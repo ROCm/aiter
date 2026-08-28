@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import hashlib
 import importlib
 import json
 import math
+import struct
 import time
 from typing import Callable, Protocol
 
@@ -43,6 +45,22 @@ CANDIDATE_STAGES = (
     "partial_pack_return",
     "final_combine",
 )
+
+TWO_KERNEL_ROUTE_PATTERNS = (
+    "rank-balanced-hot",
+    "paired-rank-half-remote",
+    "paired-rank-local-only",
+    "permuted-arbitrary-topk",
+)
+
+# Deliberately non-adjacent slot groups. Every token has eight local-node and
+# eight remote-node routes, multiple slots map to each selected rank, and at
+# least two non-adjacent slots for every selected rank repeat the exact same
+# expert ID. Keep this fixture here so Stage1 stress and real-GMM validation
+# cannot silently diverge.
+_ARBITRARY_REMOTE = (0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1)
+_ARBITRARY_RANK_DELTA = (0, 3, 2, 3, 0, 5, 2, 5, 0, 3, 6, 7, 0, 5, 6, 7)
+_ARBITRARY_EXPERT_VARIANT = (0, 1, 2, 1, 3, 4, 2, 4, 0, 5, 6, 7, 3, 4, 6, 7)
 
 
 @dataclass(frozen=True)
@@ -283,6 +301,140 @@ def _setup_dist(needs_mori: bool):
     return rank, world, local_rank, device
 
 
+def _permuted_arbitrary_topk_cpu(
+    shape: BenchmarkShape, source_rank: int
+) -> tuple[torch.Tensor, torch.Tensor, list[list[int]]]:
+    """Build the shared deterministic arbitrary-Top-K CPU fixture."""
+
+    token = torch.arange(shape.tokens, dtype=torch.int64).view(-1, 1)
+    slot = torch.arange(shape.topk, dtype=torch.int64).view(1, -1)
+    source_node = int(source_rank) // shape.gpus_per_node
+    source_local_rank = int(source_rank) % shape.gpus_per_node
+    remote = torch.tensor(_ARBITRARY_REMOTE, dtype=torch.int64).view(1, -1)
+    rank_delta = torch.tensor(
+        _ARBITRARY_RANK_DELTA, dtype=torch.int64
+    ).view(1, -1)
+    owner_local = (source_local_rank + rank_delta) % shape.gpus_per_node
+    owner_node = torch.where(
+        remote != 0,
+        torch.full_like(remote, 1 - source_node),
+        torch.full_like(remote, source_node),
+    )
+    owner = (owner_node * shape.gpus_per_node + owner_local).expand(
+        shape.tokens, -1
+    )
+
+    expert_variant = torch.tensor(
+        _ARBITRARY_EXPERT_VARIANT, dtype=torch.int64
+    ).view(1, -1)
+    expert_base = (token * 7 + int(source_rank) * 3) % shape.local_experts
+    local_expert = (expert_base + expert_variant) % shape.local_experts
+    topk_ids = (owner * shape.local_experts + local_expert).to(torch.int32)
+
+    # Preserve each original Top-K slot: all weights are distinct within one
+    # token and depend on both source rank and token.
+    numerators = (
+        (token * 17 + slot * 29 + int(source_rank) * 11) % 251 + 1
+    ).to(torch.float32)
+    route_weights = numerators / numerators.sum(dim=1, keepdim=True)
+
+    rank_slot_masks: list[list[int]] = []
+    for token_index in range(shape.tokens):
+        masks = [0] * shape.ep_size
+        ids_row = topk_ids[token_index].tolist()
+        weights_row = route_weights[token_index]
+        for topk_slot, expert in enumerate(ids_row):
+            masks[int(expert) // shape.local_experts] |= 1 << topk_slot
+        if sum(int(mask).bit_count() for mask in masks) != shape.topk:
+            raise AssertionError("arbitrary fixture lost a Top-K slot")
+        if sum(int(mask != 0) for mask in masks) != 6:
+            raise AssertionError("arbitrary fixture must select six ranks")
+        local_routes = sum(
+            int(mask).bit_count()
+            for owner_rank, mask in enumerate(masks)
+            if owner_rank // shape.gpus_per_node == source_node
+        )
+        if local_routes != shape.topk // 2:
+            raise AssertionError(
+                "arbitrary fixture must split routes equally across nodes"
+            )
+        non_adjacent_ranks = sum(
+            int(
+                mask != 0
+                and any(
+                    (mask & (1 << left))
+                    and (mask & (1 << right))
+                    and right - left > 1
+                    for left in range(shape.topk)
+                    for right in range(left + 1, shape.topk)
+                )
+            )
+            for mask in masks
+        )
+        if non_adjacent_ranks != 6:
+            raise AssertionError("arbitrary fixture rank slots must be non-adjacent")
+        if torch.unique(weights_row).numel() != shape.topk:
+            raise AssertionError("arbitrary fixture weights must be slot-distinct")
+        for owner_rank, mask in enumerate(masks):
+            slots = [
+                topk_slot
+                for topk_slot in range(shape.topk)
+                if mask & (1 << topk_slot)
+            ]
+            if not slots:
+                continue
+            experts = [int(ids_row[topk_slot]) for topk_slot in slots]
+            if len(set(experts)) == len(experts):
+                raise AssertionError(
+                    f"rank {owner_rank} has no repeated exact expert"
+                )
+        rank_slot_masks.append(masks)
+    return topk_ids, route_weights, rank_slot_masks
+
+
+def _permuted_arbitrary_destination_oracle(
+    shape: BenchmarkShape, destination_rank: int
+) -> dict[str, object]:
+    """Summarize all source routes received by one destination rank."""
+
+    expert_count = [0] * shape.local_experts
+    metadata = []
+    unique_sources = set()
+    for source_rank in range(shape.ep_size):
+        ids, weights, _ = _permuted_arbitrary_topk_cpu(shape, source_rank)
+        weight_bits = weights.contiguous().view(torch.int32)
+        for token in range(shape.tokens):
+            source = source_rank * shape.tokens + token
+            for topk_slot in range(shape.topk):
+                expert = int(ids[token, topk_slot].item())
+                if expert // shape.local_experts != destination_rank:
+                    continue
+                local_expert = expert % shape.local_experts
+                expert_count[local_expert] += 1
+                unique_sources.add(source)
+                metadata.append(
+                    (
+                        source | (topk_slot << 24),
+                        local_expert,
+                        int(weight_bits[token, topk_slot].item()) & 0xFFFFFFFF,
+                    )
+                )
+    metadata.sort()
+    metadata_sha = hashlib.sha256()
+    for packed_source, local_expert, weight_bits in metadata:
+        metadata_sha.update(
+            struct.pack("<III", packed_source, local_expert, weight_bits)
+        )
+    tiles = sum((count + 31) // 32 for count in expert_count)
+    return {
+        "routes": len(metadata),
+        "tiles": tiles,
+        "expert_count": expert_count,
+        "unique_sources": len(unique_sources),
+        "metadata_sha256": metadata_sha.hexdigest(),
+    }
+
+
 def _shared_inputs(
     shape: BenchmarkShape,
     rank: int,
@@ -334,6 +486,12 @@ def _shared_inputs(
             ((slot + token) % shape.topk + 1).to(torch.float32)
             / float(shape.topk * (shape.topk + 1) // 2)
         ).to(device)
+    elif route_pattern == "permuted-arbitrary-topk":
+        topk_ids_cpu, route_weights_cpu, _ = _permuted_arbitrary_topk_cpu(
+            shape, rank
+        )
+        topk_ids = topk_ids_cpu.to(device)
+        route_weights = route_weights_cpu.to(device)
     elif route_pattern != "rank-balanced-hot":
         raise ValueError(f"unsupported two-kernel route_pattern={route_pattern!r}")
     generator = torch.Generator(device=device).manual_seed(90_000 + rank)

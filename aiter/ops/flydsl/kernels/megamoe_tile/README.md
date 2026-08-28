@@ -420,9 +420,16 @@ communication EOS signals have been acquired.
 The hot forward makes exactly two launcher calls. Stage1 includes BF16-to-A4,
 InterNodeV1 node/rank-deduplicated transport, receive-side scoreboard
 direct-to-expert-tile placement, GMM1, SiLU and A4 requant. Stage2 uses a
-weighted GMM2 epilogue to LSA-atomic-add FP32 directly into the source-aligned
-node accumulator, followed by one partial return per token/node and final
-combine. Stage1 has no full-record rank inbox or group-sort pass; it only keeps
+weighted GMM2 epilogue to packed-BF16 LSA-atomic-add directly into the
+source-aligned node accumulator, followed by one partial return per token/node and final
+combine. The return role batches eight contiguous BF16 rows per WQE and uses
+four QPs over four batches; one wave serializes the shared Ionic doorbells.
+For each token/tile, the last route advances a 64-byte-padded token counter;
+the 28th completed hidden tile publishes one token-ready generation. RAIL
+therefore polls one local ready word per token instead of 28, while retaining
+the per-tile route counters for exact Top-K completion. Fourteen persistent
+CTAs consume the ready final-combine queue. Stage1 has no
+full-record rank inbox or group-sort pass; it only keeps
 one source-indexed quantized-activation row per `(source token, destination
 rank)` so duplicate expert routes can share the payload. Stage2 has no
 rank-partial slab or eight-rank scan. It never falls back to the multi-kernel

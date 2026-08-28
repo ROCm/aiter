@@ -8,7 +8,7 @@ in the constructor.  A hot ``forward`` performs exactly two launcher calls:
 
 1. fused BF16 quant + InterNodeV1 direct-to-expert-tile dispatch + GMM1 +
    SiLU + A4 requant;
-2. fused weighted GMM2 + direct LSA FP32 node-accumulator epilogue +
+2. fused weighted GMM2 + packed-BF16 direct LSA node-accumulator epilogue +
    InterNodeV1 combine.
 
 There is no fallback to the former record-fanout cascade.  If either strict
@@ -32,7 +32,7 @@ from .stage1_abi import (
     TwoKernelArenaLayout,
     validate_public_stage1_contract,
 )
-from .stage2_abi import Stage2ArenaLayout
+from .stage2_abi import STAGE2_TIMELINE_FIELDS, Stage2ArenaLayout
 
 
 _STAGE1_MODULE = "aiter.ops.flydsl.kernels.megamoe_tile.stage1"
@@ -136,7 +136,7 @@ class MegaMoETileA4W4:
         self.local_rank = self.rank % self.gpus_per_node
         self.peer_node = 1 - self.node
         self.device = torch.device("cuda", torch.cuda.current_device())
-        self.worker_blocks = 160
+        self.worker_blocks = int(getattr(self, "stage2_worker_blocks", 160))
         self.stage1_worker_blocks = (
             256 if self.stage1_transport == "sparse_wqe" else self.worker_blocks
         )
@@ -173,12 +173,25 @@ class MegaMoETileA4W4:
             topk=self.topk,
             max_tokens=self.mtpr,
         )
+        stage2_node_accumulation_mode = getattr(
+            self, "stage2_node_accumulation_mode", "direct_atomic"
+        )
+        stage2_rank_accumulation_mode = getattr(
+            self, "stage2_rank_accumulation_mode", "atomic"
+        )
         self.stage2_layout = Stage2ArenaLayout.create(
             hidden=self.model_dim,
             topk=self.topk,
             max_tokens=self.mtpr,
             world_size=self.world_size,
             gpus_per_node=self.gpus_per_node,
+            include_route_slots=(stage2_node_accumulation_mode == "route_store"),
+            include_rank_partials=(stage2_node_accumulation_mode == "rank_local"),
+            include_staged_reduce=(
+                stage2_node_accumulation_mode == "rank_local"
+                and stage2_rank_accumulation_mode == "staged_reduce"
+            ),
+            include_staged_ring=False,
         )
         # One physical registered window, two non-overlapping logical ABIs.
         # Stage1 writes Stage2 metadata directly through stage2_base; there is
@@ -381,6 +394,9 @@ class MegaMoETileA4W4:
             cco_geometry=self.stage1_transport,
             tile_pipeline=sparse,
             tile_pipeline_fanout_shards=16,
+            timeline_instrument=bool(
+                getattr(self, "timeline_instrument", False)
+            ),
         )
 
     def _compile_stage2(self):
@@ -394,6 +410,53 @@ class MegaMoETileA4W4:
             WORK_SHARDS=8,
             waves_per_eu_hint=2,
             team="rail",
+            accumulator_dtype="bf16",
+            final_combine_blocks=14,
+            gmm_schedule="persistent_queue",
+            return_chunk_tokens=int(
+                getattr(self, "stage2_return_chunk_tokens", 8)
+            ),
+            bf16_atomic_kind="buffer",
+            rail_return_schedule=getattr(
+                self, "stage2_rail_return_schedule", "lockstep"
+            ),
+            epilogue_schedule="lane32_meta",
+            n_tile_group=2,
+            group_pipeline_schedule="a_double_buffer",
+            node_accumulation_mode=getattr(
+                self, "stage2_node_accumulation_mode", "direct_atomic"
+            ),
+            rank_accumulation_mode=getattr(
+                self, "stage2_rank_accumulation_mode", "atomic"
+            ),
+            node_reduce_blocks=int(
+                getattr(self, "stage2_node_reduce_blocks", 32)
+            ),
+            node_reduce_vec_bytes=int(
+                getattr(self, "stage2_node_reduce_vec_bytes", 4)
+            ),
+            node_reduce_schedule=getattr(
+                self, "stage2_node_reduce_schedule", "token"
+            ),
+            node_reduce_load_schedule=getattr(
+                self,
+                "stage2_node_reduce_load_schedule",
+                "interleaved",
+            ),
+            node_reduce_work_schedule=getattr(
+                self,
+                "stage2_node_reduce_work_schedule",
+                "static_strided",
+            ),
+            node_reduce_rejoin_blocks=int(
+                getattr(self, "stage2_node_reduce_rejoin_blocks", 0)
+            ),
+            rank_epilogue_lds_addressing=getattr(
+                self, "stage2_rank_epilogue_lds_addressing", "expanded"
+            ),
+            timeline_instrument=bool(
+                getattr(self, "timeline_instrument", False)
+            ),
         )
 
     def _validate_launcher_contracts(self) -> None:
@@ -459,6 +522,62 @@ class MegaMoETileA4W4:
             if bad_architecture:
                 raise RuntimeError(
                     f"Stage1 fusion architecture mismatch: {bad_architecture}"
+                )
+            expected_stage2 = {
+                "diagnostic_mode": "full",
+                "accumulator_dtype": "bf16",
+                "final_combine_blocks": 14,
+                "gmm_schedule": "persistent_queue",
+                "return_chunk_tokens": int(
+                    getattr(self, "stage2_return_chunk_tokens", 8)
+                ),
+                "node_ready_granularity": "token",
+                "bf16_atomic_kind": "buffer",
+                "gemm2_contraction": True,
+                "communication_roles_enabled": True,
+                "node_reduce_work_schedule": getattr(
+                    self,
+                    "stage2_node_reduce_work_schedule",
+                    "static_strided",
+                ),
+                "node_reduce_rejoin_blocks": int(
+                    getattr(self, "stage2_node_reduce_rejoin_blocks", 0)
+                ),
+                "rank_epilogue_lds_addressing": getattr(
+                    self, "stage2_rank_epilogue_lds_addressing", "expanded"
+                ),
+                "rank_accumulation_mode": getattr(
+                    self, "stage2_rank_accumulation_mode", "atomic"
+                ),
+            }
+            stage2_mismatch = {
+                name: (getattr(self._stage2, name, "<missing>"), value)
+                for name, value in expected_stage2.items()
+                if getattr(self._stage2, name, "<missing>") != value
+            }
+            if stage2_mismatch:
+                raise RuntimeError(
+                    f"Stage2 fusion contract mismatch: {stage2_mismatch}"
+                )
+            stage2_architecture = getattr(
+                self._stage2, "architecture_contract", {}
+            )
+            expected_stage2_architecture = {
+                name: expected_stage2[name]
+                for name in (
+                    "node_reduce_work_schedule",
+                    "node_reduce_rejoin_blocks",
+                )
+            }
+            stage2_architecture_mismatch = {
+                name: (stage2_architecture.get(name, "<missing>"), value)
+                for name, value in expected_stage2_architecture.items()
+                if stage2_architecture.get(name, "<missing>") != value
+            }
+            if stage2_architecture_mismatch:
+                raise RuntimeError(
+                    "Stage2 fusion architecture mismatch: "
+                    f"{stage2_architecture_mismatch}"
                 )
 
     @staticmethod
@@ -672,11 +791,54 @@ class MegaMoETileA4W4:
         node_expected_all = list(
             read_window_u32(s2_ptr("node_expected"), scoreboard_size)
         )
+        node_dest_rank_masks = list(
+            read_window_u32(
+                s2_ptr("node_dest_rank_mask"), 2 * self.mtpr
+            )
+        )
         node_done_all = list(
             read_window_u32(s2_ptr("node_done"), scoreboard_size)
         )
-        node_ready_all = list(
-            read_window_u64(s2_ptr("node_tile_ready"), scoreboard_size)
+        token_scoreboard_size = 2 * self.mtpr
+        node_token_done_raw = list(
+            read_window_u32(
+                s2_ptr("node_token_done"), token_scoreboard_size * 16
+            )
+        )
+        node_token_done_all = [
+            int(node_token_done_raw[index * 16])
+            for index in range(token_scoreboard_size)
+        ]
+        node_token_ready_all = list(
+            read_window_u64(
+                s2_ptr("node_token_ready"), token_scoreboard_size
+            )
+        )
+        node_partial_ready_all = (
+            list(
+                read_window_u64(
+                    s2_ptr("node_partial_ready"), token_scoreboard_size
+                )
+            )
+            if (
+                self.stage2_layout.include_route_slots
+                or self.stage2_layout.include_rank_partials
+            )
+            else node_token_ready_all
+        )
+        compact_rank_return = (
+            self.stage2_layout.include_rank_partials
+            and getattr(self._stage2, "rail_return_schedule", "lockstep")
+            == "compact"
+        )
+        rank_return_tx_slots = (
+            list(
+                read_window_u32(
+                    s2_ptr("rank_return_tx_slot"), self.mtpr
+                )
+            )
+            if compact_rank_return
+            else list(range(self.mtpr))
         )
 
         # Canonicalize Stage1 rows by the complete packed source key, removing
@@ -685,6 +847,36 @@ class MegaMoETileA4W4:
         packed_sources = list(
             read_window_u32(s1_ptr("tile_row_source"), num_valid)
         )
+        rank_local_active_sources: set[int] = set()
+        rank_local_pending_nonzero = 0
+        rank_local_ready_missing = 0
+        if self.stage2_layout.include_rank_partials:
+            source_capacity = self.world_size * self.mtpr
+            rank_pending_raw = list(
+                read_window_u32(
+                    s2_ptr("rank_token_pending"), source_capacity * 16
+                )
+            )
+            rank_pending = [
+                int(rank_pending_raw[index * 16])
+                for index in range(source_capacity)
+            ]
+            rank_ready = list(
+                read_window_u64(s2_ptr("rank_token_ready"), source_capacity)
+            )
+            rank_local_active_sources = {
+                int(packed) & 0x00FFFFFF
+                for packed in packed_sources
+                if (int(packed) & 0x00FFFFFF) < source_capacity
+            }
+            rank_local_pending_nonzero = sum(
+                int(rank_pending[source] != 0)
+                for source in rank_local_active_sources
+            )
+            rank_local_ready_missing = sum(
+                int(int(rank_ready[source]) < generation)
+                for source in rank_local_active_sources
+            )
         input_rows = list(
             read_window_u32(s1_ptr("tile_row_input"), num_valid)
         )
@@ -697,6 +889,7 @@ class MegaMoETileA4W4:
         )
         input_row_bytes = self.model_dim // 2
         h1_row_bytes = self.inter_dim // 2
+        h1_scale_bytes = self.inter_dim // 32
         grouped_input = read_window_bytes(
             s1_ptr("grouped_input_q"),
             self.stage1_layout.source_capacity * input_row_bytes,
@@ -976,8 +1169,17 @@ class MegaMoETileA4W4:
                 .numpy()
                 .tobytes()
             )
+            replay_scale_raw = (
+                self._debug_h1_replay_scale[: num_valid * h1_scale_bytes]
+                .contiguous()
+                .cpu()
+                .numpy()
+                .tobytes()
+            )
             replay_sha = hashlib.sha256()
+            replay_scale_sha = hashlib.sha256()
             fused_vs_replay_rows = 0
+            fused_vs_replay_scale_rows = 0
             replay_per_key = {}
             for packed, row, _expert, _weight_raw in rows:
                 replay_row = replay_raw[
@@ -988,9 +1190,33 @@ class MegaMoETileA4W4:
                 ]
                 replay_sha.update(struct.pack("<I", packed))
                 replay_sha.update(replay_row)
+                replay_scale_row = bytearray(self.inter_dim // 32)
+                for scale_index in range(self.inter_dim // 32):
+                    n_block = scale_index // 4
+                    wave_group = scale_index % 4
+                    ku = n_block // 2
+                    ikxdl = n_block % 2
+                    replay_row_in_tile = row % self.stage1_layout.block_m
+                    sub = replay_row_in_tile // 16
+                    m_lane = replay_row_in_tile % 16
+                    dword = (
+                        (row // self.stage1_layout.block_m) * output_chunk_dwords
+                        + ku * 64
+                        + wave_group * 16
+                        + m_lane
+                    )
+                    source_byte = dword * 4 + ikxdl * 2 + sub
+                    replay_scale_row[scale_index] = replay_scale_raw[source_byte]
+                replay_scale_row = bytes(replay_scale_row)
+                replay_scale_sha.update(struct.pack("<I", packed))
+                replay_scale_sha.update(replay_scale_row)
                 digest = hashlib.sha256(replay_row).digest()
-                replay_per_key[packed] = digest
+                scale_digest = hashlib.sha256(replay_scale_row).digest()
+                replay_per_key[packed] = (digest, scale_digest)
                 fused_vs_replay_rows += int(replay_row != fused_row)
+                fused_vs_replay_scale_rows += int(
+                    scale_digest != per_key[packed][5]
+                )
             previous_replay = getattr(self, "_debug_previous_replay_h1", None)
             replay_changed_rows = None
             if previous_replay is not None:
@@ -1000,8 +1226,24 @@ class MegaMoETileA4W4:
                 )
             self._debug_previous_replay_h1 = replay_per_key
             canonical_h1["standalone_replay_sha256"] = replay_sha.hexdigest()
+            canonical_h1["standalone_replay_scale_sha256"] = (
+                replay_scale_sha.hexdigest()
+            )
             canonical_h1["standalone_replay_changed_rows"] = replay_changed_rows
             canonical_h1["fused_vs_standalone_changed_rows"] = fused_vs_replay_rows
+            canonical_h1["fused_vs_standalone_scale_changed_rows"] = (
+                fused_vs_replay_scale_rows
+            )
+            canonical_h1["fused_vs_standalone_q_byte_mismatches"] = sum(
+                int(left != right) for left, right in zip(h1_output, replay_raw)
+            )
+            canonical_h1["fused_vs_standalone_scale_byte_mismatches"] = sum(
+                int(left != right)
+                for left, right in zip(
+                    h1_output_scale[: num_valid * h1_scale_bytes],
+                    replay_scale_raw,
+                )
+            )
         local_base = self.node * self.mtpr * ntiles
         node_expected = []
         node_done = []
@@ -1011,11 +1253,41 @@ class MegaMoETileA4W4:
             end = start + ntiles
             expected_slice = node_expected_all[start:end]
             done_slice = node_done_all[start:end]
-            ready_slice = node_ready_all[start:end]
             node_expected.append(min(expected_slice))
-            node_done.append(min(done_slice))
+            node_done.append(
+                min(expected_slice)
+                if self.stage2_layout.include_rank_partials
+                else min(done_slice)
+            )
+            token_index = self.node * self.mtpr + token
             node_ready.append(
-                int(all(int(value) >= generation for value in ready_slice))
+                int(
+                    (node_dest_rank_masks[token_index] & 0xFF) == 0
+                    or node_partial_ready_all[token_index] >= generation
+                )
+            )
+
+        if compact_rank_return:
+            remote_plane = 1 - self.node
+            node_not_ready = 0
+            for token in range(self.mtpr):
+                token_index = remote_plane * self.mtpr + token
+                if (node_dest_rank_masks[token_index] & 0xFF) == 0:
+                    continue
+                slot = int(rank_return_tx_slots[token])
+                node_not_ready += int(
+                    slot < 0
+                    or int(
+                        node_partial_ready_all[
+                            remote_plane * self.mtpr + slot
+                        ]
+                    )
+                    < generation
+                )
+        else:
+            node_not_ready = sum(
+                int(int(value) < generation)
+                for value in node_partial_ready_all
             )
 
         return {
@@ -1029,6 +1301,20 @@ class MegaMoETileA4W4:
             "node_atomic_expected": node_expected,
             "node_atomic_done": node_done,
             "node_atomic_ready": node_ready,
+            "node_ready_granularity": "token",
+            "node_token_done_mismatch": sum(
+                int(value != ntiles) for value in node_token_done_all
+            ) if not self.stage2_layout.include_rank_partials else 0,
+            "node_accumulation_mode": getattr(
+                self._stage2, "node_accumulation_mode", "direct_atomic"
+            ),
+            "rank_local_active_tokens": len(rank_local_active_sources),
+            "rank_local_pending_nonzero": rank_local_pending_nonzero,
+            "rank_local_ready_missing": rank_local_ready_missing,
+            "node_expected_uniform_mismatch": sum(
+                int(len(set(node_expected_all[start : start + ntiles])) != 1)
+                for start in range(0, scoreboard_size, ntiles)
+            ),
             "protocol_error_count": [stage1_errors + stage2_errors],
             # Extra diagnostics retained in the benchmark JSON.
             "generation": generation,
@@ -1047,12 +1333,18 @@ class MegaMoETileA4W4:
             "gmm_jobs_completed_before_all_comm_eos": gmm_completed_before_eos,
             "expert_count_sum": sum(int(value) for value in expert_count),
             "expert_count": [int(value) for value in expert_count],
-            "node_expected_done_mismatch": sum(
-                int(int(expected) != int(done))
-                for expected, done in zip(node_expected_all, node_done_all)
+            "node_expected_done_mismatch": (
+                0
+                if self.stage2_layout.include_rank_partials
+                else sum(
+                    int(int(expected) != int(done))
+                    for expected, done in zip(node_expected_all, node_done_all)
+                )
             ),
-            "node_not_ready": sum(
-                int(int(value) < generation) for value in node_ready_all
+            "node_not_ready": node_not_ready,
+            "node_route_store_not_ready": sum(
+                int(int(value) < generation)
+                for value in node_token_ready_all
             ),
             "stage1_error_count": stage1_errors,
             "stage2_error_count": stage2_errors,
@@ -1066,6 +1358,64 @@ class MegaMoETileA4W4:
                 getattr(self._stage1, "tile_pipeline_instrument", False)
             ),
             "canonical_h1": canonical_h1,
+        }
+
+    def debug_device_timeline(self) -> dict[str, object]:
+        """Read one completed generation's diagnostic device timestamps."""
+
+        if not (
+            getattr(self._stage1, "timeline_instrument", False)
+            and getattr(self._stage2, "timeline_instrument", False)
+        ):
+            raise RuntimeError("device timeline requires instrumented launchers")
+        if self._runtime is None:
+            raise RuntimeError("CCO runtime is closed")
+        from .cco import read_window_u64
+
+        torch.cuda.synchronize(self.device)
+        generation = int(self._generation)
+        parity = generation & 1
+        address = (
+            int(self._runtime.window.local_ptr)
+            + int(self.layout.stage2_offset)
+            + int(self.stage2_layout.offset("timeline", parity=parity))
+        )
+        values = list(read_window_u64(address, len(STAGE2_TIMELINE_FIELDS)))
+        gmm_done_address = (
+            int(self._runtime.window.local_ptr)
+            + int(self.layout.stage2_offset)
+            + int(
+                self.stage2_layout.offset(
+                    "timeline_gmm_worker_done", parity=parity
+                )
+            )
+        )
+        gmm_done_all = list(read_window_u64(gmm_done_address, 256))
+        gmm_first = (
+            1
+            + int(self._stage2.final_combine_blocks)
+            + (
+                int(self._stage2.node_reduce_blocks)
+                if self._stage2.node_accumulation_mode
+                in ("route_store", "rank_local")
+                else 0
+            )
+        )
+        gmm_worker_done = [
+            int(value)
+            for value in gmm_done_all[gmm_first : int(self.worker_blocks)]
+        ]
+        ticks = {
+            name: int(value)
+            for name, value in zip(STAGE2_TIMELINE_FIELDS, values)
+        }
+        if not gmm_worker_done or any(value <= 0 for value in gmm_worker_done):
+            raise RuntimeError("incomplete Stage2 GMM worker timeline")
+        ticks["stage2_first_gmm_worker_done"] = min(gmm_worker_done)
+        ticks["stage2_all_gmm_done"] = max(gmm_worker_done)
+        return {
+            "generation": generation,
+            "ticks": ticks,
         }
 
     def close(self) -> None:

@@ -14,6 +14,11 @@ from op_tests.multigpu_tests.bench_megamoe_tile_ep16_comm_only import (
     SplitMoriCommunicationPath,
     _lightweight_shared_inputs,
 )
+from op_tests.multigpu_tests.bench_megamoe_tile_ep16_stage2_breakdown import (
+    CANDIDATE_MODES,
+    CandidateStage2Path,
+    MoriStage2Path,
+)
 from op_tests.multigpu_tests.bench_megamoe_tile_ep16_dual_path import (
     BenchmarkShape,
     HipStageTimer,
@@ -134,14 +139,17 @@ def test_mori_reference_can_expand_all_local_topk_routes():
     assert 'epilog=context["epilog"]' in h2_source
 
 
-def test_stage2_probe_keeps_direct_epilogue_work_shape():
+def test_stage2_probe_reports_the_selected_node_epilogue_shape():
     source = inspect.getsource(probe_module)
     assert "range(BM // 16)" in source
     assert "range((BN // 4) // 16)" in source
     class_source = inspect.getsource(
         MegaMoETileA4W4CommProbe._build_stage2_probe_launcher
     )
-    assert "preserves_direct_lsa_atomic_epilogue = True" in class_source
+    assert "launcher.preserves_direct_lsa_atomic_epilogue" in class_source
+    assert 'self.stage2_node_accumulation_mode == "direct_atomic"' in class_source
+    assert "launcher.preserves_route_store_register_reduce" in class_source
+    assert 'self.stage2_node_accumulation_mode == "route_store"' in class_source
 
 
 def test_probe_snapshot_is_protocol_only():
@@ -250,10 +258,44 @@ def test_stage2_diagnostic_modes_are_compile_time_and_default_full():
     source = inspect.getsource(compile_megamoe_tile_ep16_stage2_a4w4)
     assert 'diagnostic_mode == "atomic_only"' in source
     assert 'diagnostic_mode == "return_only"' in source
+    assert '"init_only"' in source
+    assert '"gmm2_only"' in source
+    assert '"gmm2_atomic_only"' in source
     assert "role_enabled" in source
     assert "compute_enabled" in source
     assert "wait_ready(" in source
+    assert "BufferAtomicPkAdd" in source
+    assert "return_chunk_tokens * wire.record_bytes" in source
+    assert "final_combine_blocks" in source
     assert '"diagnostic_mode": diagnostic_mode' in source
+    assert CANDIDATE_MODES == (
+        "full",
+        "init_only",
+        "atomic_only",
+        "gmm2_only",
+        "gmm2_atomic_only",
+        "route_store_only",
+        "return_only",
+    )
+
+
+def test_stage2_breakdown_excludes_real_stage1_and_mori_setup_from_events():
+    candidate_prepare = inspect.getsource(CandidateStage2Path.prepare_iteration)
+    candidate_timed = inspect.getsource(CandidateStage2Path.timed_iteration)
+    assert "_launch_stage1(" in candidate_prepare
+    assert "torch.cuda.synchronize" in candidate_prepare
+    assert "dist.barrier()" in candidate_prepare
+    assert "_launch_stage1(" not in candidate_timed
+    assert "_launch_stage2(" in candidate_timed
+
+    mori_prepare = inspect.getsource(MoriStage2Path._dispatch_and_capture)
+    mori_timed = inspect.getsource(MoriStage2Path.timed_iteration)
+    assert "kernel_bench_callable = captured" in mori_prepare
+    assert "local_out.zero_()" in mori_prepare
+    assert 'timer.stage("standalone_fused_moe_gmm2"' in mori_timed
+    assert 'timer.stage("mori_combine"' in mori_timed
+    assert "dispatch(" not in mori_timed
+    assert "_fused_moe(" not in mori_timed
 
 
 def test_split128x2_ticket_map_covers_each_plane_and_destination_once():
@@ -746,7 +788,8 @@ def test_stage2_accepts_route_counts_zero_through_topk():
     assert "comm_ops.fence_agent_release()" in source
     assert "expected > fx.Int32(TOPK)" in source
     assert "if expected == fx.Int32(0):" in source
-    assert "ready_ptr + fx.Int64(item) * fx.Int64(8), generation" in source
+    assert "token_ready_ptr + fx.Int64(item) * fx.Int64(8)" in source
+    assert "old_token + fx.Int32(1) == fx.Int32(hidden_tiles)" in source
     assert "expected <= fx.Int32(TOPK)" in source
 
 

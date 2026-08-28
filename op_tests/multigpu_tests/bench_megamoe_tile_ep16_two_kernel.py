@@ -10,12 +10,15 @@ and must launch exactly two GPU kernels:
 
 * Stage1: BF16->A4 quant + InterNodeV1 transport + receive-side scoreboard
   direct-to-expert-tile placement + GMM1 + SiLU + A4 requant
-* Stage2: weighted GMM2 with a direct LSA FP32 atomic epilogue into the
+* Stage2: weighted GMM2 with a packed-BF16 direct LSA atomic epilogue into the
   source-aligned node accumulator + EP return/combine
 
 JIT, packed-weight construction and workspace construction are primed before
-timing.  Input quantization is deliberately *not* primed as a standalone hot
-operator; it is part of every Stage1 launch.
+timing.  For the candidate, input quantization is part of every Stage1 launch.
+
+The production baseline follows ``bench_mega_moe_v2.py`` at the same K3 shape:
+standalone BF16-to-A4 quantization, MORI A4 dispatch, ``fused_moe`` and MORI
+combine.  No benchmark-side route expansion or intermediate requant is added.
 """
 
 from __future__ import annotations
@@ -51,6 +54,7 @@ from op_tests.multigpu_tests.bench_megamoe_tile_ep16_dual_path import (
 
 TARGET_STAGE1_SYMBOL = r".*megamoe_tile_ep16_stage1.*"
 TARGET_STAGE2_SYMBOL = r".*megamoe_tile_ep16_stage2.*"
+COMPARISON_CASE_LABEL = "TPR128_TopK16_E896_H7168_I3072_EP16_A4W4"
 DIRECT_TILE_STAGE1_CONTRACT = {
     "dispatch": "scoreboard_direct_to_expert_tile",
     "receive_comm_roles": 8,
@@ -65,10 +69,24 @@ DIRECT_TILE_STAGE1_CONTRACT = {
 }
 DIRECT_TILE_STAGE2_CONTRACT = {
     "epilogue": "direct_lsa_atomic_source_aligned_node_accumulator",
-    "node_accumulator_dtype": "fp32",
+    "node_accumulator_dtype": "bf16",
+    "node_ready_granularity": "token",
+    "node_accumulation_mode": "direct_atomic",
     "uses_rank_partial": False,
     "uses_node_scan": False,
     "uses_external_reduce_kernel": False,
+}
+ROUTE_STORE_STAGE2_CONTRACT = {
+    **DIRECT_TILE_STAGE2_CONTRACT,
+    "epilogue": "source_aligned_route_slot_store_then_register_reduce",
+    "node_accumulation_mode": "route_store",
+}
+RANK_LOCAL_STAGE2_CONTRACT = {
+    **DIRECT_TILE_STAGE2_CONTRACT,
+    "epilogue": "rank_local_atomic_then_peer_pull_node_reduce",
+    "node_accumulation_mode": "rank_local",
+    "uses_rank_partial": True,
+    "uses_node_scan": True,
 }
 PUBLIC_CONSTRUCTOR_ARGUMENTS = (
     "rank",
@@ -179,9 +197,29 @@ def _validate_direct_tile_operator(operator: object) -> None:
     _validate_architecture_manifest(
         stage1_manifest, DIRECT_TILE_STAGE1_CONTRACT, "Stage1"
     )
-    _validate_architecture_manifest(
-        stage2_manifest, DIRECT_TILE_STAGE2_CONTRACT, "Stage2"
+    node_accumulation_mode = getattr(
+        stage2, "node_accumulation_mode", "direct_atomic"
     )
+    if node_accumulation_mode == "route_store":
+        expected_stage2 = dict(ROUTE_STORE_STAGE2_CONTRACT)
+    elif node_accumulation_mode == "rank_local":
+        expected_stage2 = dict(RANK_LOCAL_STAGE2_CONTRACT)
+    else:
+        expected_stage2 = dict(DIRECT_TILE_STAGE2_CONTRACT)
+    if node_accumulation_mode in ("route_store", "rank_local"):
+        for name in (
+            "node_reduce_blocks",
+            "node_reduce_vec_bytes",
+            "node_reduce_schedule",
+            "node_reduce_load_schedule",
+        ):
+            value = getattr(stage2, name, "<missing>")
+            if value == "<missing>":
+                raise AssertionError(
+                    f"Stage2 {node_accumulation_mode} launcher is missing {name}"
+                )
+            expected_stage2[name] = value
+    _validate_architecture_manifest(stage2_manifest, expected_stage2, "Stage2")
 
 
 def _snapshot_values(snapshot: dict[str, object], name: str) -> list[int]:
@@ -255,7 +293,26 @@ def _validate_direct_tile_debug_snapshot(
     ):
         raise AssertionError("Stage2 node-atomic scoreboards must have 128 token entries")
     if node_done != node_expected or any(value == 0 for value in node_ready):
-        raise AssertionError("Stage2 node accumulator was published before all atomics")
+        raise AssertionError(
+            "Stage2 node accumulator was published before all contributions"
+        )
+    if int(snapshot.get("node_expected_uniform_mismatch", 0)) != 0:
+        raise AssertionError("Stage2 node expected count differs across hidden tiles")
+    if int(snapshot.get("node_expected_done_mismatch", 0)) != 0:
+        raise AssertionError("Stage2 node tile contributor count did not complete")
+    if int(snapshot.get("node_not_ready", 0)) != 0:
+        raise AssertionError("Stage2 node readiness did not complete")
+    if snapshot.get("node_ready_granularity") != "token":
+        raise AssertionError("Stage2 must publish whole-token readiness")
+    if int(snapshot.get("node_token_done_mismatch", -1)) != 0:
+        raise AssertionError("Stage2 token tile-count did not complete")
+    if snapshot.get("node_accumulation_mode") == "rank_local":
+        if int(snapshot.get("rank_local_active_tokens", 0)) == 0:
+            raise AssertionError("rank-local Stage2 produced no active tokens")
+        if int(snapshot.get("rank_local_pending_nonzero", -1)) != 0:
+            raise AssertionError("rank-local token completion did not drain")
+        if int(snapshot.get("rank_local_ready_missing", -1)) != 0:
+            raise AssertionError("rank-local token readiness did not complete")
     errors = _snapshot_values(snapshot, "protocol_error_count")
     if len(errors) != 1 or errors[0] != 0:
         raise AssertionError(f"device protocol_error_count={errors}")
@@ -336,9 +393,138 @@ class MoriBf16A4W4BaselinePath(MoriBaselinePath):
         return super().prime_and_check()
 
 
+class MoriFusedMoeBaselinePath:
+    """Production A4 quant + MORI dispatch + fused_moe + combine baseline.
+
+    This mirrors ``bench_mega_moe_v2.py::mori_body`` at the K3 EP16 shape.
+    Quantization happens before communication so MORI transports packed FP4
+    activations and E8M0 scales.  The dispatch tuple is passed directly to
+    ``fused_moe``; route sorting, scale-layout conversion and the inter-stage
+    representation are owned by ``fused_moe`` rather than benchmark glue.
+    """
+
+    name = "quant_mori_a4_dispatch_fused_moe_combine"
+    stage_names = ("quant_dispatch_fused_moe_combine",)
+    full_stage_field = stage_names[0]
+
+    def __init__(
+        self,
+        shape: BenchmarkShape,
+        shared: SharedInputs,
+        rank: int,
+        world: int,
+        *,
+        valid_recv: int,
+    ):
+        import aiter
+        import mori
+        from aiter.fused_moe import fused_moe
+        from aiter.ops.flydsl.moe_common import GateMode
+        from aiter.ops.quant import dynamic_per_group_scaled_quant
+
+        kernel_type = mori.ops.EpDispatchCombineKernelType.InterNodeV1LL
+        config = mori.ops.EpDispatchCombineConfig(
+            data_type=shared.a_quant.dtype,
+            rank=rank,
+            world_size=world,
+            hidden_dim=shape.hidden,
+            scale_dim=shape.hidden // 32,
+            scale_type_size=1,
+            max_token_type_size=torch.bfloat16.itemsize,
+            max_num_inp_token_per_rank=max(128, shape.tokens),
+            max_total_recv_tokens=0,
+            num_experts_per_rank=shape.local_experts,
+            num_experts_per_token=shape.topk,
+            warp_num_per_block=8,
+            block_num=256,
+            kernel_type=kernel_type,
+            rdma_block_num=128,
+            gpu_per_node=shape.gpus_per_node,
+            quant_type="none",
+        )
+        self.shape = shape
+        self.shared = shared
+        self.rank = rank
+        self.valid_recv = int(valid_recv)
+        self.op = mori.ops.EpDispatchCombineOp(config)
+        self._fused_moe = fused_moe
+        self._activation = aiter.ActivationType.Silu
+        self._quant_type = aiter.QuantType.per_1x32
+        self._quant_op = dynamic_per_group_scaled_quant
+        self._quant_q = shared.a_quant
+        self._quant_scale = shared.a_scale
+        self._gate_mode = GateMode.SEPARATED.value
+
+    def _forward(self, *, validate_recv: bool = False) -> torch.Tensor:
+        self._quant_op(
+            self._quant_q,
+            self.shared.x,
+            self._quant_scale,
+            32,
+            shuffle_scale=False,
+        )
+        dispatched, recv_weights, recv_scales, recv_ids, recv_tokens = self.op.dispatch(
+            self._quant_q,
+            self.shared.route_weights,
+            self._quant_scale,
+            self.shared.topk_ids,
+            block_num=256,
+            rdma_block_num=128,
+            warp_per_block=8,
+        )
+        if validate_recv:
+            actual_recv = int(recv_tokens.item())
+            if actual_recv != self.valid_recv:
+                raise AssertionError(
+                    f"fused_moe baseline recv_tokens={actual_recv}, "
+                    f"expected {self.valid_recv}"
+                )
+        weights = self.shared.prepared_weights
+        local_out = self._fused_moe(
+            dispatched,
+            weights.w1,
+            weights.w2,
+            recv_weights,
+            recv_ids,
+            self.shared.local_expert_mask,
+            activation=self._activation,
+            quant_type=self._quant_type,
+            doweight_stage1=False,
+            w1_scale=weights.w1_scale,
+            w2_scale=weights.w2_scale,
+            a1_scale=recv_scales,
+            num_local_tokens=recv_tokens,
+            dtype=torch.bfloat16,
+            swiglu_limit=0.0,
+            gate_mode=self._gate_mode,
+        )
+        result = self.op.combine(
+            local_out,
+            None,
+            self.shared.topk_ids,
+            block_num=256,
+            rdma_block_num=128,
+            warp_per_block=4,
+        )
+        return result[0] if isinstance(result, tuple) else result
+
+    def run_iteration(self, timer: HipStageTimer) -> torch.Tensor:
+        return timer.stage(self.stage_names[0], self._forward)
+
+    def prime_and_check(self) -> torch.Tensor:
+        output = self._forward(validate_recv=True)
+        torch.cuda.synchronize(output.device)
+        if output.shape[0] < self.shape.tokens:
+            raise AssertionError("fused_moe baseline output is shorter than local tokens")
+        if not torch.isfinite(output[: self.shape.tokens].float()).all().item():
+            raise AssertionError("fused_moe baseline produced non-finite output")
+        return output
+
+
 class TwoKernelCandidatePath:
     name = "ep16_two_kernel_candidate"
     stage_names = ("stage1_stage2_forward",)
+    full_stage_field = stage_names[0]
 
     def __init__(
         self,
@@ -560,6 +746,7 @@ def _path_summary(path, result: PathResult, tail_iterations: int) -> dict[str, o
 
     return {
         "path": path.name,
+        "full_stage_field": getattr(path, "full_stage_field", path.stage_names[0]),
         "tail_iterations": tail_iterations,
         "tail_rank_max_stats_us": {
             field: _sample_stats(values(field)) for field in fields
@@ -640,10 +827,15 @@ def main() -> int:
         default="aiter.ops.flydsl.kernels.megamoe_tile:HierarchicalMegaMoEV2",
     )
     parser.add_argument("--paths", choices=("baseline", "candidate", "both"), default="both")
+    parser.add_argument(
+        "--order",
+        choices=("baseline-first", "candidate-first"),
+        default="baseline-first",
+    )
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--tail-iters", type=int, default=20)
-    parser.add_argument("--rel-l2-threshold", type=float, default=1.0e-2)
+    parser.add_argument("--rel-l2-threshold", type=float, default=5.0e-2)
     parser.add_argument(
         "--route-pattern",
         choices=(
@@ -678,18 +870,22 @@ def main() -> int:
     )
     shape.validate()
     contract = {
+        "case_label": COMPARISON_CASE_LABEL,
         "shape": shape.__dict__,
         "route_pattern": args.route_pattern,
         "direct_packed_weights": args.direct_packed_weights,
         "candidate_stage1_transport": args.candidate_stage1_transport,
+        "order": args.order,
         "quant": "a4w4",
         "public_forward": "forward(x_bf16, wts, topk_ids) -> local_bf16",
+        "baseline": "bf16_to_a4+mori_a4_dispatch+fused_moe_a4w4_silu+mori_combine",
+        "baseline_external_requant": False,
         "stage1": (
             "bf16_to_a4+internodev1_transport+scoreboard_direct_expert_tile+"
             "gmm1+silu+a4_requant"
         ),
         "stage2": (
-            "weighted_gmm2+direct_lsa_atomic_fp32_source_aligned_node_accum+"
+            "weighted_gmm2+direct_lsa_atomic_bf16x2_source_aligned_node_accum+"
             "return+combine"
         ),
         "inter_node_payload": "once_per_source_token_per_destination_node",
@@ -728,7 +924,7 @@ def main() -> int:
     paths = []
     if args.paths in ("baseline", "both"):
         paths.append(
-            MoriBf16A4W4BaselinePath(
+            MoriFusedMoeBaselinePath(
                 shape,
                 shared,
                 rank,
@@ -737,9 +933,6 @@ def main() -> int:
                     shape.tokens * world
                     if args.route_pattern == "rank-balanced-hot"
                     else shape.tokens * world // 2
-                ),
-                expand_local_routes=(
-                    args.route_pattern != "rank-balanced-hot"
                 ),
             )
         )
@@ -758,6 +951,8 @@ def main() -> int:
                 ),
             )
         )
+    if args.paths == "both" and args.order == "candidate-first":
+        paths.reverse()
 
     results: dict[str, PathResult] = {}
     local_summaries = []
@@ -796,17 +991,17 @@ def main() -> int:
         )
     comparison_rel_l2 = None
     if args.paths == "both":
-        baseline = results["mori_bf16_a4w4_baseline"].timed
+        baseline = results["quant_mori_a4_dispatch_fused_moe_combine"].timed
         candidate = results["ep16_two_kernel_candidate"].timed
         comparison = _comparison_metrics(
             baseline,
             candidate,
             rank=rank,
-            label="two_kernel_candidate_vs_mori_bf16_a4w4",
+            label="two_kernel_candidate_vs_quant_mori_a4_fused_moe",
         )
         diagnostics.append(comparison)
         baseline_generations = results[
-            "mori_bf16_a4w4_baseline"
+            "quant_mori_a4_dispatch_fused_moe_combine"
         ].debug_generation_outputs
         candidate_generations = results[
             "ep16_two_kernel_candidate"
@@ -837,6 +1032,51 @@ def main() -> int:
     dist.gather_object(local_summaries, gathered_summaries, dst=0)
     dist.gather_object(diagnostics, gathered_diagnostics, dst=0)
     if rank == 0:
+        timing_comparison = None
+        tail_all_rank_sample_mean_us = None
+        if args.paths == "both":
+            summary_by_name = {row["path"]: row for row in local_summaries}
+            baseline_name = "quant_mori_a4_dispatch_fused_moe_combine"
+            candidate_name = "ep16_two_kernel_candidate"
+            baseline_field = summary_by_name[baseline_name]["full_stage_field"]
+            candidate_field = summary_by_name[candidate_name]["full_stage_field"]
+            baseline_stats = summary_by_name[baseline_name][
+                "tail_rank_max_stats_us"
+            ][baseline_field]
+            candidate_stats = summary_by_name[candidate_name][
+                "tail_rank_max_stats_us"
+            ][candidate_field]
+            timing_comparison = {
+                key: {
+                    "baseline_us": baseline_stats[key],
+                    "candidate_us": candidate_stats[key],
+                    "candidate_change_pct": 100.0
+                    * (candidate_stats[key] / baseline_stats[key] - 1.0),
+                }
+                for key in ("mean", "p50", "p95")
+            }
+            tail_all_rank_sample_mean_us = {}
+            for path_name, field in (
+                (baseline_name, baseline_field),
+                (candidate_name, candidate_field),
+            ):
+                per_rank = [
+                    next(
+                        row for row in rank_rows if row["path"] == path_name
+                    )["tail_local_rank_stats_us"][field]["mean"]
+                    for rank_rows in gathered_summaries
+                ]
+                tail_all_rank_sample_mean_us[path_name] = sum(per_rank) / world
+            timing_comparison["all_rank_mean"] = {
+                "baseline_us": tail_all_rank_sample_mean_us[baseline_name],
+                "candidate_us": tail_all_rank_sample_mean_us[candidate_name],
+                "candidate_change_pct": 100.0
+                * (
+                    tail_all_rank_sample_mean_us[candidate_name]
+                    / tail_all_rank_sample_mean_us[baseline_name]
+                    - 1.0
+                ),
+            }
         print(
             "MEGAMOE_EP16_TWO_KERNEL_BENCH "
             + json.dumps(
@@ -850,6 +1090,8 @@ def main() -> int:
                     "rel_l2_threshold": args.rel_l2_threshold,
                     "rank_summaries": gathered_summaries,
                     "correctness_by_rank": gathered_diagnostics,
+                    "timing_comparison": timing_comparison,
+                    "tail_all_rank_sample_mean_us": tail_all_rank_sample_mean_us,
                 },
                 sort_keys=True,
             ),

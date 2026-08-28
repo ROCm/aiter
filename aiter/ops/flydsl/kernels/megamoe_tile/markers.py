@@ -23,6 +23,12 @@ def _load_roctx():
             lib.roctxRangePushA.restype = ctypes.c_int
             lib.roctxRangePop.argtypes = []
             lib.roctxRangePop.restype = ctypes.c_int
+            if hasattr(lib, "roctxProfilerPause"):
+                lib.roctxProfilerPause.argtypes = [ctypes.c_uint64]
+                lib.roctxProfilerPause.restype = ctypes.c_int
+            if hasattr(lib, "roctxProfilerResume"):
+                lib.roctxProfilerResume.argtypes = [ctypes.c_uint64]
+                lib.roctxProfilerResume.restype = ctypes.c_int
             return lib
         except (OSError, AttributeError):
             continue
@@ -30,6 +36,19 @@ def _load_roctx():
 
 
 _ROCTX = _load_roctx()
+_PROFILER_RUNNING = (
+    os.environ.get("MEGAMOE_TILE_PROFILER_STARTS_PAUSED", "0") != "1"
+)
+
+
+def _profile_regions_enabled() -> bool:
+    return os.environ.get("MEGAMOE_TILE_PROFILE_REGIONS", "0") == "1"
+
+
+def _require_profiler_control(name: str):
+    if _ROCTX is None or not hasattr(_ROCTX, name):
+        raise RuntimeError(f"ROCTx profiler control {name} is unavailable")
+    return getattr(_ROCTX, name)
 
 
 @contextlib.contextmanager
@@ -47,18 +66,20 @@ def roctx_range(name: str):
 
 
 def profiler_pause() -> None:
-    if (
-        os.environ.get("MEGAMOE_TILE_PROFILE_REGIONS", "0") == "1"
-        and _ROCTX is not None
-        and hasattr(_ROCTX, "roctxProfilerPause")
-    ):
-        _ROCTX.roctxProfilerPause(0)
+    global _PROFILER_RUNNING
+    if not _profile_regions_enabled() or not _PROFILER_RUNNING:
+        return
+    result = _require_profiler_control("roctxProfilerPause")(0)
+    if result != 0:
+        raise RuntimeError(f"roctxProfilerPause failed with status {result}")
+    _PROFILER_RUNNING = False
 
 
 def profiler_resume() -> None:
-    if (
-        os.environ.get("MEGAMOE_TILE_PROFILE_REGIONS", "0") == "1"
-        and _ROCTX is not None
-        and hasattr(_ROCTX, "roctxProfilerResume")
-    ):
-        _ROCTX.roctxProfilerResume(0)
+    global _PROFILER_RUNNING
+    if not _profile_regions_enabled() or _PROFILER_RUNNING:
+        return
+    result = _require_profiler_control("roctxProfilerResume")(0)
+    if result != 0:
+        raise RuntimeError(f"roctxProfilerResume failed with status {result}")
+    _PROFILER_RUNNING = True

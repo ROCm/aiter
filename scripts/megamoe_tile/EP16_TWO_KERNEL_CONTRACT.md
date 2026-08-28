@@ -22,7 +22,10 @@ Stage1 -- exactly one GPU launch
 Stage2 -- exactly one GPU launch
   A4W4 GMM2
   + route-weight multiply
-  + direct LSA FP32 atomic into source-aligned node accumulator
+  + packed-BF16 direct LSA atomic into source-aligned node accumulator
+  + two-level tile-complete to whole-token-ready scoreboard
+  + 8-token contiguous RAIL return batches over four QPs
+  + 14 persistent dynamic final-combine CTAs
   + combine back to the original source rank/token
 
 output on each source rank
@@ -96,9 +99,11 @@ its final expert-tile row and stores scale, source/top-k identity and weight;
 GMM1 gathers the shared activation through `tile_row_input`.
 
 Stage2 likewise does not materialize one `rank_partial` slab per expert rank
-and scan eight slabs. Its weighted GMM2 epilogue performs a direct LSA FP32
+and scan eight slabs. Its weighted GMM2 epilogue performs a packed-BF16 direct LSA
 atomic into the source-aligned node accumulator. Completion counters make the
-node contribution visible once all selected routes have arrived. At most one
+node contribution visible once all selected routes and all 28 hidden tiles
+have arrived. The last route for each tile increments a 64-byte-padded token
+counter; the 28th tile publishes one token-ready generation. At most one
 completed node contribution per `(source token, remote node)` crosses back to
 the source node, where the final BF16 output is produced.
 
@@ -181,10 +186,10 @@ Stage2 persistent grid
   compute CTAs
     claim Stage1 output tiles
     GMM2 and apply route weights
-    epilogue LSA-atomic-add FP32 directly to the source-aligned node accumulator
+    epilogue packed-BF16 LSA-atomic-add directly to the source-aligned node accumulator
     publish a route/tile completion only after the atomic payload is visible
   return/communication CTAs
-    wait for the source token's expected direct-atomic contribution count
+    wait for one whole-token ready generation
     aggregate one remote partial return per token/node
     publish exact source-token completion
     write local BF16 output
@@ -228,25 +233,26 @@ window base
 ```
 
 Stage1 writes source contribution expectations and completion generations
-directly into the Stage2 region. Stage2 owns the FP32 source-aligned node
+directly into the Stage2 region. Stage2 owns the BF16 source-aligned node
 accumulator and its expected/done/ready scoreboards. The Stage2 offset is
 compiled into both kernels; no host copy, rank-partial translation, pointer
 table conversion, node scan, or bridge kernel exists between launches.
 
 ## Correctness oracle
 
-The headline oracle is an unfused MORI `InterNodeV1LL` path with identical
-inputs, routes, local packed weights, A4 rounding points, SiLU, and weighted
-combine:
+The headline baseline follows the production `bench_mega_moe_v2.py` call
+boundary with identical BF16 inputs, routes, local packed weights and SiLU:
 
 ```text
 BF16->A4
-MORI dispatch
-local route selection / expert sort
-A4W4 GMM1 + SiLU + A4 requant
-weighted A4W4 GMM2
+MORI A4 dispatch
+fused_moe (device route sort + A4W4 GMM1 + SiLU + internal A4 requant + GMM2)
 MORI combine
 ```
+
+The dispatched FP4 activation and E8M0 scale are passed directly to
+`fused_moe`; the benchmark does not insert Python `nonzero`/`where` route
+expansion, a manual scale copy, or an external intermediate requant.
 
 This is compared only after timed loops. Required checks are:
 
@@ -254,7 +260,8 @@ This is compared only after timed loops. Required checks are:
 - rank-balanced and duplicate-rank fixtures preserve every expected
   `(source, top-k slot, local expert, weight)` route;
 - candidate prime versus candidate final sample (epoch reuse check);
-- candidate versus MORI relative L2, reduced with MAX over ranks, `< 1e-2`;
+- candidate versus MORI+fused_moe relative L2, reduced with MAX over ranks,
+  `< 5e-2`;
 - logits diff, max absolute error, norm ratio, and per-token relative-L2 are
   recorded for diagnosis.
 
@@ -276,7 +283,7 @@ Stage1
 
 Stage2
   epilogue                     direct_lsa_atomic_source_aligned_node_accumulator
-  node_accumulator_dtype       fp32
+  node_accumulator_dtype       bf16
   uses_rank_partial            false
   uses_node_scan               false
   uses_external_reduce_kernel  false
@@ -306,8 +313,10 @@ warmup/timed regions. Production builds need not expose it; their in-kernel
 protocol error counter and output comparison remain mandatory.
 
 The baseline includes its standalone BF16-to-A4 cost because candidate Stage1
-includes that work. A prequantized MORI number may be reported separately but
-must not be used as the same-boundary headline comparison.
+includes that work. Quantization happens before MORI dispatch, so both paths
+transport packed FP4 activation plus E8M0 scale. `fused_moe` consumes that
+prequantized tuple and owns its internal Stage1-to-Stage2 representation; the
+harness inserts no additional requant operation.
 
 ## Timing and rank alignment
 

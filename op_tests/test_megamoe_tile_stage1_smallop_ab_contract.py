@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 
 from op_tests.multigpu_tests.bench_megamoe_tile_ep16_stage1_smallop_ab import (
     UNFUSED_FULL,
     UnfusedMoriStage1Path,
     _run_interleaved,
     _run_path,
+    main,
 )
 
 
@@ -65,3 +67,27 @@ def test_interleaved_runner_swaps_order_outside_each_timed_event():
     assert source.index("timer.finish_iteration()") < source.index(
         'getattr(path, "after_iteration", None)'
     )
+
+
+def test_rocprof_selected_regions_cover_only_measured_path_bodies():
+    for runner in (_run_path, _run_interleaved):
+        source = inspect.getsource(runner)
+        assert "profiler_resume()" in source
+        assert "MEGAMOE_STAGE1_SMALL_OP_AB_TIMED_" in source
+        assert "finally:" in source
+        assert "profiler_pause()" in source
+        assert source.rindex("profiler_pause()") < source.rindex(
+            'getattr(path, "after_iteration", None)'
+        )
+
+    main_source = inspect.getsource(main)
+    assert main_source.index("profiler_pause()") < main_source.index("_setup_dist(")
+
+    wrapper = (
+        Path(__file__).parents[1]
+        / "scripts"
+        / "megamoe_tile"
+        / "profile_rank0_worker.sh"
+    ).read_text()
+    assert "--selected-regions" in wrapper
+    assert "MEGAMOE_TILE_PROFILER_STARTS_PAUSED=1" in wrapper

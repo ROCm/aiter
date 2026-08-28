@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import struct
 
@@ -16,6 +15,8 @@ from op_tests.multigpu_tests.bench_megamoe_tile_ep16_comm_only import (
 )
 from op_tests.multigpu_tests.bench_megamoe_tile_ep16_dual_path import (
     BenchmarkShape,
+    _permuted_arbitrary_destination_oracle,
+    _permuted_arbitrary_topk_cpu,
     _setup_dist,
 )
 from op_tests.multigpu_tests.megamoe_tile_comm_probe_factory import (
@@ -29,107 +30,6 @@ def _prefix_masks(count: int) -> list[int]:
         bits = max(0, (int(count) + 3 - qp) // 4)
         masks.append((1 << bits) - 1)
     return masks
-
-
-# Deliberately non-adjacent slot groups.  Every token has eight local-node and
-# eight remote-node routes, multiple slots map to each selected rank, and at
-# least two non-adjacent slots for every selected rank repeat the exact same
-# expert ID.  This catches implementations that accidentally treat a rank mask
-# as one route, assume adjacent duplicate slots, or reconstruct weights by rank
-# rather than by original Top-K slot.
-_ARBITRARY_REMOTE = (0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1)
-_ARBITRARY_RANK_DELTA = (0, 3, 2, 3, 0, 5, 2, 5, 0, 3, 6, 7, 0, 5, 6, 7)
-_ARBITRARY_EXPERT_VARIANT = (0, 1, 2, 1, 3, 4, 2, 4, 0, 5, 6, 7, 3, 4, 6, 7)
-
-
-def _arbitrary_topk_cpu(
-    shape: BenchmarkShape, source_rank: int
-) -> tuple[torch.Tensor, torch.Tensor, list[list[int]]]:
-    """Build one deterministic arbitrary-Top-K source-rank fixture."""
-
-    token = torch.arange(shape.tokens, dtype=torch.int64).view(-1, 1)
-    slot = torch.arange(shape.topk, dtype=torch.int64).view(1, -1)
-    source_node = int(source_rank) // shape.gpus_per_node
-    source_local_rank = int(source_rank) % shape.gpus_per_node
-    remote = torch.tensor(_ARBITRARY_REMOTE, dtype=torch.int64).view(1, -1)
-    rank_delta = torch.tensor(
-        _ARBITRARY_RANK_DELTA, dtype=torch.int64
-    ).view(1, -1)
-    owner_local = (source_local_rank + rank_delta) % shape.gpus_per_node
-    owner_node = torch.where(
-        remote != 0,
-        torch.full_like(remote, 1 - source_node),
-        torch.full_like(remote, source_node),
-    )
-    owner = owner_node * shape.gpus_per_node + owner_local
-    owner = owner.expand(shape.tokens, -1)
-
-    expert_variant = torch.tensor(
-        _ARBITRARY_EXPERT_VARIANT, dtype=torch.int64
-    ).view(1, -1)
-    expert_base = (token * 7 + int(source_rank) * 3) % shape.local_experts
-    local_expert = (expert_base + expert_variant) % shape.local_experts
-    topk_ids = (owner * shape.local_experts + local_expert).to(torch.int32)
-
-    # All sixteen slot weights are distinct for every token and rotate with
-    # both token and source rank.  Normalize in FP32 exactly once so the CPU
-    # metadata oracle can compare the packed IEEE-754 bits byte-for-byte.
-    numerators = (
-        (token * 17 + slot * 29 + int(source_rank) * 11) % 251 + 1
-    ).to(torch.float32)
-    route_weights = numerators / numerators.sum(dim=1, keepdim=True)
-
-    rank_slot_masks: list[list[int]] = []
-    for token_index in range(shape.tokens):
-        masks = [0] * shape.ep_size
-        ids_row = topk_ids[token_index].tolist()
-        weights_row = route_weights[token_index]
-        for topk_slot, expert in enumerate(ids_row):
-            masks[int(expert) // shape.local_experts] |= 1 << topk_slot
-        if sum(int(mask).bit_count() for mask in masks) != shape.topk:
-            raise AssertionError("arbitrary fixture lost a Top-K slot")
-        if sum(int(mask != 0) for mask in masks) != 6:
-            raise AssertionError("arbitrary fixture must select six ranks")
-        local_routes = sum(
-            int(mask).bit_count()
-            for owner_rank, mask in enumerate(masks)
-            if owner_rank // shape.gpus_per_node == source_node
-        )
-        if local_routes != shape.topk // 2:
-            raise AssertionError(
-                "arbitrary fixture must split routes equally across nodes"
-            )
-        if sum(
-            int(
-                mask != 0
-                and any(
-                    (mask & (1 << left))
-                    and (mask & (1 << right))
-                    and right - left > 1
-                    for left in range(shape.topk)
-                    for right in range(left + 1, shape.topk)
-                )
-            )
-            for mask in masks
-        ) != 6:
-            raise AssertionError("arbitrary fixture rank slots must be non-adjacent")
-        if torch.unique(weights_row).numel() != shape.topk:
-            raise AssertionError("arbitrary fixture weights must be slot-distinct")
-        for owner_rank, mask in enumerate(masks):
-            slots = [
-                topk_slot
-                for topk_slot in range(shape.topk)
-                if mask & (1 << topk_slot)
-            ]
-            if not slots:
-                continue
-            experts = [int(ids_row[topk_slot]) for topk_slot in slots]
-            if len(set(experts)) == len(experts):
-                raise AssertionError(
-                    f"rank {owner_rank} has no repeated exact expert"
-                )
-        rank_slot_masks.append(masks)
-    return topk_ids, route_weights, rank_slot_masks
 
 
 def _arbitrary_shared_inputs(
@@ -146,53 +46,12 @@ def _arbitrary_shared_inputs(
         quantize_for_mori=False,
         route_pattern="rank-balanced-hot",
     )
-    topk_ids, route_weights, rank_slot_masks = _arbitrary_topk_cpu(
+    topk_ids, route_weights, rank_slot_masks = _permuted_arbitrary_topk_cpu(
         shape, rank
     )
     shared.topk_ids = topk_ids.to(device)
     shared.route_weights = route_weights.to(device)
     return shared, rank_slot_masks
-
-
-def _arbitrary_destination_oracle(
-    shape: BenchmarkShape, destination_rank: int
-) -> dict[str, object]:
-    expert_count = [0] * shape.local_experts
-    metadata = []
-    unique_sources = set()
-    for source_rank in range(shape.ep_size):
-        ids, weights, _ = _arbitrary_topk_cpu(shape, source_rank)
-        weight_bits = weights.contiguous().view(torch.int32)
-        for token in range(shape.tokens):
-            source = source_rank * shape.tokens + token
-            for topk_slot in range(shape.topk):
-                expert = int(ids[token, topk_slot].item())
-                if expert // shape.local_experts != destination_rank:
-                    continue
-                local_expert = expert % shape.local_experts
-                expert_count[local_expert] += 1
-                unique_sources.add(source)
-                metadata.append(
-                    (
-                        source | (topk_slot << 24),
-                        local_expert,
-                        int(weight_bits[token, topk_slot].item()) & 0xFFFFFFFF,
-                    )
-                )
-    metadata.sort()
-    metadata_sha = hashlib.sha256()
-    for packed_source, local_expert, weight_bits in metadata:
-        metadata_sha.update(
-            struct.pack("<III", packed_source, local_expert, weight_bits)
-        )
-    tiles = sum((count + 31) // 32 for count in expert_count)
-    return {
-        "routes": len(metadata),
-        "tiles": tiles,
-        "expert_count": expert_count,
-        "unique_sources": len(unique_sources),
-        "metadata_sha256": metadata_sha.hexdigest(),
-    }
 
 
 def _check_arbitrary_packed_records(
@@ -350,6 +209,36 @@ def main() -> int:
     )
     parser.add_argument("--stage2-expected-sweep", action="store_true")
     parser.add_argument("--poison-stage2", action="store_true")
+    deferred_stage2 = parser.add_mutually_exclusive_group()
+    deferred_stage2.add_argument("--route-store-stage2", action="store_true")
+    deferred_stage2.add_argument("--rank-local-stage2", action="store_true")
+    parser.add_argument(
+        "--stage2-node-reduce-vec-bytes",
+        type=int,
+        choices=(4, 8, 16),
+        default=8,
+    )
+    parser.add_argument(
+        "--stage2-node-reduce-load-schedule",
+        choices=("interleaved", "load_first"),
+        default="interleaved",
+    )
+    parser.add_argument(
+        "--stage2-node-reduce-work-schedule",
+        choices=("static_strided", "dynamic_head"),
+        default="static_strided",
+    )
+    parser.add_argument(
+        "--stage2-node-reduce-rejoin-blocks",
+        type=int,
+        choices=(0, 8, 16, 32),
+        default=0,
+    )
+    parser.add_argument(
+        "--stage2-rank-epilogue-lds-addressing",
+        choices=("expanded", "dynamic_base"),
+        default="expanded",
+    )
     args = parser.parse_args()
     counts = [int(value) for value in args.counts.split(",") if value]
     hot_ranks = [int(value) for value in args.hot_ranks.split(",") if value]
@@ -363,6 +252,40 @@ def main() -> int:
         raise ValueError("choose either post-EOS rejoin or tile pipeline")
     if args.tile_pipeline_instrument and not args.tile_pipeline:
         raise ValueError("tile-pipeline instrumentation requires --tile-pipeline")
+    if args.stage2_node_reduce_vec_bytes == 16 and not args.rank_local_stage2:
+        parser.error(
+            "16-byte Stage2 node reduction requires --rank-local-stage2"
+        )
+    if args.stage2_node_reduce_rejoin_blocks > 0 and not (
+        args.rank_local_stage2
+        and args.stage2_node_reduce_work_schedule == "dynamic_head"
+    ):
+        parser.error(
+            "Stage2 reducer rejoin requires --rank-local-stage2 and "
+            "--stage2-node-reduce-work-schedule=dynamic_head"
+        )
+    if args.stage2_rank_epilogue_lds_addressing == "dynamic_base" and not (
+        args.rank_local_stage2
+        and args.stage2_node_reduce_vec_bytes == 8
+        and args.stage2_node_reduce_load_schedule == "load_first"
+        and args.stage2_node_reduce_work_schedule == "static_strided"
+        and args.stage2_node_reduce_rejoin_blocks == 0
+    ):
+        parser.error(
+            "dynamic_base LDS addressing requires rank-local vec8/load_first/"
+            "static_strided with rejoin_blocks=0"
+        )
+    if (
+        args.route_store_stage2
+        or args.rank_local_stage2
+        or args.poison_stage2
+    ) and not (
+        args.stage2_expected_sweep
+    ):
+        parser.error(
+            "deferred Stage2 and --poison-stage2 require "
+            "--stage2-expected-sweep"
+        )
     has_gmm1 = args.rejoin or args.tile_pipeline
 
     shape = BenchmarkShape()
@@ -412,6 +335,45 @@ def main() -> int:
         stage1_tile_pipeline_instrument=args.tile_pipeline_instrument,
         stage1_tile_pipeline_fanout_shards=(
             args.tile_pipeline_fanout_shards
+        ),
+        stage2_worker_blocks=(
+            176
+            if args.route_store_stage2 or args.rank_local_stage2
+            else 160
+        ),
+        stage2_node_accumulation_mode=(
+            "rank_local"
+            if args.rank_local_stage2
+            else ("route_store" if args.route_store_stage2 else "direct_atomic")
+        ),
+        stage2_node_reduce_blocks=16,
+        stage2_node_reduce_vec_bytes=args.stage2_node_reduce_vec_bytes,
+        stage2_node_reduce_schedule="token",
+        stage2_node_reduce_load_schedule=(
+            args.stage2_node_reduce_load_schedule
+            if args.rank_local_stage2
+            else "interleaved"
+        ),
+        stage2_node_reduce_work_schedule=(
+            args.stage2_node_reduce_work_schedule
+            if args.rank_local_stage2
+            else "static_strided"
+        ),
+        stage2_node_reduce_rejoin_blocks=(
+            args.stage2_node_reduce_rejoin_blocks
+            if args.rank_local_stage2
+            else 0
+        ),
+        stage2_rank_epilogue_lds_addressing=(
+            args.stage2_rank_epilogue_lds_addressing
+            if args.rank_local_stage2
+            else "expanded"
+        ),
+        stage2_return_chunk_tokens=(
+            16 if args.rank_local_stage2 else 8
+        ),
+        stage2_rail_return_schedule=(
+            "compact" if args.rank_local_stage2 else "lockstep"
         ),
     )
 
@@ -479,7 +441,7 @@ def main() -> int:
         )
         topk_ids_cpu = shared.topk_ids.cpu()
         route_weights_cpu = shared.route_weights.cpu()
-        oracle = _arbitrary_destination_oracle(shape, rank)
+        oracle = _permuted_arbitrary_destination_oracle(shape, rank)
         if oracle["routes"] != 2048 or oracle["unique_sources"] != 768:
             raise AssertionError(
                 "arbitrary fixture must produce 2048 routes over 768 source rows"
@@ -626,14 +588,93 @@ def main() -> int:
                     raise AssertionError("Stage2 local done count mismatch")
                 if stage2_state["node_ready"] != [1] * 128:
                     raise AssertionError("Stage2 local ready coverage mismatch")
+                expected_accumulation_mode = (
+                    "rank_local"
+                    if args.rank_local_stage2
+                    else (
+                        "route_store"
+                        if args.route_store_stage2
+                        else "direct_atomic"
+                    )
+                )
+                if (
+                    stage2_state["node_accumulation_mode"]
+                    != expected_accumulation_mode
+                ):
+                    raise AssertionError("Stage2 accumulation mode mismatch")
+                final_expected = (
+                    128 if args.rank_local_stage2 else 128 * 28
+                )
                 expected_stage2 = {
                     "node_expected_done_mismatch": 0,
                     "node_not_ready": 0,
-                    "final_done": 128 * 28,
-                    "return_groups_ready": 32,
+                    "final_done": final_expected,
+                    "final_expected": final_expected,
+                    "return_groups_ready": (
+                        shape.tokens
+                        // int(operator._stage2.return_chunk_tokens)
+                    ),
                     "return_consumed": generation,
                     "stage2_error_count": 0,
+                    "node_token_done_mismatch": 0,
+                    "node_partial_done_mismatch": 0,
                 }
+                if args.rank_local_stage2:
+                    local_rank = rank % shape.gpus_per_node
+                    active_source_nodes = int(
+                        local_rank < local_routes
+                        or local_rank + shape.gpus_per_node < local_routes
+                    ) + int(
+                        local_rank >= local_routes
+                        or local_rank + shape.gpus_per_node >= local_routes
+                    )
+                    expected_stage2.update(
+                        {
+                            "rank_local_active_tokens": (
+                                active_source_nodes
+                                * shape.gpus_per_node
+                                * shape.tokens
+                            ),
+                            "rank_local_pending_nonzero": 0,
+                            "rank_local_pending_nonzero_all": 0,
+                            "rank_local_ready_missing": 0,
+                            "rank_local_ready_unexpected": 0,
+                            "rank_reduce_queue_expected": (
+                                int(local_routes > 0)
+                                + int(local_routes < shape.topk)
+                            )
+                            * shape.tokens,
+                            "rank_reduce_queue_count": (
+                                int(local_routes > 0)
+                                + int(local_routes < shape.topk)
+                            )
+                            * shape.tokens,
+                            "rank_reduce_queue_tail": (
+                                int(local_routes > 0)
+                                + int(local_routes < shape.topk)
+                            )
+                            * shape.tokens,
+                            "rank_reduce_queue_head": (
+                                (
+                                    int(local_routes > 0)
+                                    + int(local_routes < shape.topk)
+                                )
+                                * shape.tokens
+                                + 16
+                                + args.stage2_node_reduce_rejoin_blocks
+                                if args.stage2_node_reduce_work_schedule
+                                == "dynamic_head"
+                                else 0
+                            ),
+                            "rank_reduce_queue_permutation_mismatch": 0,
+                            "return_groups_ready": (
+                                0
+                                if local_routes == shape.topk
+                                else shape.tokens
+                                // int(operator._stage2.return_chunk_tokens)
+                            ),
+                        }
+                    )
                 for field, value in expected_stage2.items():
                     if stage2_state[field] != value:
                         raise AssertionError(

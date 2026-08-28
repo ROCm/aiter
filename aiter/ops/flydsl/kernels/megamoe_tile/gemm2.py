@@ -184,6 +184,7 @@ def gemm2_compute_v2(
     g2_bhoist=True,
     g2_ascale_pf=True,
     expert_offset=0,
+    preloaded_expert=None,
 ):
     """Run the GEMM2 K-loop and return accumulators for the selected epilogue."""
     # SBM is the sort padding unit; BM is the compute tile and must divide SBM.
@@ -228,13 +229,18 @@ def gemm2_compute_v2(
     # Map each compute block to its SBM-padded expert metadata row.
     m_block_idx = bx_i32 // num_n_blocks
     n_block_idx = bx_i32 - m_block_idx * num_n_blocks
-    eids_ptr = global_typed_ptr(arg_eids, T.i32)
-    if const_expr(SBM == BM):
-        e = rocdl.readfirstlane(T.i32, eids_ptr[m_block_idx])
-        m_row = m_block_idx * BM
+    m_row = m_block_idx * BM
+    if const_expr(preloaded_expert is None):
+        eids_ptr = global_typed_ptr(arg_eids, T.i32)
+        if const_expr(SBM == BM):
+            e = rocdl.readfirstlane(T.i32, eids_ptr[m_block_idx])
+        else:
+            e = rocdl.readfirstlane(T.i32, eids_ptr[m_row // fx.Int32(SBM)])
     else:
-        m_row = m_block_idx * BM
-        e = rocdl.readfirstlane(T.i32, eids_ptr[m_row // fx.Int32(SBM)])
+        # Grouped N tiles share the same M block and therefore the same expert.
+        # Passing the group-prologue value avoids a post-atomic global load whose
+        # dependency otherwise lowers vmcnt to zero before the next MFMA starts.
+        e = fx.Int32(preloaded_expert)
     if const_expr(expert_offset != 0):
         e = e - fx.Int32(expert_offset)
 

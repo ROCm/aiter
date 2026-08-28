@@ -50,6 +50,7 @@ from .stage1_abi import (
     SPARSE_QP_TOKEN_BITS,
     Stage1ArenaLayout,
 )
+from .stage2_abi import STAGE2_TIMELINE_INDEX
 
 
 # K3 production constants.  Keeping them visible makes trace/resource audits
@@ -119,6 +120,7 @@ def compile_megamoe_tile_ep16_stage1(
     tile_pipeline: bool = False,
     tile_pipeline_instrument: bool = False,
     tile_pipeline_fanout_shards: int = 16,
+    timeline_instrument: bool = False,
 ):
     """Compile the fixed K3 EP16 Stage-1 persistent kernel.
 
@@ -238,6 +240,12 @@ def compile_megamoe_tile_ep16_stage1(
             raise ValueError("tile_pipeline requires work_shards=8")
     if tile_pipeline_instrument and not tile_pipeline:
         raise ValueError("tile_pipeline_instrument requires tile_pipeline")
+    if timeline_instrument and (
+        cco_geometry != "sparse_wqe" or not tile_pipeline
+    ):
+        raise ValueError(
+            "timeline_instrument requires the sparse_wqe tile pipeline"
+        )
     if int(tile_pipeline_fanout_shards) not in (8, 12, 16):
         raise ValueError("tile_pipeline_fanout_shards must be 8, 12, or 16")
 
@@ -347,6 +355,7 @@ def compile_megamoe_tile_ep16_stage1(
         + ("_quant2cta" if quant_two_cta_per_token else "")
         + ("_prequant_input" if prequant_input else "")
         + ("_overlapstats" if tile_pipeline_instrument else "")
+        + ("_timeline" if timeline_instrument else "")
         + (
             "_qpstream_intergate"
             if cco_geometry == "sparse_wqe"
@@ -401,6 +410,7 @@ def compile_megamoe_tile_ep16_stage1(
             )
 
         error_addr = arena_ptr + fx.Int64(off("error_count"))
+        timeline_addr = stage2_addr("timeline")
 
         # Arrival tickets, rather than block IDs, ensure every progress role is
         # among the first resident CTAs on an oversubscribed persistent grid.
@@ -417,6 +427,15 @@ def compile_megamoe_tile_ep16_stage1(
         ticket64 = Vec(ticket_view.load())[0]
         ticket = fx.Int32(ticket64 % fx.Int64(worker_blocks))
         is_initializer = ticket == fx.Int32(0)
+        if const_expr(timeline_instrument):
+            if is_initializer & (tx == fx.Int32(0)):
+                comm_ops.store_i64_global_relaxed(
+                    timeline_addr
+                    + fx.Int64(
+                        STAGE2_TIMELINE_INDEX["stage1_entry"] * 8
+                    ),
+                    fx.Int64(comm_ops.read_wall_clock()),
+                )
         transport_enabled = diagnostic_phase in (
             "full",
             "transport_only",
@@ -963,6 +982,20 @@ def compile_megamoe_tile_ep16_stage1(
                             scope="warp",
                             team=TEAM_RAIL,
                         )
+                        if const_expr(timeline_instrument) and const_expr(
+                            stream_qp == 0
+                        ):
+                            if lane == fx.Int32(0):
+                                comm_ops.store_i64_global_relaxed(
+                                    timeline_addr
+                                    + fx.Int64(
+                                        STAGE2_TIMELINE_INDEX[
+                                            "stage1_dispatch_flush_pre"
+                                        ]
+                                        * 8
+                                    ),
+                                    fx.Int64(comm_ops.read_wall_clock()),
+                                )
                         request = flush_async(
                             dev_comm,
                             fx.Int32(stream_qp),
@@ -970,6 +1003,20 @@ def compile_megamoe_tile_ep16_stage1(
                             scope="warp",
                             team=TEAM_RAIL,
                         )
+                        if const_expr(timeline_instrument) and const_expr(
+                            stream_qp == 0
+                        ):
+                            if lane == fx.Int32(0):
+                                comm_ops.store_i64_global_relaxed(
+                                    timeline_addr
+                                    + fx.Int64(
+                                        STAGE2_TIMELINE_INDEX[
+                                            "stage1_dispatch_flush_post"
+                                        ]
+                                        * 8
+                                    ),
+                                    fx.Int64(comm_ops.read_wall_clock()),
+                                )
                         if lane == fx.Int32(0):
                             comm_ops.store_i64_global_system(
                                 local_addr("sparse_remote_request")
@@ -2792,6 +2839,14 @@ def compile_megamoe_tile_ep16_stage1(
                 comm_ops.store_i64_global_system(
                     stage2_addr("stage1_done"), generation
                 )
+                if const_expr(timeline_instrument):
+                    comm_ops.store_i64_global_relaxed(
+                        timeline_addr
+                        + fx.Int64(
+                            STAGE2_TIMELINE_INDEX["stage1_done_publish"] * 8
+                        ),
+                        fx.Int64(comm_ops.read_wall_clock()),
+                    )
 
     @flyc.jit
     def launch_megamoe_tile_ep16_stage1(
@@ -2869,6 +2924,9 @@ def compile_megamoe_tile_ep16_stage1(
     launch_megamoe_tile_ep16_stage1.tile_pipeline = bool(tile_pipeline)
     launch_megamoe_tile_ep16_stage1.tile_pipeline_instrument = bool(
         tile_pipeline_instrument
+    )
+    launch_megamoe_tile_ep16_stage1.timeline_instrument = bool(
+        timeline_instrument
     )
     launch_megamoe_tile_ep16_stage1.tile_pipeline_fanout_shards = int(
         split_fanout_shards

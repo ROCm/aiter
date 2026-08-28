@@ -20,6 +20,11 @@ import json
 import torch
 import torch.distributed as dist
 
+from aiter.ops.flydsl.kernels.megamoe_tile.markers import (
+    profiler_pause,
+    profiler_resume,
+    roctx_range,
+)
 from op_tests.multigpu_tests.bench_megamoe_tile_ep16_comm_only import (
     FusedCommunicationProbePath,
     _lightweight_shared_inputs,
@@ -229,12 +234,19 @@ def _run_path(path, device, *, warmup: int, iterations: int):
             cleanup()
 
     local_samples: list[IterationTiming] = []
-    for _ in range(iterations):
+    for iteration in range(iterations):
         torch.cuda.synchronize(device)
         dist.barrier()
         timer.begin_iteration()
-        path.run_iteration(timer)
-        local_samples.append(timer.finish_iteration())
+        profiler_resume()
+        try:
+            with roctx_range(
+                f"MEGAMOE_STAGE1_SMALL_OP_AB_TIMED_{iteration}_{path.name}"
+            ):
+                path.run_iteration(timer)
+                local_samples.append(timer.finish_iteration())
+        finally:
+            profiler_pause()
         cleanup = getattr(path, "after_iteration", None)
         if cleanup is not None:
             cleanup()
@@ -277,7 +289,23 @@ def _run_interleaved(paths, device, *, warmup: int, iterations: int):
     for iteration in range(iterations):
         order = paths if iteration % 2 == 0 else tuple(reversed(paths))
         for path in order:
-            local_samples[path.name].append(one(path))
+            torch.cuda.synchronize(device)
+            dist.barrier()
+            timer = timers[path.name]
+            timer.begin_iteration()
+            profiler_resume()
+            try:
+                with roctx_range(
+                    f"MEGAMOE_STAGE1_SMALL_OP_AB_TIMED_{iteration}_{path.name}"
+                ):
+                    path.run_iteration(timer)
+                    sample = timer.finish_iteration()
+            finally:
+                profiler_pause()
+            local_samples[path.name].append(sample)
+            cleanup = getattr(path, "after_iteration", None)
+            if cleanup is not None:
+                cleanup()
 
     return {
         path.name: (
@@ -380,6 +408,10 @@ def main() -> int:
         print("MEGAMOE_STAGE1_SMALL_OP_AB_PLAN " + json.dumps(contract, sort_keys=True))
         return 0
 
+    # When requested, exclude distributed setup, JIT, prime, warmup and result
+    # collection from rocprof.  The timed loops resume/pause collection and
+    # publish one named ROCTX range per path and iteration.
+    profiler_pause()
     rank, world, _local_rank, device = _setup_dist(needs_mori=True)
     if world != shape.ep_size:
         raise ValueError(f"Stage1 A/B requires world=16, got {world}")

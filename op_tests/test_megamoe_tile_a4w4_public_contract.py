@@ -10,8 +10,14 @@ import textwrap
 import pytest
 
 from aiter.ops.flydsl.kernels.megamoe_tile.mega_moe_tile_a4w4 import MegaMoETileA4W4
+from aiter.ops.flydsl.kernels.megamoe_tile.stage2 import (
+    compile_megamoe_tile_ep16_stage2_a4w4,
+)
 from aiter.ops.flydsl.kernels.megamoe_tile.stage1_abi import Stage1ArenaLayout, TwoKernelArenaLayout
 from aiter.ops.flydsl.kernels.megamoe_tile.stage2_abi import Stage2ArenaLayout
+from op_tests.multigpu_tests.bench_megamoe_tile_ep16_two_kernel import (
+    MoriFusedMoeBaselinePath,
+)
 
 
 def test_public_constructor_and_forward_match_megamoe_v2_names():
@@ -72,6 +78,33 @@ def test_forward_source_has_exactly_two_launcher_calls_in_order():
     assert forbidden == []
 
 
+def test_full_baseline_uses_production_mori_fused_moe_chain():
+    source = textwrap.dedent(inspect.getsource(MoriFusedMoeBaselinePath._forward))
+    tree = ast.parse(source)
+    calls = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        function = node.func
+        if isinstance(function, ast.Attribute) and function.attr in (
+            "dispatch",
+            "_fused_moe",
+            "combine",
+        ):
+            calls.append((node.lineno, function.attr))
+    assert [name for _, name in sorted(calls)] == [
+        "dispatch",
+        "_fused_moe",
+        "combine",
+    ]
+    assert "self._quant_op(" in source
+    assert "self._quant_q" in source
+    assert "self._quant_scale" in source
+    assert "a1_scale=recv_scales" in source
+    assert "_prepare_local_a4w4" not in source
+    assert "per_1x32_f4_quant" not in source
+
+
 def test_composite_arena_is_one_aligned_nonoverlapping_window():
     stage1 = Stage1ArenaLayout.create()
     stage2 = Stage2ArenaLayout.create()
@@ -118,3 +151,25 @@ def test_public_sparse_transport_selects_split_stage1_without_changing_stage2():
     stage2_source = inspect.getsource(MegaMoETileA4W4._compile_stage2)
     assert "WORK_SHARDS=8" in stage2_source
     assert "rank=self.rank" in stage2_source
+    assert 'accumulator_dtype="bf16"' in stage2_source
+    assert "final_combine_blocks=14" in stage2_source
+    assert 'gmm_schedule="persistent_queue"' in stage2_source
+    assert '"stage2_return_chunk_tokens", 8' in stage2_source
+    assert 'bf16_atomic_kind="buffer"' in stage2_source
+    assert '"stage2_rail_return_schedule", "lockstep"' in stage2_source
+    assert 'epilogue_schedule="lane32_meta"' in stage2_source
+    assert "n_tile_group=2" in stage2_source
+    assert 'group_pipeline_schedule="a_double_buffer"' in stage2_source
+
+    stage2_parameters = inspect.signature(
+        compile_megamoe_tile_ep16_stage2_a4w4
+    ).parameters
+    assert stage2_parameters["accumulator_dtype"].default == "bf16"
+    assert stage2_parameters["return_chunk_tokens"].default == 8
+    assert stage2_parameters["rail_return_schedule"].default == "lockstep"
+    assert stage2_parameters["epilogue_schedule"].default == "lane32_meta"
+    assert stage2_parameters["n_tile_group"].default == 2
+    assert (
+        stage2_parameters["group_pipeline_schedule"].default
+        == "a_double_buffer"
+    )

@@ -26,6 +26,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--worker-blocks", type=int, default=160)
+    parser.add_argument(
+        "--staged-ring",
+        action="store_true",
+        help="build Stage-1 against the staged_ring Stage-2 arena layout",
+    )
     args = parser.parse_args()
 
     # Preserve full MLIR/LLVM/HSACO generation and replace only the final HIP
@@ -33,7 +38,10 @@ def main():
     jfmod._build_call_state = lambda *unused_args, **unused_kwargs: _NoLaunch()
 
     s1 = Stage1ArenaLayout.create()
-    s2 = Stage2ArenaLayout.create()
+    s2 = Stage2ArenaLayout.create(
+        include_rank_partials=args.staged_ring,
+        include_staged_ring=args.staged_ring,
+    )
     combo = TwoKernelArenaLayout.compose(s1, s2)
     stage1 = compile_megamoe_tile_ep16_stage1(
         s1,

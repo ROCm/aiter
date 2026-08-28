@@ -225,6 +225,7 @@ def _zero_gemm2_compute_v2(
     g2_bhoist=True,
     g2_ascale_pf=True,
     expert_offset=0,
+    preloaded_expert=None,
 ):
     """Return the production accumulator geometry without a GEMM2 K-loop."""
 
@@ -311,6 +312,16 @@ class MegaMoETileA4W4CommProbe(MegaMoETileA4W4):
         stage1_phase: str = "full",
         stage2_mode: str = "full",
         stage2_worker_blocks: int = 160,
+        stage2_node_accumulation_mode: str = "direct_atomic",
+        stage2_node_reduce_blocks: int = 16,
+        stage2_node_reduce_vec_bytes: int = 8,
+        stage2_node_reduce_schedule: str = "token",
+        stage2_node_reduce_load_schedule: str = "interleaved",
+        stage2_node_reduce_work_schedule: str = "static_strided",
+        stage2_node_reduce_rejoin_blocks: int = 0,
+        stage2_rank_epilogue_lds_addressing: str = "expanded",
+        stage2_return_chunk_tokens: int = 8,
+        stage2_rail_return_schedule: str = "lockstep",
         **kwargs,
     ):
         if probe_stage not in ("stage1", "stage2", "both"):
@@ -411,10 +422,157 @@ class MegaMoETileA4W4CommProbe(MegaMoETileA4W4):
         self.stage1_phase = stage1_phase
         self.stage2_mode = stage2_mode
         self.stage2_worker_blocks = int(stage2_worker_blocks)
-        if not 8 <= self.stage2_worker_blocks <= 160:
-            raise ValueError("stage2_worker_blocks must be in [8, 160]")
-        if stage2_mode == "atomic_only" and self.stage2_worker_blocks <= 8:
-            raise ValueError("atomic_only requires at least one compute CTA")
+        self.stage2_node_accumulation_mode = str(
+            stage2_node_accumulation_mode
+        )
+        if self.stage2_node_accumulation_mode == "route_store":
+            self.stage2_contains = (
+                "route_slot_store+register_reduce+done_ready+"
+                "rail_return+final_combine"
+            )
+        elif self.stage2_node_accumulation_mode == "rank_local":
+            self.stage2_contains = (
+                "rank_local_accumulate+node_forward+register_reduce+"
+                "done_ready+rail_return+final_combine"
+            )
+        self.stage2_node_reduce_blocks = int(stage2_node_reduce_blocks)
+        self.stage2_node_reduce_vec_bytes = int(stage2_node_reduce_vec_bytes)
+        self.stage2_node_reduce_schedule = str(stage2_node_reduce_schedule)
+        self.stage2_node_reduce_load_schedule = str(
+            stage2_node_reduce_load_schedule
+        )
+        self.stage2_node_reduce_work_schedule = str(
+            stage2_node_reduce_work_schedule
+        )
+        self.stage2_node_reduce_rejoin_blocks = int(
+            stage2_node_reduce_rejoin_blocks
+        )
+        self.stage2_rank_epilogue_lds_addressing = str(
+            stage2_rank_epilogue_lds_addressing
+        )
+        self.stage2_return_chunk_tokens = int(stage2_return_chunk_tokens)
+        self.stage2_rail_return_schedule = str(stage2_rail_return_schedule)
+        if self.stage2_node_accumulation_mode not in (
+            "direct_atomic",
+            "route_store",
+            "rank_local",
+        ):
+            raise ValueError("invalid Stage2 node accumulation mode")
+        if self.stage2_node_reduce_blocks not in (8, 16, 32, 56):
+            raise ValueError("stage2_node_reduce_blocks must be one of 8,16,32,56")
+        if self.stage2_node_reduce_vec_bytes not in (4, 8, 16):
+            raise ValueError(
+                "stage2_node_reduce_vec_bytes must be 4, 8, or 16"
+            )
+        if (
+            self.stage2_node_reduce_vec_bytes == 16
+            and self.stage2_node_accumulation_mode != "rank_local"
+        ):
+            raise ValueError(
+                "16-byte node reduction requires rank_local accumulation"
+            )
+        if self.stage2_node_reduce_load_schedule not in (
+            "interleaved",
+            "load_first",
+        ):
+            raise ValueError("invalid Stage2 node-reduce load schedule")
+        if self.stage2_node_reduce_work_schedule not in (
+            "static_strided",
+            "dynamic_head",
+        ):
+            raise ValueError("invalid Stage2 node-reduce work schedule")
+        if self.stage2_node_reduce_rejoin_blocks not in (0, 8, 16, 32):
+            raise ValueError(
+                "stage2_node_reduce_rejoin_blocks must be one of 0,8,16,32"
+            )
+        if self.stage2_rank_epilogue_lds_addressing not in (
+            "expanded",
+            "dynamic_base",
+        ):
+            raise ValueError(
+                "stage2_rank_epilogue_lds_addressing must be expanded or dynamic_base"
+            )
+        if self.stage2_rank_epilogue_lds_addressing == "dynamic_base" and not (
+            self.stage2_node_accumulation_mode == "rank_local"
+            and self.stage2_node_reduce_vec_bytes == 8
+            and self.stage2_node_reduce_load_schedule == "load_first"
+            and self.stage2_node_reduce_work_schedule == "static_strided"
+            and self.stage2_node_reduce_rejoin_blocks == 0
+        ):
+            raise ValueError(
+                "dynamic_base LDS addressing requires rank_local, vec8, "
+                "load_first, static_strided reduction, and rejoin_blocks=0"
+            )
+        if self.stage2_return_chunk_tokens not in (4, 8, 16):
+            raise ValueError("stage2_return_chunk_tokens must be 4, 8, or 16")
+        if self.stage2_rail_return_schedule not in (
+            "lockstep",
+            "qp_independent",
+            "qp_prepost",
+            "compact",
+        ):
+            raise ValueError("invalid Stage2 RAIL return schedule")
+        if (
+            self.stage2_rail_return_schedule != "lockstep"
+            and self.stage2_return_chunk_tokens <= 4
+        ):
+            raise ValueError(
+                "independent Stage2 RAIL schedules require chunks larger than 4"
+            )
+        if self.stage2_rail_return_schedule == "compact" and (
+            self.stage2_node_accumulation_mode != "rank_local"
+        ):
+            raise ValueError("compact Stage2 RAIL return requires rank_local")
+        if self.stage2_node_reduce_rejoin_blocks > 0 and not (
+            self.stage2_node_accumulation_mode == "rank_local"
+            and self.stage2_rail_return_schedule == "compact"
+            and self.stage2_node_reduce_work_schedule == "dynamic_head"
+            and self.stage2_mode in ("full", "atomic_only")
+        ):
+            raise ValueError(
+                "Stage2 reducer rejoin requires a queue-producing rank_local "
+                "compact dynamic_head mode"
+            )
+        gmm_cta_count = self.stage2_worker_blocks - (
+            1 + self.stage2_node_reduce_blocks + 14
+        )
+        if (
+            self.stage2_node_reduce_rejoin_blocks > 0
+            and self.stage2_node_reduce_rejoin_blocks > gmm_cta_count
+        ):
+            raise ValueError(
+                "stage2_node_reduce_rejoin_blocks exceeds the available "
+                f"GMM2 CTA count ({gmm_cta_count})"
+            )
+        reduce_role_blocks = (
+            self.stage2_node_reduce_blocks
+            if self.stage2_node_accumulation_mode
+            in ("route_store", "rank_local")
+            else 0
+        )
+        min_stage2_worker_blocks = (
+            1
+            + reduce_role_blocks
+            + 14
+            + (0 if stage2_mode == "return_only" else 1)
+        )
+        max_stage2_worker_blocks = (
+            160 + self.stage2_node_reduce_blocks
+            if self.stage2_node_accumulation_mode
+            in ("route_store", "rank_local")
+            else 160
+        )
+        if not (
+            min_stage2_worker_blocks
+            <= self.stage2_worker_blocks
+            <= max_stage2_worker_blocks
+        ):
+            raise ValueError(
+                "stage2_worker_blocks must be in "
+                f"[{min_stage2_worker_blocks}, "
+                f"{max_stage2_worker_blocks}] for "
+                f"{self.stage2_node_accumulation_mode}/{stage2_mode}"
+            )
         super().__init__(*args, **kwargs)
 
     def _validate_weight_capacity(self, w1, w1_scale, w2, w2_scale) -> None:
@@ -610,11 +768,44 @@ class MegaMoETileA4W4CommProbe(MegaMoETileA4W4):
                 waves_per_eu_hint=2,
                 team="rail",
                 diagnostic_mode=self.stage2_mode,
+                accumulator_dtype="bf16",
+                final_combine_blocks=14,
+                gmm_schedule="persistent_queue",
+                return_chunk_tokens=self.stage2_return_chunk_tokens,
+                bf16_atomic_kind="buffer",
+                rail_return_schedule=self.stage2_rail_return_schedule,
+                epilogue_schedule="lane32_meta",
+                n_tile_group=2,
+                group_pipeline_schedule="a_double_buffer",
+                node_accumulation_mode=self.stage2_node_accumulation_mode,
+                node_reduce_blocks=self.stage2_node_reduce_blocks,
+                node_reduce_vec_bytes=self.stage2_node_reduce_vec_bytes,
+                node_reduce_schedule=self.stage2_node_reduce_schedule,
+                node_reduce_load_schedule=(
+                    self.stage2_node_reduce_load_schedule
+                ),
+                node_reduce_work_schedule=(
+                    self.stage2_node_reduce_work_schedule
+                ),
+                node_reduce_rejoin_blocks=(
+                    self.stage2_node_reduce_rejoin_blocks
+                ),
+                rank_epilogue_lds_addressing=(
+                    self.stage2_rank_epilogue_lds_addressing
+                ),
             )
         launcher.kernel_name = f"{launcher.kernel_name}_{suffix}"
         launcher.comm_probe = self.stage2_contains
         launcher.gemm2_contraction = False
-        launcher.preserves_direct_lsa_atomic_epilogue = True
+        launcher.preserves_direct_lsa_atomic_epilogue = (
+            self.stage2_node_accumulation_mode == "direct_atomic"
+        )
+        launcher.preserves_route_store_register_reduce = (
+            self.stage2_node_accumulation_mode == "route_store"
+        )
+        launcher.preserves_rank_local_register_reduce = (
+            self.stage2_node_accumulation_mode == "rank_local"
+        )
         return launcher
 
     def _compile_stage1(self):
@@ -818,6 +1009,128 @@ class MegaMoETileA4W4CommProbe(MegaMoETileA4W4):
             stream=stream,
         )
 
+    def _debug_rank_local_completion(
+        self,
+        *,
+        generation: int,
+        s1_ptr,
+        s2_ptr,
+    ) -> dict[str, int]:
+        """Summarize the logical rank-local completion words for one epoch."""
+
+        if not self.stage2_layout.include_rank_partials:
+            return {
+                "rank_local_active_tokens": 0,
+                "rank_local_pending_nonzero": 0,
+                "rank_local_pending_nonzero_all": 0,
+                "rank_local_ready_missing": 0,
+                "rank_local_ready_unexpected": 0,
+                "rank_reduce_queue_expected": 0,
+                "rank_reduce_queue_count": 0,
+                "rank_reduce_queue_tail": 0,
+                "rank_reduce_queue_head": 0,
+                "rank_reduce_queue_permutation_mismatch": 0,
+            }
+
+        from aiter.ops.flydsl.kernels.megamoe_tile.cco import (
+            read_window_u32,
+            read_window_u64,
+        )
+
+        source_capacity = self.world_size * self.mtpr
+        num_valid = int(read_window_u32(s1_ptr("num_valid"), 1)[0])
+        packed_sources = read_window_u32(
+            s1_ptr("tile_row_source"), num_valid
+        )
+        active_sources = {
+            int(packed) & 0x00FFFFFF
+            for packed in packed_sources
+            if (int(packed) & 0x00FFFFFF) < source_capacity
+        }
+        pending_raw = read_window_u32(
+            s2_ptr("rank_token_pending"), source_capacity * 16
+        )
+        pending = [
+            int(pending_raw[index * 16]) for index in range(source_capacity)
+        ]
+        ready = [
+            int(value)
+            for value in read_window_u64(
+                s2_ptr("rank_token_ready"), source_capacity
+            )
+        ]
+        token_items = 2 * self.mtpr
+        dest_masks = [
+            int(value) & 0xFF
+            for value in read_window_u32(
+                s2_ptr("node_dest_rank_mask"), token_items
+            )
+        ]
+        compact = self.stage2_rail_return_schedule == "compact"
+        expected_queue = (
+            [index for index, mask in enumerate(dest_masks) if mask != 0]
+            if compact
+            else list(range(token_items))
+        )
+        queue_tail = int(
+            read_window_u32(s2_ptr("rank_reduce_queue_tail"), 1)[0]
+        )
+        queue_head = (
+            int(read_window_u32(s2_ptr("rank_reduce_queue_head"), 1)[0])
+            if getattr(
+                self,
+                "stage2_node_reduce_work_schedule",
+                "static_strided",
+            )
+            == "dynamic_head"
+            else 0
+        )
+        queue_read_count = min(max(queue_tail, 0), token_items)
+        queue_jobs = [
+            int(value)
+            for value in read_window_u32(
+                s2_ptr("rank_reduce_queue"), queue_read_count
+            )
+        ]
+        queue_count = (
+            int(read_window_u32(s2_ptr("rank_return_count"), 3)[2])
+            if compact
+            else token_items
+        )
+        queue_mismatch = (
+            int(queue_tail != len(expected_queue))
+            + int(queue_count != len(expected_queue))
+            + abs(len(queue_jobs) - len(expected_queue))
+            + sum(
+                int(actual != expected)
+                for actual, expected in zip(
+                    sorted(queue_jobs), expected_queue
+                )
+            )
+        )
+        return {
+            "rank_local_active_tokens": len(active_sources),
+            "rank_local_pending_nonzero": sum(
+                int(pending[source] != 0) for source in active_sources
+            ),
+            "rank_local_pending_nonzero_all": sum(
+                int(value != 0) for value in pending
+            ),
+            "rank_local_ready_missing": sum(
+                int(ready[source] < generation) for source in active_sources
+            ),
+            "rank_local_ready_unexpected": sum(
+                int(value >= generation)
+                for source, value in enumerate(ready)
+                if source not in active_sources
+            ),
+            "rank_reduce_queue_expected": len(expected_queue),
+            "rank_reduce_queue_count": queue_count,
+            "rank_reduce_queue_tail": queue_tail,
+            "rank_reduce_queue_head": queue_head,
+            "rank_reduce_queue_permutation_mismatch": queue_mismatch,
+        }
+
     def debug_direct_tile_snapshot(self) -> dict[str, object]:
         """Read only protocol counters; never copy/hash H1 payload buffers."""
 
@@ -904,8 +1217,44 @@ class MegaMoETileA4W4CommProbe(MegaMoETileA4W4):
             read_window_u32(s2_ptr("node_expected"), scoreboard_size)
         )
         done_all = list(read_window_u32(s2_ptr("node_done"), scoreboard_size))
-        ready_all = list(
-            read_window_u64(s2_ptr("node_tile_ready"), scoreboard_size)
+        token_items = 2 * self.mtpr
+        token_done_raw = list(
+            read_window_u32(s2_ptr("node_token_done"), token_items * 16)
+        )
+        token_done_all = [
+            int(token_done_raw[index * 16]) for index in range(token_items)
+        ]
+        partial_done_all = (
+            [
+                int(value)
+                for index, value in enumerate(
+                    read_window_u32(
+                        s2_ptr("node_partial_done"), token_items * 16
+                    )
+                )
+                if index % 16 == 0
+            ]
+            if (
+                self.stage2_layout.include_route_slots
+                or self.stage2_layout.include_rank_partials
+            )
+            and self.stage2_node_reduce_schedule == "tile"
+            else token_done_all
+        )
+        token_ready_all = list(
+            read_window_u64(s2_ptr("node_token_ready"), token_items)
+        )
+        node_ready_all = (
+            list(read_window_u64(s2_ptr("node_partial_ready"), token_items))
+            if self.stage2_node_accumulation_mode
+            in ("route_store", "rank_local")
+            else token_ready_all
+        )
+        rank_local = self.stage2_node_accumulation_mode == "rank_local"
+        rank_local_state = self._debug_rank_local_completion(
+            generation=generation,
+            s1_ptr=s1_ptr,
+            s2_ptr=s2_ptr,
         )
         local_base = self.node * self.mtpr * ntiles
         expected = []
@@ -915,10 +1264,13 @@ class MegaMoETileA4W4CommProbe(MegaMoETileA4W4):
             start = local_base + token * ntiles
             end = start + ntiles
             expected.append(min(expected_all[start:end]))
-            done.append(min(done_all[start:end]))
-            ready.append(
-                int(all(int(value) >= generation for value in ready_all[start:end]))
+            done.append(
+                min(expected_all[start:end])
+                if rank_local
+                else min(done_all[start:end])
             )
+            token_index = self.node * self.mtpr + token
+            ready.append(int(node_ready_all[token_index] >= generation))
 
         return {
             "comm_role_eos": [int(value) for value in comm_eos],
@@ -930,6 +1282,21 @@ class MegaMoETileA4W4CommProbe(MegaMoETileA4W4):
             "node_atomic_expected": expected,
             "node_atomic_done": done,
             "node_atomic_ready": ready,
+            "node_ready_granularity": "token",
+            "node_token_done_mismatch": (
+                sum(int(value != ntiles) for value in token_done_all)
+                if not rank_local
+                else 0
+            ),
+            "node_partial_done_mismatch": (
+                sum(int(value != ntiles) for value in partial_done_all)
+                if not rank_local
+                else 0
+            ),
+            "node_expected_uniform_mismatch": sum(
+                int(len(set(expected_all[start : start + ntiles])) != 1)
+                for start in range(0, scoreboard_size, ntiles)
+            ),
             "protocol_error_count": [stage1_errors + stage2_errors],
             "generation": generation,
             "stage1_done": int(read_window_u64(s2_ptr("stage1_done"), 1)[0]),
@@ -962,16 +1329,23 @@ class MegaMoETileA4W4CommProbe(MegaMoETileA4W4):
                 )[0]
             ),
             "expert_count_sum": sum(int(value) for value in expert_count),
-            "node_expected_done_mismatch": sum(
-                int(int(lhs) != int(rhs))
-                for lhs, rhs in zip(expected_all, done_all)
+            "node_expected_done_mismatch": (
+                sum(
+                    int(int(lhs) != int(rhs))
+                    for lhs, rhs in zip(expected_all, done_all)
+                )
+                if not rank_local
+                else 0
             ),
             "node_not_ready": sum(
-                int(int(value) < generation) for value in ready_all
+                int(int(value) < generation) for value in node_ready_all
             ),
             "stage1_error_count": stage1_errors,
             "stage2_error_count": stage2_errors,
+            "node_accumulation_mode": self.stage2_node_accumulation_mode,
+            **rank_local_state,
             "final_done": final_done,
+            "final_expected": self.mtpr if rank_local else self.mtpr * ntiles,
             "return_groups_ready": sum(
                 int(int(value) >= generation) for value in return_ready
             ),
@@ -1216,7 +1590,10 @@ class MegaMoETileA4W4CommProbe(MegaMoETileA4W4):
             raise RuntimeError("CCO runtime is closed")
         import hashlib
 
-        from aiter.ops.flydsl.kernels.megamoe_tile.cco import read_window_bytes
+        from aiter.ops.flydsl.kernels.megamoe_tile.cco import (
+            read_window_bytes,
+            read_window_u32,
+        )
 
         generation = int(self._generation)
         parity = generation & 1
@@ -1295,31 +1672,41 @@ class MegaMoETileA4W4CommProbe(MegaMoETileA4W4):
                 ptr("return_group_ready"), self.stage2_layout.return_groups
             )
         )
-        scoreboard_items = 2 * self.mtpr * (self.model_dim // 256)
+        token_items = 2 * self.mtpr
         node_ready = list(
-            read_window_u64(ptr("node_tile_ready"), scoreboard_items)
+            read_window_u64(ptr("node_token_ready"), token_items)
         )
-        node_done = list(read_window_u32(ptr("node_done"), scoreboard_items))
+        token_done_raw = list(
+            read_window_u32(ptr("node_token_done"), token_items * 16)
+        )
+        node_done_expected_count = sum(
+            int(int(token_done_raw[index * 16]) == self.model_dim // 256)
+            for index in range(token_items)
+        )
         return {
             "generation": generation,
             "final_done": int(
                 read_window_u32(ptr("final_done", parity_indexed=False), 1)[0]
             ),
-            "final_expected": self.mtpr * (self.model_dim // 256),
+            "final_expected": (
+                self.mtpr
+                if self.stage2_node_accumulation_mode == "rank_local"
+                else self.mtpr * (self.model_dim // 256)
+            ),
             "return_groups_ready": sum(
                 int(int(value) >= generation) for value in return_ready
             ),
-            "return_groups_expected": self.stage2_layout.return_groups,
+            "return_groups_expected": (
+                self.mtpr // int(self._stage2.return_chunk_tokens)
+            ),
             "return_consumed": int(
                 read_window_u64(ptr("return_consumed"), 1)[0]
             ),
             "node_ready_count": sum(
                 int(int(value) >= generation) for value in node_ready
             ),
-            "node_ready_expected": scoreboard_items,
-            "node_done_expected_count": sum(
-                int(int(value) == self.gpus_per_node) for value in node_done
-            ),
+            "node_ready_expected": token_items,
+            "node_done_expected_count": node_done_expected_count,
             "stage2_error_count": int(
                 read_window_u32(
                     ptr("stage2_error_count", parity_indexed=False), 1
@@ -1336,9 +1723,15 @@ class MegaMoETileA4W4CommProbe(MegaMoETileA4W4):
 
         generation = int(self._generation)
         parity = generation & 1
-        base = (
-            int(self._runtime.window.local_ptr) + int(self.layout.stage2_offset)
-        )
+        arena_base = int(self._runtime.window.local_ptr)
+        base = arena_base + int(self.layout.stage2_offset)
+
+        def s1_ptr(name: str, *, parity_indexed: bool = True) -> int:
+            return arena_base + int(
+                self.stage1_layout.offset(
+                    name, parity=parity if parity_indexed else None
+                )
+            )
 
         def ptr(name: str, *, parity_indexed: bool = True) -> int:
             return base + int(
@@ -1353,8 +1746,56 @@ class MegaMoETileA4W4CommProbe(MegaMoETileA4W4):
             read_window_u32(ptr("node_expected"), scoreboard_items)
         )
         done_all = list(read_window_u32(ptr("node_done"), scoreboard_items))
-        ready_all = list(
-            read_window_u64(ptr("node_tile_ready"), scoreboard_items)
+        token_items = 2 * self.mtpr
+        token_done_raw = list(
+            read_window_u32(ptr("node_token_done"), token_items * 16)
+        )
+        token_done_all = [
+            int(token_done_raw[index * 16]) for index in range(token_items)
+        ]
+        token_ready_all = list(
+            read_window_u64(ptr("node_token_ready"), token_items)
+        )
+        partial_done_all = (
+            [
+                int(value)
+                for index, value in enumerate(
+                    read_window_u32(
+                        ptr("node_partial_done"), token_items * 16
+                    )
+                )
+                if index % 16 == 0
+            ]
+            if (
+                self.stage2_layout.include_route_slots
+                or self.stage2_layout.include_rank_partials
+            )
+            and self.stage2_node_reduce_schedule == "tile"
+            else token_done_all
+        )
+        partial_ready_all = (
+            list(read_window_u64(ptr("node_partial_ready"), token_items))
+            if (
+                self.stage2_layout.include_route_slots
+                or self.stage2_layout.include_rank_partials
+            )
+            else token_ready_all
+        )
+        rank_local = self.stage2_node_accumulation_mode == "rank_local"
+        dest_masks = (
+            [
+                int(value) & 0xFF
+                for value in read_window_u32(
+                    ptr("node_dest_rank_mask"), token_items
+                )
+            ]
+            if rank_local
+            else [1] * token_items
+        )
+        rank_local_state = self._debug_rank_local_completion(
+            generation=generation,
+            s1_ptr=s1_ptr,
+            s2_ptr=ptr,
         )
         local_base = self.node * self.mtpr * hidden_tiles
         expected = []
@@ -1365,11 +1806,18 @@ class MegaMoETileA4W4CommProbe(MegaMoETileA4W4):
             end = start + hidden_tiles
             expected_slice = expected_all[start:end]
             done_slice = done_all[start:end]
-            ready_slice = ready_all[start:end]
             expected.append(min(int(value) for value in expected_slice))
-            done.append(min(int(value) for value in done_slice))
+            done.append(
+                min(int(value) for value in expected_slice)
+                if rank_local
+                else min(int(value) for value in done_slice)
+            )
+            token_index = self.node * self.mtpr + token
             ready.append(
-                int(all(int(value) >= generation for value in ready_slice))
+                int(
+                    dest_masks[token_index] == 0
+                    or partial_ready_all[token_index] >= generation
+                )
             )
         return_ready = list(
             read_window_u64(
@@ -1381,21 +1829,58 @@ class MegaMoETileA4W4CommProbe(MegaMoETileA4W4):
             "node_expected": expected,
             "node_done": done,
             "node_ready": ready,
-            "node_expected_done_mismatch": sum(
-                int(int(want) != int(got))
-                for want, got in zip(expected_all, done_all)
+            "node_ready_granularity": "token",
+            "node_token_done_mismatch": (
+                sum(int(value != hidden_tiles) for value in token_done_all)
+                if not rank_local
+                else 0
+            ),
+            "node_partial_done_mismatch": (
+                sum(int(value != hidden_tiles) for value in partial_done_all)
+                if not rank_local
+                else 0
+            ),
+            "node_expected_done_mismatch": (
+                sum(
+                    int(int(want) != int(got))
+                    for want, got in zip(expected_all, done_all)
+                )
+                if not rank_local
+                else 0
             ),
             "node_not_ready": sum(
-                int(int(value) < generation) for value in ready_all
+                int(mask != 0 and int(value) < generation)
+                for mask, value in zip(dest_masks, partial_ready_all)
             ),
+            "node_route_store_not_ready": (
+                sum(int(int(value) < generation) for value in token_ready_all)
+                if not rank_local
+                else 0
+            ),
+            "node_accumulation_mode": self.stage2_node_accumulation_mode,
+            **rank_local_state,
             "final_done": int(
                 read_window_u32(ptr("final_done", parity_indexed=False), 1)[0]
             ),
-            "final_expected": self.mtpr * hidden_tiles,
+            "final_expected": (
+                self.mtpr
+                if self.stage2_node_accumulation_mode == "rank_local"
+                else self.mtpr * hidden_tiles
+            ),
             "return_groups_ready": sum(
                 int(int(value) >= generation) for value in return_ready
             ),
-            "return_groups_expected": self.stage2_layout.return_groups,
+            "return_groups_expected": (
+                (
+                    int(read_window_u32(ptr("rank_return_count"), 2)[1])
+                    + int(self._stage2.return_chunk_tokens)
+                    - 1
+                )
+                // int(self._stage2.return_chunk_tokens)
+                if rank_local
+                and self.stage2_rail_return_schedule == "compact"
+                else self.mtpr // int(self._stage2.return_chunk_tokens)
+            ),
             "return_consumed": int(
                 read_window_u64(ptr("return_consumed"), 1)[0]
             ),
@@ -1432,16 +1917,67 @@ class MegaMoETileA4W4CommProbe(MegaMoETileA4W4):
         for name, byte in (
             ("node_accumulator", 0x3F),
             ("node_done", 0x7F),
+            ("node_token_done", 0x7F),
             ("remote_node_tx", 0x3F),
             ("remote_partial_rx", 0x3F),
         ):
             address, nbytes = region_ptr(name)
             fill_window_bytes(address, nbytes, byte)
-        ready_address, ready_nbytes = region_ptr("node_tile_ready")
         old_generation = max(0, generation - 2)
-        write_window_u64(
-            ready_address, [old_generation] * (ready_nbytes // 8)
+        token_ready_address, token_ready_nbytes = region_ptr(
+            "node_token_ready"
         )
+        write_window_u64(
+            token_ready_address,
+            [old_generation] * (token_ready_nbytes // 8),
+        )
+        if (
+            self.stage2_layout.include_route_slots
+            or self.stage2_layout.include_rank_partials
+        ):
+            partial_done_address, partial_done_nbytes = region_ptr(
+                "node_partial_done"
+            )
+            fill_window_bytes(
+                partial_done_address, partial_done_nbytes, 0x7F
+            )
+            partial_ready_address, partial_ready_nbytes = region_ptr(
+                "node_partial_ready"
+            )
+            write_window_u64(
+                partial_ready_address,
+                [old_generation] * (partial_ready_nbytes // 8),
+            )
+        if self.stage2_layout.include_route_slots:
+            route_slots_address, route_slots_nbytes = region_ptr("route_slots")
+            fill_window_bytes(route_slots_address, route_slots_nbytes, 0x3F)
+        if self.stage2_layout.include_rank_partials:
+            for name, byte in (
+                ("rank_accumulator", 0x3F),
+                ("rank_token_pending", 0x7F),
+                ("rank_return_tx_slot", 0x7F),
+                ("rank_return_rx_slot", 0x7F),
+                ("rank_return_count", 0x7F),
+                ("rank_reduce_queue", 0x7F),
+                ("rank_reduce_queue_tail", 0x7F),
+                ("rank_reduce_queue_head", 0x7F),
+            ):
+                address, nbytes = region_ptr(name)
+                fill_window_bytes(address, nbytes, byte)
+            rank_ready_address, rank_ready_nbytes = region_ptr(
+                "rank_token_ready"
+            )
+            write_window_u64(
+                rank_ready_address,
+                [old_generation] * (rank_ready_nbytes // 8),
+            )
+            queue_ready_address, queue_ready_nbytes = region_ptr(
+                "rank_reduce_queue_ready"
+            )
+            write_window_u64(
+                queue_ready_address,
+                [old_generation] * (queue_ready_nbytes // 8),
+            )
         self._output.fill_(1)
         torch.cuda.synchronize(self.device)
 
@@ -1450,29 +1986,125 @@ class MegaMoETileA4W4CommProbe(MegaMoETileA4W4):
 
         if self._runtime is None:
             raise RuntimeError("CCO runtime is closed")
-        from aiter.ops.flydsl.kernels.megamoe_tile.cco import read_window_bytes
+        from aiter.ops.flydsl.kernels.megamoe_tile.cco import (
+            read_window_bytes,
+            read_window_u32,
+        )
 
         generation = int(self._generation)
         parity = generation & 1
-        base = (
-            int(self._runtime.window.local_ptr) + int(self.layout.stage2_offset)
-        )
+        arena_base = int(self._runtime.window.local_ptr)
+        base = arena_base + int(self.layout.stage2_offset)
 
-        def nonzero(name: str) -> int:
-            region = self.stage2_layout.region(name)
-            address = base + int(
-                self.stage2_layout.offset(name, parity=parity)
+        def s1_ptr(name: str, *, parity_indexed: bool = True) -> int:
+            return arena_base + int(
+                self.stage1_layout.offset(
+                    name, parity=parity if parity_indexed else None
+                )
             )
+
+        def s2_ptr(name: str, *, parity_indexed: bool = True) -> int:
+            return base + int(
+                self.stage2_layout.offset(
+                    name, parity=parity if parity_indexed else None
+                )
+            )
+
+        def nonzero(name: str, logical_bytes: int | None = None) -> int:
+            region = self.stage2_layout.region(name)
+            address = s2_ptr(name)
             payload = read_window_bytes(
-                address, region.nbytes // self.stage2_layout.parity_depth
+                address,
+                (
+                    region.nbytes // self.stage2_layout.parity_depth
+                    if logical_bytes is None
+                    else int(logical_bytes)
+                ),
             )
             return sum(int(value != 0) for value in payload)
 
+        accumulator_dtype = str(
+            getattr(self._stage2, "accumulator_dtype", "fp32")
+        )
+        accumulator_logical_bytes = (
+            2 * self.mtpr * self.model_dim * 2
+            if accumulator_dtype == "bf16"
+            else None
+        )
+        rank_local_state = self._debug_rank_local_completion(
+            generation=generation,
+            s1_ptr=s1_ptr,
+            s2_ptr=s2_ptr,
+        )
+        compact_rank_local = (
+            self.stage2_layout.include_rank_partials
+            and self.stage2_rail_return_schedule == "compact"
+        )
+        if compact_rank_local:
+            row_bytes = self.model_dim * 2
+            token_items = 2 * self.mtpr
+            dest_masks = [
+                int(value) & 0xFF
+                for value in read_window_u32(
+                    s2_ptr("node_dest_rank_mask"), token_items
+                )
+            ]
+            accumulator_payload = read_window_bytes(
+                s2_ptr("node_accumulator"), token_items * row_bytes
+            )
+            local_row_base = self.node * self.mtpr
+            node_accumulator_nonzero = sum(
+                int(value != 0)
+                for token in range(self.mtpr)
+                if dest_masks[local_row_base + token] != 0
+                for value in accumulator_payload[
+                    (local_row_base + token) * row_bytes :
+                    (local_row_base + token + 1) * row_bytes
+                ]
+            )
+            return_counts = read_window_u32(
+                s2_ptr("rank_return_count"), 2
+            )
+            tx_rows = int(return_counts[0])
+            rx_rows = int(return_counts[1])
+            remote_node_tx_nonzero = nonzero(
+                "remote_node_tx", tx_rows * row_bytes
+            )
+            remote_partial_rx_nonzero = nonzero(
+                "remote_partial_rx", rx_rows * row_bytes
+            )
+        else:
+            node_accumulator_nonzero = nonzero(
+                "node_accumulator", accumulator_logical_bytes
+            )
+            # Direct-BF16 return reads node_accumulator as the CCO source and
+            # intentionally leaves the legacy FP32->BF16 staging region alone.
+            remote_node_tx_nonzero = (
+                0
+                if accumulator_dtype == "bf16"
+                else nonzero("remote_node_tx")
+            )
+            remote_partial_rx_nonzero = nonzero("remote_partial_rx")
+
         return {
             "generation": generation,
-            "node_accumulator_nonzero_bytes": nonzero("node_accumulator"),
-            "remote_node_tx_nonzero_bytes": nonzero("remote_node_tx"),
-            "remote_partial_rx_nonzero_bytes": nonzero("remote_partial_rx"),
+            "node_accumulator_nonzero_bytes": node_accumulator_nonzero,
+            "remote_node_tx_nonzero_bytes": remote_node_tx_nonzero,
+            "remote_partial_rx_nonzero_bytes": remote_partial_rx_nonzero,
+            "rank_accumulator_nonzero_bytes": (
+                nonzero("rank_accumulator")
+                if self.stage2_layout.include_rank_partials
+                else 0
+            ),
+            "rank_token_pending_nonzero": rank_local_state[
+                "rank_local_pending_nonzero_all"
+            ],
+            "rank_token_ready_missing": rank_local_state[
+                "rank_local_ready_missing"
+            ],
+            "rank_token_ready_unexpected": rank_local_state[
+                "rank_local_ready_unexpected"
+            ],
             "output_nonzero_bytes": int(
                 torch.count_nonzero(self._output.view(torch.uint8)).item()
             ),

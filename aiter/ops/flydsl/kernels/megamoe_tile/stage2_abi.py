@@ -10,10 +10,13 @@ contract remains identical to MegaMoE v2::
 The regions below are an implementation detail shared by the fused Stage-1
 and Stage-2 kernels. Stage-1 dispatches each token at most once to a
 destination rank and writes the aligned proxy's ``node_expected`` scoreboard.
-The Stage-2 weighted GMM2 epilogue directly LSA atomic-adds FP32 output into
-that proxy's node accumulator.  There is no rank-partial payload and no
-eight-rank LSA scan.  The last contributing route publishes node-tile ready;
-the kernel returns at most one BF16 node partial per source token through CCO
+The Stage-2 weighted GMM2 epilogue directly LSA atomic-adds packed BF16 output
+into that proxy's node accumulator. The arena retains FP32-sized capacity for
+the diagnostic reference. The default layout has no rank-partial payload and
+no eight-rank LSA scan; optional experimental layouts are append-only. The
+last route for each hidden tile advances a padded
+per-token tile counter; the 28th tile publishes one whole-token ready flag.
+The kernel returns at most one BF16 node partial per source token through CCO
 and writes the final output.
 """
 
@@ -22,6 +25,34 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+
+
+STAGE2_TIMELINE_FIELDS = (
+    "stage1_entry",
+    "stage1_dispatch_flush_pre",
+    "stage1_dispatch_flush_post",
+    "stage1_done_publish",
+    "stage2_entry",
+    "stage2_stage1_gate_done",
+    "stage2_init_gate_done",
+    "stage2_qp0_tokens_ready",
+    "stage2_qp1_tokens_ready",
+    "stage2_qp2_tokens_ready",
+    "stage2_qp3_tokens_ready",
+    "stage2_first_batch_ready",
+    "stage2_qp0_payload_posted",
+    "stage2_qp1_payload_posted",
+    "stage2_qp2_payload_posted",
+    "stage2_qp3_payload_posted",
+    "stage2_first_batch_payloads_posted",
+    "stage2_return_terminal_posted",
+    "stage2_return_flush_pre",
+    "stage2_return_flush_post",
+    "stage2_return_request_done",
+)
+STAGE2_TIMELINE_INDEX = {
+    name: index for index, name in enumerate(STAGE2_TIMELINE_FIELDS)
+}
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -90,11 +121,13 @@ class Stage2ArenaLayout:
 
     Weighted GMM2 output never crosses a rank as a route. For a source rank
     ``s``, every expert rank on the current node atomically adds directly to
-    local LSA rank ``s % 8`` at ``node_accumulator[s // 8, token]``. Stage-1
+    local LSA rank ``s % 8`` at ``node_accumulator[s // 8, token]``. Production
+    treats the logical prefix as BF16 while preserving FP32-sized ABI capacity.
+    Stage-1
     writes the exact number of contributors into ``node_expected``. The last
-    route increments ``node_done`` to that value and release-publishes
-    ``node_tile_ready``. This is the direct-accumulator form of the MORI
-    InterNodeV1 combine hierarchy.
+    route increments ``node_done`` to that value; the last of 28 completed
+    hidden tiles release-publishes ``node_token_ready``. This is the
+    direct-accumulator form of the MORI InterNodeV1 combine hierarchy.
 
     Payloads are parity buffered.  Absolute-generation readiness protects all
     consumer-visible data, so stale payload bytes are never read and payload
@@ -111,6 +144,13 @@ class Stage2ArenaLayout:
     parity_depth: int
     num_qp: int
     records_per_group: int
+    include_route_slots: bool
+    include_rank_partials: bool
+    include_staged_reduce: bool
+    # Bounded per-route ring + dedicated reducer experiment.  This is kept
+    # append-only after the legacy staged_reduce regions so existing offsets
+    # remain stable when the opt-in layout is disabled.
+    include_staged_ring: bool
     regions: tuple[Stage2ArenaRegion, ...]
     total_bytes: int
 
@@ -136,6 +176,10 @@ class Stage2ArenaLayout:
         parity_depth: int = 2,
         num_qp: int = 4,
         records_per_group: int = 4,
+        include_route_slots: bool = False,
+        include_rank_partials: bool = False,
+        include_staged_reduce: bool = False,
+        include_staged_ring: bool = False,
     ) -> "Stage2ArenaLayout":
         values = {
             "hidden": hidden,
@@ -161,6 +205,12 @@ class Stage2ArenaLayout:
             raise ValueError("world_size must equal source_nodes * gpus_per_node")
         if int(num_qp) not in (1, 2, 4, 8):
             raise ValueError("num_qp must be one of 1,2,4,8")
+        if include_staged_reduce and not include_rank_partials:
+            raise ValueError("include_staged_reduce requires include_rank_partials")
+        if include_staged_ring and not include_rank_partials:
+            raise ValueError("include_staged_ring requires include_rank_partials")
+        if include_staged_ring and include_staged_reduce:
+            raise ValueError("include_staged_ring and include_staged_reduce are mutually exclusive")
         wire = Stage2NodePartialWire(int(hidden), int(records_per_group))
         groups = wire.group_count(max_tokens)
         ntiles = int(hidden) // int(tile_n)
@@ -199,9 +249,20 @@ class Stage2ArenaLayout:
                 torch.int32,
                 64,
             ),
+            # Second-level completion for whole-token readiness.
+            # The last route for each hidden tile increments
+            # node_token_done; the 28th completed tile publishes one token flag.
             (
-                "node_tile_ready",
-                (parity_depth, source_nodes, max_tokens, ntiles),
+                "node_token_done",
+                # One 64-byte cache line per token avoids false sharing among
+                # tile-completion atomics on MI355. Only lane zero is logical.
+                (parity_depth, source_nodes, max_tokens, 16),
+                torch.int32,
+                64,
+            ),
+            (
+                "node_token_ready",
+                (parity_depth, source_nodes, max_tokens),
                 torch.int64,
                 64,
             ),
@@ -225,12 +286,28 @@ class Stage2ArenaLayout:
                 torch.int64,
                 64,
             ),
-            ("return_count", (parity_depth,), torch.int64, 64),
-            ("return_count_ready", (parity_depth,), torch.int64, 64),
+            # Per-QP producer/coordinator epochs for the diagnostic
+            # independent-return schedule. They are unused by lockstep.
+            ("return_count", (parity_depth, num_qp), torch.int64, 64),
+            ("return_count_ready", (parity_depth, num_qp), torch.int64, 64),
             ("return_consumed", (parity_depth,), torch.int64, 64),
             # Stage-1 completion and Stage-2 init are LSA-visible node gates.
             ("stage1_done", (parity_depth,), torch.int64, 64),
             ("stage2_init", (parity_depth,), torch.int64, 64),
+            # Device wall-clock samples used only by timeline-instrumented
+            # diagnostic builds. Production kernels compile all stores out.
+            (
+                "timeline",
+                (parity_depth, len(STAGE2_TIMELINE_FIELDS)),
+                torch.int64,
+                64,
+            ),
+            (
+                "timeline_gmm_worker_done",
+                (parity_depth, 256),
+                torch.int64,
+                64,
+            ),
             # Persistent launch state. Each work-head shard owns a separate
             # 64-byte line. grid_barrier is monotonic and therefore needs no
             # hot-path memset when the resident grid geometry is unchanged.
@@ -243,6 +320,292 @@ class Stage2ArenaLayout:
             # erase dispatch diagnostics.
             ("stage2_error_count", (1,), torch.int32, 64),
         ]
+
+        # Optional store/reduce ABIs. Keeping these regions at the end makes
+        # the default direct-atomic layout byte-for-byte identical and also
+        # preserves every existing region offset when the experiment is on.
+        # Within one token, a reducer can load all route slots for one N tile
+        # contiguously before advancing to the next tile.
+        if include_route_slots:
+            specs.append(
+                (
+                    "route_slots",
+                    (
+                        parity_depth,
+                        source_nodes,
+                        max_tokens,
+                        ntiles,
+                        topk,
+                        tile_n,
+                    ),
+                    torch.bfloat16,
+                    256,
+                )
+            )
+
+        # The rank-local experiment first combines all routes owned by one EP
+        # rank in local memory. Its token-ready publication then gates the
+        # aligned source proxy's node-local peer pull. The logical source
+        # dimension is the complete EP world because every expert rank can
+        # receive routes from every source rank.
+        if include_rank_partials:
+            specs.extend(
+                (
+                    (
+                        "rank_accumulator",
+                        (parity_depth, world_size, max_tokens, hidden),
+                        torch.bfloat16,
+                        256,
+                    ),
+                    (
+                        "rank_token_pending",
+                        (parity_depth, world_size, max_tokens, 16),
+                        torch.int32,
+                        64,
+                    ),
+                    (
+                        "rank_token_ready",
+                        (parity_depth, world_size, max_tokens),
+                        torch.int64,
+                        64,
+                    ),
+                    (
+                        "rank_return_tx_slot",
+                        (parity_depth, max_tokens),
+                        torch.int32,
+                        64,
+                    ),
+                    (
+                        "rank_return_rx_slot",
+                        (parity_depth, max_tokens),
+                        torch.int32,
+                        64,
+                    ),
+                    (
+                        "rank_return_count",
+                        # lane 0 = compact TX rows, lane 1 = compact RX rows,
+                        # lane 2 = active local+remote plane-token reducers.
+                        (parity_depth, 16),
+                        torch.int32,
+                        64,
+                    ),
+                    (
+                        "rank_reduce_queue",
+                        (parity_depth, source_nodes * max_tokens),
+                        torch.int32,
+                        64,
+                    ),
+                    (
+                        "rank_reduce_queue_ready",
+                        (parity_depth, source_nodes * max_tokens),
+                        torch.int64,
+                        64,
+                    ),
+                    (
+                        "rank_reduce_queue_tail",
+                        # One logical counter padded to a cache line.
+                        (parity_depth, 16),
+                        torch.int32,
+                        64,
+                    ),
+                )
+            )
+
+        # Both deferred-reduction experiments converge on the same source-proxy
+        # completion protocol. Keep these shared regions single-instanced even
+        # if a diagnostic layout requests both optional payload families.
+        if include_route_slots or include_rank_partials:
+            specs.extend(
+                (
+                    (
+                        "node_partial_done",
+                        # One cache line per token avoids false sharing among
+                        # independent tile/rank arrivals.
+                        (parity_depth, source_nodes, max_tokens, 16),
+                        torch.int32,
+                        64,
+                    ),
+                    (
+                        "node_partial_ready",
+                        (parity_depth, source_nodes, max_tokens),
+                        torch.int64,
+                        64,
+                    ),
+                )
+            )
+
+        # Keep the dynamic reducer cursor last.  In particular, append it after
+        # the shared completion regions above so enabling the new scheduler
+        # does not move any pre-existing rank-partial ABI offset.
+        if include_rank_partials:
+            specs.append(
+                (
+                    "rank_reduce_queue_head",
+                    # One parity-local logical counter padded to a cache line.
+                    (parity_depth, 16),
+                    torch.int32,
+                    64,
+                )
+            )
+            if include_staged_reduce:
+                # Optional staged rank reduction payload.  These regions are
+                # appended after the existing rank-local ABI so atomic mode
+                # and every pre-existing offset remain unchanged.
+                specs.extend(
+                    (
+                        (
+                            "rank_stage_values",
+                            (
+                                parity_depth,
+                                world_size * max_tokens,
+                                topk,
+                                hidden // (2 * tile_n),
+                                2 * tile_n,
+                            ),
+                            torch.bfloat16,
+                            256,
+                        ),
+                        (
+                            "rank_stage_slot_generation",
+                            (
+                                parity_depth,
+                                world_size * max_tokens,
+                                topk,
+                                hidden // tile_n,
+                            ),
+                            torch.int64,
+                            64,
+                        ),
+                        (
+                            "rank_stage_group_pending",
+                            (parity_depth, world_size * max_tokens, hidden // (2 * tile_n)),
+                            torch.int32,
+                            64,
+                        ),
+                        (
+                            "rank_stage_tile_pending",
+                            (parity_depth, world_size * max_tokens, hidden // tile_n),
+                            torch.int32,
+                            64,
+                        ),
+                        (
+                            "rank_stage_tile_done",
+                            (parity_depth, world_size * max_tokens, hidden // tile_n),
+                            torch.int32,
+                            64,
+                        ),
+                    )
+                )
+
+            if include_staged_ring:
+                # A compact 4-MiB/parity bounded MPMC ring.  Each slot carries one
+                # route x BN=256 tile (512 B BF16 payload); metadata and
+                # sequence words are separate cache-line padded arrays.
+                # Compact 4-MiB/parity payload ring.  The reducer drains while
+                # producers run; this keeps the registered CCO window below
+                # the ~300-MiB allocation ceiling on MI355.
+                ring_slots = (4 * 1024 * 1024) // (2 * tile_n)
+                ring_groups = hidden // (2 * tile_n)
+                specs.extend(
+                    (
+                        (
+                            "rank_stage_ring_payload",
+                            (parity_depth, ring_slots, tile_n),
+                            torch.bfloat16,
+                            256,
+                        ),
+                        (
+                            "rank_stage_ring_source",
+                            (parity_depth, ring_slots),
+                            torch.int32,
+                            64,
+                        ),
+                        (
+                            "rank_stage_ring_slot",
+                            (parity_depth, ring_slots),
+                            torch.int16,
+                            64,
+                        ),
+                        (
+                            "rank_stage_ring_tile",
+                            (parity_depth, ring_slots),
+                            torch.int16,
+                            64,
+                        ),
+                        (
+                            "rank_stage_ring_sequence",
+                            (parity_depth, ring_slots),
+                            torch.int64,
+                            64,
+                        ),
+                        (
+                            "rank_stage_ring_head",
+                            (parity_depth, 16),
+                            torch.int64,
+                            64,
+                        ),
+                        (
+                            "rank_stage_ring_tail",
+                            (parity_depth, 16),
+                            torch.int64,
+                            64,
+                        ),
+                        (
+                            # Consumer claim cursor is distinct from the
+                            # release/free cursor above.  Producers use tail
+                            # for occupancy; the reducer advances claim before
+                            # reading and tail only after payload completion.
+                            "rank_stage_ring_claim",
+                            (parity_depth, 16),
+                            torch.int64,
+                            64,
+                        ),
+                        (
+                            "rank_stage_ring_reserve_lock",
+                            (parity_depth, 16),
+                            torch.int32,
+                            64,
+                        ),
+                        (
+                            "rank_stage_ring_producer_done",
+                            (parity_depth, 16),
+                            torch.int32,
+                            64,
+                        ),
+                        (
+                            "rank_stage_ring_reducer_done",
+                            (parity_depth, 16),
+                            torch.int32,
+                            64,
+                        ),
+                        (
+                            "rank_stage_ring_scratch",
+                            (
+                                parity_depth,
+                                world_size * max_tokens,
+                                ring_groups,
+                                2,
+                                tile_n,
+                            ),
+                            # BF16 scratch halves the registered-window
+                            # footprint. Reducer widens each element to FP32
+                            # for the add, then rounds back to BF16.
+                            torch.bfloat16,
+                            256,
+                        ),
+                        (
+                            "rank_stage_ring_seen",
+                            (
+                                parity_depth,
+                                world_size * max_tokens,
+                                ring_groups,
+                                2,
+                            ),
+                            torch.int32,
+                            64,
+                        ),
+                    )
+                )
 
         offset = 0
         regions: list[Stage2ArenaRegion] = []
@@ -275,6 +638,10 @@ class Stage2ArenaLayout:
             parity_depth=int(parity_depth),
             num_qp=int(num_qp),
             records_per_group=int(records_per_group),
+            include_route_slots=bool(include_route_slots),
+            include_rank_partials=bool(include_rank_partials),
+            include_staged_reduce=bool(include_staged_reduce),
+            include_staged_ring=bool(include_staged_ring),
             regions=tuple(regions),
             total_bytes=_align_up(offset, 4096),
         )
@@ -334,6 +701,8 @@ def validate_public_stage2_contract(
 
 
 __all__ = [
+    "STAGE2_TIMELINE_FIELDS",
+    "STAGE2_TIMELINE_INDEX",
     "Stage2ArenaLayout",
     "Stage2ArenaRegion",
     "Stage2NodePartialWire",
