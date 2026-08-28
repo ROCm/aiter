@@ -164,10 +164,21 @@ def batched_gemm_a8w8_CK(
 _TUNED_PERF_COLUMNS = ("us", "tflops", "bw", "errRatio")
 
 
+def _mxscale_bmm_tuned_path(bpreshuffle: bool) -> str:
+    """Tuned table for one weight layout; preshuffled rows live in their own CSV."""
+    return (
+        AITER_CONFIGS.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE
+        if bpreshuffle
+        else AITER_CONFIGS.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE
+    )
+
+
 @functools.cache
-def _load_mxscale_bmm_tuned(libtype: str | None = None) -> dict:
+def _load_mxscale_bmm_tuned(
+    libtype: str | None = None, bpreshuffle: bool = False
+) -> dict:
     """{(gfx,b,m,n,k): row} from the mxscale BMM tuned CSV; {} if it is missing."""
-    path = AITER_CONFIGS.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE
+    path = _mxscale_bmm_tuned_path(bpreshuffle)
     try:
         df = pd.read_csv(path).drop_duplicates()
     except FileNotFoundError:
@@ -180,7 +191,13 @@ def _load_mxscale_bmm_tuned(libtype: str | None = None) -> dict:
 
 @functools.lru_cache(maxsize=1024)
 def lookup_mxscale_bmm_config(
-    b: int, m: int, n: int, k: int, *, libtype: str | None = None
+    b: int,
+    m: int,
+    n: int,
+    k: int,
+    *,
+    libtype: str | None = None,
+    bpreshuffle: bool = False,
 ):
     """Exact tuned row for this shape, else one at a padded M.
 
@@ -202,8 +219,8 @@ def lookup_mxscale_bmm_config(
     reported without this layer knowing which column holds it.
     """
     gfx = get_gfx()
-    path = AITER_CONFIGS.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE
-    tuned = _load_mxscale_bmm_tuned(libtype)
+    path = _mxscale_bmm_tuned_path(bpreshuffle)
+    tuned = _load_mxscale_bmm_tuned(libtype, bpreshuffle)
 
     row, padded_m = None, m
     for gl in (None, 0, 1):
@@ -363,7 +380,7 @@ def _batched_gemm_a8w8_mxscale_bpreshuffle_impl(
     m, g, k = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
     n = int(wo_a.shape[1])
 
-    cfg = lookup_mxscale_bmm_config(g, m, n, k)
+    cfg = lookup_mxscale_bmm_config(g, m, n, k, bpreshuffle=True)
     libtype = cfg["libtype"] if cfg is not None else "flydsl"
     if libtype != "flydsl":
         raise NotImplementedError(
