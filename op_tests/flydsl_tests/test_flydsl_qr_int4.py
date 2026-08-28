@@ -7,8 +7,8 @@ Pytest collects validity cases only (no timing). ``python3`` this file
 runs an aiter-op-test ``@benchmark`` / markdown sweep. Each rank times
 ``fly.allreduce`` with ``run_perftest`` after ``compile()``. The oracle
 is an untimed fp32 NCCL all-reduce of the same per-rank inputs. INT4 is
-lossy, so the gate is SQNR vs that oracle on **every** rank, not
-bit-identity or tight ``checkAllclose``.
+lossy, so validity uses SQNR, a calibrated mismatch ratio, and a
+per-tile SQNR floor.
 
 5120 is a measured calibration width, not an ABI requirement. The kernel
 is gfx942/gfx950 TP∈{2,4,8}; other archs skip. Pytest skips a world size
@@ -20,8 +20,8 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
-import math
 import os
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -39,7 +39,7 @@ import aiter
 from aiter import dtypes
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.test_common import benchmark, run_perftest
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 pytest.importorskip("flydsl")
 
@@ -53,6 +53,12 @@ from aiter.ops.flydsl.kernels.qr_int4_kernel import (
 ARCH = get_gfx_runtime()
 SUPPORTED_ARCHS = ("gfx942", "gfx950")
 SQNR_MIN_DB = 18.0
+# Dropped/stale 32 KiB tile is ~0 dB; INT4 codec tiles stay well above this.
+TILE_SQNR_MIN_DB = 8.0
+# Calibrated to the INT4 group-16 codec vs fp32 all-reduce, not bit identity.
+CLOSE_RTOL = 1e-1
+CLOSE_ATOL = 1e-1
+CLOSE_ERR_RATIO = 0.5
 SUPER_TILE = 8
 TP = WORLD
 
@@ -96,22 +102,38 @@ def _pick_st(
     return 1
 
 
+def _sqnr(ref_pow: torch.Tensor, mse: torch.Tensor) -> torch.Tensor:
+    score = torch.where(
+        (ref_pow <= 0) & (mse <= 0),
+        torch.full_like(mse, float("inf")),
+        10.0 * torch.log10(ref_pow / mse),
+    )
+    return torch.nan_to_num(score, nan=float("-inf"), neginf=float("-inf"))
+
+
 def _sqnr_db(got: torch.Tensor, reference: torch.Tensor) -> float:
-    mse = float(((got - reference) ** 2).mean().item())
-    ref_pow = float((reference * reference).mean().item())
-    if not math.isfinite(mse) or not math.isfinite(ref_pow):
-        return float("-inf")
-    if ref_pow <= 0.0:
-        return float("inf") if mse <= 0.0 else float("-inf")
-    if mse <= 0.0:
-        return float("inf")
-    return 10.0 * math.log10(ref_pow / mse)
+    return float(
+        _sqnr((reference * reference).mean(), ((got - reference) ** 2).mean()).item()
+    )
 
 
-def _rel_mae(got: torch.Tensor, reference: torch.Tensor) -> float:
-    scale = float(reference.abs().mean().item())
-    err = float((got - reference).abs().mean().item())
-    return err / scale if scale else 0.0
+def _min_tile_sqnr_db(got: torch.Tensor, reference: torch.Tensor) -> float:
+    """Worst 32 KiB-tile SQNR. A dropped or stale tile is ~0 dB."""
+    tile_elems = TILE_BYTES // 2
+    g = got.reshape(-1)
+    r = reference.reshape(-1)
+    n = int(g.numel())
+    n_full = (n // tile_elems) * tile_elems
+    vals = []
+    if n_full:
+        gt = g[:n_full].view(-1, tile_elems)
+        rt = r[:n_full].view(-1, tile_elems)
+        mse = ((gt - rt) ** 2).mean(dim=1)
+        pow_ = (rt * rt).mean(dim=1)
+        vals.append(float(_sqnr(pow_, mse).min().item()))
+    if n > n_full:
+        vals.append(_sqnr_db(g[n_full:], r[n_full:]))
+    return min(vals) if vals else _sqnr_db(got, reference)
 
 
 def _run_rank(args) -> None:
@@ -164,17 +186,31 @@ def _run_rank(args) -> None:
         out.zero_()
         fly.allreduce(inp, out)
         torch.cuda.synchronize()
-        dist.barrier()
         got = out.to(torch.float32)
+        dist.barrier()
         nbytes = int(inp.numel()) * int(inp.element_size())
         tiles = max(1, (nbytes + TILE_BYTES - 1) // TILE_BYTES)
+        st_used = fly._pick_st(tiles)
+        st1 = fly._by_st.get(1, fly._by_st[st_used])
+        close_err = checkAllclose(
+            ref,
+            got,
+            rtol=CLOSE_RTOL,
+            atol=CLOSE_ATOL,
+            tol_err_ratio=CLOSE_ERR_RATIO,
+            printLog=False,
+            msg=f"qr_int4 rank {rank}",
+        )
         row = {
             "tokens": tokens,
             "hidden": hidden,
             "grid_cap": args.grid_cap,
-            "st_used": fly._pick_st(tiles),
+            "st1_grid": st1.grid,
+            "st_used": st_used,
+            "grid": fly._by_st[st_used].grid,
             "sqnr_db": _sqnr_db(got, ref),
-            "rel_mae": _rel_mae(got, ref),
+            "min_tile_sqnr_db": _min_tile_sqnr_db(got, ref),
+            "err": close_err,
             "us": None,
         }
         if args.time_it:
@@ -289,7 +325,7 @@ def _spawn(
     return ranks
 
 
-def _assert_sqnr(
+def _assert_validity(
     ranks: list[list[dict]],
     *,
     tokens: int,
@@ -297,7 +333,8 @@ def _assert_sqnr(
     world_size: int,
     label: str,
 ) -> dict:
-    expected_st = _pick_st(tokens, hidden, grid_cap=ranks[0][0]["grid_cap"])
+    st1_grid = ranks[0][0]["st1_grid"]
+    expected_st = _pick_st(tokens, hidden, grid_cap=st1_grid)
     if len(ranks) != world_size:
         raise AssertionError(
             f"{label}: gathered {len(ranks)} ranks, expected {world_size}"
@@ -312,8 +349,17 @@ def _assert_sqnr(
             fails.append(f"rank {rank}: ST={row['st_used']}, expected {expected_st}")
         if row["sqnr_db"] < SQNR_MIN_DB:
             fails.append(
-                f"rank {rank}: SQNR {row['sqnr_db']:.2f} dB < {SQNR_MIN_DB} "
-                f"(rel MAE {row['rel_mae']:.3e})"
+                f"rank {rank}: SQNR {row['sqnr_db']:.2f} dB < {SQNR_MIN_DB}"
+            )
+        if row["min_tile_sqnr_db"] < TILE_SQNR_MIN_DB:
+            fails.append(
+                f"rank {rank}: min-tile SQNR {row['min_tile_sqnr_db']:.2f} dB "
+                f"< {TILE_SQNR_MIN_DB}"
+            )
+        if row["err"] >= CLOSE_ERR_RATIO:
+            fails.append(
+                f"rank {rank}: checkAllclose err {row['err']:.3f} "
+                f">= {CLOSE_ERR_RATIO}"
             )
     if fails:
         raise AssertionError(
@@ -326,7 +372,7 @@ def _assert_sqnr(
 @pytest.mark.parametrize("world_size,tokens,hidden,label", _PYTEST_CASES)
 def test_qr_int4_sqnr_vs_fp32_allreduce(world_size, tokens, hidden, label):
     ranks = _spawn(world_size, [(tokens, hidden)], time_it=False)
-    _assert_sqnr(
+    _assert_validity(
         ranks,
         tokens=tokens,
         hidden=hidden,
@@ -338,7 +384,7 @@ def test_qr_int4_sqnr_vs_fp32_allreduce(world_size, tokens, hidden, label):
 @benchmark()
 def test_qr_int4(tokens, hidden, dtype, tp, grid_cap=DEFAULT_GRID_CAP):
     ranks = _spawn(tp, [(tokens, hidden)], time_it=True, grid_cap=grid_cap)
-    row = _assert_sqnr(
+    row = _assert_validity(
         ranks,
         tokens=tokens,
         hidden=hidden,
@@ -348,7 +394,8 @@ def test_qr_int4(tokens, hidden, dtype, tp, grid_cap=DEFAULT_GRID_CAP):
     nbytes = tokens * hidden * 2
     # Reduce of tp ranks: (world-1) adds per element, plus INT4 codec ALU.
     flops = tokens * hidden * (tp - 1)
-    us = row["us"] or 0.0
+    rank_us = [r[0]["us"] for r in ranks]
+    us = statistics.median(rank_us)
     return {
         "gfx": ARCH,
         "tp": tp,
@@ -357,7 +404,7 @@ def test_qr_int4(tokens, hidden, dtype, tp, grid_cap=DEFAULT_GRID_CAP):
         "flydsl us": us,
         "flydsl TFLOPS": (flops / us / 1e6) if us else 0.0,
         "flydsl TB/s": (nbytes / us / 1e6) if us else 0.0,
-        "flydsl err": max(r[0]["rel_mae"] for r in ranks),
+        "flydsl err": max(r[0]["err"] for r in ranks),
         "flydsl sqnr_db": min(r[0]["sqnr_db"] for r in ranks),
     }
 
@@ -421,7 +468,7 @@ def main():
         "--grid-cap",
         type=int,
         default=DEFAULT_GRID_CAP,
-        help="Persistent launch/inbox block cap (default 304*4=1216, matches HIP QR).",
+        help="Persistent launch/inbox block cap (default 304*4=1216, occupancy-clamped).",
     )
     args = parser.parse_args()
 

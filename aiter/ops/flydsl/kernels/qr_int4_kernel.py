@@ -5,9 +5,10 @@
 
 INT4 nibble: [-8,+7], −1/8, 4 B/thread, 1152 B rank-tile. Scale is
 group-16 signed E4M3 in the 128 B region. Super-tile ST∈{1,8}; host
-uses ST=1 when ``num_tiles ≤ GRID``. Payload HBM is bf16; in-kernel
-math is packed fp16. Each rank owns ``ATOMS / world_size`` atoms of a
-tile (8 GPUs → 1, 4 → 2, 2 → 4); LDS stays ``ATOMS * 1152``.
+uses ST=1 when ``num_tiles ≤`` the occupancy-clamped persistent grid.
+Payload HBM is bf16; in-kernel math is packed fp16. Each rank owns
+``ATOMS / world_size`` atoms of a tile (8 GPUs → 1, 4 → 2, 2 → 4); LDS
+stays ``ATOMS * 1152``.
 """
 
 import flydsl.compiler as flyc
@@ -49,6 +50,37 @@ PACK_I32 = ATOMS * RANK_TILE_I32
 LDS_BYTES = ATOMS * RANK_TILE_BYTES
 # Wire/inbox addresses are byte pointers; tile math is in i32 slots.
 I32_BYTES = 4
+
+# Conservative measured residency for gfx942/gfx950.
+_RESIDENT_WGS_PER_CU = {
+    (2, 1): 3,
+    (2, 8): 4,
+    (4, 1): 4,
+    (4, 8): 5,
+    (8, 1): 4,
+    (8, 8): 6,
+}
+
+
+def clamp_grid_cap(
+    requested: int,
+    *,
+    arch: str,
+    world_size: int,
+    super_tile: int,
+    cu_count: int,
+) -> int:
+    if requested < 1 or cu_count < 1:
+        raise ValueError("grid_cap and cu_count must be positive")
+    if arch not in ("gfx942", "gfx950"):
+        raise ValueError(f"qr_int4 has no residency measurement for {arch!r}")
+    try:
+        resident = _RESIDENT_WGS_PER_CU[(int(world_size), int(super_tile))]
+    except KeyError:
+        raise ValueError(
+            f"qr_int4 has no residency measurement for {(world_size, super_tile)}"
+        ) from None
+    return min(int(requested), resident * int(cu_count))
 
 # gfx942 buffer aux: bit 1 = sc1 (bypass L2), bit 2 = NT.
 _CM_SC1 = 2
@@ -305,7 +337,6 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
     wire_tile_bytes = wire_tile_i32 * 4
 
     flags_i32 = PHASES * grid * world_size
-
     @flyc.kernel(known_block_size=[BLOCK, 1, 1])
     def qr_int4(
         rank: Int32,
@@ -705,10 +736,6 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
         )
 
     launch_qr_int4.func.__name__ = f"launch_qr_int4_ws{world_size}_st{super_tile}"
-    try:
-        qr_int4.func.__name__ = f"qr_int4_ws{world_size}_st{super_tile}"
-    except AttributeError:
-        pass
     return {
         "launch": launch_qr_int4,
         "flags_bytes": flags_i32 * 4,
