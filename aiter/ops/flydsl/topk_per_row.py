@@ -12,16 +12,50 @@ from .kernels.topk_per_row_decode import (
     build_topk_per_row_decode_module,
     topk_per_row_decode_workspace_shapes,
 )
+from .kernels.topk_per_row_decode_persistent import (
+    create_topk_per_row_decode_tiered_kernel,
+    topk_workspace_slots,
+)
+
+# The one-workgroup path wins both eager and Graph E2E at 20K, but loses to the
+# multi-kernel path by 40K. Keep the cutoff at the measured crossover boundary.
+_ONE_WORKGROUP_MAX_ROW_WIDTH = 20_000
 
 
 @functools.cache
 def _get_topk_launcher(
-    n: int,
-    next_n: int,
+    rows: int,
     k: int,
     stable: bool,
 ):
-    return build_topk_per_row_decode_module(n, next_n, k, stable)
+    """Cache the dynamic-N multi-kernel launcher by compile-time dimensions."""
+    return build_topk_per_row_decode_module(rows, k, stable)
+
+
+@functools.cache
+def _get_one_workgroup_topk_launcher(k: int):
+    return create_topk_per_row_decode_tiered_kernel(
+        k,
+        blocks_per_row=1,
+        bits_per_pass=11,
+        scan_stages=2,
+        tier_mode="short",
+        stable=True,
+    )
+
+
+@functools.cache
+def _get_persistent_topk_launcher(k: int):
+    return create_topk_per_row_decode_tiered_kernel(
+        k,
+        blocks_per_row=16,
+        bits_per_pass=11,
+        scan_stages=8,
+        tier_mode="long",
+        tiered_mid_cap=16,
+        tiered_long_cap=16,
+        stable=True,
+    )
 
 
 def _is_stream_capturing() -> bool:
@@ -56,6 +90,50 @@ def _get_cached_workspace(
     )
 
 
+_persistent_workspace_cache: dict[tuple[int, int], torch.Tensor] = {}
+
+
+def _get_cached_persistent_workspace(
+    device_index: int,
+    output_ptr: int,
+) -> torch.Tensor:
+    """Key scratch by static output so a warmed graph captures only TopK."""
+    key = (device_index, output_ptr)
+    workspace = _persistent_workspace_cache.get(key)
+    if workspace is not None:
+        return workspace
+    workspace = torch.zeros(
+        topk_workspace_slots(1, 11),
+        device=torch.device("cuda", device_index),
+        dtype=torch.int32,
+    )
+    if len(_persistent_workspace_cache) >= 16:
+        _persistent_workspace_cache.pop(next(iter(_persistent_workspace_cache)))
+    _persistent_workspace_cache[key] = workspace
+    return workspace
+
+
+def _get_persistent_workspace(
+    device: torch.device,
+    indices: torch.Tensor,
+) -> torch.Tensor:
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    output_ptr = indices.data_ptr()
+    key = (device_index, output_ptr)
+    workspace = _persistent_workspace_cache.get(key)
+    if workspace is not None:
+        return workspace
+    if _is_stream_capturing():
+        return torch.zeros(
+            topk_workspace_slots(1, 11),
+            device=device,
+            dtype=torch.int32,
+        )
+    return _get_cached_persistent_workspace(device_index, output_ptr)
+
+
 def _get_topk_workspace(
     device: torch.device,
     hist_shape: tuple[int, ...],
@@ -80,6 +158,7 @@ def _get_topk_workspace(
 
 def clear_topk_per_row_decode_workspace_cache() -> None:
     _get_cached_workspace.cache_clear()
+    _persistent_workspace_cache.clear()
 
 
 @functools.lru_cache(maxsize=128)
@@ -89,6 +168,7 @@ def _validate_topk_signature(
     logits_dtype: torch.dtype,
     logits_device: torch.device,
     seq_lens_shape: torch.Size,
+    seq_lens_stride: tuple[int, ...],
     seq_lens_dtype: torch.dtype,
     seq_lens_device: torch.device,
     indices_shape: torch.Size,
@@ -119,6 +199,8 @@ def _validate_topk_signature(
 
     if len(seq_lens_shape) != 1 or seq_lens_dtype != torch.int32:
         raise ValueError("seq_lens must be a 1D int32 tensor")
+    if seq_lens_stride != (1,):
+        raise ValueError("seq_lens must be contiguous")
     if seq_lens_device != logits_device:
         raise ValueError("seq_lens must be on the same CUDA device as logits")
     if next_n <= 0:
@@ -159,6 +241,7 @@ def flydsl_top_k_per_row_decode(
         logits.dtype,
         logits.device,
         seq_lens.shape,
+        seq_lens.stride(),
         seq_lens.dtype,
         seq_lens.device,
         indices.shape,
@@ -172,6 +255,30 @@ def flydsl_top_k_per_row_decode(
     )
 
     rows, n = logits.shape
+    use_one_workgroup = stable and n <= _ONE_WORKGROUP_MAX_ROW_WIDTH
+    if use_one_workgroup or (rows == 1 and stable):
+        # Short rows use one independent workgroup per row: one launch, no
+        # inter-workgroup barrier, and no workspace traffic.
+        launcher = (
+            _get_one_workgroup_topk_launcher(k)
+            if use_one_workgroup
+            else _get_persistent_topk_launcher(k)
+        )
+        workspace = _get_persistent_workspace(logits.device, indices)
+        _run_compiled(
+            launcher,
+            logits,
+            next_n,
+            seq_lens,
+            indices,
+            workspace,
+            rows,
+            stride0,
+            stride1,
+            torch.cuda.current_stream(),
+        )
+        return
+
     hist_shape, state_shape = topk_per_row_decode_workspace_shapes(rows, stable)
     partial_hist, state = _get_topk_workspace(
         logits.device,
@@ -180,8 +287,7 @@ def flydsl_top_k_per_row_decode(
     )
 
     launcher = _get_topk_launcher(
-        n,
-        next_n,
+        rows,
         k,
         stable,
     )
@@ -192,6 +298,8 @@ def flydsl_top_k_per_row_decode(
         indices,
         partial_hist,
         state,
-        rows,
+        n,
+        next_n,
+        stride0,
         torch.cuda.current_stream(),
     )
