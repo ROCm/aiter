@@ -1456,7 +1456,8 @@ __global__ void indexer_qk_rope_quant_and_cache_kernel(
     if(!compute_all_q_rope && slot_idx < 0)
         return;
     int64_t pos = positions[token_idx];
-    pos = pos < 0 ? 0 : (pos >= max_position ? max_position - 1 : pos);
+    if(slot_idx < 0)
+        pos = pos < 0 ? 0 : (pos >= max_position ? max_position - 1 : pos);
     const scalar_t* cos_ptr = cos_cache + pos * cos_stride0;
     const scalar_t* sin_ptr = sin_cache + pos * sin_stride0;
 
@@ -4094,6 +4095,8 @@ void indexer_qk_rope_quant_and_cache(
     AITER_CHECK(cos_cache.dim() == 2, "cos_cache must be [max_position, rope_dim / 2]");
     AITER_CHECK(sin_cache.dim() == 2, "sin_cache must be [max_position, rope_dim / 2]");
     AITER_CHECK(q.size(0) >= num_tokens, "q must cover all indexed tokens");
+    AITER_CHECK(!compute_all_q_rope || q.size(0) == num_tokens,
+                "compute_all_q_rope requires q to have exactly num_tokens rows");
     AITER_CHECK(q.size(2) == head_dim, "q head_dim must match k head_dim");
     AITER_CHECK(positions.size(0) >= num_tokens, "positions must cover all indexed tokens");
     AITER_CHECK(q_out.size(0) >= num_tokens && q_out.size(1) == n_heads &&
