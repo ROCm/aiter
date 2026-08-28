@@ -26,14 +26,14 @@ from functools import cache
 
 import torch
 import triton
-from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.triton.utils.config_utils import AITER_TRITON_CONFIGS_PATH
-from aiter.ops.triton.utils.device_info import get_num_sms
-from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
 from packaging.version import Version
 from triton.backends.compiler import GPUTarget
 
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.triton.utils.config_utils import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.device_info import get_num_sms
+from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
 
 enable_aot_gluon_pa_mqa_logits = os.environ.get(
     "AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS", "0"
@@ -42,6 +42,8 @@ enable_aot_gluon_pa_mqa_logits = enable_aot_gluon_pa_mqa_logits == "1"
 triton_version = Version(Version(triton.__version__).base_version)
 _GLUON_PA_MQA_LOGITS_ARCHS = ("gfx942", "gfx950", "gfx1250")
 if triton_version >= Version("3.5.0"):
+    from triton.experimental.gluon._runtime import GluonASTSource as ASTSource
+
     from aiter.ops.triton._triton_kernels.attention.pa_mqa_logits import (
         _deepgemm_fp8_paged_mqa_logits,
         _deepgemm_fp8_paged_mqa_logits_ragged_k,
@@ -55,11 +57,12 @@ if triton_version >= Version("3.5.0"):
         _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle,
         _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx,
     )
-    from triton.experimental.gluon._runtime import GluonASTSource as ASTSource
 
     enable_gluon_pa_mqa_logits = get_gfx() in _GLUON_PA_MQA_LOGITS_ARCHS
     enable_jit_gluon_pa_mqa_logits_kernel = not enable_aot_gluon_pa_mqa_logits
 else:
+    from triton.compiler import ASTSource
+
     from aiter.ops.triton._triton_kernels.attention.pa_mqa_logits import (
         _deepgemm_fp8_paged_mqa_logits,
         _deepgemm_fp8_paged_mqa_logits_ragged_k,
@@ -70,7 +73,6 @@ else:
         _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle,
         _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx,
     )
-    from triton.compiler import ASTSource
 
     enable_gluon_pa_mqa_logits = (
         enable_aot_gluon_pa_mqa_logits and get_gfx() in _GLUON_PA_MQA_LOGITS_ARCHS
