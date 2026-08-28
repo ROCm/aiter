@@ -1779,29 +1779,41 @@ def flydsl_qk_norm_rope_quant(
 
 
 ROWS_PER_TILE = 8  # = waves per WG (256-thread WG)
+ROWS_PER_TILE_SPARSE = 4  # halve the WG so a thin grid still gets 2 WGs/CU
 NUM_BUFFERS = 6  # K: rotating LDS buffers (1 WG at K=6: 6*8KB=48KB LDS)
 NUM_BUFFERS_DENSE = 2  # K once the grid is deep enough to hide a short prologue
 TILES_PER_WG = 16  # CT: one H=128 token/WG; keeps cos/sin hoisting enabled
 TDM_DENSE_MIN_ROWS = 131072  # num_rows from which K=2 beats K=6
+# num_rows at which RT=8 first reaches 2 WGs per CU: 2 * 256 CUs * RT * CT.
+TDM_RT8_MIN_ROWS = 65536
 
 
 def _tdm_tiles_per_wg(num_rows, head_dim=512):
     """Pick (CT, K, RT) to fill wave slots on gfx1250.
 
-    CT is bounded by keeping gx_q = num_rows / (ROWS_PER_TILE * CT) at or above
-    the 256 CUs: RT=8 with CT=16 gives 256 workgroups at num_rows=32768 (T=256,
-    H=128) and 512 at 65536.
+    Both knobs answer the same question -- can a workgroup's load latency be
+    hidden by a neighbour, or must it cover its own?
+
+    RT sets the workgroup size, so it sets how many of them the grid holds:
+    gx_q = num_rows / (RT * CT). Below 2 WGs/CU there is no neighbour to
+    overlap with, and halving RT to double the grid pays for itself: -10.5% at
+    num_rows=32768, -13.8% at 40960, -9.5% at 49152. At 65536 (exactly 2
+    WGs/CU) it is a wash, and past that the smaller workgroup costs more than
+    the extra parallelism returns (+2.4% at 262144), so RT=8 holds there.
 
     K trades prefetch depth against the length of the load-only prologue. Once
     the grid is deep enough that one WG's prologue overlaps another's steady
     state, the shallow K=2 wins (-3.0% at num_rows=131072, -5.1% at 262144,
-    -2.9% at 2097152). Below that a WG must cover its own load latency and the
-    deeper K=6 is needed: K=2 costs +31.9% at 32768, +9.8% at 49152 and +4.1%
-    at 65536.
+    -2.9% at 2097152). Below that the deeper K=6 is needed: K=2 costs +31.9%
+    at 32768, +9.8% at 49152 and +4.1% at 65536.
+
+    Both thresholds assume a 256-CU part; they move on a card with a different
+    CU count.
     """
-    del head_dim  # tile bytes are implied by ROWS_PER_TILE * D in the kernel
+    del head_dim  # tile bytes are implied by RT * D in the kernel
     k = NUM_BUFFERS_DENSE if num_rows >= TDM_DENSE_MIN_ROWS else NUM_BUFFERS
-    return TILES_PER_WG, k, ROWS_PER_TILE
+    rt = ROWS_PER_TILE if num_rows >= TDM_RT8_MIN_ROWS else ROWS_PER_TILE_SPARSE
+    return TILES_PER_WG, k, rt
 
 
 @lru_cache(maxsize=32)
