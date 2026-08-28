@@ -135,3 +135,7 @@ def test_hip_packer_rounding_boundary_is_adjacent_to_triton(
     triton_codes = _unpack_first_block(triton_packed)
     torch.testing.assert_close(hip_codes >> 5, triton_codes >> 5, rtol=0, atol=0)
     assert int(((hip_codes & 0x1F) - (triton_codes & 0x1F)).abs().max()) <= 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

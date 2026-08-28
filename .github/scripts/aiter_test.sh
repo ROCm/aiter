@@ -149,6 +149,21 @@ for file in "${sharded_files[@]}"; do
             } | tee -a latest_test.log
             test_cmd=(env AITER_MLA_DECODE_PERSISTENT_MAX_BATCH=0 timeout 60m python3 "$file")
             ;;
+        op_tests/test_gemm_a6w6.py)
+            {
+                echo "Running tuned dispatch plus every compatible A6W6 ASM kernel"
+            } | tee -a latest_test.log
+            test_cmd=(
+                timeout 60m
+                bash -c '
+                    set -euo pipefail
+                    test_file=$1
+                    python3 "$test_file" --all-kernels -mnk 257,513,129
+                    python3 "$test_file"
+                '
+                _ "$file"
+            )
+            ;;
     esac
     # Capture start time (nanoseconds since epoch)
     start_time_ns=$(date +%s%N)

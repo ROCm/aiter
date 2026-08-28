@@ -29,6 +29,13 @@ pd.set_option("display.max_colwidth", 30)
 def run_torch(x, w, dtype):
     # fp32 reference (on GPU) that matches the mxfp6 (E2M3, per-1x32 blockscale)
     # math the kernel approximates: quantize both operands, dequantize, matmul.
+    # The packed GEMM accepts arbitrary K and pads it to its 128-wide tile. Mirror
+    # that here because quant_mxfp6_torch itself requires complete scale groups.
+    k = x.shape[1]
+    padded_k = (k + 127) // 128 * 128
+    if padded_k != k:
+        x = torch.nn.functional.pad(x, (0, padded_k - k))
+        w = torch.nn.functional.pad(w, (0, padded_k - k))
     xc, xs = quant_mxfp6_torch(x)
     wc, ws = quant_mxfp6_torch(w)
     xf = dequant_mxfp6_torch(xc, xs)
@@ -114,6 +121,8 @@ def main():
             # transformer shapes
             (9450, 13824, 5120),
             (9450, 5120, 13824),
+            # Exercise row, column, and contraction-dimension padding together.
+            (257, 513, 129),
         ],
         help="""Shape of mnk.
         e.g. -mnk 8192,8192,8192""",
@@ -133,6 +142,12 @@ def main():
 
     if args.all_kernels and args.kernel_name:
         parser.error("--all-kernels and --kernel-name are mutually exclusive")
+    if args.all_kernels:
+        from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
+
+        if get_gfx() != "gfx950":
+            aiter.logger.info("--all-kernels requires gfx950; skipping")
+            return
     results = []
     for dtype in args.dtype:
         for m, n, k in args.shape:
