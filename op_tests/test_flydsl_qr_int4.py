@@ -348,9 +348,7 @@ def _assert_validity(
         if row["st_used"] != expected_st:
             fails.append(f"rank {rank}: ST={row['st_used']}, expected {expected_st}")
         if row["sqnr_db"] < SQNR_MIN_DB:
-            fails.append(
-                f"rank {rank}: SQNR {row['sqnr_db']:.2f} dB < {SQNR_MIN_DB}"
-            )
+            fails.append(f"rank {rank}: SQNR {row['sqnr_db']:.2f} dB < {SQNR_MIN_DB}")
         if row["min_tile_sqnr_db"] < TILE_SQNR_MIN_DB:
             fails.append(
                 f"rank {rank}: min-tile SQNR {row['min_tile_sqnr_db']:.2f} dB "

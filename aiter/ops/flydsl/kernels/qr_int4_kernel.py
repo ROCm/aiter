@@ -82,6 +82,7 @@ def clamp_grid_cap(
         ) from None
     return min(int(requested), resident * int(cu_count))
 
+
 # gfx942 buffer aux: bit 1 = sc1 (bypass L2), bit 2 = NT.
 _CM_SC1 = 2
 _CM_NT = 4
@@ -337,6 +338,7 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
     wire_tile_bytes = wire_tile_i32 * 4
 
     flags_i32 = PHASES * grid * world_size
+
     @flyc.kernel(known_block_size=[BLOCK, 1, 1])
     def qr_int4(
         rank: Int32,
