@@ -295,3 +295,7 @@ def test_multi_kv_head_and_full_rotary():
     compare("k_cache", t["k_cache"], k_ref)
     compare("v_cache", t["v_cache"], v_ref)
     compare("index_cache", t["index_cache"], idx_ref)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

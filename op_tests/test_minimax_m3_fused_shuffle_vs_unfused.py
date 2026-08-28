@@ -18,8 +18,6 @@ the unfused one, i.e. the layout is what the decode kernel expects.
 import pytest
 import torch
 
-pytest.importorskip("vllm")
-
 from aiter import (
     minimax_m3_qknorm_rope_cache_shuffle_insert,
     reshape_and_cache,
@@ -32,12 +30,11 @@ PAGES_PER_BLOCK = 8  # a 128-token vLLM block is 8 physical page-16 pages
 
 
 def _vllm_ops():
+    pytest.importorskip("vllm")
     import vllm._custom_ops as ops
-    from vllm.models.minimax_m3.amd.ops.sparse_pa import (
-        minimax_m3_insert_index_cache,
-    )
 
-    return ops, minimax_m3_insert_index_cache
+    sparse_pa = pytest.importorskip("vllm.models.minimax_m3.amd.ops.sparse_pa")
+    return ops, sparse_pa.minimax_m3_insert_index_cache
 
 
 def build_case(num_tokens, nq, nkv, niq, rotary_dim, cache_dtype, idx_dtype, seed=0):
@@ -363,3 +360,7 @@ def test_fused_cache_feeds_gluon_decode_identically(quantized):
     out_got = decode(q_got, k_got, v_got)
     assert out_ref.abs().sum().item() > 0, "decode produced all zeros"
     assert torch.equal(out_ref, out_got), "gluon decode differs on the fused cache"
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
