@@ -408,4 +408,8 @@ else:
     default_kernels_dict = default_kernels_dict_950
 
 # Name-based reverse lookup for get_tune_dict() — built once at import time
-kernels_by_name = {v.name: v for v in kernels_list.values()}
+# Must include kernels from ALL arches, not just the current get_gfx() arch.
+# In a multi-target build (GPU_ARCHS=gfx942;gfx950), get_gfx() returns only the
+# last entry, but build_tune_dict processes CSV rows for all build targets.
+_all_bpreshuffle_kernels = {**expand_blockpercu(kernels_list_942), **expand_blockpercu(kernels_list_950)}
+kernels_by_name = {v.name: v for v in _all_bpreshuffle_kernels.values()}
