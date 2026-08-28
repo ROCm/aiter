@@ -5,9 +5,9 @@ import functools
 
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
+
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
-
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file

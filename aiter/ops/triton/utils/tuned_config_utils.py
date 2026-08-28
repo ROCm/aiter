@@ -9,6 +9,7 @@ device, on top of the shared core in ``config_utils``.
 import functools
 
 import triton
+
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 

@@ -27,10 +27,10 @@ import functools
 
 import triton
 import triton.language as tl
+
 from aiter.ops.triton._triton_kernels.activation import _tanh
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
-
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 _fwd_grouped_kernel_stage1_rope_repr = make_kernel_repr(
