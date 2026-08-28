@@ -6,8 +6,11 @@ import functools
 
 import torch
 
-from aiter.ops.triton.utils.config_utils import USE_LRU_CACHE, load_config_json
-from aiter.ops.triton.utils.gemm_config_utils import resolve_config_dir
+from aiter.ops.triton.utils.config_utils import (
+    USE_LRU_CACHE,
+    load_config_json,
+    resolve_config_dir,
+)
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 _DEFAULT_PREFIX_BOUNDS = {
@@ -24,6 +27,7 @@ _DEFAULT_PREFIX_BOUNDS = {
         131072,
         262144,
     ),  # max_seqlen_k
+    "PAGE": (16, 32, 64, 128, 256),  # block_size
 }
 
 
@@ -37,7 +41,7 @@ def get_dtype_str(dtype: torch.dtype):
     raise ValueError(f"No unified attention config tag for dtype: {dtype}")
 
 
-def _dtype_keys(q_tag: str, kv_tag: str) -> str:
+def _dtype_keys(q_tag: str, kv_tag: str):
     return (f"{q_tag}_{kv_tag}", f"{q_tag}_any", f"any_{kv_tag}", "any")
 
 
@@ -45,20 +49,20 @@ def _dtype_keys(q_tag: str, kv_tag: str) -> str:
 def _get_unified_attention_config_cached(
     op: str,  # "attn_2d" | "attn_3d" | "reduce"
     key: str,
-    bucket_prefix: str,  # "SQ" | "SK"
+    bucket_prefix: str,  # "SQ" | "SK" | "PAGE"
     bucket_value: int,
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
     head_size: int,
     block_size: int,
     num_queries_per_kv: int,
-    backend: str | None = None,
+    backend: str = "triton",  # "gluon" | "triton"
 ) -> tuple[dict, bool]:
     config_name = "UNIFIED-ATTENTION"
     q_tag, kv_tag = get_dtype_str(q_dtype), get_dtype_str(kv_dtype)
 
     # load default config
-    cfg_dir, _ = resolve_config_dir("attention", config_name, backend=backend)
+    cfg_dir = resolve_config_dir("attention", config_name, backend=backend)
     default_stem = "DEFAULT"
     default_fpath = f"{cfg_dir}/{default_stem}.json"
     config_dict = load_config_json(default_fpath, required=False)
@@ -67,8 +71,7 @@ def _get_unified_attention_config_cached(
 
     is_tuned = False
     for suffix in (
-        f"D={head_size}-QPKV={num_queries_per_kv}-PAGE={block_size}",
-        f"D={head_size}-PAGE={block_size}",
+        f"D={head_size}-QPKV={num_queries_per_kv}",
         f"D={head_size}",
     ):
         specialized = load_config_json(
@@ -112,13 +115,13 @@ def _get_unified_attention_config_cached(
             return dict(dtype_configs[candidate]), is_tuned
 
     # search for {bucket_prefix}_GEQ_x keys
-    for bound in bounds:
+    for bound in reversed(bounds):
         candidate = f"{bucket_prefix}_GEQ_{bound}"
         if bucket_value >= bound and candidate in dtype_configs:
             return dict(dtype_configs[candidate]), is_tuned
 
     if "any" in dtype_configs:
-        return dict(dtype_configs[candidate]), False
+        return dict(dtype_configs["any"]), False
 
     raise KeyError(
         f"{where}: no matching configuration found for "
@@ -129,14 +132,25 @@ def _get_unified_attention_config_cached(
 def get_unified_attention_config(
     op: str,  # "attn_2d" | "attn_3d" | "reduce"
     key: str,
+    bucket_prefix: str,  # "SQ" | "SK" | "PAGE"
+    bucket_value: int,
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
     head_size: int,
     block_size: int,
     num_queries_per_kv: int,
-    backend: str | None = None,
+    backend: str = "triton",  # "gluon" | "triton"
 ) -> tuple[dict, bool]:
     config, is_tuned = _get_unified_attention_config_cached(
-        op, key, q_dtype, kv_dtype, head_size, block_size, num_queries_per_kv, backend
+        op,
+        key,
+        bucket_prefix,
+        bucket_value,
+        q_dtype,
+        kv_dtype,
+        head_size,
+        block_size,
+        num_queries_per_kv,
+        backend,
     )
     return copy.deepcopy(config), is_tuned
