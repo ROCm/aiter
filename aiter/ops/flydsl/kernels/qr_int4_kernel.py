@@ -50,9 +50,41 @@ LDS_BYTES = ATOMS * RANK_TILE_BYTES
 # Wire/inbox addresses are byte pointers; tile math is in i32 slots.
 I32_BYTES = 4
 
-# gfx942 buffer aux: bit 1 = sc1 (bypass L2), bit 2 = NT.
+# gfx942 buffer aux: bit 0 = sc0, bit 1 = sc1 (bypass L2), bit 2 = NT.
+_CM_SC0 = 1
 _CM_SC1 = 2
 _CM_NT = 4
+
+# Cache policy for the peer stores in _fanout_nt / _publish, per inbox memory
+# type. See docs/qr_int4_mi350p.md.
+#
+# On an uncached inbox the memory type does all the work: a store cannot sit in
+# any cache, so every peer sees the payload as soon as `vmcnt(0)` retires and
+# the release needs nothing beyond that.
+#
+# A fine-grained inbox is cacheable, which cuts both ways. Letting the payload
+# land in the writer's L2 is exactly what makes it fast on PCIe: the L2 coalesces
+# this kernel's 64 B destination-interleaved stores into large bursts, worth 30x
+# at prefill sizes (227 us against 6708 us at 14 MiB on MI350P). But `nt` is only
+# a non-temporal *hint* -- it does not write through -- so a payload store can
+# still be parked in L2 after `vmcnt(0)` while a peer spins on a flag it cannot
+# see. That stall clears only when unrelated traffic evicts the line, so its cost
+# scales inversely with how busy the kernel is: invisible at 448 blocks,
+# 5.3 seconds at 1 block.
+#
+# So keep the payload cacheable and make the *release* explicit: write back L2
+# after the payload drains, then publish the flag write-through so the peer's
+# spin observes it immediately. Forcing the payload itself write-through
+# (`sc0 sc1` on every store) also fixes visibility, but defeats the coalescing
+# and gives back the entire bandwidth win.
+_INBOX_POLICY = {
+    "uncached": {"payload": "nt", "flag": "nt", "writeback": None},
+    "finegrained": {
+        "payload": "nt",
+        "flag": "sc0 sc1 nt",
+        "writeback": "buffer_wbl2 sc1",
+    },
+}
 
 # Dequant bit-trick: nibble | 0x6400 then + (-1032.0) as f16x2 reconstructs (q-8).
 _K_MASK_000F = 0x000F000F
@@ -238,22 +270,24 @@ def _to_sgpr_i64(addr):
     return fx.Int64(rocdl.readfirstlane(T.i64, as_ir_value(addr)))
 
 
-def _store_v4i32_nt_global(addr_i64, data):
-    """NT-store 16 B through a per-lane global address.
+def _store_v4i32_peer(addr_i64, data, policy):
+    """Store 16 B to a peer through a per-lane global address.
 
     One instruction here sends 16 B to a different GPU in each lane of a
     4-wide group. A buffer-descriptor store wants the descriptor in scalar
     registers, so LLVM would serialize those lanes (one destination at a
     time). A flat global store takes the address from a vector register,
-    so all destinations issue together. ``nt`` skips L2; this is payload,
-    not a flag.
+    so all destinations issue together.
+
+    *policy* is the cache-policy suffix for the inbox memory type; see
+    ``_PEER_STORE_POLICY``.
     """
     ptr_ty = ir.Type.parse("!llvm.ptr<1>")
     ptr = llvm.IntToPtrOp(ptr_ty, as_ir_value(addr_i64)).result
     llvm.InlineAsmOp(
         None,
         [ptr, as_ir_value(data)],
-        "global_store_dwordx4 $0, $1, off nt",
+        f"global_store_dwordx4 $0, $1, off {policy}",
         "v,v",
         has_side_effects=True,
     )
@@ -284,11 +318,26 @@ class PackStorage:
     pack: fx.Array[fx.Int32, PACK_I32, 16]
 
 
-def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: int):
+def make_qr_int4_kernel(
+    *,
+    world_size: int = WORLD,
+    super_tile: int = 1,
+    grid: int,
+    inbox_memory: str = "uncached",
+):
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(
             f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
         )
+    if inbox_memory not in _INBOX_POLICY:
+        raise ValueError(
+            f"inbox_memory must be one of {tuple(_INBOX_POLICY)}, "
+            f"got {inbox_memory!r}"
+        )
+    policy = _INBOX_POLICY[inbox_memory]
+    payload_policy = policy["payload"]
+    flag_policy = policy["flag"]
+    release_writeback = policy["writeback"]
     if ATOMS % world_size != 0:
         raise ValueError(f"ATOMS={ATOMS} is not divisible by world_size={world_size}")
     if super_tile not in SUPER_TILES:
@@ -516,7 +565,7 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
                         byte_off = _i32_to_bytes(
                             _sub_tile_i32(phase, inbox_src, sub) + wire_idx
                         )
-                        _store_v4i32_nt_global(dest + byte_off, v4)
+                        _store_v4i32_peer(dest + byte_off, v4, payload_policy)
 
         def _publish(phase, inbox_src, color):
             """Drain payload NT stores, then write *color* into every peer inbox.
@@ -531,9 +580,21 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
             payload too; ``vmcnt`` is per-wave, so without the join a
             wave-0 handshake could race stores still in flight. Neither
             can move after the color store, and neither can be dropped.
+
+            On a cacheable inbox retiring the stores is not enough -- they
+            can be sitting in this XCD's L2. ``buffer_wbl2`` after the join
+            writes them back, and its own ``vmcnt(0)`` waits for that to
+            land before the flag goes out. Every workgroup issues its own:
+            L2 is per-XCD, so one workgroup's writeback says nothing about
+            a workgroup on another die.
             """
             rocdl.s_waitcnt(vmcnt=0)
             gpu.barrier()
+            if release_writeback is not None:
+                llvm.InlineAsmOp(
+                    None, [], release_writeback, "", has_side_effects=True
+                )
+                rocdl.s_waitcnt(vmcnt=0)
             limit = fx.Int32(world_size)
             safe = (quad_id < limit).select(quad_id, fx.Int32(0))
             if quad_id < limit:
@@ -543,7 +604,7 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
                 byte_off = _i32_to_bytes(
                     _sub_tile_i32(phase, inbox_src, fx.Int32(0)) + vec_idx
                 )
-                _store_v4i32_nt_global(dest + byte_off, v4)
+                _store_v4i32_peer(dest + byte_off, v4, flag_policy)
 
         def _wait_flag(flag_rsrc, color):
             current = _load_i32_uncached(flag_rsrc)
@@ -704,9 +765,13 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
             stream=stream,
         )
 
-    launch_qr_int4.func.__name__ = f"launch_qr_int4_ws{world_size}_st{super_tile}"
+    # The inbox memory type changes the emitted store policy, so it has to be
+    # part of the symbol name -- two variants that differ only in cache bits
+    # must not collide in the JIT cache.
+    tag = f"ws{world_size}_st{super_tile}_{inbox_memory}"
+    launch_qr_int4.func.__name__ = f"launch_qr_int4_{tag}"
     try:
-        qr_int4.func.__name__ = f"qr_int4_ws{world_size}_st{super_tile}"
+        qr_int4.func.__name__ = f"qr_int4_{tag}"
     except AttributeError:
         pass
     return {
@@ -720,6 +785,10 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
         "wire_tile_bytes": wire_tile_bytes,
         "super_tile": super_tile,
         "world_size": world_size,
+        "inbox_memory": inbox_memory,
+        "payload_policy": payload_policy,
+        "flag_policy": flag_policy,
+        "release_writeback": release_writeback,
         "rank_atoms": rank_atoms,
         "grid": grid,
         "block": BLOCK,

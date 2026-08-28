@@ -14,6 +14,14 @@ class UncachedIpcHeap:
 
     _HIP_IPC_HANDLE_BYTES = 64
     _HIP_IPC_MEM_LAZY_ENABLE_PEER_ACCESS = 0x1
+    # hipExtMallocWithFlags modes. Uncached is right on xGMI, where the peer
+    # aperture has no penalty and skipping the caches keeps the handshake
+    # simple. It is catastrophic on PCIe: peer writes into uncached memory
+    # serialize per destination, so bandwidth collapses as the number of peers
+    # written grows (measured on MI350P: 55 GB/s to 1 peer, 4.45 to 2, 1.44 to
+    # 3, against 33.5 GB/s fine-grained). See docs/qr_int4_mi350p.md.
+    _HIP_DEVICE_MALLOC_DEFAULT = 0x0
+    _HIP_DEVICE_MALLOC_FINEGRAINED = 0x1
     _HIP_DEVICE_MALLOC_UNCACHED = 0x3
     _HIP_MEMCPY_HOST_TO_DEVICE = 1
     _hip = None
@@ -118,18 +126,32 @@ class UncachedIpcHeap:
         cls._hip_check(err, what="hipIpcCloseMemHandle")
 
     @classmethod
-    def alloc_uncached(cls, size: int) -> int:
+    def alloc(cls, size: int, flags: int | None = None) -> int:
+        """Zeroed device allocation, IPC-shareable, in the given memory mode.
+
+        *flags* is a ``hipExtMallocWithFlags`` mode; ``None`` means uncached.
+        Only uncached and fine-grained are used in practice -- coarse-grained
+        (``_HIP_DEVICE_MALLOC_DEFAULT``) additionally requires the kernel's
+        payload loads to bypass L2 (``sc0 sc1`` rather than the current ``nt``,
+        which is only a hint) and buys nothing over fine-grained on PCIe.
+        """
         hip = cls._load_hip()
+        if flags is None:
+            flags = cls._HIP_DEVICE_MALLOC_UNCACHED
         buf = ctypes.c_void_p()
         err = hip.hipExtMallocWithFlags(
             ctypes.byref(buf),
             ctypes.c_size_t(size),
-            ctypes.c_uint(cls._HIP_DEVICE_MALLOC_UNCACHED),
+            ctypes.c_uint(int(flags)),
         )
-        cls._hip_check(err, what="hipExtMallocWithFlags")
+        cls._hip_check(err, what=f"hipExtMallocWithFlags(flags={int(flags):#x})")
         err = hip.hipMemset(buf, 0, ctypes.c_size_t(size))
         cls._hip_check(err, what="hipMemset")
         return int(buf.value)
+
+    @classmethod
+    def alloc_uncached(cls, size: int) -> int:
+        return cls.alloc(size, cls._HIP_DEVICE_MALLOC_UNCACHED)
 
     @classmethod
     def copy_host_to_device(cls, dst_ptr: int, src, nbytes: int) -> None:

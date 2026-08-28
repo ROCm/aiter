@@ -138,6 +138,11 @@ def _run_rank(args) -> None:
         world_size=args.tp,
         super_tile=args.super_tile,
         grid_cap=args.grid_cap,
+        # The case list deliberately includes sub-threshold shapes (8x1024 is
+        # 16 KiB, well under MIN_PAYLOAD_BYTES) to cover the partial-tile path.
+        # That floor is a deployment policy about when INT4 is worth its SQNR,
+        # not a correctness bound, so it has no business gating these tests.
+        min_bytes=0,
     )
     compile_tokens = min(512, max(args.tokens))
     compile_hidden = max(args.hiddens)
