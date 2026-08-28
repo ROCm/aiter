@@ -572,3 +572,66 @@ op_tests/multigpu_tests/test_flydsl_comm_fused_full_tp8_perf.py
 - 保留 explicit system-release，不使用只在当前 ISA 上观察到可工作的 legacy ready；
 - 未匹配形状继续回退到现有 atomic + one-stage AR；
 - 正式入口的 7×100 A/B 必须再次满足 `<10 us` 且精度阈值不回退。
+
+## 12. ROCm 7.2.4 新环境的 Graph replay 下限
+
+2026-08-28 在同一台 MI355X 节点上完成了 code object、MORI、PyTorch 与
+HIP/HSA runtime 的交叉实验。结果表明，新镜像中单算子 Graph rank-max 从约
+`9.4 us` 回退到约 `13.3 us`，主要不是 kernel codegen 回退，而是
+`hipGraphLaunch` 提交吞吐下降。
+
+关键证据如下：
+
+| 对照 | M=1 fused Graph rank-max |
+|---|---:|
+| LLVM23 code object + ROCm 7.14 runtime | 约 9.42 us |
+| 同一 LLVM23 code object + ROCm 7.2.4 runtime | 约 13.25 us |
+| ROCm 7.2.4 runtime + 旧 MORI 20260810 | 约 16.98 us |
+| ROCm 7.14 runtime + 新 MORI 20260826 | 约 9.47 us |
+
+因此 MORI 不是根因；新 MORI 在 7.2.4 上反而比旧 MORI 更好。单 GPU 的最小
+Graph replay 测试也给出了相同结论：
+
+| 用户态 runtime | 单节点 Graph replay 提交时间 |
+|---|---:|
+| ROCm 7.2.4 | 约 9.3--10.0 us |
+| ROCm 7.14 | 约 4.6--5.6 us |
+
+PyTorch 2.10 保持不变、仅交叉加载 ROCm 7.14 HIP/HSA 后，最小 Graph replay
+也恢复到约 `5.5 us`，因此差异位于 HIP/HSA 用户态 runtime，而不是 PyTorch
+`CUDAGraph.replay()` 的 Python 封装。
+
+设备 trace 进一步显示：在 8 个 rank 同步起跑的样本中，ROCm 7.2.4 下同一
+fused kernel 的设备执行时间仍约为 `8.7--10.2 us`。较长样本表现为先启动的
+rank 在 kernel 内等待晚启动的 peer，而不是 GEMM/AllReduce 指令本身变慢。
+
+为消除每次只 replay 一个极短 graph 时的 host/runtime 吞吐上限，在同一 graph
+中捕获 16 次调用并均摊后，当前 LLVM24/JIT kernel 得到：
+
+| M | fused | ordinary |
+|---:|---:|---:|
+| 1 | **8.72 us** | 14.44 us |
+| 2 | **10.58 us** | 16.50 us |
+
+这说明当前 kernel 本体仍优于原来的 `M=1 9.6 us / M=2 12.7 us` 门槛。整网
+CUDA Graph 一次 replay 包含完整模型，`hipGraphLaunch` 固定成本只支付一次，
+不应把单节点 graph 的提交下限重复计入每个 MoE kernel。
+
+已排除的本地绕过方式：
+
+- `enable-post-misched=false`、expert scheduling、LSR、delay-ALU、kernarg preload
+  等编译开关没有改善 ISA 或性能；
+- `DEBUG_HIP_GRAPH_SEGMENT_SCHEDULING=0` 虽降低单 GPU 极小 graph 的提交时间，
+  但真实 TP8 M=1 回退到约 `19.5 us`，不可使用；
+- `AMD_DIRECT_DISPATCH=0`、force async queue、graph batch size、kernarg copy 等
+  runtime 开关均无有效收益；
+- ROCm 7.14 HIP 与 ROCm 7.2.4 HSA 不能混装，缺少
+  `hsa_amd_vmem_export_fabric_handle`；整套旧 HIP/HSA 与当前 PyTorch 的
+  symmetric-memory allocator 也不兼容，不能作为产品方案。
+
+ROCm 7.2.4 的 CLR 分支尚未包含后续 graph fast-dispatch 优化，包括 flat AQL
+packet buffer (`bdbc555`)、instantiate-time dependency 预计算 (`b203915`) 和
+Ext dispatch sync-plan 优化 (`8750dbd`)。
+若产品要求恢复单 graph replay 的绝对延迟，应升级匹配的 ROCm/PyTorch 用户态栈，
+或在发行版 runtime 中回移对应 CLR 修复；继续修改 small-M kernel 编译参数不能解决
+这个 runtime floor。

@@ -4,8 +4,8 @@
 
 from __future__ import annotations
 
-import functools
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import torch
 
@@ -32,7 +32,9 @@ class CommFusedMoeRuntime:
     def run(
         self,
         *,
-        shared_partial: torch.Tensor,
+        shared_partial: torch.Tensor | None,
+        before_stage2: Callable[[], torch.Tensor] | None = None,
+        stage2_stream: torch.cuda.Stream | None = None,
         **moe_args: Any,
     ) -> torch.Tensor:
         """Run ordinary MoE through Stage1 and fuse the complete Stage2 result."""
@@ -59,17 +61,28 @@ class CommFusedMoeRuntime:
             moe_args["topk_weight"] = padded_weight
             moe_args["topk_ids"] = padded_ids
 
-            padded_shared = runner.output
-            padded_shared[:raw_tokens].copy_(shared_partial)
-            padded_shared[raw_tokens:].zero_()
-            shared_partial = padded_shared
+        def stage2_override(**kwargs: Any):
+            def launch():
+                current_shared = shared_partial
+                if before_stage2 is not None:
+                    current_shared = before_stage2()
+                if current_shared is None:
+                    raise RuntimeError("comm-fused Stage2 requires shared_partial")
+                if bucket != raw_tokens:
+                    padded_shared = runner.output
+                    padded_shared[:raw_tokens].copy_(current_shared)
+                    padded_shared[raw_tokens:].zero_()
+                    current_shared = padded_shared
+                return runner(shared_partial=current_shared, **kwargs)
+
+            if stage2_stream is None:
+                return launch()
+            with torch.cuda.stream(stage2_stream):
+                return launch()
 
         output = _fused_moe_impl(
             **moe_args,
-            _stage2_override=functools.partial(
-                runner,
-                shared_partial=shared_partial,
-            ),
+            _stage2_override=stage2_override,
         )
         return output if raw_tokens == bucket else output[:raw_tokens]
 

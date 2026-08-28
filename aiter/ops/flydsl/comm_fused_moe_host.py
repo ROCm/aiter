@@ -4,6 +4,7 @@
 import csv
 from dataclasses import dataclass, fields
 from functools import cache
+from math import prod
 from pathlib import Path
 
 import flydsl.expr as fx
@@ -12,11 +13,13 @@ import torch.distributed._symmetric_memory as symm_mem
 from mori.cco import Communicator
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.ops.flydsl.kernels.comm_fused_moe import atomic_compressed
-from aiter.ops.flydsl.kernels.comm_fused_moe import full_width
-from aiter.ops.flydsl.kernels.comm_fused_moe import persistent_window
-from aiter.ops.flydsl.kernels.comm_fused_moe import small_m_allreduce
-from aiter.ops.flydsl.kernels.comm_fused_moe import windowed
+from aiter.ops.flydsl.kernels.comm_fused_moe import (
+    atomic_compressed,
+    full_width,
+    persistent_window,
+    small_m_allreduce,
+    windowed,
+)
 from aiter.ops.flydsl.kernels.comm_fused_moe.sync import (
     FLAT_VA_RANK_STRIDE,
     compile_epoch_barrier,
@@ -24,8 +27,8 @@ from aiter.ops.flydsl.kernels.comm_fused_moe.sync import (
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 from aiter.ops.flydsl.moe_kernels import _run_compiled
 
-
 _CONFIG_PATH = Path(__file__).parents[2] / "configs" / "comm_fused_moe.csv"
+_ARENA_ALIGNMENT = 64 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +94,10 @@ def _symmetric(device, shape) -> torch.Tensor:
     return symm_mem.empty(shape, dtype=torch.uint8, device=device)
 
 
+def _align_up(value: int, alignment: int) -> int:
+    return (value + alignment - 1) // alignment * alignment
+
+
 def _workspace(device, payload_bytes: int) -> torch.Tensor:
     tensor = _symmetric(device, ((payload_bytes + 8 + 255) // 256 * 256,))
     tensor[payload_bytes : payload_bytes + 8].zero_()
@@ -108,6 +115,44 @@ def _register(tp_group, rank: int, tp: int, tensors):
     )
     bases = tuple(w.local_ptr - rank * FLAT_VA_RANK_STRIDE for w in windows)
     return comm, windows, bases
+
+
+def _allocate_registered(
+    tp_group,
+    rank: int,
+    tp: int,
+    device,
+    specs: tuple[tuple[tuple[int, ...], torch.dtype], ...],
+):
+    """Allocate typed views in one symmetric arena and register it once."""
+    layouts = []
+    arena_bytes = 0
+    for shape, dtype in specs:
+        arena_bytes = _align_up(arena_bytes, _ARENA_ALIGNMENT)
+        element_size = torch.empty((), dtype=dtype).element_size()
+        nbytes = prod(shape) * element_size
+        layouts.append((arena_bytes, nbytes, shape, dtype))
+        arena_bytes += nbytes
+    arena_bytes = _align_up(arena_bytes, _ARENA_ALIGNMENT)
+    if arena_bytes > FLAT_VA_RANK_STRIDE:
+        raise ValueError(
+            f"comm-fused symmetric arena requires {arena_bytes} bytes, "
+            f"exceeding per-rank VMM stride {FLAT_VA_RANK_STRIDE}"
+        )
+
+    arena = _symmetric(device, (arena_bytes,))
+    views = tuple(
+        arena.narrow(0, offset, nbytes).view(dtype).view(shape)
+        for offset, nbytes, shape, dtype in layouts
+    )
+    comm, windows, (arena_flat_base,) = _register(
+        tp_group, rank, tp, (arena,)
+    )
+    arena_address = arena.data_ptr()
+    bases = tuple(
+        arena_flat_base + view.data_ptr() - arena_address for view in views
+    )
+    return arena, views, comm, windows, bases
 
 
 def _barrier(tensor, flat_base, ready_offset, stream) -> None:
@@ -151,26 +196,30 @@ class _SmallMRunner:
         self.config = config
         self.rank = int(tp_group.rank_in_group)
         self.device = torch.device(tp_group.device)
-        self.routes = symm_mem.empty(
-            (config.m * k.M1_TOPK, k.DEFAULT_HIDDEN),
-            dtype=torch.bfloat16,
-            device=self.device,
+        self.arena, views, self.comm, self.windows, bases = _allocate_registered(
+            tp_group,
+            self.rank,
+            k.TP,
+            self.device,
+            (
+                (
+                    (config.m * k.M1_TOPK, k.DEFAULT_HIDDEN),
+                    torch.bfloat16,
+                ),
+                (
+                    (k.M1_PARTIAL_BUFFERS, config.m, k.DEFAULT_HIDDEN),
+                    torch.bfloat16,
+                ),
+                ((k.m1_state_layout(config)[-1],), torch.uint8),
+            ),
         )
-        self.partial = symm_mem.empty(
-            (k.M1_PARTIAL_BUFFERS, config.m, k.DEFAULT_HIDDEN),
-            dtype=torch.bfloat16,
-            device=self.device,
-        )
-        self.state = _symmetric(self.device, (k.m1_state_layout(config)[-1],))
+        self.routes, self.partial, self.state = views
         self.output = torch.empty(
             (config.m, k.DEFAULT_HIDDEN),
             dtype=torch.bfloat16,
             device=self.device,
         )
         self.state.zero_()
-        self.comm, self.windows, bases = _register(
-            tp_group, self.rank, k.TP, (self.routes, self.partial, self.state)
-        )
         _routes_flat_base, self.partial_flat_base, self.state_flat_base = bases
         self.kernel = k.compile_m1_gemm2_allreduce(config, self.rank)
 
@@ -749,8 +798,27 @@ class _LazyRunners:
         return self.instances[tokens]
 
 
+class _LayerIsolatedSmallRunners:
+    """Keep small-M mutable arenas private while sharing all other runners."""
+
+    def __init__(self, shared: _LazyRunners) -> None:
+        self.shared = shared
+        self.instances = {}
+
+    def __contains__(self, tokens: int) -> bool:
+        return tokens in self.shared
+
+    def __getitem__(self, tokens: int):
+        config = self.shared.configs[tokens]
+        if not isinstance(config, small_m_allreduce.Config):
+            return self.shared[tokens]
+        if tokens not in self.instances:
+            self.instances[tokens] = create_runner(self.shared.tp_group, config)
+        return self.instances[tokens]
+
+
 def create_flydsl_comm_fused_runners(
-    *, tp_group, model_dim, inter_dim, experts, topk
+    *, tp_group, model_dim, inter_dim, experts, topk, isolate_small=False
 ):
     shape = ShapeKey(
         get_gfx_runtime(),
@@ -763,4 +831,5 @@ def create_flydsl_comm_fused_runners(
     key = (id(tp_group), shape)
     if key not in _RUNNER_CACHE:
         _RUNNER_CACHE[key] = _LazyRunners(tp_group, winners_for(shape))
-    return _RUNNER_CACHE[key]
+    shared = _RUNNER_CACHE[key]
+    return _LayerIsolatedSmallRunners(shared) if isolate_small else shared
