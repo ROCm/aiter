@@ -47,7 +47,6 @@ class _JaggedDenseBmmBroadcastAdd(torch.autograd.Function):
         seq_offsets,
         n_groups,
         max_seq_len,
-        stream,
         uniform_seqlen,
     ):
         import flydsl.compiler as flyc
@@ -84,14 +83,12 @@ class _JaggedDenseBmmBroadcastAdd(torch.autograd.Function):
             seq_offsets,
             n_groups,
             max_seq_len,
-            stream=stream,
             uniform_seqlen=uniform_seqlen,
         )
 
         ctx.save_for_backward(jagged_k, dense_k, seq_offsets)
         ctx.n_groups = n_groups
         ctx.max_seq_len = max_seq_len
-        ctx.stream = stream
         return out[:L]
 
     @staticmethod
@@ -111,11 +108,10 @@ class _JaggedDenseBmmBroadcastAdd(torch.autograd.Function):
             seq_offsets,
             n_groups=ctx.n_groups,
             max_seq_len=ctx.max_seq_len,
-            stream=ctx.stream,
         )
         # Grads for (jagged, dense, bias, seq_offsets, n_groups, max_seq_len,
-        # stream, uniform_seqlen). Only the first three are differentiable.
-        return d_jagged, d_dense, d_bias, None, None, None, None, None
+        # uniform_seqlen). Only the first three are differentiable.
+        return d_jagged, d_dense, d_bias, None, None, None, None
 
 
 def jagged_dense_bmm_autograd(
@@ -125,7 +121,6 @@ def jagged_dense_bmm_autograd(
     seq_offsets: torch.Tensor,  # (n_groups + 1,)  int32 prefix-sum offsets
     n_groups: int | None = None,
     max_seq_len: int | None = None,
-    stream=None,
     uniform_seqlen: bool = True,
 ):
     """Autograd-enabled jdbba: returns ``Out (L, N)`` with a fused backward.
@@ -170,6 +165,5 @@ def jagged_dense_bmm_autograd(
         seq_offsets,
         n_groups,
         int(max_seq_len),
-        stream,
         uniform_seqlen,
     )
