@@ -285,7 +285,7 @@ def test_op(
         if arch_info.get_arch() == "gfx1250":
             swizzle_mx_scale = "GFX1250_SCALE"
             w_scale_tri = shuffle_scale_moe(
-                w_scale_tri, arch="gfx1250", preshuffle_factor=32, scale_kwidth=8
+                w_scale_tri, arch="gfx1250", preshuffle_factor=32, scale_kwidth=4
             )
         else:
             assert arch_info.get_arch() == "gfx950"
