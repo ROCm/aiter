@@ -169,9 +169,14 @@ The ``mega_moe`` op runs both sides of the comparison:
 
 Token sweeps come from one variable, AITER_BENCH_TOKENS (see Environment
 above). The ops do not share a supported range -- score_qk asserts out past
-batch 1024, a16w16's launcher refuses operands over 4 GiB, inverse_rope faults
-at its largest tokens -- so ops whose usable range is fixed pin their sweep in
-the source and ignore the variable.
+batch 1024, inverse_rope faults at its largest tokens -- so ops whose usable
+range is fixed pin their sweep in the source and ignore the variable.
+
+``a16w16`` is not one of them: its range is a function of what opus has tuned,
+not a fixed limit. Shapes with no tuned winner fall back to a split-K kid whose
+launcher is 32-bit gmem-descriptor bound, which is both slow and, at M=65536,
+wrong. Re-tuning through csrc/gemm_a16w16/gemm_a16w16_tune.py --libtype opus is
+what widens the range, so the bench predicts nothing and reports what it gets.
 
 gfx1250's bundled CK does not compile, so the asm JIT modules must be built with
 ENABLE_CK=0. The script sets it (before importing aiter) so a plain run just
@@ -251,13 +256,20 @@ with _silence():
     from aiter.test_common import run_perftest
 
 SUPPORTED_GFX = ["gfx1250"]
-# The gfx1250 launcher addresses gmem with 32-bit descriptors.
-_GMEM_DESCRIPTOR_LIMIT = 4 << 30
 # a16w16 N shapes at K=7168: attention/router projections, then lm_head twice
 # (129280 is the DeepSeek vocab, 32320 is that sharded over TP4).
 _A16W16_NS = (64, 384, 1024, 2048, 32320, 129280)
+# lm_head cap. A shape judgement, not a kernel limit: lm_head runs one row per
+# sequence, so M past this is not something the model produces, and M*N alone
+# is 16 GB of bf16 output at (65536, 129280).
 _A16W16_WIDE_N = 2048
 _A16W16_WIDE_N_MAX_M = 2048
+# a16w16 returns its own error ratio, and a wrong answer here is silent: the UT
+# neither raises nor prints a warning. Measured on gfx1250 / 20260827, every
+# shape that computed correctly came back 0 or ~1e-5, while M=65536 came back
+# 0.96-0.99 on all four of its N -- an unrelated result, not a tolerance miss.
+# Anything above this is reported as a failed op rather than printed as data.
+_A16W16_MAX_ERR = 1e-2
 
 
 def _tokens(default=None):
@@ -281,6 +293,10 @@ def _tokens(default=None):
 # keep one here. The ops that shell out pass no shape flag unless asked, letting
 # each UT sweep the range its owner maintains.
 _TOKENS = _tokens((1, 16, 32, 64, 128, 256, 512, 1024, 2048, 65536))
+# a16w16's M is the token count, and the global sweep jumps 2048 -> 65536, so
+# the prefill chunk sizes never got measured on the BF16 linears. Add them to
+# this op's default; AITER_BENCH_TOKENS still overrides the whole thing.
+_A16W16_MS = _tokens(tuple(sorted({*_TOKENS, 4096, 8192, 16384})))
 # Pinned, not env-driven. This axis is -s (sequence length) at a fixed
 # -b 128,16, not the token count the other ops sweep, so a global setting would
 # mean something different here. 65536 is left off: it faults, and in the
@@ -297,7 +313,20 @@ _SCORE_QK_KV_LENGTHS = (
     ("16K/4K average", "4608"),
     ("32K/16K average", "10240"),
 )
-_A8W8_BLOCKSCALE_TOKENS = _tokens()
+# Was unset, which let the UT sweep its own 27-value default down to M=1. Two
+# reasons to set it. First, M here is the token count of one step, so the small
+# end of that default is decode batch and the large end is prefill chunk; this
+# list is the prefill side, up to the 65536 the other DSv4 ops sweep and past
+# the UT default's own ceiling of 10240. Second, the small M are what walk into
+# the UT bug described at "a8w8_blockscale" below: get_CKGEMM_config retries the
+# lookup as M -> get_padded_m(gl=0) -> nextPow2, so anything in [1, 16] or
+# [33, 64] can land on one of #4773's M=16/M=64 gluon rows (gemm_common.cu:13).
+# Starting at 1024 clears both ranges by a wide margin.
+#
+# Two things stop being covered, both worth remembering: decode-side M, and the
+# 11 tuned rows that are the only shapes dispatching to gluon. This is a way
+# around the UT bug, not a fix for it.
+_A8W8_BLOCKSCALE_TOKENS = _tokens((1024, 2048, 4096, 8192, 16384, 65536))
 # Pinned, not env-driven. Decode carries one token per sequence, so the token
 # axis here is the batch, and past 1024 it stops being a shape the model runs.
 # AITER_BENCH_TOKENS is deliberately not consulted for this op.
@@ -1086,26 +1115,40 @@ def run_a16w16(_args):
     # so capture the block and parse that line back out.
     batch, K = 1, 7168
     rows = []
-    for M, n in itertools.product(_TOKENS, _A16W16_NS):
+    for M, n in itertools.product(_A16W16_MS, _A16W16_NS):
         # N=32320/129280 is lm_head (the DeepSeek vocab, whole and TP4-sharded).
-        # lm_head only ever sees one row per sequence, so a large M there is not
-        # a shape the model produces -- and M*N*2 passes 4 GiB anyway.
+        # See _A16W16_WIDE_N: this is the one shape rule left here, and it is
+        # about what DSv4 runs, not about what the kernel can do.
         if n > _A16W16_WIDE_N and M > _A16W16_WIDE_N_MAX_M:
             rows.append({"batch": batch, "M": M, "N": n, "K": K,
                          "err_msg": f"skipped: N>{_A16W16_WIDE_N} is lm_head, "
                                     f"capped at M<={_A16W16_WIDE_N_MAX_M}"})
             continue
-        # The gfx1250 launcher addresses gmem with 32-bit descriptors, so the
-        # heuristic refuses any operand past 4 GiB (opus_gemm_arch_gfx1250.cuh)
-        # and raises instead of running. Skip those rather than fail the sweep.
-        if max(M * K, n * K, M * n) * 2 > _GMEM_DESCRIPTOR_LIMIT:
+        # No >4 GiB pre-check. opus_dispatch_a16w16_gfx1250 tries the tuned
+        # table FIRST and returns on a hit; check_shape_4g runs only after that
+        # misses (opus_gemm_arch_gfx1250.cuh:161), on the way to the split-K
+        # heuristic kid -- whose launcher is what builds the 32-bit gmem
+        # descriptors. A tuned 4wave_wl_co winner never reaches it: that
+        # pipeline addresses gmem through TDM descriptors, which clamp every
+        # dimension and are not 32-bit bounded. So the limit belongs to one
+        # fallback path, not to a16w16, and predicting it here would keep
+        # skipping shapes that tuning has already made runnable. Let the kernel
+        # raise and record that instead.
+        try:
+            with _capture() as box:
+                err = a16w16_mod.test_a16w16(batch=batch, M=M, N=n, K=K)
+        except Exception as exc:  # noqa: BLE001 - one shape must not end the sweep
             rows.append({"batch": batch, "M": M, "N": n, "K": K,
-                         "err_msg": "skipped: >4GiB operand"})
+                         "err_msg": f"{type(exc).__name__}: {exc}"})
             continue
-        with _capture() as box:
-            err = a16w16_mod.test_a16w16(batch=batch, M=M, N=n, K=K)
         captured = box[0].splitlines()
         row = {"batch": batch, "M": M, "N": n, "K": K, "err": err}
+        # float(): checkAllclose returns a bare 0 for a clean compare but a
+        # numpy/torch scalar for a mismatch, and only one of those formats.
+        if err is not None and float(err) > _A16W16_MAX_ERR:
+            row["err_msg"] = (f"WRONG RESULT: err={float(err):g} "
+                              f"> {_A16W16_MAX_ERR:g}")
+            _note_failure(f"a16w16 M={M} N={n} K={K}", row["err_msg"])
         for line in captured:
             if not line.startswith("[a16w16]"):
                 continue
@@ -1615,26 +1658,54 @@ DSV4_OPS = [
     # runs: 20260827, the six DSv4 (n,k) at -m 512 give err=0 at 1210-3564
     # TFLOPS, over ck / asm / flydsl.
     #
-    # What kills it is the tuning table. gemm_op_a8w8.py routes a shape whose
-    # winning row has libtype=triton into gemm_afp8wfp8_preshuffle with
-    # backend="gluon", and that gluon kernel does not compile on this image
-    # (PassManager::run failed in triton's make_llir). gfx1250 has 11 such rows,
-    # all at M=16 and M=64, added by #4773 -- which replaced 11 faster flydsl
-    # rows and copied their tflops/bw columns over unchanged, so the rows do not
-    # even agree with their own us.
+    # What kills it is one line of the UT. An earlier note here blamed #4773's
+    # gluon tuning rows; that was wrong, and re-tuning would not have helped.
+    # test_gemm_a8w8_blockscale.py:120 runs an extra "ck strided x_scale" check
+    # on x_scale.transpose(0,1).contiguous().transpose(0,1) -- the same bytes
+    # the measured call gets, but stride (1, M) instead of contiguous. #4406
+    # added it to cover its own "honor strided x_scale" fix and gated it on
+    # `if ck_preshuffle:` alone.
     #
-    # All 11 were run: 11/11 fail, across K 768..7168 and N 1536..16384, every
-    # one at the same make_llir. Three shapes whose M misses those rows pass.
-    # So this is the gluon kernel, not eleven unlucky configs -- re-tuning
-    # cannot fix it either, since the tuner would fail to compile the same
-    # candidates and simply drop them.
+    # Too wide a gate. The fp32 blockscale path does probe stride(0) != 1 to
+    # learn the layout, so strided coverage means something there. The mxfp8_128
+    # path this op runs (--flydsl --ck_preshuffle) does not: it declares the
+    # layout with is_x_scale_transposed=True and never reads the stride
+    # (gemm_op_a8w8.py:978-985 states the contract -- x_scale bytes are
+    # column-major (K//128, M) inside a contiguous (M, K//128) tensor). So the
+    # strided tensor exercises nothing real here; it only hands triton a
+    # stride != 1 specialization that dies in make_llir.
     #
-    # This op passes no -m, so the UT sweeps its 28-value default and hits M=2
-    # (padded onto the M=16 row) on the second value. Measured at n=2048,k=7168:
-    # 1/32/96/112/128/512 pass, 2/4/8/16/64 fail, 4/4 reproducible either way.
-    # Pinning -m past those M would make it runnable here, but the reported
-    # kernel would no longer be the tuned one. Fix #4773's rows instead.
-    # "a8w8_blockscale",
+    # A/B 20260828, that line the only variable. The matrix is 162 cases: the
+    # UT's 27-value default -m, times this op's six (n,k), M outer. As written
+    # the sweep dies on case 2 (M=2, padded onto the M=16 row); with
+    # .view(*x_scale.shape) it reaches case 160 -- so every M through 8192,
+    # M=16 and M=64 among them. Those are exactly the M #4773's rows cover, so
+    # the gluon kernel compiles and runs once the layout is right. (Case count
+    # is derived from where the fault lands, not from a per-case log: _run_child
+    # keeps only the last 30 lines, and a GPU fault is fatal, so reaching M's
+    # 27th value is itself the proof the first 26 completed.)
+    #
+    # The patched sweep still ends in a GPU fault at its last M, but that is a
+    # separate, older story: m=10240 n=7168 k=3072 run alone passes at err=0,
+    # 1220 TFLOPS, split-K checks included. Same shape as a fresh process, so
+    # state carried across cases -- see the f4gemm note above.
+    #
+    # The fix is upstream's call: that gate wants to be `ck_preshuffle and not
+    # use_flydsl_fp8_scale`, matching how the asm/triton block below already
+    # excludes this path. Narrowing the gate is the right shape of fix, not
+    # rewriting the line as .view() -- the two calls differ only in stride, so
+    # .view() would collapse them and drop coverage of the is_x_scale_tranposed
+    # == False branch that #4406 added the line for. Evidence either way:
+    # -m 16 -nk 2048,7168 --ck_preshuffle True passes the strided check with
+    # the line untouched, and only adding --flydsl makes it crash.
+    #
+    # Back in the sweep because _A8W8_BLOCKSCALE_TOKENS now starts at 1024,
+    # which keeps every shape clear of the M that reach those rows. Verified on
+    # 20260828, rocm/fw-bringup:gfx1250-atom--20260827-ubench: 36/36 cases,
+    # err=0 on all, 2207-7003 TFLOPS. That run also clears M=10240, the shape
+    # the earlier sweep faulted on -- more evidence that fault was cross-case
+    # state and not the shape.
+    "a8w8_blockscale",
     "a16w16",
     "mla_v4_decode",
     "inverse_rope",
