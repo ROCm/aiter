@@ -3,22 +3,27 @@
 
 import argparse
 import itertools
+import statistics
+import time
 
-import aiter
 import pandas as pd
 import pytest
 import torch
+
+import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import topk_per_row as topk_per_row_impl
 from aiter.ops.flydsl.kernels.topk_per_row_decode import (
     topk_per_row_decode_workspace_shapes,
 )
-from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.test_common import benchmark, checkAllclose
 
 torch.set_default_device("cuda")
 
 SUPPORTED_GFX = ["gfx942", "gfx950"]
+E2E_WARMUP_ITERS = 20
+E2E_TIMED_ITERS = 101
 
 
 def test_flydsl_topk_three_pass_workspace_geometry():
@@ -27,7 +32,9 @@ def test_flydsl_topk_three_pass_workspace_geometry():
 
 
 def test_flydsl_topk_workspace_cache_reuses_allocation():
-    rows, context_len, top_k = 4, 4096, 2048
+    rows = 4
+    context_len = topk_per_row_impl._ONE_WORKGROUP_MAX_ROW_WIDTH + 1
+    top_k = 2048
     logits = torch.randn((rows, context_len), dtype=torch.float32, device="cuda")
     seq_lens = torch.full((rows,), context_len, dtype=torch.int32, device=logits.device)
     output = torch.empty((rows, top_k), dtype=torch.int32, device=logits.device)
@@ -42,6 +49,53 @@ def test_flydsl_topk_workspace_cache_reuses_allocation():
         assert cache_info.hits >= 1
     finally:
         topk_per_row_impl.clear_topk_per_row_decode_workspace_cache()
+
+
+@pytest.mark.parametrize("stable", [False, True])
+def test_flydsl_topk_dynamic_n_reuses_launcher(stable: bool):
+    rows, top_k = 4, 2048
+    topk_per_row_impl._get_topk_launcher.cache_clear()
+    topk_per_row_impl.clear_topk_per_row_decode_workspace_cache()
+    try:
+        for context_len in (20_001, 40_003):
+            logits = torch.randn(
+                (rows, context_len), dtype=torch.float32, device="cuda"
+            )
+            seq_lens = torch.full(
+                (rows,), context_len, dtype=torch.int32, device="cuda"
+            )
+            output = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
+            reference = torch.empty_like(output)
+            _run_flydsl(logits, 1, seq_lens, output, top_k, stable)
+            _run_hip(logits, 1, seq_lens, reference, top_k, stable)
+            torch.cuda.synchronize()
+            if stable:
+                torch.testing.assert_close(output, reference, rtol=0, atol=0)
+            else:
+                torch.testing.assert_close(
+                    torch.sort(output, dim=1).values,
+                    torch.sort(reference, dim=1).values,
+                    rtol=0,
+                    atol=0,
+                )
+
+        cache_info = topk_per_row_impl._get_topk_launcher.cache_info()
+        assert cache_info.misses == 1
+        assert cache_info.hits >= 1
+    finally:
+        topk_per_row_impl._get_topk_launcher.cache_clear()
+        topk_per_row_impl.clear_topk_per_row_decode_workspace_cache()
+
+
+def test_flydsl_topk_rejects_strided_seq_lens():
+    rows, context_len, top_k = 4, 20_001, 2048
+    logits = torch.randn((rows, context_len), dtype=torch.float32, device="cuda")
+    seq_lens = torch.full((rows * 2,), context_len, dtype=torch.int32, device="cuda")[
+        ::2
+    ]
+    output = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError, match="seq_lens must be contiguous"):
+        _run_flydsl(logits, 1, seq_lens, output, top_k, True)
 
 
 def run_torch(
@@ -120,6 +174,31 @@ def _run_hip(
     return indices
 
 
+def _run_blocking_e2e(candidates):
+    """Measure Host call through post-call GPU synchronization."""
+    names = tuple(candidates)
+    outputs = {}
+    for _ in range(E2E_WARMUP_ITERS):
+        for name in names:
+            outputs[name] = candidates[name]()
+    torch.cuda.synchronize()
+
+    samples = {name: [] for name in names}
+    for iteration in range(E2E_TIMED_ITERS):
+        order = names if iteration % 2 == 0 else names[::-1]
+        for name in order:
+            start_ns = time.perf_counter_ns()
+            output = candidates[name]()
+            torch.cuda.synchronize()
+            samples[name].append((time.perf_counter_ns() - start_ns) / 1000.0)
+            outputs[name] = output
+
+    return outputs, {
+        name: statistics.median(candidate_samples)
+        for name, candidate_samples in samples.items()
+    }
+
+
 @pytest.mark.parametrize("stable", [False, True])
 def test_flydsl_topk_short_rows_are_minus_one_padded(stable: bool):
     top_k = 2048
@@ -164,6 +243,78 @@ def test_flydsl_topk_short_rows_are_minus_one_padded(stable: bool):
             assert torch.all(output[row, valid_len:] == -1), (
                 f"{name} row {row} did not overwrite its padded tail"
             )
+
+
+def test_flydsl_topk_single_row_persistent_graph():
+    top_k = 2048
+    context_len = 65536
+    logits = torch.randn((1, context_len), dtype=torch.float32, device="cuda")
+    seq_lens = torch.full((1,), context_len, dtype=torch.int32, device="cuda")
+    output = torch.empty((1, top_k), dtype=torch.int32, device="cuda")
+    reference = torch.empty_like(output)
+
+    # Warm the launcher and persistent workspace before graph capture.
+    _run_flydsl(logits, 1, seq_lens, output, top_k, True)
+    _run_hip(logits, 1, seq_lens, reference, top_k, True)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, reference, rtol=0, atol=0)
+
+    graph_lens = seq_lens.clone()
+    graph_output = torch.full_like(output, -777)
+    _run_flydsl(logits, 1, graph_lens, graph_output, top_k, True)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _run_flydsl(logits, 1, graph_lens, graph_output, top_k, True)
+
+    # Exercise stable ties, then transition to the direct-fill path on replay.
+    logits.zero_()
+    graph.replay()
+    _run_hip(logits, 1, seq_lens, reference, top_k, True)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(graph_output, reference, rtol=0, atol=0)
+
+    graph_lens.fill_(1)
+    graph.replay()
+    _run_hip(logits, 1, graph_lens, reference, top_k, True)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(graph_output, reference, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("num_rows", [2, 32])
+def test_flydsl_topk_short_multi_row_one_workgroup_graph(num_rows: int):
+    top_k = 2048
+    context_len = 20_000
+    torch.manual_seed(20260828 + num_rows)
+    logits = torch.randint(
+        -8,
+        9,
+        (num_rows, context_len),
+        dtype=torch.int32,
+        device="cuda",
+    ).to(torch.float32)
+    seq_lens = torch.full((num_rows,), context_len, dtype=torch.int32, device="cuda")
+    graph_output = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
+    reference = torch.empty_like(graph_output)
+
+    _run_flydsl(logits, 1, seq_lens, graph_output, top_k, True)
+    _run_hip(logits, 1, seq_lens, reference, top_k, True)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(graph_output, reference, rtol=0, atol=0)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _run_flydsl(logits, 1, seq_lens, graph_output, top_k, True)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(graph_output, reference, rtol=0, atol=0)
+
+    # Reuse the captured graph with shorter rows to exercise dynamic row bounds.
+    seq_lens.fill_(top_k + 17)
+    graph.replay()
+    _run_hip(logits, 1, seq_lens, reference, top_k, True)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(graph_output, reference, rtol=0, atol=0)
 
 
 def test_flydsl_topk_three_pass_matches_hip():
@@ -257,9 +408,11 @@ def test_flydsl_topk_decode(
         "flydsl"
     ].numel() * outputs["flydsl"].element_size()
     ref_compare = (ref if stable else torch.sort(ref, dim=-1).values).to(dtypes.fp32)
-    ret = {"gfx": get_gfx()}
-    for name, fn in candidates.items():
-        out, us = run_perftest(fn)
+    timed_outputs, e2e_us = _run_blocking_e2e(candidates)
+    ret = {"gfx": get_gfx(), "timing": "Host call + GPU sync"}
+    for name in candidates:
+        out = timed_outputs[name]
+        us = e2e_us[name]
         out_compare = (out if stable else torch.sort(out, dim=-1).values).to(
             dtypes.fp32
         )
