@@ -1139,22 +1139,22 @@ bool run(const ck_tile::ArgParser& arg_parser)
         {
             const bool is_group = (mode == mode_enum::group);
 
-            fmha_fwd_bf16_opus_args opus_args;
-            opus_args.q_ptr   = q_buf.GetDeviceBuffer();
-            opus_args.k_ptr   = k_buf.GetDeviceBuffer();
-            opus_args.v_ptr   = v_buf.GetDeviceBuffer();
-            opus_args.o_ptr   = o_buf.GetDeviceBuffer();
-            opus_args.lse_ptr = (lse ? lse_buf.GetDeviceBuffer() : nullptr);
+            fmha_fwd_bf16_opus_args opus_args{};
+            opus_args.q_ptr     = q_buf.GetDeviceBuffer();
+            opus_args.k_ptr     = k_buf.GetDeviceBuffer();
+            opus_args.v_ptr     = v_buf.GetDeviceBuffer();
+            opus_args.o_ptr     = o_buf.GetDeviceBuffer();
+            opus_args.lse_ptr   = (lse ? lse_buf.GetDeviceBuffer() : nullptr);
             opus_args.data_type = data_type;
 
             // seqstart_q/k already hold the padded starts when a padded seqlen_k was asked
             // for, so the same pair covers the real and the physical role either way.
             if(is_group)
             {
-                const int* sq = static_cast<const int*>(seqstart_q.GetDeviceBuffer());
-                const int* sk = static_cast<const int*>(seqstart_k.GetDeviceBuffer());
-                opus_args.seqstart_q_ptr     = sq;
-                opus_args.seqstart_k_ptr     = sk;
+                const int* sq            = static_cast<const int*>(seqstart_q.GetDeviceBuffer());
+                const int* sk            = static_cast<const int*>(seqstart_k.GetDeviceBuffer());
+                opus_args.seqstart_q_ptr = sq;
+                opus_args.seqstart_k_ptr = sk;
                 opus_args.seqstart_q_pad_ptr = sq;
                 opus_args.seqstart_k_pad_ptr = sk;
             }
@@ -1192,8 +1192,8 @@ bool run(const ck_tile::ArgParser& arg_parser)
             opus_args.causal        = (mask.type != mask_enum::no_mask);
 
             bool launched = true;
-            const float t = ck_tile::launch_kernel(
-                stream_config, [&](const ck_tile::stream_config& s_) {
+            const float t =
+                ck_tile::launch_kernel(stream_config, [&](const ck_tile::stream_config& s_) {
                     launched = fmha_fwd_bf16_opus_launch(opus_args, s_.stream_id_);
                 });
             return launched ? t : -1.f;

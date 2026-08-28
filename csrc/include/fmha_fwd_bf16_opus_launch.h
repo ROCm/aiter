@@ -58,7 +58,7 @@ struct fmha_fwd_bf16_opus_args
     int stride_o_b = 0, stride_o_n = 0, stride_o_h = 0;
     int stride_lse_b = 0, stride_lse_h = 0;
 
-    // Applied to Q·K^T. Pass <= 0 to get the default 1/sqrt(hdim_q).
+    // Applied to Q?K^T. Pass <= 0 to get the default 1/sqrt(hdim_q).
     float softmax_scale = 0.f;
     // Bottom-right aligned when seqlen_q != seqlen_k.
     bool causal = false;
@@ -160,7 +160,7 @@ inline bool launch_d192_v128(const fmha_fwd_bf16_opus_args& a, hipStream_t strea
     constexpr int Q_TILE_SIZE = 32, NUM_WARPS = 8;
     constexpr int Q_BLOCK = Q_TILE_SIZE * NUM_WARPS; // 256
 
-    const bool is_group    = (a.seqstart_q_ptr != nullptr);
+    const bool is_group = (a.seqstart_q_ptr != nullptr);
     if(is_group && (!a.seqstart_k_ptr || !a.seqstart_q_pad_ptr || !a.seqstart_k_pad_ptr))
     {
         return false;
@@ -277,7 +277,7 @@ inline bool launch_d192_v128(const fmha_fwd_bf16_opus_args& a, hipStream_t strea
 // 32-bit async-load offset limit.
 inline bool fmha_fwd_bf16_opus_launch(const fmha_fwd_bf16_opus_args& a, hipStream_t stream)
 {
-    std::string arch_id = get_gpu_arch();
+    static const std::string arch_id = get_gpu_arch();
     if((arch_id != "gfx950") || (a.data_type != "bf16"))
     {
         AITER_LOG_WARNING("unsupported condition in opus fwd!!! data_type: " << a.data_type);
