@@ -77,8 +77,8 @@ def dedupe_jobs(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def collect_aot_jobs(
-    csv_paths: list[str],
-    parse_csv: Callable[[str], list[dict[str, Any]]],
+    csv_paths: list[str | None],
+    parse_csv: Callable[[str | None], list[dict[str, Any]]],
     on_missing_csv: Callable[[str], None] | None = None,
 ) -> list[dict[str, Any]]:
     jobs = []
