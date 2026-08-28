@@ -120,7 +120,7 @@ def build_flash_attn_fp8_module(
     SCHRAUDOLPH_CAP = 1138753536.0
 
     assert L_SPLIT_TILES in (0, 2, 4), "the ones-column MFMA contracts two blocks"
-    EXP2_SHIFT = 4.0
+    EXP2_SHIFT = 0.0
 
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
     def fp8_attn_kernel(
@@ -731,33 +731,6 @@ def build_flash_attn_fp8_module(
                 mfma.accum_type,
                 [_raw(_bias_ones), _raw(b), _raw(mfma.zero_value), 0, 0, 0],
             )
-
-        def _watchdog_seeded(s_accs, m_frozen):
-            t = _lane_max(s_accs)
-            peer = fx.Float32(t).shuffle_xor(fx.Int32(32), fx.Int32(WARP_SIZE))
-            e = _fmax(_fsub(_fmax(t, peer), fx.Float32(SCHRAUDOLPH_CAP)), c_zero_f)
-            eu = _fmul(e, c_inv_2p23)
-            rscale = rocdl.exp2(T.f32, _raw(eu))
-            corr = rocdl.exp2(T.f32, _raw(_fsub(c_zero_f, eu)))
-            if const_expr(USE_QK_SCALE_FOLD):
-                delta = e
-            else:
-                delta = arith.divf(_raw(eu), _raw(scale_log2e))
-            return _fadd(_raw(m_frozen), _raw(delta)), corr, rscale
-
-        def _watchdog(s_accs, m_term, m_frozen):
-            t = _fadd(_lane_max(s_accs), m_term)
-            peer = fx.Float32(t).shuffle_xor(fx.Int32(32), fx.Int32(WARP_SIZE))
-            e = _fmax(_fsub(_fmax(t, peer), fx.Float32(SCHRAUDOLPH_CAP)), c_zero_f)
-
-            if const_expr(USE_QK_SCALE_FOLD):
-                delta = e
-            else:
-                delta = arith.divf(
-                    _raw(_fmul(e, c_inv_2p23)), _raw(scale_log2e)
-                )
-            corr = rocdl.exp2(T.f32, _raw(_fsub(c_zero_f, _fmul(e, c_inv_2p23))))
-            return _fsub(m_term, e), _fadd(_raw(m_frozen), _raw(delta)), corr
 
         def do_softmax_prepare(
             s_accs,
