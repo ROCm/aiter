@@ -11,6 +11,13 @@ from aiter.ops.triton.utils._triton import arch_info
 
 TRITON_VERSION = Version(triton.__version__)
 TRITON_GE_36 = TRITON_VERSION >= Version("3.6.0")
+# LLVM's SIInsertWaitcnts asserts in WaitcntBrackets::mergeAsyncMarks() when a
+# CFG join has pending async marks on one side only ("Begin must be less or
+# equal to End", llvm/ADT/Sequence.h). Fixed by llvm/llvm-project#193499
+# (81d618b6bc1e); the LLVM that Triton 3.8 pins carries it, 3.7's does not.
+# Verified on gfx950 with 3.7.0+amd.rocm7.2.0 (aborts) and 3.8.0 ToT (compiles,
+# numerically correct).
+TRITON_GE_38 = TRITON_VERSION >= Version("3.8.0")
 
 arch = arch_info.get_arch()
 _gluon_fp8_mqa_logits_kernel = None
@@ -196,6 +203,33 @@ def fp8_mqa_logits(
     else:
         num_buffers = 2
         USE_FOLDED_REDUCTION = FOLDED_REDUCTED_SUPPORT and num_heads > 16
+        # Buffer ops use a 32-bit byte offset (2 GiB resource descriptor cap).
+        # Fall back to plain global load/store when a tensor exceeds that.
+        BUFFER_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
+        # The KV loader builds one descriptor over the whole KV tensor and
+        # indexes it with tile offsets, so the 2 GiB byte cap is the real bound.
+        use_buffer_load = KV.numel() * KV.element_size() < BUFFER_LIMIT_BYTES
+
+        # Stores are different: the kernel bakes the row and the tile into the
+        # base pointer (logits_ptr + row_id * stride_logits_s + ... , then
+        # += BLOCK_KV * stride_logits_k per tile) and rebuilds the descriptor
+        # from it, so the i32 buffer offset only ever spans one tile
+        # (BLOCK_M * stride_logits_s + BLOCK_KV elements). The whole-tensor
+        # size is irrelevant. What does bind is that the kernel computes that
+        # row base in i32 *elements*, so the largest index it forms must fit in
+        # an int32. Measured on gfx950: 16384 x 131072 (max index 2**31 - 1,
+        # 8 GiB) is correct, 32768 x 131072 (2**32) faults.
+        #
+        # Keeping buffer stores here also avoids an AMDGCN codegen abort: the
+        # masked buffer store is branch-free (select mask ? off : -2**31),
+        # while a masked global store lowers to a branch. With BLOCK_M=2 the
+        # extra join blocks land inside the double-buffered async-copy region
+        # and trip an assert in LLVM's SIInsertWaitcnts (mergeAsyncMarks(),
+        # fixed upstream by llvm/llvm-project#193499, not yet in Triton 3.7).
+        max_logits_index = (seq_len - 1) * stride_logits_s + (
+            seq_len_kv - 1
+        ) * stride_logits_k
+        use_buffer_store = max_logits_index <= 2**31 - 1
         if arch == "gfx950":
             num_buffers = 2
             loop_variant = 0
@@ -203,7 +237,18 @@ def fp8_mqa_logits(
             num_chains = 4 if USE_FOLDED_REDUCTION else 0
             num_warps = 2 if num_heads <= 32 else 1
             block_kv = 64 if num_heads <= 32 else 32
-            block_m = 2 if (num_heads <= 32 and seq_len > 4096) else 1
+            # On Triton < 3.8, BLOCK_M=2 requires buffer stores: a masked
+            # *global* store lowers to a branch, and with two of them per KV
+            # tile the extra join blocks trip the SIInsertWaitcnts assert
+            # described above. With the corrected use_buffer_store bound this
+            # only bites past 2**31 logits elements. Triton >= 3.8 pins an LLVM
+            # with the fix, so the pair is safe there and BLOCK_M=2 is kept.
+            block_m2_ok = use_buffer_store or TRITON_GE_38
+            block_m = (
+                2
+                if (num_heads <= 32 and seq_len > 4096 and block_m2_ok)
+                else 1
+            )
             mfma_nonk_dim = 32 if (head_size <= 64 or num_heads == 32) else 16
             other = {
                 "USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED,
@@ -220,11 +265,6 @@ def fp8_mqa_logits(
             block_m = 1
             other = {"LOOP_VARIANT": loop_variant}
 
-        # Buffer ops use a 32-bit byte offset (2 GiB resource descriptor cap).
-        # Fall back to plain global load/store when a tensor exceeds that.
-        BUFFER_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
-        use_buffer_load = KV.numel() * KV.element_size() < BUFFER_LIMIT_BYTES
-        use_buffer_store = logits.numel() * logits.element_size() < BUFFER_LIMIT_BYTES
         _gluon_fp8_mqa_logits_kernel[((seq_len + block_m - 1) // block_m,)](
             Q_ptr=Q,
             KV_ptr=KV,
