@@ -152,12 +152,12 @@ def test_get_meta_param_fp8_arbitrary_unlisted_width_falls_back():
 def test_get_meta_param_fp8_block_cap_still_bites():
     """The width -> block_n cap must still clamp, not just avoid the KeyError.
 
-    bs=1, total_kv=128, unlisted width -> fallback min_block_n 64 ->
-    ceil(128/64) = 2 splits. A fallback that silently disabled the cap would
-    let this exceed 2.
+    bs=1, total_kv=128, unlisted width 640 -> fallback is the widest listed
+    width's block (512 -> 32) -> ceil(128/32) = 4 splits. A fallback that
+    silently disabled the cap would let this exceed 4.
     """
     num_kv_splits, _ = get_meta_param(None, 1, 128, 128, 5, fp8)
-    assert 1 <= num_kv_splits <= 2
+    assert 1 <= num_kv_splits <= 4
 
 
 @requires_cuda
