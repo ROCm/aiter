@@ -3,10 +3,10 @@
 
 import triton
 import triton.language as tl
-
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
+
 from aiter.ops.triton.utils.config_utils import get_gemm_config
 
 _batched_gemm_a16wfp4_repr = make_kernel_repr(

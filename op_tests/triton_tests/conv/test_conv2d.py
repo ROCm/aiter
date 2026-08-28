@@ -34,10 +34,11 @@ shapes, in op_benchmarks/triton/model_benchmarking_tool/bench_models.py).
 
 import pytest
 import torch
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 import aiter.ops.triton.conv.conv2d as conv2d_module
 from aiter.ops.triton.utils import config_utils
-from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils._config import conv as conv_config_impl
 
 from ._helpers import (
     ALL_SUPPORTED_ARCHS,
@@ -241,7 +242,7 @@ def test_conv_config_layout_variant_precedence(monkeypatch, isolated_conv_config
         "any": {"source": "any"},
     }
     monkeypatch.setattr(
-        config_utils, "_get_conv_config_file", lambda _config_name: config
+        conv_config_impl, "_get_conv_config_file", lambda _config_name: config
     )
 
     def selected(*variants, key=shape_key, M=32):
