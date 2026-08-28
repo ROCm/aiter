@@ -26,44 +26,25 @@ def resolve_config_dir(
     op: str,
     config_name: str,
     backend: str | None = None,
-    legacy_dir: str | None = None,
+    arch: str | None = None,
 ) -> tuple[str, str]:
     """Return (cfg_dir, name_prefix) for the first candidate whose default
     file exists: DEFAULT.json when name_prefix is empty (the nested layout,
     dir from _dtype_dir()), else <name_prefix><config_name>.json. Falls back
-    to the last candidate so the missing-file assertion names a legacy path."""
+    to the last candidate so the missing-file assertion names the nested path.
+    ``arch`` overrides the running architecture, for loaders that retry under
+    another arch when the running one has no tuned configs."""
     dtype_dir = _dtype_dir(config_name)
-    dev = arch_info.get_arch()
-    arch_prefix = f"{dev}-"
+    dev = arch if arch is not None else arch_info.get_arch()
     if backend is None:
         candidates = [
             (f"{AITER_TRITON_CONFIGS_PATH}/{dev}/triton/{op}/{dtype_dir}", ""),
             (f"{AITER_TRITON_CONFIGS_PATH}/{dev}/gluon/{op}/{dtype_dir}", ""),
         ]
-        if legacy_dir:
-            candidates.append(
-                (
-                    f"{AITER_TRITON_CONFIGS_PATH}/{legacy_dir}",
-                    arch_prefix,
-                )  # TODO(satya): legacy, remove
-            )
     else:
         candidates = [
             (f"{AITER_TRITON_CONFIGS_PATH}/{dev}/{backend}/{op}/{dtype_dir}", ""),
         ]
-        if legacy_dir:
-            candidates.append(
-                (
-                    f"{AITER_TRITON_CONFIGS_PATH}/{legacy_dir}/{backend}",
-                    arch_prefix,
-                )  # TODO(satya): legacy, remove
-            )
-            candidates.append(
-                (
-                    f"{AITER_TRITON_CONFIGS_PATH}/{legacy_dir}",
-                    arch_prefix,
-                )  # TODO(satya): legacy, remove
-            )
     for cfg_dir, name_prefix in candidates:
         # Nested dirs (empty prefix) name their default DEFAULT.json.
         stem = f"{name_prefix}{config_name}" if name_prefix else "DEFAULT"
@@ -89,8 +70,7 @@ def _get_gemm_config_cached(
     callers can freely mutate the returned dict without polluting the cache.
 
     Resolves from ``<arch>/<backend>/gemm/<d_type>/`` (prefix-less filenames,
-    default named ``DEFAULT.json``) first; ``backend=None`` tries triton then
-    gluon. Falls back to the legacy flat ``gemm/`` layout (arch-prefixed) for unmigrated configs.
+    default named ``DEFAULT.json``); ``backend=None`` tries triton then gluon.
     """
     # Input validation
     assert M >= 0, "M must be positive."
@@ -102,13 +82,10 @@ def _get_gemm_config_cached(
         and all(x < y for x, y in itertools.pairwise(bounds))
     ), "When provided, bounds must be a non-empty tuple of strictly increasing positive numbers."
 
-    # Nested layout <arch>/<backend>/gemm/<d_type>/ (no arch prefix, default
-    # named DEFAULT.json) first, then legacy flat gemm/ (arch-prefixed) for
-    # unmigrated configs; the shared probe lives in resolve_config_dir().
-    # TODO(satya): drop legacy_dir="gemm" once all configs are migrated.
-    cfg_dir, name_prefix = resolve_config_dir(
-        "gemm", config_name, backend=backend, legacy_dir="gemm"
-    )
+    # Every GEMM family lives in the nested layout <arch>/<backend>/gemm/
+    # <d_type>/ (no arch prefix, default named DEFAULT.json); the shared probe
+    # lives in resolve_config_dir().
+    cfg_dir, name_prefix = resolve_config_dir("gemm", config_name, backend=backend)
     default_stem = f"{name_prefix}{config_name}" if name_prefix else "DEFAULT"
 
     # Load default config (must exist)
@@ -176,7 +153,7 @@ def get_gemm_config(
 
     This function provides a unified way to load GEMM configs across all kernels.
     It uses the following logic:
-    1. Load default config file: <d_type>/DEFAULT.json (legacy: {arch}-{config_name}.json)
+    1. Load default config file: <d_type>/DEFAULT.json
     2. If B, N and K are provided, try B-specialized config: {config_name}-B={B}-N={N}-K={K}.json
     3. If N and K are provided, try to load specialized config: {config_name}-N={N}-K={K}.json
        Or if specialized_filename is provided, use: {config_name}-{specialized_filename}.json

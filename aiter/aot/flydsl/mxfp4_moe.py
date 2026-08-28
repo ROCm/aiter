@@ -334,25 +334,34 @@ def parse_csv(csv_path: str):
                     )
             elif _is_mxfp4_kname(kn2):
                 p2 = _parse_mxfp4_g2_kname(kn2)
-                if p2["mxfp4out"] and not _MXFP4_INTERMEDIATE:
-                    continue
-                _add(
-                    {
-                        "stage": 2,
-                        "kernel_name": kn2,
-                        "BM": p2["BM"],
-                        "use_nt": p2["use_nt"],
-                        "NE": expert,
-                        "N_OUT": model_dim,
-                        "epilog": _epilog_of(
-                            p2["atomic"], p2["mxfp4out"], p2["cshuffle"]
-                        ),
-                        "D_INTER": d_inter,
-                        "D_INTER_REAL": d_inter_real,
-                        "topk": topk,  # unused by the kernel; for the entry signature
-                        "xcd_swizzle": p2["xcd_swizzle"],
-                    }
-                )
+                # An _f4out row falls back to the plain kernel whenever the
+                # mxfp4-out path is gated off -- by AITER_MXFP4_INTERMEDIATE
+                # here, or by the shape check in fused_moe at runtime. Emit that
+                # fallback too, else RUN_ONLY has no cache entry for the kernel
+                # that actually launches.
+                mxfp4outs = [False]
+                if p2["mxfp4out"] and _MXFP4_INTERMEDIATE:
+                    mxfp4outs.append(True)
+                for mxfp4out in mxfp4outs:
+                    _add(
+                        {
+                            "stage": 2,
+                            "kernel_name": (
+                                kn2 if mxfp4out else kn2.replace("_f4out", "")
+                            ),
+                            "BM": p2["BM"],
+                            "use_nt": p2["use_nt"],
+                            "NE": expert,
+                            "N_OUT": model_dim,
+                            "epilog": _epilog_of(
+                                p2["atomic"], mxfp4out, p2["cshuffle"]
+                            ),
+                            "D_INTER": d_inter,
+                            "D_INTER_REAL": d_inter_real,
+                            "topk": topk,  # unused by the kernel; for the entry signature
+                            "xcd_swizzle": p2["xcd_swizzle"],
+                        }
+                    )
 
     return jobs
 

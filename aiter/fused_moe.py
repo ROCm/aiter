@@ -118,6 +118,7 @@ _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "
 # so there is no overhead.
 kernel_bench_callable = None
 
+
 # FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
 # topk_weights through the sorted_* kernarg slots and accumulate via
 # global_atomic_pk_add_bf16, so moe_sorting is a pass-through for them.
@@ -1534,8 +1535,10 @@ def _flydsl_stage1_wrapper(
         act = "swiglu"
     elif activation == ActivationType.Situv2:
         act = "situv2"
-    else:
+    elif activation == ActivationType.Silu:
         act = "silu"
+    else:
+        raise ValueError(f"Unsupported activation for FlyDSL MoE stage1: {activation}")
     _a_scale_one = parsed.get("a_scale_one", False)
     return aiter.ops.flydsl.flydsl_moe_stage1(
         a=hidden_states,
@@ -2163,9 +2166,8 @@ def _mxfp4_scale_u8(scale):
     same reinterpret_cast HIP does). Returns the uint8 view, or the input (already
     uint8, or None) unchanged.
 
-    Do not cache tensor views here: inference and config sweeps pass distinct
-    weight tensors, and a cached view keeps each tensor's GPU storage alive.
-    """
+    Not memoized: tensors hash by identity, so per-call intermediates never hit and
+    the cache would pin them on the device instead."""
     if scale is not None and scale.element_size() == 1 and scale.dtype != torch.uint8:
         return scale.view(torch.uint8)
     return scale
@@ -2410,6 +2412,14 @@ def get_2stage_cfgs(
 
         # Fallback dict: disable act_type so any activation can match.
         df_fallback = df.copy()
+        if "kernelName1" in df_fallback.columns:
+            is_ck2stages = (
+                df_fallback["kernelName1"]
+                .fillna("")
+                .astype(str)
+                .str.contains("moe_ck2stages")
+            )
+            df_fallback = df_fallback.loc[~is_ck2stages]
         if "act_type" in df_fallback.columns:
             df_fallback["act_type"] = _ACT_TYPE_DISABLED_KEY
         dup_mask = df_fallback.duplicated(subset=_INDEX_COLS, keep="first")
@@ -2505,9 +2515,7 @@ def get_2stage_cfgs(
         if not c2s:
             return None
         primary, fallback = c2s
-        lookup_keys = keys
-        if config_file is not None:
-            lookup_keys = keys[:7] + (str(activation),) + keys[8:]
+        lookup_keys = keys[:7] + (str(activation),) + keys[8:]
         result = primary.get(lookup_keys, None)
         if result is None and config_file is None:
             result = fallback.get(keys_disabled, None)
@@ -2516,7 +2524,7 @@ def get_2stage_cfgs(
             tier_idx = _PADDED_M_TIERS.index(token) if token in _PADDED_M_TIERS else -1
             for fallback_tier in reversed(_PADDED_M_TIERS[:tier_idx]):
                 # keys layout: (gfx, cu_num, token, ...); replace token (idx 2).
-                keys_fb = keys[:2] + (fallback_tier,) + keys[3:]
+                keys_fb = lookup_keys[:2] + (fallback_tier,) + lookup_keys[3:]
                 keys_fb_disabled = (
                     keys_disabled[:2] + (fallback_tier,) + keys_disabled[3:]
                 )
@@ -2592,11 +2600,24 @@ def get_2stage_cfgs(
                     f"[fused_moe] Opus stage2 config unsupported ({opus_reason}); "
                     "using default heuristics"
                 )
+
     bypass_tuned_config = int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0"))
     if config_file is not None and (cfg is None or bypass_tuned_config):
         raise NotImplementedError(
             "The dedicated FHMoE path requires an exact tuned config row for "
             f"{keys} in {tune_file}"
+        )
+
+    # The asm 1-stage kernels are compiled only for Silu/Gelu
+    if (
+        cfg is not None
+        and cfg.get("run_1stage", False)
+        and activation not in (ActivationType.Silu, ActivationType.Gelu)
+    ):
+        cfg = None
+        logger.warning(
+            f"[fused_moe] discarding 1-stage tuned config for unsupported "
+            f"activation {activation}; using default heuristics"
         )
 
     use_non_temporal_load = False
@@ -3770,8 +3791,12 @@ def asm_stage1(
             aiter.silu_and_mul(out, tmp_out.view(dtypes.fp32))
         elif activation == ActivationType.Swiglu:
             aiter.swiglu_and_mul(out, tmp_out.view(dtypes.fp32))
-        else:
+        elif activation == ActivationType.Gelu:
             aiter.gelu_and_mul(out, tmp_out.view(dtypes.fp32))
+        else:
+            raise ValueError(
+                f"Unsupported activation for split-k post-activation: {activation}"
+            )
     return out
 
 
@@ -4198,8 +4223,12 @@ def ck_moe_stage1(
         valid_out = tmp_out[: token_num * topk, :]
         if activation == ActivationType.Silu:
             aiter.silu_and_mul(out, valid_out.view(dtypes.fp32))
-        else:
+        elif activation == ActivationType.Gelu:
             aiter.gelu_and_mul(out, valid_out.view(dtypes.fp32))
+        else:
+            raise ValueError(
+                f"Unsupported activation for split-k post-activation: {activation}"
+            )
     return out
 
 
@@ -4317,13 +4346,18 @@ def cktile_moe_stage1(
                     token_num,
                     topk,
                 )
-            else:
+            elif activation == ActivationType.Gelu:
                 NLane = 16
                 N0 = inter_dim // NLane
                 flat = valid_out.view(-1, N0, 2, NLane)
                 gate = flat[:, :, 0, :].reshape(-1, inter_dim)
                 up = flat[:, :, 1, :].reshape(-1, inter_dim)
                 out.view(-1, inter_dim).copy_(torch.nn.functional.gelu(gate) * up)
+            else:
+                raise ValueError(
+                    f"Unsupported activation for interleaved split-k "
+                    f"post-activation: {activation}"
+                )
         else:
             if bias1 is not None and topk_ids is None:
                 raise ValueError(
@@ -4334,14 +4368,23 @@ def cktile_moe_stage1(
                 aiter.silu_and_mul_bias(out, valid_out, expert_ids, bias1)
             elif bias1 is not None and activation == ActivationType.Swiglu:
                 aiter.swiglu_and_mul_bias(out, valid_out, expert_ids, bias1)
-            elif bias1 is not None:
+            elif bias1 is not None and activation == ActivationType.Gelu:
                 aiter.gelu_and_mul_bias(out, valid_out, expert_ids, bias1)
+            elif bias1 is not None:
+                raise ValueError(
+                    f"Unsupported activation for split-k post-activation "
+                    f"with bias: {activation}"
+                )
             elif activation == ActivationType.Silu:
                 aiter.silu_and_mul(out, valid_out)
             elif activation == ActivationType.Swiglu:
                 aiter.swiglu_and_mul(out, valid_out)
-            else:
+            elif activation == ActivationType.Gelu:
                 aiter.gelu_and_mul(out, valid_out)
+            else:
+                raise ValueError(
+                    f"Unsupported activation for split-k post-activation: {activation}"
+                )
     return out
 
 

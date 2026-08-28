@@ -983,7 +983,8 @@ void mla_decode_stage1_asm_fwd(
     } else if (arch_id == "gfx950" && q_type == "fp8" && kv_type == "fp8" && persistent
                && ((gqa_ratio == 32 && max_seqlen_q >= 4)
                    || (gqa_ratio == 64 && max_seqlen_q >= 2)
-                   || (gqa_ratio == 128))){
+                   || (gqa_ratio == 128)
+                   || (gqa_ratio == 96 && max_seqlen_q <= 6))){
         config_max_seqlen_q = 4;
         config_gqa_ratio = 32;
         args.s_MQA = gqa_ratio;
