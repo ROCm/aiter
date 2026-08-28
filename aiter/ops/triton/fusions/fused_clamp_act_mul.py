@@ -7,6 +7,7 @@ from typing import Literal
 
 import torch
 import triton
+
 from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_clamp_act_mul import (
     _fused_clamp_silu_mul_kernel as _fused_clamp_silu_mul_gluon_kernel,
 )
