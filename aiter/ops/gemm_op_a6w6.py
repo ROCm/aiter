@@ -18,9 +18,8 @@ from ..utility import dtypes
 
 # The mxfp6 (E2M3, per-1x32 blockscale) asm gemm shares the a4w4 kernarg ABI.
 # Its packed operand/scale layouts are produced by the helpers below and must
-# match exactly what the `f6gemm_dmabig_kernel_func` kernel consumes.
-_KERNEL_NAME = "f6gemm_dmabig_kernel_func"
-_SAFE_FALLBACK_KERNEL_NAME = "f6gemm_dmabig_swz0_kernel_func"
+# match exactly what the asm kernels consume.
+_DEFAULT_KERNEL_NAME = "f6gemm_tstage_kernel_func"
 _TILE = 256
 _K_TILE = 128
 _SCALE_GROUP_SIZE = 32
@@ -28,9 +27,6 @@ _PADK = 2  # K-padding steps (of 128) baked into the packed A/B layout
 _PACKED_TILE_BYTES = 24576
 _SCALE_TILE_BYTES = 1024
 _PACK_LAYOUT = "mxfp6_c0c1_256_padk2"
-_SHORT_K_SWIZZLE_LIMIT = 48 * _K_TILE
-_GROUPED_SWIZZLE_MAX_M = 16 * 32 * _TILE
-_GROUPED_SWIZZLE_MAX_N = 64 * _TILE
 _BATCHED_PACK_MIN_ELEMENTS = 32 * 1024 * 1024
 _BATCHED_PACK_BLOCK_M = 64
 _BATCHED_PACK_K_BLOCKS = _K_TILE // _SCALE_GROUP_SIZE
@@ -598,21 +594,8 @@ def clear_gemm_a6w6_config_cache() -> None:
 
 
 def _default_gemm_a6w6_kernel(M: int, N: int, K: int) -> str:
-    """Choose a safe untuned fallback for the physical launch shape.
-
-    The optimized grouped-M kernel has compile-time swizzle bounds for short-K
-    launches. Natural ordering has no such grid bound and is used outside them.
-    """
-    padM, padN, padK = _ceil(M, _TILE), _ceil(N, _TILE), _ceil(K, _K_TILE)
-    short_k = padK <= _SHORT_K_SWIZZLE_LIMIT
-    grouped_grid_in_bounds = (
-        padM <= _GROUPED_SWIZZLE_MAX_M and padN <= _GROUPED_SWIZZLE_MAX_N
-    )
-    return (
-        _KERNEL_NAME
-        if not short_k or grouped_grid_in_bounds
-        else _SAFE_FALLBACK_KERNEL_NAME
-    )
+    """Choose the unbounded T-stage kernel for an untuned launch shape."""
+    return _DEFAULT_KERNEL_NAME
 
 
 @functools.lru_cache(maxsize=1024)
@@ -848,7 +831,7 @@ def gemm_a6w6_asm(
     if not kernelName:
         if out.ndim != 2:
             raise ValueError("gemm_a6w6_asm expects a 2D [M, N] output tensor.")
-        kernelName = _default_gemm_a6w6_kernel(*out.shape, K)
+        kernelName = _select_gemm_a6w6_kernel(*out.shape, K, None)
     _gemm_a6w6_asm(
         A,
         B,

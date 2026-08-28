@@ -17,12 +17,11 @@ constexpr int kKPaddingTiles        = 2;
 constexpr size_t kPackedTileBytes   = 24576;
 constexpr size_t kScaleTileBytes    = 1024;
 constexpr char kPackLayout[]        = "mxfp6_c0c1_256_padk2";
-constexpr char kDefaultKernelName[] = "f6gemm_dmabig_kernel_func";
+constexpr char kDefaultKernelName[] = "f6gemm_tstage_kernel_func";
 
-// KernelArgs layout is identical to the a4w4 asm gemm ABI; the mxfp6 dmabig
-// kernel was assembled against the same kernarg struct (0x180 bytes). Fields
-// the fp6 kernel does not consume (ptr_C, beta, A/B strides, k-split) are left
-// zeroed and ignored by the kernel.
+// KernelArgs layout is identical to the a4w4 asm gemm ABI. The mxfp6 kernels
+// use the same kernarg struct (0x180 bytes). Fields they do not consume
+// (ptr_C, beta, A/B strides, k-split) are left zeroed and ignored.
 struct __attribute__((packed)) KernelArgs
 {
     void* ptr_D;

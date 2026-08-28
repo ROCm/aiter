@@ -155,19 +155,19 @@ class TestA6W6TuningLookup(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate"):
             gemm_op_a6w6._load_gemm_a6w6_configs(self.config)
 
-    def test_explicit_override_and_safe_default(self):
+    def test_explicit_override_and_default(self):
         self.assertEqual(
             gemm_op_a6w6._select_gemm_a6w6_kernel(1, 1, 1, "explicit_kernel"),
             "explicit_kernel",
         )
         self.assertEqual(
             gemm_op_a6w6._default_gemm_a6w6_kernel(512, 55296, 6144),
-            gemm_op_a6w6._SAFE_FALLBACK_KERNEL_NAME,
+            gemm_op_a6w6._DEFAULT_KERNEL_NAME,
         )
 
 
 class TestA6W6ApiValidation(unittest.TestCase):
-    def test_asm_wrapper_selects_safe_default_kernel(self):
+    def test_asm_wrapper_selects_default_kernel(self):
         packed = torch.empty(0, dtype=torch.uint8, device="meta")
         out = torch.empty((512, 55296), dtype=torch.bfloat16, device="meta")
 
@@ -178,7 +178,7 @@ class TestA6W6ApiValidation(unittest.TestCase):
 
         self.assertIs(result, out)
         self.assertEqual(
-            launch.call_args.args[6], gemm_op_a6w6._SAFE_FALLBACK_KERNEL_NAME
+            launch.call_args.args[6], gemm_op_a6w6._DEFAULT_KERNEL_NAME
         )
 
     def test_torch_quantizer_rejects_non_matrix_input(self):
@@ -207,31 +207,42 @@ class TestA6W6ApiValidation(unittest.TestCase):
 class TestA6W6Manifest(unittest.TestCase):
     def test_manifest_candidates_are_compatible_and_present(self):
         configs = pd.read_csv(MANIFEST)
-        self.assertGreater(len(configs), 1)
+        expected_kernels = {
+            "f6gemm_tstage_kernel_func",
+            "f6gemm_astage_g32_kernel_func",
+            "f6gemm_astage_g64_kernel_func",
+            "f6gemm_astage_allk_kernel_func",
+            "f6gemm_persist_n1_kernel_func",
+            "f6gemm_pipeline_q10_kernel_func",
+            "f6gemm_persist_n2_kernel_func",
+            "f6gemm_n2_stage_kernel_func",
+            "f6gemm_rect128_kernel_func",
+        }
+        self.assertEqual(set(configs["knl_name"]), expected_kernels)
         self.assertFalse(configs["knl_name"].duplicated().any())
         self.assertTrue((configs["splitK"] == 0).all())
-        self.assertTrue((configs["block_size"] == 256).all())
+        layouts = set(
+            configs[["tile_M", "tile_N", "block_size"]]
+            .itertuples(index=False, name=None)
+        )
+        self.assertEqual(layouts, {(256, 256, 256), (256, 512, 256), (128, 256, 128)})
         self.assertTrue((configs["pack_layout"] == gemm_op_a6w6._PACK_LAYOUT).all())
         self.assertTrue(
             {"swizzle_max_M", "swizzle_max_N", "swizzle_max_K"}.issubset(
                 configs.columns
             )
         )
-        swz0 = configs[
-            configs["knl_name"] == gemm_op_a6w6._SAFE_FALLBACK_KERNEL_NAME
+        default = configs[
+            configs["knl_name"] == gemm_op_a6w6._DEFAULT_KERNEL_NAME
         ].iloc[0]
         self.assertEqual(
             (
-                swz0["swizzle_max_M"],
-                swz0["swizzle_max_N"],
-                swz0["swizzle_max_K"],
+                default["swizzle_max_M"],
+                default["swizzle_max_N"],
+                default["swizzle_max_K"],
             ),
             (0, 0, 0),
         )
-        grp16 = configs[configs["knl_name"] == "f6gemm_dmabig_grp16_kernel_func"].iloc[
-            0
-        ]
-        self.assertEqual(grp16["swizzle_max_M"], 65536)
         manifest_dir = os.path.dirname(MANIFEST)
         for co_name in configs["co_name"]:
             self.assertTrue(os.path.exists(os.path.join(manifest_dir, co_name)))
