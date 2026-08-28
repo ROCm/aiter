@@ -19,9 +19,14 @@ import torch
 from flydsl.expr.typing import Stream
 
 from .kernels.sparse_mla_prefill import compile_sparse_mla_prefill
+from .kernels.sparse_mla_prefill_dsv4 import compile_sparse_mla_prefill_dsv4
 from .kernels.tensor_shim import _run_compiled
 
-__all__ = ["flydsl_sparse_mla_prefill", "flydsl_sparse_mla_prefill_2region"]
+__all__ = [
+    "flydsl_sparse_mla_prefill",
+    "flydsl_sparse_mla_prefill_2region",
+    "flydsl_sparse_mla_prefill_dsv4",
+]
 
 NUM_HEADS = 128
 HEAD_DIM = 512  # DSv4 (448 nope + 64 rope)
@@ -97,6 +102,43 @@ def _get_kernel(
         single_request=single_request,
         cache_layout=cache_layout,
         rope_bf16=rope_bf16,
+    )
+
+
+@lru_cache(maxsize=32)
+def _get_kernel_dsv4(
+    has_sink: bool,
+    r0_convert: bool,
+    r0_is_ocp: bool,
+    r1_is_ocp: bool,
+    softmax_scale: float,
+    single_request: bool,
+    rope_bf16: bool,
+    vt_inreg: bool,
+    kv_double_buffer: bool,
+    kv_pf_late: bool,
+    vt_wide: bool,
+    rope_prefetch: bool,
+    scale_coalesce: bool,
+    slot_hoist: bool,
+    xcd_remap: bool,
+):
+    return compile_sparse_mla_prefill_dsv4(
+        has_sink=has_sink,
+        r0_convert=r0_convert,
+        r0_is_ocp=r0_is_ocp,
+        r1_is_ocp=r1_is_ocp,
+        softmax_scale=softmax_scale,
+        single_request=single_request,
+        rope_bf16=rope_bf16,
+        vt_inreg=vt_inreg,
+        kv_double_buffer=kv_double_buffer,
+        kv_pf_late=kv_pf_late,
+        vt_wide=vt_wide,
+        rope_prefetch=rope_prefetch,
+        scale_coalesce=scale_coalesce,
+        slot_hoist=slot_hoist,
+        xcd_remap=xcd_remap,
     )
 
 
@@ -515,6 +557,142 @@ def flydsl_sparse_mla_prefill_2region(
             out_flat,
             q_sc_t,
             kv_sc_t,
+            int(num_queries),
+            int(m_rows),
+            int(e_rows),
+            int(block_size),
+            int(e_block_size),
+            int(m_max_blocks),
+            int(e_max_blocks),
+            _fx_stream(q.device, stream),
+        )
+
+
+def flydsl_sparse_mla_prefill_dsv4(
+    q: torch.Tensor,
+    out: torch.Tensor,
+    main_cache: torch.Tensor,
+    main_indices: torch.Tensor,
+    main_indptr: torch.Tensor,
+    main_block_table: torch.Tensor,
+    extra_cache: torch.Tensor,
+    extra_indices: torch.Tensor,
+    extra_indptr: torch.Tensor,
+    extra_block_table: torch.Tensor,
+    *,
+    block_size: int,
+    attn_sink: torch.Tensor | None = None,
+    extra_block_size: int | None = None,
+    main_num_rows: int | None = None,
+    extra_num_rows: int | None = None,
+    q_req: torch.Tensor | None = None,
+    main_is_fnuz: bool = True,
+    extra_is_fnuz: bool = False,
+    main_scale_mode: str = "none",
+    rope_bf16: bool = False,
+    single_request: bool = True,
+    validate_regions: bool = True,
+    vt_inreg: bool = False,
+    kv_double_buffer: bool = False,
+    kv_pf_late: bool = False,
+    vt_wide: bool = False,
+    rope_prefetch: bool = True,
+    scale_coalesce: bool = True,
+    slot_hoist: bool = False,
+    xcd_remap: bool = True,
+    stream: torch.cuda.Stream | None = None,
+) -> None:
+    """DSv4-only two-region sparse MLA prefill (dedicated pipelined kernel).
+
+    Same contract and arguments as ``flydsl_sparse_mla_prefill_2region``, but
+    dispatches to ``sparse_mla_prefill_dsv4.py``, which carries only the DSv4
+    two-region path.  Kept as a separate entry point so the two can be A/B'd;
+    the general kernel remains the fallback for GLM, single-region, and any
+    configuration this one rejects.
+    """
+    if main_scale_mode not in ("none", "ue8m0"):
+        raise ValueError(f"main_scale_mode must be 'none' or 'ue8m0', got {main_scale_mode!r}")
+    _require_cuda(q, out, main_cache, extra_cache, main_indices, main_indptr, extra_indices, extra_indptr)
+    _check_gfx942(q.device)
+    num_queries, num_heads, head_dim, v_dim = _validate_qout(q, out)
+    if head_dim != HEAD_DIM:
+        raise NotImplementedError(f"dsv4 path requires head_dim={HEAD_DIM}, got {head_dim}")
+
+    e_block_size = block_size if extra_block_size is None else extra_block_size
+    m_cache_u8, m_default_rows, _ = _packed_cache_u8(main_cache, block_size)
+    e_cache_u8, e_default_rows, _ = _packed_cache_u8(extra_cache, e_block_size)
+    m_rows = int(main_num_rows) if main_num_rows is not None else m_default_rows
+    e_rows = int(extra_num_rows) if extra_num_rows is not None else e_default_rows
+
+    m_idx = _require_int32_1d(main_indices, "main_indices")
+    m_iptr = _require_int32_1d(main_indptr, "main_indptr", numel=num_queries + 1)
+    e_idx = _require_int32_1d(extra_indices, "extra_indices")
+    e_iptr = _require_int32_1d(extra_indptr, "extra_indptr", numel=num_queries + 1)
+
+    # region0 (main) non-empty contract: the kernel seeds shared softmax state
+    # from region0 tile 0 and derives the per-query tile count from region0.
+    if m_idx.numel() == 0:
+        raise ValueError(
+            "flydsl_sparse_mla_prefill_dsv4: region0 (main_indices) must be non-empty; "
+            "the kernel seeds shared softmax state from region0 tile 0"
+        )
+    if validate_regions:
+        main_lens = m_iptr[1:] - m_iptr[:-1]
+        if bool((main_lens < 1).any().item()):
+            raise ValueError(
+                "flydsl_sparse_mla_prefill_dsv4 requires every query's region0 (main) "
+                "segment to be non-empty; pass validate_regions=False to skip this check "
+                "when the contract is guaranteed"
+            )
+
+    if main_block_table.dim() != 2 or extra_block_table.dim() != 2:
+        raise ValueError("main_block_table and extra_block_table must be 2D [num_reqs, max_blocks]")
+    m_bt = _require_int32_contiguous(main_block_table, "main_block_table").view(-1)
+    e_bt = _require_int32_contiguous(extra_block_table, "extra_block_table").view(-1)
+    m_max_blocks = main_block_table.shape[1]
+    e_max_blocks = extra_block_table.shape[1]
+
+    has_sink = attn_sink is not None
+    q_req_t = _resolve_q_req(q_req, num_queries=num_queries, single_request=single_request, device=q.device)
+    sink_t = _resolve_sink(attn_sink, has_sink=has_sink, device=q.device)
+    q_flat = _flat_bf16(q, "q")
+    out_flat = _flat_bf16(out, "out")
+
+    # region0 takes the DMA fast path only when it is fnuz with unity scales;
+    # UE8M0 scales or OCP bytes force the register-staged convert load.
+    r0_convert = (main_scale_mode == "ue8m0") or (not main_is_fnuz)
+    exe = _get_kernel_dsv4(
+        has_sink=has_sink,
+        r0_convert=r0_convert,
+        r0_is_ocp=(not main_is_fnuz),
+        r1_is_ocp=(not extra_is_fnuz),
+        softmax_scale=DEFAULT_SOFTMAX_SCALE,
+        single_request=single_request,
+        rope_bf16=rope_bf16,
+        vt_inreg=vt_inreg,
+        kv_double_buffer=kv_double_buffer,
+        kv_pf_late=kv_pf_late,
+        vt_wide=vt_wide,
+        rope_prefetch=rope_prefetch,
+        scale_coalesce=scale_coalesce,
+        slot_hoist=slot_hoist,
+        xcd_remap=xcd_remap,
+    )
+    with torch.cuda.device(q.device.index):
+        _run_compiled(
+            exe,
+            q_flat,
+            m_cache_u8,
+            m_idx,
+            m_iptr,
+            m_bt,
+            e_cache_u8,
+            e_idx,
+            e_iptr,
+            e_bt,
+            q_req_t,
+            sink_t,
+            out_flat,
             int(num_queries),
             int(m_rows),
             int(e_rows),

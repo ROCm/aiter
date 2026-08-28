@@ -44,6 +44,7 @@ if is_flydsl_available():
     from .sparse_mla_prefill_kernels import (
         flydsl_sparse_mla_prefill,
         flydsl_sparse_mla_prefill_2region,
+        flydsl_sparse_mla_prefill_dsv4,
     )
 
     # from .linear_attention_kernels import flydsl_gdr_decode
@@ -57,5 +58,6 @@ if is_flydsl_available():
         "flydsl_qk_norm_rope_quant",
         "flydsl_sparse_mla_prefill",
         "flydsl_sparse_mla_prefill_2region",
+        "flydsl_sparse_mla_prefill_dsv4",
         # "flydsl_gdr_decode",
     ]
