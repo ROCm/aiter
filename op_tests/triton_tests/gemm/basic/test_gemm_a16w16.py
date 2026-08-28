@@ -63,6 +63,7 @@ def get_x_vals():
     x_vals += [(2**i, 256, 7168) for i in range(5, 9)]  # DSR1 router GEMM
     # GPT-OSS-120B attention projections
     x_vals += [(2**i, 5120, 2880) for i in range(5, 9)]  # GPTOSS QKV input projection
+    x_vals += [(2048, 5120, 2880)]  # GPTOSS QKV @ M=2048 (ATT profiling)
     x_vals += [(2**i, 2880, 4096) for i in range(5, 9)]  # output projection
     x_vals += [(2**i, 128, 2880) for i in range(5, 9)]  # Router GEMM
     x_vals += [(v, 106496, 16384) for v in (256, 4096)]  # LL3 405B FC1
