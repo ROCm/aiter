@@ -21,7 +21,8 @@ Contents:
   - ``QManager16bV2`` — Q loader (per-warp TDM into private padded LDS, no ring).
   - ``KManager16bV1`` — K loader (one-block stage, natural ``ds_load_b128`` B-fragment).
   - ``VManager16bV1`` — V loader (V-specific swizzle, transpose ``ds_load_tr16_b128``).
-  - ``OManager16b`` — O writer (WMMA accumulator -> LDS reshape -> coalesced store).
+  - ``OManager16bV1`` — O writer (WMMA accumulator -> swizzled LDS -> coalesced buffer_store).
+  - ``OManager16bV2`` — O writer (accumulator -> row-major padded LDS -> per-warp TDM store).
 
 Target: gfx1250 (MI400 / mi450), wave32, 8 waves per threadgroup (256 threads).
 """
@@ -31,8 +32,19 @@ from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import rocdl as rocdl_dialect
 from flydsl.expr import arith, gpu, rocdl
 from flydsl.expr.rocdl import tdm_ops
+from flydsl.compiler.ast_rewriter import ReplaceIfWithDispatch
 
 from aiter.ops.flydsl.kernels import buffer_ops
+
+_scf_if_dispatch = ReplaceIfWithDispatch.scf_if_dispatch
+
+
+def _min_i32(a, b):
+    return fx.Int32(arith.minsi(arith.unwrap(a), arith.unwrap(b)))
+
+
+def _max_i32(a, b):
+    return fx.Int32(arith.maxsi(arith.unwrap(a), arith.unwrap(b)))
 
 # ============================================================================
 # Manager-intrinsic tiling constants (private — not the caller's config).
@@ -886,6 +898,7 @@ class VManager16bV1:
 _K_PAD_ELEMS = 8   # 4 DW = 16 B per K row
 _V_PAD_ELEMS = 16  # 8 DW = 32 B per V row
 _Q_PAD_ELEMS = 8   # 4 DW = 16 B per Q row (matches K)
+_O_PAD_ELEMS = 8   # 4 DW = 16 B per O row (conflict-free ds_store_b128)
 
 
 def _tdm_load_views(*, ptr_x, stride_seq, stride_head, head, row0, valid,
@@ -1142,7 +1155,7 @@ class VManager16bV2:
 # ============================================================================
 
 
-class OManager16b:
+class OManager16bV1:
     """Owns the O epilogue: fp32 WMMA accumulator -> bf16 -> global VRAM.
 
     PV leaves each wave's 16 x v_hdim tile in the accumulator layout: for d-tile
@@ -1234,7 +1247,7 @@ class OManager16b:
     def store_o_to_vram(
         self,
         *,
-        o_rsrc,  # buffer resource over the O tensor (buffer_ops.create_buffer_resource)
+        ptr_O,  # fx.Pointer to the O tensor (buffer resource built internally)
         o_base_elems,  # fx.Int32: element offset of this (batch, ...) origin (0 for thd)
         stride_o_seq,  # elements per token step
         stride_o_head,  # elements per q-head step
@@ -1252,13 +1265,20 @@ class OManager16b:
 
         ``o_frags[k]`` is this lane's v8 fp32 for d-tile ``k``, already normalized
         (O / row-sum). Rows with seq >= q_len are dropped via the buffer_store mask,
-        which redirects to offset ``0x7FFFFFFF`` -- so ``o_rsrc`` MUST carry the real
-        ``num_records`` (``max_size=False``) or it faults.
+        which redirects to offset ``0x7FFFFFFF`` -- so the internally-built buffer
+        resource is bounded to the real ``num_records`` (below 0x7FFFFFFF) so the drop
+        lands OOB (dropped) rather than faulting. ``stride_o_*`` in ELEMENTS.
         """
         if len(o_frags) != self.d_tiles:
             raise ValueError(
                 f"expected {self.d_tiles} O frags (v_hdim//{_WMMA_M}); got {len(o_frags)}"
             )
+        # Bound records to the last valid token so mask-dropped rows (redirected to byte
+        # 0x7FFFFFFF) land OOB instead of faulting; every valid write is far below that.
+        o_num_records_bytes = (q_start + q_len) * stride_o_seq * fx.Int32(_BF16_BYTES)
+        o_rsrc = buffer_ops.create_buffer_resource(
+            ptr_O, num_records_bytes=arith.unwrap(o_num_records_bytes)
+        )
         lds_warp = ptr_lds + warp_idx * self._warp_stride
         q_st = lane_idx % _WMMA_M
         d_half = (lane_idx // _WMMA_M) * _CHUNK_ELEMS  # 0 or 8
@@ -1351,3 +1371,222 @@ class OManager16b:
             if u + 1 < self.n_units:
                 emit_write(u + 1)
             emit_read(u)
+
+
+class OManager16bV2:
+    """O epilogue via TDM store. Accumulator (fp32) -> bf16 -> row-major padded private LDS
+    (``ds_store_b128``) -> global VRAM (per-warp ``tensor_store_from_lds``). No transpose re-read:
+    the TDM descriptor does the LDS->global reshape, and HW OOB drops rows ``seq >= q_len``.
+
+    PV leaves each wave's 16 x v_hdim tile in the accumulator layout: for d-tile ``k`` lane ``l``
+    holds ``O[q = l%16, d = 16*k + (l//16)*8 + {0..7}]``. That maps straight to a row-major
+    ``[16, v_hdim]`` LDS tile (row = q, col = d) — lane ``l`` ds_stores 8 bf16 at row ``l%16``,
+    col ``16*k + (l//16)*8``. The global side is the GQA-packed 3-D ``[n_seq, gqa, v_hdim]``
+    descriptor (packed row pr -> seq pr//gqa, head kv_head*gqa + pr%gqa), degenerating to
+    ``[rows,1,v_hdim]`` at gqa==1; ``num_warps=1`` so each wave stores only its own rows into a
+    private LDS region (no cross-wave sync).
+
+    NOTE: the LDS staging is CONTIGUOUS (row stride == v_hdim, no pad). The TDM store IGNORES LDS
+    padding on the LDS->memory direction (Shader Programming Guide 4.10.2: "there is no de-padding
+    operation; padding is ignored"), so a padded LDS would be read misaligned (only row 0 lands).
+    The unpadded ``ds_store_b128`` therefore takes a bank conflict (lane l -> row l%16, same column
+    group), but O is a one-time epilogue store so the cost is negligible."""
+
+    def __init__(self, *, v_hdim, gqa_ratio, num_waves=_DEFAULT_NUM_WAVES, q_tiles_per_wave=1):
+        if v_hdim % _WMMA_M != 0:
+            raise ValueError(f"v_hdim must be a multiple of {_WMMA_M}; got {v_hdim}")
+        if num_waves != _DEFAULT_NUM_WAVES:
+            raise NotImplementedError("V2 TDM loader assumes 8 waves")
+        self.v_hdim = v_hdim
+        self.gqa_ratio = gqa_ratio
+        self.num_waves = num_waves
+        self.q_tiles_per_wave = q_tiles_per_wave
+        self.d_tiles = v_hdim // _WMMA_M
+        self.rows_per_warp = _WMMA_M * q_tiles_per_wave        # 32
+        self.block_m = self.rows_per_warp * num_waves          # 256
+        self.row_elems = v_hdim                                # CONTIGUOUS (TDM store ignores pad)
+        self.row_bytes = self.row_elems * _BF16_BYTES
+
+    def get_lds_size_in_byte(self):
+        return self.num_waves * self.rows_per_warp * self.row_bytes
+
+    def store_o_to_vram(self, *, ptr_O, o_base_elems, stride_o_seq, stride_o_head,
+                        q_start, q_len, kv_head, block_x, warp_idx, lane_idx, ptr_lds,
+                        o_frags, qtile=0):
+        """Reshape this warp's 16 x v_hdim fp32 accumulator to bf16 and TDM-store it. ``o_frags[k]``
+        is this lane's v8 fp32 for d-tile ``k`` (already normalized). Rows with seq >= q_len are
+        dropped by the TDM extent. ``stride_o_*`` in ELEMENTS (host convention)."""
+        if len(o_frags) != self.d_tiles:
+            raise ValueError(f"expected {self.d_tiles} O frags (v_hdim//{_WMMA_M}); got {len(o_frags)}")
+        gqa = self.gqa_ratio
+        warp_region = ptr_lds + warp_idx * fx.Int32(self.rows_per_warp * self.row_bytes)
+        tile_lds = warp_region + fx.Int32(qtile * _WMMA_M * self.row_bytes)
+
+        # (1) Accumulator -> row-major padded LDS. lane_base = tile + (l%16)*row_bytes + (l//16)*16;
+        # d-tile k at +k*32 (16 cols * 2 B). One b128 per d-tile.
+        lane_base = (tile_lds
+                     + (lane_idx % _WMMA_M) * fx.Int32(self.row_bytes)
+                     + (lane_idx // _WMMA_M) * fx.Int32(_CHUNK_ELEMS * _BF16_BYTES))
+        base_ptr = buffer_ops.create_llvm_ptr(lane_base, address_space=3)
+        for k in range(self.d_tiles):
+            bf = o_frags[k].to(fx.BFloat16)
+            imm = k * _WMMA_M * _BF16_BYTES
+            p = base_ptr if imm == 0 else buffer_ops.get_element_ptr(base_ptr, static_byte_offset=imm)
+            llvm_dialect.store(_ir(bf), p, alignment=_CHUNK_BYTES)
+        rocdl.s_wait_dscnt(0)  # drain b128 stores so the TDM read sees coherent LDS
+
+        # (2) TDM store: private padded LDS tile -> global O (HW OOB drop on the seq axis).
+        base_row = block_x * fx.Int32(self.block_m) + warp_idx * fx.Int32(self.rows_per_warp) \
+            + fx.Int32(qtile * _WMMA_M)
+        seq0 = base_row // fx.Int32(gqa)
+        head0 = kv_head * fx.Int32(gqa)
+        rem = q_len - seq0
+        n_seq_valid = fx.Int32(arith.maxsi(arith.unwrap(rem), arith.unwrap(fx.Int32(0))))
+        lds_ptr_ty = fx.PointerType.get(
+            elem_ty=fx.BFloat16.ir_type, address_space=fx.AddressSpace.Shared, alignment=16)
+        lds_iter = fx.inttoptr(lds_ptr_ty, tile_lds)
+        if gqa == 1:
+            # gqa==1: packed rows == contiguous seqs of one head -> a plain 2-D store.
+            off = fx.Int64(o_base_elems) + fx.Int64(q_start + base_row) * fx.Int64(stride_o_seq) \
+                + fx.Int64(kv_head) * fx.Int64(stride_o_head)
+            gbase = fx.add_offset(fx.get_iter(ptr_O), off)
+            g_view = fx.Tensor(fx.make_view(
+                gbase, fx.make_layout((_WMMA_M, self.v_hdim), (self.v_hdim, 1))))
+            atom = fx.rocdl.make_tdm_atom(
+                g_view, [n_seq_valid, None], strides=[stride_o_seq, None], num_warps=1)
+            lds_view = fx.Tensor(fx.make_view(
+                lds_iter, fx.make_layout((_WMMA_M, self.v_hdim), (self.row_elems, 1))))
+        else:
+            # GQA: packed row pr -> seq pr//gqa, head kv_head*gqa + pr%gqa -> 3-D descriptor.
+            n_seq = _WMMA_M // gqa
+            off = fx.Int64(o_base_elems) + fx.Int64(q_start + seq0) * fx.Int64(stride_o_seq) \
+                + fx.Int64(head0) * fx.Int64(stride_o_head)
+            gbase = fx.add_offset(fx.get_iter(ptr_O), off)
+            g_view = fx.Tensor(fx.make_view(
+                gbase, fx.make_layout((n_seq, gqa, self.v_hdim), (gqa * self.v_hdim, self.v_hdim, 1))))
+            atom = fx.rocdl.make_tdm_atom(
+                g_view, [n_seq_valid, None, None], strides=[stride_o_seq, stride_o_head, None],
+                num_warps=1)
+            lds_view = fx.Tensor(fx.make_view(
+                lds_iter, fx.make_layout((n_seq, gqa, self.v_hdim), (gqa * self.row_elems, self.row_elems, 1))))
+        fx.copy_atom_call(atom, lds_view, g_view)  # src=shared, dst=global => store
+
+
+class OManager16bV3:
+    """O writer: conflict-free PADDED LDS ds_store + per-b128 ``global_store_async_from_lds_b128``
+    (LDS->VRAM), NO TDM. Keeps V2's padded LDS (bank-conflict-free ``ds_store_b128``, 4DW pad) but
+    avoids the TDM store's "padding ignored" limitation by addressing each b128 ourselves; and skips
+    V1's VGPR re-read (the async store goes LDS->global directly).
+
+    Accumulator (d-tile k, lane l = ``O[q=l%16, d=16k+(l//16)*8+{0..7}]``) -> row-major PADDED LDS
+    ``[16, v_hdim]`` (row stride v_hdim+_O_PAD_ELEMS). Then the 16 x (v_hdim/8) b128 chunks are stored
+    LDS->global over ``n_rounds`` waves of 32 lanes: round r lane l -> chunk c=r*32+l, row=c//cpr,
+    d_chunk=c%cpr (cpr = v_hdim/8) -> coalesced (consecutive lanes = consecutive global). Rows with
+    seq>=q_len are EXEC-masked off (async store has no bounds; ``scf_if_dispatch`` per lane)."""
+
+    def __init__(self, *, v_hdim, gqa_ratio, num_waves=_DEFAULT_NUM_WAVES, q_tiles_per_wave=1):
+        if v_hdim % _WMMA_M != 0:
+            raise ValueError(f"v_hdim must be a multiple of {_WMMA_M}; got {v_hdim}")
+        if num_waves != _DEFAULT_NUM_WAVES:
+            raise NotImplementedError("V3 assumes 8 waves")
+        self.v_hdim = v_hdim
+        self.gqa_ratio = gqa_ratio
+        self.num_waves = num_waves
+        self.q_tiles_per_wave = q_tiles_per_wave
+        self.d_tiles = v_hdim // _WMMA_M
+        self.rows_per_warp = _WMMA_M * q_tiles_per_wave
+        self.block_m = self.rows_per_warp * num_waves
+        self.row_elems = v_hdim + _O_PAD_ELEMS                 # PADDED (conflict-free ds_store)
+        self.row_bytes = self.row_elems * _BF16_BYTES
+        self.chunks_per_row = v_hdim // _CHUNK_ELEMS           # b128 chunks per row
+        self.n_rounds = (_WMMA_M * self.chunks_per_row) // _WAVE_LANES
+        self._pending = []                                     # per-qtile (tile_lds, base_row)
+
+    def get_lds_size_in_byte(self):
+        return self.num_waves * self.rows_per_warp * self.row_bytes
+
+    def store_o_to_vram(self, *, ptr_O, o_base_elems, stride_o_seq, stride_o_head,
+                        q_start, q_len, kv_head, block_x, warp_idx, lane_idx, ptr_lds,
+                        o_frags, qtile=0):
+        """Called once per q-tile: cvt accumulator->bf16 + compute LDS write pointers (VALU), STASH;
+        the LAST call flushes the whole WARP: (a) ds_stores back-to-back, (b) ALL rows_per_warp rows'
+        global addresses together (all live -> distinct regs, so no later store's addr VALU reuses an
+        earlier still-in-flight store's source reg -- a ~161-cyc WAR halt when split per-tile), (c) one
+        s_wait_dscnt(0) then ONE back-to-back async burst. The warp's q_tiles_per_wave 16-row tiles are
+        CONTIGUOUS in LDS (tile qt at warp_region + qt*16*row_bytes) so they form one 32-row block."""
+        if len(o_frags) != self.d_tiles:
+            raise ValueError(f"expected {self.d_tiles} O frags; got {len(o_frags)}")
+        warp_region = ptr_lds + warp_idx * fx.Int32(self.rows_per_warp * self.row_bytes)
+        tile_lds = warp_region + fx.Int32(qtile * _WMMA_M * self.row_bytes)
+
+        # (1) Per call: cvt fp32->bf16 + compute LDS write pointers (no issue yet). Stash.
+        lane_base = (tile_lds
+                     + (lane_idx % _WMMA_M) * fx.Int32(self.row_bytes)
+                     + (lane_idx // _WMMA_M) * fx.Int32(_CHUNK_ELEMS * _BF16_BYTES))
+        base_ptr = buffer_ops.create_llvm_ptr(lane_base, address_space=3)
+        ds_ops = []
+        for k in range(self.d_tiles):
+            bf = o_frags[k].to(fx.BFloat16)  # cvt
+            imm = k * _WMMA_M * _BF16_BYTES
+            p = base_ptr if imm == 0 else buffer_ops.get_element_ptr(base_ptr, static_byte_offset=imm)
+            ds_ops.append((bf, p))
+        self._pending.append(ds_ops)
+        if qtile == 0:
+            self._warp_region = warp_region
+            self._warp_base = block_x * fx.Int32(self.block_m) + warp_idx * fx.Int32(self.rows_per_warp)
+            self._cfg = dict(ptr_O=ptr_O, o_base_elems=o_base_elems, stride_o_seq=stride_o_seq,
+                             stride_o_head=stride_o_head, q_start=q_start, q_len=q_len,
+                             kv_head=kv_head, lane_idx=lane_idx)
+
+        if qtile != self.q_tiles_per_wave - 1:
+            return
+
+        # (2) LAST call -- flush the whole warp.
+        rocdl.sched_barrier(0)
+        for ds_ops in self._pending:
+            for bf, p in ds_ops:
+                llvm_dialect.store(_ir(bf), p, alignment=_CHUNK_BYTES)
+        addrs, valid_rows = self._warp_addrs(self._warp_region, self._warp_base, **self._cfg)
+        rocdl.sched_barrier(0)  # address VALU above, store burst below -- no interleave
+        rocdl.s_wait_dscnt(0)   # all ds_stores landed (every async row reads a full padded row)
+
+        def _burst(*_a):
+            for gdst, lsrc in addrs:
+                rocdl_dialect.global_store_async_from_lds_b128(_ir(gdst), _ir(lsrc), 0)
+        _scf_if_dispatch(valid_rows > fx.Int32(0), _burst)  # skip a fully-OOB warp
+        # No s_wait_asynccnt: HW drains the async stores' LDS reads at workgroup retire.
+        self._pending = []
+
+    def _warp_addrs(self, warp_region, warp_base, *, ptr_O, o_base_elems, stride_o_seq,
+                    stride_o_head, q_start, q_len, kv_head, lane_idx):
+        """Pure ALU: (gdst, lsrc) for every round of the warp's ``rows_per_warp x v_hdim`` block,
+        row-coalesced. OOB rows (seq>=q_len) clamp to the warp's last valid row -- a redundant,
+        idempotent write (a real lane of THIS warp stores the same bytes; warps own disjoint rows so
+        no cross-warp race) -- so every store issues UNCONDITIONALLY (no per-store branch) and the
+        burst stays back-to-back. Returns (addrs, valid_rows); valid_rows<=0 => whole warp OOB."""
+        gqa = self.gqa_ratio
+        cpr = self.chunks_per_row
+        rpw = self.rows_per_warp
+        n_rounds = (rpw * cpr) // _WAVE_LANES
+        ptr_O_i64 = fx.Int64(fx.ptrtoint(fx.get_iter(ptr_O)))
+        # packed rows [warp_base, warp_base+rpw) valid iff pr//gqa < q_len iff pr < q_len*gqa.
+        valid_rows = q_len * fx.Int32(gqa) - warp_base
+        last_valid = _min_i32(_max_i32(valid_rows - fx.Int32(1), fx.Int32(0)), fx.Int32(rpw - 1))
+        addrs = []
+        for r in range(n_rounds):
+            c = fx.Int32(r * _WAVE_LANES) + lane_idx
+            row = c // fx.Int32(cpr)
+            d_chunk = c % fx.Int32(cpr)
+            srow = _min_i32(row, last_valid)  # OOB rows -> warp's last valid row (idempotent redirect)
+            d = d_chunk * fx.Int32(_CHUNK_ELEMS)
+            lds_src = warp_region + srow * fx.Int32(self.row_bytes) + d_chunk * fx.Int32(_CHUNK_BYTES)
+            pr = warp_base + srow
+            seq_g = pr // fx.Int32(gqa) if gqa > 1 else pr
+            head = kv_head * fx.Int32(gqa) + pr % fx.Int32(gqa) if gqa > 1 else kv_head
+            token = q_start + seq_g
+            off64 = (fx.Int64(o_base_elems) + fx.Int64(token) * fx.Int64(stride_o_seq)
+                     + fx.Int64(head) * fx.Int64(stride_o_head) + fx.Int64(d))
+            gdst = buffer_ops.create_llvm_ptr(ptr_O_i64 + off64 * fx.Int64(_BF16_BYTES), address_space=1)
+            lsrc = buffer_ops.create_llvm_ptr(lds_src, address_space=3)
+            addrs.append((gdst, lsrc))
+        return addrs, valid_rows

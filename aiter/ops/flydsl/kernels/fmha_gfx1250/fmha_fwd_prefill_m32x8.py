@@ -62,8 +62,9 @@ scf_if_dispatch = ReplaceIfWithDispatch.scf_if_dispatch
 # Q/K/V staging managers (own their LDS swizzles + async copy schedules). They are
 # self-contained: this kernel maintains its own arch constants below and passes the
 # config each manager needs through its constructor.
-from .mha_buffer_managers import QManager16bV1, KManager16bV1, VManager16bV1, OManager16b
-from .mha_buffer_managers import QManager16bV2, KManager16bV2, VManager16bV2
+from .mha_buffer_managers import QManager16bV1, KManager16bV1, VManager16bV1, OManager16bV1
+from .mha_buffer_managers import QManager16bV2, KManager16bV2, VManager16bV2, OManager16bV2
+from .mha_buffer_managers import OManager16bV3
 from flydsl.expr.rocdl import tdm_ops
 
 # Single source of truth for gfx1250 Expert Scheduling Mode 2 (DEP_MODE=2). Lives
@@ -131,9 +132,14 @@ LOG2E = 1.4426950408889634
 ENABLE_DEFER_RESCALE = True
 RESCALE_THRESHOLD = 8.0
 
-# Compile-time K/V loader select. False = V1 (cluster_load_async + swizzled LDS);
-# True = V2 (TDM global->LDS + row-major padded LDS, HW OOB, fewer address VGPRs).
+# Compile-time Q/K/V loader select. False = V1 (Q ring async + swizzled LDS; K/V cluster_load_async +
+# swizzled LDS); True = V2 (Q per-warp TDM; K/V TDM global->LDS; all row-major padded LDS, HW OOB,
+# fewer address VGPRs). Gates all three loaders (Q, K and V); O is selected separately by O_VARIANT.
 USE_TDM_LOADER = True
+# O writer variant (decoupled from USE_TDM_LOADER): "v1" swizzled LDS + buffer_store (fastest so
+# far), "v2" TDM store (padding ignored -> contiguous LDS -> bank conflict, slow), "v3" padded LDS +
+# global_store_async_from_lds_b128.
+O_VARIANT = "v3"
 
 # NOTE: the remaining tiling constants (chunk sizes, K/V write-tile + V swizzle
 # granularity) live inside mha_buffer_managers.py — they are intrinsic to the
@@ -1121,10 +1127,13 @@ def _core_attention(
     # last load into it was local tile n_iter-2 (issued during local tile n_iter-3,
     # consumed at n_iter-2), and the top-of-body barrier at local tile n_iter-1 already
     # synchronized every wave past that read. So the slot is idle here -- no cross-wave
-    # barrier needed. Keep s_wait_asynccnt(0) as a per-wave WAR guard: it retires any
-    # still-inflight async load into this slot before O's LDS write. The R q-tiles
+    # barrier needed. Only the V1 loader issues async loads (asynccnt); under TDM (V2/V3)
+    # K/V/Q load via tensorcnt, so nothing increments asynccnt and s_wait_asynccnt(0) is a
+    # pure no-op -- keep it only for V1 as a defensive per-wave WAR guard (retire any
+    # still-inflight async load into this slot before O's LDS write). The R q-tiles
     # serialize through the same O ring (s_wait_dscnt(0) between them).
-    o_mgr = OManager16b(
+    _OMgr = {"v1": OManager16bV1, "v2": OManager16bV2, "v3": OManager16bV3}[O_VARIANT]
+    o_mgr = _OMgr(
         v_hdim=v_hdim, gqa_ratio=gqa_ratio, num_waves=NUM_WAVES,
         q_tiles_per_wave=R,
     )
@@ -1132,16 +1141,11 @@ def _core_attention(
         f"O ring budget {o_mgr.get_lds_size_in_byte()}B exceeds K|V slot {slot_bytes}B"
     )
     non_cur_pp = n_iter % fx.Int32(N_KV_PP)
-    rocdl.s_wait_asynccnt(0)  # per-wave WAR: retire inflight async loads before slot reuse
-    # O strides are in ELEMENTS (OManager multiplies by _BF16_BYTES itself), unlike the
-    # BYTE strides the K/V load path uses -- pass stride_o_* straight through. OManager
-    # redirects mask-dropped rows to offset 0x7FFFFFFF, so o_rsrc must bound below that
-    # (max_size=True would make the drop land in-bounds and fault); every valid write is
-    # < (q_start+q_len)*stride_o_seq bytes, far below 0x7FFFFFFF.
-    o_num_records_bytes = (q_start + q_len) * stride_o_seq * fx.Int32(2)
-    o_rsrc = buffer_ops.create_buffer_resource(
-        ptr_O, num_records_bytes=arith.unwrap(o_num_records_bytes)
-    )
+    if not USE_TDM_LOADER:
+        rocdl.s_wait_asynccnt(0)  # V1-only WAR: retire inflight async loads before slot reuse
+    # O strides are in ELEMENTS (OManager multiplies by _BF16_BYTES itself). Both V1/V2
+    # take ptr_O and build their own store descriptor internally (V1 a bounded buffer
+    # resource for the masked buffer_store; V2 the TDM store atom with HW OOB drop).
     o_lds_base = _k_lds_buf(non_cur_pp)
     for qt in range(R):
         # Normalize this q-tile's O by its running denom d, then reshape+store to VRAM.
@@ -1160,9 +1164,9 @@ def _core_attention(
         # writeback or the added drain reshuffles RA into a new race. Left uncovered.
         o_norm = [o_final[dt] * inv_vec for dt in range(d_tiles)]
         if qt > 0:
-            rocdl.s_wait_dscnt(0)  # drain prev q-tile's O ring DS ops before reuse
+            rocdl.s_wait_dscnt(0)  # drain prev q-tile's O ring/DS ops before reuse
         o_mgr.store_o_to_vram(
-            o_rsrc=o_rsrc,
+            ptr_O=ptr_O,
             o_base_elems=fx.Int32(0),
             stride_o_seq=stride_o_seq,
             stride_o_head=stride_o_head,
