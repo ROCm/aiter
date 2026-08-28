@@ -52,12 +52,7 @@ from aiter.ops.flydsl.moe_kernels import (
     resolve_flydsl_stage2_tile_k,
     runtime_swiglu_limit,
 )
-from aiter.ops.flydsl.mxfp4_kname import (
-    _parse_mxfp4_g1_kname,
-    _select_mxfp4_a4w4_kernels,
-    parse_flydsl_v2_gemm2_kernel,
-)
-from aiter.ops.moe_mxfp4_aux import is_mxfp4_moe_shape_supported
+from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
 
 # Keep the default AOT coverage aligned with runtime config resolution.
 DEFAULT_CSVS = [
@@ -121,15 +116,7 @@ def parse_csv(csv_path: str):
                 if stage1_name.startswith("flydsl_")
                 else None
             )
-            stage1_output_sorted = False
-            if stage1_name.startswith("flydsl_mxmoe_g1_"):
-                stage1_mx_params = _parse_mxfp4_g1_kname(stage1_name)
-                stage1_out_dtype = stage1_mx_params["out_dtype"]
-                stage1_output_sorted = True
-            else:
-                stage1_out_dtype = (
-                    stage1_params.get("out_dtype") if stage1_params else None
-                )
+            stage1_out_dtype = stage1_params.get("out_dtype") if stage1_params else None
             stage1_v2_output_layout = "_moe2_layout_" in stage2_name
             stage2_v2_params = (
                 parse_flydsl_v2_gemm2_kernel(stage2_name)
@@ -203,7 +190,6 @@ def parse_csv(csv_path: str):
                             if stage1_out_dtype in ("fp4", "fp8")
                             else None
                         )
-                        job["intermediate_sorted"] = stage1_output_sorted
                     full_job = {**job, **params}
                     if params["stage"] == 1 and stage1_v2_output_layout:
                         full_job["v2_output_layout"] = True
@@ -215,70 +201,6 @@ def parse_csv(csv_path: str):
                     seen.add(key)
 
                     jobs.append(full_job)
-
-            # Legacy A4W4 rows are dynamically replaced at runtime by a sorted
-            # MXMOE GEMM1 plus a FlyDSL GEMM2. The configured pair above remains
-            # covered for replacement-disabled runs; add the effective stage2
-            # specialization as well so RUN_ONLY can find its AOT cache.
-            configured_stage1 = row.get("kernelName1", "").strip()
-            row_gfx = row.get("gfx") or ("gfx950" if cu_num == 256 else "unknown")
-            padded_shape = (
-                experts,
-                model_dim,
-                ((inter_dim + 255) // 256) * 256,
-                topk,
-            )
-            if (
-                not configured_stage1.startswith("flydsl_mxmoe_g1_")
-                and os.environ.get("AITER_MXFP4_GEMM1_REPLACEMENT", "1").lower()
-                not in ("0", "false")
-                and row_gfx == "gfx950"
-                and act_type == "ActivationType.Silu"
-                and dtype == "torch.bfloat16"
-                and row.get("q_dtype_a") == "torch.float4_e2m1fn_x2"
-                and q_dtype_w == "torch.float4_e2m1fn_x2"
-                and q_type == "QuantType.per_1x32"
-                and int(row.get("use_g1u1") or 0) == 1
-                and not doweight_stage1
-                and model_dim % 256 == 0
-                and padded_shape != (896, 3584, 512, 16)
-                and is_mxfp4_moe_shape_supported(experts, model_dim, inter_dim, topk)
-            ):
-                replacement = _select_mxfp4_a4w4_kernels(
-                    token=token,
-                    expert=experts,
-                    topk=topk,
-                )
-                runtime_stage1 = _parse_mxfp4_g1_kname(replacement["kernelName1"])
-                runtime_stage2 = replacement["kernelName2"]
-                params = get_flydsl_kernel_params(runtime_stage2)
-                if params is None:
-                    print(
-                        f"  [WARN] Unknown runtime replacement kernel: "
-                        f"{runtime_stage2}, skipping"
-                    )
-                    continue
-                for enable_bias in enable_bias_options:
-                    full_job = {
-                        "kernel_name": runtime_stage2,
-                        "model_dim": model_dim,
-                        "inter_dim": inter_dim,
-                        "experts": experts,
-                        "topk": topk,
-                        "doweight_stage1": doweight_stage1,
-                        "cu_num": cu_num,
-                        "act": act,
-                        "enable_bias": enable_bias,
-                        "token_num": token,
-                        "block_m": replacement["BM"],
-                        "stage1_fuse_quant": runtime_stage1["out_dtype"],
-                        "intermediate_sorted": True,
-                        **params,
-                    }
-                    key = job_identity(full_job)
-                    if key not in seen:
-                        seen.add(key)
-                        jobs.append(full_job)
 
     return jobs
 
@@ -318,7 +240,6 @@ def _precompile_to_cache(
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
     stage1_fuse_quant=None,
-    intermediate_sorted: bool = False,
     k_wave: int = 1,
     v2_output_layout: bool = False,
     # Stage2-only kernel tuning knobs (registered by the production-variant
@@ -748,11 +669,7 @@ def _precompile_to_cache(
             # inter_dim=384), in which case runtime compiles the legal fallback.
             tile_k = resolve_flydsl_stage2_tile_k(inter_dim, tile_k)
 
-            # MXFP4 GEMM1 can feed GEMM2 in expert-sorted layout directly.
-            if intermediate_sorted:
-                packed_inter = inter_dim // 2 if a_dtype == "fp4" else inter_dim
-                a_shape = (max_num_tokens_padded, packed_inter)
-            elif a_dtype == "fp4":
+            if a_dtype == "fp4":
                 a_shape = (tokens, topk, inter_dim // 2)
             else:
                 a_shape = (tokens, topk, inter_dim)
@@ -837,7 +754,7 @@ def _precompile_to_cache(
                     sw_arg,
                     num_valid_ids,
                     tokens,
-                    a.shape[0] if intermediate_sorted else tokens * topk,
+                    tokens * topk,
                     _n_in,
                     _k_in,
                     m_blocks,
@@ -889,7 +806,6 @@ def _precompile_to_cache(
                 b_nt=b_nt,
                 xcd_swizzle=xcd_swizzle,
                 enable_bias=enable_bias,
-                a_sorted=intermediate_sorted,
             )
             _run_compiled(exe, args)
 

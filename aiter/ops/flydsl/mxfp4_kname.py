@@ -157,18 +157,6 @@ def _select_mxfp4_g1_kernel(
     }
 
 
-def _select_mxfp4_a4w4_kernels(*, token: int, expert: int, topk: int) -> dict:
-    """Select the canonical MXFP4 GEMM1/GEMM2 pair for a routed-M shape."""
-    selected = _select_mxfp4_g1_kernel(
-        token=token,
-        expert=expert,
-        topk=topk,
-    )
-    block_m = selected["BM"]
-    g2 = f"flydsl_moe2_afp4_wfp4_bf16_t{block_m}x128x256_reduce"
-    return {**selected, "kernelName2": g2}
-
-
 _FLYDSL_V2_GEMM2_RE = re.compile(
     r"^flydsl_moe2_layout_a(?P<a>\w+?)_w(?P<b>\w+?)_(?P<out>\w+?)_"
     r"t(?P<tm>\d+)x(?P<tn>\d+)x(?P<tk>\d+)_(?P<epilog>atomic|reduce)"

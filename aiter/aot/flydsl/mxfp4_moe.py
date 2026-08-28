@@ -107,16 +107,18 @@ def _job_key(job: dict) -> tuple:
 
 def parse_csv(csv_path: str):
     """Parse a tuned CSV into unique MXMOE-port compile jobs (one per stage)."""
+    from aiter.ops.flydsl.moe_common import (
+        DEFAULT_SITUV2_BETA,
+        DEFAULT_SITUV2_LINEAR_BETA,
+    )
     from aiter.ops.flydsl.mxfp4_gemm1_kernels import _effective_use_nt
     from aiter.ops.flydsl.mxfp4_gemm2_kernels import _epilog_of
     from aiter.ops.flydsl.mxfp4_kname import (
         _is_mxfp4_kname,
         _parse_mxfp4_g1_kname,
         _parse_mxfp4_g2_kname,
-        _select_mxfp4_g1_kernel,
         parse_flydsl_v2_gemm2_kernel,
     )
-    from aiter.ops.moe_mxfp4_aux import is_mxfp4_moe_shape_supported
 
     jobs = []
     seen = set()
@@ -139,97 +141,8 @@ def parse_csv(csv_path: str):
             d_inter = ((inter_dim + 255) // 256) * 256
             d_inter_real = inter_dim if inter_dim != d_inter else None
 
-            configured_kn1 = (row.get("kernelName1") or "").strip()
-            configured_kn2 = (row.get("kernelName2") or "").strip()
-            act_type = row.get("act_type")
-            q_dtype_a = row.get("q_dtype_a")
-            shape = (expert, model_dim, d_inter, topk)
-            is_kimi_k3 = shape == (896, 3584, 512, 16)
-            is_dsv4 = shape in {
-                (384, 7168, 512, 6),
-                (384, 7168, 768, 6),
-                (384, 7168, 1536, 6),
-                (385, 7168, 512, 7),
-                (385, 7168, 768, 7),
-                (385, 7168, 1536, 7),
-                (48, 7168, 3072, 6),
-                (256, 4096, 256, 6),
-            }
-            is_a4w4_variant = q_dtype_a == "torch.float4_e2m1fn_x2" and act_type in (
-                "ActivationType.Silu",
-                "ActivationType.Swiglu",
-                "ActivationType.Situv2",
-            )
-            is_a8w4_variant = q_dtype_a == "torch.float8_e4m3fn" and (
-                (act_type == "ActivationType.Silu" and is_dsv4)
-                or (act_type == "ActivationType.Situv2" and is_kimi_k3)
-            )
-            row_gfx = row.get("gfx") or (
-                "gfx950" if int(row.get("cu_num") or 0) == 256 else "unknown"
-            )
-            use_replacement = (
-                row_gfx == "gfx950"
-                and row.get("dtype") == "torch.bfloat16"
-                and (is_a4w4_variant or is_a8w4_variant)
-                and row.get("q_dtype_w") == "torch.float4_e2m1fn_x2"
-                and row.get("q_type") == "QuantType.per_1x32"
-                and int(row.get("use_g1u1") or 0) == 1
-                and int(row.get("doweight_stage1") or 0) == 0
-                and is_mxfp4_moe_shape_supported(
-                    expert,
-                    model_dim,
-                    inter_dim,
-                    topk,
-                )
-            )
-            if use_replacement and is_a8w4_variant:
-                act = "situv2" if act_type == "ActivationType.Situv2" else "silu"
-                replacement = _select_mxfp4_g1_kernel(
-                    token=token,
-                    expert=expert,
-                    topk=topk,
-                    block_m=int(row.get("block_m") or 0) or None,
-                    a_dtype="fp8",
-                    out_dtype="fp8",
-                    act=act,
-                    interleave="_gui" in configured_kn1.lower(),
-                )
-                # GEMM1 emits the same FP8+E8M0 contract consumed by the tuned
-                # GEMM2, so stage2 remains byte-for-byte unchanged.
-                replacement["kernelName2"] = configured_kn2
-            elif use_replacement:
-                if act_type == "ActivationType.Swiglu":
-                    act = "swiglu"
-                elif act_type == "ActivationType.Situv2":
-                    act = "situv2"
-                else:
-                    act = "silu"
-                replacement = _select_mxfp4_g1_kernel(
-                    token=token,
-                    expert=expert,
-                    topk=topk,
-                    block_m=int(row.get("block_m") or 0) or None,
-                    act=act,
-                    enable_bias=act == "swiglu",
-                )
-                replacement["kernelName2"] = configured_kn2
-            else:
-                replacement = None
-
-            kn1 = (
-                configured_kn1
-                if _is_mxfp4_kname(configured_kn1)
-                else (
-                    replacement["kernelName1"]
-                    if replacement is not None
-                    else configured_kn1
-                )
-            )
-            kn2 = (
-                replacement["kernelName2"]
-                if replacement is not None
-                else configured_kn2
-            )
+            kn1 = (row.get("kernelName1") or "").strip()
+            kn2 = (row.get("kernelName2") or "").strip()
             v2_g2 = parse_flydsl_v2_gemm2_kernel(kn2)
             if v2_g2 is not None:
                 bk = v2_g2["tile_k"]
@@ -249,41 +162,46 @@ def parse_csv(csv_path: str):
                     use_nt=p1["use_nt"],
                     inline_quant=p1["inline_quant"],
                 )
-                _add(
-                    {
-                        "stage": 1,
-                        "kernel_name": kn1,
-                        "BM": p1["BM"],
-                        "BN": p1["BN"],
-                        "BK": p1["BK"],
-                        # Runtime may disable BM32 streaming loads once routed
-                        # M blocks saturate the experts. AOT must specialize on
-                        # that effective value, not only the kernel-name flag.
-                        "use_nt": effective_use_nt,
-                        "n_tokens": token,
-                        "inline_quant": p1["inline_quant"],
-                        "D_HIDDEN": model_dim,
-                        # GEMM1 specializes on the logical output width. GEMM2
-                        # padding is backend-specific and must not change its
-                        # AOT cache key (for example, inter_dim=384 vs 512).
-                        "D_INTER": inter_dim,
-                        "NE": expert,
-                        "topk": topk,
-                        "xcd_swizzle": p1["xcd_swizzle"],
-                        "a_dtype": p1["a_dtype"],
-                        "out_dtype": p1["out_dtype"],
-                        "act": p1["act"],
-                        "situ_beta": 2.0 if p1["act"] == "situv2" else 1.0,
-                        "situ_linear_beta": 1.5 if p1["act"] == "situv2" else 1.0,
-                        "swiglu_limit": 7.0,
-                        "enable_bias": p1["enable_bias"],
-                        "interleave": p1["interleave"],
-                        "native_scale_layout": p1["BM"] == 16
-                        and kn2.startswith("flydsl_mxmoe_g2_"),
-                        "num_waves": p1.get("num_waves", 4),
-                        "k_wave": p1.get("k_wave", 1),
-                    }
-                )
+                situ_params = [(1.0, 1.0)]
+                if p1["act"] == "situv2":
+                    situ_params.append(
+                        (DEFAULT_SITUV2_BETA, DEFAULT_SITUV2_LINEAR_BETA)
+                    )
+                for situ_beta, situ_linear_beta in situ_params:
+                    _add(
+                        {
+                            "stage": 1,
+                            "kernel_name": kn1,
+                            "BM": p1["BM"],
+                            "BN": p1["BN"],
+                            "BK": p1["BK"],
+                            # Runtime may disable BM32 streaming loads once routed
+                            # M blocks saturate the experts. AOT must specialize on
+                            # that effective value, not only the kernel-name flag.
+                            "use_nt": effective_use_nt,
+                            "n_tokens": token,
+                            "inline_quant": p1["inline_quant"],
+                            "D_HIDDEN": model_dim,
+                            # GEMM1 specializes on the logical output width. GEMM2
+                            # padding is backend-specific and must not change its
+                            # AOT cache key (for example, inter_dim=384 vs 512).
+                            "D_INTER": inter_dim,
+                            "NE": expert,
+                            "topk": topk,
+                            "xcd_swizzle": p1["xcd_swizzle"],
+                            "a_dtype": p1["a_dtype"],
+                            "out_dtype": p1["out_dtype"],
+                            "act": p1["act"],
+                            "situ_beta": situ_beta,
+                            "situ_linear_beta": situ_linear_beta,
+                            "swiglu_limit": 7.0,
+                            "enable_bias": p1["enable_bias"],
+                            "interleave": p1["interleave"],
+                            "native_scale_layout": p1["BM"] == 16,
+                            "num_waves": p1.get("num_waves", 4),
+                            "k_wave": p1.get("k_wave", 1),
+                        }
+                    )
 
             if v2_g2 is not None:
                 bm = v2_g2["tile_m"]

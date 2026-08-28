@@ -46,7 +46,6 @@ def _get_compiled_mxfp4_gemm1_port(
     D_HIDDEN,
     D_INTER,
     NE,
-    topk,
     BN,
     BK,
     interleave=False,
@@ -58,7 +57,6 @@ def _get_compiled_mxfp4_gemm1_port(
     situ_linear_beta=1.0,
     swiglu_limit=7.0,
     enable_bias=False,
-    v2_output_layout=True,
     native_scale_layout=False,
     num_waves=4,
     k_wave=1,
@@ -72,7 +70,6 @@ def _get_compiled_mxfp4_gemm1_port(
         D_HIDDEN=D_HIDDEN,
         D_INTER=D_INTER,
         NE=NE,
-        TOPK=topk,
         BN=BN,
         BK=BK,
         interleave=interleave,
@@ -84,7 +81,6 @@ def _get_compiled_mxfp4_gemm1_port(
         situ_linear_beta=situ_linear_beta,
         swiglu_limit=swiglu_limit,
         enable_bias=enable_bias,
-        v2_output_layout=v2_output_layout,
         native_scale_layout=native_scale_layout,
         num_waves=num_waves,
         k_wave=k_wave,
@@ -232,8 +228,6 @@ def flydsl_mxfp4_gemm1(
     BK=256,
     interleave=False,
     xcd_swizzle=0,
-    sorted_token_ids=None,
-    v2_output_layout=True,
     native_scale_layout=False,
     a_dtype="fp4",
     out_dtype="fp4",
@@ -276,10 +270,6 @@ def flydsl_mxfp4_gemm1(
         native_scale_layout=native_scale_layout,
         k_wave=k_wave,
     )
-    if not v2_output_layout and sorted_token_ids is None:
-        raise ValueError(
-            "sorted_token_ids are required for the dense GEMM1 output layout"
-        )
     from .kernels.mxfp4_gemm1 import gemm1_grid
 
     launch = _get_compiled_mxfp4_gemm1_port(
@@ -289,7 +279,6 @@ def flydsl_mxfp4_gemm1(
         D_HIDDEN,
         D_INTER,
         NE,
-        topk,
         BN,
         BK,
         interleave,
@@ -301,7 +290,6 @@ def flydsl_mxfp4_gemm1(
         situ_linear_beta,
         swiglu_limit,
         bias is not None,
-        v2_output_layout,
         native_scale_layout,
         num_waves,
         k_wave,
@@ -322,7 +310,6 @@ def flydsl_mxfp4_gemm1(
             sorted_expert_ids.data_ptr(),
             cumsum_tensor.data_ptr(),
             m_indices.data_ptr(),
-            0 if sorted_token_ids is None else sorted_token_ids.data_ptr(),
             n_tokens,
             grid,
             inter_sorted_quant.data_ptr(),

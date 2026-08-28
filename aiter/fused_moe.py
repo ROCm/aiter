@@ -1458,7 +1458,6 @@ class MOEMetadata:
     output_aux: bool | str = False
     prequant: bool = True
     skip_inter_quant: bool = False
-    intermediate_sorted: bool = False
     route_bucket: str = ""
     expected_sorted_blocks: int | None = None
     min_sorted_blocks: int | None = None
@@ -1597,8 +1596,6 @@ def _flydsl_stage2_wrapper(
     model_dim_pad: int = 0,
     expert_mask=None,
     topk_ids=None,
-    intermediate_sorted: bool = False,
-    logical_token_num: int | None = None,
     **_kwargs,
 ):
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
@@ -1647,8 +1644,6 @@ def _flydsl_stage2_wrapper(
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
         expert_mask=expert_mask,
         topk_ids=topk_ids,
-        intermediate_sorted=intermediate_sorted,
-        logical_token_num=logical_token_num,
     )
 
 
@@ -1774,7 +1769,6 @@ def _mxfp4_a4w4_stage1(
         sorted_expert_ids=sorted_expert_ids,
         cumsum_tensor=cumsum_tensor,
         m_indices=m_indices,
-        sorted_token_ids=sorted_token_ids,
         inter_sorted_quant=inter_sorted_quant,
         inter_sorted_shuffled_scale=inter_sorted_shuffled_scale,
         hidden_states=hidden_states,
@@ -1790,7 +1784,6 @@ def _mxfp4_a4w4_stage1(
         BK=BK,
         interleave=interleave,
         xcd_swizzle=_xcd1,
-        v2_output_layout=True,
         native_scale_layout=native_scale_layout,
         a_dtype=a_dtype,
         out_dtype=out_dtype,
@@ -2744,25 +2737,17 @@ def get_2stage_cfgs(
             "flydsl_moe2_layout_"
         )
         is_native_gemm2 = _is_mxfp4_kname(kernelName2)
-        if is_native_gemm2 or is_layout_gemm2:
-            stage2_func = functools.partial(
-                _mxfp4_a4w4_stage2_fw,
-                kernelName2=kernelName2,
-                inter_dim_pad=intermediate_pad,
-                model_dim_pad=hidden_pad,
-            )
-        elif isinstance(kernelName2, str) and kernelName2.startswith("flydsl_"):
-            stage2_func = functools.partial(
-                _flydsl_stage2_wrapper,
-                kernelName=kernelName2,
-                inter_dim_pad=intermediate_pad,
-                model_dim_pad=hidden_pad,
-            )
-        else:
+        if not (is_native_gemm2 or is_layout_gemm2):
             raise ValueError(
-                "MXMOE GEMM1 requires a sorted-intermediate GEMM2 backend, "
+                "MXMOE GEMM1 requires a native or layout GEMM2 backend, "
                 f"got {kernelName2!r}"
             )
+        stage2_func = functools.partial(
+            _mxfp4_a4w4_stage2_fw,
+            kernelName2=kernelName2,
+            inter_dim_pad=intermediate_pad,
+            model_dim_pad=hidden_pad,
+        )
         enable_bias = (
             _needs_swiglu_bias_support(dtype, q_type) and q_dtype_w == dtypes.fp4x2
         )
@@ -2817,7 +2802,6 @@ def get_2stage_cfgs(
             prequant=_p1["a_dtype"] == "fp8" and not _p1["inline_quant"],
             has_bias=enable_bias and _p1.get("enable_bias", False),
             stage2_has_bias=enable_bias and stage2_supports_bias,
-            intermediate_sorted=True,
             **route_bucket_metadata,
         )
 
@@ -3588,9 +3572,6 @@ def fused_moe_2stages(
         extra_stage1_args["m_indices"] = m_indices
         extra_stage1_args["moe_buf"] = _sort_moe_buf
         extra_stage2_args["reverse_sorted"] = reverse_sorted
-    if metadata.intermediate_sorted:
-        extra_stage2_args["intermediate_sorted"] = True
-        extra_stage2_args["logical_token_num"] = token_num
     _stage1_call = functools.partial(
         metadata.stage1,
         a1,
@@ -3623,7 +3604,7 @@ def fused_moe_2stages(
         kernel_bench_callable.append(("stage1", _stage1_call))
     a2 = _stage1_call()
     if isinstance(a2, tuple) and (
-        metadata.intermediate_sorted
+        stage1_func is _mxfp4_a4w4_stage1_fw
         or metadata.skip_inter_quant
         or m_indices is not None
     ):

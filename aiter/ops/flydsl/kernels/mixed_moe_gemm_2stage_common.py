@@ -3447,7 +3447,6 @@ def compile_mixed_moe_gemm2_common(
     cu_num_mul: int = 1,
     b_nt: int = 0,
     xcd_swizzle: int = 0,
-    a_sorted: bool = False,
     shared_expert_id: int | None = None,
 ):
     """Compile stage2 kernel (moe_gemm2): A2 @ W2.T -> [tokens, model_dim], atomic-add."""
@@ -3627,18 +3626,17 @@ def compile_mixed_moe_gemm2_common(
     cumul_tag = f"_cumul{int(cu_num_mul)}" if int(cu_num_mul) != 1 else ""
     acc_tag = "" if accumulate else "_acc0"
     xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
-    sorted_tag = "_asorted" if a_sorted else ""
     heterogeneous_tag = f"_shared_fp8_e{shared_expert_id}" if heterogeneous_b else ""
     serial_n_tag = "_serialn128" if serial_shared_n else ""
     if heterogeneous_b:
         variant_tags = (
             f"_vscale_fix3_fp4opt_v2{pm_tag}{sbm_tag}{wpe_tag}{async_tag}"
-            f"{cumul_tag}{acc_tag}{xcd_tag}{sorted_tag}{heterogeneous_tag}{serial_n_tag}"
+            f"{cumul_tag}{acc_tag}{xcd_tag}{heterogeneous_tag}{serial_n_tag}"
         )
     else:
         variant_tags = (
             f"_vscale_fix3_fp4opt_v1{pm_tag}{sbm_tag}{wpe_tag}{async_tag}"
-            f"{cumul_tag}{xcd_tag}{sorted_tag}{acc_tag}"
+            f"{cumul_tag}{xcd_tag}{acc_tag}"
         )
     module_name = (
         f"mfma_moe2_a{a_dtype}_w{b_dtype}_{out_s}_{epilog_tag}"
@@ -4144,29 +4142,21 @@ def compile_mixed_moe_gemm2_common(
 
                     if const_expr(i < num_x_addr_loads):
                         sorted_row_i = bx_m + row_local
-                        if const_expr(a_sorted):
-                            sorted_row_i32 = arith.index_cast(T.i32, sorted_row_i)
-                            c_k_div4_i32 = arith.index_cast(T.i32, c_k_div4)
-                            row_base_i32 = sorted_row_i32 * c_k_div4_i32
-                            x_row_base_div4.append(
-                                arith.index_cast(T.index, row_base_i32)
-                            )
-                        else:
-                            fused_i = buffer_ops.buffer_load(
-                                sorted_rsrc, sorted_row_i, vec_width=1, dtype=T.i32
-                            )
-                            t_i32 = arith.andi(fused_i, mask24)
-                            s_i32 = arith.shrui(fused_i, arith.constant(24))
+                        fused_i = buffer_ops.buffer_load(
+                            sorted_rsrc, sorted_row_i, vec_width=1, dtype=T.i32
+                        )
+                        t_i32 = arith.andi(fused_i, mask24)
+                        s_i32 = arith.shrui(fused_i, arith.constant(24))
 
-                            t_valid = arith.cmpi(CmpIPredicate.ult, t_i32, tokens_i32)
-                            s_valid = arith.cmpi(CmpIPredicate.ult, s_i32, topk_i32)
-                            ts_valid = arith.andi(t_valid, s_valid)
-                            t_safe = arith.select(ts_valid, t_i32, arith.constant(0))
-                            s_safe = arith.select(ts_valid, s_i32, arith.constant(0))
-                            row_ts_i32 = t_safe * topk_i32 + s_safe
-                            row_ts_idx = arith.index_cast(T.index, row_ts_i32)
+                        t_valid = arith.cmpi(CmpIPredicate.ult, t_i32, tokens_i32)
+                        s_valid = arith.cmpi(CmpIPredicate.ult, s_i32, topk_i32)
+                        ts_valid = arith.andi(t_valid, s_valid)
+                        t_safe = arith.select(ts_valid, t_i32, arith.constant(0))
+                        s_safe = arith.select(ts_valid, s_i32, arith.constant(0))
+                        row_ts_i32 = t_safe * topk_i32 + s_safe
+                        row_ts_idx = arith.index_cast(T.index, row_ts_i32)
 
-                            x_row_base_div4.append(row_ts_idx * c_k_div4)
+                        x_row_base_div4.append(row_ts_idx * c_k_div4)
                     else:
                         x_row_base_div4.append(arith.index(0))
 
@@ -5554,7 +5544,6 @@ def compile_mixed_moe_gemm2_common(
         waves_per_eu,
         use_async_copy,
         xcd_swizzle,
-        a_sorted,
     )
     if heterogeneous_b:
         cache_tag += (shared_expert_id,)

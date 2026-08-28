@@ -87,7 +87,6 @@ def _gemm1_body(
     arg_bscale,
     arg_eids,
     arg_mind,
-    arg_sorted_token_ids,
     arg_aqout,
     arg_ascaleout,
     arg_hidden,
@@ -113,9 +112,7 @@ def _gemm1_body(
     K,
     N_OUT,
     NE,
-    TOPK,
     interleave=False,
-    v2_output_layout=False,
     native_scale_layout=False,
     num_waves=4,
     k_wave=1,
@@ -1093,16 +1090,7 @@ def _gemm1_body(
                 )
 
         def store_output(sorted_row, packed0, packed1):
-            if const_expr(v2_output_layout):
-                store_payload(sorted_row, packed0, packed1)
-            else:
-                fused_id = fx.Int32(_global_i32_at(arg_sorted_token_ids, sorted_row))
-                token_id = fused_id & fx.Int32(0x00FFFFFF)
-                slot_id = fused_id >> fx.Int32(24)
-                is_valid = (token_id < i32_ntok) & (slot_id < fx.Int32(TOPK))
-                if is_valid:
-                    payload_row = token_id * fx.Int32(TOPK) + slot_id
-                    store_payload(payload_row, packed0, packed1)
+            store_payload(sorted_row, packed0, packed1)
 
         # The bias column depends on (e, n_block_idx, wave_grp, kk, ee) -- never
         # on the M rep -- so hoist the two global loads out of the mr loop. They
@@ -1371,7 +1359,6 @@ def compile_gemm1_a4w4_port(
     D_HIDDEN,
     D_INTER,
     NE,
-    TOPK,
     BN=256,
     BK=256,
     interleave=False,
@@ -1383,12 +1370,11 @@ def compile_gemm1_a4w4_port(
     situ_linear_beta=1.0,
     swiglu_limit=7.0,
     enable_bias=False,
-    v2_output_layout=False,
     native_scale_layout=False,
     num_waves=4,
     k_wave=1,
 ):
-    """Compile GEMM1 with dense token/slot output or v2 expert-sorted output."""
+    """Compile GEMM1 with expert-sorted output."""
     if a_dtype not in ("fp4", "fp8"):
         raise AssertionError(f"a_dtype must be 'fp4' or 'fp8', got {a_dtype!r}")
     if (BM, use_nt, inline_quant) not in _G1_VARIANTS[a_dtype]:
@@ -1437,7 +1423,6 @@ def compile_gemm1_a4w4_port(
         # happens once inside acc_load_sum(), and run_epilogue() -- the only
         # place the bias is added -- runs under `wave_k == 0`. So the bias lands
         # exactly once, after the reduction, as it does for k_wave == 1.
-        assert v2_output_layout, "k_wave > 1 requires v2 sorted output"
         assert (
             num_waves * k_wave <= 8
         ), f"k_wave creates too many waves: {num_waves} * {k_wave} > 8"
@@ -1462,8 +1447,9 @@ def compile_gemm1_a4w4_port(
     # Tag with H/INTER/NE so different shape specializations get distinct
     # kernel/smem symbols (so KIMI and non-KIMI instances never collide).
     gu_tag = "il" if interleave else "sep"
-    output_layout_tag = "" if v2_output_layout else f"_denseout_tk{TOPK}"
-    name_suffix = f"{a_dtype}_h{D_HIDDEN}_i{D_INTER}_ne{NE}_bm{BM}_{variant_tag}_{gu_tag}{output_layout_tag}"
+    name_suffix = (
+        f"{a_dtype}_h{D_HIDDEN}_i{D_INTER}_ne{NE}_bm{BM}_{variant_tag}_{gu_tag}"
+    )
     if native_scale_layout:
         name_suffix += "_native_scale"
     if out_dtype != "fp4":
@@ -1500,7 +1486,6 @@ def compile_gemm1_a4w4_port(
         arg_eids: fx.Int64,
         arg_cumsum: fx.Int64,
         arg_mind: fx.Int64,
-        arg_sorted_token_ids: fx.Int64,
         i32_ntok: fx.Int32,
         arg_aqout: fx.Int64,
         arg_ascaleout: fx.Int64,
@@ -1549,7 +1534,6 @@ def compile_gemm1_a4w4_port(
                 arg_bscale,
                 arg_eids,
                 arg_mind,
-                arg_sorted_token_ids,
                 arg_aqout,
                 arg_ascaleout,
                 arg_hidden,
@@ -1574,9 +1558,7 @@ def compile_gemm1_a4w4_port(
                 K=D_HIDDEN,
                 N_OUT=N_OUT,
                 NE=NE,
-                TOPK=TOPK,
                 interleave=interleave,
-                v2_output_layout=v2_output_layout,
                 native_scale_layout=native_scale_layout,
                 num_waves=num_waves,
                 k_wave=k_wave,
@@ -1591,7 +1573,6 @@ def compile_gemm1_a4w4_port(
         arg_eids: fx.Int64,
         arg_cumsum: fx.Int64,
         arg_mind: fx.Int64,
-        arg_sorted_token_ids: fx.Int64,
         i32_ntok: fx.Int32,
         i32_grid: fx.Int32,
         arg_aqout: fx.Int64,
@@ -1609,7 +1590,6 @@ def compile_gemm1_a4w4_port(
             arg_eids,
             arg_cumsum,
             arg_mind,
-            arg_sorted_token_ids,
             i32_ntok,
             arg_aqout,
             arg_ascaleout,
