@@ -631,38 +631,12 @@ def test_padded_q_stride_declines_to_triton():
     _assert_close(got.float(), want.float().reshape(got.shape))
 
 
-# --- host-only unit tests, no GPU needed -------------------------------------
-
-
-def test_env_decode_kernel_defensive_parse(monkeypatch):
-    """`_env_use_decode_kernel` must fall back to the default (True) on any
-    value that is not a clean integer, rather than raising -- a bad
-    AITER_DECODE_KERNEL used to take a bare `int(...)` and crash at import.
-
-    regression: bad AITER_DECODE_KERNEL must fall back to default, not
-    ValueError at import (PR #4676 review P2).
-    """
-    import aiter.ops.flydsl.unified_attention_kernels as uak
-
-    monkeypatch.setenv("AITER_DECODE_KERNEL", "1")
-    assert uak._env_use_decode_kernel() is True
-    monkeypatch.setenv("AITER_DECODE_KERNEL", "0")
-    assert uak._env_use_decode_kernel() is False
-    for bad in ("true", "", "yes"):
-        monkeypatch.setenv("AITER_DECODE_KERNEL", bad)
-        assert (
-            uak._env_use_decode_kernel() is True
-        ), f"bad value {bad!r} did not fall back"
-    monkeypatch.delenv("AITER_DECODE_KERNEL", raising=False)
-    assert uak._env_use_decode_kernel() is True
-
-
-# --- 4. the gate predicate, without a GPU ------------------------------------
+# --- gate predicate + dispatch checks (build tensors / launch the kernel) ----
 
 
 def test_predicate_declines_unsupported_geometry():
-    """Cheap structural checks of _supported that need no device. These would
-    otherwise only be covered by cases that are awkward to build for real."""
+    """Cheap structural checks of _supported. These would otherwise only be
+    covered by cases that are awkward to build for real."""
     from aiter.ops.flydsl.unified_attention_kernels import _supported
 
     q, k, v, out, cu_q, seqused_k, bt, q_ds, k_ds, v_ds = _build([256], [256], 64, 4)

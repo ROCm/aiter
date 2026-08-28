@@ -177,7 +177,10 @@ def test_dense_correctness(label, b, s, h, hkv, causal):
     (qf, qs), (kf, ks), (vf, vs) = make_inputs(b, s, h, hkv, HEAD_DIM, SEED)
     ov = run(build, qf, qs, kf, ks, vf, vs, b, s, h, hkv, HEAD_DIM, causal)
     if s > REF_MAX_S:
-        pytest.skip(f"S={s} torch reference too large (OOM); equivalence only")
+        # Reference won't fit, but still guard the largest shape against NaN/inf
+        # rather than asserting nothing at all.
+        assert torch.isfinite(ov.float()).all(), f"S={s} output has NaN/inf"
+        pytest.skip(f"S={s} torch reference too large (OOM); finiteness only")
     ref = torch_reference(qf, qs, kf, ks, vf, vs, causal, HEAD_DIM)
     err = (ov.float() - ref).abs().max().item()
     cos = torch.nn.functional.cosine_similarity(

@@ -173,10 +173,6 @@ def _compile_one_config_for(kind: OpKind) -> Callable[..., dict[str, Any]]:
         from .chunk_gdn_h import compile_one_config
     elif kind is OpKind.UNIFIED_ATTENTION:
         from .unified_attention import compile_one_config
-    elif kind is OpKind.GROUPED_MOE:
-        # grouped_moe AOT not wired up yet (no jobs are ever collected); keep a
-        # trivial stub so the dispatch is total.
-        return lambda **_kw: {}
     else:
         raise ValueError(f"unknown FlyDSL AOT kind: {kind!r}")
     return compile_one_config
