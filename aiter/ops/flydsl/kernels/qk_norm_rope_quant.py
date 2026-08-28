@@ -1612,8 +1612,6 @@ def flydsl_qk_norm_rope_quant(
         use_tdm = (
             USE_TDM_PREFILL
             and (not quant or T_tok * H >= 65536)
-            and not kv_write
-            and not paged
             and T_tok * H >= TDM_MIN_ROWS
             and (D % 256 == 0)
             and (H & (H - 1) == 0)
@@ -1639,6 +1637,8 @@ def flydsl_qk_norm_rope_quant(
                 quant=tdm_quant,
                 group_size=G,
                 scale_dtype=scale_dtype,
+                kv_write=kv_write,
+                paged=paged,
             )
             if stream is None:
                 stream = torch.cuda.current_stream()
@@ -1667,10 +1667,17 @@ def flydsl_qk_norm_rope_quant(
                 _t_ptr(kv_scale_arg.view(-1)),
                 _cached_from_dlpack(q_weight_arg.reshape(-1)),
                 _cached_from_dlpack(kv_weight.reshape(-1)),
+                _t_ptr(swa_kv_arg),
+                _t_ptr(ssm_arg),
+                _t_ptr(bid_arg),
                 num_rows,
                 T_tok,
                 (num_rows + per_wg - 1) // per_wg,
                 kv.stride(0),
+                swa_slot_stride,
+                swa_pos_stride,
+                swa_num_rows,
+                swa_cache_size,
                 stream if has_direct else Stream(stream),
             )
             _run_compiled(launcher, *args)
@@ -1812,6 +1819,8 @@ def _build_kernel_w32_tdm(
     quant=False,
     group_size=None,
     scale_dtype="fp32",
+    kv_write=False,
+    paged=False,
 ):
     H, D, RD = num_q_heads, head_dim, rope_head_dim
     NOPE = D - RD
@@ -1852,6 +1861,10 @@ def _build_kernel_w32_tdm(
         name += f"_sc{store_cache_modifier}"
     if quant:
         name += f"_q8g{G}_{scale_dtype}"
+    if kv_write:
+        name += "_kvw"
+    if paged:
+        name += "_paged"
     name += "_fused_w32_flydsl"
 
     @flyc.kernel(name=name, known_block_size=[BLOCK_THREADS, RT, 1])
@@ -1867,10 +1880,17 @@ def _build_kernel_w32_tdm(
         kv_scale: fx.Pointer,  # [T, NG] fp32/u8 (dummy when not quant)
         q_weight: fx.Tensor,  # [D] bf16 (dummy when not q_weighted)
         kv_weight: fx.Tensor,  # [D] bf16
+        swa_kv: fx.Pointer,  # [num_slots, cache_size, D] bf16 (dummy if not kv_write)
+        swa_index: fx.Pointer,  # paged: block_tables; direct: [T] dest rows
+        batch_id_per_token: fx.Pointer,  # [T] i32, -1 sentinel (dummy if not kv_write)
         num_rows: Int32,  # T*H
         num_tokens: Int32,  # T
         gx_q: Int32,  # workgroups owned by the Q path
         kv_in_row_stride: Int32,  # KV row stride in bf16 elements
+        swa_slot_stride: Int32,  # bf16 elements (= cache_size * D)
+        swa_pos_stride: Int32,  # bf16 elements (= D)
+        swa_num_rows: Int32,  # rows in the SWA pool; bounds the final row
+        swa_cache_size: Int32,  # ring slot count
     ):
         i32 = T.i32
         tid = fx.thread_idx.x
@@ -1963,6 +1983,9 @@ def _build_kernel_w32_tdm(
             row_base_bytes,
             scale_rsrc=None,
             scale_idx=None,
+            swa_rsrc=None,
+            swa_row_base=None,
+            do_swa=None,
         ):
             """RMSNorm + RoPE and optional per-row FP8 quantization."""
             sq = (xv * xv).reduce(ReductionOp.ADD)
@@ -2048,6 +2071,10 @@ def _build_kernel_w32_tdm(
                     VEC,
                     cache_modifier=store_cache_modifier,
                 )
+                # Same bytes as kv_out, scattered into the SWA ring.
+                if const_expr(kv_write) and do_swa is not None:
+                    if do_swa:
+                        _store_bf16_vec(final, swa_rsrc, swa_row_base, tid, VEC)
 
         def emit_q():
             q_out_rsrc = _ptr_res(q_out)
@@ -2175,7 +2202,67 @@ def _build_kernel_w32_tdm(
                 ]
             )
             wv = _load_tensor_vec(kv_weight, tid)
-            cosv, sinv = load_cs(tok)
+            pos_i32 = fx.Int32(
+                buffer_ops.buffer_load(pos_rsrc, tok, vec_width=1, dtype=T.i64).trunci(
+                    i32
+                )
+            )
+            cosv, sinv = _cs_from_pos(pos_i32)
+
+            swa_rsrc = None
+            swa_row_base = None
+            do_swa = None
+            if const_expr(kv_write):
+                # Gates mirror the wave32 path / the C++ sibling exactly: a stale
+                # token carries bid<0 or pos<0, and divsi truncates toward zero,
+                # so a negative pos would index the previous request's entry.
+                bid_i32 = fx.Int32(
+                    buffer_ops.buffer_load(
+                        _ptr_res(batch_id_per_token), tok, vec_width=1, dtype=i32
+                    )
+                )
+                pos_ok = pos_i32 >= 0
+                do_swa = (bid_i32 >= 0) & pos_ok
+                bid_safe = _imax(bid_i32, fx.Int32(0))
+                pos_safe = pos_ok.select(pos_i32, fx.Int32(0))
+                if const_expr(paged):
+                    blk = _idiv(pos_safe, swa_cache_size)
+                    blk_ok = blk < swa_slot_stride
+                    blk_safe = blk_ok.select(blk, fx.Int32(0))
+                    phys = fx.Int32(
+                        buffer_ops.buffer_load(
+                            _ptr_res(swa_index),
+                            bid_safe * swa_slot_stride + blk_safe,
+                            vec_width=1,
+                            dtype=i32,
+                        )
+                    )
+                    row = phys * swa_cache_size + (pos_safe % swa_cache_size)
+                    row_ok = blk_ok & (phys >= 0) & (row < swa_num_rows)
+                    do_swa = do_swa & row_ok
+                    row_safe = row_ok.select(row, fx.Int32(0))
+                else:
+                    row = fx.Int32(
+                        buffer_ops.buffer_load(
+                            _ptr_res(swa_index), tok, vec_width=1, dtype=i32
+                        )
+                    )
+                    dest_ok = (row >= 0) & (row < swa_num_rows)
+                    do_swa = do_swa & dest_ok
+                    row_safe = dest_ok.select(row, fx.Int32(0))
+                # row fits 32 bits but row*D*2 does not -- a unified V4 pool runs
+                # to ~150M rows, so widen before either multiply and reach the
+                # descriptor through the base address, not the 32-bit offset.
+                swa_rsrc = GTensor(
+                    swa_kv,
+                    dtype=T.bf16,
+                    shape=(D,),
+                    static_bytes_offset_i64=(
+                        fx.Int64(row_safe) * fx.Int64(swa_pos_stride) * fx.Int64(2)
+                    ),
+                ).rsrc
+                swa_row_base = fx.Int32(0)
+
             norm_rope_store(
                 xv,
                 wv,
@@ -2185,6 +2272,9 @@ def _build_kernel_w32_tdm(
                 tok * (D if const_expr(quant) else D * 2),
                 _ptr_res(kv_scale) if const_expr(quant) else None,
                 tok * NG,
+                swa_rsrc,
+                swa_row_base,
+                do_swa,
             )
 
         if g < gx_q:
@@ -2205,10 +2295,17 @@ def _build_kernel_w32_tdm(
         kv_scale: fx.Pointer,
         q_weight: fx.Tensor,
         kv_weight: fx.Tensor,
+        swa_kv: fx.Pointer,
+        swa_index: fx.Pointer,
+        batch_id_per_token: fx.Pointer,
         num_rows: fx.Int32,
         num_tokens: fx.Int32,
         gx_q: fx.Int32,
         kv_in_row_stride: fx.Int32,
+        swa_slot_stride: fx.Int32,
+        swa_pos_stride: fx.Int32,
+        swa_num_rows: fx.Int32,
+        swa_cache_size: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         gx_kv = _idiv(num_tokens + (RT - 1), fx.Int32(RT))
@@ -2225,10 +2322,17 @@ def _build_kernel_w32_tdm(
             kv_scale,
             q_weight,
             kv_weight,
+            swa_kv,
+            swa_index,
+            batch_id_per_token,
             num_rows,
             num_tokens,
             gx_q,
             kv_in_row_stride,
+            swa_slot_stride,
+            swa_pos_stride,
+            swa_num_rows,
+            swa_cache_size,
         )
         k.launch(
             grid=(fx.Index(gx), 1, 1),
