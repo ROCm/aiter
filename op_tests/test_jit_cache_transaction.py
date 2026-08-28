@@ -10,7 +10,7 @@ from unittest import mock
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../aiter/jit/utils"))
-import jit_cache  # noqa: E402
+import jit_cache
 
 
 def _write_generator(directory, body):
@@ -108,9 +108,8 @@ def test_failed_blob_publication_restores_previous_cache():
 
         with mock.patch.object(
             jit_cache.os, "replace", side_effect=fail_staging_publish
-        ):
-            with pytest.raises(OSError, match="publication failure"):
-                jit_cache.publish_blob_sources(staging_dir, blob_dir)
+        ), pytest.raises(OSError, match="publication failure"):
+            jit_cache.publish_blob_sources(staging_dir, blob_dir)
 
         assert os.listdir(blob_dir) == ["old.cpp"]
         assert os.path.exists(staging_dir)
@@ -145,9 +144,8 @@ def test_atomic_copy_keeps_previous_binary_on_copy_failure():
 
         with mock.patch.object(
             jit_cache.shutil, "copy2", side_effect=fail_after_partial_copy
-        ):
-            with pytest.raises(OSError, match="interrupted copy"):
-                jit_cache.atomic_copy(source, destination)
+        ), pytest.raises(OSError, match="interrupted copy"):
+            jit_cache.atomic_copy(source, destination)
 
         with open(destination, "rb") as file:
             assert file.read() == b"known-good"
