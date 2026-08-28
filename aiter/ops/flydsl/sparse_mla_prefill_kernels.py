@@ -591,6 +591,7 @@ def flydsl_sparse_mla_prefill_dsv4(
     main_is_fnuz: bool = True,
     extra_is_fnuz: bool = False,
     main_scale_mode: str = "none",
+    extra_scale_mode: str = "ue8m0",
     rope_bf16: bool = False,
     single_request: bool = True,
     validate_regions: bool = True,
@@ -602,7 +603,6 @@ def flydsl_sparse_mla_prefill_dsv4(
     scale_coalesce: bool = True,
     slot_hoist: bool = False,
     xcd_remap: bool = True,
-    r1_convert: bool = True,
     stream: torch.cuda.Stream | None = None,
 ) -> None:
     """DSv4-only two-region sparse MLA prefill (dedicated pipelined kernel).
@@ -615,6 +615,8 @@ def flydsl_sparse_mla_prefill_dsv4(
     """
     if main_scale_mode not in ("none", "ue8m0"):
         raise ValueError(f"main_scale_mode must be 'none' or 'ue8m0', got {main_scale_mode!r}")
+    if extra_scale_mode not in ("none", "ue8m0"):
+        raise ValueError(f"extra_scale_mode must be 'none' or 'ue8m0', got {extra_scale_mode!r}")
     _require_cuda(q, out, main_cache, extra_cache, main_indices, main_indptr, extra_indices, extra_indptr)
     _check_gfx942(q.device)
     num_queries, num_heads, head_dim, v_dim = _validate_qout(q, out)
@@ -664,6 +666,12 @@ def flydsl_sparse_mla_prefill_dsv4(
     # region0 takes the DMA fast path only when it is fnuz with unity scales;
     # UE8M0 scales or OCP bytes force the register-staged convert load.
     r0_convert = (main_scale_mode == "ue8m0") or (not main_is_fnuz)
+    # Same rule for region1: it only needs the register-staged convert if its bytes
+    # are not already fnuz, or if a non-unity UE8M0 exponent still has to be folded
+    # in. A caller whose extra cache is stored fnuz with unity scales gets region0's
+    # fire-and-forget DMA path for free -- worth -5.74%, and bit-identical, because
+    # the convert's own output is fnuz anyway.
+    r1_convert = (extra_scale_mode == "ue8m0") or (not extra_is_fnuz)
     exe = _get_kernel_dsv4(
         has_sink=has_sink,
         r0_convert=r0_convert,
