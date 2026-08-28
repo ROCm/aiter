@@ -435,7 +435,6 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
 
     # Persistent loop
     for tile_id in range(start_pid, num_tiles, NUM_WGS):
-        # geometry for the current tile (its prologue was already prefetched)
         t = remap_xcd(tile_id, num_tiles, NUM_XCDS=8)
         pid_m, pid_n = pid_grid(t, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
         m_off = pid_m * BLOCK_M
@@ -468,7 +467,7 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
             )
 
         for _ in range(num_k_tiles - (NUM_BUFFERS - 1)):
-            
+
             gl.amd.gfx1250.tdm.async_load(
                 a_desc,
                 [m_off, load_idx * BLOCK_K],
@@ -540,6 +539,8 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
 
         c_buffer.store(accumulator.to(c_ptr.type.element_ty))
 
+        gl.amd.gfx1250.tdm.async_store(c_desc, [m_off, n_off], c_buffer)
+
         next_tile_id = tile_id + NUM_WGS
         n_t = remap_xcd(next_tile_id, num_tiles, NUM_XCDS=8)
         n_pid_m, n_pid_n = pid_grid(
@@ -570,7 +571,7 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
                         b_buffer.index(pf % NUM_BUFFERS),
                     )
 
-        gl.amd.gfx1250.tdm.async_store(c_desc, [m_off, n_off], c_buffer)
+        
 
 
 _KERNEL_MAP = {
