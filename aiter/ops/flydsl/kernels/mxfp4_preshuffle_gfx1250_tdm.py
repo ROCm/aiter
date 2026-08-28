@@ -1243,16 +1243,22 @@ def launch_gemm_a8w4_tdm(
                         # first) -- enough for the carry.
                         if const_expr(persistent_active):
                             if preloaded_tile:
-                                # A preloaded tile inherits nb-1 slots from the previous
-                                # tile's drain tail, which issued them in ascending j --
-                                # so slot 0 is the OLDEST outstanding TDM and landing it
-                                # only needs the first TDM_PER ops retired, not a full
-                                # drain. Outstanding here, oldest first:
-                                #   slots 0..nb-2 (TDM_PER*(nb-1)) | prev C store (1)
-                                #   | _missing_slot just issued (TDM_PER)
-                                # so waiting to TDM_PER*(nb-1)+1 retires exactly slot 0
-                                # and keeps the rest overlapping this tile's mainloop.
-                                tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1) + 1)
+                                # A preloaded tile inherits its ring from the previous
+                                # tile's drain tail; the carry below reads slot 0.
+                                # Relaxing this to a partial count is NOT safe: how many
+                                # inherited ops are still outstanding, and where slot 0
+                                # sits among them, depends on _missing_slot (= (K_TILES-1)
+                                # % nb, so on tile_k), on TDM_PER, and on how far the
+                                # drain tail's own per-iteration fences already retired
+                                # them. a4w4 runs tile_k=256 (K_TILES 28/12) and a8w4
+                                # tile_k=128 (K_TILES 56/24); a threshold derived for one
+                                # silently under-waits the other, letting the carry read
+                                # a buffer whose TDM is still in flight (reproduced as
+                                # logits_diff 1.2e-02 at num_buffers=3). Drain fully.
+                                # The cost is bounded: the inherited slots landed during
+                                # the previous tile's epilogue, so only the one fresh
+                                # _missing_slot issue is really awaited.
+                                tdm_ops.tensor_wait(0)
                             else:
                                 # The FIRST tile a CU runs has no predecessor to hide its
                                 # prologue, and issued every buffer in slot order. Land
