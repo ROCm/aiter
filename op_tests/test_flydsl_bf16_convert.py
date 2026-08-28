@@ -14,7 +14,7 @@ turns it into infinity, so that is where it has to be tested.
   * ``fast=False`` (the shipped default) -- ``arith.truncf``, IEEE
     round-to-nearest-EVEN. NaN stays NaN and Inf stays Inf: the behaviour
     PR #4884 review item 4 asked for.
-  * ``fast=True`` (``FAST_FP32_TO_FP16=1``) -- ``(bits + 0x8000) >> 16``,
+  * ``fast=True`` (``AITER_FAST_FP32_TO_FP16=1``) -- ``(bits + 0x8000) >> 16``,
     round-half-AWAY. Faster and **does not preserve NaN**. Its expectations are
     asserted against the documented formula, including the cases where it
     destroys a NaN, so the cost of the opt-in is written down rather than merely

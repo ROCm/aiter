@@ -2508,7 +2508,7 @@ _SELECT_CASES = [
 # -- bf16 NaN/Inf classification ----------------------------------------
 
 # (label, f32 bit pattern). Chosen to cover every way the `+0x8000` rounding
-# bias in the fast converter (``FAST_FP32_TO_FP16=1``) can destroy a
+# bias in the fast converter (``AITER_FAST_FP32_TO_FP16=1``) can destroy a
 # non-finite value:
 #
 #   * low-payload NaN  -- the case PR #4884 review item 4 named: the bias

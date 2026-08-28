@@ -102,31 +102,31 @@ def _make_fast_exp(g_is_log2_scaled: bool):
 
 
 # -- f32 -> bf16 conversion ----------------------------------------------------
-# Two variants, selected by the ``FAST_FP32_TO_FP16`` environment variable.
+# Two variants, selected by the ``AITER_FAST_FP32_TO_FP16`` environment variable.
 #
 # DEFAULT (unset) -- ``arith.truncf``: plain IEEE round-to-nearest-EVEN. No
 #   custom code, unbiased rounding, and NaN/Inf classification falls out of the
 #   semantic instead of needing a guard. gfx942 has no ``v_cvt_pk_bf16_f32`` so
 #   the backend expands RNE inline.
 #
-# FAST_FP32_TO_FP16=1 -- ``(bitcast<u32>(x) + 0x8000) >> 16``, round-half-AWAY
+# AITER_FAST_FP32_TO_FP16=1 -- ``(bitcast<u32>(x) + 0x8000) >> 16``, round-half-AWAY
 #   from zero. 2 VALU/element. **UNSAFE: it does not preserve NaN.** This is the
 #   original pre-review conversion, kept as an opt-in performance escape hatch.
 #
 # What "unsafe" means concretely, verified by bit math over the pattern space:
 #
-#   input                       default (truncf)   FAST_FP32_TO_FP16=1
+#   input                       default (truncf)   AITER_FAST_FP32_TO_FP16=1
 #   0x7F800001 low-payload NaN        NaN                +Inf
 #   0xFF800001 negative NaN           NaN                -Inf
 #   0x7FFFFFFF all-ones mantissa      NaN                -0.0   <-- finite!
 #   +-Inf                             +-Inf              +-Inf
 #   finite                            finite             finite
 #
-_FAST_BF16_ENV = "FAST_FP32_TO_FP16"
+_FAST_BF16_ENV = "AITER_FAST_FP32_TO_FP16"
 
 
 def _fast_bf16_from_env() -> bool:
-    """Read ``FAST_FP32_TO_FP16`` once, at import.
+    """Read ``AITER_FAST_FP32_TO_FP16`` once, at import.
 
     Read at import rather than per call so the value cannot change midway
     through a process and leave some kernels built one way and some the other.
@@ -160,13 +160,13 @@ def _to_bf16(val, n=1, fast=None):
     ``Vector``. Returns a raw ``ir.Value``.
 
     ``fast`` selects the variant; ``None`` (the default) means "whatever
-    :data:`USE_FAST_BF16` says", i.e. the ``FAST_FP32_TO_FP16`` environment
+    :data:`USE_FAST_BF16` says", i.e. the ``AITER_FAST_FP32_TO_FP16`` environment
     variable.
 
     Default: one ``arith.truncf`` -- IEEE round-to-nearest-even, NaN and Inf
     carried through by construction.
 
-    ``FAST_FP32_TO_FP16=1``: ``(bitcast<u32>(x) + 0x8000) >> 16``, i.e.
+    ``AITER_FAST_FP32_TO_FP16=1``: ``(bitcast<u32>(x) + 0x8000) >> 16``, i.e.
     round-half-AWAY-from-zero. Values are sign-magnitude so one bias serves both
     signs, and for finite values the carry can only perturb the exponent within
     ~1 ulp of FLT_MAX. It does not preserve NaN.
