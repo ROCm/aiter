@@ -195,18 +195,33 @@ def resolve_config(
     return cfg
 
 
-# fp32 split-reduction scratch, cached per (n_groups, D, split, device). The
-# partials passes fully overwrite every slot they later reduce (empty groups
-# included), so reuse across calls is safe without re-zeroing. The cache is
-# unbounded but intentionally so: the key space is the small set of shapes a run
-# actually uses (a training run is typically one (n_groups, D)), and each entry is
+# fp32 split-reduction scratch, cached per (n_groups, D, split, device, stream).
+# The partials passes fully overwrite every slot they later reduce (empty groups
+# included), so reuse across calls on the same stream is safe without re-zeroing.
+# Stream is part of the key because concurrent calls on different streams must not
+# share partial buffers. The cache is unbounded but intentionally so: the key space
+# is the small set of (shape, stream) pairs a run actually uses, and each entry is
 # the working buffer we want resident. A given entry can be large (~0.5 GB fp32 at
 # n_groups=1024, D=256, split=2); if a future consumer sweeps many shapes and this
 # grows unacceptably, add an LRU bound or an explicit clear -- not needed today.
 _SCRATCH_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
-def _get_scratch(n_groups: int, K: int, N: int, split: int, device: torch.device):
+def _stream_cache_key(stream: torch.cuda.Stream) -> tuple[int, int]:
+    device_index = stream.device.index
+    if device_index is None:
+        raise ValueError(f"Unable to determine device index for stream {stream!r}")
+    return (device_index, int(stream.cuda_stream))
+
+
+def _get_scratch(
+    n_groups: int,
+    K: int,
+    N: int,
+    split: int,
+    device: torch.device,
+    stream: torch.cuda.Stream,
+):
     """Cached fp32 (dense_partials, bias_partials) for the split reduction.
 
     SPLIT >= 2 (e.g. D=256): real (n_groups*SPLIT*K, N) / (n_groups*SPLIT, N)
@@ -215,7 +230,15 @@ def _get_scratch(n_groups: int, K: int, N: int, split: int, device: torch.device
     correctly-typed placeholder instead of ~1 GB of unused fp32 (the grad_dense_bias
     launcher still needs valid tensor args for the const-false SPLIT>=2 branch).
     """
-    key = (n_groups, K, N, split, device.type, device.index)
+    key = (
+        n_groups,
+        K,
+        N,
+        split,
+        device.type,
+        device.index,
+        *_stream_cache_key(stream),
+    )
     cached = _SCRATCH_CACHE.get(key)
     if cached is None:
         if split >= 2:
@@ -351,7 +374,9 @@ def jagged_dense_bmm_bwd_dispatched(
         # --- dDense (+ fused dBias): split-reduction over the sequence axis m. ---
         d_dense = torch.empty(n_groups, K, N, dtype=torch.bfloat16, device=device)
         d_bias = torch.empty(n_groups, N, dtype=torch.bfloat16, device=device)
-        dense_partials, bias_partials = _get_scratch(n_groups, K, N, SPLIT, device)
+        dense_partials, bias_partials = _get_scratch(
+            n_groups, K, N, SPLIT, device, stream
+        )
         tJagged = flyc.from_dlpack(jagged).mark_layout_dynamic(
             leading_dim=1, divisibility=8
         )
