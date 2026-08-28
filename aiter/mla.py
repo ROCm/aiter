@@ -349,9 +349,6 @@ def get_meta_param(
         32: 128,
         48: 64,
         64: 64,
-        80: 64,
-        96: 64,
-        112: 64,
         128: 32,
         256: 32,
         384: 32,
@@ -359,6 +356,11 @@ def get_meta_param(
     }
 
     if dtype == dtypes.fp8 and not ignore_total_kv:
+        # Keyed by the FOLDED query width, so max_seqlen_q > 1 can produce widths
+        # the table never listed -- e.g. the qlen-agnostic gqa=128 ps=0 kernel
+        # accepts any max_seqlen_q, and qlen>=5 lands past the 512 entry. Fall
+        # back to the smallest listed block instead of raising: min_block_n only
+        # feeds the min() caps below, so it costs splits, never correctness.
         min_block_n = get_block_n_fp8.get(int(nhead * max_seqlen_q), 64)
         # ceil(avg_kv / min_block_n) computed in pure integers (avg_kv = total_kv/bs).
         num_kv_splits = min(
