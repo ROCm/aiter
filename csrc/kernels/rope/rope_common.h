@@ -8376,6 +8376,17 @@ void fused_rope_rms_set_kv(const T* qkv,
                 "block_size must be a power of 2, got ", block_size);
     AITER_CHECK(!use_shuffle_layout || (x > 0 && (x & (x - 1)) == 0),
                 "x must be a power of 2 when use_shuffle_layout is set, got ", x);
+    // The shuffle-layout K write is a single contiguous vec_t store of
+    // VEC_SIZE = head_size / WARP_SIZE elements, and get_shuffle_layout_k_base()
+    // assumes all of them land in one x-wide chunk (VEC_SIZE <= x). At
+    // head_size=512 / WARP_SIZE=32 that is VEC_SIZE=16, which exceeds x=8 for a
+    // bf16/fp16 cache (x = 16 / sizeof(elem)) and would silently corrupt the K
+    // cache for block_size>1. Reject that config instead.
+    AITER_CHECK(!use_shuffle_layout || x >= head_size / WARP_SIZE,
+                "use_shuffle_layout requires x >= head_size / WARP_SIZE (",
+                head_size / WARP_SIZE,
+                "), got x=",
+                x);
     constexpr int THREAD_BLOCK_SIZE = 256;
     auto total_warps                = num_tokens * (num_heads_q + num_heads_k + num_heads_v);
     auto num_warps_per_block        = THREAD_BLOCK_SIZE / WARP_SIZE;
