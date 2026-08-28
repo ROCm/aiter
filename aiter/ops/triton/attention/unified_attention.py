@@ -15,7 +15,10 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arc
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.types import e4m3_dtype
-from aiter.ops.triton.utils.unified_attention_utils import get_dtype_str
+from aiter.ops.triton.utils.unified_attention_utils import (
+    get_dtype_str,
+    get_unified_attention_config,
+)
 
 # gfx1250
 try:
@@ -168,6 +171,10 @@ def generate_config_key(params: _UAParams, op: str) -> str:
             key = "hlt128"
 
     return f"{key}_shuffled_kv" if params.shuffled_kv_cache else key
+
+
+def get_num_segments(params: _UAParams):
+    pass
 
 
 def select_2d_config(
@@ -737,19 +744,29 @@ def is_reduce_gluon_available(params: _UAParams, NUM_SEGMENTS, backend: str):
 
 
 def _unified_attention_2d_triton(params: _UAParams):
-    config = select_2d_config(
-        params.block_size,
-        params.head_size,
-        params.sliding_window,
-        params.all_decode,
-        params.max_seqlen_q,
-        params.max_seqlen_k,
-        params.num_queries_per_kv,
-        params.num_2d_prgms,
+    if params.shuffled_kv_cache and (
+        params.q_dtype == e4m3_dtype and params.kv_cache_dtype == e4m3_dtype
+    ):
+        assert params.block_size >= 32, (
+            "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
+        )
+
+    config, _ = get_unified_attention_config(
+        "attn_2d",
+        generate_config_key(params, "attn_2d"),
         params.q_dtype,
         params.kv_cache_dtype,
-        params.shuffled_kv_cache,
+        params.head_size,
+        params.num_queries_per_kv,
+        params.block_size,
+        backend="triton",
     )
+    # the json holds the tuned BLOCK_M, a query block still has to hold a full
+    # kv head's queries
+    config["BLOCK_M"] = max(
+        config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)
+    )
+    config["BLOCK_Q"] = config["BLOCK_M"] // params.num_queries_per_kv
     assert config["BLOCK_Q"] >= 1
     if params.all_decode:
         total_num_q_blocks = params.num_seqs
