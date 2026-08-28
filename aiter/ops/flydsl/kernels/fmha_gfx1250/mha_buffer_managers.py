@@ -17,7 +17,8 @@ The ``16b`` suffix names the element width (16-bit): every swizzle here assumes 
 its own manager family (different chunk arithmetic), hence the explicit width tag.
 
 Contents:
-  - ``QManager16b`` — Q loader (ring-buffered async stage, natural ``ds_load_b128``).
+  - ``QManager16bV1`` — Q loader (ring-buffered async stage, natural ``ds_load_b128``).
+  - ``QManager16bV2`` — Q loader (per-warp TDM into private padded LDS, no ring).
   - ``KManager16bV1`` — K loader (one-block stage, natural ``ds_load_b128`` B-fragment).
   - ``VManager16bV1`` — V loader (V-specific swizzle, transpose ``ds_load_tr16_b128``).
   - ``OManager16b`` — O writer (WMMA accumulator -> LDS reshape -> coalesced store).
@@ -28,7 +29,7 @@ Target: gfx1250 (MI400 / mi450), wave32, 8 waves per threadgroup (256 threads).
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import rocdl as rocdl_dialect
-from flydsl.expr import gpu, rocdl
+from flydsl.expr import arith, gpu, rocdl
 from flydsl.expr.rocdl import tdm_ops
 
 from aiter.ops.flydsl.kernels import buffer_ops
@@ -194,7 +195,7 @@ def _async_load_to_lds(gptrs, lds_ptrs, *, cluster, imm_offs=None):
 # ============================================================================
 
 
-class QManager16b:
+class QManager16bV1:
     """Owns everything about Q: its LDS footprint and the global->LDS->VGPR load.
 
     Keeping this behind one object means the compute core just asks the manager
@@ -297,12 +298,14 @@ class QManager16b:
                 seq = pr // self.gqa_ratio
                 safe_seq = (seq < q_len).select(seq, fx.Int32(0))  # clamp OOB
                 token = q_start + safe_seq
+                # stride_q_seq/head arrive in ELEMENTS (host convention); convert the
+                # whole offset to bytes here (V2 TDM uses the element strides directly).
                 g_off = (
                     token * stride_q_seq
                     + q_head * stride_q_head
-                    + fx.Int32(tile * _WMMA_K * _BF16_BYTES)
-                    + col_chunk * _CHUNK_BYTES
-                )
+                    + fx.Int32(tile * _WMMA_K)
+                    + col_chunk * _CHUNK_ELEMS
+                ) * fx.Int32(_BF16_BYTES)
                 gptrs.append(
                     buffer_ops.create_llvm_ptr(q_base_i64 + fx.Int64(g_off), address_space=1)
                 )
@@ -882,6 +885,7 @@ class VManager16bV1:
 
 _K_PAD_ELEMS = 8   # 4 DW = 16 B per K row
 _V_PAD_ELEMS = 16  # 8 DW = 32 B per V row
+_Q_PAD_ELEMS = 8   # 4 DW = 16 B per Q row (matches K)
 
 
 def _tdm_load_views(*, ptr_x, stride_seq, stride_head, head, row0, valid,
@@ -909,6 +913,101 @@ def _tdm_load_views(*, ptr_x, stride_seq, stride_head, head, row0, valid,
         fx.make_view(lds_iter, fx.make_layout((n_rows, hdim), (hdim + pad_elems, 1)))
     )
     return atom, g_view, lds_view
+
+
+class QManager16bV2:
+    """Q loader (per-warp TDM + row-major padded LDS). No ring buffer: each wave TDM-copies
+    ALL of its Q rows — a ``(WMMA_M * q_tiles_per_wave) x qk_hdim`` tile — into its own private
+    LDS region in one shot (``num_warps=1``, so the wave copies the whole tile; the regions are
+    disjoint so no cross-wave sync), then reads them into WMMA B-fragments. Same fragment output
+    as ``QManager16bV1`` (scale folded), so the kernel switches V1<->V2 by swapping the class.
+
+    A 3-D ``[n_seq, gqa_ratio, hdim]`` descriptor carries the GQA row-packing (packed row
+    ``pr`` -> seq ``pr//gqa``, head ``kv_head*gqa + pr%gqa``); it degenerates to ``[rows, 1, hdim]``
+    at gqa==1. LDS is plain row-major with ``hdim + _Q_PAD_ELEMS`` element row stride (matches K)."""
+
+    def __init__(self, *, qk_hdim, gqa_ratio, num_waves=_DEFAULT_NUM_WAVES,
+                 lds_tiles=None, q_tiles_per_wave=1):
+        if qk_hdim % _WMMA_K != 0:
+            raise ValueError(f"qk_hdim must be a multiple of {_WMMA_K}; got {qk_hdim}")
+        if num_waves != _DEFAULT_NUM_WAVES:
+            raise NotImplementedError("V2 TDM loader assumes 8 waves")
+        self.qk_hdim = qk_hdim               # compile-time
+        self.gqa_ratio = gqa_ratio           # compile-time
+        self.num_waves = num_waves
+        self.q_tiles_per_wave = q_tiles_per_wave
+        self.k_tiles = qk_hdim // _WMMA_K
+        self.rows_per_warp = _WMMA_M * q_tiles_per_wave          # this wave's Q rows (32)
+        self.block_m = self.rows_per_warp * num_waves            # 256
+        self.row_elems = qk_hdim + _Q_PAD_ELEMS                  # padded LDS row stride (elems)
+        self.row_bytes = self.row_elems * _BF16_BYTES
+        # lds_tiles is accepted for signature-compat with V1; V2 has no ring.
+
+    def get_lds_size_in_byte(self):
+        return self.block_m * self.row_bytes
+
+    def load_q_to_vgpr_part1(self, *, ptr_Q, stride_q_seq, stride_q_head, q_start, q_len,
+                             kv_head, block_x, warp_idx, lane_idx, ptr_lds):
+        """Issue this wave's per-warp TDM copy of its ``rows_per_warp x qk_hdim`` Q tile into its
+        private LDS region at ``ptr_lds + warp_idx*rows_per_warp*row_bytes``. ``stride_q_seq``/
+        ``stride_q_head`` are in ELEMENTS (host convention). Drain + read in ``load_q_to_vgpr_part2``."""
+        gqa = self.gqa_ratio
+        n_seq = self.rows_per_warp // gqa
+        packed_row0 = block_x * fx.Int32(self.block_m) + warp_idx * fx.Int32(self.rows_per_warp)
+        seq0 = packed_row0 // fx.Int32(gqa)
+        head0 = kv_head * fx.Int32(gqa)
+        rem = q_len - seq0
+        n_seq_valid = fx.Int32(arith.maxsi(arith.unwrap(rem), arith.unwrap(fx.Int32(0))))
+
+        off = fx.Int64(q_start + seq0) * fx.Int64(stride_q_seq) + fx.Int64(head0) * fx.Int64(stride_q_head)
+        base = fx.add_offset(fx.get_iter(ptr_Q), off)
+        g_view = fx.Tensor(fx.make_view(
+            base, fx.make_layout((n_seq, gqa, self.qk_hdim),
+                                 (gqa * self.qk_hdim, self.qk_hdim, 1))))
+        atom = fx.rocdl.make_tdm_atom(
+            g_view, [n_seq_valid, None, None],
+            strides=[stride_q_seq, stride_q_head, None],
+            num_warps=1, pad_interval=self.qk_hdim, pad_amount=_Q_PAD_ELEMS,
+        )
+        warp_region = ptr_lds + warp_idx * fx.Int32(self.rows_per_warp * self.row_bytes)
+        lds_ptr_ty = fx.PointerType.get(
+            elem_ty=fx.BFloat16.ir_type, address_space=fx.AddressSpace.Shared, alignment=16,
+        )
+        lds_iter = fx.inttoptr(lds_ptr_ty, warp_region)
+        lds_view = fx.Tensor(fx.make_view(
+            lds_iter, fx.make_layout((n_seq, gqa, self.qk_hdim),
+                                     (gqa * self.row_elems, self.row_elems, 1))))
+        fx.copy_atom_call(atom, g_view, lds_view)
+        self._warp_region = warp_region
+        self._lane_idx = lane_idx
+
+    def load_q_to_vgpr_part2(self, *, scale):
+        """Drain this wave's Q TDM (``tensor_wait(0)``) and read its ``rows_per_warp x qk_hdim``
+        tile into WMMA B-fragments (``scale`` folded). Returns a length-R list; entry ``qt`` is
+        that q-tile's list of ``k_tiles`` v16-bf16 fragments (same as ``QManager16bV1``).
+
+        Read collapses to 1 per-lane base + compile-time immediates (like K): lane ``l`` reads row
+        ``l%16``, d-byte ``(l//16)*16``; fragment (qt, tile) = base + ``qt*16*row_bytes +
+        tile*32*2`` (lo) and ``+ 16*2`` more (hi 8-col half)."""
+        tdm_ops.tensor_wait(0)
+        v8_ty = fx.Vector.make_type(_CHUNK_ELEMS, fx.BFloat16)
+        scale_bf16 = scale.to(fx.BFloat16)
+        lane = self._lane_idx
+        lane_base = (self._warp_region
+                     + (lane % _WMMA_M) * fx.Int32(self.row_bytes)
+                     + (lane // _WMMA_M) * fx.Int32(_CHUNK_ELEMS * _BF16_BYTES))
+        base = buffer_ops.create_llvm_ptr(lane_base, address_space=3)
+        q_frags_list = [[] for _ in range(self.q_tiles_per_wave)]
+        for qt in range(self.q_tiles_per_wave):
+            for tile in range(self.k_tiles):
+                imm_lo = qt * _WMMA_M * self.row_bytes + tile * _WMMA_K * _BF16_BYTES
+                imm_hi = imm_lo + _WMMA_M * _BF16_BYTES
+                p_lo = base if imm_lo == 0 else buffer_ops.get_element_ptr(base, static_byte_offset=imm_lo)
+                p_hi = buffer_ops.get_element_ptr(base, static_byte_offset=imm_hi)
+                lo = fx.Vector(llvm_dialect.load(v8_ty, p_lo))
+                hi = fx.Vector(llvm_dialect.load(v8_ty, p_hi))
+                q_frags_list[qt].append(lo.shuffle(hi, list(range(16))) * scale_bf16)
+        return q_frags_list
 
 
 class KManager16bV2:

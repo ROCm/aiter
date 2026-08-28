@@ -62,8 +62,8 @@ scf_if_dispatch = ReplaceIfWithDispatch.scf_if_dispatch
 # Q/K/V staging managers (own their LDS swizzles + async copy schedules). They are
 # self-contained: this kernel maintains its own arch constants below and passes the
 # config each manager needs through its constructor.
-from .mha_buffer_managers import QManager16b, KManager16bV1, VManager16bV1, OManager16b
-from .mha_buffer_managers import KManager16bV2, VManager16bV2
+from .mha_buffer_managers import QManager16bV1, KManager16bV1, VManager16bV1, OManager16b
+from .mha_buffer_managers import QManager16bV2, KManager16bV2, VManager16bV2
 from flydsl.expr.rocdl import tdm_ops
 
 # Single source of truth for gfx1250 Expert Scheduling Mode 2 (DEP_MODE=2). Lives
@@ -659,7 +659,8 @@ def _core_attention(
     # the prologue drains Q (part2) -> s_wait_asynccnt(0) -> gpu.barrier() BEFORE the
     # loop, and prologue K/V loads target slot 0. No separate allocation (Q's 64KB
     # footprint fits inside slot 1's 128KB span). ----
-    q_mgr = QManager16b(
+    _QMgr = QManager16bV2 if USE_TDM_LOADER else QManager16bV1
+    q_mgr = _QMgr(
         qk_hdim=qk_hdim, gqa_ratio=gqa_ratio, num_waves=NUM_WAVES,
         q_tiles_per_wave=WMMA_ROW_PER_WAVE,
     )
@@ -1676,11 +1677,11 @@ def flash_attn_varlen_m16x8(
     # Byte strides for Q/K/V, element strides for O — matches the gfx1250 fmha
     # family convention; revisit when the clean kernel body is implemented.
     bpp = q.element_size()
-    stride_q_seq = q.stride(0) * bpp
-    stride_k_seq = k.stride(0)  # K/V strides in ELEMENTS (V2 TDM uses directly; V1 ×bpp)
+    stride_q_seq = q.stride(0)  # Q/K/V strides in ELEMENTS (V2 TDM uses directly; V1 ×bpp)
+    stride_k_seq = k.stride(0)
     stride_v_seq = v.stride(0)
     stride_o_seq = out.stride(0)
-    stride_q_head = q.stride(1) * bpp
+    stride_q_head = q.stride(1)
     stride_k_head = k.stride(1)
     stride_v_head = v.stride(1)
     stride_o_head = out.stride(1)
@@ -1813,11 +1814,11 @@ def flash_attn_batch_m16x8(
     # Byte strides for Q/K/V, element strides for O. BSHD: seq is dim 1, head
     # dim 2 — the per-batch base is derived in-kernel as batch_idx * seq_len.
     bpp = q.element_size()
-    stride_q_seq = q.stride(1) * bpp
-    stride_k_seq = k.stride(1)  # K/V strides in ELEMENTS (V2 TDM uses directly; V1 ×bpp)
+    stride_q_seq = q.stride(1)  # Q/K/V strides in ELEMENTS (V2 TDM uses directly; V1 ×bpp)
+    stride_k_seq = k.stride(1)
     stride_v_seq = v.stride(1)
     stride_o_seq = out.stride(1)
-    stride_q_head = q.stride(2) * bpp
+    stride_q_head = q.stride(2)
     stride_k_head = k.stride(2)
     stride_v_head = v.stride(2)
     stride_o_head = out.stride(2)
