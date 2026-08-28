@@ -202,10 +202,16 @@ def flydsl_a16w4_gemm2(
     xcd_swizzle=1,
     w_dtype="fp4",
     persist=None,
+    epilog="atomic",
     stream=None,
 ):
     """a16w4/a16wi4/a16w16 fused stage2 (down-proj). Consumes the bf16 [sorted_size,
     D_INTER] intermediate; scatters routing-weighted bf16 into ``flat_out``.
+
+    ``epilog="atomic"`` (default): atomic-fadd scatter to ``[tokens, model_dim]``.
+    ``epilog="cshuffle"``: LDS CShuffle then coalesced store to unique
+    ``[token*topk+slot, model_dim]`` rows (caller reduces). Existing ``_atomic``
+    CSV names keep the atomic path.
 
     Tile config: ``tile_m/n/k`` -> BM/TILE_N/TILE_K, ``waves_per_eu`` ->
     rocdl.waves_per_eu, ``b_nt`` -> W-load cache modifier, ``xcd_swizzle`` -> XCD/HBM
@@ -214,6 +220,8 @@ def flydsl_a16w4_gemm2(
     """
     if k_batch != 1:
         raise NotImplementedError(f"a16w4 gemm2 only supports k_batch=1, got {k_batch}")
+    if epilog not in ("atomic", "cshuffle"):
+        raise ValueError(f"epilog must be 'atomic' or 'cshuffle', got {epilog!r}")
     if waves_per_eu is not None and int(waves_per_eu) <= 1:
         waves_per_eu = None
 
@@ -252,6 +260,8 @@ def flydsl_a16w4_gemm2(
         w_dtype=w_dtype,
         persist=_persist,
         use_k16="gfx95" not in str(get_rocm_arch()),
+        epilog=epilog,
+        topk=int(topk),
     )
     grid = gemm2_a16w4_grid(
         BM, N_OUT=D_HIDDEN, TILE_N=TILE_N, max_m_blocks=max_m_blocks, persist=_persist

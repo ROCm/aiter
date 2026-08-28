@@ -274,6 +274,16 @@ def test_a16w4_lds_budget_math():
     assert a16w4_config_fits_device(1, 16, 128, 128, 1, gfx="gfx942")
     assert a16w4_config_fits_device(2, 16, 128, 128, gfx="gfx942")
     assert not a16w4_config_fits_device(1, 16, 16, 256, 1, gfx="gfx942")
+    # CShuffle overlays A-LDS with a bf16 tile; same 4-wave N-split as atomic.
+    assert a16w4_config_fits_device(
+        2, 32, 128, 256, gfx="gfx942", epilog="cshuffle"
+    )
+    assert a16w4_config_fits_device(
+        2, 64, 128, 256, gfx="gfx942", epilog="cshuffle"
+    )
+    assert a16w4_config_fits_device(
+        2, 64, 128, 128, gfx="gfx942", epilog="cshuffle"
+    )
     # tile_m=128 at tile_k=256 is 128KiB — illegal on gfx942, legal on gfx950.
     assert not a16w4_config_fits_device(1, 128, 128, 256, 1, gfx="gfx942")
     assert not a16w4_config_fits_device(2, 128, 128, 256, gfx="gfx942")
@@ -281,6 +291,33 @@ def test_a16w4_lds_budget_math():
     # tile_n=32 + k_wave=1 => num_acc_n=0 (silent zeros).
     assert not a16w4_config_fits_device(1, 32, 32, 256, 1, gfx="gfx942")
     assert a16w4_config_fits_device(1, 32, 32, 256, 2, gfx="gfx942")
+
+
+def test_a16wmix_gemm2_cshuffle_registered():
+    """``_cshuffle`` names are registered; ``_atomic`` names stay atomic."""
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+
+    for name, b in (
+        ("flydsl_moe2_abf16_wint4_bf16_t32x128x256_atomic", "int4"),
+        ("flydsl_moe2_abf16_wint4_bf16_t64x128x256_atomic", "int4"),
+        ("flydsl_moe2_abf16_wint4_bf16_t64x128x128_atomic", "int4"),
+        ("flydsl_moe2_abf16_wfp4_bf16_t32x128x256_atomic", "fp4"),
+    ):
+        p = get_flydsl_kernel_params(name)
+        assert p is not None, name
+        assert p["mode"] == "atomic", name
+        assert p["b_dtype"] == b, name
+
+    for name in (
+        "flydsl_moe2_abf16_wint4_bf16_t32x128x256_cshuffle",
+        "flydsl_moe2_abf16_wint4_bf16_t64x128x256_cshuffle",
+        "flydsl_moe2_abf16_wint4_bf16_t64x128x128_cshuffle",
+        "flydsl_moe2_abf16_wfp4_bf16_t32x128x256_cshuffle",
+        "flydsl_moe2_abf16_wfp4_bf16_t64x128x128_cshuffle",
+    ):
+        p = get_flydsl_kernel_params(name)
+        assert p is not None, name
+        assert p["mode"] == "cshuffle", name
 
 
 @_SKIP
@@ -470,6 +507,9 @@ def test_gfx942_a16w4_tuner_enumerates_candidates():
     assert any("t32x64x256" in n and "kw2" in n for n in s1)
     assert any("t16x" in n for n in s1), "tile_m=16 must be in the a16w4 search"
     assert not any("t128x" in n for n in s1 + s2)
+    assert any("_cshuffle" in n for n in s2), "cshuffle gemm2 must compete with atomic"
+    assert any("_atomic" in n for n in s2)
+    assert not any("_reduce" in n for n in s2)
     for name in s1:
         p = get_flydsl_kernel_params(name)
         assert p is not None, name
@@ -485,6 +525,56 @@ def test_gfx942_a16w4_tuner_enumerates_candidates():
     for name in s2:
         p = get_flydsl_kernel_params(name.split("_sbm")[0])
         assert p is not None, name
+        assert p.get("mode", "atomic") in ("atomic", "cshuffle"), name
         assert a16w4_config_fits_device(
-            2, p["tile_m"], p["tile_n"], p["tile_k"], gfx="gfx942"
+            2,
+            p["tile_m"],
+            p["tile_n"],
+            p["tile_k"],
+            gfx="gfx942",
+            epilog=p.get("mode", "atomic"),
         ), name
+
+
+@_SKIP
+def test_gfx942_a16wi4_tuner_allows_cshuffle():
+    """a16wi4 gemm2 search must include CShuffle, not only atomic."""
+    if get_gfx() != "gfx942":
+        pytest.skip("gfx942 a16wi4 tuner only")
+
+    import sys
+
+    from aiter.jit.core import AITER_CSRC_DIR
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+
+    sys.path.insert(0, f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/")
+    from gemm_moe_tune import FmoeTuner
+
+    info = (
+        "gfx942",
+        304,
+        1,
+        3584,
+        3072,
+        112,
+        15,
+        ActivationType.Situv2,
+        dtypes.bf16,
+        dtypes.bf16,
+        dtypes.i4x2,
+        QuantType.per_1x32,
+        True,
+        False,
+    )
+    tasks = FmoeTuner.gen_flydsl_i4_2stages_task(
+        FmoeTuner.__new__(FmoeTuner), info, [16, 32, 64]
+    )
+    s2 = [t[0][2] for t in tasks if t[0][1] == "stage2"]
+    assert s2, "a16wi4 tuner must enumerate stage2 kernels"
+    assert any("_cshuffle" in n for n in s2), "cshuffle must compete with atomic"
+    assert any("_atomic" in n for n in s2)
+    for name in s2:
+        p = get_flydsl_kernel_params(name)
+        assert p is not None, name
+        assert p.get("mode", "atomic") in ("atomic", "cshuffle"), name
+        assert p.get("k_batch", 1) == 1, name

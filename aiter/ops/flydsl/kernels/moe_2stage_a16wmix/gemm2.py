@@ -116,6 +116,110 @@ def _atomic_bf16_epilog(
                 )
 
 
+@flyc.jit
+def _cshuffle_bf16_epilog(
+    lds_acc_base_i32,
+    accm,
+    arg_out,
+    arg_stids,
+    arg_sweights,
+    m_row,
+    n_block_idx,
+    wave,
+    lane,
+    i32_M,
+    BM,
+    N_OUT,
+    BN,
+    TOPK,
+):
+    """CShuffle then coalesced vec2 store into unique [token*topk+slot, N] rows.
+
+    Same 4-wave N-split / MFMA acc layout as ``_atomic_bf16_epilog``. Writes
+    routing-weighted bf16 into LDS (half the atomic f32 staging), remaps to
+    (MLane=8, NLane=32), and ``llvm.StoreOp``s — no atomics. Invalid/padded
+    rows are skipped; every valid (token, slot) is unique so a later topk
+    sum is race-free.
+    """
+    _kMChunks = BM // 16
+    M_REPS = BM // 8
+    _n_per_wave = BN // 4
+    num_acc_n = _n_per_wave // 16
+    _s_count = BN // 64
+    lane_div_16 = lane // fx.Int32(16)
+    lane_mod_16 = lane % fx.Int32(16)
+    lds_base = _lds_ptr3(lds_acc_base_i32, fx.Int32(0))
+
+    tx_i32 = fx.Int32(gpu.thread_id("x"))
+    m_lane = tx_i32 // fx.Int32(32)
+    n_lane = tx_i32 % fx.Int32(32)
+    col_start = n_lane * fx.Int32(2)
+    stids_base = _global_base_ptr1(arg_stids)
+    sweights_base = _global_base_ptr1(arg_sweights)
+    out_base = _global_base_ptr1(arg_out)
+
+    packed = []
+    for mr in range_constexpr(M_REPS):
+        sorted_pos = m_row + fx.Int32(mr * 8) + m_lane
+        packed.append(
+            llvm.load(T.i32, _gep(stids_base, sorted_pos * fx.Int32(4)), invariant=True)
+        )
+
+    # Weighted f32 -> bf16 into row-major LDS (CShuffle write).
+    for i in range_constexpr(_kMChunks):
+        row_base = fx.Int32(i * 16) + lane_div_16 * fx.Int32(4)
+        w0 = llvm.load(
+            T.f32,
+            _gep(sweights_base, (m_row + row_base) * fx.Int32(4)),
+            invariant=True,
+        )
+        w1 = llvm.load(
+            T.f32,
+            _gep(sweights_base, (m_row + row_base + fx.Int32(1)) * fx.Int32(4)),
+            invariant=True,
+        )
+        w2 = llvm.load(
+            T.f32,
+            _gep(sweights_base, (m_row + row_base + fx.Int32(2)) * fx.Int32(4)),
+            invariant=True,
+        )
+        w3 = llvm.load(
+            T.f32,
+            _gep(sweights_base, (m_row + row_base + fx.Int32(3)) * fx.Int32(4)),
+            invariant=True,
+        )
+        for J in range_constexpr(num_acc_n):
+            col = wave * fx.Int32(_n_per_wave) + fx.Int32(J * 16) + lane_mod_16
+            vec = Vec(accm[i][J])
+            bf4 = Vec.from_elements(
+                [vec[0] * w0, vec[1] * w1, vec[2] * w2, vec[3] * w3],
+                fx.Float32,
+            ).to(fx.BFloat16)
+            for v in range_constexpr(4):
+                idx = (row_base + fx.Int32(v)) * fx.Int32(BN) + col
+                llvm.StoreOp(_raw(bf4[v]), _gep(lds_base, idx * fx.Int32(2)))
+
+    gpu.barrier()
+
+    for mr in range_constexpr(M_REPS):
+        row_in_block = fx.Int32(mr * 8) + m_lane
+        token_id = packed[mr] & fx.Int32(0x00FFFFFF)
+        slot = packed[mr] >> fx.Int32(24)
+        if token_id < i32_M:
+            row_base_addr = (
+                (token_id * fx.Int32(TOPK) + slot) * fx.Int32(N_OUT)
+                + n_block_idx * fx.Int32(BN)
+                + col_start
+            )
+            for s in range_constexpr(_s_count):
+                idx0 = row_in_block * fx.Int32(BN) + col_start + fx.Int32(s * 64)
+                pk = Vec(
+                    llvm.load(T.vec(2, T.bf16), _gep(lds_base, idx0 * fx.Int32(2)))
+                )
+                off = (row_base_addr + fx.Int32(s * 64)) * fx.Int32(2)
+                llvm.StoreOp(_raw(pk), _gep(out_base, off))
+
+
 def _gemm2_body_a16w4(
     lds_raw_ptr,
     arg_a,
@@ -139,11 +243,14 @@ def _gemm2_body_a16w4(
     b_cache_mod=2,
     w_dtype="fp4",
     use_k16=False,
+    use_cshuffle=False,
+    topk=1,
 ):
     """a16w4/a16wi4/a16w16 stage2 body. K=inter_dim (contraction), N=model_dim (N_OUT).
 
     A = bf16 stage1 intermediate by SORTED position. W2 = mxfp4/int4/bf16 (see gemm1).
-    Output = bf16 atomic-fadd (routing-weighted) scatter to [tokens, model_dim].
+    Output = bf16 atomic-fadd scatter to [tokens, model_dim], or (cshuffle) coalesced
+    store to unique [token*topk+slot, model_dim] rows.
     """
     elem_bytes = 2
     KH_TILE_BYTES = TILE_K * elem_bytes
@@ -249,29 +356,46 @@ def _gemm2_body_a16w4(
                     _mma(accm[mi][ni], a8, bb)
         gpu.barrier()
 
-    # ---- epilogue: atomic bf16 scatter (routing-weighted). K-loop done, so the A-LDS
-    # region (offset 0) is reused for the epilog's f32 acc staging.
+    # ---- epilogue. K-loop done, so the A-LDS region (offset 0) is reused.
     gpu.barrier()
     lds_acc_base_i32 = fx.Int32(fx.ptrtoint(lds_raw_ptr))
     accm_v = [
         [accm[i][J].load().ir_value() for J in range(num_acc_n)]
         for i in range(m_repeat)
     ]
-    _atomic_bf16_epilog(
-        lds_acc_base_i32,
-        accm_v,
-        arg_out,
-        arg_stids,
-        arg_sweights,
-        m_row,
-        n_block_idx,
-        wave,
-        lane,
-        i32_M,
-        BM,
-        N_OUT,
-        TILE_N,
-    )
+    if const_expr(use_cshuffle):
+        _cshuffle_bf16_epilog(
+            lds_acc_base_i32,
+            accm_v,
+            arg_out,
+            arg_stids,
+            arg_sweights,
+            m_row,
+            n_block_idx,
+            wave,
+            lane,
+            i32_M,
+            BM,
+            N_OUT,
+            TILE_N,
+            topk,
+        )
+    else:
+        _atomic_bf16_epilog(
+            lds_acc_base_i32,
+            accm_v,
+            arg_out,
+            arg_stids,
+            arg_sweights,
+            m_row,
+            n_block_idx,
+            wave,
+            lane,
+            i32_M,
+            BM,
+            N_OUT,
+            TILE_N,
+        )
 
 
 def gemm2_a16w4_grid(BM, *, N_OUT, TILE_N, max_m_blocks, persist=False):
@@ -302,11 +426,14 @@ def compile_gemm2_a16w4_port(
     w_dtype="fp4",
     persist=False,
     use_k16,
+    epilog="atomic",
+    topk=1,
 ):
     """a16w4/a16wi4/a16w16 (bf16 intermediate A x mxfp4/int4/bf16 W2) stage2 builder.
 
     N_OUT = model_dim (down-proj output). D_INTER = inter_dim (contraction). Output
-    bf16 [tokens, model_dim] via atomic (routing-weighted) scatter.
+    bf16 [tokens, model_dim] via atomic (routing-weighted) scatter, or (epilog=
+    ``cshuffle``) coalesced stores into unique [token*topk+slot, model_dim] rows.
 
     ``xcd_swizzle`` (>0) bijectively round-robins the launch index across the 8 XCDs to
     balance per-XCD/HBM traffic (gemm2 is HBM-bound), + optional M-group swizzle for
@@ -317,6 +444,13 @@ def compile_gemm2_a16w4_port(
         "int4",
         "bf16",
     ), f"w_dtype must be 'mxfp4', 'int4' or 'bf16', got {w_dtype!r}"
+    if epilog not in ("atomic", "cshuffle"):
+        raise ValueError(f"epilog must be 'atomic' or 'cshuffle', got {epilog!r}")
+    _use_cshuffle = epilog == "cshuffle"
+    # Don't fragment the atomic compile cache across topk values.
+    _topk = int(topk) if _use_cshuffle else 1
+    if _use_cshuffle and _topk < 1:
+        raise ValueError(f"cshuffle epilog requires topk>=1, got {_topk}")
     # Arch-gate K=16 (gfx942) vs K=32 (gfx950); resolved by the caller and passed in.
     _use_k16 = use_k16
     _K = D_INTER
@@ -334,10 +468,16 @@ def compile_gemm2_a16w4_port(
     _num_n_blocks = N_OUT // TILE_N
     KH_TILE_BYTES = TILE_K * 2
 
-    # LDS: A tile (BM x TILE_K bf16) then f32 accumulator region (BM x TILE_N f32).
+    # LDS: A tile (BM x TILE_K bf16). Atomic reuses offset 0 for f32 acc staging
+    # (allocated on top of A). CShuffle reuses offset 0 for a bf16 [BM, TILE_N]
+    # shuffle tile — overlay, so budget is max(A, cshuffle), not A+acc+cshuffle.
     _a_bytes = BM * KH_TILE_BYTES
-    _acc_bytes = BM * TILE_N * 4  # f32 accumulator region
-    _lds_bytes = _a_bytes + _acc_bytes
+    if _use_cshuffle:
+        _cshuffle_bytes = BM * TILE_N * 2  # bf16 CShuffle tile
+        _lds_bytes = max(_a_bytes, _cshuffle_bytes)
+    else:
+        _acc_bytes = BM * TILE_N * 4  # f32 accumulator region
+        _lds_bytes = _a_bytes + _acc_bytes
 
     # use_k16 is the gfx942/CDNA3 MFMA fallback; that arch has 64KiB LDS.
     if use_k16:
@@ -357,6 +497,8 @@ def compile_gemm2_a16w4_port(
         _name += f"_w{waves_per_eu}"
     if persist:
         _name += "_persist"
+    if _use_cshuffle:
+        _name += f"_cshuffle_tk{_topk}"
 
     @fx.struct
     class SharedStorage:
@@ -434,6 +576,8 @@ def compile_gemm2_a16w4_port(
                 b_cache_mod=b_cache_mod,
                 w_dtype=w_dtype,
                 use_k16=_use_k16,
+                use_cshuffle=_use_cshuffle,
+                topk=_topk,
             )
 
         if const_expr(persist):

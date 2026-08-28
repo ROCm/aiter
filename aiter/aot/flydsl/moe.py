@@ -919,6 +919,11 @@ def _precompile_a16w4_to_cache(
                 tile_k=g2_tile_k,
                 w_dtype=b_dtype,
                 persist=bool(kwargs.get("persist", False)),
+                epilog=(
+                    "cshuffle"
+                    if kwargs.get("mode") == "cshuffle"
+                    else "atomic"
+                ),
                 **common,
             )
 

@@ -141,6 +141,20 @@ def _is_a16wi4_per1x32(q_dtype_a, q_dtype_w, q_type) -> bool:
     )
 
 
+def _a16wmix_gemm2_tune_mode_ok(kparams) -> bool:
+    """a16w-mix gemm2: atomic and CShuffle compete; k_batch stays 1 (gemm1).
+
+    ``reduce``-named configs are still atomic on the ported gemm2 (wasted
+    duplicate). Persist is a separate lever, dropped here so CShuffle can
+    enter the search without opening the full persist grid.
+    """
+    if kparams.get("b_dtype") not in ("fp4", "int4"):
+        return True
+    if kparams.get("persist", None) is not None:
+        return False
+    return kparams.get("mode", "atomic") in ("atomic", "cshuffle")
+
+
 # asm fused_topk pairs in fused_moe.fused_topk. Other (E, topk) go through
 # generic topk_softmax, whose current module_moe_asm ABI rejects need_renorm
 # (TypeError: got Tensor). Tuner data only needs valid routing ids.
@@ -3754,18 +3768,23 @@ class FmoeTuner(TunerCommon):
                 #    that takes the worker pool down); tile_n=128 covers the shape;
                 #  - tile_k must divide inter_dim (K); tile_k=256 on non-256 inter
                 #    (e.g. 384) is parsed verbatim by the wrapper -> OOB/wrong out.
-                if a_dtype_str == "bf16" and (
-                    s2_tile_m != blockM
-                    or kparams["tile_n"] == 256
-                    or inter_dim % kparams["tile_k"] != 0
-                    or not a16w4_config_fits_device(
-                        2,
-                        kparams["tile_m"],
-                        kparams["tile_n"],
-                        kparams["tile_k"],
-                    )
-                ):
-                    continue
+                #  - only atomic and cshuffle compete (reduce is a no-op alias).
+                if a_dtype_str == "bf16":
+                    if not _a16wmix_gemm2_tune_mode_ok(kparams):
+                        continue
+                    if (
+                        s2_tile_m != blockM
+                        or kparams["tile_n"] == 256
+                        or inter_dim % kparams["tile_k"] != 0
+                        or not a16w4_config_fits_device(
+                            2,
+                            kparams["tile_m"],
+                            kparams["tile_n"],
+                            kparams["tile_k"],
+                            epilog=kparams.get("mode", "atomic"),
+                        )
+                    ):
+                        continue
                 s2_kparams = {**kparams, "sort_block_m": blockM}
                 s2_kname = kname if s2_tile_m == blockM else f"{kname}_sbm{blockM}"
 
@@ -4510,13 +4529,15 @@ class FmoeTuner(TunerCommon):
                 s2_tile_m = kparams["tile_m"]
                 if s2_tile_m != blockM:
                     continue
+                if not _a16wmix_gemm2_tune_mode_ok(kparams):
+                    continue
                 if not a16w4_config_fits_device(
-                    2, kparams["tile_m"], kparams["tile_n"], kparams["tile_k"]
+                    2,
+                    kparams["tile_m"],
+                    kparams["tile_n"],
+                    kparams["tile_k"],
+                    epilog=kparams.get("mode", "atomic"),
                 ):
-                    continue
-                if kparams.get("mode", "atomic") != "atomic":
-                    continue
-                if kparams.get("persist", None) is not None:
                     continue
                 s2_kparams = {**kparams, "sort_block_m": blockM}
                 s2_kname = kname

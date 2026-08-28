@@ -321,6 +321,8 @@ def get_flydsl_stage2_kernels(
     tile_ks = [128, 256] if (is_fp4 or is_fp8) else [128]
     tile_ms = [16, 32, 64, 128] if is_fp4 else [32, 64, 128]
     modes = ["atomic", "reduce"]
+    if a_dtype == "bf16" and is_fp4:
+        modes = ["atomic", "reduce", "cshuffle"]
 
     b_nts = [0, 2]
 
@@ -346,7 +348,9 @@ def get_flydsl_stage2_kernels(
                             if (
                                 a_dtype == "bf16"
                                 and is_fp4
-                                and not a16w4_config_fits_device(2, tm, tn, tk)
+                                and not a16w4_config_fits_device(
+                                    2, tm, tn, tk, epilog=mode
+                                )
                             ):
                                 continue
                             base_params = {
@@ -528,9 +532,16 @@ def _gemm1_lds_bytes(tile_m: int, tile_n: int, tile_k: int, k_wave: int) -> int:
     return max(a_lds, reduce_bytes)
 
 
-def _gemm2_lds_bytes(tile_m: int, tile_n: int, tile_k: int) -> int:
-    """LDS bytes ``compile_gemm2_a16w4_port`` allocates: A tile + f32 acc overlay."""
-    return int(tile_m) * int(tile_k) * 2 + int(tile_m) * int(tile_n) * 4
+def _gemm2_lds_bytes(tile_m: int, tile_n: int, tile_k: int, epilog: str = "atomic") -> int:
+    """LDS bytes ``compile_gemm2_a16w4_port`` allocates.
+
+    Atomic: A tile + f32 acc overlay (summed, matching the current compile).
+    CShuffle: max(A tile, bf16 shuffle tile) — the shuffle reuses A-LDS offset 0.
+    """
+    a = int(tile_m) * int(tile_k) * 2
+    if epilog == "cshuffle":
+        return max(a, int(tile_m) * int(tile_n) * 2)
+    return a + int(tile_m) * int(tile_n) * 4
 
 
 def _a16w4_num_acc_n(tile_n: int, k_wave: int = 1) -> int:
@@ -551,6 +562,7 @@ def a16w4_config_fits_device(
     tile_k: int,
     k_wave: int = 1,
     gfx: str | None = None,
+    epilog: str = "atomic",
 ) -> bool:
     """True if this a16w-mix tile is legal on ``gfx`` (num_acc_n and LDS).
 
@@ -569,7 +581,7 @@ def a16w4_config_fits_device(
         # gemm2: 4 waves split TILE_N; TILE_N//4 must be >= 16.
         if int(tile_n) // 4 < 16:
             return False
-        lds = _gemm2_lds_bytes(tile_m, tile_n, tile_k)
+        lds = _gemm2_lds_bytes(tile_m, tile_n, tile_k, epilog=epilog)
     g = (gfx if gfx is not None else _current_gfx()) or ""
     if not g.lower().startswith("gfx"):
         g = "gfx950"
@@ -650,6 +662,9 @@ def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
     No ``_persist`` name is registered here: int4 stage2 does not currently
     opt into persist. a16w4 (fp4) stage2 *does* register ``_persist`` and the
     a16w port forwards it to ``flydsl_a16w4_gemm2``.
+
+    ``cshuffle`` is the nonatomic CShuffle epilog (unique per-slot store +
+    topk reduce). ``_atomic`` names keep the existing 4-wave atomic epilog.
     """
     kernels = {}
     a_dtype = "bf16"
@@ -657,13 +672,16 @@ def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
     tile_ks = [128, 256]
     tile_ms = [16, 32, 64, 128]
     tile_ns = [128]
-    # modes = ["atomic", "reduce"]
-    modes = ["atomic"]
+    modes = ["atomic", "cshuffle"]
 
     for tm in tile_ms:
         for tn in tile_ns:
             for tk in tile_ks:
                 for mode in modes:
+                    if mode == "cshuffle" and not a16w4_config_fits_device(
+                        2, tm, tn, tk, epilog="cshuffle"
+                    ):
+                        continue
                     base_name = flydsl_kernel_name(
                         2, a_dtype, b_dtype, out_dtype, tm, tn, tk, mode
                     )
@@ -819,6 +837,7 @@ def compile_flydsl_moe_stage2(
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
+    epilog: str = "atomic",
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     # a16w-mix (bf16 A x {fp4 mxfp4, int4} W) down-proj: build the ported gemm2
@@ -842,6 +861,8 @@ def compile_flydsl_moe_stage2(
             w_dtype=b_dtype,
             # gfx942 lacks K=32 bf16 MFMA + v_cvt_pk_bf16_f32 -> K=16 fallback.
             use_k16="gfx95" not in str(get_rocm_arch()),
+            epilog=epilog,
+            topk=topk,
         )
     if b_dtype in ("fp4", "fp8"):
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2
@@ -2145,6 +2166,20 @@ def _flydsl_moe_stage2_impl(
                 device=inter_states.device,
             )
         )
+        _epilog = "cshuffle" if mode == "cshuffle" else "atomic"
+        gemm2_out = out
+        if _epilog == "cshuffle":
+            # Unique per-(token, slot) rows; topk-sum into the caller's [M, H].
+            gemm2_out = torch.empty(
+                (M_logical * int(topk), model_dim),
+                dtype=out.dtype,
+                device=out.device,
+            )
+            if expert_mask is not None:
+                # EP sorting omits remote/fake routes, so those slots stay
+                # unwritten. Zero before masked reduction: moe_reduce loads
+                # every topk row, then select()s the mask.
+                gemm2_out.zero_()
         flydsl_a16w4_gemm2(
             inter_sorted_bf16=inter_states,
             w2_u8=w2.view(torch.uint8).contiguous(),
@@ -2157,7 +2192,7 @@ def _flydsl_moe_stage2_impl(
             cumsum_tensor=num_valid_ids.to(torch.int32).contiguous(),
             sorted_token_ids=sorted_token_ids,
             sorted_weights=_sw,
-            flat_out=out.view(-1),
+            flat_out=gemm2_out.view(-1),
             M_logical=M_logical,
             max_sorted=max_sorted,
             NE=E,
@@ -2172,7 +2207,18 @@ def _flydsl_moe_stage2_impl(
             xcd_swizzle=xcd_swizzle,
             w_dtype=b_dtype,
             persist=persist,
+            epilog=_epilog,
         )
+        if _epilog == "cshuffle":
+            _run_moe_reduction(
+                gemm2_out,
+                out,
+                M_logical,
+                int(topk),
+                model_dim,
+                expert_mask,
+                topk_ids,
+            )
         return out
 
     token_num = inter_states.shape[0]

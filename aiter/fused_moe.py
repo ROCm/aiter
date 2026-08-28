@@ -424,12 +424,11 @@ def stage2_uses_route_reduce(stage2: Callable) -> bool:
         parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernel_name)
         if parsed is None:
             return False
-        # a16w4 (bf16 A x mxfp4 W) down-proj only supports atomic scatter into a
-        # pre-zeroed buffer; the ported gemm2 launcher ignores the kernelName's
-        # mode, so a "reduce"-named a16w4 config must still get accumulate=True
-        # sorting (moe_buf zeroed). Treat any a16w4 stage2 as atomic here.
-        if parsed.get("a_dtype") == "bf16" and parsed.get("b_dtype") == "fp4":
-            return False
+        # a16w-mix (bf16 A x mxfp4/int4 W) down-proj: ``reduce``-named configs are
+        # still atomic (ported gemm2 ignores that mode). ``cshuffle`` is the
+        # nonatomic CShuffle + topk-reduce path and needs accumulate=False sorting.
+        if parsed.get("a_dtype") == "bf16" and parsed.get("b_dtype") in ("fp4", "int4"):
+            return parsed.get("mode") == "cshuffle"
         return parsed.get("mode", "atomic") == "reduce"
     if func is _opus_a8w4.opus_a8w4_stage2_wrapper:
         return _opus_a8w4.stage2_uses_route_reduce(stage2)
