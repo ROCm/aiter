@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import argparse
+import itertools
 import re
 import sys
 from pathlib import Path
 
+import pandas as pd
 import pytest
 import torch
 
-from aiter import q4_group64_gemv
+import aiter
+from aiter import dtypes, q4_group64_gemv
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.q4_group64_gemv import (
     _AUTO_MAPPING,
     _MAPPING_IDS,
@@ -19,11 +24,41 @@ from aiter.ops.q4_group64_gemv import (
     _require_experimental_enabled,
     _selected_mapping,
 )
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 from op_tests.op_benchmarks.hip import bench_q4_group64_gemv as q4_benchmark
 from op_tests.q4_group64_reference import pack_group64 as _pack_group64
 
 RTOL = 5.0e-4
 ATOL = 5.0e-3
+SUPPORTED_GFX = ["gfx1201"]
+
+# M is one because this operator is the decode-time matrix-vector path, with
+# N=out_features and K=in_features. For each model, q_proj/o_proj use
+# hidden_size, k_proj/v_proj use num_key_value_heads * head_dim, gate_proj/up_proj
+# use intermediate_size, and down_proj reverses hidden_size/intermediate_size.
+# These dimensions come from the released model config.json files used to define
+# this sweep.
+MODEL_MNK_SHAPES = [
+    # Qwen2.5-7B: hidden=3584, intermediate=18944, KV width=512.
+    (1, 512, 3584),
+    (1, 3584, 3584),
+    (1, 18944, 3584),
+    (1, 3584, 18944),
+    # Phi-4-mini: hidden=3072, intermediate=8192, KV width=1024.
+    (1, 1024, 3072),
+    (1, 3072, 3072),
+    (1, 8192, 3072),
+    (1, 3072, 8192),
+    # Qwen3-8B: hidden=4096, intermediate=12288, KV width=1024.
+    (1, 1024, 4096),
+    (1, 4096, 4096),
+    (1, 12288, 4096),
+    (1, 4096, 12288),
+    # Mistral-7B v0.3 adds intermediate=14336; its hidden and KV widths share
+    # two Qwen3-8B shapes above, leaving 14 unique model-derived signatures.
+    (1, 14336, 4096),
+    (1, 4096, 14336),
+]
 
 
 def _is_gfx1201() -> bool:
@@ -79,6 +114,58 @@ def _reference(x: torch.Tensor, q: torch.Tensor, scales: torch.Tensor) -> torch.
             dim=1
         ) * scales_device[:, group]
     return result
+
+
+def run_torch(x: torch.Tensor, q: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """FP32 reference for the signed-INT4, group-64 packed operator."""
+    return _reference(x, q, scales)
+
+
+@benchmark()
+def run_q4_group64_gemv_case(m: int, n: int, k: int) -> dict[str, object]:
+    if m != 1:
+        raise ValueError(f"q4_group64_gemv is a GEMV and requires M=1, got {m}")
+
+    seed = 2026082700 + (n * 131 + k) % 1_000_000
+    x_cpu, packed_cpu, q, scales = _make_case(n, k, seed=seed)
+    x = x_cpu.cuda()
+    packed_weight = packed_cpu.cuda()
+    ref = run_torch(x, q, scales)
+
+    # The public API allocates its output. Keep the old baseline allocation-
+    # equivalent with out=None so both timings reproduce the exposed call boundary.
+    candidates = {
+        "old": lambda: _q4_group64_gemv(x, packed_weight, mapping="old", out=None),
+        "public_auto": lambda: q4_group64_gemv(x, packed_weight),
+    }
+
+    # One decode GEMV performs N*K multiplies and N*K additions. Logical bytes
+    # include the packed matrix, one FP32 activation vector, and one FP32 output.
+    flops = 2 * m * n * k
+    nbytes = (
+        packed_weight.numel() * packed_weight.element_size()
+        + x.numel() * x.element_size()
+        + n * ref.element_size()
+    )
+
+    ret: dict[str, object] = {"gfx": get_gfx()}
+    for name, candidate in candidates.items():
+        out, us = run_perftest(candidate)
+        err = checkAllclose(
+            ref.to(dtypes.fp32),
+            out.to(dtypes.fp32),
+            rtol=RTOL,
+            atol=ATOL,
+            tol_err_ratio=0.0,
+            msg=f"{name}: q4_group64_gemv",
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1.0e6
+        ret[f"{name} TB/s"] = nbytes / us / 1.0e6
+        ret[f"{name} err"] = err
+        if err != 0:
+            raise AssertionError(f"{name}: mismatch ratio {err}")
+    return ret
 
 
 def _assert_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
@@ -150,6 +237,7 @@ def test_auto_dispatch_has_all_measured_plain_shapes() -> None:
         (14336, 4096): "split8",
         (18944, 3584): "split8",
     }
+    assert {(n, k) for _, n, k in MODEL_MNK_SHAPES} == set(q4_benchmark.SWEEP_SHAPES)
 
 
 def test_python_and_cpp_auto_dispatch_tables_do_not_drift() -> None:
@@ -522,5 +610,50 @@ def test_invalid_explicit_split_shape_is_rejected() -> None:
         _q4_group64_gemv(x_cpu.cuda(), packed_cpu.cuda(), mapping="split2")
 
 
+def main() -> None:
+    gfx = get_gfx()
+    if gfx not in SUPPORTED_GFX:
+        aiter.logger.warning(
+            "q4_group64_gemv unsupported on %s; expected one of %s; skipping",
+            gfx,
+            SUPPORTED_GFX,
+        )
+        return
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description=(
+            "q4_group64_gemv correctness and performance sweep.\n"
+            "Set AITER_ENABLE_EXPERIMENTAL=1 before running."
+        ),
+    )
+    parser.add_argument(
+        "-s",
+        "--mnk",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=MODEL_MNK_SHAPES,
+        help="""Decode GEMV shape as M,N,K; M must be one.
+        e.g.: -s 1,512,3584
+              --mnk 1,512,3584 1,4096,4096""",
+    )
+    args = parser.parse_args()
+    if not args.mnk:
+        parser.error("--mnk requires at least one M,N,K shape")
+    for shape in args.mnk:
+        if not isinstance(shape, tuple) or len(shape) != 3:
+            parser.error(f"expected M,N,K, got {shape}")
+
+    _require_experimental_enabled()
+
+    rows = []
+    for ((m, n, k),) in itertools.product(args.mnk):
+        rows.append(run_q4_group64_gemv_case(m, n, k))
+    df = pd.DataFrame(rows)
+    aiter.logger.info(
+        "q4_group64_gemv summary (markdown):\n%s", df.to_markdown(index=False)
+    )
+
+
 if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-v"]))
+    main()
