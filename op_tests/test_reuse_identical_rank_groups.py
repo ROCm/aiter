@@ -71,10 +71,12 @@ def _check_reuse_true():
     # EP must be a distinct object with its own EP-named comm so
     # is_ep_communicator/use_all2all are True and all2all can initialize.
     assert ep is not tp, "EP must not alias TP"
-    assert "ep" in ep.unique_name, f"EP unique_name should contain 'ep': {ep.unique_name}"
-    assert ep.device_communicator is not tp.device_communicator, (
-        "EP must own its device_communicator (EP-named), not share TP's"
-    )
+    assert (
+        "ep" in ep.unique_name
+    ), f"EP unique_name should contain 'ep': {ep.unique_name}"
+    assert (
+        ep.device_communicator is not tp.device_communicator
+    ), "EP must own its device_communicator (EP-named), not share TP's"
     assert ep.device_communicator.is_ep_communicator is True
     assert ep.device_communicator.use_all2all is True
     # ...but it reuses TP's allreduce handles (the point: no second NCCL comm).
@@ -100,9 +102,9 @@ def _check_reuse_true():
     t = torch.ones(8, device=dev)
     out = pynccl.all_reduce(t)
     torch.cuda.synchronize()
-    assert torch.allclose(out, torch.full_like(out, float(tp.world_size))), (
-        f"reused pynccl all_reduce gave {out[0].item()}, expected {tp.world_size}"
-    )
+    assert torch.allclose(
+        out, torch.full_like(out, float(tp.world_size))
+    ), f"reused pynccl all_reduce gave {out[0].item()}, expected {tp.world_size}"
 
 
 def _check_reuse_false():
@@ -113,9 +115,9 @@ def _check_reuse_false():
     assert ep is not tp
     assert ep.device_communicator is not tp.device_communicator
     assert ep.device_communicator.pynccl_comm is not tp.device_communicator.pynccl_comm
-    assert dcp.device_group is not tp.device_group, (
-        "with reuse off, DCP must allocate its own process group"
-    )
+    assert (
+        dcp.device_group is not tp.device_group
+    ), "with reuse off, DCP must allocate its own process group"
     # EP still carries an EP-named communicator regardless of reuse.
     assert ep.device_communicator.is_ep_communicator is True
 
@@ -139,9 +141,7 @@ def _worker(rank, world_size, port):
 def main():
     world_size = 2
     if torch.cuda.device_count() < world_size:
-        print(
-            f"SKIP: need {world_size} GPUs, have {torch.cuda.device_count()}"
-        )
+        print(f"SKIP: need {world_size} GPUs, have {torch.cuda.device_count()}")
         return
     port = int(os.environ.get("MASTER_PORT", "29513"))
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:

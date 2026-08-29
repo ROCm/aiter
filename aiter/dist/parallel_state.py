@@ -1937,9 +1937,12 @@ def initialize_model_parallel(
         group_ranks = [x.tolist() for x in group_ranks]
         my_ranks = next((r for r in group_ranks if rank in r), None)
         key = tuple(sorted(my_ranks)) if my_ranks is not None else None
-        dedup = reuse_identical_rank_groups and need_std_comm and key is not None and len(
-            my_ranks
-        ) > 1
+        dedup = (
+            reuse_identical_rank_groups
+            and need_std_comm
+            and key is not None
+            and len(my_ranks) > 1
+        )
         source = _built_by_ranks.get(key) if dedup else None
         group = init_model_parallel_group(
             group_ranks,
