@@ -4,7 +4,7 @@
 import torch
 
 from ..jit.core import compile_ops
-from ..jit.utils.chip_info import get_gfx_runtime
+from ..jit.utils.chip_info import get_gfx_runtime, require_gfx1250_asm
 from ..jit.utils.torch_guard import torch_compile_guard
 
 MD_NAME = "module_mla_sparse_prefill_asm"
@@ -98,6 +98,7 @@ def mla_sparse_prefill_fp8_asm(
     gfx = get_gfx_runtime()
     if gfx != "gfx1250":
         raise RuntimeError(f"mla_sparse_prefill_fp8_asm requires gfx1250, got {gfx}")
+    require_gfx1250_asm("mla_sparse_prefill_fp8_asm")
 
     if q_nope.dtype != unified_kv_nope.dtype or q_nope.dtype != kv_nope.dtype:
         raise RuntimeError(
