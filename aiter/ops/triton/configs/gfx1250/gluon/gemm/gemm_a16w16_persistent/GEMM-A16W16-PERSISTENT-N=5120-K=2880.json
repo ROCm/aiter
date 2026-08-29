@@ -41,5 +41,17 @@
         "NUM_BUFFERS": 2,
         "num_warps": 2,
         "GROUP_SIZE_M": 2
+    },
+    "M_LEQ_8192": {
+        "BLOCK_M": 256,
+        "BLOCK_N": 256,
+        "BLOCK_K": 64,
+        "NUM_BUFFERS": 2,
+        "num_warps": 4,
+        "GROUP_SIZE_M": 1,
+        "NUM_KSPLIT": 1,
+        "kernel_type": "compute_bound",
+        "num_stages": 1,
+        "waves_per_eu": 1
     }
 }

@@ -24,11 +24,53 @@ _GLUON_REPR_KEYS = [
     "USE_ACTIVATION",
     "ADD_BIAS",
     "SKIP_REDUCE",
-    "NUM_WGS",
+    "NUM_SMS",
+    "CTAS_M",
+    "CTAS_N",
     "num_warps",
     "num_stages",
     "waves_per_eu",
 ]
+
+# --------------------------------------------------------------------------- #
+# CTA-cluster (CGA) helpers -- operand multicast (see gemm_mxfp8.py). gfx1250
+# launches a CTAS_M x CTAS_N cluster; one TDM fetch is multicast to every CTA
+# that shares it. BLOCK_M/BLOCK_N are the CLUSTER tile, so each CTA computes
+# BLOCK_M//CTAS_M x BLOCK_N//CTAS_N. 1x1 => empty CGA => the original kernel.
+# --------------------------------------------------------------------------- #
+@gluon.constexpr_function
+def cga_bases(ctas_m, ctas_n):
+    bases = []
+    for dim, ctas in ((0, ctas_m), (1, ctas_n)):
+        bit = 1
+        while bit < ctas:
+            basis = [0, 0]
+            basis[dim] = bit
+            bases.append(basis)
+            bit *= 2
+    return bases
+
+
+@gluon.constexpr_function
+def cga_drop_k(cga, operand_index):
+    """Zero the K dim of a rank-2 CGA -> multicast over the other CTA axis."""
+    if not cga:
+        return []
+    k_dim = 1 if operand_index == 0 else 0
+    return [[0 if d == k_dim else b[d] for d in range(2)] for b in cga]
+
+
+@gluon.constexpr_function
+def cga_swap(cga):
+    if not cga:
+        return []
+    return [[b[1], b[0]] for b in cga]
+
+
+@gluon.constexpr_function
+def make_wmma_layout(warp_bases, cga):
+    return gl.amd.AMDWMMALayout(3, True, warp_bases, [], [16, 16, 32], cga_layout=cga)
+
 
 _gemm_a16w16_persistent_repr = make_kernel_repr(
     "gemm_a16w16_persistent_gfx1250_kernel_", _GLUON_REPR_KEYS
@@ -45,6 +87,7 @@ def gemm_a16w16_persistent_kernel_(
     b_ptr,
     bias_ptr,
     c_ptr,
+    tile_counter_ptr,
     M,
     N,
     K,
@@ -70,10 +113,13 @@ def gemm_a16w16_persistent_kernel_(
     USE_ACTIVATION: gl.constexpr,
     ADD_BIAS: gl.constexpr,
     SKIP_REDUCE: gl.constexpr,
-    NUM_WGS: gl.constexpr,
+    NUM_SMS: gl.constexpr,
     num_warps: gl.constexpr,
     num_stages: gl.constexpr = 0,
     waves_per_eu: gl.constexpr = 0,
+    CTAS_M: gl.constexpr = 1,
+    CTAS_N: gl.constexpr = 1,
+    num_ctas: gl.constexpr = 1,
 ):
 
     gl.static_assert(NUM_BUFFERS >= 2, "persistent gemm requires NUM_BUFFERS >= 2")
@@ -152,7 +198,7 @@ def gemm_a16w16_persistent_kernel_(
         )
 
     # Persistent loop
-    for tile_id in range(start_pid, num_tiles, NUM_WGS):
+    for tile_id in range(start_pid, num_tiles, NUM_SMS):
         # remap tile index
         t = remap_xcd(tile_id, num_tiles, NUM_XCDS=8)
         pid_k = t % NUM_KSPLIT
@@ -288,6 +334,7 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
     b_ptr,
     bias_ptr,
     c_ptr,
+    tile_counter_ptr,
     M,
     N,
     K,
@@ -313,36 +360,36 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
     USE_ACTIVATION: gl.constexpr,
     ADD_BIAS: gl.constexpr,
     SKIP_REDUCE: gl.constexpr,
-    NUM_WGS: gl.constexpr,
+    NUM_SMS: gl.constexpr,
     num_warps: gl.constexpr,
     num_stages: gl.constexpr = 0,
     waves_per_eu: gl.constexpr = 0,
+    CTAS_M: gl.constexpr = 1,
+    CTAS_N: gl.constexpr = 1,
+    num_ctas: gl.constexpr = 1,
 ):
     gl.static_assert(
         NUM_BUFFERS >= 2, "persistent compute_bound requires NUM_BUFFERS >= 2"
     )
-    gl.static_assert(
-        NUM_KSPLIT == 1, "persistent compute_bound requires NUM_KSPLIT == 1"
-    )
+
+    # CGA (cluster) layouts. Empty at 1x1, giving exactly the old layouts.
+    cga_c: gl.constexpr = cga_bases(CTAS_M, CTAS_N)
+    CGA_A: gl.constexpr = cga_drop_k(cga_c, 0)   # A (M, K): shard M, bcast N
+    CGA_B: gl.constexpr = cga_drop_k(cga_c, 1)   # B (K, N): shard N, bcast M
 
     SHARED_LAYOUT_A: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[BLOCK_K, 8]], [BLOCK_M, BLOCK_K], [1, 0]
+        [[BLOCK_K, 8]], [BLOCK_M, BLOCK_K], [1, 0], CGA_A
     )
     if TRANSPOSE:
         SHARED_LAYOUT_B: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[BLOCK_N, 16]], [BLOCK_K, BLOCK_N], [1, 0]
+            [[BLOCK_N, 16]], [BLOCK_K, BLOCK_N], [1, 0], CGA_B
         )
     else:
         SHARED_LAYOUT_B: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[BLOCK_K, 8]], [BLOCK_N, BLOCK_K], [1, 0]
+            [[BLOCK_K, 8]], [BLOCK_N, BLOCK_K], [1, 0], cga_swap(CGA_B)
         )
 
-    WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
-        version=3,
-        transposed=True,
-        warp_bases=WARP_BASES,
-        instr_shape=[16, 16, 32],
-    )
+    WMMA_LAYOUT: gl.constexpr = make_wmma_layout(WARP_BASES, cga_c)
     OPERAND_LAYOUT_A: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=WMMA_LAYOUT, k_width=8
     )
@@ -398,60 +445,81 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
             layout=SHARED_LAYOUT_B,
         )
 
-    num_k_tiles = gl.cdiv(K, BLOCK_K)
+    if NUM_KSPLIT == 1:
+        SHARED_LAYOUT_C: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[BLOCK_N // CTAS_N, 8]], [BLOCK_M, BLOCK_N], [1, 0], cga_c
+        )
+        c_buffer = gl.allocate_shared_memory(
+            c_ptr.type.element_ty,
+            shape=[BLOCK_M, BLOCK_N],
+            layout=SHARED_LAYOUT_C,
+        )
+        c_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=c_ptr,
+            shape=(M, N),
+            strides=(stride_cm, stride_cn),
+            block_shape=(BLOCK_M, BLOCK_N),
+            layout=SHARED_LAYOUT_C,
+        )
 
-    SHARED_LAYOUT_C: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[BLOCK_N, 8]], [BLOCK_M, BLOCK_N], [1, 0]
-    )
-    c_buffer = gl.allocate_shared_memory(
-        c_ptr.type.element_ty,
-        shape=[BLOCK_M, BLOCK_N],
-        layout=SHARED_LAYOUT_C,
-    )
-    c_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=c_ptr,
-        shape=(M, N),
-        strides=(stride_cm, stride_cn),
-        block_shape=(BLOCK_M, BLOCK_N),
-        layout=SHARED_LAYOUT_C,
-    )
-
+    # decode the first unit and prefetch its leading k-tiles
     t = remap_xcd(start_pid, num_tiles, NUM_XCDS=8)
-    pid_m, pid_n = pid_grid(t, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
+    pid_k = t % NUM_KSPLIT
+    pid = t // NUM_KSPLIT
+    if NUM_KSPLIT == 1:
+        pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
+    else:
+        pid_m = pid // num_pid_n
+        pid_n = pid % num_pid_n
     m_off = pid_m * BLOCK_M
     n_off = pid_n * BLOCK_N
+    sk_start = pid_k * SPLITK_BLOCK_SIZE
     for pf in gl.static_range(NUM_BUFFERS - 1):
         gl.amd.gfx1250.tdm.async_load(
-            a_desc, [m_off, pf * BLOCK_K], a_buffer.index(pf % NUM_BUFFERS)
+            a_desc, [m_off, sk_start + pf * BLOCK_K], a_buffer.index(pf % NUM_BUFFERS)
         )
         if TRANSPOSE:
             gl.amd.gfx1250.tdm.async_load(
-                b_desc, [pf * BLOCK_K, n_off], b_buffer.index(pf % NUM_BUFFERS)
+                b_desc, [sk_start + pf * BLOCK_K, n_off], b_buffer.index(pf % NUM_BUFFERS)
             )
         else:
             gl.amd.gfx1250.tdm.async_load(
-                b_desc, [n_off, pf * BLOCK_K], b_buffer.index(pf % NUM_BUFFERS)
+                b_desc, [n_off, sk_start + pf * BLOCK_K], b_buffer.index(pf % NUM_BUFFERS)
             )
 
-    # Persistent loop
-    for tile_id in range(start_pid, num_tiles, NUM_WGS):
+    tile_id = start_pid
+    while tile_id < num_tiles:
         t = remap_xcd(tile_id, num_tiles, NUM_XCDS=8)
-        pid_m, pid_n = pid_grid(t, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
+        pid_k = t % NUM_KSPLIT
+        pid = t // NUM_KSPLIT
+        if NUM_KSPLIT == 1:
+            pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
+        else:
+            pid_m = pid // num_pid_n
+            pid_n = pid % num_pid_n
         m_off = pid_m * BLOCK_M
         n_off = pid_n * BLOCK_N
+        sk_start = pid_k * SPLITK_BLOCK_SIZE
+        cur_num_k_tiles = gl.cdiv(
+            gl.minimum(sk_start + SPLITK_BLOCK_SIZE, K) - sk_start, BLOCK_K
+        )
 
         load_idx = NUM_BUFFERS - 1
         compute_idx = 0
 
         accumulator = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
-        if ADD_BIAS:
+        if ADD_BIAS and (NUM_KSPLIT == 1 or (SKIP_REDUCE and pid_k == 0)):
             offs_bias = n_off + gl.arange(
                 0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
             )
             bias_vals = gl.load(bias_ptr + offs_bias, mask=offs_bias < N, other=0.0)
             accumulator = accumulator + bias_vals[None, :]
 
+        if num_ctas > 1:
+            gl.amd.gfx1250.cluster.arrive()
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
+        if num_ctas > 1:
+            gl.amd.gfx1250.cluster.wait()
 
         cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
             a_buffer.index(compute_idx % NUM_BUFFERS), OPERAND_LAYOUT_A
@@ -466,27 +534,31 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
                 OPERAND_LAYOUT_B,
             )
 
-        for _ in range(num_k_tiles - (NUM_BUFFERS - 1)):
+        for _ in range(cur_num_k_tiles - (NUM_BUFFERS - 1)):
 
             gl.amd.gfx1250.tdm.async_load(
                 a_desc,
-                [m_off, load_idx * BLOCK_K],
+                [m_off, sk_start + load_idx * BLOCK_K],
                 a_buffer.index(load_idx % NUM_BUFFERS),
             )
             if TRANSPOSE:
                 gl.amd.gfx1250.tdm.async_load(
                     b_desc,
-                    [load_idx * BLOCK_K, n_off],
+                    [sk_start + load_idx * BLOCK_K, n_off],
                     b_buffer.index(load_idx % NUM_BUFFERS),
                 )
             else:
                 gl.amd.gfx1250.tdm.async_load(
                     b_desc,
-                    [n_off, load_idx * BLOCK_K],
+                    [n_off, sk_start + load_idx * BLOCK_K],
                     b_buffer.index(load_idx % NUM_BUFFERS),
                 )
 
+            if num_ctas > 1:
+                gl.amd.gfx1250.cluster.arrive()
             gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
+            if num_ctas > 1:
+                gl.amd.gfx1250.cluster.wait()
 
             load_idx += 1
 
@@ -511,7 +583,11 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
             compute_idx += 1
 
         for i in gl.static_range(NUM_BUFFERS - 2):
+            if num_ctas > 1:
+                gl.amd.gfx1250.cluster.arrive()
             gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 3 - i) * 2)
+            if num_ctas > 1:
+                gl.amd.gfx1250.cluster.wait()
 
             next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
                 a_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_A
@@ -534,20 +610,40 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
 
         accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
 
-        if USE_ACTIVATION:
+        if USE_ACTIVATION and NUM_KSPLIT == 1:
             accumulator = activation(accumulator)
 
-        c_buffer.store(accumulator.to(c_ptr.type.element_ty))
+        if NUM_KSPLIT == 1:
+            c_buffer.store(accumulator.to(c_ptr.type.element_ty))
+            gl.amd.gfx1250.tdm.async_store(c_desc, [m_off, n_off], c_buffer)
+        else:
+            offs_cm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT))
+            offs_cn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT))
+            offs_c = (pid_k * M + m_off + offs_cm)[:, None] * stride_cm + (
+                n_off + offs_cn
+            )[None, :] * stride_cn
+            mask_c = ((m_off + offs_cm)[:, None] < M) & (
+                (n_off + offs_cn)[None, :] < N
+            )
+            gl.amd.gfx1250.buffer_store(accumulator, c_ptr, offs_c, mask=mask_c)
 
-        gl.amd.gfx1250.tdm.async_store(c_desc, [m_off, n_off], c_buffer)
-
-        next_tile_id = tile_id + NUM_WGS
+        if num_ctas > 1:
+            next_tile_id = tile_id + NUM_SMS
+        else:
+            next_tile_id = gl.atomic_add(tile_counter_ptr, 1, sem="relaxed")
         n_t = remap_xcd(next_tile_id, num_tiles, NUM_XCDS=8)
-        n_pid_m, n_pid_n = pid_grid(
-            n_t, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M
-        )
+        n_pid_k = n_t % NUM_KSPLIT
+        n_pid = n_t // NUM_KSPLIT
+        if NUM_KSPLIT == 1:
+            n_pid_m, n_pid_n = pid_grid(
+                n_pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M
+            )
+        else:
+            n_pid_m = n_pid // num_pid_n
+            n_pid_n = n_pid % num_pid_n
         n_m_off = n_pid_m * BLOCK_M
         n_n_off = n_pid_n * BLOCK_N
+        n_sk_start = n_pid_k * SPLITK_BLOCK_SIZE
 
         gl.barrier()
 
@@ -555,23 +651,23 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
             for pf in gl.static_range(NUM_BUFFERS - 1):
                 gl.amd.gfx1250.tdm.async_load(
                     a_desc,
-                    [n_m_off, pf * BLOCK_K],
+                    [n_m_off, n_sk_start + pf * BLOCK_K],
                     a_buffer.index(pf % NUM_BUFFERS),
                 )
                 if TRANSPOSE:
                     gl.amd.gfx1250.tdm.async_load(
                         b_desc,
-                        [pf * BLOCK_K, n_n_off],
+                        [n_sk_start + pf * BLOCK_K, n_n_off],
                         b_buffer.index(pf % NUM_BUFFERS),
                     )
                 else:
                     gl.amd.gfx1250.tdm.async_load(
                         b_desc,
-                        [n_n_off, pf * BLOCK_K],
+                        [n_n_off, n_sk_start + pf * BLOCK_K],
                         b_buffer.index(pf % NUM_BUFFERS),
                     )
 
-        
+        tile_id = next_tile_id
 
 
 _KERNEL_MAP = {
