@@ -11,7 +11,7 @@ from aiter import logger
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from ..jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG, compile_ops
-from ..jit.utils.chip_info import get_cu_num
+from ..jit.utils.chip_info import get_cu_num, require_gfx1250_asm
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..ops.gemm_op_common import get_padded_m
 from ..utility import dtypes
@@ -191,7 +191,6 @@ def gemm_a4w4(
     k = A.shape[-1] * 2
     gfx_arch = get_gfx()
     if gfx_arch in ["gfx1250"]:
-        # F4GEMM is kept on a separate dispatch (preload kargs layout).
         out = _f4gemm_asm_dispatch(
             A,
             B,
@@ -394,6 +393,7 @@ def gemm_mxfp4_asm(
     ``(out_fp8 [M,N], scale_e8m0)``. ``scale_e8m0`` is in the PACKED
     ``(M/64,N//128,16,4)`` layout -- unpack via
     :func:`unpack_mxfp8_out_scale`."""
+    require_gfx1250_asm("gemm_mxfp4_asm")
     M = A.shape[0]
     N = B.shape[0]
     out = _alloc_f4gemm_out(M, N, dtype, A.device)
@@ -427,6 +427,7 @@ def gemm_nvfp4_asm(
     ``(out_fp8 [M,N], scale_e8m0)``. ``scale_e8m0`` is in the PACKED
     ``(M/64,N//128,16,4)`` layout -- unpack via
     :func:`unpack_mxfp8_out_scale`."""
+    require_gfx1250_asm("gemm_nvfp4_asm")
     M = A.shape[0]
     N = B.shape[0]
     out = _alloc_f4gemm_out(M, N, dtype, A.device)

@@ -107,6 +107,57 @@ def get_gfx_runtime() -> str:
     return gfx_arch
 
 
+@functools.lru_cache(maxsize=1)
+def get_asic_revision() -> int:
+    """Silicon stepping of the live GPU: 0=A0, 1=B0, 2=C0, ...
+
+    Parsed from rocminfo (same source as get_gfx_runtime) so it stays stable
+    across ROCm releases and always reflects the actual running GPU.
+    """
+    try:
+        rocminfo = executable_path("rocminfo")
+        result = subprocess.run([rocminfo], capture_output=True, text=True, check=True)
+        in_gpu = False
+        for line in result.stdout.splitlines():
+            if re.search(r"Name:\s*gfx", line):
+                in_gpu = True
+            elif in_gpu:
+                match = re.search(r"ASIC Revision:\s*(\d+)", line)
+                if match:
+                    return int(match.group(1))
+    except Exception as e:
+        raise RuntimeError(f"Get ASIC revision from rocminfo failed: {e}") from e
+    raise RuntimeError("No ASIC Revision found in rocminfo output.")
+
+
+@functools.lru_cache(maxsize=1)
+def is_gfx1250_asm_supported() -> bool:
+    """The py_itfs_cu asm kernels target gfx1250 B0 (asicRevision >= 1) only.
+
+    Returns False on gfx1250 A0 so dispatch can fall back to other path or raise.
+    """
+    try:
+        if get_gfx_runtime() != "gfx1250":
+            return True
+        return get_asic_revision() >= 1
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def require_gfx1250_asm(op_name: str) -> None:
+    """Raise warning on gfx1250 A0 (asm is B0+ only); no-op otherwise."""
+    if is_gfx1250_asm_supported():
+        return
+    logging.getLogger("aiter").warning(
+        "\033[93m[SKIP] %s asm is gfx1250 B0-only supported "
+        "(current device is gfx1250 A0)\033[0m",
+        op_name,
+    )
+    raise RuntimeError(
+        f"{op_name} asm is only supported on gfx1250 B0+ (current device is gfx1250 A0)"
+    )
+
+
 # Backfill map for legacy tuned configs that predate the `gfx` column.
 # These cu_num values were only ever tuned on a single arch historically:
 #   256 -> gfx950, 80/304 -> gfx942.
