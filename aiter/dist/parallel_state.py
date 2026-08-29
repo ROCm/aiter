@@ -525,6 +525,7 @@ class GroupCoordinator:
         use_device_communicator: bool,  # whether to use device communicator
         use_message_queue_broadcaster: bool = False,
         group_name: str | None = None,
+        reuse_from: "GroupCoordinator | None" = None,
     ):
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
@@ -532,6 +533,62 @@ class GroupCoordinator:
 
         self.rank = torch.distributed.get_rank()
         self.local_rank = local_rank
+
+        if reuse_from is not None:
+            # Identical-rank group: share the source's process groups and
+            # communicators instead of allocating a second set over the same
+            # ranks. Stays a distinct object with its own unique_name.
+            self.ranks = reuse_from.ranks
+            self.world_size = reuse_from.world_size
+            self.rank_in_group = reuse_from.rank_in_group
+            self.cpu_group = reuse_from.cpu_group
+            self.device_group = reuse_from.device_group
+            self.device = reuse_from.device
+            self.use_device_communicator = use_device_communicator
+            # Borrowed process groups; the source owns them (see destroy()).
+            self._owns_process_groups = False
+
+            self.device_communicator = None
+            if use_device_communicator and self.world_size > 1:
+                src_dc = reuse_from.device_communicator
+                if "ep" in self.unique_name:
+                    # EP needs its own EP-named communicator so use_all2all is
+                    # set and all2all_manager builds; it still reuses the
+                    # source's allreduce handles.
+                    from .device_communicators.communicator_cuda import (
+                        CudaCommunicator,
+                    )
+
+                    self.device_communicator = CudaCommunicator(
+                        cpu_group=self.cpu_group,
+                        device=self.device,
+                        device_group=self.device_group,
+                        unique_name=self.unique_name,
+                        reuse_from=src_dc,
+                    )
+                    # We own this object; destroying it only drops the shared
+                    # handle references.
+                    self._owns_device_communicator = True
+                else:
+                    # allreduce/allgather ignore unique_name, so share the
+                    # source's communicator wholesale; the source owns it.
+                    self.device_communicator = src_dc
+                    self._owns_device_communicator = False
+
+            # Reuse the source's shared-memory broadcaster; build one only if it
+            # lacks one and this group asked for it.
+            self.mq_broadcaster = reuse_from.mq_broadcaster
+            if (
+                use_message_queue_broadcaster
+                and self.world_size > 1
+                and self.mq_broadcaster is None
+            ):
+                from .shm_broadcast import MessageQueue
+
+                self.mq_broadcaster = MessageQueue.create_from_process_group(
+                    self.cpu_group, 1 << 22, 6
+                )
+            return
 
         self_device_group = None
         self_cpu_group = None
@@ -1484,13 +1541,20 @@ class GroupCoordinator:
             self.device_communicator.prepare_communication_buffer_for_model(model)
 
     def destroy(self):
+        # Groups built via reuse_from borrow their process groups and (non-EP)
+        # device_communicator; only the owner tears those down (destroying a
+        # shared ProcessGroup twice raises).
+        owns_pg = getattr(self, "_owns_process_groups", True)
+        owns_dc = getattr(self, "_owns_device_communicator", True)
         if hasattr(self, "device_group"):
-            torch.distributed.destroy_process_group(self.device_group)
+            if owns_pg:
+                torch.distributed.destroy_process_group(self.device_group)
             del self.device_group
         if hasattr(self, "cpu_group"):
-            torch.distributed.destroy_process_group(self.cpu_group)
+            if owns_pg:
+                torch.distributed.destroy_process_group(self.cpu_group)
             del self.cpu_group
-        if self.device_communicator is not None:
+        if self.device_communicator is not None and owns_dc:
             self.device_communicator.destroy()
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
@@ -1523,6 +1587,7 @@ def init_model_parallel_group(
     use_device_communicator: bool = True,
     use_message_queue_broadcaster: bool = False,
     group_name: str | None = None,
+    reuse_from: "GroupCoordinator | None" = None,
 ) -> GroupCoordinator:
     return GroupCoordinator(
         group_ranks=group_ranks,
@@ -1531,6 +1596,7 @@ def init_model_parallel_group(
         use_device_communicator=use_device_communicator,
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
+        reuse_from=reuse_from,
     )
 
 
@@ -1774,6 +1840,7 @@ def initialize_model_parallel(
     data_parallel_size: int = 1,
     prefill_context_model_parallel_size: int = 1,
     custom_group_config: dict[str, list] | None = None,
+    reuse_identical_rank_groups: bool = False,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -1784,6 +1851,12 @@ def initialize_model_parallel(
         pipeline_model_parallel_size: number of GPUs used for pipeline model
             parallelism.
         backend: name of torch distributed communication backend.
+        reuse_identical_rank_groups: when True, a later group whose rank set matches
+            an already-built group shares that group's process groups and
+            communicators instead of allocating a second set. Groups stay
+            distinct objects with correct unique_names (EP keeps an "ep"-named
+            device_communicator so all2all still initializes). The first builder
+            of a rank set owns it. Must be identical on every rank (asserted).
         custom_group_config: optional dict mapping group names to rank lists.
             Each value can be:
             - 1D List[int]: all ranks form a single group,
@@ -1843,21 +1916,49 @@ def initialize_model_parallel(
     # CudaCommunicator allocation for standard TP/PP/DP/EP groups.
     need_std_comm = custom_group_config is None
 
+    # reuse_identical_rank_groups is a collective decision: a per-rank mismatch would
+    # deadlock on new_group(). Assert unanimity to turn a silent hang into an error.
+    _flag = torch.tensor([1 if reuse_identical_rank_groups else 0], dtype=torch.int64)
+    torch.distributed.all_reduce(_flag, group=get_world_group().cpu_group)
+    _n_set = int(_flag.item())
+    assert _n_set == 0 or _n_set == world_size, (
+        f"reuse_identical_rank_groups disagrees across ranks ({_n_set}/{world_size} "
+        "set it True); it must be identical on every rank."
+    )
+
+    # Dedup helper: a group whose rank set matches an already-built one reuses it
+    # (reuse_from). The first builder is the source. Only multi-rank groups are
+    # tracked (single-rank groups hold no communicator). No-op when the flag is off.
+    _local_rank = get_world_group().local_rank
+    _built_by_ranks: dict[tuple[int, ...], GroupCoordinator] = {}
+
+    def _build_group(group_name, group_ranks, use_message_queue_broadcaster=False):
+        group_ranks = [x.tolist() for x in group_ranks]
+        my_ranks = next((r for r in group_ranks if rank in r), None)
+        key = tuple(sorted(my_ranks)) if my_ranks is not None else None
+        dedup = reuse_identical_rank_groups and need_std_comm and key is not None and len(
+            my_ranks
+        ) > 1
+        source = _built_by_ranks.get(key) if dedup else None
+        group = init_model_parallel_group(
+            group_ranks,
+            _local_rank,
+            backend,
+            use_device_communicator=need_std_comm,
+            use_message_queue_broadcaster=use_message_queue_broadcaster,
+            group_name=group_name,
+            reuse_from=source,
+        )
+        if dedup and source is None:
+            _built_by_ranks[key] = group
+        return group
+
     # Build the tensor model-parallel groups.
     global _TP
     assert _TP is None, "tensor model parallel group is already initialized"
     group_ranks = all_ranks.view(-1, tensor_model_parallel_size).unbind(0)
-    group_ranks = [x.tolist() for x in group_ranks]
-
     # message queue broadcaster is only used in tensor model parallel group
-    _TP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        use_device_communicator=need_std_comm,
-        use_message_queue_broadcaster=True,
-        group_name="tp",
-    )
+    _TP = _build_group("tp", group_ranks, use_message_queue_broadcaster=True)
 
     # Build the DCP model-parallel groups.
     global _DCP
@@ -1867,14 +1968,7 @@ def initialize_model_parallel(
     # change by DCP, it simply reuses the GPUs of TP group, and split one
     # TP group into tp_size//dcp_size DCP groups.
     group_ranks = all_ranks.reshape(-1, decode_context_model_parallel_size).unbind(0)
-    group_ranks = [x.tolist() for x in group_ranks]
-    _DCP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        use_device_communicator=need_std_comm,
-        group_name="dcp",
-    )
+    _DCP = _build_group("dcp", group_ranks)
 
     # Build the prefill context-parallel (PCP) groups.
     # PCP is an INDEPENDENT dimension (world = ... x pcp x tp), unlike the
@@ -1887,14 +1981,7 @@ def initialize_model_parallel(
         .reshape(-1, prefill_context_model_parallel_size)
         .unbind(0)
     )
-    group_ranks = [x.tolist() for x in group_ranks]
-    _PCP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        use_device_communicator=need_std_comm,
-        group_name="pcp",
-    )
+    _PCP = _build_group("pcp", group_ranks)
 
     # Build the pipeline model-parallel groups.
     global _PP
@@ -1902,26 +1989,12 @@ def initialize_model_parallel(
     group_ranks = (
         all_ranks.transpose(2, 4).reshape(-1, pipeline_model_parallel_size).unbind(0)
     )
-    group_ranks = [x.tolist() for x in group_ranks]
-    _PP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        use_device_communicator=need_std_comm,
-        group_name="pp",
-    )
+    _PP = _build_group("pp", group_ranks)
 
     global _DP
     assert _DP is None, "data parallel group is already initialized"
     group_ranks = all_ranks.transpose(1, 4).reshape(-1, data_parallel_size).unbind(0)
-    group_ranks = [x.tolist() for x in group_ranks]
-    _DP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        use_device_communicator=need_std_comm,
-        group_name="dp",
-    )
+    _DP = _build_group("dp", group_ranks)
 
     global _EP
     assert _EP is None, "expert parallel group is already initialized"
@@ -1935,14 +2008,7 @@ def initialize_model_parallel(
         )
         .unbind(0)
     )
-    group_ranks = [x.tolist() for x in group_ranks]
-    _EP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        use_device_communicator=need_std_comm,
-        group_name="ep",
-    )
+    _EP = _build_group("ep", group_ranks)
 
     # Build the custom allreduce group(s) (optional).
     assert not _CUSTOM, "custom allreduce group is already initialized"
@@ -2016,6 +2082,7 @@ def ensure_model_parallel_initialized(
     data_parallel_size: int = 1,
     prefill_context_model_parallel_size: int = 1,
     custom_group_config: dict[str, list] | None = None,
+    reuse_identical_rank_groups: bool = False,
 ) -> None:
     """Helper to initialize model parallel groups if they are not initialized,
     or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
@@ -2031,6 +2098,7 @@ def ensure_model_parallel_initialized(
             data_parallel_size,
             prefill_context_model_parallel_size=prefill_context_model_parallel_size,
             custom_group_config=custom_group_config,
+            reuse_identical_rank_groups=reuse_identical_rank_groups,
         )
         return
 

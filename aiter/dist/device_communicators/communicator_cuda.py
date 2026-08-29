@@ -34,6 +34,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         device: torch.device | None = None,
         device_group: ProcessGroup | None = None,
         unique_name: str = "",
+        reuse_from: "CudaCommunicator | None" = None,
     ):
         self._all2all_manager = None
         self._all2all_manager_created = False
@@ -43,6 +44,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         self.use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
         self.use_torch_symm_mem = False
+
+        if reuse_from is not None:
+            # Identical-rank group: share the source's allreduce communicators
+            # instead of allocating a second set over the same ranks. Keeps our
+            # own unique_name, so is_ep_communicator/use_all2all and the lazy
+            # all2all_manager are still computed for this group.
+            self.pynccl_comm = reuse_from.pynccl_comm
+            self.ca_comm = reuse_from.ca_comm
+            self.qr_comm = reuse_from.qr_comm
+            self.symm_mem_comm = reuse_from.symm_mem_comm
+            return
 
         # lazy import to avoid documentation build error
         from aiter.dist.device_communicators.custom_all_reduce import (
