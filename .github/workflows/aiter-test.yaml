@@ -358,6 +358,14 @@ jobs:
           compression-level: 0
           retention-days: 14
 
+      - name: Drop registry credentials
+        if: always()
+        run: |
+          # Self-hosted runners are persistent: drop the registry credentials
+          # written by the "Docker login" step so they do not outlive this job
+          # (SEC-00837 / ROCM-26712).
+          docker logout || true
+
   upload_s3_manifest:
     if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'schedule' }}
     needs: [build_aiter_wheels]
@@ -950,6 +958,10 @@ jobs:
         if: always()
         run: |
           docker rm -f aiter_test || true
+          # Self-hosted runners are persistent: drop the registry credentials
+          # written by the "Docker login" step so they do not outlive this job
+          # (SEC-00837 / ROCM-26712).
+          docker logout || true
 
   standard-test-finish:
     if: >-
@@ -1222,6 +1234,10 @@ jobs:
         if: always()
         run: |
           docker rm -f aiter_test || true
+          # Self-hosted runners are persistent: drop the registry credentials
+          # written by the "Docker login" step so they do not outlive this job
+          # (SEC-00837 / ROCM-26712).
+          docker logout || true
 
       - name: Clean up Rocm processes
         if: always()
