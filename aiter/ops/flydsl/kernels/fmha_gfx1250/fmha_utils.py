@@ -255,8 +255,6 @@ GEMM2_SCHEDULE: list[list[int]] = [
 ]
 
 
-
-
 WAVE_SIZE = 32
 NUM_WAVES = 4
 NUM_MSB = 4
@@ -355,10 +353,6 @@ def make_v2f32(lo, hi):
 def split_v2f32(pair):
     v = Vec(pair, dtype=Float32)
     return v[0].ir_value(), v[1].ir_value()
-
-
-def broadcast_f32_to_v2f32(val):
-    return make_v2f32(val, val)
 
 
 N_WMMA_K_TILES = (QK_HDIM // WMMA_K) // 2
@@ -536,9 +530,8 @@ class Softmax:
             )
 
         def op_broadcast_dup():
-            ss["cur_max_log2e_dup"][msb] = broadcast_f32_to_v2f32(
-                ss["cur_max_log2e_scalar"][msb]
-            )
+            _v = ss["cur_max_log2e_scalar"][msb]
+            ss["cur_max_log2e_dup"][msb] = make_v2f32(_v, _v)
 
         def op_exp_delta_dup():
             ss["exp_delta_dup"][msb] = Atom.mov_b32(ss["exp_delta"][msb])
@@ -753,7 +746,6 @@ class Softmax:
             ss["local_max"][3] = Atom.mov_b32(ss["local_max"][2])
 
         ops += [op_max01, op_max23, op_mov1, op_mov3]
-        msb_assign = [0, 2, 1, 3]
         for msb in [0, 2, 1, 3]:
 
             def op_fma_delta(b=msb):
@@ -764,9 +756,8 @@ class Softmax:
                 )
 
             ops.append(op_fma_delta)
-            msb_assign.append(msb)
         assert len(ops) == PART1_INSTS
-        return ops, msb_assign
+        return ops
 
     @staticmethod
     def build_all_gemm2_ops(
@@ -779,7 +770,7 @@ class Softmax:
             ops_by_rid[m] = Softmax.build_part0_ops(
                 ty, m, sp_pairs_all[m], softmax_state, sgpr_state
             )
-        ops_by_rid[4] = Softmax.build_part1_ops(ty, softmax_state, sgpr_state)[0]
+        ops_by_rid[4] = Softmax.build_part1_ops(ty, softmax_state, sgpr_state)
         sp_lo_cache = [[None] * N_SP_PAIRS for _ in range_constexpr(NUM_MSB)]
         sp_hi_cache = [[None] * N_SP_PAIRS for _ in range_constexpr(NUM_MSB)]
         for m in range_constexpr(NUM_MSB):
