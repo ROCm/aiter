@@ -172,7 +172,7 @@ def c_shuffle_epilog(
         _half_thr_idx = fx.Index(_half_threads).ir_value()
         _zero_idx = fx.Index(0).ir_value()
 
-        _is_group_b = (fx.Index(tx) >= fx.Index(_half_thr_idx)).ir_value()
+        _is_group_b = fx.Index(tx) >= fx.Index(_half_thr_idx)
 
         # -- write phase (all waves, each to its group's LDS buffer) --
         n_tile_base_v = n_tile_base
@@ -219,7 +219,7 @@ def c_shuffle_epilog(
         gpu.barrier()
 
         # -- read phase (each group reads from its own LDS buffer) --
-        tx_local = tx - fx.Boolean(_is_group_b).select(_half_thr_idx, _zero_idx)
+        tx_local = tx - _is_group_b.select(_half_thr_idx, _zero_idx)
         c_nlane_s = fx.Index(CShuffleNLane_s).ir_value()
         m_lane_s = tx_local // c_nlane_s
         n_lane_s = tx_local % c_nlane_s
@@ -265,7 +265,7 @@ def c_shuffle_epilog(
                     # Value-yielding if/else: kept as scf.IfOp because @flyc.jit
                     # cannot merge a result produced in both branches back to the
                     # caller. Selects the per-group LDS source buffer.
-                    _if_ld = scf.IfOp(_is_group_b, [vec_frag], has_else=True)
+                    _if_ld = scf.IfOp(_is_group_b.ir_value(), [vec_frag], has_else=True)
                     with ir.InsertionPoint(_if_ld.then_block):
                         fb = Vec.load(vec_frag, lds_out_split, [lds_idx]).ir_value()
                         scf.YieldOp([fb])
@@ -274,7 +274,7 @@ def c_shuffle_epilog(
                         scf.YieldOp([fa])
                     frag = _if_ld.results[0]
 
-                    col_pair0 = col_pair0_local + fx.Boolean(_is_group_b).select(
+                    col_pair0 = col_pair0_local + _is_group_b.select(
                         _half_n_idx, _zero_idx
                     )
                     store_pair(

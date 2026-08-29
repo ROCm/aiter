@@ -297,7 +297,7 @@ def build_flash_attn_func_module_primary(
                 pairs.append(
                     _pack_bf16_pair(f32_vals[j * 2], f32_vals[j * 2 + 1], _c16, _cmask)
                 )
-            return Vec.from_elements(pairs, fx.Int32).bitcast(elem_dtype).ir_value()
+            return Vec.from_elements(pairs, fx.Int32).bitcast(elem_dtype)
 
         def k_buf_base(buf_id):
             if const_expr(isinstance(buf_id, int)):
@@ -362,7 +362,7 @@ def build_flash_attn_func_module_primary(
         # variants are semantically equivalent for non-negative offsets.
         q_in_bounds = arith.cmpi(arith.CmpIPredicate.slt, _raw(q_row), _raw(seq_len_v))
         q_row_safe = fx.Int64(q_in_bounds.select(q_row, fx.Index(0)))
-        c_zero_v8f16 = Vec.filled(8, 0.0, elem_dtype).ir_value()
+        c_zero_v8f16 = Vec.filled(8, 0.0, elem_dtype)
         q_b_packs = []
         for ks in range_constexpr(K_STEPS_QK):
             q_col = fx.Index(ks * K_STEP_QK) + klane * WMMA_LANE_K
@@ -544,7 +544,7 @@ def build_flash_attn_func_module_primary(
             # ---- Opt2: rocdl.exp2 ----
             diff_m_raw = _fsub(m_running, m_new_raw)
             diff_m_scaled = _fmul(diff_m_raw, c_sm_scale_log2e)
-            corr = rocdl.exp2(ir.F32Type.get(), _raw(diff_m_scaled))
+            corr = fx.rocdl.exp2(ir.F32Type.get(), _raw(diff_m_scaled))
 
             scaled_max = _fmul(c_sm_scale_log2e, m_new_raw)
             neg_scaled_max = _fsub(c_zero_f, scaled_max)
@@ -553,7 +553,7 @@ def build_flash_attn_func_module_primary(
             local_sum = _raw(c_zero_f)
             for r in range_constexpr(NUM_S_VALS):
                 diff = fmath.fma(s_raw[r], _raw(c_sm_scale_log2e), neg_scaled_max)
-                p = rocdl.exp2(ir.F32Type.get(), _raw(diff))
+                p = fx.rocdl.exp2(ir.F32Type.get(), _raw(diff))
                 p_vals.append(p)
                 local_sum = _fadd(local_sum, p)
 
@@ -562,7 +562,7 @@ def build_flash_attn_func_module_primary(
             l_corr = _fmul(corr, l_running)
             l_new = _fadd(l_corr, tile_sum)
 
-            corr_vec = Vec.from_elements([corr], fx.Float32).broadcast_to(8).ir_value()
+            corr_vec = Vec.from_elements([corr], fx.Float32).broadcast_to(8)
             for dc in range_constexpr(D_CHUNKS):
                 o_accs[dc] = _fmul(o_accs[dc], corr_vec)
 
@@ -585,9 +585,7 @@ def build_flash_attn_func_module_primary(
                         elem_list = []
                         for j in range_constexpr(8):
                             elem_list.append(fx.Float32(p_slice[j]).to(elem_dtype))
-                        p_packs_st.append(
-                            Vec.from_elements(elem_list, elem_dtype).ir_value()
-                        )
+                        p_packs_st.append(Vec.from_elements(elem_list, elem_dtype))
                 p_packs_all.append(p_packs_st)
 
             # ==== GEMM2: O += V^T @ P (software pipelined, row-major V) ====
@@ -605,7 +603,7 @@ def build_flash_attn_func_module_primary(
                     )
                     v_lds_idx = v_base + kv_row * V_STRIDE + d_pos
                     v_elems.append(fx.ptr_load(lds_kv + fx.Int32(v_lds_idx)))
-                return Vec.from_elements(v_elems, elem_dtype).ir_value()
+                return Vec.from_elements(v_elems, elem_dtype)
 
             # Software pipeline: preload first V pack
             cur_v_packs = []
@@ -654,12 +652,12 @@ def build_flash_attn_func_module_primary(
         o_finals = [loop_results[2 + dc] for dc in range_constexpr(D_CHUNKS)]
 
         inv_l = arith.divf(_raw(c_one_f), _raw(l_final), fastmath=fm_fast)
-        inv_l_vec = Vec.from_elements([inv_l], fx.Float32).broadcast_to(8).ir_value()
+        inv_l_vec = Vec.from_elements([inv_l], fx.Float32).broadcast_to(8)
 
         if q_in_bounds:
             for dc in range_constexpr(D_CHUNKS):
                 o_norm_vec = _fmul(o_finals[dc], inv_l_vec)
-                o_trunc = Vec(o_norm_vec).to(elem_dtype).ir_value()
+                o_trunc = Vec(o_norm_vec).to(elem_dtype)
                 d_col = fx.Index(dc * D_CHUNK) + klane * 8
                 o_global = global_idx(q_row, d_col)
                 _store_global_half(o_ptr, o_global, o_trunc)

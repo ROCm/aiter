@@ -81,7 +81,7 @@ from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
 from flydsl.expr.typing import Int32, Stream, T
 
-from aiter.ops.flydsl.kernels import buffer_ops, vector
+from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.utility.mx_types import (
     MxDtypeInt as _MxDtypeInt,
 )
@@ -316,9 +316,9 @@ def _build_kernel(
         # --- constants ---
         c_neg_inf = arith.constant(_NEG_INF, type=f32)
         c_zero_f32 = arith.constant(0.0, type=f32)
-        c_eps = arith.constant(rms_eps, type=f32)
-        c_inv_D = arith.constant(1.0 / D, type=f32)
-        c_log2e = arith.constant(_LOG2E, type=f32)
+        c_eps = fx.Float32(rms_eps)
+        c_inv_D = fx.Float32(1.0 / D)
+        c_log2e = fx.Float32(_LOG2E)
 
         def fexp_f32(x):
             """exp(x) via exp2(x * log2e). Single v_exp_f32 on AMD."""
@@ -458,11 +458,7 @@ def _build_kernel(
                 vec_bf16 = fx.Vector(raw).bitcast(fx.BFloat16)
                 out = []
                 for i in range_constexpr(VEC):
-                    bf16_v = vector.extract(
-                        vec_bf16, static_position=[i], dynamic_position=[]
-                    )
-                    f32_v = arith.extf(f32, bf16_v)
-                    out.append(f32_v)
+                    out.append(_to_raw(fx.Vector(vec_bf16)[i].to(fx.Float32)))
                 return out
 
             def _load_f32_vec(rsrc, off_elems_i32):
@@ -475,10 +471,7 @@ def _build_kernel(
                     raw = buffer_ops.buffer_load(
                         rsrc, off_elems_i32, vec_width=vw, dtype=f32
                     )
-                    return [
-                        vector.extract(raw, static_position=[i], dynamic_position=[])
-                        for i in range(VEC)
-                    ]
+                    return [_to_raw(fx.Vector(raw)[i]) for i in range(VEC)]
                 else:
                     # VEC == 8 -> 2x dwordx4
                     assert VEC == 8
@@ -494,13 +487,9 @@ def _build_kernel(
                     )
                     out = []
                     for i in range_constexpr(half):
-                        out.append(
-                            vector.extract(r0, static_position=[i], dynamic_position=[])
-                        )
+                        out.append(_to_raw(fx.Vector(r0)[i]))
                     for i in range_constexpr(half):
-                        out.append(
-                            vector.extract(r1, static_position=[i], dynamic_position=[])
-                        )
+                        out.append(_to_raw(fx.Vector(r1)[i]))
                     return out
 
             # Buffer resources reused across K iters.
@@ -778,8 +767,8 @@ def _build_kernel(
                 cl = fx.Float32(comp_lane[i])
                 sq_local = sq_local + cl * cl
             sq_full = wave_reduce_add(sq_local)
-            var = sq_full * fx.Float32(c_inv_D)
-            rrms = fmath.rsqrt((var + fx.Float32(c_eps)).ir_value(), fastmath=fm_fast)
+            var = sq_full * c_inv_D
+            rrms = fmath.rsqrt((var + c_eps).ir_value(), fastmath=fm_fast)
 
             # rms_weight: per-channel; this thread loads VEC values at tid*VEC.
             # Production atom passes bf16 (the param is cast at model load);
@@ -847,8 +836,8 @@ def _build_kernel(
                     vec_width=1,
                     dtype=T.bf16,
                 )
-                cos_vals = [arith.extf(f32, cos_b)]
-                sin_vals = [arith.extf(f32, sin_b)]
+                cos_vals = [_to_raw(fx.BFloat16(cos_b).to(fx.Float32))]
+                sin_vals = [_to_raw(fx.BFloat16(sin_b).to(fx.Float32))]
             else:
                 cos_vec = buffer_ops.buffer_load(
                     cos_rsrc,
@@ -863,21 +852,11 @@ def _build_kernel(
                     dtype=T.bf16,
                 )
                 cos_vals = [
-                    arith.extf(
-                        f32,
-                        vector.extract(
-                            cos_vec, static_position=[i], dynamic_position=[]
-                        ),
-                    )
+                    _to_raw(fx.Vector(cos_vec)[i].to(fx.Float32))
                     for i in range(PAIRS_PER_THREAD)
                 ]
                 sin_vals = [
-                    arith.extf(
-                        f32,
-                        vector.extract(
-                            sin_vec, static_position=[i], dynamic_position=[]
-                        ),
-                    )
+                    _to_raw(fx.Vector(sin_vec)[i].to(fx.Float32))
                     for i in range(PAIRS_PER_THREAD)
                 ]
 
@@ -1296,7 +1275,7 @@ def _build_kernel(
                                 D // 2, type=i32
                             ) + ArithValue(packed_idx)
                         buffer_ops.buffer_store(
-                            arith.trunci(T.i8, _to_raw(byte_val)),
+                            fx.Int32(byte_val).to(fx.Int8),
                             out_rsrc,
                             _to_raw(byte_off),
                             offset_is_bytes=True,
@@ -1345,7 +1324,7 @@ def _build_kernel(
                                 D // _FP4_GROUP_SIZE, type=i32
                             ) + ArithValue(scale_group_idx)
                         buffer_ops.buffer_store(
-                            arith.trunci(T.i8, _to_raw(e8m0)),
+                            fx.Int32(e8m0).to(fx.Int8),
                             cs_rsrc,
                             _to_raw(cs_off),
                         )  # e8m0 uint8
@@ -1609,9 +1588,9 @@ def _build_kernel_ksplit(
         c_zero_f32 = arith.constant(0.0, type=f32)
         c_zero_i32 = arith.constant(0, type=i32)
         c_64 = arith.constant(BLOCK_THREADS, type=i32)
-        c_eps = arith.constant(rms_eps, type=f32)
-        c_inv_D = arith.constant(1.0 / D, type=f32)
-        c_log2e = arith.constant(_LOG2E, type=f32)
+        c_eps = fx.Float32(rms_eps)
+        c_inv_D = fx.Float32(1.0 / D)
+        c_log2e = fx.Float32(_LOG2E)
         c_K_m1 = arith.constant(K - 1, type=i32)
         c_K_per_wave = arith.constant(K_PER_WAVE, type=i32)
         c_state_size = arith.constant(state_size, type=i32)
@@ -1673,10 +1652,7 @@ def _build_kernel_ksplit(
                     raw = buffer_ops.buffer_load(
                         rsrc, off_elems_i32, vec_width=VEC, dtype=f32
                     )
-                    return [
-                        vector.extract(raw, static_position=[i], dynamic_position=[])
-                        for i in range(VEC)
-                    ]
+                    return [_to_raw(fx.Vector(raw)[i]) for i in range(VEC)]
                 else:
                     assert VEC == 8
                     half = VEC // 2
@@ -1691,13 +1667,9 @@ def _build_kernel_ksplit(
                     )
                     out = []
                     for i in range_constexpr(half):
-                        out.append(
-                            vector.extract(r0, static_position=[i], dynamic_position=[])
-                        )
+                        out.append(_to_raw(fx.Vector(r0)[i]))
                     for i in range_constexpr(half):
-                        out.append(
-                            vector.extract(r1, static_position=[i], dynamic_position=[])
-                        )
+                        out.append(_to_raw(fx.Vector(r1)[i]))
                     return out
 
             def _load_bf16_vec_then_f32(rsrc, off_elems_i32):
@@ -1713,10 +1685,7 @@ def _build_kernel_ksplit(
                 vec_bf16 = fx.Vector(raw).bitcast(fx.BFloat16)
                 out = []
                 for i in range_constexpr(VEC):
-                    bf16_v = vector.extract(
-                        vec_bf16, static_position=[i], dynamic_position=[]
-                    )
-                    out.append(arith.extf(f32, bf16_v))
+                    out.append(_to_raw(fx.Vector(vec_bf16)[i].to(fx.Float32)))
                 return out
 
             def _softmax_step(m_lane, kv_lane, w_lane, score_lane, kv_v_lane):
@@ -1888,10 +1857,8 @@ def _build_kernel_ksplit(
                     cl = fx.Float32(comp_lane[i])
                     sq_local = sq_local + cl * cl
                 sq_full = wave_reduce_add(sq_local)
-                var = sq_full * fx.Float32(c_inv_D)
-                rrms = fmath.rsqrt(
-                    (var + fx.Float32(c_eps)).ir_value(), fastmath=fm_fast
-                )
+                var = sq_full * c_inv_D
+                rrms = fmath.rsqrt((var + c_eps).ir_value(), fastmath=fm_fast)
 
                 rmsw_rsrc = buffer_ops.create_buffer_resource(rms_weight, max_size=True)
                 if const_expr(rms_weight_is_bf16):
@@ -1933,8 +1900,8 @@ def _build_kernel_ksplit(
                     sin_b = buffer_ops.buffer_load(
                         sin_rsrc, cos_row_base + cs_lo, vec_width=1, dtype=T.bf16
                     )
-                    cos_vals = [arith.extf(f32, cos_b)]
-                    sin_vals = [arith.extf(f32, sin_b)]
+                    cos_vals = [_to_raw(fx.BFloat16(cos_b).to(fx.Float32))]
+                    sin_vals = [_to_raw(fx.BFloat16(sin_b).to(fx.Float32))]
                 else:
                     cos_vec = buffer_ops.buffer_load(
                         cos_rsrc,
@@ -1949,21 +1916,11 @@ def _build_kernel_ksplit(
                         dtype=T.bf16,
                     )
                     cos_vals = [
-                        arith.extf(
-                            f32,
-                            vector.extract(
-                                cos_vec, static_position=[i], dynamic_position=[]
-                            ),
-                        )
+                        _to_raw(fx.Vector(cos_vec)[i].to(fx.Float32))
                         for i in range(PAIRS_PER_THREAD)
                     ]
                     sin_vals = [
-                        arith.extf(
-                            f32,
-                            vector.extract(
-                                sin_vec, static_position=[i], dynamic_position=[]
-                            ),
-                        )
+                        _to_raw(fx.Vector(sin_vec)[i].to(fx.Float32))
                         for i in range(PAIRS_PER_THREAD)
                     ]
 
@@ -2321,7 +2278,7 @@ def _build_kernel_ksplit(
                                 D // 2, type=i32
                             ) + ArithValue(packed_idx)
                         buffer_ops.buffer_store(
-                            arith.trunci(T.i8, _to_raw(byte_val)),
+                            fx.Int32(byte_val).to(fx.Int8),
                             out_rsrc,
                             _to_raw(byte_off),
                             offset_is_bytes=True,
@@ -2367,7 +2324,7 @@ def _build_kernel_ksplit(
                                 D // _FP4_GROUP_SIZE, type=i32
                             ) + ArithValue(scale_group_idx)
                         buffer_ops.buffer_store(
-                            arith.trunci(T.i8, _to_raw(e8m0)),
+                            fx.Int32(e8m0).to(fx.Int8),
                             cs_rsrc,
                             _to_raw(cs_off),
                         )  # e8m0 uint8

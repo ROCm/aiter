@@ -181,14 +181,13 @@ def _scalar_store(base_i64, idx, val, fx_dt, copy_bits):
     buf = _scalar_view(base_i64, fx_dt)
     atom = fx.make_copy_atom(fx.rocdl.BufferCopy(copy_bits), fx_dt)
     r = fx.make_rmem_tensor(fx.make_layout(1, 1), fx_dt)
-    fx.memref_store_vec(fx.Vector.from_elements([val.ir_value()], dtype=fx_dt), r)
+    fx.memref_store_vec(fx.Vector.from_elements([val], dtype=fx_dt), r)
     fx.copy(atom, r, fx.slice(buf, (idx, None)))
 
 
 def _store_bf16_tiled(vals_list, p_dst, copy, vec):
     """Convert VEC fp32 → bf16 and tiled-copy to ``p_dst``."""
-    raw = [v.ir_value() if hasattr(v, "ir_value") else v for v in vals_list]
-    f32v = fx.Vector.from_elements(raw, dtype=fx.Float32)
+    f32v = fx.Vector.from_elements(vals_list, dtype=fx.Float32)
     bf16v = f32v.truncf(T.vec(vec, T.bf16))
     frag = fx.make_fragment_like(p_dst)
     fx.memref_store_vec(bf16v, frag)
@@ -533,8 +532,7 @@ def _build_kernel_w64(
                     scaled.append(xi * rstd)
 
             out_rmem = fx.make_rmem_tensor(full_lay, fx.Float32)
-            scaled_raw = [s.ir_value() for s in scaled]
-            scaled_vec = fx.Vector.from_elements(scaled_raw, dtype=fx.Float32)
+            scaled_vec = fx.Vector.from_elements(scaled, dtype=fx.Float32)
             fx.memref_store_vec(scaled_vec, out_rmem)
 
             is_rope = tid >= fx.Int32(ROPE_THREAD_LO)
@@ -552,8 +550,8 @@ def _build_kernel_w64(
                     o = cur[2 * k + 1]
                     c = cos_f32[k]
                     s = sin_f32[k]
-                    rope_elems.append((e * c - o * s).ir_value())
-                    rope_elems.append((e * s + o * c).ir_value())
+                    rope_elems.append(e * c - o * s)
+                    rope_elems.append(e * s + o * c)
                 rotated_vec = fx.Vector.from_elements(rope_elems, dtype=fx.Float32)
                 fx.memref_store_vec(rotated_vec, out_rmem)
 
