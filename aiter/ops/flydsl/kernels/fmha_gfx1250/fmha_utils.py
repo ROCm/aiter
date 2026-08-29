@@ -303,6 +303,11 @@ CNT_SU = WV_SUBKV // SU_K_N
 
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 32
 
+LOG2_E = 1.4426950408889634
+LN_2 = 0.6931471805599453
+PERM_SEL_LO = 0x76543210
+PERM_SEL_HI = 0xFEDCBA98
+
 VPS_Q = TG_SUBQD * QK_HDIM * Q_BPP // 128
 VPS_MSB_Q = VPS_Q // NUM_MSB
 VTS_MSB_Q = VPS_MSB_Q
@@ -569,8 +574,8 @@ def make_softmax_state(old_max, local_max, delta, row_sums, sp_pairs_prev=None):
         "delta": list(delta),
         "exp_delta": _none_list(),
         "cur_max_log2e": _none_list(),
-        "cur_max_log2e_1": _none_list(),
         "cur_max_log2e_scalar": _none_list(),
+        "cur_max_log2e_1": _none_list(),
         "cur_max_log2e_dup": _none_list(),
         "vgpr_log2e_scl_pair": _none_list(),
         "exp_delta_dup": _none_list(),
@@ -818,8 +823,8 @@ class Softmax:
         def op_perm(b=bank):
             tmps[1] = Atom.permlanex16(
                 tmps_perm[0],
-                arith.constant(0x76543210, type=T.i32),
-                arith.constant(0xFEDCBA98, type=T.i32),
+                arith.constant(PERM_SEL_LO, type=T.i32),
+                arith.constant(PERM_SEL_HI, type=T.i32),
                 (b + 2) % NUM_MSB,
             )
 
@@ -1742,6 +1747,15 @@ def pv_gemm_pure(ty, blk, su, v_tiles, p_tiles_su, o_tiles):
     return o_tiles
 
 
+def _make_empty_tdm_state():
+    return {
+        "v_g0": fx.constant_vector(0, T.vec(4, T.i32)),
+        "v_g1": fx.constant_vector(0, T.vec(8, T.i32)),
+        "k_g0": fx.constant_vector(0, T.vec(4, T.i32)),
+        "k_g1": fx.constant_vector(0, T.vec(8, T.i32)),
+    }
+
+
 class TDM:
     @staticmethod
     def build_descs(dg1, addr_i64, stride_adv_i64, lds_base, su_p_size, n_su):
@@ -2214,14 +2228,7 @@ def epilogue_endtile(
             for m in fx.range_constexpr(NUM_MSB)
         ],
     )
-    et_tdm = {
-        "v_g0": fx.constant_vector(0, T.vec(4, T.i32)),
-        "v_g1": fx.constant_vector(0, T.vec(8, T.i32)),
-        "k_g0": fx.constant_vector(0, T.vec(4, T.i32)),
-        "k_g1": fx.constant_vector(0, T.vec(8, T.i32)),
-        "v_salu_queue": [],
-        "k_salu_queue": [],
-    }
+    et_tdm = _make_empty_tdm_state()
     et_o = [[ep["o_tiles"][d][n] for n in range(N_PV_WMMA_N)] for d in range(NUM_MSB)]
     et_causal_ns = (
         (fx.Int32(num_tiles_idx) - 1) * TILE_N - causal_offset
@@ -2236,7 +2243,6 @@ def epilogue_endtile(
     _, _, et_o, _, et_psp_lo, et_psp_hi, et_ped = fmha_pipeline_ctx(
         ctx,
         ty,
-        False,
         q_frags,
         ep["kv_tiles"],
         et_sp_t,
@@ -2278,39 +2284,11 @@ def epilogue_endtile(
     )
 
 
-def apply_causal_mask(ctx, su_sp_tiles, n_start_fx):
-    lane_id = ctx["lane_id"]
-    wave_id = ctx["wave_id"]
-    m_start = ctx["m_start"]
-    lane_lo = lane_id & 15
-    lane_hi_x8 = (lane_id >> 4) * 8
-    wave_x32 = wave_id * 32
-    base = (m_start - n_start_fx) + wave_x32 + (lane_lo - lane_hi_x8)
-    neg_inf_c = fx.Float32(float("-inf"))
-    for su in fx.range_constexpr(CNT_SU):
-        for msb in fx.range_constexpr(NUM_MSB):
-            off = (msb // 2) * 16 - su * 32 - (msb % 2) * 16
-            bnd_fx = base + off
-            v8w = Vec(su_sp_tiles[su][msb][0], dtype=fx.Float32)
-            masked_elems = []
-            for e in fx.range_constexpr(8):
-                cmp_fx = bnd_fx < e
-                elem_fx = v8w[e]
-                mval_fx = cmp_fx.select(neg_inf_c, elem_fx)
-                masked_elems.append(mval_fx)
-            su_sp_tiles[su][msb][0] = Vec.from_elements(masked_elems, fx.Float32)
-
-
-def apply_kv_oob_mask(ctx, su_sp_tiles, kv_remain_raw):
-    lane_id = ctx["lane_id"]
-    lane_hi = lane_id >> 4
-    lane_hi_x8 = lane_hi * 8
-    base = (kv_remain_raw - 1) - lane_hi_x8
+def _mask_sp_tiles(su_sp_tiles, bound_fn):
     neg_inf = fx.Float32(float("-inf"))
     for su in fx.range_constexpr(CNT_SU):
         for msb in fx.range_constexpr(NUM_MSB):
-            col_base_val = su * 32 + (msb % 2) * 16
-            bnd = base - col_base_val
+            bnd = bound_fn(su, msb)
             v8w = Vec(su_sp_tiles[su][msb][0], dtype=fx.Float32)
             masked_elems = []
             for e in fx.range_constexpr(8):
@@ -2319,6 +2297,24 @@ def apply_kv_oob_mask(ctx, su_sp_tiles, kv_remain_raw):
                 mval = cmp.select(neg_inf, elem)
                 masked_elems.append(mval)
             su_sp_tiles[su][msb][0] = Vec.from_elements(masked_elems, fx.Float32)
+
+
+def apply_causal_mask(ctx, su_sp_tiles, n_start_fx):
+    lane_id = ctx["lane_id"]
+    wave_id = ctx["wave_id"]
+    m_start = ctx["m_start"]
+    lane_lo = lane_id & 15
+    lane_hi_x8 = (lane_id >> 4) * 8
+    wave_x32 = wave_id * 32
+    base = (m_start - n_start_fx) + wave_x32 + (lane_lo - lane_hi_x8)
+    _mask_sp_tiles(su_sp_tiles, lambda su, msb: base + (msb // 2) * 16 - su * 32 - (msb % 2) * 16)
+
+
+def apply_kv_oob_mask(ctx, su_sp_tiles, kv_remain_raw):
+    lane_id = ctx["lane_id"]
+    lane_hi_x8 = (lane_id >> 4) * 8
+    base = (kv_remain_raw - 1) - lane_hi_x8
+    _mask_sp_tiles(su_sp_tiles, lambda su, msb: base - su * 32 - (msb % 2) * 16)
 
 
 def _setup_tdm_descs(
@@ -2351,7 +2347,6 @@ def _setup_tdm_descs(
 def fmha_pipeline_ctx(
     ctx,
     ty,
-    memload,
     q_tiles,
     kv_tiles,
     sp_tiles,
@@ -2662,14 +2657,7 @@ def tile_iteration(ctx, tile_idx, iter_args, causal_n_start=None):
         ia_row_sums,
         sp_pairs_prev=ia_partial_sp_pairs,
     )
-    tdm_state = {
-        "v_g0": fx.constant_vector(0, T.vec(4, T.i32)),
-        "v_g1": fx.constant_vector(0, T.vec(8, T.i32)),
-        "k_g0": fx.constant_vector(0, T.vec(4, T.i32)),
-        "k_g1": fx.constant_vector(0, T.vec(8, T.i32)),
-        "v_salu_queue": [],
-        "k_salu_queue": [],
-    }
+    tdm_state = _make_empty_tdm_state()
     tile_idx_i32 = arith.index_cast(T.i32, tile_idx)
     cur_v_offset = v_offset + tile_idx_i32 * (tile_n_const * stride_v_seq)
     next_tile = tile_idx_i32 + 1
@@ -2704,7 +2692,6 @@ def tile_iteration(ctx, tile_idx, iter_args, causal_n_start=None):
     ) = fmha_pipeline_ctx(
         ctx,
         ty,
-        False,
         q_frags,
         kv_tiles,
         sp_tiles,
@@ -2811,15 +2798,15 @@ def _ep_finish(
     v8bf16 = T.vec(8, T.bf16)
     rsf = list(sfx["row_sums"])
     lmf = list(sfx["local_max"])
-    slo = arith.constant(0x76543210, type=T.i32)
-    shi = arith.constant(0xFEDCBA98, type=T.i32)
+    slo = arith.constant(PERM_SEL_LO, type=T.i32)
+    shi = arith.constant(PERM_SEL_HI, type=T.i32)
     for mb in fx.range_constexpr(0, NUM_MSB, 2):
         sm = rsf[mb] + rsf[mb + 1]
         pm = rocdl_permlanex16(ty["f32"], sm, sm, slo, shi, False, False)
         sf = sm + pm
         rsf[mb] = sf
         rsf[mb + 1] = sf
-    l2e = 0.6931471805599453
+    l2e = LN_2
     lse_vals = [None] * NUM_MSB
     for msb in fx.range_constexpr(NUM_MSB):
         lse_vals[msb] = rocdl.log(ty["f32"], rsf[msb]) * l2e + lmf[msb] * scalar_f

@@ -135,7 +135,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             kv_lds_addrs_a = build_kv_lds_addrs(lane_id, k_a, v_a)
             kv_lds_addrs_b = build_kv_lds_addrs(lane_id, k_b, v_b)
             stride_k_32, stride_v_32 = stride_k_seq * 32, stride_v_seq * 32
-            scale = arith.constant(1.4426950408889634, type=T.f32) * scalar_f
+            scale = arith.constant(LOG2_E, type=T.f32) * scalar_f
             sgpr_state = {
                 "s_log2e_scl": scale,
                 "s_log2e_scl_pair": vector.broadcast(T.vec(2, T.f32), scale),
