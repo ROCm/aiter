@@ -455,6 +455,7 @@ def _build_launcher(
     max_model_len: int,
     arch: str,
     cu_count: int | None = None,
+    ordered: bool = False,
 ):
     """Build (and lru-cache) the launcher + workspace metadata for this shape.
 
@@ -467,7 +468,7 @@ def _build_launcher(
     its compile target on first use. Without it, an AOT process compiling several
     archs hands the first arch's launcher to the rest and their kernels never
     reach the cache. cu_count keys the same way one step finer, because one arch
-    spans SKUs whose bits_per_pass differs.
+    spans SKUs whose bits_per_pass differs. ``ordered`` selects a different kernel.
     """
     kernel_config = _kernel_config(num_rows, max_model_len, arch, cu_count)
 
@@ -484,6 +485,7 @@ def _build_launcher(
     )
     launcher = create_topk_per_row_decode_tiered_kernel(
         top_k=top_k,
+        ordered=ordered,
         **kernel_config,
     )
     return launcher, workspace_slots, workspace_zero
@@ -540,11 +542,6 @@ def _validate_inputs(
         raise ValueError(f"numRows={numRows} exceeds indices rows={indices.shape[0]}")
     if k <= 0:
         raise ValueError(f"k must be positive, got {k}")
-    if ordered:
-        raise ValueError(
-            "FlyDSL decode TopK returns unordered set output only; "
-            "ordered=True is not supported"
-        )
     if indices.shape[1] < k:
         raise ValueError(f"indices second dimension must be at least k={k}")
     if indices.stride() != (k, 1):
@@ -604,6 +601,11 @@ def flydsl_top_k_per_row_decode(
     ordered: bool = False,
     workspace: torch.Tensor | None = None,
 ) -> None:
+    """Write each row's top-k column indices into ``indices``.
+
+    ``ordered=False``: unordered set. ``ordered=True``: ascending, smallest-index
+    tie-break on the kth value.
+    """
     if numRows == 0:
         return
 
@@ -627,6 +629,7 @@ def flydsl_top_k_per_row_decode(
         logits.shape[1],
         arch,
         decode_cu_count(logits.device, arch),
+        ordered,
     )
 
     if workspace is None:

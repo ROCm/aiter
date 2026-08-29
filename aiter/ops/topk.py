@@ -68,9 +68,9 @@ def topk_gating(
         correction_bias: optional bias tensor, pass None for no bias. Must be
             float32, or bfloat16 when gating_output is not float16.
     """
-    assert (
-        score_func in _VALID_SCORE_FUNCS
-    ), f"Unknown score_func '{score_func}', expected one of {_VALID_SCORE_FUNCS}"
+    assert score_func in _VALID_SCORE_FUNCS, (
+        f"Unknown score_func '{score_func}', expected one of {_VALID_SCORE_FUNCS}"
+    )
     if correction_bias is None:
         correction_bias = torch.empty(
             0, dtype=torch.float32, device=gating_output.device
@@ -481,6 +481,7 @@ _TRUTHY_ENV = ("1", "true", "True", "yes", "YES")
 # Every threshold is read off graph replay rather than eager, and sits below the
 # measured sign change rather than on it. The SILOTIGER-699 gate investigation
 # holds the per-cell numbers and the reasoning behind every one.
+# stable=True uses the same bands; FlyDSL's ordered margin is wider than HIP's.
 class _DecodeGate(NamedTuple):
     # (min padded width, max rows) bands, widest first. A call is capped by the
     # first band whose width it reaches, and one that reaches none is refused.
@@ -733,14 +734,9 @@ def top_k_per_row_decode(
 
     Takes the FlyDSL tiered kernel on the archs and shapes where it beats HIP and
     the HIP one-block kernel everywhere else; see _should_use_flydsl_decode for
-    the gates and AITER_DISABLE_FLYDSL_TOPK_DECODE to force HIP. Both kernels
-    return the indices as an unordered set.
-
-    stable=True asks for the deterministic ascending-ordered, smallest-index
-    tie-break emit so every TP rank selects and orders an identical KV set. Only
-    the HIP kernel emits that order -- FlyDSL returns an unordered set and
-    rejects ordered output outright -- so stable disqualifies the FlyDSL path
-    rather than silently handing back an unordered answer.
+    the gates and AITER_DISABLE_FLYDSL_TOPK_DECODE to force HIP. ``stable=False``
+    returns an unordered set; ``stable=True`` returns ascending indices with
+    smallest-index tie-breaking on the kth value. FlyDSL forwards ``ordered=stable``.
 
     ``workspace`` lets a caller that already owns a buffer (a serving framework
     reserving device memory up front, say) hand it over instead of paying an
@@ -791,9 +787,7 @@ def top_k_per_row_decode(
         logits = logits.contiguous()
         stride0, stride1 = logits.stride()
 
-    if not stable and _should_use_flydsl_decode(
-        logits, next_n, numRows, stride0, stride1, k
-    ):
+    if _should_use_flydsl_decode(logits, next_n, numRows, stride0, stride1, k):
         if _FLYDSL_TOPK_COUNT:
             topk_decode_dispatch_counts["flydsl"] += 1
         from .flydsl.topk_per_row_decode import flydsl_top_k_per_row_decode
@@ -811,7 +805,7 @@ def top_k_per_row_decode(
             stride0,
             stride1,
             k,
-            ordered=False,
+            ordered=stable,
             workspace=workspace,
         )
 

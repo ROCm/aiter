@@ -74,14 +74,19 @@ LOAD_VEC = 4
 LOAD_VEC_LOG2 = LOAD_VEC.bit_length() - 1
 # Default histogram-scan staging (one of 1/2/4/8)
 SCAN_STAGES = 2
+# Load staging width for ordered emit (matches unordered last-pass unroll).
+ORDERED_STAGES = 4
 
 # 128B-spaced inter-workgroup counter groups (32 int32 == 128B each), kept in the int32 workspace.
 COUNTER_STRIDE = 32
-COUNTER_SLOTS = 6 * COUNTER_STRIDE
+COUNTER_SLOTS = 8 * COUNTER_STRIDE
 COUNTER_ARRIVALS = 2 * COUNTER_STRIDE
 COUNTER_OUT_FRONT = 3 * COUNTER_STRIDE
 COUNTER_OUT_BACK = 4 * COUNTER_STRIDE
 COUNTER_PASS_DONE = 5 * COUNTER_STRIDE
+# Per-workgroup selected/tied counts for ordered emit (reserved for both modes).
+COUNTER_ORDERED_ABOVE = 6 * COUNTER_STRIDE
+COUNTER_ORDERED_EQUAL = 7 * COUNTER_STRIDE
 
 SMEM_META_K = 0
 SMEM_META_LEN = 1
@@ -147,9 +152,11 @@ def create_topk_per_row_decode_tiered_kernel(
     mask_non_finite: bool = False,
     row_proportional_parts: bool = False,
     early_stop: bool = False,
+    ordered: bool = False,
 ) -> Any:
     """Build a launcher that selects the Top-K largest values' column indices per
-    decode row (unordered set, matching torch.topk by value). Implemented as a
+    decode row, matching torch.topk by value -- as an unordered set by default, or
+    ascending with deterministic tie-breaking under ``ordered``. Implemented as a
     tiered persistent multi-block radix-select; the returned launcher is cached.
 
     top_k: number of indices selected per row (compile-time; any positive value).
@@ -167,6 +174,7 @@ def create_topk_per_row_decode_tiered_kernel(
     mask_non_finite: clamp inf/NaN to -inf so they never rank into the top-k. Off
         by default, which ranks them by their raw twiddled bits the way torch.topk
         and the HIP kernel do; a direct caller has to ask for the divergence.
+    ordered: ascending output with smallest-index tie-break on the kth value.
     """
     short_max = tiered_short_max
     mid_cap = tiered_mid_cap
@@ -207,7 +215,17 @@ def create_topk_per_row_decode_tiered_kernel(
             f"tier_mode='short' requires bits_per_pass == 11, got {bits_per_pass}"
         )
 
-    short_tier = tier_mode in ("auto", "short") and bits_per_pass == 11
+    # ordered=True drops the short tier and early_stop; both assume unordered emit.
+    if ordered:
+        short_tier = False
+        early_stop = False
+    else:
+        short_tier = tier_mode in ("auto", "short") and bits_per_pass == 11
+    if ordered and blocks_per_row > WARP_SIZE:
+        raise ValueError(
+            f"ordered=True scans slice bases within one wave, so blocks_per_row "
+            f"must be <= {WARP_SIZE}, got {blocks_per_row}"
+        )
     block_threads = BLOCK_THREADS
     red_slots = (block_threads + WARP_SIZE - 1) // WARP_SIZE
     num_passes = _num_passes(bits_per_pass)
@@ -234,6 +252,7 @@ def create_topk_per_row_decode_tiered_kernel(
         f"{'_mf' if mask_non_finite else ''}"
         f"{'_rpp' if row_proportional_parts else ''}"
         f"{'_es' if early_stop else ''}"
+        f"{'_ord' if ordered else ''}"
     )
 
     @fx.struct
@@ -241,6 +260,8 @@ def create_topk_per_row_decode_tiered_kernel(
         s_hist: fx.Array[fx.Int32, num_buckets, 16]
         s_scan: fx.Array[fx.Int32, red_slots * 2, 16]
         s_meta: fx.Array[fx.Int32, 8, 16]
+        s_run: fx.Array[fx.Int32, 6, 16]  # ordered emit carry / run bases
+        s_own_hist: fx.Array[fx.Int32, num_buckets if ordered else 1, 16]
 
     @flyc.kernel(name=kernel_name, known_block_size=[block_threads, 1, 1])
     def topk_per_row_decode_tiered_kernel(
@@ -279,6 +300,10 @@ def create_topk_per_row_decode_tiered_kernel(
         c_exp_mask = fx.Int32(0x7F800000)  # fp32 exponent bits (all-ones => inf/NaN)
         c_neg_inf = fx.Float32(float("-inf"))
         c_neg_one = fx.Int32(-1)
+        c_sixteen = fx.Int32(16)
+        c_low16 = fx.Int32(0xFFFF)
+        c_three = fx.Int32(3)
+        c_five = fx.Int32(5)
         c_zero_f32 = fx.Float32(0.0)
         c_row_ws = fx.Int32(row_workspace_slots)
 
@@ -286,6 +311,10 @@ def create_topk_per_row_decode_tiered_kernel(
         s_hist = lds.s_hist.view(fx.make_layout(num_buckets, 1))
         s_scan = lds.s_scan.view(fx.make_layout(red_slots * 2, 1))
         s_meta = lds.s_meta.view(fx.make_layout(8, 1))
+        s_run = lds.s_run.view(fx.make_layout(6, 1))
+        s_own_hist = lds.s_own_hist.view(
+            fx.make_layout(num_buckets if ordered else 1, 1)
+        )
 
         # Bound this descriptor to the real allocation instead of 4 GiB. The vec4 tail
         # loads a whole group even when 1-3 elements remain and predicates the lanes
@@ -359,6 +388,10 @@ def create_topk_per_row_decode_tiered_kernel(
         def active_stride_idx(mult: int = 1):
             """Vec-block stride covering `mult` rounds of the active workgroups."""
             return fx.Index(active_threads * fx.Int32(mult))
+
+        def scan_run_stride_idx(mult: int = 1):
+            """Vec-block stride within one workgroup's ordered run."""
+            return fx.Index(c_block_i32 * fx.Int32(mult))
 
         def counter_slot(slot_const: int):
             return row_ws_base + fx.Int32(slot_const)
@@ -641,17 +674,17 @@ def create_topk_per_row_decode_tiered_kernel(
             start_bit: int,
             previous_start_bit: int,
             current_bits,
+            stride_idx=None,
         ):
+            stride_idx = stride_idx or active_stride_idx
             if const_expr(scan_stages == 1):
                 strides = [fx.Index(0)]
             elif const_expr(scan_stages == 2):
-                strides = [fx.Index(0), active_stride_idx()]
+                strides = [fx.Index(0), stride_idx()]
             elif const_expr(scan_stages == 4):
-                strides = [fx.Index(0)] + [active_stride_idx(m) for m in (1, 2, 3)]
+                strides = [fx.Index(0)] + [stride_idx(m) for m in (1, 2, 3)]
             else:
-                strides = [fx.Index(0)] + [
-                    active_stride_idx(m) for m in (1, 2, 3, 4, 5, 6, 7)
-                ]
+                strides = [fx.Index(0)] + [stride_idx(m) for m in (1, 2, 3, 4, 5, 6, 7)]
             cols_v = [fx.Int32(vblk + s) * c_vec for s in strides]
             vecs = [load_row_vec(cb) for cb in cols_v]
             for cb, vc in zip(cols_v, vecs):
@@ -741,42 +774,252 @@ def create_topk_per_row_decode_tiered_kernel(
                 early_write_vec_block(vblk, previous_start_bit, kth_bits)
                 write_results = yield [write_state[0]]
 
+        def block_exclusive_scan_i32(value):
+            """Exclusive prefix over tid and block total for one i32 per thread."""
+            gpu.barrier()
+            wave_incl = wave_inclusive_scan_i32(value)
+            wave_excl_thread = wave_incl - value
+            if lane == c_last_lane:
+                fx.memref_store(wave_incl, s_scan, wave)
+            gpu.barrier()
+            if wave == c_zero:
+                in_slots = lane < c_red_slots
+                lane_safe = in_slots.select(lane, c_zero)
+                wtot = in_slots.select(fx.memref_load(s_scan, lane_safe), c_zero)
+                wincl = wave_inclusive_scan_i32(wtot)
+                if in_slots:
+                    fx.memref_store(wincl - wtot, s_scan, lane + c_red_slots)
+            gpu.barrier()
+            wave_off = fx.memref_load(s_scan, wave + c_red_slots)
+            last_off = fx.memref_load(s_scan, c_last_wave + c_red_slots)
+            last_tot = fx.memref_load(s_scan, c_last_wave)
+            return wave_off + wave_excl_thread, last_off + last_tot
+
+        # Bins each thread owns when reducing a whole histogram. num_buckets is
+        # 1024 or 2048 against 1024 threads, so this divides exactly.
+        bins_per_thread = num_buckets // block_threads
+
+        def save_own_histogram():
+            """Copy this workgroup's histogram before the row-wide merge."""
+            for i in range_constexpr(bins_per_thread):
+                bin_i32 = tid + fx.Int32(i * block_threads)
+                fx.memref_store(fx.memref_load(s_hist, bin_i32), s_own_hist, bin_i32)
+
+        def accumulate_run_counts(pass_id: int, chosen_bucket):
+            """Fold s_own_hist lower bins into this run's selected/tied totals."""
+            if ~single_part_active:
+                mine = c_zero
+                for i in range_constexpr(bins_per_thread):
+                    bin_i32 = tid + fx.Int32(i * block_threads)
+                    count = fx.memref_load(s_own_hist, bin_i32)
+                    mine = mine + (bin_i32 < chosen_bucket).select(count, c_zero)
+                run_total = block_exclusive_scan_i32(mine)[1]
+                if tid == c_zero:
+                    carried = (
+                        c_zero
+                        if const_expr(pass_id == 0)
+                        else fx.memref_load(s_run, c_four)
+                    )
+                    fx.memref_store(carried + run_total, s_run, c_four)
+                    if const_expr(pass_id == num_passes - 1):
+                        fx.memref_store(
+                            fx.memref_load(s_own_hist, chosen_bucket), s_run, c_five
+                        )
+                gpu.barrier()
+
+        def ordered_classify(col_base, vec, col_hi, kth_bits):
+            """Classify one loaded vec-block vs the settled kth key."""
+            biased_kth = kth_bits ^ c_sign_bit
+            cols = []
+            n_selected = c_zero
+            n_tied = c_zero
+            for j in range_constexpr(LOAD_VEC):
+                col_i32 = col_base + fx.Int32(j)
+                val = vector.extract(vec, static_position=[j], dynamic_position=[])
+                key = radix_twiddle_key(val)
+                in_run = col_i32 < col_hi
+                selected = in_run.select(
+                    ((key ^ c_sign_bit) < biased_kth).select(c_one, c_zero), c_zero
+                )
+                tied = in_run.select((key == kth_bits).select(c_one, c_zero), c_zero)
+                cols.append((col_i32, selected, tied))
+                n_selected = n_selected + selected
+                n_tied = n_tied + tied
+            return cols, n_selected, n_tied
+
+        def ordered_emit(need, kth_bits):
+            """Write k ascending indices; ties on the kth value keep smallest column."""
+            c_block_log2 = fx.Int32(int.bit_length(block_threads) - 1)
+            # Trip count is uniform across workgroups; tail runs predicate columns away.
+            steps_idx = fx.Index(
+                (vblks_per_run + c_block_i32 - c_one).shrui(c_block_log2)
+            )
+            col_hi = run_col_hi
+            run_selected = fx.memref_load(s_run, c_four)
+            run_tied = fx.memref_load(s_run, c_five)
+
+            stages = ORDERED_STAGES
+            c_stage_idx = fx.Index(stages)
+            staged_limit_idx = steps_idx - fx.Index(stages - 1)
+
+            def stage_col_base(step_i32, stage: int):
+                return (
+                    run_first_vblk + (step_i32 + fx.Int32(stage)) * c_block_i32 + tid
+                ) * c_vec
+
+            def stage_loads(step_i32):
+                bases = [stage_col_base(step_i32, s) for s in range_constexpr(stages)]
+                return bases, [load_row_vec(b) for b in bases]
+
+            # Single-workgroup rows skip the cross-part exchange; bases stay zero.
+            if tid == c_zero:
+                fx.memref_store(c_zero, s_run, c_zero)
+                fx.memref_store(c_zero, s_run, c_one)
+                if single_part_active:
+                    fx.memref_store(c_zero, s_run, c_two)
+                    fx.memref_store(c_zero, s_run, c_three)
+
+            if ~single_part_active:
+                if tid == c_zero:
+                    buffer_ops.buffer_store(
+                        run_selected,
+                        workspace_rsrc,
+                        counter_slot(COUNTER_ORDERED_ABOVE) + part,
+                    )
+                    buffer_ops.buffer_store(
+                        run_tied,
+                        workspace_rsrc,
+                        counter_slot(COUNTER_ORDERED_EQUAL) + part,
+                    )
+                row_barrier(num_passes + 1)
+                if wave == c_zero:
+                    in_runs = lane < active_parts
+                    lane_safe = in_runs.select(lane, c_zero)
+                    peer_selected = in_runs.select(
+                        ws_load(counter_slot(COUNTER_ORDERED_ABOVE) + lane_safe),
+                        c_zero,
+                    )
+                    peer_tied = in_runs.select(
+                        ws_load(counter_slot(COUNTER_ORDERED_EQUAL) + lane_safe),
+                        c_zero,
+                    )
+                    selected_incl = wave_inclusive_scan_i32(peer_selected)
+                    tied_incl = wave_inclusive_scan_i32(peer_tied)
+                    if lane == part:
+                        fx.memref_store(selected_incl - peer_selected, s_run, c_two)
+                        fx.memref_store(tied_incl - peer_tied, s_run, c_three)
+            gpu.barrier()
+            base_selected = fx.memref_load(s_run, c_two)
+            base_tied = fx.memref_load(s_run, c_three)
+
+            # Phase 2: place.
+            def place_tile(col_base, vec):
+                cols, n_selected, n_tied = ordered_classify(
+                    col_base, vec, col_hi, kth_bits
+                )
+                packed_excl, packed_total = block_exclusive_scan_i32(
+                    arith.shli(n_selected, c_sixteen) + n_tied
+                )
+                carried_selected = fx.memref_load(s_run, c_zero)
+                carried_tied = fx.memref_load(s_run, c_one)
+                gpu.barrier()
+
+                my_selected = (
+                    base_selected + carried_selected + packed_excl.shrui(c_sixteen)
+                )
+                my_tied = base_tied + carried_tied + (packed_excl & c_low16)
+                for col_i32, selected, tied in cols:
+                    accepted = (my_tied < need).select(my_tied, need)
+                    out_pos = my_selected + accepted
+                    keep = selected + tied * (my_tied < need).select(c_one, c_zero)
+                    if (keep == c_one) & (out_pos < c_top_k):
+                        buffer_ops.buffer_store(
+                            col_i32, indices_rsrc, row_out + out_pos
+                        )
+                    my_selected = my_selected + selected
+                    my_tied = my_tied + tied
+
+                if tid == c_zero:
+                    fx.memref_store(
+                        carried_selected + packed_total.shrui(c_sixteen),
+                        s_run,
+                        c_zero,
+                    )
+                    fx.memref_store(
+                        carried_tied + (packed_total & c_low16), s_run, c_one
+                    )
+                gpu.barrier()
+
+            for step_b, place_state in range(
+                fx.Index(0), staged_limit_idx, c_stage_idx, init=[fx.Index(0)]
+            ):
+                bases, vecs = stage_loads(fx.Int32(step_b))
+                for s in range_constexpr(stages):
+                    place_tile(bases[s], vecs[s])
+                place_results = yield [step_b + c_stage_idx]
+            for step_b, place_state in range(
+                place_results, steps_idx, fx.Index(1), init=[c_zero]
+            ):
+                col_base = stage_col_base(fx.Int32(step_b), 0)
+                place_tile(col_base, load_row_vec(col_base))
+                place_results = yield [place_state[0]]
+
         global_vec_tid = part * c_block_i32 + tid
         global_vec_tid_idx = fx.Index(global_vec_tid)
         vec_blocks_i32 = (row_len + c_vec - c_one).shrui(fx.Int32(LOAD_VEC_LOG2))
         vec_blocks_idx = fx.Index(vec_blocks_i32)
+
+        # ordered=True: one contiguous vec-block range per workgroup.
+        vblks_per_run = (vec_blocks_i32 + active_parts - c_one) // active_parts
+        run_first_vblk = part * vblks_per_run
+        run_last_vblk = run_first_vblk + vblks_per_run
+        run_end_vblk = (run_last_vblk < vec_blocks_i32).select(
+            run_last_vblk, vec_blocks_i32
+        )
+        run_end_col = run_end_vblk * c_vec
+        run_col_hi = (run_end_col < row_len).select(run_end_col, row_len)
+        run_first_idx = fx.Index(run_first_vblk)
+        run_end_idx = fx.Index(run_end_vblk)
 
         def scan_pass(pass_id: int, current_k, current_bits, barrier_token: int):
             start_bit = max(32 - (pass_id + 1) * bits_per_pass, 0)
             previous_start_bit = max(32 - pass_id * bits_per_pass, 0)
 
             clear_local_histogram()
+            scan_step_idx = scan_run_stride_idx if ordered else active_stride_idx
+            scan_start_idx = run_first_idx + tid_idx if ordered else global_vec_tid_idx
+            scan_stop_idx = run_end_idx if ordered else vec_blocks_idx
             if const_expr(scan_stages == 8):
-                unroll_limit_idx = vec_blocks_idx - active_stride_idx(7)
-                staged_stride_idx = active_stride_idx(8)
+                unroll_limit_idx = scan_stop_idx - scan_step_idx(7)
+                staged_stride_idx = scan_step_idx(8)
             elif const_expr(scan_stages == 4):
-                unroll_limit_idx = vec_blocks_idx - active_stride_idx(3)
-                staged_stride_idx = active_stride_idx(4)
+                unroll_limit_idx = scan_stop_idx - scan_step_idx(3)
+                staged_stride_idx = scan_step_idx(4)
             elif const_expr(scan_stages == 2):
-                unroll_limit_idx = vec_blocks_idx - active_stride_idx()
-                staged_stride_idx = active_stride_idx(2)
+                unroll_limit_idx = scan_stop_idx - scan_step_idx()
+                staged_stride_idx = scan_step_idx(2)
             else:
-                unroll_limit_idx = vec_blocks_idx
-                staged_stride_idx = active_stride_idx()
+                unroll_limit_idx = scan_stop_idx
+                staged_stride_idx = scan_step_idx()
             for vblk, pass_state in range(
-                global_vec_tid_idx,
+                scan_start_idx,
                 unroll_limit_idx,
                 staged_stride_idx,
-                init=[global_vec_tid_idx],
+                init=[scan_start_idx],
             ):
                 staged_scan_vec_blocks(
-                    vblk, pass_id, start_bit, previous_start_bit, current_bits
+                    vblk,
+                    pass_id,
+                    start_bit,
+                    previous_start_bit,
+                    current_bits,
+                    scan_step_idx,
                 )
                 pass_results = yield [vblk + staged_stride_idx]
             for vblk, pass_state in range(
                 pass_results,
-                vec_blocks_idx,
-                active_stride_idx(),
+                scan_stop_idx,
+                scan_step_idx(),
                 init=[c_zero],
             ):
                 scan_vec_block(
@@ -788,40 +1031,47 @@ def create_topk_per_row_decode_tiered_kernel(
             if single_part_active:
                 choose_bucket_prefix(current_k)
             if ~single_part_active:
+                if const_expr(ordered):
+                    save_own_histogram()
                 flush_local_histogram(pass_id)
                 row_barrier(barrier_token)
                 load_global_histogram(pass_id)
                 choose_bucket_prefix(current_k)
 
             chosen_bucket = fx.memref_load(s_meta, fx.Int32(SMEM_META_THRESHOLD))
+            if const_expr(ordered):
+                accumulate_run_counts(pass_id, chosen_bucket)
             next_k = fx.memref_load(s_meta, fx.Int32(SMEM_META_K))
             next_len = fx.memref_load(s_meta, fx.Int32(SMEM_META_LEN))
             next_bits = current_bits | fx.Int32(
                 arith.shli(chosen_bucket, fx.Int32(start_bit))
             )
             if const_expr(pass_id == num_passes - 1):
-                unroll_limit_idx = vec_blocks_idx - active_stride_idx(3)
-                for vblk, write_state in range(
-                    global_vec_tid_idx,
-                    unroll_limit_idx,
-                    active_stride_idx(4),
-                    init=[global_vec_tid_idx],
-                ):
-                    for unroll_id in range_constexpr(4):
-                        write_vec_block(
-                            vblk + active_stride_idx(unroll_id),
-                            next_k,
-                            next_bits,
-                        )
-                    write_results = yield [vblk + active_stride_idx(4)]
-                for vblk, write_state in range(
-                    write_results,
-                    vec_blocks_idx,
-                    active_stride_idx(),
-                    init=[c_zero],
-                ):
-                    write_vec_block(vblk, next_k, next_bits)
-                    write_results = yield [write_state[0]]
+                if const_expr(ordered):
+                    ordered_emit(next_k, next_bits)
+                else:
+                    unroll_limit_idx = vec_blocks_idx - active_stride_idx(3)
+                    for vblk, write_state in range(
+                        global_vec_tid_idx,
+                        unroll_limit_idx,
+                        active_stride_idx(4),
+                        init=[global_vec_tid_idx],
+                    ):
+                        for unroll_id in range_constexpr(4):
+                            write_vec_block(
+                                vblk + active_stride_idx(unroll_id),
+                                next_k,
+                                next_bits,
+                            )
+                        write_results = yield [vblk + active_stride_idx(4)]
+                    for vblk, write_state in range(
+                        write_results,
+                        vec_blocks_idx,
+                        active_stride_idx(),
+                        init=[c_zero],
+                    ):
+                        write_vec_block(vblk, next_k, next_bits)
+                        write_results = yield [write_state[0]]
             return next_k, next_len, next_bits
 
         def one_workgroup_short_tier():

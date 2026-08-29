@@ -254,5 +254,73 @@ def test_seqlens_on_another_device_raises():
         )
 
 
+@pytestmark_gpu
+@pytest.mark.parametrize("rows, width, seq_len, k", ROUTING_CASES)
+def test_stable_branches_agree_on_the_exact_index_order(rows, width, seq_len, k):
+    """stable=True must match HIP index-for-index, not just as a set."""
+    logits, seq_lens, indices = make_inputs(rows, width, seq_len, k)
+    logits = (logits * 32).round() / 32
+    indices.fill_(-1)
+    topk_mod.top_k_per_row_decode(
+        logits, 1, seq_lens, indices, rows, logits.stride(0), logits.stride(1), k, True
+    )
+    torch.cuda.synchronize()
+
+    hip = torch.empty_like(indices).fill_(-1)
+    topk_mod._top_k_per_row_decode(
+        logits,
+        1,
+        seq_lens,
+        hip,
+        rows,
+        logits.stride(0),
+        logits.stride(1),
+        k,
+        topk_mod.get_topk_scratch_workspace(
+            logits.device,
+            topk_mod.topk_ob_workspace_size(rows, logits.stride(0), k, True),
+        ),
+        True,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(indices, hip), (
+        f"stable output differs from HIP at rows={rows} width={width} k={k}"
+    )
+    assert bool((indices[:, 1:] > indices[:, :-1]).all()), "not ascending"
+
+
+@pytestmark_gpu
+@pytest.mark.parametrize("stable", [False, True], ids=["unordered", "stable"])
+def test_gated_shape_reaches_flydsl_with_the_matching_order_flag(monkeypatch, stable):
+    """Gated shapes reach FlyDSL for both stable values; ``ordered`` must match."""
+    if get_gfx_runtime() not in topk_mod._FLYDSL_TOPK_DECODE_GATES:
+        pytest.skip("no FlyDSL gates for this arch")
+    rows, width, k = 1, 163840, 2048
+    gate = topk_mod._FLYDSL_TOPK_DECODE_GATES[get_gfx_runtime()]
+    if rows > topk_mod._decode_max_rows(gate, width) or k not in gate.ks:
+        pytest.skip(f"shape is outside this arch's window: {gate}")
+
+    from aiter.ops.flydsl import topk_per_row_decode as flydsl_mod
+
+    seen = {}
+    real = flydsl_mod.flydsl_top_k_per_row_decode
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(flydsl_mod, "flydsl_top_k_per_row_decode", spy)
+
+    logits, seq_lens, indices = make_inputs(rows, width, width, k)
+    topk_mod.top_k_per_row_decode(
+        logits, 1, seq_lens, indices, rows, logits.stride(0), 1, k, stable
+    )
+    torch.cuda.synchronize()
+
+    assert seen, "gated shape did not reach the FlyDSL kernel"
+    assert seen["ordered"] is stable, f"forwarded ordered={seen['ordered']!r}"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

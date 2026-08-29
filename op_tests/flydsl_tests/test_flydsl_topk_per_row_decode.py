@@ -95,7 +95,7 @@ def _build_case(num_rows, width, next_n, seq_len, dist, poison, stride_pad=0):
     return logits, seq_lens, row_ends
 
 
-def _run(logits, seq_lens, num_rows, next_n, k, workspace=None):
+def _run(logits, seq_lens, num_rows, next_n, k, workspace=None, ordered=False):
     indices = torch.empty((num_rows, k), device="cuda", dtype=torch.int32)
     flydsl_top_k_per_row_decode(
         logits,
@@ -106,7 +106,7 @@ def _run(logits, seq_lens, num_rows, next_n, k, workspace=None):
         logits.stride(0),
         logits.stride(1),
         k=k,
-        ordered=False,
+        ordered=ordered,
         workspace=workspace,
     )
     torch.cuda.synchronize()
@@ -123,9 +123,9 @@ def _assert_row_topk_set(logits_row, actual_row, k, row_len):
 
     if row_len < k:
         pad = actual_row[row_len:k]
-        assert (
-            pad == -1
-        ).all(), f"expected -1 padding, got {pad[pad != -1][:8].tolist()}"
+        assert (pad == -1).all(), (
+            f"expected -1 padding, got {pad[pad != -1][:8].tolist()}"
+        )
 
     expected = torch.topk(logits_row[:row_len], valid).indices
     a_set, e_set = set(a.tolist()), set(expected.tolist())
@@ -134,9 +134,9 @@ def _assert_row_topk_set(logits_row, actual_row, k, row_len):
 
     a_only = sorted(a_set - e_set)
     e_only = sorted(e_set - a_set)
-    assert len(a_only) == len(
-        e_only
-    ), f"set size mismatch: {len(a_only)} extra vs {len(e_only)} missing"
+    assert len(a_only) == len(e_only), (
+        f"set size mismatch: {len(a_only)} extra vs {len(e_only)} missing"
+    )
 
     av = torch.tensor([logits_row[i].item() for i in a_only]).sort().values
     ev = torch.tensor([logits_row[i].item() for i in e_only]).sort().values
@@ -316,9 +316,9 @@ def test_non_finite_mask_override_excludes_them():
         assert m._kernel_config(1, L)["mask_non_finite"]
         got = set(_run(logits, sl, 1, 1, k)[0].tolist())
 
-    assert not (
-        got & (top | bottom)
-    ), f"masked run still selected non-finite: {sorted(got & (top | bottom))}"
+    assert not (got & (top | bottom)), (
+        f"masked run still selected non-finite: {sorted(got & (top | bottom))}"
+    )
 
 
 @contextlib.contextmanager
@@ -504,11 +504,10 @@ def test_num_rows_subset_leaves_extra_untouched():
 @pytest.mark.parametrize(
     ("logits_dtype", "call_kwargs", "exc"),
     [
-        (torch.float32, {"k": 512, "ordered": True}, ValueError),
         (torch.float32, {"k": 0}, ValueError),
         (torch.float16, {"k": 512}, TypeError),
     ],
-    ids=["ordered-true", "nonpositive-k", "fp16-logits"],
+    ids=["nonpositive-k", "fp16-logits"],
 )
 def test_invalid_args_rejected(logits_dtype, call_kwargs, exc):
     k = call_kwargs["k"]
@@ -593,3 +592,119 @@ def test_strided_workspace_rejected():
     assert ws.numel() >= slots
     with pytest.raises(ValueError, match="workspace must be packed"):
         _launch(logits, seq_lens, indices, rows, k, workspace=ws)
+
+
+_TIE_DISTRIBUTIONS = ("ties", "10LSBits", "constant")
+
+
+def _twiddle_keys(values: torch.Tensor) -> torch.Tensor:
+    """Kernel twiddle_in as an int64 sort key (descending value, ascending key)."""
+    bits = values.contiguous().view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+    return torch.where(bits >> 31 != 0, bits, bits ^ 0x7FFFFFFF)
+
+
+def _ref_stable_row(row: torch.Tensor, row_len: int, k: int) -> torch.Tensor:
+    """Top-k by twiddle key, ties broken by smaller index, output ascending."""
+    valid = min(k, row_len)
+    if valid == 0:
+        return torch.empty(0, dtype=torch.int32)
+
+    keys = _twiddle_keys(row[:row_len])
+    idx = torch.arange(row_len, dtype=torch.int64)
+    order = torch.argsort(keys * row_len + idx)
+    return torch.sort(order[:valid]).values.to(torch.int32)
+
+
+def _assert_batch_stable(logits, indices, row_ends, k):
+    logits_cpu = logits.detach().cpu()
+    actual = indices.detach().cpu()
+    for row, end in enumerate(row_ends.tolist()):
+        end = int(end)
+        expected = _ref_stable_row(logits_cpu[row], end, k)
+        got = actual[row][: expected.numel()]
+        if not torch.equal(got, expected):
+            first = int((got != expected).nonzero()[0])
+            raise AssertionError(
+                f"row {row} (row_len={end}) differs at slot {first}: "
+                f"got {got[first].item()}, want {expected[first].item()}; "
+                f"got[{first}:{first + 8}]={got[first : first + 8].tolist()} "
+                f"want[{first}:{first + 8}]={expected[first : first + 8].tolist()}"
+            )
+        pad = actual[row][expected.numel() : k]
+        assert (pad == -1).all(), f"row {row}: expected -1 padding past row_len"
+
+
+def _check_stable(k, num_rows, next_n, seq_len, dist, padded):
+    width = max(_PAD_WIDTH, seq_len) if padded else seq_len
+    poison = _POISON if padded else None
+    logits, seq_lens, row_ends = _build_case(
+        num_rows, width, next_n, seq_len, dist, poison
+    )
+    indices = _run(logits, seq_lens, num_rows, next_n, k, ordered=True)
+    _assert_batch_stable(logits, indices, row_ends, k)
+
+
+@pytest.mark.parametrize("dist", _TIE_DISTRIBUTIONS)
+@pytest.mark.parametrize("L", TIER_LENGTHS)
+def test_stable_tie_matrix(L, dist):
+    _check_stable(2048, 1, 1, L, dist, padded=True)
+
+
+@pytest.mark.parametrize("dist", ("random",) + _TIE_DISTRIBUTIONS)
+@pytest.mark.parametrize("L", [2049, 32769, 120003])
+def test_stable_batched(L, dist):
+    _check_stable(2048, 8, 1, L, dist, padded=True)
+
+
+@pytest.mark.parametrize("k", SUPPORTED_KS)
+def test_stable_all_identical(k):
+    """Constant row: answer is 0..k-1."""
+    L = 32768
+    logits, sl, row_ends = _build_case(1, max(_PAD_WIDTH, L), 1, L, "constant", _POISON)
+    indices = _run(logits, sl, 1, 1, k, ordered=True)
+    torch.testing.assert_close(
+        indices[0].cpu(), torch.arange(k, dtype=torch.int32), rtol=0, atol=0
+    )
+    _assert_batch_stable(logits, indices, row_ends, k)
+
+
+@pytest.mark.parametrize("k", [256, 2048])
+def test_stable_ragged_batch_mixed_tiers(k):
+    seq_lens = [1024, 4096, 20001, 70000, 150003]
+    width = max(_PAD_WIDTH, max(seq_lens))
+    n = len(seq_lens)
+    logits, sl, row_ends = _build_case(n, width, 1, seq_lens, "ties", _POISON)
+    indices = _run(logits, sl, n, 1, k, ordered=True)
+    _assert_batch_stable(logits, indices, row_ends, k)
+
+
+@pytest.mark.parametrize("L", [32769, 150003], ids=["mid", "long"])
+def test_stable_repeat_is_byte_identical(L):
+    """The actual tensor-parallel requirement: the same input returns the same
+    bytes every launch. Runs interleave a differently-shaped launch so a stale
+    workspace or a cached per-row base would show up."""
+    k = 2048
+    logits, sl, _ = _build_case(4, max(_PAD_WIDTH, L), 1, L, "ties", _POISON)
+    other, other_sl, _ = _build_case(2, max(_PAD_WIDTH, 8192), 1, 8192, "ties", _POISON)
+
+    first = _run(logits, sl, 4, 1, k, ordered=True).clone()
+    for _ in range(3):
+        _run(other, other_sl, 2, 1, k, ordered=True)
+        again = _run(logits, sl, 4, 1, k, ordered=True)
+        assert torch.equal(first, again), "repeat launch changed the output"
+
+
+@pytest.mark.parametrize("dist", _TIE_DISTRIBUTIONS)
+def test_stable_matches_hip(dist):
+    """Cross-check the reference itself against the HIP stable kernel, so a
+    reference that encodes our own bug cannot pass both sides."""
+    from aiter.ops.topk import top_k_per_row_decode
+
+    k, L = 2048, 32769
+    logits, sl, row_ends = _build_case(2, max(_PAD_WIDTH, L), 1, L, dist, _POISON)
+    hip = torch.empty((2, k), device="cuda", dtype=torch.int32)
+    top_k_per_row_decode(
+        logits, 1, sl, hip, 2, logits.stride(0), logits.stride(1), k, True
+    )
+    torch.cuda.synchronize()
+    _assert_batch_stable(logits, hip, row_ends, k)
