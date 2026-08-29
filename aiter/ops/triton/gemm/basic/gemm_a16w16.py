@@ -30,8 +30,8 @@ def _get_triton_config(
     N: int,
     K: int,
 ):
-    config, is_tunned = get_gemm_config("GEMM-A16W16", M, N, K)
-    return compute_splitk_params(config, K), is_tunned
+    config, is_tuned = get_gemm_config("GEMM-A16W16", M, N, K)
+    return compute_splitk_params(config, K), is_tuned
 
 
 def _is_gluon_available():
