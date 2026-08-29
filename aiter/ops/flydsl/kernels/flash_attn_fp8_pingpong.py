@@ -17,7 +17,12 @@ from flydsl.expr.utils.arith import _to_raw as _raw
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
-from aiter.ops.flydsl.rocdl_mfma_fp8 import Mfma32x32x64
+from aiter.ops.flydsl.rocdl_mfma_fp8 import (
+    C16_F32_PER_LANE,
+    ONES_ROW_LANES,
+    Mfma16x16x128,
+    Mfma32x32x64,
+)
 
 _LOG2E = host_math.log2(host_math.e)
 
@@ -205,6 +210,12 @@ def build_flash_attn_fp8_module(
             return Vec(Vec(hi).bitcast(fx.Int32))[0]
 
         mfma = Mfma32x32x64()
+        # The L denominator is a pure ones-column reduction, so it does not
+        # need the 32x32 atom's output tile -- only one column of it.  The
+        # 16x16x128 atom does the same reduction with a vec<4xf32>
+        # accumulator instead of vec<16xf32>, which is what makes two
+        # independent L accumulators affordable (8 VGPRs, not 32).
+        l_mfma_atom = Mfma16x16x128()
 
         q_ptr = _extract_aligned_pointer(Q)
         k_ptr = _extract_aligned_pointer(K)
@@ -577,9 +588,22 @@ def build_flash_attn_fp8_module(
                 Vec(p_pack).shuffle(Vec(p_pack), list(range(r * 8, r * 8 + 8)))
                 for r in range_constexpr(PV_K_STEPS)
             ]
-            # The tail of the L denominator from MFMA
-            for ks in range_constexpr(PV_K_STEPS - L_MFMA_SLABS, PV_K_STEPS):
-                l_mfma = mfma.call(ones_pack, p_ks_list[ks], l_mfma)
+            # The tail of the L denominator from MFMA.  One accumulator per
+            # slab rather than one chained accumulator: a single register
+            # would serialise the slabs on the MFMA's C operand, and the
+            # trace showed the second issuing 72 cycles after the first for
+            # exactly that reason.  Independent C registers let both go
+            # back-to-back at the pipe's issue rate; the partial sums are
+            # folded together once, in the epilogue.
+            # 16x16x128 rather than 32x32x64: the reduction only ever reads
+            # one output column, so the wider atom's extra 12 accumulator
+            # registers per slab were pure cost.
+            l_mfma = [
+                l_mfma_atom.call(ones_pack, p_ks_list[ks], l_mfma[i])
+                for i, ks in enumerate(
+                    range_constexpr(PV_K_STEPS - L_MFMA_SLABS, PV_K_STEPS)
+                )
+            ]
             PV_UNITS = D_TILES * PV_K_STEPS
             kv_windows = [None] * 4
             k_preloaded = [None] * PREFETCH_DEPTH
@@ -589,10 +613,10 @@ def build_flash_attn_fp8_module(
                 dt = u // PV_K_STEPS
                 ks = u % PV_K_STEPS
                 _sched_barrier()
-                if const_expr(u < 7):
-                    _wait_lgkmcnt(4)
-                else:
-                    _wait_lgkmcnt(2)
+                # if const_expr(u < 7):
+                #     _wait_lgkmcnt(4)
+                # else:
+                #     _wait_lgkmcnt(2)
                 o_accs[dt] = mfma.call(kv_windows[u % 4], p_ks_list[ks], o_accs[dt])
                 un = u + PREFETCH_DEPTH
                 if const_expr(un < PV_UNITS):
@@ -670,10 +694,10 @@ def build_flash_attn_fp8_module(
                 nt = u // K_STEPS
                 ks = u % K_STEPS
                 _sched_barrier()
-                if const_expr(u < 7):
-                    _wait_lgkmcnt(2)
-                elif const_expr(u == 7):
-                    _wait_lgkmcnt(4)
+                # if const_expr(u < 7):
+                #     _wait_lgkmcnt(2)
+                # elif const_expr(u == 7):
+                #     _wait_lgkmcnt(4)
 
                 s_accs[nt] = qk_mfma(kv_windows[u % 4], q_packs[ks], s_accs[nt])
                 un = u + PREFETCH_DEPTH
@@ -815,11 +839,13 @@ def build_flash_attn_fp8_module(
             s_accs, o_accs, l_mfma, l_valu, m_frozen, bias_chunks, m_local, fired
         ):
             vt = Vec.make_type(C_F32_PER_LANE, fx.Float32)
+            lvt = Vec.make_type(C16_F32_PER_LANE, fx.Float32)
             if_op = scf.IfOp(
                 fired,
                 results_=[vt] * N_KV_TILES
                 + [vt] * D_TILES
-                + [vt, T.f32, T.f32, T.i32, T.i32],
+                + [lvt] * L_MFMA_SLABS
+                + [T.f32, T.f32, T.i32, T.i32],
                 has_else=True,
             )
             with ir.InsertionPoint(if_op.then_block):
@@ -856,7 +882,12 @@ def build_flash_attn_fp8_module(
                     _fmul(Vec(o_accs[dt]), f_vec)
                     for dt in range_constexpr(D_TILES)
                 ]
-                _lm = _fmul(Vec(l_mfma), f_vec)
+                # The L accumulators are only vec<4xf32>, so they need their
+                # own broadcast of the rescale factor.
+                f_vec_l = Vec.from_elements([f], fx.Float32).broadcast_to(
+                    C16_F32_PER_LANE
+                )
+                _lm = [_fmul(Vec(lm), f_vec_l) for lm in l_mfma]
                 _lv = _fmul(l_valu, f)
                 _m = _fadd(m_frozen, d)
                 # Re-derive the seed: b = C - m.  Later tiles are prefilled
@@ -865,14 +896,16 @@ def build_flash_attn_fp8_module(
                 scf.YieldOp(
                     [_raw(v) for v in _s]
                     + [_raw(v) for v in _o]
-                    + [_raw(_lm), _raw(_lv), _raw(_m)]
+                    + [_raw(v) for v in _lm]
+                    + [_raw(_lv), _raw(_m)]
                     + [_raw(bc) for bc in _bc]
                 )
             with ir.InsertionPoint(if_op.else_block):
                 scf.YieldOp(
                     [_raw(v) for v in s_accs]
                     + [_raw(v) for v in o_accs]
-                    + [_raw(l_mfma), _raw(l_valu), _raw(m_frozen)]
+                    + [_raw(v) for v in l_mfma]
+                    + [_raw(l_valu), _raw(m_frozen)]
                     + [_raw(bc) for bc in bias_chunks]
                 )
             r = if_op.results
@@ -884,14 +917,19 @@ def build_flash_attn_fp8_module(
                 as_dsl_value(r[n + i], o_accs[i]) for i in range_constexpr(D_TILES)
             ]
             k = n + D_TILES
+            lm_out = [
+                as_dsl_value(r[k + i], l_mfma[i])
+                for i in range_constexpr(L_MFMA_SLABS)
+            ]
+            k += L_MFMA_SLABS
             return (
                 s_out,
                 o_out,
-                as_dsl_value(r[k], l_mfma),
-                as_dsl_value(r[k + 1], l_valu),
-                as_dsl_value(r[k + 2], m_frozen),
+                lm_out,
+                as_dsl_value(r[k], l_valu),
+                as_dsl_value(r[k + 1], m_frozen),
                 tuple(
-                    as_dsl_value(r[k + 3 + i], bias_chunks[i])
+                    as_dsl_value(r[k + 2 + i], bias_chunks[i])
                     for i in range_constexpr(N_BIAS_CHUNKS)
                 ),
             )
@@ -1010,7 +1048,29 @@ def build_flash_attn_fp8_module(
             # them; on the non-seeded path they are whatever was passed in.
             return m_frozen, bias_chunks, p_pack, l_valu, o_accs, l_mfma
 
-        ones_pack = Vec.filled(A_FP8_PER_LANE // 4, 0x38383838, fx.Int32)
+        # Ones column for the L reduction.  0x38 is fp8 e4m3 1.0, so
+        # 0x38383838 is four of them.  The 16x16x128 atom folds lanes
+        # {n, n+16, n+32, n+48} into one output column, but a query row here
+        # is lane % 32 -- so a uniform ones operand would add row n+16 into
+        # row n.  Restricting the ones to lanes where `lo` is one of
+        # ONES_ROW_LANES gives each 16-lane group its own output row and
+        # makes C[lane][0] agree, bit for bit, with what the 32x32 atom
+        # produced (checked against it on random inputs).  Same mask the
+        # assembly kernel builds.
+        _ones_lane_pred = None
+        for _al in ONES_ROW_LANES:
+            _p = arith.cmpi(
+                arith.CmpIPredicate.eq, _raw(lo), _raw(fx.Index(_al))
+            )
+            _ones_lane_pred = _p if _ones_lane_pred is None else arith.ori(
+                _ones_lane_pred, _p
+            )
+        ones_scalar = ArithValue(_ones_lane_pred).select(
+            fx.Int32(0x38383838), fx.Int32(0)
+        )
+        ones_pack = Vec.from_elements(
+            [ones_scalar] * (A_FP8_PER_LANE // 4), fx.Int32
+        )
 
         o_init = [
             Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
@@ -1038,12 +1098,24 @@ def build_flash_attn_fp8_module(
 
         loop_step = fx.Int32(BLOCK_N)
         l_valu_init = c_zero_f
-        l_mfma_init = mfma.zero_value # c output of L-sum mfma (32x32x64_fp8)
+        # One C register per L slab: the slabs are summed independently and
+        # only merged in the epilogue, so nothing serialises them.
+        l_mfma_init = [l_mfma_atom.zero_value for _ in range_constexpr(L_MFMA_SLABS)]
+        # Carry layout.  Both groups start (m_frozen, l_valu, *l_mfma, o0..o3);
+        # g0 then carries p_pack, g1 carries s_accs[0..3].
+        G0_HEAD = 2 + L_MFMA_SLABS + 4 + 1
+        G1_HEAD = 2 + L_MFMA_SLABS + 4
+        G1_SACC = G1_HEAD + 4
         m_init = c_neg_inf
 
         ## for epilogue
         le_valu = c_zero_f
-        le_mfma = mfma.zero_value
+        # Flat names, not a list: `if is_g0` is a stateful dynamic scf.if and
+        # every live state variable has to be an MLIR value.  PV_K_STEPS is 2,
+        # so there are at most two slabs; an unused one stays zero and adds
+        # nothing to l_final.
+        le_mfma0 = l_mfma_atom.zero_value
+        le_mfma1 = l_mfma_atom.zero_value
         oe0 = Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
         oe1 = Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
         oe2 = Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
@@ -1069,7 +1141,7 @@ def build_flash_attn_fp8_module(
                 return (
                     m_frozen,
                     l_valu,
-                    l_mfma_init,
+                    *l_mfma_init,
                     o_init[0],
                     o_init[1],
                     o_init[2],
@@ -1086,10 +1158,10 @@ def build_flash_attn_fp8_module(
                 )
 
             def g0_epilogue(*carry):
-                m_frozen, l_valu, l_mfma, o0, o1, o2, o3, p_pack = carry[
-                    :8
-                ]
-                _rest = carry[8 + N_BIAS_CHUNKS :]
+                m_frozen, l_valu = carry[:2]
+                l_mfma = list(carry[2 : 2 + L_MFMA_SLABS])
+                o0, o1, o2, o3, p_pack = carry[2 + L_MFMA_SLABS : G0_HEAD]
+                _rest = carry[G0_HEAD + N_BIAS_CHUNKS :]
                 v_buff_off = _rest[0]
                 k_buff_off = _rest[3]
                 v_preloaded = _rest[5 + DMA_PASSES :]
@@ -1119,9 +1191,11 @@ def build_flash_attn_fp8_module(
                     as_dsl_value(a, ex)
                     for a, ex in zip(for_op.inner_iter_args, g0_carry)
                 ]
-                m_frozen, l_valu, l_mfma, o0, o1, o2, o3, p_pack = _g0_args[:8]
-                bias_chunks = _g0_args[8 : 8 + N_BIAS_CHUNKS]
-                _rest = _g0_args[8 + N_BIAS_CHUNKS :]
+                m_frozen, l_valu = _g0_args[:2]
+                l_mfma = list(_g0_args[2 : 2 + L_MFMA_SLABS])
+                o0, o1, o2, o3, p_pack = _g0_args[2 + L_MFMA_SLABS : G0_HEAD]
+                bias_chunks = _g0_args[G0_HEAD : G0_HEAD + N_BIAS_CHUNKS]
+                _rest = _g0_args[G0_HEAD + N_BIAS_CHUNKS :]
                 v_buff_off, v_next_off, v_further_off = _rest[0:3]
                 k_buff_off, k_next_off = _rest[3:5]
                 g_koffs = [_raw(x) for x in _rest[5 : 5 + DMA_PASSES]]
@@ -1177,7 +1251,7 @@ def build_flash_attn_fp8_module(
                     [
                         _raw(m_frozen),
                         _raw(l_valu),
-                        _raw(l_mfma),
+                        *[_raw(lm) for lm in l_mfma],
                         _raw(o[0]),
                         _raw(o[1]),
                         _raw(o[2]),
@@ -1197,6 +1271,9 @@ def build_flash_attn_fp8_module(
 
             _g0_res = [as_dsl_value(r, ex) for r, ex in zip(for_op.results, g0_carry)]
             oe, le_mfma, le_valu = g0_epilogue(*_g0_res)
+            le_mfma0 = le_mfma[0]
+            if const_expr(L_MFMA_SLABS > 1):
+                le_mfma1 = le_mfma[1]
             oe0 = oe[0]
             oe1 = oe[1]
             oe2 = oe[2]
@@ -1222,7 +1299,7 @@ def build_flash_attn_fp8_module(
                 return (
                     m_frozen,
                     l_valu_init,
-                    l_mfma_init,
+                    *l_mfma_init,
                     o_init[0],
                     o_init[1],
                     o_init[2],
@@ -1243,13 +1320,15 @@ def build_flash_attn_fp8_module(
                 )
 
             def g1_epilogue(*carry):
-                m_frozen, l_valu, l_mfma, o0, o1, o2, o3 = carry[:7]
-                s0, s1, s2, s3 = carry[7:11]
-                _rest = carry[11 + N_BIAS_CHUNKS:]
+                m_frozen, l_valu = carry[:2]
+                l_mfma = list(carry[2 : 2 + L_MFMA_SLABS])
+                o0, o1, o2, o3 = carry[2 + L_MFMA_SLABS : G1_HEAD]
+                s0, s1, s2, s3 = carry[G1_HEAD : G1_HEAD + 4]
+                _rest = carry[G1_SACC + N_BIAS_CHUNKS :]
                 v_buff_off = _rest[0]
                 k_buff_off = _rest[3]
                 v_preloaded = _rest[5 + DMA_PASSES :]
-                bias_chunks = carry[11 : 11 + N_BIAS_CHUNKS]
+                bias_chunks = carry[G1_SACC : G1_SACC + N_BIAS_CHUNKS]
                 m_frozen, _, p_pack, l_valu, o_r, l_mfma = do_softmax(
                     [s0, s1, s2, s3],
                     m_frozen,
@@ -1283,10 +1362,12 @@ def build_flash_attn_fp8_module(
                     as_dsl_value(a, ex)
                     for a, ex in zip(for_op.inner_iter_args, g1_carry)
                 ]
-                m_frozen, l_valu, l_mfma, o0, o1, o2, o3 = _g1_args[:7]
-                s0, s1, s2, s3 = _g1_args[7:11]
-                bias_chunks = _g1_args[11 : 11 + N_BIAS_CHUNKS]
-                _rest = _g1_args[11 + N_BIAS_CHUNKS:]
+                m_frozen, l_valu = _g1_args[:2]
+                l_mfma = list(_g1_args[2 : 2 + L_MFMA_SLABS])
+                o0, o1, o2, o3 = _g1_args[2 + L_MFMA_SLABS : G1_HEAD]
+                s0, s1, s2, s3 = _g1_args[G1_HEAD : G1_HEAD + 4]
+                bias_chunks = _g1_args[G1_SACC : G1_SACC + N_BIAS_CHUNKS]
+                _rest = _g1_args[G1_SACC + N_BIAS_CHUNKS :]
                 v_buff_off, v_next_off, v_further_off = _rest[0:3]
                 k_buff_off, k_next_off = _rest[3:5]
                 g_voffs = [_raw(x) for x in _rest[5 : 5 + DMA_PASSES]]
@@ -1342,7 +1423,7 @@ def build_flash_attn_fp8_module(
                     [
                         _raw(m_frozen),
                         _raw(l_valu),
-                        _raw(l_mfma),
+                        *[_raw(lm) for lm in l_mfma],
                         _raw(o[0]),
                         _raw(o[1]),
                         _raw(o[2]),
@@ -1365,6 +1446,9 @@ def build_flash_attn_fp8_module(
 
             _g1_res = [as_dsl_value(r, ex) for r, ex in zip(for_op.results, g1_carry)]
             oe, le_mfma, le_valu = g1_epilogue(*_g1_res)
+            le_mfma0 = le_mfma[0]
+            if const_expr(L_MFMA_SLABS > 1):
+                le_mfma1 = le_mfma[1]
             oe0 = oe[0]
             oe1 = oe[1]
             oe2 = oe[2]
@@ -1373,7 +1457,11 @@ def build_flash_attn_fp8_module(
         o_finals = [oe0, oe1, oe2, oe3]
         # asm: output_complete_results folds the MFMA half of L (_v_LR) into
         # the VALU half (_v_L) right before the reciprocal.
-        l_final = _fadd(le_valu, Vec(le_mfma)[0]) if const_expr(L_MFMA_SLABS) else le_valu
+        l_final = le_valu
+        if const_expr(L_MFMA_SLABS > 0):
+            l_final = _fadd(l_final, Vec(le_mfma0)[0])
+        if const_expr(L_MFMA_SLABS > 1):
+            l_final = _fadd(l_final, Vec(le_mfma1)[0])
 
         inv_l = rocdl.rcp(T.f32, l_final)
         inv_l_v = _fmul(inv_l, v_descale)
