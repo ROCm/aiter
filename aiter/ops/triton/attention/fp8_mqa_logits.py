@@ -233,17 +233,13 @@ def fp8_mqa_logits(
         if arch == "gfx950":
             num_buffers = 2
             loop_variant = 0
-            # Tuned on gfx950 / Triton 3.7 over waves_per_eu x NUM_CHAINS x
-            # (BLOCK_KV, NUM_WARPS); see tune_kernel.py. The kernel is not MFMA
-            # bound -- MFMA is ~3% of issued instructions while the per-head
-            # reduction epilogue and the register traffic it forces dominate --
-            # so these pick the lowest-pressure point rather than the highest
-            # occupancy. waves_per_eu is the VGPR budget (512/waves), and at 4
-            # the 32-head BLOCK_M=2 path spills; 64 heads stay under the cap.
-            waves_per_eu = 3 if num_heads <= 32 else 4
-            # 4 parallel FMA chains cost more in live registers than they save
-            # in dependency depth at this tile size.
-            num_chains = 2 if USE_FOLDED_REDUCTION else 0
+            # Tuned on gfx950 / Triton 3.7. The kernel is VALU bound, not MFMA
+            # bound -- the per-head relu + weighted sum and the register
+            # pressure it creates dominate -- so these pick the lowest-pressure
+            # point rather than the highest occupancy. waves_per_eu is the VGPR
+            # budget (512/waves): 3 gives the 170 the tile below needs to stay
+            # spill-free; 4 spills and 5+ collapses.
+            waves_per_eu = 3
             num_warps = 2
             block_kv = 64
             # On Triton < 3.8, BLOCK_M=2 requires buffer stores: a masked
@@ -258,11 +254,32 @@ def fp8_mqa_logits(
                 if (num_heads <= 32 and seq_len > 4096 and block_m2_ok)
                 else 1
             )
-            mfma_nonk_dim = 32 if (head_size <= 64 or num_heads == 32) else 16
+            # 32x32x64 over 16x16x128: its output layout leaves only one head
+            # bit in lanes, so the head sum needs one cross-lane step instead of
+            # two (inner loop 70 -> 55 VALU ops). Needs num_heads >= 32 and
+            # BLOCK_KV / num_warps >= 32.
+            mfma_nonk_dim = 32 if (head_size <= 64 or num_heads >= 32) else 16
+            # Fold one head chunk at a time so only that chunk's accumulators
+            # are live; without it the wider 32x32 tile spills and loses more
+            # than the layout gains. BLOCK_M=2 loads its second row through the
+            # unchunked path, so chunking is BLOCK_M=1 only.
+            m_chunk = (
+                mfma_nonk_dim
+                if (num_heads > mfma_nonk_dim and block_m == 1 and mfma_nonk_dim == 32)
+                else 0
+            )
+            # Chunking already hands the scheduler independent work, so a
+            # second parallel FMA chain only costs live registers; the unchunked
+            # path still wants 2 for dependency depth.
+            num_chains = (1 if m_chunk else 2) if USE_FOLDED_REDUCTION else 0
             other = {
                 "USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED,
                 "BLOCK_M": block_m,
                 "MFMA_NONK_DIM": mfma_nonk_dim,
+                "M_CHUNK": m_chunk,
+                # halves the loop bookkeeping and gives the scheduler two KV
+                # tiles to interleave
+                "UNROLL": 2,
             }
         else:
             loop_variant = 1

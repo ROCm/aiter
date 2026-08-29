@@ -456,6 +456,140 @@ def _load_row_operands(
 
 
 @gluon.jit
+def _partial_fold_accum(
+    s,
+    w_col,
+    M_CHUNK: gl.constexpr,
+    BLOCK_KV: gl.constexpr,
+    mfma_layout: gl.constexpr,
+    NUM_CHAINS: gl.constexpr,
+    FIRST: gl.constexpr,
+    acc=None,
+):
+    """FMA-fold one [M_CHUNK, BLOCK_KV] score tile into `acc`.
+
+    `acc` stays in the pre-cross-lane layout, so the lane-crossing half of the
+    head reduction runs once per KV tile, not once per chunk.
+    """
+    linear_layout: gl.constexpr = gl.to_linear_layout(
+        mfma_layout, [M_CHUNK, BLOCK_KV]
+    )
+    plan: gl.constexpr = _make_head_reduction_plan(
+        linear_layout, M_CHUNK, BLOCK_KV, NUM_CHAINS
+    )
+    head_bit_shape: gl.constexpr = plan[0]
+    head_bit_order: gl.constexpr = plan[1]
+    folded_shape: gl.constexpr = plan[2]
+    fold_depth: gl.constexpr = plan[3]
+    folded_count: gl.constexpr = plan[4]
+
+    w = w_col.broadcast_to([M_CHUNK, BLOCK_KV])
+    s = s.reshape(head_bit_shape).permute(head_bit_order).reshape(folded_shape)
+    w = w.reshape(head_bit_shape).permute(head_bit_order).reshape(folded_shape)
+    if FIRST:
+        return _weighted_fma_fold_serial(s, w, folded_count, fold_depth)
+    else:
+        for i in gl.static_range(0, folded_count):
+            acc = gl.fma(
+                _split_leaf(s, i, fold_depth),
+                _split_leaf(w, i, fold_depth),
+                acc,
+            )
+        return acc
+
+
+@gluon.jit
+def _row_logits_split(
+    q_chunks,
+    mfma_k,
+    w_chunks,
+    kv_scales,
+    NUM_HEADS: gl.constexpr,
+    BLOCK_KV: gl.constexpr,
+    mfma_layout: gl.constexpr,
+    NUM_CHAINS: gl.constexpr,
+    M_CHUNK: gl.constexpr,
+):
+    """One query row's logits, folding each head chunk as its MFMA retires.
+
+    `_row_logits` materialises every accumulator before reducing; chunking keeps
+    one chunk's worth live, which is what keeps the 32x32x64 tile off the spill
+    path at 64 heads.
+    """
+    NCHUNK: gl.constexpr = NUM_HEADS // M_CHUNK
+    scores = _mqa_dot(q_chunks[0], mfma_k, M_CHUNK, BLOCK_KV, mfma_layout)
+    scores = relu_f32(scores)
+    acc = _partial_fold_accum(
+        scores,
+        w_chunks[0],
+        M_CHUNK,
+        BLOCK_KV,
+        mfma_layout,
+        NUM_CHAINS,
+        True,
+    )
+    for c in gl.static_range(1, NCHUNK):
+        scores = _mqa_dot(q_chunks[c], mfma_k, M_CHUNK, BLOCK_KV, mfma_layout)
+        scores = relu_f32(scores)
+        acc = _partial_fold_accum(
+            scores,
+            w_chunks[c],
+            M_CHUNK,
+            BLOCK_KV,
+            mfma_layout,
+            NUM_CHAINS,
+            False,
+            acc,
+        )
+    acc = gl.sum(acc, axis=2)  # parallel chains
+    acc = gl.sum(acc, axis=0)  # cross-lane head bits
+    acc = gl.convert_layout(acc, gl.SliceLayout(0, mfma_layout))
+    return acc * kv_scales
+
+
+@gluon.jit
+def _load_row_operands_chunk(
+    Q_ptr,
+    weights_ptr,
+    row_id,
+    head_offset: gl.constexpr,
+    stride_q_s,
+    stride_q_h: gl.constexpr,
+    stride_q_d: gl.constexpr,
+    stride_w_s,
+    stride_w_h: gl.constexpr,
+    M_CHUNK: gl.constexpr,
+    HEAD_SIZE: gl.constexpr,
+    layout_q: gl.constexpr,
+    mfma_layout: gl.constexpr,
+    dot_a_layout: gl.constexpr,
+):
+    """Q/weights for heads [head_offset, head_offset + M_CHUNK) of one row."""
+    q = gl.amd.cdna4.buffer_load(
+        ptr=Q_ptr,
+        offsets=row_id * stride_q_s
+        + (
+            (gl.arange(0, M_CHUNK, layout=gl.SliceLayout(1, layout_q)) + head_offset)
+            * stride_q_h
+        )[:, None]
+        + (gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, layout_q)) * stride_q_d)[
+            None, :
+        ],
+        cache=".cg",
+    )
+    w_block = gl.amd.cdna4.buffer_load(
+        ptr=weights_ptr,
+        offsets=row_id * stride_w_s
+        + (
+            (gl.arange(0, M_CHUNK, layout=gl.SliceLayout(1, mfma_layout)) + head_offset)
+            * stride_w_h
+        )[:, None],
+        cache=".cg",
+    )
+    return gl.convert_layout(q, dot_a_layout), w_block
+
+
+@gluon.jit
 def _row_logits(
     mfma_q,
     mfma_k,
@@ -496,19 +630,33 @@ def _emit_row_logits(
     USE_BUFFER_STORE: gl.constexpr,
     BLOCK_M: gl.constexpr,
     MASKED: gl.constexpr,
+    M_CHUNK: gl.constexpr = 0,
 ):
     """Reduce + store one KV tile for each of the BLOCK_M query rows in this block."""
     for r in gl.static_range(0, BLOCK_M):
-        scores = _row_logits(
-            mfma_qs[r],
-            mfma_k,
-            w_blocks[r],
-            kv_scales,
-            NUM_HEADS,
-            BLOCK_KV,
-            mfma_layout,
-            NUM_CHAINS,
-        )
+        if M_CHUNK > 0:
+            scores = _row_logits_split(
+                mfma_qs[r],
+                mfma_k,
+                w_blocks[r],
+                kv_scales,
+                NUM_HEADS,
+                BLOCK_KV,
+                mfma_layout,
+                NUM_CHAINS,
+                M_CHUNK,
+            )
+        else:
+            scores = _row_logits(
+                mfma_qs[r],
+                mfma_k,
+                w_blocks[r],
+                kv_scales,
+                NUM_HEADS,
+                BLOCK_KV,
+                mfma_layout,
+                NUM_CHAINS,
+            )
         if BLOCK_M == 1:
             if MASKED:
                 _store_logits_block(
@@ -556,6 +704,8 @@ def mqa_logits_loop_double_buf(
     USE_BUFFER_LOAD: gl.constexpr,
     USE_BUFFER_STORE: gl.constexpr,
     BLOCK_M: gl.constexpr,
+    M_CHUNK: gl.constexpr = 0,
+    UNROLL: gl.constexpr = 1,
 ):
     """Double-buffered KV walk shared by BLOCK_M query rows.
 
@@ -587,7 +737,7 @@ def mqa_logits_loop_double_buf(
     # at i+2 is guaranteed to address a full tile (i+2 in [2, num_full_tiles-1]),
     # so no mask is needed
     buf_cur: gl.int32 = 0
-    for i in tl.range(0, num_full_tiles - 2):
+    for i in tl.range(0, num_full_tiles - 2, loop_unroll_factor=UNROLL):
         kv_scales = _load_kv_scales_block(
             kv_scales_ptr,
             kv_scales_off,
@@ -624,6 +774,7 @@ def mqa_logits_loop_double_buf(
             USE_BUFFER_STORE,
             BLOCK_M,
             False,
+            M_CHUNK,
         )
 
         kv_scales_off += BLOCK_KV
@@ -670,6 +821,7 @@ def mqa_logits_loop_double_buf(
             USE_BUFFER_STORE,
             BLOCK_M,
             False,
+            M_CHUNK,
         )
 
         kv_scales_off += BLOCK_KV
@@ -711,6 +863,7 @@ def mqa_logits_loop_double_buf(
         USE_BUFFER_STORE,
         BLOCK_M,
         True,
+        M_CHUNK,
     )
 
     kv_scales_off += BLOCK_KV
@@ -751,6 +904,7 @@ def mqa_logits_loop_double_buf(
         USE_BUFFER_STORE,
         BLOCK_M,
         True,
+        M_CHUNK,
     )
 
 
@@ -785,6 +939,8 @@ def _gluon_fp8_mqa_logits_kernel(
     USE_PADDED_SHARED_LAYOUT: gl.constexpr,
     BLOCK_M: gl.constexpr = 1,  # query rows per workgroup
     MFMA_NONK_DIM: gl.constexpr = 32,
+    M_CHUNK: gl.constexpr = 0,  # heads folded per MFMA group (0 = whole tile)
+    UNROLL: gl.constexpr = 1,
 ):
 
     gl.static_assert(
@@ -793,6 +949,18 @@ def _gluon_fp8_mqa_logits_kernel(
     )
     gl.static_assert(
         BLOCK_M == 1 or BLOCK_M == 2, "only BLOCK_M in {1, 2} is implemented"
+    )
+    gl.static_assert(
+        M_CHUNK == 0 or NUM_HEADS % M_CHUNK == 0,
+        "M_CHUNK must divide NUM_HEADS",
+    )
+    gl.static_assert(
+        M_CHUNK == 0 or M_CHUNK >= MFMA_NONK_DIM,
+        "M_CHUNK must cover at least one MFMA M tile",
+    )
+    gl.static_assert(
+        M_CHUNK == 0 or BLOCK_M == 1,
+        "chunked head fold is only wired up for BLOCK_M == 1",
     )
 
     # Reversed so the longest segments (highest row ids in a causal layout) are
@@ -862,21 +1030,47 @@ def _gluon_fp8_mqa_logits_kernel(
         USE_PADDED_SHARED_LAYOUT,
     )
 
-    mfma_q, w_block = _load_row_operands(
-        Q_ptr,
-        weights_ptr,
-        row_id,
-        stride_q_s,
-        stride_q_h,
-        stride_q_d,
-        stride_w_s,
-        stride_w_h,
-        NUM_HEADS,
-        HEAD_SIZE,
-        layout_q,
-        mfma_layout,
-        dot_a_layout,
-    )
+    if M_CHUNK > 0:
+        NCHUNK: gl.constexpr = NUM_HEADS // M_CHUNK
+        q_chunks = ()
+        w_chunks = ()
+        for _c in gl.static_range(0, NCHUNK):
+            _qc, _wc = _load_row_operands_chunk(
+                Q_ptr,
+                weights_ptr,
+                row_id,
+                _c * M_CHUNK,
+                stride_q_s,
+                stride_q_h,
+                stride_q_d,
+                stride_w_s,
+                stride_w_h,
+                M_CHUNK,
+                HEAD_SIZE,
+                layout_q,
+                mfma_layout,
+                dot_a_layout,
+            )
+            q_chunks = q_chunks + (_qc,)
+            w_chunks = w_chunks + (_wc,)
+        mfma_q = q_chunks
+        w_block = w_chunks
+    else:
+        mfma_q, w_block = _load_row_operands(
+            Q_ptr,
+            weights_ptr,
+            row_id,
+            stride_q_s,
+            stride_q_h,
+            stride_q_d,
+            stride_w_s,
+            stride_w_h,
+            NUM_HEADS,
+            HEAD_SIZE,
+            layout_q,
+            mfma_layout,
+            dot_a_layout,
+        )
 
     if BLOCK_M == 1:
         mfma_qs = (mfma_q,)
@@ -936,4 +1130,6 @@ def _gluon_fp8_mqa_logits_kernel(
         USE_BUFFER_LOAD,
         USE_BUFFER_STORE,
         BLOCK_M,
+        M_CHUNK,
+        UNROLL,
     )
