@@ -1784,31 +1784,14 @@ NUM_BUFFERS = 6  # K: rotating LDS buffers (1 WG at K=6: 6*8KB=48KB LDS)
 NUM_BUFFERS_DENSE = 2  # K once the grid is deep enough to hide a short prologue
 TILES_PER_WG = 16  # CT: one H=128 token/WG; keeps cos/sin hoisting enabled
 TDM_DENSE_MIN_ROWS = 131072  # num_rows from which K=2 beats K=6
-# num_rows at which RT=8 first reaches 2 WGs per CU: 2 * 256 CUs * RT * CT.
-TDM_RT8_MIN_ROWS = 65536
+TDM_RT8_MIN_ROWS = 65536  # num_rows where RT=8 first reaches 2 WGs per 256 CUs
 
 
 def _tdm_tiles_per_wg(num_rows, head_dim=512):
-    """Pick (CT, K, RT) to fill wave slots on gfx1250.
-
-    Both knobs answer the same question -- can a workgroup's load latency be
-    hidden by a neighbour, or must it cover its own?
-
-    RT sets the workgroup size, so it sets how many of them the grid holds:
-    gx_q = num_rows / (RT * CT). Below 2 WGs/CU there is no neighbour to
-    overlap with, and halving RT to double the grid pays for itself: -10.5% at
-    num_rows=32768, -13.8% at 40960, -9.5% at 49152. At 65536 (exactly 2
-    WGs/CU) it is a wash, and past that the smaller workgroup costs more than
-    the extra parallelism returns (+2.4% at 262144), so RT=8 holds there.
-
-    K trades prefetch depth against the length of the load-only prologue. Once
-    the grid is deep enough that one WG's prologue overlaps another's steady
-    state, the shallow K=2 wins (-3.0% at num_rows=131072, -5.1% at 262144,
-    -2.9% at 2097152). Below that the deeper K=6 is needed: K=2 costs +31.9%
-    at 32768, +9.8% at 49152 and +4.1% at 65536.
-
-    Both thresholds assume a 256-CU part; they move on a card with a different
-    CU count.
+    """Pick (CT, K, RT). Both knobs ask the same thing: can a workgroup's load
+    latency be hidden by a neighbour, or must it cover its own? Thin grids need
+    a smaller WG (more of them) and a deeper prologue; dense grids need neither.
+    Thresholds assume a 256-CU part.
     """
     del head_dim  # tile bytes are implied by RT * D in the kernel
     k = NUM_BUFFERS_DENSE if num_rows >= TDM_DENSE_MIN_ROWS else NUM_BUFFERS
@@ -1955,14 +1938,16 @@ def _build_kernel_w32_tdm(
                 ]
             )
 
-        def load_cs(tok):
-            """cos/sin for this token, as PAIRS-wide f32 vectors."""
-            pos_i32 = fx.Int32(
+        def load_pos(tok):
+            return fx.Int32(
                 buffer_ops.buffer_load(pos_rsrc, tok, vec_width=1, dtype=T.i64).trunci(
                     i32
                 )
             )
-            return _cs_from_pos(pos_i32)
+
+        def load_cs(tok):
+            """cos/sin for this token, as PAIRS-wide f32 vectors."""
+            return _cs_from_pos(load_pos(tok))
 
         def issue_pos(tok):
             """Fire position buffer_load (returns raw i64, no wait)."""
@@ -2093,11 +2078,8 @@ def _build_kernel_w32_tdm(
             tile_base = g * CT  # first tile index this WG owns
             wg_row0 = tile_base * RT  # first row this WG owns
             out_row_bytes = D if const_expr(quant) else D * 2
-            # A buffer descriptor's num_records is 32-bit, so one descriptor
-            # reaches 4 GiB. q_out passes that at T*H*D*2 >= 4 GiB (T>=32768 at
-            # H=128, D=512) and rows past the limit are dropped. Bias the base
-            # per workgroup -- once, outside the tile loop -- so the 32-bit
-            # offset only spans this WG's CT*RT rows.
+            # num_records is 32-bit, so one descriptor only reaches 4 GiB; bias
+            # the base per WG so the offset spans CT*RT rows, not the tensor.
             q_out_rsrc = GTensor(
                 q_out,
                 dtype=T.bf16,
@@ -2225,20 +2207,14 @@ def _build_kernel_w32_tdm(
                 ]
             )
             wv = _load_tensor_vec(kv_weight, tid)
-            pos_i32 = fx.Int32(
-                buffer_ops.buffer_load(pos_rsrc, tok, vec_width=1, dtype=T.i64).trunci(
-                    i32
-                )
-            )
+            pos_i32 = load_pos(tok)
             cosv, sinv = _cs_from_pos(pos_i32)
 
             swa_rsrc = None
             swa_row_base = None
             do_swa = None
             if const_expr(kv_write):
-                # Gates mirror the wave32 path / the C++ sibling exactly: a stale
-                # token carries bid<0 or pos<0, and divsi truncates toward zero,
-                # so a negative pos would index the previous request's entry.
+                # Gates mirror the wave32 path / C++ sibling exactly.
                 bid_i32 = fx.Int32(
                     buffer_ops.buffer_load(
                         _ptr_res(batch_id_per_token), tok, vec_width=1, dtype=i32
@@ -2273,9 +2249,7 @@ def _build_kernel_w32_tdm(
                     dest_ok = (row >= 0) & (row < swa_num_rows)
                     do_swa = do_swa & dest_ok
                     row_safe = dest_ok.select(row, fx.Int32(0))
-                # row fits 32 bits but row*D*2 does not -- a unified V4 pool runs
-                # to ~150M rows, so widen before either multiply and reach the
-                # descriptor through the base address, not the 32-bit offset.
+                # row fits 32 bits, row*D*2 does not: widen before the multiply.
                 swa_rsrc = GTensor(
                     swa_kv,
                     dtype=T.bf16,
