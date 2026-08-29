@@ -720,6 +720,7 @@ def _get_config(
     N: int,
     K: int,
     shuffle: bool = False,
+    backend: str = "triton",
 ):
     # Note: Config files use K=2*K in their naming
     K = 2 * K
@@ -730,6 +731,7 @@ def _get_config(
             N,
             K,
             bounds=(4, 8, 16, 31, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192),
+            backend=backend,
         )
     else:
-        return get_gemm_config("GEMM-AFP4WFP4", M, N, K)
+        return get_gemm_config("GEMM-AFP4WFP4", M, N, K, backend=backend)

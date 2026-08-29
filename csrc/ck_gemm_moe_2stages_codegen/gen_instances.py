@@ -1074,7 +1074,7 @@ if __name__ == "__main__":
         default="silu",
         required=False,
         type=str,
-        choices=["silu", "gelu", "swiglu"],
+        choices=["silu", "gelu", "swiglu", "gelutanh"],
         help="select activation",
     )
 
@@ -1238,6 +1238,41 @@ if __name__ == "__main__":
                 c_dtype,
                 quant_dict[quant],
                 "swiglu",
+                routed_weight,
+                True,  # preshuffle (plain f8 forced True, mirrors general loop)
+                False,  # splitk
+            )
+            codegen.generate_instance_and_lookUpTable()
+
+        # gelutanh (gelu_tanh_and_mul) plain-f8 quant moe (per_tensor / per_token = PTPC).
+        # Same rationale as the swiglu loop above: the general quant loop uses
+        # acts=["silu","gelu"] and so ships 0 gelutanh x plain-f8 instances in the
+        # AOT/wheel prebuild. Runtime JIT (Path B, gen_func passes -b f8) already
+        # generates them on demand, so this loop only extends the AOT prebuild set
+        # and removes the ~first-run cold compile -- it is NOT required for
+        # correctness. Mirrors the general loop's plain-f8 path (f8 x f8, tag=a8w8,
+        # CDEElementOp=MulABScale, plain gridwise_moe_gemm.hpp). act="gelutanh" ->
+        # CK ActOP=4. preshuffle forced True for plain f8. Targets Gemma-family MoE
+        # experts that use the tanh-approx GELU. Independent loop so existing
+        # silu/gelu/swiglu/no-quant coverage is untouched.
+        gelutanh_plain_c_dtypes = ["f16", "b16"]
+        gelutanh_plain_quant_l = ["per_tensor", "per_token"]
+        for (
+            c_dtype,
+            routed_weight,
+            quant,
+        ) in itertools.product(
+            gelutanh_plain_c_dtypes,
+            routed_weight_l,
+            gelutanh_plain_quant_l,
+        ):
+            codegen = ck_moe_2stage_gemm_codegen(
+                args.working_path,
+                "f8",  # a_dtype
+                "f8",  # b_dtype
+                c_dtype,
+                quant_dict[quant],
+                "gelutanh",
                 routed_weight,
                 True,  # preshuffle (plain f8 forced True, mirrors general loop)
                 False,  # splitk
