@@ -80,178 +80,186 @@ def tdm_load(n=1):
 #   pair_exp(msb, n)     = n exp2 ops (3-cycle transcendental)
 #   o_rescale(n)         = n O *= exp_delta rescale ops
 #   tdm_load(n)          = n TDM prefetch ops
-GEMM1_SCHEDULE: list[list[int]] = [
-    # Stage 0: TDM K prefetch + K LDS loads + softmax
-    tdm_load(2) + sm_ops(0),  # wmma 0
-    lds_k(0, 3) + o_rescale(),  # wmma 1
-    lds_k(0, 3) + sm_ops(0, 2),  # wmma 2
-    lds_k(1, 3) + sm_ops(1, 2),  # wmma 3
-    lds_k(1, 3) + sm_ops(1, 2),  # wmma 4
-    lds_k(2, 3) + sm_ops(2, 2),  # wmma 5 (ds_wait)
-    lds_k(2, 3) + sm_ops(2) + sm_ops(0),  # wmma 6
-    lds_k(3, 3) + sm_ops(3, 2),  # wmma 7
-    lds_k(3, 3) + sm_ops(3),  # wmma 8
-    sm_ops(0, 2),
-    sm_ops(0, 2),  # wmma 9-10
-    sm_ops(1, 2),
-    sm_ops(1, 2),  # wmma 11-12
-    sm_ops(1) + o_rescale(),
-    sm_ops(1) + sm_ops(0),  # wmma 13-14
-    sm_ops(2) + sm_ops(3),  # wmma 15
-    sm_ops(2) + o_rescale(),
-    sm_ops(2) + o_rescale(),  # wmma 16-17
-    sm_ops(0, 2),
-    sm_ops(0, 2),  # wmma 18-19
-    sm_ops(0, 2),
-    sm_ops(0, 2),  # wmma 20-21
-    sm_ops(0, 2),
-    sm_ops(0) + sm_ops(2),  # wmma 22-23
-    # Stage 1
-    tdm_load(2) + sm_ops(2),
-    lds_k(0, 3) + o_rescale(),
-    lds_k(0, 3) + sm_ops(0),
-    lds_k(1, 3) + sm_ops(1, 2),
-    lds_k(1, 3) + sm_ops(1, 2),
-    lds_k(2, 3) + sm_ops(2, 2),
-    lds_k(2, 3) + sm_ops(2, 2),
-    lds_k(3, 3) + sm_ops(3),
-    lds_k(3, 3) + sm_ops(3),
-    sm_ops(3, 2),
-    sm_ops(3, 2),
-    sm_ops(3, 2),
-    sm_ops(1, 2),
-    sm_ops(1, 2),
-    sm_ops(1) + sm_ops(2),
-    sm_ops(1) + o_rescale(),
-    sm_ops(2) + o_rescale(),
-    sm_ops(2) + o_rescale(),
-    sm_ops(2, 2),
-    sm_ops(2, 2),
-    sm_ops(3, 2),
-    sm_ops(3, 2),
-    sm_ops(3, 2),
-    sm_ops(3) + sm_ops(0),
-    # Stage 2: K LDS loads + heavy softmax
-    lds_k(0, 3) + sm_ops(0) + sm_ops(3),
-    lds_k(0, 3) + sm_ops(0) + sm_ops(2),
-    lds_k(1, 3) + sm_ops(1, 2),
-    lds_k(1, 3) + sm_ops(1, 2),
-    lds_k(2, 3) + sm_ops(2, 2),
-    lds_k(2, 3) + sm_ops(2, 2),
-    lds_k(3, 3) + sm_ops(3, 2),
-    lds_k(3, 3) + sm_ops(3, 2),
-    sm_ops(0, 6),
-    sm_ops(0, 7),
-    sm_ops(0, 7),
-    sm_ops(1, 7),
-    sm_ops(1, 7),
-    sm_ops(1, 7),
-    sm_ops(2, 2) + o_rescale(),
-    sm_ops(2, 2) + o_rescale(),
-    sm_ops(2, 2) + o_rescale(),
-    sm_ops(3, 2) + o_rescale(),
-    sm_ops(2, 6),
-    sm_ops(2, 6),
-    sm_ops(2, 3) + sm_ops(3, 3),
-    sm_ops(3, 6),
-    sm_ops(3, 6),
-    sm_ops(0, 4) + sm_ops(3, 2),
-    # Stage 3: V LDS loads + remaining softmax
-    lds_v(0, 2) + sm_ops(0, 2),
-    lds_v(0, 2) + sm_ops(0, 2),
-    lds_v(1, 2) + sm_ops(1, 2),
-    lds_v(1, 2) + sm_ops(1) + sm_ops(1) + sm_ops(2),
-    lds_v(2, 2) + sm_ops(2, 2),
-    lds_v(2, 2) + sm_ops(2, 2),
-    lds_v(3, 2) + sm_ops(3, 2),
-    lds_v(3, 2) + sm_ops(3) + sm_ops(1),
-    sm_ops(1, 2) + sm_ops(3),
-    sm_ops(1) + sm_ops(0),
-    sm_ops(1) + sm_ops(3),
-    sm_ops(1) + sm_ops(0) + sm_ops(3),
-    sm_ops(2) + sm_ops(3),
-    sm_ops(2, 2),
-    sm_ops(3, 2),
-    sm_ops(3, 2) + sm_ops(1),
-    o_rescale() + sm_ops(2),
-    o_rescale() + sm_ops(2),
-    o_rescale() + sm_ops(2) + sm_ops(0),
-    o_rescale() + sm_ops(2) + sm_ops(3),
-    sm_ops(0) + sm_ops(3) + sm_ops(1),
-    sm_ops(0),
-    sm_ops(3),
-    [],
+GEMM1_SCHEDULE: list[list[list[int]]] = [
+    [  # Stage 0: TDM K prefetch + K LDS loads + softmax
+        tdm_load(2) + sm_ops(0),  # wmma 0
+        lds_k(0, 3) + o_rescale(),  # wmma 1
+        lds_k(0, 3) + sm_ops(0, 2),  # wmma 2
+        lds_k(1, 3) + sm_ops(1, 2),  # wmma 3
+        lds_k(1, 3) + sm_ops(1, 2),  # wmma 4
+        lds_k(2, 3) + sm_ops(2, 2),  # wmma 5 (ds_wait)
+        lds_k(2, 3) + sm_ops(2) + sm_ops(0),  # wmma 6
+        lds_k(3, 3) + sm_ops(3, 2),  # wmma 7
+        lds_k(3, 3) + sm_ops(3),  # wmma 8
+        sm_ops(0, 2),
+        sm_ops(0, 2),  # wmma 9-10
+        sm_ops(1, 2),
+        sm_ops(1, 2),  # wmma 11-12
+        sm_ops(1) + o_rescale(),
+        sm_ops(1) + sm_ops(0),  # wmma 13-14
+        sm_ops(2) + sm_ops(3),  # wmma 15
+        sm_ops(2) + o_rescale(),
+        sm_ops(2) + o_rescale(),  # wmma 16-17
+        sm_ops(0, 2),
+        sm_ops(0, 2),  # wmma 18-19
+        sm_ops(0, 2),
+        sm_ops(0, 2),  # wmma 20-21
+        sm_ops(0, 2),
+        sm_ops(0) + sm_ops(2),  # wmma 22-23
+    ],
+    [  # Stage 1
+        tdm_load(2) + sm_ops(2),
+        lds_k(0, 3) + o_rescale(),
+        lds_k(0, 3) + sm_ops(0),
+        lds_k(1, 3) + sm_ops(1, 2),
+        lds_k(1, 3) + sm_ops(1, 2),
+        lds_k(2, 3) + sm_ops(2, 2),
+        lds_k(2, 3) + sm_ops(2, 2),
+        lds_k(3, 3) + sm_ops(3),
+        lds_k(3, 3) + sm_ops(3),
+        sm_ops(3, 2),
+        sm_ops(3, 2),
+        sm_ops(3, 2),
+        sm_ops(1, 2),
+        sm_ops(1, 2),
+        sm_ops(1) + sm_ops(2),
+        sm_ops(1) + o_rescale(),
+        sm_ops(2) + o_rescale(),
+        sm_ops(2) + o_rescale(),
+        sm_ops(2, 2),
+        sm_ops(2, 2),
+        sm_ops(3, 2),
+        sm_ops(3, 2),
+        sm_ops(3, 2),
+        sm_ops(3) + sm_ops(0),
+    ],
+    [  # Stage 2: K LDS loads + heavy softmax
+        lds_k(0, 3) + sm_ops(0) + sm_ops(3),
+        lds_k(0, 3) + sm_ops(0) + sm_ops(2),
+        lds_k(1, 3) + sm_ops(1, 2),
+        lds_k(1, 3) + sm_ops(1, 2),
+        lds_k(2, 3) + sm_ops(2, 2),
+        lds_k(2, 3) + sm_ops(2, 2),
+        lds_k(3, 3) + sm_ops(3, 2),
+        lds_k(3, 3) + sm_ops(3, 2),
+        sm_ops(0, 6),
+        sm_ops(0, 7),
+        sm_ops(0, 7),
+        sm_ops(1, 7),
+        sm_ops(1, 7),
+        sm_ops(1, 7),
+        sm_ops(2, 2) + o_rescale(),
+        sm_ops(2, 2) + o_rescale(),
+        sm_ops(2, 2) + o_rescale(),
+        sm_ops(3, 2) + o_rescale(),
+        sm_ops(2, 6),
+        sm_ops(2, 6),
+        sm_ops(2, 3) + sm_ops(3, 3),
+        sm_ops(3, 6),
+        sm_ops(3, 6),
+        sm_ops(0, 4) + sm_ops(3, 2),
+    ],
+    [  # Stage 3: V LDS loads + remaining softmax
+        lds_v(0, 2) + sm_ops(0, 2),
+        lds_v(0, 2) + sm_ops(0, 2),
+        lds_v(1, 2) + sm_ops(1, 2),
+        lds_v(1, 2) + sm_ops(1) + sm_ops(1) + sm_ops(2),
+        lds_v(2, 2) + sm_ops(2, 2),
+        lds_v(2, 2) + sm_ops(2, 2),
+        lds_v(3, 2) + sm_ops(3, 2),
+        lds_v(3, 2) + sm_ops(3) + sm_ops(1),
+        sm_ops(1, 2) + sm_ops(3),
+        sm_ops(1) + sm_ops(0),
+        sm_ops(1) + sm_ops(3),
+        sm_ops(1) + sm_ops(0) + sm_ops(3),
+        sm_ops(2) + sm_ops(3),
+        sm_ops(2, 2),
+        sm_ops(3, 2),
+        sm_ops(3, 2) + sm_ops(1),
+        o_rescale() + sm_ops(2),
+        o_rescale() + sm_ops(2),
+        o_rescale() + sm_ops(2) + sm_ops(0),
+        o_rescale() + sm_ops(2) + sm_ops(3),
+        sm_ops(0) + sm_ops(3) + sm_ops(1),
+        sm_ops(0),
+        sm_ops(3),
+        [],
+    ],
 ]
 # GEMM2 (PV) schedule: 64 rows = 4 stages x 16 WMMAs
-GEMM2_SCHEDULE: list[list[int]] = [
-    # Stage 0: TDM + V LDS loads + tree_max (PART0)
-    tdm_load(2) + tree_max(0, 3),
-    lds_v(0, 2) + tree_max(0, 3),
-    lds_v(0, 2) + tree_max(0, 3),
-    lds_v(1, 2) + tree_max(1, 4),
-    lds_v(1, 2) + tree_max(1, 4),
-    lds_v(2, 2) + tree_max(2, 4),
-    lds_v(2, 2) + tree_max(2, 4),
-    lds_v(3, 2) + tree_max(3, 4),
-    lds_v(3, 2) + tree_max(3, 4),
-    tree_max(0) + tree_max(2, 3) + tree_max(3),
-    tree_max(0) + tree_max(1, 2) + tree_max(3),
-    tree_max(0, 4) + tree_max(1),
-    tree_max(0) + tree_max(1, 2) + tree_max(2, 2),
-    tree_max(1) + tree_max(2, 2) + tree_max(3, 2),
-    tree_max(2) + tree_max(3, 2) + tree_max(1, 2),
-    tree_max(3, 2),
-    # Stage 1: V LDS loads + cross_max (PART1) + softmax PART2
-    tdm_load(2) + tree_max(0),
-    lds_v(0, 2) + [0, 1, 2, 3],
-    lds_v(0, 2) + [0, 1, 2, 3],
-    lds_v(1, 2) + [1, 0, 2, 3],
-    lds_v(1, 2) + [1, 0],
-    lds_v(2, 2) + [2, 2, 1],
-    lds_v(2, 2) + [2, 0, 1],
-    lds_v(3, 2) + [3],
-    lds_v(3, 2) + [3, 3],
-    cross_max(4),
-    cross_max(4),
-    sm_ops(1, 4) + sm_ops(2, 4),
-    sm_ops(0, 4) + sm_ops(3, 4),
-    sm_ops(0) + sm_ops(1) + sm_ops(2) + sm_ops(3),
-    (sm_ops(0) + sm_ops(1) + sm_ops(2) + sm_ops(3)) * 2,
-    sm_ops(0) + sm_ops(1) + sm_ops(2) + sm_ops(3),
-    # Stage 2: V LDS loads + softmax PART2
-    lds_v(0, 2) + sm_ops(0, 3),
-    lds_v(0, 2) + sm_ops(0, 3),
-    lds_v(1, 2) + sm_ops(1) + sm_ops(2, 2),
-    lds_v(1, 2) + sm_ops(1) + sm_ops(2, 2),
-    lds_v(2, 2) + sm_ops(2) + sm_ops(1, 2),
-    lds_v(2, 2) + sm_ops(2) + sm_ops(1, 2),
-    lds_v(3, 2) + sm_ops(3, 4),
-    lds_v(3, 2) + sm_ops(3, 3),
-    sm_ops(0, 6),
-    sm_ops(0, 3) + sm_ops(1),
-    sm_ops(1, 6),
-    sm_ops(1, 3) + sm_ops(2, 2),
-    sm_ops(2, 6),
-    sm_ops(3, 3),
-    sm_ops(3, 4),
-    sm_ops(0, 2) + sm_ops(1, 2),
-    # Stage 3: K LDS loads + pair_exp
-    lds_k(0, 3) + pair_exp(0, 2),
-    lds_k(0, 3) + pair_exp(0),
-    lds_k(1, 3) + pair_exp(1, 2),
-    lds_k(1, 3) + pair_exp(1, 2),
-    lds_k(2, 3) + sm_ops(2) + pair_exp(2),
-    lds_k(2, 3) + sm_ops(2) + pair_exp(2),
-    lds_k(3, 3) + sm_ops(3) + pair_exp(3),
-    lds_k(3, 3) + sm_ops(3) + pair_exp(3),
-    pair_exp(0, 3),
-    pair_exp(0, 2) + pair_exp(1),
-    pair_exp(1, 3),
-    pair_exp(3, 3),
-    pair_exp(2, 3),
-    pair_exp(2, 3),
-    pair_exp(3, 3),
-    [],
+GEMM2_SCHEDULE: list[list[list[int]]] = [
+    [  # Stage 0: TDM + V LDS loads + tree_max (PART0)
+        tdm_load(2) + tree_max(0, 3),
+        lds_v(0, 2) + tree_max(0, 3),
+        lds_v(0, 2) + tree_max(0, 3),
+        lds_v(1, 2) + tree_max(1, 4),
+        lds_v(1, 2) + tree_max(1, 4),
+        lds_v(2, 2) + tree_max(2, 4),
+        lds_v(2, 2) + tree_max(2, 4),
+        lds_v(3, 2) + tree_max(3, 4),
+        lds_v(3, 2) + tree_max(3, 4),
+        tree_max(0) + tree_max(2, 3) + tree_max(3),
+        tree_max(0) + tree_max(1, 2) + tree_max(3),
+        tree_max(0, 4) + tree_max(1),
+        tree_max(0) + tree_max(1, 2) + tree_max(2, 2),
+        tree_max(1) + tree_max(2, 2) + tree_max(3, 2),
+        tree_max(2) + tree_max(3, 2) + tree_max(1, 2),
+        tree_max(3, 2),
+    ],
+    [  # Stage 1: V LDS loads + cross_max (PART1) + softmax PART2
+        tdm_load(2) + tree_max(0),
+        lds_v(0, 2) + [0, 1, 2, 3],
+        lds_v(0, 2) + [0, 1, 2, 3],
+        lds_v(1, 2) + [1, 0, 2, 3],
+        lds_v(1, 2) + [1, 0],
+        lds_v(2, 2) + [2, 2, 1],
+        lds_v(2, 2) + [2, 0, 1],
+        lds_v(3, 2) + [3],
+        lds_v(3, 2) + [3, 3],
+        cross_max(4),
+        cross_max(4),
+        sm_ops(1, 4) + sm_ops(2, 4),
+        sm_ops(0, 4) + sm_ops(3, 4),
+        sm_ops(0) + sm_ops(1) + sm_ops(2) + sm_ops(3),
+        (sm_ops(0) + sm_ops(1) + sm_ops(2) + sm_ops(3)) * 2,
+        sm_ops(0) + sm_ops(1) + sm_ops(2) + sm_ops(3),
+    ],
+    [  # Stage 2: V LDS loads + softmax PART2
+        lds_v(0, 2) + sm_ops(0, 3),
+        lds_v(0, 2) + sm_ops(0, 3),
+        lds_v(1, 2) + sm_ops(1) + sm_ops(2, 2),
+        lds_v(1, 2) + sm_ops(1) + sm_ops(2, 2),
+        lds_v(2, 2) + sm_ops(2) + sm_ops(1, 2),
+        lds_v(2, 2) + sm_ops(2) + sm_ops(1, 2),
+        lds_v(3, 2) + sm_ops(3, 4),
+        lds_v(3, 2) + sm_ops(3, 3),
+        sm_ops(0, 6),
+        sm_ops(0, 3) + sm_ops(1),
+        sm_ops(1, 6),
+        sm_ops(1, 3) + sm_ops(2, 2),
+        sm_ops(2, 6),
+        sm_ops(3, 3),
+        sm_ops(3, 4),
+        sm_ops(0, 2) + sm_ops(1, 2),
+    ],
+    [  # Stage 3: K LDS loads + pair_exp
+        lds_k(0, 3) + pair_exp(0, 2),
+        lds_k(0, 3) + pair_exp(0),
+        lds_k(1, 3) + pair_exp(1, 2),
+        lds_k(1, 3) + pair_exp(1, 2),
+        lds_k(2, 3) + sm_ops(2) + pair_exp(2),
+        lds_k(2, 3) + sm_ops(2) + pair_exp(2),
+        lds_k(3, 3) + sm_ops(3) + pair_exp(3),
+        lds_k(3, 3) + sm_ops(3) + pair_exp(3),
+        pair_exp(0, 3),
+        pair_exp(0, 2) + pair_exp(1),
+        pair_exp(1, 3),
+        pair_exp(3, 3),
+        pair_exp(2, 3),
+        pair_exp(2, 3),
+        pair_exp(3, 3),
+        [],
+    ],
 ]
 
 
@@ -1363,7 +1371,7 @@ def gemm1_interleaved_stage(
         if const_expr(tdm_barrier and gemm_idx == _g1_barrier_idx):
             Atom.s_wait_tensorcnt(4)
             rocdl.s_barrier_signal(-1)
-        _g1_row = GEMM1_SCHEDULE[stage * GEMM_INST_COUNT + gemm_idx]
+        _g1_row = GEMM1_SCHEDULE[stage][gemm_idx]
         _g1_half = len(_g1_row) // 2
         for _i in range_constexpr(len(_g1_row)):
             if const_expr(_i < _g1_half):
@@ -1544,7 +1552,7 @@ def gemm2_interleaved_stage(
         if const_expr(tdm_barrier and gemm_idx == _pv_barrier_idx):
             Atom.s_wait_tensorcnt(4)
             rocdl.s_barrier_signal(-1)
-        _g2_row = GEMM2_SCHEDULE[stage * PV_GEMM_INST_COUNT + gemm_idx]
+        _g2_row = GEMM2_SCHEDULE[stage][gemm_idx]
         _g2_half = len(_g2_row) // 2
         for _i in range_constexpr(len(_g2_row)):
             if const_expr(_i < _g2_half):
@@ -2016,6 +2024,47 @@ def compute_num_tiles(
     else:
         first_causal_tile_idx = num_tiles_minus1_idx
     return num_tiles, num_tiles_idx, num_tiles_minus1_idx, first_causal_tile_idx
+
+
+def core_loop_setup(
+    ctx, ptr_K, stride_k_32, kv_lds_addrs_b,
+    k_b, v_a, k_a, v_b,
+    softmax_state_pro, sp_pairs_all_pro, all_su_sp_tiles,
+    causal_offset, IS_CAUSAL, _K_CFG, _sk_elems,
+):
+    actual_kv_len = ctx["actual_kv_len"]
+    actual_q_len, bx = ctx["actual_q_len"], ctx["bx"]
+    k_offset, stride_k_seq = ctx["k_offset"], ctx["stride_k_seq"]
+    wave_id = ctx["wave_id"]
+    tile_n_const, zero_v8f32 = ctx["tile_n_const"], ctx["zero_v8f32"]
+    ty = ctx["ty"]
+
+    num_tiles, num_tiles_idx, num_tiles_minus1_idx, first_causal_tile_idx = (
+        compute_num_tiles(
+            actual_kv_len, actual_q_len, bx,
+            tile_n_const, causal_offset, IS_CAUSAL,
+        )
+    )
+
+    rocdl.sched_barrier(0)
+    k_tile1_stride = tile_n_const * stride_k_seq
+    k_tile1_offset = k_offset + k_tile1_stride
+    k_tile1_oob_dg1 = TDM.build_oob_dg1_list(
+        _K_CFG, QK_HDIM, _sk_elems,
+        actual_kv_len - TILE_N, wave_id, dim0_stride=200,
+    )
+    TDM.load_k_only(
+        ptr_K, k_tile1_offset, stride_k_seq, stride_k_32,
+        wave_id, k_b, oob_dg1_list=k_tile1_oob_dg1,
+    )
+    rocdl.sched_barrier(0)
+
+    kv_tiles_init = load_initial_kv_tiles(ty, kv_lds_addrs_b, blk=0, su=0)
+    init_args = build_init_args(
+        zero_v8f32, softmax_state_pro, sp_pairs_all_pro,
+        kv_tiles_init, all_su_sp_tiles, k_b, v_a, k_a, v_b,
+    )
+    return init_args, num_tiles, num_tiles_idx, num_tiles_minus1_idx, first_causal_tile_idx
 
 
 def epilogue_single_tile(ctx, ep):

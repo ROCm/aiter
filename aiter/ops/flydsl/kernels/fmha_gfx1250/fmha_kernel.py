@@ -192,51 +192,14 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             ctx["tile_n_const"] = tile_n_const
             ctx["zero_v8f32"] = zero_v8f32
 
-            # ── Compute tile counts + causal split ──
-            num_tiles, num_tiles_idx, num_tiles_minus1_idx, first_causal_tile_idx = (
-                compute_num_tiles(
-                    actual_kv_len,
-                    actual_q_len,
-                    bx,
-                    tile_n_const,
-                    causal_offset,
-                    IS_CAUSAL,
+            # ── Core loop setup: tile counts + K prefetch + init args ──
+            init_args, num_tiles, num_tiles_idx, num_tiles_minus1_idx, first_causal_tile_idx = (
+                core_loop_setup(
+                    ctx, ptr_K, stride_k_32, kv_lds_addrs_b,
+                    k_b, v_a, k_a, v_b,
+                    softmax_state_pro, sp_pairs_all_pro, all_su_sp_tiles,
+                    causal_offset, IS_CAUSAL, _K_CFG, _sk_elems,
                 )
-            )
-
-            # ── K(tile 1) prefetch ──
-            rocdl.sched_barrier(0)
-            k_tile1_stride = tile_n_const * stride_k_seq
-            k_tile1_offset = k_offset + k_tile1_stride
-            k_tile1_oob_dg1 = TDM.build_oob_dg1_list(
-                _K_CFG,
-                QK_HDIM,
-                _sk_elems,
-                actual_kv_len - TILE_N,
-                wave_id,
-                dim0_stride=200,
-            )
-            TDM.load_k_only(
-                ptr_K,
-                k_tile1_offset,
-                stride_k_seq,
-                stride_k_32,
-                wave_id,
-                k_b,
-                oob_dg1_list=k_tile1_oob_dg1,
-            )
-            rocdl.sched_barrier(0)
-            kv_tiles_init = load_initial_kv_tiles(ty, kv_lds_addrs_b, blk=0, su=0)
-            init_args = build_init_args(
-                zero_v8f32,
-                softmax_state_pro,
-                sp_pairs_all_pro,
-                kv_tiles_init,
-                all_su_sp_tiles,
-                k_b,
-                v_a,
-                k_a,
-                v_b,
             )
 
             # ── Main KV Loop: non-causal tiles ──
