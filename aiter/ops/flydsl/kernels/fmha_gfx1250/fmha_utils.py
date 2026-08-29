@@ -1774,6 +1774,25 @@ class TDM:
         )
 
     @staticmethod
+    def make_kv_dg1(is_k, stride_seq_elems):
+        config = (1 << 16) | (K_TDM_CONFIG if is_k else V_TDM_CONFIG)
+        dim0 = QK_HDIM if is_k else 128
+        dim0_stride = 200 if is_k else 128
+        return Vec.from_elements(
+            [
+                fx.Int32(config),
+                fx.Int32(dim0 << 16),
+                fx.Int32(8 << 16),
+                fx.Int32(dim0_stride << 16),
+                fx.Int32(8),
+                stride_seq_elems,
+                fx.Int32(0),
+                fx.Int32(0),
+            ],
+            fx.Int32,
+        )
+
+    @staticmethod
     def make_kv_dg1_with_oob(
         config_bf16,
         dim0_elems,
@@ -1835,25 +1854,10 @@ class TDM:
         lds_base_i32,
         oob_dg1_list=None,
     ):
-        config = (1 << 16) | (K_TDM_CONFIG if is_k else V_TDM_CONFIG)
-        dim0 = QK_HDIM if is_k else 128
-        dim0_stride = 200 if is_k else 128
         dg1 = (
             oob_dg1_list
             if oob_dg1_list is not None
-            else Vec.from_elements(
-                [
-                    fx.Int32(config),
-                    fx.Int32(dim0 << 16),
-                    fx.Int32(8 << 16),
-                    fx.Int32(dim0_stride << 16),
-                    fx.Int32(8),
-                    stride_seq >> 1,
-                    fx.Int32(0),
-                    fx.Int32(0),
-                ],
-                fx.Int32,
-            )
+            else TDM.make_kv_dg1(is_k, stride_seq >> 1)
         )
         row_bytes = K_ROW_BYTES if is_k else V_ROW_BYTES
         su_p_size = LDS_K_SU_P_SIZE if is_k else LDS_V_SU_P_SIZE
@@ -2329,26 +2333,10 @@ def _setup_tdm_descs(
     oob_dg1_override,
 ):
     is_k = kv_key == "k"
-    _CFG = (1 << 16) | (K_TDM_CONFIG if is_k else V_TDM_CONFIG)
-    _stride_elems = stride_seq >> 1
     if const_expr(oob_dg1_override is not None):
         dg1 = oob_dg1_override
     else:
-        dim0 = QK_HDIM if is_k else 128
-        dim0_stride = 200 if is_k else 128
-        dg1 = Vec.from_elements(
-            [
-                fx.Int32(_CFG),
-                fx.Int32(dim0 << 16),
-                fx.Int32(8 << 16),
-                fx.Int32(dim0_stride << 16),
-                fx.Int32(8),
-                _stride_elems,
-                fx.Int32(0),
-                fx.Int32(0),
-            ],
-            fx.Int32,
-        )
+        dg1 = TDM.make_kv_dg1(is_k, stride_seq >> 1)
     row_bytes = K_ROW_BYTES if is_k else V_ROW_BYTES
     su_p_size = LDS_K_SU_P_SIZE if is_k else LDS_V_SU_P_SIZE
     addr = compute_global_addr(ptr_tensor, offset, wave_id, 8 * stride_seq)
