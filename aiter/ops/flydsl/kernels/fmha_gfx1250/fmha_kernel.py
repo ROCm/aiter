@@ -138,7 +138,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             scale = arith.constant(1.4426950408889634, type=T.f32) * scalar_f
             sgpr_state = {
                 "s_log2e_scl": scale,
-                "s_log2e_scl_pair": fx.vector.broadcast(T.vec(2, T.f32), scale),
+                "s_log2e_scl_pair": vector.broadcast(T.vec(2, T.f32), scale),
             }
             ctx = {
                 "ty": ty,

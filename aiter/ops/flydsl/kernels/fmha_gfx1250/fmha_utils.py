@@ -446,17 +446,7 @@ def _banked_op(result, bank):
 
 def _wmma_bf16(ty, src_a, src_b, acc, bank_dst):
     sched_barrier(0)
-    r = rocdl_dialect.wmma_f32_16x16x32_bf16(
-        ty["v8f32"],
-        src_a,
-        src_b,
-        acc,
-        signA=False,
-        signB=False,
-        modC=0,
-        reuseA=False,
-        reuseB=False,
-    )
+    r = rocdl_dialect.wmma_f32_16x16x32_bf16(ty["v8f32"], src_a, src_b, acc)
     return _banked_op(r.result, bank_dst)
 
 
@@ -1651,7 +1641,7 @@ def gemm2_interleaved_stage(
             if _ed is None:
                 _o_rescale_ed_v8[d_msb] = None
                 return
-            _o_rescale_ed_v8[d_msb] = fx.vector.broadcast(T.vec(8, T.f32), _ed)
+            _o_rescale_ed_v8[d_msb] = vector.broadcast(T.vec(8, T.f32), _ed)
 
     def _emit_o_rescale_tile(d_msb, n):
         if const_expr(o_rescale_exp_delta is None):
@@ -2458,7 +2448,7 @@ def fmha_pipeline_ctx(
 
     ed_v8 = []
     for dm in fx.range_constexpr(NUM_MSB):
-        ed_v8.append(fx.vector.broadcast(T.vec(8, T.f32), ia_exp_delta[dm]))
+        ed_v8.append(vector.broadcast(T.vec(8, T.f32), ia_exp_delta[dm]))
     o_rescale_by_stage = []
     for s in fx.range_constexpr(N_PV_WMMA_N):
         stage_closures = []
@@ -2817,7 +2807,7 @@ def _ep_finish(
             op()
     p_tiles = Softmax.build_p_tiles(ty, sfx)
     for msb in fx.range_constexpr(NUM_MSB):
-        edv8 = fx.vector.broadcast(T.vec(8, T.f32), exp_delta_rescale[msb])
+        edv8 = vector.broadcast(T.vec(8, T.f32), exp_delta_rescale[msb])
         for n in fx.range_constexpr(N_PV_WMMA_N):
             o_tiles[msb][n] = o_tiles[msb][n] * edv8
     kv_pv = build_kv_lds_addrs(lane_id, ep_k_cur_base, v_base_for_pv)
@@ -2865,10 +2855,10 @@ def _ep_finish(
     obf16 = []
     for msb in fx.range_constexpr(NUM_MSB):
         rcp = rocdl.rcp(ty["f32"], rsf[msb])
-        rv8 = fx.vector.broadcast(T.vec(8, T.f32), rcp)
+        rv8 = vector.broadcast(T.vec(8, T.f32), rcp)
         obf16.append(
             [
-                fx.trunc_f(v8bf16, o_tiles[msb][n] * rv8)
+                arith.truncf(v8bf16, o_tiles[msb][n] * rv8)
                 for n in fx.range_constexpr(N_PV_WMMA_N)
             ]
         )
@@ -2887,7 +2877,7 @@ def _ep_finish(
             ioff = (msb // 2) * 16 * TDM_D_TILE_DIM0 + (msb % 2) * 128 + n * 32
             la = dw + loff + ioff
             llvm_dialect.store(
-                fx.vector.bitcast(v4i32t, obf16[msb][n]),
+                vector.bitcast(v4i32t, obf16[msb][n]),
                 llvm_dialect.inttoptr(ldst, la),
                 volatile_=True,
             )
