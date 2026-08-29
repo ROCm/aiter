@@ -49,7 +49,8 @@ def _is_gfx950():
 
 
 # Scoped to the gate tests rather than module-level: the get_meta_param group
-# below is arch-independent pure-Python table logic and must also run on gfx942.
+# below is arch-independent table logic (it still allocates the split indptr
+# on CUDA) and must also run on gfx942.
 gate_only = pytest.mark.skipif(
     not _is_gfx950(), reason="gate only differentiates on gfx950"
 )
