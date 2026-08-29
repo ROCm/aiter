@@ -797,10 +797,13 @@ __global__ void inverse_rope_group_quant_kernel(
                 const float sn = static_cast<float>(sbuf[i]);
                 const float even = vals[2 * i];
                 const float odd = vals[2 * i + 1];
-                vals[2 * i] = even * c + odd * sn;
-                vals[2 * i + 1] = odd * c - even * sn;
+                using f32x2 = float __attribute__((ext_vector_type(2)));
+                const f32x2 r =
+                    f32x2{even, odd} * f32x2{c, c} + f32x2{odd, even} * f32x2{sn, -sn};
+                vals[2 * i]     = r[0];
+                vals[2 * i + 1] = r[1];
                 if constexpr(kFuseRed)
-                    red[i] = fmaxf(fabsf(vals[2 * i]), fabsf(vals[2 * i + 1]));
+                    red[i] = fmaxf(fabsf(r[0]), fabsf(r[1]));
             }
             red_ready = kFuseRed;
         };
@@ -1320,7 +1323,7 @@ void inverse_rope_group_quant(
         // bimodal over a ~3% spread in a config that does not change there, so
         // there is nothing to fit anyway.
         constexpr int kWholeRowFloorWavesPerSimd = 32;
-        constexpr int kWholeRowCeilWavesPerSimd  = 64;
+        constexpr int kWholeRowCeilWavesPerSimd  = 32;
         whole_row_block = !wave64 && LAYOUT == kScaleN32K4 && GS == 32 &&
                           wide_waves >= simds * kWholeRowFloorWavesPerSimd &&
                           wide_waves < simds * kWholeRowCeilWavesPerSimd;
