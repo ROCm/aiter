@@ -30,8 +30,8 @@ def _get_config(
     N: int,
     K: int,
 ):
-    config, is_tunned = get_gemm_config("GEMM-A8W8", M, N, K)
-    return compute_splitk_params(config, K), is_tunned
+    config, is_tuned = get_gemm_config("GEMM-A8W8", M, N, K)
+    return compute_splitk_params(config, K), is_tuned
 
 
 def gemm_a8w8(
