@@ -255,12 +255,6 @@ GEMM2_SCHEDULE: list[list[int]] = [
 ]
 
 
-def g1_row_idx(stage: int, wmma: int) -> int:
-    return stage * GEMM_INST_COUNT + wmma
-
-
-def g2_row_idx(stage: int, wmma: int) -> int:
-    return stage * PV_GEMM_INST_COUNT + wmma
 
 
 WAVE_SIZE = 32
@@ -307,7 +301,6 @@ ALU_STAGES = 8
 KV_K = 0
 KV_V = 1
 KV_NONE = 2
-BARRIER_SIGNAL_AHEAD = 0
 TDM_LOADS_PER_STAGE = 2
 
 LDS_K_SU_P_SIZE = 0x3200
@@ -360,9 +353,8 @@ def make_v2f32(lo, hi):
 
 
 def split_v2f32(pair):
-    lo = Vec(pair, dtype=Float32)[0].ir_value()
-    hi = Vec(pair, dtype=Float32)[1].ir_value()
-    return lo, hi
+    v = Vec(pair, dtype=Float32)
+    return v[0].ir_value(), v[1].ir_value()
 
 
 def broadcast_f32_to_v2f32(val):
@@ -1378,11 +1370,11 @@ def gemm1_interleaved_stage(
         sched_barrier(0)
         if const_expr(gemm_idx == 0 and has_tdm):
             _dispatch_tdm_at_wmma0(ty, tdm_type, tdm_state, has_fallback=True)
-        _g1_barrier_idx = GEMM_INST_COUNT - BARRIER_SIGNAL_AHEAD - 1
+        _g1_barrier_idx = GEMM_INST_COUNT - 1
         if const_expr(tdm_barrier and gemm_idx == _g1_barrier_idx):
             Atom.s_wait_tensorcnt(4)
             rocdl.s_barrier_signal(-1)
-        _g1_row = GEMM1_SCHEDULE[g1_row_idx(stage, gemm_idx)]
+        _g1_row = GEMM1_SCHEDULE[stage * GEMM_INST_COUNT + gemm_idx]
         _g1_half = len(_g1_row) // 2
         for _i in range_constexpr(len(_g1_row)):
             if const_expr(_i < _g1_half):
@@ -1559,11 +1551,11 @@ def gemm2_interleaved_stage(
         sched_barrier(0)
         if const_expr(gemm_idx == 0 and has_tdm):
             _dispatch_tdm_at_wmma0(ty, tdm_type, tdm_state, has_fallback=False)
-        _pv_barrier_idx = PV_GEMM_INST_COUNT - BARRIER_SIGNAL_AHEAD - 1
+        _pv_barrier_idx = PV_GEMM_INST_COUNT - 1
         if const_expr(tdm_barrier and gemm_idx == _pv_barrier_idx):
             Atom.s_wait_tensorcnt(4)
             rocdl.s_barrier_signal(-1)
-        _g2_row = GEMM2_SCHEDULE[g2_row_idx(stage, gemm_idx)]
+        _g2_row = GEMM2_SCHEDULE[stage * PV_GEMM_INST_COUNT + gemm_idx]
         _g2_half = len(_g2_row) // 2
         for _i in range_constexpr(len(_g2_row)):
             if const_expr(_i < _g2_half):
