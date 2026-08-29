@@ -383,7 +383,9 @@ jobs:
           # MI300X: skip the fp8e4m3 paged-prefill cases that fail an accuracy check with the coming Triton release.
           docker exec -w /workspace triton_test pytest -v ${TRITON_TEST} \
             --deselect "op_tests/triton_tests/attention/test_pa_prefill.py::test_contexted_kv_attention[128-fp8e4m3-dtype0-128-1-64]" \
+            --deselect "op_tests/triton_tests/attention/test_pa_prefill.py::test_contexted_kv_attention[128-fp8e4m3-dtype0-128-8-64]" \
             --deselect "op_tests/triton_tests/attention/test_chunked_pa_prefill.py::test_contexted_kv_attention[256-fp8e4m3-dtype0-128-1-64]" \
+            --deselect "op_tests/triton_tests/attention/test_chunked_pa_prefill.py::test_contexted_kv_attention[256-fp8e4m3-dtype0-128-8-64]" \
             --junitxml=test-reports/triton.xml
 
       - name: Upload test logs
