@@ -68,9 +68,9 @@ def topk_gating(
         correction_bias: optional bias tensor, pass None for no bias. Must be
             float32, or bfloat16 when gating_output is not float16.
     """
-    assert score_func in _VALID_SCORE_FUNCS, (
-        f"Unknown score_func '{score_func}', expected one of {_VALID_SCORE_FUNCS}"
-    )
+    assert (
+        score_func in _VALID_SCORE_FUNCS
+    ), f"Unknown score_func '{score_func}', expected one of {_VALID_SCORE_FUNCS}"
     if correction_bias is None:
         correction_bias = torch.empty(
             0, dtype=torch.float32, device=gating_output.device

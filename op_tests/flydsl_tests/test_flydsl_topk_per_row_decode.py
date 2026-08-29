@@ -123,9 +123,9 @@ def _assert_row_topk_set(logits_row, actual_row, k, row_len):
 
     if row_len < k:
         pad = actual_row[row_len:k]
-        assert (pad == -1).all(), (
-            f"expected -1 padding, got {pad[pad != -1][:8].tolist()}"
-        )
+        assert (
+            pad == -1
+        ).all(), f"expected -1 padding, got {pad[pad != -1][:8].tolist()}"
 
     expected = torch.topk(logits_row[:row_len], valid).indices
     a_set, e_set = set(a.tolist()), set(expected.tolist())
@@ -134,9 +134,9 @@ def _assert_row_topk_set(logits_row, actual_row, k, row_len):
 
     a_only = sorted(a_set - e_set)
     e_only = sorted(e_set - a_set)
-    assert len(a_only) == len(e_only), (
-        f"set size mismatch: {len(a_only)} extra vs {len(e_only)} missing"
-    )
+    assert len(a_only) == len(
+        e_only
+    ), f"set size mismatch: {len(a_only)} extra vs {len(e_only)} missing"
 
     av = torch.tensor([logits_row[i].item() for i in a_only]).sort().values
     ev = torch.tensor([logits_row[i].item() for i in e_only]).sort().values
@@ -316,9 +316,9 @@ def test_non_finite_mask_override_excludes_them():
         assert m._kernel_config(1, L)["mask_non_finite"]
         got = set(_run(logits, sl, 1, 1, k)[0].tolist())
 
-    assert not (got & (top | bottom)), (
-        f"masked run still selected non-finite: {sorted(got & (top | bottom))}"
-    )
+    assert not (
+        got & (top | bottom)
+    ), f"masked run still selected non-finite: {sorted(got & (top | bottom))}"
 
 
 @contextlib.contextmanager

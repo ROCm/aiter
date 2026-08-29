@@ -284,9 +284,9 @@ def test_stable_branches_agree_on_the_exact_index_order(rows, width, seq_len, k)
     )
     torch.cuda.synchronize()
 
-    assert torch.equal(indices, hip), (
-        f"stable output differs from HIP at rows={rows} width={width} k={k}"
-    )
+    assert torch.equal(
+        indices, hip
+    ), f"stable output differs from HIP at rows={rows} width={width} k={k}"
     assert bool((indices[:, 1:] > indices[:, :-1]).all()), "not ascending"
 
 
