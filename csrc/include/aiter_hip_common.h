@@ -183,6 +183,36 @@ extern "C" void __hipRegisterFunction(void* module,
                                       void* wSize) noexcept;
 } // namespace aiter_detail
 
+// ---- gfx1250 asm B0-only gate ------------------------------------------------
+// Defined ahead of the AiterAsmKernel loader (below) so its constructor can
+// refuse a B0-only code object on an A0 device. get_gpu_arch is already
+// forward-declared above; get_asic_revision is defined later — declare it here.
+static inline int get_asic_revision();
+
+// Non-raising: false only on a gfx1250 A0 device. Also used by callers that
+// fall back to a non-asm path instead of raising (e.g. fmha_v3_bwd).
+static inline bool is_gfx1250_asm_supported()
+{
+    if(get_gpu_arch() != "gfx1250")
+        return true;
+    return get_asic_revision() >= 1;
+}
+
+// Kernels verified to ALSO run on gfx1250 A0, matched as substrings of the
+// kernel/symbol name. Empty today: every shipped gfx1250 asm kernel is B0-only.
+// To ship an A0-capable asm kernel, add its name (or a unique substring) here.
+static inline bool is_gfx1250_asm_a0_ok(const char* kernel_name)
+{
+    static const char* const kA0AllowList[] = {
+        nullptr, // sentinel — keep last; add "kernel_name_substr" entries above
+    };
+    const std::string_view name{kernel_name};
+    for(const char* const* p = kA0AllowList; *p != nullptr; ++p)
+        if(name.find(*p) != std::string_view::npos)
+            return true;
+    return false;
+}
+
 namespace {
 
 class AiterAsmKernelFast
@@ -423,6 +453,11 @@ class AiterAsmKernel : private AiterAsmKernelFast
     public:
     AiterAsmKernel(const char* kernel_name, const char* hsaco_path)
     {
+        // Single choke point: gfx1250 asm .co are B0+ only; refuse on an A0
+        // device unless whitelisted A0-capable (see is_gfx1250_asm_a0_ok).
+        AITER_CHECK(is_gfx1250_asm_supported() || is_gfx1250_asm_a0_ok(kernel_name),
+                    kernel_name,
+                    " asm code object targets gfx1250 B0+; running device is A0");
         init(kernel_name, load_hsaco_file(kernel_name, hsaco_path));
     };
 
@@ -464,6 +499,16 @@ static inline bool is_fp8_ocp_arch()
         if(arch == a)
             return true;
     return false;
+}
+
+// Silicon stepping of the current device: 0=A0, 1=B0, 2=C0, ...
+static inline int get_asic_revision()
+{
+    int dev;
+    hipDeviceProp_t dev_prop;
+    HIP_CALL(hipGetDevice(&dev));
+    HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
+    return dev_prop.asicRevision;
 }
 
 static uint32_t get_num_cu_func()

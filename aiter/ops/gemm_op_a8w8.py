@@ -16,7 +16,7 @@ from ..jit.core import (
     AITER_LOG_TUNED_CONFIG,
     compile_ops,
 )
-from ..jit.utils.chip_info import get_cu_num
+from ..jit.utils.chip_info import get_cu_num, require_gfx1250_asm
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..ops.gemm_op_common import get_padded_m
@@ -1299,6 +1299,7 @@ def gemm_a8w8_mxfp8(
 ) -> Tensor:
     """gfx1250 MXFP8 x MXFP8 GEMM (a8w8). D[M,N] bf16 = A @ B^T with e8m0 block
     scales. Kernel auto-selected from M/N/K unless ``kernelName`` is given."""
+    require_gfx1250_asm("gemm_a8w8_mxfp8")
     M = A.shape[0]
     N = B.shape[0]
     K = A.shape[1]
