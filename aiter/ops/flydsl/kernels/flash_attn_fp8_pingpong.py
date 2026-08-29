@@ -219,6 +219,15 @@ def build_flash_attn_fp8_module(
         block_id = fx.Index(gpu.block_idx.x)
         tid = fx.Index(gpu.thread_idx.x)
         wave_id = tid // WARP_SIZE
+        # Wave-uniform copy of the wave index, pulled into an SGPR once.  Every
+        # LDS-DMA destination is derived from this instead of from `tid`, so the
+        # address math lands on the SALU and `_dma_lds_ptr` needs no per-use
+        # v_readfirstlane_b32.
+        wave_id_s = fx.Index(
+            arith.index_cast(
+                T.index, rocdl.readfirstlane(T.i32, arith.index_cast(T.i32, _raw(wave_id)))
+            )
+        )
         lane = tid % WARP_SIZE
         lo = lane % 32
         hi = lane // 32
@@ -299,11 +308,21 @@ def build_flash_attn_fp8_module(
             STRIDE_TOKEN
         ) + head_idx * fx.Index(HEAD_DIM)
 
+        # Byte extent of this (batch, head) slice measured from the resource
+        # base.  Handing it to the descriptor lets the hardware do the KV
+        # bounds check for free, so the per-tile voffsets need no software
+        # clamp -- see get_hbm_koffs.
+        _rsrc_num_records = (seq_len_v - fx.Index(1)) * fx.Index(
+            STRIDE_TOKEN
+        ) + fx.Index(HEAD_DIM)
+
         def _rsrc(ptr):
             base_i64 = llvm.PtrToIntOp(T.i64, ptr).result
             off_i64 = arith.index_cast(T.i64, _raw(head_base_elem))
             addr_i64 = arith.addi(base_i64, off_i64)
-            return fx.buffer_ops.create_buffer_resource_from_addr(addr_i64)
+            return fx.buffer_ops.create_buffer_resource_from_addr(
+                addr_i64, num_records_bytes=_raw(_rsrc_num_records)
+            )
 
         k_rsrc = _rsrc(k_ptr)
         v_rsrc = _rsrc(v_ptr)
@@ -315,8 +334,15 @@ def build_flash_attn_fp8_module(
         _lds_ptr_ty = ir.Type.parse("!llvm.ptr<3>")
 
         def _dma_lds_ptr(lds_byte_off):
-            """SALU-only: the LDS destination is wave-uniform."""
-            lds_addr = rocdl.readfirstlane(T.i64, arith.index_cast(T.i64, lds_byte_off))
+            """SALU-only: the LDS destination is wave-uniform.
+
+            Every input is either a constant or derived from ``wave_id_s``,
+            which was pulled into an SGPR once at kernel entry, so the whole
+            expression is uniform and the backend keeps it on the SALU.  Do
+            *not* readfirstlane here: that would force the address into a VGPR
+            first, costing a v_add_u32 + v_readfirstlane_b32 per DMA pass.
+            """
+            lds_addr = arith.index_cast(T.i64, lds_byte_off)
             return llvm.inttoptr(_lds_ptr_ty, lds_addr)
 
         def _dma_fire(rsrc, lds_ptr, voff_i32):
@@ -336,18 +362,25 @@ def build_flash_attn_fp8_module(
             c = fx.Index(p * DMA_LANES) + tid
             kv = c // fx.Index(8)
             d = (c % fx.Index(8)) * fx.Index(16)
-            lds_perm = (fx.Index(p * (NUM_WAVES // 2)) + wave_id) * fx.Index(
+            lds_perm = (fx.Index(p * (NUM_WAVES // 2)) + wave_id_s) * fx.Index(
                 K_UNIT_STRIDE
             )
             _dma_k_inv.append((kv, d, lds_perm))
 
         _ltid = tid - fx.Index(DMA_LANES)
-        _lwave = wave_id - fx.Index(NUM_WAVES // 2)
+        _lwave = wave_id_s - fx.Index(NUM_WAVES // 2)
         _half = _lwave % fx.Index(2)
         _dma_v_inv = []
         for p in range_constexpr(DMA_PASSES):
             c = fx.Index(p * DMA_LANES) + _ltid
-            d_block = c // fx.Index(BLOCK_N)
+            # d_block is wave-uniform by construction (a wave covers 64
+            # consecutive lanes and BLOCK_N is a multiple of 64), but written
+            # as c // BLOCK_N the backend cannot see that and puts it in a
+            # VGPR.  Rederive it from the uniform wave index instead so the
+            # LDS destination stays on the SALU.
+            d_block = fx.Index(p * (DMA_LANES // BLOCK_N)) + _lwave // fx.Index(
+                BLOCK_N // WARP_SIZE
+            )
             kv_lds_pos = c % fx.Index(BLOCK_N)
             blk = kv_lds_pos // fx.Index(32)
             rem = kv_lds_pos % fx.Index(32)
@@ -361,23 +394,34 @@ def build_flash_attn_fp8_module(
             )
             _dma_v_inv.append((kv, d_voff, lds_perm))
 
+        # One KV tile step, in elements of the voffset. Because the per-lane
+        # part of a voffset is loop-invariant, advancing a tile is a single
+        # add of this constant -- the FlyDSL analogue of the asm's
+        # emit_next_K_mem_addr (persistent VGPR base + scalar delta).
+        KV_TILE_DELTA = BLOCK_N * STRIDE_TOKEN
+        _c_kv_delta = arith.constant(KV_TILE_DELTA, type=T.i32)
+
+        def advance_hbm_offs(offs):
+            """Bump a carried set of voffsets by one KV tile: 1 v_add_u32 each."""
+            return [arith.addi(o, _c_kv_delta) for o in offs]
+
         def get_hbm_koffs(kv_start):
             """Per-pass voffsets for the K tile DMA.
 
-            The asm emits the address setup once (emit_next_K_mem_addr) and
-            then only the buffer_loads inside the QK loop. These are the VALU
-            half of that; they are loop-carried so they get computed during the
-            softmax phase, one iteration ahead of the loads that use them.
+            Only used to *seed* the carry (prologue / iteration 0, where
+            kv_start is a constant); inside the loop the offsets are advanced
+            with advance_hbm_offs instead of being rebuilt.
+
+            There is no software bounds clamp: the buffer resource carries a
+            num_records covering exactly this (batch, head) slice, so a tile
+            prefetched past the end of the sequence is dropped by the hardware.
             """
             out = []
             for p in range_constexpr(DMA_PASSES):
                 kv, d, _ = _dma_k_inv[p]
-                kv_abs = kv_start + kv
-                in_b = kv_abs < seq_len_v
-                kv_safe = fx.Index(ArithValue(in_b).select(kv_abs, fx.Index(0)))
                 out.append(
                     arith.index_cast(
-                        T.i32, _raw(kv_safe * fx.Index(STRIDE_TOKEN) + d)
+                        T.i32, _raw((kv_start + kv) * fx.Index(STRIDE_TOKEN) + d)
                     )
                 )
             return out
@@ -396,16 +440,13 @@ def build_flash_attn_fp8_module(
                 _dma_fire(k_rsrc, ptr, g_koffs[p])
 
         def get_hbm_voffs(kv_start):
-            """Per-pass voffsets for the V tile DMA; see dma_k_voffs."""
+            """Per-pass voffsets for the V tile DMA; see get_hbm_koffs."""
             out = []
             for p in range_constexpr(DMA_PASSES):
                 kv, d_voff, _ = _dma_v_inv[p]
-                kv_abs = kv_start + kv
-                in_b = kv_abs < seq_len_v
-                kv_safe = fx.Index(ArithValue(in_b).select(kv_abs, fx.Index(0)))
                 out.append(
                     arith.index_cast(
-                        T.i32, _raw(kv_safe * fx.Index(STRIDE_TOKEN) + d_voff)
+                        T.i32, _raw((kv_start + kv) * fx.Index(STRIDE_TOKEN) + d_voff)
                     )
                 )
             return out
@@ -1083,14 +1124,13 @@ def build_flash_attn_fp8_module(
                 _rest = _g0_args[8 + N_BIAS_CHUNKS :]
                 v_buff_off, v_next_off, v_further_off = _rest[0:3]
                 k_buff_off, k_next_off = _rest[3:5]
-                g_koffs = _rest[5 : 5 + DMA_PASSES]
+                g_koffs = [_raw(x) for x in _rest[5 : 5 + DMA_PASSES]]
                 # The DMA of this iteration lands in the buffer the *next* one
                 # reads; its voffsets were computed in the previous softmax
                 # phase, its LDS pointers are wave-uniform SALU rebuilt here.
                 l_koffs = get_lds_koffs(k_next_off)
 
                 v_preloaded = _rest[5 + DMA_PASSES :]
-                kv_start = fx.Index(iv)
 
                 _sched_barrier()
                 rocdl.s_setprio(1)
@@ -1129,8 +1169,10 @@ def build_flash_attn_fp8_module(
                     l_mfma=l_mfma,
                 )
                 # Address math for the *next* tile's DMA is computed here, in
-                # the VALU phase; do_qk only fires the buffer_loads.
-                g_koffs = get_hbm_koffs(kv_start + fx.Index(BLOCK_N * 2))
+                # the VALU phase; do_qk only fires the buffer_loads.  One add
+                # per pass off the carried value -- nothing is rebuilt from
+                # kv_start.
+                g_koffs = advance_hbm_offs(g_koffs)
                 scf.YieldOp(
                     [
                         _raw(m_frozen),
@@ -1174,6 +1216,9 @@ def build_flash_attn_fp8_module(
                 m_frozen, bias_chunks, s_accs = do_softmax_prepare(s_accs, m_init)
                 _sched_barrier()
                 _gpu_barrier()
+                # Seed for the first loop body (iv == BLOCK_N), which loads the
+                # tile at iv + 2 * BLOCK_N.
+                g_voffs = advance_hbm_offs(g_voffs)
                 return (
                     m_frozen,
                     l_valu_init,
@@ -1193,6 +1238,7 @@ def build_flash_attn_fp8_module(
                     _v_slot(2),
                     _k_slot(1),
                     _k_slot(0),
+                    *g_voffs,
                     *v_preloaded,
                 )
 
@@ -1202,7 +1248,7 @@ def build_flash_attn_fp8_module(
                 _rest = carry[11 + N_BIAS_CHUNKS:]
                 v_buff_off = _rest[0]
                 k_buff_off = _rest[3]
-                v_preloaded = _rest[5:]
+                v_preloaded = _rest[5 + DMA_PASSES :]
                 bias_chunks = carry[11 : 11 + N_BIAS_CHUNKS]
                 m_frozen, _, p_pack, l_valu, o_r, l_mfma = do_softmax(
                     [s0, s1, s2, s3],
@@ -1243,8 +1289,8 @@ def build_flash_attn_fp8_module(
                 _rest = _g1_args[11 + N_BIAS_CHUNKS:]
                 v_buff_off, v_next_off, v_further_off = _rest[0:3]
                 k_buff_off, k_next_off = _rest[3:5]
-                v_preloaded = _rest[5:]
-                kv_start = fx.Index(iv)
+                g_voffs = [_raw(x) for x in _rest[5 : 5 + DMA_PASSES]]
+                v_preloaded = _rest[5 + DMA_PASSES :]
                 # o / l_mfma still hold only the tiles apply_pv has already
                 # folded in -- i.e. strictly the past relative to the s_accs
                 # being softmaxed here -- so the rescale is well-defined.
@@ -1264,10 +1310,9 @@ def build_flash_attn_fp8_module(
                     o_accs=[o0, o1, o2, o3],
                     l_mfma=l_mfma,
                 )
-                # The K DMA's address math belongs to this (VALU) phase; the
+                # The V DMA's address math belongs to this (VALU) phase; the
                 # buffer_loads themselves are interleaved into do_qk below.
                 l_voffs = get_lds_voffs(v_buff_off)
-                g_voffs = get_hbm_voffs(kv_start + fx.Index(2 * BLOCK_N))
                 _sched_barrier()
                 rocdl.s_setprio(1)
                 _gpu_barrier()
@@ -1292,6 +1337,7 @@ def build_flash_attn_fp8_module(
                 _sched_barrier()
                 rocdl.s_setprio(0)
                 _gpu_barrier()
+                g_voffs = advance_hbm_offs(g_voffs)
                 scf.YieldOp(
                     [
                         _raw(m_frozen),
@@ -1312,6 +1358,7 @@ def build_flash_attn_fp8_module(
                         _raw(v_buff_off),
                         _raw(k_next_off),
                         _raw(k_buff_off),
+                        *[_raw(gv) for gv in g_voffs],
                         *[_raw(vp) for vp in v_preloaded],
                     ]
                 )
