@@ -374,9 +374,7 @@ def _wmma_bf16(ty, src_a, src_b, acc):
 class Atom:
     @staticmethod
     def wmma_init(ty, src_a, src_b):
-        return _wmma_bf16(
-            ty, src_a, src_b, fx.constant_vector(0.0, T.vec(8, T.f32))
-        )
+        return _wmma_bf16(ty, src_a, src_b, fx.constant_vector(0.0, T.vec(8, T.f32)))
 
     @staticmethod
     def wmma_accum(ty, src_a, src_b, acc):
@@ -440,8 +438,13 @@ class Atom:
         return llvm_dialect.bitcast(
             T.f32,
             rocdl_dialect.permlanex16(
-                res=T.i32, old=src_i32, src0=src_i32,
-                src1=s_sel0, src2=s_sel1, fi=False, bound_control=False,
+                res=T.i32,
+                old=src_i32,
+                src0=src_i32,
+                src1=s_sel0,
+                src2=s_sel1,
+                fi=False,
+                bound_control=False,
             ),
         )
 
@@ -565,7 +568,9 @@ class Softmax:
 
             def op_pkfma(idx=i):
                 sp_pairs[idx] = Atom.pk_fma_f32_neg_c(
-                    sp_pairs[idx], ss["vgpr_log2e_scl_pair"][msb], ss["cur_max_log2e_dup"][msb]
+                    sp_pairs[idx],
+                    ss["vgpr_log2e_scl_pair"][msb],
+                    ss["cur_max_log2e_dup"][msb],
                 )
 
             ops.append(op_pkfma)
@@ -603,9 +608,7 @@ class Softmax:
         for i in range_constexpr(N_SP_PAIRS):
 
             def op_cvt(cidx=i):
-                ss["p_bf16"][msb].append(
-                    Atom.cvt_pk_bf16_f32(sp_pairs[cidx])
-                )
+                ss["p_bf16"][msb].append(Atom.cvt_pk_bf16_f32(sp_pairs[cidx]))
 
             ops.append(op_cvt)
         for i in range_constexpr(N_SP_PAIRS // 2):
@@ -685,18 +688,14 @@ class Softmax:
                 def op_cross_col(k_=k, j_=j):
                     base = k_ * VALID_GROUP_STRIDE
                     s0 = base + 3 + j_ * 2
-                    tmps[k_] = Atom.max3_num_f32(
-                        _get_sp(s0), _get_sp(s0 + 1), tmps[k_]
-                    )
+                    tmps[k_] = Atom.max3_num_f32(_get_sp(s0), _get_sp(s0 + 1), tmps[k_])
 
                 ops.append(op_cross_col)
         for k in range_constexpr(N_VALID_GROUPS):
 
             def op_last_elem(k_=k):
                 base = k_ * VALID_GROUP_STRIDE
-                tmps[k_] = Atom.max3_num_f32(
-                    _get_sp(base + 7), tmps[k_], _get_sp(base)
-                )
+                tmps[k_] = Atom.max3_num_f32(_get_sp(base + 7), tmps[k_], _get_sp(base))
 
             ops.append(op_last_elem)
 
@@ -1066,9 +1065,7 @@ class Pipeline:
     def emit_lds_load(ty, lds_op, kv_lds_addrs, kv_tiles_out):
         msb, offset, v_idx = lds_op["msb"], lds_op["offset"], lds_op["v_idx"]
         if const_expr(lds_op["load_type"] == "b128"):
-            kv_tiles_out[msb][v_idx] = Atom.ds_load_b128(
-                ty, kv_lds_addrs[msb], offset
-            )
+            kv_tiles_out[msb][v_idx] = Atom.ds_load_b128(ty, kv_lds_addrs[msb], offset)
         else:
             hp = lds_op["half_p"]
             kv_tiles_out[msb][v_idx] = Atom.ds_load_tr16_b128(
@@ -1182,11 +1179,7 @@ def phase4_q_load(lane_id, q_rsrc, stride_q_seq, wave_id, q_tile_offset_bytes=No
         )
         bank_loads = []
         for i in fx.range_constexpr(_LOADS_PER_BANK):
-            voff = (
-                bank_voff
-                if i == 0
-                else add_nuw(bank_voff, fx.Int32(i * 32))
-            )
+            voff = bank_voff if i == 0 else add_nuw(bank_voff, fx.Int32(i * 32))
             bank_loads.append(
                 rocdl.raw_ptr_buffer_load(
                     vec4i32_ty, q_rsrc, voff, soff_zero, soff_zero
@@ -2027,10 +2020,21 @@ def compute_num_tiles(
 
 
 def core_loop_setup(
-    ctx, ptr_K, stride_k_32, kv_lds_addrs_b,
-    k_b, v_a, k_a, v_b,
-    softmax_state_pro, sp_pairs_all_pro, all_su_sp_tiles,
-    causal_offset, IS_CAUSAL, _K_CFG, _sk_elems,
+    ctx,
+    ptr_K,
+    stride_k_32,
+    kv_lds_addrs_b,
+    k_b,
+    v_a,
+    k_a,
+    v_b,
+    softmax_state_pro,
+    sp_pairs_all_pro,
+    all_su_sp_tiles,
+    causal_offset,
+    IS_CAUSAL,
+    _K_CFG,
+    _sk_elems,
 ):
     actual_kv_len = ctx["actual_kv_len"]
     actual_q_len, bx = ctx["actual_q_len"], ctx["bx"]
@@ -2041,8 +2045,12 @@ def core_loop_setup(
 
     num_tiles, num_tiles_idx, num_tiles_minus1_idx, first_causal_tile_idx = (
         compute_num_tiles(
-            actual_kv_len, actual_q_len, bx,
-            tile_n_const, causal_offset, IS_CAUSAL,
+            actual_kv_len,
+            actual_q_len,
+            bx,
+            tile_n_const,
+            causal_offset,
+            IS_CAUSAL,
         )
     )
 
@@ -2050,21 +2058,43 @@ def core_loop_setup(
     k_tile1_stride = tile_n_const * stride_k_seq
     k_tile1_offset = k_offset + k_tile1_stride
     k_tile1_oob_dg1 = TDM.build_oob_dg1_list(
-        _K_CFG, QK_HDIM, _sk_elems,
-        actual_kv_len - TILE_N, wave_id, dim0_stride=200,
+        _K_CFG,
+        QK_HDIM,
+        _sk_elems,
+        actual_kv_len - TILE_N,
+        wave_id,
+        dim0_stride=200,
     )
     TDM.load_k_only(
-        ptr_K, k_tile1_offset, stride_k_seq, stride_k_32,
-        wave_id, k_b, oob_dg1_list=k_tile1_oob_dg1,
+        ptr_K,
+        k_tile1_offset,
+        stride_k_seq,
+        stride_k_32,
+        wave_id,
+        k_b,
+        oob_dg1_list=k_tile1_oob_dg1,
     )
     rocdl.sched_barrier(0)
 
     kv_tiles_init = load_initial_kv_tiles(ty, kv_lds_addrs_b, blk=0, su=0)
     init_args = build_init_args(
-        zero_v8f32, softmax_state_pro, sp_pairs_all_pro,
-        kv_tiles_init, all_su_sp_tiles, k_b, v_a, k_a, v_b,
+        zero_v8f32,
+        softmax_state_pro,
+        sp_pairs_all_pro,
+        kv_tiles_init,
+        all_su_sp_tiles,
+        k_b,
+        v_a,
+        k_a,
+        v_b,
     )
-    return init_args, num_tiles, num_tiles_idx, num_tiles_minus1_idx, first_causal_tile_idx
+    return (
+        init_args,
+        num_tiles,
+        num_tiles_idx,
+        num_tiles_minus1_idx,
+        first_causal_tile_idx,
+    )
 
 
 def epilogue_single_tile(ctx, ep):
@@ -2190,7 +2220,9 @@ def apply_causal_mask(ctx, su_sp_tiles, n_start_fx):
     lane_hi_x8 = (lane_id >> 4) * 8
     wave_x32 = wave_id * 32
     base = (m_start - n_start_fx) + wave_x32 + (lane_lo - lane_hi_x8)
-    _mask_sp_tiles(su_sp_tiles, lambda su, msb: base + (msb // 2) * 16 - su * 32 - (msb % 2) * 16)
+    _mask_sp_tiles(
+        su_sp_tiles, lambda su, msb: base + (msb // 2) * 16 - su * 32 - (msb % 2) * 16
+    )
 
 
 def apply_kv_oob_mask(ctx, su_sp_tiles, kv_remain_raw):
@@ -2671,7 +2703,13 @@ def _ep_finish(
     for mb in fx.range_constexpr(0, NUM_MSB, 2):
         sm = rsf[mb] + rsf[mb + 1]
         pm = rocdl_dialect.permlanex16(
-            res=ty["f32"], old=sm, src0=sm, src1=slo, src2=shi, fi=False, bound_control=False,
+            res=ty["f32"],
+            old=sm,
+            src0=sm,
+            src1=slo,
+            src2=shi,
+            fi=False,
+            bound_control=False,
         )
         sf = sm + pm
         rsf[mb] = sf

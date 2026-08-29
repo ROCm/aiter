@@ -192,26 +192,47 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             ctx["zero_v8f32"] = zero_v8f32
 
             # ── Core loop setup: tile counts + K prefetch + init args ──
-            init_args, num_tiles, num_tiles_idx, num_tiles_minus1_idx, first_causal_tile_idx = (
-                core_loop_setup(
-                    ctx, ptr_K, stride_k_32, kv_lds_addrs_b,
-                    k_b, v_a, k_a, v_b,
-                    softmax_state_pro, sp_pairs_all_pro, all_su_sp_tiles,
-                    causal_offset, IS_CAUSAL, _K_CFG, _sk_elems,
-                )
+            (
+                init_args,
+                num_tiles,
+                num_tiles_idx,
+                num_tiles_minus1_idx,
+                first_causal_tile_idx,
+            ) = core_loop_setup(
+                ctx,
+                ptr_K,
+                stride_k_32,
+                kv_lds_addrs_b,
+                k_b,
+                v_a,
+                k_a,
+                v_b,
+                softmax_state_pro,
+                sp_pairs_all_pro,
+                all_su_sp_tiles,
+                causal_offset,
+                IS_CAUSAL,
+                _K_CFG,
+                _sk_elems,
             )
 
             # ── Main KV Loop: non-causal tiles ──
             loop1_results = init_args
-            for tile_idx, iter_args in range(1, first_causal_tile_idx, 1, init=init_args):
+            for tile_idx, iter_args in range(
+                1, first_causal_tile_idx, 1, init=init_args
+            ):
                 loop1_results = yield tile_iteration(ctx, tile_idx, iter_args)
 
             # ── Main KV Loop: causal tiles ──
             loop_results = loop1_results
-            for tile_idx, iter_args in range(first_causal_tile_idx, num_tiles_minus1_idx, 1, init=loop1_results):
+            for tile_idx, iter_args in range(
+                first_causal_tile_idx, num_tiles_minus1_idx, 1, init=loop1_results
+            ):
                 tile_idx_i32 = fx.Int32(tile_idx)
                 causal_n = tile_idx_i32 * tile_n_const - causal_offset
-                loop_results = yield tile_iteration(ctx, tile_idx, iter_args, causal_n_start=causal_n)
+                loop_results = yield tile_iteration(
+                    ctx, tile_idx, iter_args, causal_n_start=causal_n
+                )
 
             # ── Epilogue ──
             ep = unpack_loop_results(loop_results, lane_id)
