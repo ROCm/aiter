@@ -203,7 +203,7 @@ jobs:
         if: ${{ matrix.build_enabled && steps.restore_aiter_wheel.outputs.cache-hit != 'true' }}
         run: |
           set -ex
-          if [ "${{ github.event_name }}" = "schedule" ]; then
+          if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
             echo "Nightly build: syncing latest CK from develop branch..."
             git submodule set-branch --branch develop 3rdparty/composable_kernel
             git submodule sync
@@ -828,7 +828,7 @@ jobs:
       - name: Sync CK submodule
         run: |
           set -ex
-          if [ "${{ github.event_name }}" = "schedule" ]; then
+          if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
             echo "Nightly build: syncing latest CK from develop branch..."
             git submodule set-branch --branch develop 3rdparty/composable_kernel
             git submodule sync
@@ -895,13 +895,14 @@ jobs:
           PY
 
       - name: Install triton
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref || github.ref_name }}
         run: |
           # Ensure install_triton.sh is available even when the PR branch
           # was created before the script was added to main (#2959).
           # The workflow file always comes from the base branch, so we
           # materialize the script from the base ref when missing.
           if [ ! -f .github/scripts/install_triton.sh ]; then
-            BASE_REF="${{ github.event.pull_request.base.ref || github.ref_name }}"
             mkdir -p .github/scripts
             curl -fsSL \
               "https://raw.githubusercontent.com/${{ github.repository }}/${BASE_REF}/.github/scripts/install_triton.sh" \
@@ -1108,7 +1109,7 @@ jobs:
       - name: Sync CK submodule
         run: |
           set -ex
-          if [ "${{ github.event_name }}" = "schedule" ]; then
+          if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
             echo "Nightly build: syncing latest CK from develop branch..."
             git submodule set-branch --branch develop 3rdparty/composable_kernel
             git submodule sync
@@ -1176,13 +1177,14 @@ jobs:
           PY
 
       - name: Install triton
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref || github.ref_name }}
         run: |
           # Ensure install_triton.sh is available even when the PR branch
           # was created before the script was added to main (#2959).
           # The workflow file always comes from the base branch, so we
           # materialize the script from the base ref when missing.
           if [ ! -f .github/scripts/install_triton.sh ]; then
-            BASE_REF="${{ github.event.pull_request.base.ref || github.ref_name }}"
             mkdir -p .github/scripts
             curl -fsSL \
               "https://raw.githubusercontent.com/${{ github.repository }}/${BASE_REF}/.github/scripts/install_triton.sh" \
