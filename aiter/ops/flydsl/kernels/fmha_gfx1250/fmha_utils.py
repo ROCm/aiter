@@ -1069,8 +1069,6 @@ class Pipeline:
         return kv_tiles_out
 
 
-K_TILE_N = 128
-
 # TDM dim0=200 -> LDS inner stride = 200*2 = 400B
 # (2-way bank conflicts)
 K_ROW_BYTES = 400
@@ -1085,7 +1083,7 @@ K_TDM_CONFIG = 1 << 16  # data_size=1 (bf16), pad_enable=0
 # V: dim0=128, pad_interval=128 elems=64dwords → enc_interval=5, 32B pad → enc_amount=7
 V_TDM_CONFIG = (1 << 20) | (5 << 22) | (7 << 25)
 
-TILE_N = K_TILE_N
+TILE_N = 128
 
 # K_a, K_b, V_a are padded to 64KB segment boundary to prevent TDM cross-segment.
 LDS_SEGMENT = 0x10000
