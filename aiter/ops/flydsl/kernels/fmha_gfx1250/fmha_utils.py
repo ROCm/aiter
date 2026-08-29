@@ -263,26 +263,8 @@ def g2_row_idx(stage: int, wmma: int) -> int:
     return stage * PV_GEMM_INST_COUNT + wmma
 
 
-def rocdl_exp2(res, arg, **kw):
-    return rocdl_dialect.exp2(res=res, arg=arg, **kw)
-
-
-def rocdl_permlanex16(res, old, src0, src1, src2, fi, bound_control, **kw):
-    return rocdl_dialect.permlanex16(
-        res=res,
-        old=old,
-        src0=src0,
-        src1=src1,
-        src2=src2,
-        fi=fi,
-        bound_control=bound_control,
-        **kw,
-    )
-
-
 def rocdl_fmax3(a, b, c):
-    m = llvm_dialect.intr_maxnum(a, b)
-    return llvm_dialect.intr_maxnum(m, c)
+    return llvm_dialect.intr_maxnum(llvm_dialect.intr_maxnum(a, b), c)
 
 
 WAVE_SIZE = 32
@@ -438,7 +420,7 @@ class Atom:
     @staticmethod
     def exp_f32(src):
         sched_barrier(0)
-        return rocdl_exp2(T.f32, src)
+        return rocdl_dialect.exp2(res=T.f32, arg=src)
 
     @staticmethod
     def mul_f32(src0, src1):
@@ -471,7 +453,10 @@ class Atom:
         src_i32 = llvm_dialect.bitcast(T.i32, src)
         return llvm_dialect.bitcast(
             T.f32,
-            rocdl_permlanex16(T.i32, src_i32, src_i32, s_sel0, s_sel1, False, False),
+            rocdl_dialect.permlanex16(
+                res=T.i32, old=src_i32, src0=src_i32,
+                src1=s_sel0, src2=s_sel1, fi=False, bound_control=False,
+            ),
         )
 
     @staticmethod
@@ -508,22 +493,18 @@ def tdm_wait_and_barrier():
     rocdl.s_barrier_wait(-1)
 
 
-def _none_list():
-    return [None] * NUM_MSB
-
-
 def make_softmax_state(old_max, local_max, delta, row_sums, sp_pairs_prev=None):
     return {
         "old_max": list(old_max),
         "local_max": list(local_max),
         "delta": list(delta),
-        "exp_delta": _none_list(),
-        "cur_max_log2e": _none_list(),
-        "cur_max_log2e_scalar": _none_list(),
-        "cur_max_log2e_1": _none_list(),
-        "cur_max_log2e_dup": _none_list(),
-        "vgpr_log2e_scl_pair": _none_list(),
-        "exp_delta_dup": _none_list(),
+        "exp_delta": [None] * NUM_MSB,
+        "cur_max_log2e": [None] * NUM_MSB,
+        "cur_max_log2e_scalar": [None] * NUM_MSB,
+        "cur_max_log2e_1": [None] * NUM_MSB,
+        "cur_max_log2e_dup": [None] * NUM_MSB,
+        "vgpr_log2e_scl_pair": [None] * NUM_MSB,
+        "exp_delta_dup": [None] * NUM_MSB,
         "row_sums": list(row_sums),
         "p_bf16": [[] for _ in range(NUM_MSB)],
         "sp_pairs_prev": sp_pairs_prev,
@@ -544,40 +525,39 @@ class Softmax:
         sp_hi_cache=None,
     ):
         ops = []
-        bank = msb
 
-        def op_save_old_max(b=bank):
-            ss["old_max"][b] = Atom.mov_b32(ss["local_max"][b])
+        def op_save_old_max():
+            ss["old_max"][msb] = Atom.mov_b32(ss["local_max"][msb])
             sched_barrier(0)
             _scl = sgpr["s_log2e_scl"]
-            ss["vgpr_log2e_scl_pair"][b] = Vec.from_elements([_scl, _scl], Float32)
+            ss["vgpr_log2e_scl_pair"][msb] = Vec.from_elements([_scl, _scl], Float32)
             sched_barrier(0)
 
-        def op_cur_max(b=bank):
-            ss["cur_max_log2e"][b] = Atom.mul_f32(
-                ss["local_max"][b], sgpr["s_log2e_scl"]
+        def op_cur_max():
+            ss["cur_max_log2e"][msb] = Atom.mul_f32(
+                ss["local_max"][msb], sgpr["s_log2e_scl"]
             )
 
-        def op_exp_delta(b=bank):
-            ss["exp_delta"][b] = Atom.exp_f32(ss["delta"][b])
+        def op_exp_delta():
+            ss["exp_delta"][msb] = Atom.exp_f32(ss["delta"][msb])
 
-        def op_cur_max_1(b=bank):
-            ss["cur_max_log2e_1"][b] = Atom.mul_f32(
-                ss["local_max"][b], sgpr["s_log2e_scl"]
+        def op_cur_max_1():
+            ss["cur_max_log2e_1"][msb] = Atom.mul_f32(
+                ss["local_max"][msb], sgpr["s_log2e_scl"]
             )
 
-        def op_mul_old_max(b=bank):
-            ss["cur_max_log2e_scalar"][b] = Atom.mul_f32(
-                ss["old_max"][b], sgpr["s_log2e_scl"]
+        def op_mul_old_max():
+            ss["cur_max_log2e_scalar"][msb] = Atom.mul_f32(
+                ss["old_max"][msb], sgpr["s_log2e_scl"]
             )
 
-        def op_broadcast_dup(b=bank):
-            ss["cur_max_log2e_dup"][b] = broadcast_f32_to_v2f32(
-                ss["cur_max_log2e_scalar"][b]
+        def op_broadcast_dup():
+            ss["cur_max_log2e_dup"][msb] = broadcast_f32_to_v2f32(
+                ss["cur_max_log2e_scalar"][msb]
             )
 
-        def op_exp_delta_dup(b=bank):
-            ss["exp_delta_dup"][b] = Atom.mov_b32(ss["exp_delta"][b])
+        def op_exp_delta_dup():
+            ss["exp_delta_dup"][msb] = Atom.mov_b32(ss["exp_delta"][msb])
 
         ops += [
             op_save_old_max,
@@ -590,17 +570,17 @@ class Softmax:
         ]
         if not skip_rescale_sum:
 
-            def op_rescale_sum(b=bank):
-                ss["row_sums"][b] = Atom.mul_f32(
-                    ss["exp_delta"][b], ss["row_sums"][b]
+            def op_rescale_sum():
+                ss["row_sums"][msb] = Atom.mul_f32(
+                    ss["exp_delta"][msb], ss["row_sums"][msb]
                 )
 
             ops.append(op_rescale_sum)
         for i in range_constexpr(N_SP_PAIRS):
 
-            def op_pkfma(idx=i, b=bank):
+            def op_pkfma(idx=i):
                 sp_pairs[idx] = Atom.pk_fma_f32_neg_c(
-                    sp_pairs[idx], ss["vgpr_log2e_scl_pair"][b], ss["cur_max_log2e_dup"][b]
+                    sp_pairs[idx], ss["vgpr_log2e_scl_pair"][msb], ss["cur_max_log2e_dup"][msb]
                 )
 
             ops.append(op_pkfma)
@@ -609,10 +589,10 @@ class Softmax:
             _pidx, _is_hi = _eidx // 2, _eidx % 2
             if const_expr(_is_hi == 0):
 
-                def op_exp_lo(pidx=_pidx, b=bank, _clo=sp_lo_cache):
+                def op_exp_lo(pidx=_pidx, _clo=sp_lo_cache):
                     lo, hi = split_v2f32(sp_pairs[pidx])
                     sched_barrier(0)
-                    exp_lo = rocdl_exp2(T.f32, lo)
+                    exp_lo = rocdl_dialect.exp2(res=T.f32, arg=lo)
                     sched_barrier(0)
                     sp_pairs[pidx] = Vec.from_elements([exp_lo, hi], Float32)
                     if const_expr(_clo is not None):
@@ -621,10 +601,10 @@ class Softmax:
                 ops.append(op_exp_lo)
             else:
 
-                def op_exp_hi(pidx=_pidx, b=bank, _chi=sp_hi_cache):
+                def op_exp_hi(pidx=_pidx, _chi=sp_hi_cache):
                     lo, hi = split_v2f32(sp_pairs[pidx])
                     sched_barrier(0)
-                    exp_hi = rocdl_exp2(T.f32, hi)
+                    exp_hi = rocdl_dialect.exp2(res=T.f32, arg=hi)
                     sched_barrier(0)
                     sp_pairs[pidx] = Vec.from_elements([lo, exp_hi], Float32)
                     if const_expr(_chi is not None):
@@ -637,15 +617,15 @@ class Softmax:
         final_sum = [None]
         for i in range_constexpr(N_SP_PAIRS):
 
-            def op_cvt(cidx=i, b=bank):
-                ss["p_bf16"][b].append(
+            def op_cvt(cidx=i):
+                ss["p_bf16"][msb].append(
                     Atom.cvt_pk_bf16_f32(sp_pairs[cidx])
                 )
 
             ops.append(op_cvt)
         for i in range_constexpr(N_SP_PAIRS // 2):
 
-            def op_pkadd(idx=i, b=bank):
+            def op_pkadd(idx=i):
                 sum_tmps[idx] = Atom.pk_add_f32(
                     sp_pairs[idx * 2], sp_pairs[idx * 2 + 1]
                 )
@@ -653,7 +633,7 @@ class Softmax:
             ops.append(op_pkadd)
         for j in range_constexpr(N_SP_PAIRS // 4):
 
-            def op_sum_l0(j_val=j, b=bank):
+            def op_sum_l0(j_val=j):
                 sum_l0[j_val] = Atom.pk_add_f32(
                     sum_tmps[j_val * 2], sum_tmps[j_val * 2 + 1]
                 )
@@ -661,22 +641,22 @@ class Softmax:
             ops.append(op_sum_l0)
         for j in range_constexpr(2):
 
-            def op_sum_l1(j_val=j, b=bank):
+            def op_sum_l1(j_val=j):
                 sum_l1[j_val] = Atom.pk_add_f32(
                     sum_l0[j_val * 2], sum_l0[j_val * 2 + 1]
                 )
 
             ops.append(op_sum_l1)
 
-        def op_sum_l2(b=bank):
+        def op_sum_l2():
             sum_l2[0] = Atom.pk_add_f32(sum_l1[0], sum_l1[1])
 
-        def op_sum_split(b=bank):
+        def op_sum_split():
             lo, hi = split_v2f32(sum_l2[0])
             final_sum[0] = Atom.add_f32(lo, hi)
 
-        def op_sum_accum(b=bank):
-            ss["row_sums"][b] = Atom.add_f32(ss["row_sums"][b], final_sum[0])
+        def op_sum_accum():
+            ss["row_sums"][msb] = Atom.add_f32(ss["row_sums"][msb], final_sum[0])
 
         ops += [op_sum_l2, op_sum_split, op_sum_accum]
         return ops
@@ -695,7 +675,6 @@ class Softmax:
     @staticmethod
     def build_part0_ops(ty, msb, sp_pairs, ss, sgpr):
         ops = []
-        bank = msb
         sp_f32 = [None] * VPS_MSB_SP
         tmps = [None] * N_VALID_GROUPS
 
@@ -708,7 +687,7 @@ class Softmax:
 
         for k in range_constexpr(N_VALID_GROUPS):
 
-            def op_init_max3(k_=k, b=bank):
+            def op_init_max3(k_=k):
                 base = k_ * VALID_GROUP_STRIDE
                 tmps[k_] = Atom.max3_num_f32(
                     _get_sp(base), _get_sp(base + 1), _get_sp(base + 2)
@@ -718,7 +697,7 @@ class Softmax:
         for j in range_constexpr(2):
             for k in range_constexpr(N_VALID_GROUPS):
 
-                def op_cross_col(k_=k, j_=j, b=bank):
+                def op_cross_col(k_=k, j_=j):
                     base = k_ * VALID_GROUP_STRIDE
                     s0 = base + 3 + j_ * 2
                     tmps[k_] = Atom.max3_num_f32(
@@ -728,7 +707,7 @@ class Softmax:
                 ops.append(op_cross_col)
         for k in range_constexpr(N_VALID_GROUPS):
 
-            def op_last_elem(k_=k, b=bank):
+            def op_last_elem(k_=k):
                 base = k_ * VALID_GROUP_STRIDE
                 tmps[k_] = Atom.max3_num_f32(
                     _get_sp(base + 7), tmps[k_], _get_sp(base)
@@ -736,33 +715,33 @@ class Softmax:
 
             ops.append(op_last_elem)
 
-        def op_merge1(b=bank):
+        def op_merge1():
             tmps[0] = Atom.max3_num_f32(tmps[0], tmps[1], tmps[2])
 
-        def op_merge2(b=bank):
+        def op_merge2():
             tmps[0] = Atom.max3_num_f32(tmps[0], tmps[3], tmps[1])
 
         tmps_perm = [None]
         _zero_f32 = arith.constant(0.0, type=T.f32)
 
-        def op_perm_prep(b=bank, z=_zero_f32):
+        def op_perm_prep(z=_zero_f32):
             tmps_perm[0] = Atom.add_f32(tmps[0], z)
 
-        def op_perm(b=bank):
+        def op_perm():
             tmps[1] = Atom.permlanex16(
                 tmps_perm[0],
                 arith.constant(PERM_SEL_LO, type=T.i32),
                 arith.constant(PERM_SEL_HI, type=T.i32),
             )
 
-        def op_pre_max(b=bank):
-            ss["pre_max_log2e_scl"][b] = Atom.mul_f32(
-                ss["old_max"][b], sgpr["s_log2e_scl"]
+        def op_pre_max():
+            ss["pre_max_log2e_scl"][msb] = Atom.mul_f32(
+                ss["old_max"][msb], sgpr["s_log2e_scl"]
             )
 
-        def op_cur_max(b=bank):
-            ss["local_max"][b] = Atom.max3_num_f32(
-                tmps[0], tmps[1], ss["old_max"][b]
+        def op_cur_max():
+            ss["local_max"][msb] = Atom.max3_num_f32(
+                tmps[0], tmps[1], ss["old_max"][msb]
             )
 
         ops += [op_merge1, op_merge2, op_perm_prep, op_perm, op_pre_max, op_cur_max]
@@ -810,7 +789,7 @@ class Softmax:
         ty, blk, sp_pairs_all, softmax_state, sgpr_state, skip_rescale_sum=False
     ):
         if const_expr("pre_max_log2e_scl" not in softmax_state):
-            softmax_state["pre_max_log2e_scl"] = _none_list()
+            softmax_state["pre_max_log2e_scl"] = [None] * NUM_MSB
         ops_by_rid = [[] for _ in range_constexpr(RLTS_LEN)]
         for m in range_constexpr(NUM_MSB):
             ops_by_rid[m] = Softmax.build_part0_ops(
@@ -867,7 +846,7 @@ class Softmax:
     @staticmethod
     def part01_only(ty, blk, sp_pairs_all, softmax_state, sgpr_state):
         if const_expr("pre_max_log2e_scl" not in softmax_state):
-            softmax_state["pre_max_log2e_scl"] = _none_list()
+            softmax_state["pre_max_log2e_scl"] = [None] * NUM_MSB
         ops_by_rid, _, _, _ = Softmax.build_all_gemm2_ops(
             ty, blk, sp_pairs_all, softmax_state, sgpr_state
         )
@@ -2688,7 +2667,9 @@ def _ep_finish(
     shi = arith.constant(PERM_SEL_HI, type=T.i32)
     for mb in fx.range_constexpr(0, NUM_MSB, 2):
         sm = rsf[mb] + rsf[mb + 1]
-        pm = rocdl_permlanex16(ty["f32"], sm, sm, slo, shi, False, False)
+        pm = rocdl_dialect.permlanex16(
+            res=ty["f32"], old=sm, src0=sm, src1=slo, src2=shi, fi=False, bound_control=False,
+        )
         sf = sm + pm
         rsf[mb] = sf
         rsf[mb + 1] = sf
