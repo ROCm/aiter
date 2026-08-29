@@ -194,7 +194,15 @@ def _const_mxfp8(rows: int, k: int, val: float) -> torch.Tensor:
 
 
 def _prep(
-    intype: str, M: int, N: int, K: int, apre: int, data_init: str, scale_init: str, gen
+    intype: str,
+    M: int,
+    N: int,
+    K: int,
+    apre: int,
+    data_init: str,
+    scale_init: str,
+    gen,
+    need_ref: bool = True,
 ):
     """Build raw + shuffled device tensors and the f32 golden reference.
 
@@ -228,7 +236,10 @@ def _prep(
         sB = bench_init.fill_scale_e8m0((N, K // MX_SCALE_BLOCK), scale_init, gen)
 
     # fp32 golden; the caller casts/quantizes it to the requested outtype.
-    ref_f32 = _ref(intype, A, B, sA, sB, M, N)
+    # clk-mode skips it: the golden is a ~34 GB fp32 N-by-K matmul (compute-bound,
+    # would dominate the timeline AND pull the sampled clocks up to compute freqs),
+    # and clk-mode doesn't check accuracy.
+    ref_f32 = _ref(intype, A, B, sA, sB, M, N) if need_ref else None
 
     inp = {
         "A": shuffle_mxfp8fp4_a(A) if apre else A,  # B always preshuffled, A per `apre`
@@ -252,6 +263,9 @@ def test_gemm(
     seed=0,
     mode="perf",
     knl_name=None,
+    clk_mode=False,
+    clk_seconds=40.0,
+    num_iters_arg=None,
 ):
     # Skip unfittable shapes up front (before prep/shuffle) so they show as
     # "not support" rather than crashing on a shape assert / missing kernel.
@@ -280,10 +294,15 @@ def test_gemm(
     assert K % MX_SCALE_BLOCK == 0, f"K must be a multiple of {MX_SCALE_BLOCK}"
     out_dtype = _OUT_DTYPE[outtype]
     gen = bench_init.make_generator(seed)  # fixed seed -> bit-identical buffers
-    inp, ref_f32 = _prep(intype, M, N, K, apre, data_init, scale_init, gen)
-    ref = ref_f32.to(out_dtype)
+    inp, ref_f32 = _prep(
+        intype, M, N, K, apre, data_init, scale_init, gen, need_ref=not clk_mode
+    )
+    ref = ref_f32.to(out_dtype) if ref_f32 is not None else None
     needTrace = mode == "profile"
-    num_iters = 5 if mode == "func" else 101
+    if num_iters_arg is not None:
+        num_iters = num_iters_arg
+    else:
+        num_iters = 5 if mode == "func" else 101
 
     # Single ASM kernel under test, dispatched by intype. Inputs passed as ARGS so
     # run_perftest can rotate them (defeats the L2 hot-cache). Dispatch is
@@ -326,6 +345,69 @@ def test_gemm(
     _tile_m, _tile_n = _heuristic_tile(M)
     _label = f"f8gemm_{outtype}_{_middle}_{_pre}_{_tile_m}x{_tile_n}_4x4_ps"
     _report_active_tg(M, N, _tile_m, _tile_n, _label)
+
+    if clk_mode:
+        # ---- Clock-decoupling soak (DPM experiment Step -1 / Step 0) ----
+        # No golden, no profiler: launch the kernel back-to-back for >= clk_seconds
+        # so an external clk_trace.py --wait-pid can sample a long steady clock
+        # window, and BW + clocks come from the SAME window (discipline #3). The
+        # torch profiler path can't do this -- it buffers every kernel event, so a
+        # 30 s (tens of thousands of iters) run would blow up memory. Reusing the
+        # same args every iter is fine: B is ~4.3 GB, far larger than L2, so nothing
+        # caches and every iter re-reads the full operand from HBM.
+        import time as _time
+
+        run_asm, cand_args = candidates["asm"]
+        try:
+            for _ in range(3):  # warmup: JIT/dispatch, reach steady DPM/thermal
+                out = run_asm(*cand_args)
+            torch.cuda.synchronize()
+        except Exception as e:
+            if not any(m in str(e) for m in ("cannot get heuristic kernel",)):
+                raise
+            aiter.logger.warning("clk-mode: no dispatchable kernel: %s", e)
+            ret["asm us"] = float("nan")
+            ret["asm TFLOPS"] = float("nan")
+            ret["asm TB/s"] = float("nan")
+            ret["asm err"] = float("nan")
+            ret["asm result"] = "not support"
+            return ret
+
+        CHUNK = 500  # syncs are sparse, so intra-loop GPU idle gaps stay negligible
+        ev0 = torch.cuda.Event(enable_timing=True)
+        ev1 = torch.cuda.Event(enable_timing=True)
+        done = 0
+        ev0.record()
+        t0 = _time.perf_counter()
+        while True:
+            for _ in range(CHUNK):
+                out = run_asm(*cand_args)
+            done += CHUNK
+            torch.cuda.synchronize()
+            if _time.perf_counter() - t0 >= clk_seconds:
+                break
+            if num_iters_arg is not None and done >= num_iters_arg:
+                break
+        ev1.record()
+        torch.cuda.synchronize()
+        wall = _time.perf_counter() - t0
+        us = ev0.elapsed_time(ev1) * 1000.0 / done  # per-iter device us
+        io_bytes = in_bytes + out.nbytes
+        ret["asm us"] = round(us, 2)
+        ret["asm TFLOPS"] = round(flops / us / 1e6, 1)
+        ret["asm TB/s"] = round(io_bytes / us / 1e6, 2)
+        ret["asm err"] = float("nan")
+        ret["asm result"] = f"clk-mode {done}it/{wall:.0f}s"
+        aiter.logger.info(
+            "clk-mode soak: %d iters over %.1f s, %.2f us/iter, %.2f TB/s "
+            "(golden skipped, sample clocks with clk_trace during this window)",
+            done,
+            wall,
+            us,
+            ret["asm TB/s"],
+        )
+        return ret
+
     # Only a missing .co is reported as "not support"; any other failure (OOM,
     # memory fault, shape assert, ...) must propagate, not show as a green cell.
     # An explicit --knl-name that isn't in the cfg is a real error (typo / missing
@@ -481,6 +563,32 @@ def main():
         help="(M,N,K) tuples, e.g. -s 16384,16384,8192 128,16384,16384; "
         "unset uses PERF_SHAPES (perf/profile) or FUNC_SHAPES (func)",
     )
+    parser.add_argument(
+        "--clk-mode",
+        dest="clk_mode",
+        action="store_true",
+        help="DPM clock-decoupling mode: skip the fp32 golden and run the kernel "
+        "back-to-back for --clk-seconds (no profiler) so an external clk_trace.py "
+        "can sample a long steady clock window. BW is reported from that same "
+        "window; accuracy is NOT checked (err/result show clk-mode).",
+    )
+    parser.add_argument(
+        "--clk-seconds",
+        dest="clk_seconds",
+        type=float,
+        default=40.0,
+        help="clk-mode soak duration in seconds (default 40; >= 30 recommended so "
+        "the trace resolves a steady window, not just the ramp)",
+    )
+    parser.add_argument(
+        "--num-iters",
+        dest="num_iters",
+        type=int,
+        default=None,
+        help="override kernel iteration count. Normal mode: replaces the default "
+        "101 (perf) / 5 (func). clk-mode: optional hard cap on soak iters (the "
+        "soak still stops at --clk-seconds, whichever comes first).",
+    )
     args = parser.parse_args()
 
     # DATA and SCALE init are paired position-wise (NOT crossed). Mode-aware
@@ -534,6 +642,9 @@ def main():
             seed=args.seed,
             mode=args.mode,
             knl_name=args.knl_name,
+            clk_mode=args.clk_mode,
+            clk_seconds=args.clk_seconds,
+            num_iters_arg=args.num_iters,
         )
         for apre, (di, si), intype, outtype in itertools.product(
             apre_list, init_pairs, args.intype, args.outtype
