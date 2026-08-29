@@ -359,16 +359,16 @@ def get_meta_param(
         # Keyed by the FOLDED query width (nhead * max_seqlen_q), so any
         # max_seqlen_q > 1 can produce a width the table never listed: the
         # qlen-agnostic gqa=128 ps=0 kernel accepts any max_seqlen_q, and
-        # qlen >= 5 lands past the 512 entry. Fall back to the widest listed
-        # width's block instead of raising. The table is non-increasing in
-        # width (128 -> 64 -> 32) and every unlisted width that reaches here is
-        # above the top entry, so that is the direction to extrapolate -- and
-        # deriving it from the table means it cannot drift. min_block_n only
-        # feeds the min() caps on num_kv_splits below, so it bounds split
+        # qlen >= 5 lands past the 512 entry. On a miss, use the widest listed
+        # width's block (512 -> 32) instead of raising. Unlisted widths that
+        # reach here are above 512, so that is the direction to extrapolate --
+        # and deriving it from the table means it cannot drift. min_block_n
+        # only feeds the min() caps on num_kv_splits below, so it bounds split
         # parallelism, never correctness.
-        min_block_n = get_block_n_fp8.get(
-            int(nhead * max_seqlen_q), get_block_n_fp8[max(get_block_n_fp8)]
-        )
+        folded_width = int(nhead * max_seqlen_q)
+        min_block_n = get_block_n_fp8.get(folded_width)
+        if min_block_n is None:
+            min_block_n = get_block_n_fp8[max(get_block_n_fp8)]
         # ceil(avg_kv / min_block_n) computed in pure integers (avg_kv = total_kv/bs).
         num_kv_splits = min(
             num_kv_splits,
