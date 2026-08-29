@@ -82,7 +82,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
         v_oob_dg1 = TDM.build_oob_dg1_list(
             _V_CFG, 128, _sv_elems, actual_kv_len, wave_id
         )
-        q_remain_o = arith.maxsi(actual_q_len - m_start, arith.constant(0, type=T.i32))
+        q_remain_o = arith.maxsi(actual_q_len - m_start, fx.Int32(0).ir_value())
         o_oob_dim1 = TDM.per_warp_oob_dim1(q_remain_o, wave_id, 32)
 
         # ── Zero-fill output when KV is empty (seqlen_k == 0) ──
@@ -106,7 +106,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                         (q_tok_z * gdz + by) * 4
                     )
                     llvm_dialect.store(
-                        arith.constant(float("-inf"), type=T.f32),
+                        fx.Float32(float("-inf")).ir_value(),
                         llvm_dialect.inttoptr(glb_ptr_ty(), lse_addr_z),
                     )
 
@@ -134,7 +134,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             kv_lds_addrs_a = build_kv_lds_addrs(lane_id, k_a, v_a)
             kv_lds_addrs_b = build_kv_lds_addrs(lane_id, k_b, v_b)
             stride_k_32, stride_v_32 = stride_k_seq * 32, stride_v_seq * 32
-            scale = arith.constant(LOG2_E, type=T.f32) * scalar_f
+            scale = (fx.Float32(LOG2_E) * scalar_f).ir_value()
             sgpr_state = {
                 "s_log2e_scl": scale,
                 "s_log2e_scl_pair": vector.broadcast(T.vec(2, T.f32), scale),
