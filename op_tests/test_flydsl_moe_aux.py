@@ -761,7 +761,7 @@ def test_route_maps(numel, E, topk, max_m):
         ), f"{name}: row outside own expert band"
         assert len(set(r.tolist())) == numel, f"{name}: rows not a bijection"
         inv = r2t.cpu()[r.long()]
-        tokens = torch.arange(numel) // topk
+        tokens = torch.arange(numel, device="cpu") // topk
         assert bool(
             (inv == tokens).all()
         ), f"{name}: rows_to_tokens does not invert topids_to_rows"

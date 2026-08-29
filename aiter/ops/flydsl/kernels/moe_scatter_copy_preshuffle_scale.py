@@ -145,10 +145,11 @@ def build_moe_scatter_copy_preshuffle_scale_module(
         # Per-tile bases (runtime e/tile/max_m, compile-time geometry).
         # grouped src-row base of this tile's first row.
         row_base = e * max_m_i32 + tile * rows_per_tile
-        # dst dword base of this expert+tile (out_row 0 of the tile).
-        # expert stride (dwords) = max_m * src_dwords; tile adds 16 out-rows.
+        # dst dword base of this expert+tile.
+        # expert stride (dwords) = max_m * src_dwords; each tile owns one full
+        # row-tile block of units_per_tile = 16 * src_dwords * wmma_rep dwords.
         expert_dword_base = e * (max_m_i32 * src_dwords)
-        tile_out_row0 = tile * 16
+        tile_dword_base = expert_dword_base + tile * units_per_tile
 
         # Created unconditionally (no in-body `if`): for gather=False the launcher
         # passes a placeholder for rows_to_tokens and the helper never reads it.
@@ -169,7 +170,6 @@ def build_moe_scatter_copy_preshuffle_scale_module(
                 value = _emit_preshuffle_dword(
                     gather, map_p, src_p, grow, sd, src_dwords
                 )
-                tile_dword_base = expert_dword_base + tile_out_row0 * src_dwords
                 dst_off = tile_dword_base + (sd * wmma_rep + w) * 16 + lane
                 dst_p[dst_off] = value
 
