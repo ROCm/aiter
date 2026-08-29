@@ -255,7 +255,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 arith.index(1),
                 iter_args=loop1_results,
             ):
-                tile_idx_i32 = arith.index_cast(T.i32, tile_idx)
+                tile_idx_i32 = fx.Int32(tile_idx)
                 causal_n = tile_idx_i32 * tile_n_const - causal_offset
                 yield tile_iteration(ctx, tile_idx, iter_args, causal_n_start=causal_n)
 

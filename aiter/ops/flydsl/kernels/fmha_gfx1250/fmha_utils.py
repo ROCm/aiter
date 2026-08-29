@@ -1273,20 +1273,20 @@ def setreg(hwreg_enc, value):
 
 def phase4_q_load(lane_id, q_rsrc, stride_q_seq, wave_id, q_tile_offset_bytes=None):
     q_crd = idx2crd(lane_id, fx.make_layout((16, 2), (1, 16)))
-    lane_lo = arith.index_cast(T.i32, q_crd[0])
-    lane_hi = arith.index_cast(T.i32, q_crd[1])
+    lane_lo = fx.Int32(q_crd[0])
+    lane_hi = fx.Int32(q_crd[1])
     q_elem_off = (
         lane_lo * stride_q_seq + lane_hi * 16 + (wave_id * 32) * stride_q_seq
     ) >> 2
     vec4i32_ty = T.vec(4, T.i32)
     soff_zero = arith.constant(0, type=T.i32)
-    q_base_bytes = mul_nuw(q_elem_off, arith.constant(4, type=T.i32))
+    q_base_bytes = mul_nuw(q_elem_off, fx.Int32(4))
     if q_tile_offset_bytes is not None:
         q_base_bytes = add_nuw(q_tile_offset_bytes, q_base_bytes)
     stride_16_bytes = stride_q_seq * 16
-    _k_half_c = arith.constant(QK_HDIM, type=T.i32)
+    _k_half_c = fx.Int32(QK_HDIM)
     bank_offsets = [
-        arith.constant(0, type=T.i32),
+        fx.Int32(0),
         _k_half_c,
         stride_16_bytes,
         add_nuw(stride_16_bytes, _k_half_c),
@@ -1303,7 +1303,7 @@ def phase4_q_load(lane_id, q_rsrc, stride_q_seq, wave_id, q_tile_offset_bytes=No
             voff = (
                 bank_voff
                 if i == 0
-                else add_nuw(bank_voff, arith.constant(i * 32, type=T.i32))
+                else add_nuw(bank_voff, fx.Int32(i * 32))
             )
             bank_loads.append(
                 set_vgpr_bank(
@@ -2220,7 +2220,7 @@ def epilogue_endtile(
     }
     et_o = [[ep["o_tiles"][d][n] for n in range(N_PV_WMMA_N)] for d in range(NUM_MSB)]
     et_causal_ns = (
-        (arith.index_cast(T.i32, num_tiles_idx) - 1) * TILE_N - causal_offset
+        (fx.Int32(num_tiles_idx) - 1) * TILE_N - causal_offset
         if const_expr(IS_CAUSAL)
         else None
     )
@@ -2282,7 +2282,7 @@ def apply_causal_mask(ctx, su_sp_tiles, n_start_fx):
     lane_hi_x8 = (lane_id >> 4) * 8
     wave_x32 = wave_id * 32
     base = (m_start - n_start_fx) + wave_x32 + (lane_lo - lane_hi_x8)
-    neg_inf_c = arith.constant(float("-inf"), type=T.f32)
+    neg_inf_c = fx.Float32(float("-inf"))
     for su in fx.range_constexpr(CNT_SU):
         for msb in fx.range_constexpr(NUM_MSB):
             off = (msb // 2) * 16 - su * 32 - (msb % 2) * 16
@@ -2302,7 +2302,7 @@ def apply_kv_oob_mask(ctx, su_sp_tiles, kv_remain_raw):
     lane_hi = lane_id >> 4
     lane_hi_x8 = lane_hi * 8
     base = (kv_remain_raw - 1) - lane_hi_x8
-    neg_inf = arith.constant(float("-inf"), type=T.f32)
+    neg_inf = fx.Float32(float("-inf"))
     for su in fx.range_constexpr(CNT_SU):
         for msb in fx.range_constexpr(NUM_MSB):
             col_base_val = su * 32 + (msb % 2) * 16
@@ -2890,10 +2890,7 @@ def _ep_finish(
     olds2 = extract_lds_base_i32(lds_alloc_v_a.get_base()) + wsgpr * LDS_D_WV_SIZE
     _dg0 = Vec.from_elements([fx.Int32(1), olds2, alo, ahi], fx.Int32)
     _td1_lo_o = arith.andi(o_oob_dim1, arith.constant(0xFFFF, type=T.i32))
-    _g2 = arith.ori(
-        arith.shli(_td1_lo_o, arith.constant(16, type=T.i32)),
-        arith.constant(0, type=T.i32),
-    )
+    _g2 = arith.shli(_td1_lo_o, arith.constant(16, type=T.i32))
     _dg1 = Vec.from_elements(
         [
             fx.Int32(1 << 16),
