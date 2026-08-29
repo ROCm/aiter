@@ -477,12 +477,12 @@ def _build_compress_forward_kernel(
             lds_m_ptr = lds.lds_m.ptr
             lds_kv_ptr = lds.lds_kv.ptr
             lds_w_ptr = lds.lds_w.ptr
-            lds_thread_base = ArithValue(wid) * c_SLICE + ArithValue(lid) * c_VEC
+            lds_thread_base = fx.Int32(wid) * SLICE_SZ + fx.Int32(lid) * VEC
             for i in range_constexpr(VEC):
-                idx_i = lds_thread_base + arith.constant(i, type=i32)
-                fx.ptr_store(m_local[i], lds_m_ptr + fx.Int32(idx_i))
-                fx.ptr_store(kv_local[i], lds_kv_ptr + fx.Int32(idx_i))
-                fx.ptr_store(w_local[i], lds_w_ptr + fx.Int32(idx_i))
+                idx_i = lds_thread_base + i
+                fx.ptr_store(m_local[i], lds_m_ptr + idx_i)
+                fx.ptr_store(kv_local[i], lds_kv_ptr + idx_i)
+                fx.ptr_store(w_local[i], lds_w_ptr + idx_i)
 
             gpu.barrier()
 
@@ -494,13 +494,13 @@ def _build_compress_forward_kernel(
             def _wave0():
                 comp_list = []
                 for i in range_constexpr(VEC):
-                    lane_off = ArithValue(lid) * c_VEC + arith.constant(i, type=i32)
+                    lane_off = fx.Int32(lid) * VEC + i
                     # Global max across NW waves for this element.
                     m_g = fx.Float32(c_neg_inf)
                     m_arr = []
                     for w in range_constexpr(NW):
-                        idx_w = arith.constant(w * SLICE_SZ, type=i32) + lane_off
-                        m_w = fx.ptr_load(lds_m_ptr + fx.Int32(idx_w))
+                        idx_w = w * SLICE_SZ + lane_off
+                        m_w = fx.ptr_load(lds_m_ptr + idx_w)
                         m_arr.append(m_w)
                         m_g = m_g.maximumf(m_w)
 
@@ -508,9 +508,9 @@ def _build_compress_forward_kernel(
                     kv_sum = fx.Float32(0.0)
                     w_sum = fx.Float32(0.0)
                     for w in range_constexpr(NW):
-                        idx_w = arith.constant(w * SLICE_SZ, type=i32) + lane_off
-                        kv_w = fx.ptr_load(lds_kv_ptr + fx.Int32(idx_w))
-                        w_w = fx.ptr_load(lds_w_ptr + fx.Int32(idx_w))
+                        idx_w = w * SLICE_SZ + lane_off
+                        kv_w = fx.ptr_load(lds_kv_ptr + idx_w)
+                        w_w = fx.ptr_load(lds_w_ptr + idx_w)
                         m_w = m_arr[w]
                         scale_w = fx.Float32(fexp_f32(_to_raw(m_w - m_g)))
                         kv_sum = kv_sum + kv_w * scale_w

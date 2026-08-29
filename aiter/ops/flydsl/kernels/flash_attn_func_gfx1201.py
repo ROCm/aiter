@@ -44,7 +44,6 @@ from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
-from flydsl.expr.utils.arith import ArithValue
 from flydsl.expr.utils.arith import _to_raw as _raw
 
 from aiter.ops.flydsl.kernels import buffer_ops
@@ -282,7 +281,7 @@ def build_flash_attn_func_module_primary(
             return _load_global_half_vec(base_ptr, base_idx, v8f16_type)
 
         def _bitcast_i32(value):
-            return fx.Int32(ArithValue(value).bitcast(fx.Int32.ir_type))
+            return fx.Float32(value).bitcast(fx.Int32)
 
         def _pack_bf16_pair(lo, hi, shift, mask):
             lo_i32 = _bitcast_i32(lo)
@@ -362,14 +361,14 @@ def build_flash_attn_func_module_primary(
         # to `v_cmp_gt_u64_e64` and cause an ISA hash drift even though both
         # variants are semantically equivalent for non-negative offsets.
         q_in_bounds = arith.cmpi(arith.CmpIPredicate.slt, _raw(q_row), _raw(seq_len_v))
-        q_row_safe = fx.Index(ArithValue(q_in_bounds).select(q_row, fx.Index(0)))
+        q_row_safe = fx.Index(q_in_bounds.select(q_row, fx.Index(0)))
         c_zero_v8f16 = Vec.filled(8, 0.0, elem_dtype).ir_value()
         q_b_packs = []
         for ks in range_constexpr(K_STEPS_QK):
             q_col = fx.Index(ks * K_STEP_QK) + klane * WMMA_LANE_K
             g_idx = global_idx(q_row_safe, q_col)
             raw = load_global_v8f16(q_ptr, g_idx)
-            q_b_packs.append(ArithValue(q_in_bounds).select(raw, c_zero_v8f16))
+            q_b_packs.append(q_in_bounds.select(raw, c_zero_v8f16))
 
         # ---- Constants ----
         c_neg_inf = fx.Float32(float("-inf"))
@@ -385,9 +384,7 @@ def build_flash_attn_func_module_primary(
 
         _q_end = q_start + BLOCK_M
         if const_expr(CAUSAL):
-            kv_upper = fx.Index(
-                ArithValue(_q_end < seq_len_v).select(_q_end, seq_len_v)
-            )
+            kv_upper = fx.Index((_q_end < seq_len_v).select(_q_end, seq_len_v))
         else:
             kv_upper = seq_len_v
 
@@ -486,38 +483,38 @@ def build_flash_attn_func_module_primary(
                     klane_off_i32 = klane_i32 * fx.Int32(8)
                     # st=0
                     _b0 = kv_start_i32 + fx.Int32(0) + klane_off_i32
-                    s_v0 = ArithValue(_b0 > q_row_i32).select(c_neg_inf, s_v0)
+                    s_v0 = (_b0 > q_row_i32).select(c_neg_inf, s_v0)
                     _b1 = kv_start_i32 + fx.Int32(1) + klane_off_i32
-                    s_v1 = ArithValue(_b1 > q_row_i32).select(c_neg_inf, s_v1)
+                    s_v1 = (_b1 > q_row_i32).select(c_neg_inf, s_v1)
                     _b2 = kv_start_i32 + fx.Int32(2) + klane_off_i32
-                    s_v2 = ArithValue(_b2 > q_row_i32).select(c_neg_inf, s_v2)
+                    s_v2 = (_b2 > q_row_i32).select(c_neg_inf, s_v2)
                     _b3 = kv_start_i32 + fx.Int32(3) + klane_off_i32
-                    s_v3 = ArithValue(_b3 > q_row_i32).select(c_neg_inf, s_v3)
+                    s_v3 = (_b3 > q_row_i32).select(c_neg_inf, s_v3)
                     _b4 = kv_start_i32 + fx.Int32(4) + klane_off_i32
-                    s_v4 = ArithValue(_b4 > q_row_i32).select(c_neg_inf, s_v4)
+                    s_v4 = (_b4 > q_row_i32).select(c_neg_inf, s_v4)
                     _b5 = kv_start_i32 + fx.Int32(5) + klane_off_i32
-                    s_v5 = ArithValue(_b5 > q_row_i32).select(c_neg_inf, s_v5)
+                    s_v5 = (_b5 > q_row_i32).select(c_neg_inf, s_v5)
                     _b6 = kv_start_i32 + fx.Int32(6) + klane_off_i32
-                    s_v6 = ArithValue(_b6 > q_row_i32).select(c_neg_inf, s_v6)
+                    s_v6 = (_b6 > q_row_i32).select(c_neg_inf, s_v6)
                     _b7 = kv_start_i32 + fx.Int32(7) + klane_off_i32
-                    s_v7 = ArithValue(_b7 > q_row_i32).select(c_neg_inf, s_v7)
+                    s_v7 = (_b7 > q_row_i32).select(c_neg_inf, s_v7)
                     # st=1 (st_base=16)
                     _b8 = kv_start_i32 + fx.Int32(16) + klane_off_i32
-                    s_v8 = ArithValue(_b8 > q_row_i32).select(c_neg_inf, s_v8)
+                    s_v8 = (_b8 > q_row_i32).select(c_neg_inf, s_v8)
                     _b9 = kv_start_i32 + fx.Int32(17) + klane_off_i32
-                    s_v9 = ArithValue(_b9 > q_row_i32).select(c_neg_inf, s_v9)
+                    s_v9 = (_b9 > q_row_i32).select(c_neg_inf, s_v9)
                     _b10 = kv_start_i32 + fx.Int32(18) + klane_off_i32
-                    s_v10 = ArithValue(_b10 > q_row_i32).select(c_neg_inf, s_v10)
+                    s_v10 = (_b10 > q_row_i32).select(c_neg_inf, s_v10)
                     _b11 = kv_start_i32 + fx.Int32(19) + klane_off_i32
-                    s_v11 = ArithValue(_b11 > q_row_i32).select(c_neg_inf, s_v11)
+                    s_v11 = (_b11 > q_row_i32).select(c_neg_inf, s_v11)
                     _b12 = kv_start_i32 + fx.Int32(20) + klane_off_i32
-                    s_v12 = ArithValue(_b12 > q_row_i32).select(c_neg_inf, s_v12)
+                    s_v12 = (_b12 > q_row_i32).select(c_neg_inf, s_v12)
                     _b13 = kv_start_i32 + fx.Int32(21) + klane_off_i32
-                    s_v13 = ArithValue(_b13 > q_row_i32).select(c_neg_inf, s_v13)
+                    s_v13 = (_b13 > q_row_i32).select(c_neg_inf, s_v13)
                     _b14 = kv_start_i32 + fx.Int32(22) + klane_off_i32
-                    s_v14 = ArithValue(_b14 > q_row_i32).select(c_neg_inf, s_v14)
+                    s_v14 = (_b14 > q_row_i32).select(c_neg_inf, s_v14)
                     _b15 = kv_start_i32 + fx.Int32(23) + klane_off_i32
-                    s_v15 = ArithValue(_b15 > q_row_i32).select(c_neg_inf, s_v15)
+                    s_v15 = (_b15 > q_row_i32).select(c_neg_inf, s_v15)
                 s_raw = [
                     s_v0,
                     s_v1,
