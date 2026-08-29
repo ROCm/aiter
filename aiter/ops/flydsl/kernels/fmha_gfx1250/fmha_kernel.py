@@ -11,7 +11,6 @@ import flydsl.expr as fx
 import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
-from flydsl._mlir.dialects import scf
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, rocdl
 from flydsl.expr.primitive import const_expr
@@ -203,24 +202,16 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             )
 
             # ── Main KV Loop: non-causal tiles ──
-            for tile_idx, iter_args, loop1_results in scf.for_(
-                arith.index(1),
-                first_causal_tile_idx,
-                arith.index(1),
-                iter_args=init_args,
-            ):
-                yield tile_iteration(ctx, tile_idx, iter_args)
+            loop1_results = init_args
+            for tile_idx, iter_args in range(1, first_causal_tile_idx, 1, init=init_args):
+                loop1_results = yield tile_iteration(ctx, tile_idx, iter_args)
 
             # ── Main KV Loop: causal tiles ──
-            for tile_idx, iter_args, loop_results in scf.for_(
-                first_causal_tile_idx,
-                num_tiles_minus1_idx,
-                arith.index(1),
-                iter_args=loop1_results,
-            ):
+            loop_results = loop1_results
+            for tile_idx, iter_args in range(first_causal_tile_idx, num_tiles_minus1_idx, 1, init=loop1_results):
                 tile_idx_i32 = fx.Int32(tile_idx)
                 causal_n = tile_idx_i32 * tile_n_const - causal_offset
-                yield tile_iteration(ctx, tile_idx, iter_args, causal_n_start=causal_n)
+                loop_results = yield tile_iteration(ctx, tile_idx, iter_args, causal_n_start=causal_n)
 
             # ── Epilogue ──
             ep = unpack_loop_results(loop_results, lane_id)
