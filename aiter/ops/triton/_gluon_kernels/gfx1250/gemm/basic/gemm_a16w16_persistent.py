@@ -120,6 +120,7 @@ def gemm_a16w16_persistent_kernel_(
     CTAS_M: gl.constexpr = 1,
     CTAS_N: gl.constexpr = 1,
     num_ctas: gl.constexpr = 1,
+    PREFETCH_DEPTH: gl.constexpr = 0,  # unused, kept for a uniform launch signature
 ):
 
     gl.static_assert(NUM_BUFFERS >= 2, "persistent gemm requires NUM_BUFFERS >= 2")
@@ -367,9 +368,14 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
     CTAS_M: gl.constexpr = 1,
     CTAS_N: gl.constexpr = 1,
     num_ctas: gl.constexpr = 1,
+    PREFETCH_DEPTH: gl.constexpr = 0,
 ):
     gl.static_assert(
         NUM_BUFFERS >= 2, "persistent compute_bound requires NUM_BUFFERS >= 2"
+    )
+    PD: gl.constexpr = (NUM_BUFFERS - 1) if PREFETCH_DEPTH == 0 else PREFETCH_DEPTH
+    gl.static_assert(
+        NUM_BUFFERS >= PD + 1, "NUM_BUFFERS must be >= PREFETCH_DEPTH + 1"
     )
 
     # CGA (cluster) layouts. Empty at 1x1, giving exactly the old layouts.
@@ -474,7 +480,7 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
     m_off = pid_m * BLOCK_M
     n_off = pid_n * BLOCK_N
     sk_start = pid_k * SPLITK_BLOCK_SIZE
-    for pf in gl.static_range(NUM_BUFFERS - 1):
+    for pf in gl.static_range(PD):
         gl.amd.gfx1250.tdm.async_load(
             a_desc, [m_off, sk_start + pf * BLOCK_K], a_buffer.index(pf % NUM_BUFFERS)
         )
@@ -504,7 +510,7 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
             gl.minimum(sk_start + SPLITK_BLOCK_SIZE, K) - sk_start, BLOCK_K
         )
 
-        load_idx = NUM_BUFFERS - 1
+        load_idx = PD
         compute_idx = 0
 
         accumulator = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
@@ -517,7 +523,7 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
 
         if num_ctas > 1:
             gl.amd.gfx1250.cluster.arrive()
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
+        gl.amd.gfx1250.tdm.async_wait((PD - 1) * 2)
         if num_ctas > 1:
             gl.amd.gfx1250.cluster.wait()
 
@@ -534,7 +540,7 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
                 OPERAND_LAYOUT_B,
             )
 
-        for _ in range(cur_num_k_tiles - (NUM_BUFFERS - 1)):
+        for _ in range(cur_num_k_tiles - PD):
 
             gl.amd.gfx1250.tdm.async_load(
                 a_desc,
@@ -556,7 +562,7 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
 
             if num_ctas > 1:
                 gl.amd.gfx1250.cluster.arrive()
-            gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
+            gl.amd.gfx1250.tdm.async_wait((PD - 1) * 2)
             if num_ctas > 1:
                 gl.amd.gfx1250.cluster.wait()
 
@@ -582,10 +588,10 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
             cur_b = next_b
             compute_idx += 1
 
-        for i in gl.static_range(NUM_BUFFERS - 2):
+        for i in gl.static_range(PD - 1):
             if num_ctas > 1:
                 gl.amd.gfx1250.cluster.arrive()
-            gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 3 - i) * 2)
+            gl.amd.gfx1250.tdm.async_wait((PD - 2 - i) * 2)
             if num_ctas > 1:
                 gl.amd.gfx1250.cluster.wait()
 
