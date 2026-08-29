@@ -551,18 +551,28 @@ def build_flash_attn_fp8_module(
         v_tr8_ty = Vec.make_type(2, fx.Int32)
         lo_in_grp = lo % fx.Index(16)
 
-        def _v_base_ptr(v_off):
-            byte_off = (
-                fx.Index(lds_offset)
-                + v_off
-                + (lo // fx.Index(16)) * fx.Index(V_DBLOCK_STRIDE)
-                + hi * fx.Index(16 * V_KV_STRIDE)
-                + lo_in_grp * fx.Index(8)
-            )
-            return fx.buffer_ops.create_llvm_ptr(fx.Int64(byte_off), address_space=3)
+        # Lane-varying but loop-invariant part of the V read address.  Folding
+        # the slot offset in used to happen inside the MFMA phase, where the
+        # resulting v_add_u32 sat on the critical path: every ds_read_b64_tr_b8
+        # of the phase depends on it, so the first V read issued ~250-370 cycles
+        # after the barrier instead of the ~48 the asm kernel manages.  Hoisting
+        # this out and carrying the finished per-slot addresses turns the
+        # rotation into a register permute.
+        v_lane_base = (
+            fx.Index(lds_offset)
+            + (lo // fx.Index(16)) * fx.Index(V_DBLOCK_STRIDE)
+            + hi * fx.Index(16 * V_KV_STRIDE)
+            + lo_in_grp * fx.Index(8)
+        )
 
-        def read_v_pack(v_off, dt, ks):
-            base = _v_base_ptr(v_off)
+        def _v_addr(v_off):
+            """Per-lane V base address for an LDS slot byte offset."""
+            return v_lane_base + v_off
+
+        def read_v_pack(v_addr, dt, ks):
+            base = fx.buffer_ops.create_llvm_ptr(
+                fx.Int64(v_addr), address_space=3
+            )
             reads = []
             for kc in range_constexpr(4):
                 imm = (2 * dt) * V_DBLOCK_STRIDE + (
@@ -580,9 +590,9 @@ def build_flash_attn_fp8_module(
             o_accs,
             l_mfma,
             p_pack,
-            v_buff_off,
+            v_addr,
             v_preloaded,
-            k_buff_off,
+            k_base,
         ):
             p_ks_list = [
                 Vec(p_pack).shuffle(Vec(p_pack), list(range(r * 8, r * 8 + 8)))
@@ -621,11 +631,13 @@ def build_flash_attn_fp8_module(
                 un = u + PREFETCH_DEPTH
                 if const_expr(un < PV_UNITS):
                     kv_windows[un % 4] = read_v_pack(
-                        v_buff_off, un // PV_K_STEPS, un % PV_K_STEPS
+                        v_addr, un // PV_K_STEPS, un % PV_K_STEPS
                     )
                 else:
                     ki = u - (PV_UNITS - PREFETCH_DEPTH)
-                    kv_windows[un % 4] = _load_k_unit(k_buff_off, ki // K_STEPS, ki % K_STEPS)
+                    kv_windows[un % 4] = _load_k_unit(
+                        None, ki // K_STEPS, ki % K_STEPS, base=k_base
+                    )
                     k_preloaded[ki] = kv_windows[un % 4]
                 _sched_barrier()
             return o_accs, l_mfma, k_preloaded
@@ -639,13 +651,17 @@ def build_flash_attn_fp8_module(
 
         K_NT_STRIDE = 32 * K_STRIDE + (32 // K_UNIT_ROWS) * PAD_K
 
+        # Same hoist as the V side: everything but the slot offset is
+        # loop-invariant, so the per-slot row address is built once outside the
+        # loop and carried, not re-added inside the MFMA phase.
+        k_lane_base = (
+            lo * K_STRIDE
+            + (lo // fx.Index(K_UNIT_ROWS)) * fx.Index(PAD_K)
+            + hi * 32
+        )
+
         def _k_base_row(k_buff_off):
-            return (
-                k_buff_off
-                + lo * K_STRIDE
-                + (lo // fx.Index(K_UNIT_ROWS)) * fx.Index(PAD_K)
-                + hi * 32
-            )
+            return k_lane_base + k_buff_off
 
         def _load_k_unit(k_buff_off, nt, ks, base=None):
             if const_expr(base is None):
@@ -673,10 +689,10 @@ def build_flash_attn_fp8_module(
             return Vec(raw).bitcast(fx.Int32)
 
         def do_qk(
-            k_buff_off, 
-            k_preloaded, 
-            v_buff_off, 
-            seed=None, 
+            k_base,
+            k_preloaded,
+            v_addr,
+            seed=None,
             dma=None
         ):
             kv_windows = [None] * 4
@@ -703,11 +719,13 @@ def build_flash_attn_fp8_module(
                 un = u + PREFETCH_DEPTH
                 if const_expr(un < QK_UNITS):
                     kv_windows[un % 4] = _load_k_unit(
-                        k_buff_off, un // K_STEPS, un % K_STEPS
+                        None, un // K_STEPS, un % K_STEPS, base=k_base
                     )
                 else:
                     vi = u - (QK_UNITS - PREFETCH_DEPTH)
-                    kv_windows[un % 4] = read_v_pack(v_buff_off, vi // PV_K_STEPS, vi % PV_K_STEPS)
+                    kv_windows[un % 4] = read_v_pack(
+                        v_addr, vi // PV_K_STEPS, vi % PV_K_STEPS
+                    )
                     v_preloaded[vi] = kv_windows[un % 4]
                 _sched_barrier()
             for _dp in range_constexpr(len(l_ptrs)):
@@ -1132,7 +1150,12 @@ def build_flash_attn_fp8_module(
                 l_koffs = get_lds_koffs(_k_slot(1))
                 ## HBM k offs
                 g_koffs = get_hbm_koffs(BLOCK_N)
-                s_accs, v_preloaded = do_qk(k_buff_off, k_preloaded_prologue, v_buff_off, dma=(k_rsrc, l_koffs, g_koffs))
+                s_accs, v_preloaded = do_qk(
+                    _k_base_row(k_buff_off),
+                    k_preloaded_prologue,
+                    _v_addr(v_buff_off),
+                    dma=(k_rsrc, l_koffs, g_koffs),
+                )
                 m_frozen, bias_chunks, p_pack, l_valu, _, _ = do_softmax(
                     s_accs, m_init, l_valu_init
                 )
@@ -1148,6 +1171,14 @@ def build_flash_attn_fp8_module(
                     o_init[3],
                     p_pack,
                     *bias_chunks,
+                    # Finished per-lane LDS addresses, rotated in lockstep with
+                    # the raw slot offsets below.  The reads use these; only the
+                    # DMA (wave-uniform SALU) still wants the raw offsets.
+                    _v_addr(_v_slot(0)),
+                    _v_addr(_v_slot(1)),
+                    _v_addr(_v_slot(2)),
+                    _k_base_row(_k_slot(1)),
+                    _k_base_row(_k_slot(0)),
                     _v_slot(0),
                     _v_slot(1),
                     _v_slot(2),
@@ -1162,18 +1193,18 @@ def build_flash_attn_fp8_module(
                 l_mfma = list(carry[2 : 2 + L_MFMA_SLABS])
                 o0, o1, o2, o3, p_pack = carry[2 + L_MFMA_SLABS : G0_HEAD]
                 _rest = carry[G0_HEAD + N_BIAS_CHUNKS :]
-                v_buff_off = _rest[0]
-                k_buff_off = _rest[3]
-                v_preloaded = _rest[5 + DMA_PASSES :]
+                v_addr = _rest[0]
+                k_base = _rest[3]
+                v_preloaded = _rest[10 + DMA_PASSES :]
                 # After the final yield the carries describe the iteration that
                 # never ran, so the last tile's K buffer is the second slot.
                 o, l_mfma, _ = apply_pv(
                     [o0, o1, o2, o3],
                     l_mfma,
                     p_pack,
-                    v_buff_off,
+                    v_addr,
                     v_preloaded,
-                    k_buff_off,
+                    k_base,
                 )
                 return o, l_mfma, l_valu
 
@@ -1196,15 +1227,17 @@ def build_flash_attn_fp8_module(
                 o0, o1, o2, o3, p_pack = _g0_args[2 + L_MFMA_SLABS : G0_HEAD]
                 bias_chunks = _g0_args[G0_HEAD : G0_HEAD + N_BIAS_CHUNKS]
                 _rest = _g0_args[G0_HEAD + N_BIAS_CHUNKS :]
-                v_buff_off, v_next_off, v_further_off = _rest[0:3]
-                k_buff_off, k_next_off = _rest[3:5]
-                g_koffs = [_raw(x) for x in _rest[5 : 5 + DMA_PASSES]]
+                v_addr, v_next_addr, v_further_addr = _rest[0:3]
+                k_base, k_next_base = _rest[3:5]
+                v_buff_off, v_next_off, v_further_off = _rest[5:8]
+                k_buff_off, k_next_off = _rest[8:10]
+                g_koffs = [_raw(x) for x in _rest[10 : 10 + DMA_PASSES]]
                 # The DMA of this iteration lands in the buffer the *next* one
                 # reads; its voffsets were computed in the previous softmax
                 # phase, its LDS pointers are wave-uniform SALU rebuilt here.
                 l_koffs = get_lds_koffs(k_next_off)
 
-                v_preloaded = _rest[5 + DMA_PASSES :]
+                v_preloaded = _rest[10 + DMA_PASSES :]
 
                 _sched_barrier()
                 rocdl.s_setprio(1)
@@ -1213,16 +1246,16 @@ def build_flash_attn_fp8_module(
                     [o0, o1, o2, o3],
                     l_mfma,
                     p_pack,
-                    v_buff_off,
+                    v_addr,
                     v_preloaded,
-                    k_buff_off,
+                    k_base,
                 )
                 _wait_vmcnt(0)
                 seed = _bias_prefill(bias_chunks)
                 s_accs, v_preloaded = do_qk(
-                    k_buff_off,
+                    k_base,
                     k_preloaded,
-                    v_next_off,
+                    v_next_addr,
                     seed=seed,
                     dma=(k_rsrc, l_koffs, g_koffs),
                 )
@@ -1258,7 +1291,13 @@ def build_flash_attn_fp8_module(
                         _raw(o[3]),
                         _raw(p_pack),
                         *[_raw(bc) for bc in bias_chunks],
-                        # Rotate the V triple and swap the K pair.
+                        # Rotate the V triple and swap the K pair -- addresses
+                        # and raw offsets move together.
+                        _raw(v_next_addr),
+                        _raw(v_further_addr),
+                        _raw(v_addr),
+                        _raw(k_next_base),
+                        _raw(k_base),
                         _raw(v_next_off),
                         _raw(v_further_off),
                         _raw(v_buff_off),
@@ -1289,7 +1328,12 @@ def build_flash_attn_fp8_module(
                 l_voffs = get_lds_voffs(_v_slot(2))
                 ## HBM v offs
                 g_voffs = get_hbm_voffs(2 * BLOCK_N)
-                s_accs, v_preloaded = do_qk(k_buff_off, k_preloaded_prologue, v_buff_off, dma=(v_rsrc, l_voffs, g_voffs))
+                s_accs, v_preloaded = do_qk(
+                    _k_base_row(k_buff_off),
+                    k_preloaded_prologue,
+                    _v_addr(v_buff_off),
+                    dma=(v_rsrc, l_voffs, g_voffs),
+                )
                 m_frozen, bias_chunks, s_accs = do_softmax_prepare(s_accs, m_init)
                 _sched_barrier()
                 _gpu_barrier()
@@ -1310,6 +1354,11 @@ def build_flash_attn_fp8_module(
                     s_accs[3],
                     *bias_chunks,
                     # Offsets for the first loop body (i=1); see g0_iter0.
+                    _v_addr(_v_slot(0)),
+                    _v_addr(_v_slot(1)),
+                    _v_addr(_v_slot(2)),
+                    _k_base_row(_k_slot(1)),
+                    _k_base_row(_k_slot(0)),
                     _v_slot(0),
                     _v_slot(1),
                     _v_slot(2),
@@ -1325,9 +1374,9 @@ def build_flash_attn_fp8_module(
                 o0, o1, o2, o3 = carry[2 + L_MFMA_SLABS : G1_HEAD]
                 s0, s1, s2, s3 = carry[G1_HEAD : G1_HEAD + 4]
                 _rest = carry[G1_SACC + N_BIAS_CHUNKS :]
-                v_buff_off = _rest[0]
-                k_buff_off = _rest[3]
-                v_preloaded = _rest[5 + DMA_PASSES :]
+                v_addr = _rest[0]
+                k_base = _rest[3]
+                v_preloaded = _rest[10 + DMA_PASSES :]
                 bias_chunks = carry[G1_SACC : G1_SACC + N_BIAS_CHUNKS]
                 m_frozen, _, p_pack, l_valu, o_r, l_mfma = do_softmax(
                     [s0, s1, s2, s3],
@@ -1342,9 +1391,9 @@ def build_flash_attn_fp8_module(
                     o_r,
                     l_mfma,
                     p_pack,
-                    v_buff_off,
+                    v_addr,
                     v_preloaded,
-                    k_buff_off,
+                    k_base,
                 )
                 return o, l_mfma, l_valu
 
@@ -1368,10 +1417,12 @@ def build_flash_attn_fp8_module(
                 s0, s1, s2, s3 = _g1_args[G1_HEAD : G1_HEAD + 4]
                 bias_chunks = _g1_args[G1_SACC : G1_SACC + N_BIAS_CHUNKS]
                 _rest = _g1_args[G1_SACC + N_BIAS_CHUNKS :]
-                v_buff_off, v_next_off, v_further_off = _rest[0:3]
-                k_buff_off, k_next_off = _rest[3:5]
-                g_voffs = [_raw(x) for x in _rest[5 : 5 + DMA_PASSES]]
-                v_preloaded = _rest[5 + DMA_PASSES :]
+                v_addr, v_next_addr, v_further_addr = _rest[0:3]
+                k_base, k_next_base = _rest[3:5]
+                v_buff_off, v_next_off, v_further_off = _rest[5:8]
+                k_buff_off, k_next_off = _rest[8:10]
+                g_voffs = [_raw(x) for x in _rest[10 : 10 + DMA_PASSES]]
+                v_preloaded = _rest[10 + DMA_PASSES :]
                 # o / l_mfma still hold only the tiles apply_pv has already
                 # folded in -- i.e. strictly the past relative to the s_accs
                 # being softmaxed here -- so the rescale is well-defined.
@@ -1402,16 +1453,16 @@ def build_flash_attn_fp8_module(
                     [o0, o1, o2, o3],
                     l_mfma,
                     p_pack,
-                    v_buff_off,
+                    v_addr,
                     v_preloaded,
-                    k_buff_off,
+                    k_base,
                 )
                 _wait_vmcnt(0)
                 seed = _bias_prefill(bias_chunks)
                 s_accs, v_preloaded = do_qk(
-                    k_buff_off,
+                    k_base,
                     k_preloaded,
-                    v_next_off,
+                    v_next_addr,
                     seed=seed,
                     dma=(v_rsrc, l_voffs, g_voffs),
                 )
@@ -1433,7 +1484,13 @@ def build_flash_attn_fp8_module(
                         _raw(s_accs[2]),
                         _raw(s_accs[3]),
                         *[_raw(bc) for bc in bias_chunks],
-                        # Rotate the V triple and swap the K pair.
+                        # Rotate the V triple and swap the K pair -- addresses
+                        # and raw offsets move together.
+                        _raw(v_next_addr),
+                        _raw(v_further_addr),
+                        _raw(v_addr),
+                        _raw(k_next_base),
+                        _raw(k_base),
                         _raw(v_next_off),
                         _raw(v_further_off),
                         _raw(v_buff_off),
