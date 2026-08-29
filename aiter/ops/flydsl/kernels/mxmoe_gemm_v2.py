@@ -139,6 +139,7 @@ def mma_one_j(
     i0=0,
     single_rg=False,
     rg_off=0,
+    k_start=0,
     k_halves=2,
 ):
     """One J-cluster of scaled MFMAs over a 32-row A-scale group (row-groups i0, i0+1); each is
@@ -146,7 +147,7 @@ def mma_one_j(
     sa: 32-row A-scale reg. single_rg (BM16): one 16-row group, rg_off picks its byte.
     """
     row_groups = (rg_off,) if const_expr(single_rg) else range(2)
-    for k in range(k_halves):
+    for k in range(k_start, k_start + k_halves):
         for im in row_groups:
             i = i0 if const_expr(single_rg) else i0 + im
             fx.gemm(
@@ -225,6 +226,7 @@ def gemm2_body_v2(
     arg_eids,
     arg_stids,
     arg_sweights,
+    arg_bias,
     i32_M,
     i32_max_m_blocks,
     arg_out,
@@ -261,6 +263,10 @@ def gemm2_body_v2(
     g2_scale_blk=8,
     g2_epi_lanes=None,
     g2_apre=False,
+    enable_bias=False,
+    k_valid_halves=None,
+    has_kpad=False,
+    has_npad=False,
 ):
     # GEMM2 double-buffers B weight and scale one tile ahead. bhoist issues that
     # prefetch above the LDS barrier; ascale_pf prefetches A-scale one tile ahead.
@@ -296,14 +302,18 @@ def gemm2_body_v2(
     KH4 = _udiv(K_rt, fx.Int32(4 if is_f8_b else 8))
     K_TILES_MAX = INTER_MAX // BK
     K_SCALE_CHUNKS_MAX = (INTER_MAX + 255) // 256
+    total_k_halves = K_TILES_MAX * kHalves
+    if k_valid_halves is None:
+        k_valid_halves = total_k_halves
 
     # has_pad OOB pad-skip (const_expr-gated): K-skip sizes 16N B-weight buffer to REAL K; N-skip zeros fully-pad-N w2 tiles (col >= N_real=N_OUT-npad; PERF-ONLY). B-scale NOT shrunk.
     bq_num_records = None
     N_real = None
-    if const_expr(has_pad):
+    if const_expr(has_kpad):
         K_real = K_rt - fx.Int32(i32_kpad)
         halves_real = _udiv(K_real + fx.Int32(127), fx.Int32(128))
         bq_num_records = halves_real * fx.Int32(1024 * B_PAIR)
+    if const_expr(has_npad):
         N_real = N_OUT_rt - fx.Int32(i32_npad)
 
     # block -> (m_block_idx, n_block_idx); e = sorted_expert_ids[SBM-padded sort block] (SBM==BM: sort_block==m_block_idx).
@@ -441,7 +451,7 @@ def gemm2_body_v2(
     def make_bq_view(j):
         col = n_block_idx * BN + wave * (BN // 4) + j * 16
         nrec = bq_num_records
-        if const_expr(has_pad):
+        if const_expr(has_npad and has_kpad):
             # N-skip: fully-pad-N tile (col >= 16-aligned N_real) -> 0 records so weight loads OOB -> 0.
             nrec = (col < N_real).select(bq_num_records, fx.Int32(0))
         if const_expr(is_f8_b):
@@ -514,10 +524,11 @@ def gemm2_body_v2(
                 bsf[mw],
             )
 
-    def issue_b_load_into(bqf, bsf, kt_rt):
+    def issue_b_load_into(bqf, bsf, kt_rt, valid_halves=None):
         for j in range_constexpr(numAccN):
             for half in range_constexpr(kHalves):
-                issue_b_value_load(bqf[j][half], j, half, kt_rt)
+                if const_expr(valid_halves is None or half < valid_halves):
+                    issue_b_value_load(bqf[j][half], j, half, kt_rt)
         if const_expr(bsf is not None):
             issue_bscale_into(bsf, scale_chunk_tile(kt_rt))
 
@@ -541,7 +552,9 @@ def gemm2_body_v2(
         scale_shift = (kt_rt % fx.Int32(tilesPerScaleChunk)) * fx.Int32(16)
         return scale.shrui(scale_shift)
 
-    def mfma_cluster(bqf, bsf, sa, kt_rt, interleave=None):
+    K_REAL_RT = K_rt - fx.Int32(i32_kpad)
+
+    def mfma_cluster(bqf, bsf, sa, kt_rt, interleave=None, valid_halves=None):
         # opsel (no gate/up split): mni=J//2, in_b=J%2; sa is a per-32-row-chunk list.
         sa = [
             shift_scale_word(sa[sub], kt_rt) for sub in range_constexpr(kScaleSubBlocks)
@@ -553,34 +566,46 @@ def gemm2_body_v2(
         for J in range_constexpr(numAccN):
             mni, in_b = J // 2, J % 2
             sb = sb_words[mni]
-            if const_expr(is_bm16):
-                mma_one_j(
-                    J,
-                    in_b,
-                    sa[0],
-                    sb,
-                    bqf,
-                    a_frags,
-                    c_frags,
-                    mma_atoms,
-                    i0=0,
-                    single_rg=True,
-                    k_halves=kHalves,
-                )
-            else:
-                for sub in range_constexpr(kScaleSubBlocks):
+
+            def emit_mma(k_start, k_count, J=J, in_b=in_b, sb=sb):
+                if const_expr(is_bm16):
                     mma_one_j(
                         J,
                         in_b,
-                        sa[sub],
+                        sa[0],
                         sb,
                         bqf,
                         a_frags,
                         c_frags,
                         mma_atoms,
-                        i0=2 * sub,
-                        k_halves=kHalves,
+                        i0=0,
+                        single_rg=True,
+                        k_start=k_start,
+                        k_halves=k_count,
                     )
+                else:
+                    for sub in range_constexpr(kScaleSubBlocks):
+                        mma_one_j(
+                            J,
+                            in_b,
+                            sa[sub],
+                            sb,
+                            bqf,
+                            a_frags,
+                            c_frags,
+                            mma_atoms,
+                            i0=2 * sub,
+                            k_start=k_start,
+                            k_halves=k_count,
+                        )
+
+            if const_expr(valid_halves is not None):
+                if const_expr(valid_halves > 0):
+                    emit_mma(0, valid_halves)
+            else:
+                for k in range_constexpr(kHalves):
+                    if kt_rt * fx.Int32(BK) + fx.Int32(k * 128) < K_REAL_RT:
+                        emit_mma(k, 1)
             if const_expr(interleave is not None and J > 0):
                 interleave[J - 1]()
         if const_expr(interleave is not None):
@@ -617,6 +642,8 @@ def gemm2_body_v2(
             arg_out,
             arg_stids,
             arg_sweights,
+            arg_bias,
+            e,
             m_row,
             n_block_idx,
             wave,
@@ -634,6 +661,7 @@ def gemm2_body_v2(
             g2_out_pitch_align=g2_out_pitch_align,
             g2_scale_blk=g2_scale_blk,
             g2_epi_lanes=g2_epi_lanes,
+            enable_bias=enable_bias,
             **kw,
         )
 
@@ -670,11 +698,22 @@ def gemm2_body_v2(
                 _ks_issue_ascale(saf_slots[slot], fx.Int32(kt))
 
         def _ks_prefetch(kt):
-            issue_b_load_into(nxt_bqf, None, fx.Int32(kt))
+            valid_halves = min(kHalves, max(0, k_valid_halves - kt * kHalves))
+            issue_b_load_into(
+                nxt_bqf,
+                None,
+                fx.Int32(kt),
+                valid_halves=valid_halves,
+            )
             if const_expr(kt == 0 or chunk_of[kt] != chunk_of[kt - 1]):
                 _ks_issue_scales(kt)
 
-        issue_b_load_into(cur_bqf, None, fx.Int32(0))
+        issue_b_load_into(
+            cur_bqf,
+            None,
+            fx.Int32(0),
+            valid_halves=min(kHalves, k_valid_halves),
+        )
         _ks_issue_scales(0)
         rocdl.sched_barrier(0)
 
@@ -684,6 +723,7 @@ def gemm2_body_v2(
 
         for kt in range_constexpr(KT):
             kt_rt = fx.Int32(kt)
+            valid_halves_kt = min(kHalves, max(0, k_valid_halves - kt * kHalves))
             cur_bsf = bsf_slots[chunk_of[kt] % n_slots]
             if const_expr(g2_bhoist) and const_expr(kt + 1 < KT):
                 _ks_prefetch(kt + 1)
@@ -712,7 +752,14 @@ def gemm2_body_v2(
                 gpu.barrier()
             rocdl.sched_barrier(0)
             rocdl.s_setprio(1)
-            mfma_cluster(cur_bqf, cur_bsf, sa, kt_rt, interleave=_il)
+            mfma_cluster(
+                cur_bqf,
+                cur_bsf,
+                sa,
+                kt_rt,
+                interleave=_il,
+                valid_halves=valid_halves_kt,
+            )
             rocdl.s_setprio(0)
             rocdl.sched_barrier(0)
             cur_bqf, nxt_bqf = nxt_bqf, cur_bqf
@@ -844,6 +891,8 @@ def atomic_bf16_epilog(
     arg_out,
     arg_stids,
     arg_sweights,
+    arg_bias,
+    expert_id,
     m_row,
     n_block_idx,
     wave,
@@ -864,6 +913,7 @@ def atomic_bf16_epilog(
     g2_epi_lanes=None,
     emit_thunks=None,
     lds_ready=False,
+    enable_bias=False,
 ):
     if SBM is None:
         SBM = BM
@@ -898,34 +948,22 @@ def atomic_bf16_epilog(
     col_start = n_lane * store_vec
     wave_n = BN // 4
 
-    def flat_buffer(arg, elem_ty, align, nrec=None):
+    def flat_buffer(arg, elem_ty, align):
         ptr = global_typed_ptr(arg, elem_ty, align=align)
         view = fx.Tensor(fx.make_view(ptr, fx.make_layout((1, 1), (1, 1))))
-        if nrec is not None:
-            return fx.rocdl.make_buffer_tensor(view, num_records_bytes=nrec)
         return fx.rocdl.make_buffer_tensor(view, max_size=True)
-
-    _out_nrec = None
-    if const_expr(use_reduce):
-        if const_expr(route_out_fp8):
-            _rp = N_OUT + _udiv(N_OUT, fx.Int32(g2_scale_blk))
-            if const_expr(g2_out_pitch_align > 0):
-                _al = fx.Int32(g2_out_pitch_align)
-                _rp = ((_rp + _al - fx.Int32(1)) // _al) * _al
-        else:
-            _rp = N_OUT * fx.Int32(2)
-        _out_nrec = fx.Int64(i32_M) * fx.Int64(topk) * fx.Int64(_rp)
 
     stids = flat_buffer(arg_stids, T.i32, 4)
     sweights = flat_buffer(arg_sweights, T.f32, 4)
-    out_bf16 = flat_buffer(arg_out, T.bf16, 4, _out_nrec)
-    out_i8 = flat_buffer(arg_out, T.i8, 4, _out_nrec)
+    bias_f32 = None
+    if const_expr(enable_bias):
+        bias_f32 = flat_buffer(arg_bias, T.f32, 4)
+    out_bf16 = flat_buffer(arg_out, T.bf16, 4)
+    out_bf16_ptr = global_typed_ptr(arg_out, T.bf16, align=2)
+    out_i8 = flat_buffer(arg_out, T.i8, 4)
 
     load_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), Int32)
     load_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), Float32)
-    store_bf16x2 = fx.make_copy_atom(
-        fx.rocdl.BufferCopy32b(STORE_CACHE_MODIFIER), BFloat16
-    )
     atomic_bf16x2 = fx.make_copy_atom(fx.rocdl.BufferAtomicPkAdd(BFloat16), BFloat16)
     store_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(STORE_CACHE_MODIFIER), Int32)
     store_i8 = fx.make_copy_atom(fx.rocdl.BufferCopy8b(STORE_CACHE_MODIFIER), Int8)
@@ -934,6 +972,14 @@ def atomic_bf16_epilog(
         frag = fx.make_rmem_tensor(1, elem_ty)
         fx.copy(atom, src[None, index], frag)
         return Vec(frag.load())[0]
+
+    def load_bias(col):
+        return load_scalar(
+            load_f32,
+            bias_f32,
+            expert_id * N_OUT + col,
+            Float32,
+        )
 
     defer_w = bool(g2_defer_weight)
 
@@ -1003,13 +1049,6 @@ def atomic_bf16_epilog(
             return
         gpu.barrier()
 
-    # read back + weighted store (atomic: fadd out[token_id]; reduce: store out[token_id*topk+slot]);
-    # token_id<i32_M gates padding at runtime. At small/mid M the block-sparse sort floor is
-    # ~97% padding rows (M64: 12288 pad vs 384 real); ungated, every padding row (token_id==M) issues
-    # a weighted atomic-fadd into an OOB out-row -> 77x wasted atomics + L2 RMW serialization
-    # (rocprof M64: TCC_ATOMIC 7.3M->95K, 932us->107us). Always gate; reduce already gated via
-    # use_reduce. (fp4-atomic families are gated too -> strictly correct OOB-skip, kernel IR changes.)
-
     def store_one_mr(mr):
         row_in_block = fx.Int32(mr * EPI_ROWS) + m_lane
         token_id = packed[mr] & fx.Int32(0x00FFFFFF)
@@ -1043,13 +1082,31 @@ def atomic_bf16_epilog(
                     for q in range_constexpr(route_vec):
                         idx_q = row_in_block * BN + col_lane8 + fx.Int32(q)
                         if const_expr(bf16_src):
-                            bvals.append(lds_base_bf16[idx_q])
+                            bval = lds_base_bf16[idx_q]
+                            if const_expr(enable_bias):
+                                bias_val = load_bias(col_g0 + q)
+                                if const_expr(not defer_w):
+                                    bias_val = bias_val * weight[mr]
+                                bval = (fx.Float32(bval) + bias_val).to(BFloat16)
+                            bvals.append(bval)
                         elif const_expr(g2_bf16_lds):
-                            vals.append(fx.Float32(lds_base_bf16[idx_q]))
+                            val = fx.Float32(lds_base_bf16[idx_q])
+                            if const_expr(enable_bias):
+                                bias_val = load_bias(col_g0 + q)
+                                if const_expr(not defer_w):
+                                    bias_val = bias_val * weight[mr]
+                                val = val + bias_val
+                            vals.append(val)
                         elif const_expr(defer_w):
-                            vals.append(fx.Float32(lds_base_fptr[idx_q]))
+                            val = fx.Float32(lds_base_fptr[idx_q])
+                            if const_expr(enable_bias):
+                                val = val + load_bias(col_g0 + q)
+                            vals.append(val)
                         else:
-                            vals.append(fx.Float32(lds_base_fptr[idx_q]) * weight[mr])
+                            val = fx.Float32(lds_base_fptr[idx_q])
+                            if const_expr(enable_bias):
+                                val = val + load_bias(col_g0 + q)
+                            vals.append(val * weight[mr])
                     if const_expr(bf16_src):
                         msk = Vec.filled([2], 0x7FFF, Int16)
                         acc = None
@@ -1151,6 +1208,20 @@ def atomic_bf16_epilog(
                             align=4,
                         )
                     )
+                    if const_expr(enable_bias):
+                        bias_col = n_block_idx * BN + col_start + s * store_group_n
+                        bias0 = load_bias(bias_col)
+                        bias1 = load_bias(bias_col + 1)
+                        if const_expr(not defer_w):
+                            bias0 = bias0 * weight[mr]
+                            bias1 = bias1 * weight[mr]
+                        pk = Vec.from_elements(
+                            [
+                                fx.Float32(pk[0]) + bias0,
+                                fx.Float32(pk[1]) + bias1,
+                            ],
+                            Float32,
+                        ).to(BFloat16)
                 else:
                     v2 = Vec(
                         lds_vec_load(
@@ -1161,30 +1232,32 @@ def atomic_bf16_epilog(
                             align=8,
                         )
                     )
+                    v0 = fx.Float32(v2[0])
+                    v1 = fx.Float32(v2[1])
+                    if const_expr(enable_bias):
+                        bias_col = n_block_idx * BN + col_start + s * store_group_n
+                        v0 = v0 + load_bias(bias_col)
+                        v1 = v1 + load_bias(bias_col + 1)
                     if const_expr(defer_w):
-                        pk = Vec.from_elements([v2[0], v2[1]], Float32).to(BFloat16)
+                        pk = Vec.from_elements([v0, v1], Float32).to(BFloat16)
                     else:
                         pk = Vec.from_elements(
-                            [v2[0] * weight[mr], v2[1] * weight[mr]], Float32
+                            [v0 * weight[mr], v1 * weight[mr]], Float32
                         ).to(BFloat16)
                 out_frag = fx.make_rmem_tensor(store_vec, BFloat16)
                 out_frag.store(pk)
                 out_off = row_base_addr + fx.Int64(s * store_group_n)
                 if const_expr(use_reduce):
-                    fx.copy(store_bf16x2, out_frag, out_bf16[None, out_off])
+                    fx.ptr_store(pk, out_bf16_ptr + out_off)
                 else:
                     fx.copy(atomic_bf16x2, out_frag, out_bf16[None, out_off])
 
     for mr in range_constexpr(M_REPS):
         token_id = packed[mr] & fx.Int32(0x00FFFFFF)
 
-        if const_expr(use_reduce):
-            store_one_mr(mr)
-        else:
+        @flyc.jit
+        def store_if_valid(token_id, mr):
+            if token_id < i32_M:
+                store_one_mr(mr)
 
-            @flyc.jit
-            def store_if_valid(token_id, mr):
-                if token_id < i32_M:
-                    store_one_mr(mr)
-
-            store_if_valid(token_id, mr)
+        store_if_valid(token_id, mr)
