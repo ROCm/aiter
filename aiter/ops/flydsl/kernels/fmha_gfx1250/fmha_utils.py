@@ -263,10 +263,6 @@ def g2_row_idx(stage: int, wmma: int) -> int:
     return stage * PV_GEMM_INST_COUNT + wmma
 
 
-def rocdl_fmax3(a, b, c):
-    return llvm_dialect.intr_maxnum(llvm_dialect.intr_maxnum(a, b), c)
-
-
 WAVE_SIZE = 32
 NUM_WAVES = 4
 NUM_MSB = 4
@@ -308,7 +304,6 @@ N_LDS_V_PER_MSB = 4
 LDS_V_INST_COUNT = NUM_MSB * N_LDS_V_PER_MSB
 
 ALU_STAGES = 8
-GEMM1 = 0
 KV_K = 0
 KV_V = 1
 KV_NONE = 2
@@ -328,12 +323,9 @@ ALU_PER_STAGE = [40, 52, 56, 168, 120, 120, 132, 132]
 
 N_SP_PAIRS = VPS_MSB_SP // 2
 
-GEMM2 = 1
 N_V_MSB = 2
 N_PV_WMMA_N = 4
-D_MSB_K = SU_K_N
-PV_K_ITERS = 1
-PV_GEMM_INST_COUNT = NUM_MSB * PV_K_ITERS * N_PV_WMMA_N
+PV_GEMM_INST_COUNT = NUM_MSB * N_PV_WMMA_N
 
 
 def emit_void(inst_str, operands=None, constraints="", **kwargs):
@@ -445,7 +437,7 @@ class Atom:
     @staticmethod
     def max3_num_f32(src0, src1, src2):
         sched_barrier(0)
-        return rocdl_fmax3(src0, src1, src2)
+        return llvm_dialect.intr_maxnum(llvm_dialect.intr_maxnum(src0, src1), src2)
 
     @staticmethod
     def permlanex16(src, s_sel0, s_sel1):
@@ -1295,24 +1287,15 @@ def build_kv_lds_addrs(lane_id, k_base_i32, v_base_i32):
     ] + v_addrs
 
 
-def issue_k_loads(ty, kv_lds_addrs, blk, su):
+def load_initial_kv_tiles(ty, kv_lds_addrs, blk, su):
     su_off = (blk * CNT_SU + su) * LDS_K_SU_P_SIZE
     kv_raw = [[None] * N_LDS_PER_MSB for _ in range(NUM_MSB)]
     for msb in range(NUM_MSB):
         for v_idx in range(N_LDS_PER_MSB):
             offset = v_idx * 32 + su_off
             kv_raw[msb][v_idx] = Atom.ds_load_b128(ty, kv_lds_addrs[msb], offset)
-    return kv_raw
-
-
-def wait_and_pair_k(ty, kv_raw):
     rocdl.s_wait_dscnt(0)
     return Fragment.pair_k_tiles(kv_raw, ty)
-
-
-def load_initial_kv_tiles(ty, kv_lds_addrs, blk, su):
-    kv_raw = issue_k_loads(ty, kv_lds_addrs, blk, su)
-    return wait_and_pair_k(ty, kv_raw)
 
 
 def _dispatch_tdm_at_wmma0(ty, tdm_type, tdm_state, has_fallback=True):
@@ -1743,12 +1726,6 @@ class TDM:
         ]
 
     @staticmethod
-    def load_kv_blk(kv_type, dg1, addr_i64, stride_adv_i64, lds_base, su_p_size, n_su):
-        TDM.issue_from_descs(
-            TDM.build_descs(dg1, addr_i64, stride_adv_i64, lds_base, su_p_size, n_su)
-        )
-
-    @staticmethod
     def _load_kv(
         is_k,
         ptr_tensor,
@@ -1766,14 +1743,10 @@ class TDM:
         )
         row_bytes = K_ROW_BYTES if is_k else V_ROW_BYTES
         su_p_size = LDS_K_SU_P_SIZE if is_k else LDS_V_SU_P_SIZE
-        TDM.load_kv_blk(
-            KV_K if is_k else KV_V,
-            dg1,
-            compute_global_addr(ptr_tensor, offset, wave_id, 8 * stride_seq),
-            fx.Int64(stride_32),
-            lds_base_i32 + wave_id * (8 * row_bytes),
-            su_p_size,
-            CNT_SU,
+        addr = compute_global_addr(ptr_tensor, offset, wave_id, 8 * stride_seq)
+        lds_base = lds_base_i32 + wave_id * (8 * row_bytes)
+        TDM.issue_from_descs(
+            TDM.build_descs(dg1, addr, fx.Int64(stride_32), lds_base, su_p_size, CNT_SU)
         )
         tdm_wait_and_barrier()
 
