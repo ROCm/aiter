@@ -365,49 +365,6 @@ def sched_barrier(mask=0):
     llvm_dialect.call_intrinsic(None, "llvm.amdgcn.sched.barrier", [mask_val], [], [])
 
 
-USE_BANK_HINTS = False
-
-# sp_pairs[i] (v2f32) lands at HWIdx = bank*256 + SP_PAIR_BASE + i*2.
-# Offset selection is driven by per-bank free-range analysis of the ISA:
-#   Bank0: saturated (198/256 used), NO contiguous 32-slot range → skip offset hint
-#   Bank1: free from offset 174 (V/K tiles occupy 0-173)
-#   Bank2: free from offset 127 (→ use 128 for even alignment)
-#   Bank3: free from offset 121 (→ use 122 for even alignment)
-# Using 174 is safe for all of banks 1-3 (all have free range ≥174).
-# Bank0 sp_pairs use only BankHint=0 (no offset constraint) since bank0 is full.
-SP_PAIR_BASE = 174
-
-# Per-bank VGPR copy of s_log2e_scl_pair (v2f32) for pk_fma src1.
-# Offset 206 = SP_PAIR_BASE(174) + N_SP_PAIRS(16)*2, just past sp_pairs.
-LOG2E_PAIR_OFFSET = 206
-
-
-def set_vgpr_bank(raw_val, bank: int):
-    if const_expr(not USE_BANK_HINTS):
-        return raw_val
-    val_type = raw_val.type
-    bank_val = arith.constant(bank, type=T.i32)
-    return llvm_dialect.call_intrinsic(
-        val_type, "llvm.amdgcn.set.vgpr.bank", [raw_val, bank_val], [], []
-    )
-
-
-def set_vgpr_bank_offset(raw_val, bank: int, offset: int):
-    """Pin raw_val to HWIdx = bank*256+offset (single-candidate BankOffsetHint)."""
-    if const_expr(not USE_BANK_HINTS):
-        return raw_val
-    val_type = raw_val.type
-    bank_val = arith.constant(bank, type=T.i32)
-    offset_val = arith.constant(offset, type=T.i32)
-    return llvm_dialect.call_intrinsic(
-        val_type,
-        "llvm.amdgcn.set.vgpr.bank.offset",
-        [raw_val, bank_val, offset_val],
-        [],
-        [],
-    )
-
-
 def get_types():
     return {
         "f32": T.f32,
@@ -424,9 +381,8 @@ def get_types():
     }
 
 
-def make_v2f32(lo, hi, bank=0):
-    v = Vec.from_elements([lo, hi], Float32)
-    return set_vgpr_bank(v, bank)
+def make_v2f32(lo, hi):
+    return Vec.from_elements([lo, hi], Float32)
 
 
 def split_v2f32(pair):
@@ -435,48 +391,47 @@ def split_v2f32(pair):
     return lo, hi
 
 
-def broadcast_f32_to_v2f32(val, bank=0):
-    return make_v2f32(val, val, bank)
+def broadcast_f32_to_v2f32(val):
+    return make_v2f32(val, val)
 
 
 N_WMMA_K_TILES = (QK_HDIM // WMMA_K) // 2
 
 
-def _banked_op(result, bank):
+def _banked_op(result):
     sched_barrier(0)
-    b = set_vgpr_bank(result, bank)
     sched_barrier(0)
-    return b
+    return result
 
 
-def _wmma_bf16(ty, src_a, src_b, acc, bank_dst):
+def _wmma_bf16(ty, src_a, src_b, acc):
     sched_barrier(0)
     r = rocdl_dialect.wmma_f32_16x16x32_bf16(ty["v8f32"], src_a, src_b, acc)
-    return _banked_op(r.result, bank_dst)
+    return _banked_op(r.result)
 
 
 class Atom:
     @staticmethod
-    def wmma_init(ty, src_a, src_b, bank_dst):
+    def wmma_init(ty, src_a, src_b):
         return _wmma_bf16(
-            ty, src_a, src_b, fx.constant_vector(0.0, T.vec(8, T.f32)), bank_dst
+            ty, src_a, src_b, fx.constant_vector(0.0, T.vec(8, T.f32))
         )
 
     @staticmethod
-    def wmma_accum(ty, src_a, src_b, acc, bank_dst):
-        return _wmma_bf16(ty, src_a, src_b, acc, bank_dst)
+    def wmma_accum(ty, src_a, src_b, acc):
+        return _wmma_bf16(ty, src_a, src_b, acc)
 
     @staticmethod
-    def ds_load_b128(ty, addr, offset_val, bank):
+    def ds_load_b128(ty, addr, offset_val):
         sched_barrier(0)
         ptr = llvm_dialect.inttoptr(ty["lds_ptr"], (addr + offset_val))
-        return _banked_op(llvm_dialect.load(ty["v4i32"], ptr), bank)
+        return _banked_op(llvm_dialect.load(ty["v4i32"], ptr))
 
     @staticmethod
-    def ds_load_tr16_b128(ty, addr, offset_val, bank):
+    def ds_load_tr16_b128(ty, addr, offset_val):
         sched_barrier(0)
         ptr = llvm_dialect.inttoptr(ty["lds_ptr"], (addr + offset_val))
-        return _banked_op(rocdl.ds_load_tr16_b128(ty["v8bf16"], ptr), bank)
+        return _banked_op(rocdl.ds_load_tr16_b128(ty["v8bf16"], ptr))
 
     @staticmethod
     def tdm_load(ty, s_g0, s_g1):
@@ -488,61 +443,61 @@ class Atom:
         sched_barrier(0)
 
     @staticmethod
-    def exp_f32(src, bank):
+    def exp_f32(src):
         sched_barrier(0)
-        return _banked_op(rocdl_exp2(T.f32, src), bank)
+        return _banked_op(rocdl_exp2(T.f32, src))
 
     @staticmethod
-    def mul_f32(src0, src1, bank):
+    def mul_f32(src0, src1):
         sched_barrier(0)
-        return _banked_op(src0 * src1, bank)
+        return _banked_op(src0 * src1)
 
     @staticmethod
-    def fma_f32_neg_src0(src0, src1, src2, bank):
+    def fma_f32_neg_src0(src0, src1, src2):
         sched_barrier(0)
         return _banked_op(
-            llvm_dialect.intr_fma(llvm_dialect.fneg(src0), src1, src2), bank
+            llvm_dialect.intr_fma(llvm_dialect.fneg(src0), src1, src2)
         )
 
     @staticmethod
-    def mov_b32(src, bank):
+    def mov_b32(src):
         sched_barrier(0)
-        return _banked_op(src, bank)
+        return _banked_op(src)
 
     @staticmethod
-    def add_f32(src0, src1, bank):
+    def add_f32(src0, src1):
         sched_barrier(0)
-        return _banked_op(src0 + src1, bank)
+        return _banked_op(src0 + src1)
 
     @staticmethod
-    def max3_num_f32(src0, src1, src2, bank):
+    def max3_num_f32(src0, src1, src2):
         sched_barrier(0)
-        return _banked_op(rocdl_fmax3(src0, src1, src2), bank)
+        return _banked_op(rocdl_fmax3(src0, src1, src2))
 
     @staticmethod
-    def permlanex16(src, s_sel0, s_sel1, bank):
+    def permlanex16(src, s_sel0, s_sel1):
         sched_barrier(0)
         src_i32 = llvm_dialect.bitcast(T.i32, src)
         r_f32 = llvm_dialect.bitcast(
             T.f32,
             rocdl_permlanex16(T.i32, src_i32, src_i32, s_sel0, s_sel1, False, False),
         )
-        return _banked_op(r_f32, (bank + 2) % NUM_MSB)
+        return _banked_op(r_f32)
 
     @staticmethod
-    def pk_fma_f32_neg_c(a, b, c, bank):
+    def pk_fma_f32_neg_c(a, b, c):
         sched_barrier(0)
-        return _banked_op(llvm_dialect.intr_fma(a, b, llvm_dialect.fneg(c)), bank)
+        return _banked_op(llvm_dialect.intr_fma(a, b, llvm_dialect.fneg(c)))
 
     @staticmethod
-    def pk_add_f32(a, b, bank):
+    def pk_add_f32(a, b):
         sched_barrier(0)
-        return _banked_op(a + b, bank)
+        return _banked_op(a + b)
 
     @staticmethod
-    def cvt_pk_bf16_f32(a, bank):
+    def cvt_pk_bf16_f32(a):
         sched_barrier(0)
-        return _banked_op(arith.truncf(T.vec(2, T.bf16), a), bank)
+        return _banked_op(arith.truncf(T.vec(2, T.bf16), a))
 
     @staticmethod
     def s_wait_dscnt(cnt):
@@ -601,45 +556,38 @@ class Softmax:
         ops = []
         bank = msb
 
-        # CSE-safety: each bank (b) passes a different argument to set_vgpr_bank_offset /
-        # bank-specific physical register (bank×256 + LOG2E_PAIR_OFFSET for banks 1-3).
         def op_save_old_max(b=bank):
-            ss["old_max"][b] = Atom.mov_b32(ss["local_max"][b], b)
+            ss["old_max"][b] = Atom.mov_b32(ss["local_max"][b])
             sched_barrier(0)
             _scl = sgpr["s_log2e_scl"]
-            v = Vec.from_elements([_scl, _scl], Float32)
-            ss["vgpr_log2e_scl_pair"][b] = (
-                set_vgpr_bank_offset(v, b, LOG2E_PAIR_OFFSET)
-                if const_expr(b > 0)
-                else set_vgpr_bank(v, b)
-            )
+            ss["vgpr_log2e_scl_pair"][b] = Vec.from_elements([_scl, _scl], Float32)
             sched_barrier(0)
 
         def op_cur_max(b=bank):
             ss["cur_max_log2e"][b] = Atom.mul_f32(
-                ss["local_max"][b], sgpr["s_log2e_scl"], b
+                ss["local_max"][b], sgpr["s_log2e_scl"]
             )
 
         def op_exp_delta(b=bank):
-            ss["exp_delta"][b] = Atom.exp_f32(ss["delta"][b], b)
+            ss["exp_delta"][b] = Atom.exp_f32(ss["delta"][b])
 
         def op_cur_max_1(b=bank):
             ss["cur_max_log2e_1"][b] = Atom.mul_f32(
-                ss["local_max"][b], sgpr["s_log2e_scl"], b
+                ss["local_max"][b], sgpr["s_log2e_scl"]
             )
 
         def op_mul_old_max(b=bank):
             ss["cur_max_log2e_scalar"][b] = Atom.mul_f32(
-                ss["old_max"][b], sgpr["s_log2e_scl"], b
+                ss["old_max"][b], sgpr["s_log2e_scl"]
             )
 
         def op_broadcast_dup(b=bank):
             ss["cur_max_log2e_dup"][b] = broadcast_f32_to_v2f32(
-                ss["cur_max_log2e_scalar"][b], b
+                ss["cur_max_log2e_scalar"][b]
             )
 
         def op_exp_delta_dup(b=bank):
-            ss["exp_delta_dup"][b] = Atom.mov_b32(ss["exp_delta"][b], b)
+            ss["exp_delta_dup"][b] = Atom.mov_b32(ss["exp_delta"][b])
 
         ops += [
             op_save_old_max,
@@ -654,25 +602,15 @@ class Softmax:
 
             def op_rescale_sum(b=bank):
                 ss["row_sums"][b] = Atom.mul_f32(
-                    ss["exp_delta"][b], ss["row_sums"][b], b
+                    ss["exp_delta"][b], ss["row_sums"][b]
                 )
 
             ops.append(op_rescale_sum)
         for i in range_constexpr(N_SP_PAIRS):
-            _sp_offset = SP_PAIR_BASE + i * 2
-            _escaped = i < 2
 
-            def op_pkfma(idx=i, b=bank, sp_off=_sp_offset, escaped=_escaped):
-                src = sp_pairs[idx]
-                if const_expr(b > 0 and escaped):
-                    src = set_vgpr_bank(src, b)
-                result = Atom.pk_fma_f32_neg_c(
-                    src, ss["vgpr_log2e_scl_pair"][b], ss["cur_max_log2e_dup"][b], b
-                )
-                sp_pairs[idx] = (
-                    set_vgpr_bank_offset(result, b, sp_off)
-                    if const_expr(b > 0)
-                    else result
+            def op_pkfma(idx=i, b=bank):
+                sp_pairs[idx] = Atom.pk_fma_f32_neg_c(
+                    sp_pairs[idx], ss["vgpr_log2e_scl_pair"][b], ss["cur_max_log2e_dup"][b]
                 )
 
             ops.append(op_pkfma)
@@ -711,7 +649,7 @@ class Softmax:
 
             def op_cvt(cidx=i, b=bank):
                 ss["p_bf16"][b].append(
-                    Atom.cvt_pk_bf16_f32(set_vgpr_bank(sp_pairs[cidx], b), b)
+                    Atom.cvt_pk_bf16_f32(sp_pairs[cidx])
                 )
 
             ops.append(op_cvt)
@@ -719,7 +657,7 @@ class Softmax:
 
             def op_pkadd(idx=i, b=bank):
                 sum_tmps[idx] = Atom.pk_add_f32(
-                    sp_pairs[idx * 2], sp_pairs[idx * 2 + 1], b
+                    sp_pairs[idx * 2], sp_pairs[idx * 2 + 1]
                 )
 
             ops.append(op_pkadd)
@@ -727,7 +665,7 @@ class Softmax:
 
             def op_sum_l0(j_val=j, b=bank):
                 sum_l0[j_val] = Atom.pk_add_f32(
-                    sum_tmps[j_val * 2], sum_tmps[j_val * 2 + 1], b
+                    sum_tmps[j_val * 2], sum_tmps[j_val * 2 + 1]
                 )
 
             ops.append(op_sum_l0)
@@ -735,20 +673,20 @@ class Softmax:
 
             def op_sum_l1(j_val=j, b=bank):
                 sum_l1[j_val] = Atom.pk_add_f32(
-                    sum_l0[j_val * 2], sum_l0[j_val * 2 + 1], b
+                    sum_l0[j_val * 2], sum_l0[j_val * 2 + 1]
                 )
 
             ops.append(op_sum_l1)
 
         def op_sum_l2(b=bank):
-            sum_l2[0] = Atom.pk_add_f32(sum_l1[0], sum_l1[1], b)
+            sum_l2[0] = Atom.pk_add_f32(sum_l1[0], sum_l1[1])
 
         def op_sum_split(b=bank):
             lo, hi = split_v2f32(sum_l2[0])
-            final_sum[0] = Atom.add_f32(lo, hi, b)
+            final_sum[0] = Atom.add_f32(lo, hi)
 
         def op_sum_accum(b=bank):
-            ss["row_sums"][b] = Atom.add_f32(ss["row_sums"][b], final_sum[0], b)
+            ss["row_sums"][b] = Atom.add_f32(ss["row_sums"][b], final_sum[0])
 
         ops += [op_sum_l2, op_sum_split, op_sum_accum]
         return ops
@@ -783,7 +721,7 @@ class Softmax:
             def op_init_max3(k_=k, b=bank):
                 base = k_ * VALID_GROUP_STRIDE
                 tmps[k_] = Atom.max3_num_f32(
-                    _get_sp(base), _get_sp(base + 1), _get_sp(base + 2), b
+                    _get_sp(base), _get_sp(base + 1), _get_sp(base + 2)
                 )
 
             ops.append(op_init_max3)
@@ -794,7 +732,7 @@ class Softmax:
                     base = k_ * VALID_GROUP_STRIDE
                     s0 = base + 3 + j_ * 2
                     tmps[k_] = Atom.max3_num_f32(
-                        _get_sp(s0), _get_sp(s0 + 1), tmps[k_], b
+                        _get_sp(s0), _get_sp(s0 + 1), tmps[k_]
                     )
 
                 ops.append(op_cross_col)
@@ -803,39 +741,38 @@ class Softmax:
             def op_last_elem(k_=k, b=bank):
                 base = k_ * VALID_GROUP_STRIDE
                 tmps[k_] = Atom.max3_num_f32(
-                    _get_sp(base + 7), tmps[k_], _get_sp(base), b
+                    _get_sp(base + 7), tmps[k_], _get_sp(base)
                 )
 
             ops.append(op_last_elem)
 
         def op_merge1(b=bank):
-            tmps[0] = Atom.max3_num_f32(tmps[0], tmps[1], tmps[2], b)
+            tmps[0] = Atom.max3_num_f32(tmps[0], tmps[1], tmps[2])
 
         def op_merge2(b=bank):
-            tmps[0] = Atom.max3_num_f32(tmps[0], tmps[3], tmps[1], b)
+            tmps[0] = Atom.max3_num_f32(tmps[0], tmps[3], tmps[1])
 
         tmps_perm = [None]
         _zero_f32 = arith.constant(0.0, type=T.f32)
 
         def op_perm_prep(b=bank, z=_zero_f32):
-            tmps_perm[0] = Atom.add_f32(tmps[0], z, (b + 2) % NUM_MSB)
+            tmps_perm[0] = Atom.add_f32(tmps[0], z)
 
         def op_perm(b=bank):
             tmps[1] = Atom.permlanex16(
                 tmps_perm[0],
                 arith.constant(PERM_SEL_LO, type=T.i32),
                 arith.constant(PERM_SEL_HI, type=T.i32),
-                (b + 2) % NUM_MSB,
             )
 
         def op_pre_max(b=bank):
             ss["pre_max_log2e_scl"][b] = Atom.mul_f32(
-                ss["old_max"][b], sgpr["s_log2e_scl"], b
+                ss["old_max"][b], sgpr["s_log2e_scl"]
             )
 
         def op_cur_max(b=bank):
             ss["local_max"][b] = Atom.max3_num_f32(
-                tmps[0], tmps[1], ss["old_max"][b], b
+                tmps[0], tmps[1], ss["old_max"][b]
             )
 
         ops += [op_merge1, op_merge2, op_perm_prep, op_perm, op_pre_max, op_cur_max]
@@ -848,19 +785,19 @@ class Softmax:
 
         def op_max01():
             ss["local_max"][0] = Atom.max3_num_f32(
-                ss["local_max"][0], ss["local_max"][1], ss["pre_max_log2e_scl"][0], 0
+                ss["local_max"][0], ss["local_max"][1], ss["pre_max_log2e_scl"][0]
             )
 
         def op_max23():
             ss["local_max"][2] = Atom.max3_num_f32(
-                ss["local_max"][2], ss["local_max"][3], ss["pre_max_log2e_scl"][2], 2
+                ss["local_max"][2], ss["local_max"][3], ss["pre_max_log2e_scl"][2]
             )
 
         def op_mov1():
-            ss["local_max"][1] = Atom.mov_b32(ss["local_max"][0], 1)
+            ss["local_max"][1] = Atom.mov_b32(ss["local_max"][0])
 
         def op_mov3():
-            ss["local_max"][3] = Atom.mov_b32(ss["local_max"][2], 3)
+            ss["local_max"][3] = Atom.mov_b32(ss["local_max"][2])
 
         ops += [op_max01, op_max23, op_mov1, op_mov3]
         msb_assign = [0, 2, 1, 3]
@@ -871,7 +808,6 @@ class Softmax:
                     ss["local_max"][b],
                     sgpr["s_log2e_scl"],
                     ss["pre_max_log2e_scl"][b],
-                    b,
                 )
 
             ops.append(op_fma_delta)
@@ -932,13 +868,8 @@ class Softmax:
                 v8w = Vec(su_sp_tiles_list[su][msb][0], dtype=Float32)
                 for i in range_constexpr(4):
                     pair_idx = su * 4 + i
-                    v2 = make_v2f32(
-                        v8w[i * 2].ir_value(), v8w[i * 2 + 1].ir_value(), bank=msb
-                    )
-                    pairs[pair_idx] = (
-                        set_vgpr_bank_offset(v2, msb, SP_PAIR_BASE + pair_idx * 2)
-                        if const_expr(msb > 0)
-                        else v2
+                    pairs[pair_idx] = make_v2f32(
+                        v8w[i * 2].ir_value(), v8w[i * 2 + 1].ir_value()
                     )
             sp_pairs.append(pairs)
         return sp_pairs
@@ -977,7 +908,6 @@ class Softmax:
                         ty,
                         p_bf16_all[2 * mt][ps : ps + 4]
                         + p_bf16_all[2 * mt + 1][ps : ps + 4],
-                        mt,
                     )
                     for mt in range_constexpr(2)
                 ]
@@ -1010,13 +940,12 @@ class Fragment:
                 lo = kv_tiles_raw[msb][k * 2]
                 hi = kv_tiles_raw[msb][k * 2 + 1]
                 frag = Fragment.wmma_bf16(lo, hi)
-                frag = set_vgpr_bank(frag, msb)
                 msb_frags.append(frag)
             kv_paired.append(msb_frags)
         return kv_paired
 
     @staticmethod
-    def pack_v2bf16(ty, v2bf16_list, bank):
+    def pack_v2bf16(ty, v2bf16_list):
         v4s = []
         for i in range_constexpr(4):
             v4s.append(
@@ -1029,8 +958,7 @@ class Fragment:
             v8s.append(
                 vector.shuffle(v4s[i * 2], v4s[i * 2 + 1], list(range_constexpr(8)))
             )
-        result = vector.shuffle(v8s[0], v8s[1], list(range_constexpr(16)))
-        return set_vgpr_bank(result, bank)
+        return vector.shuffle(v8s[0], v8s[1], list(range_constexpr(16)))
 
     @staticmethod
     def pair_v_tiles(v_tiles_raw, ty):
@@ -1164,10 +1092,10 @@ class Pipeline:
         src_a = kv_tiles[wmma_op["k_msb"]][k_frag]
         src_b = q_tiles[wmma_op["q_msb"]][wmma_op["k_iter"] % Q_WMMA_PER_MSB]
         if const_expr(wmma_op["is_init"]):
-            sp_tiles[sp_msb][n_iter] = Atom.wmma_init(ty, src_a, src_b, sp_msb)
+            sp_tiles[sp_msb][n_iter] = Atom.wmma_init(ty, src_a, src_b)
         else:
             sp_tiles[sp_msb][n_iter] = Atom.wmma_accum(
-                ty, src_a, src_b, sp_tiles[sp_msb][n_iter], sp_msb
+                ty, src_a, src_b, sp_tiles[sp_msb][n_iter]
             )
         return sp_tiles
 
@@ -1179,7 +1107,6 @@ class Pipeline:
             v_tiles[wmma_op["v_msb"]][n],
             p_tiles[wmma_op["sp_msb"]],
             o_tiles[d_msb][n],
-            d_msb,
         )
         return o_tiles
 
@@ -1188,12 +1115,12 @@ class Pipeline:
         msb, offset, v_idx = lds_op["msb"], lds_op["offset"], lds_op["v_idx"]
         if const_expr(lds_op["load_type"] == "b128"):
             kv_tiles_out[msb][v_idx] = Atom.ds_load_b128(
-                ty, kv_lds_addrs[msb], offset, msb
+                ty, kv_lds_addrs[msb], offset
             )
         else:
             hp = lds_op["half_p"]
             kv_tiles_out[msb][v_idx] = Atom.ds_load_tr16_b128(
-                ty, kv_lds_addrs[NUM_MSB + msb * 2 + (1 if hp else 0)], offset, msb
+                ty, kv_lds_addrs[NUM_MSB + msb * 2 + (1 if hp else 0)], offset
             )
         return kv_tiles_out
 
@@ -1311,19 +1238,14 @@ def phase4_q_load(lane_id, q_rsrc, stride_q_seq, wave_id, q_tile_offset_bytes=No
                 else add_nuw(bank_voff, fx.Int32(i * 32))
             )
             bank_loads.append(
-                set_vgpr_bank(
-                    rocdl.raw_ptr_buffer_load(
-                        vec4i32_ty, q_rsrc, voff, soff_zero, soff_zero
-                    ),
-                    bank,
+                rocdl.raw_ptr_buffer_load(
+                    vec4i32_ty, q_rsrc, voff, soff_zero, soff_zero
                 )
             )
         rocdl.sched_barrier(0)
         q_frags.append(
             [
-                set_vgpr_bank(
-                    Fragment.wmma_bf16(bank_loads[2 * f], bank_loads[2 * f + 1]), bank
-                )
+                Fragment.wmma_bf16(bank_loads[2 * f], bank_loads[2 * f + 1])
                 for f in fx.range_constexpr(_FRAGS_PER_BANK)
             ]
         )
@@ -1395,12 +1317,12 @@ def build_kv_lds_addrs(lane_id, k_base_i32, v_base_i32):
         e = _V_MSB_EXTRA[msb]
         d0 = v_dh0 if e == 0 else v_dh0 + e
         d1 = v_dh1 if e == 0 else v_dh1 + e
-        v_addrs += [set_vgpr_bank(d0, msb), set_vgpr_bank(d1, msb)]
+        v_addrs += [d0, d1]
     return [
-        set_vgpr_bank(k_dh0, 0),
-        set_vgpr_bank(k_dh1, 1),
-        set_vgpr_bank(k_dh0 + K_COL_D_HALF, 2),
-        set_vgpr_bank(k_dh1 + K_COL_D_HALF, 3),
+        k_dh0,
+        k_dh1,
+        k_dh0 + K_COL_D_HALF,
+        k_dh1 + K_COL_D_HALF,
     ] + v_addrs
 
 
@@ -1410,7 +1332,7 @@ def issue_k_loads(ty, kv_lds_addrs, blk, su):
     for msb in range(NUM_MSB):
         for v_idx in range(N_LDS_PER_MSB):
             offset = v_idx * 32 + su_off
-            kv_raw[msb][v_idx] = Atom.ds_load_b128(ty, kv_lds_addrs[msb], offset, msb)
+            kv_raw[msb][v_idx] = Atom.ds_load_b128(ty, kv_lds_addrs[msb], offset)
     return kv_raw
 
 
@@ -2033,28 +1955,20 @@ def unpack_loop_results(lr, lane_id):
     ep_partial_sp_hi = [lr[_OFF_PSP_HI + i] for i in fx.range_constexpr(_PSP_SIZE)]
     return {
         "o_tiles": [
-            [
-                set_vgpr_bank(lr[d * N_PV_WMMA_N + n], d)
-                for n in fx.range_constexpr(N_PV_WMMA_N)
-            ]
+            [lr[d * N_PV_WMMA_N + n] for n in fx.range_constexpr(N_PV_WMMA_N)]
             for d in fx.range_constexpr(NUM_MSB)
         ],
-        "old_max": [set_vgpr_bank(lr[16 + i], i) for i in fx.range_constexpr(NUM_MSB)],
-        "row_sums": [set_vgpr_bank(lr[20 + i], i) for i in fx.range_constexpr(NUM_MSB)],
+        "old_max": [lr[16 + i] for i in fx.range_constexpr(NUM_MSB)],
+        "row_sums": [lr[20 + i] for i in fx.range_constexpr(NUM_MSB)],
         "kv_tiles": [
             [
-                set_vgpr_bank(lr[24 + m * N_WMMA_K_TILES + k], m)
+                lr[24 + m * N_WMMA_K_TILES + k]
                 for k in fx.range_constexpr(N_WMMA_K_TILES)
             ]
             for m in fx.range_constexpr(NUM_MSB)
         ],
-        "local_max": [
-            set_vgpr_bank(lr[_OFF_LOCAL_MAX + i], i)
-            for i in fx.range_constexpr(NUM_MSB)
-        ],
-        "delta": [
-            set_vgpr_bank(lr[_OFF_DELTA + i], i) for i in fx.range_constexpr(NUM_MSB)
-        ],
+        "local_max": [lr[_OFF_LOCAL_MAX + i] for i in fx.range_constexpr(NUM_MSB)],
+        "delta": [lr[_OFF_DELTA + i] for i in fx.range_constexpr(NUM_MSB)],
         "k_cur_base": lr[_OFF_PP],
         "v_cur_base": lr[_OFF_PP + 1],
         "k_next_base": lr[_OFF_PP + 2],
@@ -2068,15 +1982,12 @@ def unpack_loop_results(lr, lane_id):
                 make_v2f32(
                     ep_partial_sp_lo[m * N_SP_PAIRS + i],
                     ep_partial_sp_hi[m * N_SP_PAIRS + i],
-                    m,
                 )
                 for i in fx.range_constexpr(N_SP_PAIRS)
             ]
             for m in fx.range_constexpr(NUM_MSB)
         ],
-        "exp_delta": [
-            set_vgpr_bank(lr[_OFF_PED + m], m) for m in fx.range_constexpr(NUM_MSB)
-        ],
+        "exp_delta": [lr[_OFF_PED + m] for m in fx.range_constexpr(NUM_MSB)],
     }
 
 
@@ -2134,10 +2045,10 @@ def prologue_tile0(
     apply_kv_oob_mask(ctx, all_su_sp_tiles, ctx["actual_kv_len"])
     sp_pairs_all_pro = Softmax.tiles_to_pairs(all_su_sp_tiles)
     softmax_state_pro = make_softmax_state(
-        [set_vgpr_bank(neg_inf, m) for m in range(NUM_MSB)],
-        [set_vgpr_bank(neg_inf, m) for m in range(NUM_MSB)],
-        [set_vgpr_bank(zero_f32, m) for m in range(NUM_MSB)],
-        [set_vgpr_bank(zero_f32, m) for m in range(NUM_MSB)],
+        [neg_inf] * NUM_MSB,
+        [neg_inf] * NUM_MSB,
+        [zero_f32] * NUM_MSB,
+        [zero_f32] * NUM_MSB,
         sp_pairs_prev=sp_pairs_all_pro,
     )
     Softmax.part01_only(ty, 0, sp_pairs_all_pro, softmax_state_pro, sgpr_state)
@@ -2217,7 +2128,7 @@ def epilogue_endtile(
     """Epilogue for num_tiles >= 2: run endtile pipeline + ep_finish."""
     v_offset, stride_v_seq = ctx["v_offset"], ctx["stride_v_seq"]
     wave_id, actual_kv_len = ctx["wave_id"], ctx["actual_kv_len"]
-    et_sp_t = [[set_vgpr_bank(zero_v8f32, m)] for m in fx.range_constexpr(NUM_MSB)]
+    et_sp_t = [[zero_v8f32] for _ in fx.range_constexpr(NUM_MSB)]
     et_sfx = make_softmax_state(
         ep["old_max"],
         ep["local_max"],
@@ -2264,7 +2175,7 @@ def epilogue_endtile(
     )
     et_psp = [
         [
-            make_v2f32(et_psp_lo[m * N_SP_PAIRS + i], et_psp_hi[m * N_SP_PAIRS + i], m)
+            make_v2f32(et_psp_lo[m * N_SP_PAIRS + i], et_psp_hi[m * N_SP_PAIRS + i])
             for i in fx.range_constexpr(N_SP_PAIRS)
         ]
         for m in fx.range_constexpr(NUM_MSB)
@@ -2601,32 +2512,20 @@ def tile_iteration(ctx, tile_idx, iter_args, causal_n_start=None):
     tile_n_const, zero_v8f32 = ctx["tile_n_const"], ctx["zero_v8f32"]
     q_frags, sgpr_state, ty = ctx["q_frags"], ctx["sgpr_state"], ctx["ty"]
     o_tiles = [
-        [
-            set_vgpr_bank(iter_args[d * N_PV_WMMA_N + n], d)
-            for n in fx.range_constexpr(N_PV_WMMA_N)
-        ]
+        [iter_args[d * N_PV_WMMA_N + n] for n in fx.range_constexpr(N_PV_WMMA_N)]
         for d in fx.range_constexpr(NUM_MSB)
     ]
-    ia_old_max = [
-        set_vgpr_bank(iter_args[16 + i], i) for i in fx.range_constexpr(NUM_MSB)
-    ]
-    ia_row_sums = [
-        set_vgpr_bank(iter_args[20 + i], i) for i in fx.range_constexpr(NUM_MSB)
-    ]
+    ia_old_max = [iter_args[16 + i] for i in fx.range_constexpr(NUM_MSB)]
+    ia_row_sums = [iter_args[20 + i] for i in fx.range_constexpr(NUM_MSB)]
     kv_tiles = [
         [
-            set_vgpr_bank(iter_args[24 + msb * N_WMMA_K_TILES + k], msb)
+            iter_args[24 + msb * N_WMMA_K_TILES + k]
             for k in fx.range_constexpr(N_WMMA_K_TILES)
         ]
         for msb in fx.range_constexpr(NUM_MSB)
     ]
-    ia_local_max = [
-        set_vgpr_bank(iter_args[_OFF_LOCAL_MAX + i], i)
-        for i in fx.range_constexpr(NUM_MSB)
-    ]
-    ia_delta = [
-        set_vgpr_bank(iter_args[_OFF_DELTA + i], i) for i in fx.range_constexpr(NUM_MSB)
-    ]
+    ia_local_max = [iter_args[_OFF_LOCAL_MAX + i] for i in fx.range_constexpr(NUM_MSB)]
+    ia_delta = [iter_args[_OFF_DELTA + i] for i in fx.range_constexpr(NUM_MSB)]
     ia_k_cur_base, ia_v_cur_base = iter_args[_OFF_PP], iter_args[_OFF_PP + 1]
     ia_k_next_base, ia_v_next_base = iter_args[_OFF_PP + 2], iter_args[_OFF_PP + 3]
     kv_lds_addrs_cur = build_kv_lds_addrs(lane_id, ia_k_cur_base, ia_v_cur_base)
@@ -2635,21 +2534,18 @@ def tile_iteration(ctx, tile_idx, iter_args, causal_n_start=None):
     ia_partial_sp_hi = [
         iter_args[_OFF_PSP_HI + i] for i in fx.range_constexpr(_PSP_SIZE)
     ]
-    ia_exp_delta = [
-        set_vgpr_bank(iter_args[_OFF_PED + i], i) for i in fx.range_constexpr(NUM_MSB)
-    ]
+    ia_exp_delta = [iter_args[_OFF_PED + i] for i in fx.range_constexpr(NUM_MSB)]
     ia_partial_sp_pairs = [
         [
             make_v2f32(
                 ia_partial_sp_lo[m * N_SP_PAIRS + i],
                 ia_partial_sp_hi[m * N_SP_PAIRS + i],
-                m,
             )
             for i in fx.range_constexpr(N_SP_PAIRS)
         ]
         for m in fx.range_constexpr(NUM_MSB)
     ]
-    sp_tiles = [[set_vgpr_bank(zero_v8f32, msb)] for msb in fx.range_constexpr(NUM_MSB)]
+    sp_tiles = [[zero_v8f32] for _ in fx.range_constexpr(NUM_MSB)]
     softmax_state = make_softmax_state(
         ia_old_max,
         ia_local_max,
