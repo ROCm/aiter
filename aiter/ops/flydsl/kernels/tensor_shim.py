@@ -41,6 +41,53 @@ def ptr_rsrc(ptr):
     return buffer_ops.create_buffer_resource_from_addr(fx.Int64(ptrtoint(ptr)))
 
 
+_BUF_COPY_ATOM = {
+    16: fx.rocdl.BufferCopy128b,
+    8: fx.rocdl.BufferCopy64b,
+    4: fx.rocdl.BufferCopy32b,
+    1: fx.rocdl.BufferCopy8b,
+}
+
+
+def _ptr_buf_tensor(
+    ptr, elem=fx.Int32, n=0xFFFFFFF, unit_elems=1, num_records_bytes=None
+):
+    """Buffer-resource (V#) view of *ptr*, so ``t[i]`` / ``fx.slice`` index it.
+
+    Keeps the addressing `buffer_ops` used: descriptor in SGPRs, 32-bit voffset
+    per access. Indexing a plain typed pointer instead builds a full 64-bit
+    address in VGPRs each time -- measured ~2.3% on the per-token route loop.
+
+    ``unit_elems`` sets the access width and hence the rank:
+      1  -> flat ``(n,)``; ``t[i]`` is one element. No atom, no fragment.
+      >1 -> ``(n, unit_elems)``; ``fx.slice(t, (u, None))`` is one wide access
+            and ``fx.copy`` over it emits a single ``buffer_load_dwordx{2,4}``.
+            A vector *element type* would be the obvious spelling for this but
+            MLIR rejects it (``AlignAttr`` takes integer/float only), so the
+            width lives in the layout.
+
+    ``num_records_bytes`` may be a runtime value, for a hardware OOB check that
+    zero-fills rather than reading stale bytes.
+    """
+    layout = (
+        fx.make_layout((n,), (1,))
+        if unit_elems == 1
+        else fx.make_layout((n, unit_elems), (unit_elems, 1))
+    )
+    pt = fx.PointerType.get(
+        elem.ir_type,
+        address_space=fx.AddressSpace.Global,
+        alignment=unit_elems * (elem.width // 8),
+    )
+    view = fx.make_view(fx.inttoptr(pt, fx.Int64(ptrtoint(ptr))), layout)
+    return fx.rocdl.make_buffer_tensor(view, num_records_bytes=num_records_bytes)
+
+
+def _buf_copy_atom(unit_bytes, elem=fx.Int32):
+    """Copy atom for a ``unit_bytes``-wide buffer access."""
+    return fx.make_copy_atom(_BUF_COPY_ATOM[unit_bytes](), elem)
+
+
 def ptr_arg(t: torch.Tensor, dtype=None):
     """Wrap a torch.Tensor as an fx.Pointer (PointerJitArg) for kernel launch."""
     if dtype is None:
