@@ -122,19 +122,128 @@ void opus_bmm_a8w8_mxscale_bpreshuffle(
                 "current device ", arch_info.dev, " has gcnArchName='",
                 arch_info.name, "'");
   }
-  // One tile so far, so kernelId only ever selects the output dtype path. It
-  // stays in the signature because the codegen follow-up turns it into a real
-  // kid lookup shaped like opus_bmm_a8w8_mxscale_tune_dispatch above, and
-  // changing the ABI later is worse than carrying an unused argument now.
-  (void)kernelId;
-  if (Y.dtype() == AITER_DTYPE_bf16)
-    opus_bmm_a8w8_mxscale_bpreshuffle_launch_gfx1250<
-        opus_bmm_a8w8_mxscale_bpreshuffle_tile_gfx1250<bf16_t>>(
-        O, wo_a, Y, x_scale, w_scale, splitK);
-  else
-    opus_bmm_a8w8_mxscale_bpreshuffle_launch_gfx1250<
-        opus_bmm_a8w8_mxscale_bpreshuffle_tile_gfx1250<fp32_t>>(
-        O, wo_a, Y, x_scale, w_scale, splitK);
+  // kernelId selects the tile; the Y dtype selects the C path within it. Still
+  // a hand-written switch rather than the codegen'd
+  // opus_bmm_a8w8_mxscale_tune_dispatch table above, because these tiles are
+  // hand-written and have no kid rows yet.
+  //   0  128x128x256, 1 WG/CU  -- prefill; 100% occupancy from m >= 2048
+  //   1   16x 32x256, 1 WG/CU  -- decode: 4x the workgroups at fixed batch
+  //   2   16x 32x256, 2 WG/CU  -- BROKEN, measurement only. Wrong (and
+  //       nondeterministic) whenever the grid exceeds the CU count: 2 WG/CU
+  //       makes co-resident workgroups share the compile-time-id named
+  //       barriers. See the kid2/kid3 warning in the traits header.
+  //   3   16x 32x512, 2 WG/CU  -- BROKEN, same cause as kid2
+  //   4   16x 64x256, 1 WG/CU, 192 THREADS -- decode; 6 waves (2 producer +
+  //       4 consumer) so all 4 SIMDs host a consumer. A/B against kid1, which
+  //       it matches on every per-wave quantity.
+  //   5   16x 64x256, 1 WG/CU, 128 threads -- kid4's control: kid4's tile at
+  //       kid1's wave count, so kid4-vs-kid5 isolates the wave count from B_N.
+  //   6   16x128x256, 1 WG/CU, 192 threads -- B_N ladder, kExpN 2
+  //   7   16x256x256, 1 WG/CU, 192 threads -- B_N ladder, kExpN 4
+  // kid 0..7 all take a PER-COLUMN w_scale ([batch, N, K/GROUP_K]). The two
+  // below take the DSV4 128x128 block scale ([batch, N/128, K/GROUP_K]) and the
+  // launcher enforces the shape, so they are not drop-in for kid4/kid7:
+  //   8   16x 64x256, GROUP_N=128 -- kid4 at the DSV4 scale granularity
+  //   9   16x256x256, GROUP_N=128 -- kid7 at the DSV4 scale granularity
+  //  10   16x192x256, GROUP_N=128 -- kExpN=3, the only blocked-but-not-uniform
+  //                                 tile; exists to test that path, not to win
+  //  13   = kid0 + A's scale staged in LDS (SF_A_LDS), so kid13-vs-kid0 is the
+  //         pair that measures the panel. 11 and 12 were the kid8/kid9 twins of
+  //         the earlier TDM version; ids left unused rather than reassigned,
+  //         because old sweep logs name them.
+  //  14   = kid13 + B's scale staged too (SF_B_LDS), the gfx950 arrangement.
+  //         kid13-vs-kid14 isolates the B side; kid14 is the only tile whose
+  //         inner loop issues no global scale load at all.
+  //  17   = kid13 with A's panel filled by TDM instead of cooperatively, at a
+  //         geometry (width 32, pad 16) that reproduces kid13's pitch exactly,
+  //         so kid13-vs-kid17 is the FILL MECHANISM alone. Caps K at 4096.
+  //  18   = the same but at the original geometry (width 128, pad 4), so
+  //         kid18-vs-kid17 is geometry at fixed mechanism.
+  // An out-of-range kid must throw: silently falling back to kid 0 would make a
+  // tile sweep report kid 0's timing under a dozen different names.
+  AITER_CHECK((kernelId >= 0 && kernelId <= 10) || kernelId == 13 ||
+                  kernelId == 14 || kernelId == 17 || kernelId == 18,
+              "opus_bmm_a8w8_mxscale_bpreshuffle: kernelId must be 0..10, 13, "
+              "14, 17 or 18 (got ", kernelId, "); 0 = prefill 128x128x256, "
+              "1..7 = decode tiles (per-column w_scale), 8..10 = decode tiles "
+              "(128x128 w_scale), 13 = kid0 with A's scale staged in LDS, 14 = "
+              "kid13 with B's staged as well, 17/18 = kid13 with A's panel "
+              "filled by TDM (width 32 / width 128)");
+
+#define OPUS_BMM_BPRESHUF_DISPATCH(TILE)                                    \
+  do {                                                                      \
+    if (Y.dtype() == AITER_DTYPE_bf16)                                      \
+      opus_bmm_a8w8_mxscale_bpreshuffle_launch_gfx1250<TILE<bf16_t>>(       \
+          O, wo_a, Y, x_scale, w_scale, splitK);                            \
+    else                                                                    \
+      opus_bmm_a8w8_mxscale_bpreshuffle_launch_gfx1250<TILE<fp32_t>>(       \
+          O, wo_a, Y, x_scale, w_scale, splitK);                            \
+  } while (0)
+
+  switch (kernelId) {
+    case 1:
+      OPUS_BMM_BPRESHUF_DISPATCH(
+          opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n32_gfx1250);
+      break;
+    case 2:
+      OPUS_BMM_BPRESHUF_DISPATCH(
+          opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n32_wg2_gfx1250);
+      break;
+    case 3:
+      OPUS_BMM_BPRESHUF_DISPATCH(
+          opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n32_k512_gfx1250);
+      break;
+    case 4:
+      OPUS_BMM_BPRESHUF_DISPATCH(
+          opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n64_w6_gfx1250);
+      break;
+    case 5:
+      OPUS_BMM_BPRESHUF_DISPATCH(
+          opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n64_w4_gfx1250);
+      break;
+    case 6:
+      OPUS_BMM_BPRESHUF_DISPATCH(
+          opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n128_w6_gfx1250);
+      break;
+    case 7:
+      OPUS_BMM_BPRESHUF_DISPATCH(
+          opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n256_w6_gfx1250);
+      break;
+    case 8:
+      OPUS_BMM_BPRESHUF_DISPATCH(
+          opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n64_w6_gn128_gfx1250);
+      break;
+    case 9:
+      OPUS_BMM_BPRESHUF_DISPATCH(
+          opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n256_w6_gn128_gfx1250);
+      break;
+    case 10:
+      OPUS_BMM_BPRESHUF_DISPATCH(
+          opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n192_w6_gn128_gfx1250);
+      break;
+    case 13:
+      OPUS_BMM_BPRESHUF_DISPATCH(
+          opus_bmm_a8w8_mxscale_bpreshuffle_tile_sfa_gfx1250);
+      break;
+    case 14:
+      OPUS_BMM_BPRESHUF_DISPATCH(
+          opus_bmm_a8w8_mxscale_bpreshuffle_tile_sfab_gfx1250);
+      break;
+    case 17:
+      OPUS_BMM_BPRESHUF_DISPATCH(
+          opus_bmm_a8w8_mxscale_bpreshuffle_tile_sfa_tdm32_gfx1250);
+      break;
+    case 18:
+      OPUS_BMM_BPRESHUF_DISPATCH(
+          opus_bmm_a8w8_mxscale_bpreshuffle_tile_sfa_tdm128_gfx1250);
+      break;
+    default:
+      OPUS_BMM_BPRESHUF_DISPATCH(
+          opus_bmm_a8w8_mxscale_bpreshuffle_tile_gfx1250);
+      break;
+  }
+
+#undef OPUS_BMM_BPRESHUF_DISPATCH
 #endif  // OPUS_BUILD_HAS_GFX1250
 }
 

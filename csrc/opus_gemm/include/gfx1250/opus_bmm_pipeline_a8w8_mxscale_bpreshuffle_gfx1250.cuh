@@ -14,9 +14,17 @@
 //                           the wave32 WMMA operand layout; the B one additionally
 //                           has to walk the shuffle_weight(16,16) interior. Both
 //                           are marked UNVERIFIED and both need the probe below.
-//   2. the scale fetch   -- currently plain per-tile global loads of e8m0 bytes.
-//                           Correct but not fast; the LDS scale panel is the
-//                           optimisation and T::kSfPanel reserves the room for it.
+//   2. the scale fetch   -- DONE. SF_A_LDS / SF_B_LDS stage A's and B's scales
+//                           in LDS for a whole K, filled once in the prologue.
+//                           Measured 1.068 / 1.096 (A / both) against the global
+//                           path on the prefill tile, growing to 1.18 at
+//                           k=16384. kid13 and kid14 carry the flags; the
+//                           default is still global because the ladder's decode
+//                           tiles have not been re-measured. See the traits'
+//                           kSfALds section, INCLUDING its note on why an
+//                           earlier round of measurement got the sign wrong.
+//                           The older per-slot T::kSfPanel scaffold is unused
+//                           and hardwired false.
 //   3. store_c           -- the C fragment map, same UNVERIFIED caveat as (1).
 //
 // HOW TO VERIFY (1) AND (3) BEFORE TRUSTING ANY NUMBER. These three maps are the
@@ -26,7 +34,12 @@
 // print (lane, i) -> value. Anything that disagrees with the constants below is
 // the hardware telling you the layout, and the layout wins.
 //
-// The 4-wave split is w0 = A producer, w1 = B producer, w2/w3 = WMMA consumers.
+// The wave split is w0 = A producer, w1 = B producer, and every wave from
+// kNumProducerWaves up is a WMMA consumer. The wave count follows BLOCK_SIZE and
+// is not assumed to be 4 anywhere below: the barrier member counts are expressed
+// in kNumWaves / kNumConsumerWaves and the consumer's wave_m/wave_n come from
+// kTileM/kTileN, which the traits derive from kNumConsumerWaves. See the
+// kNumWaves block in the traits header for why going past 4 waves matters.
 // Every compile-time value comes from the traits header; this file declares no
 // geometry of its own.
 #pragma once
@@ -45,8 +58,12 @@ __host__ __device__ constexpr inline int opus_bmm_mx_min_i(int a, int b) {
     return a < b ? a : b;
 }
 
+// launch_bounds comes from the traits, not a literal: the host launcher already
+// sizes the block as dim3(T::BLOCK_SIZE), so a hardcoded bound here is a silent
+// mismatch the moment a tile picks a wave count other than 4 (the register
+// allocator would be budgeting for 128 threads while 192 launch).
 template <typename UserTraits>
-__global__ __launch_bounds__(128, 1)
+__global__ __launch_bounds__(opus::remove_cvref_t<UserTraits>::BLOCK_SIZE, 1)
 void bmm_a8w8_mxscale_bpreshuffle_kernel_gfx1250(opus_bmm_a8w8_mxscale_kargs_gfx1250 kargs) {
 #ifdef __HIP_DEVICE_COMPILE__
 #if defined(__gfx1250__)
@@ -60,9 +77,14 @@ void bmm_a8w8_mxscale_bpreshuffle_kernel_gfx1250(opus_bmm_a8w8_mxscale_kargs_gfx
 
     // -- named-barrier helpers (compile-time ids) ---------------------------
     // Barrier layout, P = kNumSlots:
-    //   DATA[s]   = 1        + s   memcnt = kNumWaves            (both producers + both consumers)
+    //   DATA[s]   = 1        + s   memcnt = kNumWaves            (both producers + all consumers)
     //   FREE_A[s] = 1 +   P  + s   memcnt = 1 + kNumConsumerWaves (prodA + consumers)
     //   FREE_B[s] = 1 + 2*P  + s   memcnt = 1 + kNumConsumerWaves (prodB + consumers)
+    // DATA's count is kNumWaves because both producers signal it once and each
+    // consumer joins it once: 2 + kNumConsumerWaves == kNumWaves. That identity
+    // holds only while every producer wave actually issues a DMA -- if you ever
+    // add a producer that does not, this count must become 2 + kNumConsumerWaves
+    // explicitly or the barrier will never fill.
     // FREE is PER-PRODUCER on purpose: with one shared FREE the consumer's extra
     // free can substitute for a producer's signal, releasing whichever producer
     // happened to be joined and hanging the other. Do not merge them.
@@ -129,6 +151,40 @@ void bmm_a8w8_mxscale_bpreshuffle_kernel_gfx1250(opus_bmm_a8w8_mxscale_kargs_gfx
     __shared__ char lds_buf[T::kLdsTotalBytes];
     DataA* smem_a = reinterpret_cast<DataA*>(lds_buf);
     DataB* smem_b = reinterpret_cast<DataB*>(lds_buf + T::kSegBytesA);
+    // Whole-K scale panels: A is [kBlockM rows x sf_pitch], B is
+    // [kSfBPanelRows x sf_pitch]. Both pitches track the RUNTIME K-group count
+    // (plus a bank pad) rather than a compile-time width, so a small K wastes
+    // only LDS. They sit after both ring segments, A then B, and are zero-sized
+    // when the tile does not ask for them.
+    DataSf* smem_sfa =
+        reinterpret_cast<DataSf*>(lds_buf + T::kSegBytesA + T::kSegBytesB);
+    DataSf* smem_sfb = reinterpret_cast<DataSf*>(
+        lds_buf + T::kSegBytesA + T::kSegBytesB + T::kSegBytesSfALds);
+    // Row length in K-groups, shared by both panels because both are indexed by
+    // the same kg. ceil, not floor: a K that does not fill its last group still
+    // needs that group's byte, and the read side's kg reaches it.
+    const int sf_kg = (T::kSfALds || T::kSfBLds)
+                          ? opus_bmm_mx_ceil_div_i(kargs.k, T::kGroupK)
+                          : 0;
+    // LDS row pitch: round up to the pad, then add it. See kSfPanelPad -- the
+    // pad is what keeps 16 lanes reading 16 consecutive rows off one bank, and
+    // rounding to 16 is what lets the fill keep its 16-byte store.
+    //
+    // Under kSfATdm the pitch is the D#'s own padding, so it is compile-time and
+    // the runtime expression would disagree with the layout the engine wrote.
+    // Only A can be on TDM (asserted in the traits), so there is no ambiguity
+    // about which panel this pitch belongs to.
+    const int sf_pitch =
+        T::kSfATdm
+            ? T::kSfAPitchFixed
+            : ((T::kSfALds || T::kSfBLds)
+                   ? (((sf_kg + T::kSfPanelPad - 1) & ~(T::kSfPanelPad - 1))
+                      + T::kSfPanelPad)
+                   : 0);
+    // First kGroupN block this tile's N range touches; the B panel is indexed
+    // relative to it. Blocks, not columns: tile_col need not be a multiple of
+    // kGroupN, which is what kSfBPanelRows' +1 covers.
+    const int sfb_nb_base = T::kSfBLds ? (tile_col / T::kGroupN) : 0;
     constexpr int slot_a = T::kSlotElemsA;
     constexpr int slot_b = T::kSlotElemsB;
 
@@ -144,6 +200,98 @@ void bmm_a8w8_mxscale_bpreshuffle_kernel_gfx1250(opus_bmm_a8w8_mxscale_kargs_gfx
             binit(opus::number<1 + T::kNumSlots + s>{}, kFreeMemCnt);
             binit(opus::number<1 + 2 * T::kNumSlots + s>{}, kFreeMemCnt);
         });
+    }
+
+    // Scale panels: one cooperative fill by ALL threads, before the
+    // producer/consumer split, published by the barrier below -- the same
+    // barrier that publishes the binits above, so this costs no new sync.
+    // Whole-K, so it happens ONCE per workgroup rather than per K-tile, which is
+    // what makes it cheap enough to be free at the ring's expense in LDS only.
+    //
+    // Grid-stride over each panel's flat byte count with the widest vector the
+    // geometry allows; see fill_panel for the width rule. At k=4096 with g=8
+    // that is 32 | 256, so 16 bytes, and the prefill tile's 4 KB A panel fills
+    // in two iterations per thread.
+    //
+    // OOB is handled by the buffer bound, not by clamping the row: a buffer load
+    // past num_records returns zero rather than faulting, and the rows it
+    // affects are the partial-M / partial-N tail, whose C store is dropped
+    // anyway. Nothing reduces across rows or columns, so a zero exponent in a
+    // dropped row cannot reach a live one.
+    // A by DMA instead: one wave programs a 2D window over [K-groups, M] and the
+    // engine writes the padded panel itself. Issued from the first CONSUMER
+    // wave, because the producers' steady loop is descriptor-bound and the
+    // historical TDM fill only reached its best number once the issue moved off
+    // them. tensorcnt is per-wave, so this wave drains its own transfer and the
+    // s_barrier below is what publishes the panel to everyone else -- the same
+    // barrier that publishes the binits, so again no new sync.
+    //
+    // Extents are the tensor's, not the tile's: shape1 = m with origin_1 =
+    // tile_row gives the partial-M tail a zero-extent DMA instead of a fault,
+    // exactly as the A-tile window gets it.
+    if constexpr (T::kSfATdm) {
+        if (wave_id == T::kNumProducerWaves) {
+            auto w = opus::make_tdm<typename T::WindowSfA>(
+                (u32_t)reinterpret_cast<u64_t>(smem_sfa), ptr_sfa,
+                (u32_t)sf_kg, (u32_t)kargs.m, (u64_t)kargs.stride_sfa,
+                (u32_t)0, (u32_t)tile_row);
+            w.async_load((u32_t)0);
+            opus::s_wait_tensorcnt<0>();
+        }
+    }
+    if constexpr (T::kSfACoop || T::kSfBLds) {
+        const int tid = (int)opus::thread_id_x();
+        // Flat index over the SOURCE row length; the destination re-applies
+        // sf_pitch. VEC divides sf_kg on the wide rung, so kt is a multiple of
+        // VEC, and sf_pitch is a multiple of kSfPanelPad (16) -- so the store
+        // keeps the alignment the load has, which is the whole reason the pad is
+        // a power of two rather than the 4 that would minimise bank conflicts.
+        auto fill_panel = [&](const DataSf* src, int src_pitch, DataSf* dst,
+                              int rows, unsigned bound)
+            __attribute__((always_inline)) {
+            auto g = opus::make_gmem(src, bound);
+            auto s = opus::make_smem(dst);
+            const int total = rows * sf_kg;
+            auto run = [&](auto VecN) __attribute__((always_inline)) {
+                constexpr int VEC = decltype(VecN)::value;
+                for (int idx = tid * VEC; idx < total; idx += T::BLOCK_SIZE * VEC) {
+                    const int r  = idx / sf_kg;
+                    const int kt = idx - r * sf_kg;
+                    opus::store<VEC>(s, opus::load<VEC>(g, r * src_pitch + kt),
+                                     r * sf_pitch + kt);
+                }
+            };
+            // A chunk must not span two source rows nor land unaligned, so the
+            // width has to divide both the row length and the source row stride.
+            // Runtime, hence a ladder rather than a compile-time VEC.
+            const int widths = sf_kg | src_pitch;
+            if ((widths & (T::kSfFillVecMax - 1)) == 0)
+                run(opus::number<T::kSfFillVecMax>{});
+            else
+                run(opus::number<1>{});
+        };
+        // A: rows are tile_row .. tile_row + kBlockM - 1, and the tail past m is
+        // covered by the buffer bound rather than a clamp.
+        if constexpr (T::kSfACoop) {
+            const int rows_avail = kargs.m - tile_row;      // > 0: tile_row < m
+            fill_panel(ptr_sfa + (size_t)tile_row * kargs.stride_sfa,
+                       kargs.stride_sfa, smem_sfa, T::kBlockM,
+                       (unsigned)((rows_avail - 1) * kargs.stride_sfa + sf_kg));
+        }
+        // B: rows are kGroupN BLOCKS, sfb_nb_base .. + kSfBPanelRows - 1. The
+        // last row of the panel is past the tensor whenever the tile does not
+        // straddle, so the bound is doing real work here on every launch, not
+        // just on a tail.
+        if constexpr (T::kSfBLds) {
+            const int nb_max = (kargs.n + T::kGroupN - 1) / T::kGroupN - 1;
+            fill_panel(ptr_sfb + (size_t)sfb_nb_base * kargs.stride_sfb,
+                       kargs.stride_sfb, smem_sfb, T::kSfBPanelRows,
+                       (unsigned)((nb_max - sfb_nb_base) * kargs.stride_sfb + sf_kg));
+        }
+        // s_barrier retires neither counter on its own: loadcnt for the global
+        // reads feeding the panels, dscnt for the ds_writes that publish them.
+        opus::s_wait_loadcnt<0>();
+        opus::s_wait_dscnt<0>();
     }
     __builtin_amdgcn_s_barrier();
 
@@ -241,13 +389,20 @@ void bmm_a8w8_mxscale_bpreshuffle_kernel_gfx1250(opus_bmm_a8w8_mxscale_kargs_gfx
     }
 
     // ---------------------------------------------------------------------
-    // Consumers (w2, w3). wmma accumulates the result of the matrix multiplication.
+    // Consumers (w[kNumProducerWaves] .. w[kNumWaves-1]). wmma accumulates the
+    // result of the matrix multiplication.
     // ---------------------------------------------------------------------
     const int wave_split = wave_id - T::kNumProducerWaves;
     // TileN: consumers split N (wave_n = wave_split, wave_m = 0).
     // TileM: consumers split M (wave_m = wave_split, wave_n = 0).
     const int wave_m = (T::LAYOUT == opus_gfx1250_bmm::kLayoutTileM) ? wave_split : 0;
     const int wave_n = (T::LAYOUT == opus_gfx1250_bmm::kLayoutTileM) ? 0 : wave_split;
+
+    // The A-scale panel was already filled and published in the prologue, above
+    // the producer/consumer split. It covers the tile's whole K range, so the
+    // entire K loop reads it and nothing ever overwrites it -- no ring slot, no
+    // FREE/DATA handshake, and no barrier id past the 9 already in use (the
+    // binit/bjs/bjsw chains silently alias anything above 9 to __nbar_9).
 
     using Mma = opus::wmma<DataA, DataB, DataAcc, T::kWmmaM, T::kWmmaN, T::kWmmaK>;
     Mma mma;
@@ -313,16 +468,15 @@ void bmm_a8w8_mxscale_bpreshuffle_kernel_gfx1250(opus_bmm_a8w8_mxscale_kargs_gfx
         return v;
     };
 
-    // -- TODO(kernel) 2: the scale fetch. -----------------------------------
-    // Simple and correct: read the e8m0 bytes this WMMA needs straight from global
-    // and pack them into the BX32 int operand. One int = 4 bytes = the instruction's
-    // whole K=128. At kGroupK==32 those are 4 distinct groups; at kGroupK==128 the
-    // one byte is broadcast (this is gfx950's pack_e8m0x4, unchanged).
+    // -- the scale fetch ----------------------------------------------------
+    // Pack the e8m0 bytes this WMMA needs into the BX32 int operand. One int =
+    // 4 bytes = the instruction's whole K=128. At kGroupK==32 those are 4 distinct
+    // groups; at kGroupK==128 the one byte is broadcast (gfx950's pack_e8m0x4).
     //
-    // This is the slow path on purpose -- it keeps the scaffold's correctness
-    // argument short. The optimisation is to stage the tile's scales in LDS once
-    // per K step (T::kSfPanel reserves kSegBytesSfA/B for exactly that) and read
-    // them with ds_read, which is what the gfx950 mxscale pipeline does.
+    // Parameterised by (pointer, row, row pitch) so it serves all three sources
+    // this pipeline now has: A from global, A from the LDS panel (T::kSfALds),
+    // and B from global. Keeping ONE packer is deliberate -- the three differ
+    // only in where the bytes live, never in how they are assembled.
     //
     // NOTE the OPSEL argument to the WMMA below is 0, meaning "scale comes from
     // lanes 0-15". Every lane computing the same value makes that safe; if you
@@ -350,10 +504,170 @@ void bmm_a8w8_mxscale_bpreshuffle_kernel_gfx1250(opus_bmm_a8w8_mxscale_kargs_gfx
         bjsw(opus::number<1 + s>{});
         asm volatile("" ::: "memory");
 
+        // Which kGroupN block row of w_scale span slot `in` reads, ABSOLUTE (the
+        // B panel subtracts sfb_nb_base). One expression for both B scale
+        // layouts, and it must stay that way: which ROW to read is decided by
+        // kGroupN alone (the tensor has ceil(n/kGroupN) rows), while whether the
+        // lane term can be dropped is a separate, weaker property,
+        // kSfBUniformOverN. Branching the LAYOUT on the uniformity flag would be
+        // a latent silent-wrong-answer bug: they agree for every tile defined
+        // today, but a B_N=192 tile on 4 consumer waves has kExpN=3, so its
+        // 48-column wave span does not divide 128, uniformity goes false while
+        // kGroupN stays 128, and a blocked tensor would get indexed as if it had
+        // n rows. The launcher's size(1) check cannot catch that -- the shape is
+        // right. Clamped because the tile's span can run past n on the last
+        // tile; those columns have their C store dropped anyway.
+        //
+        // Under uniformity the body ignores `in` entirely, which is what
+        // collapses kSfBLoadsPerK to 1 -- the compiler will not prove that
+        // itself, it would need tile_col's alignment. Measurably it does not:
+        // ISA load counts followed 5*kExpK*(kExpM+kExpN) exactly.
+        const int b_col_base = tile_col + wave_n * (T::kExpN * T::kWmmaN);
+        const int nb_max     = (kargs.n + T::kGroupN - 1) / T::kGroupN - 1;
+        auto sfb_nb = [&](int in) __attribute__((always_inline)) -> int {
+            const int off = T::kSfBUniformOverN
+                                ? 0
+                                : (in * T::kWmmaN + (lane_id % T::kWmmaN));
+            return opus_bmm_mx_min_i((b_col_base + off) / T::kGroupN, nb_max);
+        };
+
+        // ONE wide panel read per row for the whole K-step; each ik below takes
+        // its own byte out of it. Hoisted to here, out of the ik loop, because
+        // that is the entire point: kExpK WMMAs share one ds_read. A row's kExpK
+        // bytes are consecutive in the panel (kg advances by one per ik), and
+        // sf_pitch is 16-aligned while k_step*kExpK is kExpK-aligned, so the
+        // 2- or 4-byte read is always aligned.
+        //
+        // It is an LDS read like the fragment reads, so it sits with them under
+        // the ik loop's s_wait_dscnt(0). The panels are outside the ring, so
+        // unlike those they race nothing.
+        auto wide_read = [&](const DataSf* p) __attribute__((always_inline)) {
+            if constexpr (T::kExpK == 2) {
+                return (unsigned)*reinterpret_cast<const unsigned short*>(p);
+            } else {
+                return *reinterpret_cast<const unsigned*>(p);
+            }
+        };
+        unsigned sa_w[T::kExpM];
+        if constexpr (T::kSfAWideRead) {
+            opus::static_for<T::kExpM>([&](auto imN) __attribute__((always_inline)) {
+                constexpr int im = decltype(imN)::value;
+                const int r = wave_m * (T::kExpM * T::kWmmaM) + im * T::kWmmaM
+                              + (lane_id % T::kWmmaM);
+                sa_w[im] = wide_read(smem_sfa + (size_t)r * sf_pitch
+                                     + (size_t)k_step * T::kExpK);
+            });
+        }
+        // kSfBLoadsPerK entries, not kExpN: under uniformity the whole wave span
+        // sits in one block row, so there is one distinct read for the K-step.
+        unsigned sb_w[T::kSfBWideRead ? T::kSfBLoadsPerK : 1];
+        if constexpr (T::kSfBWideRead) {
+            opus::static_for<T::kSfBLoadsPerK>([&](auto inN) __attribute__((always_inline)) {
+                constexpr int in = decltype(inN)::value;
+                const int nb = sfb_nb(in) - sfb_nb_base;
+                sb_w[in] = wide_read(smem_sfb + (size_t)nb * sf_pitch
+                                     + (size_t)k_step * T::kExpK);
+            });
+        }
+
         opus::static_for<T::kExpK>([&](auto ikN) __attribute__((always_inline)) {
             constexpr int ik = decltype(ikN)::value;
             // K group index of this WMMA's first scale byte.
             const int kg = (k_step * T::kBlockK + ik * T::kWmmaK) / T::kGroupK;
+
+            // The GLOBAL scale bytes depend on nothing the producers put in the
+            // ring, so they can be issued either before the
+            // ds_reads (overlapping the LDS round trip) or after s_wait_dscnt(0)
+            // (spread through the WMMA sequence, covering each other). Which one
+            // wins depends on how many there are; T::kSfEarly carries the measured
+            // threshold and the data behind it. Defined once here, issued at
+            // whichever of the two points that flag selects.
+            //
+            // The scale operand is PER LANE, not per WMMA tile: the instruction
+            // takes row m's 4 e8m0 bytes from lane m (opus.hpp:3339 "per-lane E8M0
+            // exponent values", and OPSEL 0 = read them from lanes 0-15). So lane
+            // l must supply row a_row + l%16 -- exactly what the gfx950 sibling's
+            // make_layout_sfa_mxsk does with its `lane_id % T::W_M` coordinate. A
+            // uniform per-tile scale would be in-bounds, silent, and would apply
+            // row a_row's exponent to all 16 rows; with per-128K checkpoints that
+            // is wrong on every row but one (DS V4 uses GROUP_K=128 + broadcast).
+            // Lanes 16-31 duplicate 0-15 and are discarded by OPSEL 0.
+            //
+            // Both a_row and the B block row are clamped because the tile's span
+            // can run past m / n on the last tile; the rows and columns they clamp
+            // onto have their C store dropped anyway.
+            // One row's A scale, from the LDS panel when the tile has one and
+            // straight from global otherwise. Same pack_sf either way -- it is
+            // already parameterised by pointer, row and row pitch, and the panel
+            // is just a second (row, pitch) pair whose pointer lives in LDS.
+            auto pack_sfa = [&](int im) __attribute__((always_inline)) -> int {
+                const int r = wave_m * (T::kExpM * T::kWmmaM) + im * T::kWmmaM
+                              + (lane_id % T::kWmmaM);
+                if constexpr (T::kSfAWideRead) {
+                    // Byte ik of this step's wide read, replicated across the
+                    // BX32 operand. V_PERM_B32 permutes {src0:src1} with src1 as
+                    // the low dword, so a selector of ik in all four bytes picks
+                    // byte ik of sa_w four times. ONE instruction, and it stands
+                    // in for the broadcast multiply the byte path already paid --
+                    // so this widening spends no extra VALU, it only deletes
+                    // ds_reads. No LDS access here at all.
+                    return (int)__builtin_amdgcn_perm(sa_w[im], sa_w[im],
+                                                      (unsigned)ik * 0x01010101u);
+                } else if constexpr (T::kSfALds) {
+                    // TILE-local row, and deliberately unclamped: r < kBlockM by
+                    // construction, and a row past m read zero from the buffer
+                    // bound during the fill. That is safe for the same reason the
+                    // global path's clamp is: the scale operand is per lane, so
+                    // row r's byte only ever reaches row r's accumulators, and an
+                    // out-of-range row's C store is dropped. A zero exponent
+                    // there cannot reach a valid row -- it is not a reduction.
+                    return pack_sf(smem_sfa, r, sf_pitch, kg);
+                } else {
+                    return pack_sf(ptr_sfa,
+                                   opus_bmm_mx_min_i(tile_row + r, kargs.m - 1),
+                                   kargs.stride_sfa, kg);
+                }
+            };
+
+            int sa_v[T::kExpM];
+            auto fill_sa = [&]() __attribute__((always_inline)) {
+                opus::static_for<T::kExpM>([&](auto imN) __attribute__((always_inline)) {
+                    sa_v[decltype(imN)::value] = pack_sfa(decltype(imN)::value);
+                });
+            };
+
+            // One B scale value per span slot, from the LDS panel when the tile
+            // has one and straight from global otherwise. sfb_nb (hoisted to the
+            // K-step, where the wide read shares it) owns the row expression;
+            // this only chooses which (pointer, pitch) pair to apply it to.
+            int sb_v[T::kExpN];
+            auto fill_sb = [&]() __attribute__((always_inline)) {
+              opus::static_for<T::kExpN>([&](auto inN) __attribute__((always_inline)) {
+                constexpr int in = decltype(inN)::value;
+                // Under uniformity every slot reads the SAME value, so index the
+                // one entry that exists rather than kExpN copies of it.
+                constexpr int iw = T::kSfBUniformOverN ? 0 : in;
+                if constexpr (T::kSfBWideRead) {
+                    sb_v[in] = (int)__builtin_amdgcn_perm(sb_w[iw], sb_w[iw],
+                                                          (unsigned)ik * 0x01010101u);
+                } else if constexpr (T::kSfBLds) {
+                    // PANEL-local block row. Unclamped subtraction is safe:
+                    // sfb_nb returns at least tile_col/kGroupN = sfb_nb_base,
+                    // and at most the block of the span's last column, which is
+                    // inside kSfBPanelRows by construction.
+                    sb_v[in] = pack_sf(smem_sfb, sfb_nb(in) - sfb_nb_base,
+                                       sf_pitch, kg);
+                } else {
+                    sb_v[in] = pack_sf(ptr_sfb, sfb_nb(in), kargs.stride_sfb, kg);
+                }
+              });
+            };
+
+            // kSfAEarly / kSfBEarly, not kSfEarly: a panel read is a ds_read and
+            // wants to sit with the other ds_reads, under the one
+            // s_wait_dscnt(0) below.
+            if constexpr (T::kSfAEarly) { fill_sa(); }
+            if constexpr (T::kSfBEarly) { fill_sb(); }
 
             FragA va[T::kExpM];
             FragB vb[T::kExpN];
@@ -365,33 +679,18 @@ void bmm_a8w8_mxscale_bpreshuffle_kernel_gfx1250(opus_bmm_a8w8_mxscale_kargs_gfx
             });
             opus::s_wait_dscnt(opus::number<0>{});
 
+            if constexpr (!T::kSfBEarly) { fill_sb(); }
+
             opus::static_for<T::kExpM>([&](auto imN) __attribute__((always_inline)) {
                 constexpr int im = decltype(imN)::value;
-                // The scale operand is PER LANE, not per WMMA tile: the
-                // instruction takes row m's 4 e8m0 bytes from lane m (opus.hpp:3339
-                // "per-lane E8M0 exponent values", and OPSEL 0 = read them from
-                // lanes 0-15). So lane l must supply row a_row + l%16 -- exactly
-                // what the gfx950 sibling's make_layout_sfa_mxsk does with its
-                // `lane_id % T::W_M` coordinate. A uniform per-tile scale would be
-                // in-bounds, silent, and would apply row a_row's exponent to all 16
-                // rows; with per-128K checkpoints a uniform per-tile scale would
-                // be wrong on every row but one (DS V4 uses GROUP_K=128 + broadcast).
-                // Lanes 16-31 duplicate 0-15 and are discarded by OPSEL 0.
-                // Clamped because a_row + 15 can exceed m on the last tile; the
-                // rows it clamps onto have their C store dropped anyway.
-                const int a_row0 = tile_row + wave_m * (T::kExpM * T::kWmmaM) + im * T::kWmmaM;
-                const int a_row  = opus_bmm_mx_min_i(a_row0 + (lane_id % T::kWmmaM), kargs.m - 1);
-                const int sa     = pack_sf(ptr_sfa, a_row, kargs.stride_sfa, kg);
+                // On the late path each row's A scale is issued here rather than
+                // in one batch up front, so its latency is covered by the WMMAs of
+                // the previous im iteration -- that staggering is exactly what the
+                // high-kSfLoadsPerK tiles lose if they go early.
+                if constexpr (!T::kSfAEarly) sa_v[im] = pack_sfa(im);
                 opus::static_for<T::kExpN>([&](auto inN) __attribute__((always_inline)) {
                     constexpr int in = decltype(inN)::value;
-                    // Same per-lane rule on the B side: lane l supplies column
-                    // b_col + l%16. B's scale is NOT preshuffled -- w_scale is the
-                    // plain [batch, N, K/GROUP_K] tensor, so this indexes N
-                    // directly even though the weights themselves are shuffled.
-                    const int b_col0 = tile_col + wave_n * (T::kExpN * T::kWmmaN) + in * T::kWmmaN;
-                    const int b_col  = opus_bmm_mx_min_i(b_col0 + (lane_id % T::kWmmaN), kargs.n - 1);
-                    const int sb     = pack_sf(ptr_sfb, b_col, kargs.stride_sfb, kg);
-                    acc[im][in] = mma(va[im], vb[in], acc[im][in], sa, sb,
+                    acc[im][in] = mma(va[im], vb[in], acc[im][in], sa_v[im], sb_v[in],
                                       opus::number<0>{}, opus::number<0>{});
                 });
             });

@@ -28,3 +28,35 @@ template __global__ void bmm_a8w8_mxscale_bpreshuffle_kernel_gfx1250<
 template __global__ void bmm_a8w8_mxscale_bpreshuffle_kernel_gfx1250<
     opus_bmm_a8w8_mxscale_bpreshuffle_tile_gfx1250<fp32_t>>(
     opus_bmm_a8w8_mxscale_kargs_gfx1250);
+
+// Decode tiles (kid 1..4). Same two C dtypes each; see the traits header for
+// what each variant adds. They exist to be A/B'd against kid 0 at the DSV4
+// decode shapes, where kid 0's grid leaves 94% of the CUs idle. kid4 is the odd
+// one out: it is the only tile that is not 128 threads, and its A/B partner is
+// kid1 rather than kid0.
+#define OPUS_BMM_BPRESHUF_INST(TILE)                                     \
+    template __global__ void bmm_a8w8_mxscale_bpreshuffle_kernel_gfx1250< \
+        TILE<bf16_t>>(opus_bmm_a8w8_mxscale_kargs_gfx1250);              \
+    template __global__ void bmm_a8w8_mxscale_bpreshuffle_kernel_gfx1250< \
+        TILE<fp32_t>>(opus_bmm_a8w8_mxscale_kargs_gfx1250)
+
+OPUS_BMM_BPRESHUF_INST(opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n32_gfx1250);
+OPUS_BMM_BPRESHUF_INST(opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n32_wg2_gfx1250);
+OPUS_BMM_BPRESHUF_INST(opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n32_k512_gfx1250);
+OPUS_BMM_BPRESHUF_INST(opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n64_w6_gfx1250);
+OPUS_BMM_BPRESHUF_INST(opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n64_w4_gfx1250);
+OPUS_BMM_BPRESHUF_INST(opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n128_w6_gfx1250);
+OPUS_BMM_BPRESHUF_INST(opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n256_w6_gfx1250);
+OPUS_BMM_BPRESHUF_INST(opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n64_w6_gn128_gfx1250);
+OPUS_BMM_BPRESHUF_INST(opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n256_w6_gn128_gfx1250);
+OPUS_BMM_BPRESHUF_INST(opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n192_w6_gn128_gfx1250);
+OPUS_BMM_BPRESHUF_INST(opus_bmm_a8w8_mxscale_bpreshuffle_tile_sfa_gfx1250);
+OPUS_BMM_BPRESHUF_INST(opus_bmm_a8w8_mxscale_bpreshuffle_tile_sfab_gfx1250);
+OPUS_BMM_BPRESHUF_INST(opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n64_sfa_gfx1250);
+OPUS_BMM_BPRESHUF_INST(opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n256_sfa_gfx1250);
+OPUS_BMM_BPRESHUF_INST(opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n64_sfab_gfx1250);
+OPUS_BMM_BPRESHUF_INST(opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n256_sfab_gfx1250);
+OPUS_BMM_BPRESHUF_INST(opus_bmm_a8w8_mxscale_bpreshuffle_tile_sfa_tdm32_gfx1250);
+OPUS_BMM_BPRESHUF_INST(opus_bmm_a8w8_mxscale_bpreshuffle_tile_sfa_tdm128_gfx1250);
+
+#undef OPUS_BMM_BPRESHUF_INST

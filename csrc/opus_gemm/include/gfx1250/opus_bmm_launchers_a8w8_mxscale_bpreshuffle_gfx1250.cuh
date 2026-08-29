@@ -108,6 +108,46 @@ static inline void opus_bmm_a8w8_mxscale_bpreshuffle_launch_gfx1250(
                 "yet (got ", splitK, "); add the ws+reduce path from "
                 "opus_gemm_pipeline_a16w16_cluster_tdm_splitk_ws_gfx1250.cuh");
 
+    // w_scale's SHAPE is the only thing that distinguishes a per-column scale
+    // from a 128x128 block scale, and the tile's GROUP_N picks which one it will
+    // read. Nothing else in the call signature reveals the difference: both are
+    // contiguous e8m0 with dim 3, and indexing a per-column scale as if it were
+    // blocked (or the reverse) stays in bounds and returns a real exponent for
+    // the wrong columns. That is a silent wrong answer, so check it here.
+    const int sfb_rows = (n + T::kGroupN - 1) / T::kGroupN;
+    const int sfb_cols = k / T::kGroupK;
+    AITER_CHECK(w_scale.dim() == 3, "opus_bmm_a8w8_mxscale_bpreshuffle",
+                ": w_scale must be 3D [batch, N/GROUP_N, K/GROUP_K]; got dim ",
+                w_scale.dim());
+    AITER_CHECK((int)w_scale.size(1) == sfb_rows,
+                "opus_bmm_a8w8_mxscale_bpreshuffle: this tile has GROUP_N=",
+                T::kGroupN, ", so w_scale.size(1) must be ceil(N/GROUP_N)=",
+                sfb_rows, " for N=", n, "; got ", (long)w_scale.size(1),
+                ". A 128x128 block scale needs a GROUP_N=128 tile and a "
+                "per-column scale needs a GROUP_N=1 tile.");
+    AITER_CHECK((int)w_scale.size(2) == sfb_cols,
+                "opus_bmm_a8w8_mxscale_bpreshuffle: w_scale.size(2) must be "
+                "K/GROUP_K=", sfb_cols, " for K=", k, " GROUP_K=", T::kGroupK,
+                "; got ", (long)w_scale.size(2));
+
+    // A tile that stages A's scales in LDS allocates that panel at compile time
+    // but fills it with the RUNTIME K/GROUP_K as its row pitch, so a K past the
+    // bound does not truncate -- it runs the fill off the end of the panel and
+    // corrupts whatever LDS follows. Silent, and not even confined to the scale
+    // path. Hence a hard error rather than a fallback.
+    if constexpr (T::kSfALds || T::kSfBLds) {
+        // The TDM fill is the tighter bound of the two: its width is the D#'s
+        // pad interval and so is fixed at compile time, which means a larger K
+        // does not merely overrun the panel, it silently drops the K-groups past
+        // the descriptor's tile.
+        constexpr int kg_cap = T::kSfATdm ? T::kSfATdmKG : T::kSfAPanelKG;
+        AITER_CHECK(k <= kg_cap * T::kGroupK,
+                    "opus_bmm_a8w8_mxscale_bpreshuffle: this tile stages scales "
+                    "in LDS, which caps K at ",
+                    kg_cap * T::kGroupK, "; got K=", k,
+                    ". Use a tile without SF_A_LDS/SF_B_LDS for larger K.");
+    }
+
     opus_bmm_a8w8_mxscale_kargs_gfx1250 kargs{};
     kargs.ptr_a   = O.data_ptr();
     kargs.ptr_b   = wo_a.data_ptr();
