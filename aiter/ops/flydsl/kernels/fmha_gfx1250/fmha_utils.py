@@ -398,16 +398,9 @@ def broadcast_f32_to_v2f32(val):
 N_WMMA_K_TILES = (QK_HDIM // WMMA_K) // 2
 
 
-def _banked_op(result):
-    sched_barrier(0)
-    sched_barrier(0)
-    return result
-
-
 def _wmma_bf16(ty, src_a, src_b, acc):
     sched_barrier(0)
-    r = rocdl_dialect.wmma_f32_16x16x32_bf16(ty["v8f32"], src_a, src_b, acc)
-    return _banked_op(r.result)
+    return rocdl_dialect.wmma_f32_16x16x32_bf16(ty["v8f32"], src_a, src_b, acc).result
 
 
 class Atom:
@@ -425,13 +418,13 @@ class Atom:
     def ds_load_b128(ty, addr, offset_val):
         sched_barrier(0)
         ptr = llvm_dialect.inttoptr(ty["lds_ptr"], (addr + offset_val))
-        return _banked_op(llvm_dialect.load(ty["v4i32"], ptr))
+        return llvm_dialect.load(ty["v4i32"], ptr)
 
     @staticmethod
     def ds_load_tr16_b128(ty, addr, offset_val):
         sched_barrier(0)
         ptr = llvm_dialect.inttoptr(ty["lds_ptr"], (addr + offset_val))
-        return _banked_op(rocdl.ds_load_tr16_b128(ty["v8bf16"], ptr))
+        return rocdl.ds_load_tr16_b128(ty["v8bf16"], ptr)
 
     @staticmethod
     def tdm_load(ty, s_g0, s_g1):
@@ -445,59 +438,56 @@ class Atom:
     @staticmethod
     def exp_f32(src):
         sched_barrier(0)
-        return _banked_op(rocdl_exp2(T.f32, src))
+        return rocdl_exp2(T.f32, src)
 
     @staticmethod
     def mul_f32(src0, src1):
         sched_barrier(0)
-        return _banked_op(src0 * src1)
+        return src0 * src1
 
     @staticmethod
     def fma_f32_neg_src0(src0, src1, src2):
         sched_barrier(0)
-        return _banked_op(
-            llvm_dialect.intr_fma(llvm_dialect.fneg(src0), src1, src2)
-        )
+        return llvm_dialect.intr_fma(llvm_dialect.fneg(src0), src1, src2)
 
     @staticmethod
     def mov_b32(src):
         sched_barrier(0)
-        return _banked_op(src)
+        return src
 
     @staticmethod
     def add_f32(src0, src1):
         sched_barrier(0)
-        return _banked_op(src0 + src1)
+        return src0 + src1
 
     @staticmethod
     def max3_num_f32(src0, src1, src2):
         sched_barrier(0)
-        return _banked_op(rocdl_fmax3(src0, src1, src2))
+        return rocdl_fmax3(src0, src1, src2)
 
     @staticmethod
     def permlanex16(src, s_sel0, s_sel1):
         sched_barrier(0)
         src_i32 = llvm_dialect.bitcast(T.i32, src)
-        r_f32 = llvm_dialect.bitcast(
+        return llvm_dialect.bitcast(
             T.f32,
             rocdl_permlanex16(T.i32, src_i32, src_i32, s_sel0, s_sel1, False, False),
         )
-        return _banked_op(r_f32)
 
     @staticmethod
     def pk_fma_f32_neg_c(a, b, c):
         sched_barrier(0)
-        return _banked_op(llvm_dialect.intr_fma(a, b, llvm_dialect.fneg(c)))
+        return llvm_dialect.intr_fma(a, b, llvm_dialect.fneg(c))
 
     @staticmethod
     def pk_add_f32(a, b):
         sched_barrier(0)
-        return _banked_op(a + b)
+        return a + b
 
     @staticmethod
     def cvt_pk_bf16_f32(a):
         sched_barrier(0)
-        return _banked_op(arith.truncf(T.vec(2, T.bf16), a))
+        return arith.truncf(T.vec(2, T.bf16), a)
 
     @staticmethod
     def s_wait_dscnt(cnt):
