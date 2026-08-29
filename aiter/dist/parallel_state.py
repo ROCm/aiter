@@ -1840,7 +1840,6 @@ def initialize_model_parallel(
     data_parallel_size: int = 1,
     prefill_context_model_parallel_size: int = 1,
     custom_group_config: dict[str, list] | None = None,
-    reuse_identical_rank_groups: bool = False,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -1851,12 +1850,6 @@ def initialize_model_parallel(
         pipeline_model_parallel_size: number of GPUs used for pipeline model
             parallelism.
         backend: name of torch distributed communication backend.
-        reuse_identical_rank_groups: when True, a later group whose rank set matches
-            an already-built group shares that group's process groups and
-            communicators instead of allocating a second set. Groups stay
-            distinct objects with correct unique_names (EP keeps an "ep"-named
-            device_communicator so all2all still initializes). The first builder
-            of a rank set owns it. Must be identical on every rank (asserted).
         custom_group_config: optional dict mapping group names to rank lists.
             Each value can be:
             - 1D List[int]: all ranks form a single group,
@@ -1915,6 +1908,14 @@ def initialize_model_parallel(
     # (standard ops assert via _assert_no_custom_group). Skip expensive
     # CudaCommunicator allocation for standard TP/PP/DP/EP groups.
     need_std_comm = custom_group_config is None
+
+    # Reuse is gated solely by AITER_REUSE_IDENTICAL_COMM_GROUPS (default off;
+    # set to "1" to enable). When on, a later group whose rank set matches an
+    # already-built one shares its communicators (reuse_from) instead of
+    # allocating duplicates.
+    reuse_identical_rank_groups = (
+        os.environ.get("AITER_REUSE_IDENTICAL_COMM_GROUPS", "0") == "1"
+    )
 
     # reuse_identical_rank_groups is a collective decision: a per-rank mismatch would
     # deadlock on new_group(). Assert unanimity to turn a silent hang into an error.
@@ -2082,7 +2083,6 @@ def ensure_model_parallel_initialized(
     data_parallel_size: int = 1,
     prefill_context_model_parallel_size: int = 1,
     custom_group_config: dict[str, list] | None = None,
-    reuse_identical_rank_groups: bool = False,
 ) -> None:
     """Helper to initialize model parallel groups if they are not initialized,
     or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
@@ -2098,7 +2098,6 @@ def ensure_model_parallel_initialized(
             data_parallel_size,
             prefill_context_model_parallel_size=prefill_context_model_parallel_size,
             custom_group_config=custom_group_config,
-            reuse_identical_rank_groups=reuse_identical_rank_groups,
         )
         return
 
