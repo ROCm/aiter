@@ -7,7 +7,6 @@ import triton.language as tl
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
-from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 _gemm_a16wfp4_repr = make_kernel_repr(
     "_gemm_a16wfp4_kernel",
@@ -411,15 +410,3 @@ def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
         )
 
     return SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT
-
-
-def _get_config(
-    M: int,
-    N: int,
-    K: int,
-    shuffle: bool = False,
-):
-    shuffle_suffix = "_PRESHUFFLED" if shuffle else ""
-    config_name = f"GEMM-A16WFP4{shuffle_suffix}"
-    # Note: Config files use K=2*K in their naming
-    return get_gemm_config(config_name, M, N, 2 * K)

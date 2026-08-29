@@ -6,10 +6,6 @@ import triton.language as tl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
-from aiter.ops.triton.utils.gemm_config_utils import (
-    compute_splitk_params,
-    get_gemm_config,
-)
 
 _gemm_a8w8_repr = make_kernel_repr(
     "_gemm_a8w8_kernel",
@@ -188,12 +184,3 @@ def _gemm_a8w8_kernel(
         )
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         tl.store(c_ptrs, c, mask=c_mask)
-
-
-def _get_config(
-    M: int,
-    N: int,
-    K: int,
-):
-    config, is_tunned = get_gemm_config("GEMM-A8W8", M, N, K)
-    return compute_splitk_params(config, K), is_tunned

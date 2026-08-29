@@ -7,7 +7,6 @@ import triton.language as tl
 from aiter.ops.triton._triton_kernels.quant.fused_fp8_quant import _fp8_quant_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
-from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 _gemm_a16w8_blockscale_repr = make_kernel_repr(
     "_gemm_a16w8_blockscale_kernel",
@@ -418,10 +417,3 @@ def _gemm_a16w8_blockscale_preshuffle_kernel(
         )
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         tl.store(c_ptrs, c, mask=c_mask)
-
-
-def _get_config(M: int, N: int, K: int, shuffle: bool = False):
-    shuffle_suffix = "_PRESHUFFLED" if shuffle else ""
-    config_name = f"GEMM-A16W8_BLOCKSCALE{shuffle_suffix}"
-
-    return get_gemm_config(config_name, M, N, K)

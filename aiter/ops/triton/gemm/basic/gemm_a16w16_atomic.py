@@ -7,13 +7,23 @@ import triton
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16_atomic import (
     _gemm_a16_w16_atomic_kernel,
-    _get_config,
 )
 from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
-from aiter.ops.triton.utils.gemm_config_utils import add_default_gemm_config_params
+from aiter.ops.triton.utils.gemm_config_utils import (
+    add_default_gemm_config_params,
+    get_gemm_config,
+)
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+
+def _get_config(
+    M: int,
+    N: int,
+    K: int,
+):
+    return get_gemm_config("GEMM-A16W16-ATOMIC", M, N, K)
 
 
 def gemm_a16w16_atomic_fake_tensor(

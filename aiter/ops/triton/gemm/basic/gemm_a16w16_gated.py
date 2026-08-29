@@ -7,11 +7,22 @@ import triton
 from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16_gated import (
     _gemm_a16_w16_gated_kernel,
-    _get_config,
 )
+from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+
+def _get_config(
+    M: int,
+    N: int,
+    K: int,
+):
+
+    return get_gemm_config(
+        "GEMM-A16W16-gated", M, N, K, bounds=(64, 128, 256, 512, 2048)
+    )
 
 
 def gemm_a16w16_gated(
