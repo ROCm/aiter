@@ -326,11 +326,11 @@ def _build_kernel(
 
         def wave_reduce_add(x):
             """Butterfly sum across wave64."""
-            w = _to_raw(x)
+            w = fx.Float32(x)
             for sh_exp in range_constexpr(log2_block):
                 off = BLOCK_THREADS // (2 << sh_exp)
-                peer = _to_raw(ArithValue(w).shuffle_xor(off, BLOCK_THREADS))
-                w = arith.AddFOp(w, peer, fastmath=fm_fast).result
+                peer = w.shuffle_xor(off, BLOCK_THREADS)
+                w = w + peer
             return w
 
         def wave_reduce_max(x):
@@ -415,9 +415,9 @@ def _build_kernel(
 
                     m_new = arith.maximumf(m_old, score)
                     is_first = arith.cmpf(CmpFPredicate.OEQ, m_old, c_neg_inf)
-                    scale_active = fexp_f32(arith.subf(m_old, m_new))
+                    scale_active = fexp_f32(_to_raw(fx.Float32(m_old) - m_new))
                     scale_v = arith.select(is_first, c_zero_f32, scale_active)
-                    wk_active = fexp_f32(arith.subf(score, m_new))
+                    wk_active = fexp_f32(_to_raw(fx.Float32(score) - m_new))
                     if const_expr(score_can_be_neg_inf):
                         is_pad_score = arith.cmpf(CmpFPredicate.OEQ, score, c_neg_inf)
                         w_k = arith.select(is_pad_score, c_zero_f32, wk_active)
@@ -425,18 +425,15 @@ def _build_kernel(
                         w_k = wk_active
                     new_m.append(m_new)
                     new_kv.append(
-                        arith.AddFOp(
-                            arith.MulFOp(kv_old, scale_v, fastmath=fm_fast).result,
-                            arith.MulFOp(w_k, kv_v, fastmath=fm_fast).result,
-                            fastmath=fm_fast,
-                        ).result
+                        _to_raw(
+                            fx.Float32(kv_old) * fx.Float32(scale_v)
+                            + fx.Float32(w_k) * fx.Float32(kv_v)
+                        )
                     )
                     new_w.append(
-                        arith.AddFOp(
-                            arith.MulFOp(w_old, scale_v, fastmath=fm_fast).result,
-                            w_k,
-                            fastmath=fm_fast,
-                        ).result
+                        _to_raw(
+                            fx.Float32(w_old) * fx.Float32(scale_v) + fx.Float32(w_k)
+                        )
                     )
                 return new_m, new_kv, new_w
 
@@ -655,9 +652,7 @@ def _build_kernel(
                     k_i32 = arith.index_cast(i32, _to_raw(k_static))
                     kv_a_lane, score_a_lane, ape_v_lane = _phase2_issue_loads(k_i32)
                     score_k_lane = [
-                        arith.AddFOp(
-                            score_a_lane[i], ape_v_lane[i], fastmath=fm_fast
-                        ).result
+                        _to_raw(fx.Float32(score_a_lane[i]) + fx.Float32(ape_v_lane[i]))
                         for i in range(VEC)
                     ]
                     new_m, new_kv, new_w = _online_softmax_update(
@@ -716,7 +711,7 @@ def _build_kernel(
                     nxt_kv, nxt_sc, nxt_ape = _phase2_issue_loads(k_next)
 
                     score_k_lane = [
-                        arith.AddFOp(pre_sc[i], pre_ape[i], fastmath=fm_fast).result
+                        _to_raw(fx.Float32(pre_sc[i]) + fx.Float32(pre_ape[i]))
                         for i in range(VEC)
                     ]
                     new_m, new_kv, new_w = _online_softmax_update(
@@ -749,7 +744,7 @@ def _build_kernel(
                 pre_sc_t = list(loop_final[4 * VEC : 5 * VEC])
                 pre_ape_t = list(loop_final[5 * VEC : 6 * VEC])
                 score_k_lane_t = [
-                    arith.AddFOp(pre_sc_t[i], pre_ape_t[i], fastmath=fm_fast).result
+                    _to_raw(fx.Float32(pre_sc_t[i]) + fx.Float32(pre_ape_t[i]))
                     for i in range(VEC)
                 ]
                 _, new_kv_t, new_w_t = _online_softmax_update(
@@ -775,23 +770,16 @@ def _build_kernel(
             comp_lane = []
             for i in range_constexpr(VEC):
                 rcp_w = fx.rocdl.rcp(f32, w_final[i])
-                comp_lane.append(
-                    arith.MulFOp(kv_final[i], rcp_w, fastmath=fm_fast).result
-                )
+                comp_lane.append(_to_raw(fx.Float32(kv_final[i]) * fx.Float32(rcp_w)))
 
             # ---- Step 9: RMSNorm (fp32) -- sum-of-squares across wave ----
-            sq_local = arith.constant(0.0, type=f32)
+            sq_local = fx.Float32(0.0)
             for i in range_constexpr(VEC):
-                sq_local = arith.AddFOp(
-                    sq_local,
-                    arith.MulFOp(comp_lane[i], comp_lane[i], fastmath=fm_fast).result,
-                    fastmath=fm_fast,
-                ).result
+                cl = fx.Float32(comp_lane[i])
+                sq_local = sq_local + cl * cl
             sq_full = wave_reduce_add(sq_local)
-            var = arith.MulFOp(sq_full, c_inv_D, fastmath=fm_fast).result
-            rrms = fmath.rsqrt(
-                arith.AddFOp(var, c_eps, fastmath=fm_fast).result, fastmath=fm_fast
-            )
+            var = sq_full * fx.Float32(c_inv_D)
+            rrms = fmath.rsqrt((var + fx.Float32(c_eps)).ir_value(), fastmath=fm_fast)
 
             # rms_weight: per-channel; this thread loads VEC values at tid*VEC.
             # Production atom passes bf16 (the param is cast at model load);
@@ -803,11 +791,11 @@ def _build_kernel(
                 rmsw_lane = _load_f32_vec(rmsw_rsrc, tid_x_vec)
 
             normed_lane = [
-                arith.MulFOp(
-                    arith.MulFOp(comp_lane[i], rrms, fastmath=fm_fast).result,
-                    rmsw_lane[i],
-                    fastmath=fm_fast,
-                ).result
+                _to_raw(
+                    fx.Float32(comp_lane[i])
+                    * fx.Float32(rrms)
+                    * fx.Float32(rmsw_lane[i])
+                )
                 for i in range(VEC)
             ]
 
@@ -1070,9 +1058,7 @@ def _build_kernel(
                     c_zero = arith.constant(0.0, type=f32)
                     fp8_inputs = []
                     for i in range_constexpr(VEC):
-                        v = arith.MulFOp(
-                            out_lane[i], inv_scale, fastmath=fm_fast
-                        ).result
+                        v = _to_raw(fx.Float32(out_lane[i]) * fx.Float32(inv_scale))
                         # clamp to [-FP8_MAX, +FP8_MAX]
                         v = arith.minimumf(arith.maximumf(v, c_neg_fp8_max), c_fp8_max)
                         # NaN guard
@@ -1743,25 +1729,23 @@ def _build_kernel_ksplit(
                     score = score_lane[i]
                     m_new = arith.maximumf(m_old, score)
                     is_first = arith.cmpf(CmpFPredicate.OEQ, m_old, c_neg_inf)
-                    scale_active = fexp_f32(arith.subf(m_old, m_new))
+                    scale_active = fexp_f32(_to_raw(fx.Float32(m_old) - m_new))
                     scale_v = arith.select(is_first, c_zero_f32, scale_active)
-                    wk_active = fexp_f32(arith.subf(score, m_new))
+                    wk_active = fexp_f32(_to_raw(fx.Float32(score) - m_new))
                     is_pad = arith.cmpf(CmpFPredicate.OEQ, score, c_neg_inf)
                     w_k = arith.select(is_pad, c_zero_f32, wk_active)
                     new_m.append(m_new)
                     new_kv.append(
-                        arith.AddFOp(
-                            arith.MulFOp(kv_lane[i], scale_v, fastmath=fm_fast).result,
-                            arith.MulFOp(w_k, kv_v_lane[i], fastmath=fm_fast).result,
-                            fastmath=fm_fast,
-                        ).result
+                        _to_raw(
+                            fx.Float32(kv_lane[i]) * fx.Float32(scale_v)
+                            + fx.Float32(w_k) * fx.Float32(kv_v_lane[i])
+                        )
                     )
                     new_w.append(
-                        arith.AddFOp(
-                            arith.MulFOp(w_lane[i], scale_v, fastmath=fm_fast).result,
-                            w_k,
-                            fastmath=fm_fast,
-                        ).result
+                        _to_raw(
+                            fx.Float32(w_lane[i]) * fx.Float32(scale_v)
+                            + fx.Float32(w_k)
+                        )
                     )
                 return new_m, new_kv, new_w
 
@@ -1807,7 +1791,7 @@ def _build_kernel_ksplit(
                 sc = _load_bf16_vec_then_f32(score_in_rsrc, base_sc)
                 ape_v = _load_f32_vec(ape_rsrc, base_ape)
                 score = [
-                    arith.AddFOp(sc[i], ape_v[i], fastmath=fm_fast).result
+                    _to_raw(fx.Float32(sc[i]) + fx.Float32(ape_v[i]))
                     for i in range(VEC)
                 ]
                 return kv, score
@@ -1892,26 +1876,21 @@ def _build_kernel_ksplit(
 
                 # ---- RMSNorm (wave-reduce sum-of-squares over wave 0) ----
                 def wave_reduce_add(x):
-                    w = _to_raw(x)
+                    w = fx.Float32(x)
                     for sh_exp in range_constexpr(log2_block):
                         off = BLOCK_THREADS // (2 << sh_exp)
-                        peer = _to_raw(ArithValue(w).shuffle_xor(off, BLOCK_THREADS))
-                        w = arith.AddFOp(w, peer, fastmath=fm_fast).result
+                        peer = w.shuffle_xor(off, BLOCK_THREADS)
+                        w = w + peer
                     return w
 
-                sq_local = arith.constant(0.0, type=f32)
+                sq_local = fx.Float32(0.0)
                 for i in range_constexpr(VEC):
-                    sq_local = arith.AddFOp(
-                        sq_local,
-                        arith.MulFOp(
-                            comp_lane[i], comp_lane[i], fastmath=fm_fast
-                        ).result,
-                        fastmath=fm_fast,
-                    ).result
+                    cl = fx.Float32(comp_lane[i])
+                    sq_local = sq_local + cl * cl
                 sq_full = wave_reduce_add(sq_local)
-                var = arith.MulFOp(sq_full, c_inv_D, fastmath=fm_fast).result
+                var = sq_full * fx.Float32(c_inv_D)
                 rrms = fmath.rsqrt(
-                    arith.AddFOp(var, c_eps, fastmath=fm_fast).result, fastmath=fm_fast
+                    (var + fx.Float32(c_eps)).ir_value(), fastmath=fm_fast
                 )
 
                 rmsw_rsrc = buffer_ops.create_buffer_resource(rms_weight, max_size=True)
@@ -1921,11 +1900,11 @@ def _build_kernel_ksplit(
                     rmsw_lane = _load_f32_vec(rmsw_rsrc, lid_x_vec)
 
                 normed_lane = [
-                    arith.MulFOp(
-                        arith.MulFOp(comp_lane[i], rrms, fastmath=fm_fast).result,
-                        rmsw_lane[i],
-                        fastmath=fm_fast,
-                    ).result
+                    _to_raw(
+                        fx.Float32(comp_lane[i])
+                        * fx.Float32(rrms)
+                        * fx.Float32(rmsw_lane[i])
+                    )
                     for i in range(VEC)
                 ]
 
@@ -2140,9 +2119,7 @@ def _build_kernel_ksplit(
                     c_zero = arith.constant(0.0, type=f32)
                     fp8_inputs = []
                     for i in range_constexpr(VEC):
-                        v = arith.MulFOp(
-                            out_lane[i], inv_scale, fastmath=fm_fast
-                        ).result
+                        v = _to_raw(fx.Float32(out_lane[i]) * fx.Float32(inv_scale))
                         v = arith.minimumf(arith.maximumf(v, c_neg_fp8_max), c_fp8_max)
                         is_tn = arith.andi(
                             arith.cmpf(CmpFPredicate.OLT, v, c_zero),

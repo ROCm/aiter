@@ -301,8 +301,8 @@ def build_flash_attn_func_module_primary(
 
         def k_buf_base(buf_id):
             if const_expr(isinstance(buf_id, int)):
-                return fx.Index(buf_id * LDS_K_TILE_SIZE)
-            return buf_id * fx.Index(LDS_K_TILE_SIZE)
+                return fx.Int64(buf_id * LDS_K_TILE_SIZE)
+            return buf_id * fx.Int64(LDS_K_TILE_SIZE)
 
         def v_buf_base(buf_id):
             return fx.Index(LDS_V_BASE + buf_id * LDS_V_TILE_SIZE)
@@ -313,7 +313,7 @@ def build_flash_attn_func_module_primary(
                 row_offset = batch * ROWS_PER_BATCH_LOAD
                 row_idx = tile_start + load_row_in_batch + row_offset
                 if const_expr(KV_NEEDS_GUARD):
-                    row_valid = load_row_in_batch < fx.Index(BLOCK_N)
+                    row_valid = load_row_in_batch < fx.Int64(BLOCK_N)
                     if row_valid:
                         g_idx = global_idx(row_idx, load_col_base)
                         lds_row = load_row_in_batch + row_offset
@@ -345,7 +345,7 @@ def build_flash_attn_func_module_primary(
             for batch in range_constexpr(NUM_BATCHES_KV):
                 row_offset = batch * ROWS_PER_BATCH_LOAD
                 if const_expr(KV_NEEDS_GUARD):
-                    row_valid = load_row_in_batch < fx.Index(BLOCK_N)
+                    row_valid = load_row_in_batch < fx.Int64(BLOCK_N)
                     if row_valid:
                         lds_row = load_row_in_batch + row_offset
                         _v_store_row_major(v_base, lds_row, vecs[batch])
@@ -361,7 +361,7 @@ def build_flash_attn_func_module_primary(
         # to `v_cmp_gt_u64_e64` and cause an ISA hash drift even though both
         # variants are semantically equivalent for non-negative offsets.
         q_in_bounds = arith.cmpi(arith.CmpIPredicate.slt, _raw(q_row), _raw(seq_len_v))
-        q_row_safe = fx.Index(q_in_bounds.select(q_row, fx.Index(0)))
+        q_row_safe = fx.Int64(q_in_bounds.select(q_row, fx.Index(0)))
         c_zero_v8f16 = Vec.filled(8, 0.0, elem_dtype).ir_value()
         q_b_packs = []
         for ks in range_constexpr(K_STEPS_QK):
@@ -384,12 +384,12 @@ def build_flash_attn_func_module_primary(
 
         _q_end = q_start + BLOCK_M
         if const_expr(CAUSAL):
-            kv_upper = fx.Index((_q_end < seq_len_v).select(_q_end, seq_len_v))
+            kv_upper = fx.Int64((_q_end < seq_len_v).select(_q_end, seq_len_v))
         else:
             kv_upper = seq_len_v
 
         # ---- Opt4: Pre-issue first V global load before loop ----
-        _v_vecs_init = coop_load_v_global(fx.Index(0))
+        _v_vecs_init = coop_load_v_global(fx.Int64(0))
 
         init_args = [_raw(c_neg_inf), _raw(c_zero_f)]
         for _ in range_constexpr(D_CHUNKS):
@@ -418,18 +418,18 @@ def build_flash_attn_func_module_primary(
             s_accs = [_raw(c_zero_v8f32) for _ in range(NUM_S_ACCS)]
 
             for ks in range_constexpr(K_STEPS_QK):
-                k_col = fx.Index(ks * K_STEP_QK) + klane * WMMA_LANE_K
+                k_col = fx.Int64(ks * K_STEP_QK) + klane * WMMA_LANE_K
 
                 for st_idx in range_constexpr(N_SUB_TILES):
                     st_base_row = st_idx * K_SUB_N
 
-                    k_row_a = lane16 + fx.Index(st_base_row)
+                    k_row_a = lane16 + fx.Int64(st_base_row)
                     k_lds_a = k_base + k_row_a * K_STRIDE + k_col
                     k_pack_a = fx.ptr_load(
                         lds_kv + fx.Int32(k_lds_a), result_type=v8f16_type
                     )
 
-                    k_row_b = lane16 + fx.Index(st_base_row + 16)
+                    k_row_b = lane16 + fx.Int64(st_base_row + 16)
                     k_lds_b = k_base + k_row_b * K_STRIDE + k_col
                     k_pack_b = fx.ptr_load(
                         lds_kv + fx.Int32(k_lds_b), result_type=v8f16_type
@@ -595,11 +595,11 @@ def build_flash_attn_func_module_primary(
             v_base = v_buf_base(0)
 
             def _load_v_rowmajor(st_kv_base_val, pks_val, dc_val, v_base=v_base):
-                d_pos = fx.Index(dc_val * D_CHUNK) + lane16
+                d_pos = fx.Int64(dc_val * D_CHUNK) + lane16
                 v_elems = []
                 for k_sub in range_constexpr(8):
                     kv_row = (
-                        fx.Index(st_kv_base_val + pks_val * PV_K_STEP)
+                        fx.Int64(st_kv_base_val + pks_val * PV_K_STEP)
                         + klane * WMMA_LANE_K
                         + fx.Index(k_sub)
                     )
