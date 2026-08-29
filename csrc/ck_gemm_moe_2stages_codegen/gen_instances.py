@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+import glob
 import os
+import shutil
 import argparse
 import itertools
 from gemm_moe_ck2stages_common import get_gemm1_kernels_list, get_gemm2_kernels_list
@@ -1014,6 +1016,26 @@ class ck_moe_2stage_gemm_codegen:
             f_h.write(gemm2_heuristic_dispatch_str)
 
 
+
+
+def _copy_headers_to_instances(src_dir: str, dst_dir: str) -> None:
+    """Copy .cuh and .h headers into the instances directory.
+
+    ``gen_instances.py`` writes kernel ``.cu`` files into
+    ``<working_path>/instances/`` using bare ``#include "header.cuh"``
+    directives.  The ninja build compiles these from the *build*
+    directory (not ``instances/``), so bare includes only resolve if
+    the headers are co-located with the ``.cu`` files.
+    """
+    os.makedirs(dst_dir, exist_ok=True)
+    for hdr in (
+        glob.glob(os.path.join(src_dir, "*.cuh"))
+        + glob.glob(os.path.join(src_dir, "*.h"))
+    ):
+        dst = os.path.join(dst_dir, os.path.basename(hdr))
+        if not os.path.exists(dst):
+            shutil.copy(hdr, dst)
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate ck 2stage gemm instance.")
 
@@ -1220,3 +1242,8 @@ if __name__ == "__main__":
             codegen.generate_instance_and_lookUpTable()
 
     generate_instance_and_lookUpTable_end(args.working_path)
+    # Copy .cuh/.h headers alongside generated instances so bare #include works.
+    _src = os.path.dirname(os.path.abspath(__file__))
+    _instances = os.path.join(args.working_path, "instances")
+    _copy_headers_to_instances(_src, _instances)
+    _copy_headers_to_instances(_src, args.working_path)
