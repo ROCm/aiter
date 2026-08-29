@@ -22,7 +22,7 @@ from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
-    _ptr_buf_tensor,
+    ptr_buf_tensor,
 )
 
 MAX_EXPERTS_PER_BLOCK = 512
@@ -106,10 +106,10 @@ def build_moe_contiguous_psum_module():
         lds1 = lds.lds1.ptr
         carry = lds.carry.ptr
 
-        m_p = _ptr_buf_tensor(masked_m)
-        s_p = _ptr_buf_tensor(starts)
-        p_p = _ptr_buf_tensor(psum)
-        c_p = _ptr_buf_tensor(contiguous_m)
+        m_p = ptr_buf_tensor(masked_m)
+        s_p = ptr_buf_tensor(starts)
+        p_p = ptr_buf_tensor(psum)
+        c_p = ptr_buf_tensor(contiguous_m)
 
         is_lane0 = tid == fx.Uint32(0)
         if is_lane0:
@@ -231,11 +231,11 @@ def build_moe_contiguous_psum_remap_module():
         lds1 = lds.lds1.ptr
         carry = lds.carry.ptr
 
-        m_p = _ptr_buf_tensor(masked_m)
-        rows_p = _ptr_buf_tensor(topids_to_rows)
-        s_p = _ptr_buf_tensor(starts)
-        p_p = _ptr_buf_tensor(psum)
-        c_p = _ptr_buf_tensor(contiguous_m)
+        m_p = ptr_buf_tensor(masked_m)
+        rows_p = ptr_buf_tensor(topids_to_rows)
+        s_p = ptr_buf_tensor(starts)
+        p_p = ptr_buf_tensor(psum)
+        c_p = ptr_buf_tensor(contiguous_m)
 
         is_lane0 = tid == fx.Uint32(0)
         if is_lane0:
@@ -299,7 +299,7 @@ def build_moe_contiguous_psum_remap_module():
         valid_route_count = fx.Uint32(numel)
         if num_valid_routes_is_set:
             valid_route_count = fx.Uint32(
-                _ptr_buf_tensor(num_valid_routes)[fx.Uint32(0)]
+                ptr_buf_tensor(num_valid_routes)[fx.Uint32(0)]
             )
         for route_i32 in range(tid, valid_route_count, MAX_EXPERTS_PER_BLOCK):
             row_raw = rows_p[route_i32]
@@ -398,14 +398,14 @@ def build_moe_contiguous_psum_remap_ep_module():
         lds0 = lds.lds0.ptr
         lds1 = lds.lds1.ptr
 
-        m_p = _ptr_buf_tensor(masked_m)
-        rows_p = _ptr_buf_tensor(topids_to_rows)
-        s_p = _ptr_buf_tensor(starts)
-        p_p = _ptr_buf_tensor(psum)
-        c_p = _ptr_buf_tensor(contiguous_m)
-        w_p = _ptr_buf_tensor(gather_w, fx.BFloat16)
-        tis_p = _ptr_buf_tensor(tis)
-        ep_p = _ptr_buf_tensor(ep_rowmap)
+        m_p = ptr_buf_tensor(masked_m)
+        rows_p = ptr_buf_tensor(topids_to_rows)
+        s_p = ptr_buf_tensor(starts)
+        p_p = ptr_buf_tensor(psum)
+        c_p = ptr_buf_tensor(contiguous_m)
+        w_p = ptr_buf_tensor(gather_w, fx.BFloat16)
+        tis_p = ptr_buf_tensor(tis)
+        ep_p = ptr_buf_tensor(ep_rowmap)
 
         # Lanes past ``experts`` stay out of the scan entirely: they never write
         # lds0, and an in-range lane only ever reads indices below its own, so
@@ -459,7 +459,7 @@ def build_moe_contiguous_psum_remap_ep_module():
 
         # ep_rowmap is pre-filled with the (-1, 0) sentinel by a host-side memset
         # ordered before this launch, so the scatter below only writes kept rows.
-        nvr = fx.Uint32(_ptr_buf_tensor(num_valid_routes)[fx.Uint32(0)])
+        nvr = fx.Uint32(ptr_buf_tensor(num_valid_routes)[fx.Uint32(0)])
         topk_v = fx.Uint32(topk)
         max_tok_v = fx.Uint32(max_tok)
         # Fused remap + ep_rowmap scatter over valid routes ([0, nvr)).
@@ -579,11 +579,11 @@ def build_moe_route_psum_fused_module():
         lds0 = lds.lds0.ptr
         lds1 = lds.lds1.ptr
 
-        topk_p = _ptr_buf_tensor(topk_ids)
-        rows_p = _ptr_buf_tensor(topids_to_rows)
-        m_p = _ptr_buf_tensor(masked_m)
-        s_p = _ptr_buf_tensor(starts)
-        p_p = _ptr_buf_tensor(psum)
+        topk_p = ptr_buf_tensor(topk_ids)
+        rows_p = ptr_buf_tensor(topids_to_rows)
+        m_p = ptr_buf_tensor(masked_m)
+        s_p = ptr_buf_tensor(starts)
+        p_p = ptr_buf_tensor(psum)
 
         in_expert = tid < fx.Uint32(experts)
 

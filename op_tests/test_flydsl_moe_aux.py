@@ -31,18 +31,25 @@ import torch
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.grouped_moe_gfx1250 import _grouped_a8w4_preshuffle_e8m0_scale
 from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
     build_moe_contiguous_psum_module,
     build_moe_contiguous_psum_remap_ep_module,
     build_moe_contiguous_psum_remap_module,
+    build_moe_route_psum_fused_module,
 )
 from aiter.ops.flydsl.kernels.moe_g2l_lut import build_moe_g2l_lut_module
 from aiter.ops.flydsl.kernels.moe_gather_reduce import build_moe_gather_reduce_module
 from aiter.ops.flydsl.kernels.moe_route_maps import (
     DROPPED_ROUTE_ROW,
+    build_moe_route_g2l_fused_module,
     build_moe_route_g2l_lds_module,
+    build_moe_route_maps_module,
     build_moe_topids_to_rows_g2l_module,
     build_moe_topids_to_rows_module,
+)
+from aiter.ops.flydsl.kernels.moe_scatter_copy_preshuffle_scale import (
+    build_moe_scatter_copy_preshuffle_scale_module,
 )
 from aiter.ops.flydsl.kernels.moe_scatter_copy_token import (
     build_moe_scatter_copy_token_module,
@@ -692,6 +699,291 @@ def test_topids_to_rows(numel, E, max_m):
     return ret
 
 
+@benchmark()
+def test_route_maps(numel, E, topk, max_m):
+    """Atomic-scatter argsort plus the inverse ``rows_to_tokens`` map.
+
+    Same row invariants as test_topids_to_rows (intra-bucket order is
+    unspecified), with the extra check that the inverse map inverts: every row
+    the kernel claimed for route r must name r's token.
+    """
+    launch = build_moe_route_maps_module()
+    topk_ids = torch.randint(0, E, (numel,), dtype=I32)
+    counts = torch.bincount(topk_ids.long(), minlength=E).to(I32)
+    assert max_m > int(counts.max()), (
+        f"max_m={max_m} too small for numel={numel}, E={E} "
+        f"(largest bucket {int(counts.max())})"
+    )
+    atomic = torch.zeros(E, dtype=I32)
+    rows = torch.full((numel,), -99, dtype=I32)
+    r2t = torch.full((E * max_m,), -99, dtype=I32)
+    blocks = (numel + 255) // 256
+
+    def fn():
+        # The counter must be re-zeroed per call, not just per timing pass: this
+        # kernel writes rows_to_tokens *indexed by the claimed row*, so a counter
+        # carried over from a previous iteration would push that store past
+        # E*max_m and scribble on whatever follows. Production zeroes it the same
+        # way, so the memset belongs inside the timed region.
+        atomic.zero_()
+        launch(
+            ptr_arg(topk_ids),
+            ptr_arg(atomic),
+            ptr_arg(rows),
+            ptr_arg(r2t),
+            numel,
+            topk,
+            max_m,
+            blocks,
+            stream=torch.cuda.current_stream().cuda_stream,
+        )
+
+    # topk_ids in, rows out, one rows_to_tokens slot out per route
+    nbytes = numel * 3 * 4
+    ret = {"gfx": get_gfx()}
+    # eager vs graph replay are the two candidates: on the decode path these
+    # kernels run inside a captured MoE layer, so replay is the real call.
+    candidates = {"eager": fn, "cudagraph": _graph_runner(fn)}
+    for name, run in candidates.items():
+        rows.fill_(-99)
+        _, us = run_perftest(run)
+        rows.fill_(-99)
+        r2t.fill_(-99)
+        run()
+        torch.cuda.synchronize()
+        err = checkAllclose(
+            counts.float(), atomic.float(), rtol=0, atol=0, msg=f"{name}: route counts"
+        )
+        r = rows.cpu()
+        ids = topk_ids.cpu().long()
+        assert bool(
+            (r.long() // max_m == ids).all()
+        ), f"{name}: row outside own expert band"
+        assert len(set(r.tolist())) == numel, f"{name}: rows not a bijection"
+        inv = r2t.cpu()[r.long()]
+        tokens = torch.arange(numel) // topk
+        assert bool(
+            (inv == tokens).all()
+        ), f"{name}: rows_to_tokens does not invert topids_to_rows"
+        ret[f"{name} us"] = us
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+@benchmark()
+def test_route_psum_fused(numel, E, tile_m):
+    """Single-workgroup route + LDS atomic + psum + remap, all in one launch.
+
+    Collapses what test_topids_to_rows and test_contiguous_psum cover separately,
+    so the checks are the union: exact masked_m/starts/psum against the torch
+    prefix sum, and the row invariants against the *contiguous* bands it emits.
+    """
+    launch = build_moe_route_psum_fused_module()
+    max_m = max(512, 4 * numel // E)
+    topk_ids = torch.randint(0, E, (numel,), dtype=I32)
+    counts = torch.bincount(topk_ids.long(), minlength=E).to(I32)
+    assert max_m > int(counts.max()), "max_m too small for this shape"
+    ref_starts, ref_psum, _ = run_torch_psum(counts, tile_m)
+
+    rows = torch.full((numel,), -99, dtype=I32)
+    masked = torch.full((E,), -99, dtype=I32)
+    starts = torch.full((E,), -99, dtype=I32)
+    psum = torch.full((E,), -99, dtype=I32)
+
+    def fn():
+        launch(
+            ptr_arg(topk_ids),
+            ptr_arg(rows),
+            ptr_arg(masked),
+            ptr_arg(starts),
+            ptr_arg(psum),
+            numel,
+            E,
+            max_m,
+            tile_m,
+            stream=torch.cuda.current_stream().cuda_stream,
+        )
+
+    nbytes = numel * 2 * 4 + E * 3 * 4
+    ret = {"gfx": get_gfx()}
+    # eager vs graph replay are the two candidates: on the decode path these
+    # kernels run inside a captured MoE layer, so replay is the real call.
+    candidates = {"eager": fn, "cudagraph": _graph_runner(fn)}
+    for name, run in candidates.items():
+        # The LDS counter is zeroed by the kernel itself, so unlike the split
+        # route kernels this one is idempotent and needs no reset between runs.
+        rows.fill_(-99)
+        _, us = run_perftest(run)
+        err = checkAllclose(
+            counts.float(), masked.float(), rtol=0, atol=0, msg=f"{name}: masked_m"
+        )
+        checkAllclose(
+            ref_starts.float(), starts.float(), rtol=0, atol=0, msg=f"{name}: starts"
+        )
+        checkAllclose(
+            ref_psum.float(), psum.float(), rtol=0, atol=0, msg=f"{name}: psum"
+        )
+        r = rows.cpu().long()
+        ids = topk_ids.cpu().long()
+        lo = ref_starts.cpu().long()[ids]
+        assert bool(
+            ((r >= lo) & (r < lo + counts.cpu().long()[ids])).all()
+        ), f"{name}: row outside its expert's contiguous band"
+        assert len(set(r.tolist())) == numel, f"{name}: rows not a bijection"
+        ret[f"{name} us"] = us
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+@benchmark()
+def test_route_g2l_fused(numel, E_global, n_buckets, w_dtype):
+    """Single-block g2l-LUT build fused into the EP route pass.
+
+    The LUT never reaches global memory here, so it is checked indirectly: the
+    bucket a route lands in must match the LUT the standalone moe_g2l_lut kernel
+    would have produced from the same mask.
+    """
+    launch = build_moe_route_g2l_fused_module(w_dtype)
+    wdt = torch.bfloat16 if w_dtype == "bf16" else torch.float16
+    max_m = max(512, 4 * numel // max(1, n_buckets))
+
+    # Exactly n_buckets enabled global experts; the LUT is their rank order.
+    mask = torch.zeros(E_global, dtype=I32)
+    mask[torch.randperm(E_global, device="cpu")[:n_buckets].to(mask.device)] = 1
+    g2l, _, _ = run_torch_g2l_lut(mask, n_buckets, 1, 1)
+    topk_ids = torch.randint(0, E_global, (numel,), dtype=I32)
+    weight_in = torch.rand(numel, dtype=torch.float32)
+    nvr = torch.tensor([numel], dtype=I32)
+
+    le = g2l.cpu()[topk_ids.cpu().long()]
+    is_drop = le == n_buckets
+    ref_w = torch.where(is_drop, torch.zeros_like(weight_in.cpu()), weight_in.cpu())
+    ref_w = ref_w.to(wdt).cuda()
+    ref_cnt = torch.bincount(le[~is_drop].long(), minlength=n_buckets).to(I32).cuda()
+
+    counter = torch.full((n_buckets,), -99, dtype=I32)
+    rows = torch.full((numel,), -99, dtype=I32)
+    gw = torch.full((numel,), 7.0, dtype=wdt)
+
+    def fn():
+        launch(
+            ptr_arg(mask),
+            ptr_arg(topk_ids),
+            ptr_arg(weight_in),
+            ptr_arg(counter),
+            ptr_arg(rows),
+            ptr_arg(gw),
+            ptr_arg(nvr),
+            E_global,
+            numel,
+            max_m,
+            n_buckets,
+            stream=torch.cuda.current_stream().cuda_stream,
+        )
+
+    nbytes = numel * (4 + 4 + 4 + gw.element_size()) + E_global * 4
+    ret = {"gfx": get_gfx()}
+    # eager vs graph replay are the two candidates: on the decode path these
+    # kernels run inside a captured MoE layer, so replay is the real call.
+    candidates = {"eager": fn, "cudagraph": _graph_runner(fn)}
+    for name, run in candidates.items():
+        # The kernel zeroes its own (E,) counter, so repeated runs are idempotent.
+        rows.fill_(-99)
+        gw.fill_(7.0)
+        _, us = run_perftest(run)
+        err = checkAllclose(
+            ref_w.float(), gw.float(), rtol=0, atol=0, msg=f"{name}: fused gather_w"
+        )
+        checkAllclose(
+            ref_cnt.float(),
+            counter.float(),
+            rtol=0,
+            atol=0,
+            msg=f"{name}: fused bucket counts",
+        )
+        r = rows.cpu()
+        assert bool(
+            (r[is_drop] == DROPPED_ROUTE_ROW).all()
+        ), f"{name}: dropped route did not get the sentinel"
+        kept = r[~is_drop].long()
+        assert bool(
+            (kept // max_m == le[~is_drop].long()).all()
+        ), f"{name}: kept route outside its local bucket band"
+        assert len(set(kept.tolist())) == int((~is_drop).sum()), f"{name}: rows collide"
+        ret[f"{name} us"] = us
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+@benchmark()
+def test_preshuffle_scale(E, max_m, row_bytes, wmma_rep, scale_k_per_tile, gather):
+    """e8m0 scale WMMA preshuffle, with (stage1) and without (stage2) route-gather.
+
+    The oracle is the torch permute this kernel replaced
+    (``_grouped_a8w4_preshuffle_e8m0_scale``), applied to a separately built
+    row-major grouped scale -- so the reference shares no index math with the
+    kernel. Padding rows (-1 in rows_to_tokens) must come out as 0.
+    """
+    launch = build_moe_scatter_copy_preshuffle_scale_module(
+        row_bytes, wmma_rep, scale_k_per_tile, gather=gather
+    )
+    rows_per_tile = wmma_rep * 16
+    assert max_m % rows_per_tile == 0
+    tiles_per_expert = max_m // rows_per_tile
+    n_grouped = E * max_m
+
+    if gather:
+        n_src = max(1, n_grouped // 2)
+        # -1 is the padding sentinel: those grouped rows must be zero-filled.
+        r2t = torch.randint(-1, n_src, (n_grouped,), dtype=I32)
+        src = torch.randint(0, 256, (n_src, row_bytes), dtype=torch.uint8)
+        raw = torch.zeros(n_grouped, row_bytes, dtype=torch.uint8)
+        keep = r2t >= 0
+        raw[keep] = src[r2t[keep].long()]
+    else:
+        r2t = None
+        src = torch.randint(0, 256, (n_grouped, row_bytes), dtype=torch.uint8)
+        raw = src
+    ref = _grouped_a8w4_preshuffle_e8m0_scale(
+        raw.view(E, max_m, row_bytes), rows_per_tile, scale_k_per_tile
+    ).reshape(-1)
+
+    dst = torch.full((n_grouped * row_bytes,), 0xEE, dtype=torch.uint8)
+    args = (ptr_arg(src), ptr_arg(dst))
+    if gather:
+        args += (ptr_arg(r2t),)
+
+    def fn():
+        launch(
+            *args,
+            max_m,
+            E,
+            tiles_per_expert,
+            stream=torch.cuda.current_stream().cuda_stream,
+        )
+
+    # source rows read once (gather skips padding), whole output written once
+    n_read = int((r2t >= 0).sum()) if gather else n_grouped
+    nbytes = (n_read + n_grouped) * row_bytes
+    ret = {"gfx": get_gfx(), "gather": gather}
+    # eager vs graph replay are the two candidates: on the decode path these
+    # kernels run inside a captured MoE layer, so replay is the real call.
+    candidates = {"eager": fn, "cudagraph": _graph_runner(fn)}
+    for name, run in candidates.items():
+        dst.fill_(0xEE)
+        _, us = run_perftest(run)
+        err = checkAllclose(
+            ref.float(), dst.float(), rtol=0, atol=0, msg=f"{name}: preshuffle scale"
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
 def summarize(name, rows):
     aiter.logger.info(
         "%s summary (markdown):\n%s", name, pd.DataFrame(rows).to_markdown(index=False)
@@ -806,6 +1098,50 @@ def main():
             for n, E in itertools.product(
                 args.numel, [e for e in args.experts if e <= 64]
             )
+        ],
+    )
+    summarize(
+        "moe_route_maps",
+        [
+            test_route_maps(n, E, tk, max(512, 4 * n // E))
+            for n, E, tk in itertools.product(
+                args.numel, [e for e in args.experts if e <= 64], args.topk
+            )
+            if n % tk == 0
+        ],
+    )
+    # Single-workgroup fused variants: the scan is one block, so E (and E_global
+    # for the g2l fusion) is capped at the 512-thread block size.
+    summarize(
+        "moe_route_psum_fused",
+        [
+            test_route_psum_fused(n, E, tm)
+            for n, E, tm in itertools.product(
+                args.numel, [e for e in args.experts if e <= 512], args.tile_m
+            )
+        ],
+    )
+    summarize(
+        "moe_route_g2l_fused",
+        [
+            test_route_g2l_fused(n, eg, nb, wd)
+            for n, (eg, nb), wd in itertools.product(
+                args.numel,
+                [(64, 8), (256, 40), (512, 300)],
+                args.dtype,
+            )
+        ],
+    )
+    # gather=True is the stage1 fused route-gather; gather=False the stage2 pure
+    # preshuffle. row_bytes = K//32, so 224 is the K=7168 decode shape.
+    summarize(
+        "moe_preshuffle_scale",
+        [
+            test_preshuffle_scale(E, mm, rb, wr, 4, g)
+            for E, mm, rb, wr, g in itertools.product(
+                [2, 8], [32, 256], [16, 224], [1, 2], (True, False)
+            )
+            if mm % (wr * 16) == 0
         ],
     )
 

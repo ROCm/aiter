@@ -62,7 +62,7 @@ from flydsl.expr.typing import Int32
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
-    _ptr_buf_tensor,
+    ptr_buf_tensor,
 )
 
 BLOCK_THREADS = 256
@@ -152,9 +152,9 @@ def build_moe_scatter_copy_preshuffle_scale_module(
 
         # Created unconditionally (no in-body `if`): for gather=False the launcher
         # passes a placeholder for rows_to_tokens and the helper never reads it.
-        map_p = _ptr_buf_tensor(rows_to_tokens)
-        src_p = _ptr_buf_tensor(src)
-        dst_p = _ptr_buf_tensor(dst)
+        map_p = ptr_buf_tensor(rows_to_tokens)
+        src_p = ptr_buf_tensor(src)
+        dst_p = ptr_buf_tensor(dst)
 
         for it in range_constexpr(
             (units_per_tile + BLOCK_THREADS - 1) // BLOCK_THREADS

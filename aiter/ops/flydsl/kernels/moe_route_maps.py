@@ -17,7 +17,7 @@ from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
-    _ptr_buf_tensor,
+    ptr_buf_tensor,
 )
 
 BLOCK_THREADS = 256
@@ -94,9 +94,9 @@ def build_moe_route_maps_module():
         route = fx.Uint32(fx.block_idx.x) * BLOCK_THREADS + fx.Uint32(fx.thread_idx.x)
         in_range = route < fx.Uint32(numel)
         if in_range:
-            topk_p = _ptr_buf_tensor(topk_ids)
-            c_p = _ptr_buf_tensor(topids_to_rows)
-            a_p = _ptr_buf_tensor(rows_to_tokens)
+            topk_p = ptr_buf_tensor(topk_ids)
+            c_p = ptr_buf_tensor(topids_to_rows)
+            a_p = ptr_buf_tensor(rows_to_tokens)
 
             e = topk_p[route]
 
@@ -162,8 +162,8 @@ def build_moe_topids_to_rows_module():
         route = fx.Uint32(fx.block_idx.x) * BLOCK_THREADS + fx.Uint32(fx.thread_idx.x)
         in_range = route < fx.Uint32(numel)
         if in_range:
-            topk_p = _ptr_buf_tensor(topk_ids)
-            out_p = _ptr_buf_tensor(topids_to_rows)
+            topk_p = ptr_buf_tensor(topk_ids)
+            out_p = ptr_buf_tensor(topids_to_rows)
 
             e = topk_p[route]
             ptr = _slot_ptr(fx.Int64(ptrtoint(atomic_buffer)), e)
@@ -247,15 +247,15 @@ def build_moe_topids_to_rows_g2l_module(weight_dtype="bf16"):
         # topids_to_rows/gather_w slots unwritten matches the fused single-block
         # kernel (every downstream consumer is bounded by the same nvr/nvt). When
         # truncation is disabled the caller passes numel here, so nothing is oob.
-        nvr_p = _ptr_buf_tensor(num_valid_routes)
+        nvr_p = ptr_buf_tensor(num_valid_routes)
         nvr = nvr_p[c0]
         in_range = route < fx.Uint32(nvr)
         if in_range:
-            topk_p = _ptr_buf_tensor(topk_ids)
-            g2l_p = _ptr_buf_tensor(g2l_lut)
-            out_p = _ptr_buf_tensor(topids_to_rows)
-            wi_p = _ptr_buf_tensor(weight_in, fx.Float32)
-            w_p = _ptr_buf_tensor(gather_w, w_fx)
+            topk_p = ptr_buf_tensor(topk_ids)
+            g2l_p = ptr_buf_tensor(g2l_lut)
+            out_p = ptr_buf_tensor(topids_to_rows)
+            wi_p = ptr_buf_tensor(weight_in, fx.Float32)
+            w_p = ptr_buf_tensor(gather_w, w_fx)
 
             ge = fx.Uint32(topk_p[route])
             le = fx.Uint32(g2l_p[ge])
@@ -384,13 +384,13 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
         # has already folded the array's offset into this base.
         cnt_base_i64 = fx.Int64(fx.ptrtoint(lds_cnt))
 
-        tk_p = _ptr_buf_tensor(topk_ids)
-        g2l_p = _ptr_buf_tensor(g2l_lut)
-        wi_p = _ptr_buf_tensor(weight_in, fx.Float32)
-        w_p = _ptr_buf_tensor(gather_w, w_fx)
-        out_p = _ptr_buf_tensor(topids_to_rows)
+        tk_p = ptr_buf_tensor(topk_ids)
+        g2l_p = ptr_buf_tensor(g2l_lut)
+        wi_p = ptr_buf_tensor(weight_in, fx.Float32)
+        w_p = ptr_buf_tensor(gather_w, w_fx)
+        out_p = ptr_buf_tensor(topids_to_rows)
 
-        nvr_p = _ptr_buf_tensor(num_valid_routes)
+        nvr_p = ptr_buf_tensor(num_valid_routes)
         nvr = nvr_p[c0]
 
         n_buckets_i32 = fx.Uint32(n_buckets)
@@ -564,8 +564,8 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
         lds1 = lds.lds1.ptr
         lds_lut = lds.lut.ptr
 
-        m_p = _ptr_buf_tensor(expert_mask)
-        ctr_p = _ptr_buf_tensor(counter)
+        m_p = ptr_buf_tensor(expert_mask)
+        ctr_p = ptr_buf_tensor(counter)
 
         # Zero the (E,) route counter (global); barrier below orders it before the
         # phase-B atomics (single block, so no cross-block hazard).
@@ -608,17 +608,17 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
         gpu.barrier()
 
         # Phase B: grid-stride over routes.
-        tk_p = _ptr_buf_tensor(topk_ids)
-        wi_p = _ptr_buf_tensor(weight_in, fx.Float32)
-        out_p = _ptr_buf_tensor(topids_to_rows)
-        w_p = _ptr_buf_tensor(gather_w, w_fx)
+        tk_p = ptr_buf_tensor(topk_ids)
+        wi_p = ptr_buf_tensor(weight_in, fx.Float32)
+        out_p = ptr_buf_tensor(topids_to_rows)
+        w_p = ptr_buf_tensor(gather_w, w_fx)
 
         # Dynamic EP token count: routes >= num_valid_routes belong to dead-tail
         # padding rows of the dispatch buffer (rows >= total_recv) and must not
         # contribute. Load once and fold into the per-route "dropped" predicate so
         # they reuse the existing drop path (gather_w=0, folded to bucket 0). When
         # truncation is disabled the caller passes numel here, so nothing is oob.
-        nvr_p = _ptr_buf_tensor(num_valid_routes)
+        nvr_p = ptr_buf_tensor(num_valid_routes)
         nvr = nvr_p[c0]
 
         # Iterate only the valid routes ([0, nvr)); the dead-tail padding routes

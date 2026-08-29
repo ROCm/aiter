@@ -25,7 +25,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
-    _ptr_buf_tensor,
+    ptr_buf_tensor,
 )
 
 MAX_G2L_EXPERTS = 512
@@ -55,18 +55,18 @@ def build_moe_g2l_lut_module():
         c1 = fx.Int32(1)
         tid = gpu.thread_idx.x
 
-        mask_p = _ptr_buf_tensor(mask)
-        lut_p = _ptr_buf_tensor(lut)
+        mask_p = ptr_buf_tensor(mask)
+        lut_p = ptr_buf_tensor(lut)
 
         # num_valid_routes = num_local_tokens * topk (the EP dead-tail bound),
         # folded in here to drop a standalone torch elementwise launch at decode.
         if tid == c0:
-            _ptr_buf_tensor(nvr_out)[0] = _ptr_buf_tensor(nvt)[0] * topk
+            ptr_buf_tensor(nvr_out)[0] = ptr_buf_tensor(nvt)[0] * topk
 
         # Route counter zero-init folded in: E <= n <= block size, so tid<E
         # clears counter[tid] and the host torch.zeros(E) launch goes away.
         if tid < E:
-            _ptr_buf_tensor(counter)[tid] = c0
+            ptr_buf_tensor(counter)[tid] = c0
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         mr0 = lds.buf0.ptr

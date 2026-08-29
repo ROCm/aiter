@@ -41,8 +41,8 @@ from flydsl.expr.typing import Int32
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
-    _buf_copy_atom,
-    _ptr_buf_tensor,
+    buf_copy_atom,
+    ptr_buf_tensor,
 )
 
 BLOCK_THREADS = 256
@@ -93,18 +93,18 @@ def build_moe_scatter_copy_token_module(row_bytes: int):
         bid_i32 = fx.Uint32(fx.block_idx.x)
 
         if bid_i32 < fx.Uint32(num_dst):
-            srow = _ptr_buf_tensor(dst_src)[bid_i32]
+            srow = ptr_buf_tensor(dst_src)[bid_i32]
             if fx.Int32(srow) >= fx.Int32(0):
                 # A row is a contiguous run of n_units copy units.
                 if const_expr(vec_width > 1):
-                    src_t = _ptr_buf_tensor(src, cdt, unit_elems=vec_width)
-                    dst_t = _ptr_buf_tensor(dst, cdt, unit_elems=vec_width)
-                    atom = _buf_copy_atom(unit_bytes, cdt)
+                    src_t = ptr_buf_tensor(src, cdt, unit_elems=vec_width)
+                    dst_t = ptr_buf_tensor(dst, cdt, unit_elems=vec_width)
+                    atom = buf_copy_atom(unit_bytes, cdt)
                     # Hoisted: a per-iteration fragment costs more than the copy.
                     frag = fx.make_fragment_like(fx.slice(src_t, (0, None)))
                 else:
-                    src_t = _ptr_buf_tensor(src, cdt)
-                    dst_t = _ptr_buf_tensor(dst, cdt)
+                    src_t = ptr_buf_tensor(src, cdt)
+                    dst_t = ptr_buf_tensor(dst, cdt)
                 src_unit_base = fx.Uint32(srow) * n_units
                 dst_unit_base = bid_i32 * n_units
 

@@ -48,15 +48,21 @@ _BUF_COPY_ATOM = {
     1: fx.rocdl.BufferCopy8b,
 }
 
+# Nominal extent of a raw-pointer buffer view. The real bound is the V#
+# num_records field, which make_buffer_tensor(max_size=True) pins to 0xFFFFFFFF
+# bytes -- the same descriptor ptr_rsrc builds -- so this only has to be large
+# enough not to constrain any caller's indices.
+BUF_VIEW_MAX_ELEMS = 0xFFFFFFFF
 
-def _ptr_buf_tensor(
-    ptr, elem=fx.Int32, n=0xFFFFFFF, unit_elems=1, num_records_bytes=None
+
+def ptr_buf_tensor(
+    ptr, elem=fx.Int32, n=BUF_VIEW_MAX_ELEMS, unit_elems=1, num_records_bytes=None
 ):
     """Buffer-resource (V#) view of *ptr*, so ``t[i]`` / ``fx.slice`` index it.
 
     Keeps the addressing `buffer_ops` used: descriptor in SGPRs, 32-bit voffset
     per access. Indexing a plain typed pointer instead builds a full 64-bit
-    address in VGPRs each time -- measured ~2.3% on the per-token route loop.
+    address in VGPRs on every access.
 
     ``unit_elems`` sets the access width and hence the rank:
       1  -> flat ``(n,)``; ``t[i]`` is one element. No atom, no fragment.
@@ -83,7 +89,7 @@ def _ptr_buf_tensor(
     return fx.rocdl.make_buffer_tensor(view, num_records_bytes=num_records_bytes)
 
 
-def _buf_copy_atom(unit_bytes, elem=fx.Int32):
+def buf_copy_atom(unit_bytes, elem=fx.Int32):
     """Copy atom for a ``unit_bytes``-wide buffer access."""
     return fx.make_copy_atom(_BUF_COPY_ATOM[unit_bytes](), elem)
 
