@@ -987,20 +987,16 @@ def _build_kernel(
                         lane=tid,
                         is_rope_t=is_rope_t,
                         cache_base=_to_raw(_nm_cache_base),
-                        out_rsrc=buffer_ops.create_buffer_resource(
-                            kv_cache,
-                            max_size=True,
-                            base_byte_offset=block_base_bytes_i64(
+                        out_base_i64=fx.Int64(fx.ptrtoint(fx.get_iter(kv_cache)))
+                        + fx.Int64(
+                            block_base_bytes_i64(
                                 physical_block, kv_cache_block_stride, 1
-                            ),
+                            )
                         ),
                         krope_base=_to_raw(_nm_krope_base),
-                        krope_rsrc=buffer_ops.create_buffer_resource(
-                            k_rope_buff,
-                            max_size=True,
-                            base_byte_offset=block_base_bytes_i64(
-                                physical_block, krope_block_stride, 2
-                            ),
+                        krope_base_i64=fx.Int64(fx.ptrtoint(fx.get_iter(k_rope_buff)))
+                        + fx.Int64(
+                            block_base_bytes_i64(physical_block, krope_block_stride, 2)
                         ),
                         VEC=VEC,
                         NOPE=NOPE,

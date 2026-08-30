@@ -50,8 +50,6 @@ from flydsl.expr import arith, const_expr, gpu, ptrtoint, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, Stream, T
 
-from aiter.ops.flydsl.kernels import buffer_ops
-
 from .fused_compress_attn_common import (
     block_base_bytes_i64,
     emit_group_fp8_nm_asm_scatter,
@@ -790,11 +788,8 @@ def _build_norm_rope_scatter_kernel(
             if const_expr(quant):
                 # -- group_fp8 (V4 nm-asm) via shared emitter (single source of truth
                 # shared with the CSA single-kernel; fp8 entry layout stays identical).
-                # The emitter (in _common) consumes a raw buffer-resource descriptor,
-                # so the fp8 kv_cache / k_rope descriptors stay on `buffer_ops`. --
-                out_rsrc = buffer_ops.create_buffer_resource(
-                    kv_cache, max_size=True, base_byte_offset=cache_block_base
-                )
+                # The emitter stores through direct global pointers built from the
+                # i64 block base (kv_cache / k_rope) we pass below. --
                 _krope_base = slot_in_block * fx.Int32(krope_token_stride)
                 emit_group_fp8_nm_asm_scatter(
                     normed_lane=[v.ir_value() for v in normed_lane],
@@ -802,14 +797,12 @@ def _build_norm_rope_scatter_kernel(
                     lane=lane.ir_value(),
                     is_rope_t=is_rope_t.ir_value(),
                     cache_base=cache_base.ir_value(),
-                    out_rsrc=out_rsrc,
+                    out_base_i64=fx.Int64(fx.ptrtoint(fx.get_iter(kv_cache)))
+                    + fx.Int64(cache_block_base),
                     krope_base=_krope_base.ir_value(),
-                    krope_rsrc=buffer_ops.create_buffer_resource(
-                        k_rope_buff,
-                        max_size=True,
-                        base_byte_offset=block_base_bytes_i64(
-                            physical_block, krope_block_stride, 2
-                        ),
+                    krope_base_i64=fx.Int64(fx.ptrtoint(fx.get_iter(k_rope_buff)))
+                    + fx.Int64(
+                        block_base_bytes_i64(physical_block, krope_block_stride, 2)
                     ),
                     VEC=VEC,
                     NOPE=NOPE,
