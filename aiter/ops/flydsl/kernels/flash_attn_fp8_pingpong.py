@@ -7,6 +7,7 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly as _fly
 from flydsl._mlir.dialects import llvm
+from flydsl._mlir.dialects import memref
 from flydsl._mlir.dialects import scf
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
@@ -44,8 +45,8 @@ def _extract_aligned_pointer(tensor, address_space=None) -> ir.Value:
     )
     return _fly.extract_aligned_pointer_as_index(ptr_type, _llvm_value(tensor))
 
-def _pointer_load(result_type: ir.Type, ptr: ir.Value) -> ir.Value:
-    return llvm.LoadOp(result_type, _llvm_value(ptr)).result
+def _pointer_load(result_type: ir.Type, ptr: ir.Value, **kwargs) -> ir.Value:
+    return llvm.LoadOp(result_type, _llvm_value(ptr), **kwargs).result
 
 def _pointer_store(value: ir.Value, ptr: ir.Value):
     return llvm.StoreOp(_llvm_value(value), _llvm_value(ptr))
@@ -226,6 +227,13 @@ def build_flash_attn_fp8_module(
 
         base_ptr = allocator.get_base()
         lds = SmemPtr(base_ptr, lds_offset, i8_type, shape=(LDS_TOTAL,)).get()
+        # !llvm.ptr<3> at the start of this kernel's LDS slice; the K reads GEP
+        # off this so they keep the memref (and hence the LDS reservation) live.
+        # ``lds`` is already a view based at lds_offset, so no extra bias here.
+        _lds_base_ptr = fx.buffer_ops.create_llvm_ptr(
+            fx.Int64(fx.Index(memref.extract_aligned_pointer_as_index(lds))),
+            address_space=3,
+        )
 
         block_id = fx.Index(gpu.block_idx.x)
         tid = fx.Index(gpu.thread_idx.x)
@@ -344,6 +352,40 @@ def build_flash_attn_fp8_module(
 
         _lds_ptr_ty = ir.Type.parse("!llvm.ptr<3>")
 
+        # Scoped alias metadata for the LDS double buffer.
+        #
+        # The kernel already double-buffers: the DMA writes _k_slot(1) while
+        # the ds_reads of the same phase consume _k_slot(0) (and likewise for
+        # V).  LLVM cannot prove that, because the LDS pointers are built by
+        # inttoptr from computed integers, so SIInsertWaitcnts falls into its
+        # conservative branch (SIInsertWaitcnts.cpp:2456) and puts a full
+        # s_waitcnt vmcnt(0) in front of every ds_read that follows a DMA.
+        # That serializes the four DMA passes -- measured 47.5% of the wave
+        # sitting in vmcnt drains, ~1670 TFLOPS vs ~2840 when the DMAs are
+        # bunched after the last ds_read of the phase.
+        #
+        # Tagging the DMA and the ds_reads with disjoint alias scopes tells
+        # the waitcnt inserter the two do not overlap, so it can track them in
+        # separate LDSDMA slots instead of the shared one.  Correctness then
+        # rests on the explicit _wait_vmcnt(0) at each phase boundary, which
+        # is exactly how the reference asm kernel is structured: one drain per
+        # phase, none inside the MFMA region.
+        # NB: both scopes must be built by a *single* Attribute.parse call.
+        # ``distinct[0]<>`` written in two separate parses yields two unrelated
+        # distinct attributes, i.e. two different domains -- and scoped AA only
+        # proves noalias for scopes that share a domain, so split parses are
+        # silently a no-op.
+        _alias_scopes = ir.ArrayAttr(
+            ir.Attribute.parse(
+                "[#llvm.alias_scope<id = distinct[1]<>, domain = "
+                '#llvm.alias_scope_domain<id = distinct[0]<>, description = "fmha_lds">>,'
+                " #llvm.alias_scope<id = distinct[2]<>, domain = "
+                '#llvm.alias_scope_domain<id = distinct[0]<>, description = "fmha_lds">>]'
+            )
+        )
+        _dma_scopes = ir.ArrayAttr.get([_alias_scopes[0]])
+        _read_scopes = ir.ArrayAttr.get([_alias_scopes[1]])
+
         def _dma_lds_ptr(lds_byte_off):
             """SALU-only: the LDS destination is wave-uniform.
 
@@ -358,7 +400,15 @@ def build_flash_attn_fp8_module(
 
         def _dma_fire(rsrc, lds_ptr, voff_i32):
             rocdl.raw_ptr_buffer_load_lds(
-                rsrc, lds_ptr, _dma_size, voff_i32, _dma_zero, _dma_zero, _dma_aux
+                rsrc,
+                lds_ptr,
+                _dma_size,
+                voff_i32,
+                _dma_zero,
+                _dma_zero,
+                _dma_aux,
+                alias_scopes=_dma_scopes,
+                noalias_scopes=_read_scopes,
             )
 
         def _dma_issue(rsrc, lds_byte_off, voffset_idx):
@@ -581,7 +631,16 @@ def build_flash_attn_fp8_module(
                 ptr = fx.buffer_ops.get_element_ptr(
                     base, static_byte_offset=imm, elem_type=i8_type
                 )
-                reads.append(Vec(rocdl.ds_read_tr8_b64(v_tr8_ty, ptr).result))
+                reads.append(
+                    Vec(
+                        rocdl.ds_read_tr8_b64(
+                            v_tr8_ty,
+                            ptr,
+                            alias_scopes=_read_scopes,
+                            noalias_scopes=_dma_scopes,
+                        ).result
+                    )
+                )
             ab = reads[0].shuffle(reads[1], list(range(4)))
             cd = reads[2].shuffle(reads[3], list(range(4)))
             return ab.shuffle(cd, list(range(8)))
@@ -667,13 +726,36 @@ def build_flash_attn_fp8_module(
             if const_expr(base is None):
                 base = _k_base_row(k_buff_off)
             imm = nt * K_NT_STRIDE + ks * MFMA_K
-            blk_lo = Vec(
-                Vec.load(v_i8x16, lds, [base + fx.Index(imm)])
-            ).bitcast(fx.Int32)
-            blk_hi = Vec(
-                Vec.load(v_i8x16, lds, [base + fx.Index(imm + 16)])
-            ).bitcast(fx.Int32)
-            return blk_lo.shuffle(blk_hi, list(range(8)))
+            # llvm.load rather than Vec.load on the ``lds`` memref: only the
+            # LLVM op can carry alias scopes, and without them SIInsertWaitcnts
+            # drains every outstanding DMA in front of each of these reads.
+            # See the _dma_scopes comment above.
+            #
+            # The pointer is GEP'd off the memref's own base rather than built
+            # by inttoptr.  That matters twice over: it keeps ``lds`` live (it
+            # is the only remaining user, and letting it die drops the LDS
+            # allocation to zero bytes), and it gives the load real pointer
+            # provenance.
+            kp = fx.buffer_ops.get_element_ptr(
+                _lds_base_ptr, fx.Int64(base), elem_type=i8_type
+            )
+            blks = []
+            for off in (imm, imm + 16):
+                p = fx.buffer_ops.get_element_ptr(
+                    kp, static_byte_offset=off, elem_type=i8_type
+                )
+                blks.append(
+                    Vec(
+                        _pointer_load(
+                            v_i8x16,
+                            p,
+                            alignment=1,
+                            alias_scopes=_read_scopes,
+                            noalias_scopes=_dma_scopes,
+                        )
+                    ).bitcast(fx.Int32)
+                )
+            return blks[0].shuffle(blks[1], list(range(8)))
 
         def _load_k_unit_global(kv_start, nt, ks):
             kv_row = kv_start + lo + fx.Index(nt * 32)
@@ -727,9 +809,12 @@ def build_flash_attn_fp8_module(
                         v_addr, vi // PV_K_STEPS, vi % PV_K_STEPS
                     )
                     v_preloaded[vi] = kv_windows[un % 4]
+                _dp = u - 2
+                if const_expr(_dp >= 0 and _dp < len(l_ptrs)):
+                    _dma_fire(dma_rsrc, l_ptrs[_dp], g_ptrs[_dp])
                 _sched_barrier()
-            for _dp in range_constexpr(len(l_ptrs)):
-                _dma_fire(dma_rsrc, l_ptrs[_dp], g_ptrs[_dp])
+            # for _dp in range_constexpr(len(l_ptrs)):
+            #     _dma_fire(dma_rsrc, l_ptrs[_dp], g_ptrs[_dp])
             return s_accs, v_preloaded
 
         def _lane_max(vecs):
