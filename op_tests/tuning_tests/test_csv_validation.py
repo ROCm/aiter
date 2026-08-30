@@ -31,6 +31,7 @@ class TestCSVValidation(unittest.TestCase):
         "a6w6_blockscale": "a6w6_blockscale_tuned_gemm.csv",
         "a6w4_asm": "a6w4_asm_tuned_gemm.csv",
         "a4w6_asm": "a4w6_asm_tuned_gemm.csv",
+        "a6w6_blockscale_flux": "model_configs/a6w6_blockscale_tuned_gemm_flux.csv",
         "a8w8_batched": "a8w8_tuned_batched_gemm.csv",
         "bf16": "bf16_tuned_gemm.csv",
         "bf16_batched": "bf16_tuned_batched_gemm.csv",
@@ -98,6 +99,9 @@ class TestCSVValidation(unittest.TestCase):
 
     def test_a4w6_asm_no_duplicates(self):
         self._check_no_duplicates("a4w6_asm")
+
+    def test_a6w6_blockscale_flux_no_duplicates(self):
+        self._check_no_duplicates("a6w6_blockscale_flux")
 
     def test_a8w8_batched_no_duplicates(self):
         self._check_no_duplicates("a8w8_batched")
@@ -224,6 +228,7 @@ class TestCSVValidation(unittest.TestCase):
             "a6w6_blockscale_untuned_gemm.csv",
             "a6w4_asm_untuned_gemm.csv",
             "a4w6_asm_untuned_gemm.csv",
+            "model_configs/a6w6_blockscale_untuned_gemm_flux.csv",
             "a8w8_untuned_batched_gemm.csv",
             "bf16_untuned_batched_gemm.csv",
             "untuned_fmoe.csv",
