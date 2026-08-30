@@ -10,8 +10,13 @@ from unittest import mock
 import pandas as pd
 import torch
 
+from aiter.jit.core import AITER_CONFIGS
 from aiter.ops import gemm_op_a6w6
-from csrc.gemm_a6w6.gemm_a6w6_tune import choose_guarded_kernel
+from csrc.gemm_a6w6.gemm_a6w6_tune import (
+    candidate_supports_shape,
+    choose_guarded_kernel,
+    load_f6gemm_candidates,
+)
 
 AITER_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -19,6 +24,9 @@ AITER_ROOT = os.path.dirname(
 MANIFEST = os.path.join(
     AITER_ROOT, "hsa", "gfx950", "f6gemm", "f6gemm_bf16_per1x32Fp6.csv"
 )
+MODEL_CONFIGS = os.path.join(AITER_ROOT, "aiter", "configs", "model_configs")
+FLUX_TUNED_CSV = os.path.join(MODEL_CONFIGS, "a6w6_blockscale_tuned_gemm_flux.csv")
+FLUX_UNTUNED_CSV = os.path.join(MODEL_CONFIGS, "a6w6_blockscale_untuned_gemm_flux.csv")
 TUNED_HEADER = [
     "gfx",
     "cu_num",
@@ -235,6 +243,73 @@ class TestA6W6Manifest(unittest.TestCase):
         manifest_dir = os.path.dirname(MANIFEST)
         for co_name in configs["co_name"]:
             self.assertTrue(os.path.exists(os.path.join(manifest_dir, co_name)))
+
+
+class TestA6W6FluxModelConfig(unittest.TestCase):
+    """Checks the per-model Flux table that a GPU benchmark cannot make.
+
+    The nightly `a6w6_blockscale` run_config pass already times and accuracy-checks these
+    rows. What it cannot see is a row that never reaches the runtime: renamed out of the
+    `model_configs` glob, shadowed by a padded match from the shipped table, or naming a
+    kernel whose compile-time swizzle bounds reject the very launch it was tuned for.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tuned = pd.read_csv(FLUX_TUNED_CSV)
+        cls.candidates = {
+            candidate["kernel_name"]: candidate
+            for candidate in load_f6gemm_candidates()
+        }
+
+    def setUp(self):
+        gemm_op_a6w6.clear_gemm_a6w6_config_cache()
+
+    def tearDown(self):
+        gemm_op_a6w6.clear_gemm_a6w6_config_cache()
+
+    def test_every_row_selects_a_kernel_legal_for_its_shape(self):
+        for row in self.tuned.itertuples():
+            with self.subTest(shape=(row.M, row.N, row.K)):
+                candidate = self.candidates.get(row.kernelName)
+                self.assertIsNotNone(
+                    candidate, f"{row.kernelName} is not in {MANIFEST}"
+                )
+                self.assertTrue(
+                    candidate_supports_shape(candidate, row.M, row.N, row.K),
+                    f"{row.kernelName} swizzle bounds reject ({row.M}, {row.N}, {row.K})",
+                )
+
+    def test_rows_survive_the_model_config_merge(self):
+        """Resolve through the production path, not the Flux file directly.
+
+        `get_config_file` merges `model_configs/*a6w6_blockscale_tuned_gemm*.csv` with the
+        shipped table, so this is what the runtime actually reads.
+        """
+        merged = AITER_CONFIGS.AITER_CONFIG_GEMM_A6W6_FILE
+        for (gfx, cu_num), group in self.tuned.groupby(["gfx", "cu_num"], sort=False):
+            with mock.patch.object(
+                gemm_op_a6w6, "get_gfx", return_value=gfx
+            ), mock.patch.object(gemm_op_a6w6, "get_cu_num", return_value=int(cu_num)):
+                gemm_op_a6w6.clear_gemm_a6w6_config_cache()
+                for row in group.itertuples():
+                    with self.subTest(gfx=gfx, shape=(row.M, row.N, row.K)):
+                        config = gemm_op_a6w6.get_GEMM_A6W6_config(
+                            row.M, row.N, row.K, merged
+                        )
+                        self.assertIsNotNone(
+                            config,
+                            f"({row.M}, {row.N}, {row.K}) is absent from the merge",
+                        )
+                        self.assertEqual(config["kernelName"], row.kernelName)
+
+    def test_untuned_sibling_covers_every_tuned_shape(self):
+        """Every shipped row must be re-tunable from the untuned table beside it."""
+        untuned = pd.read_csv(FLUX_UNTUNED_CSV)
+        tuned_shapes = set(map(tuple, self.tuned[["M", "N", "K"]].to_numpy()))
+        untuned_shapes = set(map(tuple, untuned[["M", "N", "K"]].to_numpy()))
+        self.assertEqual(len(untuned), len(untuned_shapes), "duplicate untuned shapes")
+        self.assertEqual(tuned_shapes - untuned_shapes, set())
 
 
 class TestA6W6MinimumGainGuard(unittest.TestCase):
