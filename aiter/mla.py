@@ -23,13 +23,8 @@ _FLYDSL_MLA_REDUCE_TARGET_DV = 512
 
 @functools.lru_cache(maxsize=1)
 def _flydsl_mla_reduce_available() -> bool:
-    """Whether the optional FlyDSL package is available on this device."""
-    try:
-        from aiter.ops.flydsl import is_flydsl_available
-
-        return is_flydsl_available()
-    except (ImportError, OSError, RuntimeError):
-        return False
+    """Whether FlyDSL MLA reduce is supported on this device."""
+    return get_gfx() in _FLYDSL_MLA_REDUCE_TARGET_GFX
 
 
 def _flydsl_mla_reduce_supported(

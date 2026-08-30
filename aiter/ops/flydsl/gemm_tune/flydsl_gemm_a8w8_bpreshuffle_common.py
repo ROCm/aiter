@@ -25,12 +25,7 @@ from dataclasses import dataclass
 from functools import cache
 from typing import Any
 
-from aiter.ops.flydsl.utils import (
-    addressable_lds_bytes_for_gfx as _addressable_lds_bytes_for_gfx,
-)
-from aiter.ops.flydsl.utils import (
-    get_shared_memory_per_block,
-)
+from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
 
 
 def get_gfx():
@@ -185,20 +180,15 @@ def kernel_instance_estimated_lds_bytes(ki: kernelInstance) -> int:
     )
 
 
-def addressable_lds_bytes_for_gfx(gfx: str) -> int:
-    return _addressable_lds_bytes_for_gfx(gfx)
-
-
 @cache
 def max_lds_bytes_for_tune() -> int:
     """Addressable LDS limit for current target.
 
     Cached because ``kernel_fits_shape`` calls it per candidate (thousands of
-    times per shape) and the uncached path does a ``torch.cuda.current_device()``
-    round trip each time. The arch is already resolved once at import below, so
-    a process-lifetime cache changes nothing.
+    times per shape). The arch is resolved once at import below, so a
+    process-lifetime cache changes nothing.
     """
-    return get_shared_memory_per_block(fallback_gfx=get_gfx())
+    return SMEM_CAPACITY_MAP[get_gfx()]
 
 
 def _padded_m(M: int) -> int:
@@ -437,7 +427,7 @@ NAME_PREFIX_8WAVE = "flydsl_bpreshuffle_8w"
 # keeps CSV rows unambiguous to a human.
 KERNEL_ID_BASE_8WAVE = 1_000_000
 
-LDS_BYTES_8WAVE = get_shared_memory_per_block(fallback_gfx="gfx950")
+LDS_BYTES_8WAVE = SMEM_CAPACITY_MAP["gfx950"]
 _I32_MAX = 2**31
 
 _TILES_8WAVE = ((128, 256), (128, 512), (256, 256))

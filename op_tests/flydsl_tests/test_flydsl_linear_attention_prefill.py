@@ -26,18 +26,12 @@ import torch
 import triton
 from torch.profiler import ProfilerActivity, profile
 
-from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.ops.prefill_batch_metadata import (
     build_gated_delta_rule_prefill_metadata,
 )
 
 if not torch.cuda.is_available():
     pytest.skip("ROCm not available. Skipping GPU tests.", allow_module_level=True)
-if not is_flydsl_available():
-    pytest.skip(
-        "flydsl is not installed. Skipping FlyDSL Linear Attention Prefill tests.",
-        allow_module_level=True,
-    )
 
 try:
     from aiter.ops.flydsl.linear_attention_prefill_kernels import (

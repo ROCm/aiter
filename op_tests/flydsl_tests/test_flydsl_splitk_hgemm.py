@@ -4,8 +4,8 @@
 """Unit tests for FlyDSL split-K HGEMM precision regressions.
 
 Usage:
-    python aiter/ops/flydsl/test_flydsl_splitk_hgemm.py
-    pytest -q aiter/ops/flydsl/test_flydsl_splitk_hgemm.py
+    python op_tests/flydsl_tests/test_flydsl_splitk_hgemm.py
+    pytest -q op_tests/flydsl_tests/test_flydsl_splitk_hgemm.py
 """
 
 from __future__ import annotations
@@ -13,15 +13,10 @@ from __future__ import annotations
 import pytest
 import torch
 
-from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.ops.shuffle import shuffle_weight
 
 if not torch.cuda.is_available():
     pytest.skip("ROCm not available. Skipping GPU tests.", allow_module_level=True)
-if not is_flydsl_available():
-    pytest.skip(
-        "flydsl is not installed. Skipping FlyDSL HGEMM tests.", allow_module_level=True
-    )
 
 try:
     from aiter.ops.flydsl.gemm_kernels import (

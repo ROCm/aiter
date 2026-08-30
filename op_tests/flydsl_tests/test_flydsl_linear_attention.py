@@ -4,7 +4,7 @@
 """Unit tests for FlyDSL Linear Attention regressions.
 
 Usage:
-    pytest -sv aiter/ops/flydsl/test_flydsl_linear_attention.py
+    pytest -sv op_tests/flydsl_tests/test_flydsl_linear_attention.py
 """
 
 from __future__ import annotations
@@ -16,15 +16,8 @@ import torch
 import triton
 import triton.language as tl
 
-from aiter.ops.flydsl.utils import is_flydsl_available
-
 if not torch.cuda.is_available():
     pytest.skip("ROCm not available. Skipping GPU tests.", allow_module_level=True)
-if not is_flydsl_available():
-    pytest.skip(
-        "flydsl is not installed. Skipping FlyDSL Linear Attention tests.",
-        allow_module_level=True,
-    )
 
 try:
     from aiter.ops.flydsl.linear_attention_kernels import flydsl_gdr_decode

@@ -23,7 +23,6 @@ from .kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
 
 # from .kernels.small_m_hgemm import iter_small_m_registry_configs
 from .kernels.tensor_shim import _run_compiled
-from .utils import get_shared_memory_per_block, is_flydsl_available
 
 __all__ = [
     "flydsl_hgemm",
@@ -476,7 +475,7 @@ def _validate_hgemm_tiling(
         block_k_warps=block_k_warps,
         b_to_lds=b_to_lds,
     )
-    lds_limit = get_shared_memory_per_block(fallback_gfx=get_gfx())
+    lds_limit = SMEM_CAPACITY_MAP[get_gfx()]
     if lds_bytes > lds_limit:
         raise ValueError(
             "Invalid tile combination: estimated LDS usage "
@@ -951,23 +950,15 @@ _flydsl_import_done = False
 
 
 def _get_compile_fn():
-    """Lazy-import compile_preshuffle_gemm so the module loads even without FlyDSL."""
+    """Import the preshuffle compiler on first use."""
     global _flydsl_compile_fn, _flydsl_import_done
     if _flydsl_import_done:
         return _flydsl_compile_fn
     _flydsl_import_done = True
-    if not is_flydsl_available():
-        logger.info("[FlyDSL] not available, will fall back to CK/CKTile")
-        return None
-    try:
-        from .kernels.preshuffle_gemm import compile_preshuffle_gemm
+    from .kernels.preshuffle_gemm import compile_preshuffle_gemm
 
-        _flydsl_compile_fn = compile_preshuffle_gemm
-        logger.info("[FlyDSL] loaded preshuffle GEMM compiler")
-    except Exception as e:  # noqa: BLE001
-        logger.info(
-            f"[FlyDSL] preshuffle GEMM not available, will fall back to CK/CKTile: {e}"
-        )
+    _flydsl_compile_fn = compile_preshuffle_gemm
+    logger.info("[FlyDSL] loaded preshuffle GEMM compiler")
     return _flydsl_compile_fn
 
 
@@ -975,8 +966,8 @@ def _get_compile_fn():
 # limit and can evict a buffer a captured CUDA graph still points at. The bounds
 # come from k_split_candidates, which keeps tile_count under CU_NUM and
 # k_split * tile_count at four per CU.
-# Mirrors preshuffle_gemm.PRESHUFFLE_M_MAX; duplicated so this module imports
-# without FlyDSL present.
+# Mirrors preshuffle_gemm.PRESHUFFLE_M_MAX; duplicated to avoid importing the
+# compiler module before the preshuffle path is selected.
 PRESHUFFLE_M_MAX = 65536
 
 PRESHUFFLE_SPLIT_K_MAX_TILES = 256
