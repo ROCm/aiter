@@ -7,7 +7,9 @@ from aiter.jit.core import compile_ops
 
 
 @compile_ops(
-    "module_sparse_attn", fc_name="pa_sparse_block_score_decode", ffi_type="ctypes"
+    "module_msa_sparse_attention",
+    fc_name="pa_sparse_block_score_decode",
+    ffi_type="ctypes",
 )
 def _score_decode_raw(
     q_idx: int,
@@ -32,7 +34,9 @@ def _score_decode_raw(
 
 
 @compile_ops(
-    "module_sparse_attn", fc_name="pa_sparse_block_score_prefill", ffi_type="ctypes"
+    "module_msa_sparse_attention",
+    fc_name="pa_sparse_block_score_prefill",
+    ffi_type="ctypes",
 )
 def _score_prefill_raw(
     q_idx: int,
@@ -58,7 +62,9 @@ def _score_prefill_raw(
 ) -> None: ...
 
 
-@compile_ops("module_sparse_attn", fc_name="pa_sparse_block_topk", ffi_type="ctypes")
+@compile_ops(
+    "module_msa_sparse_attention", fc_name="pa_sparse_block_topk", ffi_type="ctypes"
+)
 def _topk_raw(
     score: int,
     topk_idx: int,

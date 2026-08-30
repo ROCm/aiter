@@ -770,7 +770,7 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
-    "module_sparse_attn": {
+    "module_msa_sparse_attention": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/sparse_attn/msa/pa_sparse_block_score_decode.cu'",
             "f'{AITER_CSRC_DIR}/kernels/sparse_attn/msa/pa_sparse_block_score_prefill.cu'",
