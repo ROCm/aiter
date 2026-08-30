@@ -1240,8 +1240,8 @@ def build_flash_attn_fp8_module(
                 v_preloaded = _rest[10 + DMA_PASSES :]
 
                 _sched_barrier()
-                rocdl.s_setprio(1)
                 _gpu_barrier()
+                rocdl.s_setprio(1)
                 o, l_mfma, k_preloaded = apply_pv(
                     [o0, o1, o2, o3],
                     l_mfma,
@@ -1446,8 +1446,8 @@ def build_flash_attn_fp8_module(
                 # buffer_loads themselves are interleaved into do_qk below.
                 l_voffs = get_lds_voffs(v_buff_off)
                 _sched_barrier()
-                rocdl.s_setprio(1)
                 _gpu_barrier()
+                rocdl.s_setprio(1)
 
                 o, l_mfma, k_preloaded = apply_pv(
                     [o0, o1, o2, o3],
