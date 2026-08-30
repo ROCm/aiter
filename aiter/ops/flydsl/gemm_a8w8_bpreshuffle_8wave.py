@@ -9,8 +9,9 @@ import functools
 import re
 
 import torch
-from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
 from torch import Tensor
+
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
 # Fixed by the kernel: MFMA_Scale(16, 16, 128) over a 128-deep K tile.
 BLOCK_K = 128
@@ -83,7 +84,7 @@ def _validate(
             f"rocdl.waves_per_eu attribute; 'no hint' is not expressible), got {waves_per_eu}"
         )
     need = lds_bytes(block_m, block_n)
-    have = SMEM_CAPACITY_MAP["gfx950"]
+    have = get_lds_capacity_bytes("gfx950")
     if need > have:
         raise ValueError(
             f"[FlyDSL 8wave] {block_m}x{block_n} needs {need} B of LDS, limit is {have} B"

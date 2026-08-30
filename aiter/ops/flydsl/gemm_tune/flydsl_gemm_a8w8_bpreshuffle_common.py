@@ -25,7 +25,8 @@ from dataclasses import dataclass
 from functools import cache
 from typing import Any
 
-from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
+from aiter.jit.utils.chip_info import get_gfx as _get_gfx
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
 
 def get_gfx():
@@ -34,8 +35,6 @@ def get_gfx():
     if env and env != "native":
         return env.split(";")[-1].strip()
     try:
-        from aiter.jit.utils.chip_info import get_gfx as _get_gfx
-
         return _get_gfx()
     except Exception:  # noqa: BLE001
         return "gfx942"
@@ -188,7 +187,7 @@ def max_lds_bytes_for_tune() -> int:
     times per shape). The arch is resolved once at import below, so a
     process-lifetime cache changes nothing.
     """
-    return SMEM_CAPACITY_MAP[get_gfx()]
+    return get_lds_capacity_bytes(get_gfx())
 
 
 def _padded_m(M: int) -> int:
@@ -427,7 +426,7 @@ NAME_PREFIX_8WAVE = "flydsl_bpreshuffle_8w"
 # keeps CSV rows unambiguous to a human.
 KERNEL_ID_BASE_8WAVE = 1_000_000
 
-LDS_BYTES_8WAVE = SMEM_CAPACITY_MAP["gfx950"]
+LDS_BYTES_8WAVE = get_lds_capacity_bytes("gfx950")
 _I32_MAX = 2**31
 
 _TILES_8WAVE = ((128, 256), (128, 512), (256, 256))

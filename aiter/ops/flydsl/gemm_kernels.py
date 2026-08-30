@@ -12,11 +12,10 @@ from itertools import product
 import flydsl.expr as fx
 import torch
 from flydsl.runtime.device import get_rocm_arch
-from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
 from torch import Tensor
 
 from aiter import logger
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
 from .kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
@@ -41,6 +40,7 @@ FIXED_C_TO_LDS = False
 KERNEL_ASYNC_COPY = get_rocm_arch() != "gfx942"
 KERNEL_FAMILY_HGEMM = "hgemm"
 KERNEL_FAMILY_SMALL_M = "small_m"
+_HGEMM_SUPPORTED_GFX = frozenset(("gfx942", "gfx950"))
 _HGEMM_KERNEL_RE = re.compile(
     r"^flydsl_gemm(?P<stages>\d+)_"
     r"a(?P<a_dtype>[a-z0-9]+)_w(?P<w_dtype>[a-z0-9]+)_(?P<out_dtype>[a-z0-9]+)_"
@@ -310,7 +310,9 @@ def selection_filter(m, n, k, kwargs):
     BLOCK_N_WARPS = kwargs["BLOCK_N_WARPS"]
     BLOCK_K_WARPS = kwargs["BLOCK_K_WARPS"]
     B_TO_LDS = kwargs.get("B_TO_LDS", True)
-    GPU_ARCH = get_rocm_arch()
+    GPU_ARCH = get_rocm_arch().split(":", 1)[0]
+    if GPU_ARCH not in _HGEMM_SUPPORTED_GFX:
+        return False
     DTYPE_BYTES = 2
 
     def get_stage_smem_use(stages_):
@@ -322,9 +324,7 @@ def selection_filter(m, n, k, kwargs):
 
     smem_use_s0 = get_stage_smem_use(STAGES)
     # smem_use_s1 = get_stage_smem_use(STAGES + 3)
-    smem_cap = SMEM_CAPACITY_MAP.get(GPU_ARCH)
-    if smem_cap is None:
-        return False
+    smem_cap = get_lds_capacity_bytes(GPU_ARCH)
     if not (smem_use_s0 <= smem_cap):
         return False
     return not (
@@ -372,10 +372,10 @@ def _validate_hgemm_tiling(
         "BLOCK_K_WARPS": block_k_warps,
         "B_TO_LDS": b_to_lds,
     }
-    arch = get_gfx()
-    lds_limit = SMEM_CAPACITY_MAP.get(arch)
-    if lds_limit is None:
+    arch = get_gfx().split(":", 1)[0]
+    if arch not in _HGEMM_SUPPORTED_GFX:
         raise ValueError(f"FlyDSL HGEMM does not support architecture {arch!r}")
+    lds_limit = get_lds_capacity_bytes(arch)
     if not selection_filter(m, n, k, config):
         raise ValueError(
             f"Invalid tiling configuration for m={m} n={n} k={k}: {config}"
