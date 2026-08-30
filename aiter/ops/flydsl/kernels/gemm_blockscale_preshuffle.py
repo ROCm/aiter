@@ -69,24 +69,28 @@ def plan_lds(
     num_k_tiles,
     use_cshuffle_epilog,
     scale_block_k=SCALE_BLOCK,
+    stage_a_scales=False,
 ):
     """Size the LDS buffers, without compiling: an over-large tile does not raise, it
     aborts the process in the backend.
 
-    Returns (stage_scales, sub_buffer_bytes, a_group_tiles, total_bytes). The first and
-    third are always False and 1 here; callers unpack positionally, so they stay. So do
-    num_waves and num_k_tiles, which only matter to a k-tile grouping this kernel does
-    not do.
+    Returns (stage_scales, sub_buffer_bytes, a_group_tiles, total_bytes). a_group_tiles
+    is always 1 here; callers unpack positionally, so it stays. So do num_waves and
+    num_k_tiles, which only matter to a k-tile grouping this kernel does not do.
 
     Mirrors the SharedStorage arithmetic below, and is the single source of that number.
     """
-    del num_waves, num_k_tiles, scale_block_k
+    del num_waves, num_k_tiles
     sub_buffer_bytes = tile_m * tile_k  # fp8 A: one byte per element
     # Mirrors SharedStorage: the CShuffle image aliases the pair of A buffers, so each of
     # the two holds half of it.
     epilog_bytes = 2 * tile_m * tile_n if use_cshuffle_epilog else 0
     buffer_bytes = max(sub_buffer_bytes, epilog_bytes // 2)
-    return False, sub_buffer_bytes, 1, 2 * buffer_bytes
+    # Appended after the A image, not aliased into it, so it cannot collide with the
+    # CShuffle output that occupies the front.
+    if stage_a_scales:
+        buffer_bytes += (tile_k // scale_block_k) * tile_m * 4
+    return bool(stage_a_scales), sub_buffer_bytes, 1, 2 * buffer_bytes
 
 
 def _minui(a, b):
@@ -145,6 +149,7 @@ def compile_blockscale_preshuffle_gemm(
     waves_per_eu: int = None,
     use_async_copy: bool = False,
     num_waves: int = NUM_WAVES,
+    stage_a_scales: bool = False,
 ):
     """Compile blockscale preshuffle GEMM. FP8 input, per-block scales, bf16/fp16 output."""
     if out_dtype not in ("fp16", "bf16"):
@@ -232,9 +237,17 @@ def compile_blockscale_preshuffle_gemm(
 
     epilog_tag = "cshuffle" if use_cshuffle_epilog else "direct"
     round_tag = f"_dsrd{dsrd_depth}" if dsrd_depth != 1 else ""
+    # Gated on the async global to LDS path: the sync fallback puts an s_waitcnt and an
+    # LDS store inside the k-loop, costing more than the redundant scale loads it
+    # removes. So this decides whether to stage, not which path.
+    _scales_async_ok = (
+        use_async_copy and ((tile_k // scale_block_k) * tile_m) % WAVE == 0
+    )
+    _stage_a_scales = stage_a_scales and _scales_async_ok
+    sas_tag = "_sas" if _stage_a_scales else ""
 
     module_name = (
-        f"bs_gemm_{out_dtype}_{epilog_tag}{round_tag}_t{tile_m}x{tile_n}x{tile_k}"
+        f"bs_gemm_{out_dtype}_{epilog_tag}{round_tag}{sas_tag}_t{tile_m}x{tile_n}x{tile_k}"
     ).replace("-", "_")
 
     # ── LDS sizing (pure Python, no MLIR ops) ────────────────────────────
@@ -243,6 +256,10 @@ def compile_blockscale_preshuffle_gemm(
 
     assert lds_out_bytes % 2 == 0, "lds_out_bytes should be multiple of 2"
     buffer_size_bytes = max(lds_tile_bytes, lds_out_bytes // 2)
+    # Mirrors plan_lds: appended after the A image so the CShuffle alias is untouched.
+    a_scale_lds_bytes = (tile_k // scale_block_k) * tile_m * 4 if _stage_a_scales else 0
+    a_scale_lds_base = buffer_size_bytes
+    buffer_size_bytes += a_scale_lds_bytes
     buffer_size_elems = buffer_size_bytes  # fp8: 1 byte per elem
 
     # Uint8 because this is byte staging; the MFMA operands take their fn/fnuz flavour
@@ -421,6 +438,53 @@ def compile_blockscale_preshuffle_gemm(
             ptr_off = fx.add_offset(lds_buffer.ptr, fx.make_int_tuple(idx_a16))
             i8_iter = fx.recast_iter(fx.Uint8, ptr_off)
             return fx.make_view(i8_iter, fx.make_layout(16, 1)).load()
+
+        # Every wave loads the same tile_m A-scale floats (sa_idx below carries no
+        # wave_id term), so staging once per workgroup replaces num_waves x m_repeat
+        # loads with one. The target is VMEM issue pressure, not bandwidth.
+        #
+        # raw_ptr_buffer_load_lds lands lane L at M0 + L*4 without a register round
+        # trip, keeping the load, s_waitcnt and ds_write chain out of the k-loop. It
+        # covers one wave of scales at a time, so staging is only enabled when the
+        # tile's scale count divides evenly by the wave size.
+        _n_scale_wave_iters = (sb_per_tile * tile_m) // WAVE if _stage_a_scales else 0
+
+        def stage_a_scales_to_lds_async(k_base, lds_buffer):
+            kb0 = k_base // c_scale_block_k
+            for it in range_constexpr(_n_scale_wave_iters):
+                slot = arith.index(it * WAVE) + lane_id
+                sb_i = slot // arith.index(tile_m)
+                row_i = slot % arith.index(tile_m)
+                g_byte = ((kb0 + sb_i) * rt_M + bx_m + row_i) * arith.index(4)
+                lds_addr = fx.Int64(fx.ptrtoint(lds_buffer.ptr)) + fx.Int64(
+                    arith.index(a_scale_lds_base + it * WAVE * 4)
+                )
+                lds_ptr = llvm.inttoptr(
+                    ir.Type.parse("!llvm.ptr<3>"),
+                    rocdl.readfirstlane(T.i64, lds_addr),
+                )
+                rocdl.raw_ptr_buffer_load_lds(
+                    scale_a_rsrc,
+                    lds_ptr,
+                    fx.Int32(4),
+                    fx.Int32(g_byte),
+                    fx.Int32(0),
+                    fx.Int32(0),
+                    fx.Int32(1),
+                )
+
+        def lds_load_a_scale_vec(sb, mi, lds_buffer):
+            """The 4 consecutive A scales this lane needs for (sb, mi).
+
+            Mirrors the global path's sa_idx, minus the kb * M term the stager applied.
+            """
+            off = arith.index(a_scale_lds_base + (sb * tile_m + mi * 16) * 4) + (
+                row_off_base * arith.index(4)
+            )
+            ptr_off = fx.add_offset(lds_buffer.ptr, fx.make_int_tuple(off))
+            i8_iter = fx.recast_iter(fx.Uint8, ptr_off)
+            raw = fx.make_view(i8_iter, fx.make_layout(16, 1)).load()
+            return Vec(raw).bitcast(fx.Float32)
 
         def lds_load_packs_k64(curr_row_a_lds, col_base, lds_buffer):
             loaded_a16 = lds_load_16b(curr_row_a_lds, col_base, lds_buffer)
@@ -601,14 +665,15 @@ def compile_blockscale_preshuffle_gemm(
                 kb = k_base // c_scale_block_k + fx.Index(sb)
                 sa_base_offset = kb * rt_M
                 s_a_vecs = []
-                for mi in range_constexpr(m_repeat):
-                    row_base_m = bx_m + mi * 16
-                    row_g_base = row_base_m + row_off_base
-                    sa_idx = sa_base_offset + row_g_base
-                    s_a_vec = buffer_ops.buffer_load(
-                        scale_a_rsrc, sa_idx, vec_width=4, dtype=T.f32
-                    )
-                    s_a_vecs.append(Vec(s_a_vec).bitcast(fx.Float32))
+                if const_expr(not _stage_a_scales):
+                    for mi in range_constexpr(m_repeat):
+                        row_base_m = bx_m + mi * 16
+                        row_g_base = row_base_m + row_off_base
+                        sa_idx = sa_base_offset + row_g_base
+                        s_a_vec = buffer_ops.buffer_load(
+                            scale_a_rsrc, sa_idx, vec_width=4, dtype=T.f32
+                        )
+                        s_a_vecs.append(Vec(s_a_vec).bitcast(fx.Float32))
 
                 s_b_vals = []
                 for ni in range_constexpr(num_acc_n):
@@ -626,8 +691,18 @@ def compile_blockscale_preshuffle_gemm(
                 all_combined.append((s_a_vecs, s_b_vals))
             return all_combined
 
-        def _combine_scale_block(s_a_vecs, s_b_vals):
-            """A-scale x B-scale for one scale block. First use of the loads."""
+        def _combine_scale_block(s_a_vecs, s_b_vals, sb=0, lds_buffer=None):
+            """A-scale x B-scale for one scale block. First use of the loads.
+
+            When staging, the A side is a ds_read from the tile's staged slice. The
+            barrier that publishes the A image publishes these too, so it needs no
+            extra synchronisation.
+            """
+            if const_expr(_stage_a_scales):
+                s_a_vecs = [
+                    lds_load_a_scale_vec(sb, mi, lds_buffer)
+                    for mi in range_constexpr(m_repeat)
+                ]
             s_b_vecs = [
                 Vec.filled(4, fx.Float32(s_b_vals[ni]), fx.Float32)
                 for ni in range_constexpr(num_acc_n)
@@ -648,7 +723,9 @@ def compile_blockscale_preshuffle_gemm(
             for sb in range_constexpr(sb_per_tile):
                 # First use of this tile's scale loads, a full tile of MFMA after
                 # they were issued, so the wait should already be satisfied.
-                combined_scales = _combine_scale_block(*pre_scales[sb])
+                combined_scales = _combine_scale_block(
+                    *pre_scales[sb], sb=sb, lds_buffer=lds_buffer
+                )
                 block_accs = [acc_init] * (num_acc_n * m_repeat)
 
                 if const_expr(_is_gfx950):
@@ -888,6 +965,8 @@ def compile_blockscale_preshuffle_gemm(
         def _load_a_to_lds(
             base_k, lds_buffer, a_load_bytes_v, tx_i32_base_v, chunk_i32_a_v
         ):
+            if const_expr(_stage_a_scales):
+                stage_a_scales_to_lds_async(base_k, lds_buffer)
             if const_expr(use_async_copy):
                 prefetch_a_to_lds(base_k, lds_buffer)
             else:
