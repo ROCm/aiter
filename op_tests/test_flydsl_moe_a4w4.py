@@ -221,7 +221,9 @@ def _out_dtype_name(dtype):
     raise ValueError(f"unsupported output dtype: {dtype}")
 
 
-def _validate_case(model_dim, inter_dim, num_experts, topk, block_m, dtype):
+def _validate_case(token, model_dim, inter_dim, num_experts, topk, block_m, dtype):
+    if token <= 0:
+        raise ValueError(f"token must be positive, got {token}")
     if dtype not in (dtypes.bf16, dtypes.fp16):
         raise ValueError(f"dtype must be bf16 or fp16, got {dtype}")
     if model_dim <= 0 or model_dim % 256:
@@ -286,7 +288,7 @@ def test_flydsl_stage1_a4w4(
 ):
     from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1
 
-    _validate_case(model_dim, inter_dim, num_experts, topk, block_m, dtype)
+    _validate_case(token, model_dim, inter_dim, num_experts, topk, block_m, dtype)
     data = _generate_a4w4_data(
         token=token,
         model_dim=model_dim,
@@ -357,7 +359,7 @@ def test_flydsl_stage2_a4w4(
 ):
     from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage2
 
-    _validate_case(model_dim, inter_dim, num_experts, topk, block_m, dtype)
+    _validate_case(token, model_dim, inter_dim, num_experts, topk, block_m, dtype)
     data = _generate_a4w4_data(
         token=token,
         model_dim=model_dim,
@@ -432,7 +434,7 @@ def test_flydsl_stage2_a4w4_return_per_slot(
 ):
     from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage2
 
-    _validate_case(model_dim, inter_dim, num_experts, topk, block_m, dtype)
+    _validate_case(token, model_dim, inter_dim, num_experts, topk, block_m, dtype)
     data = _generate_a4w4_data(
         token=token,
         model_dim=model_dim,
@@ -517,7 +519,7 @@ def test_flydsl_e2e_a4w4(
     """Benchmark stage1, requantization, scale sorting, and stage2 together."""
     from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
 
-    _validate_case(model_dim, inter_dim, num_experts, topk, block_m, dtype)
+    _validate_case(token, model_dim, inter_dim, num_experts, topk, block_m, dtype)
     torch_quant = aiter.get_torch_quant(Q_TYPE)
     data = _generate_a4w4_data(
         token=token,
@@ -718,6 +720,7 @@ def main():
 
     try:
         for case in itertools.product(
+            args.tokens,
             args.model_dim,
             args.inter_dim,
             args.experts,

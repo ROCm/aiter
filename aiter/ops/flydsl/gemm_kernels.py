@@ -372,6 +372,10 @@ def _validate_hgemm_tiling(
         "BLOCK_K_WARPS": block_k_warps,
         "B_TO_LDS": b_to_lds,
     }
+    arch = get_gfx()
+    lds_limit = SMEM_CAPACITY_MAP.get(arch)
+    if lds_limit is None:
+        raise ValueError(f"FlyDSL HGEMM does not support architecture {arch!r}")
     if not selection_filter(m, n, k, config):
         raise ValueError(
             f"Invalid tiling configuration for m={m} n={n} k={k}: {config}"
@@ -477,10 +481,6 @@ def _validate_hgemm_tiling(
         block_k_warps=block_k_warps,
         b_to_lds=b_to_lds,
     )
-    arch = get_gfx()
-    lds_limit = SMEM_CAPACITY_MAP.get(arch)
-    if lds_limit is None:
-        raise ValueError(f"FlyDSL HGEMM does not support architecture {arch!r}")
     if lds_bytes > lds_limit:
         raise ValueError(
             "Invalid tile combination: estimated LDS usage "

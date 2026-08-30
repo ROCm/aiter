@@ -44,10 +44,18 @@ from aiter.ops.opus.moe_stage1_a8w4 import (
     opus_a8w4_stage1_wrapper as _opus_a8w4_stage1_wrapper,
 )
 
+
+@functools.lru_cache(maxsize=1)
+def _get_flydsl_moe_kernels():
+    from aiter.ops.flydsl import moe_kernels
+
+    return moe_kernels
+
+
 BLOCK_SIZE_M = 32
 
 # Sorting backend flags (mutually exclusive; CK > FlyDSL > Opus priority).
-# Default is Opus.  Set AITER_USE_FLYDSL_MOE_SORTING=1 to prefer FlyDSL when available.
+# Default is Opus. Set AITER_USE_FLYDSL_MOE_SORTING=1 to prefer FlyDSL.
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") == "1"
 # "adaptive sort" backend selection (mxfp4 sort as a general World-1 backend):
@@ -489,7 +497,7 @@ def stage2_uses_route_reduce(stage2: Callable) -> bool:
     func = getattr(stage2, "func", stage2)
     kernel_name = getattr(stage2, "keywords", {}).get("kernelName", "")
     if func is _flydsl_stage2_wrapper or getattr(func, "_is_flydsl_stage2", False):
-        parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernel_name)
+        parsed = _get_flydsl_moe_kernels().get_flydsl_kernel_params(kernel_name)
         if parsed is None:
             return False
         # a16w4 (bf16 A x mxfp4 W) down-proj only supports atomic scatter into a
@@ -1533,7 +1541,8 @@ def _flydsl_stage1_wrapper(
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
         inter_dim_pad, model_dim_pad, bias1
     )
-    parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
+    moe_kernels = _get_flydsl_moe_kernels()
+    parsed = moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
     if out_dtype is not None:
@@ -1547,7 +1556,7 @@ def _flydsl_stage1_wrapper(
     else:
         raise ValueError(f"Unsupported activation for FlyDSL MoE stage1: {activation}")
     _a_scale_one = parsed.get("a_scale_one", False)
-    return aiter.ops.flydsl.flydsl_moe_stage1(
+    return moe_kernels.flydsl_moe_stage1(
         a=hidden_states,
         w1=w1,
         sorted_token_ids=sorted_token_ids,
@@ -1617,10 +1626,11 @@ def _flydsl_stage2_wrapper(
     # already baked into this dict, so the `parsed.get(..., default)`
     # calls below pick up the registered values for that kernel name
     # rather than always falling back to defaults.
-    parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
+    moe_kernels = _get_flydsl_moe_kernels()
+    parsed = moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
-    return aiter.ops.flydsl.flydsl_moe_stage2(
+    return moe_kernels.flydsl_moe_stage2(
         inter_states=inter_states,
         w2=w2,
         sorted_token_ids=sorted_token_ids,

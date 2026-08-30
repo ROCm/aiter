@@ -33,8 +33,8 @@ pytestmark = pytest.mark.skipif(
     get_gfx() not in SUPPORTED_GFX,
     reason="FlyDSL GDR decode requires gfx942 or gfx950",
 )
-_PERF_ROTATION_BUDGET = 512 * 1024**2
-_MAX_PERF_ROTATIONS = 8
+_PERF_ROTATION_BUDGET = 1024**3
+_MAX_PERF_ROTATIONS = 101
 
 
 @dataclass
@@ -431,6 +431,11 @@ def _validate_head_config(num_k_heads, num_v_heads, head_k_dim, head_v_dim):
             "num_v_heads must be a positive multiple of num_k_heads, got "
             f"{num_k_heads=} {num_v_heads=}"
         )
+    if head_k_dim % 32 or head_v_dim % 32:
+        raise ValueError(
+            "head_k_dim and head_v_dim must be multiples of 32, got "
+            f"{head_k_dim=} {head_v_dim=}"
+        )
 
 
 def _perf_rotation_count(state, out):
@@ -452,6 +457,8 @@ def test_flydsl_gdr_decode(
     dtype,
     use_qk_l2norm,
 ):
+    if b <= 0 or sq <= 0:
+        raise ValueError(f"batch and sequence length must be positive, got {b=} {sq=}")
     _validate_head_config(num_k_heads, num_v_heads, head_k_dim, head_v_dim)
     args = Args(
         dtype=dtype,
@@ -738,6 +745,10 @@ def main():
             )
         num_k_heads, num_v_heads, head_k_dim, head_v_dim = head_config
         try:
+            if batch <= 0 or sq <= 0:
+                raise ValueError(
+                    f"batch and sequence length must be positive, got {batch=} {sq=}"
+                )
             _validate_head_config(
                 num_k_heads,
                 num_v_heads,
