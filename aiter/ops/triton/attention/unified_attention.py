@@ -1,6 +1,5 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
-import math
 from typing import NamedTuple
 
 import torch
@@ -52,19 +51,6 @@ _GLUON_SUPPORTED_ARCHS = ("gfx1250",)
 
 def _is_gluon_available():
     return any(supported in DEVICE_ARCH for supported in _GLUON_SUPPORTED_ARCHS)
-
-
-def is_gfx950_small_head(head_size):
-    """
-    True for gfx950 with a head_size the wide-LDS-copy config applies to.
-
-    On gfx950, the direct-to-LDS copy only stays vectorized at TILE_SIZE=64.
-    Below that it degrades to 4 bytes/lane plus a ds_bpermute per copy.
-
-    This covers the arch and head_size half of that condition only,
-    callers add their own path conditions (decode, sw).
-    """
-    return DEVICE_ARCH == "gfx950" and head_size <= 128
 
 
 class _UAParams(NamedTuple):
@@ -127,7 +113,9 @@ class _UAParams(NamedTuple):
 
 
 def config_key(params: _UAParams, op: str) -> str:
-    assert op in ("attn_2d", "attn_3d", "reduce"), f"Unknown config op '{op}'"
+    assert op in ("attn_2d", "attn_3d", "reduce", "kv_split"), (
+        f"Unknown config op '{op}'"
+    )
 
     if op == "attn_2d":
         if not params.all_decode:
@@ -166,168 +154,6 @@ def config_key(params: _UAParams, op: str) -> str:
             key = "hlt128"
 
     return f"{key}_shuffled_kv" if params.shuffled_kv_cache else key
-
-
-def get_num_segments(params: _UAParams):
-    pass
-
-
-def select_3d_config(
-    head_size,
-    block_size,
-    max_seqlen_k,
-    target_num_prgms,
-    num_2d_prgms,
-    q_dtype: torch.dtype,
-    kv_cache_dtype: torch.dtype,
-    shuffled_kv_cache: bool = False,
-    NUM_BLOCKS_GATHER_PER_TILE: int = 1,
-    SLIDING_WINDOW: int | None = None,
-):
-    arch = get_arch()
-    reduce_num_warps = 2
-    attn_warps = 2
-    waves_per_eu = 2
-    num_segments = 0
-    attn_stages = 2
-    if IS_DEVICE_ARCH_GFX12:
-        assert kv_cache_dtype in (
-            torch.float16,
-            torch.bfloat16,
-            e4m3_dtype,
-            torch.uint8,
-        ), (
-            f"kv_cache_dtype only supports F16 ({torch.float16}) BF16 ({torch.bfloat16}), FP8 ({e4m3_dtype}), FP4 ({torch.uint8}) in arch = {DEVICE_ARCH}"
-        )
-        attn_warps = 1
-        TILE_SIZE = block_size
-        if shuffled_kv_cache and head_size < 128:
-            if kv_cache_dtype in (
-                torch.bfloat16,
-                torch.float16,
-            ):
-                if block_size <= 64:
-                    waves_per_eu = 2
-                else:
-                    waves_per_eu = 1
-            elif kv_cache_dtype == e4m3_dtype:
-                if block_size <= 128:
-                    waves_per_eu = 2
-                else:
-                    waves_per_eu = 1
-            else:
-                assert block_size == 128, "FP4 KV cache only supports block_size 128"
-                waves_per_eu = 2
-        else:
-            # GFX12 fallback
-            waves_per_eu = 1
-
-        if SLIDING_WINDOW is not None and SLIDING_WINDOW > 0:
-            num_segments = 1
-        else:
-            occ = waves_per_eu * 4 // attn_warps
-            MAX_SEGMENTS = max(1, math.ceil(max_seqlen_k / TILE_SIZE))
-            num_segments = max(1, target_num_prgms // 4 * occ // max(1, num_2d_prgms))
-            num_segments = min(MAX_SEGMENTS, num_segments)
-            num_segments = triton.next_power_of_2(num_segments)
-
-        # # this section increases the num_warps if the occ is too high
-        # total_num_wg = num_2d_prgms * num_segments
-        # if total_num_wg < occ * target_num_prgms:
-        #     # occ too high, increase attn_warps to relax occ
-        #     attn_warps = (waves_per_eu * 4) // max(
-        #         1, triton.next_power_of_2(total_num_wg // target_num_prgms)
-        #     )
-        #     attn_warps = max(attn_warps, 1)
-        #     attn_warps = min(attn_warps, 4)
-    else:
-        assert kv_cache_dtype in (
-            torch.float16,
-            torch.bfloat16,
-            e4m3_dtype,
-        ), (
-            f"kv_cache_dtype only supports F16 ({torch.float16}) BF16 ({torch.bfloat16}), FP8 ({e4m3_dtype}) in arch = {DEVICE_ARCH}"
-        )
-
-        if head_size >= 512 and not arch.is_rdna:
-            attn_warps, attn_stages = 4, 1
-        occ = waves_per_eu * 4 // attn_warps
-        wide_lds_copy = is_gfx950_small_head(head_size)
-        # The occupancy multiplier over-segments the KV split for the wide-copy
-        # path, so we skip it there; every other case applies it.
-        if not wide_lds_copy:
-            target_num_prgms = target_num_prgms * occ
-
-        TILE_SIZE = min(64, triton.next_power_of_2(block_size))
-        if wide_lds_copy:
-            # same de-vectorization fix as the 2D path
-            TILE_SIZE = 64
-
-        MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
-        # the >= 8 floor would clamp the smaller splits (4 and 2) back up to 8
-        MIN_SEGMENTS = 1 if wide_lds_copy else min(8, MAX_SEGMENTS)
-        if head_size >= 512 and not arch.is_rdna:
-            MIN_SEGMENTS = min(16, MAX_SEGMENTS)
-        if num_segments == 0:
-            num_segments = math.ceil(target_num_prgms / num_2d_prgms)
-            num_segments = min(num_segments, MAX_SEGMENTS)
-            num_segments = max(num_segments, MIN_SEGMENTS)
-            num_segments = triton.next_power_of_2(num_segments)
-
-        # The wide-copy path can reach 2 segments, so use segment count directly
-        # Keep 1-warp reduce for small segment counts
-        if num_segments <= (2 if wide_lds_copy else MIN_SEGMENTS):
-            reduce_num_warps = 1
-
-        if shuffled_kv_cache:
-            if q_dtype == e4m3_dtype and kv_cache_dtype == e4m3_dtype:
-                assert block_size >= 32, (
-                    "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
-                )
-            TILE_SIZE = block_size
-        elif q_dtype == e4m3_dtype and kv_cache_dtype == e4m3_dtype:
-            TILE_SIZE = max(32, TILE_SIZE)
-
-    if NUM_BLOCKS_GATHER_PER_TILE > 1:
-        # force gather mode
-        assert NUM_BLOCKS_GATHER_PER_TILE in [
-            4,
-            8,
-        ], "Only NUM_BLOCKS_GATHER_PER_TILE = 4 or 8 is supported"
-        attn_warps = 2
-        waves_per_eu = 1
-        num_segments = max(1, num_segments // NUM_BLOCKS_GATHER_PER_TILE)
-        TILE_SIZE = block_size * NUM_BLOCKS_GATHER_PER_TILE
-    elif TILE_SIZE > block_size:
-        assert TILE_SIZE % block_size == 0, (
-            "TILE_SIZE needs to be divisible by block_size"
-        )
-        NUM_BLOCKS_GATHER_PER_TILE = TILE_SIZE // block_size
-
-    # gfx1151 (RDNA3.5) decode is memory-latency-bound at bs=1: the default 2
-    # warps/workgroup leave unified_attention at only ~31% of the LPDDR5X
-    # bandwidth roofline. 8 warps/workgroup reach ~59% (1.5-1.9x on bf16 decode)
-    # with bitwise-identical output. Mirrors the waves_per_eu=8 gfx1151 tuning above.
-    if DEVICE_ARCH == "gfx1151":
-        attn_warps = 8
-
-    attn_config = {
-        "TILE_SIZE": TILE_SIZE,
-        "NUM_SEGMENTS_PER_SEQ": num_segments,
-        "num_warps": attn_warps,
-        "waves_per_eu": waves_per_eu,
-        "num_stages": attn_stages,
-    }
-
-    reduce_config = {
-        "TILE_SIZE": TILE_SIZE,
-        "NUM_SEGMENTS_PER_SEQ": num_segments,
-        "num_warps": reduce_num_warps,
-        "waves_per_eu": 2,
-        "num_stages": 1,
-    }
-
-    return attn_config, reduce_config
 
 
 def use_2d_kernel(params: _UAParams):
@@ -422,6 +248,17 @@ def unified_attention(
         K_WIDTH = 16 if kv_cache_dtype == e4m3_dtype else 8
         SCALE_K_WIDTH = 4
 
+    if shuffled_kv_cache:
+        # A shuffled tile is exactly one page (the kernels index the block table
+        # per tile and read TILE_SIZE * HEAD_SIZE_PADDED contiguous elements), so
+        # TILE_SIZE is pinned to block_size and has to be a power of 2 for the
+        # tl.arange over the tile. Non-shuffled pages have no such constraint:
+        # there the block table is indexed per token, so a tile may straddle pages.
+        assert block_size & (block_size - 1) == 0, (
+            "Unified Attention with pre-shuffled KV cache requires a power-of-2 "
+            f"page, got block_size={block_size}"
+        )
+
     num_seqs = len(seqused_k)
     num_queries_per_kv = num_query_heads // num_kv_heads
 
@@ -508,20 +345,21 @@ def unified_attention(
         else:
             _unified_attention_2d_triton(params)
     else:
-        NUM_BLOCKS_GATHER_PER_TILE = 1
-        attn_config, reduce_config = select_3d_config(
-            head_size,
-            block_size,
-            max_seqlen_k,
-            target_num_prgms,
-            num_2d_prgms,
-            q_dtype,
-            kv_cache_dtype,
-            shuffled_kv_cache,
-            NUM_BLOCKS_GATHER_PER_TILE,
-            SLIDING_WINDOW,
+        config, _ = get_unified_attention_config(
+            "kv_split",
+            config_key(params, "kv_split"),
+            params.q_dtype,
+            params.kv_cache_dtype,
+            params.head_size,
+            params.num_queries_per_kv,
+            params.block_size,
+            backend=backend,
         )
-        NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
+        NUM_SEGMENTS = config["NUM_SEGMENTS"]
+        if shuffled_kv_cache:
+            TILE_SIZE = block_size
+        else:
+            TILE_SIZE = config["TILE_SIZE"]
 
         if NUM_SEGMENTS > 1:
             segm_output = torch.empty(
@@ -556,26 +394,22 @@ def unified_attention(
             if DEVICE_ARCH == "gfx1250":
                 _unified_attention_3d_gfx1250(
                     params,
-                    BLOCK_M,
-                    BLOCK_Q,
-                    NUM_SEGMENTS,
                     segm_output,
                     segm_max,
                     segm_expsum,
-                    attn_config,
+                    NUM_SEGMENTS,
+                    TILE_SIZE,
                 )
             else:
                 assert False, f"No gluon subwrapper for {DEVICE_ARCH}"
         else:
             _unified_attention_3d_triton(
                 params,
-                BLOCK_M,
-                BLOCK_Q,
-                NUM_SEGMENTS,
                 segm_output,
                 segm_max,
                 segm_expsum,
-                attn_config,
+                NUM_SEGMENTS,
+                TILE_SIZE,
             )
 
         if NUM_SEGMENTS == 1:
@@ -592,22 +426,22 @@ def unified_attention(
             if DEVICE_ARCH == "gfx1250":
                 _reduce_segments_gfx1250(
                     params,
-                    NUM_SEGMENTS,
                     segm_output,
                     segm_max,
                     segm_expsum,
-                    reduce_config,
+                    NUM_SEGMENTS,
+                    TILE_SIZE,
                 )
             else:
                 assert False, f"No gluon subwrapper for {DEVICE_ARCH}"
         else:
             _reduce_segments_triton(
                 params,
-                BLOCK_Q,
                 segm_output,
                 segm_max,
                 segm_expsum,
-                reduce_config,
+                NUM_SEGMENTS,
+                TILE_SIZE,
             )
     return out
 
@@ -683,13 +517,13 @@ def _unified_attention_2d_triton(params: _UAParams):
         params.block_size,
         backend="triton",
     )
-    # the json holds the tuned BLOCK_M, a query block still has to hold a full
-    # kv head's queries
     config["BLOCK_M"] = max(
         config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)
     )
     config["BLOCK_Q"] = config["BLOCK_M"] // params.num_queries_per_kv
     assert config["BLOCK_Q"] >= 1
+    if params.shuffled_kv_cache:
+        config["TILE_SIZE"] = params.block_size
     if params.all_decode:
         total_num_q_blocks = params.num_seqs
     else:
@@ -751,16 +585,35 @@ def _unified_attention_2d_triton(params: _UAParams):
 
 def _unified_attention_3d_triton(
     params: _UAParams,
-    BLOCK_M,
-    BLOCK_Q,
-    NUM_SEGMENTS,
     segm_output,
     segm_max,
     segm_expsum,
-    attn_config,
+    NUM_SEGMENTS,
+    TILE_SIZE,
 ):
+    config, _ = get_unified_attention_config(
+        "attn_3d",
+        config_key(params, "attn_3d"),
+        params.q_dtype,
+        params.kv_cache_dtype,
+        params.head_size,
+        params.num_queries_per_kv,
+        params.block_size,
+        backend="triton",
+    )
+    config["BLOCK_M"] = max(
+        config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)
+    )
+    config["BLOCK_Q"] = config["BLOCK_M"] // params.num_queries_per_kv
+    assert config["BLOCK_Q"] >= 1
+
+    if params.all_decode:
+        total_num_q_blocks = params.num_seqs
+    else:
+        total_num_q_blocks = params.num_tokens // config["BLOCK_Q"] + params.num_seqs
+
     kernel_unified_attention_3d[
-        (params.total_num_q_blocks, params.num_kv_heads, NUM_SEGMENTS)
+        (total_num_q_blocks, params.num_kv_heads, NUM_SEGMENTS)
     ](
         segm_output_ptr=segm_output,
         segm_max_ptr=segm_max,
@@ -806,27 +659,38 @@ def _unified_attention_3d_triton(
         stride_v_cache_2=params.v.stride(2),
         stride_v_cache_3=params.v.stride(3),
         query_start_len_ptr=params.cu_seqlens_q,
-        BLOCK_Q=BLOCK_Q,
         num_seqs=params.num_seqs,
-        BLOCK_M=BLOCK_M,
         ALL_DECODE=params.all_decode,
         SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
         K_WIDTH=params.k_width,
         IS_Q_FP8=(params.q_dtype == e4m3_dtype),
         IS_KV_FP8=(params.kv_cache_dtype == e4m3_dtype),
-        **attn_config,
+        NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
+        TILE_SIZE=TILE_SIZE,
+        **config,
     )
 
 
 def _reduce_segments_triton(
     params: _UAParams,
-    BLOCK_Q,
     segm_output,
     segm_max,
     segm_expsum,
-    reduce_config,
+    NUM_SEGMENTS,
+    TILE_SIZE,
 ):
     head_size_padded = triton.next_power_of_2(params.head_size)
+    config, _ = get_unified_attention_config(
+        "reduce",
+        config_key(params, "reduce"),
+        params.q_dtype,
+        params.kv_cache_dtype,
+        params.head_size,
+        params.num_queries_per_kv,
+        params.block_size,
+        backend="triton",
+    )
+
     reduce_segments[(params.num_tokens, params.num_query_heads)](
         output_ptr=params.out,
         segm_output_ptr=segm_output,
@@ -842,8 +706,10 @@ def _reduce_segments_triton(
         HEAD_SIZE=params.head_size,
         HEAD_SIZE_PADDED=head_size_padded,
         query_start_len_ptr=params.cu_seqlens_q,
-        BLOCK_Q=BLOCK_Q,
-        **reduce_config,
+        NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
+        TILE_SIZE=TILE_SIZE,
+        BLOCK_Q=None,
+        **config,
     )
 
 
@@ -862,6 +728,7 @@ _unified_attention_3d_{arch}(
     segm_max,
     segm_expsum,
     NUM_SEGMENTS,
+    TILE_SIZE,
 ): ...
 
 _reduce_segments_{arch}(
@@ -870,6 +737,7 @@ _reduce_segments_{arch}(
     segm_max,
     segm_expsum,
     NUM_SEGMENTS,
+    TILE_SIZE,
 ): ...
 ```
 """
@@ -884,7 +752,6 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
         1=2-stage version,
         2=4-stage version
     """
-    NUM_SEQS = params.num_seqs
     assert params.softcap == 0, "Softcap is not supported"
 
     config, _ = get_unified_attention_config(
@@ -897,9 +764,8 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
         params.block_size,
         backend="gluon",
     )
+    NUM_SEQS = params.num_seqs
     TILE_SIZE = config["TILE_SIZE"]
-    # the json holds the tuned BLOCK_M, a query block still has to hold a full
-    # kv head's queries
     BLOCK_M = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
     loop_variant = config["LOOP_VARIANT"]
 
@@ -918,6 +784,7 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
         loop_variant = 0
 
     BLOCK_Q = BLOCK_M // params.num_queries_per_kv
+    assert BLOCK_Q >= 1
     if params.all_decode:
         total_query_blocks = NUM_SEQS
     else:
@@ -981,19 +848,38 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
 
 def _unified_attention_3d_gfx1250(
     params: _UAParams,
-    BLOCK_M,
-    BLOCK_Q,
-    NUM_SEGMENTS,
     segm_output,
     segm_max,
     segm_expsum,
-    attn_config,
+    NUM_SEGMENTS,
+    TILE_SIZE,
 ):
     NUM_BLOCKS_GATHER_PER_TILE = 1
     QUERY_DTYPE = get_dtype_str(params.q_dtype)
     KV_CACHE_DTYPE = get_dtype_str(params.kv_cache_dtype)
+    config, _ = get_unified_attention_config(
+        "attn_3d",
+        config_key(params, "attn_3d"),
+        params.q_dtype,
+        params.kv_cache_dtype,
+        params.head_size,
+        params.num_queries_per_kv,
+        params.block_size,
+        backend="gluon",
+    )
+    config["BLOCK_M"] = max(
+        config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)
+    )
+    config["BLOCK_Q"] = config["BLOCK_M"] // params.num_queries_per_kv
+    assert config["BLOCK_Q"] >= 1
+
+    if params.all_decode:
+        total_num_q_blocks = params.num_seqs
+    else:
+        total_num_q_blocks = params.num_tokens // config["BLOCK_Q"] + params.num_seqs
+
     _unified_attention_kernel_3d_gfx1250[
-        (params.total_num_q_blocks, params.num_kv_heads, NUM_SEGMENTS)
+        (total_num_q_blocks, params.num_kv_heads, NUM_SEGMENTS)
     ](
         segm_output_ptr=segm_output,
         segm_max_ptr=segm_max,
@@ -1048,8 +934,6 @@ def _unified_attention_3d_gfx1250(
         SCALE=params.softmax_scale,
         NUM_QUERY_HEADS=params.num_query_heads,
         NUM_KV_HEADS=params.num_kv_heads,
-        BLOCK_Q=BLOCK_Q,
-        BLOCK_M=BLOCK_M,
         ALL_DECODE=params.all_decode,
         SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
         K_WIDTH=params.k_width,
@@ -1059,20 +943,33 @@ def _unified_attention_3d_gfx1250(
         QUERY_DTYPE=QUERY_DTYPE,
         KV_CACHE_DTYPE=KV_CACHE_DTYPE,
         BLOCK_SCALES_SIZE=params.block_scales_size,
-        **attn_config,
+        NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
+        TILE_SIZE=TILE_SIZE,
+        **config,
     )
 
 
 def _reduce_segments_gfx1250(
     params: _UAParams,
-    NUM_SEGMENTS,
     segm_output,
     segm_max,
     segm_expsum,
-    reduce_config,
+    NUM_SEGMENTS,
+    TILE_SIZE,
 ):
     head_size_padded = triton.next_power_of_2(params.head_size)
     gluon_num_warps = 8 if params.num_query_heads % 8 == 0 else 4
+    config, _ = get_unified_attention_config(
+        "reduce",
+        config_key(params, "reduce"),
+        params.q_dtype,
+        params.kv_cache_dtype,
+        params.head_size,
+        params.num_queries_per_kv,
+        params.block_size,
+        backend="gluon",
+    )
+
     _reduce_segments_kernel_gfx1250[(params.num_tokens,)](
         output_ptr=params.out,
         segm_output_ptr=segm_output,
@@ -1087,10 +984,11 @@ def _reduce_segments_gfx1250(
         S=NUM_SEGMENTS,
         D=params.head_size,
         D_PAD=head_size_padded,
-        TILE_SIZE=reduce_config["TILE_SIZE"],
-        NUM_WARPS=gluon_num_warps,
+        TILE_SIZE=TILE_SIZE,
         IS_FP8_OUT=(params.out.dtype == e4m3_dtype),
         FP8_MIN=torch.finfo(e4m3_dtype).min,
         FP8_MAX=torch.finfo(e4m3_dtype).max,
+        NUM_WARPS=gluon_num_warps,
         num_warps=gluon_num_warps,
+        **config,
     )

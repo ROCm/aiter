@@ -33,7 +33,7 @@ def _dtype_keys(q_tag: str, kv_tag: str):
 
 @functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
 def _get_unified_attention_config_cached(
-    op: str,  # "attn_2d" | "attn_3d" | "reduce"
+    op: str,  # "attn_2d" | "attn_3d" | "reduce" | "kv_split"
     key: str,
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
@@ -129,6 +129,18 @@ def _get_unified_attention_config_cached(
     if "any" in dtype_configs:
         return dict(dtype_configs["any"]), is_tuned
 
+    # round the page up
+    for bound in search_bounds:
+        candidate = f"BS_GEQ_{bound}"
+        if candidate in dtype_configs:
+            return dict(dtype_configs[candidate]), is_tuned
+
+    # no BS_GEQ_x bucket at all, so there is nothing above: take the last one below
+    for bound in reversed(search_bounds):
+        candidate = f"BS_LEQ_{bound}"
+        if candidate in dtype_configs:
+            return dict(dtype_configs[candidate]), is_tuned
+
     raise KeyError(
         f"{where}: no matching configuration found for "
         f"head_size={head_size} block_size={block_size} num_queries_per_kv={num_queries_per_kv}"
@@ -136,7 +148,7 @@ def _get_unified_attention_config_cached(
 
 
 def get_unified_attention_config(
-    op: str,  # "attn_2d" | "attn_3d" | "reduce"
+    op: str,  # "attn_2d" | "attn_3d" | "reduce" | "kv_split"
     key: str,
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
@@ -156,16 +168,21 @@ def get_unified_attention_config(
        UNIFIED-ATTENTION-D={head_size}-QPKV={num_queries_per_kv}.json
     3. If it is absent, try UNIFIED-ATTENTION-D={head_size}.json; the first
        specialized file that exists wins and marks the config as tuned
-    4. Look up the op section (attn_2d|attn_3d|reduce) in the resulting file
+    4. Look up the op section (attn_2d|attn_3d|reduce|kv_split) in the resulting file
     5. Look up key inside that op, falling back to "any"
     6. Look up the q/kv dtype entry, trying "{q}_{kv}", "{q}_any", "any_{kv}",
        then "any", with the tags (nvfp4|fp8|bf16) coming from get_dtype_str()
     7. Search for BS_LEQ_x keys in order of bounds (default: _DEFAULT_BS_BOUNDS)
     8. If no BS_LEQ_x matches, search for BS_GEQ_x keys in reverse order
     9. Fall back to "any" if no bounds match
+    10. If the table has no "any" and block_size fell between the largest
+        BS_LEQ_x and the smallest BS_GEQ_x (e.g. a 48-token page in a table
+        bucketed 16/32/64+), round the page up to the smallest BS_GEQ_x, or
+        down to the largest BS_LEQ_x when the table has no BS_GEQ_x at all.
+        This makes the lookup total for any non-empty table
 
     Args:
-        op (str): Unified attention operation (attn_2d|attn_3d|reduce)
+        op (str): Unified attention operation (attn_2d|attn_3d|reduce|kv_split)
         bounds (tuple[int, ...] | None, optional): Custom bounds to use instead of
             _DEFAULT_BS_BOUNDS. Defaults to None.
 
