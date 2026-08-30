@@ -199,7 +199,15 @@ def get_flydsl_stage1_kernels(
 
     tile_ns = [32, 64, 128] if is_fp4_b else [128]
     tile_ks = [128, 256] if is_a16w4 else [256]
-    tile_ms = [16, 32, 64, 128] if a_dtype == "fp8" and is_fp4_b else [32, 64, 128]
+    # tile_m=16 halves the sort/tile M quantum. It is the winning decode config for
+    # high-expert-count shapes (Kimi-K3 E=896: measured 1.17-1.38x over tile_m=32 for
+    # every token bucket <=512, and a loss from 1024 up), so a16w4 needs the names
+    # registered or the tuner/CSV cannot select it.
+    tile_ms = (
+        [16, 32, 64, 128]
+        if (is_fp4_b and (a_dtype == "fp8" or is_a16w4))
+        else [32, 64, 128]
+    )
 
     waves_per_eus = [1, 2, 3, 4]
     k_batches = [1, 2, 4, 7, 14]
@@ -207,7 +215,10 @@ def get_flydsl_stage1_kernels(
     xcd_swizzles = [0, 1, 4] if is_a16w4 else [0, 4]
 
     for tm in tile_ms:
-        if tm == 32:
+        # tile_m=16 shares tile_m=32's N-tile set on the a16w port: both have
+        # m_repeat<=2 and take tile_n as given, so the narrow N-tiles the tiny-batch
+        # decode configs use (t*x32 / t*x64) are legal at 16 exactly as at 32.
+        if tm == 32 or (tm == 16 and is_a16w4):
             # tile_n=192/256 are a16w4-only. Each is the largest N-tile that divides
             # one of the two production inter_dims exactly (192 | 384, 256 | 512),
             # which cuts NUM_N_BLOCKS and with it the A-gather traffic and the CTA
@@ -245,12 +256,14 @@ def get_flydsl_stage1_kernels(
                                     if xcd > 0:
                                         base += f"_xcd{xcd}"
                                     # k_wave (intra-block K-slice): only for the
-                                    # small-M tile (tile_m==32), no split-K/mock,
-                                    # and capped to <=8 total waves (<=512 threads).
+                                    # small-M tiles (tile_m in {16,32}; 16 is a16w-only),
+                                    # no split-K/mock, and capped to <=8 total waves
+                                    # (<=512 threads).
                                     num_n_waves = min(4, tn // 32)
+                                    _small_m = tm == 32 or (tm == 16 and is_a16w4)
                                     k_waves = (
                                         [1, 2, 4]
-                                        if (tm == 32 and kb == 1 and not go)
+                                        if (_small_m and kb == 1 and not go)
                                         else [1]
                                     )
                                     for kw in k_waves:
