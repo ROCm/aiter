@@ -47,6 +47,13 @@
           "num_warps": 2,
           "num_stages": 1,
           "waves_per_eu": 6
+        },
+        "any": {
+          "BLOCK_M": 16,
+          "TILE_SIZE": 256,
+          "num_warps": 2,
+          "num_stages": 1,
+          "waves_per_eu": 6
         }
       }
     },
@@ -92,6 +99,13 @@
           "waves_per_eu": 6
         },
         "BS_GEQ_256": {
+          "BLOCK_M": 16,
+          "TILE_SIZE": 256,
+          "num_warps": 2,
+          "num_stages": 1,
+          "waves_per_eu": 6
+        },
+        "any": {
           "BLOCK_M": 16,
           "TILE_SIZE": 256,
           "num_warps": 2,
@@ -147,6 +161,13 @@
           "num_warps": 2,
           "num_stages": 1,
           "waves_per_eu": 6
+        },
+        "any": {
+          "BLOCK_M": 16,
+          "TILE_SIZE": 256,
+          "num_warps": 2,
+          "num_stages": 1,
+          "waves_per_eu": 6
         }
       }
     },
@@ -192,6 +213,13 @@
           "waves_per_eu": 6
         },
         "BS_GEQ_256": {
+          "BLOCK_M": 16,
+          "TILE_SIZE": 256,
+          "num_warps": 2,
+          "num_stages": 1,
+          "waves_per_eu": 6
+        },
+        "any": {
           "BLOCK_M": 16,
           "TILE_SIZE": 256,
           "num_warps": 2,
@@ -247,6 +275,13 @@
           "num_warps": 4,
           "num_stages": 1,
           "waves_per_eu": 6
+        },
+        "any": {
+          "BLOCK_M": 64,
+          "TILE_SIZE": 256,
+          "num_warps": 4,
+          "num_stages": 1,
+          "waves_per_eu": 6
         }
       }
     },
@@ -292,6 +327,13 @@
           "waves_per_eu": 6
         },
         "BS_GEQ_256": {
+          "BLOCK_M": 64,
+          "TILE_SIZE": 256,
+          "num_warps": 4,
+          "num_stages": 1,
+          "waves_per_eu": 6
+        },
+        "any": {
           "BLOCK_M": 64,
           "TILE_SIZE": 256,
           "num_warps": 4,
@@ -347,6 +389,13 @@
           "num_warps": 4,
           "num_stages": 1,
           "waves_per_eu": 6
+        },
+        "any": {
+          "BLOCK_M": 64,
+          "TILE_SIZE": 256,
+          "num_warps": 4,
+          "num_stages": 1,
+          "waves_per_eu": 6
         }
       }
     },
@@ -392,6 +441,13 @@
           "waves_per_eu": 6
         },
         "BS_GEQ_256": {
+          "BLOCK_M": 64,
+          "TILE_SIZE": 256,
+          "num_warps": 4,
+          "num_stages": 1,
+          "waves_per_eu": 6
+        },
+        "any": {
           "BLOCK_M": 64,
           "TILE_SIZE": 256,
           "num_warps": 4,
@@ -447,6 +503,13 @@
           "num_warps": 2,
           "num_stages": 1,
           "waves_per_eu": 6
+        },
+        "any": {
+          "BLOCK_M": 16,
+          "TILE_SIZE": 256,
+          "num_warps": 2,
+          "num_stages": 1,
+          "waves_per_eu": 6
         }
       }
     },
@@ -492,6 +555,13 @@
           "waves_per_eu": 6
         },
         "BS_GEQ_256": {
+          "BLOCK_M": 16,
+          "TILE_SIZE": 256,
+          "num_warps": 2,
+          "num_stages": 1,
+          "waves_per_eu": 6
+        },
+        "any": {
           "BLOCK_M": 16,
           "TILE_SIZE": 256,
           "num_warps": 2,
@@ -547,6 +617,13 @@
           "num_warps": 2,
           "num_stages": 1,
           "waves_per_eu": 6
+        },
+        "any": {
+          "BLOCK_M": 16,
+          "TILE_SIZE": 256,
+          "num_warps": 2,
+          "num_stages": 1,
+          "waves_per_eu": 6
         }
       }
     },
@@ -592,6 +669,13 @@
           "waves_per_eu": 6
         },
         "BS_GEQ_256": {
+          "BLOCK_M": 16,
+          "TILE_SIZE": 256,
+          "num_warps": 2,
+          "num_stages": 1,
+          "waves_per_eu": 6
+        },
+        "any": {
           "BLOCK_M": 16,
           "TILE_SIZE": 256,
           "num_warps": 2,
@@ -647,6 +731,13 @@
           "num_warps": 4,
           "num_stages": 1,
           "waves_per_eu": 6
+        },
+        "any": {
+          "BLOCK_M": 64,
+          "TILE_SIZE": 256,
+          "num_warps": 4,
+          "num_stages": 1,
+          "waves_per_eu": 6
         }
       }
     },
@@ -692,6 +783,13 @@
           "waves_per_eu": 6
         },
         "BS_GEQ_256": {
+          "BLOCK_M": 64,
+          "TILE_SIZE": 256,
+          "num_warps": 4,
+          "num_stages": 1,
+          "waves_per_eu": 6
+        },
+        "any": {
           "BLOCK_M": 64,
           "TILE_SIZE": 256,
           "num_warps": 4,
@@ -747,6 +845,13 @@
           "num_warps": 4,
           "num_stages": 1,
           "waves_per_eu": 6
+        },
+        "any": {
+          "BLOCK_M": 64,
+          "TILE_SIZE": 256,
+          "num_warps": 4,
+          "num_stages": 1,
+          "waves_per_eu": 6
         }
       }
     },
@@ -792,6 +897,13 @@
           "waves_per_eu": 6
         },
         "BS_GEQ_256": {
+          "BLOCK_M": 64,
+          "TILE_SIZE": 256,
+          "num_warps": 4,
+          "num_stages": 1,
+          "waves_per_eu": 6
+        },
+        "any": {
           "BLOCK_M": 64,
           "TILE_SIZE": 256,
           "num_warps": 4,
@@ -847,6 +959,13 @@
           "num_warps": 4,
           "num_stages": 1,
           "waves_per_eu": 6
+        },
+        "any": {
+          "BLOCK_M": 64,
+          "TILE_SIZE": 256,
+          "num_warps": 4,
+          "num_stages": 1,
+          "waves_per_eu": 6
         }
       }
     },
@@ -892,6 +1011,13 @@
           "waves_per_eu": 6
         },
         "BS_GEQ_256": {
+          "BLOCK_M": 64,
+          "TILE_SIZE": 256,
+          "num_warps": 4,
+          "num_stages": 1,
+          "waves_per_eu": 6
+        },
+        "any": {
           "BLOCK_M": 64,
           "TILE_SIZE": 256,
           "num_warps": 4,
@@ -947,6 +1073,13 @@
           "num_warps": 4,
           "num_stages": 1,
           "waves_per_eu": 6
+        },
+        "any": {
+          "BLOCK_M": 64,
+          "TILE_SIZE": 256,
+          "num_warps": 4,
+          "num_stages": 1,
+          "waves_per_eu": 6
         }
       }
     },
@@ -992,6 +1125,13 @@
           "waves_per_eu": 6
         },
         "BS_GEQ_256": {
+          "BLOCK_M": 64,
+          "TILE_SIZE": 256,
+          "num_warps": 4,
+          "num_stages": 1,
+          "waves_per_eu": 6
+        },
+        "any": {
           "BLOCK_M": 64,
           "TILE_SIZE": 256,
           "num_warps": 4,
@@ -1047,6 +1187,13 @@
           "num_warps": 2,
           "num_stages": 1,
           "waves_per_eu": 6
+        },
+        "any": {
+          "BLOCK_M": 16,
+          "TILE_SIZE": 256,
+          "num_warps": 2,
+          "num_stages": 1,
+          "waves_per_eu": 6
         }
       }
     },
@@ -1092,6 +1239,13 @@
           "waves_per_eu": 6
         },
         "BS_GEQ_256": {
+          "BLOCK_M": 16,
+          "TILE_SIZE": 256,
+          "num_warps": 2,
+          "num_stages": 1,
+          "waves_per_eu": 6
+        },
+        "any": {
           "BLOCK_M": 16,
           "TILE_SIZE": 256,
           "num_warps": 2,
@@ -1147,6 +1301,13 @@
           "num_warps": 2,
           "num_stages": 1,
           "waves_per_eu": 6
+        },
+        "any": {
+          "BLOCK_M": 16,
+          "TILE_SIZE": 256,
+          "num_warps": 2,
+          "num_stages": 1,
+          "waves_per_eu": 6
         }
       }
     },
@@ -1197,6 +1358,13 @@
           "num_warps": 2,
           "num_stages": 1,
           "waves_per_eu": 6
+        },
+        "any": {
+          "BLOCK_M": 16,
+          "TILE_SIZE": 256,
+          "num_warps": 2,
+          "num_stages": 1,
+          "waves_per_eu": 6
         }
       }
     },
@@ -1210,6 +1378,13 @@
           "waves_per_eu": 6
         },
         "BS_GEQ_64": {
+          "BLOCK_M": 16,
+          "TILE_SIZE": 64,
+          "num_warps": 4,
+          "num_stages": 1,
+          "waves_per_eu": 6
+        },
+        "any": {
           "BLOCK_M": 16,
           "TILE_SIZE": 64,
           "num_warps": 4,
@@ -1233,6 +1408,13 @@
           "waves_per_eu": 6
         },
         "BS_GEQ_64": {
+          "BLOCK_M": 16,
+          "TILE_SIZE": 64,
+          "num_warps": 4,
+          "num_stages": 1,
+          "waves_per_eu": 6
+        },
+        "any": {
           "BLOCK_M": 16,
           "TILE_SIZE": 64,
           "num_warps": 4,
@@ -1277,6 +1459,13 @@
           "num_warps": 4,
           "num_stages": 1,
           "waves_per_eu": 6
+        },
+        "any": {
+          "BLOCK_M": 16,
+          "TILE_SIZE": 256,
+          "num_warps": 4,
+          "num_stages": 1,
+          "waves_per_eu": 6
         }
       }
     },
@@ -1290,6 +1479,13 @@
           "waves_per_eu": 6
         },
         "BS_GEQ_64": {
+          "BLOCK_M": 16,
+          "TILE_SIZE": 64,
+          "num_warps": 4,
+          "num_stages": 1,
+          "waves_per_eu": 6
+        },
+        "any": {
           "BLOCK_M": 16,
           "TILE_SIZE": 64,
           "num_warps": 4,
@@ -1313,6 +1509,13 @@
           "waves_per_eu": 6
         },
         "BS_GEQ_64": {
+          "BLOCK_M": 16,
+          "TILE_SIZE": 64,
+          "num_warps": 4,
+          "num_stages": 1,
+          "waves_per_eu": 6
+        },
+        "any": {
           "BLOCK_M": 16,
           "TILE_SIZE": 64,
           "num_warps": 4,
@@ -1357,6 +1560,13 @@
           "num_warps": 4,
           "num_stages": 1,
           "waves_per_eu": 6
+        },
+        "any": {
+          "BLOCK_M": 16,
+          "TILE_SIZE": 256,
+          "num_warps": 4,
+          "num_stages": 1,
+          "waves_per_eu": 6
         }
       }
     },
@@ -1370,6 +1580,13 @@
           "waves_per_eu": 6
         },
         "BS_GEQ_64": {
+          "BLOCK_M": 16,
+          "TILE_SIZE": 64,
+          "num_warps": 4,
+          "num_stages": 1,
+          "waves_per_eu": 6
+        },
+        "any": {
           "BLOCK_M": 16,
           "TILE_SIZE": 64,
           "num_warps": 4,
@@ -1393,6 +1610,13 @@
           "waves_per_eu": 6
         },
         "BS_GEQ_64": {
+          "BLOCK_M": 16,
+          "TILE_SIZE": 64,
+          "num_warps": 4,
+          "num_stages": 1,
+          "waves_per_eu": 6
+        },
+        "any": {
           "BLOCK_M": 16,
           "TILE_SIZE": 64,
           "num_warps": 4,
@@ -1437,6 +1661,13 @@
           "num_warps": 4,
           "num_stages": 1,
           "waves_per_eu": 6
+        },
+        "any": {
+          "BLOCK_M": 16,
+          "TILE_SIZE": 256,
+          "num_warps": 4,
+          "num_stages": 1,
+          "waves_per_eu": 6
         }
       }
     },
@@ -1450,6 +1681,13 @@
           "waves_per_eu": 6
         },
         "BS_GEQ_64": {
+          "BLOCK_M": 16,
+          "TILE_SIZE": 64,
+          "num_warps": 4,
+          "num_stages": 1,
+          "waves_per_eu": 6
+        },
+        "any": {
           "BLOCK_M": 16,
           "TILE_SIZE": 64,
           "num_warps": 4,
@@ -1473,6 +1711,13 @@
           "waves_per_eu": 6
         },
         "BS_GEQ_64": {
+          "BLOCK_M": 16,
+          "TILE_SIZE": 64,
+          "num_warps": 4,
+          "num_stages": 1,
+          "waves_per_eu": 6
+        },
+        "any": {
           "BLOCK_M": 16,
           "TILE_SIZE": 64,
           "num_warps": 4,
@@ -1517,6 +1762,13 @@
           "num_warps": 4,
           "num_stages": 1,
           "waves_per_eu": 6
+        },
+        "any": {
+          "BLOCK_M": 16,
+          "TILE_SIZE": 256,
+          "num_warps": 4,
+          "num_stages": 1,
+          "waves_per_eu": 6
         }
       }
     },
@@ -1530,6 +1782,13 @@
           "waves_per_eu": 6
         },
         "BS_GEQ_64": {
+          "BLOCK_M": 16,
+          "TILE_SIZE": 64,
+          "num_warps": 4,
+          "num_stages": 1,
+          "waves_per_eu": 6
+        },
+        "any": {
           "BLOCK_M": 16,
           "TILE_SIZE": 64,
           "num_warps": 4,
@@ -1553,6 +1812,13 @@
           "waves_per_eu": 6
         },
         "BS_GEQ_64": {
+          "BLOCK_M": 16,
+          "TILE_SIZE": 64,
+          "num_warps": 4,
+          "num_stages": 1,
+          "waves_per_eu": 6
+        },
+        "any": {
           "BLOCK_M": 16,
           "TILE_SIZE": 64,
           "num_warps": 4,
@@ -1597,6 +1863,13 @@
           "num_warps": 4,
           "num_stages": 1,
           "waves_per_eu": 6
+        },
+        "any": {
+          "BLOCK_M": 16,
+          "TILE_SIZE": 256,
+          "num_warps": 4,
+          "num_stages": 1,
+          "waves_per_eu": 6
         }
       }
     },
@@ -1610,6 +1883,13 @@
           "waves_per_eu": 6
         },
         "BS_GEQ_64": {
+          "BLOCK_M": 16,
+          "TILE_SIZE": 64,
+          "num_warps": 4,
+          "num_stages": 1,
+          "waves_per_eu": 6
+        },
+        "any": {
           "BLOCK_M": 16,
           "TILE_SIZE": 64,
           "num_warps": 4,
@@ -1633,6 +1913,13 @@
           "waves_per_eu": 6
         },
         "BS_GEQ_64": {
+          "BLOCK_M": 16,
+          "TILE_SIZE": 64,
+          "num_warps": 4,
+          "num_stages": 1,
+          "waves_per_eu": 6
+        },
+        "any": {
           "BLOCK_M": 16,
           "TILE_SIZE": 64,
           "num_warps": 4,
@@ -1672,6 +1959,13 @@
           "waves_per_eu": 6
         },
         "BS_GEQ_256": {
+          "BLOCK_M": 16,
+          "TILE_SIZE": 256,
+          "num_warps": 4,
+          "num_stages": 1,
+          "waves_per_eu": 6
+        },
+        "any": {
           "BLOCK_M": 16,
           "TILE_SIZE": 256,
           "num_warps": 4,
@@ -1851,6 +2145,10 @@
         "BS_GEQ_64": {
           "NUM_SEGMENTS": 16,
           "TILE_SIZE": 64
+        },
+        "any": {
+          "NUM_SEGMENTS": 16,
+          "TILE_SIZE": 64
         }
       },
       "any": {
@@ -1863,6 +2161,10 @@
           "TILE_SIZE": 32
         },
         "BS_GEQ_64": {
+          "NUM_SEGMENTS": 16,
+          "TILE_SIZE": 64
+        },
+        "any": {
           "NUM_SEGMENTS": 16,
           "TILE_SIZE": 64
         }
@@ -1889,6 +2191,10 @@
         "BS_GEQ_256": {
           "NUM_SEGMENTS": 16,
           "TILE_SIZE": 256
+        },
+        "any": {
+          "NUM_SEGMENTS": 16,
+          "TILE_SIZE": 256
         }
       }
     },
@@ -1905,6 +2211,10 @@
         "BS_GEQ_64": {
           "NUM_SEGMENTS": 16,
           "TILE_SIZE": 64
+        },
+        "any": {
+          "NUM_SEGMENTS": 16,
+          "TILE_SIZE": 64
         }
       },
       "any": {
@@ -1917,6 +2227,10 @@
           "TILE_SIZE": 32
         },
         "BS_GEQ_64": {
+          "NUM_SEGMENTS": 16,
+          "TILE_SIZE": 64
+        },
+        "any": {
           "NUM_SEGMENTS": 16,
           "TILE_SIZE": 64
         }
@@ -1943,6 +2257,10 @@
         "BS_GEQ_256": {
           "NUM_SEGMENTS": 16,
           "TILE_SIZE": 256
+        },
+        "any": {
+          "NUM_SEGMENTS": 16,
+          "TILE_SIZE": 256
         }
       }
     },
@@ -1959,6 +2277,10 @@
         "BS_GEQ_64": {
           "NUM_SEGMENTS": 16,
           "TILE_SIZE": 64
+        },
+        "any": {
+          "NUM_SEGMENTS": 16,
+          "TILE_SIZE": 64
         }
       },
       "any": {
@@ -1971,6 +2293,10 @@
           "TILE_SIZE": 32
         },
         "BS_GEQ_64": {
+          "NUM_SEGMENTS": 16,
+          "TILE_SIZE": 64
+        },
+        "any": {
           "NUM_SEGMENTS": 16,
           "TILE_SIZE": 64
         }
@@ -1997,6 +2323,10 @@
         "BS_GEQ_256": {
           "NUM_SEGMENTS": 16,
           "TILE_SIZE": 256
+        },
+        "any": {
+          "NUM_SEGMENTS": 16,
+          "TILE_SIZE": 256
         }
       }
     },
@@ -2013,6 +2343,10 @@
         "BS_GEQ_64": {
           "NUM_SEGMENTS": 16,
           "TILE_SIZE": 64
+        },
+        "any": {
+          "NUM_SEGMENTS": 16,
+          "TILE_SIZE": 64
         }
       },
       "any": {
@@ -2025,6 +2359,10 @@
           "TILE_SIZE": 32
         },
         "BS_GEQ_64": {
+          "NUM_SEGMENTS": 16,
+          "TILE_SIZE": 64
+        },
+        "any": {
           "NUM_SEGMENTS": 16,
           "TILE_SIZE": 64
         }
@@ -2049,6 +2387,10 @@
           "TILE_SIZE": 128
         },
         "BS_GEQ_256": {
+          "NUM_SEGMENTS": 16,
+          "TILE_SIZE": 256
+        },
+        "any": {
           "NUM_SEGMENTS": 16,
           "TILE_SIZE": 256
         }
