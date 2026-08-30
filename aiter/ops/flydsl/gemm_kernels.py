@@ -25,6 +25,14 @@ from .kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
 from .kernels.tensor_shim import _run_compiled
 from .utils import get_shared_memory_per_block, is_flydsl_available
 
+# Tile candidates and the tuned-CSV kernelName format live in the tune-metadata
+# module so the tuner that writes a row and this op that reads it back cannot
+# drift. Order is part of the contract: kernelId indexes into it.
+from .gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_common import (
+    TILE_CANDIDATES as _BLOCKSCALE_TILE_CANDIDATES,
+    tile_is_valid as blockscale_tile_is_valid,
+)
+
 __all__ = [
     "flydsl_hgemm",
 ]
@@ -1138,3 +1146,285 @@ def flydsl_preshuffle_gemm_a8(
         Out.copy_(out_contig)
 
     return Out
+
+
+# ---------------------------------------------------------------------------
+# FlyDSL blockscale bpreshuffle GEMM kernel management
+# ---------------------------------------------------------------------------
+
+_flydsl_blockscale_compile_fn = None
+_flydsl_blockscale_import_done = False
+
+
+def _get_blockscale_compile_fn():
+    """Lazy-import the block-scale compiler so this module loads without FlyDSL."""
+    global _flydsl_blockscale_compile_fn
+    global _flydsl_blockscale_import_done
+    if _flydsl_blockscale_import_done:
+        return _flydsl_blockscale_compile_fn
+    _flydsl_blockscale_import_done = True
+    if not is_flydsl_available():
+        logger.info("[FlyDSL] not available, will fall back to CK/CKTile")
+        return None
+    try:
+        from .kernels import gemm_blockscale_preshuffle as _bs
+
+        _flydsl_blockscale_compile_fn = _bs.compile_blockscale_preshuffle_gemm
+        logger.info("[FlyDSL] loaded blockscale bpreshuffle GEMM compiler")
+    except Exception as e:
+        logger.info(
+            f"[FlyDSL] blockscale bpreshuffle GEMM not available, "
+            f"will fall back to CK/CKTile: {e}"
+        )
+    return _flydsl_blockscale_compile_fn
+
+
+@functools.lru_cache(maxsize=1024)
+def _blockscale_tile_is_valid(
+    tile_m, tile_n, tile_k, n, k, scale_block_k, use_cshuffle_epilog=False, num_waves=4
+):
+    """Cached tile_is_valid, which builds a real LDS plan and queries the device limit.
+
+    Both flags are part of the key because both change the verdict: cshuffle roughly
+    doubles the LDS footprint, and num_waves sets how tile_n must divide and how many
+    bytes each thread copies.
+    """
+    return blockscale_tile_is_valid(
+        tile_m,
+        tile_n,
+        tile_k,
+        n,
+        k,
+        scale_block_k,
+        num_waves=num_waves,
+        use_cshuffle_epilog=use_cshuffle_epilog,
+    )
+
+
+@functools.lru_cache(maxsize=1024)
+def select_blockscale_tile_config(
+    m: int,
+    n: int,
+    k: int,
+    scale_block_k: int = 128,
+    use_cshuffle_epilog: bool = False,
+    num_waves: int = 4,
+) -> tuple:
+    """Heuristic tile pick for shapes with no tuned row; prefer a tuned kernelName.
+
+    Weights come from FlyDSL's select_tile_config (tests/kernels/
+    test_blockscale_preshuffle_gemm.py at 950bed53, deleted by FlyDSL #966). The
+    tile_n term below is the one aiter change.
+    """
+    valid = [
+        t
+        for t in _BLOCKSCALE_TILE_CANDIDATES
+        if _blockscale_tile_is_valid(
+            *t,
+            n,
+            k,
+            scale_block_k,
+            use_cshuffle_epilog,
+            num_waves,
+        )
+    ]
+    if not valid:
+        return (64, 128, 128)
+    wide_n = get_gfx().startswith("gfx942")
+
+    def _score(t):
+        tm, tn, tk = t
+        s = 0
+        total_blocks = ((m + tm - 1) // tm) * (n // tn)
+        s += (
+            15
+            if total_blocks >= 256
+            else (10 if total_blocks >= 128 else (5 if total_blocks >= 64 else 0))
+        )
+        if m <= 48:
+            s += 12 if tm == 16 else (8 if tm == 32 else 0)
+        elif m <= 128:
+            s += 10 if tm == 32 else (6 if tm == 16 else (4 if tm == 64 else 0))
+        elif m <= 512:
+            s += 12 if tm == 64 else (8 if tm == 32 else 0)
+        else:
+            s += 12 if tm == 64 else 0
+        if m <= 128:
+            s += 6 if tn == 64 else (4 if tn == 128 else (2 if tn == 256 else 0))
+        elif m <= 512:
+            s += 8 if tn == 128 else (4 if tn == 64 else (4 if tn == 256 else 0))
+        elif wide_n:
+            # gfx942 measured faster with the wider tile once M is large; other
+            # arches keep FlyDSL's preference.
+            s += 8 if tn == 256 else (6 if tn == 128 else 2)
+        else:
+            s += 8 if tn == 128 else (4 if tn == 64 else (4 if tn == 256 else 0))
+        s += 6 if tk == 128 else 3
+        return s
+
+    return max(valid, key=_score)
+
+
+@functools.lru_cache(maxsize=1024)
+def _compile_flydsl_blockscale(
+    n: int,
+    k: int,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    scale_block_k: int,
+    out_dtype: str,
+    use_cshuffle_epilog: bool = False,
+    dsrd_depth: int = 1,
+    use_async_copy: bool = False,
+    num_waves: int = 4,
+    stage_a_scales: bool = False,
+):
+    """Cached compile. M is not part of the key: the kernel takes it at runtime.
+
+    Every compile flag is, though, since each one selects different code.
+
+    waves_per_eu is deliberately not exposed. Leaving it unset lets the compiler
+    choose, which measured best on both arches, and a high value collapses occupancy
+    rather than trading it."""
+    compile_fn = _get_blockscale_compile_fn()
+    if compile_fn is None:
+        raise RuntimeError("[FlyDSL] blockscale compile function not available")
+    return compile_fn(
+        N=n,
+        K=k,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        scale_block_k=scale_block_k,
+        out_dtype=out_dtype,
+        use_cshuffle_epilog=use_cshuffle_epilog,
+        dsrd_depth=dsrd_depth,
+        use_async_copy=use_async_copy,
+        num_waves=num_waves,
+        stage_a_scales=stage_a_scales,
+    )
+
+
+def flydsl_gemm_a8w8_blockscale_bpreshuffle(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor,
+    tile_m: int = 0,
+    tile_n: int = 0,
+    tile_k: int = 0,
+    scale_block_k: int = 128,
+    use_cshuffle_epilog: bool = False,
+    dsrd_depth: int = 1,
+    use_async_copy: bool = False,
+    num_waves: int = 4,
+    stage_a_scales: bool = False,
+) -> Tensor:
+    """Compile (cached) and run the FlyDSL blockscale bpreshuffle GEMM.
+
+    Caller supplies the layouts, as gemm_a8w8_blockscale_bpreshuffle already requires:
+    WQ preshuffled with shuffle_weight(w, layout=(16, 16)), and x_scale K-major.
+    Reshuffling either per call would cost more than the kernel saves.
+
+    Numerics are identical to gemm_a8w8_blockscale.
+    """
+    compile_fn = _get_blockscale_compile_fn()
+    if compile_fn is None:
+        raise RuntimeError("[FlyDSL] blockscale compile function not available")
+    dtypes = _get_dtypes()
+
+    m, k = XQ.shape[0], XQ.shape[-1]
+    n = WQ.shape[0] if WQ.dim() > 1 else w_scale.shape[0] * 128
+
+    # fp8 bytes handed over as torch.uint8 are a supported input of this op: the CK
+    # path accepts them and both triton branches normalise the same way. Raising here
+    # would make the FlyDSL row the only one that rejects a caller every other backend
+    # serves, on exactly the shapes the tuned row covers.
+    if XQ.dtype == torch.uint8:
+        XQ = XQ.view(dtypes.fp8)
+    if WQ.dtype == torch.uint8:
+        WQ = WQ.view(dtypes.fp8)
+    if XQ.dtype != dtypes.fp8:
+        raise RuntimeError(f"[FlyDSL] blockscale GEMM needs fp8 input, got {XQ.dtype}")
+    if out.dtype == torch.bfloat16:
+        out_dtype = "bf16"
+    elif out.dtype == torch.float16:
+        out_dtype = "fp16"
+    else:
+        raise RuntimeError(
+            f"[FlyDSL] unsupported output dtype {out.dtype}; "
+            f"expected torch.bfloat16 or torch.float16"
+        )
+
+    if not (tile_m and tile_n and tile_k):
+        tile_m, tile_n, tile_k = select_blockscale_tile_config(
+            m,
+            n,
+            k,
+            scale_block_k,
+            use_cshuffle_epilog,
+            num_waves,
+        )
+    if not _blockscale_tile_is_valid(
+        tile_m,
+        tile_n,
+        tile_k,
+        n,
+        k,
+        scale_block_k,
+        use_cshuffle_epilog,
+        num_waves,
+    ):
+        raise RuntimeError(
+            f"[FlyDSL] tile {tile_m}x{tile_n}x{tile_k} is invalid for N={n}, K={k}, "
+            f"scale_block_k={scale_block_k}, num_waves={num_waves}. "
+            f"Arguments not supported! Skipping gemm!"
+        )
+
+    # Keyword, not positional: the trailing arguments are four interchangeable
+    # bool/int flags, so a reorder of either signature would still compile, still
+    # run, and silently select a different kernel.
+    exe = _compile_flydsl_blockscale(
+        n,
+        k,
+        tile_m,
+        tile_n,
+        tile_k,
+        scale_block_k,
+        out_dtype,
+        use_cshuffle_epilog=use_cshuffle_epilog,
+        dsrd_depth=dsrd_depth,
+        use_async_copy=use_async_copy,
+        num_waves=num_waves,
+        stage_a_scales=stage_a_scales,
+    )
+
+    # The kernel indexes scale_a as kb * M + row, so x_scale must reach it K-major.
+    # A strided (m, scale_k) view over K-major bytes is a supported input of this op,
+    # and .contiguous() would re-materialise it M-major, which is silently wrong rather
+    # than an error. Transposing it instead is correct and copy-free.
+    if x_scale.dim() == 2 and x_scale.stride(0) == 1 and x_scale.size(1) > 1:
+        x_scale_flat = x_scale.t().contiguous().view(-1)
+    else:
+        x_scale_flat = x_scale.contiguous().view(-1)
+
+    # Unlike flydsl_preshuffle_gemm_a8, this kernel's launcher takes fx.Tensor
+    # arguments, so the tensors are handed over directly rather than as pointers.
+    out_contig = out if out.is_contiguous() else out.contiguous()
+    _run_compiled(
+        exe,
+        out_contig,
+        XQ.contiguous(),
+        WQ.contiguous(),
+        x_scale_flat,
+        w_scale.contiguous().view(-1),
+        m,
+        n,
+        fx.Stream(torch.cuda.current_stream()),
+    )
+    if out_contig is not out:
+        out.copy_(out_contig)
+
+    return out

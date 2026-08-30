@@ -50,6 +50,19 @@ def _hip_blockscale_supported() -> bool:
         return False
 
 
+# The FlyDSL block-scale kernel emits v_mfma_f32_16x16x32_fp8_fp8 (or the gfx950
+# scaled MFMA); it has no RDNA path. Extend when the kernel gains arches.
+_FLYDSL_BLOCKSCALE_ARCHES = frozenset({"gfx942", "gfx950"})
+
+
+def _flydsl_blockscale_supported() -> bool:
+    """True if the FlyDSL block-scale kernel's MFMA path covers the running arch."""
+    try:
+        return get_gfx() in _FLYDSL_BLOCKSCALE_ARCHES
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _ck_a8w8_supported() -> bool:
     """The CK/asm INT8 a8w8 GEMM ships gfx9 (CDNA) code objects only; other
     arches (e.g. RDNA gfx11/gfx12) must fall back to the Triton kernel."""
@@ -909,6 +922,61 @@ def gemm_a8w8_blockscale_bpreshuffle_fake(
     return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
 
 
+def gemm_a8w8_blockscale_flydsl(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor,
+    config: dict | None = None,
+) -> Tensor:
+    """FlyDSL blockscale bpreshuffle GEMM.
+
+    Numerics are identical to gemm_a8w8_blockscale. WQ is expected already shuffled
+    and x_scale already K-major, the same contract the CK and asm branches of
+    gemm_a8w8_blockscale_bpreshuffle are called under, so nothing is re-laid-out here.
+
+    Raises RuntimeError when the shape or the FlyDSL install cannot serve the call.
+    As in the rowwise flydsl branch, the dispatch does not catch it, so a tuned row
+    naming an unservable tile fails loudly.
+    """
+    from .flydsl.gemm_kernels import flydsl_gemm_a8w8_blockscale_bpreshuffle
+    from .flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_common import (
+        parse_kernel_name as _parse_flydsl_blockscale_kernel_name,
+    )
+
+    # A tuned row names the tile; without one (or with a name from another kernel
+    # family, e.g. a CK row someone hand-edited the libtype on) tile 0 means
+    # "pick heuristically". Note this is NOT _parse_flydsl_kernel_name: that one
+    # reads the rowwise family's name, which carries five pipeline flags this
+    # kernel does not have.
+    tm = tn = tk = 0
+    sbk = 128
+    nw = 4
+    ac = cs = False
+    if config is not None:
+        ki = _parse_flydsl_blockscale_kernel_name(str(config.get("kernelName", "")))
+        if ki is not None:
+            tm, tn, tk, sbk = ki.tile_m, ki.tile_n, ki.tile_k, ki.scale_block_k
+            nw = ki.num_waves
+            ac, cs = ki.use_async_copy, ki.use_cshuffle_epilog
+
+    return flydsl_gemm_a8w8_blockscale_bpreshuffle(
+        XQ,
+        WQ,
+        x_scale,
+        w_scale,
+        out,
+        tm,
+        tn,
+        tk,
+        sbk,
+        use_cshuffle_epilog=cs,
+        use_async_copy=ac,
+        num_waves=nw,
+    )
+
+
 @torch_compile_guard(gen_fake=gemm_a8w8_blockscale_bpreshuffle_fake)
 def gemm_a8w8_blockscale_bpreshuffle(
     XQ: Tensor,
@@ -1116,9 +1184,18 @@ def gemm_a8w8_blockscale_bpreshuffle(
                 XQ, WQ, x_scale, w_scale, Y, kernelId=kernelId
             )
         elif libtype == "flydsl" and is_flydsl_available():
-            return gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
-                XQ, WQ, x_scale, w_scale, Y, config
-            )
+            # Two FlyDSL families can claim libtype=="flydsl" on this op; the
+            # kernelName says which. The blockscale MFMA kernel names
+            # itself "flydsl_blockscale_bpreshuffle_<tile>_..."; anything else is
+            # the gfx1250 mxfp8_128 WMMA family handled above.
+            if not kernelName.startswith("flydsl_blockscale_bpreshuffle_"):
+                return gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
+                    XQ, WQ, x_scale, w_scale, Y, config
+                )
+            # An unsupported arch falls out of this branch to the CK path below,
+            # rather than to the other FlyDSL family.
+            if _flydsl_blockscale_supported():
+                return gemm_a8w8_blockscale_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
     try:
         return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
     except RuntimeError as e:
