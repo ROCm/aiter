@@ -206,7 +206,7 @@ def _check_result(ref_out, test_out, label, atol=1.0, rtol=0.05, pass_pct=95.0):
 # ---------------------------------------------------------------------------
 
 
-def test_flydsl_stage1_a4w4(
+def run_flydsl_stage1_a4w4(
     token: int = 16,
     model_dim: int = 7168,
     inter_dim: int = 256,
@@ -264,7 +264,7 @@ def test_flydsl_stage1_a4w4(
 # ---------------------------------------------------------------------------
 
 
-def test_flydsl_stage2_a4w4(
+def run_flydsl_stage2_a4w4(
     token: int = 16,
     model_dim: int = 7168,
     inter_dim: int = 256,
@@ -319,7 +319,7 @@ def test_flydsl_stage2_a4w4(
     return _check_result(ref, out, f"stage2_a4w4_{mode}", atol=atol, rtol=rtol)
 
 
-def test_flydsl_stage2_a4w4_return_per_slot(
+def run_flydsl_stage2_a4w4_return_per_slot(
     token: int = 16,
     model_dim: int = 7168,
     inter_dim: int = 256,
@@ -385,7 +385,7 @@ def test_flydsl_stage2_a4w4_return_per_slot(
 # ---------------------------------------------------------------------------
 
 
-def test_flydsl_e2e_a4w4(
+def run_flydsl_e2e_a4w4(
     token: int = 16,
     model_dim: int = 7168,
     inter_dim: int = 256,
@@ -479,6 +479,26 @@ def test_flydsl_e2e_a4w4(
     )
 
 
+def test_flydsl_stage1_a4w4():
+    passed, _, _ = run_flydsl_stage1_a4w4()
+    assert passed
+
+
+def test_flydsl_stage2_a4w4():
+    passed, _, _ = run_flydsl_stage2_a4w4()
+    assert passed
+
+
+def test_flydsl_stage2_a4w4_return_per_slot():
+    passed, _, _ = run_flydsl_stage2_a4w4_return_per_slot()
+    assert passed
+
+
+def test_flydsl_e2e_a4w4():
+    passed, _, _ = run_flydsl_e2e_a4w4()
+    assert passed
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -517,12 +537,6 @@ def main():
     parser.add_argument("--rtol", type=float, default=0.05)
     args = parser.parse_args()
 
-    from aiter.ops.flydsl.utils import is_flydsl_available
-
-    if not is_flydsl_available():
-        print("[SKIP] FlyDSL is not available. Install flydsl package first.")
-        sys.exit(0)
-
     results = []
 
     for token in args.tokens:
@@ -530,7 +544,7 @@ def main():
             # Stage1 tests
             if "stage1" in args.stage:
                 try:
-                    passed, max_delta, pct = test_flydsl_stage1_a4w4(
+                    passed, max_delta, pct = run_flydsl_stage1_a4w4(
                         token=token,
                         model_dim=args.model_dim,
                         inter_dim=args.inter_dim,
@@ -558,7 +572,7 @@ def main():
             if "stage2" in args.stage:
                 for mode in args.mode:
                     try:
-                        passed, max_delta, pct = test_flydsl_stage2_a4w4(
+                        passed, max_delta, pct = run_flydsl_stage2_a4w4(
                             token=token,
                             model_dim=args.model_dim,
                             inter_dim=args.inter_dim,
@@ -585,18 +599,16 @@ def main():
                             (f"stage2_a4w4_t{token}_bm{bm}_{mode}", "ERROR", 0, 0)
                         )
                     try:
-                        passed, max_delta, pct = (
-                            test_flydsl_stage2_a4w4_return_per_slot(
-                                token=token,
-                                model_dim=args.model_dim,
-                                inter_dim=args.inter_dim,
-                                E=args.experts,
-                                topk=args.topk,
-                                block_m=bm,
-                                mode=mode,
-                                atol=args.atol,
-                                rtol=args.rtol,
-                            )
+                        passed, max_delta, pct = run_flydsl_stage2_a4w4_return_per_slot(
+                            token=token,
+                            model_dim=args.model_dim,
+                            inter_dim=args.inter_dim,
+                            E=args.experts,
+                            topk=args.topk,
+                            block_m=bm,
+                            mode=mode,
+                            atol=args.atol,
+                            rtol=args.rtol,
                         )
                         results.append(
                             (
@@ -623,7 +635,7 @@ def main():
             if "e2e" in args.stage:
                 for mode in args.mode:
                     try:
-                        passed, max_delta, pct = test_flydsl_e2e_a4w4(
+                        passed, max_delta, pct = run_flydsl_e2e_a4w4(
                             token=token,
                             model_dim=args.model_dim,
                             inter_dim=args.inter_dim,

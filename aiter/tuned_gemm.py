@@ -21,23 +21,13 @@ import os
 import pandas as pd
 import torch
 import torch.nn.functional as F
+from torch import Tensor
 
 import aiter
 from aiter import dtypes, gemm_a16w16_asm, hipb_create_extension, hipb_mm, logger
 from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
-
-try:
-    from aiter.ops.flydsl.utils import is_flydsl_available
-except ImportError:
-
-    def is_flydsl_available():
-        return False
-
-
-from torch import Tensor
-
 from aiter.ops.gemm_op_common import get_padded_m
 
 try:
@@ -161,17 +151,16 @@ def get_GEMM_A16W16_config(
         )
         if config is not None:
             if config["libtype"] == "flydsl":
-                if is_flydsl_available():
-                    flydsl_config = aiter.ops.flydsl.gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
+                flydsl_config = (
+                    aiter.ops.flydsl.gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
                         config["kernelName"]
                     )
-                    if flydsl_config is None:
-                        logger.warning(
-                            f"FlyDSL kernel '{config['kernelName']}' from tuned config is not "
-                            "recognized by the current catalog; falling back to next candidate."
-                        )
-                        config = None
-                else:
+                )
+                if flydsl_config is None:
+                    logger.warning(
+                        f"FlyDSL kernel '{config['kernelName']}' from tuned config is not "
+                        "recognized by the current catalog; falling back to next candidate."
+                    )
                     config = None
             if config is None:
                 continue

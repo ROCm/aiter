@@ -7,12 +7,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from aiter.ops.flydsl.utils import get_shared_memory_per_block
+from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
 
 NAME_PREFIX = "flydsl_bpreshuffle_wmma"
 
 WMMA = 16  # WMMA M/N tile granularity
-LDS_BYTES = get_shared_memory_per_block(fallback_gfx="gfx1250")
+LDS_BYTES = SMEM_CAPACITY_MAP["gfx1250"]
 _MAX_WARP_TILE = 128
 _MAX_BLOCK_THREADS = 1024  # m_warp * n_warp * WAVE(32)
 

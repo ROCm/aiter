@@ -53,6 +53,15 @@ from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_LINEAR_BETA,
     get_flydsl_activation_name,
 )
+from aiter.ops.flydsl.moe_kernels import (
+    flydsl_moe_stage1,
+    flydsl_moe_stage2,
+    get_flydsl_stage1_kernels,
+    get_flydsl_stage1_kernels_int4_bf16,
+    get_flydsl_stage2_kernels,
+    get_flydsl_stage2_kernels_int4_bf16,
+    get_flydsl_stage2_v2_kernels,
+)
 from aiter.ops.flydsl.mxfp4_kname import (
     _parse_mxfp4_g1_kname,
     parse_g2_kname_any,
@@ -70,48 +79,23 @@ from aiter.utility import fp4_utils
 from aiter.utility.base_tuner import TunerCommon
 from aiter.utility.fp4_utils import moe_mxfp4_sort
 from aiter.utility.mp_tuner import mp_tuner
+from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
+    build_v2_inputs as _v2_build_inputs,
+)
+from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
+    gen as _v2_gen,
+)
+from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
+    populate_v2_intermediate_from_ref as _v2_populate_stage2,
+)
+from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
+    v2_stage1_sorted_ref as _v2_stage1_ref,
+)
 from csrc.opus_moe.opus_moe_common import (
     OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT,
     get_opus_a8w4_stage2_kernels,
     opus_a8w4_stage1_instances_for_shape,
 )
-
-try:
-    from aiter.ops.flydsl.utils import is_flydsl_available
-except ImportError:
-
-    def is_flydsl_available():
-        return False
-
-
-if is_flydsl_available():
-    try:
-        from aiter.ops.flydsl.moe_kernels import (
-            flydsl_moe_stage1,
-            flydsl_moe_stage2,
-            get_flydsl_stage1_kernels,
-            get_flydsl_stage1_kernels_int4_bf16,
-            get_flydsl_stage2_kernels,
-            get_flydsl_stage2_kernels_int4_bf16,
-            get_flydsl_stage2_v2_kernels,
-        )
-        from aiter.ops.flydsl.mxfp4_v2_tune_utils import (
-            build_v2_inputs as _v2_build_inputs,
-        )
-        from aiter.ops.flydsl.mxfp4_v2_tune_utils import (
-            gen as _v2_gen,
-        )
-        from aiter.ops.flydsl.mxfp4_v2_tune_utils import (
-            populate_v2_intermediate_from_ref as _v2_populate_stage2,
-        )
-        from aiter.ops.flydsl.mxfp4_v2_tune_utils import (
-            v2_stage1_sorted_ref as _v2_stage1_ref,
-        )
-    except ImportError:
-
-        def is_flydsl_available():
-            return False
-
 
 sys.path.insert(0, f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/")
 from gemm_moe_ck2stages_common import get_gemm1_kernels_list, get_gemm2_kernels_list
@@ -3423,8 +3407,6 @@ class FmoeTuner(TunerCommon):
 
     def gen_flydsl_2stages_task(self, info, blockMs):
         tasks_flydsl = []
-        if not is_flydsl_available():
-            return tasks_flydsl
         (
             _gfx,
             _cu_num,
@@ -3777,8 +3759,6 @@ class FmoeTuner(TunerCommon):
 
     def gen_flydsl_v2_2stages_task(self, info, blockMs):
         tasks = []
-        if not is_flydsl_available():
-            return tasks
         (
             _gfx,
             _cu_num,
@@ -3814,7 +3794,9 @@ class FmoeTuner(TunerCommon):
         out_dtype_str = "bf16"
         s1_kernels = get_flydsl_stage1_kernels(adtype, bdtype, out_dtype_str)
 
-        from aiter.ops.flydsl.mxfp4_v2_tune_utils import v2_stage1_dequant_cosine_err
+        from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
+            v2_stage1_dequant_cosine_err,
+        )
 
         for blockM in blockMs:
             if blockM not in (32, 64, 128):
@@ -4257,8 +4239,6 @@ class FmoeTuner(TunerCommon):
 
     def gen_flydsl_i4_2stages_task(self, info, blockMs):
         tasks_flydsl = []
-        if not is_flydsl_available():
-            return tasks_flydsl
         (
             _gfx,
             _cu_num,

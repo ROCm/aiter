@@ -22,15 +22,6 @@ from ..jit.utils.torch_guard import torch_compile_guard
 from ..ops.gemm_op_common import get_padded_m
 from ..utility import dtypes
 
-
-def is_flydsl_available():
-    try:
-        from ..ops.flydsl.utils import is_flydsl_available as _is_flydsl_available
-    except ImportError:
-        return False
-    return _is_flydsl_available()
-
-
 aiter_lib = Library("aiter", "FRAGMENT")
 
 
@@ -754,12 +745,12 @@ def gemm_a8w8_bpreshuffle(
             return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, splitK)
         elif libtype == "cktile":
             return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y, splitK)
-        elif libtype == "flydsl" and is_flydsl_available():
+        elif libtype == "flydsl":
             if w_k > k:
                 XQ = F.pad(XQ.contiguous(), (0, w_k - k), value=0)
             return gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
 
-    if get_gfx() == "gfx1250" and is_flydsl_available():
+    if get_gfx() == "gfx1250":
         from ..ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_wmma_common import (
             kernel_fits_shape,
             kernels_list,
@@ -989,10 +980,6 @@ def gemm_a8w8_blockscale_bpreshuffle(
                 is_x_scale_transposed=True,
                 backend=backend,
             )
-        if not is_flydsl_available():
-            raise RuntimeError(
-                "gfx1250 mxfp8_128 bpreshuffle (fp8_e8m0 scales) requires FlyDSL"
-            )
         if config is not None and config["libtype"] == "flydsl":
             return gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
                 XQ, WQ, x_scale, w_scale, Y, config
@@ -1115,7 +1102,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
             return opus_gemm_a8w8_blockscale_bpreshuffle_tune(
                 XQ, WQ, x_scale, w_scale, Y, kernelId=kernelId
             )
-        elif libtype == "flydsl" and is_flydsl_available():
+        elif libtype == "flydsl":
             return gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
                 XQ, WQ, x_scale, w_scale, Y, config
             )

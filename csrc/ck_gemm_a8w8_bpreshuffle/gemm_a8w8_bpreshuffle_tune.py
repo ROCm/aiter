@@ -58,10 +58,7 @@ except ImportError:
         return []
 
 
-from aiter.ops.flydsl.utils import is_flydsl_available
-
-if is_flydsl_available():
-    from aiter.ops.flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
+from aiter.ops.flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
 
 
 def get_valid_asm_splitK_list(K: int, max_splitK: int, tile_k: int = 128):
@@ -180,14 +177,14 @@ def run_gemm_flydsl_8wave(
 
 # Pipeline name -> (runner, is-it-usable-right-now). The availability probe is a
 # callable, and deliberately different per pipeline: preshuffle needs the symbol
-# the is_flydsl_available() gate above binds at import, while 8wave imports its
-# entry point lazily inside its runner.
+# the import above binds at module load, while 8wave imports its entry point
+# lazily inside its runner.
 _FLYDSL_PIPELINE_RUNNERS = {
     "preshuffle": (
         run_gemm_flydsl,
         lambda: "flydsl_preshuffle_gemm_a8" in globals(),
     ),
-    "8wave": (run_gemm_flydsl_8wave, is_flydsl_available),
+    "8wave": (run_gemm_flydsl_8wave, lambda: True),
 }
 
 # The tuner speaks torch dtypes, Pipeline.q_dtypes_w speaks names (that module
@@ -601,8 +598,6 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
             print(
                 f"[FlyDSL][gfx1250] WMMA ptpc supports fp8 only, skipping {q_dtype_w}"
             )
-            return []
-        if not is_flydsl_available():
             return []
         try:
             from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_wmma_common import (
