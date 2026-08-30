@@ -26,60 +26,56 @@ def lds_ptr_ty():
     return ir.Type.parse("!llvm.ptr<3>")
 
 
-# Schedule token IDs
-P1 = 4  # PART1 cross-MSB merge
-O_RESC0 = 17  # O-rescale pk_mul
-TDM_TOKEN = 18  # tensor_load_to_lds
-PART2_EXP_START = 24  # ops[0..23]=setup+pkfma, ops[24..]=exp
-# Token base offsets: token_id = BASE + msb
-P2_BASE = 5  # softmax PART2
-EXP_BASE = 19  # pair_exp (3-cycle transcendental)
-K_BASE = 9  # ds_load_b128 K
-V_BASE = 13  # ds_load_tr16_b128 V
+# ── Schedule token IDs ──
+# token = BASE + msb (msb 0‥3 selects 32-row sub-block).
+# Ops of the same type are consumed sequentially from pre-built closures.
+# See temp-doc/schedule-token-reference.md for full token→instruction mapping.
+TREE_MAX_BASE = 0
+CROSS_MAX_TOKEN = 4
+SOFTMAX_BASE = 5
+LDS_K_BASE = 9
+LDS_V_BASE = 13
+O_RESCALE_TOKEN = 17
+TDM_PREFETCH_TOKEN = 18
+PAIR_EXP_BASE = 19
+SOFTMAX_EXP_START = 24
 
 
-# Schedule row helpers: n copies of token for MSB m
+# ── Schedule row helpers: n copies of token for MSB m ──
 def lds_k(m, n=1):
-    return [K_BASE + m] * n
+    return [LDS_K_BASE + m] * n
 
 
 def lds_v(m, n=1):
-    return [V_BASE + m] * n
+    return [LDS_V_BASE + m] * n
 
 
 def tree_max(m, n=1):
-    return [m] * n
+    return [TREE_MAX_BASE + m] * n
 
 
 def cross_max(n=1):
-    return [P1] * n
+    return [CROSS_MAX_TOKEN] * n
 
 
 def sm_ops(m, n=1):
-    return [P2_BASE + m] * n
+    return [SOFTMAX_BASE + m] * n
 
 
 def pair_exp(m, n=1):
-    return [EXP_BASE + m] * n
+    return [PAIR_EXP_BASE + m] * n
 
 
 def o_rescale(n=1):
-    return [O_RESC0] * n
+    return [O_RESCALE_TOKEN] * n
 
 
 def tdm_load(n=1):
-    return [TDM_TOKEN] * n
+    return [TDM_PREFETCH_TOKEN] * n
 
 
-# GEMM1 (QK) schedule: 96 rows = 4 stages x 24 WMMAs.
+# ── GEMM1 (QK) schedule: 96 rows = 4 stages × 24 WMMAs ──
 # Each row = ops dispatched between consecutive WMMA instructions.
-#   lds_k/lds_v(msb, n) = n LDS loads for MSB bank
-#   sm_ops(msb, n)       = n softmax PART2 ops for MSB
-#   tree_max(msb, n)     = n PART0 max-reduction ops
-#   cross_max(n)         = n PART1 cross-MSB merge ops
-#   pair_exp(msb, n)     = n exp2 ops (3-cycle transcendental)
-#   o_rescale(n)         = n O *= exp_delta rescale ops
-#   tdm_load(n)          = n TDM prefetch ops
 GEMM1_SCHEDULE: list[list[list[int]]] = [
     [  # Stage 0: TDM K prefetch + K LDS loads + softmax
         tdm_load(2) + sm_ops(0),  # wmma 0
@@ -186,7 +182,7 @@ GEMM1_SCHEDULE: list[list[list[int]]] = [
         [],
     ],
 ]
-# GEMM2 (PV) schedule: 64 rows = 4 stages x 16 WMMAs
+# ── GEMM2 (PV) schedule: 64 rows = 4 stages × 16 WMMAs ──
 GEMM2_SCHEDULE: list[list[list[int]]] = [
     [  # Stage 0: TDM + V LDS loads + tree_max (PART0)
         tdm_load(2) + tree_max(0, 3),
@@ -208,14 +204,14 @@ GEMM2_SCHEDULE: list[list[list[int]]] = [
     ],
     [  # Stage 1: V LDS loads + cross_max (PART1) + softmax PART2
         tdm_load(2) + tree_max(0),
-        lds_v(0, 2) + [0, 1, 2, 3],
-        lds_v(0, 2) + [0, 1, 2, 3],
-        lds_v(1, 2) + [1, 0, 2, 3],
-        lds_v(1, 2) + [1, 0],
-        lds_v(2, 2) + [2, 2, 1],
-        lds_v(2, 2) + [2, 0, 1],
-        lds_v(3, 2) + [3],
-        lds_v(3, 2) + [3, 3],
+        lds_v(0, 2) + tree_max(0) + tree_max(1) + tree_max(2) + tree_max(3),
+        lds_v(0, 2) + tree_max(0) + tree_max(1) + tree_max(2) + tree_max(3),
+        lds_v(1, 2) + tree_max(1) + tree_max(0) + tree_max(2) + tree_max(3),
+        lds_v(1, 2) + tree_max(1) + tree_max(0),
+        lds_v(2, 2) + tree_max(2, 2) + tree_max(1),
+        lds_v(2, 2) + tree_max(2) + tree_max(0) + tree_max(1),
+        lds_v(3, 2) + tree_max(3),
+        lds_v(3, 2) + tree_max(3, 2),
         cross_max(4),
         cross_max(4),
         sm_ops(1, 4) + sm_ops(2, 4),
@@ -1310,14 +1306,16 @@ def _dispatch_tdm_at_wmma0(mlir_types, tdm_type, tdm_state, has_fallback=True):
 def _dispatch_lds_tok(
     mlir_types, _tok, lds_schedule, kv_lds_addrs, kv_tiles_next, lds_idx, ds_issued
 ):
-    if const_expr(9 <= _tok <= 12):
+    if const_expr(LDS_K_BASE <= _tok <= LDS_K_BASE + 3):
         if lds_idx < LDS_INST_COUNT:
             kv_tiles_next = Pipeline.emit_lds_load(
                 mlir_types, lds_schedule[lds_idx], kv_lds_addrs, kv_tiles_next
             )
             lds_idx += 1
             ds_issued += 1
-    elif const_expr(13 <= _tok <= 16) and lds_idx < LDS_V_INST_COUNT:
+    elif (
+        const_expr(LDS_V_BASE <= _tok <= LDS_V_BASE + 3) and lds_idx < LDS_V_INST_COUNT
+    ):
         kv_tiles_next = Pipeline.emit_lds_load(
             mlir_types, lds_schedule[lds_idx], kv_lds_addrs, kv_tiles_next
         )
@@ -1379,13 +1377,13 @@ def gemm1_interleaved_stage(
         for _i in range_constexpr(len(_g1_row)):
             if const_expr(_i < _g1_half):
                 _tok = _g1_row[_i]
-                if const_expr(5 <= _tok <= 8):
-                    _msb = _tok - P2_BASE
+                if const_expr(SOFTMAX_BASE <= _tok <= SOFTMAX_BASE + 3):
+                    _msb = _tok - SOFTMAX_BASE
                     if softmax_idx_by_msb[_msb] < len(softmax_ops_by_msb[_msb]):
                         softmax_ops_by_msb[_msb][softmax_idx_by_msb[_msb]]()
                         softmax_idx_by_msb[_msb] += 1
                     sched_barrier(0)
-                elif const_expr(_tok == O_RESC0):
+                elif const_expr(_tok == O_RESCALE_TOKEN):
                     if const_expr(o_rescale_ops is not None):
                         sched_barrier(0)
                         o_rescale_ops[_o_resc_idx]()
@@ -1408,13 +1406,13 @@ def gemm1_interleaved_stage(
         for _i in range_constexpr(len(_g1_row)):
             if const_expr(_g1_half <= _i < len(_g1_row)):
                 _tok = _g1_row[_i]
-                if const_expr(5 <= _tok <= 8):
-                    _msb = _tok - P2_BASE
+                if const_expr(SOFTMAX_BASE <= _tok <= SOFTMAX_BASE + 3):
+                    _msb = _tok - SOFTMAX_BASE
                     if softmax_idx_by_msb[_msb] < len(softmax_ops_by_msb[_msb]):
                         softmax_ops_by_msb[_msb][softmax_idx_by_msb[_msb]]()
                         softmax_idx_by_msb[_msb] += 1
                     sched_barrier(0)
-                elif const_expr(_tok == O_RESC0):
+                elif const_expr(_tok == O_RESCALE_TOKEN):
                     if const_expr(o_rescale_ops is not None):
                         sched_barrier(0)
                         o_rescale_ops[_o_resc_idx]()
@@ -1450,8 +1448,8 @@ def _dispatch_g2_tok(
 ):
     if const_expr(0 <= _tok < RLTS_LEN):
         _rid = _tok
-        if const_expr(5 <= _rid <= 8):
-            if rid_idx[_rid] < PART2_EXP_START and rid_idx[_rid] < len(
+        if const_expr(SOFTMAX_BASE <= _rid <= SOFTMAX_BASE + 3):
+            if rid_idx[_rid] < SOFTMAX_EXP_START and rid_idx[_rid] < len(
                 ops_by_rid[_rid]
             ):
                 ops_by_rid[_rid][rid_idx[_rid]]()
@@ -1461,9 +1459,9 @@ def _dispatch_g2_tok(
                 ops_by_rid[_rid][rid_idx[_rid]]()
                 rid_idx[_rid] += 1
         sched_barrier(0)
-    elif const_expr(19 <= _tok <= 22):
-        _msb = _tok - EXP_BASE
-        _erid = _msb + P2_BASE
+    elif const_expr(PAIR_EXP_BASE <= _tok <= PAIR_EXP_BASE + 3):
+        _msb = _tok - PAIR_EXP_BASE
+        _erid = _msb + SOFTMAX_BASE
         if exp_rid_idx[_msb] < len(ops_by_rid[_erid]):
             ops_by_rid[_erid][exp_rid_idx[_msb]]()
             exp_rid_idx[_msb] += 1
@@ -1509,7 +1507,7 @@ def gemm2_interleaved_stage(
         lds_schedule = Pipeline.build_lds_v_schedule(lds_blk, lds_su)
     lds_idx = 0
     ds_issued = 0
-    exp_rid_idx = [PART2_EXP_START] * NUM_MSB
+    exp_rid_idx = [SOFTMAX_EXP_START] * NUM_MSB
     _o_rescale_ed_v8 = {}
 
     def _build_o_rescale_ed_v8(d_msb):
