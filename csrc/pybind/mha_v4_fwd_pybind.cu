@@ -22,6 +22,29 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("k_scale_mode"),
           py::arg("v_scale_mode"),
           py::arg("softmax_scale"));
+    m.def("fmha_v4_fwd_sparse",
+          &aiter::torch_itfs::fmha_v4_fwd_sparse,
+          py::arg("q"),
+          py::arg("k"),
+          py::arg("v"),
+          py::arg("q_descale"),
+          py::arg("k_descale"),
+          py::arg("v_descale"),
+          py::arg("out"),
+          py::arg("q_format"),
+          py::arg("k_format"),
+          py::arg("v_format"),
+          py::arg("q_scale_mode"),
+          py::arg("k_scale_mode"),
+          py::arg("v_scale_mode"),
+          py::arg("softmax_scale"),
+          py::arg("kv_block_indices"),
+          py::arg("lut_start"),
+          py::arg("lut_count"));
+    m.def("rotate_activation_hd128",
+          &aiter::torch_itfs::rotate_activation_hd128,
+          py::arg("out"),
+          py::arg("input"));
     m.def("rotate_activation_mxfp8_quant",
           &aiter::torch_itfs::rotate_activation_mxfp8_quant,
           py::arg("out"),
@@ -50,4 +73,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("out"),
           py::arg("scale"),
           py::arg("input"));
+    m.def("mha_v4_sparse_work_table",
+          &aiter::torch_itfs::mha_v4_sparse_work_table,
+          py::arg("lut_count"),
+          py::arg("batch"),
+          py::arg("nhead"),
+          py::arg("q_tiles"));
 }

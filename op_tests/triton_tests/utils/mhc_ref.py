@@ -29,7 +29,9 @@ __all__ = [
     "generate_mhc_post_inputs",
     "get_test_shapes",
     "is_doubly_stochastic",
+    "mhc_head_dsv4_torch",
     "mhc_post_torch",
+    "mhc_pre_dsv4_torch",
     "mhc_torch",
     "sinkhorn_knopp_exp_domain_torch",
     "sinkhorn_knopp_log_domain_torch",
@@ -38,6 +40,63 @@ __all__ = [
 # =============================================================================
 # PyTorch Reference Implementations
 # =============================================================================
+
+
+def mhc_pre_dsv4_torch(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    *,
+    eps: float = 1e-6,
+    pre_eps: float = 1e-6,
+    sinkhorn_eps: float = 1e-6,
+    post_multiplier: float = 2.0,
+    sinkhorn_iters: int = 20,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """DSV4-layout reference returning ``(post, comb, layer_input)``."""
+    M, n, C = residual.shape
+    x = residual.float().reshape(M, n * C)
+    rms = torch.sqrt(torch.mean(x.square(), dim=-1, keepdim=True) + eps)
+    phi = fn.T.to(residual.dtype)
+    logits = (x / rms) @ phi.float()
+    logits = logits * torch.cat(
+        (
+            scale[0].expand(n),
+            scale[1].expand(n),
+            scale[2].expand(n * n),
+        )
+    )
+    logits = logits + base.float()
+    pre = torch.sigmoid(logits[:, :n]) + pre_eps
+    post = (post_multiplier * torch.sigmoid(logits[:, n : 2 * n])).unsqueeze(-1)
+    comb = sinkhorn_knopp_asymmetric_exp_domain_torch(
+        logits[:, 2 * n :].reshape(M, n, n),
+        num_iters=sinkhorn_iters,
+        eps=sinkhorn_eps,
+    )
+    layer_input = torch.einsum("mn,mnc->mc", pre, residual.float())
+    return post, comb, layer_input.to(residual.dtype)
+
+
+def mhc_head_dsv4_torch(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    *,
+    eps: float = 1e-6,
+    pre_eps: float = 1e-6,
+) -> torch.Tensor:
+    """DSV4 head-contraction reference for ``fn=[n,n*C]``."""
+    M, n, C = residual.shape
+    x = residual.float().reshape(M, n * C)
+    rms = torch.sqrt(torch.mean(x.square(), dim=-1, keepdim=True) + eps)
+    phi = fn.T.to(residual.dtype)
+    logits = ((x / rms) @ phi.float()) * scale.reshape(1) + base.float()
+    mix = torch.sigmoid(logits) + pre_eps
+    out = torch.einsum("mn,mnc->mc", mix, residual.float())
+    return out.to(residual.dtype)
 
 
 def mhc_torch(
