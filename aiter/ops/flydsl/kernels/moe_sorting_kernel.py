@@ -31,8 +31,6 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 
-from aiter.ops.flydsl.kernels import buffer_ops
-
 from .kernels_common import get_warp_size
 from .tensor_shim import _run_compiled
 
@@ -189,6 +187,20 @@ def _lds_store_raw(raw_ptr, val, idx):
 def _buf_iter(tensor):
     """OOB-checked V# iterator over a global tensor."""
     return fx.get_iter(fx.rocdl.make_buffer_tensor(tensor, max_size=True))
+
+
+def _i8_global_ptr(tensor):
+    """Raw i8 global pointer to `tensor` for byte-addressed stores.
+
+    Used only for the uint8 mesh scatter, which is always issued under an
+    in-bounds guard (`if valid` / `if is_mine`) -- no OOB access occurs, so a
+    plain LLVM store suffices (no V# descriptor needed). i8 element == 1 byte,
+    so a byte offset is the element index directly (no *sizeof scaling).
+    """
+    i8pt = fx.PointerType.get(
+        fx.Int8.ir_type, address_space=fx.AddressSpace.Global, alignment=1
+    )
+    return fx.inttoptr(i8pt, fx.Int64(fx.ptrtoint(fx.get_iter(tensor))))
 
 
 def _gld(it, idx):
@@ -998,11 +1010,9 @@ def _compile_moe_sorting_multiphase(
         gid = gpu.block_idx.x * fx.Int32(K2_BLOCK) + gpu.thread_idx.x
         stride = gpu.grid_dim.x * fx.Int32(K2_BLOCK)
         topk_it = _buf_iter(topk_ids)
-        # KEPT on buffer_ops: uint8 byte-addressed store into the i32 workspace
-        # (offset_is_bytes). A byte-mode store faults (not silently drops) at an
-        # OOB offset, so it cannot use the sentinel pattern -- it is guarded by
-        # `if valid` instead. make_buffer_tensor has no i8-reinterpret store path.
-        ws_rsrc = buffer_ops.create_buffer_resource(workspace, max_size=True)
+        # uint8 byte-addressed mesh scatter into the i32 workspace, always under
+        # an in-bounds `if valid` guard -> a plain i8 global-pointer store.
+        ws_i8 = _i8_global_ptr(workspace)
         c_zero = fx.Int32(0)
         c_topk = fx.Int32(topk)
         c_one = fx.Int32(1)
@@ -1023,9 +1033,7 @@ def _compile_moe_sorting_multiphase(
             byte_offset = eid * i32_mesh_stride + token_id
             val_i8 = fx.Int32(topk_slot + c_one).to(fx.Int8)
             if valid:
-                buffer_ops.buffer_store(
-                    val_i8, ws_rsrc, byte_offset, offset_is_bytes=True
-                )
+                ws_i8[byte_offset] = val_i8
 
     @flyc.jit
     def launch_p0(
@@ -1223,10 +1231,9 @@ def _compile_moe_sorting_multiphase(
         wave = tid // WARP_SIZE
 
         ws_it = _buf_iter(workspace)
-        # KEPT on buffer_ops: uint8 byte-addressed scatter store (offset_is_bytes)
-        # into the i32 workspace; guarded by `if is_mine` (byte store faults, not
-        # drops, at an OOB offset -- see Phase 2 below).
-        ws_rsrc = buffer_ops.create_buffer_resource(workspace, max_size=True)
+        # uint8 byte-addressed scatter into the i32 workspace, always under an
+        # in-bounds `if is_mine` guard (see Phase 2) -> a plain i8 pointer store.
+        ws_i8 = _i8_global_ptr(workspace)
         mask_it = _buf_iter(expert_mask_tensor)
         topk_it = _buf_iter(topk_ids)
         c_zero = fx.Int32(0)
@@ -1303,12 +1310,10 @@ def _compile_moe_sorting_multiphase(
             is_mine = valid & (expert_id == eid)
             byte_offset = eid * i32_mesh_stride + token_id
             val_i8 = fx.Int32(is_mine.select(topk_slot + c_one, c_zero)).to(fx.Int8)
-            # Byte-mode buffer_store with OOB offset crashes on AMD GPUs.
-            # Use conditional branch to skip the store for non-matching threads.
+            # Guarded byte store: skip non-matching threads so no OOB byte offset
+            # is ever formed (a raw byte store would fault, not drop, at OOB).
             if is_mine:
-                buffer_ops.buffer_store(
-                    val_i8, ws_rsrc, byte_offset, offset_is_bytes=True
-                )
+                ws_i8[byte_offset] = val_i8
 
         gpu.barrier()
 
