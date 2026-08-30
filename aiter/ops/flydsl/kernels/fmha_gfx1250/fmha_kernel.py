@@ -34,7 +34,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
         ptr_LSE: fx.Tensor,
         ptr_cu_seqlens_q: fx.Tensor,
         ptr_cu_seqlens_k: fx.Tensor,
-        scalar_f: fx.Float32,
+        softmax_scale: fx.Float32,
         stride_q_seq: fx.Int32,
         stride_k_seq: fx.Int32,
         stride_v_seq: fx.Int32,
@@ -48,21 +48,23 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
         max_seqlen_k: fx.Int32,
     ):
         """D128 BF16 FMHA Forward -- full kernel with dynamic KV loop."""
-        ty = get_types()
+        mlir_types = get_types()
         setreg(2074, 2)  # WAVE_SCHED_MODE = 2
         rocdl.s_nop(0)
-        tx = fx.Int32(fx.thread_idx.x)
-        lane_id = tx & 31
-        wave_id = tx >> 5
+        thread_id = fx.Int32(fx.thread_idx.x)
+        lane_id = thread_id & 31
+        wave_id = thread_id >> 5
 
         # ── XCD remap ──
-        raw_bx = fx.Int32(fx.block_idx.x)
-        raw_by = fx.Int32(fx.block_idx.y)
-        raw_bz = fx.Int32(fx.block_idx.z)
-        gdx = fx.Int32(fx.grid_dim.x)
-        gdy = fx.Int32(fx.grid_dim.y)
-        gdz = fx.Int32(fx.grid_dim.z)
-        bz, bx, by = xcd_remap(raw_bx, raw_by, raw_bz, gdx, gdy, gdz)
+        raw_block_x = fx.Int32(fx.block_idx.x)
+        raw_block_y = fx.Int32(fx.block_idx.y)
+        raw_block_z = fx.Int32(fx.block_idx.z)
+        grid_dim_x = fx.Int32(fx.grid_dim.x)
+        grid_dim_y = fx.Int32(fx.grid_dim.y)
+        grid_dim_z = fx.Int32(fx.grid_dim.z)
+        bz, bx, by = xcd_remap(
+            raw_block_x, raw_block_y, raw_block_z, grid_dim_x, grid_dim_y, grid_dim_z
+        )
         m_start = bx * TILE_N
 
         # ── Load seqlens ──
@@ -74,13 +76,13 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
         actual_kv_len = k_end_tok - k_start_tok
 
         # ── OOB descriptors for TDM K/V loads and D store ──
-        _sk_elems, _sv_elems = stride_k_seq >> 1, stride_v_seq >> 1
-        _K_CFG, _V_CFG = (1 << 16) | K_TDM_CONFIG, (1 << 16) | V_TDM_CONFIG
+        k_stride_elems, v_stride_elems = stride_k_seq >> 1, stride_v_seq >> 1
+        k_tdm_cfg, v_tdm_cfg = (1 << 16) | K_TDM_CONFIG, (1 << 16) | V_TDM_CONFIG
         k_oob_dg1 = TDM.build_oob_dg1_list(
-            _K_CFG, QK_HDIM, _sk_elems, actual_kv_len, wave_id, dim0_stride=200
+            k_tdm_cfg, QK_HDIM, k_stride_elems, actual_kv_len, wave_id, dim0_stride=200
         )
         v_oob_dg1 = TDM.build_oob_dg1_list(
-            _V_CFG, 128, _sv_elems, actual_kv_len, wave_id
+            v_tdm_cfg, 128, v_stride_elems, actual_kv_len, wave_id
         )
         q_remain_o = arith.maxsi(actual_q_len - m_start, fx.Int32(0).ir_value())
         o_oob_dim1 = TDM.per_warp_oob_dim1(q_remain_o, wave_id, 32)
@@ -103,7 +105,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     )
                 if const_expr(RETURN_LSE):
                     lse_addr_z = ptr_base_i64(ptr_LSE) + fx.Int64(
-                        (q_tok_z * gdz + by) * 4
+                        (q_tok_z * grid_dim_z + by) * 4
                     )
                     llvm_dialect.store(
                         fx.Float32(float("-inf")).ir_value(),
@@ -126,32 +128,32 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             head_index = head_index_div(by, gqa)
             k_offset = k_start_tok * stride_k_seq + head_index * stride_k_head
             v_offset = k_start_tok * stride_v_seq + head_index * stride_v_head
-            k_a = extract_lds_base_i32(lds_alloc_k_a.get_base())
-            k_b = extract_lds_base_i32(lds_alloc_k_b.get_base())
-            v_a = extract_lds_base_i32(lds_alloc_v_a.get_base())
-            v_b = extract_lds_base_i32(lds_alloc_v_b.get_base())
+            k_lds_base_a = extract_lds_base_i32(lds_alloc_k_a.get_base())
+            k_lds_base_b = extract_lds_base_i32(lds_alloc_k_b.get_base())
+            v_lds_base_a = extract_lds_base_i32(lds_alloc_v_a.get_base())
+            v_lds_base_b = extract_lds_base_i32(lds_alloc_v_b.get_base())
             rocdl.sched_barrier(0)
-            kv_lds_addrs_a = build_kv_lds_addrs(lane_id, k_a, v_a)
-            kv_lds_addrs_b = build_kv_lds_addrs(lane_id, k_b, v_b)
+            kv_lds_addrs_a = build_kv_lds_addrs(lane_id, k_lds_base_a, v_lds_base_a)
+            kv_lds_addrs_b = build_kv_lds_addrs(lane_id, k_lds_base_b, v_lds_base_b)
             stride_k_32, stride_v_32 = stride_k_seq * 32, stride_v_seq * 32
-            scale = (fx.Float32(LOG2_E) * scalar_f).ir_value()
+            scale = (fx.Float32(LOG2_E) * softmax_scale).ir_value()
             sgpr_state = {
                 "s_log2e_scl": scale,
                 "s_log2e_scl_pair": vector.broadcast(T.vec(2, T.f32), scale),
             }
             ctx = {
-                "ty": ty,
+                "mlir_types": mlir_types,
                 "lane_id": lane_id,
                 "wave_id": wave_id,
                 "m_start": m_start,
                 "bx": bx,
                 "by": by,
-                "gdz": gdz,
+                "grid_dim_z": grid_dim_z,
                 "ptr_K": ptr_K,
                 "ptr_V": ptr_V,
                 "ptr_O": ptr_O,
                 "ptr_LSE": ptr_LSE,
-                "scalar_f": scalar_f,
+                "softmax_scale": softmax_scale,
                 "stride_k_seq": stride_k_seq,
                 "stride_v_seq": stride_v_seq,
                 "stride_o_seq": stride_o_seq,
@@ -170,18 +172,18 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             }
             # ── Prologue: Tile 0 QK + softmax ──
             (
-                softmax_state_pro,
-                sp_pairs_all_pro,
+                softmax_state_prologue,
+                sp_pairs_prologue,
                 all_su_sp_tiles,
                 causal_offset,
                 zero_v8f32,
             ) = prologue_tile0(
                 ctx,
-                ty,
+                mlir_types,
                 q_frags,
                 kv_lds_addrs_a,
-                k_a,
-                v_a,
+                k_lds_base_a,
+                v_lds_base_a,
                 k_oob_dg1,
                 v_oob_dg1,
                 IS_CAUSAL,
@@ -203,30 +205,33 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 ptr_K,
                 stride_k_32,
                 kv_lds_addrs_b,
-                k_b,
-                v_a,
-                k_a,
-                v_b,
-                softmax_state_pro,
-                sp_pairs_all_pro,
+                k_lds_base_b,
+                v_lds_base_a,
+                k_lds_base_a,
+                v_lds_base_b,
+                softmax_state_prologue,
+                sp_pairs_prologue,
                 all_su_sp_tiles,
                 causal_offset,
                 IS_CAUSAL,
-                _K_CFG,
-                _sk_elems,
+                k_tdm_cfg,
+                k_stride_elems,
             )
 
             # ── Main KV Loop: non-causal tiles ──
-            loop1_results = init_args
+            noncausal_loop_results = init_args
             for tile_idx, iter_args in range(
                 1, first_causal_tile_idx, 1, init=init_args
             ):
-                loop1_results = yield tile_iteration(ctx, tile_idx, iter_args)
+                noncausal_loop_results = yield tile_iteration(ctx, tile_idx, iter_args)
 
             # ── Main KV Loop: causal tiles ──
-            loop_results = loop1_results
+            loop_results = noncausal_loop_results
             for tile_idx, iter_args in range(
-                first_causal_tile_idx, num_tiles_minus1_idx, 1, init=loop1_results
+                first_causal_tile_idx,
+                num_tiles_minus1_idx,
+                1,
+                init=noncausal_loop_results,
             ):
                 tile_idx_i32 = fx.Int32(tile_idx)
                 causal_n = tile_idx_i32 * tile_n_const - causal_offset
@@ -235,15 +240,15 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 )
 
             # ── Epilogue ──
-            ep = unpack_loop_results(loop_results, lane_id)
+            epilogue_state = unpack_loop_results(loop_results, lane_id)
             emit_void("s_wait_idle")
             rocdl.s_barrier_signal(-1)
             rocdl.s_barrier_wait(-1)
             if num_tiles >= 2:
                 epilogue_endtile(
                     ctx,
-                    ty,
-                    ep,
+                    mlir_types,
+                    epilogue_state,
                     q_frags,
                     sgpr_state,
                     num_tiles,
@@ -251,11 +256,11 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     tile_n_const,
                     causal_offset,
                     IS_CAUSAL,
-                    _V_CFG,
+                    v_tdm_cfg,
                     zero_v8f32,
                 )
             else:
-                epilogue_single_tile(ctx, ep)
+                epilogue_single_tile(ctx, epilogue_state)
 
     return fmha_fwd_kernel
 
@@ -300,7 +305,7 @@ def ensure_kernel(is_causal: bool, return_lse: bool = False):
         ptr_LSE: fx.Tensor,
         ptr_cu_seqlens_q: fx.Tensor,
         ptr_cu_seqlens_k: fx.Tensor,
-        scalar_f: fx.Float32,
+        softmax_scale: fx.Float32,
         stride_q_seq: fx.Int32,
         stride_k_seq: fx.Int32,
         stride_v_seq: fx.Int32,
@@ -329,7 +334,7 @@ def ensure_kernel(is_causal: bool, return_lse: bool = False):
             ptr_LSE,
             ptr_cu_seqlens_q,
             ptr_cu_seqlens_k,
-            scalar_f,
+            softmax_scale,
             stride_q_seq,
             stride_k_seq,
             stride_v_seq,
@@ -391,7 +396,11 @@ def flash_attn_varlen_d192_gfx1250(
         (total_q_tokens, nheads_q) if return_lse else (batch, nheads_q, max_seqlen_q)
     )
     lse = torch.empty(lse_shape, dtype=torch.float32, device=q.device)
-    sq, sk, sv = q.stride(0) * BPP, k.stride(0) * BPP, v.stride(0) * BPP
+    stride_q_bytes, stride_k_bytes, stride_v_bytes = (
+        q.stride(0) * BPP,
+        k.stride(0) * BPP,
+        v.stride(0) * BPP,
+    )
     ensure_kernel(bool(causal), bool(return_lse))
     _run_compiled(
         launch_fns[(bool(causal), bool(return_lse))],
@@ -403,9 +412,9 @@ def flash_attn_varlen_d192_gfx1250(
         cu_seqlens_q,
         cu_seqlens_k,
         softmax_scale,
-        sq,
-        sk,
-        sv,
+        stride_q_bytes,
+        stride_k_bytes,
+        stride_v_bytes,
         out.stride(0),
         q.stride(1) * BPP,
         k.stride(1) * BPP,
