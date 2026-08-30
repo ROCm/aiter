@@ -595,7 +595,7 @@ def compile_blockscale_preshuffle_gemm(
         row_off_base = lane_div_16 * 4
 
         def load_scales_for_tile(k_base):
-            """Load and combine scales for all scale blocks in a K-tile. Returns list of combined_scales."""
+            """Load the A and B scales for every scale block in a K-tile."""
             all_combined = []
             for sb in range_constexpr(sb_per_tile):
                 kb = k_base // c_scale_block_k + fx.Index(sb)
@@ -620,19 +620,24 @@ def compile_blockscale_preshuffle_gemm(
                     )
                     s_b_vals.append(s_b_val)
 
-                s_b_vecs = []
-                for ni in range_constexpr(num_acc_n):
-                    s_b_vecs.append(Vec.filled(4, fx.Float32(s_b_vals[ni]), fx.Float32))
-
-                combined_scales = []
-                for mi in range_constexpr(m_repeat):
-                    mi_combined = []
-                    for ni in range_constexpr(num_acc_n):
-                        combined = s_a_vecs[mi] * s_b_vecs[ni]
-                        mi_combined.append(combined)
-                    combined_scales.append(mi_combined)
-                all_combined.append(combined_scales)
+                # Hand back the raw loads. Multiplying here would make the combine the
+                # first use of the newest load, forcing a vmcnt(0) drain every scale
+                # block and spending the prefetch distance the caller set up.
+                all_combined.append((s_a_vecs, s_b_vals))
             return all_combined
+
+        def _combine_scale_block(s_a_vecs, s_b_vals):
+            """A-scale x B-scale for one scale block. First use of the loads."""
+            s_b_vecs = [
+                Vec.filled(4, fx.Float32(s_b_vals[ni]), fx.Float32)
+                for ni in range_constexpr(num_acc_n)
+            ]
+            combined_scales = []
+            for mi in range_constexpr(m_repeat):
+                combined_scales.append(
+                    [s_a_vecs[mi] * s_b_vecs[ni] for ni in range_constexpr(num_acc_n)]
+                )
+            return combined_scales
 
         def compute_tile_blockscale(
             global_accs, b_tile_in, lds_buffer, pre_scales, *, a0_prefetch=None
@@ -641,7 +646,9 @@ def compile_blockscale_preshuffle_gemm(
             current_global = list(global_accs)
 
             for sb in range_constexpr(sb_per_tile):
-                combined_scales = pre_scales[sb]
+                # First use of this tile's scale loads, a full tile of MFMA after
+                # they were issued, so the wait should already be satisfied.
+                combined_scales = _combine_scale_block(*pre_scales[sb])
                 block_accs = [acc_init] * (num_acc_n * m_repeat)
 
                 if const_expr(_is_gfx950):
