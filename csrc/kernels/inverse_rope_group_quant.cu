@@ -20,7 +20,51 @@
 
 #define CHECK_CONTIGUOUS(x) AITER_CHECK(x.is_contiguous(), #x " must be contiguous")
 
+// Two of the three scale layouts are architecture-specific, and their
+// consumers are disjoint:
+//   mfma_tile -> CDNA's V_MFMA_SCALE_F32_16x16x128_F8
+//   n32k4     -> RDNA's WMMA scaleB
+// Each is 108 of this module's 372 kernel instantiations, so building both
+// everywhere spends 29% of the module on kernels the target can never launch.
+//
+// The __gfx*__ macros are defined only in the device compilation pass, which
+// is the asymmetry these gates ride on: each is 0 exactly when compiling
+// device code for an arch with no consumer, and 1 in the host pass. The device
+// image loses the kernels while the host keeps its dispatch, and rejects the
+// layout at runtime instead (is_cdna_arch below). Either can be forced on from
+// the build for a target that really needs both.
+#if defined(__gfx90a__) || defined(__gfx940__) || defined(__gfx941__) || \
+    defined(__gfx942__) || defined(__gfx950__)
+#define AITER_IRGQ_DEVICE_IS_CDNA 1
+#else
+#define AITER_IRGQ_DEVICE_IS_CDNA 0
+#endif
+
+#ifndef AITER_INVERSE_ROPE_MFMA_TILE
+#if defined(__HIP_DEVICE_COMPILE__) && !AITER_IRGQ_DEVICE_IS_CDNA
+#define AITER_INVERSE_ROPE_MFMA_TILE 0
+#else
+#define AITER_INVERSE_ROPE_MFMA_TILE 1
+#endif
+#endif
+
+#ifndef AITER_INVERSE_ROPE_N32K4
+#if defined(__HIP_DEVICE_COMPILE__) && AITER_IRGQ_DEVICE_IS_CDNA
+#define AITER_INVERSE_ROPE_N32K4 0
+#else
+#define AITER_INVERSE_ROPE_N32K4 1
+#endif
+#endif
+
 namespace aiter {
+
+// Runtime mirror of the layout gates above: the device image only carries the
+// layout its family consumes, so the host has to refuse the other one here
+// rather than let the launch fail with a bare "invalid device function".
+static inline bool is_cdna_arch()
+{
+    return get_gpu_arch().rfind("gfx9", 0) == 0;
+}
 
 static constexpr float kAbsmaxFloor = 1e-8f;
 
@@ -1491,11 +1535,25 @@ void inverse_rope_group_quant(
 
     if(scale_layout == kScaleMfmaTile)
     {
+#if AITER_INVERSE_ROPE_MFMA_TILE
+        AITER_CHECK(is_cdna_arch(),
+                    "mfma_tile scale layout feeds CDNA's V_MFMA_SCALE and has "
+                    "no consumer on ", get_gpu_arch(), " -- use n32k4 there");
         dispatch_group_size(sl<kScaleMfmaTile>{});
+#else
+        AITER_CHECK(false, "mfma_tile scale layout is not built for this arch");
+#endif
     }
     else if(scale_layout == kScaleN32K4)
     {
+#if AITER_INVERSE_ROPE_N32K4
+        AITER_CHECK(!is_cdna_arch(),
+                    "n32k4 scale layout feeds RDNA's WMMA scaleB and has no "
+                    "consumer on ", get_gpu_arch(), " -- use mfma_tile there");
         dispatch_group_size(sl<kScaleN32K4>{});
+#else
+        AITER_CHECK(false, "n32k4 scale layout is not built for this arch");
+#endif
     }
     else
     {

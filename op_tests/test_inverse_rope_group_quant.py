@@ -769,6 +769,15 @@ def main():
             # anything else, so sweeping it here would only collect failures.
             if scale_layout == "n32k4" and group_size != 32:
                 continue
+            # mfma_tile (CDNA V_MFMA_SCALE) and n32k4 (RDNA WMMA scaleB) have
+            # disjoint consumers, so the module builds each only for the family
+            # that can launch it -- see AITER_INVERSE_ROPE_MFMA_TILE / _N32K4.
+            # Mirror that here rather than collect a not-compiled failure.
+            is_cdna = get_gfx().startswith("gfx9")
+            if scale_layout == "mfma_tile" and not is_cdna:
+                continue
+            if scale_layout == "n32k4" and is_cdna:
+                continue
             ret = test_inverse_rope_group_quant(
                 s, h, g, head_dim, rd, group_size, dtype, scale_layout
             )
