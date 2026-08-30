@@ -1,42 +1,40 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Unit tests for FlyDSL split-K HGEMM precision regressions.
+"""Correctness and performance test for FlyDSL split-K HGEMM regressions.
 
 Usage:
     python op_tests/flydsl_tests/test_flydsl_splitk_hgemm.py
-    pytest -q op_tests/flydsl_tests/test_flydsl_splitk_hgemm.py
+    python op_tests/flydsl_tests/test_flydsl_splitk_hgemm.py --case \
+        splitk8_tile32_m104_n384_k7168
 """
 
 from __future__ import annotations
 
-import pytest
+import argparse
+import itertools
+
+import pandas as pd
 import torch
 
+import aiter
+from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.gemm_kernels import flydsl_hgemm
 from aiter.ops.shuffle import shuffle_weight
-
-if not torch.cuda.is_available():
-    pytest.skip("ROCm not available. Skipping GPU tests.", allow_module_level=True)
-
-try:
-    from aiter.ops.flydsl.gemm_kernels import (
-        flydsl_hgemm,
-    )
-except ImportError as exc:
-    pytest.skip(
-        f"Unable to import FlyDSL HGEMM kernels: {exc}", allow_module_level=True
-    )
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 
+SUPPORTED_GFX = ["gfx942", "gfx950"]
+
 DEFAULT_ATOL = 1e-2
 DEFAULT_RTOL = 1e-2
-DEFAULT_PASS_PCT = 99.9
+DEFAULT_TOL_ERR_RATIO = 1e-3
 DEFAULT_INPUT_SEED = 20260401
 
-SPLITK_PRECISION_CASES = [
-    {
-        "name": "splitk8_tile32_m104_n384_k7168",
+SPLITK_PRECISION_CASES = {
+    "splitk8_tile32_m104_n384_k7168": {
         "m": 104,
         "n": 384,
         "k": 7168,
@@ -45,10 +43,16 @@ SPLITK_PRECISION_CASES = [
         "tile_n": 64,
         "pack_n": 1,
         "split_k": 8,
+        "block_m_warps": 1,
+        "block_n_warps": 4,
+        "b_to_lds": False,
         "b_preshuffle": False,
+        "atol": DEFAULT_ATOL,
+        "rtol": DEFAULT_RTOL,
+        "tol_err_ratio": DEFAULT_TOL_ERR_RATIO,
+        "max_abs_delta": None,
     },
-    {
-        "name": "splitk4_tile16_m1_n7168_k512",
+    "splitk4_tile16_m1_n7168_k512": {
         "m": 1,
         "n": 7168,
         "k": 512,
@@ -57,10 +61,16 @@ SPLITK_PRECISION_CASES = [
         "tile_n": 128,
         "pack_n": 1,
         "split_k": 2,
+        "block_m_warps": 1,
+        "block_n_warps": 4,
+        "b_to_lds": False,
         "b_preshuffle": False,
+        "atol": DEFAULT_ATOL,
+        "rtol": DEFAULT_RTOL,
+        "tol_err_ratio": DEFAULT_TOL_ERR_RATIO,
+        "max_abs_delta": None,
     },
-    {
-        "name": "splitk16_tile32_m1_n2112_k7168_warp2x2_blds",
+    "splitk16_tile32_m1_n2112_k7168_warp2x2_blds": {
         "m": 1,
         "n": 2112,
         "k": 7168,
@@ -73,11 +83,12 @@ SPLITK_PRECISION_CASES = [
         "block_n_warps": 2,
         "b_to_lds": True,
         "b_preshuffle": False,
-        "pass_pct": 99.0,
-        "max_delta_limit": 32.0,
+        "atol": DEFAULT_ATOL,
+        "rtol": DEFAULT_RTOL,
+        "tol_err_ratio": 1e-2,
+        "max_abs_delta": 32.0,
     },
-    {
-        "name": "splitk8_tile32_m1_n3072_k1536_warp2x2_blds",
+    "splitk8_tile32_m1_n3072_k1536_warp2x2_blds": {
         "m": 1,
         "n": 3072,
         "k": 1536,
@@ -90,16 +101,19 @@ SPLITK_PRECISION_CASES = [
         "block_n_warps": 2,
         "b_to_lds": True,
         "b_preshuffle": False,
-        "pass_pct": 99.0,
-        "max_delta_limit": 8.0,
+        "atol": DEFAULT_ATOL,
+        "rtol": DEFAULT_RTOL,
+        "tol_err_ratio": 1e-2,
+        "max_abs_delta": 8.0,
     },
-]
+}
 
 
-def run_torch_acc(
-    a: torch.Tensor, b: torch.Tensor, dtype=torch.float32
+def run_torch(
+    a: torch.Tensor, b: torch.Tensor, dtype: torch.dtype = dtypes.bf16
 ) -> torch.Tensor:
-    return torch.mm(a.to(torch.float32), b.to(torch.float32).t()).to(dtype)
+    """Compute the untimed reference with fp32 matmul."""
+    return torch.mm(a.to(dtypes.fp32), b.to(dtypes.fp32).t()).to(dtype)
 
 
 def make_inputs(
@@ -117,132 +131,136 @@ def make_inputs(
     return a, b
 
 
-def _check_output(
-    ref: torch.Tensor,
-    out: torch.Tensor,
-    label: str,
-    *,
-    atol: float = DEFAULT_ATOL,
-    rtol: float = DEFAULT_RTOL,
-    pass_pct: float = DEFAULT_PASS_PCT,
-    max_delta_limit: float | None = None,
-) -> tuple[bool, float, float]:
-    ref_f = ref.float()
-    out_f = out.float()
-    close_mask = torch.isclose(ref_f, out_f, atol=atol, rtol=rtol)
-    pct_close = close_mask.float().mean().item() * 100.0
-    max_delta = (ref_f - out_f).abs().max().item()
-    passed = pct_close >= pass_pct
-    if max_delta_limit is not None:
-        passed = passed and max_delta <= max_delta_limit
-    print(
-        f"  [{label}] max_delta={max_delta:.4f}, {pct_close:.4f}% close "
-        f"(atol={atol}, rtol={rtol})"
+@benchmark()
+def test_flydsl_splitk_hgemm(
+    case,
+    dtype,
+    m,
+    n,
+    k,
+    tile_k,
+    tile_m,
+    tile_n,
+    pack_n,
+    split_k,
+    block_m_warps,
+    block_n_warps,
+    b_to_lds,
+    b_preshuffle,
+    atol,
+    rtol,
+    tol_err_ratio,
+    max_abs_delta,
+):
+    a, b = make_inputs(m, n, k, dtype)
+    ref = run_torch(a, b, dtype)
+    b_shuf = shuffle_weight(b, layout=(16 * pack_n, 16)) if b_preshuffle else b
+
+    candidates = {
+        "flydsl": lambda: flydsl_hgemm(
+            a,
+            b_shuf,
+            tile_k=tile_k,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            pack_n=pack_n,
+            split_k=split_k,
+            block_m_warps=block_m_warps,
+            block_n_warps=block_n_warps,
+            b_to_lds=b_to_lds,
+            b_preshuffle=b_preshuffle,
+        )
+    }
+
+    # HGEMM counts one multiply and one add per output/K pair. Traffic includes
+    # the two inputs and output; implementation-specific workspace is additional.
+    flops = 2 * m * n * k
+    nbytes = (a.numel() + b.numel() + m * n) * a.element_size()
+
+    ret = {"gfx": get_gfx()}
+    ref_fp32 = ref.to(dtypes.fp32)
+    for name, candidate in candidates.items():
+        out, us = run_perftest(candidate)
+        out_fp32 = out.to(dtypes.fp32)
+        err = checkAllclose(
+            ref_fp32,
+            out_fp32,
+            rtol=rtol,
+            atol=atol,
+            tol_err_ratio=tol_err_ratio,
+            max_abs_delta=max_abs_delta,
+            msg=f"{name}: split-K HGEMM {case}",
+        )
+        if err > tol_err_ratio:
+            raise AssertionError(
+                f"{name}: mismatch ratio {err:.4%} exceeds {tol_err_ratio:.4%}"
+            )
+        if max_abs_delta is not None:
+            actual_max_abs_delta = (ref_fp32 - out_fp32).abs().max().item()
+            if actual_max_abs_delta > max_abs_delta:
+                raise AssertionError(
+                    f"{name}: max abs delta {actual_max_abs_delta:.4f} exceeds "
+                    f"{max_abs_delta:.4f}"
+                )
+
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+
+    return ret
+
+
+test_flydsl_splitk_hgemm.__test__ = False
+
+
+def main():
+    gfx = get_gfx()
+    if gfx not in SUPPORTED_GFX:
+        aiter.logger.warning("FlyDSL split-K HGEMM unsupported on %s; skipping", gfx)
+        return
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="FlyDSL split-K HGEMM precision/performance cases",
     )
-    print(f"  ref  sample: {ref.reshape(-1)[:8]}")
-    print(f"  test sample: {out.reshape(-1)[:8]}")
-    print(f"  --> {'PASS' if passed else 'FAIL'}")
-    return passed, max_delta, pct_close
-
-
-def run_splitk_precision_case(
-    case: dict,
-    *,
-    seed: int = DEFAULT_INPUT_SEED,
-    atol: float = DEFAULT_ATOL,
-    rtol: float = DEFAULT_RTOL,
-    pass_pct: float = DEFAULT_PASS_PCT,
-) -> tuple[bool, float, float]:
-    print("=" * 80)
-    print(
-        "[flydsl] split-K HGEMM precision regression "
-        f"case={case['name']} shape=({case['m']}, {case['n']}, {case['k']}) "
-        f"tile=({case['tile_m']}, {case['tile_n']}, {case['tile_k']}) "
-        f"split_k={case['split_k']}"
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        choices=[dtypes.bf16],
+        nargs="*",
+        default=[dtypes.bf16],
+        help="Input/output dtype (bf16 only).",
     )
-    print("=" * 80)
-
-    torch_dtype = torch.bfloat16
-    a, b = make_inputs(case["m"], case["n"], case["k"], torch_dtype, seed=seed)
-    ref = run_torch_acc(a, b, dtype=torch_dtype)
-    b_shuf = (
-        shuffle_weight(b, layout=(16 * case["pack_n"], 16))
-        if case["b_preshuffle"]
-        else b
+    parser.add_argument(
+        "-c",
+        "--case",
+        type=str,
+        choices=list(SPLITK_PRECISION_CASES),
+        nargs="*",
+        default=list(SPLITK_PRECISION_CASES),
+        help="""Regression cases to sweep.
+        e.g.: -c splitk8_tile32_m104_n384_k7168""",
     )
+    args = parser.parse_args()
 
-    out = flydsl_hgemm(
-        a,
-        b_shuf,
-        tile_k=case["tile_k"],
-        tile_m=case["tile_m"],
-        tile_n=case["tile_n"],
-        pack_n=case["pack_n"],
-        split_k=case["split_k"],
-        block_m_warps=case.get("block_m_warps", 1),
-        block_n_warps=case.get("block_n_warps", 4),
-        b_to_lds=case.get("b_to_lds", False),
-        b_preshuffle=case["b_preshuffle"],
-    )
-    torch.cuda.synchronize()
-
-    return _check_output(
-        ref,
-        out,
-        case["name"],
-        atol=case.get("atol", atol),
-        rtol=case.get("rtol", rtol),
-        pass_pct=case.get("pass_pct", pass_pct),
-        max_delta_limit=case.get("max_delta_limit"),
-    )
-
-
-@pytest.mark.parametrize(
-    "case",
-    [pytest.param(case, id=case["name"]) for case in SPLITK_PRECISION_CASES],
-)
-def test_flydsl_splitk_hgemm_precision_regressions(case: dict):
-    passed, _, _ = run_splitk_precision_case(case)
-    assert passed
-
-
-def print_summary(results: list[tuple[str, str, float, float]]) -> None:
-    print(f"\n{'='*70}")
-    print("SUMMARY")
-    print(f"{'='*70}")
-    for name, status, max_delta, pct_close in results:
-        print(
-            f"  {status:>5s}  {name:<35s}  max_delta={max_delta:>8.4f}  "
-            f"close={pct_close:>6.2f}%"
+    rows = []
+    for dtype, case_name in itertools.product(args.dtype, args.case):
+        rows.append(
+            test_flydsl_splitk_hgemm(
+                case=case_name,
+                dtype=dtype,
+                **SPLITK_PRECISION_CASES[case_name],
+            )
         )
 
-    n_pass = sum(1 for _, status, _, _ in results if status == "PASS")
-    print(f"\n  {n_pass}/{len(results)} passed")
-
-
-def main() -> int:
-    results: list[tuple[str, str, float, float]] = []
-
-    for case in SPLITK_PRECISION_CASES:
-        try:
-            passed, max_delta, pct_close = run_splitk_precision_case(case)
-            results.append(
-                (
-                    case["name"],
-                    "PASS" if passed else "FAIL",
-                    max_delta,
-                    pct_close,
-                )
-            )
-        except Exception:  # noqa: BLE001
-            import traceback
-
-            traceback.print_exc()
-            results.append((case["name"], "ERROR", 0.0, 0.0))
-
-    print_summary(results)
-    return 1 if any(status in ("FAIL", "ERROR") for _, status, _, _ in results) else 0
+    df = pd.DataFrame(rows)
+    aiter.logger.info(
+        "FlyDSL split-K HGEMM summary (markdown):\n%s",
+        df.to_markdown(index=False),
+    )
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
