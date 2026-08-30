@@ -606,7 +606,9 @@ def build_pa_mqa_logits_fp4_prefill_module(
 # ============================================================================
 
 
-@lru_cache(maxsize=32)
+# Keep compiled launchers alive: eviction can unload a module while an
+# asynchronous dispatch from that specialization is still queued.
+@lru_cache(maxsize=None)
 def compile_pa_mqa_logits_fp4_prefill(
     *,
     block_k: int = 256,
