@@ -10,6 +10,9 @@
 
 Per-block scaling (ScaleBlockM=1, ScaleBlockN=128, ScaleBlockK=128).
 Scale layouts: scale_a [scale_k, M] transposed, scale_b [scale_n, scale_k] row-major.
+
+Call plan_lds before compiling an untried tile. An over-large tile does not raise; it
+aborts the process inside the backend.
 """
 
 import flydsl.compiler as flyc
@@ -19,6 +22,8 @@ from flydsl._mlir.dialects import llvm, vector
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
+from flydsl.expr.utils.arith import ArithValue
+from flydsl.expr.utils.arith import _to_raw as _raw
 from flydsl.runtime.device import get_rocm_arch
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.kernels_common import default_f8_type
@@ -35,9 +40,8 @@ from aiter.ops.flydsl.kernels.mfma_preshuffle_pipeline import (
 def _crd2idx(crd, layout):
     """crd2idx as an index-typed ir.Value, unwrapping the fly.int_tuple.
 
-    aiter's copy of mfma_preshuffle_pipeline still exports this as `crd2idx`; upstream
-    FlyDSL renamed it `preshuffle_crd2idx`. Copied here so vendoring this kernel does not
-    have to edit a module four other kernels import.
+    aiter's copy of mfma_preshuffle_pipeline still exports this under its older name,
+    so it is copied here rather than renamed in a module four other kernels import.
     """
     scalar = fx.get_scalar(fx.crd2idx(crd, layout)).ir_value()
     if isinstance(scalar.type, ir.IndexType):
@@ -45,9 +49,90 @@ def _crd2idx(crd, layout):
     return arith.IndexCastOp(T.index, scalar).result
 
 
+SCALE_BLOCK = 128
+WAVE = 64
+NUM_WAVES = 4  # default waves per workgroup; callers may compile an 8-wave variant
+MFMA_MN = 16  # v_mfma_f32_16x16x32_fp8_fp8 output tile edge
+NUM_XCDS = 8  # MI300X/gfx942 accelerator complex dies, each with its own L2.
+# Hardcoded, as in aiter's triton GEMMs (remap_xcd(..., NUM_XCDS=8)). The
+# un-rotation stays a permutation for any real count, so a part with fewer XCDs
+# (MI308X, MI300A) loses the L2 grouping but not correctness.
+XCD_GROUP_M = 16  # m-tile rows per L2 locality group
+
+
+def plan_lds(
+    *,
+    tile_m,
+    tile_n,
+    tile_k,
+    num_waves,
+    num_k_tiles,
+    use_cshuffle_epilog,
+    scale_block_k=SCALE_BLOCK,
+):
+    """Size the LDS buffers, without compiling: an over-large tile does not raise, it
+    aborts the process in the backend.
+
+    Returns (stage_scales, sub_buffer_bytes, a_group_tiles, total_bytes). The first and
+    third are always False and 1 here; callers unpack positionally, so they stay. So do
+    num_waves and num_k_tiles, which only matter to a k-tile grouping this kernel does
+    not do.
+
+    Mirrors the SharedStorage arithmetic below, and is the single source of that number.
+    """
+    del num_waves, num_k_tiles, scale_block_k
+    sub_buffer_bytes = tile_m * tile_k  # fp8 A: one byte per element
+    # Mirrors SharedStorage: the CShuffle image aliases the pair of A buffers, so each of
+    # the two holds half of it.
+    epilog_bytes = 2 * tile_m * tile_n if use_cshuffle_epilog else 0
+    buffer_bytes = max(sub_buffer_bytes, epilog_bytes // 2)
+    return False, sub_buffer_bytes, 1, 2 * buffer_bytes
+
+
+def _minui(a, b):
+    """Unsigned integer min on two index-typed scalars.
+
+    FlyDSL 0.3 stopped unwrapping its Index/ArithValue wrappers at the dialect
+    boundary ("Operand 1 ... must be a Value"), so hand the builder raw ir.Values and
+    re-wrap the result for the index arithmetic that follows.
+    """
+    return ArithValue(arith.minui(_raw(a), _raw(b)))
+
+
+def _tile_indices(c_num_pid_m, num_pid_n):
+    """Map this workgroup's linear id to its (m-tile, n-tile) pair.
+
+    Consecutive ids go round-robin across the XCDs, each with its own L2, so a
+    tile-linear order scatters neighbouring tiles over all of them. Undoing that
+    rotation, then grouping XCD_GROUP_M m-tile rows, keeps one XCD's tiles inside a
+    single output patch so the B panel they share stays L2-resident.
+    """
+    wgid = gpu.block_id("x")
+    c_num_pid_n = arith.index(num_pid_n)
+    c_xcds = arith.index(NUM_XCDS)
+    c_group_m = arith.index(XCD_GROUP_M)
+    num_wg = c_num_pid_m * c_num_pid_n
+
+    # Undo the round-robin. XCD i owns the ids congruent to i mod NUM_XCDS, and when
+    # num_wg is not a multiple of NUM_XCDS the first (num_wg % NUM_XCDS) of them own one
+    # workgroup more than the rest. Their destination blocks therefore start
+    # min(i, rem) further along; without that term the map stops being a permutation and
+    # two workgroups claim one tile.
+    xcd = wgid % c_xcds
+    rotated = xcd * (num_wg // c_xcds) + _minui(xcd, num_wg % c_xcds) + wgid // c_xcds
+
+    # Group XCD_GROUP_M m-tile rows into one L2 locality patch. The final group is short
+    # whenever num_pid_m is not a multiple of XCD_GROUP_M, so it is folded on its real
+    # height; folding on the nominal one would send m past the end of the grid.
+    group_wgs = c_group_m * c_num_pid_n
+    first_m = (rotated // group_wgs) * c_group_m
+    group_m = _minui(c_num_pid_m - first_m, c_group_m)
+    intra = rotated % group_wgs
+    return first_m + (intra % group_m), intra // group_m
+
+
 def compile_blockscale_preshuffle_gemm(
     *,
-    M: int,
     N: int,
     K: int,
     tile_m: int,
@@ -56,8 +141,10 @@ def compile_blockscale_preshuffle_gemm(
     scale_block_k: int = 128,
     out_dtype: str = "bf16",
     use_cshuffle_epilog: bool = False,
+    dsrd_depth: int = 1,
     waves_per_eu: int = None,
     use_async_copy: bool = False,
+    num_waves: int = NUM_WAVES,
 ):
     """Compile blockscale preshuffle GEMM. FP8 input, per-block scales, bf16/fp16 output."""
     if out_dtype not in ("fp16", "bf16"):
@@ -71,6 +158,25 @@ def compile_blockscale_preshuffle_gemm(
     if K % scale_block_k != 0:
         raise ValueError(
             f"K ({K}) must be divisible by scale_block_k ({scale_block_k})"
+        )
+    # The tuned-CSV kernelName carries an _sbk<n>_ field, so a row can ask for any
+    # scale_block_k that divides tile_k. Two sites below only serve 128: the gfx950
+    # MFMA branch consumes exactly two k-units per scale block, and sa_nbytes sizes the
+    # scale_a descriptor on it. Reject the rest rather than mis-reduce K.
+    if scale_block_k != SCALE_BLOCK:
+        raise ValueError(
+            f"scale_block_k must be {SCALE_BLOCK}, got {scale_block_k}; this is a "
+            f"[{SCALE_BLOCK}, {SCALE_BLOCK}] block-scale GEMM"
+        )
+    # Checked here as well as in tile_is_valid, which the AOT prebuilder does not call.
+    # num_pid_n truncates silently, so an N that is not a whole number of tiles would
+    # leave the trailing output columns unwritten.
+    if N % tile_n != 0:
+        raise ValueError(f"N ({N}) must be divisible by tile_n ({tile_n})")
+    if tile_n % (num_waves * MFMA_MN) != 0:
+        raise ValueError(
+            f"tile_n ({tile_n}) must split into whole {MFMA_MN}-wide MFMA tiles across "
+            f"{num_waves} waves"
         )
 
     scale_k = K // scale_block_k
@@ -92,7 +198,7 @@ def compile_blockscale_preshuffle_gemm(
     if use_async_copy and gpu_arch not in ("gfx942", "gfx950"):
         raise ValueError(f"async copy not supported on {gpu_arch}")
 
-    total_threads = 256
+    total_threads = num_waves * WAVE
     bytes_a_per_tile = tile_m * tile_k * elem_bytes
     if bytes_a_per_tile % total_threads != 0:
         raise ValueError(
@@ -104,11 +210,12 @@ def compile_blockscale_preshuffle_gemm(
         a_load_bytes = 16
     elif bytes_per_thread_a % 8 == 0:
         a_load_bytes = 8
-    elif bytes_per_thread_a % 4 == 0:
-        a_load_bytes = 4
     else:
+        # Not 4: store_a_tile_to_lds only emits 16B and 8B stores, so a 4-byte chunk
+        # would read A from global and never write it to LDS, leaving the MFMA on the
+        # previous k-tile's data.
         raise ValueError(
-            f"bytes_per_thread_a ({bytes_per_thread_a}) must be divisible by 4"
+            f"bytes_per_thread_a ({bytes_per_thread_a}) must be divisible by 8"
         )
     a_async_load_bytes = 4 if _is_gfx942 else 16
     a_async_load_dword = a_async_load_bytes // 4
@@ -124,9 +231,10 @@ def compile_blockscale_preshuffle_gemm(
         return fx.BFloat16 if is_bf16_out else fx.Float16
 
     epilog_tag = "cshuffle" if use_cshuffle_epilog else "direct"
+    round_tag = f"_dsrd{dsrd_depth}" if dsrd_depth != 1 else ""
 
     module_name = (
-        f"bs_gemm_{out_dtype}_{epilog_tag}" f"_t{tile_m}x{tile_n}x{tile_k}"
+        f"bs_gemm_{out_dtype}_{epilog_tag}{round_tag}_t{tile_m}x{tile_n}x{tile_k}"
     ).replace("-", "_")
 
     # ── LDS sizing (pure Python, no MLIR ops) ────────────────────────────
@@ -137,10 +245,12 @@ def compile_blockscale_preshuffle_gemm(
     buffer_size_bytes = max(lds_tile_bytes, lds_out_bytes // 2)
     buffer_size_elems = buffer_size_bytes  # fp8: 1 byte per elem
 
+    # Uint8 because this is byte staging; the MFMA operands take their fn/fnuz flavour
+    # from default_f8_type(), not from here.
     @fx.struct
     class SharedStorage:
-        pong: fx.Array[fx.Float8E4M3FN, buffer_size_elems, 16]
-        ping: fx.Array[fx.Float8E4M3FN, buffer_size_elems, 16]
+        pong: fx.Array[fx.Uint8, buffer_size_elems, 16]
+        ping: fx.Array[fx.Uint8, buffer_size_elems, 16]
 
     # ── Compile-time layout constants ─────────────────────────────────────
     kpack_bytes = 16
@@ -150,8 +260,8 @@ def compile_blockscale_preshuffle_gemm(
     num_a_loads = bytes_per_thread_a // a_load_bytes
     m_repeat = tile_m // 16
     k_unroll = tile_k_bytes // 64
-    num_waves = 4
     n_per_wave = tile_n // num_waves
+    num_pid_n = N // tile_n  # the swizzle needs the n-tile count
     num_acc_n = n_per_wave // 16
 
     # ── Kernel function ───────────────────────────────────────────────────
@@ -188,8 +298,6 @@ def compile_blockscale_preshuffle_gemm(
         k_blocks16 = tile_k_bytes // 16
 
         tx = gpu.thread_id("x")
-        bx = gpu.block_id("x")
-        by = gpu.block_id("y")
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         lds_a_pong = lds.pong
@@ -212,7 +320,7 @@ def compile_blockscale_preshuffle_gemm(
         c_rsrc = buffer_ops.create_buffer_resource(
             arg_c, max_size=False, num_records_bytes=c_nbytes
         )
-        sa_nbytes = (K // 128) * rt_M * 4  # [scale_k, M] f32
+        sa_nbytes = scale_k * rt_M * 4  # [scale_k, M] f32
         scale_a_rsrc = buffer_ops.create_buffer_resource(
             arg_scale_a, max_size=False, num_records_bytes=sa_nbytes
         )
@@ -220,12 +328,14 @@ def compile_blockscale_preshuffle_gemm(
         b_rsrc = buffer_ops.create_buffer_resource(arg_b, max_size=True)
         scale_b_rsrc = buffer_ops.create_buffer_resource(arg_scale_b, max_size=True)
 
+        c_num_pid_m = (rt_M + arith.index(tile_m - 1)) // arith.index(tile_m)
+        bx, by = _tile_indices(c_num_pid_m, num_pid_n)
         bx_m = bx * tile_m
         by_n = by * tile_n
 
         # ---- Wave / lane decomposition ----
         wave_size = 64
-        layout_wave_lane = fx.make_layout((4, wave_size), (64, 1))
+        layout_wave_lane = fx.make_layout((num_waves, wave_size), (64, 1))
         coord_wave_lane = fx.idx2crd(fx.Int32(tx), layout_wave_lane)
         wave_id = fx.get(coord_wave_lane, 0)
         lane_id = fx.get(coord_wave_lane, 1)
@@ -482,7 +592,6 @@ def compile_blockscale_preshuffle_gemm(
         c_scale_block_k = fx.Index(scale_block_k)
         c_scale_k = fx.Index(scale_k)
         c_128 = fx.Index(128)
-        c_M = fx.Index(M)
         row_off_base = lane_div_16 * 4
 
         def load_scales_for_tile(k_base):
@@ -490,7 +599,7 @@ def compile_blockscale_preshuffle_gemm(
             all_combined = []
             for sb in range_constexpr(sb_per_tile):
                 kb = k_base // c_scale_block_k + fx.Index(sb)
-                sa_base_offset = kb * c_M
+                sa_base_offset = kb * rt_M
                 s_a_vecs = []
                 for mi in range_constexpr(m_repeat):
                     row_base_m = bx_m + mi * 16
@@ -757,8 +866,11 @@ def compile_blockscale_preshuffle_gemm(
             for sche_i in range_constexpr(sche_iters):
                 rocdl.sched_vmem(1)
                 rocdl.sched_mfma(mfma_group)
-                rocdl.sched_dsrd(1)
+                rocdl.sched_dsrd(dsrd_depth)
                 rocdl.sched_mfma(mfma_group)
+                # The -1 is upstream's and starts the ds_write tail one iteration
+                # early. Not a slip: dropping it changes codegen (a same-shape compile
+                # is 4 KB smaller), so it is a scheduling choice, not dead arithmetic.
                 if const_expr(sche_i >= dswr_start - 1):
                     rocdl.sched_dswr(1)
             rocdl.sched_barrier(0)
@@ -842,7 +954,6 @@ def compile_blockscale_preshuffle_gemm(
                 gpu.barrier()
                 a0_prefetch_pong = prefetch_a0_pack(lds_a_pong)
 
-            last_k = K - tile_k
             final_accs = compute_tile_blockscale(
                 global_accs,
                 b_tile_pong,
@@ -940,8 +1051,9 @@ def compile_blockscale_preshuffle_gemm(
         i32_n: fx.Int32,
         stream: fx.Stream,
     ):
-        gx = (i32_m + (tile_m - 1)) // tile_m
-        gy = i32_n // tile_n
+        # The swizzle needs the workgroup ids on one axis, so the grid is linearised
+        # here and split back into (m, n) inside the kernel.
+        gx = ((i32_m + (tile_m - 1)) // tile_m) * num_pid_n
 
         kernel_gemm(
             arg_c,
@@ -953,12 +1065,12 @@ def compile_blockscale_preshuffle_gemm(
             i32_n,
             value_attrs={"rocdl.waves_per_eu": waves_per_eu},
         ).launch(
-            grid=(gx, gy, 1),
-            block=(256, 1, 1),
+            grid=(gx, 1, 1),
+            block=(total_threads, 1, 1),
             stream=stream,
         )
 
     return launch_gemm
 
 
-__all__ = ["compile_blockscale_preshuffle_gemm"]
+__all__ = ["compile_blockscale_preshuffle_gemm", "plan_lds"]
