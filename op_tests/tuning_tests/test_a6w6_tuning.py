@@ -182,6 +182,30 @@ class TestA6W6TuningLookup(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "logicalShape must be 0 or 1"):
             gemm_op_a6w6._load_gemm_a6w6_configs(self.config)
 
+    def test_invalid_split_m64_is_rejected(self):
+        self._write_rows(
+            [
+                [
+                    "gfx950",
+                    256,
+                    576,
+                    55296,
+                    6144,
+                    1,
+                    0,
+                    1,
+                    "kernel",
+                    1,
+                    1,
+                    0,
+                    2,
+                ]
+            ],
+            extra_header=["splitM64"],
+        )
+        with self.assertRaisesRegex(ValueError, "splitM64 must be 0 or 1"):
+            gemm_op_a6w6._load_gemm_a6w6_configs(self.config)
+
     def test_explicit_override_and_default(self):
         self.assertEqual(
             gemm_op_a6w6._select_gemm_a6w6_kernel(1, 1, 1, "explicit_kernel"),
@@ -275,6 +299,28 @@ class TestA6W6ApiValidation(unittest.TestCase):
         gemm_op_a6w6.gemm_a6w6(packed, packed, packed, packed, 544, 3072, 3072)
 
         self.assertEqual(launch.call_args.args[8:10], (None, None))
+
+    @mock.patch.object(gemm_op_a6w6, "get_GEMM_A6W6_config")
+    @mock.patch.object(gemm_op_a6w6, "gemm_a6w6_asm")
+    def test_gemm_splits_64_row_tail_when_flagged(self, launch, get_config):
+        get_config.return_value = {"kernelName": "main_kernel", "splitM64": 1}
+        M, N, K = 576, 55296, 6144
+        nk_pad = K // 128 + 2
+        packed = torch.empty(3 * nk_pad * 24576, dtype=torch.uint8, device="meta")
+        scales = torch.empty(3 * nk_pad * 1024, dtype=torch.uint8, device="meta")
+
+        result = gemm_op_a6w6.gemm_a6w6(
+            packed, packed, scales, scales, M, N, K
+        )
+
+        self.assertEqual(result.shape, (M, N))
+        self.assertEqual(launch.call_count, 2)
+        main, tail = launch.call_args_list
+        self.assertEqual(main.args[6:10], ("main_kernel", 1.0, 512, N))
+        self.assertEqual(
+            tail.args[6:10],
+            ("aiter_a6w6_m64n128_full_stage", 1.0, 64, N),
+        )
 
     def test_torch_quantizer_rejects_non_matrix_input(self):
         with self.assertRaisesRegex(ValueError, r"2D \[R, K\] tensor"):

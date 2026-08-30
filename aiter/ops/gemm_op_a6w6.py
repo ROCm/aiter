@@ -591,6 +591,12 @@ def _load_gemm_a6w6_configs(
         )
         if not configs["logicalShape"].isin((0, 1)).all():
             raise ValueError("A6W6 logicalShape must be 0 or 1")
+    if "splitM64" in configs:
+        configs["splitM64"] = (
+            pd.to_numeric(configs["splitM64"], errors="raise").fillna(0).astype(int)
+        )
+        if not configs["splitM64"].isin((0, 1)).all():
+            raise ValueError("A6W6 splitM64 must be 0 or 1")
     configs["gfx"] = configs["gfx"].astype(str).str.strip()
     configs["kernelName"] = configs["kernelName"].astype(str).str.strip()
 
@@ -680,6 +686,13 @@ def _config_uses_logical_shape(config: dict[str, object] | None) -> bool:
     if config is None:
         return False
     value = config.get("logicalShape")
+    return bool(int(value)) if value is not None and pd.notna(value) else False
+
+
+def _config_uses_split_m64(config: dict[str, object] | None) -> bool:
+    if config is None:
+        return False
+    value = config.get("splitM64")
     return bool(int(value)) if value is not None and pd.notna(value) else False
 
 
@@ -889,11 +902,12 @@ def gemm_a6w6_asm(
     return out
 
 
-def gemm_a6w6(
+def gemm_a6w6_out(
     A: Tensor,  # packed mxfp6 A (from quant_mxfp6_gemm)
     B: Tensor,  # packed mxfp6 B (from quant_mxfp6_gemm)
     A_scale: Tensor,  # packed A scales
     B_scale: Tensor,  # packed B scales
+    out: Tensor,
     M: int,
     N: int,
     K: int,
@@ -914,6 +928,12 @@ def gemm_a6w6(
         )
     if float(alpha) != 1.0:
         raise ValueError("gemm_a6w6 currently supports only alpha=1.0.")
+    padM, padN, padK = _ceil(M, _TILE), _ceil(N, _TILE), _ceil(K, _K_TILE)
+    if tuple(out.shape) != (padM, padN):
+        raise ValueError(
+            f"gemm_a6w6_out expects padded output shape {(padM, padN)}, "
+            f"got {tuple(out.shape)}"
+        )
     config = get_GEMM_A6W6_config(M, N, K) if kernelName is None else None
     selected_kernel = (
         str(config["kernelName"])
@@ -921,8 +941,41 @@ def gemm_a6w6(
         else _select_gemm_a6w6_kernel(M, N, K, kernelName)
     )
     use_logical_shape = _config_uses_logical_shape(config)
-    padM, padN, padK = _ceil(M, _TILE), _ceil(N, _TILE), _ceil(K, _K_TILE)
-    out = torch.empty((padM, padN), dtype=dtype, device=A.device)
+    if _config_uses_split_m64(config):
+        main_M = M - 64
+        if main_M <= 0 or main_M % _TILE:
+            raise ValueError("splitM64 requires M - 64 to be a positive multiple of 256")
+        nk_pad = padK // _K_TILE + _PADK
+        packed_parent_size = nk_pad * _PACKED_TILE_BYTES
+        scale_parent_size = nk_pad * _SCALE_TILE_BYTES
+        parent_count = main_M // _TILE
+        packed_offset = parent_count * packed_parent_size
+        scale_offset = parent_count * scale_parent_size
+        gemm_a6w6_asm(
+            A[:packed_offset],
+            B,
+            A_scale[:scale_offset],
+            B_scale,
+            out[:main_M],
+            padK,
+            selected_kernel,
+            alpha,
+            main_M,
+            N,
+        )
+        gemm_a6w6_asm(
+            A[packed_offset : packed_offset + packed_parent_size],
+            B,
+            A_scale[scale_offset : scale_offset + scale_parent_size],
+            B_scale,
+            out[main_M : main_M + _TILE],
+            padK,
+            "aiter_a6w6_m64n128_full_stage",
+            alpha,
+            64,
+            N,
+        )
+        return out
     gemm_a6w6_asm(
         A,
         B,
@@ -935,6 +988,35 @@ def gemm_a6w6(
         M if use_logical_shape else None,
         N if use_logical_shape else None,
     )
-    if padM != M or padN != N:
-        return out[:M, :N]
     return out
+
+
+def gemm_a6w6(
+    A: Tensor,
+    B: Tensor,
+    A_scale: Tensor,
+    B_scale: Tensor,
+    M: int,
+    N: int,
+    K: int,
+    dtype: torch.dtype = dtypes.bf16,
+    alpha: float = 1.0,
+    kernelName: str | None = None,
+) -> Tensor:
+    """A6W6 GEMM returning a logical [M, N] view of padded output storage."""
+    padM, padN = _ceil(M, _TILE), _ceil(N, _TILE)
+    out = torch.empty((padM, padN), dtype=dtype, device=A.device)
+    gemm_a6w6_out(
+        A,
+        B,
+        A_scale,
+        B_scale,
+        out,
+        M,
+        N,
+        K,
+        dtype,
+        alpha,
+        kernelName,
+    )
+    return out[:M, :N]

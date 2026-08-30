@@ -1,4 +1,4 @@
-gfx,cu_num,M,N,K,kernelId,splitK,us,kernelName,tflops,bw,errRatio,logicalShape
+gfx,cu_num,M,N,K,kernelId,splitK,us,kernelName,tflops,bw,errRatio,logicalShape,splitM64
 gfx950,256,8192,8192,16384,7,0,527.5759,aiter_a6w6_m256n512_persistent_row_stage,4168.16,1272.02,0.0
 gfx950,256,14850,2048,2048,14,0,47.0637,aiter_a6w6_m256n256_row_stage_gm4_k16k,2646.85,2763.06,0.0
 gfx950,256,14850,2048,8192,7,0,160.1829,aiter_a6w6_m256n512_persistent_row_stage,3110.71,2108.11,0.0
@@ -54,7 +54,7 @@ gfx950,256,75600,13824,5120,1,0,2978.8409,aiter_a6w6_m256n256_row_stage_gm32_k6k
 gfx950,256,576,18432,6144,5,0,58.6738,aiter_a6w6_m256n256_persistent_prefetch10,2223.47,4342.72,0.0
 gfx950,256,928,18432,6144,7,0,78.8912,aiter_a6w6_m256n512_persistent_row_stage,2664.24,3449.13,0.0
 gfx950,256,2112,18432,6144,5,0,143.0508,aiter_a6w6_m256n256_persistent_prefetch10,3343.93,2308.98,0.0
-gfx950,256,576,55296,6144,4,0,185.3719,aiter_a6w6_m256n256_persistent,2111.32,4047.3,0.0
+gfx950,256,576,55296,6144,4,0,155.4417,aiter_a6w6_m256n256_persistent,2517.85,4826.61,0.0,0,1
 gfx950,256,928,55296,6144,7,0,229.8266,aiter_a6w6_m256n512_persistent_row_stage,2743.61,3452.65,0.0
 gfx950,256,2112,55296,6144,6,0,479.0988,aiter_a6w6_m256n512_persistent,2995.32,1959.93,0.0
 gfx950,256,8192,9216,3072,0,0,166.2921,aiter_a6w6_m256n256_tile_stage,2789.41,1551.18,0.0
