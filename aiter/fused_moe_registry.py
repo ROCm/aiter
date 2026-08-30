@@ -101,9 +101,16 @@ def resolve_fused_moe_impl(kernel_name: str) -> BoundFusedMoeImpl | None:
     if callable(candidate):
         implementation = candidate
     else:
-        module_name, attribute = candidate.rsplit(":", 1)
-        implementation = getattr(importlib.import_module(module_name), attribute)
-        if not callable(implementation):
-            raise TypeError(f"Fused MoE implementation is not callable: {candidate}")
+        try:
+            module_name, attribute = candidate.rsplit(":", 1)
+            implementation = getattr(importlib.import_module(module_name), attribute)
+            if not callable(implementation):
+                raise TypeError(
+                    f"Fused MoE implementation is not callable: {candidate}"
+                )
+        except (ImportError, AttributeError, TypeError, ValueError) as error:
+            raise FusedMoeImplResolutionError(
+                f"Failed to load fused MoE implementation {name!r}: {error}"
+            ) from error
 
     return lambda request: implementation(request, config)

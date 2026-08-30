@@ -947,9 +947,7 @@ def _fused_moe_impl(
                 w2_scale=w2_scale,
                 a1_scale=a1_scale,
                 a2_scale=a2_scale,
-                block_size_m=(
-                    int(block_size_M) if block_size_M is not None else None
-                ),
+                block_size_m=(int(block_size_M) if block_size_M is not None else None),
                 ksplit=metadata.ksplit,
                 num_local_tokens=num_local_tokens,
                 moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
@@ -2456,7 +2454,9 @@ def get_2stage_cfgs(
         is_shuffled if opus_weights_shuffled is None else opus_weights_shuffled
     )
     try:
-        full_impl = None if bypass_tuned_config else resolve_fused_moe_impl(kernel_name1)
+        full_impl = (
+            None if bypass_tuned_config else resolve_fused_moe_impl(kernel_name1)
+        )
     except FusedMoeImplResolutionError as error:
         logger.warning(f"[fused_moe] {error}; using default heuristics.")
         cfg = None

@@ -8,11 +8,10 @@ import types
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, rocdl
+from flydsl._mlir.dialects import llvm
 from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
 from flydsl.expr import range_constexpr
 from flydsl.expr.typing import Vector as Vec
-from flydsl.expr.typing import as_ir_value
 
 
 def div_up(x, y):
@@ -192,13 +191,6 @@ def all_elements(*tensors, scalar=False):
             r += 1
 
 
-def _encode_waitcnt(vmcnt=63, expcnt=7, lgkmcnt=63):
-    """Encode s_waitcnt bitfield for CDNA3 (gfx94x)."""
-    vm_lo = vmcnt & 0xF
-    vm_hi = (vmcnt >> 4) & 0x3
-    return vm_lo | (expcnt << 4) | (lgkmcnt << 8) | (vm_hi << 14)
-
-
 def get_d1_shape(tensor):
     return [
         fx.size(tensor.layout.shape[i]).to_py_value() for i in range(tensor.layout.rank)
@@ -298,8 +290,7 @@ def atomic_add_bf16(ptr_base, reg_vec):
     """
     for i in range_constexpr(reg_vec.numel // 2):
         pair = Vec.from_elements([reg_vec[i * 2], reg_vec[i * 2 + 1]], fx.BFloat16)
-        addr = fx.ptrtoint(ptr_base + i * 2)
-        llvm_ptr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), as_ir_value(addr))
+        llvm_ptr = fx.to_llvm_ptr(ptr_base + i * 2)
         llvm.AtomicRMWOp(
             llvm.AtomicBinOp.fadd,
             llvm_ptr,
@@ -566,7 +557,7 @@ def asm_mark(mark: str):
     filename = caller_frame.f_code.co_filename
     lineno = caller_frame.f_lineno
 
-    rocdl.sched_barrier(0)
+    fx.rocdl.sched_barrier(0)
     llvm.inline_asm(
         ir.Type.parse("!llvm.void"),
         [],
@@ -574,7 +565,7 @@ def asm_mark(mark: str):
         "",
         has_side_effects=True,
     )
-    rocdl.sched_barrier(0)
+    fx.rocdl.sched_barrier(0)
 
 
 def dump_ir(enable_debug_info=True):
