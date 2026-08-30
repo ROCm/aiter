@@ -17,7 +17,7 @@ constexpr int kKPaddingTiles        = 2;
 constexpr size_t kPackedTileBytes   = 24576;
 constexpr size_t kScaleTileBytes    = 1024;
 constexpr char kPackLayout[]        = "mxfp6_c0c1_256_padk2";
-constexpr char kDefaultKernelName[] = "f6gemm_tstage_kernel_func";
+constexpr char kDefaultKernelName[] = "aiter_a6w6_m256n256_tile_stage";
 
 // KernelArgs layout is identical to the a4w4 asm gemm ABI. The mxfp6 kernels
 // use the same kernarg struct (0x180 bytes). Fields they do not consume

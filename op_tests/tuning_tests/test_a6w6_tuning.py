@@ -19,6 +19,9 @@ AITER_ROOT = os.path.dirname(
 MANIFEST = os.path.join(
     AITER_ROOT, "hsa", "gfx950", "f6gemm", "f6gemm_bf16_per1x32Fp6.csv"
 )
+TUNED_CONFIG = os.path.join(
+    AITER_ROOT, "aiter", "configs", "a6w6_blockscale_tuned_gemm.csv"
+)
 TUNED_HEADER = [
     "gfx",
     "cu_num",
@@ -160,6 +163,14 @@ class TestA6W6TuningLookup(unittest.TestCase):
             gemm_op_a6w6._select_gemm_a6w6_kernel(1, 1, 1, "explicit_kernel"),
             "explicit_kernel",
         )
+
+    def test_legacy_kernel_name_maps_to_canonical_name(self):
+        self.assertEqual(
+            gemm_op_a6w6._select_gemm_a6w6_kernel(
+                1, 1, 1, "f6gemm_tstage_kernel_func"
+            ),
+            "aiter_a6w6_m256n256_tile_stage",
+        )
         self.assertEqual(
             gemm_op_a6w6._default_gemm_a6w6_kernel(512, 55296, 6144),
             gemm_op_a6w6._DEFAULT_KERNEL_NAME,
@@ -208,17 +219,18 @@ class TestA6W6Manifest(unittest.TestCase):
     def test_manifest_candidates_are_compatible_and_present(self):
         configs = pd.read_csv(MANIFEST)
         expected_kernels = {
-            "f6gemm_tstage_kernel_func",
-            "f6gemm_astage_g32_kernel_func",
-            "f6gemm_astage_g64_kernel_func",
-            "f6gemm_astage_allk_kernel_func",
-            "f6gemm_persist_n1_kernel_func",
-            "f6gemm_pipeline_q10_kernel_func",
-            "f6gemm_persist_n2_kernel_func",
-            "f6gemm_n2_stage_kernel_func",
-            "f6gemm_rect128_kernel_func",
-            "f6gemm_small_tstage_kernel_func",
-            "f6gemm_small_full_kernel_func",
+            "aiter_a6w6_m256n256_tile_stage",
+            "aiter_a6w6_m256n256_row_stage_gm32_k6k",
+            "aiter_a6w6_m256n256_row_stage_gm64_k6k",
+            "aiter_a6w6_m256n256_row_stage_gm32_k16k",
+            "aiter_a6w6_m256n256_persistent",
+            "aiter_a6w6_m256n256_persistent_prefetch10",
+            "aiter_a6w6_m256n512_persistent",
+            "aiter_a6w6_m256n512_persistent_row_stage",
+            "aiter_a6w6_m128n256_stream",
+            "aiter_a6w6_m64n128_tile_stage",
+            "aiter_a6w6_m64n128_full_stage",
+            "aiter_a6w6_m128n128_full_stage",
         }
         self.assertEqual(set(configs["knl_name"]), expected_kernels)
         self.assertFalse(configs["knl_name"].duplicated().any())
@@ -229,7 +241,13 @@ class TestA6W6Manifest(unittest.TestCase):
         )
         self.assertEqual(
             layouts,
-            {(256, 256, 256), (256, 512, 256), (128, 256, 128), (64, 128, 128)},
+            {
+                (256, 256, 256),
+                (256, 512, 256),
+                (128, 256, 128),
+                (64, 128, 128),
+                (128, 128, 256),
+            },
         )
         self.assertTrue((configs["pack_layout"] == gemm_op_a6w6._PACK_LAYOUT).all())
         self.assertTrue(
@@ -251,6 +269,16 @@ class TestA6W6Manifest(unittest.TestCase):
         manifest_dir = os.path.dirname(MANIFEST)
         for co_name in configs["co_name"]:
             self.assertTrue(os.path.exists(os.path.join(manifest_dir, co_name)))
+
+    def test_tuned_kernel_ids_match_manifest_rows(self):
+        manifest = pd.read_csv(MANIFEST)
+        tuned = pd.read_csv(TUNED_CONFIG)
+        kernel_ids = {
+            kernel_name: kernel_id
+            for kernel_id, kernel_name in enumerate(manifest["knl_name"])
+        }
+        for row in tuned.itertuples(index=False):
+            self.assertEqual(row.kernelId, kernel_ids[row.kernelName])
 
 
 class TestA6W6MinimumGainGuard(unittest.TestCase):

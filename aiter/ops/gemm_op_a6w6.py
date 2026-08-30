@@ -19,7 +19,21 @@ from ..utility import dtypes
 # The mxfp6 (E2M3, per-1x32 blockscale) asm gemm shares the a4w4 kernarg ABI.
 # Its packed operand/scale layouts are produced by the helpers below and must
 # match exactly what the asm kernels consume.
-_DEFAULT_KERNEL_NAME = "f6gemm_tstage_kernel_func"
+_DEFAULT_KERNEL_NAME = "aiter_a6w6_m256n256_tile_stage"
+_LEGACY_KERNEL_NAMES = {
+    "f6gemm_tstage_kernel_func": "aiter_a6w6_m256n256_tile_stage",
+    "f6gemm_astage_g32_kernel_func": "aiter_a6w6_m256n256_row_stage_gm32_k6k",
+    "f6gemm_astage_g64_kernel_func": "aiter_a6w6_m256n256_row_stage_gm64_k6k",
+    "f6gemm_astage_allk_kernel_func": "aiter_a6w6_m256n256_row_stage_gm32_k16k",
+    "f6gemm_persist_n1_kernel_func": "aiter_a6w6_m256n256_persistent",
+    "f6gemm_pipeline_q10_kernel_func": "aiter_a6w6_m256n256_persistent_prefetch10",
+    "f6gemm_persist_n2_kernel_func": "aiter_a6w6_m256n512_persistent",
+    "f6gemm_n2_stage_kernel_func": "aiter_a6w6_m256n512_persistent_row_stage",
+    "f6gemm_rect128_kernel_func": "aiter_a6w6_m128n256_stream",
+    "f6gemm_small_tstage_kernel_func": "aiter_a6w6_m64n128_tile_stage",
+    "f6gemm_small_full_kernel_func": "aiter_a6w6_m64n128_full_stage",
+    "f6gemm_square128_kernel_func": "aiter_a6w6_m128n128_full_stage",
+}
 _TILE = 256
 _K_TILE = 128
 _SCALE_GROUP_SIZE = 32
@@ -647,7 +661,7 @@ def get_GEMM_A6W6_config(
 
 def _select_gemm_a6w6_kernel(M: int, N: int, K: int, kernelName: str | None) -> str:
     if kernelName:
-        return kernelName
+        return _LEGACY_KERNEL_NAMES.get(kernelName, kernelName)
     config = get_GEMM_A6W6_config(M, N, K)
     if config is not None:
         return str(config["kernelName"])
@@ -832,6 +846,8 @@ def gemm_a6w6_asm(
         if out.ndim != 2:
             raise ValueError("gemm_a6w6_asm expects a 2D [M, N] output tensor.")
         kernelName = _select_gemm_a6w6_kernel(*out.shape, K, None)
+    else:
+        kernelName = _LEGACY_KERNEL_NAMES.get(kernelName, kernelName)
     _gemm_a6w6_asm(
         A,
         B,
