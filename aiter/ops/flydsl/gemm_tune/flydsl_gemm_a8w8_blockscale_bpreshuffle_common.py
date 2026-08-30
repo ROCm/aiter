@@ -19,8 +19,8 @@ scale-block size and the scheduler, then one field per swept knob:
 Only those three vary across ``kernels_list``; the dtypes and the scheduler are
 recorded at their defaults so that a name stays self-describing. All three are
 optional groups, so a name written before they existed still parses.
-``waves_per_eu`` and ``stage_a_scales`` are absent from the name entirely, because
-the tuner sweeps neither. Add fields as the sweep grows -- appending to the regex is
+``dsrd_depth``, ``waves_per_eu`` and ``stage_a_scales`` are absent from the name
+entirely: the tuner sweeps none of them, and the first two follow the arch. Add fields as the sweep grows -- appending to the regex is
 safe, changing the existing groups is not.
 """
 
@@ -197,9 +197,39 @@ def tile_is_valid(
     return not lds or lds <= max_lds_bytes_for_tune()
 
 
+def default_use_async_copy(gfx: str = "") -> bool:
+    """The global to LDS DMA moves 16 bytes per thread on gfx95x and 4 on gfx942, so
+    the wide path pays there and the narrow one does not pay here.
+
+    ``gfx`` names the arch to answer for, defaulting to the running one. The AOT
+    prewarm passes a target arch, which is not always the host.
+    """
+    if not gfx:
+        try:
+            from aiter.jit.utils.chip_info import get_gfx
+
+            gfx = get_gfx()
+        except Exception:  # noqa: BLE001
+            return False
+    return gfx.startswith("gfx95")
+
+
+def default_dsrd_depth(gfx: str = "") -> int:
+    """Absent from the kernelName and never swept, so the arch decides it.
+
+    More than one ds_read per MFMA group is a small loss on gfx942 at every depth
+    tried, and a gain on gfx95x.
+    """
+    return 3 if default_use_async_copy(gfx) else 1
+
+
+# ---------------------------------------------------------------------------
+# Tuning search space. kernelId indexes the product of the three tables below,
+# so they are append-only: inserting anywhere repoints every tuned CSV row.
+# ---------------------------------------------------------------------------
+
 # Upstream's candidate list (FlyDSL tests/kernels/test_blockscale_preshuffle_gemm.py
-# select_tile_config), extended past its tile_m ceiling of 64. Order is part of
-# the contract: kernelId in a tuned CSV row indexes into this list, so append only.
+# select_tile_config), extended past its tile_m ceiling of 64.
 TILE_CANDIDATES = (
     (16, 64, 256),
     (16, 128, 256),

@@ -29,6 +29,8 @@ from .utils import get_shared_memory_per_block, is_flydsl_available
 # module so the tuner that writes a row and this op that reads it back cannot
 # drift. Order is part of the contract: kernelId indexes into it.
 from .gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_common import (
+    default_dsrd_depth,
+    default_use_async_copy,
     TILE_CANDIDATES as _BLOCKSCALE_TILE_CANDIDATES,
     tile_is_valid as blockscale_tile_is_valid,
 )
@@ -1275,18 +1277,24 @@ def _compile_flydsl_blockscale(
     scale_block_k: int,
     out_dtype: str,
     use_cshuffle_epilog: bool = False,
-    dsrd_depth: int = 1,
-    use_async_copy: bool = False,
+    dsrd_depth: int | None = None,
+    use_async_copy: bool | None = None,
     num_waves: int = 4,
-    stage_a_scales: bool = False,
+    stage_a_scales: bool = True,
 ):
     """Cached compile. M is not part of the key: the kernel takes it at runtime.
 
-    Every compile flag is, though, since each one selects different code.
+    Every compile flag is, though, since each one selects different code. A None
+    dsrd_depth or use_async_copy resolves to the arch default before the call, so the
+    key holds the value actually compiled rather than the request.
 
     waves_per_eu is deliberately not exposed. Leaving it unset lets the compiler
     choose, which measured best on both arches, and a high value collapses occupancy
     rather than trading it."""
+    if use_async_copy is None:
+        use_async_copy = default_use_async_copy()
+    if dsrd_depth is None:
+        dsrd_depth = default_dsrd_depth()
     compile_fn = _get_blockscale_compile_fn()
     if compile_fn is None:
         raise RuntimeError("[FlyDSL] blockscale compile function not available")
@@ -1317,10 +1325,10 @@ def flydsl_gemm_a8w8_blockscale_bpreshuffle(
     tile_k: int = 0,
     scale_block_k: int = 128,
     use_cshuffle_epilog: bool = False,
-    dsrd_depth: int = 1,
-    use_async_copy: bool = False,
+    dsrd_depth: int | None = None,
+    use_async_copy: bool | None = None,
     num_waves: int = 4,
-    stage_a_scales: bool = False,
+    stage_a_scales: bool = True,
 ) -> Tensor:
     """Compile (cached) and run the FlyDSL blockscale bpreshuffle GEMM.
 
@@ -1358,6 +1366,10 @@ def flydsl_gemm_a8w8_blockscale_bpreshuffle(
             f"expected torch.bfloat16 or torch.float16"
         )
 
+    if use_async_copy is None:
+        use_async_copy = default_use_async_copy()
+    if dsrd_depth is None:
+        dsrd_depth = default_dsrd_depth()
     if not (tile_m and tile_n and tile_k):
         tile_m, tile_n, tile_k = select_blockscale_tile_config(
             m,
