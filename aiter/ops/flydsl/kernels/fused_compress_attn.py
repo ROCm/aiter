@@ -76,7 +76,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl._mlir.dialects import rocdl
-from flydsl.expr import arith, const_expr, gpu, ptrtoint, range_constexpr
+from flydsl.expr import arith, const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
 from flydsl.expr.typing import Int32, Stream, T
@@ -94,6 +94,15 @@ from .fused_compress_attn_common import (
     block_base_bytes_i64,
     emit_group_fp8_nm_asm_scatter,
     state_slot_byte_offset,
+)
+from .fused_compress_attn_common import (
+    buf_load as _buf_load,
+)
+from .fused_compress_attn_common import (
+    buf_store as _buf_store,
+)
+from .fused_compress_attn_common import (
+    buf_tensor as _buf_tensor,
 )
 from .quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
 from .tensor_shim import _run_compiled, _to_raw
@@ -133,56 +142,6 @@ _PRESHUFFLE_TILE = 16
 _FP4_GROUP_SIZE = 32
 # FP4 preshuffle k_tile = 128 elements; each holds 4 groups of 32 (= 16 bytes/group).
 _FP4_K_TILE = 128
-
-
-# ============================================================================
-# Buffer-resource (V#) helpers -- fx replacement for buffer_ops.* .
-# ============================================================================
-def _buf_tensor(tensor, elem_ty, *, base_i64=None):
-    """Build a flat buffer-resource-backed (V#) tensor over ``tensor``'s memory,
-    reinterpreted as elements of ``elem_ty``.
-
-    ``add_offset`` on the resulting iterator advances by ``elem_ty`` elements, so
-    the caller passes offsets in the SAME unit it loads/stores (matching
-    ``buffer_ops`` where the offset scales by the *load* dtype, independent of the
-    tensor's declared element type -- e.g. a bf16 tensor read as i32 dwords).
-
-    When ``base_i64`` (a 64-bit BYTE offset) is given it is folded into the base
-    pointer *before* the descriptor is built -- reproducing the identical 64-bit
-    descriptor base that ``create_buffer_resource(base_byte_offset=...)`` sets, so
-    per-thread voffsets stay 32-bit and the 4 GiB overflow guard is preserved by
-    construction (the base carries the wide term).
-    """
-    native = tensor.element_type
-    n_native = fx.get_scalar(fx.cosize(fx.get_layout(tensor)))
-    n_elems = n_native * native.width // elem_ty.width  # flat extent in elem_ty
-    base_i = fx.Int64(ptrtoint(fx.get_iter(tensor)))
-    if base_i64 is not None:
-        base_i = base_i + fx.Int64(base_i64)
-    pt = fx.PointerType.get(
-        elem_ty.ir_type,
-        address_space=fx.AddressSpace.Global,
-        alignment=elem_ty.width // 8,
-    )
-    view = fx.make_view(fx.inttoptr(pt, base_i), fx.make_layout((n_elems,), (1,)))
-    return fx.rocdl.make_buffer_tensor(view)
-
-
-def _buf_load(buf, off_elems, width, dtype):
-    """Vectorized element-offset load from a buffer-tensor ``buf`` (V# desc).
-
-    Offset is in ELEMENTS of ``buf``'s element type (== ``dtype``); the hardware
-    OOB check comes from the descriptor. Mirrors ``buffer_load``.
-    """
-    p = fx.add_offset(fx.get_iter(buf), off_elems)
-    if width == 1:
-        return p.load(dtype)
-    return p.load(T.vec(width, dtype))
-
-
-def _buf_store(val, buf, off_elems):
-    """Element-offset store into a buffer-tensor ``buf`` (V# desc)."""
-    fx.add_offset(fx.get_iter(buf), off_elems).store(val)
 
 
 # ============================================================================

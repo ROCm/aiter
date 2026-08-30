@@ -129,6 +129,44 @@ def _global_ptr(base_i64, byte_off, elem_ir_type, align):
     return fx.inttoptr(pt, addr)
 
 
+def buf_tensor(tensor, elem_ty, *, base_i64=None):
+    """Flat buffer-resource (V#) tensor over ``tensor``'s memory, reinterpreted as
+    ``elem_ty``. ``add_offset`` advances by ``elem_ty`` elements, so the caller
+    passes offsets in the load/store unit (like ``buffer_ops``, whose offset
+    scales by the *load* dtype, not the tensor's declared type -- e.g. a bf16
+    tensor read as i32 dwords). ``base_i64`` (a 64-bit BYTE offset) is folded into
+    the base pointer before the descriptor is built, reproducing
+    ``create_buffer_resource(base_byte_offset=...)`` so per-thread voffsets stay
+    32-bit and the 4 GiB guard holds by construction.
+    """
+    native = tensor.element_type
+    n_native = fx.get_scalar(fx.cosize(fx.get_layout(tensor)))
+    n_elems = n_native * native.width // elem_ty.width
+    base_i = fx.Int64(fx.ptrtoint(fx.get_iter(tensor)))
+    if base_i64 is not None:
+        base_i = base_i + fx.Int64(base_i64)
+    pt = fx.PointerType.get(
+        elem_ty.ir_type,
+        address_space=_AS_GLOBAL,
+        alignment=elem_ty.width // 8,
+    )
+    view = fx.make_view(fx.inttoptr(pt, base_i), fx.make_layout((n_elems,), (1,)))
+    return fx.rocdl.make_buffer_tensor(view)
+
+
+def buf_load(buf, off_elems, width, dtype):
+    """Element-offset load from a buffer-tensor (V# desc); offset in ELEMENTS of
+    ``dtype`` (== ``buf``'s element type). HW OOB check comes from the descriptor.
+    """
+    p = fx.add_offset(fx.get_iter(buf), off_elems)
+    return p.load(dtype if width == 1 else T.vec(width, dtype))
+
+
+def buf_store(val, buf, off_elems):
+    """Element-offset store into a buffer-tensor (V# desc)."""
+    fx.add_offset(fx.get_iter(buf), off_elems).store(val)
+
+
 def emit_group_fp8_nm_asm_scatter(
     *,
     normed_lane,  # list[VEC] f32: post-norm nope values (this lane's slice)
