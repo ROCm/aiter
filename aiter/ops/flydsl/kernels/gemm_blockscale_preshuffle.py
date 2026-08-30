@@ -11,8 +11,11 @@
 Per-block scaling (ScaleBlockM=1, ScaleBlockN=128, ScaleBlockK=128).
 Scale layouts: scale_a [scale_k, M] transposed, scale_b [scale_n, scale_k] row-major.
 
-Call plan_lds before compiling an untried tile. An over-large tile does not raise; it
-aborts the process inside the backend.
+Call plan_lds before compiling an untried tile, with the same stage_a_scales the compile
+will use. An over-large tile does not raise: it compiles, the backend reports "local
+memory (N) exceeds limit", and the launch then fails with hipErrorIllegalState without
+raising in Python -- leaving the output buffer unwritten and the HIP context poisoned, so
+the next unrelated call fails far from the cause.
 """
 
 import flydsl.compiler as flyc
@@ -71,8 +74,13 @@ def plan_lds(
     scale_block_k=SCALE_BLOCK,
     stage_a_scales=False,
 ):
-    """Size the LDS buffers, without compiling: an over-large tile does not raise, it
-    aborts the process in the backend.
+    """Size the LDS buffers, without compiling: an over-large tile does not raise, and
+    does not abort either. It compiles, the launch fails with hipErrorIllegalState and no
+    Python exception, the output is left unwritten and the HIP context is poisoned --
+    worse than an abort, because it returns. Pass the stage_a_scales the compile will
+    use; the staged A-scale slice is part of the footprint. The default matches this
+    module's own compile default, not aiter's wrapper, which passes True: a caller
+    pairing this with the wrapper must say so explicitly.
 
     Returns (stage_scales, sub_buffer_bytes, a_group_tiles, total_bytes). a_group_tiles
     is always 1 here; callers unpack positionally, so it stays. So do num_waves and

@@ -43,6 +43,7 @@ from opus_gemm.opus_gemm_common import gfx942_a8w8_kernels_list
 try:
     from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_common import (
         default_use_async_copy as flydsl_default_async,
+        effective_stage_a_scales as flydsl_effective_stage_a_scales,
         kernels_list as candidate_kernels_flydsl_dict,
         tile_is_valid as flydsl_tile_is_valid,
     )
@@ -54,6 +55,9 @@ except ImportError:
     candidate_kernels_flydsl_dict = {}
 
     def flydsl_default_async() -> bool:
+        return False
+
+    def flydsl_effective_stage_a_scales(*_args, **_kwargs) -> bool:
         return False
 
 
@@ -613,6 +617,10 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                 ki.scale_block_k,
                 num_waves=ki.num_waves,
                 use_cshuffle_epilog=ki.use_cshuffle_epilog,
+                # The staged slice is part of the footprint the backend sees.
+                stage_a_scales=flydsl_effective_stage_a_scales(
+                    ki.tile_m, ki.tile_k, ki.scale_block_k, ki.use_async_copy
+                ),
             ):
                 continue
             num_ctas = ((M + ki.tile_m - 1) // ki.tile_m) * (N // ki.tile_n)

@@ -461,6 +461,10 @@ def test_real_dispatch_branch(monkeypatch, strided_x_scale: bool):
         pytest.param({"num_waves": 8}, id="num_waves8"),
         pytest.param({"use_cshuffle_epilog": True}, id="cshuffle"),
         pytest.param({"use_async_copy": True}, id="async_copy"),
+        # The staged A-scale path; nothing else in this file compiles it.
+        pytest.param(
+            {"use_async_copy": True, "stage_a_scales": True}, id="async_copy_staged"
+        ),
     ],
 )
 def test_optional_kernel_knobs(knob: dict):
@@ -557,6 +561,7 @@ def main() -> int:
                     {"num_waves": 8},
                     {"use_cshuffle_epilog": True},
                     {"use_async_copy": True},
+                    {"use_async_copy": True, "stage_a_scales": True},
                 )
             ],
         ),

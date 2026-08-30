@@ -65,7 +65,9 @@ from aiter.ops.flydsl.gemm_kernels import (
 )
 from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_common import (
     default_dsrd_depth,
+    effective_stage_a_scales,
     parse_kernel_name as _parse_blockscale_kernel_name,
+    tile_is_valid as _blockscale_tile_is_valid,
 )
 from aiter.ops.flydsl.kernels.gemm_blockscale_preshuffle import (
     compile_blockscale_preshuffle_gemm,
@@ -703,6 +705,26 @@ def _compile_blockscale_to_cache(
     # the flags come from the kernelName; dsrd_depth and stage_a_scales are not in it,
     # so they are resolved the way flydsl_gemm_a8w8_blockscale_bpreshuffle resolves
     # them, for the arch being built rather than the host.
+    staged = effective_stage_a_scales(tile_m, tile_k, scale_block_k, use_async_copy)
+    # The tuner and the dispatch both reject an over-budget tile before it compiles, so
+    # a row reaching here should already be servable. Checked anyway: this is the one
+    # path that reads a CSV without either of them in front of it, and the failure it
+    # guards against is a launch that corrupts the context without raising.
+    if not _blockscale_tile_is_valid(
+        tile_m,
+        tile_n,
+        tile_k,
+        n,
+        k,
+        scale_block_k,
+        num_waves=num_waves,
+        use_cshuffle_epilog=use_cshuffle_epilog,
+        stage_a_scales=staged,
+    ):
+        raise RuntimeError(
+            f"tile {tile_m}x{tile_n}x{tile_k} exceeds the LDS budget for "
+            f"N={n} K={k}; refusing to prewarm it"
+        )
     exe = compile_blockscale_preshuffle_gemm(
         N=n,
         K=k,

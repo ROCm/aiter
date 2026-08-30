@@ -123,6 +123,7 @@ def estimated_lds_bytes(
     use_cshuffle_epilog: bool = False,
     k: int = 0,
     num_waves: int = 4,
+    stage_a_scales: bool = True,
 ) -> int:
     """LDS footprint of one instance, or 0 when the kernel cannot be imported.
 
@@ -131,7 +132,10 @@ def estimated_lds_bytes(
     the first time those choices changed, disagreeing with the kernel on 7 of the 14
     candidate tiles. ``use_cshuffle_epilog`` matters: the CShuffle image is
     ``2*tile_m*tile_n``, larger than the plain staging whenever ``tile_n > tile_k``, so a
-    tile that fits without it can exceed the limit with it.
+    tile that fits without it can exceed the limit with it. ``stage_a_scales`` matters for
+    the same reason and defaults to **True**, the value every production caller compiles
+    with: the staged A-scale slice adds ``2 * (tile_k // scale_block_k) * tile_m * 4``
+    bytes, and validating without it can approve kernelIds that would overflow.
     """
     try:
         from aiter.ops.flydsl.kernels.gemm_blockscale_preshuffle import plan_lds
@@ -148,6 +152,7 @@ def estimated_lds_bytes(
         num_k_tiles=num_k_tiles,
         use_cshuffle_epilog=use_cshuffle_epilog,
         scale_block_k=ki.scale_block_k,
+        stage_a_scales=stage_a_scales,
     )
     return total_bytes
 
@@ -156,6 +161,30 @@ def estimated_lds_bytes(
 # without a FlyDSL install. These are shape-independent and have not moved.
 _MFMA_MN = 16
 _WAVE = 64
+
+
+def effective_stage_a_scales(
+    tile_m: int,
+    tile_k: int,
+    scale_block_k: int = 128,
+    use_async_copy: bool = False,
+    stage_a_scales: bool = True,
+    wave: int = _WAVE,
+) -> bool:
+    """Whether the kernel will actually stage the A scales for this tile.
+
+    Mirrors ``gemm_blockscale_preshuffle`` exactly (``_stage_a_scales = stage_a_scales
+    and _scales_async_ok``): staging rides the async global->LDS path, so it is off
+    whenever async copy is, and off for tiles whose scale count is not a whole number of
+    waves. Validation must ask this rather than the caller's request -- asking the
+    request over-counts on gfx942, where async copy is arch-off, and would reject tiles
+    that genuinely fit.
+    """
+    return bool(
+        stage_a_scales
+        and use_async_copy
+        and ((tile_k // scale_block_k) * tile_m) % wave == 0
+    )
 
 
 def tile_is_valid(
@@ -167,15 +196,22 @@ def tile_is_valid(
     scale_block_k: int = 128,
     num_waves: int = 4,
     use_cshuffle_epilog: bool = False,
+    stage_a_scales: bool = True,
 ) -> bool:
     """Whether ``compile_blockscale_preshuffle_gemm`` will accept this tile.
 
     Every rejection here is one the kernel would otherwise make itself, and the reason to
     make it first is the failure mode. The kernel's own guards raise ``ValueError`` rather
     than the ``RuntimeError`` the caller contract specifies, and an over-large tile does
-    not raise at all -- it reaches the backend and aborts the process on ``local memory
-    (N) exceeds limit``, which no caller can catch. Rejecting the tile before anything is
-    compiled turns both into an ordinary RuntimeError.
+    not raise at all: it compiles, the backend reports ``local memory (N) exceeds limit``,
+    and the launch then fails with ``hipErrorIllegalState`` **without raising in Python**.
+    The output buffer is left unwritten and the HIP context is poisoned, so the next
+    unrelated call fails far from the cause. That is worse than an abort, because it
+    returns. Rejecting the tile before anything is compiled turns both into an ordinary
+    RuntimeError.
+
+    ``stage_a_scales`` defaults to True to match production; passing False here while
+    compiling with True is what let the six over-budget ids through.
     """
     total_threads = num_waves * _WAVE
     bytes_a_per_tile = tile_m * tile_k  # fp8: one byte per element
@@ -193,6 +229,7 @@ def tile_is_valid(
         use_cshuffle_epilog=use_cshuffle_epilog,
         k=k,
         num_waves=num_waves,
+        stage_a_scales=stage_a_scales,
     )
     return not lds or lds <= max_lds_bytes_for_tune()
 

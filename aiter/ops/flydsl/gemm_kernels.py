@@ -29,6 +29,7 @@ from .utils import get_shared_memory_per_block, is_flydsl_available
 # module so the tuner that writes a row and this op that reads it back cannot
 # drift. Order is part of the contract: kernelId indexes into it.
 from .gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_common import (
+    effective_stage_a_scales,
     default_dsrd_depth,
     default_use_async_copy,
     TILE_CANDIDATES as _BLOCKSCALE_TILE_CANDIDATES,
@@ -1183,13 +1184,23 @@ def _get_blockscale_compile_fn():
 
 @functools.lru_cache(maxsize=1024)
 def _blockscale_tile_is_valid(
-    tile_m, tile_n, tile_k, n, k, scale_block_k, use_cshuffle_epilog=False, num_waves=4
+    tile_m,
+    tile_n,
+    tile_k,
+    n,
+    k,
+    scale_block_k,
+    use_cshuffle_epilog=False,
+    num_waves=4,
+    stage_a_scales=True,
 ):
     """Cached tile_is_valid, which builds a real LDS plan and queries the device limit.
 
-    Both flags are part of the key because both change the verdict: cshuffle roughly
-    doubles the LDS footprint, and num_waves sets how tile_n must divide and how many
-    bytes each thread copies.
+    All three flags are part of the key because all three change the verdict: cshuffle
+    roughly doubles the LDS footprint, num_waves sets how tile_n must divide and how many
+    bytes each thread copies, and staging adds the A-scale slice. Validating with a
+    different staging value than the compile uses is what let six over-budget tiles
+    through, so this must be the value actually passed to the compile.
     """
     return blockscale_tile_is_valid(
         tile_m,
@@ -1200,6 +1211,7 @@ def _blockscale_tile_is_valid(
         scale_block_k,
         num_waves=num_waves,
         use_cshuffle_epilog=use_cshuffle_epilog,
+        stage_a_scales=stage_a_scales,
     )
 
 
@@ -1211,6 +1223,7 @@ def select_blockscale_tile_config(
     scale_block_k: int = 128,
     use_cshuffle_epilog: bool = False,
     num_waves: int = 4,
+    stage_a_scales: bool = True,
 ) -> tuple:
     """Heuristic tile pick for shapes with no tuned row; prefer a tuned kernelName.
 
@@ -1228,6 +1241,7 @@ def select_blockscale_tile_config(
             scale_block_k,
             use_cshuffle_epilog,
             num_waves,
+            stage_a_scales,
         )
     ]
     if not valid:
@@ -1284,17 +1298,21 @@ def _compile_flydsl_blockscale(
 ):
     """Cached compile. M is not part of the key: the kernel takes it at runtime.
 
-    Every compile flag is, though, since each one selects different code. A None
-    dsrd_depth or use_async_copy resolves to the arch default before the call, so the
-    key holds the value actually compiled rather than the request.
+    Every compile flag is, though, since each one selects different code. Callers must
+    resolve a None dsrd_depth or use_async_copy to the arch default *before* calling, so
+    the key holds the value actually compiled rather than the request; resolving inside
+    would happen after the key is formed, giving None and the resolved value two entries
+    and a redundant compile for the same kernel. Rejected rather than repaired, because
+    repairing it here is exactly the bug.
 
     waves_per_eu is deliberately not exposed. Leaving it unset lets the compiler
     choose, which measured best on both arches, and a high value collapses occupancy
     rather than trading it."""
-    if use_async_copy is None:
-        use_async_copy = default_use_async_copy()
-    if dsrd_depth is None:
-        dsrd_depth = default_dsrd_depth()
+    if use_async_copy is None or dsrd_depth is None:
+        raise ValueError(
+            "resolve use_async_copy and dsrd_depth to the arch default before this "
+            "cached call, so the cache key holds the value actually compiled"
+        )
     compile_fn = _get_blockscale_compile_fn()
     if compile_fn is None:
         raise RuntimeError("[FlyDSL] blockscale compile function not available")
@@ -1378,7 +1396,10 @@ def flydsl_gemm_a8w8_blockscale_bpreshuffle(
             scale_block_k,
             use_cshuffle_epilog,
             num_waves,
+            stage_a_scales and use_async_copy,
         )
+    # Validate the footprint the kernel will really build: the raw request over-counts
+    # wherever async copy is off, rejecting tiles that fit.
     if not _blockscale_tile_is_valid(
         tile_m,
         tile_n,
@@ -1388,6 +1409,9 @@ def flydsl_gemm_a8w8_blockscale_bpreshuffle(
         scale_block_k,
         use_cshuffle_epilog,
         num_waves,
+        effective_stage_a_scales(
+            tile_m, tile_k, scale_block_k, use_async_copy, stage_a_scales
+        ),
     ):
         raise RuntimeError(
             f"[FlyDSL] tile {tile_m}x{tile_n}x{tile_k} is invalid for N={n}, K={k}, "
