@@ -365,7 +365,22 @@ __global__ void inverse_rope_group_quant_kernel(
     // bytes for four adjacent k are four adjacent bytes and splitting a quad
     // would hand one 4-byte run to two different waves.
     constexpr int kRopeFirstGroup = ROPE_START / GROUP_SIZE;
-    constexpr int kNopePerHead    = GROUPS_PER_HEAD / 2;
+    // At four groups per head the half-cut is not merely coarse, it is wrong:
+    // rope lives only in group 3, so cutting at 2 files the pure-nope group 2
+    // under rope, and since the native path is gated on the pass's segment that
+    // group pays the f32 widening for a rotation it never does. Cutting at
+    // kRopeFirstGroup is exact there -- 3 nope + 1 rope, nothing misfiled --
+    // and takes the nope share of passes from 1/2 to 3/4. Worth 5.3% on
+    // row/GS=128 at s=16384 (263.5 -> 250.2 us).
+    //
+    // Only at four. The same correction at eight (GS=64, cut 4 -> 7) costs
+    // 11.7% -- a run of seven does not divide the eight slots a wave holds, so
+    // every wave straddles a head and its per-pass address footprint scatters,
+    // which is the cost the half-cut was there to avoid. At four the run is
+    // three against four slots and scatters too, but the extra quarter of
+    // passes reaching the native path more than pays for it.
+    constexpr int kNopePerHead =
+        (GROUPS_PER_HEAD <= 4) ? kRopeFirstGroup : (GROUPS_PER_HEAD / 2);
     constexpr int kRopePerHead    = GROUPS_PER_HEAD - kNopePerHead;
     // Cutting the head at the half is not where the rope tail actually starts --
     // here it is an eighth in, so half of all passes take the rope path while
@@ -1059,10 +1074,11 @@ void inverse_rope_group_quant(
     constexpr int HEAD_DIM_T = 512;
     constexpr int RD_T = 64;
 
-    // Decided below, next to the slice width it overrides, and read by the tier
-    // gate inside the launch: where a block covers the whole row there is no
-    // tier left to sort. md 18.14.
-    bool whole_row_block = false;
+    // The whole-row-block tier (md 18.14/18.16.6) is retired: its band was
+    // gated on `wide_waves >= simds*32 && wide_waves < simds*32`, which is
+    // empty, so it had not been reachable. Kept as a named constant because
+    // the tier gate and the slice width below both still read it.
+    constexpr bool whole_row_block = false;
 
     // k_slots (groups a block covers per pass) is a runtime launch choice: it
     // only sizes the block, so it costs no extra kernel instantiations.
@@ -1135,7 +1151,9 @@ void inverse_rope_group_quant(
             // tiers still partition the same groups.
             constexpr int kGph        = HEAD_DIM_T / GS;
             constexpr int kRopeFirstG = (HEAD_DIM_T - RD_T) / GS;
-            constexpr int kNopePerHd  = kGph / 2;
+            // Must mirror the kernel's kNopePerHead exactly.
+            constexpr int kNopePerHd =
+                (kGph <= 4) ? kRopeFirstG : (kGph / 2);
             const int heads_k = (scale_n % kGph == 0) ? scale_n / kGph : 0;
             // The kernel reads the tier off the wave's first slot, so what must
             // not straddle a tier boundary is a wave's slots, not a block's.
@@ -1161,8 +1179,16 @@ void inverse_rope_group_quant(
             // so it needs the row's heads to supply exactly one pass of 4-group
             // runs -- a pass, not a wave, which is why it is the one order that
             // still wants the block to be a single wave.
-            const bool ok8 = tier_base_ok && kNopePerHd >= 4 &&
-                             kNopePerHd % 4 == 0 && kNopePerHd <= kRopeFirstG &&
+            // The multiple-of-four run is an n32k4 requirement: four adjacent k
+            // are four adjacent scale bytes, so a quad must not be split across
+            // waves. Row-major writes one byte per group at its own stride and
+            // so admits any run length -- which is what lets four-group heads
+            // (GS=128) tier at all, since their nope side is only three wide.
+            constexpr bool kQuadRun = LAYOUT == kScaleN32K4;
+            const bool ok8 = tier_base_ok && kNopePerHd >= 1 &&
+                             (!kQuadRun ||
+                              (kNopePerHd >= 4 && kNopePerHd % 4 == 0)) &&
+                             kNopePerHd <= kRopeFirstG &&
                              (heads_k * kNopePerHd) % slots_per_wave == 0;
             const bool ok4 = tier_base_ok && block_size == wave_size &&
                              kGph % 4 == 0 && kRopeFirstG >= kGph - 4 &&
@@ -1227,7 +1253,10 @@ void inverse_rope_group_quant(
                     }
                 };
                 // Only instantiate the tiered kernels where they can ever run.
-                if constexpr(kTierLayoutOk && kNopePerHd >= 4)
+                // kNopePerHd >= 1 rather than >= 4: the four-wide run is an
+                // n32k4 constraint enforced in ok8 above, and a four-group head
+                // tiers with a nope side of three.
+                if constexpr(kTierLayoutOk && kNopePerHd >= 1)
                 {
                     if(tier == kTierRun4)
                     {
@@ -1310,26 +1339,7 @@ void inverse_rope_group_quant(
         const int64_t wide_waves =
             static_cast<int64_t>(rows) * D / (wave_size * 32);
 
-        // Decided before the slice width because it overrides it: the whole-row
-        // block wants the wide slice, and the band does not end at the narrow
-        // crossover but one step later -- holding the ceiling at 64 is worth
-        // 10-13% at 48 waves/SIMD and 7-12% at 56, on all three of G=16/4/2
-        // with no interval overlap (md 18.16.6).
-        //
-        // Both edges are fitted to this card. waves/SIMD and the working set
-        // are collinear across every shape knob here, so no sweep can say which
-        // one they track, and masking CUs rules out real concurrency but not
-        // the host config (md 18.16.3, 18.16.4). Past 64 the runtime goes
-        // bimodal over a ~3% spread in a config that does not change there, so
-        // there is nothing to fit anyway.
-        constexpr int kWholeRowFloorWavesPerSimd = 32;
-        constexpr int kWholeRowCeilWavesPerSimd  = 32;
-        whole_row_block = !wave64 && LAYOUT == kScaleN32K4 && GS == 32 &&
-                          wide_waves >= simds * kWholeRowFloorWavesPerSimd &&
-                          wide_waves < simds * kWholeRowCeilWavesPerSimd;
-
         const bool narrow_slice =
-            !whole_row_block &&
             wide_waves >= simds * kNarrowCrossoverWavesPerSimd;
 
         // Bytes per thread at bf16/fp16: 16B on wave64, else 32B or 64B.
@@ -1408,11 +1418,8 @@ void inverse_rope_group_quant(
                                heads_k_d > 0 && kGphD % 4 == 0 &&
                                kRopeFirstGD >= kGphD - 4 &&
                                heads_k_d * 4 == k_slots_min;
-        // In the whole-row band the launch is already large enough that the
-        // one-wave block run 4 needs is the wrong trade: giving up the tier and
-        // handing a block the whole row is worth 14-21% there (md 18.14).
         const int waves_per_block =
-            (kMfmaTile || wave64 || whole_row_block)
+            (kMfmaTile || wave64)
                 ? 4
                 : ((LAYOUT == kScaleN32K4 && !run4_fits) ? 2 : 1);
         int k_slots = std::min(
