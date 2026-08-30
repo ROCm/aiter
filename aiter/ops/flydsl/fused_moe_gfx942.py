@@ -427,7 +427,7 @@ def _run_decode(
         topk_ids,
         topk_weight,
         problem.experts,
-        problem.hidden_dim,
+        problem.model_dim,
         hidden_states.dtype,
         config.BLOCK_M,
         expert_mask,
