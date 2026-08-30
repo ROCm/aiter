@@ -570,6 +570,12 @@ def mla_decode_fwd(
     cp_rank=0,
     causal=True,
 ):
+    if o.dtype not in (dtypes.bf16, dtypes.fp16):
+        raise ValueError(
+            "mla_decode_fwd output must use a 16-bit floating dtype "
+            f"(BF16 or FP16), got {o.dtype}."
+        )
+
     device = q.device
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
     if kv_buffer.dtype != torch.uint8:
