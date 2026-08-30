@@ -48,10 +48,10 @@ class TestA6W6TuningLookup(unittest.TestCase):
         gemm_op_a6w6.clear_gemm_a6w6_config_cache()
         self.tempdir.cleanup()
 
-    def _write_rows(self, rows):
+    def _write_rows(self, rows, extra_header=()):
         with open(self.config, "w", newline="") as csv_file:
             writer = csv.writer(csv_file)
-            writer.writerow(TUNED_HEADER)
+            writer.writerow([*TUNED_HEADER, *extra_header])
             writer.writerows(rows)
         gemm_op_a6w6.clear_gemm_a6w6_config_cache()
 
@@ -158,6 +158,30 @@ class TestA6W6TuningLookup(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate"):
             gemm_op_a6w6._load_gemm_a6w6_configs(self.config)
 
+    def test_invalid_logical_shape_is_rejected(self):
+        self._write_rows(
+            [
+                [
+                    "gfx950",
+                    256,
+                    256,
+                    256,
+                    128,
+                    1,
+                    0,
+                    1,
+                    "kernel",
+                    1,
+                    1,
+                    0,
+                    2,
+                ]
+            ],
+            extra_header=["logicalShape"],
+        )
+        with self.assertRaisesRegex(ValueError, "logicalShape must be 0 or 1"):
+            gemm_op_a6w6._load_gemm_a6w6_configs(self.config)
+
     def test_explicit_override_and_default(self):
         self.assertEqual(
             gemm_op_a6w6._select_gemm_a6w6_kernel(1, 1, 1, "explicit_kernel"),
@@ -189,8 +213,68 @@ class TestA6W6ApiValidation(unittest.TestCase):
 
         self.assertIs(result, out)
         self.assertEqual(
-            launch.call_args.args[6], gemm_op_a6w6._DEFAULT_KERNEL_NAME
+            launch.call_args.args[8], gemm_op_a6w6._DEFAULT_KERNEL_NAME
         )
+
+    def test_asm_wrapper_forwards_logical_shape(self):
+        packed = torch.empty(0, dtype=torch.uint8, device="meta")
+        out = torch.empty((768, 3072), dtype=torch.bfloat16, device="meta")
+
+        with mock.patch.object(gemm_op_a6w6, "_gemm_a6w6_asm") as launch:
+            gemm_op_a6w6.gemm_a6w6_asm(
+                packed,
+                packed,
+                packed,
+                packed,
+                out,
+                3072,
+                "kernel",
+                M=544,
+                N=3072,
+            )
+
+        self.assertEqual(launch.call_args.args[5:8], (544, 3072, 3072))
+
+    def test_asm_wrapper_rejects_oversized_logical_shape(self):
+        packed = torch.empty(0, dtype=torch.uint8, device="meta")
+        out = torch.empty((256, 256), dtype=torch.bfloat16, device="meta")
+
+        with self.assertRaisesRegex(ValueError, "must fit"):
+            gemm_op_a6w6.gemm_a6w6_asm(
+                packed, packed, packed, packed, out, 128, M=257, N=256
+            )
+
+    def test_logical_shape_config_is_opt_in(self):
+        self.assertFalse(gemm_op_a6w6._config_uses_logical_shape(None))
+        self.assertFalse(gemm_op_a6w6._config_uses_logical_shape({}))
+        self.assertFalse(
+            gemm_op_a6w6._config_uses_logical_shape({"logicalShape": float("nan")})
+        )
+        self.assertTrue(
+            gemm_op_a6w6._config_uses_logical_shape({"logicalShape": 1})
+        )
+
+    @mock.patch.object(gemm_op_a6w6, "get_GEMM_A6W6_config")
+    @mock.patch.object(gemm_op_a6w6, "gemm_a6w6_asm")
+    def test_gemm_forwards_flagged_logical_shape(self, launch, get_config):
+        get_config.return_value = {"kernelName": "kernel", "logicalShape": 1}
+        packed = torch.empty(0, dtype=torch.uint8, device="meta")
+
+        gemm_op_a6w6.gemm_a6w6(
+            packed, packed, packed, packed, 576, 6144, 24576
+        )
+
+        self.assertEqual(launch.call_args.args[8:10], (576, 6144))
+
+    @mock.patch.object(gemm_op_a6w6, "get_GEMM_A6W6_config")
+    @mock.patch.object(gemm_op_a6w6, "gemm_a6w6_asm")
+    def test_gemm_preserves_padded_shape_without_flag(self, launch, get_config):
+        get_config.return_value = {"kernelName": "kernel", "logicalShape": 0}
+        packed = torch.empty(0, dtype=torch.uint8, device="meta")
+
+        gemm_op_a6w6.gemm_a6w6(packed, packed, packed, packed, 544, 3072, 3072)
+
+        self.assertEqual(launch.call_args.args[8:10], (None, None))
 
     def test_torch_quantizer_rejects_non_matrix_input(self):
         with self.assertRaisesRegex(ValueError, r"2D \[R, K\] tensor"):
@@ -232,6 +316,8 @@ class TestA6W6Manifest(unittest.TestCase):
             "aiter_a6w6_m64n128_full_stage",
             "aiter_a6w6_m128n128_tile_stage",
             "aiter_a6w6_m128n128_full_stage",
+            "aiter_a6w6_m128n256_full_stage",
+            "aiter_a6w6_m256n256_row_stage_gm4_k16k",
         }
         self.assertEqual(set(configs["knl_name"]), expected_kernels)
         self.assertFalse(configs["knl_name"].duplicated().any())
@@ -246,6 +332,7 @@ class TestA6W6Manifest(unittest.TestCase):
                 (256, 256, 256),
                 (256, 512, 256),
                 (128, 256, 128),
+                (128, 256, 256),
                 (64, 128, 128),
                 (128, 128, 256),
             },

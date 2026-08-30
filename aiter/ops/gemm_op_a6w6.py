@@ -583,6 +583,14 @@ def _load_gemm_a6w6_configs(
     configs = configs.copy()
     for column in _TUNED_CONFIG_NUMERIC_COLUMNS:
         configs[column] = pd.to_numeric(configs[column], errors="raise").astype(int)
+    if "logicalShape" in configs:
+        configs["logicalShape"] = (
+            pd.to_numeric(configs["logicalShape"], errors="raise")
+            .fillna(0)
+            .astype(int)
+        )
+        if not configs["logicalShape"].isin((0, 1)).all():
+            raise ValueError("A6W6 logicalShape must be 0 or 1")
     configs["gfx"] = configs["gfx"].astype(str).str.strip()
     configs["kernelName"] = configs["kernelName"].astype(str).str.strip()
 
@@ -666,6 +674,13 @@ def _select_gemm_a6w6_kernel(M: int, N: int, K: int, kernelName: str | None) -> 
     if config is not None:
         return str(config["kernelName"])
     return _default_gemm_a6w6_kernel(M, N, K)
+
+
+def _config_uses_logical_shape(config: dict[str, object] | None) -> bool:
+    if config is None:
+        return False
+    value = config.get("logicalShape")
+    return bool(int(value)) if value is not None and pd.notna(value) else False
 
 
 def mxfp6_gemm_pack_size(rows: int, K: int) -> tuple[int, int]:
@@ -824,6 +839,8 @@ def _gemm_a6w6_asm(
     A_scale: Tensor,  # packed e8m0 blob
     B_scale: Tensor,  # packed e8m0 blob
     out: Tensor,  # Out:[M, N] bf16
+    M: int,  # logical output rows
+    N: int,  # logical output columns
     K: int,  # logical contraction dim
     kernelName: str | None = None,
     alpha: float = 1.0,
@@ -839,21 +856,32 @@ def gemm_a6w6_asm(
     K: int,
     kernelName: str | None = None,
     alpha: float = 1.0,
+    M: int | None = None,
+    N: int | None = None,
 ) -> Tensor:
     if float(alpha) != 1.0:
         raise ValueError("gemm_a6w6 currently supports only alpha=1.0.")
+    if out.ndim != 2:
+        raise ValueError("gemm_a6w6_asm expects a 2D [M, N] output tensor.")
+    logical_M = out.shape[0] if M is None else int(M)
+    logical_N = out.shape[1] if N is None else int(N)
     if not kernelName:
-        if out.ndim != 2:
-            raise ValueError("gemm_a6w6_asm expects a 2D [M, N] output tensor.")
-        kernelName = _select_gemm_a6w6_kernel(*out.shape, K, None)
+        kernelName = _select_gemm_a6w6_kernel(logical_M, logical_N, K, None)
     else:
         kernelName = _LEGACY_KERNEL_NAMES.get(kernelName, kernelName)
+    if not 0 < logical_M <= out.shape[0] or not 0 < logical_N <= out.shape[1]:
+        raise ValueError(
+            f"logical output shape {(logical_M, logical_N)} must fit in "
+            f"storage shape {tuple(out.shape)}"
+        )
     _gemm_a6w6_asm(
         A,
         B,
         A_scale,
         B_scale,
         out,
+        logical_M,
+        logical_N,
         int(K),
         kernelName,
         float(alpha),
@@ -886,10 +914,27 @@ def gemm_a6w6(
         )
     if float(alpha) != 1.0:
         raise ValueError("gemm_a6w6 currently supports only alpha=1.0.")
-    selected_kernel = _select_gemm_a6w6_kernel(M, N, K, kernelName)
+    config = get_GEMM_A6W6_config(M, N, K) if kernelName is None else None
+    selected_kernel = (
+        str(config["kernelName"])
+        if config is not None
+        else _select_gemm_a6w6_kernel(M, N, K, kernelName)
+    )
+    use_logical_shape = _config_uses_logical_shape(config)
     padM, padN, padK = _ceil(M, _TILE), _ceil(N, _TILE), _ceil(K, _K_TILE)
     out = torch.empty((padM, padN), dtype=dtype, device=A.device)
-    gemm_a6w6_asm(A, B, A_scale, B_scale, out, padK, selected_kernel, alpha)
+    gemm_a6w6_asm(
+        A,
+        B,
+        A_scale,
+        B_scale,
+        out,
+        padK,
+        selected_kernel,
+        alpha,
+        M if use_logical_shape else None,
+        N if use_logical_shape else None,
+    )
     if padM != M or padN != N:
         return out[:M, :N]
     return out
