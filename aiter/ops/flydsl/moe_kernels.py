@@ -30,12 +30,8 @@ def _warn_tile_override(axis: str, inter_dim: int, requested: int, resolved: int
     Deduped by (axis, inter_dim, requested, resolved) so it fires once per shape
     during tuning/serving instead of every launch.
     """
-    try:
-        from aiter import logger
-    except ImportError:  # pragma: no cover - logging must never break the kernel
-        import logging
+    from aiter import logger
 
-        logger = logging.getLogger("aiter")
     logger.warning(
         "FlyDSL MoE: %s=%d does not divide inter_dim=%d (not 256-aligned); "
         "forcing %s=%d. tile=%d is NOT usable/tunable for this shape — any tuned "

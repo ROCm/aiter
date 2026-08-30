@@ -916,17 +916,12 @@ def _fused_moe_impl(
         q_dtype_a = _q_dtype_a
 
     grouped_a8w4_out = None
-    try:
-        from aiter.ops.flydsl.grouped_moe_gfx1250 import (
-            grouped_gemm_gfx1250_a8w4,
-        )
-    except ImportError:
-        grouped_gemm_gfx1250_a8w4 = None
+    from aiter.ops.flydsl.grouped_moe_gfx1250 import grouped_gemm_gfx1250_a8w4
 
     # grouped_gemm_gfx1250_a8w4 reads GUGU (gate/up row-interleaved) w1 only,
     # so it is reachable exclusively from GateMode.INTERLEAVE. SEPARATED
     # weights fall through to the generic MoE below.
-    if grouped_gemm_gfx1250_a8w4 is not None and gate_mode == GateMode.INTERLEAVE:
+    if gate_mode == GateMode.INTERLEAVE:
         grouped_a8w4_out = grouped_gemm_gfx1250_a8w4(
             hidden_states,
             w1,

@@ -33,21 +33,15 @@ from aiter.ops.prefill_batch_metadata import (
 if not torch.cuda.is_available():
     pytest.skip("ROCm not available. Skipping GPU tests.", allow_module_level=True)
 
-try:
-    from aiter.ops.flydsl.linear_attention_prefill_kernels import (
-        chunk_gated_delta_rule_fwd_h_flydsl_opt,
-    )
-    from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk import (
-        chunk_gated_delta_rule_fwd_opt_vk,
-    )
-    from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h import (
-        chunk_gated_delta_rule_fwd_h_opt_vk,
-    )
-except ImportError as exc:
-    pytest.skip(
-        f"Unable to import FlyDSL Linear Attention Prefill kernels: {exc}",
-        allow_module_level=True,
-    )
+from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+    chunk_gated_delta_rule_fwd_h_flydsl_opt,
+)
+from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk import (
+    chunk_gated_delta_rule_fwd_opt_vk,
+)
+from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h import (
+    chunk_gated_delta_rule_fwd_h_opt_vk,
+)
 
 try:
     from vllm.model_executor.layers.fla.ops.chunk_delta_h import (

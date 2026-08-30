@@ -404,19 +404,15 @@ else:
 # Pipeline 2: 8wave (CDNA4 MFMA_Scale), gfx950 only
 # ===========================================================================
 
-try:
-    from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import (
-        BLOCK_K as BLOCK_K_8WAVE,
-    )
-    from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import (
-        MIN_K as MIN_K_8WAVE,
-    )
-    from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import (
-        lds_bytes as _lds_bytes_8wave,
-    )
-except Exception as _exc:  # noqa: BLE001
-    print(f"[FlyDSL] 8wave op module unavailable ({_exc}); 8wave candidates disabled")
-    BLOCK_K_8WAVE, MIN_K_8WAVE, _lds_bytes_8wave = 128, 256, None
+from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import (
+    BLOCK_K as BLOCK_K_8WAVE,
+)
+from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import (
+    MIN_K as MIN_K_8WAVE,
+)
+from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import (
+    lds_bytes as _lds_bytes_8wave,
+)
 
 NAME_PREFIX_8WAVE = "flydsl_bpreshuffle_8w"
 
@@ -468,8 +464,6 @@ def kernel_fits_shape_8wave(
     the 8-wave kernel handles ragged M and N through its buffer descriptors and
     an explicit column guard, and the best tile for e.g. M=11256 is ragged.
     """
-    if _lds_bytes_8wave is None:
-        return False
     if M <= 0 or N <= 0 or K <= 0:
         return False
     if K % BLOCK_K_8WAVE != 0 or K < MIN_K_8WAVE:
@@ -492,7 +486,7 @@ def is_8wave_enabled() -> bool:
     ``gemm_a8w8_bpreshuffle_flydsl`` dispatches on the kernelName prefix alone.
     To exclude the pipeline, drop its rows from the tuned CSV.
     """
-    return _lds_bytes_8wave is not None and get_gfx().startswith("gfx950")
+    return get_gfx().startswith("gfx950")
 
 
 def _build_kernels_list_8wave() -> dict[int, EightWaveKernelInstance]:

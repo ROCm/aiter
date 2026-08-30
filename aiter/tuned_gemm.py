@@ -163,6 +163,8 @@ def get_GEMM_A16W16_config(
                         config["kernelName"]
                     )
                 )
+                # None means the tuned CSV names a kernel absent from this
+                # catalog version; it is unrelated to FlyDSL import availability.
                 if flydsl_config is None:
                     logger.warning(
                         f"FlyDSL kernel '{config['kernelName']}' from tuned config is not "
