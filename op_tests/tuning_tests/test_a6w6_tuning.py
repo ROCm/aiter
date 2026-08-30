@@ -217,6 +217,8 @@ class TestA6W6Manifest(unittest.TestCase):
             "f6gemm_persist_n2_kernel_func",
             "f6gemm_n2_stage_kernel_func",
             "f6gemm_rect128_kernel_func",
+            "f6gemm_small_tstage_kernel_func",
+            "f6gemm_small_full_kernel_func",
         }
         self.assertEqual(set(configs["knl_name"]), expected_kernels)
         self.assertFalse(configs["knl_name"].duplicated().any())
@@ -225,7 +227,10 @@ class TestA6W6Manifest(unittest.TestCase):
             configs[["tile_M", "tile_N", "block_size"]]
             .itertuples(index=False, name=None)
         )
-        self.assertEqual(layouts, {(256, 256, 256), (256, 512, 256), (128, 256, 128)})
+        self.assertEqual(
+            layouts,
+            {(256, 256, 256), (256, 512, 256), (128, 256, 128), (64, 128, 128)},
+        )
         self.assertTrue((configs["pack_layout"] == gemm_op_a6w6._PACK_LAYOUT).all())
         self.assertTrue(
             {"swizzle_max_M", "swizzle_max_N", "swizzle_max_K"}.issubset(

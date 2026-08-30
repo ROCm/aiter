@@ -8,3 +8,5 @@ tile_M,tile_N,block_size,splitK,bpreshuffle,pack_layout,swizzle_max_M,swizzle_ma
 256,512,256,0,0,mxfp6_c0c1_256_padk2,0,0,0,f6gemm_persist_n2_kernel_func,gemm_mxfp6_persist_n2.co
 256,512,256,0,0,mxfp6_c0c1_256_padk2,0,0,0,f6gemm_n2_stage_kernel_func,gemm_mxfp6_n2_stage.co
 128,256,128,0,0,mxfp6_c0c1_256_padk2,0,0,0,f6gemm_rect128_kernel_func,gemm_mxfp6_rect128.co
+64,128,128,0,0,mxfp6_c0c1_256_padk2,0,0,0,f6gemm_small_tstage_kernel_func,gemm_mxfp6_small_tstage.co
+64,128,128,0,0,mxfp6_c0c1_256_padk2,0,0,0,f6gemm_small_full_kernel_func,gemm_mxfp6_small_full.co
