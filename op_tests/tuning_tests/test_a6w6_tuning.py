@@ -230,6 +230,7 @@ class TestA6W6Manifest(unittest.TestCase):
             "aiter_a6w6_m128n256_stream",
             "aiter_a6w6_m64n128_tile_stage",
             "aiter_a6w6_m64n128_full_stage",
+            "aiter_a6w6_m128n128_tile_stage",
             "aiter_a6w6_m128n128_full_stage",
         }
         self.assertEqual(set(configs["knl_name"]), expected_kernels)

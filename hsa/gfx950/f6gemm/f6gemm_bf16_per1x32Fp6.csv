@@ -11,3 +11,4 @@ tile_M,tile_N,block_size,splitK,bpreshuffle,pack_layout,swizzle_max_M,swizzle_ma
 64,128,128,0,0,mxfp6_c0c1_256_padk2,0,0,0,aiter_a6w6_m64n128_tile_stage,a6w6_m64n128_tile_stage.co
 64,128,128,0,0,mxfp6_c0c1_256_padk2,0,0,0,aiter_a6w6_m64n128_full_stage,a6w6_m64n128_full_stage.co
 128,128,256,0,0,mxfp6_c0c1_256_padk2,0,0,0,aiter_a6w6_m128n128_full_stage,a6w6_m128n128_full_stage.co
+128,128,256,0,0,mxfp6_c0c1_256_padk2,0,0,0,aiter_a6w6_m128n128_tile_stage,a6w6_m128n128_tile_stage.co
