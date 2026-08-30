@@ -1,8 +1,8 @@
 gfx,cu_num,M,N,K,libtype,kernelId,splitK,us,kernelName,tflops,bw,errRatio
-gfx942,304,32768,2048,5120,flydsl,10,0,833.1985,flydsl_blockscale_bpreshuffle_64x256x128_F8_F8_B16_sbk128_default,824.77,375.03,0.0
-gfx942,304,32768,4352,5120,flydsl,10,0,1723.4181,flydsl_blockscale_bpreshuffle_64x256x128_F8_F8_B16_sbk128_default,847.32,275.77,0.0
-gfx942,304,32768,5120,768,flydsl,10,0,381.129,flydsl_blockscale_bpreshuffle_64x256x128_F8_F8_B16_sbk128_default,676.14,956.74,0.0
-gfx942,304,32768,5120,2176,flydsl,10,0,913.8769,flydsl_blockscale_bpreshuffle_64x256x128_F8_F8_B16_sbk128_default,798.95,457.38,0.0
+gfx942,304,32768,2048,5120,flydsl,10,0,833.1985,flydsl_blockscale_bpreshuffle_64x256x128_F8_F8_B16_sbk128_default_w4_ac0_cs0,824.77,375.03,0.0
+gfx942,304,32768,4352,5120,flydsl,10,0,1723.4181,flydsl_blockscale_bpreshuffle_64x256x128_F8_F8_B16_sbk128_default_w4_ac0_cs0,847.32,275.77,0.0
+gfx942,304,32768,5120,768,flydsl,10,0,381.129,flydsl_blockscale_bpreshuffle_64x256x128_F8_F8_B16_sbk128_default_w4_ac0_cs0,676.14,956.74,0.0
+gfx942,304,32768,5120,2176,flydsl,10,0,913.8769,flydsl_blockscale_bpreshuffle_64x256x128_F8_F8_B16_sbk128_default_w4_ac0_cs0,798.95,457.38,0.0
 gfx950,256,32768,2048,5120,cktile,27,0,347.582,a8w8_blockscale_cktile_192x256x128_4x2x1_16x16x128_intrawave_0x1x0_2,1977.07,899.0,0.0
 gfx950,256,32768,4352,5120,cktile,11,0,672.2039,a8w8_blockscale_cktile_192x256x128_4x2x1_16x16x128_intrawave_0x1x0_1,2172.39,707.03,0.0
 gfx950,256,32768,5120,768,cktile,28,0,185.2801,a8w8_blockscale_cktile_192x256x128_4x2x1_16x16x128_intrawave_0x1x0_3,1390.86,1968.06,0.0
