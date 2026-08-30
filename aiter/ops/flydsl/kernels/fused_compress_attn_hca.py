@@ -605,7 +605,6 @@ def _build_norm_rope_scatter_kernel(
     ):
         f32 = T.f32
         i32 = T.i32
-        vecVf32 = T.vec(VEC, T.f32)
 
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
@@ -771,7 +770,6 @@ def _build_norm_rope_scatter_kernel(
                     log2_rts=log2_rts,
                     ROPE_THREAD_LO=ROPE_THREAD_LO,
                     wave_width=WAVE,
-                    vecVf32=vecVf32,
                     fm_fast=fm_fast,
                 )
             else:

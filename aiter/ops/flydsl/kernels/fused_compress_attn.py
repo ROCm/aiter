@@ -315,7 +315,6 @@ def _build_kernel(
     ):
         f32 = T.f32
         i32 = T.i32
-        vecVf32 = T.vec(VEC, T.f32)
 
         # --- thread / block ids ---
         pid = fx.block_idx.x  # one program per plan row
@@ -938,7 +937,6 @@ def _build_kernel(
                         log2_rts=log2_rts,
                         ROPE_THREAD_LO=ROPE_THREAD_LO,
                         wave_width=BLOCK_THREADS,
-                        vecVf32=vecVf32,
                         fm_fast=fm_fast,
                     )
                 elif const_expr(not quant_fp4):
@@ -1526,7 +1524,6 @@ def _build_kernel_ksplit(
     ):
         f32 = T.f32
         i32 = T.i32
-        vecVf32 = T.vec(VEC, T.f32)
 
         pid = fx.block_idx.x
         tid = fx.thread_idx.x  # 0 .. BLOCK_TH-1
@@ -1921,7 +1918,6 @@ def _build_kernel_ksplit(
                         log2_rts=log2_rts,
                         ROPE_THREAD_LO=ROPE_THREAD_LO,
                         wave_width=BLOCK_THREADS,
-                        vecVf32=vecVf32,
                         fm_fast=fm_fast,
                     )
                 elif const_expr(not quant_fp4):

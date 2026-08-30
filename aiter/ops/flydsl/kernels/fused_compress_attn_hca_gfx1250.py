@@ -944,7 +944,6 @@ def _build_norm_rope_scatter_kernel(
                     log2_rts=log2_rts,
                     ROPE_THREAD_LO=ROPE_THREAD_LO,
                     wave_width=BLOCK_THREADS,
-                    vecVf32=vecVf32,
                     fm_fast=fm_fast,
                 )
             else:

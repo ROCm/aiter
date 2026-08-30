@@ -183,7 +183,6 @@ def emit_group_fp8_nm_asm_scatter(
     log2_rts,
     ROPE_THREAD_LO,  # first rope lane (= NOPE // VEC)
     wave_width,  # 64 (wave64) or 32 (wave32) -- shuffle_xor width
-    vecVf32,  # T.vec(VEC, f32)
     fm_fast,  # arith.FastMathFlags.fast
 ):
     """Emit the FP8 nope (1xG e8m0) + inline duplicated e8m0 scale + bf16 rope->separate
