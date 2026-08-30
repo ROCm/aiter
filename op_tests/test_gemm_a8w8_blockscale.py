@@ -16,13 +16,23 @@ from einops import repeat as eirp
 
 import aiter
 from aiter import dtypes
-from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_ck, gemm_a8w8_blockscale_cktile
+from aiter.ops.flydsl.utils import is_flydsl_available
+from aiter.ops.gemm_op_a8w8 import (
+    gemm_a8w8_blockscale_ck,
+    gemm_a8w8_blockscale_cktile,
+    gemm_a8w8_blockscale_flydsl,
+)
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.utility import fp4_utils
 
 block_shape = (128, 128)
 TEST_NUM_ITERS = 100
+
+# Set from --flydsl_blockscale once the arguments are parsed. FlyDSL is an optional
+# dependency, so the column is skipped rather than failing the whole sweep when it is
+# absent. Unrelated to --flydsl, which switches the *scales* to fp8_e8m0 (mxfp8_128).
+RUN_FLYDSL_BLOCKSCALE = False
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
@@ -84,6 +94,21 @@ def run_triton(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16, backend=No
         dtype=dtype,
         backend=backend,
     )
+
+
+@perftest(num_iters=TEST_NUM_ITERS)
+def run_gemm_flydsl_blockscale(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16):
+    """Call the FlyDSL block-scale backend directly rather than through
+    aiter.gemm_a8w8_blockscale_bpreshuffle.
+
+    The dispatch only reaches FlyDSL when a tuned CSV row names this kernel; with no
+    such row it serves CK, and the column would report CK's number under a FlyDSL
+    heading. Calling the backend directly keeps the column honest.
+    """
+    m = x.shape[0]
+    n = weightshuffle.shape[0]
+    out = torch.empty((m, n), dtype=dtype, device=x.device)
+    return gemm_a8w8_blockscale_flydsl(x, weightshuffle, x_scale, w_scale, out)
 
 
 @benchmark()
@@ -154,6 +179,19 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True, use_flydsl=False):
             ret["triton TB/s"] = (x.nbytes + weight.nbytes) / avg_d / 1e6
             ret["triton err"] = err_triton
             ret["triton/ck"] = avg_d / avg_b
+
+            # FlyDSL consumes the same preshuffled weight and K-major x_scale as the
+            # CK bpreshuffle path, so it only has inputs to run on in this branch.
+            if RUN_FLYDSL_BLOCKSCALE:
+                e, avg_e = run_gemm_flydsl_blockscale(
+                    x, gemm_weight, gemm_x_scale, w_scale, dtype
+                )
+                err_flydsl = checkAllclose(a, e, msg="flydsl", catastrophic_check=True)
+                ret["flydsl us"] = avg_e
+                ret["flydsl TFLOPS"] = m * n * k * 2 / avg_e / 1e6
+                ret["flydsl TB/s"] = (x.nbytes + weight.nbytes) / avg_e / 1e6
+                ret["flydsl err"] = err_flydsl
+                ret["flydsl/ck"] = avg_e / avg_b
 
     return ret
 
@@ -320,6 +358,15 @@ parser.add_argument(
     help="use flydsl fp8 e8m0 scale path (requires --ck_preshuffle True)",
 )
 parser.add_argument(
+    "--flydsl_blockscale",
+    type=dtypes.str2bool,
+    default=False,
+    help="""Also time the FlyDSL blockscale bpreshuffle backend, when
+    installed. Needs fp32 scales, so it is skipped under --flydsl. Off by default so
+    the CI-scheduled sweep does not depend on a FlyDSL JIT compile; matches --flydsl.
+    e.g.: --flydsl_blockscale True""",
+)
+parser.add_argument(
     "--csv",
     type=str,
     default=None,
@@ -343,6 +390,10 @@ parser.add_argument(
 )
 
 args = parser.parse_args()
+
+RUN_FLYDSL_BLOCKSCALE = args.flydsl_blockscale and is_flydsl_available()
+if args.flydsl_blockscale and not RUN_FLYDSL_BLOCKSCALE:
+    print("flydsl is not installed; skipping the FlyDSL column.", flush=True)
 
 l_preshuffle = (
     args.ck_preshuffle if isinstance(args.ck_preshuffle, list) else [args.ck_preshuffle]
