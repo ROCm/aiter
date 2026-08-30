@@ -175,20 +175,12 @@ def run_gemm_flydsl_8wave(
     return out
 
 
-# Pipeline name -> (runner, is-it-usable-right-now). The availability probe is a
-# callable, and deliberately different per pipeline: preshuffle needs the symbol
-# the import above binds at module load, while 8wave imports its entry point
-# lazily inside its runner.
 _FLYDSL_PIPELINE_RUNNERS = {
-    "preshuffle": (
-        run_gemm_flydsl,
-        lambda: "flydsl_preshuffle_gemm_a8" in globals(),
-    ),
-    "8wave": (run_gemm_flydsl_8wave, lambda: True),
+    "preshuffle": run_gemm_flydsl,
+    "8wave": run_gemm_flydsl_8wave,
 }
 
-# The tuner speaks torch dtypes, Pipeline.q_dtypes_w speaks names (that module
-# must stay importable without torch).
+# The tuner speaks torch dtypes while Pipeline.q_dtypes_w uses short names.
 _Q_DTYPE_W_NAMES = {dtypes.fp8: "fp8", dtypes.i8: "int8"}
 
 
@@ -545,10 +537,10 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
             if runner_entry is None:
                 print(f"[FlyDSL] no runner registered for pipeline {pipe.name!r}")
                 continue
-            runner, is_available = runner_entry
+            runner = runner_entry
             if q_dtype_name not in pipe.q_dtypes_w:
                 continue
-            if not pipe.kernels_list or not is_available():
+            if not pipe.kernels_list:
                 continue
             for i in sorted(pipe.kernels_list.keys()):
                 ki = pipe.kernels_list[i]

@@ -4,8 +4,8 @@
 """Unit tests for FlyDSL Linear Attention regressions.
 
 Usage:
-    python op_tests/flydsl_tests/test_flydsl_linear_attention.py
-    pytest -sv op_tests/flydsl_tests/test_flydsl_linear_attention.py
+    python op_tests/test_flydsl_linear_attention.py
+    pytest -sv op_tests/test_flydsl_linear_attention.py
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 import itertools
 from dataclasses import dataclass
-from functools import partial
 
 import pandas as pd
 import pytest
@@ -30,6 +29,12 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 torch.set_default_device("cuda")
 
 SUPPORTED_GFX = ["gfx942", "gfx950"]
+pytestmark = pytest.mark.skipif(
+    get_gfx() not in SUPPORTED_GFX,
+    reason="FlyDSL GDR decode requires gfx942 or gfx950",
+)
+_PERF_ROTATION_BUDGET = 512 * 1024**2
+_MAX_PERF_ROTATIONS = 8
 
 
 @dataclass
@@ -418,6 +423,24 @@ def _recurrent_decode_work(args, query, state, A_log, indices):
     return flops, nbytes
 
 
+def _validate_head_config(num_k_heads, num_v_heads, head_k_dim, head_v_dim):
+    if min(num_k_heads, num_v_heads, head_k_dim, head_v_dim) <= 0:
+        raise ValueError("head counts and dimensions must be positive")
+    if num_v_heads < num_k_heads or num_v_heads % num_k_heads:
+        raise ValueError(
+            "num_v_heads must be a positive multiple of num_k_heads, got "
+            f"{num_k_heads=} {num_v_heads=}"
+        )
+
+
+def _perf_rotation_count(state, out):
+    bytes_per_call = max(1, state.nbytes + out.nbytes)
+    return max(
+        1,
+        min(_MAX_PERF_ROTATIONS, _PERF_ROTATION_BUDGET // bytes_per_call),
+    )
+
+
 @benchmark()
 def test_flydsl_gdr_decode(
     b,
@@ -429,6 +452,7 @@ def test_flydsl_gdr_decode(
     dtype,
     use_qk_l2norm,
 ):
+    _validate_head_config(num_k_heads, num_v_heads, head_k_dim, head_v_dim)
     args = Args(
         dtype=dtype,
         b=b,
@@ -487,11 +511,17 @@ def test_flydsl_gdr_decode(
     flops, nbytes = _recurrent_decode_work(args, query, initial_state, A_log, indices)
     ret = {"gfx": get_gfx()}
     for name, candidate in candidates.items():
-        # GDR updates state in place. Reuse one timing state so state cloning and
-        # reset costs stay outside the measured kernel/wrapper latency.
+        # GDR updates state in place. Pass state/output as timing arguments so
+        # run_perftest rotates a bounded pool of recurrent states while keeping
+        # clone/reset costs outside the measured kernel/wrapper latency.
         perf_state = initial_state.clone()
         perf_out = create_outputs(args)[0]
-        _, us = run_perftest(partial(candidate, perf_state, perf_out))
+        _, us = run_perftest(
+            candidate,
+            perf_state,
+            perf_out,
+            num_rotate_args=_perf_rotation_count(perf_state, perf_out),
+        )
 
         # Correctness gets a pristine state/output, independent of the repeatedly
         # updated state used above.
@@ -523,6 +553,20 @@ def test_flydsl_gdr_decode(
 # The argument-driven benchmark is run by main(); pytest collects the two
 # contract regressions below.
 test_flydsl_gdr_decode.__test__ = False
+
+
+def test_flydsl_gdr_decode_default():
+    result = test_flydsl_gdr_decode(
+        1,
+        1,
+        2,
+        8,
+        128,
+        128,
+        dtypes.bf16,
+        True,
+    )
+    assert result["flydsl err"] == 0
 
 
 @pytest.mark.parametrize("input_index,input_name", [(1, "query"), (2, "key")])
@@ -640,6 +684,7 @@ def main():
         "-d",
         "--dtype",
         type=dtypes.str2Dtype,
+        choices=[dtypes.bf16, dtypes.fp16],
         nargs="*",
         default=[dtypes.bf16, dtypes.fp16],
         help="Input dtype. Example: -d bf16 fp16",
@@ -692,6 +737,15 @@ def main():
                 "num_k_heads,num_v_heads,head_k_dim,head_v_dim"
             )
         num_k_heads, num_v_heads, head_k_dim, head_v_dim = head_config
+        try:
+            _validate_head_config(
+                num_k_heads,
+                num_v_heads,
+                head_k_dim,
+                head_v_dim,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
         rows.append(
             test_flydsl_gdr_decode(
                 batch,

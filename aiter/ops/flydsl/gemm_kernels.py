@@ -322,7 +322,9 @@ def selection_filter(m, n, k, kwargs):
 
     smem_use_s0 = get_stage_smem_use(STAGES)
     # smem_use_s1 = get_stage_smem_use(STAGES + 3)
-    smem_cap = SMEM_CAPACITY_MAP[GPU_ARCH]
+    smem_cap = SMEM_CAPACITY_MAP.get(GPU_ARCH)
+    if smem_cap is None:
+        return False
     if not (smem_use_s0 <= smem_cap):
         return False
     return not (
@@ -475,7 +477,10 @@ def _validate_hgemm_tiling(
         block_k_warps=block_k_warps,
         b_to_lds=b_to_lds,
     )
-    lds_limit = SMEM_CAPACITY_MAP[get_gfx()]
+    arch = get_gfx()
+    lds_limit = SMEM_CAPACITY_MAP.get(arch)
+    if lds_limit is None:
+        raise ValueError(f"FlyDSL HGEMM does not support architecture {arch!r}")
     if lds_bytes > lds_limit:
         raise ValueError(
             "Invalid tile combination: estimated LDS usage "
@@ -945,21 +950,14 @@ def flydsl_hgemm(
 # FlyDSL preshuffle GEMM kernel management
 # ---------------------------------------------------------------------------
 
-_flydsl_compile_fn = None
-_flydsl_import_done = False
 
-
+@functools.lru_cache(maxsize=1)
 def _get_compile_fn():
     """Import the preshuffle compiler on first use."""
-    global _flydsl_compile_fn, _flydsl_import_done
-    if _flydsl_import_done:
-        return _flydsl_compile_fn
-    _flydsl_import_done = True
     from .kernels.preshuffle_gemm import compile_preshuffle_gemm
 
-    _flydsl_compile_fn = compile_preshuffle_gemm
     logger.info("[FlyDSL] loaded preshuffle GEMM compiler")
-    return _flydsl_compile_fn
+    return compile_preshuffle_gemm
 
 
 # Fixed size rather than one buffer per shape: a shape-keyed cache grows without
@@ -1028,8 +1026,6 @@ def flydsl_preshuffle_gemm_a8(
 ) -> Tensor:
     """Compile and run FlyDSL preshuffle GEMM, optionally with fp32 split-K."""
     compile_fn = _get_compile_fn()
-    if compile_fn is None:
-        raise RuntimeError("[FlyDSL] compile function not available")
     dtypes = _get_dtypes()
 
     m, k = XQ.shape[0], XQ.shape[-1]
