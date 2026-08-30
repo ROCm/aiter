@@ -171,7 +171,7 @@ def _quant_per_tensor(x, scale=None, quant_dtype=torch.float8_e4m3fn, num_rows=N
     assert scale is None
     assert num_rows is None
 
-    amax = torch.empty(1, dtype=torch.float32, device=x.device)
+    amax = torch.zeros(1, dtype=torch.float32, device=x.device)
     xq = torch.empty_like(x, dtype=quant_dtype)
     flydsl_absmax()(x, amax)
     flydsl_quant_per_tensor(quant_dtype)(x, amax, xq)

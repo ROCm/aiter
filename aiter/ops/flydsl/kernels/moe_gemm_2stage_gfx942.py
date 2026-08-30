@@ -5,7 +5,6 @@ import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, vector
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
@@ -2730,8 +2729,7 @@ def flydsl_absmax():
 
         vmax = wave_reduce_max(vmax)
         if tid == 0:
-            addr = fx.ptrtoint(Amax)
-            llvm_ptr = llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), as_ir_value(addr))
+            llvm_ptr = fx.to_llvm_ptr(Amax)
             llvm.AtomicRMWOp(
                 llvm.AtomicBinOp.fmax,
                 llvm_ptr,
