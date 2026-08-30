@@ -485,6 +485,43 @@ def top_k_per_row_decode(
     )
 
 
+def flydsl_dcp_topk_merge(
+    gathered_scores: torch.Tensor,
+    local_idx: torch.Tensor,
+    block_table: torch.Tensor,
+    out_kv_indices: torch.Tensor,
+    out_kv_indptr: torch.Tensor,
+    owned_counts: torch.Tensor,
+    staging: torch.Tensor,
+    dcp_rank: int,
+    world_size: int,
+    topk_tokens: int,
+    page_size: int,
+) -> None:
+    """DCP decode top-k merge: emit this rank's owned KV slots, packed.
+
+    Allocates no device scratch, so it is safe inside a captured CUDAGraph;
+    the first call for a new shape JIT-compiles, so warm up before capturing.
+    """
+    from .flydsl.dcp_topk_merge import (
+        flydsl_dcp_topk_merge as _impl,
+    )
+
+    return _impl(
+        gathered_scores,
+        local_idx,
+        block_table,
+        out_kv_indices,
+        out_kv_indptr,
+        owned_counts,
+        staging,
+        dcp_rank,
+        world_size,
+        topk_tokens,
+        page_size,
+    )
+
+
 @compile_ops("module_top_k_per_row", ffi_type="ctypes")
 def top_k_per_row_decode_fast(
     logits: torch.Tensor,
