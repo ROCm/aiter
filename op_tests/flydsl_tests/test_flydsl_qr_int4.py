@@ -48,6 +48,7 @@ from aiter.ops.flydsl.kernels.qr_int4_kernel import (
     SUPPORTED_WORLDS,
     TILE_BYTES,
     WORLD,
+    has_release_fence,
 )
 
 ARCH = get_gfx_runtime()
@@ -89,11 +90,22 @@ def _pick_st(
     requested: int = SUPER_TILE,
     *,
     grid_cap: int = DEFAULT_GRID_CAP,
+    inbox_memory: str = "uncached",
 ) -> int:
+    """Mirror of ``QRInt4._pick_st``, so the test asserts the rule not the code.
+
+    The rule is interconnect-dependent: an inbox that needs a release fence
+    makes each publish expensive enough to take a super-tile as soon as there
+    is one, while without a fence ST=1 is preferred for its parallelism. Which
+    one applies is a property of the host, so it comes from the rank's reported
+    ``inbox_memory`` rather than being assumed.
+    """
     tiles = _num_tiles(tokens, hidden)
-    if requested == 1 or tiles > grid_cap:
-        return requested
-    return 1
+    if requested == 1:
+        return 1
+    if has_release_fence(inbox_memory):
+        return requested if tiles >= requested else 1
+    return requested if tiles > grid_cap else 1
 
 
 def _sqnr_db(got: torch.Tensor, reference: torch.Tensor) -> float:
@@ -177,6 +189,7 @@ def _run_rank(args) -> None:
             "tokens": tokens,
             "hidden": hidden,
             "grid_cap": args.grid_cap,
+            "inbox_memory": fly.inbox_memory,
             "st_used": fly._pick_st(tiles),
             "sqnr_db": _sqnr_db(got, ref),
             "rel_mae": _rel_mae(got, ref),
@@ -302,7 +315,12 @@ def _assert_sqnr(
     world_size: int,
     label: str,
 ) -> dict:
-    expected_st = _pick_st(tokens, hidden, grid_cap=ranks[0][0]["grid_cap"])
+    expected_st = _pick_st(
+        tokens,
+        hidden,
+        grid_cap=ranks[0][0]["grid_cap"],
+        inbox_memory=ranks[0][0]["inbox_memory"],
+    )
     if len(ranks) != world_size:
         raise AssertionError(
             f"{label}: gathered {len(ranks)} ranks, expected {world_size}"

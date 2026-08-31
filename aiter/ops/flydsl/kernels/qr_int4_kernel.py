@@ -77,14 +77,33 @@ _CM_NT = 4
 # spin observes it immediately. Forcing the payload itself write-through
 # (`sc0 sc1` on every store) also fixes visibility, but defeats the coalescing
 # and gives back the entire bandwidth win.
+# ``fanout`` picks which axis of the (peer, sector) fanout runs fastest across
+# consecutive quads; see the layouts in the kernel body.
 _INBOX_POLICY = {
-    "uncached": {"payload": "nt", "flag": "nt", "writeback": None},
+    "uncached": {
+        "payload": "nt",
+        "flag": "nt",
+        "writeback": None,
+        "fanout": "sector",
+    },
     "finegrained": {
         "payload": "nt",
         "flag": "sc0 sc1 nt",
         "writeback": "buffer_wbl2 sc1",
+        "fanout": "peer",
     },
 }
+FANOUT_ORDERS = ("sector", "peer")
+
+
+def has_release_fence(inbox_memory: str) -> bool:
+    """Whether this inbox type needs an L2 writeback at every publish.
+
+    Callers use it to decide how hard to work at batching publishes: with a
+    fence they are expensive, without one they are nearly free.
+    """
+    return _INBOX_POLICY[inbox_memory]["writeback"] is not None
+
 
 # Dequant bit-trick: nibble | 0x6400 then + (-1032.0) as f16x2 reconstructs (q-8).
 _K_MASK_000F = 0x000F000F
@@ -331,13 +350,19 @@ def make_qr_int4_kernel(
         )
     if inbox_memory not in _INBOX_POLICY:
         raise ValueError(
-            f"inbox_memory must be one of {tuple(_INBOX_POLICY)}, "
-            f"got {inbox_memory!r}"
+            f"inbox_memory must be one of {tuple(_INBOX_POLICY)}, got {inbox_memory!r}"
         )
     policy = _INBOX_POLICY[inbox_memory]
     payload_policy = policy["payload"]
     flag_policy = policy["flag"]
     release_writeback = policy["writeback"]
+    # Strides for the (peer, sector) fanout, resolved here rather than in the
+    # kernel body: bindings made inside an `if` do not survive FlyDSL's trace,
+    # which is why the body pre-assigns before conditionally overwriting.
+    if policy["fanout"] == "peer":
+        int4_stride, scale_stride = (8, 1), (2, 1)
+    else:
+        int4_stride, scale_stride = (1, world_size), (1, world_size)
     if ATOMS % world_size != 0:
         raise ValueError(f"ATOMS={ATOMS} is not divisible by world_size={world_size}")
     if super_tile not in SUPER_TILES:
@@ -364,6 +389,7 @@ def make_qr_int4_kernel(
         out_ptr: Int64,
         peer_ptrs: Int64,
         colors_ptr: Int64,
+        n_blocks: Int32,
     ):
         _clamp_fp16_overflow()
         tid = fx.Int32(gpu.thread_id("x"))
@@ -399,13 +425,21 @@ def make_qr_int4_kernel(
             tid, scale_own_layout
         ).unpack()
         # Rank-tile = 18 × 64 B Infinity Fabric sectors: 16 INT4 then 2 E4M3.
-        # A workgroup has 64 quads. Lockstep: consecutive quads target
-        # consecutive peers of one sector so one NT store hits every GPU.
-        # A stripe of 8 sectors needs world_size*8 quads (64 at 8 GPUs);
-        # leftover quads sit idle (always on the 2-sector scale tail, and
-        # on the INT4 stripes when world_size < 8). Cover 18 as 8+8+2.
-        fanout_int4_stripe = fx.make_layout((world_size, 8), (1, world_size))
-        fanout_scale_stripe = fx.make_layout((world_size, 2), (1, world_size))
+        # A workgroup has 64 quads. A stripe of 8 sectors needs world_size*8
+        # quads (64 at 8 GPUs); leftover quads sit idle (always on the
+        # 2-sector scale tail, and on the INT4 stripes when world_size < 8).
+        # Cover 18 as 8+8+2.
+        #
+        # Which axis runs fastest across consecutive quads is a fabric
+        # question. "sector": consecutive quads target consecutive peers of
+        # one sector, so a single store instruction hits every GPU -- ideal
+        # on xGMI, whose native packet is exactly the 64 B a quad writes.
+        # "peer": consecutive quads walk the sectors of one peer, giving each
+        # destination a 512 B contiguous run. PCIe wants that -- interleaving
+        # destinations every 64 B costs ~1.5x against >=256 B runs (36.25 vs
+        # 54.03 GB/s measured on MI350P). See docs/qr_int4_mi350p.md.
+        fanout_int4_stripe = fx.make_layout((world_size, 8), int4_stride)
+        fanout_scale_stripe = fx.make_layout((world_size, 2), scale_stride)
         color_layout = fx.make_layout((grid,), (1,))
         wire_slot_layout = fx.make_layout(
             (PHASES, grid, world_size, super_tile),
@@ -591,9 +625,7 @@ def make_qr_int4_kernel(
             rocdl.s_waitcnt(vmcnt=0)
             gpu.barrier()
             if release_writeback is not None:
-                llvm.InlineAsmOp(
-                    None, [], release_writeback, "", has_side_effects=True
-                )
+                llvm.InlineAsmOp(None, [], release_writeback, "", has_side_effects=True)
                 rocdl.s_waitcnt(vmcnt=0)
             limit = fx.Int32(world_size)
             safe = (quad_id < limit).select(quad_id, fx.Int32(0))
@@ -662,11 +694,16 @@ def make_qr_int4_kernel(
                     gathered.append(_codec_dequant(packed, scale))
             return gathered
 
-        n_block_tiles = (num_tiles - bid + fx.Int32(grid - 1)) // fx.Int32(grid)
+        # Stride by the *launched* grid, not the compile-time cap. The host
+        # launches fewer blocks than `grid` whenever it wants each block to own
+        # several tiles (see QRInt4._grid_x); striding by the cap instead would
+        # silently leave every tile above n_blocks unprocessed. `grid` still
+        # sizes the wire slots and colour array, so n_blocks <= grid always.
+        n_block_tiles = (num_tiles - bid + n_blocks - fx.Int32(1)) // n_blocks
         color = _load_color()
         if super_tile == 1:
             for i in range(fx.Int32(0), n_block_tiles, fx.Int32(1)):
-                tile = bid + i * fx.Int32(grid)
+                tile = bid + i * n_blocks
                 atoms = _load_tile_atoms(tile)
                 _pack_reduce_scatter(atoms)
                 gpu.barrier()
@@ -695,7 +732,7 @@ def make_qr_int4_kernel(
                 n_this = (remain < st_i).select(remain, st_i)
 
                 for s in range(fx.Int32(0), n_this, fx.Int32(1)):
-                    tile = bid + (i + s) * fx.Int32(grid)
+                    tile = bid + (i + s) * n_blocks
                     atoms = _load_tile_atoms(tile)
                     _pack_reduce_scatter(atoms)
                     gpu.barrier()
@@ -726,7 +763,7 @@ def make_qr_int4_kernel(
 
                 for s in range(fx.Int32(0), n_this, fx.Int32(1)):
                     gathered = _recv_all_gather(s)
-                    tile = bid + (i + s) * fx.Int32(grid)
+                    tile = bid + (i + s) * n_blocks
                     _store_tile_atoms(tile, gathered)
 
                 color = color + fx.Int32(1)
@@ -758,6 +795,7 @@ def make_qr_int4_kernel(
             out_ptr,
             peer_ptrs,
             colors_ptr,
+            grid_x,
             value_attrs={"rocdl.flat_work_group_size": flat_wg},
         ).launch(
             grid=(grid_x, 1, 1),

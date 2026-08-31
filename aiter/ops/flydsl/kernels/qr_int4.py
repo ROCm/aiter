@@ -28,6 +28,7 @@ from .qr_int4_kernel import (
     SUPPORTED_WORLDS,
     TILE_BYTES,
     WORLD,
+    has_release_fence,
     make_qr_int4_kernel,
 )
 
@@ -56,12 +57,20 @@ INBOX_MEMORY_MODES = ("auto", "uncached", "finegrained")
 # the pre-fix numbers, which had the kernel merely at par at these sizes.
 MIN_PAYLOAD_BYTES = 128 << 10
 
+# Floor on the block count when batching publishes into super-tiles; see
+# ``QRInt4._grid_x``. Shrinking the grid trades parallelism for fewer release
+# fences, which is only a good trade once there are enough fences to matter.
+# 32 is a quarter of an MI350P's 128 CUs: low enough that the 14 MiB case still
+# reaches its measured optimum of 56 blocks, high enough that the sub-MiB cases
+# keep the parallelism they actually need.
+_MIN_BATCH_BLOCKS = 32
+
 # KFD io-link type for xGMI, from include/uapi/linux/kfd_sysfs.h. PCIe is 2.
 _HSA_IOLINK_TYPE_XGMI = 11
 _KFD_NODES = Path("/sys/class/kfd/kfd/topology/nodes")
 
 
-def _has_xgmi_peer_links() -> bool:
+def has_xgmi_peer_links() -> bool:
     """Whether any GPU-to-GPU link on this host is xGMI rather than PCIe.
 
     Arch is not enough to make this call: an MI350X (xGMI) and an MI350P
@@ -93,7 +102,7 @@ def _resolve_inbox_flags(mode: str) -> tuple[int, str]:
             f"inbox_memory must be one of {INBOX_MEMORY_MODES}, got {mode!r}"
         )
     if mode == "auto":
-        mode = "uncached" if _has_xgmi_peer_links() else "finegrained"
+        mode = "uncached" if has_xgmi_peer_links() else "finegrained"
     flags = (
         UncachedIpcHeap._HIP_DEVICE_MALLOC_UNCACHED
         if mode == "uncached"
@@ -279,6 +288,7 @@ class QRInt4:
         self.super_tile = int(super_tile)
         self._grid = cap
         self.inbox_memory = resolved_inbox
+        self._batch_publishes = has_release_fence(resolved_inbox)
         self.min_bytes = MIN_PAYLOAD_BYTES if min_bytes is None else int(min_bytes)
         if self.min_bytes < 0:
             raise ValueError(f"min_bytes must be non-negative, got {self.min_bytes}")
@@ -311,9 +321,40 @@ class QRInt4:
         self.wire_tile_bytes = primary.wire_tile_bytes
 
     def _pick_st(self, num_tiles: int) -> int:
-        if self.super_tile == 1 or num_tiles > self._grid:
-            return self.super_tile
-        return 1
+        """Super-tile for a payload of *num_tiles* tiles.
+
+        Without a release fence a publish is nearly free, so the only reason to
+        batch tiles is when there are more of them than blocks -- prefer ST=1
+        and the parallelism it buys.
+
+        With one, that trade inverts: every publish costs a full L2 writeback,
+        and ST=1 pays one per tile per phase. Take a super-tile as soon as
+        there is a whole one to take. Measured on MI350P at 1024x7168, TP4:
+        577.71 us at ST=1 against 269.01 at ST=8.
+        """
+        if self.super_tile == 1:
+            return 1
+        if self._batch_publishes:
+            return self.super_tile if num_tiles >= self.super_tile else 1
+        return self.super_tile if num_tiles > self._grid else 1
+
+    def _grid_x(self, num_tiles: int, super_tile: int) -> int:
+        """Blocks to launch for *num_tiles* tiles under *super_tile*.
+
+        Batching publishes only pays if a block actually owns a super-tile's
+        worth of work: ST=8 across 448 blocks holding one tile each still
+        publishes per tile. Hand each block a full super-tile instead, which
+        cuts publishes to ``num_tiles / ST`` per phase.
+
+        Bounded below by ``_MIN_BATCH_BLOCKS``, because that trade inverts at
+        small sizes: 14 tiles over 2 blocks saves a handful of fences and gives
+        up the whole machine to do it. Measured on MI350P at 32x7168, TP4,
+        61.95 us unbounded against 23.98 with the grid left alone.
+        """
+        if self._batch_publishes and super_tile != 1:
+            batched = max(-(-num_tiles // super_tile), _MIN_BATCH_BLOCKS)
+            num_tiles = min(num_tiles, batched)
+        return max(1, min(num_tiles, self._grid))
 
     def _check_payload(self, inp, out) -> int:
         if not isinstance(inp, torch.Tensor) or not isinstance(out, torch.Tensor):
@@ -342,7 +383,7 @@ class QRInt4:
     def _launch_eng(self, eng: _StEngine, inp, out, stream) -> None:
         live_bytes = int(inp.numel()) * int(inp.element_size())
         num_tiles = max(1, (live_bytes + TILE_BYTES - 1) // TILE_BYTES)
-        grid_x = min(num_tiles, self._grid)
+        grid_x = self._grid_x(num_tiles, eng.super_tile)
         if stream is None:
             stream = Stream(None)
         args = (
