@@ -21,19 +21,15 @@ from flydsl.expr import (
     rocdl as fly_rocdl,
 )
 from flydsl.expr.typing import T
-
 # Dynamic row bases and byte bounds are not expressible through a static layout.
 from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
 
 _KEY_BITS = 32
 _RADIX_BITS = 11
 _NUM_RADIX_PASSES = (_KEY_BITS + _RADIX_BITS - 1) // _RADIX_BITS
 _FINAL_RADIX_BITS = _KEY_BITS - (_NUM_RADIX_PASSES - 1) * _RADIX_BITS
 _VEC = 4
-_DPP_ROW_SHR_1 = 0x111
-_DPP_ROW_SHR_2 = 0x112
-_DPP_ROW_SHR_4 = 0x114
-_DPP_ROW_SHR_8 = 0x118
 _DPP_ROW_MASK = 0xF
 _DPP_BANK_MASK = 0xF
 
@@ -101,27 +97,21 @@ def _warp_inclusive_prefix_i32(val, lane):
     val_raw = as_ir_value(val)
     zero_raw = as_ir_value(fx.Int32(0))
     for dpp_op, threshold in (
-        (_DPP_ROW_SHR_1, 1),
-        (_DPP_ROW_SHR_2, 2),
-        (_DPP_ROW_SHR_4, 4),
-        (_DPP_ROW_SHR_8, 8),
+        (0x111, 1),
+        (0x112, 2),
+        (0x114, 4),
+        (0x118, 8),
     ):
-        remote = fly_rocdl.update_dpp(
-            T.i32,
-            zero_raw,
-            val_raw,
-            dpp_op,
-            _DPP_ROW_MASK,
-            _DPP_BANK_MASK,
-            True,
+        remote = update_dpp_i32(
+            zero_raw, val_raw, dpp_op, _DPP_ROW_MASK, _DPP_BANK_MASK, True
         )
-        val = (lane >= threshold).select(val + fx.Int32(remote), val)
+        val = (lane >= fx.Int32(threshold)).select(val + fx.Int32(remote), val)
         val_raw = as_ir_value(val)
 
     remote = fly_rocdl.ds_bpermute(T.i32, ((lane & 0x30) - 1) * 4, val)
-    val = (lane >= 16).select(val + fx.Int32(remote), val)
+    val = (lane >= fx.Int32(16)).select(val + fx.Int32(remote), val)
     remote = fly_rocdl.ds_bpermute(T.i32, ((lane & 0x30) - 17) * 4, val)
-    return (lane >= 32).select(val + fx.Int32(remote), val)
+    return (lane >= fx.Int32(32)).select(val + fx.Int32(remote), val)
 
 
 def _atomic_add_i32(memref, val, offset, syncscope):
