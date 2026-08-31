@@ -74,7 +74,6 @@ def gemm_a16w16_persistent_kernel_(
     num_warps: gl.constexpr,
     num_stages: gl.constexpr = 0,
     waves_per_eu: gl.constexpr = 0,
-    PREFETCH_DEPTH: gl.constexpr = 0,  # unused, kept for a uniform launch signature
 ):
 
     gl.static_assert(NUM_BUFFERS >= 2, "persistent gemm requires NUM_BUFFERS >= 2")
@@ -195,7 +194,7 @@ def gemm_a16w16_persistent_kernel_(
                 bias_vals = gl.load(bias_ptr + offs_bias, mask=offs_bias < N, other=0.0)
                 accumulator = accumulator + bias_vals[None, :]
 
-            # fill buffers with tiles
+            # prologue: fill buffers with tiles
             for _ in gl.static_range(NUM_BUFFERS - 1):
                 gl.amd.gfx1250.tdm.async_load(
                     a_desc,
@@ -216,7 +215,7 @@ def gemm_a16w16_persistent_kernel_(
                     )
                 load_idx += 1
 
-            # produce and consume k tiles
+            # main loop: produce and consume k tiles
             for _ in range(num_k_tiles - (NUM_BUFFERS - 1)):
                 gl.amd.gfx1250.tdm.async_load(
                     a_desc,
@@ -255,7 +254,7 @@ def gemm_a16w16_persistent_kernel_(
                 accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
                 compute_idx += 1
 
-            # drain remaining loads
+            # epilogue: drain remaining loads
             for i in gl.static_range(NUM_BUFFERS - 1):
                 gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - i) * 2)
 
@@ -327,15 +326,14 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
     num_warps: gl.constexpr,
     num_stages: gl.constexpr = 0,
     waves_per_eu: gl.constexpr = 0,
-    PREFETCH_DEPTH: gl.constexpr = 0,
 ):
     gl.static_assert(
         NUM_BUFFERS >= 2, "persistent compute_bound requires NUM_BUFFERS >= 2"
     )
 
     WRITES_FINAL: gl.constexpr = NUM_KSPLIT == 1
-    PD: gl.constexpr = (NUM_BUFFERS - 1) if PREFETCH_DEPTH == 0 else PREFETCH_DEPTH
-    gl.static_assert(NUM_BUFFERS >= PD + 1, "NUM_BUFFERS must be >= PREFETCH_DEPTH + 1")
+    # prefetch depth is derived from the buffer count
+    PD: gl.constexpr = NUM_BUFFERS - 1
 
     SHARED_LAYOUT_A: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_K, 8]], [BLOCK_M, BLOCK_K], [1, 0]
@@ -409,16 +407,7 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
             layout=SHARED_LAYOUT_B,
         )
 
-    SHARED_LAYOUT_C: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[BLOCK_N, 8]], [BLOCK_M, BLOCK_N], [1, 0]
-    )
-    c_buffer = gl.allocate_shared_memory(
-        c_ptr.type.element_ty,
-        shape=[BLOCK_M, BLOCK_N],
-        layout=SHARED_LAYOUT_C,
-    )
-
-    # decode the first unit and prefetch its leading k-tiles
+    # prologue: decode the first unit and prefetch its leading k-tiles
     t = remap_xcd(start_pid, num_tiles, NUM_XCDS=8)
     pid_k = t % NUM_KSPLIT
     pid = t // NUM_KSPLIT
@@ -484,6 +473,7 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
                 OPERAND_LAYOUT_B,
             )
 
+        # main loop
         for _ in range(cur_num_k_tiles - PD):
 
             gl.amd.gfx1250.tdm.async_load(
@@ -528,6 +518,7 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
             cur_b = next_b
             compute_idx += 1
 
+        # epilogue: drain remaining prefetched k-tiles
         for i in gl.static_range(PD - 1):
             gl.amd.gfx1250.tdm.async_wait((PD - 2 - i) * 2)
 
@@ -555,18 +546,16 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
         if USE_ACTIVATION and WRITES_FINAL:
             accumulator = activation(accumulator)
 
-        c_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-            base=c_ptr + pid_k.to(gl.int64) * stride_ck,
-            shape=(M, N),
-            strides=(stride_cm, stride_cn),
-            block_shape=(BLOCK_M, BLOCK_N),
-            layout=SHARED_LAYOUT_C,
+        offs_cm = m_off + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT))
+        offs_cn = n_off + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT))
+        offs_c = stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+        mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        gl.amd.gfx1250.buffer_store(
+            accumulator.to(c_ptr.type.element_ty),
+            c_ptr + pid_k.to(gl.int64) * stride_ck,
+            offs_c,
+            mask=mask_c,
         )
-        c_buffer.store(accumulator.to(c_ptr.type.element_ty))
-        gl.barrier()
-        gl.amd.gfx1250.tdm.async_store(c_desc, [m_off, n_off], c_buffer)
-        # drain before the next tile overwrites c_buffer
-        gl.amd.gfx1250.tdm.async_wait(0)
 
         next_tile_id = tile_id + NUM_SMS
         n_t = remap_xcd(next_tile_id, num_tiles, NUM_XCDS=8)
@@ -580,6 +569,7 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
 
         gl.barrier()
 
+        # prologue for next tile
         if next_tile_id < num_tiles:
             for pf in gl.static_range(NUM_BUFFERS - 1):
                 gl.amd.gfx1250.tdm.async_load(

@@ -200,7 +200,6 @@ def gemm_a16w16_(
             num_warps = config["num_warps"]
             num_stages = config.get("num_stages", 0)
             waves_per_eu = config.get("waves_per_eu", 0)
-            PREFETCH_DEPTH = config.get("PREFETCH_DEPTH", 0)
             NUM_KSPLIT = config.get("NUM_KSPLIT", 1)
 
             # Compute split-K parameters
@@ -291,7 +290,6 @@ def gemm_a16w16_(
                 num_warps=num_warps,
                 num_stages=num_stages,
                 waves_per_eu=waves_per_eu,
-                PREFETCH_DEPTH=PREFETCH_DEPTH,
             )
 
             if NUM_KSPLIT > 1:
