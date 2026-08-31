@@ -115,10 +115,24 @@ def build_flash_attn_fp8_module(
     USE_MANUAL_SCHED = True
     USE_IGLP = False
     IGLP_VARIANT = 1
-    SOFTMAX_PRIO = 1
+    # Wave priority per phase.  These arbitrate between the two ping-pong
+    # partners on a SIMD: the wave with the higher s_setprio wins the issue
+    # slot.  With MFMA=1 / SOFTMAX=0 the softmax wave is outranked for its
+    # whole phase by the partner's MFMA phase, which shows up in the trace
+    # as one VALU absorbing the entire gap (408 cy on the v_partial chain,
+    # ending 52 cy after the partner drops priority, every iteration).
+    MFMA_PRIO = 1
+    SOFTMAX_PRIO = 0
 
-    L_SPLIT_TILES = 0
+    L_SPLIT_TILES = 2
     L_MFMA_SLABS = PV_K_STEPS - L_SPLIT_TILES // 2
+    # Width of the carried l_valu.  When the VALU half of L is live we carry it
+    # *unreduced* -- one f32 per lane element -- so the lane-folding tree and
+    # the cross-lane shuffle_xor run once in the epilogue instead of once per
+    # softmax phase.  Addition is associative across iterations and the
+    # rollback rescale is a uniform scalar, so it distributes over the
+    # unfolded partial.  Costs C_F32_PER_LANE-1 carried VGPRs.
+    L_VALU_WIDTH = C_F32_PER_LANE if L_SPLIT_TILES > 0 else 1
 
     SCHRAUDOLPH_2P23 = 1 << 23
     SCHRAUDOLPH_C = 127 * SCHRAUDOLPH_2P23 - 486411
@@ -943,12 +957,14 @@ def build_flash_attn_fp8_module(
         ):
             vt = Vec.make_type(C_F32_PER_LANE, fx.Float32)
             lvt = Vec.make_type(C16_F32_PER_LANE, fx.Float32)
+            lvvt = Vec.make_type(L_VALU_WIDTH, fx.Float32)
             if_op = scf.IfOp(
                 fired,
                 results_=[vt] * N_KV_TILES
                 + [vt] * D_TILES
                 + [lvt] * L_MFMA_SLABS
-                + [T.f32, T.f32, T.i32, T.i32],
+                # l_valu is a vector now (see L_VALU_WIDTH); m_frozen stays scalar.
+                + [lvvt, T.f32, T.i32, T.i32],
                 has_else=True,
             )
             with ir.InsertionPoint(if_op.then_block):
@@ -991,7 +1007,12 @@ def build_flash_attn_fp8_module(
                     C16_F32_PER_LANE
                 )
                 _lm = [_fmul(Vec(lm), f_vec_l) for lm in l_mfma]
-                _lv = _fmul(l_valu, f)
+                # l_valu is a vector now, so it needs a broadcast of f at its
+                # own width rather than the scalar f.
+                _lv = _fmul(
+                    Vec(l_valu),
+                    Vec.from_elements([f], fx.Float32).broadcast_to(L_VALU_WIDTH),
+                )
                 _m = _fadd(m_frozen, d)
                 # Re-derive the seed: b = C - m.  Later tiles are prefilled
                 # with the new b, so they agree with the rescaled past.
@@ -1141,12 +1162,10 @@ def build_flash_attn_fp8_module(
             # The MFMA half of the L reduction has moved to the head of the
             # next MFMA phase (apply_pv); the softmax phase is VALU-only now.
             if const_expr(v_partial is not None):
-                v_sum = _lane_sum(v_partial)
-                v_sum = _fadd(
-                    v_sum,
-                    fx.Float32(v_sum).shuffle_xor(fx.Int32(32), fx.Int32(WARP_SIZE)),
-                )
-                l_valu = _fadd(l_valu, v_sum)
+                # No lane fold here: l_valu stays an unreduced per-lane
+                # vec<16xf32> and the tree + cross-lane shuffle_xor run once
+                # in the epilogue.  See l_valu_init.
+                l_valu = _fadd(Vec(l_valu), Vec(v_partial))
             # o_accs / l_mfma come back because the rollback may have rescaled
             # them; on the non-seeded path they are whatever was passed in.
             return m_frozen, bias_chunks, p_pack, l_valu, o_accs, l_mfma
@@ -1200,7 +1219,11 @@ def build_flash_attn_fp8_module(
         _gpu_barrier()
 
         loop_step = fx.Int32(BLOCK_N)
-        l_valu_init = c_zero_f
+        # See L_VALU_WIDTH: unreduced per-lane partial when the VALU half of L
+        # is live, plain scalar-in-a-vec<1> otherwise.
+        l_valu_init = Vec.from_elements([c_zero_f], fx.Float32).broadcast_to(
+            L_VALU_WIDTH
+        )
         # One C register per L slab: the slabs are summed independently and
         # only merged in the epilogue, so nothing serialises them.
         l_mfma_init = [l_mfma_atom.zero_value for _ in range_constexpr(L_MFMA_SLABS)]
@@ -1212,7 +1235,7 @@ def build_flash_attn_fp8_module(
         m_init = c_neg_inf
 
         ## for epilogue
-        le_valu = c_zero_f
+        le_valu = l_valu_init
         # Flat names, not a list: `if is_g0` is a stateful dynamic scf.if and
         # every live state variable has to be an MLIR value.  PV_K_STEPS is 2,
         # so there are at most two slabs; an unused one stays zero and adds
@@ -1326,7 +1349,7 @@ def build_flash_attn_fp8_module(
 
                 _sched_barrier()
                 _gpu_barrier()
-                rocdl.s_setprio(1)
+                rocdl.s_setprio(MFMA_PRIO)
                 o, l_mfma, k_preloaded = apply_pv(
                     [o0, o1, o2, o3],
                     l_mfma,
@@ -1346,7 +1369,7 @@ def build_flash_attn_fp8_module(
                 )
 
                 _sched_barrier()
-                rocdl.s_setprio(0)
+                rocdl.s_setprio(SOFTMAX_PRIO)
                 _gpu_barrier()
                 # apply_pv has already folded tile i-1 into o / l_mfma, and
                 # tile i's P is not built yet, so this is the one point where
@@ -1532,7 +1555,7 @@ def build_flash_attn_fp8_module(
                 l_voffs = get_lds_voffs(v_buff_off)
                 _sched_barrier()
                 _gpu_barrier()
-                rocdl.s_setprio(1)
+                rocdl.s_setprio(MFMA_PRIO)
 
                 o, l_mfma, k_preloaded = apply_pv(
                     [o0, o1, o2, o3],
@@ -1552,7 +1575,7 @@ def build_flash_attn_fp8_module(
                     dma=(v_rsrc, l_voffs, g_voffs),
                 )
                 _sched_barrier()
-                rocdl.s_setprio(0)
+                rocdl.s_setprio(SOFTMAX_PRIO)
                 _gpu_barrier()
                 g_voffs = advance_hbm_offs(g_voffs)
                 scf.YieldOp(
@@ -1599,7 +1622,17 @@ def build_flash_attn_fp8_module(
         o_finals = [oe0, oe1, oe2, oe3]
         # asm: output_complete_results folds the MFMA half of L (_v_LR) into
         # the VALU half (_v_L) right before the reciprocal.
-        l_final = le_valu
+        # The deferred lane fold: l_valu carried an unreduced vec<16xf32>
+        # through the whole loop, so the tree reduction and the cross-lane
+        # shuffle_xor happen exactly once, here, instead of per iteration.
+        if const_expr(L_SPLIT_TILES > 0):
+            l_final = _lane_sum(le_valu)
+            l_final = _fadd(
+                l_final,
+                fx.Float32(l_final).shuffle_xor(fx.Int32(32), fx.Int32(WARP_SIZE)),
+            )
+        else:
+            l_final = Vec(le_valu)[0]
         if const_expr(L_MFMA_SLABS > 0):
             l_final = _fadd(l_final, Vec(le_mfma0)[0])
         if const_expr(L_MFMA_SLABS > 1):
