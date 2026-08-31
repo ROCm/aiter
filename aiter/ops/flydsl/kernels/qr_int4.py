@@ -249,6 +249,8 @@ class QRInt4:
         if int(inp.data_ptr()) % 16 != 0 or int(out.data_ptr()) % 16 != 0:
             raise ValueError("QRInt4 requires 16-byte-aligned input/output")
         live_bytes = int(inp.numel()) * int(inp.element_size())
+        if live_bytes > 0xFFFFFFFF:
+            raise ValueError("QRInt4 payload must not exceed the 4 GiB buffer window")
         if live_bytes % 16 != 0:
             raise ValueError("byte size must be a multiple of 16 (8 bf16)")
         if int(out.numel()) * int(out.element_size()) != live_bytes:
