@@ -169,10 +169,12 @@ def _f32_to_e4m3(x):
     e = e + carry.select(fx.Int32(1), fx.Int32(0))
     m3 = carry.select(fx.Int32(0), m3)
     e4 = e + fx.Int32(7)
-    e4 = (e4 < fx.Int32(0)).select(
-        fx.Int32(0), (e4 > fx.Int32(15)).select(fx.Int32(15), e4)
-    )
+    min_exp = e4 == fx.Int32(0)
+    overflow = e4 > fx.Int32(15)
+    m3 = overflow.select(fx.Int32(7), m3)
+    e4 = (e4 < fx.Int32(0)).select(fx.Int32(0), overflow.select(fx.Int32(15), e4))
     byte = sign | (e4 << fx.Int32(3)) | (m3 & fx.Int32(7))
+    byte = min_exp.select((byte == fx.Int32(0)).select(fx.Int32(1), byte), byte)
     return is_z.select(fx.Int32(0), byte)
 
 
