@@ -32,6 +32,7 @@ namespace py = pybind11;
         .value("Gelu", ActivationType::Gelu)                                                \
         .value("Swiglu", ActivationType::Swiglu)                                            \
         .value("Situv2", ActivationType::Situv2)                                            \
+        .value("GeluTanh", ActivationType::GeluTanh)                                         \
         .export_values();                                                                   \
     pybind11::enum_<MlaVersion>(m, "MlaVersion")                                            \
         .value("V32", MlaVersion::V32)                                                      \
@@ -482,7 +483,8 @@ namespace py = pybind11;
           py::arg("scale_fmt"),                                                     \
           py::arg("weights_scale"),                                                 \
           py::arg("preshuffle") = false,                                            \
-          py::arg("is_neox") = true);                                               \
+          py::arg("is_neox") = true,                                                \
+          py::arg("compute_all_q_rope") = false);                                   \
     m.def("cp_gather_indexer_k_quant_cache",                                        \
           &aiter::cp_gather_indexer_k_quant_cache,                                  \
           py::arg("kv_cache"),                                                      \
@@ -1471,33 +1473,60 @@ namespace py = pybind11;
           py::arg("m_indices")         = std::nullopt, \
           py::arg("reverse_sorted")    = std::nullopt);
 
-#define PA_SPARSE_PREFILL_OPUS_PYBIND       \
-    m.def("pa_sparse_prefill_opus_fwd",     \
-          &pa_sparse_prefill_opus_fwd,      \
-          py::arg("q"),                     \
-          py::arg("unified_kv"),            \
-          py::arg("kv_indices_prefix"),     \
-          py::arg("kv_indptr_prefix"),      \
-          py::arg("kv"),                    \
-          py::arg("kv_indices_extend"),     \
-          py::arg("kv_indptr_extend"),      \
-          py::arg("attn_sink"),             \
-          py::arg("out"),                   \
-          py::arg("softmax_scale"));        \
-    m.def("pa_sparse_prefill_fp8_opus_fwd", \
-          &pa_sparse_prefill_fp8_opus_fwd,  \
-          py::arg("q_nope"),                \
-          py::arg("q_rope"),                \
-          py::arg("unified_kv_nope"),       \
-          py::arg("unified_kv_rope"),       \
-          py::arg("kv_indices_prefix"),     \
-          py::arg("kv_indptr_prefix"),      \
-          py::arg("kv_nope"),               \
-          py::arg("kv_rope"),               \
-          py::arg("kv_indices_extend"),     \
-          py::arg("kv_indptr_extend"),      \
-          py::arg("attn_sink"),             \
-          py::arg("out"),                   \
+#define PA_SPARSE_PREFILL_OPUS_PYBIND               \
+    m.def("pa_sparse_prefill_gfx950_opus_fwd",      \
+          &pa_sparse_prefill_gfx950_opus_fwd,       \
+          py::arg("q"),                             \
+          py::arg("unified_kv"),                    \
+          py::arg("kv_indices_prefix"),             \
+          py::arg("kv_indptr_prefix"),              \
+          py::arg("kv"),                            \
+          py::arg("kv_indices_extend"),             \
+          py::arg("kv_indptr_extend"),              \
+          py::arg("attn_sink"),                     \
+          py::arg("out"),                           \
+          py::arg("softmax_scale"));                \
+    m.def("pa_sparse_prefill_gfx1250_opus_fwd",     \
+          &pa_sparse_prefill_gfx1250_opus_fwd,      \
+          py::arg("q"),                             \
+          py::arg("unified_kv"),                    \
+          py::arg("kv_indices_prefix"),             \
+          py::arg("kv_indptr_prefix"),              \
+          py::arg("kv"),                            \
+          py::arg("kv_indices_extend"),             \
+          py::arg("kv_indptr_extend"),              \
+          py::arg("attn_sink"),                     \
+          py::arg("out"),                           \
+          py::arg("softmax_scale"));                \
+    m.def("pa_sparse_prefill_fp8_gfx950_opus_fwd",  \
+          &pa_sparse_prefill_fp8_gfx950_opus_fwd,   \
+          py::arg("q_nope"),                        \
+          py::arg("q_rope"),                        \
+          py::arg("unified_kv_nope"),               \
+          py::arg("unified_kv_rope"),               \
+          py::arg("kv_indices_prefix"),             \
+          py::arg("kv_indptr_prefix"),              \
+          py::arg("kv_nope"),                       \
+          py::arg("kv_rope"),                       \
+          py::arg("kv_indices_extend"),             \
+          py::arg("kv_indptr_extend"),              \
+          py::arg("attn_sink"),                     \
+          py::arg("out"),                           \
+          py::arg("softmax_scale"));                \
+    m.def("pa_sparse_prefill_fp8_gfx1250_opus_fwd", \
+          &pa_sparse_prefill_fp8_gfx1250_opus_fwd,  \
+          py::arg("q_nope"),                        \
+          py::arg("q_rope"),                        \
+          py::arg("unified_kv_nope"),               \
+          py::arg("unified_kv_rope"),               \
+          py::arg("kv_indices_prefix"),             \
+          py::arg("kv_indptr_prefix"),              \
+          py::arg("kv_nope"),                       \
+          py::arg("kv_rope"),                       \
+          py::arg("kv_indices_extend"),             \
+          py::arg("kv_indptr_extend"),              \
+          py::arg("attn_sink"),                     \
+          py::arg("out"),                           \
           py::arg("softmax_scale"));
 
 #define FMHA_FWD_BF16_OPUS_PYBIND                   \
@@ -1680,7 +1709,12 @@ namespace py = pybind11;
           py::arg("e8m0_shuffle")   = false,                             \
           py::arg("a16w4_shuffle")  = false,                             \
           py::arg("gate_up")        = false,                             \
-          py::arg("shuffle_weight") = false);
+          py::arg("shuffle_weight") = false);                             \
+    m.def("quant_mxfp6_gemm_hip",                                        \
+          &aiter::quant_mxfp6_gemm_hip,                                  \
+          py::arg("input"),                                              \
+          py::arg("packed"),                                             \
+          py::arg("packed_scale"));
 
 #define DSV4_ROTATE_QUANT_PYBIND                                                             \
     m.def("rotate_activation_fp4quant",                                                      \
@@ -1988,7 +2022,8 @@ namespace py = pybind11;
           py::arg("use_shuffle_layout"),                               \
           py::arg("block_size"),                                       \
           py::arg("x"),                                                \
-          py::arg("rotary_dim") = 0);                                  \
+          py::arg("rotary_dim") = 0,                                   \
+          py::arg("v_norm")     = false);                              \
     m.def("fused_qk_norm_rope_cache_block_quant_shuffle",              \
           &aiter::fused_qk_norm_rope_cache_block_quant_shuffle,        \
           py::arg("qkv"),                                              \

@@ -1,25 +1,24 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// Shared host launcher for the OPUS gfx950 bf16 flash-attention forward kernels.
-// A single entry point (`fmha_fwd_bf16_opus_fwd`) dispatches by head dim:
-//   * (D_QK,D_V) = (128,128) -> gqa_d128_kernel        (batch mode only; logic unchanged)
+// Torch entry point for the OPUS gfx950 bf16 flash-attention forward kernels.
+// `fmha_fwd_bf16_opus_fwd` validates the tensors and dispatches by head dim:
+//   * (D_QK,D_V) = (128,128) -> gqa_d128_kernel        (batch mode only)
 //   * (D_QK,D_V) = (192,128) -> gqa_d192_v128_kernel   (batch + group / varlen)
 //
-// Both device kernel templates are pulled in (IMPL-guarded, single-header) so they can
-// be launched from this one translation unit.
+// This file owns the torch-facing validation and the tensor -> stride extraction only. The
+// grid shape, the causal head/tail merge and the large-KV descriptor choice live in the
+// torch-free `fmha_fwd_bf16_opus_launch.h`, so the standalone C++ benchmark reaches the same
+// kernels through the same decisions. Defining the IMPL macro makes this translation unit
+// the owner of the device kernel instantiation.
 
-#define FMHA_FWD_HD128_BF16_OPUS_IMPL
-#include "fmha_fwd_hd128_bf16_opus.h"
-#define FMHA_FWD_HD192_V128_BF16_OPUS_IMPL
-#include "fmha_fwd_hd192_v128_bf16_opus.h"
+#define FMHA_FWD_BF16_OPUS_LAUNCH_IMPL
+#include "fmha_fwd_bf16_opus_launch.h"
 
 #include "torch/fmha_fwd_bf16_opus.h"
 #include "aiter_hip_common.h"
 
 #include <ATen/hip/HIPContext.h>
-#include <cmath>
-#include <type_traits>
 
 namespace {
 
@@ -67,34 +66,32 @@ void launch_d128(at::Tensor& q,
 
     if (B == 0 || N == 0 || H == 0) return;
 
-    opus_gqa_kargs kargs{};
-    kargs.ptr_q = q.data_ptr();
-    kargs.ptr_k = k.data_ptr();
-    kargs.ptr_v = v.data_ptr();
-    kargs.ptr_o = out.data_ptr();
-    kargs.B     = B;
-    kargs.N     = N;
-    kargs.N_KV  = N_KV;
-    kargs.H     = H;
-    kargs.H_KV  = H_KV;
-    kargs.D     = D;
-    kargs.stride_q_b  = static_cast<int>(q.stride(0));
-    kargs.stride_q_n  = static_cast<int>(q.stride(1));
-    kargs.stride_q_h  = static_cast<int>(q.stride(2));
-    kargs.stride_o_b  = static_cast<int>(out.stride(0));
-    kargs.stride_o_n  = static_cast<int>(out.stride(1));
-    kargs.stride_o_h  = static_cast<int>(out.stride(2));
-    kargs.stride_k_b  = static_cast<int>(k.stride(0));
-    kargs.stride_k_n  = static_cast<int>(k.stride(1));
-    kargs.stride_k_h  = static_cast<int>(k.stride(2));
-    kargs.stride_v_b  = static_cast<int>(v.stride(0));
-    kargs.stride_v_n  = static_cast<int>(v.stride(1));
-    kargs.stride_v_h  = static_cast<int>(v.stride(2));
-
-    if (softmax_scale <= 0.0f) {
-        softmax_scale = 1.0f / std::sqrt(static_cast<float>(D));
-    }
-    kargs.softmax_scale = softmax_scale;  // kernel applies scale * log2(e) to Q
+    fmha_fwd_bf16_opus_args args{};
+    args.q_ptr    = q.data_ptr();
+    args.k_ptr    = k.data_ptr();
+    args.v_ptr    = v.data_ptr();
+    args.o_ptr    = out.data_ptr();
+    args.batch    = B;
+    args.nhead    = H;
+    args.nhead_k  = H_KV;
+    args.seqlen_q = N;
+    args.seqlen_k = N_KV;
+    args.hdim_q   = D;
+    args.hdim_v   = D;
+    args.stride_q_b  = static_cast<int>(q.stride(0));
+    args.stride_q_n  = static_cast<int>(q.stride(1));
+    args.stride_q_h  = static_cast<int>(q.stride(2));
+    args.stride_o_b  = static_cast<int>(out.stride(0));
+    args.stride_o_n  = static_cast<int>(out.stride(1));
+    args.stride_o_h  = static_cast<int>(out.stride(2));
+    args.stride_k_b  = static_cast<int>(k.stride(0));
+    args.stride_k_n  = static_cast<int>(k.stride(1));
+    args.stride_k_h  = static_cast<int>(k.stride(2));
+    args.stride_v_b  = static_cast<int>(v.stride(0));
+    args.stride_v_n  = static_cast<int>(v.stride(1));
+    args.stride_v_h  = static_cast<int>(v.stride(2));
+    args.softmax_scale = softmax_scale;  // <= 0 picks the launcher's 1/sqrt(D) default
+    args.causal        = causal;
 
     // Optional LSE (fp32, natural log; one value per (head, query row)). Left as nullptr
     // when absent, which the kernel reads as "skip the store".
@@ -106,32 +103,14 @@ void launch_d128(at::Tensor& q,
         TORCH_CHECK(l.dim() == 3 && static_cast<int>(l.size(0)) == B &&
                         static_cast<int>(l.size(1)) == H && static_cast<int>(l.size(2)) == N,
                     "lse must be [B, H, N]");
-        kargs.ptr_lse      = l.data_ptr();
-        kargs.stride_lse_b = static_cast<int>(l.stride(0));
-        kargs.stride_lse_h = static_cast<int>(l.stride(1));
+        args.lse_ptr      = l.data_ptr();
+        args.stride_lse_b = static_cast<int>(l.stride(0));
+        args.stride_lse_h = static_cast<int>(l.stride(1));
     }
 
     HipDeviceGuard guard(q.device().index());
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
-
-    using TraitsCausal    = opus_gqa_traits<32, 64, 128, 8, true>;
-    using TraitsNonCausal = opus_gqa_traits<32, 64, 128, 8, false>;
-
-    auto launch = [&](auto traits_tag) {
-        using Traits          = decltype(traits_tag);
-        const int num_q_tiles = ceil_div(N, Traits::Q_TILE_SIZE);
-        const int num_q_blk   = ceil_div(num_q_tiles, Traits::NUM_WARPS);
-        dim3 grid(H, num_q_blk, B);
-        dim3 block(Traits::BLOCK_SIZE);
-        gqa_d128_kernel<Traits><<<grid, block, 0, stream>>>(kargs);
-        HIP_CALL_LAUNCH(hipGetLastError());
-    };
-
-    if (causal) {
-        launch(TraitsCausal{});
-    } else {
-        launch(TraitsNonCausal{});
-    }
+    TORCH_CHECK(fmha_fwd_bf16_opus_launch(args, at::hip::getCurrentHIPStream()),
+                "OPUS D=128: the launcher rejected this shape");
 }
 
 // ─── D_QK=192 / D_V=128 (asymmetric) launch — batch + group (varlen). ───
@@ -151,31 +130,25 @@ void launch_d192_v128(at::Tensor& q,
 {
     constexpr int D_QK = 192;
     constexpr int D_V  = 128;
-    constexpr int Q_TILE_SIZE = 32, KV_TILE_SIZE = 64, NUM_WARPS = 8;
+    constexpr int Q_TILE_SIZE = 32, NUM_WARPS = 8;
     constexpr int Q_BLOCK = Q_TILE_SIZE * NUM_WARPS;  // 256
 
     const bool is_group = seqstart_q.has_value() && seqstart_q->numel() > 0;
 
-    opus_gqa_d192_kargs kargs{};
-    kargs.ptr_q = q.data_ptr();
-    kargs.ptr_k = k.data_ptr();
-    kargs.ptr_v = v.data_ptr();
-    kargs.ptr_o = out.data_ptr();
-    kargs.D_QK  = D_QK;
-    kargs.D_V   = D_V;
-
-    if (softmax_scale <= 0.0f) {
-        softmax_scale = 1.0f / std::sqrt(static_cast<float>(D_QK));
-    }
-    // Plumbed into the kernel via kargs; the kernel folds in log2(e) for its exp2 softmax.
-    kargs.softmax_scale = softmax_scale;
+    fmha_fwd_bf16_opus_args args{};
+    args.q_ptr  = q.data_ptr();
+    args.k_ptr  = k.data_ptr();
+    args.v_ptr  = v.data_ptr();
+    args.o_ptr  = out.data_ptr();
+    args.hdim_q = D_QK;
+    args.hdim_v = D_V;
+    args.softmax_scale = softmax_scale;  // <= 0 picks the launcher's 1/sqrt(D_QK) default
+    args.causal        = causal;
 
     HipDeviceGuard guard(q.device().index());
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     int B, N, N_KV, H, H_KV;
-    int num_q_blocks;   // for grid / merge decision
-    int grid_x, grid_y, grid_z;
+    int num_q_blocks;   // only used for the empty-launch short circuit below
 
     if (is_group) {
         // Packed / varlen: q [total_q, H, D_QK], k [total_k, H_KV, D_QK],
@@ -218,19 +191,18 @@ void launch_d192_v128(at::Tensor& q,
         if (seqstart_k_pad.has_value()) check_seqstart(*seqstart_k_pad, "seqstart_k_pad");
 
         // Packed single-sequence strides (no batch stride).
-        kargs.stride_q_b = 0; kargs.stride_q_n = static_cast<int>(q.stride(0));   kargs.stride_q_h = static_cast<int>(q.stride(1));
-        kargs.stride_o_b = 0; kargs.stride_o_n = static_cast<int>(out.stride(0)); kargs.stride_o_h = static_cast<int>(out.stride(1));
-        kargs.stride_k_b = 0; kargs.stride_k_n = static_cast<int>(k.stride(0));   kargs.stride_k_h = static_cast<int>(k.stride(1));
-        kargs.stride_v_b = 0; kargs.stride_v_n = static_cast<int>(v.stride(0));   kargs.stride_v_h = static_cast<int>(v.stride(1));
+        args.stride_q_b = 0; args.stride_q_n = static_cast<int>(q.stride(0));   args.stride_q_h = static_cast<int>(q.stride(1));
+        args.stride_o_b = 0; args.stride_o_n = static_cast<int>(out.stride(0)); args.stride_o_h = static_cast<int>(out.stride(1));
+        args.stride_k_b = 0; args.stride_k_n = static_cast<int>(k.stride(0));   args.stride_k_h = static_cast<int>(k.stride(1));
+        args.stride_v_b = 0; args.stride_v_n = static_cast<int>(v.stride(0));   args.stride_v_h = static_cast<int>(v.stride(1));
 
-        kargs.ptr_seqstart_q     = reinterpret_cast<const int*>(seqstart_q->data_ptr());
-        kargs.ptr_seqstart_k     = reinterpret_cast<const int*>(seqstart_k->data_ptr());
-        kargs.ptr_seqstart_q_pad = reinterpret_cast<const int*>(
+        args.seqstart_q_ptr     = reinterpret_cast<const int*>(seqstart_q->data_ptr());
+        args.seqstart_k_ptr     = reinterpret_cast<const int*>(seqstart_k->data_ptr());
+        args.seqstart_q_pad_ptr = reinterpret_cast<const int*>(
             (seqstart_q_pad.has_value() ? *seqstart_q_pad : *seqstart_q).data_ptr());
-        kargs.ptr_seqstart_k_pad = reinterpret_cast<const int*>(
+        args.seqstart_k_pad_ptr = reinterpret_cast<const int*>(
             (seqstart_k_pad.has_value() ? *seqstart_k_pad : *seqstart_k).data_ptr());
 
-        // Rotated axis order (matches production asm GROUP_MODE): head=x, group=y, Q-block=z.
         num_q_blocks = ceil_div(N, Q_BLOCK);          // nqb_cap from max_seqlen_q
     } else {
         // Dense batch: q/k/v/out 4-D [B, N, H, D]. Cross-attention allowed (N != N_KV).
@@ -250,10 +222,10 @@ void launch_d192_v128(at::Tensor& q,
         TORCH_CHECK(out.size(0) == B && out.size(1) == N && out.size(2) == H,
                     "out shape must match q [B, N, H, D_V]");
 
-        kargs.stride_q_b = static_cast<int>(q.stride(0));   kargs.stride_q_n = static_cast<int>(q.stride(1));   kargs.stride_q_h = static_cast<int>(q.stride(2));
-        kargs.stride_o_b = static_cast<int>(out.stride(0)); kargs.stride_o_n = static_cast<int>(out.stride(1)); kargs.stride_o_h = static_cast<int>(out.stride(2));
-        kargs.stride_k_b = static_cast<int>(k.stride(0));   kargs.stride_k_n = static_cast<int>(k.stride(1));   kargs.stride_k_h = static_cast<int>(k.stride(2));
-        kargs.stride_v_b = static_cast<int>(v.stride(0));   kargs.stride_v_n = static_cast<int>(v.stride(1));   kargs.stride_v_h = static_cast<int>(v.stride(2));
+        args.stride_q_b = static_cast<int>(q.stride(0));   args.stride_q_n = static_cast<int>(q.stride(1));   args.stride_q_h = static_cast<int>(q.stride(2));
+        args.stride_o_b = static_cast<int>(out.stride(0)); args.stride_o_n = static_cast<int>(out.stride(1)); args.stride_o_h = static_cast<int>(out.stride(2));
+        args.stride_k_b = static_cast<int>(k.stride(0));   args.stride_k_n = static_cast<int>(k.stride(1));   args.stride_k_h = static_cast<int>(k.stride(2));
+        args.stride_v_b = static_cast<int>(v.stride(0));   args.stride_v_n = static_cast<int>(v.stride(1));   args.stride_v_h = static_cast<int>(v.stride(2));
 
         num_q_blocks = ceil_div(N, Q_BLOCK);
     }
@@ -263,7 +235,7 @@ void launch_d192_v128(at::Tensor& q,
                 "q/k/v/out must be contiguous along the head dim");
     if (B == 0 || H == 0 || num_q_blocks == 0) return;
 
-    kargs.B = B; kargs.N = N; kargs.N_KV = N_KV; kargs.H = H; kargs.H_KV = H_KV;
+    args.batch = B; args.seqlen_q = N; args.seqlen_k = N_KV; args.nhead = H; args.nhead_k = H_KV;
 
     // Optional LSE (fp32, natural log; one value per (head, query row)). Left as
     // nullptr when absent, which the kernel reads as "skip the store".
@@ -276,68 +248,20 @@ void launch_d192_v128(at::Tensor& q,
             TORCH_CHECK(l.dim() == 2 && static_cast<int>(l.size(0)) == H &&
                             l.size(1) == q.size(0),
                         "group mode lse must be [H, total_q]");
-            kargs.stride_lse_b = 0;
-            kargs.stride_lse_h = static_cast<int>(l.stride(0));
+            args.stride_lse_b = 0;
+            args.stride_lse_h = static_cast<int>(l.stride(0));
         } else {
             TORCH_CHECK(l.dim() == 3 && static_cast<int>(l.size(0)) == B &&
                             static_cast<int>(l.size(1)) == H && static_cast<int>(l.size(2)) == N,
                         "batch mode lse must be [B, H, N]");
-            kargs.stride_lse_b = static_cast<int>(l.stride(0));
-            kargs.stride_lse_h = static_cast<int>(l.stride(1));
+            args.stride_lse_b = static_cast<int>(l.stride(0));
+            args.stride_lse_h = static_cast<int>(l.stride(1));
         }
-        kargs.ptr_lse = l.data_ptr();
+        args.lse_ptr = l.data_ptr();
     }
 
-    // Head/tail merge (causal load balance): host is the single source of truth; the
-    // kernel reads the OPT_MERGE_HEADTAIL bit and never recomputes it.
-    const bool small_shape = (long long)num_q_blocks * H * B < (long long)HEADTAIL_MIN_WG;
-    const bool merge_ht    = causal && !small_shape;
-    kargs.opt = merge_ht ? OPT_MERGE_HEADTAIL : 0;
-
-    if (is_group) {
-        grid_x = H;
-        grid_y = B;
-        grid_z = merge_ht ? ceil_div(num_q_blocks, 2) : num_q_blocks;
-    } else {
-        grid_x = merge_ht ? ceil_div(num_q_blocks, 2) : num_q_blocks;   // config A: q-block=x
-        grid_y = H;
-        grid_z = B;
-    }
-    dim3 grid(grid_x, grid_y, grid_z);
-    dim3 block(NUM_WARPS * 64);
-
-    auto launch = [&](auto traits_tag) {
-        using Traits = decltype(traits_tag);
-        gqa_d192_v128_kernel<Traits><<<grid, block, 0, stream>>>(kargs);
-        HIP_CALL_LAUNCH(hipGetLastError());
-    };
-
-    // Per-tile descriptor rebasing is only needed once a buffer's per-head extent stops
-    // fitting the 32-bit num_records; under that the single-descriptor path is exact and
-    // cheaper. Decided per buffer: K's rows are 1.5x wider than V's here, so K crosses the
-    // limit first. N_KV is max_seqlen_k in group mode, so this bounds every group.
-    const long long k_slice_bytes = (long long)N_KV * (long long)kargs.stride_k_n * 2LL;  // bf16
-    const long long v_slice_bytes = (long long)N_KV * (long long)kargs.stride_v_n * 2LL;
-    const bool large_k = k_slice_bytes >= (1LL << 32);
-    const bool large_v = v_slice_bytes >= (1LL << 32);
-
-    auto launch_by_mode = [&](auto large_k_tag, auto large_v_tag) {
-        constexpr bool LK = decltype(large_k_tag)::value;
-        constexpr bool LV = decltype(large_v_tag)::value;
-        if (is_group) {
-            if (causal) launch(opus_gqa_d192_traits<32, 64, 8, true,  true,  LK, LV>{});
-            else        launch(opus_gqa_d192_traits<32, 64, 8, false, true,  LK, LV>{});
-        } else {
-            if (causal) launch(opus_gqa_d192_traits<32, 64, 8, true,  false, LK, LV>{});
-            else        launch(opus_gqa_d192_traits<32, 64, 8, false, false, LK, LV>{});
-        }
-    };
-    // (small K, large V) needs strides that invert the usual 192/128 row widths; rebasing K
-    // too is still correct there, so it folds into the all-large form rather than costing a
-    // fourth pair of instantiations.
-    if (!large_k && !large_v)     launch_by_mode(std::false_type{}, std::false_type{});
-    else if (large_k && !large_v) launch_by_mode(std::true_type{},  std::false_type{});
-    else                          launch_by_mode(std::true_type{},  std::true_type{});
+    TORCH_CHECK(fmha_fwd_bf16_opus_launch(args, at::hip::getCurrentHIPStream()),
+                "OPUS D_QK=192/D_V=128: the launcher rejected this shape");
 }
 
 } // namespace

@@ -1,14 +1,29 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #
-# A4W4 (F4GEMM) test/benchmark for gfx1250. One timed candidate ("asm") per
-# (intype, shape, apre) row; a torch fp32 reference is compared but never timed.
-# Default dispatch is heuristic (the aiter op picks the .co from f4gemm.csv by
-# (intype, a_preshuffle, outtype)); --knl-name forces an explicit kernel.
-#   MXFP4: e8m0 per-32 scales;  NVFP4: e4m3 per-16 scales + per-tensor globals
+# ============================================================================
+# gfx1250 F4GEMM ASM Support Matrix
+# ----------------------------------------------------------------------------
+#  OUTTYPE | A_PRESHUFFLE | B_PRESHUFFLE | INTYPE |   M    |   N    |   K
+# ---------+--------------+--------------+--------+--------+--------+--------
+#  BF16    |      0       |      1       | MXFP4  | %1==0  | %16==0 | %32==0
+#  BF16    |      0       |      1       | NVFP4  | %1==0  | %16==0 | %32==0
+#  BF16    |      1       |      1       | MXFP4  | %16==0 | %16==0 | %32==0
+#  BF16    |      1       |      1       | NVFP4  | %16==0 | %16==0 | %32==0
+#  FP8     |      0       |      1       | MXFP4  | %1==0  | %16==0 | %32==0
+#  FP8     |      0       |      1       | NVFP4  | %1==0  | %16==0 | %32==0
+#  FP8     |      1       |      1       | MXFP4  | %16==0 | %16==0 | %32==0
+#  FP8     |      1       |      1       | NVFP4  | %16==0 | %16==0 | %32==0
+# ----------------------------------------------------------------------------
+# Notes:
+#  - B_PRESHUFFLE is always 1 (B is always pre-shuffled).
+#  - A_PRESHUFFLE=1 tightens the M constraint from %1==0 to %16==0.
+#  - K is always a multiple of 32.
+# ============================================================================
 
 import argparse
 import itertools
+import sys
 
 import pandas as pd
 import torch
@@ -20,7 +35,6 @@ from aiter.ops.gemm_op_a4w4 import MXFP8_OUT_SCALE_BLOCK, unpack_mxfp8_out_scale
 from aiter.ops.shuffle import shuffle_scale_f4, shuffle_weight_f4
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
-from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
 
 try:
     import bench_init
@@ -36,48 +50,139 @@ pd.set_option("display.width", 1000)
 
 SUPPORTED_GFX = ["gfx1250"]
 
-SUBK = 256  # asm inner-K step: the ONLY hard shape constraint is K % SUBK == 0
+_OUT_DTYPE = {"bf16": dtypes.bf16, "fp8": dtypes.fp8}
+
+# gfx1250 F4GEMM .co is a persistent shader: it always launches PERSISTENT_TG
+# threadgroups regardless of problem size (must match the .co's WG_MAX).
+PERSISTENT_TG = 256
+
+
+def _report_active_tg(M, N, tile_m, tile_n, label):
+    """Warn when the persistent shader's TG slots aren't fully packed.
+
+    The .co always launches PERSISTENT_TG (256) threadgroups. The real work is
+    ceil(M/tile_m) * ceil(N/tile_n) tiles; when that isn't a multiple of 256 the
+    final wave leaves the leftover TG slots idle (wasted CUs) -> "poor perf".
+    (Moved here from the cpp dispatch so the report lives with the test.)
+    """
+    tg_m = (M + tile_m - 1) // tile_m
+    tg_n = (N + tile_n - 1) // tile_n
+    active_tg = tg_m * tg_n
+    wave_active = (
+        PERSISTENT_TG if active_tg % PERSISTENT_TG == 0 else active_tg % PERSISTENT_TG
+    )
+    info = (
+        f"{label}: active {wave_active}/{PERSISTENT_TG} TG "
+        f"({tg_m} M-tiles x {tg_n} N-tiles, tile_m={tile_m}, tile_n={tile_n})"
+    )
+    if active_tg % PERSISTENT_TG == 0:
+        aiter.logger.info("dispatch to %s", info)
+    else:
+        tag = "\033[31mpoor perf\033[0m" if sys.stderr.isatty() else "poor perf"
+        aiter.logger.warning("dispatch to %s - %s!", info, tag)
+
 
 PERF_SHAPES = [(16384, 16384, 16384)]
 FUNC_SHAPES = [
-    (1024, 1024, 256),
-    (1024, 1024, 512),
-    (1024, 1024, 768),
-    (1024, 1024, 1280),
-    (2048, 1024, 256),
-    (1024, 2048, 768),
-    (2048, 2048, 2048),
-    (4096, 4096, 512),
-    (1024, 5120, 256),
-    (1024, 6144, 256),
-    (1024, 7168, 256),
-    (5120, 1024, 256),
-    (3072, 8192, 256),
-    (5120, 5120, 256),
+    # pure_compute
+    (256, 2048, 8192),
+    (2048, 8192, 8192),
+    (16384, 16384, 16384),
+    # (32768, 106496, 16384),
+    # (32768, 16384, 53248),
+    # (32768, 18432, 16384),
+    # (32768, 16384, 16384),
+    (128, 106496, 16384),
+    (128, 16384, 53248),
+    (128, 18432, 16384),
+    (128, 16384, 16384),
+    (64, 106496, 16384),
+    (64, 16384, 53248),
+    (64, 18432, 16384),
+    (64, 16384, 16384),
+    (32, 106496, 16384),
+    (32, 16384, 53248),
+    (32, 18432, 16384),
+    (32, 16384, 16384),
+    # qkv_proj
+    (1, 1280, 8192),
+    (64, 1280, 8192),
+    (127, 1280, 8192),
+    (129, 1280, 8192),
+    (65, 1280, 8192),
+    (32, 1280, 8192),
+    (128, 1280, 8192),
+    (192, 1280, 8192),
+    (256, 1280, 8192),
+    (320, 1280, 8192),
+    (512, 1280, 8192),
+    (1024, 1280, 8192),
+    (2048, 1280, 8192),
+    (4096, 1280, 8192),
+    (8192, 1280, 8192),
+    # attn_out
+    (1, 8192, 1024),
+    (32, 8192, 1024),
+    (64, 8192, 1024),
+    (128, 8192, 1024),
+    (192, 8192, 1024),
+    (256, 8192, 1024),
+    (320, 8192, 1024),
+    (512, 8192, 1024),
+    (1024, 8192, 1024),
+    (2048, 8192, 1024),
+    (4096, 8192, 1024),
+    (8192, 8192, 1024),
+    (16384, 8192, 1024),
+    # tune
+    (1552, 8192, 8192),
+    (1664, 8192, 8192),
+    (1792, 8192, 8192),
+    (1920, 8192, 8192),
+    (3072, 8192, 8192),
+    (1552, 10240, 8192),
+    (1664, 10240, 8192),
+    (1792, 10240, 8192),
+    (1920, 10240, 8192),
+    (3072, 10240, 8192),
+    (1552, 57344, 8192),
+    (1664, 57344, 8192),
+    (1792, 57344, 8192),
+    (1920, 57344, 8192),
+    (3072, 57344, 8192),
+    (1552, 8192, 28672),
+    (1664, 8192, 28672),
+    (1792, 8192, 28672),
+    (1920, 8192, 28672),
+    (3072, 8192, 28672),
+    (128, 1280, 8224),
+    # partial_tile
+    (128, 384, 8192),
+    (128, 272, 8192),
+    (65, 384, 8192),
 ]
 
 MXFP4_SCALE_BLOCK = 32
 NVFP4_SCALE_BLOCK = 16
 # MXFP8_OUT_SCALE_BLOCK (=128) is imported from gemm_op_a4w4.
 
-# mxfp8 output E8M0 reference: RoundUp (ceil(amax/448)), compared with atol=1
-# (kernel rounds within +-1 step). RoundUp keeps ref data <= 448; Even/RNE can
-# round the scale down and overflow e4m3 to NaN, so must NOT be used here.
-MXFP8_SCALE_MODE = MxScaleRoundModeInt.RoundUp
-MXFP8_SCALE_ATOL = 1.0  # +-1 e8m0 step
+
+# mxfp8 output E8M0 scale, mirrors the fp8out kernel: amax/256, then
+# exp[30:23] + guard[22] (single guard-bit round, no RNE). Compared with a
+# +-1 e8m0-step tolerance (see the scale checkAllclose below).
+def _e8m0_out_scale(amax):
+    u = (amax / 256.0).view(torch.int32)
+    return (((u >> 23) & 0xFF) + ((u >> 22) & 1)).to(torch.uint8)
 
 
 def _quant_mxfp8_blockN(x_f32, block=MXFP8_OUT_SCALE_BLOCK):
-    """Golden mxfp8 output quant: per-128-col block amax -> E8M0 scale via
-    fp4_utils.f32_to_mx_e8m0_scale (RoundUp, FP8_E4M3) + e4m3 data. Returns
-    (fp8 [M,N], e8m0 row-major [M, N/block])."""
+    """Golden mxfp8 output quant: per-128-col block amax -> E8M0 scale (kernel-
+    exact) + e4m3 data. Returns (fp8 [M,N], e8m0 row-major [M, N/block])."""
     M, N = x_f32.shape
     assert N % block == 0, f"mxfp8 golden requires N % {block} == 0"
     xb = x_f32.reshape(M, N // block, block)
     amax = xb.abs().amax(dim=-1).clamp(min=torch.finfo(torch.float32).tiny)
-    scale_e8m0 = fp4_utils.f32_to_mx_e8m0_scale(
-        amax, mode=MXFP8_SCALE_MODE, dtype=MxDtypeInt.FP8_E4M3
-    )
+    scale_e8m0 = _e8m0_out_scale(amax)
     scale_f32 = fp4_utils.e8m0_to_f32(scale_e8m0).unsqueeze(-1)
     q_fp8 = (xb / scale_f32).reshape(M, N).to(dtypes.fp8)
     return q_fp8, scale_e8m0
@@ -101,39 +206,48 @@ def _verdict(err):
     return "warning" if err <= _TOL_ERR_RATIO else "failed"
 
 
+def _support_reason(outtype, apre, M, N, K):
+    """Support matrix gate. Returns None if the (outtype,apre,M,N,K) combo is
+    supported, else a short reason string (row marked "not support"). Mirrors
+    the dispatch heuristic in asm_f4gemm.cu so shapes are skipped before the
+    shuffle/prep step rather than crashing on an assert."""
+    if outtype not in _OUT_DTYPE:
+        return f"outtype {outtype}"  # no kernel for this output format yet
+    if K % 32 != 0:
+        return "K%32"  # B 16x16 preshuffle
+    if N % 16 != 0:
+        return "N%16"  # B 16x16 preshuffle
+    if apre and M % 16 != 0:
+        return "apre M%16"  # A 16x16 preshuffle
+    if outtype == "fp8" and N % MXFP8_OUT_SCALE_BLOCK != 0:
+        return "fp8 N%128"  # per-128 output-scale golden limitation
+    return None
+
+
 def _e4m3_to_f32(s: torch.Tensor) -> torch.Tensor:
     return s.view(torch.float8_e4m3fn).to(torch.float32)
 
 
-def run_torch_mxfp4(xq, wq, xs, ws, noscale=False):
+def run_torch_mxfp4(xq, wq, xs, ws):
     # Reference only: fp32 math. Returns fp32; the caller casts to bf16 or
-    # quantizes to packed fp4 per outtype. Not timed, not in the table.
+    # quantizes per outtype. Not timed, not in the table.
     x_f32 = fp4_utils.mxfp4_to_f32(xq)
     w_f32 = fp4_utils.mxfp4_to_f32(wq)
-    if noscale:
-        # noscale kernel drops all per-block scale loads and uses the HW default
-        # scale (1.0), so the reference must ignore the e8m0 scales too.
-        return x_f32 @ w_f32.T
     xs = fp4_utils.e8m0_to_f32(xs).repeat_interleave(MXFP4_SCALE_BLOCK, dim=1)
     ws = fp4_utils.e8m0_to_f32(ws).repeat_interleave(MXFP4_SCALE_BLOCK, dim=1)
     return (x_f32 * xs) @ (w_f32 * ws).T
 
 
-def run_torch_nvfp4(xq, wq, xs, ws, gA, gB, noscale=False):
+def run_torch_nvfp4(xq, wq, xs, ws, gA, gB):
     # Reference only: fp32 math. Returns fp32 (see run_torch_mxfp4).
     x_f32 = fp4_utils.mxfp4_to_f32(xq)
     w_f32 = fp4_utils.mxfp4_to_f32(wq)
-    if noscale:
-        # noscale kernel drops the per-block e4m3 scales (HW default 1.0) but
-        # STILL folds the per-tensor global scales gA*gB, so the reference must
-        # match: skip the per-block scales, keep the global ones.
-        return float(gA) * float(gB) * (x_f32 @ w_f32.T)
     xs = _e4m3_to_f32(xs).repeat_interleave(NVFP4_SCALE_BLOCK, dim=1)
     ws = _e4m3_to_f32(ws).repeat_interleave(NVFP4_SCALE_BLOCK, dim=1)
     return float(gA) * float(gB) * (x_f32 * xs) @ (w_f32 * ws).T
 
 
-def _prep_mxfp4(M, N, K, apre, data_init, scale_init, gen, noscale=False):
+def _prep_mxfp4(M, N, K, apre, data_init, scale_init, gen):
     # DATA (fp4 e2m1, packed 2/byte). data & scale are sampled *independently*.
     if data_init == "constant":
         # f4gemm.cpp data_init=0: A=0x22, B=0x33 (fixed representable e2m1).
@@ -150,7 +264,7 @@ def _prep_mxfp4(M, N, K, apre, data_init, scale_init, gen, noscale=False):
     else:  # auto / pow2_binomial / random
         xs = bench_init.fill_scale_e8m0((M, K // MXFP4_SCALE_BLOCK), scale_init, gen)
         ws = bench_init.fill_scale_e8m0((N, K // MXFP4_SCALE_BLOCK), scale_init, gen)
-    ref = run_torch_mxfp4(xq, wq, xs, ws, noscale=noscale)
+    ref = run_torch_mxfp4(xq, wq, xs, ws)
     inp = {
         "A": shuffle_weight_f4(xq) if apre else xq,
         "B": shuffle_weight_f4(wq),
@@ -162,7 +276,7 @@ def _prep_mxfp4(M, N, K, apre, data_init, scale_init, gen, noscale=False):
     return inp, ref
 
 
-def _prep_nvfp4(M, N, K, apre, data_init, scale_init, gen, noscale=False):
+def _prep_nvfp4(M, N, K, apre, data_init, scale_init, gen):
     # DATA (fp4 e2m1). data & scale sampled independently (bench_init).
     if data_init == "constant":
         # f4gemm.cpp data_init=0: A=0x22, B=0x33 (fixed representable e2m1).
@@ -181,7 +295,7 @@ def _prep_nvfp4(M, N, K, apre, data_init, scale_init, gen, noscale=False):
         ws = bench_init.fill_scale_e4m3((N, K // NVFP4_SCALE_BLOCK), scale_init, gen)
     # Per-tensor global scale is NOT part of bench_init: keep neutral.
     gA = gB = 1.0
-    ref = run_torch_nvfp4(xq, wq, xs, ws, gA, gB, noscale=noscale)
+    ref = run_torch_nvfp4(xq, wq, xs, ws, gA, gB)
     inp = {
         "A": shuffle_weight_f4(xq) if apre else xq,
         "B": shuffle_weight_f4(wq),
@@ -193,49 +307,67 @@ def _prep_nvfp4(M, N, K, apre, data_init, scale_init, gen, noscale=False):
     return inp, ref
 
 
-@benchmark()  # (intype, M, N, K, apre, outtype, data_init, scale_init, seed) -> cols
+@benchmark()  # intype, M, N, K, apre, outtype, data_init, ... -> table columns
 def test_gemm(
     intype,
     M,
     N,
     K,
     apre,
-    outtype,
-    data_init,
-    scale_init,
+    outtype="bf16",
+    data_init="uniform",
+    scale_init="auto",
     seed=0,
     mode="perf",
-    dtype=dtypes.bf16,
     knl_name=None,
 ):
+    # Skip unsupported combos up front (before prep/shuffle) so they show as
+    # "not support" rather than crashing on a shape assert.
+    pre = "ABpreShuffle" if apre else "BpreShuffle"
+    reason = _support_reason(outtype, apre, M, N, K)
+    if reason is not None:
+        base = f"f4gemm_{outtype}_{intype}_{pre}_256x256_4x4_ps"
+        actual_knl = knl_name if (knl_name and knl_name != "auto") else base
+        aiter.logger.warning(
+            "f4gemm not supported (%s): intype=%s outtype=%s apre=%s M=%s N=%s K=%s",
+            reason,
+            intype,
+            outtype,
+            apre,
+            M,
+            N,
+            K,
+        )
+        return {
+            "gfx": get_gfx(),
+            "knl_name": actual_knl,
+            "asm us": float("nan"),
+            "asm TFLOPS": float("nan"),
+            "asm TB/s": float("nan"),
+            "asm err": float("nan"),
+            "asm result": f"not support ({reason})",
+        }
+
     block = MXFP4_SCALE_BLOCK if intype == "mxfp4" else NVFP4_SCALE_BLOCK
     assert K % block == 0, f"K must be a multiple of {block}"
-    # Only the packed-fp4 .co is noscale (cvt_scale=1); bf16/fp8 use scales.
-    # Scale tensors are still built (API-required) but ignored when noscale.
-    noscale = outtype == "fp4"
-    out_fp4 = outtype == "fp4"
     out_fp8 = outtype == "fp8"
-    out_dtype = dtypes.fp4x2 if out_fp4 else (dtypes.fp8 if out_fp8 else dtype)
+    out_dtype = _OUT_DTYPE[outtype]
     gen = bench_init.make_generator(seed)  # fixed seed -> bit-identical buffers
     prep = _prep_mxfp4 if intype == "mxfp4" else _prep_nvfp4
-    inp, ref_f32 = prep(M, N, K, apre, data_init, scale_init, gen, noscale=noscale)
-    # Reference in the kernel's output form: packed e2m1 for fp4, block-scaled
-    # (fp8 e4m3 data + e8m0 scale) tuple for fp8, else bf16.
-    if out_fp4:
-        ref = fp4_utils.f32_to_mxfp4(ref_f32)
-    elif out_fp8:
+    inp, ref_f32 = prep(M, N, K, apre, data_init, scale_init, gen)
+    # Reference in the kernel's output form: block-scaled (fp8 e4m3 data + e8m0
+    # scale) tuple for fp8, else bf16.
+    if out_fp8:
         ref = _quant_mxfp8_blockN(ref_f32)  # (ref_fp8, ref_scale_e8m0)
     else:
-        ref = ref_f32.to(dtype)
+        ref = ref_f32.to(out_dtype)
     needTrace = mode == "profile"
     num_iters = 5 if mode == "func" else 101
 
     # Kernel/.co base name for this config (used for logging, and to derive the
     # mangled knl_name when an explicit dispatch is requested). See
-    # hsa/gfx1250/f4gemm/f4gemm.csv.
-    pre = "ABpreShuffle" if apre else "BpreShuffle"
-    ns = "_noscale" if noscale else ""
-    base = f"f4gemm_{outtype}_{intype}_{pre}_256x256_4x4_ps{ns}"
+    # hsa/gfx1250/f4gemm/f4gemm.csv. (`pre` is set above.)
+    base = f"f4gemm_{outtype}_{intype}_{pre}_256x256_4x4_ps"
 
     # Dispatch mode. Default (knl_name=None) is heuristic: kernelName="" lets the
     # aiter op pick the .co from f4gemm.csv by (intype, a_preshuffle, outtype), so
@@ -284,32 +416,31 @@ def test_gemm(
     candidates = {"asm": (run_asm, asm_args)}
 
     flops = 2 * M * N * K
-    # Output bytes: packed fp4 = M*N/2; fp8 = M*N (fp8) + M*N/128 (e8m0 scale);
-    # bf16 = M*N*itemsize.
-    if out_fp4:
-        out_bytes = (M * N) // 2
-    elif out_fp8:
+    # Output bytes: fp8 = M*N (fp8) + M*N/128 (e8m0 scale); bf16 = M*N*itemsize.
+    if out_fp8:
         out_bytes = M * N + M * (N // MXFP8_OUT_SCALE_BLOCK)
     else:
-        out_bytes = M * N * dtype.itemsize
-    nbytes = (
-        inp["A"].nbytes
-        + inp["B"].nbytes
-        + inp["sA"].nbytes
-        + inp["sB"].nbytes
-        + out_bytes
-    )
+        out_bytes = M * N * out_dtype.itemsize
+    # Scale bytes use the LOGICAL (unpadded) size: shuffle_scale_f4 pads scale rows
+    # to fill the preshuffle tile, but the shader clamps its scale dim and never
+    # reads the padding, so the padded buffer's .nbytes would inflate bandwidth.
+    # e8m0 (MXFP4) and e4m3 (NVFP4) are both 1 byte/elem; `block` is set above.
+    scale_bytes = (M + N) * (K // block)
+    nbytes = inp["A"].nbytes + inp["B"].nbytes + scale_bytes + out_bytes
 
     # Report the actual .co in the table: readable base name for heuristic/"auto",
     # the verbatim knl_name otherwise (kept in the table, see main()).
     actual_knl = knl_name if (knl_name and knl_name != "auto") else base
     ret = {"gfx": get_gfx(), "knl_name": actual_knl}
+    # F4GEMM tiles are always 256x256 (see f4gemm.csv). Report TG occupancy.
+    _report_active_tg(M, N, 256, 256, base)
     # Only a missing .co is reported as "not support"; any other failure (OOM,
     # memory fault, shape assert, ...) must propagate, not show as a green cell.
-    _NOT_SUPPORTED_MARKERS = (
-        "cannot get heuristic kernel",
-        "kernel not in cfg_f4gemm",
-    )
+    # An explicit --knl-name that isn't in the cfg is a real error (typo / missing
+    # build), so "kernel not in cfg" is benign ONLY on the heuristic path (knl == "").
+    _NOT_SUPPORTED_MARKERS = ("cannot get heuristic kernel",)
+    if not knl:
+        _NOT_SUPPORTED_MARKERS += ("kernel not in cfg_f4gemm",)
     for name, (fn, fn_args) in candidates.items():
         try:
             out, us = run_perftest(
@@ -318,13 +449,12 @@ def test_gemm(
         except Exception as e:
             if not any(m in str(e) for m in _NOT_SUPPORTED_MARKERS):
                 raise
-            # No .co for this config (e.g. nvfp4-fp4); mark unsupported, keep going.
+            # No .co for this config; mark unsupported, keep going.
             aiter.logger.warning(
-                "f4gemm not supported: intype=%s outtype=%s noscale=%s apre=%s "
+                "f4gemm not supported: intype=%s outtype=%s apre=%s "
                 "M=%s N=%s K=%s [%s.co]: %s",
                 intype,
                 outtype,
-                noscale,
                 apre,
                 M,
                 N,
@@ -339,8 +469,8 @@ def test_gemm(
             ret[f"{name} result"] = "not support"
             continue
         # Func-mode only: check the high-level op contracts by outtype -- bf16 ->
-        # gemm_a4w4 (single tensor), fp4 -> gemm_a4w4o4 (single tensor [.,N//2]),
-        # fp8 -> gemm_a4w4o8 ((data, scale) tuple). Not timed/tabled.
+        # gemm_a4w4 (single tensor), fp8 -> gemm_a4w4o8 ((data, scale) tuple).
+        # Not timed/tabled.
         if mode == "func":
             a4_kwargs = {"apreshuffle": bool(apre)}
             if intype == "nvfp4":
@@ -357,31 +487,15 @@ def test_gemm(
                     f"gemm_a4w4o8 shape mismatch: {tuple(o.shape)}/{tuple(s.shape)} "
                     f"vs {tuple(out[0].shape)}/{tuple(out[1].shape)}"
                 )
-            elif out_fp4:
-                res = aiter.gemm_a4w4o4(*args, **a4_kwargs)
-                assert not isinstance(res, tuple), "gemm_a4w4o4 must return a tensor"
-                assert (
-                    res.shape == out.shape
-                ), f"gemm_a4w4o4 shape mismatch: {tuple(res.shape)} vs {tuple(out.shape)}"
             else:  # bf16
                 res = aiter.gemm_a4w4(*args, dtype=out_dtype, **a4_kwargs)
                 assert not isinstance(res, tuple), "gemm_a4w4 must return a tensor"
                 assert (
                     res.shape == out.shape
                 ), f"gemm_a4w4 shape mismatch: {tuple(res.shape)} vs {tuple(out.shape)}"
-        if out_fp4:
-            # e2m1 is deterministic: compare dequantized values with zero
-            # tolerance (exact fp4-code match). Borderline RNE ties may differ.
-            err = checkAllclose(
-                fp4_utils.mxfp4_to_f32(ref),
-                fp4_utils.mxfp4_to_f32(out),
-                rtol=0,
-                atol=0,
-                msg=f"{intype} {name} fp4",
-            )
-        elif out_fp8:
-            # (fp8 data, packed e8m0). Unpack scale to row-major; judge e8m0 with
-            # atol=1 (kernel within +-1 of RNE) and dequant data with tolerance.
+        if out_fp8:
+            # (fp8 data, packed e8m0). Unpack scale to row-major; e8m0 compared
+            # with a +-1 step tolerance, data dequant with tolerance.
             ref_fp8, ref_scale = ref
             o_fp8, o_scale = out  # o_* avoids shadowing the out_fp8 flag
             M_out, N_out = o_fp8.shape
@@ -390,7 +504,9 @@ def test_gemm(
                 ref_scale.view(torch.uint8).float(),
                 out_scale_rm.view(torch.uint8).float(),
                 rtol=0,
-                atol=MXFP8_SCALE_ATOL,
+                # e8m0 out-scale rounds with a single guard bit (no RNE); allow a
+                # +-1 e8m0-step slack for rounding-mode drift across shapes/kernels.
+                atol=1,
                 msg=f"{intype} {name} fp8 e8m0 (+-1)",
             )
             err_d = checkAllclose(
@@ -402,7 +518,17 @@ def test_gemm(
             )
             err = max(err_s, err_d)
         else:
-            err = checkAllclose(ref, out, rtol=1e-1, atol=1.0, msg=f"{intype} {name}")
+            # Compare in fp32: checkAllclose does no dtype promotion, so a bf16
+            # comparison evaluates atol + rtol*|b| at 8-bit mantissa too. That
+            # makes the threshold itself jitter ~0.2% and systematically
+            # under-reports borderline elements.
+            err = checkAllclose(
+                ref.to(dtypes.fp32),
+                out.to(dtypes.fp32),
+                rtol=1e-1,
+                atol=1.0,
+                msg=f"{intype} {name}",
+            )
         ret[f"{name} us"] = round(us, 2)
         ret[f"{name} TFLOPS"] = round(flops / us / 1e6, 1)
         ret[f"{name} TB/s"] = round(nbytes / us / 1e6, 2)
@@ -427,6 +553,12 @@ def main():
         description="Test/benchmark gfx1250 A4W4 (F4GEMM) via the low-level asm entry",
     )
     parser.add_argument(
+        "--mode",
+        choices=["func", "perf", "profile"],
+        default="perf",
+        help="func=acc+timing table (fewer iters), perf=acc+timing table, profile=perf+trace",
+    )
+    parser.add_argument(
         "--intype",
         nargs="*",
         choices=["mxfp4", "nvfp4"],
@@ -437,19 +569,19 @@ def main():
         "--apre",
         type=int,
         nargs="*",
-        choices=[0, 1],
-        default=[1],
-        help="A-preshuffle sweep list: 1 preshuffles A, 0 sends it row-major",
+        choices=[1, 0],
+        default=None,
+        help="A-preshuffle sweep list: 1 preshuffles A (M%%16), 0 sends it "
+        "row-major (M%%1). Default (unset): perf/profile = [1], func = [1, 0].",
     )
     parser.add_argument(
         "--outtype",
         nargs="*",
-        choices=["bf16", "fp8", "fp4"],
+        choices=sorted(_OUT_DTYPE),
         default=["bf16", "fp8"],
         help="output-format sweep list (default: bf16 fp8):\n"
         "  bf16 = bf16 [M,N]\n"
-        "  fp8  = fp8 e4m3 [M,N] + per-128 E8M0 scale (mxfp8)\n"
-        "  fp4  = packed e2m1 [M,N//2] (noscale; mxfp4 only)",
+        "  fp8  = fp8 e4m3 [M,N] + per-128 E8M0 scale (mxfp8)",
     )
     parser.add_argument(
         "--data-init",
@@ -499,28 +631,13 @@ def main():
         "= use that exact mangled knl_name for all runs (developer experiment/debug).",
     )
     parser.add_argument(
-        "--mode",
-        choices=["func", "perf", "profile"],
-        default="perf",
-        help="func=acc+timing table (fewer iters), perf=acc+timing table, profile=perf+trace",
-    )
-    parser.add_argument(
-        "-d",
-        "--dtype",
-        type=dtypes.str2Dtype,
-        nargs="*",
-        choices=[dtypes.d_dtypes["bf16"]],
-        metavar="{bf16}",
-        default=[dtypes.d_dtypes["bf16"]],
-        help="output dtype, e.g. -d bf16",
-    )
-    parser.add_argument(
+        "-s",
         "-mnk",
         "--shape",
         type=dtypes.str2tuple,
         nargs="*",
         # Unset -> per-mode defaults: perf=PERF_SHAPES (one big square, throughput),
-        # func=FUNC_SHAPES (many small/odd shapes, correctness). K must be %SUBK.
+        # func=FUNC_SHAPES (many small/odd shapes, correctness). K must be %32.
         default=None,
         help="(M,N,K) tuples, e.g. -mnk 2048,2048,2048 16384,16384,16384; "
         "unset uses PERF_SHAPES (perf/profile) or FUNC_SHAPES (func)",
@@ -556,35 +673,42 @@ def main():
     else:
         shapes = FUNC_SHAPES if args.mode == "func" else PERF_SHAPES
 
-    for dtype in args.dtype:  # one table per output dtype
-        # init pair is the OUTERMOST product term -> rows are grouped by
-        # (data_init,scale_init) within the single summary table.
-        rows = [
-            test_gemm(
-                intype,
-                M,
-                N,
-                K,
-                apre,
-                ot,
-                di,
-                si,
-                seed=args.seed,
-                mode=args.mode,
-                dtype=dtype,
-                knl_name=args.knl_name,
-            )
-            for (di, si), intype, apre, ot, (M, N, K) in itertools.product(
-                init_pairs, args.intype, args.apre, args.outtype, shapes
-            )
-        ]
-        df = pd.DataFrame(rows)
-        # Keep knl_name (the actual .co); drop the columns constant within a table.
-        df = df.drop(columns=["seed", "dtype", "gfx", "mode"], errors="ignore")
-        aiter.logger.info(
-            "gemm_a4w4 (F4GEMM) summary (markdown):\n%s",
-            df.to_markdown(index=False),
+    # A-preshuffle sweep. Mode-aware default when unset: perf/profile exercise only
+    # the preshuffled path ([1]); func sweeps both ([1, 0]).
+    if args.apre is not None:
+        apre_list = args.apre
+    elif args.mode in ("perf", "profile"):
+        apre_list = [1]
+    else:
+        apre_list = [1, 0]
+
+    rows = [
+        test_gemm(
+            intype,
+            M,
+            N,
+            K,
+            apre,
+            outtype,
+            di,
+            si,
+            seed=args.seed,
+            mode=args.mode,
+            knl_name=args.knl_name,
         )
+        for apre, (di, si), intype, outtype, (M, N, K) in itertools.product(
+            apre_list, init_pairs, args.intype, args.outtype, shapes
+        )
+    ]
+    df = pd.DataFrame(rows)
+    # Keep knl_name (the actual .co); drop the columns constant within a table.
+    df = df.drop(columns=["seed", "gfx", "mode"], errors="ignore")
+    aiter.logger.info(
+        "gemm_a4w4 (F4GEMM) summary (markdown):\n%s",
+        df.to_markdown(index=False),
+    )
+    if args.mode == "profile":
+        aiter.logger.info("profiler traces written under ./aiter_logs/")
 
 
 if __name__ == "__main__":
