@@ -122,6 +122,11 @@ on:
         type: string
         required: false
         default: ''
+    secrets:
+      DOCKERHUB_USERNAME:
+        required: false
+      DOCKERHUB_PASSWORD:
+        required: false
     outputs:
       wheel_names:
         description: 'Space-separated list of built wheel filenames'
@@ -162,11 +167,11 @@ jobs:
       USE_MANYLINUX: ${{ inputs.use_manylinux || github.event.inputs.use_manylinux || (startsWith(matrix.docker_image, 'pytorch/manylinux') && 'true') || 'false' }}
       TORCH_PIN: ${{ inputs.torch_pin || '' }}
       TORCH_INDEX_URL: ${{ inputs.torch_index_url || '' }}
-      DOCKER_USERNAME_SECRET: ${{ github.event_name == 'workflow_dispatch' && needs.ci_config.outputs.docker_username_secret || '' }}
-      DOCKER_PASSWORD_SECRET: ${{ github.event_name == 'workflow_dispatch' && needs.ci_config.outputs.docker_password_secret || '' }}
+      DOCKER_USERNAME_SECRET: ${{ (github.event_name == 'workflow_dispatch' || inputs.docker_login) && needs.ci_config.outputs.docker_username_secret || '' }}
+      DOCKER_PASSWORD_SECRET: ${{ (github.event_name == 'workflow_dispatch' || inputs.docker_login) && needs.ci_config.outputs.docker_password_secret || '' }}
       BUILD_REF: ${{ inputs.commit || github.event.inputs.commit || '' }}
       ARTIFACT_SUFFIX: ${{ inputs.artifact_suffix || '' }}
-      DOCKER_LOGIN: ${{ github.event_name == 'workflow_dispatch' || inputs.docker_login || false }}
+      DOCKER_LOGIN: ${{ github.event_name == 'workflow_dispatch' || inputs.docker_login }}
 
     steps:
       - name: Checkout aiter repo
