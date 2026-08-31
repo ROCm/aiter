@@ -211,6 +211,10 @@ def _combined_routing(
 
     pid = tl.program_id(0)
 
+    if pid != 0 and pid < blocks1a:  # noqa: SIM102
+        if tl.load(ExpertHist + pid) == 0:
+            return
+
     _expt_data_compute_stage1(
         pid,
         ExpertHist,
