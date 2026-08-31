@@ -28,7 +28,7 @@ _BUFFER_OFFSET_ABI_BYTES = 1 << 32
 
 
 class _Stage1KernelSpec:
-    __slots__ = ("kernel", "grid_x", "block_x", "waves_per_eu_hint")
+    __slots__ = ("block_x", "grid_x", "kernel", "waves_per_eu_hint")
 
     def __init__(self, kernel, grid_x, block_x, waves_per_eu_hint):
         self.kernel = kernel
@@ -339,7 +339,7 @@ def compile_mega_moe_stage1(
                         comm_ops.store_i32_system(a_payload_ready_rows, fx.Int32(0), fx.Int32(fz_tile_m))
                         comm_ops.fence_system_release()
                     fx.barrier()
-                if const_expr(cross_rank_entry_handshake):
+                if const_expr(cross_rank_entry_handshake):  # noqa: SIM102 - preserve DSL staging
                     if tid < fx.Int32(fz_npes):
                         peer = (tid + fx.Int32(fz_rank)) % fx.Int32(fz_npes)
                         comm_ops.fence_system_release()
@@ -637,7 +637,7 @@ def compile_mega_moe_stage1(
                     work = first_work + fx.Int32(batch_offset * WORK_SHARDS)
                 if work < total_work:
                     if const_expr(not ready_tile_queue):
-                        if tid == fx.Int32(0):
+                        if tid == fx.Int32(0):  # noqa: SIM102 - preserve DSL staging
                             if const_expr(
                                 not direct_fixed_slot
                                 and debug_role_mode not in (3, 4)
@@ -693,7 +693,7 @@ def compile_mega_moe_stage1(
                 )
             fx.barrier()
             first_work = Vec(work_scratch_view.load())[0]
-            if (
+            if (  # noqa: SIM102 - preserve DSL staging
                 const_expr(ready_tile_queue and debug_role_mode != 4)
                 and first_work < total_work
             ):
@@ -721,7 +721,7 @@ def compile_mega_moe_stage1(
                         )
                     fx.barrier()
             scheduled_first = Vec(work_scratch_view.load())[0]
-            if const_expr(ready_tile_queue):
+            if const_expr(ready_tile_queue):  # noqa: SIM102 - preserve DSL staging
                 if use_ready_order:
                     comm_ops.fence_system_acquire()
             _run_work_batch(first_work, scheduled_first)

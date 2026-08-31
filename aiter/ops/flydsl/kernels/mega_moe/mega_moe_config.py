@@ -326,9 +326,7 @@ def _select_bounded_stage2(
 def _select_large_stage2(
     bucket: int, sort_block_m: int, model_dim: int
 ) -> Stage2Config:
-    if bucket == 1024:
-        persist_cu = 256
-    elif bucket == 2048:
+    if bucket in (1024, 2048):
         persist_cu = 256
     elif bucket == 16384:
         persist_cu = 192

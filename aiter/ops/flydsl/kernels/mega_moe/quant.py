@@ -70,9 +70,9 @@ def build_per_1x32_mx_quant_module(n: int, quant_mode: str):
     """Return a @flyc.jit launcher for 1x32 MX quant of a [m, n] bf16 matrix."""
     assert n % 32 == 0, f"n={n} must be divisible by 32"
     need_fp4 = quant_mode == "fp4"
-    assert need_fp4 or quant_mode == "fp8", (
-        f"quant_mode must be fp4|fp8, got {quant_mode!r}"
-    )
+    assert (
+        need_fp4 or quant_mode == "fp8"
+    ), f"quant_mode must be fp4|fp8, got {quant_mode!r}"
 
     scale_n = n // GROUP
     inv_max_pos_bits = _FP4_INV_MAX_POS_BITS if need_fp4 else _FP8_E4M3_INV_MAX_POS_BITS
@@ -203,9 +203,9 @@ def build_mxfp4_moe_scale_sort_module(cols: int):
     """Build the sorted E8M0 scale-scatter launcher."""
     assert cols % GROUP == 0, f"cols={cols} must be divisible by {GROUP}"
     scale_cols = cols // GROUP
-    assert scale_cols % 8 == 0, (
-        f"cols//32={scale_cols} must be a multiple of 8 (preshuffle pack)"
-    )
+    assert (
+        scale_cols % 8 == 0
+    ), f"cols//32={scale_cols} must be a multiple of 8 (preshuffle pack)"
     n32 = scale_cols * GROUP  # bytes per 32-row tile
     words_per_tile = n32 // 4  # == scale_cols * 8
     n_word_chunks = (words_per_tile + SCALE_SORT_BLOCK - 1) // SCALE_SORT_BLOCK

@@ -124,14 +124,14 @@ class MegaMoEV2:
         self.preload_stage2_bundle()
 
     def _build_fused_stage1(self, w1, w1_scale):
+        from .mega_moe_prepare import (
+            preload_mega_moe_prepare,
+            run_mega_moe_prepare,
+        )
         from .mega_moe_stage1 import (
             preload_mega_moe_stage1_bundle,
             run_mega_moe_stage1,
             run_mega_moe_stage1_bundle,
-        )
-        from .mega_moe_prepare import (
-            preload_mega_moe_prepare,
-            run_mega_moe_prepare,
         )
 
         self.sort_block_m = 32

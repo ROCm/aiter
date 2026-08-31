@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025-2026 FlyDSL Project Contributors
+# ruff: noqa: B023
+# Nested @flyc.jit functions execute immediately inside compile-time loops.
 """Aligned common-row fusion prototype for MegaMoE Stage2.
 
 The Stage1 fanout planner lays the selected experts' common routes out in the

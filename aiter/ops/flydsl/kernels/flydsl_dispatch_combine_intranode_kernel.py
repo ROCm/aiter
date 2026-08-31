@@ -306,9 +306,7 @@ def make_dispatch_kernel(
         for src_pe in range(lane, npes, 64):
             if global_warp_id == 0:
                 recv_num_src_addr = addr_shmem_recv_num + fx.Int64(src_pe) * 4
-                signal_value = wait_i32_until_greater_than(
-                    recv_num_src_addr, 0
-                )
+                signal_value = wait_i32_until_greater_than(recv_num_src_addr, 0)
                 peer_recv_count = signal_value - 1  # undo +1 sentinel offset
                 store_i32_system(recv_num_src_addr, 0, 0)
                 atomic_add_global_at(addr_out_total_recv, peer_recv_count)

@@ -129,7 +129,7 @@ def compile_mega_moe_prepare(
         quant_producer = ticket > fx.Int32(prepare_blocks)
         quant_slot = ticket - fx.Int32(prepare_blocks + 1)
 
-        if const_expr(quant_blocks > 0):
+        if const_expr(quant_blocks > 0):  # noqa: SIM102 - preserve DSL staging
             if quant_producer:
                 quant_in = buffer_ops.create_buffer_resource_from_addr(addr_quant_in)
                 quant_out = buffer_ops.create_buffer_resource_from_addr(addr_quant_out)
