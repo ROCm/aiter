@@ -1,0 +1,81 @@
+{
+  "_comment": "Autotune configs for SonicMoE grouped GEMM kernels on MI308X (gfx942), BF16.",
+  "_grouped_gemm_kernel": {
+    "small_NK": {
+      "BLOCK_M": 64,
+      "BLOCK_N": 64,
+      "BLOCK_K": 64,
+      "GROUP_SIZE_M": 8,
+      "num_warps": 4,
+      "num_stages": 2,
+      "_note": "N<=256, K<=256, E<=8"
+    },
+    "medium_NK": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 128,
+      "BLOCK_K": 64,
+      "GROUP_SIZE_M": 8,
+      "num_warps": 8,
+      "num_stages": 2,
+      "_note": "N<=2048, K<=2048, E<=32"
+    },
+    "large_NK": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 128,
+      "BLOCK_K": 64,
+      "GROUP_SIZE_M": 8,
+      "num_warps": 4,
+      "num_stages": 2,
+      "_note": "N>=4096 or K>=4096, E>=64"
+    }
+  },
+  "_grouped_gemm_dw_kernel": {
+    "small_NK": {
+      "BLOCK_K": 64,
+      "BLOCK_N": 64,
+      "BLOCK_T": 16,
+      "num_warps": 4,
+      "num_stages": 2,
+      "_note": "N<=128, K<=128, E<=4"
+    },
+    "medium_NK": {
+      "BLOCK_K": 128,
+      "BLOCK_N": 128,
+      "BLOCK_T": 16,
+      "num_warps": 4,
+      "num_stages": 2,
+      "_note": "N<=2048, K<=2048, E<=32"
+    },
+    "large_NK": {
+      "BLOCK_K": 128,
+      "BLOCK_N": 128,
+      "BLOCK_T": 16,
+      "num_warps": 4,
+      "num_stages": 2,
+      "_note": "N>=4096, E>=64"
+    }
+  },
+  "token_gather_sum_kernel": {
+    "small_H": {
+      "BLOCK_H": 256,
+      "BLOCK_K": 1,
+      "num_warps": 4,
+      "num_stages": 4,
+      "_note": "H<=256"
+    },
+    "medium_H": {
+      "BLOCK_H": 1024,
+      "BLOCK_K": 1,
+      "num_warps": 4,
+      "num_stages": 4,
+      "_note": "H<=1024"
+    },
+    "large_H": {
+      "BLOCK_H": 4096,
+      "BLOCK_K": 4,
+      "num_warps": 4,
+      "num_stages": 4,
+      "_note": "H>=4096"
+    }
+  }
+}
