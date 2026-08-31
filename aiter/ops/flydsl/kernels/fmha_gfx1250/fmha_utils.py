@@ -270,10 +270,9 @@ Q_BPP = 2
 KV_BPP = 2
 TG_SUBQD = 128
 TG_SUBKV = 128
-WV_SUBKV = TG_SUBKV
 SU_K_N = 32
 SU_K_K = QK_HDIM
-CNT_SU = WV_SUBKV // SU_K_N
+CNT_SU = TG_SUBKV // SU_K_N
 
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 32
 
@@ -1726,7 +1725,7 @@ class TDM:
         ]
 
     @staticmethod
-    def _load_kv(
+    def load_kv(
         is_k,
         ptr_tensor,
         offset,
@@ -1749,48 +1748,6 @@ class TDM:
             TDM.build_descs(dg1, addr, fx.Int64(stride_32), lds_base, su_p_size, CNT_SU)
         )
         tdm_wait_and_barrier()
-
-    @staticmethod
-    def load_k_only(
-        ptr_K,
-        k_offset,
-        stride_k_seq,
-        stride_k_32,
-        wave_id,
-        lds_base_i32,
-        oob_dg1_list=None,
-    ):
-        TDM._load_kv(
-            True,
-            ptr_K,
-            k_offset,
-            stride_k_seq,
-            stride_k_32,
-            wave_id,
-            lds_base_i32,
-            oob_dg1_list,
-        )
-
-    @staticmethod
-    def load_v_only(
-        ptr_V,
-        v_offset,
-        stride_v_seq,
-        stride_v_32,
-        wave_id,
-        lds_base_i32,
-        oob_dg1_list=None,
-    ):
-        TDM._load_kv(
-            False,
-            ptr_V,
-            v_offset,
-            stride_v_seq,
-            stride_v_32,
-            wave_id,
-            lds_base_i32,
-            oob_dg1_list,
-        )
 
 
 _KV_SIZE = NUM_MSB * N_WMMA_K_TILES
@@ -1963,7 +1920,8 @@ def prologue_tile0(
     zero_f32 = arith.constant(0.0, type=T.f32)
     neg_inf = arith.constant(float("-inf"), type=T.f32)
     rocdl.sched_barrier(0)
-    TDM.load_k_only(
+    TDM.load_kv(
+        True,
         ctx["ptr_K"],
         ctx["k_offset"],
         ctx["stride_k_seq"],
@@ -1984,7 +1942,8 @@ def prologue_tile0(
             [[zero_v8f32] for msb in fx.range_constexpr(NUM_MSB)],
         )
         all_su_sp_tiles.append(fresh_sp)
-    TDM.load_v_only(
+    TDM.load_kv(
+        False,
         ctx["ptr_V"],
         ctx["v_offset"],
         ctx["stride_v_seq"],
@@ -2097,7 +2056,8 @@ def core_loop_setup(
         wave_id,
         dim0_stride=200,
     )
-    TDM.load_k_only(
+    TDM.load_kv(
+        True,
         ptr_K,
         k_tile1_offset,
         stride_k_seq,
@@ -2834,7 +2794,7 @@ def epilogue_write_output(
     o_elem_off = by * stride_o_head + o_tok * stride_o_seq
     oadr64 = ptr_base_i64(ptr_O) + fx.Int64(o_elem_off * 2)
     alo, ahi = split_i64_to_lo_hi(oadr64)
-    olds2 = extract_lds_base_i32(lds_alloc_v_a.get_base()) + wsgpr * LDS_D_WV_SIZE
+    olds2 = db32 + wsgpr * LDS_D_WV_SIZE
     _dg0 = Vec.from_elements([fx.Int32(1), olds2, alo, ahi], fx.Int32)
     _td1_lo_o = arith.andi(o_oob_dim1, arith.constant(0xFFFF, type=T.i32))
     _g2 = arith.shli(_td1_lo_o, arith.constant(16, type=T.i32))
