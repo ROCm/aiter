@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import sys
 
 import pytest
 import torch
@@ -321,7 +322,11 @@ def main():
         if max_err >= 0.05:
             all_pass = False
 
-    print(f"\n{'All tests PASSED' if all_pass else 'Some tests FAILED'}.")
+    if all_pass:
+        print("\nAll tests PASSED.")
+    else:
+        print("\nSome tests FAILED.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

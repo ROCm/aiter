@@ -886,6 +886,16 @@ def main():
             print(errors.to_string(index=False))
             failed_sections.append("softmax")
 
+        # Run the pytest-style topk_softmax cases so they execute in script mode too.
+        try:
+            test_topk_softmax(num_tokens=512, num_experts=64, topk=2, need_renorm=True)
+            test_topk_softmax(num_tokens=512, num_experts=64, topk=2, need_renorm=False)
+            test_topk_softmax_bf16_caller_casts()
+            print("topk_softmax direct correctness: PASS")
+        except AssertionError as exc:
+            print(f"topk_softmax direct correctness: FAIL — {exc}")
+            failed_sections.append("topk_softmax_direct")
+
     # -- topk_gating NaN/Inf robustness -----------------------------------
     if "nan" in sections:
         nan_dtypes = [d for d in dtype_list if d != torch.float32]
@@ -1051,9 +1061,16 @@ def test_topk_softmax(num_tokens, num_experts, topk, need_renorm):
 
 
 def test_topk_softmax_bf16_caller_casts():
-    """ASM topk_softmax expects fp32 logits; caller is responsible for casting bf16."""
+    """Caller must cast bf16 logits to fp32 before passing to topk_softmax.
+
+    The ASM kernel only accepts fp32. This test builds a bf16 tensor and casts
+    it to fp32 (as a real caller would), then verifies the kernel matches the
+    reference on that fp32 input. The 2e-3 tolerance reflects the bf16→fp32
+    cast rounding that propagates into the softmax output.
+    """
     torch.manual_seed(42)
-    gating_fp32 = torch.randn(32, 8, dtype=torch.float32, device="cuda")
+    gating_bf16 = torch.randn(32, 8, dtype=torch.bfloat16, device="cuda")
+    gating_fp32 = gating_bf16.float()  # the cast a caller must perform
 
     w_ref, i_ref = ref_softmax(gating_fp32, torch.empty(0, device="cuda"), 2, 1.0, True)
     w_ref, i_ref = _align_by_id(w_ref, i_ref)
