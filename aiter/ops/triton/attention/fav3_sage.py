@@ -22,9 +22,7 @@ from aiter.ops.triton.utils.config_utils import (
 )
 
 _CONFIG_NAME = "FAV3_SAGE"
-# Arches with no tuned fav3_sage table of their own read the gfx942 file. This
-# reproduces the previous `else:` branch verbatim -- a stand-in for tuning on
-# those arches, not a measured result.
+# Arches with no tuned fav3_sage table of their own read the gfx942 file
 _FALLBACK_ARCH = "gfx942"
 
 
