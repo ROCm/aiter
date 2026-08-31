@@ -173,6 +173,8 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
     # D-derived compile-time constants (closure locals baked into the kernels).
     K = N = D
     SPLIT = _split_for(D) if split is None else int(split)
+    if SPLIT < 1:
+        raise ValueError(f"split must be >= 1, got {SPLIT}")
     NRED_BLK = min(N, 256)
     # NRED_COL_TILES > 1 when N > NRED_BLK; the last tile may be partial (N not a
     # multiple of NRED_BLK, e.g. a forced split=2 at D=384). The reduce kernels
