@@ -789,7 +789,13 @@ def mhc_post_pre_unfused_hip(
 
 @benchmark()
 def test_mhc_post_pre(
-    m, hidden_size, hc_mult, fuse_rmsnorm=False, large_m=False, fn_pack_bf16=False
+    m,
+    hidden_size,
+    hc_mult,
+    fuse_rmsnorm=False,
+    large_m=False,
+    fn_pack_bf16=False,
+    fn_shuffle=False,
 ):
     """Fused mhc_post + mhc_pre: HIP ``mhc_fused_post_pre`` vs ref / unfused HIP / Triton.
 
@@ -852,6 +858,8 @@ def test_mhc_post_pre(
         hip_kwargs["norm_weight"] = norm_weight
 
     ret = {"fuse_rmsnorm": fuse_rmsnorm, "fn_pack_bf16": fn_pack_bf16}
+    if fn_shuffle:
+        ret["fn_shuffle"] = True
 
     # --fn_pack_bf16 toggles the gemm compute for all HIP paths: on -> pre-pack fn (fp32)
     # into int32 (hi<<16|lo) ONCE via mhc_pre_convert_fn and run with is_fn_pack_bf16=1 so
@@ -868,6 +876,19 @@ def test_mhc_post_pre(
     else:
         fn_gemm = fn
         pack_flag = 0
+
+    # --fn_shuffle preshuffles fn for the FUSED gemm only: fn[n][K] -> fnS[K//32][n][K%32]
+    # so a wave's fn tile is one contiguous run instead of 16 segments fn_stride apart.
+    # The unfused mhc_pre path stages fn through LDS with its own XOR swizzle and keeps
+    # the plain layout, so it still gets fn_gemm.
+    if fn_shuffle:
+        from aiter.ops.mhc import mhc_fn_shuffle_n_pad, mhc_pre_shuffle_fn_alloc
+
+        fn_fused = mhc_pre_shuffle_fn_alloc(fn, pack_flag)
+        fused_kwargs = {"fn_n_pad": mhc_fn_shuffle_n_pad(fn.shape[0])}
+    else:
+        fn_fused = fn_gemm
+        fused_kwargs = {}
 
     (
         post_mix_unfused,
@@ -898,11 +919,12 @@ def test_mhc_post_pre(
         residual_in,
         post_layer_mix,
         comb_res_mix,
-        fn_gemm,
+        fn_fused,
         hc_scale,
         hc_base,
         force_fused=True,
         is_fn_pack_bf16=pack_flag,
+        **fused_kwargs,
         **hip_kwargs,
     )
 
@@ -1063,6 +1085,15 @@ parser.add_argument(
     "wave32 bf16 WMMA (UNVERIFIED); other arches fall back to fp32.",
 )
 
+parser.add_argument(
+    "--fn_shuffle",
+    action="store_true",
+    help="Preshuffle fn for the FUSED mhc_post_pre gemm (fn[n][K] -> fnS[K//32][n][K%32]) "
+    "so a wave's fn tile is one contiguous run instead of 16 segments fn_stride apart. "
+    "Combines with --fn_pack_bf16. Fused path only; the unfused mhc_pre path keeps the "
+    "plain layout.",
+)
+
 args = parser.parse_args()
 
 df = []
@@ -1107,6 +1138,7 @@ if not args.hc_head:
                         fuse_rmsnorm=args.fuse_rmsnorm,
                         large_m=args.largeM,
                         fn_pack_bf16=args.fn_pack_bf16,
+                        fn_shuffle=args.fn_shuffle,
                     )
                     if ret.get("skipped"):
                         continue

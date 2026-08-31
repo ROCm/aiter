@@ -16,6 +16,11 @@ void mhc_pre_gemm_sqrsum(aiter_tensor_t& out,    // (split_k, m, hc_mult3) / (m,
 // Pre-convert fn (fp32) -> packed int32 (hi<<16 | lo) for the bf16 (is_fn_pack_bf16) gemm path.
 void mhc_pre_convert_fn(aiter_tensor_t& fn_packed, // (hc_mult3, hc_hidden_size) int32 out
                         aiter_tensor_t& fn);       // (hc_mult3, hc_hidden_size) fp32 in
+// Preshuffle fn for the FUSED post_pre gemm: fn[n][K] -> fnS[K/32][n][K%32], n zero-padded
+// to n_pad (a multiple of 32). Optionally packs hi<<16|lo in the same pass.
+void mhc_pre_shuffle_fn(aiter_tensor_t& fn_shuffled, // (hc_hidden_size/32, n_pad, 32) out
+                        aiter_tensor_t& fn,          // (hc_mult3, hc_hidden_size) fp32 in
+                        int is_fn_pack_bf16 = 0);
 void mhc_pre_big_fuse(aiter_tensor_t& post_mix,        // (m, hc_mult)
                       aiter_tensor_t& comb_mix,        // (m, hc_mult * hc_mult)
                       aiter_tensor_t& layer_input,     // (m, hidden_size)
@@ -71,9 +76,10 @@ void mhc_fused_post_pre_gemm_sqrsum(
     aiter_tensor_t& residual_in,     // (m, hc_mult, hidden_size)
     aiter_tensor_t& post_layer_mix,  // (m, hc_mult)
     aiter_tensor_t& comb_res_mix,    // (m, hc_mult, hc_mult)
-    aiter_tensor_t& fn,              // (hc_mult3, hc_mult * hidden_size)
+    aiter_tensor_t& fn,              // (hc_mult3, hc_mult * hidden_size); preshuffled when fn_n_pad
     int tile_m                       = 16,
     int tile_n                       = 32,
     int tile_k                       = 32,
-    int is_fn_pack_bf16              = 0);
+    int is_fn_pack_bf16              = 0,
+    int fn_n_pad                     = 0);
 } // namespace aiter

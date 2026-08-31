@@ -32,6 +32,46 @@ def mhc_pre_convert_fn(
 ) -> None: ...
 
 
+@compile_ops("module_mhc", develop=True)
+def mhc_pre_shuffle_fn(
+    fn_shuffled: Tensor,  # (hc_hidden_size // 32, n_pad, 32) out
+    fn: Tensor,  # (hc_mult3, hc_hidden_size) fp32 in
+    is_fn_pack_bf16: int = 0,
+) -> None: ...
+
+
+def mhc_fn_shuffle_n_pad(hc_mult3: int) -> int:
+    """Rows stored per K block by the preshuffled fn layout -- hc_mult3, unpadded.
+
+    Padding up to the tile_n the kernel reads would be real extra read traffic (fn is
+    re-read by every m-block), so the kernel steers the surplus lanes out of bounds
+    instead, which reads 0 exactly as the unshuffled path does.
+    """
+    return hc_mult3
+
+
+def mhc_pre_shuffle_fn_alloc(fn: torch.Tensor, is_fn_pack_bf16: int = 0) -> torch.Tensor:
+    """Allocate + fill the preshuffled fn for the FUSED post_pre gemm.
+
+    ``fn[n][K] -> fnS[K // 32][n][K % 32]``, N zero-padded to a multiple of 32. Pass the
+    result as ``fn`` together with ``fn_n_pad`` to ``mhc_fused_post_pre``. The layout is
+    independent of (tile_m, tile_n, tile_k, warp_size), so one copy serves every config;
+    it does NOT match the unfused ``mhc_pre`` path, which stages fn through LDS.
+    """
+    hc_mult3, hc_hidden_size = fn.shape
+    assert hc_hidden_size % 32 == 0, f"{hc_hidden_size=} must be divisible by 32"
+    n_rows = mhc_fn_shuffle_n_pad(hc_mult3)
+    out = torch.empty(
+        hc_hidden_size // 32,
+        n_rows,
+        32,
+        dtype=dtypes.i32 if is_fn_pack_bf16 else dtypes.fp32,
+        device=fn.device,
+    )
+    mhc_pre_shuffle_fn(out, fn, is_fn_pack_bf16)
+    return out
+
+
 def mhc_pre_convert_fn_ref(fn: torch.Tensor) -> torch.Tensor:
     """Torch equivalent of the HIP ``mhc_pre_convert_fn`` kernel: pack fp32 fn into
     int32 dwords (hi = bf16(fn) in [31:16], lo = bf16(fn - fp32(hi)) in [15:0])."""
@@ -439,6 +479,7 @@ def mhc_fused_post_pre_gemm_sqrsum(
     tile_n: int = 32,  # 16 or 32
     tile_k: int = 32,  # 32 or 64
     is_fn_pack_bf16: int = 0,
+    fn_n_pad: int = 0,  # >0: fn is preshuffled (mhc_pre_shuffle_fn_alloc)
 ) -> None: ...
 
 
@@ -459,6 +500,7 @@ def mhc_fused_post_pre_fake(
     norm_eps: float = 1e-6,
     force_fused: bool = False,
     is_fn_pack_bf16: int = 0,
+    fn_n_pad: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     m = layer_input.size(0)
     hc_mult = residual_in.size(1)
@@ -551,6 +593,7 @@ def mhc_fused_post_pre(
     norm_eps: float = 1e-6,
     force_fused: bool = False,
     is_fn_pack_bf16: int = 0,
+    fn_n_pad: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused mhc_post + next mhc_pre (HIP), mirroring ``mhc_pre`` with post-step inputs.
 
@@ -628,12 +671,27 @@ def mhc_fused_post_pre(
         f"residual_in shape mismatch: expected ({m}, {hc_mult}, {hidden_size}), "
         f"got {tuple(residual_in.shape)}"
     )
-    hc_mult3 = fn.size(0)
-    assert hc_mult3 == hc_mult * 2 + hc_mult * hc_mult or (
-        hc_mult3 == hc_mult and sinkhorn_repeat == 0
-    )
     hc_hidden_size = hc_mult * hidden_size
-    assert fn.size(1) == hc_hidden_size
+    if fn_n_pad:
+        # Preshuffled fn: (hc_hidden_size // 32, fn_n_pad, 32); hc_mult3 is no longer a
+        # dimension of it, so derive it from hc_mult (the plain-layout branch derives it
+        # from fn.size(0) and asserts the same identity).
+        hc_mult3 = hc_mult * 2 + hc_mult * hc_mult
+        assert fn.shape == (
+            hc_hidden_size // 32,
+            fn_n_pad,
+            32,
+        ), (
+            f"preshuffled fn shape mismatch: expected ({hc_hidden_size // 32}, "
+            f"{fn_n_pad}, 32), got {tuple(fn.shape)}"
+        )
+        assert fn_n_pad == hc_mult3
+    else:
+        hc_mult3 = fn.size(0)
+        assert hc_mult3 == hc_mult * 2 + hc_mult * hc_mult or (
+            hc_mult3 == hc_mult and sinkhorn_repeat == 0
+        )
+        assert fn.size(1) == hc_hidden_size
 
     if post_layer_mix.ndim == 3:
         post_layer_mix = post_layer_mix.squeeze(-1)
@@ -672,6 +730,7 @@ def mhc_fused_post_pre(
         selected_tile_n,
         selected_tile_k,
         is_fn_pack_bf16,
+        fn_n_pad,
     )
 
     post_mix = torch.empty(m, hc_mult, 1, dtype=dtypes.fp32, device=device)
