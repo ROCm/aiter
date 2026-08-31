@@ -46,6 +46,9 @@ try:
     from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
         kernels_list_8wave as kernels_list_flydsl_8wave,
     )
+    from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
+        kernels_list_splitk as kernels_list_flydsl_splitk,
+    )
 except ImportError:
     print(
         "[FlyDSL] flydsl_gemm_a8w8_bpreshuffle_common.py not found, flydsl tuning disabled"
@@ -53,6 +56,7 @@ except ImportError:
     FLYDSL_PIPELINES = ()
     kernels_list_flydsl = {}
     kernels_list_flydsl_8wave = {}
+    kernels_list_flydsl_splitk = {}
 
     def k_split_candidates(*_a, **_kw):
         return []
@@ -178,16 +182,44 @@ def run_gemm_flydsl_8wave(
     return out
 
 
+def run_gemm_flydsl_splitk(x, weight_shuffle, x_scale, w_scale, out, kernel_id):
+    from aiter.ops.flydsl.kernels.preshuffle_gemm_splitk_op import (
+        flydsl_preshuffle_gemm_splitk_a8,
+    )
+
+    ki = kernels_list_flydsl_splitk[kernel_id]
+    flydsl_preshuffle_gemm_splitk_a8(
+        x,
+        weight_shuffle,
+        x_scale,
+        w_scale,
+        out,
+        ki.tile_m,
+        ki.tile_n,
+        ki.tile_k,
+        ki.split_k,
+        use_async_copy=ki.use_async_copy,
+        waves_per_eu=ki.waves_per_eu,
+        xcd_swizzle=ki.xcd_swizzle,
+        lds_stage=ki.lds_stage,
+        enable_scheduler=ki.enable_scheduler,
+        scale_mode=ki.scale_mode,
+        use_m_bounded_store=ki.use_m_bounded_store,
+    )
+    return out
+
+
 # Pipeline name -> (runner, is-it-usable-right-now). The availability probe is a
 # callable, and deliberately different per pipeline: preshuffle needs the symbol
-# the is_flydsl_available() gate above binds at import, while 8wave imports its
-# entry point lazily inside its runner.
+# the is_flydsl_available() gate above binds at import, while 8wave and splitk
+# import their entry points lazily inside their runners.
 _FLYDSL_PIPELINE_RUNNERS = {
     "preshuffle": (
         run_gemm_flydsl,
         lambda: "flydsl_preshuffle_gemm_a8" in globals(),
     ),
     "8wave": (run_gemm_flydsl_8wave, is_flydsl_available),
+    "splitk": (run_gemm_flydsl_splitk, is_flydsl_available),
 }
 
 # The tuner speaks torch dtypes, Pipeline.q_dtypes_w speaks names (that module

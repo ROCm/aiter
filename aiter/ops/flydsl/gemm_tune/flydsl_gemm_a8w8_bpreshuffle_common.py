@@ -3,11 +3,12 @@
 
 """Tune spaces for every FlyDSL a8w8 (ptpc) bpreshuffle pipeline on CDNA.
 
-One operator, two pipelines, swept together under the same ``flydsl`` libtype so
-a single ``--libtype flydsl`` run picks one winner per shape:
+One operator, three pipelines, swept together under the same ``flydsl`` libtype
+so a single ``--libtype flydsl`` run picks one winner per shape:
 
 * ``preshuffle`` -- 4-wave MFMA, gfx942 + gfx950, fp8 or int8 weights.
 * ``8wave``      -- 8-wave CDNA4 ``MFMA_Scale``, gfx950 only, fp8 only.
+* ``splitk``     -- workspace partial + reduce, gfx950 only, fp8 only.
 
 Each exposes the same pair -- a ``{kernelId: instance}`` table and a
 ``fits(ki, M, N, K)`` predicate -- and both are listed in :data:`PIPELINES`, so
@@ -217,7 +218,9 @@ def _padded_m(M: int) -> int:
         return (M + 127) // 128 * 128
 
 
-def kernel_fits_shape(ki: kernelInstance, M: int, N: int, K: int) -> bool:
+def kernel_fits_shape(
+    ki: kernelInstance, M: int, N: int, K: int, *, lds_bytes: int | None = None
+) -> bool:
     """Whether a preshuffle candidate is worth tuning for this shape.
 
     Every predicate is verbatim from the tuner's inline filter, in the original
@@ -226,8 +229,16 @@ def kernel_fits_shape(ki: kernelInstance, M: int, N: int, K: int) -> bool:
     invalidates the committed tuned CSVs and requires a re-tune. It lives beside
     ``kernels_list`` only so both a8w8 bpreshuffle pipelines expose the same
     ``(kernels_list, kernel_fits_shape)`` pair.
+
+    ``lds_bytes``, when given, overrides ``kernel_instance_estimated_lds_bytes(ki)``
+    for the LDS clause only -- lets a sibling family (e.g. the a4w4/mxfp4
+    split-K candidates, whose packed-4-bit A-tile footprint this module's
+    dtype table does not represent) delegate to these audited clauses without
+    misrepresenting ``ki.q_dtype_a``.
     """
-    if kernel_instance_estimated_lds_bytes(ki) > max_lds_bytes_for_tune():
+    if (
+        lds_bytes if lds_bytes is not None else kernel_instance_estimated_lds_bytes(ki)
+    ) > max_lds_bytes_for_tune():
         return False
     if N % ki.tile_n != 0 or K % ki.tile_k != 0:
         return False
@@ -255,6 +266,13 @@ def kernel_fits_shape(ki: kernelInstance, M: int, N: int, K: int) -> bool:
 # Tiles shared by gfx942 and gfx950
 _base_tiles_common = [
     # small M (decode / token-gen)
+    # narrow tile_n for small-M fp8 decode; tile_m<=32 so the
+    # existing kernel_fits_shape M-gates (>=2048/4096/8192) auto-restrict these
+    # to the decode regime.
+    (16,  16,  256), (16,  16,  512),
+    (16,  32,  256), (16,  32,  512),
+    (32,  16,  256), (32,  16,  512),
+    (32,  32,  256), (32,  32,  512),
     (16,  64,  256), (16,  64,  512),
     (16,  128, 256), (16,  128, 512), (16,  256, 256), (16,  256, 512),
     (16,  512, 256), (16,  192, 256),
@@ -525,6 +543,226 @@ kernels_list_8wave: dict[int, EightWaveKernelInstance] = (
 
 
 # ===========================================================================
+# Pipeline 3: split-K (workspace partial + reduce), gfx950 only
+# ===========================================================================
+
+KERNEL_ID_BASE_SPLITK = 2_000_000
+KERNEL_ID_BASE_SPLITK_BLOCKSCALE = 3_000_000
+# a4w4 (mxfp4) split-K claims 4_000_000 in its own module's ID space; skip past
+# it here too even though the two dicts never collide (separate module).
+KERNEL_ID_BASE_SPLITK_MX128 = 5_000_000
+NAME_PREFIX_SPLITK = "flydsl_bpreshuffle_splitk"
+
+# Narrow decode tiles -- same set Part A added to _base_tiles_common.
+_SPLITK_TILES = [
+    (16, 16, 256),
+    (16, 16, 512),
+    (16, 32, 256),
+    (16, 32, 512),
+    (32, 16, 256),
+    (32, 16, 512),
+    (32, 32, 256),
+    (32, 32, 512),
+]
+# Non-trivial split factors used to enumerate split-K tuning candidates; sk=1 is
+# the non-split pipeline, handled separately, so it is excluded here. With padded
+# (ragged) split-K these need not divide the K-tile count, so a clean shape-agnostic
+# default is safe. Override for a tuning run via AITER_FLYDSL_SPLITK_VALS, e.g.
+# AITER_FLYDSL_SPLITK_VALS="2,4,8,16,32".
+_SPLIT_K_VALS_DEFAULT = (2, 4, 8, 16)
+
+
+def _resolve_split_k_vals():
+    raw = os.getenv("AITER_FLYDSL_SPLITK_VALS")
+    if not raw:
+        return _SPLIT_K_VALS_DEFAULT
+    vals = tuple(int(x) for x in raw.split(",") if x.strip())
+    # Keep only genuine (non-trivial) splits; sk=1 is the separate non-split path.
+    vals = tuple(v for v in vals if v >= 2)
+    return vals or _SPLIT_K_VALS_DEFAULT
+
+
+_SPLIT_K_VALS = _resolve_split_k_vals()
+# tk=128 variants, added for the blockscale/mx128 builds only -- see
+# _build_kernels_list_splitk callers.
+_SPLITK_TILES_128 = [(16, 16, 128), (16, 32, 128), (32, 16, 128), (32, 32, 128)]
+
+# "sm" token in SplitKKernelInstance.name: the third code, "mx", is mx128
+# (E8M0 128-block hardware scale) -- see the split-K pipeline section below.
+# Anything not in this table (i.e. "epilogue") falls back to "ep".
+_SCALE_MODE_SPLITK_CODE = {"blockscale": "bs", "mx128": "mx"}
+
+
+@dataclass
+class SplitKKernelInstance:
+    tile_m: int
+    tile_n: int
+    tile_k: int
+    split_k: int
+    q_dtype_a: str = "fp8"
+    q_dtype_w: str = "fp8"
+    dtype: str = "bf16"
+    use_async_copy: int = 0
+    waves_per_eu: int = 0
+    xcd_swizzle: int = 0
+    lds_stage: int = 2
+    sScheduler: str = "Default"
+    scale_mode: str = "epilogue"
+    use_m_bounded_store: bool = False
+
+    @property
+    def enable_scheduler(self) -> bool:
+        """Map the scheduler name token to compile_preshuffle_gemm(enable_scheduler=)."""
+        return str(self.sScheduler).lower() != "off"
+
+    @property
+    def name(self) -> str:
+        qa = _DTYPE_SHORT.get(self.q_dtype_a, self.q_dtype_a.upper())
+        qw = _DTYPE_SHORT.get(self.q_dtype_w, self.q_dtype_w.upper())
+        dt = _DTYPE_SHORT.get(self.dtype, self.dtype.upper())
+        return "_".join(
+            [
+                "flydsl",
+                "bpreshuffle",
+                "splitk",
+                "x".join(map(str, [self.tile_m, self.tile_n, self.tile_k])),
+                f"sk{self.split_k}",
+                qa,
+                qw,
+                dt,
+                "x".join(
+                    map(
+                        str,
+                        [
+                            self.use_async_copy,
+                            self.waves_per_eu,
+                            self.xcd_swizzle,
+                            self.lds_stage,
+                        ],
+                    )
+                ),
+                self.sScheduler.lower(),
+                f"sm{_SCALE_MODE_SPLITK_CODE.get(self.scale_mode, 'ep')}",
+                f"mb{int(self.use_m_bounded_store)}",
+            ]
+        )
+
+
+def kernel_fits_shape_splitk(ki: SplitKKernelInstance, M: int, N: int, K: int) -> bool:
+    """Whether a split-K candidate is worth tuning for this shape.
+
+    Reuses ``kernel_fits_shape`` (via an equivalent non-split ``kernelInstance``)
+    so the audited LDS/divisibility/num_ctas/M-gate logic is inherited unchanged;
+    the extra clause is the split-K kernel's own validity constraint.
+    """
+    equiv = _ki(
+        ki.tile_m,
+        ki.tile_n,
+        ki.tile_k,
+        ki.use_async_copy,
+        ki.waves_per_eu,
+        ki.xcd_swizzle,
+        lds_stage=ki.lds_stage,
+        q_dtype_a=ki.q_dtype_a,
+        q_dtype_w=ki.q_dtype_w,
+        dtype=ki.dtype,
+        scheduler=ki.sScheduler,
+    )
+    # split_k need not divide the K-tile count: the kernel pads the tail split and
+    # zeroes the overflow tiles. It only has to have at least one tile per split.
+    if not (kernel_fits_shape(equiv, M, N, K) and 1 <= ki.split_k <= K // ki.tile_k):
+        return False
+    # async copy (buffer_load_lds) is a 128-bit LDS-direct DMA that only gfx950 can
+    # legalize; gfx942 caps direct-to-LDS loads at 4 bytes, so acp=1 aborts in LLVM
+    # codegen. Prune those candidates on gfx942 -- the synchronous load path is legal.
+    if ki.use_async_copy and get_gfx().startswith("gfx942"):
+        return False
+    # mx128 shares blockscale's [K/128, M] / [N/128, K/128] scale geometry (fp8
+    # operands, tile_k a multiple of 128) -- only the scale byte encoding
+    # differs, which the runtime kernel handles, not this shape predicate.
+    if ki.scale_mode in ("blockscale", "mx128") and (
+        ki.q_dtype_a != "fp8" or ki.tile_k % 128 != 0
+    ):
+        return False
+    # m_pad == M => the bounded-store predicate is a provable no-op; prune.
+    return not (ki.use_m_bounded_store and M % ki.tile_m == 0)
+
+
+def is_splitk_enabled() -> bool:
+    """Split-K candidates: gfx950 (SILOTIGER-915) and gfx942 (epilogue + blockscale).
+
+    mx128 needs the gfx950 hardware scale operand (no software dequant path), so its
+    kernel list is additionally gated gfx950-only where it is built, below.
+    """
+    return get_gfx().startswith(("gfx950", "gfx942"))
+
+
+def _build_kernels_list_splitk(
+    scale_mode: str = "epilogue",
+    tiles=_SPLITK_TILES,
+    split_k_vals=_SPLIT_K_VALS,
+) -> dict[int, SplitKKernelInstance]:
+    base = {
+        "blockscale": KERNEL_ID_BASE_SPLITK_BLOCKSCALE,
+        "mx128": KERNEL_ID_BASE_SPLITK_MX128,
+    }.get(scale_mode, KERNEL_ID_BASE_SPLITK)
+    kl: dict[int, SplitKKernelInstance] = {}
+    idx = base
+    for lds in _LDS_STAGES:
+        for wpe in _WAVES_PER_EU:
+            for acp in _ASYNC_COPY_VALS:
+                for xcd in _XCD_SWIZZLE_VALS:
+                    for sk in split_k_vals:
+                        for tm, tn, tk in tiles:
+                            if wpe > 0 and wpe > _estimate_max_wpe(tm, tn):
+                                continue
+                            for umbs in (False, True):
+                                kl[idx] = SplitKKernelInstance(
+                                    tm,
+                                    tn,
+                                    tk,
+                                    sk,
+                                    use_async_copy=acp,
+                                    waves_per_eu=wpe,
+                                    xcd_swizzle=xcd,
+                                    lds_stage=lds,
+                                    scale_mode=scale_mode,
+                                    use_m_bounded_store=umbs,
+                                )
+                                idx += 1
+    return kl
+
+
+kernels_list_splitk: dict[int, SplitKKernelInstance] = (
+    _build_kernels_list_splitk() if is_splitk_enabled() else {}
+)
+kernels_list_splitk_blockscale: dict[int, SplitKKernelInstance] = (
+    _build_kernels_list_splitk(
+        "blockscale",
+        tiles=_SPLITK_TILES + _SPLITK_TILES_128,
+        split_k_vals=_SPLIT_K_VALS + (1,),
+    )
+    if is_splitk_enabled()
+    else {}
+)
+# Same tile/split_k geometry as blockscale: the tile_m==16/num_acc_n==1 gate
+# that once restricted mx128 lived in the compiled kernel itself and has since
+# been lifted (arbitrary tile_m/num_acc_n via a per-sub-tile scaled MFMA), so
+# there is no extra tile restriction to apply here beyond blockscale's own.
+kernels_list_splitk_mx128: dict[int, SplitKKernelInstance] = (
+    _build_kernels_list_splitk(
+        "mx128",
+        tiles=_SPLITK_TILES + _SPLITK_TILES_128,
+        split_k_vals=_SPLIT_K_VALS + (1,),
+    )
+    # mx128 has no gfx942 path (it needs the hardware scale operand), so it stays
+    # gfx950-only even though is_splitk_enabled() now also covers gfx942.
+    if is_splitk_enabled() and get_gfx().startswith("gfx950")
+    else {}
+)
+
+
+# ===========================================================================
 # The protocol the tuner iterates
 # ===========================================================================
 
@@ -545,9 +783,29 @@ class Pipeline:
 
 
 # Order is load-bearing: it is the order candidates are emitted per shape, and
-# preshuffle-before-8wave matches what the tuner produced before PIPELINES
-# existed.
+# preshuffle-before-8wave-before-splitk matches what the tuner produced before
+# PIPELINES existed (for the first two) and appends the newest pipeline last.
 PIPELINES: tuple[Pipeline, ...] = (
     Pipeline("preshuffle", kernels_list, kernel_fits_shape, ("fp8", "int8")),
     Pipeline("8wave", kernels_list_8wave, kernel_fits_shape_8wave, ("fp8",)),
+    Pipeline("splitk", kernels_list_splitk, kernel_fits_shape_splitk, ("fp8",)),
+)
+
+# Not part of PIPELINES (that stays epilogue-only); a separate tuner script
+# imports this to register the blockscale split-K variant on its own.
+SPLITK_BLOCKSCALE_PIPELINE = Pipeline(
+    "splitk_blockscale",
+    kernels_list_splitk_blockscale,
+    kernel_fits_shape_splitk,
+    ("fp8",),
+)
+
+# Third scale mode of the same split-K family, same reason for staying out of
+# PIPELINES: the mx128 (E8M0 128-block hardware scale) tuner script imports
+# this to register its own variant.
+SPLITK_MX128_PIPELINE = Pipeline(
+    "splitk_mx128",
+    kernels_list_splitk_mx128,
+    kernel_fits_shape_splitk,
+    ("fp8",),
 )

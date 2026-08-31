@@ -38,7 +38,22 @@ if is_flydsl_available():
         )
 
     from .fmha_kernels import flydsl_flash_attn_func
-    from .gemm_kernels import flydsl_hgemm, flydsl_preshuffle_gemm_a8
+    from .gemm_kernels import (
+        ActivationSource,
+        BlockMfmaDecodeConfig,
+        ContractionMode,
+        DecodeConfig,
+        OutputRounding,
+        ReductionMode,
+        WaveDecodeConfig,
+        compile_gemm_decode_bf16,
+        flydsl_hgemm,
+        flydsl_preshuffle_gemm_a8,
+        flydsl_small_m_hgemm,
+        gemm_decode_bf16,
+        get_decode_arch_traits,
+        iter_gemm_decode_configs,
+    )
     from .kernels.mqa_logits.fp8_mqa_logits import (
         DEFAULT_VARIANT as FP8_MQA_LOGITS_DEFAULT_VARIANT,
     )
@@ -65,6 +80,14 @@ if is_flydsl_available():
     __all__ += [
         "FP8_MQA_LOGITS_DEFAULT_VARIANT",
         "FP8_MQA_LOGITS_VARIANTS",
+        "ActivationSource",
+        "BlockMfmaDecodeConfig",
+        "ContractionMode",
+        "DecodeConfig",
+        "OutputRounding",
+        "ReductionMode",
+        "WaveDecodeConfig",
+        "compile_gemm_decode_bf16",
         "compute_varqlen_windows",
         "flydsl_flash_attn_func",
         "flydsl_fp8_mqa_logits",
@@ -77,5 +100,9 @@ if is_flydsl_available():
         "flydsl_pa_mqa_logits_fp4_varqlen",
         "flydsl_preshuffle_gemm_a8",
         "flydsl_qk_norm_rope_quant",
+        "flydsl_small_m_hgemm",
+        "gemm_decode_bf16",
+        "get_decode_arch_traits",
+        "iter_gemm_decode_configs",
         # "flydsl_gdr_decode",
     ]

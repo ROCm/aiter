@@ -59,17 +59,21 @@ logger = logging.getLogger("aiter")
 #   gemm_a8w8_blockscale_tune.py covers cktile and standard bpreshuffle
 #   variants via --libtype all, but it writes to AITER_CONFIG_GEMM_A8W8_BLOCKSCALE.
 #   The blockscale_bpreshuffle family uses a separate CSV
-#   (AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE) that no existing
-#   .py script writes to — those modules cannot be pretuned until a dedicated
-#   tune script is added.
+#   (AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE). The non-cktile
+#   variant now has a dedicated tuner,
+#   csrc/ck_gemm_a8w8_blockscale_bpreshuffle/gemm_a8w8_blockscale_bpreshuffle_tune.py
+#   (FlyDSL blockscale split-K only, sweeps SPLITK_BLOCKSCALE_PIPELINE) —
+#   its own module entry's srcs already point at the matching `_tune.cu` name,
+#   so ``_get_tune_script`` resolves it directly and no fallback mapping is
+#   needed for it. The cktile variant still has no tune script writing to that
+#   CSV, so it stays unsupported.
 # ---------------------------------------------------------------------------
 _SCRIPT_FALLBACK: dict = {
     # cktile variant: covered by blockscale parent tuner (--libtype all)
     "module_gemm_a8w8_blockscale_cktile_tune": "module_gemm_a8w8_blockscale_tune",
     # bpreshuffle_cktile: covered by bpreshuffle parent tuner
     "module_gemm_a8w8_bpreshuffle_cktile_tune": "module_gemm_a8w8_bpreshuffle_tune",
-    # blockscale_bpreshuffle variants: no tune script writes to the bpreshuffle CSV
-    "module_gemm_a8w8_blockscale_bpreshuffle_tune": None,
+    # blockscale_bpreshuffle cktile: no tune script writes to the bpreshuffle CSV
     "module_gemm_a8w8_blockscale_bpreshuffle_cktile_tune": None,
 }
 
