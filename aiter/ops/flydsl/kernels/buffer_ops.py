@@ -97,6 +97,7 @@ def _unwrap_value(value):
     - FlyDSL ArithValue (has ._value)
     - flyc DSL Numeric like fx.Int32 (has .ir_value() method)
     - flyc ArithValue (is already ir.Value subclass)
+    - a bare single-result OpView (has .result), e.g. ``arith.TruncIOp(...)``
     """
     # DSL Numeric (Int32, Float32, etc.) — use ir_value() to materialize
     if hasattr(value, "ir_value") and not isinstance(value, ir.Value):
@@ -106,6 +107,8 @@ def _unwrap_value(value):
     while depth < max_depth and not isinstance(value, ir.Value):
         if hasattr(value, "_value"):
             value = value._value
+        elif hasattr(value, "result"):
+            value = value.result
         elif hasattr(value, "value"):
             value = value.value
         else:

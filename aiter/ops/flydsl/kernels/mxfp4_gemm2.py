@@ -163,7 +163,7 @@ def compile_gemm2_a4w4_port(
         _aq_num = arith.index_cast(T.index, _raw(i32_max_m_blocks)) * fx.Index(
             BM * _K_HALF
         )
-        aq_rsrc = _buffer_rsrc(arg_aq, _aq_num)
+        aq_rsrc = rocdl.get_buffer_rsrc(_buffer_rsrc(arg_aq, _aq_num))
         lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
         saq_base_i32 = fx.Int32(fx.ptrtoint(lds_raw_ptr))
 

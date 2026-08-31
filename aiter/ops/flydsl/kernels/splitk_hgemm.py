@@ -262,6 +262,10 @@ def compile_hgemm_kernel(
         C_ = GTensor(C, dtype=dtype_, shape=(-1, n))
         if const_expr(HAS_BIAS):
             BIAS_ = GTensor(BIAS, dtype=dtype_, shape=(n,))
+
+        a_rsrc_raw = rocdl.get_buffer_rsrc(A_.rsrc)
+        b_rsrc_raw = rocdl.get_buffer_rsrc(B_.rsrc)
+
         lds = fx.SharedAllocator().allocate(SharedStorage)
         a_lds_ptr = lds.pipeline.a_lds.peek().ptr
         c_lds_ptr = lds.c_lds.peek().ptr
@@ -580,7 +584,7 @@ def compile_hgemm_kernel(
                 lds_ptr = buffer_ops.get_element_ptr(
                     lds_ptr, static_byte_offset=BLOCK_THREADS * DMA_BYTES
                 )
-            buffer_load_lds_inline(A_.rsrc, lds_ptr, global_offset)
+            buffer_load_lds_inline(a_rsrc_raw, lds_ptr, global_offset)
             return lds_ptr
 
         def ldg_sts_a_async(k_offset, lds_stage):
@@ -614,7 +618,7 @@ def compile_hgemm_kernel(
                 lds_ptr = buffer_ops.get_element_ptr(
                     lds_ptr, static_byte_offset=BLOCK_THREADS * DMA_BYTES
                 )
-            buffer_load_lds_inline(B_.rsrc, lds_ptr, global_offset)
+            buffer_load_lds_inline(b_rsrc_raw, lds_ptr, global_offset)
             return lds_ptr
 
         def ldg_sts_b_async(k_offset, lds_stage):

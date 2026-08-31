@@ -566,6 +566,9 @@ def compile_small_m_hgemm_kernel(
         C_ = GTensor(C, dtype=dtype_, shape=(-1, n))
         BIAS_ = GTensor(BIAS, dtype=dtype_, shape=(n,))
 
+        a_rsrc_raw = rocdl.get_buffer_rsrc(A_.rsrc)
+        b_rsrc_raw = rocdl.get_buffer_rsrc(B_.rsrc)
+
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         a_lds_ptr = lds.a_lds.ptr
         a_lds_i64 = fx.Int64(fx.ptrtoint(a_lds_ptr))
@@ -886,7 +889,7 @@ def compile_small_m_hgemm_kernel(
                         )
                         lds_ptr = llvm.inttoptr(lds_ptr_type, lds_addr_)
                         rocdl.raw_ptr_buffer_load_lds(
-                            A_.rsrc,
+                            a_rsrc_raw,
                             lds_ptr,
                             arith.constant(DMA_BYTES, type=T.i32),
                             global_offset,
@@ -1110,7 +1113,7 @@ def compile_small_m_hgemm_kernel(
                         )
                         lds_ptr = llvm.inttoptr(lds_ptr_type, lds_addr_)
                         rocdl.raw_ptr_buffer_load_lds(
-                            B_.rsrc,
+                            b_rsrc_raw,
                             lds_ptr,
                             arith.constant(DMA_BYTES, type=T.i32),
                             global_offset,
