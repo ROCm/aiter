@@ -20,6 +20,11 @@ def is_fp4_avail():
     return get_arch() in ("gfx950", "gfx1250")
 
 
+def is_cdna4():
+    # CDNA4 kernels target gfx950 family.
+    return get_arch() in ("gfx950",)
+
+
 def is_fp8_avail():
     return get_arch() in ("gfx942", "gfx950", "gfx1250", "gfx1200", "gfx1201")
 
