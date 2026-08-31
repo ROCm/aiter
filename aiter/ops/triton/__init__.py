@@ -36,6 +36,18 @@ __all__ = []
 if quant is not None:
     __all__.append("quant")
 
+try:
+    from .cross_entropy import (
+        cross_entropy_backward as cross_entropy_backward,
+    )
+    from .cross_entropy import (
+        cross_entropy_forward as cross_entropy_forward,
+    )
+
+    __all__.extend(["cross_entropy_backward", "cross_entropy_forward"])
+except (ImportError, AttributeError):
+    pass
+
 if _COMMS_AVAILABLE:
     __all__.extend(
         [
@@ -123,6 +135,7 @@ _BACKWARD_COMPAT_MAP = {
     "prefill_attention": "attention.prefill_attention",
     "unified_attention_sparse_mla": "attention.unified_attention_sparse_mla",
     "unified_attention": "attention.unified_attention",
+    "mxfp8_attention": "attention.mxfp8_attention",
     # Fusions modules (fusions/)
     "fused_kv_cache": "fusions.fused_kv_cache",
     "fused_mul_add": "fusions.fused_mul_add",
@@ -140,11 +153,11 @@ _BACKWARD_COMPAT_MAP = {
     "fused_qkv_split_qk_rope": "rope.fused_qkv_split_qk_rope",
     # Utils modules (utils/)
     "common_utils": "utils.common_utils",
-    "core": "utils.core",
+    "config_utils": "utils.config_utils",
     "device_info": "utils.device_info",
     "gmm_common": "utils.gmm_common",
     "logger": "utils.logger",
-    "mha_kernel_utils": "utils.mha_kernel_utils",
+    "mha_kernel_utils": "utils._triton.mha_kernel_utils",
     "moe_common": "utils.moe_common",
     "types": "utils.types",
     # Quant modules (quant/)
