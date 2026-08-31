@@ -42,145 +42,139 @@ CACHE_ROW = 584  # TOKEN_BYTES + 8 scale bytes
 
 
 @triton.jit
-def _ocp_to_fnuz_kernel(
-    cache_ptr,
-    scale_ptr,
-    n_tokens,
-    block_size: tl.constexpr,
-    HAS_SCALE: tl.constexpr,
-    NOPE: tl.constexpr,
-    ROW: tl.constexpr,
-    TOK: tl.constexpr,
-    BLK: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    if pid >= n_tokens:
-        return
-    blk = pid // block_size
-    pos = pid % block_size
-    base = blk * (block_size * ROW) + pos * TOK
-
-    offs = tl.arange(0, BLK)
-    mask = offs < NOPE
-    raw = tl.load(cache_ptr + base + offs, mask=mask, other=0)
-    v = raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
-    # The kernel's _flush_nan: NaN becomes 0 rather than propagating.
-    v = tl.where(v != v, 0.0, v)
-    if HAS_SCALE:
-        # UE8M0 exponent byte per 64-element block. No OCP->fnuz term here: the
-        # kernel's bias_f32=1.0 only compensates for gfx942's cvt_pk_f32_fp8 being
-        # an *fnuz* instruction reading OCP bytes at half value, and float8e4nv
-        # above already decodes with the OCP bias.
-        sblk = offs // 64
-        enc = tl.load(scale_ptr + blk * (block_size * 8) + pos * 8 + sblk,
-                      mask=mask, other=127).to(tl.float32)
-        v = v * tl.exp2(enc - 127.0)
-    out = v.to(tl.float8e4b8).to(tl.uint8, bitcast=True)
-    tl.store(cache_ptr + base + offs, out, mask=mask)
-
-
-def convert_extra_cache_(cache: torch.Tensor, *, has_scale: bool = False) -> torch.Tensor:
-    """In-place OCP -> fnuz on the NoPE bytes of a packed region1 cache.
-
-    ``cache`` is ``[num_blocks, block_size, 584]`` uint8 as produced by
-    ``pack_fp8_ds_mla_cache(..., is_extra=True)``. Pass ``has_scale=True`` when the
-    UE8M0 trailer is not all 127, so the per-block exponent gets folded in.
-    """
-    assert cache.dtype == torch.uint8 and cache.ndim == 3
-    assert cache.shape[2] == CACHE_ROW, f"expected row {CACHE_ROW}, got {cache.shape[2]}"
-    num_blocks, block_size, _ = cache.shape
-    n_tokens = num_blocks * block_size
-    flat = cache.view(-1)
-    # Scale trailer sits after the block's token records; same buffer, own offset.
-    scale_view = flat[block_size * TOKEN_BYTES :] if has_scale else flat
-    _ocp_to_fnuz_kernel[(n_tokens,)](
-        flat,
-        scale_view,
-        n_tokens,
-        block_size=block_size,
-        HAS_SCALE=has_scale,
-        NOPE=NOPE_BYTES,
-        ROW=CACHE_ROW,
-        TOK=TOKEN_BYTES,
-        BLK=512,
-        num_warps=4,
-    )
-    return cache
-
-
-@triton.jit
-def _rope_bf16_to_fp8_kernel(
+def _convert_kernel(
     u8_ptr,
     i16_ptr,
     n_tokens,
-    block_size: tl.constexpr,
+    BS: tl.constexpr,
+    DO_NOPE: tl.constexpr,
+    DO_ROPE: tl.constexpr,
+    HAS_SCALE: tl.constexpr,
     NOPE: tl.constexpr,
     ROPE: tl.constexpr,
     ROW: tl.constexpr,
     TOK: tl.constexpr,
+    TOKS: tl.constexpr,
+    NBLK: tl.constexpr,
+    EXACT: tl.constexpr,
 ):
+    """Both conversions in one pass over a token record.
+
+    A token's NoPE bytes and its RoPE tail are adjacent, so doing them together
+    reads the record once instead of twice. ``TOKS`` tokens per program is what
+    makes this bandwidth-bound rather than launch-bound: one token is 448 B of NoPE
+    or 128 B of RoPE, far too little to fill a wave.
+    """
     pid = tl.program_id(0)
-    if pid >= n_tokens:
-        return
-    blk = pid // block_size
-    pos = pid % block_size
-    # bf16 source: 2 bytes per element, so index the i16 view.
-    src = (blk * (block_size * ROW) + pos * TOK + NOPE) // 2
-    offs = tl.arange(0, ROPE)
-    bits = tl.load(i16_ptr + src + offs)
-    v = bits.to(tl.bfloat16, bitcast=True).to(tl.float32)
-    v = tl.where(v != v, 0.0, v)
-    out = v.to(tl.float8e4b8).to(tl.uint8, bitcast=True)
-    # fp8 needs only ROPE bytes, so it lands at the front of the 2*ROPE the bf16
-    # occupied -- exactly where blocks 0..6's DMA addressing puts block 7.
-    dst = blk * (block_size * ROW) + pos * TOK + NOPE
-    tl.store(u8_ptr + dst + offs, out)
+    t = (pid * TOKS + tl.arange(0, TOKS)).to(tl.int32)
+    # Cache sizes are block-aligned, so the tail mask is normally dead weight on
+    # every access; EXACT lets it fold away.
+    tm = tl.full((TOKS,), 1, tl.int1) if EXACT else t < n_tokens
+    # BS is constexpr and a power of two, so these are a shift and a mask rather
+    # than the integer divide a runtime block_size would cost per token.
+    blk = t // BS
+    pos = t % BS
+    base = blk * (BS * ROW) + pos * TOK
+
+    if DO_NOPE:
+        off = tl.arange(0, NBLK).to(tl.int32)
+        m = tm[:, None] & (off[None, :] < NOPE)
+        a = base[:, None] + off[None, :]
+        v = tl.load(u8_ptr + a, mask=m, other=0).to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        v = tl.where(v != v, 0.0, v)
+        if HAS_SCALE:
+            enc = tl.load(
+                u8_ptr
+                + (blk * (BS * ROW) + BS * TOK + pos * 8)[:, None]
+                + (off // 64)[None, :],
+                mask=m,
+                other=127,
+            ).to(tl.float32)
+            v = v * tl.exp2(enc - 127.0)
+        tl.store(u8_ptr + a, v.to(tl.float8e4b8).to(tl.uint8, bitcast=True), mask=m)
+
+    if DO_ROPE:
+        ro = tl.arange(0, ROPE).to(tl.int32)
+        rm = tm[:, None]
+        # bf16 source is 2 B per element, so index the i16 view; the fp8 result needs
+        # only ROPE bytes and lands at the front of the 2*ROPE the bf16 occupied,
+        # which is exactly where _load_nope_dma's block-7 addressing looks.
+        bits = tl.load(i16_ptr + ((base + NOPE) // 2)[:, None] + ro[None, :], mask=rm)
+        rv = bits.to(tl.bfloat16, bitcast=True).to(tl.float32)
+        rv = tl.where(rv != rv, 0.0, rv)
+        tl.store(
+            u8_ptr + (base + NOPE)[:, None] + ro[None, :],
+            rv.to(tl.float8e4b8).to(tl.uint8, bitcast=True),
+            mask=rm,
+        )
 
 
-def quantize_rope_(cache: torch.Tensor) -> torch.Tensor:
-    """In-place bf16 -> fnuz fp8 on the RoPE tail of a packed cache.
+def convert_cache_(
+    cache: torch.Tensor, *, nope: bool, rope: bool, has_scale: bool = False,
+    toks: int = 8, num_warps: int = 4,
+) -> torch.Tensor:
+    """In-place cache format conversion, one pass.
 
-    Writes the 64 fp8 bytes over the front half of the 128 bf16 bytes, which is the
-    offset ``_load_nope_dma`` already computes for block 7, so the kernel can DMA
-    the rope with blocks 0..6 instead of running a bf16->fp8 register round-trip
-    (``_commit_rope_block``, the largest single stall in the kernel). The back half
-    becomes dead space; the row size does not change.
-
-    Destructive: the bf16 rope is gone afterwards, so a cache converted this way
-    cannot be used with ``rope_bf16=True``, which needs it for the QK dot.
+    ``nope`` runs OCP -> fnuz on the 448 NoPE bytes (region1 only; region0 already
+    stores fnuz). ``rope`` runs bf16 -> fp8 on the tail. Doing both in one call
+    reads each token record once.
     """
     assert cache.dtype == torch.uint8 and cache.ndim == 3
-    assert cache.shape[2] == CACHE_ROW
+    assert cache.shape[2] == CACHE_ROW, f"expected row {CACHE_ROW}, got {cache.shape[2]}"
+    if not (nope or rope):
+        return cache
     num_blocks, block_size, _ = cache.shape
     n_tokens = num_blocks * block_size
-    _rope_bf16_to_fp8_kernel[(n_tokens,)](
-        cache.view(-1),
-        cache.view(-1).view(torch.int16),
+    flat = cache.view(-1)
+    _convert_kernel[(triton.cdiv(n_tokens, toks),)](
+        flat,
+        flat.view(torch.int16),
         n_tokens,
-        block_size=block_size,
+        BS=block_size,
+        DO_NOPE=nope,
+        DO_ROPE=rope,
+        HAS_SCALE=has_scale,
         NOPE=NOPE_BYTES,
         ROPE=64,
         ROW=CACHE_ROW,
         TOK=TOKEN_BYTES,
-        num_warps=1,
+        TOKS=toks,
+        NBLK=512,
+        EXACT=(n_tokens % toks == 0),
+        num_warps=num_warps,
     )
     return cache
 
 
+def convert_extra_cache_(cache: torch.Tensor, *, has_scale: bool = False) -> torch.Tensor:
+    """OCP -> fnuz on the NoPE bytes only. Prefer ``convert_cache_`` when the RoPE
+    tail also needs quantizing, so the record is read once rather than twice."""
+    return convert_cache_(cache, nope=True, rope=False, has_scale=has_scale)
+
+
+def quantize_rope_(cache: torch.Tensor) -> torch.Tensor:
+    """bf16 -> fnuz fp8 on the RoPE tail only.
+
+    Destructive: the bf16 rope is gone afterwards, so a cache converted this way
+    cannot be used with ``rope_bf16=True``, which needs it for the QK dot.
+    """
+    return convert_cache_(cache, nope=False, rope=True)
+
+
 def _rope_reference(cache: torch.Tensor) -> torch.Tensor:
+    """Torch equivalent of the RoPE tail quantization, used only to check the kernel."""
     out = cache.clone()
     nb, bs, _ = cache.shape
     flat = out.view(-1)[: nb * bs * CACHE_ROW].view(nb, bs * CACHE_ROW)
     tok = flat[:, : bs * TOKEN_BYTES].view(nb, bs, TOKEN_BYTES)
-    bf = tok[:, :, NOPE_BYTES:].reshape(nb, bs, 64, 2).reshape(-1, 2)
-    v = bf.contiguous().view(torch.bfloat16).to(torch.float32).reshape(nb, bs, 64)
-    v = torch.where(torch.isnan(v), torch.zeros_like(v), v)
-    q = v.to(torch.float8_e4m3fnuz).view(torch.uint8)
-    tok[:, :, NOPE_BYTES : NOPE_BYTES + 64] = q
+    src = tok[:, :, NOPE_BYTES:].reshape(-1).view(torch.bfloat16).to(torch.float32)
+    src = torch.where(torch.isnan(src), torch.zeros_like(src), src)
+    q = src.to(torch.float8_e4m3fnuz).view(torch.uint8).reshape(nb, bs, 64)
+    tok[:, :, NOPE_BYTES : NOPE_BYTES + 64].copy_(q)
     return out
 
 
-def _reference(cache: torch.Tensor) -> torch.Tensor:
+def _reference(cache: torch.Tensor, has_scale: bool = False) -> torch.Tensor:
     """Torch equivalent, used only to check the kernel."""
     out = cache.clone()
     nb, bs, _ = cache.shape
@@ -188,6 +182,13 @@ def _reference(cache: torch.Tensor) -> torch.Tensor:
     nope = flat[:, : bs * TOKEN_BYTES].view(nb, bs, TOKEN_BYTES)[:, :, :NOPE_BYTES]
     f = nope.reshape(-1).view(torch.float8_e4m3fn).to(torch.float32)
     f = torch.where(torch.isnan(f), torch.zeros_like(f), f)
+    f = f.reshape(nb, bs, NOPE_BYTES)
+    if has_scale:
+        # UE8M0 trailer: 8 exponent bytes per token, one per 64-element block,
+        # living after the block's token records. Only the first 7 cover NoPE's
+        # 448 bytes; the 8th belongs to the RoPE block.
+        enc = flat[:, bs * TOKEN_BYTES :].view(nb, bs, 8)[:, :, : NOPE_BYTES // 64]
+        f = f * torch.exp2(enc.to(torch.float32) - 127.0).repeat_interleave(64, dim=2)
     nope.copy_(f.to(torch.float8_e4m3fnuz).view(torch.uint8).reshape(nope.shape))
     return out
 
@@ -213,6 +214,19 @@ def main() -> int:
     same = torch.equal(ref, got)
     bad = (ref != got).sum().item()
     print(f"  nope OCP->fnuz vs torch: bit-identical={same}  mismatched bytes={bad}")
+
+    # has_scale reads the UE8M0 trailer, whose per-block stride is only exercised
+    # once more than one block is populated with non-127 exponents.
+    scaled = cache.clone()
+    scaled.view(-1)[: nb * bs * CACHE_ROW].view(nb, bs * CACHE_ROW)[:, bs * TOKEN_BYTES :] = (
+        torch.randint(120, 132, (nb, bs * 8), dtype=torch.uint8, device=cache.device)
+    )
+    sref = _reference(scaled, has_scale=True)
+    sgot = convert_extra_cache_(scaled.clone(), has_scale=True)
+    ssame = torch.equal(sref, sgot)
+    print(f"  nope w/ UE8M0 scale vs torch: bit-identical={ssame}  "
+          f"mismatched bytes={(sref != sgot).sum().item()}")
+    same = same and ssame
 
     rref = _rope_reference(cache)
     rgot = quantize_rope_(cache.clone())
