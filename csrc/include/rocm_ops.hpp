@@ -2022,7 +2022,8 @@ namespace py = pybind11;
           py::arg("use_shuffle_layout"),                               \
           py::arg("block_size"),                                       \
           py::arg("x"),                                                \
-          py::arg("rotary_dim") = 0);                                  \
+          py::arg("rotary_dim") = 0,                                   \
+          py::arg("v_norm")     = false);                              \
     m.def("fused_qk_norm_rope_cache_block_quant_shuffle",              \
           &aiter::fused_qk_norm_rope_cache_block_quant_shuffle,        \
           py::arg("qkv"),                                              \

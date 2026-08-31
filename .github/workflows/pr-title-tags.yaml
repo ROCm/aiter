@@ -1,15 +1,20 @@
-name: PR Title Tags
+name: PR Title Tags & Labels
 
-# Keeps PR-title component tags uniform ([Triton/Gluon], [HIP], [ASM], [CK],
-# ...) and always in sync with the PR's changed files.
+# Keeps PR-title component tags ([Triton/Gluon], [HIP], [ASM], [CK], ...) and
+# the matching PR labels uniform and always in sync with the PR's changed
+# files. The title is capped at 3 tags for readability; the labels carry the
+# full component set.
 #
 # The diff is the source of truth: on every push, bracket tags in the
 # component namespace (any variant — [TRITON], [Gluon], [CK_TILE],
 # [Triton-Gluon-MLA-GFX950], ...) are recomputed from the changed files, so
 # dropped components disappear and new ones appear. Tags outside the
 # component namespace ([fix], [Perf], [MLA], [gfx1250], ...) are never
-# touched. To opt a PR out entirely, add the 'no-auto-title' label — it takes
-# effect immediately, and removing it re-syncs the title on the spot.
+# touched. The same rule applies to labels: only the component labels listed
+# in COMPONENT_LABELS are ever added or removed — human labels (ci:*, ...)
+# are left alone, while hand-toggling a managed component label is corrected
+# on the spot. To opt a PR out entirely, add the 'no-auto-title' label — it
+# takes effect immediately, and removing it re-syncs the PR on the spot.
 #
 # The tag set is documented in CONTRIBUTE.md ("PR Title Format") — keep the
 # two in sync when adding or renaming tags.
@@ -25,6 +30,7 @@ on:
 
 permissions:
   pull-requests: write
+  issues: write  # labels on PRs go through the issues API
 
 concurrency:
   group: pr-title-tags-${{ github.event.pull_request.number }}
@@ -39,10 +45,35 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
+            // The component labels this workflow owns (name -> color). Only
+            // these are ever added or removed; anything else on the PR
+            // (ci:*, no-auto-title, ...) belongs to humans.
+            const COMPONENT_LABELS = {
+              'Triton/Gluon': '1d76db',
+              'ASM':          '5319e7',
+              'HIP':          'b60205',
+              'CK':           '0e8a16',
+              'OPUS':         'fbca04',
+              'FlyDSL':       'd93f0b',
+              'CI':           'bfdadc',
+              'JIT':          'c5def5',
+              'Build':        'bfd4f2',
+              'Config':       'f9d0c4',
+              'Docs':         '0075ca',
+            };
+
+            // Label events run the sync only when they can change the outcome:
+            // the opt-out label, or a managed component label being toggled by
+            // hand (which the sync corrects on the spot). Events for any other
+            // label (ci:*, ...) are skipped. The bot's own label writes echo
+            // back here too — they find everything in sync and exit without
+            // API calls, so there is no loop.
             const action = context.payload.action;
+            const eventLabel = context.payload.label?.name;
             if ((action === 'labeled' || action === 'unlabeled')
-                && context.payload.label?.name !== 'no-auto-title') {
-              core.info(`Label '${context.payload.label?.name}' is not title-related — skipping.`);
+                && eventLabel !== 'no-auto-title'
+                && !Object.hasOwn(COMPONENT_LABELS, eventLabel))
+              core.info(`Label '${eventLabel}' is not managed — skipping.`);
               return;
             }
             const pr = context.payload.pull_request;
@@ -127,12 +158,58 @@ jobs:
             const newTitle = (add.map(t => `[${t}]`).join(' ') + ' ' + stripped).trim();
             if (newTitle === original) {
               core.info(`Title already in sync (computed: ${JSON.stringify(tags)})`);
-              return;
+            } else {
+              core.info(`Retitling: "${original}" -> "${newTitle}"`);
+              await github.rest.pulls.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number,
+                title: newTitle,
+              });
             }
-            core.info(`Retitling: "${original}" -> "${newTitle}"`);
-            await github.rest.pulls.update({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: pr.number,
-              title: newTitle,
-            });
+
+            // ---- labels: mirror the FULL computed component set (uncapped) ----
+            const current = pr.labels
+              .map(l => l.name)
+              .filter(name => name in COMPONENT_LABELS);
+            const labelsToAdd = tags.filter(t => !current.includes(t));
+            const labelsToRemove = current.filter(name => !tags.includes(name));
+
+            for (const name of labelsToAdd) {
+              // Make sure the label exists with our color; 422 = already exists.
+              try {
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name,
+                  color: COMPONENT_LABELS[name],
+                });
+              } catch (e) {
+                if (e.status !== 422) throw e;
+              }
+            }
+            if (labelsToAdd.length) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                labels: labelsToAdd,
+              });
+            }
+            for (const name of labelsToRemove) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: pr.number,
+                  name,
+                });
+              } catch (e) {
+                if (e.status !== 404) throw e;  // already gone is fine
+              }
+            }
+            if (labelsToAdd.length || labelsToRemove.length) {
+              core.info(`Labels: +[${labelsToAdd}] -[${labelsToRemove}]`);
+            } else {
+              core.info('Labels already in sync.');
+            }
