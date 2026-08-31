@@ -24,6 +24,7 @@ It supports page size = 1.
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage2.py
 
 import copy
+import functools
 
 import torch
 import triton
@@ -31,11 +32,17 @@ import triton
 from aiter.ops.triton._triton_kernels.attention.mla_decode_rope import (
     _fwd_grouped_kernel_stage1_rope,
     _fwd_kernel_stage2,
-    _get_config,
 )
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+
+@functools.lru_cache(maxsize=1024)
+def _get_config():
+    cfg_dir = resolve_config_dir("attention", "MLA_DECODE_ROPE", backend="triton")
+    return load_config_json(f"{cfg_dir}/DEFAULT.json")
 
 
 # TODO rope offset

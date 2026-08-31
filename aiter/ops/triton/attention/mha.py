@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
 import os
 from typing import Literal
 
@@ -8,15 +9,45 @@ import torch
 import triton
 import triton.language as tl
 
-from aiter.ops.triton._triton_kernels.attention.mha import _attn_fwd, _get_config
+from aiter.ops.triton._triton_kernels.attention.mha import _attn_fwd
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
 from aiter.ops.triton.attention.mha_fused_bwd import flash_attn_fused_backward
 from aiter.ops.triton.attention.mha_onekernel_bwd import flash_attn_onekernel_backward
 from aiter.ops.triton.utils import types
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+
+@functools.lru_cache(maxsize=1024)
+def _get_config(
+    enable_dropout: bool,
+    dtype: torch.dtype,
+    has_pe: bool = False,
+    head_dim_v: int | None = None,
+):
+    cfg_dir = resolve_config_dir("attention", "MHA", backend="triton")
+    config = load_config_json(f"{cfg_dir}/DEFAULT.json")
+    fwd_cfg = config["fwd"]
+    has_dropout_or_fp32 = enable_dropout or dtype == torch.float32
+    # TODO: pe + dropout is not tuned
+    if has_pe and has_dropout_or_fp32 and "pe_dropout_or_fp32" in fwd_cfg:
+        return fwd_cfg["pe_dropout_or_fp32"]
+    elif has_pe and "pe" in fwd_cfg:
+        return fwd_cfg["pe"]
+    elif enable_dropout or dtype == torch.float32:
+        return fwd_cfg["dropout_or_fp32"]
+    elif head_dim_v is not None and 16 < head_dim_v <= 64 and "small_head" in fwd_cfg:
+        # Mid-small V head dims (16 < d <= 64) hit a num_stages=1 software-pipelining
+        # pathology on this backend (e.g. ~3x slower at d64). Using num_stages=3
+        # recovers performance and is numerically verified for these dims, but
+        # regresses d128 and miscompiles d<=16, so only 16 < d <= 64 uses this path.
+        return fwd_cfg["small_head"]
+    else:
+        return fwd_cfg["default"]
+
 
 _USE_FUSED_BWD_KERNEL = False
 
