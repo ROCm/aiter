@@ -6313,7 +6313,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             dtype,
             block_size=BM,
             accumulate=atomic,
-            output_aux=True,
+            output_aux="opus",
         )
         moe_out = moe_buf if moe_buf.numel() else torch.empty((M, h), dtype=dtype)
         inter_q, inter_s = _mxfp4_a4w4_stage1_fw(
