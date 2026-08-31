@@ -213,6 +213,9 @@ def kernel_fits_shape_splitk_mxfp4(
     below are this family's own extra constraints, same as
     ``kernel_fits_shape_splitk`` adds for a8w8.
     """
+    # shuffle_{weight,scale}_w4_cdna4 require N % 32 == 0; tile_n can be 16.
+    if N % 32 != 0:
+        return False
     equiv = _ki(
         ki.tile_m,
         ki.tile_n,

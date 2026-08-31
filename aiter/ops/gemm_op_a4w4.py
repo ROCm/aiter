@@ -241,7 +241,7 @@ def gemm_a4w4(
         and kernelName.startswith("flydsl_a4w4_splitk_")
     ):
         parsed = _parse_flydsl_a4w4_splitk_kernel_name(kernelName)
-        if parsed is not None:
+        if parsed is not None and n % 32 == 0:
             (
                 tm,
                 tn,
