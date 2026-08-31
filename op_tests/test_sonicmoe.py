@@ -167,10 +167,12 @@ def test_sonicmoe_correctness(act_name, dtype):
     """Forward + backward correctness for all SonicMoE activation types."""
     torch.cuda.set_device(0)
     act_type = _ACT_MAP[act_name]
-    *_, max_err = run_correctness(T=64, H=128, I=64, E=4, K=2, act_type=act_type, dtype=dtype)
-    assert max_err < 0.05, (
-        f"SonicMoE {act_name}: max relative error {max_err:.4f} >= 0.05"
+    *_, max_err = run_correctness(
+        T=64, H=128, I=64, E=4, K=2, act_type=act_type, dtype=dtype
     )
+    assert (
+        max_err < 0.05
+    ), f"SonicMoE {act_name}: max relative error {max_err:.4f} >= 0.05"
 
 
 def run_benchmark(T, H, I, E, K, act_type, dtype, rep=100, trials=5):

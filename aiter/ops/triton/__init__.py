@@ -44,7 +44,11 @@ try:
     )
 
     __all__.extend(
-        ["cross_entropy_backward", "cross_entropy_forward", "cross_entropy_forward_chunked"]
+        [
+            "cross_entropy_backward",
+            "cross_entropy_forward",
+            "cross_entropy_forward_chunked",
+        ]
     )
 except (ImportError, AttributeError):
     pass

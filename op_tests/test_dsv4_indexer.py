@@ -6,7 +6,11 @@
 import torch
 import torch.nn.functional as F
 
-from aiter.ops.triton.attention.dsv4_indexer import dsv4_indexer, indexer_bwd, indexer_fwd
+from aiter.ops.triton.attention.dsv4_indexer import (
+    dsv4_indexer,
+    indexer_bwd,
+    indexer_fwd,
+)
 
 torch.set_default_device("cuda")
 

@@ -40,7 +40,9 @@ def test_moe_aux_loss_bwd(N, E, grad_loss_val):
 
     result = moe_aux_loss_bwd(tokens_per_expert, coeff_scaled, grad_aux_loss, N, E)
 
-    expected = tokens_per_expert.unsqueeze(0).expand(N, E) * coeff_scaled * grad_loss_val
+    expected = (
+        tokens_per_expert.unsqueeze(0).expand(N, E) * coeff_scaled * grad_loss_val
+    )
     torch.testing.assert_close(result, expected, atol=1e-6, rtol=1e-6)
 
 

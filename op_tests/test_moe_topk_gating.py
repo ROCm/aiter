@@ -1011,8 +1011,12 @@ def _run_topk_softmax(gating_output, topk, need_renorm):
     num_tokens = gating_output.shape[0]
     topk_weights = torch.empty(num_tokens, topk, dtype=torch.float32, device="cuda")
     topk_ids = torch.empty(num_tokens, topk, dtype=torch.int32, device="cuda")
-    token_expert_indices = torch.empty(num_tokens, topk, dtype=torch.int32, device="cuda")
-    aiter.topk_softmax(topk_weights, topk_ids, token_expert_indices, gating_output, need_renorm)
+    token_expert_indices = torch.empty(
+        num_tokens, topk, dtype=torch.int32, device="cuda"
+    )
+    aiter.topk_softmax(
+        topk_weights, topk_ids, token_expert_indices, gating_output, need_renorm
+    )
     return topk_weights, topk_ids
 
 
@@ -1034,7 +1038,9 @@ def test_topk_softmax(num_tokens, num_experts, topk, need_renorm):
     gating = torch.randn(num_tokens, num_experts, dtype=torch.float32, device="cuda")
 
     # ref_softmax returns (weights, ids) with sorted=False — align both sides by ID.
-    w_ref, i_ref = ref_softmax(gating, torch.empty(0, device="cuda"), topk, 1.0, need_renorm)
+    w_ref, i_ref = ref_softmax(
+        gating, torch.empty(0, device="cuda"), topk, 1.0, need_renorm
+    )
     w_ref, i_ref = _align_by_id(w_ref, i_ref)
 
     w_out, i_out = _run_topk_softmax(gating, topk, need_renorm)
