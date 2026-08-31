@@ -126,13 +126,21 @@ def build_flash_attn_fp8_module(
 
     L_SPLIT_TILES = 2
     L_MFMA_SLABS = PV_K_STEPS - L_SPLIT_TILES // 2
-    # Width of the carried l_valu.  When the VALU half of L is live we carry it
-    # *unreduced* -- one f32 per lane element -- so the lane-folding tree and
-    # the cross-lane shuffle_xor run once in the epilogue instead of once per
-    # softmax phase.  Addition is associative across iterations and the
-    # rollback rescale is a uniform scalar, so it distributes over the
-    # unfolded partial.  Costs C_F32_PER_LANE-1 carried VGPRs.
-    L_VALU_WIDTH = C_F32_PER_LANE if L_SPLIT_TILES > 0 else 1
+    # Width of the carried l_valu.  The per-iteration add count is fixed at
+    # (L_SPLIT_TILES * C_F32_PER_LANE) / 2 = 16 v_pk_add_f32 no matter how the
+    # reduction is shaped -- 32 new f32 each have to land in the accumulator
+    # exactly once and pk_add folds two per instruction -- so the width is
+    # chosen for *registers*, not instruction count.
+    #
+    #   16: carry fully unreduced; 16 pk_add/iter, 16 carried VGPRs.
+    #    2: reduce each split tile down to a lane pair first (7 pk_add each),
+    #       then 2 pk_add into the carried pair.  Same 16 pk_add, 2 VGPRs.
+    #
+    # Either way the narrow scalar tail of the tree and the cross-lane
+    # shuffle_xor happen once in the epilogue rather than every softmax phase.
+    # Legal because addition is associative across iterations and the rollback
+    # rescale is a lane-uniform scalar, so it distributes over the partial.
+    L_VALU_WIDTH = 2 if L_SPLIT_TILES > 0 else 1
 
     SCHRAUDOLPH_2P23 = 1 << 23
     SCHRAUDOLPH_C = 127 * SCHRAUDOLPH_2P23 - 486411
@@ -163,6 +171,33 @@ def build_flash_attn_fp8_module(
 
         def _fadd(a, b):
             return arith.addf(_raw(a), _raw(b), fastmath=fm_fast)
+
+        # Element-wise f32 add pinned to the non-packed VOP2 encoding.
+        #
+        # VOP3P (v_pk_*_f32) contends with the Matrix Core: a packed add
+        # issued while the SIMD partner wave is streaming MFMAs stalls ~676 cy,
+        # where a non-packed VALU op in the same window stalls ~1 (n=511 vs
+        # n=32193).  The reference asm kernel emits zero v_pk_add_f32 for its
+        # L-sum for this reason.  Scalarising in the DSL is not enough --
+        # LLVM re-vectorises (123 pk_add survived that attempt) -- so the
+        # encoding has to be nailed down in asm.  Costs 2x the instruction
+        # count: 16 pk_add -> 32 v_add_f32, ~64 cy of extra issue.
+        def _fadd_vop2(a, b):
+            return llvm.InlineAsmOp(
+                T.f32,
+                [_raw(a), _raw(b)],
+                "v_add_f32_e32 $0, $1, $2",
+                "=v,v,v",
+                has_side_effects=False,
+            ).res
+
+        def _fadd_vec_vop2(a, b, w):
+            a = Vec(a)
+            b = Vec(b)
+            return Vec.from_elements(
+                [_fadd_vop2(a[i], b[i]) for i in range_constexpr(w)],
+                fx.Float32,
+            )
 
         def _fsub(a, b):
             return arith.subf(_raw(a), _raw(b), fastmath=fm_fast)
@@ -831,26 +866,47 @@ def build_flash_attn_fp8_module(
             #     _dma_fire(dma_rsrc, l_ptrs[_dp], g_ptrs[_dp])
             return s_accs, v_preloaded
 
+        # Balanced ternary reduction, shaped so every interior node is a
+        # v_max3_f32.  The binary shape (vector fmax fold + halving tree) issues
+        # the same 63 max operations but LLVM only fuses a third of them --
+        # 21 max3 + 21 v_max = 42 instructions, against the reference asm's 32.
+        # max3 takes 3 inputs and emits 1, so it retires 2 values per
+        # instruction: 64 -> 1 costs ceil(63/2) = 32 no matter how the tree is
+        # balanced, and balanced keeps the critical path at 5 levels (vs 6 for
+        # the binary shape) rather than the 32 of a flat chain.
+        def _max3(a, b, c):
+            return _fmax(_fmax(a, b), c)
+
         def _lane_max(vecs):
-            v = _fmax(_fmax(Vec(vecs[0]), Vec(vecs[1])), _fmax(Vec(vecs[2]), Vec(vecs[3])))
-            w = C_F32_PER_LANE
-            while const_expr(w > 1):
+            vals = [
+                Vec(v)[i]
+                for v in vecs
+                for i in range_constexpr(C_F32_PER_LANE)
+            ]
+            while const_expr(len(vals) > 2):
+                nxt = []
+                i = 0
+                while const_expr(i + 2 < len(vals)):
+                    nxt.append(_max3(vals[i], vals[i + 1], vals[i + 2]))
+                    i += 3
+                nxt.extend(vals[i:])
+                vals = nxt
+            return _fmax(vals[0], vals[1]) if const_expr(len(vals) == 2) else vals[0]
+
+        # Halving tree down to `to` elements.  `vop2=True` forces every level
+        # to non-packed v_add_f32 -- see _fadd_vop2 for why that is worth
+        # doubling the instruction count inside the softmax phase.
+        def _lane_sum_to(v, to, w=C_F32_PER_LANE, vop2=False):
+            while const_expr(w > to):
                 h = w // 2
                 a = Vec(v).shuffle(Vec(v), list(range(h)))
                 b = Vec(v).shuffle(Vec(v), list(range(h, w)))
-                v = _fmax(a, b)
+                v = _fadd_vec_vop2(a, b, h) if const_expr(vop2) else _fadd(a, b)
                 w = h
-            return Vec(v)[0]
+            return Vec(v)
 
         def _lane_sum(v):
-            w = C_F32_PER_LANE
-            while const_expr(w > 1):
-                h = w // 2
-                a = Vec(v).shuffle(Vec(v), list(range(h)))
-                b = Vec(v).shuffle(Vec(v), list(range(h, w)))
-                v = _fadd(a, b)
-                w = h
-            return Vec(v)[0]
+            return _lane_sum_to(v, 1)[0]
 
         def _rowmax(s_accs, m_running):
             local_max = Vec(s_accs[0])[0]
@@ -1105,7 +1161,7 @@ def build_flash_attn_fp8_module(
             n_groups = C_F32_PER_LANE // 4
 
             p_words = []
-            v_partial = None
+            v_pairs = []
             zero_vec = Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
             i32_vec_ty = Vec.make_type(C_F32_PER_LANE, fx.Int32)
             f32_vec_ty = Vec.make_type(C_F32_PER_LANE, fx.Float32)
@@ -1139,10 +1195,13 @@ def build_flash_attn_fp8_module(
                     )
                 )
                 if const_expr(nt < L_SPLIT_TILES):
-                    v_partial = (
-                        Vec(ps_v)
-                        if const_expr(v_partial is None)
-                        else _fadd(Vec(v_partial), Vec(ps_v))
+                    # Fold this tile to a lane pair on its own (7 pk_add) and
+                    # keep the pairs in a list.  Same total add count as
+                    # summing the tiles elementwise first, but the carried
+                    # accumulator is 2 VGPRs instead of C_F32_PER_LANE, and
+                    # the tiles reduce independently rather than chaining.
+                    v_pairs.append(
+                        _lane_sum_to(Vec(ps_v), L_VALU_WIDTH, vop2=True)
                     )
                 for rg in range_constexpr(n_groups):
                     p_words.append(
@@ -1161,11 +1220,10 @@ def build_flash_attn_fp8_module(
             p_pack = Vec.from_elements(p_words, fx.Int32)
             # The MFMA half of the L reduction has moved to the head of the
             # next MFMA phase (apply_pv); the softmax phase is VALU-only now.
-            if const_expr(v_partial is not None):
-                # No lane fold here: l_valu stays an unreduced per-lane
-                # vec<16xf32> and the tree + cross-lane shuffle_xor run once
-                # in the epilogue.  See l_valu_init.
-                l_valu = _fadd(Vec(l_valu), Vec(v_partial))
+            # Accumulate the per-tile pairs.  No scalar tail and no cross-lane
+            # shuffle_xor here -- both run once in the epilogue.
+            for vp in v_pairs:
+                l_valu = _fadd_vec_vop2(l_valu, vp, L_VALU_WIDTH)
             # o_accs / l_mfma come back because the rollback may have rescaled
             # them; on the non-seeded path they are whatever was passed in.
             return m_frozen, bias_chunks, p_pack, l_valu, o_accs, l_mfma
@@ -1219,8 +1277,8 @@ def build_flash_attn_fp8_module(
         _gpu_barrier()
 
         loop_step = fx.Int32(BLOCK_N)
-        # See L_VALU_WIDTH: unreduced per-lane partial when the VALU half of L
-        # is live, plain scalar-in-a-vec<1> otherwise.
+        # See L_VALU_WIDTH: a partially-reduced lane pair when the VALU half of
+        # L is live, plain scalar-in-a-vec<1> otherwise.
         l_valu_init = Vec.from_elements([c_zero_f], fx.Float32).broadcast_to(
             L_VALU_WIDTH
         )
@@ -1622,11 +1680,11 @@ def build_flash_attn_fp8_module(
         o_finals = [oe0, oe1, oe2, oe3]
         # asm: output_complete_results folds the MFMA half of L (_v_LR) into
         # the VALU half (_v_L) right before the reciprocal.
-        # The deferred lane fold: l_valu carried an unreduced vec<16xf32>
-        # through the whole loop, so the tree reduction and the cross-lane
+        # The deferred tail: l_valu was carried at L_VALU_WIDTH through the
+        # whole loop, so the last (odd-width) tree levels and the cross-lane
         # shuffle_xor happen exactly once, here, instead of per iteration.
         if const_expr(L_SPLIT_TILES > 0):
-            l_final = _lane_sum(le_valu)
+            l_final = _lane_sum_to(le_valu, 1, w=L_VALU_WIDTH)[0]
             l_final = _fadd(
                 l_final,
                 fx.Float32(l_final).shuffle_xor(fx.Int32(32), fx.Int32(WARP_SIZE)),
