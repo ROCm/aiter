@@ -1,1493 +1,425 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL decode TopK-per-row kernel (tiered persistent multi-block radix-select)
-
-Computes Top-K indices per decode row, fusing a single-workgroup and a multi-block
-radix-select into one persistent launch grid=(blocks_per_row, num_rows). The stable
-mode adds count, prefix, and ascending-index write phases inside the same launch.
-Each row derives how many workgroups cooperate (active_parts); the rest return.
-
-Inputs/outputs:
-  - logits: fp32, logical shape (num_rows, L), strides (stride0, stride1) with
-    stride1 == 1 (contiguous within a row).
-  - seq_lens: int32 causal lengths per sequence; row r scores sequence r // next_n at
-    decode slot r % next_n, valid length seq_len - next_n + slot + 1.
-  - indices: flattened int32 output with shape (num_rows, top_k). Stable mode writes
-    ascending indices and resolves boundary ties by smallest input index. A row with
-    fewer than top_k valid entries is identity-filled and padded with -1.
-  - workspace: row-major int32 scratch sized by topk_workspace_slots(num_rows,
-    bits_per_pass). The multi-block tiers merge per-block LDS histograms into its
-    pass-private global histograms over an inter-workgroup acquire/release barrier and
-    coordinate through its counters; the single-workgroup tier never touches it.
-
-Paths (per row, by valid length row_len):
-  - short (row_len <= short_max): active_parts = 1; part 0 runs the whole radix-select
-    in one workgroup — LDS-only histograms, no inter-workgroup barrier, no workspace
-    round-trip.
-  - mid (short_max < row_len <= mid_max): active_parts = min(blocks_per_row, mid_cap).
-  - long (row_len > mid_max): active_parts = min(blocks_per_row, long_cap).
-
-Constraints:
-  - logits are fp32; the order-preserving radix key twiddle is fp32-specific.
-  - bits_per_pass is 10 or 11; the short tier requires 11 bits (2048-bin LDS histogram).
-  - BLOCK_THREADS is fixed at 1024 (wave64); the histogram/scan layout and the
-    occupancy deadlock guard rely on it.
-  - workspace must be zeroed before its first multi-block launch; the kernel resets
-    it before returning so warm calls and graph replay need no separate zero kernel.
-  - The row barrier spins (s_sleep), so a row's blocks_per_row workgroups must be
-    co-resident. This is a regular launch, not hipLaunchCooperativeKernel, and is safe
-    only because the grid is flattened x-fastest: a row's parts launch contiguously and
-    drain in order, which is scheduler launch order rather than a cooperative
-    guarantee. The wrapper's deadlock guard keeps num_rows * blocks_per_row co-resident,
-    forcing larger batches onto the barrier-free short tier.
-"""
+"""One-workgroup FlyDSL decode TopK."""
 
 from functools import cache
-from typing import Any, Literal
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, scf
-from flydsl.expr import (
-    arith,
-    as_ir_value,
-    const_expr,
-    gpu,
-    range_constexpr,
-    rocdl,
+from flydsl.expr import gpu, range_constexpr
+
+from .topk_per_row_decode import (
+    _atomic_add_i32,
+    _load_f32x4,
+    _row_length,
+    _row_resource,
+    _warp_inclusive_prefix_i32,
 )
-from flydsl.expr.typing import T
 
-# buffer_ops and vector come from aiter's own shims, not flydsl.expr: the flydsl
-# cleanup in #4501 dropped those from the stable interface.
-from aiter.ops.flydsl.kernels import buffer_ops, vector
+_BLOCK_THREADS = 1024
+_WAVE_SIZE = 64
+_VEC = 4
+_RADIX_BITS = 11
+_NUM_BUCKETS = 1 << _RADIX_BITS
+_MID_SHIFT = 10
+_LOW_MASK = (1 << _MID_SHIFT) - 1
+_NUM_WAVES = _BLOCK_THREADS // _WAVE_SIZE
 
-# HW max block size; also assumed by the bucket scan (2 bins/thread -> 2048 bins)
-# and the occupancy=2 deadlock guard. Changing it breaks both.
-BLOCK_THREADS = 1024
-WARP_SIZE = 64
-LOAD_VEC = 4
-# log2(LOAD_VEC); LOAD_VEC must be a power of two. vec_blocks = ceil(row_len/LOAD_VEC)
-# is a right shift, so the shift amount must track LOAD_VEC, not a hardcoded width.
-LOAD_VEC_LOG2 = LOAD_VEC.bit_length() - 1
-# Default histogram-scan staging (one of 1/2/4/8)
-SCAN_STAGES = 2
-
-# 128B-spaced inter-workgroup counter groups (32 int32 == 128B each), kept in the int32 workspace.
-COUNTER_STRIDE = 32
-COUNTER_SLOTS = 6 * COUNTER_STRIDE
-COUNTER_STABLE_ABOVE = 0
-COUNTER_STABLE_EQUAL = COUNTER_STRIDE
-COUNTER_ARRIVALS = 2 * COUNTER_STRIDE
-COUNTER_OUT_FRONT = 3 * COUNTER_STRIDE
-COUNTER_OUT_BACK = 4 * COUNTER_STRIDE
-COUNTER_PASS_DONE = 5 * COUNTER_STRIDE
-
-SMEM_META_K = 0
-SMEM_META_LEN = 1
-SMEM_META_THRESHOLD = 2
-SMEM_META_ABOVE = 3
-
-# Short-tier one-workgroup metadata reuses the same 8-int LDS block after zeroing.
-SMEM_META_SHORT_FIRST_ABOVE = 0
-SMEM_META_SHORT_FIRST_THRESHOLD = 1
-SMEM_META_SHORT_SECOND_ABOVE = 2
-SMEM_META_SHORT_SECOND_THRESHOLD = 3
-SMEM_META_SHORT_THIRD_ABOVE = 4
-SMEM_META_SHORT_THIRD_THRESHOLD = 5
-SMEM_META_SHORT_FRONT_COUNT = 6
-SMEM_META_SHORT_BACK_COUNT = 7
-
-
-def _num_passes(bits_per_pass: int) -> int:
-    return (32 + bits_per_pass - 1) // bits_per_pass
-
-
-def topk_workspace_slots(
-    num_rows: int,
-    bits_per_pass: int = 11,
-) -> int:
-    """Return int32 workspace slots for the tiered path (row-major, per row)."""
-    if bits_per_pass not in (10, 11):
-        raise ValueError(f"bits_per_pass must be 10 or 11, got {bits_per_pass}")
-    row_slots = COUNTER_SLOTS + _num_passes(bits_per_pass) * (1 << bits_per_pass)
-    return int(num_rows) * row_slots
-
-
-def needs_workspace_zero(
-    max_row_len: int,
-    top_k: int,
-    short_max: int,
-    tier_mode: str = "auto",
-    bits_per_pass: int = 11,
-) -> bool:
-    """Return whether any row can enter the persistent multi-block path."""
-    if tier_mode == "short":
-        return False
-    if tier_mode in ("mid", "long"):
-        return True
-    # No short tier below 11 bits, so every row is persistent regardless of length.
-    if bits_per_pass != 11:
-        return True
-    return max_row_len > max(short_max, top_k)
+_FIRST_ABOVE = 0
+_FIRST_THRESHOLD = 1
+_SECOND_ABOVE = 2
+_SECOND_THRESHOLD = 3
+_THIRD_ABOVE = 4
+_THIRD_THRESHOLD = 5
+_RUNNING_ABOVE = 6
+_RUNNING_EQUAL = 7
 
 
 @cache
-def create_topk_per_row_decode_tiered_kernel(
-    top_k: int,
-    *,
-    blocks_per_row: int = 8,
-    bits_per_pass: int = 11,
-    scan_stages: int = SCAN_STAGES,
-    tier_mode: Literal["auto", "short", "mid", "long"] = "auto",
-    tiered_short_max: int = 16384,
-    tiered_mid_cap: int = 16,
-    tiered_mid_max: int = 65536,
-    tiered_long_cap: int = 32,
-    mask_non_finite: bool = False,
-    row_proportional_parts: bool = False,
-    early_stop: bool = False,
-    stable: bool = False,
-) -> Any:
-    """Build a launcher that selects the Top-K largest values' column indices per
-    decode row (unordered set, matching torch.topk by value). Implemented as a
-    tiered persistent multi-block radix-select; the returned launcher is cached.
-
-    top_k: number of indices selected per row (compile-time; any positive value).
-    blocks_per_row: workgroups launched per row (grid width); the mid/long tiers cap
-        how many actually cooperate, excess workgroups return immediately.
-    bits_per_pass: radix digit width, 10 or 11; 11 = 2048-bin LDS histogram, required
-        by the short tier.
-    scan_stages: histogram block-scan staging, one of 1/2/4/8.
-    tier_mode: "auto" picks a tier per row by valid length; "short"/"mid"/"long"
-        force that tier for every row.
-    tiered_short_max: row_len <= this -> short tier (single workgroup, barrier-free).
-    tiered_mid_max: short_max < row_len <= this -> mid tier; longer -> long tier.
-    tiered_mid_cap / tiered_long_cap: max cooperating workgroups per row in the mid /
-        long tier (clamped to blocks_per_row).
-    mask_non_finite: clamp inf/NaN to -inf so they never rank into the top-k. Off
-        by default, which ranks them by their raw twiddled bits the way torch.topk
-        and the HIP kernel do; a direct caller has to ask for the divergence.
-    stable: emit indices in ascending order and prefer smaller indices at the
-        threshold while keeping every phase in this one kernel launch.
-    """
-    short_max = tiered_short_max
-    mid_cap = tiered_mid_cap
-    mid_max = tiered_mid_max
-    long_cap = tiered_long_cap
-
-    if bits_per_pass not in (10, 11):
-        raise ValueError(f"bits_per_pass must be 10 or 11, got {bits_per_pass}")
-    if scan_stages not in (1, 2, 4, 8):
-        raise ValueError(f"scan_stages must be one of (1, 2, 4, 8), got {scan_stages}")
-
-    # blocks_per_row == 1 collapses the launch to grid=(1, num_rows): every row runs
-    # the barrier-free single-workgroup short tier (no cooperative parts, so no dead
-    # blocks hogging co-resident slots). Only valid when the short tier exists
-    # (auto/short + bpp==11); mid/long forced modes still need >=2 cooperating parts.
-    _min_blocks_per_row = (
-        1 if (tier_mode in ("auto", "short") and bits_per_pass == 11) else 2
-    )
-    if not _min_blocks_per_row <= blocks_per_row <= 32:
-        raise ValueError(
-            f"blocks_per_row must be in [{_min_blocks_per_row}, 32], got {blocks_per_row}"
-        )
-
-    if mid_cap < 2 or long_cap < 2:
-        raise ValueError(f"mid_cap/long_cap must be >= 2, got {mid_cap}/{long_cap}")
-    if mid_max < short_max:
-        raise ValueError(f"mid_max must be >= short_max, got {mid_max} < {short_max}")
-    if tier_mode not in ("auto", "short", "mid", "long"):
-        raise ValueError(
-            f"tier_mode must be one of auto/short/mid/long, got {tier_mode!r}"
-        )
-    # The short tier runs the standalone one-workgroup radix-select (2048-bin LDS
-    # histogram), so it needs bits_per_pass == 11. It is compiled in for "auto"
-    # (short rows) and "short" (all rows); forcing "short" without bpp==11 is an
-    # error rather than a silent fallback.
-    if tier_mode == "short" and bits_per_pass != 11:
-        raise ValueError(
-            f"tier_mode='short' requires bits_per_pass == 11, got {bits_per_pass}"
-        )
-
-    short_tier = tier_mode in ("auto", "short") and bits_per_pass == 11
-    block_threads = BLOCK_THREADS
-    red_slots = (block_threads + WARP_SIZE - 1) // WARP_SIZE
-    num_passes = _num_passes(bits_per_pass)
-    num_buckets = 1 << bits_per_pass
-    row_workspace_slots = COUNTER_SLOTS + num_passes * num_buckets
-
-    # Caps/thresholds only affect codegen for modes that use them; include them in
-    # the name for those modes so distinct configs cache separately.
-    _cap_tag = (
-        ""
-        if tier_mode == "short"
-        else (
-            f"_s{tiered_short_max}_mc{tiered_mid_cap}"
-            f"_mm{tiered_mid_max}_lc{tiered_long_cap}"
-        )
-    )
-    kernel_name = (
-        f"topk_per_row_decode_persistent_k{top_k}_"
-        f"bpp{bits_per_pass}_g{blocks_per_row}_v2"
-        f"_stage{scan_stages}"
-        f"_{tier_mode}"
-        f"{_cap_tag}"
-        f"{'_1wg' if short_tier else ''}"
-        f"{'_mf' if mask_non_finite else ''}"
-        f"{'_rpp' if row_proportional_parts else ''}"
-        f"{'_es' if early_stop else ''}"
-        f"{'_stable' if stable else ''}"
-    )
+def build_topk_per_row_decode_one_workgroup_module(rows: int, k: int):
+    output_steps = (k + _BLOCK_THREADS - 1) // _BLOCK_THREADS
 
     @fx.struct
     class SharedStorage:
-        s_hist: fx.Array[fx.Int32, num_buckets, 16]
-        s_scan: fx.Array[fx.Int32, red_slots * 2, 16]
-        s_meta: fx.Array[fx.Int32, 8, 16]
+        histogram: fx.Array[fx.Int32, _NUM_BUCKETS, 16]
+        scan: fx.Array[fx.Int32, _NUM_WAVES * 2, 16]
+        metadata: fx.Array[fx.Int32, 8, 16]
 
-    @flyc.kernel(name=kernel_name, known_block_size=[block_threads, 1, 1])
-    def topk_per_row_decode_tiered_kernel(
-        logits: fx.Tensor,
-        next_n: fx.Int32,
-        seq_lens: fx.Tensor,
+    @flyc.kernel(
+        name=f"topk_per_row_decode_1wg_k{k}",
+        known_block_size=[_BLOCK_THREADS, 1, 1],
+    )
+    def topk_per_row_decode_one_workgroup_kernel(
+        input: fx.Tensor,
+        row_ends: fx.Tensor,
         indices: fx.Tensor,
-        workspace: fx.Tensor,
+        width: fx.Int32,
+        next_n: fx.Int32,
         stride0: fx.Int32,
-    ) -> None:
-        block_x = gpu.block_id("x")
-        block_y = gpu.block_id("y")
-        thread_x = gpu.thread_id("x")
-        part = fx.Int32(block_x)
-        row = fx.Int32(block_y)
-        tid = fx.Int32(thread_x)
-        tid_idx = fx.Index(thread_x)
-        lane = tid % fx.Int32(WARP_SIZE)
-        wave = tid // fx.Int32(WARP_SIZE)
+    ):
+        row = fx.block_idx.x
+        tid = fx.thread_idx.x
+        lane = tid % _WAVE_SIZE
+        wave = tid // _WAVE_SIZE
 
-        c_zero = fx.Int32(0)
-        c_one = fx.Int32(1)
-        c_two = fx.Int32(2)
-        c_four = fx.Int32(4)
-        c_red_slots = fx.Int32(red_slots)
-        c_last_wave = fx.Int32(red_slots - 1)
-        c_last_lane = fx.Int32(WARP_SIZE - 1)
-        c_vec = fx.Int32(LOAD_VEC)
-        c_top_k = fx.Int32(top_k)
-        c_block_i32 = fx.Int32(block_threads)
-        c_block_idx = fx.Index(block_threads)
-        c_bins_i32 = fx.Int32(num_buckets)
-        c_bins_idx = fx.Index(num_buckets)
-        c_parts = fx.Int32(blocks_per_row)
-        c_sign_bit = fx.Int32(-2147483648)
-        c_exp_mask = fx.Int32(0x7F800000)  # fp32 exponent bits (all-ones => inf/NaN)
-        c_neg_inf = fx.Float32(float("-inf"))
-        c_neg_one = fx.Int32(-1)
-        c_zero_f32 = fx.Float32(0.0)
-        c_row_ws = fx.Int32(row_workspace_slots)
+        zero = fx.Int32(0)
+        one = fx.Int32(1)
+        two = fx.Int32(2)
+        vec_width = fx.Int32(_VEC)
+        block_threads = fx.Int32(_BLOCK_THREADS)
+        top_k = fx.Int32(k)
+        sign_bit = fx.Int32(-2147483648)
+        zero_f32 = fx.Float32(0.0)
 
-        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        s_hist = lds.s_hist.view(fx.make_layout(num_buckets, 1))
-        s_scan = lds.s_scan.view(fx.make_layout(red_slots * 2, 1))
-        s_meta = lds.s_meta.view(fx.make_layout(8, 1))
+        storage = fx.SharedAllocator().allocate(SharedStorage)
+        histogram = storage.histogram.peek().view(fx.make_layout(_NUM_BUCKETS, 1))
+        scan = storage.scan.peek().view(fx.make_layout(_NUM_WAVES * 2, 1))
+        metadata = storage.metadata.peek().view(fx.make_layout(8, 1))
 
-        # A buffer descriptor has a 32-bit byte range. Base it at this row so a
-        # multi-row tensor may exceed 4 GiB while vec4 tail loads still get
-        # hardware OOB protection at the row boundary.
-        row_bytes = fx.Int64(stride0) * fx.Int64(4)
-        row_byte_offset = fx.Int64(row) * row_bytes
-        logits_rsrc = buffer_ops.create_buffer_resource(
-            logits,
-            max_size=False,
-            num_records_bytes=row_bytes,
-            base_byte_offset=row_byte_offset,
-        )
-        seq_lens_rsrc = buffer_ops.create_buffer_resource(seq_lens, max_size=True)
-        indices_bytes = fx.Int64(gpu.grid_dim.y) * fx.Int64(top_k) * fx.Int64(4)
-        indices_rsrc = buffer_ops.create_buffer_resource(
-            indices, max_size=False, num_records_bytes=indices_bytes
-        )
-        workspace_rsrc = buffer_ops.create_buffer_resource(workspace, max_size=True)
-        workspace_base_idx = buffer_ops.extract_base_index(workspace, address_space=1)
+        input_resource = _row_resource(input, row, width, stride0)
+        row_len = _row_length(row, row_ends, width, next_n)
+        row_indices = fx.slice(indices, (row, None))
+        row_vectors = (row_len + vec_width - one) // vec_width
 
-        hist_base_ptr = fx.ptrtoint(lds.s_hist.ptr)
-        meta_base_ptr = fx.ptrtoint(lds.s_meta.ptr)
-
-        # Decode row geometry.
-        seq_row = row // next_n
-        slot = row - seq_row * next_n
-        seq_len = fx.Int32(
-            buffer_ops.buffer_load(seq_lens_rsrc, seq_row, vec_width=1, dtype=T.i32)
-        )
-        row_len = seq_len - next_n + slot + c_one
-        row_len = (row_len > c_zero).select(row_len, c_zero)
-        row_out = row * c_top_k
-        row_ws_base = row * c_row_ws
-
-        # Active cooperating workgroups per row over the fixed grid (excess blocks
-        # return immediately). "auto" picks per row by length; short/mid/long force
-        # that tier for every row. Caps are clamped to the grid.
-        c_mid_cap = fx.Int32(mid_cap)
-        c_long_cap = fx.Int32(long_cap)
-        mid_parts = (c_parts < c_mid_cap).select(c_parts, c_mid_cap)
-        long_parts = (c_parts < c_long_cap).select(c_parts, c_long_cap)
-        if const_expr(row_proportional_parts):
-            # gfx950: the grid is sized for the padded width, so a short row would spin
-            # up more cooperating workgroups than it needs, each adding barrier/merge
-            # latency. Cap parts by the row's coverage need (one per items_per_block),
-            # floored at 2. Fewer parts is always correct -- the scan stride still
-            # covers every vec-block.
-            items_per_block = LOAD_VEC * block_threads
-            cover_shift = (items_per_block).bit_length() - 1
-            row_cover = (row_len + fx.Int32(items_per_block - 1)).shrui(
-                fx.Int32(cover_shift)
-            )
-            row_cover = (row_cover < c_two).select(c_two, row_cover)
-            mid_parts = (mid_parts < row_cover).select(mid_parts, row_cover)
-            long_parts = (long_parts < row_cover).select(long_parts, row_cover)
-        if const_expr(tier_mode == "short"):
-            active_parts = c_one
-        elif const_expr(tier_mode == "mid"):
-            active_parts = mid_parts
-        elif const_expr(tier_mode == "long"):
-            active_parts = long_parts
-        else:  # "auto": pick per row by valid length
-            c_short = fx.Int32(short_max)
-            c_mid = fx.Int32(mid_max)
-            active_parts = (row_len <= c_short).select(
-                c_one,
-                (row_len <= c_mid).select(mid_parts, long_parts),
-            )
-        active_threads = active_parts * c_block_i32
-        single_part_active = active_parts == c_one
-
-        def active_stride_idx(mult: int = 1):
-            """Vec-block stride covering `mult` rounds of the active workgroups."""
-            return fx.Index(active_threads * fx.Int32(mult))
-
-        def counter_slot(slot_const: int):
-            return row_ws_base + fx.Int32(slot_const)
-
-        def histogram_slot(pass_id: int, bin_i32):
-            return (
-                row_ws_base + fx.Int32(COUNTER_SLOTS + pass_id * num_buckets) + bin_i32
-            )
-
-        def global_i32_ptr(elem_i32):
-            elem_idx = fx.Index(elem_i32)
-            addr = fx.Index(workspace_base_idx) + fx.Index(elem_idx) * fx.Index(4)
-            ptr = buffer_ops.create_llvm_ptr(addr, address_space=1)
-            return ptr._value if const_expr(hasattr(ptr, "_value")) else ptr
-
-        def lds_i32_ptr(base, elem_i32):
-            elem_idx = fx.Index(elem_i32)
-            addr = fx.Index(base) + fx.Index(elem_idx) * fx.Index(4)
-            ptr = buffer_ops.create_llvm_ptr(addr, address_space=3)
-            return ptr._value if const_expr(hasattr(ptr, "_value")) else ptr
-
-        def ws_load(elem_i32):
-            return buffer_ops.buffer_load(
-                workspace_rsrc, elem_i32, vec_width=1, dtype=T.i32
-            )
-
-        def global_atomic_add_i32(
-            elem_i32, value, ordering=llvm.AtomicOrdering.monotonic
-        ):
-            return llvm.AtomicRMWOp(
-                llvm.AtomicBinOp.add,
-                global_i32_ptr(elem_i32),
-                as_ir_value(value),
-                ordering,
-                syncscope="agent",
-                alignment=4,
-            ).result
-
-        def global_atomic_xchg_i32(elem_i32, value, ordering):
-            return llvm.AtomicRMWOp(
-                llvm.AtomicBinOp.xchg,
-                global_i32_ptr(elem_i32),
-                as_ir_value(value),
-                ordering,
-                syncscope="agent",
-                alignment=4,
-            ).result
-
-        def global_atomic_load_i32_acquire(elem_i32):
-            # Volatile agent-scoped acquire load for the row-barrier spin. The
-            # matching release publish below makes histogram updates visible to
-            # peer workgroups without issuing a read-modify-write on the polled slot.
-            return llvm.LoadOp(
-                T.i32,
-                global_i32_ptr(elem_i32),
-                alignment=4,
-                volatile_=True,
-                ordering=llvm.AtomicOrdering.acquire,
-                syncscope="agent",
-            ).result
-
-        def lds_atomic_add_i32(base, elem_i32, value):
-            return llvm.AtomicRMWOp(
-                llvm.AtomicBinOp.add,
-                lds_i32_ptr(base, elem_i32),
-                as_ir_value(value),
-                llvm.AtomicOrdering.monotonic,
-                syncscope="workgroup",
-                alignment=4,
-            ).result
-
-        def spin_until_slot_ge(elem_i32, target):
-            w = scf.WhileOp([T.i32], [as_ir_value(c_zero)])
-            before = ir.Block.create_at_start(w.before, [T.i32])
-            after = ir.Block.create_at_start(w.after, [T.i32])
-            with ir.InsertionPoint(before):
-                cur = before.arguments[0]
-                need_wait = arith.CmpIOp(
-                    arith.CmpIPredicate.slt, cur, as_ir_value(target)
-                ).result
-                scf.ConditionOp(need_wait, [cur])
-            with ir.InsertionPoint(after):
-                rocdl.s_sleep(1)
-                data = global_atomic_load_i32_acquire(elem_i32)
-                scf.YieldOp([data])
-
-        def row_barrier(token: int):
-            # Intentional no-drain acquire/release protocol: workgroup barriers
-            # bracket local LDS work, the last workgroup release-publishes pass_done,
-            # and peers spin with acquire loads. A full waitcnt drain here is
-            # performance/correctness sensitive.
-            token_value = fx.Int32(token)
-            target_arrivals = token_value * active_parts
-            gpu.barrier()
-            if tid == c_zero:
-                prev = global_atomic_add_i32(
-                    counter_slot(COUNTER_ARRIVALS), c_one, llvm.AtomicOrdering.acq_rel
-                )
-                last = (prev + c_one) == target_arrivals
-                if last:
-                    global_atomic_xchg_i32(
-                        counter_slot(COUNTER_PASS_DONE),
-                        token_value,
-                        llvm.AtomicOrdering.release,
-                    )
-                else:
-                    spin_until_slot_ge(counter_slot(COUNTER_PASS_DONE), token_value)
-            gpu.barrier()
-
-        def mask_nonfinite(val):
-            # inf/NaN (exponent all-ones) -> -inf so they sort below every finite
-            # value and are never selected.
-            if const_expr(not mask_non_finite):
-                return val
-            bits = val.bitcast(T.i32)
-            is_nonfinite = (bits & c_exp_mask) == c_exp_mask
-            return is_nonfinite.select(c_neg_inf, val)
-
-        def radix_twiddle_key(val):
-            # Map larger fp32 values to smaller unsigned keys so ascending
-            # bucket scans select descending values. Normalize signed zero to
-            # keep tie handling value-equivalent.
-            val = mask_nonfinite(val)
-            key_val = (val == c_zero_f32).select(c_zero_f32, val)
-            bits = key_val.bitcast(T.i32)
+        def ordered_key(value):
+            value = (value == zero_f32).select(zero_f32, value)
+            bits = value.bitcast(fx.Int32)
             sign = bits.shrui(fx.Int32(31))
-            positive_mask = bits ^ fx.Int32(0x7FFFFFFF)
-            return (sign == c_zero).select(positive_mask, bits)
+            return (sign != zero).select(~bits, bits ^ sign_bit)
 
-        def bucket_for_key(key, start_bit: int):
-            return (key.shrui(fx.Int32(start_bit))) & fx.Int32(num_buckets - 1)
+        def high_bucket(value):
+            return ordered_key(value).shrui(fx.Int32(21))
 
-        def prefix_for_key(key, previous_start_bit: int):
-            return arith.shli(
-                key.shrui(fx.Int32(previous_start_bit)),
-                fx.Int32(previous_start_bit),
-            )
+        def radix_bucket(value, shift, mask):
+            return ordered_key(value).shrui(shift) & mask
 
-        def load_row_vec(col_base_i32):
-            return buffer_ops.buffer_load(
-                logits_rsrc,
-                col_base_i32,
-                vec_width=LOAD_VEC,
-                dtype=T.f32,
-            )
-
-        def clear_local_histogram():
-            for hist_idx in range(tid_idx, c_bins_idx, c_block_idx):
-                fx.memref_store(c_zero, s_hist, fx.Int32(hist_idx))
+        def clear_histogram(histogram):
+            histogram[tid] = zero
+            histogram[tid + _BLOCK_THREADS] = zero
             gpu.barrier()
 
-        def wave_inclusive_scan_i32(value):
-            cur = value
-            for sh in range_constexpr(int.bit_length(WARP_SIZE) - 1):
-                d = fx.Int32(1 << sh)
-                src_lane = lane - d
-                byte_addr = src_lane * c_four
-                peer = rocdl.ds_bpermute(
-                    T.i32, as_ir_value(byte_addr), as_ir_value(cur)
-                )
-                take = lane >= d
-                cur = take.select(cur + peer, cur)
-            return cur
-
-        def block_exclusive_scan_pair(first, second):
-            first_inclusive = wave_inclusive_scan_i32(first)
-            second_inclusive = wave_inclusive_scan_i32(second)
+        def block_exclusive_scan_pair(first, second, scan, metadata):
+            first_inclusive = _warp_inclusive_prefix_i32(first, lane)
+            second_inclusive = _warp_inclusive_prefix_i32(second, lane)
             first_exclusive = first_inclusive - first
             second_exclusive = second_inclusive - second
-            if lane == c_last_lane:
-                fx.memref_store(first_inclusive, s_scan, wave)
-                fx.memref_store(second_inclusive, s_scan, wave + c_red_slots)
+            if lane == _WAVE_SIZE - 1:
+                scan[wave] = first_inclusive
+                scan[wave + _NUM_WAVES] = second_inclusive
             gpu.barrier()
 
-            if wave == c_zero:
-                in16 = lane < c_red_slots
-                lane_safe = in16.select(lane, c_zero)
-                first_wave = in16.select(fx.memref_load(s_scan, lane_safe), c_zero)
-                second_wave = in16.select(
-                    fx.memref_load(s_scan, lane_safe + c_red_slots), c_zero
-                )
-                first_wave_inclusive = wave_inclusive_scan_i32(first_wave)
-                second_wave_inclusive = wave_inclusive_scan_i32(second_wave)
-                if in16:
-                    fx.memref_store(first_wave_inclusive - first_wave, s_scan, lane)
-                    fx.memref_store(
-                        second_wave_inclusive - second_wave,
-                        s_scan,
-                        lane + c_red_slots,
-                    )
-                if lane == c_last_wave:
-                    fx.memref_store(first_wave_inclusive, s_meta, 4)
-                    fx.memref_store(second_wave_inclusive, s_meta, 5)
+            if wave == 0:
+                active = lane < _NUM_WAVES
+                safe_lane = active.select(lane, zero)
+                first_wave = active.select(scan[safe_lane], zero)
+                second_wave = active.select(scan[safe_lane + _NUM_WAVES], zero)
+                first_wave_inclusive = _warp_inclusive_prefix_i32(first_wave, lane)
+                second_wave_inclusive = _warp_inclusive_prefix_i32(second_wave, lane)
+                if active:
+                    scan[lane] = first_wave_inclusive - first_wave
+                    scan[lane + _NUM_WAVES] = second_wave_inclusive - second_wave
+                if lane == _NUM_WAVES - 1:
+                    metadata[_THIRD_ABOVE] = first_wave_inclusive
+                    metadata[_THIRD_THRESHOLD] = second_wave_inclusive
             gpu.barrier()
             return (
-                fx.memref_load(s_scan, wave) + first_exclusive,
-                fx.memref_load(s_scan, wave + c_red_slots) + second_exclusive,
-                fx.memref_load(s_meta, 4),
-                fx.memref_load(s_meta, 5),
+                scan[wave] + first_exclusive,
+                scan[wave + _NUM_WAVES] + second_exclusive,
+                metadata[_THIRD_ABOVE],
+                metadata[_THIRD_THRESHOLD],
             )
 
-        def choose_bucket_prefix(target_k):
-            # Multi-block ascending block scan over the LDS histogram; each thread owns a bin pair.
-            first_bin = tid * c_two
-            bin0_valid = first_bin < c_bins_i32
-            bin1 = first_bin + c_one
-            bin1_valid = bin1 < c_bins_i32
-            safe0 = bin0_valid.select(first_bin, c_zero)
-            safe1 = bin1_valid.select(bin1, c_zero)
-            c0 = bin0_valid.select(fx.memref_load(s_hist, safe0), c_zero)
-            c1 = bin1_valid.select(fx.memref_load(s_hist, safe1), c_zero)
-            local_total = c0 + c1
+        def choose_threshold(
+            target_k,
+            above_slot,
+            threshold_slot,
+            histogram,
+            scan,
+            metadata,
+        ):
+            first_bin = tid * two
+            count0 = histogram[first_bin]
+            count1 = histogram[first_bin + one]
+            local_total = count0 + count1
+            wave_inclusive = _warp_inclusive_prefix_i32(local_total, lane)
+            wave_exclusive = wave_inclusive - local_total
 
-            wave_incl = wave_inclusive_scan_i32(local_total)
-            wave_excl_thread = wave_incl - local_total
-
-            if lane == c_last_lane:
-                fx.memref_store(wave_incl, s_scan, wave)
+            if lane == _WAVE_SIZE - 1:
+                scan[wave] = wave_inclusive
             gpu.barrier()
 
-            if wave == c_zero:
-                in16 = lane < c_red_slots
-                lane_safe = in16.select(lane, c_zero)
-                wtot = in16.select(fx.memref_load(s_scan, lane_safe), c_zero)
-                wincl = wave_inclusive_scan_i32(wtot)
-                wexcl = wincl - wtot
-                if in16:
-                    fx.memref_store(wexcl, s_scan, lane + c_red_slots)
+            if wave == 0:
+                active = lane < _NUM_WAVES
+                safe_lane = active.select(lane, zero)
+                wave_total = active.select(scan[safe_lane], zero)
+                wave_prefix = _warp_inclusive_prefix_i32(wave_total, lane) - wave_total
+                if active:
+                    scan[lane + _NUM_WAVES] = wave_prefix
             gpu.barrier()
 
-            wave_off = fx.memref_load(s_scan, wave + c_red_slots)
-            excl0 = wave_off + wave_excl_thread
-            incl0 = excl0 + c0
-            incl1 = incl0 + c1
+            wave_offset = scan[wave + _NUM_WAVES]
+            total = scan[_NUM_WAVES - 1] + scan[_NUM_WAVES * 2 - 1]
+            target_prefix = total - target_k
+            exclusive0 = wave_offset + wave_exclusive
+            inclusive0 = exclusive0 + count0
+            inclusive1 = inclusive0 + count1
 
-            def emit_find(bucket, excl, incl, count):
-                crosses = (excl < target_k) & (incl >= target_k)
-                if crosses:
-                    fx.memref_store(
-                        target_k - excl,
-                        s_meta,
-                        fx.Int32(SMEM_META_K),
+            def emit(bucket, exclusive, inclusive, metadata):
+                if (exclusive <= target_prefix) & (inclusive > target_prefix):
+                    metadata[threshold_slot] = bucket
+                    metadata[above_slot] = total - inclusive
+
+            emit(first_bin, exclusive0, inclusive0, metadata)
+            emit(first_bin + one, inclusive0, inclusive1, metadata)
+            gpu.barrier()
+
+        def reread_row(chunk):
+            for vector_idx in range(tid, row_vectors, block_threads):
+                col_base = vector_idx * vec_width
+                chunk(col_base, _load_f32x4(input_resource, vector_idx))
+
+        def histogram_pass1(col_base, values):
+            for lane_idx in range_constexpr(_VEC):
+                col = col_base + lane_idx
+                if col < row_len:
+                    _atomic_add_i32(
+                        histogram,
+                        one,
+                        high_bucket(values[lane_idx]),
+                        "workgroup",
                     )
-                    fx.memref_store(count, s_meta, fx.Int32(SMEM_META_LEN))
-                    fx.memref_store(bucket, s_meta, fx.Int32(SMEM_META_THRESHOLD))
-                    fx.memref_store(excl, s_meta, fx.Int32(SMEM_META_ABOVE))
 
-            emit_find(first_bin, excl0, incl0, c0)
-            emit_find(bin1, incl0, incl1, c1)
-            gpu.barrier()
+        def histogram_pass2(col_base, values, first_threshold):
+            for lane_idx in range_constexpr(_VEC):
+                col = col_base + lane_idx
+                if col < row_len:
+                    value = values[lane_idx]
+                    if high_bucket(value) == first_threshold:
+                        _atomic_add_i32(
+                            histogram,
+                            one,
+                            radix_bucket(
+                                value,
+                                fx.Int32(_MID_SHIFT),
+                                fx.Int32(_NUM_BUCKETS - 1),
+                            ),
+                            "workgroup",
+                        )
 
-        def flush_local_histogram(pass_id: int):
-            for hist_idx in range(tid_idx, c_bins_idx, c_block_idx):
-                hist_i32 = fx.Int32(hist_idx)
-                count = fx.memref_load(s_hist, hist_i32)
-                if count != c_zero:
-                    global_atomic_add_i32(histogram_slot(pass_id, hist_i32), count)
-
-        def load_global_histogram(pass_id: int):
-            # Vectorized reload
-            n_vec = num_buckets // LOAD_VEC
-            c_nvec_idx = fx.Index(n_vec)
-            for grp in range(tid_idx, c_nvec_idx, c_block_idx):
-                base_bin = fx.Int32(grp) * c_vec
-                vec = buffer_ops.buffer_load(
-                    workspace_rsrc,
-                    histogram_slot(pass_id, base_bin),
-                    vec_width=LOAD_VEC,
-                    dtype=T.i32,
-                )
-                for j in range_constexpr(LOAD_VEC):
-                    total = vector.extract(
-                        vec, static_position=[j], dynamic_position=[]
-                    )
-                    fx.memref_store(total, s_hist, base_bin + fx.Int32(j))
-            gpu.barrier()
-
-        def process_loaded_scan_vec(
+        def histogram_pass3(
             col_base,
-            vec,
-            pass_id: int,
-            start_bit: int,
-            previous_start_bit: int,
-            current_bits,
+            values,
+            first_threshold,
+            second_threshold,
         ):
-            for j in range_constexpr(LOAD_VEC):
-                col_i32 = col_base + fx.Int32(j)
-                if col_i32 < row_len:
-                    val = vector.extract(vec, static_position=[j], dynamic_position=[])
-                    key = radix_twiddle_key(val)
-                    matches_prefix = True
-                    if const_expr(pass_id != 0):
-                        matches_prefix = (
-                            prefix_for_key(key, previous_start_bit) == current_bits
+            for lane_idx in range_constexpr(_VEC):
+                col = col_base + lane_idx
+                if col < row_len:
+                    value = values[lane_idx]
+                    if (high_bucket(value) == first_threshold) & (
+                        radix_bucket(
+                            value,
+                            fx.Int32(_MID_SHIFT),
+                            fx.Int32(_NUM_BUCKETS - 1),
                         )
-                    if matches_prefix:
-                        lds_atomic_add_i32(
-                            hist_base_ptr, bucket_for_key(key, start_bit), c_one
+                        == second_threshold
+                    ):
+                        _atomic_add_i32(
+                            histogram,
+                            one,
+                            radix_bucket(value, zero, fx.Int32(_LOW_MASK)),
+                            "workgroup",
                         )
 
-        def scan_vec_block(
-            vblk, pass_id: int, start_bit: int, previous_start_bit: int, current_bits
+        def classify(
+            value,
+            first_threshold,
+            second_threshold,
+            third_threshold,
         ):
-            col_base = fx.Int32(vblk) * c_vec
-            process_loaded_scan_vec(
-                col_base,
-                load_row_vec(col_base),
-                pass_id,
-                start_bit,
-                previous_start_bit,
-                current_bits,
+            first = high_bucket(value)
+            second = radix_bucket(
+                value,
+                fx.Int32(_MID_SHIFT),
+                fx.Int32(_NUM_BUCKETS - 1),
             )
+            third = radix_bucket(value, zero, fx.Int32(_LOW_MASK))
+            above = (first > first_threshold) | (
+                (first == first_threshold)
+                & (
+                    (second > second_threshold)
+                    | ((second == second_threshold) & (third > third_threshold))
+                )
+            )
+            equal = (
+                (first == first_threshold)
+                & (second == second_threshold)
+                & (third == third_threshold)
+            )
+            return above, equal
 
-        def staged_scan_vec_blocks(
-            vblk,
-            pass_id: int,
-            start_bit: int,
-            previous_start_bit: int,
-            current_bits,
+        def stable_scatter(
+            first_threshold,
+            second_threshold,
+            third_threshold,
+            num_needed,
+            row_indices,
+            scan,
+            metadata,
         ):
-            if const_expr(scan_stages == 1):
-                strides = [fx.Index(0)]
-            elif const_expr(scan_stages == 2):
-                strides = [fx.Index(0), active_stride_idx()]
-            elif const_expr(scan_stages == 4):
-                strides = [fx.Index(0)] + [active_stride_idx(m) for m in (1, 2, 3)]
-            else:
-                strides = [fx.Index(0)] + [
-                    active_stride_idx(m) for m in (1, 2, 3, 4, 5, 6, 7)
-                ]
-            cols_v = [fx.Int32(vblk + s) * c_vec for s in strides]
-            vecs = [load_row_vec(cb) for cb in cols_v]
-            for cb, vc in zip(cols_v, vecs):
-                process_loaded_scan_vec(
-                    cb, vc, pass_id, start_bit, previous_start_bit, current_bits
-                )
-
-        def process_loaded_write_vec(col_base, vec, local_k, kth_bits):
-            for j in range_constexpr(LOAD_VEC):
-                col_i32 = col_base + fx.Int32(j)
-                if col_i32 < row_len:
-                    val = vector.extract(vec, static_position=[j], dynamic_position=[])
-                    key = radix_twiddle_key(val)
-                    if arith.cmpi(arith.CmpIPredicate.ult, key, kth_bits):
-                        pos = global_atomic_add_i32(
-                            counter_slot(COUNTER_OUT_FRONT), c_one
-                        )
-                        if pos < c_top_k:
-                            buffer_ops.buffer_store(
-                                col_i32, indices_rsrc, row_out + pos
-                            )
-                    if key == kth_bits:
-                        back = global_atomic_add_i32(
-                            counter_slot(COUNTER_OUT_BACK), c_one
-                        )
-                        if back < local_k:
-                            out_pos = c_top_k - c_one - back
-                            buffer_ops.buffer_store(
-                                col_i32, indices_rsrc, row_out + out_pos
-                            )
-
-        def write_vec_block(vblk, local_k, kth_bits):
-            col_base = fx.Int32(vblk) * c_vec
-            process_loaded_write_vec(
-                col_base, load_row_vec(col_base), local_k, kth_bits
-            )
-
-        def process_loaded_early_vec(col_base, vec, previous_start_bit: int, kth_bits):
-            # Early-stop write: the boundary bucket after the previous pass is taken
-            # whole (remaining_len == remaining_k), so every element whose prefix at
-            # the previous resolution is <= the boundary prefix is in the top-k. No
-            # tie-break needed. Mirrors HIP mb `previous_bits <= kth_value_bits`.
-            for j in range_constexpr(LOAD_VEC):
-                col_i32 = col_base + fx.Int32(j)
-                if col_i32 < row_len:
-                    val = vector.extract(vec, static_position=[j], dynamic_position=[])
-                    key = radix_twiddle_key(val)
-                    prefix = prefix_for_key(key, previous_start_bit)
-                    if arith.cmpi(arith.CmpIPredicate.ule, prefix, kth_bits):
-                        pos = global_atomic_add_i32(
-                            counter_slot(COUNTER_OUT_FRONT), c_one
-                        )
-                        if pos < c_top_k:
-                            buffer_ops.buffer_store(
-                                col_i32, indices_rsrc, row_out + pos
-                            )
-
-        def early_write_vec_block(vblk, previous_start_bit: int, kth_bits):
-            col_base = fx.Int32(vblk) * c_vec
-            process_loaded_early_vec(
-                col_base, load_row_vec(col_base), previous_start_bit, kth_bits
-            )
-
-        def early_write_all(previous_start_bit: int, kth_bits):
-            # Same 4x-staged unroll as the normal last-pass write so the early-stop
-            # row re-scan is not slower than the pass it replaces.
-            unroll_limit_idx = vec_blocks_idx - active_stride_idx(3)
-            for vblk, write_state in range(
-                global_vec_tid_idx,
-                unroll_limit_idx,
-                active_stride_idx(4),
-                init=[global_vec_tid_idx],
-            ):
-                for unroll_id in range_constexpr(4):
-                    early_write_vec_block(
-                        vblk + active_stride_idx(unroll_id),
-                        previous_start_bit,
-                        kth_bits,
-                    )
-                write_results = yield [vblk + active_stride_idx(4)]
-            for vblk, write_state in range(
-                write_results,
-                vec_blocks_idx,
-                active_stride_idx(),
-                init=[c_zero],
-            ):
-                early_write_vec_block(vblk, previous_start_bit, kth_bits)
-                write_results = yield [write_state[0]]
-
-        global_vec_tid = part * c_block_i32 + tid
-        global_vec_tid_idx = fx.Index(global_vec_tid)
-        vec_blocks_i32 = (row_len + c_vec - c_one).shrui(fx.Int32(LOAD_VEC_LOG2))
-        vec_blocks_idx = fx.Index(vec_blocks_i32)
-
-        def scan_pass(pass_id: int, current_k, current_bits, barrier_token: int):
-            start_bit = max(32 - (pass_id + 1) * bits_per_pass, 0)
-            previous_start_bit = max(32 - pass_id * bits_per_pass, 0)
-
-            clear_local_histogram()
-            if const_expr(scan_stages == 8):
-                unroll_limit_idx = vec_blocks_idx - active_stride_idx(7)
-                staged_stride_idx = active_stride_idx(8)
-            elif const_expr(scan_stages == 4):
-                unroll_limit_idx = vec_blocks_idx - active_stride_idx(3)
-                staged_stride_idx = active_stride_idx(4)
-            elif const_expr(scan_stages == 2):
-                unroll_limit_idx = vec_blocks_idx - active_stride_idx()
-                staged_stride_idx = active_stride_idx(2)
-            else:
-                unroll_limit_idx = vec_blocks_idx
-                staged_stride_idx = active_stride_idx()
-            for vblk, pass_state in range(
-                global_vec_tid_idx,
-                unroll_limit_idx,
-                staged_stride_idx,
-                init=[global_vec_tid_idx],
-            ):
-                staged_scan_vec_blocks(
-                    vblk, pass_id, start_bit, previous_start_bit, current_bits
-                )
-                pass_results = yield [vblk + staged_stride_idx]
-            for vblk, pass_state in range(
-                pass_results,
-                vec_blocks_idx,
-                active_stride_idx(),
-                init=[c_zero],
-            ):
-                scan_vec_block(
-                    vblk, pass_id, start_bit, previous_start_bit, current_bits
-                )
-                pass_results = yield [pass_state[0]]
+            if tid == 0:
+                metadata[_RUNNING_ABOVE] = zero
+                metadata[_RUNNING_EQUAL] = zero
             gpu.barrier()
 
-            if single_part_active:
-                choose_bucket_prefix(current_k)
-            if ~single_part_active:
-                flush_local_histogram(pass_id)
-                row_barrier(barrier_token)
-                load_global_histogram(pass_id)
-                choose_bucket_prefix(current_k)
-
-            chosen_bucket = fx.memref_load(s_meta, fx.Int32(SMEM_META_THRESHOLD))
-            next_k = fx.memref_load(s_meta, fx.Int32(SMEM_META_K))
-            next_len = fx.memref_load(s_meta, fx.Int32(SMEM_META_LEN))
-            next_bits = current_bits | fx.Int32(
-                arith.shli(chosen_bucket, fx.Int32(start_bit))
-            )
-            if const_expr(pass_id == num_passes - 1 and not stable):
-                unroll_limit_idx = vec_blocks_idx - active_stride_idx(3)
-                for vblk, write_state in range(
-                    global_vec_tid_idx,
-                    unroll_limit_idx,
-                    active_stride_idx(4),
-                    init=[global_vec_tid_idx],
-                ):
-                    for unroll_id in range_constexpr(4):
-                        write_vec_block(
-                            vblk + active_stride_idx(unroll_id),
-                            next_k,
-                            next_bits,
-                        )
-                    write_results = yield [vblk + active_stride_idx(4)]
-                for vblk, write_state in range(
-                    write_results,
-                    vec_blocks_idx,
-                    active_stride_idx(),
-                    init=[c_zero],
-                ):
-                    write_vec_block(vblk, next_k, next_bits)
-                    write_results = yield [write_state[0]]
-            return next_k, next_len, next_bits
-
-        def stable_finalize(local_k, kth_bits):
-            vecs_per_part = (vec_blocks_i32 + active_parts - c_one) // active_parts
-            part_vec_start = part * vecs_per_part
-            part_vec_end = part_vec_start + vecs_per_part
-            part_vec_end = (part_vec_end < vec_blocks_i32).select(
-                part_vec_end, vec_blocks_i32
-            )
-
-            local_above = c_zero
-            local_equal = c_zero
-            for vblk in range(
-                fx.Index(part_vec_start) + tid_idx,
-                fx.Index(part_vec_end),
-                c_block_idx,
-            ):
-                col_base = fx.Int32(vblk) * c_vec
-                vec = load_row_vec(col_base)
-                for j in range_constexpr(LOAD_VEC):
-                    col_i32 = col_base + fx.Int32(j)
-                    if col_i32 < row_len:
-                        key = radix_twiddle_key(
-                            vector.extract(
-                                vec, static_position=[j], dynamic_position=[]
-                            )
-                        )
-                        local_above = local_above + arith.cmpi(
-                            arith.CmpIPredicate.ult, key, kth_bits
-                        ).select(c_one, c_zero)
-                        local_equal = local_equal + (key == kth_bits).select(
-                            c_one, c_zero
-                        )
-
-            (
-                _,
-                _,
-                block_above,
-                block_equal,
-            ) = block_exclusive_scan_pair(local_above, local_equal)
-            if tid == c_zero:
-                buffer_ops.buffer_store(
-                    block_above,
-                    workspace_rsrc,
-                    counter_slot(COUNTER_STABLE_ABOVE) + part,
-                )
-                buffer_ops.buffer_store(
-                    block_equal,
-                    workspace_rsrc,
-                    counter_slot(COUNTER_STABLE_EQUAL) + part,
-                )
-            row_barrier(num_passes + 1)
-
-            if part == c_zero:
-                active_lane = tid < active_parts
-                safe_part = active_lane.select(tid, c_zero)
-                above_count = active_lane.select(
-                    ws_load(counter_slot(COUNTER_STABLE_ABOVE) + safe_part),
-                    c_zero,
-                )
-                equal_count = active_lane.select(
-                    ws_load(counter_slot(COUNTER_STABLE_EQUAL) + safe_part),
-                    c_zero,
-                )
-                above_prefix = wave_inclusive_scan_i32(above_count) - above_count
-                equal_prefix = wave_inclusive_scan_i32(equal_count) - equal_count
-                if active_lane:
-                    buffer_ops.buffer_store(
-                        above_prefix,
-                        workspace_rsrc,
-                        counter_slot(COUNTER_STABLE_ABOVE) + tid,
-                    )
-                    buffer_ops.buffer_store(
-                        equal_prefix,
-                        workspace_rsrc,
-                        counter_slot(COUNTER_STABLE_EQUAL) + tid,
-                    )
-            row_barrier(num_passes + 2)
-
-            part_above_base = fx.Int32(
-                ws_load(counter_slot(COUNTER_STABLE_ABOVE) + part)
-            )
-            part_equal_base = fx.Int32(
-                ws_load(counter_slot(COUNTER_STABLE_EQUAL) + part)
-            )
-            if tid == c_zero:
-                fx.memref_store(c_zero, s_meta, 0)
-                fx.memref_store(c_zero, s_meta, 1)
-            gpu.barrier()
-
-            part_vec_count = part_vec_end - part_vec_start
-            part_steps = (part_vec_count + c_block_i32 - c_one) // c_block_i32
-            for step in range(c_zero, part_steps, c_one):
-                vblk = part_vec_start + step * c_block_i32 + tid
-                active_vec = vblk < part_vec_end
-                safe_vblk = active_vec.select(vblk, c_zero)
-                col_base = safe_vblk * c_vec
-                vec = load_row_vec(col_base)
-                classes = fx.make_rmem_tensor(LOAD_VEC, fx.Int32)
-                thread_above = c_zero
-                thread_equal = c_zero
-                for j in range_constexpr(LOAD_VEC):
-                    col_i32 = col_base + fx.Int32(j)
-                    active = active_vec & (col_i32 < row_len)
-                    key = radix_twiddle_key(
-                        vector.extract(vec, static_position=[j], dynamic_position=[])
-                    )
-                    above = active.select(
-                        arith.cmpi(arith.CmpIPredicate.ult, key, kth_bits).select(
-                            c_one, c_zero
-                        ),
-                        c_zero,
-                    )
-                    equal = active.select(
-                        (key == kth_bits).select(c_one, c_zero),
-                        c_zero,
-                    )
-                    classes[j] = above * c_two + equal
-                    thread_above = thread_above + above
-                    thread_equal = thread_equal + equal
-
-                (
-                    thread_above_prefix,
-                    thread_equal_prefix,
-                    block_above,
-                    block_equal,
-                ) = block_exclusive_scan_pair(thread_above, thread_equal)
-                my_above = (
-                    part_above_base + fx.memref_load(s_meta, 0) + thread_above_prefix
-                )
-                my_equal = (
-                    part_equal_base + fx.memref_load(s_meta, 1) + thread_equal_prefix
-                )
-                for j in range_constexpr(LOAD_VEC):
-                    cls = classes[j]
-                    col_i32 = col_base + fx.Int32(j)
-                    accepted_equal = (my_equal < local_k).select(my_equal, local_k)
-                    out_pos = my_above + accepted_equal
-                    if cls == c_two:
-                        buffer_ops.buffer_store(
-                            col_i32, indices_rsrc, row_out + out_pos
-                        )
-                        my_above = my_above + c_one
-                    elif cls == c_one:
-                        if my_equal < local_k:
-                            buffer_ops.buffer_store(
-                                col_i32, indices_rsrc, row_out + out_pos
-                            )
-                        my_equal = my_equal + c_one
-                if tid == c_zero:
-                    fx.memref_store(
-                        fx.memref_load(s_meta, 0) + block_above,
-                        s_meta,
-                        0,
-                    )
-                    fx.memref_store(
-                        fx.memref_load(s_meta, 1) + block_equal,
-                        s_meta,
-                        1,
-                    )
-                gpu.barrier()
-
-        def one_workgroup_short_tier():
-            # Single-workgroup radix-select with LDS-only histograms. Stable mode
-            # replaces the unordered atomic append with an index-ordered block scan.
-            # Its three 11/11/10-bit passes require a 2048-bin histogram.
-            c_shift = fx.Int32(32 - 11)
-            c_mid_shift = fx.Int32(10)
-            c_bin_mask = fx.Int32((1 << 11) - 1)
-            c_low_mask = fx.Int32((1 << 10) - 1)
-            c_thirtyone = fx.Int32(31)
-
-            def ordered_key(val):
-                val = mask_nonfinite(val)
-                key_val = (val == c_zero_f32).select(c_zero_f32, val)
-                bits = key_val.bitcast(T.i32)
-                sign = bits.shrui(c_thirtyone)
-                neg_key = ~bits
-                pos_key = bits ^ c_sign_bit
-                return (sign != c_zero).select(neg_key, pos_key)
-
-            def ordered_bucket(val):
-                return ordered_key(val).shrui(c_shift)
-
-            def radix_bucket(val, shift, mask):
-                return ordered_key(val).shrui(shift) & mask
-
-            def clear_hist():
-                for h in range(tid_idx, c_bins_idx, c_block_idx):
-                    fx.memref_store(c_zero, s_hist, fx.Int32(h))
-                gpu.barrier()
-
-            def choose_threshold(target_k, above_slot, threshold_slot):
-                # Hierarchical inclusive block scan over the 2048-bin histogram;
-                # each thread owns the contiguous bin pair (2*tid, 2*tid+1). The
-                # kth-largest boundary is the first bucket whose inclusive prefix
-                # passes ``K' = total - target_k`` (excl <= K' < incl).
-                two_tid = tid * c_two
-                c0 = fx.memref_load(s_hist, two_tid)
-                c1 = fx.memref_load(s_hist, two_tid + c_one)
-                local_total = c0 + c1
-
-                wave_incl = wave_inclusive_scan_i32(local_total)
-                wave_excl_thread = wave_incl - local_total
-
-                if lane == c_last_lane:
-                    fx.memref_store(wave_incl, s_scan, wave)
-                gpu.barrier()
-
-                if wave == c_zero:
-                    in16 = lane < c_red_slots
-                    lane_safe = in16.select(lane, c_zero)
-                    wtot = in16.select(fx.memref_load(s_scan, lane_safe), c_zero)
-                    wincl = wave_inclusive_scan_i32(wtot)
-                    wexcl = wincl - wtot
-                    if in16:
-                        fx.memref_store(wexcl, s_scan, lane + c_red_slots)
-                gpu.barrier()
-
-                wave_off = fx.memref_load(s_scan, wave + c_red_slots)
-                last_off = fx.memref_load(s_scan, c_last_wave + c_red_slots)
-                last_tot = fx.memref_load(s_scan, c_last_wave)
-                total = last_off + last_tot
-                kprime = total - target_k
-
-                excl0 = wave_off + wave_excl_thread
-                incl0 = excl0 + c0
-                incl1 = incl0 + c1
-
-                def emit_find(b, excl, incl):
-                    crosses = (excl <= kprime) & (incl > kprime)
-                    if crosses:
-                        fx.memref_store(b, s_meta, threshold_slot)
-                        fx.memref_store(total - incl, s_meta, above_slot)
-
-                emit_find(two_tid, excl0, incl0)
-                emit_find(two_tid + c_one, incl0, incl1)
-                gpu.barrier()
-
-            if tid == c_zero:
-                for meta_slot in range_constexpr(8):
-                    fx.memref_store(c_zero, s_meta, fx.Int32(meta_slot))
-            gpu.barrier()
-
-            # Per-chunk bodies for the three radix passes plus the final scatter.
-            # Each takes the chunk's first column index and its already-loaded
-            # vec4 and feeds a fresh HBM load through the exact same logic.
-            def hist_pass1_chunk(col_base, vec):
-                for j in range_constexpr(LOAD_VEC):
-                    col_i32 = col_base + fx.Int32(j)
-                    if col_i32 < row_len:
-                        val = vector.extract(
-                            vec, static_position=[j], dynamic_position=[]
-                        )
-                        lds_atomic_add_i32(hist_base_ptr, ordered_bucket(val), c_one)
-
-            def hist_pass2_chunk(col_base, vec, first_threshold):
-                for j in range_constexpr(LOAD_VEC):
-                    col_i32 = col_base + fx.Int32(j)
-                    if col_i32 < row_len:
-                        val = vector.extract(
-                            vec, static_position=[j], dynamic_position=[]
-                        )
-                        if ordered_bucket(val) == first_threshold:
-                            lds_atomic_add_i32(
-                                hist_base_ptr,
-                                radix_bucket(val, c_mid_shift, c_bin_mask),
-                                c_one,
-                            )
-
-            def hist_pass3_chunk(col_base, vec, first_threshold, second_threshold):
-                for j in range_constexpr(LOAD_VEC):
-                    col_i32 = col_base + fx.Int32(j)
-                    if col_i32 < row_len:
-                        val = vector.extract(
-                            vec, static_position=[j], dynamic_position=[]
-                        )
-                        high_bucket = ordered_bucket(val)
-                        mid_bucket = radix_bucket(val, c_mid_shift, c_bin_mask)
-                        if (high_bucket == first_threshold) & (
-                            mid_bucket == second_threshold
-                        ):
-                            lds_atomic_add_i32(
-                                hist_base_ptr,
-                                radix_bucket(val, c_zero, c_low_mask),
-                                c_one,
-                            )
-
-            def classify_final(
-                val,
-                first_threshold,
-                second_threshold,
-                third_threshold,
-            ):
-                high_bucket = ordered_bucket(val)
-                mid_bucket = radix_bucket(val, c_mid_shift, c_bin_mask)
-                low_bucket = radix_bucket(val, c_zero, c_low_mask)
-                above_first = high_bucket > first_threshold
-                at_first = high_bucket == first_threshold
-                above_second = mid_bucket > second_threshold
-                at_second = mid_bucket == second_threshold
-                above_low = low_bucket > third_threshold
-                at_low = low_bucket == third_threshold
-                strictly_above = above_first | (
-                    at_first & (above_second | (at_second & above_low))
-                )
-                at_boundary = at_first & at_second & at_low
-                return strictly_above, at_boundary
-
-            def final_scatter_chunk(
-                col_base,
-                vec,
-                first_threshold,
-                second_threshold,
-                third_threshold,
-                num_needed,
-            ):
-                for j in range_constexpr(LOAD_VEC):
-                    col_i32 = col_base + fx.Int32(j)
-                    if col_i32 < row_len:
-                        val = vector.extract(
-                            vec, static_position=[j], dynamic_position=[]
-                        )
-                        strictly_above, at_boundary = classify_final(
-                            val,
-                            first_threshold,
-                            second_threshold,
-                            third_threshold,
-                        )
-                        if strictly_above:
-                            pos = lds_atomic_add_i32(
-                                meta_base_ptr,
-                                fx.Int32(SMEM_META_SHORT_FRONT_COUNT),
-                                c_one,
-                            )
-                            buffer_ops.buffer_store(
-                                col_i32, indices_rsrc, row_out + pos
-                            )
-                        if at_boundary:
-                            back = lds_atomic_add_i32(
-                                meta_base_ptr,
-                                fx.Int32(SMEM_META_SHORT_BACK_COUNT),
-                                c_one,
-                            )
-                            if back < num_needed:
-                                out_pos = c_top_k - c_one - back
-                                buffer_ops.buffer_store(
-                                    col_i32, indices_rsrc, row_out + out_pos
-                                )
-
-            def stable_final_scatter(
-                first_threshold,
-                second_threshold,
-                third_threshold,
-                num_needed,
-            ):
-                if tid == c_zero:
-                    fx.memref_store(
-                        c_zero,
-                        s_meta,
-                        fx.Int32(SMEM_META_SHORT_FRONT_COUNT),
-                    )
-                    fx.memref_store(
-                        c_zero,
-                        s_meta,
-                        fx.Int32(SMEM_META_SHORT_BACK_COUNT),
-                    )
-                gpu.barrier()
-
-                num_steps = (vec_blocks_i32 + c_block_i32 - c_one) // c_block_i32
-                for step in range(c_zero, num_steps, c_one):
-                    vblk = step * c_block_i32 + tid
-                    active_vec = vblk < vec_blocks_i32
-                    safe_vblk = active_vec.select(vblk, c_zero)
-                    col_base = safe_vblk * c_vec
-                    vec = load_row_vec(col_base)
-                    classes = fx.make_rmem_tensor(LOAD_VEC, fx.Int32)
-                    thread_above = c_zero
-                    thread_equal = c_zero
-                    for j in range_constexpr(LOAD_VEC):
-                        col_i32 = col_base + fx.Int32(j)
-                        active = active_vec & (col_i32 < row_len)
-                        val = vector.extract(
-                            vec, static_position=[j], dynamic_position=[]
-                        )
-                        strictly_above, at_boundary = classify_final(
-                            val,
-                            first_threshold,
-                            second_threshold,
-                            third_threshold,
-                        )
-                        above = active & strictly_above
-                        equal = active & at_boundary
-                        above_i32 = above.select(c_one, c_zero)
-                        equal_i32 = equal.select(c_one, c_zero)
-                        classes[j] = above_i32 * c_two + equal_i32
-                        thread_above = thread_above + above_i32
-                        thread_equal = thread_equal + equal_i32
-
-                    (
-                        thread_above_prefix,
-                        thread_equal_prefix,
-                        block_above,
-                        block_equal,
-                    ) = block_exclusive_scan_pair(thread_above, thread_equal)
-                    my_above = (
-                        fx.memref_load(
-                            s_meta,
-                            fx.Int32(SMEM_META_SHORT_FRONT_COUNT),
-                        )
-                        + thread_above_prefix
-                    )
-                    my_equal = (
-                        fx.memref_load(
-                            s_meta,
-                            fx.Int32(SMEM_META_SHORT_BACK_COUNT),
-                        )
-                        + thread_equal_prefix
-                    )
-                    for j in range_constexpr(LOAD_VEC):
-                        cls = classes[j]
-                        col_i32 = col_base + fx.Int32(j)
-                        accepted_equal = (my_equal < num_needed).select(
-                            my_equal, num_needed
-                        )
-                        out_pos = my_above + accepted_equal
-                        if cls == c_two:
-                            buffer_ops.buffer_store(
-                                col_i32, indices_rsrc, row_out + out_pos
-                            )
-                            my_above = my_above + c_one
-                        elif cls == c_one:
-                            if my_equal < num_needed:
-                                buffer_ops.buffer_store(
-                                    col_i32, indices_rsrc, row_out + out_pos
-                                )
-                            my_equal = my_equal + c_one
-                    if tid == c_zero:
-                        fx.memref_store(
-                            fx.memref_load(
-                                s_meta,
-                                fx.Int32(SMEM_META_SHORT_FRONT_COUNT),
-                            )
-                            + block_above,
-                            s_meta,
-                            fx.Int32(SMEM_META_SHORT_FRONT_COUNT),
-                        )
-                        fx.memref_store(
-                            fx.memref_load(
-                                s_meta,
-                                fx.Int32(SMEM_META_SHORT_BACK_COUNT),
-                            )
-                            + block_equal,
-                            s_meta,
-                            fx.Int32(SMEM_META_SHORT_BACK_COUNT),
-                        )
-                    gpu.barrier()
-
-            # Reread driver: stream the whole valid row from HBM once per pass.
-            # This keeps the short tier's VGPR footprint low while sharing the
-            # same per-chunk logic across radix passes and final scatter.
-            def reread_pass(chunk_fn):
-                for vblk in range(
-                    tid_idx,
-                    vec_blocks_idx,
-                    c_block_idx,
-                ):
-                    col_base = fx.Int32(vblk) * c_vec
-                    chunk_fn(col_base, load_row_vec(col_base))
-
-            # Pass 1: high 11 bits over the whole valid row.
-            clear_hist()
-            reread_pass(lambda cb, v: hist_pass1_chunk(cb, v))
-            gpu.barrier()
-            choose_threshold(
-                c_top_k,
-                fx.Int32(SMEM_META_SHORT_FIRST_ABOVE),
-                fx.Int32(SMEM_META_SHORT_FIRST_THRESHOLD),
-            )
-            first_threshold = fx.memref_load(
-                s_meta, fx.Int32(SMEM_META_SHORT_FIRST_THRESHOLD)
-            )
-
-            # Pass 2: mid 11 bits within the high boundary bucket.
-            clear_hist()
-            reread_pass(lambda cb, v: hist_pass2_chunk(cb, v, first_threshold))
-            gpu.barrier()
-            first_above = fx.memref_load(s_meta, fx.Int32(SMEM_META_SHORT_FIRST_ABOVE))
-            need_after_first = c_top_k - first_above
-            choose_threshold(
-                need_after_first,
-                fx.Int32(SMEM_META_SHORT_SECOND_ABOVE),
-                fx.Int32(SMEM_META_SHORT_SECOND_THRESHOLD),
-            )
-            second_threshold = fx.memref_load(
-                s_meta, fx.Int32(SMEM_META_SHORT_SECOND_THRESHOLD)
-            )
-
-            # Pass 3: low 10 bits within the high+mid boundary.
-            clear_hist()
-            reread_pass(
-                lambda cb, v: hist_pass3_chunk(cb, v, first_threshold, second_threshold)
-            )
-            gpu.barrier()
-            second_above = fx.memref_load(
-                s_meta, fx.Int32(SMEM_META_SHORT_SECOND_ABOVE)
-            )
-            need_after_second = need_after_first - second_above
-            choose_threshold(
-                need_after_second,
-                fx.Int32(SMEM_META_SHORT_THIRD_ABOVE),
-                fx.Int32(SMEM_META_SHORT_THIRD_THRESHOLD),
-            )
-            third_threshold = fx.memref_load(
-                s_meta, fx.Int32(SMEM_META_SHORT_THIRD_THRESHOLD)
-            )
-            third_above = fx.memref_load(s_meta, fx.Int32(SMEM_META_SHORT_THIRD_ABOVE))
-            num_needed = need_after_second - third_above
-
-            if const_expr(stable):
-                stable_final_scatter(
-                    first_threshold,
-                    second_threshold,
-                    third_threshold,
-                    num_needed,
-                )
-            else:
-                # Unordered mode keeps the cheaper atomic append.
-                reread_pass(
-                    lambda cb, v: final_scatter_chunk(
-                        cb,
-                        v,
+            num_steps = (row_vectors + block_threads - one) // block_threads
+            for step in range(zero, num_steps, one):
+                vector_idx = step * block_threads + tid
+                active_vector = vector_idx < row_vectors
+                safe_vector_idx = active_vector.select(vector_idx, zero)
+                col_base = safe_vector_idx * vec_width
+                values = _load_f32x4(input_resource, safe_vector_idx)
+                classes = fx.make_rmem_tensor(_VEC, fx.Int32)
+                local_above = zero
+                local_equal = zero
+                for lane_idx in range_constexpr(_VEC):
+                    col = col_base + lane_idx
+                    above, equal = classify(
+                        values[lane_idx],
                         first_threshold,
                         second_threshold,
                         third_threshold,
-                        num_needed,
                     )
-                )
+                    active = active_vector & (col < row_len)
+                    above_i32 = (active & above).select(one, zero)
+                    equal_i32 = (active & equal).select(one, zero)
+                    classes[lane_idx] = above_i32 * two + equal_i32
+                    local_above = local_above + above_i32
+                    local_equal = local_equal + equal_i32
 
-        # Direct-fill: rows with row_len <= top_k (part 0 only) emit identity indices + -1.
-        direct_fill = row_len <= c_top_k
-        direct_fill_active = (part == c_zero) & direct_fill
-        direct_fill_iters = direct_fill_active.select(fx.Index(top_k), fx.Index(0))
-        for out_col in range(tid_idx, direct_fill_iters, c_block_idx):
-            out_col_i32 = fx.Int32(out_col)
-            valid = out_col_i32 < row_len
-            out_val = valid.select(out_col_i32, c_neg_one)
-            buffer_ops.buffer_store(out_val, indices_rsrc, row_out + out_col_i32)
+                (
+                    above_prefix,
+                    equal_prefix,
+                    block_above,
+                    block_equal,
+                ) = block_exclusive_scan_pair(local_above, local_equal, scan, metadata)
+                my_above = metadata[_RUNNING_ABOVE] + above_prefix
+                my_equal = metadata[_RUNNING_EQUAL] + equal_prefix
+                for lane_idx in range_constexpr(_VEC):
+                    cls = classes[lane_idx]
+                    col = col_base + lane_idx
+                    accepted_equal = (my_equal < num_needed).select(
+                        my_equal, num_needed
+                    )
+                    out_pos = my_above + accepted_equal
+                    if cls == two:
+                        row_indices[out_pos] = col
+                        my_above = my_above + one
+                    elif cls == one:
+                        if my_equal < num_needed:
+                            row_indices[out_pos] = col
+                        my_equal = my_equal + one
+                if tid == 0:
+                    metadata[_RUNNING_ABOVE] = metadata[_RUNNING_ABOVE] + block_above
+                    metadata[_RUNNING_EQUAL] = metadata[_RUNNING_EQUAL] + block_equal
+                gpu.barrier()
 
-        if const_expr(short_tier):
-            short_active = single_part_active & (part == c_zero) & (row_len > c_top_k)
-            if short_active:
-                one_workgroup_short_tier()
-            persistent_active = (
-                (row_len > c_top_k) & (part < active_parts) & (~single_part_active)
+        if row_len <= top_k:
+            for output_step in range_constexpr(output_steps):
+                out_pos = output_step * _BLOCK_THREADS + tid
+                if out_pos < k:
+                    row_indices[out_pos] = (out_pos < row_len).select(
+                        out_pos, fx.Int32(-1)
+                    )
+
+        if row_len > top_k:
+            if tid < 8:
+                metadata[tid] = zero
+            gpu.barrier()
+
+            clear_histogram(histogram)
+            reread_row(histogram_pass1)
+            gpu.barrier()
+            choose_threshold(
+                top_k,
+                _FIRST_ABOVE,
+                _FIRST_THRESHOLD,
+                histogram,
+                scan,
+                metadata,
             )
-        else:
-            persistent_active = (row_len > c_top_k) & (part < active_parts)
+            first_threshold = metadata[_FIRST_THRESHOLD]
 
-        if persistent_active:
-            local_k = c_top_k
-            local_len = row_len
-            kth_bits = c_zero
-            if early_stop:
-                # Early termination: skip the final radix pass when the boundary bucket
-                # is taken whole (remaining_len == remaining_k) and write those elements
-                # directly. `early` comes from the globally merged histogram, so it is
-                # identical across the row's blocks -- they enter or skip the last
-                # row_barrier together, which is what keeps this deadlock-free.
-                for pass_id in range_constexpr(num_passes - 1):
-                    local_k, local_len, kth_bits = scan_pass(
-                        pass_id, local_k, kth_bits, pass_id + 1
-                    )
-                last_pass = num_passes - 1
-                prev_start_bit = max(32 - last_pass * bits_per_pass, 0)
-                early = local_len == local_k
-                if early:
-                    early_write_all(prev_start_bit, kth_bits)
-                if ~early:
-                    local_k, local_len, kth_bits = scan_pass(
-                        last_pass, local_k, kth_bits, last_pass + 1
-                    )
-            else:
-                for pass_id in range_constexpr(num_passes):
-                    local_k, local_len, kth_bits = scan_pass(
-                        pass_id, local_k, kth_bits, pass_id + 1
-                    )
-            if const_expr(stable):
-                stable_finalize(local_k, kth_bits)
+            clear_histogram(histogram)
+            reread_row(
+                lambda col, values: histogram_pass2(col, values, first_threshold)
+            )
+            gpu.barrier()
+            need_after_first = top_k - metadata[_FIRST_ABOVE]
+            choose_threshold(
+                need_after_first,
+                _SECOND_ABOVE,
+                _SECOND_THRESHOLD,
+                histogram,
+                scan,
+                metadata,
+            )
+            second_threshold = metadata[_SECOND_THRESHOLD]
 
-            cleanup_token = num_passes + (3 if stable else 1)
-            row_barrier(cleanup_token)
-            for workspace_idx in range(
-                global_vec_tid_idx,
-                fx.Index(row_workspace_slots),
-                active_stride_idx(),
-            ):
-                buffer_ops.buffer_store(
-                    c_zero,
-                    workspace_rsrc,
-                    row_ws_base + fx.Int32(workspace_idx),
+            clear_histogram(histogram)
+            reread_row(
+                lambda col, values: histogram_pass3(
+                    col,
+                    values,
+                    first_threshold,
+                    second_threshold,
                 )
+            )
+            gpu.barrier()
+            need_after_second = need_after_first - metadata[_SECOND_ABOVE]
+            choose_threshold(
+                need_after_second,
+                _THIRD_ABOVE,
+                _THIRD_THRESHOLD,
+                histogram,
+                scan,
+                metadata,
+            )
+            third_threshold = metadata[_THIRD_THRESHOLD]
+            num_needed = need_after_second - metadata[_THIRD_ABOVE]
+
+            stable_scatter(
+                first_threshold,
+                second_threshold,
+                third_threshold,
+                num_needed,
+                row_indices,
+                scan,
+                metadata,
+            )
 
     @flyc.jit
-    def launcher(
-        logits: fx.Tensor,
-        next_n: fx.Int32,
-        seq_lens: fx.Tensor,
+    def launch_topk_per_row_decode_one_workgroup(
+        input: fx.Tensor,
+        row_ends: fx.Tensor,
         indices: fx.Tensor,
-        workspace: fx.Tensor,
-        num_rows: fx.Int32,
+        width: fx.Int32,
+        next_n: fx.Int32,
         stride0: fx.Int32,
-        stride1: fx.Int32,
         stream: fx.Stream,
-    ) -> None:
-        grid_y = fx.Index(num_rows)
-        topk_per_row_decode_tiered_kernel(
-            logits, next_n, seq_lens, indices, workspace, stride0
+    ):
+        topk_per_row_decode_one_workgroup_kernel(
+            input,
+            row_ends,
+            indices,
+            width,
+            next_n,
+            stride0,
         ).launch(
-            grid=(blocks_per_row, grid_y, 1),
-            block=(block_threads, 1, 1),
+            grid=(rows, 1, 1),
+            block=(_BLOCK_THREADS, 1, 1),
             stream=stream,
         )
 
-    return launcher
+    return launch_topk_per_row_decode_one_workgroup
