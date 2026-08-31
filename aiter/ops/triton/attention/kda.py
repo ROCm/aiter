@@ -25,6 +25,50 @@ if _TRITON_GE_36 and _ARCH == "gfx1250":
     )
 
 
+def get_kda_config(
+    avg_T: int,
+    num_seqs: int,
+    HV: int,
+    K: int,
+    V: int,
+    overrides: dict | None = None,
+) -> dict:
+    """Route a shape to its published bucket. Every bucket in the config JSON
+    is complete (BV, SK, num_warps, num_buffers), so tuning values and their
+    fallbacks live there, not here. A partial ``overrides`` dict (config=)
+    inherits the resolved bucket's remaining values. For K outside the tuned
+    buckets, SK is shrunk to a legal divisor of the wave and K, with
+    num_warps refitted to the shrunken tile."""
+    tuned = load_config_json(
+        f"{AITER_TRITON_CONFIGS_PATH}/{_ARCH}-KDA_DECODE-DEFAULT.json"
+    )
+    num_seq_heads = num_seqs * HV
+    aligned = K % 32 == 0 and V % 32 == 0
+    if avg_T > 1:
+        if aligned and num_seq_heads >= 3072 and V % 128 == 0:
+            bucket = "t_gt1_seq_heads_geq_3072"
+        elif aligned and num_seq_heads >= 384:
+            bucket = "t_gt1_seq_heads_geq_384"
+        elif K % 16 == 0:
+            bucket = "t_gt1_default"
+        else:
+            bucket = "default"
+    elif aligned and 256 <= num_seq_heads <= 512:
+        bucket = "t1_seq_heads_256_to_512"
+    else:
+        bucket = "default"
+    config = dict(tuned[bucket])
+    overrides = overrides or {}
+    config.update(overrides)
+    if "SK" not in overrides:
+        config["SK"] = min(config["SK"], math.gcd(32, K))
+        if "num_warps" not in overrides:
+            config["num_warps"] = max(
+                1, min(config["num_warps"], config["BV"] * config["SK"] // 32)
+            )
+    return config
+
+
 def fused_recurrent_kda(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -53,6 +97,10 @@ def fused_recurrent_kda(
     config: dict | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Fused recurrent Kimi Delta Attention (KDA), gfx1250 Gluon decode path.
+
+    Per token: S = exp(g_t) * S, then S += beta_t * k_t (x) (v_t - S^T k_t),
+    then o_t = S^T q_t. Requires triton >= 3.6.0 on gfx1250.
+
     Args:
         q: [B, T, H, K] queries
         k: [B, T, H, K] keys
@@ -66,8 +114,9 @@ def fused_recurrent_kda(
             ``state_v_first`` (default) else [slots, HV, K, V]
         scale: q scale factor; defaults to K**-0.5.
         output_final_state: return the post-recurrence state
-        inplace_final_state: update ``initial_state``'s slabs in place, requires ``initial_state``.
-        state_v_first: state slab layout = [V, K]
+        inplace_final_state: update ``initial_state``'s slabs in place;
+            requires ``initial_state``.
+        state_v_first: state slab layout, [V, K] (True, default) or [K, V].
         cu_seqlens: [N + 1] varlen offsets; requires B == 1 with all tokens
             flattened into T.
         ssm_state_indices: [N, T] (or flat) per-token state slot table
@@ -89,7 +138,7 @@ def fused_recurrent_kda(
         config: tuning dict (BV, SK, num_warps, num_buffers, use_tdm_store,
             use_tdm_load, use_tdm_fused_load); None resolves a tuned bucket
             from ``configs/<arch>-KDA_DECODE-DEFAULT.json``, and omitted
-            keys fall back to defaults or a shape-based derivation.
+            keys inherit the resolved bucket's published values.
 
     Returns:
         (o, final_state): o is [B, T, HV, V] in v's dtype. final_state is
@@ -166,38 +215,14 @@ def fused_recurrent_kda(
         avg_T = max(1, T // max(1, N))
     else:
         avg_T = T
-    if config is None:
-        # Tuned buckets from the config file; keys a bucket omits fall back to
-        # the legacy derivation below.
-        tuned = load_config_json(
-            f"{AITER_TRITON_CONFIGS_PATH}/{_ARCH}-KDA_DECODE-DEFAULT.json"
-        )
-        num_seq_heads = N * HV
-        config = tuned["default"]
-        if K % 32 == 0 and V % 32 == 0:
-            if avg_T > 1:
-                if num_seq_heads >= 3072 and V % 128 == 0:
-                    config = tuned["t_gt1_seq_heads_geq_3072"]
-                elif num_seq_heads >= 384:
-                    config = tuned["t_gt1_seq_heads_geq_384"]
-            elif 256 <= num_seq_heads <= 512:
-                config = tuned["t1_seq_heads_256_to_512"]
-    BV = config.get("BV", 32)
-    SK = config.get("SK")
-    num_warps = config.get("num_warps")
+    config = get_kda_config(avg_T, N, HV, K, V, overrides=config)
+    BV = config["BV"]
+    SK = config["SK"]
+    num_warps = config["num_warps"]
     num_buffers = config.get("num_buffers", 2)
     use_tdm_store = config.get("use_tdm_store", False)
     use_tdm_load = config.get("use_tdm_load", False)
     use_tdm_fused_load = config.get("use_tdm_fused_load", False)
-    if SK is None:
-        if avg_T > 1 and K % 16 == 0 and BV * 16 >= 64:
-            SK = 8 if (V // BV) * N * HV <= 8192 else 16
-        else:
-            SK = math.gcd(32, K)
-        if num_warps is None and avg_T > 1:
-            num_warps = max(1, min(2, BV * SK // 32))
-    if num_warps is None:
-        num_warps = max(1, min(4, BV * SK // 32))
     assert V % BV == 0, f"BV={BV} must divide V={V}"
     assert 32 % SK == 0 and K % SK == 0, f"SK={SK} must divide 32 and K={K}"
     assert (BV * SK) % (

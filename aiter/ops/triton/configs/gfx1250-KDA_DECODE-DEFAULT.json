@@ -17,5 +17,16 @@
     "num_warps": 2,
     "num_buffers": 2
   },
-  "default": {}
+  "t_gt1_default": {
+    "BV": 32,
+    "SK": 8,
+    "num_warps": 2,
+    "num_buffers": 2
+  },
+  "default": {
+    "BV": 32,
+    "SK": 32,
+    "num_warps": 4,
+    "num_buffers": 2
+  }
 }

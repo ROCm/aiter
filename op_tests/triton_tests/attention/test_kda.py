@@ -8,8 +8,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-import aiter.ops.triton.attention.kda as kda_module
 from aiter.ops.triton.attention.kda import fused_recurrent_kda
+from aiter.ops.triton.utils import core as triton_core
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 arch = get_arch()
@@ -154,12 +154,13 @@ _TUNED: dict = {}
 @pytest.fixture
 def get_config(monkeypatch, tmp_path):
     name = f"{arch}-KDA_DECODE-DEFAULT.json"
-    with open(f"{kda_module.AITER_TRITON_CONFIGS_PATH}/{name}") as f:
-        buckets = list(json.load(f))
+    with open(f"{triton_core.AITER_TRITON_CONFIGS_PATH}/{name}") as f:
+        shipped = json.load(f)
 
     def _get(**variant):
-        (tmp_path / name).write_text(json.dumps(dict.fromkeys(buckets, variant)))
-        monkeypatch.setattr(kda_module, "AITER_TRITON_CONFIGS_PATH", str(tmp_path))
+        merged = {b: {**values, **variant} for b, values in shipped.items()}
+        (tmp_path / name).write_text(json.dumps(merged))
+        monkeypatch.setattr(triton_core, "AITER_TRITON_CONFIGS_PATH", str(tmp_path))
         monkeypatch.setattr(sys.modules[__name__], "_TUNED", dict(variant))
 
     return _get

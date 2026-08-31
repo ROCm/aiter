@@ -281,7 +281,7 @@ def fused_recurrent_kda_packed_decode_kernel(
     USE_TDM_LOAD: gl.constexpr = False,  # state load via TDM async_load + LDS
     CACHE_STATE_UPDATES: gl.constexpr = False,  # per-token (a, k, err), needs ssm_state_indices and no tdm_store
     USE_TDM_FUSED_LOAD: gl.constexpr = False,  # token operands via one fused TDM + LDS
-    PAD_SLOT_GUARD: gl.constexpr = False,  
+    PAD_SLOT_GUARD: gl.constexpr = False,
 ):
     gl.static_assert(V % BV == 0, "BV must divide V")
     gl.static_assert(32 % SK == 0, "SK must divide the wave")
