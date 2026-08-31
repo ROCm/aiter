@@ -984,3 +984,64 @@ def _rmsnorm_kernel_large_m_small_n(
 
     if RSIGMA is not None:
         tl.store(RSIGMA + m_off, rsigma, mask=mask_m)
+
+
+@triton.jit
+def _rmsnorm_bwd_kernel_large_m_small_n(
+    grad_output_ptr,  # [M, N]
+    input_ptr,  # [M, N]
+    g_ptr,  # [N]
+    rsigma_ptr,  # [M]
+    dx_ptr,  # [M, N]
+    dg_ptr,  # [num_programs, N] partial dgamma
+    input_row_stride,
+    output_row_stride,
+    M,
+    N,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    # Specialization for large-M / small-N (e.g. Qwen3 per-head q/k norm,
+    # M=b*s*heads, N=head_dim). The generic _rmsnorm_bwd_triton caps the grid at
+    # get_num_sms() programs and grid-strides over rows, serializing ~M/SMs rows
+    # per program. Here each program owns a BLOCK_M x BLOCK_N tile, so the row
+    # dimension is parallelized across the whole grid (mirror of the forward
+    # _rmsnorm_kernel_large_m_small_n). dgamma is reduced over rows within the
+    # block into a per-program partial, then finished by _rmsnorm_bwd_dg_reduce.
+    pid_m = tl.program_id(0)
+    m_off = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    n_off = tl.arange(0, BLOCK_N)
+
+    mask_m = m_off < M
+    mask_n = n_off < N
+    mask = mask_m[:, None] & mask_n[None, :]
+
+    x = tl.load(
+        input_ptr + m_off[:, None] * input_row_stride + n_off[None, :],
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    grad_output = tl.load(
+        grad_output_ptr + m_off[:, None] * output_row_stride + n_off[None, :],
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    g = tl.load(g_ptr + n_off, mask=mask_n, other=0.0).to(tl.float32)
+    norm_factor = tl.load(rsigma_ptr + m_off, mask=mask_m, other=0.0).to(tl.float32)
+
+    # per-row grad_sum over N (masked-out cols already contribute 0)
+    grad_sum = tl.sum(grad_output * x * g[None, :], axis=1)  # [BLOCK_M]
+
+    coeff = (norm_factor * norm_factor * norm_factor) * (grad_sum / N)  # [BLOCK_M]
+    grad_input = grad_output * norm_factor[:, None] * g[None, :] - coeff[:, None] * x
+    tl.store(
+        dx_ptr + m_off[:, None] * input_row_stride + n_off[None, :],
+        grad_input.to(dx_ptr.type.element_ty),
+        mask=mask,
+    )
+
+    # partial dgamma: reduce this block's rows (masked rows contribute 0)
+    dg = grad_output * x * norm_factor[:, None]
+    dg = tl.where(mask, dg, 0.0)
+    dg_partial = tl.sum(dg, axis=0)  # [BLOCK_N]
+    tl.store(dg_ptr + pid_m * N + n_off, dg_partial, mask=mask_n)

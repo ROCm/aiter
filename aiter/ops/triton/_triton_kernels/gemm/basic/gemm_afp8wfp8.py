@@ -470,7 +470,7 @@ def _get_config(
     N: int,
     K: int,
     shuffle: bool = False,
-    backend: str | None = None,
+    backend: str = "triton",
 ):
     # backend selects the per-backend config dir (<arch>/<backend>/gemm/), so the
     # triton and gluon kernels can carry different tuning keys for the same shape.
