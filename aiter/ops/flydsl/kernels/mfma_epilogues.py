@@ -34,27 +34,13 @@ directly, so callers no longer inject the dialect modules.
 from __future__ import annotations
 
 from collections.abc import Callable
-from contextlib import contextmanager
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import scf
-from flydsl.expr import gpu, range_constexpr
+from flydsl.expr import arith, gpu, range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
-
-
-@contextmanager
-def _if_then(if_op):
-    """Compat helper for SCF IfOp then-region across old/new Python APIs."""
-    with ir.InsertionPoint(if_op.then_block):
-        try:
-            yield if_op.then_block
-        finally:
-            blk = if_op.then_block
-            if (not blk.operations) or not isinstance(blk.operations[-1], scf.YieldOp):
-                scf.YieldOp([])
 
 
 def default_epilog(
@@ -243,12 +229,7 @@ def c_shuffle_epilog(
             )
             row_ctx = row_ctx_raw
             row_pred = None
-            if (
-                scf is not None
-                and row_ctx_raw is not None
-                and isinstance(row_ctx_raw, tuple)
-                and len(row_ctx_raw) == 2
-            ):
+            if isinstance(row_ctx_raw, tuple) and len(row_ctx_raw) == 2:
                 row_ctx, row_pred = row_ctx_raw
             _precomputed_rows_s.append((row_local, row, row_ctx, row_pred))
 
@@ -262,17 +243,18 @@ def c_shuffle_epilog(
                     col_pair0_local = col_base_nr + (n_lane_s * c_evec)
                     lds_idx = row_base_lds + col_pair0_local
 
-                    # Value-yielding if/else: kept as scf.IfOp because @flyc.jit
-                    # cannot merge a result produced in both branches back to the
-                    # caller. Selects the per-group LDS source buffer.
-                    _if_ld = scf.IfOp(_is_group_b.ir_value(), [vec_frag], has_else=True)
-                    with ir.InsertionPoint(_if_ld.then_block):
-                        fb = Vec.load(vec_frag, lds_out_split, [lds_idx]).ir_value()
-                        scf.YieldOp([fb])
-                    with ir.InsertionPoint(_if_ld.else_block):
-                        fa = Vec.load(vec_frag, lds_out, [lds_idx]).ir_value()
-                        scf.YieldOp([fa])
-                    frag = _if_ld.results[0]
+                    # Select the per-group LDS source buffer, then issue a single
+                    # load. Both buffers share the same `lds_idx`, so selecting the
+                    # source (not the loaded value) keeps this to one ds_read;
+                    # loading from both and selecting the result would double LDS
+                    # traffic. A memref-typed ternary is a hard boundary with no
+                    # numeric-`fx` wrapper, so the raw `arith` select is localized
+                    # here (a value-returning `@flyc.jit` mis-merges the two
+                    # branches and drifts numerically on multi-row tiles).
+                    src = arith.ArithValue(_is_group_b.ir_value()).select(
+                        lds_out_split, lds_out
+                    )
+                    frag = Vec.load(vec_frag, src, [lds_idx]).ir_value()
 
                     col_pair0 = col_pair0_local + _is_group_b.select(
                         _half_n_idx, _zero_idx
@@ -373,16 +355,11 @@ def c_shuffle_epilog(
             else None
         )
 
-        # Optional row-level predicate: if `precompute_row` returns `(ctx, pred_i1)` and `scf`
-        # is provided, we can skip the entire N-loop for invalid rows (cheaper than per-store checks).
+        # Optional row-level predicate: if `precompute_row` returns `(ctx, pred_i1)`,
+        # skip the entire N-loop for invalid rows (cheaper than per-store checks).
         row_ctx = row_ctx_raw
         row_pred = None
-        if (
-            scf is not None
-            and row_ctx_raw is not None
-            and isinstance(row_ctx_raw, tuple)
-            and len(row_ctx_raw) == 2
-        ):
+        if isinstance(row_ctx_raw, tuple) and len(row_ctx_raw) == 2:
             row_ctx, row_pred = row_ctx_raw
 
         _precomputed_rows.append((row_local, row, row_ctx, row_pred))
