@@ -49,12 +49,10 @@ def _imax(a, b):
 
 
 def _idiv(a, b):
-    """Truncating signed integer divide. ``//`` maps to arith.floordivsi, a
-    longer expansion; every dividend here is already clamped non-negative, so
-    the truncating op is both correct and cheaper."""
-    from flydsl.expr import arith
-
-    return fx.Int32(arith.divsi(a.ir_value(), b.ir_value()))
+    """Truncating integer divide. Signed ``//`` maps to arith.floordivsi, a
+    longer expansion; every dividend here is provably non-negative, so an
+    unsigned divide (divui) is both correct and cheaper."""
+    return fx.Int32(fx.Uint32(a) // fx.Uint32(b))
 
 
 _STATIC_ADAPTOR_CACHE = {}

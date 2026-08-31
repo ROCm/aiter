@@ -20,7 +20,6 @@ from flydsl.expr import arith, range_constexpr
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch
 
-from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.utility.mx_types import (
     MX_DEFAULT_ROUND_MODE as _MX_DEFAULT_MODE,
 )
@@ -29,6 +28,7 @@ from aiter.utility.mx_types import (
 )
 
 from .quant_utils import emit_mx_e8m0_scale
+from .tensor_shim import ptr_buf_tensor
 
 _AS_GLOBAL = fx.AddressSpace.Global
 
@@ -70,12 +70,9 @@ def state_slot_byte_offset(slot, slot_stride_f32_elems):
     size. `get_element_ptr` adds this in 64-bit pointer arithmetic, so only
     the multiply needs widening, and the remaining offset covers one entry.
     """
-    slot_i64 = arith.extsi(T.i64, buffer_ops._unwrap_value(slot))
-    stride_i64 = arith.extsi(T.i64, buffer_ops._unwrap_value(slot_stride_f32_elems))
-    return arith.muli(
-        arith.muli(slot_i64, stride_i64),
-        arith.constant(4, type=T.i64),  # sizeof(f32)
-    )
+    slot_i64 = fx.Int64(fx.Int32(slot))
+    stride_i64 = fx.Int64(fx.Int32(slot_stride_f32_elems))
+    return (slot_i64 * stride_i64 * fx.Int64(4)).ir_value()  # x sizeof(f32)
 
 
 def block_base_bytes_i64(physical_block, block_stride, elem_bytes: int = 1):
@@ -99,15 +96,15 @@ def block_base_bytes_i64(physical_block, block_stride, elem_bytes: int = 1):
     constants). ``elem_bytes`` converts: 1 for the fp8/uint8 entry caches, 2
     for a bf16 one, 4 for the fp32 per-token scale.
     """
-    blk_i64 = arith.extsi(T.i64, buffer_ops._unwrap_value(physical_block))
+    blk_i64 = fx.Int64(fx.Int32(physical_block))
     if isinstance(block_stride, int):
-        stride_i64 = arith.constant(block_stride, type=T.i64)
+        stride_i64 = fx.Int64(block_stride)
     else:
-        stride_i64 = arith.extsi(T.i64, buffer_ops._unwrap_value(block_stride))
-    base = arith.muli(blk_i64, stride_i64)
-    if elem_bytes == 1:
-        return base
-    return arith.muli(base, arith.constant(elem_bytes, type=T.i64))
+        stride_i64 = fx.Int64(fx.Int32(block_stride))
+    base = blk_i64 * stride_i64
+    if elem_bytes != 1:
+        base = base * fx.Int64(elem_bytes)
+    return base.ir_value()
 
 
 def _global_ptr(base_i64, byte_off, elem_ir_type, align):
@@ -150,8 +147,10 @@ def buf_tensor(tensor, elem_ty, *, base_i64=None):
         address_space=_AS_GLOBAL,
         alignment=elem_ty.width // 8,
     )
-    view = fx.make_view(fx.inttoptr(pt, base_i), fx.make_layout((n_elems,), (1,)))
-    return fx.rocdl.make_buffer_tensor(view)
+    # Descriptor build (view + make_buffer_tensor) is shared with tensor_shim;
+    # ptr_buf_tensor does a ptrtoint(inttoptr(base_i)) roundtrip that folds
+    # away pre-ISA, so the emitted V# is identical.
+    return ptr_buf_tensor(fx.inttoptr(pt, base_i), elem_ty, n_elems)
 
 
 def buf_load(buf, off_elems, width, dtype):
