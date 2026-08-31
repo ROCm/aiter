@@ -13,6 +13,7 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops import topk as public_topk_impl
 from aiter.ops.flydsl import topk_per_row as topk_per_row_impl
 from aiter.ops.flydsl.kernels.topk_per_row_decode import (
     topk_per_row_decode_workspace_shapes,
@@ -29,6 +30,81 @@ E2E_TIMED_ITERS = 101
 def test_flydsl_topk_three_pass_workspace_geometry():
     assert topk_per_row_decode_workspace_shapes(26, True)[0][1] == 16
     assert topk_per_row_decode_workspace_shapes(128, False)[0][1] == 16
+
+
+@pytest.mark.parametrize(
+    "arch,stable,top_k,rows,width,expected",
+    [
+        ("gfx942", True, 2048, 1, 65_536, False),
+        ("gfx950", True, 128, 1, 65_536, False),
+        ("gfx950", True, 256, 1, 65_536, False),
+        ("gfx950", True, 512, 1, 65_536, True),
+        ("gfx950", True, 1024, 1, 65_536, True),
+        ("gfx950", True, 2048, 1, 65_536, True),
+        ("gfx950", True, 4096, 1, 65_536, True),
+        ("gfx950", False, 2048, 1, 131_071, False),
+        ("gfx950", False, 2048, 32, 131_072, True),
+        ("gfx950", False, 2048, 33, 131_072, False),
+        ("gfx950", True, 2048, 128, 20_000, True),
+        ("gfx950", True, 2048, 129, 20_000, False),
+        ("gfx950", True, 2048, 1, 32_767, False),
+        ("gfx950", True, 2048, 16, 32_768, True),
+        ("gfx950", True, 2048, 17, 32_768, False),
+        ("gfx950", True, 2048, 32, 65_536, True),
+        ("gfx950", True, 2048, 33, 65_536, False),
+    ],
+)
+def test_public_topk_decode_gate(
+    monkeypatch, arch, stable, top_k, rows, width, expected
+):
+    from aiter.ops.flydsl import utils as flydsl_utils
+
+    public_topk_impl._flydsl_topk_decode_available.cache_clear()
+    monkeypatch.setattr(public_topk_impl, "get_gfx", lambda: arch)
+    monkeypatch.setattr(public_topk_impl, "_FLYDSL_TOPK_DECODE_DISABLED", False)
+    monkeypatch.setattr(flydsl_utils, "is_flydsl_available", lambda: True)
+    logits = torch.empty((rows, width), dtype=torch.float32, device="cuda")
+    assert (
+        public_topk_impl._should_use_flydsl_topk_decode(
+            logits,
+            rows,
+            top_k,
+            stable,
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize("stable", [False, True])
+def test_public_topk_decode_dispatch_matches_hip(monkeypatch, stable):
+    from aiter.ops.flydsl import utils as flydsl_utils
+
+    public_topk_impl._flydsl_topk_decode_available.cache_clear()
+    monkeypatch.setattr(public_topk_impl, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(public_topk_impl, "_FLYDSL_TOPK_DECODE_DISABLED", False)
+    monkeypatch.setattr(flydsl_utils, "is_flydsl_available", lambda: True)
+    rows, width, top_k = 4, 20_000, 2048
+    logits = torch.randn((rows, width), dtype=torch.float32, device="cuda")
+    seq_lens = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+    output = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
+    reference = torch.empty_like(output)
+    public_topk_impl.top_k_per_row_decode(
+        logits,
+        1,
+        seq_lens,
+        output,
+        rows,
+        logits.stride(0),
+        logits.stride(1),
+        top_k,
+        stable,
+    )
+    _run_hip(logits, 1, seq_lens, reference, top_k, stable)
+    torch.cuda.synchronize()
+    if not stable:
+        output = torch.sort(output, dim=-1).values
+        reference = torch.sort(reference, dim=-1).values
+    torch.testing.assert_close(output, reference, rtol=0, atol=0)
 
 
 def test_flydsl_topk_workspace_cache_reuses_allocation():
@@ -54,7 +130,7 @@ def test_flydsl_topk_workspace_cache_reuses_allocation():
 @pytest.mark.parametrize("stable", [False, True])
 def test_flydsl_topk_dynamic_n_reuses_launcher(stable: bool):
     rows, top_k = 4, 2048
-    topk_per_row_impl._get_topk_launcher.cache_clear()
+    topk_per_row_impl.build_topk_per_row_decode_module.cache_clear()
     topk_per_row_impl.clear_topk_per_row_decode_workspace_cache()
     try:
         for context_len in (20_001, 40_003):
@@ -79,11 +155,11 @@ def test_flydsl_topk_dynamic_n_reuses_launcher(stable: bool):
                     atol=0,
                 )
 
-        cache_info = topk_per_row_impl._get_topk_launcher.cache_info()
+        cache_info = topk_per_row_impl.build_topk_per_row_decode_module.cache_info()
         assert cache_info.misses == 1
         assert cache_info.hits >= 1
     finally:
-        topk_per_row_impl._get_topk_launcher.cache_clear()
+        topk_per_row_impl.build_topk_per_row_decode_module.cache_clear()
         topk_per_row_impl.clear_topk_per_row_decode_workspace_cache()
 
 
@@ -160,7 +236,7 @@ def _run_hip(
     top_k: int,
     stable: bool,
 ) -> torch.Tensor:
-    aiter.top_k_per_row_decode(
+    public_topk_impl._hip_top_k_per_row_decode(
         logits,
         next_n,
         seq_lens,
@@ -253,13 +329,13 @@ def test_flydsl_topk_single_row_dynamic_multi_graph():
     output = torch.empty((1, top_k), dtype=torch.int32, device="cuda")
     reference = torch.empty_like(output)
 
-    topk_per_row_impl._get_topk_launcher.cache_clear()
+    topk_per_row_impl.build_topk_per_row_decode_module.cache_clear()
     # Long single-row calls deliberately use the safe multi-launch path.
     _run_flydsl(logits, 1, seq_lens, output, top_k, True)
     _run_hip(logits, 1, seq_lens, reference, top_k, True)
     torch.cuda.synchronize()
     torch.testing.assert_close(output, reference, rtol=0, atol=0)
-    assert topk_per_row_impl._get_topk_launcher.cache_info().misses == 1
+    assert topk_per_row_impl.build_topk_per_row_decode_module.cache_info().misses == 1
 
     graph_lens = seq_lens.clone()
     graph_output = torch.full_like(output, -777)
@@ -430,6 +506,9 @@ def test_flydsl_topk_decode(
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = err
     return ret
+
+
+test_flydsl_topk_decode.__test__ = False
 
 
 def main():
