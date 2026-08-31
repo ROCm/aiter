@@ -97,6 +97,7 @@ else:
     from .ops.gemm_op_a8w8 import *
     from .ops.gemm_op_a16w16 import *
     from .ops.gemm_op_a4w4 import *
+    from .ops.gemm_op_a6w6 import *
     from .ops.gemm_op_a8w4 import *
     from .ops.batched_gemm_op_a8w8 import *
     from .ops.batched_gemm_op_bf16 import *
@@ -112,6 +113,7 @@ else:
     from .ops.moe_sorting import *
     from .ops.moe_sorting_opus import *
     from .ops.moe_mxfp4_aux import *
+    from .ops.mla_sparse_prefill import *
     from .ops.pa_sparse_prefill_opus import *
     from .ops.pos_encoding import *
     from .ops.cache import *

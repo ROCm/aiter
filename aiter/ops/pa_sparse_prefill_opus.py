@@ -1,21 +1,26 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""OPUS-based sparse paged prefill attention for DeepSeek-V4 on gfx950.
+"""OPUS-based sparse paged prefill attention for DeepSeek-V4.
 
 Two-region sparse scaled-dot-product attention over a paged prefix source
 (``unified_kv``) and a flat per-fwd extend source (``kv``), with a per-head
 softmax-denominator sink. The two regions share a single online-softmax
 accumulator, making the order region-invariant.
 
-The user-facing entry is :func:`pa_sparse_prefill_opus`; it forwards
-to the JIT-compiled HIP kernel via
-:func:`pa_sparse_prefill_opus_fwd`.
+The user-facing entry is :func:`pa_sparse_prefill_opus`, which dispatches on
+the running GPU. Both backends live in ``module_pa_sparse_prefill_opus``:
 
-The kernel currently only compiles a single configuration:
+* ``gfx950`` -- :func:`pa_sparse_prefill_gfx950_opus_fwd`, kernel compiled
+  from source by the JIT.
+* ``gfx1250`` -- :func:`pa_sparse_prefill_gfx1250_opus_fwd`, kernel loaded
+  from the prebuilt code objects in ``hsa/gfx1250/mla_v4_opus/``.
+
+Constraints common to both:
 
 * Head dim ``D == 512``.
 * dtype ``bf16`` or ``fp16`` for Q/K/V/O; ``attn_sink`` is ``fp32``.
+  ``gfx1250`` builds only the ``bf16`` variant.
 * Every entry in ``kv_indices_prefix`` / ``kv_indices_extend`` must be a
   valid row index into ``unified_kv`` / ``kv`` respectively. Empty CSR rows
   (``kv_indptr[i] == kv_indptr[i+1]``) are allowed.
@@ -31,9 +36,41 @@ from ..jit.utils.torch_guard import torch_compile_guard
 
 MD_NAME = "module_pa_sparse_prefill_opus"
 
+SUPPORTED_ARCHS = ("gfx950", "gfx1250")
 
-@compile_ops("module_pa_sparse_prefill_opus", develop=True)
-def pa_sparse_prefill_opus_fwd(
+
+def _dispatch(gfx: str, op_gfx950, op_gfx1250):
+    """Pick the backend for the running GPU.
+
+    gfx950 compiles the kernel from source. gfx1250 instead loads a prebuilt
+    code object (``hsa/gfx1250/mla_v4_opus/``), because its kernel needs
+    the CoExec scheduler from a custom LLVM build that release images do not
+    ship; see ``csrc/py_itfs_cu/pa_sparse_prefill_opus_kernels.cu``.
+    """
+    if gfx == "gfx1250":
+        return op_gfx1250
+    if gfx == "gfx950":
+        return op_gfx950
+    raise RuntimeError(f"pa_sparse_prefill_opus supports {SUPPORTED_ARCHS}, got {gfx}")
+
+
+@compile_ops(MD_NAME, develop=True)
+def pa_sparse_prefill_gfx950_opus_fwd(
+    q: torch.Tensor,
+    unified_kv: torch.Tensor,
+    kv_indices_prefix: torch.Tensor,
+    kv_indptr_prefix: torch.Tensor,
+    kv: torch.Tensor,
+    kv_indices_extend: torch.Tensor,
+    kv_indptr_extend: torch.Tensor,
+    attn_sink: torch.Tensor,
+    out: torch.Tensor,
+    softmax_scale: float,
+) -> None: ...
+
+
+@compile_ops(MD_NAME, develop=True)
+def pa_sparse_prefill_gfx1250_opus_fwd(
     q: torch.Tensor,
     unified_kv: torch.Tensor,
     kv_indices_prefix: torch.Tensor,
@@ -102,11 +139,16 @@ def pa_sparse_prefill_opus(
       ``out`` (``[T, H, D]`` same dtype as ``q``).
     """
     gfx = get_gfx_runtime()
-    if gfx != "gfx950":
-        raise RuntimeError(f"pa_sparse_prefill_opus requires gfx950, got {gfx}")
+    fwd = _dispatch(
+        gfx, pa_sparse_prefill_gfx950_opus_fwd, pa_sparse_prefill_gfx1250_opus_fwd
+    )
 
     if q.dtype not in (torch.bfloat16, torch.float16):
         raise RuntimeError(f"pa_sparse_prefill_opus expects fp16/bf16 q, got {q.dtype}")
+    if gfx == "gfx1250" and q.dtype != torch.bfloat16:
+        raise RuntimeError(
+            f"the gfx1250 code object only provides the bf16 variant, got {q.dtype}"
+        )
     if unified_kv.dtype != q.dtype:
         raise RuntimeError(
             f"unified_kv dtype mismatch: unified_kv={unified_kv.dtype}, q={q.dtype}"
@@ -126,7 +168,7 @@ def pa_sparse_prefill_opus(
             f"expected shape={tuple(q.shape)} dtype={q.dtype}"
         )
 
-    pa_sparse_prefill_opus_fwd(
+    fwd(
         q,
         unified_kv,
         kv_indices_prefix,
@@ -141,8 +183,26 @@ def pa_sparse_prefill_opus(
     return out
 
 
-@compile_ops("module_pa_sparse_prefill_opus", develop=True)
-def pa_sparse_prefill_fp8_opus_fwd(
+@compile_ops(MD_NAME, develop=True)
+def pa_sparse_prefill_fp8_gfx950_opus_fwd(
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+    unified_kv_nope: torch.Tensor,
+    unified_kv_rope: torch.Tensor,
+    kv_indices_prefix: torch.Tensor,
+    kv_indptr_prefix: torch.Tensor,
+    kv_nope: torch.Tensor,
+    kv_rope: torch.Tensor,
+    kv_indices_extend: torch.Tensor,
+    kv_indptr_extend: torch.Tensor,
+    attn_sink: torch.Tensor,
+    out: torch.Tensor,
+    softmax_scale: float,
+) -> None: ...
+
+
+@compile_ops(MD_NAME, develop=True)
+def pa_sparse_prefill_fp8_gfx1250_opus_fwd(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
     unified_kv_nope: torch.Tensor,
@@ -224,8 +284,11 @@ def pa_sparse_prefill_fp8_opus(
       ``out`` (``[T, H, 512]`` bf16).
     """
     gfx = get_gfx_runtime()
-    if gfx != "gfx950":
-        raise RuntimeError(f"pa_sparse_prefill_fp8_opus requires gfx950, got {gfx}")
+    fwd = _dispatch(
+        gfx,
+        pa_sparse_prefill_fp8_gfx950_opus_fwd,
+        pa_sparse_prefill_fp8_gfx1250_opus_fwd,
+    )
 
     if q_nope.dtype != unified_kv_nope.dtype or q_nope.dtype != kv_nope.dtype:
         raise RuntimeError(
@@ -244,7 +307,7 @@ def pa_sparse_prefill_fp8_opus(
             f"expected shape={(t, h, 512)} dtype={torch.bfloat16}"
         )
 
-    pa_sparse_prefill_fp8_opus_fwd(
+    fwd(
         q_nope,
         q_rope,
         unified_kv_nope,
@@ -263,8 +326,10 @@ def pa_sparse_prefill_fp8_opus(
 
 
 __all__ = [
+    "pa_sparse_prefill_fp8_gfx950_opus_fwd",
+    "pa_sparse_prefill_fp8_gfx1250_opus_fwd",
     "pa_sparse_prefill_fp8_opus",
-    "pa_sparse_prefill_fp8_opus_fwd",
+    "pa_sparse_prefill_gfx950_opus_fwd",
+    "pa_sparse_prefill_gfx1250_opus_fwd",
     "pa_sparse_prefill_opus",
-    "pa_sparse_prefill_opus_fwd",
 ]

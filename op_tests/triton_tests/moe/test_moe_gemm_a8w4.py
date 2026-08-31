@@ -241,6 +241,7 @@ class Case:
 @pytest.mark.parametrize("fused_quant", [False, True])
 @pytest.mark.parametrize("out_mx_quant", [False, True])
 @pytest.mark.parametrize("preshuffled", [False, True])
+@pytest.mark.parametrize("backend", ["gluon", "triton"])
 def test_op(
     m,
     n,
@@ -252,6 +253,7 @@ def test_op(
     fused_quant,
     out_mx_quant,
     preshuffled,
+    backend,
     n_expts_tot,
     n_expts_act,
     act_dtype_str,
@@ -262,8 +264,14 @@ def test_op(
     if get_arch() != "gfx950" and get_arch() != "gfx1250":
         pytest.skip("Kernel not supported on this GPU.")
 
+    if backend == "gluon" and get_arch() != "gfx1250":
+        pytest.skip(f"Gluon backend requires gfx1250, got {get_arch()}.")
+
     if preshuffled and get_arch() != "gfx1250":
         pytest.skip("Preshuffled weights are only supported on gfx1250.")
+
+    if preshuffled and backend == "triton":
+        pytest.skip("Preshuffled weights are decoded by the gluon kernel only.")
 
     if preshuffled and ((k // 2) % 32 != 0 or n % 16 != 0):
         pytest.skip(
@@ -271,7 +279,7 @@ def test_op(
             f"got k//2={k // 2}, N={n}."
         )
 
-    if get_arch() == "gfx1250":
+    if get_arch() == "gfx1250" and backend == "gluon":
         # temporary
         if do_gather and m > 1024 and act_dtype_str == "mxfloat8_e4m3fn":
             pytest.skip("do_gather (TDM async_gather) is not supported on gfx1250.")
@@ -388,6 +396,7 @@ def test_op(
         apply_swiglu,
         preshuffled=preshuffled,
         out_mx_quant=out_mx_quant,
+        backend=backend,
     )
     if out_mx_quant:
         tri_y, tri_y_scale = tri_y

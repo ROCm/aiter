@@ -31,10 +31,11 @@ that feeds each layer -- is built once outside the timed region, mirroring the
 build()/fn() split in mi450-scripts/run_moe_a4w4.py so the numbers are
 comparable to that runner (which benches one projection per invocation).
 
-On gfx1250 `moe_gemm_a4w4` defaults to the gluon backend, which dispatches to
-_moe_gemm_a4w4_decode when routing picks block_m == 16 and to
-_moe_gemm_a4w4_prefill otherwise. --backend pins the backend, and --preshuffle
-enables the gluon-only gfx1250 WMMA weight preshuffle.
+`moe_gemm_a4w4` defaults to the gluon kernels on gfx1250 --
+_moe_gemm_a4w4_decode when routing picks block_m == 16 and _moe_gemm_a4w4_prefill
+otherwise -- and the triton kernel elsewhere. --backend pins one instead (gluon
+needs gfx1250). --preshuffle enables the gluon-only gfx1250 WMMA weight
+preshuffle.
 """
 
 import argparse
@@ -49,7 +50,6 @@ import triton
 from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
-    is_gluon_supported,
     moe_gemm_a4w4,
     mxfp4_quant,
 )
@@ -242,17 +242,17 @@ def pin_routed_experts(logits, n_routed, n_expts_act):
     return masked, n_pinned
 
 
-def resolve_backend(backend):
-    """`None` lets moe_gemm_a4w4 pick per arch; resolve it the way it does."""
-    if backend is None:
-        return "gluon" if is_gluon_supported() else "triton"
-    return backend
+def backend_name(backend=None):
+    """Backend moe_gemm_a4w4 runs, resolving None the way the op does."""
+    if backend is not None:
+        return backend
+    return "gluon" if get_arch() == "gfx1250" else "triton"
 
 
-def kernel_variant(block_m, backend):
+def kernel_variant(block_m, backend=None):
     """Compiled kernel moe_gemm_a4w4 dispatches to -- same rule as
     run_moe_a4w4.py's `name` subcommand."""
-    if resolve_backend(backend) != "gluon":
+    if backend_name(backend) != "gluon":
         return "_moe_gemm_a4w4"
     return "_moe_gemm_a4w4_decode" if block_m == 16 else "_moe_gemm_a4w4_prefill"
 
@@ -266,8 +266,8 @@ def bench_mlp_single_weight_init(
     x_dtype,
     w_dtype,
     TP,
-    backend,
     preshuffle,
+    backend,
     routed_experts,
     rep,
     layers=LAYERS,
@@ -433,8 +433,8 @@ def bench_mlp(
     x_dtype,
     w_dtype,
     TP,
-    backend,
     preshuffle,
+    backend,
     routed_experts,
     rep,
     layers=LAYERS,
@@ -451,8 +451,8 @@ def bench_mlp(
             x_dtype,
             w_dtype,
             TP,
-            backend,
             preshuffle,
+            backend,
             routed_experts,
             rep,
             layers,
@@ -486,8 +486,8 @@ def roofline_mlp(
     x_dtype,
     w_dtype,
     TP,
-    backend,
     preshuffle,
+    backend,
     routed_experts,
     rep,
     layers=LAYERS,
@@ -506,7 +506,7 @@ def roofline_mlp(
     )
     if routed_experts is not None:
         stem += f"-routed={routed_experts}"
-    stem += f"-{resolve_backend(backend)}"
+    stem += f"-{backend_name(backend)}"
     if preshuffle:
         stem += "-preshuffled"
     if tuple(layers) != LAYERS:
@@ -522,8 +522,8 @@ def roofline_mlp(
         x_dtype,
         w_dtype,
         TP,
-        backend,
         preshuffle,
+        backend,
         routed_experts,
         rep,  # fixed args
         layers,
@@ -572,9 +572,10 @@ def parse_args(args: list[str] | None = None):
     )
     parser.add_argument(
         "--backend",
-        choices=["auto", "triton", "gluon"],
-        default="auto",
-        help="moe_gemm_a4w4 backend (default: auto, which is gluon on gfx1250).",
+        choices=["triton", "gluon"],
+        default=None,
+        help="Kernel backend for moe_gemm_a4w4. Default: unset, i.e. the arch "
+        "default (gluon on gfx1250, triton elsewhere). gluon requires gfx1250.",
     )
     parser.add_argument(
         "--preshuffle",
@@ -649,8 +650,8 @@ def main(args: list[str] | None = None) -> None:
         quantized_dtypes[0],
         quantized_dtypes[1],
         TP=1,
-        backend=None if parsed_args.backend == "auto" else parsed_args.backend,
         preshuffle=parsed_args.preshuffle,
+        backend=parsed_args.backend,
         routed_experts=parsed_args.routed_experts,
         rep=parsed_args.rep,
         # dedupe, keeping the canonical report order rather than argv order
