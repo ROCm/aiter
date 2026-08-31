@@ -11,6 +11,10 @@ multi-device backward (cuda:1 tensors, current device cuda:0), and large-B
 
 Performance (``main()``, Mi=7680): FlyDSL vs upstream Triton on headline deployment
 shapes, swept over regime and backward component (``jagged`` / ``dense_bias`` / ``all``).
+Split-component timings reuse hoisted output buffers on both sides; Triton
+``dense_bias`` still allocates ``d_bias`` internally each iteration (upstream API
+has no out-buffer for it), so that component comparison is slightly Triton-heavy
+vs FlyDSL.
 
 Run (inside the venv):
     HIP_VISIBLE_DEVICES=0 pytest op_tests/test_jagged_dense_bmm_bwd.py
@@ -188,16 +192,27 @@ def _component_cos(component, got, ref):
 
 
 def _build_triton_fn(jagged, dense, d_out, seq_offsets, B, Mi, N, K, component):
+    """Triton closures for perf timing.
+
+    Hoists ``d_jagged`` and ``d_dense`` (the buffers the upstream API accepts as
+    outputs) so timed iterations do not pay per-iter ``empty_like`` allocation.
+    ``triton_jagged_dense_bmm_add_bwd_dense_bias`` (``elementwise=False``) still
+    allocates ``d_bias`` inside the function on every call; that cost is upstream
+    API behavior, not a benchmark artifact. FlyDSL hoists ``d_bias`` because its
+    launcher accepts a caller-provided buffer.
+    """
     so64 = seq_offsets.to(torch.int64)
+    d_jagged_out = torch.empty_like(jagged)
+    d_dense_out = torch.empty_like(dense)
 
     def run_jagged():
         return triton_jagged_dense_bmm_add_bwd_jagged(
-            Mi, so64, torch.empty_like(jagged), dense, d_out, K, B, N
+            Mi, so64, d_jagged_out, dense, d_out, K, B, N
         )
 
     def run_dense_bias():
         return triton_jagged_dense_bmm_add_bwd_dense_bias(
-            Mi, so64, jagged, torch.empty_like(dense), B, K, N, d_out, False
+            Mi, so64, jagged, d_dense_out, B, K, N, d_out, False
         )
 
     if component == "jagged":
@@ -216,7 +231,9 @@ def _build_flydsl_fn(jagged, dense, d_out, seq_offsets, B, Mi, N, K, component):
 
     ``component == "all"`` uses the production dispatched wrapper (alloc + all
     launches). ``jagged`` / ``dense_bias`` use raw launchers over pre-allocated
-    buffers for kernel-only timing comparable to the split Triton kernels.
+    buffers for kernel-only timing. ``jagged`` is directly comparable to Triton;
+    ``dense_bias`` is not fully comparable because Triton allocates ``d_bias``
+    internally each call (see ``_build_triton_fn``).
     """
     _bwd.configure_dim(K)
     block_m = _bwd.BLOCK_M
