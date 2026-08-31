@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
+from functools import cache
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -608,7 +608,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
 
 # Keep compiled launchers alive: eviction can unload a module while an
 # asynchronous dispatch from that specialization is still queued.
-@lru_cache(maxsize=None)
+@cache
 def compile_pa_mqa_logits_fp4_prefill(
     *,
     block_k: int = 256,

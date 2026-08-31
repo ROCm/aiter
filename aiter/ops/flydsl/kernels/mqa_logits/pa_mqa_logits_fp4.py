@@ -591,6 +591,7 @@ def build_pa_mqa_logits_fp4_module(
 # ============================================================================
 
 
+# SGLang graph decode fixes page-table width, so this cache sees one specialization.
 @lru_cache(maxsize=32)
 def compile_pa_mqa_logits_fp4(
     *,
