@@ -458,7 +458,7 @@ _FLYDSL_TOPK_DECODE_DISABLED = os.environ.get(
 _FLYDSL_TOPK_DECODE_GATES = {
     "gfx942": {
         True: (
-            (0, 20_000, 128),
+            (0, 20_000, 64),
             (131_072, None, 16),
         ),
         False: ((524_288, None, 32),),
