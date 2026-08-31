@@ -17,10 +17,6 @@ _SCHED_ALLOW_SALU = 1 << 2
 KERNARG_PRELOAD_COUNT = 8
 
 
-def _byte_off_i32(elem_off, elem_bytes):
-    return (fx.Int32(elem_off) * elem_bytes).ir_value()
-
-
 def _f32(x):
     return fx.Float32(x)
 
@@ -94,12 +90,11 @@ def compile_gemm_a16w16(
     num_warps, block_threads = m_warp * n_warp, m_warp * n_warp * WAVE_SIZE
     warp_tile_m, warp_tile_n = tile_m // m_warp, tile_n // n_warp
     split_k_chunk = K // split_k
-    num_k_tiles = split_k_chunk // tile_k
+    num_k_tiles = (split_k_chunk + tile_k - 1) // tile_k
+    k_rem = split_k_chunk % tile_k
 
     for _nm, _v, _d in (
-        ("K", K, tile_k),
         ("K", K, split_k),
-        ("K/split_k", split_k_chunk, tile_k),
         ("tile_k", tile_k, WMMA_K),
         ("tile_m", tile_m, WMMA_M),
         ("tile_n", tile_n, WMMA_N),
@@ -112,8 +107,8 @@ def compile_gemm_a16w16(
         tile_k & (tile_k - 1) == 0, f"tile_k must be a power of 2 for TDM, got {tile_k}"
     )
 
+    _req(N > 0, "N must be > 0 at compile time")
     if physical_kn:
-        _req(N > 0, "N must be > 0 at compile time when physical_kn=True")
         _req(tile_n & (tile_n - 1) == 0, f"tile_n must be a power of 2, got {tile_n}")
     if not physical_mk:
         _req(tile_m & (tile_m - 1) == 0, f"tile_m must be a power of 2, got {tile_m}")
@@ -169,6 +164,7 @@ def compile_gemm_a16w16(
     check_smem_capacity(dsl_size_of(SharedStorage), gpu_arch)
 
     _TDMS_PER_TILE = 2  # A + B
+    n_edge = N % tile_n
 
     @flyc.kernel
     def kernel_gemm_a16w16(
@@ -177,7 +173,7 @@ def compile_gemm_a16w16(
         arg_w: fx.Pointer,
         arg_bias: fx.Pointer,
         i32_m: fx.Int32,
-        i32_n: fx.Int32,
+        i32_ldy: fx.Int32,
         i32_lda: fx.Int32,
         i32_ldb: fx.Int32,
     ):
@@ -203,12 +199,12 @@ def compile_gemm_a16w16(
         )
 
         warp_m_base, warp_n_base = wave_m_idx * warp_tile_m, wave_n_idx * warp_tile_n
-        m_idx, n_stride = fx.Uint64(i32_m), fx.Uint64(i32_n)
+        m_idx, ld_y = fx.Uint64(i32_m), fx.Uint64(i32_ldy)
         gYp = fx.Tensor(fx.make_view(arg_y, fx.make_layout((1, 1), (1, 1))))
         gY = fx.rocdl.make_buffer_tensor(
             fx.Tensor(fx.make_view(arg_y, fx.make_layout((1, 1), (1, 1)))),
             max_size=False,
-            num_records_bytes=m_idx * n_stride * elem_bytes_d,
+            num_records_bytes=m_idx * ld_y * elem_bytes_d,
         )
 
         lds = fx.SharedAllocator(static=True).allocate(SharedStorage).peek()
@@ -276,13 +272,9 @@ def compile_gemm_a16w16(
         def _imm64(k_tile, mul):
             if const_expr(not isinstance(mul, int)):
                 return fx.Int64(k_tile) * mul
-            if const_expr(isinstance(k_tile, int)):
-                return fx.Int64(k_tile * mul)
             return fx.Int64(k_tile * mul)
 
         def _slot_off(buf_idx, slot_elems):
-            if const_expr(isinstance(buf_idx, int)):
-                return fx.Uint64(buf_idx * slot_elems)
             return fx.Uint64(buf_idx * slot_elems)
 
         def _lane_bases(warp_base, reps, lds_stride, transpose):
@@ -312,7 +304,9 @@ def compile_gemm_a16w16(
         )
 
         # One spec per operand side; A and B differ only in these fields.
-        MEM, BASE, BASES, STRIDE, TR, ELEMS, REPS, ATOM, GT, SHAPE, IMM = range(11)
+        MEM, BASE, BASES, STRIDE, TR, ELEMS, REPS, ATOM, GT, SHAPE, IMM, KDIM = range(
+            12
+        )
         A_SIDE = (
             big_a_mem,
             big_a_base_idx,
@@ -325,6 +319,7 @@ def compile_gemm_a16w16(
             gA,
             a_tile_shape,
             a_imm_rt,
+            1 if physical_mk else 0,
         )
         B_SIDE = (
             big_b_mem,
@@ -338,12 +333,18 @@ def compile_gemm_a16w16(
             gB,
             b_tile_shape,
             b_imm_rt,
+            0 if physical_kn else 1,
         )
 
         def issue_tdm_loads(buf_idx, k_tile):
+            if const_expr(k_rem != 0):
+                k_left = fx.Int32(split_k_chunk) - fx.Int32(k_tile) * tile_k
             for sd in (A_SIDE, B_SIDE):
+                atom = sd[ATOM]
+                if const_expr(k_rem != 0):
+                    atom = fx.atom_set_value(atom, f"extent_{sd[KDIM]}", k_left)
                 fx.copy(
-                    sd[ATOM],
+                    atom,
                     sd[GT],
                     fx.Tensor(
                         fx.make_view(
@@ -438,24 +439,45 @@ def compile_gemm_a16w16(
 
         if const_expr(add_bias):
             bias_lay = fx.make_layout(4, 1)
-            bias_tiles = fx.logical_divide(
-                fx.rocdl.make_buffer_tensor(
-                    fx.make_view(arg_bias, fx.make_layout(N, 1)),
-                    max_size=False,
-                    num_records_bytes=N * elem_bytes,
-                ),
-                bias_lay,
+            bias_buf = fx.rocdl.make_buffer_tensor(
+                fx.make_view(arg_bias, fx.make_layout(N, 1)),
+                max_size=False,
+                num_records_bytes=N * elem_bytes,
             )
+            bias_tiles = fx.logical_divide(bias_buf, bias_lay)
             bias_atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), _fx_elem)
+            if const_expr(n_edge != 0):
+                bias_elems = fx.logical_divide(bias_buf, fx.make_layout(1, 1))
+                bias1_atom = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), _fx_elem)
 
             def load_bias4(tile_idx):
-                r = fx.make_rmem_tensor(bias_lay, _fx_elem)
-                fx.copy_atom_call(bias_atom, fx.slice(bias_tiles, (None, tile_idx)), r)
-                return r.load()
+                if const_expr(n_edge == 0):
+                    r = fx.make_rmem_tensor(bias_lay, _fx_elem)
+                    fx.copy(bias_atom, fx.slice(bias_tiles, (None, tile_idx)), r)
+                    return r.load()
+                elems = []
+                for e in range_constexpr(4):
+                    r1 = fx.make_rmem_tensor(1, _fx_elem)
+                    fx.copy(
+                        bias1_atom,
+                        fx.slice(bias_elems, (None, tile_idx * 4 + e)),
+                        r1,
+                    )
+                    elems.append(fx.Vector(r1.load())[0])
+                return fx.Vector.from_elements(elems, _fx_elem)
 
         def epilogue_stores(final_accs):
             _acc_ty = _out_num if _half_out else fx.Float32
             st_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), _acc_ty)
+            if const_expr(n_edge != 0):
+                st1_atom = fx.make_copy_atom(
+                    (
+                        fx.rocdl.BufferCopy16b()
+                        if _half_out
+                        else fx.rocdl.BufferCopy32b()
+                    ),
+                    _acc_ty,
+                )
             if const_expr(split_k > 1):
                 add_atom = fx.make_copy_atom(
                     fx.UniversalAtomicAdd(_acc_ty, syncscope=fx.rocdl.SyncScope.Agent),
@@ -492,9 +514,7 @@ def compile_gemm_a16w16(
                     if const_expr(activation is not None):
                         acc = fx.Vector.from_elements(
                             [
-                                apply_activation_scalar(
-                                    fx.Vector(acc)[i].ir_value(), activation
-                                )
+                                apply_activation_scalar(fx.Vector(acc)[i], activation)
                                 for i in range_constexpr(8)
                             ],
                             fx.Float32,
@@ -502,28 +522,68 @@ def compile_gemm_a16w16(
 
                     if const_expr(_half_out):
                         h_vec = fx.Vector(acc).to(_out_num)
-                        c_off = row * n_stride + col_base
+                        c_off = row * ld_y + col_base
                         if const_expr(split_k > 1):
                             for pair in range_constexpr(4):
                                 pair_vec = fx.Vector.from_elements(
-                                    [
-                                        h_vec[pair * 2].ir_value(),
-                                        h_vec[pair * 2 + 1].ir_value(),
-                                    ],
+                                    [h_vec[pair * 2], h_vec[pair * 2 + 1]],
                                     _out_num,
                                 )
-                                if row < m_idx:
-                                    fx.copy(
-                                        add_atom,
-                                        _rmem_vec(pair_vec, 2, _out_num),
-                                        gYp[None, c_off + pair * 2],
+                                if const_expr(n_edge == 0):
+                                    if row < m_idx:
+                                        fx.copy(
+                                            add_atom,
+                                            _rmem_vec(pair_vec, 2, _out_num),
+                                            gYp[None, c_off + pair * 2],
+                                        )
+                                else:
+                                    n_left = (
+                                        fx.Int32(N)
+                                        - fx.Int32(col_base)
+                                        - fx.Int32(pair * 2)
                                     )
+                                    if row < m_idx:
+                                        if n_left >= fx.Int32(2):
+                                            fx.copy(
+                                                add_atom,
+                                                _rmem_vec(pair_vec, 2, _out_num),
+                                                gYp[None, c_off + pair * 2],
+                                            )
+                                        if n_left == fx.Int32(1):
+                                            one_vec = fx.Vector.from_elements(
+                                                [h_vec[pair * 2]], _out_num
+                                            )
+                                            fx.copy(
+                                                add_atom,
+                                                _rmem_vec(one_vec, 1, _out_num),
+                                                gYp[None, c_off + pair * 2],
+                                            )
                         else:
-                            fx.copy(
-                                st_atom,
-                                _rmem_vec(h_vec, 8, _out_num),
-                                gY[None, c_off],
-                            )
+                            if const_expr(n_edge == 0):
+                                fx.copy(
+                                    st_atom,
+                                    _rmem_vec(h_vec, 8, _out_num),
+                                    gY[None, c_off],
+                                )
+                            else:
+                                n_left = fx.Int32(N) - fx.Int32(col_base)
+                                if n_left >= fx.Int32(8):
+                                    fx.copy(
+                                        st_atom,
+                                        _rmem_vec(h_vec, 8, _out_num),
+                                        gY[None, c_off],
+                                    )
+                                if n_left < fx.Int32(8):
+                                    for e in range_constexpr(8):
+                                        if fx.Int32(e) < n_left:
+                                            one_vec = fx.Vector.from_elements(
+                                                [h_vec[e]], _out_num
+                                            )
+                                            fx.copy(
+                                                st1_atom,
+                                                _rmem_vec(one_vec, 1, _out_num),
+                                                gY[None, c_off + e],
+                                            )
                     elif const_expr(split_k > 1):
                         for e in range_constexpr(8):
                             fx.ptr_store(
@@ -542,30 +602,58 @@ def compile_gemm_a16w16(
                                                 xt,
                                                 (lane_kgrp + 2 * e) * WMMA_N + lane16,
                                             )
-                                        ).ir_value()
+                                        )
                                     ],
                                     fx.Float32,
                                 )
-                                fx.copy(
-                                    add_atom,
-                                    _rmem_vec(xt_val, 1, fx.Float32),
-                                    gYp[None, xt_row * n_stride + t_col],
-                                )
+                                if const_expr(n_edge == 0):
+                                    fx.copy(
+                                        add_atom,
+                                        _rmem_vec(xt_val, 1, fx.Float32),
+                                        gYp[None, xt_row * ld_y + t_col],
+                                    )
+                                else:
+                                    if t_col < fx.Uint64(N):
+                                        fx.copy(
+                                            add_atom,
+                                            _rmem_vec(xt_val, 1, fx.Float32),
+                                            gYp[None, xt_row * ld_y + t_col],
+                                        )
                     else:
                         for half in range_constexpr(2):
                             vec4 = fx.Vector.from_elements(
                                 [
-                                    fx.Vector(acc)[half * 4 + vi].ir_value()
+                                    fx.Vector(acc)[half * 4 + vi]
                                     for vi in range_constexpr(4)
                                 ],
                                 fx.Float32,
                             )
                             col = col_base + half * 4
-                            fx.copy(
-                                st_atom,
-                                _rmem_vec(vec4, 4, fx.Float32),
-                                gY[None, row * n_stride + col],
-                            )
+                            if const_expr(n_edge == 0):
+                                fx.copy(
+                                    st_atom,
+                                    _rmem_vec(vec4, 4, fx.Float32),
+                                    gY[None, row * ld_y + col],
+                                )
+                            else:
+                                n_left = fx.Int32(N) - fx.Int32(col)
+                                if n_left >= fx.Int32(4):
+                                    fx.copy(
+                                        st_atom,
+                                        _rmem_vec(vec4, 4, fx.Float32),
+                                        gY[None, row * ld_y + col],
+                                    )
+                                if n_left < fx.Int32(4):
+                                    for e in range_constexpr(4):
+                                        if fx.Int32(e) < n_left:
+                                            one_vec = fx.Vector.from_elements(
+                                                [vec4[e]], fx.Float32
+                                            )
+                                            fx.copy(
+                                                st1_atom,
+                                                _rmem_vec(one_vec, 1, fx.Float32),
+                                                gY[None, row * ld_y + col + e],
+                                            )
 
         def _pack_state(accs_, a_, b_):
             return list(accs_) + list(a_) + list(b_)
@@ -670,13 +758,13 @@ def compile_gemm_a16w16(
         arg_w: fx.Pointer,
         arg_bias: fx.Pointer,
         i32_m: fx.Int32,
-        i32_n: fx.Int32,
+        i32_ldy: fx.Int32,
         i32_lda: fx.Int32,
         i32_ldb: fx.Int32,
         stream: fx.Stream,
     ):
         gx = (fx.Uint64(i32_m) + (tile_m - 1)) // tile_m
-        gy = (fx.Uint64(i32_n) + (tile_n - 1)) // tile_n
+        gy = (N + tile_n - 1) // tile_n
 
         wpe = int(waves_per_eu) if waves_per_eu is not None else 0
         launcher = kernel_gemm_a16w16(
@@ -685,7 +773,7 @@ def compile_gemm_a16w16(
             arg_w,
             arg_bias,
             i32_m,
-            i32_n,
+            i32_ldy,
             i32_lda,
             i32_ldb,
             value_attrs={

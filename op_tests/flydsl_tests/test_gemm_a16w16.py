@@ -331,3 +331,98 @@ def test_gemm_a16_w16_oob_guard_region(M, N, K, tm, tn, tk, mw, nw, nb):
 
     torch.testing.assert_close(kernel_out, torch_out, atol=1e-1, rtol=1e-2)
     assert torch.all(parent[M:] == sentinel)
+
+
+@pytest.mark.parametrize("K, tile_k", [(48, 32), (100, 32), (130, 64), (1000, 64)])
+@pytest.mark.parametrize("layout", ["TN", "NN", "TT", "NT"])
+def test_gemm_a16_w16_ragged_k(K, tile_k, layout, monkeypatch):
+    torch.cuda.empty_cache()
+    M, N = 128, 192
+    x, w, _, _ = _generate_inputs(M, N, K, torch.bfloat16, layout=layout)
+
+    def _no_pad(*args, **kwargs):
+        raise AssertionError("host-side pad/copy in gemm_a16w16 wrapper")
+
+    monkeypatch.setattr(F, "pad", _no_pad)
+    torch_out = (x.float() @ w.float().T).to(torch.bfloat16)
+    kernel_out = gemm_a16w16(x, w, dtype=torch.bfloat16, tile_k=tile_k)
+    torch.testing.assert_close(kernel_out, torch_out, atol=1e-1, rtol=1e-2)
+
+
+def test_gemm_a16_w16_ragged_k_split_k():
+    torch.cuda.empty_cache()
+    M, N, K, sk = 64, 64, 576, 2
+    x, w, _, _ = _generate_inputs(M, N, K, torch.bfloat16)
+    torch_out = x.float() @ w.float().T
+    kernel_out = gemm_a16w16(
+        x,
+        w,
+        dtype=torch.float32,
+        tile_m=64,
+        tile_n=64,
+        tile_k=64,
+        m_warp=2,
+        n_warp=2,
+        num_buffers=2,
+        split_k=sk,
+    )
+    torch.testing.assert_close(kernel_out, torch_out, atol=1e-1, rtol=1e-2)
+
+
+@pytest.mark.parametrize("N", [100, 101, 190, 257])
+@pytest.mark.parametrize("otype", [torch.bfloat16, torch.float32])
+def test_gemm_a16_w16_ragged_n_direct_store(N, otype):
+    torch.cuda.empty_cache()
+    M, K = 129, 256
+    x, w, _, _ = _generate_inputs(M, N, K, torch.bfloat16)
+    sentinel = 777.0
+    parent = torch.full((M + 32, N + 64), sentinel, dtype=otype, device="cuda")
+    y = parent[:M, :N]
+
+    torch_out = (x.float() @ w.float().T).to(otype)
+    out = gemm_a16w16(x, w, dtype=otype, y=y)
+
+    assert out is y
+    torch.testing.assert_close(out, torch_out, atol=1e-1, rtol=1e-2)
+    assert torch.all(parent[:, N:] == sentinel)
+    assert torch.all(parent[M:] == sentinel)
+
+
+@pytest.mark.parametrize("N", [100, 190])
+def test_gemm_a16_w16_ragged_n_split_k(N):
+    torch.cuda.empty_cache()
+    M, K, sk = 64, 512, 2
+    x, w, _, _ = _generate_inputs(M, N, K, torch.bfloat16)
+    sentinel = 777.0
+    parent = torch.full((M + 8, N + 32), sentinel, dtype=torch.float32, device="cuda")
+    y = parent[:M, :N]
+
+    torch_out = x.float() @ w.float().T
+    out = gemm_a16w16(
+        x,
+        w,
+        dtype=torch.float32,
+        y=y,
+        tile_m=64,
+        tile_n=64,
+        tile_k=64,
+        m_warp=2,
+        n_warp=2,
+        num_buffers=2,
+        split_k=sk,
+    )
+
+    assert out is y
+    torch.testing.assert_close(out, torch_out, atol=1e-1, rtol=1e-2)
+    assert torch.all(parent[:, N:] == sentinel)
+    assert torch.all(parent[M:] == sentinel)
+
+
+@pytest.mark.parametrize("M, N, K", [(100, 190, 256), (65, 257, 512)])
+def test_gemm_a16_w16_ragged_n_bias_activation(M, N, K):
+    torch.cuda.empty_cache()
+    x, w, bias, _ = _generate_inputs(M, N, K, torch.bfloat16, bias=True)
+
+    torch_out = F.relu(F.linear(x, w, bias=bias))
+    kernel_out = gemm_a16w16(x, w, bias=bias, dtype=torch.bfloat16, activation="relu")
+    torch.testing.assert_close(kernel_out, torch_out, atol=1e-1, rtol=1e-2)

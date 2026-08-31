@@ -11,25 +11,25 @@ import torch
 
 _compile_gemm_a16w16 = None
 _run_compiled = None
-_flyc = None
+_ptr_arg = None
 _fx = None
 
 
 def _lazy_import():
-    global _compile_gemm_a16w16, _run_compiled, _flyc, _fx
+    global _compile_gemm_a16w16, _run_compiled, _ptr_arg, _fx
     if _compile_gemm_a16w16 is not None:
         return
-    import flydsl.compiler as flyc
     import flydsl.expr as fx
 
     from aiter.ops.flydsl.kernels.gemm_a16w16_kernel_gfx1250 import (
         compile_gemm_a16w16,
     )
     from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled as run_compiled
+    from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
     _compile_gemm_a16w16 = compile_gemm_a16w16
     _run_compiled = run_compiled
-    _flyc = flyc
+    _ptr_arg = ptr_arg
     _fx = fx
 
 
@@ -45,7 +45,7 @@ def _p(t):
                 torch.float32: _fx.Float32,
             }
         )
-    return _flyc.from_c_void_p(_FX_DTYPE[t.dtype], t.data_ptr())
+    return _ptr_arg(t, _FX_DTYPE[t.dtype])
 
 
 _CFG_KEYS = (
@@ -114,24 +114,6 @@ def gemm_a16w16(
     physical_mk = x.stride(1) == 1 or K == 1
     physical_kn = w.stride(1) != 1 and N > 1
 
-    K_padded = ((K + tile_k - 1) // tile_k) * tile_k
-    if K_padded != K:
-        pad_size = K_padded - K
-        if physical_mk:
-            x = torch.nn.functional.pad(x, (0, pad_size))
-        else:
-            x = torch.nn.functional.pad(x.T, (0, 0, 0, pad_size)).T
-
-        if physical_kn:
-            if w.stride(1) == 1:
-                w = torch.nn.functional.pad(w, (0, 0, 0, pad_size))
-            else:
-                w = torch.nn.functional.pad(w.T, (0, 0, 0, pad_size)).T
-        else:
-            w = torch.nn.functional.pad(w, (0, pad_size))
-        K = K_padded
-
-    N_stride = ((N + tile_n - 1) // tile_n) * tile_n
     _splitk_f32_accum = split_k > 1 and dtype in _half
     in_dtype_str = "fp16" if x.dtype == torch.float16 else "bf16"
     out_dtype_str = {torch.float16: "f16", torch.bfloat16: "bf16"}.get(dtype, "f32")
@@ -141,19 +123,20 @@ def gemm_a16w16(
 
     _alloc = torch.zeros if split_k > 1 else torch.empty
     if y is not None and not _splitk_f32_accum:
-        y_buf = (
-            y
-            if N_stride == N
-            else _alloc((M, N_stride), device=x.device, dtype=buf_dtype)
-        )
-        if split_k > 1 and y_buf is y:
+        assert (
+            y.shape[0] == M and y.shape[1] == N
+        ), f"y must be ({M}, {N}), got {tuple(y.shape)}"
+        assert y.stride(1) == 1 or 1 in (
+            M,
+            N,
+        ), f"gemm_a16w16: y needs unit column stride, got strides {tuple(y.stride())}"
+        y_buf = y
+        if split_k > 1:
             y_buf.zero_()
     else:
-        y_buf = (
-            _alloc((M, N_stride), device=x.device, dtype=buf_dtype)
-            if N_stride != N
-            else _alloc((M, N), device=x.device, dtype=buf_dtype)
-        )
+        y_buf = _alloc((M, N), device=x.device, dtype=buf_dtype)
+    ldy = y_buf.stride(0) if M > 1 else N
+    assert ldy >= N, f"gemm_a16w16: y row stride {ldy} < N {N}"
 
     if bias is None:
         bias = torch.empty(0, device=x.device, dtype=dtype)
@@ -197,19 +180,18 @@ def gemm_a16w16(
         _p(w),
         _p(bias),
         M,
-        N_stride,
+        ldy,
         lda,
         ldb,
         _fx.Stream(stream),
     )
 
-    result = y_buf[:, :N] if N_stride != N else y_buf
-    if _splitk_f32_accum:
-        result = result.to(dtype)
-    if y is None or result is y:
-        return result
-    y.copy_(result)
-    return y
+    if not _splitk_f32_accum:
+        return y_buf
+    if y is not None:
+        y.copy_(y_buf)
+        return y
+    return y_buf.to(dtype)
 
 
 __all__ = ["gemm_a16w16"]
