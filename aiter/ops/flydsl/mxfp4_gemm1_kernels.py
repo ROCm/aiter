@@ -15,6 +15,7 @@ def _get_compiled_mxfp4_gemm1_port(
     BM,
     use_nt,
     inline_quant,
+    prefetch_hidden,
     D_HIDDEN,
     D_INTER,
     NE,
@@ -39,6 +40,7 @@ def _get_compiled_mxfp4_gemm1_port(
         BM,
         use_nt,
         inline_quant,
+        prefetch_hidden=prefetch_hidden,
         D_HIDDEN=D_HIDDEN,
         D_INTER=D_INTER,
         NE=NE,
@@ -68,6 +70,7 @@ def _assert_supported(
     BM,
     use_nt,
     inline_quant,
+    prefetch_hidden=False,
     BN=256,
     BK=256,
     a_dtype="fp4",
@@ -108,6 +111,10 @@ def _assert_supported(
     if act == "swiglu" and swiglu_limit <= 0.0:
         raise NotImplementedError(
             f"flydsl mxfp4 gemm1 requires swiglu_limit > 0, got {swiglu_limit!r}"
+        )
+    if prefetch_hidden and not inline_quant:
+        raise NotImplementedError(
+            "flydsl mxfp4 GEMM1 hidden prefetch requires inline quantization"
         )
     if D_HIDDEN % BK != 0:
         raise NotImplementedError(
@@ -192,6 +199,7 @@ def flydsl_mxfp4_gemm1(
     BM,
     use_nt,
     inline_quant,
+    prefetch_hidden=False,
     NE,
     D_HIDDEN,
     D_INTER,
@@ -221,6 +229,7 @@ def flydsl_mxfp4_gemm1(
         BM=BM,
         use_nt=use_nt,
         inline_quant=inline_quant,
+        prefetch_hidden=prefetch_hidden,
         BN=BN,
         BK=BK,
         a_dtype=a_dtype,
@@ -240,6 +249,7 @@ def flydsl_mxfp4_gemm1(
         BM,
         use_nt,
         inline_quant,
+        prefetch_hidden,
         D_HIDDEN,
         D_INTER,
         NE,

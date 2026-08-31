@@ -89,6 +89,7 @@ def _gemm1_body(
     BN,
     BK,
     inline_quant=False,
+    prefetch_hidden=False,
     a_dtype="fp4",
     out_dtype="fp4",
     act="silu",
@@ -846,18 +847,42 @@ def _gemm1_body(
         _relax_prologue = (BM == 128) and not inline_quant
         if const_expr(not inline_quant):
             issue_a_scale_load()
+        hidden_prefetch = None
+        if const_expr(inline_quant and prefetch_hidden):
+            hidden_prefetch = (
+                inline_quant_load_kt(0, global_k_tile(0), cached_row_inline),
+                inline_quant_load_kt(1, global_k_tile(0), cached_row_inline),
+            )
         for K_C_LOCAL in range_constexpr(kStages):
             K_C = global_k_tile(K_C_LOCAL)
             if const_expr(inline_quant):
                 scale_accum = fx.Int32(0)
-                scale_accum = inline_quant_kt(
-                    0, 0, K_C_LOCAL, K_C, cached_row_inline, scale_accum
-                )
+                if const_expr(prefetch_hidden):
+                    h_v0, h_v1 = hidden_prefetch
+                    if const_expr(K_C_LOCAL + 1 < K_TILES_PER_WAVE):
+                        next_k = global_k_tile(K_C_LOCAL + 1)
+                        hidden_prefetch = (
+                            inline_quant_load_kt(0, next_k, cached_row_inline),
+                            inline_quant_load_kt(1, next_k, cached_row_inline),
+                        )
+                    scale_accum = _inline_quant_core_batch(
+                        [(0, 0, h_v0)], K_C_LOCAL, scale_accum
+                    )
+                else:
+                    scale_accum = inline_quant_kt(
+                        0, 0, K_C_LOCAL, K_C, cached_row_inline, scale_accum
+                    )
+
                 issue_b_load_j(b[K_C_LOCAL], K_C, 0)
                 issue_b_load_j(b[K_C_LOCAL], K_C, 1)
-                scale_accum = inline_quant_kt(
-                    1, 0, K_C_LOCAL, K_C, cached_row_inline, scale_accum
-                )
+                if const_expr(prefetch_hidden):
+                    scale_accum = _inline_quant_core_batch(
+                        [(1, 0, h_v1)], K_C_LOCAL, scale_accum
+                    )
+                else:
+                    scale_accum = inline_quant_kt(
+                        1, 0, K_C_LOCAL, K_C, cached_row_inline, scale_accum
+                    )
                 if const_expr(N_REPS > 2):
                     issue_b_load_j(b[K_C_LOCAL], K_C, 2)
                     issue_b_load_j(b[K_C_LOCAL], K_C, 3)
@@ -883,6 +908,13 @@ def _gemm1_body(
             read_slot = OFFSET % kAStages
             write_slot = K_C_LOCAL % kAStages
             slot_b = OFFSET % kStages
+            if const_expr(inline_quant and prefetch_hidden):
+                h_v0, h_v1 = hidden_prefetch
+                if const_expr(OFFSET + 1 < kUnroll):
+                    hidden_prefetch = (
+                        inline_quant_load_kt(0, K_C + 1, cached_row_inline),
+                        inline_quant_load_kt(1, K_C + 1, cached_row_inline),
+                    )
             gpu.barrier()
             if const_expr(BM == 128):
                 asc_cur = issue_a_scale_ds_read(K_C - kStages)
@@ -892,7 +924,7 @@ def _gemm1_body(
                 asc_cur = issue_a_scale_ds_read(K_C - kStages)
             if const_expr(not inline_quant):
                 issue_a_load_lds(write_slot, K_C)
-            if const_expr(inline_quant):
+            if const_expr(inline_quant and not prefetch_hidden):
                 h_v0 = inline_quant_load_kt(0, K_C, cached_row_inline)
                 h_v1 = inline_quant_load_kt(1, K_C, cached_row_inline)
                 rocdl.sched_barrier(0)
@@ -1303,6 +1335,7 @@ def compile_gemm1_a4w4_port(
     use_nt=True,
     inline_quant=False,
     *,
+    prefetch_hidden=False,
     D_HIDDEN,
     D_INTER,
     NE,
@@ -1336,6 +1369,8 @@ def compile_gemm1_a4w4_port(
         raise AssertionError("SiTUv2 beta values must be positive")
     if act == "swiglu" and swiglu_limit <= 0.0:
         raise AssertionError("Swiglu limit must be positive")
+    if prefetch_hidden and not inline_quant:
+        raise AssertionError("hidden prefetch requires inline quantization")
     assert num_waves in (2, 4), f"num_waves must be 2 or 4, got {num_waves}"
     assert k_wave in (1, 2, 4), f"k_wave must be 1, 2, or 4, got {k_wave}"
 
@@ -1391,6 +1426,8 @@ def compile_gemm1_a4w4_port(
     _, _, _, lds_bytes = _bm_constants(BM, BN, KH_TILE, K_TILES_TOTAL, k_wave)
 
     variant_tag = "iq" if inline_quant else ("nt" if use_nt else "cached")
+    if prefetch_hidden:
+        variant_tag += "_hpf"
     # Tag with H/INTER/NE so different shape specializations get distinct
     # kernel/smem symbols (so KIMI and non-KIMI instances never collide).
     #
@@ -1501,6 +1538,7 @@ def compile_gemm1_a4w4_port(
                 BN=BN,
                 BK=BK,
                 inline_quant=inline_quant,
+                prefetch_hidden=prefetch_hidden,
                 a_dtype=a_dtype,
                 out_dtype=out_dtype,
                 act=act,

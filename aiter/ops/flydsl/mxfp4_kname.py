@@ -11,6 +11,7 @@ _MXMOE_NUMERIC_TOKENS = {
 _MXMOE_G1_FLAG_TOKENS = {
     "NT",
     "F16IN",
+    "HPF",
     "FP8OUT",
     "IL",
     "SITUV2",
@@ -107,6 +108,7 @@ def _parse_mxfp4_g1_kname(kname: str) -> dict:
         "splitk": "kSplitK" in nums,
         "kSplitK": nums.get("kSplitK", 0),
         "inline_quant": "F16IN" in flags,
+        "prefetch_hidden": "HPF" in flags,
         "use_nt": "NT" in flags,
         "xcd_swizzle": nums.get("xcd_swizzle", 0),
         "a_dtype": parsed["mode"].get("a_dtype", "fp4"),

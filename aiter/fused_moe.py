@@ -1657,6 +1657,7 @@ def _mxfp4_a4w4_stage1(
     num_waves=4,
     native_scale_layout=False,
     k_wave=1,
+    prefetch_hidden=False,
     prequantized=False,
 ):
     if a_dtype == "fp8" and not inline_quant:
@@ -1740,6 +1741,7 @@ def _mxfp4_a4w4_stage1(
         BM=BM,
         use_nt=use_nt,
         inline_quant=inline_quant,
+        prefetch_hidden=prefetch_hidden,
         NE=NE,
         D_HIDDEN=D_HIDDEN,
         D_INTER=D_INTER,
@@ -2012,6 +2014,7 @@ def _mxfp4_a4w4_stage1_fw(
         num_waves=p1.get("num_waves", 4),
         native_scale_layout=native_scale_layout,
         k_wave=p1.get("k_wave", 1),
+        prefetch_hidden=p1.get("prefetch_hidden", False),
         prequantized=prequantized,
     )
     return inter_sorted_quant, inter_sorted_scale

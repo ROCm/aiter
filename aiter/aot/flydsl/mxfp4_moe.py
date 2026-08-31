@@ -75,6 +75,7 @@ def _job_key(job: dict) -> tuple:
             job["BK"],
             job["use_nt"],
             job["inline_quant"],
+            job["prefetch_hidden"],
             job["D_HIDDEN"],
             job["D_INTER"],
             job["NE"],
@@ -169,6 +170,7 @@ def parse_csv(csv_path: str):
                             "use_nt": p1["use_nt"],
                             "n_tokens": token,
                             "inline_quant": p1["inline_quant"],
+                            "prefetch_hidden": p1.get("prefetch_hidden", False),
                             "D_HIDDEN": model_dim,
                             # Runtime derives D_INTER from the *stored* weight
                             # width (``w1.shape[1] // 2``), and non-aligned
@@ -306,6 +308,7 @@ def _compile_stage1(job):
         BK=job["BK"],
         use_nt=job["use_nt"],
         inline_quant=job["inline_quant"],
+        prefetch_hidden=job["prefetch_hidden"],
         NE=job["NE"],
         D_HIDDEN=job["D_HIDDEN"],
         D_INTER=job["D_INTER"],
