@@ -5,6 +5,7 @@
 
 import sys
 
+import pytest
 import torch
 
 from aiter.ops.triton.attention.sparse_mla_dsv4_train import (
@@ -184,8 +185,6 @@ def _run_autograd(N, H, D, N_kv, topk, has_sink=True):
 
 
 # ── pytest entry points ──────────────────────────────────────────────
-
-import pytest  # noqa: E402
 
 
 @pytest.mark.parametrize("has_sink", [True, False])
