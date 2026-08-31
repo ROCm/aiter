@@ -256,24 +256,13 @@ def gemm_a16w16_(
 
             out_ptr = y if NUM_KSPLIT == 1 else y_pp
 
-            WG_PER_CU = config.get("WG_PER_CU", 25)
-
-            CTAS_M = config.get("CTAS_M", 1)
-            CTAS_N = config.get("CTAS_N", 1)
-            num_ctas = CTAS_M * CTAS_N
             NUM_SMS = 256
-
-            # work-stealing 
-            tile_counter = torch.full(
-                (1,), NUM_SMS, dtype=torch.int32, device=x.device
-            )
 
             _GLUON_PERSISTENT_KERNEL_MAP[kernel_type][(NUM_SMS,)](
                 x,
                 w,
                 bias,
                 out_ptr,
-                tile_counter,
                 M,
                 N,
                 K,
@@ -302,9 +291,6 @@ def gemm_a16w16_(
                 num_warps=num_warps,
                 num_stages=num_stages,
                 waves_per_eu=waves_per_eu,
-                CTAS_M=CTAS_M,
-                CTAS_N=CTAS_N,
-                num_ctas=num_ctas,
                 PREFETCH_DEPTH=PREFETCH_DEPTH,
             )
 
@@ -336,7 +322,9 @@ def gemm_a16w16_(
                     ACTUAL_KSPLIT,
                     triton.next_power_of_2(NUM_KSPLIT),
                     ADD_BIAS=(bias is not None),
-                    activation=_get_activation_from_str(activation) if activation else "",
+                    activation=(
+                        _get_activation_from_str(activation) if activation else ""
+                    ),
                     use_activation=activation is not None,
                     KERNEL_NAME="_gemm_a16w16_persistent_reduce_kernel",
                 )
