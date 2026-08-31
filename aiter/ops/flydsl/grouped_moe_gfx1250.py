@@ -604,15 +604,20 @@ def _grouped_a8w4_tdm_moe(
     _quant_mode = "fp4" if _is_fp4 else "fp8"
     _a_is_fp4 = 1 if _is_fp4 else 0
 
+    # Bound once, because the quant pass below rebinds a1_scale to the
+    # PRESHUFFLED GROUPED scale. Both are uint8 and both have a plausible
+    # shape, so nothing downstream could tell which one it was handed.
+    src_a1_scale = a1_scale
+
     # Pre-quantized activation: an MX payload plus its e8m0 row is what a
     # quantizing EP dispatch delivers, and it is also aiter's standing meaning
     # for this pair.
-    _prequantized = a1_scale is not None and hidden_states.dtype in (
+    _prequantized = src_a1_scale is not None and hidden_states.dtype in (
         dtypes.fp8,
         torch.uint8,
         dtypes.fp4x2,
     )
-    if a1_scale is not None and not _prequantized:
+    if src_a1_scale is not None and not _prequantized:
         # Loud rather than silently re-quantizing something already quantized.
         assert hidden_states.dtype == dtype, (
             f"a1_scale given with hidden_states dtype {hidden_states.dtype}: "
@@ -638,7 +643,7 @@ def _grouped_a8w4_tdm_moe(
         topids_to_rows=topids_to_rows,
         source_topk=topk,
         num_valid_routes=_ep_nvr,
-        prequantized_scale=a1_scale if _prequantized else None,
+        prequantized_scale=src_a1_scale if _prequantized else None,
     )
 
     # Fuse gemm1 activation + MX quantization + scale preshuffle into the
