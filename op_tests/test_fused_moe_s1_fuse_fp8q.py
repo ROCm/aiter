@@ -6,8 +6,8 @@ The tuned path picks the fused "_fp8" stage-1 variant per shape (most rows in
 tuned_fmoe.csv carry it), which folds stage 2's mxfp8 quant and scale-sort into
 stage 1's CShuffle epilogue. The heuristic fallback did not consider it, so any
 shape without a tuned row ran a standalone quant+sort kernel that the fused
-epilogue makes unnecessary. These tests pin the fallback's choice and both
-escape hatches.
+epilogue makes unnecessary. These tests pin the fallback's default choice and
+the disable switch.
 
 The fallback is reached by emptying the tuned-config cache: get_2stage_cfgs only
 loads it when the module global is None, so a falsy-but-not-None value skips the
@@ -73,23 +73,7 @@ def test_fallback_fuses_stage1_fp8_quant(no_tuned_rows):
 
 
 def test_env_disables_fusion(no_tuned_rows, monkeypatch):
-    """AITER_S1_FUSE_FP8Q=0 restores the unfused bf16 stage 1."""
-    monkeypatch.setenv("AITER_S1_FUSE_FP8Q", "0")
+    """AITER_MOE_FUSE_STAGE1_FP8_QUANT=0 restores the unfused bf16 stage 1."""
+    monkeypatch.setattr(fused_moe, "_FUSE_STAGE1_FP8_QUANT", False)
     metadata = _fallback_metadata()
     assert metadata.fuse_quant == ""
-
-
-def test_min_inter_dim_floor_blocks_fusion(no_tuned_rows, monkeypatch):
-    """A floor above inter_dim opts the shape out."""
-    monkeypatch.setattr(fused_moe, "_S1_FUSE_FP8Q_MIN_INTER_DIM", INTER_DIM + 1)
-    metadata = _fallback_metadata()
-    assert metadata.fuse_quant == ""
-
-
-def test_env_forces_fusion_below_floor(no_tuned_rows, monkeypatch):
-    """AITER_S1_FUSE_FP8Q=1 overrides the floor, which is how the sweep that
-    set the default to always-fuse measured shapes below it."""
-    monkeypatch.setattr(fused_moe, "_S1_FUSE_FP8Q_MIN_INTER_DIM", INTER_DIM + 1)
-    monkeypatch.setenv("AITER_S1_FUSE_FP8Q", "1")
-    metadata = _fallback_metadata()
-    assert metadata.fuse_quant == "fp8"
