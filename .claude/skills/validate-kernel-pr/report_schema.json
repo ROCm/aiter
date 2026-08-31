@@ -152,6 +152,10 @@
           "type": "string",
           "description": "Environment variable used to inject the independent grid, or an empty string."
         },
+        "shape_arg": {
+          "type": "string",
+          "description": "The target's own CLI flag used to inject the independent grid, or an empty string when the environment-variable channel or no channel was used."
+        },
         "grid": {
           "type": "string",
           "description": "Independent shape grid supplied by the caller, or an empty string."
@@ -334,7 +338,7 @@
             "properties": {
               "expected_route": { "minLength": 1 },
               "shape_vars": { "minLength": 1 },
-              "runner": { "const": "pytest" }
+              "runner": { "enum": ["pytest", "script"] }
             }
           },
           "stages": {

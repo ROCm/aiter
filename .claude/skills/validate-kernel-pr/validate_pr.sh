@@ -24,6 +24,7 @@ SHAPE_ENV=""
 GRID=""
 EXPECTED_ROUTE=""
 SHAPE_VARS=""
+SHAPE_ARG=""
 TOL_TABLE=""
 LABEL="run"
 OUT=""
@@ -50,6 +51,7 @@ while [ "$#" -gt 0 ]; do
     --grid) need_value "$@"; GRID="$2"; shift 2;;
     --expected-route) need_value "$@"; EXPECTED_ROUTE="$2"; shift 2;;
     --shape-vars) need_value "$@"; SHAPE_VARS="$2"; shift 2;;
+    --shape-arg) need_value "$@"; SHAPE_ARG="$2"; shift 2;;
     --tol-table) need_value "$@"; TOL_TABLE="$2"; shift 2;;
     --label) need_value "$@"; LABEL="$2"; shift 2;;
     --out) need_value "$@"; OUT="$2"; shift 2;;
@@ -358,6 +360,7 @@ jset_json "runtime_identity" 'null'
 jset_string "test_selection.target" "$TESTS"
 jset_string "test_selection.shape_env" "$SHAPE_ENV"
 jset_string "test_selection.grid" "$GRID"
+jset_string "test_selection.shape_arg" "$SHAPE_ARG"
 jset_string "test_selection.expected_route" "$EXPECTED_ROUTE"
 jset_string "test_selection.shape_vars" "$SHAPE_VARS"
 jset_string "test_selection.runner" "unresolved"
@@ -893,6 +896,27 @@ PY
 jset_string "test_selection.runner" "$TARGET_RUNNER"
 jset_string "test_selection.runner_reason" "$TARGET_RUNNER_REASON"
 GRID_HOOK_OK=0
+if [ -n "$SHAPE_ARG" ] && [ -n "$GRID" ] && [ "$TARGET_RUNNER" = "script" ] \
+    && [ -f "$REPO_WT/$TEST_FILE" ]; then
+  GRID_HOOK_OK=$(python3 - "$REPO_WT/$TEST_FILE" "$SHAPE_ARG" <<'PY'
+import ast
+import sys
+
+tree = ast.parse(open(sys.argv[1], encoding='utf-8').read())
+flag = sys.argv[2]
+found = False
+for node in ast.walk(tree):
+    if not isinstance(node, ast.Call):
+        continue
+    if getattr(node.func, "attr", "") != "add_argument":
+        continue
+    for arg in node.args:
+        if isinstance(arg, ast.Constant) and arg.value == flag:
+            found = True
+print(int(found))
+PY
+)
+fi
 if [ -n "$SHAPE_ENV" ] && [ -n "$GRID" ] \
     && [ -f "$REPO_WT/$TEST_FILE" ]; then
   GRID_HOOK_OK=$(python3 - "$REPO_WT/$TEST_FILE" "$SHAPE_ENV" <<'PY'
@@ -946,7 +970,7 @@ run_pytest() {
     "$cache_root/torch-extensions" "$cache_root/pytest-cache" \
     "$cache_root/aiter-jit"
   rm -f "$junit" "$receipt"
-  if [ "$TARGET_RUNNER" = "pytest" ]; then
+  if [ "$TARGET_RUNNER" = "pytest" ] || [ -n "$EXPECTED_ROUTE" ]; then
     python3 - "$SCRIPT_DIR/validation_probe.py" \
       "$PROBE_DIR/$PROBE_MODULE.py" "$EXPECTED_ROUTE" "$SHAPE_VARS" "$receipt" <<'PY'
 import pathlib
@@ -975,6 +999,19 @@ PY
     "AITER_JIT_DIR=$cache_root/aiter-jit"
     "VALIDATION_PHASE=$label"
   )
+  local -a shape_cli=()
+  if [ -n "$shape_assignment" ] && [ -n "$SHAPE_ARG" ] \
+      && [ "$TARGET_RUNNER" = "script" ]; then
+    shape_cli=("$SHAPE_ARG")
+    local _grid_value="${shape_assignment#*=}"
+    local _old_ifs="$IFS"
+    IFS=';'
+    for _shape in $_grid_value; do
+      [ -n "$_shape" ] && shape_cli+=("$_shape")
+    done
+    IFS="$_old_ifs"
+    shape_assignment=""
+  fi
   if [ -n "$shape_assignment" ]; then
     environment+=("$shape_assignment")
   fi
@@ -985,10 +1022,18 @@ PY
           "$TARGET_PYTHON" -m pytest -p "$PROBE_MODULE" "$TESTS" -x -q \
             --junitxml="$junit" -o "cache_dir=$cache_root/pytest-cache"
     ) >"$log" 2>&1
+  elif [ -n "$EXPECTED_ROUTE" ]; then
+    (
+      cd "$REPO_WT" \
+        && env "${environment[@]}" timeout "$TIMEOUT" \
+          "$TARGET_PYTHON" "$SCRIPT_DIR/run_script_with_probe.py" \
+            "$PROBE_MODULE" "$TEST_FILE" "${shape_cli[@]}"
+    ) >"$log" 2>&1
   else
     (
       cd "$REPO_WT" \
-        && env "${environment[@]}" timeout "$TIMEOUT" "$TARGET_PYTHON" "$TEST_FILE"
+        && env "${environment[@]}" timeout "$TIMEOUT" \
+          "$TARGET_PYTHON" "$TEST_FILE" "${shape_cli[@]}"
     ) >"$log" 2>&1
   fi
   local result=$?
@@ -1322,15 +1367,45 @@ PY
     elif [ -n "$SHAPE_ENV" ] && [ -n "$GRID" ]; then
       stage_note "correctness_s1_grid" "skip" \
         "configured shape environment variable is not referenced by the target"
-      stage_note "execution_receipt" "skip" \
-        "shape-grid hook was not established"
+      if [ -n "$EXPECTED_ROUTE" ] && [ -f "$WORK/head/execution-receipt.json" ]; then
+        RECEIPT_JSON=$(
+          python3 "$SCRIPT_DIR/validate_evidence.py" receipt \
+            "$WORK/head/execution-receipt.json" \
+            --expected-route "$EXPECTED_ROUTE" --grid ""
+        )
+        jset_json "stages.execution_receipt" "$RECEIPT_JSON"
+        RECEIPT_STATUS=$(python3 -c \
+          'import json,sys; print(json.loads(sys.argv[1])["status"])' "$RECEIPT_JSON")
+        if [ "$RECEIPT_STATUS" != "pass" ]; then
+          finding "note" "execution_receipt" \
+            "route execution receipt was not established; PASS is not permitted"
+        fi
+      else
+        stage_note "execution_receipt" "skip" \
+          "shape-grid hook was not established and no route was supplied"
+      fi
       finding "note" "correctness" \
         "the selected target does not consume the configured shape-grid hook"
     else
       stage_note "correctness_s1_grid" "skip" \
         "kernel exposes no configured shape override; coverage is repo-default-only"
-      stage_note "execution_receipt" "skip" \
-        "no shape grid was configured"
+      if [ -n "$EXPECTED_ROUTE" ] && [ -f "$WORK/head/execution-receipt.json" ]; then
+        RECEIPT_JSON=$(
+          python3 "$SCRIPT_DIR/validate_evidence.py" receipt \
+            "$WORK/head/execution-receipt.json" \
+            --expected-route "$EXPECTED_ROUTE" --grid ""
+        )
+        jset_json "stages.execution_receipt" "$RECEIPT_JSON"
+        RECEIPT_STATUS=$(python3 -c \
+          'import json,sys; print(json.loads(sys.argv[1])["status"])' "$RECEIPT_JSON")
+        if [ "$RECEIPT_STATUS" != "pass" ]; then
+          finding "note" "execution_receipt" \
+            "route execution receipt was not established; PASS is not permitted"
+        fi
+      else
+        stage_note "execution_receipt" "skip" \
+          "no shape grid was configured and no route was supplied"
+      fi
       finding "note" "correctness" \
         "no independent shape-grid hook was configured; coverage is limited to repository defaults"
     fi

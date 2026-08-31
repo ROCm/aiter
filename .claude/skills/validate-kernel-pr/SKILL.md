@@ -69,6 +69,7 @@ For a local candidate with no remote head, omit `--head-sha`. The report then re
 | `--expected-route` | exact `module:function` route the validator-owned profiler must observe |
 | `--shape-vars` | comma-separated local names captured from each route call, in grid order |
 | `--shape-env` `--grid` | env var and shape list for the S1-owned grid |
+| `--shape-arg` | the target's own CLI flag that accepts shapes, for script targets that read no env var |
 | `--tol-table` | reference tolerances, e.g. `f32=1e-5,f16=2e-3,bf16=1e-2` |
 | `--label` `--out` | run name and report path (default `./validation_report.json`) |
 
@@ -171,9 +172,10 @@ Runner selection is structural, not assumed:
 - otherwise a file with an `if __name__ == "__main__"` guard runs as `python <file>`;
 - a file with neither is `skip`, never a test failure.
 
-The report records `test_selection.runner` and `runner_reason`. Script targets can establish that
-their real repository entry point succeeds or fails, but cannot currently use the pytest route
-profiler, so even a successful script run tops out at `INCONCLUSIVE`.
+The report records `test_selection.runner` and `runner_reason`. A script target is profiled the
+same way a pytest target is: the probe is installed by a validator-owned runner that then executes
+the file under `runpy` with `run_name="__main__"`, so `execution_receipt` is reachable for both.
+Nothing about `sys.setprofile` needed pytest; pytest was only where the hook was installed.
 
 Both, and they are reported separately, because the interesting case is when they disagree.
 Pytest runs emit JUnit XML and a zero-executed/all-skipped target is `skip`, never `pass`.
@@ -195,9 +197,23 @@ The S1-owned grid must cover three classes the PR's own tests routinely miss:
 | boundary / odd | odd N, N not a multiple of the tile — where tail masks fail |
 | long-context / large M | where 32-bit index arithmetic wraps |
 
-The grid stage runs only when the selected target source references the configured
-`--shape-env`; otherwise it is `skip` and the verdict is `INCONCLUSIVE`. This is a positive
-control against reporting the same default test run twice under different stage names.
+The grid reaches the target through whichever channel that target actually reads, and the channel
+must be proven structurally before it is used:
+
+| channel | flag | proof the hook exists |
+|---|---|---|
+| environment variable | `--shape-env` | the source references `os.getenv(VAR)` / `os.environ[VAR]` |
+| the target's own CLI flag | `--shape-arg` | the source passes that flag literal to `add_argument` |
+
+Injecting through an env var only would have made this stage permanently inert for repositories
+whose tests take shapes on the command line — a limit of the injector, not of the target. The flag
+is named by the caller rather than guessed, because a wrong guess appends argv the target silently
+ignores. Neither channel is trusted on the strength of the AST scan alone: the stage re-runs the
+target with a deliberately invalid grid value and requires it to fail. A target that passes with
+garbage shapes is not consuming the grid, so the stage is `skip`, never credited.
+
+With no channel configured the stage is `skip` and the verdict is `INCONCLUSIVE`. This is a
+positive control against reporting the same default test run twice under different stage names.
 
 When the kernel exposes no shape override, the report says `repo-default-only` rather than
 claiming coverage it does not have.
@@ -219,7 +235,13 @@ records actual calls and writes:
 
 `PASS` requires the observed route to equal `--expected-route`, at least one observed route
 symbol, and every shape named by `--grid`. The tested PR cannot obtain credit merely by writing
-its own receipt; `validate-kernel-pr.validation_probe` owns the receipt producer.
+its own receipt; `validate-kernel-pr.validation_probe` owns the receipt producer, and the script
+runner calls that producer's own hooks rather than re-implementing them.
+
+A receipt is validated whenever a route was named, including when no grid was configured or the
+grid channel could not be established. With no grid it asserts route execution and nothing about
+shapes, which is all it is then entitled to claim. Abandoning the receipt along with the grid
+would discard evidence that was already collected.
 
 ### 7 — `index_width_scan` (informational)
 
@@ -294,8 +316,9 @@ a seeded defect, and these have not been:
   Choosing the right `--target` from a diff is the unsolved part; an irrelevant target can
   still produce `PASS`. The report names the target so a reviewer can reject that evidence, but
   the executor cannot decide relevance itself.
-- **External grid adapters.** A script-only PR target may lack a shape hook. The validator does
-  not yet accept an independently hashed `--extra-target`, because that harness must be bound
+- **External grid adapters.** A target that exposes no shape channel at all — neither an env var
+  for `--shape-env` nor a CLI flag for `--shape-arg` — still cannot be given a grid. The validator
+  does not accept an independently hashed `--extra-target`, because that harness must be bound
   without changing the PR diff hash or live-base identity. Such runs remain `INCONCLUSIVE`.
 - **Cross-architecture compilation.** `arch_coverage: compile-only` is reserved for a future
   stage that actually invokes an architecture-specific compiler. No-GPU mode does not claim it.
