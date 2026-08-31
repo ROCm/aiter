@@ -7,11 +7,27 @@ import triton
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_a8w8_blockscale_a16w16 import (
     _fused_gemm_a8w8_blockscale_a16w16_kernel,
     _fused_gemm_a8w8_blockscale_a16w16_reduce_kernel,
-    _get_config,
 )
+from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+
+def _get_config(
+    M: int,
+    N_fp8: int,
+    N_bf16: int,
+    K: int,
+):
+
+    # Custom file naming: N8={N_fp8}-N16={N_bf16}-K={K}
+    specialized_filename = f"N8={N_fp8}-N16={N_bf16}-K={K}"
+    return get_gemm_config(
+        "FUSED-GEMM-A8W8_BLOCKSCALE-A16W16",
+        M,
+        specialized_filename=specialized_filename,
+    )
 
 
 def fused_gemm_a8w8_blockscale_a16w16(

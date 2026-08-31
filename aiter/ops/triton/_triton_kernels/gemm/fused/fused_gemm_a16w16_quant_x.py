@@ -7,10 +7,6 @@ import triton.language as tl
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp8_quant_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
-from aiter.ops.triton.utils.gemm_config_utils import (
-    compute_splitk_params,
-    get_gemm_config,
-)
 
 _fused_gemm_a16w16_quant_x_repr = make_kernel_repr(
     "_fused_gemm_a16w16_quant_x_kernel",
@@ -245,14 +241,3 @@ def _fused_gemm_a16w16_quant_x_kernel(
             offs_s_n[None, :] < (K // QUANT_BLOCK_SIZE)
         )
         tl.store(a_scale_ptrs, scale_2d, mask=scale_mask)
-
-
-def _get_config(
-    M: int,
-    N: int,
-    K: int,
-):
-    # Use the same tuning portal as the unfused gemm_a16w16 — the extra
-    # MXFP8 quant is assumed not to shift the optimal config.
-    config, is_tunned = get_gemm_config("GEMM-A16W16", M, N, K)
-    return compute_splitk_params(config, K), is_tunned

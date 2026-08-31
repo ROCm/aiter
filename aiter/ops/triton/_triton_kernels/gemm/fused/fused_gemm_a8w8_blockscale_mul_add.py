@@ -4,10 +4,8 @@
 import triton
 import triton.language as tl
 
-from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
-from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 _fused_gemm_a8w8_blockscale_mul_add_repr = make_kernel_repr(
     "_fused_gemm_a8w8_blockscale_mul_add_kernel",
@@ -335,21 +333,3 @@ def _fused_gemm_a8w8_blockscale_mul_add_reduce_kernel(
     )
 
     tl.store(c_out_ptrs, c)
-
-
-def _get_config(
-    M: int,
-    N: int,
-    K: int,
-    fuse_type: int = 0,
-):
-    # On gfx950 the dedicated FUSED-GEMM-A8W8_BLOCKSCALE-MUL_ADD family recovers
-    # this op's large-M regression (M > 512 -> the "any" bucket) with a fast
-    # 64x64 tile. That same tile is numerically correct for fuse_type=0 (a*Y + b) but
-    # is miscompiled by Triton 3.8 for fuse_type=1 (a*b + Y) (fails correctness), so
-    # fuse_type=1 must fall back to the base GEMM-A8W8_BLOCKSCALE config (128x128), which is
-    # correct. fuse_type=1 therefore does not get the large-M speedup.
-    if arch_info.get_arch() == "gfx950" and fuse_type == 0:
-        return get_gemm_config("FUSED-GEMM-A8W8_BLOCKSCALE-MUL_ADD", M, N, K)
-    # fuse_type=1 on gfx950 (64x64 miscompiles) and all other arches use the base.
-    return get_gemm_config("GEMM-A8W8_BLOCKSCALE", M, N, K)

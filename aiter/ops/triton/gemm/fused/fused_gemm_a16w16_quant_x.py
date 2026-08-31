@@ -10,13 +10,27 @@ from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
 )
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_a16w16_quant_x import (
     _fused_gemm_a16w16_quant_x_kernel,
-    _get_config,
+)
+from aiter.ops.triton.utils.gemm_config_utils import (
+    compute_splitk_params,
+    get_gemm_config,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
 _QUANT_BLOCK_SIZE = 32
+
+
+def _get_config(
+    M: int,
+    N: int,
+    K: int,
+):
+    # Use the same tuning portal as the unfused gemm_a16w16 — the extra
+    # MXFP8 quant is assumed not to shift the optimal config.
+    config, is_tunned = get_gemm_config("GEMM-A16W16", M, N, K)
+    return compute_splitk_params(config, K), is_tunned
 
 
 def fused_gemm_a16w16_quant_x(

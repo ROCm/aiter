@@ -5,7 +5,6 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
-from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 
 @triton.heuristics(
@@ -369,19 +368,3 @@ def _fused_gemm_a8w8_blockscale_a16w16_reduce_kernel(
         )
         c_bf16_mask = (offs_m[:, None] < M) & (offs_bf16_n[None, :] < N_bf16)
         tl.store(c_bf16_out_ptrs, c_bf16, mask=c_bf16_mask)
-
-
-def _get_config(
-    M: int,
-    N_fp8: int,
-    N_bf16: int,
-    K: int,
-):
-
-    # Custom file naming: N8={N_fp8}-N16={N_bf16}-K={K}
-    specialized_filename = f"N8={N_fp8}-N16={N_bf16}-K={K}"
-    return get_gemm_config(
-        "FUSED-GEMM-A8W8_BLOCKSCALE-A16W16",
-        M,
-        specialized_filename=specialized_filename,
-    )
