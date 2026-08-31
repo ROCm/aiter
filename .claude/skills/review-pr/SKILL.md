@@ -1,6 +1,6 @@
 ---
 name: review-pr
-description: Advisory AI code review for aiter and FlyDSL PRs. Catches perf regressions, silent correctness bugs, dispatch gate holes, and AI-generated code patterns, but never acts as a merge gate. Invoke with a PR number (optionally owner/repo#N) and an explicit validation report path; deterministic validation is reported separately.
+description: Advisory AI code review for aiter and FlyDSL PRs. Catches perf regressions, silent correctness bugs, dispatch gate holes, and AI-generated code patterns, but never acts as a merge gate. Invoke with a PR number (optionally owner/repo#N) and, when one exists, a validation report path; a review without one is static-only and is a supported outcome, not a deficiency. Deterministic validation is reported separately.
 argument-hint: <PR number> [owner/repo] [validation-report]
 ---
 
@@ -9,6 +9,24 @@ argument-hint: <PR number> [owner/repo] [validation-report]
 This skill supplies hints to a human reviewer. Its judgement is stochastic and never blocks a
 merge. Only a reproducible blocker from an explicitly supplied, head-matched
 `validation_report.json` may be used as a deterministic gate.
+
+## Promotion bar
+
+This skill is advisory now and stays advisory until both conditions below hold. Neither holds today,
+so no part of it may gate a merge.
+
+- **False clearance is measured and near zero for every family that raises a red verdict.** The
+  number that matters is not recall, and not a spot check: it is the rate at which the tool reports
+  nothing wrong when something is wrong. No committed replay corpus establishes it, so that number
+  does not currently exist.
+- **The judgement relied on is not an LLM's.** An LLM judgement never gates a merge, whatever its
+  measured accuracy. Only a reproducible blocker carried by a head-matched `validation_report.json`
+  may gate, because the report ships its reproducer with it.
+
+Until then `🔴 HIGH RISK` requests human attention and nothing more. Whoever proposes a rule edit as
+an improvement, or proposes letting this tool gate a merge, owns building the corpus and measuring
+against it. This bar lives in the header rather than in an issue because a header is read on every
+use and an issue sinks.
 
 ---
 
@@ -378,7 +396,7 @@ Check which type(s) apply; these determine which Step 5 categories are mandatory
 - [ ] **Perf / benchmark PR** → P1 (numbers with units), P5 (setup cost excluded?), P2 (production shapes), P3 (reproducible)
 - [ ] **Test / benchmark only** → P2 (production shapes), HK6 (aiter-op-test format)
 - [ ] **Async / multi-stream** → G1 (stream sync missing), G1b (blocking queue.get without timeout in serving code)
-- [ ] **FlyDSL kernel** → D10 (compile result called?), D10b (arith.unwrap() before arith.bitcast?). If an exact-head `validation_report.json` was supplied, use its deterministic stages as evidence. Otherwise mark the result `[static-only advisory review]` (see Step 8) and make no runtime clearance claim; absence of a report is not itself a blocker.
+- [ ] **FlyDSL kernel** → D10 (compile result called?), D10b (arith.unwrap() before arith.bitcast?). If an exact-head `validation_report.json` was supplied, use its deterministic stages as evidence. Otherwise mark the result `[static-only advisory review]` (see Step 8) and make no runtime clearance claim; absence of a report is not itself a blocker. Two target classes cannot reach `PASS` by construction, so their `INCONCLUSIVE` is the expected output and not a deficiency: a CPU-only target claims no GPU and therefore no architecture, and a bugfix with no shape dimension has no grid for `correctness_s1_grid` to consume. Never ask such an author for a passing report.
 - [ ] **New if/elif dispatch with variable assignment** → D1b (UnboundLocalError on uninitialized path)
 - [ ] **Change to behavior/dispatch of a downstream-consumed op** (mla / fused_moe / attention / mha / quant / gemm_op_a8w8 / moe_op / jit-core) → E4 (is downstream CI triggered or skipped?), E5 (stable-API owner sign-off)
 - [ ] **New `@compile_ops` / `torch.library.custom_op`, or change to an op's return dtype/arity** → D7 (fake/abstract impl exists?), D6 (fake dtype/shape matches real op?)
