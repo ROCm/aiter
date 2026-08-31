@@ -245,7 +245,7 @@ def test_flydsl_topk_short_rows_are_minus_one_padded(stable: bool):
             )
 
 
-def test_flydsl_topk_single_row_persistent_graph():
+def test_flydsl_topk_single_row_dynamic_multi_graph():
     top_k = 2048
     context_len = 65536
     logits = torch.randn((1, context_len), dtype=torch.float32, device="cuda")
@@ -253,11 +253,13 @@ def test_flydsl_topk_single_row_persistent_graph():
     output = torch.empty((1, top_k), dtype=torch.int32, device="cuda")
     reference = torch.empty_like(output)
 
-    # Warm the launcher and persistent workspace before graph capture.
+    topk_per_row_impl._get_topk_launcher.cache_clear()
+    # Long single-row calls deliberately use the safe multi-launch path.
     _run_flydsl(logits, 1, seq_lens, output, top_k, True)
     _run_hip(logits, 1, seq_lens, reference, top_k, True)
     torch.cuda.synchronize()
     torch.testing.assert_close(output, reference, rtol=0, atol=0)
+    assert topk_per_row_impl._get_topk_launcher.cache_info().misses == 1
 
     graph_lens = seq_lens.clone()
     graph_output = torch.full_like(output, -777)

@@ -44,20 +44,6 @@ def _get_one_workgroup_topk_launcher(k: int):
     )
 
 
-@functools.cache
-def _get_persistent_topk_launcher(k: int):
-    return create_topk_per_row_decode_tiered_kernel(
-        k,
-        blocks_per_row=16,
-        bits_per_pass=11,
-        scan_stages=8,
-        tier_mode="long",
-        tiered_mid_cap=16,
-        tiered_long_cap=16,
-        stable=True,
-    )
-
-
 def _is_stream_capturing() -> bool:
     try:
         return torch.cuda.is_current_stream_capturing()
@@ -256,14 +242,10 @@ def flydsl_top_k_per_row_decode(
 
     rows, n = logits.shape
     use_one_workgroup = stable and n <= _ONE_WORKGROUP_MAX_ROW_WIDTH
-    if use_one_workgroup or (rows == 1 and stable):
-        # Short rows use one independent workgroup per row: one launch, no
-        # inter-workgroup barrier, and no workspace traffic.
-        launcher = (
-            _get_one_workgroup_topk_launcher(k)
-            if use_one_workgroup
-            else _get_persistent_topk_launcher(k)
-        )
+    if use_one_workgroup:
+        # One independent workgroup per row: one launch, no inter-workgroup
+        # barrier, and no workspace traffic.
+        launcher = _get_one_workgroup_topk_launcher(k)
         workspace = _get_persistent_workspace(logits.device, indices)
         _run_compiled(
             launcher,
@@ -279,6 +261,10 @@ def flydsl_top_k_per_row_decode(
         )
         return
 
+    # A long-row multi-block persistent launch uses a non-cooperative grid
+    # barrier. Concurrent graph replays can schedule only part of each grid and
+    # deadlock all resident workgroups, so every long row uses safe launch-boundary
+    # synchronization instead.
     hist_shape, state_shape = topk_per_row_decode_workspace_shapes(rows, stable)
     partial_hist, state = _get_topk_workspace(
         logits.device,
