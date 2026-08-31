@@ -78,7 +78,7 @@ jobs:
           FORCE_REBUILD: ${{ github.event.inputs.force_rebuild || false }}
           SKIP_BIWEEKLY_GATE: ${{ github.event.inputs.skip_biweekly_gate || false }}
           EXPECTED_WHEEL_COUNT: '6'
-          RELEASE_CADENCE_ANCHOR: '2026-07-27'
+          RELEASE_CADENCE_ANCHOR: '2026-08-31'
         run: |
           set -euo pipefail
 
