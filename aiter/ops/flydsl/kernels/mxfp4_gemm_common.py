@@ -317,17 +317,6 @@ def _situ_mul_batch(gate_values, up_values, beta=1.0, linear_beta=1.0):
         return (x > zero).select(tanh_abs, -tanh_abs)
 
     def fused_elem(gate, up):
-        # beta == 1: situ(gate) * tanh(up) with the two reciprocals folded into
-        # one.
-        #
-        #   situ(g)  = s_g * (1-v) * rcp(1+v*v)      v = e^-|g|
-        #   tanh(u)  = s_u * (1-w) * rcp(1+w)        w = e^-2|u|/lb
-        #
-        # so the product is  s_g*s_u * (1-v)(1-w) * rcp((1+v*v)(1+w)).  One rcp
-        # instead of two, at the price of two extra full-rate multiplies:
-        # v_rcp_f32 is quarter rate (16 cycles for a wave64) while v_mul_f32 is
-        # full rate (4).  Algebraically identical -- only the rounding of the
-        # single division differs.
         v = fx.Float32(rocdl.exp2(T.f32, _raw(_fabs_f32(gate) * fx.Float32(-LOG2E))))
         w = fx.Float32(
             rocdl.exp2(
@@ -338,9 +327,7 @@ def _situ_mul_batch(gate_values, up_values, beta=1.0, linear_beta=1.0):
         num = (one - v) * (one - w)
         den = (one + v * v) * (one + w)
         r = num * fx.Float32(rocdl.rcp(T.f32, _raw(den)))
-        # tanh(up) is odd, so its sign is just up's sign.
         r = (up > zero).select(r, -r)
-        # situ's negative branch carries an extra -v factor.
         return (gate > zero).select(r, -(v * r))
 
     if float(beta) == 1.0:

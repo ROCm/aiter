@@ -382,16 +382,6 @@ def _gemm1_body(
                     soffset=fx.Int32(kt * KH_TILE) // fx.Int32(4),
                 )
 
-    # ---- A staged through registers instead of a direct-to-LDS DMA ----------
-    # The DMA form (buffer_load ... offen lds) has no register name the waitcnt
-    # pass can track, so it must drain the copy with `s_waitcnt vmcnt(N)` before
-    # the next s_barrier -- one full memory round trip on the critical path of
-    # every K iteration, even though the tile is not read for another kAStages
-    # iterations. Splitting it into a plain buffer_load into VGPRs plus a
-    # ds_write lets the load be issued a_reg_depth iterations ahead: the vmcnt
-    # wait then names a load that has long since landed, and the barrier only
-    # has to wait on lgkmcnt for the ds_write. Costs 4 VGPRs per kSubBlock per
-    # depth stage (BM64: 8 per stage).
     def issue_a_load_reg(kt):
         regs = []
         for sub in range_constexpr(kSubBlocks):
@@ -411,9 +401,6 @@ def _gemm1_body(
         return regs
 
     def a_reg_write_lds(slot, regs):
-        # Mirror the DMA's implicit destination: a wave-wide 1024 B copy lands
-        # lane L at off + L*16, i.e. row lds_row + L//8, byte (L%8)*16. The XOR
-        # swizzle already happened on the source side in issue_a_load_reg.
         for sub in range_constexpr(kSubBlocks):
             lds_row = wave_n * fx.Int32(BM // 4) + fx.Int32(sub * 8)
             dst = (
@@ -438,20 +425,9 @@ def _gemm1_body(
         return r
 
     def issue_a_ds_read(slot, khalf=None):
-        # khalf restricts the read to one 128-K half so the other half's 32
-        # registers are not live at the same time (see k_split).
         mask = _lds_swizzle_mask(lane_mod_16)
         a = [[None, None] for _ in range(kMChunks)]
         halves = range_constexpr(2) if khalf is None else (khalf,)
-        # Emit the fragments in the order mfma_cluster consumes them rather than
-        # k-major.  The reads all land back to back and the first MFMA cannot
-        # issue until its operand arrives, so the waitcnt pass turns a matching
-        # order into a descending lgkmcnt staircase (lgkm(N-1), lgkm(N-2), ...)
-        # instead of a single lgkmcnt(0) that drains the whole burst first.  With
-        # four waves per group all hitting LDS at the same instant after the
-        # barrier, that drain is a few hundred cycles of dead time per k-tile.
-        # issue_cluster walks sub-blocks outermost, then the two K halves, then
-        # the two 16-row chunks inside the sub-block.
         if const_expr(kMChunks == 1):
             order = [(0, k) for k in halves]
         else:
@@ -841,8 +817,6 @@ def _gemm1_body(
             b_slot[j][half] = r
 
     def issue_b_load_half(b1, K_C, j, khalf):
-        # k_split's rotating B buffer: one 128-K half per (j) slot, reloaded
-        # immediately after its MFMAs so only N_REPS fragments are ever live.
         v = (
             (lane_div_16 * fx.Int32(256))
             + (lane_mod_16 * fx.Int32(16))
@@ -888,9 +862,6 @@ def _gemm1_body(
         )
 
     def mfma_cluster(b_slot, a, a_scale, bs_slot, J, khalf=None):
-        # khalf=None issues both 128-K halves from b_slot[J][0]/[1]; an explicit
-        # khalf issues only that half and reads the single fragment b_slot[J]
-        # (the rotating k_split buffer).
         if const_expr(interleave):
             mni = J // 2
         else:
@@ -944,27 +915,7 @@ def _gemm1_body(
             issue_cluster(mni, J % 2 if const_expr(interleave) else J // 2)
 
     def run_k_slice_ksplit(global_k_tile):
-        # One tile per iteration, split into its two 128-K halves.
-        #
-        # A: only the half being multiplied is resident (32 registers instead of
-        #    the 64 both halves would cost).
-        # B: two rotating fragment sets, indexed by K-half, instead of kStages
-        #    whole k-tiles -- 32 registers instead of 64. bh[h][J] is refilled
-        #    with the next tile's half h right after its MFMAs retire it, so the
-        #    load has one full k-tile (8 clusters, 128 MFMA, ~2k cycles) to land,
-        #    a longer prefetch distance than the amount of register state
-        #    suggests.
         bh = [[None] * N_REPS for _ in range(2)]
-        # Register-staged A (a_reg_depth > 0) exists here for one reason: the
-        # `s_waitcnt vmcnt(0)` documented at the bottom of this loop.  vmcnt is
-        # an in-order FIFO and the A copy is the last memory op of the
-        # iteration, so retiring it also retires the eight B loads issued above
-        # it -- the prefetch for the next tile.  Routing A through VGPRs removes
-        # the `buffer_load ... offen lds` form entirely and leaves a ds_write
-        # (lgkmcnt, which the barrier drains regardless) plus an ordinary
-        # register load whose consumer is a_reg_depth iterations downstream.
-        # Costs kSubBlocks*4 VGPRs per depth stage -- 16 at BM128, so depth 2
-        # lands at 256, still two waves/SIMD.
         a_regs = [None] * a_reg_depth if a_reg_depth else []
         issue_a_scale_load()
         for S in range_constexpr(kStages):
@@ -975,7 +926,6 @@ def _gemm1_body(
         for h in range_constexpr(2):
             for j in range_constexpr(N_REPS):
                 issue_b_load_half(bh[h], global_k_tile(0), j, h)
-        # Prime the register pipeline with the tiles the loop will hand to LDS.
         for d in range_constexpr(a_reg_depth):
             if const_expr(kStages + d < K_TILES_PER_WAVE):
                 a_regs[d] = issue_a_load_reg(global_k_tile(kStages + d))
@@ -987,11 +937,6 @@ def _gemm1_body(
             gpu.barrier()
             asc_cur = issue_a_scale_ds_read(global_k_tile(KT))
             if const_expr(a_reg_depth):
-                # Top of the body, unlike the DMA: a ds_write is ordered by
-                # lgkmcnt against the ds_reads just above it, so it does not
-                # need the disjointness proof the DMA form failed, and the
-                # refill below is a plain register load with no LDS operand at
-                # all.  Both therefore leave the in-flight B loads untouched.
                 if const_expr(wt < K_TILES_PER_WAVE):
                     rocdl.sched_barrier(0)
                     a_reg_write_lds(wt % kAStages, a_regs[KT % a_reg_depth])
@@ -1010,14 +955,6 @@ def _gemm1_body(
             if const_expr(wt < K_TILES_PER_WAVE):
                 issue_b_scale_load(b_scale_v[slot_b], global_k_tile(wt))
             if const_expr(wt < K_TILES_PER_WAVE and not a_reg_depth):
-                # The A copy has to be the last memory op of the iteration.
-                # Splitting K means the second half's ds_reads are issued after
-                # the first half's MFMAs, so an A copy placed at the top of the
-                # body sits above them -- and the waitcnt pass, unable to prove
-                # the LDS ranges disjoint, then guards every following ds_read
-                # with s_waitcnt vmcnt(0), draining all eight in-flight B loads
-                # four times per iteration. Below the ds_reads it only costs the
-                # single drain the next s_barrier needs anyway.
                 rocdl.sched_barrier(0)
                 issue_a_load_lds(wt % kAStages, global_k_tile(wt))
 
@@ -1141,8 +1078,6 @@ def _gemm1_body(
     # Four dwords of row padding rotate each four-row store group by 16 banks
     # on gfx950, avoiding the 4-way conflict from a BN-aligned row stride.
     ACC_LDS_STRIDE = BN + ACC_LDS_PAD_DW
-    # The accumulator is drained in epi_splits row passes, so only BM/epi_splits
-    # rows are resident at a time; that is what sizes the LDS allocation.
     ACC_ROWS = BM // epi_splits
     acc_layout = fx.make_layout((ACC_ROWS, BN), (ACC_LDS_STRIDE, 1))
     ACC_GROUP_STRIDE = ACC_ROWS * ACC_LDS_STRIDE
@@ -1173,9 +1108,6 @@ def _gemm1_body(
             value = value + acc_load(acc_idx(fx.Int32(group), row, col))
         return value
 
-    # The epilogue reads eight consecutive accumulator columns per lane, and
-    # every stride in acc_idx is a multiple of four dwords, so those reads are
-    # four naturally-aligned ds_read_b128 instead of sixteen ds_read_b32.
     acc_x4_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Float32)
     acc_flat_tiles4 = fx.logical_divide(acc_flat_view, mem_4x1)
 
@@ -1304,7 +1236,6 @@ def _gemm1_body(
                 )
 
         for mr in range_constexpr(split * MR_PER_SPLIT, (split + 1) * MR_PER_SPLIT):
-            # LDS only holds this split's rows; the output row stays global.
             row_lds = fx.Int32((mr - split * MR_PER_SPLIT) * 16) + m_lane
             row_local = fx.Int32(mr * 16) + m_lane
 
@@ -1503,13 +1434,8 @@ def _gemm1_body(
                     )
 
     if const_expr(epi_splits > 1):
-        # epi_splits > 1 is asserted to imply BN256 / 4 waves / k_wave 1, so
-        # wave_k is statically zero and every wave runs the epilogue. Emitting
-        # the split loop at the top level (no scf.if) keeps the barriers
-        # block-wide and lets scales_per_mr dominate its use in store_scales().
         for split in range_constexpr(epi_splits):
             if const_expr(split > 0):
-                # Every wave has finished reading the previous split out of LDS.
                 gpu.barrier()
             store_acc_split(split)
             gpu.barrier()
@@ -1536,11 +1462,6 @@ def _gemm1_body(
 
 
 def _bm_constants(BM, BN, KH_TILE, K_TILES_TOTAL, k_wave=1, epi_splits=1):
-    # kAStages must exceed kStages: iteration i reads A slot i % kAStages while
-    # the direct-to-LDS copy fills slot (i + kStages) % kAStages, and each wave
-    # writes only its own quarter of the rows but reads all of them. With
-    # kAStages == kStages those are the same slot and waves race inside one
-    # barrier interval.
     kAStages = kStages + 1
     kSubBlocks = 1 if BM < 32 else BM // 32
     kMChunks = kmchunks_for(BM)
@@ -1552,23 +1473,6 @@ def _bm_constants(BM, BN, KH_TILE, K_TILES_TOTAL, k_wave=1, epi_splits=1):
 
 
 def default_epi_splits(BM, BN, KH_TILE, K_TILES_TOTAL, k_wave=1, num_waves=4):
-    """Row-split factor for the epilogue accumulator staged in LDS.
-
-    Splitting the drain shrinks the f32 accumulator buffer (BM x (BN+pad)) that
-    sizes the kernel's LDS allocation, at the cost of two extra barriers. It
-    only pays when LDS is what caps workgroups/CU.
-
-    Off by default: the 64x256 situv2 kernel measures 228 VGPRs, so it is
-    VGPR-limited long before it is LDS-limited (66 KB of 160 KB) and the split
-    is pure barrier overhead (~2%). The split path requires BN256 / 4 waves /
-    k_wave 1.
-
-    BM128/BN256 is the one shape where it is the binding constraint: the
-    unsplit f32 accumulator is 128 x 260 x 4 = 130 KB of the 160 KB LDS, so a
-    single workgroup would be resident per CU (4 waves = 1 wave/SIMD). Split
-    by 2 and the 66.5 KB buffer admits two workgroups, matching what the
-    k_split register budget was cut for.
-    """
     if BM == 128 and BN == 256 and num_waves == 4 and k_wave == 1:
         return 2
     return 1
@@ -1694,9 +1598,6 @@ def compile_gemm1_a4w4_port(
         epi_splits >= 1 and (epi_splits & (epi_splits - 1)) == 0
     ), f"epi_splits must be a power of two, got {epi_splits}"
     if epi_splits > 1:
-        # Splitting inserts a barrier inside the epilogue, so every thread in
-        # the block has to reach it: only the all-waves-run-the-epilogue
-        # configuration qualifies.
         assert (
             BN == 256 and num_waves == 4 and k_wave == 1
         ), "epi_splits > 1 requires BN256 / 4 waves / k_wave 1"
