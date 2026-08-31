@@ -96,6 +96,90 @@ namespace aiter {
         fn_packed[i] = (hi_bits << 16) | lo_bits;
     }
 
+    // ---- fn preshuffle for the FUSED post_pre gemm (mhc_pre_shuffle_fn) ----
+    //
+    // Unshuffled, one wave's fn tile is 16 N-rows of tile_k floats each, and
+    // consecutive N are fn_stride = hc_mult*hidden_size floats apart (114 KB at
+    // hidden=7168, hc_mult=4). So a single k-step touches 16 (x hc_mult heads)
+    // separate 128 B segments scattered across the whole weight -- 16 distinct
+    // memory streams for what is logically one tile.
+    //
+    // Reblock so the N dimension sits INSIDE a K block of 32:
+    //     fn[n][Kflat]  ->  fnS[Kflat/32][n][Kflat%32]
+    // A wave's tile then lands in one (or, for tile_k=64, two adjacent)
+    // 16*32*4 = 2 KB contiguous run.
+    //
+    // The block is fixed at 32, not tile_k, on purpose: every K offset the kernel
+    // forms (warp_id*hidden_size, k_split_offset, k*tile_k) is a multiple of 32,
+    // and each lane's vec_tile run lies inside ONE 32-block for both tile_k=32
+    // (vec_tile=16, lane halves at kr 0/16) and tile_k=64 (vec_tile=32, lane
+    // halves in adjacent blocks). So one layout serves every (tile_m, tile_n,
+    // tile_k, warp_size) combo -- no per-config weight copy.
+    //
+    // n is NOT padded: a K block holds exactly hc_mult3 rows. Padding up to the
+    // tile_n=32 the kernel reads would grow fn by 33% (24 -> 32 rows) and that extra
+    // is real read traffic -- fn is re-read by every m-block, so at m=65536 it is
+    // ~5.6 GB, the same order as the residual stream. The kernel instead keeps the
+    // old "OOB N reads 0" behaviour by steering those lanes past the buffer bound.
+    //
+    // pack_bf16 folds in the same hi<<16|lo packing as mhc_pre_convert_fn: the
+    // shuffle is a permutation of elements and the packing a per-element value
+    // transform, so they compose in a single pass over the (constant) weights.
+    template <typename DTYPE_I, bool pack_bf16>
+    __global__ void mhc_pre_shuffle_fn_kernel(
+        uint32_t* out, const float* fn, int hc_mult3, int hc_hidden_size)
+    {
+        int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+        int64_t total = (int64_t)(hc_hidden_size / 32) * hc_mult3 * 32;
+        if (i >= total) return;
+        const int kr = (int)(i % 32);
+        const int n  = (int)((i / 32) % hc_mult3);
+        const int64_t kb = i / (32 * (int64_t)hc_mult3);
+        uint32_t v = 0;
+        {
+            float f = fn[(int64_t)n * hc_hidden_size + kb * 32 + kr];
+            if constexpr (pack_bf16) {
+                DTYPE_I hi = static_cast<DTYPE_I>(f);
+                DTYPE_I lo = static_cast<DTYPE_I>(f - static_cast<float>(hi));
+                v = ((uint32_t)__builtin_bit_cast(uint16_t, hi) << 16)
+                  |  (uint32_t)__builtin_bit_cast(uint16_t, lo);
+            } else {
+                v = __builtin_bit_cast(uint32_t, f);
+            }
+        }
+        out[i] = v;
+    }
+
+    void mhc_pre_shuffle_fn(
+        aiter_tensor_t& fn_shuffled, // (hc_hidden_size/32, hc_mult3, 32) int32/fp32 out
+        aiter_tensor_t& fn,          // (hc_mult3, hc_hidden_size) fp32 in
+        int is_fn_pack_bf16
+    )
+    {
+        AITER_CHECK(fn.dtype() == AITER_DTYPE_fp32, "fn must be fp32");
+        AITER_CHECK(fn.dim() == 2, "fn must be 2D (hc_mult3, hc_hidden_size)");
+        const int hc_mult3 = (int)fn.size(0);
+        const int hc_hidden_size = (int)fn.size(1);
+        AITER_CHECK(hc_hidden_size % 32 == 0, "hc_hidden_size must be divisible by 32");
+        const int64_t total = (int64_t)(hc_hidden_size / 32) * hc_mult3 * 32;
+        AITER_CHECK((int64_t)fn_shuffled.numel() == total,
+                    "fn_shuffled numel must be (hc_hidden_size/32) * hc_mult3 * 32");
+        const int block_size = 256;
+        int64_t grid = (total + block_size - 1) / block_size;
+        const HipDeviceGuard device_guard(fn.device_id);
+        const hipStream_t stream = aiter::getCurrentHIPStream();
+        using DTYPE_I = typename hip2opus<hip_bfloat16>::type;
+        auto* o = reinterpret_cast<uint32_t*>(fn_shuffled.data_ptr());
+        auto* f = reinterpret_cast<const float*>(fn.data_ptr());
+        if (is_fn_pack_bf16) {
+            mhc_pre_shuffle_fn_kernel<DTYPE_I, true><<<grid, block_size, 0, stream>>>(
+                o, f, hc_mult3, hc_hidden_size);
+        } else {
+            mhc_pre_shuffle_fn_kernel<DTYPE_I, false><<<grid, block_size, 0, stream>>>(
+                o, f, hc_mult3, hc_hidden_size);
+        }
+    }
+
     // The packed hi/lo are encoded as bf16 -- the activation/MFMA element type the gemm
     // uses -- so the gemm's bit-extract round-trips.
     void mhc_pre_convert_fn(
@@ -2166,7 +2250,9 @@ namespace aiter {
         int hidden_size,
         int x_stride,
         int out_stride,
-        int split_k = 1
+        int split_k = 1,
+        int fn_n_pad = 0   // 0: fn is the plain (hc_mult3, hc_hidden_size) layout;
+                           // >0: fn is preshuffled to (hc_hidden_size/32, fn_n_pad, 32)
     )
     {
         static constexpr int store_policy = store_nt ? GROUP_NT : RT;
@@ -2209,7 +2295,9 @@ namespace aiter {
         using fp32xmma_t = opus::vector_t<float, mma_pack_size>;
 
         DTYPE_I* x_ptr = x + idx * x_stride;
-        float* fn_ptr  = fn + n_idx * hc_hidden_size;
+        // Preshuffled fn is addressed from its base (n_idx folds into the element
+        // offset below) and needs no N bound: the padded rows are zero-filled.
+        float* fn_ptr  = fn_n_pad ? fn : (fn + n_idx * hc_hidden_size);
         float* out_ptr = out + (static_cast<int64_t>(k_split_idx * m + idx)) * out_stride + n_idx;
         int residual_stride = hc_hidden_size;
         int fn_stride = hc_hidden_size;
@@ -2218,7 +2306,10 @@ namespace aiter {
         const int m_oob = m < idx + tile_m ? (m - idx) : tile_m;
         const int n_oob = hc_mult3 < (n_idx + tile_n) ? (hc_mult3 - n_idx) : tile_n;
         auto g_x = opus::make_gmem<DTYPE_I>(x_ptr, x_stride * sizeof(DTYPE_I) * m_oob);
-        auto g_fn = opus::make_gmem<float>(fn_ptr, hc_hidden_size * sizeof(float) * n_oob);
+        auto g_fn = opus::make_gmem<float>(
+            fn_ptr, fn_n_pad ? (hc_hidden_size * fn_n_pad * (int)sizeof(float))
+                             : (hc_hidden_size * (int)sizeof(float) * n_oob));
+        // fn_n_pad is the row count actually stored per K block (== hc_mult3, unpadded).
         auto g_res = opus::make_gmem<DTYPE_I>(residual_ptr, residual_stride * sizeof(DTYPE_I) * m_oob);
         auto g_nres = opus::make_gmem<DTYPE_I>(next_residual_ptr, residual_stride * sizeof(DTYPE_I) * m_oob);
         auto g_o = opus::make_gmem<float>(out_ptr, out_stride * sizeof(float) * m_oob);
@@ -2357,12 +2448,41 @@ namespace aiter {
         static constexpr int fn_load_vec = 16 / sizeof(float);
         static constexpr int fn_load_waitcnt = tile_n * tile_k / (warp_size * fn_load_vec);
         using fp32xfntile = opus::array<fp32xtile, repeat_n>;
+        // fn_n_pad is a launch-uniform scalar, so this is a scalar branch, not a
+        // per-lane one, and both arms issue the identical vec_tile-wide loads --
+        // only the address arithmetic differs.
+        //
+        // Shuffled (fn_n_pad > 0): fnS[Kflat/32][n][Kflat%32]. Every term of kbase
+        // is a multiple of 32 (see mhc_pre_shuffle_fn), so the block index splits as
+        // kbase/32 + kr0/32 and the in-block offset is just kr0 % 32. Consecutive n
+        // are then mfma_n*32 floats apart (2 KB) instead of mfma_n*fn_stride (1.75 MB).
+        const int fn_kbase = warp_id * hidden_size + k_split_offset;
+        const int fn_kr0   = (lane_id / mfma_n) * vec_tile;
         auto vgpr_load_fn_tile = [&](int k) {
             fp32xfntile v_fn;
-            int offset_base = lane_id % mfma_n * fn_stride + warp_id * hidden_size + lane_id / mfma_n * vec_tile
-                + k * tile_k + k_split_offset;
+            int offset_base, n_step;
+            if (fn_n_pad) {
+                offset_base = ((fn_kbase + k * tile_k + fn_kr0) / 32) * (fn_n_pad * 32)
+                            + (n_idx + lane_id % mfma_n) * 32 + (fn_kr0 % 32);
+                n_step = mfma_n * 32;
+                // N is not padded, so lanes whose row is >= hc_mult3 must still read 0.
+                // Steer them past the buffer bound (the same mechanism the unshuffled
+                // path gets for free from g_fn's n_oob-derived size) instead of storing
+                // zero rows, which would add 33% to fn's read traffic.
+                const int n_row = n_idx + lane_id % mfma_n;
+                for (int n = 0; n < repeat_n; n++) {
+                    v_fn[n] = (n_row + n * mfma_n) < hc_mult3
+                        ? load_vector_nbytes<float, vec_tile, 16, 0, false>(g_fn, offset_base + n * n_step)
+                        : fp32xtile{};
+                }
+                return v_fn;
+            } else {
+                offset_base = lane_id % mfma_n * fn_stride + fn_kbase + lane_id / mfma_n * vec_tile
+                    + k * tile_k;
+                n_step = mfma_n * fn_stride;
+            }
             for(int n = 0; n < repeat_n; n++) {
-                v_fn[n] = load_vector_nbytes<float, vec_tile, 16, 0, false>(g_fn, offset_base + n * mfma_n * fn_stride);
+                v_fn[n] = load_vector_nbytes<float, vec_tile, 16, 0, false>(g_fn, offset_base + n * n_step);
             }
             return v_fn;
         };
@@ -2709,7 +2829,8 @@ namespace aiter {
                 hidden_size, \
                 x_stride, \
                 out_stride, \
-                split_k); \
+                split_k, \
+                fn_n_pad); \
     });
 
 #define MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL(num_warps, tile_m, tile_n, tile_k) \
@@ -2755,18 +2876,25 @@ namespace aiter {
         int tile_m = 16,
         int tile_n = 32,
         int tile_k = 32,
-        int is_fn_pack_bf16 = 0)
+        int is_fn_pack_bf16 = 0,
+        // 0: fn is the plain (hc_mult3, hc_hidden_size) layout.
+        // >0: fn came from mhc_pre_shuffle_fn -> (hc_hidden_size/32, fn_n_pad, 32).
+        int fn_n_pad = 0)
     {
         int m = layer_input.size(0);
         int hidden_size = layer_input.size(1);
         int hc_mult = residual_in.size(1);
-        int hc_mult3 = fn.size(0);
-        int hc_hidden_size = fn.size(1);
+        // Preshuffled fn is (hc_hidden_size/32, fn_n_pad, 32), so hc_mult3 / hc_hidden_size
+        // are no longer its dim0/dim1 and its stride(0) is not the K pitch. Derive them
+        // from the shapes that do not change, and check the shuffled shape instead.
+        const bool fn_shuffled = fn_n_pad > 0;
+        int hc_mult3 = fn_shuffled ? (hc_mult * hc_mult + 2 * hc_mult) : (int)fn.size(0);
+        int hc_hidden_size = fn_shuffled ? (hc_mult * hidden_size) : (int)fn.size(1);
         int x_stride = layer_input.stride(0);
         int out_stride = gemm_out_mul.stride(1);
         int split_k = gemm_out_sqrsum.size(0);
         const int res_stride = residual_in.stride(0);
-        const int fn_stride = fn.stride(0);
+        const int fn_stride = fn_shuffled ? hc_hidden_size : (int)fn.stride(0);
 
         AITER_CHECK(hc_mult == 4, "hc_mult only supports 4");
         AITER_CHECK(res_stride == hc_hidden_size,
@@ -2774,13 +2902,22 @@ namespace aiter {
                     hc_hidden_size,
                     "), got ",
                     res_stride);
-        AITER_CHECK(fn_stride == hc_hidden_size,
-                    "fn stride(0) must equal hc_hidden_size (",
-                    hc_hidden_size,
-                    "), got ",
-                    fn_stride);
-        AITER_CHECK(hc_hidden_size == hc_mult * hidden_size,
-                    "fn K dim must equal hc_mult * hidden_size");
+        if (fn_shuffled) {
+            AITER_CHECK(fn.dim() == 3 && fn.size(0) == hc_hidden_size / 32 &&
+                            fn.size(1) == fn_n_pad && fn.size(2) == 32,
+                        "preshuffled fn must be (hc_hidden_size/32, fn_n_pad, 32)");
+            AITER_CHECK(fn_n_pad == hc_mult3, "fn_n_pad must equal hc_mult3 (rows per K block)");
+            AITER_CHECK(hc_hidden_size % 32 == 0,
+                        "hc_hidden_size must be divisible by 32 for the preshuffled fn");
+        } else {
+            AITER_CHECK(fn_stride == hc_hidden_size,
+                        "fn stride(0) must equal hc_hidden_size (",
+                        hc_hidden_size,
+                        "), got ",
+                        fn_stride);
+            AITER_CHECK(hc_hidden_size == hc_mult * hidden_size,
+                        "fn K dim must equal hc_mult * hidden_size");
+        }
         AITER_CHECK(gemm_out_mul.size(0) == split_k,
                     "gemm_out_mul dim0 must be split_k");
         AITER_CHECK(gemm_out_sqrsum.size(0) == split_k,

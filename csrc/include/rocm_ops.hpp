@@ -2478,6 +2478,12 @@ namespace py = pybind11;
           "mhc_pre_convert_fn",                   \
           py::arg("fn_packed"),                   \
           py::arg("fn"));                         \
+    m.def("mhc_pre_shuffle_fn",                   \
+          &aiter::mhc_pre_shuffle_fn,             \
+          "mhc_pre_shuffle_fn",                   \
+          py::arg("fn_shuffled"),                 \
+          py::arg("fn"),                          \
+          py::arg("is_fn_pack_bf16") = 0);        \
     m.def("mhc_pre_big_fuse",                     \
           &aiter::mhc_pre_big_fuse,               \
           "mhc_pre_big_fuse",                     \
@@ -2535,7 +2541,8 @@ namespace py = pybind11;
           py::arg("tile_m")          = 16,        \
           py::arg("tile_n")          = 32,        \
           py::arg("tile_k")          = 32,        \
-          py::arg("is_fn_pack_bf16") = 0);
+          py::arg("is_fn_pack_bf16") = 0,   \
+          py::arg("fn_n_pad")        = 0);
 #define CAUSAL_CONV1D_UPDATE_PYBIND                                            \
     m.def("causal_conv1d_update",                                              \
           &aiter::causal_conv1d_update,                                        \
