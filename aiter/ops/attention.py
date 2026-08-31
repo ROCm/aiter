@@ -19,7 +19,8 @@ from csrc.cpp_itfs.pa.pa_v1 import paged_attention_v1 as paged_attention_v1_core
 from csrc.cpp_itfs.torch_utils import direct_register_custom_op
 
 from ..jit.core import compile_ops, is_experimental_enabled
-from ..jit.utils.chip_info import get_cu_num, get_gfx, require_gfx1250_asm
+from ..jit.utils.chip_info import get_cu_num, get_gfx
+from ..jit.utils.asm_guard import require_gfx1250_asm
 
 MD_NAME = "module_attention"
 
