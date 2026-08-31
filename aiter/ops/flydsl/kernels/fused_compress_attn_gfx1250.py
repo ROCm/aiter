@@ -485,7 +485,7 @@ def _build_kernel(
                     return arith.constant(D if k_static_val >= ratio else 0, type=i32)
                 # Dynamic: (k >= RATIO) ? D : 0  via select
                 is_b = fx.Int32(k_static_val) >= ratio
-                return _to_raw(is_b.select(fx.Int32(D), fx.Int32(0)))
+                return is_b.select(fx.Int32(D), fx.Int32(0))
 
             # ---- Step 6: Phase 1 -- state cache loop (dynamic bound = window_len) ----
             # window_len ? [0, K]. When 0, the loop is a no-op.
@@ -506,11 +506,9 @@ def _build_kernel(
                 is_pad_b = s_fx < 0
                 is_pad = is_pad_b.ir_value()
                 s_safe = is_pad_b.select(fx.Int32(0), s_fx)
-                ring = _to_raw(fx.Uint32(s_safe) % state_size)
-                col_off = _col_off_for_k(k_i32)
-
+                ring = fx.Uint32(s_safe) % state_size
                 # Slot term already folded into the descriptor base.
-                col_off_fx = fx.Int32(col_off)
+                col_off_fx = fx.Int32(_col_off_for_k(k_i32))
                 base_kv_off = (
                     fx.Int32(ring) * fx.Int32(kv_state_pos_stride)
                     + col_off_fx
@@ -555,9 +553,9 @@ def _build_kernel(
                 """Compute (col_off, in_row, ape_row) for Phase 2 iter k."""
                 col_off = _col_off_for_k(k_i32)
                 # k_i32 >= 0 -> unsigned rem.
-                ape_row = _to_raw(fx.Uint32(k_i32) % ratio)
+                ape_row = fx.Uint32(k_i32) % ratio
                 tmp = arith.subi(c_K_m1, k_i32)
-                in_row = _to_raw(fx.Int32(ragged_id) - fx.Int32(tmp))
+                in_row = fx.Int32(ragged_id) - fx.Int32(tmp)
                 return col_off, in_row, ape_row
 
             def _phase2_issue_loads(k_i32):
@@ -763,7 +761,7 @@ def _build_kernel(
             # ---- Step 10: GPT-J RoPE on RD tail ----
             # is_rope = tid >= ROPE_THREAD_LO. RoPE applies only to those threads.
             # position >= 0 (guarded by the sentinel-skip IfOp) -> unsigned div.
-            comp_pos_i32 = _to_raw((fx.Uint32(position) // ratio) * ratio)
+            comp_pos_i32 = (fx.Uint32(position) // ratio) * ratio
 
             # Always compute the rotated/passthrough values per-lane, then
             # store. ROPE-only threads load cos/sin; NOPE threads use the
@@ -1416,8 +1414,8 @@ def _build_kernel_ksplit(
                 f32, "llvm.amdgcn.exp2.f32", [x * c_log2e], [], []
             )
 
-        wid = _to_raw(fx.Uint32(tid) // BLOCK_THREADS)  # -> [0, NW)
-        lid = _to_raw(fx.Uint32(tid) % BLOCK_THREADS)  # -> [0, 32)
+        wid = fx.Uint32(tid) // BLOCK_THREADS  # -> [0, NW)
+        lid = fx.Uint32(tid) % BLOCK_THREADS  # -> [0, 32)
 
         # ---- plan row (single dwordx4) ----
         plan_rsrc = buffer_ops.create_buffer_resource(plan, max_size=True)
@@ -1461,7 +1459,7 @@ def _build_kernel_ksplit(
                 if const_expr(not overlap):
                     return c_zero_i32
                 is_b = fx.Int32(k_i32) >= ratio
-                return _to_raw(is_b.select(fx.Int32(D), fx.Int32(0)))
+                return is_b.select(fx.Int32(D), fx.Int32(0))
 
             def _load_f32_vec(rsrc, off_elems_i32):
                 if const_expr(VEC <= 4):
@@ -1736,7 +1734,7 @@ def _build_kernel_ksplit(
 
                 # ---- GPT-J RoPE on RD tail ----
                 # position >= 0 (sentinel-skip guard) -> unsigned div.
-                comp_pos_i32 = _to_raw((fx.Uint32(position) // ratio) * ratio)
+                comp_pos_i32 = (fx.Uint32(position) // ratio) * ratio
                 cos_rsrc = buffer_ops.create_buffer_resource(cos_cache, max_size=True)
                 sin_rsrc = buffer_ops.create_buffer_resource(sin_cache, max_size=True)
                 cos_row_base = fx.Int32(comp_pos_i32) * (RD // 2)
