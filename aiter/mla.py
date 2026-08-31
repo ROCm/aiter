@@ -310,8 +310,8 @@ def get_meta_param(
         #   - tg_factor (caller-supplied): the v4 nm wrapper passes
         #     ceil(num_heads/64) so gqa=128 (2 head-group WGs) is counted as 2x.
         #   - wg_per_split (auto, from main): qh128 decode on gfx1250 launches 2
-        #     head-group workgroups per (batch, split) along z (mirrors gdz =
-        #     kv_split*2 in asm_mla.cu).
+        #     head-group workgroups per (batch, split) along x (mirrors gdx = 2
+        #     for gqa=128 in asm_mla.cu, where z stays the plain kv split id).
         # Take the max so either path applies; for V3 callers (tg_factor=1) the
         # gfx1250 auto-rule still kicks in, and for v4 callers the explicit
         # tg_factor governs.
@@ -396,6 +396,20 @@ def _persistent_mla_decode_max_batch():
         )
     except (TypeError, ValueError):
         return _MLA_DECODE_PERSISTENT_MAX_BATCH_DEFAULT
+
+
+def _fold_seqlen_indptr(indptr, fold_factor):
+    """Repeat each batch's seqlen ``fold_factor`` times (head-folding pseudo-batches)."""
+    lens = indptr[1:] - indptr[:-1]
+    folded_lens = lens.repeat_interleave(fold_factor)
+    out = torch.empty(
+        indptr.shape[0] + (fold_factor - 1) * (indptr.shape[0] - 1),
+        dtype=indptr.dtype,
+        device=indptr.device,
+    )
+    out[0] = 0
+    out[1:] = torch.cumsum(folded_lens, dim=0).to(indptr.dtype)
+    return out
 
 
 def _use_persistent_mla_decode(bs, nhead, max_seqlen_q, q_dtype, kv_dtype):
@@ -813,6 +827,13 @@ def mla_decode_fwd(
                 and q.dtype == dtypes.bf16
                 and kv_buffer.dtype == dtypes.bf16
             )
+            or (
+                get_gfx() == "gfx950"
+                and nhead == 96
+                and q.dtype == dtypes.fp8
+                and kv_buffer.dtype == dtypes.fp8
+                and max_seqlen_q <= 6
+            )
         ):
             # Natively support cases
             pass
@@ -837,6 +858,14 @@ def mla_decode_fwd(
                 o_orig = o
 
             o = o.view(total_s, nhead, -1)
+
+            qo_indptr = _fold_seqlen_indptr(qo_indptr, fold_factor)
+            if g_kv_indptr is not None:
+                g_kv_indptr = _fold_seqlen_indptr(g_kv_indptr, fold_factor)
+                # Each pseudo-batch shares the original batch's local kv begin.
+                kv_indptr = torch.cat(
+                    [kv_indptr[:-1].repeat_interleave(fold_factor), kv_indptr[-1:]]
+                )
             io_transformed = True
         else:
             assert False, f"{nhead=} and {max_seqlen_q=} not supported"
