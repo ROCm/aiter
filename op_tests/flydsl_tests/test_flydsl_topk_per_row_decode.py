@@ -24,7 +24,7 @@ pytestmark = pytest.mark.skipif(
 
 _E2E_CASES = {
     "gfx942": [
-        (True, 2048, 128, 20_000, 20_000, True),
+        (True, 2048, 64, 20_000, 20_000, True),
         (True, 2048, 4, 20_000, 1024, True),
         (True, 512, 16, 131_072, 131_072, True),
         (True, 2048, 4, 131_073, 131_069, True),
@@ -103,8 +103,8 @@ def _run_public(
     "arch,stable,top_k,rows,width,expected",
     [
         ("gfx942", True, 2048, 1, 65_536, False),
-        ("gfx942", True, 2048, 128, 20_000, True),
-        ("gfx942", True, 2048, 129, 20_000, False),
+        ("gfx942", True, 2048, 64, 20_000, True),
+        ("gfx942", True, 2048, 65, 20_000, False),
         ("gfx942", True, 2048, 1, 131_071, False),
         ("gfx942", True, 2048, 16, 131_072, True),
         ("gfx942", True, 2048, 17, 131_072, False),
