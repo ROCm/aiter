@@ -316,9 +316,9 @@ def test_flydsl_topk_short_rows_are_minus_one_padded(stable: bool):
             msg=f"{name} output mismatch",
         )
         for row, valid_len in enumerate(valid_lens):
-            assert torch.all(output[row, valid_len:] == -1), (
-                f"{name} row {row} did not overwrite its padded tail"
-            )
+            assert torch.all(
+                output[row, valid_len:] == -1
+            ), f"{name} row {row} did not overwrite its padded tail"
 
 
 def test_flydsl_topk_single_row_dynamic_multi_graph():
