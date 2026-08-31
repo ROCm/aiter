@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+
 import torch
 import triton
 
 from aiter.ops.triton._triton_kernels.fusions import (
+    _mhc_asymmetric_sinkhorn_kernel,
     _mhc_fused_kernel,
     _mhc_fused_split_kernel,
+    _mhc_head_kernel,
     _mhc_post_kernel,
     _mhc_post_pre_reduce_apply_kernel,
     _mhc_post_pre_split_kernel,
@@ -23,6 +26,29 @@ DEVICE_ARCH = arch_info.get_arch()
 
 _LOGGER = AiterTritonLogger()
 
+# DSV4 forward paths below are Triton. Backward deliberately recomputes the
+# formulas with PyTorch until dedicated Triton backward kernels are available.
+MHC_DSV4_BACKWARD_FALLBACK = "pytorch_recompute"
+
+
+def _validate_dot_config(config: dict, *, name: str) -> None:
+    """Reject explicit Triton launch tiles that cannot form legal dot operands."""
+    for key in ("BLOCK_M", "BLOCK_K"):
+        if key in config:
+            value = config[key]
+            if value < 16 or value & (value - 1):
+                raise ValueError(f"{name} {key} must be a power of two >= 16")
+    if "BLOCK_N" in config:
+        value = config["BLOCK_N"]
+        if value < 16 or value & (value - 1):
+            raise ValueError(f"{name} BLOCK_N must be a power of two >= 16")
+    if "BLOCK_C" in config:
+        value = config["BLOCK_C"]
+        if value < 1 or value & (value - 1):
+            raise ValueError(f"{name} BLOCK_C must be a positive power of two")
+    if config.get("NUM_KSPLIT", 1) < 1:
+        raise ValueError(f"{name} NUM_KSPLIT must be >= 1")
+
 
 def mhc(
     x: torch.Tensor,
@@ -37,6 +63,9 @@ def mhc(
     hc_post_mult_value: float = 2.0,
     sinkhorn_iters: int = 20,
     config: dict | None = None,
+    post_res_dtype: torch.dtype | None = None,
+    alphas: torch.Tensor | None = None,
+    phi_transposed: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused mHC layer in one Triton launch (or a split-K + reduce-apply
     launch pair when ``NUM_KSPLIT > 1``).
@@ -73,7 +102,9 @@ def mhc(
 
     Args:
         x:                  (M, n*C) bf16 / fp16 input.
-        phi:                (K, N=n+n+n*n) bf16 / fp16; cols ``[pre|post|res]``.
+        phi:                (K, N=n+n+n*n), or (N, K) when
+                            ``phi_transposed=True``. FP32 checkpoint storage is
+                            cast tile-wise to ``x.dtype`` inside Triton.
         alpha_pre/post/res: per-stream scaling factors.
         bias:               (N,) fp32.
         n:                  stream / manifold dimension.
@@ -84,29 +115,42 @@ def mhc(
                             (default 20).
         config:             optional config dict; loaded from per-arch tuned
                             configs when ``None``.
+        alphas:             optional (3,) FP32 device tensor replacing the
+                            three scalar alpha arguments without host sync.
+        phi_transposed:     interpret phi as checkpoint layout (N, K).
 
     Returns ``(h_post, h_res, layer_input)``:
         h_post      : (M, n, 1)  hc_post_mult_value * sigmoid(H_post)
         h_res       : (M, n, n)  Sinkhorn output (raw logits if sk_iters == 0)
         layer_input : (M, C)     sum_i (sigmoid(H_pre[m,i]) + hc_pre_eps) * x[m,i,c]
 
+    ``post_res_dtype`` optionally overrides the storage dtype for ``h_post``
+    and ``h_res``; the legacy default remains ``x.dtype``.
+
     Reference: arXiv:2512.24880.
     """
     M, K = x.shape
     C = K // n  # Derive C from K and n
-    K_phi, total_phi_cols = phi.shape
+    if phi_transposed:
+        total_phi_cols, K_phi = phi.shape
+        stride_phi_k, stride_phi_n = phi.stride(1), phi.stride(0)
+    else:
+        K_phi, total_phi_cols = phi.shape
+        stride_phi_k, stride_phi_n = phi.stride(0), phi.stride(1)
 
     n_squared = n * n
     N_POW2 = triton.next_power_of_2(n)
     N_POW2_RES = triton.next_power_of_2(n_squared)
-    N_TOTAL_POW2 = triton.next_power_of_2(n_squared + 2 * n)
+    N_TOTAL_POW2 = max(16, triton.next_power_of_2(n_squared + 2 * n))
 
     if config is None:
         config, _ = get_mhc_config("MHC_FUSED", M, C, mode="sinkhorn")
+    else:
+        _validate_dot_config(config, name="mhc")
     config = dict(config)  # Always copy to avoid mutating LRU cache
 
     num_ksplit = config.pop("NUM_KSPLIT", 1)
-    BLOCK_M = config.pop("BLOCK_M", 64 if M >= 64 else 32)
+    BLOCK_M = max(16, config.pop("BLOCK_M", 64 if M >= 64 else 32))
     BLOCK_N = triton.next_power_of_2(config.pop("BLOCK_N", n_squared))
 
     n_blocks_res = triton.cdiv(n_squared, BLOCK_N)
@@ -115,7 +159,7 @@ def mhc(
 
     BLOCK_K = config.pop("BLOCK_K", 64)
     # Ensure BLOCK_K doesn't exceed K dimension
-    BLOCK_K = min(BLOCK_K, triton.next_power_of_2(K))
+    BLOCK_K = max(16, min(BLOCK_K, triton.next_power_of_2(K)))
     BLOCK_C = config.pop("BLOCK_C", min(64, triton.next_power_of_2(C)))
 
     # Pin h_post to pid_c == 0 and h_res (with the sinkhorn loop) to pid_c == 1
@@ -148,6 +192,11 @@ def mhc(
         x.device == phi.device == bias.device
     ), "All tensors must be on the same device"
     assert x.device.type == "cuda", "mHC kernel requires CUDA device"
+    if alphas is not None:
+        assert alphas.shape == (3,), f"alphas must have shape (3,), got {alphas.shape}"
+        assert alphas.dtype == torch.float32, "alphas must be float32"
+        assert alphas.device == x.device, "alphas must be on the input device"
+    alpha_ptr = alphas if alphas is not None else bias
     # Pre-stream programs assume one program owns all H^pre cols for its row block.
     assert (
         BLOCK_N >= n
@@ -170,7 +219,12 @@ def mhc(
     N = N_total
 
     N_out_post_res = n + n_squared
-    out = torch.empty(M, N_out_post_res, dtype=x.dtype, device=x.device)
+    out = torch.empty(
+        M,
+        N_out_post_res,
+        dtype=post_res_dtype or x.dtype,
+        device=x.device,
+    )
     layer_input = torch.empty(M, C, dtype=x.dtype, device=x.device)
 
     # Stream-aware grid for the non-split-K fused kernel: one program per stream per M-tile
@@ -204,8 +258,8 @@ def mhc(
             n_squared=n_squared,
             stride_xm=x.stride(0),
             stride_xk=x.stride(1),
-            stride_phi_k=phi.stride(0),
-            stride_phi_n=phi.stride(1),
+            stride_phi_k=stride_phi_k,
+            stride_phi_n=stride_phi_n,
             stride_acc_k=acc_partial.stride(0),
             stride_acc_m=acc_partial.stride(1),
             stride_acc_n=acc_partial.stride(2),
@@ -225,6 +279,7 @@ def mhc(
             alpha_pre,
             alpha_post,
             alpha_res,
+            alpha_ptr,
             bias,
             x,
             out,
@@ -255,6 +310,7 @@ def mhc(
             ACTUAL_KSPLIT=actual_ksplit,
             NUM_SINKHORN_ITERS=sinkhorn_iters,
             RES_PID_C=RES_PID_C,
+            ALPHAS_ARE_POINTER=alphas is not None,
             **config,
         )
     else:
@@ -265,6 +321,7 @@ def mhc(
             alpha_pre,
             alpha_post,
             alpha_res,
+            alpha_ptr,
             bias,
             out,
             layer_input,
@@ -279,8 +336,8 @@ def mhc(
             hc_post_mult_value=hc_post_mult_value,
             stride_xm=x.stride(0),
             stride_xk=x.stride(1),
-            stride_phi_k=phi.stride(0),
-            stride_phi_n=phi.stride(1),
+            stride_phi_k=stride_phi_k,
+            stride_phi_n=stride_phi_n,
             stride_out_m=out.stride(0),
             stride_out_n=out.stride(1),
             stride_li_m=layer_input.stride(0),
@@ -291,6 +348,7 @@ def mhc(
             BLOCK_C=BLOCK_C,
             N_POW2=N_POW2,
             NUM_SINKHORN_ITERS=sinkhorn_iters,
+            ALPHAS_ARE_POINTER=alphas is not None,
             **config,
         )
 
@@ -807,3 +865,359 @@ def mhc_post_pre(
     if h_post.ndim == 2:
         h_post = h_post.unsqueeze(-1)
     return h_post, h_res, layer_input_out, residual_out
+
+
+def _mhc_pre_dsv4_torch(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    eps: float,
+    pre_eps: float,
+    sinkhorn_eps: float,
+    post_multiplier: float,
+    sinkhorn_iters: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Differentiable correctness fallback used only by DSV4 backward."""
+    M, n, C = residual.shape
+    x = residual.float().reshape(M, n * C)
+    rms = torch.sqrt(torch.mean(x.square(), dim=-1, keepdim=True) + eps)
+    phi = fn.T.to(residual.dtype)
+    logits = (x / rms) @ phi.float()
+    stream_scale = torch.cat(
+        (
+            scale[0].expand(n),
+            scale[1].expand(n),
+            scale[2].expand(n * n),
+        )
+    )
+    logits = logits * stream_scale + base.float()
+    pre = torch.sigmoid(logits[:, :n]) + pre_eps
+    post = (post_multiplier * torch.sigmoid(logits[:, n : 2 * n])).unsqueeze(-1)
+    comb = logits[:, 2 * n :].reshape(M, n, n)
+    if sinkhorn_iters > 0:
+        row_max = comb.amax(dim=-1, keepdim=True)
+        comb = torch.exp(comb - row_max)
+        comb = comb / comb.sum(dim=-1, keepdim=True) + sinkhorn_eps
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + sinkhorn_eps)
+        for _ in range(sinkhorn_iters - 1):
+            comb = comb / (comb.sum(dim=-1, keepdim=True) + sinkhorn_eps)
+            comb = comb / (comb.sum(dim=-2, keepdim=True) + sinkhorn_eps)
+    layer_input = torch.einsum("mn,mnc->mc", pre, residual.float())
+    return post, comb, layer_input.to(residual.dtype)
+
+
+def _mhc_head_dsv4_torch(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    eps: float,
+    pre_eps: float,
+) -> torch.Tensor:
+    """Differentiable correctness fallback used only by DSV4 backward."""
+    M, n, C = residual.shape
+    x = residual.float().reshape(M, n * C)
+    rms = torch.sqrt(torch.mean(x.square(), dim=-1, keepdim=True) + eps)
+    phi = fn.T.to(residual.dtype)
+    logits = ((x / rms) @ phi.float()) * scale.reshape(1) + base.float()
+    mix = torch.sigmoid(logits) + pre_eps
+    out = torch.einsum("mn,mnc->mc", mix, residual.float())
+    return out.to(residual.dtype)
+
+
+def _validate_dsv4_parameters(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    *,
+    head: bool,
+) -> tuple[int, int, int]:
+    if residual.ndim != 3:
+        raise ValueError(
+            f"residual must have shape [M,n,C], got {tuple(residual.shape)}"
+        )
+    M, n, C = residual.shape
+    rows = n if head else 2 * n + n * n
+    if fn.shape != (rows, n * C):
+        raise ValueError(f"fn must have shape ({rows}, {n * C}), got {tuple(fn.shape)}")
+    scale_size = 1 if head else 3
+    if scale.shape != (scale_size,):
+        raise ValueError(
+            f"scale must have shape ({scale_size},), got {tuple(scale.shape)}"
+        )
+    if base.shape != (rows,):
+        raise ValueError(f"base must have shape ({rows},), got {tuple(base.shape)}")
+    if residual.dtype not in (torch.float16, torch.bfloat16):
+        raise TypeError("residual must be float16 or bfloat16")
+    if (
+        fn.dtype != torch.float32
+        or scale.dtype != torch.float32
+        or base.dtype != torch.float32
+    ):
+        raise TypeError("fn, scale, and base must be float32")
+    if not (residual.device == fn.device == scale.device == base.device):
+        raise ValueError("residual, fn, scale, and base must be on the same device")
+    if not residual.is_contiguous():
+        raise ValueError("residual must be contiguous for CUDA-graph-safe execution")
+    if not fn.is_contiguous():
+        raise ValueError("fn must be contiguous for CUDA-graph-safe execution")
+    if residual.device.type != "cuda":
+        raise ValueError("DSV4 MHC Triton forward requires a CUDA device")
+    if not head and n * n != triton.next_power_of_2(n * n):
+        raise ValueError("DSV4 Sinkhorn requires n*n to be a power of two")
+    return M, n, C
+
+
+def _mhc_pre_dsv4_forward(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    eps: float,
+    pre_eps: float,
+    sinkhorn_eps: float,
+    post_multiplier: float,
+    sinkhorn_iters: int,
+    config: dict | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    M, n, C = _validate_dsv4_parameters(residual, fn, scale, base, head=False)
+    x = residual.view(M, n * C)
+    post, raw_comb, layer_input = mhc(
+        x,
+        fn,
+        0.0,
+        0.0,
+        0.0,
+        base,
+        n,
+        eps=eps,
+        hc_pre_eps=pre_eps,
+        hc_post_mult_value=post_multiplier,
+        sinkhorn_iters=0,
+        config=config,
+        post_res_dtype=torch.float32,
+        alphas=scale,
+        phi_transposed=True,
+    )
+    raw_comb_flat = raw_comb.view(M, n * n)
+    comb = torch.empty((M, n, n), dtype=raw_comb.dtype, device=raw_comb.device)
+    comb_flat = comb.view(M, n * n)
+    _mhc_asymmetric_sinkhorn_kernel[(M,)](
+        raw_comb_flat,
+        comb_flat,
+        M=M,
+        stride_logits_m=raw_comb_flat.stride(0),
+        stride_logits_n=raw_comb_flat.stride(1),
+        stride_out_m=comb_flat.stride(0),
+        stride_out_n=comb_flat.stride(1),
+        n=n,
+        N_POW2_RES=triton.next_power_of_2(n * n),
+        NUM_SINKHORN_ITERS=sinkhorn_iters,
+        eps=sinkhorn_eps,
+        num_warps=1,
+    )
+    return post, comb, layer_input
+
+
+class _MHCPreDSV4(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        residual,
+        fn,
+        scale,
+        base,
+        eps,
+        pre_eps,
+        sinkhorn_eps,
+        post_multiplier,
+        sinkhorn_iters,
+        config,
+    ):
+        ctx.save_for_backward(residual, fn, scale, base)
+        ctx.params = (eps, pre_eps, sinkhorn_eps, post_multiplier, sinkhorn_iters)
+        return _mhc_pre_dsv4_forward(
+            residual,
+            fn,
+            scale,
+            base,
+            eps,
+            pre_eps,
+            sinkhorn_eps,
+            post_multiplier,
+            sinkhorn_iters,
+            config,
+        )
+
+    @staticmethod
+    def backward(ctx, grad_post, grad_comb, grad_layer):
+        residual, fn, scale, base = ctx.saved_tensors
+        inputs = tuple(
+            t.detach().requires_grad_(True) for t in (residual, fn, scale, base)
+        )
+        with torch.enable_grad():
+            outputs = _mhc_pre_dsv4_torch(*inputs, *ctx.params)
+        grad_outputs = tuple(
+            torch.zeros_like(output) if grad is None else grad
+            for output, grad in zip(outputs, (grad_post, grad_comb, grad_layer))
+        )
+        grads = torch.autograd.grad(outputs, inputs, grad_outputs)
+        return (*grads, None, None, None, None, None, None)
+
+
+def mhc_pre_dsv4(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    *,
+    rms_eps: float = 1e-6,
+    hc_pre_eps: float = 1e-6,
+    hc_sinkhorn_eps: float = 1e-6,
+    hc_post_mult_value: float = 2.0,
+    sinkhorn_repeat: int = 20,
+    config: dict | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run DSV4 MHC pre-processing with a pure-Triton production forward.
+
+    ``residual`` is ``[M,n,C]`` in fp16/bf16; ``fn`` is
+    ``[2n+n²,n*C]`` FP32; ``scale`` is ``[3]`` FP32; and ``base`` is
+    ``[2n+n²]`` FP32. Returns ``(post_mix, comb_mix, layer_input)`` with
+    shapes ``[M,n,1]``, ``[M,n,n]``, and ``[M,C]``. The mixes are FP32.
+    Backward is the documented ``pytorch_recompute`` correctness fallback.
+    """
+    if sinkhorn_repeat < 0:
+        raise ValueError("sinkhorn_repeat must be non-negative")
+    return _MHCPreDSV4.apply(
+        residual,
+        fn,
+        scale,
+        base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        int(sinkhorn_repeat),
+        config,
+    )
+
+
+class _MHCPostDSV4(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, layer_input, residual, post_mix, comb_mix, config):
+        ctx.save_for_backward(layer_input, residual, post_mix, comb_mix)
+        return mhc_post(None, layer_input, residual, post_mix, comb_mix, config)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        layer_input, residual, post_mix, comb_mix = ctx.saved_tensors
+        inputs = tuple(
+            t.detach().requires_grad_(True)
+            for t in (layer_input, residual, post_mix, comb_mix)
+        )
+        with torch.enable_grad():
+            x, res, post, comb = inputs
+            post_2d = post.squeeze(-1) if post.ndim == 3 else post
+            out = post_2d[:, :, None] * x.float()[:, None, :]
+            out = out + torch.einsum("mhc,mhj->mjc", res.float(), comb.float())
+            out = out.to(x.dtype)
+        grads = torch.autograd.grad(out, inputs, grad_out)
+        return (*grads, None)
+
+
+def mhc_post_dsv4(
+    layer_input: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    *,
+    config: dict | None = None,
+) -> torch.Tensor:
+    """Apply DSV4 post mixing with Triton forward and recomputation backward.
+
+    Shapes are ``layer_input=[M,C]``, ``residual=[M,n,C]``,
+    ``post_mix=[M,n,1]`` (or ``[M,n]``), and ``comb_mix=[M,n,n]``.
+    """
+    return _MHCPostDSV4.apply(layer_input, residual, post_mix, comb_mix, config)
+
+
+def _mhc_head_dsv4_forward(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    eps: float,
+    pre_eps: float,
+    config: dict | None,
+) -> torch.Tensor:
+    M, n, C = _validate_dsv4_parameters(residual, fn, scale, base, head=True)
+    x = residual.view(M, n * C)
+    config = {} if config is None else dict(config)
+    _validate_dot_config(config, name="mhc_head_dsv4")
+    BLOCK_M = max(16, config.pop("BLOCK_M", 16))
+    BLOCK_K = config.pop("BLOCK_K", min(64, triton.next_power_of_2(n * C)))
+    BLOCK_K = max(16, min(BLOCK_K, triton.next_power_of_2(n * C)))
+    BLOCK_C = config.pop("BLOCK_C", min(128, triton.next_power_of_2(C)))
+    out = torch.empty(M, C, dtype=residual.dtype, device=residual.device)
+    _mhc_head_kernel[(triton.cdiv(M, BLOCK_M),)](
+        x,
+        fn,
+        scale,
+        base,
+        out,
+        M=M,
+        K=n * C,
+        n=n,
+        C=C,
+        eps=eps,
+        pre_eps=pre_eps,
+        stride_xm=x.stride(0),
+        stride_xk=x.stride(1),
+        stride_fn_n=fn.stride(0),
+        stride_fn_k=fn.stride(1),
+        stride_om=out.stride(0),
+        stride_oc=out.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_K=BLOCK_K,
+        BLOCK_C=BLOCK_C,
+        N_TILE=max(16, triton.next_power_of_2(n)),
+        **config,
+    )
+    return out
+
+
+class _MHCHeadDSV4(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, residual, fn, scale, base, eps, pre_eps, config):
+        ctx.save_for_backward(residual, fn, scale, base)
+        ctx.params = (eps, pre_eps)
+        return _mhc_head_dsv4_forward(residual, fn, scale, base, eps, pre_eps, config)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        inputs = tuple(t.detach().requires_grad_(True) for t in ctx.saved_tensors)
+        with torch.enable_grad():
+            out = _mhc_head_dsv4_torch(*inputs, *ctx.params)
+        grads = torch.autograd.grad(out, inputs, grad_out)
+        return (*grads, None, None, None)
+
+
+def mhc_head_dsv4(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    *,
+    rms_eps: float = 1e-6,
+    hc_pre_eps: float = 1e-6,
+    config: dict | None = None,
+) -> torch.Tensor:
+    """Contract DSV4 residual heads using a fused pure-Triton forward.
+
+    ``residual`` is ``[M,n,C]`` fp16/bf16, ``fn`` is ``[n,n*C]`` FP32,
+    ``scale`` is ``[1]`` FP32, and ``base`` is ``[n]`` FP32. Returns
+    ``[M,C]`` in ``residual.dtype``. Backward uses PyTorch recomputation.
+    """
+    return _MHCHeadDSV4.apply(residual, fn, scale, base, rms_eps, hc_pre_eps, config)

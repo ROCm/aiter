@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Per-arch tuned tiles for kernels that carry a Python autotune search space.
-
-The GEMM and MOE families resolve a tuned entry per shape at launch time. These
-kernels need less: their search is opt-in, so all that has to be decided is the
-one config registered when it is off. Keeping that in a config file rather than
-in Python means pinning a tile for a new device is a file and not a branch.
+"""Tuned kernel entries: ``get_tuned_kernel_config()`` for kernels whose
+autotune search space lives in Python and only need one pinned tile per
+device, on top of the shared core in ``config_utils``.
 """
 
 import functools
@@ -14,14 +11,16 @@ import functools
 import triton
 
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.core import (
-    AITER_TRITON_CONFIGS_PATH,
-    USE_LRU_CACHE,
-    load_config_json,
-)
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 logger = AiterTritonLogger()
+
+from aiter.ops.triton.utils.config_utils import (
+    AITER_TRITON_CONFIGS_PATH,
+    USE_LRU_CACHE,
+    _dtype_dir,
+    load_config_json,
+)
 
 
 @functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
@@ -36,7 +35,7 @@ def _get_tuned_kernel_entry(
     arch = arch_info.get_arch()
     # Nested layout of configs/CLAUDE.md: <arch>/<backend>/<op>/<d_type>/DEFAULT.json,
     # <d_type> being the config name lowercased with dashes folded to underscores.
-    dtype_dir = config_name.lower().replace("-", "_")
+    dtype_dir = _dtype_dir(config_name)
     config_path = (
         f"{AITER_TRITON_CONFIGS_PATH}/{arch}/{backend}/{op}/{dtype_dir}/DEFAULT.json"
     )
