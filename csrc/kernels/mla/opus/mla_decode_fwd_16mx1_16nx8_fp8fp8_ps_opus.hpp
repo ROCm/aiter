@@ -57,6 +57,15 @@ __global__ void mla_decode_fwd_16mx1_16nx8_fp8fp8_opus_kernel(mla_kargs)
 #include <cstdint>
 #include <opus/opus.hpp>
 
+// Route the kernel through mla_decode_fwd_simple instead of mla_decode_fwd_pipelined: one
+// KV tile at a time through a single LDS slot, every stage drained and barriered, nothing
+// in flight across a tile boundary. It exists to measure the pipeline against a floor, so
+// it deliberately keeps everything else identical -- same layouts, same MMA shapes, same
+// smem_bytes() -- and changes only the overlap.
+#ifndef MLA_OPUS_16MX1_SIMPLE
+#define MLA_OPUS_16MX1_SIMPLE 0
+#endif
+
 using opus::operator""_I;
 
 namespace mla_decode_fwd_16mx1_16nx8_fp8fp8 {
@@ -852,7 +861,7 @@ attn_mask_kv_tile(V& v_s, int last_valid_kv_pos, int kv_base_pos, opus::u32_t ne
 // Q, the O accumulator and the online-softmax state (m_row / l_row) are owned by the
 // caller and passed by reference, so a split-KV request can run several tile ranges into
 // the same accumulator.
-template <class Traits, bool STAGGER_DEL, class VO>
+template <class Traits, bool STAGGER, class VO>
 __device__ __attribute__((always_inline)) void
 mla_decode_fwd_pipelined(mla_kargs kargs,
                          int kv_ind_ptr_s,
@@ -878,7 +887,7 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     int lane_id = thread_id_x() % T::WARP_SIZE;
     asm volatile("" : "+v"(lane_id));
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
-    const int STAGGER = warp_id / 4;
+
     int diag_kv_bound = 0;
     if constexpr(T::CAUSAL)
     {
@@ -1074,8 +1083,8 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
 
     auto stage_end = [&]() {
         __builtin_amdgcn_sched_barrier(0);
-        __builtin_amdgcn_s_barrier();
-        __builtin_amdgcn_sched_barrier(0);
+        // __builtin_amdgcn_s_barrier();
+        // __builtin_amdgcn_sched_barrier(0);
     };
 
     auto stage_end_barrier = [&]() {
@@ -1111,10 +1120,10 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
     stage_end_barrier();
 
-    if (STAGGER)
-    {
-        stage_end();
-    }
+    // if constexpr(STAGGER)
+    // {
+    //     stage_end();
+    // }
     // Page index the first phase prefetches (tile_begin + 2, the one after the two the
     // prologue has already staged). Indices past the end read as 0 through the kv_indices
     // descriptor and land in a slot nobody reads.
@@ -1127,7 +1136,7 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
 
     async_load_kv(s_kv[0].ptr, cur_page);
     s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
-    stage_end();
+    stage_end_barrier();
 
     // Scores, mask, row max: the head of tile_begin's softmax, which no phase runs since a
     // phase's stage3 only heads its own tile. m_row starts at -inf and O and l at zero, so
@@ -1153,10 +1162,10 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
         // worth filling. m_row already covers tile t-1: its head ran in the last stage3.
         __builtin_amdgcn_s_setprio(1);
         vs_cur = mma0(v_q, v_k, 0, 0);
-        if (!STAGGER)
-        {
-            stage_end();
-        }
+        // if constexpr(!STAGGER)
+        // {
+        //     stage_end();
+        // }
         softmax_tile(vs_prev);
         auto p_prev = cast<D_K>(vs_prev);
         store<T::VEC_WRITE_P>(s_p, p_prev, u_sp);
@@ -1166,13 +1175,13 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
         stage_end_barrier();
 
         // stage2 [mem]: V(t-1); mask S(t) before stage4's softmax head folds it in.
-        if (STAGGER)
+        if constexpr(STAGGER)
         {
             stage_end();
         }
         load_p(v_p);
         s_waitcnt_lgkmcnt(0_I);
-        stage_end_barrier();
+        stage_end();
 
         // stage3 [compute]: gemm1 PV(t-1) [4 MFMA] || softmax-head(t) -- the row max of the
         // scores stage2 has just masked, and the rebase of O and l that follows from it.
@@ -1223,14 +1232,14 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     // Only this part is under the parity branch; keeping the V read and the PV outside it
     // is what keeps v_o off scratch.
     auto epilogue_tail = [&](auto& vs_last, int last_slot) {
-        if (!STAGGER)
-        {
-            stage_end();
-        }
+        // if constexpr(!STAGGER)
+        // {
+        //     stage_end();
+        // }
         softmax_tile(vs_last);
         store<T::VEC_WRITE_P>(s_p, cast<D_K>(vs_last), u_sp);
         s_waitcnt_lgkmcnt(0_I);
-        stage_end_barrier();
+        stage_end();
         load_p(v_p);
         s_waitcnt_lgkmcnt(0_I);
 
