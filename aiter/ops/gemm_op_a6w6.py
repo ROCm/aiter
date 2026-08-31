@@ -581,6 +581,11 @@ def _load_gemm_a6w6_configs(
         return {}
 
     configs = configs.copy()
+    separator_columns = [
+        column for column in configs.columns if str(column).startswith("Unnamed:")
+    ]
+    if separator_columns:
+        configs = configs.drop(columns=separator_columns)
     for column in _TUNED_CONFIG_NUMERIC_COLUMNS:
         configs[column] = pd.to_numeric(configs[column], errors="raise").astype(int)
     if "logicalShape" in configs:

@@ -1,16 +1,16 @@
-tile_M,tile_N,block_size,splitK,bpreshuffle,pack_layout,swizzle_max_M,swizzle_max_N,swizzle_max_K,knl_name,co_name
-256,256,256,0,0,mxfp6_c0c1_256_padk2,0,0,0,aiter_a6w6_m256n256_tile_stage,a6w6_m256n256_tile_stage.co
-256,256,256,0,0,mxfp6_c0c1_256_padk2,131072,16384,6144,aiter_a6w6_m256n256_row_stage_gm32_k6k,a6w6_m256n256_row_stage_gm32_k6k.co
-256,256,256,0,0,mxfp6_c0c1_256_padk2,262144,16384,6144,aiter_a6w6_m256n256_row_stage_gm64_k6k,a6w6_m256n256_row_stage_gm64_k6k.co
-256,256,256,0,0,mxfp6_c0c1_256_padk2,131072,16384,16384,aiter_a6w6_m256n256_row_stage_gm32_k16k,a6w6_m256n256_row_stage_gm32_k16k.co
-256,256,256,0,0,mxfp6_c0c1_256_padk2,0,0,0,aiter_a6w6_m256n256_persistent,a6w6_m256n256_persistent.co
-256,256,256,0,0,mxfp6_c0c1_256_padk2,0,0,0,aiter_a6w6_m256n256_persistent_prefetch10,a6w6_m256n256_persistent_prefetch10.co
-256,512,256,0,0,mxfp6_c0c1_256_padk2,0,0,0,aiter_a6w6_m256n512_persistent,a6w6_m256n512_persistent.co
-256,512,256,0,0,mxfp6_c0c1_256_padk2,0,0,0,aiter_a6w6_m256n512_persistent_row_stage,a6w6_m256n512_persistent_row_stage.co
-128,256,128,0,0,mxfp6_c0c1_256_padk2,0,0,0,aiter_a6w6_m128n256_stream,a6w6_m128n256_stream.co
-64,128,128,0,0,mxfp6_c0c1_256_padk2,0,0,0,aiter_a6w6_m64n128_tile_stage,a6w6_m64n128_tile_stage.co
-64,128,128,0,0,mxfp6_c0c1_256_padk2,0,0,0,aiter_a6w6_m64n128_full_stage,a6w6_m64n128_full_stage.co
-128,128,256,0,0,mxfp6_c0c1_256_padk2,0,0,0,aiter_a6w6_m128n128_full_stage,a6w6_m128n128_full_stage.co
-128,128,256,0,0,mxfp6_c0c1_256_padk2,0,0,0,aiter_a6w6_m128n128_tile_stage,a6w6_m128n128_tile_stage.co
-128,256,256,0,0,mxfp6_c0c1_256_padk2,0,0,0,aiter_a6w6_m128n256_full_stage,a6w6_m128n256_full_stage.co
-256,256,256,0,0,mxfp6_c0c1_256_padk2,131072,16384,16384,aiter_a6w6_m256n256_row_stage_gm4_k16k,a6w6_m256n256_row_stage_gm4_k16k.co
+id, kernel                                   , object                                , tile_M, tile_N, block_size, splitK, bpreshuffle, pack_layout         , swizzle_max_M, swizzle_max_N, swizzle_max_K
+ 0, aiter_a6w6_m256n256_tile_stage           , a6w6_m256n256_tile_stage.co           ,    256,    256,        256,      0,           0, mxfp6_c0c1_256_padk2,             0,             0,             0
+ 1, aiter_a6w6_m256n256_row_stage_gm32_k6k   , a6w6_m256n256_row_stage_gm32_k6k.co   ,    256,    256,        256,      0,           0, mxfp6_c0c1_256_padk2,        131072,         16384,          6144
+ 2, aiter_a6w6_m256n256_row_stage_gm64_k6k   , a6w6_m256n256_row_stage_gm64_k6k.co   ,    256,    256,        256,      0,           0, mxfp6_c0c1_256_padk2,        262144,         16384,          6144
+ 3, aiter_a6w6_m256n256_row_stage_gm32_k16k  , a6w6_m256n256_row_stage_gm32_k16k.co  ,    256,    256,        256,      0,           0, mxfp6_c0c1_256_padk2,        131072,         16384,         16384
+ 4, aiter_a6w6_m256n256_persistent           , a6w6_m256n256_persistent.co           ,    256,    256,        256,      0,           0, mxfp6_c0c1_256_padk2,             0,             0,             0
+ 5, aiter_a6w6_m256n256_persistent_prefetch10, a6w6_m256n256_persistent_prefetch10.co,    256,    256,        256,      0,           0, mxfp6_c0c1_256_padk2,             0,             0,             0
+ 6, aiter_a6w6_m256n512_persistent           , a6w6_m256n512_persistent.co           ,    256,    512,        256,      0,           0, mxfp6_c0c1_256_padk2,             0,             0,             0
+ 7, aiter_a6w6_m256n512_persistent_row_stage , a6w6_m256n512_persistent_row_stage.co ,    256,    512,        256,      0,           0, mxfp6_c0c1_256_padk2,             0,             0,             0
+ 8, aiter_a6w6_m128n256_stream               , a6w6_m128n256_stream.co               ,    128,    256,        128,      0,           0, mxfp6_c0c1_256_padk2,             0,             0,             0
+ 9, aiter_a6w6_m64n128_tile_stage            , a6w6_m64n128_tile_stage.co            ,     64,    128,        128,      0,           0, mxfp6_c0c1_256_padk2,             0,             0,             0
+10, aiter_a6w6_m64n128_full_stage            , a6w6_m64n128_full_stage.co            ,     64,    128,        128,      0,           0, mxfp6_c0c1_256_padk2,             0,             0,             0
+11, aiter_a6w6_m128n128_full_stage           , a6w6_m128n128_full_stage.co           ,    128,    128,        256,      0,           0, mxfp6_c0c1_256_padk2,             0,             0,             0
+12, aiter_a6w6_m128n128_tile_stage           , a6w6_m128n128_tile_stage.co           ,    128,    128,        256,      0,           0, mxfp6_c0c1_256_padk2,             0,             0,             0
+13, aiter_a6w6_m128n256_full_stage           , a6w6_m128n256_full_stage.co           ,    128,    256,        256,      0,           0, mxfp6_c0c1_256_padk2,             0,             0,             0
+14, aiter_a6w6_m256n256_row_stage_gm4_k16k   , a6w6_m256n256_row_stage_gm4_k16k.co   ,    256,    256,        256,      0,           0, mxfp6_c0c1_256_padk2,        131072,         16384,         16384

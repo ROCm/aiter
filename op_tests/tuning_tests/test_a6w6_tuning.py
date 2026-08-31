@@ -206,6 +206,34 @@ class TestA6W6TuningLookup(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "splitM64 must be 0 or 1"):
             gemm_op_a6w6._load_gemm_a6w6_configs(self.config)
 
+    @mock.patch.object(gemm_op_a6w6, "get_cu_num", return_value=256)
+    @mock.patch.object(gemm_op_a6w6, "get_gfx", return_value="gfx950")
+    def test_blank_separator_column_is_ignored(self, _gfx, _cu):
+        self._write_rows(
+            [
+                [
+                    "gfx950",
+                    256,
+                    256,
+                    256,
+                    128,
+                    1,
+                    0,
+                    "",
+                    1,
+                    "kernel",
+                    1,
+                    1,
+                    0,
+                ]
+            ],
+            extra_header=[""],
+        )
+
+        config = gemm_op_a6w6.get_GEMM_A6W6_config(256, 256, 128, self.config)
+
+        self.assertFalse(any(str(column).startswith("Unnamed:") for column in config))
+
     def test_explicit_override_and_default(self):
         self.assertEqual(
             gemm_op_a6w6._select_gemm_a6w6_kernel(1, 1, 1, "explicit_kernel"),
@@ -347,7 +375,8 @@ class TestA6W6ApiValidation(unittest.TestCase):
 
 class TestA6W6Manifest(unittest.TestCase):
     def test_manifest_candidates_are_compatible_and_present(self):
-        configs = pd.read_csv(MANIFEST)
+        configs = pd.read_csv(MANIFEST, skipinitialspace=True)
+        configs.columns = configs.columns.str.strip()
         expected_kernels = {
             "aiter_a6w6_m256n256_tile_stage",
             "aiter_a6w6_m256n256_row_stage_gm32_k6k",
@@ -365,8 +394,12 @@ class TestA6W6Manifest(unittest.TestCase):
             "aiter_a6w6_m128n256_full_stage",
             "aiter_a6w6_m256n256_row_stage_gm4_k16k",
         }
-        self.assertEqual(set(configs["knl_name"]), expected_kernels)
-        self.assertFalse(configs["knl_name"].duplicated().any())
+        self.assertEqual(set(configs["kernel"].str.strip()), expected_kernels)
+        self.assertFalse(configs["kernel"].duplicated().any())
+        self.assertFalse(configs["id"].duplicated().any())
+        self.assertEqual(
+            configs["id"].tolist(), list(range(len(configs)))
+        )
         self.assertTrue((configs["splitK"] == 0).all())
         layouts = set(
             configs[["tile_M", "tile_N", "block_size"]]
@@ -390,7 +423,7 @@ class TestA6W6Manifest(unittest.TestCase):
             )
         )
         default = configs[
-            configs["knl_name"] == gemm_op_a6w6._DEFAULT_KERNEL_NAME
+            configs["kernel"].str.strip() == gemm_op_a6w6._DEFAULT_KERNEL_NAME
         ].iloc[0]
         self.assertEqual(
             (
@@ -401,16 +434,19 @@ class TestA6W6Manifest(unittest.TestCase):
             (0, 0, 0),
         )
         manifest_dir = os.path.dirname(MANIFEST)
-        for co_name in configs["co_name"]:
+        for co_name in configs["object"].str.strip():
             self.assertTrue(os.path.exists(os.path.join(manifest_dir, co_name)))
 
     def test_tuned_kernel_ids_match_manifest_rows(self):
-        manifest = pd.read_csv(MANIFEST)
+        manifest = pd.read_csv(MANIFEST, skipinitialspace=True)
+        manifest.columns = manifest.columns.str.strip()
         tuned = pd.read_csv(TUNED_CONFIG)
         kernel_ids = {
-            kernel_name: kernel_id
-            for kernel_id, kernel_name in enumerate(manifest["knl_name"])
+            row.kernel.strip(): row.id for row in manifest.itertuples(index=False)
         }
+        self.assertEqual(
+            set(manifest["id"]), set(range(len(manifest)))
+        )
         for row in tuned.itertuples(index=False):
             self.assertEqual(row.kernelId, kernel_ids[row.kernelName])
 
