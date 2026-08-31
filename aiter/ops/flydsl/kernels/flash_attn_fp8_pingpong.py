@@ -124,7 +124,7 @@ def build_flash_attn_fp8_module(
     MFMA_PRIO = 1
     SOFTMAX_PRIO = 0
 
-    L_SPLIT_TILES = 2
+    L_SPLIT_TILES = 0
     L_MFMA_SLABS = PV_K_STEPS - L_SPLIT_TILES // 2
     # Width of the carried l_valu.  The per-iteration add count is fixed at
     # (L_SPLIT_TILES * C_F32_PER_LANE) / 2 = 16 v_pk_add_f32 no matter how the
@@ -920,55 +920,42 @@ def build_flash_attn_fp8_module(
             )
             return _fmax(m_running, _fmax(local_max, peer_max))
 
-        def _bias_seed(m):
-            return Vec.from_elements(
-                [_fadd(_fsub(c_zero_f, m), c_exp2_bias)], fx.Float32
-            ).broadcast_to(C_F32_PER_LANE)
-
-        # ---- MFMA bias prefill (asm: _qk_bias_split + _qk_bias_prefill) ----
+        # ---- VALU seed broadcast (replaces the MFMA bias prefill) ----
         #
-        # Broadcasting the seed into a 16-wide MFMA accumulator costs 16
-        # v_mov_b32 inside the MFMA phase. Instead split the seed into three
-        # bf16 chunks on the VALU during softmax and let one
-        # mfma_f32_32x32x8_bf16 splat it across the accumulator: A is a column
-        # of ones so every row gets chunk0+chunk1+chunk2, which reconstructs
-        # the f32 seed to ~24 bits.
-        def _f32_of_bf16_hi(x_i32):
-            """f32 value of the bf16 in the low half of x_i32."""
-            return arith.bitcast(
-                T.f32, arith.shli(_raw(x_i32), _raw(fx.Int32(16)))
-            )
-
-        def _bias_split(m_term):
-            """Three-chunk bf16 decomposition of the Schraudolph seed."""
-            c0 = rocdl.cvt_pk_bf16_f32(_raw(m_term), _raw(m_term))
-            r1 = _fsub(m_term, _f32_of_bf16_hi(c0))
-            c1 = rocdl.cvt_pk_bf16_f32(_raw(r1), _raw(r1))
-            r2 = _fsub(r1, _f32_of_bf16_hi(c1))
-            return (
-                rocdl.cvt_pk_bf16_f32(_raw(m_term), _raw(r1)),
-                rocdl.cvt_pk_bf16_f32(_raw(r2), _raw(c_zero_f)),
-            )
-
-        # A operand: bf16 [1, 1, 1, 0] on the k=0..3 half, zero on k=4..7 so
-        # only the three chunks contribute.
-        _hi0 = hi == fx.Index(0)
-        _bias_ones = Vec(
-            Vec.from_elements(
-                [
-                    ArithValue(_hi0).select(fx.Int32(_i32c(0x3F803F80)), fx.Int32(0)),
-                    ArithValue(_hi0).select(fx.Int32(0x00003F80), fx.Int32(0)),
-                ],
-                fx.Int32,
-            )
-        ).bitcast(fx.Int16)
-
-        def _bias_prefill(chunks):
-            b = Vec(Vec.from_elements(list(chunks), fx.Int32)).bitcast(fx.Int16)
-            return rocdl.mfma_f32_32x32x8bf16_1k(
-                mfma.accum_type,
-                [_raw(_bias_ones), _raw(b), _raw(mfma.zero_value), 0, 0, 0],
-            )
+        # do_qk gets the Schraudolph bias for free by taking the seed as the
+        # QK MFMA's C operand, so the seed has to arrive as a full 16-wide
+        # accumulator.  It used to be splatted there by one
+        # mfma_f32_32x32x8_bf16 (A = a column of ones, B = a three-chunk bf16
+        # decomposition of the seed, reconstructing it to ~24 bits) issued
+        # inside the MFMA phase -- 32 cy of a pipe that is 99.6% saturated.
+        #
+        # Building it on the VALU instead takes it off that pipe entirely, and
+        # because the seed only depends on m_frozen -- which is *frozen*, and
+        # moves only when the watchdog rolls back -- the broadcast hoists out
+        # of the hot loop altogether: the accumulator is simply loop-carried
+        # and re-derived only inside the rollback branch.  Net per iteration:
+        # one bf16 MFMA removed, nothing added.  Cost is 16 carried VGPRs
+        # instead of the 2 bf16 chunks, and the seed is now exact f32.
+        #
+        # The splat goes through i64 on purpose: vector.from_elements over 16
+        # f32 subregs expands to 16 v_mov_b32, whereas 8 64-bit COPYs expand
+        # to v_mov_b64_e32 on gfx950.  The inline asm pins that width so LLVM
+        # cannot scalarise it back.
+        def _bias_seed(m_term):
+            pair = Vec.from_elements([m_term, m_term], fx.Float32).bitcast(
+                fx.Int64
+            )[0]
+            movs = [
+                llvm.InlineAsmOp(
+                    T.i64,
+                    [_raw(pair)],
+                    f"v_mov_b64_e32 $0, $1 ; seed{i}",
+                    "=v,v",
+                    has_side_effects=False,
+                ).res
+                for i in range_constexpr(C_F32_PER_LANE // 2)
+            ]
+            return Vec(Vec.from_elements(movs, fx.Int64)).bitcast(fx.Float32)
 
         def do_softmax_prepare(
             s_accs,
@@ -976,7 +963,6 @@ def build_flash_attn_fp8_module(
         ):
             m_frozen = _rowmax(s_accs, m_init)
             m_term = _fadd(_fsub(c_zero_f, m_frozen), c_exp2_bias)
-            bias_chunks = _bias_split(m_term)
 
             mt_vec = Vec.from_elements([m_term], fx.Float32).broadcast_to(
                 C_F32_PER_LANE
@@ -984,7 +970,7 @@ def build_flash_attn_fp8_module(
             for nt in range_constexpr(N_KV_TILES):
                 s_accs[nt] = _fadd(Vec(s_accs[nt]), mt_vec)
 
-            return m_frozen, bias_chunks, s_accs
+            return m_frozen, s_accs
 
         # ---- overflow watchdog + rollback (see tmp/watchdog_rollback_report.md)
         #
@@ -1009,7 +995,7 @@ def build_flash_attn_fp8_module(
         # headroom is restored, so the repair is self-healing and cannot
         # thrash.
         def _rollback(
-            s_accs, o_accs, l_mfma, l_valu, m_frozen, bias_chunks, m_local, fired
+            s_accs, o_accs, l_mfma, l_valu, m_frozen, m_local, fired
         ):
             vt = Vec.make_type(C_F32_PER_LANE, fx.Float32)
             lvt = Vec.make_type(C16_F32_PER_LANE, fx.Float32)
@@ -1019,8 +1005,11 @@ def build_flash_attn_fp8_module(
                 results_=[vt] * N_KV_TILES
                 + [vt] * D_TILES
                 + [lvt] * L_MFMA_SLABS
-                # l_valu is a vector now (see L_VALU_WIDTH); m_frozen stays scalar.
-                + [lvvt, T.f32, T.i32, T.i32],
+                # l_valu is a vector now (see L_VALU_WIDTH); m_frozen stays
+                # scalar.  The seed is *not* carried: it is a pure function of
+                # m_frozen, so it is rebuilt below rather than kept live across
+                # the back-edge (which cost 8 v_mov_b64 in the MFMA phase).
+                + [lvvt, T.f32],
                 has_else=True,
             )
             with ir.InsertionPoint(if_op.then_block):
@@ -1070,15 +1059,11 @@ def build_flash_attn_fp8_module(
                     Vec.from_elements([f], fx.Float32).broadcast_to(L_VALU_WIDTH),
                 )
                 _m = _fadd(m_frozen, d)
-                # Re-derive the seed: b = C - m.  Later tiles are prefilled
-                # with the new b, so they agree with the rescaled past.
-                _bc = _bias_split(_fsub(c_exp2_bias, _m))
                 scf.YieldOp(
                     [_raw(v) for v in _s]
                     + [_raw(v) for v in _o]
                     + [_raw(v) for v in _lm]
                     + [_raw(_lv), _raw(_m)]
-                    + [_raw(bc) for bc in _bc]
                 )
             with ir.InsertionPoint(if_op.else_block):
                 scf.YieldOp(
@@ -1086,7 +1071,6 @@ def build_flash_attn_fp8_module(
                     + [_raw(v) for v in o_accs]
                     + [_raw(v) for v in l_mfma]
                     + [_raw(l_valu), _raw(m_frozen)]
-                    + [_raw(bc) for bc in bias_chunks]
                 )
             r = if_op.results
             n = N_KV_TILES
@@ -1108,17 +1092,12 @@ def build_flash_attn_fp8_module(
                 lm_out,
                 as_dsl_value(r[k], l_valu),
                 as_dsl_value(r[k + 1], m_frozen),
-                tuple(
-                    as_dsl_value(r[k + 2 + i], bias_chunks[i])
-                    for i in range_constexpr(N_BIAS_CHUNKS)
-                ),
             )
 
         def do_softmax(
             s_accs,
             m_frozen,
             l_valu,
-            bias_chunks=None,
             seeded=False,
             o_accs=None,
             l_mfma=None,
@@ -1129,7 +1108,6 @@ def build_flash_attn_fp8_module(
                 mt_vec = Vec.from_elements([m_term], fx.Float32).broadcast_to(
                     C_F32_PER_LANE
                 )
-                bias_chunks = _bias_split(m_term)
             else:
                 # Watchdog: in-lane max of this lane's patterns, then one
                 # ballot.  Cheap enough to sit on the critical path; the
@@ -1146,14 +1124,12 @@ def build_flash_attn_fp8_module(
                     l_mfma,
                     l_valu,
                     m_frozen,
-                    bias_chunks,
                 ) = _rollback(
                     s_accs,
                     o_accs,
                     l_mfma,
                     l_valu,
                     m_frozen,
-                    bias_chunks,
                     m_local,
                     fired,
                 )
@@ -1224,9 +1200,17 @@ def build_flash_attn_fp8_module(
             # shuffle_xor here -- both run once in the epilogue.
             for vp in v_pairs:
                 l_valu = _fadd_vec_vop2(l_valu, vp, L_VALU_WIDTH)
+            # Build the QK seed here, at the tail of the softmax phase, so the
+            # broadcast lands on the VALU rather than in the MFMA phase.  It is
+            # deliberately *not* loop-carried: as a carry it stays live across
+            # the back-edge, the last QK tile cannot then accumulate into it in
+            # place, and the allocator reinserts the copy as 8 v_mov_b64 inside
+            # the MFMA phase -- exactly the 32 cy the bf16 prefill cost.
+            # Rebuilding from the carried m_frozen keeps the live range short.
+            # seed = _bias_seed(_fsub(c_exp2_bias, m_frozen))
             # o_accs / l_mfma come back because the rollback may have rescaled
             # them; on the non-seeded path they are whatever was passed in.
-            return m_frozen, bias_chunks, p_pack, l_valu, o_accs, l_mfma
+            return m_frozen, p_pack, l_valu, o_accs, l_mfma
 
         # Ones column for the L reduction.  0x38 is fp8 e4m3 1.0, so
         # 0x38383838 is four of them.  The 16x16x128 atom folds lanes
@@ -1256,7 +1240,6 @@ def build_flash_attn_fp8_module(
             Vec.filled(C_F32_PER_LANE, 0.0, fx.Float32)
             for _ in range_constexpr(D_TILES)
         ]
-        N_BIAS_CHUNKS = 2
 
         is_g0 = wave_id < fx.Index(NUM_WAVES // 2)
 
@@ -1322,7 +1305,7 @@ def build_flash_attn_fp8_module(
                     _v_addr(v_buff_off),
                     dma=(k_rsrc, l_koffs, g_koffs),
                 )
-                m_frozen, bias_chunks, p_pack, l_valu, _, _ = do_softmax(
+                m_frozen, p_pack, l_valu, _, _ = do_softmax(
                     s_accs, m_init, l_valu_init
                 )
 
@@ -1336,7 +1319,6 @@ def build_flash_attn_fp8_module(
                     o_init[2],
                     o_init[3],
                     p_pack,
-                    *bias_chunks,
                     # Finished per-lane LDS addresses, rotated in lockstep with
                     # the raw slot offsets below.  The reads use these; only the
                     # DMA (wave-uniform SALU) still wants the raw offsets.
@@ -1358,7 +1340,7 @@ def build_flash_attn_fp8_module(
                 m_frozen, l_valu = carry[:2]
                 l_mfma = list(carry[2 : 2 + L_MFMA_SLABS])
                 o0, o1, o2, o3, p_pack = carry[2 + L_MFMA_SLABS : G0_HEAD]
-                _rest = carry[G0_HEAD + N_BIAS_CHUNKS :]
+                _rest = carry[G0_HEAD:]
                 v_addr = _rest[0]
                 k_base = _rest[3]
                 v_preloaded = _rest[10 + DMA_PASSES :]
@@ -1391,8 +1373,13 @@ def build_flash_attn_fp8_module(
                 m_frozen, l_valu = _g0_args[:2]
                 l_mfma = list(_g0_args[2 : 2 + L_MFMA_SLABS])
                 o0, o1, o2, o3, p_pack = _g0_args[2 + L_MFMA_SLABS : G0_HEAD]
-                bias_chunks = _g0_args[G0_HEAD : G0_HEAD + N_BIAS_CHUNKS]
-                _rest = _g0_args[G0_HEAD + N_BIAS_CHUNKS :]
+                # Rebuilt, not carried: see the note at the tail of do_softmax.
+                # g0 consumes the seed at the head of its body, before its own
+                # softmax runs, so it is derived here from the carried
+                # m_frozen -- which the previous iteration's rollback already
+                # updated, so this agrees with the rescaled past.
+                seed = _bias_seed(_fsub(c_exp2_bias, m_frozen))
+                _rest = _g0_args[G0_HEAD:]
                 v_addr, v_next_addr, v_further_addr = _rest[0:3]
                 k_base, k_next_base = _rest[3:5]
                 v_buff_off, v_next_off, v_further_off = _rest[5:8]
@@ -1417,7 +1404,6 @@ def build_flash_attn_fp8_module(
                     k_base,
                 )
                 _wait_vmcnt(0)
-                seed = _bias_prefill(bias_chunks)
                 s_accs, v_preloaded = do_qk(
                     k_base,
                     k_preloaded,
@@ -1432,11 +1418,10 @@ def build_flash_attn_fp8_module(
                 # apply_pv has already folded tile i-1 into o / l_mfma, and
                 # tile i's P is not built yet, so this is the one point where
                 # the rollback can rescale the whole past in one shot.
-                m_frozen, bias_chunks, p_pack, l_valu, o, l_mfma = do_softmax(
+                m_frozen, p_pack, l_valu, o, l_mfma = do_softmax(
                     s_accs,
                     m_frozen,
                     l_valu,
-                    bias_chunks,
                     seeded=True,
                     o_accs=o,
                     l_mfma=l_mfma,
@@ -1456,7 +1441,6 @@ def build_flash_attn_fp8_module(
                         _raw(o[2]),
                         _raw(o[3]),
                         _raw(p_pack),
-                        *[_raw(bc) for bc in bias_chunks],
                         # Rotate the V triple and swap the K pair -- addresses
                         # and raw offsets move together.
                         _raw(v_next_addr),
@@ -1500,7 +1484,7 @@ def build_flash_attn_fp8_module(
                     _v_addr(v_buff_off),
                     dma=(v_rsrc, l_voffs, g_voffs),
                 )
-                m_frozen, bias_chunks, s_accs = do_softmax_prepare(s_accs, m_init)
+                m_frozen, s_accs = do_softmax_prepare(s_accs, m_init)
                 _sched_barrier()
                 _gpu_barrier()
                 # Seed for the first loop body (iv == BLOCK_N), which loads the
@@ -1518,7 +1502,6 @@ def build_flash_attn_fp8_module(
                     s_accs[1],
                     s_accs[2],
                     s_accs[3],
-                    *bias_chunks,
                     # Offsets for the first loop body (i=1); see g0_iter0.
                     _v_addr(_v_slot(0)),
                     _v_addr(_v_slot(1)),
@@ -1539,16 +1522,14 @@ def build_flash_attn_fp8_module(
                 l_mfma = list(carry[2 : 2 + L_MFMA_SLABS])
                 o0, o1, o2, o3 = carry[2 + L_MFMA_SLABS : G1_HEAD]
                 s0, s1, s2, s3 = carry[G1_HEAD : G1_HEAD + 4]
-                _rest = carry[G1_SACC + N_BIAS_CHUNKS :]
+                _rest = carry[G1_SACC:]
                 v_addr = _rest[0]
                 k_base = _rest[3]
                 v_preloaded = _rest[10 + DMA_PASSES :]
-                bias_chunks = carry[G1_SACC : G1_SACC + N_BIAS_CHUNKS]
-                m_frozen, _, p_pack, l_valu, o_r, l_mfma = do_softmax(
+                m_frozen, p_pack, l_valu, o_r, l_mfma = do_softmax(
                     [s0, s1, s2, s3],
                     m_frozen,
                     l_valu,
-                    bias_chunks,
                     seeded=True,
                     o_accs=[o0, o1, o2, o3],
                     l_mfma=l_mfma,
@@ -1581,8 +1562,7 @@ def build_flash_attn_fp8_module(
                 l_mfma = list(_g1_args[2 : 2 + L_MFMA_SLABS])
                 o0, o1, o2, o3 = _g1_args[2 + L_MFMA_SLABS : G1_HEAD]
                 s0, s1, s2, s3 = _g1_args[G1_HEAD : G1_HEAD + 4]
-                bias_chunks = _g1_args[G1_SACC : G1_SACC + N_BIAS_CHUNKS]
-                _rest = _g1_args[G1_SACC + N_BIAS_CHUNKS :]
+                _rest = _g1_args[G1_SACC:]
                 v_addr, v_next_addr, v_further_addr = _rest[0:3]
                 k_base, k_next_base = _rest[3:5]
                 v_buff_off, v_next_off, v_further_off = _rest[5:8]
@@ -1594,7 +1574,6 @@ def build_flash_attn_fp8_module(
                 # being softmaxed here -- so the rescale is well-defined.
                 (
                     m_frozen,
-                    bias_chunks,
                     p_pack,
                     l_valu,
                     (o0, o1, o2, o3),
@@ -1603,13 +1582,13 @@ def build_flash_attn_fp8_module(
                     [s0, s1, s2, s3],
                     m_frozen,
                     l_valu,
-                    bias_chunks,
                     seeded=True,
                     o_accs=[o0, o1, o2, o3],
                     l_mfma=l_mfma,
                 )
                 # The V DMA's address math belongs to this (VALU) phase; the
                 # buffer_loads themselves are interleaved into do_qk below.
+                seed = _bias_seed(_fsub(c_exp2_bias, m_frozen))
                 l_voffs = get_lds_voffs(v_buff_off)
                 _sched_barrier()
                 _gpu_barrier()
@@ -1624,7 +1603,6 @@ def build_flash_attn_fp8_module(
                     k_base,
                 )
                 _wait_vmcnt(0)
-                seed = _bias_prefill(bias_chunks)
                 s_accs, v_preloaded = do_qk(
                     k_base,
                     k_preloaded,
@@ -1649,7 +1627,6 @@ def build_flash_attn_fp8_module(
                         _raw(s_accs[1]),
                         _raw(s_accs[2]),
                         _raw(s_accs[3]),
-                        *[_raw(bc) for bc in bias_chunks],
                         # Rotate the V triple and swap the K pair -- addresses
                         # and raw offsets move together.
                         _raw(v_next_addr),
