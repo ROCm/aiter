@@ -492,9 +492,7 @@ def _flydsl_topk_decode_shape_supported(
         min_width <= width
         and (max_width is None or width <= max_width)
         and 0 < num_rows <= max_rows
-        for min_width, max_width, max_rows in _FLYDSL_TOPK_DECODE_GATES[arch][
-            stable
-        ]
+        for min_width, max_width, max_rows in _FLYDSL_TOPK_DECODE_GATES[arch][stable]
     )
 
 
@@ -512,10 +510,7 @@ def _should_use_flydsl_topk_decode(
         return False
 
     arch = get_gfx()
-    if (
-        arch not in _FLYDSL_TOPK_DECODE_GATES
-        or not _flydsl_topk_decode_available()
-    ):
+    if arch not in _FLYDSL_TOPK_DECODE_GATES or not _flydsl_topk_decode_available():
         return False
 
     return _flydsl_topk_decode_shape_supported(
