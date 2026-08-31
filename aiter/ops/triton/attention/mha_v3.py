@@ -51,6 +51,8 @@ class _FlashAttnV3Func(torch.autograd.Function):
         if sm_margin != 0:
             raise NotImplementedError("sm_margin != 0 not supported in AMD Triton v3")
 
+        # The 16-bit Gluon dispatch lives in mha.py::flash_attn_func, alongside the
+        # 16-bit public entry point; this path is always flash_attn_3.
         out, softmax_lse, _, _ = flash_attn_3.fwd(
             q,
             k,

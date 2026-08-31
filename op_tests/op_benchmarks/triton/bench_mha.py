@@ -258,7 +258,7 @@ _MAKE_FN_FP8 = {
 }
 
 
-def get_make_fn(function: str, dtype: str) -> Callable:
+def get_make_fn(function: str, dtype: str, impl: str = "default") -> Callable:
     if dtype == "fp8":
         return _MAKE_FN_FP8[function]
     return _MAKE_FN[function]
@@ -606,7 +606,7 @@ def run_benchmark(run: BenchRun):
             warnings.warn("Skipping: PE or sink not supported with fused bwd / fp8.")
             return 0
         mha_set_use_fused_bwd_kernel(fused)
-        make_fn = get_make_fn(function, dtype)
+        make_fn = get_make_fn(function, dtype, impl)
 
         # Default softmax scale to match standard attention
         if sm_scale is None:

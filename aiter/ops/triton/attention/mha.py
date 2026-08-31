@@ -18,6 +18,11 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
+from aiter.ops.triton._gluon_kernels.gfx950.attention import mha_fwd as _gluon_fwd
+
+if not _gluon_fwd.is_available():
+    _gluon_fwd = None
+
 _USE_FUSED_BWD_KERNEL = False
 
 
@@ -77,6 +82,46 @@ def mha_set_swizzle(value: Literal["default", "spatial"]):
 
 def _get_sliding_window_size(window_size: tuple[int, int]) -> int:
     return max(int(window_size[0]), 0)
+
+
+def _use_gluon_fwd(
+    q,
+    k,
+    v,
+    causal,
+    *,
+    dropout_p=0.0,
+    window_size=(-1, -1),
+    bias=None,
+    alibi_slopes=None,
+    sink=None,
+    config=None,
+) -> bool:
+    """Should this dense forward go through the Gluon kernel?
+
+    Each feature the Gluon kernel does not implement is handed to
+    ``gluon_fwd_supported`` as a truthy entry it rejects, rather than being tested
+    here: that keeps the rejection list in one place, and a feature added to this
+    file later disqualifies the Gluon path until someone handles it explicitly.
+
+    ``config`` is one of those: an explicit config is a request for a particular
+    ``_attn_fwd`` tuning, which this kernel could only ignore.
+    """
+    if _gluon_fwd is None or _MHA_IMPL != "default":
+        return False
+    return _gluon_fwd.gluon_fwd_supported(
+        q,
+        k,
+        v,
+        causal,
+        layout="bshd",
+        dropout=dropout_p > 0.0,
+        window=window_size[0] >= 0 or window_size[1] >= 0,
+        bias=bias,
+        alibi_slopes=alibi_slopes,
+        sink=sink,
+        config=config,
+    )
 
 
 def _flash_attn_forward(
@@ -378,26 +423,53 @@ class _FlashAttnFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-        out_padded, softmax_lse, S_dmask, philox_seed, philox_offset = (
-            _flash_attn_forward(
-                q,
-                k,
-                v,
-                dropout_p,
-                softmax_scale,
-                causal=causal,
-                window_size_left=int(window_size[0]),
-                window_size_right=int(window_size[1]),
-                bias=bias,
-                alibi_slopes=alibi_slopes,
-                return_lse=return_lse,
-                return_softmax=return_softmax and dropout_p > 0,
-                max_seqlen_q=q.shape[1],
-                max_seqlen_k=k.shape[1],
-                sink=sink,
-                config=config,
+        # The Gluon kernel is forward-only: it produces no residuals for this
+        # module's backward, so it is taken only when no gradient is being built.
+        # `is_grad` already answers that question exactly.
+        if not is_grad and _use_gluon_fwd(
+            q,
+            k,
+            v,
+            causal,
+            dropout_p=dropout_p,
+            window_size=window_size,
+            bias=bias,
+            alibi_slopes=alibi_slopes,
+            sink=sink,
+            config=config,
+        ):
+            # dead_row_lse=0.0 matches what _flash_attn_forward writes for a row
+            # that attends to nothing; the Gluon default is flash_attn_3's -inf.
+            # Live rows are identical either way.
+            out_padded, softmax_lse = _gluon_fwd.gluon_mha_fwd(
+                q, k, v, softmax_scale, causal, dead_row_lse=0.0
             )
-        )
+            # Dropout is rejected by the guard above, so _flash_attn_forward would
+            # have returned None here too (it is passed `return_softmax and
+            # dropout_p > 0`), and the philox values are only read under `is_grad`.
+            S_dmask = None
+            philox_seed = philox_offset = 0
+        else:
+            out_padded, softmax_lse, S_dmask, philox_seed, philox_offset = (
+                _flash_attn_forward(
+                    q,
+                    k,
+                    v,
+                    dropout_p,
+                    softmax_scale,
+                    causal=causal,
+                    window_size_left=int(window_size[0]),
+                    window_size_right=int(window_size[1]),
+                    bias=bias,
+                    alibi_slopes=alibi_slopes,
+                    return_lse=return_lse,
+                    return_softmax=return_softmax and dropout_p > 0,
+                    max_seqlen_q=q.shape[1],
+                    max_seqlen_k=k.shape[1],
+                    sink=sink,
+                    config=config,
+                )
+            )
 
         if is_grad:
             ctx.save_for_backward(q, k, v, out_padded, softmax_lse, sink)
