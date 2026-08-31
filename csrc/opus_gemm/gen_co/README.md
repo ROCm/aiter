@@ -166,6 +166,31 @@ The reference for the 1024-VGPR entry is **`va_vdst0` = 21 and `wmma_dst_hi` =
 is deliberately no threshold on VGPR count any more — with several budgets in
 the table there is no single number that means "the pin worked".
 
+### CI provenance check
+
+Every full rebuild writes a `provenance` record to `build_info.json` with two
+SHA256 digests:
+
+- `source_sha256` covers every kid's rendered device stub, its normalized
+  compile arguments, and the recursive repository-local include closure;
+- `artifacts_sha256` covers the ordered `(kid, symbol, .co contents)` set.
+
+This lets ordinary CPU CI detect either side of a stale artifact update without
+the special LLVM toolchain or gfx1250 hardware:
+
+```sh
+python3 csrc/opus_gemm/gen_co/build_co.py --verify-provenance
+```
+
+The same check runs from `op_tests/test_opus_co_integration.py` and at the start
+of `op_tests/opus/run_tests.sh`, which is the existing OPUS CI entry point. It is
+a source/artifact consistency gate, not a claim that different LLVM revisions
+produce bit-identical ELF files; the compiler identity and flags remain recorded
+separately in `build_info.json`. Regenerate the complete CO set with the command
+in the **Rebuilding** section whenever the manifest, rendered stub, compile
+recipe, or included device headers change; do not update the recorded digests
+by hand.
+
 ## Runtime
 
 [`opus_co_launch_gfx1250.cuh`](../include/gfx1250/opus_co_launch_gfx1250.cuh)

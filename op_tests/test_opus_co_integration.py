@@ -131,6 +131,22 @@ def test_co_manifest_uses_supported_architecture_keys():
     assert manifest_arches <= SUPPORTED_OPUS_ARCHES
 
 
+def test_gfx1250_co_provenance_matches_sources_and_artifacts():
+    repo_root = Path(__file__).resolve().parents[1]
+    builder = repo_root / "csrc" / "opus_gemm" / "gen_co" / "build_co.py"
+    completed = subprocess.run(
+        [sys.executable, str(builder), "--verify-provenance"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "verified provenance for 219 gfx1250 CO kernels" in completed.stdout
+
+
 def test_gfx1250_co_registry_and_launch_contract():
     assert len(gfx1250_4wave_co_kernels_list) == 219
     assert GFX1250_4WAVE_CO_KIDS == frozenset(gfx1250_4wave_co_kernels_list)

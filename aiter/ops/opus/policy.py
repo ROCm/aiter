@@ -28,6 +28,7 @@ from csrc.opus_gemm.opus_gemm_common import (
 from ...jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from ...jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..gemm_op_common import get_padded_m
+from ._arch import GFX942, GFX950, GFX1250
 from .launch_plan import (
     A16W16LaunchPlan,
     _get_cached_a16w16_launch_plan,
@@ -202,8 +203,8 @@ def _heuristic_a16w16_kid_gfx1250(
 def _gfx942_heuristic_symbol_to_kid() -> dict[str, int]:
     """Build the canonical gfx942 launcher-symbol mapping from the registry."""
     result: dict[str, int] = {}
-    for kid in DEFAULT_COMPILED_KIDS_BY_ARCH["gfx942"]:
-        instance = get_kernel_instance("gfx942", "a16w16", kid)
+    for kid in DEFAULT_COMPILED_KIDS_BY_ARCH[GFX942]:
+        instance = get_kernel_instance(GFX942, "a16w16", kid)
         if instance is None:
             raise RuntimeError(f"gfx942 heuristic kid {kid} has no a16w16 instance")
         previous = result.setdefault(instance.name, int(kid))
@@ -328,9 +329,9 @@ def _heuristic_a16w16_kid_gfx942(
 
 
 _A16W16_HEURISTICS = {
-    "gfx942": _heuristic_a16w16_kid_gfx942,
-    "gfx950": _heuristic_a16w16_kid_gfx950,
-    "gfx1250": _heuristic_a16w16_kid_gfx1250,
+    GFX942: _heuristic_a16w16_kid_gfx942,
+    GFX950: _heuristic_a16w16_kid_gfx950,
+    GFX1250: _heuristic_a16w16_kid_gfx1250,
 }
 
 _UINT32_MAX_BYTES = (1 << 32) - 1
@@ -345,7 +346,7 @@ def _check_a16w16_heuristic_4g(
     output_dtype: object,
 ) -> None:
     """Mirror the legacy C++ heuristic guard for 32-bit buffer descriptors."""
-    if arch not in ("gfx950", "gfx1250"):
+    if arch not in (GFX950, GFX1250):
         return
 
     output_itemsize = {"bf16_t": 2, "fp32_t": 4}.get(
@@ -360,7 +361,7 @@ def _check_a16w16_heuristic_4g(
 
     reason = (
         "legacy kids require a tuned 4g_safe kid"
-        if arch == "gfx950"
+        if arch == GFX950
         else "launcher gmem descriptors are 32-bit"
     )
     raise RuntimeError(
@@ -408,7 +409,7 @@ def _resolve_a16w16_candidate(
     split_k: int,
 ) -> A16W16LaunchPlan | None:
     """Apply caller-only redirects, then validate one exact candidate."""
-    if arch == "gfx942" and N not in GFX942_BF16WS_EXACT_N:
+    if arch == GFX942 and N not in GFX942_BF16WS_EXACT_N:
         if kid == 10210:
             kid = 10200
         elif kid == 10213:

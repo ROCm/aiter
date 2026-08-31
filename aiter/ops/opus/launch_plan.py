@@ -20,6 +20,8 @@ from csrc.opus_gemm.opus_gemm_common import (
     get_kernel_instance,
 )
 
+from ._arch import GFX942, GFX1250
+
 _WORKSPACE_DTYPES = {
     "bf16_t": torch.bfloat16,
     "fp32_t": torch.float32,
@@ -59,7 +61,7 @@ def _supports_a16w16_shape(
     K: int,
     batch: int,
 ) -> bool:
-    if registry_arch == "gfx1250" and batch != 1:
+    if registry_arch == GFX1250 and batch != 1:
         return False
 
     if instance.kernel_tag == _GFX1250_FUSED_SPLITK_TAG:
@@ -183,7 +185,7 @@ def _build_a16w16_workspace_spec(
             f"K-tile limit {max_useful_split_k} for K={K}, B_K={block_k}"
         )
 
-    if registry_arch == "gfx1250":
+    if registry_arch == GFX1250:
         if batch != 1:
             raise ValueError(
                 "opus_gemm_a16w16_launch: gfx1250 workspace kids require "
@@ -291,7 +293,7 @@ def _build_a16w16_launch_plan(
             f"got split_k={requested_split_k}"
         )
     if (
-        registry_arch == "gfx942"
+        registry_arch == GFX942
         and needs_workspace
         and instance.splitk_workspace_dtype == "bf16_t"
         and N not in GFX942_BF16WS_EXACT_N
@@ -300,7 +302,7 @@ def _build_a16w16_launch_plan(
             f"gfx942 exact kid {resolved_kid} requires N in "
             f"{sorted(GFX942_BF16WS_EXACT_N)}; got N={N}"
         )
-    if registry_arch == "gfx1250" and needs_workspace and batch != 1:
+    if registry_arch == GFX1250 and needs_workspace and batch != 1:
         raise ValueError(
             "opus_gemm_a16w16_launch: gfx1250 workspace kids require "
             f"batch=1; got batch={batch}"
@@ -324,7 +326,7 @@ def _build_a16w16_launch_plan(
             "gfx1250 splitk_fuse has a narrower bf16 [N] bias contract than "
             "the public OPUS interfaces can represent"
         )
-    if has_bias and registry_arch == "gfx942" and needs_workspace:
+    if has_bias and registry_arch == GFX942 and needs_workspace:
         raise ValueError(
             "the current gfx942 a16w16 launch rejects bias on split-K kernels"
         )
@@ -336,7 +338,7 @@ def _build_a16w16_launch_plan(
         if instance.kernel_tag == _GFX1250_FUSED_SPLITK_TAG:
             workspace_capacity_split_k = int(instance.fuse_split_k)
             abi_split_k = workspace_capacity_split_k
-        elif registry_arch == "gfx942":
+        elif registry_arch == GFX942:
             workspace_capacity_split_k, abi_split_k = _plan_gfx942_split_k(
                 instance,
                 M=M,

@@ -53,6 +53,7 @@ stay identical whichever toolchain is selected.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -64,6 +65,7 @@ import tempfile
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _OPUS_GEMM_DIR = os.path.dirname(_HERE)  # csrc/opus_gemm
 _CSRC_DIR = os.path.dirname(_OPUS_GEMM_DIR)  # csrc
+_REPO_ROOT = os.path.dirname(_CSRC_DIR)
 
 # opus_gemm_common / codegen.* are imported the same way gen_instances.py does.
 sys.path.insert(0, _OPUS_GEMM_DIR)
@@ -87,6 +89,9 @@ _PIPELINE_HEADERS = {
     "a16w16_4wave_co": "opus_gemm_pipeline_a16w16_4wave_compute_gfx1250.cuh",
     "a16w16_4wave_wl_co": "opus_gemm_pipeline_a16w16_4wave_wl_gfx1250.cuh",
 }
+
+_COMMON_COMPILE_FLAGS = ("-std=c++20", "-O3", "-D__HIPCC_RTC__")
+_PROVENANCE_SCHEMA = 1
 
 # Stub TU. Mirrors the standalone kernel's own stub: the host pass gets an empty
 # body (so hipcc's two-pass compile has a definition on both sides) and only the
@@ -137,6 +142,221 @@ void {symbol}({kargs_name} kargs)
 """
 
 _BUNDLE_MAGIC = b"__CLANG_OFFLOAD_BUNDLE__"
+_INCLUDE_DIRECTIVE = re.compile(
+    r'^\s*#\s*include\s*[<"]([^">]+)[">]', re.MULTILINE
+)
+_LOCAL_INCLUDE_DIRS = (
+    os.path.join(_CSRC_DIR, "include"),
+    os.path.join(_OPUS_GEMM_DIR, "include"),
+)
+
+
+def _stub_source(k):
+    return _STUB_TEMPLATE.format(
+        pipeline_header=_PIPELINE_HEADERS[k.kernel_tag],
+        traits_name=TRAITS_NAME_MAP[k.kernel_tag],
+        traits_args=co_traits_args(k),
+        kargs_name=KARGS_NAME_MAP[k.kernel_tag],
+        body_func=KERNEL_FUNC_MAP[k.kernel_tag],
+        symbol=k.name,
+        lb_threads=k.BLOCK_SIZE,
+        lb_waves=k.co_min_waves_per_eu,
+        want_num_vgpr=1 if k.co_num_vgpr else 0,
+        num_vgpr=k.co_num_vgpr or 0,
+        cwm=k.cluster_wg_m,
+        cwn=k.cluster_wg_n,
+    )
+
+
+def _device_compile_args(arch, device_flags):
+    return [
+        "-x",
+        "hip",
+        f"--offload-arch={arch}",
+        *_COMMON_COMPILE_FLAGS,
+        f"-I{_CSRC_DIR}/include",
+        f"-I{_OPUS_GEMM_DIR}/include",
+        *device_flags,
+    ]
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _resolve_local_include(name, source_dir):
+    candidates = []
+    if source_dir is not None:
+        candidates.append(os.path.join(source_dir, name))
+    candidates.extend(os.path.join(root, name) for root in _LOCAL_INCLUDE_DIRS)
+    for candidate in candidates:
+        path = os.path.realpath(candidate)
+        in_repository = os.path.commonpath((_REPO_ROOT, path)) == _REPO_ROOT
+        if os.path.isfile(path) and in_repository:
+            return path
+    return None
+
+
+def _local_header_hashes(stub):
+    result = {}
+    pending = [(None, stub)]
+    seen = set()
+    while pending:
+        source_dir, source = pending.pop()
+        for name in _INCLUDE_DIRECTIVE.findall(source):
+            path = _resolve_local_include(name, source_dir)
+            if path is None or path in seen:
+                continue
+            seen.add(path)
+            with open(path, "rb") as stream:
+                contents = stream.read()
+            relative = os.path.relpath(path, _REPO_ROOT).replace(os.sep, "/")
+            result[relative] = hashlib.sha256(contents).hexdigest()
+            pending.append((os.path.dirname(path), contents.decode("utf-8")))
+    return dict(sorted(result.items()))
+
+
+def _portable_compile_args(arch, device_flags):
+    result = []
+    for argument in _device_compile_args(arch, device_flags):
+        if argument.startswith("-I"):
+            relative = os.path.relpath(argument[2:], _REPO_ROOT).replace(os.sep, "/")
+            argument = f"-I{relative}"
+        result.append(argument)
+    return [*result, "--genco"]
+
+
+def _canonical_sha256(value):
+    encoded = json.dumps(
+        value,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _co_source_sha256(instances_by_kid, arch, extra_device_flags=()):
+    headers = {}
+    kernels = []
+    for kid, instance in sorted(instances_by_kid.items()):
+        stub = _stub_source(instance)
+        headers.update(_local_header_hashes(stub))
+        device_flags = [*instance.co_device_flags, *extra_device_flags]
+        kernels.append(
+            {
+                "compile_args": _portable_compile_args(arch, device_flags),
+                "kid": kid,
+                "stub_sha256": hashlib.sha256(stub.encode("utf-8")).hexdigest(),
+                "symbol": instance.name,
+            }
+        )
+    return _canonical_sha256(
+        {
+            "headers": dict(sorted(headers.items())),
+            "kernels": kernels,
+            "schema": _PROVENANCE_SCHEMA,
+        }
+    )
+
+
+def _co_artifacts_sha256(instances_by_kid, out_dir):
+    artifacts = []
+    for kid, instance in sorted(instances_by_kid.items()):
+        filename = f"{instance.name}.co"
+        artifacts.append(
+            {
+                "kid": kid,
+                "sha256": _file_sha256(os.path.join(out_dir, filename)),
+                "symbol": instance.name,
+            }
+        )
+    return _canonical_sha256(artifacts)
+
+
+def _verify_provenance(instances_by_kid, arch, out_dir):
+    info_path = os.path.join(out_dir, "build_info.json")
+    try:
+        with open(info_path) as stream:
+            info = json.load(stream)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"build_co: cannot read {info_path}: {exc}") from exc
+
+    if info.get("arch") != arch:
+        raise SystemExit(
+            f"build_co: {info_path} records arch {info.get('arch')!r}, "
+            f"expected {arch!r}"
+        )
+    if info.get("common_flags") != list(_COMMON_COMPILE_FLAGS):
+        raise SystemExit(
+            f"build_co: {info_path} has stale common compile flags; rebuild the CO set"
+        )
+
+    records = info.get("kernels")
+    if not isinstance(records, list):
+        raise SystemExit(f"build_co: {info_path} has no kernels list")
+    records_by_kid = {record.get("kid"): record for record in records}
+    if len(records_by_kid) != len(records):
+        raise SystemExit(f"build_co: {info_path} contains duplicate kernel ids")
+    if set(records_by_kid) != set(instances_by_kid):
+        raise SystemExit(
+            f"build_co: {info_path} kernel ids do not match co_kernels.json"
+        )
+
+    extra_device_flags = None
+    for kid, instance in instances_by_kid.items():
+        record = records_by_kid[kid]
+        if record.get("symbol") != instance.name:
+            raise SystemExit(
+                f"build_co: kid {kid} symbol differs from co_kernels.json; rebuild"
+            )
+        declared = list(instance.co_device_flags)
+        recorded = record.get("device_flags")
+        if not isinstance(recorded, list) or recorded[: len(declared)] != declared:
+            raise SystemExit(
+                f"build_co: kid {kid} device flags differ from co_kernels.json; rebuild"
+            )
+        suffix = recorded[len(declared) :]
+        if extra_device_flags is None:
+            extra_device_flags = suffix
+        elif suffix != extra_device_flags:
+            raise SystemExit(
+                "build_co: build_info.json has inconsistent global device flags"
+            )
+
+    provenance = info.get("provenance")
+    if not isinstance(provenance, dict):
+        raise SystemExit(f"build_co: {info_path} has no provenance record; rebuild")
+    if provenance.get("schema") != _PROVENANCE_SCHEMA:
+        raise SystemExit(
+            f"build_co: unsupported provenance schema {provenance.get('schema')!r}"
+        )
+
+    expected_source = _co_source_sha256(
+        instances_by_kid,
+        arch,
+        extra_device_flags or (),
+    )
+    if provenance.get("source_sha256") != expected_source:
+        raise SystemExit(
+            "build_co: CO source fingerprint is stale; rebuild with build_co.py"
+        )
+    try:
+        expected_artifacts = _co_artifacts_sha256(instances_by_kid, out_dir)
+    except OSError as exc:
+        raise SystemExit(f"build_co: cannot hash CO artifact: {exc}") from exc
+    if provenance.get("artifacts_sha256") != expected_artifacts:
+        raise SystemExit(
+            "build_co: CO artifact fingerprint is stale; rebuild with build_co.py"
+        )
+    print(
+        f"[build_co] verified provenance for {len(instances_by_kid)} "
+        f"{arch} CO kernels"
+    )
 
 
 def _run(cmd, **kw):
@@ -270,43 +490,14 @@ def build_one(k, args, llvm_bin, workdir):
     no_pad = "-DOPUS_CO_NO_1WG_PAD" in args.device_flag
     stub_path = os.path.join(workdir, f"{symbol}.cc")
     with open(stub_path, "w") as f:
-        f.write(
-            _STUB_TEMPLATE.format(
-                pipeline_header=_PIPELINE_HEADERS[k.kernel_tag],
-                traits_name=TRAITS_NAME_MAP[k.kernel_tag],
-                traits_args=co_traits_args(k),
-                kargs_name=KARGS_NAME_MAP[k.kernel_tag],
-                body_func=KERNEL_FUNC_MAP[k.kernel_tag],
-                symbol=symbol,
-                lb_threads=k.BLOCK_SIZE,
-                lb_waves=k.co_min_waves_per_eu,
-                want_num_vgpr=1 if k.co_num_vgpr else 0,
-                num_vgpr=k.co_num_vgpr or 0,
-                cwm=k.cluster_wg_m,
-                cwn=k.cluster_wg_n,
-            )
-        )
+        f.write(_stub_source(k))
 
     out_path = os.path.join(args.out_dir, f"{symbol}.co")
     device_flags = list(k.co_device_flags) + list(args.device_flag)
     # Everything except the output mode and the input, so the -S pass below is
     # byte-for-byte the same compilation.
-    common = [
-        *args.hipcc.split(),
-        "-x",
-        "hip",
-        f"--offload-arch={args.arch}",
-        "-std=c++20",
-        "-O3",
-        # Skips the implicit __clang_hip_runtime_wrapper.h on the host pass. It
-        # also keeps the kernel free of HIP's hidden/implicit kernargs, which is
-        # what lets the runtime launch it through HIP_LAUNCH_PARAM_BUFFER_POINTER
-        # like the hand-written asm .co files.
-        "-D__HIPCC_RTC__",
-        f"-I{_CSRC_DIR}/include",
-        f"-I{_OPUS_GEMM_DIR}/include",
-        *device_flags,
-    ]
+    # __HIPCC_RTC__ skips the implicit runtime wrapper and its hidden kernargs.
+    common = [*args.hipcc.split(), *_device_compile_args(args.arch, device_flags)]
     env = dict(os.environ)
     if llvm_bin:
         env["HIP_CLANG_PATH"] = llvm_bin
@@ -465,24 +656,37 @@ def main():
         "of entries and serial is hours.",
     )
     p.add_argument("--keep-temps", action="store_true")
+    p.add_argument(
+        "--verify-provenance",
+        action="store_true",
+        help="verify committed CO files and source fingerprints without a GPU "
+        "or compiler, then exit",
+    )
     args = p.parse_args()
 
     if not args.out_dir:
         args.out_dir = os.path.join(_HERE, args.arch)
+    instances_by_kid = {
+        kid: instance
+        for kid, instance in gfx1250_4wave_co_kernels_declared.items()
+        if instance.kernel_tag in _PIPELINE_HEADERS
+    }
+    if not instances_by_kid:
+        raise SystemExit(
+            "build_co: no pre-compiled entries -- check gen_co/co_kernels.json"
+        )
+    if args.verify_provenance:
+        if args.device_flag:
+            p.error("--device-flag cannot be used with --verify-provenance")
+        _verify_provenance(instances_by_kid, args.arch, args.out_dir)
+        return
+
     os.makedirs(args.out_dir, exist_ok=True)
 
     llvm_bin = os.path.abspath(args.llvm_bin) if args.llvm_bin else ""
     print(f"[build_co] clang from: {llvm_bin or '(PATH / hipcc default)'}")
 
-    instances = [
-        k
-        for k in gfx1250_4wave_co_kernels_declared.values()
-        if k.kernel_tag in _PIPELINE_HEADERS
-    ]
-    if not instances:
-        raise SystemExit(
-            "build_co: no pre-compiled entries -- check gen_co/co_kernels.json"
-        )
+    instances = list(instances_by_kid.values())
 
     workdir = tempfile.mkdtemp(prefix="opus_build_co_")
     try:
@@ -522,8 +726,20 @@ def main():
         "device_clang": ver,
         "hip_clang_path": llvm_bin,
         # Shared by every entry; the per-entry -mllvm flags are in kernels[].
-        "common_flags": ["-D__HIPCC_RTC__", "-O3", "-std=c++20"],
+        "common_flags": list(_COMMON_COMPILE_FLAGS),
         "kernels": built,
+        "provenance": {
+            "schema": _PROVENANCE_SCHEMA,
+            "source_sha256": _co_source_sha256(
+                instances_by_kid,
+                args.arch,
+                args.device_flag,
+            ),
+            "artifacts_sha256": _co_artifacts_sha256(
+                instances_by_kid,
+                args.out_dir,
+            ),
+        },
     }
     info_path = os.path.join(args.out_dir, "build_info.json")
     with open(info_path, "w") as f:
