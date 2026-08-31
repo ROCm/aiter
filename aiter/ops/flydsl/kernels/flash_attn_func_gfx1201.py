@@ -232,13 +232,13 @@ def build_flash_attn_func_module_primary(
                 ).result
             return rocdl.wmma_f32_16x16x16_f16(v8f32_type, a_v8, b_v8, c_v8).result
 
-        seq_len_v = fx.Index(seq_len)
+        seq_len_v = fx.Uint64(seq_len)
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         lds_kv = lds.kv.ptr
 
-        block_id = fx.Index(gpu.block_idx.x)
-        tid = fx.Index(gpu.thread_idx.x)
+        block_id = fx.Uint64(gpu.block_idx.x)
+        tid = fx.Uint64(gpu.thread_idx.x)
 
         wave_id = tid // WARP_SIZE
         lane = tid % WARP_SIZE
@@ -305,9 +305,13 @@ def build_flash_attn_func_module_primary(
             return buf_id * fx.Int64(LDS_K_TILE_SIZE)
 
         def v_buf_base(buf_id):
-            return fx.Index(LDS_V_BASE + buf_id * LDS_V_TILE_SIZE)
+            return fx.Int64(LDS_V_BASE + buf_id * LDS_V_TILE_SIZE)
 
         def coop_load_k(tile_start, buf_id=0):
+            # `tile_start` may arrive as the loop induction variable (index type);
+            # normalize to i64 so it composes with the i64 thread offsets. index
+            # is i64 in the gfx1201 datalayout, so this cast is a no-op in the ISA.
+            tile_start = fx.Int64(tile_start)
             k_base = k_buf_base(buf_id)
             for batch in range_constexpr(NUM_BATCHES_KV):
                 row_offset = batch * ROWS_PER_BATCH_LOAD
@@ -332,6 +336,7 @@ def build_flash_attn_func_module_primary(
             fx.ptr_store(Vec(vec), lds_kv + fx.Int32(lds_idx))
 
         def coop_load_v_global(tile_start):
+            tile_start = fx.Int64(tile_start)
             vecs = []
             for batch in range_constexpr(NUM_BATCHES_KV):
                 row_offset = batch * ROWS_PER_BATCH_LOAD
@@ -357,15 +362,15 @@ def build_flash_attn_func_module_primary(
         q_row = q_start + wave_q_offset + lane16
         q_row_i32 = fx.Int32(q_row)
         # Use explicit signed-less-than predicate to match baseline ISA
-        # (`v_cmp_gt_i64_e64`). fx.Index defaults to unsigned which would lower
+        # (`v_cmp_gt_i64_e64`). An fx `<` on unsigned-typed operands would lower
         # to `v_cmp_gt_u64_e64` and cause an ISA hash drift even though both
         # variants are semantically equivalent for non-negative offsets.
         q_in_bounds = arith.cmpi(arith.CmpIPredicate.slt, _raw(q_row), _raw(seq_len_v))
-        q_row_safe = fx.Int64(q_in_bounds.select(q_row, fx.Index(0)))
+        q_row_safe = fx.Int64(q_in_bounds.select(q_row, fx.Int64(0)))
         c_zero_v8f16 = Vec.filled(8, 0.0, elem_dtype)
         q_b_packs = []
         for ks in range_constexpr(K_STEPS_QK):
-            q_col = fx.Index(ks * K_STEP_QK) + klane * WMMA_LANE_K
+            q_col = fx.Int64(ks * K_STEP_QK) + klane * WMMA_LANE_K
             g_idx = global_idx(q_row_safe, q_col)
             raw = load_global_v8f16(q_ptr, g_idx)
             q_b_packs.append(q_in_bounds.select(raw, c_zero_v8f16))
@@ -400,7 +405,7 @@ def build_flash_attn_func_module_primary(
 
         loop_results = init_args
         for kv_block_start, inner_iter_args in range(
-            0, kv_upper, BLOCK_N_OUT, init=init_args
+            fx.Int64(0), kv_upper, fx.Int64(BLOCK_N_OUT), init=init_args
         ):
             m_running = inner_iter_args[0]
             l_running = inner_iter_args[1]
@@ -599,7 +604,7 @@ def build_flash_attn_func_module_primary(
                     kv_row = (
                         fx.Int64(st_kv_base_val + pks_val * PV_K_STEP)
                         + klane * WMMA_LANE_K
-                        + fx.Index(k_sub)
+                        + fx.Int64(k_sub)
                     )
                     v_lds_idx = v_base + kv_row * V_STRIDE + d_pos
                     v_elems.append(fx.ptr_load(lds_kv + fx.Int32(v_lds_idx)))
@@ -639,7 +644,7 @@ def build_flash_attn_func_module_primary(
             l_running = l_new
 
             # ---- Opt4: Issue NEXT iteration's V global load ----
-            next_kv_start = kv_block_start + fx.Index(BLOCK_N_OUT)
+            next_kv_start = fx.Int64(kv_block_start) + fx.Int64(BLOCK_N_OUT)
             _v_vecs_next = coop_load_v_global(next_kv_start)
 
             _yield_args = [m_running, l_running] + o_accs
@@ -658,7 +663,7 @@ def build_flash_attn_func_module_primary(
             for dc in range_constexpr(D_CHUNKS):
                 o_norm_vec = _fmul(o_finals[dc], inv_l_vec)
                 o_trunc = Vec(o_norm_vec).to(elem_dtype)
-                d_col = fx.Index(dc * D_CHUNK) + klane * 8
+                d_col = fx.Int64(dc * D_CHUNK) + klane * 8
                 o_global = global_idx(q_row, d_col)
                 _store_global_half(o_ptr, o_global, o_trunc)
 
@@ -676,8 +681,8 @@ def build_flash_attn_func_module_primary(
     ):
         ctx = CompilationContext.get_current()
 
-        bs_idx = fx.Index(batch_size)
-        sl_idx = fx.Index(seq_len)
+        bs_idx = fx.Uint64(batch_size)
+        sl_idx = fx.Uint64(seq_len)
         num_q_tiles = (sl_idx + BLOCK_M - 1) // BLOCK_M
         grid_x = bs_idx * num_q_tiles * NUM_HEADS
 

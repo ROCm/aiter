@@ -829,28 +829,16 @@ def _build_kernel(
                 sin_vals = [sin_vec[i].to(fx.Float32) for i in range(PAIRS_PER_THREAD)]
 
             # GPT-J pair rotation per VEC pair, then select rotated vs pass-through.
-            # KEEP RAW: the operator form (e*c - o*s) lets the compiler contract
-            # into v_pk_fma_f32 (ISA drift vs explicit subf/MulFOp). Measured on
-            # csa_main bf16 decode (bs=8, nw=1): raw 12.63us vs fma 13.11us
-            # (+3.8%, contraction perturbs the tail schedule/VGPR); on fp4 legacy
-            # it's neutral (6.20 vs 6.18us). Raw is faster overall -> keep it.
+            # ambient fast_fp_math -> `*`/`-`/`+` carry fastmath<fast>, same as the
+            # old explicit MulFOp/subf/AddFOp(fastmath=fast).
             rotated_lane = list(normed_lane)
             for k in range_constexpr(PAIRS_PER_THREAD):
-                e = normed_lane[2 * k]
-                o = normed_lane[2 * k + 1]
-                c = _to_raw(cos_vals[k])
-                s = _to_raw(sin_vals[k])
-                new_e = arith.subf(
-                    arith.MulFOp(e, c, fastmath=fm_fast).result,
-                    arith.MulFOp(o, s, fastmath=fm_fast).result,
-                )
-                new_o = arith.AddFOp(
-                    arith.MulFOp(e, s, fastmath=fm_fast).result,
-                    arith.MulFOp(o, c, fastmath=fm_fast).result,
-                    fastmath=fm_fast,
-                ).result
-                rotated_lane[2 * k] = new_e
-                rotated_lane[2 * k + 1] = new_o
+                e = fx.Float32(normed_lane[2 * k])
+                o = fx.Float32(normed_lane[2 * k + 1])
+                c = cos_vals[k]
+                s = sin_vals[k]
+                rotated_lane[2 * k] = e * c - o * s
+                rotated_lane[2 * k + 1] = e * s + o * c
 
             out_lane = [
                 _to_raw(is_rope_t.select(rotated_lane[i], normed_lane[i]))
@@ -1797,8 +1785,8 @@ def _build_kernel_ksplit(
                     sin_b = fx.add_offset(
                         fx.get_iter(sin_buf), cos_row_base + cs_lo
                     ).load(T.bf16)
-                    cos_vals = [_to_raw(fx.BFloat16(cos_b).to(fx.Float32))]
-                    sin_vals = [_to_raw(fx.BFloat16(sin_b).to(fx.Float32))]
+                    cos_vals = [fx.BFloat16(cos_b).to(fx.Float32)]
+                    sin_vals = [fx.BFloat16(sin_b).to(fx.Float32)]
                 else:
                     cos_vec = fx.Vector(
                         fx.add_offset(fx.get_iter(cos_buf), cos_row_base + cs_lo).load(
@@ -1811,31 +1799,20 @@ def _build_kernel_ksplit(
                         )
                     )
                     cos_vals = [
-                        _to_raw(cos_vec[i].to(fx.Float32))
-                        for i in range(PAIRS_PER_THREAD)
+                        cos_vec[i].to(fx.Float32) for i in range(PAIRS_PER_THREAD)
                     ]
                     sin_vals = [
-                        _to_raw(sin_vec[i].to(fx.Float32))
-                        for i in range(PAIRS_PER_THREAD)
+                        sin_vec[i].to(fx.Float32) for i in range(PAIRS_PER_THREAD)
                     ]
 
                 rotated_lane = list(normed_lane)
                 for kk in range_constexpr(PAIRS_PER_THREAD):
-                    e = normed_lane[2 * kk]
-                    o = normed_lane[2 * kk + 1]
+                    e = fx.Float32(normed_lane[2 * kk])
+                    o = fx.Float32(normed_lane[2 * kk + 1])
                     cc = cos_vals[kk]
                     ss = sin_vals[kk]
-                    new_e = arith.subf(
-                        arith.MulFOp(e, cc, fastmath=fm_fast).result,
-                        arith.MulFOp(o, ss, fastmath=fm_fast).result,
-                    )
-                    new_o = arith.AddFOp(
-                        arith.MulFOp(e, ss, fastmath=fm_fast).result,
-                        arith.MulFOp(o, cc, fastmath=fm_fast).result,
-                        fastmath=fm_fast,
-                    ).result
-                    rotated_lane[2 * kk] = new_e
-                    rotated_lane[2 * kk + 1] = new_o
+                    rotated_lane[2 * kk] = e * cc - o * ss
+                    rotated_lane[2 * kk + 1] = e * ss + o * cc
 
                 out_lane = [
                     _to_raw(is_rope_t.select(rotated_lane[i], normed_lane[i]))

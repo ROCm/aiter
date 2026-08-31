@@ -15,20 +15,18 @@ See ``fused_compress_attn_hca.py`` for the original wave64 documentation.
 """
 
 import math
-from contextlib import contextmanager
 from functools import lru_cache
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, scf
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import CmpFPredicate, CmpIPredicate
 from flydsl.expr.typing import Int32, Stream, T
 
-from aiter.ops.flydsl.kernels import buffer_ops, vector
+from aiter.ops.flydsl.kernels import buffer_ops
 
 from .fused_compress_attn_common import (
     block_base_bytes_i64,
@@ -41,17 +39,6 @@ BLOCK_THREADS = 32  # 1 wave32 (RDNA4 / gfx1250)
 SLICE = 32  # head_dim elements per block (grid-Y split)
 _NEG_INF = float("-inf")
 _LOG2E = math.log2(math.e)
-
-
-@contextmanager
-def _if_then(if_op):
-    with ir.InsertionPoint(if_op.then_block):
-        try:
-            yield if_op.then_block
-        finally:
-            blk = if_op.then_block
-            if (not blk.operations) or not isinstance(blk.operations[-1], scf.YieldOp):
-                scf.YieldOp([])
 
 
 # ============================================================================
@@ -188,9 +175,9 @@ def _build_compress_forward_kernel(
         position = plan_vec[2]
         window_len = plan_vec[3]
 
-        is_active = arith.cmpi(CmpIPredicate.sge, position.ir_value(), c_zero_i32)
-        _if_active = scf.IfOp(is_active)
-        with _if_then(_if_active):
+        # Sentinel-skip: run the whole body only for position >= 0, as a closure
+        # under a runtime `if` (rewriter sees an opaque call -> scf.if).
+        def _body():
             # Per-thread head_dim base: each thread owns VEC contiguous
             # elements starting at slice_base + lid * VEC.
             col_off_base = fx.Int32(sid) * SLICE_SZ + lid * VEC
@@ -239,8 +226,8 @@ def _build_compress_forward_kernel(
                         hi.ir_value(),
                     )
                     lo16 = arith.andi(lo_or_hi, arith.constant(0xFFFF, type=i32))
-                    lo16_v = vector.from_elements(T.vec(1, T.i32), [lo16])
-                    bf16_pair = fx.Vector(vector.bitcast(T.vec(2, T.bf16), lo16_v))
+                    lo16_v = fx.Vector.from_elements([lo16], dtype=fx.Int32)
+                    bf16_pair = lo16_v.bitcast(fx.BFloat16)
                     # raw f32 for the explicit-fastmath float layer downstream.
                     return [bf16_pair[0].to(fx.Float32).ir_value()]
                 else:
@@ -253,12 +240,14 @@ def _build_compress_forward_kernel(
                         raw_s = buffer_ops.buffer_load(
                             rsrc, off_dw, vec_width=1, dtype=i32
                         )
-                        raw = vector.from_elements(T.vec(1, T.i32), [raw_s])
+                        raw = fx.Vector.from_elements([raw_s], dtype=fx.Int32)
                     else:
-                        raw = buffer_ops.buffer_load(
-                            rsrc, off_dw, vec_width=dwords, dtype=i32
+                        raw = fx.Vector(
+                            buffer_ops.buffer_load(
+                                rsrc, off_dw, vec_width=dwords, dtype=i32
+                            )
                         )
-                    vec_bf16 = fx.Vector(vector.bitcast(T.vec(VEC, T.bf16), raw))
+                    vec_bf16 = raw.bitcast(fx.BFloat16)
                     # raw f32 for the explicit-fastmath float layer downstream.
                     return [vec_bf16[i].to(fx.Float32).ir_value() for i in range(VEC)]
 
@@ -452,9 +441,7 @@ def _build_compress_forward_kernel(
             # Wave 0's 32 threads cover SLICE_SZ head_dim elements (VEC elements
             # per thread). For each owned element, the thread reads NW values
             # from LDS (one per K-split wave) and computes the global softmax.
-            is_wave0 = arith.cmpi(CmpIPredicate.eq, wid.ir_value(), c_zero_i32)
-            _if_w0 = scf.IfOp(is_wave0)
-            with _if_then(_if_w0):
+            def _wave0():
                 comp_list = []
                 for i in range_constexpr(VEC):
                     lane_off = lid * VEC + i
@@ -506,6 +493,12 @@ def _build_compress_forward_kernel(
                             comp_list[base : base + quarter], dtype=fx.Float32
                         )
                         buffer_ops.buffer_store(sv.ir_value(), out_rsrc, out_off + base)
+
+            if wid == 0:
+                _wave0()
+
+        if fx.Int32(position) >= 0:
+            _body()
 
     @flyc.jit
     def launch_hca_compress_forward(
@@ -627,12 +620,10 @@ def _build_norm_rope_scatter_kernel(
     ):
         f32 = T.f32
         i32 = T.i32
-        vecVf32 = T.vec(VEC, T.f32)
 
         pid = fx.block_idx.x
         tid = fx.thread_idx.x
 
-        c_zero_i32 = arith.constant(0, type=i32)
         c_eps = arith.constant(rms_eps, type=f32)
         c_inv_D = arith.constant(1.0 / D, type=f32)
 
@@ -653,9 +644,9 @@ def _build_norm_rope_scatter_kernel(
         batch_id = plan_vec[1]
         position = plan_vec[2]
 
-        is_active = arith.cmpi(CmpIPredicate.sge, position.ir_value(), c_zero_i32)
-        _if_active = scf.IfOp(is_active)
-        with _if_then(_if_active):
+        # Sentinel-skip: run the whole body only for position >= 0, as a closure
+        # under a runtime `if` (rewriter sees an opaque call -> scf.if).
+        def _body():
             tid_x_vec = fx.Int32(tid) * VEC
 
             # -- Load kv_compressed[pid, tid*VEC : tid*VEC + VEC] --
@@ -707,17 +698,19 @@ def _build_norm_rope_scatter_kernel(
                     raw_s = buffer_ops.buffer_load(
                         rmsw_rsrc, off_dw, vec_width=1, dtype=i32
                     )
-                    raw = vector.from_elements(T.vec(1, T.i32), [raw_s])
-                    vec_bf16 = fx.Vector(vector.bitcast(T.vec(VEC, T.bf16), raw))
+                    raw = fx.Vector.from_elements([raw_s], dtype=fx.Int32)
+                    vec_bf16 = raw.bitcast(fx.BFloat16)
                     rmsw_lane = [
                         vec_bf16[i].to(fx.Float32).ir_value()
                         for i in range_constexpr(VEC)
                     ]
                 elif const_expr(dwords <= 4):
-                    raw = buffer_ops.buffer_load(
-                        rmsw_rsrc, off_dw, vec_width=dwords, dtype=i32
+                    raw = fx.Vector(
+                        buffer_ops.buffer_load(
+                            rmsw_rsrc, off_dw, vec_width=dwords, dtype=i32
+                        )
                     )
-                    vec_bf16 = fx.Vector(vector.bitcast(T.vec(VEC, T.bf16), raw))
+                    vec_bf16 = raw.bitcast(fx.BFloat16)
                     rmsw_lane = [
                         vec_bf16[i].to(fx.Float32).ir_value()
                         for i in range_constexpr(VEC)
@@ -734,7 +727,7 @@ def _build_norm_rope_scatter_kernel(
                             vec_width=half_dw,
                             dtype=i32,
                         )
-                        vbf16 = fx.Vector(vector.bitcast(T.vec(half_bf16, T.bf16), r))
+                        vbf16 = fx.Vector(r).bitcast(fx.BFloat16)
                         rmsw_lane += [
                             vbf16[i].to(fx.Float32).ir_value()
                             for i in range_constexpr(half_bf16)
@@ -904,14 +897,14 @@ def _build_norm_rope_scatter_kernel(
                 ]
                 cache_off = cache_base + tid_x_vec
                 out_vec_t = T.vec(VEC, T.bf16)
-                raw_vec = vector.from_elements(vecVf32, out_lane)
+                raw_vec = fx.Vector.from_elements(out_lane, dtype=fx.Float32)
                 bf16_vec = raw_vec.truncf(out_vec_t)
                 # logical shift (cache_off >= 0); fx Int32 >> is arithmetic.
                 cache_off_dw = fx.Int32(
                     (fx.Uint32(cache_off.ir_value()) >> 1).ir_value()
                 )
                 dwords = (VEC + 1) // 2
-                bf16_as_i32 = fx.Vector(vector.bitcast(T.vec(dwords, T.i32), bf16_vec))
+                bf16_as_i32 = bf16_vec.bitcast(fx.Int32)
                 if const_expr(dwords == 1):
                     buffer_ops.buffer_store(
                         bf16_as_i32[0].ir_value(), out_rsrc, cache_off_dw
@@ -922,24 +915,17 @@ def _build_norm_rope_scatter_kernel(
                     )
                 else:
                     # dwords > 4 (VEC=16 -> dwords=8): split into 2x dwordx4.
-                    # vector.extract_strided_slice has no fx wrapper -> keep raw.
-                    bf16_as_i32 = bf16_as_i32.ir_value()
-                    lo = vector.extract_strided_slice(
-                        T.vec(4, T.i32),
-                        bf16_as_i32,
-                        offsets=[0],
-                        sizes=[4],
-                        strides=[1],
+                    lo = fx.Vector.from_elements(
+                        [bf16_as_i32[i] for i in range(4)], dtype=fx.Int32
                     )
-                    hi = vector.extract_strided_slice(
-                        T.vec(4, T.i32),
-                        bf16_as_i32,
-                        offsets=[4],
-                        sizes=[4],
-                        strides=[1],
+                    hi = fx.Vector.from_elements(
+                        [bf16_as_i32[i] for i in range(4, 8)], dtype=fx.Int32
                     )
-                    buffer_ops.buffer_store(lo, out_rsrc, cache_off_dw)
-                    buffer_ops.buffer_store(hi, out_rsrc, cache_off_dw + 4)
+                    buffer_ops.buffer_store(lo.ir_value(), out_rsrc, cache_off_dw)
+                    buffer_ops.buffer_store(hi.ir_value(), out_rsrc, cache_off_dw + 4)
+
+        if fx.Int32(position) >= 0:
+            _body()
 
     @flyc.jit
     def launch_hca_norm_rope_scatter(

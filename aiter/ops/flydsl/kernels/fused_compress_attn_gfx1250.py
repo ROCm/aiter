@@ -25,7 +25,6 @@ See ``fused_compress_attn.py`` for the original wave64 documentation.
 # triggering a JIT recompile per dynamic-arg value).
 
 import math
-from contextlib import contextmanager
 from functools import lru_cache
 
 import flydsl.compiler as flyc
@@ -38,7 +37,7 @@ from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
 from flydsl.expr.typing import Int32, Stream, T
 
-from aiter.ops.flydsl.kernels import buffer_ops, vector
+from aiter.ops.flydsl.kernels import buffer_ops
 
 from .fused_compress_attn_common import (
     block_base_bytes_i64,
@@ -75,23 +74,6 @@ _LOG2E = math.log2(math.e)  # exp(x) = exp2(x * log2e) -> single v_exp_f32
 
 # Preshuffle MFMA tile (gfx9/gfx94/gfx95 16x16 layout used by aiter scaled GEMM).
 _PRESHUFFLE_TILE = 16
-
-
-# ============================================================================
-# scf helpers (copied verbatim from moe_gemm_2stage.py -- too small to share)
-# ============================================================================
-
-
-@contextmanager
-def _if_then(if_op):
-    """SCF IfOp then-region context manager. Auto-yields empty if missing."""
-    with ir.InsertionPoint(if_op.then_block):
-        try:
-            yield if_op.then_block
-        finally:
-            blk = if_op.then_block
-            if (not blk.operations) or not isinstance(blk.operations[-1], scf.YieldOp):
-                scf.YieldOp([])
 
 
 # ============================================================================
@@ -295,12 +277,11 @@ def _build_kernel(
         window_len = _to_raw(plan_vec[3])
 
         # ---- Step 2: sentinel-skip ----
-        # Wrap the entire body in scf.IfOp(position >= 0). flydsl's
-        # `if cond: return` does NOT actually early-exit (tail kernel body
-        # still runs with stale values, OOB faults). The IfOp does.
-        is_active = (fx.Int32(position) >= 0).ir_value()
-        _if_active = scf.IfOp(is_active)
-        with _if_then(_if_active):
+        # Guard the entire body on position >= 0. A bare `if cond: return`
+        # would NOT early-exit (the tail kernel body still runs with stale
+        # values -> OOB faults); an `if cond:` block scoping the whole body
+        # lowers to the same scf.if guard the raw IfOp built.
+        if fx.Int32(position) >= 0:
             # ---- Step 3: per-seq state slot ----
             slot_map_rsrc = buffer_ops.create_buffer_resource(
                 state_slot_mapping, max_size=True
@@ -676,6 +657,14 @@ def _build_kernel(
 
                 # Tail iter at k=K-1. Gated by `window_len < K`: when wl==K
                 # Phase 2 is empty and the IfOp returns phase1_state.
+                #
+                # KEPT as a raw value-yielding scf.IfOp (measured floor). Both
+                # arms produce the m/kv/w accumulator; a per-lane select is
+                # INVALID here (the then-arm's softmax update reads speculative
+                # pre_* prefetch state that is garbage when wl==K). A local
+                # @flyc.jit returning the branch tuple was TESTED and drifts the
+                # gfx1250 ISA hard (1599 -> 870 lines, wholesale reschedule) --
+                # not byte-exact, so the raw IfOp stays.
                 is_phase2_nonempty = arith.cmpi(
                     CmpIPredicate.slt,
                     _to_raw(window_len),
@@ -909,22 +898,16 @@ def _build_kernel(
                         )
                     else:
                         # dwords > 4 (VEC=16 -> dwords=8): split into 2x dwordx4.
-                        # raw: extract_strided_slice has no fx.Vector slice form.
                         c4_i32 = arith.constant(4, type=i32)
-                        bf16_as_i32_r = _to_raw(bf16_as_i32)
-                        lo = vector.extract_strided_slice(
-                            T.vec(4, T.i32),
-                            bf16_as_i32_r,
-                            offsets=[0],
-                            sizes=[4],
-                            strides=[1],
+                        lo = _to_raw(
+                            fx.Vector.from_elements(
+                                [bf16_as_i32[i] for i in range(4)], dtype=fx.Int32
+                            )
                         )
-                        hi = vector.extract_strided_slice(
-                            T.vec(4, T.i32),
-                            bf16_as_i32_r,
-                            offsets=[4],
-                            sizes=[4],
-                            strides=[1],
+                        hi = _to_raw(
+                            fx.Vector.from_elements(
+                                [bf16_as_i32[i] for i in range(4, 8)], dtype=fx.Int32
+                            )
                         )
                         buffer_ops.buffer_store(lo, out_rsrc, cache_off_dw)
                         buffer_ops.buffer_store(
@@ -1136,13 +1119,7 @@ def _build_kernel(
 
                     if const_expr(VEC == 2):
                         # Only even tid stores (its dword covers peer's bytes too).
-                        is_even = arith.cmpi(
-                            CmpIPredicate.eq,
-                            arith.andi(_to_raw(tid), arith.constant(1, type=i32)),
-                            arith.constant(0, type=i32),
-                        )
-                        _if_even = scf.IfOp(is_even)
-                        with _if_then(_if_even):
+                        if (fx.Int32(tid) & 1) == 0:
                             buffer_ops.buffer_store(
                                 dword,
                                 out_rsrc,
@@ -1427,9 +1404,9 @@ def _build_kernel_ksplit(
         position = _to_raw(plan_vec[2])
         window_len = _to_raw(plan_vec[3])
 
-        is_active = (fx.Int32(position) >= 0).ir_value()
-        _if_active = scf.IfOp(is_active)
-        with _if_then(_if_active):
+        # Sentinel-skip: guard the whole body on position >= 0 (same scf.if
+        # the raw IfOp built; a bare `if cond: return` would not early-exit).
+        if fx.Int32(position) >= 0:
             slot_map_rsrc = buffer_ops.create_buffer_resource(
                 state_slot_mapping, max_size=True
             )
@@ -1664,9 +1641,7 @@ def _build_kernel_ksplit(
             gpu.barrier()
 
             # ---- wave 0: cross-wave reduce + norm + rope + scatter ----
-            is_wave0 = (fx.Int32(wid) == 0).ir_value()
-            _if_w0 = scf.IfOp(is_wave0)
-            with _if_then(_if_w0):
+            if fx.Int32(wid) == 0:
                 comp_lane = []
                 for i in range_constexpr(VEC):
                     lane_off = lid_x_vec + i
@@ -1850,22 +1825,16 @@ def _build_kernel_ksplit(
                         )
                     else:
                         # dwords > 4 (VEC=16 -> dwords=8): split into 2x dwordx4.
-                        # raw: extract_strided_slice has no fx.Vector slice form.
                         c4_i32 = arith.constant(4, type=i32)
-                        bf16_as_i32_r = _to_raw(bf16_as_i32)
-                        lo = vector.extract_strided_slice(
-                            T.vec(4, T.i32),
-                            bf16_as_i32_r,
-                            offsets=[0],
-                            sizes=[4],
-                            strides=[1],
+                        lo = _to_raw(
+                            fx.Vector.from_elements(
+                                [bf16_as_i32[i] for i in range(4)], dtype=fx.Int32
+                            )
                         )
-                        hi = vector.extract_strided_slice(
-                            T.vec(4, T.i32),
-                            bf16_as_i32_r,
-                            offsets=[4],
-                            sizes=[4],
-                            strides=[1],
+                        hi = _to_raw(
+                            fx.Vector.from_elements(
+                                [bf16_as_i32[i] for i in range(4, 8)], dtype=fx.Int32
+                            )
                         )
                         buffer_ops.buffer_store(lo, out_rsrc, cache_off_dw)
                         buffer_ops.buffer_store(
@@ -2008,13 +1977,8 @@ def _build_kernel_ksplit(
                     byte_off = in_block_off
 
                     if const_expr(VEC == 2):
-                        is_even = arith.cmpi(
-                            CmpIPredicate.eq,
-                            arith.andi(_to_raw(lid), arith.constant(1, type=i32)),
-                            arith.constant(0, type=i32),
-                        )
-                        _if_even = scf.IfOp(is_even)
-                        with _if_then(_if_even):
+                        # Only even lid stores (its dword covers peer's bytes too).
+                        if (fx.Int32(lid) & 1) == 0:
                             buffer_ops.buffer_store(
                                 dword, out_rsrc, byte_off, offset_is_bytes=True
                             )
