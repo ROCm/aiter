@@ -1914,5 +1914,16 @@
         "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": "''"
+    },
+    "module_fused_moe_router": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/fused_moe_router_entry.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
     }
 }

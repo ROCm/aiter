@@ -112,6 +112,7 @@ else:
     from .ops.moe_op import *
     from .ops.moe_sorting import *
     from .ops.moe_sorting_opus import *
+    from .ops.fused_moe_router import *
     from .ops.moe_mxfp4_aux import *
     from .ops.mla_sparse_prefill import *
     from .ops.pa_sparse_prefill_opus import *
