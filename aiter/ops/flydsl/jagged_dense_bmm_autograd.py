@@ -32,6 +32,7 @@ import torch
 
 from .jagged_dense_bmm_bwd_dispatch import jagged_dense_bmm_bwd_dispatched
 from .jagged_dense_bmm_dispatch import jagged_dense_bmm_dispatched
+from .jagged_dense_bmm_validation import validate_jdbba_autograd_inputs
 from .kernels.jagged_dense_bmm_gen import BLOCK_M as _FWD_BLOCK_M
 
 __all__ = ["jagged_dense_bmm_autograd"]
@@ -138,22 +139,7 @@ def jagged_dense_bmm_autograd(
         n_groups = dense.shape[0]
     n_groups = int(n_groups)
 
-    if dense.ndim != 3 or dense.shape[1] != dense.shape[2]:
-        raise ValueError(
-            f"dense must be (n_groups, D, D) with a square dense dim; got {tuple(dense.shape)}."
-        )
-    if dense.shape[0] != n_groups:
-        raise ValueError(f"dense.shape[0]={dense.shape[0]} != n_groups={n_groups}.")
-    if bias.shape != (n_groups, dense.shape[2]):
-        raise ValueError(
-            f"bias must be (n_groups, N)=({n_groups}, {dense.shape[2]}); got {tuple(bias.shape)}."
-        )
-    if seq_offsets.numel() != n_groups + 1:
-        raise ValueError(
-            f"seq_offsets must have n_groups+1={n_groups + 1} entries, got {seq_offsets.numel()}."
-        )
-    if seq_offsets.dtype != torch.int32:
-        raise ValueError(f"seq_offsets must be int32, got {seq_offsets.dtype}.")
+    validate_jdbba_autograd_inputs(jagged, dense, bias, seq_offsets, n_groups)
 
     if max_seq_len is None:
         max_seq_len = int((seq_offsets[1:] - seq_offsets[:-1]).max().item())
