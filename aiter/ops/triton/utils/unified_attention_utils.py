@@ -60,9 +60,7 @@ def _get_unified_attention_config_cached(
         len(bounds) > 0
         and all(x > 0 for x in bounds)
         and all(x < y for x, y in itertools.pairwise(bounds))
-    ), (
-        "When provided, bounds must be a non-empty tuple of strictly increasing positive numbers"
-    )
+    ), "When provided, bounds must be a non-empty tuple of strictly increasing positive numbers"
 
     config_name = "UNIFIED-ATTENTION"
     q_tag, kv_tag = get_dtype_str(q_dtype), get_dtype_str(kv_dtype)

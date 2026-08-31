@@ -113,9 +113,12 @@ class _UAParams(NamedTuple):
 
 
 def config_key(params: _UAParams, op: str) -> str:
-    assert op in ("attn_2d", "attn_3d", "reduce", "kv_split"), (
-        f"Unknown config op '{op}'"
-    )
+    assert op in (
+        "attn_2d",
+        "attn_3d",
+        "reduce",
+        "kv_split",
+    ), f"Unknown config op '{op}'"
 
     if op == "attn_2d":
         if not params.all_decode:
@@ -209,9 +212,9 @@ def unified_attention(
         "gluon",
     ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
     if backend == "gluon":
-        assert _is_gluon_available(), (
-            f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
-        )
+        assert (
+            _is_gluon_available()
+        ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
 
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
@@ -503,9 +506,9 @@ def _unified_attention_2d_triton(params: _UAParams):
     if params.shuffled_kv_cache and (
         params.q_dtype == e4m3_dtype and params.kv_cache_dtype == e4m3_dtype
     ):
-        assert params.block_size >= 32, (
-            "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
-        )
+        assert (
+            params.block_size >= 32
+        ), "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
 
     config, _ = get_unified_attention_config(
         "attn_2d",
@@ -773,9 +776,9 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
     if not params.shuffled_kv_cache or TILE_SIZE < params.block_size:
         TILE_SIZE = params.block_size
     num_kv_blocks = TILE_SIZE // params.block_size
-    assert num_kv_blocks & (num_kv_blocks - 1) == 0, (
-        f"TILE_SIZE={TILE_SIZE} must be a power-of-2 multiple of PAGE_SIZE={params.block_size}"
-    )
+    assert (
+        num_kv_blocks & (num_kv_blocks - 1) == 0
+    ), f"TILE_SIZE={TILE_SIZE} must be a power-of-2 multiple of PAGE_SIZE={params.block_size}"
 
     # the loop variants other than 0 mask at most twice at the end of the loop,
     # and need a tile wider than 32
@@ -908,12 +911,12 @@ def _unified_attention_3d_gfx1250(
         max_num_blocks_per_seq=params.block_table.shape[1],
         query_stride_0=params.q.stride(0),
         query_stride_1=params.q.stride(1),
-        query_scales_stride_0=params.q_scales.stride(0)
-        if params.q_scales is not None
-        else 0,
-        query_scales_stride_1=params.q_scales.stride(1)
-        if params.q_scales is not None
-        else 0,
+        query_scales_stride_0=(
+            params.q_scales.stride(0) if params.q_scales is not None else 0
+        ),
+        query_scales_stride_1=(
+            params.q_scales.stride(1) if params.q_scales is not None else 0
+        ),
         qq_bias_stride_0=params.qq_bias.stride(0) if params.use_qq_bias else 0,
         BLOCK_SIZE=params.block_size,
         HEAD_SIZE=params.head_size,
