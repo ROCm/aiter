@@ -2,11 +2,26 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 
+import torch
 from torch import Tensor
 
 from ..jit.core import compile_ops
 
 FUSED_QKNORM_IDXRQKNORM_SUPPORTS_PACKED_SHUFFLE = True
+FUSED_QKNORM_IDXRQKNORM_SUPPORTS_FP8_INDEX_Q = True
+
+_FP8_E4M3_DTYPES = tuple(
+    dt
+    for dt in (
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+    )
+    if dt is not None
+)
+
+
+def _is_fp8_e4m3_tensor(t: Tensor | None) -> bool:
+    return t is not None and t.dtype in _FP8_E4M3_DTYPES
 
 
 @compile_ops(
@@ -81,7 +96,7 @@ def fused_qknorm_idxrqknorm(
     if index_cache_dtype is None:
         index_cache_dtype = (
             "fp8"
-            if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8")
+            if _is_fp8_e4m3_tensor(index_cache) or _is_fp8_e4m3_tensor(index_q_out)
             else "auto"
         )
 

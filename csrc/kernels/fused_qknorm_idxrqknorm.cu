@@ -102,6 +102,29 @@ __device__ __forceinline__ void storeCacheElems(cache_t* __restrict__ dst,
     }
 }
 
+// index_q gather: qkv dtype, or unit-scale e4m3 (4787's q_idx contract; no scale tensor).
+template <typename scalar_t>
+__device__ __forceinline__ void storeIndexQElems(scalar_t* __restrict__ index_q_out,
+                                                 opus::fp8_t* __restrict__ index_q_fp8_out,
+                                                 const float (&elems)[kElemsPerLane],
+                                                 int64_t token_idx,
+                                                 int niq,
+                                                 int iq_head,
+                                                 int dim_base)
+{
+    const int64_t off = token_idx * static_cast<int64_t>(niq) * kHeadDim +
+                        static_cast<int64_t>(iq_head) * kHeadDim + dim_base;
+    if(index_q_fp8_out != nullptr)
+    {
+        storeCacheElems<scalar_t, opus::fp8_t, vllm::Fp8KVCacheDataType::kFp8E4M3>(
+            index_q_fp8_out + off, elems, 1.0f);
+    }
+    else if(index_q_out != nullptr)
+    {
+        storeElems(index_q_out + off, elems);
+    }
+}
+
 template <typename scalar_t, typename cache_t, vllm::Fp8KVCacheDataType kv_dt>
 __device__ __forceinline__ void copyOrQuantizeCacheElems(const scalar_t* __restrict__ src,
                                                          cache_t* __restrict__ dst,
@@ -213,6 +236,7 @@ __global__ void fusedQKNormIdxrQKNormKernel(
     scalar_t* __restrict__ qkv,
     scalar_t* __restrict__ q_out,
     scalar_t* __restrict__ index_q_out,
+    opus::fp8_t* __restrict__ index_q_fp8_out,
     const scalar_t* __restrict__ q_norm_w,
     const scalar_t* __restrict__ k_norm_w,
     const scalar_t* __restrict__ iq_norm_w,
@@ -333,14 +357,6 @@ __global__ void fusedQKNormIdxrQKNormKernel(
     {
         store_ptr = q_out + static_cast<int64_t>(token_idx) * nq * kHeadDim + slot * kHeadDim;
     }
-    else if constexpr(kProcessIndex)
-    {
-        if(is_iq && index_q_out != nullptr)
-        {
-            store_ptr = index_q_out + static_cast<int64_t>(token_idx) * niq * kHeadDim +
-                        (slot - iq_begin) * kHeadDim;
-        }
-    }
 
     int64_t mapped_slot = -1;
     if constexpr(kInsertKV)
@@ -431,9 +447,22 @@ __global__ void fusedQKNormIdxrQKNormKernel(
 
     if constexpr(kInsertKV)
     {
-        if(is_q || (kProcessIndex && is_iq))
+        if(is_q)
         {
             storeElems(store_ptr + dim_base, elems);
+        }
+        if constexpr(kProcessIndex)
+        {
+            if(is_iq)
+            {
+                storeIndexQElems(index_q_out,
+                                 index_q_fp8_out,
+                                 elems,
+                                 token_idx,
+                                 niq,
+                                 slot - iq_begin,
+                                 dim_base);
+            }
         }
 
         if(mapped_slot >= 0)
@@ -510,6 +539,20 @@ __global__ void fusedQKNormIdxrQKNormKernel(
     }
     else
     {
+        if constexpr(kProcessIndex)
+        {
+            if(is_iq)
+            {
+                storeIndexQElems(index_q_out,
+                                 index_q_fp8_out,
+                                 elems,
+                                 token_idx,
+                                 niq,
+                                 slot - iq_begin,
+                                 dim_base);
+                return;
+            }
+        }
         storeElems(store_ptr + dim_base, elems);
     }
 }
@@ -523,6 +566,7 @@ void launchFusedQKNormIdxrQKNorm(
     scalar_t* qkv,
     scalar_t* q_out,
     scalar_t* index_q_out,
+    opus::fp8_t* index_q_fp8_out,
     const scalar_t* q_norm_w,
     const scalar_t* k_norm_w,
     const scalar_t* iq_norm_w,
@@ -586,6 +630,7 @@ void launchFusedQKNormIdxrQKNorm(
         <<<grid, kBlockSize, 0, stream>>>(qkv,                                               \
                                           q_out,                                             \
                                           index_q_out,                                       \
+                                          index_q_fp8_out,                                   \
                                           q_norm_w,                                          \
                                           k_norm_w,                                          \
                                           iq_norm_w,                                         \
@@ -1007,9 +1052,11 @@ static void fused_qknorm_idxrqknorm_impl(
     if(index_q_out.has_value())
     {
         AITER_CHECK(has_index, "index_q_out requires num_index_heads > 0");
+        const bool index_q_is_fp8 = index_q_out->dtype() == AITER_DTYPE_fp8 ||
+                                    index_q_out->dtype() == AITER_DTYPE_u8;
         AITER_CHECK(index_q_out->is_gpu() && index_q_out->is_contiguous() &&
-                        index_q_out->dtype() == qkv.dtype(),
-                    "index_q_out must be contiguous CUDA and match qkv dtype");
+                        (index_q_out->dtype() == qkv.dtype() || index_q_is_fp8),
+                    "index_q_out must be contiguous CUDA and match qkv dtype or fp8 e4m3");
         AITER_CHECK(index_q_out->numel() == static_cast<int64_t>(num_tokens) * niq * kHeadDim,
                     "index_q_out must have num_tokens * num_index_heads * 128 elements");
     }
@@ -1019,6 +1066,15 @@ static void fused_qknorm_idxrqknorm_impl(
 
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(qkv.dtype(), "fused_qknorm_idxrqknorm", [&] {
         using T = scalar_t;
+        const bool index_q_is_fp8 =
+            index_q_out.has_value() && (index_q_out->dtype() == AITER_DTYPE_fp8 ||
+                                        index_q_out->dtype() == AITER_DTYPE_u8);
+        T* index_q_ptr = (!index_q_is_fp8 && index_q_out.has_value())
+                             ? reinterpret_cast<T*>(index_q_out->data_ptr())
+                             : nullptr;
+        opus::fp8_t* index_q_fp8_ptr =
+            index_q_is_fp8 ? reinterpret_cast<opus::fp8_t*>(index_q_out->data_ptr())
+                           : nullptr;
         if(fp8_kv_cache)
         {
             if(fp8_index_cache)
@@ -1030,8 +1086,8 @@ static void fused_qknorm_idxrqknorm_impl(
                                             vllm::Fp8KVCacheDataType::kFp8E4M3>(
                 reinterpret_cast<T*>(qkv.data_ptr()),
                 q_out.has_value() ? reinterpret_cast<T*>(q_out->data_ptr()) : nullptr,
-                index_q_out.has_value() ? reinterpret_cast<T*>(index_q_out->data_ptr())
-                                        : nullptr,
+                index_q_ptr,
+                index_q_fp8_ptr,
                 reinterpret_cast<const T*>(q_norm_weight.data_ptr()),
                 reinterpret_cast<const T*>(k_norm_weight.data_ptr()),
                 process_index ? reinterpret_cast<const T*>(index_q_norm_weight->data_ptr())
@@ -1087,8 +1143,8 @@ static void fused_qknorm_idxrqknorm_impl(
                                             vllm::Fp8KVCacheDataType::kAuto>(
                 reinterpret_cast<T*>(qkv.data_ptr()),
                 q_out.has_value() ? reinterpret_cast<T*>(q_out->data_ptr()) : nullptr,
-                index_q_out.has_value() ? reinterpret_cast<T*>(index_q_out->data_ptr())
-                                        : nullptr,
+                index_q_ptr,
+                index_q_fp8_ptr,
                 reinterpret_cast<const T*>(q_norm_weight.data_ptr()),
                 reinterpret_cast<const T*>(k_norm_weight.data_ptr()),
                 process_index ? reinterpret_cast<const T*>(index_q_norm_weight->data_ptr())
@@ -1147,8 +1203,8 @@ static void fused_qknorm_idxrqknorm_impl(
                                             vllm::Fp8KVCacheDataType::kFp8E4M3>(
                 reinterpret_cast<T*>(qkv.data_ptr()),
                 q_out.has_value() ? reinterpret_cast<T*>(q_out->data_ptr()) : nullptr,
-                index_q_out.has_value() ? reinterpret_cast<T*>(index_q_out->data_ptr())
-                                        : nullptr,
+                index_q_ptr,
+                index_q_fp8_ptr,
                 reinterpret_cast<const T*>(q_norm_weight.data_ptr()),
                 reinterpret_cast<const T*>(k_norm_weight.data_ptr()),
                 process_index ? reinterpret_cast<const T*>(index_q_norm_weight->data_ptr())
@@ -1200,8 +1256,8 @@ static void fused_qknorm_idxrqknorm_impl(
                                             vllm::Fp8KVCacheDataType::kAuto>(
                 reinterpret_cast<T*>(qkv.data_ptr()),
                 q_out.has_value() ? reinterpret_cast<T*>(q_out->data_ptr()) : nullptr,
-                index_q_out.has_value() ? reinterpret_cast<T*>(index_q_out->data_ptr())
-                                        : nullptr,
+                index_q_ptr,
+                index_q_fp8_ptr,
                 reinterpret_cast<const T*>(q_norm_weight.data_ptr()),
                 reinterpret_cast<const T*>(k_norm_weight.data_ptr()),
                 process_index ? reinterpret_cast<const T*>(index_q_norm_weight->data_ptr())
