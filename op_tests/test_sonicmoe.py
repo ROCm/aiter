@@ -13,7 +13,6 @@ Usage:
 import argparse
 
 import pytest
-
 import torch
 import torch.nn.functional as F
 from triton.testing import do_bench

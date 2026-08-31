@@ -39,7 +39,11 @@ if quant is not None:
 try:
     from .cross_entropy import (
         cross_entropy_backward as cross_entropy_backward,
+    )
+    from .cross_entropy import (
         cross_entropy_forward as cross_entropy_forward,
+    )
+    from .cross_entropy import (
         cross_entropy_forward_chunked as cross_entropy_forward_chunked,
     )
 
