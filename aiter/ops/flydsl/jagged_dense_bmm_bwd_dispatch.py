@@ -348,52 +348,54 @@ def jagged_dense_bmm_bwd_dispatched(
         if stream is None:
             stream = torch.cuda.current_stream(device=device)
 
-        tDOut = flyc.from_dlpack(d_out).mark_layout_dynamic(
-            leading_dim=1, divisibility=8
-        )
+        # Pin alloc/materialization and launches to the same stream so an explicit
+        # stream= cannot race ahead of a dense .contiguous() on the current stream.
+        with torch.cuda.stream(stream):
+            tDOut = flyc.from_dlpack(d_out).mark_layout_dynamic(
+                leading_dim=1, divisibility=8
+            )
 
-        # Grad outputs are allocated fresh per call (mirrors how torch.autograd invokes
-        # a backward — it allocates the returned grads each step rather than reusing
-        # buffers). They use torch.empty, NOT torch.zeros: the kernels fully overwrite
-        # every returned element (grad_jagged writes all L packed rows over all K cols;
-        # grad_dense_bias writes every (b,k,n)/(b,n), storing an explicit 0 for empty
-        # groups), so a zero-init memset (multi-GB at the largest deployment shape) would be
-        # pure overhead. The d_jagged padding rows [L:L+BLOCK_M] are never returned.
+            # Grad outputs are allocated fresh per call (mirrors how torch.autograd invokes
+            # a backward — it allocates the returned grads each step rather than reusing
+            # buffers). They use torch.empty, NOT torch.zeros: the kernels fully overwrite
+            # every returned element (grad_jagged writes all L packed rows over all K cols;
+            # grad_dense_bias writes every (b,k,n)/(b,n), storing an explicit 0 for empty
+            # groups), so a zero-init memset (multi-GB at the largest deployment shape) would be
+            # pure overhead. The d_jagged padding rows [L:L+BLOCK_M] are never returned.
 
-        # --- dJagged: RHS is Dense[b] in its plain (K, N) layout, flattened tall. ---
-        # reshape is a view; .contiguous() is a no-op for the usual contiguous (B,K,N)
-        # weight (no copy), so this adds no real per-call cost.
-        dense_kn = dense.reshape(n_groups * K, N).contiguous()
-        d_jagged = torch.empty(
-            total_rows + BLOCK_M, K, dtype=torch.bfloat16, device=device
-        )
-        tDJ = flyc.from_dlpack(d_jagged).mark_layout_dynamic(
-            leading_dim=1, divisibility=8
-        )
-        bw.grad_jagged(
-            tDJ, tDOut, dense_kn, seq_offsets, n_groups, max_seq_len, stream=stream
-        )
+            # --- dJagged: RHS is Dense[b] in its plain (K, N) layout, flattened tall. ---
+            # reshape is a view; .contiguous() is a no-op for validated contiguous (B,K,N).
+            dense_kn = dense.reshape(n_groups * K, N).contiguous()
+            d_jagged = torch.empty(
+                total_rows + BLOCK_M, K, dtype=torch.bfloat16, device=device
+            )
+            tDJ = flyc.from_dlpack(d_jagged).mark_layout_dynamic(
+                leading_dim=1, divisibility=8
+            )
+            bw.grad_jagged(
+                tDJ, tDOut, dense_kn, seq_offsets, n_groups, max_seq_len, stream=stream
+            )
 
-        # --- dDense (+ fused dBias): split-reduction over the sequence axis m. ---
-        d_dense = torch.empty(n_groups, K, N, dtype=torch.bfloat16, device=device)
-        d_bias = torch.empty(n_groups, N, dtype=torch.bfloat16, device=device)
-        dense_partials, bias_partials = _get_scratch(
-            n_groups, K, N, SPLIT, device, stream
-        )
-        tJagged = flyc.from_dlpack(jagged).mark_layout_dynamic(
-            leading_dim=1, divisibility=8
-        )
-        bw.grad_dense_bias(
-            d_dense.view(n_groups * K, N),
-            d_bias,
-            tJagged,
-            tDOut,
-            seq_offsets,
-            dense_partials,
-            bias_partials,
-            n_groups,
-            max_seq_len,
-            stream=stream,
-        )
+            # --- dDense (+ fused dBias): split-reduction over the sequence axis m. ---
+            d_dense = torch.empty(n_groups, K, N, dtype=torch.bfloat16, device=device)
+            d_bias = torch.empty(n_groups, N, dtype=torch.bfloat16, device=device)
+            dense_partials, bias_partials = _get_scratch(
+                n_groups, K, N, SPLIT, device, stream
+            )
+            tJagged = flyc.from_dlpack(jagged).mark_layout_dynamic(
+                leading_dim=1, divisibility=8
+            )
+            bw.grad_dense_bias(
+                d_dense.view(n_groups * K, N),
+                d_bias,
+                tJagged,
+                tDOut,
+                seq_offsets,
+                dense_partials,
+                bias_partials,
+                n_groups,
+                max_seq_len,
+                stream=stream,
+            )
 
-        return d_jagged[:total_rows], d_dense, d_bias
+            return d_jagged[:total_rows], d_dense, d_bias
