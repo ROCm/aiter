@@ -122,7 +122,6 @@ def compile_gemm2_a4w4_port(
     SBM=None,
     persist=False,
     cu_num=0,
-    has_pad=False,
     g2_bhoist=None,
     g2_ascale_pf=None,
     g2_spart=None,
@@ -220,9 +219,6 @@ def compile_gemm2_a4w4_port(
             "Use persist only with a_dtype='fp4', or run a8w4 with persist=False."
         )
     persist_tag = "" if not persist else f"_persist_cu{cu_num}"
-    pad_tag = (
-        "_pad" if has_pad else ""
-    )  # has_pad adds the runtime pad kernarg + weight-OOB pad-skip
     bh_tag = "_bhoist" if g2_bhoist else ""
     apf_tag = "_apf" if g2_ascale_pf else ""
     spart_tag = f"_spart{g2_group_num}x{g2_m01}" if g2_spart > 0 else ""
@@ -237,7 +233,7 @@ def compile_gemm2_a4w4_port(
     tile_tag = "" if (BN, BK) == (256, 256) else f"_bn{BN}_bk{BK}"
     bias_tag = "_bias" if enable_bias else ""
     g2_epi_lanes = _pick_epi_lanes(BM, BN, route_out_fp8, g2_scale_blk)
-    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{persist_tag}{pad_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{dw_tag}{kst_tag}{pitch_tag}{sblk_tag}{out_tag}{bias_tag}_v2_biasabi6"
+    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{persist_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{dw_tag}{kst_tag}{pitch_tag}{sblk_tag}{out_tag}{bias_tag}_v2_biasabi7"
     name = f"gemm2_a4w4_port_{tag}"
 
     @fx.struct
@@ -263,11 +259,8 @@ def compile_gemm2_a4w4_port(
         i32_max_m_blocks,
         i32_inter,
         i32_hidden,
-        i32_kpad,
-        i32_npad,
         i32_grid_blocks,
     ):
-        # Shared body for both has_pad variants (@flyc.jit -> rewriter recurses scf if / grid-stride); default passes i32_kpad/i32_npad=0 (no kernarg), folding pad math away.
         num_n_blocks = _udiv(i32_hidden, BN)
         k_bytes = _udiv(i32_inter, 1 if is_f8 else 2)
         aq_num = fx.Int64(i32_max_m_blocks) * fx.Int64(BM * k_bytes)
@@ -311,8 +304,6 @@ def compile_gemm2_a4w4_port(
                 arg_aq,
                 i32_inter,
                 i32_hidden,
-                i32_kpad,
-                i32_npad,
                 BM=BM,
                 BN=BN,
                 BK=BK,
@@ -325,7 +316,6 @@ def compile_gemm2_a4w4_port(
                 b_dtype=b_dtype,
                 use_reduce=use_reduce,
                 topk=topk,
-                has_pad=has_pad,
                 SBM=SBM,
                 g2_bhoist=g2_bhoist,
                 g2_ascale_pf=g2_ascale_pf,
@@ -409,8 +399,6 @@ def compile_gemm2_a4w4_port(
         i32_max_m_blocks: fx.Int32,
         i32_inter: fx.Int32,
         i32_hidden: fx.Int32,
-        i32_kpad: fx.Int32,
-        i32_npad: fx.Int32,
         arg_out: fx.Int64,
         arg_out_scale: fx.Int64,  # unused (atomic epilog); kept for signature parity
         i32_grid_blocks: fx.Int32,
@@ -439,8 +427,6 @@ def compile_gemm2_a4w4_port(
             i32_max_m_blocks,
             i32_inter,
             i32_hidden,
-            i32_kpad,
-            i32_npad,
             i32_grid_blocks,
         )
 
@@ -460,8 +446,6 @@ def compile_gemm2_a4w4_port(
         i32_grid_blocks: fx.Int32,
         i32_inter: fx.Int32,
         i32_hidden: fx.Int32,
-        i32_kpad: fx.Int32,
-        i32_npad: fx.Int32,
         arg_out: fx.Int64,
         arg_out_scale: fx.Int64,
         stream: fx.Stream,
@@ -483,8 +467,6 @@ def compile_gemm2_a4w4_port(
             i32_max_m_blocks,
             i32_inter,
             i32_hidden,
-            i32_kpad,
-            i32_npad,
             arg_out,
             arg_out_scale,
             i32_grid_blocks,
@@ -511,7 +493,6 @@ def get_g2(
     SBM=None,
     persist=False,
     cu_num=0,
-    has_pad=False,
     out_dtype="bf16",
     g2_bf16_lds=None,
     g2_spart=None,
@@ -549,7 +530,6 @@ def get_g2(
         SBM,
         persist,
         cu_key,
-        has_pad,
         g2_bhoist,
         g2_ascale_pf,
         g2_spart,
@@ -574,7 +554,6 @@ def get_g2(
             SBM=SBM,
             persist=persist,
             cu_num=cu_key,
-            has_pad=has_pad,
             g2_bhoist=g2_bhoist,
             g2_ascale_pf=g2_ascale_pf,
             g2_spart=g2_spart,
@@ -615,8 +594,6 @@ def mxfp4_moe_gemm2(
     persist=False,
     cu_num=0,
     n_sorted_padded=None,
-    inter_dim_pad=0,
-    model_dim_pad=0,
     out_dtype="bf16",
     HIDDEN_MAX=8192,
     INTER_MAX=8192,
@@ -625,14 +602,13 @@ def mxfp4_moe_gemm2(
     stream=None,
     bias=None,
 ):
-    """Stage-2 down-proj gemm; epilog 'atomic' (weighted atomic.fadd) or 'reduce' (store into out[token_id*topk+slot]). inter_dim_pad/model_dim_pad>0 enable has_pad pad-skip (both 0 -> byte-identical); persist = fixed cu_num m-slot grid (default OFF)."""
+    """Stage-2 down-proj gemm for unpadded dimensions."""
     import torch
 
     _validate_v2_gemm2_dtypes(a_dtype, b_dtype)
     if persist and cu_num <= 0:
         cu_num = get_cu_num()
     SBM = _norm_sbm(SBM, BM)
-    has_pad = inter_dim_pad > 0 or model_dim_pad > 0
     if BN not in (128, 256, 512):
         raise AssertionError(f"BN must be one of (128, 256, 512), got {BN}")
     if BK not in (128, 256):
@@ -690,7 +666,6 @@ def mxfp4_moe_gemm2(
         SBM=SBM,
         persist=persist,
         cu_num=cu_num,
-        has_pad=has_pad,
         out_dtype=out_dtype,
         g2_bf16_lds=g2_bf16_lds,
         g2_spart=g2_spart,
@@ -708,8 +683,6 @@ def mxfp4_moe_gemm2(
             _active_m_blocks_upper_bound(M_logical, topk, NE, BM, SBM),
         )
     out_scale = out  # unused by the atomic epilog; any valid device ptr is fine
-    # i32_kpad (inter_dim_pad) + i32_npad (model_dim_pad) are always threaded after
-    # i32_hidden; when has_pad is False they are 0 and the kernel folds pad math away.
     run_compiled(
         launch,
         inter_sorted_quant.data_ptr(),
@@ -726,8 +699,6 @@ def mxfp4_moe_gemm2(
         grid_blocks,
         D_INTER,
         D_HIDDEN,
-        int(inter_dim_pad),
-        int(model_dim_pad),
         out.data_ptr(),
         out_scale.data_ptr(),
         torch.cuda.current_stream() if stream is None else stream,

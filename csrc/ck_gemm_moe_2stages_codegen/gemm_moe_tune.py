@@ -1113,8 +1113,6 @@ class FmoeTuner(TunerCommon):
             SBM=sbm,
             persist=kparams["persist"],
             n_sorted_padded=n,
-            model_dim_pad=0,
-            inter_dim_pad=0,
         )
         if epilog == "reduce":
             from aiter.ops.flydsl.moe_kernels import _run_moe_reduction

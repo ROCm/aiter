@@ -49,9 +49,8 @@ def bq_view(
     KH4,
     K_TILES_TOTAL,
     K_HALVES,
-    num_records_bytes=None,
 ):
-    """Layout view over preshuffled B for one N-row tile; slice -> i32<4:1> (16B=32 fp4). num_records_bytes (has_pad pad-skip) sizes to REAL K; None -> max_size=False byte-identical default."""
+    """Layout view over preshuffled B for one N-row tile."""
     col_base = rocdl.readfirstlane(T.i32, _raw(row_elems) * fx.Int32(KH4))
     i32_ptr_ty = fx.PointerType.get(
         T.i32, address_space=fx.AddressSpace.Global, alignment=16
@@ -67,8 +66,6 @@ def bq_view(
             fx.make_layout(shape, (64, 4, K_HALVES * 256, 256, 1)),
         )
     )
-    if num_records_bytes is not None:
-        return fx.rocdl.make_buffer_tensor(view, num_records_bytes=num_records_bytes)
     return fx.rocdl.make_buffer_tensor(view, max_size=False)
 
 
@@ -78,7 +75,6 @@ def bq_view_fp8(
     KH4,
     K_TILES_TOTAL,
     K_HALVES,
-    num_records_bytes=None,
 ):
     """Layout view over preshuffled FP8 B; pair selects two 16B cells per MFMA."""
     base = bq_view(
@@ -87,7 +83,6 @@ def bq_view_fp8(
         KH4,
         K_TILES_TOTAL * 2,
         K_HALVES,
-        num_records_bytes=num_records_bytes,
     )
     shape = (4, 16, K_TILES_TOTAL, K_HALVES, 2, 4)
     stride = (64, 4, K_HALVES * 2 * 256, 2 * 256, 256, 1)
@@ -97,7 +92,7 @@ def bq_view_fp8(
 def scale_view(
     arg_scale, base_dw, K_TILES_TOTAL, k0_stride_dw=64, num_records_bytes=None
 ):
-    """Layout view over an e8m0 scale buffer (A-scale per 32-row chunk / B-scale per n-pack); slice -> i32<1:1> scale word. num_records_bytes (has_pad pad-skip) sizes to real extent; None -> max_size=False byte-identical default."""
+    """Layout view over an e8m0 scale buffer with an optional byte bound."""
     base_dw = rocdl.readfirstlane(T.i32, _raw(base_dw))
     i32_ptr_ty = fx.PointerType.get(
         T.i32, address_space=fx.AddressSpace.Global, alignment=4
@@ -235,8 +230,6 @@ def gemm2_body_v2(
     arg_aq,
     i32_inter,
     i32_hidden,
-    i32_kpad,
-    i32_npad,
     *,
     BM,
     BN=256,
@@ -250,7 +243,6 @@ def gemm2_body_v2(
     b_dtype,
     use_reduce=False,
     topk=1,
-    has_pad=False,
     SBM=None,
     mn_idx=None,
     g2_bhoist=True,
@@ -280,7 +272,6 @@ def gemm2_body_v2(
     is_f8_a = a_dtype == "fp8"  # only the A path differs
     is_f8_b = b_dtype == "fp8"
     B_NDW = 8 if is_f8_b else 4
-    B_PAIR = 2 if is_f8_b else 1
     a_pack = 1 if is_f8_a else 2
     KH_TILE_A = BK // a_pack
     slot_bytes = BM * KH_TILE_A
@@ -298,15 +289,6 @@ def gemm2_body_v2(
     KH4 = _udiv(K_rt, fx.Int32(4 if is_f8_b else 8))
     K_TILES_MAX = INTER_MAX // BK
     K_SCALE_CHUNKS_MAX = (INTER_MAX + 255) // 256
-
-    # has_pad OOB pad-skip (const_expr-gated): K-skip sizes 16N B-weight buffer to REAL K; N-skip zeros fully-pad-N w2 tiles (col >= N_real=N_OUT-npad; PERF-ONLY). B-scale NOT shrunk.
-    bq_num_records = None
-    N_real = None
-    if const_expr(has_pad):
-        K_real = K_rt - fx.Int32(i32_kpad)
-        halves_real = _udiv(K_real + fx.Int32(127), fx.Int32(128))
-        bq_num_records = halves_real * fx.Int32(1024 * B_PAIR)
-        N_real = N_OUT_rt - fx.Int32(i32_npad)
 
     # block -> (m_block_idx, n_block_idx); e = sorted_expert_ids[SBM-padded sort block] (SBM==BM: sort_block==m_block_idx).
     if const_expr(mn_idx is not None):
@@ -442,10 +424,6 @@ def gemm2_body_v2(
 
     def make_bq_view(j):
         col = n_block_idx * BN + wave * (BN // 4) + j * 16
-        nrec = bq_num_records
-        if const_expr(has_pad):
-            # N-skip: fully-pad-N tile (col >= 16-aligned N_real) -> 0 records so weight loads OOB -> 0.
-            nrec = (col < N_real).select(bq_num_records, fx.Int32(0))
         if const_expr(is_f8_b):
             return bq_view_fp8(
                 arg_bq,
@@ -453,7 +431,6 @@ def gemm2_body_v2(
                 KH4,
                 K_TILES_MAX,
                 kHalves,
-                num_records_bytes=nrec,
             )
         return bq_view(
             arg_bq,
@@ -461,7 +438,6 @@ def gemm2_body_v2(
             KH4,
             K_TILES_MAX,
             kHalves,
-            num_records_bytes=nrec,
         )
 
     bq_views = [make_bq_view(j) for j in range_constexpr(numAccN)]

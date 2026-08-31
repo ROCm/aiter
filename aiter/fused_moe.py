@@ -2003,8 +2003,6 @@ def _flydsl_v2_stage2_wrapper(
     a2_scale=None,
     sorted_weights=None,
     bias2=None,
-    inter_dim_pad: int = 0,
-    model_dim_pad: int = 0,
     block_m=None,
     expert_mask=None,
     topk_ids=None,
@@ -2103,8 +2101,6 @@ def _flydsl_v2_stage2_wrapper(
         epilog=epilog,
         SBM=sbm,
         persist=cfg["persist"],
-        inter_dim_pad=inter_dim_pad,
-        model_dim_pad=model_dim_pad,
         g2_bf16_lds=cfg["bf16_lds"],
         g2_spart=cfg["spart"],
         out_dtype="fp8" if _s2_fp8_inter else "bf16",
@@ -2605,8 +2601,6 @@ def get_2stage_cfgs(
                 model_dim=model_dim,
                 inter_dim=inter_dim,
                 num_experts=expert,
-                inter_dim_pad=intermediate_pad,
-                model_dim_pad=hidden_pad,
             )
         elif is_flydsl2:
             stage2_func = functools.partial(
