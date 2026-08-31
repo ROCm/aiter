@@ -39,14 +39,20 @@ _MORI_REGION_NAMES = {
     "xdb": "cross_device_barrier",
     # Only laid out on a quantizing wire; plan_api binds a missing region to 0 and
     # the kernel's `if constexpr` keeps that 0 from being read.
-    "outScales": "out_scales",
+    "outScales": "disp_out_scales",
 }
 
 
 @dataclass(frozen=True)
-class _Wire:
-    """One dispatch wire. Per token at hidden 7168: bf16 14336 B, fp8 7168 + 256,
+class _DispatchWire:
+    """One DISPATCH wire. Per token at hidden 7168: bf16 14336 B, fp8 7168 + 256,
     fp4 3584 + 256.
+
+    Dispatch-only on purpose: a quantized combine cannot reuse this. mori
+    carries no scales on a combine, the quant would have to happen inside the
+    gemm2 epilogue on an LDS tile rather than host-side on a whole tensor, and
+    recv_dtype exists only to build a torch view combine has no equivalent of.
+    Only payload_bytes would carry over.
     """
 
     payload_bytes: float  # PER FEATURE; fp4 packs two features into a byte
@@ -57,12 +63,12 @@ class _Wire:
     recv_dtype: torch.dtype
 
 
-_WIRES = {
-    "bf16": _Wire(2, torch.bfloat16, None, torch.bfloat16),
-    "fp8": _Wire(1, dtypes.fp8, dtypes.fp8, dtypes.fp8),
-    "fp4": _Wire(0.5, dtypes.fp4x2, dtypes.fp4x2, torch.uint8),
+_DISPATCH_WIRE_SPECS = {
+    "bf16": _DispatchWire(2, torch.bfloat16, None, torch.bfloat16),
+    "fp8": _DispatchWire(1, dtypes.fp8, dtypes.fp8, dtypes.fp8),
+    "fp4": _DispatchWire(0.5, dtypes.fp4x2, dtypes.fp4x2, torch.uint8),
 }
-_DISPATCH_WIRES = tuple(_WIRES)
+_DISPATCH_WIRES = tuple(_DISPATCH_WIRE_SPECS)
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -140,6 +146,9 @@ class MegaMoEStage2Config:
     max_tokens_per_rank: int
     experts_per_rank: int
     topk: int
+    # Dispatch (stage1) knobs. They live here because this package has no
+    # stage1 config yet -- dispatch and gemm1 are not fused. When that fusion
+    # lands they move together into whatever config it brings.
     dispatch_block_num: int | None = None
     dispatch_warp_num_per_block: int | None = None
     schedule: tuple | None = None
@@ -160,16 +169,17 @@ class MegaMoEStage2Config:
                 f"dispatch_wire must be one of {_DISPATCH_WIRES}, "
                 f"got {self.dispatch_wire!r}"
             )
-        if self.is_quant_wire and self.dispatch_backend != "mori":
+        if self.is_quant_dispatch_wire and self.dispatch_backend != "mori":
             # Only mori's kernel carries the scale row; this package's own
             # dispatch has no channel for it.
             raise ValueError(
                 f"dispatch_wire={self.dispatch_wire!r} requires "
                 f"dispatch_backend='mori' (got {self.dispatch_backend!r})"
             )
-        if self.is_quant_wire and self.hidden_dim % 32:
+        if self.is_quant_dispatch_wire and self.hidden_dim % 32:
             raise ValueError(
-                "one e8m0 scale covers 32 features, so a quantizing wire needs "
+                "one e8m0 scale covers 32 features, so a quantizing dispatch wire "
+                "needs "
                 f"hidden_dim % 32 == 0, got {self.hidden_dim}"
             )
         if self.dispatch_backend not in _DISPATCH_BACKENDS:
@@ -215,27 +225,28 @@ class MegaMoEStage2Config:
         return self.world_size * self.max_tokens_per_rank
 
     @property
-    def is_quant_wire(self) -> bool:
+    def is_quant_dispatch_wire(self) -> bool:
         """The wire carries an MX payload plus its e8m0 row, not bf16."""
         return self.dispatch_wire in ("fp8", "fp4")
 
     @property
-    def wire(self) -> "_Wire":
-        return _WIRES[self.dispatch_wire]
+    def dispatch_wire_spec(self) -> "_DispatchWire":
+        return _DISPATCH_WIRE_SPECS[self.dispatch_wire]
 
     @property
     def dispatch_token_nbytes(self) -> int:
-        return int(self.hidden_dim * self.wire.payload_bytes)
+        return int(self.hidden_dim * self.dispatch_wire_spec.payload_bytes)
 
     @property
-    def wire_elem_count(self) -> int:
+    def dispatch_wire_elem_count(self) -> int:
         """What mori's Cfg calls hidden_dim: ELEMENTS, at its own element size.
 
-        fp8 and fp4 both transport as one byte per element, so an fp4 wire has to
+        fp8 and fp4 both transport as one byte per element, so an fp4 dispatch
+        wire has to
         halve the count itself -- mori sizes the token as hidden_dim * elem_size
         and would otherwise move two bytes per packed byte.
         """
-        return self.dispatch_token_nbytes if self.is_quant_wire else self.hidden_dim
+        return self.dispatch_token_nbytes if self.is_quant_dispatch_wire else self.hidden_dim
 
     @property
     def combine_token_nbytes(self) -> int:
@@ -243,25 +254,25 @@ class MegaMoEStage2Config:
         return self.hidden_dim * 2
 
     @property
-    def scale_nbytes(self) -> int:
+    def dispatch_scale_nbytes(self) -> int:
         """Per-token e8m0 row as WE produce it: one byte per 32 features, packed.
 
         Handed to mori as-is. mori lays it down at its own, 128 B-aligned stride
-        (scale_dst_nbytes) because that is what keeps a TDM run's start aligned;
+        (dispatch_scale_dst_nbytes) because that is what keeps a TDM run's start aligned;
         that padding is mori's business, and the quant op's output can go straight
-        onto the wire without a repack.
+        onto the dispatch wire without a repack.
         """
-        return self.hidden_dim // 32 if self.is_quant_wire else 0
+        return self.hidden_dim // 32 if self.is_quant_dispatch_wire else 0
 
     @property
-    def scale_dst_nbytes(self) -> int:
+    def dispatch_scale_dst_nbytes(self) -> int:
         """The stride the rows ARRIVE at, which the receiving gather addresses by.
 
         Asked of mori rather than recomputed: it is the transport's layout
         decision, and a local copy of the rule would drift the first time the
         alignment changes.
         """
-        if not self.is_quant_wire:
+        if not self.is_quant_dispatch_wire:
             return 0
         try:
             from mori.ops.dispatch_combine_v2.hip_backend import scale_stride_bytes
@@ -274,7 +285,7 @@ class MegaMoEStage2Config:
                 "the installed one has no scale_stride_bytes"
             ) from e
 
-        return scale_stride_bytes(self.scale_nbytes)
+        return scale_stride_bytes(self.dispatch_scale_nbytes)
 
     @property
     def combine_slot_stride_bytes(self) -> int:
@@ -533,12 +544,12 @@ class MegaMoEGfx1250:
             recv_x = recv_x[:bound]
             recv_weights = recv_weights[:bound]
             recv_ids = recv_ids[:bound]
-        if self._config.is_quant_wire:
+        if self._config.is_quant_dispatch_wire:
             assert a1_scale is None, (
-                "a1_scale is produced by the quantizing wire itself; a "
+                "a1_scale is produced by the quantizing dispatch wire itself; a "
                 "caller-supplied one would be silently discarded"
             )
-            a1_scale = self._recv_scales()
+            a1_scale = self._recv_dispatch_scales()
             if recv_token_bound is not None:
                 a1_scale = a1_scale[: int(recv_token_bound)]
         extra = {}
@@ -598,8 +609,8 @@ class MegaMoEGfx1250:
                 *(
                     # Arrival stride, not the packed row: undersizing overruns
                     # the last slots.
-                    [("out_scales", max_recv * config.scale_dst_nbytes)]
-                    if config.scale_dst_nbytes
+                    [("disp_out_scales", max_recv * config.dispatch_scale_dst_nbytes)]
+                    if config.dispatch_scale_dst_nbytes
                     else []
                 ),
                 (
@@ -624,7 +635,7 @@ class MegaMoEGfx1250:
         self._dispatch_barrier = torch.zeros(1, dtype=torch.int32, device=device)
         # Points at the quant op's own scale rows, set per dispatch on a quantizing
         # wire; 0 (and unread) on bf16.
-        self._sent_scales_ptr = 0
+        self._dispatch_sent_scales_ptr = 0
         self._total_recv = torch.zeros(1, dtype=torch.int32, device=device)
         self._cross_device_flag = torch.ones(1, dtype=torch.int64, device=device)
         self._combine_output = torch.zeros(
@@ -721,22 +732,22 @@ class MegaMoEGfx1250:
                 "built by mori's CMake and is not shipped by every install"
             ) from error
 
-        # Passed only on a quantizing wire, matching scale_dst_nbytes: mori grew
+        # Passed only on a quantizing wire, matching dispatch_scale_dst_nbytes: mori grew
         # scale_bytes in #593 and rejects UNKNOWN kwargs outright, so sending the
         # bf16 wire's harmless 0 would make an older mori refuse the whole plan.
-        scale_kw = {"scale_bytes": config.scale_nbytes} if config.is_quant_wire else {}
+        scale_kw = {"scale_bytes": config.dispatch_scale_nbytes} if config.is_quant_dispatch_wire else {}
         plans = {}
         for spec in self._dispatch_specs:
             plan = EpDispatchPlan(
                 world_size=config.world_size,
-                # see wire_elem_count; mori's plan_api: "the caller halves
+                # see dispatch_wire_elem_count; mori's plan_api: "the caller halves
                 # hiddenDim"
-                hidden_dim=config.wire_elem_count,
+                hidden_dim=config.dispatch_wire_elem_count,
                 max_tok_per_rank=config.max_tokens_per_rank,
                 num_expert_per_rank=config.experts_per_rank,
                 num_expert_per_token=config.topk,
                 max_recv=config.max_recv,
-                dtype=config.wire.mori_dtype,
+                dtype=config.dispatch_wire_spec.mori_dtype,
                 use_weights=True,
                 **scale_kw,
                 block_num=spec[0],
@@ -781,7 +792,7 @@ class MegaMoEGfx1250:
                     # launcher is a traced @flyc.jit signature, and widening it
                     # would put a dead kernarg on a path that can never carry
                     # scales (fp8 requires dispatch_backend='mori').
-                    scales_buf=self._sent_scales_ptr,
+                    scales_buf=self._dispatch_sent_scales_ptr,
                 )
 
             return launch
@@ -804,24 +815,24 @@ class MegaMoEGfx1250:
     def _recv_tokens(self) -> torch.Tensor:
         config = self._config
         # Width in whatever recv_dtype counts: features for bf16/fp8, bytes for
-        # fp4 -- see _Wire.recv_dtype.
-        width = config.dispatch_token_nbytes // config.wire.recv_dtype.itemsize
+        # fp4 -- see _DispatchWire.recv_dtype.
+        width = config.dispatch_token_nbytes // config.dispatch_wire_spec.recv_dtype.itemsize
         return _from_gpu_ptr(
             self._arena.local_ptr("disp_out"),
             (config.max_recv, width),
-            config.wire.recv_dtype,
+            config.dispatch_wire_spec.recv_dtype,
         )
 
-    def _recv_scales(self) -> torch.Tensor | None:
+    def _recv_dispatch_scales(self) -> torch.Tensor | None:
         """The forwarded e8m0 rows, or None on the bf16 wire."""
-        if not self._config.is_quant_wire:
+        if not self._config.is_quant_dispatch_wire:
             return None
         # Full padded rows, not a trimmed view: this goes to the gather kernel as a
         # base pointer plus a build-constant pitch, and that pitch is the arrival
         # stride. The kernel reads only the meaningful bytes of each row.
         return _from_gpu_ptr(
-            self._arena.local_ptr("out_scales"),
-            (self._config.max_recv, self._config.scale_dst_nbytes),
+            self._arena.local_ptr("disp_out_scales"),
+            (self._config.max_recv, self._config.dispatch_scale_dst_nbytes),
             torch.uint8,
         )
 
@@ -849,7 +860,7 @@ class MegaMoEGfx1250:
         spec = self._select_dispatch(token_count)
         stream = fx.Stream(torch.cuda.current_stream())
         payload = hidden_states
-        if self._config.is_quant_wire:
+        if self._config.is_quant_dispatch_wire:
             # Quantize ONCE PER LOCAL TOKEN here, instead of once per received
             # copy on the far side. Destination-independent, so the bytes are the
             # same either way; the preshuffle cannot move with it, because its
@@ -858,13 +869,13 @@ class MegaMoEGfx1250:
 
             payload, scale_rows = per_1x32_mx_quant_hip(
                 hidden_states,
-                quant_dtype=self._config.wire.quant_dtype,
+                quant_dtype=self._config.dispatch_wire_spec.quant_dtype,
                 scale_type=dtypes.fp8_e8m0,
                 shuffle=False,
             )
             # Straight onto the wire; mori restrides these packed rows while it
             # stages them, so there is no repack here.
-            self._sent_scales_ptr = scale_rows.data_ptr()
+            self._dispatch_sent_scales_ptr = scale_rows.data_ptr()
         self._dispatch_variants[spec](
             self._arena.handle,
             payload.data_ptr(),
