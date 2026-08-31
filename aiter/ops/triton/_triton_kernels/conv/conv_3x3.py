@@ -5,24 +5,8 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils.conv_config_utils import get_conv_config
 
 from ..activation import _apply_activation_from_str
-
-
-def _get_config_nhwc(shape_key=None, M=None, variants=()):
-    return get_conv_config("CONV-3X3-NHWC", shape_key=shape_key, M=M, variants=variants)
-
-
-def _get_config_cblocked(shape_key=None, M=None, variants=()):
-    return get_conv_config(
-        "CONV-3X3-CBLOCKED", shape_key=shape_key, M=M, variants=variants
-    )
-
-
-def _get_config_nchw(shape_key=None, M=None, variants=()):
-    return get_conv_config("CONV-3X3-NCHW", shape_key=shape_key, M=M, variants=variants)
-
 
 _conv2d_3x3_nhwc_kernel_repr = make_kernel_repr(
     "_conv2d_3x3_nhwc_kernel",
