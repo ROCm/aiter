@@ -119,7 +119,15 @@ def _apply_sink(qk, sink):
 
 
 def _ref_mha_varlen(
-    q, k, v, cu_q, cu_k, scale, causal=False, return_lse=False, sink=None,
+    q,
+    k,
+    v,
+    cu_q,
+    cu_k,
+    scale,
+    causal=False,
+    return_lse=False,
+    sink=None,
     window_size=(-1, -1),
 ):
     """PyTorch reference for varlen THD layout, per-batch.
@@ -324,7 +332,13 @@ def run_varlen_test(
 
 
 def _ref_mha_batch(
-    q, k, v, scale, causal=False, return_lse=False, sink=None,
+    q,
+    k,
+    v,
+    scale,
+    causal=False,
+    return_lse=False,
+    sink=None,
     window_size=(-1, -1),
 ):
     """PyTorch reference for batched BSHD layout, per-batch.
@@ -426,7 +440,13 @@ def run_batch_test(
     print(f"  [{tag}] avg: {avg_ms:.3f}ms ({avg_us:.1f} us)  {fwd_tflops:.1f} TFLOPS")
 
     ref_result = _ref_mha_batch(
-        q, k, v, scale, causal=causal, return_lse=return_lse, sink=sink_t,
+        q,
+        k,
+        v,
+        scale,
+        causal=causal,
+        return_lse=return_lse,
+        sink=sink_t,
         window_size=window_size,
     )
     if return_lse:
@@ -436,9 +456,7 @@ def run_batch_test(
 
     assert tuple(o.shape) == (B, sq, H_q, d_v), f"[{tag}] bad out {tuple(o.shape)}"
 
-    err = checkAllclose(
-        o.float(), ref, rtol=1e-2, atol=1e-2, msg=f"  [{tag}] out: "
-    )
+    err = checkAllclose(o.float(), ref, rtol=1e-2, atol=1e-2, msg=f"  [{tag}] out: ")
 
     if return_lse:
         # Kernel LSE is [B, nheads_q, sq]; the reference matches that layout.
@@ -883,7 +901,9 @@ if __name__ == "__main__":
     # sink=True axis for any other head-dim so we don't test a config that falls
     # through to CK (which would drop the sink term for this path).
     def _sink_axis(d_qk, d_v):
-        return sink_list if (d_qk, d_v) == (128, 128) else [s for s in sink_list if not s]
+        return (
+            sink_list if (d_qk, d_v) == (128, 128) else [s for s in sink_list if not s]
+        )
 
     # Sliding window is only served by the 128/128 m16x8 path; any other head-dim
     # keeps the full-attention (-1,-1) window so we don't test a config that
