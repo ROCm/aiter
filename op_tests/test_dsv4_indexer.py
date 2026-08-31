@@ -3,44 +3,10 @@
 #
 # Correctness test for DSV4 indexer kernels.
 
-import importlib
-import os
-import sys
-
 import torch
 import torch.nn.functional as F
 
-_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-def _load_module(name, path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-_load_module(
-    "aiter.ops.triton._triton_kernels.attention.dsv4_indexer",
-    os.path.join(
-        _REPO,
-        "aiter",
-        "ops",
-        "triton",
-        "_triton_kernels",
-        "attention",
-        "dsv4_indexer.py",
-    ),
-)
-_wrapper = _load_module(
-    "aiter.ops.triton.attention.dsv4_indexer",
-    os.path.join(_REPO, "aiter", "ops", "triton", "attention", "dsv4_indexer.py"),
-)
-
-indexer_fwd = _wrapper.indexer_fwd
-indexer_bwd = _wrapper.indexer_bwd
-dsv4_indexer = _wrapper.dsv4_indexer
+from aiter.ops.triton.attention.dsv4_indexer import dsv4_indexer, indexer_bwd, indexer_fwd
 
 torch.set_default_device("cuda")
 

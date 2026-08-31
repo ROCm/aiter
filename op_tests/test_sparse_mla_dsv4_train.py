@@ -3,47 +3,15 @@
 #
 # Correctness test for DSV4 sparse-MLA training kernels.
 
-import importlib
-import os
 import sys
 
 import torch
 
-# Avoid importing aiter.__init__ which loads C extensions.
-# Instead, directly import the pure-Python/Triton modules.
-_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-def _load_module(name, path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-_kernel_mod = _load_module(
-    "aiter.ops.triton._triton_kernels.attention.sparse_mla_dsv4_train",
-    os.path.join(
-        _REPO,
-        "aiter",
-        "ops",
-        "triton",
-        "_triton_kernels",
-        "attention",
-        "sparse_mla_dsv4_train.py",
-    ),
+from aiter.ops.triton.attention.sparse_mla_dsv4_train import (
+    sparse_mla_bwd,
+    sparse_mla_dsv4_train,
+    sparse_mla_fwd,
 )
-_wrapper_mod = _load_module(
-    "aiter.ops.triton.attention.sparse_mla_dsv4_train",
-    os.path.join(
-        _REPO, "aiter", "ops", "triton", "attention", "sparse_mla_dsv4_train.py"
-    ),
-)
-
-sparse_mla_fwd = _wrapper_mod.sparse_mla_fwd
-sparse_mla_bwd = _wrapper_mod.sparse_mla_bwd
-sparse_mla_dsv4_train = _wrapper_mod.sparse_mla_dsv4_train
 
 torch.set_default_device("cuda")
 

@@ -2,38 +2,9 @@
 
 Calls rmsnorm_quant (CK kernel) then hipb_mm (hipBLASLt GEMM) back-to-back
 with minimal Python overhead between them.
-
-Falls back to separate Python calls if the fused C++ JIT module is not available.
 """
 
-import logging
-
 import torch
-
-_log = logging.getLogger(__name__)
-
-_fused_cpp = None
-_fused_cpp_probed = False
-
-
-def _get_fused_cpp():
-    """Try to load the C++ JIT fused module."""
-    global _fused_cpp, _fused_cpp_probed
-    if _fused_cpp_probed:
-        return _fused_cpp
-    _fused_cpp_probed = True
-    try:
-        from aiter import module_fused_norm_quant_gemm
-
-        _fused_cpp = module_fused_norm_quant_gemm
-        _log.info("fused_norm_quant_gemm: C++ JIT module loaded")
-    except (ImportError, OSError, RuntimeError) as e:
-        _log.debug(
-            "fused_norm_quant_gemm: C++ JIT module not available (%s), using Python fallback",
-            e,
-        )
-        _fused_cpp = None
-    return _fused_cpp
 
 
 def fused_rmsnorm_quant_gemm(
@@ -61,25 +32,6 @@ def fused_rmsnorm_quant_gemm(
     Returns:
         [M, N] BF16 output
     """
-    cpp = _get_fused_cpp()
-    if cpp is not None:
-        try:
-            return cpp.fused_rmsnorm_quant_gemm(
-                input_2d,
-                weight_fp8,
-                norm_w,
-                eps,
-                scale_a,
-                scale_w,
-                fp8_workspace,
-                solution_index,
-            )
-        except (ImportError, OSError, RuntimeError) as e:
-            _log.debug(
-                "fused_norm_quant_gemm: C++ path failed (%s), using Python fallback",
-                e,
-            )
-
     from aiter.ops.gradlib import hipb_mm
     from aiter.ops.rmsnorm_quant import rmsnorm_quant as _rmsnorm_quant
 
