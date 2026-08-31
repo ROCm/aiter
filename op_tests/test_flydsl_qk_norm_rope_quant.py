@@ -186,8 +186,21 @@ def _dequant(out_fp8, scale, *, D, quant_group_size, scale_dtype):
 # Main test (per-config)
 # ============================================================================
 
-# MI355X HBM3e peak. Used only for the "%peak" perf column.
-_PEAK_BW_GBPS = 8000.0
+# Nominal HBM peak per arch, used only for the "%peak" perf column. A single
+# constant made that column meaningless on every card but one.
+_PEAK_BW_GBPS_BY_GFX = {
+    "gfx942": 5300.0,  # MI300X (MI325X is 6000)
+    "gfx950": 8000.0,  # MI355X HBM3E
+    "gfx1250": 22000.0,
+}
+
+
+def _pct_peak(gbps):
+    """%peak against this card's nominal HBM peak; None when the arch is unknown."""
+    peak = _PEAK_BW_GBPS_BY_GFX.get(get_gfx())
+    return round(gbps / peak * 100, 1) if peak else None
+
+
 # Pin the arg-rotation count. Left to itself, run_perftest derives it from
 # `free_memory` at call time, so two rows timed in one process rotate a
 # different number of times and land in different L2 states -- their `us`
@@ -316,7 +329,7 @@ def test_flydsl_qk_norm_rope_quant(
     return {
         "us": round(us, 3),
         "GB/s": round(gbps, 0),
-        "%peak": round(gbps / _PEAK_BW_GBPS * 100, 1),
+        "%peak": _pct_peak(gbps),
         "err_q": err_q,
         "err_kv": err_kv,
     }

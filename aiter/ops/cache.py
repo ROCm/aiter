@@ -139,6 +139,9 @@ def indexer_qk_rope_quant_and_cache(
     weights_scale: float,
     preshuffle: bool = False,
     is_neox: bool = True,
+    # False (default): slot<0 rows skip the whole fused op.
+    # True (DCP): compute Q/weights for every row; only valid slots write K cache.
+    compute_all_q_rope: bool = False,
 ) -> None: ...
 
 
