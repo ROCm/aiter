@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""2-rank test for initialize_model_parallel(reuse_identical_rank_groups=...).
+"""2-rank test for comm-group reuse (AITER_REUSE_IDENTICAL_COMM_GROUPS).
 
 When identical-rank parallel groups span the same ranks, they should share one set
 of process groups and communicators while staying distinct GroupCoordinator
@@ -41,11 +41,13 @@ def _init(rank, world_size, port, reuse):
         backend="nccl",
     )
     # TP, DCP and EP all span the same ranks here, so DCP and EP reuse TP when
-    # reuse=True.
+    # reuse=True. Reuse is gated by the env var (read inside
+    # initialize_model_parallel); set it explicitly so the reuse=False leg does
+    # not inherit a "1" left over from the reuse=True leg in the same process.
+    os.environ["AITER_REUSE_IDENTICAL_COMM_GROUPS"] = "1" if reuse else "0"
     initialize_model_parallel(
         tensor_model_parallel_size=world_size,
         decode_context_model_parallel_size=world_size,
-        reuse_identical_rank_groups=reuse,
     )
     # Wire the custom-allreduce signal buffer exactly as init_dist_env does, so
     # the (shared) ca_comm is functional -- EP reuses this same ca object.
