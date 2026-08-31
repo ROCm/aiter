@@ -395,6 +395,7 @@ def _run_case(D, B, Mi, regime, *, seed=SEED, sparsity=0.95, label=""):
     c_dj, c_dd, c_db = _cos(dj, rj), _cos(dd, rd), _cos(db, rb)
     ok = min(c_dj, c_dd, c_db) > _COS_THRESH
     cfg = resolve_config(n_groups=B, reduction_k=D, output_n=D, max_seq_len=Mi)
+    assert cfg["gj_stages_a"] == (1 if D <= 256 else 2)
     bw = _bwd.build_backward(
         D,
         split=cfg["split"],
