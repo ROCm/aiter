@@ -44,10 +44,13 @@ namespace aiter {
     // prefetched stage in flight (<=2 inflight, within the <=3 budget); DRAIN
     // waits for all residual TDMs. No-ops off gfx1250 (residual uses async_load).
 #if defined(__gfx1250__)
-#define MHC_TDM_KEEP1() opus::s_wait_tensorcnt(opus::number<1>{})
+// KEEP(N): drain this wave's TDMs down to N still in flight -- N = ring depth - 1,
+// i.e. every stage prefetched AFTER the one about to be consumed may stay
+// outstanding. DRAIN waits for all of them.
+#define MHC_TDM_KEEP(N) opus::s_wait_tensorcnt(opus::number<(N)>{})
 #define MHC_TDM_DRAIN() opus::s_wait_tensorcnt(opus::number<0>{})
 #else
-#define MHC_TDM_KEEP1() ((void)0)
+#define MHC_TDM_KEEP(N) ((void)0)
 #define MHC_TDM_DRAIN() ((void)0)
 #endif
 
@@ -2235,7 +2238,7 @@ namespace aiter {
         // gives free row OOB (out-of-range rows load 0), so no manual zero-fill and
         // no async counter -> x is TENSORcnt-tracked, x_load_waitcnt = 0.
         static constexpr int x_load_waitcnt = 0;
-        auto lds_load_x_tile = [&](int k){
+        auto lds_load_x_tile = [&](int k, int slot){
             if (warp_id == 1) {
                 using win_t = opus::tdm<DTYPE_I, opus::seq<tile_k, tile_m>>;
                 uint32_t lds = static_cast<uint32_t>(reinterpret_cast<__UINTPTR_TYPE__>(s_x));
@@ -2243,7 +2246,7 @@ namespace aiter {
                 // make(lds_base, global_ptr, shape0, shape1, dim0_stride); the
                 // double-buffer half is the per-issue LDS write offset (elements).
                 auto win = opus::make_tdm<win_t>(lds, g, tile_k, m_oob, x_stride);
-                win.async_load(static_cast<uint32_t>((k & 1) * tile_mk));
+                win.async_load(static_cast<uint32_t>(slot * tile_mk));
             }
         };
 #else
@@ -2254,11 +2257,11 @@ namespace aiter {
 #endif
         static constexpr int x_async_load_threads = block_size * x_async_load_vec < tile_mk ? block_size : tile_mk / x_async_load_vec;
         static constexpr int x_load_waitcnt = tile_mk / (x_async_load_threads * x_async_load_vec);
-        auto lds_load_x_tile = [&](int k){
+        auto lds_load_x_tile = [&](int k, int slot){
             static constexpr int rows_per_load = x_async_load_vec * x_async_load_threads / tile_k;
             static constexpr int threads_per_row = tile_k / x_async_load_vec;
             if(threadIdx.x < x_async_load_threads) {
-                DTYPE_I* s_x_wr_ptr = s_x + (k & 1) * tile_mk;
+                DTYPE_I* s_x_wr_ptr = s_x + slot * tile_mk;
                 int offset_base = threadIdx.x / threads_per_row * x_stride + threadIdx.x % threads_per_row * x_async_load_vec + k_split_offset + k * tile_k;
                 static constexpr int s_offset_i = x_async_load_threads * x_async_load_vec;
                 [[maybe_unused]] const int row_base = threadIdx.x / threads_per_row;
@@ -2299,7 +2302,7 @@ namespace aiter {
         // (out-of-range rows load 0). residual is TENSORcnt-tracked, so it no longer
         // contributes to the async counter -> residual_load_waitcnt = 0.
         static constexpr int residual_load_waitcnt = 0;
-        auto lds_load_residual_tile = [&](int k){
+        auto lds_load_residual_tile = [&](int k, int slot){
             // TDM is a wave-level DMA (not per-lane, not EXEC-gated); a single wave
             // issues one op that fills the whole all-head tile. Only warp 0 issues;
             // the others see the data after the tensorcnt wait + workgroup barrier
@@ -2314,7 +2317,7 @@ namespace aiter {
                 const opus::u32_t coord[3] = {0, 0, 0};
                 win_t win;
                 win.make_from_layout(lds, g, shape, pitch, coord);
-                win.async_load(static_cast<uint32_t>((k & 1) * (hc_mult * tile_mk)));
+                win.async_load(static_cast<uint32_t>(slot * (hc_mult * tile_mk)));
             }
         };
 #else
@@ -2324,10 +2327,10 @@ namespace aiter {
         static constexpr int r_async_load_vec = 16 / sizeof(DTYPE_I) * warp_size <= tile_mk ? 16 / sizeof(DTYPE_I) : 4 / sizeof(DTYPE_I);
 #endif
         static constexpr int residual_load_waitcnt = tile_mk / (warp_size * r_async_load_vec);
-        auto lds_load_residual_tile = [&](int k){
+        auto lds_load_residual_tile = [&](int k, int slot){
             static constexpr int rows_per_load = r_async_load_vec * warp_size / tile_k;
             static constexpr int threads_per_row = tile_k / r_async_load_vec;
-            DTYPE_I* s_residual_wr_ptr = s_residual + (k & 1) * (hc_mult * tile_mk);
+            DTYPE_I* s_residual_wr_ptr = s_residual + slot * (hc_mult * tile_mk);
             int offset_base = lane_id / threads_per_row * hc_hidden_size + warp_id * hidden_size
                 + lane_id % threads_per_row * r_async_load_vec + k_split_offset + k * tile_k;
             static constexpr int s_offset_i = warp_size * r_async_load_vec;
@@ -2377,18 +2380,26 @@ namespace aiter {
 
         const int k_loop = hidden_size / (split_k * tile_k);
 
-        fp32xfntile v_fn0;
-        fp32xfntile v_fn1;
+        // n_stages-deep LDS ring + matching fn register ring. The slot is passed
+        // explicitly (never derived from k) so that every ring index below is a
+        // compile-time constant: v_fn[] must stay in registers, and the LDS
+        // pointers must fold into an immediate offset.
+        fp32xfntile v_fn[n_stages];
 
-        lds_load_x_tile(0);
-        lds_load_residual_tile(0);
-        v_fn0 = vgpr_load_fn_tile(0);
+        lds_load_x_tile(0, 0);
+        lds_load_residual_tile(0, 0);
+        v_fn[0] = vgpr_load_fn_tile(0);
         __builtin_amdgcn_sched_barrier(0);
-        if (k_loop > 1) {
-            lds_load_x_tile(1);
-            lds_load_residual_tile(1);
-            v_fn1 = vgpr_load_fn_tile(1);
-        }
+        opus::static_for<n_stages>([&](auto S) {
+            constexpr int s = S.value;
+            if constexpr (s >= 1) {
+                if (s < k_loop) {
+                    lds_load_x_tile(s, s);
+                    lds_load_residual_tile(s, s);
+                    v_fn[s] = vgpr_load_fn_tile(s);
+                }
+            }
+        });
 
         float sqrsum_part[m_repeat];
         fp32xovec_t v_cf[m_repeat][repeat_n];
@@ -2399,9 +2410,9 @@ namespace aiter {
             }
         }
 
-        auto compute_store_tile = [&](int i, fp32xfntile& v_fn) {
-            DTYPE_I* s_x_rd_ptr = s_x + (i & 1) * tile_mk;
-            DTYPE_I* s_residual_rd_ptr = s_residual + (i & 1) * (hc_mult * tile_mk);
+        auto compute_store_tile = [&](int i, int slot, fp32xfntile& v_fn) {
+            DTYPE_I* s_x_rd_ptr = s_x + slot * tile_mk;
+            DTYPE_I* s_residual_rd_ptr = s_residual + slot * (hc_mult * tile_mk);
             static constexpr int ds_read_vec = 16 / sizeof(DTYPE_I);
             static constexpr int step = ds_read_vec;
             static constexpr int band_j = band_mk / (warp_size * ds_read_vec);
@@ -2518,8 +2529,10 @@ namespace aiter {
         // gfx9 only: x and residual share the async counter, so the "leave in flight"
         // count is one stage's worth of async loads. On gfx1250 both x and residual
         // are TDM (TENSORcnt), there are no async loads, and these are unused.
-        [[maybe_unused]] static constexpr int x_async_wait = mhc_async_load_oob_guard ? 0 : x_load_waitcnt + residual_load_waitcnt;
-        [[maybe_unused]] static constexpr int r_async_wait = mhc_async_load_oob_guard ? 0 : residual_load_waitcnt;
+        // Leave (n_stages - 1) stages' worth of async loads in flight, matching
+        // MHC_TDM_KEEP(n_stages - 1) on the TDM side.
+        [[maybe_unused]] static constexpr int x_async_wait = mhc_async_load_oob_guard ? 0 : (n_stages - 1) * (x_load_waitcnt + residual_load_waitcnt);
+        [[maybe_unused]] static constexpr int r_async_wait = mhc_async_load_oob_guard ? 0 : (n_stages - 1) * residual_load_waitcnt;
 #if defined(__gfx1250__)
         auto wait_load_cnt = [&]() {
             // x (warp 1) and residual (warp 0) are both TDM / TENSORcnt-tracked. Each
@@ -2529,7 +2542,7 @@ namespace aiter {
             // loadcnt; there are no async loads left, so the async count is -1
             // (sentinel: suppress s_wait_asynccnt emission; 0 would emit a spurious
             // s_wait_asynccnt 0).
-            MHC_TDM_KEEP1();
+            MHC_TDM_KEEP(n_stages - 1);
             s_wait_all_loadcnt(opus::number<fn_load_waitcnt*2>{}, opus::number<-1>{});
             __builtin_amdgcn_s_barrier();
             s_wait_all_loadcnt(opus::number<fn_load_waitcnt>{}, opus::number<-1>{});
@@ -2538,7 +2551,7 @@ namespace aiter {
         auto wait_load_cnt = [&]() {
             // Ensure the current residual TDM stage is resident before the barrier
             // below publishes it to all warps; leave the next prefetched stage in flight.
-            MHC_TDM_KEEP1();
+            MHC_TDM_KEEP(n_stages - 1);
             if(threadIdx.x < x_async_load_threads) {
                 s_wait_all_loadcnt(opus::number<fn_load_waitcnt*2>{}, opus::number<x_async_wait>{});
             }
@@ -2555,51 +2568,59 @@ namespace aiter {
         };
 #endif
 
+        // Steady state, unrolled by n_stages so `s` (and hence the ring slot) is a
+        // compile-time constant. Invariant on entry to an iteration: stage i+s is
+        // resident-or-in-flight in slot s, for s in [0, n_stages). The bound
+        // i + 2*n_stages - 1 < k_loop guarantees every prefetch i+s+n_stages issued
+        // in the body is a real stage, so the body needs no k_loop test.
+        //
+        // wait_load_cnt() drains only to n_stages-1 TDMs left in flight, which
+        // proves stage i+s resident ONLY while all n_stages-1 later stages are
+        // actually outstanding -- true throughout the steady state, and the reason
+        // the tail below falls back to a full drain once the ring stops refilling.
         int i = 0;
-        for(; i + 3 < k_loop ; i += 2) {
-            wait_load_cnt();
-            compute_store_tile(i, v_fn0);
-            __builtin_amdgcn_s_barrier();
-            lds_load_x_tile(i + 2);
-            lds_load_residual_tile(i + 2);
-            v_fn0 = vgpr_load_fn_tile(i + 2);
-            __builtin_amdgcn_sched_barrier(0);
-            wait_load_cnt();
-            compute_store_tile(i + 1, v_fn1);
-            __builtin_amdgcn_s_barrier();
-            lds_load_x_tile(i + 3);
-            lds_load_residual_tile(i + 3);
-            v_fn1 = vgpr_load_fn_tile(i + 3);
+        for(; i + 2 * n_stages - 1 < k_loop; i += n_stages) {
+            opus::static_for<n_stages>([&](auto S) {
+                constexpr int s = S.value;
+                wait_load_cnt();
+                compute_store_tile(i + s, s, v_fn[s]);
+                __builtin_amdgcn_s_barrier();
+                lds_load_x_tile(i + s + n_stages, s);
+                lds_load_residual_tile(i + s + n_stages, s);
+                v_fn[s] = vgpr_load_fn_tile(i + s + n_stages);
+                __builtin_amdgcn_sched_barrier(0);
+            });
         }
 
-        if (i + 1 < k_loop) {
-            wait_load_cnt();
-            compute_store_tile(i, v_fn0);
-            if (i + 2 < k_loop) {
-                __builtin_amdgcn_s_barrier();
-                lds_load_x_tile(i + 2);
-                lds_load_residual_tile(i + 2);
-                v_fn0 = vgpr_load_fn_tile(i + 2);
-                wait_load_cnt();
+        // Tail: at most 2*n_stages-1 stages left. Unrolled over the same slot
+        // sequence (slot = s % n_stages, compile-time) with two runtime guards:
+        //   k < k_loop            -- this stage exists at all
+        //   k + n_stages < k_loop -- the ring can still be refilled from this step
+        // Once refilling stops the outstanding count falls below n_stages-1, so
+        // wait_load_cnt()'s partial drain would no longer prove residency; those
+        // steps take the full drain instead. Conservative by at most one step (the
+        // k+n_stages == k_loop case still has n_stages-1 outstanding), which is
+        // exactly what the previous hand-rolled 2-stage tail did.
+        opus::static_for<2 * n_stages - 1>([&](auto S) {
+            constexpr int s = S.value;
+            const int k = i + s;
+            if (k < k_loop) {
+                constexpr int slot = s % n_stages;
+                if (k + n_stages < k_loop) {
+                    wait_load_cnt();
+                    compute_store_tile(k, slot, v_fn[slot]);
+                    __builtin_amdgcn_s_barrier();
+                    lds_load_x_tile(k + n_stages, slot);
+                    lds_load_residual_tile(k + n_stages, slot);
+                    v_fn[slot] = vgpr_load_fn_tile(k + n_stages);
+                } else {
+                    s_wait_all_loadcnt(0_I, 0_I);
+                    MHC_TDM_DRAIN();
+                    __builtin_amdgcn_s_barrier();
+                    compute_store_tile(k, slot, v_fn[slot]);
+                }
             }
-            else {
-                s_wait_all_loadcnt(0_I, 0_I);
-                MHC_TDM_DRAIN();
-                __builtin_amdgcn_s_barrier();
-            }
-            compute_store_tile(i + 1, v_fn1);
-            if (i + 2 < k_loop) {
-                s_wait_all_loadcnt(0_I, 0_I);
-                MHC_TDM_DRAIN();
-                __builtin_amdgcn_s_barrier();
-                compute_store_tile(i + 2, v_fn0);
-            }
-        } else if (i < k_loop) {
-            s_wait_all_loadcnt(0_I, 0_I);
-            MHC_TDM_DRAIN();
-            __builtin_amdgcn_s_barrier();
-            compute_store_tile(i, v_fn0);
-        }
+        });
 
         // Reduce v_cf (gemm_out_mul) and sqrsum across the hc_mult warps in LDS so
         // only warp 0 writes a single (split_k) partial, instead of each warp
