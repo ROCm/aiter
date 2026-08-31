@@ -7,7 +7,6 @@ import triton.language as tl
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
-from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 _batched_gemm_a16wfp4_repr = make_kernel_repr(
     "_batched_gemm_a16wfp4_kernel",
@@ -310,13 +309,3 @@ def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
         )
 
     return SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT
-
-
-def _get_config(
-    M: int,
-    N: int,
-    K: int,
-):
-    # Note: Config files use K=2*K in their naming because FP4 weights are packed,
-    # so the actual K dimension in the config file corresponds to 2*K unpacked elements
-    return get_gemm_config("BATCHED_GEMM-A16WFP4", M, N, 2 * K)

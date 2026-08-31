@@ -8,18 +8,28 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import (
     _batched_gemm_a16wfp4_kernel,
     _batched_gemm_a16wfp4_reduce_kernel,
-    _get_config,
 )
 from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import (
     get_splitk,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
+from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
 _USE_GEMM_SPLITK_BF16 = False
+
+
+def _get_config(
+    M: int,
+    N: int,
+    K: int,
+):
+    # Note: Config files use K=2*K in their naming because FP4 weights are packed,
+    # so the actual K dimension in the config file corresponds to 2*K unpacked elements
+    return get_gemm_config("BATCHED_GEMM-A16WFP4", M, N, 2 * K)
 
 
 def set_use_gemm_splitk_bf16(value: bool):

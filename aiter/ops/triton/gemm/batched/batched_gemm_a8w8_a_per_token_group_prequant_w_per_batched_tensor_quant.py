@@ -6,8 +6,22 @@ import triton
 
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel,
-    _get_config,
 )
+from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
+
+
+def _get_config(
+    M: int,
+    N: int,
+    K: int,
+):
+
+    return get_gemm_config(
+        "BATCHED_GEMM-A8W8-A_PER_TOKEN_GROUP_PREQUANT_W_PER_BATCHED_TENSOR_QUANT",
+        M,
+        N,
+        K,
+    )
 
 
 def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(

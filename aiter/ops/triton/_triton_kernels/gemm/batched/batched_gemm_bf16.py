@@ -5,10 +5,6 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils.gemm_config_utils import (
-    compute_splitk_params,
-    get_gemm_config,
-)
 
 _batched_gemm_bf16_repr = make_kernel_repr(
     "_batched_gemm_bf16_kernel",
@@ -225,15 +221,3 @@ def _batched_gemm_bf16_kernel(
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
 
         tl.store(c_ptrs, c, mask=c_mask)
-
-
-def _get_config(
-    M: int,
-    N: int,
-    K: int,
-    B: int | None = None,
-):
-
-    # BF16 uses the shared 16-bit activation / 16-bit weight batched GEMM config.
-    config, is_tunned = get_gemm_config("BATCHED_GEMM-A16W16", M, N, K, B=B)
-    return compute_splitk_params(config, K), is_tunned

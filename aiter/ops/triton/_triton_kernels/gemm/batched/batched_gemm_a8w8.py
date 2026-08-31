@@ -5,7 +5,6 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 _batched_gemm_a8w8_repr = make_kernel_repr(
     "_batched_gemm_a8w8_kernel",
@@ -192,12 +191,3 @@ def _batched_gemm_a8w8_kernel(
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
 
     tl.store(c_ptrs, c, mask=c_mask)
-
-
-def _get_config(
-    M: int,
-    N: int,
-    K: int,
-):
-
-    return get_gemm_config("BATCHED_GEMM-A8W8", M, N, K)
