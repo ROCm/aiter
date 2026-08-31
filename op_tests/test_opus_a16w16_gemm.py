@@ -515,8 +515,7 @@ def test_global_a16_stale_opus_row_keeps_framework_fallback(monkeypatch):
 
 def _capture_shape_driven_opus_launch(monkeypatch, *, arch, tuned_config):
     from aiter.ops import opus
-    from aiter.ops.opus import policy
-    from aiter.ops.opus.gemm import gemm_op_a16w16
+    from aiter.ops.opus import gemm_op_a16w16, policy
 
     calls = []
 
@@ -659,8 +658,7 @@ def test_a16w16_heuristic_baseline_kid(arch, shape, expected_kid):
 
 
 def test_shape_driven_opus_selection_and_rank_route(monkeypatch):
-    from aiter.ops.opus import policy
-    from aiter.ops.opus.gemm import gemm_op_a16w16
+    from aiter.ops.opus import gemm_op_a16w16, policy
 
     tuned = [None]
     opus, calls = _capture_shape_driven_opus_launch(

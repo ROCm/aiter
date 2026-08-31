@@ -17,8 +17,8 @@ from csrc.opus_gemm.opus_gemm_common import (
 
 from . import launch_plan
 from ._arch import GFX950
-from .gemm import gemm_op_a16w16 as _a16w16_family
-from .gemm import gemm_op_a8w8 as _a8w8_family
+from . import gemm_op_a16w16 as _a16w16_family
+from . import gemm_op_a8w8 as _a8w8_family
 
 
 def _validate_a16w16_public_contract(

@@ -10,11 +10,11 @@ import torch
 
 from csrc.opus_gemm.opus_gemm_common import OpusGemmInstance
 
-from ....jit.core import compile_ops, get_module
-from ....jit.utils.torch_guard import torch_compile_guard
-from ....utility.dtypes import _aiter_dtype_id, aiter_tensor_t
-from .._arch import _device_arch_and_cu
-from ..launch_plan import _get_cached_a16w16_launch_plan
+from ...jit.core import compile_ops, get_module
+from ...jit.utils.torch_guard import torch_compile_guard
+from ...utility.dtypes import _aiter_dtype_id, aiter_tensor_t
+from ._arch import _device_arch_and_cu
+from .launch_plan import _get_cached_a16w16_launch_plan
 
 # ---- Low-level A16W16 backend --------------------------------------------
 
@@ -594,7 +594,7 @@ def gemm_a16w16_opus(
     """
     XQ, WQ, Y, is_gemm = _prepare_shape_driven_a16w16(A, B, bias, dtype, out)
     if kernelId is None:
-        from ..policy import (
+        from .policy import (
             lookup_a16w16_opus_config,
             resolve_a16w16_heuristic_candidate,
         )

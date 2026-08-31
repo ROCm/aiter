@@ -12,7 +12,7 @@ import torch
 from aiter import dtypes
 from aiter.ops import gemm_op_a8w8 as general_a8w8
 from aiter.ops.opus import opus_gemm
-from aiter.ops.opus.gemm import gemm_op_a8w8 as opus_a8w8
+from aiter.ops.opus import gemm_op_a8w8 as opus_a8w8
 
 
 def test_general_a8w8_restores_required_scales_and_blockscale_dtypes():

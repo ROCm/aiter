@@ -53,8 +53,8 @@ from aiter.ops.flydsl.mxfp4_kname import (
     parse_flydsl_v2_gemm2_kernel,
     parse_g2_kname_any,
 )
-from aiter.ops.opus.moe import moe_stage2_a8w4 as _opus_a8w4
-from aiter.ops.opus.moe.moe_stage1_a8w4 import (
+from aiter.ops.opus import moe_stage2_a8w4 as _opus_a8w4
+from aiter.ops.opus.moe_stage1_a8w4 import (
     opus_a8w4_stage1_wrapper as _opus_a8w4_stage1_wrapper,
 )
 

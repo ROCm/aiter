@@ -98,7 +98,7 @@ gemm_a16w16_opus
 The shared OPUS candidate helpers are isolated in `policy.py`.
 `tuned_gemm.py` uses only the tuned-candidate validator; a missing or invalid
 OPUS row continues through its normal framework fallback and never invokes an
-OPUS heuristic. `gemm/gemm_op_a16w16.py` owns the compatibility wrapper and applies
+OPUS heuristic. `gemm_op_a16w16.py` owns the compatibility wrapper and applies
 the migrated gfx942/gfx950/gfx1250 heuristic only after an OPUS-only tuned
 miss. A present but invalid OPUS row is not replaced by a heuristic kid: the
 exact launcher reports the invalid row. If the heuristic-selected kid is
@@ -261,7 +261,7 @@ continues through `csrc/gemm_a16w16/gemm_a16w16_tune.py`; MXFP8 BMM uses
 
 The CK-owned blockscale tuner remains unchanged. Its legacy
 `opus_gemm_a8w8_blockscale_bpreshuffle_tune(...)` import is retained in
-`gemm/gemm_op_a8w8.py` and calls the bpreshuffle family launcher directly. New
+`gemm_op_a8w8.py` and calls the bpreshuffle family launcher directly. New
 OPUS-specific tuning code should live under `csrc/opus_gemm/`.
 
 ## A16 Torch workspace
@@ -333,7 +333,7 @@ families that do not consume workspace reject a supplied Tensor.
 `launch_plan.py` owns the shared immutable workspace specification plus the
 family-specific A16W16 and A8W8 plans. Its `A8W8MxscaleBMMPlan` records the
 resolved exact kid, the split-K value passed to the ABI and an optional
-`WorkspaceSpec`. `gemm/gemm_op_a8w8.py` only adapts logical layouts, materializes
+`WorkspaceSpec`. `gemm_op_a8w8.py` only adapts logical layouts, materializes
 that workspace and invokes `_launch_a8w8_backend`.
 
 For gfx950 kid 8326, only the `split_k > 1`, `D_OUT=void` workspace
@@ -370,7 +370,7 @@ previous state, and carries C++ errors through a thread-local status bridge.
 The pybind raw remains available privately for the normal lazy JIT build and
 A/B measurement. `_launch_a16w16_backend` is the executor's only low-level
 entry; its priming state, mixed-module C ABI loader and thread-local descriptor
-pool live in the same backend section of `gemm/gemm_op_a16w16.py`. Generic JIT
+pool live in the same backend section of `gemm_op_a16w16.py`. Generic JIT
 machinery owns module discovery and build, but not per-call workspace state.
 
 A CO image is opened and registered on the first call to its launcher. That
@@ -429,10 +429,10 @@ skip on another architecture is not a pass for that target.
 | `_arch.py` | per-explicit-device architecture/CU scalar cache |
 | `policy.py` | A16 tuned/heuristic candidate selection plus MXFP8 tuned CSV discovery, padded-M lookup, local-to-global kid normalization and heuristic fallback |
 | `launch_plan.py` | shared `WorkspaceSpec`, A16 exact-kid/split-K planning, and A8 family contract/MXFP8 BMM planning |
-| `gemm/gemm_op_a16w16.py` | retained shape-driven OPUS wrapper plus A16 GEMM/BMM adapters, call-scoped Torch workspace materialization, and the unified `_launch_a16w16_backend` entry over pybind priming/C ABI |
-| `gemm/gemm_op_a8w8.py` | three non-MX A8 GEMM adapters, the legacy bpreshuffle tuner compatibility entry, MXFP8 BMM workspace materialization, and the unified `_launch_a8w8_backend` over four pybind raw bindings |
-| `moe/moe_stage1_a8w4.py` | A8W4 MoE stage-1 runtime binding and launcher |
-| `moe/moe_stage2_a8w4.py` | A8W4 MoE stage-2 runtime bindings and launchers |
+| `gemm_op_a16w16.py` | retained shape-driven OPUS wrapper plus A16 GEMM/BMM adapters, call-scoped Torch workspace materialization, and the unified `_launch_a16w16_backend` entry over pybind priming/C ABI |
+| `gemm_op_a8w8.py` | three non-MX A8 GEMM adapters, the legacy bpreshuffle tuner compatibility entry, MXFP8 BMM workspace materialization, and the unified `_launch_a8w8_backend` over four pybind raw bindings |
+| `moe_stage1_a8w4.py` | A8W4 MoE stage-1 runtime binding and launcher |
+| `moe_stage2_a8w4.py` | A8W4 MoE stage-2 runtime bindings and launchers |
 | `../gemm_op_a8w8.py` | general scaled CK/CKTile/ASM/Triton A8 dispatchers plus the tuned-row OPUS bpreshuffle route |
 | `../batched_gemm_op_bf16.py` | existing high-level CK BF16 BMM path; it is not an OPUS A16W16 BMM wrapper |
 | `../batched_gemm_op_a8w8.py` | MXFP8 high-level caller, scalar launch cache, output allocation and split-one/workspace execution choice |

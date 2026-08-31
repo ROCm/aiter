@@ -161,7 +161,7 @@ def batched_gemm_a8w8_CK(
 def _get_mxscale_bmm_launchers():
     """Resolve the checked split-1 launcher and workspace planner once."""
     from .opus import opus_bmm
-    from .opus.gemm.gemm_op_a8w8 import _opus_gemm_a8w8_mxscale_bmm_launch_raw
+    from .opus.gemm_op_a8w8 import _opus_gemm_a8w8_mxscale_bmm_launch_raw
 
     return _opus_gemm_a8w8_mxscale_bmm_launch_raw, opus_bmm
 

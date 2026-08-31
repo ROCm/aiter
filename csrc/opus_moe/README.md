@@ -116,9 +116,9 @@ gfx950 code:
 
 Python/JIT code:
 
-- `aiter/ops/opus/moe/moe_stage1_a8w4.py`: A8W4 Stage1 runtime binding and fused
+- `aiter/ops/opus/moe_stage1_a8w4.py`: A8W4 Stage1 runtime binding and fused
   MoE adapter.
-- `aiter/ops/opus/moe/moe_stage2_a8w4.py`: A8W4 Stage2 runtime bindings, typed
+- `aiter/ops/opus/moe_stage2_a8w4.py`: A8W4 Stage2 runtime bindings, typed
   tuned-config parsing, fused MoE adapter, and unified route-output reduction.
 - `gen_instances.py`: JIT-time private BF16 and A8W4 manifest/TU generator.
 - `opus_moe_common.py`: torch-free canonical Stage1/Stage2 contracts, kernel

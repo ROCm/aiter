@@ -85,7 +85,7 @@ def gemm_a16w16_opus(
     out: Tensor | None = None,
 ) -> Tensor:
     """Run the legacy shape-driven A16W16 OPUS selection path."""
-    from .gemm.gemm_op_a16w16 import gemm_a16w16_opus as _impl
+    from .gemm_op_a16w16 import gemm_a16w16_opus as _impl
 
     return _impl(
         A,
