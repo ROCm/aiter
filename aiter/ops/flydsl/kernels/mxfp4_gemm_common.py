@@ -316,6 +316,26 @@ def _situ_mul_batch(gate_values, up_values, beta=1.0, linear_beta=1.0):
         tanh_abs = (one - e) * fx.Float32(rocdl.rcp(T.f32, _raw(one + e)))
         return (x > zero).select(tanh_abs, -tanh_abs)
 
+    def fused_elem(gate, up):
+        v = fx.Float32(rocdl.exp2(T.f32, _raw(_fabs_f32(gate) * fx.Float32(-LOG2E))))
+        w = fx.Float32(
+            rocdl.exp2(
+                T.f32,
+                _raw(_fabs_f32(up) * (fx.Float32(-2.0 * LOG2E) * linear_beta_rcp)),
+            )
+        )
+        num = (one - v) * (one - w)
+        den = (one + v * v) * (one + w)
+        r = num * fx.Float32(rocdl.rcp(T.f32, _raw(den)))
+        r = (up > zero).select(r, -r)
+        return (gate > zero).select(r, -(v * r))
+
+    if float(beta) == 1.0:
+        return [
+            fused_elem(gate, up) * linear_beta_f32
+            for gate, up in zip(gate_values, up_values)
+        ]
+
     result = []
     for gate, up in zip(gate_values, up_values):
         situ = (
