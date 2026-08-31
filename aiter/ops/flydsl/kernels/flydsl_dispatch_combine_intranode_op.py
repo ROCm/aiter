@@ -1546,7 +1546,8 @@ class FlyDSLDispatchCombineIntraNodeOp:
             self._fx_p2p_comb_inp_wts,
         )
         std = (self._fx_disp_tok_map, self._fx_disp_out_wts)
-        compiled = fn.preload(
+        compiled = flyc.compile(
+            fn,
             fx.Int64(input.data_ptr()),
             *fixed,
             fx.Int64(self.shmem_disp_out_wts.data_ptr()),

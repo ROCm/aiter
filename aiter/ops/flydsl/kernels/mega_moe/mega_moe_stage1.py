@@ -994,7 +994,8 @@ def preload_mega_moe_stage1_bundle(
 ):
     """Compile and load the complete Stage1 bundle without dispatching it."""
     launch = compile_mega_moe_stage1_bundle(**compile_kw)
-    return launch.preload(
+    return flyc.compile(
+        launch,
         out,
         x,
         w,

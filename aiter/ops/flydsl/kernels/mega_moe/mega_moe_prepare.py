@@ -329,7 +329,8 @@ def preload_mega_moe_prepare(
 ):
     """Compile and load one prepare variant without dispatching it."""
     launch = compile_mega_moe_prepare(**kwargs)
-    return launch.preload(
+    return flyc.compile(
+        launch,
         addr_disp,
         i32_cur_tok,
         addr_in_idx,

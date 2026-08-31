@@ -1163,7 +1163,8 @@ def preload_mega_moe_stage2_aligned_pair(arg_aq, arg_ascale, arg_bq, arg_bscale,
         _PAIR_LAUNCH_CACHE[key] = launch
     bm = int(compile_kw.get("BM", 64))
     max_m_blocks = (int(row_capacity) + bm - 1) // bm
-    return launch.preload(
+    return flyc.compile(
+        launch,
         arg_aq,
         arg_ascale,
         arg_bq,
