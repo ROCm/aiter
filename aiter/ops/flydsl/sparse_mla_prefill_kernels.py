@@ -119,9 +119,6 @@ def _get_kernel_dsv4(
     r1_tb_carry: bool,
     persist_wg: int,
     vt_inreg: bool,
-    kv_double_buffer: bool,
-    kv_pf_late: bool,
-    vt_wide: bool,
     rope_prefetch: bool,
     scale_coalesce: bool,
     slot_hoist: bool,
@@ -140,9 +137,6 @@ def _get_kernel_dsv4(
         r1_tb_carry=r1_tb_carry,
         persist_wg=persist_wg,
         vt_inreg=vt_inreg,
-        kv_double_buffer=kv_double_buffer,
-        kv_pf_late=kv_pf_late,
-        vt_wide=vt_wide,
         rope_prefetch=rope_prefetch,
         scale_coalesce=scale_coalesce,
         slot_hoist=slot_hoist,
@@ -483,6 +477,11 @@ def flydsl_sparse_mla_prefill_2region(
     cache's per-block UE8M0 scale bytes are folded in.  region1 always reads its
     UE8M0 scale bytes via the convert path.
 
+    ``persist_wg`` is resolved for you: the kernel runs persistently with one
+    workgroup per CU, each walking a contiguous run of queries, and falls back to
+    one workgroup per query when ``single_request=False``.  Pass an explicit count
+    only to override the grid.
+
     ``rope_bf16`` selects the QK RoPE precision: ``False`` (default) re-quantizes
     the bf16 RoPE tail to fp8 (faster, ~2-4%); ``True`` dots the 64 RoPE dims in
     bf16 to match the vLLM NoPE-fp8 / RoPE-bf16 contract.
@@ -605,9 +604,6 @@ def flydsl_sparse_mla_prefill_dsv4(
     single_request: bool = True,
     validate_regions: bool = True,
     vt_inreg: bool = False,
-    kv_double_buffer: bool = False,
-    kv_pf_late: bool = False,
-    vt_wide: bool = False,
     rope_prefetch: bool = True,
     scale_coalesce: bool = True,
     slot_hoist: bool = False,
@@ -706,9 +702,6 @@ def flydsl_sparse_mla_prefill_dsv4(
         r1_tb_carry=r1_tb_carry,
         persist_wg=persist_wg,
         vt_inreg=vt_inreg,
-        kv_double_buffer=kv_double_buffer,
-        kv_pf_late=kv_pf_late,
-        vt_wide=vt_wide,
         rope_prefetch=rope_prefetch,
         scale_coalesce=scale_coalesce,
         slot_hoist=slot_hoist,

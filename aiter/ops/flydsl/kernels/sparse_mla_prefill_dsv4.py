@@ -86,28 +86,7 @@ VT_HALF_STRIDE: int = VT_BLKS_PER_ROW_PAD * 16  # 1056
 VT_COLBLK_STRIDE: int = 16
 VT_OFFSET_TL_BL: int = 4 * VT_ROWBLK_STRIDE  # 8448
 
-# ---- VtManagerWide: operand-major V^T staging (vt_wide=True) ---------------
-# The default layout gives a warp a 16-row x 128-col quadrant, so a lane holds
-# only 4 of the 8 rows an A operand needs and GEMM2 must reassemble each operand
-# from two ds_read_b32 a VT_OFFSET_TL_BL apart. Splitting V as 32 rows x 64 cols
-# per warp instead lets a lane read 8 rows x 4 cols, transpose to 4 *complete*
-# operands, and store them as 32 contiguous bytes -- so the write stays 2 x
-# ds_write_b128 and GEMM2 reads one ds_read_b64 per operand. Net -28 LDS
-# instructions per lane per tile, which matters because this kernel is
-# instruction-issue bound.
-#
-#     addr(q, col) = q*VT2_Q_STRIDE + (col//8)*VT2_GRP + (col%8)*8
-#
-# VT2_GRP must be a multiple of 16 so the ds_write_b128 stays 16-byte aligned
-# and the ds_read_b64 8-byte aligned -- a padded stride breaks both and the
-# compiler splits them (measured 2x slower). Unpadded (64) is conflict-free for
-# the 32 reads per lane per tile and only 2-way for the 2 writes, which is the
-# right side to favour.
-VT2_GRP: int = 8 * 8  # 64
-VT2_Q_STRIDE: int = (V_HEAD_DIM // 8) * VT2_GRP  # 4352
-SZ_LDS_VT2: int = 4 * VT2_Q_STRIDE  # 17408
-
-# ---- OManager16bitsV2 (bf16 output via LDS reshape; reuses KV buffer 0) ----
+# ---- OManager16bitsV2 (bf16 output via LDS reshape; reuses the KV buffer) ----
 O16_NUM_ROWS: int = 16
 O16_NUM_COLS: int = 32
 O16_PAD_ELEM_PER_2ROWS: int = 4
@@ -117,12 +96,11 @@ SZ_LDS_O16: int = NUM_WARPS * O16_LDS_PER_WARP  # 8704
 
 # ---- Overall LDS layout (byte offsets) ----
 # Q goes straight to VGPRs and V is transposed in registers, so neither needs a
-# staging region. What remains is the double-buffered KV tile plus, under
-# rope_bf16, the double-buffered bf16 RoPE K tiles. Output staging aliases KV
-# buffer 0, which is dead by the time the epilogue runs.
+# staging region. What remains is one KV tile plus, under rope_bf16, the
+# double-buffered bf16 RoPE K tiles. Output staging aliases the KV buffer, which
+# is dead by the time the epilogue runs.
 P_LDS_KV_0: int = 0
-P_LDS_KV_1: int = SZ_LDS_KV  # 16896
-P_LDS_RBF: int = 2 * SZ_LDS_KV  # 33792 (only allocated when rope_bf16)
+P_LDS_RBF: int = SZ_LDS_KV  # 16896 (only allocated when rope_bf16)
 
 assert SZ_LDS_O16 <= SZ_LDS_KV, "Output LDS must fit in the KV buffer region"
 
@@ -160,14 +138,14 @@ RBF_ROW_PAD: int = 4  # bf16 padding per kv-row to spread LDS banks
 RBF_ROW_STRIDE: int = (PK_ROPE_DIM + RBF_ROW_PAD) * 2  # 136 B per kv-row
 SZ_LDS_RBF: int = BLOCK_N * RBF_ROW_STRIDE  # 4352 B per tile
 
-def _lds_layout(rope_bf16: bool, vt_inreg: bool, vt_wide: bool = False):
+def _lds_layout(rope_bf16: bool, vt_inreg: bool):
     """Byte offset of the V^T region and the total allocation.
 
-    KV double buffer first, then the (double-buffered) bf16 RoPE K tiles under
+    The KV tile first, then the (double-buffered) bf16 RoPE K tiles under
     rope_bf16, then V^T staging unless it is transposed in registers.
     """
     p_vt = P_LDS_RBF + (2 * SZ_LDS_RBF if rope_bf16 else 0)
-    sz_vt = 0 if vt_inreg else (SZ_LDS_VT2 if vt_wide else SZ_LDS_VT)
+    sz_vt = 0 if vt_inreg else SZ_LDS_VT
     total = p_vt + sz_vt
     assert total <= 65536, f"gfx942 LDS cap: need {total} B"
     return p_vt, total
@@ -299,13 +277,6 @@ def _lds_load(byte_addr_index, vec_type, static_byte_offset=0):
     return _ptr_load(vec_type, lds_ptr, alignment=16, nontemporal=True)
 
 
-def _lds_load_at(base_idx, vec_type, byte_offset=0, alignment=4):
-    ptr = _inttoptr_lds(base_idx)
-    if byte_offset != 0:
-        ptr = _gep(ptr, static_byte_offset=byte_offset)
-    return _ptr_load(vec_type, ptr, alignment=alignment, nontemporal=True)
-
-
 def _lds_load_volatile(base_i32, vec_type, byte_offset=0):
     lds_ptr = _inttoptr_lds(ArithValue(base_i32).extui(T.i64))
     if byte_offset != 0:
@@ -370,9 +341,6 @@ def compile_sparse_mla_prefill_dsv4(
     r1_tb_carry: bool = False,
     persist_wg: int = 0,
     vt_inreg: bool = False,
-    kv_double_buffer: bool = False,
-    kv_pf_late: bool = False,
-    vt_wide: bool = False,
     rope_prefetch: bool = True,
     scale_coalesce: bool = True,
     slot_hoist: bool = False,
@@ -395,21 +363,27 @@ def compile_sparse_mla_prefill_dsv4(
                  DMA'd region0 must already be fnuz (r0_convert=False implies
                  r0_is_ocp=False).
     single_request: hardwire req_id=0 instead of reading q_req[q].
-    persist_wg:  launch a fixed grid of this many workgroups, each walking a
-                 contiguous run of queries, instead of one workgroup per query. 0
-                 keeps one-per-query; the wrapper resolves -1 to the CU count.
+    persist_wg:  workgroups to launch, each walking a contiguous run of queries.
+                 The wrapper resolves -1 (its default) to the CU count, which is the
+                 grid at which every workgroup is resident -- occupancy is one
+                 workgroup per CU, 8 waves at 2 waves/SIMD. 0 falls back to one
+                 workgroup per query, which is what a non-single_request launch gets
+                 since req_id is resolved once per workgroup.
 
-                 MEASURED -0.89% [-0.77, -1.05] at one workgroup per CU (304 on
-                 MI300X). The grid matters more than the idea: 608 costs +0.56% for a
-                 second scheduling round, and 152 costs +43% by leaving half the CUs
-                 idle. Queries are assigned in contiguous runs rather than by grid
-                 stride, so successive queries stay adjacent in Q, the output and the
-                 CSR ranges -- the stream contiguity xcd_remap showed is worth 1.45%.
+                 Worth -0.89% on its own, and the grid dominates: 608 costs +0.56%
+                 for a second scheduling round, 152 costs +43% by idling half the CUs.
+                 Queries go out in contiguous runs, not by grid stride, so successive
+                 queries stay adjacent in Q, the output and the CSR ranges.
 
-                 Needs a cross-query LDS barrier the per-tile one cannot provide (it
-                 sits after the DMA is issued); without it chunk sizes 2 and 4 gave
-                 wrong answers. Requires single_request, since req_id is resolved once
-                 per workgroup and _row_addrs closes over it.
+                 The persistent path also prefetches Q one query ahead, issuing it at
+                 the tile-loop exit and draining before the cross-query barrier so it
+                 spans the O rescale, the pack, the LDS staging and the stores -- the
+                 only stretch with no vmcnt wait to cut it short. Worth a further
+                 -0.5%, but only once the surplus read that a one-ahead pipeline
+                 implies is clamped to this workgroup's own last query; aimed at the
+                 global last it was a cold 128 KB fetch and the whole thing measured
+                 0.2% slower.
+
     rope_fp8:    the cache's RoPE tail is already fnuz fp8 in the 64 bytes at
                  PK_NOPE_BYTES, so block 7 rides the same buffer_load_to_lds as
                  blocks 0..6 and the bf16->fp8 convert disappears. That convert's
@@ -442,31 +416,14 @@ def compile_sparse_mla_prefill_dsv4(
                  which measured net slower on gfx942 -- the kernel is issue
                  bound, and there is no hardware byte-transpose (that is gfx950's
                  ds_read_b64_tr_b8). Off by default; kept for A/B.
-    kv_double_buffer: DMA the next tile's NoPE blocks into the alternate KV
-                 buffer during this tile's QK MFMAs. Cuts stall ~8%, but adds 7
-                 inline m0/DMA sequences per tile and measured net slower -- this
-                 kernel is instruction-issue bound, not latency bound. Off by
-                 default; kept for A/B.
-    kv_pf_late:  with kv_double_buffer, issue the 7 prefetch DMAs in one batch
-                 after the softmax instead of interleaved into the QK MFMA
-                 loop. GEMM1 is the LDS-busiest phase, so the DMA writes
-                 contend there; issuing after leaves GEMM2 (~2000 cycles) to
-                 land, and keeps them clear of the softmax's slot loads in
-                 the in-order vmcnt.
-    vt_wide:     split V as 32 rows x 64 cols per warp so a lane transposes
-                 complete 8-row A operands. GEMM2 then reads one ds_read_b64 per
-                 operand instead of two ds_read_b32, cutting 32 LDS instructions
-                 per lane per tile for 4 more on the V read. Ignored under
-                 vt_inreg (which has no V^T at all).
     rope_prefetch: issue the RoPE tail's global load one tile ahead and commit
                  it (cvt + ds_write) at the top of the next tile. Unlike the
                  NoPE DMA this load is register-staged, so its s_waitcnt sits
                  at the top of the tile and -- vmcnt being in-order -- drags
                  the NoPE DMAs with it. Only pays off together with
-                 kv_double_buffer -- but MEASURED: rope_prefetch alone is the
-                 best of the four corners (-2.2% vs neither), because
-                 kv_double_buffer's own 7 m0/DMA sequences per tile cost more
-                 than the DMA latency they hide. On by default.
+                 a KV double buffer, which was tried and measured +2.14% slower
+                 (its 7 m0/DMA sequences per tile cost more than the latency they
+                 hid) and has since been removed. On by default.
     scale_coalesce: fetch a token's UE8M0 exponents with one dwordx2 hoisted out
                  of the block loop instead of one dword per block. The per-block
                  form costs 7 fetches the compiler will not CSE even though
@@ -497,9 +454,6 @@ def compile_sparse_mla_prefill_dsv4(
     ROPE_BF16 = bool(rope_bf16)
     ROPE_FP8 = bool(rope_fp8)
     VT_INREG = bool(vt_inreg)
-    KV_DB = bool(kv_double_buffer)
-    KV_PF_LATE = bool(kv_pf_late)
-    VT_WIDE = bool(vt_wide) and not bool(vt_inreg)
     ROPE_PF = bool(rope_prefetch)
     SCALE_COALESCE = bool(scale_coalesce)
     SLOT_HOIST = bool(slot_hoist)
@@ -512,12 +466,12 @@ def compile_sparse_mla_prefill_dsv4(
     # convert path, which is the only consumer of the scale base.
     # ROPE_FP8 retires the rope prefetch, but the token-base carry is worth keeping
     # on its own: it moves _row_addrs a tile earlier rather than adding a call.
-    TB_CARRY = (KV_DB or ROPE_PF or ROPE_FP8) and not R0_CONVERT
+    TB_CARRY = (ROPE_PF or ROPE_FP8) and not R0_CONVERT
     # Region1 can carry too, but only off the convert path: the convert is the sole
     # consumer of the scale base, and only the token base is carried.
     R1_TB_CARRY = TB_CARRY and not R1_CONVERT and bool(r1_tb_carry)
     PERSIST_WG = int(persist_wg)
-    P_LDS_VT, TOTAL_LDS_BYTES = _lds_layout(ROPE_BF16, VT_INREG, VT_WIDE)
+    P_LDS_VT, TOTAL_LDS_BYTES = _lds_layout(ROPE_BF16, VT_INREG)
 
     if PERSIST_WG > 0 and not SINGLE_REQUEST:
         raise ValueError(
@@ -758,30 +712,6 @@ def compile_sparse_mla_prefill_dsv4(
         # ---- fire-and-forget DMA of one NoPE block into the *next* KV buffer --
         # Same instruction as _load_nope_dma but emitted as raw asm so it can be
         # issued mid-MFMA-loop without the compiler sinking it to its use.
-        def _prefetch_nope_block_asm(cache_rsrc, p_lds_kv_warp, token_base_i32, block_idx_const):
-            lds_adjust = block_idx_const * KV_BLOCK_BYTES - block_idx_const * KV_NUM_COLS
-            lds_base_i32 = _i32(ArithValue(p_lds_kv_warp) + lds_adjust)
-
-            def _emit_normal_load():
-                voff = _i32(ArithValue(token_base_i32) + kv_ld_col_base)
-                col_off_imm = block_idx_const * KV_NUM_COLS
-                lds_base_sgpr = _uniform_i32(lds_base_i32)
-                asm_str = (
-                    "s_mov_b32 m0, $0\n"
-                    "s_nop 0\n"
-                    f"buffer_load_dword $1, $2, 0 offen offset:{col_off_imm} lds"
-                )
-                _inline_asm_void([lds_base_sgpr, voff, _raw(cache_rsrc)], asm_str, "s,v,s")
-
-            is_oob = ArithValue(token_base_i32) == -1
-            if is_oob:
-                lds_addr = _i32(
-                    ArithValue(lds_base_i32) + block_idx_const * KV_NUM_COLS + _i32(lane_idx) * 4
-                )
-                _inline_asm_void([lds_addr, _raw(c_zero_i32)], "ds_write_b32 $0, $1", "v,v")
-            else:
-                _emit_normal_load()
-
         def _flush_nan(fval):
             bits = _raw(ArithValue(_f32(fval)).bitcast(T.i32))
             absb = ArithValue(bits) & 0x7FFFFFFF
@@ -1004,79 +934,6 @@ def compile_sparse_mla_prefill_dsv4(
                 for c in range_constexpr(8)
             ]
 
-        # ---- vt_wide: 32 rows x 64 cols per warp -------------------------
-        # Lane L takes operand row group q = L/16 (KV rows {4q..4q+3} and
-        # {16+4q..16+4q+3}, the pairing the P operand already uses) and the 4
-        # columns 64*warp + 4*(L%16). Eight ds_read_b32, one per row.
-        def _load_v_rows8(p_lds_kv_base_idx, warp_idx_val, lane_idx_val):
-            q = lane_idx_val / 16
-            base = (
-                p_lds_kv_base_idx
-                + warp_idx_val * KV_BLOCK_BYTES
-                + (lane_idx_val % 16) * 4
-                + q * (2 * KV_SUB_BYTES)
-            )
-            rows = []
-            for j in range_constexpr(4):
-                rows.append(_lds_load_at(base, T.i32, byte_offset=VROW4_OFF[j]))
-            for j in range_constexpr(4):
-                rows.append(
-                    _lds_load_at(
-                        base, T.i32, byte_offset=2 * KV_BYTES_PER_ROW + VROW4_OFF[j]
-                    )
-                )
-            return rows
-
-        # 8 dwords (8 rows x 4 cols) -> 4 complete operands, emitted as
-        # [lo0, hi0, lo1, hi1, ...] so operand c occupies bytes 8c..8c+7.
-        # Reuses the same four v_perm selectors as the 4x8 transpose, 16 total.
-        def _transpose_v8(rows8):
-            def _quad(d0, d1, d2, d3):
-                t0 = _vt_perm(d1, d0, c_perm0)
-                t2 = _vt_perm(d1, d0, c_perm1)
-                t1 = _vt_perm(d3, d2, c_perm0)
-                t3 = _vt_perm(d3, d2, c_perm1)
-                return [
-                    _vt_perm(t1, t0, c_perm2),
-                    _vt_perm(t1, t0, c_perm3),
-                    _vt_perm(t3, t2, c_perm2),
-                    _vt_perm(t3, t2, c_perm3),
-                ]
-
-            lo = _quad(rows8[0], rows8[1], rows8[2], rows8[3])
-            hi = _quad(rows8[4], rows8[5], rows8[6], rows8[7])
-            out = []
-            for c in range_constexpr(4):
-                out.append(lo[c])
-                out.append(hi[c])
-            return out
-
-        def _store_vt8_to_lds(vt_region_idx, warp_idx_val, lane_idx_val, ops8):
-            q = lane_idx_val / 16
-            lm = lane_idx_val % 16
-            addr = (
-                vt_region_idx
-                + q * VT2_Q_STRIDE
-                + (warp_idx_val * 8 + lm / 2) * VT2_GRP
-                + (lm % 2) * 32
-            )
-            Vec(Vec.from_elements(ops8[0:4], fx.Int32)).bitcast(fx.Int8).store(
-                lds_buffer, [addr]
-            )
-            Vec(Vec.from_elements(ops8[4:8], fx.Int32)).bitcast(fx.Int8).store(
-                lds_buffer, [addr + 16]
-            )
-
-        def _load_vt8_from_lds(vt_base_i32, col_offset):
-            return _lds_load_volatile(
-                vt_base_i32, T.i64, byte_offset=(col_offset // 8) * VT2_GRP
-            )
-
-        def _vt8_base_i32():
-            lm = lane_idx % 16
-            off = (lane_idx / 16) * VT2_Q_STRIDE + (lm / 8) * VT2_GRP + (lm % 8) * 8
-            return _i32(ArithValue(lds_base_idx + P_LDS_VT) + off)
-
         def _load_v_from_lds(p_lds_kv_base_idx, warp_idx_val, lane_idx_val):
             row = (warp_idx_val % 2) * 16 + (lane_idx_val / 16) * 4
             row_mod16 = row % 16
@@ -1189,7 +1046,12 @@ def compile_sparse_mla_prefill_dsv4(
         # Loading it directly puts all 16 loads in flight behind a single wait,
         # instead of 8 serialized rounds each with a ds_write/ds_read pair and
         # three lgkmcnt(0) stalls.
-        def _load_q_direct(q_idx_val):
+        def _issue_q_nope(q_idx_val):
+            """Issue the Q NoPE loads without waiting, so a persistent workgroup can
+            start the next query's Q at this query's tile-loop exit. From there it
+            spans the O rescale, the bf16 pack, the LDS staging and the output stores
+            -- the one stretch with no vmcnt wait to cut it short.
+            """
             head = warp_idx * 16 + (lane_idx % 16)
             base_elem = (
                 (_idx(q_idx_val) * NUM_QO_HEADS + head) * QK_HEAD_DIM + (lane_idx / 16) * 8
@@ -1202,12 +1064,22 @@ def compile_sparse_mla_prefill_dsv4(
                         query_rsrc, _i32(ArithValue(elem) // 2), vec_width=4, dtype=T.i32
                     )
                 )
-            rocdl.s_waitcnt(_encode_waitcnt(vmcnt=0))
+            return raws
+
+        def _commit_q_nope(raws, keep=0):
+            # ``keep`` leaves that many younger VMEM ops outstanding. The persistent
+            # path drains here with the epilogue's 16 output stores still in flight;
+            # they were issued after Q and vmcnt retires in order, so vmcnt(0) would
+            # wait on writes nothing needs.
+            rocdl.s_waitcnt(_encode_waitcnt(vmcnt=keep))
             packs = []
             for t in range_constexpr(NUM_NOPE_ITERS * 2):
                 w0, w1 = _bf16x4dw_to_fp8x2dw(raws[t])
                 packs.append(_pack_i32x2(w0, w1))
             return packs
+
+        def _load_q_direct(q_idx_val):
+            return _commit_q_nope(_issue_q_nope(q_idx_val))
 
 
         # ---- Q RoPE bf16 B-operands (split dot) ------------------------------
@@ -1331,25 +1203,11 @@ def compile_sparse_mla_prefill_dsv4(
             rm_in,
             rse_in,
             is_first,
-            p_lds_kv_next_warp=None,
-            prefetch_cache_rsrc=None,
-            token_base_next=None,
             q_rope_b=None,
             slots=None,
             rbf_base=None,
         ):
             k_base_i32 = _i32(ArithValue(p_lds_kv_base) + k_lds_lane_offset)
-            do_prefetch = p_lds_kv_next_warp is not None
-
-            def _maybe_prefetch(block_idx):
-                if const_expr(not do_prefetch):
-                    return
-                _prefetch_nope_block_asm(
-                    prefetch_cache_rsrc, p_lds_kv_next_warp, token_base_next, block_idx
-                )
-
-            if const_expr(not KV_PF_LATE):
-                _maybe_prefetch(0)
             P_COMP_SUBS = BLOCK_N // MFMA_N
             p_comp = [c_zero_v4f32] * P_COMP_SUBS
             for nope_pair in range_constexpr(NUM_FP8_QK_ITERS):
@@ -1363,8 +1221,6 @@ def compile_sparse_mla_prefill_dsv4(
                     _load_k_from_lds(k_base_i32, 16 * h, tile_1 * BLOCK_K)
                     for h in range_constexpr(P_COMP_SUBS)
                 ]
-                if const_expr(nope_pair + 1 < PK_NOPE_BLOCKS and not KV_PF_LATE):
-                    _maybe_prefetch(nope_pair + 1)
                 rocdl.sched_barrier(0)
                 rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=P_COMP_SUBS))
                 q_0 = q_nope[tile_0]
@@ -1409,10 +1265,7 @@ def compile_sparse_mla_prefill_dsv4(
             # iteration 0's lgkmcnt(P_COMP_SUBS) drain 6 ops instead of 2, at the
             # top of the loop where no MFMA has issued yet to cover it. Here the
             # MFMA pipeline is still draining, which covers more of it.
-            if const_expr(VT_WIDE):
-                v8_raw = _load_v_rows8(p_lds_kv_base, warp_idx, lane_idx)
-                rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
-            elif const_expr(not VT_INREG):
+            if const_expr(not VT_INREG):
                 v8_raw = _load_v_from_lds(p_lds_kv_base, warp_idx, lane_idx)
                 rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
             rocdl.sched_barrier(0)
@@ -1421,41 +1274,11 @@ def compile_sparse_mla_prefill_dsv4(
                 kv_tile_start_i32, kv_end_i32, slots=slots,
             )
             p_pack = _pack_p_to_fp8(p_exp_vals)
-            if const_expr(VT_WIDE):
-                _store_vt8_to_lds(
-                    lds_base_idx + P_LDS_VT, warp_idx, lane_idx, _transpose_v8(v8_raw)
-                )
-            elif const_expr(not VT_INREG):
+            if const_expr(not VT_INREG):
                 _store_vt_to_lds(
                     lds_base_idx + P_LDS_VT, warp_idx, lane_idx, _transpose_v(v8_raw)
                 )
-            if const_expr(KV_PF_LATE):
-                for blk in range_constexpr(PK_NOPE_BLOCKS):
-                    _maybe_prefetch(blk)
             return rm_new, rse_new, p_pack, rescale
-
-        def _gemm2_core_vt_wide(p_pack, oaccu, vt_base_i32):
-            # One ds_read_b64 per operand: the stored bytes are already the
-            # complete 8-row A operand.
-            for pv_pair in range_constexpr(NUM_PV_ITERS // 2):
-                ops = []
-                for it in range_constexpr(2):
-                    strip = (pv_pair * 2 + it) * MFMA_N * 2
-                    ops.append(_load_vt8_from_lds(vt_base_i32, strip))
-                    ops.append(_load_vt8_from_lds(vt_base_i32, strip + MFMA_N))
-                waits = [2, 0]
-                for it in range_constexpr(2):
-                    rocdl.sched_barrier(0)
-                    rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=waits[it]))
-                    acc = (pv_pair * 2 + it) * 2
-                    oaccu[acc] = _mfma_fp8(
-                        T.f32x4, [ops[it * 2], p_pack, oaccu[acc], 0, 0, 0]
-                    )
-                    oaccu[acc + 1] = _mfma_fp8(
-                        T.f32x4, [ops[it * 2 + 1], p_pack, oaccu[acc + 1], 0, 0, 0]
-                    )
-                rocdl.sched_barrier(0)
-            return oaccu
 
         def _gemm2_core_vt(p_pack, oaccu, vt_base_i32):
             for pv_pair in range_constexpr(NUM_PV_ITERS // 2):
@@ -1507,14 +1330,11 @@ def compile_sparse_mla_prefill_dsv4(
                     s = grp * 8 + c
                     oaccu[s] = _mfma_fp8(T.f32x4, [ops[c], p_pack, oaccu[s], 0, 0, 0])
                 cur = nxt
-            if const_expr(not KV_DB):
-                # WAR guard: V is read from the KV tile here, so with a single
-                # buffer the next tile's load would overwrite it mid-read. The
-                # double-buffered path writes the other buffer and does not need
-                # this. Omitting it produced a non-deterministic multitile-only
-                # mismatch, which is exactly the signature of this race.
-                _barrier(lgkmcnt=0)
-                rocdl.sched_barrier(0)
+            # WAR guard: V is read from the KV tile here, so the next tile's load
+            # would overwrite it mid-read. Omitting this produced a
+            # non-deterministic multitile-only mismatch, the signature of that race.
+            _barrier(lgkmcnt=0)
+            rocdl.sched_barrier(0)
             return oaccu
 
 
@@ -1527,12 +1347,10 @@ def compile_sparse_mla_prefill_dsv4(
         def _gemm2_run(p_pack, oaccu, kv_base):
             if const_expr(VT_INREG):
                 return _gemm2_core_inreg(p_pack, oaccu, kv_base)
-            # Barrier B publishes V^T. It also happens to guard the KV buffer,
-            # but KV is double buffered so that is no longer load-bearing.
+            # Barrier B publishes V^T, and with a single KV buffer it also guards
+            # that buffer against the next tile's load.
             _barrier(lgkmcnt=0)
             rocdl.sched_barrier(0)
-            if const_expr(VT_WIDE):
-                return _gemm2_core_vt_wide(p_pack, oaccu, _vt8_base_i32())
             return _gemm2_core_vt(p_pack, oaccu, _vt_base_i32())
 
         def _gemm2_first_iter(p_pack, kv_base):
@@ -1629,6 +1447,11 @@ def compile_sparse_mla_prefill_dsv4(
             p_lds_o = p_lds_kv_0_base
             # sink: fold a per-head virtual key (score=sink[h], zero value).
             if const_expr(HAS_SINK):
+                # Loaded here rather than hoisted out of the persistent loop. The
+                # value is query-invariant, but keeping it live across the loop cost
+                # +2.28%: it leaves the allocator one fewer register to rotate through,
+                # which stalls buffer_load issue (+101 cyc/wave-tile). Lifetime is
+                # dearer than the reload here.
                 head = _i32(
                     ArithValue(_uniform_i32(warp_idx)) * 16 + ArithValue(_i32(lane_idx % 16))
                 )
@@ -1686,14 +1509,12 @@ def compile_sparse_mla_prefill_dsv4(
                     _store_o8_bf16(dws, grp * 128 + j * 32, p_lds_o, row_base_idx)
 
         p_lds_kv_0_base = lds_base_idx + P_LDS_KV_0
-        p_lds_kv_1_base = lds_base_idx + P_LDS_KV_1
 
         def _kv_warp_lds_base(p_lds_kv_base):
             warp_offset = _raw(ArithValue(_uniform_i32(warp_idx)) * KV_SUB_BYTES)
             return _raw(ArithValue(_i32(p_lds_kv_base)) + warp_offset)
 
         p_lds_kv_0_warp = _kv_warp_lds_base(p_lds_kv_0_base)
-        p_lds_kv_1_warp = _kv_warp_lds_base(p_lds_kv_1_base)
 
         def p_lds_rbf_base(slot):
             # Only read under ROPE_BF16; the region is not allocated otherwise.
@@ -1703,7 +1524,7 @@ def compile_sparse_mla_prefill_dsv4(
         # Factored out so a persistent grid can run it more than once per
         # workgroup. req_id stays outside (and _row_addrs closes over it), so
         # persistence is restricted to SINGLE_REQUEST.
-        def _one_query(q_idx):
+        def _one_query(q_idx, q_packs=None, q_next=None):
             # ---- CSR ranges ----
             main_rng = Vec(
                 buffer_ops.buffer_load(main_indptr_rsrc, q_idx, vec_width=2, dtype=T.i32)
@@ -1745,7 +1566,10 @@ def compile_sparse_mla_prefill_dsv4(
                 slot0_pre = _issue_row_slot(main_indices_rsrc, main_start)
             else:
                 slot0_pre = None
-            q_nope_packs = _load_q_direct(q_idx)
+            if const_expr(q_packs is None):
+                q_nope_packs = _load_q_direct(q_idx)
+            else:
+                q_nope_packs = q_packs
             q_rope_packs = _load_q_rope_bf16(q_idx) if const_expr(ROPE_BF16) else None
 
             # NOTE: a one-tile CSR slot lookahead (issue tile g+1's slot loads during
@@ -1787,17 +1611,10 @@ def compile_sparse_mla_prefill_dsv4(
                 )
                 _barrier(vmcnt=0, lgkmcnt=0)
                 rocdl.sched_barrier(0)
-                pf_kwargs = {}
-                if const_expr(KV_DB and not R0_CONVERT):
-                    pf_kwargs = dict(
-                        p_lds_kv_next_warp=p_lds_kv_1_warp,
-                        prefetch_cache_rsrc=main_cache_rsrc,
-                        token_base_next=tb_next,
-                    )
                 rm_n, rse_n, p_pack, rescale = _process_tile_gemm1(
                     main_indices_rsrc, main_num_rows, p_lds_kv_0_base, kv_tile_start_i32, main_end,
                     q_nope_packs, rm_in, rse_in, is_first, q_rope_b=q_rope_packs,
-                    rbf_base=p_lds_rbf_base(0), **pf_kwargs,
+                    rbf_base=p_lds_rbf_base(0),
                 )
                 # Issue tile 1's RoPE load after the softmax, so the softmax's own
                 # slot loads do not drag it in via the in-order vmcnt, and nothing
@@ -1832,20 +1649,11 @@ def compile_sparse_mla_prefill_dsv4(
             # whose last reader was tile g-1's GEMM2.
             def _load_gemm1_select(global_t_i32, rm_in, rse_in, is_first, rp0, rp1, tb_c):
                 is_r1 = _raw(ArithValue(global_t_i32) >= ArithValue(n0_tiles))
-                # Without double buffering everything stays in buffer 0, which keeps
-                # the K/V base addresses loop-invariant so they hoist out of the tile
-                # loop. Alternating makes them a runtime select recomputed per tile.
-                if const_expr(KV_DB):
-                    is_odd = (ArithValue(global_t_i32) & 1) != 0
-                    cur_base = ArithValue(is_odd).select(p_lds_kv_1_base, p_lds_kv_0_base)
-                    cur_warp = ArithValue(is_odd).select(p_lds_kv_1_warp, p_lds_kv_0_warp)
-                    next_warp = ArithValue(is_odd).select(p_lds_kv_0_warp, p_lds_kv_1_warp)
-                    cur_rbf = ArithValue(is_odd).select(p_lds_rbf_base(1), p_lds_rbf_base(0))
-                else:
-                    cur_base = p_lds_kv_0_base
-                    cur_warp = p_lds_kv_0_warp
-                    next_warp = p_lds_kv_1_warp
-                    cur_rbf = p_lds_rbf_base(0)
+                # Everything stays in the one KV buffer, which keeps the K/V base
+                # addresses loop-invariant so they hoist out of the tile loop.
+                cur_base = p_lds_kv_0_base
+                cur_warp = p_lds_kv_0_warp
+                cur_rbf = p_lds_rbf_base(0)
                 rm_n = c_neg_large
                 rse_n = c_zero_f32
                 pp = fx.Int64(0)
@@ -1917,7 +1725,7 @@ def compile_sparse_mla_prefill_dsv4(
                             main_cache_rsrc, cur_warp, tb, sb,
                             fx.Float32(1.0) if R0_OCP else fx.Float32(0.0),
                         )
-                    elif const_expr(not KV_DB):
+                    else:
                         _load_nope_dma(main_cache_rsrc, cur_warp, tb)
                     if const_expr(ROPE_FP8):
                         _dma_rope_block(main_cache_rsrc, cur_warp, tb)
@@ -1935,17 +1743,10 @@ def compile_sparse_mla_prefill_dsv4(
                     )
                     _barrier(vmcnt=0, lgkmcnt=0)
                     rocdl.sched_barrier(0)
-                    pf_kwargs = {}
-                    if const_expr(KV_DB and not R0_CONVERT):
-                        pf_kwargs = dict(
-                            p_lds_kv_next_warp=next_warp,
-                            prefetch_cache_rsrc=main_cache_rsrc,
-                            token_base_next=tb_next,
-                        )
                     rm_n, rse_n, pp, rescale = _process_tile_gemm1(
                         main_indices_rsrc, main_num_rows, cur_base, kv_ts, main_end,
                         q_nope_packs, rm_in, rse_in, is_first, q_rope_b=q_rope_packs,
-                        rbf_base=cur_rbf, **pf_kwargs,
+                        rbf_base=cur_rbf,
                     )
                     if const_expr(ROPE_PF and not ROPE_FP8):
                         nxt = Vec(_issue_rope_load(main_cache_rsrc, tb_next))
@@ -1983,22 +1784,50 @@ def compile_sparse_mla_prefill_dsv4(
                     )
                     oaccu_n = _gemm2_with_rescale(pp, rescale, oaccu_c, cur_base)
                     results = yield [rm_n, rse_n] + oaccu_n + [rp0_n, rp1_n, tb_n]
+                if const_expr(q_next is not None):
+                    nq = _issue_q_nope(q_next)
                 rm_final = results[0]
                 rse_final = results[1]
                 oaccu_final = [results[2 + i] for i in range(N_ACC)]
                 _normalize_and_store(oaccu_final, rm_final, rse_final, row_base)
+                if const_expr(q_next is not None):
+                    return _raw(Vec.from_elements(_commit_q_nope(nq, keep=16), fx.Int64))
+                return None
 
             def _single_tile_path():
+                if const_expr(q_next is not None):
+                    nq = _issue_q_nope(q_next)
                 _normalize_and_store(oaccu_first, rm_first, rse_first, row_base)
+                if const_expr(q_next is not None):
+                    return _raw(Vec.from_elements(_commit_q_nope(nq, keep=16), fx.Int64))
+                return None
 
+            # The prefetched packs leave the has_multi branch as loop state, and an
+            # scf.if yields only MLIR-backed values -- not a Python list, not None --
+            # so they ride out as one vector and the no-prefetch form is a separate
+            # compile-time arm.
             @flyc.jit
-            def _dispatch():
+            def _dispatch_plain():
                 if has_multi:
                     _multi_tile_path()
                 else:
                     _single_tile_path()
 
-            _dispatch()
+            @flyc.jit
+            def _dispatch_pf():
+                qn = _raw(
+                    Vec.from_elements([fx.Int64(0)] * (NUM_NOPE_ITERS * 2), fx.Int64)
+                )
+                if has_multi:
+                    qn = _multi_tile_path()
+                else:
+                    qn = _single_tile_path()
+                return qn
+
+            if const_expr(q_next is None):
+                _dispatch_plain()
+                return None
+            return _dispatch_pf()
 
         if const_expr(PERSIST_WG > 0):
             # Contiguous run per workgroup, not a grid stride: successive queries then
@@ -2017,15 +1846,47 @@ def compile_sparse_mla_prefill_dsv4(
                 > ArithValue(_i32(n_queries)).with_signedness(False)
             )
             q_hi = _i32(ArithValue(past).select(_raw(_i32(n_queries)), _raw(q_end)))
-            for qi, _st in range(_idx(q_lo), _idx(q_hi), _idx(1), init=[c_zero_i32]):
+            q_last = _i32(ArithValue(_i32(n_queries)) - 1)
+
+            def _q_clamped(i32v):
+                # A workgroup whose chunk starts past the end, and the last trip's
+                # qi+1, both address a query that does not exist. The buffer resource
+                # does not clamp that -- it faults -- so pin to the last valid query
+                # and let the value go unused.
+                over = _raw(
+                    ArithValue(i32v).with_signedness(False)
+                    > ArithValue(q_last).with_signedness(False)
+                )
+                return _idx(ArithValue(over).select(_raw(q_last), _raw(i32v)))
+
+            q_pre = _raw(Vec.from_elements(_load_q_direct(_q_clamped(q_lo)), fx.Int64))
+            for qi, st in range(_idx(q_lo), _idx(q_hi), _idx(1), init=[q_pre]):
+                qv = Vec(st[0])
+                q_packs = [_raw(qv[t]) for t in range_constexpr(NUM_NOPE_ITERS * 2)]
                 # WAR across queries: the KV and V^T LDS regions are reused, so every
                 # wave must finish reading this query's tiles before any wave's DMA
                 # starts overwriting them for the next. The per-tile barrier cannot
                 # cover this -- it sits after the DMA has already been issued.
                 _barrier(lgkmcnt=0)
                 rocdl.sched_barrier(0)
-                _one_query(_idx(qi))
-                _res = yield [c_zero_i32]
+                # Clamp the last trip's qi+1 to this workgroup's own last query rather
+                # than the global last: the redundant read then hits lines this
+                # workgroup just touched instead of pulling a cold 128 KB slice some
+                # other workgroup owns. That alone was worth 0.7%.
+                q_top = _i32(ArithValue(q_hi) - 1)
+                nxt_raw = _i32(_raw(ArithValue(fx.Int32(qi)) + 1))
+                over_top = _raw(
+                    ArithValue(nxt_raw).with_signedness(False)
+                    > ArithValue(q_top).with_signedness(False)
+                )
+                q_nxt = _one_query(
+                    _idx(qi),
+                    q_packs=q_packs,
+                    q_next=_idx(
+                        ArithValue(over_top).select(_raw(q_top), _raw(nxt_raw))
+                    ),
+                )
+                _res = yield [q_nxt]
         else:
             _one_query(q_idx)
 
