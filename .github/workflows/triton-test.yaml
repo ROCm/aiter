@@ -262,7 +262,6 @@ jobs:
           docker exec -w /workspace triton_test mkdir -p test-reports
           # MI35X: skip the MHA-PE tests that fail an accuracy check on gfx950 with the coming Triton release.
           docker exec -w /workspace triton_test pytest -v ${TRITON_TEST} \
-            --deselect "op_tests/triton_tests/attention/test_mha_with_pe.py::test_mha_backward_with_pe" \
             --deselect "op_tests/triton_tests/attention/test_mha_with_pe.py::test_mha_varlen_with_pe[True-0.17-96-64-8-1-64-128]" \
             --junitxml=test-reports/triton.xml
 
