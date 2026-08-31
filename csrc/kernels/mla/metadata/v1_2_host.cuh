@@ -3,6 +3,13 @@
 #include "aiter_hip_common.h"
 #include "ps.h"
 #include "v1_comm.cuh"
+#include <algorithm>
+#include <iomanip>
+#include <iostream>
+#include <map>
+#include <set>
+#include <utility>
+#include <vector>
 
 #define SPLIT_KV_OVERHEAD 0
 
@@ -237,17 +244,17 @@ void kn_generate_ps_metadata(std::vector<int32_t>& seqlens_qo_indptr,
     }
 }
 
-void get_ps_metadata_v1_2_host(const torch::Tensor& seqlens_qo_indptr, // [batch size + 1]
-                               const torch::Tensor& pages_kv_indptr,   // [batch size + 1]
-                               const torch::Tensor& context_lens,      // [batch size]
+void get_ps_metadata_v1_2_host(const aiter_tensor_t& seqlens_qo_indptr, // [batch size + 1]
+                               const aiter_tensor_t& pages_kv_indptr,   // [batch size + 1]
+                               const aiter_tensor_t& context_lens,      // [batch size]
                                const int32_t gqa_ratio,
                                const int32_t num_heads_k,
-                               torch::Tensor& work_metadata_ptrs,
-                               torch::Tensor& work_indptr,
-                               torch::Tensor& work_info,
-                               torch::Tensor& reduce_indptr,
-                               torch::Tensor& reduce_final_map,
-                               torch::Tensor& reduce_partial_map,
+                               aiter_tensor_t& work_metadata_ptrs,
+                               aiter_tensor_t& work_indptr,
+                               aiter_tensor_t& work_info,
+                               aiter_tensor_t& reduce_indptr,
+                               aiter_tensor_t& reduce_final_map,
+                               aiter_tensor_t& reduce_partial_map,
                                const int32_t qhead_granularity,
                                const int32_t qlen_granularity,
                                const int32_t kvlen_granularity,
@@ -269,19 +276,23 @@ void get_ps_metadata_v1_2_host(const torch::Tensor& seqlens_qo_indptr, // [batch
     const int32_t tgs_per_cluster    = available_tgs / num_clusters;
     const int32_t kheads_per_cluster = num_heads_k / num_clusters;
 
-    // prepare host buffer
-    auto seqlens_qo_indptr_vec = seqlens_qo_indptr.to(at::DeviceType::CPU);
-    auto pages_kv_indptr_vec   = pages_kv_indptr.to(at::DeviceType::CPU);
-    auto context_lens_vec      = context_lens.to(at::DeviceType::CPU);
+    // prepare host buffer (copy indptr/lens from device to host)
+    std::vector<int32_t> p_seqlens_qo_indptr(batch_size + 1);
+    std::vector<int32_t> p_pages_kv_indptr(batch_size + 1);
+    std::vector<int32_t> p_context_lens(batch_size);
 
-    std::vector<int32_t> p_seqlens_qo_indptr = {seqlens_qo_indptr_vec.data_ptr<int32_t>(),
-                                                seqlens_qo_indptr_vec.data_ptr<int32_t>() +
-                                                    batch_size + 1};
-    std::vector<int32_t> p_pages_kv_indptr   = {pages_kv_indptr_vec.data_ptr<int32_t>(),
-                                                pages_kv_indptr_vec.data_ptr<int32_t>() + batch_size +
-                                                    1};
-    std::vector<int32_t> p_context_lens      = {context_lens_vec.data_ptr<int32_t>(),
-                                                context_lens_vec.data_ptr<int32_t>() + batch_size};
+    HIP_CALL(hipMemcpy(p_seqlens_qo_indptr.data(),
+                       seqlens_qo_indptr.data_ptr(),
+                       (batch_size + 1) * sizeof(int32_t),
+                       hipMemcpyDefault));
+    HIP_CALL(hipMemcpy(p_pages_kv_indptr.data(),
+                       pages_kv_indptr.data_ptr(),
+                       (batch_size + 1) * sizeof(int32_t),
+                       hipMemcpyDefault));
+    HIP_CALL(hipMemcpy(p_context_lens.data(),
+                       context_lens.data_ptr(),
+                       batch_size * sizeof(int32_t),
+                       hipMemcpyDefault));
 
     std::vector<int32_t> work_indptr_vec(work_indptr.numel(), 0);
     std::vector<WorkInfo> work_info_vec(work_info.numel() / kSizeWorkInfoInDw, WorkInfo());
@@ -319,33 +330,31 @@ void get_ps_metadata_v1_2_host(const torch::Tensor& seqlens_qo_indptr, // [batch
                          reduce_final_map_vec,
                          reduce_partial_map_vec);
 
-    // H2D
-    auto input_options   = work_indptr.options();
-    auto input_dtype     = torch::TensorOptions().dtype(torch::kInt32);
-    auto work_indptr_cpu = torch::from_blob(
-        work_indptr_vec.data(), {work_indptr.numel()}, input_options.device(torch::kCPU));
-    work_indptr.copy_(work_indptr_cpu);
+    // H2D (copy host result buffers back into the caller-provided device tensors)
+    HIP_CALL(hipMemcpy(work_indptr.data_ptr(),
+                       work_indptr_vec.data(),
+                       work_indptr.numel() * sizeof(int32_t),
+                       hipMemcpyDefault));
 
-    auto work_info_cpu =
-        torch::from_blob(work_info_vec.data(),
-                         {static_cast<int64_t>(work_info_vec.size()), kSizeWorkInfoInDw},
-                         input_options.device(torch::kCPU));
-    work_info.copy_(work_info_cpu);
+    HIP_CALL(hipMemcpy(work_info.data_ptr(),
+                       work_info_vec.data(),
+                       work_info.numel() * sizeof(int32_t),
+                       hipMemcpyDefault));
 
-    auto reduce_indptr_cpu = torch::from_blob(
-        reduce_indptr_vec.data(), {reduce_indptr.numel()}, input_options.device(torch::kCPU));
-    reduce_indptr.copy_(reduce_indptr_cpu);
+    HIP_CALL(hipMemcpy(reduce_indptr.data_ptr(),
+                       reduce_indptr_vec.data(),
+                       reduce_indptr.numel() * sizeof(int32_t),
+                       hipMemcpyDefault));
 
-    auto reduce_final_map_cpu =
-        torch::from_blob(reduce_final_map_vec.data(),
-                         {static_cast<int64_t>(reduce_final_map_vec.size()), kSizeFinalLocInDw},
-                         input_options.device(torch::kCPU));
-    reduce_final_map.copy_(reduce_final_map_cpu);
+    HIP_CALL(hipMemcpy(reduce_final_map.data_ptr(),
+                       reduce_final_map_vec.data(),
+                       reduce_final_map.numel() * sizeof(int32_t),
+                       hipMemcpyDefault));
 
-    auto reduce_partial_map_cpu = torch::from_blob(reduce_partial_map_vec.data(),
-                                                   {reduce_partial_map.numel()},
-                                                   input_options.device(torch::kCPU));
-    reduce_partial_map.copy_(reduce_partial_map_cpu);
+    HIP_CALL(hipMemcpy(reduce_partial_map.data_ptr(),
+                       reduce_partial_map_vec.data(),
+                       reduce_partial_map.numel() * sizeof(int32_t),
+                       hipMemcpyDefault));
 
 #if PRINT_DBG
     // print_metadata(work_indptr_vec, work_info_vec);

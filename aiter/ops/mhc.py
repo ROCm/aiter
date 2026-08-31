@@ -14,7 +14,7 @@ from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from ..jit.utils.torch_guard import torch_compile_guard
 
 
-@compile_ops("module_mhc")
+@compile_ops("module_mhc", develop=True)
 def mhc_pre_gemm_sqrsum(
     out: Tensor,
     sqrsum: Tensor,
@@ -25,7 +25,7 @@ def mhc_pre_gemm_sqrsum(
 ) -> None: ...
 
 
-@compile_ops("module_mhc")
+@compile_ops("module_mhc", develop=True)
 def mhc_pre_big_fuse(
     post_mix: Tensor,
     comb_mix: Tensor,
@@ -43,7 +43,7 @@ def mhc_pre_big_fuse(
 ) -> None: ...
 
 
-@compile_ops("module_mhc")
+@compile_ops("module_mhc", develop=True)
 def mhc_pre_big_fuse_rmsnorm(
     post_mix: Tensor,
     comb_mix: Tensor,
@@ -388,7 +388,7 @@ def mhc_pre(
     return post_mix, comb_mix, layer_input
 
 
-@compile_ops("module_mhc")
+@compile_ops("module_mhc", develop=True)
 def mhc_post(
     out: Tensor,
     x: Tensor,
@@ -406,7 +406,7 @@ def get_mhc_pre_splitk_large_m(m: int, hc_hidden_size: int) -> tuple[int, int]:
     return get_mhc_pre_splitk(m, hc_hidden_size)
 
 
-@compile_ops("module_mhc")
+@compile_ops("module_mhc", develop=True)
 def mhc_fused_post_pre_gemm_sqrsum(
     gemm_out_mul: Tensor,
     gemm_out_sqrsum: Tensor,

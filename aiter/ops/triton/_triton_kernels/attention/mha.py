@@ -2,20 +2,19 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
-import json
 
 import torch
 import triton
 import triton.language as tl
 
-from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
 from aiter.ops.triton.utils._triton.pid_preprocessing import (
     remap_workgroup_spatial,
     remap_xcd,
 )
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.core import load_config_json
+from aiter.ops.triton.utils.gemm_config_utils import resolve_config_dir
 
 
 @triton.jit
@@ -953,14 +952,9 @@ def _get_config(
     has_pe: bool = False,
     head_dim_v: int | None = None,
 ):
-    if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_arch()
-        _get_config._config_dict = {}
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MHA-DEFAULT.json"
-        with open(fpath, "r") as file:
-            config = json.load(file)
-        _get_config._config_dict["default"] = config
-    fwd_cfg = _get_config._config_dict["default"]["fwd"]
+    cfg_dir, _ = resolve_config_dir("attention", "MHA", backend="triton")
+    config = load_config_json(f"{cfg_dir}/DEFAULT.json")
+    fwd_cfg = config["fwd"]
     has_dropout_or_fp32 = enable_dropout or dtype == torch.float32
     # TODO: pe + dropout is not tuned
     if has_pe and has_dropout_or_fp32 and "pe_dropout_or_fp32" in fwd_cfg:
