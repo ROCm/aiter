@@ -30,7 +30,6 @@ def mha_v4_per_tensor_amax_kernel(
 _mha_v4_per_tensor_scale_repr = make_kernel_repr(
     "mha_v4_per_tensor_scale_kernel",
     [
-        "dtype_max",
         "BLOCK_SIZE",
     ],
 )
@@ -314,7 +313,6 @@ _sage_quant_v_amax_finalize_repr = make_kernel_repr(
     "sage_quant_v_amax_finalize_kernel",
     [
         "D",
-        "FP8_MAX",
         "BLOCK_N",
         "BLOCK_D",
     ],
@@ -1358,7 +1356,6 @@ _sage_quant_repr = make_kernel_repr(
     "sage_quant_kernel",
     [
         "SEQLEN_K_PADDED",
-        "FP8_MAX",
         "INT8_MAX",
         "D",
         "BLK_Q",

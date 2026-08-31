@@ -721,8 +721,6 @@ _fused_quant_fp8_sort_repr = make_kernel_repr(
         "BLOCK_SIZE_N",
         "QUANT_BLOCK_SIZE",
         "TOPK",
-        "DTYPE_MAX",
-        "DTYPE_MIN",
     ],
 )
 

@@ -43,7 +43,6 @@ _dynamic_per_tensor_quant_fp8_i8_repr = make_kernel_repr(
     "_dynamic_per_tensor_quant_fp8_i8_kernel",
     [
         "NUM_COL_POW2",
-        "DTYPE_MAX",
     ],
 )
 
@@ -73,7 +72,6 @@ _dynamic_per_token_quant_fp8_i8_repr = make_kernel_repr(
     "_dynamic_per_token_quant_fp8_i8_kernel",
     [
         "NUM_COL_POW2",
-        "DTYPE_MAX",
     ],
 )
 

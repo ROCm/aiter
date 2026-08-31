@@ -45,8 +45,6 @@ _fused_rms_fp8_per_tensor_static_quant_repr = make_kernel_repr(
     "_fused_rms_fp8_per_tensor_static_quant_kernel",
     [
         "BLOCK_SIZE_N",
-        "DTYPE_MAX",
-        "DTYPE_MIN",
         "HAVE_SECOND_INPUT",
         "FIRST_INPUT_RES",
         "FIRST_INPUT_OUT",
@@ -169,8 +167,6 @@ _fused_rms_fp8_group_quant_repr = make_kernel_repr(
     [
         "BLOCK_SIZE_N",
         "QUANT_BLOCK_SIZE",
-        "DTYPE_MAX",
-        "DTYPE_MIN",
         "HAVE_SECOND_INPUT",
         "FIRST_INPUT_RES",
         "FIRST_INPUT_OUT",
@@ -183,10 +179,7 @@ _fused_rms_fp8_group_quant_repr = make_kernel_repr(
         "HAS_BIAS_GATED",
         "HAS_Z_GATED",
         "NORM_BEFORE_GATE",
-        "FP8_MIN",
-        "FP8_MAX",
         "USE_UE8M0",
-        "FP8_MIN_SCALING_FACTOR",
         "ACTIVATION",
     ],
 )
@@ -435,8 +428,6 @@ _fused_flatten_fp8_group_quant_repr = make_kernel_repr(
     [
         "BLOCK_SIZE_N2",
         "QUANT_BLOCK_SIZE",
-        "DTYPE_MAX",
-        "DTYPE_MIN",
     ],
 )
 
@@ -503,8 +494,6 @@ _fused_reduce_act_mul_fp8_group_quant_repr = make_kernel_repr(
         "BLOCK_SIZE_N1",
         "BLOCK_SIZE_N2",
         "QUANT_BLOCK_SIZE",
-        "DTYPE_MAX",
-        "DTYPE_MIN",
         "X_HAS_SPLITK",
         "X_NUM_KSPLIT",
         "X_NUM_KSPLIT_POW2",
@@ -672,8 +661,6 @@ _fused_reduce_rms_fp8_group_quant_repr = make_kernel_repr(
         "N_MASK2",
         "N_MASK3",
         "QUANT_BLOCK_SIZE",
-        "DTYPE_MAX",
-        "DTYPE_MIN",
         "HAVE_SECOND_INPUT",
         "FIRST_INPUT_RES",
         "FIRST_INPUT_OUT",
@@ -936,8 +923,6 @@ _fused_silu_mul_fp8_per_tensor_static_quant_repr = make_kernel_repr(
     "_fused_silu_mul_fp8_per_tensor_static_quant_kernel",
     [
         "BLOCK_SIZE_N",
-        "DTYPE_MAX",
-        "DTYPE_MIN",
         "SILU_CONVERT_TO_INP_TYPE",
     ],
 )
