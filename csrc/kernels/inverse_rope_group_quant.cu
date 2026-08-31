@@ -58,13 +58,25 @@
 
 namespace aiter {
 
+// get_gpu_arch() re-queries the driver on every call (hipGetDeviceCount plus
+// hipGetDeviceProperties), which is real host time beside a 10 us kernel. The
+// device cannot change under a process, so resolve it once.
+static inline const std::string& cached_gpu_arch()
+{
+    static const std::string arch = get_gpu_arch();
+    return arch;
+}
+
 // Runtime mirror of the layout gates above: the device image only carries the
 // layout its family consumes, so the host has to refuse the other one here
 // rather than let the launch fail with a bare "invalid device function".
 static inline bool is_cdna_arch()
 {
-    return get_gpu_arch().rfind("gfx9", 0) == 0;
+    return cached_gpu_arch().rfind("gfx9", 0) == 0;
 }
+
+// The tensor engine the payload staging below rides on is gfx1250-only.
+static inline bool has_tdm_arch() { return cached_gpu_arch() == "gfx1250"; }
 
 static constexpr float kAbsmaxFloor = 1e-8f;
 
@@ -562,6 +574,99 @@ __global__ void inverse_rope_group_quant_kernel(
     // Issue all loads before consuming any -- K_PER_THREAD independent loads
     // give the wave that many requests in flight for latency hiding.
     vec_i in_vec[K_PER_THREAD];
+
+#if defined(__gfx1250__)
+    // Prefetch each pass as one TDM tile into LDS. Every access order here is a
+    // regular 2D tile, tiering included -- for a wave's slot j the low part
+    // walks a contiguous run of groups and the high part steps whole heads:
+    //
+    //   untiered   group = slot_base + j             one run, dim1 = 1
+    //   run 4      group = (j/4)*GPH + hi*4 + (j%4)  dim0 = 4 groups
+    //   run 8      group = (j/8)*GPH + seg + (j%8)   dim0 = 8 groups
+    //
+    // So dim0 = run*GROUP_SIZE, dim1 = slots/run, dim0 stride = one head, and
+    // the tier only moves the origin.
+    //
+    // Clamped so the divisions stay constant-evaluable where a group is wider
+    // than a wave; kTdmOk rejects that case.
+    constexpr int kSlotsRaw = static_cast<int>(WARP_SIZE) / THREADS_PER_GROUP;
+    constexpr int kSlotsPerWave = kSlotsRaw > 0 ? kSlotsRaw : 1;
+    // Groups in one contiguous run. Untiered a wave's whole slot span is one.
+    constexpr int kTdmRunRaw = !TIERED            ? kSlotsPerWave
+                             : (TIER == kTierRun4) ? kRun
+                                                   : kNopePerHead;
+    constexpr int kTdmRun = kTdmRunRaw > 0 ? kTdmRunRaw : 1;
+    constexpr int kTileD0 = kTdmRun * GROUP_SIZE;      // elements
+    constexpr int kTileD1 = kSlotsPerWave / kTdmRun;   // rows (heads)
+    constexpr int kHeadElems = GROUPS_PER_HEAD * GROUP_SIZE;
+    // Run 8 shares one tile shape between its two segments only when the head
+    // splits evenly; the GS=128 cut (3 nope + 1 rope) does not.
+    constexpr bool kTdmSegUniform =
+        (TIER != kTierRun8) || (kNopePerHead == kRopePerHead);
+    constexpr bool kTdmOk =
+        kSlotsRaw >= 1 && kTdmRunRaw >= 1 &&
+        kSlotsPerWave % kTdmRun == 0 && kTdmSegUniform &&
+        kTileD0 >= 1 && kTileD0 <= 65535 && kTileD1 >= 1 && kTileD1 <= 65535;
+    // Declared at function scope: the per-pass read in the main loop below
+    // needs the same base.
+    extern __shared__ char irgq_lds_raw[];
+    const int tdm_wave = tid / static_cast<int>(WARP_SIZE);
+    if constexpr(kTdmOk)
+    {
+        using TdmWin = opus::tdm<scalar_t, opus::seq<kTileD0, kTileD1>>;
+        // Disjoint per wave, so no barrier is needed.
+        constexpr int kWaveTileElems = kSlotsPerWave * GROUP_SIZE;
+
+        // Row in the pointer: the window addresses within one row, so the
+        // 2 GiB descriptor limit ROW_BASED exists for cannot bite.
+        const scalar_t* row_ptr = o + row_elem_base;
+        const opus::u32_t lds_base =
+            static_cast<opus::u32_t>(
+                reinterpret_cast<__UINTPTR_TYPE__>(irgq_lds_raw));
+        // Viewed as [heads, head_elems] when tiered, flat when not.
+        const opus::u32_t shape0 =
+            TIERED ? static_cast<opus::u32_t>(kHeadElems)
+                   : static_cast<opus::u32_t>(D);
+        const opus::u32_t shape1 =
+            TIERED ? static_cast<opus::u32_t>(D / kHeadElems) : 1u;
+        const opus::u64_t pitch =
+            TIERED ? opus::u64_t(kHeadElems) : opus::u64_t(D);
+
+#pragma unroll
+        for(int k = 0; k < K_PER_THREAD; ++k)
+        {
+            int org0, org1;
+            if constexpr(!TIERED)
+            {
+                org0 = (k_span_base + k * k_slots + tdm_wave * kSlotsPerWave) *
+                       GROUP_SIZE;
+                org1 = 0;
+            }
+            else if constexpr(TIER == kTierRun4)
+            {
+                // hi selects the run within the head; the wave picks the heads.
+                org0 = hi_of_pass(k) * kRun * GROUP_SIZE;
+                org1 = tdm_wave * kTileD1;
+            }
+            else
+            {
+                const int wave_slot =
+                    k_span_base + k * k_slots + tdm_wave * kSlotsPerWave;
+                const bool rope = segment_of_pass(k) == kRopeSegment;
+                org0 = rope ? kNopePerHead * GROUP_SIZE : 0;
+                org1 = rope ? (wave_slot - rope_segment_slot0) / kRopePerHead
+                            : wave_slot / kNopePerHead;
+            }
+            auto w = opus::make_tdm<TdmWin>(
+                lds_base, row_ptr, shape0, shape1, pitch,
+                static_cast<opus::u32_t>(org0),
+                static_cast<opus::u32_t>(org1));
+            w.async_load(static_cast<opus::u32_t>(
+                (tdm_wave * K_PER_THREAD + k) * kWaveTileElems));
+        }
+    }
+    else
+#endif
     if constexpr(TIERED)
     {
         // The tiered offsets are not affine in k -- the group a slot names jumps
@@ -761,6 +866,35 @@ __global__ void inverse_rope_group_quant_kernel(
         const int k_group =
             group_of(k, slot0 + k * k_pass_stride, segment_of_pass(k));
         const int d_base = k_group * GROUP_SIZE + group_elem_base;
+
+#if defined(__gfx1250__)
+        if constexpr(kTdmOk)
+        {
+            // Undo the tile layout: the slot's run picks the row, its position
+            // within the run picks the column.
+            constexpr int kWaveTileElems = kSlotsPerWave * GROUP_SIZE;
+            const int local_slot = k_slot - tdm_wave * kSlotsPerWave;
+            const int lds_elem =
+                (tdm_wave * K_PER_THREAD + k) * kWaveTileElems +
+                (local_slot / kTdmRun) * kTileD0 +
+                (local_slot % kTdmRun) * GROUP_SIZE + group_elem_base;
+            // Staged, so passes k+1.. stay in flight across this pass's
+            // amax -> scale -> store chain; waiting on 0 serialises every tile
+            // behind the first consumer. Dispatched because the count is a
+            // template argument and k is an induction variable; the loop is
+            // unrolled, so each arm folds to one constant wait.
+            switch(K_PER_THREAD - 1 - k)
+            {
+            case 3:  opus::s_wait_tensorcnt<3>(); break;
+            case 2:  opus::s_wait_tensorcnt<2>(); break;
+            case 1:  opus::s_wait_tensorcnt<1>(); break;
+            default: opus::s_wait_tensorcnt<0>(); break;
+            }
+            in_vec[k] = *reinterpret_cast<const OPUS_LDS_ADDR vec_i*>(
+                reinterpret_cast<__UINTPTR_TYPE__>(irgq_lds_raw) +
+                static_cast<__UINTPTR_TYPE__>(lds_elem) * sizeof(scalar_t));
+        }
+#endif
 
         // --- Inverse RoPE on the rope tail ---
         const int head_elem_base = (k_group % GROUPS_PER_HEAD) * GROUP_SIZE +
@@ -1245,6 +1379,28 @@ void inverse_rope_group_quant(
                 ok4 ? kTierRun4 : (ok8 ? kTierRun8 : kTierOff);
             const int nope_slots = heads_k * kNopePerHd;
 
+            // Dynamic LDS for the TDM staging buffer. Must mirror the kernel's
+            // kTdmOk exactly -- too little corrupts, and requesting it where
+            // the kernel will not stage spends occupancy for nothing. The arch
+            // is a runtime question here: the host pass compiles once for all
+            // targets.
+            const int slots_per_wave_tdm =
+                wave_size / THREADS_PER_GROUP;   // 0 if a group exceeds a wave
+            const int tdm_run = (tier == kTierOff)  ? slots_per_wave_tdm
+                              : (tier == kTierRun4) ? 4
+                                                    : kNopePerHd;
+            const bool tdm_seg_uniform =
+                tier != kTierRun8 || (kNopePerHd == kGph - kNopePerHd);
+            const bool tdm_used =
+                has_tdm_arch() && slots_per_wave_tdm >= 1 &&
+                tdm_run >= 1 && slots_per_wave_tdm % tdm_run == 0 &&
+                tdm_seg_uniform && tdm_run * GS <= 65535 &&
+                (slots_per_wave_tdm / tdm_run) <= 65535;
+            const size_t tdm_lds_bytes =
+                tdm_used ? static_cast<size_t>(block_size) * TDS * KPT *
+                               static_cast<size_t>(o.element_size())
+                         : 0;
+
             AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
                 o.dtype(), "inverse_rope_group_quant", [&]
             {
@@ -1267,7 +1423,7 @@ void inverse_rope_group_quant(
                     inverse_rope_group_quant_kernel<
                         scalar_opus_t, HEAD_DIM_T, RD_T, GS, TDS, KPT, LAYOUT,
                         decltype(tier_tag)::value, decltype(row_tag)::value>
-                        <<<grid, block, 0, stream>>>(
+                        <<<grid, block, tdm_lds_bytes, stream>>>(
                             reinterpret_cast<const scalar_opus_t*>(o.data_ptr()),
                             reinterpret_cast<opus::fp8_t*>(x_fp8.data_ptr()),
                             reinterpret_cast<uint8_t*>(x_scale.data_ptr()),
