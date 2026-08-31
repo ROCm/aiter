@@ -591,8 +591,9 @@ def opus_gemm(
             solidx,
         )
         fallback = torch_gemm(inp, weights, solidx)
-        fallback = fallback.to(output_dtype)
-        return fallback + bias if bias is not None else fallback
+        if bias is not None:
+            fallback = fallback.to(bias.dtype) + bias
+        return fallback.to(output_dtype)
     # NOTE: do NOT add bias again here -- the opus splitk reduce kernel already
     # folds `bias` into the fp32 accumulator before the bf16/fp32 cast (HAS_BIAS
     # path). The previous `Y = Y + bias` double-counted bias (output = A@B^T +
