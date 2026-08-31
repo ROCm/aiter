@@ -4,8 +4,8 @@
 import torch
 
 from ..jit.core import compile_ops
-from ..jit.utils.chip_info import get_gfx_runtime
 from ..jit.utils.asm_guard import require_gfx1250_asm
+from ..jit.utils.chip_info import get_gfx_runtime
 from ..jit.utils.torch_guard import torch_compile_guard
 
 MD_NAME = "module_mla_sparse_prefill_asm"
