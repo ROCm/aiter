@@ -131,7 +131,7 @@ def _kid_rejects_outdtype(k_inst, out_dtype):
     # #4246 two-stage path may write bf16 partials while reducing to bf16 or
     # fp32 Y, so workspace dtype alone must not constrain the output dtype.
     return (
-        getattr(k_inst, "arch_prefix", "") == "gfx942"
+        k_inst.arch_prefix == "gfx942"
         and _kid_uses_bf16_workspace(k_inst)
         and out_dtype is not dtypes.bf16
     )
@@ -589,7 +589,7 @@ def kid_rejects_shape(k_inst, M, N, K):
 
     # The exact-N bf16-workspace restriction belongs only to the gfx942
     # reducer. gfx1250 #4246 has a different bf16 reducer and accepts padded N.
-    if getattr(k_inst, "arch_prefix", "") == "gfx942" and _kid_uses_bf16_workspace(
+    if k_inst.arch_prefix == "gfx942" and _kid_uses_bf16_workspace(
         k_inst
     ):
         padded_N = _ceil_div(N, k_inst.B_N) * k_inst.B_N

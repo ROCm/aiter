@@ -90,7 +90,7 @@ def get_CKBatchedGEMM_config(
             get_CKBatchedGEMM_config.has_gfx = True
         else:
             logger.warning(
-                f"{AITER_CONFIGS.AITER_CONFIG_A8W8_BATCHED_GEMM_FILE} has no 'gfx' column — "
+                f"{AITER_CONFIGS.AITER_CONFIG_A8W8_BATCHED_GEMM_FILE} has no 'gfx' column; "
                 "falling back to cu_num-only key. Re-run the tuner or migrate the CSV."
             )
             get_CKBatchedGEMM_config.ck_batched_gemm_dict = (
@@ -161,7 +161,7 @@ def batched_gemm_a8w8_CK(
 def _get_mxscale_bmm_launchers():
     """Resolve the checked split-1 launcher and workspace planner once."""
     from .opus import opus_bmm
-    from .opus.gemm_op_a8w8 import _opus_gemm_a8w8_mxscale_bmm_launch_raw
+    from .opus.gemm.gemm_op_a8w8 import _opus_gemm_a8w8_mxscale_bmm_launch_raw
 
     return _opus_gemm_a8w8_mxscale_bmm_launch_raw, opus_bmm
 

@@ -89,7 +89,7 @@ workspace. The caller supplies the live HIP stream. The bridge validates
 integer conversions, switches/restores device and thread-local stream state,
 and reports exceptions through thread-local error text before returning to
 Python. Its small ctypes adapter is local to
-`aiter/ops/opus/gemm_op_a16w16.py`. The pybind A16 entry owns normal lazy JIT
+`aiter/ops/opus/gemm/gemm_op_a16w16.py`. The pybind A16 entry owns normal lazy JIT
 build and remains private for parity and performance A/B tests.
 
 ## Registry and capability

@@ -6,8 +6,8 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-from ...jit.core import compile_ops
-from ..enum import ActivationType
+from ....jit.core import compile_ops
+from ...enum import ActivationType
 
 _OPUS_MOE_STAGE1_A8W4_SCALE_GROUP = 32
 

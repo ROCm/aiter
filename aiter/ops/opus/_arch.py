@@ -41,6 +41,11 @@ import torch
 
 logger = logging.getLogger("aiter.ops.opus._arch")
 
+GFX942 = "gfx942"
+GFX950 = "gfx950"
+GFX1250 = "gfx1250"
+SUPPORTED_OPUS_ARCHES = frozenset((GFX942, GFX950, GFX1250))
+
 _DEVICE_INFO_CACHE: dict[torch.device, tuple[str, int]] = {}
 
 
@@ -156,7 +161,7 @@ def _read_device_arch_and_cu(device: torch.device) -> tuple[str, int]:
     if device.type != "cuda":
         raise RuntimeError(f"OPUS GEMM requires a GPU tensor; got device {device}")
     props = torch.cuda.get_device_properties(device)
-    raw_arch = str(getattr(props, "gcnArchName", "")).strip()
+    raw_arch = str(props.gcnArchName).strip()
     arch = raw_arch.split(":", 1)[0].lower()
     if not arch.startswith("gfx"):
         try:

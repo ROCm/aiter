@@ -446,10 +446,10 @@ def gen_splitk_fuse_instance(
     enable_bias_str = "true" if getattr(k, "enable_bias", False) else "false"
     num_slots = getattr(k, "num_slots", 3)
     wg_per_cu = getattr(k, "wg_per_cu", 2)
-    split_k = int(getattr(k, "fuse_split_k", 0))
+    split_k = int(k.fuse_split_k)
     # Historical field name retained for compatibility; physically cluster.y
     # groups N-tile peers sharing A.
-    n_cluster = int(getattr(k, "fuse_m_cluster", 1))
+    n_cluster = int(k.fuse_m_cluster)
     if split_k < 2:
         raise ValueError(f"fused instance {k.name} must declare fuse_split_k >= 2")
 

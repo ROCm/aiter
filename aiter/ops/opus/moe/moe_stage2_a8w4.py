@@ -21,7 +21,7 @@ from csrc.opus_moe.opus_moe_common import (
     require_opus_a8w4_stage2_instance,
 )
 
-from ...jit.core import compile_ops
+from ....jit.core import compile_ops
 
 _DEFAULT_SORT_BLOCK_M = 32
 _OPUS_MOE_STAGE2_ROUTE_REDUCE_AUTO_BLOCK_N = -1

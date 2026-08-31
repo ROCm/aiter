@@ -10,11 +10,11 @@ import torch
 
 from csrc.opus_gemm.opus_gemm_common import OpusGemmInstance
 
-from ...jit.core import compile_ops, get_module
-from ...jit.utils.torch_guard import torch_compile_guard
-from ...utility.dtypes import _aiter_dtype_id, aiter_tensor_t
-from ._arch import _device_arch_and_cu
-from .launch_plan import _get_cached_a16w16_launch_plan
+from ....jit.core import compile_ops, get_module
+from ....jit.utils.torch_guard import torch_compile_guard
+from ....utility.dtypes import _aiter_dtype_id, aiter_tensor_t
+from .._arch import _device_arch_and_cu
+from ..launch_plan import _get_cached_a16w16_launch_plan
 
 # ---- Low-level A16W16 backend --------------------------------------------
 
@@ -55,9 +55,7 @@ _OPUS_A16W16_MODULE = "module_deepgemm_opus"
 _opus_a16w16_cabi_primed = False
 _NULL_AITER_TENSOR = ctypes.POINTER(aiter_tensor_t)()
 _RAW_CURRENT_STREAM = getattr(torch._C, "_cuda_getCurrentRawStream", None)
-_TORCH_IS_COMPILING = getattr(
-    getattr(torch, "compiler", None), "is_compiling", lambda: False
-)
+_TORCH_IS_COMPILING = torch.compiler.is_compiling
 
 
 class _OpusA16DescriptorPool(local):
@@ -96,7 +94,7 @@ def _fill_aiter_tensor_descriptor(
 def _load_opus_a16w16_cabi():
     """Load the already-built mixed OPUS module's private A16 C ABI."""
     module = get_module(_OPUS_A16W16_MODULE)
-    module_path = getattr(module, "__file__", None)
+    module_path = module.__file__
     if not module_path:
         raise RuntimeError(
             f"{_OPUS_A16W16_MODULE} has no shared-library path for its C ABI"
@@ -596,7 +594,7 @@ def gemm_a16w16_opus(
     """
     XQ, WQ, Y, is_gemm = _prepare_shape_driven_a16w16(A, B, bias, dtype, out)
     if kernelId is None:
-        from .policy import (
+        from ..policy import (
             lookup_a16w16_opus_config,
             resolve_a16w16_heuristic_candidate,
         )

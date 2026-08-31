@@ -312,7 +312,7 @@ def _runtime_arch() -> str | None:
     if not torch.cuda.is_available():
         return None
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
-    return str(getattr(props, "gcnArchName", "")).split(":", 1)[0].lower()
+    return str(props.gcnArchName).split(":", 1)[0].lower()
 
 
 def _assert_matches_golden(actual, A, B, bias=None):
@@ -515,7 +515,8 @@ def test_global_a16_stale_opus_row_keeps_framework_fallback(monkeypatch):
 
 def _capture_shape_driven_opus_launch(monkeypatch, *, arch, tuned_config):
     from aiter.ops import opus
-    from aiter.ops.opus import gemm_op_a16w16, policy
+    from aiter.ops.opus import policy
+    from aiter.ops.opus.gemm import gemm_op_a16w16
 
     calls = []
 
@@ -658,7 +659,8 @@ def test_a16w16_heuristic_baseline_kid(arch, shape, expected_kid):
 
 
 def test_shape_driven_opus_selection_and_rank_route(monkeypatch):
-    from aiter.ops.opus import gemm_op_a16w16, policy
+    from aiter.ops.opus import policy
+    from aiter.ops.opus.gemm import gemm_op_a16w16
 
     tuned = [None]
     opus, calls = _capture_shape_driven_opus_launch(

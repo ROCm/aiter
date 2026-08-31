@@ -821,7 +821,7 @@ class FmoeTuner(TunerCommon):
         act_type,
         output_sorted=False,
     ):
-        from aiter.ops.opus.moe_stage1_a8w4 import opus_moe_stage1_a8w4_fwd
+        from aiter.ops.opus.moe.moe_stage1_a8w4 import opus_moe_stage1_a8w4_fwd
 
         out, _out_scale = opus_moe_stage1_a8w4_fwd(
             a1_qt,
@@ -1214,7 +1214,7 @@ class FmoeTuner(TunerCommon):
         # get_opus_a8w4_stage2_kernels: kid + kernel_block_m (B_M) + route_out.
         # The tuner's blockM is the moe_sorting block_m (== the kid's
         # SORT_BLOCK_M); the kernel's own B_M is kparams["kernel_block_m"].
-        from aiter.ops.opus.moe_stage2_a8w4 import (
+        from aiter.ops.opus.moe.moe_stage2_a8w4 import (
             opus_moe_stage2_a8w4_fwd,
             stage2_launch_config,
         )

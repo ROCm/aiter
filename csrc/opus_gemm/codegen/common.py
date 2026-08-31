@@ -64,7 +64,7 @@ _SPLITK_WORKSPACE_TYPES = {
 
 def splitk_workspace_type(k):
     """Return C++ storage, pointer, and Aiter dtype tokens declared by a kid."""
-    dtype = getattr(k, "splitk_workspace_dtype", None)
+    dtype = k.splitk_workspace_dtype
     try:
         return _SPLITK_WORKSPACE_TYPES[dtype]
     except KeyError as exc:
@@ -88,7 +88,7 @@ def get_arch_map(arch, map_name):
 
 def kid_arch(k):
     """Resolve a kid's target arch_prefix (defaults to gfx950 for legacy kids)."""
-    return (getattr(k, "arch_prefix", "") or "gfx950").lower()
+    return (k.arch_prefix or "gfx950").lower()
 
 
 def register_emit(arch, kernel_tag, fn):

@@ -18,7 +18,7 @@ from aiter.jit.core import (
     get_asm_dir,
 )
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
-from aiter.ops.opus.gemm_op_a8w8 import (
+from aiter.ops.opus.gemm.gemm_op_a8w8 import (
     opus_gemm_a8w8_blockscale_bpreshuffle_tune,
 )
 from aiter.ops.shuffle import shuffle_weight

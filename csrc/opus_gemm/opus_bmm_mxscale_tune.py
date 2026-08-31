@@ -180,8 +180,9 @@ _TUNE_POLICY = {
 for _kid, _sks in _TUNE_POLICY.items():
     if any(s > 1 for s in _sks):
         _tag = _CODEGEN_BMM[_kid].kernel_tag
-        assert _tag == "a8w8_mxscale_bmm_flatmm_splitk" and not getattr(
-            _CODEGEN_BMM[_kid], "direct_only", False
+        assert (
+            _tag == "a8w8_mxscale_bmm_flatmm_splitk"
+            and not _CODEGEN_BMM[_kid].direct_only
         ), f"kid {_kid} ({_tag}) is not split-K capable but sweeps {_sks}"
 
 

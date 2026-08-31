@@ -11,9 +11,9 @@
 import torch
 from torch import Tensor
 
-from ...jit.core import compile_ops
-from ._arch import _device_arch
-from .launch_plan import (
+from ....jit.core import compile_ops
+from .._arch import _device_arch
+from ..launch_plan import (
     _A8W8_BLOCKSCALE_FAMILY,
     _A8W8_BPRESHUFFLE_FAMILY,
     _A8W8_FAMILY,
