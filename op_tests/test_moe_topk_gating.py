@@ -1005,10 +1005,6 @@ def main():
         print("All topk_gating benchmarks passed!")
 
 
-if __name__ == "__main__":
-    main()
-
-
 # ---------------------------------------------------------------------------
 # pytest — topk_softmax (ASM vLLM-adapted kernel) correctness
 # ---------------------------------------------------------------------------
@@ -1080,3 +1076,7 @@ def test_topk_softmax_bf16_caller_casts():
 
     torch.testing.assert_close(w_out, w_ref, atol=2e-3, rtol=2e-3)
     assert (i_out == i_ref).all(), "expert ID sets differ"
+
+
+if __name__ == "__main__":
+    main()
