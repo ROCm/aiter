@@ -34,7 +34,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
 import torch
@@ -794,8 +794,67 @@ def check_glm_paths(inp: BenchInputsGLM, state: GlmDecodeState) -> float:
     return _cosine(fly_out, state.out_asm)
 
 
+def preprocess_b2_caches(inp: BenchInputsB2) -> tuple[BenchInputsB2, dict]:
+    """Return a copy of ``inp`` whose caches are in the format the DSv4 kernel DMAs.
+
+    Region1's NoPE bytes go OCP -> fnuz and both RoPE tails go bf16 -> fp8, which
+    lets region1 use region0's fire-and-forget ``buffer_load_to_lds`` and lets the
+    RoPE tail ride the same DMA instead of a bf16->fp8 register round-trip. Neither
+    changes results: the kernel's own convert already ends in fnuz fp8, so this only
+    moves that encoding out of the inner loop.
+
+    Copies rather than converting in place: the Triton baselines dequant these same
+    tensors assuming OCP NoPE and bf16 RoPE, so mutating them would silently feed the
+    comparison the wrong bytes.
+
+    Returns the converted inputs and the kwargs that declare the format.
+    """
+    out = replace(
+        inp,
+        main_cache=inp.main_cache.clone(),
+        extra_cache=inp.extra_cache.clone(),
+    )
+    _convert_caches_inplace(out)
+    return out, dict(extra_is_fnuz=True, extra_scale_mode="none", rope_fp8=True)
+
+
+def _convert_caches_inplace(inp: BenchInputsB2) -> None:
+    """The conversion itself, in place. Split out so it can be timed without the
+    benchmark's defensive copy landing in the measurement."""
+    from convert_extra_cache import convert_cache_
+
+    # One pass per cache. Region0's NoPE is already fnuz so the main cache only needs
+    # its RoPE tail; region1 needs both, and fusing them reads each token record once.
+    convert_cache_(inp.main_cache, nope=False, rope=True)
+    convert_cache_(inp.extra_cache, nope=True, rope=True)
+
+
+def bench_cache_preprocess(inp: BenchInputsB2, reps: int = 3) -> TimingResult:
+    """Device self-time of ``preprocess_b2_caches``, as a ONE-TIME cost.
+
+    The conversion is in place and not idempotent, so each timed run gets fresh
+    copies made outside the profiled region.  This is deliberately not folded into
+    the prefill row: it is paid once per cache, not once per prefill, so the reader
+    has to amortise it over their own call count.
+    """
+    best = float("inf")
+    stages: dict[str, float] = {}
+    for _ in range(max(1, reps)):
+        scratch = replace(inp, main_cache=inp.main_cache.clone(),
+                          extra_cache=inp.extra_cache.clone())
+        torch.cuda.synchronize()
+        ms, st = _median_ms(lambda: _convert_caches_inplace(scratch), 0, 1)
+        if ms < best:
+            best, stages = ms, st
+    return TimingResult(
+        "cache_preprocess", best, stages,
+        notes="ONE-TIME per cache, not per prefill: amortise over your call count",
+    )
+
+
 def bench_flydsl_b2(
-    inp: BenchInputsB2, warmup: int, iters: int, *, dedicated: bool = True
+    inp: BenchInputsB2, warmup: int, iters: int, *, dedicated: bool = True,
+    fmt_kw: dict | None = None,
 ) -> TimingResult:
     """Time the two-region prefill kernel.
 
@@ -829,7 +888,7 @@ def bench_flydsl_b2(
             block_size=inp.block_size,
             attn_sink=inp.sink,
             main_is_fnuz=_is_gfx942_fnuz(),
-            extra_is_fnuz=False,
+            **({"extra_is_fnuz": False} | (fmt_kw or {})),
         )
         return timer.finish()
 
@@ -982,10 +1041,27 @@ def run_bench(args: argparse.Namespace, T: int) -> None:
         args.seed + 100,
     )
     perf = perf_model_b2(b2)
+    # The caches build as OCP NoPE + bf16 RoPE, so the dedicated kernel can only take
+    # its DMA load paths once they are converted. Do it here -- once, outside the
+    # timed region -- and report the cost on its own row rather than folding a
+    # one-time cache conversion into a per-prefill number.
+    dedicated = args.kernel == "dedicated"
+    pre = None
+    fmt_kw = None
+    b2_fly = b2
+    if dedicated and args.cache_preprocess:
+        pre = bench_cache_preprocess(b2)
+        b2_fly, fmt_kw = preprocess_b2_caches(b2)
     fly_b2 = bench_flydsl_b2(
-        b2, args.warmup, args.iters, dedicated=(args.kernel == "dedicated")
+        b2_fly, args.warmup, args.iters, dedicated=dedicated, fmt_kw=fmt_kw
     )
     _print_result(fly_b2, None, perf)
+    if pre is not None:
+        _print_result(pre, None, None)
+        for n in (1, 4, 32):
+            tot = pre.total_ms + n * fly_b2.total_ms
+            print(f"{'':28s}  amortised over {n:>2d} prefill call(s): "
+                  f"{tot / n:.3f} ms/call")
     if not args.skip_triton:
         triton_e2e_b2 = bench_triton_prefill_e2e_b2(b2, args.warmup, args.iters, csr_dequant=csr_dequant)
         _print_result(triton_e2e_b2, fly_b2.total_ms, perf)
@@ -1097,6 +1173,14 @@ def main() -> None:
         choices=("dsv4", "dsv32", "glm"),
         default="dsv4",
         help="dsv4: B2 two-region only. glm/dsv32: single-region flat fp8 head_dim=576, topk=2048.",
+    )
+    parser.add_argument(
+        "--no-cache-preprocess",
+        dest="cache_preprocess",
+        action="store_false",
+        help="dsv4 preset: skip the one-time cache conversion and run the kernel's "
+             "in-loop convert paths instead (what it measured before the conversion "
+             "existed, ~7%% slower)",
     )
     parser.add_argument(
         "--kernel",
