@@ -49,7 +49,17 @@ def _mhc_apply_pre_mix_tile(
     )
 
 
-@triton.jit
+_mhc_asymmetric_sinkhorn_kernel_repr = make_kernel_repr(
+    "_mhc_asymmetric_sinkhorn_kernel",
+    [
+        "n",
+        "N_POW2_RES",
+        "NUM_SINKHORN_ITERS",
+    ],
+)
+
+
+@triton.jit(repr=_mhc_asymmetric_sinkhorn_kernel_repr)
 def _mhc_asymmetric_sinkhorn_kernel(
     logits_ptr,
     out_ptr,
@@ -92,7 +102,20 @@ def _mhc_asymmetric_sinkhorn_kernel(
     )
 
 
-@triton.jit
+_mhc_head_kernel_repr = make_kernel_repr(
+    "_mhc_head_kernel",
+    [
+        "n",
+        "C",
+        "BLOCK_M",
+        "BLOCK_K",
+        "BLOCK_C",
+        "N_TILE",
+    ],
+)
+
+
+@triton.jit(repr=_mhc_head_kernel_repr)
 def _mhc_head_kernel(
     x_ptr,
     fn_ptr,
@@ -169,7 +192,24 @@ def _mhc_head_kernel(
         )
 
 
-@triton.jit
+_mhc_fused_kernel_repr = make_kernel_repr(
+    "_mhc_fused_kernel",
+    [
+        "n",
+        "n_squared",
+        "C",
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLOCK_K",
+        "BLOCK_C",
+        "N_POW2",
+        "NUM_SINKHORN_ITERS",
+        "ALPHAS_ARE_POINTER",
+    ],
+)
+
+
+@triton.jit(repr=_mhc_fused_kernel_repr)
 def _mhc_fused_kernel(
     x_ptr,
     phi_ptr,  # Unified phi: (K, n + n + n_res), layout [pre | post | res]
@@ -373,7 +413,20 @@ def _mhc_fused_kernel(
         )
 
 
-@triton.jit
+_mhc_fused_split_kernel_repr = make_kernel_repr(
+    "_mhc_fused_split_kernel",
+    [
+        "n",
+        "n_squared",
+        "BLOCK_M",
+        "BLOCK_K",
+        "N_TOTAL_POW2",
+        "SPLITK_BLOCK_SIZE",
+    ],
+)
+
+
+@triton.jit(repr=_mhc_fused_split_kernel_repr)
 def _mhc_fused_split_kernel(
     x_ptr,
     phi_ptr,  # Unified phi: (K, n + n + n_squared)
@@ -534,7 +587,25 @@ def _mhc_reduce_apply_res_block(
     )
 
 
-@triton.jit
+_mhc_reduce_apply_kernel_repr = make_kernel_repr(
+    "_mhc_reduce_apply_kernel",
+    [
+        "n",
+        "n_squared",
+        "C",
+        "BLOCK_M",
+        "BLOCK_C",
+        "N_POW2",
+        "N_POW2_RES",
+        "ACTUAL_KSPLIT",
+        "NUM_SINKHORN_ITERS",
+        "RES_PID_C",
+        "ALPHAS_ARE_POINTER",
+    ],
+)
+
+
+@triton.jit(repr=_mhc_reduce_apply_kernel_repr)
 def _mhc_reduce_apply_kernel(
     acc_ptr,  # Unified split-K partials: (NUM_KSPLIT, M, n + n + n_squared), layout [pre | post | res]
     acc_sq_ptr,  # Sum-of-squares partials: (NUM_KSPLIT, M)
@@ -781,7 +852,17 @@ def _mhc_reduce_apply_kernel(
             )
 
 
-@triton.jit
+_mhc_post_kernel_repr = make_kernel_repr(
+    "_mhc_post_kernel",
+    [
+        "n",
+        "BLOCK_M",
+        "BLOCK_C",
+    ],
+)
+
+
+@triton.jit(repr=_mhc_post_kernel_repr)
 def _mhc_post_kernel(
     out_ptr,  # (M, n, C)  bf16 / fp16
     x_ptr,  # (M, C)     bf16 / fp16  (layer_input from mhc())
@@ -1186,7 +1267,26 @@ def _mhc_post_pre_reduce_apply_res_block(
     )
 
 
-@triton.jit
+_mhc_post_pre_reduce_apply_kernel_repr = make_kernel_repr(
+    "_mhc_post_pre_reduce_apply_kernel",
+    [
+        "n",
+        "n_squared",
+        "C",
+        "BLOCK_M",
+        "BLOCK_C",
+        "N_POW2",
+        "N_POW2_RES",
+        "ACTUAL_KSPLIT",
+        "KSPLIT_POW2",
+        "BLOCK_M_POST_RES",
+        "NUM_SINKHORN_ITERS",
+        "ASYMMETRIC_EXP_DOMAIN",
+    ],
+)
+
+
+@triton.jit(repr=_mhc_post_pre_reduce_apply_kernel_repr)
 def _mhc_post_pre_reduce_apply_kernel(
     acc_ptr,  # Unified split-K partials: (NUM_KSPLIT, M, n + n + n_squared), layout [pre | post | res]
     acc_sq_ptr,  # Sum-of-squares partials: (NUM_KSPLIT, M)
