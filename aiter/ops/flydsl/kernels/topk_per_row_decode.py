@@ -21,6 +21,7 @@ from flydsl.expr import (
     rocdl as fly_rocdl,
 )
 from flydsl.expr.typing import T
+
 # Dynamic row bases and byte bounds are not expressible through a static layout.
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
