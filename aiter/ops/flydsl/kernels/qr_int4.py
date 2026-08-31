@@ -250,7 +250,9 @@ class QRInt4:
             )
         if not inp.is_contiguous() or not out.is_contiguous():
             raise ValueError("QRInt4 requires contiguous input/output")
-        if int(inp.data_ptr()) % 16 != 0 or int(out.data_ptr()) % 16 != 0:
+        inp_ptr = int(inp.data_ptr())
+        out_ptr = int(out.data_ptr())
+        if inp_ptr % 16 != 0 or out_ptr % 16 != 0:
             raise ValueError("QRInt4 requires 16-byte-aligned input/output")
         live_bytes = int(inp.numel()) * int(inp.element_size())
         if live_bytes > 0xFFFFFFFF:
@@ -259,6 +261,8 @@ class QRInt4:
             raise ValueError("byte size must be a multiple of 16 (8 bf16)")
         if int(out.numel()) * int(out.element_size()) != live_bytes:
             raise ValueError("inp/out byte size mismatch")
+        if max(inp_ptr, out_ptr) < min(inp_ptr + live_bytes, out_ptr + live_bytes):
+            raise ValueError("QRInt4 requires non-overlapping input/output")
         return live_bytes
 
     def _launch_args(

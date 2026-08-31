@@ -50,7 +50,10 @@ from aiter.ops.flydsl.kernels.qr_int4_kernel import (
     WORLD,
 )
 
-ARCH = get_gfx_runtime()
+try:
+    ARCH = get_gfx_runtime()
+except (KeyError, RuntimeError):
+    ARCH = None
 SUPPORTED_ARCHS = ("gfx942", "gfx950")
 SQNR_MIN_DB = 18.0
 # Dropped/stale 32 KiB tile is ~0 dB; INT4 codec tiles stay well above this.
@@ -64,7 +67,7 @@ TP = WORLD
 
 pytestmark = pytest.mark.skipif(
     ARCH not in SUPPORTED_ARCHS,
-    reason="QRInt4 unsupported arch (need gfx942 or gfx950)",
+    reason="QRInt4 requires an available gfx942 or gfx950 GPU",
 )
 
 # Distinct correctness branches, not a tokens x hidden product.
