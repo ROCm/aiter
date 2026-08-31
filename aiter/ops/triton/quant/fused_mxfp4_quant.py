@@ -5,6 +5,8 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton._gluon_kernels.gfx1250.quant.fused_mxfp4_quant import (
+    _gluon_fused_dynamic_mxfp4_quant_moe_sort_kernel,
+    _gluon_fused_reduce_rms_mxfp4_quant_kernel,
     _gluon_fused_rms_mxfp4_quant_kernel,
 )
 from aiter.ops.triton._triton_kernels.activation import (
@@ -421,6 +423,7 @@ def fused_reduce_rms_mxfp4_quant(
     output_unquantized_inp1=False,
     dtype=None,
     out3=None,
+    args: str = "auto",
 ):
     """
     This op contains several steps:
@@ -545,7 +548,21 @@ def fused_reduce_rms_mxfp4_quant(
     elif x2 is not None:
         r = 2
     grid = (triton.cdiv(M, BLOCK_SIZE_M) * r,)
-    _fused_reduce_rms_mxfp4_quant_kernel[grid](
+
+    # check if args is gluon and arch is not gfx1250
+    if args == "gluon" and get_arch() != "gfx1250":
+        _LOGGER.warning(
+            "Gluon kernel is not supported on this arch, defaulting to triton kernel"
+        )
+
+    # select kernel based on args and arch
+    kernel = (
+        _gluon_fused_reduce_rms_mxfp4_quant_kernel
+        if (args in ["gluon", "auto"]) and get_arch() == "gfx1250"
+        else _fused_reduce_rms_mxfp4_quant_kernel
+    )
+
+    kernel[grid](
         x1,
         x1_weight,
         x2,
@@ -606,6 +623,7 @@ def fused_dynamic_mxfp4_quant_moe_sort(
     topk: int,
     block_size: int = 32,
     scaling_mode: str = "even",
+    args: str = "auto",
 ):
     """
     Fusing dynamic_mxfp4_quant and moe_mxfp4_sort
@@ -668,7 +686,17 @@ def fused_dynamic_mxfp4_quant_moe_sort(
     num_pid = triton.cdiv(M, BLOCK_SIZE_Mx) * scaleN + triton.cdiv(
         M_o, BLOCK_SIZE_M
     ) * triton.cdiv(N_i, BLOCK_SIZE_N)
-    _fused_dynamic_mxfp4_quant_moe_sort_kernel[(num_pid,)](
+
+    if args == "gluon" and get_arch() != "gfx1250":
+        raise ValueError("Gluon is only supported on gfx1250")
+
+    kernel = (
+        _gluon_fused_dynamic_mxfp4_quant_moe_sort_kernel
+        if (args in ["gluon", "auto"] and get_arch() == "gfx1250")
+        else _fused_dynamic_mxfp4_quant_moe_sort_kernel
+    )
+
+    kernel[(num_pid,)](
         x,
         x_fp4,
         sorted_ids,
