@@ -1157,9 +1157,9 @@ __global__ void norm_rope_hadamard_rotate_activation_fp4quant_kvcache_kernel(DTY
     const int m_oob            = m - row_base < m_block ? m - row_base : m_block;
     const int64_t row_offset   = static_cast<int64_t>(row_base) * stride;
     const int load_offset      = threadIdx.x * vec_size;
-    const int store_offset     = std::is_same_v<DTYPE_O, opus::fp4_t> ? load_offset / 2 : load_offset;
     const int row_in_block     = load_offset / dim;
     const int col_offset       = load_offset - row_in_block * dim;
+    const int store_offset     = std::is_same_v<DTYPE_O, opus::fp4_t> ? col_offset / 2 : col_offset;
     const int32_t row_idx      = row_base + row_in_block;
     const int32_t safe_row_idx = row_idx < m ? row_idx : m - 1;
     const int32_t token_id     = safe_row_idx >> log2_head_num;
