@@ -415,4 +415,6 @@ else:
 # last entry, but build_tune_dict processes CSV rows for all build targets.
 # Note: cannot use {**a, **b} merge — both arches use overlapping integer IDs,
 # which would drop entries. Collect values from both dicts instead.
-kernels_by_name = {v.name: v for v in list(_expanded_942.values()) + list(_expanded_950.values())}
+kernels_by_name = {
+    v.name: v for v in list(_expanded_942.values()) + list(_expanded_950.values())
+}

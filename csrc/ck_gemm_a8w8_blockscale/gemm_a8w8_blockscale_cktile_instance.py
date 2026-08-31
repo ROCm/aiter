@@ -153,4 +153,6 @@ else:
 # encounters a CSV row referencing a kernel name from a different arch.
 # Note: cannot use {**a, **b} merge — both arches use overlapping integer IDs,
 # which would drop entries. Collect values from both dicts instead.
-candidate_kernels_by_name = {v.name: v for v in list(_expanded_942.values()) + list(_expanded_95x.values())}
+candidate_kernels_by_name = {
+    v.name: v for v in list(_expanded_942.values()) + list(_expanded_95x.values())
+}
