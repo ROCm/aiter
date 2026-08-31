@@ -3,8 +3,9 @@
 
 """Unified correctness + performance test for jagged_dense_bmm backward (jdbba bwd).
 
-Correctness (pytest, Mi=512): dispatch config resolution, cos > 0.999 vs torch-eager
-reference on all three grads (dJagged, dDense, dBias), tail-over-read regression,
+Correctness (pytest, Mi=512): dispatch config resolution, checkAllclose vs torch-eager
+reference on all three grads (dJagged, dDense, dBias), empty-group zero checks in skew
+regime, tail-over-read regression,
 forced split=2 reduce-path coverage, end-to-end autograd at headline shapes,
 multi-device backward (cuda:1 tensors, current device cuda:0), and large-B
 (n_groups>=8192) int32 offset boundary at D=512.
@@ -40,7 +41,7 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.test_common import benchmark, run_perftest
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 try:
     import flydsl.compiler as flyc
@@ -59,7 +60,8 @@ torch.set_default_device("cuda")
 
 SUPPORTED_GFX = ("gfx942", "gfx950")
 SEED = 1234
-_COS_THRESH = 0.999
+_RTOL = 1e-2
+_ATOL = 1e-2
 
 try:
     from generative_recommenders.ops.triton.triton_jagged import (
@@ -174,21 +176,45 @@ def _flops_bytes(component, L, B, D, N):
     return f_jag + f_db, m_jag + m_db
 
 
-def _cos(a, b):
-    return torch.nn.functional.cosine_similarity(
-        a.float().flatten(), b.float().flatten(), dim=0
-    ).item()
+def _tensor_err(got, ref, msg):
+    return checkAllclose(
+        ref.to(dtypes.fp32),
+        got.to(dtypes.fp32),
+        rtol=_RTOL,
+        atol=_ATOL,
+        msg=msg,
+        printLog=False,
+    )
 
 
-def _component_cos(component, got, ref):
-    d_jagged_ref, d_dense_ref, d_bias_ref = ref
+def _grads_err(dj, dd, db, rj, rd, rb, msg):
+    return max(
+        _tensor_err(dj, rj, f"{msg} dJagged"),
+        _tensor_err(dd, rd, f"{msg} dDense"),
+        _tensor_err(db, rb, f"{msg} dBias"),
+    )
+
+
+def _component_err(component, got, ref, msg):
+    rj, rd, rb = ref
     if component == "jagged":
-        return _cos(got, d_jagged_ref)
+        return _tensor_err(got, rj, f"{msg} dJagged")
     if component == "dense_bias":
         dd, db = got
-        return min(_cos(dd, d_dense_ref), _cos(db, d_bias_ref))
+        return max(
+            _tensor_err(dd, rd, f"{msg} dDense"),
+            _tensor_err(db, rb, f"{msg} dBias"),
+        )
     dj, dd, db = got
-    return min(_cos(dj, d_jagged_ref), _cos(dd, d_dense_ref), _cos(db, d_bias_ref))
+    return _grads_err(dj, dd, db, rj, rd, rb, msg)
+
+
+def _assert_empty_group_grads_zero(d_dense, d_bias, seq_offsets):
+    """Empty groups must produce zero dDense and dBias (kernel contract)."""
+    for b in range(d_dense.shape[0]):
+        if int(seq_offsets[b + 1].item()) <= int(seq_offsets[b].item()):
+            assert d_dense[b].float().abs().max().item() == 0.0, f"group {b} dDense"
+            assert d_bias[b].float().abs().max().item() == 0.0, f"group {b} dBias"
 
 
 def _build_triton_fn(jagged, dense, d_out, seq_offsets, B, Mi, N, K, component):
@@ -322,14 +348,16 @@ def jdbba_bwd(B, D, Kout, Mi, regime, component, seed=SEED, sparsity=0.95):
     ret = {"gfx": get_gfx(), "L": L}
     for name, fn in candidates.items():
         got, us = run_perftest(fn)
-        min_cos = _component_cos(component, got, ref)
-        assert (
-            min_cos > _COS_THRESH
-        ), f"{name}: jdbba_bwd ({component}, {regime}) cos={min_cos:.5f}"
+        tag = f"{name}: jdbba_bwd ({component}, {regime})"
+        err = _component_err(component, got, ref, tag)
+        assert err == 0, f"{tag} err={err:.4g}"
+        if regime == "skew" and component != "jagged":
+            dd, db = got if component == "dense_bias" else (got[1], got[2])
+            _assert_empty_group_grads_zero(dd, db, seq_offsets)
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
-        ret[f"{name} err"] = max(0.0, 1.0 - min_cos)
+        ret[f"{name} err"] = err
     return ret
 
 
@@ -372,12 +400,18 @@ def _run_autograd_case(D, B, Mi, regime, *, seed=SEED, sparsity=0.95, label=""):
     torch.cuda.synchronize()
 
     gj_e, gd_e, gb_e = _eager_grads(jagged, dense, bias, seq_offsets, grad_out, B)
-    c_j, c_d, c_b = _cos(jf.grad, gj_e), _cos(df.grad, gd_e), _cos(bf.grad, gb_e)
-    ok = min(c_j, c_d, c_b) > _COS_THRESH
     tag = f"{label}[autograd] B={B} D={D} Mi={Mi} {regime:6s} L={L}"
+    err = max(
+        _tensor_err(jf.grad, gj_e, f"{tag} dJagged"),
+        _tensor_err(df.grad, gd_e, f"{tag} dDense"),
+        _tensor_err(bf.grad, gb_e, f"{tag} dBias"),
+    )
+    if regime == "skew":
+        _assert_empty_group_grads_zero(df.grad, bf.grad, seq_offsets)
+    ok = err == 0
     return (
         ok,
-        f"[{'PASS' if ok else 'FAIL'}] {tag}  grad cos(dJ={c_j:.5f}, dD={c_d:.5f}, dB={c_b:.5f})",
+        f"[{'PASS' if ok else 'FAIL'}] {tag}  err={err:.4g}",
     )
 
 
@@ -392,8 +426,6 @@ def _run_case(D, B, Mi, regime, *, seed=SEED, sparsity=0.95, label=""):
     )
     torch.cuda.synchronize()
     rj, rd, rb = run_torch(jagged, dense, d_out, seq_offsets, N, K)
-    c_dj, c_dd, c_db = _cos(dj, rj), _cos(dd, rd), _cos(db, rb)
-    ok = min(c_dj, c_dd, c_db) > _COS_THRESH
     cfg = resolve_config(n_groups=B, reduction_k=D, output_n=D, max_seq_len=Mi)
     assert cfg["gj_stages_a"] == (1 if D <= 256 else 2)
     bw = _bwd.build_backward(
@@ -406,9 +438,13 @@ def _run_case(D, B, Mi, regime, *, seed=SEED, sparsity=0.95, label=""):
         f"{label}B={B} D={D} Mi={Mi} {regime:6s} L={L} "
         f"gj={cfg['gj_stages_a']} split={bw.split}"
     )
+    err = _grads_err(dj, dd, db, rj, rd, rb, tag)
+    if regime == "skew":
+        _assert_empty_group_grads_zero(dd, db, seq_offsets)
+    ok = err == 0
     return (
         ok,
-        f"[{'PASS' if ok else 'FAIL'}] {tag}  cos(dJ={c_dj:.5f}, dD={c_dd:.5f}, dB={c_db:.5f})",
+        f"[{'PASS' if ok else 'FAIL'}] {tag}  err={err:.4g}",
     )
 
 
@@ -421,13 +457,15 @@ def _run_reduce_path_case(D, B, Mi, regime, *, seed=SEED, sparsity=0.95):
     )
     torch.cuda.synchronize()
     rj, rd, rb = run_torch(jagged, dense, d_out, seq_offsets, N, K)
-    c_dj, c_dd, c_db = _cos(dj, rj), _cos(dd, rd), _cos(db, rb)
-    ok = min(c_dj, c_dd, c_db) > _COS_THRESH
     ncols = (N + min(N, 256) - 1) // min(N, 256)
     tag = f"[reduce-path] B={B} D={D} Mi={Mi} {regime:6s} split=2 NRED_COL_TILES={ncols} L={L}"
+    err = _grads_err(dj, dd, db, rj, rd, rb, tag)
+    if regime == "skew":
+        _assert_empty_group_grads_zero(dd, db, seq_offsets)
+    ok = err == 0
     return (
         ok,
-        f"[{'PASS' if ok else 'FAIL'}] {tag}  cos(dJ={c_dj:.5f}, dD={c_dd:.5f}, dB={c_db:.5f})",
+        f"[{'PASS' if ok else 'FAIL'}] {tag}  err={err:.4g}",
     )
 
 
@@ -553,7 +591,6 @@ def test_jdbba_bwd_multi_device():
         sys.path.insert(0, {_REPO_ROOT!r})
 
         import torch
-        import torch.nn.functional as F
         from aiter import dtypes
         from aiter.ops.flydsl import jagged_dense_bmm_bwd_dispatched
 
@@ -588,16 +625,14 @@ def test_jdbba_bwd_multi_device():
                 d_dense[b] = (jagged[s:e].float().t() @ go).to(dtypes.bf16)
                 d_bias[b] = go.sum(0).to(dtypes.bf16)
 
-        cos_thresh = {_COS_THRESH}
+        rtol, atol = {_RTOL}, {_ATOL}
         for name, got, ref in (
             ("dJagged", dj, d_jagged),
             ("dDense", dd, d_dense),
             ("dBias", db, d_bias),
         ):
-            c = F.cosine_similarity(
-                got.float().flatten(), ref.float().flatten(), dim=0
-            ).item()
-            assert c > cos_thresh, f"{{name}} cos={{c:.6f}}"
+            close = torch.isclose(got.float(), ref.float(), rtol=rtol, atol=atol)
+            assert close.all(), f"{{name}} mismatch ({{(~close).sum().item()}} elems)"
 
         print("MULTI_DEVICE_OK", flush=True)
         """)
