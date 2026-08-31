@@ -2271,7 +2271,8 @@ namespace py = pybind11;
           py::arg("stride1"),                    \
           py::arg("k")         = 2048,           \
           py::arg("workspace") = std::nullopt,   \
-          py::arg("stable")    = false);         \
+          py::arg("stable")    = false,          \
+          py::arg("values")    = std::nullopt);  \
     m.def("topk_mb_workspace_size",              \
           &topk_mb_workspace_size,               \
           py::arg("numRows"),                    \
