@@ -1372,6 +1372,7 @@ def mha_v4(
             v_scale_mode,
             softmax_scale=softmax_scale,
             out=out,
+            **packed_lut,
         )
     if q_format == AttentionFormat.INT8 and _is_fp8_format(v_format):
         q_quantized, q_descale = quantize_int8(q)

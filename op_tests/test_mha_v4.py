@@ -3,6 +3,8 @@
 
 import math
 import os
+import subprocess
+import sys
 from typing import NamedTuple
 
 import pytest
@@ -1214,48 +1216,154 @@ def test_mha_v4_sparse_work_table_leaves_uniform_counts_in_raster_order(
     reason="sorted-sparse MHA v4 code object is not deployed",
 )
 @pytest.mark.parametrize(
-    ("q_format", "v_format"),
+    "launch",
     [
         pytest.param(
-            native_fp8_format(),
-            native_fp8_format(),
+            lambda q, k, v, mask: mha_v4(
+                q,
+                k,
+                v,
+                native_fp8_format(),
+                native_fp8_format(),
+                native_fp8_format(),
+                block_mask=mask,
+            ),
             id="fp8",
         ),
         pytest.param(
-            AttentionFormat.FP8,
-            AttentionFormat.MXFP6,
+            lambda q, k, v, mask: mha_v4(
+                q,
+                k,
+                v,
+                AttentionFormat.INT8,
+                AttentionFormat.INT8,
+                native_fp8_format(),
+                block_mask=mask,
+            ),
+            id="i8fp8",
+        ),
+        pytest.param(
+            lambda q, k, v, mask: mha_v4_mxfp8(q, k, v, block_mask=mask),
             marks=pytest.mark.skipif(
-                get_gfx() != "gfx950", reason="gfx950 MXFP6 sparse"
+                get_gfx() != "gfx950", reason="gfx950 MX sparse"
+            ),
+            id="mxfp8",
+        ),
+        pytest.param(
+            lambda q, k, v, mask: mha_v4(
+                q,
+                k,
+                v,
+                native_fp8_format(),
+                native_fp8_format(),
+                AttentionFormat.MXFP6,
+                block_mask=mask,
+            ),
+            marks=pytest.mark.skipif(
+                get_gfx() != "gfx950", reason="gfx950 MX sparse"
             ),
             id="f8f6",
         ),
         pytest.param(
-            AttentionFormat.INT8,
-            native_fp8_format(),
-            id="i8fp8",
+            lambda q, k, v, mask: mha_v4(
+                q,
+                k,
+                v,
+                AttentionFormat.MXFP6,
+                AttentionFormat.MXFP6,
+                native_fp8_format(),
+                block_mask=mask,
+            ),
+            marks=pytest.mark.skipif(
+                get_gfx() != "gfx950", reason="gfx950 MX sparse"
+            ),
+            id="mxfp6",
+        ),
+        pytest.param(
+            lambda q, k, v, mask: mha_v4(
+                q,
+                k,
+                v,
+                AttentionFormat.MXFP6,
+                AttentionFormat.MXFP6,
+                AttentionFormat.MXFP4,
+                block_mask=mask,
+            ),
+            marks=pytest.mark.skipif(
+                get_gfx() != "gfx950", reason="gfx950 MX sparse"
+            ),
+            id="f6f4",
+        ),
+        pytest.param(
+            lambda q, k, v, mask: mha_v4(
+                q,
+                k,
+                v,
+                AttentionFormat.MXFP4,
+                AttentionFormat.MXFP4,
+                native_fp8_format(),
+                block_mask=mask,
+            ),
+            marks=pytest.mark.skipif(
+                get_gfx() != "gfx950", reason="gfx950 MX sparse"
+            ),
+            id="mxfp4",
+        ),
+        pytest.param(
+            lambda q, k, v, mask: mha_v4(
+                q,
+                k,
+                v,
+                AttentionFormat.MXFP4,
+                AttentionFormat.MXFP4,
+                AttentionFormat.MXFP4,
+                block_mask=mask,
+            ),
+            marks=pytest.mark.skipif(
+                get_gfx() != "gfx950", reason="gfx950 MX sparse"
+            ),
+            id="f4f4",
         ),
     ],
 )
-def test_mha_v4_sparse_all_true_mask_matches_dense(q_format, v_format):
+def test_mha_v4_sparse_all_true_mask_matches_dense(launch):
     torch.manual_seed(41)
-    q = torch.randn((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
-    k = torch.randn((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
+    q = torch.randn((1, 511, 5, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 512, 5, 128), device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
-    kv_tiles = 256 // mha_v4_kv_tile()
-    mask = torch.ones((1, 2, 1, kv_tiles), device="cuda", dtype=torch.bool)
-    dense = mha_v4(q, k, v, q_format, q_format, v_format)
-    sparse = mha_v4(
-        q,
-        k,
-        v,
-        q_format,
-        q_format,
-        v_format,
-        block_mask=mask,
+    mask = torch.ones(
+        (1, 5, 2, 512 // mha_v4_kv_tile()), device="cuda", dtype=torch.bool
     )
+    dense = launch(q, k, v, None)
+    sparse = launch(q, k, v, mask)
     torch.cuda.synchronize()
     assert torch.equal(dense, sparse)
     assert torch.isfinite(sparse).all()
+
+
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
+@pytest.mark.parametrize(
+    "v_format",
+    [
+        pytest.param(AttentionFormat.BF16, id="bf16"),
+        pytest.param(native_fp8_format(), id="bf16fp8"),
+    ],
+)
+def test_mha_v4_sparse_dense_only_formats_reject_block_mask(v_format):
+    q = torch.zeros((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
+    mask = torch.ones(
+        (1, 2, 1, 256 // mha_v4_kv_tile()), device="cuda", dtype=torch.bool
+    )
+    with pytest.raises(NotImplementedError, match="does not have a BF16 manifest row"):
+        mha_v4(
+            q,
+            q,
+            q,
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            v_format,
+            block_mask=mask,
+        )
 
 
 @pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")
@@ -1816,52 +1924,71 @@ def test_mha_v4_sparse_rejects_empty_kv_block_indices():
     not _mha_v4_sparse_co_available(),
     reason="sorted-sparse MHA v4 code object is not deployed",
 )
-@pytest.mark.skipif(
-    os.environ.get("AITER_MHA_V4_VALIDATE_LUT", "0") in ("0", ""),
-    reason="opt-in LUT validation is disabled",
-)
 @pytest.mark.parametrize(
-    "mutate,message",
+    "mutation,message",
     [
         pytest.param(
-            lambda indices, start, count: indices.fill_(9999),
+            "indices.fill_(9999)",
             "outside",
             id="index_out_of_range",
         ),
         pytest.param(
-            lambda indices, start, count: start.fill_(-1),
+            "start.fill_(-1)",
             "negative",
             id="negative_start",
         ),
     ],
 )
-def test_mha_v4_sparse_validation_rejects_malformed_lut(mutate, message):
-    """Only reachable with AITER_MHA_V4_VALIDATE_LUT=1; otherwise these fault in the ASM."""
-    heads = 2
-    kv_tile = mha_v4_kv_tile()
-    kv_tiles = 4
-    q, k, v = _sparse_fp8_operands(sequence_k=kv_tiles * kv_tile, heads=heads)
-    mask = _tile_mask(heads, kv_tiles, (0, 1))
-    indices, start, count = block_attn_mask_to_ragged_lut(
-        mask, num_heads=heads, return_none_if_dense=False
+def test_mha_v4_sparse_validation_rejects_malformed_lut(mutation, message):
+    """Enable opt-in validation before AITER loads, without slowing the parent test process."""
+    probe = f"""
+from op_tests.test_mha_v4 import (
+    AttentionFormat,
+    AttentionScaleMode,
+    _sparse_fp8_operands,
+    _tile_mask,
+    block_attn_mask_to_ragged_lut,
+    mha_v4_kv_tile,
+    mha_v4_packed,
+    native_fp8_format,
+)
+
+heads = 2
+kv_tiles = 4
+q, k, v = _sparse_fp8_operands(
+    sequence_k=kv_tiles * mha_v4_kv_tile(), heads=heads
+)
+mask = _tile_mask(heads, kv_tiles, (0, 1))
+indices, start, count = block_attn_mask_to_ragged_lut(
+    mask, num_heads=heads, return_none_if_dense=False
+)
+{mutation}
+fp8_format = native_fp8_format()
+mha_v4_packed(
+    q.quantized,
+    k.quantized,
+    v.quantized,
+    q.descale,
+    k.descale,
+    v.descale,
+    fp8_format,
+    fp8_format,
+    fp8_format,
+    AttentionScaleMode.F32_PER_TENSOR,
+    AttentionScaleMode.F32_PER_TENSOR,
+    AttentionScaleMode.F32_PER_TENSOR,
+    kv_block_indices=indices,
+    lut_start=start,
+    lut_count=count,
+)
+"""
+    env = {**os.environ, "AITER_MHA_V4_VALIDATE_LUT": "1"}
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=AITER_ROOT_DIR,
+        env=env,
+        text=True,
+        capture_output=True,
     )
-    mutate(indices, start, count)
-    fp8_format = native_fp8_format()
-    with pytest.raises(RuntimeError, match=message):
-        mha_v4_packed(
-            q.quantized,
-            k.quantized,
-            v.quantized,
-            q.descale,
-            k.descale,
-            v.descale,
-            fp8_format,
-            fp8_format,
-            fp8_format,
-            AttentionScaleMode.F32_PER_TENSOR,
-            AttentionScaleMode.F32_PER_TENSOR,
-            AttentionScaleMode.F32_PER_TENSOR,
-            kv_block_indices=indices,
-            lut_start=start,
-            lut_count=count,
-        )
+    assert result.returncode != 0
+    assert message in result.stderr
