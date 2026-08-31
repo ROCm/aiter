@@ -19,20 +19,38 @@ all-reduce, minus the peer handshake.
 What the roofline is and is not
 ===============================
 
-Measured::
+The roof for a byte count is the **best over algorithms**, not the throughput of
+one. That distinction is load-bearing: an earlier version modelled only the
+direct two-shot below, and on a NUMA-split PCIe host that pattern is ~19% slower
+than a ring -- so RCCL, which rings, measured *above* the "ceiling" at
+``eff = 1.18``. A ceiling a real candidate can beat is not a ceiling. Every
+algorithm here is a legitimate way to all-reduce the same bytes, so the fastest
+of them is the honest bound::
 
-    1stage   N parallel transfers, GPU i reduces all N buffers into its own:
-             -N (G0..G(N-1) Gi Gi <cus> <bytes>)  for each i
+    one-shot  N parallel transfers, GPU i reduces all N buffers into its own:
+              -N (G0..G(N-1) Gi Gi <cus> <bytes>)  for each i
 
-    2stage   reduce-scatter then all-gather, as two tests whose times are
-             summed (TransferBench has no ordering between transfers within a
-             test, so they cannot share one):
-             RS: -N (G0..G(N-1) Gi Gi <cus> <bytes/N>)  for each i
-             AG: -N (Gi Gi G0..G(N-1) <cus> <bytes/N>)  for each i
+    two-shot  reduce-scatter then all-gather, as two tests whose times are
+              summed (TransferBench has no ordering between transfers within a
+              test, so they cannot share one):
+              RS: -N (G0..G(N-1) Gi Gi <cus> <bytes/N>)         for each i
+              AG: -N (Gi Gi G0..G(N-1) except Gi <cus> <bytes/N>) for each i
+
+    ring      one step, each rank sending its chunk to its successor, scaled by
+              the 2(N-1) steps a ring all-reduce takes:
+              -N (Gi Gi G(i+1 mod N) <cus> <bytes/N>)  for each i
+
+Every step of a ring all-reduce drives the identical link pattern -- only the
+chunk being carried differs -- so one step is measured and multiplied rather
+than emitting 2(N-1) tests and paying 2(N-1) launch overheads.
 
 TransferBench cannot express the chunk *offsets* that a real reduce-scatter
 reads, but the bytes moved per link are the same, which is all a bandwidth
 roofline depends on.
+
+Only the ring survives above ``MAX_FANIN``: it needs one source and one
+destination per transfer, where the other two need N. Above that world size the
+roof is the ring alone rather than absent.
 
 Deliberately not modelled, all of which make the roofline optimistic:
 
@@ -132,7 +150,14 @@ _FIXED_PATTERN = {
 
 
 def pattern(cand_key: str, predicted: str) -> str:
-    """Traffic pattern to roofline *cand_key* against.
+    """Which algorithm *cand_key* itself runs, for reporting.
+
+    **This no longer selects the roof.** It used to, and that was the bug: a
+    candidate graded against its own algorithm can beat the "ceiling" simply by
+    picking a better one, which is how ``rccl`` reached ``eff = 1.18``. The roof
+    is now the best over every algorithm in ``_ALGOS``. What survives here is
+    descriptive: comparing a candidate's own pattern against the ``roof algo``
+    that won says whether it chose well for this fabric.
 
     *predicted* is the ``cross_device_reduce_*`` the host dispatch would pick
     for this shape, and is used only for the candidates that actually follow it.
@@ -228,27 +253,87 @@ def _two_shot(tp: int, nbytes: int, cus: int) -> list[str]:
     """
     chunk = round16(nbytes // tp)
     peers = "".join(f"G{i}" for i in range(tp))
+    # RS keeps every source including the local one: a real reduce-scatter does
+    # read its own contribution. AG deliberately excludes the local destination
+    # -- a rank already holds its own chunk, and writing it to itself is local
+    # traffic no all-gather performs. Leaving it in inflated the two-shot roof
+    # enough to push measured `eff` above 1.0 at TP2.
+    others = ["".join(f"G{j}" for j in range(tp) if j != i) for i in range(tp)]
     rs = _advanced([(peers, f"G{i}", f"G{i}", cus, chunk) for i in range(tp)])
-    ag = _advanced([(f"G{i}", f"G{i}", peers, cus, chunk) for i in range(tp)])
+    ag = _advanced([(f"G{i}", f"G{i}", others[i], cus, chunk) for i in range(tp)])
     return [rs, ag]
+
+
+def _ring(tp: int, nbytes: int, cus: int) -> list[str]:
+    """One step of a ring all-reduce; the caller scales by ``_ring_steps``.
+
+    Each rank sends its chunk to its successor and receives from its
+    predecessor -- point-to-point only, never a fan-in. That is exactly why a
+    ring survives an unfavourable NUMA split that the direct patterns do not:
+    it needs N peer links rather than all N(N-1) of them, and the ring order
+    can be chosen to cross the socket boundary as few times as possible.
+    """
+    chunk = round16(nbytes // tp)
+    return [
+        _advanced(
+            [(f"G{i}", f"G{i}", f"G{(i + 1) % tp}", cus, chunk) for i in range(tp)]
+        )
+    ]
+
+
+def _ring_steps(tp: int) -> int:
+    """A ring all-reduce is 2(N-1) steps: N-1 to reduce-scatter, N-1 to gather."""
+    return 2 * (tp - 1)
+
+
+# name -> (emit, steps(tp), fan-in(tp)). ``fan-in`` is the largest source or
+# destination list the pattern builds, checked against MAX_FANIN.
+_ALGOS = (
+    ("one-shot", _one_shot, lambda tp: 1, lambda tp: tp),
+    ("two-shot", _two_shot, lambda tp: 1, lambda tp: tp),
+    ("ring", _ring, _ring_steps, lambda tp: 1),
+)
 
 
 @dataclass(frozen=True)
 class _Plan:
-    """One measurement, and how many consecutive tests it consumes."""
+    """One (byte count, algorithm, CU count) measurement.
 
-    request: tuple  # (wire_bytes, kernel) -- the caller's key
+    ``steps`` scales the measured time: 1 for the patterns emitted in full, and
+    2(N-1) for the ring, of which only one representative step is run.
+    """
+
+    nbytes: int
+    algo: str
     cus: int
+    steps: int
     lines: list[str] = field(compare=False)
 
 
-def build_plans(tp: int, requests, cus=DEFAULT_CUS) -> list[_Plan]:
-    """A plan per (request, CU count), in the order their tests will appear."""
+@dataclass(frozen=True)
+class Roof:
+    """The best time any modelled algorithm achieved, and which one it was."""
+
+    us: float
+    algo: str
+
+
+def build_plans(tp: int, byte_counts, cus=DEFAULT_CUS, algos=None) -> list[_Plan]:
+    """A plan per (byte count, algorithm, CU count), in test order.
+
+    Keyed on bytes alone: the roof is the best algorithm for that many bytes,
+    so a candidate's own choice of algorithm no longer selects its ceiling.
+    *algos* restricts which are considered; the default is all of them.
+    """
     plans = []
-    for nbytes, kernel in sorted(set(requests)):
-        for cu in cus:
-            emit = _one_shot if kernel.startswith("1stage") else _two_shot
-            plans.append(_Plan((nbytes, kernel), cu, emit(tp, nbytes, cu)))
+    for nbytes in sorted(set(byte_counts)):
+        for name, emit, steps, fanin in _ALGOS:
+            if algos is not None and name not in algos:
+                continue
+            if fanin(tp) > MAX_FANIN:
+                continue
+            for cu in cus:
+                plans.append(_Plan(nbytes, name, cu, steps(tp), emit(tp, nbytes, cu)))
     return plans
 
 
@@ -411,35 +496,24 @@ def _run(binary: str, config: str, *, iters: int, warmup: int, timeout: float) -
 
 def measure(
     tp_size: int,
-    requests,
+    byte_counts,
     *,
     binary: str,
     cus=DEFAULT_CUS,
+    algos=None,
     iters: int = 20,
     warmup: int = 3,
     timeout: float = 900.0,
 ) -> dict:
-    """Roofline microseconds for each ``(wire_bytes, kernel)`` in *requests*.
+    """``{bytes: Roof}`` -- the fastest modelled all-reduce of that many bytes.
 
-    Every request at every CU count goes into a single config file and so a
-    single process launch: the tests are independent, and a launch costs more
-    than most of the tests do. The returned time per request is the best CU
-    count's, since the ceiling is what the fabric can do rather than what one
-    arbitrary CU count achieves.
-
-    Requests that cannot be expressed (world size above ``MAX_FANIN``) are
-    absent from the result; the caller renders them as a blank cell.
+    Every byte count, algorithm and CU count goes into a single config file and
+    so a single process launch: the tests are independent, and a launch costs
+    more than most of the tests do. The winner is the minimum over *both* the
+    algorithm and the CU count, because a ceiling is what the fabric can do,
+    not what one arbitrary choice of either achieves.
     """
-    if tp_size > MAX_FANIN:
-        logger.warning(
-            "TransferBench: TP%d exceeds the %d source/destination cap; "
-            "skipping the roofline",
-            tp_size,
-            MAX_FANIN,
-        )
-        return {}
-
-    plans = build_plans(tp_size, requests, cus)
+    plans = build_plans(tp_size, byte_counts, cus, algos)
     if not plans:
         return {}
     config = "\n".join(line for p in plans for line in p.lines) + "\n"
@@ -459,27 +533,27 @@ def measure(
     for plan in plans:
         chunk = tests[pos : pos + len(plan.lines)]
         pos += len(plan.lines)
-        # Sum across the phases of a multi-test plan (2stage), then keep the
-        # fastest CU count for this request.
-        us = sum(t.slowest_exec_ms for t in chunk) * 1e3
+        # Sum across the phases of a multi-test plan (two-shot), scale by the
+        # step count (the ring runs one representative step), then keep the
+        # fastest algorithm/CU pair for this byte count.
+        us = sum(t.slowest_exec_ms for t in chunk) * 1e3 * plan.steps
         # A row below the text interface's resolution comes back nan (see
         # _duration_ms). Dropping it leaves the caller with no entry, which
         # renders as a blank cell -- reporting the 0 would instead read as an
         # infinitely fast fabric and take every efficiency to 0.
         if not math.isfinite(us) or us <= 0.0:
-            unresolved.add(plan.request)
+            unresolved.add(plan.nbytes)
             continue
-        prev = best.get(plan.request)
-        if prev is None or us < prev:
-            best[plan.request] = us
+        prev = best.get(plan.nbytes)
+        if prev is None or us < prev.us:
+            best[plan.nbytes] = Roof(us, plan.algo)
 
-    for req in sorted(unresolved - set(best)):
+    for nbytes in sorted(unresolved - set(best)):
         logger.warning(
-            "TransferBench: TP%d %d B %s is below the resolution of the "
+            "TransferBench: TP%d %d B is below the resolution of the "
             "reported table; leaving it blank",
             tp_size,
-            req[0],
-            req[1],
+            nbytes,
         )
     return best
 
@@ -565,18 +639,42 @@ def _self_test() -> None:
     assert pattern("rccl", "1stage") == "2stage"
     print("pattern self-test: ok")
 
-    # A 2stage plan must be two tests (RS then AG) and a 1stage plan one.
-    assert len(build_plans(4, [(4096, "1stage")], cus=(8,))[0].lines) == 1
-    two = build_plans(4, [(4096, "2stage")], cus=(8,))[0].lines
-    assert len(two) == 2, two
-    assert two[0] == (
+    # Every byte count is planned against all three algorithms, so the roof is
+    # a bound over algorithms rather than the cost of one.
+    plans = build_plans(4, [4096], cus=(8,))
+    assert [p.algo for p in plans] == ["one-shot", "two-shot", "ring"], plans
+    by_algo = {p.algo: p for p in plans}
+
+    assert len(by_algo["one-shot"].lines) == 1
+    assert by_algo["one-shot"].steps == 1
+    assert by_algo["one-shot"].lines[0] == (
+        "-4 (G0G1G2G3 G0 G0 8 4096) (G0G1G2G3 G1 G1 8 4096) "
+        "(G0G1G2G3 G2 G2 8 4096) (G0G1G2G3 G3 G3 8 4096)"
+    ), by_algo["one-shot"].lines[0]
+
+    two = by_algo["two-shot"]
+    assert len(two.lines) == 2 and two.steps == 1, two
+    # RS reads every rank including itself; AG writes only to the peers.
+    assert two.lines[0] == (
         "-4 (G0G1G2G3 G0 G0 8 1024) (G0G1G2G3 G1 G1 8 1024) "
         "(G0G1G2G3 G2 G2 8 1024) (G0G1G2G3 G3 G3 8 1024)"
-    ), two[0]
-    assert two[1] == (
-        "-4 (G0 G0 G0G1G2G3 8 1024) (G1 G1 G0G1G2G3 8 1024) "
-        "(G2 G2 G0G1G2G3 8 1024) (G3 G3 G0G1G2G3 8 1024)"
-    ), two[1]
+    ), two.lines[0]
+    assert two.lines[1] == (
+        "-4 (G0 G0 G1G2G3 8 1024) (G1 G1 G0G2G3 8 1024) "
+        "(G2 G2 G0G1G3 8 1024) (G3 G3 G0G1G2 8 1024)"
+    ), two.lines[1]
+
+    # One representative step, scaled by 2(N-1) rather than emitted 6 times.
+    ring = by_algo["ring"]
+    assert len(ring.lines) == 1 and ring.steps == 6, ring
+    assert ring.lines[0] == (
+        "-4 (G0 G0 G1 8 1024) (G1 G1 G2 8 1024) (G2 G2 G3 8 1024) (G3 G3 G0 8 1024)"
+    ), ring.lines[0]
+    assert _ring_steps(2) == 2 and _ring_steps(8) == 14
+
+    # Above the fan-in cap only the ring is expressible, and it still is.
+    wide = build_plans(16, [4096], cus=(8,))
+    assert [p.algo for p in wide] == ["ring"], wide
     print("config self-test: ok")
 
 
@@ -597,11 +695,14 @@ def main() -> None:
         help="payload byte counts (default: one bf16 8x7168 activation)",
     )
     p.add_argument(
-        "-k",
-        "--kernel",
-        default="1stage",
-        choices=["1stage", "2stage"],
-        help="traffic pattern to model",
+        "-a",
+        "--algo",
+        nargs="*",
+        default=None,
+        choices=[name for name, *_ in _ALGOS],
+        help="restrict the algorithms considered. Default: all of them, and\n"
+        "the roof is the fastest -- which is the point. Pin one to compare\n"
+        "patterns directly (e.g. ring vs two-shot on a NUMA-split host).",
     )
     p.add_argument("--cus", type=int, nargs="*", default=list(DEFAULT_CUS))
     p.add_argument("--iters", type=int, default=20)
@@ -619,31 +720,39 @@ def main() -> None:
         _self_test()
         return
 
-    requests = [(round16(b), args.kernel) for b in args.bytes]
+    byte_counts = [round16(b) for b in args.bytes]
     if args.dry_run:
-        for plan in build_plans(args.tp, requests, args.cus):
-            print(f"# {plan.request[1]} {plan.request[0]}B x {plan.cus} CUs")
+        for plan in build_plans(args.tp, byte_counts, args.cus, args.algo):
+            steps = f" x{plan.steps} steps" if plan.steps != 1 else ""
+            print(f"# {plan.algo} {plan.nbytes}B x {plan.cus} CUs{steps}")
             print("\n".join(plan.lines))
         return
 
     binary = find_binary(args.bin)
     if binary is None:
-        raise SystemExit(
-            "TransferBench not found. Build it from "
+        # Self-skip rather than exit non-zero. CI runs `python3 <file>` over
+        # every .py under multigpu_tests/ (.github/scripts/aiter_test.sh), so a
+        # hard failure here would fail the whole multi-GPU job on every runner
+        # that lacks an optional third-party binary.
+        logger.warning(
+            "TransferBench not found; nothing to do. Build it from "
             "https://github.com/ROCm/TransferBench and set $TRANSFERBENCH "
             "or pass --bin."
         )
+        return
     got = measure(
         args.tp,
-        requests,
+        byte_counts,
         binary=binary,
         cus=args.cus,
+        algos=args.algo,
         iters=args.iters,
         warmup=args.warmup,
     )
-    for (nbytes, kernel), us in sorted(got.items()):
+    for nbytes, roof in sorted(got.items()):
         print(
-            f"{kernel:8s} {nbytes:>12,d} B  {us:9.2f} us  {nbytes / us / 1e3:7.1f} GB/s"
+            f"{nbytes:>12,d} B  {roof.us:9.2f} us  "
+            f"{nbytes / roof.us / 1e3:7.1f} GB/s  via {roof.algo}"
         )
 
 

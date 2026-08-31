@@ -31,13 +31,14 @@ sweep could run them) where they do not apply:
 * ``fly_int4`` needs bf16, TP in {2, 4, 8} and gfx942/gfx950.
 
 The first table printed is the ``summary``: per shape, the fastest candidate
-clearing an accuracy floor (``best``), the fastest bit-accurate one
-(``best exact``), and each one's ratio against the baseline. The floor defaults
+clearing an accuracy floor (``fastest collective``), the fastest bit-accurate
+one (``fastest exact collective``), and each one's ratio against the
+production path (``prod collective``, ``prod time (us)``). The floor defaults
 to ``DEFAULT_MIN_SQNR`` and exists so a codec that is fast only because it
 barely transmits anything cannot win the column; ``--min-sqnr`` moves it, and
-``best SQNR dB`` prints what the winning choice actually cost. The
-per-candidate latency and accuracy tables below it are the full picture the
-summary collapses -- a candidate below the floor still appears there.
+``fastest collective SQNR dB`` prints what the winning choice actually cost.
+The per-candidate latency and accuracy tables below it are the full picture
+the summary collapses -- a candidate below the floor still appears there.
 
 Because the candidates are **not accuracy-equivalent**, every one is graded on
 SQNR against a common fp32 reference and asserted against its own floor in
@@ -82,18 +83,18 @@ production gates leave on the table.
 
 Examples::
 
-    # default sweep: every TP that fits, DSv4 shapes plus every dispatch boundary
+    # default sweep: TP4 only, DSv4 shapes plus every dispatch boundary
     python3 op_tests/multigpu_tests/bench_comm_allreduce.py
 
-    # the 2-GPU case, decode shapes only
+    # also cover the 1stage-only TP2 case, decode shapes only
     HIP_VISIBLE_DEVICES=6,7 python3 op_tests/multigpu_tests/bench_comm_allreduce.py \
-        -t 2 -s 1,7168 8,7168
+        -tp 2 -s 1,7168 8,7168
 
     # just the two kernels we ship, against RCCL
     python3 op_tests/multigpu_tests/bench_comm_allreduce.py -c cdr rccl
 
     # "what is the fastest thing I could actually ship?" -- the summary table's
-    # `best` column, restricted to candidates clearing 25 dB SQNR
+    # `fastest collective` column, restricted to candidates clearing 25 dB SQNR
     python3 op_tests/multigpu_tests/bench_comm_allreduce.py --min-sqnr 25
 
     # fp16, where the fp8-quantized custom AR becomes available
@@ -110,7 +111,7 @@ Examples::
 
     # profiling entrypoint: few iters, per-rank chrome trace
     HIP_VISIBLE_DEVICES=6,7 python3 op_tests/multigpu_tests/bench_comm_allreduce.py \
-        -t 2 -s 8,7168 --iters 20 --profile
+        -tp 2 -s 8,7168 --iters 20 --profile
 
     # under rocprofv3. Do NOT pass -o: ranks are separate processes and a fixed
     # output name makes them overwrite each other (you get one rank, silently).
@@ -118,7 +119,7 @@ Examples::
     HIP_VISIBLE_DEVICES=4,5,6,7 rocprofv3 --kernel-trace -d /tmp/arprof \
         --output-format csv -- \
         python3 op_tests/multigpu_tests/bench_comm_allreduce.py \
-            -t 4 -s 8,7168 12,7168 --iters 20 --warmup 2
+            -tp 4 -s 8,7168 12,7168 --iters 20 --warmup 2
     # then filter Kernel_Name for cross_device_reduce_{1,2}stage.
 """
 
@@ -190,13 +191,58 @@ _FP8_MIN_NUMEL = 128 * 2048
 # bench reports the same availability aiter does.
 if is_flydsl_available():
     from aiter.ops.flydsl import QRInt4
-    from aiter.ops.flydsl.kernels.qr_int4 import MIN_PAYLOAD_BYTES
+    from aiter.ops.flydsl.kernels.qr_int4 import (
+        MIN_PAYLOAD_BYTES,
+        has_xgmi_peer_links,
+    )
 
     HAS_FLY_INT4 = True
 else:
     QRInt4 = None
     MIN_PAYLOAD_BYTES = 0
+    has_xgmi_peer_links = None
     HAS_FLY_INT4 = False
+
+
+def _peer_link_type() -> str:
+    """GPU-to-GPU link type for the provenance header.
+
+    Shares QRInt4's KFD probe rather than reimplementing it, so the report can
+    never disagree with the dispatch decision the kernel actually made. Says so
+    plainly when flydsl is absent and the probe is unavailable, rather than
+    guessing -- a wrong link type here would misattribute a whole class of
+    performance difference.
+    """
+    if has_xgmi_peer_links is None:
+        return "unknown (flydsl unavailable)"
+    return "xGMI" if has_xgmi_peer_links() else "PCIe (no xGMI)"
+
+
+def _gpu_numa_map() -> str:
+    """``cuda:i -> NUMA node`` for every visible GPU, for the provenance header.
+
+    *Which* GPUs a run used is not cosmetic on a multi-socket PCIe host. A GPU
+    hangs off one socket's root complex, so a pair on one node reaches each
+    other through that socket's switch while a pair spanning nodes also crosses
+    the inter-socket link. Picking devices 1,2,3,4 rather than 0,1,2,3 on the
+    reference box moves 3 of 6 pairs across that boundary to 4 of 6, and
+    measured 21% on the roofline -- a swing large enough that two reports
+    without this line are simply not comparable.
+
+    Read from sysfs via the BDF torch reports, since neither torch nor the HIP
+    runtime exposes the NUMA node directly. Degrades to a plain "unknown"
+    rather than guessing.
+    """
+    try:
+        parts = []
+        for i in range(torch.cuda.device_count()):
+            p = torch.cuda.get_device_properties(i)
+            bdf = f"{p.pci_domain_id:04x}:{p.pci_bus_id:02x}:{p.pci_device_id:02x}.0"
+            node = Path(f"/sys/bus/pci/devices/{bdf}/numa_node")
+            parts.append(f"{i}:{node.read_text().strip() if node.exists() else '?'}")
+        return ", ".join(parts) if parts else "none"
+    except (OSError, AttributeError, RuntimeError):
+        return "unknown"
 
 
 @dataclass(frozen=True)
@@ -240,10 +286,11 @@ CANDIDATES = (
 CANDIDATE_KEYS = [c.key for c in CANDIDATES]
 PRIMARY = "cdr"  # the kernel we ship, and the default baseline
 
-# Accuracy floor, in dB, for the summary table's `best` column. Ranked on speed
-# alone `best` would name the widest-error codec in the sweep at nearly every
-# shape -- qr_int3 at ~12 dB is ~25% relative error -- so the default excludes
-# the codecs that are fast only because they barely transmit anything.
+# Accuracy floor, in dB, for the summary table's `fastest collective` column.
+# Ranked on speed alone it would name the widest-error codec in the sweep at
+# nearly every shape -- qr_int3 at ~12 dB is ~25% relative error -- so the
+# default excludes the codecs that are fast only because they barely transmit
+# anything.
 #
 # 15 dB is not a judgement about what is shippable; it is the *widest gap*
 # between adjacent accuracy classes above, so the default cannot flip a winner
@@ -709,7 +756,7 @@ def _row(tp_size, tokens, hidden, dtype, rank_rets):
         "TP": tp_size,
         "M": tokens,
         "K": hidden,
-        "KiB": nbytes / 1024,
+        "payload size (KiB)": nbytes / 1024,
         # Carried for the roofline, which needs the exact byte count rather
         # than the rounded KiB the tables print. Not in ID_COLUMNS, so it never
         # reaches a printed table.
@@ -797,7 +844,24 @@ def device_description() -> str:
     )
 
 
-ID_COLUMNS = ["gfx", "dtype", "TP", "M", "KiB", "kernel", "naive", "prod path"]
+ID_COLUMNS = [
+    "gfx",
+    "dtype",
+    "TP",
+    "M",
+    "payload size (KiB)",
+    "kernel",
+    "naive",
+    "prod path",
+]
+
+# The summary table answers "what should I use", not "how was this row
+# dispatched" -- gfx/dtype are constant for a whole report section and
+# kernel/naive are dispatch predictions that `prod path` already summarizes,
+# so they are dropped rather than repeated on every row.
+SUMMARY_ID_COLUMNS = [
+    c for c in ID_COLUMNS if c not in ("gfx", "dtype", "kernel", "naive")
+]
 
 
 def latency_table(df, baseline: str, keys):
@@ -840,7 +904,42 @@ def metric_table(df, suffix: str, keys):
     return df[cols]
 
 
-def summary_table(df, keys, baseline: str, min_sqnr: float = DEFAULT_MIN_SQNR):
+def _roof(row, key, measured):
+    """TransferBench ceiling for *key*'s wire bytes in this row, or None.
+
+    Shared by ``roofline_table`` and ``summary_table`` so both grade a
+    candidate against the bytes it actually sends rather than the payload it
+    was handed. *key* of ``None`` means the payload itself.
+
+    Keyed on ``(TP, bytes)`` only. It used to also key on the candidate's own
+    algorithm, which meant a candidate was graded against a ceiling built from
+    the same algorithm it had chosen -- so picking a better one than the model
+    put ``eff`` above 1.0. The roof is now the best algorithm for that many
+    bytes, which is a bound a candidate cannot legitimately beat.
+    """
+    nbytes = int(row["_nbytes"])
+    return measured.get(
+        (int(row["TP"]), tbr.wire_bytes(nbytes, key) if key else nbytes)
+    )
+
+
+def _roof_us(row, key, measured):
+    """``_roof`` reduced to microseconds, or None when it was not measured."""
+    roof = _roof(row, key, measured)
+    return roof.us if roof is not None else None
+
+
+def _eff(row, key, us, measured):
+    """``roof us / us`` for *key*, or nan if the candidate or roofline is missing."""
+    if key is None or not pd.notna(us):
+        return float("nan")
+    roof = _roof_us(row, key, measured)
+    return roof / us if roof is not None else float("nan")
+
+
+def summary_table(
+    df, keys, baseline: str, min_sqnr: float = DEFAULT_MIN_SQNR, roofline=None
+):
     """One winner per shape, and what it buys over *baseline*.
 
     The headline answer: for this shape, what is the fastest thing aiter can do
@@ -849,23 +948,34 @@ def summary_table(df, keys, baseline: str, min_sqnr: float = DEFAULT_MIN_SQNR):
     **Ranked on speed alone this table would be a trap**, which is why the
     winner is accuracy-gated and why there are two of them:
 
-    * ``best`` is the fastest candidate clearing *min_sqnr* (default
-      ``DEFAULT_MIN_SQNR``), with ``best SQNR dB`` printed beside it so the cost
-      of the choice is never off-screen. Without a floor the winner would be the
-      widest-error codec in the sweep at nearly every shape -- ``qr_int3`` at
-      ~12 dB is ~25% relative error and beats everything on speed.
-    * ``best exact`` is the fastest of the bit-accurate candidates
-      (``Candidate.exact``), i.e. the fastest option that does not change the
-      model's numerics at all. Omitted when every candidate in the sweep is
-      already exact, since it would just repeat ``best``.
+    * ``fastest collective`` is the fastest candidate clearing *min_sqnr*
+      (default ``DEFAULT_MIN_SQNR``), with ``fastest collective SQNR dB``
+      printed beside it so the cost of the choice is never off-screen. Without
+      a floor the winner would be the widest-error codec in the sweep at
+      nearly every shape -- ``qr_int3`` at ~12 dB is ~25% relative error and
+      beats everything on speed.
+    * ``fastest exact collective`` is the fastest of the bit-accurate
+      candidates (``Candidate.exact``), i.e. the fastest option that does not
+      change the model's numerics at all. Omitted when every candidate in the
+      sweep is already exact, since it would just repeat ``fastest
+      collective``.
 
     A candidate excluded by the floor is not hidden: it keeps its column in the
     latency table, and the count of rows where the floor changed the winner is
     logged, so the default can never silently bury a result.
 
-    Both ratios are ``baseline us / winner us``, so **> 1.0 means faster than
-    the baseline**, matching ``latency_table``. A row whose winner *is* the
-    baseline reads 1.0, which is the useful answer that nothing beat it.
+    Both ratios are ``prod time (us) / fastest time (us)``, so **> 1.0 means
+    faster than production**, matching ``latency_table``. A row whose winner
+    *is* the production path reads 1.0, which is the useful answer that
+    nothing beat it. ``prod time (us)`` is *baseline*'s time -- usually the
+    ``cdr`` kernel aiter ships, but it can read as an RCCL collective wherever
+    ``prod path`` fell back to it.
+
+    *roofline*, when given the ``measured`` lookup from ``measure_roofline``,
+    adds a ``prod eff`` / ``fastest eff`` / ``fastest exact eff`` column next
+    to each winner -- the same ``roof us / cand us`` ratio as
+    ``roofline_table``, graded on that candidate's own wire bytes and pattern,
+    so a quantizing winner is not held to the exact candidates' ceiling.
     """
     exact_keys = {c.key for c in CANDIDATES if c.exact}
     live = [k for k in keys if f"{k} us" in df.columns]
@@ -896,16 +1006,23 @@ def summary_table(df, keys, baseline: str, min_sqnr: float = DEFAULT_MIN_SQNR):
 
     rows = []
     gated = {}  # candidate -> how many rows it would have won but for the floor
+    id_rename = {"prod path": "prod collective"}
     for _, r in df.iterrows():
-        out = {c: r[c] for c in ID_COLUMNS if c in df}
+        out = {id_rename.get(c, c): r[c] for c in SUMMARY_ID_COLUMNS if c in df}
         base_us = r.get(base_col, float("nan"))
-        out[f"{baseline} us"] = base_us
+        out["prod time (us)"] = base_us
+        if roofline is not None:
+            out["prod eff"] = _eff(r, baseline, base_us, roofline)
 
         k, us = _pick(r, live, min_sqnr)
-        out["best"] = k or "-"
-        out["best us"] = us
-        out[f"best vs {baseline}"] = base_us / us if pd.notna(base_us) else float("nan")
-        out["best SQNR dB"] = r.get(f"{k} SQNR dB", float("nan")) if k else float("nan")
+        out["fastest collective"] = k or "-"
+        out["fastest time (us)"] = us
+        out["fastest vs prod"] = base_us / us if pd.notna(base_us) else float("nan")
+        if roofline is not None:
+            out["fastest eff"] = _eff(r, k, us, roofline)
+        out["fastest collective SQNR dB"] = (
+            r.get(f"{k} SQNR dB", float("nan")) if k else float("nan")
+        )
 
         # What the floor cost, so it is visible rather than merely applied.
         ungated, _ = _pick(r, live, None)
@@ -914,11 +1031,13 @@ def summary_table(df, keys, baseline: str, min_sqnr: float = DEFAULT_MIN_SQNR):
 
         if want_exact:
             k, us = _pick(r, [x for x in live if x in exact_keys], min_sqnr)
-            out["best exact"] = k or "-"
-            out["best exact us"] = us
-            out[f"best exact vs {baseline}"] = (
+            out["fastest exact collective"] = k or "-"
+            out["fastest exact time (us)"] = us
+            out["fastest exact vs prod"] = (
                 base_us / us if pd.notna(base_us) else float("nan")
             )
+            if roofline is not None:
+                out["fastest exact eff"] = _eff(r, k, us, roofline)
         rows.append(out)
 
     for k, n in sorted(gated.items(), key=lambda kv: -kv[1]):
@@ -940,31 +1059,16 @@ def summary_table(df, keys, baseline: str, min_sqnr: float = DEFAULT_MIN_SQNR):
     return pd.DataFrame(rows)
 
 
-def roofline_table(df, keys, *, binary, cus, iters, warmup):
-    """Fabric ceiling per row, and what fraction of it each candidate reached.
-
-    ``roof us`` is TransferBench moving the *payload* bytes in this row's
-    dispatched pattern -- the reference for the exact candidates. Each
-    ``<cand> eff`` is instead measured against that candidate's own wire size
-    and its own algorithm (see ``transferbench_roofline.wire_bytes`` and
-    ``.pattern``), so a quantizing candidate is graded on the bytes it really
-    sends rather than the ones it was handed.
-
-    ``eff`` is ``roof us / cand us``, so **1.0 means the candidate is at the
-    ceiling**. Two ways to read a surprising number:
-
-    * **Well below 1.0 at small sizes is expected, not a finding.** The
-      roofline has no peer handshake, and the 1-stage kernel is dominated by
-      the ``start_sync`` spin there. The gap is the sync cost, not waste.
-    * **Above 1.0 means the roofline was pessimistic**, not that the kernel
-      broke physics -- most likely none of the ``--roofline-cus`` counts suited
-      that size. Widen the sweep before believing it.
+def measure_roofline(df, keys, *, binary, cus, iters, warmup):
+    """Run TransferBench once per TP and return the ``(tp, wire_bytes,
+    pattern) -> us`` lookup that ``roofline_table`` and ``summary_table`` both
+    grade candidates against.
 
     One TransferBench process per TP; the ranks have already been joined by
     then, so the GPUs are free. A TP whose measurement fails is warned about
-    and left blank rather than taking the whole run down.
+    and left blank rather than taking the whole run down. Returns ``None`` if
+    every TP failed, so callers can skip the roofline entirely.
     """
-    out = df[[c for c in ID_COLUMNS if c in df]].copy()
     live = [k for k in keys if f"{k} us" in df.columns]
 
     # (tp, wire_bytes, pattern) -> us. Collect every distinct request first so
@@ -975,14 +1079,15 @@ def roofline_table(df, keys, *, binary, cus, iters, warmup):
         requests = set()
         for _, r in sub.iterrows():
             nbytes = int(r["_nbytes"])
-            requests.add((nbytes, tbr.pattern("cdr", r["kernel"])))
+            requests.add(nbytes)
             for k in live:
                 if pd.notna(r[f"{k} us"]):
-                    requests.add(
-                        (tbr.wire_bytes(nbytes, k), tbr.pattern(k, r["kernel"]))
-                    )
+                    requests.add(tbr.wire_bytes(nbytes, k))
         logger.info(
-            "TransferBench: TP%d, %d distinct measurement(s)", tp_size, len(requests)
+            "TransferBench: TP%d, %d distinct byte count(s) x %d algorithm(s)",
+            tp_size,
+            len(requests),
+            len(tbr._ALGOS),
         )
         try:
             got = tbr.measure(
@@ -996,35 +1101,52 @@ def roofline_table(df, keys, *, binary, cus, iters, warmup):
         except (RuntimeError, OSError, subprocess.SubprocessError) as e:
             logger.warning("TransferBench: TP%d roofline unavailable: %s", tp_size, e)
             continue
-        for req, us in got.items():
-            measured[(int(tp_size), *req)] = us
+        for nbytes, roof in got.items():
+            measured[(int(tp_size), nbytes)] = roof
 
-    if not measured:
-        return None
+    return measured or None
 
-    def _roof(row, key):
-        nbytes = int(row["_nbytes"])
-        return measured.get(
-            (
-                int(row["TP"]),
-                tbr.wire_bytes(nbytes, key) if key else nbytes,
-                tbr.pattern(key or "cdr", row["kernel"]),
-            )
-        )
 
-    out["roof us"] = [_roof(r, None) for _, r in df.iterrows()]
+def roofline_table(df, keys, measured):
+    """Fabric ceiling per row, and what fraction of it each candidate reached.
+
+    ``roof us`` is the fastest way TransferBench could move this row's *payload*
+    bytes, over one-shot, two-shot and ring; ``roof algo`` names the winner.
+    Each ``<cand> eff`` uses the same best-over-algorithms roof but at that
+    candidate's own wire size (``transferbench_roofline.wire_bytes``), so a
+    quantizing candidate is graded on the bytes it really sends rather than the
+    ones it was handed.
+
+    ``eff`` is ``roof us / cand us``, so **1.0 means the candidate is at the
+    ceiling and values above 1.0 should not occur**. Two ways to read it:
+
+    * **Well below 1.0 at small sizes is expected, not a finding.** The
+      roofline has no peer handshake, and the 1-stage kernel is dominated by
+      the ``start_sync`` spin there. The gap is the sync cost, not waste.
+    * **Above 1.0 is a bug in the roofline**, not a fast kernel. It means some
+      algorithm the candidate can reach is not in ``_ALGOS``, so the "ceiling"
+      is really the cost of an algorithm the candidate beat. This is exactly
+      what a two-shot-only model did to ``rccl`` on a NUMA-split PCIe host
+      (``eff`` 1.18, because RCCL rings and the model did not). Add the missing
+      pattern rather than explaining the number away.
+
+    ``roof algo`` is worth reading next to the ``kernel`` column: where they
+    disagree, the dispatch picked an algorithm this fabric does not favour.
+
+    *measured* is the lookup from ``measure_roofline``.
+    """
+    out = df[[c for c in ID_COLUMNS if c in df]].copy()
+    live = [k for k in keys if f"{k} us" in df.columns]
+
+    roofs = [_roof(r, None, measured) for _, r in df.iterrows()]
+    out["roof us"] = [x.us if x is not None else None for x in roofs]
     out["roof GB/s"] = [
         float("nan") if u is None or not u else n / u / 1e3
         for u, n in zip(out["roof us"], df["_nbytes"])
     ]
+    out["roof algo"] = [x.algo if x is not None else "-" for x in roofs]
     for k in live:
-        effs = []
-        for _, r in df.iterrows():
-            roof, got = _roof(r, k), r[f"{k} us"]
-            effs.append(
-                roof / got if roof is not None and pd.notna(got) else float("nan")
-            )
-        out[f"{k} eff"] = effs
+        out[f"{k} eff"] = [_eff(r, k, r[f"{k} us"], measured) for _, r in df.iterrows()]
     return out
 
 
@@ -1045,6 +1167,16 @@ def _write_report(
         f"- generated: {stamp}",
         f"- device: {device_description()}",
         f"- arch: {get_gfx()} ({visible} GPU(s) visible)",
+        # Arch does not identify the fabric -- MI350X (xGMI) and MI350P
+        # (PCIe-only) both report gfx950, and peer bandwidth between them
+        # differs by an order of magnitude. Without this line two reports from
+        # the two machines are indistinguishable on the axis that explains
+        # most of the gap between them.
+        f"- peer links: {_peer_link_type()}",
+        # Which devices, not just how many: on a PCIe host the NUMA split of
+        # the chosen subset is worth ~21% on the roofline (see _gpu_numa_map).
+        f"- HIP_VISIBLE_DEVICES: {os.environ.get('HIP_VISIBLE_DEVICES', '(unset)')}",
+        f"- GPU NUMA node: {_gpu_numa_map()}",
         f"- iters: {args.iters} (warmup {args.warmup})",
         f"- baseline: {args.baseline}",
         f"- fly_int4 available: {HAS_FLY_INT4}",
@@ -1053,7 +1185,7 @@ def _write_report(
             f"{os.environ.get('AITER_QUICK_REDUCE_CAST_BF16_TO_FP16', '1')}"
         ),
         f"- `prod path` evaluated with {_QR_ENV}={prod_regime!r}",
-        f"- summary `best` accuracy floor: {args.min_sqnr} dB",
+        f"- summary `fastest collective` accuracy floor: {args.min_sqnr} dB",
     ]
     # Only describe the roofline when one was actually measured: --roofline
     # degrades to a warning when the binary is missing, and a header promising
@@ -1065,19 +1197,22 @@ def _write_report(
         "",
         "Candidates are not accuracy-equivalent --",
         "read the latency table alongside the SQNR one, never alone.",
-        "The summary table's `best` column is the fastest candidate clearing the",
-        "accuracy floor above, with `best SQNR dB` beside it showing what that",
-        "choice costs; `best exact` is the fastest option that leaves the",
-        "model's numerics untouched. Candidates below the floor are excluded",
-        "from `best` only -- their timings are still in the latency table.",
+        "The summary table's `fastest collective` column is the fastest candidate",
+        "clearing the accuracy floor above, with `fastest collective SQNR dB`",
+        "beside it showing what that choice costs; `fastest exact collective` is",
+        "the fastest option that leaves the model's numerics untouched.",
+        "Candidates below the floor are excluded from `fastest collective` only --",
+        "their timings are still in the latency table.",
         "",
     ]
     if roofline_cus is not None:
         lines += [
             "`eff` in the roofline table is `roof us / cand us`, where the roof is",
-            "TransferBench moving that candidate's wire bytes in that candidate's",
-            "pattern **with no peer handshake**. Below 1.0 at small sizes is the",
-            "sync cost, not waste; above 1.0 means the CU sweep was too narrow.",
+            "the fastest of one-shot / two-shot / ring moving that candidate's wire",
+            "bytes **with no peer handshake**; `roof algo` names the winner. Below",
+            "1.0 at small sizes is the sync cost, not waste. Above 1.0 should not",
+            "happen and means the roof is missing an algorithm the candidate used,",
+            "not that the kernel was fast.",
             "",
         ]
     for title, table in sections:
@@ -1101,15 +1236,16 @@ def main():
         description=__doc__,
     )
     parser.add_argument(
-        "-t",
+        "-tp",
         "--tp",
         type=int,
         nargs="*",
         choices=[2, 4, 6, 8],
         default=None,
-        help="tensor-parallel world size(s). Default: every one of 2/4/8 that\n"
-        "fits the visible GPUs. TP2 can only reach 1stage; TP6 is custom-AR\n"
-        "only (quick reduce rejects it).",
+        help="tensor-parallel world size(s). Default: TP4 only. Pass -tp 2 to\n"
+        "also cover the 1stage-only TP2 case, or -tp 2 4 8 for the full sweep\n"
+        "(each still capped to the visible GPUs). TP6 is custom-AR only\n"
+        "(quick reduce rejects it).",
     )
     parser.add_argument(
         "-s",
@@ -1124,9 +1260,14 @@ def main():
         "--dtype",
         type=str,
         nargs="*",
-        choices=["fp16", "bf16"],
+        choices=["fp16", "bf16", "fp32"],
         default=["bf16"],
-        help="data type(s). fp16 is the only one where cdr_fp8 applies",
+        help="data type(s). fp16 is the only one where cdr_fp8 applies.\n"
+        "fp32 reaches only cdr/cdr_naive/rccl (every codec is fp16/bf16-only),\n"
+        "and is the apples-to-apples case for --roofline: TransferBench is\n"
+        "itself fp32, so the roof then matches on element type as well as on\n"
+        "byte count. Note a token is twice the bytes, so the 1stage/2stage\n"
+        "dispatch boundaries land at half the M.",
     )
     parser.add_argument(
         "-c",
@@ -1176,8 +1317,9 @@ def main():
         type=int,
         nargs="*",
         default=list(tbr.DEFAULT_CUS),
-        help="CU counts to try per roofline point; the best one wins. Widen\n"
-        f"this if a candidate reports eff > 1.0. Default: {list(tbr.DEFAULT_CUS)}",
+        help="CU counts to try per roofline point; the best one wins, across\n"
+        "every modelled algorithm. Measured effect is small (<1%% between 8-32\n"
+        f"and 4-128 on gfx950). Default: {list(tbr.DEFAULT_CUS)}",
     )
     parser.add_argument(
         "--profile",
@@ -1208,7 +1350,7 @@ def main():
     )
     args = parser.parse_args()
 
-    tps = args.tp if args.tp else [t for t in (2, 4, 8) if t <= visible]
+    tps = args.tp if args.tp else [4]
     tps = [t for t in tps if t <= visible]
     if not tps:
         logger.warning("no requested TP size fits %d visible GPUs; skipping", visible)
@@ -1254,18 +1396,10 @@ def main():
         for tp_size in tps:
             rows += run_sweep(tp_size, args.shape, dtype, args, keys, prod_regime)
         df = pd.DataFrame(rows)
-        tables = [
-            (
-                f"{dtype_name} summary",
-                summary_table(df, keys, args.baseline, args.min_sqnr),
-            ),
-            (f"{dtype_name} latency", latency_table(df, args.baseline, keys)),
-            (f"{dtype_name} accuracy", metric_table(df, "SQNR dB", keys)),
-        ]
-        if args.busbw:
-            tables.append((f"{dtype_name} busbw", metric_table(df, "busbw GB/s", keys)))
+
+        measured = None
         if roofline_bin is not None:
-            roof = roofline_table(
+            measured = measure_roofline(
                 df,
                 keys,
                 binary=roofline_bin,
@@ -1273,9 +1407,22 @@ def main():
                 iters=args.iters,
                 warmup=args.warmup,
             )
-            if roof is not None:
-                tables.append((f"{dtype_name} roofline", roof))
-                roofline_cus = args.roofline_cus
+
+        tables = [
+            (
+                f"{dtype_name} summary",
+                summary_table(df, keys, args.baseline, args.min_sqnr, measured),
+            ),
+            (f"{dtype_name} latency", latency_table(df, args.baseline, keys)),
+            (f"{dtype_name} accuracy", metric_table(df, "SQNR dB", keys)),
+        ]
+        if args.busbw:
+            tables.append((f"{dtype_name} busbw", metric_table(df, "busbw GB/s", keys)))
+        if measured is not None:
+            tables.append(
+                (f"{dtype_name} roofline", roofline_table(df, keys, measured))
+            )
+            roofline_cus = args.roofline_cus
         for title, table in tables:
             md = table.to_markdown(index=False, floatfmt=".4g")
             logger.info("all-reduce %s (markdown):\n%s", title, md)
