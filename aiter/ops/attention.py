@@ -1008,10 +1008,6 @@ def get_ps_metadata_info_v1(
     qlen_granularity: int = 256,
 ):
     """
-    Note: If running with FULL graphs, max_kvlen must be static (a fixed upper
-    bound on kv length, e.g. from max model/context length), not the per-step
-    runtime kv max, so the returned buffer sizes stay constant across replays.
-
     Returns:
         1. Shape of work_metadata_ptrs followed by its scalar type.
         2. Shape of work_indptr followed by its scalar type.
