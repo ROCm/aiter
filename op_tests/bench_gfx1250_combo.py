@@ -99,6 +99,12 @@ dtype, and correctness checking:
     TOKENS=512 MODES=graph \
       python op_tests/bench_gfx1250_combo.py --dsv4 --ops mori_ep
 
+It sweeps two dispatch wires by default, bf16 and fp4, one child process each
+(bench_ep.py reads $DISP at import). fp4 is the wire DSv4 serves on; bf16 is
+the reference. $DISP overrides, comma-separated -- DISP=fp8 or DISP=bf16,fp8,fp4.
+Note that mori disables its own correctness check on fp4, so those rows are
+unchecked rather than verified; the table label says so.
+
 The ``mhc`` op runs:
 
     python3 op_tests/test_mhc.py -n 7168 -m 512 --fuse_rmsnorm
@@ -366,6 +372,19 @@ _MLA_PREFILL_FP8_NNZ = (256, 1024, 4096, 16384)
 # MORI_SHMEM_HEAP_SIZE reaches, so the tier cannot run from here. Ask for it via
 # AITER_BENCH_TOKENS anyway and you get it, along with that failure.
 _MEGA_MOE_TOKENS = _tokens((1, 16, 32, 64, 128, 256, 512, 1024, 2048))
+# What dispatch puts on the wire; combine is always bf16, so anything but bf16
+# is an asymmetric pair. fp4 is the wire DSv4 actually serves on -- the receiver
+# hands the payload straight to the expert GEMM as its A operand, and that GEMM
+# is a4w4 (ATOM's serve script pins MEGA_WIRE=fp4, AITER_FORCE_A8W4=0) -- so
+# measuring only bf16 measures a leg the model does not run. $DISP overrides,
+# comma-separated, and is passed through unvalidated: mori owns the value set.
+_MORI_EP_DISP = tuple(
+    d.strip() for d in os.environ.get("DISP", "bf16,fp4").split(",") if d.strip()
+)
+# bench_ep.py forces its own correctness check off on fp4 ("fp4 combine is too
+# lossy to compare"), so a passing fp4 row is unchecked, not verified. Labelled
+# in the table rather than left for the reader to know that from mori's source.
+_MORI_EP_UNCHECKED = ("fp4",)
 
 
 def _int_quad(s):
@@ -1352,7 +1371,6 @@ def run_mori_ep(_args):
             "WARMUP": "10",
             "MODES": env.get("MODES", "eager,graph"),
             "COMBINE_IN": env.get("COMBINE_IN", "inplace"),
-            "DISP": env.get("DISP", "bf16"),
             "CHECK": env.get("CHECK", "1"),
             "DBN": "",
             "DWPB": "",
@@ -1360,19 +1378,24 @@ def run_mori_ep(_args):
             "CWPB": "",
         }
     )
-    _run_child(
-        "mori_ep (DSv4 dispatch/combine)",
-        [
-            "torchrun",
-            "--standalone",
-            f"--nproc_per_node={env.get('EP', '4')}",
-            "tests/python/ops/dispatch_combine_v2/bench_ep.py",
-        ],
-        cwd=mori,
-        env=env,
-        extract=_lines(_quiet),
-        timeout=3600,
-    )
+    # One child per wire: bench_ep.py reads $DISP once at import and builds the
+    # transport for that dtype, so the tiers cannot share a process.
+    for disp in _MORI_EP_DISP:
+        env["DISP"] = disp
+        note = " UNCHECKED" if disp in _MORI_EP_UNCHECKED else ""
+        _run_child(
+            f"mori_ep (DSv4 dispatch/combine, disp={disp}, combine=bf16{note})",
+            [
+                "torchrun",
+                "--standalone",
+                f"--nproc_per_node={env.get('EP', '4')}",
+                "tests/python/ops/dispatch_combine_v2/bench_ep.py",
+            ],
+            cwd=mori,
+            env=env,
+            extract=_lines(_quiet),
+            timeout=3600,
+        )
 
 
 def _perf_ratio(num, den):
