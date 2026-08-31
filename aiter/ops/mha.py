@@ -14,7 +14,8 @@ from ..jit.core import (
     compile_ops,
     is_experimental_enabled,
 )
-from ..jit.utils.chip_info import get_cu_num, get_gfx, is_gfx1250_asm_supported
+from ..jit.utils.asm_guard import is_gfx1250_asm_supported
+from ..jit.utils.chip_info import get_cu_num, get_gfx
 from ..jit.utils.mha_recipes import (
     compose_mha_fwd_variant_suffix_and_filter,
     get_mha_varlen_prebuild_variants_by_names,

@@ -130,34 +130,6 @@ def get_asic_revision() -> int:
     raise RuntimeError("No ASIC Revision found in rocminfo output.")
 
 
-@functools.lru_cache(maxsize=1)
-def is_gfx1250_asm_supported() -> bool:
-    """The py_itfs_cu asm kernels target gfx1250 B0 (asicRevision >= 1) only.
-
-    Returns False on gfx1250 A0 so dispatch can fall back to other path or raise.
-    """
-    try:
-        if get_gfx_runtime() != "gfx1250":
-            return True
-        return get_asic_revision() >= 1
-    except Exception:  # noqa: BLE001
-        return True
-
-
-def require_gfx1250_asm(op_name: str) -> None:
-    """Raise warning on gfx1250 A0 (asm is B0+ only); no-op otherwise."""
-    if is_gfx1250_asm_supported():
-        return
-    logging.getLogger("aiter").warning(
-        "\033[93m[SKIP] %s asm is gfx1250 B0-only supported "
-        "(current device is gfx1250 A0)\033[0m",
-        op_name,
-    )
-    raise RuntimeError(
-        f"{op_name} asm is only supported on gfx1250 B0+ (current device is gfx1250 A0)"
-    )
-
-
 # Backfill map for legacy tuned configs that predate the `gfx` column.
 # These cu_num values were only ever tuned on a single arch historically:
 #   256 -> gfx950, 80/304 -> gfx942.

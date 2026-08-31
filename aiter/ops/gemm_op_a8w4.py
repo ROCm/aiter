@@ -12,7 +12,7 @@ import torch
 from torch import Tensor
 
 from ..jit.core import compile_ops
-from ..jit.utils.chip_info import require_gfx1250_asm
+from ..jit.utils.asm_guard import require_gfx1250_asm
 from ..utility import dtypes
 
 
