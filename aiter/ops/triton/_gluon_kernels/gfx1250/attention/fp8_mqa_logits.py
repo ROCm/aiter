@@ -492,7 +492,7 @@ def mqa_logits_loop_pipelined(
         scales_next = scales_next2
 
         logits_ptr += BLOCK_KV * stride_logits_k
-    kv_pos_post = (start_ind + end_pairs) * BLOCK_KV
+    kv_pos_post = start_ind + end_pairs * BLOCK_KV
     # Odd leftover: one sub-iter A so the epilogue's two stores line up
     # with the last full tile + partial tail.
     if odd_peel:
