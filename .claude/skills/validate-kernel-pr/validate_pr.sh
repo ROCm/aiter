@@ -273,7 +273,11 @@ for item in data["findings"]:
 PY
 }
 
+# Two independent facts about the supplied worktree:
+#   BASE_ACTIVE=1    the patch is currently reversed out, i.e. we are mid-baseline-run
+#   PATCH_APPLIED=1  this process applied the patch and still owes the caller a revert
 BASE_ACTIVE=0
+PATCH_APPLIED=0
 restore_head() {
   if [ "$BASE_ACTIVE" -eq 0 ]; then
     return 0
@@ -286,8 +290,20 @@ restore_head() {
   return 1
 }
 cleanup() {
+  if [ "$PATCH_APPLIED" -eq 0 ]; then
+    return
+  fi
   if [ "$BASE_ACTIVE" -eq 1 ]; then
-    restore_head || echo "failed to restore candidate patch in $REPO_WT" >&2
+    # The baseline run already reversed the patch out, which is the state the
+    # caller handed us; re-applying it here is what used to leave residue.
+    PATCH_APPLIED=0
+    return
+  fi
+  if git -C "$REPO_WT" apply -R --check "$PATCHF" >/dev/null 2>&1 \
+      && git -C "$REPO_WT" apply -R "$PATCHF" >/dev/null 2>&1; then
+    PATCH_APPLIED=0
+  else
+    echo "failed to revert the candidate patch in $REPO_WT; it is left applied" >&2
   fi
 }
 trap cleanup EXIT
@@ -311,7 +327,8 @@ amdsmi.amdsmi_init()
 try:
     for handle in amdsmi.amdsmi_get_processor_handles():
         if amdsmi.amdsmi_get_gpu_enumeration_info(handle).get("hip_id") == requested:
-            print(amdsmi.amdsmi_get_gpu_activity(handle).get("gfx_activity"))
+            gfx, _ = picker.read_activity(amdsmi, handle)
+            print("unavailable" if gfx is None else gfx)
             break
     else:
         raise RuntimeError(f"HIP index {requested} has no amd-smi mapping")
@@ -321,6 +338,9 @@ PY
   )
   if [[ "$ACTIVITY_AFTER" =~ ^[0-9]+$ ]]; then
     jset_json "stages.gpu_claim.gfx_activity_after_pct" "$ACTIVITY_AFTER"
+  elif [ "$ACTIVITY_AFTER" = "unavailable" ]; then
+    jset_string "stages.gpu_claim.post_run_note" \
+      "post-run GFX activity is not reported by the activity API on this host"
   else
     jset_string "stages.gpu_claim.post_run_note" \
       "post-run GFX activity could not be recorded"
@@ -371,6 +391,7 @@ if [ -n "$PATCHF" ]; then
   fi
   if git -C "$REPO_WT" apply --check "$PATCHF" >/dev/null 2>&1 \
       && git -C "$REPO_WT" apply "$PATCHF" >/dev/null 2>&1; then
+    PATCH_APPLIED=1
     stage_note "merge_sim" "pass" "patch applies cleanly to the recorded base"
     jset_string "repo.patch_sha256" "$(sha256sum "$PATCHF" | awk '{print $1}')"
     if [ -n "$HEAD_SHA" ]; then
@@ -421,10 +442,16 @@ else
   PICK_RC=$?
   if [ "$PICK_RC" -ne 0 ] || [[ ! "$PICK" =~ ^[0-9]+$ ]]; then
     PICK=""
-    stage_note "gpu_claim" "skip" \
-      "no verified-idle GPU was claimable (picker exit $PICK_RC)"
+    # An environment fact and a validator portability gap are different things
+    # and must not share one message.
+    case "$PICK_RC" in
+      1) CLAIM_NOTE="GPUs are present but none stayed below the idleness thresholds across the sampling window" ;;
+      2) CLAIM_NOTE="AMD SMI could not be queried on this host, so idleness could not be established; this is a validator portability gap, not a statement about the GPUs" ;;
+      *) CLAIM_NOTE="no verified-idle GPU was claimable (picker exit $PICK_RC)" ;;
+    esac
+    stage_note "gpu_claim" "skip" "$CLAIM_NOTE"
     jset_string "degraded_mode" "NO_GPU"
-    finding "note" "gpu_claim" "no verified-idle GPU was claimable; no runtime correctness claim is made"
+    finding "note" "gpu_claim" "$CLAIM_NOTE; no runtime correctness claim is made"
   else
     exec {GPU_LOCK_FD}>"/tmp/gpu-$PICK.lock"
     if ! flock -n "$GPU_LOCK_FD"; then
@@ -459,7 +486,7 @@ try:
         raise RuntimeError(f"HIP index {requested} has no amd-smi mapping")
     smi_index, handle = match
     asic = amdsmi.amdsmi_get_gpu_asic_info(handle)
-    activity = amdsmi.amdsmi_get_gpu_activity(handle)
+    gfx_activity, _ = picker.read_activity(amdsmi, handle)
     print(
         json.dumps(
             {
@@ -469,7 +496,7 @@ try:
                 "model": asic.get("market_name", "unknown"),
                 "arch": asic.get("target_graphics_version", "unknown"),
                 "bdf": amdsmi.amdsmi_get_gpu_device_bdf(handle),
-                "gfx_activity_before_pct": activity.get("gfx_activity"),
+                "gfx_activity_before_pct": gfx_activity,
                 "host": socket.gethostname(),
             }
         )
@@ -488,6 +515,12 @@ PY
         finding "note" "gpu_claim" "GPU identity could not be verified; no runtime correctness claim is made"
       else
         jset_json "stages.gpu_claim" "$GPU_INFO"
+        IDLENESS_BASIS=$(sed -n 's/^idleness-basis: //p' "$WORK/gpu-picker.log" | tail -1)
+        jset_string "stages.gpu_claim.idleness_basis" "${IDLENESS_BASIS:-unknown}"
+        if [ "$IDLENESS_BASIS" = "vram-only" ]; then
+          finding "note" "gpu_claim" \
+            "GPU activity is unavailable on this host; idleness was established from resident VRAM alone"
+        fi
       fi
     fi
   fi

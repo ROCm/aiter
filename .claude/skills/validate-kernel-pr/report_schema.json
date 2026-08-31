@@ -206,6 +206,11 @@
             "model": { "type": "string" },
             "arch": { "type": "string" },
             "bdf": { "type": "string" },
+            "idleness_basis": {
+              "type": "string",
+              "enum": ["activity+vram", "vram-only", "unknown"],
+              "description": "Evidence the idleness claim rests on. 'vram-only' means the activity API was unavailable, so a null gfx_activity_before_pct is unknown rather than a measured zero."
+            },
             "gfx_activity_before_pct": { "type": ["integer", "null"] },
             "gfx_activity_after_pct": { "type": ["integer", "null"] },
             "host": { "type": "string" }

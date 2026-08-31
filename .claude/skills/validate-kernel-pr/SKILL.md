@@ -96,6 +96,11 @@ The supplied worktree must be clean. The report records the base commit, patch S
 caller-supplied head OID. A direct head checkout without a patch can run diagnostics, but cannot
 prove mergeability or base attribution and therefore cannot produce `PASS`.
 
+The patch is reverted when the process exits, including on interrupt and on every degraded path,
+so the worktree is handed back in the state it was supplied. Consecutive runs in the same worktree
+are therefore supported; a run that left the patch applied would make the next one report
+`not isolated-clean` and blame the caller.
+
 ### 2 — `gpu_claim`
 
 Claim a GPU over a **sampling window**, not one instantaneous reading, and acquire a non-blocking
@@ -111,9 +116,18 @@ The report records host, HIP index, matching AMD SMI index, BDF, market name, ar
 GFX activity before the run. `pick-idle-gpu.py` emits the **translated HIP index**; the validator
 maps it back through AMD SMI enumeration instead of incorrectly using it as an AMD SMI index.
 
+`amdsmi_get_gpu_activity` is not available everywhere — some driver and amd-smi combinations fail
+it outright or report `N/A` while enumeration, BDF, ASIC and VRAM queries all work. Activity is
+therefore treated as optional, and `gpu_claim.idleness_basis` names the evidence the claim rests
+on: `activity+vram` when busy percentages were measured, `vram-only` when only resident VRAM
+separated the devices. In the `vram-only` case `gfx_activity_before_pct` is `null`, which means
+unknown, not zero — an unavailable metric is never reported as an observed idle GPU.
+
 If no GPU stays idle, `gpu_claim` is `skip`, `degraded_mode` is `NO_GPU`, both correctness stages
 are `skip`, and the verdict is `INCONCLUSIVE`. The script performs no architecture-specific
-compile in this branch, so it does not call the result `compile-only`.
+compile in this branch, so it does not call the result `compile-only`. That skip distinguishes two
+different facts: GPUs present but none idle is an environment fact, whereas AMD SMI being
+unqueryable is a portability gap in the validator and says nothing about the GPUs.
 
 ### 3 — `runtime_compat`
 
