@@ -24,8 +24,17 @@ def num_programs(x):
     return min(x.shape[0], get_num_sms())
 
 
+# Cap blocked path at 8192 (fastest) to avoid severe VGPR spilling.
+blocked_max_block_size = 8192
+
+
 def block_size(x):
-    return min(65536 // x.element_size(), triton.next_power_of_2(x.shape[1]))
+    n_pow2 = triton.next_power_of_2(x.shape[1])
+    cap = 65536 // x.element_size()
+    if n_pow2 > cap:
+        # blocked; still < the row, so use_blocked() holds
+        return blocked_max_block_size
+    return n_pow2
 
 
 def use_blocked(x):
@@ -34,6 +43,18 @@ def use_blocked(x):
 
 def dg_tmp_rows(x):
     return x.shape[0] if use_blocked(x) else num_programs(x)
+
+
+# num_programs() caps the grid at one workgroup per CU, limiting resident workgroups
+# available to hide per-row reduction latency. Oversubscribe 4x, except large blocks.
+fwd_program_oversub = 4
+fwd_oversub_max_block_size = 8192
+
+
+def num_programs_fwd(x):
+    if block_size(x) > fwd_oversub_max_block_size:
+        return num_programs(x)
+    return min(x.shape[0], get_num_sms() * fwd_program_oversub)
 
 
 def _rmsnorm_forward(x: torch.Tensor, weight: torch.Tensor, epsilon: float):
@@ -45,7 +66,7 @@ def _rmsnorm_forward(x: torch.Tensor, weight: torch.Tensor, epsilon: float):
 
     blk_size = block_size(x)
     USE_BLOCKED = use_blocked(x)
-    NUM_PRGMS = num_programs(x)
+    NUM_PRGMS = num_programs_fwd(x)
 
     grid = lambda meta: (NUM_PRGMS,)
     _rms_norm_kernel[grid](
@@ -80,7 +101,7 @@ def _rmsnorm_forward_with_add(
 
     blk_size = block_size(x)
     USE_BLOCKED = use_blocked(x)
-    NUM_PRGMS = num_programs(x)
+    NUM_PRGMS = num_programs_fwd(x)
 
     grid = lambda meta: (NUM_PRGMS,)
     _fused_add_rmsnorm_kernel[grid](
@@ -152,6 +173,9 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
             dg_tmp.shape[1],
             BLOCK_SIZE_M=128,
             BLOCK_SIZE_N=64,
+            # 8 warps, not 4: this reduce launches only cdiv(N, 64) workgroups,
+            # so small N starves the CUs (N=1245: 20 WGs on 256, 16.4 -> 4.5us).
+            num_warps=8,
         )
 
     return dx, dgamma
@@ -314,7 +338,7 @@ def rmsnorm2d_fwd_with_smoothquant(
 
     blk_size = block_size(input)
     USE_BLOCKED = use_blocked(input)
-    NUM_PRGMS = num_programs(input)
+    NUM_PRGMS = num_programs_fwd(input)
 
     IS_SMOOTH = True
     DTYPE_MAX = get_dtype_max(out.dtype)
@@ -384,7 +408,7 @@ def rmsnorm2d_fwd_with_dynamicquant(
 
     blk_size = block_size(input)
     USE_BLOCKED = use_blocked(input)
-    NUM_PRGMS = num_programs(input)
+    NUM_PRGMS = num_programs_fwd(input)
 
     xscale = None
     IS_SMOOTH = False
@@ -461,7 +485,7 @@ def rmsnorm2d_fwd_with_add_smoothquant(
 
     blk_size = block_size(input)
     USE_BLOCKED = use_blocked(input)
-    NUM_PRGMS = num_programs(input)
+    NUM_PRGMS = num_programs_fwd(input)
 
     IS_SMOOTH = True
     DTYPE_MAX = get_dtype_max(out.dtype)
@@ -524,7 +548,7 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
 
     blk_size = block_size(input)
     USE_BLOCKED = use_blocked(input)
-    NUM_PRGMS = num_programs(input)
+    NUM_PRGMS = num_programs_fwd(input)
 
     xscale = None
     IS_SMOOTH = False
