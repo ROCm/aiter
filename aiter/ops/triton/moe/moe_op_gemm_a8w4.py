@@ -29,19 +29,9 @@ from aiter.ops.triton.moe.reduce import (
     validate_reduce_out,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH, load_config_json
 from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
-
-
-def _get_a8w4_dispatch(arch: str) -> dict:
-    """Per-(block_m, N, K) dispatch table for moe_gemm_a8w4. Returns {} if no
-    tuned file is shipped for this arch (caller uses the safe-default fallback).
-    Mirrors get_moe_configs() in utils/moe_config_utils.py."""
-    dispatch = load_config_json(
-        f"{AITER_TRITON_CONFIGS_PATH}/moe/{arch}-A8W4.json", required=False
-    )
-    return dispatch if dispatch is not None else {}
+from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
 
 
 def can_overflow_int32(tensor: torch.Tensor):
@@ -122,10 +112,10 @@ def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
     split_k = 1
 
     # Tuned dispatch: per-(block_m, N, K) winners from a sweep tuner.
-    # Schema mirrors sister files like gfx950-MOE-FP8_W8A8.json (BLOCK_SIZE_N,
-    # BLOCK_SIZE_K, num_warps, …) except BLOCK_SIZE_M is omitted because block_m
-    # is the dispatch key, not a tunable (routing decides block_m for the layer).
-    tuned = _get_a8w4_dispatch(arch).get(f"bm{block_m}_n{n}_k{k}")
+    # Entries carry BLOCK_SIZE_N, BLOCK_SIZE_K, num_warps, num_stages, … but
+    # omit BLOCK_SIZE_M because block_m is the dispatch key, not a tunable
+    # (routing decides block_m for the layer).
+    tuned = get_moe_dispatch("A8W4", arch, "triton").get(f"bm{block_m}_n{n}_k{k}")
     if tuned is not None:
         return {
             "block_m": block_m,
@@ -147,7 +137,7 @@ def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
     # geometry and num_stages from that entry are a better starting point than
     # a generic default, and avoid regressing to num_stages=1 on gfx950.
     # Under CDNA4 swizzle, skip BLOCK_K<256 entries since unswizzle can't compile them.
-    dispatch = _get_a8w4_dispatch(arch)
+    dispatch = get_moe_dispatch("A8W4", arch, "triton")
     proxy = next(
         (
             v
@@ -312,7 +302,7 @@ def get_kernel_config_gluon(m, n, k, routing_data, out_mx_quant=False):
     split_k = 1
 
     bucket = m2bucket(m)
-    tuned = _get_a8w4_dispatch(get_arch())
+    tuned = get_moe_dispatch("A8W4", get_arch(), "gluon")
     key = f"bm{block_m}_n{n}_k{k}_{bucket}"
     if key not in tuned:
         key = f"bm{block_m}_any"
