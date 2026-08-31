@@ -359,6 +359,37 @@ def unified_attention(
     shuffled_kv_cache: bool = False,
     skip_reduce: bool = False,
 ):
+    if _KR_TS is not None and _KR_TS.ENABLED:
+        _KR_TS.ENABLED = False
+        try:
+            return _KR_TS.unified_attention_tailsplit(
+                q,
+                k,
+                v,
+                out,
+                cu_seqlens_q,
+                max_seqlen_q,
+                seqused_k,
+                max_seqlen_k,
+                softmax_scale,
+                causal,
+                window_size,
+                block_table,
+                softcap,
+                q_descale,
+                k_descale,
+                v_descale,
+                q_scales=q_scales,
+                alibi_slopes=alibi_slopes,
+                output_scale=output_scale,
+                qq_bias=qq_bias,
+                sinks=sinks,
+                shuffled_kv_cache=shuffled_kv_cache,
+                skip_reduce=skip_reduce,
+            )
+        finally:
+            _KR_TS.ENABLED = True
+
     assert causal, "Only causal attention is supported"
 
     use_alibi_slopes = alibi_slopes is not None
@@ -958,3 +989,9 @@ def _gfx1250_unified_attention_2d(
         NUM_BUFFERS=num_buffers,
         LOOP_VARIANT=loop_variant,
     )
+
+
+try:
+    from aiter.ops.triton.attention import kr_ua as _KR_TS
+except Exception:  # noqa: E722
+    _KR_TS = None
