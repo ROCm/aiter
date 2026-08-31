@@ -152,10 +152,19 @@
           "type": "string",
           "description": "Environment variable used to inject the independent grid, or an empty string."
         },
-        "shape_arg": {
-          "type": "string",
-          "description": "The target's own CLI flag used to inject the independent grid, or an empty string when the environment-variable channel or no channel was used."
-        },
+            "shape_arg": {
+              "type": "string",
+              "description": "The target's own CLI flag used to inject the independent grid, or an empty string when the environment-variable channel or no channel was used."
+            },
+            "gpu_requirement": {
+              "type": "string",
+              "enum": ["required", "not-required"],
+              "description": "Whether this target needs a GPU. 'not-required' is only recorded after the target was observed to pass with no visible device, never inferred from the diff."
+            },
+            "gpu_requirement_basis": {
+              "type": "string",
+              "description": "How gpu_requirement was established, including the executed-test count that rules out a suite which merely skipped everything."
+            },
         "grid": {
           "type": "string",
           "description": "Independent shape grid supplied by the caller, or an empty string."

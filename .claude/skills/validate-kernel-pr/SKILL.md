@@ -124,11 +124,25 @@ on: `activity+vram` when busy percentages were measured, `vram-only` when only r
 separated the devices. In the `vram-only` case `gfx_activity_before_pct` is `null`, which means
 unknown, not zero — an unavailable metric is never reported as an observed idle GPU.
 
-If no GPU stays idle, `gpu_claim` is `skip`, `degraded_mode` is `NO_GPU`, both correctness stages
-are `skip`, and the verdict is `INCONCLUSIVE`. The script performs no architecture-specific
-compile in this branch, so it does not call the result `compile-only`. That skip distinguishes two
-different facts: GPUs present but none idle is an environment fact, whereas AMD SMI being
-unqueryable is a portability gap in the validator and says nothing about the GPUs.
+If no GPU stays idle, `gpu_claim` is `skip`, `degraded_mode` is `NO_GPU`, and the script performs no
+architecture-specific compile in this branch, so it does not call the result `compile-only`. That
+skip names which fact it rests on: no GPUs on this host (picker exit 3) and GPUs present but none
+idle (exit 1) are environment facts, while AMD SMI being unqueryable (exit 2) says nothing about the
+GPUs at all.
+
+When no GPU was claimed, the target is then asked whether it needs one: it is run once with no
+visible device, and `test_selection.gpu_requirement` becomes `not-required` only if it **passes and
+executes at least one test**. The executed count is what makes this evidence — a suite guarded by
+`skipif(not torch.cuda.is_available())` also exits 0 while proving nothing. This is deliberately an
+observation rather than a judgement about the diff: a Python-level dispatch change reroutes kernels
+without touching kernel source, and ROCm/aiter#5089 decides whether 34 gfx950 kernels compile from a
+seven-line helper, so no static rule over changed paths could settle it.
+
+A `not-required` target runs its correctness stages instead of skipping them, which is the evidence
+a CPU-only fix is able to supply. It still claims nothing further: `arch_coverage` stays empty
+because only a passing `gpu_claim` credits an architecture, and `PASS` is unchanged — it continues
+to require `gpu_claim: pass`, so this path cannot produce a clearance that was previously
+unreachable.
 
 ### 3 — `runtime_compat`
 

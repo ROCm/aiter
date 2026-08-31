@@ -449,7 +449,8 @@ else
     # and must not share one message.
     case "$PICK_RC" in
       1) CLAIM_NOTE="GPUs are present but none stayed below the idleness thresholds across the sampling window" ;;
-      2) CLAIM_NOTE="AMD SMI could not be queried on this host, so idleness could not be established; this is a validator portability gap, not a statement about the GPUs" ;;
+      2) CLAIM_NOTE="AMD SMI could not be queried on this host, so idleness could not be established; see the picker log for whether AMD SMI is absent or failing" ;;
+      3) CLAIM_NOTE="this host reports no GPUs" ;;
       *) CLAIM_NOTE="no verified-idle GPU was claimable (picker exit $PICK_RC)" ;;
     esac
     stage_note "gpu_claim" "skip" "$CLAIM_NOTE"
@@ -1077,9 +1078,49 @@ print(json.loads(sys.argv[1])[sys.argv[2]])
 PY
 }
 
+# ---------- does this target actually need a GPU? ----------
+# Asked of the target, not inferred from the diff. A diff heuristic cannot settle this:
+# a Python-level dispatch change reroutes kernels without touching kernel source, and
+# ROCm/aiter#5089 decides whether 34 gfx950 kernels compile from a 7-line helper. Here
+# PICK is empty, so run_pytest already exports HIP_VISIBLE_DEVICES="" and the target
+# runs with no visible device -- passing there is an observation, not a guess.
+GPU_REQUIREMENT="required"
+GPU_REQUIREMENT_BASIS="a GPU was claimed, so the requirement was not probed"
+if [ -z "$PICK" ]; then
+  if [ "$RUNTIME_OK" -eq 1 ] && [ "$TARGET_RUNNER" != "none" ]; then
+    GPUFREE_RESULT=$(run_pytest "gpufree-probe" "")
+    GPUFREE_RC=${GPUFREE_RESULT%%|*}
+    GPUFREE_LOG=${GPUFREE_RESULT##*|}
+    GPUFREE_STATS=$(target_stats "gpufree-probe" "$GPUFREE_RC")
+    GPUFREE_EXECUTED=$(stats_field "$GPUFREE_STATS" executed)
+    if [ "$GPUFREE_RC" -eq 0 ] && [ "$GPUFREE_EXECUTED" -ge 1 ]; then
+      # executed>=1 carries this test: a suite guarded by
+      # skipif(not torch.cuda.is_available()) also exits 0, having proved nothing.
+      GPU_REQUIREMENT="not-required"
+      GPU_REQUIREMENT_BASIS="target passed with no visible GPU, executing $GPUFREE_EXECUTED test(s)"
+    else
+      GPU_REQUIREMENT_BASIS="target did not pass with no visible GPU (exit $GPUFREE_RC, executed $GPUFREE_EXECUTED)"
+    fi
+  else
+    GPU_REQUIREMENT_BASIS="the target could not be probed without a GPU"
+  fi
+fi
+jset_string "test_selection.gpu_requirement" "$GPU_REQUIREMENT"
+jset_string "test_selection.gpu_requirement_basis" "$GPU_REQUIREMENT_BASIS"
+if [ "$GPU_REQUIREMENT" = "not-required" ]; then
+  # gpu_claim stays skip: no device was claimed, which remains the fact. What changes is
+  # that the absence no longer suppresses the correctness stages. arch_coverage is left
+  # empty because mark_runtime_coverage credits only a passing claim, so a run in this
+  # mode cannot assert that any architecture was exercised.
+  jset_string "stages.gpu_claim.requirement_note" \
+    "the target does not require a GPU: $GPU_REQUIREMENT_BASIS"
+  finding "note" "gpu_claim" \
+    "the target ran with no visible GPU; correctness was checked but no runtime architecture coverage is claimed"
+fi
+
 CAN_TEST=1
 SKIP_REASON=""
-if [ -z "$PICK" ]; then
+if [ -z "$PICK" ] && [ "$GPU_REQUIREMENT" != "not-required" ]; then
   CAN_TEST=0
   SKIP_REASON="no verified-idle GPU was claimed"
 elif [ "$RUNTIME_OK" -ne 1 ]; then

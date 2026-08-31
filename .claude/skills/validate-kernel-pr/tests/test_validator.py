@@ -274,6 +274,20 @@ class ValidateKernelPrTests(unittest.TestCase):
     def harmless_change(repo):
         (repo / "aiter" / "kernel.py").write_text("VALUE = 1\n# candidate\n")
 
+    @staticmethod
+    def gpu_requiring_change(repo):
+        (repo / "aiter" / "kernel.py").write_text("VALUE = 1\n# candidate\n")
+        (repo / "tests" / "test_needs_device.py").write_text(
+            "import os\n"
+            "\n"
+            "def run_kernel(M, N, dtype_str):\n"
+            "    assert M > 0 and N > 0 and dtype_str\n"
+            "\n"
+            "def test_needs_device():\n"
+            '    assert os.environ.get("HIP_VISIBLE_DEVICES"), "target needs a device"\n'
+            "    run_kernel(7, 257, 'f32')\n"
+        )
+
     def assert_complete_stage_objects(self, report):
         self.assertEqual(REQUIRED_STAGES, set(report["stages"]))
         for stage in report["stages"].values():
@@ -292,8 +306,36 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertEqual("skip", report["stages"]["gpu_claim"]["status"])
         self.assertEqual("NO_GPU", report["degraded_mode"])
         self.assertEqual({}, report["arch_coverage"])
+        self.assertEqual({}, report["arch_coverage_basis"])
+        # This target was observed to need no device, so its correctness stages run
+        # rather than abstain. Everything except gpu_claim can therefore pass, which is
+        # exactly why PASS must still be withheld: nothing here exercised an
+        # architecture, so a clearance would be a claim no stage established.
+        self.assertEqual("not-required", report["test_selection"]["gpu_requirement"])
+        self.assertEqual("pass", report["stages"]["correctness_repo_tests"]["status"])
+        self.assertEqual("pass", report["stages"]["correctness_s1_grid"]["status"])
+        self.assert_complete_stage_objects(report)
+
+    def test_no_gpu_withholds_correctness_from_a_target_that_needs_a_device(self):
+        patch = self.fixture.make_patch(
+            self.gpu_requiring_change, "needs-device.patch"
+        )
+        no_gpu_picker = self.fixture.tools / "no-gpu-picker"
+        write_executable(no_gpu_picker, "#!/usr/bin/env bash\nexit 1\n")
+
+        result, report = self.fixture.validate(
+            patch,
+            tests="tests/test_needs_device.py",
+            picker=no_gpu_picker,
+            grid=False,
+            expected_route="test_needs_device:run_kernel",
+        )
+
+        self.assertEqual(2, result.returncode)
+        self.assertEqual("INCONCLUSIVE", report["verdict"])
+        self.assertEqual("required", report["test_selection"]["gpu_requirement"])
         self.assertEqual("skip", report["stages"]["correctness_repo_tests"]["status"])
-        self.assertEqual("skip", report["stages"]["correctness_s1_grid"]["status"])
+        self.assertEqual({}, report["arch_coverage"])
         self.assert_complete_stage_objects(report)
 
     def test_runtime_probe_uses_aiter_checkout_and_full_run_can_pass(self):

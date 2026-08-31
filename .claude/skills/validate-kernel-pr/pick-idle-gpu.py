@@ -207,6 +207,11 @@ def main() -> int:
                 file=sys.stderr,
             )
 
+    if not gpus:
+        # Exit 3, distinct from 1: an absent device is an environment fact, and
+        # reporting it as "activity unavailable" would blame the validator instead.
+        print("This host reports no GPUs.", file=sys.stderr)
+        return 3
     if not eligible:
         if all(gpu["peak_gfx"] is None for gpu in gpus):
             print(
