@@ -929,20 +929,26 @@ def build_flash_attn_fp8_module(
         # decomposition of the seed, reconstructing it to ~24 bits) issued
         # inside the MFMA phase -- 32 cy of a pipe that is 99.6% saturated.
         #
-        # Building it on the VALU instead takes it off that pipe entirely, and
-        # because the seed only depends on m_frozen -- which is *frozen*, and
-        # moves only when the watchdog rolls back -- the broadcast hoists out
-        # of the hot loop altogether: the accumulator is simply loop-carried
-        # and re-derived only inside the rollback branch.  Net per iteration:
-        # one bf16 MFMA removed, nothing added.  Cost is 16 carried VGPRs
-        # instead of the 2 bf16 chunks, and the seed is now exact f32.
+        # Building it on the VALU instead takes it off that pipe entirely.
+        # Net per iteration: one bf16 MFMA removed, nothing added; the seed is
+        # also exact f32 now rather than a 3-chunk bf16 reconstruction.
+        #
+        # The argument is c - m, not m: that biased form is what the loop
+        # carries (see do_softmax_prepare), precisely so this is a pure
+        # broadcast with no v_sub_f32 in front of it.  The row max as such has
+        # no other consumer -- the rollback's m += d becomes m_bias -= d, and
+        # _rowmax only runs in the prologue off m_init.
         #
         # The splat goes through i64 on purpose: vector.from_elements over 16
         # f32 subregs expands to 16 v_mov_b32, whereas 8 64-bit COPYs expand
-        # to v_mov_b64_e32 on gfx950.  The inline asm pins that width so LLVM
-        # cannot scalarise it back.
-        def _bias_seed(m_term):
-            pair = Vec.from_elements([m_term, m_term], fx.Float32).bitcast(
+        # to v_mov_b64_e32 on gfx950.
+        #
+        # The `; seed{i}` tags are load-bearing.  These are pure (no side
+        # effects) asm ops with identical operands, so with identical strings
+        # LLVM CSEs all 8 into one and from_elements falls back to 14 scalar
+        # v_mov_b32.  Making the strings textually distinct blocks that.
+        def _bias_seed(m_bias):
+            pair = Vec.from_elements([m_bias, m_bias], fx.Float32).bitcast(
                 fx.Int64
             )[0]
             movs = [
@@ -962,15 +968,17 @@ def build_flash_attn_fp8_module(
             m_init,
         ):
             m_frozen = _rowmax(s_accs, m_init)
-            m_term = _fadd(_fsub(c_zero_f, m_frozen), c_exp2_bias)
+            m_bias = _fadd(_fsub(c_zero_f, m_frozen), c_exp2_bias)
 
-            mt_vec = Vec.from_elements([m_term], fx.Float32).broadcast_to(
+            mt_vec = Vec.from_elements([m_bias], fx.Float32).broadcast_to(
                 C_F32_PER_LANE
             )
             for nt in range_constexpr(N_KV_TILES):
                 s_accs[nt] = _fadd(Vec(s_accs[nt]), mt_vec)
 
-            return m_frozen, s_accs
+            # Carry the *biased* form c - m, not m itself: see the note on
+            # _bias_seed.  The row max as such has no consumer past this point.
+            return m_bias, s_accs
 
         # ---- overflow watchdog + rollback (see tmp/watchdog_rollback_report.md)
         #
@@ -995,7 +1003,7 @@ def build_flash_attn_fp8_module(
         # headroom is restored, so the repair is self-healing and cannot
         # thrash.
         def _rollback(
-            s_accs, o_accs, l_mfma, l_valu, m_frozen, m_local, fired
+            s_accs, o_accs, l_mfma, l_valu, m_bias, m_local, fired
         ):
             vt = Vec.make_type(C_F32_PER_LANE, fx.Float32)
             lvt = Vec.make_type(C16_F32_PER_LANE, fx.Float32)
@@ -1005,9 +1013,9 @@ def build_flash_attn_fp8_module(
                 results_=[vt] * N_KV_TILES
                 + [vt] * D_TILES
                 + [lvt] * L_MFMA_SLABS
-                # l_valu is a vector now (see L_VALU_WIDTH); m_frozen stays
+                # l_valu is a vector now (see L_VALU_WIDTH); m_bias stays
                 # scalar.  The seed is *not* carried: it is a pure function of
-                # m_frozen, so it is rebuilt below rather than kept live across
+                # m_bias, so it is rebuilt below rather than kept live across
                 # the back-edge (which cost 8 v_mov_b64 in the MFMA phase).
                 + [lvvt, T.f32],
                 has_else=True,
@@ -1058,7 +1066,9 @@ def build_flash_attn_fp8_module(
                     Vec(l_valu),
                     Vec.from_elements([f], fx.Float32).broadcast_to(L_VALU_WIDTH),
                 )
-                _m = _fadd(m_frozen, d)
+                # Carried value is c - m, so the m += d repair is a subtract:
+                # c - (m + d) == (c - m) - d.
+                _m = _fsub(m_bias, d)
                 scf.YieldOp(
                     [_raw(v) for v in _s]
                     + [_raw(v) for v in _o]
@@ -1070,7 +1080,7 @@ def build_flash_attn_fp8_module(
                     [_raw(v) for v in s_accs]
                     + [_raw(v) for v in o_accs]
                     + [_raw(v) for v in l_mfma]
-                    + [_raw(l_valu), _raw(m_frozen)]
+                    + [_raw(l_valu), _raw(m_bias)]
                 )
             r = if_op.results
             n = N_KV_TILES
@@ -1091,21 +1101,24 @@ def build_flash_attn_fp8_module(
                 o_out,
                 lm_out,
                 as_dsl_value(r[k], l_valu),
-                as_dsl_value(r[k + 1], m_frozen),
+                as_dsl_value(r[k + 1], m_bias),
             )
 
         def do_softmax(
             s_accs,
-            m_frozen,
+            m_bias,
             l_valu,
             seeded=False,
             o_accs=None,
             l_mfma=None,
         ):
             if const_expr(not seeded):
-                m_frozen = _rowmax(s_accs, m_frozen)
-                m_term = _fadd(_fsub(c_zero_f, m_frozen), c_exp2_bias)
-                mt_vec = Vec.from_elements([m_term], fx.Float32).broadcast_to(
+                # Only the prologue reaches this path, and it is always handed
+                # m_init (-inf), never a carried value -- so the carry never has
+                # to be converted back from c - m to m.
+                m_frozen = _rowmax(s_accs, m_bias)
+                m_bias = _fadd(_fsub(c_zero_f, m_frozen), c_exp2_bias)
+                mt_vec = Vec.from_elements([m_bias], fx.Float32).broadcast_to(
                     C_F32_PER_LANE
                 )
             else:
@@ -1123,13 +1136,13 @@ def build_flash_attn_fp8_module(
                     o_accs,
                     l_mfma,
                     l_valu,
-                    m_frozen,
+                    m_bias,
                 ) = _rollback(
                     s_accs,
                     o_accs,
                     l_mfma,
                     l_valu,
-                    m_frozen,
+                    m_bias,
                     m_local,
                     fired,
                 )
@@ -1206,11 +1219,11 @@ def build_flash_attn_fp8_module(
             # the back-edge, the last QK tile cannot then accumulate into it in
             # place, and the allocator reinserts the copy as 8 v_mov_b64 inside
             # the MFMA phase -- exactly the 32 cy the bf16 prefill cost.
-            # Rebuilding from the carried m_frozen keeps the live range short.
-            # seed = _bias_seed(_fsub(c_exp2_bias, m_frozen))
+            # Rebuilding from the carried m_bias keeps the live range short.
+            # seed = _bias_seed(m_bias)
             # o_accs / l_mfma come back because the rollback may have rescaled
             # them; on the non-seeded path they are whatever was passed in.
-            return m_frozen, p_pack, l_valu, o_accs, l_mfma
+            return m_bias, p_pack, l_valu, o_accs, l_mfma
 
         # Ones column for the L reduction.  0x38 is fp8 e4m3 1.0, so
         # 0x38383838 is four of them.  The 16x16x128 atom folds lanes
@@ -1268,7 +1281,7 @@ def build_flash_attn_fp8_module(
         # One C register per L slab: the slabs are summed independently and
         # only merged in the epilogue, so nothing serialises them.
         l_mfma_init = [l_mfma_atom.zero_value for _ in range_constexpr(L_MFMA_SLABS)]
-        # Carry layout.  Both groups start (m_frozen, l_valu, *l_mfma, o0..o3);
+        # Carry layout.  Both groups start (m_bias, l_valu, *l_mfma, o0..o3);
         # g0 then carries p_pack, g1 carries s_accs[0..3].
         G0_HEAD = 2 + L_MFMA_SLABS + 4 + 1
         G1_HEAD = 2 + L_MFMA_SLABS + 4
@@ -1305,13 +1318,13 @@ def build_flash_attn_fp8_module(
                     _v_addr(v_buff_off),
                     dma=(k_rsrc, l_koffs, g_koffs),
                 )
-                m_frozen, p_pack, l_valu, _, _ = do_softmax(
+                m_bias, p_pack, l_valu, _, _ = do_softmax(
                     s_accs, m_init, l_valu_init
                 )
 
                 g_koffs = get_hbm_koffs(BLOCK_N * 2)
                 return (
-                    m_frozen,
+                    m_bias,
                     l_valu,
                     *l_mfma_init,
                     o_init[0],
@@ -1337,7 +1350,7 @@ def build_flash_attn_fp8_module(
                 )
 
             def g0_epilogue(*carry):
-                m_frozen, l_valu = carry[:2]
+                m_bias, l_valu = carry[:2]
                 l_mfma = list(carry[2 : 2 + L_MFMA_SLABS])
                 o0, o1, o2, o3, p_pack = carry[2 + L_MFMA_SLABS : G0_HEAD]
                 _rest = carry[G0_HEAD:]
@@ -1370,15 +1383,16 @@ def build_flash_attn_fp8_module(
                     as_dsl_value(a, ex)
                     for a, ex in zip(for_op.inner_iter_args, g0_carry)
                 ]
-                m_frozen, l_valu = _g0_args[:2]
+                m_bias, l_valu = _g0_args[:2]
                 l_mfma = list(_g0_args[2 : 2 + L_MFMA_SLABS])
                 o0, o1, o2, o3, p_pack = _g0_args[2 + L_MFMA_SLABS : G0_HEAD]
                 # Rebuilt, not carried: see the note at the tail of do_softmax.
                 # g0 consumes the seed at the head of its body, before its own
                 # softmax runs, so it is derived here from the carried
-                # m_frozen -- which the previous iteration's rollback already
-                # updated, so this agrees with the rescaled past.
-                seed = _bias_seed(_fsub(c_exp2_bias, m_frozen))
+                # m_bias -- which the previous iteration's rollback already
+                # updated, so this agrees with the rescaled past.  The carry is
+                # already c - m, so the broadcast is all that is left.
+                seed = _bias_seed(m_bias)
                 _rest = _g0_args[G0_HEAD:]
                 v_addr, v_next_addr, v_further_addr = _rest[0:3]
                 k_base, k_next_base = _rest[3:5]
@@ -1418,9 +1432,9 @@ def build_flash_attn_fp8_module(
                 # apply_pv has already folded tile i-1 into o / l_mfma, and
                 # tile i's P is not built yet, so this is the one point where
                 # the rollback can rescale the whole past in one shot.
-                m_frozen, p_pack, l_valu, o, l_mfma = do_softmax(
+                m_bias, p_pack, l_valu, o, l_mfma = do_softmax(
                     s_accs,
-                    m_frozen,
+                    m_bias,
                     l_valu,
                     seeded=True,
                     o_accs=o,
@@ -1433,7 +1447,7 @@ def build_flash_attn_fp8_module(
                 g_koffs = advance_hbm_offs(g_koffs)
                 scf.YieldOp(
                     [
-                        _raw(m_frozen),
+                        _raw(m_bias),
                         _raw(l_valu),
                         *[_raw(lm) for lm in l_mfma],
                         _raw(o[0]),
@@ -1484,14 +1498,14 @@ def build_flash_attn_fp8_module(
                     _v_addr(v_buff_off),
                     dma=(v_rsrc, l_voffs, g_voffs),
                 )
-                m_frozen, s_accs = do_softmax_prepare(s_accs, m_init)
+                m_bias, s_accs = do_softmax_prepare(s_accs, m_init)
                 _sched_barrier()
                 _gpu_barrier()
                 # Seed for the first loop body (iv == BLOCK_N), which loads the
                 # tile at iv + 2 * BLOCK_N.
                 g_voffs = advance_hbm_offs(g_voffs)
                 return (
-                    m_frozen,
+                    m_bias,
                     l_valu_init,
                     *l_mfma_init,
                     o_init[0],
@@ -1518,7 +1532,7 @@ def build_flash_attn_fp8_module(
                 )
 
             def g1_epilogue(*carry):
-                m_frozen, l_valu = carry[:2]
+                m_bias, l_valu = carry[:2]
                 l_mfma = list(carry[2 : 2 + L_MFMA_SLABS])
                 o0, o1, o2, o3 = carry[2 + L_MFMA_SLABS : G1_HEAD]
                 s0, s1, s2, s3 = carry[G1_HEAD : G1_HEAD + 4]
@@ -1526,9 +1540,9 @@ def build_flash_attn_fp8_module(
                 v_addr = _rest[0]
                 k_base = _rest[3]
                 v_preloaded = _rest[10 + DMA_PASSES :]
-                m_frozen, p_pack, l_valu, o_r, l_mfma = do_softmax(
+                m_bias, p_pack, l_valu, o_r, l_mfma = do_softmax(
                     [s0, s1, s2, s3],
-                    m_frozen,
+                    m_bias,
                     l_valu,
                     seeded=True,
                     o_accs=[o0, o1, o2, o3],
@@ -1558,7 +1572,7 @@ def build_flash_attn_fp8_module(
                     as_dsl_value(a, ex)
                     for a, ex in zip(for_op.inner_iter_args, g1_carry)
                 ]
-                m_frozen, l_valu = _g1_args[:2]
+                m_bias, l_valu = _g1_args[:2]
                 l_mfma = list(_g1_args[2 : 2 + L_MFMA_SLABS])
                 o0, o1, o2, o3 = _g1_args[2 + L_MFMA_SLABS : G1_HEAD]
                 s0, s1, s2, s3 = _g1_args[G1_HEAD : G1_HEAD + 4]
@@ -1573,14 +1587,14 @@ def build_flash_attn_fp8_module(
                 # folded in -- i.e. strictly the past relative to the s_accs
                 # being softmaxed here -- so the rescale is well-defined.
                 (
-                    m_frozen,
+                    m_bias,
                     p_pack,
                     l_valu,
                     (o0, o1, o2, o3),
                     l_mfma,
                 ) = do_softmax(
                     [s0, s1, s2, s3],
-                    m_frozen,
+                    m_bias,
                     l_valu,
                     seeded=True,
                     o_accs=[o0, o1, o2, o3],
@@ -1588,7 +1602,7 @@ def build_flash_attn_fp8_module(
                 )
                 # The V DMA's address math belongs to this (VALU) phase; the
                 # buffer_loads themselves are interleaved into do_qk below.
-                seed = _bias_seed(_fsub(c_exp2_bias, m_frozen))
+                seed = _bias_seed(m_bias)
                 l_voffs = get_lds_voffs(v_buff_off)
                 _sched_barrier()
                 _gpu_barrier()
@@ -1616,7 +1630,7 @@ def build_flash_attn_fp8_module(
                 g_voffs = advance_hbm_offs(g_voffs)
                 scf.YieldOp(
                     [
-                        _raw(m_frozen),
+                        _raw(m_bias),
                         _raw(l_valu),
                         *[_raw(lm) for lm in l_mfma],
                         _raw(o[0]),
