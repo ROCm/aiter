@@ -11,7 +11,6 @@ import torch
 import torch.distributed as dist
 from flydsl.expr.typing import Int32, Int64, Stream
 
-from aiter.dist.parallel_state import in_the_same_node_as
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .qr_int4_ipc import UncachedIpcHeap
@@ -41,6 +40,10 @@ def _cuda_index(device) -> int:
 
 def _validate_ipc_process_group(group, *, rank: int) -> None:
     """Reject groups that cannot exchange HIP IPC handles or CPU-side metadata."""
+    # Keep parallel_state lazy: this module is imported while aiter's AOT setup
+    # is still initializing the top-level package.
+    from aiter.dist.parallel_state import in_the_same_node_as
+
     backend = dist.get_backend(group)
     if backend == dist.Backend.NCCL:
         raise ValueError(
