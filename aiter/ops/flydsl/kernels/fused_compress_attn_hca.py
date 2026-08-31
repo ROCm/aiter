@@ -187,12 +187,16 @@ def _build_compress_forward_kernel(
         sid = fx.block_idx.y
         tid = fx.thread_idx.x  # 0..BLOCK_TH-1
 
+        # -inf sentinel + its 0.0 partner feed the softmax maximumf / == compare,
+        # which must stay non-fast (a plain fx const would take ambient fast_fp_math
+        # and corrupt the -inf guard) -- keep both raw.
         c_neg_inf = arith.constant(_NEG_INF, type=f32)
         c_zero_f32 = arith.constant(0.0, type=f32)
-        c_log2e = arith.constant(_LOG2E, type=f32)
+        c_log2e = fx.Float32(_LOG2E)
 
         def fexp_f32(x):
-            return fx.rocdl.exp2(f32, x * c_log2e)
+            # x is fx.Float32; exp2 needs a raw operand -> wrap once here.
+            return fx.rocdl.exp2(f32, _to_raw(x * c_log2e))
 
         # Per-thread wave / lane (block-local).
         wid = fx.Int32(tid) // 64  # -> [0, NW)
@@ -361,9 +365,9 @@ def _build_compress_forward_kernel(
                     kv_k = fx.Float32(kv_k_list[i])
                     m_new = m_old.maximumf(score_k)
                     is_first = m_old == neg_inf
-                    scale_active = fx.Float32(fexp_f32((m_old - m_new).ir_value()))
+                    scale_active = fx.Float32(fexp_f32(m_old - m_new))
                     scale_v = is_first.select(zero, scale_active)
-                    wk_active = fx.Float32(fexp_f32((score_k - m_new).ir_value()))
+                    wk_active = fx.Float32(fexp_f32(score_k - m_new))
                     w_k = (score_k == neg_inf).select(zero, wk_active)
                     new_kv.append((kv_old * scale_v + w_k * kv_k).ir_value())
                     new_w.append((w_old * scale_v + w_k).ir_value())
@@ -477,7 +481,7 @@ def _build_compress_forward_kernel(
                         kv_w = fx.ptr_load(lds_kv_ptr + idx_w)
                         w_w = fx.ptr_load(lds_w_ptr + idx_w)
                         m_w = m_arr[w]
-                        scale_w = fx.Float32(fexp_f32(_to_raw(m_w - m_g)))
+                        scale_w = fx.Float32(fexp_f32(m_w - m_g))
                         kv_sum = kv_sum + kv_w * scale_w
                         w_sum = w_sum + w_w * scale_w
                     rcp_w = fx.Float32(fx.rocdl.rcp(f32, w_sum.ir_value()))
@@ -645,8 +649,8 @@ def _build_norm_rope_scatter_kernel(
         lane = fx.Int32(tid) & (WAVE - 1)
         pid = fx.Int32(bid) * KW + wave_id
 
-        c_eps = arith.constant(rms_eps, type=f32)
-        c_inv_D = arith.constant(1.0 / D, type=f32)
+        c_eps = fx.Float32(rms_eps)
+        c_inv_D = fx.Float32(1.0 / D)
 
         def wave_reduce_add(x):
             w = fx.Float32(x)
@@ -699,8 +703,8 @@ def _build_norm_rope_scatter_kernel(
             for i in range_constexpr(VEC):
                 sq_local = sq_local + comp_lane[i] * comp_lane[i]
             sq_full = wave_reduce_add(sq_local)
-            var = sq_full * fx.Float32(c_inv_D)
-            rrms = fmath.rsqrt((var + fx.Float32(c_eps)).ir_value(), fastmath=fm_fast)
+            var = sq_full * c_inv_D
+            rrms = fmath.rsqrt((var + c_eps).ir_value(), fastmath=fm_fast)
 
             # rms_weight load
             if const_expr(rms_weight_is_bf16):

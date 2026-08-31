@@ -76,9 +76,8 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl._mlir.dialects import rocdl
-from flydsl.expr import arith, const_expr, gpu, range_constexpr
+from flydsl.expr import arith, const_expr, fastmath, gpu, range_constexpr
 from flydsl.expr import math as fmath
-from flydsl.expr.arith import CmpFPredicate
 from flydsl.expr.typing import Int32, Stream, T
 
 from aiter.utility.mx_types import (
@@ -427,21 +426,24 @@ def _build_kernel(
                     w_old = w_lane[i]
                     kv_old = kv_lane[i]
 
-                    # -inf sentinel: maximumf + OEQ cmpf against -inf must stay
-                    # raw (fx.max/cmp would pick up ambient fast fastmath and
-                    # corrupt the -inf handling). select is not float-arith, so
-                    # convert it -- ambient fastmath does not apply.
-                    m_new = arith.maximumf(m_old, score)
-                    is_first = fx.Boolean(
-                        arith.cmpf(CmpFPredicate.OEQ, m_old, c_neg_inf)
-                    )
-                    scale_active = fexp_f32(fx.Float32(m_old) - m_new)
+                    # -inf sentinel. maximumf keeps the ambient fast_fp_math
+                    # (matches the old raw maximumf, which resolved
+                    # fastmath<fast>). The OEQ compares against -inf MUST emit
+                    # fastmath<none> -- ambient fast lets `x == -inf` fold to
+                    # false and corrupts the sentinel -- so scope only the `==`
+                    # to fastmath(None) (== the old raw cmpf, no fastmath).
+                    m_old_f = fx.Float32(m_old)
+                    score_f = fx.Float32(score)
+                    neg_inf_f = fx.Float32(c_neg_inf)
+                    m_new = fx.max(m_old_f, score_f).ir_value()
+                    with fastmath(None):
+                        is_first = m_old_f == neg_inf_f
+                    scale_active = fexp_f32(m_old_f - m_new)
                     scale_v = is_first.select(c_zero_f32, scale_active)
-                    wk_active = fexp_f32(fx.Float32(score) - m_new)
+                    wk_active = fexp_f32(score_f - m_new)
                     if const_expr(score_can_be_neg_inf):
-                        is_pad_score = fx.Boolean(
-                            arith.cmpf(CmpFPredicate.OEQ, score, c_neg_inf)
-                        )
+                        with fastmath(None):
+                            is_pad_score = score_f == neg_inf_f
                         w_k = is_pad_score.select(c_zero_f32, wk_active)
                     else:
                         w_k = wk_active
@@ -550,7 +552,7 @@ def _build_kernel(
 
             # ---- Step 6: Phase 1 -- state cache loop (dynamic bound = window_len) ----
             # window_len ? [0, K]. When 0, the loop is a no-op.
-            for k_static, state in range(0, _to_raw(window_len), 1, init=init_state):
+            for k_static, state in range(0, window_len, 1, init=init_state):
                 m_lane, kv_lane, w_lane = _split_state(state)
 
                 k_i32 = fx.Int32(k_static)
@@ -623,9 +625,7 @@ def _build_kernel(
                 return kv, sc, ape
 
             if const_expr(not enable_prefetch_input):
-                for k_static, state in range(
-                    _to_raw(window_len), K, 1, init=phase1_state
-                ):
+                for k_static, state in range(window_len, K, 1, init=phase1_state):
                     m_lane, kv_lane, w_lane = _split_state(state)
                     k_i32 = fx.Int32(k_static)
                     kv_a_lane, score_a_lane, ape_v_lane = _phase2_issue_loads(k_i32)
@@ -672,9 +672,7 @@ def _build_kernel(
                 )
 
                 loop_final = init_pf_state
-                for k_static, state in range(
-                    _to_raw(window_len), K - 1, 1, init=init_pf_state
-                ):
+                for k_static, state in range(window_len, K - 1, 1, init=init_pf_state):
                     m_lane = list(state[0:VEC])
                     kv_lane = list(state[VEC : 2 * VEC])
                     w_lane = list(state[2 * VEC : 3 * VEC])
@@ -1599,16 +1597,23 @@ def _build_kernel_ksplit(
                 for i in range_constexpr(VEC):
                     m_old = m_lane[i]
                     score = score_lane[i]
-                    # -inf sentinel: keep maximumf + OEQ cmpf raw (see legacy
-                    # _online_softmax_update); select is safe to convert.
-                    m_new = arith.maximumf(m_old, score)
-                    is_first = fx.Boolean(
-                        arith.cmpf(CmpFPredicate.OEQ, m_old, c_neg_inf)
-                    )
-                    scale_active = fexp_f32(fx.Float32(m_old) - m_new)
+                    # -inf sentinel. maximumf keeps the ambient fast_fp_math
+                    # (matches the old raw maximumf, which resolved
+                    # fastmath<fast>). The OEQ compares against -inf MUST emit
+                    # fastmath<none> -- ambient fast lets `x == -inf` fold to
+                    # false and corrupts the sentinel -- so scope only the `==`
+                    # to fastmath(None) (== the old raw cmpf, no fastmath).
+                    m_old_f = fx.Float32(m_old)
+                    score_f = fx.Float32(score)
+                    neg_inf_f = fx.Float32(c_neg_inf)
+                    m_new = fx.max(m_old_f, score_f).ir_value()
+                    with fastmath(None):
+                        is_first = m_old_f == neg_inf_f
+                    scale_active = fexp_f32(m_old_f - m_new)
                     scale_v = is_first.select(c_zero_f32, scale_active)
-                    wk_active = fexp_f32(fx.Float32(score) - m_new)
-                    is_pad = fx.Boolean(arith.cmpf(CmpFPredicate.OEQ, score, c_neg_inf))
+                    wk_active = fexp_f32(score_f - m_new)
+                    with fastmath(None):
+                        is_pad = score_f == neg_inf_f
                     w_k = is_pad.select(c_zero_f32, wk_active)
                     new_m.append(m_new)
                     new_kv.append(
@@ -1670,9 +1675,7 @@ def _build_kernel_ksplit(
 
             # Phase 1 sub-loop [k_start, split): state cache.
             p1 = init_state
-            for k_static, state in range(
-                _to_raw(k_start), _to_raw(split), 1, init=init_state
-            ):
+            for k_static, state in range(k_start, split, 1, init=init_state):
                 m_lane = list(state[0:VEC])
                 kv_lane = list(state[VEC : 2 * VEC])
                 w_lane = list(state[2 * VEC : 3 * VEC])
@@ -1683,7 +1686,7 @@ def _build_kernel_ksplit(
 
             # Phase 2 sub-loop [split, k_end): ragged input.
             final = p1
-            for k_static, state in range(_to_raw(split), _to_raw(k_end), 1, init=p1):
+            for k_static, state in range(split, k_end, 1, init=p1):
                 m_lane = list(state[0:VEC])
                 kv_lane = list(state[VEC : 2 * VEC])
                 w_lane = list(state[2 * VEC : 3 * VEC])
