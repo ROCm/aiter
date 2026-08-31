@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .core import load_config_json
+from .config_utils import load_config_json
 from .gemm_config_utils import resolve_config_dir
 
 _LAUNCH_META = frozenset({"num_warps", "num_stages"})
