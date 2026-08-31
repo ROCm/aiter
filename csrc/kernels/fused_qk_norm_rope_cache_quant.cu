@@ -3266,7 +3266,8 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                                                 bool use_shuffle_layout,
                                                 int64_t block_size,
                                                 int64_t x,
-                                                int64_t rotary_dim)
+                                                int64_t rotary_dim,
+                                                bool v_norm)
 {
     AITER_CHECK(qkv.is_contiguous() && qw.is_contiguous() && kw.is_contiguous() &&
                 cos_sin.is_contiguous());
@@ -3335,7 +3336,8 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                     k_cache_token_stride,
                     k_cache_head_stride,
                     v_cache_token_stride,
-                    v_cache_head_stride);
+                    v_cache_head_stride,
+                    v_norm);
             }
             else
             {
@@ -3386,7 +3388,8 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                             k_cache_token_stride,
                             k_cache_head_stride,
                             v_cache_token_stride,
-                            v_cache_head_stride);
+                            v_cache_head_stride,
+                            v_norm);
                     }
                     else
                     {
@@ -3433,7 +3436,8 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                             k_cache_token_stride,
                             k_cache_head_stride,
                             v_cache_token_stride,
-                            v_cache_head_stride);
+                            v_cache_head_stride,
+                            v_norm);
                     }
                 }
                 else

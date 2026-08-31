@@ -46,6 +46,22 @@ def _mfma16(a_bf16x4, b_bf16x4, c_f32x4):
     return fx.Float32x4(frag_c.load())
 
 
+def _mfma16_f32(a_f32x4, b_f32x4, c_f32x4):
+    """Run a full-K 16x16 fp32 matrix product using 16x16x4 MFMA."""
+    frag_a = fx.make_rmem_tensor(1, fx.Float32)
+    frag_b = fx.make_rmem_tensor(1, fx.Float32)
+    frag_c = fx.make_rmem_tensor(4, fx.Float32)
+    frag_c.store(fx.Float32x4(c_f32x4))
+    a = fx.Float32x4(a_f32x4)
+    b = fx.Float32x4(b_f32x4)
+    mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 4, fx.Float32))
+    for p in range_constexpr(4):
+        frag_a[0] = a[p]
+        frag_b[0] = b[p]
+        fx.gemm(mma, frag_c, frag_a, frag_b, frag_c)
+    return fx.Float32x4(frag_c.load())
+
+
 def _acc16_n4():
     """Return a zeroed four-tile accumulator."""
     frag = fx.make_rmem_tensor((4, 1, 4), fx.Float32)
@@ -123,6 +139,20 @@ def _load_fp32_tile(
     if negate:
         vals = -vals
     return fx.BFloat16x4([vals[p].to(fx.BFloat16) for p in range(4)])
+
+
+def _load_fp32_tile_raw(
+    s_t, row_base, col_base, thr_copy, copy_atom, transpose=False, negate=False
+):
+    """Load one fp32 tile without reducing precision."""
+    src = _tile16_view(s_t, row_base, col_base, transpose)
+    part_src = thr_copy.partition_S(src)
+    frag = fx.make_fragment_like(part_src)
+    fx.copy(copy_atom, part_src, frag)
+    vals = fx.Float32x4(frag.load())
+    if negate:
+        vals = -vals
+    return vals
 
 
 def _store_fp32_tile(s_t, row_base, col_base, d_f32x4, thr_copy, copy_atom):
@@ -434,11 +464,15 @@ def compile_gdn_prepare(
                 gc[tid] = beta_j * _exp2_f32(gc_j * LOG2E)
 
             # Invert each diagonal block with (I+B)(I+B^2)(I+B^4)(I+B^8).
+            # Keep the inverse polynomial in fp32. The fp32 MFMA path retains
+            # matrix-level parallelism without the unstable bf16 round trips.
             br = warp16
-            neg_A = _load_fp32_tile(s_A, br, br, wave_copy_A32, lds_copy32, negate=True)
+            neg_A = _load_fp32_tile_raw(
+                s_A, br, br, wave_copy_A32, lds_copy32, negate=True
+            )
             I_acc = _identity_frag(lane)
             z4 = fx.Float32x4(0.0)
-            neg_A_T = _load_fp32_tile(
+            neg_A_T = _load_fp32_tile_raw(
                 s_A,
                 br,
                 br,
@@ -447,18 +481,14 @@ def compile_gdn_prepare(
                 transpose=True,
                 negate=True,
             )
-            b2 = _mfma16(neg_A, neg_A_T, z4)
-            b2t = _mfma16(neg_A_T, neg_A, z4)
-            b2_o = _accum_to_bf16x4(b2)
-            b2t_o = _accum_to_bf16x4(b2t)
-            b4 = _mfma16(b2t_o, b2_o, z4)
-            b4t = _mfma16(b2_o, b2t_o, z4)
-            b4_o = _accum_to_bf16x4(b4)
-            b4t_o = _accum_to_bf16x4(b4t)
-            C_acc = _mfma16(b4t_o, b4_o, I_acc)
-            C_acc = _mfma16(b4t_o, _accum_to_bf16x4(C_acc), C_acc)
-            C_acc = _mfma16(b2t_o, _accum_to_bf16x4(C_acc), C_acc)
-            C_acc = _mfma16(neg_A, _accum_to_bf16x4(C_acc), C_acc)
+            b2 = _mfma16_f32(neg_A, neg_A_T, z4)
+            b2t = _mfma16_f32(neg_A_T, neg_A, z4)
+            b4 = _mfma16_f32(b2t, b2, z4)
+            b4t = _mfma16_f32(b2, b2t, z4)
+            C_acc = _mfma16_f32(b4t, b4, I_acc)
+            C_acc = _mfma16_f32(b4t, C_acc, C_acc)
+            C_acc = _mfma16_f32(b2t, C_acc, C_acc)
+            C_acc = _mfma16_f32(neg_A, C_acc, C_acc)
             _store_fp32_tile(s_A, br, br, C_acc, wave_copy_C32, lds_copy32)
             for it in range_constexpr((16 * 16 + WARP_SIZE - 1) // WARP_SIZE):
                 idx = lane + it * WARP_SIZE
