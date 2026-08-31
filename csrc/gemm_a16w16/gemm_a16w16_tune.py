@@ -11,8 +11,10 @@ hipblaslt is opt-in via --with-hipblaslt (imports from gradlib).
 
 import argparse
 import functools
+import itertools
 import os
 import sys
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, ClassVar
 
@@ -39,13 +41,23 @@ try:
     if is_flydsl_available():
         from aiter.ops.flydsl.gemm_kernels import (
             flydsl_hgemm,
-            get_flydsl_splitk_hgemm_kernels,
+            flydsl_hgemm_kernel_name,
+        )
+        from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import (
+            GEMM_A16W16_DTYPE_BF16,
+            GEMM_A16W16_DTYPE_FP16,
+            GEMM_A16W16_DTYPE_FP32,
+            make_gemm_a16w16_param_and_validate,
         )
     else:
         raise ImportError("flydsl package is not installed")
 except ImportError as exc:
     flydsl_hgemm = None
-    get_flydsl_splitk_hgemm_kernels = None
+    flydsl_hgemm_kernel_name = None
+    make_gemm_a16w16_param_and_validate = None
+    GEMM_A16W16_DTYPE_BF16 = None
+    GEMM_A16W16_DTYPE_FP16 = None
+    GEMM_A16W16_DTYPE_FP32 = None
     FLYDSL_TUNE_ERROR = str(exc)
 
 OPUS_TUNE_ERROR = None
@@ -110,6 +122,206 @@ def _default_tol(outdtype):
     """Return (rtol, atol) for the given output dtype."""
     tol = 5e-2 if outdtype == dtypes.bf16 else 1e-2
     return tol, tol
+
+
+@dataclass(frozen=True)
+class GemmConfigPruner:
+    """Prune A16W16 policies using tile efficiency and estimated occupancy."""
+
+    m: int
+    n: int
+    k: int
+    device_props: object
+    element_bytes: int
+    target_waves_per_cu: int = 8
+    max_split_grid_rounds: int = 2
+    max_tile_grid_ratio: int = 4
+
+    @staticmethod
+    def _ceil_div(value, divisor):
+        return (value + divisor - 1) // divisor
+
+    def _tiles(self, config):
+        return self._ceil_div(self.m, config["block_m"]) * self._ceil_div(
+            self.n, config["block_n"]
+        )
+
+    def _iou(self, config):
+        split_k = config["split_k"]
+        padded_m = self._ceil_div(self.m, config["block_m"]) * config["block_m"]
+        padded_n = self._ceil_div(self.n, config["block_n"]) * config["block_n"]
+        part_k = self.k // split_k
+        padded_k = (
+            self._ceil_div(part_k, config["block_k"]) * config["block_k"] * split_k
+        )
+        return self.m * self.n * self.k / (padded_m * padded_n * padded_k)
+
+    def _occupancy(self, config):
+        props = self.device_props
+        waves = config["m_waves"] * config["n_waves"] * config["k_waves"]
+        lds = max(
+            config["stages"]
+            * (config["block_m"] + config["block_n"])
+            * config["block_k"]
+            * self.element_bytes,
+            config["k_waves"]
+            * config["block_m"]
+            * config["block_n"]
+            * self.element_bytes,
+        )
+        lds_per_cu = getattr(
+            props,
+            "shared_memory_per_multiprocessor",
+            props.shared_memory_per_block,
+        )
+        resident = (
+            min(
+                props.max_threads_per_multi_processor // props.warp_size // waves,
+                lds_per_cu // lds,
+            )
+            * waves
+        )
+        grid = (
+            self._tiles(config)
+            * config["split_k"]
+            * waves
+            / props.multi_processor_count
+        )
+        return min(self.target_waves_per_cu, resident, grid)
+
+    def prune(self, configs):
+        if not configs:
+            return configs
+        ious = [self._iou(config) for config in configs]
+        keep_ratio = max(0.625, 1 - self.m / 160, 1 - 120 / self.m)
+        min_iou = max(ious) * keep_ratio
+        num_cus = self.device_props.multi_processor_count
+        max_tiles = (
+            max(num_cus, min(self._tiles(config) for config in configs))
+            * self.max_tile_grid_ratio
+        )
+        kept = []
+        for config, iou in zip(configs, ious):
+            tiles = self._tiles(config)
+            max_split_k = (
+                1
+                if tiles >= num_cus
+                else self._ceil_div(self.max_split_grid_rounds * num_cus, tiles)
+            )
+            if (
+                iou >= min_iou
+                and tiles <= max_tiles
+                and config["split_k"] <= max_split_k
+                and (config["group_m"] == 0 or (tiles >= num_cus and tiles % 8 == 0))
+            ):
+                kept.append(config)
+
+        best = {}
+        keep = set()
+        for index, config in sorted(
+            enumerate(kept), key=lambda item: (item[1]["k_waves"], item[0])
+        ):
+            key = tuple(
+                (name, value) for name, value in config.items() if name != "k_waves"
+            )
+            occupancy = self._occupancy(config)
+            if occupancy > best.get(key, -1.0) + 1e-9:
+                best[key] = occupancy
+                keep.add(index)
+        return [config for index, config in enumerate(kept) if index in keep]
+
+
+def get_flydsl_a16w16_configs(
+    m: int,
+    n: int,
+    k: int,
+    dtype: torch.dtype,
+    out_dtype: torch.dtype,
+    has_bias: bool,
+):
+    """Generate and validate the shape-aware policy catalog used by tuning."""
+
+    if make_gemm_a16w16_param_and_validate is None:
+        return []
+    if get_gfx() != "gfx950":
+        return []
+    if dtype not in (torch.float16, torch.bfloat16):
+        return []
+    if out_dtype not in (dtype, torch.float32):
+        return []
+
+    split_k_candidates = [1]
+    split_k_candidates.extend(split_k for split_k in range(2, 10) if k % split_k == 0)
+    selections = {
+        "block_m": [16, 32, 48, 64, 80, 96, 128, 256],
+        "block_n": [16, 32, 64, 80, 96, 128, 256],
+        "block_k": [64, 128, 256],
+        "stages": list(range(2, 10)),
+        "split_k": split_k_candidates,
+        "m_waves": [1, 2, 4],
+        "n_waves": [1, 2, 4],
+        "k_waves": [1, 2],
+        "group_m": [0, 4],
+        "use_half_tile_interleaved": [False, True],
+    }
+    configs = [
+        dict(zip(selections, combo))
+        for combo in itertools.product(*selections.values())
+    ]
+    device_props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    configs = GemmConfigPruner(
+        m,
+        n,
+        k,
+        device_props,
+        2,
+    ).prune(configs)
+
+    in_dtype_id = (
+        GEMM_A16W16_DTYPE_FP16 if dtype == torch.float16 else GEMM_A16W16_DTYPE_BF16
+    )
+    out_dtype_id = GEMM_A16W16_DTYPE_FP32 if out_dtype == torch.float32 else in_dtype_id
+    valid_configs = []
+    is_large_gemm = m >= 4096 and n >= 4096 and k >= 4096
+    for config in configs:
+        if is_large_gemm:
+            if not (
+                config["use_half_tile_interleaved"]
+                and config["block_m"] == 256
+                and config["block_n"] == 256
+                and config["block_k"] == 64
+                and config["stages"] == 2
+                and config["split_k"] == 1
+                and config["m_waves"] == 2
+                and config["n_waves"] == 4
+                and config["k_waves"] == 1
+            ):
+                continue
+        elif not config["use_half_tile_interleaved"]:
+            mma_m_iters = config["block_m"] // config["m_waves"] // 16
+            mma_n_iters = config["block_n"] // config["n_waves"] // 16
+            if mma_m_iters > 4 or mma_n_iters > 4:
+                continue
+
+        validation_config = {
+            **config,
+            "in_dtype_id": in_dtype_id,
+            "out_dtype_id": out_dtype_id,
+            "a_is_transposed": False,
+            "b_is_transposed": True,
+            "has_bias": has_bias,
+        }
+        if (
+            make_gemm_a16w16_param_and_validate(
+                m,
+                n,
+                k,
+                validation_config,
+            )
+            is not None
+        ):
+            valid_configs.append(config)
+    return valid_configs
 
 
 # ---------------------------------------------------------------------------
@@ -287,12 +499,18 @@ def run_skinny_gemm_a16w16(input, weight, bias=None, otype=dtypes.bf16):
     return native_skinny_gemm(input, weight, 2, bias=bias, otype=otype)
 
 
-def run_flydsl_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, config=None):
+def run_flydsl_gemm_bf16(
+    input,
+    weight,
+    out,
+    bias=None,
+    otype=dtypes.bf16,
+    config=None,
+):
     if flydsl_hgemm is None:
         raise RuntimeError(f"flydsl is not available for tuning: {FLYDSL_TUNE_ERROR}")
     if config is None:
         raise ValueError("flydsl tuning requires a kernel config")
-    stages = config.get("stages", config.get("stage", 2))
     fused_bias = None
     if (
         bias is not None
@@ -303,25 +521,19 @@ def run_flydsl_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, config=Non
     out = flydsl_hgemm(
         input,
         weight,
+        out=out,
         bias=fused_bias,
-        kernel_family=config.get("kernel_family"),
-        tile_m=config["tile_m"],
-        tile_n=config["tile_n"],
-        tile_k=config["tile_k"],
+        tile_m=config["block_m"],
+        tile_n=config["block_n"],
+        tile_k=config["block_k"],
         split_k=config["split_k"],
-        block_m_warps=config["block_m_warps"],
-        block_n_warps=config["block_n_warps"],
-        block_k_warps=config["block_k_warps"],
-        n_tile_repeat=config.get("n_tile_repeat", 1),
-        persistent_n_tiles=config.get("persistent_n_tiles", 1),
-        waves_per_eu=config.get("waves_per_eu", 0),
-        b_to_lds_unroll=config.get("b_to_lds_unroll", 0),
-        stages=stages,
-        async_copy=config.get("async_copy", False),
-        b_to_lds=config["b_to_lds"],
-        b_preshuffle=config.get("b_preshuffle", False),
-        auto_shuffle_b=False,
-        c_to_lds=config.get("c_to_lds", False),
+        block_m_warps=config["m_waves"],
+        block_n_warps=config["n_waves"],
+        block_k_warps=config["k_waves"],
+        stages=config["stages"],
+        group_m=config["group_m"],
+        policy="ht" if config["use_half_tile_interleaved"] else "ft",
+        out_dtype=otype,
     )
     if bias is not None and fused_bias is None:
         out = out.to(bias.dtype) + bias
@@ -336,10 +548,33 @@ def run_flydsl_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, config=Non
 
 
 @lru_cache(maxsize=1)
-def get_flydsl_bf16_catalog(m: int, n: int, k: int):
-    if get_flydsl_splitk_hgemm_kernels is None:
+def get_flydsl_bf16_catalog(
+    m: int,
+    n: int,
+    k: int,
+    out_dtype: torch.dtype,
+    has_bias: bool,
+):
+    if flydsl_hgemm_kernel_name is None:
         return []
-    kernels = get_flydsl_splitk_hgemm_kernels("bf16", "bf16", m=m, n=n, k=k)
+    fused_bias = bool(has_bias and out_dtype == torch.bfloat16)
+    configs = get_flydsl_a16w16_configs(
+        m,
+        n,
+        k,
+        torch.bfloat16,
+        out_dtype,
+        fused_bias,
+    )
+    kernels = {
+        flydsl_hgemm_kernel_name(
+            dtype=torch.bfloat16,
+            out_dtype=out_dtype,
+            config=config,
+            has_bias=fused_bias,
+        ): config
+        for config in configs
+    }
     catalog = [
         (idx, name, dict(kernels[name])) for idx, name in enumerate(sorted(kernels))
     ]
@@ -723,35 +958,16 @@ class GemmA16W16Tuner(GemmCommonTuner):
     def _get_flydsl_tasks(
         self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
     ):
-        if flydsl_hgemm is None or get_flydsl_splitk_hgemm_kernels is None:
+        if flydsl_hgemm is None or flydsl_hgemm_kernel_name is None:
             logger.warning(f"FlyDSL not available, skip. reason: {FLYDSL_TUNE_ERROR}")
             return []
-        if scaleAB or indtype != dtypes.bf16:
+        if scaleAB or is_shuffle or indtype != dtypes.bf16 or get_gfx() != "gfx950":
             return []
-        M, N, K = info_keys[2], info_keys[3], info_keys[4]
+        M, N, K = (int(info_keys[2]), int(info_keys[3]), int(info_keys[4]))
         rtol, atol = _default_tol(outdtype)
-        flydsl_catalog = get_flydsl_bf16_catalog(M, N, K)
-        weight_key = "shuffleweights" if is_shuffle else "weights"
-        min_tile_m = min((c["tile_m"] for _, _, c in flydsl_catalog), default=16)
+        flydsl_catalog = get_flydsl_bf16_catalog(M, N, K, outdtype, has_bias)
         tasks = []
         for solidx, kernel_name, config in flydsl_catalog:
-            if config.get("b_preshuffle", False) != is_shuffle:
-                continue
-            if config["tile_m"] > max(M, min_tile_m):
-                continue
-            if N < config["tile_n"] or N % config["tile_n"] != 0:
-                continue
-            if K % config["split_k"] != 0:
-                continue
-            ks = K // config["split_k"]
-            if ks < config["tile_k"] or ks % config["tile_k"] != 0:
-                continue
-            if config["split_k"] > 1:
-                counters = ((M + config["tile_m"] - 1) // config["tile_m"]) * (
-                    N // config["tile_n"]
-                )
-                if counters > 128:
-                    continue
             info = (
                 info_keys,
                 solidx,
@@ -766,7 +982,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
                     generate_data,
                     (M, N, K, indtype, outdtype, scaleAB, is_shuffle, 0, has_bias),
                     run_flydsl_gemm_bf16,
-                    (["inp", weight_key, "bias"], outdtype, config),
+                    (["inp", "weights", "out_asm", "bias"], outdtype, config),
                     dict(run_kwargs),
                     get_gemm_ref,
                     (
@@ -778,6 +994,9 @@ class GemmA16W16Tuner(GemmCommonTuner):
                     None,
                     rtol,
                     atol,
+                    None,
+                    None,
+                    ("out_asm",),
                 )
             )
         logger.info(f"FlyDSL candidate count for M={M}, N={N}, K={K}: {len(tasks)}")
