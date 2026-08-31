@@ -79,7 +79,7 @@ def test_jit_dependency_invalidation_uses_module_build_lock(tmp_path, monkeypatc
 
 
 def test_tuned_gemm_missing_opus_kernel_falls_back_to_torch(monkeypatch):
-    import aiter.tuned_gemm as tuned_gemm
+    from aiter import tuned_gemm
 
     marker = torch.empty(0, dtype=torch.bfloat16)
     monkeypatch.setattr(tuned_gemm, "_opus_tune", _missing_tuned_kernel)
@@ -99,7 +99,7 @@ def test_tuned_gemm_missing_opus_kernel_falls_back_to_torch(monkeypatch):
 
 
 def test_tuned_gemm_missing_opus_kernel_honors_fp32_output(monkeypatch):
-    import aiter.tuned_gemm as tuned_gemm
+    from aiter import tuned_gemm
 
     monkeypatch.setattr(tuned_gemm, "_opus_tune", _missing_tuned_kernel)
 
