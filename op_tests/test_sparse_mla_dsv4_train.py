@@ -66,10 +66,10 @@ def max_abs_err(a, b):
     return (a.float() - b.float()).abs().max().item()
 
 
-# ── Test runner ──────────────────────────────────────────────────────
+# ── Test runner helpers (called by main() and pytest parametrize) ────
 
 
-def test_fwd(N, H, D, N_kv, topk, has_sink=True):
+def _run_fwd(N, H, D, N_kv, topk, has_sink=True):
     print(
         f"  FWD  N={N} H={H} D={D} N_kv={N_kv} topk={topk} sink={has_sink} ...", end=" "
     )
@@ -92,7 +92,7 @@ def test_fwd(N, H, D, N_kv, topk, has_sink=True):
     return ok
 
 
-def test_bwd(N, H, D, N_kv, topk, has_sink=True):
+def _run_bwd(N, H, D, N_kv, topk, has_sink=True):
     print(
         f"  BWD  N={N} H={H} D={D} N_kv={N_kv} topk={topk} sink={has_sink} ...", end=" "
     )
@@ -154,7 +154,7 @@ def test_bwd(N, H, D, N_kv, topk, has_sink=True):
     return ok
 
 
-def test_autograd(N, H, D, N_kv, topk, has_sink=True):
+def _run_autograd(N, H, D, N_kv, topk, has_sink=True):
     print(
         f"  AUTOGRAD  N={N} H={H} D={D} N_kv={N_kv} topk={topk} sink={has_sink} ...",
         end=" ",
@@ -181,6 +181,50 @@ def test_autograd(N, H, D, N_kv, topk, has_sink=True):
     ok = has_grads
     print(f"grads_exist={has_grads}  {'PASS' if ok else 'FAIL'}")
     return ok
+
+
+# ── pytest entry points ──────────────────────────────────────────────
+
+import pytest  # noqa: E402
+
+
+@pytest.mark.parametrize("has_sink", [True, False])
+@pytest.mark.parametrize(
+    "N, H, D, N_kv, topk",
+    [
+        (32, 8, 64, 64, 32),
+        (64, 16, 128, 128, 64),
+        (128, 8, 512, 160, 64),
+        (256, 64, 512, 320, 128),
+    ],
+)
+def test_sparse_mla_fwd(N, H, D, N_kv, topk, has_sink):
+    assert _run_fwd(N, H, D, N_kv, topk, has_sink)
+
+
+@pytest.mark.parametrize("has_sink", [True, False])
+@pytest.mark.parametrize(
+    "N, H, D, N_kv, topk",
+    [
+        (32, 8, 64, 64, 32),
+        (64, 16, 128, 128, 64),
+        (128, 8, 512, 160, 64),
+    ],
+)
+def test_sparse_mla_bwd(N, H, D, N_kv, topk, has_sink):
+    assert _run_bwd(N, H, D, N_kv, topk, has_sink)
+
+
+@pytest.mark.parametrize("has_sink", [True, False])
+@pytest.mark.parametrize(
+    "N, H, D, N_kv, topk",
+    [
+        (32, 8, 64, 64, 32),
+        (64, 16, 128, 128, 64),
+    ],
+)
+def test_sparse_mla_autograd(N, H, D, N_kv, topk, has_sink):
+    assert _run_autograd(N, H, D, N_kv, topk, has_sink)
 
 
 def main():
@@ -221,9 +265,9 @@ def main():
 
     for N, H, D, N_kv, topk in configs:
         for has_sink in [True, False]:
-            all_pass &= test_fwd(N, H, D, N_kv, topk, has_sink)
-            all_pass &= test_bwd(N, H, D, N_kv, topk, has_sink)
-            all_pass &= test_autograd(N, H, D, N_kv, topk, has_sink)
+            all_pass &= _run_fwd(N, H, D, N_kv, topk, has_sink)
+            all_pass &= _run_bwd(N, H, D, N_kv, topk, has_sink)
+            all_pass &= _run_autograd(N, H, D, N_kv, topk, has_sink)
 
     print()
     if all_pass:
