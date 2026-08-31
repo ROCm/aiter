@@ -27,19 +27,22 @@ def test_moe_aux_loss_fwd(N, E):
     torch.testing.assert_close(result, expected, atol=1e-4, rtol=1e-4)
 
 
+@pytest.mark.parametrize("grad_loss_val", [1.0, 2.0, 0.5])
 @pytest.mark.parametrize("N", [1, 32, 512])
 @pytest.mark.parametrize("E", [8, 64])
-def test_moe_aux_loss_bwd(N, E):
+def test_moe_aux_loss_bwd(N, E, grad_loss_val):
     from aiter.ops.triton.moe.moe_aux_loss import moe_aux_loss_bwd
 
     torch.manual_seed(42)
     tokens_per_expert = torch.randint(0, N, (E,), dtype=torch.float32)
     coeff_scaled = 0.01
-    grad_aux_loss = torch.tensor(1.0)
+    grad_aux_loss = torch.tensor(grad_loss_val)
 
     result = moe_aux_loss_bwd(tokens_per_expert, coeff_scaled, grad_aux_loss, N, E)
 
-    expected = tokens_per_expert.unsqueeze(0).expand(N, E) * coeff_scaled
+    expected = (
+        tokens_per_expert.unsqueeze(0).expand(N, E) * coeff_scaled * grad_loss_val
+    )
     torch.testing.assert_close(result, expected, atol=1e-6, rtol=1e-6)
 
 

@@ -112,10 +112,14 @@ def _moe_wgrad_kernel(
     n_mask = offs_n < N
     k_mask = offs_k < K
 
+    # Widen to int64 before multiplying by stride: at DSv4 scale (batch=512,
+    # seq=16384, top_k=7, hidden=7168) total tokens ~58M and the product
+    # overflows int32.
+    token_row = (offs_token // top_k).to(tl.int64)
     grad_ptrs = (
         grad_ptr
-        + (offs_token // top_k)[:, None] * stride_gm
-        + offs_n[None, :] * stride_gn
+        + token_row[:, None] * stride_gm
+        + offs_n[None, :].to(tl.int64) * stride_gn
     )
     grad_block = tl.load(
         grad_ptrs,
@@ -125,8 +129,8 @@ def _moe_wgrad_kernel(
 
     input_ptrs = (
         input_ptr
-        + (offs_token // top_k)[:, None] * stride_im
-        + offs_k[None, :] * stride_ik
+        + token_row[:, None] * stride_im
+        + offs_k[None, :].to(tl.int64) * stride_ik
     )
     input_block = tl.load(
         input_ptrs,

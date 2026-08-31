@@ -12,16 +12,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from .core import load_config_json
-from .gemm_config_utils import resolve_config_dir
+from .config_utils import load_config_json, resolve_config_dir
 
 _LAUNCH_META = frozenset({"num_warps", "num_stages"})
 
 
 def load_sonicmoe_configs() -> dict[str, Any] | None:
-    cfg_dir, name_prefix = resolve_config_dir("moe", "SONICMOE-BF16", backend="triton")
-    stem = f"{name_prefix}SONICMOE-BF16" if name_prefix else "DEFAULT"
-    return load_config_json(f"{cfg_dir}/{stem}.json", required=False)
+    cfg_dir = resolve_config_dir("moe", "SONICMOE-BF16", backend="triton")
+    return load_config_json(f"{cfg_dir}/DEFAULT.json", required=False)
 
 
 def _clean_bucket(bucket: dict[str, Any]) -> dict[str, Any]:

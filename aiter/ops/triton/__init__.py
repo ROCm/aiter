@@ -43,8 +43,17 @@ try:
     from .cross_entropy import (
         cross_entropy_forward as cross_entropy_forward,
     )
+    from .cross_entropy import (
+        cross_entropy_forward_chunked as cross_entropy_forward_chunked,
+    )
 
-    __all__.extend(["cross_entropy_backward", "cross_entropy_forward"])
+    __all__.extend(
+        [
+            "cross_entropy_backward",
+            "cross_entropy_forward",
+            "cross_entropy_forward_chunked",
+        ]
+    )
 except (ImportError, AttributeError):
     pass
 
@@ -135,6 +144,7 @@ _BACKWARD_COMPAT_MAP = {
     "prefill_attention": "attention.prefill_attention",
     "unified_attention_sparse_mla": "attention.unified_attention_sparse_mla",
     "unified_attention": "attention.unified_attention",
+    # gfx950 (CDNA4) only — importing on other archs raises NotImplementedError below.
     "mxfp8_attention": "attention.mxfp8_attention",
     # Fusions modules (fusions/)
     "fused_kv_cache": "fusions.fused_kv_cache",
@@ -169,6 +179,9 @@ _BACKWARD_COMPAT_MAP = {
 }
 
 
+_CDNA4_ONLY = frozenset({"mxfp8_attention"})
+
+
 def __getattr__(name):
     """
     Handles attribute access to the triton module
@@ -177,6 +190,13 @@ def __getattr__(name):
     x = aiter.ops.triton.gemm_afp4wfp4
     """
     if name in _BACKWARD_COMPAT_MAP:
+        if name in _CDNA4_ONLY:
+            from aiter.ops.triton.utils._triton.arch_info import is_cdna4
+
+            if not is_cdna4():
+                raise NotImplementedError(
+                    f"aiter.ops.triton.{name} requires gfx950 (CDNA4) or newer"
+                )
         new_path = f"aiter.ops.triton.{_BACKWARD_COMPAT_MAP[name]}"
         _warn_if_deprecated(name, new_path)
         module = importlib.import_module(new_path)

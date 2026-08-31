@@ -11,7 +11,9 @@ Usage:
 """
 
 import argparse
+import sys
 
+import pytest
 import torch
 import torch.nn.functional as F
 from triton.testing import do_bench
@@ -151,9 +153,26 @@ def run_correctness(T, H, I, E, K, act_type, dtype):
     print(f"  dw1 rel err:    {dw1_err:.4f}")
     print(f"  dw2 rel err:    {dw2_err:.4f}")
 
-    status = "PASS" if max(o_err, dx_err, dw1_err, dw2_err) < 0.05 else "FAIL"
+    max_err = max(o_err, dx_err, dw1_err, dw2_err)
+    status = "PASS" if max_err < 0.05 else "FAIL"
     print(f"  Status: {status}")
-    return o_err, dx_err, dw1_err, dw2_err, status
+    return o_err, dx_err, dw1_err, dw2_err, max_err
+
+
+@pytest.mark.parametrize(
+    "act_name", ["swiglu", "geglu", "reglu", "gelu", "relu", "silu", "relu_sq"]
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_sonicmoe_correctness(act_name, dtype):
+    """Forward + backward correctness for all SonicMoE activation types."""
+    torch.cuda.set_device(0)
+    act_type = _ACT_MAP[act_name]
+    *_, max_err = run_correctness(
+        T=64, H=128, I=64, E=4, K=2, act_type=act_type, dtype=dtype
+    )
+    assert (
+        max_err < 0.05
+    ), f"SonicMoE {act_name}: max relative error {max_err:.4f} >= 0.05"
 
 
 def run_benchmark(T, H, I, E, K, act_type, dtype, rep=100, trials=5):
@@ -297,13 +316,17 @@ def main():
     for act_name in activations:
         at = _ACT_MAP[act_name]
         print(f"\n{act_name}:")
-        _, _, _, _, status = run_correctness(
+        *_, max_err = run_correctness(
             args.T, args.H, args.I, args.E, args.K, at, torch_dtype
         )
-        if status != "PASS":
+        if max_err >= 0.05:
             all_pass = False
 
-    print(f"\n{'All tests PASSED' if all_pass else 'Some tests FAILED'}.")
+    if all_pass:
+        print("\nAll tests PASSED.")
+    else:
+        print("\nSome tests FAILED.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

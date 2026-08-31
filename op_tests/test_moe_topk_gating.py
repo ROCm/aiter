@@ -19,6 +19,7 @@ import os
 import sys
 
 import pandas as pd
+import pytest
 import torch
 
 import aiter
@@ -885,6 +886,16 @@ def main():
             print(errors.to_string(index=False))
             failed_sections.append("softmax")
 
+        # Run the pytest-style topk_softmax cases so they execute in script mode too.
+        try:
+            test_topk_softmax(num_tokens=512, num_experts=64, topk=2, need_renorm=True)
+            test_topk_softmax(num_tokens=512, num_experts=64, topk=2, need_renorm=False)
+            test_topk_softmax_bf16_caller_casts()
+            print("topk_softmax direct correctness: PASS")
+        except AssertionError as exc:
+            print(f"topk_softmax direct correctness: FAIL — {exc}")
+            failed_sections.append("topk_softmax_direct")
+
     # -- topk_gating NaN/Inf robustness -----------------------------------
     if "nan" in sections:
         nan_dtypes = [d for d in dtype_list if d != torch.float32]
@@ -992,6 +1003,79 @@ def main():
         sys.exit(1)
     else:
         print("All topk_gating benchmarks passed!")
+
+
+# ---------------------------------------------------------------------------
+# pytest — topk_softmax (ASM vLLM-adapted kernel) correctness
+# ---------------------------------------------------------------------------
+# These cases exercise aiter.topk_softmax directly, independent of the
+# topk_gating fused path, and are the pytest-discoverable counterpart of
+# the bench_topk_softmax benchmark above.
+
+
+def _run_topk_softmax(gating_output, topk, need_renorm):
+    num_tokens = gating_output.shape[0]
+    topk_weights = torch.empty(num_tokens, topk, dtype=torch.float32, device="cuda")
+    topk_ids = torch.empty(num_tokens, topk, dtype=torch.int32, device="cuda")
+    token_expert_indices = torch.empty(
+        num_tokens, topk, dtype=torch.int32, device="cuda"
+    )
+    aiter.topk_softmax(
+        topk_weights, topk_ids, token_expert_indices, gating_output, need_renorm
+    )
+    return topk_weights, topk_ids
+
+
+def _align_by_id(weights, ids):
+    """Sort (weights, ids) rows by expert ID for order-independent comparison."""
+    order = ids.argsort(dim=-1)
+    return weights.gather(1, order), ids.gather(1, order)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 32, 512, 4096])
+@pytest.mark.parametrize("num_experts", [8, 64, 128])
+@pytest.mark.parametrize("topk", [1, 2, 8])
+@pytest.mark.parametrize("need_renorm", [True, False])
+def test_topk_softmax(num_tokens, num_experts, topk, need_renorm):
+    if topk > num_experts:
+        pytest.skip("topk > num_experts")
+
+    torch.manual_seed(42)
+    gating = torch.randn(num_tokens, num_experts, dtype=torch.float32, device="cuda")
+
+    # ref_softmax returns (weights, ids) with sorted=False — align both sides by ID.
+    w_ref, i_ref = ref_softmax(
+        gating, torch.empty(0, device="cuda"), topk, 1.0, need_renorm
+    )
+    w_ref, i_ref = _align_by_id(w_ref, i_ref)
+
+    w_out, i_out = _run_topk_softmax(gating, topk, need_renorm)
+    w_out, i_out = _align_by_id(w_out, i_out)
+
+    torch.testing.assert_close(w_out, w_ref, atol=1e-4, rtol=1e-4)
+    assert (i_out == i_ref).all(), "expert ID sets differ"
+
+
+def test_topk_softmax_bf16_caller_casts():
+    """Caller must cast bf16 logits to fp32 before passing to topk_softmax.
+
+    The ASM kernel only accepts fp32. This test builds a bf16 tensor and casts
+    it to fp32 (as a real caller would), then verifies the kernel matches the
+    reference on that fp32 input. The 2e-3 tolerance reflects the bf16→fp32
+    cast rounding that propagates into the softmax output.
+    """
+    torch.manual_seed(42)
+    gating_bf16 = torch.randn(32, 8, dtype=torch.bfloat16, device="cuda")
+    gating_fp32 = gating_bf16.float()  # the cast a caller must perform
+
+    w_ref, i_ref = ref_softmax(gating_fp32, torch.empty(0, device="cuda"), 2, 1.0, True)
+    w_ref, i_ref = _align_by_id(w_ref, i_ref)
+
+    w_out, i_out = _run_topk_softmax(gating_fp32, 2, True)
+    w_out, i_out = _align_by_id(w_out, i_out)
+
+    torch.testing.assert_close(w_out, w_ref, atol=2e-3, rtol=2e-3)
+    assert (i_out == i_ref).all(), "expert ID sets differ"
 
 
 if __name__ == "__main__":

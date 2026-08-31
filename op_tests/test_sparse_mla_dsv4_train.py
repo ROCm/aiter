@@ -3,47 +3,16 @@
 #
 # Correctness test for DSV4 sparse-MLA training kernels.
 
-import importlib
-import os
 import sys
 
+import pytest
 import torch
 
-# Avoid importing aiter.__init__ which loads C extensions.
-# Instead, directly import the pure-Python/Triton modules.
-_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-def _load_module(name, path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-_kernel_mod = _load_module(
-    "aiter.ops.triton._triton_kernels.attention.sparse_mla_dsv4_train",
-    os.path.join(
-        _REPO,
-        "aiter",
-        "ops",
-        "triton",
-        "_triton_kernels",
-        "attention",
-        "sparse_mla_dsv4_train.py",
-    ),
+from aiter.ops.triton.attention.sparse_mla_dsv4_train import (
+    sparse_mla_bwd,
+    sparse_mla_dsv4_train,
+    sparse_mla_fwd,
 )
-_wrapper_mod = _load_module(
-    "aiter.ops.triton.attention.sparse_mla_dsv4_train",
-    os.path.join(
-        _REPO, "aiter", "ops", "triton", "attention", "sparse_mla_dsv4_train.py"
-    ),
-)
-
-sparse_mla_fwd = _wrapper_mod.sparse_mla_fwd
-sparse_mla_bwd = _wrapper_mod.sparse_mla_bwd
-sparse_mla_dsv4_train = _wrapper_mod.sparse_mla_dsv4_train
 
 torch.set_default_device("cuda")
 
@@ -98,10 +67,10 @@ def max_abs_err(a, b):
     return (a.float() - b.float()).abs().max().item()
 
 
-# ── Test runner ──────────────────────────────────────────────────────
+# ── Test runner helpers (called by main() and pytest parametrize) ────
 
 
-def test_fwd(N, H, D, N_kv, topk, has_sink=True):
+def _run_fwd(N, H, D, N_kv, topk, has_sink=True):
     print(
         f"  FWD  N={N} H={H} D={D} N_kv={N_kv} topk={topk} sink={has_sink} ...", end=" "
     )
@@ -124,7 +93,7 @@ def test_fwd(N, H, D, N_kv, topk, has_sink=True):
     return ok
 
 
-def test_bwd(N, H, D, N_kv, topk, has_sink=True):
+def _run_bwd(N, H, D, N_kv, topk, has_sink=True):
     print(
         f"  BWD  N={N} H={H} D={D} N_kv={N_kv} topk={topk} sink={has_sink} ...", end=" "
     )
@@ -186,7 +155,7 @@ def test_bwd(N, H, D, N_kv, topk, has_sink=True):
     return ok
 
 
-def test_autograd(N, H, D, N_kv, topk, has_sink=True):
+def _run_autograd(N, H, D, N_kv, topk, has_sink=True):
     print(
         f"  AUTOGRAD  N={N} H={H} D={D} N_kv={N_kv} topk={topk} sink={has_sink} ...",
         end=" ",
@@ -213,6 +182,48 @@ def test_autograd(N, H, D, N_kv, topk, has_sink=True):
     ok = has_grads
     print(f"grads_exist={has_grads}  {'PASS' if ok else 'FAIL'}")
     return ok
+
+
+# ── pytest entry points ──────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("has_sink", [True, False])
+@pytest.mark.parametrize(
+    "N, H, D, N_kv, topk",
+    [
+        (32, 8, 64, 64, 32),
+        (64, 16, 128, 128, 64),
+        (128, 8, 512, 160, 64),
+        (256, 64, 512, 320, 128),
+    ],
+)
+def test_sparse_mla_fwd(N, H, D, N_kv, topk, has_sink):
+    assert _run_fwd(N, H, D, N_kv, topk, has_sink)
+
+
+@pytest.mark.parametrize("has_sink", [True, False])
+@pytest.mark.parametrize(
+    "N, H, D, N_kv, topk",
+    [
+        (32, 8, 64, 64, 32),
+        (64, 16, 128, 128, 64),
+        (128, 8, 512, 160, 64),
+    ],
+)
+def test_sparse_mla_bwd(N, H, D, N_kv, topk, has_sink):
+    assert _run_bwd(N, H, D, N_kv, topk, has_sink)
+
+
+@pytest.mark.parametrize("has_sink", [True, False])
+@pytest.mark.parametrize(
+    "N, H, D, N_kv, topk",
+    [
+        (32, 8, 64, 64, 32),
+        (64, 16, 128, 128, 64),
+    ],
+)
+def test_sparse_mla_autograd(N, H, D, N_kv, topk, has_sink):
+    assert _run_autograd(N, H, D, N_kv, topk, has_sink)
 
 
 def main():
@@ -253,9 +264,9 @@ def main():
 
     for N, H, D, N_kv, topk in configs:
         for has_sink in [True, False]:
-            all_pass &= test_fwd(N, H, D, N_kv, topk, has_sink)
-            all_pass &= test_bwd(N, H, D, N_kv, topk, has_sink)
-            all_pass &= test_autograd(N, H, D, N_kv, topk, has_sink)
+            all_pass &= _run_fwd(N, H, D, N_kv, topk, has_sink)
+            all_pass &= _run_bwd(N, H, D, N_kv, topk, has_sink)
+            all_pass &= _run_autograd(N, H, D, N_kv, topk, has_sink)
 
     print()
     if all_pass:
