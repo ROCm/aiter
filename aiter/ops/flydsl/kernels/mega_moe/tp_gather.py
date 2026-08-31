@@ -225,6 +225,7 @@ class TPActivationGather:
         num_waves=4,
         producer_blocks=32,
         double_buffer=True,
+        enable_pull=True,
     ):
         if int(tp_size) not in _SUPPORTED_TP:
             raise ValueError(
@@ -244,6 +245,16 @@ class TPActivationGather:
             raise ValueError(
                 f"producer_blocks={producer_blocks} must be divisible by tp_size={tp_size}"
             )
+        if enable_pull and not double_buffer:
+            # Pull inverts the buffer-reuse hazard: instead of a peer writing into
+            # our receive slab, we read the peer's source slab, so what has to be
+            # ordered is the peer's *next* quantize against our current read. The
+            # launch rendezvous cannot order that on its own, because the quantize
+            # runs before the rendezvous on the peer's stream. Two slots close the
+            # gap -- a peer only rewrites slab p in round N+2, and by then our
+            # round-N kernel has provably retired. Checked before the first
+            # collective allocation so a bad config raises instead of hanging.
+            raise ValueError("enable_pull requires double_buffer=True")
 
         initialised = _shmem_looks_initialised()
         if initialised is False:
@@ -270,6 +281,7 @@ class TPActivationGather:
         self.num_waves = int(num_waves)
         self.producer_blocks = int(producer_blocks)
         self.slots = 2 if double_buffer else 1
+        self.enable_pull = bool(enable_pull)
         dev = device or torch.device("cuda", torch.cuda.current_device())
         if dev.type == "cuda" and dev.index is None:
             dev = torch.device("cuda", torch.cuda.current_device())
@@ -302,6 +314,28 @@ class TPActivationGather:
             t.zero_()
         ms.shmem_barrier_all()
 
+        # Pull needs the *source* rows to be readable by peers, which push does
+        # not: under push a rank reads only its own quantized tensor. So the
+        # quantized rows have to live in a symmetric buffer of their own, and the
+        # producer of those rows has to write them there directly -- staging them
+        # with a copy afterwards would put two extra launches on the critical
+        # path and defeat the point of fusing. Hence tx_*: allocated here (a
+        # collective call, so it cannot be deferred to the first forward) and
+        # handed to the caller through tx_views().
+        if self.enable_pull:
+            self.tx_x = ms.mori_shmem_create_tensor(
+                (self.slots, self.mtpr, self.row_bytes), torch.uint8
+            )
+            self.tx_scale = ms.mori_shmem_create_tensor(
+                (self.slots, self.mtpr, self.scale_bytes), torch.uint8
+            )
+            for t in (self.tx_x, self.tx_scale):
+                t.zero_()
+            ms.shmem_barrier_all()
+        else:
+            self.tx_x = None
+            self.tx_scale = None
+
         self.p2p_rx_x = _p2p_table(self.rx_x, self.tp_rank, self.tp_size, dev)
         self.p2p_rx_scale = _p2p_table(self.rx_scale, self.tp_rank, self.tp_size, dev)
         self.p2p_payload_ready = _p2p_table(
@@ -310,6 +344,14 @@ class TPActivationGather:
         self.p2p_launch_ready = _p2p_table(
             self.launch_ready, self.tp_rank, self.tp_size, dev
         )
+        if self.enable_pull:
+            self.p2p_tx_x = _p2p_table(self.tx_x, self.tp_rank, self.tp_size, dev)
+            self.p2p_tx_scale = _p2p_table(
+                self.tx_scale, self.tp_rank, self.tp_size, dev
+            )
+        else:
+            self.p2p_tx_x = None
+            self.p2p_tx_scale = None
 
         # Round counter kept on the host: parity is deterministic (every rank
         # calls the same number of times), so deriving it here avoids a
@@ -331,7 +373,56 @@ class TPActivationGather:
             return self.rows * self.row_bytes
         if kind == "scale":
             return self.rows * self.scale_bytes
+        if kind == "tx_x":
+            return self.mtpr * self.row_bytes
+        if kind == "tx_scale":
+            return self.mtpr * self.scale_bytes
         raise ValueError(kind)
+
+    def tx_views(self, m_local, parity):
+        """Destination views the caller should quantize into for a pull round.
+
+        Returns ``(x_q, x_scale)`` aliasing this rank's symmetric source slab, so
+        the quantize kernel writes where the peers will read. The activation view
+        carries float8_e4m3fn to match what a plain per_1x32_mx_quant would
+        return; the scale view stays uint8, as it already is everywhere else.
+        """
+        if not self.enable_pull:
+            raise RuntimeError("tx_views() needs enable_pull=True")
+        m = int(m_local)
+        if not (0 < m <= self.mtpr):
+            raise ValueError(f"m_local={m} outside 1..{self.mtpr}")
+        x = self.tx_x[parity, :m].view(torch.float8_e4m3fn)
+        scale = self.tx_scale[parity, :m]
+        return x, scale
+
+    def is_tx_view(self, t, m_local, parity, kind):
+        """True if ``t`` already aliases the tx slab, i.e. no staging copy is due."""
+        if not self.enable_pull:
+            return False
+        base = self.tx_x if kind == "x" else self.tx_scale
+        return (
+            t.data_ptr() == base[parity].data_ptr()
+            and t.shape[0] == int(m_local)
+            and t.is_contiguous()
+        )
+
+    def stage_source(self, x_q, x_scale, parity):
+        """Make sure this round's rows are in the symmetric slab peers will read.
+
+        A caller that quantized into tx_views() already satisfies this and pays
+        nothing. Callers that hand in an ordinary tensor (the tests and the bench
+        do) get a copy, which is correct but costs two extra launches -- it is
+        not the shape the production path should take.
+        """
+        m_local = int(x_q.shape[0])
+        if self.is_tx_view(x_q, m_local, parity, "x") and self.is_tx_view(
+            x_scale, m_local, parity, "scale"
+        ):
+            return
+        dst_x, dst_scale = self.tx_views(m_local, parity)
+        dst_x.view(torch.uint8).copy_(x_q.view(torch.uint8))
+        dst_scale.copy_(x_scale.view(torch.uint8))
 
     def _validate(self, x_q, x_scale):
         m_local = int(x_q.shape[0])

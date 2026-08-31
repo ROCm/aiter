@@ -134,6 +134,7 @@
 
 ## 9. 相关文档
 
+- 后续：`docs/superpowers/specs/2026-08-31-tp-moe-pull-direction.md`。把跨卡搬运改成接收端触发，删掉了整套 `payload_ready` 协议；m_local=256 上快约 5%，最小尺寸小亏，中间尺寸噪声太大说不清。第 7 节第一条（查融合为什么比两次 launch 慢）仍然没做。
 - 设计：`docs/superpowers/specs/2026-08-26-tp-moe-stage1-fused-p2p-design.md`（第 3 节与第 8 节已用实测数字更新）
 - 阶段一交接：`docs/superpowers/specs/2026-08-25-tp-moe-stage1-phase2-handoff.md`
 - 四份实施方案：`docs/superpowers/plans/2026-08-26-tp-moe-phase2{a,b,c,d}-*.md`。其中 2a 已作废（抽取路线被否），文件开头有说明。

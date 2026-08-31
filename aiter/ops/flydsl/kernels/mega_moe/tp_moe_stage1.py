@@ -71,6 +71,7 @@ class TPMoEStage1:
         swiglu_limit: float = 0.0,
         stage1_kernel_name: str = _DEFAULT_STAGE1_KERNEL,
         max_tok_per_rank: int | None = None,
+        pull: bool = True,
     ):
         self.group = group
         if (tp_size is None) != (tp_rank is None):
@@ -168,6 +169,7 @@ class TPMoEStage1:
             None if max_tok_per_rank is None else int(max_tok_per_rank)
         )
         self._fused = None
+        self.pull = bool(pull)
         if self.max_tok_per_rank is not None:
             from .tp_fused_stage1 import TPFusedStage1Runner
             from .tp_gather import TPActivationGather
@@ -178,9 +180,11 @@ class TPMoEStage1:
                 tp_rank=self.tp_rank,
                 max_tok_per_rank=self.max_tok_per_rank,
                 device=self.device,
+                enable_pull=self.pull,
             )
             self._fused = TPFusedStage1Runner(
                 gather=gather,
+                pull=self.pull,
                 w=self.w1,
                 w_scale=self.w1_scale,
                 model_dim=self.model_dim,
@@ -321,7 +325,7 @@ class TPMoEStage1:
         """
         m_local = self._validate_call(x_bf16, route_weights, topk_ids, torch.bfloat16)
         m_global = self.m_logical_for(m_local)
-        x_q, x_scale = self.quantize(x_bf16)
+        x_q, x_scale = self.quantize(x_bf16, m_local=m_local)
         # topk_ids and route_weights have the same shape; ship them as one int32
         # buffer so the metadata costs one collective instead of two.
         meta = torch.empty(
@@ -348,8 +352,21 @@ class TPMoEStage1:
             m_global,
         )
 
-    def quantize(self, x_bf16):
-        """Local per-1x32 BF16 -> FP8 E4M3 + E8M0. Same routine MegaMoEV2 uses."""
+    def quantize(self, x_bf16, m_local=None):
+        """Local per-1x32 BF16 -> FP8 E4M3 + E8M0. Same routine MegaMoEV2 uses.
+
+        Under pull the peers read this rank's rows straight out of a Mori
+        symmetric buffer, so the quantize kernel writes there directly. Staging
+        the rows with a copy afterwards would be correct but would add two
+        launches to the critical path, which is precisely the cost fusing exists
+        to remove.
+        """
+        if self.pull and self._fused is not None and m_local is not None:
+            g = self._fused.gather
+            dst_x, dst_scale = g.tx_views(m_local, g.current_parity())
+            return per_1x32_mx_quant(
+                x_bf16, quant_mode="fp8", out=dst_x, scale_out=dst_scale
+            )
         return per_1x32_mx_quant(x_bf16, quant_mode="fp8")
 
     __call__ = forward

@@ -172,7 +172,11 @@ def _stages_fused(op, x, wts, ids):
     s = {}
 
     def quantize():
-        s["x_q"], s["x_scale"] = op.quantize(x)
+        # m_local is what tells the operator to quantize straight into the
+        # symmetric source slab under pull. Dropping it here would leave the
+        # rows in an ordinary tensor and push a staging copy into the fused
+        # stage, which is not what forward() does.
+        s["x_q"], s["x_scale"] = op.quantize(x, m_local=m_local)
 
     def metadata():
         meta = torch.empty((m_local, 2 * op.topk), dtype=torch.int32, device=op.device)
@@ -418,14 +422,24 @@ def _run(args, rank, world, device):
     ref = TPMoEStage1NCCLRef(**common)
     # The symmetric receive buffers are a collective allocation sized once, so
     # they must cover the largest size in the sweep.
-    fused = TPMoEStage1(max_tok_per_rank=max(sizes), **common)
+    # Two production operators that differ in exactly one compile-time flag:
+    # which side triggers the cross-rank movement. Same GEMM1, same tile config,
+    # same bytes to the same offsets -- only the direction differs. Both
+    # constructors allocate symmetric memory, so the order matters and must be
+    # the same on every rank.
+    fused = TPMoEStage1(max_tok_per_rank=max(sizes), pull=True, **common)
+    fused_push = TPMoEStage1(max_tok_per_rank=max(sizes), pull=False, **common)
 
     # Arm A of the controlled comparison needs its own symmetric buffers and its
     # own launch-ticket counter (see _ctrl_arm_a). This is a collective
     # allocation: constructed once here, with identical arguments on every rank.
     from aiter.ops.flydsl.kernels.mega_moe.tp_gather import TPActivationGather
 
-    runner = fused._fused
+    # The controlled two-launch-vs-one-launch comparison is a push-side result
+    # and stays that way, so it remains comparable with the numbers already
+    # recorded in the phase-2 conclusion. Pull is compared against push
+    # separately, through the two full-forward arms.
+    runner = fused_push._fused
     gather_a = TPActivationGather(
         model_dim=model_dim,
         tp_size=runner.gather.tp_size,
@@ -491,8 +505,11 @@ def _run(args, rank, world, device):
         f = _median_stages(
             lambda: _stages_fused(fused, x, wts, ids), args.iters, args.warmup
         )
-        merged = _max_across_ranks(b + p + f, device)
-        b, p, f = merged[:8], merged[8:16], merged[16:]
+        fp = _median_stages(
+            lambda: _stages_fused(fused_push, x, wts, ids), args.iters, args.warmup
+        )
+        merged = _max_across_ranks(b + p + f + fp, device)
+        b, p, f, fp = merged[:8], merged[8:16], merged[16:24], merged[24:]
 
         # ---- controlled arm: same GEMM1, two launches vs one ---------------
         x_q_c, x_scale_c = fused.quantize(x)
@@ -578,12 +595,27 @@ def _run(args, rank, world, device):
             f"  {'TOTAL':<16}{tot_b:>12.4f}{sum(b[4:]):>12.4f}"
             f"{tot_p:>12.4f}{sum(p[4:]):>12.4f}"
         )
-        print("  fused path")
-        print(f"  {'stage':<16}{'dev':>12}{'host':>12}")
+        print("  fused path (pull vs push: identical apart from which side")
+        print("  triggers the transfer)")
+        print(
+            f"  {'stage':<16}{'pull dev':>12}{'pull host':>12}"
+            f"{'push dev':>12}{'push host':>12}"
+        )
         fused_names = ["local quantize", "metadata coll", "moe_sorting", "fused kernel"]
         for i, name in enumerate(fused_names):
-            print(f"  {name:<16}{f[i]:>12.4f}{f[i + 4]:>12.4f}")
-        print(f"  {'TOTAL':<16}{tot_f:>12.4f}{sum(f[4:]):>12.4f}")
+            print(
+                f"  {name:<16}{f[i]:>12.4f}{f[i + 4]:>12.4f}"
+                f"{fp[i]:>12.4f}{fp[i + 4]:>12.4f}"
+            )
+        tot_fp = sum(fp[:4])
+        print(
+            f"  {'TOTAL':<16}{tot_f:>12.4f}{sum(f[4:]):>12.4f}"
+            f"{tot_fp:>12.4f}{sum(fp[4:]):>12.4f}"
+        )
+        print(
+            f"  kernel only: pull {f[3] * 1e3:.1f}us  push {fp[3] * 1e3:.1f}us  "
+            f"delta {(f[3] - fp[3]) * 1e3:+.1f}us"
+        )
         print(
             f"  speedup vs bf16 reference: {tot_b / tot_f:.3f}x "
             f"({100 * (tot_b - tot_f) / tot_b:+.1f}% time)"

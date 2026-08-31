@@ -132,20 +132,49 @@ def _get_launcher(n: int, quant_mode: str):
     return launcher
 
 
-def per_1x32_mx_quant(x, quant_mode="fp4", stream=None):
-    """Quantize BF16 rows to MXFP4 or MXFP8 payloads with E8M0 scales."""
+def _dest_or_empty(dest, shape, dtype, device, name):
+    """Return ``dest`` reinterpreted as ``dtype``, or a fresh tensor if it is None.
+
+    The destination is allowed to carry any dtype of the same element size --
+    callers hand us uint8 slices of a byte-typed symmetric buffer -- so this
+    checks shape, element size, contiguity and device, then re-views.
+    """
+    if dest is None:
+        return torch.empty(shape, dtype=dtype, device=device)
+    if tuple(dest.shape) != tuple(shape):
+        raise ValueError(f"{name} must have shape {tuple(shape)}, got {tuple(dest.shape)}")
+    if dest.element_size() != torch.empty(0, dtype=dtype).element_size():
+        raise ValueError(f"{name} dtype {dest.dtype} is not byte-compatible with {dtype}")
+    if not dest.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+    if dest.device != device:
+        raise ValueError(f"{name} is on {dest.device}, expected {device}")
+    return dest if dest.dtype == dtype else dest.view(dtype)
+
+
+def per_1x32_mx_quant(x, quant_mode="fp4", stream=None, out=None, scale_out=None):
+    """Quantize BF16 rows to MXFP4 or MXFP8 payloads with E8M0 scales.
+
+    ``out`` / ``scale_out`` let the caller name the destination instead of
+    receiving a fresh allocation. TP stage1 uses this to land the quantized rows
+    directly in a Mori symmetric buffer, which is what makes the peers' pull
+    readable; copying into that buffer afterwards would cost two extra launches
+    on the critical path. Both are optional and independent, and omitting them
+    reproduces the original behaviour exactly.
+    """
     assert x.dtype == torch.bfloat16, f"x must be bf16, got {x.dtype}"
     x = x.contiguous()
     m, n = x.shape
     assert n % GROUP == 0, f"n={n} must be divisible by {GROUP}"
     scale_n = n // GROUP
     if quant_mode == "fp4":
-        y = torch.empty((m, n // 2), dtype=torch.uint8, device=x.device)
+        y_shape, y_dtype = (m, n // 2), torch.uint8
     elif quant_mode == "fp8":
-        y = torch.empty((m, n), dtype=torch.float8_e4m3fn, device=x.device)
+        y_shape, y_dtype = (m, n), torch.float8_e4m3fn
     else:
         raise ValueError(f"quant_mode must be fp4|fp8, got {quant_mode!r}")
-    scale = torch.empty((m, scale_n), dtype=torch.uint8, device=x.device)
+    y = _dest_or_empty(out, y_shape, y_dtype, x.device, "out")
+    scale = _dest_or_empty(scale_out, (m, scale_n), torch.uint8, x.device, "scale_out")
     grid_blocks = (m * scale_n + BLOCK - 1) // BLOCK
     fx_stream = fx.Stream(
         stream if stream is not None else torch.cuda.current_stream().cuda_stream

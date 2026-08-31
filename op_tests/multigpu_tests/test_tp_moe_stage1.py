@@ -740,17 +740,238 @@ def _assert_ctor_signatures_mirror():
     mirrored by the copy; without this the test never passes the new argument to
     either side and the divergence goes unnoticed.
 
-    ``max_tok_per_rank`` is the one legitimate asymmetry: it sizes the fused
-    path's symmetric receive buffers, which the phase-1 copy deliberately does
-    not have. Assert it really is present on production before excluding it, so
-    that a stale exclusion set cannot make the comparison pass vacuously.
+    Two keywords are legitimate asymmetries, both because they only describe the
+    fused path's symmetric buffers, which the phase-1 copy deliberately does not
+    have: ``max_tok_per_rank`` sizes them, and ``pull`` selects which direction
+    the staging CTAs move bytes through them. Assert they really are present on
+    production before excluding them, so that a stale exclusion set cannot make
+    the comparison pass vacuously.
     """
     p_prod = list(inspect.signature(TPMoEStage1.__init__).parameters)
     p_ref = list(inspect.signature(TPMoEStage1NCCLRef.__init__).parameters)
-    _FUSED_ONLY = {"max_tok_per_rank"}
+    _FUSED_ONLY = {"max_tok_per_rank", "pull"}
     assert _FUSED_ONLY <= set(p_prod), (_FUSED_ONLY, p_prod)
     assert not (_FUSED_ONLY & set(p_ref)), (_FUSED_ONLY, p_ref)
     assert [p for p in p_prod if p not in _FUSED_ONLY] == p_ref, (p_prod, p_ref)
+
+
+def _routed_rows(out):
+    """Row indices of ``out``'s payload that stage1 actually wrote.
+
+    Everything else is PAD: the fused kernel never stores those rows, so they
+    hold whatever the allocation happened to contain. Comparing them would
+    compare two unrelated pieces of leftover memory.
+    """
+    nvalid = int(out.num_valid_ids[0].item())
+    tok = (out.sorted_token_ids[:nvalid] & 0x00FFFFFF).long()
+    return torch.nonzero(tok < out.m_logical, as_tuple=True)[0]
+
+
+def case_pull_vs_push():
+    """Pulling and pushing must produce bit-identical stage1 output.
+
+    Both directions stage the same rows to the same offsets of the same receive
+    slab, and the GEMM half downstream is the same ``do_tile`` over the same
+    static tile split. Nothing in the arithmetic differs, so the bar here is
+    bitwise equality, not a tolerance -- a tolerance would hide exactly the kind
+    of off-by-one destination bug this is meant to catch.
+
+    Negative control (run by hand, documented in the phase-2 spec): change the
+    pull destination in tp_fused_stage1.py from ``source * m_local + row`` to a
+    row-major ``row * npes + source`` and this case must fail. The test file sets
+    FLYDSL_EXTRA_SOURCE_DIRS at the top so that edit actually invalidates the
+    FlyDSL disk cache; without it the stale binary comes back and the control
+    passes vacuously.
+    """
+    import mori.shmem as ms
+
+    rank, world, device = _setup_dist()
+    import torch._C._distributed_c10d as c10d
+
+    c10d._register_process_group("default", dist.group.WORLD)
+    ms.shmem_torch_process_group_init("default")
+    try:
+        model_dim = NETWORK["model_dim"]
+        experts, topk = NETWORK["experts"], NETWORK["topk"]
+        inter_dim, limit = 384, NETWORK["swiglu_limit"]
+        _, _, w1_shuf, w1_scale_shuf = build_mxfp4_w1(
+            experts, inter_dim, model_dim, device, seed=4242
+        )
+        common = dict(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            w1=w1_shuf,
+            w1_scale=w1_scale_shuf,
+            device=device,
+            swiglu_limit=limit,
+            stage1_kernel_name=STAGE1_KERNEL,
+            max_tok_per_rank=MAX_TOK_PER_RANK,
+        )
+        # Both constructors allocate symmetric memory, which is collective, so
+        # every rank has to build them in this order.
+        pull_op = TPMoEStage1(pull=True, **common)
+        push_op = TPMoEStage1(pull=False, **common)
+
+        for m_local in (1, 8, 64, 128):
+            g = torch.Generator(device="cpu").manual_seed(3300 + rank * 17 + m_local)
+            x = torch.randn((m_local, model_dim), generator=g).to(
+                device=device, dtype=torch.bfloat16
+            ) * (model_dim**-0.25)
+            ids, wts = _random_routes(m_local, experts, topk, device, seed=97 + rank)
+
+            a = pull_op.forward(x, wts, ids)
+            b = push_op.forward(x, wts, ids)
+            torch.cuda.synchronize()
+
+            assert torch.equal(a.num_valid_ids, b.num_valid_ids)
+            rows = _routed_rows(a)
+            assert int(rows.numel()) == a.m_logical * topk, (
+                int(rows.numel()),
+                a.m_logical * topk,
+            )
+            qa = a.inter_sorted_quant[rows].view(torch.uint8)
+            qb = b.inter_sorted_quant[rows].view(torch.uint8)
+            if not torch.equal(qa, qb):
+                bad = int((qa != qb).sum())
+                raise AssertionError(
+                    f"payload differs at m_local={m_local}: {bad} of {qa.numel()} bytes"
+                )
+            sa = a.inter_sorted_shuffled_scale[rows]
+            sb = b.inter_sorted_shuffled_scale[rows]
+            if not torch.equal(sa, sb):
+                bad = int((sa != sb).sum())
+                raise AssertionError(
+                    f"scale differs at m_local={m_local}: {bad} of {sa.numel()} bytes"
+                )
+        if rank == 0:
+            print("case_pull_vs_push OK (bitwise, m_local 1/8/64/128)")
+    finally:
+        try:
+            ms.shmem_finalize()
+        finally:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+
+
+def case_pull_skew():
+    """A slow rank must not let a fast rank read half-written source rows.
+
+    Pull has no data-ready flag of its own. It leans entirely on
+    emit_launch_rendezvous: seeing a peer's launch epoch means that peer entered
+    this round, and on one stream that means its quantize kernel -- the thing
+    that fills the source slab -- already retired. This case is what makes that
+    claim testable. Rank 0 sleeps before each round so the ranks enter the kernel
+    far apart, which is exactly the window a missing handshake would open.
+
+    The oracle is the push path run in lockstep, not the NCCL reference.
+    case_pull_vs_push already establishes that the two directions agree bit for
+    bit when nothing is skewed, so any difference here is attributable to the
+    skew. Using the NCCL reference instead would import an unrelated one-ULP
+    disagreement: on the round-5 input below, both fused directions return 86
+    where the reference returns 85 at one element out of 1179648. That predates
+    this work -- push reproduces it byte for byte -- and is recorded in the
+    phase-2 spec rather than papered over here.
+
+    Everything collective is precomputed UP FRONT. A collective inside the loop
+    is a full 8-rank barrier and would erase the skew the sleep just created;
+    that mistake silently disarmed the equivalent push test until it was found,
+    so the loop below calls only local kernels and the fused kernel itself.
+
+    Negative control (run by hand): comment out the emit_launch_rendezvous call
+    in tp_fused_stage1.py and this case must fail.
+    """
+    import time
+
+    import mori.shmem as ms
+
+    rank, world, device = _setup_dist()
+    import torch._C._distributed_c10d as c10d
+
+    c10d._register_process_group("default", dist.group.WORLD)
+    ms.shmem_torch_process_group_init("default")
+    try:
+        model_dim = NETWORK["model_dim"]
+        experts, topk = NETWORK["experts"], NETWORK["topk"]
+        inter_dim, limit = 384, NETWORK["swiglu_limit"]
+        _, _, w1_shuf, w1_scale_shuf = build_mxfp4_w1(
+            experts, inter_dim, model_dim, device, seed=5150
+        )
+        common = dict(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            w1=w1_shuf,
+            w1_scale=w1_scale_shuf,
+            device=device,
+            swiglu_limit=limit,
+            stage1_kernel_name=STAGE1_KERNEL,
+        )
+        pull_op = TPMoEStage1(max_tok_per_rank=MAX_TOK_PER_RANK, pull=True, **common)
+        push_op = TPMoEStage1(max_tok_per_rank=MAX_TOK_PER_RANK, pull=False, **common)
+        ref = TPMoEStage1NCCLRef(**common)
+
+        iters, m_local = 6, 64
+        rounds = []
+        for it in range(iters):
+            g = torch.Generator(device="cpu").manual_seed(8800 + rank * 13 + it)
+            x = torch.randn((m_local, model_dim), generator=g).to(
+                device=device, dtype=torch.bfloat16
+            ) * (model_dim**-0.25)
+            ids, wts = _random_routes(m_local, experts, topk, device, seed=53 + rank)
+            # The NCCL reference is here only to produce the sorted metadata; its
+            # payload is not the oracle.
+            meta = ref.forward(x, wts, ids)
+            xq, xs = push_op.quantize(x)
+            want, _ = push_op._run_fused(
+                xq,
+                xs,
+                meta.sorted_token_ids,
+                meta.sorted_expert_ids,
+                meta.num_valid_ids,
+                m_local,
+            )
+            rounds.append(
+                dict(
+                    x=x,
+                    meta=meta,
+                    rows=_routed_rows(meta),
+                    want=want.view(torch.uint8).clone(),
+                )
+            )
+        dist.barrier()
+        torch.cuda.synchronize()
+
+        # No collectives past this point, so the sleep really does skew the ranks.
+        for it in range(iters):
+            if rank == 0:
+                time.sleep(0.05)
+            r = rounds[it]
+            meta = r["meta"]
+            x_q, x_scale = pull_op.quantize(r["x"], m_local=m_local)
+            payload, _ = pull_op._run_fused(
+                x_q,
+                x_scale,
+                meta.sorted_token_ids,
+                meta.sorted_expert_ids,
+                meta.num_valid_ids,
+                m_local,
+            )
+            torch.cuda.synchronize()
+            got = payload.view(torch.uint8)[r["rows"]]
+            want = r["want"][r["rows"]]
+            bad = int((got != want).sum())
+            assert bad == 0, f"round {it}: {bad} of {got.numel()} payload bytes differ"
+        if rank == 0:
+            print(f"case_pull_skew OK ({iters} skewed rounds, m_local={m_local})")
+    finally:
+        try:
+            ms.shmem_finalize()
+        finally:
+            if dist.is_initialized():
+                dist.destroy_process_group()
 
 
 def case_ref_fidelity():
@@ -992,6 +1213,8 @@ CASES = {
     "exports": case_exports,
     "ref_fidelity": case_ref_fidelity,
     "fused_numerics": case_fused_numerics,
+    "pull_vs_push": case_pull_vs_push,
+    "pull_skew": case_pull_skew,
 }
 
 

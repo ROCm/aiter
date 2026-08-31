@@ -9,8 +9,28 @@ This is an assembly of two halves that were each verified on their own:
 * the persistent GEMM1 tile loop from ``tp_gemm1.py``, proven bit-identical to
   the original contiguous loaders fed host-permuted data.
 
+The staging half runs in one of two directions, chosen at compile time by
+``pull``:
+
+* ``pull=True`` (default) -- each staging CTA owns a SOURCE rank and reads that
+  rank's rows out of its symmetric ``tx`` slab into our own receive slab. Nobody
+  writes into anybody else's memory. That removes the ``payload_ready`` protocol
+  entirely: ``emit_launch_rendezvous`` already proves every peer entered this
+  round, and on a single stream that implies the peer's quantize kernel retired,
+  which is exactly the readiness condition. What remains is a device-local
+  counter so the GEMM half does not start before this rank's own staging CTAs
+  finish. The price is that the quantized rows must live in a Mori symmetric
+  buffer -- see ``TPActivationGather.tx_views``.
+* ``pull=False`` -- the original push: each staging CTA owns a DESTINATION rank
+  and writes our rows into that peer's receive slab, then the last one bumps
+  every peer's ``payload_ready``.
+
+Both directions move the same bytes to the same offsets, so the GEMM half sees a
+byte-identical A operand and the two are a controlled A/B of nothing but the
+trigger side.
+
 The grid is the GEMM's (``num_cu * grid_mult``); the launch ticket taken by
-``emit_ticket_and_roles`` decides which CTA owns the round and which ones push.
+``emit_ticket_and_roles`` decides which CTA owns the round and which ones stage.
 Every CTA then waits once for all source ranks and runs its share of the tile
 loop. The wait is per CTA, not per tile: under TP every tile's ``sort_block_m``
 rows are scattered over all source ranks, so no tile can start early and
@@ -84,8 +104,9 @@ _EPOCH_SLOT = 0
 @functools.cache
 def compile_tp_fused_stage1(
     *,
-    # push half (tp_gather.py)
+    # staging half (tp_gather.py)
     model_dim: int, npes: int, rank: int, producer_blocks: int = 32, slots: int = 2,
+    pull: bool = True,
     # GEMM half (tp_gemm1.py)
     inter_dim: int, experts: int, total_rows: int, sort_block_m: int = 32,
     tile_n: int = 256, tile_k: int = 256, num_waves: int = 4, num_cu: int = 256,
@@ -107,6 +128,7 @@ def compile_tp_fused_stage1(
     assert model_dim % 512 == 0, "copy_row needs 16-byte granularity on both rows"
     assert producer_blocks % npes == 0
     assert 0 <= rank < npes
+    assert not (pull and slots != 2), "pull needs double buffering; see TPActivationGather"
 
     NUM_WAVES = num_waves
     TOTAL_THREADS = NUM_WAVES * 64
@@ -117,14 +139,17 @@ def compile_tp_fused_stage1(
         f"producer_blocks={producer_blocks} + 1 exceeds grid {GRID_X}"
     )
 
-    # --- push half ---------------------------------------------------------
+    # --- staging half ------------------------------------------------------
     ROW_BYTES = model_dim
     SCALE_BYTES = model_dim // 32
     ROW_I32 = ROW_BYTES // 4
     SCALE_I32 = SCALE_BYTES // 4
     ROW_SAFE_END = (ROW_I32 // 512) * 512
     SCALE_SAFE_END = (SCALE_I32 // 512) * 512
-    BLOCKS_PER_DEST = producer_blocks // npes
+    # Staging CTAs are partitioned by peer: under push a group writes to one
+    # destination rank, under pull it reads from one source rank. Same count,
+    # same split, opposite direction.
+    BLOCKS_PER_PEER = producer_blocks // npes
 
     # --- GEMM half ---------------------------------------------------------
     n_per_wave = tile_n // NUM_WAVES
@@ -147,7 +172,8 @@ def compile_tp_fused_stage1(
         A_scale: fx.Array[fx.Int8, n_scale_bytes, 16]
 
     kernel_name = (
-        f"tp_fused_stage1_d{model_dim}_i{inter_dim}_n{npes}_pb{producer_blocks}"
+        f"tp_fused_stage1_{'pull' if pull else 'push'}"
+        f"_d{model_dim}_i{inter_dim}_n{npes}_pb{producer_blocks}"
         f"_t{sort_block_m}x{tile_n}x{tile_k}_w{NUM_WAVES}_g{GRID_X}"
     )
 
@@ -163,11 +189,17 @@ def compile_tp_fused_stage1(
         # plan
         tile_row_base: fx.Tensor, expert_ids: fx.Tensor,
         sorted_token_ids: fx.Tensor, num_valid_ids: fx.Tensor,
-        # this rank's locally quantized input, pushed to every peer
+        # push only: this rank's locally quantized input, pushed to every peer
         addr_x_q: fx.Int64, addr_x_scale: fx.Int64,
-        # p2p pointer tables (i64[npes] each)
+        # push only: p2p tables of every peer's receive slab
         addr_p2p_rx_x: fx.Int64, addr_p2p_rx_scale: fx.Int64,
-        addr_p2p_payload_ready: fx.Int64, addr_p2p_launch_ready: fx.Int64,
+        addr_p2p_payload_ready: fx.Int64,
+        # pull only: p2p tables of every peer's source slab, and this rank's
+        # own receive slab for the parity in play (the pull destination)
+        addr_p2p_tx_x: fx.Int64, addr_p2p_tx_scale: fx.Int64,
+        addr_rx_x: fx.Int64, addr_rx_scale: fx.Int64,
+        # both modes
+        addr_p2p_launch_ready: fx.Int64,
         # local flags / counters
         addr_payload_ready: fx.Int64, addr_launch_ready: fx.Int64,
         addr_epoch_gate: fx.Int64, addr_entry_count: fx.Int64, addr_reset: fx.Int64,
@@ -175,6 +207,7 @@ def compile_tp_fused_stage1(
         m_local: fx.Int32, parity: fx.Int32, expected: fx.Int32,
         launch_epoch: fx.Int32, tokens: fx.Int32,
         x_slab_bytes: fx.Int32, scale_slab_bytes: fx.Int32,
+        tx_slab_bytes: fx.Int32, tx_scale_slab_bytes: fx.Int32,
     ):
         # fmt: on
         tid = fx.thread_idx.x
@@ -196,57 +229,110 @@ def compile_tp_fused_stage1(
             reset_count=_RESET_COUNTERS, gate_addr=gate_addr, gate_epoch=gate_epoch,
             launch_epoch=launch_epoch, npes=npes, rank=rank)
 
-        # ---- push this rank's rows into every peer's receive buffer --------
+        # ---- stage all m_global rows into this rank's receive slab ---------
         if const_expr(slots == 1):
             slab = fx.Int32(0)
         else:
             slab = parity
         x_base_off = fx.Int64(slab) * fx.Int64(x_slab_bytes)
         s_base_off = fx.Int64(slab) * fx.Int64(scale_slab_bytes)
+        tx_base_off = fx.Int64(slab) * fx.Int64(tx_slab_bytes)
+        ts_base_off = fx.Int64(slab) * fx.Int64(tx_scale_slab_bytes)
 
-        if is_producer:
-            destination = producer_slot // fx.Int32(BLOCKS_PER_DEST)
-            sub = producer_slot - destination * fx.Int32(BLOCKS_PER_DEST)
-            rx_table = _make_buffer_from_addr(addr_p2p_rx_x, fx.Int64)
-            sc_table = _make_buffer_from_addr(addr_p2p_rx_scale, fx.Int64)
-            peer_x = _buffer_load(rx_table, destination, fx.Int64) + x_base_off
-            peer_s = _buffer_load(sc_table, destination, fx.Int64) + s_base_off
-            dest_base = fx.Int32(rank) * m_local
-            row0 = sub + warp * fx.Int32(BLOCKS_PER_DEST)
-            row_stride = fx.Int32(BLOCKS_PER_DEST * num_waves)
-            for row in range(row0, m_local, row_stride):
-                dest_row = dest_base + row
-                # fmt: off
-                copy_row(
-                    buffer_ops.create_buffer_resource_from_addr(addr_x_q + fx.Int64(row) * fx.Int64(ROW_BYTES)),
-                    buffer_ops.create_buffer_resource_from_addr(peer_x + fx.Int64(dest_row) * fx.Int64(ROW_BYTES)),
-                    lane, safe_end_i32=ROW_SAFE_END, n_i32=ROW_I32)
-                copy_row(
-                    buffer_ops.create_buffer_resource_from_addr(addr_x_scale + fx.Int64(row) * fx.Int64(SCALE_BYTES)),
-                    buffer_ops.create_buffer_resource_from_addr(peer_s + fx.Int64(dest_row) * fx.Int64(SCALE_BYTES)),
-                    lane, safe_end_i32=SCALE_SAFE_END, n_i32=SCALE_I32)
-                # fmt: on
-            fx.rocdl.s_waitcnt(0)
-            fx.barrier()
-            # Last producer block on this rank publishes once to every peer, so
-            # payload_ready advances by exactly npes per launch -- the step the
-            # host's _expected_for() assumes.
+        if const_expr(pull):
+            # Pull: each staging CTA owns one SOURCE rank and copies that rank's
+            # rows out of its symmetric tx slab into our own receive slab. The
+            # rows land at exactly the same offsets push would have written, so
+            # the GEMM half sees a byte-identical A operand either way.
+            #
+            # No readiness flag is needed for the data. emit_launch_rendezvous
+            # above already proved every peer entered this round, and on a single
+            # stream that implies the peer's quantize kernel -- which writes tx --
+            # retired. Its fence_system_release before publishing the epoch wrote
+            # that data back out of the peer's L2, so the acquire below is enough
+            # to see it. That is the whole reason pull can drop payload_ready and
+            # the npes system atomics that maintained it.
+            if is_producer:
+                comm_ops.fence_system_acquire()
+                source = producer_slot // fx.Int32(BLOCKS_PER_PEER)
+                sub = producer_slot - source * fx.Int32(BLOCKS_PER_PEER)
+                tx_table = _make_buffer_from_addr(addr_p2p_tx_x, fx.Int64)
+                ts_table = _make_buffer_from_addr(addr_p2p_tx_scale, fx.Int64)
+                peer_x = _buffer_load(tx_table, source, fx.Int64) + tx_base_off
+                peer_s = _buffer_load(ts_table, source, fx.Int64) + ts_base_off
+                dest_base = source * m_local
+                row0 = sub + warp * fx.Int32(BLOCKS_PER_PEER)
+                row_stride = fx.Int32(BLOCKS_PER_PEER * num_waves)
+                for row in range(row0, m_local, row_stride):
+                    dest_row = dest_base + row
+                    # fmt: off
+                    copy_row(
+                        buffer_ops.create_buffer_resource_from_addr(peer_x + fx.Int64(row) * fx.Int64(ROW_BYTES)),
+                        buffer_ops.create_buffer_resource_from_addr(addr_rx_x + fx.Int64(dest_row) * fx.Int64(ROW_BYTES)),
+                        lane, safe_end_i32=ROW_SAFE_END, n_i32=ROW_I32)
+                    copy_row(
+                        buffer_ops.create_buffer_resource_from_addr(peer_s + fx.Int64(row) * fx.Int64(SCALE_BYTES)),
+                        buffer_ops.create_buffer_resource_from_addr(addr_rx_scale + fx.Int64(dest_row) * fx.Int64(SCALE_BYTES)),
+                        lane, safe_end_i32=SCALE_SAFE_END, n_i32=SCALE_I32)
+                    # fmt: on
+                fx.rocdl.s_waitcnt(0)
+                fx.barrier()
+                if tid == fx.Int32(0):
+                    comm_ops.fence_agent_release()
+                    comm_ops.atomic_add_agent(addr_reset, fx.Int32(1))
+
+            # Every CTA waits for this rank's staging to finish. The writers are
+            # all on this device now, so the counter and the fence are agent
+            # scope; push has to use system scope because its writers are remote.
             if tid == fx.Int32(0):
-                comm_ops.fence_system_release()
-                done = fx.Int32(comm_ops.atomic_add_agent(addr_reset, fx.Int32(1)))
-                if done == fx.Int32(producer_blocks - 1):
-                    pr_table = _make_buffer_from_addr(addr_p2p_payload_ready, fx.Int64)
-                    for pe in range_constexpr(npes):
-                        remote = _buffer_load(pr_table, fx.Int32(pe), fx.Int64)
-                        comm_ops.atomic_add_system(
-                            remote + fx.Int64(parity) * fx.Int64(4), fx.Int32(1))
+                mori_shmem.int32_wait_until_equals(
+                    addr_reset, fx.Int32(producer_blocks))
+                comm_ops.fence_agent_acquire()
+            fx.barrier()
+        else:
+            if is_producer:
+                destination = producer_slot // fx.Int32(BLOCKS_PER_PEER)
+                sub = producer_slot - destination * fx.Int32(BLOCKS_PER_PEER)
+                rx_table = _make_buffer_from_addr(addr_p2p_rx_x, fx.Int64)
+                sc_table = _make_buffer_from_addr(addr_p2p_rx_scale, fx.Int64)
+                peer_x = _buffer_load(rx_table, destination, fx.Int64) + x_base_off
+                peer_s = _buffer_load(sc_table, destination, fx.Int64) + s_base_off
+                dest_base = fx.Int32(rank) * m_local
+                row0 = sub + warp * fx.Int32(BLOCKS_PER_PEER)
+                row_stride = fx.Int32(BLOCKS_PER_PEER * num_waves)
+                for row in range(row0, m_local, row_stride):
+                    dest_row = dest_base + row
+                    # fmt: off
+                    copy_row(
+                        buffer_ops.create_buffer_resource_from_addr(addr_x_q + fx.Int64(row) * fx.Int64(ROW_BYTES)),
+                        buffer_ops.create_buffer_resource_from_addr(peer_x + fx.Int64(dest_row) * fx.Int64(ROW_BYTES)),
+                        lane, safe_end_i32=ROW_SAFE_END, n_i32=ROW_I32)
+                    copy_row(
+                        buffer_ops.create_buffer_resource_from_addr(addr_x_scale + fx.Int64(row) * fx.Int64(SCALE_BYTES)),
+                        buffer_ops.create_buffer_resource_from_addr(peer_s + fx.Int64(dest_row) * fx.Int64(SCALE_BYTES)),
+                        lane, safe_end_i32=SCALE_SAFE_END, n_i32=SCALE_I32)
+                    # fmt: on
+                fx.rocdl.s_waitcnt(0)
+                fx.barrier()
+                # Last producer block on this rank publishes once to every peer, so
+                # payload_ready advances by exactly npes per launch -- the step the
+                # host's _expected_for() assumes.
+                if tid == fx.Int32(0):
+                    comm_ops.fence_system_release()
+                    done = fx.Int32(comm_ops.atomic_add_agent(addr_reset, fx.Int32(1)))
+                    if done == fx.Int32(producer_blocks - 1):
+                        pr_table = _make_buffer_from_addr(addr_p2p_payload_ready, fx.Int64)
+                        for pe in range_constexpr(npes):
+                            remote = _buffer_load(pr_table, fx.Int32(pe), fx.Int64)
+                            comm_ops.atomic_add_system(
+                                remote + fx.Int64(parity) * fx.Int64(4), fx.Int32(1))
 
-        # ---- every CTA waits once for all source ranks ---------------------
-        if tid == fx.Int32(0):
-            mori_shmem.int32_wait_until_equals(
-                addr_payload_ready + fx.Int64(parity) * fx.Int64(4), expected)
-            comm_ops.fence_system_acquire()
-        fx.barrier()
+            # ---- every CTA waits once for all source ranks -----------------
+            if tid == fx.Int32(0):
+                mori_shmem.int32_wait_until_equals(
+                    addr_payload_ready + fx.Int64(parity) * fx.Int64(4), expected)
+                comm_ops.fence_system_acquire()
+            fx.barrier()
 
         # ---- GEMM1 ---------------------------------------------------------
         a_buf = lds.pool
@@ -329,24 +415,30 @@ def compile_tp_fused_stage1(
         sorted_token_ids: fx.Tensor, num_valid_ids: fx.Tensor,
         addr_x_q: fx.Int64, addr_x_scale: fx.Int64,
         addr_p2p_rx_x: fx.Int64, addr_p2p_rx_scale: fx.Int64,
-        addr_p2p_payload_ready: fx.Int64, addr_p2p_launch_ready: fx.Int64,
+        addr_p2p_payload_ready: fx.Int64,
+        addr_p2p_tx_x: fx.Int64, addr_p2p_tx_scale: fx.Int64,
+        addr_rx_x: fx.Int64, addr_rx_scale: fx.Int64,
+        addr_p2p_launch_ready: fx.Int64,
         addr_payload_ready: fx.Int64, addr_launch_ready: fx.Int64,
         addr_epoch_gate: fx.Int64, addr_entry_count: fx.Int64, addr_reset: fx.Int64,
         m_local: fx.Int32, parity: fx.Int32, expected: fx.Int32,
         launch_epoch: fx.Int32, tokens: fx.Int32,
         x_slab_bytes: fx.Int32, scale_slab_bytes: fx.Int32,
+        tx_slab_bytes: fx.Int32, tx_scale_slab_bytes: fx.Int32,
         stream: fx.Stream,
     ):
         fused_kernel(
             out, out_scale, x, scale_x, w, scale_w,
             tile_row_base, expert_ids, sorted_token_ids, num_valid_ids,
             addr_x_q, addr_x_scale,
-            addr_p2p_rx_x, addr_p2p_rx_scale,
-            addr_p2p_payload_ready, addr_p2p_launch_ready,
+            addr_p2p_rx_x, addr_p2p_rx_scale, addr_p2p_payload_ready,
+            addr_p2p_tx_x, addr_p2p_tx_scale, addr_rx_x, addr_rx_scale,
+            addr_p2p_launch_ready,
             addr_payload_ready, addr_launch_ready,
             addr_epoch_gate, addr_entry_count, addr_reset,
             m_local, parity, expected, launch_epoch, tokens,
             x_slab_bytes, scale_slab_bytes,
+            tx_slab_bytes, tx_scale_slab_bytes,
             value_attrs={
                 "rocdl.waves_per_eu": waves_per_eu_hint,
                 "rocdl.flat_work_group_size": f"{TOTAL_THREADS},{TOTAL_THREADS}",
@@ -366,8 +458,14 @@ class TPFusedStage1Runner:
     """
 
     def __init__(self, *, gather, w, w_scale, model_dim, inter_dim, experts,
-                 sort_block_m=32, swiglu_limit=0.0, **cfg):
+                 sort_block_m=32, swiglu_limit=0.0, pull=True, **cfg):
         self.gather = gather
+        if pull and not gather.enable_pull:
+            raise ValueError(
+                "pull=True needs the symmetric source slab; construct "
+                "TPActivationGather with enable_pull=True"
+            )
+        self.pull = bool(pull)
         # Weights are constant across calls; keep the uint8 views the kernel wants.
         self.w = w.view(torch.uint8)
         self.w_scale = w_scale.view(torch.uint8)
@@ -406,6 +504,7 @@ class TPFusedStage1Runner:
             rank=g.tp_rank,
             producer_blocks=g.producer_blocks,
             slots=g.slots,
+            pull=self.pull,
             inter_dim=self.inter_dim,
             experts=self.experts,
             total_rows=g.rows,
@@ -435,6 +534,17 @@ class TPFusedStage1Runner:
         if stream is None:
             stream = fx.Stream(torch.cuda.current_stream())
 
+        if self.pull:
+            # Peers read this rank's rows out of the symmetric tx slab, so they
+            # have to be there. A caller that quantized straight into
+            # gather.tx_views() pays nothing here; anything else gets copied.
+            g.stage_source(x_q, x_scale, parity)
+            addr_p2p_tx_x = fx.Int64(g.p2p_tx_x.data_ptr())
+            addr_p2p_tx_scale = fx.Int64(g.p2p_tx_scale.data_ptr())
+        else:
+            addr_p2p_tx_x = fx.Int64(0)
+            addr_p2p_tx_scale = fx.Int64(0)
+
         # fmt: off
         _run_compiled(
             launch,
@@ -445,6 +555,9 @@ class TPFusedStage1Runner:
             fx.Int64(x_q.data_ptr()), fx.Int64(x_scale.data_ptr()),
             fx.Int64(g.p2p_rx_x.data_ptr()), fx.Int64(g.p2p_rx_scale.data_ptr()),
             fx.Int64(g.p2p_payload_ready.data_ptr()),
+            addr_p2p_tx_x, addr_p2p_tx_scale,
+            fx.Int64(g.rx_x[parity].data_ptr()),
+            fx.Int64(g.rx_scale[parity].data_ptr()),
             fx.Int64(g.p2p_launch_ready.data_ptr()),
             fx.Int64(g.payload_ready.data_ptr()), fx.Int64(g.launch_ready.data_ptr()),
             fx.Int64(g.epoch_gate.data_ptr()), fx.Int64(g.entry_count.data_ptr()),
@@ -452,6 +565,8 @@ class TPFusedStage1Runner:
             fx.Int32(m_local), fx.Int32(parity), fx.Int32(expected),
             fx.Int32(launch_epoch), fx.Int32(int(max_sorted)),
             fx.Int32(g.slab_bytes("x")), fx.Int32(g.slab_bytes("scale")),
+            fx.Int32(g.slab_bytes("tx_x") if self.pull else 0),
+            fx.Int32(g.slab_bytes("tx_scale") if self.pull else 0),
             stream,
         )
         # fmt: on
