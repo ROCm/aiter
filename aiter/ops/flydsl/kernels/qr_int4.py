@@ -179,6 +179,7 @@ class QRInt4:
         self.rank = int(rank)
         self.world_size = int(world_size)
         self.super_tile = int(super_tile)
+        self._has_launched = False
         cu_count = int(
             torch.cuda.get_device_properties(self._device_index).multi_processor_count
         )
@@ -303,6 +304,9 @@ class QRInt4:
             num_tiles=num_tiles,
             grid_x=min(num_tiles, eng.grid),
         )
+        # A launch may still be using the raw HIP allocations when Python drops
+        # the communicator. Keep cleanup conservative even if launch raises.
+        self._has_launched = True
         _run_compiled(eng.launch, *args)
 
     def compile(self, inp, out, stream=None) -> None:
@@ -317,9 +321,22 @@ class QRInt4:
             self._launch_eng(eng, inp, out, stream, live_bytes=live_bytes)
 
     def close(self):
-        for eng in self._by_st.values():
+        engines = getattr(self, "_by_st", None)
+        if not engines:
+            return
+        if getattr(self, "_has_launched", False):
+            torch.cuda.synchronize(self._device_index)
+            self._has_launched = False
+        for eng in engines.values():
             eng.close()
-        self._by_st = {}
+        engines.clear()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001
+            # Destructors must not raise, especially during interpreter shutdown.
+            return
 
     def allreduce(self, inp, out, stream=None):
         """Two-shot INT4 all-reduce into ``out``.
