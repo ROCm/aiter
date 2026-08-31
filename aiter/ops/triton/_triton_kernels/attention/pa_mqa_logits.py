@@ -4,13 +4,26 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
 
 @triton.jit
 def _sum_combine(a, b):
     return a + b
 
 
-@triton.jit
+_deepgemm_fp8_paged_mqa_logits_stage1_ragged_k_repr = make_kernel_repr(
+    "_deepgemm_fp8_paged_mqa_logits_stage1_ragged_k",
+    [
+        "ChunkQ",
+        "ChunkK",
+        "HiddenDim",
+        "SplitKV",
+    ],
+)
+
+
+@triton.jit(repr=_deepgemm_fp8_paged_mqa_logits_stage1_ragged_k_repr)
 def _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k(
     batch_size,
     next_n,
@@ -106,7 +119,18 @@ def _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k(
         )
 
 
-@triton.jit
+_deepgemm_fp8_paged_mqa_logits_ragged_k_repr = make_kernel_repr(
+    "_deepgemm_fp8_paged_mqa_logits_ragged_k",
+    [
+        "ChunkQ",
+        "ChunkK",
+        "HiddenDim",
+        "SplitKV",
+    ],
+)
+
+
+@triton.jit(repr=_deepgemm_fp8_paged_mqa_logits_ragged_k_repr)
 def _deepgemm_fp8_paged_mqa_logits_ragged_k(
     batch_size,
     next_n,
@@ -201,7 +225,19 @@ def _deepgemm_fp8_paged_mqa_logits_ragged_k(
         )
 
 
-@triton.jit
+_deepgemm_fp8_paged_mqa_logits_stage1_repr = make_kernel_repr(
+    "_deepgemm_fp8_paged_mqa_logits_stage1",
+    [
+        "ChunkQ",
+        "ChunkK",
+        "HiddenDim",
+        "KVBlockSize",
+        "SplitKV",
+    ],
+)
+
+
+@triton.jit(repr=_deepgemm_fp8_paged_mqa_logits_stage1_repr)
 def _deepgemm_fp8_paged_mqa_logits_stage1(
     batch_size,
     next_n,
@@ -311,7 +347,17 @@ def _deepgemm_fp8_paged_mqa_logits_stage1(
         )
 
 
-@triton.jit
+_deepgemm_fp8_paged_mqa_logits_varctx_schedule_repr = make_kernel_repr(
+    "_deepgemm_fp8_paged_mqa_logits_varctx_schedule",
+    [
+        "ChunkK",
+        "AlignedBatchSize",
+        "TryCount",
+    ],
+)
+
+
+@triton.jit(repr=_deepgemm_fp8_paged_mqa_logits_varctx_schedule_repr)
 def _deepgemm_fp8_paged_mqa_logits_varctx_schedule(
     batch_size,
     context_len_ptr,
@@ -357,7 +403,19 @@ def _deepgemm_fp8_paged_mqa_logits_varctx_schedule(
         tl.store(safe_chunks_per_cta_ptr, safe_seg_lens)
 
 
-@triton.jit
+_deepgemm_fp8_paged_mqa_logits_repr = make_kernel_repr(
+    "_deepgemm_fp8_paged_mqa_logits",
+    [
+        "ChunkQ",
+        "ChunkK",
+        "HiddenDim",
+        "KVBlockSize",
+        "SplitKV",
+    ],
+)
+
+
+@triton.jit(repr=_deepgemm_fp8_paged_mqa_logits_repr)
 def _deepgemm_fp8_paged_mqa_logits(
     batch_size,
     next_n,
