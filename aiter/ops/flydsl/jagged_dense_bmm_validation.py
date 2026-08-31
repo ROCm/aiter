@@ -78,9 +78,7 @@ def validate_jdbba_autograd_inputs(
 ) -> tuple[int, int, int]:
     """Full autograd entry contract: common tensors plus bias."""
     K, N, L = _validate_jdbba_common(jagged, dense, seq_offsets, n_groups)
-    _require_tensor(
-        "bias", bias, dtype=torch.bfloat16, ndim=2, device=jagged.device
-    )
+    _require_tensor("bias", bias, dtype=torch.bfloat16, ndim=2, device=jagged.device)
     if bias.shape != (n_groups, N):
         raise ValueError(
             f"`bias` must be (n_groups, N)=({n_groups}, {N}); got {tuple(bias.shape)}."
