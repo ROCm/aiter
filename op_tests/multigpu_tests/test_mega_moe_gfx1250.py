@@ -131,7 +131,7 @@ def resolve_spec(quant_key):
 
 
 # The MegaMoE (--combine fused) dispatch wire.
-_WIRE_FOR_QUANT = {"a8w4_mxfp4": "fp8", "a4w4_mxfp4": "fp4"}
+_DISPATCH_WIRE_FOR_QUANT = {"a8w4_mxfp4": "fp8", "a4w4_mxfp4": "fp4"}
 
 
 def resolve_dispatch_wire(wire, quant_key):
@@ -144,14 +144,14 @@ def resolve_dispatch_wire(wire, quant_key):
     than deep inside the gather.
     """
     if wire == "auto":
-        return _WIRE_FOR_QUANT.get(quant_key, "bf16")
+        return _DISPATCH_WIRE_FOR_QUANT.get(quant_key, "bf16")
     if wire == "bf16":
         return "bf16"
-    want = _WIRE_FOR_QUANT.get(quant_key)
+    want = _DISPATCH_WIRE_FOR_QUANT.get(quant_key)
     if want is None:
         raise ValueError(
             f"--dispatch_wire={wire} needs an MX quant key "
-            f"({'/'.join(_WIRE_FOR_QUANT)}), got -q {quant_key}"
+            f"({'/'.join(_DISPATCH_WIRE_FOR_QUANT)}), got -q {quant_key}"
         )
     if wire != want:
         raise ValueError(
@@ -982,6 +982,10 @@ def main():
 
 
 def _parse_args():
+    # Imported here, not at module scope: pulling in the mega package before
+    # FLYDSL_GPU_ARCH is set below would hand flydsl the wrong arch.
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import read_dispatch_wire_env
+
     p = argparse.ArgumentParser(description="multi-layer EP MoE perf + accuracy")
     p.add_argument(
         "-q",
@@ -1032,7 +1036,7 @@ def _parse_args():
         "--dispatch_wire",
         type=str,
         choices=["auto", "bf16", "fp8", "fp4"],
-        default=os.environ.get("MEGA_DISPATCH_WIRE", "bf16"),
+        default=read_dispatch_wire_env(),
         help="what dispatch puts on the wire (--combine fused only): bf16 sends "
         "activations and the receiver quantizes each copy; fp8/fp4 quantize once "
         "on the sender and forward the e8m0 row. 'auto' picks what the quant "

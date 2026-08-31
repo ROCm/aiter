@@ -43,7 +43,7 @@ _MORI_REGION_NAMES = {
 }
 
 
-def _dispatch_wire_from_env() -> str:
+def read_dispatch_wire_env() -> str:
     """$MEGA_DISPATCH_WIRE, and a loud death for the name it replaced.
 
     Not a fallback: an env var that is silently ignored sends a run that asked
@@ -196,9 +196,8 @@ class MegaMoEStage2Config:
             )
         if self.is_quant_dispatch_wire and self.hidden_dim % 32:
             raise ValueError(
-                "one e8m0 scale covers 32 features, so a quantizing dispatch wire "
-                "needs "
-                f"hidden_dim % 32 == 0, got {self.hidden_dim}"
+                "one e8m0 scale covers 32 features, so a quantizing dispatch "
+                f"wire needs hidden_dim % 32 == 0, got {self.hidden_dim}"
             )
         if self.dispatch_backend not in _DISPATCH_BACKENDS:
             raise ValueError(
@@ -260,11 +259,15 @@ class MegaMoEStage2Config:
         """What mori's Cfg calls hidden_dim: ELEMENTS, at its own element size.
 
         fp8 and fp4 both transport as one byte per element, so an fp4 dispatch
-        wire has to
-        halve the count itself -- mori sizes the token as hidden_dim * elem_size
+        wire has to halve the count itself -- mori sizes the token as
+        hidden_dim * elem_size
         and would otherwise move two bytes per packed byte.
         """
-        return self.dispatch_token_nbytes if self.is_quant_dispatch_wire else self.hidden_dim
+        return (
+            self.dispatch_token_nbytes
+            if self.is_quant_dispatch_wire
+            else self.hidden_dim
+        )
 
     @property
     def combine_token_nbytes(self) -> int:
@@ -456,7 +459,7 @@ class MegaMoEGfx1250:
                 dispatch_wire=(
                     dispatch_wire
                     if dispatch_wire is not None
-                    else _dispatch_wire_from_env()
+                    else read_dispatch_wire_env()
                 ),
             ),
             communicator,
@@ -753,7 +756,11 @@ class MegaMoEGfx1250:
         # Passed only on a quantizing wire, matching dispatch_scale_dst_nbytes: mori grew
         # scale_bytes in #593 and rejects UNKNOWN kwargs outright, so sending the
         # bf16 wire's harmless 0 would make an older mori refuse the whole plan.
-        scale_kw = {"scale_bytes": config.dispatch_scale_nbytes} if config.is_quant_dispatch_wire else {}
+        scale_kw = (
+            {"scale_bytes": config.dispatch_scale_nbytes}
+            if config.is_quant_dispatch_wire
+            else {}
+        )
         plans = {}
         for spec in self._dispatch_specs:
             plan = EpDispatchPlan(
@@ -834,7 +841,10 @@ class MegaMoEGfx1250:
         config = self._config
         # Width in whatever recv_dtype counts: features for bf16/fp8, bytes for
         # fp4 -- see _DispatchWire.recv_dtype.
-        width = config.dispatch_token_nbytes // config.dispatch_wire_spec.recv_dtype.itemsize
+        width = (
+            config.dispatch_token_nbytes
+            // config.dispatch_wire_spec.recv_dtype.itemsize
+        )
         return _from_gpu_ptr(
             self._arena.local_ptr("disp_out"),
             (config.max_recv, width),
