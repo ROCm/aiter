@@ -18,8 +18,7 @@ from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config
 _CONFIG_NAME = "FAV3_SAGE_MXFP4"
 _MXFP4_ARCH = "gfx950"
 
-# Read at import, off any traced path -- see _load_sage_fwd_tables() in
-# fav3_sage.py for why this cannot happen inside the wrapper.
+
 _SAGE_FWD_MXFP4_TABLE = load_config_json(
     resolve_config_dir("attention", _CONFIG_NAME, backend="triton", arch=_MXFP4_ARCH)
     + "/DEFAULT.json"
