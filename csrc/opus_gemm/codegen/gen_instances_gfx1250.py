@@ -360,6 +360,14 @@ void
     // vs the old VEC=16/BS=64 (both 1024 N per block).
     constexpr int REDUCE_VEC = 8;
     constexpr int REDUCE_BS  = 128;
+    // The reduce carries one row per grid.y block, and grid.y stops at 65535.
+    // Past that it does not fail -- it writes garbage (NaN at M=65536, measured)
+    // until M is large enough that the launch itself is rejected. The tuner will
+    // not pick a split-K kid here, so reaching this means a stale tuned CSV or an
+    // explicit kernelId; say so rather than returning wrong numbers.
+    AITER_CHECK(M <= 65535,
+        "split-K reduce puts one row per grid.y block and grid.y is capped at "
+        "65535; M=", M, " needs a non-split-K kernel");
     dim3 grid_reduce((N + REDUCE_VEC * REDUCE_BS - 1) / (REDUCE_VEC * REDUCE_BS), M, 1);
     dim3 block_reduce(REDUCE_BS);
 

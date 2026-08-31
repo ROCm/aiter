@@ -639,6 +639,16 @@ def kid_rejects_shape(k_inst, M, N, K):
             splitk main kernel's mask_va_tail cover both edge cases, so
             splitk is safe for any (M, N, K).
     """
+    # The gfx1250 _ws reduce launches as dim3(ceil(N, VEC*BLOCK), M, 1) and
+    # grid.y is capped at 65535. Past that it does not fail, it writes garbage:
+    # at M=65536 the output is NaN, while the same shape on a .co kid (no reduce)
+    # is exact, and M >= 65537 does not launch at all ("invalid configuration
+    # argument"). Tuning one tends to take the box down with it. The fuse family
+    # reduces in-kernel and is unaffected. The generated launcher re-checks, for
+    # a tuned CSV that predates this.
+    if M > 65535 and _kid_launches_reduce(k_inst):
+        return True
+
     # Pre-compiled (.co) kids: answered first, because almost none of the rules
     # below apply to them. The pipeline builds NO buffer resource at all (it is
     # the only a16w16 pipeline with zero make_gmem -- A, B and C all ride TDM
@@ -1029,6 +1039,17 @@ _WS_SPLITK_TAGS = frozenset(
 
 # The pre-compiled (.co) families. Mirrors codegen/common.py:_A16W16_CO_TAGS.
 _A16W16_CO_TAGS = frozenset({"a16w16_4wave_co", "a16w16_4wave_wl_co"})
+
+
+def _kid_launches_reduce(k_inst):
+    """True for the gfx1250 families whose launcher runs splitk_reduce separately.
+
+    The gfx942 _sk families and flatmm_splitk launch the same reduce with the
+    same grid.y, so the 65535 cap is theirs too -- they are left alone here
+    only because this change is scoped to gfx1250. The fuse family reduces
+    in-kernel and launches nothing.
+    """
+    return getattr(k_inst, "kernel_tag", "") in _WS_SPLITK_TAGS
 
 
 def _ensure_kids_compiled(candidate_kids):

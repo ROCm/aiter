@@ -137,6 +137,20 @@ inline void check_shape_4g(int M, int N, int K, size_t c_elem_bytes)
                 "opus_gemm gfx1250: a16w16 heuristic refuses >4 GiB shape (M=",
                 M, " N=", N, " K=", K, "): launcher gmem descriptors are 32-bit.");
 }
+
+inline void check_shape_reduce_grid(int M)
+{
+    // Every kid this heuristic can return is split-K, and their reduce carries
+    // one row per grid.y block against a 65535 cap. Past it the reduce writes
+    // garbage rather than failing -- NaN at M=65536, measured. A .co kid has no
+    // reduce and handles these shapes, but the heuristic never returns one, so
+    // the only way through is a tuned row.
+    AITER_CHECK(M <= 65535,
+                "opus_gemm gfx1250: a16w16 heuristic refuses M=", M,
+                " (> 65535): every heuristic kid is split-K and its reduce is "
+                "capped at 65535 rows. Tune this shape -- the winner will be a "
+                ".co kid, which has no reduce.");
+}
 }  // namespace opus_gfx1250_detail
 
 template <typename CDataType>
@@ -159,6 +173,7 @@ opus_dispatch_a16w16_gfx1250<bf16_t>(int M, int N, int K, int batch, bool has_bi
         return it->func;
     (void)batch;
     opus_gfx1250_detail::check_shape_4g(M, N, K, sizeof(bf16_t));
+    opus_gfx1250_detail::check_shape_reduce_grid(M);
     const int kid = opus_a16w16_heuristic_kid_gfx1250(M, N, K, has_bias);
     return opus_a16w16_tune_dispatch_gfx1250<fp32_t>(kid);
 }
@@ -179,6 +194,7 @@ opus_dispatch_a16w16_gfx1250<fp32_t>(int M, int N, int K, int batch, bool has_bi
         return it->func;
     (void)batch;
     opus_gfx1250_detail::check_shape_4g(M, N, K, sizeof(fp32_t));
+    opus_gfx1250_detail::check_shape_reduce_grid(M);
     const int kid = opus_a16w16_heuristic_kid_gfx1250(M, N, K, has_bias);
     return opus_a16w16_tune_dispatch_gfx1250<fp32_t>(kid);
 }
