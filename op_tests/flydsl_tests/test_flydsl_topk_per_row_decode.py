@@ -16,13 +16,36 @@ from aiter.ops.flydsl.utils import is_flydsl_available
 
 torch.set_default_device("cuda")
 
+_GFX = get_gfx()
 pytestmark = pytest.mark.skipif(
-    get_gfx() not in ("gfx942", "gfx950") or not is_flydsl_available(),
+    _GFX not in ("gfx942", "gfx950") or not is_flydsl_available(),
     reason="CDNA (gfx942/gfx950) + FlyDSL required for decode TopK",
 )
-_GFX950_ONLY = pytest.mark.skipif(
-    get_gfx() != "gfx950", reason="public FlyDSL dispatch is gfx950-only"
-)
+
+_E2E_CASES = {
+    "gfx942": [
+        (True, 2048, 128, 20_000, 20_000, True),
+        (True, 2048, 4, 20_000, 1024, True),
+        (True, 512, 16, 131_072, 131_072, True),
+        (True, 2048, 4, 131_073, 131_069, True),
+        (False, 4096, 32, 524_288, 524_288, True),
+        (True, 2048, 17, 131_072, 131_072, False),
+        (True, 256, 1, 131_072, 131_072, False),
+        (True, 2048, 1, 131_071, 131_071, False),
+    ],
+    "gfx950": [
+        (True, 2048, 128, 20_000, 20_000, True),
+        (True, 2048, 4, 20_000, 1024, True),
+        (True, 512, 16, 32_768, 32_768, True),
+        (True, 2048, 4, 65_537, 65_533, True),
+        (False, 4096, 32, 131_072, 131_072, True),
+        (True, 2048, 17, 32_768, 32_768, False),
+        (True, 256, 1, 65_536, 65_536, False),
+        (True, 2048, 1, 32_767, 32_767, False),
+    ],
+}.get(_GFX, [])
+
+_GRAPH_WIDTH = 131_072 if _GFX == "gfx942" else 65_536
 
 
 def run_torch(
@@ -80,6 +103,14 @@ def _run_public(
     "arch,stable,top_k,rows,width,expected",
     [
         ("gfx942", True, 2048, 1, 65_536, False),
+        ("gfx942", True, 2048, 128, 20_000, True),
+        ("gfx942", True, 2048, 129, 20_000, False),
+        ("gfx942", True, 2048, 1, 131_071, False),
+        ("gfx942", True, 2048, 16, 131_072, True),
+        ("gfx942", True, 2048, 17, 131_072, False),
+        ("gfx942", False, 2048, 1, 524_287, False),
+        ("gfx942", False, 2048, 32, 524_288, True),
+        ("gfx942", False, 2048, 33, 524_288, False),
         ("gfx950", True, 128, 1, 65_536, False),
         ("gfx950", True, 4096, 1, 65_536, True),
         ("gfx950", False, 2048, 1, 131_071, False),
@@ -108,18 +139,8 @@ def test_public_topk_decode_gate(arch, stable, top_k, rows, width, expected):
 
 @pytest.mark.parametrize(
     "stable,top_k,rows,width,seq_len,use_flydsl",
-    [
-        (True, 2048, 128, 20_000, 20_000, True),
-        (True, 2048, 4, 20_000, 1024, True),
-        (True, 512, 16, 32_768, 32_768, True),
-        (True, 2048, 4, 65_537, 65_533, True),
-        (False, 4096, 32, 131_072, 131_072, True),
-        (True, 2048, 17, 32_768, 32_768, False),
-        (True, 256, 1, 65_536, 65_536, False),
-        (True, 2048, 1, 32_767, 32_767, False),
-    ],
+    _E2E_CASES,
 )
-@_GFX950_ONLY
 def test_public_topk_decode_e2e(stable, top_k, rows, width, seq_len, use_flydsl):
     """Check both FlyDSL kernels and HIP fallbacks against the Torch reference."""
     torch.manual_seed(0)
@@ -158,10 +179,9 @@ def test_public_topk_decode_e2e(stable, top_k, rows, width, seq_len, use_flydsl)
         assert torch.all(output[:, seq_len:] == -1)
 
 
-@_GFX950_ONLY
 def test_public_topk_decode_cuda_graph():
     """Check capture and replay of the long-row multi-kernel path."""
-    rows, width, top_k = 1, 65_536, 2048
+    rows, width, top_k = 1, _GRAPH_WIDTH, 2048
     torch.manual_seed(0)
     logits = torch.randn((rows, width), dtype=torch.float32, device="cuda")
     seq_lens = torch.full((rows,), width, dtype=torch.int32, device="cuda")
