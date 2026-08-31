@@ -38,6 +38,9 @@ try:
         PIPELINES as FLYDSL_PIPELINES,
     )
     from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
+        k_split_candidates,
+    )
+    from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
         kernels_list as kernels_list_flydsl,
     )
     from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
@@ -50,6 +53,9 @@ except ImportError:
     FLYDSL_PIPELINES = ()
     kernels_list_flydsl = {}
     kernels_list_flydsl_8wave = {}
+
+    def k_split_candidates(*_a, **_kw):
+        return []
 
 
 from aiter.ops.flydsl.utils import is_flydsl_available
@@ -131,7 +137,7 @@ def run_gemm_a8w8_asm(
     )
 
 
-def run_gemm_flydsl(x, weight_shuffle, x_scale, w_scale, out, kernel_id):
+def run_gemm_flydsl(x, weight_shuffle, x_scale, w_scale, out, kernel_id, k_split=1):
     ki = kernels_list_flydsl[kernel_id]
     flydsl_preshuffle_gemm_a8(
         x,
@@ -147,11 +153,14 @@ def run_gemm_flydsl(x, weight_shuffle, x_scale, w_scale, out, kernel_id):
         ki.xcd_swizzle,
         ki.lds_stage,
         ki.enable_scheduler,
+        split_k=k_split,
     )
     return out
 
 
-def run_gemm_flydsl_8wave(x, weight_shuffle, x_scale, w_scale, out, kernel_id):
+def run_gemm_flydsl_8wave(
+    x, weight_shuffle, x_scale, w_scale, out, kernel_id, k_split=1
+):
     from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import flydsl_8wave_gemm_a8
 
     ki = kernels_list_flydsl_8wave[kernel_id]
@@ -411,20 +420,10 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         gemm_keys = ["x", "weight_shuffle", "x_scale", "w_scale", "out"]
         ref_keys = ["x", "weight", "x_scale", "w_scale", "bias_f32"]
         tasks_ck = []
-        for i, kernel in filtered_cktile.items():
-            maxsplitK = (
-                aiter.compute_gemm_SplitK(
-                    M,
-                    N,
-                    K,
-                    kernel.MTile,
-                    kernel.NTile,
-                    kernel.KTile,
-                )
-                if useSplitK
-                else 0
-            )
-            for splitK in range(maxsplitK + 1):
+        for i in filtered_cktile:
+            # cktile's flatmm accumulates into E without clearing it, so k_batch
+            # stays 1 regardless of --splitK.
+            for splitK in range(1):
                 info = (info_keys, i, splitK, "", "cktile")
                 tasks_ck.append(
                     (
@@ -523,6 +522,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
     def get_flydsl_gemm_a8w8_bpreshuffle_tune_task(
         self,
         info_keys,
+        useSplitK,
         seed,
     ):
         gfx, _cu_num, M, N, K, q_dtype_w = info_keys
@@ -557,34 +557,41 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                 ki = pipe.kernels_list[i]
                 if not pipe.fits(ki, M, N, K):
                     continue
-                tasks.append(
-                    (
-                        (info_keys, i, 0, ki.name, "flydsl"),
-                        generate_data,
-                        (M, N, K, seed, dtypes.bf16, q_dtype_eval),
-                        runner,
+                for ks in [1] + (
+                    k_split_candidates(ki, M, N, K, cu_num=self.get_cu_num())
+                    if useSplitK and pipe.name == "preshuffle"
+                    else []
+                ):
+                    name = ki.name if ks == 1 else f"{ki.name}_ks{ks}"
+                    tasks.append(
                         (
-                            gemm_flydsl_keys,
-                            i,
-                        ),
-                        {
-                            "num_warmup": args.warmup,
-                            "num_iters": args.iters,
-                        },
-                        run_torch,
-                        (
-                            ref_keys,
-                            dtypes.bf16,
-                        ),
-                        {},
-                        None,
-                        1e-2,
-                        0.01,
-                        None,
-                        None,
-                        ("out",),
+                            (info_keys, i, 0 if ks == 1 else ks, name, "flydsl"),
+                            generate_data,
+                            (M, N, K, seed, dtypes.bf16, q_dtype_eval),
+                            runner,
+                            (
+                                gemm_flydsl_keys,
+                                i,
+                                ks,
+                            ),
+                            {
+                                "num_warmup": args.warmup,
+                                "num_iters": args.iters,
+                            },
+                            run_torch,
+                            (
+                                ref_keys,
+                                dtypes.bf16,
+                            ),
+                            {},
+                            None,
+                            1e-2,
+                            0.01,
+                            None,
+                            None,
+                            ("out",),
+                        )
                     )
-                )
         return tasks
 
     def _get_flydsl_tune_task_gfx1250(self, info_keys, seed):
@@ -691,6 +698,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                 task.extend(
                     self.get_flydsl_gemm_a8w8_bpreshuffle_tune_task(
                         info_keys,
+                        useSplitK,
                         seed,
                     )
                 )

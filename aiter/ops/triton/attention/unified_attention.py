@@ -46,6 +46,19 @@ WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
 WAPR_SIZE_LOG2 = int(math.log2(WARP_SIZE))
 
 
+def is_gfx950_small_head(head_size):
+    """
+    True for gfx950 with a head_size the wide-LDS-copy config applies to.
+
+    On gfx950, the direct-to-LDS copy only stays vectorized at TILE_SIZE=64.
+    Below that it degrades to 4 bytes/lane plus a ds_bpermute per copy.
+
+    This covers the arch and head_size half of that condition only,
+    callers add their own path conditions (decode, sw).
+    """
+    return DEVICE_ARCH == "gfx950" and head_size <= 128
+
+
 def is_2d_gluon_available(
     q_dtype, kv_cache_dtype, softcap, use_qq_bias, use_alibi_slopes
 ):
@@ -113,6 +126,12 @@ def select_2d_config(
                 num_stages_2d, num_warps = 1, 4
             else:
                 num_stages_2d, num_warps = 3, 2
+        # gfx950: keep LDS copies wide (TILE_SIZE=64) to avoid the narrow-copy overhead.
+        # Windowed decode only, as wide copy prefers a shallower pipeline.
+        if is_gfx950_small_head(head_size) and sliding_window > 0:
+            TILE_SIZE = 64
+            num_stages_2d, num_warps = 2, 2
+            waves_per_eu = 1
 
     BLOCK_Q = BLOCK_M // num_queries_per_kv
     num_stages_2d = min(max_num_stages_2d, num_stages_2d)
@@ -213,12 +232,20 @@ def select_3d_config(
         if head_size >= 512 and not arch.is_rdna:
             attn_warps, attn_stages = 4, 1
         occ = waves_per_eu * 4 // attn_warps
-        target_num_prgms = target_num_prgms * occ
+        wide_lds_copy = is_gfx950_small_head(head_size)
+        # The occupancy multiplier over-segments the KV split for the wide-copy
+        # path, so we skip it there; every other case applies it.
+        if not wide_lds_copy:
+            target_num_prgms = target_num_prgms * occ
 
         TILE_SIZE = min(64, triton.next_power_of_2(block_size))
+        if wide_lds_copy:
+            # same de-vectorization fix as the 2D path
+            TILE_SIZE = 64
 
         MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
-        MIN_SEGMENTS = min(8, MAX_SEGMENTS)
+        # the >= 8 floor would clamp the smaller splits (4 and 2) back up to 8
+        MIN_SEGMENTS = 1 if wide_lds_copy else min(8, MAX_SEGMENTS)
         if head_size >= 512 and not arch.is_rdna:
             MIN_SEGMENTS = min(16, MAX_SEGMENTS)
         if num_segments == 0:
@@ -227,7 +254,9 @@ def select_3d_config(
             num_segments = max(num_segments, MIN_SEGMENTS)
             num_segments = triton.next_power_of_2(num_segments)
 
-        if num_segments == MIN_SEGMENTS:
+        # The wide-copy path can reach 2 segments, so use segment count directly
+        # Keep 1-warp reduce for small segment counts
+        if num_segments <= (2 if wide_lds_copy else MIN_SEGMENTS):
             reduce_num_warps = 1
 
         if shuffled_kv_cache:

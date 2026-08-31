@@ -10,27 +10,37 @@ import re
 import torch
 from torch import Tensor
 
+from .mxfp8_128_bpreshuffle_gemm_gfx1250 import BLOCK_K as SCALE_BLOCK_SIZE
+
 # Lazily bound flydsl symbols (kept out of import path when flydsl is absent).
 _launch_gemm_a8w8 = None
+_compile_splitk_reduce = None
+_run_compiled = None
 _ptr_arg = None
 _fx = None
 
 _WMMA_K = 128
 _SUPPORTED_NUM_BUFFERS = (2, 3, 4)
 _OUT_DTYPE_NAME = {torch.bfloat16: "bf16", torch.float16: "f16"}
-_MAX_SPLIT_K = 1
+_MAX_SPLIT_K = 8
 
 
 def _lazy_import():
-    global _launch_gemm_a8w8, _ptr_arg, _fx
+    global _launch_gemm_a8w8, _compile_splitk_reduce, _run_compiled, _ptr_arg, _fx
     if _launch_gemm_a8w8 is not None:
         return
     import flydsl.expr as fx_mod
 
     from .kernels.gemm_a8w8_gfx1250 import launch_gemm_a8w8
+    from .kernels.gemm_a8w8_splitk_reduce_gfx1250 import (
+        compile_gemm_a8w8_splitk_reduce,
+    )
+    from .kernels.tensor_shim import _run_compiled as run_compiled
     from .kernels.tensor_shim import ptr_arg
 
     _launch_gemm_a8w8 = launch_gemm_a8w8
+    _compile_splitk_reduce = compile_gemm_a8w8_splitk_reduce
+    _run_compiled = run_compiled
     _ptr_arg = ptr_arg
     _fx = fx_mod
 
@@ -103,8 +113,8 @@ def run_preshuffle_gemm_a8_gfx1250(
 
     if split_k > _MAX_SPLIT_K:
         raise RuntimeError(
-            f"[FlyDSL gfx1250] split_k={split_k} exceeds the bf16/f16 atomic-add "
-            f"precision cap of {_MAX_SPLIT_K}"
+            f"[FlyDSL gfx1250] split_k={split_k} exceeds the "
+            f"supported maximum of {_MAX_SPLIT_K}"
         )
 
     # Validate (tuned names always pass); fail loudly rather than silently clamp.
@@ -125,19 +135,37 @@ def run_preshuffle_gemm_a8_gfx1250(
             f"[FlyDSL gfx1250] {nb}-buffer pipeline needs >= {nb} K-tiles per "
             f"split-k chunk, got {num_k_tiles} (K={K}, split_k={split_k}, tile_k={tile_k})"
         )
+    if split_k > 1:
+        if Out.stride(1) != 1:
+            raise RuntimeError(
+                "[FlyDSL gfx1250] split_k>1 needs contiguous Out rows, got "
+                f"strides={tuple(Out.stride())} for {M}x{N}"
+            )
+        # A padded row stride is reduced row-by-row, so each row start must keep
+        # the 16B alignment the vectorised copy needs.
+        if Out.stride(0) != N and (Out.stride(0) & 7 or N & 7):
+            raise RuntimeError(
+                f"[FlyDSL gfx1250] split_k>1 with padded Out rows needs N and "
+                f"stride(0) to be multiples of 8, got N={N}, "
+                f"stride(0)={Out.stride(0)}"
+            )
 
     sa = _as_1d_fp32(x_scale, M, "x_scale")
     sb = _as_1d_fp32(w_scale, N, "w_scale")
 
     lda = XQ.stride(0)
     ldc = Out.stride(0)
+    partials = (
+        torch.empty((split_k, M, ldc), dtype=Out.dtype, device=Out.device)
+        if split_k > 1
+        else None
+    )
+    gemm_out = Out if partials is None else partials
     out_is_f16 = 1 if out_dtype == "f16" else 0
-    if split_k > 1:
-        Out.zero_()  # split-k atomic-accumulates into Out
 
     stream = _fx.Stream(torch.cuda.current_stream(device=XQ.device))
     _launch_gemm_a8w8(
-        _ptr_arg(Out),
+        _ptr_arg(gemm_out),
         _ptr_arg(XQ),
         _ptr_arg(WQ),
         _ptr_arg(sa),
@@ -159,7 +187,21 @@ def run_preshuffle_gemm_a8_gfx1250(
         cluster_m,
         cluster_n,
         False,
+        SCALE_BLOCK_SIZE,
+        split_k,
     )
+    if partials is not None:
+        dense = ldc == N
+        _run_compiled(
+            _compile_splitk_reduce(split_k=split_k, out_dtype_str=out_dtype),
+            _ptr_arg(partials),
+            _ptr_arg(Out),
+            M * N if dense else N,
+            1 if dense else M,
+            ldc,
+            M * ldc * Out.element_size(),
+            stream,
+        )
     return Out
 
 
