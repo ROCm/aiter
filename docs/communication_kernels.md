@@ -5,7 +5,9 @@ actually runs, and how to exercise them across the GPUs of a gfx950 node.
 
 The immediate target is **DeepSeek-V4 at TP4 and TP8** — §8 narrows everything
 here to that model and evaluates the dispatch boundaries at its actual
-dimensions. §1–§7 are the general picture it rests on.
+dimensions. §1–§7 are the general picture it rests on. §9–§10 document the
+benchmark harness the §8 numbers come from, and the TransferBench roofline that
+bounds them from above.
 
 Everything below was read out of the tree at the time of writing; file/line
 references are the source of truth if this drifts.
@@ -130,7 +132,7 @@ where reads stall. It is currently enabled only for
 `world_size == 8 && bytes > 512*4096*2 && arch == gfx942`
 ([:3798-3803](../csrc/include/custom_all_reduce.cuh#L3798-L3803)) — **on gfx950
 this path is dead code**. Whether it should be enabled on gfx950 is an open
-question worth measuring (see §9).
+question worth measuring (see §11).
 
 ### 2.6 Host-side dispatch
 
@@ -331,7 +333,7 @@ Every one of these selects a different code path and none of them are swept in C
 
 ## 5. Tests and benchmarks
 
-22 files in [op_tests/multigpu_tests/](../op_tests/multigpu_tests/), 2 in
+24 files in [op_tests/multigpu_tests/](../op_tests/multigpu_tests/), 2 in
 `triton_test/`, 4 in `gfx1250_poc/`.
 
 Structural notes, because they affect how you run them:
@@ -364,6 +366,8 @@ Structural notes, because they affect how you run them:
 | [test_parallel_groups.py](../op_tests/multigpu_tests/test_parallel_groups.py) | TP×DP×PP×PCP group construction | `--tp --dp --pp --pcp -w` |
 | [test_communication.py](../op_tests/multigpu_tests/test_communication.py) | AR + AR-RMSNorm-quant, graph capture | hardcoded 8 |
 | [test_car_rccl_latency.py](../op_tests/multigpu_tests/test_car_rccl_latency.py) | **bench**: custom AR vs RCCL latency | — |
+| [bench_comm_allreduce.py](../op_tests/multigpu_tests/bench_comm_allreduce.py) | **bench**: all 10 AR candidates, speed + SQNR — see §9 | `-t 2\|4\|6\|8` |
+| [transferbench_roofline.py](../op_tests/multigpu_tests/transferbench_roofline.py) | TransferBench fabric roofline for the above — see §10 | `-t`, self-skips |
 | [test_collective_profile.py](../op_tests/multigpu_tests/test_collective_profile.py) | `record_param_comms` instrumentation, chrome trace | `device_count()` |
 | [test_mori_all2all.py](../op_tests/multigpu_tests/test_mori_all2all.py), [test_dispatch_combine.py](../op_tests/multigpu_tests/test_dispatch_combine.py) | Mori EP all2all + fused_moe | needs `mori` |
 | [test_mega_moe_v2.py](../op_tests/multigpu_tests/test_mega_moe_v2.py) / [bench_mega_moe_v2.py](../op_tests/multigpu_tests/bench_mega_moe_v2.py) | multi-layer EP MoE accuracy + **perf guards** | torchrun 8 |
@@ -819,7 +823,8 @@ currently taking.
 [bench_comm_allreduce.py](../op_tests/multigpu_tests/bench_comm_allreduce.py)
 was written for exactly this: it drives `ca_comm.all_reduce` directly at
 DSv4 shapes, reports which of the two kernels each row hit, and gives
-algbw/busbw plus an RCCL baseline. Steps 1–3 below are one invocation of it.
+algbw/busbw plus an RCCL baseline. Its architecture and measurement methodology
+are §9. Steps 1–3 below are one invocation of it.
 Note TP2 can only reach the 1-stage kernel (the C++ dispatch hardcodes it at
 `world_size == 2`), so `-t 4` is required to measure both.
 
@@ -869,11 +874,12 @@ QuickReduce dispatch tables.
 
 **It is usable as an all-reduce**: the API is `QRInt4(group=..., device=..., rank=...,
 world_size=...)` then `.compile(inp, out)` once and `.allreduce(inp, out)`, which is
-a drop-in shape match for `ca_comm.all_reduce`. It is now a permanent third
-candidate in [bench_comm_allreduce.py](../op_tests/multigpu_tests/bench_comm_allreduce.py),
-side by side with `custom` and `rccl`, gated behind the repo's own
-`is_flydsl_available()` and skipped (columns absent) for fp16, TP6, or a
-non-gfx942/950 arch.
+a drop-in shape match for `ca_comm.all_reduce`. It is a permanent candidate
+(`fly_int4`) in [bench_comm_allreduce.py](../op_tests/multigpu_tests/bench_comm_allreduce.py)
+alongside the `cdr`, `qr_*` and `rccl` families (§9.1), gated behind the repo's
+own `is_flydsl_available()` and skipped (columns absent) for fp16, TP6, or a
+non-gfx942/950 arch. It measures ~19.2 dB SQNR, which clears the summary
+table's default 15 dB floor (§9.3).
 
 Because the candidates are not accuracy-equivalent, the bench grades **all** of
 them on SQNR against a shared fp32 reference, each with its own floor in
@@ -981,7 +987,294 @@ communication.
 
 ---
 
-## 9. Open questions
+## 9. The all-reduce benchmark harness
+
+[bench_comm_allreduce.py](../op_tests/multigpu_tests/bench_comm_allreduce.py) is
+the harness the §8.7 numbers come from. §8.7 shows *what it found*; this section
+is *how it works*, because the design choices are what make its numbers
+trustworthy and several of them are non-obvious.
+
+The question it answers: **"which of the things aiter can do to an all-reduce is
+fastest at this shape, and what does it cost in accuracy?"** Both halves matter —
+half the candidates are lossy codecs, so a latency table alone is not a result.
+
+### 9.1 Candidate model
+
+Every implementation reachable from the plain (unfused) AR path is a candidate,
+declared in one `CANDIDATES` tuple:
+
+| key | what runs | wire | exact |
+|---|---|---|---|
+| `cdr` | `cross_device_reduce_{1,2}stage` (§2.3, §2.4) | bf16/fp16 | yes |
+| `cdr_naive` | same call, `use_new=False` → `*_naive` kernels | bf16/fp16 | yes |
+| `cdr_fp8` | `CustomAllreduce::runFp8QuantKernel` | fp8 | no |
+| `qr_fp` / `qr_fp8` / `qr_int6` / `qr_int4` / `qr_int3` | quick-reduce codecs (§2.9) | fp/fp8/int6/int4/int3 | no |
+| `fly_int4` | FlyDSL two-shot INT4, #4970 (§8.8) | int4 | no |
+| `rccl` | `dist.all_reduce` | bf16/fp16 | yes |
+
+Four design principles follow from that table:
+
+**1. Kernels are called directly, not through the dispatcher.** Each candidate is
+invoked at *every* shape, even where production would never select it. The
+separate `prod path` column reports what `CudaCommunicator.all_reduce` *would*
+have dispatched for that row. That split is the point: it shows what the
+production gates leave on the table. It is also the only way to reach a kernel
+the host dispatch hides — there is no env override for the 1-stage/2-stage
+choice (§2.6), so shape selection is the sole lever, and `cdr` additionally
+bypasses `should_custom_ar()`'s size window so it is still measured above the
+64 MiB RCCL-fallback cap.
+
+**2. `nan` always means "cannot run here", never "ran and was slow".** Each
+candidate's `applicable()` gate mirrors its own upstream constraint — `cdr_fp8`
+is fp16-only above 128×2048 elements (below that `custom_all_reduce.cu:90`
+silently runs the plain kernel, so timing it would report one number twice under
+two names); `qr_*` need TP ∈ {2,4,8} and fp16/bf16 with `qr_int3` TP2-only;
+`fly_int4` needs bf16, TP ∈ {2,4,8}, gfx942/gfx950. A candidate that cannot
+legally run is not run at all, and a candidate nothing in the sweep could run
+loses its column entirely.
+
+**3. The shape list is dispatch boundaries, not round numbers.** At bf16 × 7168 a
+token is 14336 B, which is what puts the boundaries where they are: M ∈ {1,2,4,8}
+are DSv4 decode, {5,6} straddle the TP8 80 KiB crossover, {11,12} the TP4 160 KiB
+one (the pair that produced the §8.7 finding), 4681 is the 64 MiB cap to the
+token, and 8192 is past it where production diverts to RCCL.
+
+**4. Candidates are not accuracy-equivalent, so they are graded, not just timed.**
+See §9.3.
+
+### 9.2 How speed is measured
+
+- **hipEvents bracketing the call**, not summed per-kernel device time. This is
+  deliberate twice over. First, the torch profiler is *not usable here*: ranks
+  are spawned children, and once the parent has initialized HIP — which
+  `import aiter` does at module scope — some ROCm builds hand the children a
+  profiler that records CPU ops but no GPU activity. That is silent for RCCL (an
+  aten op with 0 device time) and fatal for the custom-AR candidates, which
+  register no aten op at all. Second, events are the *honest* metric: they
+  include the `start_sync` peer-wait that per-kernel device time hides, and that
+  wait dominates the 1-stage kernel (§8.6 item 3).
+- **A barrier before each timed region**, so a measurement reflects the kernel
+  rather than accumulated rank skew. Production time is therefore *higher* than
+  these numbers, not lower.
+- **The slowest rank is reported**, since that is what the model waits on. The
+  spread (max − min across ranks) is reported once, for the primary candidate,
+  as the skew indicator — skew is a property of the barrier, not of any one
+  candidate.
+- **One process per rank, all shapes inside it.** The per-rank setup being
+  amortized is not small: an RCCL communicator, the custom-AR IPC pool, the
+  quick-reduce IPC buffer, and a FlyDSL JIT. Only scalars cross the process
+  boundary — returning a 56 MiB prefill activation per rank exhausts `/dev/shm`.
+  Inputs are rebuilt from a seeded CPU generator instead, so any rank can
+  reconstruct any other rank's contribution and check the reduction locally.
+
+### 9.3 How accuracy is measured
+
+Every candidate is graded on **SQNR in dB against a common fp32 reference**, the
+only metric that spans exact kernels and 3-bit codecs, and asserted against its
+*own* floor — an exact kernel and a 3-bit codec cannot share one:
+
+```
+55 / 73 dB   cdr, cdr_naive, qr_fp     the bf16 / fp16 rounding floor
+51 / 69 dB   rccl                      lower: reduces in bf16, not fp32 accum
+33 dB        cdr_fp8 (fp16 only)
+30.4 dB      qr_int6
+29.5 dB      qr_fp8
+19.2 dB      fly_int4
+18.3 dB      qr_int4
+12.2 dB      qr_int3                   ~25% relative error
+```
+
+Floors sit ~5 dB below measured, which catches a real regression without
+tripping on rounding. The exact candidates *additionally* get a tight
+`checkAllclose`; the quantizing ones are graded on SQNR alone, because ~19 dB is
+~11% relative error and `checkAllclose` would log a scary failure for a kernel
+behaving exactly as designed.
+
+**The summary table's `best` column is accuracy-gated for this reason.** Ranked
+on speed alone it would name `qr_int3` at nearly every shape. The default floor
+is 15 dB — chosen not as a shippability judgement but as the widest gap between
+adjacent accuracy classes above (12.2 → 18.3), so the default cannot flip a
+winner on measurement wobble. `--min-sqnr` moves it; `best SQNR dB` prints
+beside the winner what the choice cost; `best exact` gives the fastest option
+that leaves the model's numerics untouched. A gated candidate is never hidden —
+it keeps its columns in the latency and accuracy tables, and the count of rows
+where the floor changed the winner is logged.
+
+### 9.4 Output
+
+Four tables, in order: **summary** (winner per shape + ratio vs baseline),
+**latency** (`us` per candidate + speedup vs baseline, > 1.0 = faster),
+**accuracy** (`SQNR dB` per candidate), and optionally **busbw** (`--busbw`) and
+**roofline** (`--roofline`, §10). Ratios are always `baseline / candidate`, and
+the baseline name is in the column header so a saved report stays
+self-describing.
+
+`busbw` is always computed on the *payload* dtype, including for the quantizing
+candidates whose wire is several times smaller: the question is "how fast does
+my (M, hidden) all-reduce finish", not "how efficiently is the wire used".
+
+`-o PATH` writes markdown with a provenance header — arch, device, visible GPU
+count, iteration counts, accuracy floor, and the exact command — because the
+point of saving a report is diffing a later run against it, and without those a
+saved table is unfalsifiable.
+
+```bash
+# default sweep: every TP that fits, DSv4 shapes plus every dispatch boundary
+python3 op_tests/multigpu_tests/bench_comm_allreduce.py
+
+# "what could I actually ship?" -- winner restricted to >= 25 dB
+python3 op_tests/multigpu_tests/bench_comm_allreduce.py --min-sqnr 25
+
+# save a report to diff against after a kernel change
+python3 op_tests/multigpu_tests/bench_comm_allreduce.py -o /tmp/ar_before.md
+```
+
+Under `rocprofv3`, do **not** pass `-o`: ranks are separate processes and a fixed
+output name makes them overwrite each other, silently leaving one rank.
+
+---
+
+## 10. TransferBench: the fabric roofline
+
+Every candidate in §9 is a *floor* — they tell you whether one kernel beats
+another, not how much of the fabric any of them is using. §8.7's TP2 prefill
+finding ("55.7 GB/s busbw versus 160.5 for TP4") only reads as bad because busbw
+across world sizes happens to be comparable; there is no general answer to "is
+548 µs good for 56 MiB on this box?" without a ceiling to compare against.
+
+[TransferBench](https://github.com/ROCm/TransferBench) supplies the ceiling.
+
+### 10.1 Why it fits, and where it stops
+
+TransferBench benchmarks simultaneous transfers between CPUs, GPUs, and NICs.
+The one feature that makes it usable here: **a Transfer sums multiple sources
+into a destination** (a copy is just the single-source case), and memory
+locations concatenate. So `G0G1G2G3->G0->G0` is a GPU-0 kernel that reads all
+four peer buffers, adds them, and writes GPU 0's copy — exactly the data
+movement of a one-shot all-reduce (§2.3), minus the collective's semantics.
+
+**It cannot replace the §9 harness.** The blockers are structural, not missing
+features:
+
+1. **Everything is `float`.** Buffers, the reduce kernel, fill patterns and
+   validation are hardcoded fp32 (`numBytes / sizeof(float)` throughout
+   `src/header/TransferBench.hpp`). No bf16/fp16, and no notion of a quantized
+   wire — `qr_*`, `cdr_fp8` and `fly_int4`, the majority of the candidate table,
+   cannot be expressed at all.
+2. **No accuracy dimension.** Validation is exact-match against a reference sum.
+   There is no SQNR and no way there could be, which is precisely the axis §9.3
+   exists to measure.
+3. **No peer handshake.** Ranks barrier on the *host* before the timed loop;
+   there is no in-kernel `start_sync`/`end_sync` (§2.2). Since that spin
+   dominates the 1-stage kernel (§8.6 item 3), TransferBench structurally cannot
+   measure the thing §8.6 identified as 27.7% of kernel time.
+4. **No ordering within a test.** Transfers on one config line run in parallel
+   with no dependency, so two-shot cannot be one timed test.
+5. **It does not run aiter code.** No `cross_device_reduce_*`, no RCCL, no
+   production-dispatch column.
+
+So it is a complement, not a replacement: **the bandwidth ceiling the kernels are
+working against**, and an upper bound that is optimistic by construction.
+
+### 10.2 How the roofline is modelled
+
+[transferbench_roofline.py](../op_tests/multigpu_tests/transferbench_roofline.py)
+generates configs, runs the binary, and parses the result;
+`bench_comm_allreduce.py --roofline` adds the table.
+
+```
+1stage   N parallel transfers, GPU i reduces all N buffers into its own:
+         -N (G0..G(N-1) Gi Gi <cus> <bytes>)          for each i
+
+2stage   reduce-scatter then all-gather, as two tests whose times are summed
+         (they cannot share one line, see blocker 4):
+         RS: -N (G0..G(N-1) Gi Gi <cus> <bytes/N>)    for each i
+         AG: -N (Gi Gi G0..G(N-1) <cus> <bytes/N>)    for each i
+```
+
+TransferBench cannot express the chunk *offsets* a real reduce-scatter reads, but
+the bytes moved per link are identical, which is all a bandwidth roofline
+depends on.
+
+Three modelling choices worth knowing:
+
+- **Each candidate is rooflined against its own wire size and its own
+  algorithm.** A `qr_int4` row is compared against TransferBench moving
+  `payload/4` bytes, not the payload — otherwise the quantizers would be graded
+  against a ceiling they were never trying to reach. Quick-reduce and `fly_int4`
+  are pinned to two-shot regardless of shape (every regime lands in
+  `allreduce_prototype_twoshot`), and RCCL likewise, since a ring all-reduce
+  moves the same 2(N−1)/N × nbytes per rank. Only `cdr` follows the host
+  dispatch's own prediction.
+- **The CU count is swept** (`--roofline-cus`, default 8/16/32) and the best
+  wins, because a single count reports what that count achieves rather than what
+  the fabric can do.
+- **TP8 is the hard ceiling.** `MAX_SRCS`/`MAX_DSTS` are 8, so one-shot at TP8
+  sits exactly at the limit and TP16 cannot be expressed.
+
+The roofline is optimistic on every axis: no handshake, no quantize/dequantize
+ALU cost, and the codec scale bytes (§8.8's 128 B of E4M3 scales per 1152 B
+tile) are not counted.
+
+### 10.3 Reading the `eff` column
+
+`eff` is `roof us / candidate us`, so **1.0 means the candidate is at the
+ceiling**. Two readings are not findings:
+
+- **Well below 1.0 at small sizes is expected.** The roofline has no peer
+  handshake and the 1-stage kernel is dominated by the `start_sync` spin there.
+  The gap *is* the sync cost — which makes this table a way to quantify §8.6's
+  27.7% skew claim directly, by size.
+- **Above 1.0 means the roofline was pessimistic**, not that the kernel broke
+  physics — most likely no swept CU count suited that size. Widen
+  `--roofline-cus` before believing it.
+
+A low `eff` at *large* sizes is the real question, since that is where the
+handshake amortizes away and only bandwidth is left.
+
+### 10.4 Getting it, and CI
+
+TransferBench is **not in a default ROCm install** — it ships with
+ROCmValidationSuite, or is built from source. Point `$TRANSFERBENCH` at the
+binary or pass `--roofline-bin`.
+
+```bash
+# check the config generator and parser without a binary or GPUs
+python3 op_tests/multigpu_tests/transferbench_roofline.py --self-test
+python3 op_tests/multigpu_tests/transferbench_roofline.py --dry-run -t 4
+
+# standalone: one shape, TP4
+python3 op_tests/multigpu_tests/transferbench_roofline.py -t 4 -b 114688
+
+# the full sweep with the roofline table appended
+python3 op_tests/multigpu_tests/bench_comm_allreduce.py --roofline
+```
+
+Both entry points **self-skip when the binary is absent** — a warning and exit 0,
+never a hard failure. This is load-bearing: CI runs `python3 <file>` over every
+`.py` under `multigpu_tests/` (§6), so a missing optional third-party binary
+would otherwise fail the whole multi-GPU job. It is the same failure mode §6 gap
+4 complains about, avoided deliberately.
+
+Parsing targets the human-readable table rather than `OUTPUT_TO_CSV=1`: CSV mode
+emits the same 5-column table comma-separated under a stale 11-column header
+(`Test#,Transfer#,NumBytes,…`) that no longer matches it, *and* drops the
+`Test N:` line that delimits one test from the next. The parser is checked
+against a captured sample by `--self-test`, borders on and off.
+
+### 10.5 Status
+
+**No roofline numbers are recorded here yet.** TransferBench is not installed on
+the reference box, so the harness above has been exercised end-to-end against a
+stubbed backend and its parser against captured output, but no measured `eff`
+figures exist to publish. The §8.7 table remains the only measured data in this
+document. Filling this in — a `--roofline` sweep at the DSv4 shapes, TP2/4/8 —
+is the obvious next step, and would answer directly whether the §8.7 dispatch
+findings are bandwidth or sync effects.
+
+---
+
+## 11. Open questions
 
 - Should write-mode (§2.5) be enabled on gfx950? It is gated to gfx942 and
   `world_size == 8`; nobody appears to have measured it on gfx950. The push/pull
