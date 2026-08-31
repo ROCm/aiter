@@ -1,16 +1,25 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+"""Conv config loading: ``get_conv_config()`` with the variant-aware
+four-tier walk, the shape-key formatters, and the optional-table probes,
+on top of the shared core in ``config_utils``.
+"""
+
 import functools
 
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.core import (
-    AITER_TRITON_CONFIGS_PATH,
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+logger = AiterTritonLogger()
+
+from aiter.ops.triton.utils.config_utils import (
     USE_LRU_CACHE,
     load_config_json,
+    resolve_config_dir,
 )
 
-STANDARD_M_BOUNDS: tuple[int, ...] = (
+CONV_STANDARD_M_BOUNDS: tuple[int, ...] = (
     4,
     8,
     16,
@@ -61,8 +70,10 @@ def format_prepack_shape_key(N: int, C: int, H: int, W: int, CB: int) -> str:
 
 
 def _conv_config_path(config_name: str) -> str:
-    dev = arch_info.get_arch()
-    return f"{AITER_TRITON_CONFIGS_PATH}/conv/{dev}-{config_name}.json"
+    # Nested layout <arch>/triton/conv/<d_type>/DEFAULT.json; the shared probe
+    # lives in resolve_config_dir().
+    cfg_dir = resolve_config_dir("conv", config_name, backend="triton")
+    return f"{cfg_dir}/DEFAULT.json"
 
 
 def _get_conv_config_file(config_name: str) -> dict:
@@ -94,7 +105,7 @@ def _get_conv_config_cached(
 
     # Tier 3: M-bucket walk.
     if M is not None and M >= 0:
-        for bound in STANDARD_M_BOUNDS:
+        for bound in CONV_STANDARD_M_BOUNDS:
             key = f"M_LEQ_{bound}"
             if M <= bound and key in config_dict:
                 return config_dict[key]

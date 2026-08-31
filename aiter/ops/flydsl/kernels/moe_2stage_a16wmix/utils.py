@@ -121,7 +121,8 @@ def _int4_nibble_to_bf16x8(raw_i32, scale_f32, *, use_k16=False, old_pack=False)
 
     ``raw_i32`` holds 8 signed-int4 nibbles. ``v_cvt_off_f32_i4`` reads the nibble
     unsigned, subtracts 8, and scales the mantissa by 16, so the x16 is folded into
-    eff = scale*16. ``use_k16`` (gfx942): v_cvt_pk_bf16_f32 is gfx950-only -> scalar.
+    ``eff = scale*16``. ``use_k16`` (gfx942): pack two f32 high-16s into a bf16
+    pair with lshr-16 (no ``v_cvt_pk_bf16_f32`` on this arch).
 
     ``old_pack`` (a16wi4 consuming the OLD FlyDSL kernel's weight preshuffle,
     ``pack_int8_to_packed_int4``): byte j packs K_j (low nibble) and K_{j+4} (high
@@ -135,19 +136,24 @@ def _int4_nibble_to_bf16x8(raw_i32, scale_f32, *, use_k16=False, old_pack=False)
     raw_even = fx.Int32(raw_i32)
     raw_odd = raw_even.shrui(fx.Int32(4))
     if use_k16:
-        # gfx942 fallback: scalar f32 -> bf16 truncation (no v_cvt_pk_bf16_f32).
+        # gfx942: pack two f32 high-16s into a bf16 pair. Exact for scaled int4.
         los = []
         his = []
         for j in range_constexpr(4):
             f_lo = fx.Float32(rocdl.cvt_off_f32_i4(_raw(raw_even), byte_sel=j)) * eff
             f_hi = fx.Float32(rocdl.cvt_off_f32_i4(_raw(raw_odd), byte_sel=j)) * eff
-            los.append(f_lo.to(fx.BFloat16))
-            his.append(f_hi.to(fx.BFloat16))
-        if old_pack:
-            bf16s = los + his  # K0..K3 (los), K4..K7 (his)
-        else:
-            bf16s = [x for pair in zip(los, his) for x in pair]  # K0,K1,...,K7
-        return fx.Vector.from_elements([_raw(x) for x in bf16s], fx.BFloat16)  # v8bf16
+            los.append(f_lo)
+            his.append(f_hi)
+        f32s = (los + his) if old_pack else [x for pair in zip(los, his) for x in pair]
+        c16 = fx.Int32(16)
+        hi16 = fx.Int32(0xFFFF0000)
+        i32s = []
+        for i in range_constexpr(4):
+            b0 = f32s[2 * i].bitcast(fx.Int32)
+            b1 = f32s[2 * i + 1].bitcast(fx.Int32)
+            i32s.append(b0.shrui(c16) | (b1 & hi16))
+        v4i32 = fx.Vector.from_elements([_raw(x) for x in i32s], fx.Int32)
+        return v4i32.bitcast(fx.BFloat16)  # v8bf16
     # byte_sel loads (1 shift total); side-effecting pk-convert.
     los = []
     his = []
@@ -442,6 +448,9 @@ def make_b_loader(
 
     Returns a :class:`_BLoader`. The closures emit no IR until called, so building them
     here rather than inline in the kernel body does not perturb instruction order.
+
+    Cache-key note: FlyDSL hashes this factory's source (not nested helpers).
+    gfx942 a16wi4 W upconvert is lshr-16 bf16 pack in ``_int4_nibble_to_bf16x8``.
     """
     _is_int4 = w_dtype == "int4"
     _is_bf16 = w_dtype == "bf16"
