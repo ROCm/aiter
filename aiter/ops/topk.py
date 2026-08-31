@@ -456,6 +456,13 @@ _FLYDSL_TOPK_DECODE_DISABLED = os.environ.get(
 # with short effective lengths may therefore enter a long-row gate.
 # (minimum width, maximum width, maximum rows), with inclusive bounds.
 _FLYDSL_TOPK_DECODE_GATES = {
+    "gfx942": {
+        True: (
+            (0, 20_000, 128),
+            (131_072, None, 16),
+        ),
+        False: ((524_288, None, 32),),
+    },
     "gfx950": {
         True: (
             (0, 20_000, 128),
