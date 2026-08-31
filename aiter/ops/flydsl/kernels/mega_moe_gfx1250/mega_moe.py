@@ -143,7 +143,7 @@ class MegaMoEStage2Config:
     dispatch_block_num: int | None = None
     dispatch_warp_num_per_block: int | None = None
     schedule: tuple | None = None
-    dispatch_backend: str = "mori"
+    dispatch_backend: str = "flydsl"
     # What dispatch puts on the wire. fp8 halves the payload and fp4 quarters it,
     # each sending a per-token e8m0 row along; the receiver then skips its own
     # quant. Combine is unaffected -- it moves post-expert tokens, which are bf16
@@ -422,7 +422,7 @@ class MegaMoEGfx1250:
                 dispatch_backend=(
                     dispatch_backend
                     if dispatch_backend is not None
-                    else os.environ.get("MEGA_DISPATCH", "mori")
+                    else os.environ.get("MEGA_DISPATCH", "flydsl")
                 ),
                 dispatch_wire=(
                     dispatch_wire
