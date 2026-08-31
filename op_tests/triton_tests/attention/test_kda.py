@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import json
 import sys
 
 import pytest
 import torch
 import torch.nn.functional as F
 
+import aiter.ops.triton.attention.kda as kda_module
 from aiter.ops.triton.attention.kda import fused_recurrent_kda
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
@@ -146,6 +148,23 @@ def _replay_into_snapshots(pool, indices, lens, BV=32):
             pool[int(indices[n, t])] = S
 
 
+_TUNED: dict = {}
+
+
+@pytest.fixture
+def get_config(monkeypatch, tmp_path):
+    name = f"{arch}-KDA_DECODE-DEFAULT.json"
+    with open(f"{kda_module.AITER_TRITON_CONFIGS_PATH}/{name}") as f:
+        buckets = list(json.load(f))
+
+    def _get(**variant):
+        (tmp_path / name).write_text(json.dumps(dict.fromkeys(buckets, variant)))
+        monkeypatch.setattr(kda_module, "AITER_TRITON_CONFIGS_PATH", str(tmp_path))
+        monkeypatch.setattr(sys.modules[__name__], "_TUNED", dict(variant))
+
+    return _get
+
+
 @pytest.fixture(autouse=True, params=["snapshots", "cache_state_updates"])
 def kda_store_mode(request, monkeypatch):
     """Run the suite twice: as-is, then routed through the cached-update path."""
@@ -158,7 +177,7 @@ def kda_store_mode(request, monkeypatch):
     def wrapped(**kw):
         state = kw.get("initial_state")
         idx = kw.get("ssm_state_indices")
-        cfg = kw.get("config") or {}
+        cfg = kw.get("config") or _TUNED
         if (
             "cache_state_updates" in kw
             or kw.get("num_accepted_tokens") is not None
@@ -580,42 +599,33 @@ def test_cache_state_updates_variants(gate, beta_headwise, dtype, H, HV):
     ],
 )
 def test_cache_state_updates_tiling(
-    BV, num_warps, SK, num_buffers, use_tdm_load, use_tdm_fused_load
+    BV,
+    num_warps,
+    SK,
+    num_buffers,
+    use_tdm_load,
+    use_tdm_fused_load,
+    get_config,
 ):
     """Every tiling and load path must reconstruct bitwise vs snapshots."""
-    acc = torch.tensor([2, 4, 1, 3], device=DEVICE, dtype=torch.int32)
-    _cached_vs_snapshot(
-        4,
-        4,
-        4,
-        4,
-        128,
-        [acc],
-        config={
-            "BV": BV,
-            "num_warps": num_warps,
-            "SK": SK,
-            "num_buffers": num_buffers,
-            "use_tdm_load": use_tdm_load,
-            "use_tdm_fused_load": use_tdm_fused_load,
-        },
+    get_config(
+        BV=BV,
+        num_warps=num_warps,
+        SK=SK,
+        num_buffers=num_buffers,
+        use_tdm_load=use_tdm_load,
+        use_tdm_fused_load=use_tdm_fused_load,
     )
+    acc = torch.tensor([2, 4, 1, 3], device=DEVICE, dtype=torch.int32)
+    _cached_vs_snapshot(4, 4, 4, 4, 128, [acc])
 
 
 @pytest.mark.parametrize("BV, num_warps", [(32, 4), (32, 2), (64, 2), (128, 4)])
-def test_cache_state_updates_k_first(BV, num_warps):
+def test_cache_state_updates_k_first(BV, num_warps, get_config):
     """[K, V] layout must still be bitwise-exact vs snapshots."""
+    get_config(BV=BV, num_warps=num_warps)
     acc = torch.tensor([1, 4, 2, 3], device=DEVICE, dtype=torch.int32)
-    _cached_vs_snapshot(
-        4,
-        4,
-        4,
-        4,
-        128,
-        [acc],
-        config={"BV": BV, "num_warps": num_warps},
-        state_v_first=False,
-    )
+    _cached_vs_snapshot(4, 4, 4, 4, 128, [acc], state_v_first=False)
 
 
 def test_cache_state_updates_vs_reference():
@@ -744,8 +754,9 @@ def test_cache_state_updates_guards():
 
 
 @pytest.mark.parametrize("BV, num_warps", [(32, 1), (64, 2), (128, 4), (64, 1)])
-def test_tiling_equivalence(BV, num_warps):
+def test_tiling_equivalence(BV, num_warps, get_config):
     """BV / num_warps must not change results."""
+    get_config(BV=BV, num_warps=num_warps)
     B, T, H, D = 2, 4, 4, 128
     q, k, v = make_qkv(B, T, H, H, D, torch.float32)
     q, k = F.normalize(q, p=2, dim=-1), F.normalize(k, p=2, dim=-1)
@@ -754,9 +765,7 @@ def test_tiling_equivalence(BV, num_warps):
     h0 = torch.randn(B, H, D, D, dtype=torch.float32, device=DEVICE)
 
     ref, ref_ht = naive_recurrent_kda(q, k, v, g, beta, initial_state=h0)
-    tri, tri_ht = run(
-        q, k, v, g, beta, h0.clone(), config={"BV": BV, "num_warps": num_warps}
-    )
+    tri, tri_ht = run(q, k, v, g, beta, h0.clone())
     assert_close("o", ref, tri)
     assert_close("ht", ref_ht, tri_ht)
 
@@ -780,6 +789,14 @@ def test_guards():
 
     with pytest.raises(AssertionError):  # gate chain needs A_log
         fused_recurrent_kda(**args, use_gate_in_kernel=True)
+
+    with pytest.raises(AssertionError):
+        fused_recurrent_kda(**dict(args, beta=args["beta"][..., :2]))
+
+    with pytest.raises(AssertionError):
+        fused_recurrent_kda(
+            **dict(args, beta=args["beta"].unsqueeze(-1).expand(B, T, H, 64))
+        )
 
     with pytest.raises(AssertionError):  # spec decoding needs the slot table
         fused_recurrent_kda(
@@ -923,8 +940,13 @@ def test_beta_headwise(T):
 @pytest.mark.parametrize("num_buffers", [1, 2])
 @pytest.mark.parametrize("use_tdm_store", [False, True])
 @pytest.mark.parametrize("use_tdm_fused_load", [False, True])
-def test_num_buffers(num_buffers, use_tdm_store, use_tdm_fused_load):
+def test_num_buffers(num_buffers, use_tdm_store, use_tdm_fused_load, get_config):
     """Operand prefetch mode and load/store paths must not change results (paged)."""
+    get_config(
+        num_buffers=num_buffers,
+        use_tdm_store=use_tdm_store,
+        use_tdm_fused_load=use_tdm_fused_load,
+    )
     B, T, H, D = 2, 4, 8, 128
     pool_kv, indices, untouched = make_pool(B, T, H, D)
     total_T = B * T
@@ -944,11 +966,6 @@ def test_num_buffers(num_buffers, use_tdm_store, use_tdm_fused_load):
         output_final_state=True,
         cu_seqlens=cu,
         ssm_state_indices=indices,
-        config={
-            "num_buffers": num_buffers,
-            "use_tdm_store": use_tdm_store,
-            "use_tdm_fused_load": use_tdm_fused_load,
-        },
     )
     pool_out = state.transpose(-1, -2)
     for n in range(B):
@@ -964,6 +981,46 @@ def test_num_buffers(num_buffers, use_tdm_store, use_tdm_fused_load):
         assert_close(f"o[{n}]", ref, o[:, b:e])
         assert_close(f"ht[{n}]", ref_ht[0], pool_out[int(indices[n, T - 1])])
     assert torch.equal(pool_out[untouched], pool_kv[untouched]), "wrote outside slots"
+
+
+def test_paged_output_only():
+    """Paged with no final state requested: outputs only, the pool untouched."""
+    B, T, H, D = 2, 3, 4, 128
+    pool_kv, indices, _ = make_pool(B, T, H, D)
+    base = pool_kv.clone()
+    total_T = B * T
+    q, k, v = make_qkv(1, total_T, H, H, D, torch.float32)
+    q, k = F.normalize(q, p=2, dim=-1), F.normalize(k, p=2, dim=-1)
+    g = F.logsigmoid(torch.randn(1, total_T, H, D, dtype=torch.float32, device=DEVICE))
+    beta = torch.rand(1, total_T, H, dtype=torch.float32, device=DEVICE).sigmoid()
+    cu = torch.arange(0, total_T + 1, step=T, device=DEVICE).long()
+    pool = to_vk(pool_kv)
+
+    o, ht = fused_recurrent_kda(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=pool,
+        output_final_state=False,
+        inplace_final_state=False,
+        cu_seqlens=cu,
+        ssm_state_indices=indices,
+    )
+    assert ht is None
+    for n in range(B):
+        b, e = n * T, (n + 1) * T
+        ref, _ = naive_recurrent_kda(
+            q[:, b:e],
+            k[:, b:e],
+            v[:, b:e],
+            g[:, b:e],
+            beta[:, b:e],
+            initial_state=base[int(indices[n, 0])][None],
+        )
+        assert_close(f"o[{n}]", ref, o[:, b:e])
+    assert torch.equal(pool, to_vk(base)), "state pool must be untouched"
 
 
 def test_paged_state_out():
@@ -1014,8 +1071,9 @@ def test_paged_state_out():
 
 @pytest.mark.parametrize("T", [1, 4])
 @pytest.mark.parametrize("BV", [32, 128])
-def test_state_v_first_matches_k_first(T, BV):
+def test_state_v_first_matches_k_first(T, BV, get_config):
     """The [V, K] and [K, V] state layouts must agree, given transposed states."""
+    get_config(BV=BV)
     B, H, D = 2, 4, 128
     q, k, v, g, beta, h0_kv = _small(T=T, B=B, H=H, D=D)
 
@@ -1028,7 +1086,6 @@ def test_state_v_first_matches_k_first(T, BV):
         initial_state=h0_kv.clone(),
         output_final_state=True,
         state_v_first=False,
-        config={"BV": BV},
     )
     o_vk, ht_vk = fused_recurrent_kda(
         q=q,
@@ -1039,7 +1096,6 @@ def test_state_v_first_matches_k_first(T, BV):
         initial_state=to_vk(h0_kv),
         output_final_state=True,
         state_v_first=True,
-        config={"BV": BV},
     )
     assert_close("o", o_kv, o_vk, 1e-4)
     assert_close("ht", ht_kv, ht_vk.transpose(-1, -2), 1e-4)
@@ -1138,19 +1194,98 @@ def test_reference_guards():
         )
 
 
-def test_non_contiguous_inputs():
+def test_strided_token_inputs():
+    """Token-strided packed views (vLLM's qkvgfab split) must run copy-free."""
+    B, T, H, D = 2, 3, 4, 128
+    torch.manual_seed(7)
+    packed = torch.rand(B, T, 3, H, D, dtype=torch.float32, device=DEVICE)
+    packed[:, :, :2] = F.normalize(packed[:, :, :2], p=2, dim=-1)
+    q, k, v = packed.unbind(2)
+    g = F.logsigmoid(torch.randn(B, T, 2, H, D, dtype=torch.float32, device=DEVICE))[
+        :, :, 0
+    ]
+    beta = torch.rand(B, T, 2, H, dtype=torch.float32, device=DEVICE).sigmoid()[:, :, 0]
+    for x in (q, k, v, g, beta):
+        assert not x.is_contiguous()
+    h0 = torch.randn(B, H, D, D, dtype=torch.float32, device=DEVICE)
+
+    ref, ref_ht = naive_recurrent_kda(q, k, v, g, beta, initial_state=h0)
+    o, ht = run(q, k, v, g, beta, h0.clone())
+    assert_close("o", ref, o)
+    assert_close("ht", ref_ht, ht)
+
+
+def test_strided_inner_dims_rejected():
+    """Only token/batch strides are free; strided feature dims must assert."""
     B, T, H, D = 2, 3, 4, 128
     q, k, v, g, beta, h0 = _small(T=T, B=B, H=H, D=D)
-    ref, ref_ht = naive_recurrent_kda(q, k, v, g, beta, initial_state=h0)
+    args = {"q": q, "k": k, "v": v, "g": g, "beta": beta, "initial_state": to_vk(h0)}
 
     wide = torch.empty(B, T, H, D * 2, dtype=torch.float32, device=DEVICE)
     wide[..., ::2] = q
-    q_nc = wide[..., ::2]
-    assert not q_nc.is_contiguous()
+    with pytest.raises(AssertionError):
+        fused_recurrent_kda(**dict(args, q=wide[..., ::2]))
 
-    o, ht = run(q_nc, k, v, g, beta, h0.clone())
-    assert_close("o", ref, o)
-    assert_close("ht", ref_ht, ht)
+    qt = torch.rand(T, B, H, D, dtype=torch.float32, device=DEVICE).transpose(0, 1)
+    with pytest.raises(AssertionError):
+        fused_recurrent_kda(**dict(args, q=qt))
+
+
+def test_pad_slot_guard():
+    B, T, H, D = 3, 3, 4, 128
+    total_T = B * T
+    torch.manual_seed(11)
+    pool_kv = torch.randn(2 * T + 1, H, D, D, dtype=torch.float32, device=DEVICE)
+    pool_kv[0] = POISON
+    base = pool_kv.clone()
+    indices = torch.tensor(
+        [
+            [i + 1 for i in range(T)],
+            [0, -1, 0],
+            [T + 1 + i for i in range(T)],
+        ],
+        device=DEVICE,
+        dtype=torch.int32,
+    )
+    q, k, v = make_qkv(1, total_T, H, H, D, torch.float32)
+    q, k = F.normalize(q, p=2, dim=-1), F.normalize(k, p=2, dim=-1)
+    g = F.logsigmoid(torch.randn(1, total_T, H, D, dtype=torch.float32, device=DEVICE))
+    beta = torch.rand(1, total_T, H, dtype=torch.float32, device=DEVICE).sigmoid()
+    cu = torch.arange(0, total_T + 1, step=T, device=DEVICE).long()
+    out = torch.full_like(v, 123.0)
+
+    o, state = fused_recurrent_kda(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=to_vk(pool_kv),
+        output_final_state=True,
+        cu_seqlens=cu,
+        ssm_state_indices=indices,
+        out=out,
+        cache_state_updates=False,
+        pad_slot_guard=True,
+    )
+    pool_out = state.transpose(-1, -2)
+
+    for n in (0, 2):
+        b, e = n * T, (n + 1) * T
+        ref, ref_ht = naive_recurrent_kda(
+            q[:, b:e],
+            k[:, b:e],
+            v[:, b:e],
+            g[:, b:e],
+            beta[:, b:e],
+            initial_state=base[int(indices[n, 0])][None],
+        )
+        assert_close(f"o[{n}]", ref, o[:, b:e])
+        assert_close(f"ht[{n}]", ref_ht[0], pool_out[int(indices[n, T - 1])])
+
+    assert torch.all(o[:, T] == 0), "pad seq token 0 must be zeroed"
+    assert torch.all(o[:, T + 1 : 2 * T] == 123.0), "pad seq must not be computed"
+    assert torch.all(pool_out[0] == POISON), "the pad slot was written"
 
 
 # (BV, SK, num_warps) -> ROWS = BV*SK // (32*num_warps); SK lanes split the K axis
@@ -1167,8 +1302,9 @@ SK_CONFIGS = [
 
 @pytest.mark.parametrize("BV, SK, num_warps", SK_CONFIGS)
 @pytest.mark.parametrize("state_v_first", [True, False])
-def test_sk_equivalence(BV, SK, num_warps, state_v_first):
+def test_sk_equivalence(BV, SK, num_warps, state_v_first, get_config):
     """Splitting K across SK lanes must not change results, in either layout."""
+    get_config(BV=BV, SK=SK, num_warps=num_warps)
     B, T, H, D = 2, 3, 4, 128
     q, k, v, g, beta, h0 = _small(T=T, B=B, H=H, D=D)
     ref, ref_ht = naive_recurrent_kda(q, k, v, g, beta, initial_state=h0)
@@ -1183,15 +1319,15 @@ def test_sk_equivalence(BV, SK, num_warps, state_v_first):
         initial_state=state,
         output_final_state=True,
         state_v_first=state_v_first,
-        config={"BV": BV, "SK": SK, "num_warps": num_warps},
     )
     assert_close("o", ref, o)
     assert_close("ht", ref_ht, ht.transpose(-1, -2) if state_v_first else ht)
 
 
 @pytest.mark.parametrize("SK", [2, 4, 8])
-def test_sk_paged(SK):
+def test_sk_paged(SK, get_config):
     """SK on the paged snapshot path, where the LDS staging layout also changes."""
+    get_config(BV=32, SK=SK, num_warps=SK)
     B, T, H, D = 2, 3, 8, 128
     pool_kv, indices, untouched = make_pool(B, T, H, D)
     total_T = B * T
@@ -1211,7 +1347,6 @@ def test_sk_paged(SK):
         output_final_state=True,
         cu_seqlens=cu,
         ssm_state_indices=indices,
-        config={"BV": 32, "SK": SK, "num_warps": SK},
     )
     pool_out = state.transpose(-1, -2)
     for n in range(B):

@@ -86,12 +86,16 @@ def make_inputs(B, T, H, D, dtype, device, paged, gate, num_accepted=0):
     }
 
 
-def traffic_bytes(B, T, H, D, dtype, paged):
+def traffic_bytes(B, T, H, D, dtype, paged, csu=False, BV=32):
     slab = H * D * D * 4
-    state = B * slab + (B * T * slab if paged else B * slab)
+    if csu:
+        record = H * (D // BV) * (2 * D + BV) * 4
+        writes = B * (slab + (T - 1) * record)
+    else:
+        writes = B * T * slab if paged else B * slab
     e = torch.tensor([], dtype=dtype).element_size()
     per_tok = 3 * H * D * e + H * D * 4 + H * 4 + H * D * e
-    return state + B * T * per_tok
+    return B * slab + writes + B * T * per_tok
 
 
 def _time(fn, args):
@@ -204,7 +208,6 @@ def benchmark(args):
         inputs = make_inputs(
             B, T, H, D, dtype, args.device, args.paged, args.gate, args.num_accepted
         )
-        mem = traffic_bytes(B, T, H, D, dtype, args.paged)
         shared = dict(
             inputs,
             out=torch.empty_like(inputs["v"]),
@@ -217,6 +220,7 @@ def benchmark(args):
             bv, nw, sk, nb, ts, tl, csu, tf = (
                 int(x) for x in provider.split(":")[1].split(",")
             )
+            mem = traffic_bytes(B, T, H, D, dtype, args.paged, csu=bool(csu), BV=bv)
 
             def fn():
                 fused_recurrent_kda(
@@ -234,6 +238,7 @@ def benchmark(args):
                 )
 
         else:
+            mem = traffic_bytes(B, T, H, D, dtype, args.paged)
 
             def fn():
                 fla_kda(**shared)
