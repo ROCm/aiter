@@ -845,11 +845,6 @@ def launch_gemm_a8w4_tdm(
                         comm_ops.store_i32_system(
                             _gate_addr, 0, entry_gen + fx.Int32(1)
                         )
-                else:
-                    if tid == fx.Int32(0):
-                        comm_ops.spin_until_eq_i32(
-                            _gate_addr, entry_gen + fx.Int32(1)
-                        )
                 workgroup_barrier()
                 if is_producer:
                     emit_compact_payload(
@@ -895,6 +890,24 @@ def launch_gemm_a8w4_tdm(
                 # (see emit_compact_wait_tile in the work-queue tile loop) and
                 # planner/producers rejoin the queue as consumers below.
                 workgroup_barrier()
+                # Do not hold every non-planner CTA behind the planner's final
+                # epoch gate. The destination publishes its tile map and M as
+                # plan_ready before source-side pair grouping finishes.
+                # Producers already wait for both plan_ready and pair ordering;
+                # consumers need only this rank's plan before claiming tiles.
+                if tid == fx.Int32(0):
+                    _local_plan_slot = (
+                        (entry_gen & fx.Int32(1)) * fx.Int32(dispatch_world)
+                        + fx.Int32(dispatch_rank)
+                    )
+                    comm_ops.spin_until_eq_i32(
+                        _tk_base
+                        + fx.Int64(dispatch_layout.plan_ready)
+                        + fx.Int64(_local_plan_slot) * 4,
+                        entry_gen + fx.Int32(1),
+                    )
+                workgroup_barrier()
+                comm_ops.fence_system_acquire()
             elif const_expr(plan_on):
                 # The plan: one workgroup, ahead of everything, while the rest
                 # of the grid is still being dispatched. It also resets what

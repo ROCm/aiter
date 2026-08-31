@@ -492,7 +492,18 @@ class MegaMoEGfx1250:
                 f"got {tuple(topk_ids.shape)}"
             )
         stage1_dispatch = None
-        if self._config.fused_stage1:
+        # At mtpr<=64 the compact persistent protocol costs more than the GEMM:
+        # count/base round-trips and reserved producer CUs dominate ~140us of
+        # useful GEMM1 work. The fixed-recv experiments also showed that adding
+        # a receiver compact phase to the same persistent grid serializes the
+        # tile-ready path. Keep the proven recv-slot dispatch plus the ~4us
+        # standalone preshuffle for this knee; larger buckets retain fused
+        # compact dispatch.
+        use_fused_stage1 = (
+            self._config.fused_stage1
+            and self._config.max_tokens_per_rank > 64
+        )
+        if use_fused_stage1:
             stream = fx.Stream(torch.cuda.current_stream())
             warps = self._wire_quant.warps_per_block
             self._wire_quant(
@@ -519,7 +530,7 @@ class MegaMoEGfx1250:
             recv_x, recv_weights, recv_ids, total_recv, routing = self._dispatch(
                 hidden_states, topk_weights, topk_ids
             )
-        if recv_token_bound is not None and not self._config.fused_stage1:
+        if recv_token_bound is not None and not use_fused_stage1:
             bound = int(recv_token_bound)
             if bound <= 0 or bound > recv_x.shape[0]:
                 raise ValueError(

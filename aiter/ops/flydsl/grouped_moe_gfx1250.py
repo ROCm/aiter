@@ -174,8 +174,9 @@ def _stage1_dispatch_grid_mult(tokens: int, mtpr: int) -> int:
 
       1 planner + num_producer + first-wave consumers = CU
 
-    so ``num_producer + num_consumer`` on that wave is ``CU - 1``. The 512
-    token bucket uses two waves; larger-capacity buckets use one.
+    so ``num_producer + num_consumer`` on that wave is ``CU - 1``. Extra
+    consumer waves (grid_mult=2) help none of the gfx1250 tpr buckets: 64/128
+    nearly doubled, 256/512 were flat-to-worse. Default is one wave.
     Override with ``AITER_FLYDSL_STAGE1_GRID_MULT``.
     """
     raw = os.environ.get("AITER_FLYDSL_STAGE1_GRID_MULT")
@@ -187,7 +188,8 @@ def _stage1_dispatch_grid_mult(tokens: int, mtpr: int) -> int:
                 "1,2,3,4,6,8,12,16,24,32"
             )
         return value
-    return 2 if mtpr <= tokens else 1
+    _ = (tokens, mtpr)
+    return 1
 
 
 def _stage1_compact_dispatch_cu(
@@ -212,10 +214,17 @@ def _stage1_compact_dispatch_cu(
     if raw != "auto":
         dispatch_cu = max(0, int(raw))
     else:
-        # Match the requested gfx1250 buckets: the exact-MTPR case uses 128
-        # producers in a two-wave grid; max-capacity cases use 64 in one wave.
+        # Per-tpr knees on gfx1250 (61-layer, world=4). A second consumer wave
+        # is never the right default; producer count still tracks copy vs GEMM.
         _ = (experts_per_rank, model_dim, inter_dim)
-        dispatch_cu = 128 if mtpr <= tokens else 64
+        if mtpr > tokens:
+            dispatch_cu = 64
+        elif tokens <= 64:
+            dispatch_cu = 128
+        elif tokens <= 256:
+            dispatch_cu = 192
+        else:
+            dispatch_cu = 128
     if world_size <= 0:
         raise ValueError("compact dispatch needs a positive world size")
     # Leave ticket 0 for the planner and at least one first-wave consumer.
@@ -909,7 +918,17 @@ def _grouped_a8w4_tdm_moe(
         if dispatch_on
         else (
             _stage1_producer_blocks(device, contiguous_m, _gemm1_tiles)
-            if _wire_stride
+            # At tpr=64 the tile_m=16 recv-slot producer path can index beyond
+            # its compact route workspace (and disabling its fused plan still
+            # produces NaNs). The standalone route preshuffle is both safe and
+            # only ~4us at this size, so do not fuse those producers into GEMM1.
+            if (
+                _wire_stride
+                and (
+                    stage2_scatter is None
+                    or int(stage2_scatter.max_tokens_per_rank) > 64
+                )
+            )
             else 0
         )
     )
