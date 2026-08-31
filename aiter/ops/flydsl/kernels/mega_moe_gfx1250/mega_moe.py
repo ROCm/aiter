@@ -43,6 +43,24 @@ _MORI_REGION_NAMES = {
 }
 
 
+def _dispatch_wire_from_env() -> str:
+    """$MEGA_DISPATCH_WIRE, and a loud death for the name it replaced.
+
+    Not a fallback: an env var that is silently ignored sends a run that asked
+    for fp4 down the bf16 path and reports nothing, which is the one failure
+    mode a wire benchmark cannot survive.
+    """
+    stale, current = os.environ.get("MEGA_WIRE"), os.environ.get("MEGA_DISPATCH_WIRE")
+    if stale is not None and current != stale:
+        raise RuntimeError(
+            "MEGA_WIRE was renamed to MEGA_DISPATCH_WIRE (combine gets its own "
+            f"wire); found MEGA_WIRE={stale!r} with MEGA_DISPATCH_WIRE="
+            f"{current!r}. Update the launch script rather than relying on the "
+            "old name -- it is no longer read."
+        )
+    return current or "bf16"
+
+
 @dataclass(frozen=True)
 class _DispatchWire:
     """One DISPATCH wire. Per token at hidden 7168: bf16 14336 B, fp8 7168 + 256,
@@ -438,7 +456,7 @@ class MegaMoEGfx1250:
                 dispatch_wire=(
                     dispatch_wire
                     if dispatch_wire is not None
-                    else os.environ.get("MEGA_WIRE", "bf16")
+                    else _dispatch_wire_from_env()
                 ),
             ),
             communicator,
