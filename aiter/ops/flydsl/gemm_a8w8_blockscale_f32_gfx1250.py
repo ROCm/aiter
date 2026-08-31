@@ -55,6 +55,7 @@ def _p(t):
 @functools.lru_cache(maxsize=1024)
 def _cached_launcher(*cfg):
     keys = (
+        "N",
         "K",
         "tile_m",
         "tile_n",
@@ -127,36 +128,20 @@ def gemm_a8w8_blockscale(
     _half_str = "fp16" if dtype == torch.float16 else "bf16"
     out_dtype_str = "f32" if _splitk_f32_accum or dtype == torch.float32 else _half_str
 
-    K_padded = ((K + tile_k - 1) // tile_k) * tile_k
-    if K_padded != K:
-        pad_size = K_padded - K
-        x = torch.nn.functional.pad(x, (0, pad_size))
-        w = torch.nn.functional.pad(w, (0, pad_size * 16))
-        new_scale_k = K_padded // scale_block_k
-        scale_pad = new_scale_k - scale_k
-        if scale_pad > 0:
-            x_scale = torch.nn.functional.pad(x_scale, (0, scale_pad))
-            w_scale = torch.nn.functional.pad(w_scale, (0, scale_pad))
-        K = K_padded
-
-    # Pad N up to tile_n so the kernel's WMMAs and stores land inside the allocated output.
-    N_stride = ((N + tile_n - 1) // tile_n) * tile_n
-
     if y is not None:
         assert y.shape == (M, N), f"y shape {y.shape} != ({M}, {N})"
         assert y.dtype == dtype, f"y dtype {y.dtype} != {dtype}"
 
     _alloc = torch.zeros if split_k > 1 else torch.empty
-    if _splitk_f32_accum or N_stride != N:
-        y_buf = _alloc((M, N_stride), dtype=buf_dtype, device=x.device)
-    elif y is not None:
+    if _splitk_f32_accum or y is None:
+        y_buf = _alloc((M, N), dtype=buf_dtype, device=x.device)
+    else:
         y_buf = y
         if split_k > 1:
             y_buf.zero_()
-    else:
-        y_buf = _alloc((M, N), dtype=dtype, device=x.device)
 
     launcher = _cached_launcher(
+        N,
         K,
         tile_m,
         tile_n,
@@ -196,13 +181,12 @@ def gemm_a8w8_blockscale(
         _fx.Stream(stream),
     )
 
-    result = y_buf[:, :N] if N_stride != N else y_buf
-    if _splitk_f32_accum:
-        result = result.to(dtype)
-    if y is None or result is y:
-        return result
-    y.copy_(result)
-    return y
+    if not _splitk_f32_accum:
+        return y_buf
+    if y is not None:
+        y.copy_(y_buf)
+        return y
+    return y_buf.to(dtype)
 
 
 __all__ = ["gemm_a8w8_blockscale"]

@@ -31,6 +31,7 @@ def _byte_off_i32(elem_off, elem_bytes):
 
 def compile_gemm_a8w8_blockscale(
     *,
+    N: int,
     K: int,
     tile_m: int = 128,
     tile_n: int = 128,
@@ -71,22 +72,18 @@ def compile_gemm_a8w8_blockscale(
             ("warp_tile_n", warp_tile_n, WMMA_N),
             ("scale_block_k", scale_block_k, WMMA_K),
             ("tile_k", tile_k, scale_block_k),
-            ("K", K, tile_k),
-            ("K", K, scale_block_k),
+            ("K", K, 32),
         )
     )
+    _req(N > 0, "N must be > 0 at compile time")
+    _req(N % 16 == 0, f"N ({N}) must be a multiple of 16 (preshuffled W)")
     if split_k > 1:
         _req(
             variant == "memory_bound", f"split_k>1 needs memory_bound, got {variant!r}"
         )
         _req(out_dtype == "f32", "split_k>1 requires out_dtype='f32' (f32 atomic-fadd)")
         _req(K % split_k == 0, f"K ({K}) must be divisible by split_k ({split_k})")
-        _req_multiples(
-            (
-                ("K/split_k", K // split_k, tile_k),
-                ("K/split_k", K // split_k, scale_block_k),
-            )
-        )
+        _req_multiples((("K/split_k", K // split_k, scale_block_k),))
 
     wmma_m_rep, wmma_n_rep = warp_tile_m // WMMA_M, warp_tile_n // WMMA_N
     n_accs = wmma_m_rep * wmma_n_rep
@@ -100,8 +97,11 @@ def compile_gemm_a8w8_blockscale(
     ]
 
     split_k_chunk = K // split_k
-    num_k_tiles, scale_k = split_k_chunk // tile_k, K // scale_block_k
-    scale_k_per_split = split_k_chunk // scale_block_k
+    num_k_tiles = (split_k_chunk + tile_k - 1) // tile_k
+    k_rem = split_k_chunk % tile_k
+    n_edge = N % tile_n
+    scale_k = (K + scale_block_k - 1) // scale_block_k
+    scale_k_per_split = (split_k_chunk + scale_block_k - 1) // scale_block_k
 
     NUM_W_CHUNKS = (scale_k_per_split + 31) // 32
     USES_W_CHUNK_PREFETCH = NUM_W_CHUNKS > 1
@@ -246,20 +246,29 @@ def compile_gemm_a8w8_blockscale(
             )
 
         def _issue_tile(buf_idx, k_tile):
-            for atom, gt, base, shape, row in _TDM_SPECS:
-                fx.copy(
-                    atom,
-                    gt,
-                    fx.Tensor(
-                        fx.make_view(
-                            fx.add_offset(
-                                base, _slot_byte_off(buf_idx, shape[0] * row)
-                            ),
-                            fx.make_layout(shape, (row, 1)),
-                        )
-                    ),
-                    imm_offset=_imm64(k_tile, shape[1]),
+            for atom, atom_tail, gt, base, shape, row in _TDM_SPECS:
+                dst = fx.Tensor(
+                    fx.make_view(
+                        fx.add_offset(base, _slot_byte_off(buf_idx, shape[0] * row)),
+                        fx.make_layout(shape, (row, 1)),
+                    )
                 )
+                imm = _imm64(k_tile, shape[1])
+                if const_expr(k_rem == 0):
+                    fx.copy(atom, gt, dst, imm_offset=imm)
+                elif const_expr(isinstance(k_tile, int)):
+                    fx.copy(
+                        atom_tail if k_tile == num_k_tiles - 1 else atom,
+                        gt,
+                        dst,
+                        imm_offset=imm,
+                    )
+                else:
+                    kt, tail_i = fx.Uint32(k_tile), fx.Uint32(num_k_tiles - 1)
+                    if kt == tail_i:
+                        fx.copy(atom_tail, gt, dst, imm_offset=imm)
+                    if kt < tail_i:
+                        fx.copy(atom, gt, dst, imm_offset=imm)
 
         def ds_read_x_scales(buf_idx):
             slot_elems = lds_x_scale_data_bytes // 4
@@ -500,10 +509,61 @@ def compile_gemm_a8w8_blockscale(
             early_timeout=True,
         )
 
+        xs_tail_bytes = scale_k_per_split * 4 - (num_k_tiles - 1) * xs_row_bytes
+        atom_x_tail = (
+            fx.rocdl.make_tdm_atom(
+                gX,
+                [mn_oob, k_rem],
+                strides=[fx.Int32(i32_lda), None],
+                num_warps=num_warps,
+                pad_interval=tile_k,
+                pad_amount=LDS_PAD_A_BYTES,
+                early_timeout=True,
+            )
+            if k_rem
+            else atom_x
+        )
+        atom_w_tail = (
+            fx.rocdl.make_tdm_atom(
+                gW,
+                [nb_oob, k_rem * 16],
+                strides=[fx.Int32(i32_ldb), None],
+                num_warps=num_warps,
+                early_timeout=True,
+            )
+            if k_rem
+            else atom_w
+        )
+        atom_xs_tail = (
+            fx.rocdl.make_tdm_atom(
+                gXS,
+                [mn_oob, xs_tail_bytes],
+                strides=[fx.Int32(i32_lds), None],
+                num_warps=num_warps,
+                early_timeout=True,
+            )
+            if k_rem
+            else atom_xs
+        )
+
         _TDM_SPECS = (
-            (atom_x, gX, big_a_mem, (tile_m, tile_k), lds_a_stride_bytes),
-            (atom_w, gW, big_b_mem, (tile_n // 16, tile_k * 16), lds_b_stride_bytes),
-            (atom_xs, gXS, lds.xs.ptr, (tile_m, xs_row_bytes), xs_row_bytes),
+            (atom_x, atom_x_tail, gX, big_a_mem, (tile_m, tile_k), lds_a_stride_bytes),
+            (
+                atom_w,
+                atom_w_tail,
+                gW,
+                big_b_mem,
+                (tile_n // 16, tile_k * 16),
+                lds_b_stride_bytes,
+            ),
+            (
+                atom_xs,
+                atom_xs_tail,
+                gXS,
+                lds.xs.ptr,
+                (tile_m, xs_row_bytes),
+                xs_row_bytes,
+            ),
         )
 
         wave_n_block = (blk_n + warp_n_base) // scale_block_n
@@ -723,36 +783,59 @@ def compile_gemm_a8w8_blockscale(
                                     fx.add_offset(
                                         xt, (lane_kgrp + 2 * e) * WMMA_N + lane16
                                     )
-                                ).ir_value()
+                                )
                             ],
                             fx.Float32,
                         )
-                        fx.copy(
-                            add_atom,
-                            _rmem_vec(xt_val, 1, fx.Float32),
-                            gYp[None, xt_row * ldc + t_col],
-                        )
+                        if const_expr(n_edge == 0):
+                            fx.copy(
+                                add_atom,
+                                _rmem_vec(xt_val, 1, fx.Float32),
+                                gYp[None, xt_row * ldc + t_col],
+                            )
+                        else:
+                            if t_col < fx.Uint64(N):
+                                fx.copy(
+                                    add_atom,
+                                    _rmem_vec(xt_val, 1, fx.Float32),
+                                    gYp[None, xt_row * ldc + t_col],
+                                )
             elif const_expr(_half_out):
                 h_vec = _vec(accs[idx]).to(out_dt)
-                fx.copy(
-                    st_atom,
-                    _rmem_vec(h_vec, 8, out_dt),
-                    gY[None, elem_off],
-                )
+                if const_expr(n_edge == 0):
+                    fx.copy(
+                        st_atom,
+                        _rmem_vec(h_vec, 8, out_dt),
+                        gY[None, elem_off],
+                    )
+                else:
+                    n_left = fx.Int32(N) - fx.Int32(col_base)
+                    if n_left >= fx.Int32(8):
+                        fx.copy(
+                            st_atom,
+                            _rmem_vec(h_vec, 8, out_dt),
+                            gY[None, elem_off],
+                        )
             else:
                 for half in range_constexpr(2):
                     vec4 = fx.Vector.from_elements(
-                        [
-                            _vec(accs[idx])[half * 4 + vi].ir_value()
-                            for vi in range_constexpr(4)
-                        ],
+                        [_vec(accs[idx])[half * 4 + vi] for vi in range_constexpr(4)],
                         fx.Float32,
                     )
-                    fx.copy(
-                        st_atom,
-                        _rmem_vec(vec4, 4, fx.Float32),
-                        gY[None, elem_off + half * 4],
-                    )
+                    if const_expr(n_edge == 0):
+                        fx.copy(
+                            st_atom,
+                            _rmem_vec(vec4, 4, fx.Float32),
+                            gY[None, elem_off + half * 4],
+                        )
+                    else:
+                        n_left = fx.Int32(N) - fx.Int32(col_base) - fx.Int32(half * 4)
+                        if n_left >= fx.Int32(4):
+                            fx.copy(
+                                st_atom,
+                                _rmem_vec(vec4, 4, fx.Float32),
+                                gY[None, elem_off + half * 4],
+                            )
 
     @flyc.jit
     def launch_gemm_a8w8_blockscale(
@@ -770,7 +853,7 @@ def compile_gemm_a8w8_blockscale(
         stream: fx.Stream,
     ):
         gx = (fx.Uint64(i32_m) + (tile_m - 1)) // tile_m
-        gy = (fx.Uint64(i32_n) + (tile_n - 1)) // tile_n
+        gy = (N + tile_n - 1) // tile_n
 
         wpe = int(waves_per_eu) if waves_per_eu is not None else 0
         launcher = kernel_gemm_a8w8_blockscale(
