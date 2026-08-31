@@ -10,13 +10,11 @@ it here avoids drift between the two kernels' fp8 entry layouts (they MUST stay
 byte-identical so the V4 nm-asm sparse-attn reader sees one layout).
 """
 
-from contextlib import contextmanager
 from functools import lru_cache
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import scf
-from flydsl.expr import arith, range_constexpr
+from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch
 
@@ -28,25 +26,8 @@ from aiter.utility.mx_types import (
 )
 
 from .quant_utils import emit_mx_e8m0_scale
-from .tensor_shim import ptr_buf_tensor
 
 _AS_GLOBAL = fx.AddressSpace.Global
-
-
-@contextmanager
-def _if_then(cond):
-    """scf.if then-region guard for a runtime fx.Boolean. Used instead of a plain
-    Python ``if`` because this emitter is an imported helper -- the DSL's
-    ``if cond:`` -> scf.if AST rewrite only fires on the decorated kernel source,
-    not on code it calls into, so guarded stores here must build the scf.if."""
-    if_op = scf.IfOp(cond.ir_value())
-    with ir.InsertionPoint(if_op.then_block):
-        try:
-            yield
-        finally:
-            blk = if_op.then_block
-            if (not blk.operations) or not isinstance(blk.operations[-1], scf.YieldOp):
-                scf.YieldOp([])
 
 
 @lru_cache(maxsize=1)
@@ -126,46 +107,6 @@ def _global_ptr(base_i64, byte_off, elem_ir_type, align):
     return fx.inttoptr(pt, addr)
 
 
-def buf_tensor(tensor, elem_ty, *, base_i64=None):
-    """Flat buffer-resource (V#) tensor over ``tensor``'s memory, reinterpreted as
-    ``elem_ty``. ``add_offset`` advances by ``elem_ty`` elements, so the caller
-    passes offsets in the load/store unit (like ``buffer_ops``, whose offset
-    scales by the *load* dtype, not the tensor's declared type -- e.g. a bf16
-    tensor read as i32 dwords). ``base_i64`` (a 64-bit BYTE offset) is folded into
-    the base pointer before the descriptor is built, reproducing
-    ``create_buffer_resource(base_byte_offset=...)`` so per-thread voffsets stay
-    32-bit and the 4 GiB guard holds by construction.
-    """
-    native = tensor.element_type
-    n_native = fx.get_scalar(fx.cosize(fx.get_layout(tensor)))
-    n_elems = n_native * native.width // elem_ty.width
-    base_i = fx.Int64(fx.ptrtoint(fx.get_iter(tensor)))
-    if base_i64 is not None:
-        base_i = base_i + fx.Int64(base_i64)
-    pt = fx.PointerType.get(
-        elem_ty.ir_type,
-        address_space=_AS_GLOBAL,
-        alignment=elem_ty.width // 8,
-    )
-    # Descriptor build (view + make_buffer_tensor) is shared with tensor_shim;
-    # ptr_buf_tensor does a ptrtoint(inttoptr(base_i)) roundtrip that folds
-    # away pre-ISA, so the emitted V# is identical.
-    return ptr_buf_tensor(fx.inttoptr(pt, base_i), elem_ty, n_elems)
-
-
-def buf_load(buf, off_elems, width, dtype):
-    """Element-offset load from a buffer-tensor (V# desc); offset in ELEMENTS of
-    ``dtype`` (== ``buf``'s element type). HW OOB check comes from the descriptor.
-    """
-    p = fx.add_offset(fx.get_iter(buf), off_elems)
-    return p.load(dtype if width == 1 else T.vec(width, dtype))
-
-
-def buf_store(val, buf, off_elems):
-    """Element-offset store into a buffer-tensor (V# desc)."""
-    fx.add_offset(fx.get_iter(buf), off_elems).store(val)
-
-
 def emit_group_fp8_nm_asm_scatter(
     *,
     normed_lane,  # list[VEC] f32: post-norm nope values (this lane's slice)
@@ -182,7 +123,6 @@ def emit_group_fp8_nm_asm_scatter(
     log2_rts,
     ROPE_THREAD_LO,  # first rope lane (= NOPE // VEC)
     wave_width,  # 64 (wave64) or 32 (wave32) -- shuffle_xor width
-    fm_fast,  # arith.FastMathFlags.fast
 ):
     """Emit the FP8 nope (1xG e8m0) + inline duplicated e8m0 scale + bf16 rope->separate
     buffer scatter (V4 nm-asm layout). Byte-identical across CSA / HCA / wave32.
@@ -219,53 +159,71 @@ def emit_group_fp8_nm_asm_scatter(
     inv_scale = (quant_exp << fx.Int32(23)).bitcast(fx.Float32)
 
     # -- nope lanes: scaled fp8 + group-leader dup e8m0 byte --
-    with _if_then(lane < fx.Int32(ROPE_THREAD_LO)):
-        safe = []
-        for i in range_constexpr(VEC):
-            sv = arith.MulFOp(
-                normed[i].ir_value(), inv_scale.ir_value(), fastmath=fm_fast
-            ).result
-            sv = fx.Float32(sv)
-            # e4m3fnuz -0->+0 clamp: small negatives -> +0 (cvt returns NaN otherwise)
-            is_tn = (sv < c0f) & (sv > c_neg_uf)
-            safe.append(is_tn.select(c0f, sv))
-        # pack VEC fp8 -> VEC/4 dwords (2 cvt_pk_fp8 per dword)
-        dwords = []
-        for d in range_constexpr(VEC // 4):
-            pk = fx.Int32(0).ir_value()
-            pk = fx.rocdl.cvt_pk_fp8_f32(i32, safe[4 * d + 0], safe[4 * d + 1], pk, 0)
-            pk = fx.rocdl.cvt_pk_fp8_f32(i32, safe[4 * d + 2], safe[4 * d + 3], pk, 1)
-            dwords.append(fx.Int32(pk))
-        nope_off = cache_base + lane * fx.Int32(VEC)
-        store_vec = fx.Vector.from_elements(dwords, fx.Int32)
-        # VEC fp8 bytes = VEC//4 i32 dwords at byte offset nope_off.
-        _global_ptr(out_base_i64, nope_off, i32, VEC).store(store_vec)
+    # Guarded bodies live in local @flyc.jit helpers so a plain `if` lowers to
+    # scf.if: the DSL's if-rewrite fires on a decorated body, not on this
+    # imported emitter's own source (skill Sec.5).
+    @flyc.jit
+    def _nope_lanes():
+        if lane < fx.Int32(ROPE_THREAD_LO):
+            safe = []
+            for i in range_constexpr(VEC):
+                # inv_scale is fast-fp-math ambient -> `*` == the old
+                # MulFOp(fastmath=fast) (byte-identical under _DEFAULT_COMPILE_HINTS).
+                sv = normed[i] * inv_scale
+                # e4m3fnuz -0->+0 clamp: small negatives -> +0 (cvt returns NaN otherwise)
+                is_tn = (sv < c0f) & (sv > c_neg_uf)
+                safe.append(is_tn.select(c0f, sv))
+            # pack VEC fp8 -> VEC/4 dwords (2 cvt_pk_fp8 per dword)
+            dwords = []
+            for d in range_constexpr(VEC // 4):
+                pk = fx.Int32(0).ir_value()
+                pk = fx.rocdl.cvt_pk_fp8_f32(
+                    i32, safe[4 * d + 0].ir_value(), safe[4 * d + 1].ir_value(), pk, 0
+                )
+                pk = fx.rocdl.cvt_pk_fp8_f32(
+                    i32, safe[4 * d + 2].ir_value(), safe[4 * d + 3].ir_value(), pk, 1
+                )
+                dwords.append(fx.Int32(pk))
+            nope_off = cache_base + lane * fx.Int32(VEC)
+            store_vec = fx.Vector.from_elements(dwords, fx.Int32)
+            # VEC fp8 bytes = VEC//4 i32 dwords at byte offset nope_off.
+            _global_ptr(out_base_i64, nope_off, i32, VEC).store(store_vec)
 
-        with _if_then((lane & fx.Int32(RTS - 1)) == fx.Int32(0)):
-            e8m0_i8 = fx.Int32(e8m0).to(fx.Int8)
-            group_id = lane >> fx.Int32(log2_rts)
-            sc_off = cache_base + fx.Int32(NOPE) + group_id * fx.Int32(2)
-            # e8m0 duplicated x2: one i8 byte at sc_off and sc_off+1.
-            sc_ptr = _global_ptr(out_base_i64, sc_off, T.i8, 1)
-            sc_ptr[0] = e8m0_i8
-            sc_ptr[1] = e8m0_i8
+            if (lane & fx.Int32(RTS - 1)) == fx.Int32(0):
+                e8m0_i8 = fx.Int32(e8m0).to(fx.Int8)
+                group_id = lane >> fx.Int32(log2_rts)
+                sc_off = cache_base + fx.Int32(NOPE) + group_id * fx.Int32(2)
+                # e8m0 duplicated x2: one i8 byte at sc_off and sc_off+1.
+                sc_ptr = _global_ptr(out_base_i64, sc_off, T.i8, 1)
+                sc_ptr[0] = e8m0_i8
+                sc_ptr[1] = e8m0_i8
+
+    _nope_lanes()
 
     # -- rope lanes: rotated bf16 -> separate k_rope_buff --
-    with _if_then(is_rope_t):
-        rope_rel = lane - fx.Int32(ROPE_THREAD_LO)
-        krope_off = krope_base + rope_rel * fx.Int32(VEC)  # bf16 elements
-        rope_f32 = fx.Vector.from_elements(list(rotated_lane), fx.Float32)
-        rope_bf16 = rope_f32.truncf(T.vec(VEC, T.bf16))
-        dwr = (VEC + 1) // 2
-        rope_i32 = rope_bf16.bitcast(fx.Int32)  # -> vec<dwr x i32>
-        # bf16 element offset -> byte offset (x2). dwr i32 dwords per rope row.
-        krope_byte = krope_off << fx.Int32(1)
-        if dwr <= 4:
-            # VEC<=8 (wave64): single dwordx{dwr} store.
-            _global_ptr(krope_base_i64, krope_byte, i32, 4 * dwr).store(rope_i32)
-        else:
-            # VEC=16 (wave32) -> dwr=8: no dwordx8 store; split into 2x dwordx4.
-            lo = fx.Vector.from_elements([rope_i32[k] for k in range(4)], fx.Int32)
-            hi = fx.Vector.from_elements([rope_i32[k + 4] for k in range(4)], fx.Int32)
-            _global_ptr(krope_base_i64, krope_byte, i32, 16).store(lo)
-            _global_ptr(krope_base_i64, krope_byte + fx.Int32(16), i32, 16).store(hi)
+    @flyc.jit
+    def _rope_lanes():
+        if is_rope_t:
+            rope_rel = lane - fx.Int32(ROPE_THREAD_LO)
+            krope_off = krope_base + rope_rel * fx.Int32(VEC)  # bf16 elements
+            rope_f32 = fx.Vector.from_elements(list(rotated_lane), fx.Float32)
+            rope_bf16 = rope_f32.truncf(T.vec(VEC, T.bf16))
+            dwr = (VEC + 1) // 2
+            rope_i32 = rope_bf16.bitcast(fx.Int32)  # -> vec<dwr x i32>
+            # bf16 element offset -> byte offset (x2). dwr i32 dwords per rope row.
+            krope_byte = krope_off << fx.Int32(1)
+            if dwr <= 4:
+                # VEC<=8 (wave64): single dwordx{dwr} store.
+                _global_ptr(krope_base_i64, krope_byte, i32, 4 * dwr).store(rope_i32)
+            else:
+                # VEC=16 (wave32) -> dwr=8: no dwordx8 store; split into 2x dwordx4.
+                lo = fx.Vector.from_elements([rope_i32[k] for k in range(4)], fx.Int32)
+                hi = fx.Vector.from_elements(
+                    [rope_i32[k + 4] for k in range(4)], fx.Int32
+                )
+                _global_ptr(krope_base_i64, krope_byte, i32, 16).store(lo)
+                _global_ptr(krope_base_i64, krope_byte + fx.Int32(16), i32, 16).store(
+                    hi
+                )
+
+    _rope_lanes()

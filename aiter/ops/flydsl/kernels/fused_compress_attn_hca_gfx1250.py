@@ -895,7 +895,6 @@ def _build_norm_rope_scatter_kernel(
                     log2_rts=log2_rts,
                     ROPE_THREAD_LO=ROPE_THREAD_LO,
                     wave_width=BLOCK_THREADS,
-                    fm_fast=fm_fast,
                 )
             else:
                 # ---- BF16 single-buffer scatter (nope + rope contiguous) ----

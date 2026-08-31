@@ -966,7 +966,6 @@ def _build_kernel(
                         log2_rts=log2_rts,
                         ROPE_THREAD_LO=ROPE_THREAD_LO,
                         wave_width=BLOCK_THREADS,
-                        fm_fast=fm_fast,
                     )
                 else:
                     # -- QUANT=1: FP8 per-row scaled write + fp32 scale --

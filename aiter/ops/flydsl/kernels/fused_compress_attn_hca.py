@@ -55,21 +55,27 @@ from .fused_compress_attn_common import (
     emit_group_fp8_nm_asm_scatter,
     state_slot_byte_offset,
 )
-from .fused_compress_attn_common import (
-    buf_load as _buf_load,
-)
-from .fused_compress_attn_common import (
-    buf_store as _buf_store,
-)
-from .fused_compress_attn_common import (
-    buf_tensor as _buf_tensor,
-)
-from .tensor_shim import _run_compiled, _to_raw
+from .tensor_shim import _run_compiled, _to_raw, ptr_buf_tensor
 
 BLOCK_THREADS = 64  # 1 wave64
 SLICE = 64  # head_dim elements per block (grid-Y split)
 _NEG_INF = float("-inf")
 _LOG2E = math.log2(math.e)
+
+
+def _ptr_at_byte_off(tensor, base_i64):
+    """Global byte pointer at ``tensor``'s base + ``base_i64`` (64-bit byte offset).
+
+    Used to fold a slot/block rebase into the pointer handed to
+    ``ptr_buf_tensor``, which re-derives the descriptor's element type -- so the
+    i8 carrier type here only carries the address and the ptrtoint/inttoptr
+    roundtrip folds away pre-ISA, keeping the emitted V# identical to the old
+    ``buf_tensor(base_i64=...)`` descriptor.
+    """
+    pt = fx.PointerType.get(T.i8, address_space=fx.AddressSpace.Global, alignment=1)
+    return fx.inttoptr(
+        pt, fx.Int64(fx.ptrtoint(fx.get_iter(tensor))) + fx.Int64(base_i64)
+    )
 
 
 # ============================================================================
@@ -193,8 +199,10 @@ def _build_compress_forward_kernel(
         lid = fx.Int32(tid) % 64  # -> [0, 64)
 
         # -- Load plan row ----------------------------------------------
-        plan_buf = _buf_tensor(plan, fx.Int32)
-        plan_vec = fx.Vector(_buf_load(plan_buf, fx.Int32(pid) * 4, 4, i32))
+        plan_buf = ptr_buf_tensor(fx.get_iter(plan), fx.Int32)
+        plan_vec = fx.Vector(
+            fx.add_offset(fx.get_iter(plan_buf), fx.Int32(pid) * 4).load(T.vec(4, i32))
+        )
         ragged_id = plan_vec[0]
         batch_id = plan_vec[1]
         position = plan_vec[2]
@@ -207,25 +215,27 @@ def _build_compress_forward_kernel(
             # elements starting at slice_base + lid * VEC.
             col_off_base = fx.Int32(sid) * SLICE_SZ + fx.Int32(lid) * VEC
 
-            slot_map_buf = _buf_tensor(state_slot_mapping, fx.Int32)
-            slot = _buf_load(slot_map_buf, batch_id, 1, i32)
+            slot_map_buf = ptr_buf_tensor(fx.get_iter(state_slot_mapping), fx.Int32)
+            slot = fx.add_offset(fx.get_iter(slot_map_buf), batch_id).load(i32)
 
             # bf16 inputs are read as i32 dwords (unaligned bit-extract) -> i32 buf.
-            kv_in_buf = _buf_tensor(kv_in, fx.Int32)
-            score_in_buf = _buf_tensor(score_in, fx.Int32)
+            kv_in_buf = ptr_buf_tensor(fx.get_iter(kv_in), fx.Int32)
+            score_in_buf = ptr_buf_tensor(fx.get_iter(score_in), fx.Int32)
             # Rebased onto this program's slot — the 64-bit slot byte offset is
-            # folded into the descriptor base (see `_buf_tensor` / `state_slot_byte_offset`).
-            kv_state_buf = _buf_tensor(
-                kv_state,
+            # folded into the descriptor base (see `state_slot_byte_offset`).
+            kv_state_buf = ptr_buf_tensor(
+                _ptr_at_byte_off(
+                    kv_state, state_slot_byte_offset(slot, kv_state_slot_stride)
+                ),
                 fx.Float32,
-                base_i64=state_slot_byte_offset(slot, kv_state_slot_stride),
             )
-            score_state_buf = _buf_tensor(
-                score_state,
+            score_state_buf = ptr_buf_tensor(
+                _ptr_at_byte_off(
+                    score_state, state_slot_byte_offset(slot, score_state_slot_stride)
+                ),
                 fx.Float32,
-                base_i64=state_slot_byte_offset(slot, score_state_slot_stride),
             )
-            ape_buf = _buf_tensor(ape, fx.Float32)
+            ape_buf = ptr_buf_tensor(fx.get_iter(ape), fx.Float32)
 
             def _load_bf16_vec_to_f32(buf, base_off_elems_i32):
                 """Load VEC contiguous bf16 elements starting at
@@ -238,7 +248,7 @@ def _build_compress_forward_kernel(
                 if const_expr(VEC == 1):
                     off_dw = base_off >> 1
                     lane_in_dw = base_off & 1
-                    raw_s = fx.Int32(_buf_load(buf, off_dw, 1, i32))
+                    raw_s = fx.Int32(fx.add_offset(fx.get_iter(buf), off_dw).load(i32))
                     # logical (unsigned) shift for the hi-word extract: fx Int32 >>
                     # is arithmetic -> use Uint32 to keep v_lshrrev_b32.
                     hi = fx.Int32((fx.Uint32(raw_s) >> 16).ir_value())
@@ -256,10 +266,15 @@ def _build_compress_forward_kernel(
                         # vec_width=1 returns scalar i32; wrap into vec<1xi32>
                         # before bitcast to vec<2xbf16>.
                         raw = fx.Vector.from_elements(
-                            [_buf_load(buf, off_dw, 1, i32)], dtype=fx.Int32
+                            [fx.add_offset(fx.get_iter(buf), off_dw).load(i32)],
+                            dtype=fx.Int32,
                         )
                     else:
-                        raw = fx.Vector(_buf_load(buf, off_dw, dwords, i32))
+                        raw = fx.Vector(
+                            fx.add_offset(fx.get_iter(buf), off_dw).load(
+                                T.vec(dwords, i32)
+                            )
+                        )
                     vec_bf16 = raw.bitcast(fx.BFloat16)
                     return [vec_bf16[i].to(fx.Float32) for i in range_constexpr(VEC)]
 
@@ -268,16 +283,32 @@ def _build_compress_forward_kernel(
                 if const_expr(VEC <= 4):
                     if const_expr(VEC == 1):
                         # width=1 returns scalar, not 1-vec.
-                        return [fx.Float32(_buf_load(buf, base_off_elems_i32, 1, f32))]
-                    raw = fx.Vector(_buf_load(buf, base_off_elems_i32, VEC, f32))
+                        return [
+                            fx.Float32(
+                                fx.add_offset(
+                                    fx.get_iter(buf), base_off_elems_i32
+                                ).load(f32)
+                            )
+                        ]
+                    raw = fx.Vector(
+                        fx.add_offset(fx.get_iter(buf), base_off_elems_i32).load(
+                            T.vec(VEC, f32)
+                        )
+                    )
                     return [raw[i] for i in range(VEC)]
                 else:
                     # VEC == 8: AMD HW max is dwordx4 -> 2 loads.
                     assert VEC == 8
                     half = VEC // 2
                     base = fx.Int32(base_off_elems_i32)
-                    r0 = fx.Vector(_buf_load(buf, base, half, f32))
-                    r1 = fx.Vector(_buf_load(buf, base + half, half, f32))
+                    r0 = fx.Vector(
+                        fx.add_offset(fx.get_iter(buf), base).load(T.vec(half, f32))
+                    )
+                    r1 = fx.Vector(
+                        fx.add_offset(fx.get_iter(buf), base + half).load(
+                            T.vec(half, f32)
+                        )
+                    )
                     return [r0[i] for i in range(half)] + [r1[i] for i in range(half)]
 
             def _issue_phase2_loads(k_i32):
@@ -453,23 +484,23 @@ def _build_compress_forward_kernel(
                     comp_list.append(kv_sum * rcp_w)
 
                 # -- Vectorized write of VEC f32 comp values --
-                out_buf = _buf_tensor(kv_compressed, fx.Float32)
+                out_buf = ptr_buf_tensor(fx.get_iter(kv_compressed), fx.Float32)
                 out_off = (
                     fx.Int32(pid) * fx.Int32(kv_compressed_row_stride) + col_off_base
                 )
                 if const_expr(VEC == 1):
-                    _buf_store(comp_list[0], out_buf, out_off)
+                    fx.add_offset(fx.get_iter(out_buf), out_off).store(comp_list[0])
                 elif const_expr(VEC <= 4):
                     out_vec = fx.Vector.from_elements(comp_list, dtype=fx.Float32)
-                    _buf_store(out_vec, out_buf, out_off)
+                    fx.add_offset(fx.get_iter(out_buf), out_off).store(out_vec)
                 else:
                     # VEC == 8: AMD HW max is dwordx4 -> 2 stores.
                     assert VEC == 8
                     half = VEC // 2
                     v0 = fx.Vector.from_elements(comp_list[0:half], dtype=fx.Float32)
                     v1 = fx.Vector.from_elements(comp_list[half:VEC], dtype=fx.Float32)
-                    _buf_store(v0, out_buf, out_off)
-                    _buf_store(v1, out_buf, out_off + half)
+                    fx.add_offset(fx.get_iter(out_buf), out_off).store(v0)
+                    fx.add_offset(fx.get_iter(out_buf), out_off + half).store(v1)
 
             if wid == 0:
                 _wave0()
@@ -625,8 +656,10 @@ def _build_norm_rope_scatter_kernel(
             return w
 
         # -- Load plan row --
-        plan_buf = _buf_tensor(plan, fx.Int32)
-        plan_vec = fx.Vector(_buf_load(plan_buf, pid * 4, 4, i32))
+        plan_buf = ptr_buf_tensor(fx.get_iter(plan), fx.Int32)
+        plan_vec = fx.Vector(
+            fx.add_offset(fx.get_iter(plan_buf), pid * 4).load(T.vec(4, i32))
+        )
         batch_id = plan_vec[1]
         position = plan_vec[2]
 
@@ -640,17 +673,25 @@ def _build_norm_rope_scatter_kernel(
             tid_x_vec = lane * VEC
 
             # -- Load kv_compressed[pid, tid*VEC : tid*VEC + VEC] --
-            kvc_buf = _buf_tensor(kv_compressed, fx.Float32)
+            kvc_buf = ptr_buf_tensor(fx.get_iter(kv_compressed), fx.Float32)
             base_off = pid * fx.Int32(kv_compressed_row_stride) + tid_x_vec
             # VEC ? {2, 4, 8}: VEC <= 4 -> single dwordx{VEC}; VEC=8 -> 2x dwordx4.
             if const_expr(VEC <= 4):
-                raw = fx.Vector(_buf_load(kvc_buf, base_off, VEC, f32))
+                raw = fx.Vector(
+                    fx.add_offset(fx.get_iter(kvc_buf), base_off).load(T.vec(VEC, f32))
+                )
                 comp_lane = [raw[i] for i in range(VEC)]
             else:
                 assert VEC == 8
                 half = 4
-                r0 = fx.Vector(_buf_load(kvc_buf, base_off, half, f32))
-                r1 = fx.Vector(_buf_load(kvc_buf, base_off + half, half, f32))
+                r0 = fx.Vector(
+                    fx.add_offset(fx.get_iter(kvc_buf), base_off).load(T.vec(half, f32))
+                )
+                r1 = fx.Vector(
+                    fx.add_offset(fx.get_iter(kvc_buf), base_off + half).load(
+                        T.vec(half, f32)
+                    )
+                )
                 comp_lane = [r0[i] for i in range(half)] + [r1[i] for i in range(half)]
 
             # -- RMSNorm (wave reduce-add of squares / D + eps; rsqrt) --
@@ -664,26 +705,43 @@ def _build_norm_rope_scatter_kernel(
             # rms_weight load
             if const_expr(rms_weight_is_bf16):
                 # bf16 weights read as i32 dwords -> i32 buf.
-                rmsw_buf = _buf_tensor(rms_weight, fx.Int32)
+                rmsw_buf = ptr_buf_tensor(fx.get_iter(rms_weight), fx.Int32)
                 dwords = (VEC + 1) // 2
                 off_dw = fx.Int32((fx.Uint32(tid_x_vec) >> 1).ir_value())
                 if const_expr(dwords == 1):
                     raw = fx.Vector.from_elements(
-                        [_buf_load(rmsw_buf, off_dw, 1, i32)], dtype=fx.Int32
+                        [fx.add_offset(fx.get_iter(rmsw_buf), off_dw).load(i32)],
+                        dtype=fx.Int32,
                     )
                 else:
-                    raw = fx.Vector(_buf_load(rmsw_buf, off_dw, dwords, i32))
+                    raw = fx.Vector(
+                        fx.add_offset(fx.get_iter(rmsw_buf), off_dw).load(
+                            T.vec(dwords, i32)
+                        )
+                    )
                 vec_bf16 = raw.bitcast(fx.BFloat16)
                 rmsw_lane = [vec_bf16[i].to(fx.Float32) for i in range_constexpr(VEC)]
             else:
-                rmsw_buf = _buf_tensor(rms_weight, fx.Float32)
+                rmsw_buf = ptr_buf_tensor(fx.get_iter(rms_weight), fx.Float32)
                 if const_expr(VEC <= 4):
-                    raw = fx.Vector(_buf_load(rmsw_buf, tid_x_vec, VEC, f32))
+                    raw = fx.Vector(
+                        fx.add_offset(fx.get_iter(rmsw_buf), tid_x_vec).load(
+                            T.vec(VEC, f32)
+                        )
+                    )
                     rmsw_lane = [raw[i] for i in range(VEC)]
                 else:
                     half = 4
-                    r0 = fx.Vector(_buf_load(rmsw_buf, tid_x_vec, half, f32))
-                    r1 = fx.Vector(_buf_load(rmsw_buf, tid_x_vec + half, half, f32))
+                    r0 = fx.Vector(
+                        fx.add_offset(fx.get_iter(rmsw_buf), tid_x_vec).load(
+                            T.vec(half, f32)
+                        )
+                    )
+                    r1 = fx.Vector(
+                        fx.add_offset(fx.get_iter(rmsw_buf), tid_x_vec + half).load(
+                            T.vec(half, f32)
+                        )
+                    )
                     rmsw_lane = [r0[i] for i in range(half)] + [
                         r1[i] for i in range(half)
                     ]
@@ -692,8 +750,8 @@ def _build_norm_rope_scatter_kernel(
 
             # -- GPT-J RoPE on RD tail --
             comp_pos_i32 = (fx.Int32(position) // ratio) * ratio
-            cos_buf = _buf_tensor(cos_cache, fx.BFloat16)
-            sin_buf = _buf_tensor(sin_cache, fx.BFloat16)
+            cos_buf = ptr_buf_tensor(fx.get_iter(cos_cache), fx.BFloat16)
+            sin_buf = ptr_buf_tensor(fx.get_iter(sin_cache), fx.BFloat16)
             cos_row_base = comp_pos_i32 * (RD // 2)
 
             is_rope_t = lane >= fx.Int32(ROPE_THREAD_LO)
@@ -702,16 +760,24 @@ def _build_norm_rope_scatter_kernel(
             cs_lo = rope_rel * PAIRS_PER_THREAD
 
             if const_expr(PAIRS_PER_THREAD == 1):
-                cos_b = _buf_load(cos_buf, cos_row_base + cs_lo, 1, T.bf16)
-                sin_b = _buf_load(sin_buf, cos_row_base + cs_lo, 1, T.bf16)
+                cos_b = fx.add_offset(fx.get_iter(cos_buf), cos_row_base + cs_lo).load(
+                    T.bf16
+                )
+                sin_b = fx.add_offset(fx.get_iter(sin_buf), cos_row_base + cs_lo).load(
+                    T.bf16
+                )
                 cos_vals = [fx.BFloat16(cos_b).to(fx.Float32)]
                 sin_vals = [fx.BFloat16(sin_b).to(fx.Float32)]
             else:
                 cos_vec = fx.Vector(
-                    _buf_load(cos_buf, cos_row_base + cs_lo, PAIRS_PER_THREAD, T.bf16)
+                    fx.add_offset(fx.get_iter(cos_buf), cos_row_base + cs_lo).load(
+                        T.vec(PAIRS_PER_THREAD, T.bf16)
+                    )
                 )
                 sin_vec = fx.Vector(
-                    _buf_load(sin_buf, cos_row_base + cs_lo, PAIRS_PER_THREAD, T.bf16)
+                    fx.add_offset(fx.get_iter(sin_buf), cos_row_base + cs_lo).load(
+                        T.vec(PAIRS_PER_THREAD, T.bf16)
+                    )
                 )
                 cos_vals = [cos_vec[i].to(fx.Float32) for i in range(PAIRS_PER_THREAD)]
                 sin_vals = [sin_vec[i].to(fx.Float32) for i in range(PAIRS_PER_THREAD)]
@@ -729,11 +795,11 @@ def _build_norm_rope_scatter_kernel(
             ci = fx.Int32(position) // ratio
             block_in_seq = ci // k_per_block
             slot_in_block = ci % k_per_block
-            bt_buf = _buf_tensor(block_table, fx.Int32)
+            bt_buf = ptr_buf_tensor(fx.get_iter(block_table), fx.Int32)
             bt_off = (
                 fx.Int32(batch_id) * fx.Int32(block_table_seq_stride) + block_in_seq
             )
-            physical_block = _buf_load(bt_buf, bt_off, 1, i32)
+            physical_block = fx.add_offset(fx.get_iter(bt_buf), bt_off).load(i32)
             # The block term rides on the descriptor's base, not on the
             # 32-bit offset -- see `block_base_bytes_i64`. What is left is one
             # block's worth, which fits by construction.
@@ -770,12 +836,14 @@ def _build_norm_rope_scatter_kernel(
                     log2_rts=log2_rts,
                     ROPE_THREAD_LO=ROPE_THREAD_LO,
                     wave_width=WAVE,
-                    fm_fast=fm_fast,
                 )
             else:
                 # ---- BF16 single-buffer scatter (nope + rope contiguous) ----
                 # bf16 kv_cache written as i32 dwords -> i32 buf, block base folded.
-                out_buf = _buf_tensor(kv_cache, fx.Int32, base_i64=cache_block_base)
+                out_buf = ptr_buf_tensor(
+                    _ptr_at_byte_off(kv_cache, cache_block_base),
+                    fx.Int32,
+                )
                 out_lane = [
                     is_rope_t.select(rotated_lane[i], normed_lane[i])
                     for i in range_constexpr(VEC)
@@ -788,9 +856,11 @@ def _build_norm_rope_scatter_kernel(
                 cache_off_dw = fx.Int32((fx.Uint32(cache_off) >> 1).ir_value())
                 dwords = (VEC + 1) // 2
                 if const_expr(dwords == 1):
-                    _buf_store(bf16_as_i32[0], out_buf, cache_off_dw)
+                    fx.add_offset(fx.get_iter(out_buf), cache_off_dw).store(
+                        bf16_as_i32[0]
+                    )
                 else:
-                    _buf_store(bf16_as_i32, out_buf, cache_off_dw)
+                    fx.add_offset(fx.get_iter(out_buf), cache_off_dw).store(bf16_as_i32)
 
         if is_active:
             _body()
