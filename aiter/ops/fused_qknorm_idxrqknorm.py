@@ -6,6 +6,8 @@ from torch import Tensor
 
 from ..jit.core import compile_ops
 
+FUSED_QKNORM_IDXRQKNORM_SUPPORTS_PACKED_SHUFFLE = True
+
 
 @compile_ops(
     "module_fused_qknorm_idxrqknorm",
@@ -38,6 +40,7 @@ def _fused_qknorm_idxrqknorm_hip(
     k_scale: Tensor | None = None,
     v_scale: Tensor | None = None,
     asm_layout: bool = False,
+    skip_index_branch: bool = False,
 ) -> None:
     pass
 
@@ -68,6 +71,7 @@ def fused_qknorm_idxrqknorm(
     k_scale: Tensor | None = None,
     v_scale: Tensor | None = None,
     asm_layout: bool = False,
+    skip_index_branch: bool = False,
 ) -> None:
     # The main K/V caches are always passed as separate kv_cache_k / kv_cache_v
     # tensors. asm_layout selects the in-cache addressing: page-16 SHUFFLE
@@ -86,19 +90,22 @@ def fused_qknorm_idxrqknorm(
         and isinstance(kv_cache_dtype, str)
         and kv_cache_dtype.startswith("fp8")
     )
-    use_per_token_kv_scale = use_fp8_kv_cache and kv_cache_dtype != "fp8_e4m3_unit"
+    use_per_token_kv_scale = use_fp8_kv_cache and kv_cache_dtype in (
+        "fp8",
+        "fp8_e4m3",
+    )
+    use_static_kv_scale = use_fp8_kv_cache and kv_cache_dtype == "fp8_e4m3_static"
     if use_fp8_kv_cache:
-        if index_slot_mapping is None:
+        if not skip_index_branch and index_slot_mapping is None:
             index_slot_mapping = slot_mapping
-        assert index_q_norm_weight is not None
-        assert index_k_norm_weight is not None
         assert slot_mapping is not None
         assert kv_cache_v is not None
-        assert index_cache is not None
-        assert q_out is not None
-        assert index_q_out is not None
-        assert index_slot_mapping is not None
-        if use_per_token_kv_scale:
+        if not skip_index_branch:
+            assert index_q_norm_weight is not None
+            assert index_k_norm_weight is not None
+            assert index_cache is not None
+            assert index_slot_mapping is not None
+        if use_per_token_kv_scale or use_static_kv_scale:
             assert k_scale is not None
             assert v_scale is not None
         else:
@@ -131,4 +138,5 @@ def fused_qknorm_idxrqknorm(
         k_scale,
         v_scale,
         asm_layout,
+        skip_index_branch,
     )

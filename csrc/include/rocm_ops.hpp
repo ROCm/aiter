@@ -1946,7 +1946,8 @@ namespace py = pybind11;
           py::arg("index_cache_dtype") = "auto",       \
           py::arg("k_scale")           = std::nullopt, \
           py::arg("v_scale")           = std::nullopt, \
-          py::arg("asm_layout")        = false)
+          py::arg("asm_layout")        = false,        \
+          py::arg("skip_index_branch") = false)
 
 #define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND                           \
     m.def("fused_qk_norm_rope_cache_quant_shuffle",                    \
