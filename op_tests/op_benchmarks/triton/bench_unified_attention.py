@@ -298,6 +298,7 @@ def run_benchmark(custom, args):
                 k_descale=inputs["k_descale"],
                 v_descale=inputs["v_descale"],
                 output_scale=inputs["out_scale"],
+                backend=args.backend,
             )
 
         ms = triton.testing.do_bench_cudagraph(fn)
@@ -445,6 +446,13 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Sliding window size (default: disabled)",
     )
+    parser.add_argument(
+        "-backend",
+        type=str,
+        default=None,
+        choices=["triton", "gluon"],
+        help="Kernel backend",
+    )
 
     return parser.parse_args(args=args)
 
@@ -463,9 +471,9 @@ def main(args: list[str] | None = None) -> None:
         custom_config = True
         if not args.dv:
             args.dv = args.d
-        assert (
-            args.b and args.hq and args.sq and args.d and args.dv
-        ), "Custom config requires -b, -hq, -sq, -d (and optionally -dv)"
+        assert args.b and args.hq and args.sq and args.d and args.dv, (
+            "Custom config requires -b, -hq, -sq, -d (and optionally -dv)"
+        )
 
     run_benchmark(custom_config, args)
 
