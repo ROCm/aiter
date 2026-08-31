@@ -537,6 +537,7 @@ def run_fused_dynamic_mxfp4_quant_moe_sort_triton(
     num_local_tokens,
     num_valid_ids,
     block_size_M,
+    args: str,
 ):
     x_fp4, x_scales = fused_dynamic_mxfp4_quant_moe_sort(
         x,
@@ -545,6 +546,7 @@ def run_fused_dynamic_mxfp4_quant_moe_sort_triton(
         token_num=token_num,
         topk=topk,
         block_size=block_size_M,
+        args=args,
     )
     return x_fp4, x_scales
 
@@ -556,6 +558,7 @@ def run_fused_dynamic_mxfp4_quant_moe_sort_triton(
 )
 @pytest.mark.parametrize("topk", [1, 8])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("args", ["auto", "gluon", "triton"])
 def test_fused_dynamic_mxfp4_quant_moe_sort(
     hidden_dim: int,
     token_num: int,
@@ -563,9 +566,12 @@ def test_fused_dynamic_mxfp4_quant_moe_sort(
     num_valid_ids_0: int,
     topk: int,
     dtype,
+    args: str,
 ):
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
+    if args == "gluon" and arch_info.get_arch() != "gfx1250":
+        pytest.skip("Gluon kernel only supported on gfx1250 hardware")
 
     torch.manual_seed(0)
 
@@ -606,6 +612,7 @@ def test_fused_dynamic_mxfp4_quant_moe_sort(
         num_local_tokens,
         num_valid_ids,
         block_size_M,
+        args,
     )
 
     tol = 0.1
