@@ -7,6 +7,7 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
+from ..mxfp4_kname import MXFP4_G1_VARIANTS
 from . import dpp_utils
 from .mxfp4_gemm_common import (
     _activation_mul_batch,
@@ -41,11 +42,6 @@ from .mxfp4_gemm_common import (
 )
 
 ACC_LDS_PAD_DW = 4
-
-
-def scale_out_uses_atomic(BM):
-    """Whether scale output requires an atomic pre-clear."""
-    return False
 
 
 def k_g2_half_for(inter):
@@ -1302,27 +1298,6 @@ def _bm_constants(BM, BN, KH_TILE, K_TILES_TOTAL, k_wave=1):
     return kAStages, kSubBlocks, kMChunks, lds_bytes
 
 
-_G1_VARIANTS = {
-    "fp4": {
-        (32, True, False),
-        (32, False, False),
-        (64, True, False),
-        (64, False, False),
-        (128, False, False),
-        (16, True, True),
-    },
-    # a8w4: fp8 (e4m3) A x mxfp4 W1. Same tiling as fp4; A is 1 B/elem so the
-    # A-LDS tile doubles. inline_quant (bf16 hidden -> fp8) supported at (16,True).
-    "fp8": {
-        (32, True, False),
-        (32, False, False),
-        (64, False, False),
-        (128, False, False),
-        (16, True, True),
-    },
-}
-
-
 def compile_gemm1_a4w4_port(
     BM=32,
     use_nt=True,
@@ -1349,7 +1324,7 @@ def compile_gemm1_a4w4_port(
     """Compile GEMM1 with expert-sorted output."""
     if a_dtype not in ("fp4", "fp8"):
         raise AssertionError(f"a_dtype must be 'fp4' or 'fp8', got {a_dtype!r}")
-    if (BM, use_nt, inline_quant) not in _G1_VARIANTS[a_dtype]:
+    if (BM, use_nt, inline_quant) not in MXFP4_G1_VARIANTS[a_dtype]:
         raise AssertionError(
             f"unsupported gemm1 variant (a_dtype={a_dtype}, BM={BM}, use_nt={use_nt}, inline_quant={inline_quant})"
         )
@@ -1418,6 +1393,13 @@ def compile_gemm1_a4w4_port(
     variant_tag = "iq" if inline_quant else ("nt" if use_nt else "cached")
     # Tag with H/INTER/NE so different shape specializations get distinct
     # kernel/smem symbols (so KIMI and non-KIMI instances never collide).
+    #
+    # situ_beta / situ_linear_beta / swiglu_limit are deliberately absent: they
+    # are floats, so they would make ugly symbols, and they cannot collide.
+    # FlyDSL's disk cache is not keyed on this symbol name -- the key is a hash
+    # over the launcher source, its dependency sources, and every scalar closure
+    # value reachable from it (see jit_function._jit_function_cache_key /
+    # _collect_closure_scalar_vals), and gemm1_kernel closes over all three.
     gu_tag = "il" if interleave else "sep"
     name_suffix = (
         f"{a_dtype}_h{D_HIDDEN}_i{D_INTER}_ne{NE}_bm{BM}_{variant_tag}_{gu_tag}"
@@ -1427,7 +1409,6 @@ def compile_gemm1_a4w4_port(
     if out_dtype != "fp4":
         name_suffix += f"_o{out_dtype}"
     if act != "silu":
-        # Compile-time scalar values are already part of FlyDSL's closure cache key.
         name_suffix += f"_{act}"
     if enable_bias:
         name_suffix += "_bias"

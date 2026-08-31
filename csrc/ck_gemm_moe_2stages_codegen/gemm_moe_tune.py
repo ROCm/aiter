@@ -6125,9 +6125,10 @@ class Mxfp4FlydslTuner(FmoeTuner):
         return cand
 
     def _candidate_rows(self, row):
-        from aiter.ops.flydsl.mxfp4_gemm1_kernels import _SUPPORTED as G1
         from aiter.ops.flydsl.mxfp4_gemm2_kernels import _SUPPORTED as G2
+        from aiter.ops.flydsl.mxfp4_kname import MXFP4_G1_VARIANTS
 
+        G1 = MXFP4_G1_VARIANTS["fp4"]
         g2_bms = {v[0] for v in G2}
         cands = []
         for bm in sorted({v[0] for v in G1}):

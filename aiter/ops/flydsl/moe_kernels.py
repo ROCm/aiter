@@ -2087,7 +2087,7 @@ def _flydsl_moe_stage2_impl(
     x_rows = inter_states.shape[0] * inter_states.shape[1]
     E = w2.shape[0]
     model_dim = w2.shape[1]
-    inter_dim = inter_states.shape[-1]
+    inter_dim = inter_states.shape[2]
 
     # Debug: force stage2 to use the masked reduce epilogue instead of atomic
     # accumulate. Enabled by default; set AITER_FLYDSL_FORCE_REDUCE=0 to opt out.

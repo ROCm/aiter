@@ -7,35 +7,7 @@ import functools
 import torch
 
 from aiter.ops.flydsl import moe_kernels as _moe_kernels
-from aiter.ops.flydsl.kernels.mxfp4_gemm1 import scale_out_uses_atomic
-
-_SUPPORTED = {
-    (32, True, False),
-    (32, False, False),
-    (64, True, False),
-    (64, False, False),
-    (128, False, False),
-    (16, True, True),
-}
-_SUPPORTED_BY_DTYPE = {
-    "fp4": _SUPPORTED,
-    "fp8": {
-        (32, True, False),
-        (32, False, False),
-        (64, False, False),
-        (128, False, False),
-        (16, True, True),
-    },
-}
-
-
-def _effective_use_nt(*, n_tokens, topk, NE, BM, use_nt, inline_quant):
-    """Keep BM32 streaming loads only while each expert averages under one M tile."""
-    if use_nt and not inline_quant and BM == 32:
-        total_m_blocks = (int(n_tokens) * int(topk) + BM - 1) // BM
-        if total_m_blocks >= int(NE):
-            return False
-    return use_nt
+from aiter.ops.flydsl.mxfp4_kname import MXFP4_G1_VARIANTS
 
 
 @functools.cache
@@ -109,9 +81,9 @@ def _assert_supported(
     native_scale_layout=False,
     k_wave=1,
 ):
-    if a_dtype not in _SUPPORTED_BY_DTYPE:
+    if a_dtype not in MXFP4_G1_VARIANTS:
         raise NotImplementedError(
-            f"flydsl mxfp4 gemm1 requires a_dtype in {tuple(_SUPPORTED_BY_DTYPE)}, "
+            f"flydsl mxfp4 gemm1 requires a_dtype in {tuple(MXFP4_G1_VARIANTS)}, "
             f"got {a_dtype!r}"
         )
     if out_dtype not in ("fp4", "fp8"):
@@ -196,7 +168,7 @@ def _assert_supported(
             raise NotImplementedError(
                 f"k_wave leaves fewer than 2 K tiles per wave: {k_tiles // k_wave}"
             )
-    if (BM, use_nt, inline_quant) not in _SUPPORTED_BY_DTYPE[a_dtype]:
+    if (BM, use_nt, inline_quant) not in MXFP4_G1_VARIANTS[a_dtype]:
         raise NotImplementedError(
             f"flydsl mxfp4 gemm1 unsupported variant "
             f"(a_dtype={a_dtype}, BM={BM}, use_nt={use_nt}, "
@@ -241,14 +213,6 @@ def flydsl_mxfp4_gemm1(
     k_wave=1,
 ):
     """Launch GEMM1; v2 output keeps payload rows in expert-sorted order."""
-    use_nt = _effective_use_nt(
-        n_tokens=n_tokens,
-        topk=topk,
-        NE=NE,
-        BM=BM,
-        use_nt=use_nt,
-        inline_quant=inline_quant,
-    )
     _assert_supported(
         NE=NE,
         D_HIDDEN=D_HIDDEN,
@@ -295,8 +259,6 @@ def flydsl_mxfp4_gemm1(
         k_wave,
     )
     grid = gemm1_grid(n_tokens, BM, NE=NE, TOPK=topk, INTER=D_INTER, BN=BN)
-    if scale_out_uses_atomic(BM):
-        inter_sorted_shuffled_scale.zero_()
     _moe_kernels._run_compiled(
         launch,
         (

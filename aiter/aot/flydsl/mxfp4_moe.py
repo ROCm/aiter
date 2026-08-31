@@ -111,12 +111,12 @@ def parse_csv(csv_path: str):
         DEFAULT_SITUV2_BETA,
         DEFAULT_SITUV2_LINEAR_BETA,
     )
-    from aiter.ops.flydsl.mxfp4_gemm1_kernels import _effective_use_nt
     from aiter.ops.flydsl.mxfp4_gemm2_kernels import _epilog_of
     from aiter.ops.flydsl.mxfp4_kname import (
         _is_mxfp4_kname,
         _parse_mxfp4_g1_kname,
         _parse_mxfp4_g2_kname,
+        native_scale_layout_for,
         parse_flydsl_v2_gemm2_kernel,
     )
 
@@ -153,14 +153,6 @@ def parse_csv(csv_path: str):
 
             if _is_mxfp4_kname(kn1):
                 p1 = _parse_mxfp4_g1_kname(kn1)
-                effective_use_nt = _effective_use_nt(
-                    n_tokens=token,
-                    topk=topk,
-                    NE=expert,
-                    BM=p1["BM"],
-                    use_nt=p1["use_nt"],
-                    inline_quant=p1["inline_quant"],
-                )
                 situ_params = [(1.0, 1.0)]
                 if p1["act"] == "situv2":
                     situ_params.append(
@@ -174,17 +166,21 @@ def parse_csv(csv_path: str):
                             "BM": p1["BM"],
                             "BN": p1["BN"],
                             "BK": p1["BK"],
-                            # Runtime may disable BM32 streaming loads once routed
-                            # M blocks saturate the experts. AOT must specialize on
-                            # that effective value, not only the kernel-name flag.
-                            "use_nt": effective_use_nt,
+                            "use_nt": p1["use_nt"],
                             "n_tokens": token,
                             "inline_quant": p1["inline_quant"],
                             "D_HIDDEN": model_dim,
-                            # GEMM1 specializes on the logical output width. GEMM2
-                            # padding is backend-specific and must not change its
-                            # AOT cache key (for example, inter_dim=384 vs 512).
-                            "D_INTER": inter_dim,
+                            # Runtime derives D_INTER from the *stored* weight
+                            # width (``w1.shape[1] // 2``), and non-aligned
+                            # shards ship padded to a multiple of 256 with the
+                            # logical width carried separately in
+                            # ``w2.inter_real`` -- the same convention
+                            # ``is_mxfp4_moe_shape_supported`` uses. Keying on
+                            # the raw CSV ``inter_dim`` would miss those rows
+                            # (Kimi-K3: 384 stored as 512). ``d_inter`` is used
+                            # rather than the GEMM2 ``v2_d_inter`` because the
+                            # latter pads to a backend-specific tile_k.
+                            "D_INTER": d_inter,
                             "NE": expert,
                             "topk": topk,
                             "xcd_swizzle": p1["xcd_swizzle"],
@@ -196,7 +192,7 @@ def parse_csv(csv_path: str):
                             "swiglu_limit": 7.0,
                             "enable_bias": p1["enable_bias"],
                             "interleave": p1["interleave"],
-                            "native_scale_layout": p1["BM"] == 16,
+                            "native_scale_layout": native_scale_layout_for(p1["BM"]),
                             "num_waves": p1.get("num_waves", 4),
                             "k_wave": p1.get("k_wave", 1),
                         }

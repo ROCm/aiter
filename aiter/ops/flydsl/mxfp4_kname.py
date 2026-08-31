@@ -23,131 +23,34 @@ _MXMOE_NUMERIC_RE = re.compile(r"^([A-Z]+)(\d+)$")
 _MXMOE_TILE_RE = re.compile(r"^(\d+)x(\d+)x(\d+)$")
 _MXMOE_PREFIX = {1: "flydsl_mxmoe_g1_a4w4_", 2: "flydsl_mxmoe_g2_a4w4_"}
 _MXMOE_G1_PREFIX_RE = re.compile(r"^flydsl_mxmoe_g1_a(?P<a>[48])w4_")
+MXFP4_G1_VARIANTS = {
+    "fp4": {
+        (32, True, False),
+        (32, False, False),
+        (64, True, False),
+        (64, False, False),
+        (128, False, False),
+        (16, True, True),
+    },
+    "fp8": {
+        (32, True, False),
+        (32, False, False),
+        (64, False, False),
+        (128, False, False),
+        (16, True, True),
+    },
+}
 
 
-def _select_mxfp4_block_m(*, token: int, expert: int, topk: int) -> int:
-    routed_rows = int(token) * int(topk)
-    expert = int(expert)
-    average_rows = (routed_rows + expert - 1) // expert
+def native_scale_layout_for(BM: int) -> bool:
+    """The A-scale layout GEMM1 must emit for a given block_m.
 
-    # BM16's fused inline quantization has excessive error for a single token.
-    if int(token) == 1:
-        return 32
-    if int(token) <= 128:
-        return 16
-    if average_rows <= 32:
-        return 32
-    if average_rows <= 64:
-        return 64
-    return 128
-
-
-def _make_mxfp4_g1_kname(
-    *,
-    BM: int,
-    BN: int = 256,
-    BK: int = 256,
-    a_dtype: str = "fp4",
-    out_dtype: str = "fp4",
-    act: str = "silu",
-    inline_quant: bool = False,
-    use_nt: bool = False,
-    interleave: bool = False,
-    kSplitK: int = 0,
-    xcd_swizzle: int = 0,
-    enable_bias: bool = False,
-    num_waves: int = 4,
-    k_wave: int = 1,
-) -> str:
-    """Build a GEMM1 kernel name."""
-    a_dtype = str(a_dtype).lower()
-    out_dtype = str(out_dtype).lower()
-    act = str(act).lower()
-    if a_dtype not in ("fp4", "fp8"):
-        raise ValueError(f"unsupported mxmoe GEMM1 a_dtype: {a_dtype!r}")
-    if out_dtype not in ("fp4", "fp8"):
-        raise ValueError(f"unsupported mxmoe GEMM1 out_dtype: {out_dtype!r}")
-    if act not in ("silu", "swiglu", "situv2"):
-        raise ValueError(f"unsupported mxmoe GEMM1 activation: {act!r}")
-    if num_waves not in (2, 4):
-        raise ValueError(f"unsupported mxmoe GEMM1 num_waves: {num_waves!r}")
-    if k_wave not in (1, 2, 4):
-        raise ValueError(f"unsupported mxmoe GEMM1 k_wave: {k_wave!r}")
-    family = "a8w4" if a_dtype == "fp8" else "a4w4"
-    name = f"flydsl_mxmoe_g1_{family}_{int(BM)}x{int(BN)}x{int(BK)}"
-    if inline_quant:
-        name += "_f16in"
-    if use_nt:
-        name += "_nt"
-    if interleave:
-        name += "_il"
-    if out_dtype == "fp8":
-        name += "_fp8out"
-    if act == "situv2":
-        name += "_situv2"
-    elif act == "swiglu":
-        name += "_swiglu"
-    if enable_bias:
-        name += "_bias"
-    if kSplitK:
-        name += f"_sk{int(kSplitK)}"
-    if k_wave > 1:
-        name += f"_kw{int(k_wave)}"
-    if xcd_swizzle:
-        name += f"_xcd{int(xcd_swizzle)}"
-    if num_waves == 2:
-        name += "_w2"
-    return name
-
-
-def _select_mxfp4_g1_kernel(
-    *,
-    token: int,
-    expert: int,
-    topk: int,
-    block_m: int | None = None,
-    BN: int = 256,
-    BK: int = 256,
-    a_dtype: str = "fp4",
-    out_dtype: str = "fp4",
-    act: str = "silu",
-    interleave: bool = False,
-    enable_bias: bool = False,
-    num_waves: int = 4,
-    k_wave: int = 1,
-) -> dict:
-    """Select an MXMOE GEMM1 while retaining a tuned block_m when supplied."""
-    routed_rows = int(token) * int(topk)
-    expert = int(expert)
-    block_m = (
-        _select_mxfp4_block_m(token=token, expert=expert, topk=topk)
-        if block_m is None
-        else int(block_m)
-    )
-    total_m_blocks = (routed_rows + block_m - 1) // block_m
-    use_nt = block_m in (16, 32, 64) and total_m_blocks < expert
-    # The FP8-input port intentionally has no BM64 non-temporal specialization.
-    if a_dtype == "fp8" and block_m == 64:
-        use_nt = False
-    xcd_swizzle = 2 if block_m == 64 and use_nt else 0
-    return {
-        "BM": block_m,
-        "kernelName1": _make_mxfp4_g1_kname(
-            BM=block_m,
-            BN=BN,
-            BK=BK,
-            a_dtype=a_dtype,
-            out_dtype=out_dtype,
-            act=act,
-            inline_quant=block_m == 16,
-            use_nt=True if block_m == 16 else use_nt,
-            interleave=interleave,
-            xcd_swizzle=xcd_swizzle,
-            enable_bias=enable_bias,
-            num_waves=num_waves,
-            k_wave=k_wave,
-        ),
-    }
+    This is a GEMM1/GEMM2 contract, not a tuning knob: BM16 writes the native
+    scale layout and the matching GEMM2 reads it back. Every caller (runtime
+    dispatch, AOT warm-up, tuner) must agree, so the rule lives here -- a
+    second, divergent default is what made the tuner emit NaN.
+    """
+    return int(BM) == 16
 
 
 _FLYDSL_V2_GEMM2_RE = re.compile(

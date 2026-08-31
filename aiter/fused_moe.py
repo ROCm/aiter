@@ -50,6 +50,7 @@ from aiter.ops.flydsl.mxfp4_kname import (
     _is_mxfp4_kname,
     _parse_mxfp4_g1_kname,
     _parse_mxfp4_g2_kname,
+    native_scale_layout_for,
     parse_flydsl_v2_gemm2_kernel,
     parse_g2_kname_any,
 )
@@ -905,6 +906,9 @@ def _fused_moe_impl(
                     f"a16w4 (bf16 A x MXFP4 W) SiTUv2 is not supported: {_why}."
                 )
 
+    config_situ_beta, config_situ_linear_beta, _ = _normalize_mxfp4_activation_params(
+        activation, beta, linear_beta, swiglu_limit
+    )
     metadata = get_2stage_cfgs(
         get_padded_M(M),  # consider token_num > 1024 as prefill
         model_dim,
@@ -923,9 +927,10 @@ def _fused_moe_impl(
         isShuffled,
         gate_mode,
         is_ep=expert_mask is not None,
+        has_stage1_bias=bias1 is not None,
         has_stage2_bias=bias2 is not None,
-        situ_beta=1.0 if beta is None else float(beta),
-        situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
+        situ_beta=config_situ_beta,
+        situ_linear_beta=config_situ_linear_beta,
         opus_weights_shuffled=getattr(w1, "is_shuffled", False)
         and getattr(w2, "is_shuffled", False),
         config_file=_metadata_config_file,
@@ -1420,6 +1425,23 @@ def _mxfp4_activation_name(activation):
     return "silu"
 
 
+def _normalize_mxfp4_activation_params(
+    activation,
+    beta: float | None,
+    linear_beta: float | None,
+    swiglu_limit: float | None,
+) -> tuple[float, float, float | None]:
+    situ_beta = 1.0
+    situ_linear_beta = 1.0
+    if activation == ActivationType.Situv2:
+        situ_beta = 1.0 if beta is None else float(beta)
+        situ_linear_beta = 1.0 if linear_beta is None else float(linear_beta)
+    normalized_swiglu_limit = (
+        swiglu_limit if activation == ActivationType.Swiglu else None
+    )
+    return situ_beta, situ_linear_beta, normalized_swiglu_limit
+
+
 def _normalize_bias_for_kernel(
     bias: torch.Tensor | None,
 ) -> torch.Tensor | None:
@@ -1902,7 +1924,7 @@ def _mxfp4_a4w4_stage1_fw(
     swiglu_limit: float | None = None,
     situ_beta=1.0,
     situ_linear_beta=1.0,
-    native_scale_layout=False,
+    native_scale_layout: bool | None = None,
     **_kwargs,
 ):
     device = hidden_states.device
@@ -1915,6 +1937,8 @@ def _mxfp4_a4w4_stage1_fw(
             "MXMOE bias presence does not match the cache-safe kernel name"
         )
     BM = p1["BM"]
+    if native_scale_layout is None:
+        native_scale_layout = native_scale_layout_for(BM)
     inline_quant = p1["inline_quant"]
     if w1.element_size() == 1 and w1.dtype != torch.uint8:
         w1 = w1.view(torch.uint8)
@@ -2008,6 +2032,7 @@ def _mxfp4_a4w4_stage2_fw(
     block_m=None,
     sorted_weights=None,
     topk_weights=None,
+    bias2=None,
     kernelName2="",
     reverse_sorted=None,
     inter_dim_pad: int = 0,
@@ -2064,10 +2089,13 @@ def _mxfp4_a4w4_stage2_fw(
             a2_scale=a2_scale,
             sorted_weights=sorted_weights,
             topk_weights=topk_weights,
+            bias2=bias2,
             inter_dim_pad=inter_dim_pad,
             model_dim_pad=model_dim_pad,
             block_m=block_m,
         )
+    if bias2 is not None:
+        raise ValueError(f"MXMOE GEMM2 {kernelName2!r} does not support bias")
     out = _mxfp4_a4w4_stage2(
         inter_states,
         a2_scale,
@@ -2279,6 +2307,7 @@ def get_2stage_cfgs(
     is_shuffled=True,
     gate_mode=GateMode.SEPARATED.value,
     is_ep=False,
+    has_stage1_bias=False,
     has_stage2_bias=False,
     situ_beta=1.0,
     situ_linear_beta=1.0,
@@ -2512,14 +2541,32 @@ def get_2stage_cfgs(
             )
 
     if cfg is not None and _is_mxfp4_kname(kn1):
-        configured_act = _parse_mxfp4_g1_kname(kn1)["act"]
+        parsed_g1 = _parse_mxfp4_g1_kname(kn1)
+        configured_act = parsed_g1["act"]
         expected_act = _mxfp4_activation_name(activation)
+        reject_reason = None
         if configured_act != expected_act:
+            reject_reason = (
+                f"activation {configured_act!r} does not match runtime "
+                f"{expected_act!r}"
+            )
+        elif not aiter.is_mxfp4_moe_shape_supported(expert, model_dim, inter_dim, topk):
+            reject_reason = (
+                "generated MXFP4 auxiliary kernels do not cover "
+                f"(expert={expert}, model_dim={model_dim}, "
+                f"inter_dim={inter_dim}, topk={topk})"
+            )
+        elif has_stage1_bias and not parsed_g1.get("enable_bias", False):
+            reject_reason = "stage1 bias is present but kernelName1 lacks '_bias'"
+        elif has_stage2_bias and parse_flydsl_v2_gemm2_kernel(kn2) is None:
+            reject_reason = (
+                f"stage2 bias requires a flydsl_moe2_layout_ kernel, got {kn2!r}"
+            )
+        if reject_reason is not None:
             cfg = None
             logger.warning(
-                f"[fused_moe] discarding MXMOE config with activation "
-                f"{configured_act!r} for runtime activation {expected_act!r}; "
-                "using default heuristics"
+                f"[fused_moe] discarding MXMOE config: {reject_reason}; "
+                f"using default heuristics"
             )
 
     if cfg is not None:
@@ -2656,25 +2703,12 @@ def get_2stage_cfgs(
             return 16 if token < 2048 else 32 if token < 16384 else 64
 
     if _is_mxfp4_kname(kernelName1):
-        try:
-            _p1 = _parse_mxfp4_g1_kname(kernelName1)
-            _bm = _p1["BM"]
-        except ValueError:
-            _p1 = {
-                "a_dtype": "fp4",
-                "out_dtype": "fp4",
-                "interleave": gate_mode == GateMode.INTERLEAVE,
-            }
-            _bm = int(block_m) if block_m is not None else BLOCK_SIZE_M
-        expected_act = _mxfp4_activation_name(activation)
-        if _p1.get("act", expected_act) != expected_act:
-            raise ValueError(
-                f"MXMOE GEMM1 activation {_p1.get('act')!r} does not match "
-                f"runtime activation {expected_act!r}"
-            )
-        is_layout_gemm2 = isinstance(kernelName2, str) and kernelName2.startswith(
-            "flydsl_moe2_layout_"
-        )
+        _p1 = _parse_mxfp4_g1_kname(kernelName1)
+        _bm = _p1["BM"]
+        # Use the same parser the stage2 dispatch uses (_mxfp4_a4w4_stage2_fw ->
+        # parse_g2_kname_any), so stage2_has_bias below cannot promise a bias the
+        # runtime path then refuses.
+        is_layout_gemm2 = parse_flydsl_v2_gemm2_kernel(kernelName2) is not None
         is_native_gemm2 = _is_mxfp4_kname(kernelName2)
         if not (is_native_gemm2 or is_layout_gemm2):
             raise ValueError(
@@ -2686,12 +2720,6 @@ def get_2stage_cfgs(
             kernelName2=kernelName2,
             inter_dim_pad=intermediate_pad,
             model_dim_pad=hidden_pad,
-        )
-        enable_bias = (
-            _needs_swiglu_bias_support(dtype, q_type) and q_dtype_w == dtypes.fp4x2
-        )
-        stage2_supports_bias = isinstance(kernelName2, str) and (
-            kernelName2.startswith(("flydsl_", "cktile_"))
         )
         runtime_interleave = gate_mode == GateMode.INTERLEAVE
         if _p1["interleave"] != runtime_interleave:
@@ -2710,7 +2738,6 @@ def get_2stage_cfgs(
                 _mxfp4_a4w4_stage1_fw,
                 kernelName1=kernelName1,
                 interleave=runtime_interleave,
-                native_scale_layout=_bm == 16,
             ),
             stage2=stage2_func,
             block_m=_bm,
@@ -2718,9 +2745,8 @@ def get_2stage_cfgs(
             fuse_quant=_p1["out_dtype"],
             output_aux=AUX_SORT_OPUS,
             prequant=_p1["a_dtype"] == "fp8" and not _p1["inline_quant"],
-            has_bias=enable_bias and _p1.get("enable_bias", False),
-            stage2_has_bias=enable_bias and stage2_supports_bias,
-            **route_bucket_metadata,
+            has_bias=has_stage1_bias and _p1.get("enable_bias", False),
+            stage2_has_bias=has_stage2_bias and is_layout_gemm2,
         )
 
     if run_1stage:
@@ -3261,6 +3287,9 @@ def fused_moe_2stages(
     if moe_out.numel() == 0:
         moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
     is_shuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
+    config_situ_beta, config_situ_linear_beta, normalized_swiglu_limit = (
+        _normalize_mxfp4_activation_params(activation, beta, linear_beta, swiglu_limit)
+    )
     metadata = get_2stage_cfgs(
         get_padded_M(token_num),  # consider token_num > 1024 as prefill
         model_dim,
@@ -3279,9 +3308,10 @@ def fused_moe_2stages(
         is_shuffled,
         gate_mode,
         is_ep=expert_mask is not None,
+        has_stage1_bias=bias1 is not None,
         has_stage2_bias=bias2 is not None,
-        situ_beta=1.0 if beta is None else float(beta),
-        situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
+        situ_beta=config_situ_beta,
+        situ_linear_beta=config_situ_linear_beta,
         opus_weights_shuffled=getattr(w1, "is_shuffled", False)
         and getattr(w2, "is_shuffled", False),
         config_file=_metadata_config_file,
@@ -3441,15 +3471,13 @@ def fused_moe_2stages(
         _opus_a8w4_stage1_wrapper,
         _mxfp4_a4w4_stage1_fw,
     ):
-        extra_stage1_args["swiglu_limit"] = swiglu_limit
+        extra_stage1_args["swiglu_limit"] = normalized_swiglu_limit
+    if stage1_func is _flydsl_stage1_wrapper and metadata.skip_inter_quant:
+        extra_stage1_args["v2_output_layout"] = True
     if stage1_func in (_flydsl_stage1_wrapper, _mxfp4_a4w4_stage1_fw):
-        if stage1_func is _flydsl_stage1_wrapper and metadata.skip_inter_quant:
-            extra_stage1_args["v2_output_layout"] = True
         # MXMOE bakes SiTUv2 scalars into its compile key.
-        extra_stage1_args["situ_beta"] = 1.0 if beta is None else float(beta)
-        extra_stage1_args["situ_linear_beta"] = (
-            1.0 if linear_beta is None else float(linear_beta)
-        )
+        extra_stage1_args["situ_beta"] = config_situ_beta
+        extra_stage1_args["situ_linear_beta"] = config_situ_linear_beta
     elif stage1_func is _opus_a8w4_stage1_wrapper:
         if metadata.skip_inter_quant:
             extra_stage1_args["output_sorted"] = True
