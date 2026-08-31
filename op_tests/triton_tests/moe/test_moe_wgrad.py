@@ -77,6 +77,16 @@ def _ref_moe_wgrad(grad, input, topk_ids, num_experts, top_k):
 
 
 # ── tests ─────────────────────────────────────────────────────────────
+#
+# Scope note: these shapes guard *functional* correctness (right values,
+# right expert routing) but NOT the int32-overflow regression fixed in
+# the companion moe_wgrad.py change.  At T<=128 the product
+# (offs_token // top_k) * stride_gm stays well below 2^31, so removing
+# the .to(tl.int64) widening would still produce correct results here.
+# The overflow only fires at DSv4 production scale (~58 M tokens with
+# hidden=7168), which is not reachable in CI.  If a future refactor
+# touches the pointer arithmetic, manually verify the .to(tl.int64) is
+# preserved on all three grad/input/dW pointer expressions.
 
 
 @pytest.mark.parametrize(
