@@ -45,6 +45,7 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250", "gfx1250-strict")
+IS_DEVICE_ARCH_RDNA4 = DEVICE_ARCH in ("gfx1201",)
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
 
 
@@ -83,6 +84,7 @@ def select_3d_config(
     reduce_waves_per_eu = 2
     num_segments = 0
     TILE_SIZE = block_size
+    seg_cap = 128
     if IS_DEVICE_ARCH_GFX12:
         # If we cannot infer max_seqlen_k during graph capture
         maybe_guess_max_seqlen_k = 128000 if max_seqlen_k == 0 else max_seqlen_k
@@ -110,13 +112,25 @@ def select_3d_config(
         num_segments = max(1, target_num_prgms // 4 * occ // max(1, num_2d_prgms))
         num_segments = min(MAX_SEGMENTS, num_segments)
         num_segments = triton.next_power_of_2(num_segments)
+    elif IS_DEVICE_ARCH_RDNA4:
+        # RDNA4 (gfx1201) was previously unhandled and fell through to the
+        # generic split path below with attn_num_warps == 2. Tuning on the
+        # AMD Radeon AI PRO R9700 (CU=32) shows that path both under-warps the
+        # attention kernel and over-splits the KV cache at low batch:
+        #   * attn_num_warps = 8 is a near-universal win for the attn stage.
+        #   * capping NUM_SEGMENTS at 32 removes the low-batch over-split
+        #     (the split count still floors at 8, which is best at high batch).
+        # Segments are computed by the shared block below (num_segments == 0);
+        # here we only set the warp count and the per-arch segment cap.
+        attn_num_warps = 8
+        seg_cap = 32
 
     MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
     if num_segments == 0:
         num_segments = math.ceil(target_num_prgms / num_2d_prgms) * 2
         num_segments = min(num_segments, MAX_SEGMENTS)
         num_segments = triton.next_power_of_2(num_segments)
-        num_segments = min(num_segments, 128)
+        num_segments = min(num_segments, seg_cap)
         MIN_SEGMENTS = max(8, num_segments)
         num_segments = max(num_segments, MIN_SEGMENTS)
 
