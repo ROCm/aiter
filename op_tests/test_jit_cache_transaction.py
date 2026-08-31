@@ -116,12 +116,33 @@ def test_failed_blob_publication_restores_previous_cache():
         assert not [name for name in os.listdir(tmp) if ".backup." in name]
 
 
-def test_codegen_that_produces_no_source_is_rejected():
+def test_header_only_codegen_is_accepted():
+    with tempfile.TemporaryDirectory() as tmp:
+        op_dir = os.path.join(tmp, "module")
+        generator = _write_generator(
+            tmp,
+            """import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument("--output_dir", required=True)
+args = parser.parse_args()
+with open(args.output_dir + "/generated.hpp", "w") as header:
+    header.write("// generated build input\\n")
+""",
+        )
+
+        staging_dir = jit_cache.stage_blob_sources(
+            f"{generator} --output_dir {{}}", op_dir, sys.executable
+        )
+
+        assert os.path.exists(os.path.join(staging_dir, "generated.hpp"))
+
+
+def test_codegen_that_produces_no_build_input_is_rejected():
     with tempfile.TemporaryDirectory() as tmp:
         op_dir = os.path.join(tmp, "module")
         generator = _write_generator(tmp, "# successful but produced nothing\n")
 
-        with pytest.raises(RuntimeError, match="produced no C\\+\\+/HIP sources"):
+        with pytest.raises(RuntimeError, match="produced no C\\+\\+/HIP build inputs"):
             jit_cache.stage_blob_sources(generator, op_dir, sys.executable)
 
         assert not [name for name in os.listdir(op_dir) if name.startswith(".blob-")]

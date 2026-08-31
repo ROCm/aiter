@@ -9,6 +9,8 @@ import subprocess
 import tempfile
 import time
 
+GENERATED_BUILD_INPUT_SUFFIXES = (".cpp", ".cu", ".h", ".hpp", ".cuh")
+
 
 def stage_blob_sources(
     blob_gen_cmd, op_dir, python_executable, logger=None, log_commands=False
@@ -30,14 +32,14 @@ def stage_blob_sources(
                 logger.info("exec_blob ---> %s", shlex.join(args))
             subprocess.run(args, check=True)
 
-        generated_sources = [
+        generated_build_inputs = [
             os.path.join(root, filename)
             for root, _directories, filenames in os.walk(staging_dir)
             for filename in filenames
-            if filename.endswith((".cpp", ".cu"))
+            if filename.endswith(GENERATED_BUILD_INPUT_SUFFIXES)
         ]
-        if not generated_sources:
-            raise RuntimeError("blob code generation produced no C++/HIP sources")
+        if not generated_build_inputs:
+            raise RuntimeError("blob code generation produced no C++/HIP build inputs")
         return staging_dir
     except Exception:
         shutil.rmtree(staging_dir, ignore_errors=True)
