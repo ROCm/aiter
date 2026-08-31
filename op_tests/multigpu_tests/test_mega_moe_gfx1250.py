@@ -2,8 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Multi-layer EP MoE end-to-end perf + accuracy on the mori v2 cco/FlyDSL op-layer.
 
-N (default 61, DeepSeek-V4-Pro) MoE layers are chained. The ``base`` mode uses
-Mori v2 dispatch -> AITER fused_moe -> Mori v2 combine. ``fused`` calls only
+N (default 61, DeepSeek-V4-Pro) MoE layers are chained. Gather/scatter use Mori
+v2 dispatch -> AITER fused_moe -> Mori v2 combine. Scatter-fused calls only
 ``MegaMoEGfx1250``, which owns AITER's dispatch -> fused_moe -> fused-combine
 pipeline. The combined output plus residual feeds the next layer.
 
@@ -20,15 +20,14 @@ config, the bf16 weights and the per-layer routings):
 
 Launcher: torchrun (one process per rank / GPU), mirroring test_moe_layer_ep.py.
 
-Launch (4x gfx1250; every env knob below is already the script's default):
+Launch (4x gfx1250, must build CK-free on gfx1250 -> ENABLE_CK=0):
     cd <dir not under /app>   # avoid the /app/triton namespace shadow
+    ENABLE_CK=0 AITER_FORCE_A8W4=1 AITER_USE_GROUPED_GEMM=1 AITER_BF16_FP8_MOE_BOUND=0 \
     torchrun --standalone --nproc_per_node=4 test_mega_moe_gfx1250.py \
-      -q a4w4_mxfp4 -e 384 -k 6 -hd 7168 -id 3072 --layers 61 --combine fused \
-      --dispatch_commu_dtype fp4
+      -q a8w4_mxfp4 -e 384 -k 6 -hd 7168 -id 3072 --layers 61
     # Set MORI_CCO_BC to a prebuilt libmori_cco_device.bc to skip CCO JIT.
 
-Env / CLI: --layers --logits_tol --acc_verify --dispatch_commu_dtype --combine
-           -tpr -hd -id -e -k --shared_E -q
+Env / CLI: --layers --logits_tol --acc_verify --dispatch_commu_dtype -tpr -hd -id -e -k --shared_E -q
 """
 
 import argparse
@@ -38,12 +37,15 @@ import torch
 import torch.distributed as dist
 import torch.profiler as tprof
 
+import aiter
 from aiter import (
     ActivationType,
     QuantType,
     dtypes,
     get_gfx,
+    get_hip_quant,
     get_torch_quant,
+    pertoken_quant,
 )
 from aiter.fused_moe import fused_moe
 from aiter.ops.flydsl.moe_common import GateMode
@@ -55,25 +57,19 @@ try:
 except Exception:  # noqa: BLE001 # pragma: no cover
     get_trace_perf = None
 
-# gfx1250 grouped mxfp4 kernel knobs. Force the real grouped path regardless of
-# token count (mirrors test_moe_ep.py). AITER_FORCE_A8W4 is deliberately absent:
-# it selects the grouped kernel's ACTIVATION dtype (0 -> fp4, 1 -> fp8) and main()
-# derives it from -q, so a stale value in the environment cannot make -q a4w4
-# silently measure a8w4.
+# a8w4 (fp8 activation + mxfp4 weight) grouped kernel knobs. Force the real
+# fp8/mxfp4 grouped path regardless of token count (mirrors test_moe_ep.py).
 os.environ.setdefault("ENABLE_CK", "0")
+os.environ.setdefault("AITER_FORCE_A8W4", "1")
 os.environ.setdefault("AITER_USE_GROUPED_GEMM", "1")
 os.environ.setdefault("AITER_BF16_FP8_MOE_BOUND", "0")
-# The `base` path's mori EpDispatchCombineOp and the dispatch inside
-# MegaMoEGfx1250 both go through mori's HIP/JIT kernels, so the two modes'
-# kernel tables differ only in the combine. MegaMoE's own default is already
-# mori (see MegaMoEStage2Config.dispatch_backend).
-os.environ.setdefault("MORI_V2_KERNEL_BACKEND", "hip")
 
 os.environ.setdefault("FLYDSL_GPU_ARCH", get_gfx())
 
-# Both keys carry mxfp4 WEIGHTS and differ only in the activation dtype the
-# grouped GEMM wants for its A operand: a8w4 -> fp8, a4w4 -> fp4.
-QUANT_KEYS = ["a8w4_mxfp4", "a4w4_mxfp4"]
+_FP8_DTYPE = dtypes.fp8
+QUANT_KEYS = ["No", "per_Token", "per_128x128", "a8w4_mxfp4", "a4w4_mxfp4"]
+_MXFP4_KEYS = ("a8w4_mxfp4", "a4w4_mxfp4")
+_FP8_KEYS = ("per_Token", "per_128x128")
 
 
 def _import_mori_comm():
@@ -86,7 +82,7 @@ def _import_mori_comm():
 def _import_mori_v2():
     """Import Mori's non-fused dispatch/combine v2 path.
 
-    Deferred: the fused mode runs entirely on aiter's own mega_moe kernels and
+    Deferred: scatter_fused runs entirely on aiter's own mega_moe kernels and
     only needs the communicator, so importing this eagerly would make the fused
     path fail whenever Mori's copy lags the installed flydsl API.
     """
@@ -99,56 +95,96 @@ def _import_mori_v2():
 
 
 # Config / quant-path spec
-def resolve_spec(quant_key, wire):
-    """How to prepare weights / call fused_moe for a quant key, plus the resolved
-    dispatch wire. Both quant keys use the grouped gfx1250 kernels."""
+def resolve_spec(quant_key, transport, combine_mode="gather"):
+    """How to prepare weights / quantize activations / call fused_moe for a quant
+    key, plus the dispatch transport dtype. transport: auto|bf16|fp8."""
+    is_mxfp4 = quant_key in _MXFP4_KEYS
+    is_fp8 = quant_key in _FP8_KEYS
+
+    if transport == "auto":
+        transport = "fp8" if is_fp8 else "bf16"
+    if transport == "fp8" and not is_fp8:
+        transport = "bf16"
+
+    if quant_key == "No":
+        aiter_qtype = QuantType.No
+    elif quant_key == "per_Token":
+        aiter_qtype = QuantType.per_Token
+    elif quant_key == "per_128x128":
+        aiter_qtype = QuantType.per_128x128
+    else:  # a8w4_mxfp4 / a4w4_mxfp4
+        aiter_qtype = QuantType.per_1x32
+
+    gate_mode = GateMode.INTERLEAVE if quant_key == "a8w4_mxfp4" else GateMode.SEPARATED
+    if is_mxfp4 and combine_mode == "scatter_fused":
+        # MegaMoE's gemm2-fused scatter is g1u1-interleave only, so a4w4 cannot
+        # keep the SEPARATED default it uses elsewhere.
+        gate_mode = GateMode.INTERLEAVE
+
     return {
         "key": quant_key,
-        "aiter_qtype": QuantType.per_1x32,
-        # The gfx1250 grouped MoE GEMM reads GUGU (gate/up row-interleaved) w1
-        # only, so both mxfp4 keys have to ask for INTERLEAVE; a SEPARATED layout
-        # silently falls through to the generic 2-stage MoE.
-        "gate_mode": GateMode.INTERLEAVE,
+        "aiter_qtype": aiter_qtype,
+        "gate_mode": gate_mode,
+        # Which family of expert kernels the weights are laid out for. The MX
+        # keys differ only in the ACTIVATION dtype -- the weights are the same
+        # mxfp4 either way -- but a4w4 has historically meant "the 2-stage mxfp4
+        # kernels" here (e8m0_shuffle, is_shuffled) while a8w4 meant "the grouped
+        # n32k4 ones". MegaMoE is grouped-only, so under it both keys take the
+        # grouped prep; getting this wrong is silent, and costs a full run to
+        # find (the output is uncorrelated, not merely imprecise).
+        "grouped_weights": is_mxfp4 and combine_mode == "scatter_fused",
         "activation": ActivationType.Silu,
-        "wire": resolve_wire(wire, quant_key),
+        "is_mxfp4": is_mxfp4,
+        "is_fp8": is_fp8,
+        "transport": transport,
+        "prequant": transport == "fp8",
+        "fp8_dtype": _FP8_DTYPE,
     }
 
 
-# What the dispatch puts on the wire. A quantizing wire moves the activation
-# quant to the SENDER: the payload shrinks (fp8 halves it, fp4 quarters it), a
-# per-token e8m0 row rides along, and the receiver skips its own quant. Combine
-# is unaffected -- it carries post-expert tokens, which are bf16 regardless.
-_WIRE_FOR_QUANT = {"a8w4_mxfp4": "fp8", "a4w4_mxfp4": "fp4"}
+# The MegaMoE (scatter_fused) wire. Unrelated to `transport` above, which belongs
+# to the mori-v1 dispatch the other combine modes use.
+_MEGA_WIRE_FOR_QUANT = {"a8w4_mxfp4": "fp8", "a4w4_mxfp4": "fp4"}
 
 
-def resolve_wire(wire, quant_key):
-    """Validate the dispatch wire against the quant key: bf16 | fp8 | fp4.
+def resolve_mega_wire(mega_wire, quant_key):
+    """What MegaMoE's dispatch puts on the wire: bf16 | fp8 | fp4.
 
     A quantizing wire is not a free choice -- the receiver hands the payload to
-    the grouped GEMM as its A operand, so it has to be the width that GEMM wants
-    (a8w4 -> fp8, a4w4 -> fp4). Picking the other one is a width error, not a
-    slow path, so it is rejected here rather than deep inside the gather. This
-    is why the knob is not simply a bool: naming the format keeps the intended
-    pairing visible at the call site.
-
-    `None` means "unset", and resolves to the quant key's own width so that the
-    quantizing wire is what you get by default on either key.
+    the grouped GEMM as its A operand, so it has to be the format that GEMM wants
+    (a8w4 -> fp8, a4w4 -> fp4), which is what ``auto`` resolves to. Picking the
+    other one is a width error, not a slow path, so it is rejected here rather
+    than deep inside the gather.
     """
-    if wire is None:
-        return _WIRE_FOR_QUANT[quant_key]
-    if wire == "bf16":
+    if mega_wire == "auto":
+        return _MEGA_WIRE_FOR_QUANT.get(quant_key, "bf16")
+    if mega_wire == "bf16":
         return "bf16"
-    want = _WIRE_FOR_QUANT[quant_key]
-    if wire != want:
+    want = _MEGA_WIRE_FOR_QUANT.get(quant_key)
+    if want is None:
         raise ValueError(
-            f"-q {quant_key} wants a {want} A operand, so "
-            f"--dispatch_commu_dtype={wire} would hand the GEMM the wrong "
-            "payload width"
+            f"--mega_wire={mega_wire} needs an MX quant key "
+            f"({'/'.join(_MEGA_WIRE_FOR_QUANT)}), got -q {quant_key}"
         )
-    return wire
+    if mega_wire != want:
+        raise ValueError(
+            f"-q {quant_key} wants a {want} A operand, so --mega_wire={mega_wire} "
+            "would hand the GEMM the wrong payload width"
+        )
+    return mega_wire
 
 
 # Weight quantization + shuffle (device path) / dequant (reference)
+def weight_per_128x128_quant(weight, quant_dtype):
+    E, dim1, dim2 = weight.shape
+    wb = weight.view(E, dim1 // 128, 128, dim2 // 128, 128)
+    wb = wb.permute(0, 1, 3, 2, 4).contiguous().view(E, -1, 128 * 128)
+    w_qt, w_s = aiter.pertoken_quant(wb, quant_dtype=quant_dtype)
+    w_qt = w_qt.view(E, dim1 // 128, dim2 // 128, 128, 128)
+    w_qt = w_qt.permute(0, 1, 3, 2, 4).contiguous().view(E, dim1, dim2)
+    return w_qt, w_s.view(E, dim1 // 128, dim2 // 128)
+
+
 def _mxfp4_quant(w):
     """per_1x32 mxfp4 quant: packed fp4x2 weight [E, d1, d2//2] + e8m0 scale."""
     tq = get_torch_quant(QuantType.per_1x32)
@@ -176,34 +212,64 @@ def _gguu_to_gugu_rows(t):
 
 def raw_quant_weights(w1, w2, spec):
     """Quantize (unshuffled) a group of routed-expert weights."""
+    key = spec["key"]
+    if key == "No":
+        tq = get_torch_quant(QuantType.No)
+        w1_qt, _ = tq(w1, quant_dtype=None)
+        w2_qt, _ = tq(w2, quant_dtype=None)
+        return w1_qt.view(w1.shape), None, w2_qt.view(w2.shape), None
+    if key == "per_Token":
+        w1_qt, w1_s = pertoken_quant(w1, quant_dtype=_FP8_DTYPE)
+        w2_qt, w2_s = pertoken_quant(w2, quant_dtype=_FP8_DTYPE)
+        return w1_qt, w1_s, w2_qt, w2_s
+    if key == "per_128x128":
+        w1_qt, w1_s = weight_per_128x128_quant(w1, quant_dtype=_FP8_DTYPE)
+        w2_qt, w2_s = weight_per_128x128_quant(w2, quant_dtype=_FP8_DTYPE)
+        return w1_qt, w1_s, w2_qt, w2_s
     w1_qt, w1_s = _mxfp4_quant(w1)
     w2_qt, w2_s = _mxfp4_quant(w2)
     return w1_qt, w1_s, w2_qt, w2_s
 
 
 def shuffle_group(w1_qt, w1_s, w2_qt, w2_s, spec, n_experts):
-    """Layout-shuffle a group of `n_experts` quantized experts for the kernel.
-
-    Both mxfp4 keys share the grouped gfx1250 layout (GUGU-interleaved w1 + the
-    n32k4 e8m0 B-scale). The only difference is the weight DTYPE handed to
-    ``fused_moe``: it keys off ``w1.dtype`` to pick the activation dtype, so
-    uint8 selects the fp8-activation (a8w4) kernel and fp4x2 the fp4-activation
-    (a4w4) one. See ``grouped_moe_gfx1250._grouped_a8w4_tdm_moe``.
-    """
-    w1_phys = _gguu_to_gugu_rows(w1_qt.view(torch.uint8))
-    w1_a = shuffle_weight(w1_phys, layout=(16, 16))
-    w2_a = shuffle_weight(w2_qt.view(torch.uint8), layout=(16, 16))
-    w1_ss = moe_shuffle_scale(
-        w1_s.contiguous(),
-        experts_cnt=n_experts,
-        is_guinterleave=True,
-        gate_up=True,
-    )
-    w2_ss = moe_shuffle_scale(w2_s.contiguous(), experts_cnt=n_experts)
-    if spec["key"] == "a4w4_mxfp4":
-        w1_a = w1_a.view(dtypes.fp4x2)
-        w2_a = w2_a.view(dtypes.fp4x2)
+    """Layout-shuffle a group of `n_experts` quantized experts for the kernel."""
+    key = spec["key"]
+    if key in ("No", "per_Token", "per_128x128"):
+        return shuffle_weight(w1_qt), shuffle_weight(w2_qt), w1_s, w2_s
+    if key == "a8w4_mxfp4" or spec.get("grouped_weights"):
+        if spec["gate_mode"] == GateMode.INTERLEAVE:
+            w1_phys = _gguu_to_gugu_rows(w1_qt.view(torch.uint8))
+            w1_a = shuffle_weight(w1_phys, layout=(16, 16))
+            w1_ss = moe_shuffle_scale(
+                w1_s.contiguous(),
+                experts_cnt=n_experts,
+                is_guinterleave=True,
+                gate_up=True,
+            )
+        else:
+            w1_a = shuffle_weight(w1_qt.view(torch.uint8), layout=(16, 16))
+            w1_ss = moe_shuffle_scale(w1_s.contiguous(), experts_cnt=n_experts)
+        w2_a = shuffle_weight(w2_qt.view(torch.uint8), layout=(16, 16))
+        w2_ss = moe_shuffle_scale(w2_s.contiguous(), experts_cnt=n_experts)
+        return w1_a, w2_a, w1_ss, w2_ss
+    # a4w4_mxfp4 on the 2-stage kernels (a different B layout from the grouped
+    # branch above -- e8m0_shuffle, not the n32k4 fold).
+    w1_a = shuffle_weight(w1_qt, layout=(16, 16))
+    w2_a = shuffle_weight(w2_qt, layout=(16, 16))
+    w1_ss = fp4_utils.e8m0_shuffle(w1_s)
+    w2_ss = fp4_utils.e8m0_shuffle(w2_s)
+    w1_a.is_shuffled = True
+    w2_a.is_shuffled = True
     return w1_a, w2_a, w1_ss, w2_ss
+
+
+def quant_tokens_fp8(tokens, spec):
+    """Per-token / per-block fp8 quant of the activations (fp8 pre-quant transport)."""
+    qt = spec["aiter_qtype"]
+    quant_func = get_hip_quant(
+        qt if qt != QuantType.per_128x128 else QuantType.per_1x128
+    )
+    return quant_func(tokens, quant_dtype=spec["fp8_dtype"])
 
 
 def moe_forward(
@@ -216,6 +282,7 @@ def moe_forward(
     topk_ids,
     expert_mask,
     spec,
+    a1_scale=None,
     num_local_tokens=None,
 ):
     """Single fused_moe call (device path). ``num_local_tokens`` (device int32
@@ -226,20 +293,35 @@ def moe_forward(
         num_local_tokens = torch.tensor(
             [hidden.shape[0]], dtype=dtypes.i32, device=hidden.device
         )
+    if spec["is_mxfp4"]:
+        return fused_moe(
+            hidden,
+            w1_a,
+            w2_a,
+            topk_weights,
+            topk_ids,
+            expert_mask=expert_mask,
+            activation=spec["activation"],
+            gate_mode=spec["gate_mode"].value,
+            quant_type=spec["aiter_qtype"],
+            w1_scale=w1_s,
+            w2_scale=w2_s,
+            dtype=dtypes.bf16,
+            num_local_tokens=num_local_tokens,
+        )
     return fused_moe(
         hidden,
         w1_a,
         w2_a,
         topk_weights,
         topk_ids,
-        expert_mask=expert_mask,
-        activation=spec["activation"],
-        gate_mode=spec["gate_mode"].value,
-        quant_type=spec["aiter_qtype"],
+        expert_mask,
+        num_local_tokens=num_local_tokens,
         w1_scale=w1_s,
         w2_scale=w2_s,
+        quant_type=spec["aiter_qtype"],
+        a1_scale=a1_scale,
         dtype=dtypes.bf16,
-        num_local_tokens=num_local_tokens,
     )
 
 
@@ -297,9 +379,8 @@ def make_routings(n_layers, ct, E, topk, dev, seed):
 def _rmsnorm(x, eps=1e-6):
     """RMSNorm (no learnable gain) on the last dim. Applied to each layer's MoE
     input so activations stay unit-scale across the 61-layer residual chain --
-    without it the narrow activation quant (fp4/fp8) saturates and the chain
-    diverges to NaN after a few layers. Both device and reference use the SAME
-    normalization."""
+    without it the a8w4 fp8 activation quant (max ~448) overflows to NaN after a
+    few layers. Both device and reference use the SAME normalization."""
     xf = x.float()
     n = xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps)
     return n.to(x.dtype)
@@ -312,36 +393,6 @@ def _calc_diff(x, y):
     if denom == 0:
         return 0.0
     return float(1 - 2 * (x * y).sum() / denom)
-
-
-# Accuracy budget, measured on gfx1250 (2 ranks, 1024 tok/rank, 7168x3072, E=384,
-# topk=6).
-#
-# _calc_diff is ||x-y||^2 / (||x||^2 + ||y||^2), a SQUARED error, and the per-layer
-# errors accumulate as a random walk: r ~ sqrt(L) makes r^2 ~ L, so the metric grows
-# about linearly in the layer count, then saturates as it approaches the bound:
-#
-#             L=1       L=2       L=4       L=8
-#   a4w4   0.021877  0.042683  0.080897  0.144881
-#   a8w4   0.001433  0.002871  0.005742  0.011369
-#
-# slope * L / (1 + sat * L) reproduces both rows within 1%, so scaling that curve
-# keeps the SAME headroom at every layer count. A flat tol cannot: 0.1 rejects a
-# healthy 8-layer a4w4 run (0.145) yet passes anything at all on a8w4. The rows
-# were taken with an mxfp8 combine wire in the loop, which is a touch pessimistic
-# here (it cost +32% on a8w4 and +1.6% on a4w4), so these budgets are slightly
-# loose rather than tight.
-_ACC_TOL = {  # quant key -> (per-layer slope, saturation)
-    "a4w4_mxfp4": (0.0225, 0.031),
-    "a8w4_mxfp4": (0.00143, 0.0012),
-}
-_ACC_TOL_SAFETY = 1.5
-
-
-def default_logits_tol(quant_key, n_layers):
-    # Per-quant tol for an n_layers chain; see _ACC_TOL for the calibration.
-    slope, sat = _ACC_TOL[quant_key]
-    return _ACC_TOL_SAFETY * slope * n_layers / (1.0 + sat * n_layers)
 
 
 # torchrun rendezvous helper
@@ -401,10 +452,15 @@ class RefModel:
         if wd is None:
             w1_g = self.w1_bf[g : g + 1]
             w2_g = self.w2_bf[g : g + 1]
-            w1_qt, w1_s = _mxfp4_quant(w1_g)
-            w2_qt, w2_s = _mxfp4_quant(w2_g)
-            w1d = _mxfp4_dequant(w1_qt, w1_s, (1, *w1_g.shape[1:]))[0]
-            w2d = _mxfp4_dequant(w2_qt, w2_s, (1, *w2_g.shape[1:]))[0]
+            if self.spec["is_mxfp4"]:
+                w1_qt, w1_s = _mxfp4_quant(w1_g)
+                w2_qt, w2_s = _mxfp4_quant(w2_g)
+                w1d = _mxfp4_dequant(w1_qt, w1_s, (1, *w1_g.shape[1:]))[0]
+                w2d = _mxfp4_dequant(w2_qt, w2_s, (1, *w2_g.shape[1:]))[0]
+            else:
+                # No / fp8 paths: use the bf16 weights directly (approximate ref).
+                w1d = w1_g[0].float()
+                w2d = w2_g[0].float()
             wd = self._cache[g] = (w1d, w2d)
         return wd
 
@@ -465,7 +521,7 @@ class DeviceMoEPipeline:
         sw2,
         routings,
         ct,
-        combine_mode="base",
+        combine_mode="gather",
     ):
         self.dist_ctx = dist_ctx
         self.E, self.hdim, self.idim, self.topk = E, hdim, idim, topk
@@ -510,7 +566,11 @@ class DeviceMoEPipeline:
         uid = Communicator.get_unique_id() if r == 0 else None
         uid = self.dist_ctx.bcast_uid(uid)
         self.comm = Communicator.init(self.dist_ctx.world, r, uid)
-        if self.combine_mode == "fused":
+        if self.combine_mode == "scatter_fused":
+            if self.spec["key"] not in _MXFP4_KEYS:
+                raise NotImplementedError(
+                    f"scatter_fused is available only for {'/'.join(_MXFP4_KEYS)}"
+                )
             from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import MegaMoEGfx1250
 
             # Geometry + the expert-GEMM recipe are per-model, so they are fixed
@@ -527,9 +587,8 @@ class DeviceMoEPipeline:
                 activation=self.spec["activation"],
                 gate_mode=self.spec["gate_mode"].value,
                 quant_type=self.spec["aiter_qtype"],
-                # Passed explicitly: MegaMoE otherwise falls back to $MEGA_WIRE,
-                # and a stale one there would change what is measured.
-                dispatch_wire=self.spec["wire"],
+                # Explicit so a stale $MEGA_WIRE cannot change what is measured.
+                dispatch_wire=self.spec["mega_wire"],
             )
         else:
             EpDispatchCombineConfig, EpDispatchCombineOp = _import_mori_v2()
@@ -541,7 +600,7 @@ class DeviceMoEPipeline:
                 num_experts_per_rank=self.EPR,
                 num_experts_per_token=self.topk,
                 data_type=self.transport_dtype,
-                combine_mode="gather",  # mori's name for the `base` combine
+                combine_mode=self.combine_mode,
             )
             self.op = EpDispatchCombineOp(cfg, self.comm)
         self.comm.barrier()
@@ -549,7 +608,7 @@ class DeviceMoEPipeline:
     # ---- one graph-capturable layer + full chain (calls grouped together) ---- #
     def _layer_step(self, x, layer_idx):
         ids, wts = self.routings[layer_idx]
-        xn = _rmsnorm(x)  # keep the quantized activations in range across 61 layers
+        xn = _rmsnorm(x)  # keep a8w4 fp8 activations in range across 61 layers
         if self.mega is not None:
             y = self.mega(
                 xn,
@@ -720,16 +779,12 @@ def _aggregate_prof_table(prof, dist_ctx, per_layer_denom=1.0, row_limit=200):
         rows.append((avg_self, name, per_call, pc_avg, avg_count))
     rows.sort(key=lambda r: (-r[0], r[1]))
     dev_per_layer = total_self / per_layer_denom if per_layer_denom else 0.0
-    # Wide enough for a full TDM GEMM name, whose tile/warp/buffer recipe and its
-    # `_epscatter` / `_prefetch` suffix are the whole point of reading this table
-    # (e.g. a8w4_tdm_fp4_t256x256x256_w2x2_b3_K3072_e96_cn4_prefetch_epscatter).
-    name_w = 72
     lines = [
         (
             f"# per-call self device time (us) by rank, {world} ranks "
             f"(rows sorted by total self time):"
         ),
-        f"{'Name':<{name_w}}"
+        f"{'Name':<52}"
         + "".join(f"{f'rank{r}':>11}" for r in range(world))
         + f"{'avg':>11}{'calls':>8}",
     ]
@@ -737,9 +792,7 @@ def _aggregate_prof_table(prof, dist_ctx, per_layer_denom=1.0, row_limit=200):
         cells = "".join(
             f"{v:>11.3f}" if v is not None else f"{'-':>11}" for v in per_call
         )
-        lines.append(
-            f"{name[:name_w]:<{name_w}}{cells}{pc_avg:>11.3f}{avg_count:>8.1f}"
-        )
+        lines.append(f"{name[:52]:<52}{cells}{pc_avg:>11.3f}{avg_count:>8.1f}")
     lines.append(
         f"# TOTAL self device time over ALL {len(rows)} kernels = {total_self:.1f} us "
         f"-> {dev_per_layer:.1f} us/layer (device-busy; compare to per_layer wall)"
@@ -762,18 +815,17 @@ def _device_shared_ffn(tokens, sw1, sw2):
 # Driver
 def main():
     args = _parse_args()
-    # Set, not setdefault: this is the grouped kernel's activation-dtype switch
-    # (aiter/fused_moe.py reads it per call on gfx1250, defaulting to fp4x2 unless
-    # it is 1), so the quant key has to drive it or a stale environment value makes
-    # -q a4w4_mxfp4 silently measure a8w4.
+    # The import-time setdefault above pins a8w4; a4w4 is the other half of the
+    # same switch (aiter/fused_moe.py reads it per call on gfx1250, defaulting to
+    # fp4x2 unless this is 1), so the quant key has to drive it or -q a4w4_mxfp4
+    # silently measures a8w4.
     os.environ["AITER_FORCE_A8W4"] = "0" if args.quant_type == "a4w4_mxfp4" else "1"
-    # Ahead of Dist(): a bad -q/--dispatch_commu_dtype pairing is a width error,
-    # so report it as one traceback per rank rather than after a rendezvous.
-    spec = resolve_spec(args.quant_type, args.dispatch_commu_dtype)
     dist_ctx = Dist()
     dev = torch.device("cuda", dist_ctx.local_rank)
+    spec = resolve_spec(args.quant_type, args.dispatch_commu_dtype, args.combine)
+    spec["mega_wire"] = resolve_mega_wire(args.mega_wire, args.quant_type)
 
-    if get_gfx() not in ("gfx950", "gfx1250"):
+    if spec["is_mxfp4"] and get_gfx() not in ("gfx950", "gfx1250"):
         if dist_ctx.rank == 0:
             print(
                 f"skip {args.quant_type}: mxfp4 requires gfx950/gfx1250, got {get_gfx()}"
@@ -791,7 +843,7 @@ def main():
         print(
             f"[cfg] world={dist_ctx.world} layers={n_layers} tokens/rank={ct} hidden={hdim} "
             f"inter={idim} E={E} topk={topk} EPR={E // dist_ctx.world} quant={args.quant_type} "
-            f"combine={args.combine} wire={spec['wire']} "
+            f"combine={args.combine} mega_wire={spec['mega_wire']} "
             f"force_a8w4={os.environ['AITER_FORCE_A8W4']} "
             f"gate={spec['gate_mode'].name} shared_E={args.shared_experts} gfx={get_gfx()}",
             flush=True,
@@ -887,30 +939,23 @@ def main():
     # ---- accuracy (isolated CPU/fp32 reference): end-to-end accumulated compare.
     accuracy_failure = None
     if args.acc_verify:
-        auto_tol = args.logits_tol is None
-        tol = (
-            default_logits_tol(args.quant_type, n_layers)
-            if auto_tol
-            else args.logits_tol
-        )
-        tol_desc = f"{tol:.6f}{' auto' if auto_tol else ''}"
         out_dev = pipe.final_output().float()
         ref = RefModel(w1_bf, w2_bf, sw1, sw2, spec, dev)
         ref_out = ref.run(x0, routings).float()
         logits_diff = _calc_diff(ref_out, out_dev)
-        errs = dist_ctx.allreduce_sum(0 if logits_diff < tol else 1)
+        errs = dist_ctx.allreduce_sum(0 if logits_diff < args.logits_tol else 1)
         avg_diff = dist_ctx.allreduce_avg_float(logits_diff)
         if dist_ctx.rank == 0:
             print(
                 f"# MEGA-CHECK layers={n_layers}: {'PASS' if errs == 0 else 'FAIL'} "
                 f"(avg logits_diff={avg_diff:.6f} over {dist_ctx.world} ranks, "
-                f"tol={tol_desc})",
+                f"tol={args.logits_tol})",
                 flush=True,
             )
         if errs != 0:
             accuracy_failure = (
                 f"MegaMoE accuracy check failed on {errs}/{dist_ctx.world} ranks: "
-                f"average logits_diff={avg_diff:.6f}, tolerance={tol_desc}"
+                f"average logits_diff={avg_diff:.6f}, tolerance={args.logits_tol}"
             )
 
     pipe.teardown()
@@ -926,9 +971,8 @@ def _parse_args():
         "--quant_type",
         type=str,
         choices=QUANT_KEYS,
-        default="a4w4_mxfp4",
-        help="quantization type: mxfp4 weights either way, the prefix picks the "
-        "grouped GEMM's activation dtype (a8w4 -> fp8, a4w4 -> fp4)",
+        default="a8w4_mxfp4",
+        help="quantization type",
     )
     p.add_argument(
         "-tpr", "--token_per_rank", type=int, default=128, help="tokens per rank"
@@ -948,11 +992,7 @@ def _parse_args():
         help="base RNG seed for weights/tokens/routing (optional; default 0)",
     )
     p.add_argument(
-        "--logits_tol",
-        type=float,
-        default=None,
-        help="end-to-end accuracy tol; default: the per-quant budget for --layers "
-        "(see _ACC_TOL)",
+        "--logits_tol", type=float, default=0.1, help="end-to-end 1-cosine tol"
     )
     p.add_argument(
         "--acc_verify", type=int, default=1, help="run fp32 reference accuracy check"
@@ -970,21 +1010,27 @@ def _parse_args():
     p.add_argument(
         "--dispatch_commu_dtype",
         type=str,
-        choices=["bf16", "fp8", "fp4"],
-        default=os.environ.get("DISPATCH_COMMU_DTYPE"),
-        help="dispatch wire (communication) dtype: bf16 sends activations and the "
-        "receiver quantizes each copy; fp8/fp4 quantize once on the sender and "
-        "forward the e8m0 row. A quantizing wire must match what -q's GEMM wants "
-        "for its A operand (a8w4 -> fp8, a4w4 -> fp4), and the other pairing is "
-        "rejected. Falls back to $DISPATCH_COMMU_DTYPE, then to -q's own width.",
+        choices=["auto", "bf16", "fp8"],
+        default="auto",
+        help="dispatch transport (communication) dtype",
+    )
+    p.add_argument(
+        "--mega_wire",
+        type=str,
+        choices=["auto", "bf16", "fp8", "fp4"],
+        default=os.environ.get("MEGA_WIRE", "bf16"),
+        help="MegaMoE (scatter_fused) dispatch wire: bf16 sends activations and "
+        "the receiver quantizes each copy; fp8/fp4 quantize once on the sender "
+        "and forward the e8m0 row. 'auto' picks what the quant key's GEMM wants. "
+        "Needs dispatch_backend=mori (MEGA_DISPATCH=mori).",
     )
     p.add_argument(
         "--combine",
         type=str,
-        choices=["base", "fused"],
-        default=os.environ.get("COMBINE", "fused"),
-        help="EP combine mode: base (mori v2 dispatch/combine around fused_moe) "
-        "| fused (gemm2-fused P2P scatter). Falls back to $COMBINE.",
+        choices=["gather", "scatter", "scatter_fused"],
+        default=os.environ.get("COMBINE", "gather"),
+        help="EP combine mode: gather | scatter | scatter_fused "
+        "(gemm2-fused P2P scatter; a8w4 only). Falls back to $COMBINE.",
     )
     return p.parse_args()
 
