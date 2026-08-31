@@ -170,6 +170,11 @@ AITER_CONFIG_GDN_K5_OPT = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_opt_tuned.csv",
 )
 
+AITER_CONFIG_DISPATCH_COMBINE_INTRANODE = os.getenv(
+    "AITER_CONFIG_DISPATCH_COMBINE_INTRANODE",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_dispatch_combine_intranode.csv",
+)
+
 
 class AITER_CONFIG:
     @property
@@ -266,6 +271,14 @@ class AITER_CONFIG:
             "AITER_CONFIG_GDN_K5_OPT",
             AITER_CONFIG_GDN_K5_OPT,
             "chunk_gdn_h_opt_tuned",
+        )
+
+    @property
+    def AITER_CONFIG_DISPATCH_COMBINE_INTRANODE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_DISPATCH_COMBINE_INTRANODE",
+            AITER_CONFIG_DISPATCH_COMBINE_INTRANODE,
+            "tuned_dispatch_combine_intranode",
         )
 
     @property

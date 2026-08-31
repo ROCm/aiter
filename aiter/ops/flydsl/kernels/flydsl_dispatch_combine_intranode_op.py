@@ -47,8 +47,8 @@ _DEFAULT_COMBINE_WARP_NUM = 8
 
 logger = logging.getLogger(__name__)
 
-# Per-shape tuning JSONs (schema: flydsl_{arch}_{model}_{kernel}_ep{n}.json).
-_TUNING_CONFIGS_DIR = Path(__file__).resolve().parent / "mega_moe_tuning_config"
+# Launch-geometry tuned CSV lives under ``aiter/configs/`` and is resolved via
+# ``AITER_CONFIGS.AITER_CONFIG_DISPATCH_COMBINE_INTRANODE_FILE``.
 
 
 @functools.cache
@@ -138,36 +138,17 @@ def _detect_gpu_model(device_index=0):
 def resolve_tuning_config_path(
     ep_size, *, kernel_type="IntraNode", gpu_arch=None, gpu_model=None
 ):
-    if not _TUNING_CONFIGS_DIR.is_dir():
-        return None
-    if gpu_arch is None:
-        try:
-            gpu_arch = str(get_rocm_arch() or "")
-        except Exception:  # noqa: BLE001
-            gpu_arch = None
-    if gpu_model is None:
-        gpu_model = _detect_gpu_model()
-    suffix = f"_{kernel_type}_ep{ep_size}.json"
-    candidates = [
-        p for p in _TUNING_CONFIGS_DIR.glob(f"flydsl_*{suffix}") if p.is_file()
-    ]
-    if not candidates:
-        return None
+    """Resolved tuned CSV path (``kernel_type`` / ``ep_size`` kept for API compat)."""
+    del ep_size, kernel_type
+    from aiter.jit.core import AITER_CONFIGS
 
-    def _score(p):
-        n = p.name
-        return (
-            1 if (gpu_arch and gpu_arch in n) else 0,
-            1 if (gpu_model and gpu_model in n) else 0,
-        )
-
-    candidates.sort(key=lambda p: (_score(p), p.name), reverse=True)
-    return candidates[0]
+    path = Path(AITER_CONFIGS.AITER_CONFIG_DISPATCH_COMBINE_INTRANODE_FILE)
+    return path if path.is_file() else None
 
 
 def build_geometry_tuning_table_for_config(cfg, path=None):
-    """Build a :class:`GeometryTuningTable` for ``cfg``'s shape (tuning JSON
-    auto-resolved from ``cfg.world_size`` when ``path`` omitted); None on miss."""
+    """Build a :class:`GeometryTuningTable` for ``cfg``'s shape (tuning CSV
+    auto-resolved when ``path`` omitted); None on miss."""
     if path is None:
         path = resolve_tuning_config_path(cfg.world_size)
     if path is None or not Path(path).is_file():
@@ -176,8 +157,15 @@ def build_geometry_tuning_table_for_config(cfg, path=None):
         dispatch_dtype_name = dtype_to_tuning_name(cfg.dispatch_dtype)
     except ValueError:
         return None
+    try:
+        gfx = str(get_rocm_arch() or "")
+    except Exception:  # noqa: BLE001
+        gfx = None
     table = GeometryTuningTable.from_tuning_file(
         str(path),
+        ep_size=cfg.world_size,
+        gfx=gfx.split(":")[0] if gfx else None,
+        gpu_model=_detect_gpu_model(),
         dtype=dispatch_dtype_name,
         hidden_dim=cfg.hidden_dim,
         zero_copy=cfg.zero_copy,
