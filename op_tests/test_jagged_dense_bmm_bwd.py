@@ -261,7 +261,7 @@ def _build_flydsl_fn(jagged, dense, d_out, seq_offsets, B, Mi, N, K, component):
 
     if component == "jagged":
         dense_kn = dense.reshape(B * K, N).contiguous()
-        d_jagged = torch.zeros(
+        d_jagged = torch.empty(
             total_rows + block_m, K, dtype=dtypes.bf16, device=device
         )
         t_dj = flyc.from_dlpack(d_jagged).mark_layout_dynamic(
@@ -274,11 +274,11 @@ def _build_flydsl_fn(jagged, dense, d_out, seq_offsets, B, Mi, N, K, component):
 
         return run_jagged
 
-    d_dense = torch.zeros(B, K, N, dtype=dtypes.bf16, device=device)
+    d_dense = torch.empty(B, K, N, dtype=dtypes.bf16, device=device)
     d_dense_v = d_dense.view(B * K, N)
-    dense_partials = torch.zeros(B * split * K, N, dtype=torch.float32, device=device)
-    d_bias = torch.zeros(B, N, dtype=dtypes.bf16, device=device)
-    bias_partials = torch.zeros(B * split, N, dtype=torch.float32, device=device)
+    dense_partials = torch.empty(B * split * K, N, dtype=torch.float32, device=device)
+    d_bias = torch.empty(B, N, dtype=dtypes.bf16, device=device)
+    bias_partials = torch.empty(B * split, N, dtype=torch.float32, device=device)
     t_jagged = flyc.from_dlpack(jagged).mark_layout_dynamic(
         leading_dim=1, divisibility=8
     )
