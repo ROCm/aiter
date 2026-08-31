@@ -184,8 +184,11 @@ def gemm2_compute_v2(
     g2_bhoist=True,
     g2_ascale_pf=True,
     expert_offset=0,
+    explicit_m_row=None,
+    explicit_n_block=None,
+    explicit_expert=None,
 ):
-    """Run the GEMM2 K-loop and return accumulators for the selected epilogue."""
+    """Run GEMM2, optionally using an explicitly selected expert row/tile."""
     # SBM is the sort padding unit; BM is the compute tile and must divide SBM.
     if SBM is None:
         SBM = BM
@@ -226,15 +229,21 @@ def gemm2_compute_v2(
         N_real = N_OUT_rt - fx.Int32(i32_npad)
 
     # Map each compute block to its SBM-padded expert metadata row.
-    m_block_idx = bx_i32 // num_n_blocks
-    n_block_idx = bx_i32 - m_block_idx * num_n_blocks
-    eids_ptr = global_typed_ptr(arg_eids, T.i32)
-    if const_expr(SBM == BM):
-        e = rocdl.readfirstlane(T.i32, eids_ptr[m_block_idx])
-        m_row = m_block_idx * BM
+    if const_expr(explicit_m_row is not None):
+        m_row = fx.Int32(explicit_m_row)
+        m_block_idx = m_row // fx.Int32(BM)
+        n_block_idx = fx.Int32(explicit_n_block)
+        e = fx.Int32(explicit_expert)
     else:
-        m_row = m_block_idx * BM
-        e = rocdl.readfirstlane(T.i32, eids_ptr[m_row // fx.Int32(SBM)])
+        m_block_idx = bx_i32 // num_n_blocks
+        n_block_idx = bx_i32 - m_block_idx * num_n_blocks
+        eids_ptr = global_typed_ptr(arg_eids, T.i32)
+        if const_expr(SBM == BM):
+            e = rocdl.readfirstlane(T.i32, eids_ptr[m_block_idx])
+            m_row = m_block_idx * BM
+        else:
+            m_row = m_block_idx * BM
+            e = rocdl.readfirstlane(T.i32, eids_ptr[m_row // fx.Int32(SBM)])
     if const_expr(expert_offset != 0):
         e = e - fx.Int32(expert_offset)
 

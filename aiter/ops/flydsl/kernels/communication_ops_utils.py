@@ -29,6 +29,7 @@ __all__ = [
     "atomic_add_agent",
     "atomic_add_global_at",
     "atomic_add_system",
+    "atomic_add_workgroup",
     "fence_acquire",
     "fence_agent_acquire",
     "fence_agent_release",
@@ -36,6 +37,7 @@ __all__ = [
     "fence_system_acquire",
     "fence_system_release",
     "load_i32_acquire",
+    "load_i32_system",
     "load_i32_nt",
     "load_i64_acquire",
     "load_i64_global",
@@ -46,6 +48,9 @@ __all__ = [
     "store_i32_system",
     "store_i64_global_system",
     "traced",
+    "wait_i32_until_equals",
+    "wait_i32_until_greater_than",
+    "wait_i64_until_equals",
     "waitcnt_all",
 ]
 
@@ -54,6 +59,13 @@ def _to_ptr_global(v):
     """Cast an i64 address to ``!llvm.ptr<1>`` (global address space)."""
     return _llvm_d.IntToPtrOp(
         _llvm_d.PointerType.get(address_space=1), arith.unwrap(v)
+    ).result
+
+
+def _to_ptr_shared(v):
+    """Cast an i64 address to ``!llvm.ptr<3>`` (shared address space)."""
+    return _llvm_d.IntToPtrOp(
+        _llvm_d.PointerType.get(address_space=3), arith.unwrap(v)
     ).result
 
 
@@ -106,6 +118,12 @@ def load_i64_acquire(addr_i64):
     ).res
 
 
+def load_i32_system(addr_i64, index):
+    """Compatibility system-scope i32 load at ``addr_i64 + index * 4``."""
+    item_addr = fx.Int64(addr_i64) + fx.Int64(index) * fx.Int64(4)
+    return fx.Int32(load_i32_acquire(item_addr))
+
+
 def load_i32_nt(base_i64, offset):
     """Non-temporal global i32 load at base + offset*4."""
     return _llvm_d.LoadOp(
@@ -145,6 +163,24 @@ def spin_until_gt_i32(addr_i64, val):
     while cur <= fx.Int32(val):
         cur = fx.Int32(load_i32_acquire(addr_i64))
     return cur
+
+
+def wait_i32_until_equals(addr_i64, expected):
+    """Compatibility wrapper for the historical MegaMoE wait helper."""
+    spin_until_eq_i32(addr_i64, expected)
+
+
+def wait_i32_until_greater_than(addr_i64, expected):
+    """Compatibility wrapper returning the first i32 value above ``expected``."""
+    return spin_until_gt_i32(addr_i64, expected)
+
+
+@traced
+def wait_i64_until_equals(addr_i64, expected):
+    """Spin until a system-visible i64 flag equals ``expected``."""
+    cur = fx.Int64(load_i64_acquire(addr_i64))
+    while cur != fx.Int64(expected):
+        cur = fx.Int64(load_i64_acquire(addr_i64))
 
 
 def store_i32_system(addr_i64, offset, val):
@@ -240,6 +276,17 @@ def atomic_add_agent(addr_i64, val):
 def atomic_add_system(addr_i64, val):
     """System-scope monotonic global fetch-and-add."""
     return atomic_add_global_at(addr_i64, val)
+
+
+def atomic_add_workgroup(addr_i64, val):
+    """Workgroup-scope monotonic shared-memory fetch-and-add."""
+    return _llvm_d.AtomicRMWOp(
+        _llvm_d.AtomicBinOp.add,
+        _to_ptr_shared(addr_i64),
+        arith.unwrap(val),
+        _llvm_d.AtomicOrdering.monotonic,
+        syncscope="workgroup",
+    ).res
 
 
 @dataclass

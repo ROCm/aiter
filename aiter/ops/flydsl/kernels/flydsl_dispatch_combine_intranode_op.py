@@ -1463,6 +1463,102 @@ class FlyDSLDispatchCombineIntraNodeOp:
             stage2_p2p_quant=stage2_p2p_quant,
         )
 
+    def preload_combine_no_stage1(
+        self,
+        input,
+        *,
+        cur_tok,
+        enable_weights: bool = False,
+        stage2_p2p_quant=None,
+    ):
+        """Compile and load one fused-Stage2 combine geometry without launching it."""
+        if not type(self)._ENABLE_COMBINE_NO_STAGE1:
+            raise NotImplementedError("combine_no_stage1 preload is not enabled")
+        cfg = self.cfg
+        self._check_combine_inputs(input, None, None, None, strict_input_dtype=False)
+        p2p_quant = (
+            cfg.stage2_p2p_quant if stage2_p2p_quant is None else stage2_p2p_quant
+        )
+        if p2p_quant not in _SUPPORTED_STAGE2_P2P_QUANT_TYPES:
+            raise ValueError(f"unsupported stage2_p2p_quant={p2p_quant!r}")
+        fp8_dc = (
+            cfg.combine_quant_type == "fp8_direct_cast"
+            and input.dtype == torch.bfloat16
+        )
+        blockwise_fp8 = p2p_quant == "fp8_blockwise_1x32"
+        c_dtype = torch.float8_e4m3fn if fp8_dc else input.dtype
+        _cur_tok = self._resolve_cur_tok(cur_tok, "preload_combine_no_stage1()")
+        block_num, warp_num = _resolve_launch_geometry(
+            "combine",
+            cfg.combine_block_num,
+            cfg.combine_warp_num_per_block,
+            cfg.tuning_table,
+            _cur_tok,
+            _DEFAULT_COMBINE_BLOCK_NUM,
+            _DEFAULT_COMBINE_WARP_NUM,
+        )
+        _check_block_num_resident("combine", block_num)
+        key = (
+            c_dtype,
+            bool(cfg.zero_copy),
+            bool(enable_weights),
+            bool(fp8_dc),
+            bool(blockwise_fp8),
+            block_num,
+            warp_num,
+            True,
+        )
+        fn = self._comb_jit_cache.get(key)
+        if fn is None:
+            fn = make_combine_jit(
+                rank=cfg.rank,
+                npes=cfg.world_size,
+                experts_per_token=cfg.num_experts_per_token,
+                hidden_dim=cfg.hidden_dim,
+                max_tok_per_rank=cfg.max_num_inp_token_per_rank,
+                block_num=block_num,
+                warp_num_per_block=warp_num,
+                data_type=c_dtype,
+                enable_weights=bool(enable_weights),
+                enable_std_moe=cfg.enable_std_moe,
+                zero_copy=cfg.zero_copy,
+                skip_stage1=True,
+                fp8_direct_cast=bool(fp8_dc),
+                blockwise_fp8_transport=bool(blockwise_fp8),
+                max_recv=self._effective_max_recv,
+            )
+            self._comb_jit_cache[key] = fn
+        fixed = (
+            self._fx_comb_inp,
+            self._fx_comb_out,
+            self._fx_xdb_mem,
+            self._fx_xdev_flag,
+            self._fx_tok_map,
+            self._fx_comb_bar,
+            self._fx_trecv,
+            self._fx_out_shmem_tok_id_to_src,
+            self._fx_p2p_comb_inp,
+            self._fx_p2p_xdb_mem,
+        )
+        tail = (
+            self._fx_comb_inp_wts,
+            self._fx_comb_out_wts,
+            self._fx_p2p_comb_inp_wts,
+        )
+        std = (self._fx_disp_tok_map, self._fx_disp_out_wts)
+        compiled = fn.preload(
+            fx.Int64(input.data_ptr()),
+            *fixed,
+            fx.Int64(self.shmem_disp_out_wts.data_ptr()),
+            *tail,
+            fx.Int64(0),
+            *std,
+            _cur_tok,
+            torch.cuda.current_stream(),
+        )
+        self._comb_compiled_cache[key] = compiled
+        return compiled
+
     def get_dispatch_src_token_pos(self):
         torch.cuda.synchronize()
         n = int(self.total_recv[0].item())

@@ -21,7 +21,7 @@ def test_mtpr8192_bundle_deduplicates_expected_variants():
     plan = build_mega_moe_bundle_plan(8192)
 
     assert len(plan.entries) == 13
-    assert len(plan.stage1_variants) == 11
+    assert len(plan.stage1_variants) == 8
     assert len(plan.stage2_variants) == 6
     assert [entry.pair_id for entry in plan.entries] == list(range(13))
 
@@ -83,7 +83,7 @@ def test_default_prefill_keeps_payload_deduplication_disabled():
         plan.entry_for_tokens(tokens).config.stage1 for tokens in rank_tokens
     )
 
-    assert all(not config.deduplicate_payload for config in configs)
+    assert all(not getattr(config, "deduplicate_payload", False) for config in configs)
 
 
 @pytest.mark.parametrize("mtpr", [8192, 16384, 32768])
@@ -158,7 +158,13 @@ def test_large_mtpr_bundle_keeps_stage1_and_stage2_in_compact_mode():
     assert all(not key.fixed_slot_dispatch for key in plan.stage2_variants)
 
 
-@pytest.mark.parametrize("tokens", [0, 8193])
+def test_empty_rank_uses_smallest_collective_bundle_entry():
+    plan = build_mega_moe_bundle_plan(8192)
+
+    assert plan.entry_for_tokens(0) == plan.entries[0]
+
+
+@pytest.mark.parametrize("tokens", [-1, 8193])
 def test_bundle_rejects_out_of_range_tokens(tokens):
     with pytest.raises(ValueError, match="must be in"):
         build_mega_moe_bundle_plan(8192).entry_for_tokens(tokens)

@@ -87,9 +87,6 @@ class ATileLoader:
         swizzle=False,
         x_tensor=None,
         async_copy=False,
-        row_index_rsrc=None,
-        row_map_lds=None,
-        source_capacity_rows=None,
     ):
         self._sort_block_m = sort_block_m
         self._k_step_bytes = k_step_bytes
@@ -100,12 +97,6 @@ class ATileLoader:
         self._wave = self._tx // 64
         self._x_tensor = x_tensor
         self._async_copy = bool(async_copy)
-        self._row_index_rsrc = row_index_rsrc
-        self._row_map_lds = row_map_lds
-        self._indirect = row_index_rsrc is not None
-        assert self._indirect == (row_map_lds is not None)
-        assert self._indirect == (source_capacity_rows is not None)
-        self._source_capacity_rows = source_capacity_rows
         assert x_tensor is not None
         if const_expr(self._async_copy):
             assert total_threads % 64 == 0
@@ -118,52 +109,13 @@ class ATileLoader:
 
     def for_tile(self, tile_row_base_i32):
         """Precompute LDS and tile-local global offsets for one M tile."""
-        if const_expr(self._indirect):
-
-            @flyc.jit
-            def stage_row(row: fx.Int32):
-                if row < fx.Int32(self._sort_block_m):
-                    packed = _buffer_load(
-                        self._row_index_rsrc,
-                        tile_row_base_i32 + row,
-                        fx.Int32,
-                    )
-                    source_row = packed & fx.Int32(0xFFFFFF)
-                    payload_row = (
-                        source_row < fx.Int32(self._source_capacity_rows)
-                    ).select(source_row, fx.Int32(0))
-                    dst = fx.make_view(
-                        fx.add_offset(self._row_map_lds.ptr, row),
-                        fx.make_layout(1, 1),
-                    )
-                    fragment = fx.make_rmem_tensor(1, fx.Int32)
-                    fragment.store(Vec.from_elements([payload_row], fx.Int32))
-                    fx.copy(
-                        fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32),
-                        fragment,
-                        dst,
-                    )
-
-            stage_row(fx.Int32(self._tx))
-            fx.rocdl.s_waitcnt(0)
-            fx.barrier()
-            tile_iter = fx.get_iter(self._x_tensor)
-        else:
-            tile_iter = fx.add_offset(
-                fx.get_iter(self._x_tensor),
-                fx.Int64(tile_row_base_i32) * fx.Int64(self._row_bytes),
-            )
+        tile_iter = fx.add_offset(
+            fx.get_iter(self._x_tensor),
+            fx.Int64(tile_row_base_i32) * fx.Int64(self._row_bytes),
+        )
         tile_view = fx.Tensor(
             fx.make_view(
-                tile_iter,
-                fx.make_layout(
-                    (
-                        self._source_capacity_rows * self._row_bytes
-                        if self._indirect
-                        else self._sort_block_m * self._row_bytes
-                    ),
-                    1,
-                ),
+                tile_iter, fx.make_layout(self._sort_block_m * self._row_bytes, 1)
             )
         )
         self._tile_rsrc = _make_buffer(
@@ -171,21 +123,13 @@ class ATileLoader:
             fx.Int32,
             4,
             max_size=False,
-            num_records_bytes=(
-                self._source_capacity_rows * self._row_bytes
-                if self._indirect
-                else self._sort_block_m * self._row_bytes
-            ),
+            num_records_bytes=self._sort_block_m * self._row_bytes,
         )
         if const_expr(self._async_copy):
             tile_buffer = fx.rocdl.make_buffer_tensor(
                 tile_view,
                 max_size=False,
-                num_records_bytes=(
-                    self._source_capacity_rows * self._row_bytes
-                    if self._indirect
-                    else self._sort_block_m * self._row_bytes
-                ),
+                num_records_bytes=self._sort_block_m * self._row_bytes,
             )
             self._tile_dma = fx.logical_divide(
                 tile_buffer,
@@ -208,24 +152,7 @@ class ATileLoader:
                 lds_byte = swz * fx.Int32(4)
             else:
                 lds_byte = lin * fx.Int32(16)
-            if const_expr(self._indirect):
-                row_byte = self._load_payload_row(row) * fx.Int32(self._row_bytes)
             self._chunks.append((lds_byte, row_byte + chunk * fx.Int32(16)))
-        self._dma_rows = []
-        if const_expr(self._async_copy and self._indirect):
-            for round_base in range_constexpr(
-                0,
-                self._sort_block_m * 16,
-                self._total_threads,
-            ):
-                physical = fx.Int32(round_base) + fx.Int32(self._tx)
-                row = physical // fx.Int32(16)
-                self._dma_rows.append(self._load_payload_row(row))
-
-    def _load_payload_row(self, logical_row):
-        ptr = fx.add_offset(self._row_map_lds.ptr, logical_row)
-        value = fx.make_view(ptr, fx.make_layout(1, 1)).load()
-        return Vec(value, dtype=fx.Int32)[0]
 
     def load_regs(self, k_step_byte_off):
         """Read this K-step's 16-B chunks gmem->reg (VMEM); only the K-step offset varies. Returns (lds_off, vec4)."""
@@ -260,12 +187,10 @@ class ATileLoader:
             lds_dst.ptr,
         )
         total_chunks = self._sort_block_m * 16
-        for round_index, round_base in enumerate(
-            range_constexpr(
-                0,
-                total_chunks,
-                self._total_threads,
-            )
+        for round_base in range_constexpr(
+            0,
+            total_chunks,
+            self._total_threads,
         ):
             physical = fx.Int32(round_base) + fx.Int32(self._tx)
             row = physical // fx.Int32(16)
@@ -274,13 +199,8 @@ class ATileLoader:
                 logical_chunk = physical_chunk ^ (row & fx.Int32(15))
             else:
                 logical_chunk = physical_chunk
-            source_row = row
-            if const_expr(self._indirect):
-                source_row = self._dma_rows[round_index]
             src_byte = (
-                source_row * fx.Int32(self._row_bytes)
-                + koff
-                + logical_chunk * fx.Int32(16)
+                row * fx.Int32(self._row_bytes) + koff + logical_chunk * fx.Int32(16)
             )
             src = fx.slice(
                 self._tile_dma,
@@ -403,16 +323,7 @@ class BScaleLoader:
 class AScaleLoader:
     """Per-1x32 E8M0 A scales STAGED to LDS once per tile (stage), read via ds_read in K-loop (kills VMEM flood)."""
 
-    def __init__(
-        self,
-        *,
-        scale_rsrc,
-        m_repeat,
-        model_dim,
-        sort_block_m,
-        total_threads,
-        row_map_lds=None,
-    ):
+    def __init__(self, *, scale_rsrc, m_repeat, model_dim, sort_block_m, total_threads):
         self._rsrc = scale_rsrc
         self._n_scale = model_dim // 32
         self._lane = fx.thread_idx.x % 64
@@ -420,8 +331,6 @@ class AScaleLoader:
         self._sort_block_m = sort_block_m
         self._total_threads = total_threads
         self._tx = fx.thread_idx.x
-        self._row_map_lds = row_map_lds
-        self._indirect = row_map_lds is not None
 
     def stage(self, lds_ascale, tile_row_base_i32):
         """Coalesced gmem->LDS copy of this tile's e8m0 A-scale block [sort_block_m, n_scale]. Call before K-loop."""
@@ -429,24 +338,13 @@ class AScaleLoader:
         assert total % 16 == 0, "A-scale tile must contain whole 16-byte copy chunks"
         base = tile_row_base_i32 * fx.Int32(self._n_scale)
         n16 = total // 16
-        chunks_per_row = self._n_scale // 16
 
         @flyc.jit
         def copy_chunk(lin: fx.Int32):
             if lin < fx.Int32(n16):
-                row = lin // fx.Int32(chunks_per_row)
-                chunk = lin % fx.Int32(chunks_per_row)
-                source_index = base + lin * fx.Int32(16)
-                if const_expr(self._indirect):
-                    row_ptr = fx.add_offset(self._row_map_lds.ptr, row)
-                    row_value = fx.make_view(row_ptr, fx.make_layout(1, 1)).load()
-                    payload_row = Vec(row_value, dtype=fx.Int32)[0]
-                    source_index = payload_row * fx.Int32(
-                        self._n_scale
-                    ) + chunk * fx.Int32(16)
                 v = _buffer_load(
                     self._rsrc,
-                    source_index // fx.Int32(16),
+                    (base + lin * fx.Int32(16)) // fx.Int32(16),
                     fx.Int32,
                     4,
                 )
