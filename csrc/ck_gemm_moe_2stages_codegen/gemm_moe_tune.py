@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
+import math
 import os
 import re
 import sys
@@ -6081,14 +6082,119 @@ class Mxfp4FlydslTuner(FmoeTuner):
     }
 
     @staticmethod
-    def _g1_kname(bm, use_nt, inline_quant):
-        # flydsl_mxmoe_g1_a4w4_<BM>x256x256[_f16in][_nt]; see mxfp4_kname.py.
-        name = f"flydsl_mxmoe_g1_a4w4_{bm}x256x256"
+    def _g1_kname(
+        bm,
+        use_nt,
+        inline_quant,
+        act="silu",
+        prefetch_hidden=False,
+        bn=256,
+        bk=256,
+        k_wave=1,
+        xcd_swizzle=0,
+        num_waves=4,
+    ):
+        # flydsl_mxmoe_g1_a4w4_<BM>x<BN>x<BK>[_f16in][_hpf][_nt]
+        #   [_situv2|_swiglu][_kw<n>][_xcd<n>][_w2];
+        # token order must match _parse_mxfp4_g1_kname in mxfp4_kname.py.
+        if prefetch_hidden and not inline_quant:
+            raise ValueError("hidden prefetch requires inline quantization")
+        name = f"flydsl_mxmoe_g1_a4w4_{bm}x{bn}x{bk}"
         if inline_quant:
             name += "_f16in"
+        if prefetch_hidden:
+            name += "_hpf"
         if use_nt:
             name += "_nt"
+        if act == "situv2":
+            name += "_situv2"
+        elif act == "swiglu":
+            name += "_swiglu"
+        if k_wave > 1:
+            name += f"_kw{int(k_wave)}"
+        if xcd_swizzle:
+            name += f"_xcd{int(xcd_swizzle)}"
+        if num_waves == 2:
+            name += "_w2"
         return name
+
+    # GEMM1 axes swept on top of (BM, use_nt, inline_quant). Their constraints
+    # interact (BN64 implies BM32 non-inline separated; num_waves==2 implies
+    # BN64; k_wave>1 implies BM32 non-inline and num_waves*k_wave<=8), so
+    # _g1_variants enumerates the cross-product and lets the kernel's own
+    # _assert_supported reject the rest instead of duplicating that logic.
+    _G1_BN = (64, 128, 256)
+    _G1_XCD_SWIZZLE = (0, 2, 4)
+    _G1_K_WAVE = (1, 2, 4)
+    _G1_NUM_WAVES = (4, 2)
+
+    def _g1_variants(self, row):
+        """Valid _g1_kname kwargs for one shape, most-default first."""
+        from aiter.ops.flydsl.mxfp4_gemm1_kernels import _assert_supported
+        from aiter.ops.flydsl.mxfp4_kname import MXFP4_G1_VARIANTS
+
+        ne, h, e = int(row["expert"]), int(row["model_dim"]), int(row["inter_dim"])
+        topk = int(row["topk"])
+        act = self._row_act(row)
+        out = []
+        for bm, use_nt, inline_quant in sorted(MXFP4_G1_VARIANTS["fp4"]):
+            for bn in self._G1_BN:
+                for num_waves in self._G1_NUM_WAVES:
+                    for k_wave in self._G1_K_WAVE:
+                        # Hidden prefetch hoists the next K-tile's hidden_states
+                        # load, which only the inline-quant path performs.
+                        for hpf in (False, True) if inline_quant else (False,):
+                            for xcd in self._G1_XCD_SWIZZLE:
+                                try:
+                                    _assert_supported(
+                                        NE=ne,
+                                        D_HIDDEN=h,
+                                        D_INTER=e,
+                                        topk=topk,
+                                        BM=bm,
+                                        BN=bn,
+                                        BK=256,
+                                        use_nt=use_nt,
+                                        inline_quant=inline_quant,
+                                        prefetch_hidden=hpf,
+                                        act=act,
+                                        situ_beta=DEFAULT_SITUV2_BETA,
+                                        situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+                                        num_waves=num_waves,
+                                        k_wave=k_wave,
+                                        native_scale_layout=bm == 16,
+                                    )
+                                except NotImplementedError:
+                                    continue
+                                out.append(
+                                    {
+                                        "bm": bm,
+                                        "use_nt": use_nt,
+                                        "inline_quant": inline_quant,
+                                        "act": act,
+                                        "prefetch_hidden": hpf,
+                                        "bn": bn,
+                                        "bk": 256,
+                                        "k_wave": k_wave,
+                                        "xcd_swizzle": xcd,
+                                        "num_waves": num_waves,
+                                    }
+                                )
+        return out
+
+    @staticmethod
+    def _row_act(row):
+        """The GEMM1 activation tag for this row.
+
+        Folding Situv2 into Silu makes the tuner write a name without
+        `_situv2`, which fused_moe then rejects on activation mismatch.
+        """
+        act_type = str(row.get("act_type", ""))
+        if act_type.endswith("Situv2"):
+            return "situv2"
+        if act_type.endswith("Swiglu"):
+            return "swiglu"
+        return "silu"
 
     @staticmethod
     def _g2_kname(bm, use_nt, epilog):
@@ -6126,37 +6232,34 @@ class Mxfp4FlydslTuner(FmoeTuner):
 
     def _candidate_rows(self, row):
         from aiter.ops.flydsl.mxfp4_gemm2_kernels import _SUPPORTED as G2
-        from aiter.ops.flydsl.mxfp4_kname import MXFP4_G1_VARIANTS
 
-        G1 = MXFP4_G1_VARIANTS["fp4"]
         g2_bms = {v[0] for v in G2}
         cands = []
-        for bm in sorted({v[0] for v in G1}):
-            for _, n1, iq1 in sorted(v for v in G1 if v[0] == bm):
-                kn1 = self._g1_kname(bm, n1, iq1)
-                # (A) native mxmoe g2 candidates (flydsl_mxmoe_g2_a4w4_*).
-                if bm in g2_bms:
-                    for _, n2, ep in sorted(v for v in G2 if v[0] == bm):
-                        cands.append(
-                            self._candidate_row(
-                                row, bm, kn1, self._g2_kname(bm, n2, ep)
-                            )
-                        )
-                # (B) path B: flydsl_moe2_layout g2 candidates coupled with this
-                # mxmoe g1. Only the native SBM==tile_m==bm variants (verified
-                # correct for BM in {16,32,64,128} x {atomic,reduce}); re-tiling
-                # (tile_m<bm) is not enabled. Selected e2e-fastest by _tune_one_shape.
-                for kn2v, kp in get_flydsl_stage2_v2_kernels(
-                    "fp4",
-                    "fp4",
-                    "bf16",
-                    bm,
-                    model_dim=int(row["model_dim"]),
-                    inter_dim=int(row["inter_dim"]),
-                ).items():
-                    if kp["tile_m"] != bm:
-                        continue
-                    cands.append(self._candidate_row(row, bm, kn1, kn2v))
+        for g1 in self._g1_variants(row):
+            bm = g1["bm"]
+            kn1 = self._g1_kname(**g1)
+            # (A) native mxmoe g2 candidates (flydsl_mxmoe_g2_a4w4_*).
+            if bm in g2_bms:
+                for _, n2, ep in sorted(v for v in G2 if v[0] == bm):
+                    cands.append(
+                        self._candidate_row(row, bm, kn1, self._g2_kname(bm, n2, ep))
+                    )
+            # (B) path B: flydsl_moe2_layout g2 candidates coupled with this
+            # mxmoe g1. Only the native SBM==tile_m==bm variants (verified
+            # correct for BM in {16,32,64,128} x {atomic,reduce}); re-tiling
+            # (tile_m<bm) is not enabled. Selected e2e-fastest by
+            # _tune_one_shape.
+            for kn2v, kp in get_flydsl_stage2_v2_kernels(
+                "fp4",
+                "fp4",
+                "bf16",
+                bm,
+                model_dim=int(row["model_dim"]),
+                inter_dim=int(row["inter_dim"]),
+            ).items():
+                if kp["tile_m"] != bm:
+                    continue
+                cands.append(self._candidate_row(row, bm, kn1, kn2v))
         return cands
 
     @staticmethod
@@ -6199,7 +6302,8 @@ class Mxfp4FlydslTuner(FmoeTuner):
         _g2 = parse_g2_kname_any(kn2)
         BM = _g2["BM"]
         atomic = _g2["atomic"]
-        BM1 = _parse_mxfp4_g1_kname(kn1)["BM"]
+        p1 = _parse_mxfp4_g1_kname(kn1)
+        BM1 = p1["BM"]
         M = data["input"].shape[0]
         sti, sw, sei, nvi, moe_buf, m_indices, reverse_sorted = moe_sorting(
             data["topk_ids"],
@@ -6226,6 +6330,13 @@ class Mxfp4FlydslTuner(FmoeTuner):
             kernelName1=kn1,
             m_indices=m_indices,
             moe_buf=moe_buf,
+            # _torch_ref runs SiTUv2 at run_torch_moe_stage1's default betas, so
+            # the kernel has to use the same pair or the candidate fails the
+            # accuracy gate for a reason that is not the kernel's fault.
+            situ_beta=DEFAULT_SITUV2_BETA if p1["act"] == "situv2" else 1.0,
+            situ_linear_beta=(
+                DEFAULT_SITUV2_LINEAR_BETA if p1["act"] == "situv2" else 1.0
+            ),
         )
         return _mxfp4_a4w4_stage2_fw(
             inter_q,
@@ -6280,16 +6391,18 @@ class Mxfp4FlydslTuner(FmoeTuner):
         token, topk = int(row["token"]), int(row["topk"])
         dtype = dtypes.bf16
         kn1, kn2 = candidate["kernelName1"], candidate["kernelName2"]
-        activation = (
-            ActivationType.Swiglu
-            if str(row["act_type"]).endswith("Swiglu")
-            else ActivationType.Silu
-        )
+        activation = {
+            "situv2": ActivationType.Situv2,
+            "swiglu": ActivationType.Swiglu,
+            "silu": ActivationType.Silu,
+        }[self._row_act(row)]
         data = self._prepare_case(token, h, e, ne, topk, dtype)
         out = self._port_e2e(data, kn1, kn2, topk, ne, h, dtype)
         ref = self._torch_ref(data, topk, dtype, activation)
         err = cosine_diff_compare(ref, out, msg=f"port[{kn1}+{kn2}]")
-        if err is None or float(err) > args.errRatio:
+        # NaN must reject explicitly: `nan > errRatio` is False, so a candidate
+        # producing garbage would otherwise pass the gate and, being fast, win.
+        if err is None or not math.isfinite(float(err)) or float(err) > args.errRatio:
             raise RuntimeError(f"cosine err_ratio {err} > {args.errRatio}")
         _, us = run_perftest(
             lambda: self._port_e2e(data, kn1, kn2, topk, ne, h, dtype),
