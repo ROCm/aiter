@@ -66,6 +66,9 @@ from aiter.ops.flydsl.gemm_kernels import (
     get_flydsl_splitk_hgemm_kernel_params,
     parse_gemm_decode_kernel_name,
 )
+from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a4w4_bpreshuffle_common import (
+    parse_a4w4_splitk_kernel_name as _parse_flydsl_a4w4_splitk_kernel_name,
+)
 from aiter.ops.flydsl.kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
 from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm
 from aiter.ops.flydsl.kernels.preshuffle_gemm_splitk import (
@@ -90,7 +93,6 @@ from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
 from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
     parse_wmma_kernel_name as parse_mxfp8_128_wmma_kernel_name,
 )
-from aiter.ops.gemm_op_a4w4 import _parse_flydsl_a4w4_splitk_kernel_name
 
 # Keep the default AOT coverage aligned with runtime config resolution.
 DEFAULT_CSVS = [

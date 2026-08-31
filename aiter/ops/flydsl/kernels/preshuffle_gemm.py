@@ -155,8 +155,10 @@ def compile_preshuffle_gemm(
     if split_k < 1 or K % split_k != 0:
         raise ValueError(f"split_k must divide K; got split_k={split_k}, K={K}")
     split_k_extent = K // split_k
-    if tile_n < 16:
-        raise ValueError(f"tile_n must be at least 16; got tile_n={tile_n}")
+    if tile_n < 16 or tile_n % 16 != 0:
+        raise ValueError(
+            f"tile_n must be a multiple of 16 and at least 16; got tile_n={tile_n}"
+        )
     if tile_k <= 0 or split_k_extent % tile_k != 0:
         raise ValueError(
             "tile_k must be a positive divisor of K/split_k; "

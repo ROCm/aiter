@@ -19,6 +19,7 @@ Runners stay on the tuner side: this module must remain importable without
 flydsl (the tuner reads it to name candidates on hosts that cannot compile).
 """
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -147,6 +148,37 @@ class A4W4SplitKKernelInstance:
                 f"mb{int(self.use_m_bounded_store)}",
             ]
         )
+
+
+def parse_a4w4_splitk_kernel_name(kernel_name: str):
+    """Parse ``A4W4SplitKKernelInstance.name`` into a tuple, or None.
+
+    Returns ``(tile_m, tile_n, tile_k, split_k, use_async_copy, waves_per_eu,
+    xcd_swizzle, lds_stage, scheduler, use_m_bounded_store)``. The OUTDTYPE
+    token is not captured (callers that need it parse it separately).
+    """
+    m = re.match(
+        r"flydsl_a4w4_splitk_(\d+)x(\d+)x(\d+)_sk(\d+)_\w+_"
+        r"(\d+)x(\d+)x(\d+)x(\d+)_([A-Za-z0-9]+)_sb32_mb([01])$",
+        kernel_name,
+    )
+    if m is None:
+        return None
+    tm, tn, tk, sk, acp, wpe, xcd_swizzle, lds_stage = (
+        int(m.group(i)) for i in range(1, 9)
+    )
+    return (
+        tm,
+        tn,
+        tk,
+        sk,
+        acp,
+        wpe,
+        xcd_swizzle,
+        lds_stage,
+        m.group(9),
+        bool(int(m.group(10))),
+    )
 
 
 def kernel_instance_estimated_lds_bytes_mxfp4(ki: A4W4SplitKKernelInstance) -> int:

@@ -13,52 +13,15 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from ..jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG, compile_ops
 from ..jit.utils.chip_info import get_cu_num
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
+from ..ops.flydsl.gemm_tune.flydsl_gemm_a4w4_bpreshuffle_common import (
+    parse_a4w4_splitk_kernel_name as _parse_flydsl_a4w4_splitk_kernel_name,
+)
 from ..ops.flydsl.splitk_bpreshuffle_common import (
     dispatch_flydsl_splitk,
     is_flydsl_available,
 )
 from ..ops.gemm_op_common import get_padded_m
 from ..utility import dtypes
-
-
-def _parse_flydsl_a4w4_splitk_kernel_name(kernel_name: str):
-    """Parse a flydsl a4w4 (mxfp4) split-K kernelName into (tile_m, tile_n,
-    tile_k, split_k, use_async_copy, waves_per_eu, xcd_swizzle, lds_stage,
-    scheduler, use_m_bounded_store), or None.
-
-    Format, from ``A4W4SplitKKernelInstance.name`` in
-    ``flydsl_gemm_a4w4_bpreshuffle_common.py``::
-
-        flydsl_a4w4_splitk_{tm}x{tn}x{tk}_sk{sk}_{OUTDTYPE}_{acp}x{wpe}x{xcd}x{lds}_{scheduler}_sb32_mb{0|1}
-
-    ``sb32`` (32-block E8M0 scale) is fixed for this family and not captured.
-    """
-    import re
-
-    m = re.match(
-        r"flydsl_a4w4_splitk_(\d+)x(\d+)x(\d+)_sk(\d+)_\w+_"
-        r"(\d+)x(\d+)x(\d+)x(\d+)_([A-Za-z0-9]+)_sb32_mb([01])$",
-        kernel_name,
-    )
-    if m is None:
-        return None
-    tm, tn, tk, sk, acp, wpe, xcd_swizzle, lds_stage = (
-        int(m.group(i)) for i in range(1, 9)
-    )
-    scheduler = m.group(9)
-    use_m_bounded_store = bool(int(m.group(10)))
-    return (
-        tm,
-        tn,
-        tk,
-        sk,
-        acp,
-        wpe,
-        xcd_swizzle,
-        lds_stage,
-        scheduler,
-        use_m_bounded_store,
-    )
 
 
 @functools.lru_cache(maxsize=1024)

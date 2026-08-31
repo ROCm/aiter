@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Minimal driver for the two-pass fp32 split-K preshuffle GEMM.
+"""Two-pass fp32 split-K preshuffle GEMM driver.
 
-Deliberately not wired into the tuned-config dispatch: this is the callable the
-correctness test and the follow-up perf runs use directly.
+Production dispatch is ``aiter.ops.flydsl.splitk_bpreshuffle_common.dispatch_flydsl_splitk``,
+used by the a8w8 and a4w4 tuned-config paths. Direct calls remain for the
+correctness tests and isolated perf runs.
 """
 
 import os
