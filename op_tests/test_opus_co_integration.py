@@ -86,12 +86,8 @@ def _run_gfx1250_co_case(kid: int, device: torch.device | None = None) -> None:
     )
 
     generator = torch.Generator(device=device).manual_seed(kid)
-    A = torch.randn(
-        (M, K), device=device, dtype=torch.bfloat16, generator=generator
-    )
-    B = torch.randn(
-        (N, K), device=device, dtype=torch.bfloat16, generator=generator
-    )
+    A = torch.randn((M, K), device=device, dtype=torch.bfloat16, generator=generator)
+    B = torch.randn((N, K), device=device, dtype=torch.bfloat16, generator=generator)
     Y = torch.full((M, N), float("nan"), device=device, dtype=torch.bfloat16)
 
     actual = opus_gemm(A, B, Y, kid=kid, split_k=0)

@@ -589,9 +589,7 @@ def kid_rejects_shape(k_inst, M, N, K):
 
     # The exact-N bf16-workspace restriction belongs only to the gfx942
     # reducer. gfx1250 #4246 has a different bf16 reducer and accepts padded N.
-    if k_inst.arch_prefix == "gfx942" and _kid_uses_bf16_workspace(
-        k_inst
-    ):
+    if k_inst.arch_prefix == "gfx942" and _kid_uses_bf16_workspace(k_inst):
         padded_N = _ceil_div(N, k_inst.B_N) * k_inst.B_N
         if loops < 2 or K % B_K != 0 or padded_N != N:
             return True

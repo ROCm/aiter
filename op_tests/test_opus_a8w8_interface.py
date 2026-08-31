@@ -11,8 +11,8 @@ import torch
 
 from aiter import dtypes
 from aiter.ops import gemm_op_a8w8 as general_a8w8
-from aiter.ops.opus import opus_gemm
 from aiter.ops.opus import gemm_op_a8w8 as opus_a8w8
+from aiter.ops.opus import opus_gemm
 
 
 def test_general_a8w8_restores_required_scales_and_blockscale_dtypes():
@@ -183,7 +183,7 @@ def test_bpreshuffle_uses_opus_for_tuned_row(monkeypatch):
         ck_calls.append(kernelName)
         return Y
 
-    import aiter.ops.opus as opus
+    from aiter.ops import opus
 
     monkeypatch.setattr(general_a8w8, "get_gfx", lambda: "gfx942")
     monkeypatch.setattr(general_a8w8, "_hip_blockscale_supported", lambda: True)

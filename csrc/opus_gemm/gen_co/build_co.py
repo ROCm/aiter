@@ -142,9 +142,7 @@ void {symbol}({kargs_name} kargs)
 """
 
 _BUNDLE_MAGIC = b"__CLANG_OFFLOAD_BUNDLE__"
-_INCLUDE_DIRECTIVE = re.compile(
-    r'^\s*#\s*include\s*[<"]([^">]+)[">]', re.MULTILINE
-)
+_INCLUDE_DIRECTIVE = re.compile(r'^\s*#\s*include\s*[<"]([^">]+)[">]', re.MULTILINE)
 _LOCAL_INCLUDE_DIRS = (
     os.path.join(_CSRC_DIR, "include"),
     os.path.join(_OPUS_GEMM_DIR, "include"),
