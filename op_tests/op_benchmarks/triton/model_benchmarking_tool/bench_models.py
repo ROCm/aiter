@@ -12,6 +12,12 @@ from typing import TypeAlias
 
 import matplotlib.pyplot as plt
 import pandas as pd
+from op_tests.op_benchmarks.triton.bench_moe_gemm_a4w4 import (
+    main as bench_moe_gemm_a4w4_main,
+)
+from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w4 import (
+    main as bench_moe_gemm_a8w4_main,
+)
 from triton.runtime.errors import OutOfResources
 
 from aiter.ops.triton.utils._triton import arch_info
@@ -38,12 +44,6 @@ from op_tests.op_benchmarks.triton.bench_gemm_afp4wfp4 import (
 )
 from op_tests.op_benchmarks.triton.bench_mha import main as bench_mha_main
 from op_tests.op_benchmarks.triton.bench_mla_decode import main as bench_mla_main
-from op_tests.op_benchmarks.triton.bench_moe_gemm_a4w4 import (
-    main as bench_moe_gemm_a4w4_main,
-)
-from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w4 import (
-    main as bench_moe_gemm_a8w4_main,
-)
 from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w8 import (
     main as bench_moe_gemm_a8w8_main,
 )

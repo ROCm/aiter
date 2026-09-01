@@ -1059,8 +1059,27 @@ class CustomAllreduce:
         # PyTorch caching allocator (its memory accounting is what downstream
         # consumers profile against). Gated on the same condition as the
         # capture copy-in path above; _init_ipc only runs for non-VMM.
-        raw_cached = _expandable_segments_enabled()
+        # AITER_CUSTOM_AR_RAW_INPUT_POOL forces the raw pool without
+        # expandable segments. Its use case is co-resident engines on one node
+        # (#4921): a second engine's torch.empty input pool can fail
+        # hipIpcGetMemHandle outright, and the raw pool sidesteps that while
+        # everything else (meta pool, capture-time outputs) stays exportable
+        # under the default allocator.
+        raw_cached = _expandable_segments_enabled() or _env_flag(
+            "AITER_CUSTOM_AR_RAW_INPUT_POOL"
+        )
         self._pool.create("input", max_size, raw_cached=raw_cached)
+        # One line per rank so every run self-documents which pool it actually
+        # got: a silently-inert trigger is indistinguishable from a working one
+        # by behaviour alone (both serve fine single-engine), and this class of
+        # bug (#4921) was reachable only in specific pool modes.
+        logger.info(
+            "CustomAllreduce input pool: %s (expandable_segments=%s, "
+            "AITER_CUSTOM_AR_RAW_INPUT_POOL=%s)",
+            "raw_cached/hipMalloc" if raw_cached else "torch.empty",
+            _expandable_segments_enabled(),
+            _env_flag("AITER_CUSTOM_AR_RAW_INPUT_POOL"),
+        )
 
         handles, offsets = self._pool.get_ipc_meta("meta")
         self._ptr = self._ops_init_custom_ar(
@@ -1565,7 +1584,7 @@ class CustomAllreduce:
                     residual_inp,
                     w=weight,
                     eps=eps,
-                    registered=True,
+                    registered=self.enable_register_for_capturing,
                     use_1stage=use_1stage,
                     out_hidden_dim=out_hidden_dim,
                     gemma_norm=gemma_norm,
@@ -1669,7 +1688,7 @@ class CustomAllreduce:
                     residual_inp,
                     w=weight,
                     eps=eps,
-                    registered=True,
+                    registered=self.enable_register_for_capturing,
                     use_1stage=use_1stage,
                     post_per_token_quant=True,
                     gemma_norm=gemma_norm,
@@ -1867,7 +1886,7 @@ class CustomAllreduce:
                     q_w,
                     k_w,
                     eps,
-                    registered=True,
+                    registered=self.enable_register_for_capturing,
                 )
             else:
                 return (
@@ -1936,7 +1955,7 @@ class CustomAllreduce:
                     head_dim,
                     rotary_dim,
                     eps,
-                    registered=True,
+                    registered=self.enable_register_for_capturing,
                 )
             else:
                 return (
@@ -2038,7 +2057,7 @@ class CustomAllreduce:
                     w=weight,
                     eps=eps,
                     group_size=group_size,
-                    registered=True,
+                    registered=self.enable_register_for_capturing,
                     use_1stage=use_1stage,
                     emit_bf16=emit_bf16,
                     transpose_scale=transpose_scale,
@@ -2097,7 +2116,7 @@ class CustomAllreduce:
                     residual_inp,
                     w=weight,
                     eps=eps,
-                    registered=True,
+                    registered=self.enable_register_for_capturing,
                     use_1stage=use_1stage,
                     emit_bf16=emit_bf16,
                 )

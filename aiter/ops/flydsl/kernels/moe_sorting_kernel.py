@@ -27,12 +27,9 @@ import flydsl.expr as fx
 import torch
 from flydsl.expr import gpu, range_constexpr
 from flydsl.expr import rocdl as fly_rocdl
-from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
-
-from aiter.ops.flydsl.kernels import buffer_ops
 
 from .kernels_common import get_warp_size
 from .tensor_shim import _run_compiled
@@ -116,18 +113,17 @@ def _allwave_inclusive_prefix_sum(val, lane, wave, scratch_mr, NUM_WAVES, WARP_S
 
 
 @flyc.jit
-def _zero_moe_buf_grid_stride(moe_buf_rsrc, gid_v4, stride_v4, total_v4, oob_idx):
-    """Grid-stride loop zeroing moe_buf via vectorized buffer_store."""
+def _zero_moe_buf_grid_stride(moe_buf_it, gid_v4, stride_v4, total_v4, oob_idx):
+    """Grid-stride loop zeroing moe_buf via vectorized (4xi32) stores."""
     c_one = fx.Int32(1)
     niters = (total_v4 + stride_v4 - c_one) // stride_v4
     c_zero_v4 = fx.Vector.filled(4, 0, fx.Int32)
     c4 = fx.Int32(4)
-    for _z in range(fx.Index(0), ArithValue(niters).index_cast(T.index), fx.Index(1)):
+    for _z in range(fx.Int32(0), niters, fx.Int32(1)):
         idx = gid_v4 + fx.Int32(_z) * stride_v4
         valid = idx < total_v4
-        buffer_ops.buffer_store(
-            c_zero_v4, moe_buf_rsrc, valid.select(idx * c4, oob_idx)
-        )
+        # Store 4 i32 at element offset idx*4 (OOB sentinel drops the write).
+        fx.ptr_store(c_zero_v4, moe_buf_it + fx.Int64(valid.select(idx * c4, oob_idx)))
 
 
 def _extend_prefix_sum_serial(mr, start_block, E, load_fn, store_fn):
@@ -146,39 +142,75 @@ def _extend_prefix_sum_serial(mr, start_block, E, load_fn, store_fn):
 
 
 @flyc.jit
-def _write_expert_id_blocks(sorted_e_rsrc, local_eid, blk_start, n_blks):
+def _write_expert_id_blocks(sorted_e_it, local_eid, blk_start, n_blks):
     """Write local_eid to sorted_expert_ids[blk_start .. blk_start+n_blks)."""
-    for _jb in range(fx.Index(0), ArithValue(n_blks).index_cast(T.index), fx.Index(1)):
+    for _jb in range(fx.Int32(0), n_blks, fx.Int32(1)):
         blk_idx = blk_start + fx.Int32(_jb)
-        buffer_ops.buffer_store(local_eid, sorted_e_rsrc, blk_idx)
+        _gst(sorted_e_it, local_eid, blk_idx)
 
 
 @flyc.jit
 def _fill_sentinel_slots(
-    sorted_ids_rsrc, sorted_w_rsrc, start, count, sentinel, block_size, tid, oob_idx
+    sorted_ids_it, sorted_w_it, start, count, sentinel, block_size, tid, oob_idx
 ):
     """Cooperative sentinel fill: threads fill [start, start+count) with sentinels."""
     c_zero = fx.Int32(0)
     end = start + count
     niters = (count + fx.Int32(block_size) - fx.Int32(1)) // fx.Int32(block_size)
-    for _p in range(fx.Index(0), ArithValue(niters).index_cast(T.index), fx.Index(1)):
+    for _p in range(fx.Int32(0), niters, fx.Int32(1)):
         slot = start + fx.Int32(_p) * fx.Int32(block_size) + tid
         safe = (slot < end).select(slot, oob_idx)
-        buffer_ops.buffer_store(sentinel, sorted_ids_rsrc, safe)
-        buffer_ops.buffer_store(c_zero, sorted_w_rsrc, safe)
+        _gst(sorted_ids_it, sentinel, safe)
+        _gst(sorted_w_it, c_zero, safe)
 
 
 # ---------------------------------------------------------------------------
 # LDS helpers for multiphase kernels (module-level, used inside @flyc.kernel)
 # ---------------------------------------------------------------------------
 def _lds_load_raw(raw_ptr, idx):
-    """Load i32 from an LDS pointer at element offset `idx` (i32 or index)."""
+    """Load i32 from an LDS pointer at i32 element offset `idx`."""
     return fx.ptr_load(raw_ptr + fx.Int64(idx))
 
 
 def _lds_store_raw(raw_ptr, val, idx):
-    """Store i32 to an LDS pointer at element offset `idx` (i32 or index)."""
+    """Store i32 to an LDS pointer at i32 element offset `idx`."""
     fx.ptr_store(val, raw_ptr + fx.Int64(idx))
+
+
+# ---------------------------------------------------------------------------
+# Global buffer-tensor helpers. ``it`` is ``fx.get_iter(make_buffer_tensor(t))``:
+# the iterator carries the OOB-checked V# descriptor, so a load/store at the
+# sentinel element index 0x7FFFFFFF is dropped (store) / returns 0 (load),
+# preserving the ``.select(idx, oob_idx)`` masking used throughout this file.
+# Offsets are in ELEMENTS of the buffer's dtype.
+# ---------------------------------------------------------------------------
+def _buf_iter(tensor):
+    """OOB-checked V# iterator over a global tensor."""
+    return fx.get_iter(fx.rocdl.make_buffer_tensor(tensor, max_size=True))
+
+
+def _i8_global_ptr(tensor):
+    """Raw i8 global pointer to `tensor` for byte-addressed stores.
+
+    Used only for the uint8 mesh scatter, which is always issued under an
+    in-bounds guard (`if valid` / `if is_mine`) -- no OOB access occurs, so a
+    plain LLVM store suffices (no V# descriptor needed). i8 element == 1 byte,
+    so a byte offset is the element index directly (no *sizeof scaling).
+    """
+    i8pt = fx.PointerType.get(
+        fx.Int8.ir_type, address_space=fx.AddressSpace.Global, alignment=1
+    )
+    return fx.inttoptr(i8pt, fx.Int64(fx.ptrtoint(fx.get_iter(tensor))))
+
+
+def _gld(it, idx):
+    """Scalar load at i32 element offset `idx` (OOB -> 0)."""
+    return fx.ptr_load(it + fx.Int64(idx))
+
+
+def _gst(it, val, idx):
+    """Scalar store at i32 element offset `idx` (OOB dropped)."""
+    fx.ptr_store(val, it + fx.Int64(idx))
 
 
 _dummy_mask_cache = {}  # device -> torch.Tensor(1, dtype=i32, value=1)
@@ -284,36 +316,22 @@ def _compile_moe_sorting_oneshot(
 
         tokens = i32_tokens
         if has_local_tokens:
-            ltok_rsrc = buffer_ops.create_buffer_resource(
-                local_tokens_tensor, max_size=True
-            )
-            tokens = buffer_ops.buffer_load(
-                ltok_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32
-            )
+            ltok_it = _buf_iter(local_tokens_tensor)
+            tokens = _gld(ltok_it, fx.Int32(0))
         c_zero_i32 = fx.Int32(0)
         c_one_i32 = fx.Int32(1)
         c_oob_idx = fx.Int32(0x7FFFFFFF)
         c4_i32 = fx.Int32(4)
 
-        # Buffer resources (needed by both paths, defined at top level)
-        moe_buf_rsrc = buffer_ops.create_buffer_resource(moe_buf, max_size=True)
-        topk_ids_rsrc = buffer_ops.create_buffer_resource(
-            topk_ids_tensor, max_size=True
-        )
-        weights_rsrc = buffer_ops.create_buffer_resource(
-            topk_weights_tensor, max_size=True
-        )
-        sorted_ids_rsrc = buffer_ops.create_buffer_resource(
-            sorted_token_ids, max_size=True
-        )
-        sorted_w_rsrc = buffer_ops.create_buffer_resource(
-            sorted_weights_out, max_size=True
-        )
-        sorted_e_rsrc = buffer_ops.create_buffer_resource(
-            sorted_expert_ids, max_size=True
-        )
-        nvalid_rsrc = buffer_ops.create_buffer_resource(num_valid_ids, max_size=True)
-        mask_rsrc = buffer_ops.create_buffer_resource(expert_mask_tensor, max_size=True)
+        # Buffer iterators (OOB-checked V# descriptors; needed by both paths).
+        moe_buf_it = _buf_iter(moe_buf)
+        topk_ids_it = _buf_iter(topk_ids_tensor)
+        weights_it = _buf_iter(topk_weights_tensor)
+        sorted_ids_it = _buf_iter(sorted_token_ids)
+        sorted_w_it = _buf_iter(sorted_weights_out)
+        sorted_e_it = _buf_iter(sorted_expert_ids)
+        nvalid_it = _buf_iter(num_valid_ids)
+        mask_it = _buf_iter(expert_mask_tensor)
 
         # LDS: capture field pointers ONCE — dominates all child scf.for/scf.if.
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
@@ -335,7 +353,7 @@ def _compile_moe_sorting_oneshot(
             num_zero_blocks = gpu.grid_dim.x - c_one_i32
             zero_stride_v4 = num_zero_blocks * fx.Int32(ONESHOT_BLOCK)
             _zero_moe_buf_grid_stride(
-                moe_buf_rsrc,
+                moe_buf_it,
                 zero_gid_v4,
                 zero_stride_v4,
                 i32_moe_buf_elems >> fx.Int32(2),
@@ -350,9 +368,8 @@ def _compile_moe_sorting_oneshot(
                 idx = fx.Int32(i_clear) + tid
                 is_valid = idx < fx.Int32(sub_tokens * smem_cols)
                 safe_idx = is_valid.select(idx, c_zero_i32)
-                safe_idx_ix = ArithValue(safe_idx).index_cast(T.index)
                 # Always store; out-of-bounds threads harmlessly write to index 0
-                _lds_store_raw(mesh_mr, c_zero_i32, safe_idx_ix)
+                _lds_store_raw(mesh_mr, c_zero_i32, safe_idx)
             gpu.barrier()
 
             # Fill mesh: for each (token, topk_slot), write topk_slot+1 to mesh[token, expert_id]
@@ -366,9 +383,7 @@ def _compile_moe_sorting_oneshot(
                 topk_slot = safe_flat % c_topk
 
                 global_idx = token_id * c_topk + topk_slot
-                eid = buffer_ops.buffer_load(
-                    topk_ids_rsrc, global_idx, vec_width=1, dtype=T.i32
-                )
+                eid = _gld(topk_ids_it, global_idx)
 
                 # mesh[token_id, eid] = topk_slot + 1 (valid threads only).
                 # Invalid threads must NOT write to mesh[0] — that would race
@@ -376,9 +391,8 @@ def _compile_moe_sorting_oneshot(
                 mesh_addr = token_id * c_smem_cols + eid
                 last_mesh_idx = fx.Int32(sub_tokens * smem_cols - 1)
                 safe_mesh_addr = is_valid.select(mesh_addr, last_mesh_idx)
-                safe_mesh_ix = ArithValue(safe_mesh_addr).index_cast(T.index)
                 val = is_valid.select(topk_slot + c_one_i32, c_zero_i32)
-                _lds_store_raw(mesh_mr, val, safe_mesh_ix)
+                _lds_store_raw(mesh_mr, val, safe_mesh_addr)
             gpu.barrier()
 
             # ===================== PHASE 2: Count + Prefix Sum =====================
@@ -407,8 +421,7 @@ def _compile_moe_sorting_oneshot(
                     safe_sub = combined_valid.select(sub_idx, c_zero_i32)
                     safe_eid = combined_valid.select(eid_local, c_zero_i32)
                     mesh_rd_addr = safe_sub * c_smem_cols + safe_eid
-                    mesh_rd_ix = ArithValue(mesh_rd_addr).index_cast(T.index)
-                    mesh_val = _lds_load_raw(mesh_mr, mesh_rd_ix)
+                    mesh_val = _lds_load_raw(mesh_mr, mesh_rd_addr)
 
                     has_token = combined_valid.select(
                         (mesh_val != c_zero_i32).select(c_one_i32, c_zero_i32),
@@ -428,9 +441,8 @@ def _compile_moe_sorting_oneshot(
                 # cumsum[0] which is harmless (cumsum[0] is always 0).
                 write_valid = eid_valid & (lane_group_os == c_zero_i32)
                 cs_idx = write_valid.select(eid_local + c_one_i32, c_zero_i32)
-                cs_ix = ArithValue(cs_idx).index_cast(T.index)
                 cs_val = write_valid.select(cnt, c_zero_i32)
-                _lds_store_raw(cumsum_mr, cs_val, cs_ix)
+                _lds_store_raw(cumsum_mr, cs_val, cs_idx)
             gpu.barrier()
 
             # Phase 2b: Prefix sum over expert counts.
@@ -440,15 +452,14 @@ def _compile_moe_sorting_oneshot(
                 cvt_valid = cvt_eid < c_E
                 # Safe index: valid → cumsum[eid+1], invalid → cumsum[0] (write 0, harmless)
                 safe_cvt_idx = cvt_valid.select(cvt_eid + c_one_i32, c_zero_i32)
-                cvt_ix = ArithValue(safe_cvt_idx).index_cast(T.index)
-                raw_cnt_cvt = _lds_load_raw(cumsum_mr, cvt_ix)
+                raw_cnt_cvt = _lds_load_raw(cumsum_mr, safe_cvt_idx)
                 blocks_cvt = (raw_cnt_cvt + c_unit - c_one_i32) // c_unit
                 padded_cvt = (raw_cnt_cvt == c_zero_i32).select(
                     c_zero_i32, blocks_cvt * c_unit
                 )
                 # Valid threads write padded value; invalid threads write 0 to cumsum[0]
                 _lds_store_raw(
-                    cumsum_mr, cvt_valid.select(padded_cvt, c_zero_i32), cvt_ix
+                    cumsum_mr, cvt_valid.select(padded_cvt, c_zero_i32), safe_cvt_idx
                 )
             gpu.barrier()
 
@@ -460,19 +471,15 @@ def _compile_moe_sorting_oneshot(
                     ep_eid = fx.Int32(i_ep) + tid
                     ep_valid = ep_eid < c_E
                     ep_safe_eid = ep_valid.select(ep_eid, c_zero_i32)
-                    ep_m = buffer_ops.buffer_load(
-                        mask_rsrc, ep_safe_eid, vec_width=1, dtype=T.i32
-                    )
+                    ep_m = _gld(mask_it, ep_safe_eid)
                     should_zero = ep_valid & (ep_m == c_zero_i32)
-                    ep_cs_ix = ArithValue(
-                        ep_valid.select(ep_eid + c_one_i32, c_zero_i32)
-                    ).index_cast(T.index)
+                    ep_cs_idx = ep_valid.select(ep_eid + c_one_i32, c_zero_i32)
                     _lds_store_raw(
                         cumsum_mr,
                         should_zero.select(
-                            c_zero_i32, _lds_load_raw(cumsum_mr, ep_cs_ix)
+                            c_zero_i32, _lds_load_raw(cumsum_mr, ep_cs_idx)
                         ),
-                        ep_cs_ix,
+                        ep_cs_idx,
                     )
                 gpu.barrier()
 
@@ -481,13 +488,11 @@ def _compile_moe_sorting_oneshot(
             for _ps_chunk in range_constexpr(0, E, ONESHOT_BLOCK):
                 ps_eid = fx.Int32(_ps_chunk) + tid
                 ps_valid = ps_eid < c_E
-                ps_safe_ix = ArithValue(
-                    ps_valid.select(ps_eid + c_one_i32, c_zero_i32)
-                ).index_cast(T.index)
+                ps_safe_idx = ps_valid.select(ps_eid + c_one_i32, c_zero_i32)
                 ps_val = ps_valid.select(
-                    _lds_load_raw(cumsum_mr, ps_safe_ix), c_zero_i32
+                    _lds_load_raw(cumsum_mr, ps_safe_idx), c_zero_i32
                 )
-                _lds_store_raw(cumdup_mr, ps_val, ps_safe_ix)
+                _lds_store_raw(cumdup_mr, ps_val, ps_safe_idx)
             _lds_store_raw(cumdup_mr, c_zero_i32, c_zero_i32)
             gpu.barrier()
 
@@ -502,9 +507,7 @@ def _compile_moe_sorting_oneshot(
             _lds_store_raw(
                 cumdup_mr,
                 ps_tid_valid.select(inclusive_ps, c_zero_i32),
-                ArithValue(ps_tid_valid.select(tid + c_one_i32, c_zero_i32)).index_cast(
-                    T.index
-                ),
+                ps_tid_valid.select(tid + c_one_i32, c_zero_i32),
             )
             gpu.barrier()
 
@@ -521,10 +524,9 @@ def _compile_moe_sorting_oneshot(
             gpu.barrier()
 
             # Write num_valid_ids from cumdup[E]
-            cs_E_ix_ps = ArithValue(c_E).index_cast(T.index)
-            total_padded = _lds_load_raw(cumdup_mr, cs_E_ix_ps)
-            buffer_ops.buffer_store(total_padded, nvalid_rsrc, c_zero_i32)
-            buffer_ops.buffer_store(tokens, nvalid_rsrc, c_one_i32)
+            total_padded = _lds_load_raw(cumdup_mr, c_E)
+            _gst(nvalid_it, total_padded, c_zero_i32)
+            _gst(nvalid_it, tokens, c_one_i32)
             gpu.barrier()
 
             # Copy cumdup → cumsum (all threads, one expert per thread)
@@ -532,9 +534,8 @@ def _compile_moe_sorting_oneshot(
                 cp_idx = fx.Int32(i_cp) + tid
                 cp_valid = cp_idx <= c_E
                 safe_cp_idx = cp_valid.select(cp_idx, c_zero_i32)
-                cp_ix = ArithValue(safe_cp_idx).index_cast(T.index)
-                cp_val = _lds_load_raw(cumdup_mr, cp_ix)
-                _lds_store_raw(cumsum_mr, cp_val, cp_ix)
+                cp_val = _lds_load_raw(cumdup_mr, safe_cp_idx)
+                _lds_store_raw(cumsum_mr, cp_val, safe_cp_idx)
             gpu.barrier()
 
             if has_mask:
@@ -544,14 +545,10 @@ def _compile_moe_sorting_oneshot(
                     ml_eid = fx.Int32(i_ml) + tid
                     ml_valid = ml_eid < c_E
                     safe_ml_eid = ml_valid.select(ml_eid, c_zero_i32)
-                    ml_mask = buffer_ops.buffer_load(
-                        mask_rsrc, safe_ml_eid, vec_width=1, dtype=T.i32
-                    )
+                    ml_mask = _gld(mask_it, safe_ml_eid)
                     ml_val = ml_valid.select(ml_mask, c_zero_i32)
-                    ml_ix = ArithValue(
-                        ml_valid.select(ml_eid + c_one_i32, c_zero_i32)
-                    ).index_cast(T.index)
-                    _lds_store_raw(cumdup_mr, ml_val, ml_ix)
+                    ml_idx = ml_valid.select(ml_eid + c_one_i32, c_zero_i32)
+                    _lds_store_raw(cumdup_mr, ml_val, ml_idx)
                 _lds_store_raw(cumdup_mr, c_zero_i32, c_zero_i32)
                 gpu.barrier()
 
@@ -566,9 +563,7 @@ def _compile_moe_sorting_oneshot(
                 _lds_store_raw(
                     cumdup_mr,
                     m_tid_valid.select(inclusive_m, c_zero_i32),
-                    ArithValue(
-                        m_tid_valid.select(tid + c_one_i32, c_zero_i32)
-                    ).index_cast(T.index),
+                    m_tid_valid.select(tid + c_one_i32, c_zero_i32),
                 )
                 gpu.barrier()
 
@@ -587,9 +582,8 @@ def _compile_moe_sorting_oneshot(
                     ml_eid = fx.Int32(i_ml) + tid
                     ml_valid = ml_eid < c_E
                     safe_ml_eid = ml_valid.select(ml_eid, c_zero_i32)
-                    ml_ix = ArithValue(safe_ml_eid).index_cast(T.index)
                     _lds_store_raw(
-                        cumdup_mr, ml_valid.select(safe_ml_eid, c_zero_i32), ml_ix
+                        cumdup_mr, ml_valid.select(safe_ml_eid, c_zero_i32), safe_ml_eid
                     )
                 gpu.barrier()
 
@@ -600,38 +594,33 @@ def _compile_moe_sorting_oneshot(
                 eid_wr_valid = eid_wr < c_E
                 safe_eid_wr = eid_wr_valid.select(eid_wr, c_zero_i32)
 
-                cs_start_ix = ArithValue(safe_eid_wr).index_cast(T.index)
-                cs_end_ix = ArithValue(safe_eid_wr + c_one_i32).index_cast(T.index)
-                e_start = _lds_load_raw(cumsum_mr, cs_start_ix)
+                e_start = _lds_load_raw(cumsum_mr, safe_eid_wr)
                 e_end = eid_wr_valid.select(
-                    _lds_load_raw(cumsum_mr, cs_end_ix), e_start
+                    _lds_load_raw(cumsum_mr, safe_eid_wr + c_one_i32), e_start
                 )
-                local_eid = _lds_load_raw(cumdup_mr, cs_start_ix)
+                local_eid = _lds_load_raw(cumdup_mr, safe_eid_wr)
 
                 # Store cumdup: reuse cumdup for scatter phase position tracking.
                 # Write e_start to cumdup[eid] (overwriting mask cumsum, no longer needed).
-                _lds_store_raw(cumdup_mr, e_start, cs_start_ix)
+                _lds_store_raw(cumdup_mr, e_start, safe_eid_wr)
 
                 blk_start = e_start // c_unit
                 blk_end = e_end // c_unit
                 n_blks_wr = eid_wr_valid.select(blk_end - blk_start, c_zero_i32)
-                _write_expert_id_blocks(sorted_e_rsrc, local_eid, blk_start, n_blks_wr)
+                _write_expert_id_blocks(sorted_e_it, local_eid, blk_start, n_blks_wr)
             gpu.barrier()
 
             # Store cumdup[E] = cumsum[E].
             # All threads write cumE to cumdup[E] (all write the same value, no race).
-            cs_E_ix = ArithValue(c_E).index_cast(T.index)
-            cumE = _lds_load_raw(cumsum_mr, cs_E_ix)
-            _lds_store_raw(cumdup_mr, cumE, cs_E_ix)
+            cumE = _lds_load_raw(cumsum_mr, c_E)
+            _lds_store_raw(cumdup_mr, cumE, c_E)
             gpu.barrier()
 
             # ====================== PRE-FILL: Sentinel fill (cooperative) ===========
-            total_padded_pre = _lds_load_raw(
-                cumdup_mr, ArithValue(c_E).index_cast(T.index)
-            )
+            total_padded_pre = _lds_load_raw(cumdup_mr, c_E)
             _fill_sentinel_slots(
-                sorted_ids_rsrc,
-                sorted_w_rsrc,
+                sorted_ids_it,
+                sorted_w_it,
                 c_zero_i32,
                 total_padded_pre,
                 c_sentinel | i32_tokens,
@@ -652,16 +641,10 @@ def _compile_moe_sorting_oneshot(
                 sc_expert_enabled = eid_sc_valid
                 if has_mask:
                     # EP: check if this expert is masked (skip scatter for masked experts)
-                    sc_mask_val = buffer_ops.buffer_load(
-                        mask_rsrc,
-                        eid_sc_valid.select(eid_sc, c_zero_i32),
-                        vec_width=1,
-                        dtype=T.i32,
-                    )
+                    sc_mask_val = _gld(mask_it, eid_sc_valid.select(eid_sc, c_zero_i32))
                     sc_expert_enabled = eid_sc_valid & (sc_mask_val != c_zero_i32)
 
-                cs_sc_ix = ArithValue(safe_eid_sc).index_cast(T.index)
-                position = _lds_load_raw(cumsum_mr, cs_sc_ix)
+                position = _lds_load_raw(cumsum_mr, safe_eid_sc)
 
                 for i_sub2 in range_constexpr(0, sub_tokens, 8):
                     # This lane handles sub_token (i_sub2 + lane_group_os).
@@ -669,8 +652,7 @@ def _compile_moe_sorting_oneshot(
                     my_sub_valid = sc_expert_enabled & (my_sub < c_sub_tokens)
                     safe_my_sub = my_sub_valid.select(my_sub, c_zero_i32)
                     my_mesh_addr = safe_my_sub * c_smem_cols + safe_eid_sc
-                    my_mesh_ix = ArithValue(my_mesh_addr).index_cast(T.index)
-                    my_x = _lds_load_raw(mesh_mr, my_mesh_ix)
+                    my_x = _lds_load_raw(mesh_mr, my_mesh_addr)
                     my_has_token = my_sub_valid & (my_x != c_zero_i32)
                     local_cnt = my_has_token.select(c_one_i32, c_zero_i32)
 
@@ -738,22 +720,20 @@ def _compile_moe_sorting_oneshot(
                     topk_slot_sc = safe_x - c_one_i32
                     packed_id = (topk_slot_sc << fx.Int32(24)) | my_sub
                     safe_slot = my_has_token.select(slot, c_oob_idx)
-                    buffer_ops.buffer_store(packed_id, sorted_ids_rsrc, safe_slot)
+                    _gst(sorted_ids_it, packed_id, safe_slot)
 
                     w_addr = my_has_token.select(
                         my_sub * c_topk + topk_slot_sc, c_zero_i32
                     )
-                    w_val_i32 = buffer_ops.buffer_load(
-                        weights_rsrc, w_addr, vec_width=1, dtype=T.i32
-                    )
-                    buffer_ops.buffer_store(w_val_i32, sorted_w_rsrc, safe_slot)
+                    w_val_i32 = _gld(weights_it, w_addr)
+                    _gst(sorted_w_it, w_val_i32, safe_slot)
 
                     # Advance position by batch total
                     position = position + batch_total
 
                 # Write back updated position (for padding phase).
                 # Invalid lane groups write position (=0+0=0) to cumsum[0] which is harmless.
-                _lds_store_raw(cumsum_mr, position, cs_sc_ix)
+                _lds_store_raw(cumsum_mr, position, safe_eid_sc)
             gpu.barrier()
 
             # Padding already filled by PRE-FILL phase above (before scatter).
@@ -848,20 +828,14 @@ def _compile_moe_sorting_multiphase(
     E = num_experts
 
     @flyc.jit
-    def _extend_local_idx_for_extra_experts(
-        cumsum_mr, mask_rsrc, K4_BLOCK, E, has_mask
-    ):
+    def _extend_local_idx_for_extra_experts(cumsum_mr, mask_it, K4_BLOCK, E, has_mask):
         """Thread-0: write local expert indices for experts >= K4_BLOCK to cumsum_mr."""
         if has_mask:
             prev_local = _lds_load_raw(cumsum_mr, fx.Int32(K4_BLOCK - 1))
-            prev_mask = buffer_ops.buffer_load(
-                mask_rsrc, fx.Int32(K4_BLOCK - 1), vec_width=1, dtype=T.i32
-            )
+            prev_mask = _gld(mask_it, fx.Int32(K4_BLOCK - 1))
             prev_local = prev_local + prev_mask
             for _e3 in range_constexpr(K4_BLOCK, E):
-                e3_mask = buffer_ops.buffer_load(
-                    mask_rsrc, fx.Int32(_e3), vec_width=1, dtype=T.i32
-                )
+                e3_mask = _gld(mask_it, fx.Int32(_e3))
                 _lds_store_raw(cumsum_mr, prev_local, fx.Int32(_e3))
                 prev_local = prev_local + e3_mask
         else:
@@ -872,11 +846,11 @@ def _compile_moe_sorting_multiphase(
     def _p23_scatter_mesh(
         tid,
         scatter_mr,
-        ws_rsrc,
-        weights_rsrc,
-        sorted_ids_rsrc,
-        sorted_w_rsrc,
-        mask_rsrc,
+        ws_it,
+        weights_it,
+        sorted_ids_it,
+        sorted_w_it,
+        mask_it,
         my_expert,
         my_start,
         my_end,
@@ -894,9 +868,7 @@ def _compile_moe_sorting_multiphase(
         c_ff, c_oob_idx = fx.Int32(0xFF), fx.Int32(0x7FFFFFFF)
         p23_bid_enabled = c_one != c_zero
         if has_mask:
-            p23_bid_mask = buffer_ops.buffer_load(
-                mask_rsrc, my_expert, vec_width=1, dtype=T.i32
-            )
+            p23_bid_mask = _gld(mask_it, my_expert)
             p23_bid_enabled = p23_bid_mask != c_zero
         i32_words_per_row = i32_scan_words_per_row
         n_mesh_iters = (my_start != my_end).select(
@@ -904,18 +876,16 @@ def _compile_moe_sorting_multiphase(
         )
         mesh_row_i32_base = (my_expert * i32_mesh_stride) >> fx.Int32(2)
         for _si, state in range(
-            fx.Index(0),
-            ArithValue(n_mesh_iters).index_cast(T.index),
-            fx.Index(1),
+            fx.Int32(0),
+            n_mesh_iters,
+            fx.Int32(1),
             init=[my_start],
         ):
             position = state[0]
             word_idx = fx.Int32(_si) * fx.Int32(K4_BLOCK) + tid
             col_valid = p23_bid_enabled & (word_idx < i32_words_per_row)
             safe_word_idx = col_valid.select(word_idx, c_zero)
-            word = buffer_ops.buffer_load(
-                ws_rsrc, mesh_row_i32_base + safe_word_idx, vec_width=1, dtype=T.i32
-            )
+            word = _gld(ws_it, mesh_row_i32_base + safe_word_idx)
             x0 = word & c_ff
             x1 = (word >> fx.Int32(8)) & c_ff
             x2 = (word >> fx.Int32(16)) & c_ff
@@ -957,46 +927,38 @@ def _compile_moe_sorting_multiphase(
             safe_slot_2 = h2.select(off2, c_oob_idx)
             off3 = off2 + h2.select(c_one, c_zero)
             safe_slot_3 = h3.select(off3, c_oob_idx)
-            w_val_0 = buffer_ops.buffer_load(
-                weights_rsrc,
+            w_val_0 = _gld(
+                weights_it,
                 h0.select(base_col * c_topk + h0.select(x0 - c_one, c_zero), c_zero),
-                vec_width=1,
-                dtype=T.i32,
             )
-            w_val_1 = buffer_ops.buffer_load(
-                weights_rsrc,
+            w_val_1 = _gld(
+                weights_it,
                 h1.select(
                     (base_col + c_one) * c_topk + h1.select(x1 - c_one, c_zero), c_zero
                 ),
-                vec_width=1,
-                dtype=T.i32,
             )
-            w_val_2 = buffer_ops.buffer_load(
-                weights_rsrc,
+            w_val_2 = _gld(
+                weights_it,
                 h2.select(
                     (base_col + fx.Int32(2)) * c_topk + h2.select(x2 - c_one, c_zero),
                     c_zero,
                 ),
-                vec_width=1,
-                dtype=T.i32,
             )
-            w_val_3 = buffer_ops.buffer_load(
-                weights_rsrc,
+            w_val_3 = _gld(
+                weights_it,
                 h3.select(
                     (base_col + fx.Int32(3)) * c_topk + h3.select(x3 - c_one, c_zero),
                     c_zero,
                 ),
-                vec_width=1,
-                dtype=T.i32,
             )
-            buffer_ops.buffer_store(pid_0, sorted_ids_rsrc, safe_slot_0)
-            buffer_ops.buffer_store(pid_1, sorted_ids_rsrc, safe_slot_1)
-            buffer_ops.buffer_store(pid_2, sorted_ids_rsrc, safe_slot_2)
-            buffer_ops.buffer_store(pid_3, sorted_ids_rsrc, safe_slot_3)
-            buffer_ops.buffer_store(w_val_0, sorted_w_rsrc, safe_slot_0)
-            buffer_ops.buffer_store(w_val_1, sorted_w_rsrc, safe_slot_1)
-            buffer_ops.buffer_store(w_val_2, sorted_w_rsrc, safe_slot_2)
-            buffer_ops.buffer_store(w_val_3, sorted_w_rsrc, safe_slot_3)
+            _gst(sorted_ids_it, pid_0, safe_slot_0)
+            _gst(sorted_ids_it, pid_1, safe_slot_1)
+            _gst(sorted_ids_it, pid_2, safe_slot_2)
+            _gst(sorted_ids_it, pid_3, safe_slot_3)
+            _gst(sorted_w_it, w_val_0, safe_slot_0)
+            _gst(sorted_w_it, w_val_1, safe_slot_1)
+            _gst(sorted_w_it, w_val_2, safe_slot_2)
+            _gst(sorted_w_it, w_val_3, safe_slot_3)
             pos_next = position + batch_total
             results = yield [pos_next]
         return results
@@ -1012,12 +974,12 @@ def _compile_moe_sorting_multiphase(
         i32_total_elems: fx.Int32,
     ):
         gid = gpu.block_idx.x * fx.Int32(K1_BLOCK) + gpu.thread_idx.x
-        ws_rsrc = buffer_ops.create_buffer_resource(workspace, max_size=True)
+        ws_it = _buf_iter(workspace)
         c_zero = fx.Int32(0)
 
         # Each thread stores exactly one element (no loop needed).
         valid = gid < i32_total_elems
-        buffer_ops.buffer_store(c_zero, ws_rsrc, valid.select(gid, c_zero))
+        _gst(ws_it, c_zero, valid.select(gid, c_zero))
 
     @flyc.jit
     def launch_clear_ws(
@@ -1047,38 +1009,31 @@ def _compile_moe_sorting_multiphase(
     ):
         gid = gpu.block_idx.x * fx.Int32(K2_BLOCK) + gpu.thread_idx.x
         stride = gpu.grid_dim.x * fx.Int32(K2_BLOCK)
-        topk_rsrc = buffer_ops.create_buffer_resource(topk_ids, max_size=True)
-        ws_rsrc = buffer_ops.create_buffer_resource(workspace, max_size=True)
+        topk_it = _buf_iter(topk_ids)
+        # uint8 byte-addressed mesh scatter into the i32 workspace, always under
+        # an in-bounds `if valid` guard -> a plain i8 global-pointer store.
+        ws_i8 = _i8_global_ptr(workspace)
         c_zero = fx.Int32(0)
         c_topk = fx.Int32(topk)
         c_one = fx.Int32(1)
 
         tokens_ = i32_tokens
         if has_local_tokens:
-            ltok_rsrc = buffer_ops.create_buffer_resource(
-                local_tokens_tensor, max_size=True
-            )
-            tokens_ = buffer_ops.buffer_load(
-                ltok_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32
-            )
+            ltok_it = _buf_iter(local_tokens_tensor)
+            tokens_ = _gld(ltok_it, fx.Int32(0))
         total = tokens_ * c_topk
 
-        _s = fx.Index(0)
-        _e = ArithValue(i32_niters).index_cast(T.index)
-        _one = fx.Index(1)
-        for _i in range(_s, _e, _one):
+        for _i in range(fx.Int32(0), i32_niters, fx.Int32(1)):
             flat = gid + fx.Int32(_i) * stride
             valid = flat < total
             safe_flat = valid.select(flat, c_zero)
             token_id = safe_flat // c_topk
             topk_slot = safe_flat % c_topk
-            eid = buffer_ops.buffer_load(topk_rsrc, safe_flat, vec_width=1, dtype=T.i32)
+            eid = _gld(topk_it, safe_flat)
             byte_offset = eid * i32_mesh_stride + token_id
-            val_i8 = ArithValue(topk_slot + c_one).trunci(T.i8)
+            val_i8 = fx.Int32(topk_slot + c_one).to(fx.Int8)
             if valid:
-                buffer_ops.buffer_store(
-                    val_i8, ws_rsrc, byte_offset, offset_is_bytes=True
-                )
+                ws_i8[byte_offset] = val_i8
 
     @flyc.jit
     def launch_p0(
@@ -1131,7 +1086,7 @@ def _compile_moe_sorting_multiphase(
         lane = tid % WARP_SIZE
         wave = tid // WARP_SIZE
 
-        ws_rsrc = buffer_ops.create_buffer_resource(workspace, max_size=True)
+        ws_it = _buf_iter(workspace)
         c_zero = fx.Int32(0)
         c_one = fx.Int32(1)
         c_ff = fx.Int32(0xFF)
@@ -1141,12 +1096,8 @@ def _compile_moe_sorting_multiphase(
         # Data-dependent scan
         tokens_ = i32_tokens
         if has_local_tokens:
-            ltok_rsrc = buffer_ops.create_buffer_resource(
-                local_tokens_tensor, max_size=True
-            )
-            tokens_ = buffer_ops.buffer_load(
-                ltok_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32
-            )
+            ltok_it = _buf_iter(local_tokens_tensor)
+            tokens_ = _gld(ltok_it, fx.Int32(0))
 
         mesh_row_i32_base = (eid * i32_mesh_stride) >> fx.Int32(2)
         i32_scan_words_per_row = (tokens_ + fx.Int32(3)) >> fx.Int32(2)
@@ -1155,23 +1106,21 @@ def _compile_moe_sorting_multiphase(
         ) >> fx.Int32(K3_WORDS_PER_ITER_LOG2)
 
         if has_mask:
-            mask_rsrc = buffer_ops.create_buffer_resource(
-                expert_mask_tensor, max_size=True
-            )
-            p1_mask = buffer_ops.buffer_load(mask_rsrc, eid, vec_width=1, dtype=T.i32)
+            mask_it = _buf_iter(expert_mask_tensor)
+            p1_mask = _gld(mask_it, eid)
             p1_is_local = p1_mask != c_zero
             p1_should_zero = (~p1_is_local) & (tid == c_zero)
-            buffer_ops.buffer_store(
+            _gst(
+                ws_it,
                 c_zero,
-                ws_rsrc,
                 p1_should_zero.select(i32_mesh_size + eid, fx.Int32(0x7FFFFFFF)),
             )
             n_iters = p1_is_local.select(n_iters, c_zero)
 
         for _i, state in range(
-            fx.Index(0),
-            ArithValue(n_iters).index_cast(T.index),
-            fx.Index(1),
+            fx.Int32(0),
+            n_iters,
+            fx.Int32(1),
             init=[c_zero],
         ):
             cnt_so_far = state[0]
@@ -1181,7 +1130,7 @@ def _compile_moe_sorting_multiphase(
             )
             valid = word_base < i32_scan_words_per_row
             safe_addr = mesh_row_i32_base + valid.select(word_base, c_zero)
-            vec4 = buffer_ops.buffer_load(ws_rsrc, safe_addr, vec_width=4, dtype=T.i32)
+            vec4 = fx.ptr_load(ws_it + fx.Int64(safe_addr), result_type=T.i32x4)
 
             iter_cnt = c_zero
             for _wi in range_constexpr(K3_VEC_WIDTH):
@@ -1213,8 +1162,7 @@ def _compile_moe_sorting_multiphase(
         # Cross-warp reduce via LDS: lane 0 of each warp writes partial sum
         is_lane0 = lane == c_zero
         if is_lane0:
-            wave_ix = ArithValue(wave).index_cast(T.index)
-            _lds_store_raw(reduce_mr, cnt, wave_ix)
+            _lds_store_raw(reduce_mr, cnt, wave)
         gpu.barrier()
 
         # Thread 0 sums all warp partials and writes to HBM
@@ -1226,7 +1174,7 @@ def _compile_moe_sorting_multiphase(
         cs_offset = i32_mesh_size + eid
         c_oob_idx = fx.Int32(0x7FFFFFFF)
         safe_cs = is_t0.select(cs_offset, c_oob_idx)
-        buffer_ops.buffer_store(total, ws_rsrc, safe_cs)
+        _gst(ws_it, total, safe_cs)
 
     @flyc.jit
     def launch_p1(
@@ -1282,9 +1230,12 @@ def _compile_moe_sorting_multiphase(
         lane = tid % WARP_SIZE
         wave = tid // WARP_SIZE
 
-        ws_rsrc = buffer_ops.create_buffer_resource(workspace, max_size=True)
-        mask_rsrc = buffer_ops.create_buffer_resource(expert_mask_tensor, max_size=True)
-        topk_rsrc = buffer_ops.create_buffer_resource(topk_ids, max_size=True)
+        ws_it = _buf_iter(workspace)
+        # uint8 byte-addressed scatter into the i32 workspace, always under an
+        # in-bounds `if is_mine` guard (see Phase 2) -> a plain i8 pointer store.
+        ws_i8 = _i8_global_ptr(workspace)
+        mask_it = _buf_iter(expert_mask_tensor)
+        topk_it = _buf_iter(topk_ids)
         c_zero = fx.Int32(0)
         c_oob = fx.Int32(0x7FFFFFFF)
         c_one = fx.Int32(1)
@@ -1300,12 +1251,8 @@ def _compile_moe_sorting_multiphase(
 
         tokens_ = i32_tokens
         if has_local_tokens:
-            ltok_rsrc = buffer_ops.create_buffer_resource(
-                local_tokens_tensor, max_size=True
-            )
-            tokens_ = buffer_ops.buffer_load(
-                ltok_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32
-            )
+            ltok_it = _buf_iter(local_tokens_tensor)
+            tokens_ = _gld(ltok_it, fx.Int32(0))
 
         # Phase 3 (count) only needs to scan words that can hold real mesh
         # bytes -- the first tokens_ columns (dynamic per-call count), never
@@ -1324,31 +1271,25 @@ def _compile_moe_sorting_multiphase(
         is_local_expert = c_one != c_zero
         # EP: load mask, write cumsum=0 for masked experts, set loop bounds to 0
         if has_mask:
-            m_val = buffer_ops.buffer_load(mask_rsrc, eid, vec_width=1, dtype=T.i32)
+            m_val = _gld(mask_it, eid)
             is_local_expert = m_val != c_zero
             should_write_zero = (~is_local_expert) & (tid == c_zero)
-            buffer_ops.buffer_store(
-                c_zero, ws_rsrc, should_write_zero.select(i32_mesh_size + eid, c_oob)
-            )
+            _gst(ws_it, c_zero, should_write_zero.select(i32_mesh_size + eid, c_oob))
             clear_niters = is_local_expert.select(clear_niters, c_zero)
             scatter_niters = is_local_expert.select(scatter_niters, c_zero)
             count_niters = is_local_expert.select(count_niters, c_zero)
 
         # ---- Phase 1: Clear this expert's mesh row ----
-        for _ci in range(
-            fx.Index(0), ArithValue(clear_niters).index_cast(T.index), fx.Index(1)
-        ):
+        for _ci in range(fx.Int32(0), clear_niters, fx.Int32(1)):
             word_idx = fx.Int32(_ci) * c_block + tid
             valid = word_idx < i32_words_per_row
             safe_idx = mesh_row_i32_base + valid.select(word_idx, c_zero)
-            buffer_ops.buffer_store(c_zero, ws_rsrc, valid.select(safe_idx, c_oob))
+            _gst(ws_it, c_zero, valid.select(safe_idx, c_oob))
 
         gpu.barrier()
 
         # ---- Phase 2: Scatter (scan all T*topk, filter by expert) ----
-        for _si in range(
-            fx.Index(0), ArithValue(scatter_niters).index_cast(T.index), fx.Index(1)
-        ):
+        for _si in range(fx.Int32(0), scatter_niters, fx.Int32(1)):
             flat = fx.Int32(_si) * c_block + tid
             valid = flat < total_assignments
             safe_flat = valid.select(flat, c_zero)
@@ -1364,27 +1305,23 @@ def _compile_moe_sorting_multiphase(
                 else safe_flat % c_topk
             )
 
-            expert_id = buffer_ops.buffer_load(
-                topk_rsrc, safe_flat, vec_width=1, dtype=T.i32
-            )
+            expert_id = _gld(topk_it, safe_flat)
 
             is_mine = valid & (expert_id == eid)
             byte_offset = eid * i32_mesh_stride + token_id
-            val_i8 = ArithValue(is_mine.select(topk_slot + c_one, c_zero)).trunci(T.i8)
-            # Byte-mode buffer_store with OOB offset crashes on AMD GPUs.
-            # Use conditional branch to skip the store for non-matching threads.
+            val_i8 = fx.Int32(is_mine.select(topk_slot + c_one, c_zero)).to(fx.Int8)
+            # Guarded byte store: skip non-matching threads so no OOB byte offset
+            # is ever formed (a raw byte store would fault, not drop, at OOB).
             if is_mine:
-                buffer_ops.buffer_store(
-                    val_i8, ws_rsrc, byte_offset, offset_is_bytes=True
-                )
+                ws_i8[byte_offset] = val_i8
 
         gpu.barrier()
 
         # ---- Phase 3: Count non-zero bytes + warp/cross-wave reduce ----
         for _ki, state in range(
-            fx.Index(0),
-            ArithValue(count_niters).index_cast(T.index),
-            fx.Index(1),
+            fx.Int32(0),
+            count_niters,
+            fx.Int32(1),
             init=[c_zero],
         ):
             cnt_so_far = state[0]
@@ -1392,7 +1329,7 @@ def _compile_moe_sorting_multiphase(
             word_base = fx.Int32(_ki) * c_block + tid
             valid = word_base < i32_scan_words_per_row
             safe_addr = mesh_row_i32_base + valid.select(word_base, c_zero)
-            word = buffer_ops.buffer_load(ws_rsrc, safe_addr, vec_width=1, dtype=T.i32)
+            word = _gld(ws_it, safe_addr)
 
             b0 = word & c_ff
             b1 = (word >> fx.Int32(8)) & c_ff
@@ -1418,8 +1355,7 @@ def _compile_moe_sorting_multiphase(
         # Cross-warp reduce via LDS: lane 0 of each warp writes partial sum
         is_lane0 = lane == c_zero
         if is_lane0:
-            wave_ix = ArithValue(wave).index_cast(T.index)
-            _lds_store_raw(reduce_mr, cnt, wave_ix)
+            _lds_store_raw(reduce_mr, cnt, wave)
         gpu.barrier()
 
         # Thread 0 sums all warp partials and writes to HBM
@@ -1431,7 +1367,7 @@ def _compile_moe_sorting_multiphase(
         cs_offset = i32_mesh_size + eid
         c_oob_idx = fx.Int32(0x7FFFFFFF)
         safe_cs = is_t0.select(cs_offset, c_oob_idx)
-        buffer_ops.buffer_store(total, ws_rsrc, safe_cs)
+        _gst(ws_it, total, safe_cs)
 
     @flyc.jit
     def launch_p0v2(
@@ -1500,18 +1436,12 @@ def _compile_moe_sorting_multiphase(
         c_sentinel = fx.Int32(topk << 24)
         c_oob_idx = fx.Int32(0x7FFFFFFF)
 
-        # Buffer resources
-        ws_rsrc = buffer_ops.create_buffer_resource(workspace, max_size=True)
-        weights_rsrc = buffer_ops.create_buffer_resource(
-            topk_weights_tensor, max_size=True
-        )
-        sorted_ids_rsrc = buffer_ops.create_buffer_resource(
-            sorted_token_ids, max_size=True
-        )
-        sorted_w_rsrc = buffer_ops.create_buffer_resource(
-            sorted_weights_out, max_size=True
-        )
-        mask_rsrc = buffer_ops.create_buffer_resource(expert_mask_tensor, max_size=True)
+        # Buffer iterators (OOB-checked V# descriptors).
+        ws_it = _buf_iter(workspace)
+        weights_it = _buf_iter(topk_weights_tensor)
+        sorted_ids_it = _buf_iter(sorted_token_ids)
+        sorted_w_it = _buf_iter(sorted_weights_out)
+        mask_it = _buf_iter(expert_mask_tensor)
 
         # LDS: cumsum[E+1] for prefix sums + cross-wave scratch
         lds = fx.SharedAllocator().allocate(K4SharedStorage).peek()
@@ -1523,11 +1453,11 @@ def _compile_moe_sorting_multiphase(
 
         # ================ MOE_BUF ZEROING (blocks >= E) ==================
         if is_zero_block:
-            moe_buf_rsrc = buffer_ops.create_buffer_resource(moe_buf, max_size=True)
+            moe_buf_it = _buf_iter(moe_buf)
             zero_gid_v4 = (bid - c_E) * fx.Int32(K4_BLOCK) + tid
             zero_stride_v4 = (gpu.grid_dim.x - c_E) * fx.Int32(K4_BLOCK)
             _zero_moe_buf_grid_stride(
-                moe_buf_rsrc,
+                moe_buf_it,
                 zero_gid_v4,
                 zero_stride_v4,
                 i32_moe_buf_elems >> fx.Int32(2),
@@ -1541,12 +1471,8 @@ def _compile_moe_sorting_multiphase(
 
             tokens_ = i32_tokens
             if has_local_tokens:
-                ltok_rsrc = buffer_ops.create_buffer_resource(
-                    local_tokens_tensor, max_size=True
-                )
-                tokens_ = buffer_ops.buffer_load(
-                    ltok_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32
-                )
+                ltok_it = _buf_iter(local_tokens_tensor)
+                tokens_ = _gld(ltok_it, fx.Int32(0))
 
             # Step 1: Load expert counts from workspace -> pad to unit_size -> LDS cumsum
             # Process E experts in chunks of K4_BLOCK (256). Most models have
@@ -1561,30 +1487,20 @@ def _compile_moe_sorting_multiphase(
             my_mask_val = c_one
             if has_mask:
                 tid_has_expert = tid < c_E
-                my_mask_val = buffer_ops.buffer_load(
-                    mask_rsrc,
-                    tid_has_expert.select(tid, c_zero),
-                    vec_width=1,
-                    dtype=T.i32,
-                )
+                my_mask_val = _gld(mask_it, tid_has_expert.select(tid, c_zero))
                 my_mask_val = tid_has_expert.select(my_mask_val, c_zero)
 
             for _chunk in range_constexpr(0, E, K4_BLOCK):
                 expert_idx = fx.Int32(_chunk) + tid
                 tid_valid_expert = expert_idx < c_E
                 ws_cs_addr = i32_mesh_size + tid_valid_expert.select(expert_idx, c_zero)
-                raw_cnt = buffer_ops.buffer_load(
-                    ws_rsrc, ws_cs_addr, vec_width=1, dtype=T.i32
-                )
+                raw_cnt = _gld(ws_it, ws_cs_addr)
                 raw_cnt = tid_valid_expert.select(raw_cnt, c_zero)
                 blocks = (raw_cnt + c_unit - c_one) // c_unit
                 padded = (raw_cnt == c_zero).select(c_zero, blocks * c_unit)
                 if has_mask:
-                    chunk_mask = buffer_ops.buffer_load(
-                        mask_rsrc,
-                        tid_valid_expert.select(expert_idx, c_zero),
-                        vec_width=1,
-                        dtype=T.i32,
+                    chunk_mask = _gld(
+                        mask_it, tid_valid_expert.select(expert_idx, c_zero)
                     )
                     chunk_mask = tid_valid_expert.select(chunk_mask, c_zero)
                     padded = (chunk_mask == c_zero).select(c_zero, padded)
@@ -1633,11 +1549,9 @@ def _compile_moe_sorting_multiphase(
 
             # Block 0, thread 0 writes num_valid_ids
             if (bid == c_zero) & (tid == c_zero):
-                nvalid_rsrc = buffer_ops.create_buffer_resource(
-                    num_valid_ids, max_size=True
-                )
-                buffer_ops.buffer_store(total_padded, nvalid_rsrc, c_zero)
-                buffer_ops.buffer_store(tokens_, nvalid_rsrc, c_one)
+                nvalid_it = _buf_iter(num_valid_ids)
+                _gst(nvalid_it, total_padded, c_zero)
+                _gst(nvalid_it, tokens_, c_one)
 
             # Step 3: Write sorted_expert_ids for THIS expert (using local_idx_p23 for EP)
             # Store local_idx to LDS cumsum[tid], barrier, read cumsum[my_expert]
@@ -1648,18 +1562,16 @@ def _compile_moe_sorting_multiphase(
                 gpu.barrier()
                 if tid == c_zero:
                     _extend_local_idx_for_extra_experts(
-                        cumsum_mr, mask_rsrc, K4_BLOCK, E, has_mask
+                        cumsum_mr, mask_it, K4_BLOCK, E, has_mask
                     )
             gpu.barrier()
             my_local_idx = _lds_load_raw(cumsum_mr, my_expert)
 
-            sorted_e_rsrc = buffer_ops.create_buffer_resource(
-                sorted_expert_ids, max_size=True
-            )
+            sorted_e_it = _buf_iter(sorted_expert_ids)
             blk_start = my_start // c_unit
             blk_end = my_end // c_unit
             _write_expert_id_blocks(
-                sorted_e_rsrc, my_local_idx, blk_start, blk_end - blk_start
+                sorted_e_it, my_local_idx, blk_start, blk_end - blk_start
             )
 
             # Step 4: Mesh-based scatter (EP mask + uint8 mesh read + DPP prefix sum + scatter)
@@ -1668,11 +1580,11 @@ def _compile_moe_sorting_multiphase(
             scatter_end_pos_t0 = _p23_scatter_mesh(
                 tid,
                 scatter_mr,
-                ws_rsrc,
-                weights_rsrc,
-                sorted_ids_rsrc,
-                sorted_w_rsrc,
-                mask_rsrc,
+                ws_it,
+                weights_it,
+                sorted_ids_it,
+                sorted_w_it,
+                mask_it,
                 my_expert,
                 my_start,
                 my_end,
@@ -1685,8 +1597,8 @@ def _compile_moe_sorting_multiphase(
 
             # Step 5: Fill padding with sentinel for THIS expert (parallel)
             _fill_sentinel_slots(
-                sorted_ids_rsrc,
-                sorted_w_rsrc,
+                sorted_ids_it,
+                sorted_w_it,
                 scatter_end_pos_t0,
                 my_end - scatter_end_pos_t0,
                 c_sentinel | i32_tokens,
