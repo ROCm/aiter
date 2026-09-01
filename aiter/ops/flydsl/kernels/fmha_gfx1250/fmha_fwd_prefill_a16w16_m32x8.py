@@ -1344,6 +1344,8 @@ def _zero_fill_attention(
     v_hdim,
     gqa_ratio,
     return_lse,
+    has_sink,
+    ptr_sink,
     ptr_O,
     ptr_LSE,
     stride_o_seq,
@@ -1354,9 +1356,10 @@ def _zero_fill_attention(
     q_start,
     q_len,
 ):
-    """q_len>0 with kv_len==0 (cross-attention): softmax over an empty KV set, so
-    O=0 and LSE=-inf for this WG's valid query rows. Flat coalesced b128 write —
-    consecutive lanes write consecutive 16-byte O chunks (no WMMA layout)."""
+    """q_len>0 with kv_len==0 (cross-attention): softmax over an empty KV set, so O=0 for
+    this WG's valid query rows. LSE=-inf, or (with a sink) LSE=sink[head] since the only
+    surviving softmax term is exp(sink) (sink value is 0, O stays 0). Flat coalesced b128
+    write — consecutive lanes write consecutive 16-byte O chunks (no WMMA layout)."""
     tid = _warp_id() * fx.Int32(WAVE_SIZE) + _lane_id()
     kv_head = fx.Int32(gpu.block_id("y"))
     row0 = fx.Int32(gpu.block_id("x")) * fx.Int32(BLOCK_M)
@@ -1388,14 +1391,15 @@ def _zero_fill_attention(
         prow = row0 + tid  # one LSE per packed row (BLOCK_SIZE threads == BLOCK_M)
         seq = prow // g
         head = kv_head * g + prow % g
+        if has_sink:
+            num_heads_q = gpu.grid_dim.y * g
+            lse_val = _load_sink_logit(ptr_sink, head, num_heads_q)
+        else:
+            lse_val = fx.Float32(float("-inf"))
         off = (q_start + seq) * stride_lse_seq + head * stride_lse_head
         off_masked = (seq < q_len).select(off * fx.Int32(4), fx.Int32(0x7FFFFFFF))
         buffer_ops.buffer_store(
-            fx.Float32(float("-inf")),
-            lse_rsrc,
-            off_masked,
-            mask=None,
-            offset_is_bytes=True,
+            lse_val, lse_rsrc, off_masked, mask=None, offset_is_bytes=True
         )
 
 
@@ -1547,11 +1551,13 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
                         **_ca_kw,
                     )
             elif q_len > fx.Int32(0):
-                # Cross-attention tail: q_len>0 but kv_len==0 -> O=0, LSE=-inf.
+                # Cross-attention tail: q_len>0 but kv_len==0 -> O=0, LSE=-inf (or sink).
                 _zero_fill_attention(
                     v_hdim=V_HDIM,
                     gqa_ratio=GQA_RATIO,
                     return_lse=RET_LSE,
+                    has_sink=HAS_SINK,
+                    ptr_sink=ptr_sink,
                     ptr_O=ptr_O,
                     ptr_LSE=ptr_LSE,
                     stride_o_seq=stride_o_seq,
@@ -2107,10 +2113,22 @@ def flash_attn_batch_m32x8(
         stride_lse_head = 0
         stride_lse_batch = 0
 
-    # Empty tensor (no queries or no keys) — skip the launch entirely. seq_len_q/
-    # seq_len_k are host-known dims (no device sync), so the kernel never sees an
-    # empty batch (kv_len==0 would give an empty softmax denom -> O/0 = NaN).
+    # Empty tensor — skip the launch (host-known dims, no device sync). No queries: out
+    # has no rows to write. No keys (seq_len_k==0, seq_len_q>0): softmax over an empty KV
+    # set -> O=0. LSE=-inf, or (with a sink) LSE=sink[head] since the only surviving
+    # softmax term is exp(sink) (sink value is 0, so O stays 0).
     if seq_len_q == 0 or seq_len_k == 0:
+        if seq_len_q > 0 and seq_len_k == 0:
+            out.zero_()
+            if return_lse:
+                if sink is not None:
+                    lse.copy_(
+                        sink.to(device=lse.device, dtype=lse.dtype)
+                        .view(1, -1, 1)
+                        .expand_as(lse)
+                    )
+                else:
+                    lse.fill_(float("-inf"))
         return (out, lse) if return_lse else out
 
     # BSHD: seq is dim 1, head dim 2 — the per-batch base is derived in-kernel as

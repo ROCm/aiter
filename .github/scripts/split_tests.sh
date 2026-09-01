@@ -169,7 +169,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_gemm_a8w8_bpreshuffle_pad_k.py]=7
     FILE_TIMES[op_tests/test_gemm_codegen.py]=7
     FILE_TIMES[op_tests/test_jit_arch_guard.py]=7
-    FILE_TIMES[op_tests/test_mha_flydsl_varlen.py]=7
+    FILE_TIMES[op_tests/test_mha_flydsl.py]=7
     FILE_TIMES[op_tests/test_mla_decode_pagesize64.py]=7
     FILE_TIMES[op_tests/test_mla_v40_persistent.py]=7
     FILE_TIMES[op_tests/test_mla_v4_kargpreld.py]=7

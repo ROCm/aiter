@@ -261,9 +261,9 @@ def run_varlen_test(
     else:
         ref = ref_result
 
-    # A batch whose kv_len==0 attends to no keys: the kernel skips those work-
-    # groups and leaves their query-row output undefined. Mark those rows invalid
-    # so checkAllclose ignores them (True = compare, False = ignore).
+    # A batch whose kv_len==0 attends to no keys: the kernel writes O=0 and LSE=-inf
+    # (or LSE=sink[head] with a sink). Exclude those rows from the main O compare
+    # (True = compare, False = ignore) and check them explicitly below.
     kv_lens = [cu_k[b + 1] - cu_k[b] for b in range(B)]
     o_f = o.float()
     valid = torch.ones_like(o_f, dtype=torch.bool)
@@ -274,6 +274,26 @@ def run_varlen_test(
     err = checkAllclose(
         o_f, ref, rtol=1e-2, atol=1e-2, msg=f"  [{tag}] out: ", mask=valid
     )
+
+    # Empty-KV batches: O must be all-zero; LSE must be -inf (no sink) or sink[head].
+    for b in range(B):
+        if kv_lens[b] != 0:
+            continue
+        rows = slice(int(cu_q[b]), int(cu_q[b + 1]))
+        if not bool((o_f[rows] == 0).all()):
+            print(f"  [{tag}] kv0 batch {b}: O not all-zero")
+            err = max(err, 1.0)
+        if return_lse:
+            lse_b = lse[rows]  # [sq, nheads_q]
+            if sink_t is not None:
+                exp_lse = sink_t.to(lse_b.dtype).view(1, -1).expand_as(lse_b)
+                err = max(
+                    err,
+                    checkAllclose(lse_b, exp_lse, msg=f"  [{tag}] kv0 lse batch {b}: "),
+                )
+            elif not bool(torch.isneginf(lse_b).all()):
+                print(f"  [{tag}] kv0 batch {b}: LSE not all -inf")
+                err = max(err, 1.0)
 
     if return_lse:
         for b in range(B):
@@ -825,13 +845,11 @@ if __name__ == "__main__":
         else [(-1, -1)]
     )
 
-    # sink/window are served by m32x8 only where it is routed (mirrors
-    # fmha_kernels._use_fdsl_wave8_fmha); off those paths keep sink=False / window=(-1,-1).
     def _m32x8_serves_sink_window(d_qk, d_v):
         if d_v != 128:
             return False
         exp = is_experimental_enabled()
-        return d_qk == 128 or (d_qk == 192 and not exp) or (d_qk == 256 and exp)
+        return d_qk in (128, 192) or (d_qk == 256 and exp)
 
     def _sink_axis(d_qk, d_v):
         return (

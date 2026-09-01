@@ -262,20 +262,30 @@ def flydsl_flash_attn_varlen_func(
         or (qk_hdim == 192 and not _use_sibling)
         or (qk_hdim == 256 and exp)
     )
-    _sink_ok = sink is None or _use_fdsl_wave8_fmha
+    # sink must route to ours AND be a valid [nheads_q] fp32 tensor; heads must divide;
+    # window_size[2] (sink_size) is unsupported (reject so it is never silently dropped).
+    _nq, _nkv = q.shape[-2], k.shape[-2]
+    _sink_ok = sink is None or (
+        _use_fdsl_wave8_fmha
+        and torch.is_tensor(sink)
+        and sink.dtype == torch.float32
+        and sink.shape == (_nq,)
+    )
     _window_ok = tuple(window_size[:2]) == (-1, -1) or _use_fdsl_wave8_fmha
     supported = (
         get_gfx() == "gfx1250"
         and (_use_fdsl_wave8_fmha or _use_sibling)
         and v.shape[-1] == 128
         and q.dtype == torch.bfloat16
+        and _nkv > 0
+        and _nq % _nkv == 0
         and dropout_p == 0.0
         and _window_ok
+        and (len(window_size) < 3 or window_size[2] == 0)
         and block_table is None
         and bias is None
         and alibi_slopes is None
         and _sink_ok
-        and not deterministic
         and not return_attn_probs
     )
     if not supported:
@@ -348,19 +358,29 @@ def flydsl_flash_attn_batch_func(
     # BSHD routes to the m32x8 kernel (no d192 sibling exists for BSHD). D_v=128. D_qk 128/192 are
     # the DEFAULT; D_qk==256 needs AITER_ENABLE_EXPERIMENTAL=1 (else CK).
     _bqk = q.shape[-1]
+    # Head count (BSHD [B,S,H,D]) and sink must satisfy the kernel's asserts, else validate
+    # up front so an unsupported request returns None instead of tripping a kernel assert.
+    _nq, _nkv = q.shape[-2], k.shape[-2]
+    _sink_ok = sink is None or (
+        torch.is_tensor(sink) and sink.dtype == torch.float32 and sink.shape == (_nq,)
+    )
     supported = (
         get_gfx() == "gfx1250"
         and q.dim() == 4
         and (_bqk in (128, 192) or (_bqk == 256 and is_experimental_enabled()))
         and v.shape[-1] == 128
         and q.dtype == torch.bfloat16
+        and _nkv > 0
+        and _nq % _nkv == 0
+        and _sink_ok
         and dropout_p == 0.0
         and bias is None
         and alibi_slopes is None
-        and not deterministic
         and (len(window_size) < 3 or window_size[2] == 0)
         and not return_attn_probs
     )
+    # No `not deterministic` gate: it is a backward-only flag (this forward is atomic-free
+    # / deterministic), and flash_attn_func defaults it True — gating would reject all.
     if not supported:
         return None
 

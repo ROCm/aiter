@@ -493,7 +493,9 @@ def checkAllclose(
     # mask (bool, broadcastable to a/b): True = compare, False = ignore.
     # Error ratio is taken over the checked elements only.
     if mask is not None:
-        mask = mask.to(isClose.device).broadcast_to(isClose.shape)
+        mask = mask.to(device=isClose.device, dtype=torch.bool).broadcast_to(
+            isClose.shape
+        )
         isClose = isClose | ~mask
         denom = int(mask.sum().item())
         if denom == 0:
