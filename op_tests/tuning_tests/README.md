@@ -8,6 +8,7 @@ Minimal test suite for validating the aiter tuning infrastructure.
 |------|-------|-----|---------------|
 | `test_csv_validation.py` | 0 | No | Tuned CSV integrity: duplicates (all families), invalid times, errRatio, git conflicts |
 | `test_tuner_infra.py` | 1 | No | `base_tuner` utilities: CSV I/O, merge, dedup, calculate, post_process topk, update_config_files |
+| `test_arch_resolution.py` | 1 | No | GPU SKU resolution: `get_device_name` (MI300X/MI300A/MI308X), `_get_pci_chip_id`, `gfx_from_cu_num`, `get_build_targets` CU-count handling, `normalize_fp8_dtype` |
 | `test_compare_logic.py` | 1 | No | Compare/update_improved: `_build_compare_update_plan`, `_merge_compare_filtered_results` |
 | `test_mp_tuner_logic.py` | 1 | No | `mp_tuner` polling: timeout, AcceleratorError, KeyError, pool restart |
 | `test_online_tune.py` | 1 | No | `AITER_ONLINE_TUNE` decision logic, `mp_lock` synchronization, MainFunc CSV write, cfg_2stages reload |
