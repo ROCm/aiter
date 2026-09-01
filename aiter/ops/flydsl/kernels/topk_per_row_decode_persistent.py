@@ -19,13 +19,11 @@ from .topk_per_row_decode import (
 )
 
 _BLOCK_THREADS = 1024
-_WAVE_SIZE = 64
 _VEC = 4
 _RADIX_BITS = 11
 _NUM_BUCKETS = 1 << _RADIX_BITS
 _MID_SHIFT = 10
 _LOW_MASK = (1 << _MID_SHIFT) - 1
-_NUM_WAVES = _BLOCK_THREADS // _WAVE_SIZE
 
 _FIRST_ABOVE = 0
 _FIRST_THRESHOLD = 1
@@ -41,14 +39,18 @@ _RUNNING_EQUAL = 7
 def build_topk_per_row_decode_one_workgroup_module(
     rows: int,
     k: int,
+    wave_size: int,
     write_values: bool = False,
 ):
+    if wave_size not in (32, 64):
+        raise ValueError("wave size must be 32 or 64")
+    num_waves = _BLOCK_THREADS // wave_size
     output_steps = (k + _BLOCK_THREADS - 1) // _BLOCK_THREADS
 
     @fx.struct
     class SharedStorage:
         histogram: fx.Array[fx.Int32, _NUM_BUCKETS, 16]
-        scan: fx.Array[fx.Int32, _NUM_WAVES * 2, 16]
+        scan: fx.Array[fx.Int32, num_waves * 2, 16]
         metadata: fx.Array[fx.Int32, 8, 16]
 
     @flyc.kernel(
@@ -67,8 +69,8 @@ def build_topk_per_row_decode_one_workgroup_module(
     ):
         row = fx.block_idx.x
         tid = fx.thread_idx.x
-        lane = tid % _WAVE_SIZE
-        wave = tid // _WAVE_SIZE
+        lane = tid % wave_size
+        wave = tid // wave_size
 
         zero = fx.Int32(0)
         one = fx.Int32(1)
@@ -80,7 +82,7 @@ def build_topk_per_row_decode_one_workgroup_module(
 
         storage = fx.SharedAllocator().allocate(SharedStorage)
         histogram = storage.histogram.peek().view(fx.make_layout(_NUM_BUCKETS, 1))
-        scan = storage.scan.peek().view(fx.make_layout(_NUM_WAVES * 2, 1))
+        scan = storage.scan.peek().view(fx.make_layout(num_waves * 2, 1))
         metadata = storage.metadata.peek().view(fx.make_layout(8, 1))
 
         input_resource = _row_resource(input, row, width, stride0)
@@ -104,32 +106,36 @@ def build_topk_per_row_decode_one_workgroup_module(
             gpu.barrier()
 
         def block_exclusive_scan_pair(first, second, scan, metadata):
-            first_inclusive = _warp_inclusive_prefix_i32(first, lane)
-            second_inclusive = _warp_inclusive_prefix_i32(second, lane)
+            first_inclusive = _warp_inclusive_prefix_i32(first, lane, wave_size)
+            second_inclusive = _warp_inclusive_prefix_i32(second, lane, wave_size)
             first_exclusive = first_inclusive - first
             second_exclusive = second_inclusive - second
-            if lane == _WAVE_SIZE - 1:
+            if lane == wave_size - 1:
                 scan[wave] = first_inclusive
-                scan[wave + _NUM_WAVES] = second_inclusive
+                scan[wave + num_waves] = second_inclusive
             gpu.barrier()
 
             if wave == 0:
-                active = lane < _NUM_WAVES
+                active = lane < num_waves
                 safe_lane = active.select(lane, zero)
                 first_wave = active.select(scan[safe_lane], zero)
-                second_wave = active.select(scan[safe_lane + _NUM_WAVES], zero)
-                first_wave_inclusive = _warp_inclusive_prefix_i32(first_wave, lane)
-                second_wave_inclusive = _warp_inclusive_prefix_i32(second_wave, lane)
+                second_wave = active.select(scan[safe_lane + num_waves], zero)
+                first_wave_inclusive = _warp_inclusive_prefix_i32(
+                    first_wave, lane, wave_size
+                )
+                second_wave_inclusive = _warp_inclusive_prefix_i32(
+                    second_wave, lane, wave_size
+                )
                 if active:
                     scan[lane] = first_wave_inclusive - first_wave
-                    scan[lane + _NUM_WAVES] = second_wave_inclusive - second_wave
-                if lane == _NUM_WAVES - 1:
+                    scan[lane + num_waves] = second_wave_inclusive - second_wave
+                if lane == num_waves - 1:
                     metadata[_THIRD_ABOVE] = first_wave_inclusive
                     metadata[_THIRD_THRESHOLD] = second_wave_inclusive
             gpu.barrier()
             return (
                 scan[wave] + first_exclusive,
-                scan[wave + _NUM_WAVES] + second_exclusive,
+                scan[wave + num_waves] + second_exclusive,
                 metadata[_THIRD_ABOVE],
                 metadata[_THIRD_THRESHOLD],
             )
@@ -146,24 +152,29 @@ def build_topk_per_row_decode_one_workgroup_module(
             count0 = histogram[first_bin]
             count1 = histogram[first_bin + one]
             local_total = count0 + count1
-            wave_inclusive = _warp_inclusive_prefix_i32(local_total, lane)
+            wave_inclusive = _warp_inclusive_prefix_i32(
+                local_total, lane, wave_size
+            )
             wave_exclusive = wave_inclusive - local_total
 
-            if lane == _WAVE_SIZE - 1:
+            if lane == wave_size - 1:
                 scan[wave] = wave_inclusive
             gpu.barrier()
 
             if wave == 0:
-                active = lane < _NUM_WAVES
+                active = lane < num_waves
                 safe_lane = active.select(lane, zero)
                 wave_total = active.select(scan[safe_lane], zero)
-                wave_prefix = _warp_inclusive_prefix_i32(wave_total, lane) - wave_total
+                wave_prefix = (
+                    _warp_inclusive_prefix_i32(wave_total, lane, wave_size)
+                    - wave_total
+                )
                 if active:
-                    scan[lane + _NUM_WAVES] = wave_prefix
+                    scan[lane + num_waves] = wave_prefix
             gpu.barrier()
 
-            wave_offset = scan[wave + _NUM_WAVES]
-            total = scan[_NUM_WAVES - 1] + scan[_NUM_WAVES * 2 - 1]
+            wave_offset = scan[wave + num_waves]
+            total = scan[num_waves - 1] + scan[num_waves * 2 - 1]
             target_prefix = total - target_k
             exclusive0 = wave_offset + wave_exclusive
             inclusive0 = exclusive0 + count0
