@@ -490,65 +490,6 @@ def run_batch_test(
     return passed, ret
 
 
-def run_route_m16x8_test():
-    """Routing check: with AITER_ENABLE_EXPERIMENTAL=1, a D_qk=D_v=128 varlen
-    call must dispatch to ``fk.flash_attn_varlen_m32x8`` (both causal and
-    non-causal). Spies on that entry to assert it fired exactly once per call and
-    that the returned output has shape ``(total_q, H, D)``. This is a routing/shape
-    check only — numerical correctness is covered by the main suite.
-    """
-    import aiter.ops.flydsl.fmha_kernels as fk
-    from aiter.jit.core import is_experimental_enabled
-
-    if not is_experimental_enabled():
-        print(
-            "  [route-m16x8] SKIP: run with AITER_ENABLE_EXPERIMENTAL=1 to route "
-            "the 128/128 path to the m16x8 kernel"
-        )
-        return True
-
-    device = torch.device("cuda")
-    torch.manual_seed(42)
-    B, H, S, D = 2, 8, 128, 128
-    total = B * S
-    q = torch.randn(total, H, D, dtype=torch.bfloat16, device=device)
-    k = torch.randn(total, H, D, dtype=torch.bfloat16, device=device)
-    v = torch.randn(total, H, D, dtype=torch.bfloat16, device=device)
-    cu = torch.arange(0, (B + 1) * S, S, dtype=torch.int32, device=device)
-    scale = 1.0 / math.sqrt(D)
-
-    # Spy on the kernel-file entry that flydsl_flash_attn_varlen_func dispatches to.
-    calls = {"n": 0}
-    orig = fk.flash_attn_varlen_m32x8
-
-    def _spy(*a, **kw):
-        calls["n"] += 1
-        return orig(*a, **kw)
-
-    fk.flash_attn_varlen_m32x8 = _spy
-    ok = True
-    try:
-        for causal in (False, True):
-            calls["n"] = 0
-            out = flash_attn_varlen_func(
-                q, k, v, cu, cu, S, S, softmax_scale=scale, causal=causal
-            )
-            torch.cuda.synchronize()
-            routed = calls["n"] == 1
-            shape_ok = tuple(out.shape) == (total, H, D)
-            status = "OK" if (routed and shape_ok) else "FAIL"
-            print(
-                f"  [route-m16x8] causal={causal}: dispatched={calls['n']} "
-                f"out={tuple(out.shape)} -> {status}"
-            )
-            ok = ok and routed and shape_ok
-    finally:
-        fk.flash_attn_varlen_m32x8 = orig
-
-    print(f"  [route-m16x8] {'PASS' if ok else 'FAIL'}")
-    return ok
-
-
 def _fwd_flops_varlen(cu_q, cu_k, H_q, d_qk, d_v, causal):
     """FLOPs for varlen forward: sum per-batch QK^T + PV, causal halves each batch."""
     flop = 0
@@ -697,23 +638,7 @@ if __name__ == "__main__":
         action="store_true",
         help="Also time Triton for each case and print speedup.",
     )
-    # TEMPORARY: routing-only check for the empty m16x8 scaffold.
-    # TODO(m16x8): remove --route-m16x8 (and run_route_m16x8_test) once the
-    # kernel body is implemented and the normal correctness suite covers 128/128.
-    parser.add_argument(
-        "--route-m16x8",
-        action="store_true",
-        help="Routing check only: verify a D_qk=D_v=128 varlen call dispatches to\n"
-        "the experimental m16x8 kernel. Requires AITER_ENABLE_EXPERIMENTAL=1.\n"
-        "No correctness check (kernel body is an empty scaffold).",
-    )
     args = parser.parse_args()
-
-    if args.route_m16x8:
-        print("=" * 60)
-        print("FlyDSL MHA m16x8 routing check")
-        print("=" * 60)
-        sys.exit(0 if run_route_m16x8_test() else 1)
 
     # Neither selector -> run both suites.
     run_thd = args.varlen or not args.batch
