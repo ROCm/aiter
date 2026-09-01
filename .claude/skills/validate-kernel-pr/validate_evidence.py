@@ -96,7 +96,7 @@ def validate_receipt(
             "status": "skip",
             "note": f"execution receipt is missing required shapes: {missing}",
         }
-    return {
+    result = {
         "status": "pass",
         "route": expected_route,
         "producer": receipt["producer"],
@@ -106,6 +106,23 @@ def validate_receipt(
         "receipt": str(path),
         "receipt_sha256": file_sha256(path),
     }
+    # A pass here proves the route executed and nothing more. When the caller asked for shape
+    # capture and none arrived, saying only "pass" publishes an absence as a confirmation:
+    # every observed case was a route deriving its shapes in its body, where the requested
+    # names never became locals the probe could see. Name the gap in the report so no consumer
+    # can read the empty list as evidence that no shapes were needed.
+    requested_vars = [name for name in receipt.get("shape_vars") or [] if name]
+    if requested_vars and not observed_shapes:
+        result["shape_capture"] = {
+            "requested": requested_vars,
+            "observed": 0,
+            "note": (
+                "shape capture was requested but produced no rows: the route never bound all "
+                "of these names as locals the probe could read. This receipt asserts route "
+                "execution only; it makes no claim about the shapes exercised."
+            ),
+        }
+    return result
 
 
 def loaded_native_artifacts(roots: list[pathlib.Path]) -> list[dict]:
