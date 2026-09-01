@@ -953,6 +953,9 @@ def _fused_moe_impl(
                 doweight_stage1=doweight_stage1,
                 w1_scale=w1_scale,
                 w2_scale=w2_scale,
+                # A quantizing EP dispatch puts the caller's e8m0 row here;
+                # the gfx1250 path uses it to skip a quant it would redo.
+                a1_scale=a1_scale,
                 expert_mask=expert_mask,
                 hidden_pad=hidden_pad,
                 intermediate_pad=intermediate_pad,
