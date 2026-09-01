@@ -13,6 +13,7 @@ from build_targets import (
     get_build_targets_env,
 )
 from cpp_extension import executable_path
+from hip_runtime import get_hip_runtime_version, load_hip_runtime
 from torch_guard import torch_compile_guard
 
 logger = logging.getLogger("aiter")
@@ -422,13 +423,13 @@ def _get_pci_chip_id(device_id=0):
     import ctypes
 
     # ROCm 7.1 inserted MaxAvailableVgprsPerThread ahead of PciChipId, shifting it.
-    version = _hip_version()
-    if version is not None and version < (7, 1):
+    version = get_hip_runtime_version()
+    if version is not None and version[:2] < (7, 1):
         hipDeviceAttributePciChipId = 10019
     else:
         hipDeviceAttributePciChipId = 10020
 
-    libhip = ctypes.CDLL("libamdhip64.so")
+    libhip = load_hip_runtime()
     chip_id = ctypes.c_int(0)
     err = libhip.hipDeviceGetAttribute(
         ctypes.byref(chip_id),
@@ -462,44 +463,27 @@ def get_device_name():
         raise RuntimeError("Unsupported gfx")
 
 
-@functools.lru_cache(maxsize=1)
-def _hip_version() -> tuple[int, int] | None:
-    """(major, minor) of the loaded HIP runtime; None if it cannot be determined."""
-    import ctypes
-
-    try:
-        libhip = ctypes.CDLL("libamdhip64.so")
-        val = ctypes.c_int(0)
-        err = libhip.hipRuntimeGetVersion(ctypes.byref(val))
-    except Exception:  # noqa: BLE001  probing must never break a kernel launch
-        return None
-    if err != 0:
-        return None
-    # HIP_VERSION = major * 10000000 + minor * 100000 + patch
-    return val.value // 10000000, (val.value // 100000) % 100
-
-
 def _query_num_xccs() -> int | None:
     """Ask HIP how many XCCs this device has; None if it cannot say."""
     import ctypes
 
     # Added in ROCm 7.0; on an older runtime this ordinal names some other
     # attribute, which would return a plausible small integer rather than fail.
-    version = _hip_version()
-    if version is None or version < (7, 0):
+    version = get_hip_runtime_version()
+    if version is None or version[:2] < (7, 0):
         return None
 
     hipDeviceAttributeNumberOfXccs = 10018
 
     try:
-        libhip = ctypes.CDLL("libamdhip64.so")
+        libhip = load_hip_runtime()
         val = ctypes.c_int(0)
         err = libhip.hipDeviceGetAttribute(
             ctypes.byref(val),
             hipDeviceAttributeNumberOfXccs,
             0,
         )
-    except Exception:  # noqa: BLE001  probing must never break a kernel launch
+    except Exception:  # noqa: BLE001
         return None
     if err != 0:
         return None
