@@ -175,23 +175,6 @@ class MegaMoEStage2Config:
         return stride
 
 
-@dataclass(frozen=True)
-class CombineScatterTarget:
-    """The combine staging window, described for an external expert GEMM.
-
-    ``view`` is ``[rows, hidden]`` bf16 over every peer's slot region, strided by
-    the (power-of-two padded) slot pitch. Row ``pe*peer_rows + origin_lid*topk +
-    k`` is the slot for one (origin token, k); the producer needs
-    ``max_tokens_per_rank`` and ``topk`` to build those indices from a dispatch's
-    reverse source map.
-    """
-
-    view: torch.Tensor
-    peer_rows: int
-    max_tokens_per_rank: int
-    topk: int
-
-
 @dataclass
 class Routing:
     token_count: int
@@ -361,7 +344,12 @@ class MegaMoEGfx1250:
         received count -- the kernels skip the tail past the device-side count on
         their own.
         """
-        self._validate_inputs(hidden_states, topk_weights, topk_ids)
+        if hidden_states.dtype != torch.bfloat16 or not hidden_states.is_contiguous():
+            raise ValueError("hidden_states must be contiguous bfloat16")
+        if topk_weights.dtype != torch.float32 or not topk_weights.is_contiguous():
+            raise ValueError("topk_weights must be contiguous float32")
+        if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
+            raise ValueError("topk_ids must be contiguous int32")
         if os.environ.get("AITER_DISABLE_GROUPED_A8W4", "0") == "1":
             raise RuntimeError(
                 "MegaMoE fused stage2 scatter requires the grouped A8W4 kernel; "
@@ -399,6 +387,23 @@ class MegaMoEGfx1250:
             raise ValueError(
                 f"MegaMoE fused stage2 scatter requires w2 shape "
                 f"{expected_w2_shape}, got {tuple(w2.shape)}"
+            )
+        token_count = int(hidden_states.shape[0])
+        if token_count > self.max_tokens_per_rank:
+            raise ValueError(
+                f"tokens={token_count} exceeds max_tokens_per_rank="
+                f"{self.max_tokens_per_rank}"
+            )
+        expected_shape = (token_count, self.topk)
+        if tuple(topk_weights.shape) != expected_shape:
+            raise ValueError(
+                f"topk_weights must have shape {expected_shape}, "
+                f"got {tuple(topk_weights.shape)}"
+            )
+        if tuple(topk_ids.shape) != expected_shape:
+            raise ValueError(
+                f"topk_ids must have shape {expected_shape}, "
+                f"got {tuple(topk_ids.shape)}"
             )
         recv_x, recv_weights, recv_ids, total_recv, routing = self._dispatch(
             hidden_states, topk_weights, topk_ids
@@ -445,105 +450,6 @@ class MegaMoEGfx1250:
 
     __call__ = forward
 
-    def _validate_inputs(self, hidden_states, topk_weights, topk_ids):
-        """The activation-side checks, shared by forward() and dispatch().
-
-        The weight and scale checks stay in forward(): they describe MegaMoE's own
-        expert GEMM, which dispatch() does not run.
-        """
-        if hidden_states.dtype != torch.bfloat16 or not hidden_states.is_contiguous():
-            raise ValueError("hidden_states must be contiguous bfloat16")
-        if topk_weights.dtype != torch.float32 or not topk_weights.is_contiguous():
-            raise ValueError("topk_weights must be contiguous float32")
-        if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
-            raise ValueError("topk_ids must be contiguous int32")
-        token_count = int(hidden_states.shape[0])
-        if token_count > self.max_tokens_per_rank:
-            raise ValueError(
-                f"tokens={token_count} exceeds max_tokens_per_rank="
-                f"{self.max_tokens_per_rank}"
-            )
-        expected_shape = (token_count, self.topk)
-        if tuple(topk_weights.shape) != expected_shape:
-            raise ValueError(
-                f"topk_weights must have shape {expected_shape}, "
-                f"got {tuple(topk_weights.shape)}"
-            )
-        if tuple(topk_ids.shape) != expected_shape:
-            raise ValueError(
-                f"topk_ids must have shape {expected_shape}, "
-                f"got {tuple(topk_ids.shape)}"
-            )
-
-    # ── transport-only entry points ───────────────────────────────────────────
-    # forward() owns the whole layer, which only works for the expert GEMM it was
-    # written against. These three expose the same pipeline as separable steps, so
-    # a caller with its own expert GEMM can keep the fused combine: dispatch, run
-    # experts that deliver their un-reduced rows into the staging window this
-    # describes, then combine. The kernels and the arena are identical either way
-    # -- forward() is just the pre-composed case.
-
-    def dispatch(
-        self,
-        hidden_states: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-    ):
-        """All-to-all only: returns (recv_x, recv_weights, recv_ids, total_recv,
-        routing). Buffers are arena views of the full world*max_tokens_per_rank
-        arena, and `total_recv` is a device scalar -- so the caller stays
-        capture-safe by masking rather than slicing."""
-        self._validate_inputs(hidden_states, topk_weights, topk_ids)
-        return self._dispatch(hidden_states, topk_weights, topk_ids)
-
-    def combine_scatter_target(self) -> CombineScatterTarget:
-        """The combine staging window as one row-indexed tensor, for an external
-        expert GEMM.
-
-        Every peer's slot region sits at the same stride in the flat symmetric VA,
-        and the slot pitch is a power of two dividing that stride, so ONE row
-        index ``pe*peer_rows + origin_lid*topk + k`` addresses any (peer, slot)
-        pair -- the same collapse the fused GEMM2 epilogue performs in-kernel,
-        here handed out as a strided view so an ordinary kernel can store through
-        it. The rows a peer does not own are never addressed, so the view carries
-        no gaps that need masking.
-        """
-        per_rank = self._lsa_per_rank_size
-        slot_stride = self._config.combine_slot_stride_bytes
-        if per_rank % slot_stride:
-            raise RuntimeError(
-                f"per_rank_size={per_rank} is not a multiple of the combine slot "
-                f"stride {slot_stride}; a single row index cannot address both "
-                f"peer and slot"
-            )
-        peer_rows = per_rank // slot_stride
-        slots = self._config.max_tokens_per_rank * self._config.topk
-        # local_ptr is this rank's alias of comb_inp; step back to peer 0's.
-        base = self._arena.local_ptr("comb_inp") - self._config.rank * per_rank
-        # Sized to end at the LAST peer's last slot, not at a round
-        # world_size*peer_rows: the tail of that would run past the flat space.
-        rows = (self._config.world_size - 1) * peer_rows + slots
-        stride_elems = slot_stride // 2  # bf16 wire
-        view = _from_gpu_ptr(base, (rows * stride_elems,), torch.bfloat16).as_strided(
-            (rows, self._config.hidden_dim), (stride_elems, 1)
-        )
-        return CombineScatterTarget(
-            view=view,
-            peer_rows=peer_rows,
-            max_tokens_per_rank=self._config.max_tokens_per_rank,
-            topk=self._config.topk,
-        )
-
-    def combine(self, routing) -> torch.Tensor:
-        """Barrier on every peer's delivery, then sum each token's topk slots.
-
-        Reads only the staging window, so it does not care whether the rows got
-        there from ``forward()``'s GEMM2 epilogue or from an external scatter --
-        only that they all arrived. The caller must have finished delivering on
-        this stream: the kernel boundary is the release.
-        """
-        return self._combine(routing)
-
     def __enter__(self):
         return self
 
@@ -552,23 +458,6 @@ class MegaMoEGfx1250:
 
     def _initialize_pipeline(self, config: MegaMoEStage2Config, communicator):
         self._config = config
-        # Stride between peers' regions in the flat symmetric VA, for
-        # combine_scatter_target(). Only DevCommHandle exposes it, and creating
-        # one may be collective, so it is read HERE -- where every rank is
-        # constructing its MegaMoE and a barrier follows -- rather than lazily on
-        # a first forward, where ranks need not be aligned. The Communicator owns
-        # the handle it appends to its own resource list, so nothing to close.
-        _dev_comm = communicator.create_dev_comm()
-        self._lsa_per_rank_size = int(_dev_comm.per_rank_size)
-        # Every kernel is launched with config.rank as `my_lsa_rank`, so the local
-        # window must sit at that index -- otherwise the host-side address math in
-        # combine_scatter_target() and the kernels' own would disagree.
-        _lsa_rank = int(_dev_comm.lsa_rank)
-        if _lsa_rank != config.rank:
-            raise RuntimeError(
-                f"cco lsa_rank {_lsa_rank} != rank {config.rank}; the kernels "
-                "address the local window by rank, so the two must agree"
-            )
         self._closed = False
         device = torch.device("cuda", torch.cuda.current_device())
         max_recv = config.max_recv
