@@ -48,9 +48,6 @@ if is_flydsl_available():
     from .kernels.mqa_logits.fp8_mqa_logits import (
         flydsl_fp8_mqa_logits,
     )
-    from .kernels.sparse_mla import (
-        flydsl_sparse_mla_prefill,
-    )
     from .kernels.mqa_logits.pa_mqa_logits_fp4 import (
         flydsl_pa_mqa_logits_fp4,
     )
@@ -60,6 +57,7 @@ if is_flydsl_available():
         flydsl_pa_mqa_logits_fp4_varqlen,
     )
     from .kernels.qk_norm_rope_quant import flydsl_qk_norm_rope_quant
+    from .kernels.sparse_mla import flydsl_sparse_mla_prefill
     from .mla_reduce_kernels import flydsl_mla_reduce_v1
     from .moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
 
@@ -71,7 +69,6 @@ if is_flydsl_available():
         "compute_varqlen_windows",
         "flydsl_flash_attn_func",
         "flydsl_fp8_mqa_logits",
-        "flydsl_sparse_mla_prefill",
         "flydsl_hgemm",
         "flydsl_mla_reduce_v1",
         "flydsl_moe_stage1",
@@ -81,5 +78,6 @@ if is_flydsl_available():
         "flydsl_pa_mqa_logits_fp4_varqlen",
         "flydsl_preshuffle_gemm_a8",
         "flydsl_qk_norm_rope_quant",
+        "flydsl_sparse_mla_prefill",
         # "flydsl_gdr_decode",
     ]

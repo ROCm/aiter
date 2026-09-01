@@ -14,6 +14,11 @@ BF16 MFMA, and reuses the prefetched slots for score validity. PV consumes the
 shared KV through ``ds_read_tr16_b64``. KV allocations above the 32-bit buffer
 range use the 64-bit-addressed non-DMA staging path; other head counts use the
 scalar correctness path.
+
+The gfx950 tiling, LDS staging, MFMA structure, and split-KV technique are
+adapted from PyTorch PR #194309 (implementation snapshot ``420a10f`` and
+split-KV snapshot ``aa3922d``). The DSV4 ragged MQA layout and attention-sink
+semantics are specialized here for this operator.
 """
 
 # Do not enable postponed annotations. FlyDSL inspects concrete annotations.
@@ -31,9 +36,9 @@ from aiter.ops.flydsl.kernels import vector
 
 from .tensor_shim import GTensor, _run_compiled, _to_raw
 
-_HEAD_DIM = 512
 _NOPE_HEAD_DIM = 448
 _ROPE_HEAD_DIM = 64
+_HEAD_DIM = _NOPE_HEAD_DIM + _ROPE_HEAD_DIM
 _WAVE_SIZE = 64
 _OWNER_WAVES = 4
 _BLOCK_THREADS = _WAVE_SIZE * _OWNER_WAVES
@@ -351,345 +356,6 @@ def _build_sparse_mla_prefill_kernel(*, num_heads: int, has_attn_sink: bool):
     return launch
 
 
-def _build_sparse_mla_prefill_mfma_kernel(*, has_attn_sink: bool):
-    """Build the H=16 MFMA path.
-
-    Four independent waves cover four 128-wide output slices.  Each wave
-    computes the same 16-head x 16-token score tile with
-    ``mfma_f32_16x16x32_bf16`` and keeps only its own output slice.  This
-    deliberately trades duplicate QK work for a compact 32-FP32 accumulator
-    footprint per lane and avoids cross-wave barriers in the ragged loop.
-    """
-    heads = 16
-    has_sink = bool(has_attn_sink)
-    mfma_k = 32
-    kv_tile = 16
-    output_slice = _HEAD_DIM // _OWNER_WAVES
-    output_tiles = output_slice // 16
-    k_steps = _HEAD_DIM // mfma_k
-    kernel_name = f"dsv4_sparse_mla_prefill_h16_sink{int(has_sink)}_mfma_gfx950"
-
-    @fx.struct
-    class SharedStorage:
-        probabilities: fx.Array[fx.BFloat16, _OWNER_WAVES * heads * kv_tile, 16]
-
-    @flyc.kernel(name=kernel_name, known_block_size=[_BLOCK_THREADS, 1, 1])
-    def kernel(
-        q: fx.Tensor,
-        kv: fx.Tensor,
-        indices: fx.Tensor,
-        indptr: fx.Tensor,
-        attn_sink: fx.Tensor,
-        out: fx.Tensor,
-        num_queries: fx.Int32,
-        num_kv: fx.Int32,
-        scale_log2: fx.Float32,
-    ):
-        f32 = T.f32
-        i32 = T.i32
-        tid = fx.Int32(fx.thread_idx.x)
-        wave = tid // fx.Int32(_WAVE_SIZE)
-        lane = tid % fx.Int32(_WAVE_SIZE)
-        lane_group = lane // fx.Int32(16)
-        lane_mod = lane % fx.Int32(16)
-        query = fx.Int32(fx.block_idx.x)
-
-        c_zero = arith.constant(0.0, type=f32)
-        c_neg_big = arith.constant(_NEG_BIG, type=f32)
-        c_log2e = arith.constant(_LOG2E, type=f32)
-        fm_fast = arith.FastMathFlags.fast
-
-        indices_t = GTensor(indices, dtype=T.i32, shape=(-1,))
-        indptr_t = GTensor(indptr, dtype=T.i32, shape=(-1,))
-        sink_t = GTensor(attn_sink, dtype=T.f32, shape=(-1,))
-        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        probability_ptr = lds.probabilities.ptr
-
-        def make_row_i32(tensor, row):
-            row_bytes = fx.Int64(fx.Uint32(row)) * fx.Int64(_HEAD_DIM * 2)
-            return GTensor(
-                tensor,
-                dtype=T.i32,
-                shape=(-1,),
-                static_bytes_offset_i64=row_bytes,
-            )
-
-        def load_bf16x8(row_i32, dword_offset):
-            raw = row_i32.vec_load((dword_offset,), 4)
-            return vector.bitcast(T.vec(8, T.bf16), raw)
-
-        def mfma(a_bf16x8, b_bf16x8, acc_f32x4):
-            return fx.rocdl.mfma_f32_16x16x32_bf16(
-                T.f32x4,
-                [a_bf16x8, b_bf16x8, acc_f32x4, 0, 0, 0],
-            )
-
-        def reduce_max_across_token_groups(value):
-            reduced = fx.Float32(value)
-            for distance in (16, 32):
-                reduced = reduced.maximumf(reduced.shuffle_xor(distance, 64))
-            return reduced
-
-        def reduce_sum_across_token_groups(value):
-            reduced = fx.Float32(value)
-            for distance in (16, 32):
-                reduced = reduced + reduced.shuffle_xor(distance, 64)
-            return reduced
-
-        # B operand of KV @ Q^T: lane_mod selects the query head and
-        # lane_group selects one contiguous eight-BF16 K fragment.
-        q_row = query * fx.Int32(heads) + lane_mod
-        q_row_i32 = make_row_i32(q, q_row)
-        q_packs = []
-        for k_step in range_constexpr(k_steps):
-            dword_offset = fx.Int32(k_step * (mfma_k // 2)) + lane_group * fx.Int32(4)
-            q_packs.append(load_bf16x8(q_row_i32, dword_offset))
-
-        row_start = fx.Int32(indptr_t[query])
-        row_end = fx.Int32(indptr_t[query + fx.Int32(1)])
-        zero4 = fx.Vector.filled(4, 0.0, fx.Float32)
-        init_state = [c_neg_big, c_zero] + [zero4] * output_tiles
-
-        final_state = init_state
-        for ragged_pos, state in range(
-            _to_raw(row_start), _to_raw(row_end), kv_tile, init=init_state
-        ):
-            tile_base = fx.Int32(arith.index_cast(i32, _to_raw(ragged_pos)))
-            local_pos = tile_base + lane_mod
-            local_in_range = local_pos < row_end
-            safe_local_pos = local_in_range.select(local_pos, row_start)
-            local_slot = fx.Int32(indices_t[safe_local_pos])
-            local_slot_valid = (
-                local_in_range & (local_slot >= fx.Int32(0)) & (local_slot < num_kv)
-            )
-            safe_local_slot = local_slot_valid.select(local_slot, fx.Int32(0))
-            kv_row_i32 = make_row_i32(kv, safe_local_slot)
-
-            scores = fx.Vector.filled(4, 0.0, fx.Float32)
-            for k_step in range_constexpr(k_steps):
-                dword_offset = fx.Int32(k_step * (mfma_k // 2)) + lane_group * fx.Int32(
-                    4
-                )
-                kv_pack = load_bf16x8(kv_row_i32, dword_offset)
-                scores = mfma(kv_pack, q_packs[k_step], scores)
-
-            running_max = fx.Float32(state[0])
-            running_sum = fx.Float32(state[1])
-            output_acc = [
-                fx.Vector(state[2 + output_tile])
-                for output_tile in range_constexpr(output_tiles)
-            ]
-
-            score_values = []
-            score_valid = []
-            local_max = fx.Float32(c_neg_big)
-            for element in range_constexpr(4):
-                token = lane_group * fx.Int32(4) + fx.Int32(element)
-                token_pos = tile_base + token
-                token_in_range = token_pos < row_end
-                safe_token_pos = token_in_range.select(token_pos, row_start)
-                token_slot = fx.Int32(indices_t[safe_token_pos])
-                token_valid = (
-                    token_in_range & (token_slot >= fx.Int32(0)) & (token_slot < num_kv)
-                )
-                raw_score = arith.MulFOp(
-                    _to_raw(fx.Float32(scores[element])),
-                    _to_raw(scale_log2),
-                    fastmath=fm_fast,
-                ).result
-                score = fx.Float32(
-                    arith.select(_to_raw(token_valid), raw_score, c_neg_big)
-                )
-                score_values.append(score)
-                score_valid.append(token_valid)
-                local_max = local_max.maximumf(score)
-
-            block_max = reduce_max_across_token_groups(local_max)
-            new_max = running_max.maximumf(block_max)
-            correction = fx.rocdl.exp2(f32, _to_raw(running_max - new_max))
-            local_sum = fx.Float32(0.0)
-            probabilities = []
-            for element in range_constexpr(4):
-                active_probability = fx.Float32(
-                    fx.rocdl.exp2(f32, _to_raw(score_values[element] - new_max))
-                )
-                probability = score_valid[element].select(
-                    active_probability, fx.Float32(0.0)
-                )
-                probabilities.append(probability)
-                local_sum = local_sum + probability
-            block_sum = reduce_sum_across_token_groups(local_sum)
-            new_sum = running_sum * fx.Float32(correction) + block_sum
-
-            correction4 = fx.Vector.from_elements(
-                [fx.Float32(correction)] * 4, dtype=fx.Float32
-            )
-            output_acc = [
-                fx.Vector(accumulator) * correction4 for accumulator in output_acc
-            ]
-
-            probability_bf16 = vector.from_elements(
-                T.vec(4, T.bf16),
-                [
-                    arith.trunc_f(T.bf16, _to_raw(probability))
-                    for probability in probabilities
-                ],
-            )
-            probability_offset = (
-                wave * fx.Int32(heads * kv_tile)
-                + lane_mod * fx.Int32(kv_tile)
-                + lane_group * fx.Int32(4)
-            )
-            fx.ptr_store(probability_bf16, probability_ptr + probability_offset)
-            fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
-
-            probability_read_offset = (
-                wave * fx.Int32(heads * kv_tile)
-                + lane_mod * fx.Int32(kv_tile)
-                + (lane_group & fx.Int32(1)) * fx.Int32(8)
-            )
-            probability_raw = fx.ptr_load(
-                probability_ptr + probability_read_offset,
-                result_type=T.vec(8, T.bf16),
-            )
-            probability_pack = vector.from_elements(
-                T.vec(8, T.bf16),
-                [
-                    (lane_group < fx.Int32(2)).select(
-                        fx.BFloat16(
-                            vector.extract(
-                                probability_raw,
-                                static_position=[element],
-                                dynamic_position=[],
-                            )
-                        ),
-                        fx.BFloat16(0.0),
-                    )
-                    for element in range_constexpr(8)
-                ],
-            )
-
-            v_slots = []
-            v_valid = []
-            v_token_base = (lane_group & fx.Int32(1)) * fx.Int32(8)
-            v_group_valid = lane_group < fx.Int32(2)
-            for element in range_constexpr(8):
-                token_pos = tile_base + v_token_base + fx.Int32(element)
-                token_in_range = v_group_valid & (token_pos < row_end)
-                safe_token_pos = token_in_range.select(token_pos, row_start)
-                token_slot = fx.Int32(indices_t[safe_token_pos])
-                token_valid = (
-                    token_in_range & (token_slot >= fx.Int32(0)) & (token_slot < num_kv)
-                )
-                v_slots.append(token_valid.select(token_slot, fx.Int32(0)))
-                v_valid.append(token_valid)
-
-            for output_tile in range_constexpr(output_tiles):
-                input_dimension = (
-                    wave * fx.Int32(output_slice)
-                    + fx.Int32(output_tile * 16)
-                    + lane_mod
-                )
-                value_elements = []
-                for element in range_constexpr(8):
-                    kv_row_bf16 = GTensor(
-                        kv,
-                        dtype=T.bf16,
-                        shape=(-1,),
-                        static_bytes_offset_i64=(
-                            fx.Int64(fx.Uint32(v_slots[element]))
-                            * fx.Int64(_HEAD_DIM * 2)
-                        ),
-                    )
-                    value = fx.BFloat16(kv_row_bf16[input_dimension])
-                    value_elements.append(
-                        v_valid[element].select(value, fx.BFloat16(0.0))
-                    )
-                value_pack = vector.from_elements(T.vec(8, T.bf16), value_elements)
-                output_acc[output_tile] = mfma(
-                    value_pack, probability_pack, output_acc[output_tile]
-                )
-
-            final_state = yield [new_max, new_sum, *output_acc]
-
-        running_max = fx.Float32(final_state[0])
-        running_sum = fx.Float32(final_state[1])
-        output_acc = [
-            fx.Vector(final_state[2 + output_tile])
-            for output_tile in range_constexpr(output_tiles)
-        ]
-        numerator_scale = fx.Float32(1.0)
-        denominator = running_sum
-        if const_expr(has_sink):
-            sink_log2 = fx.Float32(sink_t[lane_mod]) * fx.Float32(c_log2e)
-            merged_max = running_max.maximumf(sink_log2)
-            has_tokens = running_sum > fx.Float32(0.0)
-            active_scale = fx.Float32(
-                fx.rocdl.exp2(f32, _to_raw(running_max - merged_max))
-            )
-            numerator_scale = has_tokens.select(active_scale, fx.Float32(0.0))
-            sink_weight = fx.Float32(
-                fx.rocdl.exp2(f32, _to_raw(sink_log2 - merged_max))
-            )
-            denominator = running_sum * numerator_scale + sink_weight
-
-        has_denominator = denominator > fx.Float32(0.0)
-        safe_denominator = has_denominator.select(denominator, fx.Float32(1.0))
-        output_scale = numerator_scale / safe_denominator
-        output_scale = has_denominator.select(output_scale, fx.Float32(0.0))
-        output_scale4 = fx.Vector.from_elements([output_scale] * 4, dtype=fx.Float32)
-
-        output_row = query * fx.Int32(heads) + lane_mod
-        output_row_i32 = make_row_i32(out, output_row)
-        for output_tile in range_constexpr(output_tiles):
-            output_values = fx.Vector(output_acc[output_tile]) * output_scale4
-            output_bf16 = vector.from_elements(
-                T.vec(4, T.bf16),
-                [
-                    arith.trunc_f(T.bf16, _to_raw(fx.Float32(output_values[element])))
-                    for element in range_constexpr(4)
-                ],
-            )
-            output_i32 = vector.bitcast(T.vec(2, T.i32), output_bf16)
-            output_dimension = (
-                wave * fx.Int32(output_slice)
-                + fx.Int32(output_tile * 16)
-                + lane_group * fx.Int32(4)
-            )
-            output_row_i32.vec_store((output_dimension // fx.Int32(2),), output_i32, 2)
-
-    @flyc.jit
-    def launch(
-        q: fx.Tensor,
-        kv: fx.Tensor,
-        indices: fx.Tensor,
-        indptr: fx.Tensor,
-        attn_sink: fx.Tensor,
-        out: fx.Tensor,
-        num_queries: fx.Int32,
-        num_kv: fx.Int32,
-        scale_log2: fx.Float32,
-        stream: Stream,
-    ):
-        kernel(
-            q,
-            kv,
-            indices,
-            indptr,
-            attn_sink,
-            out,
-            num_queries,
-            num_kv,
-            scale_log2,
-        ).launch(
-            grid=(fx.Index(num_queries), 1, 1),
-            block=(_BLOCK_THREADS, 1, 1),
-            stream=stream,
-        )
-
-    return launch
-
-
 def _build_sparse_mla_prefill_mfma64_kernel(
     *, has_attn_sink: bool, use_lds_dma: bool, split_kv: bool = False
 ):
@@ -991,8 +657,10 @@ def _build_sparse_mla_prefill_mfma64_kernel(
 
             wave_max = reduce_max_token_groups(local_max)
 
-            def store_wave_max():
-                fx.ptr_store(wave_max, maxima_lds + wave * fx.Int32(heads) + lane_mod)
+            # Bind the loop-carried IR value when the helper is defined. The
+            # helper is invoked immediately from the guarded JIT region.
+            def store_wave_max(value=wave_max):
+                fx.ptr_store(value, maxima_lds + wave * fx.Int32(heads) + lane_mod)
 
             @flyc.jit
             def guarded_store_wave_max():
@@ -1040,8 +708,8 @@ def _build_sparse_mla_prefill_mfma64_kernel(
 
             wave_sum = reduce_sum_token_groups(local_sum)
 
-            def store_wave_sum():
-                fx.ptr_store(wave_sum, sums_lds + wave * fx.Int32(heads) + lane_mod)
+            def store_wave_sum(value=wave_sum):
+                fx.ptr_store(value, sums_lds + wave * fx.Int32(heads) + lane_mod)
 
             @flyc.jit
             def guarded_store_wave_sum():
@@ -1209,10 +877,8 @@ def _build_sparse_mla_prefill_mfma64_kernel(
                 + lane_group * fx.Int32(4)
             )
 
-            def store_output():
-                output_row_i32.vec_store(
-                    (output_dimension // fx.Int32(2),), output_i32, 2
-                )
+            def store_output(dimension=output_dimension, value=output_i32):
+                output_row_i32.vec_store((dimension // fx.Int32(2),), value, 2)
 
             @flyc.jit
             def guarded_store_output():
