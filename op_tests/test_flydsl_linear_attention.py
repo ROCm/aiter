@@ -35,6 +35,11 @@ pytestmark = pytest.mark.skipif(
 )
 _PERF_ROTATION_BUDGET = 1024**3
 _MAX_PERF_ROTATIONS = 101
+# ``checkAllclose`` returns the fraction of mismatching elements. The kernel
+# stores bf16 while the reference accumulates in fp32, so a value sitting on a
+# rounding boundary can land one ULP away -- a handful of such elements per
+# tensor is expected. A real correctness break moves far more than this.
+_TOL_ERR_RATIO = 1e-4
 
 
 @dataclass
@@ -549,7 +554,10 @@ def test_flydsl_gdr_decode(
             atol=1e-3,
             msg=f"{name}: GDR decode state ",
         )
-        assert err_out == 0 and err_state == 0
+        assert err_out <= _TOL_ERR_RATIO and err_state <= _TOL_ERR_RATIO, (
+            f"{name}: mismatch ratio exceeds {_TOL_ERR_RATIO:g} "
+            f"(output {err_out:.3e}, state {err_state:.3e})"
+        )
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
