@@ -202,9 +202,7 @@ def test_public_topk_decode_e2e(
         logits = torch.randn((rows, width), dtype=torch.float32, device="cuda")
     else:
         context_lens = list(context_lens)
-        logits = torch.arange(width, dtype=torch.float32, device="cuda").repeat(
-            rows, 1
-        )
+        logits = torch.arange(width, dtype=torch.float32, device="cuda").repeat(rows, 1)
     seq_lens = torch.tensor(context_lens, dtype=torch.int32, device="cuda")
     output = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
     values = (
@@ -256,8 +254,7 @@ def test_public_topk_decode_stable_tie_break(rows, width, top_k):
     for row in range(rows):
         above_count = top_k // 4 + row * 17
         above_indices = (
-            torch.arange(above_count, dtype=torch.int64, device="cuda") * 17
-            + row * 13
+            torch.arange(above_count, dtype=torch.int64, device="cuda") * 17 + row * 13
         ) % width
         logits[row, above_indices] = 1.0
 
