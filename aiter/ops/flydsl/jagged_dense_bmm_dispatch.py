@@ -34,6 +34,7 @@ _DISPATCH_CACHE: dict[tuple, dict] = {}
 SKEW_COMPACT_MAX_GROUPS = 4096
 SKEW_COMPACT_XCD_C = 32
 SKEW_COMPACT_XCD_W = 8
+_SKEW_COMPACT_ENV = "FLYDSL_JDBBA_SKEW_COMPACT"
 _TILE_MAP_CACHE: dict[int, tuple] = {}
 
 _SCHEMA_DEFAULTS = {
@@ -52,6 +53,9 @@ _SCHEMA_DEFAULTS = {
     "n_warps": 1,
     "waves_per_eu": 0,
     "b_to_lds": False,
+    "sched_hints": False,
+    "prologue_sched_hints": False,
+    "sched_span": 2,
 }
 
 
@@ -122,7 +126,12 @@ def clear_skew_tile_map_cache() -> None:
 
 
 def _skew_compact_enabled(*, uniform_seqlen: bool, n_groups: int) -> bool:
-    return not (uniform_seqlen or n_groups > SKEW_COMPACT_MAX_GROUPS)
+    if uniform_seqlen or n_groups > SKEW_COMPACT_MAX_GROUPS:
+        return False
+    env = os.environ.get(_SKEW_COMPACT_ENV)
+    if env is None:
+        return True
+    return env.strip().lower() not in ("0", "false", "off", "no")
 
 
 _SKEW_XCD_REMAP_SMALL_B_THRESHOLD = 120
@@ -164,6 +173,12 @@ def _normalize_cfg(cfg: dict) -> dict:
         raw = cfg.get(key, default)
         if key == "use_mfma_k32":
             out[key] = _coerce(raw, bool)
+        elif key == "sched_hints":
+            out[key] = False if raw is None else bool(raw)
+        elif key == "prologue_sched_hints":
+            out[key] = False if raw is None else bool(raw)
+        elif key == "sched_span":
+            out[key] = 2 if raw is None else int(raw)
         elif key == "b_to_lds":
             out[key] = bool(raw) if raw is not None else False
         else:
@@ -316,6 +331,9 @@ def jagged_dense_bmm_dispatched(
             block_k=cfg.get("block_k"),
             tile_map=tile_map,
             total_occ_tiles=ub,
+            sched_hints=cfg.get("sched_hints", False),
+            prologue_sched_hints=cfg.get("prologue_sched_hints", False),
+            sched_span=int(cfg.get("sched_span") or 2),
         )
 
     skew_remap_on = (not uniform_seqlen) and output_n <= 256 and n_groups >= 1024
@@ -334,6 +352,9 @@ def jagged_dense_bmm_dispatched(
             use_mfma_k32=cfg["use_mfma_k32"],
             uniform_seqlen=False,
             block_k=cfg.get("block_k"),
+            sched_hints=cfg.get("sched_hints", False),
+            prologue_sched_hints=cfg.get("prologue_sched_hints", False),
+            sched_span=int(cfg.get("sched_span") or 2),
         )
 
     return jagged_dense_bmm(
@@ -354,4 +375,7 @@ def jagged_dense_bmm_dispatched(
         block_k=cfg.get("block_k"),
         waves_per_eu=int(cfg.get("waves_per_eu") or 0) if uniform_seqlen else 0,
         threads=_coerce(cfg.get("threads"), int) if uniform_seqlen else None,
+        sched_hints=cfg.get("sched_hints", False),
+        prologue_sched_hints=cfg.get("prologue_sched_hints", False),
+        sched_span=int(cfg.get("sched_span") or 2),
     )
