@@ -20,7 +20,7 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16_persistent import (
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
-from aiter.ops.triton.utils.core import (
+from aiter.ops.triton.utils.config_utils import (
     AITER_TRITON_CONFIGS_PATH,
     load_config_json,
 )
