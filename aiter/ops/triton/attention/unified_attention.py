@@ -301,7 +301,7 @@ def unified_attention(
         else:
             _unified_attention_2d_triton(params)
     else:
-        config, _ = get_unified_attention_config("kv_split", params, backend=backend)
+        config = get_unified_attention_config("kv_split", params, backend=backend)
         NUM_SEGMENTS = config["NUM_SEGMENTS"]
         if shuffled_kv_cache:
             TILE_SIZE = block_size
@@ -454,7 +454,7 @@ def _unified_attention_2d_triton(params: _UAParams):
             params.block_size >= 32
         ), "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
 
-    config, _ = get_unified_attention_config("attn_2d", params, backend="triton")
+    config = get_unified_attention_config("attn_2d", params, backend="triton")
     config["BLOCK_M"] = max(
         config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)
     )
@@ -529,7 +529,7 @@ def _unified_attention_3d_triton(
     NUM_SEGMENTS,
     TILE_SIZE,
 ):
-    config, _ = get_unified_attention_config("attn_3d", params, backend="triton")
+    config = get_unified_attention_config("attn_3d", params, backend="triton")
     config["BLOCK_M"] = max(
         config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)
     )
@@ -609,7 +609,7 @@ def _reduce_segments_triton(
     TILE_SIZE,
 ):
     head_size_padded = triton.next_power_of_2(params.head_size)
-    config, _ = get_unified_attention_config("reduce", params, backend="triton")
+    config = get_unified_attention_config("reduce", params, backend="triton")
 
     reduce_segments[(params.num_tokens, params.num_query_heads)](
         output_ptr=params.out,
@@ -674,7 +674,7 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
     """
     assert params.softcap == 0, "Softcap is not supported"
 
-    config, _ = get_unified_attention_config("attn_2d", params, backend="gluon")
+    config = get_unified_attention_config("attn_2d", params, backend="gluon")
     NUM_SEQS = params.num_seqs
     TILE_SIZE = config["TILE_SIZE"]
     BLOCK_M = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
@@ -768,7 +768,7 @@ def _unified_attention_3d_gfx1250(
     NUM_BLOCKS_GATHER_PER_TILE = 1
     QUERY_DTYPE = get_dtype_str(params.q_dtype)
     KV_CACHE_DTYPE = get_dtype_str(params.kv_cache_dtype)
-    config, _ = get_unified_attention_config("attn_3d", params, backend="gluon")
+    config = get_unified_attention_config("attn_3d", params, backend="gluon")
     config["BLOCK_M"] = max(
         config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)
     )
@@ -861,7 +861,7 @@ def _reduce_segments_gfx1250(
 ):
     head_size_padded = triton.next_power_of_2(params.head_size)
     gluon_num_warps = 8 if params.num_query_heads % 8 == 0 else 4
-    config, _ = get_unified_attention_config("reduce", params, backend="gluon")
+    config = get_unified_attention_config("reduce", params, backend="gluon")
 
     _reduce_segments_kernel_gfx1250[(params.num_tokens,)](
         output_ptr=params.out,

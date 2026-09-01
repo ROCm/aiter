@@ -174,30 +174,14 @@ def _axis_values(
     }
 
 
-def _load(op: str, head_size, num_queries_per_kv, backend, arch) -> tuple:
-    """Return ``(table, axes, is_tuned, cfg_dir)`` for one op."""
+def _load(op: str, backend, arch) -> tuple:
+    """Return ``(table, axes, cfg_dir)`` for one op."""
     cfg_dir = resolve_config_dir("attention", _CONFIG_NAME, backend=backend, arch=arch)
     config = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False)
     if config is None:
         raise AssertionError(
             f"Required config file doesn't exist: {cfg_dir}/DEFAULT.json"
         )
-
-    is_tuned = False
-    for suffix in (f"D={head_size}-QPKV={num_queries_per_kv}", f"D={head_size}"):
-        tuned = load_config_json(
-            f"{cfg_dir}/{_CONFIG_NAME}-{suffix}.json", required=False
-        )
-        if tuned is not None:
-            # Override per section, so a file tuning only attn_2d keeps the
-            # default's other sections.
-            config = {
-                **config,
-                "schema": {**config.get("schema", {}), **tuned.get("schema", {})},
-                **{s: tuned[s] for s in _OPS if s in tuned},
-            }
-            is_tuned = True
-            break
 
     if op not in config:
         raise KeyError(f"{_CONFIG_NAME}[{op}] in {cfg_dir}: file has no {op} section")
@@ -207,7 +191,7 @@ def _load(op: str, head_size, num_queries_per_kv, backend, arch) -> tuple:
         f"{_CONFIG_NAME}[{op}] in {cfg_dir}: schema names unknown axes {unknown} "
         f"(known: {sorted(_AXIS_KIND)})"
     )
-    return config[op], axes, is_tuned, cfg_dir
+    return config[op], axes, cfg_dir
 
 
 @functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
@@ -220,17 +204,15 @@ def _get_unified_attention_config_cached(
     shuffled_kv_cache: bool,
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
-    num_queries_per_kv: int,
     block_size: int,
     backend: str,
     arch: str | None,
-) -> tuple[dict, bool]:
+) -> dict:
     assert op in _OPS, f"Unknown config op {op!r}, expected one of {_OPS}"
     assert head_size > 0, "head_size must be positive"
     assert block_size > 0, "block_size must be positive"
-    assert num_queries_per_kv > 0, "num_queries_per_kv must be positive"
 
-    table, axes, is_tuned, _ = _load(op, head_size, num_queries_per_kv, backend, arch)
+    table, axes, _ = _load(op, backend, arch)
     values = _axis_values(
         head_size,
         max_seqlen_q,
@@ -242,7 +224,7 @@ def _get_unified_attention_config_cached(
         kv_dtype,
     )
     _, config = _lookup(table, axes, values)
-    return compute_tile_params(config, block_size), is_tuned
+    return compute_tile_params(config, block_size)
 
 
 def get_unified_attention_config(
@@ -250,7 +232,7 @@ def get_unified_attention_config(
     params,
     backend: str = "triton",
     arch: str | None = None,
-) -> tuple[dict, bool]:
+) -> dict:
     """Load the config for one op.
 
     Args:
@@ -262,11 +244,9 @@ def get_unified_attention_config(
             in kernels.
 
     Returns:
-        ``(config, is_tuned)``. The config is a fresh deep copy, safe to
-        mutate. ``is_tuned`` is True only when a specialized ``-D=`` /
-        ``-QPKV=`` file was hit; do not discard it.
+        The config, as a fresh deep copy that is safe to mutate.
     """
-    config, is_tuned = _get_unified_attention_config_cached(
+    config = _get_unified_attention_config_cached(
         op,
         params.head_size,
         params.max_seqlen_q,
@@ -275,19 +255,16 @@ def get_unified_attention_config(
         params.shuffled_kv_cache,
         params.q_dtype,
         params.kv_cache_dtype,
-        params.num_queries_per_kv,
         params.block_size,
         backend,
         arch,
     )
-    return copy.deepcopy(config), is_tuned
+    return copy.deepcopy(config)
 
 
 def explain(op: str, params, backend: str = "triton", arch: str | None = None) -> str:
     """Report which entry a lookup lands on, and the config it yields."""
-    table, axes, _, cfg_dir = _load(
-        op, params.head_size, params.num_queries_per_kv, backend, arch
-    )
+    table, axes, cfg_dir = _load(op, backend, arch)
     values = _axis_values(
         params.head_size,
         params.max_seqlen_q,

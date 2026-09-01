@@ -192,7 +192,7 @@ def test_resolution_is_total(arch, backend, op):
                                 kv_cache_dtype=kv_dtype,
                                 block_size=block_size,
                             )
-                            config, _ = get_unified_attention_config(
+                            config = get_unified_attention_config(
                                 op, params, backend=backend, arch=arch
                             )
                             missing = REQUIRED_KEYS[backend][op] - set(config)
@@ -213,7 +213,7 @@ def test_tile_size_divides_or_is_divided_by_page(arch, backend, block_size):
     """
     for head_size in HEAD_SIZES:
         params = make_params(head_size=head_size, block_size=block_size)
-        config, _ = get_unified_attention_config(
+        config = get_unified_attention_config(
             "kv_split", params, backend=backend, arch=arch
         )
         tile = config["TILE_SIZE"]
@@ -236,10 +236,10 @@ def test_fp8_tile_is_never_smaller_than_bf16(arch, backend):
         fp8 = make_params(
             block_size=block_size, q_dtype=e4m3_dtype, kv_cache_dtype=e4m3_dtype
         )
-        c_bf16, _ = get_unified_attention_config(
+        c_bf16 = get_unified_attention_config(
             "kv_split", bf16, backend=backend, arch=arch
         )
-        c_fp8, _ = get_unified_attention_config(
+        c_fp8 = get_unified_attention_config(
             "kv_split", fp8, backend=backend, arch=arch
         )
         assert c_fp8["TILE_SIZE"] >= c_bf16["TILE_SIZE"]
@@ -251,14 +251,10 @@ def test_resolution_is_deterministic_and_isolated(arch, backend):
     the loader hands back a deep copy of a cached table.
     """
     params = make_params()
-    first, _ = get_unified_attention_config(
-        "attn_2d", params, backend=backend, arch=arch
-    )
+    first = get_unified_attention_config("attn_2d", params, backend=backend, arch=arch)
     first["BLOCK_M"] = -1
     first["INJECTED"] = True
-    second, _ = get_unified_attention_config(
-        "attn_2d", params, backend=backend, arch=arch
-    )
+    second = get_unified_attention_config("attn_2d", params, backend=backend, arch=arch)
     assert second["BLOCK_M"] != -1
     assert "INJECTED" not in second
 
@@ -279,7 +275,7 @@ def test_explain_names_the_entry_and_agrees_with_the_lookup(arch, backend, op):
             assert "matched:" in text and "leaf:" in text
             assert "UNRESOLVED" not in text
 
-            config, _ = get_unified_attention_config(
+            config = get_unified_attention_config(
                 op, params, backend=backend, arch=arch
             )
             reported = {}
@@ -314,7 +310,7 @@ def test_no_key_the_kernel_launch_would_reject(arch, backend, op):
                     max_seqlen_q=max_seqlen_q,
                     block_size=block_size,
                 )
-                config, _ = get_unified_attention_config(
+                config = get_unified_attention_config(
                     op, params, backend=backend, arch=arch
                 )
                 allowed = ALLOWED_KEYS[backend][op]
