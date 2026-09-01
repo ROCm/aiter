@@ -13,7 +13,11 @@ from build_targets import (
     get_build_targets_env,
 )
 from cpp_extension import executable_path
-from hip_runtime import get_hip_runtime_version, load_hip_runtime
+from hip_runtime import (
+    get_current_hip_device,
+    get_hip_runtime_version,
+    load_hip_runtime,
+)
 from torch_guard import torch_compile_guard
 
 logger = logging.getLogger("aiter")
@@ -419,8 +423,11 @@ def write_lookup_header(
         f.write(lookup_end)
 
 
-def _get_pci_chip_id(device_id=0):
+def _get_pci_chip_id(device_id=None):
     import ctypes
+
+    if device_id is None:
+        device_id = get_current_hip_device()
 
     # ROCm 7.1 inserted MaxAvailableVgprsPerThread ahead of PciChipId, shifting it.
     version = get_hip_runtime_version()
@@ -463,8 +470,8 @@ def get_device_name():
         raise RuntimeError("Unsupported gfx")
 
 
-def _query_num_xccs() -> int | None:
-    """Ask HIP how many XCCs this device has; None if it cannot say."""
+def _query_num_xccs(device_id: int) -> int | None:
+    """Ask HIP how many XCCs the given device has; None if it cannot say."""
     import ctypes
 
     # Added in ROCm 7.0; on an older runtime this ordinal names some other
@@ -481,7 +488,7 @@ def _query_num_xccs() -> int | None:
         err = libhip.hipDeviceGetAttribute(
             ctypes.byref(val),
             hipDeviceAttributeNumberOfXccs,
-            0,
+            device_id,
         )
     except Exception:  # noqa: BLE001
         return None
@@ -494,16 +501,23 @@ def _query_num_xccs() -> int | None:
     return n if 1 <= n <= 64 else None
 
 
-@functools.lru_cache(maxsize=1)
-def get_num_xcds() -> int:
-    """XCD (accelerator die) count visible to this process."""
-    num_xcds = _query_num_xccs()
+@functools.cache
+def _num_xcds_for_device(device_id: int) -> int:
+    """XCD count for one device ordinal, warning once per device on fallback."""
+    num_xcds = _query_num_xccs(device_id)
     if num_xcds is not None:
         return num_xcds
 
     fallback_num_xcds = 8
     logger.warning(
-        "hipDeviceAttributeNumberOfXccs is unavailable; using %d XCDs as fallback value.",
+        "hipDeviceAttributeNumberOfXccs is unavailable for device %d; "
+        "using %d XCDs as fallback value.",
+        device_id,
         fallback_num_xcds,
     )
     return fallback_num_xcds
+
+
+def get_num_xcds() -> int:
+    """XCD (accelerator die) count of the device this thread is bound to."""
+    return _num_xcds_for_device(get_current_hip_device())

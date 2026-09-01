@@ -43,3 +43,18 @@ def get_hip_runtime_version() -> tuple[int, int, int] | None:
     # HIP_VERSION = major * 10000000 + minor * 100000 + patch
     raw = val.value
     return raw // 10_000_000, (raw // 100_000) % 100, raw % 100_000
+
+
+def get_current_hip_device() -> int:
+    """Ordinal of the device this thread is bound to, or 0 if unavailable.
+
+    Uncached on purpose: torch.cuda.set_device() moves it between calls.
+    """
+    try:
+        libhip = load_hip_runtime()
+        val = ctypes.c_int(0)
+        if libhip.hipGetDevice(ctypes.byref(val)) != 0:
+            return 0
+    except Exception:  # noqa: BLE001
+        return 0
+    return val.value
