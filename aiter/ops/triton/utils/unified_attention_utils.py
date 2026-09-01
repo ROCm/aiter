@@ -138,11 +138,18 @@ def _lookup(table: dict, axes: tuple, values: dict) -> tuple:
 
 
 def compute_tile_params(config: dict, block_size: int) -> dict:
-    """Derive TILE_SIZE from the tuned bounds and the runtime page size."""
+    """Derive TILE_SIZE from the tuned bounds and the runtime page size.
+
+    Either bound may stand alone. A floor with no cap is what the gluon 2d
+    entries use: that kernel reads the tile only with a shuffled cache, which
+    is asserted to have a power-of-2 page, so a cap could never bind.
+    """
+    if "TILE_SIZE_MIN" not in config and "TILE_SIZE_MAX" not in config:
+        return config
     hi = config.pop("TILE_SIZE_MAX", None)
     lo = config.pop("TILE_SIZE_MIN", 1)
-    if hi is not None:
-        config["TILE_SIZE"] = max(lo, min(hi, triton.next_power_of_2(block_size)))
+    tile = triton.next_power_of_2(block_size)
+    config["TILE_SIZE"] = max(lo, tile if hi is None else min(hi, tile))
     return config
 
 

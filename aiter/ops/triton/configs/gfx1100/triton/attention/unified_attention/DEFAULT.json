@@ -71,23 +71,18 @@
     "waves_per_eu": 2
   },
   "kv_split": {
-    "DT_fp8_fp8.BS_GEQ_32": {
-      "NUM_SEGMENTS": 32,
-      "TILE_SIZE_MIN": 32,
-      "TILE_SIZE_MAX": 64
-    },
-    "DT_fp8_fp8": {
+    "DT_fp8_fp8.BS_LEQ_16": {
       "NUM_SEGMENTS": 64,
       "TILE_SIZE_MIN": 32,
       "TILE_SIZE_MAX": 64
     },
-    "BS_GEQ_32": {
-      "NUM_SEGMENTS": 32,
+    "BS_LEQ_16": {
+      "NUM_SEGMENTS": 64,
       "TILE_SIZE_MIN": 16,
       "TILE_SIZE_MAX": 64
     },
     "any": {
-      "NUM_SEGMENTS": 64,
+      "NUM_SEGMENTS": 32,
       "TILE_SIZE_MIN": 16,
       "TILE_SIZE_MAX": 64
     }

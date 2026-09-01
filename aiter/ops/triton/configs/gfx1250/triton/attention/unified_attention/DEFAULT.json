@@ -18,6 +18,7 @@
       "BS"
     ]
   },
+  "segment_tile": "page",
   "attn_2d": {
     "D_GEQ_256.Q_LEQ_1.DT_fp8_fp8": {
       "BLOCK_M": 16,
@@ -57,14 +58,6 @@
       "num_stages": 1,
       "waves_per_eu": 2,
       "TILE_SIZE_MIN": 16,
-      "TILE_SIZE_MAX": 64
-    },
-    "D_LEQ_128.Q_GEQ_256": {
-      "BLOCK_M": 128,
-      "num_warps": 4,
-      "num_stages": 1,
-      "waves_per_eu": 2,
-      "TILE_SIZE_MIN": 64,
       "TILE_SIZE_MAX": 64
     },
     "D_LEQ_128.Q_LEQ_1": {
@@ -107,14 +100,6 @@
       "TILE_SIZE_MIN": 16,
       "TILE_SIZE_MAX": 16
     },
-    "D_LEQ_128": {
-      "BLOCK_M": 16,
-      "num_warps": 2,
-      "num_stages": 1,
-      "waves_per_eu": 2,
-      "TILE_SIZE_MIN": 64,
-      "TILE_SIZE_MAX": 64
-    },
     "Q_GEQ_256": {
       "BLOCK_M": 128,
       "num_warps": 4,
@@ -141,43 +126,19 @@
     }
   },
   "attn_3d": {
-    "SHUF.DT_bf16_bf16.BS_GEQ_128": {
+    "D_LEQ_64.SHUF.DT_any_bf16.BS_GEQ_128": {
       "BLOCK_M": 16,
       "num_warps": 1,
       "num_stages": 2,
       "waves_per_eu": 1
     },
-    "SHUF.DT_fp8_bf16.BS_GEQ_128": {
+    "D_LEQ_64.SHUF.BS_GEQ_256": {
       "BLOCK_M": 16,
       "num_warps": 1,
       "num_stages": 2,
       "waves_per_eu": 1
     },
-    "SHUF.DT_bf16_bf16": {
-      "BLOCK_M": 16,
-      "num_warps": 1,
-      "num_stages": 2,
-      "waves_per_eu": 2
-    },
-    "SHUF.DT_fp8_bf16": {
-      "BLOCK_M": 16,
-      "num_warps": 1,
-      "num_stages": 2,
-      "waves_per_eu": 2
-    },
-    "SHUF.BS_GEQ_256": {
-      "BLOCK_M": 16,
-      "num_warps": 1,
-      "num_stages": 2,
-      "waves_per_eu": 1
-    },
-    "D_GEQ_128": {
-      "BLOCK_M": 16,
-      "num_warps": 1,
-      "num_stages": 2,
-      "waves_per_eu": 1
-    },
-    "SHUF": {
+    "D_LEQ_64.SHUF": {
       "BLOCK_M": 16,
       "num_warps": 1,
       "num_stages": 2,
@@ -196,70 +157,35 @@
     "waves_per_eu": 2
   },
   "kv_split": {
-    "SHUF.DT_bf16_bf16.BS_GEQ_128": {
+    "D_LEQ_64.SHUF.DT_any_bf16.BS_GEQ_128": {
       "NUM_SEGMENTS": 8,
       "TILE_SIZE_MIN": 16,
-      "TILE_SIZE_MAX": 2048
+      "TILE_SIZE_MAX": 256
     },
-    "SHUF.DT_bf16_bf16.BS_LEQ_32": {
+    "D_LEQ_64.SHUF.BS_GEQ_256": {
+      "NUM_SEGMENTS": 8,
+      "TILE_SIZE_MIN": 16,
+      "TILE_SIZE_MAX": 256
+    },
+    "D_LEQ_64.SHUF.BS_GEQ_64": {
+      "NUM_SEGMENTS": 16,
+      "TILE_SIZE_MIN": 16,
+      "TILE_SIZE_MAX": 256
+    },
+    "D_LEQ_64.SHUF": {
       "NUM_SEGMENTS": 32,
       "TILE_SIZE_MIN": 16,
-      "TILE_SIZE_MAX": 2048
+      "TILE_SIZE_MAX": 256
     },
-    "SHUF.DT_fp8_bf16.BS_GEQ_128": {
-      "NUM_SEGMENTS": 8,
-      "TILE_SIZE_MIN": 16,
-      "TILE_SIZE_MAX": 2048
-    },
-    "SHUF.DT_fp8_bf16.BS_LEQ_32": {
-      "NUM_SEGMENTS": 32,
-      "TILE_SIZE_MIN": 16,
-      "TILE_SIZE_MAX": 2048
-    },
-    "D_GEQ_128.BS_GEQ_128": {
-      "NUM_SEGMENTS": 8,
-      "TILE_SIZE_MIN": 16,
-      "TILE_SIZE_MAX": 2048
-    },
-    "SHUF.DT_bf16_bf16": {
+    "BS_LEQ_64": {
       "NUM_SEGMENTS": 16,
       "TILE_SIZE_MIN": 16,
-      "TILE_SIZE_MAX": 2048
-    },
-    "SHUF.DT_fp8_bf16": {
-      "NUM_SEGMENTS": 16,
-      "TILE_SIZE_MIN": 16,
-      "TILE_SIZE_MAX": 2048
-    },
-    "SHUF.BS_GEQ_256": {
-      "NUM_SEGMENTS": 8,
-      "TILE_SIZE_MIN": 16,
-      "TILE_SIZE_MAX": 2048
-    },
-    "SHUF.BS_LEQ_32": {
-      "NUM_SEGMENTS": 32,
-      "TILE_SIZE_MIN": 16,
-      "TILE_SIZE_MAX": 2048
-    },
-    "D_GEQ_128": {
-      "NUM_SEGMENTS": 16,
-      "TILE_SIZE_MIN": 16,
-      "TILE_SIZE_MAX": 2048
-    },
-    "SHUF": {
-      "NUM_SEGMENTS": 16,
-      "TILE_SIZE_MIN": 16,
-      "TILE_SIZE_MAX": 2048
-    },
-    "BS_GEQ_128": {
-      "NUM_SEGMENTS": 8,
-      "TILE_SIZE_MIN": 16,
-      "TILE_SIZE_MAX": 2048
+      "TILE_SIZE_MAX": 256
     },
     "any": {
-      "NUM_SEGMENTS": 16,
+      "NUM_SEGMENTS": 8,
       "TILE_SIZE_MIN": 16,
-      "TILE_SIZE_MAX": 2048
+      "TILE_SIZE_MAX": 256
     }
   }
 }

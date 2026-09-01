@@ -60,11 +60,6 @@
       "TILE_SIZE_MIN": 32,
       "TILE_SIZE_MAX": 64
     },
-    "DT_fp8_fp8": {
-      "NUM_SEGMENTS": 16,
-      "TILE_SIZE_MIN": 32,
-      "TILE_SIZE_MAX": 64
-    },
     "BS_LEQ_32": {
       "NUM_SEGMENTS": 32,
       "TILE_SIZE_MIN": 16,

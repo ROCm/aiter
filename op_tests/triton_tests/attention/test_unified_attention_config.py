@@ -37,32 +37,48 @@ TABLES = [
     ("gfx1200", "triton"),
     ("gfx1201", "triton"),
     ("gfx1250", "triton"),
-    pytest.param(
-        "gfx1250",
-        "gluon",
-        marks=pytest.mark.skip(
-            reason="gluon table not yet converted to the nested format"
-        ),
-    ),
+    ("gfx1250", "gluon"),
 ]
 
 OPS = ["attn_2d", "attn_3d", "reduce", "kv_split"]
 
-# Exactly what each op's config may contain. attn_2d/attn_3d/reduce configs are
-# splatted into the kernel launch as **config, so an EXTRA key is a TypeError at
-# launch, and a key the wrapper also passes by name is a duplicate-argument
-# TypeError. attn_3d and reduce both receive TILE_SIZE by name, which is why
-# their leaves must not carry tile bounds. kv_split is read field by field.
+# Exactly what each op's config may contain, per backend. attn_2d/attn_3d/reduce
+# configs are splatted into the kernel launch as **config, so an EXTRA key is a
+# TypeError at launch, and a key the wrapper also passes by name is a
+# duplicate-argument TypeError. attn_3d and reduce both receive TILE_SIZE by
+# name, which is why their leaves must not carry tile bounds. kv_split is read
+# field by field.
+#
+# The gluon kernels are separate kernels with their own signatures: the 2d one
+# is scheduled by hand (LOOP_VARIANT, NUM_BUFFERS) instead of by num_stages,
+# and the reduce is handed num_warps by the wrapper, so a num_warps in its
+# config would be a duplicate argument.
 ALLOWED_KEYS = {
-    "attn_2d": {"BLOCK_M", "TILE_SIZE", "num_warps", "num_stages", "waves_per_eu"},
-    "attn_3d": {"BLOCK_M", "num_warps", "num_stages", "waves_per_eu"},
-    "reduce": {"num_warps", "num_stages", "waves_per_eu"},
-    "kv_split": {"NUM_SEGMENTS", "TILE_SIZE"},
+    "triton": {
+        "attn_2d": {"BLOCK_M", "TILE_SIZE", "num_warps", "num_stages", "waves_per_eu"},
+        "attn_3d": {"BLOCK_M", "num_warps", "num_stages", "waves_per_eu"},
+        "reduce": {"num_warps", "num_stages", "waves_per_eu"},
+        "kv_split": {"NUM_SEGMENTS", "TILE_SIZE"},
+    },
+    "gluon": {
+        "attn_2d": {
+            "BLOCK_M",
+            "TILE_SIZE",
+            "num_warps",
+            "waves_per_eu",
+            "LOOP_VARIANT",
+            "NUM_BUFFERS",
+        },
+        "attn_3d": {"BLOCK_M", "num_warps", "num_stages", "waves_per_eu"},
+        "reduce": {"num_stages", "waves_per_eu"},
+        "kv_split": {"NUM_SEGMENTS", "TILE_SIZE"},
+    },
 }
 
-# Page sizes: powers of two on and between bucket edges, plus the two the
-# ladder could not express -- 1 (below every bound) and 48 (between them).
-BLOCK_SIZES = [1, 16, 32, 48, 64, 128, 256]
+# Page sizes: on every bucket edge, in every gap between edges, below the
+# smallest and above the largest. Sweeping only powers of two on the edges is
+# what let a table that disagreed with its buckets in the gaps (17, 96) ship.
+BLOCK_SIZES = [1, 16, 17, 32, 48, 64, 96, 128, 192, 256, 512]
 HEAD_SIZES = [32, 64, 128, 192, 256, 512, 576]
 QUERY_LENS = [1, 4, 100, 256, 4096]
 DTYPES = [
@@ -72,12 +88,29 @@ DTYPES = [
     (torch.uint8, torch.uint8),
 ]
 
-# Params every op must come back with, whatever the arch or the rules that fired.
+# Params every op must come back with, whatever the arch or the entry that hit.
+# The gluon 2d wrapper indexes LOOP_VARIANT and NUM_BUFFERS directly, so an
+# entry missing either is a KeyError before the launch, not a bad schedule.
 REQUIRED_KEYS = {
-    "attn_2d": {"BLOCK_M", "num_warps", "waves_per_eu", "TILE_SIZE"},
-    "attn_3d": {"BLOCK_M", "num_warps", "waves_per_eu"},
-    "reduce": {"waves_per_eu"},
-    "kv_split": {"NUM_SEGMENTS", "TILE_SIZE"},
+    "triton": {
+        "attn_2d": {"BLOCK_M", "num_warps", "waves_per_eu", "TILE_SIZE"},
+        "attn_3d": {"BLOCK_M", "num_warps", "waves_per_eu"},
+        "reduce": {"waves_per_eu"},
+        "kv_split": {"NUM_SEGMENTS", "TILE_SIZE"},
+    },
+    "gluon": {
+        "attn_2d": {
+            "BLOCK_M",
+            "num_warps",
+            "waves_per_eu",
+            "TILE_SIZE",
+            "LOOP_VARIANT",
+            "NUM_BUFFERS",
+        },
+        "attn_3d": {"BLOCK_M", "num_warps", "waves_per_eu"},
+        "reduce": {"waves_per_eu"},
+        "kv_split": {"NUM_SEGMENTS", "TILE_SIZE"},
+    },
 }
 
 
@@ -162,7 +195,7 @@ def test_resolution_is_total(arch, backend, op):
                             config, _ = get_unified_attention_config(
                                 op, params, backend=backend, arch=arch
                             )
-                            missing = REQUIRED_KEYS[op] - set(config)
+                            missing = REQUIRED_KEYS[backend][op] - set(config)
                             assert not missing, (
                                 f"{arch}/{backend} {op}: missing {sorted(missing)} for "
                                 f"D={head_size} Q={max_seqlen_q} BS={block_size} "
@@ -284,11 +317,11 @@ def test_no_key_the_kernel_launch_would_reject(arch, backend, op):
                 config, _ = get_unified_attention_config(
                     op, params, backend=backend, arch=arch
                 )
-                extra = set(config) - ALLOWED_KEYS[op]
+                allowed = ALLOWED_KEYS[backend][op]
+                extra = set(config) - allowed
                 assert not extra, (
                     f"{arch}/{backend} {op}: config carries {sorted(extra)}, which "
-                    f"the kernel launch does not accept (allowed: "
-                    f"{sorted(ALLOWED_KEYS[op])})"
+                    f"the kernel launch does not accept (allowed: {sorted(allowed)})"
                 )
 
 
@@ -302,10 +335,12 @@ def test_no_key_the_kernel_launch_would_reject(arch, backend, op):
 # --------------------------------------------------------------------------
 
 # What a leaf may hold: the launch keys for that op, plus the tile bounds that
-# compute_tile_params() consumes into TILE_SIZE.
+# compute_tile_params() consumes into TILE_SIZE. Either bound may stand alone --
+# a floor with no cap means "follow the page size, but never below MIN".
 _TILE_BOUNDS = {"TILE_SIZE_MIN", "TILE_SIZE_MAX"}
 ALLOWED_LEAF_KEYS = {
-    op: (keys - {"TILE_SIZE"}) | _TILE_BOUNDS for op, keys in ALLOWED_KEYS.items()
+    backend: {op: (keys - {"TILE_SIZE"}) | _TILE_BOUNDS for op, keys in ops.items()}
+    for backend, ops in ALLOWED_KEYS.items()
 }
 
 
@@ -413,14 +448,14 @@ def test_every_entry_is_complete_and_carries_nothing_extra(arch, backend, op):
     situation happens to reach is still covered."""
     table = _table(arch, backend)
     axes = table.get("schema", {}).get(op, [])
-    required = REQUIRED_KEYS[op] - {"TILE_SIZE"}
+    required = REQUIRED_KEYS[backend][op] - {"TILE_SIZE"}
     for key, config in _entries(table[op], axes):
-        extra = set(config) - ALLOWED_LEAF_KEYS[op]
+        extra = set(config) - ALLOWED_LEAF_KEYS[backend][op]
         assert not extra, f"{arch}/{backend} {op}: {key!r} has extra {sorted(extra)}"
         missing = required - set(config)
         assert not missing, f"{arch}/{backend} {op}: {key!r} missing {sorted(missing)}"
-        if "TILE_SIZE" in ALLOWED_KEYS[op]:
-            assert _TILE_BOUNDS <= set(config), (
-                f"{arch}/{backend} {op}: {key!r} needs {sorted(_TILE_BOUNDS)} "
-                f"to derive TILE_SIZE"
+        if "TILE_SIZE" in ALLOWED_KEYS[backend][op]:
+            assert _TILE_BOUNDS & set(config), (
+                f"{arch}/{backend} {op}: {key!r} needs at least one of "
+                f"{sorted(_TILE_BOUNDS)} to derive TILE_SIZE"
             )
