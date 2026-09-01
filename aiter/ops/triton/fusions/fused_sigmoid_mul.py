@@ -36,10 +36,10 @@ def fused_sigmoid_mul(
 ) -> torch.Tensor:
     """
     Fused elementwise ``out = x * sigmoid(gate)``.
-    
+
     Args:
         x: any shape, contiguous
-        gate: same shape and dtype as x, contiguous. 
+        gate: same shape and dtype as x, contiguous.
         out: optional destination
 
     Returns:

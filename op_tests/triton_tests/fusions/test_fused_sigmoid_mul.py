@@ -34,10 +34,10 @@ def generate_fused_sigmoid_mul_inputs(shape, dtype, device="cuda"):
     [
         (4, 64),
         (128, 256),
-        (31, 500),  
+        (31, 500),
         (2, 16, 128),
         (1, 3, 7, 32),
-        (1, _K3_TP8_WIDTH), 
+        (1, _K3_TP8_WIDTH),
         (8192, 512),
     ],
 )
@@ -58,7 +58,7 @@ def test_fused_sigmoid_mul(shape, dtype, use_explicit_out):
         )
     else:
         ret = fused_sigmoid_mul(x, gate)
-        assert ret is x  
+        assert ret is x
 
     torch.testing.assert_close(ret, ref, rtol=1e-2, atol=1e-2)
 
@@ -79,7 +79,7 @@ def test_fused_sigmoid_mul_k3_mla_gate_shapes(n_tokens):
 
 
 def test_fused_sigmoid_mul_matches_eager_within_dtype_noise():
-    """Agreement with the eager form the fusion replaces. """
+    """Agreement with the eager form the fusion replaces."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     dtype = torch.bfloat16
