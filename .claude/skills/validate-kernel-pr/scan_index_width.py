@@ -221,6 +221,26 @@ class KernelScopeScanner(ast.NodeVisitor):
         return False
 
     @staticmethod
+    def _own_nodes(func):
+        """Walk this function's body without crossing into a nested function.
+
+        `ast.walk` descends through nested defs, so every expression inside a nested helper was
+        scanned in the ENCLOSING function's scope: with the outer function's parameters, the
+        outer function's widened locals, and the outer function's device/host verdict. Four
+        real candidates inside a `@flyc.kernel` body were classified host-side that way.
+        """
+        stack = list(func.body)
+        while stack:
+            node = stack.pop()
+            yield node
+            for child in ast.iter_child_nodes(node):
+                if isinstance(
+                    child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+                ):
+                    continue
+                stack.append(child)
+
+    @staticmethod
     def _names_in(node):
         return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
 
@@ -292,8 +312,26 @@ class KernelScopeScanner(ast.NodeVisitor):
         # judgement of which parameters are "stride-like" is left to the reviewer: we report
         # every runtime scalar parameter the DIFF introduced, not every one that matches a
         # name pattern.
-        self._scope = "device" if self._device_scope(node) else "host"
+        # Inherited, not re-derived. A device function's nested helpers carry no decorator and
+        # no constexpr parameter of their own; deriving scope per function demoted four real
+        # candidates inside a `@flyc.kernel` body to host scope. Code that runs on the device
+        # because its enclosing function does is device code.
+        outer_scope = getattr(self, "_scope", "host")
+        outer_runtime = set(getattr(self, "_enclosing_runtime", set()))
+        outer_constexpr = set(getattr(self, "_enclosing_constexpr", set()))
+        outer_widened = set(getattr(self, "_enclosing_widened", set()))
+        self._scope = (
+            "device" if (outer_scope == "device" or self._device_scope(node)) else "host"
+        )
+        # A nested helper closes over the enclosing kernel's parameters, so provenance and
+        # widening both follow the scope chain.
+        runtime_params = runtime_params | outer_runtime
+        constexpr_params = constexpr_params | outer_constexpr
+        self._enclosing_widened = outer_widened
         widened_locals = self._collect_widened_locals(node)
+        self._enclosing_runtime = runtime_params
+        self._enclosing_constexpr = constexpr_params
+        self._enclosing_widened = widened_locals
         before = len(self.hits)
         self._scan_body(node, runtime_params, constexpr_params, widened_locals)
 
@@ -311,9 +349,16 @@ class KernelScopeScanner(ast.NodeVisitor):
                 and getattr(a, "annotation", None) is None
             ):
                 self.untyped_params.append((a.arg, a.lineno))
-        # Nested functions get their own scope.
+        # `visit`, not `generic_visit`: generic_visit descends to a statement's CHILDREN, so a
+        # nested `def` that IS a statement of this body was never dispatched to this method.
+        # While _scan_body walked the whole subtree that went unnoticed; once it stopped at
+        # function boundaries, those bodies would have gone unscanned entirely.
         for child in node.body:
-            self.generic_visit(child)
+            self.visit(child)
+        self._scope = outer_scope
+        self._enclosing_runtime = outer_runtime
+        self._enclosing_constexpr = outer_constexpr
+        self._enclosing_widened = outer_widened
 
     visit_AsyncFunctionDef = visit_FunctionDef
 
@@ -326,8 +371,8 @@ class KernelScopeScanner(ast.NodeVisitor):
         miss only in code that widens a name and then rebinds it narrower, which would be a
         separate defect worth its own rule.
         """
-        widened = set()
-        for sub in ast.walk(func):
+        widened = set(self._enclosing_widened)
+        for sub in self._own_nodes(func):
             targets = []
             if isinstance(sub, ast.Assign):
                 targets, value = sub.targets, sub.value
@@ -346,7 +391,7 @@ class KernelScopeScanner(ast.NodeVisitor):
         return widened
 
     def _scan_body(self, func, runtime_params, constexpr_params, widened_locals):
-        for sub in ast.walk(func):
+        for sub in self._own_nodes(func):
             if not isinstance(sub, ast.BinOp) or not isinstance(sub.op, ast.Add):
                 continue
             # Each addend of an address-building chain.

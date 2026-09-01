@@ -1840,6 +1840,47 @@ class GpuClaimTests(unittest.TestCase):
         self.assertEqual("activity+vram", claim["idleness_basis"])
 
 
+class ScannerScopeTests(unittest.TestCase):
+    def _scan(self, source):
+        with tempfile.TemporaryDirectory() as directory:
+            diff = Path(directory) / "d.diff"
+            body = "".join(f"+{line}\n" for line in source.splitlines())
+            diff.write_text(
+                "diff --git a/k.py b/k.py\n--- /dev/null\n+++ b/k.py\n"
+                f"@@ -0,0 +1,{len(source.splitlines())} @@\n" + body
+            )
+            return json.loads(
+                run([str(SCANNER), "--diff", str(diff), "--json"]).stdout
+            )
+
+    def test_a_nested_helper_inherits_its_kernels_device_scope(self):
+        # _scan_body used ast.walk, which descends through nested defs, so every expression in
+        # a nested helper was scanned in the ENCLOSING function's scope -- with the outer
+        # function's parameters and its host/device verdict. Four real candidates inside a
+        # @flyc.kernel body were classified host-side that way, which is a miss.
+        payload = self._scan(
+            "def build(stride_a):\n"
+            "    @flyc.kernel(name='k')\n"
+            "    def kernel_gemm(stride_b):\n"
+            "        def helper(row):\n"
+            "            return base + row * stride_b\n"
+            "        return helper\n"
+        )
+        self.assertEqual(1, payload["index_stride_candidates"], payload)
+        self.assertEqual(0, payload["host_scope_candidates"], payload)
+        self.assertEqual("device", payload["candidates"][0]["scope"])
+
+    def test_host_side_arithmetic_is_listed_apart_from_device_candidates(self):
+        # int32 overflow is a device concern; host-side FLOP accounting in the same shape is
+        # not D9. It is listed rather than dropped, because the device test is a spelling.
+        payload = self._scan(
+            "def _flops_bytes(rows, stride_x):\n"
+            "    return total + rows * stride_x\n"
+        )
+        self.assertEqual(0, payload["index_stride_candidates"], payload)
+        self.assertEqual(1, payload["host_scope_candidates"], payload)
+
+
 class ShapeGridPluginTests(unittest.TestCase):
     """The plugin is what substitutes the grid, so its refusals are what keep a target the
     grid cannot express from being reported as a failing PR."""
@@ -1876,6 +1917,29 @@ class ShapeGridPluginTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         self.assertIn("2 passed", result.stdout)
         self.assertNotIn("TypeError", result.stdout + result.stderr)
+
+    def test_grid_arity_mismatch_is_rejected_at_invocation(self):
+        # The arity check lived in the plugin generator, whose exit status run_pytest never
+        # read: the stale plugin from the previous phase survived, head-grid re-ran the
+        # invalid-grid sentinel, and its failure was published as "the PR adds this target and
+        # its independent shape grid fails" -- a blocker produced by a caller's typo. It is
+        # now refused at argument parsing, before any phase can run.
+        fixture = ValidatorFixture()
+        try:
+            result = subprocess.run(
+                [
+                    str(VALIDATOR),
+                    "--repo", str(fixture.repo),
+                    "--target", "tests/test_sample.py",
+                    "--shape-argnames", "m",
+                    "--grid", "255,3;512,4",
+                ],
+                capture_output=True, text=True,
+            )
+        finally:
+            fixture.close()
+        self.assertEqual(2, result.returncode, result.stdout + result.stderr)
+        self.assertIn("--grid", result.stderr)
 
     def test_a_single_scalar_argname_is_substituted(self):
         # The same code path with scalar values must still replace the target's own literals,

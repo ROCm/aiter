@@ -83,6 +83,30 @@ fi
 if [ -n "$OUT" ]; then
   OUT=$(cd -- "$(dirname -- "$OUT")" && pwd)/$(basename -- "$OUT")
 fi
+if [ -n "$SHAPE_ARGNAMES" ] && [ -n "$GRID" ]; then
+  if ! python3 - "$SHAPE_ARGNAMES" "$GRID" <<'PY'
+import sys
+
+names = [part.strip() for part in sys.argv[1].split(",") if part.strip()]
+rows = [row for row in sys.argv[2].split(";") if row.strip()]
+bad = [row for row in rows if len(row.split(",")) != len(names)]
+if bad:
+    print(
+        f"--grid rows must have {len(names)} cells to match --shape-argnames "
+        f"{','.join(names)}; offending rows: {bad}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
+  then
+    # Checked here and not inside a phase. The arity check used to live in the plugin
+    # generator, whose exit status run_pytest never read: the stale plugin from the previous
+    # phase survived, head-grid re-ran the invalid-grid sentinel, and its failure was
+    # published as "the PR adds this target and its independent shape grid fails".
+    echo "--grid does not match --shape-argnames" >&2
+    exit 2
+  fi
+fi
 if [ -n "$HEAD_SHA" ] && [[ ! "$HEAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
   echo "--head-sha must be a full 40-character commit OID" >&2
   exit 2
@@ -1052,12 +1076,13 @@ PY
 fi
 
 GRID_HOOK_PYTEST=0
+GRID_PYTEST_REFUSAL=""
 if [ -n "$SHAPE_ARGNAMES" ] && [ -n "$GRID" ] && [ "$TARGET_RUNNER" = "pytest" ] \
     && [ -f "$REPO_WT/$TEST_FILE" ]; then
   # Held to the same standard of proof as the other two channels: the names must actually be
   # parameters of a test the file defines, or bound by a parametrize mark it declares. A name
   # the file does not take would append a parametrization nothing consumes.
-  GRID_HOOK_PYTEST=$(python3 - "$REPO_WT/$TEST_FILE" "$SHAPE_ARGNAMES" <<'PY'
+  GRID_PYTEST_PROBE=$(python3 - "$REPO_WT/$TEST_FILE" "$SHAPE_ARGNAMES" <<'PY'
 import ast
 import sys
 
@@ -1111,6 +1136,7 @@ def mark_values_are_scalar(call):
 # Decided per test function, exactly as the plugin decides per metafunc. A file-wide check
 # let one unrelated test's overlapping mark disable the channel for the whole file.
 reachable = False
+refusal = ""
 for node in ast.walk(tree):
     if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         continue
@@ -1126,17 +1152,24 @@ for node in ast.walk(tree):
     ]
     bound_all = set()
     blocked = False
+    reason = ""
     for mark in marks:
         bound = mark_names(mark)
         bound_all |= bound
         if (bound & wanted) and not (bound <= wanted):
             blocked = True
+            reason = f"the target parametrises {sorted(bound)} together, so name all of them or none"
         if (bound & wanted) and not mark_values_are_scalar(mark):
             blocked = True
+            reason = "the target's own parametrize values are not scalar cells (a dict or object per case), which a shape grid cannot express"
     if wanted <= (names | bound_all) and not blocked:
         reachable = True
         break
-print(int(bool(wanted) and reachable))
+    if wanted <= (names | bound_all) and reason and not refusal:
+        # The names ARE present; something else refused. Saying "does not take all of these as
+        # test parameters" when it does sends the caller to fix a spelling that was correct.
+        refusal = reason
+print(int(bool(wanted) and reachable), refusal)
 raise SystemExit(0)
 
 available = set()
@@ -1170,6 +1203,9 @@ for node in ast.walk(tree):
 print(int(bool(wanted) and wanted <= available and not partial))
 PY
 )
+  GRID_HOOK_PYTEST=${GRID_PYTEST_PROBE%% *}
+  GRID_PYTEST_REFUSAL=${GRID_PYTEST_PROBE#* }
+  [ "$GRID_PYTEST_REFUSAL" = "$GRID_PYTEST_PROBE" ] && GRID_PYTEST_REFUSAL=""
 fi
 
 # Combine. The CLI channel is preferred when both probe positive, because the caller named the
@@ -1209,7 +1245,11 @@ if [ -n "$GRID" ] && [ "$GRID_HOOK_OK" -ne 1 ]; then
       if [ "$TARGET_RUNNER" != "pytest" ]; then
         GRID_CHANNEL_REASON="$GRID_CHANNEL_REASON --shape-argnames needs a pytest target and this one runs under $TARGET_RUNNER;"
       else
-        GRID_CHANNEL_REASON="$GRID_CHANNEL_REASON $TEST_FILE does not take all of '"'"'$SHAPE_ARGNAMES'"'"' as test parameters;"
+        if [ -n "$GRID_PYTEST_REFUSAL" ]; then
+          GRID_CHANNEL_REASON="$GRID_CHANNEL_REASON $GRID_PYTEST_REFUSAL;"
+        else
+          GRID_CHANNEL_REASON="$GRID_CHANNEL_REASON $TEST_FILE does not take all of '"'"'$SHAPE_ARGNAMES'"'"' as test parameters;"
+        fi
       fi
     fi
   fi
@@ -1329,6 +1369,9 @@ PY
   local -a shape_plugin=()
   if [ "$GRID_CHANNEL" = "pytest" ] && [ -n "$shape_assignment" ]; then
     local _grid_value="${shape_assignment#*=}"
+    # Remove first: a generator that fails must not leave the PREVIOUS phase's plugin in
+    # place, or the next phase silently re-runs the grid it was carrying.
+    rm -f "$PROBE_DIR/${PROBE_MODULE}_shapes.py"
     python3 - "$SCRIPT_DIR/shape_grid_plugin.py" \
       "$PROBE_DIR/${PROBE_MODULE}_shapes.py" "$SHAPE_ARGNAMES" "$_grid_value" <<'PY'
 import pathlib
@@ -1382,6 +1425,11 @@ text += (
 )
 pathlib.Path(output).write_text(text)
 PY
+    if [ ! -s "$PROBE_DIR/${PROBE_MODULE}_shapes.py" ]; then
+      echo "shape plugin generation failed for $label" >&2
+      printf '%s|%s\n' 2 "$log"
+      return 0
+    fi
     shape_plugin=(-p "${PROBE_MODULE}_shapes")
     shape_assignment=""
   fi
