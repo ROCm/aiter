@@ -39,6 +39,12 @@ DEFAULT_RTOL = 1e-2
 DEFAULT_PASS_PCT = 99.9
 DEFAULT_INPUT_SEED = 20260401
 
+# `max_delta_limit` is set to ONE bf16 ULP at each case's output magnitude
+# (ulp(x) = 2^(floor(log2 x) - 7)): the split-K combine sums fp32 partials and
+# rounds once, so the result is correctly rounded and any multi-ULP drift is a
+# real regression. Measured max_delta is 0.0 on all four cases -- the earlier
+# 4-ULP limits and 99% pass rates existed to tolerate the bf16 atomic combine
+# that has since been removed.
 SPLITK_PRECISION_CASES = [
     {
         "name": "splitk8_tile32_m104_n384_k7168",
@@ -51,6 +57,8 @@ SPLITK_PRECISION_CASES = [
         "pack_n": 1,
         "split_k": 8,
         "b_preshuffle": False,
+        "pass_pct": 100.0,
+        "max_delta_limit": 8.0,  # max|ref| ~1856
     },
     {
         "name": "splitk4_tile16_m1_n7168_k512",
@@ -63,6 +71,8 @@ SPLITK_PRECISION_CASES = [
         "pack_n": 1,
         "split_k": 2,
         "b_preshuffle": False,
+        "pass_pct": 100.0,
+        "max_delta_limit": 1.0,  # max|ref| ~142
     },
     {
         "name": "splitk16_tile32_m1_n2112_k7168_warp2x2_blds",
@@ -78,8 +88,8 @@ SPLITK_PRECISION_CASES = [
         "block_n_warps": 2,
         "b_to_lds": True,
         "b_preshuffle": False,
-        "pass_pct": 99.0,
-        "max_delta_limit": 32.0,
+        "pass_pct": 100.0,
+        "max_delta_limit": 8.0,  # max|ref| ~1808
     },
     {
         "name": "splitk8_tile32_m1_n3072_k1536_warp2x2_blds",
@@ -95,8 +105,8 @@ SPLITK_PRECISION_CASES = [
         "block_n_warps": 2,
         "b_to_lds": True,
         "b_preshuffle": False,
-        "pass_pct": 99.0,
-        "max_delta_limit": 8.0,
+        "pass_pct": 100.0,
+        "max_delta_limit": 2.0,  # max|ref| ~390
     },
 ]
 

@@ -59,6 +59,28 @@ except Exception:  # noqa: BLE001  blanket catch is intentional here
 # so its absence here is safe to detect.)
 
 
+def _flydsl_prewarm_capture_workspace(inp, weights, flydsl_config) -> None:
+    """The opus analogue above, for the FlyDSL split-K workspace: size it before
+    capture, since it cannot grow inside one. Cheap once warm; soft-fails so a
+    prewarm that cannot run never breaks eager callers.
+    """
+    try:
+        aiter.ops.flydsl.gemm_kernels.flydsl_splitk_prewarm_capture_workspace(
+            inp.shape[0],
+            weights.shape[0],
+            split_k=int(flydsl_config.get("split_k", 1)),
+            block_k_warps=int(flydsl_config.get("block_k_warps", 1)),
+            device=inp.device,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            f"FlyDSL split-K workspace prewarm on the graph capture stream failed "
+            f"({type(e).__name__}: {e}); HIP graph capture of this shape may abort. "
+            f"Run it eagerly once before capturing, or call "
+            f"flydsl_splitk_prewarm_capture_workspace(...) on your capture stream."
+        )
+
+
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -490,6 +512,10 @@ def flydsl_gemm(
         config["kernelName"]
     )
     stages = flydsl_config.get("stages", flydsl_config.get("stage", 2))
+    # Size the split-K workspace on the capture stream now: it cannot grow inside
+    # a capture, and an unwarmed shape raises there. Same reason and placement as
+    # _opus_prewarm_capture_workspace in gemm() below.
+    _flydsl_prewarm_capture_workspace(inp, weights, flydsl_config)
     fused_bias = None
     if (
         bias is not None
