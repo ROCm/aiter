@@ -18,6 +18,41 @@ from aiter.test_common import (
 torch.set_default_device("cuda")
 
 
+def test_i8_static_quant_uses_rne_and_saturates():
+    values = torch.tensor(
+        [
+            -200.0,
+            -127.6,
+            -127.5,
+            -2.5,
+            -1.5,
+            -0.5,
+            0.5,
+            1.5,
+            2.5,
+            126.5,
+            127.5,
+            127.6,
+            200.0,
+        ],
+        dtype=torch.bfloat16,
+    ).repeat(2, 1)
+    scale = torch.ones(1, dtype=torch.float32)
+    expected = torch.round(values).clamp(-127, 127).to(torch.int8)
+
+    backends = {
+        "torch": get_torch_quant(aiter.QuantType.per_Tensor),
+        "triton": get_triton_quant(aiter.QuantType.per_Tensor),
+        "hip": get_hip_quant(aiter.QuantType.per_Tensor),
+    }
+    for name, quant in backends.items():
+        actual, _ = quant(values, scale=scale, quant_dtype=dtypes.i8)
+        assert torch.equal(actual, expected), (
+            f"{name} static INT8 quant must use round-to-nearest-even and "
+            "saturate to [-127, 127]"
+        )
+
+
 @benchmark()
 def test_quant(m, n, q_type, q_dtype, h_dtype):
     dim = (m, n)
@@ -117,6 +152,8 @@ parser.add_argument(
 
 args = parser.parse_args()
 list_quant = [d_quant[key] for key in args.quant]
+if any(q_dtype == dtypes.i8 for _, q_dtype in list_quant):
+    test_i8_static_quant_uses_rne_and_saturates()
 
 for (
     (q_type, q_dtype),
