@@ -452,6 +452,9 @@ def get_device_name():
             return "MI308"
         return "MI300"
     elif gfx == "gfx950":
+        # MI350P is a half-size gfx950: 4 XCDs against 8 on MI350X and MI355X.
+        if get_num_xcds() == 4:
+            return "MI350P"
         return "MI350"
     elif gfx == "gfx1250":
         return "MI400"
