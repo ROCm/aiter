@@ -2467,8 +2467,12 @@ def flydsl_moe_topids_to_rows(
 
     When ``g2l_lut`` is given, ``topk_ids`` are treated as GLOBAL expert ids and
     remapped to local buckets on-device (EP fusion): ``g2l_lut[global] -> local``
-    in [0, E), or the sentinel ``E`` for dropped routes. Dropped routes fold into
-    bucket 0. The kernel casts the f32 ``weight_in`` route weights into ``gather_w``
+    in [0, E), or the sentinel ``E`` for dropped routes. Dropped routes claim no
+    slot and get ``moe_route_maps.DROPPED_ROUTE_ROW`` as their row, so the returned
+    counts (== ``masked_m``) cover only the routes whose expert is local to this
+    rank -- everything downstream (psum, contiguous row count, the grouped GEMM's
+    M) shrinks with them, and every consumer of the row map must skip the sentinel.
+    The kernel casts the f32 ``weight_in`` route weights into ``gather_w``
     (``weight_dtype``, out) in the same pass -- kept -> cast, dropped -> 0 --
     folding the host ``topk_weight.to(bf16)`` copy + dropped-weight masked_fill.
 
@@ -2607,7 +2611,9 @@ def flydsl_moe_fused_route_quant_scatter(
 
     When ``g2l_lut`` is given (EP fusion), ``topk_ids`` are GLOBAL expert ids and
     the kernel remaps them to local buckets in [0, E) on-device (sentinel ``E``
-    for dropped routes, folded into bucket 0 with their ``gather_w`` entry zeroed).
+    for dropped routes). A dropped route claims no slot, is tagged with
+    ``moe_route_maps.DROPPED_ROUTE_ROW``, has its ``gather_w`` entry zeroed and is
+    not quantized/scattered, so ``masked_m`` counts local routes only.
 
     ``counter`` is the ``(E,)`` per-expert atomic slot counter; a pre-zeroed
     buffer (from the g2l-LUT kernel) skips the host ``torch.zeros(E)`` launch.
@@ -2708,6 +2714,8 @@ def flydsl_moe_fused_route_quant_scatter(
             source_topk=topk,
             ksplit=use_ksplit_s1,
         )
+        _null_i32 = torch.empty(0, dtype=torch.int32, device=device)
+        assert _null_i32.data_ptr() == 0, "expected a null data_ptr"
         launch_routeks(
             ptr_arg(hidden_flat),
             ptr_arg(grouped_a1.view(-1)),
@@ -2716,6 +2724,12 @@ def flydsl_moe_fused_route_quant_scatter(
             ptr_arg(counter),  # dummy row_starts; unused because remap_rows=False
             1,
             numel,
+            # Pre-existing omission, not fallout of the prequantized change: this
+            # branch never passed num_valid_routes. A 0-element tensor has a null
+            # data_ptr, which the kernel tests for before dereferencing.
+            ptr_arg(_null_i32),
+            # src_scale: read only by the prequantized build, which this is not.
+            ptr_arg(grouped_a1_scale.view(-1)),
             grid_blocks,
             stream=torch.cuda.current_stream(),
         )
@@ -2952,6 +2966,8 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
     source_topk: int = 0,
     remap_rows: bool = False,
     ksplit: bool = True,
+    prequantized: bool = False,
+    src_scale_bytes_per_row: int = 0,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_fused_quant_preshuffle_route_ksplit_module,
@@ -2964,6 +2980,8 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
         source_topk=source_topk,
         remap_rows=remap_rows,
         ksplit=ksplit,
+        prequantized=prequantized,
+        src_scale_bytes_per_row=src_scale_bytes_per_row,
     )
 
 
@@ -2981,9 +2999,12 @@ def flydsl_moe_fused_quant_preshuffle(
     route_max_m: int = 0,
     out_payload: torch.Tensor | None = None,  # (E, max_m, Pb) uint8
     out_scale: torch.Tensor | None = None,  # (E, max_m//wmma_rep, Ws*wmma_rep)
-    num_valid_routes: (
-        torch.Tensor | None
-    ) = None,  # (1,) int32; route-branch only: skip routes >= this (EP dead-tail)
+    # (1,) int32; route-branch only: skip routes >= this (EP dead-tail)
+    num_valid_routes: torch.Tensor | None = None,
+    # (tokens, Ws) uint8 e8m0. When given, grouped_in IS the MX payload for
+    # ``quant_mode``: the sender already quantized, so the kernel only scatters
+    # + preshuffles.
+    prequantized_scale: torch.Tensor | None = None,
 ):
     """Fused grouped quant + e8m0 scale-preshuffle in one kernel pass.
 
@@ -2994,11 +3015,44 @@ def flydsl_moe_fused_quant_preshuffle(
             f"flydsl_moe_fused_quant_preshuffle: quant_mode={quant_mode!r} "
             "unsupported (expected 'fp4' or 'fp8')."
         )
-    assert (
-        grouped_in.dtype == torch.bfloat16
-    ), f"fused grouped quant+preshuffle requires bf16 input (got {grouped_in.dtype})"
+    # A quantizing EP dispatch (fp8 or fp4) already put the payload and its e8m0
+    # row on the wire: nothing left to convert, only scatter + preshuffle.
+    prequantized = prequantized_scale is not None
+    if prequantized:
+        # torch dtypes, not aiter.dtypes: this module deliberately imports only
+        # torch and the tensor shim.
+        _packed = tuple(
+            d
+            for d in (
+                torch.float8_e4m3fn,
+                torch.float8_e4m3fnuz,
+                torch.uint8,
+                getattr(torch, "float4_e2m1fn_x2", None),
+            )
+            if d is not None
+        )
+        assert grouped_in.dtype in _packed, (
+            "prequantized payload must be packed MX bytes " f"(got {grouped_in.dtype})"
+        )
+        assert (
+            topids_to_rows is not None
+        ), "prequantized mode exists only on the route-indexed branch"
+        assert (
+            prequantized_scale.dtype == torch.uint8
+            and prequantized_scale.is_contiguous()
+        ), "prequantized scale must be a contiguous uint8 (tokens, Ws) tensor"
+    else:
+        assert grouped_in.dtype == torch.bfloat16, (
+            "fused grouped quant+preshuffle requires bf16 input "
+            f"(got {grouped_in.dtype})"
+        )
     device = grouped_in.device
+    # feat_dim is the FEATURE count, and a prequantized fp4 row carries two
+    # features per byte -- taking shape[-1] there would halve every derived
+    # geometry (Pb, Ws, the module name) without tripping a single assert.
     feat_dim = grouped_in.shape[-1]
+    if prequantized and quant_mode == "fp4":
+        feat_dim *= 2
     rows_per_tile = wmma_rep * 16
     assert (
         max_m % rows_per_tile == 0
@@ -3051,6 +3105,10 @@ def flydsl_moe_fused_quant_preshuffle(
             source_topk=source_topk,
             remap_rows=remap_rows,
             ksplit=use_ksplit,
+            prequantized=prequantized,
+            src_scale_bytes_per_row=(
+                int(prequantized_scale.shape[-1]) if prequantized else 0
+            ),
         )
         # Dead-tail skip (EP dynamic token count): routes >= num_valid_routes are
         # padding rows of the dispatch buffer and are not gathered/quantized. When
@@ -3071,6 +3129,11 @@ def flydsl_moe_fused_quant_preshuffle(
             route_max_m_arg,
             numel,
             ptr_arg(num_valid_routes_i32),
+            # Read only when prequantized; the quant path must still pass a valid
+            # pointer, so hand it the output scale, which the kernel never loads.
+            ptr_arg(
+                prequantized_scale.view(-1) if prequantized else out_scale.view(-1)
+            ),
             grid_blocks,
             stream=torch.cuda.current_stream(),
         )

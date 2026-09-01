@@ -261,8 +261,32 @@ def gen_mha_fwd_native_splitkv_fake_tensors(
     return o, lse
 
 
+# torch-free kernel entry: the C++ TU takes aiter_tensor_t views and writes into
+# caller-allocated buffers, so all outputs/scratch are allocated Python-side (see
+# mha_fwd_native_splitkv below) and passed in.
 @compile_ops(
     "module_mha_fwd_native_splitkv",
+    fc_name="mha_fwd_native_splitkv",
+    develop=True,
+)
+def _mha_fwd_native_splitkv(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    o: Tensor,
+    lse: Tensor,
+    scratch_o: Tensor,
+    scratch_lse: Tensor,
+    softmax_scale: float,
+    causal: bool,
+    return_lse: bool,
+    num_splits: int,
+) -> None: ...
+
+
+@torch_compile_guard(
+    mutates_args=["out"],
+    device="cuda",
     gen_fake=gen_mha_fwd_native_splitkv_fake_tensors,
 )
 def mha_fwd_native_splitkv(
@@ -274,7 +298,49 @@ def mha_fwd_native_splitkv(
     causal: bool,
     return_lse: bool,
     num_splits: int,
-) -> tuple[Tensor, Tensor]: ...
+) -> tuple[Tensor, Tensor]:
+    # @torch_compile_guard registers this as torch.ops.aiter.mha_fwd_native_splitkv
+    # (opaque under torch.compile via the gen_fake above) *and* rebinds this module
+    # name to the op dispatcher, so callers keep writing the plain Python name.
+    # This eager impl allocates every buffer (the de-torched kernel can no longer
+    # allocate) and calls the void kernel.
+    batch_size, seqlen_q, nhead_q, hdim = q.shape
+    G = int(num_splits)
+    o = (
+        out
+        if out is not None
+        else torch.empty(
+            (batch_size, seqlen_q, nhead_q, hdim), dtype=q.dtype, device=q.device
+        )
+    )
+    lse = (
+        torch.empty(
+            (batch_size, nhead_q, seqlen_q), dtype=torch.float32, device=q.device
+        )
+        if return_lse
+        else torch.empty((0,), dtype=torch.float32, device=q.device)
+    )
+    # split-major fp32 scratch: [G,B,Hq,Sq,D] partial-O + [G,B,Hq,Sq] partial-LSE.
+    scratch_o = torch.empty(
+        (G, batch_size, nhead_q, seqlen_q, hdim), dtype=torch.float32, device=q.device
+    )
+    scratch_lse = torch.empty(
+        (G, batch_size, nhead_q, seqlen_q), dtype=torch.float32, device=q.device
+    )
+    _mha_fwd_native_splitkv(
+        q,
+        k,
+        v,
+        o,
+        lse,
+        scratch_o,
+        scratch_lse,
+        softmax_scale,
+        causal,
+        return_lse,
+        num_splits,
+    )
+    return o, lse
 
 
 def gen_fmha_v3_fwd_fake_tensors(
@@ -334,6 +400,7 @@ def gen_fmha_fwd_bf16_opus_fwd_fake(
     out: Tensor,
     causal: bool,
     softmax_scale: float,
+    lse: Tensor | None = None,
     seqstart_q: Tensor | None = None,
     seqstart_k: Tensor | None = None,
     seqstart_q_pad: Tensor | None = None,
@@ -347,12 +414,11 @@ def gen_fmha_fwd_bf16_opus_fwd_fake(
 # OPUS gfx950 bf16 forward (shared entry point): low-level @compile_ops stub bound to
 # the pybind symbol via fc_name. Dispatches by head dim in C++ to the symmetric D=128
 # kernel (batch only) or the asymmetric D_QK=192/D_V=128 kernel (batch + group/varlen).
-# Writes `out` in place, returns None.
+# Writes `out` (and `lse`, when given) in place, returns None.
 @compile_ops(
     "module_fmha_fwd_bf16_opus",
     fc_name="fmha_fwd_bf16_opus_fwd",
     gen_fake=gen_fmha_fwd_bf16_opus_fwd_fake,
-    develop=True,
 )
 def _fmha_fwd_bf16_opus_fwd(
     q: Tensor,
@@ -361,6 +427,7 @@ def _fmha_fwd_bf16_opus_fwd(
     out: Tensor,
     causal: bool,
     softmax_scale: float,
+    lse: Tensor | None = None,
     seqstart_q: Tensor | None = None,
     seqstart_k: Tensor | None = None,
     seqstart_q_pad: Tensor | None = None,
@@ -377,26 +444,38 @@ def fmha_fwd_bf16_opus_fwd(
     softmax_scale: float,
     causal: bool,
     out: Tensor | None = None,
-) -> Tensor:
+    return_lse: bool = False,
+    lse: Tensor | None = None,
+) -> Tensor | tuple[Tensor, Tensor]:
     """Public wrapper for the OPUS gfx950 bf16 dense (batch) forward (D=128 and
     D_QK=192/D_V=128). q/k/v are dense bshd [B, S, H, D]; allocates `out`
     ([B, S, H_q, D_v]) if needed and forwards. The kernel applies `softmax_scale`
-    to Q·K^T internally, handles GQA fan-out, and produces no LSE.
+    to Q·K^T internally and handles GQA fan-out.
+
+    `lse` is an output buffer for the log-sum-exp of the scaled scores ([B, H_q, S]
+    float32, natural log; rows that see no keys get -inf), filled when supplied and
+    allocated here when `return_lse` is set. Like `out` it does not change the return
+    type on its own: only `return_lse` does, and then the return is `(out, lse)`.
 
     Varlen / packed inputs go through `fmha_fwd_bf16_opus_varlen_fwd` instead.
     """
     v_head_dim = v.size(-1)
+    batch, q_seq_len, q_head_num = q.size(0), q.size(1), q.size(2)
 
     if out is None:
-        batch, q_seq_len, q_head_num = q.size(0), q.size(1), q.size(2)
         out = torch.empty(
             (batch, q_seq_len, q_head_num, v_head_dim),
             dtype=q.dtype,
             device=q.device,
         )
 
-    _fmha_fwd_bf16_opus_fwd(q, k, v, out, bool(causal), float(softmax_scale))
-    return out
+    if return_lse and lse is None:
+        lse = torch.empty(
+            (batch, q_head_num, q_seq_len), dtype=torch.float32, device=q.device
+        )
+
+    _fmha_fwd_bf16_opus_fwd(q, k, v, out, bool(causal), float(softmax_scale), lse=lse)
+    return (out, lse) if return_lse else out
 
 
 def fmha_fwd_bf16_opus_varlen_fwd(
@@ -412,11 +491,19 @@ def fmha_fwd_bf16_opus_varlen_fwd(
     out: Tensor | None = None,
     seqstart_q_pad: Tensor | None = None,
     seqstart_k_pad: Tensor | None = None,
-) -> Tensor:
+    return_lse: bool = False,
+    lse: Tensor | None = None,
+) -> Tensor | tuple[Tensor, Tensor]:
     """Public wrapper for the OPUS gfx950 bf16 group/varlen forward (D_QK=192/D_V=128
     only). q/k/v are packed [total, H, D]; allocates `out` ([total_q, H_q, D_v]) if
-    needed and forwards. The kernel applies `softmax_scale` to Q·K^T internally,
-    handles GQA fan-out, and produces no LSE.
+    needed and forwards. The kernel applies `softmax_scale` to Q·K^T internally and
+    handles GQA fan-out.
+
+    `lse` is an output buffer for the log-sum-exp of the scaled scores ([H_q, total_q]
+    float32, natural log), filled when supplied and allocated here when `return_lse` is
+    set. Like `out` it does not change the return type on its own: only `return_lse`
+    does, and then the return is `(out, lse)`. Rows that see no keys get -inf; rows in
+    the padding gaps of a KV-padded layout are left untouched.
 
     seqstart_q / seqstart_k          : cumulative REAL sequence lengths (int32, len
                                        num_groups+1; drive masks / tile counts).
@@ -425,12 +512,15 @@ def fmha_fwd_bf16_opus_varlen_fwd(
     max_seqlen_q / max_seqlen_k      : upper bounds driving the grid.
     """
     v_head_dim = v.size(-1)
+    total_q, q_head_num = q.size(0), q.size(1)
 
     if out is None:
-        total_q, q_head_num = q.size(0), q.size(1)
         out = torch.empty(
             (total_q, q_head_num, v_head_dim), dtype=q.dtype, device=q.device
         )
+
+    if return_lse and lse is None:
+        lse = torch.empty((q_head_num, total_q), dtype=torch.float32, device=q.device)
 
     seqstart_q = seqstart_q.to(torch.int32).contiguous()
     seqstart_k = seqstart_k.to(torch.int32).contiguous()
@@ -446,6 +536,7 @@ def fmha_fwd_bf16_opus_varlen_fwd(
         out,
         bool(causal),
         float(softmax_scale),
+        lse,
         seqstart_q,
         seqstart_k,
         seqstart_q_pad if seqstart_q_pad is not None else seqstart_q,
@@ -453,7 +544,7 @@ def fmha_fwd_bf16_opus_varlen_fwd(
         int(max_seqlen_q),
         int(max_seqlen_k),
     )
-    return out
+    return (out, lse) if return_lse else out
 
 
 # ---------------------------------------------------------------------------
@@ -1433,11 +1524,11 @@ def cmdGenFunc_mha_batch_prefill(
     # Per-page descale for KV_BLOCKSCALE mode (Q per-tensor, K/V per-page)
     # Mutually exclusive with k_descale/v_descale
     kv_block_descale: Tensor | None = None,  # [num_block, num_kv_head, 2]
-    sink_ptr: Tensor | None = None,
-    gen: Generator | None = None,
     kv_last_page_lens: Tensor | None = None,
     block_table: Tensor | None = None,
     seqlen_k: Tensor | None = None,
+    sink_ptr: Tensor | None = None,
+    gen: Generator | None = None,
 ):
     # causal=true is the same as causal=false in this case
     causal = is_causal
@@ -1504,7 +1595,7 @@ def cmdGenFunc_mha_batch_prefill(
         filter_fwd += "_pertensor*"
     # Sink only applies when there is a causal/window mask; full attention
     # (window_size_left==-1 and window_size_right==-1) ignores sink_size.
-    has_effective_sink = sink_size > 0 and (
+    has_effective_sink = (sink_size > 0 or sink_ptr is not None) and (
         causal or not (window_size_left == -1 and window_size_right == -1)
     )
     if has_effective_sink:
@@ -1948,7 +2039,8 @@ def _flash_attn_forward(
             return False
         # KV byte extent >= 2^32 wraps the kernel's 32-bit async-load soffset; fall back to
         # v3/CK. Actual seqlen stride (layout-aware, matches the C++ guard).
-        return not seqlen_k * k.stride(1) * k.element_size() >= 1 << 32
+        kv_stride = max(k.stride(1), v.stride(1))
+        return not seqlen_k * kv_stride * k.element_size() >= 1 << 32
 
     def _can_impl_fmha_fwd_hd192_v128_bf16_opus():
         # OPUS gfx950 dense D_QK=192 / D_V=128 bf16 forward. Enabled by DEFAULT (no env)
@@ -1959,10 +2051,11 @@ def _flash_attn_forward(
         return hdim_q == 192 and hdim_v == 128
 
     def can_impl_fmha_fwd_bf16_opus():
-        # Shared eligibility for the OPUS gfx950 bf16 forward kernels (inference-only:
-        # no LSE/dropout mask, so it must never capture return_lse / the autograd path).
-        # Cheapest / most-selective gates first so the per-head-dim helpers (which read
-        # env vars) are only evaluated once the common conditions already hold.
+        # Shared eligibility for the OPUS gfx950 bf16 forward kernels. LSE is supported
+        # ([B, H_q, S] fp32, natural log), so return_lse no longer disqualifies the path;
+        # the dropout mask (return_softmax) still does. Cheapest / most-selective gates
+        # first so the per-head-dim helpers (which read env vars) are only evaluated once
+        # the common conditions already hold.
         ret = get_gfx() == "gfx950"
         ret = ret and (q.dtype == dtypes.bf16)
         ret = ret and (nhead_q % nhead_k == 0)
@@ -1972,7 +2065,7 @@ def _flash_attn_forward(
         ret = ret and (window_size_left == -1 and window_size_right == -1)
         ret = ret and (sink_size == 0 and sink_ptr is None)
         ret = ret and (q_descale is None and k_descale is None and v_descale is None)
-        ret = ret and (not return_lse) and (not return_softmax)
+        ret = ret and (not return_softmax)
         ret = ret and (
             _can_impl_fmha_fwd_hd128_bf16_opus()
             or _can_impl_fmha_fwd_hd192_v128_bf16_opus()
@@ -2060,8 +2153,13 @@ def _flash_attn_forward(
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
     elif can_impl_fmha_fwd_bf16_opus():
         # OPUS gfx950 dense forward (shared entry point; dispatches D=128 vs
-        # D_QK=192/D_V=128 in C++ by head dim). Inference-only: the lse/S_dmask/rng
-        # slots are unused placeholders (gate guarantees not return_lse/return_softmax).
+        # D_QK=192/D_V=128 in C++ by head dim). The S_dmask/rng slots stay unused
+        # placeholders (the gate guarantees no dropout mask).
+        softmax_lse = torch.empty(
+            (batch_size, nhead_q, seqlen_q) if return_lse else (0,),
+            dtype=torch.float32,
+            device=q.device,
+        )
         out_ = fmha_fwd_bf16_opus_fwd(
             q,
             k,
@@ -2069,8 +2167,8 @@ def _flash_attn_forward(
             softmax_scale=float(softmax_scale),
             causal=bool(causal),
             out=out,
+            lse=softmax_lse if return_lse else None,
         )
-        softmax_lse = torch.empty((0,), dtype=torch.float32, device=q.device)
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
     elif can_impl_fmha_v3_fwd() and seqlen_q > 128:  # Prefer CK for decode cases
@@ -2894,9 +2992,9 @@ def _flash_attn_varlen_forward(
 
     def can_impl_fmha_fwd_hd192_v128_bf16_opus_varlen():
         # OPUS gfx950 group/varlen D_QK=192 / D_V=128 bf16 forward. Enabled by DEFAULT
-        # (no env). Packed THD q/k/v; supports KV padding (cu_seqlens_*_padded) and
-        # cross-attention (causal bottom-right aligned). Inference-only: no LSE / dropout
-        # / bias / alibi / swa / sink / quant / paged.
+        # (no env). Packed THD q/k/v; supports KV padding (cu_seqlens_*_padded),
+        # cross-attention (causal bottom-right aligned) and LSE ([H_q, total_q] fp32,
+        # natural log). No dropout / bias / alibi / swa / sink / quant / paged.
         # AITER_DISABLE_FMHA_OPUS=1 force-disables it (fall back to v3/CK; for A/B).
         if int(os.environ.get("AITER_DISABLE_FMHA_OPUS", "0")) != 0:
             return False
@@ -2911,7 +3009,8 @@ def _flash_attn_varlen_forward(
         ret = ret and (sink_size == 0 and sink_ptr is None)
         ret = ret and (q_descale is None and k_descale is None and v_descale is None)
         ret = ret and (block_table is None)
-        ret = ret and (not return_lse) and (not return_softmax)
+        ret = ret and (not return_softmax)
+        ret = ret and (max_seqlen_q > 0 and max_seqlen_k > 0)
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -2920,6 +3019,11 @@ def _flash_attn_varlen_forward(
         # OPUS gfx950 group/varlen D=192 path. cu_seqlens_* are the REAL cumulative
         # lengths (masks / tile counts); cu_seqlens_*_padded are the PHYSICAL row
         # offsets (KV padding). When no padded arrays are given, physical == real.
+        softmax_lse = torch.empty(
+            (nhead_q, q.size(0)) if return_lse else (0,),
+            dtype=torch.float32,
+            device=q.device,
+        )
         out = fmha_fwd_bf16_opus_varlen_fwd(
             q,
             k,
@@ -2933,8 +3037,8 @@ def _flash_attn_varlen_forward(
             seqstart_k_pad=cu_seqlens_k_padded,
             max_seqlen_q=int(max_seqlen_q),
             max_seqlen_k=int(max_seqlen_k),
+            lse=softmax_lse if return_lse else None,
         )
-        softmax_lse = torch.empty((0,), dtype=torch.float32, device=q.device)
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
     elif can_impl_fmha_fwd_with_sink_varlen_asm():

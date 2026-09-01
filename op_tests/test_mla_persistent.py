@@ -649,6 +649,13 @@ def torch_mla_extend_split_kv(
             and max_seqlen_q == 1
         )
         or (get_gfx() == "gfx950" and not is_fp8_q and not is_fp8_kvc)
+        or (
+            get_gfx() == "gfx950"
+            and nheads == 96
+            and is_fp8_q
+            and is_fp8_kvc
+            and max_seqlen_q <= 6
+        )
     ):
         # Natively support cases
         pass
@@ -714,9 +721,21 @@ def torch_mla_extend_split_kv(
         # For a split chunk, we need to account for the position offsets of Q and KV within the batch
         causal_diagonal = None
         if is_causal:
-            q_local_start = qo_start - qo_indptr[batch_idx].item()
+            if q_ratio > 1:
+                # Folded head layout: qo_start/qo_end index the folded token
+                # space, where every (batch, head-group) pair is its own batch of
+                # max_seqlen_q tokens starting at row[0] * max_seqlen_q. qo_indptr
+                # only describes the unfolded batches, so measuring the query
+                # offset against it shifts the diagonal by head_group *
+                # max_seqlen_q for every group past the first.
+                q_local_start = qo_start - row[0].item() * max_seqlen_q
+                total_q_len = max_seqlen_q
+            else:
+                q_local_start = qo_start - qo_indptr[batch_idx].item()
+                total_q_len = (
+                    qo_indptr[batch_idx + 1].item() - qo_indptr[batch_idx].item()
+                )
             kv_local_start = (kv_start - kv_indptr[batch_idx].item()) * page_size
-            total_q_len = qo_indptr[batch_idx + 1].item() - qo_indptr[batch_idx].item()
             causal_diagonal = (
                 q_local_start - kv_local_start + cur_real_kv_seq_len - total_q_len
             )
