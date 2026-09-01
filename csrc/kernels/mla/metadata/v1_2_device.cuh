@@ -904,6 +904,8 @@ void get_mla_metadata_v1_2_device(const aiter_tensor_t& seqlens_qo_indptr, // [b
         ((arch_id == "gfx942") && (num_heads == 128) && q_is_fp8 && kv_is_fp8) ||
         ((arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 &&
          ((num_heads == 32) || (num_heads == 64) || (num_heads == 128))) ||
+        ((arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 && (num_heads == 96) &&
+         (max_seqlen_qo <= 6)) ||
         hk_mtp_experimental;
 
     if(!natively_supported && (num_heads % 16 == 0))
