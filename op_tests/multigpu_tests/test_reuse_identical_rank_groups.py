@@ -147,10 +147,15 @@ def _assert_reuse_invariants(groups):
     """Hold in every topology, independent of the specific rank layout."""
     for name, g in groups.items():
         if g.reuse_from is not None:
-            # A reusing group shares its source's exact rank set...
-            assert _rankset(g) == _rankset(
-                g.reuse_from
-            ), f"{name} reuses a source with a different rank set"
+            # A reusing group inherits its source's ranks/rank_in_group verbatim,
+            # so reuse is only correct when the *ordered* rank list is identical --
+            # not merely the same set. Dedup keys on tuple(my_ranks) for exactly
+            # this reason; asserting ordered equality (not set equality) locks that
+            # in: if keying ever reverts to sorted() and a non-ascending group
+            # appears, a same-set/different-order collapse would trip this.
+            assert (
+                g.ranks == g.reuse_from.ranks
+            ), f"{name} reuses a source with a different rank order"
             # ...and single-member groups never reuse (they hold no communicator).
             assert g.world_size > 1, f"{name} is single-rank yet reuses"
         # EP always keeps an ep-named unique_name, reuse or not.

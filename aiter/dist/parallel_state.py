@@ -1936,7 +1936,13 @@ def initialize_model_parallel(
     def _build_group(group_name, group_ranks, use_message_queue_broadcaster=False):
         group_ranks = [x.tolist() for x in group_ranks]
         my_ranks = next((r for r in group_ranks if rank in r), None)
-        key = tuple(sorted(my_ranks)) if my_ranks is not None else None
+        # Key on the ordered rank tuple, not the sorted set: a reusing group
+        # inherits the source's ranks/rank_in_group verbatim, so reuse is only
+        # correct when the rank *order* is identical. Two groups sharing the
+        # same rank set but a different order (e.g. a future non-ascending
+        # slice) must NOT collapse -- that would corrupt order-dependent ops
+        # (all_gather layout, reduce_scatter, send/recv neighbors).
+        key = tuple(my_ranks) if my_ranks is not None else None
         dedup = (
             reuse_identical_rank_groups
             and need_std_comm
