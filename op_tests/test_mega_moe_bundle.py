@@ -8,6 +8,7 @@ import pytest
 os.environ.setdefault("AITER_AOT_IMPORT", "1")
 
 from aiter.aot.flydsl.mega_moe import default_jobs
+from aiter.ops.flydsl.kernels import tensor_shim
 from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
     TOKEN_BUCKETS,
     Stage2BundleKey,
@@ -15,6 +16,44 @@ from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
     build_mega_moe_bundle_plan,
     select_mega_moe_config,
 )
+
+
+def test_preload_compiled_prefers_native_no_dispatch_api(monkeypatch):
+    events = []
+
+    class FakeLaunch:
+        def preload(self, *args):
+            events.append(("preload", args))
+            return "native-artifact"
+
+    monkeypatch.setattr(
+        tensor_shim.flyc,
+        "compile",
+        lambda *_args: pytest.fail("native preload must not call flyc.compile"),
+    )
+
+    assert tensor_shim._preload_compiled(FakeLaunch(), 1, 2) == "native-artifact"
+    assert events == [("preload", (1, 2))]
+
+
+@pytest.mark.parametrize("old_value", [None, "0"])
+def test_preload_compiled_legacy_fallback_never_dispatches(monkeypatch, old_value):
+    launch = object()
+    if old_value is None:
+        monkeypatch.delenv("COMPILE_ONLY", raising=False)
+    else:
+        monkeypatch.setenv("COMPILE_ONLY", old_value)
+
+    def compile_only(exe, *args):
+        assert exe is launch
+        assert args == (3, 4)
+        assert os.environ["COMPILE_ONLY"] == "1"
+        return "legacy-artifact"
+
+    monkeypatch.setattr(tensor_shim.flyc, "compile", compile_only)
+
+    assert tensor_shim._preload_compiled(launch, 3, 4) == "legacy-artifact"
+    assert os.environ.get("COMPILE_ONLY") == old_value
 
 
 def test_mtpr8192_bundle_deduplicates_expected_variants():

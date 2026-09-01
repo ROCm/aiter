@@ -22,6 +22,7 @@ from .flydsl_dispatch_combine_intranode_kernel import (
     make_combine_jit,
     make_dispatch_jit,
 )
+from .tensor_shim import _preload_compiled
 
 # Reject unsupported token dtypes at construction, not deep in JIT codegen.
 _SUPPORTED_TOK_DTYPES = (
@@ -1546,7 +1547,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
             self._fx_p2p_comb_inp_wts,
         )
         std = (self._fx_disp_tok_map, self._fx_disp_out_wts)
-        compiled = flyc.compile(
+        compiled = _preload_compiled(
             fn,
             fx.Int64(input.data_ptr()),
             *fixed,

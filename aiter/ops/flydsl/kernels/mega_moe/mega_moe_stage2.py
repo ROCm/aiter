@@ -17,7 +17,7 @@ from ..mxfp4_gemm_common import (
     lds_typed_ptr,
     lds_vec_load,
 )
-from ..tensor_shim import _run_compiled
+from ..tensor_shim import _preload_compiled, _run_compiled
 
 from .gemm2 import (
     _resolve_g2_knobs,
@@ -774,7 +774,7 @@ def preload_mega_moe_stage2(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, ar
     )
     max_m_blocks = (row_capacity + BM - 1) // BM
     grid_blocks = launch_cu_num if persist else max_m_blocks
-    return flyc.compile(
+    return _preload_compiled(
         launch,
         arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cumsum,
         arg_max_expert_tiles, arg_stids, arg_sweights, arg_trb, arg_expert_tile_end,

@@ -12,7 +12,7 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 
 from .. import communication_ops_utils as comm_ops
-from ..tensor_shim import _run_compiled
+from ..tensor_shim import _preload_compiled, _run_compiled
 from .dispatch import (
     DispatchSlot,
     emit_direct_fixed_slot_finalize,
@@ -994,7 +994,7 @@ def preload_mega_moe_stage1_bundle(
 ):
     """Compile and load the complete Stage1 bundle without dispatching it."""
     launch = compile_mega_moe_stage1_bundle(**compile_kw)
-    return flyc.compile(
+    return _preload_compiled(
         launch,
         out,
         x,

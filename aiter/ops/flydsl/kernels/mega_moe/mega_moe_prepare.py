@@ -13,7 +13,7 @@ from flydsl.runtime.device import get_rocm_arch
 
 from .. import buffer_ops
 from .. import communication_ops_utils as comm_ops
-from ..tensor_shim import _run_compiled
+from ..tensor_shim import _preload_compiled, _run_compiled
 from .dispatch import DispatchSlot, emit_dispatch_group, emit_dispatch_plan
 from .gemm_util import _buffer_load, _buffer_store, _make_buffer_from_addr
 from .quant import emit_per_1x32_mx_fp8_group
@@ -329,7 +329,7 @@ def preload_mega_moe_prepare(
 ):
     """Compile and load one prepare variant without dispatching it."""
     launch = compile_mega_moe_prepare(**kwargs)
-    return flyc.compile(
+    return _preload_compiled(
         launch,
         addr_disp,
         i32_cur_tok,

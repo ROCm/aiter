@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
+import threading
 from abc import ABC, abstractmethod
 from itertools import product
 
@@ -34,6 +35,8 @@ AITER_FLYDSL_KERNARG_PRELOAD_COUNT = int(
 AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE = bool(
     int(os.environ.get("AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE", "0"))
 )
+
+_PRELOAD_COMPILE_LOCK = threading.RLock()
 
 
 def ptr_rsrc(ptr):
@@ -124,6 +127,31 @@ def _run_compiled(exe, *args):
         except Exception:  # noqa: BLE001, S110
             pass
         raise
+
+
+def _preload_compiled(exe, *args):
+    """Materialize a JIT artifact without dispatching its GPU kernels.
+
+    Newer FlyDSL versions expose ``JitFunction.preload()`` for this operation.
+    Older supported versions provide the same no-dispatch behavior through the
+    public ``COMPILE_ONLY`` mode.  Calling ``flyc.compile()`` without either
+    guard executes the launcher and is unsafe for preload callers that pass
+    placeholder pointers.
+    """
+    preload = getattr(exe, "preload", None)
+    if callable(preload):
+        return preload(*args)
+
+    with _PRELOAD_COMPILE_LOCK:
+        old_compile_only = os.environ.get("COMPILE_ONLY")
+        os.environ["COMPILE_ONLY"] = "1"
+        try:
+            return flyc.compile(exe, *args)
+        finally:
+            if old_compile_only is None:
+                os.environ.pop("COMPILE_ONLY", None)
+            else:
+                os.environ["COMPILE_ONLY"] = old_compile_only
 
 
 def _to_raw(v):

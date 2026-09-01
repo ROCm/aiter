@@ -21,7 +21,7 @@ from aiter.ops.flydsl.kernels import buffer_ops
 
 from ..mxfp4_gemm_common import _fabs_f32 as fabs_f32
 from ..mxfp4_gemm_common import lds_typed_ptr, lds_vec_load
-from ..tensor_shim import _run_compiled
+from ..tensor_shim import _preload_compiled, _run_compiled
 from .gemm2 import (
     _resolve_g2_knobs,
     gemm2_compute_v2,
@@ -1163,7 +1163,7 @@ def preload_mega_moe_stage2_aligned_pair(arg_aq, arg_ascale, arg_bq, arg_bscale,
         _PAIR_LAUNCH_CACHE[key] = launch
     bm = int(compile_kw.get("BM", 64))
     max_m_blocks = (int(row_capacity) + bm - 1) // bm
-    return flyc.compile(
+    return _preload_compiled(
         launch,
         arg_aq,
         arg_ascale,
