@@ -354,12 +354,11 @@ if [ -z "$VALIDATION_REPORT" ] \
   AUTO_TARGET=$(python3 -c \
     'import json,sys; print(json.load(open(sys.argv[1]))["target"])' \
     "$WORK/validation_requirement.json")
-  # The validator is invoked directly, not through bin/validate-kernel-pr. That wrapper's only
-  # addition is a PR-number front end that re-fetches the diff and re-resolves the base tip,
-  # and this step already holds both. Deriving them a second time reopens the window the gate
-  # below closes: main can advance between the two `gh api` calls, and the report would then
-  # name a base this same review rejects as stale. Reusing what is already fetched also keeps
-  # the dependency inside .claude/skills, alongside the scanner and the schema above.
+  # The validator is invoked directly, with the base and head this step already holds. A
+  # PR-number front end that re-fetched the diff and re-resolved the base tip would reopen the
+  # window the gate below closes: main can advance between the two `gh api` calls, and the report
+  # would then name a base this same review rejects as stale. Calling it in place also keeps the
+  # dependency inside .claude/skills, alongside the scanner and the schema above.
   VALIDATOR="$SKILLS_ROOT/validate-kernel-pr/validate_pr.sh"
   if [ ! -x "$VALIDATOR" ]; then
     echo "required validator is missing or not executable: $VALIDATOR" >&2

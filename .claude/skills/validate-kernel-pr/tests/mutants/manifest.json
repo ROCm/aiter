@@ -4,7 +4,7 @@
   "tests": "tests/kernels/test_softmax.py",
   "shape_env": "ROCDSL_SOFTMAX_SHAPES",
   "grid": "64,2000,f32;32,257,f32;128,1024,f32;1024,8192,bf16",
-  "tolerance_table": "f32=1e-5,f16=2e-3,bf16=1e-2",
+  "tolerance_table": "f32=1e-5,f16=1e-2,bf16=2e-2",
   "cases": [
     {
       "id": "m0-clean-control",

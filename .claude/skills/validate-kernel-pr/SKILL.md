@@ -6,8 +6,9 @@ argument-hint: --repo <worktree> --target <script file or pytest target>
 
 # validate-kernel-pr
 
-`review-pr` never builds and never runs. It is a static reviewer, and a good one — but three
-failure modes are invisible to it, and this skill exists for exactly those three:
+`review-pr` reads the diff; it does not build and it does not run. It is a static reviewer, and a
+good one — but three failure modes are invisible to it, and this skill exists for exactly those
+three:
 
 1. **The PR's own tests pass while the kernel is wrong.** A suite whose non-aligned shapes are
    commented out reports green on an out-of-bounds tail store.
@@ -19,6 +20,12 @@ failure modes are invisible to it, and this skill exists for exactly those three
 Output is `validation_report.json`: deterministic execution evidence kept separate from
 `review-pr`'s advisory judgement. A review may consume it only when `repo.head` matches the exact
 PR head; a review written without one must mark validation `NOT RUN`.
+
+The two skills stay split at judgement, not at invocation. `review-pr` triages whether a PR has
+runtime surface at all and, when it does and the PR ships a single target, runs this script itself
+rather than asking a human to. Everything below is still produced here and merely consumed there:
+the executor never writes an advisory verdict, and `review-pr` never manufactures evidence it did
+not get from a report.
 
 ---
 
@@ -70,12 +77,18 @@ For a local candidate with no remote head, omit `--head-sha`. The report then re
 | `--shape-vars` | comma-separated local names captured from each route call, in grid order |
 | `--shape-env` `--grid` | env var and shape list for the S1-owned grid |
 | `--shape-arg` | the target's own CLI flag that accepts shapes, for script targets that read no env var |
-| `--tol-table` | reference tolerances, e.g. `f32=1e-5,f16=2e-3,bf16=1e-2` |
+| `--tol-table` | reference tolerances recorded alongside the head-vs-base comparison (see [`test_policy`](#4--test_policy--run-before-the-suite)) |
+| `--perf-args` | benchmark entry point for the timing stage; also forces perf on when detection would decline |
+| `--no-perf` | skip the timing stage entirely |
 | `--label` `--out` | run name and report path (default `./validation_report.json`) |
 
 Environment knobs: `PYLIB` (runtime modules outside the checkout), `PYTHON_BIN` (one interpreter
 used for pytest and script targets), `PICKER` (override the shipped `pick-idle-gpu.py`), and
-`TIMEOUT` (per-target budget, default 1800s). The executor
+`TIMEOUT` (per-target budget, default 1800s). The timing stage adds `PERF_TIMEOUT` (its own budget,
+defaulting to `TIMEOUT`, because a bench sweep is legitimately longer than a correctness run),
+`PERF_REPEAT` (runs per side, default 3), `PERF_THRESHOLD` (head/base ratio that counts as a
+regression, default 0.95) and `PERF_MIN_ROWS` (matched rows required before any ratio is reported,
+default 3). The executor
 overrides `AITER_JIT_DIR` with separate fresh base/head directories and sets
 `PYTHONDONTWRITEBYTECODE=1`, so repository JIT output cannot cross phases or dirty the worktree.
 
@@ -263,12 +276,47 @@ Runs `scan_index_width.py` over the diff and records the count of index×stride 
 carry no 64-bit widening. Candidates, not verdicts — the reviewer judges each. See
 [Why this stage exists](#why-the-index-width-scan-is-a-separate-stage).
 
-### 8 — verdict
+### 8 — `perf`
+
+The cost of a kernel change, measured rather than assumed. Base and head are timed on the same
+locked GPU, back to back, in the same worktree — the baseline is this PR's own base with the patch
+reversed, not whatever machine the PR's table was produced on. A head-only number reproduces the
+PR's own comparison and cannot show a regression.
+
+On by default, because the regression this stage exists to catch is the one nobody suspected and an
+opt-in flag is only ever set by someone who already suspects. The entry point is detected from the
+target (`--scenario bench`, or a `perftest`/`@benchmark` harness); `--perf-args` names it explicitly
+and `--no-perf` turns the stage off.
+
+Each side runs `PERF_REPEAT` times and each cell is reduced to its **best** sample, which is what
+makes a threshold as tight as 0.95 usable. Minimum is the correct estimator because contention,
+clock ramp and scheduling only ever add time. `repeats` is recorded in the report, because the
+threshold is only defensible if a reader can see N.
+
+The stage is `skip` — never `fail` — on every path that is not "both sides ran clean and the
+numbers disagree": no harness, a timeout, a nonzero exit on either side (a truncated log compares
+whatever printed before the crash), or fewer than `PERF_MIN_ROWS` matched rows. A false regression
+blocks a good PR and would get the stage switched off within a week.
+
+A measured regression appends a `should-fix` finding, which makes the verdict `NEEDS_WORK` and the
+exit code 1, and it ships its own reproducer: both logs, both exit codes, and the command. `perf`
+is deliberately **not** a required stage — a run that could not be timed downgrades nothing, and a
+`PASS` stays a `PASS`.
+
+Because a bench harness routinely writes results next to the code (aiter targets drop a
+`tuned_op_bench.csv` in the repo root), the timing run snapshots and restores the worktree, touching
+only paths whose git status changed across it. Without that, the baseline cleanliness check would
+fail and skip the entire head correctness phase — a perf stage that silently disables correctness
+validation is far worse than no perf stage.
+
+### 9 — verdict
 
 `BLOCK` if a reproducible candidate defect fired, `NEEDS_WORK` if a deterministic policy concern
 fired, `INCONCLUSIVE` if any required stage did not complete, else `PASS`. `PASS` therefore means
 the merge simulation, GPU claim, repo-aware runtime probe, policy comparison, baseline control,
-both correctness targets, execution receipt, and index scan all ran.
+both correctness targets, execution receipt, and index scan all ran. It does **not** mean a timing
+comparison was made: read `stages.perf` for that, and read a `skip` there as "not measured", not as
+"no regression".
 
 Process exit codes match the verdict: `PASS=0`, `BLOCK/NEEDS_WORK=1`, and `INCONCLUSIVE=2`.
 
@@ -292,8 +340,11 @@ These are fields, not prose, so a report cannot overclaim by omission:
   verdict applies only to those named inputs.
 - **`runtime_identity`** — resolved package, interpreter, source SHA, and native artifact hashes.
 - **`execution_receipt`** — observed route, kernel symbols, and exact shapes emitted by the test.
-- **Every perf number keeps its provenance.** A number in the PR description that does not
-  reproduce is tagged `[unreproducible]`; it is not quietly dropped.
+- **Every perf number keeps its provenance.** `stages.perf` carries the baseline it was measured
+  against, the command, the harness it was detected from, the repeat count and reduction, the
+  threshold, the matched-row count, and both logs. A ratio without those is not reportable, and a
+  stage that could not measure says `skip` with a reason rather than reporting an empty comparison
+  as agreement.
 
 ---
 
@@ -336,10 +387,11 @@ a seeded defect, and these have not been:
   without changing the PR diff hash or live-base identity. Such runs remain `INCONCLUSIVE`.
 - **Cross-architecture compilation.** `arch_coverage: compile-only` is reserved for a future
   stage that actually invokes an architecture-specific compiler. No-GPU mode does not claim it.
-- **`perf` and `claims` stages.** The schema reserves both — median-of-N against a baseline on the
-  same locked GPU, and reproducing the numbers in the PR description — and the script emits
-  neither. A report today carries no performance evidence, and a review must not read the absence
-  of a `perf` stage as "no regression".
+- **Reproducing the PR's stated numbers.** The `perf` stage measures base against head on this
+  box; it does not attempt to reproduce the specific figures a PR description claims, so a number
+  in the description that nobody can reproduce is not flagged as such. That check was previously
+  reserved in the schema as a `claims` stage, which has been removed rather than left standing as
+  a contract nothing satisfies.
 - **Adversarial route attestation.** The validator-owned profiler prevents accidental and
   worktree-shadowed receipts, but arbitrary Python running in the same process can still spoof a
   matching frame. A hostile-code gate needs an out-of-process HIP/rocprof trace.
