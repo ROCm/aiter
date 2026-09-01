@@ -8,7 +8,8 @@ from collections import namedtuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops, vector
+from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops
+from flydsl._mlir.dialects import vector
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
 
