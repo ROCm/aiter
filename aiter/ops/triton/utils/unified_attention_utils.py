@@ -22,7 +22,7 @@ only the axes that matter, joined by '.':
 
 Lookup walks the axes in the order "schema" lists them and takes the first key
 that exists: LEQ bounds ascending, then GEQ descending, then "any". So the
-leftmost axis wins -- D before Q is what makes head_size outrank max_seqlen_q.
+leftmost axis wins: D before Q is what makes head_size outrank max_seqlen_q.
 Dtypes fall back too: DT_fp8_fp8, then DT_fp8_any, DT_any_fp8, then "any".
 
 A section with no axes, like reduce above, is just a config.
@@ -142,12 +142,6 @@ def _lookup(table: dict, axes: tuple, values: dict) -> tuple:
 
 def compute_tile_params(config: dict, block_size: int) -> dict:
     """Derive TILE_SIZE from the tuned bounds and the runtime page size.
-
-    The page is rounded up to a power of two first, because the kernels index
-    a tile with tl.arange(0, TILE_SIZE). Either bound may then stand alone: a
-    floor with no cap is what the gluon 2d entries use, since that kernel reads
-    the tile only with a shuffled cache, whose page is asserted to be a power
-    of two -- so a cap could never bind.
     """
     if "TILE_SIZE_MIN" not in config and "TILE_SIZE_MAX" not in config:
         return config
@@ -160,12 +154,6 @@ def compute_tile_params(config: dict, block_size: int) -> dict:
 
 def compute_segment_params(config: dict, params) -> dict:
     """Derive NUM_SEGMENTS: how many ways to split the KV range for one query.
-
-    Not a tuned constant. The useful split count depends on how much
-    parallelism the launch already has -- batch, KV heads, CU count -- and on
-    how many KV tiles the context even holds, none of which a config key can
-    name. So the table carries the tuned bounds and the budget per CU, and the
-    arithmetic happens here.
 
     The reduce section carries the same parameters plus SMALL_SPLIT_MAX, and
     gets num_warps out of this instead of a segment count: one warp is enough
@@ -282,9 +270,9 @@ def get_unified_attention_config(
     """Load the config for one op.
 
     Args:
-        op: ``attn_2d`` | ``attn_3d`` | ``reduce`` | ``kv_split``.
-        params: the ``_UAParams`` for this call; every axis is read from it.
-        backend: ``"triton"`` or ``"gluon"``. The two take disjoint config
+        op: attn_2d | attn_3d | reduce | kv_split.
+        params: the _UAParams for this call; every axis is read from it.
+        backend: "triton" or "gluon". The two take disjoint config
             params, so a config from the wrong backend is not usable.
         arch: resolve another arch's table, for tooling and tests. Leave None
             in kernels.
