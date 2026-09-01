@@ -22,6 +22,7 @@ from aiter.ops.mha import (
 )
 from aiter.ops.mha_v4 import (
     AttentionFormat,
+    AttentionPack,
     AttentionScaleMode,
     mha_v4,
     mha_v4_kv_tile,
@@ -43,6 +44,7 @@ from aiter.ops.mha_v4 import (
     quantize_v_fp8,
     quantize_v_mxfp4,
     quantize_v_mxfp6,
+    quantize_v_mxfp6_fp6_p,
     rotate_activation_hd128,
     scale_modes_for_formats,
 )
@@ -1209,12 +1211,17 @@ def make_kernel_runner(
         )
 
     if args.kernel == "mha4_f8f6":
-        if args.qsmooth or (args.hadamard_rotate and args.block_r != 128):
+        if (
+            args.qsmooth
+            or not args.hadamard_rotate
+            or args.block_r != 128
+            or args.f8f6_v_scale != "block"
+        ):
             raise ValueError(
-                "mha4_f8f6 Hadamard preprocessing requires block_r=128 "
-                "and does not support --qsmooth"
+                "mha4_f8f6 requires block_r=128 Hadamard preprocessing, "
+                "block V scales, and does not support --qsmooth"
             )
-        if args.e2e and args.hadamard_rotate and args.f8f6_v_scale == "block":
+        if args.e2e:
             return lambda: launch_mha_v4(
                 q_bshd,
                 k_bshd,
@@ -1225,36 +1232,22 @@ def make_kernel_runner(
                 softmax_scale=softmax_scale,
             )
 
-        if args.e2e:
-            return lambda: mha_v4_packed(
-                *f8f6_quantize(
-                    q_bshd,
-                    k_bshd,
-                    v_bshd,
-                    rotate_qk=args.hadamard_rotate,
-                    v_scale_mode=args.f8f6_v_scale,
-                ),
-                fp8_format,
-                fp8_format,
-                AttentionFormat.MXFP6,
-                *f8f6_scale_modes,
-                softmax_scale=softmax_scale,
-            )
-
-        packed = f8f6_quantize(
-            q_bshd,
-            k_bshd,
-            v_bshd,
-            rotate_qk=args.hadamard_rotate,
-            v_scale_mode=args.f8f6_v_scale,
-        )
+        q_quantized, q_descale = quantize_fp8_rotated(q_bshd)
+        k_quantized, k_descale = quantize_fp8_rotated(k_bshd)
+        v_quantized, v_descale = quantize_v_mxfp6_fp6_p(v_bshd)
         return lambda: launch_mha_v4_packed(
-            *packed,
+            q_quantized,
+            k_quantized,
+            v_quantized,
+            q_descale,
+            k_descale,
+            v_descale,
             fp8_format,
             fp8_format,
             AttentionFormat.MXFP6,
             *f8f6_scale_modes,
             softmax_scale=softmax_scale,
+            v_pack=AttentionPack.V_FOR_FP6_P,
         )
 
     if args.kernel == "mha4_i8fp8":

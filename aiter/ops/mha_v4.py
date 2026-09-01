@@ -1406,6 +1406,7 @@ def mha_v4(
         "lut_start": lut_start,
         "lut_count": lut_count,
     }
+    v_pack = AttentionPack.DEFAULT
     if q_format == AttentionFormat.BF16 and v_format == AttentionFormat.BF16:
         return mha_v4_packed(
             q,
@@ -1456,6 +1457,9 @@ def mha_v4(
         k_quantized, k_descale = quantize_fp8_rotated(k)
         if _is_fp8_format(v_format):
             v_quantized, v_descale = quantize_fp8(v)
+        elif lut_indices is None:
+            v_quantized, v_descale = quantize_v_mxfp6_fp6_p(v)
+            v_pack = AttentionPack.V_FOR_FP6_P
         else:
             v_quantized, v_descale = quantize_v_mxfp6(v)
     elif q_format == AttentionFormat.MXFP4 and v_format in (
@@ -1582,5 +1586,6 @@ def mha_v4(
         softmax_scale=softmax_scale,
         out=out,
         return_lse=return_lse,
+        v_pack=v_pack,
         **packed_lut,
     )

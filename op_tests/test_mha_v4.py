@@ -284,6 +284,42 @@ def test_mha_v4_mxfp6_fp6_p_layout_matches_permuted_canonical(sequence, dtype):
     assert not torch.equal(scale, canonical_scale)
 
 
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 F8F6 kernel")
+def test_mha_v4_f8f6_raw_compile_parity():
+    torch.manual_seed(43)
+    q = torch.randn((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
+    eager_out = torch.empty_like(q)
+    compiled_out = torch.empty_like(q)
+    fp8_format = native_fp8_format()
+
+    eager = mha_v4(
+        q,
+        k,
+        v,
+        fp8_format,
+        fp8_format,
+        AttentionFormat.MXFP6,
+        out=eager_out,
+    )
+    compiled = torch.compile(mha_v4, fullgraph=True)(
+        q,
+        k,
+        v,
+        fp8_format,
+        fp8_format,
+        AttentionFormat.MXFP6,
+        out=compiled_out,
+    )
+    torch.cuda.synchronize()
+
+    assert eager.data_ptr() == eager_out.data_ptr()
+    assert compiled.data_ptr() == compiled_out.data_ptr()
+    assert torch.equal(compiled, eager)
+    assert torch.isfinite(compiled).all()
+
+
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP6 V packing")
 @pytest.mark.parametrize("sequence", [256, 257])
 def test_mha_v4_mxfp6_v_direct_buffers_match_combined_reference(sequence):
