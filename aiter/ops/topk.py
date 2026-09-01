@@ -444,6 +444,7 @@ def _top_k_per_row_decode(
     k: int = 2048,
     workspace: torch.Tensor | None = None,
     stable: bool = False,
+    values: torch.Tensor | None = None,
 ) -> None: ...
 
 
@@ -563,9 +564,14 @@ def _hip_top_k_per_row_decode(
     values: torch.Tensor | None = None,
 ) -> None:
     if values is not None:
-        raise ValueError(
-            "values output is not yet supported on the HIP decode TopK path"
-        )
+        if values.dtype != torch.float32:
+            raise ValueError("values must be a float32 tensor")
+        if values.shape != indices.shape:
+            raise ValueError("values must have the same shape as indices")
+        if not values.is_contiguous():
+            raise ValueError("values must be contiguous")
+        if values.device != logits.device:
+            raise ValueError("values must be on the same CUDA device as logits")
     size = topk_ob_workspace_size(num_rows, stride0, k, True)
     workspace = get_topk_scratch_workspace(logits.device, size)
     return _top_k_per_row_decode(
@@ -579,6 +585,7 @@ def _hip_top_k_per_row_decode(
         k,
         workspace,
         stable,
+        values,
     )
 
 
@@ -677,6 +684,43 @@ def flydsl_top_k_per_row_decode(
         k,
         stable,
         values,
+    )
+
+
+def flydsl_dcp_topk_merge(
+    gathered_scores: torch.Tensor,
+    local_idx: torch.Tensor,
+    block_table: torch.Tensor,
+    out_kv_indices: torch.Tensor,
+    out_kv_indptr: torch.Tensor,
+    owned_counts: torch.Tensor,
+    staging: torch.Tensor,
+    dcp_rank: int,
+    world_size: int,
+    topk_tokens: int,
+    page_size: int,
+) -> None:
+    """DCP decode top-k merge: emit this rank's owned KV slots, packed.
+
+    Allocates no device scratch, so it is safe inside a captured CUDAGraph;
+    the first call for a new shape JIT-compiles, so warm up before capturing.
+    """
+    from .flydsl.dcp_topk_merge import (
+        flydsl_dcp_topk_merge as _impl,
+    )
+
+    return _impl(
+        gathered_scores,
+        local_idx,
+        block_table,
+        out_kv_indices,
+        out_kv_indptr,
+        owned_counts,
+        staging,
+        dcp_rank,
+        world_size,
+        topk_tokens,
+        page_size,
     )
 
 
