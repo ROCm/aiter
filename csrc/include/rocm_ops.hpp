@@ -140,6 +140,17 @@ namespace py = pybind11;
           py::arg("group_size"),                         \
           py::arg("limit")         = 0.0f,               \
           py::arg("shuffle_scale") = false);             \
+    m.def("situv2_and_mul_quant",                        \
+          &aiter::situv2_and_mul_quant,                  \
+          "Fused SiTUv2 and per-token FP8 quantization." \
+          " Requires group_size == d.",                  \
+          py::arg("out"),                                \
+          py::arg("input"),                              \
+          py::arg("scale"),                              \
+          py::arg("group_size"),                         \
+          py::arg("beta"),                               \
+          py::arg("linear_beta"),                        \
+          py::arg("shuffle_scale") = false);             \
     m.def("gelu_and_mul",                                \
           &aiter::gelu_and_mul,                          \
           "Activation function used in GELU.",           \
