@@ -115,6 +115,7 @@ else:
     from .ops.moe_mxfp4_aux import *
     from .ops.mla_sparse_prefill import *
     from .ops.pa_sparse_prefill_opus import *
+    from .ops.msa_attention import *
     from .ops.pos_encoding import *
     from .ops.cache import *
     from .ops.rmsnorm import *
