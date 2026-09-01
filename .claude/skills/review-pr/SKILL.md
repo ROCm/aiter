@@ -305,11 +305,21 @@ if [ -z "$VALIDATION_REPORT" ] \
     # Route and shape knowledge cannot be derived from a diff, so without these the receipt
     # and grid stages skip and the run tops out at INCONCLUSIVE by construction. That is a
     # limit of what a diff tells you, not a defect in the PR -- Step 8 must say so.
+    # When a grid is supplied and no channel carries it, the report's
+    # test_selection.grid_channel_reason names each channel tried, what was found in the
+    # target, and which channels the target does offer -- so a wrong guess costs one run
+    # rather than a reading of the target's source.
     AUTO_ARGS=()
     [ -n "${REVIEW_EXPECTED_ROUTE:-}" ] && AUTO_ARGS+=(--expected-route "$REVIEW_EXPECTED_ROUTE")
     [ -n "${REVIEW_SHAPE_VARS:-}" ] && AUTO_ARGS+=(--shape-vars "$REVIEW_SHAPE_VARS")
     [ -n "${REVIEW_SHAPE_ENV:-}" ] && AUTO_ARGS+=(--shape-env "$REVIEW_SHAPE_ENV")
     [ -n "${REVIEW_SHAPE_ARG:-}" ] && AUTO_ARGS+=(--shape-arg "$REVIEW_SHAPE_ARG")
+    # The pytest-parametrization channel reaches targets neither of the other two can: none of
+    # the seven files in op_tests/flydsl_tests/ reads a shape env var or parses a shape flag,
+    # and all of them declare shapes as literals in @pytest.mark.parametrize. Without this the
+    # channel exists but no auto-validated review can use it.
+    [ -n "${REVIEW_SHAPE_ARGNAMES:-}" ] \
+      && AUTO_ARGS+=(--shape-argnames "$REVIEW_SHAPE_ARGNAMES")
     [ -n "${REVIEW_GRID:-}" ] && AUTO_ARGS+=(--grid "$REVIEW_GRID")
     echo "auto-validation: running $AUTO_TARGET for PR #$PR (minutes, needs an idle GPU)"
     # BLOCK, NEEDS_WORK and INCONCLUSIVE all still write a report worth consuming, so the
