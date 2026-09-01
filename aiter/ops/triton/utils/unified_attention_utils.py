@@ -143,9 +143,11 @@ def _lookup(table: dict, axes: tuple, values: dict) -> tuple:
 def compute_tile_params(config: dict, block_size: int) -> dict:
     """Derive TILE_SIZE from the tuned bounds and the runtime page size.
 
-    Either bound may stand alone. A floor with no cap is what the gluon 2d
-    entries use: that kernel reads the tile only with a shuffled cache, which
-    is asserted to have a power-of-2 page, so a cap could never bind.
+    The page is rounded up to a power of two first, because the kernels index
+    a tile with tl.arange(0, TILE_SIZE). Either bound may then stand alone: a
+    floor with no cap is what the gluon 2d entries use, since that kernel reads
+    the tile only with a shuffled cache, whose page is asserted to be a power
+    of two -- so a cap could never bind.
     """
     if "TILE_SIZE_MIN" not in config and "TILE_SIZE_MAX" not in config:
         return config
@@ -156,7 +158,7 @@ def compute_tile_params(config: dict, block_size: int) -> dict:
     return config
 
 
-def compute_segment_params(config: dict, params, page_tile: bool) -> dict:
+def compute_segment_params(config: dict, params) -> dict:
     """Derive NUM_SEGMENTS: how many ways to split the KV range for one query.
 
     Not a tuned constant. The useful split count depends on how much
@@ -165,11 +167,13 @@ def compute_segment_params(config: dict, params, page_tile: bool) -> dict:
     name. So the table carries the tuned bounds and the budget per CU, and the
     arithmetic happens here.
 
-    ``page_tile`` measures a segment in whole pages rather than in power-of-2
-    KV tiles, which is what a kernel that gathers one page per tile needs.
+    The reduce section carries the same parameters plus SMALL_SPLIT_MAX, and
+    gets num_warps out of this instead of a segment count: one warp is enough
+    when the split landed on its floor.
     """
     if "SEGMENTS_PER_CU" not in config:
         return config
+    small_split_max = config.pop("SMALL_SPLIT_MAX", None)
     per_cu = config.pop("SEGMENTS_PER_CU")
     lo = config.pop("MIN_SEGMENTS", 1)
     cap = config.pop("MAX_SEGMENTS", None)
@@ -177,7 +181,7 @@ def compute_segment_params(config: dict, params, page_tile: bool) -> dict:
     tile_hi = config.pop("SEGMENT_TILE_MAX", None)
 
     # tokens one segment must cover, so the split never outruns the context
-    tile = params.block_size if page_tile else triton.next_power_of_2(params.block_size)
+    tile = triton.next_power_of_2(params.block_size)
     tile = max(tile_lo, tile if tile_hi is None else min(tile_hi, tile))
     limit = triton.cdiv(params.max_seqlen_k, tile)
     if cap is not None:
@@ -186,9 +190,12 @@ def compute_segment_params(config: dict, params, page_tile: bool) -> dict:
     budget = params.num_sms * per_cu
     prgms = max(1, params.num_2d_prgms)
     share = triton.cdiv(budget, prgms)
-    config["NUM_SEGMENTS"] = triton.next_power_of_2(
-        max(min(lo, limit), min(limit, max(1, share)))
-    )
+    segments = triton.next_power_of_2(max(min(lo, limit), min(limit, max(1, share))))
+    if small_split_max is None:
+        config["NUM_SEGMENTS"] = segments
+    elif segments <= min(small_split_max, limit):
+        # the split landed on its floor: too few segments to be worth 2 warps
+        config["num_warps"] = 1
     return config
 
 
@@ -214,7 +221,7 @@ def _axis_values(
 
 
 def _load(op: str, backend, arch) -> tuple:
-    """Return ``(table, axes, cfg_dir, page_tile)`` for one op."""
+    """Return ``(table, axes, cfg_dir)`` for one op."""
     cfg_dir = resolve_config_dir("attention", _CONFIG_NAME, backend=backend, arch=arch)
     config = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False)
     if config is None:
@@ -230,7 +237,7 @@ def _load(op: str, backend, arch) -> tuple:
         f"{_CONFIG_NAME}[{op}] in {cfg_dir}: schema names unknown axes {unknown} "
         f"(known: {sorted(_AXIS_KIND)})"
     )
-    return config[op], axes, cfg_dir, config.get("segment_tile") == "page"
+    return config[op], axes, cfg_dir
 
 
 @functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
@@ -246,12 +253,12 @@ def _get_unified_attention_config_cached(
     block_size: int,
     backend: str,
     arch: str | None,
-) -> tuple[dict, bool]:
+) -> dict:
     assert op in _OPS, f"Unknown config op {op!r}, expected one of {_OPS}"
     assert head_size > 0, "head_size must be positive"
     assert block_size > 0, "block_size must be positive"
 
-    table, axes, _, page_tile = _load(op, backend, arch)
+    table, axes, _ = _load(op, backend, arch)
     values = _axis_values(
         head_size,
         max_seqlen_q,
@@ -263,7 +270,7 @@ def _get_unified_attention_config_cached(
         kv_dtype,
     )
     _, config = _lookup(table, axes, values)
-    return compute_tile_params(config, block_size), page_tile
+    return compute_tile_params(config, block_size)
 
 
 def get_unified_attention_config(
@@ -285,7 +292,7 @@ def get_unified_attention_config(
     Returns:
         The config, as a fresh deep copy that is safe to mutate.
     """
-    config, page_tile = _get_unified_attention_config_cached(
+    config = _get_unified_attention_config_cached(
         op,
         params.head_size,
         params.max_seqlen_q,
@@ -300,12 +307,12 @@ def get_unified_attention_config(
     )
     # NUM_SEGMENTS is derived out here rather than in the cached lookup: it
     # reads the launch's program count, which is not part of the cache key.
-    return compute_segment_params(copy.deepcopy(config), params, page_tile)
+    return compute_segment_params(copy.deepcopy(config), params)
 
 
 def explain(op: str, params, backend: str = "triton", arch: str | None = None) -> str:
     """Report which entry a lookup lands on, and the config it yields."""
-    table, axes, cfg_dir, page_tile = _load(op, backend, arch)
+    table, axes, cfg_dir = _load(op, backend, arch)
     values = _axis_values(
         params.head_size,
         params.max_seqlen_q,
@@ -318,7 +325,7 @@ def explain(op: str, params, backend: str = "triton", arch: str | None = None) -
     )
     key, config = _lookup(table, axes, values)
     derived = compute_segment_params(
-        compute_tile_params(dict(config), params.block_size), params, page_tile
+        compute_tile_params(dict(config), params.block_size), params
     )
 
     lines = [
@@ -329,7 +336,7 @@ def explain(op: str, params, backend: str = "triton", arch: str | None = None) -
         "  leaf:",
     ]
     lines += [f"    {k:22} = {v}" for k, v in sorted(config.items())]
-    for name in ("TILE_SIZE", "NUM_SEGMENTS"):
-        if name in derived and name not in config:
-            lines.append(f"    {name:22} = {derived[name]}   (derived)")
+    for name, value in sorted(derived.items()):
+        if config.get(name) != value:
+            lines.append(f"    {name:22} = {value}   (derived)")
     return "\n".join(lines)

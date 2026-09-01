@@ -9,6 +9,9 @@
     "attn_3d": [
       "D"
     ],
+    "reduce": [
+      "D"
+    ],
     "kv_split": [
       "D",
       "DT"
@@ -52,7 +55,7 @@
       "num_warps": 2,
       "num_stages": 2,
       "waves_per_eu": 2,
-      "TILE_SIZE_MIN": 16,
+      "TILE_SIZE_MIN": 1,
       "TILE_SIZE_MAX": 64
     },
     "D_GEQ_512.Q_LEQ_1": {
@@ -60,7 +63,7 @@
       "num_warps": 4,
       "num_stages": 1,
       "waves_per_eu": 2,
-      "TILE_SIZE_MIN": 16,
+      "TILE_SIZE_MIN": 1,
       "TILE_SIZE_MAX": 64
     },
     "D_LEQ_128.Q_LEQ_1": {
@@ -68,7 +71,7 @@
       "num_warps": 2,
       "num_stages": 3,
       "waves_per_eu": 2,
-      "TILE_SIZE_MIN": 16,
+      "TILE_SIZE_MIN": 1,
       "TILE_SIZE_MAX": 64
     },
     "D_GEQ_512.DT_fp8_fp8": {
@@ -116,7 +119,7 @@
       "num_warps": 2,
       "num_stages": 2,
       "waves_per_eu": 2,
-      "TILE_SIZE_MIN": 16,
+      "TILE_SIZE_MIN": 1,
       "TILE_SIZE_MAX": 64
     },
     "any": {
@@ -143,9 +146,37 @@
     }
   },
   "reduce": {
-    "num_warps": 2,
-    "num_stages": 1,
-    "waves_per_eu": 2
+    "D_GEQ_512": {
+      "num_stages": 1,
+      "waves_per_eu": 2,
+      "num_warps": 2,
+      "SMALL_SPLIT_MAX": 16,
+      "MIN_SEGMENTS": 16,
+      "SEGMENTS_PER_CU": 8,
+      "MAX_SEGMENTS": 128,
+      "SEGMENT_TILE_MAX": 64
+    },
+    "D_LEQ_128": {
+      "num_stages": 1,
+      "waves_per_eu": 2,
+      "num_warps": 2,
+      "SMALL_SPLIT_MAX": 2,
+      "MIN_SEGMENTS": 1,
+      "SEGMENTS_PER_CU": 4,
+      "MAX_SEGMENTS": 128,
+      "SEGMENT_TILE_MIN": 64,
+      "SEGMENT_TILE_MAX": 16
+    },
+    "any": {
+      "num_stages": 1,
+      "waves_per_eu": 2,
+      "num_warps": 2,
+      "SMALL_SPLIT_MAX": 8,
+      "MIN_SEGMENTS": 8,
+      "SEGMENTS_PER_CU": 16,
+      "MAX_SEGMENTS": 128,
+      "SEGMENT_TILE_MAX": 64
+    }
   },
   "kv_split": {
     "D_GEQ_512.DT_fp8_fp8": {
@@ -161,7 +192,7 @@
       "SEGMENTS_PER_CU": 8,
       "MAX_SEGMENTS": 128,
       "SEGMENT_TILE_MAX": 64,
-      "TILE_SIZE_MIN": 16,
+      "TILE_SIZE_MIN": 1,
       "TILE_SIZE_MAX": 64
     },
     "D_LEQ_128": {
@@ -186,7 +217,7 @@
       "SEGMENTS_PER_CU": 16,
       "MAX_SEGMENTS": 128,
       "SEGMENT_TILE_MAX": 64,
-      "TILE_SIZE_MIN": 16,
+      "TILE_SIZE_MIN": 1,
       "TILE_SIZE_MAX": 64
     }
   }

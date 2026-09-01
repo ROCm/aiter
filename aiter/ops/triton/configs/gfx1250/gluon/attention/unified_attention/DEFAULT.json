@@ -1,12 +1,11 @@
 {
   "schema": {
     "attn_2d": [
+      "D",
       "Q",
       "SW",
       "SKLT",
-      "DT",
-      "SHUF",
-      "BS"
+      "DT"
     ],
     "attn_3d": [
       "D",
@@ -21,71 +20,69 @@
       "BS"
     ]
   },
-  "segment_tile": "page",
   "attn_2d": {
-    "Q_LEQ_1.DT_any_bf16": {
+    "D_LEQ_64.Q_LEQ_1.DT_any_nvfp4": {
       "BLOCK_M": 16,
       "num_warps": 1,
       "waves_per_eu": 2,
       "LOOP_VARIANT": 0,
       "NUM_BUFFERS": 2,
-      "TILE_SIZE_MIN": 64
+      "TILE_SIZE_MIN": 1,
+      "TILE_SIZE_MAX": 64
     },
-    "Q_LEQ_1.DT_bf16_any": {
+    "D_LEQ_64.SW.DT_any_nvfp4": {
+      "BLOCK_M": 64,
+      "num_warps": 4,
+      "waves_per_eu": 4,
+      "LOOP_VARIANT": 0,
+      "NUM_BUFFERS": 2,
+      "TILE_SIZE_MIN": 1,
+      "TILE_SIZE_MAX": 64
+    },
+    "D_LEQ_64.SKLT.DT_any_nvfp4": {
+      "BLOCK_M": 64,
+      "num_warps": 1,
+      "waves_per_eu": 2,
+      "LOOP_VARIANT": 0,
+      "NUM_BUFFERS": 2,
+      "TILE_SIZE_MIN": 1,
+      "TILE_SIZE_MAX": 64
+    },
+    "D_LEQ_64.DT_any_nvfp4": {
+      "BLOCK_M": 128,
+      "num_warps": 4,
+      "waves_per_eu": 2,
+      "LOOP_VARIANT": 2,
+      "NUM_BUFFERS": 2,
+      "TILE_SIZE_MIN": 1,
+      "TILE_SIZE_MAX": 64
+    },
+    "Q_LEQ_1.DT_fp8_fp8": {
       "BLOCK_M": 16,
       "num_warps": 1,
       "waves_per_eu": 2,
       "LOOP_VARIANT": 0,
       "NUM_BUFFERS": 2,
-      "TILE_SIZE_MIN": 64
+      "TILE_SIZE_MIN": 128,
+      "TILE_SIZE_MAX": 128
     },
-    "SW.DT_any_bf16": {
+    "SW.DT_fp8_fp8": {
       "BLOCK_M": 64,
       "num_warps": 4,
       "waves_per_eu": 4,
       "LOOP_VARIANT": 0,
       "NUM_BUFFERS": 2,
-      "TILE_SIZE_MIN": 64
+      "TILE_SIZE_MIN": 128,
+      "TILE_SIZE_MAX": 128
     },
-    "SW.DT_bf16_any": {
+    "SKLT.DT_fp8_fp8": {
       "BLOCK_M": 64,
-      "num_warps": 4,
-      "waves_per_eu": 4,
-      "LOOP_VARIANT": 0,
-      "NUM_BUFFERS": 2,
-      "TILE_SIZE_MIN": 64
-    },
-    "SKLT.DT_any_bf16": {
-      "BLOCK_M": 64,
-      "num_warps": 1,
+      "num_warps": 2,
       "waves_per_eu": 2,
       "LOOP_VARIANT": 0,
       "NUM_BUFFERS": 2,
-      "TILE_SIZE_MIN": 64
-    },
-    "SKLT.DT_bf16_any": {
-      "BLOCK_M": 64,
-      "num_warps": 1,
-      "waves_per_eu": 2,
-      "LOOP_VARIANT": 0,
-      "NUM_BUFFERS": 2,
-      "TILE_SIZE_MIN": 64
-    },
-    "DT_any_bf16.SHUF": {
-      "BLOCK_M": 128,
-      "num_warps": 4,
-      "waves_per_eu": 2,
-      "LOOP_VARIANT": 2,
-      "NUM_BUFFERS": 2,
-      "TILE_SIZE_MIN": 64
-    },
-    "DT_bf16_any.SHUF": {
-      "BLOCK_M": 128,
-      "num_warps": 4,
-      "waves_per_eu": 2,
-      "LOOP_VARIANT": 2,
-      "NUM_BUFFERS": 2,
-      "TILE_SIZE_MIN": 64
+      "TILE_SIZE_MIN": 128,
+      "TILE_SIZE_MAX": 128
     },
     "Q_LEQ_1": {
       "BLOCK_M": 16,
@@ -93,7 +90,8 @@
       "waves_per_eu": 2,
       "LOOP_VARIANT": 0,
       "NUM_BUFFERS": 2,
-      "TILE_SIZE_MIN": 128
+      "TILE_SIZE_MIN": 64,
+      "TILE_SIZE_MAX": 64
     },
     "SW": {
       "BLOCK_M": 64,
@@ -101,31 +99,26 @@
       "waves_per_eu": 4,
       "LOOP_VARIANT": 0,
       "NUM_BUFFERS": 2,
-      "TILE_SIZE_MIN": 128
+      "TILE_SIZE_MIN": 64,
+      "TILE_SIZE_MAX": 64
     },
     "SKLT": {
       "BLOCK_M": 64,
-      "num_warps": 2,
+      "num_warps": 1,
       "waves_per_eu": 2,
       "LOOP_VARIANT": 0,
       "NUM_BUFFERS": 2,
-      "TILE_SIZE_MIN": 128
+      "TILE_SIZE_MIN": 64,
+      "TILE_SIZE_MAX": 64
     },
-    "SHUF": {
+    "DT_fp8_fp8": {
       "BLOCK_M": 128,
       "num_warps": 4,
       "waves_per_eu": 2,
       "LOOP_VARIANT": 2,
       "NUM_BUFFERS": 2,
-      "TILE_SIZE_MIN": 128
-    },
-    "BS_LEQ_32": {
-      "BLOCK_M": 128,
-      "num_warps": 4,
-      "waves_per_eu": 2,
-      "LOOP_VARIANT": 0,
-      "NUM_BUFFERS": 2,
-      "TILE_SIZE_MIN": 128
+      "TILE_SIZE_MIN": 128,
+      "TILE_SIZE_MAX": 128
     },
     "any": {
       "BLOCK_M": 128,
@@ -133,17 +126,30 @@
       "waves_per_eu": 2,
       "LOOP_VARIANT": 2,
       "NUM_BUFFERS": 2,
-      "TILE_SIZE_MIN": 128
+      "TILE_SIZE_MIN": 64,
+      "TILE_SIZE_MAX": 64
     }
   },
   "attn_3d": {
-    "D_LEQ_64.SHUF.DT_any_bf16.BS_GEQ_128": {
+    "D_LEQ_64.SHUF.DT_any_fp8.BS_GEQ_256": {
       "BLOCK_M": 16,
       "num_warps": 1,
       "num_stages": 2,
       "waves_per_eu": 1
     },
-    "D_LEQ_64.SHUF.BS_GEQ_256": {
+    "D_LEQ_64.SHUF.DT_any_fp8": {
+      "BLOCK_M": 16,
+      "num_warps": 1,
+      "num_stages": 2,
+      "waves_per_eu": 2
+    },
+    "D_LEQ_64.SHUF.DT_any_nvfp4": {
+      "BLOCK_M": 16,
+      "num_warps": 1,
+      "num_stages": 2,
+      "waves_per_eu": 2
+    },
+    "D_LEQ_64.SHUF.BS_GEQ_128": {
       "BLOCK_M": 16,
       "num_warps": 1,
       "num_stages": 2,
@@ -170,38 +176,41 @@
     "D_LEQ_64.SHUF.DT_any_fp8.BS_GEQ_256": {
       "MIN_SEGMENTS": 1,
       "SEGMENTS_PER_CU": 4,
-      "TILE_SIZE_MIN": 16,
-      "TILE_SIZE_MAX": 256
+      "TILE_SIZE_MIN": 1,
+      "TILE_SIZE_MAX": 4096
     },
     "D_LEQ_64.SHUF.DT_any_fp8": {
       "MIN_SEGMENTS": 1,
       "SEGMENTS_PER_CU": 8,
-      "TILE_SIZE_MIN": 16,
-      "TILE_SIZE_MAX": 256
+      "SEGMENT_TILE_MAX": 128,
+      "TILE_SIZE_MIN": 1,
+      "TILE_SIZE_MAX": 4096
     },
     "D_LEQ_64.SHUF.DT_any_nvfp4": {
       "MIN_SEGMENTS": 1,
       "SEGMENTS_PER_CU": 8,
-      "TILE_SIZE_MIN": 16,
-      "TILE_SIZE_MAX": 256
+      "SEGMENT_TILE_MAX": 128,
+      "TILE_SIZE_MIN": 1,
+      "TILE_SIZE_MAX": 4096
     },
     "D_LEQ_64.SHUF.BS_GEQ_128": {
       "MIN_SEGMENTS": 1,
       "SEGMENTS_PER_CU": 4,
-      "TILE_SIZE_MIN": 16,
-      "TILE_SIZE_MAX": 256
+      "TILE_SIZE_MIN": 1,
+      "TILE_SIZE_MAX": 4096
     },
     "D_LEQ_64.SHUF": {
       "MIN_SEGMENTS": 1,
       "SEGMENTS_PER_CU": 8,
-      "TILE_SIZE_MIN": 16,
-      "TILE_SIZE_MAX": 256
+      "SEGMENT_TILE_MAX": 128,
+      "TILE_SIZE_MIN": 1,
+      "TILE_SIZE_MAX": 4096
     },
     "any": {
       "MIN_SEGMENTS": 1,
       "SEGMENTS_PER_CU": 4,
-      "TILE_SIZE_MIN": 16,
-      "TILE_SIZE_MAX": 256
+      "TILE_SIZE_MIN": 1,
+      "TILE_SIZE_MAX": 4096
     }
   }
 }

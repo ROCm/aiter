@@ -38,7 +38,7 @@
       "num_warps": 4,
       "num_stages": 1,
       "waves_per_eu": 8,
-      "TILE_SIZE_MIN": 16,
+      "TILE_SIZE_MIN": 1,
       "TILE_SIZE_MAX": 64
     },
     "DT_fp8_fp8": {
@@ -65,9 +65,14 @@
     "waves_per_eu": 2
   },
   "reduce": {
-    "num_warps": 2,
     "num_stages": 1,
-    "waves_per_eu": 2
+    "waves_per_eu": 2,
+    "num_warps": 2,
+    "SMALL_SPLIT_MAX": 8,
+    "MIN_SEGMENTS": 8,
+    "SEGMENTS_PER_CU": 16,
+    "MAX_SEGMENTS": 128,
+    "SEGMENT_TILE_MAX": 64
   },
   "kv_split": {
     "DT_fp8_fp8": {
@@ -83,7 +88,7 @@
       "SEGMENTS_PER_CU": 16,
       "MAX_SEGMENTS": 128,
       "SEGMENT_TILE_MAX": 64,
-      "TILE_SIZE_MIN": 16,
+      "TILE_SIZE_MIN": 1,
       "TILE_SIZE_MAX": 64
     }
   }

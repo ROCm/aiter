@@ -342,11 +342,20 @@ _SEGMENT_PARAMS = {
     "SEGMENT_TILE_MIN",
     "SEGMENT_TILE_MAX",
 }
+# The triton reduce carries the split parameters as well: its warp count turns
+# on whether the split landed on its floor, so it needs the same floor kv_split
+# used. The gluon reduce is handed num_warps by its wrapper and needs none of
+# them.
 ALLOWED_LEAF_KEYS = {
     backend: {
         op: (keys - {"TILE_SIZE", "NUM_SEGMENTS"})
         | _TILE_BOUNDS
         | (_SEGMENT_PARAMS if op == "kv_split" else set())
+        | (
+            _SEGMENT_PARAMS | {"SMALL_SPLIT_MAX"}
+            if op == "reduce" and backend == "triton"
+            else set()
+        )
         for op, keys in ops.items()
     }
     for backend, ops in ALLOWED_KEYS.items()
@@ -458,10 +467,10 @@ def test_every_entry_is_complete_and_carries_nothing_extra(arch, backend, op):
     table = _table(arch, backend)
     axes = table.get("schema", {}).get(op, [])
     required = REQUIRED_KEYS[backend][op] - {"TILE_SIZE"}
-    if op == "kv_split":
+    if op == "kv_split" or (op == "reduce" and backend == "triton"):
         # NUM_SEGMENTS is derived; SEGMENTS_PER_CU is the one parameter with no
         # default, so its absence is what would break the derivation.
-        required = (required - {"NUM_SEGMENTS"}) | {"SEGMENTS_PER_CU"}
+        required = (required - {"NUM_SEGMENTS", "num_warps"}) | {"SEGMENTS_PER_CU"}
     for key, config in _entries(table[op], axes):
         extra = set(config) - ALLOWED_LEAF_KEYS[backend][op]
         assert not extra, f"{arch}/{backend} {op}: {key!r} has extra {sorted(extra)}"
@@ -586,16 +595,6 @@ def test_every_entry_is_reachable(arch, backend, op):
                     for sliding_window in (0, 1024):
                         for max_seqlen_k in (512, 65536):
                             for shuffled in (False, True):
-                                params = make_params(
-                                    head_size=head_size,
-                                    max_seqlen_q=max_seqlen_q,
-                                    max_seqlen_k=max_seqlen_k,
-                                    sliding_window=sliding_window,
-                                    shuffled_kv_cache=shuffled,
-                                    q_dtype=q_dtype,
-                                    kv_cache_dtype=kv_dtype,
-                                    block_size=block_size,
-                                )
                                 values = unified_attention_utils._axis_values(
                                     head_size,
                                     max_seqlen_q,
