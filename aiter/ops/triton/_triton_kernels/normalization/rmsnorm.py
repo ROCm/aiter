@@ -821,6 +821,7 @@ _rmsnorm_bwd_triton_repr = make_kernel_repr(
     [
         "BLOCK_SIZE",
         "USE_BLOCKED",
+        "NUM_PRGMS",
     ],
 )
 
