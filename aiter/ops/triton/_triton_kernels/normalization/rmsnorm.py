@@ -47,6 +47,7 @@ _rms_norm_kernel_repr = make_kernel_repr(
     [
         "BLOCK_SIZE",
         "USE_BLOCKED",
+        "NUM_PRGMS",
     ],
 )
 
