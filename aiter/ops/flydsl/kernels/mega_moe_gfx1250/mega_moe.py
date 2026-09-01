@@ -498,13 +498,23 @@ class MegaMoEGfx1250:
         # It is slower than recv-slot dispatch at every measured size, so this
         # is a correctness/architecture switch and not a performance one.
         # Per-layer at 4 ranks, e384/topk6/hd7168, recv-slot vs fused:
-        # mtpr 64 311/565us, 128 388/558, 256 590/882, 512 605/1040,
-        # 1024 648/1186. The cost is the payload producer, which spends ~600us
-        # of a 512-token layer moving what the standalone ep_dispatch_tdm does
-        # in 46us; see the group-major note in dispatch_compact. mtpr<=64 is the
-        # worst ratio because the single-CTA planner and the reserved producer
-        # CUs are close to fixed cost and there is no longer a GEMM big enough
-        # to hide them behind.
+        # mtpr 64 311/480us, 128 388/469, 256 590/773, 512 605/856,
+        # 1024 648/960.
+        #
+        # What is left of the gap is the payload producer. At 512 tokens the
+        # producer's row movement prices at 302us (GEMM1 741us against 439us
+        # with the payload stores removed), against 46us for the whole of
+        # ep_dispatch_tdm, and the remaining ~440us is the floor it shares with
+        # the standalone path (GEMM plus the planner's cross-rank handshake).
+        # That 302us is 22.7MB of remote rows at ~75GB/s per rank where the
+        # standalone dispatch gets ~270GB/s, and it is throughput-bound, not
+        # latency-bound: cutting the TDM drain count 6x (the token-major walk)
+        # bought 19us of it, and deeper TDM pipelining bought nothing. Closing
+        # the rest needs fewer fabric bytes, i.e. recv-slot's (token, peer)
+        # dedup plus a destination-side gather pass -- 1.82x on the bytes, paid
+        # for with 45MB of local traffic. mtpr<=64 is the worst ratio because
+        # the planner is close to fixed cost and there is no longer a GEMM big
+        # enough to hide it.
         use_fused_stage1 = self._config.fused_stage1
         if use_fused_stage1:
             stream = fx.Stream(torch.cuda.current_stream())

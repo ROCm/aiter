@@ -174,13 +174,17 @@ def _stage1_dispatch_grid_mult(tokens: int, mtpr: int) -> int:
 
       1 planner + num_producer + first-wave consumers = CU
 
-    so ``num_producer + num_consumer`` on that wave is ``CU - 1``. Whether a
-    second wave pays depends on the producer count it is paired with: against
-    128 producers it is flat-to-worse everywhere, but once producers take the
-    whole first wave the GEMM has to live in the second one. Measured at
-    ``CU - 4`` producers, it wins from tpr=256 up (912 vs 929us at 256, 1063 vs
-    1089us at 512, 1219 vs 1234us at 1024) and still loses at tpr=128
-    (686 vs 560us). Override with ``AITER_FLYDSL_STAGE1_GRID_MULT``.
+    so a second wave only earns its keep when the producers have crowded the
+    GEMM out of the first one. That used to be the case from tpr=256 up, when
+    dispatch took ``CU - 4`` blocks. It no longer is: the token-major payload
+    walk moved the dispatch knee to 64 blocks at tpr>=512, which leaves ~191
+    first-wave consumers, and a second wave then only adds contention --
+    per-layer 857 vs 868us at tpr=512, 963 vs 976us at 1024, 769 vs 766us
+    (a tie) at 256, and 472 vs 607us at 128. So one wave everywhere.
+
+    Judge this one end-to-end: on GEMM1's own kernel time the two are
+    indistinguishable, and the difference shows up only once combine is
+    included. Override with ``AITER_FLYDSL_STAGE1_GRID_MULT``.
     """
     raw = os.environ.get("AITER_FLYDSL_STAGE1_GRID_MULT")
     if raw is not None:
@@ -191,7 +195,8 @@ def _stage1_dispatch_grid_mult(tokens: int, mtpr: int) -> int:
                 "1,2,3,4,6,8,12,16,24,32"
             )
         return value
-    return 2 if mtpr <= tokens and tokens >= 256 else 1
+    _ = (tokens, mtpr)
+    return 1
 
 
 def _stage1_compact_dispatch_cu(
@@ -216,18 +221,31 @@ def _stage1_compact_dispatch_cu(
     if raw != "auto":
         dispatch_cu = max(0, int(raw))
     else:
-        # Per-tpr knees on gfx1250 (61-layer, world=4). Producers are a pure
-        # bandwidth stage and the exact-MTPR buckets are starved for them, not
-        # for GEMM consumers: at tpr=512 the sweep runs 4715us (pb=4), 1570us
-        # (pb=32), 1334us (pb=128), 1074us (pb=192) and then plateaus, so take
-        # the whole first wave and let the second wave do the GEMM.
+        # Per-layer us on gfx1250 (61-layer, world=4), sweeping this count:
+        #
+        #   tpr    pb=16    pb=32    pb=64   pb=128   pb=192   pb=252
+        #    64    536.2    518.1    511.7    495.1    484.9    481.9
+        #   128    566.7    566.6    525.3    493.3    474.9    469.5
+        #   256    817.3    786.3    796.0    796.2    770.9    759.2
+        #   512    932.0    869.9    854.4    998.3    968.6    953.0
+        #  1024   1142.0   1005.7    965.0   1076.6        -   1037.2
+        #
+        # The split at 512 is a payload-size effect, not a bandwidth one. Every
+        # dispatch block rejoins the work queue as a GEMM consumer once its own
+        # producer work is done, so an over-provisioned count is not wasted at
+        # small tpr -- 256 tokens over 252 blocks is one token per block, and it
+        # still wins. From 512 tokens up, the payload is large enough that the
+        # cost of ``group_done`` (every dispatch block must arrive before any of
+        # them may publish readiness) outgrows what the extra blocks contribute,
+        # and 64 blocks -- 512 waves, one token per wave for the token-major
+        # walk -- is the knee.
         _ = (experts_per_rank, model_dim, inter_dim)
         if mtpr > tokens:
             dispatch_cu = 64
-        elif tokens <= 64:
-            dispatch_cu = 128
-        else:
+        elif tokens <= 256:
             dispatch_cu = cu
+        else:
+            dispatch_cu = 64
     if world_size <= 0:
         raise ValueError("compact dispatch needs a positive world size")
     # Leave ticket 0 for the planner and at least one first-wave consumer.

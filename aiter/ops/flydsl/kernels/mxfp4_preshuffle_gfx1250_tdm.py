@@ -79,40 +79,20 @@ REMAP_DONE_OFF = PLAN_GATE_OFF + PLAN_GATE_DWORDS
 TICKET_SLOTS = REMAP_DONE_OFF + REMAP_DONE_DWORDS
 
 
-def _resolve_dispatch_pipe_depth(
-    dispatch_on, wire_stride, num_waves, budget_bytes, env_val
-):
-    """Producer wire tiles per wave, with deeper batching available for tuning.
+def _check_dispatch_lds(dispatch_on, wire_stride, num_waves, budget_bytes):
+    """Assert the compact producer's one wire tile per wave fits beside the GEMM.
 
     Wire rows stage in LDS the producer owns, disjoint from the GEMM A/B/C
-    arena. Depths above one batch multiple rows per tensor drain, but remain
-    opt-in because their extra LDS and later tile publication can cost more than
-    the reduced wait count on current gfx1250 shapes.
+    arena, so the tiles come straight out of GEMM occupancy.
     """
     if not dispatch_on:
-        return 1
-
-    def _bytes(depth):
-        return compact_payload_lds_bytes(
-            wire_stride=wire_stride, num_waves=num_waves, pipe_depth=depth
-        )
-
-    if _bytes(1) > budget_bytes:
+        return
+    need = compact_payload_lds_bytes(wire_stride=wire_stride, num_waves=num_waves)
+    if need > budget_bytes:
         raise ValueError(
-            f"one compact dispatch wire tile per wave needs {_bytes(1)}B of LDS, "
+            f"one compact dispatch wire tile per wave needs {need}B of LDS, "
             f"above the {budget_bytes}B left once the GEMM arena is placed"
         )
-    if env_val is not None and env_val != "":
-        req = int(env_val)
-        if req < 1:
-            raise ValueError("AITER_DISPATCH_PIPE_DEPTH must be >= 1")
-        if _bytes(req) > budget_bytes:
-            raise ValueError(
-                f"AITER_DISPATCH_PIPE_DEPTH={req} needs {_bytes(req)}B of LDS, "
-                f"above the {budget_bytes}B left once the GEMM arena is placed"
-            )
-        return req
-    return 1
 
 
 @flyc.jit
@@ -550,18 +530,12 @@ def launch_gemm_a8w4_tdm(
         if dispatch_on
         else 0
     )
-    _dispatch_pipe_depth = _resolve_dispatch_pipe_depth(
-        dispatch_on,
-        dispatch_wire_stride,
-        num_waves,
-        _DISPATCH_LDS_BUDGET_B,
-        os.environ.get("AITER_DISPATCH_PIPE_DEPTH"),
+    _check_dispatch_lds(
+        dispatch_on, dispatch_wire_stride, num_waves, _DISPATCH_LDS_BUDGET_B
     )
     _DISPATCH_LDS_B = (
         compact_payload_lds_bytes(
-            wire_stride=dispatch_wire_stride,
-            num_waves=num_waves,
-            pipe_depth=_dispatch_pipe_depth,
+            wire_stride=dispatch_wire_stride, num_waves=num_waves
         )
         if dispatch_on
         else 0
@@ -617,7 +591,6 @@ def launch_gemm_a8w4_tdm(
     # lets the profiler aggregate the ranks into a single row.
     _disp = (
         f"_disp{dispatch_blocks}p{dispatch_persist_blocks}w{dispatch_world}"
-        f"d{_dispatch_pipe_depth}"
         if dispatch_on
         else ""
     )
@@ -862,6 +835,8 @@ def launch_gemm_a8w4_tdm(
                         lds_base_i32=arith.index_cast(T.i32, dispatch_lds_idx),
                         addr_in_wire=fx.Int64(ptrtoint(arg_dispatch_wire)),
                         addr_in_weights=fx.Int64(ptrtoint(arg_dispatch_weights)),
+                        addr_in_idx=fx.Int64(ptrtoint(arg_dispatch_ids)),
+                        cur_tokens=fx.Int32(dispatch_cur_tokens),
                         payload_offset=(
                             dispatch_payload_offset - dispatch_workspace_offset
                         ),
@@ -882,7 +857,6 @@ def launch_gemm_a8w4_tdm(
                         scale_rowmajor=_stage1_rowmajor_scale,
                         parity=entry_gen & fx.Int32(1),
                         expected=entry_gen + fx.Int32(1),
-                        pipe_depth=_dispatch_pipe_depth,
                     )
                 # Producers now scatter WMMA-interleaved scales per expert, so
                 # there is no global scale-finalize phase and no launch_ready
