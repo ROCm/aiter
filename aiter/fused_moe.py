@@ -1479,7 +1479,9 @@ def _flydsl_stage1_wrapper(
         sorted_weights=sorted_weights,
         use_async_copy=True,
         k_batch=parsed.get("k_batch", 1),
-        waves_per_eu=parsed.get("waves_per_eu", 3),
+        # None, matching stage 2: the int4 stage-1 registry does not emit a
+        # waves_per_eu key, and a numeric default would clamp its occupancy.
+        waves_per_eu=parsed.get("waves_per_eu", None),
         b_nt=parsed.get("b_nt", 2),
         gate_mode=parsed.get("gate_mode", "separated"),
         inter_dim_pad=inter_dim_pad,
