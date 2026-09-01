@@ -392,6 +392,7 @@ if _HAVE_TRITON:
         "_pack_qk_fp6_kernel",
         [
             "BLOCK_N",
+            "num_warps",
         ],
     )
 
