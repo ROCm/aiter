@@ -26,6 +26,10 @@ TOKEN_BUCKETS = (
 P2P_FP8_MIN_MTPR = 1024
 FIXED_SLOT_MAX_MTPR = 255
 MAX_MTPR_CLASS = 32768
+# Source-indexed payload storage cuts the maximum-capacity activation buffer
+# by roughly ``topk``.  Keep every smaller capacity on the historical layout.
+INDEXED_PAYLOAD_MIN_MTPR = MAX_MTPR_CLASS
+INDEXED_PAYLOAD_MIN_SBM = 128
 REFERENCE_EXPERTS_PER_RANK = 48
 EXPERT_CONFIG_GRANULARITY = 64
 

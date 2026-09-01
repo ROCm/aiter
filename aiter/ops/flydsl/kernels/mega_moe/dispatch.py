@@ -1620,6 +1620,7 @@ def emit_dispatch_payload(
     ready_tile_queue=False,
     tile_state_stride=0,
     deduplicate_payload=False,
+    indexed_payload=False,
     retire_control_ctas=False,
     fanout_masks=(),
     runtime_fanout=False,
@@ -1907,6 +1908,8 @@ def emit_dispatch_payload(
 
             if const_expr(not deduplicate_payload) or copy_payload != fx.Int32(0):
                 payload_row = destination_row
+                if const_expr(indexed_payload):
+                    payload_row = source_key
                 if const_expr(fz_enable_scales):
                     scale_lane = lane
                     if const_expr(fz_scale_n_i32 % 4 == 0):

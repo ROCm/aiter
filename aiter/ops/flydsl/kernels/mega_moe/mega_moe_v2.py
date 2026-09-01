@@ -17,6 +17,8 @@ from ..flydsl_dispatch_combine_intranode_op import (
 from .dispatch import DISPATCH_TABLE_SIZE, DispatchSlot
 from .mega_moe_config import (
     FIXED_SLOT_MAX_MTPR,
+    INDEXED_PAYLOAD_MIN_MTPR,
+    INDEXED_PAYLOAD_MIN_SBM,
     MegaMoEConfig,
     Stage1Config,
     build_mega_moe_bundle_plan,
@@ -106,7 +108,9 @@ class MegaMoEV2:
             num_experts_per_token=self.topk, combine_dtype=torch.bfloat16,
             dispatch_dtype=torch.float8_e4m3fn, scale_dim=self._s1_scale_dim, scale_type_size=1,
             enable_std_moe=False, enable_group_major=True, gm_unit_size=capacity_tile_m,
-            gm_scheme=mega_scheme, gm_compact=compact, max_total_recv_tokens=self.world_size)
+            gm_scheme=mega_scheme, gm_compact=compact,
+            gm_indexed_payload=compact and self.mtpr >= INDEXED_PAYLOAD_MIN_MTPR,
+            max_total_recv_tokens=self.world_size)
         # fmt: on
         self.comb_op = FlyDSLDispatchCombineIntraNodeOp(self.comb_cfg)
         torch.cuda.synchronize()
@@ -139,6 +143,11 @@ class MegaMoEV2:
         self._s1_w1_scale = w1_scale.contiguous().view(torch.uint8)
         op = self.comb_op._gm
         assert op is not None, "combine op was built without enable_group_major"
+        expected_indexed_payload = (
+            not self._s1_fixed_slot and self.mtpr >= INDEXED_PAYLOAD_MIN_MTPR
+        )
+        if op.indexed_payload != expected_indexed_payload:
+            raise ValueError("group-major payload layout disagrees with Stage1")
         self._s1_op = op
         # Payload capacity follows the largest SBM; metadata covers the smallest candidate.
         metadata_blocks = (op.num_valid_max + self.sort_block_m - 1) // self.sort_block_m
@@ -603,6 +612,20 @@ class MegaMoEV2:
             raise ValueError("scales must be contiguous")
         if config is None:
             config = self._select_config(cur_tok).stage1
+        indexed_variant = (
+            self.mtpr >= INDEXED_PAYLOAD_MIN_MTPR
+            and config.sort_block_m >= INDEXED_PAYLOAD_MIN_SBM
+        )
+        if self._s1_op.indexed_payload and not indexed_variant:
+            route_rows = (
+                self.world_size * cur_tok * self.topk
+                + self.epr * config.sort_block_m
+            )
+            if route_rows > self._s1_op.payload_rows_max:
+                raise ValueError(
+                    "route-major Stage1 variant exceeds the compact payload buffer; "
+                    "select an indexed SBM configuration"
+                )
         if prepared and self._s1_fixed_slot:
             raise ValueError("fixed-slot Stage1 cannot consume compact prepare")
         if not prepared:

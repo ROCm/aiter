@@ -36,7 +36,7 @@ class _LdsF32View:
 @flyc.jit
 def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
     a_scale_lds, a_lds_i32, K_ITERS, M_REPEAT, NUM_ACC_N, A_K_STEP_BYTES, pipe_weights,
-    mfma_amajor, async_a_copy, trb_rsrc, tib_rsrc, indirect_input):
+    mfma_amajor, async_a_copy, trb_rsrc, tib_rsrc, indirect_input, indexed_input):
 # fmt: on
     N_ACC = M_REPEAT * NUM_ACC_N
     NUM_B_SCALE = NUM_ACC_N // _PACK
@@ -50,6 +50,8 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
     tile_input_base = tile_row_base
     if const_expr(indirect_input):
         tile_input_base = _buffer_load(tib_rsrc, m_tile, fx.Int32)
+    if const_expr(indexed_input):
+        tile_input_base = tile_row_base
     b_row = sched.gate_base_row(expert) + n_tile_base
     a_gather.for_tile(tile_input_base)
     if const_expr(pipe_weights):
@@ -274,7 +276,8 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     model_dim, inter_dim, sort_block_m, tile_n, num_waves, n_per_wave, wave_id,
     m_repeat, num_acc_n, a_k_step_bytes, total_threads, k_iters, a_lds_i32, n_tiles,
     expert_offset, b_cache_modifier, swizzle_a, pipe_weights, mfma_amajor, async_a_copy,
-    use_tile_resource, indirect_input, swiglu_limit=0.0):
+    use_tile_resource, indirect_input, indexed_input=False, row_map_rsrc=None,
+    source_rows=0, swiglu_limit=0.0):
     # fmt: on
     """Build the GEMM1 atoms and return its expert resolver and tile runner."""
     sched = TileScheduler(
@@ -287,7 +290,9 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     # fmt: off
     a_gather = ATileLoader(row_bytes=model_dim, sort_block_m=sort_block_m,
         k_step_bytes=a_k_step_bytes, total_threads=total_threads, swizzle=swizzle_a,
-        x_tensor=x_tensor, async_copy=async_a_copy)
+        x_tensor=x_tensor, async_copy=async_a_copy,
+        indexed_input=indexed_input, row_map_rsrc=row_map_rsrc,
+        source_rows=source_rows)
     # fmt: on
     a_s2r = AS2RLoader(k_step_bytes=a_k_step_bytes, swizzle=swizzle_a)
     b_loader = BWeightLoader(
@@ -303,6 +308,8 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
         model_dim=model_dim,
         sort_block_m=sort_block_m,
         total_threads=total_threads,
+        indexed_input=indexed_input,
+        row_map_rsrc=row_map_rsrc,
     )
     mfma = MfmaScaleGU(m_repeat=m_repeat, num_acc_n=num_acc_n)
     # fmt: off
@@ -330,7 +337,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
             a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
             a_scale_lds, a_lds_i32, k_iters, m_repeat, num_acc_n,
             a_k_step_bytes, pipe_weights, mfma_amajor, async_a_copy,
-            trb_rsrc, tib_rsrc, indirect_input)
+            trb_rsrc, tib_rsrc, indirect_input, indexed_input)
         # fmt: on
 
     return expert_of_flat, do_scheduled_tile

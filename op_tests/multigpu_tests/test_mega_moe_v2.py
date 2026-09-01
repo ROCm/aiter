@@ -221,9 +221,14 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
     _barrier()
     eager_output = output.clone()
     rel_l2 = -1.0
-    # A zero-token rank must not enter the reference collectives by itself:
-    # peers with non-zero inputs correctly skip this optional accuracy path.
-    if 0 < tokens <= args.accuracy_max_bs:
+    # The reference uses fixed-shape all_gather and therefore requires every
+    # rank to make the same decision and contribute the same token count.
+    token_min = torch.tensor(tokens, dtype=torch.int32, device=device)
+    token_max = token_min.clone()
+    dist.all_reduce(token_min, op=dist.ReduceOp.MIN)
+    dist.all_reduce(token_max, op=dist.ReduceOp.MAX)
+    uniform_tokens = int(token_min.item()) == int(token_max.item())
+    if uniform_tokens and 0 < tokens <= args.accuracy_max_bs:
         reference = _reference(
             x,
             weights,

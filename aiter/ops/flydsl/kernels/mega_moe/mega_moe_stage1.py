@@ -21,7 +21,11 @@ from .dispatch import (
 )
 from .gemm1 import _LdsF32View, build_fused_gemm1
 from .gemm_util import _buffer_load, _buffer_store, _make_buffer, _make_buffer_from_addr
-from .mega_moe_config import Stage1Config
+from .mega_moe_config import (
+    INDEXED_PAYLOAD_MIN_MTPR,
+    INDEXED_PAYLOAD_MIN_SBM,
+    Stage1Config,
+)
 
 _SC0_CACHE = 1
 _BUFFER_OFFSET_ABI_BYTES = 1 << 32
@@ -193,6 +197,20 @@ def compile_mega_moe_stage1(
     if fixed_slot_dispatch and not direct_fixed_slot:
         raise ValueError("fixed-slot dispatch requires the direct fixed-slot layout")
     fz_total_experts = fz_npes * fz_epr
+    indexed_payload = (
+        not fixed_slot_dispatch
+        and fuse_mtpr >= INDEXED_PAYLOAD_MIN_MTPR
+        and sort_block_m >= INDEXED_PAYLOAD_MIN_SBM
+    )
+    source_rows = fz_npes * fz_mtpr + 1 if indexed_payload else 0
+    if indexed_payload and source_rows * model_dim >= _BUFFER_OFFSET_ABI_BYTES:
+        raise ValueError(
+            "MegaMoE v2 indexed payload exceeds the 32-bit buffer-resource ABI"
+        )
+    if indexed_payload and fuse_scale_dim % 16:
+        raise ValueError(
+            "MegaMoE v2 indexed E8M0 rows must be a multiple of 16 bytes"
+        )
     # Small batches stream B; large batches cache it across M tiles.
     b_cache_modifier = int(b_nt) if int(b_nt) >= 0 else (3 if fz_mtpr <= 512 else 0)
     fz_n_i32, fz_nbytes = model_dim // 4, model_dim
@@ -232,6 +250,7 @@ def compile_mega_moe_stage1(
         f"_rc31_wb{WORK_BATCH}_adaptive"
         f"_erh{int(cross_rank_entry_handshake)}"
         f"_prep{int(preplanned_compact)}"
+        f"_ix{int(indexed_payload)}"
         f"_rtq{int(ready_tile_queue)}"
         f"_drm{debug_role_mode}"
         f"{fanout_suffix}"
@@ -462,6 +481,7 @@ def compile_mega_moe_stage1(
                         chunks_per_destination=chunks_per_destination, payload_tile_ready=payload_tile_ready,
                         ready_tile_queue=ready_tile_queue,
                         tile_state_stride=tile_state_stride,
+                        indexed_payload=indexed_payload,
                         fanout_masks=fanout_masks,
                         runtime_fanout=runtime_fanout,
                     )
@@ -491,6 +511,9 @@ def compile_mega_moe_stage1(
         tib_rsrc = _make_buffer_from_addr(
             _disp_ptr(DispatchSlot.TILE_INPUT_BASE), fx.Int32
         )
+        srcmap_rsrc = _make_buffer_from_addr(
+            _disp_ptr(DispatchSlot.SRCMAP), fx.Int32
+        )
         expert_rsrc = _make_buffer(expert_ids, fx.Int32)
         nv_rsrc = _make_buffer(num_valid_ids, fx.Int32)
         scale_cols = (inter_dim // 32 + 7) // 8 * 8
@@ -515,7 +538,10 @@ def compile_mega_moe_stage1(
             n_tiles=N_TILES, expert_offset=fz_rank * fz_epr, b_cache_modifier=b_cache_modifier,
             swizzle_a=swizzle_a, pipe_weights=pipe_weights, mfma_amajor=mfma_amajor,
             async_a_copy=async_a_copy, use_tile_resource=use_tile_resource,
-            indirect_input=fanout_enabled,
+            indirect_input=fanout_enabled and not indexed_payload,
+            indexed_input=indexed_payload,
+            row_map_rsrc=srcmap_rsrc,
+            source_rows=source_rows,
             swiglu_limit=swiglu_limit,
         )
 
@@ -881,6 +907,20 @@ def compile_mega_moe_stage1_bundle(
     return launch
 
 
+def stage1_bundle_variant_groups(variants, *, indexed_payload):
+    """Separate source-indexed variants from route-major variants."""
+    variants = tuple(variants)
+    if not indexed_payload:
+        return (variants,)
+    route_major = tuple(
+        config for config in variants if config.sort_block_m < INDEXED_PAYLOAD_MIN_SBM
+    )
+    source_indexed = tuple(
+        config for config in variants if config.sort_block_m >= INDEXED_PAYLOAD_MIN_SBM
+    )
+    return tuple(group for group in (route_major, source_indexed) if group)
+
+
 def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_ids, num_valid_ids, out_scale,
     tokens, addr_disp, i32_cur_tok, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc,
     addr_parity, addr_expected, stream, *, model_dim, inter_dim, rank, experts_per_rank, fuse_npes,
@@ -943,6 +983,17 @@ def run_mega_moe_stage1_bundle(
     variants = tuple(compile_kw["variants"])
     if not 0 <= int(variant_id) < len(variants):
         raise ValueError(f"invalid Stage1 bundle variant_id={variant_id}")
+    selected = variants[int(variant_id)]
+    groups = stage1_bundle_variant_groups(
+        variants,
+        indexed_payload=(
+            not bool(compile_kw["fixed_slot_dispatch"])
+            and int(compile_kw["fuse_mtpr"]) >= INDEXED_PAYLOAD_MIN_MTPR
+        ),
+    )
+    variants = next(group for group in groups if selected in group)
+    variant_id = variants.index(selected)
+    compile_kw = {**compile_kw, "variants": variants}
     launch = compile_mega_moe_stage1_bundle(**compile_kw)
     _run_compiled(
         launch,
@@ -993,28 +1044,40 @@ def preload_mega_moe_stage1_bundle(
     **compile_kw,
 ):
     """Compile and load the complete Stage1 bundle without dispatching it."""
-    launch = compile_mega_moe_stage1_bundle(**compile_kw)
-    return _preload_compiled(
-        launch,
-        out,
-        x,
-        w,
-        scale_x,
-        scale_w,
-        sorted_token_ids,
-        expert_ids,
-        num_valid_ids,
-        out_scale,
-        tokens,
-        addr_disp,
-        i32_cur_tok,
-        addr_in_tok,
-        addr_in_idx,
-        addr_in_wts,
-        addr_in_sc,
-        addr_parity,
-        addr_expected,
-        fx.Int32(variant_id),
-        stream,
+    groups = stage1_bundle_variant_groups(
+        compile_kw["variants"],
+        indexed_payload=(
+            not bool(compile_kw["fixed_slot_dispatch"])
+            and int(compile_kw["fuse_mtpr"]) >= INDEXED_PAYLOAD_MIN_MTPR
+        ),
     )
+    artifact = None
+    for variants in groups:
+        launch = compile_mega_moe_stage1_bundle(
+            **{**compile_kw, "variants": variants}
+        )
+        artifact = _preload_compiled(
+            launch,
+            out,
+            x,
+            w,
+            scale_x,
+            scale_w,
+            sorted_token_ids,
+            expert_ids,
+            num_valid_ids,
+            out_scale,
+            tokens,
+            addr_disp,
+            i32_cur_tok,
+            addr_in_tok,
+            addr_in_idx,
+            addr_in_wts,
+            addr_in_sc,
+            addr_parity,
+            addr_expected,
+            fx.Int32(0),
+            stream,
+        )
+    return artifact
 # fmt: on

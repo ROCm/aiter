@@ -265,6 +265,7 @@ class FlyDSLDispatchCombineConfig:
     gm_unit_size: int = 0
     gm_scheme: str = "fixedslot"
     gm_compact: bool = False
+    gm_indexed_payload: bool = False
 
     def __post_init__(self):
         if self.data_type is not None and (
@@ -389,10 +390,16 @@ class FlyDSLDispatchGroupMajorOp:
         scale_dim,
         scale_type_size=1,
         compact=False,
+        indexed_payload=False,
     ):
         assert world_size <= 8
         # Compact mode uses a count-first layout without per-expert reservations.
         self.compact = bool(compact)
+        self.indexed_payload = bool(indexed_payload)
+        if self.indexed_payload and not self.compact:
+            raise ValueError(
+                "indexed payload storage requires compact group-major mode"
+            )
         self.rank = rank
         self.npes = world_size
         self.hidden = hidden_dim
@@ -423,6 +430,13 @@ class FlyDSLDispatchGroupMajorOp:
             num_valid_max = experts_per_rank * self.ll_cap + 256
         self.num_valid_max = int(num_valid_max)
         self.max_blocks = (self.num_valid_max + unit_size - 1) // unit_size
+        # Route metadata remains expert-major.  Activations and scales use one
+        # deterministic row per (source rank, source token), plus a sentinel.
+        self.payload_rows_max = (
+            world_size * max_tok_per_rank + 1
+            if self.indexed_payload
+            else self.num_valid_max
+        )
 
         self._alloc()
         ms.shmem_barrier_all()
@@ -436,12 +450,14 @@ class FlyDSLDispatchGroupMajorOp:
     def _alloc(self):
         npes, epr = self.npes, self.epr
         nvm = self.num_valid_max
+        payload_rows = self.payload_rows_max
         self.done2 = self._sym((npes,), torch.int32)
         self.running = self._sym((epr,), torch.int32)
         self.ll_count = self._sym((epr,), torch.int32)
-        self.rx_em = self._sym((nvm * self.row_bytes,), torch.int8)
-        self.scale_em = self._sym((max(1, nvm * self.scale_n_i32),), torch.int32)
-        self.idx_em = self._sym((nvm,), torch.int32)
+        self.rx_em = self._sym((payload_rows * self.row_bytes,), torch.int8)
+        self.scale_em = self._sym(
+            (max(1, payload_rows * self.scale_n_i32),), torch.int32
+        )
         self.wts_em = self._sym((nvm,), torch.float32)
         self.srcmap_em = self._sym((nvm,), torch.int32)
         self.gb1 = torch.zeros(1, dtype=torch.int64, device=self._dev)
@@ -507,7 +523,6 @@ class FlyDSLDispatchGroupMajorOp:
         self.p2p_running = self._p2p_table(self.running)
         self.p2p_rx_em = self._p2p_table(self.rx_em)
         self.p2p_scale_em = self._p2p_table(self.scale_em)
-        self.p2p_idx_em = self._p2p_table(self.idx_em)
         self.p2p_wts_em = self._p2p_table(self.wts_em)
         self.p2p_srcmap_em = self._p2p_table(self.srcmap_em)
         self.p2p_recv_num = self._p2p_table(
@@ -527,16 +542,19 @@ class FlyDSLDispatchGroupMajorOp:
 
     def _ll_views(self):
         rx_dtype = torch.float4_e2m1fn_x2 if _is_fp4_dtype(self.dtype) else self.dtype
-        rx_em_view = self.rx_em.view(rx_dtype).view(self.num_valid_max, self.row_view)
+        rx_em_view = self.rx_em.view(rx_dtype).view(
+            self.payload_rows_max, self.row_view
+        )
         scale_em_view = self.scale_em.view(torch.uint8).view(
-            self.num_valid_max, max(1, self.scale_n_i32 * 4)
+            self.payload_rows_max, max(1, self.scale_n_i32 * 4)
         )[:, : self.scale_bytes]
-        scale_em_i32 = self.scale_em.view(self.num_valid_max, max(1, self.scale_n_i32))
+        scale_em_i32 = self.scale_em.view(
+            self.payload_rows_max, max(1, self.scale_n_i32)
+        )
         return {
             "rx_em": rx_em_view,
             "scale_em": scale_em_view,
             "scale_em_i32": scale_em_i32,
-            "idx_em": self.idx_em,
             "wts_em": self.wts_em,
             "srcmap_em": self.srcmap_em,
             "sorted_expert_ids": self.sorted_expert_ids,
@@ -642,6 +660,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 scale_dim=config.scale_dim,
                 scale_type_size=config.scale_type_size,
                 compact=config.gm_compact,
+                indexed_payload=config.gm_indexed_payload,
             )
             # Fused dispatch and combine share one receive-count buffer.
             self._gm.total_recv = self.total_recv
