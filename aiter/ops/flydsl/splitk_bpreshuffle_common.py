@@ -49,6 +49,7 @@ def dispatch_flydsl_splitk(
     scale_mode: str,
     use_m_bounded_store: bool,
     in_dtype: str | None = None,
+    stage_a_scales: bool = False,
     preshuffle: (
         Callable[
             [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
@@ -92,5 +93,6 @@ def dispatch_flydsl_splitk(
         scale_mode=scale_mode,
         use_m_bounded_store=use_m_bounded_store,
         in_dtype=in_dtype,
+        stage_a_scales=stage_a_scales,
     )
     return Out

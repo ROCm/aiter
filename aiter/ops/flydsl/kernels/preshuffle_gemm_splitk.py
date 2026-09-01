@@ -163,6 +163,7 @@ def compile_preshuffle_gemm_splitk(
     scale_block_k: int = 128,
     use_m_bounded_store: bool = False,
     direct_out: bool = False,
+    stage_a_scales: bool = False,
 ):
     """Compile the split-K preshuffle GEMM partial pass (fp8/int8/fp16/bf16).
 
@@ -292,6 +293,14 @@ def compile_preshuffle_gemm_splitk(
             )
     scale_k = K // scale_block_k
     blocks_per_tile = tile_k // scale_block_k
+    a_scale_tile_elems = blocks_per_tile * tile_m
+    effective_stage_a_scales = (
+        stage_a_scales
+        and is_blockscale
+        and use_async_copy
+        and a_scale_tile_elems % 64 == 0
+        and not use_blockscale_gfx942
+    )
 
     if is_f16_or_bf16:
         layout_elem = Float16 if is_f16 else BFloat16
@@ -355,6 +364,10 @@ def compile_preshuffle_gemm_splitk(
         a0: fx.Array[layout_elem, a_lds_elems, 16]
         if lds_stage == 2:
             a1: fx.Array[layout_elem, a_lds_elems, 16]
+        if effective_stage_a_scales:
+            scale_a0: fx.Array[Float32, a_scale_tile_elems, 16]
+            if lds_stage == 2:
+                scale_a1: fx.Array[Float32, a_scale_tile_elems, 16]
 
     # ── Kernel ────────────────────────────────────────────────────────
     @flyc.kernel
@@ -491,6 +504,29 @@ def compile_preshuffle_gemm_splitk(
         else:
             sA_stages = [_make_sA(lds.a0), _make_sA(lds.a1)]
 
+        if const_expr(effective_stage_a_scales):
+            scale_a_lds_arrays = [lds.scale_a0]
+            scale_a_lds_stages = [
+                lds.scale_a0.view(fx.make_layout(a_scale_tile_elems, 1))
+            ]
+            scale_a_lds_i32_stages = [
+                fx.make_view(
+                    fx.recast_iter(Int32, lds.scale_a0.ptr),
+                    fx.make_layout(a_scale_tile_elems, 1),
+                )
+            ]
+            if const_expr(lds_stage == 2):
+                scale_a_lds_arrays.append(lds.scale_a1)
+                scale_a_lds_stages.append(
+                    lds.scale_a1.view(fx.make_layout(a_scale_tile_elems, 1))
+                )
+                scale_a_lds_i32_stages.append(
+                    fx.make_view(
+                        fx.recast_iter(Int32, lds.scale_a1.ptr),
+                        fx.make_layout(a_scale_tile_elems, 1),
+                    )
+                )
+
         # Partitions
         pA_g = thr_g2s.partition_S(tA)
         pA_s_stages = [thr_g2s.partition_D(s) for s in sA_stages]
@@ -554,6 +590,32 @@ def compile_preshuffle_gemm_splitk(
                 num_records_bytes=fx.Int64(i32_m) * fx.Int64(K) * fx.Int64(elem_bytes),
             )
             gA_div = fx.logical_divide(gA_flat, fx.make_layout(1, 1))
+            if const_expr(effective_stage_a_scales):
+                scale_a_dma_atom = fx.make_copy_atom(
+                    fx.rocdl.BufferCopyLDS32b(), Int32
+                )
+                g_scale_a = fx.rocdl.make_buffer_tensor(
+                    fx.Tensor(
+                        fx.make_view(
+                            fx.recast_iter(Int32, fx.get_iter(arg_scale_a)),
+                            fx.make_layout(65536 * scale_k, 1),
+                        )
+                    ),
+                    max_size=False,
+                    num_records_bytes=fx.Int64(scale_k)
+                    * fx.Int64(i32_m)
+                    * fx.Int64(4),
+                )
+                g_scale_a_flat = fx.make_view(
+                    fx.get_iter(g_scale_a), fx.make_layout(65536 * scale_k, 1)
+                )
+                g_scale_a_tiles = fx.logical_divide(
+                    g_scale_a_flat, fx.make_layout(1, 1)
+                )
+                s_scale_a_tiles = [
+                    fx.logical_divide(s, fx.make_layout(1, 1))
+                    for s in scale_a_lds_i32_stages
+                ]
             sA_i8_ptr = [fx.recast_iter(Int8, lds.a0.ptr)]
             if const_expr(lds_stage == 2):
                 sA_i8_ptr.append(fx.recast_iter(Int8, lds.a1.ptr))
@@ -582,6 +644,25 @@ def compile_preshuffle_gemm_splitk(
                     dst = fx.make_view(lds_ptr, fx.make_layout(1, 1))
                     src = fx.slice(gA_div, (None, fx.Int32(gmem_byte)))
                     fx.copy(dma_atom, src, dst)
+
+            def dma_scale_a_to_lds(k_tile_val, stage):
+                if const_expr(effective_stage_a_scales):
+                    global_kb0 = k_tile_val * Int32(blocks_per_tile)
+                    lane = tid % Int32(64)
+                    for it in range_constexpr(a_scale_tile_elems // 64):
+                        slot = Int32(it * 64) + lane
+                        sb = slot // Int32(tile_m)
+                        row = slot % Int32(tile_m)
+                        src_idx = (global_kb0 + sb) * Int32(i32_m) + bid_x * Int32(
+                            tile_m
+                        ) + row
+                        fx.copy(
+                            scale_a_dma_atom,
+                            fx.slice(g_scale_a_tiles, (None, src_idx)),
+                            fx.slice(
+                                s_scale_a_tiles[stage], (None, Int32(it * 64))
+                            ),
+                        )
 
         # ── Scheduling hints ───────────
         def build_scheduler(numer: int, denom: int):
@@ -718,7 +799,7 @@ def compile_preshuffle_gemm_splitk(
                 num_records_bytes=fx.Int64((N // scale_block_k) * scale_k * 4),
             )
 
-            def block_scale_vec(kb):
+            def block_scale_vec(kb, a_stage, local_sb):
                 """scale_a[kb,row] * scale_b[col/128,kb], laid out like the accumulator.
 
                 The N-block index is lane-uniform: a wave's 16-column group starts on a
@@ -737,18 +818,36 @@ def compile_preshuffle_gemm_splitk(
                     )
                     for ni in range_constexpr(num_acc_n)
                 ]
-                s_a = [
-                    Vec(
-                        buffer_ops.buffer_load(
-                            bs_scale_a_rsrc,
-                            fx.Int32(kb) * Int32(i32_m)
-                            + fx.Int32(bs_bx_m + mi * 16 + bs_lane_div_16 * 4),
-                            vec_width=4,
-                            dtype=T.f32,
+                if const_expr(effective_stage_a_scales):
+                    s_a = []
+                    for mi in range_constexpr(m_repeat):
+                        lds_off = (
+                            local_sb * tile_m
+                            + mi * 16
+                            + bs_lane_div_16 * 4
                         )
-                    ).bitcast(fx.Float32)
-                    for mi in range_constexpr(m_repeat)
-                ]
+                        ptr_off = fx.add_offset(
+                            scale_a_lds_arrays[a_stage].ptr, lds_off
+                        )
+                        i8_iter = fx.recast_iter(fx.Uint8, ptr_off)
+                        s_a.append(
+                            Vec(
+                                fx.make_view(i8_iter, fx.make_layout(16, 1)).load()
+                            ).bitcast(Float32)
+                        )
+                else:
+                    s_a = [
+                        Vec(
+                            buffer_ops.buffer_load(
+                                bs_scale_a_rsrc,
+                                fx.Int32(kb) * Int32(i32_m)
+                                + fx.Int32(bs_bx_m + mi * 16 + bs_lane_div_16 * 4),
+                                vec_width=4,
+                                dtype=T.f32,
+                            )
+                        ).bitcast(fx.Float32)
+                        for mi in range_constexpr(m_repeat)
+                    ]
                 elems = []
                 for p in range_constexpr(acc_size):
                     ni = p // (m_repeat * 4)
@@ -940,7 +1039,9 @@ def compile_preshuffle_gemm_splitk(
                     )
                     if const_expr(ki % 2 == 1):
                         sc = block_scale_vec(
-                            k_tile * Int32(blocks_per_tile) + Int32(ki // 2)
+                            k_tile * Int32(blocks_per_tile) + Int32(ki // 2),
+                            a_stage,
+                            ki // 2,
                         )
                         frag_C.store(scaled_acc(frag_C.load(), frag_blk.load(), sc))
                 elif const_expr(is_blockscale):
@@ -954,7 +1055,9 @@ def compile_preshuffle_gemm_splitk(
                         cur_frag_B[None, None, k_coord],
                         frag_blk,
                     )
-                    sc = block_scale_vec(k_tile * Int32(blocks_per_tile) + Int32(ki))
+                    sc = block_scale_vec(
+                        k_tile * Int32(blocks_per_tile) + Int32(ki), a_stage, ki
+                    )
                     frag_C.store(scaled_acc(frag_C.load(), frag_blk.load(), sc))
                 elif const_expr(is_mx):
                     # One k-step spans exactly one 128-K scale block, so a single
@@ -1005,6 +1108,7 @@ def compile_preshuffle_gemm_splitk(
             do_next = read_next and next_k_val is not None
             if const_expr(use_async_copy):
                 if const_expr(do_next):
+                    dma_scale_a_to_lds(next_k_val, a_write)
                     dma_a_to_lds(next_k_val, a_write)
                     load_B(write_stage, next_k_val)
                 mma_kloop(a_read, cur_frag_B, cur_k_val)
@@ -1032,6 +1136,7 @@ def compile_preshuffle_gemm_splitk(
             else Vec.filled(acc_size, 0.0, Float32)
         )
         if const_expr(use_async_copy):
+            dma_scale_a_to_lds(k_off, 0)
             dma_a_to_lds(k_off, 0)
             load_B(0, k_off)
             frag_C.store(acc_zero)
@@ -1057,6 +1162,7 @@ def compile_preshuffle_gemm_splitk(
                 load_B(0, k_next)
                 gpu.barrier()  # single buffer: all reads done before overwrite
                 if const_expr(use_async_copy):
+                    dma_scale_a_to_lds(k_next, 0)
                     dma_a_to_lds(k_next, 0)
                 else:
                     fx.copy(uni_copy, frag_copy_A, pA_s_stages[0][None, None, None])
