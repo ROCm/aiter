@@ -199,8 +199,7 @@ def get_flydsl_stage1_kernels(
 
     tile_ns = [32, 64, 128] if is_fp4_b else [128]
     tile_ks = [128, 256] if is_a16w4 else [256]
-    # tile_m=16 halves the M quantum; 1.18-1.35x on the E=896 inter=384 GEMM pair,
-    # token<=512 only. inter=512 is not tuned for it and stays at 32.
+    # tile_m=16 halves the M quantum: 1.18-1.35x at E=896 inter=384, token<=512 only.
     tile_ms = (
         [16, 32, 64, 128]
         if (is_fp4_b and (a_dtype == "fp8" or is_a16w4))
@@ -532,9 +531,8 @@ def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
         for tn in tile_ns:
             for tk in tile_ks:
                 # The kernel splits the 4 waves into (4/kw) N-waves x kw K-waves, so
-                # each N-wave covers tn/(4/kw) cols, a multiple of 16 for the 16x16 MMA
-                # (so kw=1 requires tn % 64 == 0, not merely tn >= 64: 80, 96, 112 and
-                # 160 are all dropped); kw > 1 additionally needs
+                # each N-wave covers tn/(4/kw) cols and needs >= 16 for the 16x16 MMA
+                # (kw=1 therefore requires tn % 64 == 0); kw > 1 additionally needs
                 # 4*tn <= tk so the K-slice fits the tile. b_nt=0 (L2-cached W loads)
                 # is registered alongside the default nt/streaming b_nt=2: large-M
                 # weight reuse wants cached, decode wants streamed.
