@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Correctness + perf for flydsl strided-batched a8w4 GEMM
-(``aiter/ops/flydsl/kernels/mxfp4_preshuffle_batched_gemm_gfx1250_tdm.py``).
+"""Correctness + perf for flydsl strided-batched GEMMs.
 
 DeepSeek-V4 grouped-output LoRA (``wo_a``) in ATOM is BF16 x BF16:
 
@@ -22,8 +21,8 @@ Shape mapping (V4-Pro, ``config.json``):
   k = n_heads * head_dim // o_groups = 4096
 
 Run:
-    python op_tests/test_flydsl_batched_gemm_a8w4_wo_a.py
-    python op_tests/test_flydsl_batched_gemm_a8w4_wo_a.py -s 128,1024,4096 -b 2
+    python op_tests/test_flydsl_batched_gemm.py
+    python op_tests/test_flydsl_batched_gemm.py -s 128,1024,4096 -b 2
 """
 
 import argparse
@@ -35,17 +34,49 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale_bpreshuffle
 from aiter.ops.flydsl.batched_gemm_mxfp4 import (
     flydsl_batched_gemm_a8w4_v2,
     preshuffle_a8w4_weight_mbn,
     quant_act_mxfp8_mbn,
 )
+from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 
 SUPPORTED_GFX = ["gfx1250"]
 SEED = 0
+BLOCK = 128  # a8w8 e8m0 block: 1x128 on the activation, 128x128 on the weight
+
+
+def _to_e8m0_scale(scale):
+    e = torch.ceil(torch.log2(scale.to(dtypes.fp32))).to(torch.int32) + 127
+    e = torch.clamp(e, 0, 255).to(torch.uint8)
+    return e, torch.exp2(e.to(dtypes.fp32) - 127.0)
+
+
+def quant_act_e8m0_128(x_bf16):
+    """[M,B,K] bf16 -> fp8 [M,B,K] + e8m0 [M,B,K/128]."""
+    m, b, k = x_bf16.shape
+    xb = x_bf16.to(dtypes.fp32).view(m, b, k // BLOCK, BLOCK)
+    raw = xb.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8) / 448.0
+    e8m0, scale = _to_e8m0_scale(raw)
+    q = (xb / scale).clamp(-448.0, 448.0).to(dtypes.fp8)
+    return q.view(m, b, k).contiguous(), e8m0.squeeze(-1)
+
+
+def quant_weight_e8m0_128(w_bf16):
+    """[B,N,K] bf16 -> fp8 [B,N,K] + e8m0 [B,N/128,K/128]."""
+    b, n, k = w_bf16.shape
+    wb = w_bf16.to(dtypes.fp32).view(b, n // BLOCK, BLOCK, k // BLOCK, BLOCK)
+    raw = wb.abs().amax(dim=(2, 4), keepdim=True).clamp(min=1e-8) / 448.0
+    e8m0, scale = _to_e8m0_scale(raw)
+    q = (wb / scale).clamp(-448.0, 448.0).to(dtypes.fp8)
+    return (
+        q.view(b, n, k).contiguous(),
+        e8m0.view(b, n // BLOCK, k // BLOCK).contiguous(),
+    )
 
 
 def _ref_quant_n32k4_mbn(o_mbn: torch.Tensor):
@@ -123,8 +154,8 @@ def test_fused_quant_n32k4_mbn(b, m, k, dtype):
 
 
 @benchmark()
-def test_wo_a_a8w4_gemm(b, m, n, k, dtype, layout):
-    """Strided-batched a8w4 GEMM vs BF16 einsum (lossy quant tolerances)."""
+def test_batched_gemm(b, m, n, k, dtype, layout):
+    """a8w4 and a8w8 strided-batched GEMM vs the same BF16 einsum."""
     torch.manual_seed(SEED)
     # Model path: o is physically [m, b, k] (mbn); kernel out is a transposed
     # view of preallocated [m, b, n] — same as test_batched_gemm_bf16 mbn case.
@@ -157,17 +188,34 @@ def test_wo_a_a8w4_gemm(b, m, n, k, dtype, layout):
         )
         return y_out
 
-    candidates = {"flydsl_v2": _launch}
+    candidates = {"a8w4": _launch}
+    # mxfp8 A + mxfp4 B + scale traffic + bf16 C
+    nbytes = {
+        "a8w4": (
+            m * b * k  # fp8 A
+            + b * n * (k // 2)  # mxfp4 B codes
+            + ((m + 31) // 32) * b * (k // 32) * 32  # A scale
+            + b * (n // 32) * (k // 32) * 32  # B scale
+            + b * m * n * y_phys.element_size()  # bf16 out
+        )
+    }
+
+    if layout == "mbn":
+        x8, xs8 = quant_act_e8m0_128(o_mbn)
+        w8, ws8 = quant_weight_e8m0_128(w_bnk)
+        w8_shuf = shuffle_weight(w8)
+        candidates["a8w8"] = lambda: batched_gemm_a8w8_mxscale_bpreshuffle(
+            x8, w8_shuf, xs8, ws8, dtype=dtype
+        ).transpose(0, 1)
+        nbytes["a8w8"] = (
+            m * b * k  # fp8 A
+            + b * n * k  # fp8 B (twice the fp4 codes)
+            + m * b * (k // BLOCK)  # A scale (per-token x 128)
+            + b * (n // BLOCK) * (k // BLOCK)  # B scale (128x128 block)
+            + b * m * n * y_phys.element_size()
+        )
 
     flops = 2 * b * m * n * k
-    # mxfp8 A + mxfp4 B + scale traffic + bf16 C
-    nbytes = (
-        m * b * k  # fp8 A
-        + b * n * (k // 2)  # mxfp4 B codes
-        + ((m + 31) // 32) * b * (k // 32) * 32  # A scale
-        + b * (n // 32) * (k // 32) * 32  # B scale
-        + b * m * n * y_phys.element_size()  # bf16 out
-    )
 
     ret = {"gfx": get_gfx()}
     for name, fn in candidates.items():
@@ -185,7 +233,7 @@ def test_wo_a_a8w4_gemm(b, m, n, k, dtype, layout):
         err = 0.0 if cos >= 0.99 else (1.0 - cos)
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
-        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} TB/s"] = nbytes[name] / us / 1e6
         ret[f"{name} cos"] = cos
         ret[f"{name} mre"] = mre
         ret[f"{name} err"] = err
@@ -223,8 +271,7 @@ def main():
         "--batch",
         type=int,
         nargs="*",
-        # n_local_groups = o_groups // tp for V4 deployments (see test_batched_gemm_bf16).
-        default=[16, 8, 4, 2],
+        default=[16, 8, 4, 2, 1],
         help="Batch size (n_local_groups).\n        e.g.: -b 2",
     )
     parser.add_argument(
@@ -234,11 +281,13 @@ def main():
         nargs="*",
         default=[
             (1, 1024, 4096),
+            (16, 1024, 4096),  # cudagraph decode bucket
             (17, 1024, 4096),  # M not a multiple of 32 -> super padding/OOB
             (32, 1024, 4096),
             (128, 1024, 4096),
             (1024, 1024, 4096),
             (4096, 1024, 4096),
+            (16384, 1024, 4096),  # chunked-prefill budget
         ],
         help="Shape m,n,k.\n        e.g.: -s 128,1024,4096",
     )
@@ -263,8 +312,8 @@ def main():
         for layout, b, (m, n, k) in itertools.product(
             args.layout, args.batch, args.mnk
         ):
-            gemm_rows.append(test_wo_a_a8w4_gemm(b, m, n, k, dtype, layout))
-        summarize("wo_a_a8w4_gemm", gemm_rows)
+            gemm_rows.append(test_batched_gemm(b, m, n, k, dtype, layout))
+        summarize("batched_gemm (a8w4 vs a8w8, same BF16 reference)", gemm_rows)
 
 
 if __name__ == "__main__":
