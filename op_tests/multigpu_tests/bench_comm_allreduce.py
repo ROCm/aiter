@@ -19,8 +19,9 @@ all-reduce is fastest at this shape, and what does it cost in accuracy".
 | ``fly_int4``  | FlyDSL two-shot INT4 (ROCm/aiter#4970)  | int4     | no  |
 | ``rccl``      | ``dist.all_reduce``                     | bf16/fp16| yes |
 
-Candidates are skipped (``nan`` cell, or no column at all when nothing in the
-sweep could run them) where they do not apply:
+Candidates are skipped (an ``n/a`` cell in the latency/accuracy/busbw/roofline
+tables, or no column at all when nothing in the sweep could run them) where
+they do not apply:
 
 * ``cdr_fp8`` is **fp16-only and only above 128*2048 elements** -- below that
   ``custom_all_reduce.cu:90`` silently runs the plain kernel instead, so timing
@@ -192,14 +193,17 @@ _FP8_MIN_NUMEL = 128 * 2048
 if is_flydsl_available():
     from aiter.ops.flydsl import QRInt4
     from aiter.ops.flydsl.kernels.qr_int4 import (
+        ALGORITHMS,
         MIN_PAYLOAD_BYTES,
         has_xgmi_peer_links,
     )
 
+    _FLY_MIN_BYTES = {n: a.min_bytes for n, a in ALGORITHMS.items()}
     HAS_FLY_INT4 = True
 else:
     QRInt4 = None
     MIN_PAYLOAD_BYTES = 0
+    _FLY_MIN_BYTES = {}
     has_xgmi_peer_links = None
     HAS_FLY_INT4 = False
 
@@ -264,6 +268,7 @@ class Candidate:
     quant: str | None = None  # QuickReduceRegime name, family == "qr"
     use_new: bool = True  # family == "cdr"
     fp8: bool = False  # family == "cdr"
+    algorithm: str = "two_shot"  # QRInt4 schedule, family == "fly"
 
 
 # Floors sit ~5 dB below what each candidate measures on a healthy gfx950 build
@@ -281,6 +286,12 @@ CANDIDATES = (
     Candidate("qr_int4", "qr", 14.0, False, quant="INT4"),  # 18.3 / 18.3
     Candidate("qr_int3", "qr", 8.0, False, quant="INT3"),  # 12.2 / 12.2
     Candidate("fly_int4", "fly", 15.0, False),  # 19.2 / n/a
+    # Same kernel family, ring schedule. Its floor is lower than fly_int4's
+    # because the ring's reduce-scatter lap requantizes N-1 times where two-shot
+    # requantizes once; measured 18.7 dB at TP4 (against 19.2), and *better*
+    # than two-shot at TP2 (22.2 dB) where the all-gather lap's verbatim
+    # forwarding dominates. 14 dB leaves the usual ~5 dB of headroom.
+    Candidate("fly_int4_ring", "fly", 14.0, False, algorithm="ring"),  # 18.7 / n/a
     Candidate("rccl", "rccl", 40.0, True),  # 51 / 69
 )
 CANDIDATE_KEYS = [c.key for c in CANDIDATES]
@@ -315,9 +326,13 @@ def applicable(cand: Candidate, world_size: int, dtype, numel: int, nbytes: int)
     """Whether *cand* can legally run this configuration.
 
     Mirrors each implementation's own gate. A candidate that is not applicable
-    is not run at all, so its cell comes out ``nan`` (or its column is absent
-    when nothing in the sweep could run it): ``nan`` always means "cannot run
-    here", never "ran and was slow".
+    is not run at all, so its cell reads ``n/a`` in the latency, accuracy,
+    busbw and roofline-efficiency tables (or its column is absent when nothing
+    in the sweep could run it): ``n/a`` always means "cannot run here", never
+    "ran and was slow". A bare ``nan`` elsewhere in those tables means
+    something else entirely -- a roofline measurement TransferBench could not
+    make, or a summary winner excluded by the accuracy floor -- and is left as
+    ``nan`` on purpose so the two are not confused.
     """
     if nbytes % 16 != 0:
         # Every custom path requires 16B-aligned payloads; only RCCL survives.
@@ -334,16 +349,17 @@ def applicable(cand: Candidate, world_size: int, dtype, numel: int, nbytes: int)
         # production refuses to take.
         return not (cand.quant == "INT3" and world_size != 2)
     if cand.family == "fly":
-        # QRInt4.allreduce refuses payloads under MIN_PAYLOAD_BYTES, where INT4
-        # compression cannot pay for its two handshake round trips and the
-        # exact kernels are at least as fast. Mirror that gate rather than
-        # letting the call raise.
+        # QRInt4.allreduce refuses payloads under its floor. The two schedules
+        # have different ones -- two-shot's is an accuracy policy, the ring's a
+        # speed one (it only overtakes two-shot past ~10.5 MiB on PCIe) -- so
+        # mirror whichever applies rather than letting the call raise.
+        floor = _FLY_MIN_BYTES[cand.algorithm]
         return (
             HAS_FLY_INT4
             and get_gfx() in _FLY_ARCHS
             and world_size in _FLY_WORLDS
             and dtype == dtypes.bf16
-            and nbytes >= MIN_PAYLOAD_BYTES
+            and nbytes >= floor
         )
     return True  # rccl
 
@@ -515,8 +531,8 @@ def _build_thunks(cands, *, ca_comm, qr_comm, fly, group, x):
             thunks[cand.key] = _qr
         elif cand.family == "fly":
 
-            def _fly(o=out):
-                fly.allreduce(x, o)
+            def _fly(o=out, eng=fly[cand.algorithm]):
+                eng.allreduce(x, o)
                 return o
 
             thunks[cand.key] = _fly
@@ -559,7 +575,7 @@ def _bench_shape(
         if c.key in keys
         and applicable(c, tp_size, dtype, x.numel(), nbytes)
         and not (c.family == "qr" and qr_comm is None)
-        and not (c.family == "fly" and fly is None)
+        and not (c.family == "fly" and c.algorithm not in fly)
     ]
     thunks, buffers = _build_thunks(
         cands, ca_comm=ca_comm, qr_comm=qr_comm, fly=fly, group=group, x=x
@@ -689,28 +705,37 @@ def _worker(
     dist.all_reduce(torch.zeros(1, device=device), group=group)
     torch.cuda.synchronize()
 
-    fly = None
+    fly = {}  # QRInt4 schedule name -> engine
+    wanted_algos = sorted(
+        {c.algorithm for c in CANDIDATES if c.family == "fly" and c.key in keys}
+    )
     if (
-        "fly_int4" in keys
+        wanted_algos
         and HAS_FLY_INT4
         and get_gfx() in _FLY_ARCHS
         and tp_size in _FLY_WORLDS
         and dtype == dtypes.bf16
     ):
-        # QRInt4 exchanges IPC handles via broadcast_object_list, so it needs
-        # the gloo (CPU) group -- it rejects an NCCL group outright.
-        fly = QRInt4(
-            group=tp_group.cpu_group,
-            device=device,
-            rank=rank,
-            world_size=tp_size,
-        )
+        # One engine per schedule: each owns its own IPC inbox, whose layout is
+        # schedule-specific. Built in a fixed (sorted) order so every rank
+        # performs its handle exchanges in the same sequence.
+        for algo in wanted_algos:
+            # QRInt4 exchanges IPC handles via broadcast_object_list, so it
+            # needs the gloo (CPU) group -- it rejects an NCCL group outright.
+            fly[algo] = QRInt4(
+                group=tp_group.cpu_group,
+                device=device,
+                rank=rank,
+                world_size=tp_size,
+                algorithm=algo,
+            )
         # compile() is itself a collective launch on every super-tile engine and
         # builds all of them, so one call at any shape keeps the JIT out of
         # every timed region below.
         warm = torch.zeros((8, DSV4_HIDDEN), dtype=dtypes.bf16, device=device)
-        dist.barrier(group=group)
-        fly.compile(warm, torch.empty_like(warm))
+        for algo in wanted_algos:
+            dist.barrier(group=group)
+            fly[algo].compile(warm, torch.empty_like(warm))
         del warm
 
     try:
@@ -734,8 +759,8 @@ def _worker(
             for tokens, hidden in shapes
         ]
     finally:
-        if fly is not None:
-            fly.close()
+        for eng in fly.values():
+            eng.close()
         if dist.is_initialized():
             destroy_model_parallel()
             destroy_distributed_environment()
@@ -864,6 +889,24 @@ SUMMARY_ID_COLUMNS = [
 ]
 
 
+def _mark_na(out, cols):
+    """Turn NaN into ``None`` in *cols*, so ``to_markdown(missingval="n/a")``
+    renders it as ``n/a`` instead of ``nan``.
+
+    Only for columns whose NaN can *only* mean "candidate not applicable to
+    this row" (see ``applicable()``) -- a plain float NaN elsewhere (a failed
+    roofline measurement, a floor-excluded winner) is left alone, since that is
+    a different thing than "this kernel does not run here" and should keep
+    reading ``nan``. Needs an explicit ``None`` rather than a float NaN because
+    tabulate's ``missingval`` only fires on the former; converting the column
+    to ``object`` first is what makes that stick without disturbing the
+    ``floatfmt`` of the real numbers still in it.
+    """
+    for col in cols:
+        if col in out.columns:
+            out[col] = out[col].astype(object).where(out[col].notna(), None)
+
+
 def latency_table(df, baseline: str, keys):
     """``us`` per candidate plus a speedup column against *baseline*.
 
@@ -888,12 +931,14 @@ def latency_table(df, baseline: str, keys):
             "this sweep); skipping speedup columns",
             baseline,
         )
+        _mark_na(out, [f"{k} us" for k in keys])
         return out
     for k in keys:
         col = f"{k} us"
         if k == baseline or col not in df.columns:
             continue
         out[f"{k} vs {baseline}"] = df[base_col] / df[col]
+    _mark_na(out, [f"{k} us" for k in keys] + [f"{k} vs {baseline}" for k in keys])
     return out
 
 
@@ -901,7 +946,9 @@ def metric_table(df, suffix: str, keys):
     cols = [c for c in ID_COLUMNS if c in df] + [
         f"{k} {suffix}" for k in keys if f"{k} {suffix}" in df
     ]
-    return df[cols]
+    out = df[cols].copy()
+    _mark_na(out, [f"{k} {suffix}" for k in keys])
+    return out
 
 
 def _roof(row, key, measured):
@@ -937,13 +984,50 @@ def _eff(row, key, us, measured):
     return roof / us if roof is not None else float("nan")
 
 
-def summary_table(
-    df, keys, baseline: str, min_sqnr: float = DEFAULT_MIN_SQNR, roofline=None
-):
-    """One winner per shape, and what it buys over *baseline*.
+def _prod_candidate_key(prod_path: str) -> str | None:
+    """Map a ``prod path`` string to the ``CANDIDATES`` key with its timing.
+
+    ``production_path()`` emits exactly three shapes: ``"rccl"``,
+    ``"cdr:<kernel>"`` (e.g. ``"cdr:2stage"``), and ``"qr:<regime>"`` (e.g.
+    ``"qr:int4"``). The ``cdr:`` prefix always means the shipped kernel --
+    production has no lever to select ``cdr_naive``. Returns ``None`` for a
+    format this does not recognize, which the caller treats as "no production
+    reference for this row" rather than guessing.
+    """
+    if prod_path == "rccl":
+        return "rccl"
+    if prod_path.startswith("cdr:"):
+        return "cdr"
+    if prod_path.startswith("qr:"):
+        return f"qr_{prod_path.split(':', 1)[1]}"
+    return None
+
+
+def summary_table(df, keys, min_sqnr: float = DEFAULT_MIN_SQNR, roofline=None):
+    """One winner per shape, and what it buys over the row's production path.
 
     The headline answer: for this shape, what is the fastest thing aiter can do
-    to an all-reduce, and how much faster is it than the kernel we ship?
+    to an all-reduce, and how much faster is it than what production actually
+    dispatches here?
+
+    **"Production" is derived per row from ``prod path``, not from a fixed
+    candidate.** An earlier version used *every* row's ``prod time (us)`` from
+    a single CLI-selected baseline (``cdr`` by default) while labelling the
+    column with the per-row ``prod path`` string -- so a row where production
+    falls back to RCCL (large messages past the custom-AR cutoff, or QR
+    disabled) printed ``prod collective = rccl`` next to ``cdr``'s time and
+    efficiency under that name. The two must always describe the same
+    collective: ``_prod_candidate_key`` parses ``prod path`` (``"rccl"``,
+    ``"cdr:<kernel>"``, ``"qr:<regime>"``) back into the ``CANDIDATES`` key
+    that was actually timed, and every ``prod *`` column below comes from that
+    key's own row -- never from an unrelated fixed baseline.
+
+    A row can still show ``prod collective`` with no timing: if ``prod path``
+    names a candidate the sweep did not measure (``-c`` excluded it, or the
+    env implied a candidate the sweep never enabled), ``prod time (us)`` is
+    NaN and a rendered ``-``. That is reported once per candidate rather than
+    silently substituting a different collective's number -- see the log line
+    this emits.
 
     **Ranked on speed alone this table would be a trap**, which is why the
     winner is accuracy-gated and why there are two of them:
@@ -967,19 +1051,22 @@ def summary_table(
     Both ratios are ``prod time (us) / fastest time (us)``, so **> 1.0 means
     faster than production**, matching ``latency_table``. A row whose winner
     *is* the production path reads 1.0, which is the useful answer that
-    nothing beat it. ``prod time (us)`` is *baseline*'s time -- usually the
-    ``cdr`` kernel aiter ships, but it can read as an RCCL collective wherever
-    ``prod path`` fell back to it.
+    nothing beat it.
 
     *roofline*, when given the ``measured`` lookup from ``measure_roofline``,
     adds a ``prod eff`` / ``fastest eff`` / ``fastest exact eff`` column next
     to each winner -- the same ``roof us / cand us`` ratio as
-    ``roofline_table``, graded on that candidate's own wire bytes and pattern,
-    so a quantizing winner is not held to the exact candidates' ceiling.
+    ``roofline_table``, graded on that candidate's own wire bytes, so a
+    quantizing winner is not held to the exact candidates' ceiling. This is
+    also why a faster winner can show a *lower* eff than a slower one: e.g.
+    ``fly_int4`` sends 1/4 the bytes of ``rccl``, so its roof is a quarter the
+    size, and the same fixed quantize/dequantize and launch overhead is a
+    larger fraction of a smaller roof. Faster-but-less-efficient is the
+    signature of a candidate that is winning on payload reduction rather than
+    on using the fabric well.
     """
     exact_keys = {c.key for c in CANDIDATES if c.exact}
     live = [k for k in keys if f"{k} us" in df.columns]
-    base_col = f"{baseline} us"
     # Only worth a separate column when the sweep actually mixes accuracy
     # classes; with -c cdr rccl every candidate is exact and it would duplicate.
     want_exact = any(k not in exact_keys for k in live)
@@ -1006,18 +1093,30 @@ def summary_table(
 
     rows = []
     gated = {}  # candidate -> how many rows it would have won but for the floor
+    unresolved_prod = {}  # candidate -> rows where prod path named it unmeasured
     id_rename = {"prod path": "prod collective"}
     for _, r in df.iterrows():
         out = {id_rename.get(c, c): r[c] for c in SUMMARY_ID_COLUMNS if c in df}
-        base_us = r.get(base_col, float("nan"))
-        out["prod time (us)"] = base_us
+
+        prod_key = _prod_candidate_key(r["prod path"])
+        prod_us = r.get(f"{prod_key} us") if prod_key else None
+        if prod_key is not None and (prod_us is None or not pd.notna(prod_us)):
+            unresolved_prod[prod_key] = unresolved_prod.get(prod_key, 0) + 1
+            prod_us = None
+        out["prod time (us)"] = prod_us if prod_us is not None else float("nan")
         if roofline is not None:
-            out["prod eff"] = _eff(r, baseline, base_us, roofline)
+            out["prod eff"] = (
+                _eff(r, prod_key, prod_us, roofline)
+                if prod_key is not None and prod_us is not None
+                else float("nan")
+            )
 
         k, us = _pick(r, live, min_sqnr)
         out["fastest collective"] = k or "-"
         out["fastest time (us)"] = us
-        out["fastest vs prod"] = base_us / us if pd.notna(base_us) else float("nan")
+        out["fastest vs prod"] = (
+            prod_us / us if prod_us is not None and pd.notna(us) else float("nan")
+        )
         if roofline is not None:
             out["fastest eff"] = _eff(r, k, us, roofline)
         out["fastest collective SQNR dB"] = (
@@ -1034,7 +1133,7 @@ def summary_table(
             out["fastest exact collective"] = k or "-"
             out["fastest exact time (us)"] = us
             out["fastest exact vs prod"] = (
-                base_us / us if pd.notna(base_us) else float("nan")
+                prod_us / us if prod_us is not None and pd.notna(us) else float("nan")
             )
             if roofline is not None:
                 out["fastest exact eff"] = _eff(r, k, us, roofline)
@@ -1050,11 +1149,14 @@ def summary_table(
             min_sqnr,
         )
 
-    if base_col not in df.columns:
+    for k, n in sorted(unresolved_prod.items(), key=lambda kv: -kv[1]):
         logger.warning(
-            "baseline %r produced no results in this sweep; the summary "
-            "table's ratio columns will be empty",
-            baseline,
+            "summary: prod path named %s on %d/%d row(s), but it was not "
+            "measured in this sweep (excluded by -c, or implied by an env "
+            "var this sweep did not enable); prod time/eff are blank there",
+            k,
+            n,
+            len(df),
         )
     return pd.DataFrame(rows)
 
@@ -1146,7 +1248,15 @@ def roofline_table(df, keys, measured):
     ]
     out["roof algo"] = [x.algo if x is not None else "-" for x in roofs]
     for k in live:
-        out[f"{k} eff"] = [_eff(r, k, r[f"{k} us"], measured) for _, r in df.iterrows()]
+        # None (-> "n/a") when the candidate does not apply to this row;
+        # float nan (-> "nan") when it does but the roofline point for it
+        # could not be measured. _eff() collapses that distinction, so it is
+        # remade here rather than by blanket-marking the column afterwards.
+        effs = [
+            _eff(r, k, r[f"{k} us"], measured) if pd.notna(r[f"{k} us"]) else None
+            for _, r in df.iterrows()
+        ]
+        out[f"{k} eff"] = pd.Series(effs, dtype=object, index=out.index)
     return out
 
 
@@ -1411,7 +1521,7 @@ def main():
         tables = [
             (
                 f"{dtype_name} summary",
-                summary_table(df, keys, args.baseline, args.min_sqnr, measured),
+                summary_table(df, keys, args.min_sqnr, measured),
             ),
             (f"{dtype_name} latency", latency_table(df, args.baseline, keys)),
             (f"{dtype_name} accuracy", metric_table(df, "SQNR dB", keys)),
@@ -1424,7 +1534,7 @@ def main():
             )
             roofline_cus = args.roofline_cus
         for title, table in tables:
-            md = table.to_markdown(index=False, floatfmt=".4g")
+            md = table.to_markdown(index=False, floatfmt=".4g", missingval="n/a")
             logger.info("all-reduce %s (markdown):\n%s", title, md)
             sections.append((title, md))
 

@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Host launch for gfx942/gfx950 TP∈{2,4,8} INT4 two-shot all-reduce.
+"""Host launch for gfx942/gfx950 TP∈{2,4,8} INT4 all-reduce.
 
-Public type ``QRInt4``. Super-tile ST∈{1,8}; ST=1 when ``num_tiles ≤ grid_cap``.
+Public type ``QRInt4``, with two interchangeable schedules selected by
+``algorithm``: ``"two_shot"`` (the default -- direct fanout to all N-1 peers,
+twice) and ``"ring"`` (2(N-1) single-destination hops). Super-tile ST∈{1,8}.
 INT4 nibble + group-16 E4M3. Payload HBM is bf16.
 """
 
@@ -11,6 +13,8 @@ from __future__ import annotations
 
 import ctypes
 import logging
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import flydsl.compiler as flyc
@@ -30,6 +34,11 @@ from .qr_int4_kernel import (
     WORLD,
     has_release_fence,
     make_qr_int4_kernel,
+)
+from .qr_int4_ring_kernel import (
+    RING_SUPER_TILES,
+    RS_CODECS,
+    make_qr_int4_ring_kernel,
 )
 
 logger = logging.getLogger("aiter")
@@ -64,6 +73,90 @@ MIN_PAYLOAD_BYTES = 128 << 10
 # reaches its measured optimum of 56 blocks, high enough that the sub-MiB cases
 # keep the parallelism they actually need.
 _MIN_BATCH_BLOCKS = 32
+
+# Size floor for the ring, separate from the two-shot's -- and unlike the
+# two-shot's, this one is a *speed* policy, not an accuracy one.
+#
+# The ring pays 2(N-1) serialized handshakes where two-shot pays 2 (6 at TP4,
+# 14 at TP8) and buys back a contiguous single-destination write. Which wins is
+# purely a size question. Measured on MI350P (PCIe, fine-grained inbox), TP4,
+# bf16, hidden 7168, ST=8, 30 timed iterations:
+#
+#     tokens    MiB   two-shot     ring
+#        12    0.16     17.1 us   32.5 us   1.9x slower
+#       128    1.75     52.8 us   73.9 us
+#       512    7.00    134.8 us  157.0 us
+#       640    8.75    161.9 us  176.6 us
+#       768   10.50    192.1 us  191.3 us   <- par
+#       896   12.25    217.5 us  208.4 us
+#      1024   14.00    249.6 us  227.4 us   1.10x faster
+#      4096   56.00    939.8 us  829.7 us   1.13x faster
+#
+# 12 MiB sits just past the measured par point, so `is_beneficial` only admits
+# sizes where the ring actually wins rather than merely ties.
+#
+# Note this is a TP>=4 result. At TP2 the two-shot already writes to a single
+# peer, so there is no destination interleaving for the ring to remove and it
+# only adds hops: 458.5 us against 414.5 at 56 MiB. It is still *more accurate*
+# there (22.2 dB against 19.2, see the class docstring), which is a reason to
+# choose it, but not a throughput one.
+_RING_MIN_PAYLOAD_BYTES = 12 << 20
+
+
+@dataclass(frozen=True)
+class _Algorithm:
+    """One all-reduce schedule, plus the host-side policy that tunes it.
+
+    Everything ``QRInt4`` does *around* the kernel -- IPC setup, payload
+    validation, one engine per super-tile, launch -- is identical across
+    schedules and stays on the class. What differs is which kernel factory to
+    call, which super-tile values and wire formats that factory accepts, and
+    where the size floor sits. That is this record.
+
+    ``build`` is keyword-only and always receives ``rank`` and ``rs_codec``,
+    whether or not a given schedule uses them. The ring bakes ``rank`` in at
+    compile time -- the chunk a step operates on is ``(rank - step) % N``, which
+    has to be a Python constant to index a register-resident atom list -- while
+    two-shot takes it as a runtime kernel argument and ignores it here.
+    """
+
+    name: str
+    build: Callable[..., dict]
+    super_tiles: tuple[int, ...]
+    rs_codecs: tuple[str, ...]
+    min_bytes: int
+    min_batch_blocks: int
+
+
+def _build_two_shot(*, world_size, rank, super_tile, grid, inbox_memory, rs_codec):
+    del rank, rs_codec  # a runtime kernel argument; and not a two-shot knob
+    return make_qr_int4_kernel(
+        world_size=world_size,
+        super_tile=super_tile,
+        grid=grid,
+        inbox_memory=inbox_memory,
+    )
+
+
+ALGORITHMS = {
+    "two_shot": _Algorithm(
+        name="two_shot",
+        build=_build_two_shot,
+        super_tiles=SUPER_TILES,
+        rs_codecs=("int4",),
+        min_bytes=MIN_PAYLOAD_BYTES,
+        min_batch_blocks=_MIN_BATCH_BLOCKS,
+    ),
+    "ring": _Algorithm(
+        name="ring",
+        build=make_qr_int4_ring_kernel,
+        super_tiles=RING_SUPER_TILES,
+        rs_codecs=RS_CODECS,
+        min_bytes=_RING_MIN_PAYLOAD_BYTES,
+        min_batch_blocks=_MIN_BATCH_BLOCKS,
+    ),
+}
+DEFAULT_ALGORITHM = "two_shot"
 
 # KFD io-link type for xGMI, from include/uapi/linux/kfd_sysfs.h. PCIe is 2.
 _HSA_IOLINK_TYPE_XGMI = 11
@@ -221,6 +314,26 @@ class QRInt4:
 
     Requires a non-NCCL, single-node process group for IPC metadata exchange.
 
+    ``algorithm`` selects the schedule. Both are drop-in for each other -- same
+    constructor, same ``compile`` / ``allreduce`` / ``close``, same payload
+    rules -- so switching is one keyword:
+
+    * ``"two_shot"`` (default) -- reduce-scatter then all-gather, each rank
+      pushing to every one of the ``N-1`` peers. Two hops. Optimal on a meshed
+      xGMI node.
+    * ``"ring"`` -- ``2(N-1)`` hops, each a single contiguous run into exactly
+      one peer's inbox. Same wire volume (``2(N-1)/N`` of the payload), traded
+      for per-destination locality: on a PCIe host, one shared uplink handed
+      ``>=256 B`` runs to one destination measured 54.03 GB/s against 36.25 for
+      64 B destination-interleaved. Structurally worse at decode sizes and on
+      xGMI; opt in deliberately.
+
+    ``rs_codec`` is the wire format of the ring's reduce-scatter lap, which is
+    the only place the ring loses accuracy the two-shot does not (it requantizes
+    ``N-1`` times where two-shot requantizes once). ``"int6"`` widens that lap
+    only; the all-gather lap forwards bytes verbatim and stays INT4 in both.
+    Rejected for ``algorithm="two_shot"``, which has no such lap.
+
     ``inbox_memory`` selects how the IPC inbox is allocated:
 
     * ``"auto"`` (default) -- ``uncached`` on hosts with xGMI peer links,
@@ -252,14 +365,27 @@ class QRInt4:
         grid_cap: int | None = None,
         inbox_memory: str = "auto",
         min_bytes: int | None = None,
+        algorithm: str = DEFAULT_ALGORITHM,
+        rs_codec: str = "int4",
     ):
         if world_size not in SUPPORTED_WORLDS:
             raise ValueError(
                 f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
             )
-        if super_tile not in SUPER_TILES:
+        if algorithm not in ALGORITHMS:
             raise ValueError(
-                f"super_tile must be one of {SUPER_TILES}, got {super_tile!r}"
+                f"algorithm must be one of {tuple(ALGORITHMS)}, got {algorithm!r}"
+            )
+        algo = ALGORITHMS[algorithm]
+        if super_tile not in algo.super_tiles:
+            raise ValueError(
+                f"super_tile must be one of {algo.super_tiles} for "
+                f"algorithm={algorithm!r}, got {super_tile!r}"
+            )
+        if rs_codec not in algo.rs_codecs:
+            raise ValueError(
+                f"rs_codec must be one of {algo.rs_codecs} for "
+                f"algorithm={algorithm!r}, got {rs_codec!r}"
             )
         group_world = dist.get_world_size(group=group)
         group_rank = dist.get_rank(group=group)
@@ -288,8 +414,11 @@ class QRInt4:
         self.super_tile = int(super_tile)
         self._grid = cap
         self.inbox_memory = resolved_inbox
+        self.algorithm = algorithm
+        self.rs_codec = rs_codec
+        self._algo = algo
         self._batch_publishes = has_release_fence(resolved_inbox)
-        self.min_bytes = MIN_PAYLOAD_BYTES if min_bytes is None else int(min_bytes)
+        self.min_bytes = algo.min_bytes if min_bytes is None else int(min_bytes)
         if self.min_bytes < 0:
             raise ValueError(f"min_bytes must be non-negative, got {self.min_bytes}")
 
@@ -298,11 +427,13 @@ class QRInt4:
             sts.append(self.super_tile)
         self._by_st = {}
         for st in sts:
-            spec = make_qr_int4_kernel(
+            spec = algo.build(
                 world_size=self.world_size,
+                rank=self.rank,
                 super_tile=st,
                 grid=self._grid,
                 inbox_memory=resolved_inbox,
+                rs_codec=rs_codec,
             )
             self._by_st[st] = _StEngine(
                 spec=spec,
@@ -352,7 +483,7 @@ class QRInt4:
         61.95 us unbounded against 23.98 with the grid left alone.
         """
         if self._batch_publishes and super_tile != 1:
-            batched = max(-(-num_tiles // super_tile), _MIN_BATCH_BLOCKS)
+            batched = max(-(-num_tiles // super_tile), self._algo.min_batch_blocks)
             num_tiles = min(num_tiles, batched)
         return max(1, min(num_tiles, self._grid))
 

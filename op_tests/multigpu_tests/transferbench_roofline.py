@@ -126,6 +126,7 @@ WIRE_RATIO = {
     "qr_int4": 4.0 / 16.0,
     "qr_int3": 3.0 / 16.0,
     "fly_int4": 4.0 / 16.0,
+    "fly_int4_ring": 4.0 / 16.0,
     "rccl": 1.0,
 }
 
@@ -136,6 +137,10 @@ WIRE_RATIO = {
 #   qr_*      always two-shot -- every regime lands in
 #             allreduce_prototype_twoshot (csrc/include/quick_all_reduce.cuh)
 #   fly_int4  two-shot by construction (ROCm/aiter#4970)
+#   fly_int4_ring
+#             the same kernel family on a 2(N-1)-hop ring; identical wire
+#             volume to two-shot, so it shares the ratio and differs only in
+#             which pattern it drives
 #   rccl      a ring all-reduce moves 2(N-1)/N x nbytes per rank, which is the
 #             same per-link traffic as reduce-scatter plus all-gather
 _FIXED_PATTERN = {
@@ -145,6 +150,7 @@ _FIXED_PATTERN = {
     "qr_int4": "2stage",
     "qr_int3": "2stage",
     "fly_int4": "2stage",
+    "fly_int4_ring": "ring",
     "rccl": "2stage",
 }
 
