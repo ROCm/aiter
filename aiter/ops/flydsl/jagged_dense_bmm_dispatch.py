@@ -53,9 +53,6 @@ _SCHEMA_DEFAULTS = {
     "n_warps": 1,
     "waves_per_eu": 0,
     "b_to_lds": False,
-    "sched_hints": False,
-    "prologue_sched_hints": False,
-    "sched_span": 2,
 }
 
 
@@ -173,12 +170,6 @@ def _normalize_cfg(cfg: dict) -> dict:
         raw = cfg.get(key, default)
         if key == "use_mfma_k32":
             out[key] = _coerce(raw, bool)
-        elif key == "sched_hints":
-            out[key] = False if raw is None else bool(raw)
-        elif key == "prologue_sched_hints":
-            out[key] = False if raw is None else bool(raw)
-        elif key == "sched_span":
-            out[key] = 2 if raw is None else int(raw)
         elif key == "b_to_lds":
             out[key] = bool(raw) if raw is not None else False
         else:
@@ -331,9 +322,6 @@ def jagged_dense_bmm_dispatched(
             block_k=cfg.get("block_k"),
             tile_map=tile_map,
             total_occ_tiles=ub,
-            sched_hints=cfg.get("sched_hints", False),
-            prologue_sched_hints=cfg.get("prologue_sched_hints", False),
-            sched_span=int(cfg.get("sched_span") or 2),
         )
 
     skew_remap_on = (not uniform_seqlen) and output_n <= 256 and n_groups >= 1024
@@ -352,9 +340,6 @@ def jagged_dense_bmm_dispatched(
             use_mfma_k32=cfg["use_mfma_k32"],
             uniform_seqlen=False,
             block_k=cfg.get("block_k"),
-            sched_hints=cfg.get("sched_hints", False),
-            prologue_sched_hints=cfg.get("prologue_sched_hints", False),
-            sched_span=int(cfg.get("sched_span") or 2),
         )
 
     return jagged_dense_bmm(
@@ -375,7 +360,4 @@ def jagged_dense_bmm_dispatched(
         block_k=cfg.get("block_k"),
         waves_per_eu=int(cfg.get("waves_per_eu") or 0) if uniform_seqlen else 0,
         threads=_coerce(cfg.get("threads"), int) if uniform_seqlen else None,
-        sched_hints=cfg.get("sched_hints", False),
-        prologue_sched_hints=cfg.get("prologue_sched_hints", False),
-        sched_span=int(cfg.get("sched_span") or 2),
     )
