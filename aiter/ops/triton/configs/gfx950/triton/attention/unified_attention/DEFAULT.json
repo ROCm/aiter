@@ -165,7 +165,7 @@
       "SEGMENTS_PER_CU": 4,
       "MAX_SEGMENTS": 128,
       "SEGMENT_TILE_MIN": 64,
-      "SEGMENT_TILE_MAX": 16
+      "SEGMENT_TILE_MAX": 64
     },
     "any": {
       "num_stages": 1,
@@ -200,7 +200,7 @@
       "SEGMENTS_PER_CU": 4,
       "MAX_SEGMENTS": 128,
       "SEGMENT_TILE_MIN": 64,
-      "SEGMENT_TILE_MAX": 16,
+      "SEGMENT_TILE_MAX": 64,
       "TILE_SIZE_MIN": 64,
       "TILE_SIZE_MAX": 64
     },
