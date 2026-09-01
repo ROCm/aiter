@@ -53,6 +53,17 @@
         "verbose": "False",
         "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m pa --output_dir {{}}'"
     },
+    "module_mtp_verify_attn_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mtp_verify_attn.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_pa_metadata": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/pa_metadata_pybind.cu'",

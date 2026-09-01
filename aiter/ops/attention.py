@@ -1864,3 +1864,79 @@ def mla_decode_fwd_opus_stage1(
     kv_scale: torch.Tensor | None = None,  # float[1] per-tensor descale
     causal: bool = True,  # mask across the max_seqlen_q query tokens
 ) -> None: ...
+
+
+@compile_ops(
+    "module_mtp_verify_attn_asm", fc_name="mtp_verify_attn_fwd", ffi_type="ctypes"
+)
+def _mtp_verify_attn_fwd(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
+    segm_out: torch.Tensor,
+    segm_max: torch.Tensor,
+    segm_expsum: torch.Tensor,
+    out: torch.Tensor,
+    softmax_scale: float,
+) -> None: ...
+
+
+def mtp_verify_attn_num_segments(num_seqs: int, num_kv_heads: int) -> int:
+    """Split-KV segments per sequence so the grid (segments, seqs, kv heads)
+    fills the GPU in one round of 1-work-group-per-CU. Any value in [1, 64] is
+    valid; empty segments are written neutrally by the kernel."""
+    num_cus = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    segs = max(1, num_cus // max(1, num_seqs * num_kv_heads))
+    segs = 1 << (segs.bit_length() - 1)
+    return max(1, min(64, segs))
+
+
+def mtp_verify_attn_fwd_asm(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
+    softmax_scale: float,
+    num_segments: int | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """MTP-verify attention on gfx950 (hand-written assembly).
+
+    Speculative-decoding verify step: every sequence has exactly 4 query tokens
+    (q_len 4, causal against the last 4 KV positions) attending to its paged
+    fp8 KV cache. Shapes:
+      q:            [num_seqs * 4, num_q_heads, 256] bf16 (token-major, cu_seqlens_q order)
+      k_cache/v_cache: [num_pages, 16, num_kv_heads, 256] fp8 e4m3 (NHD, page size 16)
+      block_tables: [num_seqs, max_pages] int32
+      seq_lens:     [num_seqs] int64, KV length including the 4 query tokens
+      cu_seqlens_q: [num_seqs + 1] int32
+      k_descale / v_descale: [1] fp32 device tensors (per-tensor KV scales)
+    GQA ratio (num_q_heads / num_kv_heads) must be 16 or 8. Returns bf16
+    [num_seqs * 4, num_q_heads, 256].
+    """
+    num_tokens, num_q_heads, head_size = q.shape
+    num_seqs = seq_lens.shape[0]
+    num_kv_heads = k_cache.shape[2]
+    if num_segments is None:
+        num_segments = mtp_verify_attn_num_segments(num_seqs, num_kv_heads)
+    segm_out = torch.empty(
+        num_tokens, num_q_heads, num_segments, head_size, dtype=torch.float32, device=q.device
+    )
+    segm_max = torch.empty(num_tokens, num_q_heads, num_segments, dtype=torch.float32, device=q.device)
+    segm_expsum = torch.empty_like(segm_max)
+    if out is None:
+        out = torch.empty(num_tokens, num_q_heads, head_size, dtype=q.dtype, device=q.device)
+    _mtp_verify_attn_fwd(
+        q, k_cache, v_cache, block_tables, seq_lens, cu_seqlens_q,
+        k_descale, v_descale, segm_out, segm_max, segm_expsum, out, float(softmax_scale),
+    )
+    return out
