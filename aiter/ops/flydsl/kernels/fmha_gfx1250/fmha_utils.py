@@ -487,7 +487,6 @@ class Softmax:
         sp_pairs,
         ss,
         sgpr,
-        skip_rescale_sum=False,
         sp_lo_cache=None,
         sp_hi_cache=None,
     ):
@@ -534,14 +533,13 @@ class Softmax:
             op_broadcast_dup,
             op_exp_delta_dup,
         ]
-        if not skip_rescale_sum:
 
-            def op_rescale_sum():
-                ss["row_sums"][msb] = Atom.mul_f32(
-                    ss["exp_delta"][msb], ss["row_sums"][msb]
-                )
+        def op_rescale_sum():
+            ss["row_sums"][msb] = Atom.mul_f32(
+                ss["exp_delta"][msb], ss["row_sums"][msb]
+            )
 
-            ops.append(op_rescale_sum)
+        ops.append(op_rescale_sum)
         for i in range_constexpr(N_SP_PAIRS):
 
             def op_pkfma(idx=i):
@@ -640,7 +638,7 @@ class Softmax:
     def build_part0_ops(msb, sp_pairs, ss, sgpr):
         ops = []
         sp_f32 = [None] * VPS_MSB_SP
-        tmps = [None] * N_VALID_GROUPS
+        tmps = [None] * CNT_SU
 
         def _get_sp(offset):
             if const_expr(sp_f32[offset] is None):
@@ -649,7 +647,7 @@ class Softmax:
                 ].ir_value()
             return sp_f32[offset]
 
-        for k in range_constexpr(N_VALID_GROUPS):
+        for k in range_constexpr(CNT_SU):
 
             def op_init_max3(k_=k):
                 base = k_ * VALID_GROUP_STRIDE
@@ -659,7 +657,7 @@ class Softmax:
 
             ops.append(op_init_max3)
         for j in range_constexpr(2):
-            for k in range_constexpr(N_VALID_GROUPS):
+            for k in range_constexpr(CNT_SU):
 
                 def op_cross_col(k_=k, j_=j):
                     base = k_ * VALID_GROUP_STRIDE
@@ -667,7 +665,7 @@ class Softmax:
                     tmps[k_] = Atom.max3_num_f32(_get_sp(s0), _get_sp(s0 + 1), tmps[k_])
 
                 ops.append(op_cross_col)
-        for k in range_constexpr(N_VALID_GROUPS):
+        for k in range_constexpr(CNT_SU):
 
             def op_last_elem(k_=k):
                 base = k_ * VALID_GROUP_STRIDE
@@ -743,9 +741,7 @@ class Softmax:
         return ops
 
     @staticmethod
-    def build_all_gemm2_ops(
-        sp_pairs_all, softmax_state, sgpr_state, skip_rescale_sum=False
-    ):
+    def build_all_gemm2_ops(sp_pairs_all, softmax_state, sgpr_state):
         if const_expr("pre_max_log2e_scl" not in softmax_state):
             softmax_state["pre_max_log2e_scl"] = [None] * NUM_MSB
         ops_by_rid = [[] for _ in range_constexpr(RLTS_LEN)]
@@ -762,7 +758,6 @@ class Softmax:
                 sp_pairs_all[m],
                 softmax_state,
                 sgpr_state,
-                skip_rescale_sum=skip_rescale_sum,
                 sp_lo_cache=sp_lo_cache[m],
                 sp_hi_cache=sp_hi_cache[m],
             )
@@ -786,8 +781,6 @@ class Softmax:
 
     @staticmethod
     def part01_only(sp_pairs_all, softmax_state, sgpr_state):
-        if const_expr("pre_max_log2e_scl" not in softmax_state):
-            softmax_state["pre_max_log2e_scl"] = [None] * NUM_MSB
         ops_by_rid, _, _ = Softmax.build_all_gemm2_ops(
             sp_pairs_all, softmax_state, sgpr_state
         )
@@ -827,8 +820,6 @@ class Softmax:
 PART0_INSTS = 22
 PART1_INSTS = 8
 RLTS_LEN = 9
-
-N_VALID_GROUPS = CNT_SU
 VALID_GROUP_STRIDE = 8
 
 
@@ -1436,7 +1427,6 @@ def gemm2_interleaved_stage(
     tdm_state=None,
     tdm_type=KV_NONE,
     tdm_barrier=False,
-    o_rescale_exp_delta=None,
 ):
     has_tdm = tdm_type != KV_NONE
     wmma_schedule = Pipeline.build_pv_schedule()
@@ -1447,34 +1437,13 @@ def gemm2_interleaved_stage(
     lds_idx = 0
     ds_issued = 0
     exp_rid_idx = [SOFTMAX_EXP_START] * NUM_MSB
-    _o_rescale_ed_v8 = {}
-
-    def _build_o_rescale_ed_v8(d_msb):
-        if d_msb not in _o_rescale_ed_v8:
-            _ed = o_rescale_exp_delta[d_msb]
-            if _ed is None:
-                _o_rescale_ed_v8[d_msb] = None
-                return
-            _o_rescale_ed_v8[d_msb] = vector.broadcast(T.vec(8, T.f32), _ed)
-
-    def _emit_o_rescale_tile(d_msb, n):
-        if const_expr(o_rescale_exp_delta is None):
-            return
-        _build_o_rescale_ed_v8(d_msb)
-        _ed_v8 = _o_rescale_ed_v8[d_msb]
-        if _ed_v8 is None:
-            return
-        o_tiles[d_msb][n] = o_tiles[d_msb][n] * _ed_v8
 
     if const_expr(stage == 0):
         sched_barrier(0)
-        for _n0 in range_constexpr(N_PV_WMMA_N):
-            _emit_o_rescale_tile(0, _n0)
         sched_barrier(0)
     for gemm_idx in range_constexpr(PV_GEMM_INST_COUNT):
         if const_expr(stage == 0 and 3 * N_PV_WMMA_N <= gemm_idx < PV_GEMM_INST_COUNT):
             sched_barrier(0)
-            _emit_o_rescale_tile(3, gemm_idx - 3 * N_PV_WMMA_N)
             sched_barrier(0)
         wmma_op = wmma_schedule[gemm_idx]
         o_tiles = Pipeline.emit_pv_wmma(mlir_types, wmma_op, v_tiles, p_tiles, o_tiles)
@@ -1482,11 +1451,9 @@ def gemm2_interleaved_stage(
         if const_expr(stage == 0):
             if const_expr(0 <= gemm_idx < N_PV_WMMA_N):
                 sched_barrier(0)
-                _emit_o_rescale_tile(1, gemm_idx)
                 sched_barrier(0)
             elif const_expr(N_PV_WMMA_N <= gemm_idx < 2 * N_PV_WMMA_N):
                 sched_barrier(0)
-                _emit_o_rescale_tile(2, gemm_idx - N_PV_WMMA_N)
                 sched_barrier(0)
         sched_barrier(0)
         if const_expr(gemm_idx == PV_GEMM_INST_COUNT // 4 - 1):
