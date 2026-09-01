@@ -1,0 +1,265 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""Tune catalog for the FlyDSL MXFP4/MXFP6/MXFP8 preshuffle GEMM (gfx950 MFMA).
+
+Mirrors the aiter a8w8-bpreshuffle tune catalog style (kernelInstance + name +
+build_kernels_list), but the mxscale_preshuffle kernel exposes only tile_m/n/k +
+waves_per_eu as perf knobs (no async/lds/cshuffle/xcd/scheduler/split-K), so the
+candidate schema and kernelName grammar are correspondingly small.
+
+kernelName grammar (distinct `mxpsh` prefix, never collides with flydsl_bpreshuffle_*):
+    flydsl_mxpsh_{tm}x{tn}x{tk}_{A}_{B}_{OUT}_w{wpe}_x{xcd}
+e.g. flydsl_mxpsh_64x128x128_F8_F8_B16_w0_x0   (a8w8)
+     flydsl_mxpsh_64x128x256_F4_F4_B16_w2_x4   (a4w4)
+"""
+
+from __future__ import annotations
+
+import math
+import re
+from dataclasses import dataclass
+
+_DTYPE_SHORT = {"fp8": "F8", "fp6": "F6", "fp4": "F4", "bf16": "B16", "fp16": "F16"}
+_SHORT_DTYPE = {v: k for k, v in _DTYPE_SHORT.items()}
+
+# a/b operand combos the kernel supports (a4w4 / a6w4 / a8w8).
+_COMBOS = [("fp4", "fp4"), ("fp6", "fp4"), ("fp8", "fp8")]
+_TILE_M = (32, 64, 96, 128, 256)
+# tile_n=16/32 use fewer N-waves (block 64/128) so wide-N small-M shapes launch more
+# workgroups (WG=N/tile_n) and fill the CUs; tile_n>=64 keeps 4 waves / block 256.
+_TILE_N = (16, 32, 64, 128, 256, 512)
+_TILE_K = (128, 256)
+# Occupancy hints, following the (0, 2, 4) selection
+# flydsl/kernels/small_m_hgemm.py already uses: 0 (no hint) is a distinct mode,
+# and the odd values in between duplicate their neighbours rather than adding
+# reach. Measured over 197500 tuned candidates / 80 shapes, all five values won
+# about equally often (18/13/15/16/18) -- they supply extra draws, not extra
+# coverage -- and dropping 1 and 3 costs a median 0.01% / worst 1.55%, well
+# inside the +-7-10% run-to-run spread a re-tune of the same space shows.
+_WAVES_PER_EU = (0, 2, 4)
+_XCD_SWIZZLE = (0, 4)  # L2-rasterization XCD swizzle group size (0=off)
+MAX_SPLIT_K = 32
+_SPLIT_K = tuple(range(1, MAX_SPLIT_K + 1))
+_SPLITK_MAX_TMP_BYTES = 1 << 32
+_GFX950_CU_NUM = 256
+_WAVES_PER_WG = 4  # max N-waves the kernel splits a tile into
+_MFMA_N = 16  # the scaled-MFMA emits 16 N-cols
+_MFMA_M = 16
+_VGPR_PER_SIMD = 512  # gfx950 architected VGPRs per SIMD
+
+
+def _estimate_max_wpe(
+    tile_m: int, tile_n: int, total_vgpr: int = _VGPR_PER_SIMD
+) -> int:
+    """Max waves_per_eu the register file can sustain for this tile.
+
+    Mirrors ``_estimate_max_wpe`` in flydsl_gemm_a8w8_bpreshuffle_common, except
+    the thread count follows THIS kernel's N-wave split (``min(4, tile_n//16)``)
+    rather than a fixed 4 waves/WG. Each thread holds
+    ``padded_m*padded_n/threads`` accumulator VGPRs; the x1.5 covers the A/B
+    pipeline. A wpe hint above this asks for an occupancy the register file
+    cannot reach, so the instance is dropped instead of tuned -- ~20% of the
+    catalog, with no measured loss (see instance_valid).
+    """
+    n_waves = min(_WAVES_PER_WG, tile_n // _MFMA_N)
+    padded_m = math.ceil(tile_m / _MFMA_M) * _MFMA_M
+    padded_n = math.ceil(tile_n / _MFMA_N) * _MFMA_N
+    c_per_thread = padded_m * padded_n // max(n_waves * 64, 1)
+    return int(total_vgpr / max(c_per_thread * 1.5, 1))
+
+
+def _a_row_bytes(a_dtype: str, tile_k: int) -> int:
+    """A bytes per row in a K-tile: fp4 packs 2 codes/byte, fp6/fp8 = 1 byte/code."""
+    return tile_k // 2 if a_dtype == "fp4" else tile_k
+
+
+def make_kernel_name(
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    a_dtype: str,
+    b_dtype: str,
+    out_dtype: str,
+    waves_per_eu: int,
+    xcd_swizzle: int = 0,
+    split_k: int = 1,
+    blockscale: str = "none",
+) -> str:
+    """The one place the mxpsh kernelName is spelled.
+
+    Shared by the tune catalog (`kernelInstance.name` -> the tuned CSV) and by the
+    kernel itself (`@flyc.kernel(name=...)` -> the GPU symbol), so a profile line
+    can be matched back to its CSV row. `blockscale != "none"` is a distinct
+    Constexpr -> distinct binary, so the GPU symbol gets a suffix to keep profiles
+    apart. The suffix is deliberately NOT part of the CSV grammar
+    (`parse_kernel_name` returns None for it) and never reaches `kernelInstance.name`:
+    the CSV keeps one spelling per launch config, so CSVs tuned before the suffix
+    existed keep working unchanged.
+    """
+    a, b, o = _DTYPE_SHORT[a_dtype], _DTYPE_SHORT[b_dtype], _DTYPE_SHORT[out_dtype]
+    name = (
+        f"flydsl_mxpsh_{tile_m}x{tile_n}x{tile_k}"
+        f"_{a}_{b}_{o}_w{waves_per_eu}_x{xcd_swizzle}_sk{split_k}"
+    )
+    return name if blockscale == "none" else f"{name}_bs{blockscale}"
+
+
+@dataclass
+class kernelInstance:
+    tile_m: int
+    tile_n: int
+    tile_k: int
+    a_dtype: str  # "fp4" | "fp6" | "fp8"
+    b_dtype: str  # "fp4" | "fp8"
+    out_dtype: str  # "bf16" | "fp16"
+    waves_per_eu: int  # 0=no hint, 1-4=occupancy limit
+    xcd_swizzle: int = 0  # 0=off, >0=XCD L2-rasterization group size
+    split_k: int = 1  # 1=no split-K, >1=K-batch (partials reduced in fp32)
+
+    @property
+    def name(self) -> str:
+        return make_kernel_name(
+            self.tile_m,
+            self.tile_n,
+            self.tile_k,
+            self.a_dtype,
+            self.b_dtype,
+            self.out_dtype,
+            self.waves_per_eu,
+            self.xcd_swizzle,
+            self.split_k,
+        )
+
+
+_NAME_RE = re.compile(
+    r"^flydsl_mxpsh_(\d+)x(\d+)x(\d+)_([A-Z0-9]+)_([A-Z0-9]+)_([A-Z0-9]+)_w(\d+)"
+    r"(?:_x(\d+))?(?:_sk(\d+))?$"
+)
+
+
+def parse_kernel_name(name: str):
+    """kernelName string -> dict of launch params (None if it isn't an mxpsh name).
+
+    The _x{xcd} and _sk{split_k} suffixes are optional (older names without them
+    default to xcd_swizzle=0 / split_k=1).
+    """
+    m = _NAME_RE.match(name.strip())
+    if not m:
+        return None
+    tm, tn, tk, a, b, o, wpe, xcd, sk = m.groups()
+    return {
+        "tile_m": int(tm),
+        "tile_n": int(tn),
+        "tile_k": int(tk),
+        "a_dtype": _SHORT_DTYPE[a],
+        "b_dtype": _SHORT_DTYPE[b],
+        "out_dtype": _SHORT_DTYPE[o],
+        "waves_per_eu": int(wpe),
+        "xcd_swizzle": int(xcd) if xcd is not None else 0,
+        "split_k": int(sk) if sk is not None else 1,
+    }
+
+
+def estimated_lds_bytes(ki: kernelInstance) -> int:
+    """Double-buffered A tile in LDS (SharedA.a0/a1), row-major [tile_m][a_row_bytes]."""
+    return 2 * ki.tile_m * _a_row_bytes(ki.a_dtype, ki.tile_k)
+
+
+def _max_lds_bytes() -> int:
+    try:
+        from aiter.ops.flydsl.utils import get_shared_memory_per_block
+
+        return int(get_shared_memory_per_block(fallback_gfx="gfx950"))
+    except Exception:  # noqa: BLE001
+        return 160 * 1024  # gfx950 LDS
+
+
+def instance_valid(ki: kernelInstance) -> bool:
+    """Shape-independent legality against the mxscale_preshuffle kernel constraints."""
+    if ki.tile_k not in (128, 256):
+        return False
+    if ki.tile_m % 32 != 0:  # microscale packs M by 2 -> m_chunks = tile_m//16 even
+        return False
+    if ki.tile_n % 16 != 0:  # MFMA emits 16 N-cols; tile_n must be a multiple of 16
+        return False
+    _nw = min(4, ki.tile_n // 16)  # N-waves; each handles tile_n//_nw cols
+    if (ki.tile_n // _nw) % 16 != 0:  # per-wave N span must be a whole 16-col count
+        return False
+    if ki.waves_per_eu > 0 and ki.waves_per_eu > _estimate_max_wpe(
+        ki.tile_m, ki.tile_n
+    ):
+        return False  # unschedulable occupancy hint -- see _estimate_max_wpe
+    arb = _a_row_bytes(ki.a_dtype, ki.tile_k)
+    if (
+        ki.tile_m * arb
+    ) % 4096 != 0:  # A coop load: n_coop = tile_m*arb//4096 must be integral
+        return False
+    return not estimated_lds_bytes(ki) > _max_lds_bytes()
+
+
+def fits_shape(ki: kernelInstance, M: int, N: int, K: int) -> bool:
+    """M is ragged (grid ceil + OOB clip). K must be a multiple of 128: each e8m0
+    microscale half is 128-K, and tile_k=128 pairs two halves into one 256-K scale
+    word (shuffle_scale rounds K up to a whole 256-K chunk). K%tile_k excludes
+    tile_k=256 when K%256!=0, so a K=384 shape only matches tile_k=128 kernels.
+
+    split-K legality (split_k>1): the per-split K length (K/split_k) must stay a
+    whole number of tile_k K-tiles AND a whole number of 256-K e8m0 scale chunks,
+    so the split boundary never straddles a tile or a microscale word."""
+    if K % 128 != 0:
+        return False
+    # blockscale is a8w8-only and needs whole 128-N blocks: shuffle_scale_blockscale_b
+    # takes (N//128, K//128) and the kernel reads 4 dwords per 128-N block. fp4/fp6
+    # combos run the per-1x32 MX path (blockscale=False) and are exempt.
+    if (ki.a_dtype, ki.b_dtype) == ("fp8", "fp8") and N % 128 != 0:
+        return False
+    if (N % ki.tile_n != 0) or (K % ki.tile_k != 0):
+        return False
+    if ki.split_k > 1:
+        k_per_split = K // ki.split_k
+        if (
+            K % ki.split_k != 0
+            or k_per_split % ki.tile_k != 0
+            or k_per_split % 256 != 0
+        ):
+            return False
+        # fp32 scratch tmp[split_k, M, N] must fit the 32-bit num_records field.
+        if M * N * ki.split_k * 4 >= _SPLITK_MAX_TMP_BYTES:
+            return False
+        # occupancy guard: skip split_k>1 when the base grid already fills the CUs.
+        base_wg = ((M + ki.tile_m - 1) // ki.tile_m) * (N // ki.tile_n)
+        if base_wg >= _GFX950_CU_NUM:
+            return False
+    return True
+
+
+def _build_kernels_list():
+    out = {}
+    idx = 0
+    for a_dtype, b_dtype in _COMBOS:
+        for tm in _TILE_M:
+            for tn in _TILE_N:
+                for tk in _TILE_K:
+                    for wpe in _WAVES_PER_EU:
+                        for xcd in _XCD_SWIZZLE:
+                            for sk in _SPLIT_K:
+                                ki = kernelInstance(
+                                    tm, tn, tk, a_dtype, b_dtype, "bf16", wpe, xcd, sk
+                                )
+                                if instance_valid(ki):
+                                    out[idx] = ki
+                                    idx += 1
+    return out
+
+
+kernels_list = _build_kernels_list()
+
+
+def candidates_for(a_dtype: str, b_dtype: str, M: int, N: int, K: int):
+    """(kernel_id, kernelInstance) that match the dtypes and fit the shape."""
+    return [
+        (i, ki)
+        for i, ki in kernels_list.items()
+        if ki.a_dtype == a_dtype and ki.b_dtype == b_dtype and fits_shape(ki, M, N, K)
+    ]

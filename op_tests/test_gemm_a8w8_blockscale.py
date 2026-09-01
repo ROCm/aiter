@@ -16,8 +16,13 @@ from einops import repeat as eirp
 
 import aiter
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_ck, gemm_a8w8_blockscale_cktile
-from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.shuffle import (
+    shuffle_scale_blockscale_a,
+    shuffle_scale_blockscale_b,
+    shuffle_weight,
+)
 from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.utility import fp4_utils
 
@@ -110,13 +115,21 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True, use_flydsl=False):
     a, _ = run_torch(x, weight, x_scale, w_scale, dtype)
 
     x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
-    gemm_x_scale = x_scale_t if ck_preshuffle else x_scale
     gemm_weight = shuffle_weight(weight, layout=(16, 16)) if ck_preshuffle else weight
+    if use_flydsl_fp8_scale and get_gfx() == "gfx950":
+        gemm_x_scale = shuffle_scale_blockscale_a(x_scale, k)
+        gemm_w_scale = shuffle_scale_blockscale_b(w_scale, n, k)
+    elif use_flydsl_fp8_scale:
+        gemm_x_scale = x_scale
+        gemm_w_scale = w_scale
+    else:
+        gemm_x_scale = x_scale_t if ck_preshuffle else x_scale
+        gemm_w_scale = w_scale
     run_func = run_gemm_bpreshuffle if ck_preshuffle else run_gemm
-    b, avg_b = run_func(x, gemm_weight, gemm_x_scale, w_scale, dtype)
+    b, avg_b = run_func(x, gemm_weight, gemm_x_scale, gemm_w_scale, dtype)
 
     err_ck = checkAllclose(a, b, msg="ck", catastrophic_check=True)
-    if ck_preshuffle:
+    if ck_preshuffle and not use_flydsl_fp8_scale:
         x_scale_strided = x_scale.transpose(0, 1).contiguous().transpose(0, 1)
         b_strided = aiter.gemm_a8w8_blockscale_bpreshuffle(
             x, gemm_weight, x_scale_strided, w_scale, dtype
@@ -127,6 +140,7 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True, use_flydsl=False):
             msg="ck strided x_scale",
             catastrophic_check=True,
         )
+    ret["gfx"] = get_gfx()
     ret["ck us"] = avg_b
     ret["ck TFLOPS"] = m * n * k * 2 / avg_b / 1e6
     ret["ck TB/s"] = (x.nbytes + weight.nbytes) / avg_b / 1e6

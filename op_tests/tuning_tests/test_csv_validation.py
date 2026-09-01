@@ -82,7 +82,9 @@ class TestCSVValidation(unittest.TestCase):
         )
 
     def test_a8w8_blockscale_bpreshuffle_no_duplicates(self):
-        self._check_no_duplicates("a8w8_blockscale_bpreshuffle", extra_keys=["libtype"])
+        self._check_no_duplicates(
+            "a8w8_blockscale_bpreshuffle", extra_keys=["scaletype", "libtype"]
+        )
 
     def test_a4w4_blockscale_no_duplicates(self):
         self._check_no_duplicates("a4w4_blockscale")
