@@ -79,13 +79,25 @@ static std::tuple<std::string, int> get_heuristic_kernel(int M,
                                                          CFG* cfgs)
 {
     // Tile choice is a plain size rule, not a round/efficiency search: a tiny M
-    // wastes most of a 256-tall tile's rows, so M<=64 takes the 64x512 variant;
-    // any larger M takes 256x256 (which also fills a full persistent 256-TG wave).
-    const int want_tile_m = (M <= 64) ? 64 : 256;
-    const int want_tile_n = (M <= 64) ? 512 : 256;
+    // wastes most of a taller tile's rows. Preferred tiles are ranked per M and we
+    // take the highest-ranked one actually registered for this (b_intype,a_preshuffle):
+    //   M<=16 -> 16x512 (decode tile; ships FP4 + a_preshuffle=0 only), else 64x512, else 256x256
+    //   M<=64 -> 64x512, else 256x256
+    //   M>64  -> 256x256 (fills a full persistent 256-TG wave), else 64x512
+    // When a preferred tile is absent for the combo (e.g. 16x512 for fp8) the next
+    // rank resolves it, so small-M fp8/a_preshuffle=1 still lands on 64x512 as before.
+    const int (*tile_prefs)[2];
+    int n_prefs;
+    static const int prefs_m16[][2]  = {{16, 512}, {64, 512}, {256, 256}};
+    static const int prefs_m64[][2]  = {{64, 512}, {256, 256}};
+    static const int prefs_big[][2]  = {{256, 256}, {64, 512}};
+    if(M <= 16)      { tile_prefs = prefs_m16; n_prefs = 3; }
+    else if(M <= 64) { tile_prefs = prefs_m64; n_prefs = 2; }
+    else             { tile_prefs = prefs_big; n_prefs = 2; }
 
     std::string selectedKernelName = "";
-    std::string fallbackKernelName = ""; // any valid variant if the wanted tile is absent
+    std::string fallbackKernelName = ""; // any valid variant if no preferred tile is present
+    int bestRank = n_prefs;              // lower is better; n_prefs == "no preferred tile matched"
 
     for(const auto& el : *cfgs)
     {
@@ -107,10 +119,14 @@ static std::tuple<std::string, int> get_heuristic_kernel(int M,
         if(fallbackKernelName.empty())
             fallbackKernelName = el.first;
 
-        if(cfg.tile_m == want_tile_m && cfg.tile_n == want_tile_n)
+        for(int r = 0; r < bestRank; ++r)
         {
-            selectedKernelName = el.first;
-            break;
+            if(cfg.tile_m == tile_prefs[r][0] && cfg.tile_n == tile_prefs[r][1])
+            {
+                bestRank          = r;
+                selectedKernelName = el.first;
+                break;
+            }
         }
     }
 

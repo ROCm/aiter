@@ -63,22 +63,30 @@ _OUT_DTYPE = {"bf16": dtypes.bf16}
 PERSISTENT_TG = 256
 
 
-def _heuristic_tile(M):
+def _heuristic_tile(M, intype="a8w4", apre=0):
     """Tile (tile_m, tile_n) the cpp dispatch picks for this M (mirrors
-    get_heuristic_kernel in asm_mxfp8fp4gemm.cu): M<=64 wastes most of a 256-tall
-    tile's rows, so it takes the 64x512 variant; any larger M takes 256x256."""
+    get_heuristic_kernel in asm_mxfp8fp4gemm.cu): M<=16 takes the 16x512 decode tile
+    (FP4 + a_preshuffle=0 only), M<=64 the 64x512 variant, larger M 256x256. When the
+    16x512 variant isn't shipped for the combo (e.g. fp8 or a_preshuffle=1) it falls
+    back to 64x512, so small-M fp8/apre still resolves to 64x512 as before."""
+    has_16x512 = (intype == "a8w4") and (apre == 0)
+    if M <= 16 and has_16x512:
+        return (16, 512)
     return (64, 512) if M <= 64 else (256, 256)
 
 
 def _heuristic_kernel_base(outtype, intype, apre, M):
     """Mangled-name base the heuristic .co uses for this config, matching the CSV
     convention (hsa/gfx1250/mxfp8fp4gemm/mxfp8fp4gemm.csv). BOTH the tile and the
-    cluster depend on M: M<=64 -> 64x512 with cluster 4x1, else 256x256 with
-    cluster 4x4 (the cluster is NOT 4x4 for the 64x512 tile). Used for the
-    TG-occupancy label so it names the .co the heuristic actually dispatches to."""
+    cluster depend on M: M<=16 -> 16x512 (FP4 + a_preshuffle=0 only) with cluster 4x1,
+    M<=64 -> 64x512 with cluster 4x1, else 256x256 with cluster 4x4 (the cluster is NOT
+    4x4 for the 512-wide tiles). Used for the TG-occupancy label so it names the .co
+    the heuristic actually dispatches to."""
     middle = "mxfp8fp8" if intype == "a8w8" else "mxfp8fp4"
     pre = "ABpreShuffle" if apre else "BpreShuffle"
-    tile, cluster = ("64x512", "4x1") if M <= 64 else ("256x256", "4x4")
+    tile_m, tile_n = _heuristic_tile(M, intype, apre)
+    tile = f"{tile_m}x{tile_n}"
+    cluster = "4x4" if (tile_m, tile_n) == (256, 256) else "4x1"
     return f"f8gemm_{outtype}_{middle}_{pre}_{tile}_{cluster}_ps"
 
 
@@ -357,8 +365,9 @@ def test_gemm(
     in_bytes = inp["A"].nbytes + inp["B"].nbytes + scale_bytes
 
     ret = {"gfx": get_gfx(), "knl_name": knl_name or "(heuristic)"}
-    # Report TG occupancy for the tile the cpp dispatch picks (M<=64 -> 64x512).
-    _tile_m, _tile_n = _heuristic_tile(M)
+    # Report TG occupancy for the tile the cpp dispatch picks (M<=16 -> 16x512 for
+    # a8w4/apre=0, else M<=64 -> 64x512).
+    _tile_m, _tile_n = _heuristic_tile(M, intype, apre)
     _label = _heuristic_kernel_base(outtype, intype, apre, M)
     _report_active_tg(M, N, _tile_m, _tile_n, _label)
 

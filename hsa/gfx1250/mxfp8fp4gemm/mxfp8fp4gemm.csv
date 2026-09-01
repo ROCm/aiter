@@ -7,3 +7,4 @@ tile_m,tile_n,b_intype,a_preshuffle,cluster_x,cluster_y,outtype,knl_name,co_name
 64,512,mxfp8,0,4,1,bf16,_ZN5aiter46f8gemm_bf16_mxfp8fp8_BpreShuffle_64x512_4x1_psE,f8gemm_bf16_mxfp8fp8_BpreShuffle_64x512_4x1_ps.co
 64,512,mxfp4,1,4,1,bf16,_ZN5aiter47f8gemm_bf16_mxfp8fp4_ABpreShuffle_64x512_4x1_psE,f8gemm_bf16_mxfp8fp4_ABpreShuffle_64x512_4x1_ps.co
 64,512,mxfp4,0,4,1,bf16,_ZN5aiter46f8gemm_bf16_mxfp8fp4_BpreShuffle_64x512_4x1_psE,f8gemm_bf16_mxfp8fp4_BpreShuffle_64x512_4x1_ps.co
+16,512,mxfp4,0,4,1,bf16,_ZN5aiter46f8gemm_bf16_mxfp8fp4_BpreShuffle_16x512_4x1_psE,f8gemm_bf16_mxfp8fp4_BpreShuffle_16x512_4x1_ps.co
