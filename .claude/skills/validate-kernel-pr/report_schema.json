@@ -80,6 +80,41 @@
           "type": "string"
         }
       }
+    },
+    "passing_correctness_stage": {
+      "description": "What a correctness stage has to look like for the report to be PASS: it ran, it exited 0, and it executed at least one test. Referenced by both correctness stages -- they were spelled out twice, and divergence between two copies of the PASS gate would silently change what earns a clearance.",
+      "required": [
+        "status",
+        "exit",
+        "stats"
+      ],
+      "properties": {
+        "status": {
+          "const": "pass"
+        },
+        "exit": {
+          "const": 0
+        },
+        "stats": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/execution_stats"
+            }
+          ],
+          "properties": {
+            "failures": {
+              "const": 0
+            },
+            "errors": {
+              "const": 0
+            },
+            "executed": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        }
+      }
     }
   },
   "properties": {
@@ -225,7 +260,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "description": "Commit of the checkout the resolved module came from, suffixed '-dirty' when that tree has uncommitted changes -- which the head phase always does, since it runs with the candidate patch applied. Null when the module resolved to an installed package with no source checkout to name; attributing a commit to a prebuilt binary is the provenance claim this validator does not make."
         },
         "native_artifacts": {
           "type": "array",
@@ -313,6 +349,15 @@
         "runner_reason": {
           "type": "string",
           "minLength": 1
+        },
+        "grid_channel": {
+          "enum": [
+            "cli-flag",
+            "env-var",
+            "cli-flag-unusable",
+            "none"
+          ],
+          "description": "Which channel carried the S1 grid, and therefore which hook was proven. 'cli-flag-unusable' means --shape-arg was named for a target that does not run as a script, so argv never reaches it -- a fact about the request, not about the target."
         }
       }
     },
@@ -389,6 +434,12 @@
             },
             "host": {
               "type": "string"
+            },
+            "post_run_note": {
+              "type": "string"
+            },
+            "requirement_note": {
+              "type": "string"
             }
           }
         },
@@ -421,7 +472,8 @@
               }
             },
             "reference_tolerances": {
-              "type": "object"
+              "type": "object",
+              "description": "Tolerances named by --tol-table, recorded as context only. The gate is the head-vs-base comparison above; this table is keyed by dtype while the scraped tolerances are a positional list, so the two cannot be matched up and no verdict is drawn from this field."
             },
             "loosened": {
               "type": "array",
@@ -615,6 +667,14 @@
                   },
                   "ratio": {
                     "type": "number"
+                  },
+                  "base_repeats": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "head_repeats": {
+                    "type": "integer",
+                    "minimum": 1
                   }
                 }
               }
@@ -632,22 +692,6 @@
                 "reduction": {
                   "type": "string"
                 }
-              }
-            }
-          }
-        },
-        "claims": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/stage"
-            }
-          ],
-          "description": "Reproduction of the performance numbers stated in the PR description. A number that does not reproduce is tagged [unreproducible] rather than dropped.",
-          "properties": {
-            "unreproducible": {
-              "type": "array",
-              "items": {
-                "type": "string"
               }
             }
           }
@@ -791,78 +835,10 @@
                 }
               },
               "correctness_repo_tests": {
-                "required": [
-                  "status",
-                  "exit",
-                  "stats"
-                ],
-                "properties": {
-                  "status": {
-                    "const": "pass"
-                  },
-                  "exit": {
-                    "const": 0
-                  },
-                  "stats": {
-                    "type": "object",
-                    "required": [
-                      "tests",
-                      "failures",
-                      "errors",
-                      "skipped",
-                      "executed"
-                    ],
-                    "properties": {
-                      "failures": {
-                        "const": 0
-                      },
-                      "errors": {
-                        "const": 0
-                      },
-                      "executed": {
-                        "type": "integer",
-                        "minimum": 1
-                      }
-                    }
-                  }
-                }
+                "$ref": "#/definitions/passing_correctness_stage"
               },
               "correctness_s1_grid": {
-                "required": [
-                  "status",
-                  "exit",
-                  "stats"
-                ],
-                "properties": {
-                  "status": {
-                    "const": "pass"
-                  },
-                  "exit": {
-                    "const": 0
-                  },
-                  "stats": {
-                    "type": "object",
-                    "required": [
-                      "tests",
-                      "failures",
-                      "errors",
-                      "skipped",
-                      "executed"
-                    ],
-                    "properties": {
-                      "failures": {
-                        "const": 0
-                      },
-                      "errors": {
-                        "const": 0
-                      },
-                      "executed": {
-                        "type": "integer",
-                        "minimum": 1
-                      }
-                    }
-                  }
-                }
+                "$ref": "#/definitions/passing_correctness_stage"
               },
               "execution_receipt": {
                 "required": [

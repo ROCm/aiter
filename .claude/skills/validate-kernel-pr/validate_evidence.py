@@ -8,6 +8,7 @@ import importlib
 import json
 import pathlib
 import platform
+import subprocess
 import sys
 import xml.etree.ElementTree as ET
 
@@ -62,8 +63,7 @@ def validate_receipt(
         return {
             "status": "skip",
             "note": (
-                f"expected route {expected_route!r}, "
-                f"observed {receipt.get('route')!r}"
+                f"expected route {expected_route!r}, observed {receipt.get('route')!r}"
             ),
         }
     symbols = receipt.get("kernel_symbols")
@@ -130,6 +130,41 @@ def loaded_native_artifacts(roots: list[pathlib.Path]) -> list[dict]:
     ]
 
 
+def source_sha(module_path: pathlib.Path) -> str | None:
+    """The commit of the checkout the resolved module actually came from, if there is one.
+
+    A prebuilt package installed into site-packages has no source commit to name, and
+    attributing one from an unrelated checkout is precisely the source-to-binary provenance
+    claim this skill refuses to make -- so that case stays null rather than guessing.
+
+    The `-dirty` suffix is not cosmetic. The head phase runs with the candidate patch applied
+    to the worktree, so the bare commit is the base and would name a tree that is not the one
+    under test. A reader has to be able to tell those apart.
+    """
+    parent = str(module_path.parent)
+    try:
+        head = subprocess.run(
+            ["git", "-C", parent, "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if head.returncode != 0 or not head.stdout.strip():
+            return None
+        status = subprocess.run(
+            ["git", "-C", parent, "status", "--porcelain", "--untracked-files=no"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    commit = head.stdout.strip()
+    if status.returncode == 0 and status.stdout.strip():
+        return f"{commit}-dirty"
+    return commit
+
+
 def runtime_identity(
     module_name: str,
     expected_root: pathlib.Path,
@@ -151,7 +186,7 @@ def runtime_identity(
         "expected_root": str(root),
         "python_executable": sys.executable,
         "python_version": platform.python_version(),
-        "source_sha": None,
+        "source_sha": source_sha(module_path),
         "native_artifacts": artifacts,
     }
 
