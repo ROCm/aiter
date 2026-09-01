@@ -34,9 +34,7 @@ _DEFAULT_STREAM = fx.Stream(None)
 def _emit_prefix_sum_seq(seq_rsrc, group, block_m):
     # Intentional O(n_groups) per-block scan; tiny prep kernel.
     c_one = fx.Int32(1)
-    for _cur, state in range(
-        fx.Index(0), fx.Index(group), fx.Index(1), init=[fx.Int32(0)]
-    ):
+    for _cur, state in range(fx.Int32(0), group, fx.Int32(1), init=[fx.Int32(0)]):
         acc = state[0]
         cur = fx.Int32(_cur)
         s = buffer_ops.buffer_load(seq_rsrc, cur, vec_width=1, dtype=T.i32)
@@ -54,7 +52,7 @@ def _scatter_group_rows(map_rsrc, grp, tid, prefix, tiles, seq_start, seq_end):
     c_three = fx.Int32(3)
     c_four = fx.Int32(4)
     trips = (tiles + fx.Int32(BLOCK_THREADS - 1)) // c_threads
-    for _it in range(fx.Index(0), fx.Index(trips), fx.Index(1)):
+    for _it in range(fx.Int32(0), trips, fx.Int32(1)):
         local_tile = fx.Int32(_it) * c_threads + tid
         if local_tile < tiles:
             base = (prefix + local_tile) * c_four
