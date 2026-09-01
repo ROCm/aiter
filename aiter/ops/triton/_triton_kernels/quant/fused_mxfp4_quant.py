@@ -319,6 +319,8 @@ _fused_reduce_act_mul_and_dynamic_mxfp4_quant_repr = make_kernel_repr(
         "X_HAS_SPLITK",
         "X_NUM_KSPLIT",
         "X_NUM_KSPLIT_POW2",
+        "num_warps",
+        "num_stages",
     ],
 )
 
