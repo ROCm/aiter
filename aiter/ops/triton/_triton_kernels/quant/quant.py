@@ -321,6 +321,8 @@ _dynamic_mxfp4_quant_repr = make_kernel_repr(
         "MXFP4_QUANT_BLOCK_SIZE",
         "EVEN_M_N",
         "SCALING_MODE",
+        "num_warps",
+        "num_stages",
     ],
 )
 
