@@ -161,89 +161,73 @@ void opus_bmm_a8w8_mxscale_bpreshuffle(
   //         kid18-vs-kid17 is geometry at fixed mechanism.
   // An out-of-range kid must throw: silently falling back to kid 0 would make a
   // tile sweep report kid 0's timing under a dozen different names.
-  AITER_CHECK((kernelId >= 0 && kernelId <= 10) || kernelId == 13 ||
-                  kernelId == 14 || kernelId == 17 || kernelId == 18,
-              "opus_bmm_a8w8_mxscale_bpreshuffle: kernelId must be 0..10, 13, "
-              "14, 17 or 18 (got ", kernelId, "); 0 = prefill 128x128x256, "
-              "1..7 = decode tiles (per-column w_scale), 8..10 = decode tiles "
-              "(128x128 w_scale), 13 = kid0 with A's scale staged in LDS, 14 = "
-              "kid13 with B's staged as well, 17/18 = kid13 with A's panel "
-              "filled by TDM (width 32 / width 128)");
+  // Wider prefill tiles. NUM_SLOTS is 3 throughout -- the producer ring only
+  // implements that depth; slots=2 deadlocks (see the traits header).
+  //  19   256x128x256, 192 thr, consumer grid 2x2 -- M doubled, squared grid
+  //  20   128x256x256, 192 thr, grid 1x4          -- N doubled
+  //  21   256x256x128, 320 thr, grid 2x4          -- both doubled, kid22's
+  //       register footprint at 4x kid22's output tile
+  //  22   128x128x256, 192 thr, grid 1x4  CONTROL: kid0's tile with 4 consumer
+  //       waves instead of 2, so kid22-vs-kid0 is the wave count alone
+  //  23   128x128x128, 192 thr, grid 1x4  CONTROL: kid22 at B_K=128, which
+  //       prices the halved K reuse kid21 pays for its LDS
+  //  24   128x128x256, 192 thr, grid 2x2  CONTROL: kid22's tile squared, the
+  //       clean read on the grid shape by itself
+  //  25   256x128x128, 192 thr, grid 2x2 -- kid19 with B_K halved so the tile
+  //       fits the 6-wave 512-VGPR ceiling instead of spilling 108 B/lane
+  // Validity is the table's membership test, below -- a second hand-kept id
+  // range here would drift from it, and did: it silently rejected 23 and 24
+  // after they were added to the table.
 
-#define OPUS_BMM_BPRESHUF_DISPATCH(TILE)                                    \
-  do {                                                                      \
-    if (Y.dtype() == AITER_DTYPE_bf16)                                      \
-      opus_bmm_a8w8_mxscale_bpreshuffle_launch_gfx1250<TILE<bf16_t>>(       \
-          O, wo_a, Y, x_scale, w_scale, splitK);                            \
-    else                                                                    \
-      opus_bmm_a8w8_mxscale_bpreshuffle_launch_gfx1250<TILE<fp32_t>>(       \
-          O, wo_a, Y, x_scale, w_scale, splitK);                            \
-  } while (0)
+  // Table-driven kid -> launcher dispatch, mirroring the gfx950 pattern
+  // (opus_bmm_a8w8_mxscale_tune_dispatch above). Each entry dispatches on
+  // Y.dtype internally so the table holds one fn_ptr per kid, not two.
+  using BpreshufLauncher = void (*)(
+      aiter_tensor_t &, aiter_tensor_t &, aiter_tensor_t &,
+      aiter_tensor_t &, aiter_tensor_t &, int);
 
-  switch (kernelId) {
-    case 1:
-      OPUS_BMM_BPRESHUF_DISPATCH(
-          opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n32_gfx1250);
-      break;
-    case 2:
-      OPUS_BMM_BPRESHUF_DISPATCH(
-          opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n32_wg2_gfx1250);
-      break;
-    case 3:
-      OPUS_BMM_BPRESHUF_DISPATCH(
-          opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n32_k512_gfx1250);
-      break;
-    case 4:
-      OPUS_BMM_BPRESHUF_DISPATCH(
-          opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n64_w6_gfx1250);
-      break;
-    case 5:
-      OPUS_BMM_BPRESHUF_DISPATCH(
-          opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n64_w4_gfx1250);
-      break;
-    case 6:
-      OPUS_BMM_BPRESHUF_DISPATCH(
-          opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n128_w6_gfx1250);
-      break;
-    case 7:
-      OPUS_BMM_BPRESHUF_DISPATCH(
-          opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n256_w6_gfx1250);
-      break;
-    case 8:
-      OPUS_BMM_BPRESHUF_DISPATCH(
-          opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n64_w6_gn128_gfx1250);
-      break;
-    case 9:
-      OPUS_BMM_BPRESHUF_DISPATCH(
-          opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n256_w6_gn128_gfx1250);
-      break;
-    case 10:
-      OPUS_BMM_BPRESHUF_DISPATCH(
-          opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n192_w6_gn128_gfx1250);
-      break;
-    case 13:
-      OPUS_BMM_BPRESHUF_DISPATCH(
-          opus_bmm_a8w8_mxscale_bpreshuffle_tile_sfa_gfx1250);
-      break;
-    case 14:
-      OPUS_BMM_BPRESHUF_DISPATCH(
-          opus_bmm_a8w8_mxscale_bpreshuffle_tile_sfab_gfx1250);
-      break;
-    case 17:
-      OPUS_BMM_BPRESHUF_DISPATCH(
-          opus_bmm_a8w8_mxscale_bpreshuffle_tile_sfa_tdm32_gfx1250);
-      break;
-    case 18:
-      OPUS_BMM_BPRESHUF_DISPATCH(
-          opus_bmm_a8w8_mxscale_bpreshuffle_tile_sfa_tdm128_gfx1250);
-      break;
-    default:
-      OPUS_BMM_BPRESHUF_DISPATCH(
-          opus_bmm_a8w8_mxscale_bpreshuffle_tile_gfx1250);
-      break;
+#define OPUS_BMM_BPRESHUF_ENTRY(TILE)                                        \
+  +[](aiter_tensor_t &O_, aiter_tensor_t &wo_a_, aiter_tensor_t &Y_,         \
+      aiter_tensor_t &x_scale_, aiter_tensor_t &w_scale_, int splitK_) {     \
+    if (Y_.dtype() == AITER_DTYPE_bf16)                                      \
+      opus_bmm_a8w8_mxscale_bpreshuffle_launch_gfx1250<TILE<bf16_t>>(        \
+          O_, wo_a_, Y_, x_scale_, w_scale_, splitK_);                        \
+    else                                                                     \
+      opus_bmm_a8w8_mxscale_bpreshuffle_launch_gfx1250<TILE<fp32_t>>(        \
+          O_, wo_a_, Y_, x_scale_, w_scale_, splitK_);                        \
   }
 
-#undef OPUS_BMM_BPRESHUF_DISPATCH
+  static const std::unordered_map<int, BpreshufLauncher> kBpreshuf = {
+    { 0, OPUS_BMM_BPRESHUF_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_gfx1250)},
+    { 1, OPUS_BMM_BPRESHUF_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n32_gfx1250)},
+    { 2, OPUS_BMM_BPRESHUF_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n32_wg2_gfx1250)},
+    { 3, OPUS_BMM_BPRESHUF_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n32_k512_gfx1250)},
+    { 4, OPUS_BMM_BPRESHUF_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n64_w6_gfx1250)},
+    { 5, OPUS_BMM_BPRESHUF_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n64_w4_gfx1250)},
+    { 6, OPUS_BMM_BPRESHUF_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n128_w6_gfx1250)},
+    { 7, OPUS_BMM_BPRESHUF_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n256_w6_gfx1250)},
+    { 8, OPUS_BMM_BPRESHUF_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n64_w6_gn128_gfx1250)},
+    { 9, OPUS_BMM_BPRESHUF_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n256_w6_gn128_gfx1250)},
+    {10, OPUS_BMM_BPRESHUF_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n192_w6_gn128_gfx1250)},
+    {13, OPUS_BMM_BPRESHUF_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_sfa_gfx1250)},
+    {14, OPUS_BMM_BPRESHUF_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_sfab_gfx1250)},
+    {17, OPUS_BMM_BPRESHUF_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_sfa_tdm32_gfx1250)},
+    {18, OPUS_BMM_BPRESHUF_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_sfa_tdm128_gfx1250)},
+    {19, OPUS_BMM_BPRESHUF_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_pf_m256_gfx1250)},
+    {20, OPUS_BMM_BPRESHUF_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_pf_n256_gfx1250)},
+    {21, OPUS_BMM_BPRESHUF_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_pf_m256n256_gfx1250)},
+    {22, OPUS_BMM_BPRESHUF_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_pf_w6_gfx1250)},
+    {23, OPUS_BMM_BPRESHUF_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_pf_bk128_gfx1250)},
+    {24, OPUS_BMM_BPRESHUF_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_pf_w6_2x2_gfx1250)},
+    {25, OPUS_BMM_BPRESHUF_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_pf_m256_bk128_gfx1250)},
+  };
+#undef OPUS_BMM_BPRESHUF_ENTRY
+
+  auto it = kBpreshuf.find(kernelId);
+  AITER_CHECK(it != kBpreshuf.end(),
+              "opus_bmm_a8w8_mxscale_bpreshuffle: unknown kernelId ", kernelId,
+              "; valid ids: 0..10, 13, 14, 17..25");
+  it->second(O, wo_a, Y, x_scale, w_scale, splitK);
 #endif  // OPUS_BUILD_HAS_GFX1250
 }
 

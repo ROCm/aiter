@@ -399,10 +399,17 @@ void bmm_a8w8_mxscale_bpreshuffle_kernel_gfx1250(opus_bmm_a8w8_mxscale_kargs_gfx
     // result of the matrix multiplication.
     // ---------------------------------------------------------------------
     const int wave_split = wave_id - T::kNumProducerWaves;
-    // TileN: consumers split N (wave_n = wave_split, wave_m = 0).
-    // TileM: consumers split M (wave_m = wave_split, wave_n = 0).
-    const int wave_m = (T::LAYOUT == opus_gfx1250_bmm::kLayoutTileM) ? wave_split : 0;
-    const int wave_n = (T::LAYOUT == opus_gfx1250_bmm::kLayoutTileM) ? 0 : wave_split;
+    // Position in the kTileM x kTileN consumer-wave grid, N-major so that
+    // adjacent waves cover adjacent N and their B-fragment reads stay
+    // neighbouring in LDS.
+    //
+    // This is the GENERAL form, and it reproduces both 1D layouts exactly
+    // rather than special-casing them -- which is the only reason it is safe to
+    // apply to the twenty tiles that predate the 2D grid:
+    //   kLayoutTileN (kTileM=1, kTileN=W): wave_m = split/W = 0, wave_n = split
+    //   kLayoutTileM (kTileM=W, kTileN=1): wave_m = split/1 = split, wave_n = 0
+    const int wave_m = wave_split / T::kTileN;
+    const int wave_n = wave_split % T::kTileN;
 
     // The A-scale panel was already filled and published in the prologue, above
     // the producer/consumer split. It covers the tile's whole K range, so the

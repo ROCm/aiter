@@ -59,6 +59,15 @@ OPUS_BMM_BPRESHUF_INST(opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n256_sfab_gfx1
 OPUS_BMM_BPRESHUF_INST(opus_bmm_a8w8_mxscale_bpreshuffle_tile_sfa_tdm32_gfx1250);
 OPUS_BMM_BPRESHUF_INST(opus_bmm_a8w8_mxscale_bpreshuffle_tile_sfa_tdm128_gfx1250);
 
+// Prefill tile candidates -- see the traits header for sizing rationale.
+OPUS_BMM_BPRESHUF_INST(opus_bmm_a8w8_mxscale_bpreshuffle_tile_pf_m256_gfx1250);
+OPUS_BMM_BPRESHUF_INST(opus_bmm_a8w8_mxscale_bpreshuffle_tile_pf_n256_gfx1250);
+OPUS_BMM_BPRESHUF_INST(opus_bmm_a8w8_mxscale_bpreshuffle_tile_pf_m256n256_gfx1250);
+OPUS_BMM_BPRESHUF_INST(opus_bmm_a8w8_mxscale_bpreshuffle_tile_pf_w6_gfx1250);
+OPUS_BMM_BPRESHUF_INST(opus_bmm_a8w8_mxscale_bpreshuffle_tile_pf_bk128_gfx1250);
+OPUS_BMM_BPRESHUF_INST(opus_bmm_a8w8_mxscale_bpreshuffle_tile_pf_w6_2x2_gfx1250);
+OPUS_BMM_BPRESHUF_INST(opus_bmm_a8w8_mxscale_bpreshuffle_tile_pf_m256_bk128_gfx1250);
+
 #undef OPUS_BMM_BPRESHUF_INST
 
 // ===========================================================================

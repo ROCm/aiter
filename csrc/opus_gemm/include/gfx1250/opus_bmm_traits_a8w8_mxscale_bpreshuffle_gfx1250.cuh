@@ -160,7 +160,12 @@ template<int BLOCK_SIZE_,
          bool SF_A_LDS_ = false,
          bool SF_B_LDS_ = false,
          int SF_A_TDM_KG_  = 0,
-         int SF_A_TDM_PAD_ = 16>
+         int SF_A_TDM_PAD_ = 16,
+         // Consumer-wave grid, M extent. 0 keeps the historical 1D behaviour
+         // driven by LAYOUT_; any other value makes the grid TILE_M_ x
+         // (kNumConsumerWaves / TILE_M_) and LAYOUT_ is then ignored. See the
+         // kTileM/kTileN derivation for why 2D is worth having.
+         int TILE_M_ = 0>
 struct opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250 {
     static constexpr int BLOCK_SIZE = BLOCK_SIZE_;
     static constexpr int B_M = B_M_;
@@ -227,8 +232,37 @@ struct opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250 {
     // kNumConsumerWaves by construction and the pipeline's wave_m/wave_n
     // derivation is unchanged. The cost is that B_N (or B_M) must grow with the
     // wave count to keep kExpN >= 1 -- see the kid4 alias below.
-    static constexpr int kTileM = (LAYOUT == opus_gfx1250_bmm::kLayoutTileM) ? kNumConsumerWaves : 1;
-    static constexpr int kTileN = (LAYOUT == opus_gfx1250_bmm::kLayoutTileM) ? 1 : kNumConsumerWaves;
+    // Consumer-wave grid over the B_M x B_N output tile. The three per-wave
+    // register costs respond to it differently, which is the whole reason it is
+    // a grid and not a line:
+    //
+    //   acc    = (B_M/16/kTileM) * (B_N/16/kTileN) * 8   depends only on the
+    //                                                    PRODUCT, i.e. the wave
+    //                                                    count -- no shape can
+    //                                                    change it
+    //   A frag = (B_M/16/kTileM) * kExpK * 16            shrinks with kTileM only
+    //   B frag = (B_N/16/kTileN) * kExpK * 16            shrinks with kTileN only
+    //
+    // A 1D grid therefore leaves one of the two fragment terms at its full,
+    // un-divided size, and that term is what pins kid0 at 542 VGPR and
+    // occupancy 1. Squaring the grid minimises A+B for a fixed area: on kid0's
+    // 128x128x256 tile at 4 consumer waves, 1x4 and 4x1 both cost 448 VGPR
+    // while 2x2 costs 384. It matters far more when widening -- 256x256x128 at
+    // 8 waves is 544 as 1x8 but 448 as 2x4, which is kid22's footprint for 4x
+    // the output tile.
+    //
+    // TILE_M_ == 0 reproduces the old LAYOUT-driven 1D split exactly
+    // (kLayoutTileN -> 1 x W, kLayoutTileM -> W x 1), so every tile defined
+    // before this parameter existed is unchanged.
+    static constexpr int kTileM =
+        TILE_M_ != 0 ? TILE_M_
+                     : ((LAYOUT == opus_gfx1250_bmm::kLayoutTileM) ? kNumConsumerWaves : 1);
+    static constexpr int kTileN =
+        TILE_M_ != 0 ? (kNumConsumerWaves / (TILE_M_ != 0 ? TILE_M_ : 1))
+                     : ((LAYOUT == opus_gfx1250_bmm::kLayoutTileM) ? 1 : kNumConsumerWaves);
+    static_assert(TILE_M_ == 0 || kNumConsumerWaves % TILE_M_ == 0,
+                  "TILE_M_ must divide the consumer wave count "
+                  "(BLOCK_SIZE/32 - 2)");
     static constexpr int kTileK = 1;
     static_assert(kTileM * kTileN == kNumConsumerWaves,
                   "consumer waves must equal kTileM*kTileN");
@@ -1297,6 +1331,210 @@ using opus_bmm_a8w8_mxscale_bpreshuffle_tile_sfa_tdm128_gfx1250 =
         /*GROUP_K*/128, /*NUM_SLOTS*/3, /*WG_PER_CU*/1, /*GROUP_N*/1,
         /*SF_A_LDS*/true, /*SF_B_LDS*/false,
         /*SF_A_TDM_KG*/128, /*SF_A_TDM_PAD*/4>;
+
+// -- SIZING A TILE ON gfx1250: the two ceilings ------------------------------
+// Measured 2026-09-01 with -Rpass-analysis=kernel-resource-usage. Both were
+// learned by hitting them, and the second one cost a wrong diagnosis first.
+//
+// CEILING 1 -- LDS, 320 KB per workgroup, enforced by static_assert:
+//     NUM_SLOTS * (B_M*(B_K+16) + B_N*B_K)
+//   NUM_SLOTS is NOT a free parameter: the producer ring only implements 3
+//   (slots=2 deadlocks, see below), so a tile that does not fit must give up
+//   B_K, not ring depth.
+//
+// CEILING 2 -- REGISTERS. The file is ~1024 VGPR per SIMD in wave32, and a
+// workgroup of W waves puts ceil(W/4) of them on every SIMD, so
+//     per-wave ceiling ~= 1024 / ceil(W/4)
+//   Measured, and the fit is exact at the two points that touch it:
+//     W=4  (128 thr)  ceiling ~1024   kid0  used 538, never near it
+//     W=6  (192 thr)  ceiling  512    kid19 and kid20 both pinned at EXACTLY 512
+//     W=10 (320 thr)  ceiling  336    kid21 pinned at EXACTLY 336
+//
+// What a tile demands, per consumer wave:
+//     acc    = kExpM * kExpN * 8      (16x16 fp32 accumulator / 32 lanes)
+//     A frag = kExpM * kExpK * 16     (16x128 fp8 operand / 32 lanes)
+//     B frag = kExpN * kExpK * 16
+//   with kExpM = B_M/(16*kTileM), kExpN = B_N/(16*kTileN), kExpK = B_K/128.
+//
+// THE TRAP, and it is worth stating plainly because it produced a wrong
+// conclusion for half a day: MORE WAVES CUTS THE CEILING FASTER THAN IT CUTS
+// THE DEMAND. Going 6 -> 10 waves divides acc by 1.5 (four more consumers) but
+// divides the ceiling by 1.5 as well, while leaving the A fragment term alone.
+// kid21 at 320 threads wanted ~448 against a 336 ceiling and spilled 1353
+// registers into 1376 B/lane of scratch; the natural reading -- "256x256 is too
+// big for this chip" -- is wrong. The tile is fine; the wave count was not.
+// Spend the budget on the tile and stay at 6 waves.
+//
+// And the grid shape is free money on top: acc depends only on the PRODUCT
+// kTileM*kTileN, while the two fragment terms are each divided by one factor
+// alone. Squaring the grid therefore shrinks A+B at no cost to acc -- kid24
+// (2x2) measures 314 VGPR against kid22's (1x4) 368 on the identical tile.
+//
+// -- prefill tile candidates ------------------------------------------------
+// gfx950 wins every m>=2048 DSV4 cell with a 512x256 tile against kid0's
+// 128x128, and the decode sweep showed that what binds is the work a workgroup
+// DUPLICATES (A rows, per-WMMA scales). Wider tiles amortise that.
+//
+// Two resources scale with tile area and constrain it:
+//   LDS  = NUM_SLOTS * (B_M*(B_K+16) + B_N*B_K). kid0 at slots=3 is 198 KB.
+//          NUM_SLOTS IS NOT AVAILABLE TO BUY LDS BACK -- see below -- so a tile
+//          that does not fit at slots=3 has to give up B_K instead.
+//   VGPR = B_M * B_N / (32 * kNumConsumerWaves). kid0 holds 256 acc/lane.
+//          BLOCK_SIZE must grow with tile area to keep acc/lane at 256 or the
+//          accumulator alone exceeds the 512-VGPR architectural limit.
+//
+// NUM_SLOTS MUST BE 3. The traits static_assert accepts 2, and every one of the
+// twenty tiles that came before this block uses 3, so that path had never run.
+// It deadlocks: the producer's steady step signals DATA[s-2], which at
+// kNumSlots==2 is DATA[s] -- the slot it has just issued and not waited on --
+// and the prologue's `static_for<kNumSlots - 2>` runs zero times, so no DATA is
+// ever signalled for the first tiles and the consumers block forever on
+// DATA[0]. Measured: kid19/20/21 at slots=2 hung the GPU queue (kernel launched,
+// synchronize never returned, 0% GPU); the same tiles at slots=3 are below, and
+// kid22 (slots=3 from the start) passed on the first try.
+//
+// Each candidate below is sized to hit ~256 acc/lane and fit LDS at slots=3.
+// The compiler static_asserts are the referee; the resource remarks say what
+// the register allocator actually used, and whether it spilled.
+//
+// kid19: 256x128 on a 2x2 consumer grid -- the SAME TILE the 1x4 version
+// spilled 1156 B/lane on. 2x2 halves kExpM (16 -> 8) where 1x4 left it at the
+// full B_M/16, so the A-fragment term goes 256 -> 128 VGPR. If the 2D grid is
+// worth anything this pair is where it shows, because nothing else changed.
+// LDS = 3*256*272 + 3*8*4096 = 300 KB.
+template <typename DataC>
+using opus_bmm_a8w8_mxscale_bpreshuffle_tile_pf_m256_gfx1250 =
+    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
+        /*BLOCK_SIZE*/192, /*B_M*/256, /*B_N*/128, /*B_K*/256,
+        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
+        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
+        /*GROUP_K*/128, /*NUM_SLOTS*/3, /*WG_PER_CU*/1, /*GROUP_N*/1,
+        /*SF_A_LDS*/false, /*SF_B_LDS*/false,
+        /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2>;
+
+// kid20: N doubled. Same wave count and acc/lane as kid19, but the extra
+// coverage is in N, so the grid shrinks in a different dimension. At the DSV4
+// wo_a shape (n=1024) this halves the N tiles from 8 to 4.
+// LDS = 3*128*272 + 3*16*4096 = 294 KB.
+template <typename DataC>
+using opus_bmm_a8w8_mxscale_bpreshuffle_tile_pf_n256_gfx1250 =
+    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
+        /*BLOCK_SIZE*/192, /*B_M*/128, /*B_N*/256, /*B_K*/256,
+        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
+        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
+        /*GROUP_K*/128, /*NUM_SLOTS*/3, /*WG_PER_CU*/1>;
+
+// kid21: 256x256x128 on a 2x4 grid, 8 consumer waves (BLOCK_SIZE=320). This is
+// the tile the 2D grid exists for: by the fragment arithmetic it costs 448
+// VGPR, exactly kid22's footprint, while covering FOUR TIMES kid22's output
+// tile. The same tile on 1x8 costs 544 and is what the earlier kid21 measured
+// at 9x slower.
+//
+// B_K is 128, not 256: at slots=3 (the only ring depth the producer implements)
+// a 256x256x256 tile needs 396 KB of LDS against a 320 KB budget. 3*256*144 +
+// 3*16*2048 = 204 KB fits. The cost is kExpK 1 instead of 2, i.e. half the K
+// reuse per LDS slot -- a confound kid23 below controls for.
+template <typename DataC>
+using opus_bmm_a8w8_mxscale_bpreshuffle_tile_pf_m256n256_gfx1250 =
+    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
+        /*BLOCK_SIZE*/320, /*B_M*/256, /*B_N*/256, /*B_K*/128,
+        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
+        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
+        /*GROUP_K*/128, /*NUM_SLOTS*/3, /*WG_PER_CU*/1, /*GROUP_N*/1,
+        /*SF_A_LDS*/false, /*SF_B_LDS*/false,
+        /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2>;
+
+// kid23: B_K CONTROL. kid22's tile and wave count at B_K=128 instead of 256, so
+// kid22-vs-kid23 prices the halved K reuse on its own and kid23-vs-kid21 is
+// then the tile size at fixed B_K. Without it a kid21 win or loss cannot be
+// split between the wider tile and the shorter K step.
+template <typename DataC>
+using opus_bmm_a8w8_mxscale_bpreshuffle_tile_pf_bk128_gfx1250 =
+    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
+        /*BLOCK_SIZE*/192, /*B_M*/128, /*B_N*/128, /*B_K*/128,
+        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
+        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
+        /*GROUP_K*/128, /*NUM_SLOTS*/3, /*WG_PER_CU*/1>;
+
+// kid25: 256x128x128 on a 2x2 grid, 192 threads. The tile the measured VGPR
+// budget points at, and the first one built from a rule rather than a guess.
+//
+// The rule, read off kid0/kid22/kid19/kid21: the register file is ~1024 VGPR
+// per SIMD in wave32, and a workgroup of W waves puts ceil(W/4) of them on each
+// SIMD, so the per-wave ceiling is ~1024/ceil(W/4). Measured ceilings: 4 waves
+// -> kid0 sat at 538 without touching one; 6 waves -> kid19 and kid20 both
+// pinned at exactly 512; 10 waves -> kid21 pinned at exactly 336. kid21's
+// spilling was therefore never about its tile being too wide -- 320 threads put
+// three waves on a SIMD and cut the ceiling to 336 while the tile wanted ~448.
+//
+// So: stay at 6 waves (ceiling 512) and spend the budget on the tile instead of
+// on waves. Against kid19, which is the same 256x128 shape and spills 108
+// B/lane, the only change is B_K 256 -> 128, which halves kExpK and with it
+// both fragment terms:
+//
+//            kExpM kExpN kExpK   acc  A frag  B frag   total   ceiling
+//   kid19        8     4     2   256     256     128     640       512
+//   kid25        8     4     1   256     128      64     448       512
+//
+// LDS = 3*256*144 + 3*8*2048 = 156 KB, comfortably inside 320.
+//
+// MEASURED, AND THE ARITHMETIC ABOVE IS WRONG. kid25 was predicted to fit at
+// 448; it pins at 512 and spills 12 registers into 52 B/lane of scratch. Less
+// than kid19's 108 and kid20's 84, so halving B_K did help, but not to zero.
+//
+// The model's error has a sign that tracks kExpK, which says what is wrong with
+// it: the B_K=256 tiles all measure BELOW it (kid0 538 vs 640, kid22 368 vs 448,
+// kid24 314 vs 384) and the B_K=128 tiles all measure ABOVE (kid23 352 vs 288,
+// kid25 ~524 vs 448). So the fragment terms do not scale with kExpK -- at
+// kExpK=2 the compiler reloads between the two K steps instead of holding both
+// live, and at kExpK=1 a fixed addressing/scale overhead the model omits
+// dominates instead. Treat the arithmetic as an ORDERING and a guide to grid
+// shape, which it gets right, and never as a fit/no-fit test: only the resource
+// remarks answer that.
+//
+// The standing result after all of this: at 6 waves and a 512-VGPR ceiling,
+// 128x128 is the only tile that fits with zero scratch. Every widening tried
+// spills something. What actually paid was never the tile -- it was the wave
+// count (kid0 -> kid22, 538 -> 368 VGPR, occupancy 1 -> 2) and then the grid
+// shape (kid22 -> kid24, 368 -> 314, still zero scratch).
+//
+// The B_K halving is a real cost (half the K reuse per LDS slot) and kid23 is
+// its control at the 128x128 tile, so kid25-vs-kid19 and kid23-vs-kid22 price
+// the same change on two different tiles.
+template <typename DataC>
+using opus_bmm_a8w8_mxscale_bpreshuffle_tile_pf_m256_bk128_gfx1250 =
+    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
+        /*BLOCK_SIZE*/192, /*B_M*/256, /*B_N*/128, /*B_K*/128,
+        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
+        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
+        /*GROUP_K*/128, /*NUM_SLOTS*/3, /*WG_PER_CU*/1, /*GROUP_N*/1,
+        /*SF_A_LDS*/false, /*SF_B_LDS*/false,
+        /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2>;
+
+// kid24: kid22's tile on a 2x2 grid instead of 1x4. Same tile, same wave count,
+// same LDS -- only the grid shape differs, so this is the cleanest possible
+// read on whether squaring the grid is worth its 448 -> 384 VGPR on a tile that
+// already fits.
+template <typename DataC>
+using opus_bmm_a8w8_mxscale_bpreshuffle_tile_pf_w6_2x2_gfx1250 =
+    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
+        /*BLOCK_SIZE*/192, /*B_M*/128, /*B_N*/128, /*B_K*/256,
+        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
+        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
+        /*GROUP_K*/128, /*NUM_SLOTS*/3, /*WG_PER_CU*/1, /*GROUP_N*/1,
+        /*SF_A_LDS*/false, /*SF_B_LDS*/false,
+        /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2>;
+
+// kid22: control — kid0's geometry at 192 threads (6 waves: 2 producer +
+// 4 consumer, vs kid0's 4 waves: 2+2). Same tile, same LDS, so
+// kid22-vs-kid0 isolates the consumer wave count from the tile size.
+template <typename DataC>
+using opus_bmm_a8w8_mxscale_bpreshuffle_tile_pf_w6_gfx1250 =
+    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
+        /*BLOCK_SIZE*/192, /*B_M*/128, /*B_N*/128, /*B_K*/256,
+        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
+        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
+        /*GROUP_K*/128, /*NUM_SLOTS*/3, /*WG_PER_CU*/1>;
 
 // -- smem -> register read layouts -----------------------------------------
 // Device-only in effect, but compiled on the host pass too so vtype_c matches.
