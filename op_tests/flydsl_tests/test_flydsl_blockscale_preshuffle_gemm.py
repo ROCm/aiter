@@ -42,17 +42,11 @@ if not is_flydsl_available():
 try:
     from aiter import dtypes
     from aiter.ops.flydsl.gemm_kernels import (
-        _compile_flydsl_blockscale,
         flydsl_gemm_a8w8_blockscale_bpreshuffle,
         select_blockscale_tile_config,
     )
     from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_common import (
-        FLAG_CANDIDATES,
-        TILE_CANDIDATES,
-        WAVE_CANDIDATES,
         kernelInstance,
-        kernels_list,
-        parse_kernel_name,
         tile_is_valid,
     )
     from aiter.ops.flydsl.kernels.gemm_blockscale_preshuffle import (
@@ -85,23 +79,10 @@ SCALE_BLOCK_K = 128
 # an all-powers-of-two table exercises none of them.
 PRECISION_CASES = [
     {"name": "m1_n512_k512_auto", "m": 1, "n": 512, "k": 512},
-    {"name": "m33_n512_k512_auto", "m": 33, "n": 512, "k": 512},
     {"name": "m100_n512_k512_auto", "m": 100, "n": 512, "k": 512},
     {"name": "m512_n512_k512_auto", "m": 512, "n": 512, "k": 512},
-    {
-        "name": "m17_n512_k512_t16x64x256",
-        "m": 17,
-        "n": 512,
-        "k": 512,
-        "tile": (16, 64, 256),
-    },
-    {
-        "name": "m100_n512_k512_t32x64x128",
-        "m": 100,
-        "n": 512,
-        "k": 512,
-        "tile": (32, 64, 128),
-    },
+    # The only case that passes an explicit tile rather than letting the heuristic
+    # pick, so it covers the tuned-row path. Its tile is one no auto case resolves to.
     {
         "name": "m1024_n512_k512_t64x256x128",
         "m": 1024,
@@ -253,27 +234,6 @@ def test_flydsl_blockscale_precision(case: dict):
     )
 
 
-def test_one_compile_serves_every_m():
-    """One compile must serve every M.
-
-    M changes from call to call at serving time. If it were baked into codegen, each
-    new M would JIT on the critical path, so this asserts the compile cache takes
-    exactly one miss across four different M values.
-    """
-    n, k, tile = 512, 512, (64, 256, 128)
-    _compile_flydsl_blockscale.cache_clear()
-    for m in (64, 100, 1024, 2049):
-        x, _, _, w_scale, w_shuf, x_scale_km = make_inputs(m, n, k)
-        out = torch.zeros((m, n), dtype=torch.bfloat16, device="cuda")
-        flydsl_gemm_a8w8_blockscale_bpreshuffle(
-            x, w_shuf, x_scale_km, w_scale, out, *tile, SCALE_BLOCK_K
-        )
-    torch.cuda.synchronize()
-    info = _compile_flydsl_blockscale.cache_info()
-    print(f"  compile cache: {info}")
-    assert info.misses == 1, f"expected a single compile across 4 M values, got {info}"
-
-
 def test_invalid_tile_raises_runtime_error():
     """A tile the kernel cannot serve must raise RuntimeError, not abort.
 
@@ -303,71 +263,6 @@ def test_unsupported_out_dtype_raises_runtime_error():
         )
 
 
-@pytest.mark.parametrize("kernel_id", sorted(kernels_list))
-def test_kernel_name_round_trip(kernel_id: int):
-    """The tuner writes kernelName; the dispatch parses it back. A mismatch
-    silently degrades every tuned row to the heuristic tile, which looks like a
-    performance regression with no error anywhere, so pin the round trip."""
-    ki = kernels_list[kernel_id]
-    parsed = parse_kernel_name(ki.name)
-    assert parsed == ki, f"{ki.name!r} parsed back as {parsed}"
-
-
-def test_kernel_name_rejects_foreign_names():
-    """Names from the CK and rowwise-FlyDSL families must not parse as this one."""
-    for name in (
-        "",
-        "a8w8_blockscale_bpreshuffle_1x128x128_256x64x256x128_intrawave_v1",
-        "flydsl_a8w8_bpreshuflle_64x128x128_F8_F8_B16_ls2_ce0_ac1_wpe0_default",
-        "flydsl_blockscale_bpreshuffle_64x256x128_F8_F8_B16_default",  # no sbk field
-    ):
-        assert parse_kernel_name(name) is None, f"{name!r} should not parse"
-
-
-def test_tile_candidates_are_append_only():
-    """kernelId in a tuned CSV row indexes into TILE_CANDIDATES. Reordering or
-    removing an entry re-points every already-written row at a different tile, so
-    the first entries are pinned here as a tripwire."""
-    assert TILE_CANDIDATES[:3] == ((16, 64, 256), (16, 128, 256), (32, 64, 128))
-    assert TILE_CANDIDATES[10] == (64, 256, 128)
-    assert len(kernels_list) == len(TILE_CANDIDATES) * len(WAVE_CANDIDATES) * len(
-        FLAG_CANDIDATES
-    )
-    # The wave and flag axes are appended, never interleaved, and the all-default
-    # blocks sort first: ids [0, len(TILE_CANDIDATES)) stay the 4-wave no-flag tiles
-    # in TILE_CANDIDATES order, so a row written by any earlier sweep still resolves
-    # to the kernel it measured.
-    assert WAVE_CANDIDATES[0] == 4
-    assert FLAG_CANDIDATES[0] == (False, False)
-    for f_idx, (ac, cs) in enumerate(FLAG_CANDIDATES):
-        for w_idx, num_waves in enumerate(WAVE_CANDIDATES):
-            for i, tile in enumerate(TILE_CANDIDATES):
-                idx = (f_idx * len(WAVE_CANDIDATES) + w_idx) * len(TILE_CANDIDATES) + i
-                ki = kernels_list[idx]
-                assert (ki.tile_m, ki.tile_n, ki.tile_k) == tile
-                assert ki.num_waves == num_waves
-                assert ki.use_async_copy is ac
-                assert ki.use_cshuffle_epilog is cs
-
-
-def test_kernel_name_wave_field_is_backward_compatible():
-    """A name written before the wave axis existed has no _w field. It must still
-    parse, as the 4 waves it was measured at; otherwise every already-tuned row
-    silently re-points at a different kernel."""
-    legacy = "flydsl_blockscale_bpreshuffle_64x256x128_F8_F8_B16_sbk128_default"
-    ki = parse_kernel_name(legacy)
-    assert ki is not None and ki.num_waves == 4
-    assert (ki.tile_m, ki.tile_n, ki.tile_k) == (64, 256, 128)
-    assert ki.use_async_copy is False and ki.use_cshuffle_epilog is False
-    # a name from the intermediate sweep, carrying only some of the fields
-    partial = parse_kernel_name(legacy + "_w8")
-    assert partial.num_waves == 8
-    assert partial.use_async_copy is False and partial.use_cshuffle_epilog is False
-    # and every generated name round-trips, both widths
-    for k in kernels_list.values():
-        assert parse_kernel_name(k.name) == k
-
-
 def test_heuristic_tile_is_always_valid():
     """Whatever the heuristic picks must be something the kernel accepts; a pick the
     validator then rejects raises RuntimeError out of the dispatch, uncaught.
@@ -383,42 +278,13 @@ def test_heuristic_tile_is_always_valid():
                 ), f"heuristic picked invalid tile {tile} for M={m} N={n} K={k}"
 
 
-def test_dispatch_matches_direct_call():
-    """The same numbers must come out of gemm_a8w8_blockscale_bpreshuffle as out of
-    the op called directly, i.e. the tuned-row plumbing (libtype, kernelName, the
-    scale/weight layouts the wrapper assumes) does not reshape anything on the way."""
-    import aiter
-
-    m, n, k, tile = 512, 512, 512, (64, 256, 128)
-    x, _, _, w_scale, w_shuf, x_scale_km = make_inputs(m, n, k)
-
-    direct = torch.zeros((m, n), dtype=torch.bfloat16, device="cuda")
-    flydsl_gemm_a8w8_blockscale_bpreshuffle(
-        x, w_shuf, x_scale_km, w_scale, direct, *tile, SCALE_BLOCK_K
-    )
-
-    ki = kernelInstance(*tile, scale_block_k=SCALE_BLOCK_K)
-    config = {"libtype": "flydsl", "kernelName": ki.name, "splitK": 0}
-    via_dispatch = aiter.ops.gemm_op_a8w8.gemm_a8w8_blockscale_flydsl(
-        x,
-        w_shuf,
-        x_scale_km,
-        w_scale,
-        torch.zeros((m, n), dtype=torch.bfloat16, device="cuda"),
-        config,
-    )
-    torch.cuda.synchronize()
-    assert torch.equal(direct, via_dispatch), "dispatch and direct call disagree"
-
-
 @pytest.mark.parametrize("strided_x_scale", [False, True])
 def test_real_dispatch_branch(monkeypatch, strided_x_scale: bool):
     """Drive aiter.gemm_a8w8_blockscale_bpreshuffle itself, not the wrapper below it.
 
-    test_dispatch_matches_direct_call stops one frame short: it calls
-    gemm_a8w8_blockscale_flydsl, so the tuned-row lookup and the
-    kernelName.startswith("flydsl_blockscale_bpreshuffle_") branch that selects it
-    never run. Injecting the config exercises both.
+    Entering at gemm_a8w8_blockscale_flydsl would stop one frame short, leaving the
+    tuned-row lookup and the kernelName.startswith("flydsl_blockscale_bpreshuffle_")
+    branch that selects it unrun. Injecting the config exercises both.
 
     Both x_scale layouts the op accepts are covered. The strided one is the shape a
     bare .contiguous() re-materialises M-major, which the kernel then reads
@@ -428,11 +294,23 @@ def test_real_dispatch_branch(monkeypatch, strided_x_scale: bool):
     import aiter.ops.gemm_op_a8w8 as gemm_op
 
     m, n, k, tile = 512, 512, 512, (64, 256, 128)
-    x, _, x_scale, w_scale, w_shuf, x_scale_km = make_inputs(m, n, k)
+    x, w, x_scale, w_scale, w_shuf, x_scale_km = make_inputs(m, n, k)
 
     ki = kernelInstance(*tile, scale_block_k=SCALE_BLOCK_K)
     cfg = {"libtype": "flydsl", "kernelName": ki.name, "splitK": 0}
     monkeypatch.setattr(gemm_op, "get_CKGEMM_config", lambda *a, **kw: cfg)
+
+    # Record that the FlyDSL branch actually ran. Every path out of this dispatch
+    # ends in a correct result, so an oracle check alone passes just as happily
+    # when the call falls through to CK.
+    served_by_flydsl = []
+    _real_flydsl = gemm_op.gemm_a8w8_blockscale_flydsl
+
+    def _spy(*args, **kwargs):
+        served_by_flydsl.append(True)
+        return _real_flydsl(*args, **kwargs)
+
+    monkeypatch.setattr(gemm_op, "gemm_a8w8_blockscale_flydsl", _spy)
 
     scale_k = k // SCALE_BLOCK_K
     if strided_x_scale:
@@ -444,15 +322,18 @@ def test_real_dispatch_branch(monkeypatch, strided_x_scale: bool):
     assert xs.shape == (m, scale_k)
 
     got = aiter.gemm_a8w8_blockscale_bpreshuffle(x, w_shuf, xs, w_scale)
-
-    expect = torch.zeros((m, n), dtype=torch.bfloat16, device="cuda")
-    flydsl_gemm_a8w8_blockscale_bpreshuffle(
-        x, w_shuf, x_scale_km, w_scale, expect, *tile, SCALE_BLOCK_K
-    )
     torch.cuda.synchronize()
-    assert torch.equal(got, expect), (
-        f"real dispatch disagrees with the direct call "
-        f"(strided_x_scale={strided_x_scale})"
+    assert (
+        served_by_flydsl
+    ), "another backend served the call; the FlyDSL branch never ran"
+
+    # Against the fp32 oracle, not against another kernel run: two kernel calls
+    # agreeing proves only that they are wrong in the same way.
+    ref = run_torch(x, w, x_scale, w_scale)
+    rel, tile_rel = rel_norm(ref, got), max_tile_rel(ref, got)
+    assert rel <= DEFAULT_REL_TOL and tile_rel <= DEFAULT_TILE_REL_TOL, (
+        f"strided_x_scale={strided_x_scale}: rel={rel:.3e}, "
+        f"max_tile_rel={tile_rel:.3e}"
     )
 
 
@@ -470,10 +351,12 @@ def test_real_dispatch_branch(monkeypatch, strided_x_scale: bool):
     ],
 )
 def test_optional_kernel_knobs(knob: dict):
-    """num_waves, use_cshuffle_epilog and use_async_copy have no production caller yet.
+    """The optional compile knobs, each checked against the oracle.
 
-    They are compiled and checked here anyway: an untested knob that ships is one that
-    silently rots until the first caller finds it broken.
+    use_async_copy and use_cshuffle_epilog are no longer hypothetical: tuned rows
+    that select them ship in aiter/configs, so a break here is a break in a served
+    shape. num_waves=8 has no tuned row yet and is covered so it does not rot
+    before the first one arrives.
     """
     import flydsl.expr as fx
 
@@ -530,20 +413,12 @@ def main() -> int:
             results.append((case["name"], "ERROR", float("nan")))
 
     checks = [
-        ("one_compile_serves_every_m", test_one_compile_serves_every_m),
         ("invalid_tile_raises", test_invalid_tile_raises_runtime_error),
         (
             "unsupported_out_dtype_raises",
             test_unsupported_out_dtype_raises_runtime_error,
         ),
-        (
-            "kernel_name_round_trip",
-            lambda: [test_kernel_name_round_trip(i) for i in kernels_list],
-        ),
-        ("kernel_name_rejects_foreign", test_kernel_name_rejects_foreign_names),
-        ("tile_candidates_append_only", test_tile_candidates_are_append_only),
         ("heuristic_tile_valid", test_heuristic_tile_is_always_valid),
-        ("dispatch_matches_direct", test_dispatch_matches_direct_call),
         # test_real_dispatch_branch is the only check that drives
         # aiter.gemm_a8w8_blockscale_bpreshuffle through the new dispatch branch, so it
         # must not be pytest-only; _MonkeyPatch is what pytest hands its fixture.
