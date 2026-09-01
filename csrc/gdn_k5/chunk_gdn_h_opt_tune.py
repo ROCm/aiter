@@ -33,10 +33,7 @@ from aiter.utility.base_tuner import TunerCommon, _read_csv
 CHUNK_SIZE = 64
 BV_CANDIDATES = (16, 32, 64)
 _K5_TEST_PATH = (
-    Path(AITER_ROOT_DIR)
-    / "op_tests"
-    / "flydsl_tests"
-    / "test_flydsl_linear_attention_prefill.py"
+    Path(AITER_ROOT_DIR) / "op_tests" / "test_flydsl_linear_attention_prefill.py"
 )
 LOOKUP_KEYS = (
     "gfx",
