@@ -18,7 +18,6 @@ from collections import OrderedDict
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels import buffer_ops
@@ -30,6 +29,7 @@ BLOCK_M = 128
 BLOCK_N = 128
 BLOCK_K = 64
 STAGES_A = 2
+B_STAGES = 3
 THREADS = 256
 LDS_BYTES = 65536
 K_TILE_GRAN = 32  # MFMA K-tile loop uses BLOCK_K // 32 stages
@@ -91,15 +91,11 @@ def _build_launcher(
     BLOCK_M,
     BLOCK_N,
     BLOCK_K,
-    STAGES_A,
     THREADS,
     BM_TILES,
     N_GROUPS,
     XCD_C,
     XCD_W,
-    USE_MFMA_K32,
-    WAVES_PER_EU=0,
-    B_STAGES=3,
     COMPACT=False,
 ):
     N_BLOCKS = N // BLOCK_N  # output column-tiles per group (compile-time)
@@ -258,9 +254,7 @@ def _build_launcher(
                         soffset=fx.Int32(a_next_k) * gA_k_stride,
                     )
                 if fx.const_expr(b_next_k is not None):
-                    b_fetch_slot = (
-                        b_read_slot + (2 if fx.const_expr(B_STAGES > 2) else 1)
-                    ) % B_STAGES
+                    b_fetch_slot = (b_read_slot + 2) % B_STAGES
                     fx.copy(
                         buffer_copy_128b,
                         thr_gB_k[None, None, None, 0],
@@ -274,14 +268,8 @@ def _build_launcher(
                         thr_sA_s2r[None, None, block_k_iter, a_read_stage],
                         mma_frag_A_retile[None, None, block_k_iter],
                     )
-                    if fx.const_expr(USE_MFMA_K32):
-                        frag_A_k = mma_frag_A[None, None, block_k_iter]
-                        frag_B_k = mma_frag_B[None, None, block_k_iter, b_read_slot]
-                    else:
-                        frag_A_k = mma_frag_A[None, None, (None, block_k_iter)]
-                        frag_B_k = mma_frag_B[
-                            None, None, (None, block_k_iter), b_read_slot
-                        ]
+                    frag_A_k = mma_frag_A[None, None, (None, block_k_iter)]
+                    frag_B_k = mma_frag_B[None, None, (None, block_k_iter), b_read_slot]
                     fx.gemm(
                         tiled_mma,
                         mma_frag_C,
@@ -306,7 +294,7 @@ def _build_launcher(
                 thr_gB_k[None, None, None, 0],
                 mma_frag_B_retile[None, None, None, 0],
             )
-            if fx.const_expr(B_STAGES > 2 and n_tiles > 1):
+            if fx.const_expr(n_tiles > 1):
                 fx.copy(
                     buffer_copy_128b,
                     thr_gB_k[None, None, None, 0],
@@ -388,21 +376,14 @@ def _build_launcher(
         max_seq_len: int,
         stream: fx.Stream = _DEFAULT_STREAM,
     ):
-        if fx.const_expr(USE_MFMA_K32):
-            tiled_mma = fx.make_tiled_mma(
-                fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.BFloat16)),
-                fx.make_layout((1, 4, 1), (0, 1, 0)),
-                fx.make_tile(None, None, fx.make_layout((8, 4), (1, 8))),
-            )
-        else:
-            n_warps_total = THREADS // 64
-            n_warps = min(n_warps_total, BLOCK_N // 16)
-            m_warps = n_warps_total // n_warps
-            tiled_mma = fx.make_tiled_mma(
-                fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16)),
-                fx.make_layout((m_warps, n_warps, 1), (1, m_warps, 0)),
-                fx.make_tile(None, None, fx.make_layout((4, 4, 2), (1, 8, 4))),
-            )
+        n_warps_total = THREADS // 64
+        n_warps = min(n_warps_total, BLOCK_N // 16)
+        m_warps = n_warps_total // n_warps
+        tiled_mma = fx.make_tiled_mma(
+            fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16)),
+            fx.make_layout((m_warps, n_warps, 1), (1, m_warps, 0)),
+            fx.make_tile(None, None, fx.make_layout((4, 4, 2), (1, 8, 4))),
+        )
         val_per_thr = 8  # 16B / bf16
         thrs_col = BLOCK_K // val_per_thr
         thrs_row = THREADS // thrs_col
@@ -434,35 +415,17 @@ def _build_launcher(
             grid = (total_occ_tiles, 1, N_BLOCKS)
         else:
             grid = (bm * N_BLOCKS, 1, n_groups)
-        if WAVES_PER_EU:
-            with CompilationContext.compile_hints({"waves_per_eu": WAVES_PER_EU}):
-                jdbba_kernel(
-                    C,
-                    A,
-                    B,
-                    BIAS,
-                    SEQ_OFFSETS,
-                    TILE_MAP,
-                    tiled_mma,
-                    tiled_copy_g2s_A,
-                    tiled_copy_s2g_C,
-                ).launch(
-                    grid=grid, block=(THREADS, 1, 1), smem=epi_smem_bytes, stream=stream
-                )
-        else:
-            jdbba_kernel(
-                C,
-                A,
-                B,
-                BIAS,
-                SEQ_OFFSETS,
-                TILE_MAP,
-                tiled_mma,
-                tiled_copy_g2s_A,
-                tiled_copy_s2g_C,
-            ).launch(
-                grid=grid, block=(THREADS, 1, 1), smem=epi_smem_bytes, stream=stream
-            )
+        jdbba_kernel(
+            C,
+            A,
+            B,
+            BIAS,
+            SEQ_OFFSETS,
+            TILE_MAP,
+            tiled_mma,
+            tiled_copy_g2s_A,
+            tiled_copy_s2g_C,
+        ).launch(grid=grid, block=(THREADS, 1, 1), smem=epi_smem_bytes, stream=stream)
 
     return _launch
 
@@ -492,42 +455,45 @@ def jagged_dense_bmm(
     stream: fx.Stream = _DEFAULT_STREAM,
     xcd_c: int | None = None,
     xcd_w: int | None = None,
-    use_mfma_k32: bool | None = None,
     uniform_seqlen: bool = True,
     block_m: int | None = None,
     block_n: int | None = None,
     block_k: int | None = None,
-    waves_per_eu: int = 0,
     threads: int | None = None,
     tile_map=None,
     total_occ_tiles: int | None = None,
 ):
     N = B.shape[0] // n_groups
     K = B.shape[1]
-    if use_mfma_k32 is None:
-        use_mfma_k32 = False
+    bmn = BLOCK_M if block_m is None else int(block_m)
+    bnn = BLOCK_N if block_n is None else int(block_n)
+    if bmn <= 0:
+        raise ValueError(f"block_m must be positive, got {bmn}")
+    # No partial-tile path in N: N_BLOCKS floors, so a non-divisor block_n
+    # would silently drop the trailing N % block_n output columns.
+    if bnn <= 0 or N % bnn != 0:
+        raise ValueError(f"block_n={bnn} must be a positive divisor of N={N}")
     if block_k is None:
-        if use_mfma_k32:
-            block_k = 128 if K <= 256 else BLOCK_K
-        else:
-            block_k = BLOCK_K
+        block_k = BLOCK_K
     else:
         block_k = int(block_k)
         if block_k <= 0 or block_k % K_TILE_GRAN != 0:
             raise ValueError(
                 f"block_k must be a positive multiple of {K_TILE_GRAN}, got {block_k}"
             )
-        if not use_mfma_k32 and block_k < 64:
+        if block_k < 64:
             raise ValueError(f"block_k must be >= 64 for MFMA 16x16x16, got {block_k}")
-        a_smem = BLOCK_M * block_k * STAGES_A * 2
-        epi_smem = max(a_smem, BLOCK_M * BLOCK_N * 2)
-        if epi_smem > LDS_BYTES:
-            raise ValueError(
-                f"block_k={block_k} needs {epi_smem} bytes LDS (max {LDS_BYTES}); "
-                f"A-stage staging is {a_smem} bytes"
-            )
-        if K % block_k != 0:
-            raise ValueError(f"block_k={block_k} must divide K={K}")
+    # These depend on block_m / block_n too, so they run for the default block_k
+    # as well: n_tiles = K // block_k floors, silently dropping the K tail.
+    if K % block_k != 0:
+        raise ValueError(f"block_k={block_k} must divide K={K}")
+    a_smem = bmn * block_k * STAGES_A * 2
+    epi_smem = max(a_smem, bmn * bnn * 2)
+    if epi_smem > LDS_BYTES:
+        raise ValueError(
+            f"block_k={block_k} needs {epi_smem} bytes LDS (max {LDS_BYTES}); "
+            f"A-stage staging is {a_smem} bytes"
+        )
     if xcd_c is None:
         if not uniform_seqlen:
             xcd_c = 1
@@ -537,10 +503,7 @@ def jagged_dense_bmm(
             xcd_c = XCD_C_SMALL_K
     if xcd_w is None:
         xcd_w = 1 if xcd_c == 1 else XCD_W
-    bmn = BLOCK_M if block_m is None else block_m
-    bnn = BLOCK_N if block_n is None else block_n
     bm = (max_seq_len + bmn - 1) // bmn
-    b_stages = 2 if use_mfma_k32 else 3
     nthreads = THREADS if threads is None else threads
     compact = tile_map is not None
 
@@ -553,16 +516,12 @@ def jagged_dense_bmm(
         bmn,
         bnn,
         block_k,
-        STAGES_A,
         nthreads,
         bm,
         n_groups,
         tot,
         xcd_c,
         xcd_w,
-        use_mfma_k32,
-        waves_per_eu,
-        b_stages,
         compact,
     )
     launch_args = (C, A, B, BIAS, SEQ_OFFSETS, tmap, tot, n_groups, max_seq_len, stream)
@@ -575,15 +534,11 @@ def jagged_dense_bmm(
             bmn,
             bnn,
             block_k,
-            STAGES_A,
             nthreads,
             bm,
             n_groups,
             xcd_c,
             xcd_w,
-            use_mfma_k32,
-            waves_per_eu,
-            b_stages,
             compact,
         )
         _cache_put(key, launch)
