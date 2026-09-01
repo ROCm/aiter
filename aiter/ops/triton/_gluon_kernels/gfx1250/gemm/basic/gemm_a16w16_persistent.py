@@ -154,13 +154,13 @@ def gemm_a16w16_persistent_kernel_(
     for tile_id in range(start_pid, num_tiles, NUM_SMS):
 
         SHARED_LAYOUT_C: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-                [[BLOCK_N, 8]], [BLOCK_M, BLOCK_N], [1, 0]
-            )
+            [[BLOCK_N, 8]], [BLOCK_M, BLOCK_N], [1, 0]
+        )
         c_buffer = gl.allocate_shared_memory(
-                c_ptr.type.element_ty,
-                shape=[BLOCK_M, BLOCK_N],
-                layout=SHARED_LAYOUT_C,
-            )
+            c_ptr.type.element_ty,
+            shape=[BLOCK_M, BLOCK_N],
+            layout=SHARED_LAYOUT_C,
+        )
         # remap tile index
         t = remap_xcd(tile_id, num_tiles, NUM_XCDS=8)
         pid_k = t % NUM_KSPLIT
