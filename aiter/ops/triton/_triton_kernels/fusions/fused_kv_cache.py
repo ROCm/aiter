@@ -9,6 +9,7 @@ from aiter.ops.triton.rope.rope import (
     _get_neox_rotated_x,
     _get_neox_rotated_x_1D,
 )
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 
 @triton.jit
@@ -243,7 +244,29 @@ def _unit_rope_cat(
     tl.store(x_out_ptr + x_out_offs + (d_pe_offs + BLOCK_D_nope) * x_out_stride_d, x_pe)
 
 
-@triton.jit
+_fused_qk_rope_cat_and_cache_mla_kernel_repr = make_kernel_repr(
+    "_fused_qk_rope_cat_and_cache_mla_kernel",
+    [
+        "QH",
+        "KH",
+        "QH_PER_KH",
+        "BLOCK_D_nope",
+        "BLOCK_D_pe",
+        "BLOCK_D_HALF_pe",
+        "BLOCK_SIZE",
+        "REUSE_FREQS_FRONT_PART",
+        "IS_NEOX",
+        "SHUFFLED_KV_CACHE",
+        "SCALE_K_WIDTH_NOPE",
+        "SCALE_K_WIDTH_ROPE",
+        "OUTPUT_Q_NOPE_ZEROS_AND_Q_PE",
+        "HAVE_K_SCALE",
+        "UPCAST_OPERAND",
+    ],
+)
+
+
+@triton.jit(repr=_fused_qk_rope_cat_and_cache_mla_kernel_repr)
 def _fused_qk_rope_cat_and_cache_mla_kernel(
     q_nope_ptr,
     q_pe_ptr,
@@ -594,7 +617,33 @@ def _unit_rope_2d(
     return x_pe * cos + x_pe_rotated * sin
 
 
-@triton.jit
+_fused_qk_rope_reshape_and_cache_kernel_repr = make_kernel_repr(
+    "_fused_qk_rope_reshape_and_cache_kernel",
+    [
+        "QH",
+        "KH",
+        "QH_PER_KH",
+        "BLOCK_D_pe",
+        "BLOCK_D_HALF_pe",
+        "BLOCK_SIZE",
+        "BLOCK_H",
+        "KH_BLOCK",
+        "X_SIZE",
+        "REUSE_FREQS_FRONT_PART",
+        "IS_NEOX",
+        "FLASH_LAYOUT",
+        "VALUE_SHUFFLE_LAYOUT",
+        "SCALE_K_WIDTH",
+        "HAVE_POS",
+        "HAVE_K_SCALE",
+        "HAVE_V_SCALE",
+        "HAVE_ZEROS",
+        "UPCAST_OPERAND",
+    ],
+)
+
+
+@triton.jit(repr=_fused_qk_rope_reshape_and_cache_kernel_repr)
 def _fused_qk_rope_reshape_and_cache_kernel(
     q_ptr,
     k_ptr,
@@ -919,7 +968,27 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                 )
 
 
-@triton.jit
+_fused_qk_rope_cosine_cache_llama_kernel_repr = make_kernel_repr(
+    "_fused_qk_rope_cosine_cache_llama_kernel",
+    [
+        "QH",
+        "KH",
+        "QH_PER_KH",
+        "BLOCK_D_pe",
+        "BLOCK_D_HALF_pe",
+        "BLOCK_SIZE",
+        "X_SIZE",
+        "REUSE_FREQS_FRONT_PART",
+        "IS_NEOX",
+        "FLASH_LAYOUT",
+        "HAVE_POS",
+        "HAVE_K_SCALE",
+        "HAVE_V_SCALE",
+    ],
+)
+
+
+@triton.jit(repr=_fused_qk_rope_cosine_cache_llama_kernel_repr)
 def _fused_qk_rope_cosine_cache_llama_kernel(
     q_ptr,
     k_ptr,
