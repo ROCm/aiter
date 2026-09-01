@@ -28,6 +28,7 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import ArithValue
 from flydsl.expr.utils.arith import _to_raw as _raw
 from flydsl.runtime.device import get_rocm_arch
+
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.kernels_common import default_f8_type
 from aiter.ops.flydsl.kernels.mfma_epilogues import mfma_epilog
@@ -154,7 +155,7 @@ def compile_blockscale_preshuffle_gemm(
     out_dtype: str = "bf16",
     use_cshuffle_epilog: bool = False,
     dsrd_depth: int = 1,
-    waves_per_eu: int = None,
+    waves_per_eu: int | None = None,
     use_async_copy: bool = False,
     num_waves: int = NUM_WAVES,
     stage_a_scales: bool = False,
@@ -563,9 +564,7 @@ def compile_blockscale_preshuffle_gemm(
                 idx0 = _crd2idx((fx.Int32(row_a_local), fx.Int32(col_swz)), layout_lds)
                 ptr_off = fx.add_offset(lds_buffer.ptr, fx.make_int_tuple(idx0))
                 i8_iter = fx.recast_iter(fx.Uint8, ptr_off)
-                if const_expr(a_load_bytes_v == 16):
-                    fx.ptr_store(Vec(vec_a_parts[i]).bitcast(fx.Uint8), i8_iter)
-                elif const_expr(a_load_bytes_v == 8):
+                if const_expr(a_load_bytes_v == 16) or const_expr(a_load_bytes_v == 8):
                     fx.ptr_store(Vec(vec_a_parts[i]).bitcast(fx.Uint8), i8_iter)
 
         # ── A DMA async: direct global→LDS transfer ─────────────────────

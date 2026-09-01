@@ -43,8 +43,14 @@ from opus_gemm.opus_gemm_common import gfx942_a8w8_kernels_list
 try:
     from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_common import (
         default_use_async_copy as flydsl_default_async,
+    )
+    from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_common import (
         effective_stage_a_scales as flydsl_effective_stage_a_scales,
+    )
+    from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_common import (
         kernels_list as candidate_kernels_flydsl_dict,
+    )
+    from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_common import (
         tile_is_valid as flydsl_tile_is_valid,
     )
 except ImportError:
@@ -569,7 +575,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         preshuffleB,
         run_kwargs,
     ):
-        gfx, cu_num, M, N, K = info_keys
+        gfx, _cu_num, M, N, K = info_keys
 
         # FlyDSL only implements the B-preshuffle block-scale GEMM.
         if not preshuffleB:
@@ -587,7 +593,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             print("[FlyDSL] not available, skipping flydsl blockscale tuning")
             return []
         # The kernel's async-copy path is written for MFMA archs only.
-        if not (gfx.startswith("gfx94") or gfx.startswith("gfx95")):
+        if not gfx.startswith(("gfx94", "gfx95")):
             print(f"[FlyDSL] blockscale preshuffle GEMM unsupported on {gfx}, skipping")
             return []
 

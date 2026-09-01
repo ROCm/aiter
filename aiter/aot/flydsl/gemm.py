@@ -66,7 +66,11 @@ from aiter.ops.flydsl.gemm_kernels import (
 from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_common import (
     default_dsrd_depth,
     effective_stage_a_scales,
+)
+from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_common import (
     parse_kernel_name as _parse_blockscale_kernel_name,
+)
+from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_common import (
     tile_is_valid as _blockscale_tile_is_valid,
 )
 from aiter.ops.flydsl.kernels.gemm_blockscale_preshuffle import (

@@ -14,6 +14,8 @@ Usage:
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 
@@ -26,7 +28,7 @@ if not torch.cuda.is_available():
 
 # CDNA only: gfx95x the kernel emits v_mfma_f32_16x16x32_fp8_fp8
 _GFX = get_gfx()
-if not (_GFX.startswith("gfx942") or _GFX.startswith("gfx95")):
+if not _GFX.startswith(("gfx942", "gfx95")):
     pytest.skip(
         f"blockscale bpreshuffle GEMM needs gfx942/gfx95x, got {_GFX}",
         allow_module_level=True,
@@ -39,22 +41,22 @@ if not is_flydsl_available():
 
 try:
     from aiter import dtypes
-    from aiter.ops.flydsl.kernels.gemm_blockscale_preshuffle import (
-        compile_blockscale_preshuffle_gemm,
-    )
     from aiter.ops.flydsl.gemm_kernels import (
+        _compile_flydsl_blockscale,
         flydsl_gemm_a8w8_blockscale_bpreshuffle,
         select_blockscale_tile_config,
-        _compile_flydsl_blockscale,
     )
-    from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_common import (  # noqa: E501
-        TILE_CANDIDATES,
+    from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_common import (
         FLAG_CANDIDATES,
+        TILE_CANDIDATES,
         WAVE_CANDIDATES,
         kernelInstance,
         kernels_list,
         parse_kernel_name,
         tile_is_valid,
+    )
+    from aiter.ops.flydsl.kernels.gemm_blockscale_preshuffle import (
+        compile_blockscale_preshuffle_gemm,
     )
 except ImportError as exc:
     pytest.skip(
@@ -521,7 +523,7 @@ def main() -> int:
             results.append(
                 (case["name"], "PASS" if passed else "FAIL", max(rel, tile_rel))
             )
-        except Exception:
+        except Exception:  # noqa: BLE001
             import traceback
 
             traceback.print_exc()
@@ -570,7 +572,7 @@ def main() -> int:
         try:
             fn()
             results.append((name, "PASS", float("nan")))
-        except Exception:
+        except Exception:  # noqa: BLE001
             import traceback
 
             traceback.print_exc()
@@ -578,7 +580,7 @@ def main() -> int:
 
     print(f"\n{'=' * 70}\nSUMMARY\n{'=' * 70}")
     for name, status, rel in results:
-        rel_s = "" if rel != rel else f"  rel={rel:.3e}"
+        rel_s = "" if math.isnan(rel) else f"  rel={rel:.3e}"
         print(f"  {status:>5s}  {name:<38s}{rel_s}")
     n_pass = sum(1 for _, s, _ in results if s == "PASS")
     print(f"\n  {n_pass}/{len(results)} passed")

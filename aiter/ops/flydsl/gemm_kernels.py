@@ -19,22 +19,25 @@ from aiter import logger
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
+# Tile candidates and the tuned-CSV kernelName format live in the tune-metadata
+# module so the tuner that writes a row and this op that reads it back cannot
+# drift. Order is part of the contract: kernelId indexes into it.
+from .gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_common import (
+    TILE_CANDIDATES as _BLOCKSCALE_TILE_CANDIDATES,
+)
+from .gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_common import (
+    default_dsrd_depth,
+    default_use_async_copy,
+    effective_stage_a_scales,
+)
+from .gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_common import (
+    tile_is_valid as blockscale_tile_is_valid,
+)
 from .kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
 
 # from .kernels.small_m_hgemm import iter_small_m_registry_configs
 from .kernels.tensor_shim import _run_compiled
 from .utils import get_shared_memory_per_block, is_flydsl_available
-
-# Tile candidates and the tuned-CSV kernelName format live in the tune-metadata
-# module so the tuner that writes a row and this op that reads it back cannot
-# drift. Order is part of the contract: kernelId indexes into it.
-from .gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_common import (
-    effective_stage_a_scales,
-    default_dsrd_depth,
-    default_use_async_copy,
-    TILE_CANDIDATES as _BLOCKSCALE_TILE_CANDIDATES,
-    tile_is_valid as blockscale_tile_is_valid,
-)
 
 __all__ = [
     "flydsl_hgemm",
@@ -1174,7 +1177,8 @@ def _get_blockscale_compile_fn():
 
         _flydsl_blockscale_compile_fn = _bs.compile_blockscale_preshuffle_gemm
         logger.info("[FlyDSL] loaded blockscale bpreshuffle GEMM compiler")
-    except Exception as e:
+    # Optional backend probe: any failure here just means the fallback is used.
+    except Exception as e:  # noqa: BLE001
         logger.info(
             f"[FlyDSL] blockscale bpreshuffle GEMM not available, "
             f"will fall back to CK/CKTile: {e}"

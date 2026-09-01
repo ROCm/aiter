@@ -113,7 +113,8 @@ def max_lds_bytes_for_tune() -> int:
 
     try:
         from aiter.jit.utils.chip_info import get_gfx
-    except Exception:  # pragma: no cover - chip_info needs a live runtime
+    # chip_info needs a live runtime.
+    except Exception:  # noqa: BLE001  # pragma: no cover
         return get_shared_memory_per_block()
     return get_shared_memory_per_block(fallback_gfx=get_gfx())
 
@@ -139,7 +140,7 @@ def estimated_lds_bytes(
     """
     try:
         from aiter.ops.flydsl.kernels.gemm_blockscale_preshuffle import plan_lds
-    except Exception:  # pragma: no cover - needs a FlyDSL install
+    except Exception:  # noqa: BLE001  # pragma: no cover - needs a FlyDSL install
         return 0
     num_k_tiles = (k // ki.tile_k) if k else 1
     if num_k_tiles < 1:
