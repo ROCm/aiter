@@ -199,7 +199,8 @@ def get_flydsl_stage1_kernels(
 
     tile_ns = [32, 64, 128] if is_fp4_b else [128]
     tile_ks = [128, 256] if is_a16w4 else [256]
-    # tile_m=16 halves the M quantum; the decode win at E=896 (1.17-1.38x, token<=512).
+    # tile_m=16 halves the M quantum; 1.18-1.35x on the E=896 inter=384 GEMM pair,
+    # token<=512 only. inter=512 is not tuned for it and stays at 32.
     tile_ms = (
         [16, 32, 64, 128]
         if (is_fp4_b and (a_dtype == "fp8" or is_a16w4))
