@@ -173,12 +173,14 @@ def _rms_norm_kernel(
 _quant_rms_norm_kernel_repr = make_kernel_repr(
     "_quant_rms_norm_kernel",
     [
+        "DTYPE_MAX",
         "CLAMP_MAX",
         "IS_SMOOTH",
         "CLAMP_OUT",
         "DUMP_INTERMEDIATE",
         "BLOCK_SIZE",
         "USE_BLOCKED",
+        "NUM_PRGMS",
     ],
 )
 
