@@ -610,7 +610,18 @@ __global__ void inverse_rope_group_quant_kernel(
     // Declared at function scope: the per-pass read in the main loop below
     // needs the same base.
     extern __shared__ char irgq_lds_raw[];
+    // Uniform by construction -- a wave is WARP_SIZE consecutive tid -- but tid
+    // is threadIdx-derived, so LLVM's divergence analysis calls it divergent and
+    // that spreads to org1, wave_slot and the LDS offset below. opus then has to
+    // insert a real readfirstlane per descriptor field (17 of them at s=16384),
+    // each preceded by a v_mov to get the already-scalar value into a VGPR.
+    // Asserting uniformity once here lets those fold to nothing.
+#if defined(__HIP_DEVICE_COMPILE__)
+    const int tdm_wave =
+        __builtin_amdgcn_readfirstlane(tid / static_cast<int>(WARP_SIZE));
+#else
     const int tdm_wave = tid / static_cast<int>(WARP_SIZE);
+#endif
     if constexpr(kTdmOk)
     {
         using TdmWin = opus::tdm<scalar_t, opus::seq<kTileD0, kTileD1>>;
@@ -799,9 +810,20 @@ __global__ void inverse_rope_group_quant_kernel(
 
     // One byte per group, from consecutive k_slots: row-major scale lands as
     // one contiguous run per wave.
+    //
+    // Every lane of a group stores it, rather than lane 0 under an exec mask.
+    // k_group is built from k_slot and byte comes out of
+    // reduce_amax_across_group, so a group's lanes already agree on both the
+    // address and the value -- the mask only suppressed writes that were
+    // duplicates. It did not pay for itself: wrapping the store in
+    // s_and_saveexec / s_or exec_lo makes EXEC a WAR hazard against the store
+    // still in flight, so the compiler drains the address queue with
+    // s_wait_xcnt 0x0 before it can restore the mask. That drain is four of the
+    // ten xcnt sites in this kernel and ~40% of its xcnt stall in the s = 16384
+    // ATT trace. The duplicate stores land on the byte the group already owns,
+    // so they cost requests but no extra cache lines.
     auto store_scale = [&](int k_group, uint8_t byte)
     {
-        if(lane_in_group != 0) return;
         if constexpr(SCALE_LAYOUT == kScaleMfmaTile)
         {
             if constexpr(GROUP_SIZE == 128)
@@ -949,17 +971,24 @@ __global__ void inverse_rope_group_quant_kernel(
         // that consumes it: the payload loads are all issued up in the prologue,
         // so consuming in_vec first forces a wait, and a cos/sin load issued
         // after that wait overlaps nothing. Worth -0.8% at S = 16384.
-        if(local0 >= 0)
-        {
-            const int crow = local0 >> 1;
+        //
+        // Loaded unguarded off a clamped row rather than under `if(local0 >= 0)`.
+        // local0 carries the lane term, so that test was an exec mask around two
+        // global_loads, and both the `v_cmpx` that enters it and the `s_or
+        // exec_lo` that leaves it are WAR hazards against the loads still in
+        // flight -- the compiler drains the address queue with `s_wait_xcnt 0x0`
+        // at each. Three of the ten xcnt sites in this kernel were this one
+        // branch. A lane below the tail now reads row 0 and discards it; the row
+        // is the same cache line the rotating lanes are already pulling, so the
+        // read is an L1 hit and no wider than the mask it replaces.
+        const int crow = (local0 >= 0 ? local0 : 0) >> 1;
 #pragma unroll
-            for(int c = 0; c < NCOS / CCHUNK; ++c)
-            {
-                *reinterpret_cast<vec_c*>(cbuf + c * CCHUNK) =
-                    *reinterpret_cast<const vec_c*>(cos_row + crow + c * CCHUNK);
-                *reinterpret_cast<vec_c*>(sbuf + c * CCHUNK) =
-                    *reinterpret_cast<const vec_c*>(sin_row + crow + c * CCHUNK);
-            }
+        for(int c = 0; c < NCOS / CCHUNK; ++c)
+        {
+            *reinterpret_cast<vec_c*>(cbuf + c * CCHUNK) =
+                *reinterpret_cast<const vec_c*>(cos_row + crow + c * CCHUNK);
+            *reinterpret_cast<vec_c*>(sbuf + c * CCHUNK) =
+                *reinterpret_cast<const vec_c*>(sin_row + crow + c * CCHUNK);
         }
 
         float vals[THREAD_DATA_SIZE];
