@@ -40,11 +40,11 @@
         "num_warps": 2
     },
     "any": {
-        "BLOCK_M": 128,
-        "BLOCK_N": 128,
-        "BLOCK_K": 128,
+        "BLOCK_M": 256,
+        "BLOCK_N": 256,
+        "BLOCK_K": 64,
         "GROUP_SIZE_M": 2,
-        "NUM_BUFFERS": 2,
-        "num_warps": 2
+        "NUM_BUFFERS": 4,
+        "num_warps": 4
     }
 }
