@@ -11,13 +11,6 @@ from aiter.ops.triton.utils._triton import arch_info
 
 TRITON_VERSION = Version(triton.__version__)
 TRITON_GE_36 = TRITON_VERSION >= Version("3.6.0")
-# LLVM's SIInsertWaitcnts asserts in WaitcntBrackets::mergeAsyncMarks() when a
-# CFG join has pending async marks on one side only ("Begin must be less or
-# equal to End", llvm/ADT/Sequence.h). Fixed by llvm/llvm-project#193499
-# (81d618b6bc1e); the LLVM that Triton 3.8 pins carries it, 3.7's does not.
-# Verified on gfx950 with 3.7.0+amd.rocm7.2.0 (aborts) and 3.8.0 ToT (compiles,
-# numerically correct).
-TRITON_GE_38 = TRITON_VERSION >= Version("3.8.0")
 
 arch = arch_info.get_arch()
 _gluon_fp8_mqa_logits_kernel = None
@@ -203,82 +196,60 @@ def fp8_mqa_logits(
     else:
         num_buffers = 2
         USE_FOLDED_REDUCTION = FOLDED_REDUCTED_SUPPORT and num_heads > 16
-        # Buffer ops use a 32-bit byte offset (2 GiB resource descriptor cap).
-        # Fall back to plain global load/store when a tensor exceeds that.
+        # Buffer ops address through a resource descriptor whose window is a
+        # 32-bit byte offset (2 GiB). Fall back to plain global load/store when
+        # a descriptor would have to span more than that.
         BUFFER_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
-        # The KV loader builds one descriptor over the whole KV tensor and
-        # indexes it with tile offsets, so the 2 GiB byte cap is the real bound.
         use_buffer_load = KV.numel() * KV.element_size() < BUFFER_LIMIT_BYTES
-
-        # Stores are different: the kernel bakes the row and the tile into the
-        # base pointer (logits_ptr + row_id * stride_logits_s + ... , then
-        # += BLOCK_KV * stride_logits_k per tile) and rebuilds the descriptor
-        # from it, so the i32 buffer offset only ever spans one tile
-        # (BLOCK_M * stride_logits_s + BLOCK_KV elements). The whole-tensor
-        # size is irrelevant. What does bind is that the kernel computes that
-        # row base in i32 *elements*, so the largest index it forms must fit in
-        # an int32. Measured on gfx950: 16384 x 131072 (max index 2**31 - 1,
-        # 8 GiB) is correct, 32768 x 131072 (2**32) faults.
-        #
-        # Keeping buffer stores here also avoids an AMDGCN codegen abort: the
-        # masked buffer store is branch-free (select mask ? off : -2**31),
-        # while a masked global store lowers to a branch. With BLOCK_M=2 the
-        # extra join blocks land inside the double-buffered async-copy region
-        # and trip an assert in LLVM's SIInsertWaitcnts (mergeAsyncMarks(),
-        # fixed upstream by llvm/llvm-project#193499, not yet in Triton 3.7).
-        max_logits_index = (seq_len - 1) * stride_logits_s + (
-            seq_len_kv - 1
-        ) * stride_logits_k
-        use_buffer_store = max_logits_index <= 2**31 - 1
+        use_buffer_store = logits.numel() * logits.element_size() < BUFFER_LIMIT_BYTES
         if arch == "gfx950":
+            # This kernel never spans a tensor with one descriptor: it rebuilds
+            # every descriptor from an i64 base pointer that already has the
+            # row and the tile baked in, so the i32 offset only covers one KV
+            # tile or one query row. Nothing here scales with the tensor, so
+            # the 2 GiB window cannot be reached and both flags hold at any
+            # size. That also keeps BLOCK_M=2 available everywhere: a masked
+            # *global* store lowers to a branch, and two of them per KV tile
+            # trip an assert in LLVM's SIInsertWaitcnts.
+            use_buffer_load = True
+            use_buffer_store = True
             num_buffers = 2
             loop_variant = 0
-            # Tuned on gfx950 / Triton 3.7. The kernel is VALU bound, not MFMA
-            # bound -- the per-head relu + weighted sum and the register
-            # pressure it creates dominate -- so these pick the lowest-pressure
-            # point rather than the highest occupancy. waves_per_eu is the VGPR
-            # budget (512/waves): 3 gives the 170 the tile below needs to stay
-            # spill-free; 4 spills and 5+ collapses.
+            # Tuned on gfx950. The kernel is VALU bound, not MFMA bound -- the
+            # per-head relu + weighted sum dominates -- so these pick the
+            # lowest register pressure rather than the highest occupancy.
+            # waves_per_eu is the VGPR budget (512/waves): 3 gives the ~168
+            # the tile below wants; 4 caps it at 128 and spills hard (measured
+            # on glm5.2 4x8kx8k: 612 us at 3, 1106 us at 4).
             waves_per_eu = 3
             num_warps = 2
             block_kv = 64
-            # On Triton < 3.8, BLOCK_M=2 requires buffer stores: a masked
-            # *global* store lowers to a branch, and with two of them per KV
-            # tile the extra join blocks trip the SIInsertWaitcnts assert
-            # described above. With the corrected use_buffer_store bound this
-            # only bites past 2**31 logits elements. Triton >= 3.8 pins an LLVM
-            # with the fix, so the pair is safe there and BLOCK_M=2 is kept.
-            block_m2_ok = use_buffer_store or TRITON_GE_38
-            block_m = (
-                2
-                if (num_heads <= 32 and seq_len > 4096 and block_m2_ok)
-                else 1
-            )
+            # 2 rows of Q at 64 heads is 64 VGPRs, which only fits at 2
+            # waves/SIMD, so BLOCK_M=2 is a <=32-head option.
+            block_m = 2 if (num_heads <= 32 and seq_len > 4096) else 1
             # 32x32x64 over 16x16x128: its output layout leaves only one head
             # bit in lanes, so the head sum needs one cross-lane step instead of
-            # two (inner loop 70 -> 55 VALU ops). Needs num_heads >= 32 and
-            # BLOCK_KV / num_warps >= 32.
+            # two. Needs num_heads >= 32 and BLOCK_KV / num_warps >= 32.
             mfma_nonk_dim = 32 if (head_size <= 64 or num_heads >= 32) else 16
             # Fold one head chunk at a time so only that chunk's accumulators
             # are live; without it the wider 32x32 tile spills and loses more
-            # than the layout gains. BLOCK_M=2 loads its second row through the
-            # unchunked path, so chunking is BLOCK_M=1 only.
+            # than the layout gains. BLOCK_M=2 loads its second row unchunked.
             m_chunk = (
                 mfma_nonk_dim
                 if (num_heads > mfma_nonk_dim and block_m == 1 and mfma_nonk_dim == 32)
                 else 0
             )
-            # Chunking already hands the scheduler independent work, so a
-            # second parallel FMA chain only costs live registers; the unchunked
-            # path still wants 2 for dependency depth.
-            num_chains = (1 if m_chunk else 2) if USE_FOLDED_REDUCTION else 0
+            # BLOCK_M=1 wants one chain; a second only costs live registers
+            # (glm5.2 1x4kx4k 55.7 -> 53.8 us, dsv4 4x8kx8k 1143 -> 1039 us).
+            # BLOCK_M=2 needs two -- with one the scheduler spills instead
+            # (57 vs 2 slots, 748 vs 605 us on glm5.2 4x8kx8k).
+            num_chains = (2 if block_m == 2 else 1) if USE_FOLDED_REDUCTION else 0
             other = {
                 "USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED,
                 "BLOCK_M": block_m,
                 "MFMA_NONK_DIM": mfma_nonk_dim,
                 "M_CHUNK": m_chunk,
-                # halves the loop bookkeeping and gives the scheduler two KV
-                # tiles to interleave
+                # two KV tiles per loop body for the scheduler to interleave
                 "UNROLL": 2,
             }
         else:

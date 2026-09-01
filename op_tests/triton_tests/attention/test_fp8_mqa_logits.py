@@ -149,3 +149,109 @@ def test_fp8_mqa_logits(
     if ref_neginf_mask.all():
         return  # nothing left to compare
     assert diff < 1e-3, f"{diff=}"
+
+
+@pytest.mark.parametrize("num_heads", [32, 64])
+@torch.inference_mode()
+def test_fp8_mqa_logits_large_kv(num_heads: int) -> None:
+    """A logits buffer past 2**31 elements.
+
+    The kernel bakes the row and the tile into the store base pointer, so that
+    base has to be formed in int64 -- in int32 elements it wraps here. The dense
+    reference is far too large at this shape, so a sample of rows is recomputed
+    instead, biased towards the high row ids where the base is largest.
+    """
+    s_q, s_k = 8192, 270336  # 2.21e9 logits elements, 8.85 GiB of fp32
+    head_dim = 128
+    need = s_q * s_k * 4 + 4 * 1024**3
+    if torch.cuda.mem_get_info()[0] < need:
+        pytest.skip(f"needs {need / 1024**3:.0f} GiB of free device memory")
+
+    torch.manual_seed(0)
+    q = torch.randn(s_q, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(s_k, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
+    weights = torch.randn(s_q, num_heads, device="cuda", dtype=torch.float32)
+    ks = torch.zeros(s_q, dtype=torch.int, device="cuda")
+    ke = torch.arange(s_q, dtype=torch.int, device="cuda") + (s_k - s_q) + 1
+
+    logits = fp8_mqa_logits(q.to(e4m3_type), kv_fp8, scales, weights, ks, ke)
+
+    # Every masked position, and only those, must have been written as -inf.
+    assert int(torch.isfinite(logits).sum()) == int((ke - ks).clamp(min=0).sum())
+
+    kv_f32 = kv_fp8.to(torch.float32) * scales.reshape(-1, 1)
+    rows = [0, 1, s_q // 2, s_q - 2, s_q - 1] + torch.randint(0, s_q, (5,)).tolist()
+    for r in sorted(set(rows)):
+        lo, hi = int(ks[r]), min(int(ke[r]), s_k)
+        score = (q[r].to(torch.float32) @ kv_f32[lo:hi].T).relu()
+        ref = (score * weights[r][:, None]).sum(0)
+        diff = calc_diff(logits[r, lo:hi], ref)
+        assert diff < 1e-3, f"row {r}: {diff=}"
+
+
+def _check_rows(logits, q, kv_fp8, scales, weights, lo, hi, rows):
+    """Recompute `rows` against a reference; the dense one is far too large."""
+    kv_f32 = kv_fp8[lo:hi].to(torch.float32) * scales[lo:hi].reshape(-1, 1)
+    for r in rows:
+        score = (q[r].to(torch.float32) @ kv_f32.T).relu()
+        ref = (score * weights[r][:, None]).sum(0)
+        diff = calc_diff(logits[r, lo:hi], ref)
+        assert diff < 1e-3, f"row {r}: {diff=}"
+
+
+@pytest.mark.parametrize("num_heads", [32, 64])
+@torch.inference_mode()
+def test_fp8_mqa_logits_long_query(num_heads: int) -> None:
+    """More query rows than a 2 GiB Q tensor holds.
+
+    The buffer descriptor for Q covers one row, so the row has to go into its
+    base pointer in int64. Folded into the 32-bit offset instead, rows past
+    2**31 / (num_heads * head_dim) read out of range and silently come back as
+    zeros rather than faulting.
+    """
+    head_dim, s_k = 128, 512
+    s_q = 2**31 // (num_heads * head_dim) + 8192  # just over 2 GiB of Q
+    need = s_q * (num_heads * head_dim + s_k * 4) + 2 * 1024**3
+    if torch.cuda.mem_get_info()[0] < need:
+        pytest.skip(f"needs {need / 1024**3:.0f} GiB of free device memory")
+
+    torch.manual_seed(0)
+    q = torch.randn(s_q, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(s_k, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
+    weights = torch.randn(s_q, num_heads, device="cuda", dtype=torch.float32)
+    ks = torch.zeros(s_q, dtype=torch.int, device="cuda")
+    ke = torch.full((s_q,), s_k, dtype=torch.int, device="cuda")
+
+    logits = fp8_mqa_logits(q.to(e4m3_type), kv_fp8, scales, weights, ks, ke, False)
+    _check_rows(logits, q, kv_fp8, scales, weights, 0, s_k, [0, s_q // 2, s_q - 1])
+
+
+@torch.inference_mode()
+def test_fp8_mqa_logits_kv_over_2gib() -> None:
+    """A KV tensor larger than 2 GiB, with the window past that point.
+
+    Same story on the load side: the KV descriptor is rebased once per tile, so
+    `row_offset * stride_kv_s` must be int64. Keeping it exact is what lets the
+    launcher stay on buffer loads here instead of the slower global path.
+    """
+    num_heads, head_dim = 64, 128
+    s_q, s_k = 64, 17_039_360  # 2.03 GiB of KV
+    lo = 16_700_000  # window starts past the 2 GiB mark
+    need = s_k * head_dim + s_q * s_k * 4 + 4 * 1024**3
+    if torch.cuda.mem_get_info()[0] < need:
+        pytest.skip(f"needs {need / 1024**3:.0f} GiB of free device memory")
+
+    torch.manual_seed(0)
+    q = torch.randn(s_q, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(s_k, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
+    del kv
+    torch.cuda.empty_cache()
+    weights = torch.randn(s_q, num_heads, device="cuda", dtype=torch.float32)
+    ks = torch.full((s_q,), lo, dtype=torch.int, device="cuda")
+    ke = torch.full((s_q,), s_k, dtype=torch.int, device="cuda")
+
+    logits = fp8_mqa_logits(q.to(e4m3_type), kv_fp8, scales, weights, ks, ke, False)
+    _check_rows(logits, q, kv_fp8, scales, weights, lo, s_k, [0, s_q // 2, s_q - 1])
