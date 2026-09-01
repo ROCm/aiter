@@ -164,6 +164,7 @@ def compile_preshuffle_gemm_splitk(
     use_m_bounded_store: bool = False,
     direct_out: bool = False,
     stage_a_scales: bool = False,
+    sched_dsrd: int | None = None,
 ):
     """Compile the split-K preshuffle GEMM partial pass (fp8/int8/fp16/bf16).
 
@@ -191,6 +192,8 @@ def compile_preshuffle_gemm_splitk(
         raise ValueError(f"split-K supports only epilogue='none', got {epilogue!r}")
     if lds_stage not in (1, 2):
         raise ValueError(f"lds_stage must be 1 or 2, got {lds_stage}")
+    if sched_dsrd is not None and sched_dsrd < 0:
+        raise ValueError(f"sched_dsrd must be non-negative or None, got {sched_dsrd}")
     if scale_mode not in ("epilogue", "blockscale", "mx128", "mxfp4"):
         raise ValueError(
             f"scale_mode must be epilogue/blockscale/mx128/mxfp4, got {scale_mode!r}"
@@ -370,7 +373,16 @@ def compile_preshuffle_gemm_splitk(
                 scale_a1: fx.Array[Float32, a_scale_tile_elems, 16]
 
     # ── Kernel ────────────────────────────────────────────────────────
-    @flyc.kernel
+    if not sched_dsrd:
+        kernel_decorator = flyc.kernel
+    else:
+        module_name = (
+            f"preshuffle_gemm_splitk_{in_dtype}_{scale_mode}_dsrd{sched_dsrd}_"
+            f"t{tile_m}x{tile_n}x{tile_k}_sk{split_k}"
+        ).replace("-", "_")
+        kernel_decorator = flyc.kernel(name=module_name)
+
+    @kernel_decorator
     def kernel_gemm(
         arg_c: fx.Tensor,
         arg_a: fx.Tensor,
@@ -760,7 +772,9 @@ def compile_preshuffle_gemm_splitk(
                         if const_expr(idx_ds_read + n_dsrd > num_ds_load):
                             n_dsrd = num_ds_load - idx_ds_read
                         if const_expr(n_dsrd):
-                            rocdl.sched_dsrd(n_dsrd)
+                            rocdl.sched_dsrd(
+                                sched_dsrd if sched_dsrd else n_dsrd
+                            )
                             idx_ds_read += n_dsrd
                     n_vmem = vmem_schedule[mfma_idx]
                     if const_expr(n_vmem and (idx_gmem_load < num_gmem_loads)):

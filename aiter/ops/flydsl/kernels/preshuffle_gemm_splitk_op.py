@@ -54,6 +54,7 @@ def flydsl_preshuffle_gemm_splitk_a8(
     use_m_bounded_store: bool | None = None,
     in_dtype: str | None = None,
     stage_a_scales: bool = False,
+    sched_dsrd: int | None = None,
 ) -> torch.Tensor:
     """Split-K fp8 preshuffle GEMM: partial pass into an fp32 workspace, then reduce.
 
@@ -116,6 +117,7 @@ def flydsl_preshuffle_gemm_splitk_a8(
         ),
         direct_out=direct_out,
         stage_a_scales=stage_a_scales,
+        sched_dsrd=sched_dsrd,
     )
     reduce_exe = (
         None
