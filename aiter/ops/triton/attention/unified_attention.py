@@ -112,53 +112,6 @@ class _UAParams(NamedTuple):
     skip_reduce: bool = False
 
 
-def config_key(params: _UAParams, op: str) -> str:
-    assert op in (
-        "attn_2d",
-        "attn_3d",
-        "reduce",
-        "kv_split",
-    ), f"Unknown config op '{op}'"
-
-    if op == "attn_2d":
-        if not params.all_decode:
-            if params.head_size >= 512:
-                key = "prefill_hge512"
-            elif params.head_size >= 256:
-                key = "prefill_hge256"
-            else:
-                key = "prefill"
-            if params.max_seqlen_q >= 256:
-                key += "_qge256"
-            if params.sliding_window > 0:
-                key += "_sw"
-            if params.max_seqlen_k < 2048:
-                key += "_sklt2048"
-        else:
-            if params.head_size >= 512:
-                key = "decode_hge512"
-            elif params.head_size > 128:
-                key = "decode_hgt128"
-            else:
-                key = "decode"
-            if params.sliding_window > 0:
-                key += "_sw"
-    else:
-        # attn_3d / reduce split on head_size alone. head_size == 128 is its own
-        # bucket because the gfx950 wide-LDS path is head_size <= 128 while the
-        # gfx1250 shuffled-KV path is head_size < 128.
-        if params.head_size >= 512:
-            key = "hge512"
-        elif params.head_size > 128:
-            key = "hgt128"
-        elif params.head_size == 128:
-            key = "heq128"
-        else:
-            key = "hlt128"
-
-    return f"{key}_shuffled_kv" if params.shuffled_kv_cache else key
-
-
 def use_2d_kernel(params: _UAParams):
     # if IS_DEVICE_ARCH_GFX12, always use 3D if all_decode and 2D otherwise
     if IS_DEVICE_ARCH_GFX12:
@@ -348,16 +301,7 @@ def unified_attention(
         else:
             _unified_attention_2d_triton(params)
     else:
-        config, _ = get_unified_attention_config(
-            "kv_split",
-            config_key(params, "kv_split"),
-            params.q_dtype,
-            params.kv_cache_dtype,
-            params.head_size,
-            params.num_queries_per_kv,
-            params.block_size,
-            backend=backend,
-        )
+        config, _ = get_unified_attention_config("kv_split", params, backend=backend)
         NUM_SEGMENTS = config["NUM_SEGMENTS"]
         if shuffled_kv_cache:
             TILE_SIZE = block_size
@@ -510,16 +454,7 @@ def _unified_attention_2d_triton(params: _UAParams):
             params.block_size >= 32
         ), "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
 
-    config, _ = get_unified_attention_config(
-        "attn_2d",
-        config_key(params, "attn_2d"),
-        params.q_dtype,
-        params.kv_cache_dtype,
-        params.head_size,
-        params.num_queries_per_kv,
-        params.block_size,
-        backend="triton",
-    )
+    config, _ = get_unified_attention_config("attn_2d", params, backend="triton")
     config["BLOCK_M"] = max(
         config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)
     )
@@ -594,16 +529,7 @@ def _unified_attention_3d_triton(
     NUM_SEGMENTS,
     TILE_SIZE,
 ):
-    config, _ = get_unified_attention_config(
-        "attn_3d",
-        config_key(params, "attn_3d"),
-        params.q_dtype,
-        params.kv_cache_dtype,
-        params.head_size,
-        params.num_queries_per_kv,
-        params.block_size,
-        backend="triton",
-    )
+    config, _ = get_unified_attention_config("attn_3d", params, backend="triton")
     config["BLOCK_M"] = max(
         config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)
     )
@@ -683,16 +609,7 @@ def _reduce_segments_triton(
     TILE_SIZE,
 ):
     head_size_padded = triton.next_power_of_2(params.head_size)
-    config, _ = get_unified_attention_config(
-        "reduce",
-        config_key(params, "reduce"),
-        params.q_dtype,
-        params.kv_cache_dtype,
-        params.head_size,
-        params.num_queries_per_kv,
-        params.block_size,
-        backend="triton",
-    )
+    config, _ = get_unified_attention_config("reduce", params, backend="triton")
 
     reduce_segments[(params.num_tokens, params.num_query_heads)](
         output_ptr=params.out,
@@ -757,16 +674,7 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
     """
     assert params.softcap == 0, "Softcap is not supported"
 
-    config, _ = get_unified_attention_config(
-        "attn_2d",
-        config_key(params, "attn_2d"),
-        params.q_dtype,
-        params.kv_cache_dtype,
-        params.head_size,
-        params.num_queries_per_kv,
-        params.block_size,
-        backend="gluon",
-    )
+    config, _ = get_unified_attention_config("attn_2d", params, backend="gluon")
     NUM_SEQS = params.num_seqs
     TILE_SIZE = config["TILE_SIZE"]
     BLOCK_M = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
@@ -860,16 +768,7 @@ def _unified_attention_3d_gfx1250(
     NUM_BLOCKS_GATHER_PER_TILE = 1
     QUERY_DTYPE = get_dtype_str(params.q_dtype)
     KV_CACHE_DTYPE = get_dtype_str(params.kv_cache_dtype)
-    config, _ = get_unified_attention_config(
-        "attn_3d",
-        config_key(params, "attn_3d"),
-        params.q_dtype,
-        params.kv_cache_dtype,
-        params.head_size,
-        params.num_queries_per_kv,
-        params.block_size,
-        backend="gluon",
-    )
+    config, _ = get_unified_attention_config("attn_3d", params, backend="gluon")
     config["BLOCK_M"] = max(
         config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)
     )
@@ -962,16 +861,7 @@ def _reduce_segments_gfx1250(
 ):
     head_size_padded = triton.next_power_of_2(params.head_size)
     gluon_num_warps = 8 if params.num_query_heads % 8 == 0 else 4
-    config, _ = get_unified_attention_config(
-        "reduce",
-        config_key(params, "reduce"),
-        params.q_dtype,
-        params.kv_cache_dtype,
-        params.head_size,
-        params.num_queries_per_kv,
-        params.block_size,
-        backend="gluon",
-    )
+    config, _ = get_unified_attention_config("reduce", params, backend="gluon")
 
     _reduce_segments_kernel_gfx1250[(params.num_tokens,)](
         output_ptr=params.out,
