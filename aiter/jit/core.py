@@ -675,30 +675,22 @@ def rename_cpp_to_cu(els, dst, hipify, recursive=False):
     return ret
 
 
-def _stage_blob_sources(blob_gen_cmd, op_dir, src_dir, sources, hipify):
-    """Generate JIT sources in an isolated directory.
-
-    A failed or interrupted generator must never modify the canonical ``blob``
-    directory. A unique staging directory also keeps a later builder from
-    consuming files left by an abandoned build.
-    """
+def _stage_blob_sources(
+    blob_gen_cmd, op_dir, src_dir, sources, hipify, seed_files=None
+):
+    """Generate JIT sources in a deterministic transactional working tree."""
     staging_dir = stage_blob_sources(
         blob_gen_cmd,
         op_dir,
         PY,
         logger=logger,
         log_commands=AITER_LOG_MORE > 0,
+        seed_files=seed_files,
     )
     if staging_dir is None:
         return sources, None
-    try:
-        generated_sources = rename_cpp_to_cu(
-            [staging_dir], src_dir, hipify, recursive=True
-        )
-        return sources + generated_sources, staging_dir
-    except Exception:
-        shutil.rmtree(staging_dir, ignore_errors=True)
-        raise
+    generated_sources = rename_cpp_to_cu([staging_dir], src_dir, hipify, recursive=True)
+    return sources + generated_sources, staging_dir
 
 
 @torch_compile_guard()
@@ -941,7 +933,10 @@ def build_module(
 
     def MainFunc():
         if AITER_REBUILD == 1:
+            rm_module(md_name)
             clear_build(md_name)
+        elif AITER_REBUILD >= 2:
+            rm_module(md_name)
         op_dir = f"{bd_dir}/{md_name}"
         logger.info(
             f"[pid={os.getpid()} pname={multiprocessing.current_process().name}] "
@@ -951,6 +946,22 @@ def build_module(
         opbd_dir = f"{op_dir}/build"
         src_dir = f"{op_dir}/build/srcs"
         os.makedirs(src_dir, exist_ok=True)
+
+        def raise_build_error(error):
+            tag = f"\033[31mfailed jit build [{md_name}]\033[0m"
+            logger.error(
+                f"{tag}\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\n-->[History]: {{}}{tag}\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191".format(
+                    re.sub(
+                        "error:",
+                        "\033[31merror:\033[0m",
+                        "-->".join(traceback.format_exception(*sys.exc_info())),
+                        flags=re.IGNORECASE,
+                    ),
+                )
+            )
+            raise RuntimeError(
+                f"[aiter] build [{md_name}] under {opbd_dir} failed !!!!!!"
+            ) from error
 
         sources = rename_cpp_to_cu(srcs, src_dir, hipify)
 
@@ -1043,10 +1054,27 @@ def build_module(
         flags_hip = [el for el in flags_hip if hip_flag_checker(el)]
         check_and_set_ninja_worker()
 
-        sources, staged_blob_dir = _stage_blob_sources(
-            blob_gen_cmd, op_dir, src_dir, sources, hipify
-        )
         blob_dir = f"{op_dir}/blob"
+        staged_blob_dir = None
+        seed_files = None
+        if md_name == "module_deepgemm_opus":
+            seed_files = [
+                (
+                    f"{bd_dir}/compiled_kids_opus.json",
+                    "compiled_kids_opus.json",
+                )
+            ]
+        try:
+            sources, staged_blob_dir = _stage_blob_sources(
+                blob_gen_cmd,
+                op_dir,
+                src_dir,
+                sources,
+                hipify,
+                seed_files=seed_files,
+            )
+        except Exception as error:  # noqa: BLE001
+            raise_build_error(error)
         active_blob_dir = staged_blob_dir or blob_dir
 
         extra_include_paths = []
@@ -1116,9 +1144,6 @@ def build_module(
                 hipify=hipify,
                 extra_cuda_cflags_per_source=flags_extra_hip_per_source,
             )
-            if staged_blob_dir is not None:
-                publish_blob_sources(staged_blob_dir, blob_dir)
-                staged_blob_dir = None
             if is_python_module and not is_standalone:
                 atomic_copy(
                     f"{opbd_dir}/{target_name}",
@@ -1129,24 +1154,19 @@ def build_module(
                     f"{opbd_dir}/{target_name}",
                     f"{AITER_ROOT_DIR}/op_tests/cpp/mha/{target_name}",
                 )
-        except Exception as e:
-            tag = f"\033[31mfailed jit build [{md_name}]\033[0m"
-            logger.error(
-                f"{tag}\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\n-->[History]: {{}}{tag}\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191".format(
-                    re.sub(
-                        "error:",
-                        "\033[31merror:\033[0m",
-                        "-->".join(traceback.format_exception(*sys.exc_info())),
-                        flags=re.IGNORECASE,
-                    ),
+        except Exception as error:  # noqa: BLE001
+            raise_build_error(error)
+
+        if staged_blob_dir is not None:
+            try:
+                publish_blob_sources(staged_blob_dir, blob_dir)
+            except Exception:
+                logger.warning(
+                    "JIT build [%s] succeeded, but publishing its generated-source "
+                    "cache failed; keeping the installed artifact",
+                    md_name,
+                    exc_info=AITER_LOG_MORE > 0,
                 )
-            )
-            raise RuntimeError(
-                f"[aiter] build [{md_name}] under {opbd_dir} failed !!!!!!"
-            ) from e
-        finally:
-            if staged_blob_dir is not None:
-                shutil.rmtree(staged_blob_dir, ignore_errors=True)
 
     def FinalFunc():
         logger.info(
