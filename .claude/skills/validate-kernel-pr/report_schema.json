@@ -184,6 +184,19 @@
         "runner_reason": {
           "type": "string",
           "minLength": 1
+        },
+        "shape_argnames": {
+          "type": "string",
+          "description": "Comma-separated pytest parameter names the independent grid replaced, or an empty string when another channel or no channel was used."
+        },
+        "grid_channel": {
+          "type": "string",
+          "enum": ["", "cli", "env", "pytest"],
+          "description": "Which channel actually delivered the independent grid. Empty when none was established. Declared but deliberately NOT required, so reports from earlier validators stay valid."
+        },
+        "grid_channel_reason": {
+          "type": "string",
+          "description": "When no channel was established, names each channel tried and what was found in the target -- so a limit of the validator is never published as a property of the target."
         }
       }
     },
@@ -275,6 +288,16 @@
             "kernel_symbols": { "type": "array", "items": { "type": "string" } },
             "required_shapes": { "type": "array", "items": { "type": "string" } },
             "executed_shapes": { "type": "array", "items": { "type": "string" } },
+            "shape_capture": {
+              "type": "object",
+              "description": "Present only when shape capture was requested and produced no rows. A receipt carrying this asserts route execution and makes no claim about shapes.",
+              "properties": {
+                "requested": { "type": "array", "items": { "type": "string" } },
+                "observed": { "type": "integer" },
+                "note": { "type": "string", "minLength": 1 }
+              },
+              "required": ["requested", "observed", "note"]
+            },
             "receipt_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
           }
         },

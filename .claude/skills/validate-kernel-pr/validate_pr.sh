@@ -25,6 +25,7 @@ GRID=""
 EXPECTED_ROUTE=""
 SHAPE_VARS=""
 SHAPE_ARG=""
+SHAPE_ARGNAMES=""
 TOL_TABLE=""
 LABEL="run"
 OUT=""
@@ -52,6 +53,7 @@ while [ "$#" -gt 0 ]; do
     --expected-route) need_value "$@"; EXPECTED_ROUTE="$2"; shift 2;;
     --shape-vars) need_value "$@"; SHAPE_VARS="$2"; shift 2;;
     --shape-arg) need_value "$@"; SHAPE_ARG="$2"; shift 2;;
+    --shape-argnames) need_value "$@"; SHAPE_ARGNAMES="$2"; shift 2;;
     --tol-table) need_value "$@"; TOL_TABLE="$2"; shift 2;;
     --label) need_value "$@"; LABEL="$2"; shift 2;;
     --out) need_value "$@"; OUT="$2"; shift 2;;
@@ -361,6 +363,7 @@ jset_string "test_selection.target" "$TESTS"
 jset_string "test_selection.shape_env" "$SHAPE_ENV"
 jset_string "test_selection.grid" "$GRID"
 jset_string "test_selection.shape_arg" "$SHAPE_ARG"
+jset_string "test_selection.shape_argnames" "$SHAPE_ARGNAMES"
 jset_string "test_selection.expected_route" "$EXPECTED_ROUTE"
 jset_string "test_selection.shape_vars" "$SHAPE_VARS"
 jset_string "test_selection.runner" "unresolved"
@@ -418,11 +421,18 @@ else
 fi
 
 # ---------- stage 2: GPU claim (sampling window + whole-run lock) ----------
-PICKER="${PICKER:-$(command -v pick-idle-gpu.py || true)}"
-if [ -z "$PICKER" ]; then
+# Resolution order: an explicit PICKER wins, then the picker this skill SHIPS, and only then
+# whatever is on PATH. The shipped picker is part of the evidence contract -- it is the thing
+# that prints `idleness-basis:`. Preferring a PATH copy silently substituted a picker that
+# omits that line, and the report then published `idleness_basis: "unknown"` next to a
+# concrete `gfx_activity_before_pct: 0`, presenting an unavailable reading as a measured idle
+# one. Observed on two independent runs.
+if [ -z "${PICKER:-}" ]; then
   for candidate in "$SCRIPT_DIR/pick-idle-gpu.py" \
+                   "$(command -v pick-idle-gpu.py || true)" \
                    "$HOME/.local/bin/pick-idle-gpu.py" \
                    /usr/local/bin/pick-idle-gpu.py /opt/bin/pick-idle-gpu.py; do
+    [ -n "$candidate" ] || continue
     if [ -x "$candidate" ] || {
       [ "$candidate" = "$SCRIPT_DIR/pick-idle-gpu.py" ] && [ -r "$candidate" ]
     }; then
@@ -441,8 +451,19 @@ if [ -z "$PICKER" ] || { [ ! -x "$PICKER" ] && [ ! -r "$PICKER" ]; }; then
 else
   PICKER_CMD=("$PICKER")
   [ -x "$PICKER" ] || PICKER_CMD=(python3 "$PICKER")
-  PICK=$("${PICKER_CMD[@]}" --samples 10 --interval 1 --quiet 2>"$WORK/gpu-picker.log")
+  # Ask for the whole eligible ranking, not just the winner, so a contended lock on the first
+  # choice falls through to the next. The picker is deterministic, so concurrent validators all
+  # select the same device and all but one reported "no idle GPU" while the other seven sat
+  # idle. Older pickers do not know --all; their single line is a ranking of one.
+  PICK_CANDIDATES=$("${PICKER_CMD[@]}" --samples 10 --interval 1 --quiet --all \
+    2>"$WORK/gpu-picker.log")
   PICK_RC=$?
+  if [ "$PICK_RC" -ne 0 ] && grep -q -- "--all" "$WORK/gpu-picker.log" 2>/dev/null; then
+    PICK_CANDIDATES=$("${PICKER_CMD[@]}" --samples 10 --interval 1 --quiet \
+      2>"$WORK/gpu-picker.log")
+    PICK_RC=$?
+  fi
+  PICK=$(printf '%s\n' "$PICK_CANDIDATES" | head -1)
   if [ "$PICK_RC" -ne 0 ] || [[ ! "$PICK" =~ ^[0-9]+$ ]]; then
     PICK=""
     # An environment fact and a validator portability gap are different things
@@ -457,11 +478,24 @@ else
     jset_string "degraded_mode" "NO_GPU"
     finding "note" "gpu_claim" "$CLAIM_NOTE; no runtime correctness claim is made"
   else
-    exec {GPU_LOCK_FD}>"/tmp/gpu-$PICK.lock"
-    if ! flock -n "$GPU_LOCK_FD"; then
+    GPU_LOCK_TRIED=0
+    GPU_LOCK_HELD=0
+    while read -r _cand; do
+      [[ "$_cand" =~ ^[0-9]+$ ]] || continue
+      GPU_LOCK_TRIED=$((GPU_LOCK_TRIED + 1))
+      exec {GPU_LOCK_FD}>"/tmp/gpu-$_cand.lock"
+      if flock -n "$GPU_LOCK_FD"; then
+        PICK="$_cand"
+        GPU_LOCK_HELD=1
+        break
+      fi
+      exec {GPU_LOCK_FD}>&-
+      GPU_LOCK_FD=""
+    done <<< "$PICK_CANDIDATES"
+    if [ "$GPU_LOCK_HELD" -ne 1 ]; then
       PICK=""
       stage_note "gpu_claim" "skip" \
-        "selected GPU was claimed by another process before the lock was acquired"
+        "all $GPU_LOCK_TRIED verified-idle GPUs were already locked by another validator"
       jset_string "degraded_mode" "NO_GPU"
       finding "note" "gpu_claim" "GPU claim raced with another process; no runtime correctness claim is made"
     else
@@ -718,12 +752,25 @@ changed = subprocess.run(
 ).stdout.splitlines()
 
 def tolerances(source):
+    # A tolerance declared as a named constant -- DEFAULT_REL_TOL = 2e-2, TOL = 1e-3 -- was
+    # invisible to the old pattern, so a file that uses them reported ZERO tolerances and this
+    # policy check passed on an empty list. Loosening a named constant is exactly the m2
+    # mutant the stage exists to catch, and it was undetectable. Observed on a real PR
+    # declaring DEFAULT_REL_TOL / DEFAULT_TILE_REL_TOL, which reported tolerances_head: [].
     assignments = [
-        float(value)
-        for value in re.findall(
-            r"(?:atol|rtol)\s*=\s*([0-9.eE+-]+)", source
+        float(direct or named)
+        for direct, named in re.findall(
+            r"(?:atol|rtol)\s*=\s*([0-9.eE+-]+)"
+            r"|^[ \t]*[A-Za-z_][A-Za-z0-9_]*(?:TOL|tol)[A-Za-z0-9_]*[ \t]*=[ \t]*([0-9.eE+-]+)",
+            source,
+            re.MULTILINE,
         )
+        if (direct or named)
     ]
+    # A tolerance passed by NAME (atol=DEFAULT_TOL) resolves to no literal here. Record that
+    # the file has tolerances the checker cannot value, so an empty list is never read as
+    # "this suite declares no tolerances".
+    indirect = re.findall(r"(?:atol|rtol)\s*=\s*([A-Za-z_][A-Za-z0-9_.]*)", source)
     mappings = [
         float(value)
         for value in re.findall(
@@ -731,10 +778,10 @@ def tolerances(source):
             source,
         )
     ]
-    return assignments + mappings
+    return assignments + mappings, sorted(set(indirect))
 
-head_tolerances = tolerances(head)
-base_tolerances = tolerances(base)
+head_tolerances, head_indirect = tolerances(head)
+base_tolerances, base_indirect = tolerances(base)
 loosened = []
 if (
     base_tolerances
@@ -770,6 +817,8 @@ stage = {
     "status": "fail" if loosened else "pass",
     "tolerances_base": base_tolerances,
     "tolerances_head": head_tolerances,
+    "tolerances_head_by_name": head_indirect,
+    "tolerances_base_by_name": base_indirect,
     "reference_tolerances": reference,
     "commented_out_shape_rows_base": commented_base,
     "commented_out_shape_rows": commented_head,
@@ -896,10 +945,19 @@ PY
 )
 jset_string "test_selection.runner" "$TARGET_RUNNER"
 jset_string "test_selection.runner_reason" "$TARGET_RUNNER_REASON"
+# Two independent channels can carry the S1 grid: the target's own CLI flag (--shape-arg)
+# and an environment variable it reads (--shape-env). They are probed separately and the
+# results are combined, because a caller who supplies both is describing one target that has
+# both -- and an earlier version let the env probe's result overwrite the CLI probe's
+# unconditionally, so supplying both DISCARDED a working CLI channel and then reported the
+# env channel's absence as the reason no grid ran.
+GRID_HOOK_CLI=0
+GRID_HOOK_ENV=0
 GRID_HOOK_OK=0
+GRID_CHANNEL=""
 if [ -n "$SHAPE_ARG" ] && [ -n "$GRID" ] && [ "$TARGET_RUNNER" = "script" ] \
     && [ -f "$REPO_WT/$TEST_FILE" ]; then
-  GRID_HOOK_OK=$(python3 - "$REPO_WT/$TEST_FILE" "$SHAPE_ARG" <<'PY'
+  GRID_HOOK_CLI=$(python3 - "$REPO_WT/$TEST_FILE" "$SHAPE_ARG" <<'PY'
 import ast
 import sys
 
@@ -920,7 +978,7 @@ PY
 fi
 if [ -n "$SHAPE_ENV" ] && [ -n "$GRID" ] \
     && [ -f "$REPO_WT/$TEST_FILE" ]; then
-  GRID_HOOK_OK=$(python3 - "$REPO_WT/$TEST_FILE" "$SHAPE_ENV" <<'PY'
+  GRID_HOOK_ENV=$(python3 - "$REPO_WT/$TEST_FILE" "$SHAPE_ENV" <<'PY'
 import ast
 import sys
 
@@ -957,6 +1015,159 @@ print(int(found))
 PY
 )
 fi
+
+GRID_HOOK_PYTEST=0
+if [ -n "$SHAPE_ARGNAMES" ] && [ -n "$GRID" ] && [ "$TARGET_RUNNER" = "pytest" ] \
+    && [ -f "$REPO_WT/$TEST_FILE" ]; then
+  # Held to the same standard of proof as the other two channels: the names must actually be
+  # parameters of a test the file defines, or bound by a parametrize mark it declares. A name
+  # the file does not take would append a parametrization nothing consumes.
+  GRID_HOOK_PYTEST=$(python3 - "$REPO_WT/$TEST_FILE" "$SHAPE_ARGNAMES" <<'PY'
+import ast
+import sys
+
+tree = ast.parse(open(sys.argv[1], encoding="utf-8").read())
+wanted = {name.strip() for name in sys.argv[2].split(",") if name.strip()}
+
+available = set()
+for node in ast.walk(tree):
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if node.name.startswith("test"):
+            args = node.args
+            for arg in list(args.posonlyargs) + list(args.args) + list(args.kwonlyargs):
+                available.add(arg.arg)
+partial = False
+for node in ast.walk(tree):
+    if isinstance(node, ast.Call):
+        func = node.func
+        if getattr(func, "attr", "") == "parametrize" and node.args:
+            first = node.args[0]
+            bound = set()
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                bound = {part.strip() for part in first.value.split(",") if part.strip()}
+            elif isinstance(first, (ast.List, ast.Tuple)):
+                bound = {
+                    str(element.value)
+                    for element in first.elts
+                    if isinstance(element, ast.Constant)
+                }
+            available |= bound
+            # A mark binding the wanted names together with others cannot be replaced without
+            # leaving those others unfilled, so the plugin refuses it. Refuse here too, or the
+            # channel is reported established and the run then fails for an unrelated reason.
+            if (bound & wanted) and not (bound <= wanted):
+                partial = True
+print(int(bool(wanted) and wanted <= available and not partial))
+PY
+)
+fi
+
+# Combine. The CLI channel is preferred when both probe positive, because the caller named the
+# flag explicitly and a flag the target parses is stronger evidence than a variable it reads.
+if [ "$GRID_HOOK_CLI" -eq 1 ]; then
+  GRID_HOOK_OK=1
+  GRID_CHANNEL="cli"
+elif [ "$GRID_HOOK_ENV" -eq 1 ]; then
+  GRID_HOOK_OK=1
+  GRID_CHANNEL="env"
+elif [ "$GRID_HOOK_PYTEST" -eq 1 ]; then
+  GRID_HOOK_OK=1
+  GRID_CHANNEL="pytest"
+fi
+jset_string "test_selection.grid_channel" "$GRID_CHANNEL"
+# The reason a grid did not run must name which channel was tried and what was found, so a
+# caller can tell "this target has no shape channel" from "the channel I named is not the one
+# this target has" -- and so a limit of the validator is never published as a property of the
+# target.
+GRID_CHANNEL_REASON=""
+if [ -n "$GRID" ] && [ "$GRID_HOOK_OK" -ne 1 ]; then
+  if [ -z "$SHAPE_ARG" ] && [ -z "$SHAPE_ENV" ]; then
+    GRID_CHANNEL_REASON="a grid was supplied but neither --shape-arg nor --shape-env named a channel to deliver it through"
+  else
+    GRID_CHANNEL_REASON="grid channel not established:"
+    if [ -n "$SHAPE_ARG" ]; then
+      if [ "$TARGET_RUNNER" != "script" ]; then
+        GRID_CHANNEL_REASON="$GRID_CHANNEL_REASON --shape-arg '"'"'$SHAPE_ARG'"'"' was ignored because the target runs under $TARGET_RUNNER and the CLI channel is wired only for script targets (a validator limit, not a target property);"
+      else
+        GRID_CHANNEL_REASON="$GRID_CHANNEL_REASON '"'"'$SHAPE_ARG'"'"' is not passed to add_argument in $TEST_FILE;"
+      fi
+    fi
+    if [ -n "$SHAPE_ENV" ]; then
+      GRID_CHANNEL_REASON="$GRID_CHANNEL_REASON $TEST_FILE does not read \$$SHAPE_ENV;"
+    fi
+    if [ -n "$SHAPE_ARGNAMES" ]; then
+      if [ "$TARGET_RUNNER" != "pytest" ]; then
+        GRID_CHANNEL_REASON="$GRID_CHANNEL_REASON --shape-argnames needs a pytest target and this one runs under $TARGET_RUNNER;"
+      else
+        GRID_CHANNEL_REASON="$GRID_CHANNEL_REASON $TEST_FILE does not take all of '"'"'$SHAPE_ARGNAMES'"'"' as test parameters;"
+      fi
+    fi
+  fi
+fi
+if [ -n "$GRID_CHANNEL_REASON" ] && [ -f "$REPO_WT/$TEST_FILE" ]; then
+  GRID_CHANNEL_OFFERS=$(python3 - "$REPO_WT/$TEST_FILE" <<'PY'
+import ast
+
+import sys
+
+tree = ast.parse(open(sys.argv[1], encoding="utf-8").read())
+env, flags, argnames = set(), set(), set()
+for node in ast.walk(tree):
+    if isinstance(node, ast.Call):
+        func = node.func
+        parts = []
+        walk = func
+        while isinstance(walk, ast.Attribute):
+            parts.append(walk.attr)
+            walk = walk.value
+        if isinstance(walk, ast.Name):
+            parts.append(walk.id)
+        path = tuple(reversed(parts))
+        if path in {("os", "getenv"), ("os", "environ", "get")} and node.args:
+            key = node.args[0]
+            if isinstance(key, ast.Constant):
+                env.add(str(key.value))
+        if getattr(func, "attr", "") == "add_argument":
+            for arg in node.args:
+                if isinstance(arg, ast.Constant) and str(arg.value).startswith("-"):
+                    flags.add(str(arg.value))
+        if getattr(func, "attr", "") == "parametrize" and node.args:
+            first = node.args[0]
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                argnames.add(",".join(p.strip() for p in first.value.split(",")))
+            elif isinstance(first, (ast.List, ast.Tuple)):
+                argnames.add(
+                    ",".join(
+                        str(e.value) for e in first.elts if isinstance(e, ast.Constant)
+                    )
+                )
+    if isinstance(node, ast.Subscript):
+        walk, parts = node.value, []
+        while isinstance(walk, ast.Attribute):
+            parts.append(walk.attr)
+            walk = walk.value
+        if isinstance(walk, ast.Name):
+            parts.append(walk.id)
+        if tuple(reversed(parts)) == ("os", "environ"):
+            key = node.slice
+            if isinstance(key, ast.Constant):
+                env.add(str(key.value))
+
+offers = []
+if env:
+    offers.append("--shape-env candidates: " + ", ".join(sorted(env)))
+if flags:
+    offers.append("--shape-arg candidates: " + ", ".join(sorted(flags)))
+if argnames:
+    offers.append(
+        "--shape-argnames candidates: " + "; ".join(sorted(a for a in argnames if a))
+    )
+print(" | ".join(offers) if offers else "this target exposes no shape channel of any kind")
+PY
+)
+  GRID_CHANNEL_REASON="$GRID_CHANNEL_REASON what this target does offer -> $GRID_CHANNEL_OFFERS"
+fi
+jset_string "test_selection.grid_channel_reason" "$GRID_CHANNEL_REASON"
 
 run_pytest() {
   local label="$1"
@@ -1000,9 +1211,72 @@ PY
     "AITER_JIT_DIR=$cache_root/aiter-jit"
     "VALIDATION_PHASE=$label"
   )
+  # The pytest channel needs its plugin generated per run, with the grid baked in, so the
+  # tested PR can neither read nor forge it.
+  local -a shape_plugin=()
+  if [ "$GRID_CHANNEL" = "pytest" ] && [ -n "$shape_assignment" ]; then
+    local _grid_value="${shape_assignment#*=}"
+    python3 - "$SCRIPT_DIR/shape_grid_plugin.py" \
+      "$PROBE_DIR/${PROBE_MODULE}_shapes.py" "$SHAPE_ARGNAMES" "$_grid_value" <<'PY'
+import pathlib
+import sys
+
+source, output, argnames, grid = sys.argv[1:5]
+names = tuple(part.strip() for part in argnames.split(",") if part.strip())
+SENTINEL = "__VALIDATOR_INVALID_GRID__"
+if grid.strip() == SENTINEL:
+    # The invalid-grid probe must reach the TARGET, not crash the plugin. A row of the wrong
+    # arity would raise inside pytest's parametrize and the non-zero exit would credit the
+    # channel without the target ever having consumed a shape. Keep the arity, poison the
+    # values: the target then fails on its own, which is the evidence the probe is for.
+    rows = [tuple(SENTINEL for _ in names)]
+else:
+    rows = [
+        tuple(cell.strip() for cell in row.split(","))
+        for row in grid.split(";")
+        if row.strip()
+    ]
+bad = [row for row in rows if len(row) != len(names)]
+if bad:
+    raise SystemExit(
+        f"grid rows must have {len(names)} cells to match --shape-argnames "
+        f"{','.join(names)}; offending rows: {bad}"
+    )
+# Cells arrive as text. Anything that is an integer is passed as one, because a test that
+# indexes or allocates with a shape argument needs an int, not "128". Everything else is left
+# as the string the caller wrote, which is what a dtype argument wants.
+def _coerce(cell):
+    if cell in ("True", "False"):
+        # Before this, "False" reached the target as a non-empty string, which is truthy, and
+        # every row of a boolean dimension silently ran the True branch.
+        return cell == "True"
+    if cell in ("None", "none"):
+        return None
+    try:
+        return int(cell)
+    except ValueError:
+        pass
+    try:
+        return float(cell)
+    except ValueError:
+        return cell
+
+rows = [tuple(_coerce(cell) for cell in row) for row in rows]
+text = pathlib.Path(source).read_text()
+text += (
+    f"\n_VALIDATION_SHAPE_ARGNAMES = {names!r}\n"
+    f"_VALIDATION_SHAPE_GRID = {rows!r}\n"
+)
+pathlib.Path(output).write_text(text)
+PY
+    shape_plugin=(-p "${PROBE_MODULE}_shapes")
+    shape_assignment=""
+  fi
   local -a shape_cli=()
-  if [ -n "$shape_assignment" ] && [ -n "$SHAPE_ARG" ] \
-      && [ "$TARGET_RUNNER" = "script" ]; then
+  # Dispatch on the channel that actually probed positive, not on "--shape-arg was supplied".
+  # With both flags given and only the env channel real, the old condition still routed the
+  # grid through the CLI flag the target does not parse.
+  if [ -n "$shape_assignment" ] && [ "$GRID_CHANNEL" = "cli" ]; then
     shape_cli=("$SHAPE_ARG")
     local _grid_value="${shape_assignment#*=}"
     local _old_ifs="$IFS"
@@ -1020,7 +1294,8 @@ PY
     (
       cd "$REPO_WT" \
         && env "${environment[@]}" timeout "$TIMEOUT" \
-          "$TARGET_PYTHON" -m pytest -p "$PROBE_MODULE" "$TESTS" -x -q \
+          "$TARGET_PYTHON" -m pytest -p "$PROBE_MODULE" "${shape_plugin[@]}" \
+            "$TESTS" -x -q \
             --junitxml="$junit" -o "cache_dir=$cache_root/pytest-cache"
     ) >"$log" 2>&1
   elif [ -n "$EXPECTED_ROUTE" ]; then
@@ -1428,8 +1703,20 @@ PY
       finding "note" "correctness" \
         "the selected target does not consume the configured shape-grid hook"
     else
-      stage_note "correctness_s1_grid" "skip" \
-        "kernel exposes no configured shape override; coverage is repo-default-only"
+      # A skip must describe what was actually found. "kernel exposes no configured shape
+      # override" reads as a property of the target even when the real cause is that the
+      # validator ignored the channel the caller named -- which is a capability gap wearing a
+      # skip's costume, the exact failure this skill exists to prevent.
+      if [ -n "$GRID_CHANNEL_REASON" ]; then
+        stage_note "correctness_s1_grid" "skip" \
+          "$GRID_CHANNEL_REASON; coverage is repo-default-only"
+      elif [ -z "$GRID" ]; then
+        stage_note "correctness_s1_grid" "skip" \
+          "no --grid was supplied, so no independent shape coverage was attempted; coverage is repo-default-only"
+      else
+        stage_note "correctness_s1_grid" "skip" \
+          "kernel exposes no configured shape override; coverage is repo-default-only"
+      fi
       if [ -n "$EXPECTED_ROUTE" ] && [ -f "$WORK/head/execution-receipt.json" ]; then
         RECEIPT_JSON=$(
           python3 "$SCRIPT_DIR/validate_evidence.py" receipt \

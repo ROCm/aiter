@@ -70,14 +70,39 @@ For a local candidate with no remote head, omit `--head-sha`. The report then re
 | `--shape-vars` | comma-separated local names captured from each route call, in grid order |
 | `--shape-env` `--grid` | env var and shape list for the S1-owned grid |
 | `--shape-arg` | the target's own CLI flag that accepts shapes, for script targets that read no env var |
+| `--shape-argnames` | the pytest parameter names the grid should replace, for targets whose shapes are literals inside `@pytest.mark.parametrize` |
 | `--tol-table` | reference tolerances, e.g. `f32=1e-5,f16=2e-3,bf16=1e-2` |
 | `--label` `--out` | run name and report path (default `./validation_report.json`) |
 
-Environment knobs: `PYLIB` (runtime modules outside the checkout), `PYTHON_BIN` (one interpreter
-used for pytest and script targets), `PICKER` (override the shipped `pick-idle-gpu.py`), and
-`TIMEOUT` (per-target budget, default 1800s). The executor
-overrides `AITER_JIT_DIR` with separate fresh base/head directories and sets
-`PYTHONDONTWRITEBYTECODE=1`, so repository JIT output cannot cross phases or dirty the worktree.
+Four settings are environment variables rather than flags, because they describe the **host**
+rather than the PR under test, and a caller validating many PRs on one machine sets them once:
+
+| env | meaning |
+|---|---|
+| `PYLIB` | runtime modules living outside the checkout |
+| `PYTHON_BIN` | the one interpreter used for both pytest and script targets |
+| `PICKER` | override the shipped `pick-idle-gpu.py`; unset, the **shipped** picker is used, and only then one found on `PATH` |
+| `TIMEOUT` | per-target budget, default 1800s |
+
+Everything that describes the PR is a flag. The executor also overrides `AITER_JIT_DIR` with
+separate fresh base/head directories and sets `PYTHONDONTWRITEBYTECODE=1`, so repository JIT
+output cannot cross phases or dirty the worktree.
+
+### Which shape channel to name
+
+The three shape flags are alternatives, not a sequence; supply the one the target actually has.
+The report says which channel was established in `test_selection.grid_channel`, and when none
+was, `test_selection.grid_channel_reason` names each channel tried and what was found in the
+target — so a failed guess costs one run, not a reading of this file.
+
+| the target takes its shapes from | flag | what is checked before the channel is credited |
+|---|---|---|
+| an environment variable it reads | `--shape-env` | the source reads that name via `os.getenv` / `os.environ` |
+| its own CLI flag | `--shape-arg` | the source passes that flag literal to `add_argument` |
+| `@pytest.mark.parametrize` literals | `--shape-argnames` | the source binds all those names as test parameters |
+
+All three are then held to the same proof: a deliberately unusable grid must make the target
+**fail**. A target that ignores the grid produces a skip, never a pass.
 
 ---
 
