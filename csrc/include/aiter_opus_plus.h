@@ -4,14 +4,6 @@
 
 #include "hip_reduce.h"
 #include "opus/opus.hpp"
-// todo: remove this to use aiterTensor dtype
-// c10 half/bfloat16 are only needed for the t2opus<c10::*> specializations
-// below. Torch-free translation units (which use hip2opus instead) can define
-// AITER_NO_TORCH_TYPES before including this header to drop the torch include.
-#ifndef AITER_NO_TORCH_TYPES
-#include <c10/util/BFloat16.h>
-#include <c10/util/Half.h>
-#endif
 #include <hip/hip_bf16.h>
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp16.h>
@@ -898,37 +890,6 @@ OPUS_D void s_wait_all_dscnt(number<ds_cnt> = {})
 #endif
     }
 }
-
-// todo: edit this to use aiterTensor dtype
-template <typename T>
-struct t2opus;
-template <>
-struct t2opus<float>
-{
-    using type = float;
-};
-#ifndef AITER_NO_TORCH_TYPES
-template <>
-struct t2opus<c10::Half>
-{
-    using type = opus::fp16_t;
-};
-template <>
-struct t2opus<c10::BFloat16>
-{
-    using type = opus::bf16_t;
-};
-#endif
-template <>
-struct t2opus<int32_t>
-{
-    using type = int32_t;
-};
-template <>
-struct t2opus<int8_t>
-{
-    using type = opus::i8_t;
-};
 
 // HIP native type -> opus type mapping
 template <typename T> struct hip2opus;
