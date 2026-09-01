@@ -20,8 +20,12 @@ except Exception as e:  # noqa: BLE001
     _IMPORT_ERR = e
 
 
-@unittest.skipUnless(fused_moe_mod is not None, f"aiter imports unavailable: {_IMPORT_ERR}")
 class TestTritonFmoeDispatch(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if _IMPORT_ERR is not None:
+            raise RuntimeError("aiter imports unavailable") from _IMPORT_ERR
+
     def setUp(self):
         fused_moe_mod._load_triton_fmoe_configs.cache_clear()
 
