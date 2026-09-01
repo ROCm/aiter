@@ -566,13 +566,6 @@ def _sage_fwd_blocksparse_mask_mxfp4(
     return acc, l_i, m_i
 
 
-# As in sage_fwd, every key here must render as a valid C identifier -- no
-# negatives, no non-integral floats. Left out:
-#   Q_DTYPE_STR, K_DTYPE_STR   the sole launch site passes "e2m1" for both, which
-#                              the base name already says. Re-add if a second
-#                              dtype pair is ever launched.
-#   IS_VARLEN                  literal False at that launch site.
-#   BLOCK_DMODEL_QK/V          max(16, next_pow2(ACTUAL_BLOCK_DMODEL_*)).
 _sage_fwd_mxfp4_repr = make_kernel_repr(
     "sage_fwd_mxfp4",
     [
