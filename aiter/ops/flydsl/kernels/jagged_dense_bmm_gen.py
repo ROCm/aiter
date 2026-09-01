@@ -183,13 +183,9 @@ def _build_launcher(
                 fx.get_layout(B),
             )
 
-            A_buf = make_bounded_buffer_tensor(
-                A_g, fx.Int64(fx.Int32(M_b) * fx.Int32(K) * fx.Int32(2))
-            )
+            A_buf = make_bounded_buffer_tensor(A_g, fx.Int64(M_b * K * 2))
             B_buf = fx.rocdl.make_buffer_tensor(B_g, max_size=True)
-            C_buf = make_bounded_buffer_tensor(
-                C_g, fx.Int64(fx.Int32(M_b) * fx.Int32(N) * fx.Int32(2))
-            )
+            C_buf = make_bounded_buffer_tensor(C_g, fx.Int64(M_b * N * 2))
 
             gA_k = fx.flat_divide(A_buf, (BLOCK_M, BLOCK_K))[
                 None, None, block_m_idx, None
