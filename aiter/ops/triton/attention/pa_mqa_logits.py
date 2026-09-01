@@ -266,6 +266,7 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     is_padded_mode: bool,
     WavePerEU: int = 2,
     VarCtxOpt: bool = False,
+    PerQueryContext: bool = False,
 ):
     gfx_version = get_gfx()
     assert gfx_version in _GLUON_PA_MQA_LOGITS_ARCHS
@@ -327,6 +328,7 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     fn_signature["HiddenDim"] = "constexpr"
     fn_signature["CDNA_VERSION"] = "constexpr"
     fn_signature["ARCH"] = "constexpr"
+    fn_signature["PerQueryContext"] = "constexpr"
 
     effective_wave_per_eu = 1 if is_gfx1250 and not Preshuffle else WavePerEU
     effective_num_warps = 1 if is_gfx1250 and Preshuffle else 4
@@ -373,6 +375,7 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
             "HiddenDim": HiddenDim,
             "CDNA_VERSION": cdna_version,
             "ARCH": gfx_version,
+            "PerQueryContext": PerQueryContext,
         },
         attrs={
             (2,): [["tt.divisibility", 16]],  # heads_num
@@ -409,7 +412,8 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
         padded_str = "T" if is_padded_mode and not Preshuffle else "F"
         preshuffle_suffix = "_preshuffle" if Preshuffle else ""
         varctx_suffix = "_varctx" if VarCtxOpt else ""
-        kernel_str = f"paged_mqa_logits{preshuffle_suffix}{varctx_suffix}_{ChunkQ}x{ChunkK}x{HiddenDim}_B{KVBlockSize}P{padded_str}W{WavePerEU}"
+        per_query_suffix = "_per_query_ctx" if PerQueryContext else ""
+        kernel_str = f"paged_mqa_logits{preshuffle_suffix}{varctx_suffix}{per_query_suffix}_{ChunkQ}x{ChunkK}x{HiddenDim}_B{KVBlockSize}P{padded_str}W{WavePerEU}"
         metadata_pth = f"{AITER_TRITON_CONFIGS_PATH}/paged_mqa_logits/aot/{kernel_str}"
         with AOTMetadataContext(
             kernel_fn.fn.__name__,
@@ -478,6 +482,26 @@ def deepgemm_fp8_paged_mqa_logits(
     if TotalCuCount is None:
         TotalCuCount = get_num_sms()
     batch_size, next_n, heads, hidden_dim = q_fp8.size()
+    if context_lens.ndim == 1:
+        assert context_lens.shape[0] >= batch_size, (
+            context_lens.shape,
+            batch_size,
+        )
+        per_query_context = False
+    elif context_lens.ndim == 2:
+        assert context_lens.shape == (batch_size, next_n), (
+            context_lens.shape,
+            (batch_size, next_n),
+        )
+        assert (
+            context_lens.is_contiguous()
+        ), "Per-query context_lens must be contiguous [batch_size, next_n]"
+        per_query_context = True
+    else:
+        raise ValueError(
+            "context_lens must be [batch_size] or [batch_size, next_n], "
+            f"got shape={tuple(context_lens.shape)}"
+        )
     _, block_Size, _, index_dim = kv_cache.size()
     _, max_block_len = kv_indices.size()
 
@@ -522,6 +546,10 @@ def deepgemm_fp8_paged_mqa_logits(
         VarCtxSchedule = None
 
     VarCtxOpt = VarCtxSchedule is not None
+    if VarCtxOpt and per_query_context:
+        raise ValueError(
+            "VarCtxSchedule does not support per-query context_lens [B, N]"
+        )
     if VarCtxOpt:
         grid = (TotalCuCount * WavePerEU, 1, 1)
     else:
@@ -538,6 +566,7 @@ def deepgemm_fp8_paged_mqa_logits(
             is_padded_mode=is_padded_mode,
             WavePerEU=WavePerEU,
             VarCtxOpt=VarCtxOpt,
+            PerQueryContext=per_query_context,
         )
         if triton_version >= Version("3.5.0"):
             cdna_version = get_cdna_version()
@@ -570,6 +599,7 @@ def deepgemm_fp8_paged_mqa_logits(
                 hidden_dim,
                 cdna_version,
                 get_gfx(),
+                per_query_context,
             )
         else:  #  load AOT compiled gluon kernel
             assert triton_version < Version(
@@ -606,6 +636,7 @@ def deepgemm_fp8_paged_mqa_logits(
                 ChunkK,
                 KVBlockSize,
                 hidden_dim,
+                per_query_context,
             )
     else:
         assert not Preshuffle, "Preshuffle mode is only supported on gluon kernel."
@@ -639,5 +670,6 @@ def deepgemm_fp8_paged_mqa_logits(
             SplitKV=SplitKV,
             HiddenDim=hidden_dim,
             KVBlockSize=KVBlockSize,
+            PerQueryContext=per_query_context,
         )
     return triton.runtime.cache.get_cache_manager(kernel.hash).key

@@ -385,6 +385,7 @@ def _deepgemm_fp8_paged_mqa_logits(
     HiddenDim: tl.constexpr,
     KVBlockSize: tl.constexpr,
     SplitKV: tl.constexpr = 1,
+    PerQueryContext: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     num_block_q_head = tl.cdiv(heads_num, ChunkQ)
@@ -393,7 +394,12 @@ def _deepgemm_fp8_paged_mqa_logits(
     pid_next_n, remain_pid = remain_pid % next_n, remain_pid // next_n
     pid_batch, pid_split_kv = remain_pid % batch_size, remain_pid // batch_size
 
-    context_length = tl.load(context_len_ptr + pid_batch)
+    if PerQueryContext:
+        context_length = tl.load(context_len_ptr + pid_batch * next_n + pid_next_n)
+        context_end = context_length - 1
+    else:
+        context_length = tl.load(context_len_ptr + pid_batch)
+        context_end = context_length - next_n + pid_next_n
 
     context_chunk_num = tl.cdiv(context_length, ChunkK)
     split_context_chunk_num = tl.cdiv(context_chunk_num, SplitKV)
@@ -451,9 +457,7 @@ def _deepgemm_fp8_paged_mqa_logits(
         o = tl.maximum(o, 0.0)
         o = o * scale_weight[None, :].T
 
-        mask = (
-            context_idx + tl.arange(0, ChunkK) <= context_length - next_n + pid_next_n
-        )
+        mask = context_idx + tl.arange(0, ChunkK) <= context_end
         o = tl.where(mask[None, :], o, float("-inf"))
 
         logits = tl.reduce(o, axis=0, combine_fn=_sum_combine)
@@ -493,6 +497,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
     ChunkK: tl.constexpr,
     HiddenDim: tl.constexpr,
     KVBlockSize: tl.constexpr = 1,
+    PerQueryContext: tl.constexpr = False,
 ):
     # for AOT load use, only need kernel have the same signature as implementation side
     pass
@@ -525,6 +530,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
     ChunkK: tl.constexpr,
     HiddenDim: tl.constexpr,
     KVBlockSize: tl.constexpr = 16,
+    PerQueryContext: tl.constexpr = False,
 ):
     # for AOT load use, only need kernel have the same signature as implementation side
     pass
@@ -557,6 +563,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
     ChunkK: tl.constexpr,
     HiddenDim: tl.constexpr,
     KVBlockSize: tl.constexpr = 16,
+    PerQueryContext: tl.constexpr = False,
 ):
     # for AOT load use, only need kernel have the same signature as implementation side
     pass
