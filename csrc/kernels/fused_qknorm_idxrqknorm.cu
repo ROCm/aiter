@@ -103,9 +103,11 @@ __device__ __forceinline__ void storeCacheElems(cache_t* __restrict__ dst,
 }
 
 // index_q gather: qkv dtype, or unit-scale e4m3 (4787's q_idx contract; no scale tensor).
+// When neither gather buffer is provided, write the packed qkv index-Q row (inplace).
 template <typename scalar_t>
 __device__ __forceinline__ void storeIndexQElems(scalar_t* __restrict__ index_q_out,
                                                  opus::fp8_t* __restrict__ index_q_fp8_out,
+                                                 scalar_t* __restrict__ fallback_ptr,
                                                  const float (&elems)[kElemsPerLane],
                                                  int64_t token_idx,
                                                  int niq,
@@ -122,6 +124,10 @@ __device__ __forceinline__ void storeIndexQElems(scalar_t* __restrict__ index_q_
     else if(index_q_out != nullptr)
     {
         storeElems(index_q_out + off, elems);
+    }
+    else if(fallback_ptr != nullptr)
+    {
+        storeElems(fallback_ptr, elems);
     }
 }
 
@@ -457,6 +463,7 @@ __global__ void fusedQKNormIdxrQKNormKernel(
             {
                 storeIndexQElems(index_q_out,
                                  index_q_fp8_out,
+                                 store_ptr + dim_base,
                                  elems,
                                  token_idx,
                                  niq,
@@ -545,6 +552,7 @@ __global__ void fusedQKNormIdxrQKNormKernel(
             {
                 storeIndexQElems(index_q_out,
                                  index_q_fp8_out,
+                                 store_ptr + dim_base,
                                  elems,
                                  token_idx,
                                  niq,
