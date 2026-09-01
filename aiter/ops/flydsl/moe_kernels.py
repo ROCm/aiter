@@ -192,17 +192,14 @@ def get_flydsl_stage1_kernels(
     kernels = {}
     is_fp4_a = a_dtype == "fp4"
     is_fp4_b = b_dtype == "fp4"
-    # a16w4 (bf16 A x MXFP4 W) gemm1 is fully CSV/registry-driven: register the extra
-    # tile_n=192/256, tile_k=128 and xcd_swizzle=1 variants its tuned kernelNames name
+    # a16w4 (bf16 A x MXFP4 W) gemm1 is fully CSV/registry-driven: register the
+    # extra tile_k=128 and xcd_swizzle=1 variants its tuned kernelNames name
     # (t32x{64,128,192,256}x128 / _xcd1), which the other dtypes don't use.
     is_a16w4 = a_dtype == "bf16" and is_fp4_b
 
     tile_ns = [32, 64, 128] if is_fp4_b else [128]
     tile_ks = [128, 256] if is_a16w4 else [256]
-    # tile_m=16 halves the sort/tile M quantum. It is the winning decode config for
-    # high-expert-count shapes (Kimi-K3 E=896: measured 1.17-1.38x over tile_m=32 for
-    # every token bucket <=512, and a loss from 1024 up), so a16w4 needs the names
-    # registered or the tuner/CSV cannot select it.
+    # tile_m=16 halves the M quantum; the decode win at E=896 (1.17-1.38x, token<=512).
     tile_ms = (
         [16, 32, 64, 128]
         if (is_fp4_b and (a_dtype == "fp8" or is_a16w4))
@@ -215,9 +212,7 @@ def get_flydsl_stage1_kernels(
     xcd_swizzles = [0, 1, 4] if is_a16w4 else [0, 4]
 
     for tm in tile_ms:
-        # tile_m=16 shares tile_m=32's N-tile set on the a16w port: both have
-        # m_repeat<=2 and take tile_n as given, so the narrow N-tiles the tiny-batch
-        # decode configs use (t*x32 / t*x64) are legal at 16 exactly as at 32.
+        # tile_m=16 shares tile_m=32's N-tile set: m_repeat<=2 either way.
         if tm == 32 or (tm == 16 and is_a16w4):
             # 192|384, 256|512 exactly; a16w4-only (that port takes tile_n as given).
             tile_ns = [32, 64, 128, 192, 256] if is_a16w4 else [32, 64, 128]
@@ -249,9 +244,8 @@ def get_flydsl_stage1_kernels(
                                     if xcd > 0:
                                         base += f"_xcd{xcd}"
                                     # k_wave (intra-block K-slice): only for the
-                                    # small-M tiles (tile_m in {16,32}; 16 is a16w-only),
-                                    # no split-K/mock, and capped to <=8 total waves
-                                    # (<=512 threads).
+                                    # small-M tiles (tile_m in {16,32}), no split-K/mock,
+                                    # and capped to <=8 total waves (<=512 threads).
                                     num_n_waves = min(4, tn // 32)
                                     _small_m = tm == 32 or (tm == 16 and is_a16w4)
                                     k_waves = (
@@ -537,11 +531,11 @@ def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
         for tn in tile_ns:
             for tk in tile_ks:
                 # The kernel splits the 4 waves into (4/kw) N-waves x kw K-waves, so
-                # each N-wave covers tn/(4/kw) cols and needs a multiple of 16 for the
-                # 16x16 MMA (kw=1 therefore requires tn >= 64); kw > 1 additionally
-                # needs 4*tn <= tk so the K-slice fits the tile. b_nt=0 (L2-cached W
-                # loads) is registered alongside the default nt/streaming b_nt=2:
-                # large-M weight reuse wants cached, decode wants streamed.
+                # each N-wave covers tn/(4/kw) cols, a multiple of 16 for the 16x16 MMA
+                # (kw=1 therefore requires tn >= 64); kw > 1 additionally needs
+                # 4*tn <= tk so the K-slice fits the tile. b_nt=0 (L2-cached W loads)
+                # is registered alongside the default nt/streaming b_nt=2: large-M
+                # weight reuse wants cached, decode wants streamed.
                 for kw in (1, 2, 4):
                     num_n_waves = 4 // kw
                     if tn % num_n_waves or (tn // num_n_waves) % 16:
