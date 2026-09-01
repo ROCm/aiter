@@ -22,9 +22,7 @@ class RocmHeaderDiscoveryTest(unittest.TestCase):
     def test_matching_system_headers_are_discovered(self):
         with tempfile.TemporaryDirectory() as tempdir:
             include = self._write_system_headers(pathlib.Path(tempdir))
-            with patch.object(
-                cpp_extension, "_SYSTEM_ROCM_INCLUDE", str(include)
-            ):
+            with patch.object(cpp_extension, "_SYSTEM_ROCM_INCLUDE", str(include)):
                 self.assertEqual(
                     cpp_extension._find_matching_system_rocm_include((7, 15)),
                     str(include),
@@ -33,9 +31,7 @@ class RocmHeaderDiscoveryTest(unittest.TestCase):
     def test_mismatched_system_headers_are_rejected(self):
         with tempfile.TemporaryDirectory() as tempdir:
             include = self._write_system_headers(pathlib.Path(tempdir), (7, 14))
-            with patch.object(
-                cpp_extension, "_SYSTEM_ROCM_INCLUDE", str(include)
-            ):
+            with patch.object(cpp_extension, "_SYSTEM_ROCM_INCLUDE", str(include)):
                 self.assertIsNone(
                     cpp_extension._find_matching_system_rocm_include((7, 15))
                 )
@@ -44,9 +40,7 @@ class RocmHeaderDiscoveryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tempdir:
             include = self._write_system_headers(pathlib.Path(tempdir))
             (include / "rocprim" / "rocprim.hpp").unlink()
-            with patch.object(
-                cpp_extension, "_SYSTEM_ROCM_INCLUDE", str(include)
-            ):
+            with patch.object(cpp_extension, "_SYSTEM_ROCM_INCLUDE", str(include)):
                 self.assertIsNone(
                     cpp_extension._find_matching_system_rocm_include((7, 15))
                 )
