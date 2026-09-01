@@ -10,7 +10,6 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
 
 from .kernels_common import atomic_add_i32
-from .tensor_shim import row_rsrc
 from .topk_per_row_decode import (
     _f32_to_ord,
     _load_f32x4,
@@ -84,7 +83,10 @@ def build_topk_per_row_decode_one_workgroup_module(
         scan = storage.scan.peek().view(fx.make_layout(num_waves * 2, 1))
         metadata = storage.metadata.peek().view(fx.make_layout(8, 1))
 
-        input_resource = row_rsrc(input, row, width, stride0)
+        input_buffer = fx.rocdl.make_buffer_tensor(input, max_size=False)
+        input_resource = fx.logical_divide(
+            fx.slice(input_buffer, (row, None)), fx.make_layout(_VEC, 1)
+        )
         row_len = _row_length(row, row_ends, width, next_n)
         row_indices = fx.slice(indices, (row, None))
         row_values = fx.slice(values, (row, None))

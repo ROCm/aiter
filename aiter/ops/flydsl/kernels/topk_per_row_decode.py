@@ -22,14 +22,12 @@ from flydsl.expr import (
 )
 from flydsl.expr.typing import T
 
-# Dynamic row bases and byte bounds are not expressible through a static layout.
-from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
 from aiter.ops.flydsl.kernels.kernels_common import (
     atomic_add_i32,
     uint32_to_int32,
 )
-from aiter.ops.flydsl.kernels.tensor_shim import row_rsrc
+from aiter.ops.flydsl.kernels.tensor_shim import buf_copy_atom
 
 _KEY_BITS = 32
 _RADIX_BITS = 11
@@ -72,15 +70,11 @@ def _row_length(row, row_ends, width, next_n):
     return (row_len > width).select(width, row_len)
 
 
-def _load_f32x4(resource, vec_idx):
-    return fx.Vector(
-        buffer_ops.buffer_load(
-            resource,
-            vec_idx * _VEC,
-            vec_width=_VEC,
-            dtype=Float32,
-        )
-    )
+def _load_f32x4(tensor, vec_idx):
+    src = fx.slice(tensor, (None, vec_idx))
+    fragment = fx.make_fragment_like(src)
+    fx.copy(buf_copy_atom(16, Float32), src, fragment)
+    return fx.Vector(fx.memref_load_vec(fragment))
 
 
 def _warp_inclusive_prefix_i32(val, lane, wave_size):
@@ -209,7 +203,10 @@ def build_topk_per_row_decode_module(
         chunk = fx.block_idx.y
         tid = fx.thread_idx.x
 
-        input_rsrc = row_rsrc(input, row, n, stride0)
+        input_buffer = fx.rocdl.make_buffer_tensor(input, max_size=False)
+        input_rsrc = fx.logical_divide(
+            fx.slice(input_buffer, (row, None)), fx.make_layout(_VEC, 1)
+        )
         row_indices = fx.slice(indices, (row, None))
         row_values = fx.slice(values, (row, None))
         row_len = _row_length(row, row_ends, n, next_n)
@@ -443,7 +440,10 @@ def build_topk_per_row_decode_module(
         chunk = fx.block_idx.y
         tid = fx.thread_idx.x
 
-        input_rsrc = row_rsrc(input, row, n, stride0)
+        input_buffer = fx.rocdl.make_buffer_tensor(input, max_size=False)
+        input_rsrc = fx.logical_divide(
+            fx.slice(input_buffer, (row, None)), fx.make_layout(_VEC, 1)
+        )
         row_len = _row_length(row, row_ends, n, next_n)
         row_indices = fx.slice(indices, (row, None))
         row_values = fx.slice(values, (row, None))
@@ -620,7 +620,10 @@ def build_topk_per_row_decode_module(
         chunk_i32 = fx.Int32(chunk)
         tid_i32 = fx.Int32(tid)
 
-        input_rsrc = row_rsrc(input, row_i32, n, stride0)
+        input_buffer = fx.rocdl.make_buffer_tensor(input, max_size=False)
+        input_rsrc = fx.logical_divide(
+            fx.slice(input_buffer, (row_i32, None)), fx.make_layout(_VEC, 1)
+        )
         row_indices = fx.slice(indices, (row, None))
         row_values = fx.slice(values, (row, None))
         row_len = _row_length(row_i32, row_ends, n, next_n)
