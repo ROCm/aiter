@@ -99,6 +99,15 @@ __device__ __forceinline__ float bf16f(const T& x)
 // Max experts per lane, covering E <= 512 (the entry's limit).
 static constexpr int kEptMax = 8;
 
+// Expert-id slots the routing map spans: the routed experts, the fused shared
+// experts (replicated, so every rank holds all of them), and -- under EP only --
+// one trailing sentinel that ranks not owning a token park its shared row on.
+// Host and device both call this so the histogram width cannot drift.
+__host__ __device__ constexpr int expert_slots(int E, int n_shared, bool ep)
+{
+    return E + n_shared + ((ep && n_shared > 0) ? 1 : 0);
+}
+
 // Single source of truth for the LDS layout: the kernel carves its pointers out
 // of the dynamic allocation and the host asks this for the byte count, so the
 // two cannot drift. Every slot is 4 bytes, offsets in elements.
@@ -107,20 +116,24 @@ struct LdsLayout
     int    s_weight, s_cnt, s_scan, s_buf, s_unit, s_lid;
     size_t bytes;
 
-    // ep: an expert_mask was supplied. s_lid is allocated only then, so the
-    // non-EP footprint (and its occupancy) is untouched.
-    __host__ __device__ constexpr LdsLayout(int BlockSize, int total_routed_rows, int E, bool ep)
+    // E_tot: expert_slots(...). ep: an expert_mask was supplied. s_lid is
+    // allocated only then, so the non-EP footprint (and its occupancy) is
+    // untouched.
+    __host__ __device__ constexpr LdsLayout(int BlockSize, int total_routed_rows, int E_tot,
+                                            bool ep)
         : s_weight(total_routed_rows) // s_expert is at 0
         , s_cnt(s_weight + total_routed_rows)
-        , s_scan(s_cnt + E)
+        , s_scan(s_cnt + E_tot)
         // s_buf also holds the phase-2 scan's 2*NWAVE wave totals, hence the
         // floor, which only bites at M*topk < 8.
-        , s_buf(s_scan + 2 * BlockSize)
+        // s_scan spans 2*BlockSize slots -- one per thread-pair -- or E_tot when
+        // the fused shared slots push past that; see the phase-2 tail fixup.
+        , s_buf(s_scan + (E_tot > 2 * BlockSize ? E_tot : 2 * BlockSize))
         , s_unit(s_buf + (total_routed_rows > 2 * (BlockSize / kWaveSize)
                               ? total_routed_rows
                               : 2 * (BlockSize / kWaveSize)))
         , s_lid(s_unit + total_routed_rows)
-        , bytes((size_t)(s_lid + (ep ? E : 0)) * sizeof(int))
+        , bytes((size_t)(s_lid + (ep ? E_tot : 0)) * sizeof(int))
     {
     }
 };
@@ -218,14 +231,18 @@ __device__ __forceinline__ void phase1_topk_load(const DTYPE_I* __restrict__ gat
     }
 }
 
-template <int EPT, typename DTYPE_I, typename DTYPE_B>
+template <int EPT, int NSHARED, typename DTYPE_I, typename DTYPE_B>
 __device__ __forceinline__ void phase1_topk_select(const DTYPE_I* __restrict__ gating_row,
                                                    float* __restrict__ topk_weights,
                                                    int* __restrict__ topk_ids, int token, int E,
                                                    int topk, bool need_renorm, float rsf,
+                                                   float shared_w, int ep_rank, int ep_size,
                                                    const DTYPE_I* g, const DTYPE_B* b)
 {
     const int lane_id = threadIdx.x & (kWaveSize - 1);
+    // Rows this token occupies: its routed picks plus one per fused shared
+    // expert. NSHARED == 0 makes this topk and every use below folds away.
+    const int topk_total = topk + NSHARED;
 
     uint64_t key[EPT];
 #pragma unroll
@@ -289,8 +306,27 @@ __device__ __forceinline__ void phase1_topk_select(const DTYPE_I* __restrict__ g
     }
     if(lane_id < topk)
     {
-        topk_ids[token * topk + lane_id]     = winner_expert;
-        topk_weights[token * topk + lane_id] = w;
+        topk_ids[token * topk_total + lane_id]     = winner_expert;
+        topk_weights[token * topk_total + lane_id] = w;
+    }
+    // Fused shared experts occupy the tail lanes. Written after the renorm
+    // above, never before: the DPP sum spans all 64 lanes and only holds
+    // because w == 0 outside lane_id < topk.
+    if constexpr(NSHARED > 0)
+    {
+        const int s = lane_id - topk;
+        if(s >= 0 && s < NSHARED)
+        {
+            // The shared weights are replicated on every rank and every rank
+            // sees every token, so emitting the shared row unconditionally
+            // would make the post-MoE all-reduce sum ep_size copies of it.
+            // Round-robin token ownership instead; non-owners park the row on
+            // the always-masked sentinel slot, which contributes nothing.
+            // ep_size == 1 makes every rank the owner, i.e. the non-EP case.
+            const bool owner = (token % ep_size) == ep_rank;
+            topk_ids[token * topk_total + lane_id] = owner ? (E + s) : (E + NSHARED);
+            topk_weights[token * topk_total + lane_id] = shared_w;
+        }
     }
 }
 
@@ -353,13 +389,14 @@ __device__ __forceinline__ void phase1_quant_token(opus::fp4_t* __restrict__ out
             CALL(8);                \
     } while(0)
 
-template <int BlockSize, int TD, typename DTYPE_I, typename DTYPE_B>
+template <int BlockSize, int TD, int NSHARED, typename DTYPE_I, typename DTYPE_B>
 __device__ __forceinline__ void
 phase1_token(opus::fp4_t* __restrict__ out, uint8_t* __restrict__ tok_scale,
              const DTYPE_I* __restrict__ hidden, const DTYPE_I* __restrict__ gating,
              const DTYPE_B* __restrict__ bias, float* __restrict__ topk_weights,
              int* __restrict__ topk_ids, int token, int E, int topk, int cols, int group_size,
-             int scaleN_pad, bool need_renorm, float rsf)
+             int scaleN_pad, bool need_renorm, float rsf, float shared_w, int ep_rank,
+             int ep_size)
 {
     const DTYPE_I* gating_row = gating + (int64_t)token * E;
     const bool     sel  = (threadIdx.x >> 6) == 0;
@@ -378,9 +415,10 @@ phase1_token(opus::fp4_t* __restrict__ out, uint8_t* __restrict__ tok_scale,
 
     if(sel)
     {
-#define FMR_SELECT(EPT)                                                              \
-    phase1_topk_select<EPT, DTYPE_I, DTYPE_B>(gating_row, topk_weights, topk_ids,    \
-                                              token, E, topk, need_renorm, rsf, g, b)
+#define FMR_SELECT(EPT)                                                                \
+    phase1_topk_select<EPT, NSHARED, DTYPE_I, DTYPE_B>(                                \
+        gating_row, topk_weights, topk_ids, token, E, topk, need_renorm, rsf,          \
+        shared_w, ep_rank, ep_size, g, b)
         FMR_EPT_DISPATCH(FMR_SELECT);
 #undef FMR_SELECT
     }
@@ -426,14 +464,15 @@ __device__ __forceinline__ void expert_rank_list(int* buf, const int* s_expert, 
     }
 }
 
-// Dynamic LDS layout (R = total_routed_rows = M*topk):
+// Dynamic LDS layout (R = total_routed_rows = M*(topk+NSHARED),
+// E_tot = expert_slots(E, NSHARED, ep)):
 //   s_expert [R]            routed expert id per row   (phase 2)
 //   s_weight [R]            routed weight per row      (phase 2)
-//   s_cnt    [E]            expert histogram           (phase 2)
-//   s_scan   [2*BlockSize]  padded prefix sum          (phase 2, needs >= E)
+//   s_cnt    [E_tot]        expert histogram           (phase 2)
+//   s_scan   [max(2*BlockSize, E_tot)] padded prefix sum (phase 2)
 //   s_buf    [R]            ballot rank list           (phase 3)
 //   s_unit   [R]            unit index -> owning expert (phase 2)
-//   s_lid    [E]            global -> local expert id, EP only (phase 2)
+//   s_lid    [E_tot]        global -> local expert id, EP only (phase 2)
 //
 // PART selects which half a launch runs: kFused is both with the grid barrier
 // between, kPhase1/kPhase23 split at exactly that barrier into two launches.
@@ -441,7 +480,7 @@ __device__ __forceinline__ void expert_rank_list(int* buf, const int* s_expert, 
 enum FmrPart { kFused = 0, kPhase1 = 1, kPhase23 = 2 };
 
 template <int BlockSize, int TD, typename DTYPE_I, int PART = kFused,
-          typename DTYPE_B = DTYPE_I>
+          typename DTYPE_B = DTYPE_I, int NSHARED = 0>
 __global__ void __launch_bounds__(BlockSize)
 fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
                          const DTYPE_B* __restrict__ bias,     // [E] fp32 or bf16
@@ -461,19 +500,32 @@ fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
                          DTYPE_I* __restrict__ moe_buf,        // [M, model_dim] or nullptr
                          int moe_buf_elems,                    // M * model_dim
                          unsigned int* __restrict__ sem,       // [1] persistent
-                         // [E], nonzero iff this rank owns the expert; nullptr = no EP
+                         // [E_tot], nonzero iff this rank owns the expert; nullptr = no EP
                          const int* __restrict__ expert_mask,
                          int M, int E, int topk, int unit_size, int group_size, int cols,
                          int max_blocks, // length of sorted_expert_ids
                          int max_tokens, // length of sorted_ids
-                         bool need_renorm, float rsf)
+                         bool need_renorm, float rsf,
+                         // Fused shared experts (NSHARED > 0): the weight every
+                         // token gives each shared expert, and this rank's slot
+                         // in the round-robin that keeps them un-duplicated.
+                         float shared_w, int ep_rank, int ep_size)
 {
     extern __shared__ char smem_raw[];
-    const int  total_routed_rows = M * topk;
+    // One row per pick plus one per fused shared expert.
+    const int  topk_total        = topk + NSHARED;
+    const int  total_routed_rows = M * topk_total;
     constexpr int NWAVE  = BlockSize / kWaveSize;
     const bool ep = expert_mask != nullptr;
+    // Phase 2's histogram is indexed by whatever phase 1 emitted, sentinel
+    // included, so it must span every slot rather than just the routed experts.
+    const int E_tot = expert_slots(E, NSHARED, ep);
+    // The pair scan below reaches 2*BlockSize slots, one per thread-pair. E is
+    // capped there, so only the fused shared tail can spill past it.
+    constexpr int kPairSlots = 2 * BlockSize;
+    const int scan_slots = E_tot > kPairSlots ? E_tot : kPairSlots;
 
-    const LdsLayout lds(BlockSize, total_routed_rows, E, ep);
+    const LdsLayout lds(BlockSize, total_routed_rows, E_tot, ep);
     int*   s_base   = reinterpret_cast<int*>(smem_raw);
     int*   s_expert = s_base;
     float* s_weight = reinterpret_cast<float*>(s_base + lds.s_weight);
@@ -520,9 +572,9 @@ fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
     if constexpr(PART != kPhase23)
     for(int t = blockIdx.x; t < M; t += gridDim.x)
     {
-        phase1_token<BlockSize, TD, DTYPE_I, DTYPE_B>(
+        phase1_token<BlockSize, TD, NSHARED, DTYPE_I, DTYPE_B>(
             out, tok_scale, hidden, gating, bias, topk_weights, topk_ids, t, E, topk, cols,
-            group_size, scaleN_pad, need_renorm, rsf);
+            group_size, scaleN_pad, need_renorm, rsf, shared_w, ep_rank, ep_size);
         __syncthreads(); // the aliased scratch is reused each iteration
     }
 
@@ -535,7 +587,7 @@ fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
     }
     else if constexpr(PART == kPhase23)
     {
-        for(int e = tid; e < E; e += BlockSize)
+        for(int e = tid; e < E_tot; e += BlockSize)
             s_cnt[e] = 0;
         __syncthreads();
     }
@@ -543,7 +595,7 @@ fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
     {
         // __syncthreads() fences global memory too, so no release/acquire.
         __syncthreads();
-        for(int e = tid; e < E; e += BlockSize)
+        for(int e = tid; e < E_tot; e += BlockSize)
             s_cnt[e] = 0;
         __syncthreads();
     }
@@ -551,7 +603,7 @@ fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
     {
         unsigned int arr_old;
         grid_arrive(sem, gridDim.x, &arr_old);
-        for(int e = tid; e < E; e += BlockSize)
+        for(int e = tid; e < E_tot; e += BlockSize)
             s_cnt[e] = 0;
         grid_wait(sem, &arr_old);
     }
@@ -581,8 +633,8 @@ fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
     // mask cumsum is a second DPP scan riding the same data path and the same
     // __syncthreads, so it adds no barrier -- what matters, since phase 2 is
     // latency-bound.
-    const int owned0 = (2 * tid < E) ? (ep ? (expert_mask[2 * tid] != 0) : 1) : 0;
-    const int owned1 = (2 * tid + 1 < E) ? (ep ? (expert_mask[2 * tid + 1] != 0) : 1) : 0;
+    const int owned0 = (2 * tid < E_tot) ? (ep ? (expert_mask[2 * tid] != 0) : 1) : 0;
+    const int owned1 = (2 * tid + 1 < E_tot) ? (ep ? (expert_mask[2 * tid + 1] != 0) : 1) : 0;
     // Unit counts, not padded row counts: the unit table below needs them.
     const int units0 = (owned0 ? ((s_cnt[2 * tid] + unit_size - 1) >> log2u) : 0);
     const int units1 = (owned1 ? ((s_cnt[2 * tid + 1] + unit_size - 1) >> log2u) : 0);
@@ -617,9 +669,9 @@ fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
         const int owned_base = owned_wave_prefix + owned_incl - pair_owned;
         // Masked-out experts own no units, so nothing looks their slot up; -1
         // matches the stock sentinel and keeps a bug visible if one ever does.
-        if(2 * tid < E)
+        if(2 * tid < E_tot)
             s_lid[2 * tid] = owned0 ? owned_base : -1;
-        if(2 * tid + 1 < E)
+        if(2 * tid + 1 < E_tot)
             s_lid[2 * tid + 1] = owned1 ? (owned_base + owned0) : -1;
     }
 
@@ -635,7 +687,40 @@ fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
             s_unit[unit_base + units0 + u] = 2 * tid + 1;
     }
     __syncthreads();
-    const int num_valid = s_scan[2 * BlockSize - 1];
+
+    if constexpr(NSHARED > 0)
+    {
+        // Slots past the pair scan's reach: at most NSHARED + 1 of them, each a
+        // block of rows appended after the routed ones. They need a running
+        // total, not a scan, so one thread walks them serially -- cheaper than
+        // a second scan pass and it keeps the pair scan's shape untouched.
+        if(E_tot > kPairSlots && tid == 0)
+        {
+            int rows = s_scan[kPairSlots - 1];
+            int lid  = 0;
+            if(ep)
+                for(int w = 0; w < NWAVE; ++w)
+                    lid += s_mtot[w]; // local ids the main range already used
+            for(int e = kPairSlots; e < E_tot; ++e)
+            {
+                const int owned = ep ? (expert_mask[e] != 0) : 1;
+                const int units = owned ? ((s_cnt[e] + unit_size - 1) >> log2u) : 0;
+                const int ubase = rows >> log2u; // rows is unit-aligned
+                for(int u = 0; u < units; ++u)
+                    s_unit[ubase + u] = e;
+                rows += units << log2u;
+                s_scan[e] = rows;
+                if(ep)
+                {
+                    s_lid[e] = owned ? lid : -1;
+                    lid += owned;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    const int num_valid = s_scan[scan_slots - 1];
     if(blockIdx.x == 0 && tid == 0)
     {
         num_valid_ids[0] = num_valid;
@@ -647,7 +732,7 @@ fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
     // past num_valid must be initialized: left alone it holds whatever shared
     // the allocator pool, which under vLLM's graph capture is another graph's
     // activations reinterpreted as int32, indexing far out of bounds. Zero is a
-    // valid expert id and pack_id(M, topk) is the "no token" sentinel the stock
+    // valid expert id and pack_id(M, topk_total) is the "no token" sentinel the stock
     // path also writes. Grid-strided, and cannot race phase 3, which only
     // writes below num_valid.
     const int global_tid    = (int)blockIdx.x * BlockSize + tid;
@@ -659,7 +744,7 @@ fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
 
     for(int j = num_valid + global_tid; j < max_tokens; j += global_stride)
     {
-        sorted_ids[j]     = pack_id(M, topk);
+        sorted_ids[j]     = pack_id(M, topk_total);
         sorted_weights[j] = 0.0f;
     }
 
@@ -708,17 +793,17 @@ fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
             const int expert_row = row - base;
             if(expert_row < cnt)
             {
-                // s_buf holds routed-entry indices: entry / topk is the token,
-                // entry % topk is which of its picks this row is.
+                // s_buf holds routed-entry indices: entry / topk_total is the
+                // token, entry % topk_total is which row of that token it is.
                 const int routed_idx = s_buf[expert_row];
-                const int token      = routed_idx / topk;
-                const int slot       = routed_idx - token * topk;
+                const int token      = routed_idx / topk_total;
+                const int slot       = routed_idx - token * topk_total;
                 sorted_ids[row]      = pack_id(token, slot);
                 sorted_weights[row]  = s_weight[routed_idx];
             }
             else
             {
-                sorted_ids[row]     = pack_id(M, topk); // sentinel row
+                sorted_ids[row]     = pack_id(M, topk_total); // sentinel row
                 sorted_weights[row] = 0.0f;
             }
         }
@@ -737,7 +822,7 @@ fused_moe_routing_kernel(const DTYPE_I* __restrict__ gating,   // [M, E]
                 const int scale_begin = (idx - slice_row * chunk) * thread_data;
                 const int expert_row  = row - base;
                 // pad rows -> zeros
-                const int token = (expert_row < cnt) ? (s_buf[expert_row] / topk) : M;
+                const int token = (expert_row < cnt) ? (s_buf[expert_row] / topk_total) : M;
                 const uint8_t* src =
                     (token < M) ? (tok_scale + (int64_t)token * scaleN_pad + scale_begin)
                                 : nullptr;
