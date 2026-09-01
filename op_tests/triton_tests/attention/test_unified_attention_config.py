@@ -81,12 +81,11 @@ ALLOWED_KEYS = {
 BLOCK_SIZES = [1, 16, 17, 32, 48, 64, 96, 128, 192, 256, 512]
 HEAD_SIZES = [32, 64, 128, 192, 256, 512, 576]
 QUERY_LENS = [1, 4, 100, 256, 4096]
-DTYPES = [
-    (torch.bfloat16, torch.bfloat16),
-    (e4m3_dtype, e4m3_dtype),
-    (torch.bfloat16, e4m3_dtype),
-    (torch.uint8, torch.uint8),
-]
+# Every (query, KV) pair, not just the matched ones: the tables key on the two
+# independently, so DT_any_bf16 is only reachable through a mixed pair like
+# (fp8, bf16). A grid without those cannot tell a live entry from a dead one.
+_DTYPE_TAGS = [torch.bfloat16, e4m3_dtype, torch.uint8]
+DTYPES = [(q, kv) for q in _DTYPE_TAGS for kv in _DTYPE_TAGS]
 
 # Params every op must come back with, whatever the arch or the entry that hit.
 # The gluon 2d wrapper indexes LOOP_VARIANT and NUM_BUFFERS directly, so an
@@ -526,3 +525,93 @@ def test_num_segments_never_grows_with_a_shorter_context(arch, backend):
             f"{arch}/{backend} page={block_size}: NUM_SEGMENTS {counts} over "
             f"contexts [512, 2048, 8192, 65536] is not non-decreasing"
         )
+
+
+def _component_is_matchable(part):
+    """True when the resolver can ever produce this component as a candidate.
+
+    ``_axis_of`` only reads the prefix, so a malformed bound like ``Q_LE_1``
+    still names axis Q and passes a schema check -- but ``_candidates`` only
+    ever emits ``Q_LEQ_n``/``Q_GEQ_n``, so the entry is dead. This is the shape
+    check that catches it.
+    """
+    axis = unified_attention_utils._axis_of(part)
+    kind = unified_attention_utils._AXIS_KIND.get(axis)
+    if kind == "bool":
+        return part == axis
+    if kind == "enum":
+        tags = part[len(axis) + 1 :].split("_")
+        return len(tags) == 2 and all(
+            t in {"bf16", "fp8", "nvfp4", "any"} for t in tags
+        )
+    if kind == "num":
+        head, _, bound = part.rpartition("_")
+        return head in (f"{axis}_LEQ", f"{axis}_GEQ") and bound.isdigit()
+    return False
+
+
+@pytest.mark.parametrize("arch,backend", TABLES)
+@pytest.mark.parametrize("op", OPS)
+def test_key_components_are_shaped_so_the_resolver_can_match_them(arch, backend, op):
+    """A component the resolver never emits is a silently dead entry."""
+    table = _table(arch, backend)
+    if not table.get("schema", {}).get(op, []):
+        return
+    for key in table[op]:
+        for part in _components(key):
+            assert _component_is_matchable(part), (
+                f"{arch}/{backend} {op}: {key!r} has component {part!r}, which "
+                f"the resolver can never produce as a candidate"
+            )
+
+
+@pytest.mark.parametrize("arch,backend", TABLES)
+@pytest.mark.parametrize("op", OPS)
+def test_every_entry_is_reachable(arch, backend, op):
+    """Some situation has to land on each entry.
+
+    Shape checks alone miss an entry that is well-formed but shadowed by a
+    more general one, or left behind by an edit. Sweeping the grid and
+    collecting what actually matched catches both, and a typo besides.
+    """
+    table = _table(arch, backend)
+    axes = tuple(table.get("schema", {}).get(op, []))
+    if not axes:
+        return
+    hit = set()
+    for block_size in BLOCK_SIZES:
+        for head_size in HEAD_SIZES:
+            for max_seqlen_q in QUERY_LENS:
+                for q_dtype, kv_dtype in DTYPES:
+                    for sliding_window in (0, 1024):
+                        for max_seqlen_k in (512, 65536):
+                            for shuffled in (False, True):
+                                params = make_params(
+                                    head_size=head_size,
+                                    max_seqlen_q=max_seqlen_q,
+                                    max_seqlen_k=max_seqlen_k,
+                                    sliding_window=sliding_window,
+                                    shuffled_kv_cache=shuffled,
+                                    q_dtype=q_dtype,
+                                    kv_cache_dtype=kv_dtype,
+                                    block_size=block_size,
+                                )
+                                values = unified_attention_utils._axis_values(
+                                    head_size,
+                                    max_seqlen_q,
+                                    max_seqlen_k,
+                                    sliding_window,
+                                    shuffled,
+                                    block_size,
+                                    q_dtype,
+                                    kv_dtype,
+                                )
+                                key, _ = unified_attention_utils._lookup(
+                                    table[op], axes, values
+                                )
+                                hit.add(key)
+    dead = sorted(set(table[op]) - hit)
+    assert not dead, (
+        f"{arch}/{backend} {op}: {dead} never matched any situation -- "
+        f"shadowed, misspelled, or left over from an edit"
+    )
