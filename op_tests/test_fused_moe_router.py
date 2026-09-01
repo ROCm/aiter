@@ -205,7 +205,7 @@ def _compare(ref, got, M, topk, unit_size):
     }
     errs["topk_id_err"] = len(set(rset) ^ set(gset))
     errs["topk_w_err"] = (
-        max((abs(rset[k] - gset[k]) for k in rset & gset.keys()), default=0.0)
+        max((abs(rset[k] - gset[k]) for k in rset.keys() & gset.keys()), default=0.0)
         if rset
         else 0.0
     )
