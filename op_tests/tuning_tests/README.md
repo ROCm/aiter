@@ -48,6 +48,7 @@ If `AITER_CONFIGS` is unavailable (e.g. aiter not installed), the test falls bac
 python3 -m unittest op_tests.tuning_tests.test_csv_validation \
   op_tests.tuning_tests.test_tuner_infra \
   op_tests.tuning_tests.test_mp_tuner_logic \
+  op_tests.tuning_tests.test_arch_resolution \
   op_tests.tuning_tests.test_online_tune -v
 
 # Level 2: pipeline smoke (~10min)
