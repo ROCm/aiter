@@ -88,6 +88,15 @@ def rotate_activation_mxfp6_quant_k(
 
 
 @compile_ops("module_fmha_v4_fwd", develop=True)
+def _quantize_v_mxfp6_fp6_p_hip(
+    out: Tensor,
+    scale: Tensor,
+    input: Tensor,
+) -> None:
+    """Pack V in the contraction order required by an FP6 P operand."""
+
+
+@compile_ops("module_fmha_v4_fwd", develop=True)
 def rotate_activation_mxfp4_quant(
     out: Tensor,
     scale: Tensor,
@@ -161,6 +170,13 @@ class AttentionFormat(IntEnum):
     MXFP6_E3M2 = FP6_E3M2
     MXBF6 = FP6_E3M2
     MXFP4 = FP4_E2M1
+
+
+class AttentionPack(IntEnum):
+    """Stable IDs describing operand layouts within a numeric format."""
+
+    DEFAULT = 0
+    V_FOR_FP6_P = 1
 
 
 class AttentionScaleMode(IntEnum):
@@ -283,6 +299,22 @@ def _validate_format_contract(
         AttentionFormat.MXFP6,
     ):
         raise ValueError("FP8 Q/K requires matching FP8 or MXFP6 V")
+
+
+def _validate_pack_contract(
+    v_format: AttentionFormat,
+    v_pack: AttentionPack,
+) -> None:
+    if v_pack == AttentionPack.DEFAULT:
+        return
+    if v_pack == AttentionPack.V_FOR_FP6_P and v_format in (
+        AttentionFormat.FP6_E2M3,
+        AttentionFormat.FP4_E2M1,
+    ):
+        return
+    raise ValueError(
+        f"unsupported V pack {v_pack.name} for format {v_format.name}"
+    )
 
 
 def scale_modes_for_formats(
@@ -409,13 +441,14 @@ def _fmha_v4_fwd_fake(
     q_format: int,
     k_format: int,
     v_format: int,
+    v_pack: int,
     q_scale_mode: int,
     k_scale_mode: int,
     v_scale_mode: int,
     softmax_scale: float,
 ) -> None:
     del q, k, v, q_descale, k_descale, v_descale
-    del q_format, k_format, v_format
+    del q_format, k_format, v_format, v_pack
     del q_scale_mode, k_scale_mode, v_scale_mode, softmax_scale
     del out
 
@@ -436,6 +469,7 @@ def _fmha_v4_fwd(
     q_format: int,
     k_format: int,
     v_format: int,
+    v_pack: int,
     q_scale_mode: int,
     k_scale_mode: int,
     v_scale_mode: int,
@@ -455,6 +489,7 @@ def _mha_v4_fwd_launch(
     q_format: int,
     k_format: int,
     v_format: int,
+    v_pack: int,
     q_scale_mode: int,
     k_scale_mode: int,
     v_scale_mode: int,
@@ -471,6 +506,7 @@ def _mha_v4_fwd_launch(
         q_format,
         k_format,
         v_format,
+        v_pack,
         q_scale_mode,
         k_scale_mode,
         v_scale_mode,
@@ -490,13 +526,14 @@ def _mha_v4_fwd_launch_fake(
     q_format: int,
     k_format: int,
     v_format: int,
+    v_pack: int,
     q_scale_mode: int,
     k_scale_mode: int,
     v_scale_mode: int,
     softmax_scale: float,
 ) -> None:
     del q, k, v, q_descale, k_descale, v_descale, out
-    del q_format, k_format, v_format
+    del q_format, k_format, v_format, v_pack
     del q_scale_mode, k_scale_mode, v_scale_mode, softmax_scale
 
 
@@ -511,6 +548,7 @@ def _fmha_v4_fwd_sparse_fake(
     q_format: int,
     k_format: int,
     v_format: int,
+    v_pack: int,
     q_scale_mode: int,
     k_scale_mode: int,
     v_scale_mode: int,
@@ -520,7 +558,7 @@ def _fmha_v4_fwd_sparse_fake(
     lut_count: Tensor,
 ) -> None:
     del q, k, v, q_descale, k_descale, v_descale
-    del q_format, k_format, v_format
+    del q_format, k_format, v_format, v_pack
     del q_scale_mode, k_scale_mode, v_scale_mode, softmax_scale
     del kv_block_indices, lut_start, lut_count
     del out
@@ -542,6 +580,7 @@ def _fmha_v4_fwd_sparse(
     q_format: int,
     k_format: int,
     v_format: int,
+    v_pack: int,
     q_scale_mode: int,
     k_scale_mode: int,
     v_scale_mode: int,
@@ -564,6 +603,7 @@ def _mha_v4_fwd_sparse_launch(
     q_format: int,
     k_format: int,
     v_format: int,
+    v_pack: int,
     q_scale_mode: int,
     k_scale_mode: int,
     v_scale_mode: int,
@@ -583,6 +623,7 @@ def _mha_v4_fwd_sparse_launch(
         q_format,
         k_format,
         v_format,
+        v_pack,
         q_scale_mode,
         k_scale_mode,
         v_scale_mode,
@@ -605,6 +646,7 @@ def _mha_v4_fwd_sparse_launch_fake(
     q_format: int,
     k_format: int,
     v_format: int,
+    v_pack: int,
     q_scale_mode: int,
     k_scale_mode: int,
     v_scale_mode: int,
@@ -614,7 +656,7 @@ def _mha_v4_fwd_sparse_launch_fake(
     lut_count: Tensor,
 ) -> None:
     del q, k, v, q_descale, k_descale, v_descale, out
-    del q_format, k_format, v_format
+    del q_format, k_format, v_format, v_pack
     del q_scale_mode, k_scale_mode, v_scale_mode, softmax_scale
     del kv_block_indices, lut_start, lut_count
 
@@ -638,6 +680,7 @@ def mha_v4_packed(
     kv_block_indices: Optional[Tensor] = None,  # noqa: UP045
     lut_start: Optional[Tensor] = None,  # noqa: UP045
     lut_count: Optional[Tensor] = None,  # noqa: UP045
+    v_pack: AttentionPack = AttentionPack.DEFAULT,
 ) -> Tensor:
     """Launch non-causal MHA v4 over pre-quantized BSHD operands.
 
@@ -649,6 +692,7 @@ def mha_v4_packed(
     if return_lse:
         raise NotImplementedError("MHA v4 kernels do not produce LSE yet")
     lut = _packed_lut_triple(kv_block_indices, lut_start, lut_count)
+    _validate_pack_contract(v_format, v_pack)
     expected_scale_modes = scale_modes_for_formats(q_format, k_format, v_format)
     scale_modes = (q_scale_mode, k_scale_mode, v_scale_mode)
     mxfp8_scale_modes = (
@@ -730,6 +774,7 @@ def mha_v4_packed(
         int(q_format),
         int(k_format),
         int(v_format),
+        int(v_pack),
         int(q_scale_mode),
         int(k_scale_mode),
         int(v_scale_mode),
@@ -1084,6 +1129,30 @@ def _quantize_v_mxfp6_fake(input: Tensor) -> tuple[Tensor, Tensor]:
         (heads * head_stride, 96, head_stride, 1),
     )
     return quantized, input.new_empty((batch, heads, tiles * 512), dtype=torch.uint8)
+
+
+@torch.library.custom_op("aiter::mha_v4_quantize_v_mxfp6_fp6_p", mutates_args=())
+def quantize_v_mxfp6_fp6_p(input: Tensor) -> tuple[Tensor, Tensor]:
+    """Pack MXFP6 V in the contraction order required by an FP6 P operand."""
+    batch, sequence, heads, head_dim = _validate_bshd_hd128(
+        input, "FP6-P MXFP6 V quantization"
+    )
+    tiles = (sequence + 127) // 128
+    head_stride = tiles * 12288
+    raw = input.new_empty((batch * heads * head_stride + 256,), dtype=torch.uint8)
+    scale = input.new_empty((batch, heads, tiles * 512), dtype=torch.uint8)
+    _quantize_v_mxfp6_fp6_p_hip(raw, scale, input)
+    quantized = torch.as_strided(
+        raw,
+        (batch, sequence, heads, head_dim),
+        (heads * head_stride, 96, head_stride, 1),
+    )
+    return quantized, scale
+
+
+@quantize_v_mxfp6_fp6_p.register_fake
+def _quantize_v_mxfp6_fp6_p_fake(input: Tensor) -> tuple[Tensor, Tensor]:
+    return _quantize_v_mxfp6_fake(input)
 
 
 def mxfp4_v_view(raw: Tensor, scale: Tensor, sequence: int) -> Tensor:

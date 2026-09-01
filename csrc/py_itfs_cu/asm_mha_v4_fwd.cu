@@ -40,6 +40,14 @@ enum class AttentionFormat : int64_t
 
 constexpr int64_t format_id(AttentionFormat format) { return static_cast<int64_t>(format); }
 
+enum class AttentionPack : int64_t
+{
+    Default  = 0,
+    VForFp6P = 1,
+};
+
+constexpr int64_t pack_id(AttentionPack pack) { return static_cast<int64_t>(pack); }
+
 // Scale granularity is dispatched independently from the operand encoding.
 enum class AttentionScaleMode : int64_t
 {
@@ -192,6 +200,7 @@ const fmha_v4_fwdConfig& find_config(const std::string& arch,
                                      int64_t q_format,
                                      int64_t k_format,
                                      int64_t v_format,
+                                     int64_t v_pack,
                                      int64_t q_scale_mode,
                                      int64_t k_scale_mode,
                                      int64_t v_scale_mode,
@@ -200,8 +209,8 @@ const fmha_v4_fwdConfig& find_config(const std::string& arch,
     for(const auto& entry : cfg_fmha_v4_fwd)
     {
         const auto& cfg = entry.second;
-        if(cfg.arch == arch && cfg.q_format == q_format && cfg.k_format == k_format &&
-           cfg.v_format == v_format && cfg.q_scale_mode == q_scale_mode &&
+          if(cfg.arch == arch && cfg.q_format == q_format && cfg.k_format == k_format &&
+              cfg.v_format == v_format && cfg.v_pack == v_pack && cfg.q_scale_mode == q_scale_mode &&
            cfg.k_scale_mode == k_scale_mode && cfg.v_scale_mode == v_scale_mode &&
            cfg.o_format == format_id(AttentionFormat::Bf16) &&
            cfg.o_scale_mode == scale_mode_id(AttentionScaleMode::None) && cfg.hdim_q == kHeadDim &&
@@ -217,6 +226,8 @@ const fmha_v4_fwdConfig& find_config(const std::string& arch,
                 k_format,
                 ", v_format=",
                 v_format,
+                ", v_pack=",
+                v_pack,
                 ", q_scale_mode=",
                 q_scale_mode,
                 ", k_scale_mode=",
@@ -545,6 +556,7 @@ PackedMhaV4Shapes validate_packed_mha_v4(const at::Tensor& q,
                                          int64_t q_format,
                                          int64_t k_format,
                                          int64_t v_format,
+                                         int64_t v_pack,
                                          int64_t q_scale_mode,
                                          int64_t k_scale_mode,
                                          int64_t v_scale_mode)
@@ -564,6 +576,15 @@ PackedMhaV4Shapes validate_packed_mha_v4(const at::Tensor& q,
     check_format_tensor(q, q_format, "Q");
     check_format_tensor(k, k_format, "K");
     check_format_tensor(v, v_format, "V");
+    TORCH_CHECK(
+        v_pack == pack_id(AttentionPack::Default) ||
+            (v_pack == pack_id(AttentionPack::VForFp6P) &&
+             (v_format == format_id(AttentionFormat::Fp6E2M3) ||
+              v_format == format_id(AttentionFormat::Fp4E2M1))),
+        "unsupported MHA v4 V pack for format: v_pack=",
+        v_pack,
+        ", v_format=",
+        v_format);
     TORCH_CHECK(q.stride(-1) == 1 && k.stride(-1) == 1 && v.stride(-1) == 1 && out.stride(-1) == 1,
                 "Q, K, V, and out must have contiguous last dimensions");
 
@@ -700,6 +721,7 @@ void fmha_v4_fwd(const at::Tensor& q,
                  int64_t q_format,
                  int64_t k_format,
                  int64_t v_format,
+                 int64_t v_pack,
                  int64_t q_scale_mode,
                  int64_t k_scale_mode,
                  int64_t v_scale_mode,
@@ -715,6 +737,7 @@ void fmha_v4_fwd(const at::Tensor& q,
                                                q_format,
                                                k_format,
                                                v_format,
+                                               v_pack,
                                                q_scale_mode,
                                                k_scale_mode,
                                                v_scale_mode);
@@ -724,8 +747,15 @@ void fmha_v4_fwd(const at::Tensor& q,
     const HipDeviceGuard device_guard{q.get_device()};
 
     const auto arch = get_gpu_arch();
-    const auto& cfg = find_config(
-        arch, q_format, k_format, v_format, q_scale_mode, k_scale_mode, v_scale_mode, /*mode=*/0);
+    const auto& cfg = find_config(arch,
+                                  q_format,
+                                  k_format,
+                                  v_format,
+                                  v_pack,
+                                  q_scale_mode,
+                                  k_scale_mode,
+                                  v_scale_mode,
+                                  /*mode=*/0);
 
     FmhaV4Kernarg args{};
     populate_dense_kernarg(args,
@@ -768,6 +798,7 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
                         int64_t q_format,
                         int64_t k_format,
                         int64_t v_format,
+                        int64_t v_pack,
                         int64_t q_scale_mode,
                         int64_t k_scale_mode,
                         int64_t v_scale_mode,
@@ -786,6 +817,7 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
                                                q_format,
                                                k_format,
                                                v_format,
+                                               v_pack,
                                                q_scale_mode,
                                                k_scale_mode,
                                                v_scale_mode);
@@ -796,8 +828,15 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
     const HipDeviceGuard device_guard{q.get_device()};
 
     const auto arch = get_gpu_arch();
-    const auto& cfg = find_config(
-        arch, q_format, k_format, v_format, q_scale_mode, k_scale_mode, v_scale_mode, /*mode=*/1);
+    const auto& cfg = find_config(arch,
+                                  q_format,
+                                  k_format,
+                                  v_format,
+                                  v_pack,
+                                  q_scale_mode,
+                                  k_scale_mode,
+                                  v_scale_mode,
+                                  /*mode=*/1);
     TORCH_CHECK(shapes.seqlen_k % cfg.ts_kv == 0,
                 "sorted-sparse MHA v4 requires key length padded to a multiple of ",
                 cfg.ts_kv);

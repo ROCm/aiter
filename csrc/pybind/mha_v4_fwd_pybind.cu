@@ -27,6 +27,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("q_format"),
           py::arg("k_format"),
           py::arg("v_format"),
+          py::arg("v_pack"),
           py::arg("q_scale_mode"),
           py::arg("k_scale_mode"),
           py::arg("v_scale_mode"),
@@ -43,6 +44,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("q_format"),
           py::arg("k_format"),
           py::arg("v_format"),
+          py::arg("v_pack"),
           py::arg("q_scale_mode"),
           py::arg("k_scale_mode"),
           py::arg("v_scale_mode"),
@@ -68,6 +70,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("multiplier"));
     m.def("rotate_activation_mxfp6_quant_k",
           &aiter::torch_itfs::rotate_activation_mxfp6_quant_k,
+          py::arg("out"),
+          py::arg("scale"),
+          py::arg("input"));
+      m.def("_quantize_v_mxfp6_fp6_p_hip",
+          &aiter::torch_itfs::quantize_v_mxfp6_fp6_p,
           py::arg("out"),
           py::arg("scale"),
           py::arg("input"));

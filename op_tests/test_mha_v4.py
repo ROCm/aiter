@@ -17,6 +17,7 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha_v4 import (
     MHA_V4_LOG2E,
     AttentionFormat,
+    AttentionPack,
     AttentionScaleMode,
     mha_v4,
     mha_v4_kv_tile,
@@ -38,6 +39,7 @@ from aiter.ops.mha_v4 import (
     quantize_mxfp8_q,
     quantize_v_mxfp4,
     quantize_v_mxfp6,
+    quantize_v_mxfp6_fp6_p,
     rotate_activation_hd128,
     rotate_activation_mxfp6_quant,
     scale_modes_for_formats,
@@ -172,6 +174,8 @@ def test_attention_format_ids_are_stable():
     assert int(AttentionFormat.UINT8) == 11
     assert int(AttentionFormat.INT4) == 12
     assert int(AttentionFormat.UINT4) == 13
+    assert int(AttentionPack.DEFAULT) == 0
+    assert int(AttentionPack.V_FOR_FP6_P) == 1
 
 
 def test_mha_v4_q_multiplier_recipe():
@@ -245,6 +249,37 @@ def test_mha_v4_mxfp6_v_layout_contract():
     assert packed.stride() == (2 * 2 * 12288, 96, 2 * 12288, 1)
     assert scale.shape == (1, 2, 2 * 512)
     assert scale.dtype == torch.uint8
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP6 V packing")
+@pytest.mark.parametrize("sequence", [256, 257])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mha_v4_mxfp6_fp6_p_layout_matches_permuted_canonical(sequence, dtype):
+    torch.manual_seed(41)
+    value = torch.randn((1, sequence, 2, 128), device="cuda", dtype=dtype)
+
+    canonical, canonical_scale = quantize_v_mxfp6(value)
+    packed, scale = quantize_v_mxfp6_fp6_p(value)
+    token = torch.arange(value.shape[1], device=value.device)
+    within_block = token % 64
+    paired = (
+        (within_block & ~0x24)
+        | ((within_block & 0x04) << 3)
+        | ((within_block & 0x20) >> 3)
+    )
+    source_token = torch.minimum(token - within_block + paired, token.new_tensor(sequence - 1))
+    permuted = value[:, source_token].contiguous()
+    expected, expected_scale = quantize_v_mxfp6(permuted)
+    tiles = (sequence + 127) // 128
+    data_size = value.shape[0] * value.shape[2] * tiles * 12288
+
+    assert torch.equal(
+        packed.as_strided((data_size,), (1,)),
+        expected.as_strided((data_size,), (1,)),
+    )
+    assert torch.equal(scale.reshape(-1), expected_scale.reshape(-1))
+    assert not torch.equal(packed, canonical)
+    assert not torch.equal(scale, canonical_scale)
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP6 V packing")
