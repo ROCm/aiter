@@ -931,8 +931,12 @@ def make_combine_kernel(
         rsrc_out = create_buffer_resource_from_addr(addr_out_shmem_tok)
 
         n_elems = n_i32
-        # Clamp denom to 1 when cur_rank_num_token == 0 (loop won't execute anyway).
-        safe_token_count = (cur_rank_num_token == 0).select(1, cur_rank_num_token)
+        # A dynamic ``range(..., 0, ...)`` is not a safe empty-loop contract in
+        # the current FlyDSL lowering.  Keep both the divisor and loop bound
+        # positive for an empty rank, then start at the bound so Stage 3 still
+        # executes zero iterations.
+        zero_tokens = cur_rank_num_token == 0
+        safe_token_count = zero_tokens.select(fx.Int32(1), cur_rank_num_token)
         warps_per_tok = (global_warp_num + safe_token_count - 1) // safe_token_count
         if const_expr(blockwise_fp8_transport):
             # Align warp partitions to the 32-value blockwise FP8 scale.
@@ -943,9 +947,11 @@ def make_combine_kernel(
             hdim_per_warp = ((scale_blocks + warps_per_tok - 1) // warps_per_tok) * 8
         else:
             hdim_per_warp = (n_elems + warps_per_tok - 1) // warps_per_tok
-        s3_total_work = cur_rank_num_token * warps_per_tok
+        raw_s3_total_work = cur_rank_num_token * warps_per_tok
+        s3_total_work = zero_tokens.select(fx.Int32(1), raw_s3_total_work)
+        s3_start = zero_tokens.select(s3_total_work, global_warp_id)
 
-        for s3_work_idx in range(global_warp_id, s3_total_work, global_warp_num):
+        for s3_work_idx in range(s3_start, s3_total_work, global_warp_num):
             tok_id = s3_work_idx // warps_per_tok
             part_id = s3_work_idx % warps_per_tok
             hdim_off = part_id * hdim_per_warp

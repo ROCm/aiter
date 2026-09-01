@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import os
 from dataclasses import replace
 
@@ -219,6 +220,7 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
     tokens = x.shape[0]
     output = moe(x, weights, ids)[:tokens]
     _barrier()
+    eager_output = output.clone()
     rel_l2 = -1.0
     if tokens <= args.accuracy_max_bs:
         reference = _reference(
@@ -258,6 +260,13 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
     _barrier()
     stage2_ms = _time_graph(stage2, device, args.iters)
     e2e_ms = _time_graph(end_to_end, device, args.iters)
+    graph_output = state["output"][:tokens]
+    graph_replay_exact = torch.tensor(
+        int(torch.equal(graph_output, eager_output)), dtype=torch.int32, device=device
+    )
+    dist.all_reduce(graph_replay_exact, op=dist.ReduceOp.MIN)
+    if not int(graph_replay_exact.item()):
+        raise AssertionError(f"bs={tokens} CUDA Graph replay changed the output")
     sbm = int(moe._s1_active_tile_m)
     gemm2_bm = int(moe._g2_active_block_m)
     p2p_quant = moe._active_config.p2p_quant
@@ -265,6 +274,7 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
         print(
             f"[MEGA-V2] bs={tokens} relL2={rel_l2:.6f} "
             f"path={'fixed' if moe._s1_fixed_slot else 'compact'} "
+            f"graph_replay=PASS "
             f"p2p_quant={p2p_quant} SBM={sbm} G2_BM={gemm2_bm} "
             f"stage1={stage1_ms[0]:.4f}/{stage1_ms[1]:.4f}ms "
             f"stage2={stage2_ms[0]:.4f}/{stage2_ms[1]:.4f}ms "
@@ -336,6 +346,12 @@ def _install_config_policy(moe, config_tokens, unify_fields):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--network", choices=NETWORKS, default="v4_pro")
+    parser.add_argument(
+        "--experts",
+        type=int,
+        choices=(384, 416, 448),
+        help="override the v4_pro physical-expert profile (r0/r32/r64 EPLB)",
+    )
     parser.add_argument("--bs-list", default="128")
     parser.add_argument("--iters", type=int, default=30)
     parser.add_argument("--seed", type=int, default=123)
@@ -354,7 +370,9 @@ def main():
 
     rank, world, device = _setup_dist()
     try:
-        network = NETWORKS[args.network]
+        network = dict(NETWORKS[args.network])
+        if args.experts is not None:
+            network["experts"] = args.experts
         if network["experts"] % world:
             raise ValueError(
                 f"experts={network['experts']} must be divisible by world={world}"
@@ -395,22 +413,25 @@ def main():
             device,
         )
         ref_weights = w1_q, w1_ref_scale, w2_q, w2_ref_scale
+        shared_moe = None
         for batch_size in batch_sizes:
             local_batch_size = rank_tokens[rank] if rank_tokens else batch_size
             max_tok_per_rank = args.max_tok_per_rank or max(
                 16, _next_power_of_two(batch_size)
             )
-            moe = MegaMoEV2(
-                rank=rank,
-                world_size=world,
-                quant="a8w4",
-                w1=w1,
-                w1_scale=w1_scale,
-                w2=w2,
-                w2_scale=w2_scale,
-                max_tok_per_rank=max_tok_per_rank,
-                **network,
-            )
+            if shared_moe is None or args.max_tok_per_rank is None:
+                shared_moe = MegaMoEV2(
+                    rank=rank,
+                    world_size=world,
+                    quant="a8w4",
+                    w1=w1,
+                    w1_scale=w1_scale,
+                    w2=w2,
+                    w2_scale=w2_scale,
+                    max_tok_per_rank=max_tok_per_rank,
+                    **network,
+                )
+            moe = shared_moe
             _install_config_policy(moe, args.config_tokens, args.unify_fields)
             if rank_tokens:
                 selected = moe._select_config(local_batch_size)
@@ -447,6 +468,15 @@ def main():
                     world,
                     device,
                 )
+            if args.max_tok_per_rank is None:
+                shared_moe = None
+                del moe
+            # Each case captures three CUDA Graphs.  Their Python reference
+            # cycles otherwise survive into later cases and can retain graph
+            # memory, distorting a multi-shape scan even when the MegaMoE
+            # operator itself is intentionally shared for MTPR=MAX.
+            gc.collect()
+            torch.cuda.empty_cache()
     finally:
         _cleanup()
 

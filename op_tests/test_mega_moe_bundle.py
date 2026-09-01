@@ -9,11 +9,16 @@ os.environ.setdefault("AITER_AOT_IMPORT", "1")
 
 from aiter.aot.flydsl.mega_moe import default_jobs
 from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
+    INDEXED_PAYLOAD_MIN_MTPR,
     TOKEN_BUCKETS,
     Stage2BundleKey,
     Stage2Config,
     build_mega_moe_bundle_plan,
     select_mega_moe_config,
+)
+from aiter.ops.flydsl.kernels.mega_moe.mega_moe_stage1 import (
+    STAGE1_EPOCH_SLOT_COUNT,
+    stage1_epoch_slot,
 )
 
 
@@ -21,7 +26,7 @@ def test_mtpr8192_bundle_deduplicates_expected_variants():
     plan = build_mega_moe_bundle_plan(8192)
 
     assert len(plan.entries) == 13
-    assert len(plan.stage1_variants) == 8
+    assert len(plan.stage1_variants) == 11
     assert len(plan.stage2_variants) == 6
     assert [entry.pair_id for entry in plan.entries] == list(range(13))
 
@@ -84,6 +89,40 @@ def test_default_prefill_keeps_payload_deduplication_disabled():
     )
 
     assert all(not getattr(config, "deduplicate_payload", False) for config in configs)
+
+
+def test_indexed_payload_is_a_profile_layout_not_a_tuning_variant():
+    assert INDEXED_PAYLOAD_MIN_MTPR == 8192
+    for mtpr in (8192, 16384, 32768):
+        assert all(
+            not config.deduplicate_payload
+            for config in build_mega_moe_bundle_plan(mtpr).stage1_variants
+        )
+
+
+@pytest.mark.parametrize("mtpr", [8192, 16384, 32768])
+@pytest.mark.parametrize("experts_per_rank", [48, 52, 56])
+def test_dynamic_stage1_launch_populations_use_distinct_generation_counters(
+    mtpr, experts_per_rank
+):
+    plan = build_mega_moe_bundle_plan(mtpr, experts_per_rank=experts_per_rank)
+    slots = {
+        stage1_epoch_slot(config.grid_mult, config.num_dispatch_cu)
+        for config in plan.stage1_variants
+    }
+    identities = {
+        (config.grid_mult, config.num_dispatch_cu)
+        for config in plan.stage1_variants
+    }
+
+    assert len(slots) == len(identities)
+    assert all(0 <= slot < STAGE1_EPOCH_SLOT_COUNT for slot in slots)
+
+
+def test_zero_tokens_selects_the_smallest_runtime_config():
+    plan = build_mega_moe_bundle_plan(32768)
+
+    assert select_mega_moe_config(0, 32768) == plan.entries[0].config
 
 
 @pytest.mark.parametrize("mtpr", [8192, 16384, 32768])
