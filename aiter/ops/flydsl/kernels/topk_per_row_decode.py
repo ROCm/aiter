@@ -394,9 +394,7 @@ def build_topk_per_row_decode_module(
                 warp_val = fx.Int32(0)
                 if lane < fx.Int32(reduce_num_waves):
                     warp_val = scan[lane]
-                warp_inclusive = _warp_inclusive_prefix_i32(
-                    warp_val, lane, wave_size
-                )
+                warp_inclusive = _warp_inclusive_prefix_i32(warp_val, lane, wave_size)
                 if lane < fx.Int32(reduce_num_waves):
                     scan[lane] = warp_inclusive - warp_val
                 if lane == fx.Int32(reduce_num_waves - 1):
@@ -589,8 +587,7 @@ def build_topk_per_row_decode_module(
 
         if state[row, _STATE_DIRECT] == 0:
             for chunk_group in range_constexpr(
-                (chunks_per_row + fused_prefix_num_waves - 1)
-                // fused_prefix_num_waves
+                (chunks_per_row + fused_prefix_num_waves - 1) // fused_prefix_num_waves
             ):
                 chunk = warp + fx.Int32(chunk_group * fused_prefix_num_waves)
                 count = fx.Int32(0)

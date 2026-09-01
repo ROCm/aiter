@@ -152,9 +152,7 @@ def build_topk_per_row_decode_one_workgroup_module(
             count0 = histogram[first_bin]
             count1 = histogram[first_bin + one]
             local_total = count0 + count1
-            wave_inclusive = _warp_inclusive_prefix_i32(
-                local_total, lane, wave_size
-            )
+            wave_inclusive = _warp_inclusive_prefix_i32(local_total, lane, wave_size)
             wave_exclusive = wave_inclusive - local_total
 
             if lane == wave_size - 1:
@@ -166,8 +164,7 @@ def build_topk_per_row_decode_one_workgroup_module(
                 safe_lane = active.select(lane, zero)
                 wave_total = active.select(scan[safe_lane], zero)
                 wave_prefix = (
-                    _warp_inclusive_prefix_i32(wave_total, lane, wave_size)
-                    - wave_total
+                    _warp_inclusive_prefix_i32(wave_total, lane, wave_size) - wave_total
                 )
                 if active:
                     scan[lane + num_waves] = wave_prefix
