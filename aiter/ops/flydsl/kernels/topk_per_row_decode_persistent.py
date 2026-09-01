@@ -9,14 +9,14 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
 
+from .kernels_common import atomic_add_i32
+from .tensor_shim import row_rsrc
 from .topk_per_row_decode import (
     _f32_to_ord,
     _load_f32x4,
     _row_length,
     _warp_inclusive_prefix_i32,
 )
-from .kernels_common import atomic_add_i32
-from .tensor_shim import row_rsrc
 
 _BLOCK_THREADS = 1024
 _VEC = 4

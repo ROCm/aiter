@@ -7,6 +7,7 @@ from functools import lru_cache
 
 import torch
 
+from .kernels.kernels_common import get_warp_size
 from .kernels.tensor_shim import _run_compiled
 from .kernels.topk_per_row_decode import (
     build_topk_per_row_decode_module,
@@ -58,11 +59,6 @@ def clear_topk_per_row_decode_workspace_cache() -> None:
     _get_cached_workspace.cache_clear()
 
 
-@lru_cache(maxsize=8)
-def _get_wave_size(device: torch.device) -> int:
-    return torch.cuda.get_device_properties(device).warp_size
-
-
 @lru_cache(maxsize=128)
 def _validate_topk_signature(
     logits_shape: torch.Size,
@@ -97,8 +93,6 @@ def _validate_topk_signature(
         raise ValueError("num_rows must equal logits.shape[0]")
     if (stride0, stride1) != logits_stride:
         raise ValueError("stride0 and stride1 must match logits strides")
-    if _get_wave_size(logits_device) not in (32, 64):
-        raise ValueError("the FlyDSL decode TopK kernel requires a wave32/64 GPU")
 
     if len(seq_lens_shape) != 1 or seq_lens_dtype != torch.int32:
         raise ValueError("seq_lens must be a 1D int32 tensor")
@@ -281,7 +275,8 @@ def flydsl_top_k_per_row_decode(
     )
 
     rows, width = logits.shape
-    wave_size = _get_wave_size(logits.device)
+    arch = torch.cuda.get_device_properties(logits.device).gcnArchName
+    wave_size = get_warp_size(arch)
     stream = torch.cuda.current_stream(logits.device)
     if width <= _ONE_WORKGROUP_MAX_ROW_WIDTH:
         launcher = build_topk_per_row_decode_one_workgroup_module(
