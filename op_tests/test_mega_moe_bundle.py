@@ -15,6 +15,7 @@ from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
     Stage2Config,
     build_mega_moe_bundle_plan,
     select_mega_moe_config,
+    stage1_bundle_identity,
 )
 
 
@@ -89,7 +90,9 @@ def test_bundle_selection_matches_production_config_for_every_token():
     for tokens in range(1, 8193):
         entry = plan.entry_for_tokens(tokens)
         assert entry.config == select_mega_moe_config(tokens, 8192)
-        assert plan.stage1_variants[entry.stage1_variant_id] == entry.config.stage1
+        assert stage1_bundle_identity(
+            plan.stage1_variants[entry.stage1_variant_id]
+        ) == stage1_bundle_identity(entry.config.stage1)
         stage2_key = plan.stage2_variants[entry.stage2_variant_id]
         assert stage2_key.config == entry.config.stage2
         assert stage2_key.sbm == entry.config.stage1.sort_block_m
@@ -138,7 +141,9 @@ def test_every_deployment_bucket_maps_to_its_exact_production_pair(
             bucket, mtpr, experts_per_rank=experts_per_rank
         )
         assert entry.config == expected
-        assert plan.stage1_variants[entry.stage1_variant_id] == expected.stage1
+        assert stage1_bundle_identity(
+            plan.stage1_variants[entry.stage1_variant_id]
+        ) == stage1_bundle_identity(expected.stage1)
         assert plan.stage2_variants[entry.stage2_variant_id] == Stage2BundleKey(
             expected.stage2,
             expected.stage1.sort_block_m,
@@ -154,6 +159,19 @@ def test_large_mtpr_profile_covers_every_bucket(mtpr, entry_count):
     plan = build_mega_moe_bundle_plan(mtpr)
     assert len(plan.entries) == entry_count
     assert plan.entries[-1].token_bucket == mtpr
+
+
+@pytest.mark.parametrize("mtpr", [8192, 16384, 32768])
+def test_stage1_bundle_deduplicates_prepare_only_variants(mtpr):
+    plan = build_mega_moe_bundle_plan(mtpr)
+    identities = tuple(stage1_bundle_identity(v) for v in plan.stage1_variants)
+
+    assert len(identities) == len(set(identities))
+    for entry in plan.entries:
+        variant = plan.stage1_variants[entry.stage1_variant_id]
+        assert stage1_bundle_identity(variant) == stage1_bundle_identity(
+            entry.config.stage1
+        )
 
 
 def test_stage2_bundle_identity_includes_stage1_sbm():

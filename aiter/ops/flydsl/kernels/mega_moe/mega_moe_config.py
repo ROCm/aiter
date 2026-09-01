@@ -3,7 +3,7 @@
 """Static MegaMoEV2 configuration rules for MI355X."""
 
 from bisect import bisect_left
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cache
 
 TOKEN_BUCKETS = (
@@ -50,6 +50,11 @@ class Stage1Config:
     payload_tile_ready: bool = False
     prepare_cu: int = 32
     prepare_quant_cu: int = 64
+
+
+def stage1_bundle_identity(config: Stage1Config) -> Stage1Config:
+    """Return the Stage1 kernel identity without prepare-only launch knobs."""
+    return replace(config, prepare_cu=0, prepare_quant_cu=0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -425,7 +430,8 @@ def build_mega_moe_bundle_plan(
             model_dim=model_dim,
             inter_dim=inter_dim,
         )
-        stage1_id = stage1_ids.setdefault(config.stage1, len(stage1_variants))
+        stage1_key = stage1_bundle_identity(config.stage1)
+        stage1_id = stage1_ids.setdefault(stage1_key, len(stage1_variants))
         if stage1_id == len(stage1_variants):
             stage1_variants.append(config.stage1)
         stage2_key = Stage2BundleKey(
