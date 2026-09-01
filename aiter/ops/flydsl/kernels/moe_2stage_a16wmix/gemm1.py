@@ -441,10 +441,7 @@ def compile_gemm1_a16w4_port(
     assert (
         TILE_N // (4 // k_wave)
     ) >= 16, f"TILE_N//(4//k_wave) must be >= 16 (num_acc_n>=1), got TILE_N={TILE_N}, k_wave={k_wave}"
-    # The per-wave column count must also be a WHOLE number of 16-wide MFMA groups.
-    # Otherwise num_acc_n truncates and the remainder columns of every wave are never
-    # computed -- a silent wrong answer, not a slowdown. TILE_N=96/k_wave=1 gives 24
-    # cols/wave, num_acc_n=1, so 8 of every 24 output columns stay zero.
+    # Not a multiple of 16 -> num_acc_n truncates and drops columns (TILE_N=96: 8 of 24).
     assert (TILE_N // (4 // k_wave)) % 16 == 0, (
         f"TILE_N//(4//k_wave) must be a multiple of 16 (else num_acc_n truncates and "
         f"drops columns), got TILE_N={TILE_N}, k_wave={k_wave}"

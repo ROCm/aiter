@@ -192,9 +192,9 @@ def get_flydsl_stage1_kernels(
     kernels = {}
     is_fp4_a = a_dtype == "fp4"
     is_fp4_b = b_dtype == "fp4"
-    # a16w4 (bf16 A x MXFP4 W) gemm1 is fully CSV/registry-driven: register the
-    # extra tile_n=192, tile_k=128 and xcd_swizzle=1 variants its tuned kernelNames
-    # name (t32x{64,128,192}x128 / _xcd1), which the other dtypes don't use.
+    # a16w4 (bf16 A x MXFP4 W) gemm1 is fully CSV/registry-driven: register the extra
+    # tile_n=192/256, tile_k=128 and xcd_swizzle=1 variants its tuned kernelNames name
+    # (t32x{64,128,192,256}x128 / _xcd1), which the other dtypes don't use.
     is_a16w4 = a_dtype == "bf16" and is_fp4_b
 
     tile_ns = [32, 64, 128] if is_fp4_b else [128]
@@ -219,14 +219,7 @@ def get_flydsl_stage1_kernels(
         # m_repeat<=2 and take tile_n as given, so the narrow N-tiles the tiny-batch
         # decode configs use (t*x32 / t*x64) are legal at 16 exactly as at 32.
         if tm == 32 or (tm == 16 and is_a16w4):
-            # tile_n=192/256 are a16w4-only. Each is the largest N-tile that divides
-            # one of the two production inter_dims exactly (192 | 384, 256 | 512),
-            # which cuts NUM_N_BLOCKS and with it the A-gather traffic and the CTA
-            # count. Both are bitwise-identical to 128, since tile_n does not change
-            # the K-reduction order. They are legal only on the a16w port, which
-            # takes tile_n as given -- the other fp4 dtypes route through
-            # resolve_flydsl_stage1_tile_n, which would force a non-256-aligned
-            # inter_dim back to 128 and make the name a lie.
+            # 192|384, 256|512 exactly; a16w4-only (that port takes tile_n as given).
             tile_ns = [32, 64, 128, 192, 256] if is_a16w4 else [32, 64, 128]
         else:
             tile_ns = [64, 128] if is_fp4_a else [128, 256]
@@ -544,13 +537,11 @@ def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
         for tn in tile_ns:
             for tk in tile_ks:
                 # The kernel splits the 4 waves into (4/kw) N-waves x kw K-waves, so
-                # each N-wave covers tn/(4/kw) cols, which must be a WHOLE number of
-                # 16-wide MFMA groups: num_acc_n = (tn/(4/kw))//16 truncates, and the
-                # remainder columns of every wave are then silently never computed
-                # (kw=1 therefore requires tn to be a multiple of 64). kw > 1
-                # additionally needs 4*tn <= tk so the K-slice fits the tile. b_nt=0
-                # (L2-cached W loads) is registered alongside the default nt/streaming
-                # b_nt=2: large-M weight reuse wants cached, decode wants streamed.
+                # each N-wave covers tn/(4/kw) cols and needs a multiple of 16 for the
+                # 16x16 MMA (kw=1 therefore requires tn >= 64); kw > 1 additionally
+                # needs 4*tn <= tk so the K-slice fits the tile. b_nt=0 (L2-cached W
+                # loads) is registered alongside the default nt/streaming b_nt=2:
+                # large-M weight reuse wants cached, decode wants streamed.
                 for kw in (1, 2, 4):
                     num_n_waves = 4 // kw
                     if tn % num_n_waves or (tn // num_n_waves) % 16:
@@ -1540,15 +1531,7 @@ def _flydsl_moe_stage1_impl(
     # w_dtypes consume the standard (GGUU) N-major preshuffle; a16wi4 W1 is the
     # OLD-kernel int4 prep (pack_int8_to_packed_int4(shuffle_weight(w,(16,16)))) +
     # (E,G//2,N,2) bf16 scale.
-    #
-    # waves_per_eu: wpe=1 must map to None, not to 1. A name with no _w suffix parses
-    # to wpe=1, and rocdl.waves_per_eu=1 is a real (occupancy-capped) request, not the
-    # absence of one -- forwarding it verbatim would silently recompile every
-    # unsuffixed config into a different, worse kernel. Only _w2/_w3/_w4 request the
-    # attribute. This was previously hardcoded to None, which made the whole axis
-    # inert: compile_gemm1_a16w4_port is cached on its arguments, so all four _w
-    # variants collapsed onto one binary with no attribute emitted, and the tuner
-    # measured the same kernel four times.
+    # wpe=1 (a no-_w name) must map to None: waves_per_eu=1 is a real occupancy cap.
     _g1_waves_per_eu = (
         waves_per_eu if (waves_per_eu is not None and int(waves_per_eu) > 1) else None
     )
