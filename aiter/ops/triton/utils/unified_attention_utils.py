@@ -1,42 +1,31 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Unified-attention config loading.
+"""Loads tuning configs for unified attention.
 
-Each section is a flat table of complete configs, keyed by the case it covers::
+Each op is a flat table of configs, keyed by the case it covers. A key lists
+only the axes that matter, joined by '.':
 
     {
-      "schema": {"attn_2d": ["D", "Q", "SW", "DT"], "kv_split": ["DT", "BS"]},
+      "schema": {"attn_2d": ["D", "Q", "SW", "DT"]},
 
       "attn_2d": {
-        "D_LEQ_128.Q_LEQ_1.SW": {...},   # small head, decode, sliding window
-        "D_LEQ_128.Q_LEQ_1":    {...},   # small head, decode
-        "D_GEQ_512":            {...},   # large head
+        "D_LEQ_128.Q_LEQ_1.SW": {...},   # head_size <= 128, decode, sliding window
+        "D_LEQ_128.Q_LEQ_1":    {...},   # head_size <= 128, decode
+        "D_GEQ_512":            {...},   # head_size >= 512, any query length
+        "DT_fp8_fp8":           {...},   # fp8 query and KV cache
         "any":                  {...}
       },
 
       "reduce": {"num_warps": 2, "num_stages": 1, "waves_per_eu": 2}
     }
 
-A key names only the axes that matter; the rest are left out. A section with no
-axes is a bare config, like ``reduce`` above. ``schema`` lists the axes each
-section uses -- bounds are not declared, the keys state them.
+Lookup walks the axes in the order "schema" lists them and takes the first key
+that exists: LEQ bounds ascending, then GEQ descending, then "any". So the
+leftmost axis wins -- D before Q is what makes head_size outrank max_seqlen_q.
+Dtypes fall back too: DT_fp8_fp8, then DT_fp8_any, DT_any_fp8, then "any".
 
-Key components, by axis kind:
-
-===== ================= =========================================
-kind  example           matches
-===== ================= =========================================
-num   ``D_LEQ_128``     head_size <= 128 (also ``D_GEQ_512``)
-bool  ``SW``            sliding_window > 0
-enum  ``DT_fp8_fp8``    (q, kv) dtypes, falling back through
-                        ``DT_fp8_any`` and ``DT_any_fp8``
-===== ================= =========================================
-
-Lookup tries each axis's candidates in schema order -- LEQ ascending, GEQ
-descending, then "any" -- and takes the first key that exists. The leftmost
-axis is therefore the most significant, which is how head_size outranks
-max_seqlen_q.
+A section with no axes, like reduce above, is just a config.
 """
 
 import copy
@@ -149,8 +138,7 @@ def _lookup(table: dict, axes: tuple, values: dict) -> tuple:
 
 
 def compute_tile_params(config: dict, block_size: int) -> dict:
-    """Derive TILE_SIZE from the tuned bounds and the runtime page size.
-    """
+    """Derive TILE_SIZE from the tuned bounds and the runtime page size."""
     hi = config.pop("TILE_SIZE_MAX", None)
     lo = config.pop("TILE_SIZE_MIN", 1)
     if hi is not None:
