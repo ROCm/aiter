@@ -1,3 +1,4 @@
+import functools
 import math
 from collections.abc import Callable
 
@@ -9,9 +10,6 @@ from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
 )
 from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale_preshuffle as triton_gemm_a8w8_blockscale_preshuffle,
-)
-from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
-    gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
 )
 from aiter.test_common import checkAllclose
 from op_tests.op_benchmarks.triton.utils.argparse import (
@@ -156,7 +154,7 @@ def run_benchmark(args, defaults):
         args.shape and args.M
     ), "User can specify --shape or --model MODEL -M VAL exclusively"
     if args.gluon:
-        impl = gluon_gemm_a8w8_blockscale
+        impl = functools.partial(triton_gemm_a8w8_blockscale, backend="gluon")
     elif args.preshuffle:
         impl = triton_gemm_a8w8_blockscale_preshuffle
     else:

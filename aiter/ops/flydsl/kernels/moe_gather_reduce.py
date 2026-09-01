@@ -43,12 +43,10 @@ nothing and need no branch; EP routes that own no grouped row instead carry
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, ptrtoint, range_constexpr
+from flydsl.expr import ptrtoint, range_constexpr
 from flydsl.expr.typing import Int32, T
 
-from aiter.ops.flydsl.kernels import buffer_ops, vector
+from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.kernels_common import format_kernel_name
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
@@ -115,8 +113,7 @@ def build_moe_gather_reduce_module(
     # Smaller per-thread groups increase column-grid parallelism for tiny token
     # batches (e.g. token=1 decode) and reduce per-CTA split_k/topk work.
     VEC = int(vec_dwords)
-    out_dwords = model_dim // 2  # dwords per output row
-    _row_dwords = model_dim // 2  # dwords per grouped_out_flat row (same)
+    out_dwords = model_dim // 2  # dwords per output row (also the source row width)
     DWORDS_PER_ITER = BLOCK_THREADS * VEC  # dwords advanced per loop iter
     n_iters = (out_dwords + DWORDS_PER_ITER - 1) // DWORDS_PER_ITER
 
@@ -139,7 +136,6 @@ def build_moe_gather_reduce_module(
         tid = fx.thread_idx.x
 
         i32 = T.i32
-        vec_i32_ty = T.vec(VEC, i32)
         # Route-weight native dtype. "f32" lets the host pass raw fp32 route
         # weights straight through (no pre-cast); bf16/f16 get extended below.
         # (Ternary, not multi-line if: the flydsl tracer does not capture vars
@@ -151,9 +147,8 @@ def build_moe_gather_reduce_module(
             else (fx.BFloat16 if w_dtype == "bf16" else fx.Float16)
         )
 
-        # Uint32 (not Int32): every index here is a non-negative count, and the
-        # unsigned type makes `<` / `<=` lower to ult/ule like the cmpi calls it
-        # replaces.
+        # Uint32 (not Int32): every index here is a non-negative count, so `<`
+        # and `<=` lower to ult/ule.
         out_dwords_i32 = fx.Uint32(out_dwords)
         topk_i32 = fx.Uint32(topk)
         vec_i32 = fx.Uint32(VEC)
@@ -181,8 +176,8 @@ def build_moe_gather_reduce_module(
             w_rsrc = ptr_rsrc(gather_w)
             out_rsrc = ptr_rsrc(out)
             in_base_i64 = fx.Uint64(ptrtoint(grouped_out_flat))
-            # Uint64 widening of a Uint32 is a zero-extend, matching the
-            # arith.extui these row/stride byte offsets used to go through.
+            # Uint64 widening of a Uint32 is a zero-extend, which is what these
+            # row/stride byte offsets want.
             slice_stride_by_i64 = fx.Uint64(slice_stride_dw_i32) * 4
 
             row_bytes = fx.Int32(model_dim * 2)
@@ -242,13 +237,7 @@ def build_moe_gather_reduce_module(
                                 dtype=i32,
                             )
                             for lane in range_constexpr(VEC):
-                                raw_dw = fx.Uint32(
-                                    vector.extract(
-                                        raw_vec,
-                                        static_position=[lane],
-                                        dynamic_position=[],
-                                    )
-                                )
+                                raw_dw = fx.Uint32(fx.Vector(raw_vec)[lane])
                                 lo_f32, hi_f32 = _unpack_pair_to_f32(raw_dw, out_dtype)
                                 red[2 * lane] = red[2 * lane] + lo_f32
                                 red[2 * lane + 1] = red[2 * lane + 1] + hi_f32
@@ -262,7 +251,7 @@ def build_moe_gather_reduce_module(
                         _pack_pair_from_f32(acc[2 * lane], acc[2 * lane + 1], out_dtype)
                         for lane in range(VEC)
                     ]
-                    out_vec = vector.from_elements(vec_i32_ty, packed)
+                    out_vec = fx.Vector.from_elements(packed, fx.Uint32)
                     buffer_ops.buffer_store(
                         out_vec, out_rsrc, out_row_dw_base + dw_base
                     )
@@ -310,11 +299,6 @@ def build_moe_gather_reduce_module(
         num_valid_tokens: fx.Pointer,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            pass
-
-        idx_tokens = arith.index_cast(T.index, num_tokens)
         launcher = moe_gather_reduce_kernel(
             grouped_out_flat,
             topids_to_rows,
@@ -325,7 +309,7 @@ def build_moe_gather_reduce_module(
             num_valid_tokens,
         )
         launcher.launch(
-            grid=(idx_tokens, n_iters, 1),
+            grid=(fx.Int64(num_tokens), n_iters, 1),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
         )
