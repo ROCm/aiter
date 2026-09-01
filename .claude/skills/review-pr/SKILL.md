@@ -279,7 +279,7 @@ severities = {
     for finding in findings
 }
 complete = (
-    selection["runner"] == "pytest"
+    selection["runner"] in {"pytest", "script"}
     and bool(coverage)
     and bool(coverage_basis)
     and report["stages"]["merge_sim"]["status"] == "pass"
