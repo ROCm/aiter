@@ -489,7 +489,6 @@ def _fused_flatten_fp8_group_quant_kernel(
 _fused_reduce_act_mul_fp8_group_quant_repr = make_kernel_repr(
     "_fused_reduce_act_mul_fp8_group_quant",
     [
-        "ACTIVATION",
         "BLOCK_SIZE_M2",
         "BLOCK_SIZE_N1",
         "BLOCK_SIZE_N2",
