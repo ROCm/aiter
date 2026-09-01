@@ -70,9 +70,31 @@ AUX_SORT_THREESTAGE = "threestage"
 AUX_SORT_OPUS = "opus"
 
 
-def _aux_uses_opus(output_aux, block_size):
-    """Use Opus only when it replaces the three-stage auxiliary sort."""
-    return output_aux == AUX_SORT_OPUS and block_size != 16
+def _aux_uses_opus(output_aux, block_size, routed_rows=None, num_experts=None):
+    """Pick the auxiliary sort: Opus (one CTA per expert) or the fused one.
+
+    block_size 16 has no three-stage sort instance -- codegen emits `aux_sort3s_*`
+    only for MB in {32, 64, 128}, so it falls back to sort_quant_kernel_impl,
+    whose whole sort runs under `blockIdx.x == 0`. That single CTA costs
+    O(routed_rows); Opus spends one CTA per expert. So the fused sort wins while
+    the routed rows are few relative to the experts and loses linearly after,
+    which is why block_size 16 was originally pinned away from Opus wholesale.
+
+    Switch on which side of that crossover we are: routed_rows >= num_experts is
+    "at least one routed row per expert on average". Measured on kimi-k3 a4w4
+    (NE=896, topk=16, gfx950) the prologue crosses between token 32 and 64 --
+    fused is 2.2us faster at 32, Opus 0.9us faster at 64 and 10.6us faster at
+    512 -- and the rule puts the boundary at token 56.
+
+    Callers that cannot supply the shape keep the old conservative answer.
+    """
+    if output_aux != AUX_SORT_OPUS:
+        return False
+    if block_size != 16:
+        return True
+    if routed_rows is None or num_experts is None:
+        return False
+    return routed_rows >= num_experts
 
 
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
@@ -205,7 +227,7 @@ def _moe_sorting_impl(
 
     if (
         output_aux
-        and not _aux_uses_opus(output_aux, block_size)
+        and not _aux_uses_opus(output_aux, block_size, M * topk, num_experts)
         and _MOE_SORT_BACKEND not in ("opus", "ck")
     ):
         # Adaptive sort emits aux metadata and zero-initializes atomic output.
@@ -247,7 +269,9 @@ def _moe_sorting_impl(
     aux_reverse_sorted = None
     if output_aux:
         use_opus = True
-        dispatch_policy = 0 if _aux_uses_opus(output_aux, block_size) else 1
+        dispatch_policy = (
+            0 if _aux_uses_opus(output_aux, block_size, M * topk, num_experts) else 1
+        )
         aux_m_indices = torch.empty(
             max_num_tokens_padded, dtype=dtypes.i32, device=device
         )
@@ -3323,10 +3347,16 @@ def fused_moe_2stages(
         metadata = _metadata_transform(metadata)
     if output_aux:
         metadata = replace(metadata, output_aux=output_aux)
-    if getattr(
-        metadata.stage1, "func", metadata.stage1
-    ) is _mxfp4_a4w4_stage1_fw and _aux_uses_opus(
-        metadata.output_aux, int(metadata.block_m)
+    if (
+        getattr(metadata.stage1, "func", metadata.stage1) is _mxfp4_a4w4_stage1_fw
+        and metadata.output_aux == AUX_SORT_OPUS
+        # Prequant is a property of GEMM1, not of the sort: block_m 16 is the
+        # only inline-quant ("_f16in") a4w4 variant, and that kernel reads raw
+        # bf16 hidden_states and ignores the A buffers entirely. Handing it a
+        # prequantized fp4 A plus scales faults with an illegal address. Keep
+        # this keyed on block_m rather than on _aux_uses_opus, which now sends
+        # block_m 16 to Opus for the sort alone.
+        and int(metadata.block_m) != 16
     ):
         # Main's fused prequant already writes the E8M0 scale layout consumed by
         # replacement GEMM1. Only Opus takes this path; an explicit threestage
