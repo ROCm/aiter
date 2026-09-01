@@ -499,8 +499,8 @@ def run_route_m16x8_test():
     TEMPORARY: remove this together with the --route-m16x8 flag once the m16x8
     kernel body is implemented and covered by the normal correctness suite.
     """
-    from aiter.jit.core import is_experimental_enabled
     import aiter.ops.flydsl.fmha_kernels as fk
+    from aiter.jit.core import is_experimental_enabled
 
     if not is_experimental_enabled():
         print(

@@ -36,22 +36,22 @@ Target: gfx1250, wave32, 8 waves per threadgroup (256 threads).
 import functools
 from enum import IntEnum
 
-import torch
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import rocdl as rocdl_dialect
 from flydsl._mlir.dialects import scf
+from flydsl.compiler.ast_rewriter import ReplaceIfWithDispatch
 from flydsl.expr import arith, gpu, rocdl
 from flydsl.expr import math as fmath
+from flydsl.expr.typing import T
+from flydsl.expr.utils.arith import _to_raw as _raw
 
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.utils import get_shared_memory_per_block
-from flydsl.expr.typing import T
-from flydsl.expr.utils.arith import _to_raw as _raw
-from flydsl.compiler.ast_rewriter import ReplaceIfWithDispatch
+
 from ..tensor_shim import _run_compiled
 
 # Runtime `if` helper the AST rewriter lowers dynamic conditions to. Called
@@ -62,27 +62,26 @@ scf_if_dispatch = ReplaceIfWithDispatch.scf_if_dispatch
 # Q/K/V staging managers (own their LDS swizzles + async copy schedules). They are
 # self-contained: this kernel maintains its own arch constants below and passes the
 # config each manager needs through its constructor.
-from .mha_buffer_managers import (
-    QManager16bV1,
-    KManager16bV1,
-    VManager16bV1,
-    OManager16bV1,
-)
-from .mha_buffer_managers import (
-    QManager16bV2,
-    KManager16bV2,
-    VManager16bV2,
-    OManager16bV2,
-)
-from .mha_buffer_managers import OManager16bV3
 from flydsl.expr.rocdl import tdm_ops
 
 # Single source of truth for gfx1250 Expert Scheduling Mode 2 (DEP_MODE=2). Lives
 # in mha_buffer_managers. Under mode 2 the LLVM setreg (via the
 # amdgpu-expert-scheduling-mode hint, set in _ensure_*_kernel) makes LLVM insert all
 # depctr covers itself for the plain intrinsics the kernel emits.
-from .mha_buffer_managers import ENABLE_SCHED_MODE2, _ir
-from .mha_buffer_managers import _async_load_to_lds
+from .mha_buffer_managers import (
+    ENABLE_SCHED_MODE2,
+    KManager16bV1,
+    KManager16bV2,
+    OManager16bV1,
+    OManager16bV2,
+    OManager16bV3,
+    QManager16bV1,
+    QManager16bV2,
+    VManager16bV1,
+    VManager16bV2,
+    _async_load_to_lds,
+    _ir,
+)
 
 # ============================================================================
 # Threadgroup / arch constants
@@ -1349,7 +1348,7 @@ def _core_attention(
 # ============================================================================
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def build_fmha_fwd_prefill_m32x8(
     *,
     layout: str = "thd",

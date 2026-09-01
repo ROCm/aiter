@@ -30,9 +30,9 @@ Target: gfx1250 (MI400 / mi450), wave32, 8 waves per threadgroup (256 threads).
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import rocdl as rocdl_dialect
-from flydsl.expr import arith, gpu, rocdl
-from flydsl.expr.rocdl import tdm_ops
 from flydsl.compiler.ast_rewriter import ReplaceIfWithDispatch
+from flydsl.expr import arith, rocdl
+from flydsl.expr.rocdl import tdm_ops
 
 from aiter.ops.flydsl.kernels import buffer_ops
 

@@ -8,8 +8,8 @@ import torch
 from torch import Generator, Tensor
 
 from ..jit.core import (
-    CK_DIR,
     AITER_META_DIR,
+    CK_DIR,
     ENABLE_CK,
     compile_ops,
     is_experimental_enabled,

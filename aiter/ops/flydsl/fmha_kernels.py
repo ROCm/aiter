@@ -28,16 +28,16 @@ import torch
 import torch.nn.functional as F
 
 from .kernels.flash_attn_func_gfx1201 import build_flash_attn_func_module
-from .kernels.fmha_gfx1250.fmha_kernel import flash_attn_varlen_d192_gfx1250
 from .kernels.fmha_gfx1250.fmha_fwd_prefill_m32x8 import (
-    flash_attn_varlen_m32x8,
     flash_attn_batch_m32x8,
+    flash_attn_varlen_m32x8,
 )
+from .kernels.fmha_gfx1250.fmha_kernel import flash_attn_varlen_d192_gfx1250
 
 __all__ = [
+    "flydsl_flash_attn_batch_func",
     "flydsl_flash_attn_func",
     "flydsl_flash_attn_varlen_func",
-    "flydsl_flash_attn_batch_func",
 ]
 
 
@@ -239,8 +239,8 @@ def flydsl_flash_attn_varlen_func(
     Returns the result if FlyDSL can handle this configuration,
     otherwise returns None so the caller falls through to Triton/CK.
     """
-    from ...jit.utils.chip_info import get_gfx
     from ...jit.core import is_experimental_enabled
+    from ...jit.utils.chip_info import get_gfx
 
     # FlyDSL handles only plain MHA. Any unsupported feature (bias, alibi, sink,
     # dropout, sliding window, paging, probs/deterministic) falls through to
@@ -338,8 +338,8 @@ def flydsl_flash_attn_batch_func(
     this configuration, otherwise returns ``None`` so the caller falls through
     to Triton/CK.
     """
-    from ...jit.utils.chip_info import get_gfx
     from ...jit.core import is_experimental_enabled
+    from ...jit.utils.chip_info import get_gfx
 
     # BSHD routes to the m32x8 kernel (no d192 sibling exists for BSHD). D_v=128. D_qk 128/192 are
     # the DEFAULT; D_qk==256 needs AITER_ENABLE_EXPERIMENTAL=1 (else CK).
