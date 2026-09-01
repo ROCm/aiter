@@ -2,6 +2,8 @@
 """Production host runtime for communication-fused FlyDSL MoE."""
 
 import csv
+import math
+import re
 from dataclasses import MISSING, dataclass, fields
 from functools import cache
 from pathlib import Path
@@ -11,7 +13,8 @@ import torch
 import torch.distributed._symmetric_memory as symm_mem
 from mori.cco import Communicator
 
-from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.flydsl.kernels.comm_fused_moe.gfx950.a8w4 import (
     gemm2_tp_atomic_pipeline,
     gemm2_tp_megakernel,
@@ -27,8 +30,14 @@ from aiter.ops.flydsl.kernels.comm_fused_moe.gfx950.a8w4.sync import (
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 from aiter.ops.flydsl.moe_kernels import _run_compiled
 
-_CONFIG_PATH = Path(__file__).parents[2] / "configs" / "comm_fused_moe.csv"
 _PEER_VMM_ALLOCATION_ALIGNMENT = 2 * 1024 * 1024
+_MAX_ABS_ERROR = 1.0
+_MAX_REL_L2_ERROR = 0.05
+_ACT_TYPE = "ActivationType.Silu"
+_DTYPE = "torch.bfloat16"
+_Q_DTYPE_A = "torch.float8_e4m3fn"
+_Q_DTYPE_W = "torch.float4_e2m1fn_x2"
+_Q_TYPE = "QuantType.per_1x32"
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +48,14 @@ class ShapeKey:
     experts: int
     topk: int
     tp: int
+    cu_num: int | None = None
+    act_type: str = _ACT_TYPE
+    dtype: str = _DTYPE
+    q_dtype_a: str = _Q_DTYPE_A
+    q_dtype_w: str = _Q_DTYPE_W
+    q_type: str = _Q_TYPE
+    use_g1u1: int = 1
+    doweight_stage1: int = 0
 
     def kernel_shape(self) -> Gemm2TPShape:
         return Gemm2TPShape(
@@ -55,58 +72,270 @@ PipelineConfig = (
     | gemm2_tp_megakernel.Gemm2TPMegakernelConfig
     | gemm2_tp_window_pipeline.Gemm2TPWindowPipelineConfig
 )
-_CONFIG_TYPES = {
-    "gemm2_tp_atomic": gemm2_tp_atomic_pipeline.Gemm2TPAtomicPipelineConfig,
-    "gemm2_tp_mega": gemm2_tp_megakernel.Gemm2TPMegakernelConfig,
-    "gemm2_tp_window": gemm2_tp_window_pipeline.Gemm2TPWindowPipelineConfig,
-}
+_CONFIG_NAME_PREFIX = "flydsl_comm_moe2_afp8_wfp4_bf16_"
 _RUNNER_CACHE = {}
 
 
-def _config(row, shape: Gemm2TPShape) -> PipelineConfig:
-    config_type = _CONFIG_TYPES[row["family"]]
-    values = {"shape": shape}
-    for field in fields(config_type):
-        if field.name == "shape":
+def _int_value(raw, name: str) -> int:
+    numeric = float(raw)
+    integer = int(numeric)
+    if numeric != integer:
+        raise ValueError(f"{name} must be an integer, got {raw!r}")
+    return integer
+
+
+def _mega_defaults() -> dict:
+    defaults = {}
+    for field in fields(gemm2_tp_megakernel.Gemm2TPMegakernelConfig):
+        if field.name in ("shape", "m"):
             continue
-        raw = row.get(field.name)
-        if raw in (None, ""):
-            if field.default is not MISSING:
-                values[field.name] = field.default
-                continue
-            if field.default_factory is not MISSING:
-                values[field.name] = field.default_factory()
-                continue
-            raise KeyError(field.name)
-        if field.type is str:
-            values[field.name] = raw
-        elif field.type is bool:
-            values[field.name] = bool(int(raw))
+        if field.default is MISSING:
+            raise TypeError(f"missing megakernel default for {field.name}")
+        defaults[field.name] = field.default
+    return defaults
+
+
+def config_name(config: PipelineConfig) -> str:
+    prefix = _CONFIG_NAME_PREFIX
+    if isinstance(config, gemm2_tp_atomic_pipeline.Gemm2TPAtomicPipelineConfig):
+        return (
+            f"{prefix}atomic_rs{config.reduce_scatter_grid}"
+            f"_ag{config.all_gather_grid}"
+        )
+    if isinstance(config, gemm2_tp_window_pipeline.Gemm2TPWindowPipelineConfig):
+        return (
+            f"{prefix}window_t{config.tile_m}x{config.tile_n}x{config.tile_k}"
+            f"_sbm{config.sort_block_m}_win{config.window}"
+            f"_lw{config.local_workers}_rs{config.reduce_scatter_grid}"
+            f"_ag{config.all_gather_grid}"
+        )
+    if not isinstance(config, gemm2_tp_megakernel.Gemm2TPMegakernelConfig):
+        raise TypeError(f"unsupported comm_fused config {type(config)!r}")
+
+    defaults = _mega_defaults()
+    parts = [
+        f"{prefix}t{config.tile_m}x{config.tile_n}x{config.tile_k}",
+    ]
+    numeric_tags = (
+        ("sort_block_m", "sbm"),
+        ("compute_groups", "cg"),
+        ("block_threads", "bt"),
+        ("vector_width", "v"),
+        ("waves_per_eu", "w"),
+        ("b_cache_modifier", "bnt"),
+        ("local_load_cache_modifier", "ll"),
+        ("remote_load_cache_modifier", "rl"),
+        ("gather_load_cache_modifier", "gl"),
+        ("remote_store_cache_modifier", "rs"),
+        ("n_tile_cohort", "ntc"),
+    )
+    for field_name, tag in numeric_tags:
+        value = getattr(config, field_name)
+        if value != defaults[field_name]:
+            parts.append(f"{tag}{value}")
+    if config.route_store_scope != defaults["route_store_scope"]:
+        parts.append(f"rts{config.route_store_scope}")
+    if config.collective != defaults["collective"]:
+        parts.append(
+            {
+                "rs_broadcast": "rsbcast",
+                "rsag": "rsag",
+            }[config.collective]
+        )
+    if config.service_groups != defaults["service_groups"]:
+        parts.append(f"sg{config.service_groups}")
+    if config.service_tile_group != defaults["service_tile_group"]:
+        parts.append(f"stg{config.service_tile_group}")
+    if config.producer_mode != defaults["producer_mode"]:
+        parts.append(
+            {
+                "atomic_shared": "patomic",
+                "routes_fp8_fixed": "pfp8",
+            }[config.producer_mode]
+        )
+    if config.flat_producer_grid:
+        parts.append("flat")
+    return "_".join(parts)
+
+
+def _parse_megakernel_name(name: str, shape: Gemm2TPShape, m: int):
+    prefix = _CONFIG_NAME_PREFIX
+    if not name.startswith(prefix):
+        return None
+    parts = name[len(prefix) :].split("_")
+    tile = re.fullmatch(r"t(\d+)x(\d+)x(\d+)", parts.pop(0))
+    if tile is None:
+        raise ValueError(f"invalid megakernel tile in {name!r}")
+    values = _mega_defaults()
+    values.update(
+        tile_m=int(tile.group(1)),
+        tile_n=int(tile.group(2)),
+        tile_k=int(tile.group(3)),
+    )
+    numeric_tags = {
+        "sbm": "sort_block_m",
+        "cg": "compute_groups",
+        "bt": "block_threads",
+        "v": "vector_width",
+        "w": "waves_per_eu",
+        "bnt": "b_cache_modifier",
+        "ll": "local_load_cache_modifier",
+        "rl": "remote_load_cache_modifier",
+        "gl": "gather_load_cache_modifier",
+        "rs": "remote_store_cache_modifier",
+        "ntc": "n_tile_cohort",
+        "sg": "service_groups",
+        "stg": "service_tile_group",
+    }
+    collective = values["collective"]
+    for part in parts:
+        if part in ("direct", "rsbcast", "rsag"):
+            if collective != values["collective"]:
+                raise ValueError(f"duplicate collective in {name!r}")
+            collective = {
+                "direct": "direct",
+                "rsbcast": "rs_broadcast",
+                "rsag": "rsag",
+            }[part]
+        elif part == "patomic":
+            values["producer_mode"] = "atomic_shared"
+        elif part == "pfp8":
+            values["producer_mode"] = "routes_fp8_fixed"
+        elif part == "flat":
+            values["flat_producer_grid"] = True
+        elif part.startswith("rts"):
+            values["route_store_scope"] = part[3:]
         else:
-            values[field.name] = int(raw)
-    return config_type(**values)
+            for tag, field_name in sorted(
+                numeric_tags.items(), key=lambda item: -len(item[0])
+            ):
+                if part.startswith(tag):
+                    values[field_name] = _int_value(part[len(tag) :], field_name)
+                    break
+            else:
+                raise ValueError(f"unknown megakernel option {part!r} in {name!r}")
+    values["collective"] = collective
+    return gemm2_tp_megakernel.Gemm2TPMegakernelConfig(shape=shape, m=m, **values)
+
+
+def _config(row, shape: Gemm2TPShape) -> PipelineConfig:
+    name = row["kernelName"]
+    m = _int_value(row["token"], "token")
+    atomic = re.fullmatch(
+        rf"{re.escape(_CONFIG_NAME_PREFIX)}atomic_rs(\d+)_ag(\d+)", name
+    )
+    if atomic is not None:
+        return gemm2_tp_atomic_pipeline.Gemm2TPAtomicPipelineConfig(
+            shape, m, int(atomic.group(1)), int(atomic.group(2))
+        )
+    window = re.fullmatch(
+        rf"{re.escape(_CONFIG_NAME_PREFIX)}window_"
+        r"t(\d+)x(\d+)x(\d+)_sbm(\d+)_win(\d+)_lw(\d+)_rs(\d+)_ag(\d+)",
+        name,
+    )
+    if window is not None:
+        config = gemm2_tp_window_pipeline.Gemm2TPWindowPipelineConfig(
+            shape, m, *(int(value) for value in window.groups())
+        )
+    else:
+        config = _parse_megakernel_name(name, shape, m)
+        if config is None:
+            raise ValueError(f"unknown comm_fused kernelName {name!r}")
+    block_m = _int_value(row["block_m"], "block_m")
+    if config.sort_block_m != block_m:
+        raise ValueError(
+            f"kernelName sort_block_m={config.sort_block_m} does not match "
+            f"CSV block_m={block_m}"
+        )
+    return config
+
+
+def _optional_float(row, name: str) -> float | None:
+    raw = row.get(name)
+    if raw in (None, ""):
+        return None
+    value = float(raw)
+    return value if math.isfinite(value) else None
+
+
+def _row_is_accurate(row) -> bool:
+    max_abs = _optional_float(row, "max_abs")
+    rel_l2 = _optional_float(row, "rel_l2")
+    return (max_abs is None or max_abs <= _MAX_ABS_ERROR) and (
+        rel_l2 is None or rel_l2 <= _MAX_REL_L2_ERROR
+    )
+
+
+def _select_row(key, rows):
+    accurate = [row for row in rows if _row_is_accurate(row)]
+    if not accurate:
+        raise ValueError(f"all comm_fused configs fail accuracy for {key}")
+    if len(accurate) == 1:
+        return accurate[0]
+    measured = [
+        (latency, row)
+        for row in accurate
+        if (latency := _optional_float(row, "us")) is not None
+    ]
+    if len(measured) != len(accurate):
+        raise ValueError(
+            f"duplicate comm_fused configs require measured 'us' for {key}"
+        )
+    return min(measured, key=lambda item: item[0])[1]
 
 
 @cache
 def _winner_table() -> dict[ShapeKey, dict[int, PipelineConfig]]:
-    table = {}
-    with _CONFIG_PATH.open(newline="") as file:
+    candidates = {}
+    config_path = Path(AITER_CONFIGS.AITER_CONFIG_COMM_FUSED_MOE_FILE)
+    with config_path.open(newline="") as file:
         for row in csv.DictReader(file):
+            # Skip ordinary Stage2 + TP AllReduce fallback rows.
+            if row["kernelName"].strip().lower() == "fallback":
+                continue
             shape = ShapeKey(
                 row["gfx"],
                 int(row["model_dim"]),
                 int(row["inter_dim"]),
-                int(row["experts"]),
+                int(row["expert"]),
                 int(row["topk"]),
                 int(row["tp"]),
+                int(row["cu_num"]),
+                row["act_type"],
+                row["dtype"],
+                row["q_dtype_a"],
+                row["q_dtype_w"],
+                row["q_type"],
+                _int_value(row["use_g1u1"], "use_g1u1"),
+                _int_value(row["doweight_stage1"], "doweight_stage1"),
             )
-            table.setdefault(shape, {})[int(row["m"])] = _config(
-                row, shape.kernel_shape()
-            )
+            key = (shape, int(row["token"]))
+            candidates.setdefault(key, []).append(row)
+    table = {}
+    for (shape, m), rows in candidates.items():
+        row = _select_row((shape, m), rows)
+        table.setdefault(shape, {})[m] = _config(row, shape.kernel_shape())
     return table
 
 
 def winners_for(shape: ShapeKey) -> dict[int, PipelineConfig]:
+    if shape.cu_num is None:
+        shape = ShapeKey(
+            shape.gfx,
+            shape.model_dim,
+            shape.inter_dim,
+            shape.experts,
+            shape.topk,
+            shape.tp,
+            get_cu_num(),
+            shape.act_type,
+            shape.dtype,
+            shape.q_dtype_a,
+            shape.q_dtype_w,
+            shape.q_type,
+            shape.use_g1u1,
+            shape.doweight_stage1,
+        )
     table = _winner_table()
     try:
         return table[shape]
@@ -167,6 +396,13 @@ def _stage2_args(args, kwargs, config):
     inter_states, w2 = args[0], args[2]
     sorted_token_ids, sorted_expert_ids, num_valid_ids = args[3:6]
     shape = config.shape
+    runtime_sort_block_m = int(kwargs["block_m"])
+    if runtime_sort_block_m != config.sort_block_m:
+        raise RuntimeError(
+            "comm_fused sort_block_m does not match ordinary fused MoE: "
+            f"config={config.sort_block_m}, runtime={runtime_sort_block_m}, "
+            f"M={config.m}, shape={shape.tag}"
+        )
     return (
         ptr_arg(inter_states),
         ptr_arg(w2),
@@ -607,6 +843,7 @@ def create_flydsl_comm_fused_runners(*, tp_group, model_dim, inter_dim, experts,
         experts,
         topk,
         int(tp_group.world_size),
+        get_cu_num(),
     )
     key = (id(tp_group), shape)
     if key not in _RUNNER_CACHE:

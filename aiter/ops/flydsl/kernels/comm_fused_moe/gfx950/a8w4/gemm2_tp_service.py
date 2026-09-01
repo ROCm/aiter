@@ -7,13 +7,16 @@ from flydsl._mlir.dialects import llvm as llvm_d
 from flydsl._mlir.dialects import scf
 from flydsl._mlir.dialects.arith import CmpIPredicate
 from flydsl.expr import arith, const_expr, gpu, ptrtoint, range_constexpr
-from flydsl.expr.typing import T
+from flydsl.expr import math as fmath
+from flydsl.expr.typing import ReductionOp, T
 from flydsl.utils.smem_allocator import SmemPtr
 
 from .... import buffer_ops
 from .... import communication_ops_utils as comm_ops
 from .collectives import (
     decode_scaled_fp8_f32,
+    e8m0_scale,
+    load_e8m0_scale,
     load_fp8_words,
     pack_fp8_words,
     store_fp8_words,
@@ -68,6 +71,79 @@ def _decode_scaled_fp8_bf16(words, scale):
     return values
 
 
+def _mxfp8_scale(values, lane, vector_width):
+    local_max = fx.Float32(1e-10).maximumf(fmath.absf(values).reduce(ReductionOp.MAX))
+    max_bits = local_max.bitcast(fx.Int32)
+    remote_bits = fx.rocdl.ds_bpermute(
+        T.i32, (lane ^ fx.Int32(1)) * fx.Int32(4), max_bits
+    )
+    local_max = local_max.maximumf(fx.Int32(remote_bits).bitcast(fx.Float32))
+    if const_expr(vector_width == 8):
+        max_bits = local_max.bitcast(fx.Int32)
+        remote_bits = fx.rocdl.ds_bpermute(
+            T.i32, (lane ^ fx.Int32(2)) * fx.Int32(4), max_bits
+        )
+        local_max = local_max.maximumf(fx.Int32(remote_bits).bitcast(fx.Float32))
+    return e8m0_scale(local_max)
+
+
+def _store_mxfp8_scale(
+    payload_resource,
+    scale_resource,
+    payload_bytes,
+    offset,
+    vector_width,
+    e8m0,
+):
+    if const_expr(vector_width == 8):
+        scale_leader = scf.IfOp(
+            arith.cmpi(
+                CmpIPredicate.eq,
+                offset % fx.Int32(32),
+                fx.Int32(0),
+            )
+        )
+        with ir.InsertionPoint(scale_leader.then_block):
+            buffer_ops.buffer_store(
+                e8m0.to(fx.Int8),
+                scale_resource,
+                offset // fx.Int32(32),
+                offset_is_bytes=True,
+            )
+            scf.YieldOp([])
+    else:
+        buffer_ops.buffer_store(
+            e8m0 << fx.Int32(23),
+            payload_resource,
+            fx.Int32(payload_bytes // 4) + offset // fx.Int32(vector_width),
+        )
+
+
+def _load_mxfp8_scale(
+    payload_resource,
+    scale_resource,
+    payload_bytes,
+    offset,
+    vector_width,
+    cache_modifier,
+):
+    if const_expr(vector_width == 8):
+        return load_e8m0_scale(
+            scale_resource,
+            offset // fx.Int32(32),
+            cache_modifier,
+        )
+    return fx.Int32(
+        buffer_ops.buffer_load(
+            payload_resource,
+            fx.Int32(payload_bytes // 4) + offset // fx.Int32(vector_width),
+            vec_width=1,
+            dtype=T.i32,
+            cache_modifier=cache_modifier,
+        )
+    ).bitcast(fx.Float32)
+
+
 def _atomic_add_i32_agent(addr, value):
     return llvm_d.AtomicRMWOp(
         llvm_d.AtomicBinOp.add,
@@ -78,14 +154,18 @@ def _atomic_add_i32_agent(addr, value):
     ).res
 
 
-def _wait_i32_system_until_at_least(addr, expected):
+def _wait_i32_system_until_at_least(addr, expected, *, acquire=False, sleep=True):
     def load():
         return llvm_d.LoadOp(
             ir.IntegerType.get_signless(32),
             comm_ops._to_ptr_global(addr),
             alignment=4,
             volatile_=True,
-            ordering=llvm_d.AtomicOrdering.monotonic,
+            ordering=(
+                llvm_d.AtomicOrdering.acquire
+                if acquire
+                else llvm_d.AtomicOrdering.monotonic
+            ),
             syncscope=fx.rocdl.SyncScope.OneAs,
         ).result
 
@@ -99,7 +179,8 @@ def _wait_i32_system_until_at_least(addr, expected):
         ).result
         scf.ConditionOp(waiting, [current])
     with ir.InsertionPoint(after):
-        llvm_d.InlineAsmOp(None, [], "s_sleep 1", "", has_side_effects=True)
+        if sleep:
+            llvm_d.InlineAsmOp(None, [], "s_sleep 1", "", has_side_effects=True)
         scf.YieldOp([load()])
     return loop.results[0]
 
@@ -214,7 +295,11 @@ def emit_tile(
 ):
     rank = fx.Int32(specialized_rank)
     payload_bytes = config.payload_bytes
+    partial_payload_bytes = config.partial_payload_bytes
     partial_bytes = config.partial_bytes
+    partial_scale_sideband = (
+        not config.shared_bf16_partials and config.vector_width == 8
+    )
     reduce_items = config.m * config.tile_n // config.vector_width
     local_workspace_base = fx.Int64(ptrtoint(workspace))
     state_n_tile = (n_tile // fx.Int32(config.service_tile_group)) * fx.Int32(
@@ -246,15 +331,38 @@ def emit_tile(
         producer_resource = route_resource
     partial_resource = buffer_ops.create_buffer_resource_from_addr(
         local_workspace_base + slot * fx.Int64(partial_bytes),
-        num_records_bytes=partial_bytes,
+        num_records_bytes=(
+            partial_payload_bytes if partial_scale_sideband else partial_bytes
+        ),
     )
+    partial_scale_resource = None
+    if partial_scale_sideband:
+        partial_scale_resource = buffer_ops.create_buffer_resource_from_addr(
+            local_workspace_base
+            + slot * fx.Int64(partial_bytes)
+            + fx.Int64(partial_payload_bytes),
+            num_records_bytes=config.partial_scale_bytes,
+        )
     if config.collective == "rsag":
         reduced_resource = buffer_ops.create_buffer_resource_from_addr(
             local_workspace_base
             + fx.Int64(config.reduced_offset)
             + slot * fx.Int64(config.reduced_shard_bytes),
-            num_records_bytes=config.reduced_shard_bytes,
+            num_records_bytes=(
+                config.reduced_payload_bytes
+                if config.vector_width == 8
+                else config.reduced_shard_bytes
+            ),
         )
+        reduced_scale_resource = None
+        if config.vector_width == 8:
+            reduced_scale_resource = buffer_ops.create_buffer_resource_from_addr(
+                local_workspace_base
+                + fx.Int64(config.reduced_offset)
+                + slot * fx.Int64(config.reduced_shard_bytes)
+                + fx.Int64(config.reduced_payload_bytes),
+                num_records_bytes=config.reduced_scale_bytes,
+            )
     service_stride = config.block_threads * config.service_groups
     service_start = tid + service_group * fx.Int32(config.block_threads)
     retain_local_partials = (
@@ -349,13 +457,23 @@ def emit_tile(
                         local_even = local_even + load_route(route_slot)
                 reduced_f32 = local_even + local_odd
 
-        quant_scale = fx.Int32((254 - config.fp8_scale_exponent) << 23).bitcast(
-            fx.Float32
+        partial_e8m0, quant_scale = _mxfp8_scale(
+            reduced_f32,
+            tid & fx.Int32(63),
+            config.vector_width,
         )
         packed_words = config.vector_width // 4
         packed = pack_fp8_words(reduced_f32, quant_scale, packed_words)
         store_fp8_words(partial_resource, output_offset, packed, packed_words)
-        return packed
+        _store_mxfp8_scale(
+            partial_resource,
+            partial_scale_resource,
+            partial_payload_bytes,
+            output_offset,
+            config.vector_width,
+            partial_e8m0,
+        )
+        return packed, partial_e8m0
 
     retained_local_partials = []
 
@@ -410,15 +528,18 @@ def emit_tile(
                     ),
                 ).extf(T.vec(load_vector_width, T.f32))
             if const_expr(retain_local_partials and peer == specialized_rank):
-                scale = fx.Int32(config.fp8_scale_exponent << 23).bitcast(fx.Float32)
+                retained_packed, retained_e8m0 = retained_local_partial
+                scale = (fx.Uint32(retained_e8m0) << fx.Uint32(23)).bitcast(fx.Float32)
                 return fx.Vector.from_elements(
-                    decode_scaled_fp8_f32(retained_local_partial, scale),
+                    decode_scaled_fp8_f32(retained_packed, scale),
                     fx.Float32,
                 )
             load_offset = offset
             peer_resource = buffer_ops.create_buffer_resource_from_addr(
                 peer_base(workspace_flat_base, peer) + slot * fx.Int64(partial_bytes),
-                num_records_bytes=partial_bytes,
+                num_records_bytes=(
+                    partial_payload_bytes if partial_scale_sideband else partial_bytes
+                ),
             )
             if cache_modifier is None:
                 cache_modifier = (
@@ -433,7 +554,22 @@ def emit_tile(
                 load_width=load_vector_width // 4,
                 cache_modifier=cache_modifier,
             )
-            scale = fx.Int32(config.fp8_scale_exponent << 23).bitcast(fx.Float32)
+            peer_scale_resource = None
+            if partial_scale_sideband:
+                peer_scale_resource = buffer_ops.create_buffer_resource_from_addr(
+                    peer_base(workspace_flat_base, peer)
+                    + slot * fx.Int64(partial_bytes)
+                    + fx.Int64(partial_payload_bytes),
+                    num_records_bytes=config.partial_scale_bytes,
+                )
+            scale = _load_mxfp8_scale(
+                peer_resource,
+                peer_scale_resource,
+                partial_payload_bytes,
+                load_offset,
+                config.vector_width,
+                cache_modifier,
+            )
             return fx.Vector.from_elements(
                 decode_scaled_fp8_f32(words, scale),
                 fx.Float32,
@@ -684,9 +820,11 @@ def emit_tile(
                             config.remote_store_cache_modifier,
                         )
                 else:
-                    reduced_quant_scale = fx.Int32(
-                        (254 - config.fp8_scale_exponent) << 23
-                    ).bitcast(fx.Float32)
+                    reduced_e8m0, reduced_quant_scale = _mxfp8_scale(
+                        reduced,
+                        tid & fx.Int32(63),
+                        collective_vector_width,
+                    )
                     store_fp8_words(
                         reduced_resource,
                         reduced_offset,
@@ -696,6 +834,14 @@ def emit_tile(
                             collective_vector_width // 4,
                         ),
                         collective_vector_width // 4,
+                    )
+                    _store_mxfp8_scale(
+                        reduced_resource,
+                        reduced_scale_resource,
+                        config.reduced_payload_bytes,
+                        reduced_offset,
+                        collective_vector_width,
+                        reduced_e8m0,
                     )
                 scf.YieldOp([])
             fx.rocdl.s_waitcnt(0)
@@ -817,8 +963,21 @@ def emit_tile(
                 peer_base(workspace_flat_base, source)
                 + fx.Int64(config.reduced_offset)
                 + slot * fx.Int64(config.reduced_shard_bytes),
-                num_records_bytes=config.reduced_shard_bytes,
+                num_records_bytes=(
+                    config.reduced_payload_bytes
+                    if config.vector_width == 8
+                    else config.reduced_shard_bytes
+                ),
             )
+            source_scale_resource = None
+            if config.vector_width == 8:
+                source_scale_resource = buffer_ops.create_buffer_resource_from_addr(
+                    peer_base(workspace_flat_base, source)
+                    + fx.Int64(config.reduced_offset)
+                    + slot * fx.Int64(config.reduced_shard_bytes)
+                    + fx.Int64(config.reduced_payload_bytes),
+                    num_records_bytes=config.reduced_scale_bytes,
+                )
             gather_loop = scf.ForOp(
                 arith.index_cast(T.index, first_token),
                 arith.constant(shard_tokens, index=True),
@@ -847,7 +1006,14 @@ def emit_tile(
                     load_width=gather_vector_width // 4,
                     cache_modifier=gather_cache_modifier,
                 )
-                scale = fx.Int32(config.fp8_scale_exponent << 23).bitcast(fx.Float32)
+                scale = _load_mxfp8_scale(
+                    source_resource,
+                    source_scale_resource,
+                    config.reduced_payload_bytes,
+                    reduced_offset,
+                    gather_vector_width,
+                    gather_cache_modifier,
+                )
                 values = fx.Vector.from_elements(
                     _decode_scaled_fp8_bf16(words, scale),
                     fx.BFloat16,
@@ -928,9 +1094,10 @@ def emit_tile(
                 + fx.Int64(local_slot) * fx.Int64(4)
             )
             if config.single_pass_direct:
-                _wait_i32_agent_until_at_least(
+                _wait_i32_system_until_at_least(
                     ready_address,
                     expected_i32,
+                    acquire=True,
                     sleep=False,
                 )
             else:

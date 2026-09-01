@@ -40,6 +40,12 @@ def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
 
+def _mxfp8_scale_bytes(payload_bytes: int, vector_width: int) -> int:
+    if vector_width == 8:
+        return payload_bytes // 32
+    return payload_bytes * 4 // vector_width
+
+
 def _byte_ptr(addr):
     pointer = fx.PointerType.get(
         fx.Uint8.ir_type,
@@ -69,7 +75,6 @@ class Gemm2TPMegakernelConfig:
     remote_load_cache_modifier: int = 1
     gather_load_cache_modifier: int = -1
     remote_store_cache_modifier: int = 0
-    fp8_scale_exponent: int = 127
     n_tile_cohort: int = 0
     collective: str = "direct"
     service_groups: int = 1
@@ -145,11 +150,6 @@ class Gemm2TPMegakernelConfig:
         if self.vector_width not in (8, 16):
             raise ValueError(
                 "production GEMM2 TP megakernel requires vector_width 8 or 16"
-            )
-        if not 0 <= self.fp8_scale_exponent <= 254:
-            raise ValueError(
-                "fp8_scale_exponent must be in [0, 254], got "
-                f"{self.fp8_scale_exponent}"
             )
         if self.n_tile_cohort < 0:
             raise ValueError(
@@ -272,14 +272,34 @@ class Gemm2TPMegakernelConfig:
 
     @property
     def partial_bytes(self) -> int:
+        return _align_up(self.partial_payload_bytes + self.partial_scale_bytes, 16)
+
+    @property
+    def partial_payload_bytes(self) -> int:
         return self.m * self.shape.model_dim
 
     @property
-    def reduced_shard_bytes(self) -> int:
+    def partial_scale_bytes(self) -> int:
+        if self.shared_bf16_partials:
+            return 0
+        return _mxfp8_scale_bytes(self.partial_payload_bytes, self.vector_width)
+
+    @property
+    def reduced_payload_bytes(self) -> int:
         if not self.uses_rsag:
             return 0
-        element_bytes = 2 if self.collective == "rs_broadcast" else 1
+        element_bytes = 2 if self.shared_bf16_partials else 1
         return self.m * self.shape.model_dim * element_bytes // self.shape.tp_size
+
+    @property
+    def reduced_scale_bytes(self) -> int:
+        if not self.uses_rsag or self.shared_bf16_partials:
+            return 0
+        return _mxfp8_scale_bytes(self.reduced_payload_bytes, self.vector_width)
+
+    @property
+    def reduced_shard_bytes(self) -> int:
+        return _align_up(self.reduced_payload_bytes + self.reduced_scale_bytes, 16)
 
     @property
     def reduced_offset(self) -> int:
@@ -386,7 +406,7 @@ def _compile_gemm2_tp_megakernel(
         if config.n_tile_cohort or config.flat_producer_grid
         else (n_tiles, config.compute_groups, 1)
     )
-    cache_abi = "gemm2_tp_mega_v2"
+    cache_abi = "gemm2_tp_mega_mxfp8"
     cache_config = hashlib.sha256(repr(config).encode()).hexdigest()[:16]
 
     def compose(*, module_name, emit_gemm2, allocator):
@@ -399,7 +419,6 @@ def _compile_gemm2_tp_megakernel(
                 f"_rts{config.route_store_scope}"
                 f"_glc{gather_cache_tag}"
                 f"_rsc{config.remote_store_cache_modifier}"
-                f"_fp8e{config.fp8_scale_exponent}"
                 f"_ntc{config.n_tile_cohort}_{config.collective}"
                 f"_sg{config.service_groups}_stg{config.service_tile_group}"
                 f"_p{config.producer_mode}"

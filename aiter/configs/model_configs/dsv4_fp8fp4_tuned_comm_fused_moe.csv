@@ -1,0 +1,17 @@
+gfx,cu_num,token,model_dim,inter_dim,expert,topk,tp,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1,block_m,us,kernelName,max_abs,rel_l2
+gfx950,256,1,7168,384,384,6,8,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,32,14.5049,flydsl_comm_moe2_afp8_wfp4_bf16_t16x256x128_cg12_w2,0.1875,0.015055
+gfx950,256,2,7168,384,384,6,8,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,32,16.0774,flydsl_comm_moe2_afp8_wfp4_bf16_t16x256x128_cg12_w2,0.21875,0.014570
+gfx950,256,4,7168,384,384,6,8,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,32,18.3758,flydsl_comm_moe2_afp8_wfp4_bf16_t16x256x128_cg16_w2,0.25,0.014027
+gfx950,256,8,7168,384,384,6,8,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,32,24.7047,flydsl_comm_moe2_afp8_wfp4_bf16_t16x256x128_cg32_v8_w2,0.25,0.013463
+gfx950,256,16,7168,384,384,6,8,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,32,37.0805,flydsl_comm_moe2_afp8_wfp4_bf16_t16x256x128_cg64_v8_w2,0.28125,0.013407
+gfx950,256,32,7168,384,384,6,8,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,32,,fallback,,
+gfx950,256,64,7168,384,384,6,8,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,32,,fallback,,
+gfx950,256,128,7168,384,384,6,8,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,32,,fallback,,
+gfx950,256,256,7168,384,384,6,8,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,32,,fallback,,
+gfx950,256,512,7168,384,384,6,8,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,32,,fallback,,
+gfx950,256,1024,7168,384,384,6,8,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,32,,fallback,,
+gfx950,256,2048,7168,384,384,6,8,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,64,,fallback,,
+gfx950,256,4096,7168,384,384,6,8,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,64,,fallback,,
+gfx950,256,8192,7168,384,384,6,8,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,64,,fallback,,
+gfx950,256,16384,7168,384,384,6,8,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,64,,fallback,,
+gfx950,256,32768,7168,384,384,6,8,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0,64,,fallback,,
