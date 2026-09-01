@@ -593,6 +593,64 @@ struct opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250 {
     //
     // kSfALds/kSfBLds are declared up beside kSfLoadsPerK, which reads them.
 
+    // ------------------------------------------------------------------
+    // 2026-09-01 RE-MEASUREMENT. Everything above is LEFT AS WRITTEN and is
+    // CONTRADICTED by the numbers below. Recorded, not resolved: the cause has
+    // not been found, so nothing above has been rewritten on the strength of
+    // one day's run.
+    //
+    // Protocol (_bmm_perf/bench_cc.py, mode "kids"): all arms of a shape inside
+    // one sweep, 11 independent reps, a kid0-vs-kid0 control arm, and the
+    // baseline's absolute time printed beside every ratio with a quiet-window
+    // selection on it -- the discipline this file's own notes ask for. The
+    // control read 1.000 and 11/11 reps were quiet at every shape, and
+    // rocprofv3 --kernel-trace agrees with the event timing to ~1%, so the two
+    // methods are not the disagreement.
+    //
+    //   b=8 m=512    kid0 37.70   kid13 38.74   kid14 42.86   kid17 44.03  (us, trace)
+    //   b=8 m=2048   kid0 149.46  kid13 149.22  kid14 169.85  kid17 147.50
+    //   b=16 m=2048  kid0 289.81  kid13 288.25  kid14 326.55  kid17 285.27  (event)
+    //
+    // So on this build: the A panel (kid13) is NEUTRAL, not +7%, and staging B
+    // as well (kid14) COSTS 11-12% where this file records +8.1% geomean.
+    //
+    // The second contradiction is the one that may explain the first. This file
+    // says "both compilers put kid0 at ~48 us today" and discards an earlier
+    // 38.60 us kid0 at b=8 m=512 as measuring some mid-experiment binary.
+    // kid0 measures 37.70 us (trace) / 38.79 us (event) here, cleanly and
+    // repeatably. The discarded reading is the one that reproduces; the ~48 us
+    // era is what now looks unexplained. Since the panel's whole claimed win is
+    // a ratio against that baseline, the two contradictions are probably one.
+    //
+    // Do not act on either direction until the ~48 vs ~38 kid0 is understood.
+    // ------------------------------------------------------------------
+
+    // DECODE TILE LADDER, measured the same day and NOT in contradiction with
+    // anything above -- this ground was never covered on kernel time before.
+    //
+    // Wall time cannot see this at all: a host dispatch costs ~8 us and these
+    // kernels are 9-16, so an event-timed loop reads EVERY decode tile at
+    // 19.2 us to three digits. On kernel time they span 1.53x. Every earlier
+    // decode conclusion taken from wall time is blind, including the B_N
+    // ladder's recorded "32 -> 64 alone paid 1.21x - 1.99x".
+    //
+    //   kernel us     b=2 m=1   b=8 m=1   b=8 m=16
+    //   kid1 16x32      11.14     12.30      15.78
+    //   kid4 16x64       8.85      9.41      10.78
+    //   kid6 16x128      8.65      9.05      10.34
+    //   kid7 16x256     12.50     12.66      14.54
+    //
+    // Swept over batch 1..16 x m 1..256, kid6 wins 26 of 35 cells and kid1 --
+    // the tile the "kid0 leaves 94% of the CUs idle" premise produced -- wins
+    // none of them, and is 6x off the best at b=16 m=256. Time IMPROVES as the
+    // grid shrinks 64 -> 32 -> 16 workgroups (25% -> 6% of the CUs), so what
+    // binds below the CU count is the work each workgroup DUPLICATES (its own
+    // copy of B_M=16 rows of A, its own per-WMMA scale reads), not occupancy.
+    // The premise was backwards: fewer and fatter, not more and narrower.
+    // Above the CU count that reverses and kid0's B_M=128 takes over. The
+    // dispatch rule fitted to this is _heuristic_bpreshuffle_kid in
+    // aiter/ops/opus/bmm_op.py, which keys on kid6's workgroup count.
+
     // Panel width bound in K-groups. Caps the K this tile accepts at
     // kSfAPanelKG * GROUP_K = 16384 at GROUP_K=128, enforced in the launcher.
     // Unlike the TDM version this is ONLY an allocation bound -- the layout uses

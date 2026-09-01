@@ -279,10 +279,135 @@ def bmm_a8w8_mxscale_opus(
     return Y
 
 
+# The bpreshuffle raw binding takes a kernelId verbatim and defaults it to 0,
+# the 128x128 prefill tile. That default costs 1.8x at the DSV4 decode shapes,
+# so the selection below is what a caller should go through.
+
+
+@functools.cache
+def _cu_count() -> int:
+    return int(torch.cuda.get_device_properties(0).multi_processor_count)
+
+
+# The three bpreshuffle tiles the heuristic picks among, as (B_M, B_N). The
+# full list (kid 0..10, 13, 14, 17, 18) is documented in csrc/opus_gemm/
+# opus_bmm.cu; the rest are either A/B controls for a tile that won, tiles for
+# the 128x128 blocked w_scale, or -- kid 2 and 3 -- known broken.
+_BPRESHUF_TILE_BN = {0: (128, 128), 6: (16, 128), 7: (16, 256)}
+# Largest m the decode tiles were swept at. Past it, kid0.
+_BPRESHUF_DECODE_M_MAX = 256
+
+
+def _heuristic_bpreshuffle_kid(batch: int, m: int, n: int) -> int:
+    """Tile picker for the per-column-w_scale bpreshuffle BMM.
+
+    Measured on gfx1250 (256 CU) over batch 1..16 x m 1..256 at n=1024 k=4096,
+    on KERNEL time -- a host dispatch costs ~8 us there and the kernels are
+    9..16, so wall time reads every tile as identical and cannot see this at
+    all. Winner map: kid6 takes 26 of 35 cells, kid7 a narrow band above it,
+    kid0 the large-b*m corner.
+
+    This rule names the measured winner in 30 of 35 cells. All five misses are
+    near-ties it declines to chase: four are cells where the 16x64 tile (kid4)
+    edged kid6 by 0.5%-2.3%, and one is a 0.2% split at batch=4 m=256. The
+    sweep's own agreement with rocprofv3 is 2.7% at worst, so a branch cut to
+    catch them would be fitting the measurement, not the machine. Worst regret
+    against a perfect oracle is therefore 2.3%, against 1.8x for the kernelId=0
+    the raw binding defaults to.
+
+    The shape of the rule is a workgroup count, not an M threshold, because the
+    two effects that set the optimum both key on it. Below the CU count, time
+    falls as the grid SHRINKS -- 64 -> 32 -> 16 workgroups all get faster --
+    because a narrower B_N means more workgroups each re-reading the same
+    B_M=16 rows of A and the same per-WMMA scales, and that duplication, not
+    occupancy, is what binds. This inverts the premise the decode tiles were
+    added under (kid0 "leaves 94% of the CUs idle", so add workgroups): kid1,
+    the 16x32 tile that premise produced, does not win a single cell and is
+    6x off the best at batch=16 m=256. Above the CU count the grid no longer
+    buys anything, wasted M rows stop being free, and kid0's B_M=128 -- which
+    amortises the A and scale reads over 128 rows instead of 16 -- takes over.
+
+    n and k enter only through the workgroup count: every tile masks its
+    partial M/N/K tiles, so nothing here needs an alignment check.
+    """
+    # The sweep this is fitted to stops at m=256, and the workgroup rule alone
+    # extrapolates badly past it: at batch=2 m=512 it lands in the kid7 band and
+    # picks a tile that is 1.52x off kid0 (50.5 us against 33.3). Measured at
+    # every m>256 boundary cell -- (2,512), (4,512), (8,256), (16,128), (16,256)
+    # -- kid0 is the winner, which is what a 128-row tile should be once m fills
+    # it several times over. So the decode tiles are confined to the region they
+    # were actually measured in rather than trusted outside it.
+    if m > _BPRESHUF_DECODE_M_MAX:
+        return 0
+    cus = _cu_count()
+    # kid6's grid, the quantity both branches of the trade are measured against.
+    bm6, bn6 = _BPRESHUF_TILE_BN[6]
+    wg6 = -(-m // bm6) * -(-n // bn6) * batch
+    if wg6 <= cus:
+        return 6
+    if wg6 <= 2 * cus:
+        return 7
+    return 0
+
+
+def bmm_a8w8_mxscale_bpreshuffle_opus(
+    x: torch.Tensor,
+    wo_a: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    out: torch.Tensor | None = None,
+    dtype: torch.dtype = torch.bfloat16,
+    kernelId: int | None = None,
+    splitK: int | None = None,
+) -> torch.Tensor:
+    """Opus fp8 e8m0 mxscale BMM with a PRESHUFFLED B, tile picked by shape.
+
+    ``x`` [M, batch, K] fp8 (a [batch, M, K] buffer is passed as
+    ``.transpose(0, 1)``, which is free -- the strides carry the layout),
+    ``wo_a`` [batch, N, K] fp8 run through ``shuffle_weight(w, layout=(16,16))``,
+    ``x_scale`` [M, batch, K/128], ``w_scale`` [batch, N, K/128] e8m0,
+    ``out`` optional [M, batch, N]. Returns the [M, batch, N] output.
+
+    ``kernelId`` None picks by shape (_heuristic_bpreshuffle_kid); pass an id to
+    run it verbatim, which is what a tile sweep wants.
+    _opus_bmm_a8w8_mxscale_bpreshuffle_raw is the entry with no selection at all.
+
+    Only the per-column w_scale family is dispatched here. A 128x128 blocked
+    w_scale needs a GROUP_N=128 tile (kid 8/9/10) and none of those has been
+    swept, so it must name its kernelId rather than get a guess -- the launcher
+    would otherwise reject the scale shape with a message about GROUP_N that
+    says nothing about why no id was chosen.
+    """
+    # Only the grid is decided here; K and every layout rule are the
+    # launcher's, which checks them against the tile it is handed.
+    m, batch = int(x.shape[0]), int(x.shape[1])
+    n = int(wo_a.shape[1])
+
+    Y = out if out is not None else torch.empty(
+        (m, batch, n), dtype=dtype, device=x.device
+    )
+
+    if kernelId is None:
+        if int(w_scale.shape[1]) != n:
+            raise ValueError(
+                "bmm_a8w8_mxscale_bpreshuffle_opus: w_scale.shape[1] is "
+                f"{int(w_scale.shape[1])}, not N={n}, so this is a blocked "
+                "(GROUP_N>1) scale. Only the per-column tiles have been swept; "
+                "pass kernelId explicitly (8/9/10 are the GROUP_N=128 tiles)."
+            )
+        kernelId = _heuristic_bpreshuffle_kid(batch, m, n)
+
+    _opus_bmm_a8w8_mxscale_bpreshuffle_raw(
+        x, wo_a, Y, x_scale, w_scale, int(splitK or 1), int(kernelId)
+    )
+    return Y
+
+
 __all__ = [
     "_opus_bmm_a8w8_mxscale_bpreshuffle_clusterclaunch_raw",
     "_opus_bmm_a8w8_mxscale_bpreshuffle_raw",
     "_opus_bmm_a8w8_mxscale_raw",
     "bmm_a8w8_mxscale_bpreshuffle_cc_ws",
+    "bmm_a8w8_mxscale_bpreshuffle_opus",
     "bmm_a8w8_mxscale_opus",
 ]

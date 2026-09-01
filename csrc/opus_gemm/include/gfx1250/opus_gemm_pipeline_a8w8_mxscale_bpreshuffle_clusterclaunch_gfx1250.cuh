@@ -37,6 +37,26 @@
 //     16B dwordx4. This is why an unverified C map (below) does not endanger the
 //     split-K plumbing.
 //
+// MEASURED 2026-09-01 (_bmm_perf/bench_cc.py; control arm 1.000, 11/11 reps
+// quiet). Two results, and they point opposite ways:
+//
+//   * mClusterWg=2 at SplitK=1 -- the B multicast across M-tile peers -- is a
+//     real win on prefill: 1.034 / 1.060 / 1.053 at (b=8,m=512), (b=8,m=2048),
+//     (b=16,m=2048). Small, consistent, and free of a workspace.
+//   * SplitK does not pay anywhere yet. On prefill it costs about 2.5x per
+//     doubling (sk2 0.379, sk4 0.209, sk8 0.108 of the plain launch), and the
+//     reason is structural rather than a tuning miss: at b=8 m=512 the SplitK=1
+//     grid is already 4*8*8 = 256 workgroups against 256 CUs, so a split buys
+//     no parallelism, while kid0's partial tile is a full B_M x B_N fp32 --
+//     (SplitK-1) x 117 MB written and read again at sk=8, against ~50 MB of A
+//     and B for the entire GEMM. On decode the partials are small and SplitK is
+//     free (b=2: sk1..sk8 all read 0.82), but entering the cluster path costs a
+//     flat ~21% at SplitK=1 there, which nothing then wins back.
+//
+// So the multicast is the part of this kernel that pays today. A split-K that
+// pays needs either a tile whose partial is much smaller than its output, or a
+// shape whose SplitK=1 grid does not already fill the machine.
+//
 // STILL A SCAFFOLD IN ONE RESPECT. The data movement, the scale path and the
 // whole split-K epilogue are complete, but two fragment maps are still inferred
 // rather than measured, and they are marked `TODO(kernel)`:
