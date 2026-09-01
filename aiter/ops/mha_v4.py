@@ -674,13 +674,14 @@ def mha_v4_packed(
     q_scale_mode: AttentionScaleMode,
     k_scale_mode: AttentionScaleMode,
     v_scale_mode: AttentionScaleMode,
+    *,
+    v_pack: AttentionPack = AttentionPack.DEFAULT,
     softmax_scale: Optional[float] = None,  # noqa: UP045
     out: Optional[Tensor] = None,  # noqa: UP045
     return_lse: bool = False,
     kv_block_indices: Optional[Tensor] = None,  # noqa: UP045
     lut_start: Optional[Tensor] = None,  # noqa: UP045
     lut_count: Optional[Tensor] = None,  # noqa: UP045
-    v_pack: AttentionPack = AttentionPack.DEFAULT,
 ) -> Tensor:
     """Launch non-causal MHA v4 over pre-quantized BSHD operands.
 

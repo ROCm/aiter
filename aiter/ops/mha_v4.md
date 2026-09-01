@@ -171,6 +171,7 @@ output = mha_v4_packed(
     q_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
     k_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
     v_scale_mode=AttentionScaleMode.F32_PER_CHANNEL,
+    v_pack=AttentionPack.DEFAULT,
     softmax_scale=1.0,
     return_lse=False,
     out=None,
