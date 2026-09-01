@@ -18,10 +18,10 @@ from .dispatch import (
     DispatchSlot,
     emit_direct_fixed_slot_finalize,
     emit_direct_fixed_slot_payload,
-    emit_expand_payload_tile,
     emit_dispatch_group,
     emit_dispatch_payload,
     emit_dispatch_plan,
+    emit_expand_payload_tile,
     emit_unique_payload,
 )
 from .gemm1 import _LdsF32View, build_fused_gemm1
@@ -52,14 +52,11 @@ def stage1_epoch_slot(grid_mult: int, dispatch_blocks: int) -> int:
         raise ValueError(f"grid_mult={grid_mult} is not supported")
     if not 0 < dispatch_blocks < _ENTRY_DISPATCH_SLOTS:
         raise ValueError(f"dispatch_blocks={dispatch_blocks} must be in [1, 255]")
-    return (
-        _GRID_MULT_VALUES.index(grid_mult) * _ENTRY_DISPATCH_SLOTS
-        + dispatch_blocks
-    )
+    return _GRID_MULT_VALUES.index(grid_mult) * _ENTRY_DISPATCH_SLOTS + dispatch_blocks
 
 
 class _Stage1KernelSpec:
-    __slots__ = ("kernel", "grid_x", "block_x", "waves_per_eu_hint")
+    __slots__ = ("block_x", "grid_x", "kernel", "waves_per_eu_hint")
 
     def __init__(self, kernel, grid_x, block_x, waves_per_eu_hint):
         self.kernel = kernel
@@ -141,11 +138,10 @@ def compile_mega_moe_stage1(
     indexed_payload = (
         not fixed_slot_dispatch and fuse_mtpr >= INDEXED_PAYLOAD_MIN_MTPR
     )
-    if deduplicate_payload:
-        if fixed_slot_dispatch or not payload_tile_ready:
-            raise ValueError(
-                "payload deduplication requires compact dispatch with tile-ready publication"
-            )
+    if deduplicate_payload and (fixed_slot_dispatch or not payload_tile_ready):
+        raise ValueError(
+            "payload deduplication requires compact dispatch with tile-ready publication"
+        )
     planner_blocks = 1
     role_prefix_blocks = dispatch_blocks
     if planner_blocks + role_prefix_blocks >= num_cu:
@@ -558,13 +554,12 @@ def compile_mega_moe_stage1(
                         indexed_payload=indexed_payload,
                         deduplicate_payload=False,
                     )
-        if const_expr(direct_fixed_slot):
-            if compact_owner:
-                emit_direct_fixed_slot_finalize(
-                    fz_npes=fz_npes, fz_epr=fz_epr, fz_cap=fz_cap, fz_mtpr=fz_mtpr, fz_rank=fz_rank,
-                    fz_tile_m=fz_tile_m, n_tiles=N_TILES, addr_disp=addr_disp, parity=payload_parity,
-                    expected=payload_expected,
-                )
+        if const_expr(direct_fixed_slot) and compact_owner:
+            emit_direct_fixed_slot_finalize(
+                fz_npes=fz_npes, fz_epr=fz_epr, fz_cap=fz_cap, fz_mtpr=fz_mtpr, fz_rank=fz_rank,
+                fz_tile_m=fz_tile_m, n_tiles=N_TILES, addr_disp=addr_disp, parity=payload_parity,
+                expected=payload_expected,
+            )
         # Primus-style role retirement: control CTAs stop before constructing any GEMM state;
         # the over-issued cohort enters the unchanged dynamic consumer queue.
         consumer_active = ticket > fx.Int32(role_prefix_blocks)

@@ -111,8 +111,7 @@ def test_dynamic_stage1_launch_populations_use_distinct_generation_counters(
         for config in plan.stage1_variants
     }
     identities = {
-        (config.grid_mult, config.num_dispatch_cu)
-        for config in plan.stage1_variants
+        (config.grid_mult, config.num_dispatch_cu) for config in plan.stage1_variants
     }
 
     assert len(slots) == len(identities)

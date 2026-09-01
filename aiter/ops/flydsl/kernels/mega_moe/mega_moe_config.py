@@ -311,11 +311,7 @@ def _select_bounded_stage1(
         raise ValueError(f"bounded MTPR does not support token bucket {bucket}")
 
     dispatch_cu = (
-        _compact_dispatch_cu(bucket)
-        if bucket <= 128
-        else 160
-        if bucket == 256
-        else 64
+        _compact_dispatch_cu(bucket) if bucket <= 128 else 160 if bucket == 256 else 64
     )
     tile_resource = bucket == 256
     b_nt = 0 if bucket == 1 or bucket >= 1024 else 3
