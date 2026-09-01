@@ -1437,6 +1437,11 @@ def fused_moe_router(
         num_expert_group == 1 and topk_group == 1
     ), f"fused_moe_router: {num_expert_group=} {topk_group=}, only 1/1 is fused"
     assert not doweight_stage1, "fused_moe_router: doweight_stage1 is not fused"
+    # Mirrors the entry's E <= 2 * BlockSize check; assert here so the failure
+    # names the gating width rather than surfacing from C++.
+    assert (
+        global_E <= 512
+    ), f"fused_moe_router: num_experts must be <= 512, got {global_E}"
     assert (
         dtype == dtypes.bf16
     ), f"fused_moe_router: moe_buf is zero-filled as bf16, got out {dtype=}"
