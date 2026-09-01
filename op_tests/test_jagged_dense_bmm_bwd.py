@@ -7,8 +7,9 @@ Correctness (pytest, Mi=512): dispatch config resolution, checkAllclose vs torch
 reference on all three grads (dJagged, dDense, dBias), empty-group zero checks in skew
 regime, tail-over-read regression,
 forced split=2 reduce-path coverage, end-to-end autograd at headline shapes,
-multi-device backward (cuda:1 tensors, current device cuda:0), and large-B
-(n_groups>=8192) int32 offset boundary at D=512.
+multi-device backward (cuda:1 tensors, current device cuda:0), large-B
+(n_groups>=8192) int32 offset boundary at D=512, and deployment-shape
+(B=1024, Mi=7680, D=512) int64 seq_start rebase (L*D > 2^31).
 
 Performance (``main()``, Mi=7680): FlyDSL vs upstream Triton on headline deployment
 shapes, swept over regime and backward component (``jagged`` / ``dense_bias`` / ``all``).
@@ -98,6 +99,8 @@ _PERF_SHAPES = [
     (1024, 512, 512),
 ]
 _PERF_MI = 7680
+# Deployment headline: last-group seq_start*D exceeds int32 at D=512 (P2 int64-rebase).
+_INT64_REBASE_CASE = (1024, _PERF_MI, 512)
 
 
 def _make_seq_offsets(B, Mi, regime, seed=SEED, device="cuda", sparsity=0.95):
@@ -566,6 +569,21 @@ def test_jdbba_bwd_dispatch_worker(D):
 @pytest.mark.parametrize("D", [512, 384])
 def test_jdbba_bwd_reduce_path(D):
     ok, msg = _run_reduce_path_case(D, 120, 512, "genrec")
+    assert ok, msg
+
+
+@_requires_backend
+def test_jdbba_bwd_int64_rebase_production_L():
+    """grad_jagged / grad_dense_bias seq_start*D rebase at deployment L (P2).
+
+    Mi=512 headline cases keep L*D < 2^31; uniform B=1024 Mi=7680 D=512 gives
+    L≈7.86M and seq_start*D≈4G on the last group, which wrapped int32 bases
+    before the Int64 rebase. Needs ~16 GiB device memory for jagged/dOut.
+    """
+    B, Mi, D = _INT64_REBASE_CASE
+    L = B * Mi
+    assert L * D > 2**31, f"precondition: L*D must exceed 2^31 (got {L * D})"
+    ok, msg = _run_case(D, B, Mi, "uniform", label="[int64-rebase] ")
     assert ok, msg
 
 
