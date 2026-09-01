@@ -21,6 +21,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-used-gib", type=float, default=2.0)
     parser.add_argument("--min-free-gib", type=float, default=16.0)
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="print every eligible HIP index in preference order, one per line, so a caller "
+        "whose lock on the first choice is contended can fall through to the next instead of "
+        "reporting no idle GPU while idle GPUs remain",
+    )
     args = parser.parse_args()
     if args.samples < 1 or args.interval < 0:
         parser.error("samples must be positive and interval must be non-negative")
@@ -119,9 +126,7 @@ def sample(amdsmi, count: int, interval: float) -> tuple[list[dict], int]:
                 "used_gib": used,
                 "free_gib": total - used,
                 "peak_gfx": max(gpu["gfx"]) if gpu["gfx"] else None,
-                "mean_gfx": (
-                    sum(gpu["gfx"]) / len(gpu["gfx"]) if gpu["gfx"] else None
-                ),
+                "mean_gfx": (sum(gpu["gfx"]) / len(gpu["gfx"]) if gpu["gfx"] else None),
                 "peak_umc": max(gpu["umc"]) if gpu["umc"] else None,
             }
         )
@@ -236,6 +241,10 @@ def main() -> int:
             f"(amd-smi {selected['smi_index']}, {selected['bdf']}).",
             file=sys.stderr,
         )
+    if args.all:
+        for gpu in eligible:
+            print(gpu["hip_index"])
+        return 0
     print(selected["hip_index"])
     return 0
 
