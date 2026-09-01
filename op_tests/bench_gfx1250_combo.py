@@ -74,6 +74,12 @@ Other variables:
 
     ENABLE_CK=0                        set before importing aiter; the module
                                        already setdefault()s it.
+    GPU_ARCHS / CU_NUM                 detected once here and exported to every
+                                       child, so no child runs rocminfo. Four
+                                       ranks starting at once contend for
+                                       rocminfo's rocm_smi mutex and a rank can
+                                       lose it outright -- see _pin_arch. Set
+                                       either yourself and yours wins.
 
 mega_moe at tokens/rank=65536 fails in setup(), asking 7.5 GB for cco's VMM
 arena against a 4 GiB default. MORI_SHMEM_HEAP_SIZE does not reach that arena
@@ -270,7 +276,7 @@ with _silence():
 
     import aiter
     from aiter import dtypes
-    from aiter.jit.utils.chip_info import get_gfx
+    from aiter.jit.utils.chip_info import get_cu_num, get_gfx
     from aiter.test_common import run_perftest
 
 SUPPORTED_GFX = ["gfx1250"]
@@ -920,6 +926,29 @@ def _keep_going(label):
             pass
 
 
+def _pin_arch(env):
+    """Hand the child the arch we already know, so it never runs rocminfo.
+
+    chip_info shells out to rocminfo twice -- once for the arch, once for the
+    CU count -- and rocminfo takes a per-device rocm_smi mutex on the way in.
+    One process is fine. A torchrun op starts four ranks at once, and they
+    contend for that mutex: on 20260901/b45-1 a rank lost it and aborted
+    ("init_mutex /rocm_smi_renderD128: unlock timed lock", surfacing as
+    "Allgather operation failed" once the dead rank took the collective with
+    it), and on b45-2 four rocminfo processes sat in it for minutes, one of
+    them wedged in D state. Both cost a whole op; the nine single-GPU ops
+    never noticed, because one process has nobody to contend with.
+
+    GPU_ARCHS covers get_gfx_list, CU_NUM covers get_cu_num -- both are read
+    from the environment before either shells out. Detected once here, in this
+    process, where the call is serial. Not forced: an explicit setting from
+    the caller wins.
+    """
+    env.setdefault("GPU_ARCHS", get_gfx())
+    env.setdefault("CU_NUM", str(get_cu_num()))
+    return env
+
+
 def _run_child(name, cmd, cwd, env=None, extract=None, timeout=None, tail=30,
                kernels=True):
     """Run a child UT with its output captured and surface only its results.
@@ -930,6 +959,9 @@ def _run_child(name, cmd, cwd, env=None, extract=None, timeout=None, tail=30,
     when the child fails or emits nothing recognisable.
     """
     extract = extract or _DEFAULT_EXTRACT
+    # env=None means "inherit ours", which already carries these two.
+    if env is not None:
+        _pin_arch(env)
     try:
         proc = subprocess.run(
             cmd, cwd=cwd, env=env, text=True, timeout=timeout,
@@ -1726,6 +1758,9 @@ def main():
             f"combo bench targets {SUPPORTED_GFX} only; current {get_gfx()} — skipping"
         )
         return
+    # Before any child is spawned: children that inherit our environ (env=None)
+    # get these too, not just the ones handed an explicit env. See _pin_arch.
+    _pin_arch(os.environ)
 
     p = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
