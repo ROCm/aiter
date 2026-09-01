@@ -174,11 +174,13 @@ def kunroll_for(k, BK):
 
 
 def kas_c_k1_for(k):
-    return (k // 32) // 4 // 2
+    # Scale shuffling groups eight 1x32 scales (K=256) and pads the final
+    # group.  Keep the accounting in sync for K values such as 4224.
+    return (k + 255) // 256
 
 
 def kbs_c_k1_for(k):
-    return (k // 32) // 4 // 2
+    return (k + 255) // 256
 
 
 def kbs_stride_n0_dw_for(k):
