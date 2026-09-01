@@ -4,6 +4,7 @@
 import os
 
 import pytest
+import torch
 
 os.environ.setdefault("AITER_AOT_IMPORT", "1")
 
@@ -17,6 +18,7 @@ from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
     select_mega_moe_config,
     stage1_bundle_identity,
 )
+from aiter.ops.flydsl.kernels.mega_moe.mega_moe_v2 import MegaMoEV2
 
 
 def test_preload_compiled_prefers_native_no_dispatch_api(monkeypatch):
@@ -35,6 +37,22 @@ def test_preload_compiled_prefers_native_no_dispatch_api(monkeypatch):
 
     assert tensor_shim._preload_compiled(FakeLaunch(), 1, 2) == "native-artifact"
     assert events == [("preload", (1, 2))]
+
+
+def test_zero_token_quantize_does_not_launch_a_kernel(monkeypatch):
+    moe = object.__new__(MegaMoEV2)
+    moe._s1_quant_x = torch.empty((1, 32), dtype=torch.uint8)
+    moe._s1_quant_scale = torch.empty((1, 1), dtype=torch.uint8)
+    x = torch.empty((0, 32), dtype=torch.bfloat16)
+
+    monkeypatch.setattr(
+        "aiter.ops.flydsl.kernels.mega_moe.mega_moe_v2.per_1x32_mx_quant",
+        lambda *_args, **_kwargs: pytest.fail("zero-token quant must not launch"),
+    )
+
+    quant, scale = moe.quantize(x)
+    assert quant.shape == (0, 32)
+    assert scale.shape == (0, 1)
 
 
 @pytest.mark.parametrize("old_value", [None, "0"])

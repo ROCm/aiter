@@ -732,6 +732,10 @@ class MegaMoEV2:
         return self._s1_active_tile_m
 
     def quantize(self, x_bf16):
+        if x_bf16.shape[0] == 0:
+            # A zero-token rank still participates in the downstream
+            # collectives, but HIP rejects a zero-grid quant kernel launch.
+            return self._s1_quant_x[:0], self._s1_quant_scale[:0]
         return per_1x32_mx_quant(x_bf16, quant_mode="fp8")
 
     def _run_joint(
