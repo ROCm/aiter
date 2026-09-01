@@ -458,6 +458,7 @@ class FlyDSLDispatchGroupMajorOp:
         self.scale_em = self._sym(
             (max(1, payload_rows * self.scale_n_i32),), torch.int32
         )
+        self.idx_em = self._sym((nvm,), torch.int32)
         self.wts_em = self._sym((nvm,), torch.float32)
         self.srcmap_em = self._sym((nvm,), torch.int32)
         self.gb1 = torch.zeros(1, dtype=torch.int64, device=self._dev)
@@ -523,6 +524,7 @@ class FlyDSLDispatchGroupMajorOp:
         self.p2p_running = self._p2p_table(self.running)
         self.p2p_rx_em = self._p2p_table(self.rx_em)
         self.p2p_scale_em = self._p2p_table(self.scale_em)
+        self.p2p_idx_em = self._p2p_table(self.idx_em)
         self.p2p_wts_em = self._p2p_table(self.wts_em)
         self.p2p_srcmap_em = self._p2p_table(self.srcmap_em)
         self.p2p_recv_num = self._p2p_table(
@@ -555,6 +557,7 @@ class FlyDSLDispatchGroupMajorOp:
             "rx_em": rx_em_view,
             "scale_em": scale_em_view,
             "scale_em_i32": scale_em_i32,
+            "idx_em": self.idx_em,
             "wts_em": self.wts_em,
             "srcmap_em": self.srcmap_em,
             "sorted_expert_ids": self.sorted_expert_ids,

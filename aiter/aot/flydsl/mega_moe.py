@@ -17,7 +17,6 @@ import torch
 
 from aiter.aot.flydsl.common import compile_only_env, override_env, run_jobs_parallel
 from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
-    INDEXED_PAYLOAD_MIN_MTPR,
     build_mega_moe_bundle_plan,
 )
 
@@ -73,7 +72,6 @@ def _compile_stage1(mtpr, experts_per_rank, rank, plan):
     )
     from aiter.ops.flydsl.kernels.mega_moe.mega_moe_stage1 import (
         compile_mega_moe_stage1_bundle,
-        stage1_bundle_variant_groups,
     )
     from aiter.ops.flydsl.kernels.mega_moe.quant import _get_launcher
 
@@ -144,49 +142,43 @@ def _compile_stage1(mtpr, experts_per_rank, rank, plan):
         fx.Stream(None),
     )
 
-    for variants in stage1_bundle_variant_groups(
-        plan.stage1_variants,
-        indexed_payload=(
-            not plan.fixed_slot_dispatch and mtpr >= INDEXED_PAYLOAD_MIN_MTPR
-        ),
-    ):
-        launch = compile_mega_moe_stage1_bundle(
-            model_dim=MODEL_DIM,
-            inter_dim=INTER_DIM,
-            rank=rank,
-            experts_per_rank=experts_per_rank,
-            fuse_npes=WORLD_SIZE,
-            fuse_topk=TOPK,
-            fuse_cap=WORLD_SIZE * mtpr,
-            fuse_mtpr=mtpr,
-            fuse_scale_dim=MODEL_DIM // 32,
-            fixed_slot_dispatch=plan.fixed_slot_dispatch,
-            num_cu=NUM_CU,
-            tile_state_stride=tile_state_stride,
-            variants=variants,
-            swiglu_limit=SWIGLU_LIMIT,
-        )
-        launch(
-            _tensor((1, INTER_DIM), torch.float8_e4m3fn),
-            _tensor((1, MODEL_DIM), torch.float8_e4m3fn),
-            # Keep every non-unit dimension larger than one so FlyDSL records the
-            # same contiguous-stride signature as the runtime weight tensor.  An
-            # all-ones placeholder makes the first dimension look unit-strided and
-            # produces an AOT cache key that the real tensor can never reuse.
-            _tensor((2, 2, 2), torch.uint8),
-            _tensor((1, MODEL_DIM // 128), torch.int32),
-            _tensor((2, 2), torch.uint8),
-            _tensor((1,), torch.int32),
-            _tensor((1,), torch.int32),
-            _tensor((2,), torch.int32),
-            _tensor((1,), torch.uint8),
-            fx.Int32(1),
-            fx.Int64(0),
-            fx.Int32(1),
-            *([fx.Int64(0)] * 6),
-            fx.Int32(0),
-            fx.Stream(None),
-        )
+    launch = compile_mega_moe_stage1_bundle(
+        model_dim=MODEL_DIM,
+        inter_dim=INTER_DIM,
+        rank=rank,
+        experts_per_rank=experts_per_rank,
+        fuse_npes=WORLD_SIZE,
+        fuse_topk=TOPK,
+        fuse_cap=WORLD_SIZE * mtpr,
+        fuse_mtpr=mtpr,
+        fuse_scale_dim=MODEL_DIM // 32,
+        fixed_slot_dispatch=plan.fixed_slot_dispatch,
+        num_cu=NUM_CU,
+        tile_state_stride=tile_state_stride,
+        variants=plan.stage1_variants,
+        swiglu_limit=SWIGLU_LIMIT,
+    )
+    launch(
+        _tensor((1, INTER_DIM), torch.float8_e4m3fn),
+        _tensor((1, MODEL_DIM), torch.float8_e4m3fn),
+        # Keep every non-unit dimension larger than one so FlyDSL records the
+        # same contiguous-stride signature as the runtime weight tensor.  An
+        # all-ones placeholder makes the first dimension look unit-strided and
+        # produces an AOT cache key that the real tensor can never reuse.
+        _tensor((2, 2, 2), torch.uint8),
+        _tensor((1, MODEL_DIM // 128), torch.int32),
+        _tensor((2, 2), torch.uint8),
+        _tensor((1,), torch.int32),
+        _tensor((1,), torch.int32),
+        _tensor((2,), torch.int32),
+        _tensor((1,), torch.uint8),
+        fx.Int32(1),
+        fx.Int64(0),
+        fx.Int32(1),
+        *([fx.Int64(0)] * 6),
+        fx.Int32(0),
+        fx.Stream(None),
+    )
 
 
 def _compile_stage2(mtpr, experts_per_rank, rank, plan):

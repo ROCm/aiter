@@ -18,9 +18,6 @@ from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
     select_mega_moe_config,
     stage1_bundle_identity,
 )
-from aiter.ops.flydsl.kernels.mega_moe.mega_moe_stage1 import (
-    stage1_bundle_variant_groups,
-)
 from aiter.ops.flydsl.kernels.mega_moe.mega_moe_v2 import MegaMoEV2
 
 
@@ -139,7 +136,7 @@ def test_role_retirement_is_not_a_configurable_stage1_variant():
         assert stage1.payload_tile_ready
 
 
-def test_indexed_payload_does_not_add_a_tuning_dimension():
+def test_default_prefill_keeps_payload_deduplication_disabled():
     plan = build_mega_moe_bundle_plan(8192)
     rank_tokens = (1, 8, 32, 128, 256, 512, 4096, 8192)
     configs = tuple(
@@ -147,19 +144,6 @@ def test_indexed_payload_does_not_add_a_tuning_dimension():
     )
 
     assert all(not getattr(config, "deduplicate_payload", False) for config in configs)
-
-
-def test_only_indexed_payload_splits_stage1_bundle_by_sbm():
-    variants = build_mega_moe_bundle_plan(8192).stage1_variants
-
-    assert stage1_bundle_variant_groups(variants, indexed_payload=False) == (variants,)
-    groups = stage1_bundle_variant_groups(variants, indexed_payload=True)
-    grouped_variants = tuple(config for group in groups for config in group)
-    assert len(grouped_variants) == len(variants)
-    assert set(grouped_variants) == set(variants)
-    assert len(groups) == 2
-    assert all(config.sort_block_m < 128 for config in groups[0])
-    assert all(config.sort_block_m >= 128 for config in groups[1])
 
 
 @pytest.mark.parametrize("mtpr", [8192, 16384, 32768])

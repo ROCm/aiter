@@ -36,7 +36,7 @@ class _LdsF32View:
 @flyc.jit
 def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
     a_scale_lds, a_lds_i32, K_ITERS, M_REPEAT, NUM_ACC_N, A_K_STEP_BYTES, pipe_weights,
-    mfma_amajor, async_a_copy, trb_rsrc, tib_rsrc, indirect_input, indexed_input):
+    mfma_amajor, async_a_copy, trb_rsrc, tib_rsrc, indirect_input):
 # fmt: on
     N_ACC = M_REPEAT * NUM_ACC_N
     NUM_B_SCALE = NUM_ACC_N // _PACK
@@ -50,8 +50,6 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
     tile_input_base = tile_row_base
     if const_expr(indirect_input):
         tile_input_base = _buffer_load(tib_rsrc, m_tile, fx.Int32)
-    if const_expr(indexed_input):
-        tile_input_base = tile_row_base
     b_row = sched.gate_base_row(expert) + n_tile_base
     a_gather.for_tile(tile_input_base)
     if const_expr(pipe_weights):
@@ -337,7 +335,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
             a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
             a_scale_lds, a_lds_i32, k_iters, m_repeat, num_acc_n,
             a_k_step_bytes, pipe_weights, mfma_amajor, async_a_copy,
-            trb_rsrc, tib_rsrc, indirect_input, indexed_input)
+            trb_rsrc, tib_rsrc, indirect_input)
         # fmt: on
 
     return expert_of_flat, do_scheduled_tile

@@ -453,19 +453,6 @@ class AScaleLoader:
             def copy_chunk(lin: fx.Int32):
                 if lin < fx.Int32(n16):
                     source_group = (base + lin * fx.Int32(16)) // fx.Int32(16)
-                    if const_expr(self._indexed_input):
-                        byte_offset = lin * fx.Int32(16)
-                        row = byte_offset // fx.Int32(self._n_scale)
-                        column = byte_offset - row * fx.Int32(self._n_scale)
-                        packed = _buffer_load(
-                            self._row_map_rsrc,
-                            tile_row_base_i32 + row,
-                            fx.Int32,
-                        )
-                        source_row = packed & fx.Int32(0xFFFFFF)
-                        source_group = (
-                            source_row * fx.Int32(self._n_scale) + column
-                        ) // fx.Int32(16)
                     copy_group(lin, source_group)
 
             for c in range_constexpr(0, n16, self._total_threads):
