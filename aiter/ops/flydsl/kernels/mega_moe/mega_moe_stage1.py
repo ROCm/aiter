@@ -6,6 +6,7 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl.compiler.jit_function import _jit_function_cache_key
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -843,7 +844,15 @@ def compile_mega_moe_stage1_bundle(
         )
         for config in variants
     )
-    kernels = tuple(spec.kernel for spec in specs)
+    # FlyDSL treats tuples as scalar closure values when it builds the JIT
+    # manager key.  A tuple of KernelFunction objects therefore hashes their
+    # process-local repr (including object addresses), which makes an AOT
+    # artifact impossible to reuse in a service process.  Keep the executable
+    # objects in a list and capture stable dependency fingerprints separately.
+    kernels = [spec.kernel for spec in specs]
+    kernel_cache_keys = tuple(
+        _jit_function_cache_key(spec.kernel._original_func) for spec in specs
+    )
     grid_xs = tuple(spec.grid_x for spec in specs)
     block_xs = tuple(spec.block_x for spec in specs)
     waves_per_eu = tuple(spec.waves_per_eu_hint for spec in specs)
@@ -871,7 +880,7 @@ def compile_mega_moe_stage1_bundle(
         variant_id: fx.Int32,
         stream: fx.Stream,
     ):
-        for index in range_constexpr(len(kernels)):
+        for index in range_constexpr(len(kernel_cache_keys)):
             if variant_id == fx.Int32(index):
                 kernels[index](
                     out,
