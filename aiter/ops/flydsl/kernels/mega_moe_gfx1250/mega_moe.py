@@ -492,17 +492,20 @@ class MegaMoEGfx1250:
                 f"got {tuple(topk_ids.shape)}"
             )
         stage1_dispatch = None
-        # At mtpr<=64 the compact persistent protocol costs more than the GEMM:
-        # count/base round-trips and reserved producer CUs dominate ~140us of
-        # useful GEMM1 work. The fixed-recv experiments also showed that adding
-        # a receiver compact phase to the same persistent grid serializes the
-        # tile-ready path. Keep the proven recv-slot dispatch plus the ~4us
-        # standalone preshuffle for this knee; larger buckets retain fused
-        # compact dispatch.
-        use_fused_stage1 = (
-            self._config.fused_stage1
-            and self._config.max_tokens_per_rank > 64
-        )
+        # ``fused_stage1`` alone decides this: the caller asked for the fused
+        # path, so every bucket takes it.
+        #
+        # It is slower than recv-slot dispatch at every measured size, so this
+        # is a correctness/architecture switch and not a performance one.
+        # Per-layer at 4 ranks, e384/topk6/hd7168, recv-slot vs fused:
+        # mtpr 64 311/565us, 128 388/558, 256 590/882, 512 605/1040,
+        # 1024 648/1186. The cost is the payload producer, which spends ~600us
+        # of a 512-token layer moving what the standalone ep_dispatch_tdm does
+        # in 46us; see the group-major note in dispatch_compact. mtpr<=64 is the
+        # worst ratio because the single-CTA planner and the reserved producer
+        # CUs are close to fixed cost and there is no longer a GEMM big enough
+        # to hide them behind.
+        use_fused_stage1 = self._config.fused_stage1
         if use_fused_stage1:
             stream = fx.Stream(torch.cuda.current_stream())
             warps = self._wire_quant.warps_per_block

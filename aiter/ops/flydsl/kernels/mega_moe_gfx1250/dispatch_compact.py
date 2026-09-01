@@ -30,6 +30,21 @@ Synchronization invariants
 * TDM tensor counters and remote scale stores are drained before tile progress
   is incremented, so the tile counter is the only GEMM-readiness gate.
 
+Why the payload walk is group-major
+-----------------------------------
+A producer claims ``(destination, expert)`` tasks and moves that task's rows,
+which means a token routed to several of one destination's experts is loaded
+once per route rather than once per token.  Amortizing those loads by walking
+tokens instead was measured and is a large net loss (tpr=512, 4 ranks:
+1038us -> 1747us per layer).  Group-major keeps a block's rows contiguous in
+the destination -- four waves filling ~8 consecutive whole rows -- and that
+write locality is worth far more than the duplicate wire reads cost.  Token
+order scatters each of a token's rows into a different expert's region of a
+12288-row buffer, and the readiness atomics scatter with them.
+``dispatch_tdm``'s recv-slot dispatch gets both because its destination row is
+one slot per (token, peer), handed out block-local; compaction gives that up by
+construction, since the destination row is fixed by expert grouping.
+
 The input wire scale is row-major.  It must not be exposed as the grouped GEMM
 scale: that layout is ``(Mtile, K//128, wmma_rep, 16, 4)``.  Payload producers
 split one whole-row LDS load into a tightly packed payload store and scatter
@@ -50,6 +65,7 @@ from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels import communication_ops_utils as comm_ops
+from aiter.ops.flydsl.kernels import vector
 from aiter.ops.flydsl.kernels.communication_ops_utils import traced
 from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
     _scale_row_dword_base,
@@ -680,16 +696,22 @@ def emit_compact_payload(
         # store count drops 4x -- that store count is the bulk of the fused
         # producer's non-payload cost.
         scale_dwords = scale_bytes // 4
+        # Row-major transport lands one grouped row's whole e8m0 run
+        # contiguously, so the copy can go wider than a dword per lane. Four
+        # turns the 224B run into a single 16B-per-lane step instead of two
+        # 4B-per-lane ones, halving the fabric transactions. The interleaved
+        # layout scatters with a ``rows_per_tile`` stride and cannot widen.
+        scale_vec = 4 if scale_rowmajor and scale_dwords % 4 == 0 else 1
         wire_scale_dw_base = fx.Int32(source_token) * fx.Int32(wire_stride // 4) + fx.Int32(
             payload_bytes // 4
         )
-        for dw in range_constexpr(0, scale_dwords, WAVE):
-            dword = fx.Int32(dw) + lane
+        for dw in range_constexpr(0, scale_dwords, WAVE * scale_vec):
+            dword = fx.Int32(dw) + lane * fx.Int32(scale_vec)
             if dword < fx.Int32(scale_dwords):
                 value = buffer_ops.buffer_load(
                     _rsrc(fx.Int64(addr_in_wire)),
                     wire_scale_dw_base + dword,
-                    vec_width=1,
+                    vec_width=scale_vec,
                     dtype=T.i32,
                 )
                 if const_expr(scale_rowmajor):
@@ -729,15 +751,17 @@ def emit_compact_payload(
                 + source_token * fx.Int32(topk)
                 + topk_slot
             )
-            _store_i32(
-                _peer(window, destination, arena_offset, rowmap_offset),
+            # The two fields are adjacent, so ship them as one 8B store. Split
+            # into two dwords this is two fabric transactions per row, and at 8B
+            # of payload each that per-transaction cost is the whole price: the
+            # rowmap carries 1/900th of the payload's bytes and cost a third of
+            # its time.
+            buffer_ops.buffer_store(
+                vector.from_elements(
+                    T.vec(2, T.i32), [source_encoding, weight_bits]
+                ),
+                _rsrc(_peer(window, destination, arena_offset, rowmap_offset)),
                 destination_row * fx.Int32(2),
-                source_encoding,
-            )
-            _store_i32(
-                _peer(window, destination, arena_offset, rowmap_offset),
-                destination_row * fx.Int32(2) + fx.Int32(1),
-                weight_bits,
             )
 
     task = destination_group

@@ -174,10 +174,13 @@ def _stage1_dispatch_grid_mult(tokens: int, mtpr: int) -> int:
 
       1 planner + num_producer + first-wave consumers = CU
 
-    so ``num_producer + num_consumer`` on that wave is ``CU - 1``. Extra
-    consumer waves (grid_mult=2) help none of the gfx1250 tpr buckets: 64/128
-    nearly doubled, 256/512 were flat-to-worse. Default is one wave.
-    Override with ``AITER_FLYDSL_STAGE1_GRID_MULT``.
+    so ``num_producer + num_consumer`` on that wave is ``CU - 1``. Whether a
+    second wave pays depends on the producer count it is paired with: against
+    128 producers it is flat-to-worse everywhere, but once producers take the
+    whole first wave the GEMM has to live in the second one. Measured at
+    ``CU - 4`` producers, it wins from tpr=256 up (912 vs 929us at 256, 1063 vs
+    1089us at 512, 1219 vs 1234us at 1024) and still loses at tpr=128
+    (686 vs 560us). Override with ``AITER_FLYDSL_STAGE1_GRID_MULT``.
     """
     raw = os.environ.get("AITER_FLYDSL_STAGE1_GRID_MULT")
     if raw is not None:
@@ -188,8 +191,7 @@ def _stage1_dispatch_grid_mult(tokens: int, mtpr: int) -> int:
                 "1,2,3,4,6,8,12,16,24,32"
             )
         return value
-    _ = (tokens, mtpr)
-    return 1
+    return 2 if mtpr <= tokens and tokens >= 256 else 1
 
 
 def _stage1_compact_dispatch_cu(
@@ -214,17 +216,18 @@ def _stage1_compact_dispatch_cu(
     if raw != "auto":
         dispatch_cu = max(0, int(raw))
     else:
-        # Per-tpr knees on gfx1250 (61-layer, world=4). A second consumer wave
-        # is never the right default; producer count still tracks copy vs GEMM.
+        # Per-tpr knees on gfx1250 (61-layer, world=4). Producers are a pure
+        # bandwidth stage and the exact-MTPR buckets are starved for them, not
+        # for GEMM consumers: at tpr=512 the sweep runs 4715us (pb=4), 1570us
+        # (pb=32), 1334us (pb=128), 1074us (pb=192) and then plateaus, so take
+        # the whole first wave and let the second wave do the GEMM.
         _ = (experts_per_rank, model_dim, inter_dim)
         if mtpr > tokens:
             dispatch_cu = 64
         elif tokens <= 64:
             dispatch_cu = 128
-        elif tokens <= 256:
-            dispatch_cu = 192
         else:
-            dispatch_cu = 128
+            dispatch_cu = cu
     if world_size <= 0:
         raise ValueError("compact dispatch needs a positive world size")
     # Leave ticket 0 for the planner and at least one first-wave consumer.
