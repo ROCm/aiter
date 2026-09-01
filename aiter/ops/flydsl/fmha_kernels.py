@@ -353,6 +353,8 @@ def flydsl_flash_attn_batch_func(
         and dropout_p == 0.0
         and bias is None
         and alibi_slopes is None
+        and not deterministic
+        and (len(window_size) < 3 or window_size[2] == 0)
         and not return_attn_probs
     )
     if not supported:

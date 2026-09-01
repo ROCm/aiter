@@ -513,9 +513,9 @@ def checkAllclose(
     else:
         try:
             mask = ~isClose
-            num = mask.sum()
+            num = int(mask.sum().item())
             printNum = min(printNum, num)
-            percent = (num / denom).item()
+            percent = num / denom
             if not printLog:
                 if percent >= tol_err_ratio:
                     return percent
@@ -528,9 +528,9 @@ def checkAllclose(
             delta = (a_msked - b_msked).abs()
         except RuntimeError:
             mask = ~isClose.to("cpu")
-            num = mask.sum()
+            num = int(mask.sum().item())
             printNum = min(printNum, num)
-            percent = (num / denom).item()
+            percent = num / denom
             if not printLog:
                 if percent >= tol_err_ratio:
                     return percent

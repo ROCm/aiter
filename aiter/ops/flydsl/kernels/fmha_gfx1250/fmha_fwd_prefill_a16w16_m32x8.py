@@ -1357,45 +1357,48 @@ def _zero_fill_attention(
     q_len,
 ):
     """q_len>0 with kv_len==0 (cross-attention): softmax over an empty KV set, so
-    O=0 and LSE=-inf for this WG's valid query rows. Kept off the _core_attention
-    hot path; mirrors the O/LSE epilogue's masked-buffer_store row addressing."""
-    lane_idx = _lane_id()
-    warp_idx = _warp_id()
-    _, q_head_idx, seq_idx = _packed_tile_indices(gqa_ratio, warp_idx, lane_idx)
-    khalf0 = (lane_idx // fx.Int32(WMMA_M)) == fx.Int32(0)  # store once per lane pair
-    _CH = 8  # bf16 elems per b128 store
+    O=0 and LSE=-inf for this WG's valid query rows. Flat coalesced b128 write —
+    consecutive lanes write consecutive 16-byte O chunks (no WMMA layout)."""
+    tid = _warp_id() * fx.Int32(WAVE_SIZE) + _lane_id()
+    kv_head = fx.Int32(gpu.block_id("y"))
+    row0 = fx.Int32(gpu.block_id("x")) * fx.Int32(BLOCK_M)
+    g = fx.Int32(gqa_ratio)
+    _CH = 8  # bf16 per b128 store
+    cpr = v_hdim // _CH  # b128 chunks per O row
 
     o_num_records_bytes = (q_start + q_len) * stride_o_seq * fx.Int32(2)
     o_rsrc = buffer_ops.create_buffer_resource(
         ptr_O, num_records_bytes=o_num_records_bytes
     )
     zero_o = fx.Vector.filled(_CH, 0.0, fx.BFloat16)
-    for qt in range(WMMA_ROW_PER_WAVE):
-        valid = khalf0 & (seq_idx[qt] < q_len)
-        row_base = (q_start + seq_idx[qt]) * stride_o_seq + q_head_idx[
-            qt
-        ] * stride_o_head
-        for c in range(v_hdim // _CH):
-            off_bytes = (row_base + fx.Int32(c * _CH)) * fx.Int32(2)
-            off_masked = valid.select(off_bytes, fx.Int32(0x7FFFFFFF))
-            buffer_ops.buffer_store(
-                zero_o, o_rsrc, off_masked, mask=None, offset_is_bytes=True
-            )
+    for r in range(BLOCK_M * cpr // BLOCK_SIZE):
+        cix = fx.Int32(r * BLOCK_SIZE) + tid  # flat b128-chunk index this round
+        prow = row0 + cix // fx.Int32(cpr)
+        d = (cix % fx.Int32(cpr)) * fx.Int32(_CH)
+        seq = prow // g
+        head = kv_head * g + prow % g
+        off = (q_start + seq) * stride_o_seq + head * stride_o_head + d
+        off_masked = (seq < q_len).select(off * fx.Int32(2), fx.Int32(0x7FFFFFFF))
+        buffer_ops.buffer_store(
+            zero_o, o_rsrc, off_masked, mask=None, offset_is_bytes=True
+        )
 
     if return_lse:
         lse_rsrc = buffer_ops.create_buffer_resource(
             ptr_LSE, num_records_bytes=lse_num_records_bytes
         )
-        neg_inf = fx.Float32(float("-inf"))
-        for qt in range(WMMA_ROW_PER_WAVE):
-            valid = khalf0 & (seq_idx[qt] < q_len)
-            off_el = (q_start + seq_idx[qt]) * stride_lse_seq + q_head_idx[
-                qt
-            ] * stride_lse_head
-            off_masked = valid.select(off_el * fx.Int32(4), fx.Int32(0x7FFFFFFF))
-            buffer_ops.buffer_store(
-                neg_inf, lse_rsrc, off_masked, mask=None, offset_is_bytes=True
-            )
+        prow = row0 + tid  # one LSE per packed row (BLOCK_SIZE threads == BLOCK_M)
+        seq = prow // g
+        head = kv_head * g + prow % g
+        off = (q_start + seq) * stride_lse_seq + head * stride_lse_head
+        off_masked = (seq < q_len).select(off * fx.Int32(4), fx.Int32(0x7FFFFFFF))
+        buffer_ops.buffer_store(
+            fx.Float32(float("-inf")),
+            lse_rsrc,
+            off_masked,
+            mask=None,
+            offset_is_bytes=True,
+        )
 
 
 # ============================================================================
