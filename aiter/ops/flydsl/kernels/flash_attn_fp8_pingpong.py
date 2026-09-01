@@ -1265,10 +1265,11 @@ def build_flash_attn_fp8_module(
         if is_g0:
             dma_k(fx.Index(0), fx.Index(0))
         else:
+            rocdl.s_setprio(1)
             dma_v(fx.Index(0), fx.Index(0))
             dma_v(fx.Index(1), fx.Index(BLOCK_N))
+            rocdl.s_setprio(0)
 
-        _wait_vmcnt()
         _wait_lgkmcnt()
         _gpu_barrier()
 
@@ -1312,6 +1313,7 @@ def build_flash_attn_fp8_module(
                 l_koffs = get_lds_koffs(_k_slot(1))
                 ## HBM k offs
                 g_koffs = get_hbm_koffs(BLOCK_N)
+                _wait_vmcnt(0)
                 s_accs, v_preloaded = do_qk(
                     _k_base_row(k_buff_off),
                     k_preloaded_prologue,
@@ -1492,6 +1494,7 @@ def build_flash_attn_fp8_module(
                 l_voffs = get_lds_voffs(_v_slot(2))
                 ## HBM v offs
                 g_voffs = get_hbm_voffs(2 * BLOCK_N)
+                _wait_vmcnt(4)
                 s_accs, v_preloaded = do_qk(
                     _k_base_row(k_buff_off),
                     k_preloaded_prologue,
@@ -1500,6 +1503,7 @@ def build_flash_attn_fp8_module(
                 )
                 m_bias, s_accs = do_softmax_prepare(s_accs, m_init)
                 _sched_barrier()
+                _wait_vmcnt(0)
                 _gpu_barrier()
                 # Seed for the first loop body (iv == BLOCK_N), which loads the
                 # tile at iv + 2 * BLOCK_N.
