@@ -52,7 +52,30 @@ def find_seq_idx(
     return left - 1
 
 
-@triton.jit
+_kernel_unified_attention_2d_repr = make_kernel_repr(
+    "kernel_unified_attention_2d",
+    [
+        "num_query_heads",
+        "num_queries_per_kv",
+        "BLOCK_SIZE",
+        "TILE_SIZE",
+        "HEAD_SIZE",
+        "HEAD_SIZE_PADDED",
+        "USE_ALIBI_SLOPES",
+        "USE_QQ_BIAS",
+        "USE_SOFTCAP",
+        "USE_SINKS",
+        "SLIDING_WINDOW",
+        "BLOCK_Q",
+        "BLOCK_M",
+        "ALL_DECODE",
+        "SHUFFLED_KV_CACHE",
+        "K_WIDTH",
+    ],
+)
+
+
+@triton.jit(repr=_kernel_unified_attention_2d_repr)
 def kernel_unified_attention_2d(
     output_ptr,  # [num_tokens, num_query_heads, head_size]
     query_ptr,  # [num_tokens, num_query_heads, head_size]

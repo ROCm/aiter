@@ -264,6 +264,11 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
     experiment with multi-destination scattering without changing the quant math.
     Shared verbatim by both stage1 and stage2; only the preamble that computes
     ``c.dests`` differs.
+
+    With ``c.prequantized`` the source row is already an MX payload plus a
+    separate e8m0 row (``c.src_scale_base`` / ``c.src_scale_bytes_per_row``, and
+    ``c.feat_bytes_per_row`` sized for the payload, not for bf16): the first pass
+    loads what it would otherwise have computed, and the store pass is unchanged.
     """
     i32 = c.i32
     f32 = c.f32
@@ -290,13 +295,54 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
         hidden_row_addr, num_records_bytes=c.feat_bytes_per_row
     )
     feat_elem_base = arith.constant(0, type=i32)
+
+    # Pre-quantized source: load what the quant pass would have computed, so the
+    # store pass below stays shared. That destination arithmetic has already
+    # moved once (to WMMA-contiguous); a second copy of it would fail silently,
+    # by writing to the wrong offset.
+    prequantized = getattr(c, "prequantized", False)
+    src_scale_rsrc = None
+    if const_expr(prequantized):
+        c2_i32 = arith.constant(2, type=i32)
+        # Its own stride: a sender pads the e8m0 row (mori pads to 128 B so every
+        # token's TDM run starts aligned), so it is a build constant rather than
+        # feat_dim // 32.
+        src_scale_rsrc = buffer_ops.create_buffer_resource_from_addr(
+            c.src_scale_base + fx.Uint64(c.feat_row_i32) * c.src_scale_bytes_per_row,
+            num_records_bytes=c.src_scale_bytes_per_row,
+        )
+
     quant_results = []
     for it in range_constexpr(c.block_iters):
         # MX block (along K) this lane works on this iteration.
         mx_block = (mx_group_base + arith.constant(it, type=i32)) * arith.constant(
             c.mx_blocks_per_wave_iter, type=i32
         ) + c.block_in_wave
-        if const_expr(c.use_pk8):
+        if const_expr(prequantized):
+            # This lane's payload bytes sit at exactly the offset the store pass
+            # writes them to, so both sides share the expression and cannot drift.
+            # fp8: 8 B/lane = 2 dwords; fp4: 4 B/lane = 1 dword -- the same types
+            # the pk8 converts produce, so the store needs no special case.
+            byte_off = (
+                mx_block * c.c_payload_bytes_per_block
+                + c.lane_in_block * c.c_payload_bytes_per_lane
+            )
+            payload_val = buffer_ops.buffer_load(
+                hidden_rsrc,
+                byte_off >> c2_i32,
+                vec_width=c.payload_dwords_per_lane,
+                dtype=i32,
+            )
+            # Every lane of an MX block loads the same e8m0 byte (one cache line)
+            # and only the lead lane stores it. Unconditional on purpose: a value
+            # defined inside an scf.if would not dominate the store pass below.
+            e8m0_byte = buffer_ops.buffer_load(
+                src_scale_rsrc, mx_block, vec_width=1, dtype=T.i8
+            )
+            # Widen so the store pass's trunci sees the same i32 it does on the
+            # quant path, where e8m0 comes out of emit_mx_e8m0_scale as i32.
+            e8m0_scale = arith.extui(i32, ArithValue(e8m0_byte))
+        elif const_expr(c.use_pk8):
             # gfx1250 native pk8: 8 contiguous bf16 cols this lane.
             # col_base = mx_block*32 + lane_in_block*8.
             col_base = (
@@ -1289,6 +1335,8 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     source_topk: int = 0,
     remap_rows: bool = False,
     ksplit: bool = True,
+    prequantized: bool = False,
+    src_scale_bytes_per_row: int = 0,
 ):
     """Route-indexed grouped quant+preshuffle.
 
@@ -1299,6 +1347,13 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     across ``grid.y = block_iters`` so each workgroup handles one K-group.
     When ``ksplit=False`` (large token counts where grid.x already saturates),
     ``grid.y = 1`` and each warp loops over all K-groups internally.
+
+    ``prequantized`` says ``grouped_in`` is an MX payload the sender already
+    produced (fp8 or fp4 EP dispatch) and ``src_scale`` its row-major e8m0 rows,
+    ``src_scale_bytes_per_row`` apart. The kernel then keeps the route gather and
+    the scale preshuffle and drops only the quant -- the preshuffle cannot move
+    to the sender, because its destination is a function of the grouped row THIS
+    rank assigns, which no sender knows.
     """
     L = _quant_layout(feat_dim, quant_mode, wmma_rep)
     if not L.use_pk8:
@@ -1324,15 +1379,34 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     block_iters = L.block_iters
     amax_shuffle_dists = L.amax_shuffle_dists
 
+    if prequantized:
+        assert src_scale_bytes_per_row >= L.scale_bytes_per_row, (
+            f"src_scale_bytes_per_row {src_scale_bytes_per_row} cannot hold "
+            f"{L.scale_bytes_per_row} e8m0 bytes for feat_dim {feat_dim}"
+        )
+    # The payload row IS the source row here, so the loop's bounds and its
+    # per-lane offsets both come off the payload geometry.
+    src_bytes_per_row = payload_bytes_per_row if prequantized else feat_dim * 2
+    payload_dwords_per_lane = payload_bytes_per_lane // 4
+    if prequantized:
+        assert payload_bytes_per_lane % 4 == 0, (
+            f"prequantized load is dword-wide; {quant_mode} gives "
+            f"{payload_bytes_per_lane} B/lane"
+        )
+
     source_tag = f"srctk{source_topk}" if source_topk > 0 else "srcrow"
     remap_tag = "_remap" if remap_rows else ""
     ksplit_tag = "" if ksplit else "_noKS"
+    # In the name because it changes what the kernel READS, not just how fast:
+    # two builds with the same feat_dim/quant_mode are not interchangeable.
+    prequant_tag = f"_pq{src_scale_bytes_per_row}" if prequantized else ""
     source_topk_is_pow2 = source_topk > 0 and (source_topk & (source_topk - 1)) == 0
     source_topk_shift = source_topk.bit_length() - 1 if source_topk_is_pow2 else 0
 
     module_name = (
         f"moe_fused_quant_preshuffle_routeks_fd{feat_dim}_r{wmma_rep}"
         f"_{quant_mode}_{L.native_tag}_{source_tag}{remap_tag}{ksplit_tag}"
+        f"{prequant_tag}"
     )
 
     @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
@@ -1345,6 +1419,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         route_max_m: Int32,  # masked route stride, read iff remap_rows
         numel: Int32,
         num_valid_routes: fx.Pointer,  # (1,) int32: routes >= this are dead-tail padding (EP dynamic token count); skip
+        src_scale: fx.Pointer,  # (tokens, src_scale_bytes_per_row) e8m0, read iff prequantized
     ):
         """Write masked or contiguous ``(Mtile, K//128, wmma_rep, 16, 4)`` scales."""
         i32 = T.i32
@@ -1469,8 +1544,12 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                 payload_base=payload_base,
                 payload_bytes_per_row=payload_bytes_per_row,
                 hidden_base=hidden_base,
-                feat_bytes_per_row=feat_dim * 2,
+                feat_bytes_per_row=src_bytes_per_row,
                 feat_row_i32=feat_row_i32,
+                prequantized=prequantized,
+                payload_dwords_per_lane=payload_dwords_per_lane,
+                src_scale_base=fx.Int64(ptrtoint(src_scale)),
+                src_scale_bytes_per_row=src_scale_bytes_per_row,
                 mx_blocks_per_wave_iter=mx_blocks_per_wave_iter,
                 mx_blocks_per_row=mx_blocks_per_row,
                 amax_shuffle_dists=amax_shuffle_dists,
@@ -1518,6 +1597,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         route_max_m: fx.Int32,
         numel: fx.Int32,
         num_valid_routes: fx.Pointer,
+        src_scale: fx.Pointer,
         grid_route_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
@@ -1532,6 +1612,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
             route_max_m,
             numel,
             num_valid_routes,
+            src_scale,
         ).launch(
             grid=(grid_x, grid_y, 1),
             block=(BLOCK_THREADS, 1, 1),

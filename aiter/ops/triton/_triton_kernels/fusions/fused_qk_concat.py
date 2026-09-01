@@ -5,6 +5,7 @@ from aiter.ops.triton._triton_kernels.rope.rope import (
     _get_gptj_rotated_x_1D,
     _get_neox_rotated_x_1D,
 )
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 
 @triton.jit
@@ -38,7 +39,17 @@ def _unit_cat(
     tl.store(x_out_ptr + x_out_offs + (d2_offs + BLOCK_D1) * x_out_stride_d, x2)
 
 
-@triton.jit
+_qk_cat_kernel_repr = make_kernel_repr(
+    "_qk_cat_kernel",
+    [
+        "QH_PER_KH",
+        "BLOCK_D1",
+        "BLOCK_D2",
+    ],
+)
+
+
+@triton.jit(repr=_qk_cat_kernel_repr)
 def _qk_cat_kernel(
     q1_ptr,
     q2_ptr,
@@ -168,7 +179,20 @@ def _unit_rope_cat(
     tl.store(x_out_ptr + x_out_offs + (d_pe_offs + BLOCK_D_nope) * x_out_stride_d, x_pe)
 
 
-@triton.jit
+_qk_rope_cat_kernel_repr = make_kernel_repr(
+    "_qk_rope_cat_kernel",
+    [
+        "QH_PER_KH",
+        "BLOCK_D_nope",
+        "BLOCK_D_pe",
+        "BLOCK_D_HALF_pe",
+        "REUSE_FREQS_FRONT_PART",
+        "IS_NEOX",
+    ],
+)
+
+
+@triton.jit(repr=_qk_rope_cat_kernel_repr)
 def _qk_rope_cat_kernel(
     q_nope_ptr,
     q_pe_ptr,

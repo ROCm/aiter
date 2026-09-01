@@ -14,8 +14,8 @@ tolerance model used by the test suite, and how to add a new kernel.
 
 **In scope.**
 
-- Forward 2-D convolution on AMD ROCm/RDNA (WMMA-capable).
-- `fp16` and `bf16` inputs; configurable output dtype.
+- Forward 2-D convolution on AMD ROCm, optimized for RDNA GPUs.
+- `fp16` and `bf16` inputs; output dtype matches the input dtype.
 - NCHW and NHWC input layouts.
 - Optional fused bias add and activation (`relu`, `relu6`, `gelu`).
 - Drop-in replacement for `nn.Conv2d` for inference.
@@ -23,9 +23,10 @@ tolerance model used by the test suite, and how to add a new kernel.
 **Out of scope (today).**
 
 - **Backward / training.** Inference only. No grad support.
-- **`groups > 1`** (depthwise / grouped). Detected at the example layer and
-  left to PyTorch/MIOpen.
-- **`padding_mode != "zeros"`** (reflect / replicate / circular). Same fall-back.
+- **`groups > 1`** (depthwise / grouped). Callers must leave these on another
+  backend.
+- **`padding_mode != "zeros"`** (reflect / replicate / circular). Callers must
+  leave these on another backend.
 - **fp32 / fp8 inputs not supported.**
 
 ---
@@ -58,7 +59,9 @@ flowchart TD
     NHWC3 --> S2{_select_3x3_method}:::sel
     NHWCG --> KGn[/_conv2d_general/]:::kernel
 
-    S1 --> P1[repack<br/>NCHW → NCHWc]:::pack
+    S1 --> D1{direct NCHW<br/>profitable?}:::sel
+    D1 --> KNCHW[/nchw direct<br/>no repack/]:::kernel
+    D1 --> P1[fused repack<br/>NCHW → NCHWc]:::pack
     S1 --> KWF[/winograd_f4x3/]:::wino
     S1 --> P3[repack<br/>NCHW → NCHWc]:::pack
 
@@ -81,7 +84,7 @@ The Winograd kernels (`winograd_f4x3*`) themselves are a 3-stage pipeline:
 
 ```mermaid
 flowchart LR
-    X([X<br/>NCHW or NHWC]):::data
+    X([X<br/>NCHW, NHWC, or NCHWc]):::data
     X --> IT[input transform<br/>V = BᵀXB]:::stage
     IT --> V([V : 36 × T × C_pad]):::data
 
@@ -100,28 +103,25 @@ flowchart LR
 aiter/ops/triton/conv/
   __init__.py          empty marker (consumers import directly from conv2d.py)
   conv2d.py            public functions + smart routing in conv2d_nchw / conv2d_nhwc
-  _launch.py           grid setup, _select_3x3_method, dtype mapping
-  _prepack.py          weight/input repacks + LRU caches
+  _launch.py           explicit Triton launches, grids, and config selection
+  _prepack.py          pack allocation/transforms + weight LRU caches
   _utils.py            shape math, _is_*_conv predicates, eligibility checks
 
 aiter/ops/triton/_triton_kernels/conv/
   __init__.py          empty marker (kernels are imported by full path)
-  helpers.py           CONV_AUTOTUNE_ENABLED env-var gate (consumed when
-                       AITER_TRITON_CONV_AUTOTUNE=1). Activation helpers
-                       (_relu, _relu6, _gelu_tanh) are imported from the
-                       shared aiter/ops/triton/_triton_kernels/activation.py.
-                       Each kernel file ships its own AUTOTUNE_*_CONFIGS
-                       candidate-config list alongside the kernel it tunes.
-                       Steady-state per-kernel configs live in JSON under
-                       aiter/ops/triton/configs/conv/, loaded via
-                       aiter/ops/triton/utils/conv_config_utils.py.
   conv_1x1.py          1×1 GEMM kernel (NCHW + NHWC via LAYOUT constexpr)
-  conv_3x3.py          3×3 NHWC kernel + 3×3 cblocked (NCHWc) kernel
+  conv_3x3.py          3×3 NHWC, direct NCHW, and cblocked NCHWc kernels
+  nchw_to_cblocked.py  fused NCHW-to-NCHWc activation-layout kernel
   conv_general.py      K-major reduction with on-the-fly (c, r, s) decoding
   conv_3x3_winograd_f4x3.py
                        4 kernels: input transform (NCHW & NHWC), cblocked input
                        transform, batched GEMM, output transform
 ```
+
+Activation helpers (`_relu`, `_relu6`, `_gelu_tanh`) come from the shared
+`_triton_kernels/activation.py`. Production Conv2D modules contain no autotune
+candidate tables or runtime autotune decorators. Offline tooling owns the
+candidate search spaces and writes the winning configurations to JSON.
 
 The split mirrors *responsibility*, not LOC: `conv2d.py` is "what does the user
 ask for", `_launch.py` is "how do we set up the grid", `_prepack.py` is "what
@@ -144,15 +144,15 @@ def conv2d(x, w_oihw, bias=None, stride=(1,1), padding=(0,0), dilation=(1,1),
 |---|---|
 | `x` | Input. NCHW shape, optionally with `channels_last` strides for NHWC mode. |
 | `w_oihw` | Weight in PyTorch's canonical `[K_out, C, R, S]` layout. |
-| `bias` | Optional 1-D bias of length `K_out`, cast to fp32 once at entry. |
+| `bias` | Optional 1-D bias. A non-unit-stride view is made contiguous; kernels promote loaded values to fp32. |
 | `stride`, `padding`, `dilation` | Standard `Conv2d` semantics; tuples of ints. |
 | `activation` | `"none" / "relu" / "relu6" / "gelu"` — fused into the kernel epilogue. |
 | `layout` | `"nchw"` or `"nhwc"` (case-insensitive — passed through `.lower()`). Selects which top-level routing function runs. |
 
 The semi-public method-specific functions (`conv2d_nchw_cblocked`,
-`conv2d_winograd_f4x3_cblocked`, …) take an internal `block_k=64` channel-pack
-tile size used by the prepack caches. It is intentionally not surfaced on the
-public `conv2d` — every shipped config in `configs/conv/` assumes 64, so the
+`conv2d_winograd_f4x3_cblocked`, …) take an internal `block_k=64` channel-block
+and padding granularity. It is intentionally not surfaced on the public
+`conv2d` — every shipped config in `configs/conv/` was tuned with 64, so the
 parameter has no good user story.
 
 `x.dtype` is validated at entry: anything other than `torch.float16` /
@@ -169,41 +169,60 @@ dispatch (returns a `Route` enum member whose value is the kernel display name).
 The benchmark defines a thin `which_kernel(x, w_oihw, ...)` helper on top of it
 to label rows in the per-layer table and pick correctness tolerances, without
 launching. Routing logic stays in `conv2d.py`; the bench-only label query lives
-with the bench.
+with the bench. `_route_and_run(...)` executes that decision and explicitly
+materializes NCHWc before dispatching either cblocked route; method-specific
+wrappers retain optional packing only for direct calls and kernel-only timing.
 
 ---
 
 ## 4. Smart routing (`_select_3x3_method`)
 
 Only 3×3 has a real choice — 1×1 always uses the 1×1 kernel, 5×5/7×7 always
-fall to `general`. For 3×3, `_launch.py:_select_3x3_method` decides:
+fall to `general`. For 3×3, `conv2d.py:_select_3x3_method` decides:
 
 ```python
 def _select_3x3_method(N, C, H, W, K_out, stride, dilation):
-    # 1) Non-Winograd-eligible (stride>1, dilation>1, or C<4) -> cblocked
+    # Narrow C wastes most of a padded 64-channel dot tile.
+    if C < 64:
+        return "general"
+    # Non-Winograd-eligible (stride>1 or dilation>1) -> direct/cblocked
     if not _is_winograd_eligible(3, 3, stride, dilation, C):
         return "cblocked"
-    # 2) Tile count: F(4,3) emits one 4x4 output tile from each 6x6 input patch,
-    #    overlap = 2 (input tiles step by 4 with 6-wide windows).
+    # Compute the measured Winograd candidate region first.
     P, Q = _out_hw(H, W, 3, 3, stride, (1,1), dilation)
     tile_H, tile_W = (P + 3) // 4, (Q + 3) // 4
     T = N * tile_H * tile_W
     # 3) Winograd only wins when both C and K are large enough
     #    AND there are enough tiles to amortize transform overhead.
     if C >= 512 and K_out >= 512 and T >= 98:
+        # RDNA wave32 has num_stages=1: avoid the three-launch Winograd path.
+        if _is_amd_wave32():
+            return "cblocked"
         return "winograd_f4x3_cblocked" if T >= 392 else "winograd_f4x3"
     return "cblocked"
 ```
 
-The thresholds (`C/K ≥ 512`, `T ≥ 98`, `T ≥ 392`) come from a sweep on
-RDNA4 — see the comment block in `_launch.py`. Two implications worth knowing:
+The Winograd thresholds are retained for non-wave32 targets. On RDNA wave32,
+Triton's single-stage execution makes the three launches and V/M materialization
+more expensive than direct 3×3 on the model shapes, so Winograd is bypassed.
+For NCHW, `conv2d.py` maps the remaining direct-convolution family to the
+explicit `DIRECT_NCHW_3X3` route only when an architecture-specific
+`CONV-3X3-NCHW` table exists. A normal table uses the spatial crossover;
+a table marked `route_exact_only` instead requires the complete convolution
+shape to be explicitly present. Otherwise the router returns the distinct
+`CBLOCKED_NCHW` route and materializes NCHWc. Direct-NCHW tables currently
+ship for gfx1100, gfx1151, and gfx1201; the first two use exact-only routing.
 
-1. **The router uses padding `(1,1)` regardless of the caller's padding.** The
-   tile count it computes is approximate by design: the router only needs to
-   pick a method, not the exact `(P, Q)`. The actual padding flows through the
-   chosen kernel unchanged. (This is intentional — see
-   `memory/project_select_3x3_padding_heuristic.md`.)
-2. **Below `C/K = 512`, the cblocked direct kernel is faster than Winograd.**
+`AITER_TRITON_CONV_NCHW_DIRECT_MIN_PIXELS` overrides the default 512-pixel
+crossover for non-exact tables and is read when the Python module is imported.
+
+Two routing details are worth noting:
+
+1. **The Winograd heuristic uses padding `(1,1)` regardless of the caller's
+   padding.** The tile count it computes is approximate by design: the router
+   only needs to pick a method, not the exact `(P, Q)`. The actual padding
+   flows through the chosen kernel unchanged.
+2. **Below `C/K = 512`, the direct/cblocked kernels are faster than Winograd.**
    The Winograd transform overhead (read 6×6 patches, two 6×6 matrix
    multiplies by Bᵀ and B, ~70 fp32 FMAs per (tile, channel) for the input
    transform alone) dominates the FMA savings until the GEMM body is large
@@ -283,10 +302,11 @@ NHWC-native 3×3 with **K-major weight layout** `W3[K_out, 9, C_pad]`:
   the corresponding `[BLOCK_M, BLOCK_K]` slice of input and the matching
   `[BLOCK_K, BLOCK_N]` slice of W3, and accumulates
   `tl.dot(...)` into `[BLOCK_M, BLOCK_N]`.
-- Channel padding `C_pad` is rounded up to a multiple of `BLOCK_K` and the
-  trailing weight lanes are pre-zeroed in the prepack. The spatial validity
-  mask is hoisted out of the inner C loop; the only per-iteration mask is
-  the channel-bound check (`k_offs < C`).
+- Channel padding `C_pad` is rounded up to the 64-channel pack granularity;
+  this is separate from the per-launch reduction tile named `BLOCK_K` in the
+  JSON configuration. Trailing weight lanes are pre-zeroed in the prepack.
+  The spatial validity mask is hoisted out of the inner C loop; the only
+  per-iteration mask is the channel-bound check (`k_offs < C`).
 - Hardcoded `stride_x_c=1` (channels are contiguous in NHWC) means the
   load addressing collapses to a single base + linear stride; the compiler
   emits one vectorized load per row.
@@ -321,28 +341,38 @@ Highlights:
   compiler emits one vectorized load per channel chunk — structurally the
   same hardcoded-stride trick as `stride_x_c=1` in the NHWC kernel.
 - **Channel addressing.** Inside the C loop, `k_offs // Cb` selects the
-  block index and `k_offs % Cb` the offset within the block. This stays
-  coalesced **only when `BLOCK_K ≤ Cb`** — at the boundary, `cblock_idx`
-  jumps and the load address discontinues. This is an implicit constraint
-  on `configs/conv/{arch}-CONV-3X3-CBLOCKED.json`; new configs must respect it.
+  block index and `k_offs % Cb` the offset within the block. Every `Cb`-wide
+  segment is contiguous; a `BLOCK_K` larger than `Cb` spans multiple segments
+  and introduces an address discontinuity at each block boundary. Shipped JSON
+  configurations include both 64- and 128-wide reduction tiles where measured
+  performance justifies the trade-off.
 - **Same L2 swizzle as 5.1/5.2** — workgroups are reordered into
   super-groups of `GROUP_SIZE_M` along the `M` axis so each weight
   (`N`-axis) tile stays hot in L2 across `GROUP_SIZE_M` consecutive
   workgroups.
 
-The cblocked kernel is the default for NCHW 3×3 below the Winograd threshold
-because, even after paying the input repack cost, it consistently beats both
-"general with K-major" and the NHWC kernel with implicit transposes. The
-kernel+repack number in the bench includes the per-batch input repack;
-the user-facing `conv2d_nchw` calls `get_or_make_input_pack_cblocked`, which
-caches by `(storage_ptr, shape, dtype, ...)` so back-to-back calls with the
-same input tensor only repack once.
+The cblocked kernel is the fallback for small NCHW activations. Its pack is a
+single Triton transpose-and-pad dispatch; activation packs are never cached
+because real inference produces a new activation on every layer invocation.
+
+### 5.3a `_conv2d_3x3_nchw_kernel`
+
+An architecture must ship `CONV-3X3-NCHW` to enable this route. gfx1201 uses
+the default `N*H*W >= 512` crossover, while gfx1100 and gfx1151 use exact pins
+because direct-versus-cblocked performance depends on channels, output channels,
+stride, and spatial size. Architectures without the optional table remain on
+the cblocked fallback. Selected inputs stay in contiguous NCHW and allocate no
+activation buffer. The kernel transposes the dot operands so lanes traverse the
+unit-stride pixel dimension. It uses the true `C*H*W` batch stride and masks
+`C_pad-C` weight lanes, so channel counts that are not multiples of 64 do not
+require a padded activation copy.
 
 ### 5.4 `_conv2d_general_kernel`
 
 The fallback for everything that isn't 1×1, 3×3, or Winograd-eligible —
 i.e. any kernel size other than 1×1 or 3×3 (5×5, 7×7, dilated 5×5, etc.).
-Note: dilated 3×3 still routes to cblocked, not here. Strategy:
+Note: a dilated 3×3 with `C >= 64` still routes to cblocked; narrow-C 3×3
+routes here to avoid padded channel reduction. Strategy:
 
 - Pack weights once into K-major `W_K[K_out, K_pad]` where
   `K_pad = pad(C·R·S, block_k)`. The trailing `K_pad − C·R·S` weight lanes
@@ -381,10 +411,10 @@ sensitivity in fp16/bf16. The math is in section 6; here are the four kernels:
 `conv2d_winograd_f4x3` and `conv2d_winograd_f4x3_cblocked` both use the
 3-kernel pipeline (input transform + GEMM + output transform).
 
-The **filter transform** `U = G g Gᵀ` runs once on the host in
-`prepack_winograd_filter_f4x3` (in fp32), then is cast to the activation
-dtype and stored as `U[36, K_out, C_pad]`. The transform is per-weight, not
-per-call, so it amortizes across every forward pass.
+The **filter transform** `U = G g Gᵀ` is implemented by PyTorch GPU operations
+in `prepack_winograd_filter_f4x3`: it computes in fp32, casts to the activation
+dtype, and stores `U[36, K_out, C_pad]`. The result is cached per weight, so
+these GPU operations amortize across later forward passes.
 
 ---
 
@@ -407,7 +437,7 @@ and are why the realized speedup is smaller than 4×.
 
 **Reporting convention.** Both the bench harness and the published charts
 divide measured wall time by the *direct-convolution* FLOP count
-`2·N·K·C·R·S·H·W`, regardless of which algorithm actually ran. This is
+`2·N·K·C·R·S·P·Q`, regardless of which algorithm actually ran. This is
 the universal convention — it gives a single yardstick on which different
 algorithms (direct, im2col-GEMM, Winograd, FFT) are comparable, since
 literal hardware-MAC counts are not. The implication: a Winograd row's
@@ -436,13 +466,13 @@ G  =   │ -4   4  -4 │ × (1/24)   Bᵀ =│  0   4  -4  -1   1   0 │
 ```
 
 (`_prepack.py:prepack_winograd_filter_f4x3` writes G with the `1/24` already
-absorbed: rows scaled by `1/4, -1/6, -1/6, 1/24, 1/24, 1` so a host-side
+absorbed: rows scaled by `1/4, -1/6, -1/6, 1/24, 1/24, 1` so the GPU-side
 `G g Gᵀ` produces `U` directly.)
 
 The math is then:
 
 ```
-  U   = G g Gᵀ          (6×6, computed once per weight, host-side, fp32)
+  U   = G g Gᵀ          (6×6, computed once per weight on the GPU, fp32 intermediate)
   V   = Bᵀ d B          (6×6, computed per input tile, on-chip, fp32)
   M   = U ⊙ V           (6×6, element-wise)
   Y   = Aᵀ M A          (4×4, output tile)
@@ -516,43 +546,49 @@ The test harness applies a **6× tolerance multiplier** to Winograd kernels
 
 ## 7. Memory layouts and repacking
 
-There are four "shapes" the kernels actually consume, plus the user's NCHW
-input:
+The main input and packed-weight layouts are:
 
 | Layout | Kernel | Where the repack happens | Cached? |
 |---|---|---|---|
+| `[K_out, C]` (1×1 weight view) | `1x1` | squeeze/contiguous in `_launch.py` | no separate LRU |
 | `[K_out, K_pad]` (K-major weight) | `general` | `_prepack.py:prepack_oihw_to_kmajor` | LRU 256, `_PACK_CACHE` |
-| `[K_out, 9, C_pad]` (3×3 weight) | `3x3_nhwc`, `3x3_cblocked` | `prepack_oihw_to_3x3` | LRU 256, `_PACK_CACHE_3x3` |
-| `[N, C_blocks, H, W, Cb]` (NCHWc input, `Cb=64`) | `3x3_cblocked`, `winograd_f4x3_cblocked` (input transform) | `prepack_nchw_to_cblocked` | **Single-entry dict** by design |
+| `[K_out, 9, C_pad]` (3×3 weight) | `3x3_nhwc`, `3x3_nchw`, `3x3_cblocked` | `prepack_oihw_to_3x3` | LRU 256, `_PACK_CACHE_3x3` |
+| Original contiguous `[N,C,H,W]` | `3x3_nchw` | no repack | not applicable |
+| Logical `[N,C,H,W]` with channels-last strides | NHWC paths | `conv2d_nhwc` only if needed | not cached |
+| `[N, C_blocks, H, W, Cb]` (NCHWc input, `Cb=64`) | `3x3_cblocked`, `winograd_f4x3_cblocked` | fused `prepack_nchw_to_cblocked` | not cached |
 | `[36, K_out, C_pad]` (Winograd weight) | `winograd_f4x3_*` | `prepack_winograd_filter_f4x3` | LRU 256, `_PACK_CACHE_WINOGRAD_F4X3` |
 
-### Why three weight caches are LRU but the input cache is single-entry
+The fused NCHWc launcher in `_launch.py` loads its parameters from
+`configs/conv/{arch}-CONV-PREPACK.json`. It uses the canonical key
+`N=...,C=...,H=...,W=...,CB=...`; exact pins cover tuned shapes, then
+architecture-specific `M_LEQ_*` buckets and `any` cover unseen shapes by
+spatial size.
+
+### Why weight packs are cached but activation packs are not
 
 Weights are reused every forward pass. A 53-layer ResNet has 53 unique
 weight tensors; with a 256-entry LRU we keep them all warm and the second
 forward pass through the model has zero repack cost.
 
-Input activations are *unique intermediate tensors* — the output of layer N
-is consumed exactly once, by layer N+1, and never seen again. Caching them
-LRU would just bloat memory; a single-entry dict is enough to dedup
-repeated calls with the same tensor (which the bench loop *does* do — it
-runs each layer with `warmup=15, rep=50` over the same input to get a
-stable timing). The `.clear()` in the bench's per-call setup deliberately
-models the per-batch repack cost in real inference, which is reported as
-the "kernel + repack" row.
+Input activations are unique intermediate tensors. Caching a materialized pack
+would retain large dead buffers and would not help real inference, so the pack
+cost remains in the public NCHW timing. The direct NCHW route removes that cost
+instead of hiding it behind a benchmark-only cache.
 
 ### Cache key safety
 
-Each cache key includes `(storage_ptr, shape, dtype, block_k, _version)`.
+Each cache key includes `(data_ptr, device, shape, stride, dtype, _version,
+block_k)`. `data_ptr` distinguishes storage-offset aliases and `_version`
+invalidates an entry after an in-place weight update.
 The cache also stores a strong reference to the source tensor in the value,
 so its storage cannot be freed and re-used by a different tensor while the
-entry lives — this prevents `storage_ptr` collisions from producing a
-false hit. The single-entry input cache also re-checks the source pointer
-on hit (defense in depth).
+entry lives — this prevents pointer recycling from producing a
+false hit.
 
 `AITER_TRITON_CONV_PACK_CACHE_SIZE=N` (env var) overrides the LRU bound.
 Default 256 is enough for the models exercised by the bench harness without
-eviction; larger models need the env override.
+eviction; larger models may need the env override. The value is read when
+`_prepack.py` is imported.
 
 ---
 
@@ -613,21 +649,22 @@ launch time via `get_conv_config(...)` in
 `aiter/ops/triton/utils/conv_config_utils.py`, which reads the per-arch JSON in
 `configs/conv/{arch}-CONV-{KERNEL}.json`. There is **no runtime autotune on the
 hot path** — the search already happened offline and its winners are frozen in
-JSON, so first-call latency and CI compile time stay predictable. (The
-`AITER_TRITON_CONV_AUTOTUNE=1` escape hatch restores live `@triton.autotune`
-for development; it is off by default and never used in normal inference.)
+JSON, so first-call latency and CI compile time stay predictable. Candidate
+search spaces are maintained by offline tuning tooling, outside the production
+package.
 
 ### The JSON is a keyed lookup, not a list of layers
 
 A common confusion: "ResNet-50 has 53 conv layers, but the JSON only has ~23
 entries — how does inference work?" The JSON is **not** a per-layer list. It is
-a shape-keyed lookup table with a three-tier fallback, so it can never "miss":
+a shape-keyed lookup table with a four-tier fallback, so it can never "miss":
 
 ```
 get_conv_config walks, first hit wins:
-  1. shapes[shape_key]   exact-shape pin  (the offline-tuned entries)
-  2. M_LEQ_<n>           nearest row-count bucket (M_total, or T for Winograd)
-  3. "any"               global fallback
+  1. shapes_<variant>[shape_key]  optional layout-specific pin
+  2. shapes[shape_key]            generic exact-shape pin
+  3. M_LEQ_<n>                    nearest row-count bucket (M_total, or T)
+  4. "any"                        global fallback
 ```
 
 At inference every one of the 53 physical layers fires and issues its own
@@ -635,26 +672,25 @@ kernel launch. Each builds a `shape_key`
 (`format_shape_key(N,C,H,W,K,R,S,…)`) and looks it up:
 
 - ResNet-50's 53 conv layers span only **23 distinct shapes** (repeated
-  bottleneck blocks reuse shapes). The 23 distinct shapes hit **Tier 1**
-  (they are exactly what was tuned into `shapes`). The ~30 duplicate layers
+  bottleneck blocks reuse shapes). The 23 distinct shapes hit an exact-shape
+  entry (a variant in Tier 1 or the generic `shapes` map in Tier 2). The ~30 duplicate layers
   build a `shape_key` identical to one of the 23, so they re-resolve to the
-  same Tier-1 entry — an LRU-cached, near-free re-read. **53 launches,
+  same exact entry — an LRU-cached, near-free re-read. **53 launches,
   ≤23 distinct config lookups.**
 - A shape that was *not* tuned offline (e.g. a different batch size, so
-  `N` differs) matches nothing in Tier 1. It does not error — it falls to the
+  `N` differs) matches neither exact tier. It does not error — it falls to the
   `M_LEQ_<n>` bucket for its row count, or ultimately to `"any"`. Slightly
   less optimal, still correct.
 
 This tiered fallback is why tuning only the **deduped** shape set is safe:
 identical shapes need tuning once, and any unseen shape degrades gracefully
 instead of failing. `get_conv_config` is modeled on `get_gemm_config` and uses
-the same `M_LEQ_x → any` walk; the conv-native addition is the exact-shape
-Tier-1 (`shapes[shape_key]`), since conv has more shape degrees of freedom than
-GEMM's M/N/K.
+the same `M_LEQ_x → any` walk; the conv-native addition is exact-shape lookup,
+since conv has more shape degrees of freedom than GEMM's M/N/K.
 
 > The dedup lives in two independent places, both offline: the **bench** shape
-> list (`conv_shapes.json`, timing distinct work once) and the **tuning** set
-> (`tune_conv2d.py` dedups by literal tuple before sweeping). Neither the bench
+> list (`conv_shapes.json`, timing distinct work once) and the input set built
+> by the external tuning driver before sweeping. Neither the bench
 > nor the runtime lookup re-dedups; the runtime simply reuses a config when two
 > layers share a shape.
 
@@ -668,6 +704,7 @@ for kernel dispatch in the test harness. Adding a new method takes one entry:
 ```python
 METHOD_REGISTRY = {
     "default":                MethodEntry(conv2d_nchw,                   None,        False, "",                         "default"),
+    "direct":                 MethodEntry(conv2d_nchw_3x3_direct,        _direct_3x3_guard, False, "[direct]",            "direct"),
     "cblocked":               MethodEntry(conv2d_nchw_cblocked,          _3x3_guard,  False, "[cblocked]",               "cblocked"),
     "winograd_f4x3":          MethodEntry(conv2d_winograd_f4x3,          _wino_guard, True,  "[winograd_f4x3]",          "WF(4,3)"),
     "winograd_f4x3_cblocked": MethodEntry(conv2d_winograd_f4x3_cblocked, _wino_guard, True,  "[winograd_f4x3_cblocked]", "WF4cb"),
@@ -704,10 +741,10 @@ Concretely, to add (say) a `winograd_f6x3` variant:
    no `__init__.py` re-export needed.
 4. **Add a prepack** in `_prepack.py` if the kernel needs a different
    weight layout. Use `_LRUPackCache` with a key that includes
-   `(storage_ptr, shape, dtype, block_k, _version)` and store a strong
-   ref to the source tensor in the cached value. For input-side prepacks
-   (rare — only `_PACK_CACHE_CBLOCKED` does this today), use a
-   single-entry plain dict cleared per-call instead — see §7.
+   `(data_ptr, device, shape, stride, dtype, _version, block_k)` and store a
+   strong ref to the source tensor in the cached value. Do not cache ordinary
+   input activations: they are normally unique per invocation and retaining
+   their packed buffers increases memory use without producing cache hits.
 5. **Register** in `op_tests/triton_tests/conv/_helpers.py` (`METHOD_REGISTRY`). Set
    `is_winograd=True` if the kernel uses Winograd-style transforms
    (you'll need the 6× tolerance bump). If the kernel uses a different
@@ -724,8 +761,8 @@ Concretely, to add (say) a `winograd_f6x3` variant:
    branch in `_resolve_route` (the single source of truth for dispatch),
    plus the matching branch in `_route_and_run`. The bench's `which_kernel`
    labels then follow automatically.
-7. **Run the suite** — `pytest op_tests/triton_tests/conv/` parametrizes
-   `test_no_bias` and `test_activations` over every entry in
+7. **Run the suite** — `pytest op_tests/triton_tests/conv/` parametrizes the
+   edge, fuzz, no-bias, and activation families over every entry in
    `METHOD_REGISTRY`, so the new method gets correctness coverage
    automatically. Bench it via
    `python -m op_tests.op_benchmarks.triton.bench_conv2d --method <new_name> ...`.
