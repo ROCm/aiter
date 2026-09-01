@@ -316,10 +316,11 @@ static void mla_decode_gfx1250_dispatch(
     const int num_heads    = Q->size(1);
     const int gqa_ratio    = num_heads / nhead_kv;
     const int kv_split     = splitData->size(1);
-    // TODO: Keep the ABI decision in this host dispatch layer: it owns kernel
-    // selection and the exact kernarg layout. qh128 remains on the legacy ABI
-    // for e2e stability; the other gfx1250 gfx1250 kernels use packed preload.
-    const bool use_packed_gfx1250_args = !(gqa_ratio == 128 && max_seqlen_q == 1);
+    // Keep the ABI decision in this host dispatch layer: it owns kernel selection
+    // and the exact kernarg layout. Every gfx1250 MLA kernel -- qh128 included --
+    // is now built from the poc_kl sp3 with DIRECT_PARAM=1, i.e. the 120B packed
+    // preload ABI, so there is no longer a legacy exception.
+    const bool use_packed_gfx1250_args = true;
     constexpr int bdx      = 128;
     constexpr int bdy      = 1;
     constexpr int bdz      = 1;
@@ -407,9 +408,9 @@ static void mla_decode_gfx1250_dispatch(
         AITER_CHECK(false, __func__, " not find kernel ", kernelName);
     }
 
-    // gfx1250 gfx1250 dispatch. qh128 is temporarily left on the legacy 288B ABI
-    // because it is used by e2e. Other gfx1250 private kernels use the new
-    // 120B packed-preload ABI from poc_kl/gfx1250/mla/mla_execute_v3_hip.inl.
+    // gfx1250 dispatch. All gfx1250 private kernels use the 120B packed-preload
+    // ABI from poc_kl/gfx1250/mla/mla_execute_v3_hip.inl; the legacy 288B branch
+    // below is kept only for kernels that have not been rebuilt from sp3 yet.
     const int q_elem_size = Q->element_size();
     const int qk_head_dim = Q->size(2);
     const int q_seq_lens_kernel = max_seqlen_q * gqa_ratio;
@@ -473,9 +474,13 @@ static void mla_decode_gfx1250_dispatch(
         arg_size = sizeof(packed_args);
     }
 
-    const int gdx = (max_seqlen_q * gqa_ratio + sub_Q - 1) / sub_Q;
+    // The kernel body covers 64 Q rows per workgroup, so gqa=128 is split across
+    // two workgroups along X: the kernel copies the X id into _s_tg_idx (guarded by
+    // _s_MQA > 64) and shifts Q by Q_GROUP_PAD_SIZE * tg_idx. Z is the plain KV
+    // split id in every case -- it must not carry the head half as well.
+    const int gdx = (gqa_ratio == 128) ? 2 : (max_seqlen_q * gqa_ratio + sub_Q - 1) / sub_Q;
     const int gdy = batch;
-    const int gdz = (gqa_ratio == 128) ? kv_split * 2 : kv_split;
+    const int gdz = kv_split;
 
 #ifdef ASM_DEBUG
     std::printf("[aiter][gfx1250][debug] kernelName=%s\n", kernelName.c_str());
@@ -668,6 +673,7 @@ void mla_decode_stage1_asm_fwd(
     int cp_rank,                          //   round-robin CP rank id
     aiter_tensor_t* valid_split_count,    //   [batch_size] scratch for packed gfx1250 kernels (nullable)
     int use_valid_split_count_reduce,     //   enable packed-kernel valid split count writeback/reduce
+    int causal,                           //   apply the causal mask across the max_seqlen_q query tokens
     hipStream_t stream)
 {    
     int batch           = qo_indptr->size(0) - 1;
@@ -852,7 +858,11 @@ void mla_decode_stage1_asm_fwd(
     
     int ps = persistent ? 1 : 0;
     int prefill = 0; // decode stage
-    int causal = 0;
+    int config_causal = causal;
+    // A single query token makes the causal mask a no-op, so both causal modes
+    // share the masked kernel instead of requiring an msk0 duplicate.
+    if(max_seqlen_q == 1)
+        config_causal = 1;
     int config_max_seqlen_q = max_seqlen_q;
     int config_gqa_ratio = gqa_ratio;
     int sub_Q = 128; // default value
@@ -913,7 +923,7 @@ void mla_decode_stage1_asm_fwd(
             if((max_seqlen_q == 1) && !persistent){
                 config_max_seqlen_q = 1;
                 sub_Q = 32;
-            } else if((max_seqlen_q >= 4) && persistent && arch_id == "gfx950"){
+            } else if((max_seqlen_q >= 3) && persistent && arch_id == "gfx950"){
                 config_max_seqlen_q = 4;
                 sub_Q = 128;
             } else if((max_seqlen_q == 2) && persistent){
@@ -924,7 +934,7 @@ void mla_decode_stage1_asm_fwd(
                 sub_Q = 32;
             } else {
                 AITER_CHECK(false, __func__,
-                    ": fp8/fp8 with gqa_ratio=32 only supports decode_qlen=1,2,4 in persistent mode and decode_qlen>4 in persistent mode on gfx950");
+                    ": fp8/fp8 with gqa_ratio=32 only supports decode_qlen=1,2 in persistent mode and decode_qlen>=3 in persistent mode on gfx950");
             }
         }
     } else if (gqa_ratio == 64){
@@ -978,15 +988,23 @@ void mla_decode_stage1_asm_fwd(
     } else if (arch_id == "gfx950" && q_type == "fp8" && kv_type == "fp8" && persistent
                && ((gqa_ratio == 32 && max_seqlen_q >= 4)
                    || (gqa_ratio == 64 && max_seqlen_q >= 2)
-                   || (gqa_ratio == 128))){
+                   || (gqa_ratio == 128)
+                   || (gqa_ratio == 96 && max_seqlen_q <= 6))){
         config_max_seqlen_q = 4;
         config_gqa_ratio = 32;
+        args.s_MQA = gqa_ratio;
+    } else if (arch_id == "gfx950" && q_type == "fp8" && kv_type == "fp8" && persistent
+        && ((gqa_ratio == 16 && (max_seqlen_q == 3 || max_seqlen_q == 4))
+            || (gqa_ratio == 32 && (max_seqlen_q == 2 || max_seqlen_q == 3))
+            || (gqa_ratio == 64 && max_seqlen_q == 1))){
+        config_max_seqlen_q = 4;
+        config_gqa_ratio = 16;
         args.s_MQA = gqa_ratio;
     }
     int lse_flag = (lse != nullptr && persistent) ? 1 : 0;
 
     int cprr_flag = (g_kv_indptr != nullptr && g_kv_indptr->data_ptr() != nullptr) ? 1 : 0;
-    std::string kernelName = get_heuristic_kernel_mla(q_type, kv_type, config_gqa_ratio, ps, prefill, causal, config_max_seqlen_q, arch_id, config_map, lse_flag, cprr_flag);
+    std::string kernelName = get_heuristic_kernel_mla(q_type, kv_type, config_gqa_ratio, ps, prefill, config_causal, config_max_seqlen_q, arch_id, config_map, lse_flag, cprr_flag);
     AITER_CHECK(!kernelName.empty(), __func__, ": cannot find suitable kernel");
     
     AiterAsmKernel* impl_ptr = nullptr;

@@ -1,9 +1,10 @@
-import triton
 import torch
+import triton
+
 from aiter.ops.triton._triton_kernels.moe.moe_routing.topk import (
-    _topk,
-    _hash_routing,
     _grouped_topk,
+    _hash_routing,
+    _topk,
 )
 from aiter.ops.triton.moe.moe_routing.bitmatrix import Bitmatrix
 
@@ -185,9 +186,14 @@ def topk(
       - "sqrtsoftplus": pre-transform `scores = sqrt(softplus(logits))` before
         adding the optional `bias` and running topk. Selected weights are the
         UNBIASED sqrt(softplus(logits)). DeepSeek-V4 noaux_tc router.
+      - "sigmoid": pre-transform `scores = sigmoid(logits)`; same
+        select-on-biased / return-unbiased contract. GLM-5.2 / DeepSeek-V3
+        noaux_tc router with n_group == 1 (which bypasses grouped_topk).
+        Selected in fp32 whatever the logits dtype; weights keep that dtype.
 
     bias (fp32, [n_expts_tot]): added to scores for selection only, not for
-    returned weights. Only meaningful with score_mode='sqrtsoftplus'.
+    returned weights. Only meaningful with score_mode in
+    ('sqrtsoftplus', 'sigmoid').
 
     renorm: renormalize weights to sum=1 per row before multiplying by
     routed_scaling_factor.
@@ -206,7 +212,8 @@ def topk(
     assert score_mode in (
         "softmax",
         "sqrtsoftplus",
-    ), f"score_mode must be 'softmax' or 'sqrtsoftplus', got {score_mode!r}"
+        "sigmoid",
+    ), f"score_mode must be 'softmax', 'sqrtsoftplus' or 'sigmoid', got {score_mode!r}"
     if score_mode != "softmax":
         assert not apply_softmax, "apply_softmax only valid with score_mode='softmax'"
     has_bias = bias is not None
@@ -214,9 +221,10 @@ def topk(
         assert bias.dim() == 1
         assert bias.shape[0] == x.shape[-1]
         assert bias.dtype == torch.float32
-        assert (
-            score_mode == "sqrtsoftplus"
-        ), "bias currently only supported with score_mode='sqrtsoftplus'"
+        assert score_mode in (
+            "sqrtsoftplus",
+            "sigmoid",
+        ), "bias only supported with score_mode='sqrtsoftplus' or 'sigmoid'"
     dev = x.device
     # scratchpad tensors
     # NOTE: these are not returned

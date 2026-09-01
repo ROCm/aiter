@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+// This translation unit is torch-free: define AITER_NO_TORCH_TYPES before any
+// aiter header so aiter_opus_plus.h does not pull in the c10 half/bfloat16
+// headers. The kernels use aiter::hip2opus + the _rmTorch dispatch macros, never
+// the t2opus<c10::*> specializations, so nothing here needs torch/ATen/c10.
+#define AITER_NO_TORCH_TYPES
 #include "aiter_hip_common.h"
 #include "aiter_dispatch.h"
 #include "aiter_opus_plus.h"
@@ -9,7 +14,6 @@
 #include "quant.h"
 #include "mx_quant_utils.h"
 #include "rocprim/rocprim.hpp"
-#include <hipcub/hipcub.hpp>
 
 
 const int32_t BlockSize           = 256;
@@ -56,10 +60,10 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     int64_t row_offset       = static_cast<int64_t>(blockIdx.x) * block_size;
     int64_t groupId          = (row_offset + threadIdx.x) / num_thread_per_group;
     int32_t scaleN           = ori_cols / group_size;
-    // Shuffle tiles e8m0 bytes 8-wide along scaleN regardless of element
-    // dtype, so the padding applies to any e8m0-scale path (fp4 always,
-    // fp8 only when emit_e8m0_scale).
-    int32_t scaleN_pad       = (use_e8m0_scale && shuffle_scale)
+    // Shuffle tiles e8m0 bytes 8-wide along scaleN for the MX hardware
+    // scale-load layout (group_size == 32 only); group_size == 128 shuffle
+    // is a plain transpose and needs no padding.
+    int32_t scaleN_pad       = (use_e8m0_scale && shuffle_scale && group_size == 32)
                                    ? (((scaleN + 7) / 8) * 8)
                                    : scaleN;
     int64_t x                = groupId / scaleN_pad;
@@ -95,7 +99,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     {
         absMax = max(absMax, abs(static_cast<float>(thread_data[j])));
     }
-    absMax = multithread_reduce(absMax, hipcub::Max(), num_thread_per_group);
+    absMax = multithread_reduce(absMax, aiter::Max(), num_thread_per_group);
 
     // MX e8m0 path: use the project-wide default round mode
     // (``kDefaultMxScaleRoundMode``, currently RoundUp = NV / DSv4 RCEIL).
@@ -132,7 +136,10 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
             uint8_t exponent = (__builtin_bit_cast(uint32_t, inverted_scale) >> 23) & 0b11111111;
             if constexpr(shuffle_scale)
             {
-                groupId = aiter::mx_scale_shuffle_idx(scaleN_pad, static_cast<int>(x), y);
+                if constexpr(group_size == 32)
+                    groupId = aiter::mx_scale_shuffle_idx(scaleN_pad, static_cast<int>(x), y);
+                else
+                    groupId = y * ori_rows + x;
             }
             tmp[groupId] = exponent;
         }
@@ -230,10 +237,7 @@ __device__ std::tuple<float, DTYPE_I*> data_to_per_row_scale(const DTYPE_I* __re
     }
     // double load core loop end
 
-    // using BlockReduce = hipcub::BlockReduce<float, BlockSize>;
-    // __shared__ typename BlockReduce::TempStorage temp_storage;
-    // absMax = BlockReduce(temp_storage).Reduce(absMax, hipcub::Max());
-    absMax = block_reduce<float, hipcub::Max, BlockSize, true>(absMax, hipcub::Max());
+    absMax = block_reduce<float, aiter::Max, BlockSize, true>(absMax, aiter::Max());
 
     float row_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
                           ? aiter::fp4_f32_to_e8m0_scale(absMax)
@@ -445,7 +449,7 @@ smooth_data_to_per_row_scale(const DTYPE_I* __restrict__ input,
         absMax         = max(absMax, abs(smscale_cur[j]));
     }
 
-    absMax = block_reduce<float, hipcub::Max, block_size, true>(absMax, hipcub::Max());
+    absMax = block_reduce<float, aiter::Max, block_size, true>(absMax, aiter::Max());
 
     float row_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
                           ? aiter::fp4_f32_to_e8m0_scale(absMax)
@@ -886,12 +890,12 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
             constexpr bool ss = decltype(shuffle_tag)::value;
             constexpr bool ee = decltype(e8m0_tag)::value;
             // e8m0 + shuffle pads scaleN up to a multiple of 8 (tile width)
-            // regardless of element dtype; non-shuffle / fp32-scale paths
-            // use exactly `rows * scaleN` slots.
+            // for the MX hw layout (_GS == 32 only); group_size == 128
+            // shuffle is a plain transpose, no padding.
             int num_group;
             if constexpr(ee)
             {
-                num_group = ss ? rows * ((scaleN + 7) / 8 * 8) : rows * scaleN;
+                num_group = (ss && _GS == 32) ? rows * ((scaleN + 7) / 8 * 8) : rows * scaleN;
             }
             else
             {
@@ -1536,7 +1540,7 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v2(DTYPE_O* __restrict_
                 vec_input_f[j] = vec_input_f[j] * smscale[j];
                 absMax         = max(absMax, abs(vec_input_f[j]));
             }
-            absMax = block_reduce<float, hipcub::Max, block_size, true>(absMax, hipcub::Max());
+            absMax = block_reduce<float, aiter::Max, block_size, true>(absMax, aiter::Max());
 
             float row_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
                                 ? aiter::fp4_f32_to_e8m0_scale(absMax)
@@ -1838,7 +1842,7 @@ __global__ void fused_mx_quant_moe_sort_kernel(
                 vec_input_f[j] = static_cast<float>(vec_input[j]);
                 absMax         = max(absMax, abs(vec_input_f[j]));
             }
-            absMax = multithread_reduce(absMax, hipcub::Max(), num_thread_per_group);
+            absMax = multithread_reduce(absMax, aiter::Max(), num_thread_per_group);
 
             // MXFP4 / MXFP8 use the project-wide default round mode
             // (kDefaultMxScaleRoundMode, currently NV ROUND_UP =

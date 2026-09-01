@@ -1,26 +1,32 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
+
 import torch
 import triton
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.common_utils import serialize_dict, deserialize_str
-from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
-    _gemm_afp4wfp4_kernel as _triton_gemm_afp4wfp4_kernel,
-    _gemm_afp4wfp4_preshuffle_kernel as _triton_gemm_afp4wfp4_preshuffle_kernel,
-    _gemm_afp4wfp4_kernel_preshuffle_scales as _triton_gemm_afp4wfp4_kernel_preshuffle_scales,
-    _get_config,
-)
+
+from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
 )
-from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
+    _gemm_afp4wfp4_kernel as _triton_gemm_afp4wfp4_kernel,
+)
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
+    _gemm_afp4wfp4_kernel_preshuffle_scales as _triton_gemm_afp4wfp4_kernel_preshuffle_scales,
+)
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
+    _gemm_afp4wfp4_preshuffle_kernel as _triton_gemm_afp4wfp4_preshuffle_kernel,
+)
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
+    _get_config,
+)
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
-global _USE_GEMM_SPLITK_BF16
 _USE_GEMM_SPLITK_BF16 = False
 
 
@@ -70,10 +76,10 @@ def gemm_afp4wfp4_fake_tensor(
     w: torch.Tensor,
     x_scales: torch.Tensor,
     w_scales: torch.Tensor,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[str] = None,
-    skip_reduce: Optional[bool] = False,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: str | None = None,
+    skip_reduce: bool | None = False,
 ) -> torch.Tensor:
     M, K = x.shape
     N, _ = w.shape
@@ -106,10 +112,10 @@ def gemm_afp4wfp4_(
     w: torch.Tensor,
     x_scales: torch.Tensor,
     w_scales: torch.Tensor,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[str] = None,
-    skip_reduce: Optional[bool] = False,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: str | None = None,
+    skip_reduce: bool | None = False,
 ) -> torch.Tensor:
     """
     Computes matrix multiplication Y = X @ W^T with FP4 activations and FP4 weights.
@@ -182,7 +188,7 @@ def gemm_afp4wfp4_(
 
     # config["BLOCK_SIZE_N"] = max(config["BLOCK_SIZE_N"], 32)
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])
@@ -256,10 +262,10 @@ def gemm_afp4wfp4(
     w: torch.Tensor,
     x_scales: torch.Tensor,
     w_scales: torch.Tensor,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-    skip_reduce: Optional[bool] = False,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
+    skip_reduce: bool | None = False,
 ) -> torch.Tensor:
     if config is None:
         config_hashable = None
@@ -277,9 +283,9 @@ def gemm_afp4wfp4_preshuffled_scales(
     w,
     x_scales,
     w_scales,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
 ):
     """
     Computes matrix multiplication Y = X @ W^T with FP4 activations and FP4 weights using preshuffled scales.
@@ -344,7 +350,7 @@ def gemm_afp4wfp4_preshuffled_scales(
 
     config["BLOCK_SIZE_N"] = max(config["BLOCK_SIZE_N"], 32)
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])
@@ -412,16 +418,15 @@ def gemm_afp4wfp4_preshuffled_scales(
 
 
 # TODO: Split-K support
-# TODO: gluon kernel for M < 32 without preshuffling scales for M < 32
 def gemm_afp4wfp4_preshuffle(
     x_fp4: torch.Tensor,
     w_preshuf: torch.Tensor,
     x_scales: torch.Tensor,
     w_scales: torch.Tensor,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-    skip_reduce: Optional[bool] = False,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
+    skip_reduce: bool | None = False,
 ) -> torch.Tensor:
     """
     Computes matrix multiplication Y = X @ W^T with FP4 activations and FP4 weights.
@@ -429,11 +434,23 @@ def gemm_afp4wfp4_preshuffle(
 
     Args:
         x (torch.Tensor): FP4 E2M1 input matrix with shape (M, K//2).
-        w (torch.Tensor): FP4 E2M1 weight matrix with shape (N//16, K*16), internally transposed.
-        x_scales (torch.Tensor): E8M0 per-group scale for x with shape (M//32, K) if M >= 32 otherwise (M, K//32).
-            One scale per 32 elements in K dimension.
-        w_scales (torch.Tensor): E8M0 per-group scale for w with shape (M//32, K).
-            One scale per 32 elements in K dimension.
+        w (torch.Tensor): FP4 E2M1 weight matrix with shape (N//16, K*16),
+            preshuffled via aiter.ops.shuffle.shuffle_weight_gfx1250 (or
+            equivalently shuffle_weight(layout=(16, 16)) reshaped to
+            (N//16, K*16) — both produce the same bytes). Internally transposed.
+        x_scales (torch.Tensor): E8M0 per-group scale for x, one scale per 32
+            elements in K. For M >= 32: preshuffled via
+            aiter.ops.shuffle.shuffle_scale (identical layout on gfx950 and
+            gfx1250), then viewed as one row per 32-row stripe, i.e.
+            (M_pad//32, (K//32)*32) where M_pad = M rounded up to a multiple
+            of 256. shuffle_scale returns the buffer flat as
+            (M_pad, K//32), so the caller owns the reshape:
+            ``s = shuffle_scale(x_scales); s.view(-1, s.shape[-1] * 32)``
+            (take the shape off the shuffled tensor -- shuffle_scale pads both
+            dims). For M < 32: un-shuffled (M, K//32) row-major.
+        w_scales (torch.Tensor): E8M0 per-group scale for w, one scale per 32
+            elements in K: same shuffle_scale + stripe view as x_scales,
+            i.e. (N_pad//32, (K//32)*32). Always shuffled, including M < 32.
         dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
         y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
         config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
@@ -445,17 +462,21 @@ def gemm_afp4wfp4_preshuffle(
     """
 
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
-    use_gluon = False  # arch_info.get_arch() == "gfx1250" TODO: (Satya) revert after upstream triton is fixed
+    use_gluon = arch_info.get_arch() == "gfx1250"
 
     M, K_bytes = x_fp4.shape
     n16, _ = w_preshuf.shape
     N = n16 * 16
     K_elems = 2 * K_bytes
-    # _get_config doubles K for config - 2 * K_bytes == K_elems
-    K_cfg = K_elems
 
     if config is None:
-        config, _ = _get_config(M, N, K_cfg, True)
+        # _get_config doubles K itself (logical K = 2 * K_bytes) — pass bytes,
+        # matching the non-preshuffled path. The two backends take disjoint
+        # params (gluon: NUM_BUFFERS, triton: NUM_KSPLIT/GROUP_SIZE_M/...), so
+        # the config must come from the dir of the backend we actually launch.
+        config, _ = _get_config(
+            M, N, K_bytes, True, backend="gluon" if use_gluon else "triton"
+        )
 
     config["BLOCK_SIZE_N"] = max(config["BLOCK_SIZE_N"], 32)
     if M < 32:
@@ -467,13 +488,28 @@ def gemm_afp4wfp4_preshuffle(
             config["BLOCK_SIZE_M"] >= 32
         ), "for M >= 32, BLOCK_SIZE_M must be 32 or more as x_scale are assumed to be preshuffled"
 
+    # shuffle_scale pads K//32 up to a multiple of 8 (its k-chunk), but the
+    # kernels bound the scale reads at (K//32)*32 columns per stripe row. A
+    # k-chunk interleaves its 8 k-groups across all 256 of its bytes, so a
+    # bound that lands mid-chunk silently masks *real* k-groups to zero rather
+    # than only the padding -- e.g. K=896 loses k-groups 26 and 27. Require
+    # whole k-chunks. w_scales are always preshuffled, so this holds for M < 32
+    # too, where x_scales themselves are un-shuffled.
+    assert K_elems % 256 == 0, (
+        f"preshuffled scales require K % 256 == 0 (K//32 a multiple of 8), got K={K_elems}. "
+        "shuffle_scale pads K//32 to a multiple of 8 and the kernels cannot mask a "
+        "partial k-chunk"
+    )
+
     if use_gluon:
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
             gemm_mxfp4_preshuffle_gfx1250 as _gluon_gemm_mxfp4_preshuffle_gfx1250,
+        )
+        from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
             get_gemm_afp4wfp4_preshuffle_layouts,
         )
 
-        grid = lambda META: (  # noqa: E731
+        grid = lambda META: (
             (
                 triton.cdiv(M, META["BLOCK_SIZE_M"])
                 * triton.cdiv(N, META["BLOCK_SIZE_N"])
@@ -495,8 +531,6 @@ def gemm_afp4wfp4_preshuffle(
             config["BLOCK_SIZE_K"],
         )
 
-        # Kernel consumes preshuffled scales directly (address math inverts the shuffle in registers)
-        assert M >= 32, "gluon mxfp4 preshuffle path requires M >= 32"
         _gluon_gemm_mxfp4_preshuffle_gfx1250[grid](
             x_fp4,
             w_preshuf,
@@ -556,7 +590,7 @@ def gemm_afp4wfp4_preshuffle(
     if M < 32 and M_POW2 > 16:
         M_POW2 = 16
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])
@@ -631,9 +665,9 @@ def gemm_afp4wfp4_preshuffled_weight_scales(
     w,
     x_scales,
     w_scales,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
 ):
     """
     This this a backward-compatible API and will be deprecated in future release

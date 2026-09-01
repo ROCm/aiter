@@ -1,23 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
 import ctypes
 import itertools
 import math
 import os
 import weakref
 
+import pandas as pd
 import pytest
 import torch
-
-import pandas as pd
+from einops import rearrange, repeat
 
 import aiter
-from aiter import dtypes
-from aiter import per_tensor_quant
-from einops import rearrange, repeat
-import argparse
-
+from aiter import dtypes, per_tensor_quant
 from aiter.test_common import (
     perftest,
 )
@@ -142,10 +139,7 @@ def should_skip_rocm72_issue(causal, logits_soft_cap):
 
     # Only skip on ROCm 7.2.x + gfx950
     major, minor = rocm_version
-    if (major, minor) == (7, 2) and gpu_arch == "gfx950":
-        return True
-
-    return False
+    return bool((major, minor) == (7, 2) and gpu_arch == "gfx950")
 
 
 def check_common_skip_conditions(
@@ -158,13 +152,12 @@ def check_common_skip_conditions(
     """
 
     # FP8 is inference-only, no backward pass needed, so LSE is not required
-    if skip_test_if(
-        is_input_fp8 and return_lse,
-        "FP8 is inference-only, LSE not needed for backward pass",
-    ):
-        return True
-
-    return False
+    return bool(
+        skip_test_if(
+            is_input_fp8 and return_lse,
+            "FP8 is inference-only, LSE not needed for backward pass",
+        )
+    )
 
 
 def check_layout_skip_conditions(
@@ -322,7 +315,7 @@ def ref_masked_attention(
     attn_weights = scale * torch.einsum("qhd,khd->hqk", query.float(), key.float())
 
     if 0 < logits_soft_cap:
-        mode = int(os.environ.get("CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT", 0))
+        mode = int(os.environ.get("CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT", "0"))
         if mode == 0:
             attn_weights = logits_soft_cap * torch.tanh(attn_weights / logits_soft_cap)
         else:
@@ -1254,18 +1247,18 @@ def run_ck(
         max_seqlen_q,
         max_seqlen_k,
     )
-    kernel_kwargs = dict(
-        causal=causal,
-        logits_soft_cap=logits_soft_cap,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
-        kv_block_descale=kv_block_descale,
-        kv_last_page_lens=kv_last_page_lens,
-        block_table=block_table,
-        seqlen_k=seqlen_k,
-        return_lse=return_lse,
-    )
+    kernel_kwargs = {
+        "causal": causal,
+        "logits_soft_cap": logits_soft_cap,
+        "q_descale": q_descale,
+        "k_descale": k_descale,
+        "v_descale": v_descale,
+        "kv_block_descale": kv_block_descale,
+        "kv_last_page_lens": kv_last_page_lens,
+        "block_table": block_table,
+        "seqlen_k": seqlen_k,
+        "return_lse": return_lse,
+    }
 
     if profile:
         result, time_us = profile_func(
@@ -1314,6 +1307,115 @@ def vectorize_kv_cache(
         .contiguous()
     )
     return k_cache, v_cache
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "batch_size,qo_len,kv_len,num_qo_heads,num_kv_heads,randomize_lengths",
+    [
+        (1, 512, 512, 8, 1, False),
+        (1, 128, 1024, 8, 1, False),
+        (2, 512, 768, 8, 1, True),
+        (2, 256, 256, 16, 2, False),
+    ],
+)
+def test_batch_prefill_hd256_fp8_page64_asm(
+    causal,
+    batch_size,
+    qo_len,
+    kv_len,
+    num_qo_heads,
+    num_kv_heads,
+    randomize_lengths,
+):
+    """LINEAR FP8 hd256 page_size=64 -- asm PAGED_VARLEN (packed Q/O + varlen)."""
+    if skip_test_if(
+        get_gpu_arch() != "gfx950",
+        "hd256 FP8 page_size=64 asm is gfx950-only",
+    ):
+        return
+    torch.manual_seed(19378)
+    page_size = 64
+    head_dim = 256
+    dtype = torch.bfloat16
+    k_vector_size_fp8 = get_vector_size(dtypes.fp8)
+
+    qo_lens = build_qo_lens(batch_size, qo_len, randomize=randomize_lengths)
+    q_indptr_cpu = convert_lens_to_indptr(qo_lens)
+    q = build_q_tensor_for_test(
+        qo_lens, batch_size, qo_len, num_qo_heads, head_dim, dtype, -10, 10, True
+    )
+    kv_lens = build_kv_lens(batch_size, kv_len, qo_lens, randomize=randomize_lengths)
+    kv_cache = build_paged_kv_cache(
+        batch_size,
+        kv_len,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        kv_lens,
+        None,
+        None,
+        dtype,
+        use_uniform=True,
+        contiguous_kv=True,
+    )
+    q_indptr_gpu = q_indptr_cpu.to(0)
+    kv_indptr_gpu = kv_cache["kv_indptr_cpu"].to(0)
+    kv_indices_gpu = kv_cache["kv_indices_cpu"].to(0)
+    kv_last_page_len_gpu = kv_cache["kv_last_page_len_cpu"].to(0)
+    k_cache_ref, v_cache_ref = extract_kv_caches(kv_cache, True)
+
+    o_ref = build_reference_output(
+        q,
+        q_indptr_cpu,
+        kv_cache["kv_data_fp32"],
+        kv_cache["kv_indices_cpu"],
+        kv_cache["kv_indptr_cpu"],
+        kv_cache["kv_last_page_len_cpu"],
+        num_kv_heads,
+        head_dim,
+        dtype,
+        causal,
+        0.0,
+        return_lse=False,
+    )
+
+    q_quant, q_descale = per_tensor_quant(q, quant_dtype=dtypes.fp8)
+    k_cache_quant, k_descale = per_tensor_quant(
+        k_cache_ref.to(dtype), quant_dtype=dtypes.fp8
+    )
+    v_cache_quant, v_descale = per_tensor_quant(
+        v_cache_ref.to(dtype), quant_dtype=dtypes.fp8
+    )
+    k_cache_quant, v_cache_quant = apply_kv_layout(
+        k_cache_quant,
+        v_cache_quant,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        k_vector_size_fp8,
+        "linear",
+    )
+
+    out_fp8 = aiter.mha_batch_prefill_func(
+        q_quant,
+        k_cache_quant,
+        v_cache_quant,
+        q_indptr_gpu,
+        kv_indptr_gpu,
+        kv_indices_gpu,
+        int(qo_lens.max().item()),
+        int(kv_lens.max().item()),
+        causal=causal,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        kv_last_page_lens=kv_last_page_len_gpu,
+    )
+    fp8_threshold = 0.06 if causal and kv_len < qo_len else 0.055
+    if head_dim > 128:
+        fp8_threshold = max(fp8_threshold, 0.06)
+    verify_fp8_output(out_fp8, o_ref, threshold=fp8_threshold)
 
 
 @pytest.mark.parametrize("table_layout", ["sglang", "vllm"])
@@ -1565,7 +1667,7 @@ def per_page_quant(tensor, page_size, quant_dtype):
         quantized: quantized tensor [num_pages, page_size, num_heads, head_dim]
         descales: [num_pages, num_heads] per-page descale factors
     """
-    num_pages, ps, num_heads, head_dim = tensor.shape
+    _num_pages, ps, _num_heads, _head_dim = tensor.shape
     assert ps == page_size
 
     # Compute per-page max absolute value
@@ -2009,11 +2111,16 @@ def test_batch_prefill_large_kvcache(
     extra_kwargs = {}
     if is_fp8:
         if quant_mode == "kv_blockscale":
-            extra_kwargs = dict(q_descale=q_descale, kv_block_descale=kv_block_descale)
+            extra_kwargs = {
+                "q_descale": q_descale,
+                "kv_block_descale": kv_block_descale,
+            }
         else:
-            extra_kwargs = dict(
-                q_descale=q_descale, k_descale=k_descale, v_descale=v_descale
-            )
+            extra_kwargs = {
+                "q_descale": q_descale,
+                "k_descale": k_descale,
+                "v_descale": v_descale,
+            }
 
     result = aiter.mha_batch_prefill_func(
         q_kernel,
@@ -2245,11 +2352,16 @@ def test_batch_prefill_4gb_boundary_targeted(
     extra_kwargs = {}
     if is_fp8:
         if quant_mode == "kv_blockscale":
-            extra_kwargs = dict(q_descale=q_descale, kv_block_descale=kv_block_descale)
+            extra_kwargs = {
+                "q_descale": q_descale,
+                "kv_block_descale": kv_block_descale,
+            }
         else:
-            extra_kwargs = dict(
-                q_descale=q_descale, k_descale=k_descale, v_descale=v_descale
-            )
+            extra_kwargs = {
+                "q_descale": q_descale,
+                "k_descale": k_descale,
+                "v_descale": v_descale,
+            }
 
     out = aiter.mha_batch_prefill_func(
         q_kernel,
@@ -2344,11 +2456,10 @@ def run_batch_prefill_kv_blockscale(
 
     quant_dtype = dtypes.fp8
     # KV_BLOCKSCALE only supports page_size=1024
-    if page_size != 1024:
-        if skip_test_if(
-            True, f"KV_BLOCKSCALE only supports page_size=1024, got {page_size}"
-        ):
-            return {"status": "skipped"}
+    if page_size != 1024 and skip_test_if(
+        True, f"KV_BLOCKSCALE only supports page_size=1024, got {page_size}"
+    ):
+        return {"status": "skipped"}
 
     k_vector_size = get_vector_size(quant_dtype)
 
@@ -2591,7 +2702,7 @@ parser.add_argument(
     "--pagesize",
     type=int,
     const=None,
-    choices=[1, 16, 1024],
+    choices=[1, 16, 64, 1024],
     default=[1, 16, 1024],
     nargs="*",
     help="""page size.
@@ -3565,6 +3676,7 @@ def _aick1171_run_in_subprocess(child_code: str, timeout: int = 180):
         text=True,
         timeout=timeout,
         env=env,
+        check=False,
     )
 
 

@@ -1,7 +1,7 @@
-import os
-import sys
 import argparse
+import os
 import subprocess
+import sys
 
 
 def parse_args():
