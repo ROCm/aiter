@@ -56,6 +56,8 @@ from aiter.ops.triton.quant.quant import dynamic_mxfp8_quant
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     fp4_v_padded_sequence,
     fp4_v_raw_buffer_size,
+    pack_v_mxfp4_colmajor_fp6_p_raw,
+    pack_v_mxfp4_colmajor_raw,
 )
 
 
@@ -594,6 +596,36 @@ def test_mha_v4_mxfp4_v_pack_matches_reference(sequence):
         fp4_v_padded_sequence(sequence) * 64,
         1,
     )
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP4 V validation")
+@pytest.mark.parametrize("sequence", [128, 129, 257])
+def test_mha_v4_mxfp4_fp6_p_pack_matches_permuted_canonical(sequence):
+    torch.manual_seed(sequence)
+    value = torch.randn((2, sequence, 3, 128), device="cuda", dtype=torch.bfloat16)
+    token = torch.arange(sequence, device=value.device)
+    within_block = token % 64
+    paired = (
+        (within_block & ~0x24)
+        | ((within_block & 0x04) << 3)
+        | ((within_block & 0x20) >> 3)
+    )
+    source_token = torch.minimum(
+        token - within_block + paired, token.new_tensor(sequence - 1)
+    )
+
+    raw, scale = pack_v_mxfp4_colmajor_fp6_p_raw(value)
+    compiled_raw, compiled_scale = torch.compile(
+        pack_v_mxfp4_colmajor_fp6_p_raw, fullgraph=True
+    )(value)
+    expected_raw, expected_scale = pack_v_mxfp4_colmajor_raw(
+        value[:, source_token].contiguous()
+    )
+
+    assert torch.equal(raw, expected_raw)
+    assert torch.equal(scale, expected_scale)
+    assert torch.equal(compiled_raw, expected_raw)
+    assert torch.equal(compiled_scale, expected_scale)
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP6 K validation")

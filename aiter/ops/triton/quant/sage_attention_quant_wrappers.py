@@ -360,6 +360,37 @@ def _pack_v_mxfp4_colmajor_raw_fake(value):
     )
 
 
+@torch.library.custom_op(
+    "aiter::pack_v_mxfp4_colmajor_fp6_p_raw", mutates_args=()
+)
+def pack_v_mxfp4_colmajor_fp6_p_raw(
+    value: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack MXFP4 V in the token order required by an FP6 P operand.
+
+    The returned payload and E8M0 scale buffers have the same shapes as the
+    canonical col-major packer. Tail source tokens are clamped to the final
+    logical token before quantization.
+    """
+    _, sequence, _, _ = value.shape
+    token = torch.arange(sequence, device=value.device)
+    within_block = token % 64
+    paired = (
+        (within_block & ~0x24)
+        | ((within_block & 0x04) << 3)
+        | ((within_block & 0x20) >> 3)
+    )
+    source_token = torch.minimum(
+        token - within_block + paired, token.new_tensor(sequence - 1)
+    )
+    return pack_v_mxfp4_colmajor_raw(value[:, source_token].contiguous())
+
+
+@pack_v_mxfp4_colmajor_fp6_p_raw.register_fake
+def _pack_v_mxfp4_colmajor_fp6_p_raw_fake(value):
+    return _pack_v_mxfp4_colmajor_raw_fake(value)
+
+
 def sage_quant_v_mxfp4(value):
     """Return true-MXFP4 V data view and kernel-ready E8M0 block-scale image."""
     batch, sequence, heads, _ = value.shape
