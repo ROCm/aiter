@@ -73,6 +73,16 @@ if [ -n "$PATCHF" ] && [ ! -r "$PATCHF" ]; then
   echo "--patch is not readable: $PATCHF" >&2
   exit 2
 fi
+# Resolve before anything changes directory. A relative --patch used to be read from the
+# caller's cwd in one place and from the worktree in another; the mismatch surfaced as
+# "patch does not apply to the current base" and a BLOCK verdict -- a fact about the
+# invocation, published as a reproducible defect against the PR author.
+if [ -n "$PATCHF" ]; then
+  PATCHF=$(cd -- "$(dirname -- "$PATCHF")" && pwd)/$(basename -- "$PATCHF")
+fi
+if [ -n "$OUT" ]; then
+  OUT=$(cd -- "$(dirname -- "$OUT")" && pwd)/$(basename -- "$OUT")
+fi
 if [ -n "$HEAD_SHA" ] && [[ ! "$HEAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
   echo "--head-sha must be a full 40-character commit OID" >&2
   exit 2
@@ -806,6 +816,18 @@ for item in filter(None, table.split(",")):
     name, value = item.split("=", 1)
     reference[name] = float(value)
 
+# --tol-table was parsed, published, and compared against nothing: a documented flag with a
+# validated argument and no effect on any verdict. The comparison the caller is entitled to is
+# whether the suite accepts error beyond anything they declared acceptable. Which literal
+# belongs to which dtype is not recoverable from the source, so the bound is the loosest
+# declared reference -- a tolerance above that is loose under every reading.
+exceeds_reference = []
+if reference and head_tolerances:
+    ceiling = max(reference.values())
+    exceeds_reference = sorted(
+        value for value in set(head_tolerances) if value > ceiling
+    )
+
 kernel_suffixes = (".py", ".cu", ".cuh", ".h", ".hpp", ".cpp")
 kernel_changed = any(
     path.endswith(kernel_suffixes)
@@ -820,11 +842,24 @@ stage = {
     "tolerances_head_by_name": head_indirect,
     "tolerances_base_by_name": base_indirect,
     "reference_tolerances": reference,
+    "exceeds_reference": exceeds_reference,
     "commented_out_shape_rows_base": commented_base,
     "commented_out_shape_rows": commented_head,
     "commented_out_shape_rows_added": commented_added,
     "kernel_files_changed": kernel_changed,
 }
+if exceeds_reference:
+    data["findings"].append(
+        {
+            "severity": "should-fix",
+            "stage": "test_policy",
+            "detail": (
+                f"the suite accepts error up to {max(exceeds_reference)}, above the loosest "
+                f"reference tolerance supplied ({max(reference.values())}); a kernel defect "
+                f"smaller than that gap cannot make these tests red"
+            ),
+        }
+    )
 if loosened:
     stage["loosened"] = loosened
     if kernel_changed:
@@ -1029,6 +1064,48 @@ import sys
 tree = ast.parse(open(sys.argv[1], encoding="utf-8").read())
 wanted = {name.strip() for name in sys.argv[2].split(",") if name.strip()}
 
+def mark_names(call):
+    if not call.args:
+        return set()
+    first = call.args[0]
+    if isinstance(first, ast.Constant) and isinstance(first.value, str):
+        return {part.strip() for part in first.value.split(",") if part.strip()}
+    if isinstance(first, (ast.List, ast.Tuple)):
+        return {
+            str(e.value) for e in first.elts if isinstance(e, ast.Constant)
+        }
+    return set()
+
+
+# Decided per test function, exactly as the plugin decides per metafunc. A file-wide check
+# let one unrelated test's overlapping mark disable the channel for the whole file.
+reachable = False
+for node in ast.walk(tree):
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        continue
+    if not node.name.startswith("test"):
+        continue
+    args = node.args
+    names = {
+        a.arg for a in list(args.posonlyargs) + list(args.args) + list(args.kwonlyargs)
+    }
+    marks = [
+        d for d in node.decorator_list
+        if isinstance(d, ast.Call) and getattr(d.func, "attr", "") == "parametrize"
+    ]
+    bound_all = set()
+    blocked = False
+    for mark in marks:
+        bound = mark_names(mark)
+        bound_all |= bound
+        if (bound & wanted) and not (bound <= wanted):
+            blocked = True
+    if wanted <= (names | bound_all) and not blocked:
+        reachable = True
+        break
+print(int(bool(wanted) and reachable))
+raise SystemExit(0)
+
 available = set()
 for node in ast.walk(tree):
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -1081,7 +1158,7 @@ jset_string "test_selection.grid_channel" "$GRID_CHANNEL"
 # target.
 GRID_CHANNEL_REASON=""
 if [ -n "$GRID" ] && [ "$GRID_HOOK_OK" -ne 1 ]; then
-  if [ -z "$SHAPE_ARG" ] && [ -z "$SHAPE_ENV" ]; then
+  if [ -z "$SHAPE_ARG" ] && [ -z "$SHAPE_ENV" ] && [ -z "$SHAPE_ARGNAMES" ]; then
     GRID_CHANNEL_REASON="a grid was supplied but neither --shape-arg nor --shape-env named a channel to deliver it through"
   else
     GRID_CHANNEL_REASON="grid channel not established:"
@@ -1176,7 +1253,10 @@ run_pytest() {
   local phase=${label%%-*}
   local cache_root="$WORK/$phase"
   local junit="$cache_root/junit-$label.xml"
-  local receipt="$cache_root/execution-receipt.json"
+  # Per LABEL, not per phase. head-repo and head-grid share a phase directory, so a grid run
+  # that died during collection overwrote the receipt head-repo had already written and the
+  # report claimed the route never executed -- erasing evidence that had been collected.
+  local receipt="$cache_root/execution-receipt-$label.json"
   mkdir -p "$cache_root/home" "$cache_root/xdg-cache" \
     "$cache_root/flydsl-cache" "$cache_root/triton-cache" \
     "$cache_root/torch-extensions" "$cache_root/pytest-cache" \
@@ -1344,6 +1424,26 @@ PY
   fi
 }
 
+# The grid receipt is preferred when it proves the route, because it is the run that
+# exercised the injected shapes; otherwise the repository run's receipt stands. A phase that
+# observed nothing never speaks over one that observed something.
+head_receipt() {
+  local grid="$WORK/head/execution-receipt-head-grid.json"
+  local repo="$WORK/head/execution-receipt-head-repo.json"
+  if [ -f "$grid" ] && python3 -c '
+import json, sys
+print(0 if json.load(open(sys.argv[1])).get("route") else 1)
+' "$grid" 2>/dev/null | grep -q '^0$'; then
+    printf '%s\n' "$grid"
+    return 0
+  fi
+  if [ -f "$repo" ]; then
+    printf '%s\n' "$repo"
+    return 0
+  fi
+  printf '%s\n' "$grid"
+}
+
 stats_field() {
   python3 - "$1" "$2" <<'PY'
 import json
@@ -1457,7 +1557,11 @@ else
             "base-grid-probe" "$SHAPE_ENV=__VALIDATOR_INVALID_GRID__")
           BASE_PROBE_RC=${BASE_PROBE_RESULT%%|*}
           BASE_PROBE_LOG=${BASE_PROBE_RESULT##*|}
-          if [ "$BASE_PROBE_RC" -eq 0 ]; then
+          # A non-zero probe exit is only evidence that the GRID was consumed when the same
+          # target succeeds without it. On a held-out PR whose module could not be imported at
+          # all, the probe failed for that reason and the channel was credited although no
+          # shape ever reached the kernel. Require the unpoisoned baseline run to have passed.
+          if [ "$BASE_PROBE_RC" -eq 0 ] || [ "${BASE_REPO_RC:-1}" -ne 0 ]; then
             BASE_GRID_STATE="hook-not-consumed"
           else
             BASE_GRID_RESULT=$(run_pytest "base-grid" "$SHAPE_ENV=$GRID")
@@ -1664,8 +1768,9 @@ PY
         fi
         RECEIPT_JSON=$(
           python3 "$SCRIPT_DIR/validate_evidence.py" receipt \
-            "$WORK/head/execution-receipt.json" \
-            --expected-route "$EXPECTED_ROUTE" --grid "$GRID"
+            "$(head_receipt)" \
+            --expected-route "$EXPECTED_ROUTE" --grid "$GRID" \
+            --grid-channel "$GRID_CHANNEL"
         )
         jset_json "stages.execution_receipt" "$RECEIPT_JSON"
         RECEIPT_STATUS=$(python3 - "$RECEIPT_JSON" <<'PY'
@@ -1683,11 +1788,11 @@ PY
     elif [ -n "$SHAPE_ENV" ] && [ -n "$GRID" ]; then
       stage_note "correctness_s1_grid" "skip" \
         "configured shape environment variable is not referenced by the target"
-      if [ -n "$EXPECTED_ROUTE" ] && [ -f "$WORK/head/execution-receipt.json" ]; then
+      if [ -n "$EXPECTED_ROUTE" ] && [ -f "$(head_receipt)" ]; then
         RECEIPT_JSON=$(
           python3 "$SCRIPT_DIR/validate_evidence.py" receipt \
-            "$WORK/head/execution-receipt.json" \
-            --expected-route "$EXPECTED_ROUTE" --grid ""
+            "$(head_receipt)" \
+            --expected-route "$EXPECTED_ROUTE" --grid "" --grid-channel ""
         )
         jset_json "stages.execution_receipt" "$RECEIPT_JSON"
         RECEIPT_STATUS=$(python3 -c \
@@ -1717,11 +1822,11 @@ PY
         stage_note "correctness_s1_grid" "skip" \
           "kernel exposes no configured shape override; coverage is repo-default-only"
       fi
-      if [ -n "$EXPECTED_ROUTE" ] && [ -f "$WORK/head/execution-receipt.json" ]; then
+      if [ -n "$EXPECTED_ROUTE" ] && [ -f "$(head_receipt)" ]; then
         RECEIPT_JSON=$(
           python3 "$SCRIPT_DIR/validate_evidence.py" receipt \
-            "$WORK/head/execution-receipt.json" \
-            --expected-route "$EXPECTED_ROUTE" --grid ""
+            "$(head_receipt)" \
+            --expected-route "$EXPECTED_ROUTE" --grid "" --grid-channel ""
         )
         jset_json "stages.execution_receipt" "$RECEIPT_JSON"
         RECEIPT_STATUS=$(python3 -c \

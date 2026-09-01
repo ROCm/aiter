@@ -74,9 +74,17 @@ def pytest_generate_tests(metafunc):
 
     rows = [tuple(row) for row in _VALIDATION_SHAPE_GRID]
     if len(names) == 1:
+        # pytest sets force_tuple only when argnames is a STRING (_pytest/mark/structures.py).
+        # Passing a one-element LIST with scalar rows made collection die with
+        # "object of type 'int' has no len()", and the executor published that crash as a
+        # blocker against the PR author. One name is the dominant shape in the targets this
+        # channel exists for, so this path was broken for exactly its main case.
+        argnames = names[0]
         rows = [row[0] for row in rows]
+    else:
+        argnames = names
     metafunc.parametrize(
-        names,
+        argnames,
         rows,
         ids=[f"s1grid{index}" for index in range(len(rows))],
     )

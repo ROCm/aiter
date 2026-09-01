@@ -355,10 +355,14 @@ a seeded defect, and these have not been:
   Choosing the right `--target` from a diff is the unsolved part; an irrelevant target can
   still produce `PASS`. The report names the target so a reviewer can reject that evidence, but
   the executor cannot decide relevance itself.
-- **External grid adapters.** A target that exposes no shape channel at all — neither an env var
-  for `--shape-env` nor a CLI flag for `--shape-arg` — still cannot be given a grid. The validator
-  does not accept an independently hashed `--extra-target`, because that harness must be bound
-  without changing the PR diff hash or live-base identity. Such runs remain `INCONCLUSIVE`.
+- **External grid adapters.** Three channels now exist — `--shape-env`, `--shape-arg`, and
+  `--shape-argnames` for pytest parametrization — and between them they reach the great majority
+  of aiter's `op_tests`. What remains unreachable is a target whose shapes are none of those: a
+  parametrized case whose single parameter is a **dict or object** rather than scalar cells, and
+  a target that takes its shapes from a file or a fixture. The validator still does not accept an
+  independently hashed `--extra-target`, because that harness would have to be bound without
+  changing the PR diff hash or live-base identity. Such runs remain `INCONCLUSIVE`, and
+  `test_selection.grid_channel_reason` says which of these applies.
 - **Cross-architecture compilation.** `arch_coverage: compile-only` is reserved for a future
   stage that actually invokes an architecture-specific compiler. No-GPU mode does not claim it.
 - **`perf` and `claims` stages.** The schema reserves both — median-of-N against a baseline on the

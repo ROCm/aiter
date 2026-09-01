@@ -27,7 +27,12 @@ def pytest_stats(path: pathlib.Path) -> dict:
         key: sum(int(suite.attrib.get(key, 0)) for suite in suites)
         for key in ("tests", "failures", "errors", "skipped")
     }
-    totals["executed"] = totals["tests"] - totals["skipped"]
+    # errors are collection and fixture failures: the test body never ran. Counting them as
+    # executed let a target that failed to import credit arch_coverage with runtime coverage,
+    # on the strength of an "executed test" that was the collection error itself.
+    totals["executed"] = max(
+        0, totals["tests"] - totals["skipped"] - totals["errors"]
+    )
     totals["junit_xml"] = str(path)
     return totals
 
@@ -36,6 +41,7 @@ def validate_receipt(
     path: pathlib.Path,
     expected_route: str,
     grid: str,
+    grid_channel: str = "",
 ) -> dict:
     if not expected_route:
         return {
@@ -82,6 +88,12 @@ def validate_receipt(
             "note": "expected route is absent from observed kernel_symbols",
         }
     expected_shapes = [shape.strip() for shape in grid.split(";") if shape.strip()]
+    # The pytest channel substitutes the grid into the TEST's parameters, while the receipt
+    # records locals inside the ROUTE. The two vocabularies need not coincide, and requiring
+    # one to contain the other reported "execution receipt is missing required shapes" for a
+    # run whose every grid case passed. What the grid required is still recorded; only the
+    # cross-namespace containment assertion is dropped, and the note says so.
+    cross_namespace = grid_channel == "pytest"
     observed_shapes = receipt.get("executed_shapes")
     if not isinstance(observed_shapes, list) or not all(
         isinstance(shape, str) and shape for shape in observed_shapes
@@ -91,7 +103,7 @@ def validate_receipt(
             "note": "execution receipt has no executed_shapes list",
         }
     missing = sorted(set(expected_shapes) - set(observed_shapes))
-    if missing:
+    if missing and not cross_namespace:
         return {
             "status": "skip",
             "note": f"execution receipt is missing required shapes: {missing}",
@@ -111,6 +123,12 @@ def validate_receipt(
     # every observed case was a route deriving its shapes in its body, where the requested
     # names never became locals the probe could see. Name the gap in the report so no consumer
     # can read the empty list as evidence that no shapes were needed.
+    if cross_namespace:
+        result["shape_namespace"] = (
+            "the grid was delivered as pytest parameters and executed_shapes records the "
+            "route's own locals; the two are different vocabularies, so this receipt attests "
+            "route execution and the grid's own evidence is correctness_s1_grid"
+        )
     requested_vars = [name for name in receipt.get("shape_vars") or [] if name]
     if requested_vars and not observed_shapes:
         result["shape_capture"] = {
@@ -161,6 +179,22 @@ def runtime_identity(
     if dependency_root:
         roots.append(dependency_root.resolve())
     artifacts = loaded_native_artifacts(roots)
+    # This probe runs before the target does and imports only `module_name`, so the set of
+    # loaded shared objects is whatever that import pulled in -- not what the kernel will load.
+    # An empty list was being published as though it were a measurement of "no native
+    # artifacts"; three separate runs recorded `native_artifacts: []` on a host where the
+    # FlyDSL runtime demonstrably executed the kernel. State the boundary instead.
+    basis = (
+        f"shared objects loaded by importing {module_name!r}, restricted to "
+        + ", ".join(str(candidate) for candidate in roots)
+    )
+    if not artifacts:
+        basis += (
+            "; none were found, which means this import loaded none under those roots -- it "
+            "is not evidence that the target loads none, because the target had not run yet"
+        )
+    if dependency_root is None:
+        basis += "; no --dependency-root was supplied, so runtimes outside the checkout are outside this probe's reach"
     return {
         "module": module_name,
         "module_path": str(module_path),
@@ -170,6 +204,7 @@ def runtime_identity(
         "python_version": platform.python_version(),
         "source_sha": None,
         "native_artifacts": artifacts,
+        "native_artifacts_basis": basis,
     }
 
 
@@ -184,6 +219,7 @@ def parse_args() -> argparse.Namespace:
     receipt.add_argument("path", type=pathlib.Path)
     receipt.add_argument("--expected-route", default="")
     receipt.add_argument("--grid", default="")
+    receipt.add_argument("--grid-channel", default="")
 
     runtime = subparsers.add_parser("runtime")
     runtime.add_argument("module")
@@ -198,7 +234,9 @@ def main() -> int:
     if args.command == "pytest-stats":
         result = pytest_stats(args.junit_xml)
     elif args.command == "receipt":
-        result = validate_receipt(args.path, args.expected_route, args.grid)
+        result = validate_receipt(
+            args.path, args.expected_route, args.grid, args.grid_channel
+        )
     else:
         result = runtime_identity(
             args.module,

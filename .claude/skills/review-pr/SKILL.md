@@ -475,7 +475,10 @@ if receipt.get("status") == "pass" and (
     or receipt.get("route") != selection["expected_route"]
     or selection["expected_route"] not in receipt.get("kernel_symbols", [])
     or sorted(set(receipt.get("required_shapes", []))) != sorted(set(required_shapes))
-    or not set(required_shapes).issubset(set(receipt.get("executed_shapes", [])))
+    or (
+        selection.get("grid_channel") != "pytest"
+        and not set(required_shapes).issubset(set(receipt.get("executed_shapes", [])))
+    )
 ):
     raise SystemExit("execution receipt contradicts the selected route/grid")
 severities = {

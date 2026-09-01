@@ -51,7 +51,17 @@ import sys
 # Recognised 64-bit widening spellings. This is a list of WIDENING FORMS, not of variable
 # names -- it says how a programmer writes "make this int64", not what they call their loop
 # counter. Missing a spelling here costs a false positive, never a miss.
+# Compared case-insensitively: FlyDSL spells it `fx.Int64(...)`, Triton `tl.int64`, C++
+# `int64_t`. An exact-case set reported explicitly widened FlyDSL code as a candidate.
+# This IS a spelling list, and it is the one remaining place where the scanner depends on how
+# a widening is written rather than on what it does. A missing spelling costs a false
+# positive, never a miss, which is the safe direction -- but add new spellings here rather
+# than working around the false positive somewhere else.
 WIDEN_ATTRS = {"int64", "int64_t", "long"}
+
+
+def _is_widen_name(name):
+    return name.lower() in WIDEN_ATTRS
 WIDEN_CALL_RE = re.compile(r"\bint64\b|\bint64_t\b|\bstatic_cast<\s*int64_t")
 
 HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
@@ -196,9 +206,9 @@ class KernelScopeScanner(ast.NodeVisitor):
     def _widens(node):
         """True if this subtree explicitly produces a 64-bit value."""
         for sub in ast.walk(node):
-            if isinstance(sub, ast.Attribute) and sub.attr in WIDEN_ATTRS:
+            if isinstance(sub, ast.Attribute) and _is_widen_name(sub.attr):
                 return True
-            if isinstance(sub, ast.Name) and sub.id in WIDEN_ATTRS:
+            if isinstance(sub, ast.Name) and _is_widen_name(sub.id):
                 return True
             if isinstance(sub, ast.Call):
                 func = sub.func

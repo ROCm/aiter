@@ -288,6 +288,7 @@
             "kernel_symbols": { "type": "array", "items": { "type": "string" } },
             "required_shapes": { "type": "array", "items": { "type": "string" } },
             "executed_shapes": { "type": "array", "items": { "type": "string" } },
+            "shape_namespace": { "type": "string", "minLength": 1 },
             "shape_capture": {
               "type": "object",
               "description": "Present only when shape capture was requested and produced no rows. A receipt carrying this asserts route execution and makes no claim about shapes.",
