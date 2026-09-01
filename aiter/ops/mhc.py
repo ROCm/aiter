@@ -21,7 +21,7 @@ def mhc_pre_gemm_sqrsum(
     x: Tensor,
     fn: Tensor,
     tile_k: int = 128,  # 64 or 128
-    is_fn_pack_bf16: int = 0,  # 1: fn is pre-packed int32 (hi<<16|lo) from mhc_pre_convert_fn
+    is_res_w_preshuffle_bf16: int = 0,  # 1: fn is pre-packed int32 (hi<<16|lo) from mhc_pre_convert_fn
 ) -> None: ...
 
 
@@ -30,46 +30,6 @@ def mhc_pre_convert_fn(
     fn_packed: Tensor,  # (hc_mult3, hc_hidden_size) int32 out
     fn: Tensor,  # (hc_mult3, hc_hidden_size) fp32 in
 ) -> None: ...
-
-
-@compile_ops("module_mhc", develop=True)
-def mhc_pre_shuffle_fn(
-    fn_shuffled: Tensor,  # (hc_hidden_size // 32, n_pad, 32) out
-    fn: Tensor,  # (hc_mult3, hc_hidden_size) fp32 in
-    is_fn_pack_bf16: int = 0,
-) -> None: ...
-
-
-def mhc_fn_shuffle_n_pad(hc_mult3: int) -> int:
-    """Rows stored per K block by the preshuffled fn layout -- hc_mult3, unpadded.
-
-    Padding up to the tile_n the kernel reads would be real extra read traffic (fn is
-    re-read by every m-block), so the kernel steers the surplus lanes out of bounds
-    instead, which reads 0 exactly as the unshuffled path does.
-    """
-    return hc_mult3
-
-
-def mhc_pre_shuffle_fn_alloc(fn: torch.Tensor, is_fn_pack_bf16: int = 0) -> torch.Tensor:
-    """Allocate + fill the preshuffled fn for the FUSED post_pre gemm.
-
-    ``fn[n][K] -> fnS[K // 32][n][K % 32]``, N zero-padded to a multiple of 32. Pass the
-    result as ``fn`` together with ``fn_n_pad`` to ``mhc_fused_post_pre``. The layout is
-    independent of (tile_m, tile_n, tile_k, warp_size), so one copy serves every config;
-    it does NOT match the unfused ``mhc_pre`` path, which stages fn through LDS.
-    """
-    hc_mult3, hc_hidden_size = fn.shape
-    assert hc_hidden_size % 32 == 0, f"{hc_hidden_size=} must be divisible by 32"
-    n_rows = mhc_fn_shuffle_n_pad(hc_mult3)
-    out = torch.empty(
-        hc_hidden_size // 32,
-        n_rows,
-        32,
-        dtype=dtypes.i32 if is_fn_pack_bf16 else dtypes.fp32,
-        device=fn.device,
-    )
-    mhc_pre_shuffle_fn(out, fn, is_fn_pack_bf16)
-    return out
 
 
 def mhc_pre_convert_fn_ref(fn: torch.Tensor) -> torch.Tensor:
@@ -97,6 +57,7 @@ def mhc_pre_big_fuse(
     hc_sinkhorn_eps: float = 1e-6,
     hc_post_mult_value: float = 1.0,
     sinkhorn_repeat: int = 20,
+    res_preshuffle: int = 0,
 ) -> None: ...
 
 
@@ -117,7 +78,45 @@ def mhc_pre_big_fuse_rmsnorm(
     norm_eps: float = 1e-6,
     hc_post_mult_value: float = 1.0,
     sinkhorn_repeat: int = 20,
+    res_preshuffle: int = 0,
 ) -> None: ...
+
+
+# Pre-shuffled residual layout used by the fused post+pre path when
+# is_res_w_preshuffle_bf16 is set (kernel-side constant: mhc_res_ks).
+#   resS[k // KS][head][row][k % KS]  <-  res[row][head][k]
+# The tensor keeps its (m, hc_mult, hidden_size) shape and element count; only the
+# order of the elements inside the buffer changes. Both the gemm's residual read and
+# its next_residual write use this layout, so it stays internal to a stack of layers:
+# only the first residual in and the last one out need converting.
+MHC_RES_KS = 32
+# ABLATION KNOB: 0 keeps the plain residual layout while leaving the bf16 fn gemm on.
+# Must be kept in lockstep with mhc_res_shuffle in csrc/kernels/mhc_kernels.cu.
+MHC_RES_SHUFFLE = 1
+
+
+def mhc_res_shuffle(residual: torch.Tensor) -> torch.Tensor:
+    """res[row][head][k] -> resS[k//KS][head][row][k%KS], same shape."""
+    m, hc_mult, hidden_size = residual.shape
+    assert hidden_size % MHC_RES_KS == 0
+    return (
+        residual.view(m, hc_mult, hidden_size // MHC_RES_KS, MHC_RES_KS)
+        .permute(2, 1, 0, 3)
+        .contiguous()
+        .view(m, hc_mult, hidden_size)
+    )
+
+
+def mhc_res_unshuffle(shuffled: torch.Tensor) -> torch.Tensor:
+    """Inverse of :func:`mhc_res_shuffle`."""
+    m, hc_mult, hidden_size = shuffled.shape
+    assert hidden_size % MHC_RES_KS == 0
+    return (
+        shuffled.view(hidden_size // MHC_RES_KS, hc_mult, m, MHC_RES_KS)
+        .permute(2, 1, 0, 3)
+        .contiguous()
+        .view(m, hc_mult, hidden_size)
+    )
 
 
 @functools.lru_cache(maxsize=1024)
@@ -355,7 +354,7 @@ def mhc_pre_fake(
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
     large_m_splitk: bool = False,
-    is_fn_pack_bf16: int = 0,
+    is_res_w_preshuffle_bf16: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     m = residual.size(0)
     hc_mult = residual.size(1)
@@ -381,7 +380,7 @@ def mhc_pre(
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
     large_m_splitk: bool = False,
-    is_fn_pack_bf16: int = 0,  # 1: fn is pre-packed int32 (hi<<16|lo) from mhc_pre_convert_fn
+    is_res_w_preshuffle_bf16: int = 0,  # 1: fn is pre-packed int32 (hi<<16|lo) from mhc_pre_convert_fn
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     m = residual.size(0)
     hc_mult = residual.size(1)
@@ -401,8 +400,8 @@ def mhc_pre(
     )
     out = out_pad[:, :, :hc_mult3]
     sqrsum = torch.empty(selected_splitk, m, dtype=dtypes.fp32, device=device)
-    # is_fn_pack_bf16=1: fn is the pre-packed int32 tensor (bf16 hi/lo MFMA path).
-    mhc_pre_gemm_sqrsum(out, sqrsum, residual, fn, selected_tile_k, is_fn_pack_bf16)
+    # is_res_w_preshuffle_bf16=1: fn is the pre-packed int32 tensor (bf16 hi/lo MFMA path).
+    mhc_pre_gemm_sqrsum(out, sqrsum, residual, fn, selected_tile_k, is_res_w_preshuffle_bf16)
     # out = out.sum(0)
     # sqrsum = sqrsum.sum(0)
 
@@ -478,8 +477,7 @@ def mhc_fused_post_pre_gemm_sqrsum(
     tile_m: int = 16,  # 16, 32 or 64
     tile_n: int = 32,  # 16 or 32
     tile_k: int = 32,  # 32 or 64
-    is_fn_pack_bf16: int = 0,
-    fn_n_pad: int = 0,  # >0: fn is preshuffled (mhc_pre_shuffle_fn_alloc)
+    is_res_w_preshuffle_bf16: int = 0,
 ) -> None: ...
 
 
@@ -499,8 +497,7 @@ def mhc_fused_post_pre_fake(
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
     force_fused: bool = False,
-    is_fn_pack_bf16: int = 0,
-    fn_n_pad: int = 0,
+    is_res_w_preshuffle_bf16: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     m = layer_input.size(0)
     hc_mult = residual_in.size(1)
@@ -529,7 +526,7 @@ def mhc_fused_post_pre_large_m(
     sinkhorn_repeat: int = 20,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
-    is_fn_pack_bf16: int = 0,
+    is_res_w_preshuffle_bf16: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """gfx950 large-M post+pre (M > 1024): upstream ``mhc_post`` + ``mhc_pre``."""
     m = residual_in.size(0)
@@ -570,7 +567,7 @@ def mhc_fused_post_pre_large_m(
         norm_weight,
         norm_eps,
         large_m_splitk=True,
-        is_fn_pack_bf16=is_fn_pack_bf16,
+        is_res_w_preshuffle_bf16=is_res_w_preshuffle_bf16,
     )
     return post_mix, comb_mix, layer_input_out, next_residual
 
@@ -592,8 +589,7 @@ def mhc_fused_post_pre(
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
     force_fused: bool = False,
-    is_fn_pack_bf16: int = 0,
-    fn_n_pad: int = 0,
+    is_res_w_preshuffle_bf16: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused mhc_post + next mhc_pre (HIP), mirroring ``mhc_pre`` with post-step inputs.
 
@@ -619,6 +615,14 @@ def mhc_fused_post_pre(
         "gfx1250": 1024,
     }.get(arch, 1024)
 
+    # The pre-shuffled residual layout is produced and consumed only by
+    # mhc_fused_post_pre_gemm_sqrsum + mhc_pre_big_fuse{,_rmsnorm}. The fallbacks below
+    # go through mhc_post / the large_m kernel, which read res[row][head][k]; feeding
+    # them a shuffled tensor would silently compute garbage, so refuse instead.
+    assert not (is_res_w_preshuffle_bf16 and not force_fused and m >= fused_m_upper_bound), (
+        "is_res_w_preshuffle_bf16 requires the fused path (pass force_fused=True); "
+        f"m={m} >= fused_m_upper_bound={fused_m_upper_bound} would fall back to mhc_post + mhc_pre"
+    )
     if not force_fused and m >= fused_m_upper_bound:
         next_residual = torch.empty_like(residual_in)
         mhc_post(
@@ -640,10 +644,13 @@ def mhc_fused_post_pre(
             sinkhorn_repeat,
             norm_weight,
             norm_eps,
-            is_fn_pack_bf16=is_fn_pack_bf16,
+            is_res_w_preshuffle_bf16=is_res_w_preshuffle_bf16,
         )
         return post_mix, comb_mix, layer_input_out, next_residual
 
+    assert not (
+        is_res_w_preshuffle_bf16 and force_fused and arch == "gfx950" and m > fused_m_upper_bound
+    ), "mhc_fused_post_pre_large_m does not implement the pre-shuffled residual layout"
     if force_fused and arch == "gfx950" and m > fused_m_upper_bound:
         return mhc_fused_post_pre_large_m(
             layer_input,
@@ -660,7 +667,7 @@ def mhc_fused_post_pre(
             sinkhorn_repeat,
             norm_weight,
             norm_eps,
-            is_fn_pack_bf16=is_fn_pack_bf16,
+            is_res_w_preshuffle_bf16=is_res_w_preshuffle_bf16,
         )
 
     assert layer_input.shape == (
@@ -672,26 +679,11 @@ def mhc_fused_post_pre(
         f"got {tuple(residual_in.shape)}"
     )
     hc_hidden_size = hc_mult * hidden_size
-    if fn_n_pad:
-        # Preshuffled fn: (hc_hidden_size // 32, fn_n_pad, 32); hc_mult3 is no longer a
-        # dimension of it, so derive it from hc_mult (the plain-layout branch derives it
-        # from fn.size(0) and asserts the same identity).
-        hc_mult3 = hc_mult * 2 + hc_mult * hc_mult
-        assert fn.shape == (
-            hc_hidden_size // 32,
-            fn_n_pad,
-            32,
-        ), (
-            f"preshuffled fn shape mismatch: expected ({hc_hidden_size // 32}, "
-            f"{fn_n_pad}, 32), got {tuple(fn.shape)}"
-        )
-        assert fn_n_pad == hc_mult3
-    else:
-        hc_mult3 = fn.size(0)
-        assert hc_mult3 == hc_mult * 2 + hc_mult * hc_mult or (
-            hc_mult3 == hc_mult and sinkhorn_repeat == 0
-        )
-        assert fn.size(1) == hc_hidden_size
+    hc_mult3 = fn.size(0)
+    assert hc_mult3 == hc_mult * 2 + hc_mult * hc_mult or (
+        hc_mult3 == hc_mult and sinkhorn_repeat == 0
+    )
+    assert fn.size(1) == hc_hidden_size
 
     if post_layer_mix.ndim == 3:
         post_layer_mix = post_layer_mix.squeeze(-1)
@@ -729,8 +721,7 @@ def mhc_fused_post_pre(
         selected_tile_m,
         selected_tile_n,
         selected_tile_k,
-        is_fn_pack_bf16,
-        fn_n_pad,
+        is_res_w_preshuffle_bf16,
     )
 
     post_mix = torch.empty(m, hc_mult, 1, dtype=dtypes.fp32, device=device)
@@ -753,6 +744,7 @@ def mhc_fused_post_pre(
             norm_eps,
             hc_post_mult_value,
             sinkhorn_repeat,
+            res_preshuffle=is_res_w_preshuffle_bf16 and MHC_RES_SHUFFLE,
         )
     else:
         mhc_pre_big_fuse(
@@ -769,6 +761,7 @@ def mhc_fused_post_pre(
             hc_sinkhorn_eps,
             hc_post_mult_value,
             sinkhorn_repeat,
+            res_preshuffle=is_res_w_preshuffle_bf16 and MHC_RES_SHUFFLE,
         )
 
     return post_mix, comb_mix, layer_input_out, next_residual
