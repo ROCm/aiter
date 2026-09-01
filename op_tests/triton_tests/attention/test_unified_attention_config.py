@@ -334,8 +334,22 @@ def test_no_key_the_kernel_launch_would_reject(arch, backend, op):
 # compute_tile_params() consumes into TILE_SIZE. Either bound may stand alone --
 # a floor with no cap means "follow the page size, but never below MIN".
 _TILE_BOUNDS = {"TILE_SIZE_MIN", "TILE_SIZE_MAX"}
+# kv_split leaves hold the split-K parameters, not a segment count: the count
+# depends on the launch's program count and CU count, which no key can name.
+_SEGMENT_PARAMS = {
+    "SEGMENTS_PER_CU",
+    "MIN_SEGMENTS",
+    "MAX_SEGMENTS",
+    "SEGMENT_TILE_MIN",
+    "SEGMENT_TILE_MAX",
+}
 ALLOWED_LEAF_KEYS = {
-    backend: {op: (keys - {"TILE_SIZE"}) | _TILE_BOUNDS for op, keys in ops.items()}
+    backend: {
+        op: (keys - {"TILE_SIZE", "NUM_SEGMENTS"})
+        | _TILE_BOUNDS
+        | (_SEGMENT_PARAMS if op == "kv_split" else set())
+        for op, keys in ops.items()
+    }
     for backend, ops in ALLOWED_KEYS.items()
 }
 
@@ -445,6 +459,10 @@ def test_every_entry_is_complete_and_carries_nothing_extra(arch, backend, op):
     table = _table(arch, backend)
     axes = table.get("schema", {}).get(op, [])
     required = REQUIRED_KEYS[backend][op] - {"TILE_SIZE"}
+    if op == "kv_split":
+        # NUM_SEGMENTS is derived; SEGMENTS_PER_CU is the one parameter with no
+        # default, so its absence is what would break the derivation.
+        required = (required - {"NUM_SEGMENTS"}) | {"SEGMENTS_PER_CU"}
     for key, config in _entries(table[op], axes):
         extra = set(config) - ALLOWED_LEAF_KEYS[backend][op]
         assert not extra, f"{arch}/{backend} {op}: {key!r} has extra {sorted(extra)}"
@@ -455,3 +473,56 @@ def test_every_entry_is_complete_and_carries_nothing_extra(arch, backend, op):
                 f"{arch}/{backend} {op}: {key!r} needs at least one of "
                 f"{sorted(_TILE_BOUNDS)} to derive TILE_SIZE"
             )
+
+
+@pytest.mark.parametrize("arch,backend", TABLES)
+def test_num_segments_follows_the_launch_not_the_table(arch, backend):
+    """The split count has to fall as the launch gains parallelism.
+
+    This is the property a tabulated constant cannot have, and the reason
+    NUM_SEGMENTS is derived rather than stored. A regression here means someone
+    put a fixed count back in the table.
+    """
+    counts = []
+    for num_2d_prgms in (1, 8, 64, 512, 4096):
+        params = make_params()._replace(
+            num_2d_prgms=num_2d_prgms, num_sms=256, target_num_prgms=1024
+        )
+        config = get_unified_attention_config(
+            "kv_split", params, backend=backend, arch=arch
+        )
+        counts.append(config["NUM_SEGMENTS"])
+    assert counts == sorted(counts, reverse=True), (
+        f"{arch}/{backend}: NUM_SEGMENTS {counts} does not fall as the launch "
+        f"gains programs"
+    )
+    assert counts[0] > counts[-1], (
+        f"{arch}/{backend}: NUM_SEGMENTS is {counts[0]} at every program count "
+        f"-- it is not reacting to the launch at all"
+    )
+
+
+@pytest.mark.parametrize("arch,backend", TABLES)
+def test_num_segments_never_grows_with_a_shorter_context(arch, backend):
+    """A shorter context holds fewer KV tiles, so it can never want more
+    segments. This is the half of the derivation that reads max_seqlen_k; a
+    tabulated count could not react to it at all.
+
+    Note what this does NOT claim: at a page size of 1 the split can still
+    exceed the tiles the kernel will process, because the limit divides the
+    context by the page rather than by the kernel's TILE_SIZE. That is what
+    the heuristic this replaces did, so it is reproduced rather than fixed.
+    """
+    for block_size in BLOCK_SIZES:
+        counts = []
+        for max_seqlen_k in (512, 2048, 8192, 65536):
+            params = make_params(max_seqlen_k=max_seqlen_k, block_size=block_size)
+            params = params._replace(num_2d_prgms=1, num_sms=256)
+            config = get_unified_attention_config(
+                "kv_split", params, backend=backend, arch=arch
+            )
+            counts.append(config["NUM_SEGMENTS"])
+        assert counts == sorted(counts), (
+            f"{arch}/{backend} page={block_size}: NUM_SEGMENTS {counts} over "
+            f"contexts [512, 2048, 8192, 65536] is not non-decreasing"
+        )

@@ -26,6 +26,9 @@ leftmost axis wins -- D before Q is what makes head_size outrank max_seqlen_q.
 Dtypes fall back too: DT_fp8_fp8, then DT_fp8_any, DT_any_fp8, then "any".
 
 A section with no axes, like reduce above, is just a config.
+
+Tile size and number of splits (segments) are derived from the following parameters:
+TILE_SIZE_MIN/MAX, and MIN_SEGMENTS/MAX_SEGMENTS/SEGMENTS_PER_CU.
 """
 
 import copy
@@ -153,6 +156,42 @@ def compute_tile_params(config: dict, block_size: int) -> dict:
     return config
 
 
+def compute_segment_params(config: dict, params, page_tile: bool) -> dict:
+    """Derive NUM_SEGMENTS: how many ways to split the KV range for one query.
+
+    Not a tuned constant. The useful split count depends on how much
+    parallelism the launch already has -- batch, KV heads, CU count -- and on
+    how many KV tiles the context even holds, none of which a config key can
+    name. So the table carries the tuned bounds and the budget per CU, and the
+    arithmetic happens here.
+
+    ``page_tile`` measures a segment in whole pages rather than in power-of-2
+    KV tiles, which is what a kernel that gathers one page per tile needs.
+    """
+    if "SEGMENTS_PER_CU" not in config:
+        return config
+    per_cu = config.pop("SEGMENTS_PER_CU")
+    lo = config.pop("MIN_SEGMENTS", 1)
+    cap = config.pop("MAX_SEGMENTS", None)
+    tile_lo = config.pop("SEGMENT_TILE_MIN", 1)
+    tile_hi = config.pop("SEGMENT_TILE_MAX", None)
+
+    # tokens one segment must cover, so the split never outruns the context
+    tile = params.block_size if page_tile else triton.next_power_of_2(params.block_size)
+    tile = max(tile_lo, tile if tile_hi is None else min(tile_hi, tile))
+    limit = triton.cdiv(params.max_seqlen_k, tile)
+    if cap is not None:
+        limit = min(cap, limit)
+
+    budget = params.num_sms * per_cu
+    prgms = max(1, params.num_2d_prgms)
+    share = triton.cdiv(budget, prgms)
+    config["NUM_SEGMENTS"] = triton.next_power_of_2(
+        max(min(lo, limit), min(limit, max(1, share)))
+    )
+    return config
+
+
 def _axis_values(
     head_size,
     max_seqlen_q,
@@ -175,7 +214,7 @@ def _axis_values(
 
 
 def _load(op: str, backend, arch) -> tuple:
-    """Return ``(table, axes, cfg_dir)`` for one op."""
+    """Return ``(table, axes, cfg_dir, page_tile)`` for one op."""
     cfg_dir = resolve_config_dir("attention", _CONFIG_NAME, backend=backend, arch=arch)
     config = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False)
     if config is None:
@@ -191,7 +230,7 @@ def _load(op: str, backend, arch) -> tuple:
         f"{_CONFIG_NAME}[{op}] in {cfg_dir}: schema names unknown axes {unknown} "
         f"(known: {sorted(_AXIS_KIND)})"
     )
-    return config[op], axes, cfg_dir
+    return config[op], axes, cfg_dir, config.get("segment_tile") == "page"
 
 
 @functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
@@ -207,12 +246,12 @@ def _get_unified_attention_config_cached(
     block_size: int,
     backend: str,
     arch: str | None,
-) -> dict:
+) -> tuple[dict, bool]:
     assert op in _OPS, f"Unknown config op {op!r}, expected one of {_OPS}"
     assert head_size > 0, "head_size must be positive"
     assert block_size > 0, "block_size must be positive"
 
-    table, axes, _ = _load(op, backend, arch)
+    table, axes, _, page_tile = _load(op, backend, arch)
     values = _axis_values(
         head_size,
         max_seqlen_q,
@@ -224,7 +263,7 @@ def _get_unified_attention_config_cached(
         kv_dtype,
     )
     _, config = _lookup(table, axes, values)
-    return compute_tile_params(config, block_size)
+    return compute_tile_params(config, block_size), page_tile
 
 
 def get_unified_attention_config(
@@ -246,7 +285,7 @@ def get_unified_attention_config(
     Returns:
         The config, as a fresh deep copy that is safe to mutate.
     """
-    config = _get_unified_attention_config_cached(
+    config, page_tile = _get_unified_attention_config_cached(
         op,
         params.head_size,
         params.max_seqlen_q,
@@ -259,12 +298,14 @@ def get_unified_attention_config(
         backend,
         arch,
     )
-    return copy.deepcopy(config)
+    # NUM_SEGMENTS is derived out here rather than in the cached lookup: it
+    # reads the launch's program count, which is not part of the cache key.
+    return compute_segment_params(copy.deepcopy(config), params, page_tile)
 
 
 def explain(op: str, params, backend: str = "triton", arch: str | None = None) -> str:
     """Report which entry a lookup lands on, and the config it yields."""
-    table, axes, cfg_dir = _load(op, backend, arch)
+    table, axes, cfg_dir, page_tile = _load(op, backend, arch)
     values = _axis_values(
         params.head_size,
         params.max_seqlen_q,
@@ -276,7 +317,9 @@ def explain(op: str, params, backend: str = "triton", arch: str | None = None) -
         params.kv_cache_dtype,
     )
     key, config = _lookup(table, axes, values)
-    derived = compute_tile_params(dict(config), params.block_size)
+    derived = compute_segment_params(
+        compute_tile_params(dict(config), params.block_size), params, page_tile
+    )
 
     lines = [
         f"{_CONFIG_NAME}[{op}]  {cfg_dir}",
@@ -286,6 +329,7 @@ def explain(op: str, params, backend: str = "triton", arch: str | None = None) -
         "  leaf:",
     ]
     lines += [f"    {k:22} = {v}" for k, v in sorted(config.items())]
-    if "TILE_SIZE" in derived:
-        lines.append(f"    {'TILE_SIZE':22} = {derived['TILE_SIZE']}   (derived)")
+    for name in ("TILE_SIZE", "NUM_SEGMENTS"):
+        if name in derived and name not in config:
+            lines.append(f"    {name:22} = {derived[name]}   (derived)")
     return "\n".join(lines)

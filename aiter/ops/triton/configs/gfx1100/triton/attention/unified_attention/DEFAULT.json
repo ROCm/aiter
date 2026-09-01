@@ -5,8 +5,7 @@
       "DT"
     ],
     "kv_split": [
-      "DT",
-      "BS"
+      "DT"
     ]
   },
   "attn_2d": {
@@ -71,18 +70,19 @@
     "waves_per_eu": 2
   },
   "kv_split": {
-    "DT_fp8_fp8.BS_LEQ_16": {
-      "NUM_SEGMENTS": 64,
+    "DT_fp8_fp8": {
+      "MIN_SEGMENTS": 8,
+      "SEGMENTS_PER_CU": 16,
+      "MAX_SEGMENTS": 128,
+      "SEGMENT_TILE_MAX": 64,
       "TILE_SIZE_MIN": 32,
       "TILE_SIZE_MAX": 64
     },
-    "BS_LEQ_16": {
-      "NUM_SEGMENTS": 64,
-      "TILE_SIZE_MIN": 16,
-      "TILE_SIZE_MAX": 64
-    },
     "any": {
-      "NUM_SEGMENTS": 32,
+      "MIN_SEGMENTS": 8,
+      "SEGMENTS_PER_CU": 16,
+      "MAX_SEGMENTS": 128,
+      "SEGMENT_TILE_MAX": 64,
       "TILE_SIZE_MIN": 16,
       "TILE_SIZE_MAX": 64
     }
