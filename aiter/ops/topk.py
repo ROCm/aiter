@@ -539,7 +539,12 @@ def _hip_top_k_per_row_decode(
     stride1: int,
     k: int,
     stable: bool,
+    values: torch.Tensor | None = None,
 ) -> None:
+    if values is not None:
+        raise ValueError(
+            "values output is not yet supported on the HIP decode TopK path"
+        )
     size = topk_ob_workspace_size(num_rows, stride0, k, True)
     workspace = get_topk_scratch_workspace(logits.device, size)
     return _top_k_per_row_decode(
@@ -566,6 +571,7 @@ def top_k_per_row_decode(
     stride1: int,
     k: int = 2048,
     stable: bool = False,
+    values: torch.Tensor | None = None,
 ) -> None:
     """Per-row top-k (decode). Always uses the one-block kernel; the scratch
     workspace is allocated + cached on the Python side and passed in, so the C++
@@ -573,7 +579,12 @@ def top_k_per_row_decode(
 
     When stable=True, the deterministic ascending-ordered, smallest-index
     tie-break emit is used so every TP rank selects and orders an identical
-    KV set."""
+    KV set.
+
+    When ``values`` is given (float32, same shape as ``indices``), each selected
+    index's logit is written alongside it. Rows shorter than k pad the index
+    with -1 and the score with -inf, so the padding sorts below every real
+    candidate and a consumer that ranks these scores needs no extra mask."""
     if _should_use_flydsl_topk_decode(
         logits,
         numRows,
@@ -590,6 +601,7 @@ def top_k_per_row_decode(
             stride1,
             k,
             stable,
+            values,
         )
 
     return _hip_top_k_per_row_decode(
@@ -602,6 +614,7 @@ def top_k_per_row_decode(
         stride1,
         k,
         stable,
+        values,
     )
 
 
@@ -615,6 +628,7 @@ def flydsl_top_k_per_row_decode(
     stride1: int,
     k: int = 2048,
     stable: bool = False,
+    values: torch.Tensor | None = None,
 ) -> None:
     """FlyDSL per-row decode TopK with the same call shape as the HIP interface.
 
@@ -635,6 +649,7 @@ def flydsl_top_k_per_row_decode(
         stride1,
         k,
         stable,
+        values,
     )
 
 

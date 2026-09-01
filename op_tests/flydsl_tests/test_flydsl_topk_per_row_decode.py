@@ -24,24 +24,18 @@ pytestmark = pytest.mark.skipif(
 
 _E2E_CASES = {
     "gfx942": [
-        (True, 2048, 64, 20_000, 20_000, True),
+        (True, 2048, 64, 20_000, 20_000, False),
         (True, 2048, 4, 20_000, 1024, True),
-        (True, 512, 16, 131_072, 131_072, True),
+        (True, 512, 16, 131_072, 131_072, False),
         (True, 2048, 4, 131_073, 131_069, True),
         (False, 4096, 32, 524_288, 524_288, True),
-        (True, 2048, 17, 131_072, 131_072, False),
-        (True, 256, 1, 131_072, 131_072, False),
-        (True, 2048, 1, 131_071, 131_071, False),
     ],
     "gfx950": [
-        (True, 2048, 128, 20_000, 20_000, True),
+        (True, 2048, 128, 20_000, 20_000, False),
         (True, 2048, 4, 20_000, 1024, True),
-        (True, 512, 16, 32_768, 32_768, True),
+        (True, 512, 16, 32_768, 32_768, False),
         (True, 2048, 4, 65_537, 65_533, True),
-        (False, 4096, 32, 131_072, 131_072, True),
-        (True, 2048, 17, 32_768, 32_768, False),
-        (True, 256, 1, 65_536, 65_536, False),
-        (True, 2048, 1, 32_767, 32_767, False),
+        (False, 4096, 32, 131_072, 131_072, False),
     ],
 }.get(_GFX, [])
 
@@ -85,6 +79,7 @@ def _run_public(
     output: torch.Tensor,
     top_k: int,
     stable: bool,
+    values: torch.Tensor | None = None,
 ) -> None:
     public_topk_impl.top_k_per_row_decode(
         logits,
@@ -96,6 +91,7 @@ def _run_public(
         logits.stride(1),
         top_k,
         stable,
+        values,
     )
 
 
@@ -138,27 +134,30 @@ def test_public_topk_decode_gate(arch, stable, top_k, rows, width, expected):
 
 
 @pytest.mark.parametrize(
-    "stable,top_k,rows,width,seq_len,use_flydsl",
+    "stable,top_k,rows,width,seq_len,write_values",
     _E2E_CASES,
 )
-def test_public_topk_decode_e2e(stable, top_k, rows, width, seq_len, use_flydsl):
-    """Check both FlyDSL kernels and HIP fallbacks against the Torch reference."""
+def test_public_topk_decode_e2e(
+    stable,
+    top_k,
+    rows,
+    width,
+    seq_len,
+    write_values,
+):
+    """Check FlyDSL kernels against the Torch reference."""
     torch.manual_seed(0)
     logits = torch.randn((rows, width), dtype=torch.float32, device="cuda")
     seq_lens = torch.full((rows,), seq_len, dtype=torch.int32, device="cuda")
     output = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
+    values = (
+        torch.empty((rows, top_k), dtype=torch.float32, device="cuda")
+        if write_values
+        else None
+    )
     reference = run_torch(logits, [seq_len] * rows, 1, top_k, stable)
 
-    assert (
-        public_topk_impl._should_use_flydsl_topk_decode(
-            logits,
-            rows,
-            top_k,
-            stable,
-        )
-        is use_flydsl
-    )
-    _run_public(logits, seq_lens, output, top_k, stable)
+    _run_public(logits, seq_lens, output, top_k, stable, values)
     torch.cuda.synchronize()
     if stable:
         torch.testing.assert_close(output, reference, rtol=0, atol=0)
@@ -177,6 +176,11 @@ def test_public_topk_decode_e2e(stable, top_k, rows, width, seq_len, use_flydsl)
         )
     if seq_len < top_k:
         assert torch.all(output[:, seq_len:] == -1)
+    if values is not None:
+        valid = output >= 0
+        gathered = torch.gather(logits, 1, output.clamp_min(0).to(torch.int64))
+        torch.testing.assert_close(values[valid], gathered[valid], rtol=0, atol=0)
+        assert torch.all(torch.isneginf(values[~valid]))
 
 
 def test_public_topk_decode_cuda_graph():

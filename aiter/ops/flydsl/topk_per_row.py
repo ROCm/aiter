@@ -115,6 +115,26 @@ def _validate_topk_signature(
         raise ValueError("indices must be on the same CUDA device as logits")
 
 
+@lru_cache(maxsize=128)
+def _validate_values_signature(
+    values_shape: torch.Size,
+    values_stride: tuple[int, ...],
+    values_dtype: torch.dtype,
+    values_device: torch.device,
+    rows: int,
+    k: int,
+    logits_device: torch.device,
+) -> None:
+    if values_dtype != torch.float32:
+        raise ValueError("values must be a float32 tensor")
+    if values_shape != (rows, k):
+        raise ValueError("values must have shape [rows, k]")
+    if values_stride != (k, 1):
+        raise ValueError("values must be contiguous")
+    if values_device != logits_device:
+        raise ValueError("values must be on the same CUDA device as logits")
+
+
 def flydsl_top_k_per_row_decode(
     logits: torch.Tensor,
     next_n: int,
@@ -125,6 +145,7 @@ def flydsl_top_k_per_row_decode(
     stride1: int,
     k: int = 2048,
     stable: bool = False,
+    values: torch.Tensor | None = None,
 ) -> None:
     """Write per-row TopK indices using each request's effective context length.
 
@@ -134,6 +155,8 @@ def flydsl_top_k_per_row_decode(
     are filled with ``-1``.
     When ``stable`` is true, indices are emitted in ascending order and ties at
     the selection threshold prefer the smallest input indices.
+    When ``values`` is given, each selected index's logit is written alongside it.
+    Rows shorter than ``k`` pad the index with ``-1`` and the score with ``-inf``.
     """
     _validate_topk_signature(
         logits.shape,
@@ -154,16 +177,31 @@ def flydsl_top_k_per_row_decode(
         stride1,
         k,
     )
+    if values is not None:
+        _validate_values_signature(
+            values.shape,
+            values.stride(),
+            values.dtype,
+            values.device,
+            logits.shape[0],
+            k,
+            logits.device,
+        )
 
     rows, width = logits.shape
     stream = torch.cuda.current_stream(logits.device)
     if width <= _ONE_WORKGROUP_MAX_ROW_WIDTH:
-        launcher = build_topk_per_row_decode_one_workgroup_module(rows, k)
+        launcher = build_topk_per_row_decode_one_workgroup_module(
+            rows,
+            k,
+            write_values=values is not None,
+        )
         _run_compiled(
             launcher,
             logits,
             seq_lens,
             indices,
+            values if values is not None else logits,
             width,
             next_n,
             stride0,
@@ -171,7 +209,6 @@ def flydsl_top_k_per_row_decode(
         )
         return
 
-    # Launch boundaries avoid the long persistent kernel's grid-barrier deadlock.
     hist_shape, state_shape = topk_per_row_decode_workspace_shapes(rows, stable)
     partial_hist, state = _get_topk_workspace(
         logits.device,
@@ -184,12 +221,14 @@ def flydsl_top_k_per_row_decode(
         rows,
         k,
         stable,
+        write_values=values is not None,
     )
     _run_compiled(
         launcher,
         logits,
         seq_lens,
         indices,
+        values if values is not None else logits,
         partial_hist,
         state,
         width,
