@@ -157,7 +157,13 @@ class SymmetricArena:
 
 
 @dataclass
-class MegaMoEStage2Config:
+class MegaMoEConfig:
+    """Op-level config: geometry, plus the dispatch knobs.
+
+    Nothing here tunes stage2 -- that is the gemm2 epilogue fused into combine
+    (Stage2ScatterContext), which takes no parameter from this side.
+    """
+
     rank: int
     world_size: int
     hidden_dim: int
@@ -444,7 +450,7 @@ class MegaMoEGfx1250:
         self.expert_mask[first_expert : first_expert + self.experts_per_rank] = 1
 
         self._initialize_pipeline(
-            MegaMoEStage2Config(
+            MegaMoEConfig(
                 rank=int(rank),
                 world_size=int(world_size),
                 hidden_dim=self.model_dim,
@@ -611,7 +617,7 @@ class MegaMoEGfx1250:
     def __exit__(self, *exc):
         self.close()
 
-    def _initialize_pipeline(self, config: MegaMoEStage2Config, communicator):
+    def _initialize_pipeline(self, config: MegaMoEConfig, communicator):
         self._config = config
         self._closed = False
         device = torch.device("cuda", torch.cuda.current_device())
@@ -726,7 +732,7 @@ class MegaMoEGfx1250:
             off_xdb_mem=self._arena.offset("cross_device_barrier"),
         )
 
-    def _build_mori_dispatch(self, config: MegaMoEStage2Config) -> dict:
+    def _build_mori_dispatch(self, config: MegaMoEConfig) -> dict:
         """mori's HIP/JIT dispatch, wearing `_make_dispatch`'s calling convention.
 
         Only the kernel changes: mori leaves the same arena state this package's
