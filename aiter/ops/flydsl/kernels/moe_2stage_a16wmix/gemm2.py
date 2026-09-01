@@ -343,10 +343,11 @@ def compile_gemm2_a16w4_port(
     assert (
         TILE_N // 4
     ) >= 16, f"TILE_N//4 must be >= 16 (num_acc_n>=1), got TILE_N={TILE_N}"
-    # Not a multiple of 16 -> num_acc_n truncates and silently drops columns.
-    assert (TILE_N // 4) % 16 == 0, (
-        f"TILE_N must be a multiple of 64 (TILE_N//4 a multiple of 16, else num_acc_n "
-        f"truncates and drops columns), got TILE_N={TILE_N}"
+    # Each of the 4 N-waves must own a whole number of 16-wide MFMA groups, else
+    # num_acc_n truncates and silently drops columns.
+    assert TILE_N % 64 == 0, (
+        f"TILE_N must be a multiple of 64 (else num_acc_n truncates and drops "
+        f"columns), got TILE_N={TILE_N}"
     )
     assert BM % 16 == 0, f"BM must be a multiple of 16, got {BM}"
     _num_n_blocks = N_OUT // TILE_N
