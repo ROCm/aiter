@@ -561,6 +561,7 @@ def moe_gemm_a4w4(
             HAS_MX_OUT=out_mx_quant,
             DstRow=dst_row,
             EP_SCATTER=fused_ep_scatter,
+            Y_ROWS=(ep_scatter.out.shape[0] if fused_ep_scatter else 0),
             num_warps=config["num_warps"],
         )
     elif use_gluon:
@@ -635,6 +636,7 @@ def moe_gemm_a4w4(
             HAS_MX_OUT=out_mx_quant,
             DstRow=dst_row,
             EP_SCATTER=fused_ep_scatter,
+            Y_ROWS=(ep_scatter.out.shape[0] if fused_ep_scatter else 0),
             num_ctas=config["num_ctas"],
             num_warps=config["num_warps"],
         )

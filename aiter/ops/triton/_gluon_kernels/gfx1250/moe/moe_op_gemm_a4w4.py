@@ -620,6 +620,8 @@ def _moe_gemm_a4w4_prefill(
     # combine-staging window, negative where the row must not be delivered.
     DstRow=None,
     EP_SCATTER: gl.constexpr = False,
+    # Row extent of the combine window, so an out-of-range index is droppable.
+    Y_ROWS=0,
 ):
     MX_PACK_DIVISOR: gl.constexpr = 32
     gl.static_assert(
@@ -1231,21 +1233,55 @@ def _moe_gemm_a4w4_prefill(
         # Gammas was applied above, exactly as on the reduce path, so rows land
         # already route-weighted and the peer's combine sum stays unweighted.
         out = out.to(gl.bfloat16)
-        offs_m_d = BLOCK_M * block_id + gl.arange(0, BLOCK_M)
+        # Build the row offsets DIRECTLY in the layout async_scatter wants, so
+        # there is one layout end to end. Letting the arange auto-resolve and
+        # converting `dst` afterwards makes it feed two conflicting consumers
+        # (buffer_load and the scatter), and auto-encoding cannot pick:
+        # "'tt.make_range' op Failed to infer return type".
+        THREADS_PER_WARP: gl.constexpr = 32
+        NUM_WARPS: gl.constexpr = gl.num_warps()
+        idx_base: gl.constexpr = gl.BlockedLayout(
+            [BLOCK_M, 1], [1, THREADS_PER_WARP], [1, NUM_WARPS], [1, 0]
+        )
+        idx_layout: gl.constexpr = gl.SliceLayout(1, idx_base)
+        offs_m_d = BLOCK_M * block_id + gl.arange(0, BLOCK_M, layout=idx_layout)
         dst = gl.amd.gfx1250.buffer_load(
             DstRow + start_m, offs_m_d, mask=offs_m_d < M, other=-1
         )
-        offs_n_d = pid_n * OUT_BLOCK_N + gl.arange(0, OUT_BLOCK_N)
-        # int64 on the row term only: dst * stride_y_m spans every peer's slot
-        # region of the symmetric window, which overflows int32 at realistic
-        # hidden sizes. The column term is bounded by yN and stays 32-bit.
-        gl.store(
-            Y + dst[:, None].to(gl.int64) * stride_y_m + offs_n_d[None, :] * stride_y_n,
-            out,
-            # dst < 0 covers both the tile's padding rows (offs_m_d >= M, loaded
-            # as -1 above) and the rows this rank must not deliver.
-            mask=(dst[:, None] >= 0) & (offs_n_d[None, :] < yN),
+        # Delivered by TDM scatter through LDS, not by per-thread global stores.
+        #
+        # This matters ONLY because the destination is remote. ~3/4 of these rows
+        # land in a peer's HBM over xGMI, where the transaction shape dominates:
+        # per-thread stores emit OUT_BLOCK_N*2 bytes per row per tile (256 B at
+        # BLOCK_N=128) as many small independent writes, while TDM moves whole
+        # rows, 8 per instruction with int32 indices. flydsl's a8w4 GEMM2 does
+        # exactly this and delivers the same rows for ~13us on top of its GEMM,
+        # against ~177us for the per-thread version measured here.
+        #
+        # Rows this rank must not deliver, and the tile's padding rows, are aimed
+        # at Y_ROWS -- the first row past the window -- so the bounds check drops
+        # them instead of a mask doing it. Same trick flydsl uses.
+        dst = gl.where(dst >= 0, dst, Y_ROWS)
+        y_buffer = gl.allocate_shared_memory(
+            Y.type.element_ty,
+            shape=[BLOCK_M, OUT_BLOCK_N],
+            layout=SHARED_LAYOUT_Y,
         )
+        y_buffer.store(out)
+        # Rows are addressed by index, so the descriptor carries only the column
+        # position; no start_m bias applies, dst is already absolute.
+        y_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=Y,
+            shape=(Y_ROWS, yN),
+            strides=(stride_y_m, stride_y_n),
+            block_shape=(BLOCK_M, OUT_BLOCK_N),
+            layout=SHARED_LAYOUT_Y,
+        )
+        y_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+            y_desc, add_offsets=[0, pid_n * OUT_BLOCK_N], clamp_bounds=True
+        )
+        gl.amd.gfx1250.tdm.async_scatter(y_desc, dst, y_buffer)
+        gl.amd.gfx1250.tdm.async_wait(0)
     else:
         # write-back via TDM store: registers -> shared memory -> global memory
         out = out.to(gl.bfloat16)
@@ -1353,6 +1389,8 @@ def _moe_gemm_a4w4_decode(
     # combine-staging window, negative where the row must not be delivered.
     DstRow=None,
     EP_SCATTER: gl.constexpr = False,
+    # Row extent of the combine window, so an out-of-range index is droppable.
+    Y_ROWS=0,
 ):
     MX_PACK_DIVISOR: gl.constexpr = 32
     gl.static_assert(
@@ -2029,21 +2067,55 @@ def _moe_gemm_a4w4_decode(
         # Gammas was applied above, exactly as on the reduce path, so rows land
         # already route-weighted and the peer's combine sum stays unweighted.
         out = out.to(gl.bfloat16)
-        offs_m_d = BLOCK_M * block_id + gl.arange(0, BLOCK_M)
+        # Build the row offsets DIRECTLY in the layout async_scatter wants, so
+        # there is one layout end to end. Letting the arange auto-resolve and
+        # converting `dst` afterwards makes it feed two conflicting consumers
+        # (buffer_load and the scatter), and auto-encoding cannot pick:
+        # "'tt.make_range' op Failed to infer return type".
+        THREADS_PER_WARP: gl.constexpr = 32
+        NUM_WARPS: gl.constexpr = gl.num_warps()
+        idx_base: gl.constexpr = gl.BlockedLayout(
+            [BLOCK_M, 1], [1, THREADS_PER_WARP], [1, NUM_WARPS], [1, 0]
+        )
+        idx_layout: gl.constexpr = gl.SliceLayout(1, idx_base)
+        offs_m_d = BLOCK_M * block_id + gl.arange(0, BLOCK_M, layout=idx_layout)
         dst = gl.amd.gfx1250.buffer_load(
             DstRow + start_m, offs_m_d, mask=offs_m_d < M, other=-1
         )
-        offs_n_d = pid_n * OUT_BLOCK_N + gl.arange(0, OUT_BLOCK_N)
-        # int64 on the row term only: dst * stride_y_m spans every peer's slot
-        # region of the symmetric window, which overflows int32 at realistic
-        # hidden sizes. The column term is bounded by yN and stays 32-bit.
-        gl.store(
-            Y + dst[:, None].to(gl.int64) * stride_y_m + offs_n_d[None, :] * stride_y_n,
-            out,
-            # dst < 0 covers both the tile's padding rows (offs_m_d >= M, loaded
-            # as -1 above) and the rows this rank must not deliver.
-            mask=(dst[:, None] >= 0) & (offs_n_d[None, :] < yN),
+        # Delivered by TDM scatter through LDS, not by per-thread global stores.
+        #
+        # This matters ONLY because the destination is remote. ~3/4 of these rows
+        # land in a peer's HBM over xGMI, where the transaction shape dominates:
+        # per-thread stores emit OUT_BLOCK_N*2 bytes per row per tile (256 B at
+        # BLOCK_N=128) as many small independent writes, while TDM moves whole
+        # rows, 8 per instruction with int32 indices. flydsl's a8w4 GEMM2 does
+        # exactly this and delivers the same rows for ~13us on top of its GEMM,
+        # against ~177us for the per-thread version measured here.
+        #
+        # Rows this rank must not deliver, and the tile's padding rows, are aimed
+        # at Y_ROWS -- the first row past the window -- so the bounds check drops
+        # them instead of a mask doing it. Same trick flydsl uses.
+        dst = gl.where(dst >= 0, dst, Y_ROWS)
+        y_buffer = gl.allocate_shared_memory(
+            Y.type.element_ty,
+            shape=[BLOCK_M, OUT_BLOCK_N],
+            layout=SHARED_LAYOUT_Y,
         )
+        y_buffer.store(out)
+        # Rows are addressed by index, so the descriptor carries only the column
+        # position; no start_m bias applies, dst is already absolute.
+        y_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=Y,
+            shape=(Y_ROWS, yN),
+            strides=(stride_y_m, stride_y_n),
+            block_shape=(BLOCK_M, OUT_BLOCK_N),
+            layout=SHARED_LAYOUT_Y,
+        )
+        y_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+            y_desc, add_offsets=[0, pid_n * OUT_BLOCK_N], clamp_bounds=True
+        )
+        gl.amd.gfx1250.tdm.async_scatter(y_desc, dst, y_buffer)
+        gl.amd.gfx1250.tdm.async_wait(0)
     else:
         # write-back via TDM store: registers -> shared memory -> global memory
         out = out.to(gl.bfloat16)

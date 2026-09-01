@@ -686,6 +686,7 @@ def moe_gemm_a8w4(
             HAS_MX_OUT=out_mx_quant,
             DstRow=dst_row,
             EP_SCATTER=fused_ep_scatter,
+            Y_ROWS=(ep_scatter.out.shape[0] if fused_ep_scatter else 0),
         )
     elif use_gluon:
         layouts = get_moe_a8w4_layouts(
@@ -763,6 +764,7 @@ def moe_gemm_a8w4(
             HAS_MX_OUT=out_mx_quant,
             DstRow=dst_row,
             EP_SCATTER=fused_ep_scatter,
+            Y_ROWS=(ep_scatter.out.shape[0] if fused_ep_scatter else 0),
             **layouts,
         )
     else:
