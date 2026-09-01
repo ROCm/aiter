@@ -72,7 +72,7 @@ jobs:
             const eventLabel = context.payload.label?.name;
             if ((action === 'labeled' || action === 'unlabeled')
                 && eventLabel !== 'no-auto-title'
-                && !Object.hasOwn(COMPONENT_LABELS, eventLabel))
+                && !Object.hasOwn(COMPONENT_LABELS, eventLabel)) {
               core.info(`Label '${eventLabel}' is not managed — skipping.`);
               return;
             }

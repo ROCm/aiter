@@ -49,149 +49,6 @@ def _mhc_apply_pre_mix_tile(
     )
 
 
-_mhc_asymmetric_sinkhorn_kernel_repr = make_kernel_repr(
-    "_mhc_asymmetric_sinkhorn_kernel",
-    [
-        "n",
-        "N_POW2_RES",
-        "NUM_SINKHORN_ITERS",
-    ],
-)
-
-
-@triton.jit(repr=_mhc_asymmetric_sinkhorn_kernel_repr)
-def _mhc_asymmetric_sinkhorn_kernel(
-    logits_ptr,
-    out_ptr,
-    M,
-    stride_logits_m,
-    stride_logits_n,
-    stride_out_m,
-    stride_out_n,
-    n: tl.constexpr,
-    N_POW2_RES: tl.constexpr,
-    NUM_SINKHORN_ITERS: tl.constexpr,
-    eps: tl.constexpr,
-):
-    """TileKernels-compatible asymmetric exp-domain Sinkhorn."""
-    pid_m = tl.program_id(0)
-    rn = tl.arange(0, N_POW2_RES)
-    values = tl.load(
-        logits_ptr + pid_m * stride_logits_m + rn * stride_logits_n,
-        mask=rn < n * n,
-        other=0.0,
-    )
-    if NUM_SINKHORN_ITERS > 0:
-        A = tl.reshape(values, (n, n))
-        row_max = tl.max(A, axis=1)
-        P = tl.exp(A - row_max[:, None])
-        row_sum = tl.sum(P, axis=1)
-        P = P / row_sum[:, None] + eps
-        col_sum = tl.sum(P, axis=0)
-        P = P / (col_sum[None, :] + eps)
-        for _ in range(NUM_SINKHORN_ITERS - 1):
-            row_sum = tl.sum(P, axis=1)
-            P = P / (row_sum[:, None] + eps)
-            col_sum = tl.sum(P, axis=0)
-            P = P / (col_sum[None, :] + eps)
-        values = tl.reshape(P, (N_POW2_RES,))
-    tl.store(
-        out_ptr + pid_m * stride_out_m + rn * stride_out_n,
-        values,
-        mask=(pid_m < M) & (rn < n * n),
-    )
-
-
-_mhc_head_kernel_repr = make_kernel_repr(
-    "_mhc_head_kernel",
-    [
-        "n",
-        "C",
-        "BLOCK_M",
-        "BLOCK_K",
-        "BLOCK_C",
-        "N_TILE",
-    ],
-)
-
-
-@triton.jit(repr=_mhc_head_kernel_repr)
-def _mhc_head_kernel(
-    x_ptr,
-    fn_ptr,
-    scale_ptr,
-    base_ptr,
-    out_ptr,
-    M: tl.constexpr,
-    K: tl.constexpr,
-    n: tl.constexpr,
-    C: tl.constexpr,
-    eps: tl.constexpr,
-    pre_eps: tl.constexpr,
-    stride_xm,
-    stride_xk,
-    stride_fn_n,
-    stride_fn_k,
-    stride_om,
-    stride_oc,
-    BLOCK_M: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    BLOCK_C: tl.constexpr,
-    N_TILE: tl.constexpr,
-):
-    """Fused normalized head projection, sigmoid, and stream contraction.
-
-    ``N_TILE`` is padded to at least 16 because ``tl.dot`` requires an output
-    N dimension of at least 16. Lanes beyond the logical stream count ``n``
-    are masked to zero before the contraction.
-    """
-    pid_m = tl.program_id(0)
-    rm = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
-    rn = tl.arange(0, N_TILE)
-    acc = tl.zeros((BLOCK_M, N_TILE), dtype=tl.float32)
-    acc_sq = tl.zeros((BLOCK_M,), dtype=tl.float32)
-    for k in range(0, K, BLOCK_K):
-        rk = k + tl.arange(0, BLOCK_K)
-        x = tl.load(
-            x_ptr + rm[:, None] * stride_xm + rk[None, :] * stride_xk,
-            mask=(rm[:, None] < M) & (rk[None, :] < K),
-            other=0.0,
-        )
-        fn = tl.load(
-            fn_ptr + rn[None, :] * stride_fn_n + rk[:, None] * stride_fn_k,
-            mask=(rn[None, :] < n) & (rk[:, None] < K),
-            other=0.0,
-        ).to(x_ptr.dtype.element_ty)
-        acc = tl.dot(x, fn, acc=acc)
-        x_f32 = x.to(tl.float32)
-        acc_sq += tl.sum(x_f32 * x_f32, axis=1)
-    rsigma = tl.math.rsqrt(acc_sq / K + eps)
-    scale = tl.load(scale_ptr).to(tl.float32)
-    base = tl.load(base_ptr + rn, mask=rn < n, other=0.0).to(tl.float32)
-    mix = tl.where(
-        rn[None, :] < n,
-        tl.sigmoid(acc * rsigma[:, None] * scale + base[None, :]) + pre_eps,
-        0.0,
-    )
-    for c0 in range(0, C, BLOCK_C):
-        rc = c0 + tl.arange(0, BLOCK_C)
-        _mhc_apply_pre_mix_tile(
-            x_ptr,
-            out_ptr,
-            mix,
-            rm,
-            rc,
-            rn,
-            M,
-            C,
-            n,
-            stride_xm,
-            stride_xk,
-            stride_om,
-            stride_oc,
-        )
-
-
 _mhc_fused_kernel_repr = make_kernel_repr(
     "_mhc_fused_kernel",
     [
@@ -216,7 +73,6 @@ def _mhc_fused_kernel(
     alpha_pre,
     alpha_post,
     alpha_res,
-    alpha_ptr,
     bias_ptr,
     out_ptr,  # Shrunk output: (M, n + n_squared), layout [post | res]
     layer_input_ptr,  # (M, C); written directly via the inline apply step
@@ -243,7 +99,6 @@ def _mhc_fused_kernel(
     BLOCK_C: tl.constexpr,
     N_POW2: tl.constexpr,
     NUM_SINKHORN_ITERS: tl.constexpr,
-    ALPHAS_ARE_POINTER: tl.constexpr,
 ):
     """
     Fused kernel for mHC equations 14-18 + the apply step (non-split-K path).
@@ -318,7 +173,7 @@ def _mhc_fused_kernel(
             + phi_col_offset[None, :] * stride_phi_n,
             mask=(rk[:, None] < K) & (rn_local[None, :] < n_out),
             other=0.0,
-        ).to(x_ptr.dtype.element_ty)
+        )
 
         acc = tl.dot(x_tile, phi_tile, acc=acc)
         x_tile_f32 = x_tile.to(tl.float32)
@@ -328,12 +183,9 @@ def _mhc_fused_kernel(
     rsigma = 1.0 / rms
 
     bias = tl.load(bias_ptr + rn_global, mask=rn_global < N, other=0.0).to(tl.float32)
-    if ALPHAS_ARE_POINTER:
-        alpha_val = tl.load(alpha_ptr + is_post_i32 + is_res_i32 * 2).to(tl.float32)
-    else:
-        alpha_val = tl.where(
-            is_pre_program, alpha_pre, tl.where(is_post_program, alpha_post, alpha_res)
-        )
+    alpha_val = tl.where(
+        is_pre_program, alpha_pre, tl.where(is_post_program, alpha_post, alpha_res)
+    )
 
     out = rsigma[:, None] * alpha_val * acc + bias[None, :]
 
@@ -497,7 +349,7 @@ def _mhc_fused_split_kernel(
             phi_ptr + rk[:, None] * stride_phi_k + rn[None, :] * stride_phi_n,
             mask=(rk[:, None] < split_k_end) & (rn[None, :] < N),
             other=0.0,
-        ).to(x_ptr.dtype.element_ty)
+        )
 
         acc = tl.dot(x_tile, phi_tile, acc=acc)
         x_tile_f32 = x_tile.to(tl.float32)
@@ -612,7 +464,6 @@ def _mhc_reduce_apply_kernel(
     alpha_pre,
     alpha_post,
     alpha_res,
-    alpha_ptr,
     bias_ptr,  # (n + n + n_squared,) fp32
     x_ptr,  # (M, n*C)
     out_ptr,  # Unified output: (M, n + n_squared), layout [post | res]
@@ -643,7 +494,6 @@ def _mhc_reduce_apply_kernel(
     ACTUAL_KSPLIT: tl.constexpr,
     NUM_SINKHORN_ITERS: tl.constexpr,
     RES_PID_C: tl.constexpr,
-    ALPHAS_ARE_POINTER: tl.constexpr,
 ):
     """
     Reduce-and-apply kernel for the split-K mHC pipeline (Eq 15-19 + apply).
@@ -666,14 +516,6 @@ def _mhc_reduce_apply_kernel(
     """
     pid_m = tl.program_id(0)
     pid_c = tl.program_id(1)
-    if ALPHAS_ARE_POINTER:
-        alpha_pre_val = tl.load(alpha_ptr)
-        alpha_post_val = tl.load(alpha_ptr + 1)
-        alpha_res_val = tl.load(alpha_ptr + 2)
-    else:
-        alpha_pre_val = alpha_pre
-        alpha_post_val = alpha_post
-        alpha_res_val = alpha_res
 
     rm = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
     rc = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
@@ -703,7 +545,7 @@ def _mhc_reduce_apply_kernel(
 
     # --- 3) Pre stream: bias + alpha + sigmoid + hc_pre_eps (Eq 16-17) ---
     bias_pre = tl.load(bias_ptr + rn_pre, mask=rn_pre < n, other=0.0).to(tl.float32)
-    h_pre = rsigma[:, None] * alpha_pre_val * acc_pre + bias_pre[None, :]
+    h_pre = rsigma[:, None] * alpha_pre * acc_pre + bias_pre[None, :]
     pre_mix_2d = tl.sigmoid(h_pre) + hc_pre_eps
 
     # --- 4) Apply step for this pid's BLOCK_C slice ---
@@ -762,7 +604,7 @@ def _mhc_reduce_apply_kernel(
                 mask=rn_post_local < n,
                 other=0.0,
             ).to(tl.float32)
-            h_post = rsigma[:, None] * alpha_post_val * acc_post + bias_post[None, :]
+            h_post = rsigma[:, None] * alpha_post * acc_post + bias_post[None, :]
             out_post = tl.sigmoid(h_post) * hc_post_mult_value
             tl.store(
                 out_ptr
@@ -778,7 +620,7 @@ def _mhc_reduce_apply_kernel(
                 rm,
                 rn_res_local,
                 rn_res_global,
-                alpha_res_val,
+                alpha_res,
                 bias_ptr,
                 out_ptr,
                 M,
@@ -809,7 +651,7 @@ def _mhc_reduce_apply_kernel(
                 mask=rn_post_local < n,
                 other=0.0,
             ).to(tl.float32)
-            h_post = rsigma[:, None] * alpha_post_val * acc_post + bias_post[None, :]
+            h_post = rsigma[:, None] * alpha_post * acc_post + bias_post[None, :]
             out_post = tl.sigmoid(h_post) * hc_post_mult_value
             tl.store(
                 out_ptr
@@ -838,7 +680,7 @@ def _mhc_reduce_apply_kernel(
                 rm,
                 rn_res_local,
                 rn_res_global,
-                alpha_res_val,
+                alpha_res,
                 bias_ptr,
                 out_ptr,
                 M,
