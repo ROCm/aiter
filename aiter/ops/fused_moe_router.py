@@ -33,6 +33,10 @@ def fused_moe_router_impl(
     workspace: torch.Tensor,
     expert_mask: torch.Tensor | None = None,
     moe_buf: torch.Tensor | None = None,
+    num_fused_shared_experts: int = 0,
+    shared_expert_weight: float = 1.0,
+    ep_rank: int = 0,
+    ep_size: int = 1,
 ) -> None:
     """Single-barrier fused routing preamble: biased grouped topk + moe_sort +
     MXFP4 activation quant, in one (or, above M~104, two) launches.
@@ -51,8 +55,8 @@ def fused_moe_router_impl(
         bias: ``[num_experts]`` bf16 or fp32 e_score_correction_bias. Read as
             given; unlike the stock wrapper this path does not coerce it.
         hidden: ``[M, cols]`` bf16 activations to quantize.
-        topk_ids: ``[M, topk]`` int32 output.
-        topk_weights: ``[M, topk]`` fp32 output.
+        topk_ids: ``[M, topk + num_fused_shared_experts]`` int32 output.
+        topk_weights: same shape, fp32 output.
         sorted_ids: ``[max_num_tokens_padded]`` int32 output.
         sorted_weights: ``[max_num_tokens_padded]`` fp32 output.
         sorted_expert_ids: ``[max_num_m_blocks]`` int32 output.
@@ -69,10 +73,21 @@ def fused_moe_router_impl(
         workspace: uint8 scratch of at least
             ``fused_moe_router_workspace_size(M)`` bytes, first 4 bytes zeroed
             once at allocation. Use :func:`get_fused_moe_router_workspace`.
-        expert_mask: ``[>= num_experts]`` int32, nonzero iff this rank owns the
-            expert. ``None`` disables EP; when given, ``sorted_expert_ids``
-            carries local ids.
+        expert_mask: ``[>= num_experts + num_fused_shared_experts + 1]`` int32
+            under shared fusion, ``[>= num_experts]`` otherwise; nonzero iff
+            this rank owns the expert. ``None`` disables EP; when given,
+            ``sorted_expert_ids`` carries local ids.
         moe_buf: optional GEMM output buffer to zero-fill while routing runs.
+        num_fused_shared_experts: shared experts appended after the routed ids,
+            taking global ids ``num_experts .. num_experts + n - 1``. 0 or the
+            model's shared-expert count; at most 1.
+        shared_expert_weight: weight every token gives each shared expert.
+        ep_rank: this rank's index, used only under shared fusion.
+        ep_size: EP world size. Shared weights are replicated on every rank
+            while every rank sees every token, so token ownership round-robins
+            over ``ep_size`` and non-owners park the shared row on an
+            always-masked sentinel. 1 (the default) makes every rank an owner,
+            which is the non-EP case.
     """
 
 
