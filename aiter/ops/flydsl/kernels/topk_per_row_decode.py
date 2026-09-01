@@ -14,6 +14,7 @@ from flydsl.expr import (
     Int32,
     arith,
     as_ir_value,
+    const_expr,
     gpu,
     range_constexpr,
 )
@@ -184,6 +185,7 @@ def build_topk_per_row_decode_module(
     rows: int,
     k: int,
     stable: bool,
+    write_values: bool = False,
 ):
     """Build a multi-launch radix TopK with runtime row width and MTP geometry."""
     max_n_hist_bins = 1 << _RADIX_BITS
@@ -206,6 +208,7 @@ def build_topk_per_row_decode_module(
         input: fx.Tensor,
         row_ends: fx.Tensor,
         indices: fx.Tensor,
+        values: fx.Tensor,
         partial_hist: fx.Tensor,
         state: fx.Tensor,
         shift: fx.Int32,
@@ -220,6 +223,7 @@ def build_topk_per_row_decode_module(
         n: fx.Int32,
         next_n: fx.Int32,
         stride0: fx.Int32,
+        write_values: fx.Constexpr[bool],
     ):
         row = fx.block_idx.x
         chunk = fx.block_idx.y
@@ -227,6 +231,7 @@ def build_topk_per_row_decode_module(
 
         input_rsrc = _row_resource(input, row, n, stride0)
         row_indices = fx.slice(indices, (row, None))
+        row_values = fx.slice(values, (row, None))
         row_len = _row_length(row, row_ends, n, next_n)
         direct = row_len <= fx.Int32(k)
         row_state = fx.slice(state, (row, None))
@@ -240,9 +245,13 @@ def build_topk_per_row_decode_module(
             for output_step in range_constexpr(output_steps):
                 out_pos = fx.Int32(output_step * block_threads) + fx.Int32(tid)
                 if out_pos < fx.Int32(k):
-                    row_indices[out_pos] = (out_pos < row_len).select(
-                        out_pos, fx.Int32(-1)
-                    )
+                    valid = out_pos < row_len
+                    row_indices[out_pos] = valid.select(out_pos, fx.Int32(-1))
+                    if const_expr(write_values):
+                        row_values[out_pos] = valid.select(
+                            input[row, out_pos],
+                            fx.Float32(float("-inf")),
+                        )
         storage = fx.SharedAllocator().allocate(
             _make_hist_storage(max_n_hist_bins, block_num_waves)
         )
@@ -441,10 +450,12 @@ def build_topk_per_row_decode_module(
         input: fx.Tensor,
         row_ends: fx.Tensor,
         indices: fx.Tensor,
+        values: fx.Tensor,
         state: fx.Tensor,
         n: fx.Int32,
         next_n: fx.Int32,
         stride0: fx.Int32,
+        write_values: fx.Constexpr[bool],
     ):
         row = fx.block_idx.x
         chunk = fx.block_idx.y
@@ -453,6 +464,7 @@ def build_topk_per_row_decode_module(
         input_rsrc = _row_resource(input, row, n, stride0)
         row_len = _row_length(row, row_ends, n, next_n)
         row_indices = fx.slice(indices, (row, None))
+        row_values = fx.slice(values, (row, None))
         row_state = fx.slice(state, (row, None))
 
         if chunk == 0 and row_len < fx.Int32(k):
@@ -462,6 +474,8 @@ def build_topk_per_row_decode_module(
                 )
                 if out_pos < fx.Int32(k):
                     row_indices[out_pos] = fx.Int32(-1)
+                    if const_expr(write_values):
+                        row_values[out_pos] = fx.Float32(float("-inf"))
 
         threshold = row_state[_STATE_PREFIX]
         remaining_k = row_state[_STATE_REMAINING_K]
@@ -537,10 +551,16 @@ def build_topk_per_row_decode_module(
                 local_pos = step * block_threads + tid
                 if local_pos < s_above_count[0]:
                     out_pos = s_above_base[0] + local_pos
-                    row_indices[out_pos] = s_above_idxs[local_pos]
+                    idx = s_above_idxs[local_pos]
+                    row_indices[out_pos] = idx
+                    if const_expr(write_values):
+                        row_values[out_pos] = input[row, idx]
                 if local_pos < s_equal_count[0]:
                     out_pos = s_equal_base[0] + local_pos
-                    row_indices[out_pos] = s_equal_idxs[local_pos]
+                    idx = s_equal_idxs[local_pos]
+                    row_indices[out_pos] = idx
+                    if const_expr(write_values):
+                        row_values[out_pos] = input[row, idx]
 
     @flyc.kernel(known_block_size=[_FUSED_PREFIX_THREADS, 1, 1])
     def stable_count_prefix_kernel(
@@ -602,11 +622,13 @@ def build_topk_per_row_decode_module(
         input: fx.Tensor,
         row_ends: fx.Tensor,
         indices: fx.Tensor,
+        values: fx.Tensor,
         partial_hist: fx.Tensor,
         state: fx.Tensor,
         n: fx.Int32,
         next_n: fx.Int32,
         stride0: fx.Int32,
+        write_values: fx.Constexpr[bool],
     ):
         row = fx.block_idx.x
         chunk = fx.block_idx.y
@@ -617,6 +639,7 @@ def build_topk_per_row_decode_module(
 
         input_rsrc = _row_resource(input, row_i32, n, stride0)
         row_indices = fx.slice(indices, (row, None))
+        row_values = fx.slice(values, (row, None))
         row_len = _row_length(row_i32, row_ends, n, next_n)
 
         if chunk_i32 == 0 and row_len < fx.Int32(k):
@@ -624,6 +647,8 @@ def build_topk_per_row_decode_module(
                 out_pos = row_len + fx.Int32(output_step * block_threads) + tid_i32
                 if out_pos < fx.Int32(k):
                     row_indices[out_pos] = fx.Int32(-1)
+                    if const_expr(write_values):
+                        row_values[out_pos] = fx.Float32(float("-inf"))
 
         threshold = state[row, _STATE_PREFIX]
         remaining_k = state[row, _STATE_REMAINING_K]
@@ -676,8 +701,15 @@ def build_topk_per_row_decode_module(
             second_total = second_scan[block_num_waves]
             return first_result, second_result, first_total, second_total
 
-        def write_values(
-            row_indices, classes_reg, base, remaining_k, my_above, my_equal
+        def write_outputs(
+            row_indices,
+            row_values,
+            selected_values,
+            classes_reg,
+            base,
+            remaining_k,
+            my_above,
+            my_equal,
         ):
             for vi in range_constexpr(_VEC):
                 cls = classes_reg[vi]
@@ -686,10 +718,14 @@ def build_topk_per_row_decode_module(
                 out_pos = my_above + accepted_before
                 if cls == 2:
                     row_indices[out_pos] = col
+                    if const_expr(write_values):
+                        row_values[out_pos] = selected_values[vi]
                     my_above = my_above + 1
                 elif cls == 1:
                     if my_equal < remaining_k:
                         row_indices[out_pos] = col
+                        if const_expr(write_values):
+                            row_values[out_pos] = selected_values[vi]
                     my_equal = my_equal + 1
 
         if tid == 0:
@@ -747,8 +783,10 @@ def build_topk_per_row_decode_module(
             )
             my_above = above_prefix + s_above_running[0] + local_above_prefix
             my_equal = equal_prefix + s_equal_running[0] + local_equal_prefix
-            write_values(
+            write_outputs(
                 row_indices,
+                row_values,
+                rvals,
                 classes_reg,
                 base,
                 remaining_k,
@@ -765,6 +803,7 @@ def build_topk_per_row_decode_module(
         input: fx.Tensor,
         row_ends: fx.Tensor,
         indices: fx.Tensor,
+        values: fx.Tensor,
         partial_hist: fx.Tensor,
         state: fx.Tensor,
         n: fx.Int32,
@@ -788,6 +827,7 @@ def build_topk_per_row_decode_module(
                 input,
                 row_ends,
                 indices,
+                values,
                 partial_hist,
                 state,
                 fx.Int32(shift),
@@ -802,6 +842,7 @@ def build_topk_per_row_decode_module(
                 n,
                 next_n,
                 stride0,
+                write_values,
             )
             histogram.launch(
                 grid=(rows, chunks_per_row, 1),
@@ -834,11 +875,13 @@ def build_topk_per_row_decode_module(
                 input,
                 row_ends,
                 indices,
+                values,
                 partial_hist,
                 state,
                 n,
                 next_n,
                 stride0,
+                write_values,
             )
             stable_write.launch(
                 grid=(rows, chunks_per_row, 1),
@@ -850,10 +893,12 @@ def build_topk_per_row_decode_module(
                 input,
                 row_ends,
                 indices,
+                values,
                 state,
                 n,
                 next_n,
                 stride0,
+                write_values,
             )
             gather.launch(
                 grid=(rows, chunks_per_row, 1),

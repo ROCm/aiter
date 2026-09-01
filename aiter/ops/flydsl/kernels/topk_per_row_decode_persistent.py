@@ -7,7 +7,7 @@ from functools import cache
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr
 
 from .topk_per_row_decode import (
     _atomic_add_i32,
@@ -37,7 +37,11 @@ _RUNNING_EQUAL = 7
 
 
 @cache
-def build_topk_per_row_decode_one_workgroup_module(rows: int, k: int):
+def build_topk_per_row_decode_one_workgroup_module(
+    rows: int,
+    k: int,
+    write_values: bool = False,
+):
     output_steps = (k + _BLOCK_THREADS - 1) // _BLOCK_THREADS
 
     @fx.struct
@@ -54,9 +58,11 @@ def build_topk_per_row_decode_one_workgroup_module(rows: int, k: int):
         input: fx.Tensor,
         row_ends: fx.Tensor,
         indices: fx.Tensor,
+        values: fx.Tensor,
         width: fx.Int32,
         next_n: fx.Int32,
         stride0: fx.Int32,
+        write_values: fx.Constexpr[bool],
     ):
         row = fx.block_idx.x
         tid = fx.thread_idx.x
@@ -70,7 +76,6 @@ def build_topk_per_row_decode_one_workgroup_module(rows: int, k: int):
         block_threads = fx.Int32(_BLOCK_THREADS)
         top_k = fx.Int32(k)
         sign_bit = fx.Int32(-2147483648)
-        zero_f32 = fx.Float32(0.0)
 
         storage = fx.SharedAllocator().allocate(SharedStorage)
         histogram = storage.histogram.peek().view(fx.make_layout(_NUM_BUCKETS, 1))
@@ -80,10 +85,10 @@ def build_topk_per_row_decode_one_workgroup_module(rows: int, k: int):
         input_resource = _row_resource(input, row, width, stride0)
         row_len = _row_length(row, row_ends, width, next_n)
         row_indices = fx.slice(indices, (row, None))
+        row_values = fx.slice(values, (row, None))
         row_vectors = (row_len + vec_width - one) // vec_width
 
         def ordered_key(value):
-            value = (value == zero_f32).select(zero_f32, value)
             bits = value.bitcast(fx.Int32)
             sign = bits.shrui(fx.Int32(31))
             return (sign != zero).select(~bits, bits ^ sign_bit)
@@ -265,6 +270,7 @@ def build_topk_per_row_decode_one_workgroup_module(rows: int, k: int):
             third_threshold,
             num_needed,
             row_indices,
+            row_values,
             scan,
             metadata,
         ):
@@ -279,14 +285,14 @@ def build_topk_per_row_decode_one_workgroup_module(rows: int, k: int):
                 active_vector = vector_idx < row_vectors
                 safe_vector_idx = active_vector.select(vector_idx, zero)
                 col_base = safe_vector_idx * vec_width
-                values = _load_f32x4(input_resource, safe_vector_idx)
+                rvals = _load_f32x4(input_resource, safe_vector_idx)
                 classes = fx.make_rmem_tensor(_VEC, fx.Int32)
                 local_above = zero
                 local_equal = zero
                 for lane_idx in range_constexpr(_VEC):
                     col = col_base + lane_idx
                     above, equal = classify(
-                        values[lane_idx],
+                        rvals[lane_idx],
                         first_threshold,
                         second_threshold,
                         third_threshold,
@@ -315,10 +321,14 @@ def build_topk_per_row_decode_one_workgroup_module(rows: int, k: int):
                     out_pos = my_above + accepted_equal
                     if cls == two:
                         row_indices[out_pos] = col
+                        if const_expr(write_values):
+                            row_values[out_pos] = rvals[lane_idx]
                         my_above = my_above + one
                     elif cls == one:
                         if my_equal < num_needed:
                             row_indices[out_pos] = col
+                            if const_expr(write_values):
+                                row_values[out_pos] = rvals[lane_idx]
                         my_equal = my_equal + one
                 if tid == 0:
                     metadata[_RUNNING_ABOVE] = metadata[_RUNNING_ABOVE] + block_above
@@ -329,9 +339,13 @@ def build_topk_per_row_decode_one_workgroup_module(rows: int, k: int):
             for output_step in range_constexpr(output_steps):
                 out_pos = output_step * _BLOCK_THREADS + tid
                 if out_pos < k:
-                    row_indices[out_pos] = (out_pos < row_len).select(
-                        out_pos, fx.Int32(-1)
-                    )
+                    valid = out_pos < row_len
+                    row_indices[out_pos] = valid.select(out_pos, fx.Int32(-1))
+                    if const_expr(write_values):
+                        row_values[out_pos] = valid.select(
+                            input[row, out_pos],
+                            fx.Float32(float("-inf")),
+                        )
 
         if row_len > top_k:
             if tid < 8:
@@ -395,6 +409,7 @@ def build_topk_per_row_decode_one_workgroup_module(rows: int, k: int):
                 third_threshold,
                 num_needed,
                 row_indices,
+                row_values,
                 scan,
                 metadata,
             )
@@ -404,6 +419,7 @@ def build_topk_per_row_decode_one_workgroup_module(rows: int, k: int):
         input: fx.Tensor,
         row_ends: fx.Tensor,
         indices: fx.Tensor,
+        values: fx.Tensor,
         width: fx.Int32,
         next_n: fx.Int32,
         stride0: fx.Int32,
@@ -413,9 +429,11 @@ def build_topk_per_row_decode_one_workgroup_module(rows: int, k: int):
             input,
             row_ends,
             indices,
+            values,
             width,
             next_n,
             stride0,
+            write_values,
         ).launch(
             grid=(rows, 1, 1),
             block=(_BLOCK_THREADS, 1, 1),

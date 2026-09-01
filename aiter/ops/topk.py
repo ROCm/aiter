@@ -681,6 +681,7 @@ def flydsl_top_k_per_row_decode(
     stride1: int,
     k: int = 2048,
     stable: bool = False,
+    values: torch.Tensor | None = None,
 ) -> None:
     """FlyDSL per-row decode TopK with the same call shape as the HIP interface.
 
@@ -701,6 +702,7 @@ def flydsl_top_k_per_row_decode(
         stride1,
         k,
         stable,
+        values,
     )
 
 
