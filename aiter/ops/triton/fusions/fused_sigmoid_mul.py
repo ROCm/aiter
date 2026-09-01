@@ -12,21 +12,14 @@ import triton
 from aiter.ops.triton._triton_kernels.fusions.fused_sigmoid_mul import (
     _fused_sigmoid_mul_kernel,
 )
-from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.config_utils import (
-    AITER_TRITON_CONFIGS_PATH,
-    load_config_json,
-)
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
 __all__ = ["fused_sigmoid_mul"]
 
-
-def _get_config() -> dict:
-    base = f"{AITER_TRITON_CONFIGS_PATH}/{get_arch()}/triton/fusions/fused_sigmoid_mul"
-    return dict(load_config_json(f"{base}/DEFAULT.json", required=True)["any"])
+_BLOCK_SIZE_N = 4096
+_NUM_WARPS = 4
 
 
 def fused_sigmoid_mul(
@@ -66,16 +59,13 @@ def fused_sigmoid_mul(
     if N == 0:
         return out
 
-    config = _get_config()
-    BLOCK_SIZE_N = config.pop("BLOCK_SIZE_N")
-
-    _fused_sigmoid_mul_kernel[(triton.cdiv(N, BLOCK_SIZE_N),)](
+    _fused_sigmoid_mul_kernel[(triton.cdiv(N, _BLOCK_SIZE_N),)](
         x,
         gate,
         out,
         N,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        NEED_MASK=N % BLOCK_SIZE_N != 0,
-        **config,
+        BLOCK_SIZE_N=_BLOCK_SIZE_N,
+        NEED_MASK=N % _BLOCK_SIZE_N != 0,
+        num_warps=_NUM_WARPS,
     )
     return out
