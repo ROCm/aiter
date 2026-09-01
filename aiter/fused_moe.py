@@ -199,6 +199,8 @@ def _get_gfx1201_triton_fmoe_config(
     a2_scale,
     num_local_tokens,
     gate_mode,
+    w1_is_contiguous,
+    w2_is_contiguous,
 ):
     if not (
         get_gfx_runtime() == "gfx1201"
@@ -224,6 +226,8 @@ def _get_gfx1201_triton_fmoe_config(
         and a2_scale is None
         and num_local_tokens is None
         and gate_mode == GateMode.SEPARATED
+        and w1_is_contiguous
+        and w2_is_contiguous
     ):
         return None
 
@@ -1146,12 +1150,14 @@ def _fused_moe_impl(
         a2_scale=a2_scale,
         num_local_tokens=num_local_tokens,
         gate_mode=gate_mode,
+        w1_is_contiguous=w1.is_contiguous(),
+        w2_is_contiguous=w2.is_contiguous(),
     )
     if triton_config is not None:
         return _triton_bf16_g1u1_moe(
             hidden_states.contiguous(),
-            w1.contiguous(),
-            w2.contiguous(),
+            w1,
+            w2,
             topk_weight,
             topk_ids,
             config=triton_config,

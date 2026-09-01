@@ -54,6 +54,8 @@ class TestTritonFmoeDispatch(unittest.TestCase):
             a2_scale=None,
             num_local_tokens=None,
             gate_mode=GateMode.SEPARATED,
+            w1_is_contiguous=True,
+            w2_is_contiguous=True,
         )
         kwargs.update(overrides)
         with (
@@ -122,6 +124,8 @@ class TestTritonFmoeDispatch(unittest.TestCase):
         self.assertIsNone(self._call(w1_scale=object()))
         self.assertIsNone(self._call(num_local_tokens=object()))
         self.assertIsNone(self._call(gate_mode=GateMode.INTERLEAVE))
+        self.assertIsNone(self._call(w1_is_contiguous=False))
+        self.assertIsNone(self._call(w2_is_contiguous=False))
 
     def test_config_family_resolves(self):
         path = fused_moe_mod.AITER_CONFIGS.AITER_CONFIG_TRITON_FMOE_FILE
