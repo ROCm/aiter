@@ -4750,6 +4750,20 @@ class FmoeTuner(TunerCommon):
                     activation=act_type,
                     quant_type=q_type,
                     doweight_stage1=doweight_stage1,
+                    # The torch reference runs SiTUv2 with the model's betas;
+                    # fused_moe defaults to 1.0. Without this every Situv2 shape
+                    # reports logits_diff ~0.14 (out_norm/ref_norm ~0.61)
+                    # regardless of which kernel it dispatched.
+                    beta=(
+                        DEFAULT_SITUV2_BETA
+                        if act_type == ActivationType.Situv2
+                        else None
+                    ),
+                    linear_beta=(
+                        DEFAULT_SITUV2_LINEAR_BETA
+                        if act_type == ActivationType.Situv2
+                        else None
+                    ),
                     w1_scale=w1_scale_fmoe,
                     w2_scale=w2_scale_fmoe,
                     dtype=dtype,
