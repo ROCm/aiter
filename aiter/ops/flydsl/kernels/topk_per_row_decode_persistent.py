@@ -11,6 +11,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 
 from .topk_per_row_decode import (
     _atomic_add_i32,
+    _f32_to_ord,
     _load_f32x4,
     _row_length,
     _row_resource,
@@ -89,9 +90,7 @@ def build_topk_per_row_decode_one_workgroup_module(
         row_vectors = (row_len + vec_width - one) // vec_width
 
         def ordered_key(value):
-            bits = value.bitcast(fx.Int32)
-            sign = bits.shrui(fx.Int32(31))
-            return (sign != zero).select(~bits, bits ^ sign_bit)
+            return _f32_to_ord(value) ^ sign_bit
 
         def high_bucket(value):
             return ordered_key(value).shrui(fx.Int32(21))

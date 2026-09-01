@@ -135,7 +135,7 @@ def _validate_values_signature(
         raise ValueError("values must be on the same CUDA device as logits")
 
 
-def flydsl_top_k_per_row_decode(
+def _validate_flydsl_topk_call(
     logits: torch.Tensor,
     next_n: int,
     seq_lens: torch.Tensor,
@@ -143,21 +143,9 @@ def flydsl_top_k_per_row_decode(
     num_rows: int,
     stride0: int,
     stride1: int,
-    k: int = 2048,
-    stable: bool = False,
-    values: torch.Tensor | None = None,
+    k: int,
+    values: torch.Tensor | None,
 ) -> None:
-    """Write per-row TopK indices using each request's effective context length.
-
-    For output row ``r``, the valid input length is
-    ``seq_lens[r // next_n] - next_n + r % next_n + 1``.
-    If the valid input length is less than ``k``, the remaining output positions
-    are filled with ``-1``.
-    When ``stable`` is true, indices are emitted in ascending order and ties at
-    the selection threshold prefer the smallest input indices.
-    When ``values`` is given, each selected index's logit is written alongside it.
-    Rows shorter than ``k`` pad the index with ``-1`` and the score with ``-inf``.
-    """
     _validate_topk_signature(
         logits.shape,
         logits.stride(),
@@ -187,6 +175,105 @@ def flydsl_top_k_per_row_decode(
             k,
             logits.device,
         )
+
+
+_TensorSignature = tuple[
+    torch.Size,
+    tuple[int, ...],
+    torch.dtype,
+    torch.device,
+]
+
+
+def _tensor_signature(tensor: torch.Tensor) -> _TensorSignature:
+    return tensor.shape, tensor.stride(), tensor.dtype, tensor.device
+
+
+@lru_cache(maxsize=128)
+def _is_flydsl_topk_call_supported(
+    logits_signature: _TensorSignature,
+    seq_lens_signature: _TensorSignature,
+    indices_signature: _TensorSignature,
+    next_n: int,
+    num_rows: int,
+    stride0: int,
+    stride1: int,
+    k: int,
+    values_signature: _TensorSignature | None,
+) -> bool:
+    try:
+        _validate_topk_signature(
+            *logits_signature,
+            *seq_lens_signature,
+            *indices_signature,
+            next_n,
+            num_rows,
+            stride0,
+            stride1,
+            k,
+        )
+        if values_signature is not None:
+            _validate_values_signature(
+                *values_signature,
+                logits_signature[0][0],
+                k,
+                logits_signature[3],
+            )
+    except (RuntimeError, TypeError, ValueError):
+        return False
+    return True
+
+
+def is_flydsl_top_k_per_row_decode_supported(
+    logits: torch.Tensor,
+    next_n: int,
+    seq_lens: torch.Tensor,
+    indices: torch.Tensor,
+    num_rows: int,
+    stride0: int,
+    stride1: int,
+    k: int,
+    values: torch.Tensor | None = None,
+) -> bool:
+    """Return whether a call satisfies every FlyDSL-only precondition."""
+    return _is_flydsl_topk_call_supported(
+        _tensor_signature(logits),
+        _tensor_signature(seq_lens),
+        _tensor_signature(indices),
+        next_n,
+        num_rows,
+        stride0,
+        stride1,
+        k,
+        None if values is None else _tensor_signature(values),
+    )
+
+
+def flydsl_top_k_per_row_decode(
+    logits: torch.Tensor,
+    next_n: int,
+    seq_lens: torch.Tensor,
+    indices: torch.Tensor,
+    num_rows: int,
+    stride0: int,
+    stride1: int,
+    k: int = 2048,
+    stable: bool = False,
+    values: torch.Tensor | None = None,
+) -> None:
+    """Write per-row TopK indices using each request's effective context length."""
+
+    _validate_flydsl_topk_call(
+        logits,
+        next_n,
+        seq_lens,
+        indices,
+        num_rows,
+        stride0,
+        stride1,
+        k,
+        values,
+    )
 
     rows, width = logits.shape
     stream = torch.cuda.current_stream(logits.device)

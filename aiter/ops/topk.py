@@ -505,9 +505,15 @@ def _flydsl_topk_decode_shape_supported(
 
 def _should_use_flydsl_topk_decode(
     logits: torch.Tensor,
+    next_n: int,
+    seq_lens: torch.Tensor,
+    indices: torch.Tensor,
     num_rows: int,
+    stride0: int,
+    stride1: int,
     k: int,
     stable: bool,
+    values: torch.Tensor | None = None,
 ) -> bool:
     if (
         _FLYDSL_TOPK_DECODE_DISABLED
@@ -520,12 +526,27 @@ def _should_use_flydsl_topk_decode(
     if arch not in _FLYDSL_TOPK_DECODE_GATES or not _flydsl_topk_decode_available():
         return False
 
-    return _flydsl_topk_decode_shape_supported(
+    if not _flydsl_topk_decode_shape_supported(
         arch,
         stable,
         logits.shape[1],
         num_rows,
         k,
+    ):
+        return False
+
+    from .flydsl.topk_per_row import is_flydsl_top_k_per_row_decode_supported
+
+    return is_flydsl_top_k_per_row_decode_supported(
+        logits,
+        next_n,
+        seq_lens,
+        indices,
+        num_rows,
+        stride0,
+        stride1,
+        k,
+        values,
     )
 
 
@@ -587,9 +608,15 @@ def top_k_per_row_decode(
     candidate and a consumer that ranks these scores needs no extra mask."""
     if _should_use_flydsl_topk_decode(
         logits,
+        next_n,
+        seqLens,
+        indices,
         numRows,
+        stride0,
+        stride1,
         k,
         stable,
+        values,
     ):
         return flydsl_top_k_per_row_decode(
             logits,
