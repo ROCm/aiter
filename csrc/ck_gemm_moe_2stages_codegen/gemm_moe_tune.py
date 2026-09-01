@@ -6314,10 +6314,18 @@ class Mxfp4FlydslTuner(FmoeTuner):
     def _port_e2e(data, kn1, kn2, topk, ne, h, dtype):
         # kn2 may name either gemm2 family (path B or native mxmoe).
         _g2 = parse_g2_kname_any(kn2)
-        BM = _g2["BM"]
         atomic = _g2["atomic"]
         p1 = _parse_mxfp4_g1_kname(kn1)
-        BM1 = p1["BM"]
+        # One block_m for the whole pipeline, taken from kernelName1 -- mirrors
+        # production, where metadata.block_m comes from kernelName1 and feeds the
+        # sort, the prequant, stage1 and stage2 alike. _candidate_rows only pairs
+        # a g1 with a g2 of the same tile_m, so the two always agree today;
+        # assert it rather than reading both, so relaxing that pairing cannot
+        # silently desync the prequant's block stride from the sorted_ids it walks.
+        BM = p1["BM"]
+        assert (
+            _g2["BM"] == BM
+        ), f"block_m mismatch between {kn1!r} (BM={BM}) and {kn2!r} (BM={_g2['BM']})"
         M = data["input"].shape[0]
         sti, sw, sei, nvi, moe_buf, m_indices, reverse_sorted = moe_sorting(
             data["topk_ids"],
@@ -6330,8 +6338,23 @@ class Mxfp4FlydslTuner(FmoeTuner):
             output_aux="opus",
         )
         moe_out = moe_buf if moe_buf.numel() else torch.empty((M, h), dtype=dtype)
+        stage1_input = data["input"]
+        stage1_scale = None
+        # Keep the tuner aligned with the production fused_moe_2stages pipeline:
+        # BM16 quantizes inline; the other A4W4 variants consume the fused Opus
+        # prequant output.
+        if BM != 16:
+            stage1_input, stage1_scale = aiter.fused_dynamic_mxfp4_quant_moe_sort(
+                input=data["input"],
+                sorted_ids=sti,
+                num_valid_ids=nvi,
+                token_num=M,
+                topk=topk,
+                block_size=BM,
+                sorted_weights=sw,
+            )
         inter_q, inter_s = _mxfp4_a4w4_stage1_fw(
-            data["input"],
+            stage1_input,
             data["w1_a16"],
             data["w2_a16"],
             sti,
@@ -6339,7 +6362,8 @@ class Mxfp4FlydslTuner(FmoeTuner):
             nvi,
             None,
             topk,
-            block_m=BM1,
+            block_m=BM,
+            a1_scale=stage1_scale,
             w1_scale=data["w1s_a16"],
             kernelName1=kn1,
             m_indices=m_indices,
