@@ -451,3 +451,66 @@ def get_device_name():
         return "MI400"
     else:
         raise RuntimeError("Unsupported gfx")
+
+
+@functools.lru_cache(maxsize=1)
+def _hip_version() -> tuple[int, int] | None:
+    """(major, minor) of the loaded HIP runtime; None if it cannot be determined."""
+    import ctypes
+
+    try:
+        libhip = ctypes.CDLL("libamdhip64.so")
+        val = ctypes.c_int(0)
+        err = libhip.hipRuntimeGetVersion(ctypes.byref(val))
+    except Exception:  # noqa: BLE001  probing must never break a kernel launch
+        return None
+    if err != 0:
+        return None
+    # HIP_VERSION = major * 10000000 + minor * 100000 + patch
+    return val.value // 10000000, (val.value // 100000) % 100
+
+
+def _query_num_xccs() -> int | None:
+    """Ask HIP how many XCCs this device has; None if it cannot say."""
+    import ctypes
+
+    # Added in ROCm 7.0; on an older runtime this ordinal names some other
+    # attribute, which would return a plausible small integer rather than fail.
+    version = _hip_version()
+    if version is None or version < (7, 0):
+        return None
+
+    hipDeviceAttributeNumberOfXccs = 10018
+
+    try:
+        libhip = ctypes.CDLL("libamdhip64.so")
+        val = ctypes.c_int(0)
+        err = libhip.hipDeviceGetAttribute(
+            ctypes.byref(val),
+            hipDeviceAttributeNumberOfXccs,
+            0,
+        )
+    except Exception:  # noqa: BLE001  probing must never break a kernel launch
+        return None
+    if err != 0:
+        return None
+
+    # A shifted ordinal resolves to an unrelated attribute, whose value lands well
+    # outside this range. Loose because MI300A has 6 dies and partitions vary.
+    n = val.value
+    return n if 1 <= n <= 64 else None
+
+
+@functools.lru_cache(maxsize=1)
+def get_num_xcds() -> int:
+    """XCD (accelerator die) count visible to this process."""
+    num_xcds = _query_num_xccs()
+    if num_xcds is not None:
+        return num_xcds
+
+    fallback_num_xcds = 8
+    logger.warning(
+        "hipDeviceAttributeNumberOfXccs is unavailable; using %d XCDs as fallback value.",
+        fallback_num_xcds,
+    )
+    return fallback_num_xcds
