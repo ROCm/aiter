@@ -105,7 +105,6 @@ def _build_launcher(
     N_BLOCKS = N // BLOCK_N  # output column-tiles per group (compile-time)
     XCD_NUM_ROWS = BM_TILES * N_GROUPS
     XCD_NUM_COLS = N_BLOCKS
-    C_FRAG_LEN = BLOCK_M * BLOCK_N // THREADS
     smem_bytes = BLOCK_M * BLOCK_K * STAGES_A * 2  # bf16 A double-buffer staging
 
     @flyc.kernel(known_block_size=[THREADS, 1, 1])
@@ -346,15 +345,11 @@ def _build_launcher(
                 thr_gBias,
                 bias_frag,
             )
-            bias_f32 = fx.arith.ExtFOp(
-                T.vec(C_FRAG_LEN, T.f32), bias_frag.load()
-            ).result
-            mma_frag_C_bf16.store(
-                fx.arith.trunc_f(
-                    T.vec(C_FRAG_LEN, T.bf16),
-                    fx.arith.addf(mma_frag_C.load(), bias_f32),
-                )
-            )
+            acc = mma_frag_C.load()
+            # Same element count, different logical shape: relabel the bias
+            # fragment so the add stays a flat vector op instead of broadcasting.
+            bias = fx.Vector(bias_frag.load(), acc.shape, fx.BFloat16)
+            mma_frag_C_bf16.store((acc + bias).to(fx.BFloat16))
 
             sC = fx.make_view(
                 fx.get_dyn_shared(fx.BFloat16),
