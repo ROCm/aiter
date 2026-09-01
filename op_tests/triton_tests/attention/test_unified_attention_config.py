@@ -232,8 +232,8 @@ def test_resolution_is_deterministic_and_isolated(arch, backend):
 
 @pytest.mark.parametrize("arch,backend", TABLES)
 @pytest.mark.parametrize("op", OPS)
-def test_explain_traces_the_path_and_agrees_with_the_lookup(arch, backend, op):
-    """`explain` has to report the leaf the real lookup actually lands on.
+def test_explain_names_the_entry_and_agrees_with_the_lookup(arch, backend, op):
+    """`explain` has to report the entry the real lookup actually lands on.
 
     A trace that drifts from the resolver is worse than no trace, so this
     checks the reported values against get_unified_attention_config() rather
@@ -243,7 +243,7 @@ def test_explain_traces_the_path_and_agrees_with_the_lookup(arch, backend, op):
         for max_seqlen_q in (1, 4096):
             params = make_params(head_size=head_size, max_seqlen_q=max_seqlen_q)
             text = explain(op, params, backend=backend, arch=arch)
-            assert "path:" in text and "leaf:" in text
+            assert "matched:" in text and "leaf:" in text
             assert "UNRESOLVED" not in text
 
             config, _ = get_unified_attention_config(
@@ -322,93 +322,105 @@ def _table(arch, backend):
     return json.loads(path.read_text())
 
 
-def _walk(node, path=""):
-    """Yield (path, node, is_leaf) for every node in the tree."""
-    leaf = not any(isinstance(v, dict) for v in node.values())
-    yield path or "<root>", node, leaf
-    if not leaf:
-        for key, child in node.items():
-            yield from _walk(child, f"{path}/{key}")
+def _entries(table, axes):
+    """(key, config) for every entry. A section with no axes is one bare
+    config, not a table of entries."""
+    return [("(flat)", table)] if not axes else list(table.items())
+
+
+def _components(key):
+    return () if key == "any" else tuple(key.split("."))
 
 
 @pytest.mark.parametrize("arch,backend", TABLES)
 @pytest.mark.parametrize("op", OPS)
-def test_every_level_has_an_any_fallback(arch, backend, op):
-    """The descent has no backtracking, so a level with no matching bucket and
-    no 'any' is unreachable-by-fallthrough -- and would hang the resolver's
-    loop rather than raise, if the guard were ever removed."""
-    for path, node, leaf in _walk(_table(arch, backend)[op]):
-        if not leaf:
-            assert "any" in node, (
-                f"{arch}/{backend} {op}: level {path} has no 'any' "
-                f"(keys: {sorted(node)})"
-            )
+def test_every_section_has_an_any_entry(arch, backend, op):
+    """Resolution walks candidates and takes the first hit, so a section with
+    no 'any' has shapes that resolve to nothing at all."""
+    table = _table(arch, backend)
+    axes = table.get("schema", {}).get(op, [])
+    if not axes:
+        return
+    assert (
+        "any" in table[op]
+    ), f"{arch}/{backend} {op}: no 'any' entry (keys: {sorted(table[op])[:6]})"
 
 
 @pytest.mark.parametrize("arch,backend", TABLES)
 @pytest.mark.parametrize("op", OPS)
-def test_buckets_match_the_declared_schema(arch, backend, op):
-    """Every bucket names an axis the resolver can evaluate, and one the
-    section's schema lists. A typo'd key would otherwise never match and
+def test_key_components_match_the_declared_schema(arch, backend, op):
+    """Every component names an axis the resolver can evaluate, and one the
+    section's schema lists. A typo'd component would otherwise never match and
     silently fall through to 'any'."""
     table = _table(arch, backend)
     declared = table.get("schema", {}).get(op, [])
-    for path, node, leaf in _walk(table[op]):
-        if leaf:
-            continue
-        for key in node:
-            if key == "any":
-                continue
-            axis = unified_attention_utils._axis_of(key)
+    if not declared:
+        return
+    for key in table[op]:
+        for part in _components(key):
+            axis = unified_attention_utils._axis_of(part)
             assert axis in unified_attention_utils._AXIS_KIND, (
-                f"{arch}/{backend} {op}: bucket {key!r} at {path} names unknown "
-                f"axis {axis!r}"
+                f"{arch}/{backend} {op}: {key!r} has component {part!r} naming "
+                f"unknown axis {axis!r}"
             )
             assert axis in declared, (
-                f"{arch}/{backend} {op}: bucket {key!r} at {path} branches on "
-                f"{axis!r}, which the schema does not list ({declared})"
+                f"{arch}/{backend} {op}: {key!r} keys on {axis!r}, which the "
+                f"schema does not list ({declared})"
             )
 
 
 @pytest.mark.parametrize("arch,backend", TABLES)
 @pytest.mark.parametrize("op", OPS)
 def test_schema_lists_exactly_the_axes_used(arch, backend, op):
-    """The schema is meant to be an honest summary of the file, so an axis that
-    is declared but never branched on is as wrong as one that is missing."""
+    """The schema is meant to be an honest summary, so an axis declared but
+    never used is as wrong as one that is missing."""
     table = _table(arch, backend)
     declared = set(table.get("schema", {}).get(op, []))
     used = {
-        unified_attention_utils._axis_of(k)
-        for _, node, leaf in _walk(table[op])
-        if not leaf
-        for k in node
-        if k != "any"
+        unified_attention_utils._axis_of(part)
+        for key in (table[op] if declared else {})
+        for part in _components(key)
     }
     assert declared == used, (
         f"{arch}/{backend} {op}: schema declares {sorted(declared)} but the "
-        f"tree branches on {sorted(used)}"
+        f"keys use {sorted(used)}"
     )
 
 
 @pytest.mark.parametrize("arch,backend", TABLES)
 @pytest.mark.parametrize("op", OPS)
-def test_every_leaf_is_complete_and_carries_nothing_extra(arch, backend, op):
-    """Checked structurally rather than through resolution, so a leaf no test
+def test_no_duplicate_entries_after_canonicalisation(arch, backend, op):
+    """Keys omit don't-care axes, so two different-looking keys can expand to
+    the same slots -- one would silently shadow the other."""
+    table = _table(arch, backend)
+    axes = tuple(table.get("schema", {}).get(op, []))
+    if not axes:
+        return
+    seen = {}
+    for key in table[op]:
+        canon = unified_attention_utils._canonical(key, axes)
+        assert canon not in seen, (
+            f"{arch}/{backend} {op}: {key!r} and {seen[canon]!r} both expand to "
+            f"{canon}"
+        )
+        seen[canon] = key
+
+
+@pytest.mark.parametrize("arch,backend", TABLES)
+@pytest.mark.parametrize("op", OPS)
+def test_every_entry_is_complete_and_carries_nothing_extra(arch, backend, op):
+    """Checked structurally rather than through resolution, so an entry no test
     situation happens to reach is still covered."""
+    table = _table(arch, backend)
+    axes = table.get("schema", {}).get(op, [])
     required = REQUIRED_KEYS[op] - {"TILE_SIZE"}
-    for path, node, leaf in _walk(_table(arch, backend)[op]):
-        if not leaf:
-            continue
-        extra = set(node) - ALLOWED_LEAF_KEYS[op]
-        assert (
-            not extra
-        ), f"{arch}/{backend} {op}: leaf {path} has extra {sorted(extra)}"
-        missing = required - set(node)
-        assert (
-            not missing
-        ), f"{arch}/{backend} {op}: leaf {path} missing {sorted(missing)}"
+    for key, config in _entries(table[op], axes):
+        extra = set(config) - ALLOWED_LEAF_KEYS[op]
+        assert not extra, f"{arch}/{backend} {op}: {key!r} has extra {sorted(extra)}"
+        missing = required - set(config)
+        assert not missing, f"{arch}/{backend} {op}: {key!r} missing {sorted(missing)}"
         if "TILE_SIZE" in ALLOWED_KEYS[op]:
-            assert _TILE_BOUNDS <= set(node), (
-                f"{arch}/{backend} {op}: leaf {path} needs {sorted(_TILE_BOUNDS)} "
+            assert _TILE_BOUNDS <= set(config), (
+                f"{arch}/{backend} {op}: {key!r} needs {sorted(_TILE_BOUNDS)} "
                 f"to derive TILE_SIZE"
             )

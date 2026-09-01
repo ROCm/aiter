@@ -3,52 +3,55 @@
 
 """Unified-attention config loading.
 
-One nesting level per axis, and **every leaf is a complete config**. Reading
-the config for a case is reading one leaf -- values are never assembled from
+One entry per case, and **every entry is a complete config**. Reading the
+config for a case is reading one line -- values are never assembled from
 several places::
 
     {
-      "schema": {"attn_2d": ["D", "Q", "SW", "DT"], "kv_split": ["D", "DT", "BS"]},
+      "schema": {"attn_2d": ["D", "Q", "SW", "DT"], "kv_split": ["DT", "BS"]},
+
       "attn_2d": {
-        "D_LEQ_128": {                                  # small head
-          "Q_LEQ_1": {"BLOCK_M": 16, "num_warps": 2,    #   decode
-                      "num_stages": 3, "waves_per_eu": 2,
-                      "TILE_SIZE_MIN": 16, "TILE_SIZE_MAX": 64}
-        },
-        "D_GEQ_512": {                                  # large head
-          "Q_LEQ_1": {...},                             #   decode
-          "any":     {...}                              #   prefill
-        },
-        "any": {                                        # everything else
-          "Q_LEQ_1":   {...},                           #   decode
-          "Q_GEQ_256": {...},                           #   long prefill
-          "any":       {...}                            #   prefill
-        }
-      }
+        "D_LEQ_128.Q_LEQ_1.SW":   {...},   # small head, decode, sliding window
+        "D_LEQ_128.Q_LEQ_1":      {...},   # small head, decode
+        "D_LEQ_128.Q_GEQ_256":    {...},   # small head, long prefill
+        "D_GEQ_512":              {...},   # large head
+        "Q_LEQ_1":                {...},   # decode, any head size
+        "any":                    {...}    # everything else
+      },
+
+      "reduce": {"num_warps": 2, "num_stages": 1, "waves_per_eu": 2}
     }
 
-``schema`` lists the axes each section branches on -- only the ones this arch
-actually uses, so the header is an honest summary of the file. Bounds are not
-declared; the bucket keys state them. A section that is a single flat config
-needs no entry at all. Nesting order *is* precedence: ``D`` outside ``Q`` is
-what makes head_size outrank max_seqlen_q, as the old if-else nesting did.
+Each key component names its axis, so an axis that does not matter for a case
+is simply left out -- there is no "any" padding, and a key reads as the
+situation it covers. A section with no axes at all is a bare config, as
+``reduce`` is above.
 
-Resolution is a plain descent in the GEMM search order -- ``X_LEQ`` ascending,
-then ``X_GEQ`` descending, then ``any``. Every level carries an ``any``
-(enforced at load time), so a lookup always lands and there is no backtracking
-or failure path. A level may be omitted entirely where it never changes
-anything, and each level's axis is read from its own bucket names rather than
-from a declared order the file might not follow.
+``schema`` lists the axes each section keys on -- only the ones this arch
+actually uses, so the header is an honest summary. Bounds are not declared; the
+keys state them, so adding a bucket is a one-line edit.
 
-Bucket grammar per axis kind -- every bucket names its axis:
+Resolution walks the cross product of each axis's candidates in schema order --
+X_LEQ ascending, then X_GEQ descending, then the looser dtype fallbacks, then
+"any". The enumeration order *is* the priority: leftmost axis most significant,
+which is what makes head_size outrank max_seqlen_q as the old if-else nesting
+did. Keys are expanded to one slot per axis once at load time, so no ranking
+over variable-length keys is needed. Entries are stored most specific first, so
+the file reads in the order the lookup tries them.
+
+Component grammar per axis kind:
   numeric  ``D_LEQ_128`` / ``D_GEQ_512``
-  boolean  ``SW`` -- present means the flag is set; ``any`` is the other case
-  enum     ``DT=fp8_fp8`` -- the (q, kv) dtype tag pair, with ``DT=fp8_any`` /
-           ``DT=any_fp8`` / ``any`` as progressively looser fallbacks
+  boolean  ``SW`` -- present means the flag is set; absent means don't care
+  enum     ``DT_fp8_fp8`` -- the (q, kv) dtype tag pair, with ``DT_fp8_any`` /
+           ``DT_any_fp8`` as progressively looser fallbacks
+
+Separator is ``.`` rather than ``_``: axis names collide otherwise, since D is
+a prefix of DT and ``DT_any`` would read as axis D.
 """
 
 import copy
 import functools
+import itertools
 
 import torch
 import triton
@@ -61,6 +64,9 @@ from aiter.ops.triton.utils.config_utils import (
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 _CONFIG_NAME = "UNIFIED-ATTENTION"
+# Separates key components. Not "_": axis names collide under it, since D
+# is a prefix of DT and "DT_any" would read as axis D.
+_SEP = "."
 _OPS = ("attn_2d", "attn_3d", "reduce", "kv_split")
 
 # How each axis name is bucketed. Adding an axis here plus a value in
@@ -86,67 +92,91 @@ def get_dtype_str(dtype: torch.dtype) -> str:
     raise ValueError(f"No unified attention config tag for dtype: {dtype}")
 
 
-def _axis_of(key: str) -> str:
-    """Every bucket names its axis: D_LEQ_128, SW, DT=fp8_fp8."""
-    return key.split("=")[0].split("_LEQ_")[0].split("_GEQ_")[0]
+def _axis_of(component: str) -> str:
+    """D_LEQ_128 -> D;  DT_fp8_fp8 -> DT;  SW -> SW."""
+    return "DT" if component.startswith("DT_") else component.split("_")[0]
 
 
-def _candidates(axis: str, value, node: dict) -> list[str]:
-    """Bucket names to try for this axis, in resolution order -- X_LEQ
-    ascending, then X_GEQ descending, then the looser fallbacks, then "any".
+def _canonical(key: str, axes: tuple) -> tuple:
+    """A key with one slot per axis, "any" where the key says nothing.
 
-    Bounds are read from the node's own keys. Declaring them again in the schema
-    was a second source of truth for a fact the keys already state, and it meant
-    adding one bucket required editing two places.
+    Keys name only the axes that matter, so they vary in length; expanding them
+    to a fixed shape once at load time is what lets the lookup be a plain
+    cross-product walk instead of a specificity ranking over variable keys.
+    """
+    slot = dict.fromkeys(axes, "any")
+    if key != "any":
+        for part in key.split(_SEP):
+            slot[_axis_of(part)] = part
+    return tuple(slot[a] for a in axes)
+
+
+@functools.lru_cache(maxsize=256)
+def _index(keys: tuple, axes: tuple) -> tuple:
+    """(canonical slots -> original key, components present per axis).
+
+    Keyed on the table's key names alone -- they are what the index depends on,
+    and unlike the configs they are hashable, so this is computed once per
+    table rather than once per shape.
+    """
+    idx = {_canonical(k, axes): k for k in keys}
+    seen: dict = {a: set() for a in axes}
+    for key in keys:
+        if key != "any":
+            for part in key.split(_SEP):
+                seen[_axis_of(part)].add(part)
+    return idx, seen
+
+
+def _candidates(axis: str, value, present: set) -> list[str]:
+    """Components to try for this axis, most specific first -- X_LEQ ascending,
+    then X_GEQ descending, then the looser dtype fallbacks, then "any".
+
+    Bounds come from the components the table actually uses, so adding a bucket
+    is a one-line edit with nothing to declare elsewhere.
     """
     kind = _AXIS_KIND[axis]
     if kind == "num":
 
-        def bound(key):
-            return int(key.rsplit("_", 1)[1])
+        def bound(component):
+            return int(component.rsplit("_", 1)[1])
 
-        leq = sorted((k for k in node if k.startswith(f"{axis}_LEQ_")), key=bound)
+        leq = sorted((c for c in present if c.startswith(f"{axis}_LEQ_")), key=bound)
         geq = sorted(
-            (k for k in node if k.startswith(f"{axis}_GEQ_")), key=bound, reverse=True
+            (c for c in present if c.startswith(f"{axis}_GEQ_")),
+            key=bound,
+            reverse=True,
         )
-        out = [k for k in leq if value <= bound(k)]
-        out += [k for k in geq if value >= bound(k)]
+        out = [c for c in leq if value <= bound(c)]
+        out += [c for c in geq if value >= bound(c)]
         return out + ["any"]
     if kind == "bool":
         return ([axis] if value else []) + ["any"]
     q, k = value
-    return [f"{axis}={q}_{k}", f"{axis}={q}_any", f"{axis}=any_{k}", "any"]
+    return [f"{axis}_{q}_{k}", f"{axis}_{q}_any", f"{axis}_any_{k}", "any"]
 
 
-def _is_leaf(node: dict) -> bool:
-    """A leaf holds scalars; a level holds sub-dicts."""
-    return not any(isinstance(v, dict) for v in node.values())
+def _resolve(table: dict, axes: list, values: dict) -> dict:
+    """Find the entry for this call.
 
-
-def _resolve(node: dict, values: dict) -> dict:
-    """Descend to the leaf for this call.
-
-    Each level's axis is read from its own bucket names, so the tree drives the
-    descent rather than a declared order the file might not follow. Every level
-    carries an "any" -- enforced by the config tests, not re-checked per lookup
-    -- so in a well-formed table the descent always lands and there is no
-    backtracking or failure path.
+    Walks the cross product of each axis's candidates in schema order, so the
+    enumeration order *is* the priority -- leftmost axis most significant, most
+    specific component first. No ranking function, and no failure path in a
+    well-formed table, which always has an "any".
     """
-    while not _is_leaf(node):
-        axis = _axis_of(next(k for k in node if k != "any"))
-        for key in _candidates(axis, values[axis], node):
-            if key in node:
-                node = node[key]
-                break
-        else:
-            # Structure is checked in the config tests, not here -- this guard
-            # exists so a malformed table fails loudly at the offending level
-            # rather than looping forever on a node it cannot descend.
-            raise KeyError(
-                f"no bucket for {axis}={values[axis]!r} and no 'any' fallback "
-                f"among {sorted(node)}"
-            )
-    return dict(node)
+    if not axes:
+        return dict(table)
+    axes = tuple(axes)
+    idx, seen = _index(tuple(table), axes)
+    per_axis = [_candidates(a, values[a], seen[a]) for a in axes]
+    for combo in itertools.product(*per_axis):
+        if combo in idx:
+            return dict(table[idx[combo]])
+    raise KeyError(
+        "no entry for "
+        + " ".join(f"{a}={values[a]!r}" for a in axes)
+        + f"; a table needs an 'any' entry. Keys: {sorted(table)[:8]}"
+    )
 
 
 def compute_tile_params(config: dict, block_size: int) -> dict:
@@ -267,7 +297,7 @@ def _get_unified_attention_config_cached(
         kv_tag,
     )
 
-    config = _resolve(config_dict[op], values)
+    config = _resolve(config_dict[op], axes, values)
     config = compute_tile_params(config, block_size)
     return config, is_tuned
 
@@ -334,18 +364,25 @@ def explain(op: str, params, backend: str = "triton", arch: str | None = None) -
         kv_tag,
     )
 
-    trail: list[str] = []
-    node = config_dict[op]
-    while not _is_leaf(node):
-        axis = _axis_of(next(k for k in node if k != "any"))
-        for key in _candidates(axis, values[axis], node):
-            if key in node:
-                trail.append(f"{'  ' * len(trail)}{axis}={values[axis]!r} -> {key}")
-                node = node[key]
+    axes = tuple(axes)
+    if not axes:
+        leaf, key = dict(config_dict[op]), "(flat config, no axes)"
+    else:
+        table = config_dict[op]
+        idx, seen = _index(tuple(table), axes)
+        per_axis = [_candidates(a, values[a], seen[a]) for a in axes]
+        leaf, key = None, None
+        for combo in itertools.product(*per_axis):
+            if combo in idx:
+                key = idx[combo]
+                leaf = dict(table[key])
                 break
-    leaf = dict(node)
-    lines = [f"{_CONFIG_NAME}[{op}]  {cfg_dir}", f"  axes {list(axes)}", "  path:"]
-    lines += [f"    {step}" for step in trail]
+    lines = [f"{_CONFIG_NAME}[{op}]  {cfg_dir}", f"  axes {list(axes)}"]
+    lines.append("  " + "  ".join(f"{a}={values[a]!r}" for a in axes))
+    if leaf is None:
+        lines.append("  UNRESOLVED")
+        return "\n".join(lines)
+    lines.append(f"  matched: {key}")
     resolved = compute_tile_params(dict(leaf), params.block_size)
     lines.append("  leaf:")
     for key in sorted(leaf):
