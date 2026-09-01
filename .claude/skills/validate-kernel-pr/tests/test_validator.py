@@ -1602,3 +1602,108 @@ class ScannerScopeTests(unittest.TestCase):
         )
         self.assertEqual(0, payload["index_stride_candidates"], payload)
         self.assertEqual(1, payload["host_scope_candidates"], payload)
+
+
+class ProbeReceiptTests(unittest.TestCase):
+    """Unit-level checks on the probe and the evidence checker it feeds."""
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    def run_probe(self, target_source, shape_vars, route_suffix="run_kernel"):
+        """Generate the probe exactly as validate_pr.sh does and run pytest under it."""
+        directory = Path(self.tempdir.name)
+        target = directory / "test_route.py"
+        target.write_text(target_source)
+        receipt = directory / "execution-receipt.json"
+        route = f"test_route:{route_suffix}"
+        probe = directory / "validation_probe_under_test.py"
+        probe.write_text(
+            (SKILL_DIR / "validation_probe.py").read_text()
+            + f"\n_VALIDATION_EXPECTED_ROUTE = {route!r}\n"
+            + f"_VALIDATION_SHAPE_VARS = {shape_vars!r}\n"
+            + f"_VALIDATION_RECEIPT_PATH = {str(receipt)!r}\n"
+        )
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(directory)
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-p",
+                "validation_probe_under_test",
+                str(target),
+                "-q",
+                "-o",
+                f"cache_dir={directory}/pytest-cache",
+            ],
+            cwd=directory,
+            env=environment,
+        )
+        return route, receipt, json.loads(receipt.read_text())
+
+    def test_two_calls_to_one_route_produce_two_shape_rows(self):
+        """Each call is its own row.
+
+        The pending-capture table is keyed by the frame OBJECT. Keying it by id() would
+        be wrong for exactly this case: a freed frame's address is reused, so the second
+        call's frame can present the identity of the first and be treated as already
+        recorded.
+        """
+        _, _, receipt = self.run_probe(
+            "def run_kernel(spec):\n"
+            "    M, N, dtype_str = spec.split(',')\n"
+            "    M = int(M)\n"
+            "    N = int(N)\n"
+            "    assert M > 0\n"
+            "\n"
+            "def test_two_calls():\n"
+            "    run_kernel('7,257,f32')\n"
+            "    run_kernel('8,513,bf16')\n",
+            "M,N,dtype_str",
+        )
+
+        self.assertEqual(["7,257,f32", "8,513,bf16"], receipt["executed_shapes"])
+
+    def test_requested_but_empty_capture_is_declared_in_the_result(self):
+        """An empty `executed_shapes`, from a route that bound none of the requested
+        names, is an absence of evidence. The result has to say so rather than let a
+        consumer read the empty list as "no shapes were needed"."""
+        route, receipt_path, receipt = self.run_probe(
+            "def run_kernel(payload):\n"
+            "    assert payload\n"
+            "\n"
+            "def test_one_call():\n"
+            "    run_kernel({'shape': (7, 257)})\n",
+            "M,N,dtype_str",
+        )
+        self.assertEqual([], receipt["executed_shapes"])
+        # Carried in the receipt so the checker can tell "no shapes were asked for" from
+        # "shapes were asked for and none arrived".
+        self.assertEqual(["M", "N", "dtype_str"], receipt["shape_vars"])
+
+        result = json.loads(
+            run(
+                [
+                    sys.executable,
+                    str(SKILL_DIR / "validate_evidence.py"),
+                    "receipt",
+                    str(receipt_path),
+                    "--expected-route",
+                    route,
+                    "--grid",
+                    "",
+                ]
+            ).stdout
+        )
+
+        self.assertEqual("pass", result["status"])
+        self.assertEqual([], result["executed_shapes"])
+        self.assertEqual(["M", "N", "dtype_str"], result["shape_capture"]["requested"])
+        self.assertEqual(0, result["shape_capture"]["observed"])
+        self.assertIn("makes no claim", result["shape_capture"]["note"])
