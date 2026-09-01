@@ -578,9 +578,11 @@ def _fused_add_rmsnorm_kernel(
 _quant_fused_add_rmsnorm_kernel_repr = make_kernel_repr(
     "_quant_fused_add_rmsnorm_kernel",
     [
+        "DTYPE_MAX",
         "IS_SMOOTH",
         "BLOCK_SIZE",
         "USE_BLOCKED",
+        "NUM_PRGMS",
     ],
 )
 
