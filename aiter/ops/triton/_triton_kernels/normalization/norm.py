@@ -437,6 +437,7 @@ def _quant_layernorm_kernel(
 _quant_fused_add_layernorm_kernel_repr = make_kernel_repr(
     "_quant_fused_add_layernorm_kernel",
     [
+        "DTYPE_MAX",
         "IS_SMOOTH",
         "BLOCK_SIZE",
     ],
