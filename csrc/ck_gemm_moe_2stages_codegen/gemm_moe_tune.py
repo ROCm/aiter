@@ -3472,7 +3472,9 @@ class FmoeTuner(TunerCommon):
         )
 
         for blockM in blockMs:
-            if blockM not in [32, 64, 128] or not use_g1u1:
+            # 16 included: the a16w4/a8w4 stage-1 registries emit t16 names, and the
+            # s1_tile_m != blockM filter below drops the dtypes that do not.
+            if blockM not in [16, 32, 64, 128] or not use_g1u1:
                 continue
             for kname, kparams in flydsl_s1_kernels.items():
                 is_splitk = kparams.get("k_batch", 1) > 1
@@ -3502,7 +3504,9 @@ class FmoeTuner(TunerCommon):
                 # otherwise pick it. Require num_acc_n >= 1 for a16w4.
                 if a_dtype_str == "bf16":
                     _n_waves = max(1, 4 // _kw)
-                    if (kparams["tile_n"] // _n_waves) < 16:
+                    # Match the kernel assert: each N-wave needs a WHOLE number of
+                    # 16-wide groups, so a floor-divide test lets tile_n=96 through.
+                    if kparams["tile_n"] % (16 * _n_waves) != 0:
                         continue
 
                 # (kernel_name, kparams, is_fp4, is_fp8)
@@ -3669,13 +3673,16 @@ class FmoeTuner(TunerCommon):
                 # Skip a16w-mix stage2 candidates the port can't run correctly:
                 #  - _sbm (tile_m<blockM) re-tiles the SORTED [sorted_size, inter]
                 #    stream finer than the moe_sorting padding -> queue fault;
-                #  - tile_n=256 over-allocates LDS at large tile_m (compile failure
-                #    that takes the worker pool down); tile_n=128 covers the shape;
+                #  - the port's LDS request is tile_m*(tile_k*2 + tile_n*4); over the
+                #    160 KiB budget the build fails and takes the worker pool down.
+                #    Only tile_m=128 with tile_n=256 and tile_k=256 exceeds it, so the
+                #    bound is checked directly rather than refusing tile_n=256 outright;
                 #  - tile_k must divide inter_dim (K); tile_k=256 on non-256 inter
                 #    (e.g. 384) is parsed verbatim by the wrapper -> OOB/wrong out.
+                _s2_lds = s2_tile_m * (kparams["tile_k"] * 2 + kparams["tile_n"] * 4)
                 if a_dtype_str == "bf16" and (
                     s2_tile_m != blockM
-                    or kparams["tile_n"] == 256
+                    or _s2_lds > 160 * 1024
                     or inter_dim % kparams["tile_k"] != 0
                 ):
                     continue
