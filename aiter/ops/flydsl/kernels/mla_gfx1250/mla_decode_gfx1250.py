@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""gfx1250 MLA page-size-64 FP8 stage-1 kernel."""
+"""gfx1250 MLA page-size-64 FP8 stage-1 kernel gluon api"""
 
 import math
 
@@ -12,8 +12,7 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from ..gemm_common_gfx1250 import make_lds_copy_ops
-from ..tensor_shim import buf_copy_atom, buf_load_scalar, ptr_buf_tensor, ptr_rsrc
+from ..tensor_shim import buf_copy_atom, ptr_buf_tensor
 from .mla_common import _xor16_f32
 
 BLOCK_THREADS = 128
@@ -34,67 +33,48 @@ QK_NOPE_HEAD_DIM = 512
 QK_ROPE_HEAD_DIM = 64
 QK_HEAD_DIM = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM
 V_HEAD_DIM = QK_NOPE_HEAD_DIM
-Q_HEAD_STRIDE = 768
+Q_HEAD_STRIDE = QK_HEAD_DIM
 QK_ACC_DWORDS = 8
 PACKED_PROB_WORDS = 8
 Q_ROW_STRIDE = NUM_Q_HEADS * Q_HEAD_STRIDE
 Q_GROUP_STRIDE = HEADS_PER_GROUP * Q_HEAD_STRIDE
 Q_WAVE_STRIDE = HEADS_PER_WAVE * Q_HEAD_STRIDE
 PAGE_SIZE = 64
+LOG2_PAGE_SIZE = 6
 KV_PAGE_ELEMENTS = PAGE_SIZE * QK_HEAD_DIM
-KV_NOPE_PAGE_ELEMENTS = PAGE_SIZE * QK_NOPE_HEAD_DIM
+KV_TOKEN_ELEMENTS = QK_HEAD_DIM
 PV_ACC_DWORDS = 8
 LDS_WAVE_BYTES = 0x10000
 LDS_TOTAL_BYTES = NUM_WAVES * LDS_WAVE_BYTES
-Q_LDS_ROW_BYTES = QK_NOPE_HEAD_DIM + 16
+KV_PAD_INTERVAL = 64
+KV_PAD_AMOUNT = 16
+KV_ROW_STRIDE = QK_HEAD_DIM + KV_PAD_AMOUNT * (QK_HEAD_DIM // KV_PAD_INTERVAL)
 KV_NUM_STAGES = 5
-KV_STAGE_BYTES = 0x2800
-KV_ROPE_STAGE_BASE = 0xC800
-KV_ROPE_STAGE_BYTES = 0x800
+KV_STAGE_BYTES = HEADS_PER_WAVE * KV_ROW_STRIDE
 LOG2E = math.log2(math.e)
 _DEFAULT_STREAM = fx.Stream(None)
 
 
-ROPE_ASYNC_PER_PAGE = 2
-
-
-def _dword_iter(ptr):
-    return fx.recast_iter(
-        fx.PointerType.get(fx.Int32.ir_type, ptr.memspace, 4),
-        ptr,
-    )
-
-
-def _rope_row_to_lds(src, src_dword, lds_base, lds_offset):
-    from flydsl._mlir.dialects import llvm as _llvm
-
-    rocdl.sched_barrier(0)
-    gptr = fx.add_offset(src, src_dword).llvm_ptr
-    lds_ptr = fx.recast_iter(fx.Int8, fx.add_offset(lds_base, lds_offset)).llvm_ptr
-    rocdl.sched_barrier(0)
-    _llvm.inline_asm(
-        None, [], "s_wait_alu depctr_va_vdst(0)", "", has_side_effects=True
-    )
-    rocdl.global_load_async_to_lds_b128(gptr, lds_ptr, 0, 0)
-    rocdl.sched_barrier(0)
+def kv_row_offset(data_offset: int) -> int:
+    return data_offset + KV_PAD_AMOUNT * (data_offset // KV_PAD_INTERVAL)
 
 
 @flyc.jit
-def launch_mla_pagesize64_fp8_fp8(
+def launch_mla_decode_pagesize64_fp8_fp8_gluon(
     ptr_r: fx.Pointer,
     ptr_lse: fx.Pointer,
     ptr_q: fx.Pointer,
     ptr_kv: fx.Pointer,
-    kv_indptr: fx.Pointer,
-    kv_page_indices: fx.Pointer,
-    kv_last_page_lens: fx.Pointer,
+    block_tables: fx.Pointer,
+    seq_lens: fx.Pointer,
     qo_indptr: fx.Pointer,
-    num_kv_splits_indptr: fx.Pointer,
     q_scale: fx.Pointer,
     kv_scale: fx.Pointer,
     softmax_scale: fx.Float32,
     batch: fx.Int32,
     num_splits: fx.Int32,
+    block_tables_stride: fx.Int32,
+    num_tokens_per_seq: fx.Int32,
     out_16_nosplit: fx.Constexpr[int],
     stream: fx.Stream = _DEFAULT_STREAM,
 ):
@@ -105,15 +85,15 @@ def launch_mla_pagesize64_fp8_fp8(
         ptr_lse: fx.Pointer,
         ptr_q: fx.Pointer,
         ptr_kv: fx.Pointer,
-        kv_indptr: fx.Pointer,
-        kv_page_indices: fx.Pointer,
-        kv_last_page_lens: fx.Pointer,
+        block_tables: fx.Pointer,
+        seq_lens: fx.Pointer,
         qo_indptr: fx.Pointer,
-        num_kv_splits_indptr: fx.Pointer,
         q_scale: fx.Pointer,
         kv_scale: fx.Pointer,
         softmax_scale: fx.Float32,
         num_splits: fx.Int32,
+        block_tables_stride: fx.Int32,
+        num_tokens_per_seq: fx.Int32,
     ):
         fm_no_inf = (
             fx.FastMathFlags.nnan
@@ -125,31 +105,52 @@ def launch_mla_pagesize64_fp8_fp8(
         )
         rocdl.disable_xdl_arb_stall()
 
-        lds_base = fx.SharedAllocator(static=False).allocate(LDS_TOTAL_BYTES)._ptr
-        lds_base_idx = fx.index_cast(T.index, fx.ptrtoint(lds_base))
-        lds_load_b128, lds_store_b128 = make_lds_copy_ops(128)
+        arena = fx.SharedAllocator(static=False)
+        arena.allocate(LDS_TOTAL_BYTES)
+        lds_base = arena.base_ptr
+        lds_b128_layout = fx.make_layout(4, 1)
+        lds_b128_atom = fx.make_copy_atom(fx.UniversalCopy(128), fx.Int32)
+        lds_i32x4_ty = fx.PointerType.get(
+            elem_ty=fx.Int32.ir_type,
+            address_space=fx.AddressSpace.Shared,
+            alignment=16,
+        )
+
+        def _lds_b128(byte_offset):
+            return fx.Tensor(
+                fx.make_view(
+                    fx.recast_iter(
+                        lds_i32x4_ty,
+                        fx.add_offset(lds_base, byte_offset),
+                    ),
+                    lds_b128_layout,
+                )
+            )
+
+        def lds_load_b128(byte_offset):
+            rmem = fx.make_rmem_tensor(lds_b128_layout, fx.Int32)
+            fx.copy_atom_call(lds_b128_atom, _lds_b128(byte_offset), rmem)
+            return rmem.load()
+
+        def lds_store_b128(byte_offset, data):
+            rmem = fx.make_rmem_tensor(lds_b128_layout, fx.Int32)
+            rmem.store(data)
+            fx.copy_atom_call(lds_b128_atom, rmem, _lds_b128(byte_offset))
 
         r_f32 = ptr_buf_tensor(ptr_r, fx.Float32)
         lse_t = ptr_buf_tensor(ptr_lse, fx.Float32)
         q_t = ptr_buf_tensor(ptr_q, fx.Int32, unit_elems=4)
         q_atom = buf_copy_atom(16)
         q_frag = fx.make_fragment_like(fx.slice(q_t, (0, None)))
-        # Batch metadata and page ids are wave-uniform and feed scalar state --
-        # loop bounds and the TDM page base -- so they take the SMEM path. A
-        # vector load would land them in VGPRs and force a readfirstlane before
-        # the descriptor can use them.
-        kv_indptr_rsrc = ptr_rsrc(kv_indptr)
-        kv_page_indices_rsrc = ptr_rsrc(kv_page_indices)
-        kv_last_page_lens_rsrc = ptr_rsrc(kv_last_page_lens)
-        qo_indptr_rsrc = ptr_rsrc(qo_indptr)
+        bt = ptr_buf_tensor(block_tables)
+        seq_t = ptr_buf_tensor(seq_lens)
+        qo_t = ptr_buf_tensor(qo_indptr)
         q_scale_t = ptr_buf_tensor(q_scale, fx.Float32)
         kv_scale_t = ptr_buf_tensor(kv_scale, fx.Float32)
 
-        def _page_id(index):
-            return fx.Int32(buf_load_scalar(kv_page_indices_rsrc, index, dwords=1))
-
         tid = fx.Int32(fx.thread_idx.x)
-        _, batch_id, z = fx.block_idx
+        token_block, batch_id, z = fx.block_idx
+        token_id = fx.Int32(token_block)
         batch_i32 = fx.Int32(batch_id)
 
         head_group = z & 1
@@ -166,14 +167,19 @@ def launch_mla_pagesize64_fp8_fp8(
         def lds_segment_token_base(slot):
             return (wave_id ^ slot) * HEADS_PER_WAVE
 
-        qo_start = fx.Int32(buf_load_scalar(qo_indptr_rsrc, batch_i32, dwords=1))
-        q_row_base = fx.Int64(qo_start) * Q_ROW_STRIDE
+        zero_b128 = Vec.filled(4, 0, fx.Int32)
+        for chunk in range_constexpr(LDS_TOTAL_BYTES // (BLOCK_THREADS * 16)):
+            lds_store_b128((chunk * BLOCK_THREADS + tid) * 16, zero_b128)
+        rocdl.s_wait_dscnt(0)
+        gpu.barrier()
+
+        q_row = qo_t[batch_i32] + token_id
+        q_row_base = fx.Int64(q_row) * Q_ROW_STRIDE
         q_tile_base = (
             q_row_base
             + fx.Int64(head_group) * Q_GROUP_STRIDE
             + fx.Int64(wave_id) * Q_WAVE_STRIDE
         )
-
         q_unit_base = fx.Int32(q_tile_base >> 4)
         q_head_dwords = head_in_wave * (Q_HEAD_STRIDE // 4)
         q_lane_dwords = q_head_dwords + lane_half * 4
@@ -199,8 +205,6 @@ def launch_mla_pagesize64_fp8_fp8(
             for chunk in range_constexpr(2)
         ]
 
-        rope_row = lane_id >> 2
-        rope_chunk = lane_id & 3
         rocdl.sched_barrier(0)
 
         # ----------------------------------------------
@@ -238,16 +242,18 @@ def launch_mla_pagesize64_fp8_fp8(
         score_scale = softmax_scale * q_scale_t[0] * kv_scale_t[0]
         scale_log2 = score_scale * fx.Float32(LOG2E)
 
-        page_begin = fx.Int32(buf_load_scalar(kv_indptr_rsrc, batch_i32, dwords=1))
-        page_end = fx.Int32(
-            buf_load_scalar(kv_indptr_rsrc, batch_i32 + fx.Int32(1), dwords=1)
-        )
+        def _scalar(value):
+            return fx.Int32(rocdl.readfirstlane(T.i32, value))
 
-        split_page_begin = page_begin + split_id
-        has_pages = split_page_begin < page_end
-        last_page_len = fx.Int32(
-            buf_load_scalar(kv_last_page_lens_rsrc, batch_i32, dwords=1)
+        seq_len = _scalar(
+            seq_t[batch_i32] - num_tokens_per_seq + token_id + fx.Int32(1)
         )
+        page_end = (seq_len + fx.Int32(PAGE_SIZE - 1)) // fx.Int32(PAGE_SIZE)
+
+        split_page_begin = split_id
+        has_pages = split_page_begin < page_end
+        last_page_len = seq_len - (page_end - fx.Int32(1)) * fx.Int32(PAGE_SIZE)
+        block_table_base = _scalar(batch_i32 * block_tables_stride)
 
         token_begin = wave_id * HEADS_PER_WAVE
         negative_inf = fx.Float32(float("-inf"))
@@ -267,75 +273,62 @@ def launch_mla_pagesize64_fp8_fp8(
                 fx.make_view(
                     kv_lds_ptr,
                     fx.make_layout(
-                        (HEADS_PER_WAVE, QK_NOPE_HEAD_DIM),
-                        (Q_LDS_ROW_BYTES, 1),
+                        (HEADS_PER_WAVE, QK_HEAD_DIM),
+                        (KV_ROW_STRIDE, 1),
                     ),
                 )
             )
-            kv_nope_global = fx.Tensor(
+            kv_global = fx.Tensor(
                 fx.make_view(
                     fx.add_offset(
                         ptr_kv,
-                        kv_page_base + fx.Int64(token_begin) * QK_NOPE_HEAD_DIM,
+                        kv_page_base + fx.Int64(token_begin) * KV_TOKEN_ELEMENTS,
                     ),
                     fx.make_layout(
-                        (HEADS_PER_WAVE, QK_NOPE_HEAD_DIM),
-                        (QK_NOPE_HEAD_DIM, 1),
+                        (HEADS_PER_WAVE, QK_HEAD_DIM),
+                        (KV_TOKEN_ELEMENTS, 1),
                     ),
                 )
             )
-            kv_nope_tdm_atom = fx.rocdl.make_tdm_atom(
-                kv_nope_global,
+            kv_tdm_atom = fx.rocdl.make_tdm_atom(
+                kv_global,
                 [HEADS_PER_WAVE, None],
-                strides=[QK_NOPE_HEAD_DIM, None],
+                strides=[KV_TOKEN_ELEMENTS, None],
                 num_warps=1,
-                pad_interval=QK_NOPE_HEAD_DIM,
-                pad_amount=Q_LDS_ROW_BYTES - QK_NOPE_HEAD_DIM,
+                pad_interval=KV_PAD_INTERVAL,
+                pad_amount=KV_PAD_AMOUNT,
             )
             rocdl.sched_barrier(0)
-            fx.copy(kv_nope_tdm_atom, kv_nope_global, kv_lds)
-            kv_dwords = _dword_iter(ptr_kv)
-            for rope_pass in range_constexpr(2):
-                src_row = token_begin + rope_pass * 8 + rope_row
-                src_dword = (
-                    fx.Int64(physical_page) * (KV_PAGE_ELEMENTS // 4)
-                    + KV_NOPE_PAGE_ELEMENTS // 4
-                    + fx.Int64(src_row) * (QK_ROPE_HEAD_DIM // 4)
-                    + fx.Int64(rope_chunk) * 4
-                )
-                _rope_row_to_lds(
-                    kv_dwords,
-                    src_dword,
-                    lds_base,
-                    wave_id * LDS_WAVE_BYTES
-                    + KV_ROPE_STAGE_BASE
-                    + kv_stage * KV_ROPE_STAGE_BYTES
-                    + rope_pass * 512
-                    + lane_id * 16,
-                )
+            fx.copy(kv_tdm_atom, kv_global, kv_lds)
             rocdl.sched_barrier(0)
 
         @flyc.jit
         def wait_kv_page(has_next, has_second_next):
             if has_second_next:
                 tdm_ops.tensor_wait(2)
-                rocdl.s_wait_asynccnt(2 * ROPE_ASYNC_PER_PAGE)
             else:
                 if has_next:
                     tdm_ops.tensor_wait(1)
-                    rocdl.s_wait_asynccnt(1 * ROPE_ASYNC_PER_PAGE)
                 else:
                     tdm_ops.tensor_wait(0)
-                    rocdl.s_wait_asynccnt(0)
 
         second_page = split_page_begin + num_splits
         third_page = split_page_begin + num_splits * 2
         if has_pages:
-            issue_kv_page(_page_id(split_page_begin), fx.Int32(0))
+            issue_kv_page(
+                _scalar(bt[block_table_base + split_page_begin]),
+                fx.Int32(0),
+            )
             if second_page < page_end:
-                issue_kv_page(_page_id(second_page), fx.Int32(1))
+                issue_kv_page(
+                    _scalar(bt[block_table_base + second_page]),
+                    fx.Int32(1),
+                )
             if third_page < page_end:
-                issue_kv_page(_page_id(third_page), fx.Int32(2))
+                issue_kv_page(
+                    _scalar(bt[block_table_base + third_page]),
+                    fx.Int32(2),
+                )
 
         q_nope_fragments = q_nope_chunks
         q_rope_fragment = q_rope_chunks
@@ -391,9 +384,9 @@ def launch_mla_pagesize64_fp8_fp8(
                     v_byte_offset = (
                         lds_segment_byte(token_tile)
                         + pending_stage * KV_STAGE_BYTES
-                        + v_row * Q_LDS_ROW_BYTES
+                        + v_row * KV_ROW_STRIDE
                         + v_col
-                        + dv_tile * 16
+                        + const_expr(kv_row_offset(dv_tile * 16))
                     )
                     v_ptr = fx.add_offset(lds_base, v_byte_offset)
                     v_tr8_chunks.append(
@@ -551,38 +544,41 @@ def launch_mla_pagesize64_fp8_fp8(
                 k_fragment_groups = []
                 for k_fragment in range_constexpr(Q_NOPE_FRAGMENT_COUNT):
                     k_fragment_chunks = []
-                    k_fragment_offset = (
+                    k_row_base = (
                         lds_segment_byte(n_tile)
                         + kv_stage * KV_STAGE_BYTES
-                        + head_in_wave * Q_LDS_ROW_BYTES
-                        + k_fragment * 128
+                        + head_in_wave * KV_ROW_STRIDE
                         + lane_half * 16
                     )
                     for chunk in range_constexpr(4):
                         k_fragment_chunks.append(
                             Vec(
                                 lds_load_b128(
-                                    lds_base_idx,
-                                    k_fragment_offset + chunk * 32,
+                                    k_row_base
+                                    + const_expr(
+                                        kv_row_offset(k_fragment * 128 + chunk * 32)
+                                    ),
                                 )
                             )
                         )
                     k_fragment_groups.append(k_fragment_chunks)
 
                 k_rope_fragment = []
-                k_rope_fragment_offset = (
+                # RoPE now sits in the tail of the same row as its token's NoPE.
+                k_rope_row_base = (
                     lds_segment_byte(n_tile)
-                    + KV_ROPE_STAGE_BASE
-                    + kv_stage * KV_ROPE_STAGE_BYTES
-                    + head_in_wave * QK_ROPE_HEAD_DIM
+                    + kv_stage * KV_STAGE_BYTES
+                    + head_in_wave * KV_ROW_STRIDE
                     + lane_half * 16
                 )
                 for chunk in range_constexpr(2):
                     k_rope_fragment.append(
                         Vec(
                             lds_load_b128(
-                                lds_base_idx,
-                                k_rope_fragment_offset + chunk * 32,
+                                k_rope_row_base
+                                + const_expr(
+                                    kv_row_offset(QK_NOPE_HEAD_DIM + chunk * 32)
+                                ),
                             )
                         )
                     )
@@ -721,7 +717,10 @@ def launch_mla_pagesize64_fp8_fp8(
 
             if future_page < page_end:
                 future_stage = (page_iteration + 3) % KV_NUM_STAGES
-                issue_kv_page(_page_id(future_page), future_stage)
+                issue_kv_page(
+                    _scalar(bt[block_table_base + future_page]),
+                    future_stage,
+                )
             gpu.barrier()
             pending_meta = Vec.from_elements(
                 [kv_stage, page_valid_len, fx.Int32(1)],
@@ -791,8 +790,6 @@ def launch_mla_pagesize64_fp8_fp8(
 
         loop_results = tail_results
         if has_pages:
-            # The peeled page is the only partial one; the page before it is always
-            # full, so its deferred PV never needs the tail mask.
             loop_results = pipeline_step(
                 last_page_pos, loop_results, mask_last=True, pv_masked=None
             )
@@ -829,7 +826,7 @@ def launch_mla_pagesize64_fp8_fp8(
             inv_page_sum = fx.Float32(rocdl.rcp(T.f32, running_sum))
             output_scale = kv_scale_t[0] * inv_page_sum
             output_base = (
-                (fx.Int64(batch_id) * fx.Int64(num_splits) + fx.Int64(split_id))
+                (fx.Int64(q_row) * fx.Int64(num_splits) + fx.Int64(split_id))
                 * NUM_Q_HEADS
                 + fx.Int64(head)
             ) * V_HEAD_DIM
@@ -849,32 +846,25 @@ def launch_mla_pagesize64_fp8_fp8(
                         + (dv_tile * 16 + lane_half * 8) * 2
                     )
                     lds_store_b128(
-                        lds_base_idx,
                         lds_output_offset,
                         packed_bf16,
                     )
                 rocdl.s_wait_dscnt(0)
                 gpu.barrier()
 
-                output_lds_ptr_type = fx.PointerType.get(
-                    elem_ty=fx.BFloat16.ir_type,
-                    address_space=fx.AddressSpace.Shared,
-                    alignment=16,
-                )
-                output_lds_ptr = fx.inttoptr(
-                    output_lds_ptr_type,
-                    fx.ptrtoint(
-                        fx.add_offset(
-                            lds_base,
-                            wave_id * LDS_WAVE_BYTES,
-                        )
+                output_lds_ptr = fx.recast_iter(
+                    fx.PointerType.get(
+                        elem_ty=fx.BFloat16.ir_type,
+                        address_space=fx.AddressSpace.Shared,
+                        alignment=16,
                     ),
+                    fx.add_offset(lds_base, wave_id * LDS_WAVE_BYTES),
                 )
                 output_head_begin = (
                     head_group * HEADS_PER_GROUP + wave_id * HEADS_PER_WAVE
                 )
                 output_tile_base = (
-                    fx.Int64(qo_start) * NUM_Q_HEADS + fx.Int64(output_head_begin)
+                    fx.Int64(q_row) * NUM_Q_HEADS + fx.Int64(output_head_begin)
                 ) * V_HEAD_DIM
                 output_global = fx.Tensor(
                     fx.make_view(
@@ -916,7 +906,7 @@ def launch_mla_pagesize64_fp8_fp8(
 
             if lane_half == fx.Int32(0):
                 lse_offset = (
-                    fx.Int64(batch_id) * fx.Int64(num_splits) + fx.Int64(split_id)
+                    fx.Int64(q_row) * fx.Int64(num_splits) + fx.Int64(split_id)
                 ) * NUM_Q_HEADS + fx.Int64(head)
                 lse = running_max * score_scale + fmath.log(running_sum)
                 lse_t[fx.Int32(lse_offset)] = lse
@@ -926,23 +916,23 @@ def launch_mla_pagesize64_fp8_fp8(
         ptr_lse,
         ptr_q,
         ptr_kv,
-        kv_indptr,
-        kv_page_indices,
-        kv_last_page_lens,
+        block_tables,
+        seq_lens,
         qo_indptr,
-        num_kv_splits_indptr,
         q_scale,
         kv_scale,
         softmax_scale,
         num_splits,
+        block_tables_stride,
+        num_tokens_per_seq,
     ).launch(
-        grid=(1, batch, NUM_HEAD_GROUPS * num_splits),
+        grid=(num_tokens_per_seq, batch, NUM_HEAD_GROUPS * num_splits),
         block=(BLOCK_THREADS, 1, 1),
         stream=stream,
     )
 
 
-launch_mla_pagesize64_fp8_fp8.compile_hints = {
+launch_mla_decode_pagesize64_fp8_fp8_gluon.compile_hints = {
     "llvm_options": {
         "amdgpu-expert-scheduling-mode": True,
         "amdgpu-sched-strategy": "iterative-ilp",

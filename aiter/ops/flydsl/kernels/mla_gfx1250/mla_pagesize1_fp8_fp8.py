@@ -7,19 +7,17 @@ import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm as llvm_dialect
-from flydsl._mlir.dialects import memref as memref_dialect
-from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
-from flydsl.utils.smem_allocator import SmemAllocator
 
-from .. import buffer_ops
-from ..gemm_common_gfx1250 import make_lds_copy_ops
+from ..mega_moe_gfx1250.tdm_gather_shim import (
+    TDMGatherDescriptor,
+    make_tensor_gather_descriptor,
+)
+from ..tensor_shim import buf_load_scalar, ptr_rsrc
 from .mla_common import (
     _dwordx4_iter,
     _instruction_prefetch,
@@ -49,22 +47,40 @@ PV_D_TILES = V_HEAD_DIM // 16
 PV_ACC_DWORDS = 8
 PV_REG_D_TILES = PV_D_TILES
 PV_LOAD_DEPTH = 8
+PAGE_SIZE = 1
 KV_TILE_TOKENS = 64
 KV_GATHER_ROWS_PER_WAVE = KV_TILE_TOKENS // NUM_WAVES
 KV_N_TILES = KV_TILE_TOKENS // 16
 PACKED_PROB_WORDS = KV_TILE_TOKENS // 2 // 4
-KV_NOPE_ROW_STRIDE = QK_NOPE_HEAD_DIM + 16
-KV_NOPE_SLOT_BYTES = KV_TILE_TOKENS * KV_NOPE_ROW_STRIDE
-KV_ROPE_SLOT_OFFSET = KV_NOPE_SLOT_BYTES
-KV_ROPE_SLOT_BYTES = KV_TILE_TOKENS * QK_ROPE_HEAD_DIM
-KV_SLOT_BYTES = KV_NOPE_SLOT_BYTES + KV_ROPE_SLOT_BYTES
 KV_RING_STAGES = 5
-KV_RING_BYTES = KV_RING_STAGES * KV_SLOT_BYTES
+
+KV_SEGMENT_BYTES = 65536
+KV_QUARTER_TOKENS = 16
+KV_QUARTERS = KV_TILE_TOKENS // KV_QUARTER_TOKENS
+KV_PAD_INTERVAL = 64
+KV_PAD_AMOUNT = 16
+KV_ROW_STRIDE = QK_HEAD_DIM + KV_PAD_AMOUNT * (QK_HEAD_DIM // KV_PAD_INTERVAL)
+KV_QUARTER_SLOT_BYTES = KV_QUARTER_TOKENS * KV_ROW_STRIDE
+
+
+def kv_row_offset(data_offset: int) -> int:
+    """Map a byte offset inside a page row to its padded LDS offset.
+
+    Reads are 8 or 16 B and always sit at offsets whose low 6 bits are at most 56,
+    so none of them straddles a pad and this stays a compile-time constant.
+    """
+    return data_offset + KV_PAD_AMOUNT * (data_offset // KV_PAD_INTERVAL)
+
+
+KV_RING_BYTES = (KV_QUARTERS - 1) * KV_SEGMENT_BYTES + (
+    KV_RING_STAGES * KV_QUARTER_SLOT_BYTES
+)
 OUTPUT_LDS_WAVE_BYTES = HEADS_PER_WAVE * V_HEAD_DIM * 4
 OUTPUT_LDS_BYTES = NUM_WAVES * OUTPUT_LDS_WAVE_BYTES
 LDS_TOTAL_BYTES = max(KV_RING_BYTES, OUTPUT_LDS_BYTES)
 INSTRUCTION_PREFETCH_PAGES = 4
 LOG2E = math.log2(math.e)
+_DEFAULT_STREAM = fx.Stream(None)
 
 
 @flyc.jit
@@ -81,7 +97,7 @@ def launch_mla_pagesize1_fp8_fp8(
     num_pages: fx.Int32,
     num_cus: fx.Constexpr[int],
     lds_size: fx.Constexpr[int],
-    stream: fx.Stream = fx.Stream(None),
+    stream: fx.Stream = _DEFAULT_STREAM,
 ):
     """Launch one persistent 256-thread workgroup per CU."""
     assert (
@@ -112,39 +128,46 @@ def launch_mla_pagesize1_fp8_fp8(
         rocdl.disable_xdl_arb_stall()
         _instruction_prefetch(INSTRUCTION_PREFETCH_PAGES)
 
-        smem = SmemAllocator(None, arch="gfx1250", global_sym_name="mla_pagesize1_smem")
-        smem.ptr = LDS_TOTAL_BYTES
-        with ir.InsertionPoint(CompilationContext.get_current().gpu_module_body):
-            smem.finalize()
+        arena = fx.SharedAllocator(static=False)
+        arena.allocate(LDS_TOTAL_BYTES)
+        lds_base = arena.base_ptr
+        lds_tile = fx.Tensor(
+            fx.make_view(
+                fx.recast_iter(fx.Int8, lds_base),
+                fx.make_layout(LDS_TOTAL_BYTES, 1),
+            )
+        )
+        lds_b128_layout = fx.make_layout(4, 1)
+        lds_b128_atom = fx.make_copy_atom(fx.UniversalCopy(128), fx.Int32)
+        lds_i32x4_ty = fx.PointerType.get(
+            elem_ty=fx.Int32.ir_type,
+            address_space=fx.AddressSpace.Shared,
+            alignment=16,
+        )
 
-        lds_memref = smem.get_base()
-        lds_base_idx = fx.Index(
-            memref_dialect.extract_aligned_pointer_as_index(lds_memref)
-        )
-        lds_base = fx.inttoptr(
-            fx.PointerType.get(
-                elem_ty=fx.Int8.ir_type,
-                address_space=fx.AddressSpace.Shared,
-                alignment=8,
-            ),
-            fx.Int32(lds_base_idx),
-        )
-        lds_load_b128, lds_store_b128 = make_lds_copy_ops(128)
+        def _lds_b128(byte_offset):
+            return fx.Tensor(
+                fx.make_view(
+                    fx.recast_iter(lds_i32x4_ty, fx.add_offset(lds_base, byte_offset)),
+                    lds_b128_layout,
+                )
+            )
+
+        def lds_load_b128(byte_offset):
+            rmem = fx.make_rmem_tensor(lds_b128_layout, fx.Int32)
+            fx.copy_atom_call(lds_b128_atom, _lds_b128(byte_offset), rmem)
+            return rmem.load()
+
+        def lds_store_b128(byte_offset, data):
+            rmem = fx.make_rmem_tensor(lds_b128_layout, fx.Int32)
+            rmem.store(data)
+            fx.copy_atom_call(lds_b128_atom, rmem, _lds_b128(byte_offset))
+
         global_load_b128 = make_global_load_b128()
 
         kv_pages = fx.Tensor(fx.make_view(ptr_kv, fx.make_layout(QK_HEAD_DIM, 1)))
-        page_indices_addr = fx.Int64(fx.ptrtoint(kv_page_indices))
-        page_indices_nbytes = fx.Int64(num_pages) * 4
-        page_indices_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            page_indices_addr.ir_value(),
-            num_records_bytes=page_indices_nbytes.ir_value(),
-        )
-        # rocdl.global_prefetch stays on raw LLVM operands: it has no AttrBuilder
-        # for its cache-policy attr (a plain int is rejected), and the fx.inttoptr
-        # wrapper benchmarked slower than llvm.inttoptr for the address.
-        global_ptr_type = ir.Type.parse("!llvm.ptr<1>")
-        prefetch_scope_se = ir.IntegerAttr.get(
-            ir.IntegerType.get_signless(32), tdm_ops.PREFETCH_SCOPE_SE
+        page_indices_rsrc = ptr_rsrc(
+            kv_page_indices, num_records_bytes=fx.Int64(num_pages) * 4
         )
 
         tid = fx.thread_idx.x
@@ -154,6 +177,23 @@ def launch_mla_pagesize1_fp8_fp8(
         head_in_wave = lane_id & (HEADS_PER_WAVE - 1)
         lane_half = lane_id >> 4
         head = wave_id * HEADS_PER_WAVE + head_in_wave
+
+        kv_start_quarter = fx.Int32((wave_id & 1) | ((wave_id & 4) >> 1))
+        kv_wave_segment_base = kv_start_quarter * KV_SEGMENT_BYTES
+
+        def kv_quarter_base(raw_slot, step):
+            """Base of the quarter this wave reads at `step`.
+
+            The XOR only touches ADDR[17:16], and everything added afterwards stays
+            under 64kB, so this is one live base register plus a compile-time XOR
+            immediate rather than a second base per region.
+            """
+            slot_base = kv_wave_segment_base + raw_slot * KV_QUARTER_SLOT_BYTES
+            return slot_base ^ const_expr(step * KV_SEGMENT_BYTES)
+
+        def kv_quarter_token_base(step):
+            """First token index of the quarter this wave reads at `step`."""
+            return (kv_start_quarter ^ const_expr(step)) * KV_QUARTER_TOKENS
 
         def _concat_wmma_operand(chunks):
             v01 = chunks[0].shuffle(chunks[1], list(range(8)))
@@ -188,63 +228,32 @@ def launch_mla_pagesize1_fp8_fp8(
         )
 
         zero_indices = [fx.Int32(0) for _ in range_constexpr(KV_GATHER_ROWS_PER_WAVE)]
-        nope_descriptor_template = tdm_ops.make_tensor_gather_descriptor(
+        # One descriptor covers the whole 576 B page row: nope then rope.
+        kv_descriptor_template = make_tensor_gather_descriptor(
             global_ptr=kv_pages,
-            lds_memref=lds_memref,
+            lds_memref=lds_tile,
             row_indices=zero_indices,
-            row_width=QK_NOPE_HEAD_DIM,
+            row_width=QK_HEAD_DIM,
             tensor_dim0=QK_HEAD_DIM,
             tensor_dim1=num_pages,
             stride=QK_HEAD_DIM,
             elem_bytes=1,
-            pad_interval=QK_NOPE_HEAD_DIM,
-            pad_amount=KV_NOPE_ROW_STRIDE - QK_NOPE_HEAD_DIM,
+            pad_interval=KV_PAD_INTERVAL,
+            pad_amount=KV_PAD_AMOUNT,
             index_size=32,
             gather_tile_dim1=KV_GATHER_ROWS_PER_WAVE,
+            lds_byte_offset=fx.Index(0),
         )
-        rope_descriptor_template = tdm_ops.make_tensor_gather_descriptor(
-            global_ptr=kv_pages,
-            lds_memref=lds_memref,
-            row_indices=zero_indices,
-            row_width=QK_ROPE_HEAD_DIM,
-            tensor_dim0=QK_HEAD_DIM,
-            tensor_dim1=num_pages,
-            stride=QK_HEAD_DIM,
-            elem_bytes=1,
-            index_size=32,
-            gather_tile_dim1=KV_GATHER_ROWS_PER_WAVE,
-            global_byte_offset=fx.Int64(QK_NOPE_HEAD_DIM),
-        )
-
-        def prefetch_page_indices(tile_start):
-            wave_token_start = tile_start + wave_id * KV_GATHER_ROWS_PER_WAVE
-            safe_token = (wave_token_start < num_pages).select(
-                wave_token_start, fx.Int32(0)
-            )
-            byte_addr = page_indices_addr + fx.Int64(safe_token) * 4
-            rocdl.global_prefetch(
-                llvm_dialect.inttoptr(global_ptr_type, byte_addr.ir_value()),
-                cache_policy=prefetch_scope_se,
-            )
 
         def prepare_kv_tile(tile_start, kv_end, raw_slot):
-            slot_byte_offset = raw_slot * KV_SLOT_BYTES
+            wave_quarter_base = (
+                wave_id >> 1
+            ) * KV_SEGMENT_BYTES + raw_slot * KV_QUARTER_SLOT_BYTES
+            wave_local_row = (wave_id & 1) * KV_GATHER_ROWS_PER_WAVE
             wave_token_start = tile_start + wave_id * KV_GATHER_ROWS_PER_WAVE
-            page_indices_lo = Vec(
-                buffer_ops.buffer_load(
-                    page_indices_rsrc,
-                    wave_token_start,
-                    vec_width=4,
-                    is_scalar=True,
-                )
-            )
+            page_indices_lo = Vec(buf_load_scalar(page_indices_rsrc, wave_token_start))
             page_indices_hi = Vec(
-                buffer_ops.buffer_load(
-                    page_indices_rsrc,
-                    wave_token_start + 4,
-                    vec_width=4,
-                    is_scalar=True,
-                )
+                buf_load_scalar(page_indices_rsrc, wave_token_start + 4)
             )
             rocdl.sched_barrier(0)
             row_indices = []
@@ -257,130 +266,92 @@ def launch_mla_pagesize1_fp8_fp8(
                     physical_page = page_indices_hi[i - 4]
                 row_indices.append(is_valid.select(physical_page, num_pages))
 
-            nope_descriptor = tdm_ops.make_tensor_gather_descriptor(
+            kv_descriptor = make_tensor_gather_descriptor(
                 global_ptr=kv_pages,
-                lds_memref=lds_memref,
+                lds_memref=lds_tile,
                 row_indices=row_indices,
-                row_width=QK_NOPE_HEAD_DIM,
+                row_width=QK_HEAD_DIM,
                 tensor_dim0=QK_HEAD_DIM,
                 tensor_dim1=num_pages,
                 stride=QK_HEAD_DIM,
                 elem_bytes=1,
-                pad_interval=QK_NOPE_HEAD_DIM,
-                pad_amount=KV_NOPE_ROW_STRIDE - QK_NOPE_HEAD_DIM,
+                pad_interval=KV_PAD_INTERVAL,
+                pad_amount=KV_PAD_AMOUNT,
                 index_size=32,
                 gather_tile_dim1=KV_GATHER_ROWS_PER_WAVE,
                 lds_byte_offset=fx.Index(
-                    slot_byte_offset
-                    + wave_id * (KV_GATHER_ROWS_PER_WAVE * KV_NOPE_ROW_STRIDE)
+                    wave_quarter_base + wave_local_row * KV_ROW_STRIDE
                 ),
             )
-            rope_descriptor = tdm_ops.make_tensor_gather_descriptor(
-                global_ptr=kv_pages,
-                lds_memref=lds_memref,
-                row_indices=row_indices,
-                row_width=QK_ROPE_HEAD_DIM,
-                tensor_dim0=QK_HEAD_DIM,
-                tensor_dim1=num_pages,
-                stride=QK_HEAD_DIM,
-                elem_bytes=1,
-                index_size=32,
-                gather_tile_dim1=KV_GATHER_ROWS_PER_WAVE,
-                lds_byte_offset=fx.Index(
-                    slot_byte_offset
-                    + KV_ROPE_SLOT_OFFSET
-                    + wave_id * (KV_GATHER_ROWS_PER_WAVE * QK_ROPE_HEAD_DIM)
-                ),
-                global_byte_offset=fx.Int64(QK_NOPE_HEAD_DIM),
+            return TDMGatherDescriptor(
+                dgroup0=kv_descriptor.dgroup0,
+                dgroup1=kv_descriptor_template.dgroup1,
+                dgroup2=kv_descriptor.dgroup2,
+                dgroup3=kv_descriptor.dgroup3,
             )
-            nope_descriptor = tdm_ops.TDMGatherDescriptor(
-                dgroup0=nope_descriptor.dgroup0,
-                dgroup1=nope_descriptor_template.dgroup1,
-                dgroup2=nope_descriptor.dgroup2,
-                dgroup3=nope_descriptor.dgroup3,
-            )
-            rope_descriptor = tdm_ops.TDMGatherDescriptor(
-                dgroup0=rope_descriptor.dgroup0,
-                dgroup1=rope_descriptor_template.dgroup1,
-                dgroup2=rope_descriptor.dgroup2,
-                dgroup3=rope_descriptor.dgroup3,
-            )
-            return nope_descriptor, rope_descriptor
 
-        def issue_prepared_kv_tile(nope_descriptor, rope_descriptor):
+        def issue_prepared_kv_tile(kv_descriptor):
             rocdl.sched_barrier(0)
-            tdm_ops.tensor_load_gather(nope_descriptor)
-            tdm_ops.tensor_load_gather(rope_descriptor)
+            tdm_ops.tensor_load_gather(kv_descriptor)
             rocdl.sched_barrier(0)
 
         @flyc.jit
         def issue_kv_tile(tile_start, kv_end, raw_slot):
-            nope_descriptor, rope_descriptor = prepare_kv_tile(
-                tile_start, kv_end, raw_slot
-            )
-            issue_prepared_kv_tile(nope_descriptor, rope_descriptor)
+            issue_prepared_kv_tile(prepare_kv_tile(tile_start, kv_end, raw_slot))
 
         @flyc.jit
         def wait_kv_tile(has_next, has_second_next):
             if has_second_next:
-                tdm_ops.tensor_wait(4)
+                tdm_ops.tensor_wait(2)
             else:
                 if has_next:
-                    tdm_ops.tensor_wait(2)
+                    tdm_ops.tensor_wait(1)
                 else:
                     tdm_ops.tensor_wait(0)
 
         def load_k_tile(raw_slot, n_tile):
-            slot_byte_offset = raw_slot * KV_SLOT_BYTES
-            k_nope_row = n_tile * 16 + head_in_wave
-            nope_row_offset = (
-                slot_byte_offset + k_nope_row * KV_NOPE_ROW_STRIDE + lane_half * 16
-            )
+            quarter_base = kv_quarter_base(raw_slot, n_tile)
+            row_base = quarter_base + head_in_wave * KV_ROW_STRIDE + lane_half * 16
             nope_groups = []
             for fragment in range_constexpr(Q_NOPE_FRAGMENT_COUNT):
                 chunks = []
-                fragment_offset = nope_row_offset + fragment * 128
                 for chunk in range_constexpr(4):
                     chunks.append(
                         Vec(
                             lds_load_b128(
-                                lds_base_idx,
-                                fragment_offset + chunk * 32,
+                                row_base
+                                + const_expr(
+                                    kv_row_offset(fragment * 128 + chunk * 32)
+                                ),
                             )
                         )
                     )
                 nope_groups.append(chunks)
 
-            rope_row_offset = (
-                slot_byte_offset
-                + KV_ROPE_SLOT_OFFSET
-                + k_nope_row * QK_ROPE_HEAD_DIM
-                + lane_half * 16
-            )
             rope_chunks = []
             for chunk in range_constexpr(2):
                 rope_chunks.append(
                     Vec(
                         lds_load_b128(
-                            lds_base_idx,
-                            rope_row_offset + chunk * 32,
+                            row_base
+                            + const_expr(kv_row_offset(QK_NOPE_HEAD_DIM + chunk * 32)),
                         )
                     )
                 )
             return nope_groups, rope_chunks
 
         def load_v_operand(raw_slot, d_tile):
-            slot_byte_offset = raw_slot * KV_SLOT_BYTES
             v_row = (lane_id >> 3) * 4 + (lane_id & 3)
             v_col = ((lane_id & 7) >> 2) * 8
             chunks = []
             for token_tile in range_constexpr(KV_N_TILES):
+                # v_col is at most 8 and d_tile * 16 is 16-aligned, so the pair never
+                # crosses a 64 B pad boundary and the remap stays compile-time.
                 v_byte_offset = (
-                    slot_byte_offset
-                    + token_tile * 16 * KV_NOPE_ROW_STRIDE
-                    + v_row * KV_NOPE_ROW_STRIDE
+                    kv_quarter_base(raw_slot, token_tile)
+                    + v_row * KV_ROW_STRIDE
+                    + const_expr(kv_row_offset(d_tile * 16))
                     + v_col
-                    + d_tile * 16
                 )
                 v_ptr = fx.add_offset(lds_base, v_byte_offset)
                 chunks.append(
@@ -462,10 +433,7 @@ def launch_mla_pagesize1_fp8_fp8(
             has_producer = producer_tile_start < kv_end
             safe_producer_start = has_producer.select(producer_tile_start, tile_start)
             rocdl.s_barrier_signal(-1)
-            # The backend schedules prepare_kv_tile's index loads after the PV block,
-            # so warm their cache line here and let the PV work cover the miss.
-            prefetch_page_indices(safe_producer_start)
-            producer_nope_descriptor, producer_rope_descriptor = prepare_kv_tile(
+            producer_descriptor = prepare_kv_tile(
                 safe_producer_start,
                 kv_end,
                 producer_slot,
@@ -480,10 +448,7 @@ def launch_mla_pagesize1_fp8_fp8(
             rocdl.s_barrier_wait(-1)
 
             if has_producer:
-                issue_prepared_kv_tile(
-                    producer_nope_descriptor,
-                    producer_rope_descriptor,
-                )
+                issue_prepared_kv_tile(producer_descriptor)
 
             rocdl.sched_barrier(0)
             qk_accs = []
@@ -537,17 +502,23 @@ def launch_mla_pagesize1_fp8_fp8(
                         rocdl.sched_dsrd(QK_DS_READ_SCHEDULE[mma_slot])
             rocdl.sched_barrier(0)
 
+            valid_count = fx.Int32(KV_TILE_TOKENS)
             if const_expr(mask_tail):
                 valid_count = kv_end - tile_start
                 valid_count = (valid_count > fx.Int32(KV_TILE_TOKENS)).select(
                     fx.Int32(KV_TILE_TOKENS), valid_count
                 )
-                negative_inf = fx.Float32(float("-inf"))
+            negative_inf = fx.Float32(float("-inf"))
             masked_scores = []
             for n_tile in range_constexpr(KV_N_TILES):
                 tile_scores = []
                 for i in range_constexpr(QK_ACC_DWORDS):
-                    local_token = n_tile * 16 + lane_half * QK_ACC_DWORDS + i
+                    # The quarter walk is a permutation, so the token index has to
+                    # follow it. Only contexts that are not a multiple of the tile
+                    # size expose a mistake here.
+                    local_token = (
+                        kv_quarter_token_base(n_tile) + lane_half * QK_ACC_DWORDS + i
+                    )
                     score = qk_accs[n_tile][i] * softmax_scale
                     if const_expr(mask_tail):
                         valid_token = local_token < valid_count
@@ -643,24 +614,21 @@ def launch_mla_pagesize1_fp8_fp8(
         work_start = fx.Int32(rocdl.readfirstlane(T.i32, work_indptr[worker_idx]))
         work_end = fx.Int32(rocdl.readfirstlane(T.i32, work_indptr[worker_idx + 1]))
 
+        def work_info_scalar(work_base, field):
+            return fx.Int32(
+                rocdl.readfirstlane(T.i32, work_info_set[work_base + fx.Int64(field)])
+            )
+
         for work_idx in range(
             work_start,
             work_end,
             fx.Int32(1),
         ):
             work_base = fx.Int64(work_idx) * fx.Int64(8)
-
-            def work_info_scalar(field):
-                return fx.Int32(
-                    rocdl.readfirstlane(
-                        T.i32, work_info_set[work_base + fx.Int64(field)]
-                    )
-                )
-
-            partial_qo_loc = work_info_scalar(1)
-            qo_start = work_info_scalar(2)
-            kv_start = work_info_scalar(4)
-            kv_end = work_info_scalar(5)
+            partial_qo_loc = work_info_scalar(work_base, 1)
+            qo_start = work_info_scalar(work_base, 2)
+            kv_start = work_info_scalar(work_base, 4)
+            kv_end = work_info_scalar(work_base, 5)
 
             q_tile_base = fx.Int64(qo_start) * Q_ROW_STRIDE + fx.Int64(wave_id) * (
                 HEADS_PER_WAVE * Q_HEAD_STRIDE
@@ -789,21 +757,19 @@ def launch_mla_pagesize1_fp8_fp8(
                         + (d_tile * 16 + lane_half * PV_ACC_DWORDS + half * 4) * 4
                     )
                     lds_store_b128(
-                        lds_base_idx,
                         lds_output_offset,
                         output_dwords,
                     )
             rocdl.s_wait_dscnt(0)
             gpu.barrier()
 
-            output_lds_ptr_type = fx.PointerType.get(
-                elem_ty=fx.Float32.ir_type,
-                address_space=fx.AddressSpace.Shared,
-                alignment=16,
-            )
-            output_lds_ptr = fx.inttoptr(
-                output_lds_ptr_type,
-                fx.ptrtoint(lds_base),
+            output_lds_ptr = fx.recast_iter(
+                fx.PointerType.get(
+                    elem_ty=fx.Float32.ir_type,
+                    address_space=fx.AddressSpace.Shared,
+                    alignment=16,
+                ),
+                lds_base,
             )
             output_tile_base = fx.Int64(partial_qo_loc) * (NUM_Q_HEADS * V_HEAD_DIM)
             output_global = fx.Tensor(
