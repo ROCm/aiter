@@ -87,6 +87,7 @@ def _ce_fused_loss_grad_kernel(
     ignore_idx,
     n_cols,
     n_rows,
+    n_valid_ptr,
     reduce_loss: tl.constexpr,
     label_smoothing: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -99,8 +100,13 @@ def _ce_fused_loss_grad_kernel(
     - Writes the softmax-based gradient into *X* in-place.
     - Stores the scalar loss for the row.
 
-    Supports ``label_smoothing`` (``0`` = standard CE) and
-    ``reduce_loss`` (``True`` = average over non-ignored rows).
+    ``reduce_loss=True`` normalizes the *gradient* by ``n_valid`` (the number
+    of non-ignored rows, read from ``n_valid_ptr``) so that it matches a
+    mean-over-non-ignored reduction; ``n_rows`` is retained only for the
+    all-gather stride offset. ``label_smoothing`` (``0`` = standard CE) is
+    only correct for ``world_size == 1``: ``scaled_x_sum`` is collected from
+    the local vocab shard alone, so smoothing under tensor parallelism is
+    unsupported.
     """
     pid = tl.program_id(0).to(tl.int64)
     X_ptr += pid * X_stride
@@ -131,6 +137,10 @@ def _ce_fused_loss_grad_kernel(
         m = tl.maximum(m, m_new)
         ori_Xy = tl.maximum(ori_Xy, Xy_new)
 
+    n_valid: tl.float32 = 1.0
+    if reduce_loss:
+        n_valid = tl.load(n_valid_ptr).to(tl.float32)
+
     eps = label_smoothing / (n_cols * world_size)
     scaled_x_sum: tl.float32 = 0.0
 
@@ -142,7 +152,7 @@ def _ce_fused_loss_grad_kernel(
         if label_smoothing > 0:
             scaled_x_sum += tl.sum(tl.where(offs < n_cols, -eps * blk, 0.0))
         if reduce_loss:
-            blk = (tl.exp(blk - m) / d - eps) / n_rows
+            blk = (tl.exp(blk - m) / d - eps) / n_valid
         else:
             blk = tl.exp(blk - m) / d - eps
         tl.store(X_ptr + offs, blk.to(grad_dtype), mask=offs < n_cols)
@@ -159,7 +169,7 @@ def _ce_fused_loss_grad_kernel(
     if y >= vocab_start and y < vocab_end:
         Xy_grad = tl.load(X_ptr + y - vocab_start)
         if reduce_loss:
-            Xy_grad += -(1 - label_smoothing) / n_rows
+            Xy_grad += -(1 - label_smoothing) / n_valid
         else:
             Xy_grad += -(1 - label_smoothing)
         tl.store(X_ptr + y - vocab_start, Xy_grad)

@@ -45,10 +45,15 @@ def cross_entropy_forward(
     Args:
         _input:  Logits shard for this TP rank — ``[B, SQ, V_local]``.
         target:  Label indices — ``[B, SQ]``  (global vocab ids).
-        label_smoothing:  Label-smoothing factor (0 = standard CE).
-        reduce_loss:  If ``True``, return scalar loss averaged over rows.
+        label_smoothing:  Label-smoothing factor (0 = standard CE). Only
+            correct for single-GPU (``dist_group is None``); under tensor
+            parallelism the smoothing term uses only the local vocab shard.
+        reduce_loss:  If ``True``, return a scalar loss and gradient averaged
+            over the *non-ignored* rows (matching ``F.cross_entropy`` mean),
+            not over all ``B*SQ`` rows.
         dist_group:  TP process group (``None`` for single-GPU).
-        ignore_idx:  Target value to ignore (default ``-100``).
+        ignore_idx:  Target value to ignore (required; callers typically
+            pass ``-100``).
 
     Returns:
         ``(loss, grad_input)`` where *grad_input* has the same shape as
@@ -63,12 +68,23 @@ def cross_entropy_forward(
     loss_1d = torch.zeros(n_rows, dtype=torch.float32, device=_input.device)
     m_d_Xy = torch.zeros(n_rows * 3, dtype=torch.float32, device=_input.device)
 
-    if _input.stride(-1) != 1:
+    # Full contiguity, not just stride(-1) == 1: both kernels flatten B*SQ with
+    # a single row stride, so a tensor sliced along SQ (inner stride still 1 but
+    # batch stride != SQ*stride(-2)) would make later programs read wrong rows.
+    if not _input.is_contiguous():
         _input = _input.contiguous()
-    if target.stride(-1) != 1:
+    if not target.is_contiguous():
         target = target.contiguous()
 
     rank = 0 if dist_group is None else dist.get_rank(dist_group)
+
+    # For reduce_loss, both the loss and the in-kernel gradient normalization
+    # divide by the count of non-ignored rows (matching F.cross_entropy mean),
+    # not by n_rows. Kept on-device as a 0-d tensor to avoid a CPU sync.
+    if reduce_loss:
+        n_valid = (target != ignore_idx).sum()
+    else:
+        n_valid = torch.ones((), dtype=torch.int64, device=_input.device)
 
     _ce_local_softmax_stats_kernel[(n_rows,)](
         _input,
@@ -106,13 +122,14 @@ def cross_entropy_forward(
         ignore_idx,
         V,
         n_rows,
+        n_valid,
         reduce_loss=reduce_loss,
         label_smoothing=label_smoothing,
         BLOCK_SIZE=BLOCK_SIZE,
         num_warps=NUM_WARPS,
     )
 
-    loss = loss_1d.reshape(B, SQ) if not reduce_loss else (loss_1d.sum() / n_rows)
+    loss = loss_1d.reshape(B, SQ) if not reduce_loss else (loss_1d.sum() / n_valid)
     return loss, _input
 
 
@@ -129,11 +146,16 @@ def cross_entropy_forward_chunked(
 
     Splits the row dimension (B*SQ) into chunks of ``chunk_rows`` and
     processes each independently: online_softmax → allgather → ce_kernel.
-    Peak activation memory is proportional to ``chunk_rows * V_local``
-    rather than ``B*SQ * V_local``.
+
+    This does *not* shrink the ``B*SQ*V_local`` logits activation (the caller
+    still materializes it in full and it is updated in-place). What it bounds
+    is the per-step online-softmax scratch and, under tensor parallelism, the
+    all-gather/communication buffer, which drop from ``B*SQ * 3`` to
+    ``chunk_rows * 3`` floats per rank — at the cost of repeated launches and
+    collectives.
 
     The gradient is written in-place into ``_input`` exactly as in the
-    non-chunked path.  The caller must ensure ``_input`` is contiguous.
+    non-chunked path.
 
     Args:
         _input:    Logit shard ``[B, SQ, V_local]`` — modified in-place.
@@ -144,17 +166,37 @@ def cross_entropy_forward_chunked(
     Returns:
         ``(loss, _input)`` where *loss* is ``[B, SQ]`` or a scalar.
     """
+    if chunk_rows < 1:
+        raise ValueError(f"chunk_rows must be >= 1, got {chunk_rows}")
+
+    # Enforce the contiguity contract before flattening: reshape() on a
+    # non-contiguous tensor would return a *copy*, the kernels would write the
+    # gradient into that copy, and we would return the untouched original.
+    if not _input.is_contiguous():
+        _input = _input.contiguous()
+    if not target.is_contiguous():
+        target = target.contiguous()
+
     B, SQ, V = _input.shape
     n_rows = B * SQ
 
     # Flatten to 2-D views so we can slice by row without copying.
-    input_2d = _input.reshape(n_rows, V)  # view, no alloc
-    target_1d = target.reshape(n_rows)  # view, no alloc
-    loss_1d = torch.empty(n_rows, dtype=torch.float32, device=_input.device)
+    input_2d = _input.view(n_rows, V)  # view, no alloc
+    target_1d = target.view(n_rows)  # view, no alloc
+    # zeros (not empty): ignored rows never store a loss, so they must default
+    # to 0 to match the non-chunked path and F.cross_entropy(reduction="none").
+    loss_1d = torch.zeros(n_rows, dtype=torch.float32, device=_input.device)
 
     BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(V))
     world_size = 1 if dist_group is None else dist.get_world_size(dist_group)
     rank = 0 if dist_group is None else dist.get_rank(dist_group)
+
+    # Global non-ignored row count — every chunk normalizes its gradient by the
+    # same denominator so the result matches the non-chunked reduce path.
+    if reduce_loss:
+        n_valid = (target_1d != ignore_idx).sum()
+    else:
+        n_valid = torch.ones((), dtype=torch.int64, device=_input.device)
 
     # Allocate scratch buffers once at max chunk size to avoid per-chunk alloc.
     m_d_Xy = torch.empty(chunk_rows * 3, dtype=torch.float32, device=_input.device)
@@ -207,7 +249,8 @@ def cross_entropy_forward_chunked(
             ignore_idx,
             V,
             rows_this,
-            reduce_loss=False,  # accumulate manually after loop
+            n_valid,  # global denominator, shared across chunks
+            reduce_loss=reduce_loss,
             label_smoothing=label_smoothing,
             BLOCK_SIZE=BLOCK_SIZE,
             num_warps=NUM_WARPS,
@@ -216,7 +259,7 @@ def cross_entropy_forward_chunked(
         row += rows_this
 
     if reduce_loss:
-        loss = loss_1d.sum() / n_rows
+        loss = loss_1d.sum() / n_valid
     else:
         loss = loss_1d.reshape(B, SQ)
     return loss, _input
@@ -247,6 +290,18 @@ def cross_entropy_backward(
 
     B, SQ, V = _input.shape
     n_rows = B * SQ
+
+    # The scale kernel reads grad_output as either a scalar or one value per
+    # row with unit stride. Reject any other size (would read OOB) and make it
+    # contiguous so a transposed per-row tensor can't scale rows with wrong
+    # values.
+    if grad_output.numel() not in (1, n_rows):
+        raise ValueError(
+            f"grad_output must be scalar or one value per row (n_rows={n_rows}), "
+            f"got numel={grad_output.numel()}"
+        )
+    grad_output = grad_output.contiguous()
+
     BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(V))
     _ce_grad_scale_kernel[(n_rows,)](
         _input,
