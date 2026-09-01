@@ -702,9 +702,7 @@ def run_minimax_tp4_focused_case(
             )
 
 
-def run_minimax_tp4_fp8_index_q_case(
-    *, kv_cache_dtype: str, skip_index_branch: bool
-):
+def run_minimax_tp4_fp8_index_q_case(*, kv_cache_dtype: str, skip_index_branch: bool):
     """MiniMax TP4: unit-scale e4m3 index_q + index cache (4787 q_idx contract)."""
     fp8_dtype = fp8_cache_dtype()
     assert fp8_dtype is not None
@@ -745,7 +743,9 @@ def run_minimax_tp4_fp8_index_q_case(
         if use_static_fp8
         else None
     )
-    tag = f"minimax tp4 fp8-iq {kv_cache_dtype} {'skip' if skip_index_branch else 'full'}"
+    tag = (
+        f"minimax tp4 fp8-iq {kv_cache_dtype} {'skip' if skip_index_branch else 'full'}"
+    )
 
     aiter.fused_qknorm_idxrqknorm(
         case["qkv"],
@@ -778,7 +778,9 @@ def run_minimax_tp4_fp8_index_q_case(
 
     check_close(q_out, refs["q"], msg=f"{tag} q", rtol=1e-2, atol=1e-2)
     if skip_index_branch:
-        assert torch.equal(index_q_out.view(torch.uint8), index_q_before.view(torch.uint8))
+        assert torch.equal(
+            index_q_out.view(torch.uint8), index_q_before.view(torch.uint8)
+        )
         assert torch.equal(
             index_cache.view(torch.uint8), index_cache_before.view(torch.uint8)
         )
