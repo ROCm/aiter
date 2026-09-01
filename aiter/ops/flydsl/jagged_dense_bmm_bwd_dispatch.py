@@ -11,7 +11,9 @@ host-side glue the backward needs:
       which bakes D and the schedule knobs in as closure constants — so MULTIPLE
       D coexist in one process (no single-D-per-process constraint, no
       module-global snapshot, and no cache-collision hazard on the knobs);
-    - fp32 split-reduction scratch allocation (cached per (n_groups, D, device));
+    - fp32 split-reduction scratch allocation (cached per
+      ``(n_groups, K, N, split, device.type, device.index,
+      *_stream_cache_key(stream))``);
     - the ``BLOCK_M``-padded ``dJagged`` output (so a partial tail-tile store
       stays in-bounds) and the ``[:L]`` view returned to the caller;
     - the dense reshape to the backward's **plain ``(n_groups*K, N)`` K-major**
@@ -209,8 +211,8 @@ def resolve_config(
     return cfg
 
 
-# fp32 split-reduction scratch, cached per (n_groups, D, split, device, stream).
-# The partials passes fully overwrite every slot they later reduce (empty groups
+# fp32 split-reduction scratch; see _get_scratch for the cache key and sizes.
+# Partials passes fully overwrite every slot they later reduce (empty groups
 # included), so reuse across calls on the same stream is safe without re-zeroing.
 # Stream is part of the key because concurrent calls on different streams must not
 # share partial buffers. The cache is unbounded but intentionally so: the key space
@@ -237,6 +239,9 @@ def _get_scratch(
     stream: torch.cuda.Stream,
 ):
     """Cached fp32 (dense_partials, bias_partials) for the split reduction.
+
+    Cache key: ``(n_groups, K, N, split, device.type, device.index,
+    *_stream_cache_key(stream))``.
 
     SPLIT >= 2 (e.g. D=256): real (n_groups*SPLIT*K, N) / (n_groups*SPLIT, N)
     scratch the reduce passes sum. SPLIT == 1 (e.g. D=512): the partials pass
