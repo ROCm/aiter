@@ -1232,24 +1232,6 @@ class ValidateKernelPrTests(unittest.TestCase):
         )
 
 
-class IndexScannerTests(unittest.TestCase):
-    def test_json_count_is_deduplicated(self):
-        with tempfile.TemporaryDirectory() as directory:
-            diff = Path(directory) / "candidate.diff"
-            diff.write_text(
-                "+++ b/kernel.py\n"
-                "+out = block_id * row_stride\n"
-                "+out = block_id * row_stride\n"
-                "+safe = block_id.to(tl.int64) * row_stride\n"
-            )
-            result = run([str(SCANNER), "--diff", str(diff), "--json"])
-            payload = json.loads(result.stdout)
-
-        self.assertEqual(1, payload["index_stride_candidates"])
-        self.assertEqual(0, payload["untyped_stride_parameters"])
-        self.assertEqual(1, payload["total_candidates"])
-
-
 class GpuPickerTests(unittest.TestCase):
     def test_shipped_picker_returns_translated_hip_index(self):
         fixture = ValidatorFixture()
@@ -1343,3 +1325,280 @@ class ReviewSkillContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def new_file_diff(path, source):
+    """A diff that CREATES `path` with `source`.
+
+    Every line is an addition and the post image is fully contained in the diff, so the
+    scanner needs neither --source-root nor a git object store to recover it. Line
+    numbers are 1-based, matching the post image, which is what the scanner filters
+    candidates on.
+    """
+    lines = source.splitlines()
+    return (
+        f"diff --git a/{path} b/{path}\n"
+        "new file mode 100644\n"
+        "index 0000000..1111111\n"
+        "--- /dev/null\n"
+        f"+++ b/{path}\n"
+        f"@@ -0,0 +1,{len(lines)} @@\n"
+    ) + "".join(f"+{line}\n" for line in lines)
+
+
+class IndexScannerTests(unittest.TestCase):
+    def scan(self, diff_text, directory=None):
+        with tempfile.TemporaryDirectory() as scratch:
+            diff = Path(scratch) / "candidate.diff"
+            diff.write_text(diff_text)
+            result = run(
+                [str(SCANNER), "--diff", str(diff), "--json"],
+                cwd=directory or scratch,
+            )
+            payload = json.loads(result.stdout)
+        return payload
+
+    def scan_source(self, source, path="kernel.py"):
+        return self.scan(new_file_diff(path, source))
+
+    def test_broadcast_subscript_operand_is_found(self):
+        r"""The regression the reviewer's blocker was really about.
+
+        `(offs_token // top_k)[:, None] * stride_gm` is the standard Triton pointer
+        idiom and the exact shape of the ROCm/aiter#4978 overflow. The old regex operand
+        class was `[\w\.\[\]]+`, which spans neither the comma nor the space inside
+        `[:, None]`, so it matched nothing on either of these two lines and the scanner
+        reported the PR clean. Structurally both are candidates: a multiply feeding an
+        addition chain, with a plain (non-constexpr) kernel parameter as an operand.
+        """
+        payload = self.scan_source(
+            "import triton\n"
+            "import triton.language as tl\n"
+            "\n"
+            "@triton.jit\n"
+            "def moe_wgrad_kernel(a_ptr, offs_token, top_k, stride_gm, stride_gn,\n"
+            "                     BLOCK_N: tl.constexpr):\n"
+            "    offs_n = tl.arange(0, BLOCK_N)\n"
+            "    a_ptrs = (\n"
+            "        a_ptr\n"
+            "        + (offs_token // top_k)[:, None] * stride_gm\n"
+            "        + offs_n[None, :] * stride_gn\n"
+            "    )\n"
+            "    return a_ptrs\n"
+        )
+
+        expressions = sorted(row["expression"] for row in payload["candidates"])
+        self.assertEqual(
+            [
+                "(offs_token // top_k)[:, None] * stride_gm",
+                "offs_n[None, :] * stride_gn",
+            ],
+            expressions,
+        )
+        self.assertEqual(2, payload["index_stride_candidates"])
+        # Each row names the runtime parameters that made it a candidate, so the
+        # reviewer can judge production scale without re-deriving provenance.
+        provenance = {
+            row["expression"]: row["runtime_params"] for row in payload["candidates"]
+        }
+        self.assertEqual(
+            ["offs_token", "stride_gm", "top_k"],
+            provenance["(offs_token // top_k)[:, None] * stride_gm"],
+        )
+        # The unannotated-parameter list is now scoped to parameters this function
+        # actually multiplies in pointer arithmetic -- `a_ptr` is a parameter too and is
+        # correctly absent -- rather than to every parameter whose name looked stride-
+        # ish.
+        self.assertEqual(
+            {"offs_token", "stride_gm", "stride_gn", "top_k"},
+            {row["name"] for row in payload["parameters"]},
+        )
+
+    def test_widening_hoisted_to_an_earlier_line_suppresses_the_candidate(self):
+        """This is the shape of the FIX (aiter#5132), not the defect.
+
+        The widening is applied on its own statement and carried into the multiply
+        through a local name. A scanner that only looks at the multiply's own line fires
+        here, which would make it report every fixed kernel as still defective.
+        """
+        payload = self.scan_source(
+            "import triton\n"
+            "import triton.language as tl\n"
+            "\n"
+            "@triton.jit\n"
+            "def moe_wgrad_kernel(a_ptr, offs_token, top_k, stride_gm):\n"
+            "    token_row = (offs_token // top_k).to(tl.int64)\n"
+            "    a_ptrs = a_ptr + token_row[:, None] * stride_gm\n"
+            "    return a_ptrs\n"
+        )
+
+        self.assertEqual([], payload["candidates"])
+        self.assertEqual(0, payload["index_stride_candidates"])
+
+    def test_flydsl_capitalised_widening_spelling_is_recognised(self):
+        """FlyDSL writes `fx.Int64(...)`; Triton writes `tl.int64`.
+
+        WIDEN_ATTRS was matched case-sensitively, so a kernel that had been explicitly widened
+        in FlyDSL's own spelling was reported as an unwidened overflow candidate -- the
+        scanner publishing its own vocabulary gap as a defect in the code. The list is a list
+        of widening FORMS, and how a form is capitalised is not part of what it does.
+        """
+        payload = self.scan_source(
+            "import flydsl as fx\n"
+            "\n"
+            "def kernel(base_ptr, offs, stride):\n"
+            "    return base_ptr + fx.Int64(offs) * stride\n"
+        )
+
+        self.assertEqual([], payload["candidates"])
+        self.assertEqual(0, payload["index_stride_candidates"])
+
+    def test_constexpr_only_operand_is_not_a_candidate(self):
+        """A tile-constant multiplicand bounds the product at compile time.
+
+        `k_ptrs += BLOCK_N * stride_kn` advances a pointer by one tile and cannot
+        overflow. It nonetheless matches "runtime parameter inside a multiply inside
+        pointer arithmetic" exactly, so provenance -- not the name -- has to exclude it.
+        """
+        payload = self.scan_source(
+            "import triton\n"
+            "import triton.language as tl\n"
+            "\n"
+            "@triton.jit\n"
+            "def gemm_kernel(k_ptr, stride_kn, BLOCK_N: tl.constexpr):\n"
+            "    k_ptrs = k_ptr + BLOCK_N * stride_kn\n"
+            "    return k_ptrs\n"
+        )
+
+        self.assertEqual([], payload["candidates"])
+
+    def test_json_count_is_deduplicated(self):
+        """Identical expressions collapse into ONE row that carries its occurrences.
+
+        The old contract counted every textual site. One reasoning step clears one
+        distinct expression however many times a generated kernel family repeats it, so
+        the count is now of distinct expressions and the repetition is carried in
+        `occurrences`/`lines` rather than discarded.
+        """
+        payload = self.scan_source(
+            "import triton\n"
+            "import triton.language as tl\n"
+            "\n"
+            "@triton.jit\n"
+            "def twin_kernel(a_ptr, b_ptr, offs_m, stride_am):\n"
+            "    p1 = a_ptr + offs_m[:, None] * stride_am\n"
+            "    p2 = b_ptr + offs_m[:, None] * stride_am\n"
+            "    return p1, p2\n"
+        )
+
+        self.assertEqual(1, payload["index_stride_candidates"])
+        row = payload["candidates"][0]
+        self.assertEqual("offs_m[:, None] * stride_am", row["expression"])
+        self.assertEqual(2, row["occurrences"])
+        self.assertEqual([6, 7], row["lines"])
+        self.assertEqual(6, row["line"])
+        # Renamed key: the old `untyped_stride_parameters` was a name-list verdict; this
+        # one counts runtime parameters the diff added with no width annotation.
+        self.assertEqual(2, payload["unannotated_runtime_parameters"])
+        self.assertEqual(3, payload["total_candidates"])
+        self.assertEqual([], payload["unscanned"])
+
+    def test_candidate_is_found_with_names_from_no_list(self):
+        """Proof that the INDEXY/STRIDEY name lists are actually gone.
+
+        Not one identifier here matches the deleted patterns (idx/_id/block/row/token/
+        offset ... times stride/pitch/hidden_dim). The old scanner was silent on this
+        file; the structure is identical to the defect, so the new one must not be.
+        """
+        payload = self.scan_source(
+            "import triton\n"
+            "import triton.language as tl\n"
+            "\n"
+            "@triton.jit\n"
+            "def frobnicate(base_ptr, quux, WIDTH: tl.constexpr):\n"
+            "    zork = tl.arange(0, WIDTH)\n"
+            "    return base_ptr + zork * quux\n"
+        )
+
+        self.assertEqual(1, payload["index_stride_candidates"])
+        self.assertEqual("zork * quux", payload["candidates"][0]["expression"])
+        self.assertEqual(["quux"], payload["candidates"][0]["runtime_params"])
+
+    def test_unrecoverable_post_image_is_reported_not_counted_clean(self):
+        """A file the scanner could not read is not a file with no defects.
+
+        The diff modifies an existing file, so the post image lives in a blob this
+        object store does not have. Dropping it silently would make an incomplete scan
+        indistinguishable from a clean one -- the exact failure this skill argues
+        against.
+        """
+        missing_blob = "b" * 40
+        diff = (
+            "diff --git a/kernel.py b/kernel.py\n"
+            f"index {'a' * 40}..{missing_blob} 100644\n"
+            "--- a/kernel.py\n"
+            "+++ b/kernel.py\n"
+            "@@ -1,1 +1,2 @@\n"
+            " import triton\n"
+            "+x = 1\n"
+        )
+        with tempfile.TemporaryDirectory() as outside_git:
+            payload = self.scan(diff, directory=outside_git)
+            plain = run(
+                [str(SCANNER), "--diff", str(self._write(outside_git, diff))],
+                cwd=outside_git,
+            )
+
+        self.assertEqual([], payload["candidates"])
+        self.assertEqual(1, len(payload["unscanned"]))
+        self.assertEqual("kernel.py", payload["unscanned"][0]["path"])
+        self.assertTrue(payload["unscanned"][0]["reason"])
+        self.assertIn(missing_blob, payload["unscanned"][0]["reason"])
+        # And it is loud in the human-readable output: 0 candidates here must not read
+        # as a clearance.
+        self.assertIn("NOT SCANNED", plain.stdout)
+        self.assertIn("D9 CANNOT be cleared", plain.stdout)
+
+    @staticmethod
+    def _write(directory, diff_text):
+        path = Path(directory) / "plain.diff"
+        path.write_text(diff_text)
+        return path
+
+
+class ScannerScopeTests(unittest.TestCase):
+    def _scan(self, source):
+        with tempfile.TemporaryDirectory() as directory:
+            diff = Path(directory) / "d.diff"
+            body = "".join(f"+{line}\n" for line in source.splitlines())
+            diff.write_text(
+                "diff --git a/k.py b/k.py\n--- /dev/null\n+++ b/k.py\n"
+                f"@@ -0,0 +1,{len(source.splitlines())} @@\n" + body
+            )
+            return json.loads(run([str(SCANNER), "--diff", str(diff), "--json"]).stdout)
+
+    def test_a_nested_helper_inherits_its_kernels_device_scope(self):
+        # _scan_body used ast.walk, which descends through nested defs, so every expression in
+        # a nested helper was scanned in the ENCLOSING function's scope -- with the outer
+        # function's parameters and its host/device verdict. Four real candidates inside a
+        # @flyc.kernel body were classified host-side that way, which is a miss.
+        payload = self._scan(
+            "def build(stride_a):\n"
+            "    @flyc.kernel(name='k')\n"
+            "    def kernel_gemm(stride_b):\n"
+            "        def helper(row):\n"
+            "            return base + row * stride_b\n"
+            "        return helper\n"
+        )
+        self.assertEqual(1, payload["index_stride_candidates"], payload)
+        self.assertEqual(0, payload["host_scope_candidates"], payload)
+        self.assertEqual("device", payload["candidates"][0]["scope"])
+
+    def test_host_side_arithmetic_is_listed_apart_from_device_candidates(self):
+        # int32 overflow is a device concern; host-side FLOP accounting in the same shape is
+        # not D9. It is listed rather than dropped, because the device test is a spelling.
+        payload = self._scan(
+            "def _flops_bytes(rows, stride_x):\n    return total + rows * stride_x\n"
+        )
+        self.assertEqual(0, payload["index_stride_candidates"], payload)
+        self.assertEqual(1, payload["host_scope_candidates"], payload)
