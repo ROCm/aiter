@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <climits>
 #include <cstdlib>
+#include <type_traits>
 
 #include <torch/extension.h>
 #include <hip/hip_runtime.h>
@@ -55,7 +56,16 @@ void fused_moe_router_impl(
     std::optional<torch::Tensor> expert_mask,
     // [M, model_dim] bf16 stage2 accumulator, zeroed by the kernel (stage2
     // accumulates atomically). None = caller zeroed it already.
-    std::optional<torch::Tensor> moe_buf)
+    std::optional<torch::Tensor> moe_buf,
+    // Fused shared experts appended after the routed ids, 0 = none. Each token
+    // gives every shared expert shared_expert_weight. Under EP the shared
+    // weights are replicated on every rank while every rank sees every token,
+    // so token ownership round-robins over ep_size to keep the post-MoE
+    // all-reduce from summing ep_size copies; ep_size == 1 is the non-EP case.
+    int64_t num_fused_shared_experts,
+    double  shared_expert_weight,
+    int64_t ep_rank,
+    int64_t ep_size)
 {
     using namespace aiter::fmr;
     opus::bf16_t* moe_buf_ptr = nullptr;
@@ -74,9 +84,35 @@ void fused_moe_router_impl(
     const int cols = hidden.size(1);
     constexpr int BlockSize = 256;
     constexpr int TD        = 16; // cols / TD must equal BlockSize
+    // Instantiated shared-expert counts. Every model that fuses shared experts
+    // today has exactly one; a wider ladder is dead template instantiations.
+    constexpr int kMaxShared = 1;
+    const int     n_shared   = (int)num_fused_shared_experts;
+    TORCH_CHECK(n_shared >= 0 && n_shared <= kMaxShared,
+                "fused_moe_router_impl: num_fused_shared_experts must be in 0..",
+                kMaxShared, ", got ", n_shared);
+    // ep_size is the round-robin modulus and ep_rank picks this rank's residue,
+    // so a bad pair silently gives every token to one rank or to none.
+    TORCH_CHECK(ep_size >= 1 && ep_rank >= 0 && ep_rank < ep_size,
+                "fused_moe_router_impl: need 0 <= ep_rank < ep_size, got ep_rank=",
+                ep_rank, " ep_size=", ep_size);
     TORCH_CHECK(cols == BlockSize * TD, "fused_moe_router_impl: cols must be ", BlockSize * TD);
+    // The histogram, the scan and the local-id table are all indexed by emitted
+    // expert id, so it is the full slot count -- not the routed count -- that
+    // has to fit s_scan's 2*BlockSize slots.
+    const bool ep    = expert_mask.has_value() && expert_mask->defined();
+    const int  E_tot = aiter::fmr::expert_slots(E, n_shared, ep);
+    // Non-owners park the shared row on the sentinel slot, which exists only
+    // when a mask does. Without one there is nothing masking it out and no slot
+    // to hold it, so the histogram would take an out-of-range atomicAdd.
+    TORCH_CHECK(n_shared == 0 || ep || ep_size == 1,
+                "fused_moe_router_impl: ep_size=", ep_size,
+                " needs an expert_mask (the shared sentinel slot lives in it)");
+    // Routed experts only: the pair scan reaches 2*BlockSize slots, and the
+    // fused shared tail past that is filled serially rather than scanned.
     TORCH_CHECK(E <= 2 * BlockSize,
-                "fused_moe_router_impl: num_experts must be <= ", 2 * BlockSize);
+                "fused_moe_router_impl: num_experts must be <= ", 2 * BlockSize,
+                ", got ", E);
     // A partial group would make the abs-max reduction span the wrong lanes.
     TORCH_CHECK(group_size % TD == 0,
                 "fused_moe_router_impl: group_size must be a multiple of ", TD,
@@ -94,11 +130,12 @@ void fused_moe_router_impl(
     // block_size is a power of two, so check rather than carry a fallback.
     TORCH_CHECK(unit_size > 0 && (unit_size & (unit_size - 1)) == 0,
                 "fused_moe_router_impl: unit_size must be a power of two, got ", unit_size);
-    // Phase 1 selects within one wave, so a larger topk would silently drop
-    // every winner past lane 63.
-    TORCH_CHECK(topk > 0 && topk <= 64,
-                "fused_moe_router_impl: topk must be in 1..64 (phase 1 selects "
-                "within one wave), got ", topk);
+    // Phase 1 selects within one wave and the shared experts take the lanes
+    // just past topk, so the two together must fit those 64 lanes.
+    const int topk_total = (int)topk + n_shared;
+    TORCH_CHECK(topk > 0 && topk_total <= 64,
+                "fused_moe_router_impl: topk + fused shared experts must be in "
+                "1..64 (phase 1 selects within one wave), got ", topk_total);
     // Rounds past E elect a sentinel lane (expert == INT_MAX), which the weight
     // recompute would then use to index the gating row.
     TORCH_CHECK(topk <= E,
@@ -114,16 +151,19 @@ void fused_moe_router_impl(
                 " B, need ", fused_moe_router_workspace_size(M), " B for num_tokens=", M,
                 "; size it with fused_moe_router_workspace_size");
 
-    // The mask is indexed by global expert id. vLLM sizes it longer than E
-    // (expert_map_manager.py) with trailing sentinel and fused-shared slots;
-    // neither is a routed expert, so only the first E are read. Local ids still
-    // match the stock path because local(e) is an *exclusive* prefix.
+    // The mask is indexed by global expert id, over the routed experts, the
+    // fused shared slots and, when both EP and shared fusion are on, the
+    // trailing sentinel -- exactly vLLM's global_num_experts + shared + 1
+    // layout (expert_map_manager.py), whose sentinel is zero and whose shared
+    // slots are owned. Local ids still match the stock path because local(e) is
+    // an *exclusive* prefix.
     const int* mask_ptr = nullptr;
-    if(expert_mask.has_value() && expert_mask->defined())
+    if(ep)
     {
-        TORCH_CHECK(expert_mask->numel() >= E,
-                    "fused_moe_router_impl: expert_mask must have at least num_experts (",
-                    E, ") entries, got ", expert_mask->numel());
+        TORCH_CHECK(expert_mask->numel() >= E_tot,
+                    "fused_moe_router_impl: expert_mask must have at least ", E_tot,
+                    " entries (num_experts + fused shared + sentinel), got ",
+                    expert_mask->numel());
         TORCH_CHECK(expert_mask->scalar_type() == torch::kInt32,
                     "fused_moe_router_impl: expert_mask must be int32");
         TORCH_CHECK(expert_mask->is_contiguous(),
@@ -144,7 +184,7 @@ void fused_moe_router_impl(
     hipGetDeviceProperties(&prop, dev_id);
     GRID = std::max(1, std::min(GRID, prop.multiProcessorCount));
 
-    const int total_routed_rows = M * topk;
+    const int total_routed_rows = M * topk_total;
     const int max_blocks        = (int)sorted_expert_ids.numel();
     const int max_tokens        = (int)sorted_ids.numel();
     const int scaleN_valid      = (cols + group_size - 1) / group_size;
@@ -152,7 +192,7 @@ void fused_moe_router_impl(
         ((scaleN_valid + kScalesPerThread - 1) / kScalesPerThread) * kScalesPerThread;
 
     const size_t shmem =
-        aiter::fmr::LdsLayout(BlockSize, total_routed_rows, E, mask_ptr != nullptr).bytes;
+        aiter::fmr::LdsLayout(BlockSize, total_routed_rows, E_tot, mask_ptr != nullptr).bytes;
 
     // LDS grows as ~16 * M * topk, so a large enough M overruns the per-block
     // budget and the launch fails with an opaque hipErrorInvalidValue.
@@ -192,6 +232,15 @@ void fused_moe_router_impl(
                          std::make_pair(&num_valid_ids, "num_valid_ids")})
         TORCH_CHECK(p.first->is_contiguous(),
                     "fused_moe_router_impl: ", p.second, " must be contiguous");
+    // The shared rows extend each token's stride, and the kernel indexes these
+    // with the widened stride; a caller that sized them [M, topk] would have
+    // every token past the first write out of bounds.
+    for(const auto& p : {std::make_pair(&topk_ids, "topk_ids"),
+                         std::make_pair(&topk_weights, "topk_weights")})
+        TORCH_CHECK(p.first->numel() >= (int64_t)M * topk_total,
+                    "fused_moe_router_impl: ", p.second, " has ", p.first->numel(),
+                    " elements, need M * (topk + fused shared) = ",
+                    (int64_t)M * topk_total);
 
     const opus::bf16_t* g = reinterpret_cast<const opus::bf16_t*>(gating.data_ptr());
     const opus::bf16_t* h = reinterpret_cast<const opus::bf16_t*>(hidden.data_ptr());
@@ -206,12 +255,13 @@ void fused_moe_router_impl(
                 "bfloat16, got ", bias.scalar_type());
     const bool bias_is_f32 = bias.scalar_type() == at::kFloat;
 
-    // One body, instantiated per bias dtype.
-    auto launch_all = [&](auto bias_tag) {
-        using DB = decltype(bias_tag);
+    // One body, instantiated per (bias dtype, shared-expert count).
+    auto launch_all = [&](auto bias_tag, auto nshared_tag) {
+        using DB                = decltype(bias_tag);
+        constexpr int NSHARED   = decltype(nshared_tag)::value;
         const DB* b = reinterpret_cast<const DB*>(bias.data_ptr());
         auto* kern = aiter::fmr::fused_moe_routing_kernel<
-            BlockSize, TD, opus::bf16_t, aiter::fmr::kFused, DB>;
+            BlockSize, TD, opus::bf16_t, aiter::fmr::kFused, DB, NSHARED>;
         (void)hipFuncSetAttribute(reinterpret_cast<const void*>(kern),
                                   hipFuncAttributeMaxDynamicSharedMemorySize, shmem);
         // The grid barrier deadlocks unless every block is co-resident.
@@ -245,9 +295,9 @@ void fused_moe_router_impl(
         if(split)
         {
             auto* k1 = aiter::fmr::fused_moe_routing_kernel<
-                BlockSize, TD, opus::bf16_t, aiter::fmr::kPhase1, DB>;
+                BlockSize, TD, opus::bf16_t, aiter::fmr::kPhase1, DB, NSHARED>;
             auto* k23 = aiter::fmr::fused_moe_routing_kernel<
-                BlockSize, TD, opus::bf16_t, aiter::fmr::kPhase23, DB>;
+                BlockSize, TD, opus::bf16_t, aiter::fmr::kPhase23, DB, NSHARED>;
             (void)hipFuncSetAttribute(reinterpret_cast<const void*>(k1),
                                       hipFuncAttributeMaxDynamicSharedMemorySize, shmem);
             (void)hipFuncSetAttribute(reinterpret_cast<const void*>(k23),
@@ -262,7 +312,8 @@ void fused_moe_router_impl(
         reinterpret_cast<uint8_t*>(out_scale.data_ptr()),                                    \
         ws_tok_scale, moe_buf_ptr, moe_buf_elems, ws_sem, mask_ptr, M, E, topk,              \
         unit_size, group_size, cols, max_blocks, max_tokens, need_renorm,                    \
-        (float)routed_scaling_factor
+        (float)routed_scaling_factor, (float)shared_expert_weight, (int)ep_rank,             \
+        (int)ep_size
             k1<<<G1, BlockSize, shmem, stream>>>(FMR_ARGS);
             k23<<<G23, BlockSize, shmem, stream>>>(FMR_ARGS);
 #undef FMR_ARGS
@@ -279,13 +330,24 @@ void fused_moe_router_impl(
             reinterpret_cast<uint8_t*>(out_scale.data_ptr()),
             ws_tok_scale, moe_buf_ptr, moe_buf_elems, ws_sem, mask_ptr,
             M, E, topk, unit_size, group_size, cols, max_blocks, max_tokens, need_renorm,
-            (float)routed_scaling_factor);
+            (float)routed_scaling_factor, (float)shared_expert_weight, (int)ep_rank,
+            (int)ep_size);
+    };
+
+    // NSHARED == 0 must reach the same instantiation as before this feature
+    // existed, so the shared-expert lanes fold out entirely and the no-shared
+    // config keeps its register count.
+    auto dispatch_shared = [&](auto bias_tag) {
+        if(n_shared == 0)
+            launch_all(bias_tag, std::integral_constant<int, 0>{});
+        else
+            launch_all(bias_tag, std::integral_constant<int, 1>{});
     };
 
     if(bias_is_f32)
-        launch_all(float{});
+        dispatch_shared(float{});
     else
-        launch_all(opus::bf16_t{});
+        dispatch_shared(opus::bf16_t{});
 }
 
 #include "rocm_ops.hpp"
@@ -302,7 +364,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("group_size"), py::arg("need_renorm"),
           py::arg("routed_scaling_factor"), py::arg("workspace"),
           py::arg("expert_mask") = std::nullopt,
-          py::arg("moe_buf") = std::nullopt);
+          py::arg("moe_buf") = std::nullopt,
+          py::arg("num_fused_shared_experts") = 0,
+          py::arg("shared_expert_weight") = 1.0,
+          py::arg("ep_rank") = 0,
+          py::arg("ep_size") = 1);
     m.def("fused_moe_router_workspace_size", &fused_moe_router_workspace_size,
           "workspace bytes for up to max_tokens tokens", py::arg("max_tokens"));
 }
