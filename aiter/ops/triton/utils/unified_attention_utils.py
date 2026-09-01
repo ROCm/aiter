@@ -141,8 +141,7 @@ def _lookup(table: dict, axes: tuple, values: dict) -> tuple:
 
 
 def compute_tile_params(config: dict, block_size: int) -> dict:
-    """Derive TILE_SIZE from the tuned bounds and the runtime page size.
-    """
+    """Derive TILE_SIZE from the tuned bounds and the runtime page size."""
     if "TILE_SIZE_MIN" not in config and "TILE_SIZE_MAX" not in config:
         return config
     hi = config.pop("TILE_SIZE_MAX", None)

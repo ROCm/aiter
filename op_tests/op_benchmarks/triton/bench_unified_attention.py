@@ -471,9 +471,9 @@ def main(args: list[str] | None = None) -> None:
         custom_config = True
         if not args.dv:
             args.dv = args.d
-        assert args.b and args.hq and args.sq and args.d and args.dv, (
-            "Custom config requires -b, -hq, -sq, -d (and optionally -dv)"
-        )
+        assert (
+            args.b and args.hq and args.sq and args.d and args.dv
+        ), "Custom config requires -b, -hq, -sq, -d (and optionally -dv)"
 
     run_benchmark(custom_config, args)
 
