@@ -400,12 +400,19 @@ default_kernels_dict_950 = {
 # fmt: on
 
 arch = get_gfx()
+_expanded_942 = expand_blockpercu(kernels_list_942)
+_expanded_950 = expand_blockpercu(kernels_list_950)
 if arch == "gfx942":
-    kernels_list = expand_blockpercu(kernels_list_942)
+    kernels_list = _expanded_942
     default_kernels_dict = default_kernels_dict_942
 else:
-    kernels_list = expand_blockpercu(kernels_list_950)
+    kernels_list = _expanded_950
     default_kernels_dict = default_kernels_dict_950
 
 # Name-based reverse lookup for get_tune_dict() — built once at import time
-kernels_by_name = {v.name: v for v in kernels_list.values()}
+# Must include kernels from ALL arches, not just the current get_gfx() arch.
+# In a multi-target build (GPU_ARCHS=gfx942;gfx950), get_gfx() returns only the
+# last entry, but build_tune_dict processes CSV rows for all build targets.
+# Note: cannot use {**a, **b} merge — both arches use overlapping integer IDs,
+# which would drop entries. Collect values from both dicts instead.
+kernels_by_name = {v.name: v for v in list(_expanded_942.values()) + list(_expanded_950.values())}

@@ -138,10 +138,19 @@ default_kernels_cktile_dict = {
 
 
 arch = get_gfx()
+_expanded_942 = expand_blockpercu(kernels_list_942)
+_expanded_95x = expand_blockpercu(kernels_list_95x)
 if arch.startswith("gfx95"):
-    candidate_kernels_cktile_dict = expand_blockpercu(kernels_list_95x)
+    candidate_kernels_cktile_dict = _expanded_95x
 else:
-    candidate_kernels_cktile_dict = expand_blockpercu(kernels_list_942)
+    candidate_kernels_cktile_dict = _expanded_942
 
 # Name-based reverse lookup for get_tune_dict()
-candidate_kernels_by_name = {v.name: v for v in candidate_kernels_cktile_dict.values()}
+# Must include kernels from ALL arches, not just the current get_gfx() arch.
+# In a multi-target build (GPU_ARCHS=gfx942;gfx950), get_gfx() returns only the
+# last entry (gfx950), but build_tune_dict processes CSV rows for all build targets.
+# If the name registry only has the current arch's kernels, codegen crashes when it
+# encounters a CSV row referencing a kernel name from a different arch.
+# Note: cannot use {**a, **b} merge — both arches use overlapping integer IDs,
+# which would drop entries. Collect values from both dicts instead.
+candidate_kernels_by_name = {v.name: v for v in list(_expanded_942.values()) + list(_expanded_95x.values())}
