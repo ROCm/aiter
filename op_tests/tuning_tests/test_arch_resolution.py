@@ -59,9 +59,9 @@ class TestDeviceName(unittest.TestCase):
     def _name_for(self, gfx, chip_id):
         from aiter.jit.utils import chip_info
 
-        with mock.patch.object(chip_info, "get_gfx", return_value=gfx), mock.patch.object(
-            chip_info, "_get_pci_chip_id", return_value=chip_id
-        ):
+        with mock.patch.object(
+            chip_info, "get_gfx", return_value=gfx
+        ), mock.patch.object(chip_info, "_get_pci_chip_id", return_value=chip_id):
             return chip_info.get_device_name()
 
     def test_mi300a_chip_id(self):
@@ -208,7 +208,9 @@ class TestBuildTargets(unittest.TestCase):
         )
 
     def test_no_live_gpu_keeps_table_defaults(self):
-        self.assertEqual(self._targets(gpu_archs="gfx942", live=None), [("gfx942", 304)])
+        self.assertEqual(
+            self._targets(gpu_archs="gfx942", live=None), [("gfx942", 304)]
+        )
 
     def test_mi308x_partition_also_refined(self):
         # Same mechanism protects MI308X and non-SPX MI300X partition modes.
