@@ -276,7 +276,10 @@ def flydsl_flash_attn_varlen_func(
         get_gfx() == "gfx1250"
         and (_use_fdsl_wave8_fmha or _use_sibling)
         and v.shape[-1] == 128
+        and k.shape[-1] == qk_hdim
         and q.dtype == torch.bfloat16
+        and k.dtype == torch.bfloat16
+        and v.dtype == torch.bfloat16
         and _nkv > 0
         and _nq % _nkv == 0
         and dropout_p == 0.0
@@ -357,7 +360,7 @@ def flydsl_flash_attn_batch_func(
 
     # BSHD routes to the m32x8 kernel (no d192 sibling exists for BSHD). D_v=128. D_qk 128/192 are
     # the DEFAULT; D_qk==256 needs AITER_ENABLE_EXPERIMENTAL=1 (else CK).
-    _bqk = q.shape[-1]
+    qk_hdim = q.shape[-1]
     # Head count (BSHD [B,S,H,D]) and sink must satisfy the kernel's asserts, else validate
     # up front so an unsupported request returns None instead of tripping a kernel assert.
     _nq, _nkv = q.shape[-2], k.shape[-2]
@@ -367,9 +370,12 @@ def flydsl_flash_attn_batch_func(
     supported = (
         get_gfx() == "gfx1250"
         and q.dim() == 4
-        and (_bqk in (128, 192) or (_bqk == 256 and is_experimental_enabled()))
+        and (qk_hdim in (128, 192) or (qk_hdim == 256 and is_experimental_enabled()))
         and v.shape[-1] == 128
+        and k.shape[-1] == qk_hdim
         and q.dtype == torch.bfloat16
+        and k.dtype == torch.bfloat16
+        and v.dtype == torch.bfloat16
         and _nkv > 0
         and _nq % _nkv == 0
         and _sink_ok
