@@ -252,17 +252,21 @@ def flydsl_flash_attn_varlen_func(
     # kernel); by default 192 takes ours (it's ~16% faster).
     qk_hdim = q.shape[-1]
     exp = is_experimental_enabled()
-    _use_wave8_mha = (
-        qk_hdim == 128 or (qk_hdim == 192 and not exp) or (qk_hdim == 256 and exp)
+    # Attention sink + finite sliding window are served only by our m32x8 path; the d192
+    # sibling is full/causal only. So under experimental the sibling is the 192 A/B
+    # fallback ONLY for plain full/causal — a sink or finite window on 192 stays on ours.
+    _needs_m32x8 = sink is not None or tuple(window_size[:2]) != (-1, -1)
+    _use_sibling = qk_hdim == 192 and exp and not _needs_m32x8
+    _use_fdsl_wave8_fmha = (
+        qk_hdim == 128
+        or (qk_hdim == 192 and not _use_sibling)
+        or (qk_hdim == 256 and exp)
     )
-    _use_sibling = qk_hdim == 192 and exp
-    # Attention sink + finite sliding window are supported only by our m32x8 path (d192 is
-    # full/causal, no sink), so they require routing to ours.
-    _sink_ok = sink is None or _use_wave8_mha
-    _window_ok = tuple(window_size[:2]) == (-1, -1) or _use_wave8_mha
+    _sink_ok = sink is None or _use_fdsl_wave8_fmha
+    _window_ok = tuple(window_size[:2]) == (-1, -1) or _use_fdsl_wave8_fmha
     supported = (
         get_gfx() == "gfx1250"
-        and (_use_wave8_mha or _use_sibling)
+        and (_use_fdsl_wave8_fmha or _use_sibling)
         and v.shape[-1] == 128
         and q.dtype == torch.bfloat16
         and dropout_p == 0.0
@@ -281,7 +285,7 @@ def flydsl_flash_attn_varlen_func(
     if out is None:
         out = torch.empty_like(q[:, :, : v.shape[-1]])
 
-    if _use_wave8_mha:
+    if _use_fdsl_wave8_fmha:
         # New clean-DSL 8-wave prefill kernel (m32x8), D_qk in {128,192,256}, D_v=128.
         return flash_attn_varlen_m32x8(
             q,

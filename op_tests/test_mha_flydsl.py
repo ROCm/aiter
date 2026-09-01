@@ -825,7 +825,7 @@ if __name__ == "__main__":
     )
 
     # sink/window are served by m32x8 only where it is routed (mirrors
-    # fmha_kernels._use_wave8_mha); off those paths keep sink=False / window=(-1,-1).
+    # fmha_kernels._use_fdsl_wave8_fmha); off those paths keep sink=False / window=(-1,-1).
     def _m32x8_serves_sink_window(d_qk, d_v):
         if d_v != 128:
             return False
