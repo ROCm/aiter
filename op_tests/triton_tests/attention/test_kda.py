@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from aiter.ops.triton.attention.kda import fused_recurrent_kda
-from aiter.ops.triton.utils import core as triton_core
+from aiter.ops.triton.utils import config_utils as triton_core
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 arch = get_arch()
