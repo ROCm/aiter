@@ -10,15 +10,16 @@ using Triton kernels, optimized for chunk-based operations.
 """
 
 import os
+
 import torch
 import triton
 import triton.language as tl
 
 from ..gated_delta_rule_utils import (
-    input_guard,
+    IS_TMA_SUPPORTED,
     autotune_cache_kwargs,
     gated_delta_rule_autotune_configs,
-    IS_TMA_SUPPORTED,
+    input_guard,
 )
 from .index import prepare_chunk_indices
 from .op import make_tensor_descriptor
@@ -32,6 +33,32 @@ assert FLA_TRIL_PRECISION in [
 DOT_PRECISION_AUTOTUNE_LIST = (
     ["ieee"] if not IS_TMA_SUPPORTED else list({"ieee", FLA_TRIL_PRECISION})
 )
+
+
+# tl.make_block_ptr was removed in Triton 3.8 ("Block pointers have been removed
+# in favor of the tensor descriptor API"). Every block access in this file is a
+# row-major (BR, BC) tile with unit column stride, so plain pointer arithmetic
+# with an explicit bounds mask reproduces the boundary_check=(0, 1) behaviour.
+@triton.jit
+def _bp_ld2d(base, R, C, rs, r0, c0, BR: tl.constexpr, BC: tl.constexpr):
+    r = r0 + tl.arange(0, BR)
+    c = c0 + tl.arange(0, BC)
+    return tl.load(
+        base + r[:, None] * rs + c[None, :],
+        mask=(r < R)[:, None] & (c < C)[None, :],
+        other=0.0,
+    )
+
+
+@triton.jit
+def _bp_st2d(base, R, C, rs, r0, c0, val, BR: tl.constexpr, BC: tl.constexpr):
+    r = r0 + tl.arange(0, BR)
+    c = c0 + tl.arange(0, BC)
+    tl.store(
+        base + r[:, None] * rs + c[None, :],
+        val,
+        mask=(r < R)[:, None] & (c < C)[None, :],
+    )
 
 
 @triton.heuristics(
@@ -58,19 +85,21 @@ def solve_tril_16x16_kernel(
     A,
     Ai,
     cu_seqlens,
-    chunk_indices,
+    sequence_ids,
+    chunk_ids,
     T,
     H: tl.constexpr,
     BT: tl.constexpr,
     USE_TMA: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    INDEX_STRIDE: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(
-            chunk_indices + i_t * 2 + 1
+        i_n, i_t = tl.load(sequence_ids + i_t * INDEX_STRIDE).to(tl.int32), tl.load(
+            chunk_ids + i_t * INDEX_STRIDE
         ).to(tl.int32)
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
             cu_seqlens + i_n + 1
@@ -87,11 +116,8 @@ def solve_tril_16x16_kernel(
 
     offset = (i_t * 16) % BT
     if not USE_TMA:
-        p_A = tl.make_block_ptr(
-            A, (T, BT), (H * BT, 1), (i_t * 16, offset), (16, 16), (1, 0)
-        )
         # [16, 16]
-        b_A = tl.load(p_A, boundary_check=(0, 1)).to(tl.float32)
+        b_A = _bp_ld2d(A, T, BT, H * BT, i_t * 16, offset, 16, 16).to(tl.float32)
         b_A = tl.where(m_A, b_A, 0)
     else:
         desc = make_tensor_descriptor(A, [T, BT], [H * BT, 1], [16, 16])
@@ -109,13 +135,16 @@ def solve_tril_16x16_kernel(
         b_A = tl.where((o_i == i)[:, None], b_a, b_A)
     b_A += m_I
     if not USE_TMA:
-        p_Ai = tl.make_block_ptr(
-            Ai, (T, 16), (H * 16, 1), (i_t * 16, 0), (16, 16), (1, 0)
-        )
-        tl.store(
-            p_Ai,
-            b_A.to(p_Ai.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
+        _bp_st2d(
+            Ai,
+            T,
+            16,
+            H * 16,
+            i_t * 16,
+            0,
+            b_A.to(Ai.dtype.element_ty, fp_downcast_rounding="rtne"),
+            16,
+            16,
         )
     else:
         desc_o.store([i_t * 16, 0], b_A.to(desc_o.dtype, fp_downcast_rounding="rtne"))
@@ -148,19 +177,21 @@ def merge_16x16_to_32x32_inverse_kernel(
     A,
     Ai,
     cu_seqlens,
-    chunk_indices,
+    sequence_ids,
+    chunk_ids,
     T,
     H: tl.constexpr,
     BT: tl.constexpr,
     USE_TMA: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    INDEX_STRIDE: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(
-            chunk_indices + i_t * 2 + 1
+        i_n, i_t = tl.load(sequence_ids + i_t * INDEX_STRIDE).to(tl.int32), tl.load(
+            chunk_ids + i_t * INDEX_STRIDE
         ).to(tl.int32)
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
             cu_seqlens + i_n + 1
@@ -176,14 +207,8 @@ def merge_16x16_to_32x32_inverse_kernel(
     Ai += (bos * H + i_h) * BT
 
     if not USE_TMA:
-        p_A_11 = tl.make_block_ptr(
-            A, (T, BT), (H * BT, 1), (i_t * BT, 0), (16, 16), (1, 0)
-        )
-        p_A_22 = tl.make_block_ptr(
-            A, (T, BT), (H * BT, 1), (i_t * BT + 16, 16), (16, 16), (1, 0)
-        )
-        b_Ai_11 = tl.load(p_A_11, boundary_check=(0, 1)).to(tl.float32)
-        b_Ai_22 = tl.load(p_A_22, boundary_check=(0, 1)).to(tl.float32)
+        b_Ai_11 = _bp_ld2d(A, T, BT, H * BT, i_t * BT, 0, 16, 16).to(tl.float32)
+        b_Ai_22 = _bp_ld2d(A, T, BT, H * BT, i_t * BT + 16, 16, 16, 16).to(tl.float32)
     else:
         desc = make_tensor_descriptor(A, [T, BT], [H * BT, 1], [16, 16])
         desc_o = make_tensor_descriptor(Ai, [T, BT], [H * BT, 1], [16, 16])
@@ -207,10 +232,7 @@ def merge_16x16_to_32x32_inverse_kernel(
     b_Ai_22 += m_I
 
     if not USE_TMA:
-        p_A_21 = tl.make_block_ptr(
-            A, (T, BT), (H * BT, 1), (i_t * BT + 16, 0), (16, 16), (1, 0)
-        )
-        b_A_21 = tl.load(p_A_21, boundary_check=(0, 1)).to(tl.float32)
+        b_A_21 = _bp_ld2d(A, T, BT, H * BT, i_t * BT + 16, 0, 16, 16).to(tl.float32)
     else:
         b_A_21 = desc.load([i_t * BT + 16, 0]).to(tl.float32)
 
@@ -227,38 +249,40 @@ def merge_16x16_to_32x32_inverse_kernel(
     z16 = tl.zeros([16, 16], dtype=b_Ai_11.dtype)
 
     if not USE_TMA:
-        p_Ai_11 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT, 0), (16, 16), (1, 0)
+        _bp_st2d(
+            Ai,
+            T,
+            BT,
+            H * BT,
+            i_t * BT,
+            0,
+            b_Ai_11.to(Ai.dtype.element_ty, fp_downcast_rounding="rtne"),
+            16,
+            16,
         )
-        p_Ai_21 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT + 16, 0), (16, 16), (1, 0)
+        _bp_st2d(
+            Ai,
+            T,
+            BT,
+            H * BT,
+            i_t * BT + 16,
+            16,
+            b_Ai_22.to(Ai.dtype.element_ty, fp_downcast_rounding="rtne"),
+            16,
+            16,
         )
-        p_Ai_22 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT + 16, 16), (16, 16), (1, 0)
+        _bp_st2d(
+            Ai,
+            T,
+            BT,
+            H * BT,
+            i_t * BT + 16,
+            0,
+            b_Ai_21.to(Ai.dtype.element_ty, fp_downcast_rounding="rtne"),
+            16,
+            16,
         )
-        p_Ai_12 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT, 16), (16, 16), (1, 0)
-        )
-        tl.store(
-            p_Ai_11,
-            b_Ai_11.to(p_Ai_11.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
-        )
-        tl.store(
-            p_Ai_22,
-            b_Ai_22.to(p_Ai_22.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
-        )
-        tl.store(
-            p_Ai_21,
-            b_Ai_21.to(p_Ai_21.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
-        )
-        tl.store(
-            p_Ai_12,
-            z16.to(p_Ai_12.dtype.element_ty),
-            boundary_check=(0, 1),
-        )
+        _bp_st2d(Ai, T, BT, H * BT, i_t * BT, 16, z16.to(Ai.dtype.element_ty), 16, 16)
     else:
         desc_o.store(
             [i_t * BT + 0, 0], b_Ai_11.to(desc_o.dtype, fp_downcast_rounding="rtne")
@@ -299,19 +323,21 @@ def merge_16x16_to_64x64_inverse_kernel(
     A,
     Ai,
     cu_seqlens,
-    chunk_indices,
+    sequence_ids,
+    chunk_ids,
     T,
     H: tl.constexpr,
     BT: tl.constexpr,
     USE_TMA: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    INDEX_STRIDE: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(
-            chunk_indices + i_t * 2 + 1
+        i_n, i_t = tl.load(sequence_ids + i_t * INDEX_STRIDE).to(tl.int32), tl.load(
+            chunk_ids + i_t * INDEX_STRIDE
         ).to(tl.int32)
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
             cu_seqlens + i_n + 1
@@ -327,22 +353,10 @@ def merge_16x16_to_64x64_inverse_kernel(
     Ai += (bos * H + i_h) * BT
 
     if not USE_TMA:
-        p_A_11 = tl.make_block_ptr(
-            A, (T, BT), (H * BT, 1), (i_t * BT, 0), (16, 16), (1, 0)
-        )
-        p_A_22 = tl.make_block_ptr(
-            A, (T, BT), (H * BT, 1), (i_t * BT + 16, 16), (16, 16), (1, 0)
-        )
-        p_A_33 = tl.make_block_ptr(
-            A, (T, BT), (H * BT, 1), (i_t * BT + 32, 32), (16, 16), (1, 0)
-        )
-        p_A_44 = tl.make_block_ptr(
-            A, (T, BT), (H * BT, 1), (i_t * BT + 48, 48), (16, 16), (1, 0)
-        )
-        b_Ai_11 = tl.load(p_A_11, boundary_check=(0, 1)).to(tl.float32)
-        b_Ai_22 = tl.load(p_A_22, boundary_check=(0, 1)).to(tl.float32)
-        b_Ai_33 = tl.load(p_A_33, boundary_check=(0, 1)).to(tl.float32)
-        b_Ai_44 = tl.load(p_A_44, boundary_check=(0, 1)).to(tl.float32)
+        b_Ai_11 = _bp_ld2d(A, T, BT, H * BT, i_t * BT, 0, 16, 16).to(tl.float32)
+        b_Ai_22 = _bp_ld2d(A, T, BT, H * BT, i_t * BT + 16, 16, 16, 16).to(tl.float32)
+        b_Ai_33 = _bp_ld2d(A, T, BT, H * BT, i_t * BT + 32, 32, 16, 16).to(tl.float32)
+        b_Ai_44 = _bp_ld2d(A, T, BT, H * BT, i_t * BT + 48, 48, 16, 16).to(tl.float32)
     else:
         desc = make_tensor_descriptor(A, [T, BT], [H * BT, 1], [16, 16])
         desc_o = make_tensor_descriptor(Ai, [T, BT], [H * BT, 1], [16, 16])
@@ -383,30 +397,12 @@ def merge_16x16_to_64x64_inverse_kernel(
     b_Ai_44 += m_I
 
     if not USE_TMA:
-        p_A_21 = tl.make_block_ptr(
-            A, (T, BT), (H * BT, 1), (i_t * BT + 16, 0), (16, 16), (1, 0)
-        )
-        p_A_31 = tl.make_block_ptr(
-            A, (T, BT), (H * BT, 1), (i_t * BT + 32, 0), (16, 16), (1, 0)
-        )
-        p_A_32 = tl.make_block_ptr(
-            A, (T, BT), (H * BT, 1), (i_t * BT + 32, 16), (16, 16), (1, 0)
-        )
-        p_A_41 = tl.make_block_ptr(
-            A, (T, BT), (H * BT, 1), (i_t * BT + 48, 0), (16, 16), (1, 0)
-        )
-        p_A_42 = tl.make_block_ptr(
-            A, (T, BT), (H * BT, 1), (i_t * BT + 48, 16), (16, 16), (1, 0)
-        )
-        p_A_43 = tl.make_block_ptr(
-            A, (T, BT), (H * BT, 1), (i_t * BT + 48, 32), (16, 16), (1, 0)
-        )
-        b_A_21 = tl.load(p_A_21, boundary_check=(0, 1)).to(tl.float32)
-        b_A_31 = tl.load(p_A_31, boundary_check=(0, 1)).to(tl.float32)
-        b_A_32 = tl.load(p_A_32, boundary_check=(0, 1)).to(tl.float32)
-        b_A_41 = tl.load(p_A_41, boundary_check=(0, 1)).to(tl.float32)
-        b_A_42 = tl.load(p_A_42, boundary_check=(0, 1)).to(tl.float32)
-        b_A_43 = tl.load(p_A_43, boundary_check=(0, 1)).to(tl.float32)
+        b_A_21 = _bp_ld2d(A, T, BT, H * BT, i_t * BT + 16, 0, 16, 16).to(tl.float32)
+        b_A_31 = _bp_ld2d(A, T, BT, H * BT, i_t * BT + 32, 0, 16, 16).to(tl.float32)
+        b_A_32 = _bp_ld2d(A, T, BT, H * BT, i_t * BT + 32, 16, 16, 16).to(tl.float32)
+        b_A_41 = _bp_ld2d(A, T, BT, H * BT, i_t * BT + 48, 0, 16, 16).to(tl.float32)
+        b_A_42 = _bp_ld2d(A, T, BT, H * BT, i_t * BT + 48, 16, 16, 16).to(tl.float32)
+        b_A_43 = _bp_ld2d(A, T, BT, H * BT, i_t * BT + 48, 32, 16, 16).to(tl.float32)
     else:
         b_A_21 = desc.load([i_t * BT + 16, 0]).to(tl.float32)
         b_A_31 = desc.load([i_t * BT + 32, 0]).to(tl.float32)
@@ -458,111 +454,129 @@ def merge_16x16_to_64x64_inverse_kernel(
     z16 = tl.zeros([16, 16], dtype=b_Ai_11.dtype)
 
     if not USE_TMA:
-        p_Ai_11 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT, 0), (16, 16), (1, 0)
-        )
-        p_Ai_22 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT + 16, 16), (16, 16), (1, 0)
-        )
-        p_Ai_33 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT + 32, 32), (16, 16), (1, 0)
-        )
-        p_Ai_44 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT + 48, 48), (16, 16), (1, 0)
-        )
-        p_Ai_21 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT + 16, 0), (16, 16), (1, 0)
-        )
-        p_Ai_31 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT + 32, 0), (16, 16), (1, 0)
-        )
-        p_Ai_32 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT + 32, 16), (16, 16), (1, 0)
-        )
-        p_Ai_41 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT + 48, 0), (16, 16), (1, 0)
-        )
-        p_Ai_42 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT + 48, 16), (16, 16), (1, 0)
-        )
-        p_Ai_43 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT + 48, 32), (16, 16), (1, 0)
-        )
         # 6 strict-upper sub-block zero ptrs
-        p_Ai_12 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT, 16), (16, 16), (1, 0)
+        _bp_st2d(
+            Ai,
+            T,
+            BT,
+            H * BT,
+            i_t * BT,
+            0,
+            b_Ai_11.to(Ai.dtype.element_ty, fp_downcast_rounding="rtne"),
+            16,
+            16,
         )
-        p_Ai_13 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT, 32), (16, 16), (1, 0)
+        _bp_st2d(
+            Ai,
+            T,
+            BT,
+            H * BT,
+            i_t * BT + 16,
+            16,
+            b_Ai_22.to(Ai.dtype.element_ty, fp_downcast_rounding="rtne"),
+            16,
+            16,
         )
-        p_Ai_14 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT, 48), (16, 16), (1, 0)
+        _bp_st2d(
+            Ai,
+            T,
+            BT,
+            H * BT,
+            i_t * BT + 32,
+            32,
+            b_Ai_33.to(Ai.dtype.element_ty, fp_downcast_rounding="rtne"),
+            16,
+            16,
         )
-        p_Ai_23 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT + 16, 32), (16, 16), (1, 0)
+        _bp_st2d(
+            Ai,
+            T,
+            BT,
+            H * BT,
+            i_t * BT + 48,
+            48,
+            b_Ai_44.to(Ai.dtype.element_ty, fp_downcast_rounding="rtne"),
+            16,
+            16,
         )
-        p_Ai_24 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT + 16, 48), (16, 16), (1, 0)
+        _bp_st2d(
+            Ai,
+            T,
+            BT,
+            H * BT,
+            i_t * BT + 16,
+            0,
+            b_Ai_21.to(Ai.dtype.element_ty, fp_downcast_rounding="rtne"),
+            16,
+            16,
         )
-        p_Ai_34 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT + 32, 48), (16, 16), (1, 0)
+        _bp_st2d(
+            Ai,
+            T,
+            BT,
+            H * BT,
+            i_t * BT + 32,
+            0,
+            b_Ai_31.to(Ai.dtype.element_ty, fp_downcast_rounding="rtne"),
+            16,
+            16,
         )
-        tl.store(
-            p_Ai_11,
-            b_Ai_11.to(p_Ai_11.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
+        _bp_st2d(
+            Ai,
+            T,
+            BT,
+            H * BT,
+            i_t * BT + 32,
+            16,
+            b_Ai_32.to(Ai.dtype.element_ty, fp_downcast_rounding="rtne"),
+            16,
+            16,
         )
-        tl.store(
-            p_Ai_22,
-            b_Ai_22.to(p_Ai_22.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
+        _bp_st2d(
+            Ai,
+            T,
+            BT,
+            H * BT,
+            i_t * BT + 48,
+            0,
+            b_Ai_41.to(Ai.dtype.element_ty, fp_downcast_rounding="rtne"),
+            16,
+            16,
         )
-        tl.store(
-            p_Ai_33,
-            b_Ai_33.to(p_Ai_33.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
+        _bp_st2d(
+            Ai,
+            T,
+            BT,
+            H * BT,
+            i_t * BT + 48,
+            16,
+            b_Ai_42.to(Ai.dtype.element_ty, fp_downcast_rounding="rtne"),
+            16,
+            16,
         )
-        tl.store(
-            p_Ai_44,
-            b_Ai_44.to(p_Ai_44.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
+        _bp_st2d(
+            Ai,
+            T,
+            BT,
+            H * BT,
+            i_t * BT + 48,
+            32,
+            b_Ai_43.to(Ai.dtype.element_ty, fp_downcast_rounding="rtne"),
+            16,
+            16,
         )
-        tl.store(
-            p_Ai_21,
-            b_Ai_21.to(p_Ai_21.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
+        _bp_st2d(Ai, T, BT, H * BT, i_t * BT, 16, z16.to(Ai.dtype.element_ty), 16, 16)
+        _bp_st2d(Ai, T, BT, H * BT, i_t * BT, 32, z16.to(Ai.dtype.element_ty), 16, 16)
+        _bp_st2d(Ai, T, BT, H * BT, i_t * BT, 48, z16.to(Ai.dtype.element_ty), 16, 16)
+        _bp_st2d(
+            Ai, T, BT, H * BT, i_t * BT + 16, 32, z16.to(Ai.dtype.element_ty), 16, 16
         )
-        tl.store(
-            p_Ai_31,
-            b_Ai_31.to(p_Ai_31.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
+        _bp_st2d(
+            Ai, T, BT, H * BT, i_t * BT + 16, 48, z16.to(Ai.dtype.element_ty), 16, 16
         )
-        tl.store(
-            p_Ai_32,
-            b_Ai_32.to(p_Ai_32.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
+        _bp_st2d(
+            Ai, T, BT, H * BT, i_t * BT + 32, 48, z16.to(Ai.dtype.element_ty), 16, 16
         )
-        tl.store(
-            p_Ai_41,
-            b_Ai_41.to(p_Ai_41.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
-        )
-        tl.store(
-            p_Ai_42,
-            b_Ai_42.to(p_Ai_42.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
-        )
-        tl.store(
-            p_Ai_43,
-            b_Ai_43.to(p_Ai_43.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
-        )
-        tl.store(p_Ai_12, z16.to(p_Ai_12.dtype.element_ty), boundary_check=(0, 1))
-        tl.store(p_Ai_13, z16.to(p_Ai_13.dtype.element_ty), boundary_check=(0, 1))
-        tl.store(p_Ai_14, z16.to(p_Ai_14.dtype.element_ty), boundary_check=(0, 1))
-        tl.store(p_Ai_23, z16.to(p_Ai_23.dtype.element_ty), boundary_check=(0, 1))
-        tl.store(p_Ai_24, z16.to(p_Ai_24.dtype.element_ty), boundary_check=(0, 1))
-        tl.store(p_Ai_34, z16.to(p_Ai_34.dtype.element_ty), boundary_check=(0, 1))
     else:
         desc_o.store(
             [i_t * BT + 0, 0], b_Ai_11.to(desc_o.dtype, fp_downcast_rounding="rtne")
@@ -606,8 +620,12 @@ def merge_16x16_to_64x64_inverse_kernel(
 def solve_tril(
     A: torch.Tensor,
     cu_seqlens: torch.Tensor | None = None,
-    chunk_indices: torch.LongTensor | None = None,
+    chunk_indices: torch.Tensor | None = None,
     output_dtype: torch.dtype = torch.float,
+    *,
+    sequence_ids: torch.Tensor | None = None,
+    chunk_ids: torch.Tensor | None = None,
+    index_stride: int = 1,
 ) -> torch.Tensor:
     """
     Compute the inverse of the matrix I + A where A is strictly lower triangular.
@@ -617,12 +635,25 @@ def solve_tril(
             [B, T, H, BT], where BT should only be 16, 32, or 64.
             A should be strictly lower triangular, i.e., A.triu() == 0.
         cu_seqlens (torch.Tensor):
-            The cumulative sequence lengths of the input tensor. Default: `None`.
-        chunk_indices (torch.LongTensor):
-            Pre-computed chunk indices. Default: `None`.
+            Integer cumulative sequence lengths with shape `[N+1]`. Supplying
+            it enables variable-length indexing. Default: `None`.
+        chunk_indices (torch.Tensor):
+            Integer `[num_chunks, 2]` tensor containing interleaved sequence
+            and local chunk IDs. Used only for variable-length inputs when
+            separate IDs are not supplied. Default: `None`.
         output_dtype (torch.dtype):
             The dtype of the output tensor. Default: `torch.float`.
             If `None`, the output dtype will be the same as the input dtype.
+        sequence_ids (torch.Tensor):
+            One-dimensional integer sequence IDs on the same device as `A`.
+            Must be passed together with `chunk_ids` for variable-length input.
+        chunk_ids (torch.Tensor):
+            One-dimensional integer local chunk IDs on the same device as `A`.
+            Must be passed together with `sequence_ids`.
+        index_stride (int):
+            Element stride between IDs. Use `1` for separate contiguous ID
+            tensors and `2` for flattened interleaved chunk indices.
+            Default: `1`.
 
     Returns:
         (I + A)^-1 with the same shape as A
@@ -631,9 +662,22 @@ def solve_tril(
     output_dtype = A.dtype if output_dtype is None else output_dtype
 
     B, T, H, BT = A.shape
-    if chunk_indices is None and cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
-    NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
+    if (sequence_ids is None) != (chunk_ids is None):
+        raise ValueError("`sequence_ids` and `chunk_ids` must be provided together.")
+    if index_stride <= 0:
+        raise ValueError(f"`index_stride` must be positive, got {index_stride}.")
+    if cu_seqlens is not None and sequence_ids is None:
+        if chunk_indices is None:
+            chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+        flat_chunk_indices = chunk_indices.reshape(-1)
+        sequence_ids = flat_chunk_indices
+        chunk_ids = flat_chunk_indices[1:]
+        index_stride = 2
+    NT = (
+        len(sequence_ids) // index_stride
+        if cu_seqlens is not None
+        else triton.cdiv(T, BT)
+    )
 
     # `empty_like` is safe because the kernels below explicitly write every
     # in-bounds element of Ai's chunked layout (strict-lower + diagonal + the
@@ -652,10 +696,12 @@ def solve_tril(
         A=A,
         Ai=Ai,
         cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
+        sequence_ids=sequence_ids,
+        chunk_ids=chunk_ids,
         T=T,
         H=H,
         BT=BT,
+        INDEX_STRIDE=index_stride,
         USE_TMA=IS_TMA_SUPPORTED,
     )
     return Ai

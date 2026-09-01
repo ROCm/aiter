@@ -35,9 +35,9 @@ from op_tests.triton_tests.utils.mhc_ref import (
     generate_mhc_post_inputs,
     get_test_shapes,
     is_doubly_stochastic,
+    mhc_e2e_ref,
     mhc_post_torch,
     mhc_torch,
-    mhc_e2e_ref,
 )
 
 try:
@@ -142,6 +142,7 @@ def test_mhc_correctness(M, n, C, dtype):
     """
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
+    torch.manual_seed(0)
 
     x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(
         M, n, C, dtype
@@ -175,6 +176,7 @@ def test_mhc_correctness(M, n, C, dtype):
 def test_mhc_different_epsilon(eps, M, n, C):
     """Test mhc() with different epsilon values for RMSNorm (Eq 15)."""
     torch.cuda.empty_cache()
+    torch.manual_seed(0)
 
     x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(
         M, n, C
@@ -201,6 +203,7 @@ def test_mhc_different_epsilon(eps, M, n, C):
 def test_mhc_different_alpha(alpha_scale):
     """Test mhc() with different scaling factors α (Eq 16)."""
     torch.cuda.empty_cache()
+    torch.manual_seed(0)
 
     M, n, C = 32, 4, 1024
     x, phi, _, _, _, bias, n_streams = generate_mhc_inputs(M, n, C)
@@ -231,6 +234,7 @@ def test_mhc_different_alpha(alpha_scale):
 def test_mhc_zero_input():
     """Test mhc() with zero input (edge case for RMSNorm)."""
     torch.cuda.empty_cache()
+    torch.manual_seed(0)
 
     M, n, C = 16, 4, 512
     nC = n * C
@@ -251,6 +255,7 @@ def test_mhc_zero_input():
 def test_mhc_large_values():
     """Test mhc() numerical stability with large input values."""
     torch.cuda.empty_cache()
+    torch.manual_seed(0)
 
     M, n, C = 32, 4, 1024
     nC = n * C
@@ -276,6 +281,7 @@ def test_mhc_small_shapes(M, n, C, dtype):
     """Quick smoke test for mhc() with representative shapes."""
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
+    torch.manual_seed(0)
 
     x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(
         M, n, C, dtype
@@ -306,6 +312,7 @@ def test_mhc_small_shapes(M, n, C, dtype):
 def test_mhc_output_range():
     """Validate output value ranges for mhc()."""
     torch.cuda.empty_cache()
+    torch.manual_seed(0)
 
     M, n, C = 64, 4, 1024
     x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(
@@ -385,6 +392,7 @@ def test_split_k_correctness(M, n, C, num_ksplit, dtype):
     """Test that split-K matches the PyTorch reference (no Sinkhorn)."""
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
+    torch.manual_seed(0)
 
     x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(
         M, n, C, dtype
@@ -430,6 +438,7 @@ def test_split_k_mhc_full_pipeline(M, n, C, num_ksplit):
     """Test split-K with the full mhc() pipeline including Sinkhorn-Knopp."""
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
+    torch.manual_seed(0)
 
     x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(
         M, n, C
@@ -471,6 +480,7 @@ def test_split_k_mhc_full_pipeline(M, n, C, num_ksplit):
 def test_split_k_various_splits(num_ksplit):
     """Test split-K with various split counts (skip Sinkhorn)."""
     torch.cuda.empty_cache()
+    torch.manual_seed(0)
 
     M, n, C = 32, 4, 1024
     x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(
@@ -525,6 +535,7 @@ def test_split_k_various_splits(num_ksplit):
 def test_split_k_large_k():
     """Test split-K with large K dimension where split-K should be beneficial."""
     torch.cuda.empty_cache()
+    torch.manual_seed(0)
 
     M, n, C = 64, 4, 2048  # K = n * C = 8192
     x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(
@@ -625,8 +636,6 @@ def test_triton_mhc_matches_hip(M, n, C):
 
     rms_eps = 1e-6
     hc_pre_eps = 0.0
-    hc_sinkhorn_eps = 0.0
-    hc_post_mult_value = 2.0
     sinkhorn_repeat = 20
 
     x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(
@@ -723,6 +732,7 @@ def test_triton_mhc_matches_hip(M, n, C):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_mhc_post_correctness(M, n, C, dtype):
     """Test mhc_post against PyTorch reference."""
+    torch.manual_seed(0)
     layer_input, residual, post_mix, comb_mix = generate_mhc_post_inputs(M, n, C, dtype)
     ref = mhc_post_torch(layer_input, residual, post_mix, comb_mix)
     out = mhc_post(None, layer_input, residual, post_mix, comb_mix)
@@ -740,13 +750,14 @@ def test_mhc_post_preallocated_output():
     """Verify in-place path: result is out and matches reference."""
     from aiter.ops.triton.fusions.mhc import mhc_post
     from op_tests.triton_tests.utils.mhc_ref import (
-        mhc_post_torch,
         generate_mhc_post_inputs,
+        mhc_post_torch,
     )
 
     M, n, C = 128, 4, 1024
     dtype = torch.bfloat16
 
+    torch.manual_seed(0)
     layer_input, residual, post_mix, comb_mix = generate_mhc_post_inputs(M, n, C, dtype)
 
     out = torch.empty(M, n, C, dtype=dtype, device=layer_input.device)
@@ -769,13 +780,14 @@ def test_mhc_post_squeeze_post_mix():
     """Pass post_mix as (M, n, 1) — as mhc() emits it."""
     from aiter.ops.triton.fusions.mhc import mhc_post
     from op_tests.triton_tests.utils.mhc_ref import (
-        mhc_post_torch,
         generate_mhc_post_inputs,
+        mhc_post_torch,
     )
 
     M, n, C = 64, 4, 512
     dtype = torch.bfloat16
 
+    torch.manual_seed(0)
     layer_input, residual, post_mix, comb_mix = generate_mhc_post_inputs(M, n, C, dtype)
 
     post_mix_3d = post_mix.unsqueeze(-1)  # (M, n, 1)
@@ -831,7 +843,7 @@ def test_triton_mhc_post_matches_hip(M, n, C, dtype):
     if n != 4:
         pytest.skip("aiter.mhc_post hardcodes hc_mult == 4")
 
-    import aiter.jit.utils.chip_info as chip_info
+    from aiter.jit.utils import chip_info
 
     arch_id = chip_info.get_gfx()
     block = _hip_post_dispatch_block(C, arch_id)
@@ -1064,6 +1076,7 @@ def test_mhc_e2e_correctness(M, n, C, dtype):
     3. h_post and h_res match reference
     """
     sinkhorn_iters = 20
+    torch.manual_seed(0)
     x_l_flat, phi, alpha_pre, alpha_post, alpha_res, bias, _ = generate_mhc_inputs(
         M, n, C, dtype
     )

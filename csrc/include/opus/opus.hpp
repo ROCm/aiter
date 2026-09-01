@@ -202,33 +202,120 @@ template<typename T, typename R = void> struct get_value_type { using type = rem
 template<typename T, typename R = void> using get_value_t = typename get_value_type<T, R>::type;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
-// array, enhanced C like array style
+// sub-byte "packs" (fp4_t/int4_t/uint4_t): ONE logical <8-bit element, cutlass float_e2m1_t style. Full byte standalone/in a C array; opus::array/vector bit-pack it (via is_packs_v) and hand out a proxy reference.
+namespace impl {
+// "pack" trait carrier. `storage` = smallest addressable unit; `num_packs` = logical elements per storage unit (for computing packed byte size).
+template<typename storage_, unsigned int bits_, bool is_signed_ = true>
+struct dpacks {
+    using storage = remove_cvref_t<storage_>;
+    static constexpr unsigned int bits = bits_;
+    static constexpr unsigned int mask = (1 << bits) - 1;
+    static constexpr bool is_signed = is_signed_;
+    static constexpr unsigned int num_packs = sizeof(storage) * 8 / bits;   // logical elements per storage unit
+    storage value;   // holds ONE logical element in the low `bits` bits when standalone
+};
+
+template<typename storage_, unsigned int bits_, unsigned int exp_bits_, unsigned int mantissa_bits_, bool is_signed_ = true>
+struct fpacks : dpacks<storage_, bits_, is_signed_> {
+    static constexpr unsigned int exp_bits = exp_bits_;
+    static constexpr unsigned int mantissa_bits = mantissa_bits_;
+};
+} // namespace impl
+
+template <typename> struct is_packs : false_type {};
+template <typename S, unsigned int B, bool X> struct is_packs<impl::dpacks<S, B, X>> : true_type {};
+template <typename S, unsigned int B, unsigned int E, unsigned int M, bool X> struct is_packs<impl::fpacks<S, B, E, M, X>> : true_type {};
+template <typename T> static constexpr bool is_packs_v = is_packs<remove_cvref_t<T>>::value;
+
+// how many logical elements fit in one storage byte (1 for non-pack scalars)
+template <typename T, typename = void> struct num_packs { static constexpr int value = 1; };
+template <typename T> struct num_packs<T, std::enable_if_t<is_packs_v<T>>> { static constexpr int value = T::num_packs; };
+template <typename T> static constexpr int num_packs_v = num_packs<T>::value;
+
+template <typename T> struct sizeof_bits { static constexpr int value = int(sizeof(T) * 8); };
+template <> struct sizeof_bits<void> { static constexpr int value = 0; };
+template <typename S, unsigned int B, bool X> struct sizeof_bits<impl::dpacks<S, B, X>> { static constexpr int value = impl::dpacks<S, B, X>::bits; };
+template <typename S, unsigned int B, unsigned int E, unsigned int M, bool X> struct sizeof_bits<impl::fpacks<S, B, E, M, X>> { static constexpr int value = impl::fpacks<S, B, E, M, X>::bits; };
+template <class T> static constexpr auto sizeof_bits_v = sizeof_bits<T>::value;
+
+template <typename T, index_t N> static constexpr index_t packed_bytes_v = index_t((index_t(sizeof_bits<T>::value) * N + 7) / 8);
+
+namespace impl {
+template<typename T>
+struct subbyte_reference {
+    using storage = typename T::storage;
+    static constexpr unsigned int bits = T::bits;
+    static constexpr storage vmask = storage((storage(1) << bits) - 1);
+    storage* ptr_;
+    unsigned int idx_;   // logical element index within *ptr_ (0..num_packs-1)
+    OPUS_H_D constexpr subbyte_reference(storage* p, unsigned int i) : ptr_(p), idx_(i) {}
+    OPUS_H_D constexpr subbyte_reference(const subbyte_reference&) = default;
+    OPUS_H_D constexpr T get() const {
+        storage v = storage((storage(*ptr_) >> (idx_ * bits)) & vmask);
+        return __builtin_bit_cast(T, v);
+    }
+    OPUS_H_D constexpr operator T() const { return get(); }
+    OPUS_H_D constexpr const subbyte_reference& operator=(const T& x) const {
+        storage item = storage(__builtin_bit_cast(storage, x) & vmask);
+        storage clr  = storage(~(vmask << (idx_ * bits)));
+        *ptr_ = storage((storage(*ptr_) & clr) | storage(item << (idx_ * bits)));
+        return *this;
+    }
+    OPUS_H_D constexpr const subbyte_reference& operator=(const subbyte_reference& o) const { return *this = o.get(); }
+};
+template<typename T>
+struct const_subbyte_reference {
+    using storage = typename T::storage;
+    static constexpr unsigned int bits = T::bits;
+    static constexpr storage vmask = storage((storage(1) << bits) - 1);
+    const storage* ptr_;
+    unsigned int idx_;
+    OPUS_H_D constexpr const_subbyte_reference(const storage* p, unsigned int i) : ptr_(p), idx_(i) {}
+    OPUS_H_D constexpr const_subbyte_reference(const subbyte_reference<T>& r) : ptr_(r.ptr_), idx_(r.idx_) {}
+    OPUS_H_D constexpr T get() const {
+        storage v = storage((storage(*ptr_) >> (idx_ * bits)) & vmask);
+        return __builtin_bit_cast(T, v);
+    }
+    OPUS_H_D constexpr operator T() const { return get(); }
+};
+} // namespace impl
+
+namespace impl {
+template<typename V, index_t N, bool = is_packs_v<V>> struct array_storage { using type = V; static constexpr index_t count = N; };
+template<typename V, index_t N> struct array_storage<V, N, true> { using type = typename V::storage; static constexpr index_t count = packed_bytes_v<V, N>; };
+}
 template <typename T, index_t N>
 struct array {
     using value_type = remove_cvref_t<T>;
     using type = array<value_type, N>;
-#if 0   // don't define following, just let me be trivially copyable class
+    static constexpr bool is_packed = is_packs_v<value_type>;
+    using storage = typename impl::array_storage<value_type, N>::type;             // value_type, or the pack's byte storage
+    static constexpr index_t nstore = impl::array_storage<value_type, N>::count;   // N, or the packed byte count
+    using reference       = std::conditional_t<is_packed, impl::subbyte_reference<value_type>, value_type&>;
+    using const_reference = std::conditional_t<is_packed, impl::const_subbyte_reference<value_type>, const value_type&>;
+
     OPUS_H_D constexpr array() = default;
-    OPUS_H_D constexpr array(const type& o) { static_for<N>([&](auto i){ content[i.value] = o[i.value]; }); }
-    OPUS_H_D constexpr type& operator=(const type o) { static_for<N>([&](auto i){ content[i.value] = o[i.value]; }); return *this; }
-    template<typename...Z, std::enable_if_t<(std::is_same_v<remove_cvref_t<Z>, value_type> && ...), bool> = true>
-    OPUS_H_D constexpr array(Z&&... zs) : content{zs...}  { /* used for make_array */ }
-#endif
-    OPUS_H_D constexpr value_type& operator[](index_t pos) { return content[pos]; }
-    OPUS_H_D constexpr const value_type& operator[](index_t pos) const { return content[pos]; }
-    template<index_t I> OPUS_H_D constexpr value_type& operator[](number<I>) { return content[I]; }
-    template<index_t I> OPUS_H_D constexpr const value_type& operator[](number<I>) const { return content[I]; }
-    OPUS_H_D constexpr void fill(const T& value) { static_for<N>([&](auto i){ content[i.value] = value; }); }
-    OPUS_H_D constexpr void clear() { fill(static_cast<T>(0)); }
+    template<typename... Z, std::enable_if_t<!is_packs_v<value_type> && sizeof...(Z) == N && (std::is_convertible_v<Z, value_type> && ...), bool> = true>
+    OPUS_H_D constexpr array(Z&&... zs) : content{ static_cast<value_type>(zs)... } {}
+    template<typename... Z, std::enable_if_t<is_packs_v<value_type> && sizeof...(Z) == N && (std::is_convertible_v<Z, value_type> && ...), bool> = true>
+    OPUS_H_D constexpr array(Z... zs) { index_t i = 0; ((void)((*this)[i++] = static_cast<value_type>(zs)), ...); }
+
+    OPUS_H_D constexpr reference       operator[](index_t pos)       { if constexpr (is_packed) return reference(&content[pos / value_type::num_packs], (unsigned)(pos % value_type::num_packs)); else return content[pos]; }
+    OPUS_H_D constexpr const_reference operator[](index_t pos) const { if constexpr (is_packed) return const_reference(&content[pos / value_type::num_packs], (unsigned)(pos % value_type::num_packs)); else return content[pos]; }
+    template<index_t I> OPUS_H_D constexpr reference       operator[](number<I>)       { if constexpr (is_packed) return reference(&content[I / value_type::num_packs], (unsigned)(I % value_type::num_packs)); else return content[I]; }
+    template<index_t I> OPUS_H_D constexpr const_reference operator[](number<I>) const { if constexpr (is_packed) return const_reference(&content[I / value_type::num_packs], (unsigned)(I % value_type::num_packs)); else return content[I]; }
+
+    OPUS_H_D constexpr void fill(const value_type& value) { for (index_t i = 0; i < N; ++i) (*this)[i] = value; }
+    OPUS_H_D constexpr void clear() { if constexpr (is_packed) { for (index_t i = 0; i < nstore; ++i) content[i] = storage(0); } else { fill(static_cast<value_type>(0)); } }
     OPUS_H_D static constexpr bool empty() { return size() == 0; }
     OPUS_H_D static constexpr index_t size() { return N; }
 
-    // we need this "content" member to have a default value, so that the implicitly defined constructor could be constexpr
+    // default member initializer keeps the implicitly-defaulted default ctor constexpr
     // see: https://en.cppreference.com/w/cpp/language/constexpr.html#constexpr_constructor
-    value_type content[N] {};
+    storage content[nstore] {};
 };
 
-template <typename T, index_t N>
+template <typename T, index_t N, std::enable_if_t<!is_packs_v<T>, bool> = true>
 OPUS_H_D constexpr bool operator==(const array<T,N>& x, const array<T,N>& y) { for (index_t i = 0; i < N; ++i) { if (x[i] != y[i]) { return false; } } return true; }
 
 template <typename T, index_t N> OPUS_H_D constexpr void clear(array<T,N>& a) { a.clear(); }
@@ -253,9 +340,10 @@ template<typename D, typename... Types> using array_return_type = opus::array<ty
 }
 template<typename D = void, typename... Types> OPUS_H_D constexpr impl::array_return_type<D, Types...> make_array(Types&&... t) { return {std::forward<Types>(t)...}; }
 
-template <index_t I, typename T, std::enable_if_t<is_array_v<T>, bool> = true> OPUS_H_D constexpr decltype(auto) get(T const& t) { static_assert(I < T::size()); return t[number<I>{}]; }
-template <index_t I, typename T, std::enable_if_t<is_array_v<T>, bool> = true> OPUS_H_D constexpr decltype(auto) get(T&  t)      { static_assert(I < T::size()); return t[number<I>{}]; }
-template <index_t I, typename T, std::enable_if_t<is_array_v<T>, bool> = true> OPUS_H_D constexpr decltype(auto) get(T&& t)      { static_assert(I < T::size()); return t[number<I>{}]; }
+// For packed arrays operator[] yields a proxy; get<> decays it to the value type so make_array/concat_array deduce the element type, not the proxy.
+template <index_t I, typename T, std::enable_if_t<is_array_v<T>, bool> = true> OPUS_H_D constexpr decltype(auto) get(T const& t) { static_assert(I < T::size()); if constexpr (is_packs_v<typename T::value_type>) return typename T::value_type(t[number<I>{}]); else return t[number<I>{}]; }
+template <index_t I, typename T, std::enable_if_t<is_array_v<T>, bool> = true> OPUS_H_D constexpr decltype(auto) get(T&  t)      { static_assert(I < T::size()); if constexpr (is_packs_v<typename T::value_type>) return typename T::value_type(t[number<I>{}]); else return t[number<I>{}]; }
+template <index_t I, typename T, std::enable_if_t<is_array_v<T>, bool> = true> OPUS_H_D constexpr decltype(auto) get(T&& t)      { static_assert(I < T::size()); if constexpr (is_packs_v<typename T::value_type>) return typename T::value_type(t[number<I>{}]); else return t[number<I>{}]; }
 
 namespace impl {
 template <class T0, class T1, index_t... I0, index_t... I1>
@@ -578,9 +666,9 @@ template <index_t cached_vec = 0, typename Sx, typename Sy> OPUS_H_D constexpr a
     else                                return layout_cached<cached_vec, layout<Sx, Sy>>(std::forward<Sx>(s), std::forward<Sy>(t)); }
 template <index_t cached_vec = 0, typename Sx, typename Sy, typename Sz>
 OPUS_H_D constexpr auto                       make_layout(Sx&& s, Sy&& t, Sz&& c) {
-    if constexpr (cached_vec < 0)  return layout<Sx, Sy, Sz>(std::forward<Sx>(s), std::forward<Sy>(t), std::forward<Sz>(c));
-    if constexpr (cached_vec == 0) return layout_linear<layout<Sx, Sy, Sz>>(std::forward<Sx>(s), std::forward<Sy>(t), std::forward<Sz>(c));
-    else                           return layout_cached<cached_vec, layout<Sx, Sy, Sz>>(std::forward<Sx>(s), std::forward<Sy>(t), std::forward<Sz>(c)); }
+    if      constexpr (cached_vec < 0)  return layout<Sx, Sy, Sz>(std::forward<Sx>(s), std::forward<Sy>(t), std::forward<Sz>(c));
+    else if constexpr (cached_vec == 0) return layout_linear<layout<Sx, Sy, Sz>>(std::forward<Sx>(s), std::forward<Sy>(t), std::forward<Sz>(c));
+    else                                return layout_cached<cached_vec, layout<Sx, Sy, Sz>>(std::forward<Sx>(s), std::forward<Sy>(t), std::forward<Sz>(c)); }
 template <index_t cached_vec = 0, typename... Ts, std::enable_if_t<(!is_tuple_v<Ts> && ...), bool> = true>
 OPUS_H_D constexpr auto                       make_layout(Ts&&... ss) { return make_layout<cached_vec>(opus::make_tuple(ss...), packed_shape_to_stride(opus::make_tuple(ss...))); }
 template <index_t cached_vec = 0, typename S> OPUS_H_D constexpr auto make_layout(S&& s) { return make_layout<cached_vec>(std::forward<S>(s), packed_shape_to_stride(s)); }
@@ -643,6 +731,8 @@ struct layout_cached : public remove_cvref_t<Layout> {
     array<index_t, num_issues> offsets;
 };
 
+// Wraps a layout with a *compile-time* offset N. Keeping N in the type lets smem::tr_load lower it into the `offset:` immediate of ds_read_b64_tr_*.
+// Construct it as `layout/layout_linear/layout_cached + number<N>{}`
 template<typename Layout, index_t N>
 struct layout_shifted : public remove_cvref_t<Layout> {
     using base = remove_cvref_t<Layout>;
@@ -651,6 +741,9 @@ struct layout_shifted : public remove_cvref_t<Layout> {
     OPUS_H_D constexpr layout_shifted(const Shape& shape, const Stride& stride, const Coord& coord = {}) : base(shape, stride, coord) {}
     template <typename... Cs>
     OPUS_H_D constexpr auto operator()(Cs&&... cs) const { return base::operator()(std::forward<Cs>(cs)...) + N; }
+
+    OPUS_H_D constexpr layout_shifted& operator+=(index_t offset) { static_cast<base&>(*this) += offset; return *this; }
+    OPUS_H_D constexpr layout_shifted operator+(index_t offset) const { layout_shifted result(*this); static_cast<base&>(result) += offset; return result; }
 };
 
 template<typename T> struct is_layout : false_type {};
@@ -716,15 +809,24 @@ template<typename Layout, index_t vec>
 inline constexpr auto layout_imm_offsets_v = layout_to_offsets<vec>(Layout{typename Layout::Shape{}, typename Layout::Stride{}, typename Layout::Coord{}});
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // vector, a wrapper for __attribute__((ext_vector_type(*)))
+namespace impl {
+template <typename T, index_t N> struct packed_vec : opus::array<T, N> { using base = opus::array<T, N>; using base::base; };
+template<typename V, index_t N, bool = is_packs_v<V>> struct vector_storage { using type = V __attribute__((ext_vector_type(N))); };
+template<typename V, index_t N> struct vector_storage<V, N, true> { using type = packed_vec<V, N>; };
+}
 template <typename V_, index_t N_> // V_ must be literal type, otherwise clang ext_vector_type will not recognize
 struct vector {
     static constexpr index_t N = N_;
     using value_type           = remove_cvref_t<V_>;
-    using type = value_type __attribute__((ext_vector_type(N))); // this is danguous
+    using type = typename impl::vector_storage<value_type, N_>::type;
 };
 template <typename T, index_t N> using vector_t = typename vector<T, N>::type;
 
 template <typename> struct is_vector : false_type {};
+template <typename T, index_t N> struct is_vector<impl::packed_vec<T, N>>    : true_type {};
+template <typename T, index_t N> struct is_vector<impl::packed_vec<T, N>&>   : true_type {};
+template <typename T, index_t N> struct is_vector<const impl::packed_vec<T, N>&> : true_type {};
+template <typename T, index_t N> struct is_vector<impl::packed_vec<T, N>&&>  : true_type {};
 template <typename T, index_t N> struct is_vector<T __attribute((ext_vector_type(N)))> : true_type {};
 template <typename T, index_t N> struct is_vector<T __attribute((ext_vector_type(N)))&> : true_type {};
 template <typename T, index_t N> struct is_vector<const T __attribute((ext_vector_type(N)))&> : true_type {};
@@ -735,6 +837,7 @@ namespace impl {
 template <typename T>            struct vector_traits_impl { using dtype = remove_cvref_t<T>; static constexpr index_t size() { return 1; } };
 template <typename T, index_t N> struct vector_traits_impl<T __attribute__((ext_vector_type(N)))> { using dtype = T; static constexpr index_t size() { return N; } };
 template <typename T, index_t N> struct vector_traits_impl<array<T, N>> { using dtype = T; static constexpr index_t size() { return N; } };
+template <typename T, index_t N> struct vector_traits_impl<impl::packed_vec<T, N>> { using dtype = T; static constexpr index_t size() { return N; } };
 template <typename... T>         struct vector_traits_impl<tuple<T...>> { using dtype = __type_pack_element<0, T...> /*TODO: use first type*/; static constexpr index_t size() { return sizeof...(T); } };
 }
 template <typename T> struct vector_traits : public impl::vector_traits_impl<remove_cvref_t<T>> {};
@@ -904,7 +1007,11 @@ template<typename T> struct is_dtype : false_type {};
 template<typename T> constexpr bool is_dtype_v = is_dtype<remove_cvref_t<T>>::value;    // use this!
 
 REGISTER_DTYPE(fp32, float)
-#if __clang_major__ >= 20   // enable for rocm 7.0+
+// clang>=24 types the half operands of the fp16 matrix-core builtins (wmma_*_f16, mfma_*f16) and of raw_ptr_buffer_atomic_fadd_v2f16 as _Float16, and an __fp16 ext_vector no longer converts to a _Float16 one -- every fp16 mfma/wmma dispatch below is a hard error under __fp16 there. _Float16 is what opus used before clang 20 and what ck_tile still uses; the cost of respelling it is that arithmetic on fp16_t becomes a native half fma (v_fma_f16) instead of the fp32-intermediate v_fma_mixlo_f16, so keep __fp16 on the older compilers rather than shifting their numerics.
+#if __clang_major__ >= 24
+REGISTER_DTYPE(bf16, __bf16)
+REGISTER_DTYPE(fp16, _Float16)
+#elif __clang_major__ >= 20   // enable for rocm 7.0+
 REGISTER_DTYPE(bf16, __bf16)
 REGISTER_DTYPE(fp16, __fp16)
 #else
@@ -921,10 +1028,11 @@ REGISTER_DTYPE(u16 , unsigned short)
 #endif
 REGISTER_DTYPE(i8  , signed char)
 REGISTER_DTYPE(u8  , unsigned char)
+REGISTER_DTYPE(i64 , long long)
+REGISTER_DTYPE(u64 , unsigned long long)
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////
-// numeric_limits -- returns min/max/lowest/quiet_nan/infinity in the *original* dtype
-// (see finfo below for float-valued properties like eps/max/min/tiny)
+// numeric_limits -- returns min/max/lowest/quiet_nan/infinity in the *original* dtype (see finfo below for float-valued properties like eps/max/min/tiny)
 template<typename T> struct numeric_limits;
 
 template<> struct numeric_limits<fp32_t> {
@@ -1120,14 +1228,12 @@ OPUS_D constexpr auto fp32_to_bf16(const fp32_t& x, number<rm> = {}) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wuninitialized"
 #pragma clang diagnostic ignored "-Wc++20-extensions"
-// scalar fp8 <-> fp32 via packed intrinsics (lo slot only). NOT constexpr: clang eagerly rejects non-template
-// constexpr functions containing GPU builtins (__builtin_amdgcn_cvt_*) that can never be compile-time evaluated.
+// scalar fp8 <-> fp32 via packed intrinsics (lo slot only). NOT constexpr: clang eagerly rejects non-template constexpr functions containing GPU builtins (__builtin_amdgcn_cvt_*) that can never be compile-time evaluated.
 // Template constexpr (packed variants, OPUS_CAST_DEFINE) survives because the check is deferred to instantiation.
 // TODO: we may remove constexpr from cast in the future
 OPUS_D auto fp32_to_fp8(const fp32_t& x) {
 #if defined(__HIP_DEVICE_COMPILE__) && !(defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx1250__))
-    // RDNA3/3.5 (gfx1100/gfx115x) lack fp8-conversion-insts; compile-only
-    // stub so headers build. BF16 code paths never invoke fp8 conversion.
+    // RDNA3/3.5 (gfx1100/gfx115x) lack fp8-conversion-insts; compile-only stub so headers build. BF16 code paths never invoke fp8 conversion.
     (void)x; return __builtin_bit_cast(fp8_t, static_cast<signed char>(0));
 #else
     int w; w = __builtin_amdgcn_cvt_pk_fp8_f32(x, 0.0f, w, /*sel=lo*/0);
@@ -1159,42 +1265,6 @@ OPUS_CAST_DEFINE(fp32, fp32)
 OPUS_CAST_DEFINE(i8, fp32)
 OPUS_CAST_DEFINE(fp32, i8)
 
-namespace impl {
-// implement a "pack" of data, storage should pad to multiple of byte(8bit)
-template<typename storage_, unsigned int bits_, bool is_signed_ = true>
-struct dpacks {
-    using storage = remove_cvref_t<storage_>;
-    static constexpr unsigned int bits = bits_;
-    static constexpr unsigned int mask = (1 << bits) - 1;
-    static constexpr bool is_signed = is_signed_;
-    static constexpr unsigned int num_packs = sizeof(storage) * 8 / bits;   // we will not check if evenly divided or not here
-    OPUS_H_D                     constexpr storage operator[](index_t i) const { return (value >> (i * bits)) & mask; } // NOTE: not efficient, better use v_bfi/v_bfe/v_perm on device
-    template<index_t I> OPUS_H_D constexpr storage operator[](number<I>) const { return (value >> (I * bits)) & mask; } // NOTE: not efficient, better use v_bfi/v_bfe/v_perm on device
-    storage value;
-};
-
-template<typename storage_, unsigned int bits_, unsigned int exp_bits_, unsigned int mantissa_bits_, bool is_signed_ = true>
-struct fpacks : dpacks<storage_, bits_, is_signed_> {
-    static constexpr unsigned int exp_bits = exp_bits_;
-    static constexpr unsigned int mantissa_bits = mantissa_bits_;
-};
-} // namespace impl
-
-template <typename> struct is_packs : false_type {};
-template <typename S, unsigned int B, bool X> struct is_packs<impl::dpacks<S, B, X>> : true_type {};
-template <typename S, unsigned int B, unsigned int E, unsigned int M, bool X> struct is_packs<impl::fpacks<S, B, E, M, X>> : true_type {};
-template <typename T> static constexpr bool is_packs_v = is_packs<remove_cvref_t<T>>::value;
-
-// how many real data within one byte
-template <typename T, typename = void> struct num_packs { static constexpr int value = 1; };
-template <typename T> struct num_packs<T, std::enable_if_t<is_packs_v<T>>> { static constexpr int value = T::num_packs; };
-template <typename T> static constexpr int num_packs_v = num_packs<T>::value;
-
-template <typename T> struct sizeof_bits { static constexpr int value = int(sizeof(T) * 8); };
-template <> struct sizeof_bits<void> { static constexpr int value = 0; };
-template <typename S, unsigned int B, bool X> struct sizeof_bits<impl::dpacks<S, B, X>> { static constexpr int value = impl::dpacks<S, B, X>::bits; };
-template <typename S, unsigned int B, unsigned int E, unsigned int M, bool X> struct sizeof_bits<impl::fpacks<S, B, E, M, X>> { static constexpr int value = impl::fpacks<S, B, E, M, X>::bits; };
-template <class T> static constexpr auto sizeof_bits_v = sizeof_bits<T>::value;
 
 #define OPUS_DEFINE_DPACKS(name_, storage_, bits_, is_signed_) \
     struct name_ : opus::impl::dpacks<storage_, bits_, is_signed_> { using base = opus::impl::dpacks<storage_, bits_, is_signed_>; };  \
@@ -1204,12 +1274,11 @@ template <class T> static constexpr auto sizeof_bits_v = sizeof_bits<T>::value;
     struct name_ : opus::impl::fpacks<storage_, bits_, exp_bits_, mantissa_bits_, is_signed_> {using base = opus::impl::fpacks<storage_, bits_, exp_bits_, mantissa_bits_, is_signed_>; };  \
     template<> struct sizeof_bits<name_> { static constexpr int value = name_::bits; }; template<> struct is_packs<name_> : true_type {}; template<> struct is_dtype<name_> : true_type {};
 
-// NOTE: convention here. The subbyte type below is indeed "packed" data. e.g. fp4_t, underneath it is fp4x2 in one byte, but we don't name it this way
-// This is different from cutlass convention (e.g float4_e2m1_t, but storage is unsigned char, hence an array of float4_e2m1_t will be expanded), and different from ck convention(explicitly name it fp4x2_t)
-OPUS_DEFINE_DPACKS(int4_t , unsigned char, 4, true)           // int4x2
-OPUS_DEFINE_DPACKS(uint4_t, unsigned char, 4, false)          // uint4x2
-OPUS_DEFINE_FPACKS(fp4_t,   unsigned char, 4, 2, 1, true)     // fp4x2
-OPUS_DEFINE_FPACKS(e8m0_t,  unsigned char, 8, 8, 0, false)    // fp4x2
+// cutlass-style convention: each type below is ONE logical element (full byte standalone, sizeof_bits==4), and only opus::array/vector bit-pack it -- so array<fp4_t,N> is N values in ceil(N*4/8) bytes (vs the ck fp4x2_t pack).
+OPUS_DEFINE_DPACKS(int4_t , unsigned char, 4, true)           // one int4  element
+OPUS_DEFINE_DPACKS(uint4_t, unsigned char, 4, false)          // one uint4 element
+OPUS_DEFINE_FPACKS(fp4_t,   unsigned char, 4, 2, 1, true)     // one fp4 (e2m1) element
+OPUS_DEFINE_FPACKS(e8m0_t,  unsigned char, 8, 8, 0, false)    // one e8m0 scale (8-bit)
 
 // finfo specializations for subbyte/packed types (defined after OPUS_DEFINE_FPACKS)
 // fp4 E2M1: 1 sign, 2 exp, 1 mantissa, bias=1
@@ -1278,8 +1347,7 @@ OPUS_D constexpr decltype(auto) fold_as_container_of_arr(const S& s, number<fold
     return fold_as_tuple_of_arr(s, make_index_seq<size<S>() / fold_size>{});
 }
 
-// Unfold a tuple-of-sub-results (produced by auto-fold cast) back into a flat container. Used in pair with above
-// matching the original input container type OrigS.
+// Unfold a tuple-of-sub-results (produced by auto-fold cast) back into a flat container, used in pair with above, matching the original input container type OrigS.
 //   OrigS is vector  -> flat vector_t<elem, total>
 //   OrigS is array   -> flat array<elem, total>
 //   OrigS is tuple   -> flat tuple<elem, elem, ...>
@@ -1302,30 +1370,30 @@ OPUS_D constexpr auto unfold_from_container(const Tup& tup) {
 template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true>
 OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x2(const S& s, float scale = 1.0f, number<sel> = {}) {
     u32_t w; w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(w, s[0], s[1], scale, sel);
-    return __builtin_bit_cast(array<fp4_t, 1>, static_cast<u8_t>(w));
+    return __builtin_bit_cast(array<fp4_t, 2>, static_cast<u8_t>(w));
 }
 template<typename S, std::enable_if_t<std::is_same_v<S, fp32x4_t>, bool> = true>
 OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x4(const S& s, float scale = 1.0f) {
     u32_t w; w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(w, s[0], s[1], scale, 0); w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(w, s[2], s[3], scale, 1);
-    return __builtin_bit_cast(array<fp4_t, 2>, static_cast<u16_t>(w));
+    return __builtin_bit_cast(array<fp4_t, 4>, static_cast<u16_t>(w));
 }
 template<typename S, std::enable_if_t<std::is_same_v<S, fp32x8_t>, bool> = true>
 OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x8(const S& s, float scale = 1.0f) {
     u32_t w; w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(w, s[0], s[1], scale, 0); w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(w, s[2], s[3], scale, 1);
     w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(w, s[4], s[5], scale, 2); w = __builtin_amdgcn_cvt_scalef32_pk_fp4_f32(w, s[6], s[7], scale, 3);
-    return __builtin_bit_cast(array<fp4_t, 4>, w);
+    return __builtin_bit_cast(array<fp4_t, 8>, w);
 }
-template<typename S, index_t sel = 0, std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 1>>, bool> = true>
+template<typename S, index_t sel = 0, std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 2>>, bool> = true>
 OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x2(const S& s, float scale = 1.0f, number<sel> = {}) {
     return __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(static_cast<u32_t>(__builtin_bit_cast(u8_t, s)), scale, sel);
 }
-template<typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 2>>, bool> = true>
+template<typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 4>>, bool> = true>
 OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x4(const S& s, float scale = 1.0f) {
     auto ss = static_cast<u32_t>(__builtin_bit_cast(u16_t, s));
     auto x = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(ss, scale, 0); auto y = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(ss, scale, 1);
     return fp32x4_t{x[0], x[1], y[0], y[1]};
 }
-template<typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 4>>, bool> = true>
+template<typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 8>>, bool> = true>
 OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x8(const S& s, float scale = 1.0f) {
     auto ss = static_cast<u32_t>(__builtin_bit_cast(u32_t, s));
     auto x = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(ss, scale, 0); auto y = __builtin_amdgcn_cvt_scalef32_pk_f32_fp4(ss, scale, 1);
@@ -1335,12 +1403,11 @@ OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x8(const S& s, float scale = 
 
 template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, bf16x2_t>, bool> = true>
 OPUS_D constexpr decltype(auto) bf16_to_fp4_packed_x2(const S& s, float scale = 1.0f, number<sel> = {}) {
-    union { unsigned int bitwise; fp4_t fp4_pack[4]; } value;
-    value.bitwise = __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(value.bitwise, s, scale, sel);
-    return value.fp4_pack[0];
+    u32_t w{}; w = __builtin_amdgcn_cvt_scalef32_pk_fp4_bf16(w, s, scale, sel);
+    return __builtin_bit_cast(array<fp4_t, 2>, static_cast<u8_t>(w));   // low byte = 2 packed fp4
 }
-template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, fp4_t>, bool> = true>
-OPUS_D constexpr decltype(auto) fp4_to_bf16_packed_x2(const S& s, float scale = 1.0f, number<sel> = {}) { return __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(s, scale, sel); }
+template<typename S, index_t sel = 0, std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 2>>, bool> = true>
+OPUS_D constexpr decltype(auto) fp4_to_bf16_packed_x2(const S& s, float scale = 1.0f, number<sel> = {}) { return __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(static_cast<u32_t>(__builtin_bit_cast(u8_t, s)), scale, sel); }
 #elif defined(__gfx1250__)
 // gfx1250: pk8 builtins convert 8 fp4 <-> 8 f32 at once
 // f32->fp4: __builtin_amdgcn_cvt_scalef32_pk8_fp4_f32(v8f32 src, float scale) -> i32
@@ -1351,34 +1418,34 @@ template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, fp32x2_
 OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x2(const S& s, float scale = 1.0f, number<sel> = {}) {
     fp32x8_t v{s[0], s[1], 0, 0, 0, 0, 0, 0};
     u32_t w = __builtin_amdgcn_cvt_scalef32_pk8_fp4_f32(v, scale);
-    return __builtin_bit_cast(array<fp4_t, 1>, static_cast<u8_t>(w));
+    return __builtin_bit_cast(array<fp4_t, 2>, static_cast<u8_t>(w));
 }
 template<typename S, std::enable_if_t<std::is_same_v<S, fp32x4_t>, bool> = true>
 OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x4(const S& s, float scale = 1.0f) {
     fp32x8_t v{s[0], s[1], s[2], s[3], 0, 0, 0, 0};
     u32_t w = __builtin_amdgcn_cvt_scalef32_pk8_fp4_f32(v, scale);
-    return __builtin_bit_cast(array<fp4_t, 2>, static_cast<u16_t>(w));
+    return __builtin_bit_cast(array<fp4_t, 4>, static_cast<u16_t>(w));
 }
 template<typename S, std::enable_if_t<std::is_same_v<S, fp32x8_t>, bool> = true>
 OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x8(const S& s, float scale = 1.0f) {
     u32_t w = __builtin_amdgcn_cvt_scalef32_pk8_fp4_f32(s, scale);
-    return __builtin_bit_cast(array<fp4_t, 4>, w);
+    return __builtin_bit_cast(array<fp4_t, 8>, w);
 }
-template<typename S, index_t sel = 0, std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 1>>, bool> = true>
+template<typename S, index_t sel = 0, std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 2>>, bool> = true>
 OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x2(const S& s, float scale = 1.0f, number<sel> = {}) {
     i32_t e = (__builtin_bit_cast(i32_t, scale) >> 23) & 0xFF;
     i32_t scale_e8m0 = e * static_cast<i32_t>(0x01010101);
     fp32x8_t r = __builtin_amdgcn_cvt_scale_pk8_f32_fp4(static_cast<i32_t>(__builtin_bit_cast(u8_t, s)), scale_e8m0, 0);
     return fp32x2_t{r[0], r[1]};
 }
-template<typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 2>>, bool> = true>
+template<typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 4>>, bool> = true>
 OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x4(const S& s, float scale = 1.0f) {
     i32_t e = (__builtin_bit_cast(i32_t, scale) >> 23) & 0xFF;
     i32_t scale_e8m0 = e * static_cast<i32_t>(0x01010101);
     fp32x8_t r = __builtin_amdgcn_cvt_scale_pk8_f32_fp4(static_cast<i32_t>(__builtin_bit_cast(u16_t, s)), scale_e8m0, 0);
     return fp32x4_t{r[0], r[1], r[2], r[3]};
 }
-template<typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 4>>, bool> = true>
+template<typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 8>>, bool> = true>
 OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x8(const S& s, float scale = 1.0f) {
     i32_t e = (__builtin_bit_cast(i32_t, scale) >> 23) & 0xFF;
     i32_t scale_e8m0 = e * static_cast<i32_t>(0x01010101);
@@ -1387,18 +1454,18 @@ OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x8(const S& s, float scale = 
 }
 // bf16<->fp4 stubs for gfx1250 (no pk bf16<->fp4 builtins available)
 template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, bf16x2_t>, bool> = true>
-OPUS_D constexpr decltype(auto) bf16_to_fp4_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f, number<sel> = {}) { return fp4_t{}; }
-template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, fp4_t>, bool> = true>
+OPUS_D constexpr decltype(auto) bf16_to_fp4_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f, number<sel> = {}) { return array<fp4_t, 2>{}; }
+template<typename S, index_t sel = 0, std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 2>>, bool> = true>
 OPUS_D constexpr decltype(auto) fp4_to_bf16_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f, number<sel> = {}) { return bf16x2_t{}; }
 #else
-template<typename S, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true>  OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f) { return array<fp4_t, 1>{}; }
-template<typename S, std::enable_if_t<std::is_same_v<S, fp32x4_t>, bool> = true>  OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x4(const S& /*s*/, float /*scale*/ = 1.0f) { return array<fp4_t, 2>{}; }
-template<typename S, std::enable_if_t<std::is_same_v<S, fp32x8_t>, bool> = true>  OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x8(const S& /*s*/, float /*scale*/ = 1.0f) { return array<fp4_t, 4>{}; }
-template<typename S, std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 1>>, bool> = true>     OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f) { return fp32x2_t{}; }
-template<typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 2>>, bool> = true>     OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x4(const S& /*s*/, float /*scale*/ = 1.0f) { return fp32x4_t{}; }
-template<typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 4>>, bool> = true>     OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x8(const S& /*s*/, float /*scale*/ = 1.0f) { return fp32x8_t{}; }
-template<typename S, std::enable_if_t<std::is_same_v<S, bf16x2_t>, bool> = true>  OPUS_D constexpr decltype(auto) bf16_to_fp4_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f) { return fp4_t{}; }
-template<typename S, std::enable_if_t<std::is_same_v<S, fp4_t>, bool> = true>     OPUS_D constexpr decltype(auto) fp4_to_bf16_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f) { return bf16x2_t{}; }
+template<typename S, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true>  OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f) { return array<fp4_t, 2>{}; }
+template<typename S, std::enable_if_t<std::is_same_v<S, fp32x4_t>, bool> = true>  OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x4(const S& /*s*/, float /*scale*/ = 1.0f) { return array<fp4_t, 4>{}; }
+template<typename S, std::enable_if_t<std::is_same_v<S, fp32x8_t>, bool> = true>  OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x8(const S& /*s*/, float /*scale*/ = 1.0f) { return array<fp4_t, 8>{}; }
+template<typename S, std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 2>>, bool> = true>     OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f) { return fp32x2_t{}; }
+template<typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 4>>, bool> = true>     OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x4(const S& /*s*/, float /*scale*/ = 1.0f) { return fp32x4_t{}; }
+template<typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 8>>, bool> = true>     OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x8(const S& /*s*/, float /*scale*/ = 1.0f) { return fp32x8_t{}; }
+template<typename S, std::enable_if_t<std::is_same_v<S, bf16x2_t>, bool> = true>  OPUS_D constexpr decltype(auto) bf16_to_fp4_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f) { return array<fp4_t, 2>{}; }
+template<typename S, std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 2>>, bool> = true>     OPUS_D constexpr decltype(auto) fp4_to_bf16_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f) { return bf16x2_t{}; }
 #endif
 #pragma clang diagnostic pop
 
@@ -1417,11 +1484,11 @@ template<typename D, typename S, typename... Aux, std::enable_if_t<std::is_same_
 OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return fp32_to_fp4_packed_x4(s, std::forward<Aux>(aux)...); }
 template<typename D, typename S, typename... Aux, std::enable_if_t<std::is_same_v<S, fp32x8_t> && std::is_same_v<D, fp4_t>, bool> = true>
 OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return fp32_to_fp4_packed_x8(s, std::forward<Aux>(aux)...); }
-template<typename D, typename S, typename... Aux, std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 1>> && std::is_same_v<D, fp32_t>, bool> = true>
+template<typename D, typename S, typename... Aux, std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 2>> && std::is_same_v<D, fp32_t>, bool> = true>
 OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return fp4_to_fp32_packed_x2(s, std::forward<Aux>(aux)...); }
-template<typename D, typename S, typename... Aux, std::enable_if_t<std::is_same_v<S, array<fp4_t, 2>> && std::is_same_v<D, fp32_t>, bool> = true>
-OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return fp4_to_fp32_packed_x4(s, std::forward<Aux>(aux)...); }
 template<typename D, typename S, typename... Aux, std::enable_if_t<std::is_same_v<S, array<fp4_t, 4>> && std::is_same_v<D, fp32_t>, bool> = true>
+OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return fp4_to_fp32_packed_x4(s, std::forward<Aux>(aux)...); }
+template<typename D, typename S, typename... Aux, std::enable_if_t<std::is_same_v<S, array<fp4_t, 8>> && std::is_same_v<D, fp32_t>, bool> = true>
 OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) { return fp4_to_fp32_packed_x8(s, std::forward<Aux>(aux)...); }
 
 namespace impl {
@@ -1461,7 +1528,7 @@ OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) {
 // entry point for vectorized cast(), for dpacks
 template<typename D, typename S, typename... Aux, std::enable_if_t<((is_vector_v<S> || is_tuple_v<S> || is_array_v<S>) && (is_packs_v<D> || is_packs_v<get_value_t<S>>))
     && !(is_any_of_v<S, fp32x2_t, fp32x4_t, fp32x8_t> && std::is_same_v<D, fp4_t >)         // fp32
-    && !(is_any_of_v<S, fp4_t, array<fp4_t, 1>, array<fp4_t, 2>, array<fp4_t, 4>, tuple_array<fp4_t, 1>, tuple_array<fp4_t, 2>, tuple_array<fp4_t, 4>> && std::is_same_v<D, fp32_t>)
+    && !(is_any_of_v<S, fp4_t, array<fp4_t, 2>, array<fp4_t, 4>, array<fp4_t, 8>, tuple_array<fp4_t, 2>, tuple_array<fp4_t, 4>, tuple_array<fp4_t, 8>> && std::is_same_v<D, fp32_t>)
 , bool> = true>
 OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) {
     constexpr index_t num_packs_ = [&](){   // TODO: how to consider both D and S are packs?
@@ -1473,9 +1540,11 @@ OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) {
                     return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<4>{}), make_index_seq<size<S>() / 4>{}, std::forward<Aux>(aux)...)); }
     else if constexpr (std::is_same_v<get_value_t<S>, fp32_t> && size<S>() % 2 == 0 && std::is_same_v<D, fp4_t>) { // fp32 -> fp4 , x2N
                     return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<2>{}), make_index_seq<size<S>() / 2>{}, std::forward<Aux>(aux)...)); }
-    else if constexpr (std::is_same_v<get_value_t<S>, fp4_t> && size<S>() % 4 == 0) { // fp4 -> fp32 , x8N
+    else if constexpr (std::is_same_v<get_value_t<S>, fp4_t> && size<S>() % 8 == 0) { // fp4 -> fp32 , 8 values/group
+                    return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_arr(s, number<8>{}), make_index_seq<size<S>() / 8>{}, std::forward<Aux>(aux)...)); }
+    else if constexpr (std::is_same_v<get_value_t<S>, fp4_t> && size<S>() % 4 == 0) { // fp4 -> fp32 , 4 values/group
                     return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_arr(s, number<4>{}), make_index_seq<size<S>() / 4>{}, std::forward<Aux>(aux)...)); }
-    else if constexpr (std::is_same_v<get_value_t<S>, fp4_t> && size<S>() % 2 == 0) { // fp4 -> fp32 , x4N
+    else if constexpr (std::is_same_v<get_value_t<S>, fp4_t> && size<S>() % 2 == 0) { // fp4 -> fp32 , 2 values/group
                     return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_arr(s, number<2>{}), make_index_seq<size<S>() / 2>{}, std::forward<Aux>(aux)...)); }
     else            return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<num_packs_>{}), make_index_seq<size<S>() / num_packs_>{}, std::forward<Aux>(aux)...));
 }
@@ -1541,8 +1610,7 @@ OPUS_H_D constexpr index_t get_smem_size()
 }
 
 // ---- Device intrinsic wrappers ----
-// Replace HIP runtime macros (threadIdx.x, __syncthreads, __all, etc.) so kernels compile
-// with just #include <opus/opus.hpp> -- no <hip/hip_runtime.h> needed.
+// Replace HIP runtime macros (threadIdx.x, __syncthreads, __all, etc.) so kernels compile with just #include <opus/opus.hpp> -- no <hip/hip_runtime.h> needed.
 OPUS_D index_t thread_id_x() { return __builtin_amdgcn_workitem_id_x(); }
 OPUS_D index_t thread_id_y() { return __builtin_amdgcn_workitem_id_y(); }
 OPUS_D index_t thread_id_z() { return __builtin_amdgcn_workitem_id_z(); }
@@ -1552,6 +1620,16 @@ OPUS_D index_t block_id_z()  { return __builtin_amdgcn_workgroup_id_z(); }
 OPUS_D index_t block_size_x() { return __builtin_amdgcn_workgroup_size_x(); }
 OPUS_D index_t block_size_y() { return __builtin_amdgcn_workgroup_size_y(); }
 OPUS_D index_t block_size_z() { return __builtin_amdgcn_workgroup_size_z(); }
+#if defined(__gfx1250__)
+OPUS_D index_t cluster_workgroup_id_x() {return __builtin_amdgcn_cluster_workgroup_id_x();}
+OPUS_D index_t cluster_workgroup_id_y() {return __builtin_amdgcn_cluster_workgroup_id_y();}
+OPUS_D index_t cluster_workgroup_id_z() {return __builtin_amdgcn_cluster_workgroup_id_z();}
+OPUS_D index_t cluster_workgroup_flat_id() {return __builtin_amdgcn_cluster_workgroup_flat_id();}
+OPUS_D index_t cluster_id_x() {return __builtin_amdgcn_cluster_id_x();}
+OPUS_D index_t cluster_id_y() {return __builtin_amdgcn_cluster_id_y();}
+OPUS_D index_t cluster_id_z() {return __builtin_amdgcn_cluster_id_z();}
+#endif
+// grid x-z switch to cluster_id when cluster enable in gfx1250
 OPUS_D index_t grid_size_x()  { return __builtin_amdgcn_grid_size_x(); }
 OPUS_D index_t grid_size_y()  { return __builtin_amdgcn_grid_size_y(); }
 OPUS_D index_t grid_size_z()  { return __builtin_amdgcn_grid_size_z(); }
@@ -1615,6 +1693,34 @@ OPUS_D unsigned int lane_id() {
     else return __builtin_amdgcn_mbcnt_hi(-1, __builtin_amdgcn_mbcnt_lo(-1, 0));
 }
 
+//gfx1250 only feature. Named-barrier / cluster-sync builtins + __amdgpu_named_workgroup_barrier_t only exist on clang>=22 (ROCm>=7.2); gate the host pass too so clang-20 (ROCm 7.1) CI does not parse them.
+#if (defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)) && (__clang_major__ >= 22)
+OPUS_D u32_t waveid_in_workgroup() { u32_t wave_id; asm volatile("s_bfe_u32 %0, ttmp8, 0x50019" : "=s"(wave_id)); return wave_id; }
+
+//Named Barrier define
+#define DECLARE_NAMED_BARRIERS() \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_1; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_2; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_3; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_4; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_5; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_6; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_7; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_8; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_9; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_10; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_11; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_12; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_13; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_14; \
+    __shared__ __amdgpu_named_workgroup_barrier_t __nbar_15;
+
+OPUS_D void s_barrier_init_ptr(__amdgpu_named_workgroup_barrier_t* bar, u32_t member_cnt) { __builtin_amdgcn_s_barrier_init(bar, member_cnt); }
+OPUS_D void s_barrier_join_ptr(__amdgpu_named_workgroup_barrier_t* bar)                      { __builtin_amdgcn_s_barrier_join(bar); }
+OPUS_D void sync_cluster()   { __builtin_amdgcn_s_barrier_signal(-3); __builtin_amdgcn_s_barrier_wait(-3); }
+OPUS_D void sync_workgroup() { __builtin_amdgcn_s_barrier_signal(-1); __builtin_amdgcn_s_barrier_wait(-1); }
+#endif
+
 // cross-lane shuffle via ds_bpermute (no hip_runtime.h dependency)
 template<typename T>
 OPUS_D T shfl(T var, int src_lane, int width = get_warp_size()) {
@@ -1653,6 +1759,83 @@ OPUS_D __amdgpu_buffer_rsrc_t make_buffer_rsrc(const void* ptr, unsigned int siz
 OPUS_D void llvm_amdgcn_raw_buffer_load_lds(i32x4_t r, OPUS_LDS_ADDR unsigned int* p, index_t size, index_t vos, index_t sos, index_t ios, index_t aux) __asm("llvm.amdgcn.raw.buffer.load.lds");
 #pragma clang diagnostic pop
 #endif
+
+// ── buffer atomic feature guards ───────────────────────────────────────────────
+// per BuiltinsAMDGPU.td / IntrinsicsAMDGPU.td:
+//   fadd.f32     : atomic-fadd-rtn-insts                 (gfx908+, incl. gfx942/gfx950/gfx1250)
+//   fadd.v2f16   : atomic-buffer-global-pk-add-f16-insts (gfx942/gfx950/gfx1250)
+//   fadd.v2bf16  : raw_buffer_atomic_fadd<v2bf16>        (gfx90a/gfx942/gfx950/gfx12+; gated to gfx950/gfx1250 per request)
+//   fmin/fmax.f32: atomic-fmin-fmax-global-f32           (gfx950/gfx1250)
+#if defined(__gfx908__) || defined(__gfx90a__) || defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1250__) || defined(__gfx1200__) || defined(__gfx1201__)
+#define OPUS_HAS_BUFFER_ATOMIC_FADD_F32 1
+#else
+#define OPUS_HAS_BUFFER_ATOMIC_FADD_F32 0
+#endif
+#if defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1250__)
+#define OPUS_HAS_BUFFER_ATOMIC_PK_ADD_F16 1
+#else
+#define OPUS_HAS_BUFFER_ATOMIC_PK_ADD_F16 0
+#endif
+#if defined(__gfx950__) || defined(__gfx1250__)
+#define OPUS_HAS_BUFFER_ATOMIC_PK_ADD_BF16 1
+#else
+#define OPUS_HAS_BUFFER_ATOMIC_PK_ADD_BF16 0
+#endif
+#if defined(__gfx950__) || defined(__gfx1250__)
+#define OPUS_HAS_BUFFER_ATOMIC_FMINMAX_F32 1
+#else
+#define OPUS_HAS_BUFFER_ATOMIC_FMINMAX_F32 0
+#endif
+
+// __builtin_amdgcn_raw_ptr_buffer_atomic_fadd_{f32,v2f16} (opaque rsrc) only exist on clang>=22 / ROCm>=7.2; __has_builtin picks the builtin where present, else the __asm LLVM-intrinsic fallback (i32x4 rsrc, below) -- no -D flag or version literal needed.
+#ifndef OPUS_HAS_RAW_PTR_ATOMIC_FADD_F32_BUILTIN
+#if defined(__has_builtin) && __has_builtin(__builtin_amdgcn_raw_ptr_buffer_atomic_fadd_f32)
+#define OPUS_HAS_RAW_PTR_ATOMIC_FADD_F32_BUILTIN 1
+#else
+#define OPUS_HAS_RAW_PTR_ATOMIC_FADD_F32_BUILTIN 0
+#endif
+#endif
+#ifndef OPUS_HAS_RAW_PTR_ATOMIC_FADD_V2F16_BUILTIN
+#if defined(__has_builtin) && __has_builtin(__builtin_amdgcn_raw_ptr_buffer_atomic_fadd_v2f16)
+#define OPUS_HAS_RAW_PTR_ATOMIC_FADD_V2F16_BUILTIN 1
+#else
+#define OPUS_HAS_RAW_PTR_ATOMIC_FADD_V2F16_BUILTIN 0
+#endif
+#endif
+
+#ifndef OPUS_HAS_UNSIGNED_TENSOR_D0
+#if __clang_major__ >= 24
+#define OPUS_HAS_UNSIGNED_TENSOR_D0 1
+#else
+#define OPUS_HAS_UNSIGNED_TENSOR_D0 0
+#endif
+#endif
+
+// No clang builtin for these (only global/flat/ds, never raw_(ptr_)buffer), so each binds the LLVM IR int_amdgcn_raw_buffer_atomic_* via __asm under one -Wundefined-inline silence; rsrc is the i32x4 form (memcpy'd, non-copyable): fadd.v2bf16=packed bf16 add, cmpswap.i32=32-bit CAS (emulates pk fadd where unsupported), add.i32=i32 add (aux drives returning-bit+scope).
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wundefined-inline"
+#if OPUS_HAS_BUFFER_ATOMIC_PK_ADD_BF16
+OPUS_D bf16x2_t llvm_amdgcn_raw_buffer_atomic_fadd_v2bf16(bf16x2_t vdata, i32x4_t rsrc, index_t voffset, index_t soffset, index_t aux) __asm("llvm.amdgcn.raw.buffer.atomic.fadd.v2bf16");
+#endif
+// fadd.f32 / fadd.v2f16 __asm fallbacks for toolchains without the raw_ptr builtins (clang < 22).
+#if OPUS_HAS_BUFFER_ATOMIC_FADD_F32 && !OPUS_HAS_RAW_PTR_ATOMIC_FADD_F32_BUILTIN
+OPUS_D fp32_t llvm_amdgcn_raw_buffer_atomic_fadd_f32(fp32_t vdata, i32x4_t rsrc, index_t voffset, index_t soffset, index_t aux) __asm("llvm.amdgcn.raw.buffer.atomic.fadd.f32");
+#endif
+#if OPUS_HAS_BUFFER_ATOMIC_PK_ADD_F16 && !OPUS_HAS_RAW_PTR_ATOMIC_FADD_V2F16_BUILTIN
+OPUS_D fp16x2_t llvm_amdgcn_raw_buffer_atomic_fadd_v2f16(fp16x2_t vdata, i32x4_t rsrc, index_t voffset, index_t soffset, index_t aux) __asm("llvm.amdgcn.raw.buffer.atomic.fadd.v2f16");
+#endif
+OPUS_D i32_t llvm_amdgcn_raw_buffer_atomic_cmpswap_i32(i32_t src, i32_t cmp, i32x4_t rsrc, index_t voffset, index_t soffset, index_t aux) __asm("llvm.amdgcn.raw.buffer.atomic.cmpswap.i32");
+OPUS_D i32_t llvm_amdgcn_raw_buffer_atomic_add_i32(i32_t vdata, i32x4_t rsrc, index_t voffset, index_t soffset, index_t aux) __asm("llvm.amdgcn.raw.buffer.atomic.add.i32");
+#pragma clang diagnostic pop
+
+#if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
+enum class atomic_scope : u8_t { cu=0, se=1, dev=2, sys=3 };   // VMEM cache scope[4:3] for atomics
+// RMW-atomic cpol (NOT make_cpol's load hints): TH[0]=returning (1=>returns pre-op value, tracked by LOADcnt; 0=>non-ret, STOREcnt), TH[1]=NT, TH[2]=cascade (defer scope of non-ret atomics; keep 0 for gates), scope[4:3]=cu/se/dev/sys (cross-cluster needs >=dev).
+OPUS_H_D constexpr int make_atomic_cpol(atomic_scope sc = atomic_scope::dev, bool returning = true, bool nt = false, bool cascade = false) { return (returning ? 1 : 0) | (nt ? (1 << 1) : 0) | (cascade ? (1 << 2) : 0) | ((int(sc) & 0x3) << 3); }
+static_assert(make_atomic_cpol(atomic_scope::dev, true, true, false) == 19, "atomic cpol layout drift");
+static_assert(make_atomic_cpol(atomic_scope::sys, false, false, false) == 24, "atomic cpol layout drift");
+#endif
+
 template<typename T_>
 struct gmem {
     using T = remove_cvref_t<T_>;
@@ -1731,8 +1914,88 @@ struct gmem {
         if      constexpr (sizeof(vector_type<vec>) == 1)  { __builtin_amdgcn_raw_buffer_store_b8  (__builtin_bit_cast(i8_t,    x), cached_rsrc, v_os, s_os, aux); }
         else if constexpr (sizeof(vector_type<vec>) == 2)  { __builtin_amdgcn_raw_buffer_store_b16 (__builtin_bit_cast(i16_t,   x), cached_rsrc, v_os, s_os, aux); }
         else if constexpr (sizeof(vector_type<vec>) == 4)  { __builtin_amdgcn_raw_buffer_store_b32 (__builtin_bit_cast(i32_t,   x), cached_rsrc, v_os, s_os, aux); }
-        else if constexpr (sizeof(vector_type<vec>) == 8)  { __builtin_amdgcn_raw_buffer_store_b64 (__builtin_bit_cast(i32x2_t, x), cached_rsrc, v_os, s_os, aux); }
-        else if constexpr (sizeof(vector_type<vec>) == 16) { __builtin_amdgcn_raw_buffer_store_b128(__builtin_bit_cast(i32x4_t, x), cached_rsrc, v_os, s_os, aux); }
+        else if constexpr (sizeof(vector_type<vec>) == 8)  { __builtin_amdgcn_raw_buffer_store_b64 (__builtin_bit_cast(u32x2_t, x), cached_rsrc, v_os, s_os, aux); }
+        else if constexpr (sizeof(vector_type<vec>) == 16) {
+#if defined(__gfx1250__) && (__clang_major__ <= 22)
+            // clang<=22 (HIP<=7.2) miscompiles bounded b128 store under high C-store reg expansion (large gfx1250 clusterlaunch tiles, e.g. 128x128): sinks the uniform voffset part into the buffer BASE via readfirstlane, corrupting high address bits and bypassing the num_records bound -> OOB fault. Inline-asm barrier keeps voffset opaque so the full offset stays in the bounds-checked VGPR. Fixed in clang-23/HIP 7.14, where this branch compiles out.
+            int vo_ = v_os;
+            asm volatile("" : "+v"(vo_));
+            __builtin_amdgcn_raw_buffer_store_b128(__builtin_bit_cast(u32x4_t, x), cached_rsrc, vo_, s_os, aux);
+#else
+            __builtin_amdgcn_raw_buffer_store_b128(__builtin_bit_cast(u32x4_t, x), cached_rsrc, v_os, s_os, aux);
+#endif
+        }
+    }
+
+    // CAS-loop fallback: emulate a packed fp16/bf16 atomic-add on the 32-bit word at (vo,s_os) when the arch lacks native pk_add -- read the word, add in fp32, write back via cmpswap, retry until the compare succeeds. add_pk is the increment as an fp32x2 (lo,hi lanes).
+    template<typename Pk>
+    OPUS_D Pk _atomic_pk_add_cas(const Pk& add_pk, int vo, int s_os, index_t aux) {
+        i32x4_t rsrc_; __builtin_memcpy(&rsrc_, &cached_rsrc, sizeof(i32x4_t));
+        i32_t old = __builtin_bit_cast(i32_t, _load<1>(vo, s_os, number<0>{}));   // seed with a normal read of the word
+        i32_t assumed;
+        do {
+            assumed = old;
+            Pk cur = __builtin_bit_cast(Pk, assumed);
+            Pk nxt;
+            if constexpr (std::is_same_v<scalar_type, bf16_t>) {
+                nxt[0] = fp32_to_bf16(bf16_to_fp32(cur[0]) + bf16_to_fp32(add_pk[0]));
+                nxt[1] = fp32_to_bf16(bf16_to_fp32(cur[1]) + bf16_to_fp32(add_pk[1]));
+            } else { // fp16
+                nxt[0] = fp32_to_fp16(fp16_to_fp32(cur[0]) + fp16_to_fp32(add_pk[0]));
+                nxt[1] = fp32_to_fp16(fp16_to_fp32(cur[1]) + fp16_to_fp32(add_pk[1]));
+            }
+            old = llvm_amdgcn_raw_buffer_atomic_cmpswap_i32(__builtin_bit_cast(i32_t, nxt), assumed, rsrc_, vo, s_os, aux);
+        } while (old != assumed);
+        return __builtin_bit_cast(Pk, old);
+    }
+
+    // buffer atomic add. v_os/ioffset in BYTES (ioffset compile-time -> folded into the immediate offset: field, v_os stays in a VGPR). Returns the old value. Dispatch on (scalar_type,total): f32x1/f16x2/bf16x2/i32x1/u32x1; packed types fall back to a cmpswap loop on archs lacking native pk_add.
+    template<index_t vec = 1, index_t ioffset = 0, typename V, index_t aux = 0>   // os in unit of byte
+    OPUS_D auto _atomic_add(const V& x, int v_os, int s_os = 0, number<ioffset> = {}, number<aux> = {}) {
+        using type = vector_type<vec>;
+        constexpr index_t total = vec * vector_size;
+        const int vo = v_os + ioffset;
+        static_assert((std::is_same_v<scalar_type, fp32_t> && total == 1) ||
+                      (std::is_same_v<scalar_type, fp16_t> && total == 2) ||
+                      (std::is_same_v<scalar_type, bf16_t> && total == 2) ||
+                      ((std::is_same_v<scalar_type, i32_t> || std::is_same_v<scalar_type, u32_t>) && total == 1),
+                      "unsupported atomic_add (scalar_type, vec) combination");
+#if defined(__HIP_DEVICE_COMPILE__)
+        if constexpr (std::is_same_v<scalar_type, fp32_t> && total == 1) {
+            static_assert(OPUS_HAS_BUFFER_ATOMIC_FADD_F32, "buffer_atomic_add f32 not supported on this arch");
+#if OPUS_HAS_BUFFER_ATOMIC_FADD_F32
+#if OPUS_HAS_RAW_PTR_ATOMIC_FADD_F32_BUILTIN
+            return __builtin_bit_cast(type, __builtin_amdgcn_raw_ptr_buffer_atomic_fadd_f32(__builtin_bit_cast(fp32_t, x), cached_rsrc, vo, s_os, aux));
+#else
+            i32x4_t rsrc_; __builtin_memcpy(&rsrc_, &cached_rsrc, sizeof(i32x4_t));   // __amdgpu_buffer_rsrc_t is non-copyable
+            return __builtin_bit_cast(type, llvm_amdgcn_raw_buffer_atomic_fadd_f32(__builtin_bit_cast(fp32_t, x), rsrc_, vo, s_os, aux));
+#endif
+#endif
+        } else if constexpr (std::is_same_v<scalar_type, fp16_t> && total == 2) {
+#if OPUS_HAS_BUFFER_ATOMIC_PK_ADD_F16
+#if OPUS_HAS_RAW_PTR_ATOMIC_FADD_V2F16_BUILTIN
+            return __builtin_bit_cast(type, __builtin_amdgcn_raw_ptr_buffer_atomic_fadd_v2f16(__builtin_bit_cast(fp16x2_t, x), cached_rsrc, vo, s_os, aux));
+#else
+            i32x4_t rsrc_; __builtin_memcpy(&rsrc_, &cached_rsrc, sizeof(i32x4_t));   // __amdgpu_buffer_rsrc_t is non-copyable
+            return __builtin_bit_cast(type, llvm_amdgcn_raw_buffer_atomic_fadd_v2f16(__builtin_bit_cast(fp16x2_t, x), rsrc_, vo, s_os, aux));
+#endif
+#else
+            return __builtin_bit_cast(type, _atomic_pk_add_cas(__builtin_bit_cast(fp16x2_t, x), vo, s_os, aux));
+#endif
+        } else if constexpr (std::is_same_v<scalar_type, bf16_t> && total == 2) {
+#if OPUS_HAS_BUFFER_ATOMIC_PK_ADD_BF16
+            i32x4_t rsrc_; __builtin_memcpy(&rsrc_, &cached_rsrc, sizeof(i32x4_t));   // __amdgpu_buffer_rsrc_t is non-copyable
+            return __builtin_bit_cast(type, llvm_amdgcn_raw_buffer_atomic_fadd_v2bf16(__builtin_bit_cast(bf16x2_t, x), rsrc_, vo, s_os, aux));
+#else
+            return __builtin_bit_cast(type, _atomic_pk_add_cas(__builtin_bit_cast(bf16x2_t, x), vo, s_os, aux));
+#endif
+        } else /* i32/u32 */ {
+            i32x4_t rsrc_; __builtin_memcpy(&rsrc_, &cached_rsrc, sizeof(i32x4_t));   // __amdgpu_buffer_rsrc_t is non-copyable
+            return __builtin_bit_cast(type, llvm_amdgcn_raw_buffer_atomic_add_i32(__builtin_bit_cast(i32_t, x), rsrc_, vo, s_os, aux));
+        }
+#else
+        (void)vo; (void)s_os; return type{};   // host: never codegen'd, body present only to satisfy parsing
+#endif
     }
 
     template<index_t vec = 1, index_t aux = 0>   // os in unit of T and cast to vector with vec
@@ -1749,6 +2012,34 @@ struct gmem {
         } else {
             static_assert((vec * vector_size) == vector_traits<V>::size(), "vector size need to be same, please check" );
             _store<vec>(x, v_os * sizeof(T), s_os * sizeof(T), number<aux>{});
+        }
+    }
+
+    // atomic add. v_os / s_os in unit of T; ioffset is a compile-time element offset folded into the instruction immediate offset: field (also in unit of T). Returns the old value. x must match vec*vector_size.
+    template<index_t vec = 1, index_t ioffset = 0, typename V, index_t aux = 0, std::enable_if_t<(is_vector_v<V> || is_dtype_v<V> || is_array_v<V>), bool> = true>
+    OPUS_D auto atomic_add(const V& x, int v_os, int s_os = 0, number<ioffset> = {}, number<aux> = {}) {
+        static_assert(std::is_same_v<typename vector_traits<V>::dtype, scalar_type>, "scalar type must match for atomic_add");
+        static_assert((vec * vector_size) == vector_traits<V>::size(), "vector size need to be same, please check");
+        return _atomic_add<vec, ioffset * static_cast<index_t>(sizeof(T))>(x, v_os * sizeof(T), s_os * sizeof(T), number<ioffset * static_cast<index_t>(sizeof(T))>{}, number<aux>{});
+    }
+
+    // bulk atomic add over a tile layout. value is array/vector of partials, one vec per issue.
+    template<index_t vec = 1, typename V, typename Layout, index_t aux = 0, std::enable_if_t<((is_array_v<V> || is_vector_v<V>) && is_layout_v<Layout>), bool> = true>
+    OPUS_D void atomic_add(const V& x, const Layout& u, int s_os = 0, number<aux> = {})
+    {
+        using LT = layout_load_traits<Layout, vec>;
+        constexpr auto r_elem = LT::r_elem;
+        auto offsets = layout_to_offsets<vec>(u);
+#if OPUS_TILE_CONTAINER == 0
+        auto a_ = [&](){ if constexpr (is_array_v<V>) return to_vector(x);
+                         else if constexpr (is_vector_v<V>) return x; }();
+#elif OPUS_TILE_CONTAINER == 1
+        auto a_ = to_array(x);
+#endif
+        for (index_t i = 0; i < r_elem.value; i++) {
+            vector_type<vec> v_;
+            for (index_t j = 0; j < vec * vector_size; j++) v_[j] = a_[i * vec * vector_size + j];
+            atomic_add<vec>(v_, offsets[i], s_os, number<0>{}, number<aux>{});   // offsets are in element units
         }
     }
 
@@ -1910,8 +2201,16 @@ struct smem {
         else if constexpr (elem_bits == 4)  { asm volatile("ds_read_b64_tr_b4 %0, %1 offset:%2\n" : "=v"(raw) : "v"(addr), "i"(imm_offset) : "memory"); }
         else { static_assert(sizeof(T_) == 0, "smem::_tr_load: unsupported scalar type"); }
         return __builtin_bit_cast(type, raw);
+#elif defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1250__)
+        using type = vector_type<vec>;
+        constexpr index_t elem_bits = sizeof_bits_v<scalar_type>;
+        OPUS_LDS_ADDR char* p = ptr + v_os + imm_offset;
+        if      constexpr (elem_bits == 16) { return __builtin_bit_cast(type, __builtin_amdgcn_ds_load_tr16_b128_v8i16(reinterpret_cast<OPUS_LDS_ADDR i16x8_t*>(p))); }
+        else if constexpr (elem_bits == 8)  { return __builtin_bit_cast(type, __builtin_amdgcn_ds_load_tr8_b64_v2i32(reinterpret_cast<OPUS_LDS_ADDR i32x2_t*>(p))); }
+        else if constexpr (elem_bits == 4)  { return __builtin_bit_cast(type, __builtin_amdgcn_ds_load_tr4_b64_v2i32(reinterpret_cast<OPUS_LDS_ADDR i32x2_t*>(p))); }
+        else { static_assert(sizeof(T_) == 0, "smem::_tr_load: unsupported scalar type"); return type{}; }
 #elif defined(__HIP_DEVICE_COMPILE__)
-        static_assert(sizeof(T_) == 0, "smem::_tr_load requires __gfx950__");
+        static_assert(sizeof(T_) == 0, "smem::_tr_load requires __gfx950__ or __gfx1250__");
         return _load<vec>(v_os + imm_offset);
 #else
         return _load<vec>(v_os + imm_offset);
@@ -2110,6 +2409,553 @@ struct smem {
 template<typename T_> OPUS_D decltype(auto) make_smem(T_* ptr) { return smem<T_>{ptr}; }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
+// tdm (gfx1250): the tensor-DMA tile window -- tdm_traits configures, tdm_desc is the descriptor, tdm is what kernels call. Gated on clang>=22 (ROCm>=7.2), host pass included, so clang-20 CI never parses the DMA opcodes.
+#if (defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)) && (__clang_major__ >= 22)
+
+namespace impl {
+// Every D# byte figure is sizeof(element), so a sub-byte pack (fp4_t/int4_t/uint4_t) may only appear as the one whole byte, array<fp4_t, 2>. The bare type reports sizeof 1 for a 4-bit value, so a descriptor built from it strides twice as far as the data; array/vector of any other width instead makes the D#'s element several values at once, silently rescaling every extent, stride and pad. Neither is caught by the byte-size checks, and neither is converted for you.
+// packed_vec (what vector_t<fp4_t, N> resolves to) derives from array rather than being one, so it needs its own specialization.
+template<typename T>              struct tdm_elem                   { static constexpr bool ok = sizeof_bits<T>::value == int(sizeof(T)) * 8; };
+template<typename T, index_t N>   struct tdm_elem<array<T, N>>      { static constexpr bool ok = !is_packs_v<T> || N == 2; };
+template<typename T, index_t N>   struct tdm_elem<packed_vec<T, N>> { static constexpr bool ok = !is_packs_v<T> || N == 2; };
+template<typename T> static constexpr bool tdm_elem_ok_v = tdm_elem<remove_cvref_t<T>>::ok;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
+// TDM 1/3 -- tdm_traits: one tag per D# concern, plus the machinery resolving an unordered tag pack into one type per concern.
+namespace tdm_traits {
+
+// ── raw D# bits that are not policy ──
+// Not inert: measured on gfx1250, setting all three breaks every example, so each needs its own programming worked out first.
+static constexpr bool atomic_barrier_enable   = false;   // [18]
+static constexpr bool iterate_enable          = false;   // [19]
+static constexpr bool multicast_early_timeout = false;   // [21]
+
+// ── cache policy ──
+// One 3-bit encoding, two enums (`th` is the hardware's field name): the assembler takes only TH_LOAD_* on loads, TH_STORE_* on stores, and encoding 3 splits again by scope -- LU/WB below sys, BYPASS at sys -- with the wrong spelling a hard error.
+enum class load_temporal_hint  : u8_t { regular=0, non_temporal=1, high_temporal=2, last_use=3, non_temporal_regular=4, regular_non_temporal=5, non_temporal_high_temporal=6 };                                 // 7 has no legal load spelling on gfx1250
+enum class store_temporal_hint : u8_t { regular=0, non_temporal=1, high_temporal=2, write_back=3, non_temporal_regular=4, regular_non_temporal=5, non_temporal_high_temporal=6, non_temporal_write_back=7 };   // 7 = TH_STORE_NT_WB, store-only
+enum class scope : u8_t { cu=0, se=1, dev=2, sys=3 };
+
+// cache_policy[6:0] = | rsvd | non_volatile | scope[4:3] | temporal_hint[2:0] |
+OPUS_H_D constexpr int make_cache_policy(load_temporal_hint th = load_temporal_hint::regular, scope sc = scope::dev, bool non_volatile = false) { return (int(th) & 0x7) | ((int(sc) & 0x3) << 3) | (non_volatile ? (1 << 5) : 0); }
+OPUS_H_D constexpr int make_cache_policy(store_temporal_hint th, scope sc = scope::dev, bool non_volatile = false) { return (int(th) & 0x7) | ((int(sc) & 0x3) << 3) | (non_volatile ? (1 << 5) : 0); }
+static constexpr int default_cache_policy = make_cache_policy();   // regular temporal hint, device scope
+
+// ── padding (LDS write side) ──
+// "After every IntervalElements written, skip AmountElements of LDS", in ELEMENT counts (T only scales them to bytes); both D# fields are encoded, pad_interval [24:22] = 8 << enc bytes and pad_amount [31:25] = 4 * (enc + 1) bytes.
+// LOAD DIRECTION ONLY -- measured on gfx1250, a store ignores both fields even when programmed, so a padded tile stores a row at a time (tile_dim1 == 1); separately, a pad interval under 128 B demotes part of the transfer off the direct-copy path (perf, not correctness).
+template<typename T = u8_t, index_t IntervalElements = 0, index_t AmountElements = 0>
+struct padding {
+    static constexpr bool    enabled           = IntervalElements != 0 || AmountElements != 0;
+    static constexpr index_t interval_bytes    = IntervalElements * index_t(sizeof(T));
+    static constexpr index_t amount_bytes      = AmountElements   * index_t(sizeof(T));
+    // Exported so a kernel's LDS pitch cannot drift from the D#'s actual padding.
+    static constexpr index_t pitch_elements    = IntervalElements + AmountElements;
+
+    static_assert(!enabled || (IntervalElements > 0 && AmountElements > 0),
+                  "tdm_traits::padding: pad both counts or neither; padding<> is the neither");
+    // The tag carries its own T, so a mis-spelled one encodes the pad against a different element size than the tdm it is attached to. Checked even when disabled: a wrong T here is a typo either way.
+    static_assert(impl::tdm_elem_ok_v<T>,
+                  "tdm_traits::padding: a sub-byte element (fp4_t/int4_t/uint4_t) is only accepted as the one-byte pair array<fp4_t, 2> -- not the bare type, and not an array/vector of any other width");
+    static_assert(!enabled || (interval_bytes & (interval_bytes - 1)) == 0,
+                  "tdm_traits::padding: IntervalElements * sizeof(T) must be a power of two (3-bit log-scale field)");
+    static_assert(!enabled || (interval_bytes >= 8 && interval_bytes <= 1024),
+                  "tdm_traits::padding: IntervalElements * sizeof(T) must be in [8, 1024] bytes (3-bit field, 8 << enc)");
+    static_assert(!enabled || amount_bytes % 4 == 0,
+                  "tdm_traits::padding: AmountElements * sizeof(T) must be a whole number of DWORD");
+    static_assert(!enabled || (amount_bytes >= 4 && amount_bytes <= 512),
+                  "tdm_traits::padding: AmountElements * sizeof(T) must be in [4, 512] bytes (7-bit field, 4 * (enc + 1))");
+
+    // Guarded, not just zeroed: disabled means interval_bytes 0, where these would be a shift count of -3 and a DWORD count of -1.
+    static constexpr u64_t encoded_interval = enabled ? u64_t(__builtin_ctz(u32_t(interval_bytes)) - 3) : 0;   // 8 << enc
+    static constexpr u64_t encoded_amount   = enabled ? u64_t(amount_bytes / 4 - 1)                     : 0;   // DWORD count - 1
+    // Not covered by the range checks above: interval_bytes >= 8 alone still allows enc 0.
+    static_assert(!enabled || encoded_interval != 0 || encoded_amount != 0,
+                  "tdm_traits::padding: encoded (0,0) is the hardware's unpredictable case; use padding<> for no padding");
+};
+
+// One read vector of pad per row, the recipe that breaks the power-of-two bank conflict.
+template<typename T, index_t RowElements, index_t ReadVectorBytes = 16>
+using padding_auto = padding<T, RowElements, ReadVectorBytes / index_t(sizeof(T))>;
+
+// ── multicast (compile-time peer set) ──
+// The statically known peer set, stored as the finished workgroup_mask rather than the index list; the runtime mask still goes through set_workgroup_mask(), and multicast<> is the 0 the hardware reads as no multicast.
+// Folding a fan-out of <=1 to "no multicast" is SAFETY: a cluster-load opcode issued by a wave that is not in a cluster may hang or corrupt data. Not asserted, just pointless: GL1 merges at most 5 requests, so >5 peers buys nothing.
+template<index_t... Workgroups>
+struct multicast {
+    static constexpr u16_t bits = (u16_t(0) | ... | u16_t(u16_t(1) << Workgroups));
+    static_assert(sizeof...(Workgroups) != 1,
+                  "tdm_traits::multicast<W> with one peer is a no-op and can hang a non-cluster launch; use multicast<>");
+    static_assert(((Workgroups >= 0 && Workgroups < 16) && ...),
+                  "tdm_traits::multicast: workgroup_mask is 16-bit, peer indices must be in [0,16)");
+    static_assert(__builtin_popcount(u32_t(bits)) == sizeof...(Workgroups),
+                  "tdm_traits::multicast: duplicate peer index -- GL1 merges requests by mask match, so a repeated bit is a typo");
+};
+
+// A mask already through the <=1-peer fold; set_workgroup_mask() takes only this type, so the fold cannot be bypassed with a bare integer.
+struct mask { u16_t bits; };
+
+// A mask bit is indexed y * ClusterDimX + x, pinned by measurement on gfx1250: flat_id() reads HW_REG_IB_STS2[24:21] while id_x/y are preloaded SGPRs.
+// Position comes from hardware, never an argument: a swapped local_x/local_y names the wrong peers, which does not fail, it silently stops GL1 merging. Extents stay compile-time too -- a builtin-bounded loop measured 125 instructions against 11, and a runtime extent gives up the <=1 fold above.
+template<index_t ClusterDimX, index_t ClusterDimY>
+OPUS_D mask peers_along_y() {
+    if constexpr (ClusterDimY <= 1) return {0};
+    else {
+        const index_t x = index_t(__builtin_amdgcn_cluster_workgroup_id_x());
+        u16_t bits = 0;
+        #pragma unroll
+        for (index_t y = 0; y < ClusterDimY; ++y) bits |= u16_t(1u << (y * ClusterDimX + x));
+        return {bits};
+    }
+}
+template<index_t ClusterDimX, index_t ClusterDimY>
+OPUS_D mask peers_along_x() {
+    if constexpr (ClusterDimX <= 1) return {0};
+    else {
+        const index_t y = index_t(__builtin_amdgcn_cluster_workgroup_id_y());
+        u16_t bits = 0;
+        #pragma unroll
+        for (index_t x = 0; x < ClusterDimX; ++x) bits |= u16_t(1u << (y * ClusterDimX + x));
+        return {bits};
+    }
+}
+
+// ── gather/scatter (row-index list in D# groups 2/3) ──
+template<index_t IndexBits = 0>
+struct gather {
+    static_assert(IndexBits == 0 || IndexBits == 16 || IndexBits == 32,
+                  "tdm_traits::gather: index width is 16 or 32 bits; gather<> is no gather");
+    static constexpr bool  enabled    = IndexBits != 0;
+    static constexpr u64_t index_size = (IndexBits == 32) ? 1 : 0;   // 16-bit -> 2 idx/dword, 32-bit -> 1
+};
+
+// ── cache ──
+// A wrapper because an unordered pack cannot hold a bare int; the member name is what is_cache keys on, so not `value`.
+template<int Policy> struct cache { static constexpr int cache_policy = Policy; };
+
+// ── resolving an unordered pack of the tags above ──
+// A tag's concern is read off the D# field it carries, so a new spelling of an existing one (padding_auto) classifies itself.
+template<typename T, typename = void> struct is_padding   : false_type {};
+template<typename T> struct is_padding  <T, std::void_t<decltype(T::encoded_interval)>> : true_type {};
+template<typename T, typename = void> struct is_multicast : false_type {};
+template<typename T> struct is_multicast<T, std::void_t<decltype(T::bits)>>             : true_type {};
+template<typename T, typename = void> struct is_gather    : false_type {};
+template<typename T> struct is_gather   <T, std::void_t<decltype(T::index_size)>>       : true_type {};
+template<typename T, typename = void> struct is_cache     : false_type {};
+template<typename T> struct is_cache    <T, std::void_t<decltype(T::cache_policy)>>     : true_type {};
+
+template<typename T> static constexpr bool is_tag_v =
+    is_padding<T>::value || is_multicast<T>::value || is_gather<T>::value || is_cache<T>::value;
+
+// First tag the trait accepts, else Default. Linear scan; the pack is a handful of entries.
+template<template<typename, typename> class Is, typename Default, typename... Policies> struct pick { using type = Default; };
+template<template<typename, typename> class Is, typename Default, typename P0, typename... Rest>
+struct pick<Is, Default, P0, Rest...> {
+    using type = std::conditional_t<Is<P0, void>::value, P0, typename pick<Is, Default, Rest...>::type>;
+};
+template<template<typename, typename> class Is, typename Default, typename... Policies>
+using pick_t = typename pick<Is, Default, Policies...>::type;
+
+// Matching tags in the pack; >1 is a self-contradicting call site (pick would silently honour the first), so tdm<> rejects it.
+template<template<typename, typename> class Is, typename... Policies>
+static constexpr int count = ((int(Is<Policies, void>::value)) + ... + 0);
+
+// The whole compile-time configuration of one window; each detector is paired with its default here once.
+template<typename DataType, typename TileShape, typename... Policies>
+struct resolve {
+    static_assert((is_tag_v<Policies> && ...),
+                  "tdm: every policy argument must be a tdm_traits tag (padding/multicast/gather/cache)");
+    static_assert(count<is_padding,   Policies...> <= 1, "tdm: duplicate padding policy");
+    static_assert(count<is_multicast, Policies...> <= 1, "tdm: duplicate multicast policy");
+    static_assert(count<is_gather,    Policies...> <= 1, "tdm: duplicate gather policy");
+    static_assert(count<is_cache,     Policies...> <= 1, "tdm: duplicate cache policy");
+
+    using data_type  = DataType;
+    using tile_shape = TileShape;
+    // The `_tag` suffix is load-bearing: a member named `padding` would shadow the tag template of the same name for every later use in this scope.
+    using padding_tag   = pick_t<is_padding,   padding<>,   Policies...>;
+    using multicast_tag = pick_t<is_multicast, multicast<>, Policies...>;
+    using gather_tag    = pick_t<is_gather,    gather<>,    Policies...>;
+    // Named cache_pol, not cache_policy: that is the field is_cache keys on, and a configuration carrying it would itself classify as a tag.
+    static constexpr int cache_pol = pick_t<is_cache, cache<default_cache_policy>, Policies...>::cache_policy;
+};
+
+}   // namespace tdm_traits
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
+// TDM 2/3 -- tdm_desc: the D# bit layout held as the instruction's own operand groups, compile-time fields baked into the initializer and mask+or setters for the runtime ones.
+// Entirely internal: tdm::make_descriptor() hands what it built straight to the builtin.
+namespace impl {
+// SGPR operand groups, named after the hardware's "Group N". A 2D non-gather tile needs only groups 0+1; groups 2/3 carry extra dims or the gather list.
+using tdm_sgpr4 = i32_t __attribute__((ext_vector_type(4)));
+using tdm_sgpr8 = i32_t __attribute__((ext_vector_type(8)));
+
+// Out of line because an explicit specialization cannot be written inside tdm_desc; the empty form is what makes [[no_unique_address]] free.
+// The two compile-time dwords come in as template arguments rather than being written by tdm_desc's initializer, which is the only way this can be an aggregate the empty case optimises away; they carry tile_dim3 and tile_dim4, so leaving them zero collapses a rank-4 or rank-5 tile onto its dim3/dim4 = 0 slice.
+template<bool En, u32_t G2Dword3 = 0, u32_t G3Dword2 = 0> struct tdm_groups23 {};
+template<u32_t G2Dword3, u32_t G3Dword2> struct tdm_groups23<true, G2Dword3, G3Dword2> {
+    tdm_sgpr4 group2{0, 0, 0, i32_t(G2Dword3)};
+    tdm_sgpr4 group3{0, 0, i32_t(G3Dword2), 0};
+};
+
+template<typename Traits>
+struct tdm_desc {
+    using T = Traits;
+
+    // D#.data_size is log2 of the element size in bytes; the field has no encoding for a size that is not a power of two up to 8.
+    static constexpr u32_t elem_bytes = u32_t(sizeof(typename T::data_type));
+    static_assert(elem_bytes == 1 || elem_bytes == 2 || elem_bytes == 4 || elem_bytes == 8,
+                  "tdm: element size must be 1, 2, 4 or 8 bytes -- D#.data_size only encodes those");
+    static constexpr u64_t data_size = u64_t(__builtin_ctz(unsigned(elem_bytes)));
+    static constexpr u64_t wg_mask   = u64_t(T::multicast_tag::bits);
+    static constexpr u32_t ndim      = u32_t(T::tile_shape::size());
+    static_assert(ndim >= 2 && ndim <= 5, "tdm: TileShape must have 2..5 dimensions");
+
+    // Slots past the end stay 0, the D#'s "dimension unused" encoding; the untaken ?: branch is never evaluated, so at() is not read past the extents.
+    static constexpr u64_t tile_dim0 = u64_t(T::tile_shape::at(0)), tile_dim1 = u64_t(T::tile_shape::at(1));
+    static constexpr u64_t tile_dim2 = (ndim > 2) ? u64_t(T::tile_shape::at(2)) : u64_t(0);
+    static constexpr u64_t tile_dim3 = (ndim > 3) ? u64_t(T::tile_shape::at(3)) : u64_t(0);
+    static constexpr u64_t tile_dim4 = (ndim > 4) ? u64_t(T::tile_shape::at(4)) : u64_t(0);
+    // 0 is rejected rather than read as "unused": ndim is the tile shape's own rank, so a zero extent within it is a typo.
+    static_assert(tile_dim0 >= 1 && tile_dim0 <= 65535 && tile_dim1 >= 1 && tile_dim1 <= 65535
+                  && (ndim < 3 || (tile_dim2 >= 1 && tile_dim2 <= 65535))
+                  && (ndim < 4 || (tile_dim3 >= 1 && tile_dim3 <= 65535))
+                  && (ndim < 5 || (tile_dim4 >= 1 && tile_dim4 <= 65535)),
+                  "tdm: every tile extent must be in [1, 65535] -- tile_dimN is a 16-bit D# field");
+
+    static constexpr u64_t lds_pad_enable = T::padding_tag::enabled ? 1 : 0;
+    static constexpr u64_t pad_interval   = T::padding_tag::encoded_interval;
+    static constexpr u64_t pad_amount     = T::padding_tag::encoded_amount;
+
+    // Compile-time dword inits; trailing comments list each dword's fields, "(rt)" marking setter-patched ones.
+    // The two literals are ISA-fixed: count has only NULL/Valid and type no legal value but 2. scope/th stay 0, the cache policy riding as asm modifiers.
+    // count[1:0]=1 (Valid Tensor) | index_size[30] | gather_mode[31].
+    // MEASURED on gfx1250, and it contradicts MLIR: AMDGPUToROCDL's make_dma_base emits gather_mode at 30 and index_size at 31 (the offsets its lit test names), which does not gather. Issuing the same descriptor twice with only this dword changed, 0x80000001 fetches the listed rows and 0x40000001 returns consecutive rows from the origin -- see gcnasm/opus_tdm_test, which is what the probe exists for.
+    // Only gather<16> can tell the two orderings apart: gather<32> is 0xC0000001 either way, so a 32-bit-only workload will never notice a transposition.
+    static constexpr u32_t group0_dword0_const = 1u | (u32_t(T::gather_tag::index_size & 0x1) << 30) | (u32_t((T::gather_tag::enabled ? 1 : 0) & 0x1) << 31);
+    static constexpr u32_t group0_dword3_const = 2u << 30;                                                                                                                                    // global_addr_hi(rt) | type[127:126]=2 (image)
+    static constexpr u32_t group1_dword0_const = u32_t(wg_mask & 0xFFFF) | (u32_t(data_size & 0x3) << 16) | (u32_t(tdm_traits::atomic_barrier_enable) << 18) | (u32_t(tdm_traits::iterate_enable) << 19) | (u32_t(lds_pad_enable & 0x1) << 20) | (u32_t(tdm_traits::multicast_early_timeout) << 21) | (u32_t(pad_interval & 0x7) << 22) | (u32_t(pad_amount & 0x7F) << 25);   // wg_mask | data_size | build-wide bits | pad
+    static constexpr u32_t group1_dword3_const = u32_t(tile_dim0 & 0xFFFF) << 16;                                                                                                               // tensor_dim1_lo(rt) | tile_dim0
+    static constexpr u32_t group1_dword4_const = u32_t(tile_dim1 & 0xFFFF) | (u32_t(tile_dim2 & 0xFFFF) << 16);                                                                              // tile_dim1 | tile_dim2
+    static constexpr u32_t group2_dword3_const = u32_t(tile_dim3 & 0xFFFF) << 16;                                                                                                               // tdim2_stride_hi(rt) | tile_dim3
+    static constexpr u32_t group3_dword2_const = u32_t(tile_dim4 & 0xFFFF) << 16;                                                                                                               // tensor_dim4_hi(rt) | tile_dim4
+
+    // A >2D tensor or a gather row-index list; when neither, the pair costs nothing and the backend narrows the instruction to its two-operand form itself.
+    static constexpr bool needs_groups23 = (ndim > 2) || T::gather_tag::enabled;
+    // Both claimants want the same eight dwords, and the index list wins by overwriting, so a >2D gather would silently lose its dim2..4 extents.
+    static_assert(!(T::gather_tag::enabled && ndim > 2), "tdm: gather is 2D-only -- the row-index list occupies the same groups 2/3 as the dim2..4 extents");
+
+    // Stored as the operand groups the instruction takes, so nothing is transcribed at issue; every subscript is constant, so this stays SSA scalars rather than a live vector.
+    tdm_sgpr4 group0{ i32_t(group0_dword0_const), 0, 0, i32_t(group0_dword3_const) };
+    tdm_sgpr8 group1{ i32_t(group1_dword0_const), 0, 0, i32_t(group1_dword3_const), i32_t(group1_dword4_const), 0, 0, 0 };
+    [[no_unique_address]] tdm_groups23<needs_groups23, group2_dword3_const, group3_dword2_const> groups23{};
+
+    // Runtime setters, bit positions in the trailing comments. g() reads one dword unsigned: the vectors hold i32_t, but every field below is bit arithmetic.
+    OPUS_H_D static u32_t g(i32_t x) { return u32_t(x); }
+    OPUS_H_D void set_lds_addr          (u32_t v) { group0[1] = i32_t(v); }                                                                                                     // [32:32] (LDS addr is 32-bit on gfx1250)
+    OPUS_H_D void set_global_addr       (u64_t v) { group0[2] = i32_t(u32_t(v)); group0[3] = i32_t((g(group0[3]) & 0xFE000000u) | u32_t((v >> 32) & 0x01FFFFFFu)); }        // [64:57]
+    OPUS_H_D void set_tensor_dim0       (u32_t  v) { group1[1] = i32_t((g(group1[1]) & 0x0000FFFFu) | (v << 16)); group1[2] = i32_t((g(group1[2]) & 0xFFFF0000u) | (v >> 16)); }   // [48:32]
+    OPUS_H_D void set_tensor_dim1       (u32_t  v) { group1[2] = i32_t((g(group1[2]) & 0x0000FFFFu) | (v << 16)); group1[3] = i32_t((g(group1[3]) & 0xFFFF0000u) | (v >> 16)); }   // [80:32]
+    OPUS_H_D void set_tensor_dim0_stride(u64_t  v) { group1[5] = i32_t(u32_t(v)); group1[6] = i32_t((g(group1[6]) & 0xFFFF0000u) | u32_t((v >> 32) & 0xFFFFu)); }           // [160:48]
+    // Split 16/32 rather than 32/16 like the other three: this one straddles a dword boundary the other way, low half sharing sgpr6 with dim0_stride's high half.
+    OPUS_H_D void set_tensor_dim1_stride(u64_t  v) { group1[6] = i32_t((g(group1[6]) & 0x0000FFFFu) | (u32_t(v) << 16)); group1[7] = i32_t(u32_t(v >> 16)); }              // [208:48]
+    OPUS_H_D void set_tensor_dim2       (u32_t  v) { groups23.group2[0] = i32_t(v); }                                                                                      // [0:32]
+    OPUS_H_D void set_tensor_dim3       (u32_t  v) { groups23.group2[1] = i32_t(v); }                                                                                      // [32:32]
+    OPUS_H_D void set_tensor_dim2_stride(u64_t  v) { groups23.group2[2] = i32_t(u32_t(v)); groups23.group2[3] = i32_t((g(groups23.group2[3]) & 0xFFFF0000u) | u32_t((v >> 32) & 0xFFFFu)); }   // [64:48]
+    OPUS_H_D void set_tensor_dim3_stride(u64_t  v) { groups23.group3[0] = i32_t(u32_t(v)); groups23.group3[1] = i32_t((g(groups23.group3[1]) & 0xFFFF0000u) | u32_t((v >> 32) & 0xFFFFu)); }   // [0:48]
+    OPUS_H_D void set_tensor_dim4       (u32_t  v) { groups23.group3[1] = i32_t((g(groups23.group3[1]) & 0x0000FFFFu) | (v << 16)); groups23.group3[2] = i32_t((g(groups23.group3[2]) & 0xFFFF0000u) | (v >> 16)); }   // [48:32]
+    // Raw peer bitmask; the <=1-bit fold is the caller's.
+    OPUS_H_D void set_workgroup_mask    (u32_t  v) { group1[0] = i32_t((g(group1[0]) & 0xFFFF0000u) | (v & 0xFFFFu)); }      // [0:16]
+    // The one tile extent worth patching at runtime: it lets one window type serve two operands differing only in row count (the 4wave GEMM's A/B fold).
+    OPUS_H_D void set_tile_dim1         (u32_t  v) { group1[4] = i32_t((g(group1[4]) & 0xFFFF0000u) | (v & 0xFFFFu)); }      // [128:16]
+};
+} // namespace impl
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
+// TDM 3/3 -- tdm: what kernels use. make_tdm() builds, move() walks, set_indices() fills groups 2/3 for gather, make_descriptor() lowers to the D#, async_load()/async_store() issue it.
+namespace impl {
+// A delta the caller spelled 0_I, which move() drops at compile time.
+template<typename T> static constexpr bool is_static_zero_v = is_same_v<remove_cvref_t<T>, number<0>>;
+
+// Converge to lane 0, making the value uniform to LLVM's divergence analysis: "s" constraints require an SGPR but do not guarantee uniformity, and a divergent input turns every later move() add into VALU.
+// Device-only; the #else is the host pass, where lane convergence has no meaning.
+OPUS_D u32_t tdm_uniform(u32_t v) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    return __builtin_amdgcn_readfirstlane(v);
+#else
+    return v;
+#endif
+}
+// readfirstlane is 32-bit, so 64-bit fields (global address, stride) go half at a time.
+OPUS_D u64_t tdm_uniform(u64_t v) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    return (u64_t(tdm_uniform(u32_t(v >> 32))) << 32) | u64_t(tdm_uniform(u32_t(v)));
+#else
+    return v;
+#endif
+}
+OPUS_D i64_t tdm_uniform(i64_t v) { return i64_t(tdm_uniform(u64_t(v))); }
+
+// Pure-SALU saturating sub, clamping underflow to 0; exact for e, o < 2^31, which holds of extents and origins.
+// s_max_i32 keeps SCC off the data path: SCC is one register, so a cselect idiom serialises. Two asm blocks let the scheduler fill the forwarding waitstate.
+OPUS_D u32_t tdm_saturating_sub(u32_t e, u32_t o) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    u32_t es = __builtin_amdgcn_readfirstlane(e), os = __builtin_amdgcn_readfirstlane(o), d, r;
+    asm("s_sub_co_u32 %0, %1, %2" : "=s"(d) : "s"(es), "s"(os) : "scc");
+    asm("s_max_i32 %0, %1, 0"     : "=s"(r) : "s"(d)           : "scc");
+    return r;
+#else
+    return (o < e) ? (e - o) : 0u;
+#endif
+}
+} // namespace impl
+
+// Policies are an UNORDERED pack of tdm_traits tags; only DataType and TileShape are positional, and anything omitted takes its default.
+template<typename DataType,
+         typename TileShape,          // seq<D0, D1, ...> in D# order (D0 = fastest), 2..5 dims; ndim = size()
+         typename... Policies>
+struct tdm {
+    using traits = tdm_traits::resolve<DataType, TileShape, Policies...>;
+private:
+    using desc_type = impl::tdm_desc<traits>;
+public:
+    using data_type    = DataType;
+    using tile_shape   = TileShape;
+    static constexpr u32_t     ndim      = desc_type::ndim;
+    static constexpr bool      has_dim2  = (ndim >= 3), has_dim3 = (ndim >= 4), has_dim4 = (ndim >= 5);
+    static_assert((traits::cache_pol & ~0x3F) == 0, "tdm: cache_policy must fit in 6 bits");
+    static_assert(impl::tdm_elem_ok_v<DataType>,
+                  "tdm: a sub-byte element (fp4_t/int4_t/uint4_t) is only accepted as the one-byte pair array<fp4_t, 2> -- not the bare type, and not an array/vector of any other width");
+    static_assert(!traits::padding_tag::enabled || (desc_type::tile_dim0 * sizeof(DataType)) % 4 == 0,
+                  "tdm: with padding enabled, tile_dim0 * sizeof(DataType) must be a multiple of 4 bytes");
+    static constexpr bool is_gather  = traits::gather_tag::enabled;
+    static constexpr bool needs_groups23 = desc_type::needs_groups23;
+
+    using descriptor = desc_type;
+
+    // The whole persistent state, all uniform so it stays in SGPRs across the loop. The 20-dword D# is never live -- make_descriptor() rebuilds it.
+    u32_t  lds_base_addr=0;                                                                         // LDS addr is 32-bit on gfx1250; the write point within it is the caller's, per issue
+    u64_t  global_base_addr=0, global_offset_bytes=0;
+    // D# order (0 = fastest); every subscript is constant, so SROA promotes these to SGPRs.
+    u32_t  extent[ndim]{}, origin[ndim]{};
+    u64_t  stride[ndim - 1]{};                                                                      // stride[N] = D# tensor_dim{N}_stride, which advances dimension N+1 (elements)
+    // Each defaults to desc_type's compile-time field and only differs once a setter has been called.
+    u32_t  workgroup_mask_override = u32_t(desc_type::wg_mask);                                     // CLUSTER_LOAD multicast mask (group1[0] low16)
+    u32_t  tile_dim1_override      = u32_t(desc_type::tile_dim1 & 0xFFFFu);                         // tile row count (group1[4] low16)
+    // dim1's clamp, cached: a delta1 of 0_I compiles move()'s update away, so recomputing it per make_descriptor() would cost two dead SALU plus a waitstate.
+    // dim0 cannot be cached: origin[0] advances every step.
+    u32_t  dim1_clamped = 0;
+    u32_t  gidx[8] = {0,0,0,0,0,0,0,0};                                                              // gather/scatter row-index dwords (groups 2/3); only used when is_gather
+    u32_t  gather_n = 0;                                                                             // #valid gather indices (-> tile_dim1)
+
+    // UNITS: everything the caller passes is an ELEMENT count -- extents, strides, origins, the LDS offset. Only the two base addresses are bytes; the scaling to them happens in here.
+
+    // shape0/shape1 are the WHOLE tensor's extents, origin_0/origin_1 this tile's start within them.
+    // An out-of-range origin needs no caller handling: saturating_sub clamps tensor_dim to 0, a zero-extent DMA that touches no memory but still bumps tensorcnt, so a pipeline can over-issue unguarded.
+    OPUS_D void make(u32_t lds_base_address, const void* global_base_address,
+                     u32_t shape0, u32_t shape1, u64_t dim0_stride, u32_t origin_0 = 0, u32_t origin_1 = 0) {
+        static_assert(ndim == 2, "tdm::make(): flat form is 2D; pass an opus::layout for 3D..5D");
+        // The arrays are locals SROA never materialises.
+        const u32_t shape[2]{shape0, shape1}, coord[2]{origin_0, origin_1};
+        const u64_t pitch[1]{dim0_stride};
+        make_from_layout(lds_base_address, global_base_address, shape, pitch, coord);
+    }
+
+    // General form: shape/stride/origin already split out of an opus::layout and reversed into D# order by make_tdm(), so this is a handful of SGPR copies.
+    // Every entry point converges here, so the window state is uniform by construction.
+    OPUS_D void make_from_layout(u32_t lds_base_address, const void* global_base_address,
+                                 const u32_t (&shape)[ndim], const u64_t (&pitch)[ndim - 1], const u32_t (&coord)[ndim]) {
+        lds_base_addr    = impl::tdm_uniform(lds_base_address);
+        global_base_addr = impl::tdm_uniform(reinterpret_cast<u64_t>(global_base_address));
+        static_for<ndim>([&](auto N) { extent[N.value] = impl::tdm_uniform(shape[N.value]); origin[N.value] = impl::tdm_uniform(coord[N.value]); });
+        static_for<ndim - 1>([&](auto N) { stride[N.value] = impl::tdm_uniform(pitch[N.value]); });
+        dim1_clamped = impl::tdm_saturating_sub(extent[1], origin[1]);
+        // dim0 is the fastest axis, so its stride is 1 and origin[0] contributes directly.
+        u64_t off = u64_t(origin[0]);
+        static_for<ndim - 1>([&](auto N) { off += u64_t(origin[N.value + 1]) * stride[N.value]; });
+        global_offset_bytes = off * sizeof(DataType);
+    }
+
+    // Takes only tdm_traits::mask, which comes from a producer that has already folded a fan-out of <=1 to zero; a raw u16_t overload would reopen the hang path.
+    OPUS_H_D void set_workgroup_mask(tdm_traits::mask m) { workgroup_mask_override = u32_t(m.bits); }
+
+    // Runtime tile row count, so one window type serves two operands differing only in tile_dim1.
+    OPUS_H_D void set_tile_dim1(u32_t rows) { tile_dim1_override = rows & 0xFFFFu; }
+
+    // Cannot be hoisted out of the loop and cached, since move() rewrites the state. The 20 dwords are a local, so SROA keeps each an SSA scalar.
+    // Kept apart from the issue so the caller can put unrelated work between them: SALU does not forward into memory instructions, so a descriptor write next to the DMA costs a full SGPR write-back.
+    // The LDS write point is a parameter, not window state: the window walks the global side only. Defaulted, so single-buffered sites omit it.
+    OPUS_D descriptor make_descriptor(u32_t lds_offset_elems = 0) const {
+        desc_type d;   // compile-time field inits already baked in
+        d.set_lds_addr(lds_base_addr + lds_offset_elems * u32_t(sizeof(DataType)));
+        d.set_global_addr(global_base_addr + global_offset_bytes);
+        d.set_tensor_dim0(impl::tdm_saturating_sub(extent[0], origin[0]));
+        d.set_tensor_dim1(dim1_clamped);                                                              // == saturating_sub(extent[1], origin[1]), cached
+        d.set_tensor_dim0_stride(stride[0]);
+        d.set_workgroup_mask(workgroup_mask_override);
+        d.set_tile_dim1(tile_dim1_override);
+        // Each extent past dim1 goes in with the stride that reaches it.
+        if constexpr (has_dim2) { d.set_tensor_dim2(impl::tdm_saturating_sub(extent[2], origin[2])); d.set_tensor_dim1_stride(stride[1]); }
+        if constexpr (has_dim3) { d.set_tensor_dim3(impl::tdm_saturating_sub(extent[3], origin[3])); d.set_tensor_dim2_stride(stride[2]); }
+        if constexpr (has_dim4) { d.set_tensor_dim4(impl::tdm_saturating_sub(extent[4], origin[4])); d.set_tensor_dim3_stride(stride[3]); }
+        if constexpr (is_gather) {                                                    // groups 2/3 carry the row-index list; both mode bits are compile-time and already sit in group0_dword0_const, which nothing here patches
+            d.set_tile_dim1(gather_n);                                                // tile_dim1 = #valid indices, which is what the field means in gather mode
+            d.groups23.group2 = impl::tdm_sgpr4{ i32_t(gidx[0]), i32_t(gidx[1]), i32_t(gidx[2]), i32_t(gidx[3]) };
+            d.groups23.group3 = impl::tdm_sgpr4{ i32_t(gidx[4]), i32_t(gidx[5]), i32_t(gidx[6]), i32_t(gidx[7]) };
+        }
+        return d;
+    }
+
+    // The DMA returns no data and completes via tensorcnt.
+    OPUS_D static void async_load (const descriptor& d) { issue<false>(d); }
+    OPUS_D static void async_store(const descriptor& d) { issue<true >(d); }
+
+    // Fused form, for the sites with no independent work to spread the two halves across.
+    OPUS_D void async_load (u32_t lds_offset_elems = 0) const { async_load (make_descriptor(lds_offset_elems)); }
+    OPUS_D void async_store(u32_t lds_offset_elems = 0) const { async_store(make_descriptor(lds_offset_elems)); }
+
+    // Fill D# groups 2+3 (8 SGPRs) with the row-index list plus the valid count (which redefines tile_dim1) and enable gather_mode in group 0.
+    // gather<16> packs 2 idx/dword (<=16), gather<32> packs 1 (<=8). Call after make_tdm().
+    template<typename Idx>
+    OPUS_H_D void set_indices(const Idx* idx, int n) {
+        gather_n = u32_t(n);
+        for (int i = 0; i < 8; ++i) gidx[i] = 0;
+        if constexpr (traits::gather_tag::index_size == 0) {                              // 16-bit: 2 indices per dword
+            for (int i = 0; i < n && i < 16; ++i) { u32_t sh = (i & 1) ? 16u : 0u; gidx[i >> 1] |= (u32_t(idx[i]) & 0xFFFFu) << sh; }
+        } else {                                                             // 32-bit: 1 index per dword
+            for (int i = 0; i < n && i < 8; ++i) gidx[i] = u32_t(idx[i]);
+        }
+    }
+
+    // Element deltas in D# order, global side only, at most one per dimension; trailing dimensions left out do not move, so a 2D window writes move(k_step) and never names the rest.
+    // A 0_I anywhere is elided at compile time, so passing a dimension you do not move stays free.
+    template<typename... Args>
+    OPUS_D void move(Args... args) {
+        constexpr int n = int(sizeof...(Args));
+        static_assert(n <= int(ndim), "tdm::move(): more element deltas than the window has dimensions");
+        const auto t = opus::make_tuple(args...);
+        move_all(delta_of<n,0>(t), delta_of<n,1>(t), delta_of<n,2>(t), delta_of<n,3>(t), delta_of<n,4>(t));
+    }
+private:
+    // Element I of the caller's pack, or a static zero for a dimension the caller left off the end.
+    template<int NDelta, int I, typename Tup>
+    OPUS_H_D static constexpr auto delta_of(const Tup& t) {
+        if constexpr (I < NDelta) return get<I>(t);
+        else                      return number<0>{};
+    }
+
+    template<typename D0, typename D1, typename D2, typename D3, typename D4>
+    OPUS_D void move_all(D0 delta0, D1 delta1, D2 delta2, D3 delta3, D4 delta4) {
+        static_assert(has_dim2 || impl::is_static_zero_v<D2>, "tdm::move(): delta2 requires has_dim2");
+        static_assert(has_dim3 || impl::is_static_zero_v<D3>, "tdm::move(): delta3 requires has_dim3");
+        static_assert(has_dim4 || impl::is_static_zero_v<D4>, "tdm::move(): delta4 requires has_dim4");
+        // Each field converges before landing back in the state, so a divergent delta costs a few readfirstlane rather than turning the window into VALU.
+        if constexpr (!impl::is_static_zero_v<D0>)             origin[0] = impl::tdm_uniform(u32_t(i64_t(origin[0]) + i64_t(delta0)));
+        if constexpr (!impl::is_static_zero_v<D1>)           { origin[1] = impl::tdm_uniform(u32_t(i64_t(origin[1]) + i64_t(delta1)));
+                                                               dim1_clamped = impl::tdm_saturating_sub(extent[1], origin[1]); }
+        if constexpr (has_dim2 && !impl::is_static_zero_v<D2>) origin[2] = impl::tdm_uniform(u32_t(i64_t(origin[2]) + i64_t(delta2)));
+        if constexpr (has_dim3 && !impl::is_static_zero_v<D3>) origin[3] = impl::tdm_uniform(u32_t(i64_t(origin[3]) + i64_t(delta3)));
+        if constexpr (has_dim4 && !impl::is_static_zero_v<D4>) origin[4] = impl::tdm_uniform(u32_t(i64_t(origin[4]) + i64_t(delta4)));
+        // State-only: the D# is rebuilt from these scalars at issue time, so move() writes no descriptor.
+        constexpr bool any_moved = !impl::is_static_zero_v<D0> || !impl::is_static_zero_v<D1> ||
+                                   (has_dim2 && !impl::is_static_zero_v<D2>) ||
+                                   (has_dim3 && !impl::is_static_zero_v<D3>) ||
+                                   (has_dim4 && !impl::is_static_zero_v<D4>);
+        if constexpr (any_moved) global_offset_bytes = impl::tdm_uniform(u64_t(i64_t(global_offset_bytes) + coord_delta_to_global_offset_bytes(delta0, delta1, delta2, delta3, delta4)));
+    }
+    // The cache policy rides in as the plain integer the builtin takes; the backend spells the th:/scope:/nv modifiers.
+    // Groups 2/3 go in zeroed when the tile needs neither, which makes the backend emit the two-operand short form; the fifth operand reaches no instruction field (measured) and is passed zero.
+    template<bool IsStore>
+    OPUS_D static void issue(const descriptor& d) {
+        // th=7 has a store spelling (TH_STORE_NT_WB) but no legal load one on gfx1250.
+        static_assert(IsStore || (traits::cache_pol & 0x7) != 7,
+                      "tdm: temporal_hint 7 is store-only; no TH_LOAD_* spelling exists on gfx1250");
+        impl::tdm_sgpr4 g2{0,0,0,0};
+        impl::tdm_sgpr4 g3{0,0,0,0};
+        if constexpr (needs_groups23) { g2 = d.groups23.group2; g3 = d.groups23.group3; }
+        constexpr impl::tdm_sgpr8 unused{0,0,0,0,0,0,0,0};
+#if OPUS_HAS_UNSIGNED_TENSOR_D0
+        // Same lanes either way, so this cast generates nothing.
+        const u32x4_t g0 = __builtin_bit_cast(u32x4_t, d.group0);
+        if constexpr (IsStore) __builtin_amdgcn_tensor_store_from_lds(g0, d.group1, g2, g3, unused, traits::cache_pol);
+        else                   __builtin_amdgcn_tensor_load_to_lds   (g0, d.group1, g2, g3, unused, traits::cache_pol);
+#else
+        if constexpr (IsStore) __builtin_amdgcn_tensor_store_from_lds(d.group0, d.group1, g2, g3, unused, traits::cache_pol);
+        else                   __builtin_amdgcn_tensor_load_to_lds   (d.group0, d.group1, g2, g3, unused, traits::cache_pol);
+#endif
+    }
+    // Element-count deltas in, byte delta out.
+    template<typename D0, typename D1, typename D2, typename D3, typename D4>
+    OPUS_H_D constexpr i64_t coord_delta_to_global_offset_bytes(D0 delta0, D1 delta1, D2 delta2, D3 delta3, D4 delta4) const {
+        i64_t delta_bytes = 0;
+        if constexpr (!impl::is_static_zero_v<D0>)             delta_bytes += i64_t(delta0) * i64_t(sizeof(DataType));
+        if constexpr (!impl::is_static_zero_v<D1>)             delta_bytes += i64_t(delta1) * i64_t(stride[0]) * i64_t(sizeof(DataType));
+        if constexpr (has_dim2 && !impl::is_static_zero_v<D2>) delta_bytes += i64_t(delta2) * i64_t(stride[1]) * i64_t(sizeof(DataType));
+        if constexpr (has_dim3 && !impl::is_static_zero_v<D3>) delta_bytes += i64_t(delta3) * i64_t(stride[2]) * i64_t(sizeof(DataType));
+        if constexpr (has_dim4 && !impl::is_static_zero_v<D4>) delta_bytes += i64_t(delta4) * i64_t(stride[3]) * i64_t(sizeof(DataType));
+        return delta_bytes;
+    }
+};
+
+// Factory: a 2D window at tile origin (origin0, origin1). Runtime args are the two bases, the WHOLE tensor's shape and its dim0 stride.
+template<typename DataType, typename TileShape, typename... Policies>
+OPUS_D auto make_tdm(u32_t lds_base_address, const void* global_base_address,
+                       u32_t shape0, u32_t shape1, u64_t stride, u32_t origin0 = 0, u32_t origin1 = 0) {
+    tdm<DataType, TileShape, Policies...> t;
+    t.make(lds_base_address, global_base_address, shape0, shape1, stride, origin0, origin1);
+    return t;
+}
+
+// Same, for an already-named window type (the usual case, a kernel_traits alias).
+template<typename Window>
+OPUS_D Window make_tdm(u32_t lds_base_address, const void* global_base_address,
+                         u32_t shape0, u32_t shape1, u64_t stride, u32_t origin0 = 0, u32_t origin1 = 0) {
+    Window t;
+    t.make(lds_base_address, global_base_address, shape0, shape1, stride, origin0, origin1);
+    return t;
+}
+
+// Layout form, the general entry point: shape, stride and origin travel in one opus::layout in opus (C) order, reversed into D# order here.
+// THE dimension-order reversal is the `rank - 1 - k` below, and it happens here and nowhere else -- a second application anywhere would cancel it out.
+// The origin is the layout's coord; a layout without one starts the window at 0.
+template<typename Window, typename Layout, std::enable_if_t<is_layout_v<Layout>, bool> = true>
+OPUS_D Window make_tdm(u32_t lds_base_address, const void* global_base_address, const Layout& tensor) {
+    using L = remove_cvref_t<Layout>;
+    constexpr u32_t ndim = Window::ndim;
+    static_assert(L::rank == ndim, "make_tdm(): layout rank must match the window's TileShape rank");
+    static_assert(std::is_same_v<typename L::Coord, false_type> || L::coord_rank == L::rank,
+                  "make_tdm(): a peepholed (underscore) coord has no meaning as a tile origin");
+
+    u32_t shape[ndim], coord[ndim];
+    u64_t pitch[ndim - 1];
+    static_for<ndim>([&](auto K) {                                                    // K is a D# dimension index
+        constexpr index_t L_K = index_t(ndim) - 1 - K.value;
+        shape[K.value] = u32_t(tensor.template shape<L_K>());
+        if constexpr (std::is_same_v<typename L::Coord, false_type>) coord[K.value] = 0;
+        else                                                         coord[K.value] = u32_t(tensor.template coord<L_K>());
+    });
+    // pitch[N] advances D# dimension N+1, so it is layout dimension (ndim - 1) - (N + 1).
+    static_for<ndim - 1>([&](auto N) { pitch[N.value] = u64_t(tensor.template stride<index_t(ndim) - 2 - N.value>()); });
+
+    Window t;
+    t.make_from_layout(lds_base_address, global_base_address, shape, pitch, coord);
+    return t;
+}
+
+// Same, spelling the window's type parameters inline rather than naming the type.
+template<typename DataType, typename TileShape, typename... Policies, typename Layout,
+         std::enable_if_t<is_layout_v<Layout>, bool> = true>
+OPUS_D auto make_tdm(u32_t lds_base_address, const void* global_base_address, const Layout& tensor) {
+    return make_tdm<tdm<DataType, TileShape, Policies...>>(lds_base_address, global_base_address, tensor);
+}
+
+// Ring depth, for the pipeline that owns the slot index and the s_wait_tensorcnt depth: 3 tensor ops in flight per wave, 6 per SIMD, issue to XACK.
+// Exceeding it stalls rather than fails, so a deeper ring parks the prologue.
+
+#endif
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
 // mem type traits & free function wrappers (eliminate .template syntax in dependent context)
 template<typename>   struct is_gmem : false_type {};
 template<typename T> struct is_gmem<gmem<T>> : true_type {};
@@ -2120,6 +2966,22 @@ template<typename T> struct is_smem<smem<T>> : true_type {};
 template<typename T> constexpr bool is_smem_v = is_smem<remove_cvref_t<T>>::value;
 
 template<typename T> constexpr bool is_mem_v = is_gmem_v<T> || is_smem_v<T>;
+
+// A tdm window is a memory handle but not a `mem`: it has only the asynchronous DMA, so keeping it out of is_mem_v makes load(window) fail to compile.
+#if (defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)) && (__clang_major__ >= 22)
+template<typename>   struct is_tdm : false_type {};
+template<typename DataType, typename TileShape, typename... Policies>
+struct is_tdm<tdm<DataType, TileShape, Policies...>> : true_type {};
+template<typename T> constexpr bool is_tdm_v = is_tdm<remove_cvref_t<T>>::value;
+
+// opus::async_load(window) / async_store(window), so a window reads like the other memory handles; both the fused and descriptor forms dispatch here.
+template<typename Window, typename... Args, std::enable_if_t<is_tdm_v<Window>, bool> = true>
+OPUS_D void async_load(const Window& window, Args&&... args) { window.async_load(std::forward<Args>(args)...); }
+template<typename Window, typename... Args, std::enable_if_t<is_tdm_v<Window>, bool> = true>
+OPUS_D void async_store(const Window& window, Args&&... args) { window.async_store(std::forward<Args>(args)...); }
+template<typename Window, std::enable_if_t<is_tdm_v<Window>, bool> = true>
+OPUS_D auto make_descriptor(const Window& window) { return window.make_descriptor(); }
+#endif
 
 template<index_t vec = 1, typename Mem, typename... Args, std::enable_if_t<is_mem_v<Mem>, bool> = true>
 OPUS_D auto load(Mem& mem, Args&&... args) { return mem.template load<vec>(std::forward<Args>(args)...); }
@@ -2218,8 +3080,7 @@ template<typename T, index_t N> using mfma_vtype_t = typename impl::mfma_vtype<T
 
 // prefer use make_mfma() to create instance, which will return impl::mfma_adaptor_xxx. In this way we can access layout info from the "mma"
 //
-// Scaled MFMA (gfx950: __builtin_amdgcn_mfma_scale_f32_{32x32x64,16x16x128}_f8f6f4)
-// is also dispatched from this struct via the operator()(a, b, c, int scale_a, int scale_b) overload.
+// Scaled MFMA (gfx950: __builtin_amdgcn_mfma_scale_f32_{32x32x64,16x16x128}_f8f6f4) is also dispatched from this struct via the operator()(a, b, c, int scale_a, int scale_b) overload.
 // Input registers are always 256 bits (i32x8_t) regardless of element type; bitcast is done internally.
 // Format codes (Atype / Btype): 0=fp8(E4M3), 1=bf8(E5M2), 2=fp6(E2M3), 3=bf6(E3M2), 4=fp4(E2M1)
 // scale_a, scale_b: E8M0 exponent values (int); actual_scale = 2^(value - 127). Use 127 for no scaling.
@@ -2291,6 +3152,8 @@ struct mfma {
 #if defined(__gfx950__)
         else if constexpr DISPATCH_MFMA_SCALE_(fp8_t, fp8_t, fp32_t, 32, 32,  64, __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4)
         else if constexpr DISPATCH_MFMA_SCALE_(fp8_t, fp8_t, fp32_t, 16, 16, 128, __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4)
+        else if constexpr DISPATCH_MFMA_SCALE_(fp8_t, fp4_t, fp32_t, 32, 32,  64, __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4)
+        else if constexpr DISPATCH_MFMA_SCALE_(fp8_t, fp4_t, fp32_t, 16, 16, 128, __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4)
         else if constexpr DISPATCH_MFMA_SCALE_(fp4_t, fp4_t, fp32_t, 32, 32,  64, __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4)
         else if constexpr DISPATCH_MFMA_SCALE_(fp4_t, fp4_t, fp32_t, 16, 16, 128, __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4)
 #endif
@@ -2339,18 +3202,18 @@ using mfma_scale_f32_16x16x128_fp4_fp4  = mfma_f32_16x16x128_fp4_fp4;
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // wmma (RDNA4 / wave32) -- gfx1250 uses wmma-256b builtins (16x16x{4,32,64,128}); gfx1200/gfx1201 (Navi 44/48) use wmma-128b _w32_gfx12 builtins (16x16x16). Dispatch macros for the two arg-list shapes differ -- gfx12 set is DISPATCH_WMMA_GFX12_*.
 #if defined(__gfx1250__) || defined(__gfx1201__) || defined(__gfx1200__) || !defined(__HIP_DEVICE_COMPILE__)
-// f16/bf16/f32 builtins: (neg_a, A, neg_b, B, matrix_fmts, C, clamp, neg_c)
+// f16/bf16/f32 builtins: (a_neg, A, b_neg, B, c_mod, C, matrix_a_reuse, matrix_b_reuse)
 #define DISPATCH_WMMA_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
  (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && \
   wave_m == wm_ && wave_n == wn_ && wave_k == wk_) { \
-    return inst_(false, a, false, b, static_cast<short>(0), c, false, false); }
-// bf16f32 special: accumulator is f32 but output is bf16 => (neg_a, A, neg_b, B, fmts, C_f32, clamp, neg_c)
+    return inst_(false, a, false, b, static_cast<short>(0), c, reuse_a, reuse_b); }
+// bf16f32 special: accumulator is f32 but output is bf16 => (a_neg, A, b_neg, B, c_mod, C_f32, matrix_a_reuse, matrix_b_reuse)
 // The builtin takes f32 accumulator and returns bf16 output; we store the f32 accum but return bf16.
 #define DISPATCH_WMMA_BF16F32_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
  (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && \
   wave_m == wm_ && wave_n == wn_ && wave_k == wk_) { \
-    return inst_(false, a, false, b, static_cast<short>(0), c, false, false); }
-// fp8/bf8 builtins: (A, B, matrix_fmts, C, clamp, neg_c)  -- no neg_a/neg_b
+    return inst_(false, a, false, b, static_cast<short>(0), c, reuse_a, reuse_b); }
+// fp8/bf8 builtins: (A, B, c_mod, C, matrix_a_reuse, matrix_b_reuse)  -- no a_neg/b_neg
 // A/B are packed as _ExtVector<N, int>; bitcast from the fp8/bf8 vector
 #define DISPATCH_WMMA_8BIT_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
  (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && \
@@ -2359,7 +3222,7 @@ using mfma_scale_f32_16x16x128_fp4_fp4  = mfma_f32_16x16x128_fp4_fp4;
     constexpr index_t i32_b = elem_b * static_cast<index_t>(sizeof(dtype_b)) / static_cast<index_t>(sizeof(i32_t)); \
     return inst_(__builtin_bit_cast(vector_t<i32_t, i32_a>, a), \
                  __builtin_bit_cast(vector_t<i32_t, i32_b>, b), \
-                 static_cast<short>(0), c, false, false); }
+                 static_cast<short>(0), c, reuse_a, reuse_b); }
 
 // gfx12 builtins: 3-arg (A, B, C) -- no matrix_fmts/neg_c. ws_ selects _w32/_w64 (same {wm,wn,wk} triple).
 #define DISPATCH_WMMA_GFX12_MATCH_(ta_, tb_, tc_, wm_, wn_, wk_, ws_) \
@@ -2407,8 +3270,8 @@ struct wmma {
     static constexpr int fmt_a = std::is_same_v<dtype_a, fp8_t> ? 0 : std::is_same_v<dtype_a, bf8_t> ? 1 : std::is_same_v<dtype_a, fp4_t> ? 4 : -1;
     static constexpr int fmt_b = std::is_same_v<dtype_b, fp8_t> ? 0 : std::is_same_v<dtype_b, bf8_t> ? 1 : std::is_same_v<dtype_b, fp4_t> ? 4 : -1;
 
-    // Regular (non-scaled) dispatch
-    template<typename VA, typename VB, typename VC>
+    // Regular (non-scaled) dispatch. reuse_a/reuse_b are the gfx1250 matrix_{a,b}_reuse hints: assert the operand repeats the previous WMMA's. Undefined if it does not; matrix_a_reuse is a no-op on MI450.
+    template<bool reuse_a = false, bool reuse_b = false, typename VA, typename VB, typename VC>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c) -> vtype_c {
         (void)a; (void)b; (void)c;
         if      constexpr (false) {}
@@ -2878,25 +3741,37 @@ struct wmma_adaptor_swap_ab : wmma_adaptor<WMMA> {
     // Only generate _c layout methods (shape_c/dim_c changed)
     OPUS_ADAPTOR_LAYOUT_API_DEFINE_FOR(c)
 
-    template<typename VA, typename VB, typename VC>
+    // reuse_a/reuse_b name THIS call's operands, so they swap too: under swap_ab `a` lands in SRC1, making reuse_a the one that reaches the working bit.
+    template<bool reuse_a = false, bool reuse_b = false, typename VA, typename VB, typename VC>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c) {
-        return base::operator()(b, a, c);
+        return base::template operator()<reuse_b, reuse_a>(b, a, c);
     }
 
     template<typename VA, typename VB>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b) {
-        typename WMMA::vtype_c c{0}; return operator()(b, a, c);
+        typename base::vtype_c c{0}; return operator()(a, b, c);
     }
 
-    // Scaled overloads (BX32 / BX16): swap a,b then forward to base
-    template<typename VA, typename VB, typename VC>
-    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b) {
-        return base::operator()(b, a, c, scale_a, scale_b);
+    // BX32 scaled: scale word is an int holding 4 packed E8M0 bytes.
+    template<typename VA, typename VB, typename VC, index_t a_scale_sel = 0, index_t b_scale_sel = 0>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b, number<a_scale_sel> = {}, number<b_scale_sel> = {}) {
+        return base::operator()(b, a, c, scale_b, scale_a, number<b_scale_sel>{}, number<a_scale_sel>{});
     }
 
-    template<typename VA, typename VB, typename VC>
-    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, long scale_a, long scale_b) {
-        return base::operator()(b, a, c, scale_a, scale_b);
+    template<typename VA, typename VB, index_t a_scale_sel = 0, index_t b_scale_sel = 0>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, int scale_a, int scale_b, number<a_scale_sel> = {}, number<b_scale_sel> = {}) {
+        typename base::vtype_c c{0}; return operator()(a, b, c, scale_a, scale_b, number<a_scale_sel>{}, number<b_scale_sel>{});
+    }
+
+    // BX16 scaled: scale word is a long holding 8 packed E8M0 bytes.
+    template<typename VA, typename VB, typename VC, index_t a_scale_sel = 0, index_t b_scale_sel = 0>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, long scale_a, long scale_b, number<a_scale_sel> = {}, number<b_scale_sel> = {}) {
+        return base::operator()(b, a, c, scale_b, scale_a, number<b_scale_sel>{}, number<a_scale_sel>{});
+    }
+
+    template<typename VA, typename VB, index_t a_scale_sel = 0, index_t b_scale_sel = 0>
+    OPUS_D constexpr auto operator()(const VA& a, const VB& b, long scale_a, long scale_b, number<a_scale_sel> = {}, number<b_scale_sel> = {}) {
+        typename base::vtype_c c{0}; return operator()(a, b, c, scale_a, scale_b, number<a_scale_sel>{}, number<b_scale_sel>{});
     }
 };
 } // namespace impl (wmma_adaptor)

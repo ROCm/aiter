@@ -1,19 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional, Dict
 import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
-from aiter.ops.triton.utils.types import _is_fp8
-from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 from aiter.ops.triton._triton_kernels.attention.mha_onekernel_bwd import (
     _bwd_preprocess,
+    _get_config,
     bwd_kernel_causal,
     bwd_kernel_noncausal,
-    _get_config,
 )
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.types import _is_fp8
 
 _LOGGER = AiterTritonLogger()
 
@@ -38,23 +37,23 @@ def flash_attn_onekernel_backward(
     dv: torch.Tensor,
     dbias: torch.Tensor,
     sm_scale: float,
-    alibi_slopes: Optional[torch.Tensor],
+    alibi_slopes: torch.Tensor | None,
     causal: bool,
-    cu_seqlens_q: Optional[torch.Tensor],
-    cu_seqlens_k: Optional[torch.Tensor],
+    cu_seqlens_q: torch.Tensor | None,
+    cu_seqlens_k: torch.Tensor | None,
     max_seqlen_q: int,
     max_seqlen_k: int,
     dropout_p: float,
-    philox_seed: Optional[int] = 0,
-    philox_offset: Optional[int] = 0,
-    descale_q: Optional[torch.Tensor] = None,
-    descale_k: Optional[torch.Tensor] = None,
-    descale_v: Optional[torch.Tensor] = None,
-    descale_do: Optional[torch.Tensor] = None,
-    USE_INT64_STRIDES: Optional[bool] = False,
-    sink: Optional[torch.Tensor] = None,
-    dsink: Optional[torch.Tensor] = None,
-    config: Optional[Dict[str, any]] = None,
+    philox_seed: int | None = 0,
+    philox_offset: int | None = 0,
+    descale_q: torch.Tensor | None = None,
+    descale_k: torch.Tensor | None = None,
+    descale_v: torch.Tensor | None = None,
+    descale_do: torch.Tensor | None = None,
+    USE_INT64_STRIDES: bool | None = False,
+    sink: torch.Tensor | None = None,
+    dsink: torch.Tensor | None = None,
+    config: dict[str, any] | None = None,
     sliding_window: int = 0,
 ):
     """
@@ -133,14 +132,14 @@ def flash_attn_onekernel_backward(
             stride_descale_do_z,
         )
 
-    IS_VARLEN = True if cu_seqlens_q is not None else False
+    IS_VARLEN = cu_seqlens_q is not None
 
     # get strides and shape
     if IS_VARLEN:
         # Layout is thd.
         # q and k are [total_tokens, num_head, head_dim_qk].
         # v is [total_tokens, num_head, head_dim_v].
-        batch, seqlen_q, num_q_heads = (
+        batch, _seqlen_q, num_q_heads = (
             len(cu_seqlens_q) - 1,
             max_seqlen_q,
             q.shape[1],
@@ -159,7 +158,7 @@ def flash_attn_onekernel_backward(
         # Layout is bshd.
         # q and k are [batch, seq_len, num_head, head_dim_qk].
         # v is [batch, seq_len, num_head, head_dim_v]
-        batch, seqlen_q, num_q_heads = q.shape[:-1]
+        batch, _seqlen_q, num_q_heads = q.shape[:-1]
         _, num_k_heads = k.shape[1], k.shape[2]
         q_strides = (q.stride(0), q.stride(2), q.stride(1), q.stride(3))
         k_strides = (k.stride(0), k.stride(2), k.stride(1), k.stride(3))

@@ -1,36 +1,38 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional, Tuple
 
-import triton
 import torch
+import triton
+
 from aiter.ops.triton._triton_kernels.quant.quant import (
-    _static_per_tensor_quant_fp8_i8_kernel,
+    _dynamic_mxfp4_quant_kernel,
+    _dynamic_mxfp8_quant_kernel,
+    _dynamic_mxfp8_quant_n32k4_mbn_kernel,
+    _dynamic_nvfp4_quant_kernel,
     _dynamic_per_tensor_quant_fp8_i8_kernel,
     _dynamic_per_token_quant_fp8_i8_kernel,
-    _dynamic_mxfp4_quant_kernel,
-    _mxfp4_quant_op,
-    _dynamic_mxfp8_quant_kernel,
-    _mxfp8_quant_op,
     _fp8_legacy_to_mxfp8_kernel,
-    _dynamic_nvfp4_quant_kernel,
+    _mxfp4_quant_op,
+    _mxfp8_quant_op,
     _nvfp4_quant_op,
+    _static_per_tensor_quant_fp8_i8_kernel,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 __all__ = [
-    "static_per_tensor_quant_fp8_i8",
+    "_mxfp4_quant_op",
+    "_mxfp8_quant_op",
+    "_nvfp4_quant_op",
+    "dynamic_mxfp4_quant",
+    "dynamic_mxfp8_quant",
+    "dynamic_mxfp8_quant_n32k4_mbn",
+    "dynamic_nvfp4_quant",
     "dynamic_per_tensor_quant_fp8_i8",
     "dynamic_per_token_quant_fp8_i8",
-    "dynamic_mxfp4_quant",
-    "_mxfp4_quant_op",
-    "dynamic_mxfp8_quant",
     "fp8_legacy_to_mxfp8",
-    "_mxfp8_quant_op",
-    "dynamic_nvfp4_quant",
-    "_nvfp4_quant_op",
+    "static_per_tensor_quant_fp8_i8",
 ]
 
 _MXFP8_QUANT_BLOCK_SIZE = 32
@@ -59,7 +61,7 @@ def static_per_tensor_quant_fp8_i8(
     rows = x_in.shape[0]
     cols = x_in.shape[1]
     NUM_COL_POW2 = triton.next_power_of_2(cols)
-    grid = lambda meta: (rows,)  # noqa: E731
+    grid = (rows,)
     _static_per_tensor_quant_fp8_i8_kernel[grid](
         qx, x_in, scale_in, cols, x_in.stride(0), NUM_COL_POW2=NUM_COL_POW2
     )
@@ -86,7 +88,7 @@ def dynamic_per_tensor_quant_fp8_i8(
     rows = x_in.shape[0]
     cols = x_in.shape[1]
     NUM_COL_POW2 = triton.next_power_of_2(cols)
-    grid = lambda meta: (rows,)  # noqa: E731
+    grid = (rows,)
     _dynamic_per_tensor_quant_fp8_i8_kernel[grid](
         x_in,
         scale_out,
@@ -129,7 +131,7 @@ def dynamic_per_token_quant_fp8_i8(
     rows = x_in.shape[0]
     cols = x_in.shape[1]
     NUM_COL_POW2 = triton.next_power_of_2(cols)
-    grid = lambda meta: (rows,)  # noqa: E731
+    grid = (rows,)
     _dynamic_per_token_quant_fp8_i8_kernel[grid](
         qx,
         scale_out,
@@ -234,9 +236,9 @@ def dynamic_mxfp4_quant(
 
 def dynamic_mxfp8_quant(
     x: torch.Tensor,
-    scale: Optional[torch.Tensor] = None,
+    scale: torch.Tensor | None = None,
     quant_dtype: torch.dtype = torch.float8_e4m3fn,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Per-1x32 MXFP8 quantization (e8m0 scale + FP8 e4m3 values).
 
@@ -271,7 +273,8 @@ def dynamic_mxfp8_quant(
         assert scale.dtype == torch.uint8
 
     BLOCK_SIZE_N = triton.next_power_of_2(K)
-    NUM_PRGMS = M
+    # Bound launch overhead on large token-head batches; the kernel loops rows by stride.
+    NUM_PRGMS = min(M, 32768)
     grid = (NUM_PRGMS,)
 
     _dynamic_mxfp8_quant_kernel[grid](
@@ -296,12 +299,71 @@ def dynamic_mxfp8_quant(
     return y, s
 
 
+def dynamic_mxfp8_quant_n32k4_mbn(
+    o: torch.Tensor,
+    quant_dtype: torch.dtype = torch.float8_e4m3fn,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused per-1x32 MXFP8 quant + n32k4 scale preshuffle for an mbn activation.
+
+    Single Triton launch: quantizes ``o`` to FP8 e4m3 and writes the e8m0 scale
+    *directly* in the [M//32, B, (K//32)*32] n32k4 layout consumed by the flydsl
+    strided-batched a8w4 kernel (layout='mbn'). Replaces the
+    ``dynamic_mxfp8_quant`` + transpose/permute/contiguous chain (3 uint8 copies)
+    with zero post-quant copies.
+
+    Args:
+        o: [M(tokens), B(groups), K] bf16/fp16 activation, M-outer contiguous.
+        quant_dtype: FP8 dtype for the payload.
+
+    Returns:
+        (a_fp8, a_scales):
+          a_fp8   : [M, B, K] fp8 (mbn physical, M-outer)
+          a_scales: [ceil(M/32), B, (K//32)*32] uint8 e8m0 (n32k4, pre-zeroed)
+    """
+    assert o.dim() == 3, f"expected [M,B,K], got {tuple(o.shape)}"
+    M, B, K = o.shape
+    assert (
+        K % _MXFP8_QUANT_BLOCK_SIZE == 0
+    ), f"K={K} must be a multiple of {_MXFP8_QUANT_BLOCK_SIZE}"
+
+    R = M * B
+    x2d = o.reshape(R, K).contiguous()  # row r = m*B + b (no copy if o contiguous)
+    Ns = K // _MXFP8_QUANT_BLOCK_SIZE
+    S_SUPER = Ns * 32  # bytes per (super, batch) e8m0 block
+
+    y = torch.empty((R, K), dtype=quant_dtype, device=o.device)
+    n_super = (M + 31) // 32
+    # Pre-zeroed so padded rows (m >= M within the last super) stay benign.
+    scale = torch.zeros((n_super, B, S_SUPER), dtype=torch.uint8, device=o.device)
+
+    BLOCK_SIZE_N = triton.next_power_of_2(K)
+    grid = (R,)
+    _dynamic_mxfp8_quant_n32k4_mbn_kernel[grid](
+        x2d,
+        y,
+        scale,
+        R,
+        K,
+        B,
+        x2d.stride(0),
+        x2d.stride(1),
+        y.stride(0),
+        y.stride(1),
+        S_SUPER,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        QUANT_BLOCK_SIZE=_MXFP8_QUANT_BLOCK_SIZE,
+        NUM_PRGMS=R,
+    )
+
+    return y.view(M, B, K), scale
+
+
 def fp8_legacy_to_mxfp8(
     x_fnuz: torch.Tensor,
     x_scale_fp32: torch.Tensor,
-    y_fn: Optional[torch.Tensor] = None,
-    y_scale: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    y_fn: torch.Tensor | None = None,
+    y_scale: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Transcode (FP8 e4m3fnuz, fp32 1x128 scale) -> (FP8 e4m3fn, e8m0 1x32 scale)
     in a single Triton launch. Replaces the Python dequant+requant cascade
@@ -359,7 +421,7 @@ def fp8_legacy_to_mxfp8(
 
 def dynamic_nvfp4_quant(
     x: torch.Tensor,
-    global_scale: Optional[torch.Tensor] = None,
+    global_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to MX FP4 format.

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 
 import torch
 import triton
@@ -54,20 +53,20 @@ def _pick_block_size_m(M: int, num_local_heads: int, num_splitk: int) -> int:
 def fused_reduce_qk_norm_rope_swa_write(
     q: torch.Tensor,
     kv: torch.Tensor,
-    q_norm_weight: Optional[torch.Tensor],
-    kv_norm_weight: Optional[torch.Tensor],
+    q_norm_weight: torch.Tensor | None,
+    kv_norm_weight: torch.Tensor | None,
     q_rms_eps: float,
     kv_rms_eps: float,
     rope_head_dim: int,
     cos_cache: torch.Tensor,
     sin_cache: torch.Tensor,
     positions: torch.Tensor,
-    q_out: Optional[torch.Tensor] = None,
+    q_out: torch.Tensor | None = None,
     is_neox: bool = False,
-    write_indices: Optional[torch.Tensor] = None,
-    batch_id_per_token: Optional[torch.Tensor] = None,
-    state_slot_mapping: Optional[torch.Tensor] = None,
-    swa_kv: Optional[torch.Tensor] = None,
+    write_indices: torch.Tensor | None = None,
+    batch_id_per_token: torch.Tensor | None = None,
+    state_slot_mapping: torch.Tensor | None = None,
+    swa_kv: torch.Tensor | None = None,
     win: int = 128,
     dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:

@@ -1,21 +1,37 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
+import math
+import os
+
 import torch
 import triton
-from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_blockscale import (
-    _gemm_a8w8_blockscale_kernel,
-    _gemm_a8w8_blockscale_preshuffle_kernel,
-    _get_config,
-)
+from packaging.version import Version
+
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
 )
-from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_blockscale import (
+    _gemm_a8w8_blockscale_kernel as triton_gemm_a8w8_blockscale_kernel,
+)
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_blockscale import (
+    _gemm_a8w8_blockscale_preshuffle_kernel as triton_gemm_a8w8_blockscale_preshuffle_kernel,
+)
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_blockscale import (
+    _get_config,
+)
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+_FORCE_GFX1250_EX = os.environ.get("AITER_FORCE_GFX1250_EX", "0") == "1"
+_TRITON_VERSION = Version(triton.__version__)
+
+_GLUON_SUPPORTED_ARCHS = ("gfx950", "gfx1250")
+_GLUON_PRESHUFFLE_ARCHS = ("gfx1250",)
+_GLUON_DEFAULT_ARCHS = ("gfx1250",)
+_GLUON_KERNEL_TYPES = ("bandwidth_bound", "compute_bound")
 
 
 def gemm_a8w8_blockscale(
@@ -23,10 +39,12 @@ def gemm_a8w8_blockscale(
     w: torch.Tensor,
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
-    dtype: Optional[float] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-    skip_reduce: Optional[bool] = False,
+    dtype: float | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
+    skip_reduce: bool | None = False,
+    kernel_type: str = "bandwidth_bound",
+    backend: str | None = None,
 ):
     """
     Computes 8 bit matrix multiplication Y = X @ W^T using block-wise quantization scales.
@@ -61,8 +79,21 @@ def gemm_a8w8_blockscale(
     w = w.T  # (K, N)
     w_scale = w_scale.T  # (scale_k, scale_n)
 
+    if backend is None:
+        backend = "gluon" if get_arch() in _GLUON_DEFAULT_ARCHS else "triton"
+    backend = backend.lower()
+    assert backend in (
+        "triton",
+        "gluon",
+    ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
+
+    if backend == "gluon":
+        assert (
+            get_arch() in _GLUON_SUPPORTED_ARCHS
+        ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
+
     if config is None:
-        config, _ = _get_config(M, N, K)
+        config, _ = _get_config(M, N, K, backend=backend)
 
     if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
         y = torch.empty((M, N), dtype=dtype, device=x.device)
@@ -95,14 +126,53 @@ def gemm_a8w8_blockscale(
     ), "GROUP_K must equal BLOCK_SIZE_K"
 
     # grid = (config["NUM_KSPLIT"], triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])
             * triton.cdiv(N, META["BLOCK_SIZE_N"])
         ),  # Effective launch grid dims: [NUM_KSPLIT, NUM_M_BLOCKS, NUM_N_BLOCKS]
     )
-    _gemm_a8w8_blockscale_kernel[grid](
+
+    extra_constexpr = {}
+    if backend == "gluon":
+        arch = get_arch()
+        assert (
+            kernel_type in _GLUON_KERNEL_TYPES
+        ), f"Unknown kernel_type '{kernel_type}', must be one of {list(_GLUON_KERNEL_TYPES)}"
+        if arch == "gfx950":
+            from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a8w8_blockscale import (
+                _gemm_a8w8_blockscale_kernel as gluon_kernel,
+            )
+
+            # gfx950 has one blockscale kernel, which serves both kernel types.
+            impl = gluon_kernel
+            extra_constexpr["NUM_WARPS"] = config["num_warps"]
+            extra_constexpr["NUM_STAGES"] = max(config.get("num_stages", 2), 2)
+        elif arch == "gfx1250":
+            from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a8w8_blockscale import (
+                _KERNEL_MAP,
+            )
+
+            impl = _KERNEL_MAP[kernel_type]
+            warp_bases = [(0, 1)]
+            for i in range(int(math.log2(config["num_warps"] // 2))):
+                warp_bases.append((1 << i, 0))
+            extra_constexpr["warp_bases"] = tuple(warp_bases)
+            config["NUM_BUFFERS"] = config.pop("num_stages", 1)
+        else:
+            raise AssertionError(
+                f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{arch}'"
+            )
+
+        _LOGGER.info(
+            f"GEMM_A8W8 BLOCKSCALE [gluon/{arch}]: x={tuple(x.shape)} "
+            f"w={tuple(w.shape)} kernel={kernel_type}"
+        )
+    else:
+        impl = triton_gemm_a8w8_blockscale_kernel
+
+    impl[grid](
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -123,6 +193,7 @@ def gemm_a8w8_blockscale(
         w_scale.stride(0),
         w_scale.stride(1),
         **config,
+        **extra_constexpr,
     )
 
     if config["NUM_KSPLIT"] > 1:
@@ -166,11 +237,13 @@ def gemm_a8w8_blockscale_preshuffle(
     w: torch.Tensor,
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
-    dtype: Optional[float] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-    skip_reduce: Optional[bool] = False,
-    is_x_scale_tranposed: Optional[bool] = True,
+    dtype: float | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
+    skip_reduce: bool | None = False,
+    is_x_scale_tranposed: bool | None = True,
+    kernel_type: str = "bandwidth_bound",
+    backend: str | None = None,
 ):
     """
     Computes 8 bit matrix multiplication Y = X @ W^T using block-wise quantization scales.
@@ -207,8 +280,28 @@ def gemm_a8w8_blockscale_preshuffle(
     # w = w.T  # (K, N)
     w_scale = w_scale.T  # (scale_k, scale_n)
 
+    # Resolve backend up-front so the config is loaded from the backend's
+    # config dir (gemm/<backend>/), falling back to the shared gemm/ dir.
+    if backend is None:
+        backend = "gluon" if get_arch() in _GLUON_PRESHUFFLE_ARCHS else "triton"
+    backend = backend.lower()
+
     if config is None:
-        config, _ = _get_config(M, N, K, True)
+        config, _ = _get_config(M, N, K, True, backend=backend)
+
+    # Triton 3.6 fails TritonAMDGPUConvertToBufferOps for gfx950 preshuffle
+    # configs with three pipeline stages. Keep the tuned tile and split-K.
+    if (
+        backend == "triton"
+        and get_arch() == "gfx950"
+        and _TRITON_VERSION < Version("3.7.0")
+        and config.get("num_stages", 1) > 2
+    ):
+        config["num_stages"] = 2
+
+    kernel_type_from_config = config.pop("kernel_type", None)
+    if kernel_type_from_config is not None:
+        kernel_type = kernel_type_from_config
 
     if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
         y = torch.empty((M, N), dtype=dtype, device=x.device)
@@ -247,15 +340,50 @@ def gemm_a8w8_blockscale_preshuffle(
         config["GROUP_K"] == config["BLOCK_SIZE_K"]
     ), "GROUP_K must equal BLOCK_SIZE_K"
 
+    if _FORCE_GFX1250_EX:
+        config["BLOCK_SIZE_K"] = 64
+
     # grid = (config["NUM_KSPLIT"], triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])
             * triton.cdiv(N, META["BLOCK_SIZE_N"])
         ),  # Effective launch grid dims: [NUM_KSPLIT, NUM_M_BLOCKS, NUM_N_BLOCKS]
     )
-    _gemm_a8w8_blockscale_preshuffle_kernel[grid](
+
+    extra_constexpr = {}
+    assert backend in (
+        "triton",
+        "gluon",
+    ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
+
+    if backend == "gluon":
+        assert (
+            get_arch() in _GLUON_PRESHUFFLE_ARCHS
+        ), f"Gluon preshuffle requires one of {_GLUON_PRESHUFFLE_ARCHS}, got '{get_arch()}'"
+        from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a8w8_blockscale import (
+            _PRESHUFFLE_KERNEL_MAP,
+        )
+
+        assert (
+            kernel_type in _PRESHUFFLE_KERNEL_MAP
+        ), f"Unknown kernel_type '{kernel_type}', must be one of {list(_PRESHUFFLE_KERNEL_MAP.keys())}"
+        _LOGGER.info(
+            f"GEMM_A8W8 BLOCKSCALE PRESHUFFLE [gluon/gfx1250]: x={tuple(x.shape)} w={tuple(w.shape)} "
+            f"kernel={kernel_type}"
+        )
+
+        impl = _PRESHUFFLE_KERNEL_MAP[kernel_type]
+        warp_bases = [(0, 1)]
+        for i in range(int(math.log2(config["num_warps"] // 2))):
+            warp_bases.append((1 << i, 0))
+        extra_constexpr["warp_bases"] = tuple(warp_bases)
+        config["NUM_BUFFERS"] = config.pop("num_stages", 1)
+    else:
+        impl = triton_gemm_a8w8_blockscale_preshuffle_kernel
+
+    impl[grid](
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -280,6 +408,7 @@ def gemm_a8w8_blockscale_preshuffle(
         w_scale.stride(0),
         w_scale.stride(1),
         **config,
+        **extra_constexpr,
     )
 
     if config["NUM_KSPLIT"] > 1:

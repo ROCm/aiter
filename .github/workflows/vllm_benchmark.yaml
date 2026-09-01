@@ -23,6 +23,14 @@ env:
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
 jobs:
+  ci_config:
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+      (contains(github.event.pull_request.labels.*.name, 'ci:vllm') ||
+      contains(github.event.pull_request.labels.*.name, 'ci:all')))
+    uses: ./.github/workflows/ci-config.yaml
+
   check-signal:
     if: >-
       github.event_name != 'pull_request' ||
@@ -47,7 +55,7 @@ jobs:
       (github.event.pull_request.draft == false &&
       (contains(github.event.pull_request.labels.*.name, 'ci:vllm') ||
       contains(github.event.pull_request.labels.*.name, 'ci:all')))
-    needs: check-signal
+    needs: [check-signal, ci_config]
     runs-on: build-only-aiter
     steps:
       - name: Checkout aiter repo
@@ -65,10 +73,11 @@ jobs:
       - name: Docker login
         if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
         env:
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
+          DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
         run: |
           for attempt in 1 2 3; do
-            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+            if echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin; then
               echo "Docker login succeeded on attempt ${attempt}"
               exit 0
             fi
@@ -115,35 +124,50 @@ jobs:
           retention-days: 14
 
   vllm_benchmark:
-    name: vLLM Benchmark (8 GPU)
+    name: vLLM Benchmark
     timeout-minutes: 60
     if: >-
       github.event_name != 'pull_request' ||
       (github.event.pull_request.draft == false &&
       (contains(github.event.pull_request.labels.*.name, 'ci:vllm') ||
       contains(github.event.pull_request.labels.*.name, 'ci:all')))
-    needs: build_aiter_wheel
-    runs-on: aiter-8gpu-runner
+    needs: [build_aiter_wheel, ci_config]
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       max-parallel: 2
       matrix:
         include:
-          - model: openai/gpt-oss-120b
+          - model: deepseek-ai/DeepSeek-V4-Pro
+            runner: linux-aiter-do-mi350x-8
             kv_cache_dtype: fp8_kvcache
             tp: 8
-            extra_args: --gpu-memory-utilization 0.3
+            extra_args: >-
+              --quantization deepseek_v4_fp8
+              --moe-backend aiter
+              --tokenizer-mode deepseek_v4
+              --reasoning-parser deepseek_v4
             extra_env_args: ""
-          - model: deepseek-ai/DeepSeek-R1-0528
+          - model: amd/MiniMax-M3-MXFP4
+            runner: linux-aiter-do-mi350x-8
+            kv_cache_dtype: default_kvcache
+            tp: 4
+            extra_args: >-
+              --block-size 128
+              --attention-backend TRITON_ATTN
+              --reasoning-parser minimax_m3
+              --moe-backend aiter
+            extra_env_args: -e VLLM_ROCM_USE_AITER_MOE=1 -e VLLM_USE_BREAKABLE_CUDAGRAPH=0
+          - model: amd/MiniMax-M3-MXFP4
+            runner: linux-aiter-do-mi350x-8
             kv_cache_dtype: default_kvcache
             tp: 8
-            extra_args: --block-size 1
-            extra_env_args: ""
-          - model: moonshotai/Kimi-K2.5
-            kv_cache_dtype: default_kvcache
-            tp: 8
-            extra_args: --block-size 1 --trust-remote-code
-            extra_env_args: -e VLLM_USE_TRITON_FLASH_ATTN=0
+            extra_args: >-
+              --block-size 128
+              --attention-backend TRITON_ATTN
+              --reasoning-parser minimax_m3
+              --moe-backend aiter
+            extra_env_args: -e VLLM_ROCM_USE_AITER_MOE=1 -e VLLM_USE_BREAKABLE_CUDAGRAPH=0
         
     steps:
       - name: Checkout Docker pull retry helper
@@ -164,10 +188,11 @@ jobs:
       - name: Docker login
         if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
         env:
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
+          DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
         run: |
           for attempt in 1 2 3; do
-            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+            if echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin; then
               echo "Docker login succeeded on attempt ${attempt}"
               exit 0
             fi

@@ -17,12 +17,12 @@
 
 import functools
 import os
-from typing import Optional
 
-import aiter
 import pandas as pd
 import torch
 import torch.nn.functional as F
+
+import aiter
 from aiter import dtypes, gemm_a16w16_asm, hipb_create_extension, hipb_mm, logger
 from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
@@ -36,13 +36,28 @@ except ImportError:
         return False
 
 
-from aiter.ops.gemm_op_common import get_padded_m
 from torch import Tensor
+
+from aiter.ops.gemm_op_common import get_padded_m
 
 try:
     from aiter.ops.opus.gemm_op_a16w16 import opus_gemm_a16w16_tune as _opus_tune
-except Exception:
+except Exception:  # noqa: BLE001  blanket catch is intentional here
     _opus_tune = None
+
+# NOTE: gfx1250 split-K kids allocate their partial-sum workspace as a plain
+# torch.empty tensor (see aiter.ops.opus.gemm_op_a16w16._get_opus_workspace)
+# passed explicitly to the launcher. torch's caching allocator is HIP graph-
+# capture aware, so that single torch.empty path serves both eager and capture
+# (a buffer first touched inside capture comes from the graph mempool with a
+# replay-stable address) and no eager pre-warm of the shape is required. (The
+# old per-stream hipMalloc registry -- opus_gemm_workspace_init /
+# opus_splitk_ws_get -- used by the gfx942/gfx950 a16w16 split-K path still needs
+# an eager warm before capture; if that path is ever exercised under cudagraphs,
+# warm it via aiter.opus_gemm_workspace_init() on the capture stream. It fails
+# loudly ("splitk workspace not initialized") rather than silently corrupting,
+# so its absence here is safe to detect.)
+
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -92,7 +107,7 @@ def is_skinny_default_shape(
     N: int,
     K: int,
     dtype,
-    cu_num: Optional[int] = None,
+    cu_num: int | None = None,
 ):
     if isinstance(dtype, str):
         dtype = eval(dtype)
@@ -191,14 +206,28 @@ def get_GEMM_A16W16_config(
                 assert (
                     False
                 ), f"no solution for {M=} {N=} {K=} {dtype=} {bias=}, {scaleAB=}, {bpreshuffle=}"
-        elif is_skinny_default_shape(M, N, K, dtype, cu_num):
-            # soltype, solution_idx = 3, 2
+        elif gfx in ("gfx90a", "gfx942", "gfx950") and is_skinny_default_shape(
+            M, N, K, dtype, cu_num
+        ):
             default_config["libtype"] = "skinny"
             default_config["solidx"] = 2
             default_config["kernelName"] = ""
         if not default_config:
-            default_config["libtype"] = "torch"
-            default_config["solidx"] = 0
+            # gfx1250 has no tuned ASM/skinny/hipblaslt bf16 kernels, so the
+            # torch fallback lands on hipBLASLt, which is markedly slower than
+            # the Triton (gluon) a16w16 kernel for these shapes. Prefer Triton
+            # for unscaled bf16/fp16 GEMMs; explicit tuned CSV entries still win
+            # since they are matched before this fallback is reached.
+            if (
+                gfx == "gfx1250"
+                and not scaleAB
+                and eval(dtype) in (dtypes.bf16, dtypes.fp16)
+            ):
+                default_config["libtype"] = "triton"
+                default_config["solidx"] = 0
+            else:
+                default_config["libtype"] = "torch"
+                default_config["solidx"] = 0
         logger.info(
             f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, {bpreshuffle=}, not found tuned config in {AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE}, will use default config! using {default_config['libtype']} solution:{default_config['solidx']}"
         )
@@ -217,7 +246,7 @@ def save_shapes(
     scaleAB,
     bpreshuffle,
 ):
-    save_gemm = int(os.environ.get("AITER_TUNE_GEMM", 0))
+    save_gemm = int(os.environ.get("AITER_TUNE_GEMM", "0"))
     global tuned_df
     if save_gemm:
         tuned_df = pd.concat(
@@ -243,11 +272,11 @@ def save_shapes(
 def gen_gemm_a16w16_fake_tensor(
     A: Tensor,
     B: Tensor,
-    bias: Optional[Tensor] = None,
-    otype: Optional[torch.dtype] = None,
-    scale_a: Optional[Tensor] = None,
-    scale_b: Optional[Tensor] = None,
-    scale_c: Optional[Tensor] = None,
+    bias: Tensor | None = None,
+    otype: torch.dtype | None = None,
+    scale_a: Tensor | None = None,
+    scale_b: Tensor | None = None,
+    scale_c: Tensor | None = None,
 ) -> Tensor:
     return torch.empty(
         *A.shape[:-1],
@@ -261,11 +290,11 @@ def gen_gemm_a16w16_fake_tensor(
 def gemm_a16w16(
     A: Tensor,
     B: Tensor,
-    bias: Optional[Tensor] = None,
-    otype: Optional[torch.dtype] = None,
-    scale_a: Optional[Tensor] = None,
-    scale_b: Optional[Tensor] = None,
-    scale_c: Optional[Tensor] = None,
+    bias: Tensor | None = None,
+    otype: torch.dtype | None = None,
+    scale_a: Tensor | None = None,
+    scale_b: Tensor | None = None,
+    scale_c: Tensor | None = None,
 ) -> Tensor:
     bpreshuffle = False
     if hasattr(B, "is_shuffled") and B.is_shuffled is True:
@@ -329,13 +358,13 @@ def skinny_gemm(
     inp: Tensor,
     weights: Tensor,
     solidx: int,
-    bias: Optional[Tensor] = None,
-    otype: Optional[torch.dtype] = None,
-    scale_a: Optional[Tensor] = None,
-    scale_b: Optional[Tensor] = None,
-    scale_c: Optional[Tensor] = None,
+    bias: Tensor | None = None,
+    otype: torch.dtype | None = None,
+    scale_a: Tensor | None = None,
+    scale_b: Tensor | None = None,
+    scale_c: Tensor | None = None,
     bpreshuffle=False,
-    config: Optional[dict] = None,
+    config: dict | None = None,
 ):
     import aiter as ops
 
@@ -364,13 +393,13 @@ def hipb_gemm(
     inp: Tensor,
     weights: Tensor,
     solidx: int,
-    bias: Optional[Tensor] = None,
-    otype: Optional[torch.dtype] = None,
-    scale_a: Optional[Tensor] = None,
-    scale_b: Optional[Tensor] = None,
-    scale_c: Optional[Tensor] = None,
+    bias: Tensor | None = None,
+    otype: torch.dtype | None = None,
+    scale_a: Tensor | None = None,
+    scale_b: Tensor | None = None,
+    scale_c: Tensor | None = None,
     bpreshuffle=False,
-    config: Optional[dict] = None,
+    config: dict | None = None,
 ):
     if otype is None:
         otype = inp.dtype
@@ -387,13 +416,13 @@ def torch_gemm(
     inp: Tensor,
     weights: Tensor,
     solidx: int,
-    bias: Optional[Tensor] = None,
-    otype: Optional[torch.dtype] = None,
-    scale_a: Optional[Tensor] = None,
-    scale_b: Optional[Tensor] = None,
-    scale_c: Optional[Tensor] = None,
+    bias: Tensor | None = None,
+    otype: torch.dtype | None = None,
+    scale_a: Tensor | None = None,
+    scale_b: Tensor | None = None,
+    scale_c: Tensor | None = None,
     bpreshuffle=False,
-    config: Optional[dict] = None,
+    config: dict | None = None,
 ):
     assert not bpreshuffle, "bpreshuffle is not supported in torch_gemm!"
     if inp.dtype == dtypes.fp8:
@@ -426,13 +455,13 @@ def asm_gemm(
     inp: Tensor,
     weights: Tensor,
     solidx: int,
-    bias: Optional[Tensor] = None,
-    otype: Optional[torch.dtype] = None,
-    scale_a: Optional[Tensor] = None,
-    scale_b: Optional[Tensor] = None,
-    scale_c: Optional[Tensor] = None,
+    bias: Tensor | None = None,
+    otype: torch.dtype | None = None,
+    scale_a: Tensor | None = None,
+    scale_b: Tensor | None = None,
+    scale_c: Tensor | None = None,
     bpreshuffle=False,
-    config: Optional[dict] = None,
+    config: dict | None = None,
 ):
     kernelName = config.get("kernelName") if config else None
     splitK = config.get("splitK") if config else None
@@ -446,13 +475,13 @@ def flydsl_gemm(
     inp: Tensor,
     weights: Tensor,
     solidx: int,
-    bias: Optional[Tensor] = None,
-    otype: Optional[torch.dtype] = None,
-    scale_a: Optional[Tensor] = None,
-    scale_b: Optional[Tensor] = None,
-    scale_c: Optional[Tensor] = None,
+    bias: Tensor | None = None,
+    otype: torch.dtype | None = None,
+    scale_a: Tensor | None = None,
+    scale_b: Tensor | None = None,
+    scale_c: Tensor | None = None,
     bpreshuffle=False,
-    config: Optional[dict] = None,
+    config: dict | None = None,
 ):
     assert (
         scale_a is None and scale_b is None and scale_c is None
@@ -502,13 +531,13 @@ def opus_gemm(
     inp: Tensor,
     weights: Tensor,
     solidx: int,
-    bias: Optional[Tensor] = None,
-    otype: Optional[torch.dtype] = None,
-    scale_a: Optional[Tensor] = None,
-    scale_b: Optional[Tensor] = None,
-    scale_c: Optional[Tensor] = None,
-    bpreshuffle: Optional[bool] = False,
-    config: Optional[dict] = None,
+    bias: Tensor | None = None,
+    otype: torch.dtype | None = None,
+    scale_a: Tensor | None = None,
+    scale_b: Tensor | None = None,
+    scale_c: Tensor | None = None,
+    bpreshuffle: bool | None = False,
+    config: dict | None = None,
 ):
     if _opus_tune is None:
         logger.warning(
@@ -531,8 +560,10 @@ def opus_gemm(
     ), "opus_gemm does not support scaling"
     assert not bpreshuffle, "opus_gemm does not support bpreshuffle"
     splitK = int(config.get("splitK", 0)) if config is not None else 0
-    m, k = inp.shape
+    m, _k = inp.shape
     n = weights.shape[0]
+    # The split-K workspace (if any) is allocated capture-safely inside
+    # opus_gemm_a16w16_tune -> _get_opus_workspace; no eager pre-warm needed.
     Y = torch.empty(m, n, dtype=otype or inp.dtype, device=inp.device)
     _opus_tune(
         inp.unsqueeze(0),
@@ -542,8 +573,11 @@ def opus_gemm(
         kernelId=int(solidx),
         splitK=splitK,
     )
-    if bias is not None:
-        Y = Y + bias
+    # NOTE: do NOT add bias again here -- the opus splitk reduce kernel already
+    # folds `bias` into the fp32 accumulator before the bf16/fp32 cast (HAS_BIAS
+    # path). The previous `Y = Y + bias` double-counted bias (output = A@B^T +
+    # 2*bias), causing ~54% miscompare (maxabs ~= bias range) for every bias!=None
+    # opus shape under tgemm (e.g. ATOM's bf16 linear).
     return Y
 
 
@@ -551,13 +585,13 @@ def triton_gemm(
     inp: Tensor,
     weights: Tensor,
     solidx: int,
-    bias: Optional[Tensor] = None,
-    otype: Optional[torch.dtype] = None,
-    scale_a: Optional[Tensor] = None,
-    scale_b: Optional[Tensor] = None,
-    scale_c: Optional[Tensor] = None,
-    bpreshuffle: Optional[bool] = False,
-    config: Optional[dict] = None,
+    bias: Tensor | None = None,
+    otype: torch.dtype | None = None,
+    scale_a: Tensor | None = None,
+    scale_b: Tensor | None = None,
+    scale_c: Tensor | None = None,
+    bpreshuffle: bool | None = False,
+    config: dict | None = None,
 ):
     from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 
@@ -584,7 +618,7 @@ class TunedGemm:
 
     def __init__(self):
         # self.extensions_created = False
-        self.save_gemm = int(os.environ.get("AITER_TUNE_GEMM", 0))
+        self.save_gemm = int(os.environ.get("AITER_TUNE_GEMM", "0"))
         self.untune_path = f"{this_dir}/configs/bf16_untuned_gemm.csv"
         self.tune_path = AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE
         if self.save_gemm == 1:
@@ -607,11 +641,11 @@ class TunedGemm:
         self,
         inp: Tensor,
         weights: Tensor,
-        bias: Optional[Tensor] = None,
-        otype: Optional[torch.dtype] = None,
-        scale_a: Optional[Tensor] = None,
-        scale_b: Optional[Tensor] = None,
-        scale_c: Optional[Tensor] = None,
+        bias: Tensor | None = None,
+        otype: torch.dtype | None = None,
+        scale_a: Tensor | None = None,
+        scale_b: Tensor | None = None,
+        scale_c: Tensor | None = None,
     ):
 
         out = gemm_a16w16(

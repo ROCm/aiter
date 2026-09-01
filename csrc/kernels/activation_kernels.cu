@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+// This translation unit is torch-free: define AITER_NO_TORCH_TYPES before any
+// aiter header so aiter_opus_plus.h does not pull in the c10 half/bfloat16
+// headers. The kernels use aiter::hip2opus + the _rmTorch dispatch macros, never
+// the t2opus<c10::*> specializations, so nothing here needs torch/ATen/c10.
+#define AITER_NO_TORCH_TYPES
 #include <cmath>
 
 #include "aiter_hip_common.h"
@@ -11,7 +16,6 @@
 #include "mx_quant_utils.h"
 #include <hip/hip_bf16.h>
 #include "rocprim/rocprim.hpp"
-#include <hipcub/hipcub.hpp>
 
 using fp8_type = opus::fp8_t;
 
@@ -602,7 +606,7 @@ __global__ void act_and_mul_quant_kernel(
                        "v"(fabsf(result_float[i + 1 < VEC_SIZE_I ? i + 1 : i])));
     }
 
-    float max_val = multithread_reduce(thread_max, hipcub::Max(), reduce_thread_size);
+    float max_val = multithread_reduce(thread_max, aiter::Max(), reduce_thread_size);
 
     float quant_scale = is_fp4
         ? aiter::fp4_f32_to_e8m0_scale(max_val)
@@ -871,8 +875,12 @@ static constexpr int nextPow2(unsigned int num)
             using output_dtype = input_dtype;                                                     \
             AITER_DISPATCH_CASE_VEC_SIZE_rmTorch(                                                         \
                 vec_size,                                                                         \
-                aiter::                                                                           \
-                    act_and_mul_kernel<input_dtype, output_dtype, KERNEL<input_dtype>, VEC_SIZE, HAS_LIMIT_VAL, GROUP_NT> \
+                aiter::act_and_mul_kernel<input_dtype,                                            \
+                                          output_dtype,                                           \
+                                          KERNEL<input_dtype>,                                    \
+                                          VEC_SIZE,                                               \
+                                          HAS_LIMIT_VAL,                                          \
+                                          GROUP_NT>                                               \
                 <<<grid, block, 0, stream>>>(reinterpret_cast<output_dtype*>(out.data_ptr()),     \
                                              reinterpret_cast<input_dtype*>(input.data_ptr()),    \
                                              d, limit_val);)                                      \

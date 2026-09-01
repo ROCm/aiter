@@ -15,11 +15,11 @@ WARP_SIZE = 64
 W3_KERNEL_PAIRS = {
     "a16w16_kbuf2v": "a16w16_kbuf2v_sk",
     "a16w16_kbuf2v_bk128": "a16w16_kbuf2v_bk128_sk",
-    "a16w16_kbuf1": "a16w16_kbuf1_sk",
     "a16w16_quad_mfma32_kbuf1": "a16w16_quad_mfma32_kbuf1_sk",
 }
 _NOSPLIT = tuple(W3_KERNEL_PAIRS.keys())
-_SPLITK = tuple(W3_KERNEL_PAIRS.values())
+_GFX942_SPLITK_ONLY = ("a16w16_kbuf1_sk",)
+_SPLITK = tuple(W3_KERNEL_PAIRS.values()) + _GFX942_SPLITK_ONLY
 _GFX942_A16W16_TAGS = (
     _SPLITK
     + (
@@ -30,12 +30,28 @@ _GFX942_A16W16_TAGS = (
     )
     + _NOSPLIT
 )
+# Pre-compiled (.co) a16w16 families: device code comes from an offline build
+# (csrc/opus_gemm/gen_co), not from the JIT. They are a16w16 tags like any other
+# -- same input dtypes, same tune-lookup machinery -- but they get their own
+# launcher signature and their own dispatch table, because none of them needs
+# the workspace argument the gfx1250 split-K families carry. A future split-K
+# .co family would drop out of this tuple and back into the workspace ABI.
+_A16W16_CO_TAGS = ("a16w16_4wave_co", "a16w16_4wave_wl_co")
+
 _A16W16_TAGS = (
     "a16w16",
     "a16w16_flatmm",
     "a16w16_flatmm_splitk",
     "a16w16_persistent",
     "a16w16_mono_tile",
+    # gfx1250 cluster/TDM split-K (fp32 workspace + reduce kernel).
+    "a16w16_cluster_tdm_splitk_ws",
+    # gfx1250 CLUSTER-LAUNCH (multicast) TDM split-K (fp32 workspace + reduce).
+    "a16w16_clusterlaunch_tdm_splitk_ws",
+    # gfx1250 FUSED single-kernel in-cluster split-K reduce (no reduce kernel);
+    # B multicast + GL2-resident partial workspace + cluster-barrier sync.
+    "a16w16_clusterlaunch_tdm_splitk_fuse",
+    *_A16W16_CO_TAGS,
 ) + _GFX942_A16W16_TAGS
 
 EMIT_REGISTRY = {}

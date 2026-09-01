@@ -3,13 +3,12 @@
 
 #pragma once
 
+#include "aiter_stream.h"
+#include "aiter_tensor.h"
 #include "hk_mla_buffer_managers.cuh"
 #include "hk_mla_softmax.cuh"
 #include "mla.h"
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <assert.h>
-#include <torch/python.h>
 
 using namespace hk_mla;
 
@@ -17,7 +16,7 @@ using namespace hk_mla;
 template <typename T>
 __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
     __attribute__((amdgpu_num_vgpr(72))) void kn_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(
-        HkMlaDecodeFwdParams<T> params)
+        HkMlaV32DecodeFwdParams<T> params)
 {
     using q_t     = T::q_t;
     using kv_t    = T::kv_t;
@@ -581,9 +580,20 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                     if constexpr(kEpilogueType == PvGemmEpilogueType::OutputFinal)
                     {
                         o_manager.template output_to_vram<oaccu_base, col_offset, true>(
-                            params.final_output.raw_ptr, warp_idx, qo_start, qo_end, p_lds_o, num_qheads);
-                        o_manager.template output_to_vram<oaccu_base + 8, col_offset + T::kBlockK, true>(
-                            params.final_output.raw_ptr, warp_idx, qo_start, qo_end, p_lds_o, num_qheads);
+                            params.final_output.raw_ptr,
+                            warp_idx,
+                            qo_start,
+                            qo_end,
+                            p_lds_o,
+                            num_qheads);
+                        o_manager
+                            .template output_to_vram<oaccu_base + 8, col_offset + T::kBlockK, true>(
+                                params.final_output.raw_ptr,
+                                warp_idx,
+                                qo_start,
+                                qo_end,
+                                p_lds_o,
+                                num_qheads);
                     }
                     else
                     {
@@ -594,14 +604,14 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
                             0,
                             p_lds_o,
                             num_qheads);
-                        split_o_manager
-                            .template output_to_vram<oaccu_base + 8, col_offset + T::kBlockK, false>(
-                                params.split_output.raw_ptr,
-                                warp_idx,
-                                partial_qo_loc,
-                                0,
-                                p_lds_o,
-                                num_qheads);
+                        split_o_manager.template output_to_vram<oaccu_base + 8,
+                                                                col_offset + T::kBlockK,
+                                                                false>(params.split_output.raw_ptr,
+                                                                       warp_idx,
+                                                                       partial_qo_loc,
+                                                                       0,
+                                                                       p_lds_o,
+                                                                       num_qheads);
                     }
                 }
             });
@@ -825,30 +835,30 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy)
 template <typename T>
 __global__ __launch_bounds__(
     T::kNumThreads,
-    T::kOccupancy) void kn_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(HkMlaDecodeFwdParams<T> params)
+    T::kOccupancy) void kn_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(HkMlaV32DecodeFwdParams<T> params)
 { assert(false); }
 #endif
 
 template <typename Traits>
-void mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(torch::Tensor& query,
-                                            torch::Tensor& kv_buffer,
-                                            const torch::Tensor& qo_indptr,
-                                            const torch::Tensor& kv_indptr,
-                                            const torch::Tensor& kv_page_indices,
-                                            const torch::Tensor& kv_last_page_lens,
-                                            const torch::Tensor& work_indptr,
-                                            const torch::Tensor& work_info_set,
+void mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(aiter_tensor_t& query,
+                                            aiter_tensor_t& kv_buffer,
+                                            const aiter_tensor_t& qo_indptr,
+                                            const aiter_tensor_t& kv_indptr,
+                                            const aiter_tensor_t& kv_page_indices,
+                                            const aiter_tensor_t& kv_last_page_lens,
+                                            const aiter_tensor_t& work_indptr,
+                                            const aiter_tensor_t& work_info_set,
                                             const int max_seqlen_q,
                                             const float softmax_scale,
-                                            torch::Tensor& split_output,
-                                            torch::Tensor& split_lse,
-                                            torch::Tensor& final_output)
+                                            aiter_tensor_t& split_output,
+                                            aiter_tensor_t& split_lse,
+                                            aiter_tensor_t& final_output)
 {
     const int32_t num_qheads = query.size(1);
-    TORCH_CHECK((num_qheads & (num_qheads - 1)) == 0 && num_qheads >= 16 && num_qheads <= 128,
+    AITER_CHECK((num_qheads & (num_qheads - 1)) == 0 && num_qheads >= 16 && num_qheads <= 128,
                 "num_qheads must be a power of 2 in [16, 128], got ",
                 num_qheads);
-    TORCH_CHECK(num_qheads * max_seqlen_q == Traits::kBlockM,
+    AITER_CHECK(num_qheads * max_seqlen_q == Traits::kBlockM,
                 "num_qheads * max_seqlen_q must equal ",
                 Traits::kBlockM,
                 ", got ",
@@ -864,9 +874,9 @@ void mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(torch::Tensor& query,
     HIP_CALL(hipGetDevice(&dev));
     HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
 
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    HkMlaDecodeFwdParams<Traits> params = {
+    HkMlaV32DecodeFwdParams<Traits> params = {
         hk::make_gl<typename Traits::gl_q>(
             static_cast<uint64_t>(reinterpret_cast<uintptr_t>(query.data_ptr())),
             query.size(0),
@@ -880,12 +890,12 @@ void mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(torch::Tensor& query,
             Traits::kKvNumHead,
             Traits::kQkHeadDim),
         // kv_indices
-        kv_page_indices.data_ptr<int32_t>(),
+        reinterpret_cast<int32_t*>(kv_page_indices.data_ptr()),
         // kv_last_page_lens (only read by kernel when kPageSize > 1)
-        kv_last_page_lens.data_ptr<int32_t>(),
+        reinterpret_cast<int32_t*>(kv_last_page_lens.data_ptr()),
         // metadata
-        work_indptr.data_ptr<int32_t>(),
-        work_info_set.data_ptr<int32_t>(),
+        reinterpret_cast<int32_t*>(work_indptr.data_ptr()),
+        reinterpret_cast<int32_t*>(work_info_set.data_ptr()),
         hk::make_gl<typename Traits::gl_o>(
             static_cast<uint64_t>(reinterpret_cast<uintptr_t>(final_output.data_ptr())),
             1,
@@ -915,41 +925,39 @@ void mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(torch::Tensor& query,
         <<<grid, Traits::kNumThreads, lds_size, stream>>>(params);
 }
 
-void hk_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(torch::Tensor& query,
-                                               torch::Tensor& kv_buffer,
-                                               const torch::Tensor& qo_indptr,
-                                               const torch::Tensor& kv_indptr,
-                                               const torch::Tensor& kv_page_indices,
-                                               const torch::Tensor& kv_last_page_lens,
-                                               const torch::Tensor& work_indptr,
-                                               const torch::Tensor& work_info_set,
+void hk_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(aiter_tensor_t& query,
+                                               aiter_tensor_t& kv_buffer,
+                                               const aiter_tensor_t& qo_indptr,
+                                               const aiter_tensor_t& kv_indptr,
+                                               const aiter_tensor_t& kv_page_indices,
+                                               const aiter_tensor_t& kv_last_page_lens,
+                                               const aiter_tensor_t& work_indptr,
+                                               const aiter_tensor_t& work_info_set,
                                                const int max_seqlen_q,
                                                const float softmax_scale,
-                                               torch::Tensor& split_output,
-                                               torch::Tensor& split_lse,
-                                               torch::Tensor& final_output)
+                                               aiter_tensor_t& split_output,
+                                               aiter_tensor_t& split_lse,
+                                               aiter_tensor_t& final_output)
 {
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(final_output));
+    HipDeviceGuard device_guard(final_output.device_id);
 
-    const bool q_is_fp8  = (query.scalar_type() == at::ScalarType::Float8_e4m3fn) ||
-                           (query.scalar_type() == at::ScalarType::Float8_e4m3fnuz);
-    const bool kv_is_fp8 = (kv_buffer.scalar_type() == at::ScalarType::Float8_e4m3fn) ||
-                           (kv_buffer.scalar_type() == at::ScalarType::Float8_e4m3fnuz);
+    const bool q_is_fp8  = (query.dtype() == AITER_DTYPE_fp8);
+    const bool kv_is_fp8 = (kv_buffer.dtype() == AITER_DTYPE_fp8);
 
     if(q_is_fp8 && kv_is_fp8)
     {
         const int32_t page_size = kv_buffer.size(1);
 
-#define DISPATCH_PAGE_SIZE(PS)                                            \
-    case PS: {                                                            \
-        using Traits = HkMlaDecodeFwdTraits<hk::fp8e4m3,                  \
-                                            hk::fp8e4m3,                  \
-                                            hk::bf16,                     \
-                                            /*kBlockN_=*/32,              \
-                                            /*kNumWarps_=*/8,             \
-                                            /*kOccupancy_=*/1,            \
-                                            /*kBlockM_=*/128,             \
-                                            /*kPageSize_=*/PS>;           \
+#define DISPATCH_PAGE_SIZE(PageSize)                                      \
+    case PageSize: {                                                      \
+        using Traits = HkMlaV32DecodeFwdTraits<hk::fp8e4m3,               \
+                                               hk::fp8e4m3,               \
+                                               hk::bf16,                  \
+                                               /*kBlockN_=*/32,           \
+                                               /*kNumWarps_=*/8,          \
+                                               /*kOccupancy_=*/1,         \
+                                               /*kBlockM_=*/128,          \
+                                               /*kPageSize_=*/PageSize>;  \
         mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8<Traits>(query,             \
                                                        kv_buffer,         \
                                                        qo_indptr,         \
@@ -974,7 +982,7 @@ void hk_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(torch::Tensor& query,
             DISPATCH_PAGE_SIZE(1)
             DISPATCH_PAGE_SIZE(64)
         default:
-            TORCH_CHECK(false,
+            AITER_CHECK(false,
                         "hk_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8: unsupported page_size ",
                         page_size,
                         " (supported: 1, 64).");
@@ -984,11 +992,11 @@ void hk_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(torch::Tensor& query,
     }
     else
     {
-        TORCH_CHECK(false,
+        AITER_CHECK(false,
                     "hk_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8 doesn't support q type ",
-                    toString(query.scalar_type()),
+                    AiterDtype_to_str(query.dtype()),
                     " and kv type",
-                    toString(kv_buffer.scalar_type()),
+                    AiterDtype_to_str(kv_buffer.dtype()),
                     ".");
     }
 }

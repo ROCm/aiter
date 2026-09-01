@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+// This translation unit is torch-free: define AITER_NO_TORCH_TYPES before any
+// aiter header so aiter_opus_plus.h does not pull in the c10 half/bfloat16
+// headers. The kernels use aiter::hip2opus + the _rmTorch dispatch macros, never
+// the t2opus<c10::*> specializations, so nothing here needs torch/ATen/c10.
+#define AITER_NO_TORCH_TYPES
 #include "aiter_hip_common.h"
 #include "aiter_dispatch.h"
 #include "aiter_opus_plus.h"
@@ -38,13 +43,17 @@ __device__ __forceinline__ uint32_t cvt_fp4_pk(uint32_t src, uint32_t pair, floa
 __device__ __forceinline__ uint8_t even_round_e2m1(float val) {
     float a = fabsf(val);
     uint8_t mag;
-    if      (a >= 5.0f)  mag = 7;
+    // Round-to-nearest-even: at an exact midpoint, round to the value whose
+    // E2M1 mantissa bit is 0. Midpoints where the larger neighbor is odd
+    // (5.0, 2.5, 1.25, 0.25) use strict '>' so the tie rounds down to even;
+    // midpoints where the larger neighbor is even (3.5, 1.75, 0.75) use '>='.
+    if      (a >  5.0f)  mag = 7;
     else if (a >= 3.5f)  mag = 6;
-    else if (a >= 2.5f)  mag = 5;
+    else if (a >  2.5f)  mag = 5;
     else if (a >= 1.75f) mag = 4;
-    else if (a >= 1.25f) mag = 3;
+    else if (a >  1.25f) mag = 3;
     else if (a >= 0.75f) mag = 2;
-    else if (a >= 0.25f) mag = 1;
+    else if (a >  0.25f) mag = 1;
     else                 mag = 0;
     uint8_t sign_bit = (val < 0.0f) ? 8u : 0u;
     return sign_bit | mag;

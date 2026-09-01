@@ -35,10 +35,12 @@ else
 fi
 
 skip_tests=(
+    "op_tests/multigpu_tests/bench_mega_moe_v2.py"
     "op_tests/multigpu_tests/test_dispatch_combine.py"
     "op_tests/multigpu_tests/test_communication.py"
     "op_tests/multigpu_tests/test_mori_all2all.py"
     "op_tests/multigpu_tests/test_fused_ar_rms.py"
+    "op_tests/multigpu_tests/test_mega_moe_v2.py"
     "op_tests/multigpu_tests/triton_test/test_reduce_scatter_all_gather.py"
     "op_tests/multigpu_tests/triton_test/test_fused_rs_rmsnorm_quant_ag.py"
 )
@@ -78,9 +80,57 @@ for file in "${sharded_files[@]}"; do
         } | tee -a latest_test.log
         continue
     fi
+    # Persistent MLA op-tests always pass work_meta_data; disable the decode
+    # batch gate so they exercise the persistent kernel at every batch size.
+    test_cmd=(timeout 60m python3 "$file")
+    case "$file" in
+        op_tests/multigpu_tests/test_mega_moe_gfx1250.py)
+            {
+                echo "Running gfx1250 MegaMoE fused-scatter accuracy on 8 GPUs when supported"
+            } | tee -a latest_test.log
+            test_cmd=(
+                timeout 60m
+                bash -c '
+                    set -euo pipefail
+                    test_file=$1
+                    arch=$(python3 -c \
+                        "from aiter.jit.utils.chip_info import get_gfx; print(get_gfx())")
+                    if [[ "$arch" != "gfx1250" ]]; then
+                        echo "Skipping $test_file: requires gfx1250, got $arch"
+                        exit 0
+                    fi
+                    exec env MORI_SHMEM_HEAP_SIZE=40G \
+                        torchrun --standalone --nproc_per_node=8 "$test_file" \
+                        --combine scatter_fused --layers 2 --acc_verify 1
+                '
+                _ "$file"
+            )
+            ;;
+        op_tests/test_mla_persistent.py|op_tests/test_mla_persistent_round_robin.py)
+            {
+                echo "Using AITER_MLA_DECODE_PERSISTENT_MAX_BATCH=0 for $file"
+            } | tee -a latest_test.log
+            test_cmd=(env AITER_MLA_DECODE_PERSISTENT_MAX_BATCH=0 timeout 60m python3 "$file")
+            ;;
+        op_tests/test_gemm_a6w6.py)
+            {
+                echo "Running tuned dispatch plus every compatible A6W6 ASM kernel"
+            } | tee -a latest_test.log
+            test_cmd=(
+                timeout 60m
+                bash -c '
+                    set -euo pipefail
+                    test_file=$1
+                    python3 "$test_file" --all-kernels -mnk 257,513,129
+                    python3 "$test_file"
+                '
+                _ "$file"
+            )
+            ;;
+    esac
     # Capture start time (nanoseconds since epoch)
     start_time_ns=$(date +%s%N)
-    if ! timeout 60m python3 "$file" 2>&1 | tee -a latest_test.log; then
+    if ! "${test_cmd[@]}" 2>&1 | tee -a latest_test.log; then
         status="❌ Test failed"
         testFailed=true
         failedFiles+=("$file")
@@ -118,7 +168,9 @@ if [[ "$mla_in_shard" == "true" && "$MULTIGPU" != "TRUE" ]]; then
         "-c 49152 -b 1 -n 16,1 -kvd bf16" \
         "-c 98304 -b 1 -n 16,1 -kvd fp8" \
         "-c 10000 100000 -b 1 3 4 -n 12,1 16,1 -kvd bf16 -lse" \
-        "-c 1 21 63 64 65 256 -b 1 -n 16,1 -kvd bf16 -lse"; do
+        "-c 1 21 63 64 65 256 -b 1 -n 16,1 -kvd bf16 -lse" \
+        "-c 16384 -b 4 -n 16,8 16,17 -kvd bf16" \
+        "-c 260 388 -b 1 2 -n 16,8 -kvd bf16"; do
         echo "=== extra: test_mla.py $args ===" | tee -a latest_test.log
         if ! timeout 10m python3 op_tests/test_mla.py $args 2>&1 | tee -a latest_test.log; then
             testFailed=true

@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
 import copy
+
+import pandas as pd
 import torch
 from torch import Tensor
+
 import aiter
-from aiter.test_common import checkAllclose, perftest, benchmark
-from aiter.utility.dtypes import get_dtype_fp8
+from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.utility import dtypes
-import argparse
-import pandas as pd
+from aiter.utility.dtypes import get_dtype_fp8
 
 
 def rms_norm_forward(x: Tensor, weight: Tensor, eps: float):
@@ -199,7 +201,7 @@ def run_torch_qk_norm_rope_cache_quant_shuffle(
 
     v = v.view(num_tokens, -1, head_size)
 
-    from aiter import reshape_and_cache_with_pertoken_quant, reshape_and_cache
+    from aiter import reshape_and_cache, reshape_and_cache_with_pertoken_quant
 
     if kv_cache_dtype == "auto":
         reshape_and_cache(
@@ -1815,13 +1817,11 @@ def test_qk_norm_rope_cache_block_quant(
     elif total_len < num_tokens:
         seq_lens[-1] += num_tokens - total_len
     max_tpb = max(seq_lens)
-    #
     cu_q_len = torch.zeros(batch_size + 1, dtype=torch.int64, device="cuda")
 
     cu_q_len[0] = 0
     for i in range(batch_size):
         cu_q_len[i + 1] = cu_q_len[i] + seq_lens[i]
-    #
     assert (
         cu_q_len[-1].item() == num_tokens
     ), f"cu_q_len[-1]={cu_q_len[-1].item()} != num_tokens={num_tokens}"
@@ -1973,7 +1973,6 @@ def test_qk_norm_rope_cache_block_quant(
     ]  # k_cache: [num_blocks, num_kv_heads, head_size//x, page_size, x]
     chunk_left_ctx_lens = page_size - 1
     chunk_total_tokens = batch_size * chunk_left_ctx_lens
-    #
     chunk_qkv = torch.randn(
         (chunk_total_tokens, (num_heads_q + num_heads_k + num_heads_v) * head_size),
         dtype=dtype,
@@ -2013,7 +2012,6 @@ def test_qk_norm_rope_cache_block_quant(
     v_scale_chunk_ref = v_scale_ref.clone()
     k_scale_chunk = k_scale.clone()
     v_scale_chunk = v_scale.clone()
-    #
     (
         q_chunk_ref,
         k_chunk_ref,
@@ -2064,7 +2062,6 @@ def test_qk_norm_rope_cache_block_quant(
             max_tokens_per_batch=chunk_left_ctx_lens,
         )
     )
-    #
     print(
         f"chunk-prefill: torch avg: {avg_torch_chunk:.2f} us, cu avg: {avg_cu_chunk:.2f} us"
     )
@@ -2074,14 +2071,14 @@ def test_qk_norm_rope_cache_block_quant(
     # Combine prefill + chunk slots to check all pages with data
     all_slots_so_far = torch.cat([slot_mapping, chunk_slot_mapping])
     chunk_slots_edit = torch.unique(all_slots_so_far // page_size)
-    chunk_k_cache_err = checkAllclose(
+    checkAllclose(
         k_cache_ref.float()[chunk_slots_edit],
         k_cache.float()[chunk_slots_edit],
         msg="chunk k_cache",
         rtol=5e-2,
         atol=0.05,
     )
-    chunk_v_cache_err = checkAllclose(
+    checkAllclose(
         v_cache_ref.float()[chunk_slots_edit],
         v_cache.float()[chunk_slots_edit],
         msg="chunk v_cache",
@@ -2874,7 +2871,10 @@ def test_pts_quant_shuffle_block_layout_parity(
     eps=1e-6,
     use_shuffle_layout=True,
 ):
-    """Parity: the pts write must give identical KV cache for the original [2, num_blocks, ...] and new [num_blocks, 2, ...] (unbind(1)) paged layouts, for both use_shuffle_layout=True and False (both honor the cache's per-block stride)."""
+    """Parity: the pts write must give an identical KV cache across paged layouts
+    that differ only in block/token/head strides -- [2, num_blocks, ...],
+    [num_blocks, 2, ...] (unbind(1)), and the packed
+    [num_blocks, num_heads_kv, block_size, 2*head_size] (non-shuffle only)."""
     cache_dtype = cache_dtype or dtype  # None => auto (cache dtype == qkv dtype)
     x = (
         16 // torch.empty(0, dtype=cache_dtype).element_size()
@@ -2904,22 +2904,42 @@ def test_pts_quant_shuffle_block_layout_parity(
     per_tensor_k_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
     per_tensor_v_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
 
-    def run(blocks_first: bool):
-        # blocks_first=True: new [num_blocks,2,...] (K=cache[:,0], stride 2x); False: original [2,num_blocks,...] (K=cache[0], contiguous).
-        if blocks_first:
-            kv = torch.zeros(
-                (num_blocks, 2, block_size, num_heads_kv, head_size),
-                dtype=cache_dtype,
-                device="cuda",
-            )
-            k_cache, v_cache = kv[:, 0], kv[:, 1]
-        else:
+    def run(layout: str):
+        # Three physically distinct paged KV layouts that must all write the same
+        # logical [num_blocks, block_size, num_heads_kv, head_size] K/V cache. The
+        # kernel is stride-aware in block/token/head; only the innermost head_size
+        # dim must stay contiguous (stride 1).
+        if layout == "kv_first":
+            # original [2, num_blocks, ...]: K=cache[0], per-block contiguous.
             kv = torch.zeros(
                 (2, num_blocks, block_size, num_heads_kv, head_size),
                 dtype=cache_dtype,
                 device="cuda",
             )
             k_cache, v_cache = kv[0], kv[1]
+        elif layout == "blocks_first":
+            # [num_blocks, 2, ...]: K=cache[:,0], K/V interleaved per block (block stride 2x).
+            kv = torch.zeros(
+                (num_blocks, 2, block_size, num_heads_kv, head_size),
+                dtype=cache_dtype,
+                device="cuda",
+            )
+            k_cache, v_cache = kv[:, 0], kv[:, 1]
+        elif layout == "packed_headdim":
+            # [num_blocks, num_heads_kv, block_size, 2*head_size]: K/V packed along
+            # the innermost dim (K=[...,:D], V=[...,D:]) with head/token order
+            # transposed vs the others. permute(0,2,1,3) ->
+            # [num_blocks, block_size, num_heads_kv, head_size] so the kernel's
+            # (block, token, head) stride reads line up; head_size stays contiguous.
+            kv = torch.zeros(
+                (num_blocks, num_heads_kv, block_size, 2 * head_size),
+                dtype=cache_dtype,
+                device="cuda",
+            )
+            k_cache = kv[..., :head_size].permute(0, 2, 1, 3)
+            v_cache = kv[..., head_size:].permute(0, 2, 1, 3)
+        else:
+            raise ValueError(f"unknown layout {layout!r}")
         q_out = torch.empty(
             (num_tokens, num_heads_q, head_size), dtype=dtype, device="cuda"
         )
@@ -2958,8 +2978,20 @@ def test_pts_quant_shuffle_block_layout_parity(
         )
         return q_out, k_cache, v_cache
 
-    q_orig, k_orig, v_orig = run(blocks_first=False)  # [2, num_blocks, ...]
-    q_new, k_new, v_new = run(blocks_first=True)  # [num_blocks, 2, ...]
+    # Reference layout + the variants under test; every layout must produce a
+    # bit-identical logical K/V cache (only block/token/head strides differ).
+    q_ref, k_ref, v_ref = run("kv_first")  # [2, num_blocks, ...]
+    variants = {
+        "blocks_first": run("blocks_first"),  # [num_blocks, 2, ...]
+    }
+    # Packed [num_blocks, Hkv, block_size, 2*head_size]: head_size contiguous in the
+    # innermost dim (K=[...,:D], V=[...,D:]). Non-shuffle only -- the x-shuffle repacks
+    # head_size non-contiguously and honors only the block stride, so a contiguous-head
+    # packed layout can't be represented under it.
+    if not use_shuffle_layout:
+        variants["packed_headdim"] = run(
+            "packed_headdim"
+        )  # [num_blocks, Hkv, block_size, 2*D]
 
     tag = (
         f"block_layout_parity qkv={dtype}, cache={cache_dtype}, tokens={num_tokens}, "
@@ -2967,16 +2999,25 @@ def test_pts_quant_shuffle_block_layout_parity(
         f"block_size={block_size}, blocks={num_blocks}, neox={is_neox_style}, "
         f"shuffle={use_shuffle_layout}"
     )
-    # Only the block stride differs -> must match exactly; checkAllclose logs but doesn't raise, so assert on its ratio.
-    for name, a, b in (
-        ("q_out", q_orig, q_new),
-        ("k_cache", k_orig, k_new),
-        ("v_cache", v_orig, v_new),
-    ):
-        err = checkAllclose(
-            a.float(), b.float(), rtol=0, atol=0, printLog=False, msg=f"{name} {tag}"
-        )
-        assert err == 0, f"{name} [2,B] vs [B,2] parity MISMATCH (err={err}): {tag}"
+    # Only block/token/head strides differ -> must match exactly; checkAllclose
+    # logs but doesn't raise, so assert on its returned ratio.
+    for layout, (q_v, k_v, v_v) in variants.items():
+        for name, a, b in (
+            ("q_out", q_ref, q_v),
+            ("k_cache", k_ref, k_v),
+            ("v_cache", v_ref, v_v),
+        ):
+            err = checkAllclose(
+                a.float(),
+                b.float(),
+                rtol=0,
+                atol=0,
+                printLog=False,
+                msg=f"{name} kv_first vs {layout} {tag}",
+            )
+            assert (
+                err == 0
+            ), f"{name} kv_first vs {layout} parity MISMATCH (err={err}): {tag}"
     print(f"[PASS] {tag}", flush=True)
     return {
         "qkv_dtype": str(dtype),
@@ -2991,6 +3032,101 @@ def test_pts_quant_shuffle_block_layout_parity(
         "is_neox_style": "1" if is_neox_style else "0",
         "use_shuffle_layout": "1" if use_shuffle_layout else "0",
         "status": "PASS",
+    }
+
+
+@benchmark()
+def test_fused_qk_norm_rope_cache_pts_v_norm(
+    dtype,
+    head_size,
+    v_norm,
+    cache_dtype,
+    v_scale,
+    eps=1e-6,
+):
+    """fused_qk_norm_rope_cache_pts_quant_shuffle must write a weightless
+    RMS-normalized V to the cache when v_norm=True (Gemma4), and raw V otherwise.
+    Covers head_dim 256 (sliding) and 512 (full-attention) layers.
+
+    The per-tensor v_scale only divides V on the fp8 quant write path -- a
+    same-dtype cache copies V verbatim (scale is a no-op). So the fp8 +
+    v_scale!=1 case is what actually exercises norm-then-quantize ordering: a
+    scale/norm misorder would only surface once both are active."""
+    dev = "cuda"
+    nt, hq, hk, hv = 1, 1, 1, 1
+    num_heads = hq + hk + hv
+    block_size = 1
+    is_fp8 = cache_dtype not in (torch.bfloat16, torch.float16)
+
+    qkv = torch.randn(nt, num_heads * head_size, dtype=dtype, device=dev)
+    qw = torch.randn(head_size, dtype=dtype, device=dev)
+    kw = torch.randn(head_size, dtype=dtype, device=dev)
+    cos_sin = torch.randn(8, head_size, dtype=dtype, device=dev)
+    positions = torch.zeros(nt, dtype=torch.int64, device=dev)
+    q_out = torch.empty(nt, hq * head_size, dtype=dtype, device=dev)
+    # NHD contiguous cache: [num_blocks, block_size, num_heads, head_size]
+    k_cache = torch.zeros(1, block_size, hk, head_size, dtype=cache_dtype, device=dev)
+    v_cache = torch.zeros(1, block_size, hv, head_size, dtype=cache_dtype, device=dev)
+    slot_mapping = torch.zeros(nt, dtype=torch.int64, device=dev)
+    k_scale = torch.ones(1, dtype=torch.float32, device=dev)
+    v_scale_t = torch.full((1,), v_scale, dtype=torch.float32, device=dev)
+    x = 16 // k_cache.element_size()
+
+    aiter.fused_qk_norm_rope_cache_pts_quant_shuffle(
+        qkv.clone(),
+        qw,
+        kw,
+        cos_sin,
+        positions,
+        nt,
+        hq,
+        hk,
+        hv,
+        head_size,
+        True,  # is_neox_style
+        eps,
+        q_out,
+        k_cache,
+        v_cache,
+        slot_mapping,
+        k_scale,
+        v_scale_t,
+        None,  # k_out
+        None,  # v_out
+        False,  # return_kv
+        False,  # use_shuffle_layout
+        block_size,
+        x,
+        0,  # rotary_dim
+        v_norm,
+    )
+
+    v_in = qkv[:, (hq + hk) * head_size :].view(nt, hv, head_size).float()
+    v_ref = (
+        v_in * torch.rsqrt(v_in.pow(2).mean(-1, keepdim=True) + eps) if v_norm else v_in
+    )
+    # Dequantize the fp8 cache (from_ stored V / v_scale); the same-dtype cache
+    # stored V verbatim, so leave it as-is.
+    v_got = v_cache.view(nt, hv, head_size).float()
+    if is_fp8:
+        v_got = v_got * v_scale
+    # fp8 e4m3 rounding is coarse -- loosen tolerance on the quantized path.
+    tol = 0.1 if is_fp8 else 1e-2
+    err = checkAllclose(
+        v_ref,
+        v_got,
+        rtol=tol,
+        atol=tol,
+        tol_err_ratio=0.1 if is_fp8 else 0.05,
+        msg=f"pts v_norm={v_norm} D={head_size} cache={cache_dtype} v_scale={v_scale}",
+    )
+    return {
+        "dtype": str(dtype),
+        "head_size": head_size,
+        "v_norm": "1" if v_norm else "0",
+        "cache_dtype": str(cache_dtype),
+        "v_scale": v_scale,
+        "err": err,
     }
 
 
@@ -3277,7 +3413,6 @@ if __name__ == "__main__":
                     num_prefill_batches=8,
                     prefill_seq_len=100,
                 )
-    #
     dtype = torch.bfloat16
     batch_size = 2
     num_tokens1 = 3608
@@ -3376,7 +3511,9 @@ if __name__ == "__main__":
     df_md = df.to_markdown(index=False)
     aiter.logger.info("partial_rotary_pts_quant summary (markdown):\n%s", df_md)
 
-    # Stride-aware shuffle parity: original [2, num_blocks, ...] vs new [num_blocks, 2, ...] paged layout must give identical KV cache.
+    # Stride-aware shuffle parity: [2, num_blocks, ...], [num_blocks, 2, ...] and
+    # packed [num_blocks, Hkv, block_size, 2*head_size] paged layouts must all
+    # give an identical KV cache.
     fp8 = get_dtype_fp8()
     df = []
     for is_neox_style in args.is_neox_styles:
@@ -3410,5 +3547,32 @@ if __name__ == "__main__":
     df = pd.DataFrame(df)
     aiter.logger.info(
         "pts_quant_shuffle_block_layout parity summary (markdown):\n%s",
+        df.to_markdown(index=False),
+    )
+
+    # Weightless V-norm (Gemma4): head_dim 256 (sliding) + 512 (full attention),
+    # v_norm on/off. (cache_dtype, v_scale) pairs: a same-dtype cache (scale is a
+    # no-op) plus fp8 at unit and non-trivial scale to check norm-then-quantize.
+    fp8 = get_dtype_fp8()
+    df = []
+    for head_size in (256, 512):
+        for v_norm in (False, True):
+            for cache_dtype, v_scale in (
+                (torch.bfloat16, 1.0),
+                (fp8, 1.0),
+                (fp8, 0.5),
+            ):
+                df.append(
+                    test_fused_qk_norm_rope_cache_pts_v_norm(
+                        torch.bfloat16,
+                        head_size,
+                        v_norm,
+                        cache_dtype,
+                        v_scale,
+                    )
+                )
+    df = pd.DataFrame(df)
+    aiter.logger.info(
+        "fused_qk_norm_rope_cache_pts_v_norm summary (markdown):\n%s",
         df.to_markdown(index=False),
     )

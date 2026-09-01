@@ -1,18 +1,108 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import numpy as np
-import flydsl.compiler as flyc
-from itertools import product
+import os
 from abc import ABC, abstractmethod
+from itertools import product
 
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+import numpy as np
+import torch
+from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly, llvm
 from flydsl.compiler.protocol import extract_to_ir_values
-from flydsl._mlir import ir
+from flydsl.expr import ptrtoint, range_constexpr
 from flydsl.expr.typing import T
 
-from flydsl.expr import buffer_ops, range_constexpr, vector, arith, ptrtoint
+from aiter.ops.flydsl.kernels import buffer_ops, vector
+
+# Global toggle for the amdgpu-kernarg-preload compile hint used by the flydsl
+# kernels. Enabled by default; set AITER_FLYDSL_KERNARG_PRELOAD=0 to disable it
+# globally for all kernels. AITER_FLYDSL_KERNARG_PRELOAD_COUNT overrides the
+# number of kernel arguments to preload.
+AITER_FLYDSL_KERNARG_PRELOAD = bool(
+    int(os.environ.get("AITER_FLYDSL_KERNARG_PRELOAD", "1"))
+)
+AITER_FLYDSL_KERNARG_PRELOAD_COUNT = int(
+    os.environ.get("AITER_FLYDSL_KERNARG_PRELOAD_COUNT", "32")
+)
+
+# Toggle for the amdgpu-expert-scheduling-mode compile hint on the MoE GEMM
+# kernels. Disabled by default; set AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE=1
+# to enable it.
+AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE = bool(
+    int(os.environ.get("AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE", "0"))
+)
+
+
+def ptr_rsrc(ptr):
+    """Convert an fx.Pointer kernel arg to a buffer resource for buffer_load/store."""
+    return buffer_ops.create_buffer_resource_from_addr(fx.Int64(ptrtoint(ptr)))
+
+
+_BUF_COPY_ATOM = {
+    16: fx.rocdl.BufferCopy128b,
+    8: fx.rocdl.BufferCopy64b,
+    4: fx.rocdl.BufferCopy32b,
+    1: fx.rocdl.BufferCopy8b,
+}
+
+# Nominal extent of a raw-pointer buffer view. The real bound is the V#
+# num_records field, which make_buffer_tensor(max_size=True) pins to 0xFFFFFFFF
+# bytes -- the same descriptor ptr_rsrc builds -- so this only has to be large
+# enough not to constrain any caller's indices.
+BUF_VIEW_MAX_ELEMS = 0xFFFFFFFF
+
+
+def ptr_buf_tensor(
+    ptr, elem=fx.Int32, n=BUF_VIEW_MAX_ELEMS, unit_elems=1, num_records_bytes=None
+):
+    """Buffer-resource (V#) view of *ptr*, so ``t[i]`` / ``fx.slice`` index it.
+
+    Keeps the addressing `buffer_ops` used: descriptor in SGPRs, 32-bit voffset
+    per access. Indexing a plain typed pointer instead builds a full 64-bit
+    address in VGPRs on every access.
+
+    ``unit_elems`` sets the access width and hence the rank:
+      1  -> flat ``(n,)``; ``t[i]`` is one element. No atom, no fragment.
+      >1 -> ``(n, unit_elems)``; ``fx.slice(t, (u, None))`` is one wide access
+            and ``fx.copy`` over it emits a single ``buffer_load_dwordx{2,4}``.
+            A vector *element type* would be the obvious spelling for this but
+            MLIR rejects it (``AlignAttr`` takes integer/float only), so the
+            width lives in the layout.
+
+    ``num_records_bytes`` may be a runtime value, for a hardware OOB check that
+    zero-fills rather than reading stale bytes.
+    """
+    layout = (
+        fx.make_layout((n,), (1,))
+        if unit_elems == 1
+        else fx.make_layout((n, unit_elems), (unit_elems, 1))
+    )
+    pt = fx.PointerType.get(
+        elem.ir_type,
+        address_space=fx.AddressSpace.Global,
+        alignment=unit_elems * (elem.width // 8),
+    )
+    view = fx.make_view(fx.inttoptr(pt, fx.Int64(ptrtoint(ptr))), layout)
+    return fx.rocdl.make_buffer_tensor(view, num_records_bytes=num_records_bytes)
+
+
+def buf_copy_atom(unit_bytes, elem=fx.Int32):
+    """Copy atom for a ``unit_bytes``-wide buffer access."""
+    return fx.make_copy_atom(_BUF_COPY_ATOM[unit_bytes](), elem)
+
+
+def ptr_arg(t: torch.Tensor, dtype=None):
+    """Wrap a torch.Tensor as an fx.Pointer (PointerJitArg) for kernel launch."""
+    if dtype is None:
+        dtype = fx.Uint8
+    type_name = type(t).__name__
+    module_name = type(t).__module__
+    if type_name == "FakeTensor" or "fake_tensor" in module_name:
+        return flyc.from_c_void_p(dtype, 0)
+    return flyc.from_c_void_p(dtype, t.data_ptr())
 
 
 def _run_compiled(exe, *args):
@@ -20,11 +110,20 @@ def _run_compiled(exe, *args):
     Subsequent calls: fast dispatch via the cached ``CompiledFunction``.
     """
     cf = getattr(exe, "_cf", None)
-    if cf is None:
+    if cf is not None:
+        cf(*args)
+        return
+    try:
         cf = flyc.compile(exe, *args)
         exe._cf = cf
-    else:
-        cf(*args)
+    except Exception:
+        # flyc.compile leaks ir.Context on failure; pop it so a retry takes the right path.
+        try:
+            while ir.Context.current is not None:
+                ir.Context.current.__exit__(None, None, None)
+        except Exception:  # noqa: BLE001, S110
+            pass
+        raise
 
 
 def _to_raw(v):
@@ -57,18 +156,14 @@ def get_dtype_in_kernel(dtype: str):
 def get_dtype_vec_size(dtype: str):
     if dtype == "f32":
         return 4
-    elif dtype == "f16":
-        return 8
-    elif dtype == "bf16":
+    elif dtype == "f16" or dtype == "bf16":
         return 8
 
 
 def get_dtype_bytes(dtype: str):
     if dtype == "f32":
         return 4
-    elif dtype == "f16":
-        return 2
-    elif dtype == "bf16":
+    elif dtype == "f16" or dtype == "bf16":
         return 2
 
 
@@ -296,7 +391,7 @@ class GTensor(TensorBase):
         raw = extract_to_ir_values(memref)[0]
         if static_bytes_offset_i64 is None:
             if str(raw.type).startswith("!fly.ptr"):
-                base_i64 = arith.index_cast(T.i64, ptrtoint(memref))
+                base_i64 = fx.Int64(ptrtoint(memref))
                 self.rsrc = buffer_ops.create_buffer_resource_from_addr(base_i64)
             else:
                 self.rsrc = buffer_ops.create_buffer_resource(memref, max_size=True)
@@ -316,11 +411,12 @@ class GTensor(TensorBase):
         )
 
     def get_llvm_ptr(self, ptr, bytes_offset_i64, ptr_type="!llvm.ptr<1>"):
-        bytes_offset_i64 = arith.index_cast(T.i64, bytes_offset_i64)
+        # fx.Int64 coerces index / i32 / i64 byte offsets to i64.
+        bytes_offset_i64 = _to_raw(fx.Int64(bytes_offset_i64))
         _ptr_type = ir.Type.parse(ptr_type)
         raw = extract_to_ir_values(ptr)[0]
         if str(raw.type).startswith("!fly.ptr"):
-            base_ptr = arith.index_cast(T.i64, ptrtoint(ptr))
+            base_ptr = _to_raw(fx.Int64(ptrtoint(ptr)))
         else:
             base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, raw)
             base_ptr = llvm.PtrToIntOp(T.i64, base_ptr).result
