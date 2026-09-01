@@ -38,6 +38,7 @@ import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
 from aiter import logger, torch_compile_guard
+from aiter.dist.utils import env_flag
 
 
 def supports_custom_op():
@@ -516,6 +517,14 @@ class GroupCoordinator:
     ca_comm: Any | None  # Custom allreduce communicator
     qr_comm: Any | None  # Quick allreduce communicator
     mq_broadcaster: Any | None  # shared memory broadcaster
+    # Group this one borrows process groups / communicators from; None if it
+    # allocated its own.
+    reuse_from: "GroupCoordinator | None"
+    # Teardown ownership: a borrowed resource is destroyed only by its owner
+    # (a second destroy_process_group() raises). Set on both paths; no default.
+    _owns_cpu_group: bool
+    _owns_device_group: bool
+    _owns_device_communicator: bool
 
     def __init__(
         self,
@@ -526,6 +535,7 @@ class GroupCoordinator:
         use_message_queue_broadcaster: bool = False,
         group_name: str | None = None,
         reuse_from: "GroupCoordinator | None" = None,
+        is_ep: bool = False,
     ):
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
@@ -534,110 +544,128 @@ class GroupCoordinator:
         self.rank = torch.distributed.get_rank()
         self.local_rank = local_rank
 
+        self.reuse_from = reuse_from
+
+        # --- Acquire process groups: borrow from `reuse_from`, or create. -----
+        # Only acquisition differs; the shared tail below runs for both.
         if reuse_from is not None:
             # Identical-rank group: share the source's process groups and
             # communicators instead of allocating a second set over the same
             # ranks. Stays a distinct object with its own unique_name.
+            my_ranks = next((r for r in group_ranks if self.rank in r), None)
+            assert (
+                my_ranks is not None
+            ), f"{self.unique_name}: rank {self.rank} is in none of {group_ranks}"
+            # ranks/rank_in_group are inherited verbatim, so a source with a
+            # different rank list -- or the same one reordered -- silently
+            # addresses the wrong peers. Validate, don't trust the caller.
+            assert list(reuse_from.ranks) == list(my_ranks), (
+                f"{self.unique_name}: reuse_from {reuse_from.unique_name} spans "
+                f"{reuse_from.ranks}, but this group spans {my_ranks}"
+            )
+            assert reuse_from.local_rank == local_rank, (
+                f"{self.unique_name}: reuse_from {reuse_from.unique_name} has "
+                f"local_rank {reuse_from.local_rank}, this group has {local_rank}; "
+                "the inherited device would not match"
+            )
             self.ranks = reuse_from.ranks
             self.world_size = reuse_from.world_size
             self.rank_in_group = reuse_from.rank_in_group
-            self.cpu_group = reuse_from.cpu_group
             self.device_group = reuse_from.device_group
             self.device = reuse_from.device
-            self.use_device_communicator = use_device_communicator
-            # Borrowed process groups; the source owns them (see destroy()).
-            self._owns_process_groups = False
+            self._owns_device_group = False
 
-            self.device_communicator = None
-            if use_device_communicator and self.world_size > 1:
-                src_dc = reuse_from.device_communicator
-                if "ep" in self.unique_name:
-                    # EP needs its own EP-named communicator so use_all2all is
-                    # set and all2all_manager builds; it still reuses the
-                    # source's allreduce handles.
-                    from .device_communicators.communicator_cuda import (
-                        CudaCommunicator,
-                    )
+            if is_ep and use_device_communicator and self.world_size > 1:
+                # mori registers this group under a fixed name and bootstraps
+                # on it, assuming exclusive use. A gloo PG holds none of the
+                # NCCL/CA/QR buffers reuse saves, so EP keeps a private one.
+                self.cpu_group = None
+                for ranks in group_ranks:
+                    cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+                    if self.rank in ranks:
+                        self.cpu_group = cpu_group
+                assert self.cpu_group is not None
+                self._owns_cpu_group = True
+            else:
+                self.cpu_group = reuse_from.cpu_group
+                self._owns_cpu_group = False
+        else:
+            self_device_group = None
+            self_cpu_group = None
 
-                    self.device_communicator = CudaCommunicator(
-                        cpu_group=self.cpu_group,
-                        device=self.device,
-                        device_group=self.device_group,
-                        unique_name=self.unique_name,
-                        reuse_from=src_dc,
-                    )
-                    # We own this object; destroying it only drops the shared
-                    # handle references.
-                    self._owns_device_communicator = True
-                else:
-                    # allreduce/allgather ignore unique_name, so share the
-                    # source's communicator wholesale; the source owns it.
-                    self.device_communicator = src_dc
-                    self._owns_device_communicator = False
-
-            # Reuse the source's shared-memory broadcaster; build one only if it
-            # lacks one and this group asked for it.
-            self.mq_broadcaster = reuse_from.mq_broadcaster
-            if (
-                use_message_queue_broadcaster
-                and self.world_size > 1
-                and self.mq_broadcaster is None
-            ):
-                from .shm_broadcast import MessageQueue
-
-                self.mq_broadcaster = MessageQueue.create_from_process_group(
-                    self.cpu_group, 1 << 22, 6
+            for ranks in group_ranks:
+                device_group = torch.distributed.new_group(
+                    ranks, backend=torch_distributed_backend
                 )
-            return
+                # a group with `gloo` backend, to allow direct coordination
+                # between processes through the CPU.
+                cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+                if self.rank in ranks:
+                    self.ranks = ranks
+                    self.world_size = len(ranks)
+                    self.rank_in_group = ranks.index(self.rank)
+                    self_device_group = device_group
+                    self_cpu_group = cpu_group
 
-        self_device_group = None
-        self_cpu_group = None
+            assert self_cpu_group is not None
+            assert self_device_group is not None
 
-        for ranks in group_ranks:
-            device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
-            )
-            # a group with `gloo` backend, to allow direct coordination between
-            # processes through the CPU.
-            cpu_group = torch.distributed.new_group(ranks, backend="gloo")
-            if self.rank in ranks:
-                self.ranks = ranks
-                self.world_size = len(ranks)
-                self.rank_in_group = ranks.index(self.rank)
-                self_device_group = device_group
-                self_cpu_group = cpu_group
+            self.cpu_group = self_cpu_group
+            self.device_group = self_device_group
+            self.device = torch.device(f"cuda:{local_rank}")
+            self._owns_cpu_group = True
+            self._owns_device_group = True
 
-        assert self_cpu_group is not None
-        assert self_device_group is not None
-
-        self.cpu_group = self_cpu_group
-        self.device_group = self_device_group
-
-        self.device = torch.device(f"cuda:{local_rank}")
-
+        # --- Shared tail: identical for borrowed and freshly created groups. --
         self.use_device_communicator = use_device_communicator
         logger.debug(
             f"Initialized GroupCoordinator {self.unique_name} with "
             f"ranks={self.ranks}, local_rank={self.local_rank}, "
             f"world_size={self.world_size}, "
             f"torch_distributed_backend={torch_distributed_backend}, "
-            f"use_device_communicator={self.use_device_communicator}"
+            f"use_device_communicator={self.use_device_communicator}, "
+            f"reuse_from={reuse_from.unique_name if reuse_from else None}"
         )
+
         self.device_communicator = None
+        self._owns_device_communicator = False
         if use_device_communicator and self.world_size > 1:
-            from .device_communicators.communicator_cuda import CudaCommunicator
+            src_dc = reuse_from.device_communicator if reuse_from is not None else None
+            if src_dc is not None and not is_ep:
+                # Non-EP collectives ignore unique_name: share it wholesale.
+                assert not src_dc.is_ep_communicator, (
+                    f"{self.unique_name}: refusing to share EP communicator "
+                    f"{src_dc.unique_name}; use_all2all / all2all_manager state "
+                    "is per-EP-group and must not be inherited by a non-EP group"
+                )
+                self.device_communicator = src_dc
+            else:
+                from .device_communicators.communicator_cuda import CudaCommunicator
 
-            self.device_communicator = CudaCommunicator(
-                cpu_group=self.cpu_group,
-                device=self.device,
-                device_group=self.device_group,
-                unique_name=self.unique_name,
-            )
-
-        from .shm_broadcast import MessageQueue
+                # EP needs its own ep-named communicator (is_ep_communicator /
+                # use_all2all), but still shares handles via reuse_from.
+                self.device_communicator = CudaCommunicator(
+                    cpu_group=self.cpu_group,
+                    device=self.device,
+                    device_group=self.device_group,
+                    unique_name=self.unique_name,
+                    reuse_from=src_dc,
+                )
+                # Ours to destroy; for a borrower that only drops references.
+                self._owns_device_communicator = True
 
         self.mq_broadcaster = None
         if use_message_queue_broadcaster and self.world_size > 1:
+            if reuse_from is not None:
+                # The shm ring has a single write cursor and its
+                # broadcast_object path hard-asserts src == 0, so it cannot be
+                # shared. Unreachable today (TP is built first, never borrows).
+                raise NotImplementedError(
+                    f"{self.unique_name}: use_message_queue_broadcaster is not "
+                    "supported on a group that borrows another group's cpu_group"
+                )
+            from .shm_broadcast import MessageQueue
+
             self.mq_broadcaster = MessageQueue.create_from_process_group(
                 self.cpu_group, 1 << 22, 6
             )
@@ -1541,21 +1569,26 @@ class GroupCoordinator:
             self.device_communicator.prepare_communication_buffer_for_model(model)
 
     def destroy(self):
-        # Groups built via reuse_from borrow their process groups and (non-EP)
-        # device_communicator; only the owner tears those down (destroying a
-        # shared ProcessGroup twice raises).
-        owns_pg = getattr(self, "_owns_process_groups", True)
-        owns_dc = getattr(self, "_owns_device_communicator", True)
+        """Release what this group owns.
+
+        A ``reuse_from`` group borrows its process groups and (unless EP) its
+        device_communicator; only the owner tears those down, since a second
+        destroy raises and aborts teardown part-way.
+        """
         if hasattr(self, "device_group"):
-            if owns_pg:
+            if self._owns_device_group:
                 torch.distributed.destroy_process_group(self.device_group)
             del self.device_group
         if hasattr(self, "cpu_group"):
-            if owns_pg:
+            if self._owns_cpu_group:
                 torch.distributed.destroy_process_group(self.cpu_group)
             del self.cpu_group
-        if self.device_communicator is not None and owns_dc:
-            self.device_communicator.destroy()
+        if self.device_communicator is not None:
+            if self._owns_device_communicator:
+                self.device_communicator.destroy()
+            # Drop it either way: a kept reference would route collectives into
+            # process groups that are destroyed by now.
+            self.device_communicator = None
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
 
@@ -1588,6 +1621,7 @@ def init_model_parallel_group(
     use_message_queue_broadcaster: bool = False,
     group_name: str | None = None,
     reuse_from: "GroupCoordinator | None" = None,
+    is_ep: bool = False,
 ) -> GroupCoordinator:
     return GroupCoordinator(
         group_ranks=group_ranks,
@@ -1597,6 +1631,7 @@ def init_model_parallel_group(
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
         reuse_from=reuse_from,
+        is_ep=is_ep,
     )
 
 
@@ -1869,6 +1904,19 @@ def initialize_model_parallel(
     are on the same DGX box. For example if we are using 2 DGX-1 boxes
     with a total of 16 GPUs, rank 0 to 7 belong to the first box and
     ranks 8 to 15 belong to the second box.
+
+    Environment:
+        AITER_REUSE_IDENTICAL_COMM_GROUPS (default off; 1/true/yes/on): a group
+            whose rank list exactly matches an already-built one borrows that
+            group's process groups and allreduce communicators instead of
+            allocating a second set (with tp == dcp == ep == world_size, DCP and
+            EP borrow TP). The groups stay distinct objects with their own
+            unique_name; EP keeps its own EP-named device_communicator and a
+            private CPU group. Borrowed resources are released only by their
+            owner, in destroy().
+
+    Collective: all ranks must call this together (it all_reduces to check that
+    they agree on the reuse flag).
     """
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
@@ -1909,23 +1957,47 @@ def initialize_model_parallel(
     # CudaCommunicator allocation for standard TP/PP/DP/EP groups.
     need_std_comm = custom_group_config is None
 
-    # Reuse is gated solely by AITER_REUSE_IDENTICAL_COMM_GROUPS (default off;
-    # set to "1" to enable). When on, a later group whose rank set matches an
-    # already-built one shares its communicators (reuse_from) instead of
-    # allocating duplicates.
-    reuse_identical_rank_groups = (
-        os.environ.get("AITER_REUSE_IDENTICAL_COMM_GROUPS", "0") == "1"
-    )
+    # When on, a group whose rank list matches an earlier one shares its
+    # communicators instead of allocating duplicates.
+    reuse_identical_rank_groups = env_flag("AITER_REUSE_IDENTICAL_COMM_GROUPS")
 
-    # reuse_identical_rank_groups is a collective decision: a per-rank mismatch would
-    # deadlock on new_group(). Assert unanimity to turn a silent hang into an error.
-    _flag = torch.tensor([1 if reuse_identical_rank_groups else 0], dtype=torch.int64)
-    torch.distributed.all_reduce(_flag, group=get_world_group().cpu_group)
-    _n_set = int(_flag.item())
-    assert _n_set == 0 or _n_set == world_size, (
-        f"reuse_identical_rank_groups disagrees across ranks ({_n_set}/{world_size} "
-        "set it True); it must be identical on every rank."
-    )
+    # Declared here so the precondition reads below are legal (a name cannot
+    # be used before its `global`).
+    global _TP, _DCP, _PCP, _PP, _DP, _EP
+
+    # Before the collective below: a second (or partial-rank) call must keep
+    # failing fast and locally instead of blocking in gloo forever.
+    assert _TP is None, "tensor model parallel group is already initialized"
+    assert _DCP is None, "decode context model parallel group is already initialized"
+    assert _PCP is None, "prefill context parallel group is already initialized"
+    assert _PP is None, "pipeline model parallel group is already initialized"
+    assert _DP is None, "data parallel group is already initialized"
+    assert _EP is None, "expert parallel group is already initialized"
+    assert not _CUSTOM, "custom allreduce group is already initialized"
+
+    # Set on only some ranks, those ranks skip new_group() for DCP/EP while the
+    # rest call it, and the job deadlocks in init with no output. Check
+    # unanimity to turn that into an error -- but only where reuse can happen
+    # (need_std_comm False => guaranteed no-op, don't charge every startup).
+    if need_std_comm and world_size > 1:
+        _flag = torch.tensor(
+            [1 if reuse_identical_rank_groups else 0], dtype=torch.int64
+        )
+        torch.distributed.all_reduce(_flag, group=get_world_group().cpu_group)
+        _n_set = int(_flag.item())
+        if _n_set not in (0, world_size):
+            # Not an assert: `python -O` would strip this guard.
+            raise RuntimeError(
+                f"AITER_REUSE_IDENTICAL_COMM_GROUPS disagrees across ranks "
+                f"({_n_set}/{world_size} ranks have it enabled); it must be set "
+                "identically on every rank. Note it accepts 1/true/yes/on, so a "
+                "mixed launcher using different spellings is still unanimous."
+            )
+        if rank == 0:
+            logger.info(
+                f"AITER_REUSE_IDENTICAL_COMM_GROUPS resolved to "
+                f"{reuse_identical_rank_groups}"
+            )
 
     # Dedup helper: a group whose rank set matches an already-built one reuses it
     # (reuse_from). The first builder is the source. Only multi-rank groups are
@@ -1958,21 +2030,21 @@ def initialize_model_parallel(
             use_message_queue_broadcaster=use_message_queue_broadcaster,
             group_name=group_name,
             reuse_from=source,
+            # Pass the EP role explicitly rather than duplicating the
+            # "ep" in unique_name rule DeviceCommunicatorBase already owns; a
+            # missed EP group silently loses all2all and returns wrong outputs.
+            is_ep=group_name == "ep",
         )
         if dedup and source is None:
             _built_by_ranks[key] = group
         return group
 
     # Build the tensor model-parallel groups.
-    global _TP
-    assert _TP is None, "tensor model parallel group is already initialized"
     group_ranks = all_ranks.view(-1, tensor_model_parallel_size).unbind(0)
     # message queue broadcaster is only used in tensor model parallel group
     _TP = _build_group("tp", group_ranks, use_message_queue_broadcaster=True)
 
     # Build the DCP model-parallel groups.
-    global _DCP
-    assert _DCP is None, "decode context model parallel group is already initialized"
     # Note(hc): In the current implementation of decode context parallel,
     # dcp_size must not exceed tp_size, because the world size does not
     # change by DCP, it simply reuses the GPUs of TP group, and split one
@@ -1984,8 +2056,6 @@ def initialize_model_parallel(
     # PCP is an INDEPENDENT dimension (world = ... x pcp x tp), unlike the
     # commented-out DCP above which reuses TP GPUs. PCP sits just outside TP,
     # so transpose(3, 4) brings the PCP dim innermost. DO NOT touch _DCP.
-    global _PCP
-    assert _PCP is None, "prefill context parallel group is already initialized"
     group_ranks = (
         all_ranks.transpose(3, 4)
         .reshape(-1, prefill_context_model_parallel_size)
@@ -1994,20 +2064,14 @@ def initialize_model_parallel(
     _PCP = _build_group("pcp", group_ranks)
 
     # Build the pipeline model-parallel groups.
-    global _PP
-    assert _PP is None, "pipeline model parallel group is already initialized"
     group_ranks = (
         all_ranks.transpose(2, 4).reshape(-1, pipeline_model_parallel_size).unbind(0)
     )
     _PP = _build_group("pp", group_ranks)
 
-    global _DP
-    assert _DP is None, "data parallel group is already initialized"
     group_ranks = all_ranks.transpose(1, 4).reshape(-1, data_parallel_size).unbind(0)
     _DP = _build_group("dp", group_ranks)
 
-    global _EP
-    assert _EP is None, "expert parallel group is already initialized"
     group_ranks = (
         all_ranks.transpose(1, 2)
         .reshape(
@@ -2021,7 +2085,6 @@ def initialize_model_parallel(
     _EP = _build_group("ep", group_ranks)
 
     # Build the custom allreduce group(s) (optional).
-    assert not _CUSTOM, "custom allreduce group is already initialized"
     if custom_group_config is not None:
         for gname, ranks in custom_group_config.items():
             assert (

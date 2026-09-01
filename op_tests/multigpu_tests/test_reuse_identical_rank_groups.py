@@ -10,10 +10,11 @@ all2all still initializes), but no second communicator set is allocated.
 
 Two independent test surfaces:
 
-1. **Decision logic (GPU-free, gloo/CPU).** The dedup decision is pure Python over
-   rank lists. These tests monkeypatch `init_model_parallel_group` to record the
-   reuse graph without building any device communicator, so they run on any box
-   (no GPU / NCCL). They cover the topologies that actually occur in production:
+1. **Decision logic + bookkeeping (GPU-free, gloo/CPU).** Drive the *real*
+   GroupCoordinator over gloo with only the CUDA leaf (CudaCommunicator)
+   stubbed, so the reuse path, ownership flags, EP private cpu_group and guarded
+   destroy() all execute on any box. They also assert reuse allocates strictly
+   fewer process groups and handles than the flag-off baseline. Topologies:
      - all-alias        (tp==dcp==ep over all ranks): DCP/EP reuse TP
      - dp-attention     (tp=1, dp=world): EP reuses **DP**, not TP
      - partial/no-alias (tp=2, dp=2):   DP is its own source, EP aliases nobody
@@ -32,6 +33,8 @@ Run:
 """
 
 import os
+import time
+from typing import ClassVar
 
 import pytest
 import torch
@@ -83,49 +86,77 @@ def _dims(topo, world):
 # --------------------------------------------------------------------------- #
 # Decision-logic surface (GPU-free)
 # --------------------------------------------------------------------------- #
-class _FakeGroup:
-    """Stand-in returned by the patched init_model_parallel_group.
+class _StubCommunicator:
+    """GPU-free stand-in for CudaCommunicator.
 
-    Records only what the reuse decision produces: this rank's subgroup, the
-    group_name-derived unique_name, and the source it was told to reuse. Builds
-    no process group / device communicator, so the decision runs GPU-free.
+    Only the CUDA leaf is replaced, so the real GroupCoordinator reuse path,
+    ownership flags and guarded destroy() still execute. Mirrors the two
+    behaviours parallel_state depends on: the ``"ep" in unique_name`` rule and
+    handle inheritance. Constructions are logged in ``instances`` for counting.
     """
 
-    def __init__(self, group_name, my_ranks, rank, reuse_from):
-        # Real code appends a counter ("ep:0"); "ep" in name is all we assert on.
-        self.unique_name = group_name
-        self.group_name = group_name
-        self.ranks = list(my_ranks)
-        self.world_size = len(my_ranks)
-        self.rank_in_group = my_ranks.index(rank)
-        self.reuse_from = reuse_from
+    instances: ClassVar[list] = []
 
-    def destroy(self):
-        pass
-
-
-def _record_groups(rank):
-    """Patch ps.init_model_parallel_group with a recorder; return the restorer.
-
-    _build_group looks the symbol up in the module namespace at call time, so
-    patching the attribute is enough. Restored even if the body raises.
-    """
-    original = ps.init_model_parallel_group
-
-    def recorder(
-        group_ranks,
-        local_rank,
-        backend,
-        use_device_communicator=True,
-        use_message_queue_broadcaster=False,
-        group_name=None,
+    def __init__(
+        self,
+        cpu_group,
+        device=None,
+        device_group=None,
+        unique_name: str = "",
         reuse_from=None,
     ):
-        my = next((r for r in group_ranks if rank in r), group_ranks[0])
-        return _FakeGroup(group_name, my, rank, reuse_from)
+        self.cpu_group = cpu_group
+        self.device_group = device_group
+        self.device = device
+        self.unique_name = unique_name
+        self.reuse_from = reuse_from
+        self.ranks = dist.get_process_group_ranks(cpu_group)
+        self.world_size = len(self.ranks)
+        self.rank_in_group = self.ranks.index(dist.get_rank())
+        # As DeviceCommunicatorBase derives them.
+        self.is_ep_communicator = "ep" in unique_name
+        self.use_all2all = self.is_ep_communicator
+        if reuse_from is not None:
+            self.pynccl_comm = reuse_from.pynccl_comm
+            self.ca_comm = reuse_from.ca_comm
+            self.qr_comm = reuse_from.qr_comm
+        else:
+            # Sentinels for the per-group NCCL/CA/QR buffers; distinct ids
+            # counted == memory saved.
+            self.pynccl_comm = object()
+            self.ca_comm = object()
+            self.qr_comm = object()
+        self.destroyed = False
+        type(self).instances.append(self)
 
-    ps.init_model_parallel_group = recorder
-    return lambda: setattr(ps, "init_model_parallel_group", original)
+    def destroy(self):
+        self.destroyed = True
+
+
+def _patch_cuda_communicator():
+    """Swap in _StubCommunicator, reset the log, return the restorer.
+
+    GroupCoordinator imports it inside __init__, so patching the attr suffices.
+    """
+    from aiter.dist.device_communicators import communicator_cuda as cc
+
+    original = cc.CudaCommunicator
+    _StubCommunicator.instances = []
+    cc.CudaCommunicator = _StubCommunicator
+    return lambda: setattr(cc, "CudaCommunicator", original)
+
+
+def _count_new_group():
+    """Count torch.distributed.new_group calls; return (calls, restorer)."""
+    original = torch.distributed.new_group
+    calls = []
+
+    def counting(*args, **kwargs):
+        calls.append(args[0] if args else kwargs.get("ranks"))
+        return original(*args, **kwargs)
+
+    torch.distributed.new_group = counting
+    return calls, lambda: setattr(torch.distributed, "new_group", original)
 
 
 def _rankset(g):
@@ -147,24 +178,66 @@ def _assert_reuse_invariants(groups):
     """Hold in every topology, independent of the specific rank layout."""
     for name, g in groups.items():
         if g.reuse_from is not None:
-            # A reusing group inherits its source's ranks/rank_in_group verbatim,
-            # so reuse is only correct when the *ordered* rank list is identical --
-            # not merely the same set. Dedup keys on tuple(my_ranks) for exactly
-            # this reason; asserting ordered equality (not set equality) locks that
-            # in: if keying ever reverts to sorted() and a non-ascending group
-            # appears, a same-set/different-order collapse would trip this.
+            src = g.reuse_from
+            # ranks/rank_in_group are inherited verbatim, so the *ordered* rank
+            # list must match -- not merely the same set. Asserting ordered
+            # equality locks in the tuple(my_ranks) dedup key.
             assert (
-                g.ranks == g.reuse_from.ranks
+                g.ranks == src.ranks
             ), f"{name} reuses a source with a different rank order"
+            assert g.rank_in_group == src.rank_in_group
             # ...and single-member groups never reuse (they hold no communicator).
             assert g.world_size > 1, f"{name} is single-rank yet reuses"
+
+            # device_group (the NCCL one, i.e. the memory saved) is always shared.
+            assert g.device_group is src.device_group, f"{name} did not share NCCL PG"
+            assert not g._owns_device_group, f"{name} claims to own a borrowed PG"
+
+            if name == "ep":
+                # mori assumes exclusive use of the EP cpu_group, so it stays
+                # private (a gloo PG holds none of the saved buffers).
+                assert (
+                    g.cpu_group is not src.cpu_group
+                ), "EP borrower must not share the source's cpu_group with mori"
+                assert g._owns_cpu_group, "EP borrower must own its private cpu_group"
+                assert dist.get_process_group_ranks(g.cpu_group) == list(g.ranks)
+            else:
+                assert g.cpu_group is src.cpu_group, f"{name} did not share cpu_group"
+                assert not g._owns_cpu_group, f"{name} claims to own a borrowed PG"
+
+            # The shm ring is single-owner and hard-asserts src == 0.
+            assert g.mq_broadcaster is None, f"{name} built a broadcaster while reusing"
+
+            # EP needs its own (ep-named, all2all-capable); others share.
+            if name == "ep":
+                assert g.device_communicator is not src.device_communicator
+                assert g._owns_device_communicator
+                assert g.device_communicator.is_ep_communicator
+                # ...with no second set of allreduce handles.
+                assert (
+                    g.device_communicator.pynccl_comm
+                    is src.device_communicator.pynccl_comm
+                ), "EP borrower allocated a second pynccl comm"
+            else:
+                assert (
+                    g.device_communicator is src.device_communicator
+                ), f"{name} allocated a second device communicator"
+                assert not g._owns_device_communicator
+                assert not g.device_communicator.is_ep_communicator, (
+                    f"{name} borrowed an EP communicator; its collectives would "
+                    "route through all2all"
+                )
+        else:
+            assert g._owns_cpu_group and g._owns_device_group
         # EP always keeps an ep-named unique_name, reuse or not.
         if name == "ep":
             assert "ep" in g.unique_name, f"EP unique_name lost 'ep': {g.unique_name}"
+            if g.device_communicator is not None:
+                assert g.device_communicator.use_all2all, "EP lost all2all"
 
 
 def _decision_worker(rank, world_size, port, topo, reuse):
-    restore = None
+    restore = []
     try:
         os.environ[_ENV] = "1" if reuse else "0"
         init_distributed_environment(
@@ -174,7 +247,7 @@ def _decision_worker(rank, world_size, port, topo, reuse):
             local_rank=rank,
             backend="gloo",
         )
-        restore = _record_groups(rank)
+        restore.append(_patch_cuda_communicator())
         initialize_model_parallel(**_dims(topo, world_size))
         g = _groups()
 
@@ -182,6 +255,7 @@ def _decision_worker(rank, world_size, port, topo, reuse):
             # Flag off: nothing reuses, regardless of topology.
             for name, grp in g.items():
                 assert grp.reuse_from is None, f"{name} reused with flag off"
+                assert grp._owns_cpu_group and grp._owns_device_group
         else:
             _assert_reuse_invariants(g)
             if topo == "all_alias":
@@ -209,16 +283,66 @@ def _decision_worker(rank, world_size, port, topo, reuse):
                 ), "EP matches no prior rank set; must not reuse"
                 assert g["ep"].world_size == world_size
 
+        # Real guarded teardown: a double destroy_process_group() would raise,
+        # and borrowers must drop their reference to the source's communicator.
+        borrowers = [grp for grp in g.values() if grp.reuse_from is not None]
         destroy_model_parallel()
+        for grp in borrowers:
+            assert grp.device_communicator is None, "borrower kept a dead communicator"
     finally:
-        if restore is not None:
-            restore()
+        for undo in reversed(restore):
+            undo()
+        if dist.is_initialized():
+            destroy_distributed_environment()
+
+
+def _saving_worker(rank, world_size, port, topo):
+    """A/B the same topology in one process and assert reuse allocates less."""
+    restore = []
+    try:
+        init_distributed_environment(
+            world_size=world_size,
+            rank=rank,
+            distributed_init_method=f"tcp://127.0.0.1:{port}",
+            local_rank=rank,
+            backend="gloo",
+        )
+        restore.append(_patch_cuda_communicator())
+
+        counts = {}
+        for reuse in (False, True):
+            os.environ[_ENV] = "1" if reuse else "0"
+            _StubCommunicator.instances = []
+            calls, undo_count = _count_new_group()
+            try:
+                initialize_model_parallel(**_dims(topo, world_size))
+                comms = list(_StubCommunicator.instances)
+                # Distinct handles == buffers actually allocated.
+                counts[reuse] = (
+                    len(calls),
+                    len(comms),
+                    len({id(c.pynccl_comm) for c in comms}),
+                )
+            finally:
+                undo_count()
+                destroy_model_parallel()
+
+        off_pg, off_comm, off_handles = counts[False]
+        on_pg, on_comm, on_handles = counts[True]
+        assert on_pg < off_pg, f"{topo}: no process groups saved ({on_pg} vs {off_pg})"
+        assert (
+            on_handles < off_handles
+        ), f"{topo}: no allreduce handles saved ({on_handles} vs {off_handles})"
+        assert on_comm <= off_comm
+    finally:
+        for undo in reversed(restore):
+            undo()
         if dist.is_initialized():
             destroy_distributed_environment()
 
 
 def _unanimity_worker(rank, world_size, port):
-    """rank 0 sets the flag off, the rest on -> the unanimity assert must fire."""
+    """rank 0 sets the flag off, the rest on -> the unanimity guard must fire."""
     try:
         os.environ[_ENV] = "0" if rank == 0 else "1"
         init_distributed_environment(
@@ -228,29 +352,46 @@ def _unanimity_worker(rank, world_size, port):
             local_rank=rank,
             backend="gloo",
         )
-        raised = False
-        try:
+        # RuntimeError, not assert (`python -O` strips those). Match the message
+        # so an unrelated failure cannot pass this test.
+        with pytest.raises(RuntimeError, match=_ENV):
             initialize_model_parallel(tensor_model_parallel_size=world_size)
-        except AssertionError:
-            raised = True
-        assert raised, "disagreeing reuse flag across ranks must raise AssertionError"
-        destroy_model_parallel()
     finally:
         if dist.is_initialized():
             destroy_distributed_environment()
 
 
-def _spawn(worker, world_size, *args):
+def _spawn(worker, world_size, *args, timeout=180):
     # Fresh port per spawn -> no "address in use" across back-to-back tests.
     port = get_open_port()
-    mp.spawn(worker, args=(world_size, port, *args), nprocs=world_size, join=True)
+    # Explicit timeout: a reuse bug here hangs (ranks disagreeing on whether to
+    # call new_group), which would otherwise wedge CI until the job timeout.
+    ctx = mp.spawn(
+        worker, args=(world_size, port, *args), nprocs=world_size, join=False
+    )
+    deadline = time.monotonic() + timeout
+    while not ctx.join(timeout=1):
+        if time.monotonic() > deadline:
+            for proc in ctx.processes:
+                if proc.is_alive():
+                    proc.terminate()
+            raise TimeoutError(
+                f"{worker.__name__} did not finish within {timeout}s "
+                "(ranks likely disagree on which process groups to create)"
+            )
 
 
-@pytest.mark.parametrize("topo", ["all_alias", "dp_attention", "partial"])
+@pytest.mark.parametrize("topo", _TOPO_NAMES)
 @pytest.mark.parametrize("reuse", [True, False])
 def test_reuse_decision(topo, reuse):
-    """GPU-free: the dedup decision picks the right source per topology."""
+    """GPU-free: the real GroupCoordinator picks the right source per topology."""
     _spawn(_decision_worker, 4, topo, reuse)
+
+
+@pytest.mark.parametrize("topo", _TOPO_NAMES)
+def test_reuse_saves_process_groups_and_handles(topo):
+    """GPU-free: reuse must actually allocate less -- the point of the PR."""
+    _spawn(_saving_worker, 4, topo)
 
 
 def test_reuse_flag_disagreement_asserts():
@@ -273,17 +414,8 @@ def _gpu_init(rank, world_size, port, topo, reuse):
     )
     os.environ[_ENV] = "1" if reuse else "0"
     initialize_model_parallel(**_dims(topo, world_size))
-    # Wire the custom-allreduce signal buffer exactly as init_dist_env does, so
-    # the (possibly shared) ca_comm is functional. Use the multi-rank source
-    # group -- TP is a singleton (device_communicator is None) under dp-attention.
-    src = get_dp_group() if topo == "dp_attention" else get_tp_group()
-    dc = src.device_communicator
-    ca = dc.ca_comm if dc is not None else None
-    if ca is not None and not getattr(ca, "_is_gfx1250", False):
-        signal = torch.zeros(world_size * 64, dtype=torch.int64, device=rank)
-        ca.signal = signal
-        ca.register_input_buffer(signal)
-        ca.buffer = ca._pool["input"].tensor
+    # ca_comm is checked by identity only; the functional check below runs over
+    # pynccl_comm. Driving CA would need init_dist_env's full buffer handshake.
 
 
 def _gpu_teardown():
@@ -343,7 +475,9 @@ def _gpu_worker(rank, world_size, port, topo, reuse):
         assert ep.device_communicator.ca_comm is source.device_communicator.ca_comm
         assert ep.device_communicator.qr_comm is source.device_communicator.qr_comm
         assert ep.device_group is source.device_group
-        assert ep.cpu_group is source.cpu_group
+        # ...but cpu_group stays private for mori (see the GPU-free suite).
+        assert ep.cpu_group is not source.cpu_group
+        assert dist.get_process_group_ranks(ep.cpu_group) == list(source.ranks)
 
         if topo == "all_alias":
             # DCP (non-EP) shares TP's device_communicator wholesale.
@@ -390,6 +524,8 @@ def main():
     for reuse in (True, False):
         for topo in _TOPO_NAMES:
             _spawn(_decision_worker, 4, topo, reuse)
+    for topo in _TOPO_NAMES:
+        _spawn(_saving_worker, 4, topo)
     _spawn(_unanimity_worker, 4)
     print("decision-logic tests: PASSED")
 
