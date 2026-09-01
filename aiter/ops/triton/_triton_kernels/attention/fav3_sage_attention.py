@@ -1220,6 +1220,26 @@ def compute_block_masking(
         )
 
 
+# Only the constexprs that actually separate one specialization from another.
+#
+# Every key here must render as a valid C identifier: make_kernel_repr puts the
+# value straight into the kernel name and Triton checks it against
+# ^[a-zA-Z_][a-zA-Z0-9_]*$. A negative renders a '-' and a non-integral float
+# renders a '.', and either fails the compile. Add nothing to this list that
+# can be either one.
+#
+# Left out, and why:
+#   WINDOW_SIZE_LEFT, WINDOW_SIZE_RIGHT
+#     -1 is the "no sliding window" sentinel and the common case, so these put
+#     "-1" in the name and broke every non-windowed launch. Do not re-add them.
+#     USE_SLIDING_WINDOW keeps the bit that says which masking path compiled.
+#   IS_VARLEN, ENABLE_DROPOUT, RETURN_SCORES, USE_ALIBI, USE_EXP2, USE_SEQUSED
+#     the sole launch site passes a literal for each, so they were six fixed
+#     segments in every name.
+#   BLOCK_DMODEL_QK, BLOCK_DMODEL_V
+#     max(16, next_pow2(ACTUAL_BLOCK_DMODEL_*)), so the ACTUAL keys already
+#     determine them -- and they are the more informative half, since head
+#     sizes 1, 2, 4 and 16 all pad to 16.
 _sage_fwd_repr = make_kernel_repr(
     "sage_fwd",
     [
@@ -1228,22 +1248,12 @@ _sage_fwd_repr = make_kernel_repr(
         "HK",
         "ACTUAL_BLOCK_DMODEL_QK",
         "ACTUAL_BLOCK_DMODEL_V",
-        "IS_VARLEN",
         "IS_CAUSAL",
         "USE_SLIDING_WINDOW",
-        "WINDOW_SIZE_LEFT",
-        "WINDOW_SIZE_RIGHT",
         "BLOCK_M",
-        "BLOCK_DMODEL_QK",
-        "BLOCK_DMODEL_V",
         "BLOCK_N",
         "PRE_LOAD_V",
         "USE_BIAS",
-        "ENABLE_DROPOUT",
-        "RETURN_SCORES",
-        "USE_ALIBI",
-        "USE_EXP2",
-        "USE_SEQUSED",
         "USE_BLOCK_SPARSE",
     ],
 )
