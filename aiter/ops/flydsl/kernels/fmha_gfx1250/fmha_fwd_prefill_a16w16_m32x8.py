@@ -14,8 +14,8 @@ so a threadgroup is ``8 * 32 = 256`` threads and ``BLOCK_M = 32 * 8 = 256`` Q
 rows. (The leading ``32`` is per-wave Q rows; ``16`` is the WMMA M dimension.)
 
 Layout support — two device kernels over one shared compute core (option B):
-  - ``kn_fmha_fwd_prefill_m32x8_thd``  — varlen THD, driven by ``cu_seqlens``.
-  - ``kn_fmha_fwd_prefill_m32x8_bshd`` — batched BSHD, uniform ``seq_len`` scalar
+  - ``kn_fmha_fwd_prefill_a16w16_m32x8_thd``  — varlen THD, driven by ``cu_seqlens``.
+  - ``kn_fmha_fwd_prefill_a16w16_m32x8_bshd`` — batched BSHD, uniform ``seq_len`` scalar
     (no ``cu_seqlens`` tensors → nothing transient to bake into a CUDA graph).
 Both resolve their per-workgroup base offsets + sequence bounds, then call the
 layout-agnostic ``_core_attention`` helper.
@@ -65,10 +65,10 @@ scf_if_dispatch = ReplaceIfWithDispatch.scf_if_dispatch
 from flydsl.expr.rocdl import tdm_ops
 
 # Single source of truth for gfx1250 Expert Scheduling Mode 2 (DEP_MODE=2). Lives
-# in mha_buffer_managers. Under mode 2 the LLVM setreg (via the
+# in fmha_b16_buffer_managers. Under mode 2 the LLVM setreg (via the
 # amdgpu-expert-scheduling-mode hint, set in _ensure_*_kernel) makes LLVM insert all
 # depctr covers itself for the plain intrinsics the kernel emits.
-from .mha_buffer_managers import (
+from .fmha_b16_buffer_managers import (
     ENABLE_SCHED_MODE2,
     KManager16bV1,
     KManager16bV2,
@@ -156,7 +156,7 @@ USE_TDM_LOADER = True
 O_VARIANT = "v3"
 
 # NOTE: the remaining tiling constants (chunk sizes, K/V write-tile + V swizzle
-# granularity) live inside mha_buffer_managers.py — they are intrinsic to the
+# granularity) live inside fmha_b16_buffer_managers.py — they are intrinsic to the
 # managers' LDS layouts, so the kernel no longer declares them here.
 
 
@@ -1341,13 +1341,70 @@ def _core_attention(
             )
 
 
+def _zero_fill_attention(
+    *,
+    v_hdim,
+    gqa_ratio,
+    return_lse,
+    ptr_O,
+    ptr_LSE,
+    stride_o_seq,
+    stride_o_head,
+    stride_lse_seq,
+    stride_lse_head,
+    lse_num_records_bytes,
+    q_start,
+    q_len,
+):
+    """q_len>0 with kv_len==0 (cross-attention): softmax over an empty KV set, so
+    O=0 and LSE=-inf for this WG's valid query rows. Kept off the _core_attention
+    hot path; mirrors the O/LSE epilogue's masked-buffer_store row addressing."""
+    lane_idx = _lane_id()
+    warp_idx = _warp_id()
+    _, q_head_idx, seq_idx = _packed_tile_indices(gqa_ratio, warp_idx, lane_idx)
+    khalf0 = (lane_idx // fx.Int32(WMMA_M)) == fx.Int32(0)  # store once per lane pair
+    _CH = 8  # bf16 elems per b128 store
+
+    o_num_records_bytes = (q_start + q_len) * stride_o_seq * fx.Int32(2)
+    o_rsrc = buffer_ops.create_buffer_resource(
+        ptr_O, num_records_bytes=o_num_records_bytes
+    )
+    zero_o = fx.Vector.filled(_CH, 0.0, fx.BFloat16)
+    for qt in range(WMMA_ROW_PER_WAVE):
+        valid = khalf0 & (seq_idx[qt] < q_len)
+        row_base = (q_start + seq_idx[qt]) * stride_o_seq + q_head_idx[
+            qt
+        ] * stride_o_head
+        for c in range(v_hdim // _CH):
+            off_bytes = (row_base + fx.Int32(c * _CH)) * fx.Int32(2)
+            off_masked = valid.select(off_bytes, fx.Int32(0x7FFFFFFF))
+            buffer_ops.buffer_store(
+                zero_o, o_rsrc, off_masked, mask=None, offset_is_bytes=True
+            )
+
+    if return_lse:
+        lse_rsrc = buffer_ops.create_buffer_resource(
+            ptr_LSE, num_records_bytes=lse_num_records_bytes
+        )
+        neg_inf = fx.Float32(float("-inf"))
+        for qt in range(WMMA_ROW_PER_WAVE):
+            valid = khalf0 & (seq_idx[qt] < q_len)
+            off_el = (q_start + seq_idx[qt]) * stride_lse_seq + q_head_idx[
+                qt
+            ] * stride_lse_head
+            off_masked = valid.select(off_el * fx.Int32(4), fx.Int32(0x7FFFFFFF))
+            buffer_ops.buffer_store(
+                neg_inf, lse_rsrc, off_masked, mask=None, offset_is_bytes=True
+            )
+
+
 # ============================================================================
 # Builder — one device kernel per (layout, config)
 # ============================================================================
 
 
 @functools.cache
-def build_fmha_fwd_prefill_m32x8(
+def build_fmha_fwd_prefill_a16w16_m32x8(
     *,
     layout: str = "thd",
     qk_hdim: int = DEFAULT_QK_HDIM,
@@ -1390,7 +1447,7 @@ def build_fmha_fwd_prefill_m32x8(
     if layout == "thd":
 
         @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
-        def kn_fmha_fwd_prefill_m32x8_thd(
+        def kn_fmha_fwd_prefill_a16w16_m32x8_thd(
             ptr_O: fx.Pointer,
             ptr_Q: fx.Pointer,
             ptr_K: fx.Pointer,
@@ -1488,11 +1545,27 @@ def build_fmha_fwd_prefill_m32x8(
                         lds_base=lds_base,
                         **_ca_kw,
                     )
+            elif q_len > fx.Int32(0):
+                # Cross-attention tail: q_len>0 but kv_len==0 -> O=0, LSE=-inf.
+                _zero_fill_attention(
+                    v_hdim=V_HDIM,
+                    gqa_ratio=GQA_RATIO,
+                    return_lse=RET_LSE,
+                    ptr_O=ptr_O,
+                    ptr_LSE=ptr_LSE,
+                    stride_o_seq=stride_o_seq,
+                    stride_o_head=stride_o_head,
+                    stride_lse_seq=stride_lse_seq,
+                    stride_lse_head=stride_lse_head,
+                    lse_num_records_bytes=lse_num_records_bytes,
+                    q_start=q_start,
+                    q_len=q_len,
+                )
 
-        return kn_fmha_fwd_prefill_m32x8_thd
+        return kn_fmha_fwd_prefill_a16w16_m32x8_thd
 
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
-    def kn_fmha_fwd_prefill_m32x8_bshd(
+    def kn_fmha_fwd_prefill_a16w16_m32x8_bshd(
         ptr_O: fx.Pointer,
         ptr_Q: fx.Pointer,
         ptr_K: fx.Pointer,
@@ -1582,7 +1655,7 @@ def build_fmha_fwd_prefill_m32x8(
                 **_ca_kw,
             )
 
-    return kn_fmha_fwd_prefill_m32x8_bshd
+    return kn_fmha_fwd_prefill_a16w16_m32x8_bshd
 
 
 # ============================================================================
@@ -1613,7 +1686,7 @@ def _ensure_thd_kernel(
     )
     if key in _launch_fns:
         return
-    kernel = build_fmha_fwd_prefill_m32x8(
+    kernel = build_fmha_fwd_prefill_a16w16_m32x8(
         layout="thd",
         qk_hdim=qk_hdim,
         mask_left=mask_left,
@@ -1722,7 +1795,7 @@ def _ensure_bshd_kernel(
     )
     if key in _launch_fns:
         return
-    kernel = build_fmha_fwd_prefill_m32x8(
+    kernel = build_fmha_fwd_prefill_a16w16_m32x8(
         layout="bshd",
         qk_hdim=qk_hdim,
         mask_left=mask_left,
@@ -1852,6 +1925,9 @@ def flash_attn_varlen_m32x8(
     batch = cu_seqlens_q.shape[0] - 1
     nheads_q = q.shape[1]
     nheads_k = k.shape[1]
+    assert (
+        nheads_q % nheads_k == 0
+    ), f"nheads_q={nheads_q} must be a multiple of nheads_k={nheads_k}"
     gqa = nheads_q // nheads_k
 
     has_sink = sink is not None
@@ -1984,6 +2060,9 @@ def flash_attn_batch_m32x8(
     batch, seq_len_q, nheads_q, _ = q.shape
     seq_len_k = k.shape[1]
     nheads_k = k.shape[2]
+    assert (
+        nheads_q % nheads_k == 0
+    ), f"nheads_q={nheads_q} must be a multiple of nheads_k={nheads_k}"
     gqa = nheads_q // nheads_k
 
     has_sink = sink is not None

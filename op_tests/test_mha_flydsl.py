@@ -644,19 +644,23 @@ if __name__ == "__main__":
     run_thd = args.varlen or not args.batch
     run_bshd = args.batch or not args.varlen
 
-    # Drop cases whose kernel is behind the experimental gate: without it the
-    # public wrappers fall through to CK and would report a pass for a FlyDSL
-    # kernel that never ran.
+    # Without experimental: THD 128/128 -> ASM and 256/128 -> CK; BSHD 256/128 -> CK.
+    # Drop those so we never report a pass for a kernel other than ours.
     if not is_experimental_enabled():
-        if run_bshd:
-            print("  SKIP bshd suite: set AITER_ENABLE_EXPERIMENTAL=1")
-            run_bshd = False
         if run_thd:
-            gated = [d for d in args.d_qk_v if d == (128, 128)]
-            if gated:
-                print("  SKIP thd d_qk_v=128,128: set AITER_ENABLE_EXPERIMENTAL=1")
-                args.d_qk_v = [d for d in args.d_qk_v if d not in gated]
-                run_thd = bool(args.d_qk_v)
+            keep = [d for d in args.d_qk_v if d not in ((128, 128), (256, 128))]
+            if keep != args.d_qk_v:
+                print(
+                    "  SKIP thd 128/128 (ASM) + 256/128 (CK): set AITER_ENABLE_EXPERIMENTAL=1"
+                )
+                args.d_qk_v = keep
+            run_thd = bool(args.d_qk_v)
+        if run_bshd:
+            keep = [d for d in args.batch_d_qk_v if d != (256, 128)]
+            if keep != args.batch_d_qk_v:
+                print("  SKIP bshd 256/128 (CK): set AITER_ENABLE_EXPERIMENTAL=1")
+                args.batch_d_qk_v = keep
+            run_bshd = bool(args.batch_d_qk_v)
 
     for d_qk_v in args.d_qk_v:
         _check_d_qk_v("thd", d_qk_v)
@@ -820,19 +824,23 @@ if __name__ == "__main__":
         else [(-1, -1)]
     )
 
-    # Attention sink is served only by the m16x8 (d_qk=d_v=128) kernel; skip the
-    # sink=True axis for any other head-dim so we don't test a config that falls
-    # through to CK (which would drop the sink term for this path).
+    # sink/window are served by m32x8 only where it is routed (mirrors
+    # fmha_kernels._use_wave8_mha); off those paths keep sink=False / window=(-1,-1).
+    def _m32x8_serves_sink_window(d_qk, d_v):
+        if d_v != 128:
+            return False
+        exp = is_experimental_enabled()
+        return d_qk == 128 or (d_qk == 192 and not exp) or (d_qk == 256 and exp)
+
     def _sink_axis(d_qk, d_v):
         return (
-            sink_list if (d_qk, d_v) == (128, 128) else [s for s in sink_list if not s]
+            sink_list
+            if _m32x8_serves_sink_window(d_qk, d_v)
+            else [s for s in sink_list if not s]
         )
 
-    # Sliding window is only served by the 128/128 m16x8 path; any other head-dim
-    # keeps the full-attention (-1,-1) window so we don't test a config that
-    # falls through to CK.
     def _window_axis(d_qk, d_v):
-        return window_list if (d_qk, d_v) == (128, 128) else [(-1, -1)]
+        return window_list if _m32x8_serves_sink_window(d_qk, d_v) else [(-1, -1)]
 
     tests = []
     if run_thd:
