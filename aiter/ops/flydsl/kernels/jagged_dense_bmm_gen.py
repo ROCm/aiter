@@ -14,7 +14,6 @@ skewed sequence lengths.
 
 from __future__ import annotations
 
-import os
 from collections import OrderedDict
 
 import flydsl.compiler as flyc
@@ -41,28 +40,6 @@ NXCD = 8
 XCD_W = 8
 XCD_C_SMALL_K = 32
 XCD_C_LARGE_K = 120
-
-# Set to 1/true/on to enable hot-loop or prologue sched_* hints (A/B).
-# Both default off: measured gfx942 interleave regresses wall-clock.
-# FLYDSL_JDBBA_SCHED_SPAN: pack VMEM into the leading 1/span of the MFMA
-# block (default 2) so the last A load stays above the ds_write.
-_SCHED_HINTS_ENV = "FLYDSL_JDBBA_SCHED_HINTS"
-_PROLOGUE_SCHED_ENV = "FLYDSL_JDBBA_PROLOGUE_SCHED"
-_SCHED_SPAN_ENV = "FLYDSL_JDBBA_SCHED_SPAN"
-
-
-def _env_flag(name: str, requested: bool) -> bool:
-    env = os.environ.get(name)
-    if env is None:
-        return bool(requested)
-    return env.strip().lower() not in ("0", "false", "off", "no")
-
-
-def _env_int(name: str, requested: int) -> int:
-    env = os.environ.get(name)
-    if env is None or not env.strip():
-        return int(requested)
-    return int(env.strip())
 
 
 def _xcd_remap(xy, num_rows, num_cols, C, W, nXCD=NXCD):
@@ -124,9 +101,6 @@ def _build_launcher(
     WAVES_PER_EU=0,
     B_STAGES=3,
     COMPACT=False,
-    SCHED_HINTS=False,
-    SCHED_PROLOGUE=False,
-    SCHED_SPAN=2,
 ):
     N_BLOCKS = N // BLOCK_N  # output column-tiles per group (compile-time)
     XCD_NUM_ROWS = BM_TILES * N_GROUPS
@@ -328,62 +302,7 @@ def _build_launcher(
                         copy_frag_A,
                         thr_sA[None, None, None, a_write_stage],
                     )
-                if fx.const_expr(SCHED_HINTS):
-                    k_atom = 32 if USE_MFMA_K32 else 16
-                    n_warps_total = THREADS // 64
-                    n_warps = min(n_warps_total, BLOCK_N // 16)
-                    m_warps = max(n_warps_total // n_warps, 1)
-                    mfma_total = (
-                        (BLOCK_M // (m_warps * 16))
-                        * (BLOCK_N // (n_warps * 16))
-                        * (BLOCK_K // k_atom)
-                    )
-                    vmem_a = (
-                        (BLOCK_M * BLOCK_K * 2) // (THREADS * 16)
-                        if a_next_k is not None
-                        else 0
-                    )
-                    vmem_b = (
-                        (BLOCK_N * BLOCK_K * 2) // (THREADS * 16)
-                        if b_next_k is not None
-                        else 0
-                    )
-                    num_vmem = vmem_a + vmem_b
-                    dsrd_per_k = BLOCK_M // 16
-                    k_iters = BLOCK_K // 32
-                    num_dswr = (BLOCK_M * BLOCK_K * 2) // (THREADS * 16)
-                    sche_iters = num_vmem if num_vmem > 0 else max(mfma_total, 1)
-                    span = SCHED_SPAN if SCHED_SPAN > 0 else 1
-                    mfma_interleave = mfma_total // span
-                    mfma_per_vmem = (
-                        mfma_interleave // sche_iters
-                        if sche_iters > 0
-                        else mfma_interleave
-                    )
-                    leftover_mfma = mfma_interleave - sche_iters * mfma_per_vmem
-                    mfma_tail = mfma_total - mfma_interleave
-
-                    def hot_loop_scheduler():
-                        for _ki in fx.range_constexpr(k_iters):
-                            fx.rocdl.sched_dsrd(dsrd_per_k)
-                        for sche_i in fx.range_constexpr(sche_iters):
-                            if fx.const_expr(num_vmem > 0):
-                                fx.rocdl.sched_vmem(1)
-                            if fx.const_expr(mfma_per_vmem > 0):
-                                fx.rocdl.sched_mfma(mfma_per_vmem)
-                        if fx.const_expr(leftover_mfma > 0):
-                            fx.rocdl.sched_mfma(leftover_mfma)
-                        if fx.const_expr(mfma_tail > 0):
-                            fx.rocdl.sched_mfma(mfma_tail)
-                        if fx.const_expr(num_dswr > 0):
-                            for _dw in fx.range_constexpr(num_dswr):
-                                fx.rocdl.sched_dswr(1)
-                        fx.rocdl.sched_barrier(0)
-
-                    hot_loop_scheduler()
                 fx.gpu.barrier()
-                if fx.const_expr(SCHED_HINTS):
-                    fx.rocdl.sched_barrier(0)
 
             n_tiles = K // BLOCK_K
             fx.copy(buffer_copy_128b, thr_gA_k[None, None, None, 0], copy_frag_A)
@@ -401,21 +320,7 @@ def _build_launcher(
                 )
             mma_frag_C.fill(0)
             fx.copy(uni_copy_128b, copy_frag_A, thr_sA[None, None, None, 0])
-            if fx.const_expr(SCHED_PROLOGUE):
-                n_vmem_p = (BLOCK_M * BLOCK_K * 2) // (THREADS * 16)
-                n_vmem_p += (BLOCK_N * BLOCK_K * 2) // (THREADS * 16)
-                if fx.const_expr(B_STAGES > 2 and n_tiles > 1):
-                    n_vmem_p += (BLOCK_N * BLOCK_K * 2) // (THREADS * 16)
-                n_dswr_p = (BLOCK_M * BLOCK_K * 2) // (THREADS * 16)
-                dswr_p_start = max(n_vmem_p - n_dswr_p, 0)
-                for pi in fx.range_constexpr(n_vmem_p):
-                    fx.rocdl.sched_vmem(1)
-                    if fx.const_expr(pi >= dswr_p_start):
-                        fx.rocdl.sched_dswr(1)
-                fx.rocdl.sched_barrier(0)
             fx.gpu.barrier()
-            if fx.const_expr(SCHED_PROLOGUE):
-                fx.rocdl.sched_barrier(0)
 
             for k_tile in fx.range_constexpr(n_tiles):
                 a_slot = k_tile % 2
@@ -610,9 +515,6 @@ def jagged_dense_bmm(
     threads: int | None = None,
     tile_map=None,
     total_occ_tiles: int | None = None,
-    sched_hints: bool = False,
-    prologue_sched_hints: bool = False,
-    sched_span: int = 2,
 ):
     N = B.shape[0] // n_groups
     K = B.shape[1]
@@ -655,11 +557,6 @@ def jagged_dense_bmm(
     b_stages = 2 if use_mfma_k32 else 3
     nthreads = THREADS if threads is None else threads
     compact = tile_map is not None
-    use_sched_hints = _env_flag(_SCHED_HINTS_ENV, sched_hints)
-    use_prologue_sched = _env_flag(_PROLOGUE_SCHED_ENV, prologue_sched_hints)
-    use_sched_span = _env_int(_SCHED_SPAN_ENV, sched_span)
-    if use_sched_span < 1:
-        use_sched_span = 1
 
     tmap = SEQ_OFFSETS if tile_map is None else tile_map
     tot = 0 if total_occ_tiles is None else int(total_occ_tiles)
@@ -681,9 +578,6 @@ def jagged_dense_bmm(
         waves_per_eu,
         b_stages,
         compact,
-        use_sched_hints,
-        use_prologue_sched,
-        use_sched_span,
     )
     launch_args = (C, A, B, BIAS, SEQ_OFFSETS, tmap, tot, n_groups, max_seq_len, stream)
 
@@ -707,9 +601,6 @@ def jagged_dense_bmm(
         waves_per_eu,
         b_stages,
         compact,
-        use_sched_hints,
-        use_prologue_sched,
-        use_sched_span,
     )
     try:
         _cache_put(key, flyc.compile(launch, *launch_args))
