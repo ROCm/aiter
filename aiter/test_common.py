@@ -495,6 +495,13 @@ def checkAllclose(
     if mask is not None:
         isClose = isClose | ~mask
         denom = int(mask.sum().item())
+        if denom == 0:
+            if printLog:
+                logger.info(
+                    f"{msg}[checkAllclose {atol=} {rtol=} "
+                    f"\033[33mskipped: empty mask\033[0m]"
+                )
+            return 0
     else:
         denom = a.numel()
 

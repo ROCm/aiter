@@ -1340,8 +1340,6 @@ def _core_attention(
                 lse_val, lse_rsrc, lse_off_masked, mask=None, offset_is_bytes=True
             )
 
-    del q_head_idx, seq_idx
-
 
 # ============================================================================
 # Builder — one device kernel per (layout, config)
@@ -1438,41 +1436,41 @@ def build_fmha_fwd_prefill_m32x8(
             # write. Self-attn's kv_len==0 implies q_len==0, so this only skips
             # genuinely empty work. (varlen may carry a per-batch kv_len==0 tail.)
             if (q_len > fx.Int32(0)) & (kv_len > fx.Int32(0)):
-                _ca_kw = dict(
-                    qk_hdim=QK_HDIM,
-                    v_hdim=V_HDIM,
-                    n_block=N_BLOCK,
-                    mask_left=MASK_LEFT,
-                    mask_right=MASK_RIGHT,
-                    return_lse=RET_LSE,
-                    has_sink=HAS_SINK,
-                    gqa_ratio=GQA_RATIO,
-                    ptr_O=ptr_O,
-                    ptr_Q=ptr_Q,
-                    ptr_K=ptr_K,
-                    ptr_V=ptr_V,
-                    ptr_LSE=ptr_LSE,
-                    ptr_sink=ptr_sink,
-                    softmax_scale=softmax_scale,
-                    stride_q_seq=stride_q_seq,
-                    stride_k_seq=stride_k_seq,
-                    stride_v_seq=stride_v_seq,
-                    stride_o_seq=stride_o_seq,
-                    stride_q_head=stride_q_head,
-                    stride_k_head=stride_k_head,
-                    stride_v_head=stride_v_head,
-                    stride_o_head=stride_o_head,
-                    stride_lse_seq=stride_lse_seq,
-                    stride_lse_head=stride_lse_head,
-                    lse_base_elems=lse_base_elems,
-                    lse_num_records_bytes=lse_num_records_bytes,
-                    q_start=q_start,
-                    q_len=q_len,
-                    kv_start=kv_start,
-                    kv_len=kv_len,
-                    window_left=window_left,
-                    window_right=window_right,
-                )
+                _ca_kw = {
+                    "qk_hdim": QK_HDIM,
+                    "v_hdim": V_HDIM,
+                    "n_block": N_BLOCK,
+                    "mask_left": MASK_LEFT,
+                    "mask_right": MASK_RIGHT,
+                    "return_lse": RET_LSE,
+                    "has_sink": HAS_SINK,
+                    "gqa_ratio": GQA_RATIO,
+                    "ptr_O": ptr_O,
+                    "ptr_Q": ptr_Q,
+                    "ptr_K": ptr_K,
+                    "ptr_V": ptr_V,
+                    "ptr_LSE": ptr_LSE,
+                    "ptr_sink": ptr_sink,
+                    "softmax_scale": softmax_scale,
+                    "stride_q_seq": stride_q_seq,
+                    "stride_k_seq": stride_k_seq,
+                    "stride_v_seq": stride_v_seq,
+                    "stride_o_seq": stride_o_seq,
+                    "stride_q_head": stride_q_head,
+                    "stride_k_head": stride_k_head,
+                    "stride_v_head": stride_v_head,
+                    "stride_o_head": stride_o_head,
+                    "stride_lse_seq": stride_lse_seq,
+                    "stride_lse_head": stride_lse_head,
+                    "lse_base_elems": lse_base_elems,
+                    "lse_num_records_bytes": lse_num_records_bytes,
+                    "q_start": q_start,
+                    "q_len": q_len,
+                    "kv_start": kv_start,
+                    "kv_len": kv_len,
+                    "window_left": window_left,
+                    "window_right": window_right,
+                }
                 # Warp specialization: LO warp (waves 0..N/2-1) vs HI warp (N/2..N-1).
                 lds_base = _alloc_lds()
                 warp_idx = _warp_id()
@@ -1531,41 +1529,41 @@ def build_fmha_fwd_prefill_m32x8(
         lse_base_elems = batch * stride_lse_batch
         lse_num_records_bytes = (lse_base_elems + stride_lse_batch) * fx.Int32(4)
 
-        _ca_kw = dict(
-            qk_hdim=QK_HDIM,
-            v_hdim=V_HDIM,
-            n_block=N_BLOCK,
-            mask_left=MASK_LEFT,
-            mask_right=MASK_RIGHT,
-            return_lse=RET_LSE,
-            has_sink=HAS_SINK,
-            gqa_ratio=GQA_RATIO,
-            ptr_O=ptr_O,
-            ptr_Q=ptr_Q,
-            ptr_K=ptr_K,
-            ptr_V=ptr_V,
-            ptr_LSE=ptr_LSE,
-            ptr_sink=ptr_sink,
-            softmax_scale=softmax_scale,
-            stride_q_seq=stride_q_seq,
-            stride_k_seq=stride_k_seq,
-            stride_v_seq=stride_v_seq,
-            stride_o_seq=stride_o_seq,
-            stride_q_head=stride_q_head,
-            stride_k_head=stride_k_head,
-            stride_v_head=stride_v_head,
-            stride_o_head=stride_o_head,
-            stride_lse_seq=stride_lse_seq,
-            stride_lse_head=stride_lse_head,
-            lse_base_elems=lse_base_elems,
-            lse_num_records_bytes=lse_num_records_bytes,
-            q_start=batch * seq_len_q,
-            q_len=seq_len_q,
-            kv_start=batch * seq_len_k,
-            kv_len=seq_len_k,
-            window_left=window_left,
-            window_right=window_right,
-        )
+        _ca_kw = {
+            "qk_hdim": QK_HDIM,
+            "v_hdim": V_HDIM,
+            "n_block": N_BLOCK,
+            "mask_left": MASK_LEFT,
+            "mask_right": MASK_RIGHT,
+            "return_lse": RET_LSE,
+            "has_sink": HAS_SINK,
+            "gqa_ratio": GQA_RATIO,
+            "ptr_O": ptr_O,
+            "ptr_Q": ptr_Q,
+            "ptr_K": ptr_K,
+            "ptr_V": ptr_V,
+            "ptr_LSE": ptr_LSE,
+            "ptr_sink": ptr_sink,
+            "softmax_scale": softmax_scale,
+            "stride_q_seq": stride_q_seq,
+            "stride_k_seq": stride_k_seq,
+            "stride_v_seq": stride_v_seq,
+            "stride_o_seq": stride_o_seq,
+            "stride_q_head": stride_q_head,
+            "stride_k_head": stride_k_head,
+            "stride_v_head": stride_v_head,
+            "stride_o_head": stride_o_head,
+            "stride_lse_seq": stride_lse_seq,
+            "stride_lse_head": stride_lse_head,
+            "lse_base_elems": lse_base_elems,
+            "lse_num_records_bytes": lse_num_records_bytes,
+            "q_start": batch * seq_len_q,
+            "q_len": seq_len_q,
+            "kv_start": batch * seq_len_k,
+            "kv_len": seq_len_k,
+            "window_left": window_left,
+            "window_right": window_right,
+        }
         # Warp specialization: LO warp (waves 0..N/2-1) vs HI warp (N/2..N-1).
         lds_base = _alloc_lds()
         warp_idx = _warp_id()
@@ -1590,9 +1588,6 @@ def build_fmha_fwd_prefill_m32x8(
 # ============================================================================
 # Launch wrappers + host entries
 # ============================================================================
-# NOTE: v1 scaffold. The device kernel bodies are empty, so launching produces
-# no output yet — this wiring exists so the dispatch paths in fmha_kernels.py can
-# route qk_hdim==128 here while the kernel is being built out.
 
 _launch_fns = (
     {}
@@ -1898,12 +1893,8 @@ def flash_attn_varlen_m32x8(
         stride_lse_seq = 0
         stride_lse_head = 0
 
-    # Byte strides for Q/K/V, element strides for O — matches the gfx1250 fmha
-    # family convention; revisit when the clean kernel body is implemented.
-    bpp = q.element_size()
-    stride_q_seq = q.stride(
-        0
-    )  # Q/K/V strides in ELEMENTS (V2 TDM uses directly; V1 ×bpp)
+    # Q/K/V/O strides in ELEMENTS (TDM loaders consume them directly).
+    stride_q_seq = q.stride(0)
     stride_k_seq = k.stride(0)
     stride_v_seq = v.stride(0)
     stride_o_seq = out.stride(0)
@@ -2042,12 +2033,9 @@ def flash_attn_batch_m32x8(
     if seq_len_q == 0 or seq_len_k == 0:
         return (out, lse) if return_lse else out
 
-    # Byte strides for Q/K/V, element strides for O. BSHD: seq is dim 1, head
-    # dim 2 — the per-batch base is derived in-kernel as batch_idx * seq_len.
-    bpp = q.element_size()
-    stride_q_seq = q.stride(
-        1
-    )  # Q/K/V strides in ELEMENTS (V2 TDM uses directly; V1 ×bpp)
+    # BSHD: seq is dim 1, head dim 2 — the per-batch base is derived in-kernel as
+    # batch_idx * seq_len. Q/K/V/O strides in ELEMENTS (TDM loaders consume directly).
+    stride_q_seq = q.stride(1)
     stride_k_seq = k.stride(1)
     stride_v_seq = v.stride(1)
     stride_o_seq = out.stride(1)

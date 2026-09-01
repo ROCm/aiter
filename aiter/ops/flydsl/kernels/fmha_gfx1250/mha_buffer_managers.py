@@ -1766,16 +1766,16 @@ class OManager16bV3:
             self._warp_base = block_x * fx.Int32(self.block_m) + warp_idx * fx.Int32(
                 self.rows_per_warp
             )
-            self._cfg = dict(
-                ptr_O=ptr_O,
-                o_base_elems=o_base_elems,
-                stride_o_seq=stride_o_seq,
-                stride_o_head=stride_o_head,
-                q_start=q_start,
-                q_len=q_len,
-                kv_head=kv_head,
-                lane_idx=lane_idx,
-            )
+            self._cfg = {
+                "ptr_O": ptr_O,
+                "o_base_elems": o_base_elems,
+                "stride_o_seq": stride_o_seq,
+                "stride_o_head": stride_o_head,
+                "q_start": q_start,
+                "q_len": q_len,
+                "kv_head": kv_head,
+                "lane_idx": lane_idx,
+            }
 
         if qtile != self.q_tiles_per_wave - 1:
             return

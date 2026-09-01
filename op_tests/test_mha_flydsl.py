@@ -492,12 +492,10 @@ def run_batch_test(
 
 def run_route_m16x8_test():
     """Routing check: with AITER_ENABLE_EXPERIMENTAL=1, a D_qk=D_v=128 varlen
-    call must dispatch to the experimental m16x8 kernel (both causal and
-    non-causal). No correctness check — the kernel body is an empty scaffold and
-    writes no output yet; we only assert the dispatch and the output shape.
-
-    TEMPORARY: remove this together with the --route-m16x8 flag once the m16x8
-    kernel body is implemented and covered by the normal correctness suite.
+    call must dispatch to ``fk.flash_attn_varlen_m32x8`` (both causal and
+    non-causal). Spies on that entry to assert it fired exactly once per call and
+    that the returned output has shape ``(total_q, H, D)``. This is a routing/shape
+    check only — numerical correctness is covered by the main suite.
     """
     import aiter.ops.flydsl.fmha_kernels as fk
     from aiter.jit.core import is_experimental_enabled
@@ -1045,7 +1043,7 @@ if __name__ == "__main__":
             collected.append(ret)
             if ok:
                 n_pass += 1
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - per-case guard: report and keep the suite going
             print(
                 f"  [{case[:-4]} causal={causal} lse={return_lse} sink={sink} "
                 f"window={window}] ERROR: {e}"
