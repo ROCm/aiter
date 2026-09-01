@@ -19,26 +19,12 @@ The gfx1250 WMMA pipeline has its own file and is not part of PIPELINES yet.
 """
 
 import math
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cache
 from typing import Any
 
-from aiter.jit.utils.chip_info import get_gfx as _get_gfx
-from aiter.jit.utils.chip_info import get_lds_capacity_bytes
-
-
-def get_gfx():
-    """Detect GPU arch: honour GPU_ARCHS env, fall back to chip_info, default gfx942."""
-    env = os.environ.get("GPU_ARCHS", "")
-    if env and env != "native":
-        return env.split(";")[-1].strip()
-    try:
-        return _get_gfx()
-    except Exception:  # noqa: BLE001
-        return "gfx942"
-
+from aiter.jit.utils.chip_info import get_gfx, get_lds_capacity_bytes
 
 _DTYPE_SHORT = {
     "fp8": "F8",
@@ -422,7 +408,7 @@ NAME_PREFIX_8WAVE = "flydsl_bpreshuffle_8w"
 # keeps CSV rows unambiguous to a human.
 KERNEL_ID_BASE_8WAVE = 1_000_000
 
-LDS_BYTES_8WAVE = get_lds_capacity_bytes("gfx950")
+LDS_BYTES_8WAVE = get_lds_capacity_bytes(get_gfx())
 _I32_MAX = 2**31
 
 _TILES_8WAVE = ((128, 256), (128, 512), (256, 256))
