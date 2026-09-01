@@ -89,13 +89,14 @@ def get_gfx_runtime() -> str:
 
 # Backfill map for legacy tuned configs that predate the `gfx` column.
 # These cu_num values were only ever tuned on a single arch historically:
-#   256 -> gfx950, 80/304 -> gfx942.
+#   256 -> gfx950, 80/228/304 -> gfx942 (MI308X / MI300A / MI300X).
 # Newer archs that happen to share a cu_num (e.g. gfx1250 also reports 256)
 # are always written with their real arch by the tuner, so they never rely on
 # this backfill.
 _LEGACY_CU_NUM_TO_GFX = {
     256: "gfx950",
     80: "gfx942",
+    228: "gfx942",
     304: "gfx942",
 }
 
@@ -175,16 +176,35 @@ def get_build_targets() -> list[tuple[str, int]]:
 
     Priority:
       1. GPU_ARCHS set to an explicit non-empty target list -> delegate to
-         get_build_targets_env() (no GPU needed).
+         get_build_targets_env() (no GPU needed), then refine the cu_num of any
+         target matching the live GPU (see below).
       2. GPU_ARCHS unset, empty/whitespace, or "native" -> call get_gfx()
          (GPU_ARCHS-aware; falls back to rocminfo when GPU_ARCHS is unset) and
          get_cu_num(), which correctly reflect partition mode and binned variants.
       3. Neither -> raise RuntimeError with a clear message.
+
+    On the GPU_ARCHS path, GFX_CU_NUM_MAP supplies one canonical cu_num per arch
+    (gfx942 -> 304, the MI300X SPX value). That is wrong for every other gfx942
+    SKU and partition mode: on a 228-CU MI300A, `GPU_ARCHS=gfx942` alone yields
+    ('gfx942', 304), gen_instances then filters out every (gfx942, 228) tuned row,
+    and dispatch fails at runtime with "not present in the compiled registry".
+    So when the live GPU's arch matches a requested target and CU_NUM was not set
+    explicitly, prefer the live CU count. An explicit CU_NUM still wins, and
+    cross-compiling for an arch that is not the live GPU is unaffected.
     """
     gpu_archs = os.getenv("GPU_ARCHS")
     gpu_archs_normalized = gpu_archs.strip() if gpu_archs is not None else ""
     if gpu_archs_normalized and gpu_archs_normalized.lower() != "native":
-        return get_build_targets_env()
+        targets = get_build_targets_env()
+        if os.getenv("CU_NUM"):
+            return targets
+        try:
+            live_gfx, live_cu = get_gfx_runtime(), get_cu_num()
+        except Exception:  # noqa: BLE001  no live GPU: keep the table defaults
+            return targets
+        return [
+            (gfx, live_cu if gfx == live_gfx else cu_num) for gfx, cu_num in targets
+        ]
 
     try:
         # get_gfx() is intentional here -- this is a build-time path; get_gfx_runtime()
@@ -419,22 +439,33 @@ def write_lookup_header(
 
 
 def _get_pci_chip_id(device_id=0):
+    """Return the PCI device id of a GPU (e.g. 0x74A0), or None if unavailable.
+
+    Resolved via hipDeviceGetPCIBusId plus sysfs rather than
+    hipDeviceGetAttribute(hipDeviceAttributePciChipId). The AMD-specific block
+    of hipDeviceAttribute_t is an unnumbered enum, so the ordinal of
+    PciChipId shifts whenever an attribute is inserted ahead of it. On
+    ROCm 7.2 the ordinal this used to hardcode (10019) resolves to
+    hipDeviceAttributeMaxAvailableVgprsPerThread and returns 512 on every
+    device, which silently defeated the MI308 check below.
+    """
     import ctypes
 
-    libhip = ctypes.CDLL("libamdhip64.so")
-    chip_id = ctypes.c_int(0)
-    hipDeviceAttributePciChipId = 10019
-    err = libhip.hipDeviceGetAttribute(
-        ctypes.byref(chip_id),
-        hipDeviceAttributePciChipId,
-        device_id,
-    )
-    if err != 0:
-        raise RuntimeError(f"hipDeviceGetAttribute(PciChipId) failed with error {err}")
-    return chip_id.value
+    try:
+        libhip = ctypes.CDLL("libamdhip64.so")
+        buf = ctypes.create_string_buffer(64)
+        if libhip.hipDeviceGetPCIBusId(buf, len(buf), device_id) != 0:
+            return None
+        bdf = buf.value.decode()
+        with open(f"/sys/bus/pci/devices/{bdf}/device") as f:
+            return int(f.read().strip(), 16)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
 
 
 MI308_CHIP_IDS = {0x74A2, 0x74A8, 0x74B6, 0x74BC}
+# MI300A is the gfx942 APU: 228 CUs and 6 XCCs, against MI300X's 304 and 8.
+MI300A_CHIP_IDS = {0x74A0}
 
 
 def get_device_name():
@@ -444,6 +475,8 @@ def get_device_name():
         chip_id = _get_pci_chip_id()
         if chip_id in MI308_CHIP_IDS:
             return "MI308"
+        if chip_id in MI300A_CHIP_IDS:
+            return "MI300A"
         return "MI300"
     elif gfx == "gfx950":
         return "MI350"
