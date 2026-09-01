@@ -1205,6 +1205,12 @@ def _fused_moe_impl(
 # GEMMs dominate
 FUSED_MOE_ROUTER_MAX_TOKENS = 128
 
+# Mirror fused_moe_router_entry.cu. Phase 1 selects within one wave and the
+# shared rows take the lanes just past topk, so both must fit kWaveSize. The
+# pair scan gives each of BlockSize threads two expert slots.
+FUSED_MOE_ROUTER_MAX_TOPK = 64  # kWaveSize
+FUSED_MOE_ROUTER_MAX_EXPERTS = 512  # 2 * BlockSize
+
 
 def fused_moe_router_arch_supported() -> bool:
     """Whether this GPU can run :func:`fused_moe_router` at all.
@@ -1256,6 +1262,7 @@ def fused_moe_router_supported(
     a1_scale: torch.Tensor | None = None,
     dtype: torch.dtype | None = None,
     expert_mask: torch.Tensor | None = None,
+    num_fused_shared_experts: int = 0,
 ) -> bool:
     """Whether :func:`fused_moe_router` can serve this call.
 
@@ -1265,6 +1272,17 @@ def fused_moe_router_supported(
     :func:`fused_moe_router_config_supported`, so it depends on the actual
     call and has to be re-checked on every forward.
     """
+    # gating_output is not passed in, so bound global_E by the shapes. The mask
+    # spans every emitted id -- routed, then the shared slots, then the
+    # always-masked sentinel the fused-shared path adds -- so dropping those
+    # trailing slots gives an upper bound, which is the safe side of the cap.
+    # Without a mask there is no EP and w1 holds routed plus shared.
+    n_shared = num_fused_shared_experts
+    local_E = w1.shape[0]
+    if expert_mask is not None:
+        global_E = expert_mask.numel() - n_shared - (1 if n_shared else 0)
+    else:
+        global_E = local_E - n_shared
     if not (
         fused_moe_router_config_supported(
             hidden_states.shape[-1],
@@ -1279,6 +1297,14 @@ def fused_moe_router_supported(
         # every expert", which is the same as no grouping at all.
         and num_expert_group == 1
         and topk_group == 1
+        # Phase 1 places the shared rows on the lanes just past topk, within
+        # the one wave the top-k selects in.
+        and 0 <= n_shared <= 1
+        and topk + n_shared <= FUSED_MOE_ROUTER_MAX_TOPK
+        # Mirror the entry's expert-count checks; stage1 also needs a weight
+        # row per emitted expert.
+        and global_E <= FUSED_MOE_ROUTER_MAX_EXPERTS
+        and local_E >= max(topk, n_shared)
     ):
         return False
 
@@ -1302,7 +1328,7 @@ def fused_moe_router_supported(
         model_dim,
         inter_dim,
         E,
-        topk,
+        topk + num_fused_shared_experts,
         dtype,
         q_dtype_a,
         q_dtype_w,
@@ -1345,6 +1371,10 @@ def fused_moe_router(
     bias1: torch.Tensor | None = None,
     bias2: torch.Tensor | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
+    num_fused_shared_experts: int = 0,
+    shared_expert_weight: float = 1.0,
+    ep_rank: int = 0,
+    ep_size: int = 1,
 ) -> torch.Tensor:
     """MoE forward that routes internally, replacing the 4-kernel preamble.
 
@@ -1369,7 +1399,16 @@ def fused_moe_router(
         need_renorm: renormalize the topk weights.
         routed_scaling_factor: post-renorm weight scale.
         expert_mask: ``[>= global_expert]`` int32, nonzero iff this rank owns
-            the expert. ``None`` for the non-EP config.
+            the expert. ``None`` for the non-EP config. Under shared fusion it
+            must also cover the shared slots and the trailing sentinel, i.e.
+            vLLM's ``global_expert + num_fused_shared_experts + 1`` layout.
+        num_fused_shared_experts: shared experts to append to each token's
+            picks, taking weight rows ``global_expert ..``. 0 disables.
+        shared_expert_weight: weight every token gives each shared expert.
+        ep_rank: this rank's index; only read under shared fusion.
+        ep_size: EP world size. Shared weights are replicated per rank, so
+            token ownership round-robins over it to keep the post-MoE
+            all-reduce from summing ``ep_size`` copies of the shared output.
 
     Returns:
         ``[M, model_dim]`` output in ``dtype`` (default ``hidden_states``').
@@ -1396,17 +1435,25 @@ def fused_moe_router(
     # global_E is the gating row stride in the kernel (gating + token * E), so
     # taking it from the mask would read past the end of every row.
     global_E = gating_output.shape[1]
+    # Every expert id the router can emit: routed, then the fused shared slots,
+    # then -- under EP -- the always-masked sentinel non-owner ranks park their
+    # shared row on. This is what sizes the sorted buffers and the histogram.
+    n_shared = num_fused_shared_experts
+    E_tot = global_E + n_shared + (1 if (expert_mask is not None and n_shared) else 0)
+    topk_total = topk + n_shared
 
     dtype, quant_type, q_dtype_a, q_dtype_w = _resolve_quant_dtypes(
         M, hidden_states, w1, quant_type, activation, gate_mode, a1_scale, dtype
     )
 
+    # topk_total, not topk: the shared rows go through the same GEMM, so they
+    # are what the config is sized for downstream.
     metadata = get_2stage_cfgs(
         get_padded_M(M),
         model_dim,
         inter_dim,
         E,
-        topk,
+        topk_total,
         dtype,
         q_dtype_a,
         q_dtype_w,
@@ -1437,32 +1484,50 @@ def fused_moe_router(
         num_expert_group == 1 and topk_group == 1
     ), f"fused_moe_router: {num_expert_group=} {topk_group=}, only 1/1 is fused"
     assert not doweight_stage1, "fused_moe_router: doweight_stage1 is not fused"
-    # Mirrors the entry's E <= 2 * BlockSize check; assert here so the failure
-    # names the gating width rather than surfacing from C++.
+    # Mirrors the entry's routed-expert check; assert here so the failure names
+    # the gating width rather than surfacing from C++.
     assert (
-        global_E <= 512
-    ), f"fused_moe_router: num_experts must be <= 512, got {global_E}"
+        global_E <= FUSED_MOE_ROUTER_MAX_EXPERTS
+    ), (
+        f"fused_moe_router: num_experts must be <= "
+        f"{FUSED_MOE_ROUTER_MAX_EXPERTS}, got {global_E}"
+    )
+    assert 0 <= n_shared <= 1, (
+        f"fused_moe_router: num_fused_shared_experts must be 0 or 1, got {n_shared}"
+    )
+    # The shared experts get their own weight rows, appended after the local
+    # routed ones (matching vLLM's expert_map). Without them stage1 would index
+    # past the last expert for every shared row.
+    assert n_shared == 0 or E >= n_shared, (
+        f"fused_moe_router: {n_shared} fused shared experts need weight rows, "
+        f"but w1 has only {E}"
+    )
+    assert n_shared == 0 or expert_mask is not None or E == global_E + n_shared, (
+        f"fused_moe_router: non-EP shared fusion needs w1 to hold "
+        f"{global_E + n_shared} experts, got {E}"
+    )
     assert (
         dtype == dtypes.bf16
     ), f"fused_moe_router: moe_buf is zero-filled as bf16, got out {dtype=}"
     assert bias1 is None and bias2 is None, "fused_moe_router: swiglu bias is not fused"
-    # The mask may be longer than the routed count (sentinel + fused shared
-    # slots); the kernel reads only the first global_E. Shorter is a real bug.
-    assert expert_mask is None or expert_mask.numel() >= global_E, (
+    # The mask spans every id the router can emit; shorter is a real bug.
+    assert expert_mask is None or expert_mask.numel() >= E_tot, (
         f"fused_moe_router: expert_mask has {expert_mask.numel()} entries, "
-        f"need at least {global_E}"
+        f"need at least {E_tot}"
     )
     assert correction_bias is None or correction_bias.numel() >= global_E, (
         f"fused_moe_router: correction_bias has {correction_bias.numel()} "
         f"entries, need at least {global_E}"
     )
 
-    # Sorted-map buffers, sized exactly as _moe_sorting_impl does.
+    # Sorted-map buffers, sized exactly as _moe_sorting_impl does, but over the
+    # full slot count: every emitted id (shared and sentinel included) gets its
+    # own padded block in the sort.
     group_size = 32
-    max_num_tokens_padded = M * topk + global_E * block_size_M - topk
+    max_num_tokens_padded = M * topk_total + E_tot * block_size_M - topk_total
     max_num_m_blocks = (max_num_tokens_padded + block_size_M - 1) // block_size_M
-    topk_ids = torch.empty((M, topk), dtype=dtypes.i32, device=device)
-    topk_weights = torch.empty((M, topk), dtype=dtypes.fp32, device=device)
+    topk_ids = torch.empty((M, topk_total), dtype=dtypes.i32, device=device)
+    topk_weights = torch.empty((M, topk_total), dtype=dtypes.fp32, device=device)
     sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
     sorted_weights = torch.empty(
         max_num_tokens_padded, dtype=dtypes.fp32, device=device
@@ -1507,13 +1572,17 @@ def fused_moe_router(
         get_fused_moe_router_workspace(device, FUSED_MOE_ROUTER_MAX_TOKENS),
         expert_mask=expert_mask,
         moe_buf=moe_buf,
+        num_fused_shared_experts=n_shared,
+        shared_expert_weight=shared_expert_weight,
+        ep_rank=ep_rank,
+        ep_size=ep_size,
     )
 
     return fused_moe_2stages(
         hidden_states,
         w1,
         w2,
-        topk,
+        topk_total,
         sorted_ids,
         sorted_weights,
         sorted_expert_ids,
