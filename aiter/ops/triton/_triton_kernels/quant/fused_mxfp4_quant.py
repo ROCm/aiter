@@ -312,7 +312,6 @@ _fused_reduce_act_mul_and_dynamic_mxfp4_quant_repr = make_kernel_repr(
         "MXFP4_QUANT_BLOCK_SIZE",
         "EVEN_M_N",
         "SCALING_MODE",
-        "ACTIVATION",
         "scaleN",
         "scaleM_pad",
         "scaleN_pad",
