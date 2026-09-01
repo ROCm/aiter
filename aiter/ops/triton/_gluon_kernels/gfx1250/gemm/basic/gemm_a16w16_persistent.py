@@ -358,25 +358,6 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
     start_pid = gl.program_id(axis=0)
     num_pid_n = gl.cdiv(N, BLOCK_N)
 
-    a_buffer = gl.allocate_shared_memory(
-        a_ptr.type.element_ty,
-        shape=[NUM_BUFFERS, BLOCK_M, BLOCK_K],
-        layout=SHARED_LAYOUT_A,
-    )
-
-    if TRANSPOSE:
-        b_buffer = gl.allocate_shared_memory(
-            b_ptr.type.element_ty,
-            shape=[NUM_BUFFERS, BLOCK_K, BLOCK_N],
-            layout=SHARED_LAYOUT_B,
-        )
-    else:
-        b_buffer = gl.allocate_shared_memory(
-            b_ptr.type.element_ty,
-            shape=[NUM_BUFFERS, BLOCK_N, BLOCK_K],
-            layout=SHARED_LAYOUT_B,
-        )
-
     a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=a_ptr,
         shape=(M, K),
@@ -405,41 +386,28 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
     SHARED_LAYOUT_C: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_N, 8]], [BLOCK_M, BLOCK_N], [1, 0]
     )
-    # one staging buffer shared across all tiles
-    c_buffer = gl.allocate_shared_memory(
-        c_ptr.type.element_ty,
-        shape=[BLOCK_M, BLOCK_N],
-        layout=SHARED_LAYOUT_C,
-    )
-
-    # prologue: decode the first unit and prefetch its leading k-tiles
-    t = remap_xcd(start_pid, num_tiles, NUM_XCDS=8)
-    pid_k = t % NUM_KSPLIT
-    pid = t // NUM_KSPLIT
-    pid_m = pid // num_pid_n
-    pid_n = pid % num_pid_n
-    m_off = pid_m * BLOCK_M
-    n_off = pid_n * BLOCK_N
-    sk_start = pid_k * SPLITK_BLOCK_SIZE
-    for pf in gl.static_range(PD):
-        gl.amd.gfx1250.tdm.async_load(
-            a_desc, [m_off, sk_start + pf * BLOCK_K], a_buffer.index(pf % NUM_BUFFERS)
-        )
-        if TRANSPOSE:
-            gl.amd.gfx1250.tdm.async_load(
-                b_desc,
-                [sk_start + pf * BLOCK_K, n_off],
-                b_buffer.index(pf % NUM_BUFFERS),
-            )
-        else:
-            gl.amd.gfx1250.tdm.async_load(
-                b_desc,
-                [n_off, sk_start + pf * BLOCK_K],
-                b_buffer.index(pf % NUM_BUFFERS),
-            )
 
     tile_id = start_pid
     while tile_id < num_tiles:
+        # allocations done within the loop, this is very slow but allows prefetching
+        a_buffer = gl.allocate_shared_memory(
+            a_ptr.type.element_ty,
+            shape=[NUM_BUFFERS, BLOCK_M, BLOCK_K],
+            layout=SHARED_LAYOUT_A,
+        )
+        if TRANSPOSE:
+            b_buffer = gl.allocate_shared_memory(
+                b_ptr.type.element_ty,
+                shape=[NUM_BUFFERS, BLOCK_K, BLOCK_N],
+                layout=SHARED_LAYOUT_B,
+            )
+        else:
+            b_buffer = gl.allocate_shared_memory(
+                b_ptr.type.element_ty,
+                shape=[NUM_BUFFERS, BLOCK_N, BLOCK_K],
+                layout=SHARED_LAYOUT_B,
+            )
+
         t = remap_xcd(tile_id, num_tiles, NUM_XCDS=8)
         pid_k = t % NUM_KSPLIT
         pid = t // NUM_KSPLIT
@@ -451,6 +419,26 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
         cur_num_k_tiles = gl.cdiv(
             gl.minimum(sk_start + SPLITK_BLOCK_SIZE, K) - sk_start, BLOCK_K
         )
+
+        # prologue: prefetch this tile's leading PD k-tiles at the top of the loop
+        for pf in gl.static_range(PD):
+            gl.amd.gfx1250.tdm.async_load(
+                a_desc,
+                [m_off, sk_start + pf * BLOCK_K],
+                a_buffer.index(pf % NUM_BUFFERS),
+            )
+            if TRANSPOSE:
+                gl.amd.gfx1250.tdm.async_load(
+                    b_desc,
+                    [sk_start + pf * BLOCK_K, n_off],
+                    b_buffer.index(pf % NUM_BUFFERS),
+                )
+            else:
+                gl.amd.gfx1250.tdm.async_load(
+                    b_desc,
+                    [n_off, sk_start + pf * BLOCK_K],
+                    b_buffer.index(pf % NUM_BUFFERS),
+                )
 
         load_idx = PD
         compute_idx = 0
@@ -551,6 +539,16 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
         if USE_ACTIVATION and WRITES_FINAL:
             accumulator = activation(accumulator)
 
+        # release a and b buffers, counterintuitive name
+        a_buffer._keep_alive()
+        b_buffer._keep_alive()
+
+        c_buffer = gl.allocate_shared_memory(
+            c_ptr.type.element_ty,
+            shape=[BLOCK_M, BLOCK_N],
+            layout=SHARED_LAYOUT_C,
+        )
+
         c_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=c_ptr + pid_k.to(gl.int64) * stride_ck,
             shape=(M, N),
@@ -563,40 +561,12 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
         gl.amd.gfx1250.tdm.async_store(c_desc, [m_off, n_off], c_buffer)
         gl.amd.gfx1250.tdm.async_wait(0)
 
-        next_tile_id = tile_id + NUM_SMS
-        n_t = remap_xcd(next_tile_id, num_tiles, NUM_XCDS=8)
-        n_pid_k = n_t % NUM_KSPLIT
-        n_pid = n_t // NUM_KSPLIT
-        n_pid_m = n_pid // num_pid_n
-        n_pid_n = n_pid % num_pid_n
-        n_m_off = n_pid_m * BLOCK_M
-        n_n_off = n_pid_n * BLOCK_N
-        n_sk_start = n_pid_k * SPLITK_BLOCK_SIZE
+        # release c buffer
+        c_buffer._keep_alive()
 
         gl.barrier()
 
-        # prologue for next tile
-        if next_tile_id < num_tiles:
-            for pf in gl.static_range(NUM_BUFFERS - 1):
-                gl.amd.gfx1250.tdm.async_load(
-                    a_desc,
-                    [n_m_off, n_sk_start + pf * BLOCK_K],
-                    a_buffer.index(pf % NUM_BUFFERS),
-                )
-                if TRANSPOSE:
-                    gl.amd.gfx1250.tdm.async_load(
-                        b_desc,
-                        [n_sk_start + pf * BLOCK_K, n_n_off],
-                        b_buffer.index(pf % NUM_BUFFERS),
-                    )
-                else:
-                    gl.amd.gfx1250.tdm.async_load(
-                        b_desc,
-                        [n_n_off, n_sk_start + pf * BLOCK_K],
-                        b_buffer.index(pf % NUM_BUFFERS),
-                    )
-
-        tile_id = next_tile_id
+        tile_id = tile_id + NUM_SMS
 
 
 _KERNEL_MAP = {
