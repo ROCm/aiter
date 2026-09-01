@@ -1279,9 +1279,11 @@ def _core_attention(
         # lane pair) to finish softmax. OManager16b masks rows with seq >= q_len.
         d_final = fx.Float32(final[qt * _QS + 1])
         o_final = [fx.Vector(final[qt * _QS + 2 + dt]) for dt in range(d_tiles)]
-        inv_vec = fx.Vector.from_elements(
-            [fx.Float32(1.0) / d_final], fx.Float32
-        ).broadcast_to(8)
+        # Fully-masked row (d_final==0): 1/0=inf, o_final=0, 0*inf=NaN -> guard to O=0.
+        inv = (d_final > fx.Float32(0.0)).select(
+            fx.Float32(1.0) / d_final, fx.Float32(0.0)
+        )
+        inv_vec = fx.Vector.from_elements([inv], fx.Float32).broadcast_to(8)
         # NOTE (mode-2): tying o_final through va_vdst here (to cover the final PV-wmma
         # writeback -> this normalize mul) was MEASURED HARMFUL: 8192nc 1/80 -> 9/80 with
         # the same PV fence present. Either va_vdst doesn't reliably track the wmma
