@@ -189,8 +189,6 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 IS_CAUSAL,
                 sgpr_state,
             )
-            tile_n_const = TILE_N
-            ctx["tile_n_const"] = tile_n_const
             ctx["zero_v8f32"] = zero_v8f32
 
             # ── Core loop setup: tile counts + K prefetch + init args ──
@@ -234,7 +232,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 init=noncausal_loop_results,
             ):
                 tile_idx_i32 = fx.Int32(tile_idx)
-                causal_n = tile_idx_i32 * tile_n_const - causal_offset
+                causal_n = tile_idx_i32 * TILE_N - causal_offset
                 loop_results = yield tile_iteration(
                     ctx, tile_idx, iter_args, causal_n_start=causal_n
                 )
@@ -253,7 +251,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                     sgpr_state,
                     num_tiles,
                     num_tiles_idx,
-                    tile_n_const,
+                    TILE_N,
                     causal_offset,
                     IS_CAUSAL,
                     v_tdm_cfg,

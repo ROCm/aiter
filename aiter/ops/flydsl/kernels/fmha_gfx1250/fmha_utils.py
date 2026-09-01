@@ -281,12 +281,9 @@ LN_2 = 0.6931471805599453
 PERM_SEL_LO = 0x76543210
 PERM_SEL_HI = 0xFEDCBA98
 
-VPS_Q = TG_SUBQD * QK_HDIM * Q_BPP // 128
-VPS_MSB_Q = VPS_Q // NUM_MSB
-VTS_MSB_Q = VPS_MSB_Q
-Q_WMMA_PER_MSB = VTS_MSB_Q // 8
-VPS_KV = SU_K_K * SU_K_N * KV_BPP // 128
-VPS_MSB_KV = VPS_KV // NUM_MSB
+VPS_MSB_Q = TG_SUBQD * QK_HDIM * Q_BPP // 128 // NUM_MSB
+Q_WMMA_PER_MSB = VPS_MSB_Q // 8
+VPS_MSB_KV = SU_K_K * SU_K_N * KV_BPP // 128 // NUM_MSB
 VPS_MSB_SP = 32
 SP_MSB_M = 16
 SP_MSB_N = 16
@@ -310,8 +307,6 @@ LDS_V_SU_P_SIZE = 0x2400
 EXP_PER_MSB_TO_G2 = 8
 PART2_SETUP_A = 8
 PART2_SPLIT = 24 + EXP_PER_MSB_TO_G2
-PART2_G2_SPLIT = PART2_SPLIT
-GEMM1_EXP_OPS = VPS_MSB_SP - EXP_PER_MSB_TO_G2
 
 ALU_PER_STAGE = [40, 52, 56, 168, 120, 120, 132, 132]
 
@@ -336,15 +331,9 @@ def sched_barrier(mask=0):
 def get_types():
     return {
         "f32": T.f32,
-        "bf16": T.bf16,
-        "i32": T.i32,
-        "v2f32": T.vec(2, T.f32),
-        "v2bf16": T.vec(2, T.bf16),
         "v8f32": T.vec(8, T.f32),
         "v8bf16": T.vec(8, T.bf16),
-        "v16bf16": T.vec(16, T.bf16),
         "v4i32": T.vec(4, T.i32),
-        "v8i32": T.vec(8, T.i32),
         "lds_ptr": lds_ptr_ty(),
     }
 
@@ -504,7 +493,6 @@ class Softmax:
     def build_part2_ops(
         mlir_types,
         msb,
-        blk,
         sp_pairs,
         ss,
         sgpr,
@@ -649,12 +637,12 @@ class Softmax:
         return ops
 
     @staticmethod
-    def build_all_part2_ops(mlir_types, blk, sp_pairs_all, softmax_state, sgpr_state):
+    def build_all_part2_ops(mlir_types, sp_pairs_all, softmax_state, sgpr_state):
         ops_by_msb = [[] for _ in range_constexpr(NUM_MSB)]
         for m in range_constexpr(NUM_MSB):
             sp_pairs = sp_pairs_all[m]
             msb_ops = Softmax.build_part2_ops(
-                mlir_types, m, blk, sp_pairs, softmax_state, sgpr_state
+                mlir_types, m, sp_pairs, softmax_state, sgpr_state
             )
             ops_by_msb[m] = msb_ops
         return ops_by_msb
@@ -767,7 +755,7 @@ class Softmax:
 
     @staticmethod
     def build_all_gemm2_ops(
-        mlir_types, blk, sp_pairs_all, softmax_state, sgpr_state, skip_rescale_sum=False
+        mlir_types, sp_pairs_all, softmax_state, sgpr_state, skip_rescale_sum=False
     ):
         if const_expr("pre_max_log2e_scl" not in softmax_state):
             softmax_state["pre_max_log2e_scl"] = [None] * NUM_MSB
@@ -783,7 +771,6 @@ class Softmax:
             p2_ops = Softmax.build_part2_ops(
                 mlir_types,
                 m,
-                blk,
                 sp_pairs_all[m],
                 softmax_state,
                 sgpr_state,
@@ -791,7 +778,7 @@ class Softmax:
                 sp_lo_cache=sp_lo_cache[m],
                 sp_hi_cache=sp_hi_cache[m],
             )
-            ops_by_rid[5 + m] = p2_ops[:PART2_G2_SPLIT]
+            ops_by_rid[5 + m] = p2_ops[:PART2_SPLIT]
         rid_budget = [[0] * RLTS_LEN for _ in range_constexpr(4)]
         p0c = min(PART0_INSTS, ALU_PER_STAGE[0] // NUM_MSB)
         for m in range_constexpr(NUM_MSB):
@@ -825,11 +812,11 @@ class Softmax:
         return sp_pairs
 
     @staticmethod
-    def part01_only(mlir_types, blk, sp_pairs_all, softmax_state, sgpr_state):
+    def part01_only(mlir_types, sp_pairs_all, softmax_state, sgpr_state):
         if const_expr("pre_max_log2e_scl" not in softmax_state):
             softmax_state["pre_max_log2e_scl"] = [None] * NUM_MSB
         ops_by_rid, _, _, _ = Softmax.build_all_gemm2_ops(
-            mlir_types, blk, sp_pairs_all, softmax_state, sgpr_state
+            mlir_types, sp_pairs_all, softmax_state, sgpr_state
         )
         for _b in range_constexpr(4):
             for rid in range_constexpr(NUM_MSB):
@@ -959,9 +946,6 @@ class Fragment:
 class Pipeline:
     @staticmethod
     def build_qk_schedule(blk, su):
-        k_MSBOFF = (su % 2) * VPS_MSB_KV
-        sp_off = (blk % 2) * VPS_MSB_SP + 8 * su
-        _K_FRAGS_PER_MSB = (SP_MSB_K // WMMA_K) // 2
         schedule = []
         for msb_idx in range_constexpr(2):
             for k in range_constexpr(SP_MSB_K // WMMA_K):
@@ -971,15 +955,13 @@ class Pipeline:
                             schedule.append(
                                 {
                                     "sp_msb": sp_msb,
-                                    "k_msb": (k // _K_FRAGS_PER_MSB) * 2 + sp_msb % 2,
+                                    "k_msb": (k // N_WMMA_K_TILES) * 2 + sp_msb % 2,
                                     "q_msb": (sp_msb // 2) * 2 + k // Q_WMMA_PER_MSB,
                                     "k_iter": k,
-                                    "k_frag": k % _K_FRAGS_PER_MSB,
+                                    "k_frag": k % N_WMMA_K_TILES,
                                     "n_iter": n,
                                     "m_iter": m,
                                     "is_init": k == 0,
-                                    "sp_off": sp_off,
-                                    "k_MSBOFF": k_MSBOFF,
                                 }
                             )
         assert len(schedule) == GEMM_INST_COUNT
@@ -987,7 +969,6 @@ class Pipeline:
 
     @staticmethod
     def build_pv_schedule(blk, su):
-        sp_off = (blk % 2) * VPS_MSB_SP + 8 * su
         schedule = []
         for d_msb in range_constexpr(NUM_MSB):
             for n in range_constexpr(N_PV_WMMA_N):
@@ -997,7 +978,6 @@ class Pipeline:
                         "n": n,
                         "sp_msb": d_msb // 2,
                         "v_msb": d_msb % N_V_MSB,
-                        "sp_off": sp_off,
                     }
                 )
         assert len(schedule) == PV_GEMM_INST_COUNT
@@ -1081,6 +1061,10 @@ K_ROW_BYTES = 400
 V_ROW_BYTES = 288
 K_SU_HALF_OFFSET = 0x1900
 V_SU_HALF_OFFSET = 0x1200
+K_COL_D_HALF = QK_HDIM * KV_BPP // 2
+V_D_HALF = V_HDIM * KV_BPP // 2
+V_COL_GROUP = (N_LDS_V_PER_MSB // 2) * 32
+V_MSB_EXTRA = [0, V_D_HALF, V_COL_GROUP, V_D_HALF + V_COL_GROUP]
 
 # K: dim0=192 (QK_HDIM), no padding. QK_HDIM=192 is not a multiple of any
 # power-of-2 pad_interval that fits in one pad per row, so we skip padding to
@@ -1247,18 +1231,14 @@ def build_kv_lds_addrs(lane_id, k_base_i32, v_base_i32):
     k_col = arith.index_cast(T.i32, k_crd[1])
     k_dh0 = k_base_i32 + k_row * K_ROW_BYTES + k_col * 16
     k_dh1 = k_dh0 + K_SU_HALF_OFFSET
-    K_COL_D_HALF = QK_HDIM * KV_BPP // 2
     v_crd = idx2crd(lane_id, fx.make_layout((8, 2, 2), (1, 8, 16)))
     v_row = arith.index_cast(T.i32, v_crd[0]) + arith.index_cast(T.i32, v_crd[2]) * 8
     v_dh0 = v_base_i32 + v_row * V_ROW_BYTES + arith.index_cast(T.i32, v_crd[1]) * 16
     v_dh1 = v_dh0 + V_SU_HALF_OFFSET
     rocdl.sched_barrier(0)
-    _V_D_HALF = V_HDIM * KV_BPP // 2
-    _V_COL_GROUP = (N_LDS_V_PER_MSB // 2) * 32
-    _V_MSB_EXTRA = [0, _V_D_HALF, _V_COL_GROUP, _V_D_HALF + _V_COL_GROUP]
     v_addrs = []
     for msb in range(NUM_MSB):
-        e = _V_MSB_EXTRA[msb]
+        e = V_MSB_EXTRA[msb]
         d0 = v_dh0 if e == 0 else v_dh0 + e
         d1 = v_dh1 if e == 0 else v_dh1 + e
         v_addrs += [d0, d1]
@@ -1367,8 +1347,7 @@ def gemm1_interleaved_stage(
         sched_barrier(0)
         if const_expr(gemm_idx == 0 and has_tdm):
             _dispatch_tdm_at_wmma0(mlir_types, tdm_type, tdm_state, has_fallback=True)
-        _g1_barrier_idx = GEMM_INST_COUNT - 1
-        if const_expr(tdm_barrier and gemm_idx == _g1_barrier_idx):
+        if const_expr(tdm_barrier and gemm_idx == GEMM_INST_COUNT - 1):
             Atom.s_wait_tensorcnt(4)
             rocdl.s_barrier_signal(-1)
         _g1_row = GEMM1_SCHEDULE[stage][gemm_idx]
@@ -1554,8 +1533,7 @@ def gemm2_interleaved_stage(
         sched_barrier(0)
         if const_expr(gemm_idx == 0 and has_tdm):
             _dispatch_tdm_at_wmma0(mlir_types, tdm_type, tdm_state, has_fallback=False)
-        _pv_barrier_idx = PV_GEMM_INST_COUNT - 1
-        if const_expr(tdm_barrier and gemm_idx == _pv_barrier_idx):
+        if const_expr(tdm_barrier and gemm_idx == PV_GEMM_INST_COUNT - 1):
             Atom.s_wait_tensorcnt(4)
             rocdl.s_barrier_signal(-1)
         _g2_row = GEMM2_SCHEDULE[stage][gemm_idx]
@@ -1965,10 +1943,10 @@ def prologue_tile0(
         sp_pairs_prev=sp_pairs_prologue,
     )
     Softmax.part01_only(
-        mlir_types, 0, sp_pairs_prologue, softmax_state_prologue, sgpr_state
+        mlir_types, sp_pairs_prologue, softmax_state_prologue, sgpr_state
     )
     pro_part2_ops = Softmax.build_all_part2_ops(
-        mlir_types, 0, sp_pairs_prologue, softmax_state_prologue, sgpr_state
+        mlir_types, sp_pairs_prologue, softmax_state_prologue, sgpr_state
     )
     for m in fx.range_constexpr(NUM_MSB):
         for op in pro_part2_ops[m][:PART2_SPLIT]:
@@ -1983,13 +1961,13 @@ def prologue_tile0(
 
 
 def compute_num_tiles(
-    actual_kv_len, actual_q_len, bx, tile_n_const, causal_offset, IS_CAUSAL
+    actual_kv_len, actual_q_len, bx, TILE_N, causal_offset, IS_CAUSAL
 ):
     """Compute number of KV tiles, first causal tile index, and num_tiles_minus1 index."""
-    kv_tiles_avail = (actual_kv_len + (tile_n_const - 1)) // tile_n_const
+    kv_tiles_avail = (actual_kv_len + (TILE_N - 1)) // TILE_N
     if const_expr(IS_CAUSAL):
         sk_sq_diff = actual_kv_len - actual_q_len
-        sk_sq_tiles = (sk_sq_diff + (tile_n_const - 1)) // tile_n_const
+        sk_sq_tiles = (sk_sq_diff + (TILE_N - 1)) // TILE_N
         bx_plus_1 = bx + 1
         causal_tiles = bx_plus_1 + sk_sq_tiles
         num_tiles = arith.minui(causal_tiles.ir_value(), kv_tiles_avail)
@@ -1999,7 +1977,7 @@ def compute_num_tiles(
     num_tiles_minus1 = num_tiles - 1
     num_tiles_minus1_idx = arith.index_cast(T.index, num_tiles_minus1)
     if const_expr(IS_CAUSAL):
-        first_causal_tile = bx + causal_offset // tile_n_const
+        first_causal_tile = bx + causal_offset // TILE_N
         first_causal_tile = arith.maxsi(
             first_causal_tile.ir_value(), arith.constant(1, type=T.i32)
         )
@@ -2031,7 +2009,7 @@ def core_loop_setup(
     actual_q_len, bx = ctx["actual_q_len"], ctx["bx"]
     k_offset, stride_k_seq = ctx["k_offset"], ctx["stride_k_seq"]
     wave_id = ctx["wave_id"]
-    tile_n_const, zero_v8f32 = ctx["tile_n_const"], ctx["zero_v8f32"]
+    zero_v8f32 = ctx["zero_v8f32"]
     mlir_types = ctx["mlir_types"]
 
     num_tiles, num_tiles_idx, num_tiles_minus1_idx, first_causal_tile_idx = (
@@ -2039,14 +2017,14 @@ def core_loop_setup(
             actual_kv_len,
             actual_q_len,
             bx,
-            tile_n_const,
+            TILE_N,
             causal_offset,
             IS_CAUSAL,
         )
     )
 
     rocdl.sched_barrier(0)
-    k_tile1_stride = tile_n_const * stride_k_seq
+    k_tile1_stride = TILE_N * stride_k_seq
     k_tile1_offset = k_offset + k_tile1_stride
     k_tile1_oob_dg1 = TDM.build_oob_dg1_list(
         _K_CFG,
@@ -2113,7 +2091,7 @@ def epilogue_endtile(
     sgpr_state,
     num_tiles,
     num_tiles_idx,
-    tile_n_const,
+    TILE_N,
     causal_offset,
     IS_CAUSAL,
     _V_CFG,
@@ -2146,11 +2124,11 @@ def epilogue_endtile(
         if const_expr(IS_CAUSAL)
         else None
     )
-    et_kv_remain = actual_kv_len - (num_tiles - 1) * tile_n_const
+    et_kv_remain = actual_kv_len - (num_tiles - 1) * TILE_N
     et_v_oob_dg1 = TDM.build_oob_dg1_list(
         _V_CFG, 128, stride_v_seq >> 1, et_kv_remain, wave_id
     )
-    ep_v_endtile_offset = v_offset + (num_tiles - 1) * tile_n_const * stride_v_seq
+    ep_v_endtile_offset = v_offset + (num_tiles - 1) * TILE_N * stride_v_seq
     _, _, et_o, _, et_psp_lo, et_psp_hi, et_ped = execute_tile_pipeline(
         ctx,
         mlir_types,
@@ -2299,7 +2277,7 @@ def execute_tile_pipeline(
     if const_expr(sp_pairs_all is None):
         sp_pairs_all = [[None] * N_SP_PAIRS for _ in range(NUM_MSB)]
     softmax_ops_by_msb = Softmax.build_all_part2_ops(
-        mlir_types, 0, sp_pairs_all, softmax_state, sgpr_state
+        mlir_types, sp_pairs_all, softmax_state, sgpr_state
     )
     softmax_idx_by_msb = [PART2_SPLIT] * NUM_MSB
 
@@ -2411,7 +2389,6 @@ def execute_tile_pipeline(
         g2_sp_hi_cache,
     ) = Softmax.build_all_gemm2_ops(
         mlir_types,
-        blk,
         sp_pairs_current,
         softmax_state,
         sgpr_state,
@@ -2511,7 +2488,7 @@ def tile_iteration(ctx, tile_idx, iter_args, causal_n_start=None):
     actual_kv_len = ctx["actual_kv_len"]
     stride_k_seq, stride_v_seq = ctx["stride_k_seq"], ctx["stride_v_seq"]
     k_offset, v_offset = ctx["k_offset"], ctx["v_offset"]
-    tile_n_const, zero_v8f32 = ctx["tile_n_const"], ctx["zero_v8f32"]
+    zero_v8f32 = ctx["zero_v8f32"]
     q_frags, sgpr_state, mlir_types = (
         ctx["q_frags"],
         ctx["sgpr_state"],
@@ -2565,9 +2542,9 @@ def tile_iteration(ctx, tile_idx, iter_args, causal_n_start=None):
     )
     tdm_state = _make_empty_tdm_state()
     tile_idx_i32 = arith.index_cast(T.i32, tile_idx)
-    cur_v_offset = v_offset + tile_idx_i32 * (tile_n_const * stride_v_seq)
+    cur_v_offset = v_offset + tile_idx_i32 * (TILE_N * stride_v_seq)
     next_tile = tile_idx_i32 + 1
-    next_k_offset = k_offset + next_tile * (tile_n_const * stride_k_seq)
+    next_k_offset = k_offset + next_tile * (TILE_N * stride_k_seq)
     _loop_stride_k_elems = stride_k_seq >> 1
     _loop_stride_v_elems = stride_v_seq >> 1
     _loop_K_CFG_OOB = (1 << 16) | K_TDM_CONFIG
@@ -2576,14 +2553,14 @@ def tile_iteration(ctx, tile_idx, iter_args, causal_n_start=None):
         _loop_V_CFG_OOB,
         128,
         _loop_stride_v_elems,
-        actual_kv_len - tile_idx_i32 * tile_n_const,
+        actual_kv_len - tile_idx_i32 * TILE_N,
         wave_id,
     )
     loop_k_oob_dg1 = TDM.build_oob_dg1_list(
         _loop_K_CFG_OOB,
         QK_HDIM,
         _loop_stride_k_elems,
-        actual_kv_len - next_tile * tile_n_const,
+        actual_kv_len - next_tile * TILE_N,
         wave_id,
         dim0_stride=200,
     )
@@ -2683,7 +2660,7 @@ def epilogue_write_output(
     sfx = make_softmax_state(
         old_max_in, local_max_in, delta_in, row_sums_in, sp_pairs_prev=sp_pairs_in
     )
-    p2ops = Softmax.build_all_part2_ops(mlir_types, 0, sp_pairs_in, sfx, sgpr_state)
+    p2ops = Softmax.build_all_part2_ops(mlir_types, sp_pairs_in, sfx, sgpr_state)
     for m in fx.range_constexpr(NUM_MSB):
         for i in fx.range_constexpr(PART2_SETUP_A - 1):
             p2ops[m][i]()
