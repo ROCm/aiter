@@ -421,9 +421,15 @@ def write_lookup_header(
 def _get_pci_chip_id(device_id=0):
     import ctypes
 
+    # ROCm 7.1 inserted MaxAvailableVgprsPerThread ahead of PciChipId, shifting it.
+    version = _hip_version()
+    if version is not None and version < (7, 1):
+        hipDeviceAttributePciChipId = 10019
+    else:
+        hipDeviceAttributePciChipId = 10020
+
     libhip = ctypes.CDLL("libamdhip64.so")
     chip_id = ctypes.c_int(0)
-    hipDeviceAttributePciChipId = 10019
     err = libhip.hipDeviceGetAttribute(
         ctypes.byref(chip_id),
         hipDeviceAttributePciChipId,
