@@ -46,7 +46,7 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import arith, const_expr, gpu, range_constexpr
+from flydsl.expr import arith, const_expr, fastmath, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, Stream, T
 
@@ -363,12 +363,21 @@ def _build_compress_forward_kernel(
                     w_old = fx.Float32(w_old_list[i])
                     score_k = fx.Float32(score_k_list[i])
                     kv_k = fx.Float32(kv_k_list[i])
+                    # maximumf keeps the ambient fast_fp_math (matches the old
+                    # raw maximumf, which resolved fastmath<fast>). The OEQ
+                    # compares against -inf MUST emit fastmath<none> -- ambient
+                    # fast carries ninf, which lets `x == -inf` fold to false
+                    # and drops the sentinel select -- so scope only the `==`
+                    # to fastmath(None) (== the old raw cmpf, no fastmath).
                     m_new = m_old.maximumf(score_k)
-                    is_first = m_old == neg_inf
+                    with fastmath(None):
+                        is_first = m_old == neg_inf
                     scale_active = fx.Float32(fexp_f32(m_old - m_new))
                     scale_v = is_first.select(zero, scale_active)
                     wk_active = fx.Float32(fexp_f32(score_k - m_new))
-                    w_k = (score_k == neg_inf).select(zero, wk_active)
+                    with fastmath(None):
+                        is_pad_score = score_k == neg_inf
+                    w_k = is_pad_score.select(zero, wk_active)
                     new_kv.append((kv_old * scale_v + w_k * kv_k).ir_value())
                     new_w.append((w_old * scale_v + w_k).ir_value())
                     new_m.append(m_new.ir_value())
