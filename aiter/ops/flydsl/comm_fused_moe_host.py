@@ -17,6 +17,9 @@ from aiter.ops.flydsl.kernels.comm_fused_moe.gfx950.a8w4 import (
     gemm2_tp_megakernel,
     gemm2_tp_window_pipeline,
 )
+from aiter.ops.flydsl.kernels.comm_fused_moe.gfx950.a8w4.shape import (
+    Gemm2TPShape,
+)
 from aiter.ops.flydsl.kernels.comm_fused_moe.gfx950.a8w4.sync import (
     FLAT_VA_RANK_STRIDE,
     compile_epoch_barrier,
@@ -37,6 +40,15 @@ class ShapeKey:
     topk: int
     tp: int
 
+    def kernel_shape(self) -> Gemm2TPShape:
+        return Gemm2TPShape(
+            self.model_dim,
+            self.inter_dim,
+            self.experts,
+            self.topk,
+            self.tp,
+        )
+
 
 PipelineConfig = (
     gemm2_tp_atomic_pipeline.Gemm2TPAtomicPipelineConfig
@@ -51,10 +63,12 @@ _CONFIG_TYPES = {
 _RUNNER_CACHE = {}
 
 
-def _config(row) -> PipelineConfig:
+def _config(row, shape: Gemm2TPShape) -> PipelineConfig:
     config_type = _CONFIG_TYPES[row["family"]]
-    values = {}
+    values = {"shape": shape}
     for field in fields(config_type):
+        if field.name == "shape":
+            continue
         raw = row.get(field.name)
         if raw in (None, ""):
             if field.default is not MISSING:
@@ -86,7 +100,9 @@ def _winner_table() -> dict[ShapeKey, dict[int, PipelineConfig]]:
                 int(row["topk"]),
                 int(row["tp"]),
             )
-            table.setdefault(shape, {})[int(row["m"])] = _config(row)
+            table.setdefault(shape, {})[int(row["m"])] = _config(
+                row, shape.kernel_shape()
+            )
     return table
 
 
@@ -140,16 +156,17 @@ def _register(tp_group, rank: int, tp: int, tensors):
     return comm, windows, bases
 
 
-def _barrier(tensor, flat_base, ready_offset, stream) -> None:
+def _barrier(tensor, flat_base, ready_offset, tp_size, stream) -> None:
     _run_compiled(
-        compile_epoch_barrier(),
+        compile_epoch_barrier(tp_size),
         (ptr_arg(tensor), fx.Int64(flat_base), fx.Int64(ready_offset), stream),
     )
 
 
-def _stage2_args(args, kwargs, kernels, config):
+def _stage2_args(args, kwargs, config):
     inter_states, w2 = args[0], args[2]
     sorted_token_ids, sorted_expert_ids, num_valid_ids = args[3:6]
+    shape = config.shape
     return (
         ptr_arg(inter_states),
         ptr_arg(w2),
@@ -161,8 +178,8 @@ def _stage2_args(args, kwargs, kernels, config):
         ptr_arg(num_valid_ids),
         ptr_arg(inter_states),
         config.m,
-        kernels.H,
-        kernels.I,
+        shape.model_dim,
+        shape.inter_dim,
         int(sorted_expert_ids.shape[0]) * config.sort_block_m // config.tile_m,
     )
 
@@ -173,26 +190,28 @@ class _Gemm2TPAtomicPipelineRunner:
         tp_group,
         config: gemm2_tp_atomic_pipeline.Gemm2TPAtomicPipelineConfig,
     ) -> None:
-        k = gemm2_tp_atomic_pipeline
         self.config = config
         self.rank = int(tp_group.rank_in_group)
         self.device = torch.device(tp_group.device)
-        self.partial_ready = config.m * (k.H + k.H // 32)
-        self.reduced_ready = config.shard_rows * k.H
+        shape = config.shape
+        self.partial_ready = config.m * (shape.model_dim + shape.model_dim // 32)
+        self.reduced_ready = config.shard_rows * shape.model_dim
         sizes = (
             (self.partial_ready + 8 + 255) // 256 * 256,
             (self.reduced_ready + 8 + 255) // 256 * 256,
-            config.shard_rows * (k.H // 32),
+            config.shard_rows * (shape.model_dim // 32),
         )
         self.workspace, tensors, offsets = _packed_symmetric(self.device, sizes)
         self.partial, self.reduced_payload, self.reduced_scale = tensors
         self.partial[self.partial_ready : self.partial_ready + 8].zero_()
         self.reduced_payload[self.reduced_ready : self.reduced_ready + 8].zero_()
         self.output = torch.empty(
-            (config.m, k.H), dtype=torch.bfloat16, device=self.device
+            (config.m, shape.model_dim),
+            dtype=torch.bfloat16,
+            device=self.device,
         )
         self.comm, self.windows, (workspace_base,) = _register(
-            tp_group, self.rank, k.TP, (self.workspace,)
+            tp_group, self.rank, shape.tp_size, (self.workspace,)
         )
         (
             self.partial_flat_base,
@@ -223,7 +242,13 @@ class _Gemm2TPAtomicPipelineRunner:
             k.compile_stage2_quantize(config),
             (ptr_arg(shared_partial), ptr_arg(self.partial), stream),
         )
-        _barrier(self.partial, self.partial_flat_base, self.partial_ready, stream)
+        _barrier(
+            self.partial,
+            self.partial_flat_base,
+            self.partial_ready,
+            config.shape.tp_size,
+            stream,
+        )
         _run_compiled(
             k.compile_stage2_tp_reduce_scatter(config),
             (
@@ -239,6 +264,7 @@ class _Gemm2TPAtomicPipelineRunner:
             self.reduced_payload,
             self.reduced_payload_base,
             self.reduced_ready,
+            config.shape.tp_size,
             stream,
         )
         _run_compiled(
@@ -262,7 +288,7 @@ class _Gemm2TPMegakernelRunner:
         tp_group,
         config: gemm2_tp_megakernel.Gemm2TPMegakernelConfig,
     ) -> None:
-        k = gemm2_tp_megakernel
+        shape = config.shape
         self.config = config
         self.rank = int(tp_group.rank_in_group)
         self.device = torch.device(tp_group.device)
@@ -271,12 +297,12 @@ class _Gemm2TPMegakernelRunner:
         self.output = (
             self.workspace.narrow(0, config.output_offset, config.payload_bytes)
             .view(torch.bfloat16)
-            .view(config.m, k.H)
+            .view(config.m, shape.model_dim)
         )
         self.comm, self.windows, bases = _register(
             tp_group,
             self.rank,
-            k.TP,
+            shape.tp_size,
             (self.workspace,),
         )
         # Register all peer windows before launching a peer-dereferencing kernel.
@@ -341,7 +367,7 @@ class _Gemm2TPMegakernelRunner:
                     "GEMM2 TP megakernel shared_partial storage changed after "
                     "symmetric registration"
                 )
-        common = list(_stage2_args(stage2_args, stage2_kwargs, k, self.config))
+        common = list(_stage2_args(stage2_args, stage2_kwargs, self.config))
         _run_compiled(
             k.compile_gemm2_tp_megakernel(self.config, self.rank),
             (
@@ -363,12 +389,17 @@ class _Gemm2TPWindowPipelineRunner:
         config: gemm2_tp_window_pipeline.Gemm2TPWindowPipelineConfig,
     ) -> None:
         k = gemm2_tp_window_pipeline
+        shape = config.shape
         self.config = config
         self.rank = int(tp_group.rank_in_group)
         self.device = torch.device(tp_group.device)
         self.routes = tuple(
             torch.empty(
-                (config.m, k.TOPK, config.window + config.window // 8),
+                (
+                    config.m,
+                    shape.topk,
+                    config.window + config.window // 8,
+                ),
                 dtype=torch.uint8,
                 device=self.device,
             )
@@ -390,10 +421,12 @@ class _Gemm2TPWindowPipelineRunner:
         for payload in self.reduced_payloads:
             payload[self.reduced_ready : self.reduced_ready + 8].zero_()
         self.output = torch.empty(
-            (config.m, k.H), dtype=torch.bfloat16, device=self.device
+            (config.m, shape.model_dim),
+            dtype=torch.bfloat16,
+            device=self.device,
         )
         self.comm, self.windows, (workspace_base,) = _register(
-            tp_group, self.rank, k.TP, (self.workspace,)
+            tp_group, self.rank, shape.tp_size, (self.workspace,)
         )
         bases = tuple(workspace_base + offset for offset in offsets)
         self.partial_bases = bases[: k.SLOTS]
@@ -405,11 +438,11 @@ class _Gemm2TPWindowPipelineRunner:
                 shard_begin : shard_begin + config.shard_rows,
                 phase * config.window : (phase + 1) * config.window,
             ]
-            for phase in range(k.H // config.window)
+            for phase in range(shape.model_dim // config.window)
         )
         self.gathered_outputs = tuple(
             self.output[:, phase * config.window : (phase + 1) * config.window]
-            for phase in range(k.H // config.window)
+            for phase in range(shape.model_dim // config.window)
         )
 
     def _local_args(self, phase, shared_partial):
@@ -464,7 +497,7 @@ class _Gemm2TPWindowPipelineRunner:
         k = gemm2_tp_window_pipeline
         config = self.config
         stream = torch.cuda.current_stream(self.device)
-        common = _stage2_args(stage2_args, stage2_kwargs, k, config)
+        common = _stage2_args(stage2_args, stage2_kwargs, config)
         _run_compiled(
             k.compile_stage2_compute(config, 0),
             (ptr_arg(self.routes[0]), *common, stream),
@@ -493,6 +526,7 @@ class _Gemm2TPWindowPipelineRunner:
                 self.partials[local_slot],
                 self.partial_bases[local_slot],
                 self.partial_ready,
+                config.shape.tp_size,
                 stream,
             )
             if reduce_scatter >= 0:
@@ -501,6 +535,7 @@ class _Gemm2TPWindowPipelineRunner:
                     self.reduced_payloads[reduce_slot],
                     self.reduced_payload_bases[reduce_slot],
                     self.reduced_ready,
+                    config.shape.tp_size,
                     stream,
                 )
 
@@ -512,12 +547,14 @@ class _Gemm2TPWindowPipelineRunner:
             self.partials[last_slot],
             self.partial_bases[last_slot],
             self.partial_ready,
+            config.shape.tp_size,
             stream,
         )
         _barrier(
             self.reduced_payloads[reduce_slot],
             self.reduced_payload_bases[reduce_slot],
             self.reduced_ready,
+            config.shape.tp_size,
             stream,
         )
         self._drain(None, last, last - 1, shared_partial, stream)
@@ -525,6 +562,7 @@ class _Gemm2TPWindowPipelineRunner:
             self.reduced_payloads[last_slot],
             self.reduced_payload_bases[last_slot],
             self.reduced_ready,
+            config.shape.tp_size,
             stream,
         )
         self._drain(None, None, last, shared_partial, stream)
