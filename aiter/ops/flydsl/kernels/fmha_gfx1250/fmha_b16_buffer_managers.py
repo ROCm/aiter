@@ -229,7 +229,9 @@ class QManager16bV1:
         num_waves=_DEFAULT_NUM_WAVES,
         lds_tiles=None,
         q_tiles_per_wave=1,
+        elem_dtype=fx.BFloat16,
     ):
+        self.elem_dtype = elem_dtype
         if qk_hdim % _WMMA_K != 0:
             raise ValueError(f"qk_hdim must be a multiple of {_WMMA_K}; got {qk_hdim}")
         self.qk_hdim = qk_hdim  # compile-time
@@ -420,8 +422,8 @@ class QManager16bV1:
         R = self.q_tiles_per_wave
         k_tiles = self.k_tiles
         lds_tiles = self.lds_tiles
-        v8_ty = fx.Vector.make_type(_CHUNK_ELEMS, fx.BFloat16)
-        scale_bf16 = scale.to(fx.BFloat16)
+        v8_ty = fx.Vector.make_type(_CHUNK_ELEMS, self.elem_dtype)
+        scale_bf16 = scale.to(self.elem_dtype)
 
         def _read_tile(ds_ptrs, tile):
             lo = fx.Vector(llvm_dialect.load(v8_ty, ds_ptrs[2 * tile]))
@@ -506,8 +508,14 @@ class KManager16bV1:
     """
 
     def __init__(
-        self, *, qk_hdim, n_block=_DEFAULT_N_BLOCK, num_waves=_DEFAULT_NUM_WAVES
+        self,
+        *,
+        qk_hdim,
+        n_block=_DEFAULT_N_BLOCK,
+        num_waves=_DEFAULT_NUM_WAVES,
+        elem_dtype=fx.BFloat16,
     ):
+        self.elem_dtype = elem_dtype
         if qk_hdim % _WMMA_K != 0:
             raise ValueError(f"qk_hdim must be a multiple of {_WMMA_K}; got {qk_hdim}")
         if n_block not in _N_BLOCK_CHOICES:
@@ -677,7 +685,7 @@ class KManager16bV1:
         """Burst all K ``ds_load_b128`` for the resident block from the 2 bases of
         ``ds_load_ptrs`` (buffer selected by ``base_ptrs``), in ``_qk_gemm`` order
         ``[(kv, dt, half) ...]``."""
-        v8_ty = fx.Vector.make_type(8, fx.BFloat16)
+        v8_ty = fx.Vector.make_type(8, self.elem_dtype)
         tile_stride = (
             _WMMA_M * _WMMA_K * _BF16_BYTES
         )  # 1024: lane-independent tile step
@@ -721,8 +729,14 @@ class VManager16bV1:
     """
 
     def __init__(
-        self, *, v_hdim, n_block=_DEFAULT_N_BLOCK, num_waves=_DEFAULT_NUM_WAVES
+        self,
+        *,
+        v_hdim,
+        n_block=_DEFAULT_N_BLOCK,
+        num_waves=_DEFAULT_NUM_WAVES,
+        elem_dtype=fx.BFloat16,
     ):
+        self.elem_dtype = elem_dtype
         if v_hdim % _V_TILE != 0:
             raise ValueError(f"v_hdim must be a multiple of {_V_TILE}; got {v_hdim}")
         if n_block % _V_BLK_KV != 0:
@@ -889,7 +903,7 @@ class VManager16bV1:
         """Burst all V ``ds_load_tr16_b128`` for the resident block from the 2 bases of
         ``ds_load_ptrs`` (buffer selected by ``base_ptrs``), in ``_pv_gemm`` order
         ``[(dt, kt, half) ...]``."""
-        v8_ty = fx.Vector.make_type(8, fx.BFloat16)
+        v8_ty = fx.Vector.make_type(8, self.elem_dtype)
         d_tiles = self.v_hdim // _WMMA_M
         nkt = self.n_block // _WMMA_K
         out = []
@@ -953,6 +967,7 @@ def _tdm_load_views(
     hdim,
     pad_elems,
     lds_base,
+    elem_dtype,
 ):
     """Build a LIST of ``(atom, g_view, lds_view)`` TDM global->LDS copies for one
     ``[n_rows, hdim]`` tile into a row-major padded (``hdim + pad_elems`` element row stride) LDS
@@ -967,7 +982,7 @@ def _tdm_load_views(
     off = fx.Int64(row0) * fx.Int64(stride_seq) + fx.Int64(head) * fx.Int64(stride_head)
     base_iter = fx.get_iter(ptr_x)
     lds_ptr_ty = fx.PointerType.get(
-        elem_ty=fx.BFloat16.ir_type,
+        elem_ty=elem_dtype.ir_type,
         address_space=fx.AddressSpace.Shared,
         alignment=16,
     )
@@ -1011,7 +1026,9 @@ class QManager16bV2:
         num_waves=_DEFAULT_NUM_WAVES,
         lds_tiles=None,
         q_tiles_per_wave=1,
+        elem_dtype=fx.BFloat16,
     ):
+        self.elem_dtype = elem_dtype
         if qk_hdim % _WMMA_K != 0:
             raise ValueError(f"qk_hdim must be a multiple of {_WMMA_K}; got {qk_hdim}")
         if num_waves != _DEFAULT_NUM_WAVES:
@@ -1064,7 +1081,7 @@ class QManager16bV2:
         base_iter = fx.get_iter(ptr_Q)
         warp_region = ptr_lds + warp_idx * fx.Int32(self.rows_per_warp * self.row_bytes)
         lds_ptr_ty = fx.PointerType.get(
-            elem_ty=fx.BFloat16.ir_type,
+            elem_ty=self.elem_dtype.ir_type,
             address_space=fx.AddressSpace.Shared,
             alignment=16,
         )
@@ -1106,8 +1123,8 @@ class QManager16bV2:
         ``l%16``, d-byte ``(l//16)*16``; fragment (qt, tile) = base + ``qt*16*row_bytes +
         tile*32*2`` (lo) and ``+ 16*2`` more (hi 8-col half)."""
         tdm_ops.tensor_wait(0)
-        v8_ty = fx.Vector.make_type(_CHUNK_ELEMS, fx.BFloat16)
-        scale_bf16 = scale.to(fx.BFloat16)
+        v8_ty = fx.Vector.make_type(_CHUNK_ELEMS, self.elem_dtype)
+        scale_bf16 = scale.to(self.elem_dtype)
         lane = self._lane_idx
         lane_base = (
             self._warp_region
@@ -1137,8 +1154,14 @@ class KManager16bV2:
     (``_qk_gemm`` order ``[(kv, dt, half)...]``, natural ``ds_load_b128``)."""
 
     def __init__(
-        self, *, qk_hdim, n_block=_DEFAULT_N_BLOCK, num_waves=_DEFAULT_NUM_WAVES
+        self,
+        *,
+        qk_hdim,
+        n_block=_DEFAULT_N_BLOCK,
+        num_waves=_DEFAULT_NUM_WAVES,
+        elem_dtype=fx.BFloat16,
     ):
+        self.elem_dtype = elem_dtype
         if qk_hdim % _WMMA_K != 0:
             raise ValueError(f"qk_hdim must be a multiple of {_WMMA_K}; got {qk_hdim}")
         if n_block not in _N_BLOCK_CHOICES:
@@ -1174,6 +1197,7 @@ class KManager16bV2:
             hdim=self.qk_hdim,
             pad_elems=_K_PAD_ELEMS,
             lds_base=ptr_lds,
+            elem_dtype=self.elem_dtype,
         )
 
     def ds_load_ptrs(self, *, ptr_lds, lane_idx):
@@ -1192,7 +1216,7 @@ class KManager16bV2:
         """Burst all K ``ds_load_b128`` from the row-major padded block, in ``_qk_gemm``
         order ``[(kv, dt, half)...]``, off the single base of ``ds_load_ptrs``. Fragment
         (kv, dt, half) = base + ``kv*16*row_bytes + (dt*32 + half*16)*2`` bytes."""
-        v8_ty = fx.Vector.make_type(8, fx.BFloat16)
+        v8_ty = fx.Vector.make_type(8, self.elem_dtype)
         NKV = self.n_block // _WMMA_M
         NDT = self.qk_hdim // _WMMA_K
         base = base_ptrs[0]
@@ -1218,8 +1242,14 @@ class VManager16bV2:
     ``ds_load_tr16_b128`` crossbar ``V[kv+(l//16)*8+l%8, d+((l//8)%2)*8]``)."""
 
     def __init__(
-        self, *, v_hdim, n_block=_DEFAULT_N_BLOCK, num_waves=_DEFAULT_NUM_WAVES
+        self,
+        *,
+        v_hdim,
+        n_block=_DEFAULT_N_BLOCK,
+        num_waves=_DEFAULT_NUM_WAVES,
+        elem_dtype=fx.BFloat16,
     ):
+        self.elem_dtype = elem_dtype
         if v_hdim % _WMMA_M != 0:
             raise ValueError(f"v_hdim must be a multiple of {_WMMA_M}; got {v_hdim}")
         if n_block % _WMMA_K != 0:
@@ -1252,6 +1282,7 @@ class VManager16bV2:
             hdim=self.v_hdim,
             pad_elems=_V_PAD_ELEMS,
             lds_base=ptr_lds,
+            elem_dtype=self.elem_dtype,
         )
 
     def ds_load_ptrs(self, *, ptr_lds, lane_idx):
@@ -1273,7 +1304,7 @@ class VManager16bV2:
         ``_pv_gemm`` order ``[(dt, kt, half)...]``, off the single base of ``ds_load_ptrs``.
         Fragment (dt, kt, half) = base + ``(kt*32 + half*16)*row_bytes + dt*16*2`` bytes.
         """
-        v8_ty = fx.Vector.make_type(8, fx.BFloat16)
+        v8_ty = fx.Vector.make_type(8, self.elem_dtype)
         d_tiles = self.v_hdim // _WMMA_M
         nkt = self.n_block // _WMMA_K
         base = base_ptrs[0]
@@ -1335,7 +1366,9 @@ class OManager16bV1:
         cols_per_tile=_O_COLS_PER_TILE,
         inflight_units=_O_INFLIGHT_UNITS,
         lds_budget_bytes=_O_LDS_BUDGET_BYTES,
+        elem_dtype=fx.BFloat16,
     ):
+        self.elem_dtype = elem_dtype
         if v_hdim % _WMMA_M != 0:
             raise ValueError(f"v_hdim must be a multiple of {_WMMA_M}; got {v_hdim}")
         self.v_hdim = v_hdim
@@ -1435,7 +1468,7 @@ class OManager16bV1:
         lds_warp = ptr_lds + warp_idx * self._warp_stride
         q_st = lane_idx % _WMMA_M
         d_half = (lane_idx // _WMMA_M) * _CHUNK_ELEMS  # 0 or 8
-        v8_ty = fx.Vector.make_type(_CHUNK_ELEMS, fx.BFloat16)
+        v8_ty = fx.Vector.make_type(_CHUNK_ELEMS, self.elem_dtype)
         base_row = (
             block_x * self.block_m
             + warp_idx * (self.q_tiles_per_wave * _WMMA_M)
@@ -1465,7 +1498,7 @@ class OManager16bV1:
             for kk in range(TPU):
                 k = u * TPU + kk
                 d_col = d_half + fx.Int32(kk * _WMMA_M)  # slot-local column
-                bf = o_frags[k].to(fx.BFloat16)
+                bf = o_frags[k].to(self.elem_dtype)
                 addr = lds_warp + self._lds_byte(slot, q_st, d_col)
                 lds_ptr = buffer_ops.create_llvm_ptr(addr, address_space=3)
                 llvm_dialect.store(_ir(bf), lds_ptr, alignment=_CHUNK_BYTES)
@@ -1546,8 +1579,15 @@ class OManager16bV2:
     group), but O is a one-time epilogue store so the cost is negligible."""
 
     def __init__(
-        self, *, v_hdim, gqa_ratio, num_waves=_DEFAULT_NUM_WAVES, q_tiles_per_wave=1
+        self,
+        *,
+        v_hdim,
+        gqa_ratio,
+        num_waves=_DEFAULT_NUM_WAVES,
+        q_tiles_per_wave=1,
+        elem_dtype=fx.BFloat16,
     ):
+        self.elem_dtype = elem_dtype
         if v_hdim % _WMMA_M != 0:
             raise ValueError(f"v_hdim must be a multiple of {_WMMA_M}; got {v_hdim}")
         if num_waves != _DEFAULT_NUM_WAVES:
@@ -1602,7 +1642,7 @@ class OManager16bV2:
         )
         base_ptr = buffer_ops.create_llvm_ptr(lane_base, address_space=3)
         for k in range(self.d_tiles):
-            bf = o_frags[k].to(fx.BFloat16)
+            bf = o_frags[k].to(self.elem_dtype)
             imm = k * _WMMA_M * _BF16_BYTES
             p = (
                 base_ptr
@@ -1623,7 +1663,7 @@ class OManager16bV2:
         rem = q_len - seq0
         n_seq_valid = fx.max(rem, fx.Int32(0))
         lds_ptr_ty = fx.PointerType.get(
-            elem_ty=fx.BFloat16.ir_type,
+            elem_ty=self.elem_dtype.ir_type,
             address_space=fx.AddressSpace.Shared,
             alignment=16,
         )
@@ -1699,8 +1739,15 @@ class OManager16bV3:
     """
 
     def __init__(
-        self, *, v_hdim, gqa_ratio, num_waves=_DEFAULT_NUM_WAVES, q_tiles_per_wave=1
+        self,
+        *,
+        v_hdim,
+        gqa_ratio,
+        num_waves=_DEFAULT_NUM_WAVES,
+        q_tiles_per_wave=1,
+        elem_dtype=fx.BFloat16,
     ):
+        self.elem_dtype = elem_dtype
         if v_hdim % _WMMA_M != 0:
             raise ValueError(f"v_hdim must be a multiple of {_WMMA_M}; got {v_hdim}")
         if num_waves != _DEFAULT_NUM_WAVES:
@@ -1759,7 +1806,7 @@ class OManager16bV3:
         base_ptr = buffer_ops.create_llvm_ptr(lane_base, address_space=3)
         ds_ops = []
         for k in range(self.d_tiles):
-            bf = o_frags[k].to(fx.BFloat16)  # cvt
+            bf = o_frags[k].to(self.elem_dtype)  # cvt
             imm = k * _WMMA_M * _BF16_BYTES
             p = (
                 base_ptr

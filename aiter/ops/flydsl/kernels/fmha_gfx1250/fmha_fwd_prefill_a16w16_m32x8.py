@@ -111,12 +111,12 @@ class WarpType(IntEnum):
     HI_WARP = 1  # waves NUM_WAVES/2..NUM_WAVES-1
 
 
-# v1 defaults (compile-time; see module docstring).
 DEFAULT_QK_HDIM = 128
 DEFAULT_V_HDIM = 128
 DEFAULT_DTYPE = "bf16"
-# Supported D_qk (all with D_v=128, n_block=64). 256 needs the K|V slot sized to fit
-# Q staging (see _core_attention slot_bytes).
+_DTYPE_MAP = {"bf16": fx.BFloat16, "fp16": fx.Float16}
+_TORCH_DTYPE_MAP = {"bf16": torch.bfloat16, "fp16": torch.float16}
+_ELEM_DTYPE = fx.BFloat16
 SUPPORTED_QK_HDIM = (128, 192, 256)
 
 # KV sequence block (columns of one QK GEMM tile). Configurable; 64 for now.
@@ -259,23 +259,21 @@ def _packed_tile_indices(gqa_ratio, warp_idx, lane_idx):
 # ============================================================================
 
 
-def _wmma_bf16(a, b, c):
-    """v_wmma_f32_16x16x32_bf16 (gfx1250, wave32): C[16x16 f32] = A[16x32 bf16] @
-    B[32x16 bf16] + C. No fdsl wrapper exists for this op (only mfma/fp8/f4), so
-    we unwrap operands and call the raw ODS builder locally.
+def _wmma(a, b, c):
+    """v_wmma_f32_16x16x32_{bf16,f16} (gfx1250, wave32): C[16x16 f32] = A[16x32] @
+    B[32x16] + C, intrinsic picked by the build-time _ELEM_DTYPE. No fdsl wrapper
+    exists for this op (only mfma/fp8/f4), so we call the raw ODS builder locally.
 
-    a/b: v16 bf16 fragments; c: v8 f32 accumulator; returns the v8 f32 result
+    a/b: v16 16-bit fragments; c: v8 f32 accumulator; returns the v8 f32 result
     (raw MLIR value, feed straight back as ``c`` to accumulate)."""
     v8f32 = fx.Vector.make_type(8, fx.Float32)
+    wmma = (
+        rocdl_dialect.wmma_f32_16x16x32_f16
+        if _ELEM_DTYPE is fx.Float16
+        else rocdl_dialect.wmma_f32_16x16x32_bf16
+    )
     # modC defaults to WMMACModifier::none (== the old modC=0); omit it.
-    return rocdl_dialect.wmma_f32_16x16x32_bf16(
-        v8f32,
-        _ir(a),
-        _ir(b),
-        _ir(c),
-        reuseA=False,
-        reuseB=False,
-    ).result
+    return wmma(v8f32, _ir(a), _ir(b), _ir(c), reuseA=False, reuseB=False).result
 
 
 def _qk_gemm(*, k_values, q_frags_list, n_block):
@@ -323,7 +321,7 @@ def _qk_gemm(*, k_values, q_frags_list, n_block):
                     if dt > 0
                     else fx.Vector.filled(8, 0.0, fx.Float32)
                 )
-                s_acc_list[qt][kv] = _wmma_bf16(k_frag, q_frags_list[qt][dt], acc)
+                s_acc_list[qt][kv] = _wmma(k_frag, q_frags_list[qt][dt], acc)
     return s_acc_list
 
 
@@ -539,7 +537,7 @@ def _softmax(
                 pe.append(pj)
                 p_flat.append(pj)
                 idx += 1
-            p.append(fx.Vector.from_elements(pe, fx.Float32).to(fx.BFloat16))
+            p.append(fx.Vector.from_elements(pe, fx.Float32).to(_ELEM_DTYPE))
         p_list.append(p)
         p_flat_list.append(p_flat)
 
@@ -611,7 +609,7 @@ def _pv_gemm(*, v_values, p_list, v_hdim, n_block, o_acc_list=None):
                 # B-operand: P^T frag = two consecutive softmax kv-tiles -> v16 bf16.
                 p = p_list[qt]
                 p_frag = p[2 * kt].shuffle(p[2 * kt + 1], list(range(16)))
-                accs[qt] = _wmma_bf16(v_frag, p_frag, accs[qt])
+                accs[qt] = _wmma(v_frag, p_frag, accs[qt])
         for qt in range(R):
             out_list[qt][dt] = accs[qt]
     return out_list
@@ -702,18 +700,34 @@ def _core_attention(
             gqa_ratio=gqa_ratio,
             num_waves=NUM_WAVES,
             q_tiles_per_wave=WMMA_ROW_PER_WAVE,
+            elem_dtype=_ELEM_DTYPE,
         )
-        k_mgr = KManager16bV2(qk_hdim=qk_hdim, n_block=n_block, num_waves=NUM_WAVES)
-        v_mgr = VManager16bV2(v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES)
+        k_mgr = KManager16bV2(
+            qk_hdim=qk_hdim,
+            n_block=n_block,
+            num_waves=NUM_WAVES,
+            elem_dtype=_ELEM_DTYPE,
+        )
+        v_mgr = VManager16bV2(
+            v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES, elem_dtype=_ELEM_DTYPE
+        )
     else:
         q_mgr = QManager16bV1(
             qk_hdim=qk_hdim,
             gqa_ratio=gqa_ratio,
             num_waves=NUM_WAVES,
             q_tiles_per_wave=WMMA_ROW_PER_WAVE,
+            elem_dtype=_ELEM_DTYPE,
         )
-        k_mgr = KManager16bV1(qk_hdim=qk_hdim, n_block=n_block, num_waves=NUM_WAVES)
-        v_mgr = VManager16bV1(v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES)
+        k_mgr = KManager16bV1(
+            qk_hdim=qk_hdim,
+            n_block=n_block,
+            num_waves=NUM_WAVES,
+            elem_dtype=_ELEM_DTYPE,
+        )
+        v_mgr = VManager16bV1(
+            v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES, elem_dtype=_ELEM_DTYPE
+        )
     k_blk_bytes = max(k_mgr.get_lds_size_in_byte(), MIN_KV_BLK_BYTES)
     v_blk_bytes = max(v_mgr.get_lds_size_in_byte(), MIN_KV_BLK_BYTES)
     slot_bytes = max(k_blk_bytes + v_blk_bytes, q_mgr.get_lds_size_in_byte())
@@ -1259,6 +1273,7 @@ def _core_attention(
         gqa_ratio=gqa_ratio,
         num_waves=NUM_WAVES,
         q_tiles_per_wave=R,
+        elem_dtype=_ELEM_DTYPE,
     )
     assert (
         o_mgr.get_lds_size_in_byte() <= slot_bytes
@@ -1377,7 +1392,7 @@ def _zero_fill_attention(
     o_rsrc = buffer_ops.create_buffer_resource(
         ptr_O, num_records_bytes=o_num_records_bytes
     )
-    zero_o = fx.Vector.filled(_CH, 0.0, fx.BFloat16)
+    zero_o = fx.Vector.filled(_CH, 0.0, _ELEM_DTYPE)
     for r in range(BLOCK_M * cpr // BLOCK_SIZE):
         cix = fx.Int32(r * BLOCK_SIZE) + tid  # flat b128-chunk index this round
         prow = row0 + cix // fx.Int32(cpr)
@@ -1440,7 +1455,11 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
     assert (
         qk_hdim in SUPPORTED_QK_HDIM and v_hdim == 128
     ), f"supports qk_hdim in {SUPPORTED_QK_HDIM} with v_hdim==128, got {qk_hdim}/{v_hdim}"
-    assert dtype_str == "bf16", f"v1 supports bf16 only, got {dtype_str!r}"
+    assert (
+        dtype_str in _DTYPE_MAP
+    ), f"dtype_str must be in {list(_DTYPE_MAP)}, got {dtype_str!r}"
+    global _ELEM_DTYPE
+    _ELEM_DTYPE = _DTYPE_MAP[dtype_str]
     assert gqa_ratio >= 1, f"gqa_ratio must be >= 1, got {gqa_ratio}"
     assert (
         n_block in N_BLOCK_CHOICES
@@ -1691,6 +1710,7 @@ def _ensure_thd_kernel(
     has_sink: bool,
     gqa_ratio: int,
     qk_hdim: int = DEFAULT_QK_HDIM,
+    dtype_str: str = DEFAULT_DTYPE,
 ):
     key = (
         "thd",
@@ -1700,6 +1720,7 @@ def _ensure_thd_kernel(
         bool(has_sink),
         int(gqa_ratio),
         int(qk_hdim),
+        str(dtype_str),
     )
     if key in _launch_fns:
         return
@@ -1711,6 +1732,7 @@ def _ensure_thd_kernel(
         return_lse=return_lse,
         has_sink=has_sink,
         gqa_ratio=gqa_ratio,
+        dtype_str=dtype_str,
     )
 
     @flyc.jit
@@ -1800,6 +1822,7 @@ def _ensure_bshd_kernel(
     has_sink: bool,
     gqa_ratio: int,
     qk_hdim: int = DEFAULT_QK_HDIM,
+    dtype_str: str = DEFAULT_DTYPE,
 ):
     key = (
         "bshd",
@@ -1809,6 +1832,7 @@ def _ensure_bshd_kernel(
         bool(has_sink),
         int(gqa_ratio),
         int(qk_hdim),
+        str(dtype_str),
     )
     if key in _launch_fns:
         return
@@ -1820,6 +1844,7 @@ def _ensure_bshd_kernel(
         return_lse=return_lse,
         has_sink=has_sink,
         gqa_ratio=gqa_ratio,
+        dtype_str=dtype_str,
     )
 
     @flyc.jit
@@ -1916,7 +1941,7 @@ def flash_attn_varlen_m32x8(
     sink=None,
     lse=None,
 ):
-    """Host entry — varlen THD, qk_hdim in {128,192,256} / v_hdim=128, bf16.
+    """Host entry — varlen THD, qk_hdim in {128,192,256} / v_hdim=128, bf16 or fp16.
 
     ``window_size`` (optional): ``(left, right)`` sliding-window bounds. ``-1`` =
     infinite on that side; ``(-1, -1)`` = full attention. ``causal`` forces
@@ -1931,7 +1956,11 @@ def flash_attn_varlen_m32x8(
     ``lse`` (optional): caller-provided ``[total_q, nheads_q]`` fp32 output buffer,
     used only when ``return_lse``; allocated here when ``return_lse`` and None.
     """
-    assert q.dtype == torch.bfloat16, f"Expected bf16, got {q.dtype}"
+    assert q.dtype in _TORCH_DTYPE_MAP.values(), f"Expected bf16 or fp16, got {q.dtype}"
+    assert (
+        k.dtype == q.dtype and v.dtype == q.dtype
+    ), f"q/k/v dtype must match, got {q.dtype}/{k.dtype}/{v.dtype}"
+    dtype_str = "bf16" if q.dtype == torch.bfloat16 else "fp16"
     qk_hdim = q.shape[-1]
     assert (
         qk_hdim in SUPPORTED_QK_HDIM
@@ -1971,7 +2000,7 @@ def flash_attn_varlen_m32x8(
 
     if out is None:
         out = torch.empty(
-            (total_q_tokens, nheads_q, 128), dtype=torch.bfloat16, device=q.device
+            (total_q_tokens, nheads_q, 128), dtype=q.dtype, device=q.device
         )
     if return_lse:
         if lse is None:
@@ -1997,12 +2026,27 @@ def flash_attn_varlen_m32x8(
     stride_o_head = out.stride(1)
 
     _ensure_thd_kernel(
-        mask_left, mask_right, bool(return_lse), has_sink, gqa, qk_hdim=qk_hdim
+        mask_left,
+        mask_right,
+        bool(return_lse),
+        has_sink,
+        gqa,
+        qk_hdim=qk_hdim,
+        dtype_str=dtype_str,
     )
 
     _run_compiled(
         _launch_fns[
-            ("thd", mask_left, mask_right, bool(return_lse), has_sink, gqa, qk_hdim)
+            (
+                "thd",
+                mask_left,
+                mask_right,
+                bool(return_lse),
+                has_sink,
+                gqa,
+                qk_hdim,
+                dtype_str,
+            )
         ],
         out,
         q,
@@ -2049,7 +2093,7 @@ def flash_attn_batch_m32x8(
     sink=None,
     lse=None,
 ):
-    """Host entry — batched BSHD ``[B, S, H, D]``, qk_hdim in {128,192,256} / v_hdim=128, bf16.
+    """Host entry — batched BSHD ``[B, S, H, D]``, qk_hdim in {128,192,256} / v_hdim=128, bf16 or fp16.
 
     Uses the dedicated BSHD kernel with a uniform ``seq_len`` scalar (no
     cu_seqlens), so there is nothing transient to bake into a CUDA graph.
@@ -2066,7 +2110,11 @@ def flash_attn_batch_m32x8(
     ``lse`` (optional): caller-provided ``[B, nheads_q, S_q]`` fp32 output buffer,
     used only when ``return_lse``; allocated here when ``return_lse`` and None.
     """
-    assert q.dtype == torch.bfloat16, f"Expected bf16, got {q.dtype}"
+    assert q.dtype in _TORCH_DTYPE_MAP.values(), f"Expected bf16 or fp16, got {q.dtype}"
+    assert (
+        k.dtype == q.dtype and v.dtype == q.dtype
+    ), f"q/k/v dtype must match, got {q.dtype}/{k.dtype}/{v.dtype}"
+    dtype_str = "bf16" if q.dtype == torch.bfloat16 else "fp16"
     assert q.dim() == 4, f"Expected 4D BSHD tensor, got rank {q.dim()}"
     qk_hdim = q.shape[-1]
     assert (
@@ -2106,7 +2154,7 @@ def flash_attn_batch_m32x8(
 
     if out is None:
         out = torch.empty(
-            (batch, seq_len_q, nheads_q, 128), dtype=torch.bfloat16, device=q.device
+            (batch, seq_len_q, nheads_q, 128), dtype=q.dtype, device=q.device
         )
     if return_lse:
         if lse is None:
@@ -2153,12 +2201,27 @@ def flash_attn_batch_m32x8(
     stride_o_head = out.stride(2)
 
     _ensure_bshd_kernel(
-        mask_left, mask_right, bool(return_lse), has_sink, gqa, qk_hdim=qk_hdim
+        mask_left,
+        mask_right,
+        bool(return_lse),
+        has_sink,
+        gqa,
+        qk_hdim=qk_hdim,
+        dtype_str=dtype_str,
     )
 
     _run_compiled(
         _launch_fns[
-            ("bshd", mask_left, mask_right, bool(return_lse), has_sink, gqa, qk_hdim)
+            (
+                "bshd",
+                mask_left,
+                mask_right,
+                bool(return_lse),
+                has_sink,
+                gqa,
+                qk_hdim,
+                dtype_str,
+            )
         ],
         out,
         q,

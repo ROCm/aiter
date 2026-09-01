@@ -256,7 +256,10 @@ def flydsl_flash_attn_varlen_func(
     # sibling is full/causal only. So under experimental the sibling is the 192 A/B
     # fallback ONLY for plain full/causal — a sink or finite window on 192 stays on ours.
     _needs_m32x8 = sink is not None or tuple(window_size[:2]) != (-1, -1)
-    _use_sibling = qk_hdim == 192 and exp and not _needs_m32x8
+    # Sibling d192 is bf16-only; fp16 at 192 always takes ours.
+    _use_sibling = (
+        qk_hdim == 192 and exp and not _needs_m32x8 and q.dtype == torch.bfloat16
+    )
     _use_fdsl_wave8_fmha = (
         qk_hdim == 128
         or (qk_hdim == 192 and not _use_sibling)
@@ -277,9 +280,9 @@ def flydsl_flash_attn_varlen_func(
         and (_use_fdsl_wave8_fmha or _use_sibling)
         and v.shape[-1] == 128
         and k.shape[-1] == qk_hdim
-        and q.dtype == torch.bfloat16
-        and k.dtype == torch.bfloat16
-        and v.dtype == torch.bfloat16
+        and q.dtype in (torch.bfloat16, torch.float16)
+        and k.dtype == q.dtype
+        and v.dtype == q.dtype
         and _nkv > 0
         and _nq % _nkv == 0
         and dropout_p == 0.0
@@ -373,9 +376,9 @@ def flydsl_flash_attn_batch_func(
         and (qk_hdim in (128, 192) or (qk_hdim == 256 and is_experimental_enabled()))
         and v.shape[-1] == 128
         and k.shape[-1] == qk_hdim
-        and q.dtype == torch.bfloat16
-        and k.dtype == torch.bfloat16
-        and v.dtype == torch.bfloat16
+        and q.dtype in (torch.bfloat16, torch.float16)
+        and k.dtype == q.dtype
+        and v.dtype == q.dtype
         and _nkv > 0
         and _nq % _nkv == 0
         and _sink_ok

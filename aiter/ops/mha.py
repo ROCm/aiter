@@ -2836,7 +2836,7 @@ def flash_attn_func(
     if (
         cu_seqlens_q is None
         and cu_seqlens_kv is None
-        and num_splits == 0
+        and num_splits <= 1
         and (len(window_size) < 3 or window_size[2] == 0)
     ):
         from .flydsl.fmha_kernels import flydsl_flash_attn_batch_func
