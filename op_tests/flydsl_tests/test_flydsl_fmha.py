@@ -739,6 +739,16 @@ def test_flydsl_fmha_softmax_scale():
         )
 
 
+@pytest.mark.parametrize(
+    "softmax_scale", [0.0, -0.125, float("inf"), float("-inf"), float("nan")]
+)
+def test_flydsl_fmha_invalid_softmax_scale_raises(softmax_scale):
+    """Non-positive and non-finite scales fail before kernel compilation."""
+    q, k, v = _make_qkv(1, 128, 2, 128, torch.bfloat16)
+    with pytest.raises(ValueError, match="softmax_scale must be finite and positive"):
+        flydsl_flash_attn_func(q, k, v, causal=False, softmax_scale=softmax_scale)
+
+
 def test_flydsl_fmha_out_buffer():
     """Preallocated ``out=`` buffer is written in place and returned.
 

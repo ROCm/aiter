@@ -16,7 +16,7 @@ scatter store overhead negates read savings at BN=32. Row-major V with
 software-pipelined scalar reads is faster.
 
 Note: V pre-transpose (scatter store to col-major LDS, vec8 GEMM2 read) was
-tested but the extra scalar stores per thread during coop_store_v regress
+tested but the extra scalar stores per thread during coop_store_v regressed
 versus the row-major layout.
 
 WMMA 16x16x16 register layout (wave32):
@@ -204,7 +204,7 @@ def build_flash_attn_func_module(
         Q: fx.Pointer,
         K: fx.Pointer,
         V: fx.Pointer,
-        O: fx.Pointer,  # noqa: E741 - kernel ABI uses Q/K/V/O tensor names
+        O: fx.Pointer,
         seq_len: fx.Int32,
         seq_len_real: fx.Int32,
         seq_len_kv: fx.Int32,
@@ -572,7 +572,7 @@ def build_flash_attn_func_module(
         Q: fx.Pointer,
         K: fx.Pointer,
         V: fx.Pointer,
-        O: fx.Pointer,  # noqa: E741 - kernel ABI uses Q/K/V/O tensor names
+        O: fx.Pointer,
         batch_size: fx.Int32,
         seq_len: fx.Int32,
         seq_len_real: fx.Int32,
@@ -615,7 +615,7 @@ def build_flash_attn_func_module(
         Q,
         K,
         V,
-        O,  # noqa: E741 - kernel ABI uses Q/K/V/O tensor names
+        O,
         batch_size,
         seq_len,
         seq_len_real,

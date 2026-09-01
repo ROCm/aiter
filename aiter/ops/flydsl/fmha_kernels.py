@@ -28,6 +28,7 @@ Public entry point ``flydsl_flash_attn_func`` wraps the FlyDSL
 
 from __future__ import annotations
 
+import math
 from functools import lru_cache
 
 import torch
@@ -540,6 +541,10 @@ def flydsl_flash_attn_func(
             raise TypeError(
                 f"softmax_scale must be convertible to float, got {softmax_scale!r}"
             ) from exc
+        if not math.isfinite(softmax_scale) or softmax_scale <= 0.0:
+            raise ValueError(
+                "softmax_scale must be finite and positive, " f"got {softmax_scale!r}"
+            )
 
     block_m, block_n = _pick_tiles(seq_q_real, head_dim)
 
