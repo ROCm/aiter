@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+
 """Device-side TILE_MAP prep for skew jdbba launches.
 
 Builds a group-major list of ``(group_id, m_tile_idx, seq_start, seq_end)``
