@@ -268,15 +268,15 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
     return Out
 
 
-_NAME_SUFFIX_RE = (
+NAME_SUFFIX_RE = (
     r"t(?P<tile_m>\d+)x(?P<tile_n>\d+)x(?P<tile_k>\d+)_"
     r"mw(?P<m_warp>\d+)_nw(?P<n_warp>\d+)_"
     r"nb(?P<num_buffers>\d+)_sk(?P<split_k>\d+)_"
     r"cm(?P<cluster_m>\d+)_cn(?P<cluster_n>\d+)$"
 )
-_KERNEL_NAME_RE = re.compile(rf"^{re.escape(WMMA_NAME_PREFIX)}_{_NAME_SUFFIX_RE}")
+_KERNEL_NAME_RE = re.compile(rf"^{re.escape(WMMA_NAME_PREFIX)}_{NAME_SUFFIX_RE}")
 _COMPUTE_KERNEL_NAME_RE = re.compile(
-    rf"^{re.escape(COMPUTE_WMMA_NAME_PREFIX)}_{_NAME_SUFFIX_RE}"
+    rf"^{re.escape(COMPUTE_WMMA_NAME_PREFIX)}_{NAME_SUFFIX_RE}"
 )
 
 
