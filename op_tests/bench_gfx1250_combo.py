@@ -31,7 +31,6 @@ Run from the aiter repo root so `op_tests/` siblings import cleanly:
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops mla_v4_decode   # sparse MLA v4 decode
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops inverse_rope  # inverse RoPE + group quant
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops mla_v4_prefill  # MLA v4 prefill
-    python op_tests/bench_gfx1250_combo.py --dsv4 --ops mla_v4_prefill_fp8  # FP8 MLA v4 prefill
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops mhc       # mHC fused RMSNorm
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops qk_norm   # QK norm + RoPE
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops score_qk  # FP8 paged MQA logits
@@ -63,12 +62,13 @@ same thing to every op:
                     _MEGA_MOE_TOKENS.
     a8w8_blockscale 1024..65536. Below 1024 it walks into a UT bug; see the
                     note in DSV4_OPS.
-    mla_v4_prefill  1024 only. Larger n faults in the kernel.
+    mla_v4_prefill  1024..16384, the DSv4 prefill chunk. 65536 faults; see
+                    _MLA_PREFILL_TOKENS.
 
-With the variable unset, the child-UT ops (score_qk, a8w8_blockscale,
-mla_v4_prefill_fp8) pass no shape flag at all, so each UT sweeps the range its
-owner maintains. The in-process ops (moe, a16w16, mha, mla_v4_prefill) iterate
-shapes here and take their default from the module.
+With the variable unset, the child-UT ops (score_qk, a8w8_blockscale) pass no
+shape flag at all, so each UT sweeps the range its owner maintains. The
+in-process ops (moe, a16w16, mha, mla_v4_prefill) iterate shapes here and take
+their default from the module.
 
 Other variables:
 
@@ -137,18 +137,20 @@ step scans -- input + output/2 -- after CSA's 4x KV compression:
 The DSv4 ``mla_v4_decode`` op runs sparse decode with GQA/H=128, batch=512 and
 q_seq=1 (M=512), sweeping KV lengths 256/512/1024 and split counts 1/2/4.
 
-The DSv4 ``mla_v4_prefill`` op runs four FP8 performance cases at M=16384,
-H=128 and D=512: compressed prefix-pool rows 4096/16384 crossed with
-dense/sparse CSR modes. The current 16K-token chunk remains uncompressed:
+The DSv4 ``mla_v4_prefill`` op runs eight performance cases at H=128 and
+D=512: compressed prefix-pool rows 4096/16384, crossed with dense/sparse CSR
+modes, crossed with fp8/bf16. The current chunk remains uncompressed:
 
     python3 op_tests/test_pa_sparse_prefill.py \
-      -n 16384 --h_q 128 -d 512 \
-      --total_pages 4096 16384 --total_tokens 16384 \
-      --prec fp8 --mode dense sparse --no-verify
+      -n <token sweep> --h_q 128 -d 512 \
+      --total_pages 4096 16384 --total_tokens <token sweep> \
+      --prec fp8 bf16 --mode dense sparse --no-verify
 
-The separate ``mla_v4_prefill_fp8`` op runs:
-
-    PYTHONPATH=. python3 op_tests/test_pa_sparse_prefill.py
+The UT compares the backends it has for each precision -- opus and asm on fp8,
+opus and triton on bf16 -- so one run covers both precisions and all three
+backends. There is no nnz axis to sweep: the CSR is generated from --mode
+(sparse draws a random nnz per row, dense fills every row) under --seed, so
+nnz is an outcome, not an input.
 
 The ``inverse_rope`` op runs the tp1 attention-output shape (-b is
 (n_local_heads, n_local_groups); 128,16 is V4-Pro at dp/tp1):
@@ -348,24 +350,22 @@ _A8W8_BLOCKSCALE_TOKENS = _tokens((1024, 2048, 4096, 8192, 16384, 65536))
 # count; past 1024 it stops being a shape the model runs, hence its own default
 # rather than _TOKENS. AITER_BENCH_TOKENS overrides it like everywhere else.
 _MLA_DECODE_TOKENS = _tokens((1, 16, 32, 64, 128, 256, 512, 1024))
-# Pinned to the one n that has never faulted. Measured on gfx1250 / 20260827
-# with --no-verify on, so no reference is involved:
-#   1024   3/3 pass
-#   2048   2/3 fault  <- intermittent, not a shape rule
-#   4096   1/1 fault
-#   8192   1/1 fault
-#   16384  3/3 fault
-#   65536  1/1 fault
-# Only 16384 is reproducibly dead; the middle tiers have too few observations to
-# tell an intermittent fault from a deterministic one. 16384 is the DSv4 prefill
-# chunk and is what this op exists to measure, so this is coverage lost to a
-# kernel bug, not a shape the model does not run. Restore the list once the
-# fault is fixed. AITER_BENCH_TOKENS still overrides, for re-checking.
-_MLA_PREFILL_TOKENS = _tokens((1024,))
-# Unset by default so the UT keeps its own -n ([512, 1024, 2048, 4096]).
-_MLA_PREFILL_FP8_TOKENS = _tokens()
-# UT default minus 8192, the one value that faults. See run_mla_v4_prefill_fp8.
-_MLA_PREFILL_FP8_NNZ = (256, 1024, 4096, 16384)
+# Up to 16384, the DSv4 prefill chunk. Re-measured on the #5084 UT (20260901,
+# b45-2), one process per tier, all with the --no-verify below:
+#   1024 .. 16384  clean, no coredump   (4096/8192/16384 faulted on the old UT)
+#   65536          Memory access fault, and an 89 GB coredump with it
+# 65536 stays out: it is past the chunk size the model prefills, and one fault
+# costs a third of the host's free disk. Its fault also looks unrelated to the
+# others -- address 0x7f2ddbec0000, a mapped high address, where the old UT's
+# faults were low wild pointers like 0xc00000.
+#
+# "Clean" here means the kernel did not fault, NOT that it computed correctly.
+# Correctness cannot be checked on gfx1250 at all right now: drop --no-verify
+# and even n=1024 dies at the first case (fp8/dense, fault at 0x43000), so the
+# reference or the comparison is what breaks, not the kernel under test. Until
+# that is fixed these are timings from an unverified kernel -- the same footing
+# as a16w16's M=65536 rows before _A16W16_MAX_ERR caught them.
+_MLA_PREFILL_TOKENS = _tokens((1024, 2048, 4096, 8192, 16384))
 # Default stops at 2048: tokens/rank=65536 dies in pipe.setup() building the
 # symmetric arena -- cco sizes it from Communicator.DEFAULT_PER_RANK_VMM (4 GiB)
 # and asks for 7.5 GB. That is a per_rank_vmm the UT never passes, not something
@@ -785,22 +785,30 @@ def _space_table(header_col):
     Emitted as the UT formatted it rather than rebuilt as markdown: pandas
     writes multi-word column names ("opus us", "asm TFLOPS"), so the header
     splits into 33 words against 21 data fields and cannot be mapped back to
-    columns. A column name also appears in the UT's argument echo
-    ("nnz_prefix = 256,"), so require the next line to look like data.
+    columns. A column name also appears in a UT's argument echo
+    ("total_tokens = 1024,"), so require the next line to look like data.
+
+    "Looks like data" counts numeric fields rather than testing the first one:
+    the sparse-prefill table leads with prec/mode (bf16, dense), so a
+    first-field test drops the whole table. An argument echo carries one
+    number, a data row carries most of a row of them.
     """
+
+    def is_data(fields):
+        return sum(1 for f in fields if _isnum(f)) >= 4
 
     def extract(lines):
         for i, line in enumerate(lines):
             if header_col not in line.split() or i + 1 >= len(lines):
                 continue
             first = lines[i + 1].split()
-            if not first or not _isnum(first[0]):
+            if not first or not is_data(first):
                 continue
             width = len(first)
             out = [line]
             for follower in lines[i + 1 :]:
                 fields = follower.split()
-                if len(fields) != width or not _isnum(fields[0]):
+                if len(fields) != width or not is_data(fields):
                     break
                 out.append(follower)
             return out
@@ -1606,11 +1614,6 @@ def run_mla_v4_prefill(_args):
                 "dense",
                 "sparse",
                 "--no-verify",
-                # Empty the nnz list: the UT runs the mode/total_pages sweep and
-                # the explicit-nnz sweep independently, and the latter is exactly
-                # what mla_v4_prefill_fp8 covers. Left on, every M repeats those
-                # five cases for nothing.
-                "--nnz-prefix",
             ],
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             # Not _table_row: the UT has no "latency_us" column (it prints
@@ -1619,39 +1622,6 @@ def run_mla_v4_prefill(_args):
             # as data, and dropped the real header, which starts with "n".
             extract=_space_table("total_pages"),
         )
-
-
-def run_mla_v4_prefill_fp8(_args):
-    """Run the default gfx1250 MLA v4 sparse-prefill FP8 sweep."""
-    env = os.environ.copy()
-    env["PYTHONPATH"] = "."
-    # Keep the UT's own -n default ([512, 1024, 2048, 4096]).
-    #
-    # --nnz-prefix drops 8192 from the UT's default [256, 1024, 4096, 8192,
-    # 16384]. 256/1024/4096/16384 all pass, so this is one bad point, not a size
-    # limit -- and the kernel is not what breaks: at (n=2048, nnz_prefix=8192)
-    # the run faults with verify on and passes with --no-verify, reporting
-    # 2040 TFLOPS. It is the reference or the comparison that dies. Dropped here
-    # anyway because this op runs the UT bare, where verify is on, and the UT
-    # prints its table only at the very end, so the fault costs every shape that
-    # already ran.
-    _run_child(
-        "mla_v4 prefill FP8 (sparse-prefill default sweep)",
-        [
-            sys.executable,
-            "op_tests/test_pa_sparse_prefill.py",
-            *(
-                ["-n", *map(str, _MLA_PREFILL_FP8_TOKENS)]
-                if _MLA_PREFILL_FP8_TOKENS
-                else []
-            ),
-            "--nnz-prefix",
-            *map(str, _MLA_PREFILL_FP8_NNZ),
-        ],
-        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        env=env,
-        extract=_space_table("nnz_prefix"),
-    )
 
 
 OPS = {
@@ -1664,7 +1634,6 @@ OPS = {
     "mla_v4_decode": run_mla_v4_decode,
     "inverse_rope": run_inverse_rope,
     "mla_v4_prefill": run_mla_v4_prefill,
-    "mla_v4_prefill_fp8": run_mla_v4_prefill_fp8,
     "mhc": run_mhc,
     "qk_norm": run_qk_norm,
     "score_qk": run_score_qk,
@@ -1745,7 +1714,6 @@ DSV4_OPS = [
     "mla_v4_decode",
     "inverse_rope",
     "mla_v4_prefill",
-    "mla_v4_prefill_fp8",
     "mhc",
     "qk_norm",
     "score_qk",
