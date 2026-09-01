@@ -1,5 +1,9 @@
 // Host entry for the fused MoE routing kernel (module_fused_moe_router).
 
+#include <algorithm>
+#include <climits>
+#include <cstdlib>
+
 #include <torch/extension.h>
 #include <hip/hip_runtime.h>
 #include <ATen/hip/HIPContext.h>
