@@ -141,7 +141,7 @@ class ValidatorFixture:
             "def amdsmi_init(): pass\n"
             "def amdsmi_shut_down(): pass\n"
             "def amdsmi_get_processor_handles(): return ['gpu0']\n"
-            "def amdsmi_get_gpu_enumeration_info(handle): return {'hip_id': 7}\n"
+            "def amdsmi_get_gpu_enumeration_info(handle): return {'hip_id': 57}\n"
             "def amdsmi_get_gpu_asic_info(handle):\n"
             "    return {'market_name': 'Synthetic GPU', "
             "'target_graphics_version': 'gfx-test'}\n"
@@ -151,7 +151,11 @@ class ValidatorFixture:
             "    return {'vram_used': 256, 'vram_total': 294912}\n"
         )
         self.picker = self.tools / "pick-idle-gpu.py"
-        write_executable(self.picker, "#!/usr/bin/env bash\nprintf '7\\n'\n")
+        # 57 is deliberately NOT a real device index on any host this suite runs on. The
+        # validator locks /tmp/gpu-<index>.lock for whatever index it claims, so a fixture
+        # that named a real GPU would contend with anything genuinely using that device --
+        # and report NO_GPU for a reason that has nothing to do with the code under test.
+        write_executable(self.picker, "#!/usr/bin/env bash\nprintf '57\\n'\n")
 
     def close(self):
         self.tempdir.cleanup()
@@ -212,15 +216,23 @@ class ValidatorFixture:
         shape_env="VALIDATOR_TEST_GRID",
         shape_arg=None,
         shape_argnames=None,
+        shape_vars="M,N,dtype_str",
+        tol_table="f32=1e-5,f16=2e-3,bf16=1e-2",
         use_picker_env=True,
+        cwd=None,
     ):
         report = self.root / f"{patch.stem}-report.json"
+        # `cwd` exists for one reason: the validator has to accept RELATIVE --patch/--out from
+        # whatever directory the caller happens to be in. Passing them absolute, as every other
+        # test does, cannot see a path resolved against the wrong base.
+        patch_arg = os.path.relpath(patch, cwd) if cwd else str(patch)
+        report_arg = os.path.relpath(report, cwd) if cwd else str(report)
         command = [
             str(VALIDATOR),
             "--repo",
             str(self.repo),
             "--patch",
-            str(patch),
+            patch_arg,
             "--head-sha",
             "b" * 40,
             "--target",
@@ -228,13 +240,13 @@ class ValidatorFixture:
             "--expected-route",
             expected_route,
             "--shape-vars",
-            "M,N,dtype_str",
+            shape_vars,
             "--tol-table",
-            "f32=1e-5,f16=2e-3,bf16=1e-2",
+            tol_table,
             "--label",
             patch.stem,
             "--out",
-            str(report),
+            report_arg,
         ]
         if grid:
             if shape_env:
@@ -259,7 +271,7 @@ class ValidatorFixture:
             environment["PYLIB"] = str(pylib)
         if path_prefix:
             environment["PATH"] = f"{path_prefix}:{environment['PATH']}"
-        result = run(command, env=environment, check=False)
+        result = run(command, env=environment, cwd=cwd, check=False)
         if not report.exists():
             raise AssertionError(
                 f"validator did not write a report\nstdout:\n{result.stdout}\n"
@@ -747,6 +759,89 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertEqual("skip", report["stages"]["baseline_control"]["status"])
         self.assertEqual("skip", report["stages"]["correctness_repo_tests"]["status"])
 
+    def test_relative_patch_path_is_not_a_merge_failure(self):
+        """A relative --patch is an invocation detail, not a defect in the PR.
+
+        The path was read from the caller's cwd for the readability check and then handed to
+        `git -C "$REPO_WT" apply`, which resolves it against the WORKTREE. The mismatch
+        surfaced as `merge_sim: patch does not apply to the recorded base` -- a BLOCK verdict
+        published against an author whose patch applies perfectly.
+        """
+        patch = self.fixture.make_patch(self.harmless_change, "relative-patch.patch")
+        # Run from a directory that is neither the repo nor the worktree, with --patch and
+        # --out given relative to it. Nested TWO levels deep on purpose: from one level the
+        # relative path happens to resolve to the same file against the worktree as against
+        # the caller, and the bug is invisible.
+        elsewhere = self.fixture.root / "caller" / "cwd"
+        elsewhere.mkdir(parents=True)
+
+        _, report = self.fixture.validate(patch, cwd=elsewhere)
+
+        merge = report["stages"]["merge_sim"]
+        self.assertEqual("pass", merge["status"])
+        self.assertFalse(
+            [
+                item
+                for item in report["findings"]
+                if item["stage"] == "merge_sim" and item["severity"] == "blocker"
+            ]
+        )
+
+    def test_tol_table_reports_a_tolerance_above_the_loosest_reference(self):
+        """--tol-table was parsed, validated, published -- and compared against nothing.
+
+        The added `rtol = 5e-2` loosens nothing (it is a new assertion, not a widened one), so
+        the `loosened` check stays silent. It is nonetheless above every reference tolerance
+        the caller declared, which is the fact the flag exists to surface: a kernel defect
+        smaller than that gap cannot turn this suite red.
+        """
+
+        def add_loose_tolerance(repo):
+            path = repo / "tests" / "test_sample.py"
+            path.write_text(
+                path.read_text().replace(
+                    "    atol = 1e-5\n",
+                    "    atol = 1e-5\n    rtol = 5e-2\n",
+                )
+            )
+
+        patch = self.fixture.make_patch(add_loose_tolerance, "tol-exceeds.patch")
+
+        _, report = self.fixture.validate(patch)
+
+        policy = report["stages"]["test_policy"]
+        self.assertEqual([0.05], policy["exceeds_reference"])
+        # No tolerance was WIDENED, so the older check must stay quiet -- the two findings are
+        # about different things and one must not stand in for the other.
+        self.assertNotIn("loosened", policy)
+        findings = [
+            item
+            for item in report["findings"]
+            if item["stage"] == "test_policy" and item["severity"] == "should-fix"
+        ]
+        self.assertEqual(1, len(findings))
+        self.assertIn("loosest reference tolerance", findings[0]["detail"])
+
+    def test_tol_table_is_silent_when_every_tolerance_is_within_reference(self):
+        """The other half of the contract: the field is recorded even when empty.
+
+        An absent key and an empty list read the same to a consumer that uses `.get`, so the
+        comparison has to be visible as having been made and found nothing.
+        """
+        patch = self.fixture.make_patch(self.harmless_change, "tol-within.patch")
+
+        _, report = self.fixture.validate(patch)
+
+        policy = report["stages"]["test_policy"]
+        self.assertEqual([], policy["exceeds_reference"])
+        self.assertFalse(
+            [
+                item
+                for item in report["findings"]
+                if item["stage"] == "test_policy" and item["severity"] == "should-fix"
+            ]
+        )
+
     def test_existing_ignored_artifact_rejects_nonisolated_worktree(self):
         (self.fixture.repo / ".gitignore").write_text("ignored-cache/\n")
         run(["git", "add", ".gitignore"], cwd=self.fixture.repo)
@@ -842,6 +937,209 @@ class GridChannelTests(unittest.TestCase):
             "def test_shapes(M, N, dtype_str):\n"
             "    run_kernel(M, N, dtype_str)\n"
         )
+
+    @staticmethod
+    def add_single_name_parametrized_target(repo):
+        """One shape parameter -- the dominant shape in the targets this channel exists for.
+
+        `run_kernel` requires an int so that the invalid-grid probe fails INSIDE the target:
+        the sentinel arrives as a string and the assertion is what rejects it.
+        """
+        (repo / "tests" / "test_one_name.py").write_text(
+            "import pytest\n"
+            "\n"
+            "def run_kernel(m):\n"
+            "    assert isinstance(m, int) and m > 0\n"
+            "\n"
+            '@pytest.mark.parametrize("m", [3])\n'
+            "def test_one_shape(m):\n"
+            "    run_kernel(m)\n"
+        )
+
+    @staticmethod
+    def add_target_with_an_unrelated_parametrize(repo):
+        """Two tests in one file: one the grid replaces, one it must not touch.
+
+        `test_unrelated` binds `m` together with `other`, so the grid cannot be substituted
+        into it without leaving `other` unfilled. Its assertion on its OWN values is what
+        proves the plugin left it alone.
+        """
+        (repo / "tests" / "test_two_marks.py").write_text(
+            "import pytest\n"
+            "\n"
+            "def run_kernel(m, n):\n"
+            "    assert isinstance(m, int) and isinstance(n, int)\n"
+            "    assert m > 0 and n > 0\n"
+            "\n"
+            '@pytest.mark.parametrize("m,n", [(3, 5)])\n'
+            "def test_shapes(m, n):\n"
+            "    run_kernel(m, n)\n"
+            "\n"
+            '@pytest.mark.parametrize("m,other", [(11, "keep")])\n'
+            "def test_unrelated(m, other):\n"
+            "    assert (m, other) == (11, 'keep')\n"
+        )
+
+    @staticmethod
+    def add_target_that_rejects_the_grid_after_the_route_ran(repo):
+        """The repository run reaches the route; the grid run dies before it.
+
+        The guard is on the TEST, ahead of the call, so the grid phase produces a receipt
+        that observed nothing while the repository phase produced one that proved the route.
+        """
+        (repo / "tests" / "test_late_grid.py").write_text(
+            "import pytest\n"
+            "\n"
+            "def run_kernel(m):\n"
+            "    assert m > 0\n"
+            "\n"
+            '@pytest.mark.parametrize("m", [3])\n'
+            "def test_shape(m):\n"
+            '    assert m < 100, "shape unsupported by this target"\n'
+            "    run_kernel(m)\n"
+        )
+
+    def test_single_shape_argname_is_delivered_and_not_published_as_a_defect(self):
+        """The most consequential regression of the batch.
+
+        The plugin unwrapped one-name rows to scalars but passed `argnames` as a LIST, and
+        pytest sets force_tuple only for a `str` argnames. Collection died with "object of
+        type 'int' has no len()", the grid run exited non-zero, and the executor published
+        that crash as `[blocker] the PR adds this target and its independent shape grid
+        fails` -- a BLOCK verdict against three real authors for a fault in the injector.
+        """
+        patch = self.fixture.make_patch(
+            self.add_single_name_parametrized_target, "one-name.patch"
+        )
+
+        _, report = self.fixture.validate(
+            patch,
+            tests="tests/test_one_name.py",
+            expected_route="test_one_name:run_kernel",
+            shape_env=None,
+            shape_argnames="m",
+            shape_vars="m",
+            grid_value="128;256",
+        )
+
+        self.assertEqual("pytest", report["test_selection"]["grid_channel"])
+        self.assertNotEqual("BLOCK", report["verdict"])
+        self.assertEqual(
+            [], [item for item in report["findings"] if item["severity"] == "blocker"]
+        )
+        grid_stage = report["stages"]["correctness_s1_grid"]
+        self.assertEqual("pass", grid_stage["status"])
+        # Both grid rows collected and ran -- not one collection error counted as a test.
+        self.assertEqual(2, grid_stage["stats"]["executed"])
+        # And the injected values, not the target's own literal 3, are what reached the route.
+        receipt = report["stages"]["execution_receipt"]
+        self.assertEqual("pass", receipt["status"])
+        self.assertEqual(["128", "256"], sorted(receipt["executed_shapes"]))
+
+    def test_an_unrelated_parametrize_does_not_disable_the_channel(self):
+        """The partial-overlap guard belongs to a test function, not to a file.
+
+        Evaluated file-wide, `test_unrelated`'s `(m, other)` mark -- which overlaps the
+        requested names without being contained in them -- switched the channel off for every
+        test in the file, and the skip text then blamed the target for taking parameters it
+        demonstrably takes. The plugin has always decided per metafunc; only the executor's
+        reachability probe was file-scoped.
+        """
+        patch = self.fixture.make_patch(
+            self.add_target_with_an_unrelated_parametrize, "two-marks.patch"
+        )
+
+        _, report = self.fixture.validate(
+            patch,
+            tests="tests/test_two_marks.py",
+            expected_route="test_two_marks:run_kernel",
+            shape_env=None,
+            shape_argnames="m,n",
+            shape_vars="m,n",
+            grid_value="128,7;256,9",
+        )
+
+        self.assertEqual("pytest", report["test_selection"]["grid_channel"])
+        self.assertEqual("", report["test_selection"]["grid_channel_reason"])
+        grid_stage = report["stages"]["correctness_s1_grid"]
+        self.assertEqual("pass", grid_stage["status"])
+        # Two grid rows for test_shapes plus the one unrelated case, which kept its own
+        # parametrization: it asserts (11, 'keep') and would have failed had the grid been
+        # substituted into it.
+        self.assertEqual(3, grid_stage["stats"]["executed"])
+        receipt = report["stages"]["execution_receipt"]
+        self.assertEqual(["128,7", "256,9"], sorted(receipt["executed_shapes"]))
+
+    def test_a_failed_grid_run_does_not_erase_the_repository_run_receipt(self):
+        """Receipts are per label, because evidence already collected must not be deleted.
+
+        `head-repo` and `head-grid` shared `$WORK/head/execution-receipt.json`. The grid run
+        starts by removing that path, so a grid phase that observed nothing overwrote a
+        receipt that had already proved the route, and the report then said the route never
+        executed -- an erasure reported as an absence.
+        """
+        patch = self.fixture.make_patch(
+            self.add_target_that_rejects_the_grid_after_the_route_ran,
+            "receipt-erasure.patch",
+        )
+
+        _, report = self.fixture.validate(
+            patch,
+            tests="tests/test_late_grid.py",
+            expected_route="test_late_grid:run_kernel",
+            shape_env=None,
+            shape_argnames="m",
+            shape_vars="m",
+            grid_value="128;256",
+        )
+
+        # The grid phase really did fail; that is the premise, not the thing under test.
+        self.assertEqual("fail", report["stages"]["correctness_s1_grid"]["status"])
+        receipt = report["stages"]["execution_receipt"]
+        self.assertEqual("pass", receipt["status"])
+        self.assertEqual("test_late_grid:run_kernel", receipt["route"])
+        # The receipt that speaks is the repository run's, which observed the route.
+        self.assertEqual(["3"], receipt["executed_shapes"])
+
+    def test_invalid_grid_probe_needs_a_passing_control_before_it_proves_anything(self):
+        """A non-zero probe exit is evidence about the GRID only if the target works without it.
+
+        On a held-out PR whose module could not be imported, the invalid-grid probe failed for
+        that reason and the channel was credited although no shape ever reached the kernel.
+        The break is planted on BASE, so the base control run is red before the grid is ever
+        involved.
+        """
+        path = self.fixture.repo / "tests" / "test_sample.py"
+        path.write_text(
+            "raise ImportError('the module under test cannot be imported')\n"
+            + path.read_text()
+        )
+        run(["git", "add", "-A"], cwd=self.fixture.repo)
+        run(
+            [
+                "git",
+                "-c",
+                "user.name=Validator Test",
+                "-c",
+                "user.email=validator@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "broken base",
+            ],
+            cwd=self.fixture.repo,
+        )
+        patch = self.fixture.make_patch(
+            ValidateKernelPrTests.harmless_change, "broken-control.patch"
+        )
+
+        _, report = self.fixture.validate(patch)
+
+        baseline_grid = report["stages"]["baseline_control"]["s1_grid"]
+        self.assertEqual("hook-not-consumed", baseline_grid["state"])
+        # No base grid run was attempted, so there is no exit code to report for one.
+        self.assertNotIn("exit", baseline_grid)
+        self.assertNotEqual("pass", report["stages"]["correctness_s1_grid"]["status"])
 
     def test_working_cli_channel_survives_a_second_shape_flag(self):
         """Supplying --shape-arg AND --shape-env must not discard the CLI channel.
@@ -1089,6 +1387,136 @@ class ProbeReceiptTests(unittest.TestCase):
         self.assertIn("makes no claim", result["shape_capture"]["note"])
 
 
+class EvidenceCheckerTests(unittest.TestCase):
+    """Unit-level checks on validate_evidence.py, where the report's numbers come from."""
+
+    RECEIPT = {
+        "schema_version": 1,
+        "producer": "validate-kernel-pr.validation_probe",
+        "route": "test_route:run_kernel",
+        "kernel_symbols": ["test_route:run_kernel"],
+        "executed_shapes": ["3,5"],
+        "shape_vars": ["m", "n"],
+        "pytest_exitstatus": 0,
+    }
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.directory = Path(self.tempdir.name)
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    def evidence(self, *arguments):
+        return json.loads(
+            run(
+                [sys.executable, str(SKILL_DIR / "validate_evidence.py"), *arguments]
+            ).stdout
+        )
+
+    def test_junit_errors_are_not_counted_as_executed_tests(self):
+        """An error is a collection or fixture failure: the test body never ran.
+
+        Counting it as executed let a target that could not even be imported credit
+        `arch_coverage` with RUNTIME coverage -- on the strength of an "executed test" that
+        was the collection error itself.
+        """
+        junit = self.directory / "junit.xml"
+        junit.write_text(
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<testsuites><testsuite name="pytest" errors="1" failures="0" '
+            'skipped="0" tests="1" time="0.01" /></testsuites>\n'
+        )
+
+        stats = self.evidence("pytest-stats", str(junit))
+
+        self.assertEqual(1, stats["tests"])
+        self.assertEqual(1, stats["errors"])
+        self.assertEqual(0, stats["executed"])
+
+    def test_pytest_channel_receipt_does_not_assert_across_namespaces(self):
+        """The grid is delivered as test PARAMETERS; the receipt records the ROUTE's locals.
+
+        Requiring one to contain the other produced "execution receipt is missing required
+        shapes" on a run whose every grid case passed. The requirement is still recorded and
+        the mismatch is named; only the cross-namespace containment assertion is dropped.
+        """
+        path = self.directory / "receipt.json"
+        path.write_text(json.dumps(self.RECEIPT))
+
+        result = self.evidence(
+            "receipt",
+            str(path),
+            "--expected-route",
+            "test_route:run_kernel",
+            "--grid",
+            "128,7;256,9",
+            "--grid-channel",
+            "pytest",
+        )
+
+        self.assertEqual("pass", result["status"])
+        # The grid's requirement is not discarded, only its containment assertion.
+        self.assertEqual(["128,7", "256,9"], result["required_shapes"])
+        self.assertEqual(["3,5"], result["executed_shapes"])
+        self.assertIn("different vocabularies", result["shape_namespace"])
+
+    def test_a_channel_that_shares_the_receipt_namespace_still_must_contain_the_grid(self):
+        """The control for the test above: without the pytest channel, nothing is relaxed.
+
+        The env and CLI channels put the grid into the same vocabulary the receipt records,
+        so a missing shape there is still a real gap in coverage.
+        """
+        path = self.directory / "receipt.json"
+        path.write_text(json.dumps(self.RECEIPT))
+
+        result = self.evidence(
+            "receipt",
+            str(path),
+            "--expected-route",
+            "test_route:run_kernel",
+            "--grid",
+            "128,7;256,9",
+            "--grid-channel",
+            "env",
+        )
+
+        self.assertEqual("skip", result["status"])
+        self.assertIn("missing required shapes", result["note"])
+
+    def test_empty_native_artifact_list_states_what_it_does_not_mean(self):
+        """`native_artifacts: []` was published as though it were a measurement.
+
+        The probe runs BEFORE the target and imports only the named module, so an empty list
+        describes that import and nothing else. Three real runs recorded it on a host where
+        the runtime demonstrably executed the kernel.
+        """
+        fixture = ValidatorFixture()
+        try:
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = str(fixture.repo)
+            identity = json.loads(
+                run(
+                    [
+                        sys.executable,
+                        str(SKILL_DIR / "validate_evidence.py"),
+                        "runtime",
+                        "aiter",
+                        str(fixture.repo),
+                    ],
+                    env=environment,
+                ).stdout
+            )
+        finally:
+            fixture.close()
+
+        self.assertEqual([], identity["native_artifacts"])
+        basis = identity["native_artifacts_basis"]
+        self.assertTrue(basis)
+        self.assertIn("aiter", basis)
+        self.assertIn("not evidence", basis)
+
+
 class IndexScannerTests(unittest.TestCase):
     def scan(self, diff_text, directory=None):
         with tempfile.TemporaryDirectory() as scratch:
@@ -1173,6 +1601,24 @@ class IndexScannerTests(unittest.TestCase):
             "    token_row = (offs_token // top_k).to(tl.int64)\n"
             "    a_ptrs = a_ptr + token_row[:, None] * stride_gm\n"
             "    return a_ptrs\n"
+        )
+
+        self.assertEqual([], payload["candidates"])
+        self.assertEqual(0, payload["index_stride_candidates"])
+
+    def test_flydsl_capitalised_widening_spelling_is_recognised(self):
+        """FlyDSL writes `fx.Int64(...)`; Triton writes `tl.int64`.
+
+        WIDEN_ATTRS was matched case-sensitively, so a kernel that had been explicitly widened
+        in FlyDSL's own spelling was reported as an unwidened overflow candidate -- the
+        scanner publishing its own vocabulary gap as a defect in the code. The list is a list
+        of widening FORMS, and how a form is capitalised is not part of what it does.
+        """
+        payload = self.scan_source(
+            "import flydsl as fx\n"
+            "\n"
+            "def kernel(base_ptr, offs, stride):\n"
+            "    return base_ptr + fx.Int64(offs) * stride\n"
         )
 
         self.assertEqual([], payload["candidates"])
@@ -1312,7 +1758,7 @@ class GpuPickerTests(unittest.TestCase):
         finally:
             fixture.close()
 
-        self.assertEqual("7", result.stdout.strip())
+        self.assertEqual("57", result.stdout.strip())
 
 
 class GpuClaimTests(unittest.TestCase):
@@ -1331,13 +1777,14 @@ class GpuClaimTests(unittest.TestCase):
         of the machine sat idle. The claim now walks the whole eligible ranking.
         """
         picker = self.fixture.tools / "ranking-picker"
-        # HIP 61 ranks first and is unavailable; 7 is the index the fake amdsmi can map.
+        # HIP 61 ranks first and is unavailable; 57 is the index the fake amdsmi can map.
+        # Both are deliberately fake indices, so this never contends with a real device.
         write_executable(
             picker,
             "#!/usr/bin/env bash\n"
             "printf 'idleness-basis: activity+vram\\n' >&2\n"
             'for arg in "$@"; do\n'
-            '  if [ "$arg" = "--all" ]; then printf \'61\\n7\\n\'; exit 0; fi\n'
+            '  if [ "$arg" = "--all" ]; then printf \'61\\n57\\n\'; exit 0; fi\n'
             "done\n"
             "printf '61\\n'\n",
         )
@@ -1359,7 +1806,7 @@ class GpuClaimTests(unittest.TestCase):
 
         claim = report["stages"]["gpu_claim"]
         self.assertEqual("pass", claim["status"])
-        self.assertEqual(7, claim["hip_index"])
+        self.assertEqual(57, claim["hip_index"])
         self.assertNotEqual("NO_GPU", report["degraded_mode"])
 
     def test_shipped_picker_wins_over_one_earlier_on_path(self):
@@ -1389,7 +1836,7 @@ class GpuClaimTests(unittest.TestCase):
 
         claim = report["stages"]["gpu_claim"]
         self.assertEqual("pass", claim["status"])
-        self.assertEqual(7, claim["hip_index"])
+        self.assertEqual(57, claim["hip_index"])
         self.assertEqual("activity+vram", claim["idleness_basis"])
 
 
