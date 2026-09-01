@@ -40,6 +40,20 @@ def _bound_names(mark):
     return [str(name) for name in argnames]
 
 
+def _values_are_scalar(mark):
+    if len(mark.args) < 2:
+        return False
+    values = mark.args[1]
+    if not isinstance(values, (list, tuple)) or not values:
+        return False
+    for row in values:
+        cells = row if isinstance(row, (list, tuple)) else [row]
+        for cell in cells:
+            if not isinstance(cell, (int, float, str, bool, type(None))):
+                return False
+    return True
+
+
 @pytest.hookimpl(tryfirst=True)
 def pytest_generate_tests(metafunc):
     names = list(_VALIDATION_SHAPE_ARGNAMES)
@@ -67,6 +81,12 @@ def pytest_generate_tests(metafunc):
             bound = set(_bound_names(mark))
             if bound & set(names):
                 if not bound <= set(names):
+                    return
+                if not _values_are_scalar(mark):
+                    # The target's own values are not scalar cells -- a dict or an object per
+                    # case. Substituting scalars makes the TARGET raise, and the executor
+                    # then reports that as the PR's shape grid failing. Refuse, so the stage
+                    # abstains instead of blaming the author.
                     return
                 continue
         kept.append(mark)

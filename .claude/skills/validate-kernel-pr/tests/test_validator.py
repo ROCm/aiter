@@ -1840,6 +1840,58 @@ class GpuClaimTests(unittest.TestCase):
         self.assertEqual("activity+vram", claim["idleness_basis"])
 
 
+class ShapeGridPluginTests(unittest.TestCase):
+    """The plugin is what substitutes the grid, so its refusals are what keep a target the
+    grid cannot express from being reported as a failing PR."""
+
+    def _run_target(self, argnames, grid, target_source):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plugin = root / "sgp.py"
+            plugin.write_text(
+                (SKILL_DIR / "shape_grid_plugin.py").read_text()
+                + f"\n_VALIDATION_SHAPE_ARGNAMES = {argnames!r}\n"
+                + f"_VALIDATION_SHAPE_GRID = {grid!r}\n"
+            )
+            target = root / "test_target.py"
+            target.write_text(target_source)
+            return subprocess.run(
+                [sys.executable, "-m", "pytest", "-p", "sgp", str(target), "-q"],
+                cwd=root, capture_output=True, text=True,
+            )
+
+    def test_dict_valued_parametrize_is_refused_rather_than_poisoned(self):
+        # A target parametrizing one `case: dict` passed the argnames-only gate, the grid
+        # substituted integers, and the target raised TypeError -- which the executor
+        # published as "the PR adds this target and its independent shape grid fails", a
+        # BLOCK against an author whose own suite was green in the same report.
+        result = self._run_target(
+            ("case",),
+            [(1,), (513,)],
+            "import pytest\n"
+            '@pytest.mark.parametrize("case", [{"m": 1}, {"m": 3}])\n'
+            "def test_case(case):\n"
+            "    assert case['m'] > 0\n",
+        )
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn("2 passed", result.stdout)
+        self.assertNotIn("TypeError", result.stdout + result.stderr)
+
+    def test_a_single_scalar_argname_is_substituted(self):
+        # The same code path with scalar values must still replace the target's own literals,
+        # or the refusal above would have been bought by disabling the channel.
+        result = self._run_target(
+            ("m",),
+            [(3,), (15,), (32,)],
+            "import pytest\n"
+            '@pytest.mark.parametrize("m", [1, 2])\n'
+            "def test_m(m):\n"
+            "    assert m in (3, 15, 32)\n",
+        )
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn("3 passed", result.stdout)
+
+
 class ReviewSkillContractTests(unittest.TestCase):
     def test_review_skill_is_advisory_and_has_no_dead_scanner_paths(self):
         review_skill = (SKILL_DIR.parent / "review-pr" / "SKILL.md").read_text()

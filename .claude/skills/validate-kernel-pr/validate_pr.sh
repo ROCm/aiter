@@ -1077,6 +1077,37 @@ def mark_names(call):
     return set()
 
 
+def mark_values_are_scalar(call):
+    """Do this mark's own values look like the scalar cells a grid can express?
+
+    The gate used to read only the argnames. A target parametrizing a single `case: dict`
+    therefore passed it, the validator substituted integers, and the target raised
+    `TypeError: 'int' object is not subscriptable` -- which the executor published as
+    "the PR adds this target and its independent shape grid fails", a BLOCK against an author
+    whose own suite was 138 passed in the same report. SKILL.md already documented that such
+    targets stay INCONCLUSIVE; this is that promise implemented rather than asserted.
+
+    Unknown-shaped values (a module constant, a call) are treated as NOT scalar. A grid this
+    channel cannot express must cost an INCONCLUSIVE, never a blocker aimed at the author.
+    """
+    if len(call.args) < 2:
+        return False
+    values = call.args[1]
+    if not isinstance(values, (ast.List, ast.Tuple)):
+        return False
+    if not values.elts:
+        return False
+    for row in values.elts:
+        cells = row.elts if isinstance(row, (ast.List, ast.Tuple)) else [row]
+        for cell in cells:
+            if isinstance(cell, ast.Constant):
+                continue
+            if isinstance(cell, ast.UnaryOp) and isinstance(cell.operand, ast.Constant):
+                continue
+            return False
+    return True
+
+
 # Decided per test function, exactly as the plugin decides per metafunc. A file-wide check
 # let one unrelated test's overlapping mark disable the channel for the whole file.
 reachable = False
@@ -1099,6 +1130,8 @@ for node in ast.walk(tree):
         bound = mark_names(mark)
         bound_all |= bound
         if (bound & wanted) and not (bound <= wanted):
+            blocked = True
+        if (bound & wanted) and not mark_values_are_scalar(mark):
             blocked = True
     if wanted <= (names | bound_all) and not blocked:
         reachable = True
@@ -1460,7 +1493,7 @@ PY
 # PICK is empty, so run_pytest already exports HIP_VISIBLE_DEVICES="" and the target
 # runs with no visible device -- passing there is an observation, not a guess.
 GPU_REQUIREMENT="required"
-GPU_REQUIREMENT_BASIS="a GPU was claimed, so the requirement was not probed"
+GPU_REQUIREMENT_BASIS="a GPU was claimed, so whether the target can run without one was never probed; 'required' here is the conservative default, not an observation"
 if [ -z "$PICK" ]; then
   if [ "$RUNTIME_OK" -eq 1 ] && [ "$TARGET_RUNNER" != "none" ]; then
     GPUFREE_RESULT=$(run_pytest "gpufree-probe" "")
@@ -1702,7 +1735,11 @@ PY
       fi
     fi
 
-    if [ "$GRID_HOOK_OK" -eq 1 ]; then
+    # Same causality requirement as the base side: a probe that fails because the target
+    # is broken proves nothing about the grid. On a held-out PR whose module could not be
+    # imported at all, the probe's non-zero exit credited the channel although no shape
+    # ever reached the kernel. Require the unpoisoned head run to have passed first.
+    if [ "$GRID_HOOK_OK" -eq 1 ] && [ "${HEAD_RC:-1}" -eq 0 ]; then
       HEAD_PROBE_RESULT=$(run_pytest \
         "head-grid-probe" "$SHAPE_ENV=__VALIDATOR_INVALID_GRID__")
       HEAD_PROBE_RC=${HEAD_PROBE_RESULT%%|*}
@@ -1863,7 +1900,16 @@ elif [ ! -x "$SCANNER" ]; then
   finding "note" "index_width_scan" \
     "required index-width scan did not run; do not interpret this as an empty candidate list"
 else
-  SCAN_JSON=$("$SCANNER" --diff "$PATCHF" --json 2>"$WORK/index-width-scan.log")
+  # The scan is an AST pass and needs each changed file's POST image. Reading it from the
+  # worktree while the patch is applied is exact and free; without it the scanner falls back
+  # to the diff's index blobs, which are absent unless the PR head was fetched, and every
+  # MODIFIED file lands in `unscanned`. A held-out PR ran with three of its files unexamined
+  # while the stage still reported a candidate count.
+  SCAN_ARGS=(--diff "$PATCHF" --json)
+  if [ "$PATCH_APPLIED" -eq 1 ] && [ "$BASE_ACTIVE" -eq 0 ]; then
+    SCAN_ARGS+=(--source-root "$REPO_WT")
+  fi
+  SCAN_JSON=$("$SCANNER" "${SCAN_ARGS[@]}" 2>"$WORK/index-width-scan.log")
   SCAN_RC=$?
   if [ "$SCAN_RC" -ne 0 ]; then
     stage_note "index_width_scan" "skip" "index-width scanner failed"

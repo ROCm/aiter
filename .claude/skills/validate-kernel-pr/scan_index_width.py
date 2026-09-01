@@ -240,6 +240,40 @@ class KernelScopeScanner(ast.NodeVisitor):
         return names <= constexpr_params
 
     # -- the visit --------------------------------------------------------------
+    @staticmethod
+    def _device_scope(node):
+        """Is this function compiled for the device?
+
+        int32 overflow in index arithmetic is a DEVICE concern. Scanning every Python function
+        put host-side bookkeeping in the candidate list: on a held-out PR all four candidates
+        were `float` FLOP accounting in a `_flops_bytes()` helper and none were in the 916-line
+        kernel. The docstring and this class's own name already claimed kernel scope; the code
+        did not implement it.
+
+        Two structural signals, no variable names: a `constexpr`-annotated parameter (only a
+        device function has compile-time tile parameters), or a decorator that names a JIT or
+        kernel entry point. The decorator test IS a spelling test -- it is the one place this
+        scanner asks how something is written -- so a function matching neither is still
+        scanned and reported separately rather than dropped, and the reviewer sees both lists.
+        """
+        for arg in (
+            list(node.args.posonlyargs) + list(node.args.args) + list(node.args.kwonlyargs)
+        ):
+            if KernelScopeScanner._is_constexpr(getattr(arg, "annotation", None)):
+                return True
+        for decorator in node.decorator_list:
+            target = decorator.func if isinstance(decorator, ast.Call) else decorator
+            parts = []
+            while isinstance(target, ast.Attribute):
+                parts.append(target.attr)
+                target = target.value
+            if isinstance(target, ast.Name):
+                parts.append(target.id)
+            spelling = ".".join(reversed(parts)).lower()
+            if "jit" in spelling or "kernel" in spelling:
+                return True
+        return False
+
     def visit_FunctionDef(self, node):
         args = node.args
         params = list(args.posonlyargs) + list(args.args) + list(args.kwonlyargs)
@@ -258,6 +292,7 @@ class KernelScopeScanner(ast.NodeVisitor):
         # judgement of which parameters are "stride-like" is left to the reviewer: we report
         # every runtime scalar parameter the DIFF introduced, not every one that matches a
         # name pattern.
+        self._scope = "device" if self._device_scope(node) else "host"
         widened_locals = self._collect_widened_locals(node)
         before = len(self.hits)
         self._scan_body(node, runtime_params, constexpr_params, widened_locals)
@@ -267,7 +302,7 @@ class KernelScopeScanner(ast.NodeVisitor):
         # parameter whose NAME looked stride-ish (244 on aiter#4978); reporting only the ones
         # the code multiplies keeps the same signal without the name list.
         multiplicands = set()
-        for _, _, provenance in self.hits[before:]:
+        for _, _, provenance, _scope in self.hits[before:]:
             multiplicands.update(provenance)
         for a in params:
             if (
@@ -346,6 +381,7 @@ class KernelScopeScanner(ast.NodeVisitor):
                 lineno,
                 ast.unparse(node),
                 sorted(names & runtime_params),
+                self._scope,
             )
         )
 
@@ -416,7 +452,7 @@ def main():
         # kernel family repeats it, so identical expressions in a file collapse to one row
         # that carries its own occurrence count and every line it appears on.
         by_expr = {}
-        for lineno, expr, provenance in hits:
+        for lineno, expr, provenance, scope in hits:
             entry = by_expr.setdefault(
                 expr,
                 {
@@ -424,6 +460,7 @@ def main():
                     "line": lineno,
                     "expression": expr,
                     "runtime_params": provenance,
+                    "scope": scope,
                     "occurrences": 0,
                     "lines": [],
                 },
@@ -437,11 +474,15 @@ def main():
         for name, lineno in untyped:
             params.append({"path": path, "line": lineno, "name": name})
 
+    device = [c for c in candidates if c.get("scope") == "device"]
+    host = [c for c in candidates if c.get("scope") != "device"]
     payload = {
-        "index_stride_candidates": len(candidates),
+        "index_stride_candidates": len(device),
+        "host_scope_candidates": len(host),
         "unannotated_runtime_parameters": len(params),
-        "total_candidates": len(candidates) + len(params),
-        "candidates": candidates,
+        "total_candidates": len(device) + len(params),
+        "candidates": device,
+        "host_candidates": host,
         "parameters": params,
         "unscanned": unscanned,
     }
@@ -454,11 +495,11 @@ def main():
     # printing all of them crowds the rule pass out of context. The rollup is always complete
     # and --json always carries every row, so nothing is discarded -- only deferred.
     per_file = {}
-    for c in candidates:
+    for c in device:
         per_file.setdefault(c["path"], []).append(c)
     print(
-        f"== index x stride reaching pointer arithmetic, no 64-bit widening: "
-        f"{len(candidates)} distinct expressions in {len(per_file)} files =="
+        f"== index x stride in DEVICE code, reaching pointer arithmetic, no 64-bit "
+        f"widening: {len(device)} distinct expressions in {len(per_file)} files =="
     )
     for path, rows in sorted(per_file.items(), key=lambda kv: -len(kv[1])):
         sites = sum(r["occurrences"] for r in rows)
@@ -492,6 +533,19 @@ def main():
         print(f"  {c['path']}:{c['line']}{repeat}")
         print(f"      {c['expression']}")
         print(f"      runtime kernel params in this expression: {provenance}")
+    if host:
+        # Listed, not merged: int32 overflow is a device concern, and host-side arithmetic in
+        # this shape is usually FLOP accounting rather than an index. Kept visible because the
+        # device/host test is a decorator spelling, and a wrong answer must cost a glance
+        # rather than a miss.
+        print(
+            f"\n== same shape in HOST code ({len(host)}) -- normally not D9; check only if "
+            f"one of these computes a device offset =="
+        )
+        for c in host[:5]:
+            print(f"  {c['path']}:{c['line']}  {c['expression']}")
+        if len(host) > 5:
+            print(f"  ... {len(host) - 5} more; all rows are in --json output")
     print(
         f"\n== runtime kernel parameters added with no width annotation: {len(params)} =="
     )

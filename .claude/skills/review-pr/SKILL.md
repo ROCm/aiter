@@ -457,7 +457,11 @@ for stage_name in ("correctness_repo_tests", "correctness_s1_grid"):
         stat_keys = ("tests", "failures", "errors", "skipped", "executed")
         if any(type(stats.get(key)) is not int for key in stat_keys):
             raise SystemExit(f"{stage_name} has malformed execution counters")
-        if stats["executed"] != stats["tests"] - stats["skipped"]:
+        # errors are collection and fixture failures: the test body never ran, so they are
+        # not executed tests. The two sides of this equality disagreed only when errors > 0 --
+        # which is exactly the shape of a report carrying a real runtime blocker, so a report
+        # that had correctly found one was rejected here and could not be used.
+        if stats["executed"] != stats["tests"] - stats["skipped"] - stats["errors"]:
             raise SystemExit(f"{stage_name} has inconsistent execution counters")
     elif stage["status"] == "pass":
         raise SystemExit(f"{stage_name} passed without execution counters")
@@ -469,7 +473,15 @@ for stage_name in ("correctness_repo_tests", "correctness_s1_grid"):
     ):
         raise SystemExit(f"{stage_name} has a hollow or contradictory pass")
 receipt = report["stages"]["execution_receipt"]
-required_shapes = [shape.strip() for shape in selection.get("grid", "").split(";") if shape.strip()]
+# Only a grid that was actually DELIVERED imposes required shapes. A grid the caller supplied
+# for a target with no channel to receive it was still being turned into a requirement here,
+# so the receipt's honest empty list read as a contradiction and the report was rejected --
+# discarding exactly the runs that carried the accurate "no channel" diagnostic.
+required_shapes = (
+    [shape.strip() for shape in selection.get("grid", "").split(";") if shape.strip()]
+    if selection.get("grid_channel")
+    else []
+)
 if receipt.get("status") == "pass" and (
     receipt.get("producer") != "validate-kernel-pr.validation_probe"
     or receipt.get("route") != selection["expected_route"]
