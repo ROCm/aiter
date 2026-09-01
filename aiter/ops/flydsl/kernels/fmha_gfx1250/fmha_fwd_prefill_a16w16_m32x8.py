@@ -1900,7 +1900,7 @@ def flash_attn_varlen_m32x8(
     sink=None,
     lse=None,
 ):
-    """Host entry — varlen THD, qk_hdim=v_hdim=128, bf16.
+    """Host entry — varlen THD, qk_hdim in {128,192,256} / v_hdim=128, bf16.
 
     ``window_size`` (optional): ``(left, right)`` sliding-window bounds. ``-1`` =
     infinite on that side; ``(-1, -1)`` = full attention. ``causal`` forces
@@ -2033,7 +2033,7 @@ def flash_attn_batch_m32x8(
     sink=None,
     lse=None,
 ):
-    """Host entry — batched BSHD ``[B, S, H, D]``, qk_hdim=v_hdim=128, bf16.
+    """Host entry — batched BSHD ``[B, S, H, D]``, qk_hdim in {128,192,256} / v_hdim=128, bf16.
 
     Uses the dedicated BSHD kernel with a uniform ``seq_len`` scalar (no
     cu_seqlens), so there is nothing transient to bake into a CUDA graph.

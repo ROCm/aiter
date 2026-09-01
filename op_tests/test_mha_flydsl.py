@@ -595,7 +595,8 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Attention sink: true/false. Default runs both.\n"
-        "Only the m16x8 (d_qk=d_v=128) path supports sink; skipped elsewhere.\n"
+        "Served by the m32x8 kernel (v_hdim=128) wherever it is routed; the sink\n"
+        "axis is skipped only for (d_qk,d_v) pairs that fall through to CK/sibling.\n"
         "e.g.: -s true",
     )
     parser.add_argument(
