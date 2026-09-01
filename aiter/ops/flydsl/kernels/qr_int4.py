@@ -36,6 +36,7 @@ from .qr_int4_kernel import (
     make_qr_int4_kernel,
 )
 from .qr_int4_ring_kernel import (
+    RING_ST_LADDER,
     RING_SUPER_TILES,
     RS_CODECS,
     make_qr_int4_ring_kernel,
@@ -126,6 +127,12 @@ class _Algorithm:
     rs_codecs: tuple[str, ...]
     min_bytes: int
     min_batch_blocks: int
+    default_super_tile: int
+    # ``(min_payload_bytes, super_tile, grid_cap)`` rungs, ascending. Empty means
+    # "one super-tile for every size", which is what two-shot does. When it is
+    # non-empty and the caller did not pin ``super_tile``, QRInt4 builds an
+    # engine per rung and selects by payload size at launch.
+    st_ladder: tuple[tuple[int, int, int], ...] = ()
 
 
 def _build_two_shot(*, world_size, rank, super_tile, grid, inbox_memory, rs_codec):
@@ -146,6 +153,7 @@ ALGORITHMS = {
         rs_codecs=("int4",),
         min_bytes=MIN_PAYLOAD_BYTES,
         min_batch_blocks=_MIN_BATCH_BLOCKS,
+        default_super_tile=8,
     ),
     "ring": _Algorithm(
         name="ring",
@@ -154,6 +162,8 @@ ALGORITHMS = {
         rs_codecs=RS_CODECS,
         min_bytes=_RING_MIN_PAYLOAD_BYTES,
         min_batch_blocks=_MIN_BATCH_BLOCKS,
+        default_super_tile=8,
+        st_ladder=RING_ST_LADDER,
     ),
 }
 DEFAULT_ALGORITHM = "two_shot"
@@ -361,7 +371,7 @@ class QRInt4:
         device,
         rank: int,
         world_size: int = WORLD,
-        super_tile: int = 8,
+        super_tile: int | None = None,
         grid_cap: int | None = None,
         inbox_memory: str = "auto",
         min_bytes: int | None = None,
@@ -377,6 +387,13 @@ class QRInt4:
                 f"algorithm must be one of {tuple(ALGORITHMS)}, got {algorithm!r}"
             )
         algo = ALGORITHMS[algorithm]
+        # ``None`` means "use the schedule's own policy": for two-shot that is a
+        # single super-tile, for the ring the payload-size ladder. Passing a
+        # value pins one super-tile for every size, which is what the benchmark
+        # variants and the tuning sweeps do.
+        pinned_st = super_tile is not None
+        if super_tile is None:
+            super_tile = algo.default_super_tile
         if super_tile not in algo.super_tiles:
             raise ValueError(
                 f"super_tile must be one of {algo.super_tiles} for "
@@ -404,6 +421,21 @@ class QRInt4:
         cap = DEFAULT_GRID_CAP if grid_cap is None else int(grid_cap)
         if cap < 1:
             raise ValueError(f"grid_cap must be positive, got {cap}")
+        # Rungs to build, each ``(super_tile, grid_cap)``. Pinning
+        # ``super_tile`` collapses the ladder to that one rung -- a caller who
+        # named a super-tile gets exactly it, at every size.
+        #
+        # ``grid_cap`` is a *ceiling*, not a pin: it bounds every rung rather
+        # than disabling size-dependent selection. Raising it above a rung's own
+        # cap is a no-op (the rung cap is already sized so ``_grid_x`` never
+        # binds over that rung's payload range), while lowering it constrains
+        # the wire buffer, which is what a caller passing it usually wants.
+        if algo.st_ladder and not pinned_st:
+            rungs = [(st, min(rung_cap, cap)) for _, st, rung_cap in algo.st_ladder]
+            ladder = algo.st_ladder
+        else:
+            rungs = [(super_tile, cap)]
+            ladder = ()
         inbox_flags, resolved_inbox = _resolve_inbox_flags(inbox_memory)
         torch.cuda.set_device(device)
         self.group = group
@@ -422,16 +454,21 @@ class QRInt4:
         if self.min_bytes < 0:
             raise ValueError(f"min_bytes must be non-negative, got {self.min_bytes}")
 
-        sts = [1]
-        if self.super_tile != 1:
-            sts.append(self.super_tile)
+        # ST=1 is always built: _pick_st falls back to it when a payload has
+        # fewer tiles than the chosen super-tile. Engines are built in a fixed
+        # order because each does its own IPC handle exchange, which is a
+        # collective -- ranks disagreeing on the order would deadlock.
+        by_cap = {1: cap}
+        for st, rung_cap in rungs:
+            by_cap.setdefault(st, rung_cap)
+        self._ladder = ladder
         self._by_st = {}
-        for st in sts:
+        for st in sorted(by_cap):
             spec = algo.build(
                 world_size=self.world_size,
                 rank=self.rank,
                 super_tile=st,
-                grid=self._grid,
+                grid=by_cap[st],
                 inbox_memory=resolved_inbox,
                 rs_codec=rs_codec,
             )
@@ -451,8 +488,26 @@ class QRInt4:
         self.rank_tile_bytes = primary.rank_tile_bytes
         self.wire_tile_bytes = primary.wire_tile_bytes
 
-    def _pick_st(self, num_tiles: int) -> int:
+    def _ladder_st(self, live_bytes: int) -> int:
+        """Super-tile the ladder assigns to a *live_bytes* payload.
+
+        Publishes per rank are ``num_tiles / ST * 2(N-1)`` and cost a full L2
+        writeback each, so a bigger payload wants a bigger ST -- but ST also
+        divides the block count, so it cannot simply be maximised. The rungs and
+        the measurements behind them are in ``RING_ST_LADDER``.
+        """
+        st = self._by_st and min(self._by_st)
+        for floor, rung_st, _cap in self._ladder:
+            if live_bytes >= floor:
+                st = rung_st
+        return st
+
+    def _pick_st(self, num_tiles: int, live_bytes: int | None = None) -> int:
         """Super-tile for a payload of *num_tiles* tiles.
+
+        With a ladder, *live_bytes* chooses the rung and *num_tiles* only has to
+        confirm there is a whole super-tile to take; without one the single
+        configured super-tile is the only candidate.
 
         Without a release fence a publish is nearly free, so the only reason to
         batch tiles is when there are more of them than blocks -- prefer ST=1
@@ -463,14 +518,21 @@ class QRInt4:
         there is a whole one to take. Measured on MI350P at 1024x7168, TP4:
         577.71 us at ST=1 against 269.01 at ST=8.
         """
-        if self.super_tile == 1:
+        want = self.super_tile
+        if self._ladder and live_bytes is not None:
+            want = self._ladder_st(live_bytes)
+        if want == 1:
             return 1
         if self._batch_publishes:
-            return self.super_tile if num_tiles >= self.super_tile else 1
-        return self.super_tile if num_tiles > self._grid else 1
+            return want if num_tiles >= want else 1
+        return want if num_tiles > self._by_st[want].grid else 1
 
-    def _grid_x(self, num_tiles: int, super_tile: int) -> int:
+    def _grid_x(self, num_tiles: int, super_tile: int, grid: int | None = None) -> int:
         """Blocks to launch for *num_tiles* tiles under *super_tile*.
+
+        *grid* is the compile-time cap of the engine that will run, which is
+        per-super-tile once a ladder is in play -- the wire buffer scales with
+        ``ST * grid``, so a high rung pairs a large ST with a small cap.
 
         Batching publishes only pays if a block actually owns a super-tile's
         worth of work: ST=8 across 448 blocks holding one tile each still
@@ -485,7 +547,7 @@ class QRInt4:
         if self._batch_publishes and super_tile != 1:
             batched = max(-(-num_tiles // super_tile), self._algo.min_batch_blocks)
             num_tiles = min(num_tiles, batched)
-        return max(1, min(num_tiles, self._grid))
+        return max(1, min(num_tiles, self._grid if grid is None else grid))
 
     def _check_payload(self, inp, out) -> int:
         if not isinstance(inp, torch.Tensor) or not isinstance(out, torch.Tensor):
@@ -514,7 +576,7 @@ class QRInt4:
     def _launch_eng(self, eng: _StEngine, inp, out, stream) -> None:
         live_bytes = int(inp.numel()) * int(inp.element_size())
         num_tiles = max(1, (live_bytes + TILE_BYTES - 1) // TILE_BYTES)
-        grid_x = self._grid_x(num_tiles, eng.super_tile)
+        grid_x = self._grid_x(num_tiles, eng.super_tile, eng.grid)
         if stream is None:
             stream = Stream(None)
         args = (
@@ -576,5 +638,5 @@ class QRInt4:
                 "an exact all-reduce, or pass min_bytes=0 to override."
             )
         num_tiles = max(1, (live_bytes + TILE_BYTES - 1) // TILE_BYTES)
-        st = self._pick_st(num_tiles)
+        st = self._pick_st(num_tiles, live_bytes)
         self._launch_eng(self._by_st[st], inp, out, stream)

@@ -269,6 +269,16 @@ class Candidate:
     use_new: bool = True  # family == "cdr"
     fp8: bool = False  # family == "cdr"
     algorithm: str = "two_shot"  # QRInt4 schedule, family == "fly"
+    # QRInt4 tuning knobs, family == "fly". None means "leave the constructor
+    # default alone"; a value makes this candidate a distinct engine with its
+    # own IPC inbox, so two rows can differ only in tuning.
+    super_tile: int | None = None
+    grid_cap: int | None = None
+
+    @property
+    def fly_cfg(self) -> tuple:
+        """Identity of the QRInt4 engine this candidate needs."""
+        return (self.algorithm, self.super_tile, self.grid_cap)
 
 
 # Floors sit ~5 dB below what each candidate measures on a healthy gfx950 build
@@ -291,7 +301,51 @@ CANDIDATES = (
     # requantizes once; measured 18.7 dB at TP4 (against 19.2), and *better*
     # than two-shot at TP2 (22.2 dB) where the all-gather lap's verbatim
     # forwarding dominates. 14 dB leaves the usual ~5 dB of headroom.
+    # Auto: no pinned super_tile, so QRInt4 walks RING_ST_LADDER and picks by
+    # payload size at launch. This is what production gets.
     Candidate("fly_int4_ring", "fly", 14.0, False, algorithm="ring"),  # 18.7 / n/a
+    # Super-tile variants of the ring with the ladder *disabled* -- pinning
+    # super_tile fixes one value for every size. Kept as separate rows so a
+    # sweep is one bench run rather than a rebuild, and so `fly_int4_ring`
+    # (auto) can be checked against the best pinned row at each shape. ST sets how many tiles a block batches behind
+    # one publish; publishes per rank are `num_tiles / ST * 2(N-1)` and are
+    # *independent of the block count*, so ST is the only knob that reduces
+    # them -- and it pays in parallelism, because `_grid_x` derives the block
+    # count from `num_tiles / ST`. Measured on MI350P TP4 bf16 hidden 7168:
+    # ST=8 wins at 14 MiB, ST=16 is 1.24x at 56 MiB and 1.27x at 114 MiB, ST=32
+    # is slightly behind 16. Accuracy is identical at every ST.
+    #
+    # Each carries its own grid_cap because the wire buffer is
+    # `2(N-1) * grid * (ST * rank_atoms * 1152 + 64)` bytes -- ST=16 at the
+    # default cap of 1216 is ~269 MB per rank, against 28 MB at cap 128, and
+    # they measure the same (671 vs 673 us).
+    Candidate(
+        "fly_int4_ring_st8",
+        "fly",
+        14.0,
+        False,
+        algorithm="ring",
+        super_tile=8,
+        grid_cap=128,
+    ),
+    Candidate(
+        "fly_int4_ring_st16",
+        "fly",
+        14.0,
+        False,
+        algorithm="ring",
+        super_tile=16,
+        grid_cap=128,
+    ),
+    Candidate(
+        "fly_int4_ring_st32",
+        "fly",
+        14.0,
+        False,
+        algorithm="ring",
+        super_tile=32,
+        grid_cap=128,
+    ),
     Candidate("rccl", "rccl", 40.0, True),  # 51 / 69
 )
 CANDIDATE_KEYS = [c.key for c in CANDIDATES]
@@ -531,7 +585,7 @@ def _build_thunks(cands, *, ca_comm, qr_comm, fly, group, x):
             thunks[cand.key] = _qr
         elif cand.family == "fly":
 
-            def _fly(o=out, eng=fly[cand.algorithm]):
+            def _fly(o=out, eng=fly[cand.fly_cfg]):
                 eng.allreduce(x, o)
                 return o
 
@@ -575,7 +629,7 @@ def _bench_shape(
         if c.key in keys
         and applicable(c, tp_size, dtype, x.numel(), nbytes)
         and not (c.family == "qr" and qr_comm is None)
-        and not (c.family == "fly" and c.algorithm not in fly)
+        and not (c.family == "fly" and c.fly_cfg not in fly)
     ]
     thunks, buffers = _build_thunks(
         cands, ca_comm=ca_comm, qr_comm=qr_comm, fly=fly, group=group, x=x
@@ -706,36 +760,51 @@ def _worker(
     torch.cuda.synchronize()
 
     fly = {}  # QRInt4 schedule name -> engine
-    wanted_algos = sorted(
-        {c.algorithm for c in CANDIDATES if c.family == "fly" and c.key in keys}
+    # One engine per distinct (schedule, super_tile, grid_cap): each owns its
+    # own IPC inbox, whose layout depends on all three. Sorted so every rank
+    # performs its handle exchanges in the same sequence -- the exchange is a
+    # collective, so a differing order across ranks deadlocks.
+    # ``None`` means "constructor default" and does not order against an int,
+    # so sort on a total key rather than the tuple itself.
+    wanted_cfgs = sorted(
+        {c.fly_cfg for c in CANDIDATES if c.family == "fly" and c.key in keys},
+        key=lambda c: (
+            c[0],
+            -1 if c[1] is None else c[1],
+            -1 if c[2] is None else c[2],
+        ),
     )
     if (
-        wanted_algos
+        wanted_cfgs
         and HAS_FLY_INT4
         and get_gfx() in _FLY_ARCHS
         and tp_size in _FLY_WORLDS
         and dtype == dtypes.bf16
     ):
-        # One engine per schedule: each owns its own IPC inbox, whose layout is
-        # schedule-specific. Built in a fixed (sorted) order so every rank
-        # performs its handle exchanges in the same sequence.
-        for algo in wanted_algos:
+        for cfg in wanted_cfgs:
+            algo, st, cap = cfg
             # QRInt4 exchanges IPC handles via broadcast_object_list, so it
             # needs the gloo (CPU) group -- it rejects an NCCL group outright.
-            fly[algo] = QRInt4(
+            kw = {}
+            if st is not None:
+                kw["super_tile"] = st
+            if cap is not None:
+                kw["grid_cap"] = cap
+            fly[cfg] = QRInt4(
                 group=tp_group.cpu_group,
                 device=device,
                 rank=rank,
                 world_size=tp_size,
                 algorithm=algo,
+                **kw,
             )
         # compile() is itself a collective launch on every super-tile engine and
         # builds all of them, so one call at any shape keeps the JIT out of
         # every timed region below.
         warm = torch.zeros((8, DSV4_HIDDEN), dtype=dtypes.bf16, device=device)
-        for algo in wanted_algos:
+        for cfg in wanted_cfgs:
             dist.barrier(group=group)
-            fly[algo].compile(warm, torch.empty_like(warm))
+            fly[cfg].compile(warm, torch.empty_like(warm))
         del warm
 
     try:

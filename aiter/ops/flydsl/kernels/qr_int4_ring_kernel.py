@@ -73,12 +73,49 @@ from .qr_int4_kernel import (
 # Super-tile values the ring accepts. Deliberately the same as the two-shot's.
 #
 # The ring publishes 2(N-1) times per super-tile against the two-shot's 2, and
-# on a cacheable inbox every publish is a full L2 writeback -- so the obvious
-# reflex is to raise ST until they amortize. Resist it: the wire buffer is
-# ``2(N-1) * grid * (ST * rank_atoms * 1152 + 64)`` bytes, already ~150 MB at
-# TP4/ST=8/grid=1216, and ST=32 would be gigabytes. Shrink ``grid`` instead --
-# ``QRInt4._grid_x`` already hands each block a whole super-tile.
-RING_SUPER_TILES = (1, 8)
+# on a cacheable inbox every publish is a full L2 writeback. Publishes per rank
+# are ``num_tiles / ST * 2(N-1)`` -- independent of the block count, so ST is
+# the *only* knob that reduces them, and it pays for them in parallelism:
+# ``_grid_x`` derives blocks from ``num_tiles / ST``.
+#
+# The optimum is payload-dependent, so it is not a single value -- see
+# ``RING_ST_LADDER`` below, which is what the host actually selects from. These
+# are the values a caller may *pin* with ``super_tile=``.
+#
+# Mind the buffer when pinning a large one: it is
+# ``2(N-1) * grid * (ST * rank_atoms * 1152 + 64)`` bytes, so ST=16 at the
+# default cap of 1216 is ~269 MB per rank against 28 MB at cap 128, and the two
+# measure the same (671 vs 673 us). Pin ``grid_cap`` alongside ``super_tile``.
+RING_SUPER_TILES = (1, 8, 16, 32)
+
+# Payload-size ladder: ``(min_bytes, super_tile, grid_cap)``, ascending.
+#
+# ``QRInt4`` builds one engine per rung and picks by payload at ``allreduce``
+# time, because the caller does not know the size at construction time and a JIT
+# inside a collective deadlocks. Sited on MI350P, TP4, bf16, hidden 7168 -- best
+# ST per size, us:
+#
+#     MiB    ST=8    ST=16   ST=32      MiB    ST=8    ST=16   ST=32
+#      14   236.6    253.8   255.2       56   855.8    681.0   690.6
+#      21   321.7    307.9   339.6       64  1098      800.8   792.6
+#      28   416.5    368.9   416.4       84  1365     1186    1044
+#      42   629.0    504.3   503.4      112  1813     1421    1330
+#
+# 8 -> 16 crosses between 14 and 21 MiB; 16 -> 32 is inside noise from 42 to
+# 64 MiB (<= 1.5%) and decisive by 84 MiB, so the boundary is placed where 32
+# first wins rather than where it first ties.
+#
+# Every rung caps the grid at 128, which is not a compromise: ``_grid_x`` already
+# limits blocks to ``ceil(num_tiles / ST)``, and over each rung's size range that
+# is <= 128 for ST=8 and ST=16. Only ST=32 is clamped, and it costs 0.7%
+# (1310 us at cap 64, 1301 at 128, 1292 at 256 for 112 MiB) for half the memory.
+# The whole ladder is ~101 MB per rank -- *less* than the single ST=8 engine at
+# the default cap of 1216, which is 135 MB on its own.
+RING_ST_LADDER = (
+    (0, 8, 128),
+    (18 << 20, 16, 128),
+    (64 << 20, 32, 128),
+)
 
 # Wire formats accepted for the reduce-scatter lap.
 #
@@ -353,12 +390,13 @@ def make_qr_int4_ring_kernel(
             fx.copy(hbm_copy_atom, frag, dst)
 
         def _lds_write_packet(j, packed, scale_word, is_leader):
-            fx.memref_store(packed, pack, (fx.Int32(j), tid))
+            row = fx.Int32(j)
+            fx.memref_store(packed, pack, (row, tid))
             if is_leader:
                 fx.memref_store(
                     scale_word,
                     pack,
-                    (fx.Int32(j), fx.Int32(SCALE_I32_OFF) + scale_slot),
+                    (row, fx.Int32(SCALE_I32_OFF) + scale_slot),
                 )
 
         def _recv_raw(step, sub, j):
@@ -395,9 +433,9 @@ def make_qr_int4_ring_kernel(
                 # Flat sector id -> (rank-atom, sector), then -> i32 offset. Both
                 # by arithmetic, for the same reason as _slot_i32: at TP8
                 # rank_atoms is 1, and a unit mode in a layout does not survive
-                # coalescing intact. The same offset addresses LDS and the wire,
-                # because the LDS pack rows and the wire rank-tiles share the
-                # RANK_TILE_I32 stride.
+                # coalescing intact. The same offset addresses LDS and the
+                # wire, because the LDS pack rows and the wire rank-tiles share
+                # the RANK_TILE_I32 stride.
                 j = safe // fx.Int32(N_SECTORS)
                 sector = safe % fx.Int32(N_SECTORS)
                 if s < fx.Int32(total_sectors):

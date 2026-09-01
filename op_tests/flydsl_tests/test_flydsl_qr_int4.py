@@ -50,6 +50,7 @@ from aiter.ops.flydsl.kernels.qr_int4_kernel import (
     WORLD,
     has_release_fence,
 )
+from aiter.ops.flydsl.kernels.qr_int4_ring_kernel import RING_ST_LADDER
 
 ARCH = get_gfx_runtime()
 SUPPORTED_ARCHS = ("gfx942", "gfx950")
@@ -96,16 +97,29 @@ def _pick_st(
     *,
     grid_cap: int = DEFAULT_GRID_CAP,
     inbox_memory: str = "uncached",
+    algorithm: str = "two_shot",
 ) -> int:
     """Mirror of ``QRInt4._pick_st``, so the test asserts the rule not the code.
 
-    The rule is interconnect-dependent: an inbox that needs a release fence
-    makes each publish expensive enough to take a super-tile as soon as there
-    is one, while without a fence ST=1 is preferred for its parallelism. Which
-    one applies is a property of the host, so it comes from the rank's reported
+    Two rules compose. The interconnect one: an inbox that needs a release fence
+    makes each publish expensive enough to take a super-tile as soon as there is
+    one, while without a fence ST=1 is preferred for its parallelism. Which
+    applies is a property of the host, so it comes from the rank's reported
     ``inbox_memory`` rather than being assumed.
+
+    The payload one, ring only: publishes per rank are
+    ``num_tiles / ST * 2(N-1)``, so a bigger payload wants a bigger super-tile.
+    ``RING_ST_LADDER`` holds the sited rungs. The tests construct QRInt4 without
+    pinning ``super_tile``, so the ring walks that ladder and ``requested`` does
+    not apply to it.
     """
     tiles = _num_tiles(tokens, hidden)
+    if algorithm == "ring":
+        nbytes = tokens * hidden * 2
+        requested = 1
+        for floor, rung_st, _cap in RING_ST_LADDER:
+            if nbytes >= floor:
+                requested = rung_st
     if requested == 1:
         return 1
     if has_release_fence(inbox_memory):
@@ -154,7 +168,9 @@ def _run_rank(args) -> None:
         rank=rank,
         world_size=args.tp,
         algorithm=args.algorithm,
-        super_tile=args.super_tile,
+        # Left unpinned for the ring so QRInt4 walks RING_ST_LADDER -- that is
+        # the configuration production runs, and the one worth testing.
+        **({} if args.algorithm == "ring" else {"super_tile": args.super_tile}),
         grid_cap=args.grid_cap,
         # The case list deliberately includes sub-threshold shapes (8x1024 is
         # 16 KiB, well under MIN_PAYLOAD_BYTES) to cover the partial-tile path.
@@ -197,7 +213,9 @@ def _run_rank(args) -> None:
             "grid_cap": args.grid_cap,
             "algorithm": args.algorithm,
             "inbox_memory": fly.inbox_memory,
-            "st_used": fly._pick_st(tiles),
+            # Pass nbytes as well: with a ladder the super-tile is chosen by
+            # payload size, and omitting it silently reports the fallback.
+            "st_used": fly._pick_st(tiles, nbytes),
             "sqnr_db": _sqnr_db(got, ref),
             "rel_mae": _rel_mae(got, ref),
             "us": None,
@@ -331,6 +349,7 @@ def _assert_sqnr(
         hidden,
         grid_cap=ranks[0][0]["grid_cap"],
         inbox_memory=ranks[0][0]["inbox_memory"],
+        algorithm=algorithm,
     )
     if len(ranks) != world_size:
         raise AssertionError(

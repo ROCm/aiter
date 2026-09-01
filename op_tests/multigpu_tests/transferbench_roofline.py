@@ -168,7 +168,7 @@ def pattern(cand_key: str, predicted: str) -> str:
     *predicted* is the ``cross_device_reduce_*`` the host dispatch would pick
     for this shape, and is used only for the candidates that actually follow it.
     """
-    fixed = _FIXED_PATTERN.get(cand_key)
+    fixed = _FIXED_PATTERN.get(base_key(cand_key))
     if fixed is not None:
         return fixed
     return "1stage" if predicted.startswith("1stage") else "2stage"
@@ -220,9 +220,27 @@ def round16(nbytes) -> int:
     return max(16, (int(nbytes) // 16) * 16)
 
 
+_ST_SUFFIX = re.compile(r"_st\d+$")
+
+
+def base_key(cand_key: str) -> str:
+    """Strip a ``_st<N>`` tuning suffix; variants share their base's wire shape.
+
+    ``fly_int4_ring_st16`` puts exactly the bytes on the wire that
+    ``fly_int4_ring`` does and drives the same pattern -- the super-tile changes
+    how many tiles a block batches behind one publish, never the wire format.
+
+    Resolving by prefix matters because both lookups below fall back to a
+    *silent* default (ratio 1.0, pattern two-shot). A variant added in
+    ``bench_comm_allreduce.py`` and forgotten here would then be graded against
+    a 4x-too-large roof and quietly report a quarter of its real efficiency.
+    """
+    return _ST_SUFFIX.sub("", cand_key)
+
+
 def wire_bytes(payload_bytes: int, cand_key: str) -> int:
     """Bytes *cand_key* puts on the wire for a *payload_bytes* all-reduce."""
-    return round16(payload_bytes * WIRE_RATIO.get(cand_key, 1.0))
+    return round16(payload_bytes * WIRE_RATIO.get(base_key(cand_key), 1.0))
 
 
 # ---------------------------------------------------------------------------
