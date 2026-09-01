@@ -47,6 +47,29 @@ _MXFP8_LEGACY_BLOCK_SIZE = 128
 _LOGGER = AiterTritonLogger()
 
 
+def _mxfp8_gfx1250_block_config(M: int, K: int) -> tuple[int, int, int]:
+    """
+    Tuned (BLOCK_SIZE_M, BLOCK_SIZE_N, NUM_ITER) for dynamic_mxfp8_quant's M > 32
+    gfx1250 path, bucketed by M ({<=512, <=4096, >4096}) x K ({<=1024, <=3072,
+    >3072}) from a benchmark sweep. BLOCK_SIZE_N must be >= 128 (NUM_QUANT_BLOCKS
+    >= 4 required by scaled_downcast, see _mxfp8_quant_op).
+    """
+    m_bucket = 0 if M <= 512 else 1 if M <= 4096 else 2
+    k_bucket = 0 if K <= 1024 else 1 if K <= 3072 else 2
+    table = {
+        (0, 0): (32, 128, 1),
+        (0, 1): (32, 128, 1),
+        (0, 2): (32, 128, 1),
+        (1, 0): (32, 128, 1),
+        (1, 1): (64, 128, 1),
+        (1, 2): (64, 128, 2),
+        (2, 0): (32, 256, 1),
+        (2, 1): (32, 512, 1),
+        (2, 2): (32, 512, 1),
+    }
+    return table[(m_bucket, k_bucket)]
+
+
 def static_per_tensor_quant_fp8_i8(
     qx: torch.Tensor, x_in: torch.Tensor, scale_in: torch.Tensor
 ):
@@ -342,23 +365,9 @@ def dynamic_mxfp8_quant(
             NUM_WARPS = 4
             NUM_STAGES = 1
         else:
-            NUM_ITER = 8
-            BLOCK_SIZE_M = 64
-            BLOCK_SIZE_N = 64
-            NUM_WARPS = 1
-            NUM_STAGES = 2
-
-            if K <= 16384:
-                BLOCK_SIZE_M = 32
-                BLOCK_SIZE_N = 256
-
-        if K <= 1024:
-            NUM_ITER = 1
-            NUM_STAGES = 1
             NUM_WARPS = 4
-            BLOCK_SIZE_N = min(128, triton.next_power_of_2(K))
-            BLOCK_SIZE_N = max(32, BLOCK_SIZE_N)
-            BLOCK_SIZE_M = min(32, triton.next_power_of_2(M))
+            NUM_STAGES = 2
+            BLOCK_SIZE_M, BLOCK_SIZE_N, NUM_ITER = _mxfp8_gfx1250_block_config(M, K)
 
         grid = (
             triton.cdiv(M, BLOCK_SIZE_M),
@@ -373,7 +382,7 @@ def dynamic_mxfp8_quant(
             num_warps=NUM_WARPS,
             MXFP8_QUANT_BLOCK_SIZE=_MXFP8_QUANT_BLOCK_SIZE,
             EVEN_M_N=even_m_n,
-            waves_per_eu=0,
+            waves_per_eu=4,
         )
         gluon_dynamic_mxfp8_quant_kernel_gfx1250[grid](
             x2d,

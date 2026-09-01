@@ -165,12 +165,11 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx1250(
         bs_offs_n = pid_n * NUM_QUANT_BLOCKS + gl.arange(0, NUM_QUANT_BLOCKS)
         bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
         if EVEN_M_N:
-            gl.amd.cdna5.buffer_store(bs_e8m0, bs_ptr, bs_offs)
+            gl.store(bs_ptr + bs_offs, bs_e8m0)
         else:
-            gl.amd.cdna5.buffer_store(
+            gl.store(
+                bs_ptr + bs_offs,
                 bs_e8m0,
-                bs_ptr,
-                bs_offs,
                 mask=(bs_offs_m < M)[:, None]
                 & (
                     bs_offs_n
@@ -207,12 +206,11 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx1250(
         bs_offs_n = pid_n * NUM_QUANT_BLOCKS + gl.arange(0, NUM_QUANT_BLOCKS)
         bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
         if EVEN_M_N:
-            gl.amd.cdna5.buffer_store(bs_e8m0, bs_ptr, bs_offs)
+            gl.store(bs_ptr + bs_offs, bs_e8m0)
         else:
-            gl.amd.cdna5.buffer_store(
+            gl.store(
+                bs_ptr + bs_offs,
                 bs_e8m0,
-                bs_ptr,
-                bs_offs,
                 mask=(bs_offs_m < M)[:, None]
                 & (
                     bs_offs_n
@@ -228,12 +226,19 @@ def _mxfp8_quant_op(
     BLOCK_SIZE_N: gl.constexpr,
     BLOCK_SIZE_M: gl.constexpr,
     MXFP8_QUANT_BLOCK_SIZE: gl.constexpr,
+    num_warps: gl.constexpr,
 ):
     """
     Converts x (fp32) [BLOCK_SIZE_M, BLOCK_SIZE_N] to fp8 e4m3 via
     gl.amd.cdna5.scaled_downcast, computing the per-32-element e8m0 scale
     ourselves. Unlike mxfp4, fp8 downcast is elementwise (no packing), so
     x_fp8 keeps the input's shape.
+
+    scaled_downcast requires bs_e8m0 in a compact layout (size_per_thread
+    reduced to NUM_QUANT_BLOCKS on the scaled axis), only expressible as a
+    plain BlockedLayout when threads_per_warp[axis] == 32 // size_per_thread
+    [axis] -- hence caller must use threads_per_warp=[8, 4], and we
+    convert_layout since gl.max's native output layout doesn't match.
     """
     NUM_QUANT_BLOCKS: gl.constexpr = BLOCK_SIZE_N // MXFP8_QUANT_BLOCK_SIZE
     x_grouped = x.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP8_QUANT_BLOCK_SIZE)
@@ -241,13 +246,20 @@ def _mxfp8_quant_op(
     amax = amax.to(gl.int32, bitcast=True)
     amax = (amax + 0x200000).to(gl.uint32, bitcast=True) & 0xFF800000
     amax = amax.to(gl.float32, bitcast=True)
-    # e4m3 dtypeMax = 448 = 2**8 * 1.75, so the unbiased exponent offset is -8
-    # (vs -2 for mxfp4's e2m1 dtypeMax = 6).
+    # e4m3 dtypeMax = 448 = 2**8 * 1.75 -> unbiased exponent offset -8 (mxfp4: -2, dtypeMax 6)
     scale_e8m0_unbiased = gl.log2(amax).floor() - 8
     scale_e8m0_unbiased = gl.maximum(-127, gl.minimum(scale_e8m0_unbiased, 127))
     bs_e8m0 = scale_e8m0_unbiased.to(gl.uint8) + 127
     bs_e8m0 = bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS)
 
+    # compact layout scaled_downcast requires for the scale (see docstring)
+    compact_layout: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, NUM_QUANT_BLOCKS],
+        threads_per_warp=[8, 4],
+        warps_per_cta=[num_warps, 1],
+        order=[1, 0],
+    )
+    bs_e8m0 = gl.convert_layout(bs_e8m0, compact_layout)
     x_fp8 = gl.amd.cdna5.scaled_downcast(x, bs_e8m0, "e4m3", axis=1)
 
     return x_fp8, bs_e8m0
@@ -280,13 +292,6 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
     pid_m = gl.program_id(0)
     start_n = gl.program_id(1) * NUM_ITER
 
-    stride_x_m = stride_x_m_in
-    stride_x_n = stride_x_n_in
-    stride_x_fp8_m = stride_x_fp8_m_in
-    stride_x_fp8_n = stride_x_fp8_n_in
-    stride_bs_m = stride_bs_m_in
-    stride_bs_n = stride_bs_n_in
-
     NUM_QUANT_BLOCKS: gl.constexpr = BLOCK_SIZE_N // MXFP8_QUANT_BLOCK_SIZE
 
     # LDS layout: row-major, vec=8 elements = 128-bit stores, padded to avoid bank conflicts
@@ -294,11 +299,12 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
         [[BLOCK_SIZE_N, 8]], [BLOCK_SIZE_M, BLOCK_SIZE_N], [1, 0]
     )
 
-    # Register layout for LDS reads: order=[1,0] = N fastest, matches row-major LDS
+    # Register layout for LDS reads (order=[1,0]: N fastest, matches row-major LDS);
+    # threads_per_warp=[8,4] required by _mxfp8_quant_op's scaled_downcast.
     blocked_layout: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 8],
-        threads_per_warp=[4, 8],
-        warps_per_cta=[1, num_warps],
+        threads_per_warp=[8, 4],
+        warps_per_cta=[num_warps, 1],
         order=[1, 0],
     )
 
@@ -308,26 +314,46 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
         shape=[NUM_BUFFERS, BLOCK_SIZE_M, BLOCK_SIZE_N],
         layout=SHARED_LAYOUT_X,
     )
-
-    # Output fp8 values are written directly to global memory (skipping an
-    # LDS round-trip): scaled_downcast keeps x_reg's blocked_layout, which
-    # buffer_store can use directly to compute per-lane addresses.
-    local_m = gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, blocked_layout))
-    local_n = gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, blocked_layout))
-    out_offs = local_m[:, None] * stride_x_fp8_m_in + local_n[None, :] * stride_x_fp8_n_in
-    if not EVEN_M_N:
-        out_offs_m = pid_m * BLOCK_SIZE_M + local_m
+    out_smem = gl.allocate_shared_memory(
+        x_fp8_ptr.type.element_ty,
+        shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        layout=SHARED_LAYOUT_X,
+    )
+    SHARED_LAYOUT_BS: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[NUM_QUANT_BLOCKS, 8]], [BLOCK_SIZE_M, NUM_QUANT_BLOCKS], [1, 0]
+    )
+    bs_smem = gl.allocate_shared_memory(
+        bs_ptr.type.element_ty,
+        shape=[BLOCK_SIZE_M, NUM_QUANT_BLOCKS],
+        layout=SHARED_LAYOUT_BS,
+    )
 
     # TDM descriptor: base at this CTA's (M, N) origin
     x_base = (
-        x_ptr + pid_m * BLOCK_SIZE_M * stride_x_m + start_n * BLOCK_SIZE_N * stride_x_n
+        x_ptr
+        + pid_m * BLOCK_SIZE_M * stride_x_m_in
+        + start_n * BLOCK_SIZE_N * stride_x_n_in
     )
     x_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=x_base,
         shape=(M - pid_m * BLOCK_SIZE_M, N - start_n * BLOCK_SIZE_N),
-        strides=(stride_x_m, stride_x_n),
+        strides=(stride_x_m_in, stride_x_n_in),
         block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
         layout=SHARED_LAYOUT_X,
+    )
+    out_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=x_fp8_ptr,
+        shape=(M, N),
+        strides=(stride_x_fp8_m_in, stride_x_fp8_n_in),
+        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
+        layout=SHARED_LAYOUT_X,
+    )
+    bs_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=bs_ptr,
+        shape=(M, (N + MXFP8_QUANT_BLOCK_SIZE - 1) // MXFP8_QUANT_BLOCK_SIZE),
+        strides=(stride_bs_m_in, stride_bs_n_in),
+        block_shape=(BLOCK_SIZE_M, NUM_QUANT_BLOCKS),
+        layout=SHARED_LAYOUT_BS,
     )
 
     load_idx = 0
@@ -361,38 +387,27 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
         )
 
         out_fp8, bs_e8m0 = _mxfp8_quant_op(
-            x_reg, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP8_QUANT_BLOCK_SIZE
+            x_reg, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP8_QUANT_BLOCK_SIZE, num_warps
         )
 
         pid_n = start_n + compute_idx
-        out_block_ptr = (
-            x_fp8_ptr
-            + (pid_m * BLOCK_SIZE_M).to(gl.int64) * stride_x_fp8_m
-            + (pid_n * BLOCK_SIZE_N).to(gl.int64) * stride_x_fp8_n
+        out_smem.store(out_fp8)
+        gl.barrier()
+        gl.amd.gfx1250.tdm.async_store(
+            out_desc,
+            [pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N],
+            out_smem,
         )
-        if EVEN_M_N:
-            gl.amd.cdna5.buffer_store(out_fp8, out_block_ptr, out_offs)
-        else:
-            out_offs_n = pid_n * BLOCK_SIZE_N + local_n
-            out_mask = (out_offs_m < M)[:, None] & (out_offs_n < N)[None, :]
-            gl.amd.cdna5.buffer_store(out_fp8, out_block_ptr, out_offs, mask=out_mask)
+        gl.amd.gfx1250.tdm.async_wait(0)
 
-        bs_offs_m = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M)
-        bs_offs_n = pid_n * NUM_QUANT_BLOCKS + gl.arange(0, NUM_QUANT_BLOCKS)
-        bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
-        if EVEN_M_N:
-            gl.amd.cdna5.buffer_store(bs_e8m0, bs_ptr, bs_offs)
-        else:
-            gl.amd.cdna5.buffer_store(
-                bs_e8m0,
-                bs_ptr,
-                bs_offs,
-                mask=(bs_offs_m < M)[:, None]
-                & (
-                    bs_offs_n
-                    < (N + MXFP8_QUANT_BLOCK_SIZE - 1) // MXFP8_QUANT_BLOCK_SIZE
-                )[None, :],
-            )
+        bs_smem.store(bs_e8m0)
+        gl.barrier()
+        gl.amd.gfx1250.tdm.async_store(
+            bs_desc,
+            [pid_m * BLOCK_SIZE_M, pid_n * NUM_QUANT_BLOCKS],
+            bs_smem,
+        )
+        gl.amd.gfx1250.tdm.async_wait(0)
         compute_idx += 1
 
     # ---- Epilogue: drain remaining NUM_BUFFERS-1 tiles ----
@@ -406,37 +421,26 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
         )
 
         out_fp8, bs_e8m0 = _mxfp8_quant_op(
-            x_reg, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP8_QUANT_BLOCK_SIZE
+            x_reg, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP8_QUANT_BLOCK_SIZE, num_warps
         )
 
         pid_n = start_n + compute_idx
-        out_block_ptr = (
-            x_fp8_ptr
-            + (pid_m * BLOCK_SIZE_M).to(gl.int64) * stride_x_fp8_m
-            + (pid_n * BLOCK_SIZE_N).to(gl.int64) * stride_x_fp8_n
+        out_smem.store(out_fp8)
+        gl.barrier()
+        gl.amd.gfx1250.tdm.async_store(
+            out_desc,
+            [pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N],
+            out_smem,
         )
-        if EVEN_M_N:
-            gl.amd.cdna5.buffer_store(out_fp8, out_block_ptr, out_offs)
-        else:
-            out_offs_n = pid_n * BLOCK_SIZE_N + local_n
-            out_mask = (out_offs_m < M)[:, None] & (out_offs_n < N)[None, :]
-            gl.amd.cdna5.buffer_store(out_fp8, out_block_ptr, out_offs, mask=out_mask)
+        gl.amd.gfx1250.tdm.async_wait(0)
 
-        bs_offs_m = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M)
-        bs_offs_n = pid_n * NUM_QUANT_BLOCKS + gl.arange(0, NUM_QUANT_BLOCKS)
-        bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
-        if EVEN_M_N:
-            gl.amd.cdna5.buffer_store(bs_e8m0, bs_ptr, bs_offs)
-        else:
-            gl.amd.cdna5.buffer_store(
-                bs_e8m0,
-                bs_ptr,
-                bs_offs,
-                mask=(bs_offs_m < M)[:, None]
-                & (
-                    bs_offs_n
-                    < (N + MXFP8_QUANT_BLOCK_SIZE - 1) // MXFP8_QUANT_BLOCK_SIZE
-                )[None, :],
-            )
+        bs_smem.store(bs_e8m0)
+        gl.barrier()
+        gl.amd.gfx1250.tdm.async_store(
+            bs_desc,
+            [pid_m * BLOCK_SIZE_M, pid_n * NUM_QUANT_BLOCKS],
+            bs_smem,
+        )
+        gl.amd.gfx1250.tdm.async_wait(0)
         compute_idx += 1
 
