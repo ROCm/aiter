@@ -242,6 +242,14 @@ PY
 # Auto-running the validator is not the same act as trusting a found file. The run below binds
 # its own report to this head, writes it inside this invocation's scratch dir, and then faces
 # the unmodified gate. Set REVIEW_AUTO_VALIDATE=0 to skip it.
+#
+# Each way the auto-run can give up records why, because "required but not run" is only useful
+# to a reader if it names the reason. Triage's own blocker covers the cases where no run was
+# ever attempted; this file covers the ones where it was.
+if [ "${REVIEW_AUTO_VALIDATE:-1}" != 1 ]; then
+  echo "auto-validation is disabled (REVIEW_AUTO_VALIDATE=0)" \
+    >"$WORK/auto_validation_outcome.txt"
+fi
 if [ -z "$VALIDATION_REPORT" ] \
   && [ "${REVIEW_AUTO_VALIDATE:-1}" = 1 ] \
   && python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); sys.exit(0 if r["required"] and r["target"] else 1)' \
@@ -249,10 +257,45 @@ if [ -z "$VALIDATION_REPORT" ] \
   AUTO_TARGET=$(python3 -c \
     'import json,sys; print(json.load(open(sys.argv[1]))["target"])' \
     "$WORK/validation_requirement.json")
-  VALIDATOR_WRAPPER="$PROJECT_ROOT/bin/validate-kernel-pr"
-  if [ ! -x "$VALIDATOR_WRAPPER" ]; then
-    echo "auto-validation skipped: $VALIDATOR_WRAPPER is missing or not executable" >&2
+  # The validator is invoked directly, not through bin/validate-kernel-pr. That wrapper's only
+  # addition is a PR-number front end that re-fetches the diff and re-resolves the base tip,
+  # and this step already holds both. Deriving them a second time reopens the window the gate
+  # below closes: main can advance between the two `gh api` calls, and the report would then
+  # name a base this same review rejects as stale. Reusing what is already fetched also keeps
+  # the dependency inside .claude/skills, alongside the scanner and the schema above.
+  VALIDATOR="$SKILLS_ROOT/validate-kernel-pr/validate_pr.sh"
+  if [ ! -x "$VALIDATOR" ]; then
+    echo "required validator is missing or not executable: $VALIDATOR" >&2
+    exit 1
+  fi
+  # repo.base in the report is `git rev-parse HEAD` inside the worktree handed over, so that
+  # worktree has to sit on the base recorded above for the two to agree.
+  AUTO_BASE=$(cat "$WORK/base_head.txt")
+  AUTO_HEAD=$(python3 -c \
+    'import json,sys; print(json.load(open(sys.argv[1]))["headRefOid"])' \
+    "$WORK/pr_meta.json")
+  AUTO_WT="$WORK/base_repo"
+  # A PR reviewed from another repository resolves a base this checkout has never seen, so
+  # failing to materialise it leaves the review static-only rather than aborting it.
+  set +e
+  git -C "$PROJECT_ROOT" cat-file -e "${AUTO_BASE}^{commit}" 2>/dev/null \
+    || git -C "$PROJECT_ROOT" fetch -q origin "$AUTO_BASE" 2>/dev/null
+  git -C "$PROJECT_ROOT" worktree add --detach "$AUTO_WT" "$AUTO_BASE" >/dev/null 2>&1
+  AUTO_WT_RC=$?
+  set -e
+  if [ "$AUTO_WT_RC" -ne 0 ]; then
+    echo "base $AUTO_BASE cannot be checked out in $PROJECT_ROOT, which is expected for a PR" \
+      "reviewed from another repository" >"$WORK/auto_validation_outcome.txt"
+    echo "auto-validation skipped: $(cat "$WORK/auto_validation_outcome.txt")" >&2
   else
+    # Removal is on a trap because a run interrupted mid-validation would otherwise leave the
+    # worktree registered. The validator reverts its candidate patch on every exit path, so
+    # this disposes of the review's own scratch checkout and is not a dirty-tree repair.
+    remove_auto_worktree() {
+      git -C "$PROJECT_ROOT" worktree remove --force "$AUTO_WT" >/dev/null 2>&1 || true
+      git -C "$PROJECT_ROOT" worktree prune
+    }
+    trap remove_auto_worktree EXIT
     # Route and shape knowledge cannot be derived from a diff, so without these the receipt
     # and grid stages skip and the run tops out at INCONCLUSIVE by construction. That is a
     # limit of what a diff tells you, not a defect in the PR -- Step 8 must say so.
@@ -266,14 +309,17 @@ if [ -z "$VALIDATION_REPORT" ] \
     # BLOCK, NEEDS_WORK and INCONCLUSIVE all still write a report worth consuming, so the
     # exit code must not abort the review; only a missing file means there is nothing to read.
     set +e
-    "$VALIDATOR_WRAPPER" --pr "$PR" --repo "$REPO" --target "$AUTO_TARGET" \
-      --label "review-pr-auto" --out "$WORK/auto_validation_report.json" "${AUTO_ARGS[@]}"
+    "$VALIDATOR" --repo "$AUTO_WT" --patch "$WORK/pr.diff" --head-sha "$AUTO_HEAD" \
+      --target "$AUTO_TARGET" --label "review-pr-auto" \
+      --out "$WORK/auto_validation_report.json" "${AUTO_ARGS[@]}"
     AUTO_RC=$?
     set -e
     if [ -r "$WORK/auto_validation_report.json" ]; then
       VALIDATION_REPORT="$WORK/auto_validation_report.json"
       echo "auto-validation exited $AUTO_RC; consuming its report through the standard gate"
     else
+      echo "the validator exited $AUTO_RC without writing a report" \
+        >"$WORK/auto_validation_outcome.txt"
       echo "auto-validation exited $AUTO_RC and wrote no report; the review stays static-only" >&2
     fi
   fi
@@ -474,15 +520,17 @@ print(
 )
 PY
 else
-  # Distinguish the two reasons there is no report. "Not applicable" and "required but
-  # missing" are different facts about the PR, and collapsing them into one sentence is what
-  # made the old verdict line uninformative.
-  python3 - "$WORK/validation_requirement.json" <<'PY'
+  # Distinguish the reasons there is no report. "Not applicable" and "required but missing"
+  # are different facts about the PR, and collapsing them into one sentence is what made the
+  # old verdict line uninformative. Triage's blocker explains the runs never attempted; the
+  # outcome file explains the ones that were, and one of the two is always present.
+  python3 - "$WORK/validation_requirement.json" "$WORK/auto_validation_outcome.txt" <<'PY'
 import json
 import pathlib
 import sys
 
 req = json.loads(pathlib.Path(sys.argv[1]).read_text())
+outcome = pathlib.Path(sys.argv[2])
 if not req["required"]:
     print(
         "validation not applicable: no runtime surface changed "
@@ -490,10 +538,14 @@ if not req["required"]:
         "not deficient"
     )
 else:
+    reason = req["blocking_reason"]
+    if not reason and outcome.is_file():
+        reason = outcome.read_text().strip()
     print(
         "validation REQUIRED but not run: "
-        f"{req['blocking_reason']}. Report it as a gap in the evidence, and if the reason "
-        "is a missing test target, as a finding about the PR."
+        f"{reason or 'reason unrecorded, which is itself a defect in this step'}. "
+        "Report it as a gap in the evidence, and if the reason is a missing test target, "
+        "as a finding about the PR."
     )
 PY
 fi
