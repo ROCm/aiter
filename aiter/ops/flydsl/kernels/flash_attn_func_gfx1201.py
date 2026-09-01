@@ -204,7 +204,7 @@ def build_flash_attn_func_module(
         Q: fx.Pointer,
         K: fx.Pointer,
         V: fx.Pointer,
-        O: fx.Pointer,
+        O: fx.Pointer,  # noqa: E741 - kernel ABI uses Q/K/V/O tensor names
         seq_len: fx.Int32,
         seq_len_real: fx.Int32,
         seq_len_kv: fx.Int32,
@@ -308,9 +308,13 @@ def build_flash_attn_func_module(
                 pairs.append(
                     _pack_bf16_pair(f32_vals[j * 2], f32_vals[j * 2 + 1], _c16, _cmask)
                 )
-            return Vec.from_elements(pairs, fx.Int32).bitcast(elem_dtype).ir_value()
+            return Vec.from_elements(pairs, fx.Int32).bitcast(elem_dtype)
 
         def coop_load_k(tile_start):
+            # The loop induction variable is index-typed; normalize it before
+            # composing it with the i64 address offsets below. This follows the
+            # current FlyDSL API cleanup on main and is a no-op in gfx1201 ISA.
+            tile_start = fx.Int64(tile_start)
             for batch in range_constexpr(NUM_BATCHES_KV):
                 row_offset = batch * ROWS_PER_BATCH_LOAD
                 row_idx = tile_start + load_row_in_batch + row_offset
@@ -334,6 +338,7 @@ def build_flash_attn_func_module(
             Vec(vec).store(lds_kv, [fx.Index(lds_idx)])
 
         def coop_load_v_global(tile_start):
+            tile_start = fx.Int64(tile_start)
             vecs = []
             for batch in range_constexpr(NUM_BATCHES_KV):
                 row_offset = batch * ROWS_PER_BATCH_LOAD
@@ -370,7 +375,7 @@ def build_flash_attn_func_module(
         # (`v_cmp_gt_i64_e64`) and preserve the baseline ISA hash.
         q_in_bounds = arith.cmpi(arith.CmpIPredicate.slt, _raw(q_row), _raw(seq_len_v))
         q_row_safe = fx.Int64(q_in_bounds.select(q_row, fx.Int64(0)))
-        c_zero_v8f16 = Vec.filled(8, 0.0, elem_dtype).ir_value()
+        c_zero_v8f16 = Vec.filled(8, 0.0, elem_dtype)
         q_b_packs = []
         for ks in range_constexpr(K_STEPS_QK):
             q_col = fx.Int64(ks * K_STEP_QK) + klane * WMMA_LANE_K
@@ -483,9 +488,7 @@ def build_flash_attn_func_module(
                         elem_list = []
                         for j in range_constexpr(8):
                             elem_list.append(fx.Float32(p_slice[j]).to(elem_dtype))
-                        p_packs_st.append(
-                            Vec.from_elements(elem_list, elem_dtype).ir_value()
-                        )
+                        p_packs_st.append(Vec.from_elements(elem_list, elem_dtype))
                 p_packs_all.append(p_packs_st)
 
             # ==== GEMM2: O += V^T @ P (software pipelined, row-major V) ====
@@ -503,7 +506,7 @@ def build_flash_attn_func_module(
                     )
                     v_lds_idx = v_base + kv_row * V_STRIDE + d_pos
                     v_elems.append(_memref.load(lds_kv, [_raw(fx.Index(v_lds_idx))]))
-                return Vec.from_elements(v_elems, elem_dtype).ir_value()
+                return Vec.from_elements(v_elems, elem_dtype)
 
             # Software pipeline: preload first V pack
             cur_v_packs = []
@@ -554,12 +557,12 @@ def build_flash_attn_func_module(
         o_finals = [loop_results[2 + dc] for dc in range_constexpr(D_CHUNKS)]
 
         inv_l = arith.divf(_raw(c_one_f), _raw(l_final), fastmath=fm_fast)
-        inv_l_vec = Vec.from_elements([inv_l], fx.Float32).broadcast_to(8).ir_value()
+        inv_l_vec = Vec.from_elements([inv_l], fx.Float32).broadcast_to(8)
 
         if q_in_bounds:
             for dc in range_constexpr(D_CHUNKS):
                 o_norm_vec = _fmul(o_finals[dc], inv_l_vec)
-                o_trunc = Vec(o_norm_vec).to(elem_dtype).ir_value()
+                o_trunc = Vec(o_norm_vec).to(elem_dtype)
                 d_col = fx.Int64(dc * D_CHUNK) + klane * 8
                 o_global = global_idx(q_row, d_col)
                 _store_global_half(o_ptr, o_global, o_trunc)
@@ -569,7 +572,7 @@ def build_flash_attn_func_module(
         Q: fx.Pointer,
         K: fx.Pointer,
         V: fx.Pointer,
-        O: fx.Pointer,
+        O: fx.Pointer,  # noqa: E741 - kernel ABI uses Q/K/V/O tensor names
         batch_size: fx.Int32,
         seq_len: fx.Int32,
         seq_len_real: fx.Int32,
@@ -612,7 +615,7 @@ def build_flash_attn_func_module(
         Q,
         K,
         V,
-        O,
+        O,  # noqa: E741 - kernel ABI uses Q/K/V/O tensor names
         batch_size,
         seq_len,
         seq_len_real,
