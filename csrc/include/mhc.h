@@ -10,17 +10,12 @@ namespace aiter {
 void mhc_pre_gemm_sqrsum(aiter_tensor_t& out,    // (split_k, m, hc_mult3) / (m, hc_mult3)
                          aiter_tensor_t& sqrsum, // (split_k, m) / (m)
                          aiter_tensor_t& x,      // (m, hc_hidden_size)
-                         aiter_tensor_t& fn,     // (hc_mult3, hc_hidden_size) fp32; packed int32 when is_fn_pack_bf16
+                         aiter_tensor_t& fn,     // (hc_mult3, hc_hidden_size) fp32; packed int32 when is_res_w_preshuffle_bf16
                          int tile_k = 128,
-                         int is_fn_pack_bf16 = 0);
-// Pre-convert fn (fp32) -> packed int32 (hi<<16 | lo) for the bf16 (is_fn_pack_bf16) gemm path.
+                         int is_res_w_preshuffle_bf16 = 0);
+// Pre-convert fn (fp32) -> packed int32 (hi<<16 | lo) for the bf16 (is_res_w_preshuffle_bf16) gemm path.
 void mhc_pre_convert_fn(aiter_tensor_t& fn_packed, // (hc_mult3, hc_hidden_size) int32 out
                         aiter_tensor_t& fn);       // (hc_mult3, hc_hidden_size) fp32 in
-// Preshuffle fn for the FUSED post_pre gemm: fn[n][K] -> fnS[K/32][n][K%32], n zero-padded
-// to n_pad (a multiple of 32). Optionally packs hi<<16|lo in the same pass.
-void mhc_pre_shuffle_fn(aiter_tensor_t& fn_shuffled, // (hc_hidden_size/32, n_pad, 32) out
-                        aiter_tensor_t& fn,          // (hc_mult3, hc_hidden_size) fp32 in
-                        int is_fn_pack_bf16 = 0);
 void mhc_pre_big_fuse(aiter_tensor_t& post_mix,        // (m, hc_mult)
                       aiter_tensor_t& comb_mix,        // (m, hc_mult * hc_mult)
                       aiter_tensor_t& layer_input,     // (m, hidden_size)
@@ -33,7 +28,10 @@ void mhc_pre_big_fuse(aiter_tensor_t& post_mix,        // (m, hc_mult)
                       float hc_pre_eps         = 1e-6,
                       float hc_sinkhorn_eps    = 1e-6,
                       float hc_post_mult_value = 1.0,
-                      int sinkhorn_repeat      = 20);
+                      int sinkhorn_repeat      = 20,
+                      // 1: residual is in the pre-shuffled resS[k/KS][head][row][k%KS]
+                      // layout written by mhc_fused_post_pre_gemm_sqrsum.
+                      int res_preshuffle       = 0);
 void mhc_pre_big_fuse_rmsnorm(aiter_tensor_t& post_mix,        // (m, hc_mult)
                               aiter_tensor_t& comb_mix,        // (m, hc_mult * hc_mult)
                               aiter_tensor_t& out,             // (m, hidden_size)
@@ -48,7 +46,10 @@ void mhc_pre_big_fuse_rmsnorm(aiter_tensor_t& post_mix,        // (m, hc_mult)
                               float hc_sinkhorn_eps    = 1e-6,
                               float norm_eps           = 1e-6,
                               float hc_post_mult_value = 1.0,
-                              int sinkhorn_repeat      = 20);
+                              int sinkhorn_repeat      = 20,
+                              // 1: residual is in the pre-shuffled
+                              // resS[k/KS][head][row][k%KS] layout.
+                              int res_preshuffle       = 0);
 void mhc_post(aiter_tensor_t& out,            // (m, hc_mult, hidden_size)
               aiter_tensor_t& x,              // (m, hidden_size)
               aiter_tensor_t& residual,       // (m, hc_mult, hidden_size)
@@ -76,10 +77,12 @@ void mhc_fused_post_pre_gemm_sqrsum(
     aiter_tensor_t& residual_in,     // (m, hc_mult, hidden_size)
     aiter_tensor_t& post_layer_mix,  // (m, hc_mult)
     aiter_tensor_t& comb_res_mix,    // (m, hc_mult, hc_mult)
-    aiter_tensor_t& fn,              // (hc_mult3, hc_mult * hidden_size); preshuffled when fn_n_pad
+    aiter_tensor_t& fn,              // (hc_mult3, hc_mult * hidden_size) fp32; packed int32
+                                     // when is_res_w_preshuffle_bf16
     int tile_m                       = 16,
     int tile_n                       = 32,
     int tile_k                       = 32,
-    int is_fn_pack_bf16              = 0,
-    int fn_n_pad                     = 0);
+    // 1: bf16 hi/lo fn gemm, and residual_in / next_residual are in the
+    // pre-shuffled resS[k/KS][head][row][k%KS] layout.
+    int is_res_w_preshuffle_bf16     = 0);
 } // namespace aiter
