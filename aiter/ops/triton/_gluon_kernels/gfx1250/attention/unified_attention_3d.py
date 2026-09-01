@@ -722,7 +722,7 @@ class AttentionProgram:
         query_offset_1_pv,
         query_mask_0_pv,
         query_mask_1_pv,
-        segm_idx,
+        segment_tile_start,
         tiles_per_segment,
         stride_k_cache_0,
         stride_k_cache_1,
@@ -903,8 +903,8 @@ class AttentionProgram:
 
         # Calculate tile range
         num_tiles = (max_seq_prefix_len + cfg.TILE_SIZE - 1) // cfg.TILE_SIZE
-        tile_start = segm_idx * tiles_per_segment
-        tile_end = min((segm_idx + 1) * tiles_per_segment, num_tiles)
+        tile_start = segment_tile_start
+        tile_end = min(segment_tile_start + tiles_per_segment, num_tiles)
         if cfg.SLIDING_WINDOW > 0:
             qpos_lo = q_block_local_idx * cfg.BLOCK_Q
             qpos_hi = gl.minimum(
@@ -913,8 +913,10 @@ class AttentionProgram:
             )
             first_allowed_key = context_len + qpos_lo - cfg.SLIDING_WINDOW + 1
             last_allowed_key = context_len + qpos_hi
-            tile_start = gl.maximum(0, first_allowed_key // cfg.BLOCK_SIZE)
-            tile_end = gl.minimum((last_allowed_key // cfg.BLOCK_SIZE) + 1, num_tiles)
+            first_allowed_tile = gl.maximum(0, first_allowed_key // cfg.TILE_SIZE)
+            last_allowed_tile = (last_allowed_key // cfg.TILE_SIZE) + 1
+            tile_start = gl.maximum(tile_start, first_allowed_tile)
+            tile_end = gl.minimum(tile_end, gl.minimum(last_allowed_tile, num_tiles))
 
         query_pos_qk = gl.convert_layout(
             query_pos_qk, gl.SliceLayout(1, cfg.QK_WMMA_UNPACKED_LAYOUT)
@@ -1835,17 +1837,30 @@ def cdiv_fn(x, y):
 def get_seq_metadata(
     seq_lens_ptr,
     seq_idx,
+    segm_idx,
     TILE_SIZE: gl.constexpr,
     NUM_SEGMENTS_PER_SEQ: gl.constexpr,
+    SLIDING_WINDOW: gl.constexpr,
+    ALL_DECODE: gl.constexpr,
 ):
     # sequence len for this particular sequence
     seq_len = gl.load(seq_lens_ptr + seq_idx)
 
-    # number of segments for this particular sequence
+    # Decode only needs tiles intersecting the live window. Rebase the segment
+    # grid onto its first tile so different segments do not repeat that work.
+    total_seq_tiles = cdiv_fn(seq_len, TILE_SIZE)
     num_segments = NUM_SEGMENTS_PER_SEQ
-    tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+    if ALL_DECODE and SLIDING_WINDOW > 0:
+        first_allowed_key = gl.maximum(0, seq_len - SLIDING_WINDOW)
+        first_tile = first_allowed_key // TILE_SIZE
+        live_tiles = total_seq_tiles - first_tile
+        tiles_per_segment = cdiv_fn(live_tiles, num_segments)
+        segment_tile_start = first_tile + segm_idx * tiles_per_segment
+    else:
+        tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+        segment_tile_start = segm_idx * tiles_per_segment
 
-    return seq_len, tiles_per_segment
+    return seq_len, tiles_per_segment, segment_tile_start, total_seq_tiles
 
 
 @gluon.jit
@@ -1910,6 +1925,7 @@ unified_attention_gluon_kernel_3d_repr = make_kernel_repr(
         "BLOCK_SIZE",
         "TILE_SIZE",
         "HEAD_SIZE",
+        "SLIDING_WINDOW",
         "NUM_BLOCKS_GATHER_PER_TILE",
         "NUM_SEGMENTS_PER_SEQ",
         "num_warps",
@@ -2053,14 +2069,17 @@ def _unified_attention_gluon_kernel_3d(
         if q_block_local_idx * cfg.BLOCK_Q >= cur_batch_query_len:
             return
 
-    seq_len, tiles_per_segment = get_seq_metadata(
+    seq_len, tiles_per_segment, segment_tile_start, total_seq_tiles = get_seq_metadata(
         seq_lens_ptr,
         seq_idx,
+        segm_idx,
         cfg.TILE_SIZE,
         cfg.NUM_SEGMENTS_PER_SEQ,
+        cfg.SLIDING_WINDOW,
+        cfg.ALL_DECODE,
     )
 
-    if segm_idx * tiles_per_segment * cfg.TILE_SIZE >= seq_len:
+    if segment_tile_start >= total_seq_tiles:
         return
 
     qk_factor: gl.float32 = cfg.QK_SCALE
@@ -2235,7 +2254,7 @@ def _unified_attention_gluon_kernel_3d(
         query_offset_1_pv,
         query_mask_0_pv,
         query_mask_1_pv,
-        segm_idx,  # for 2D, segm_idx = 0
+        segment_tile_start,
         tiles_per_segment,  # for 2D, tiles_per_segment = num_tiles = (max_seq_prefix_len + cfg.BLOCK_SIZE - 1) // cfg.BLOCK_SIZE
         stride_k_cache_0,
         stride_k_cache_1,

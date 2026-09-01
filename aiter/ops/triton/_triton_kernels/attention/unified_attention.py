@@ -469,6 +469,7 @@ kernel_unified_attention_3d_repr = make_kernel_repr(
         "BLOCK_SIZE",
         "TILE_SIZE",
         "HEAD_SIZE",
+        "SLIDING_WINDOW",
         "NUM_SEGMENTS_PER_SEQ",
         "num_warps",
         "waves_per_eu",
@@ -571,11 +572,23 @@ def kernel_unified_attention_3d(
     # sequence len for this particular sequence
     seq_len = tl.load(seq_lens_ptr + seq_idx)
 
-    # number of segments for this particular sequence
+    # Number of segments for this sequence. For sliding-window decode, split
+    # only the live KV window. Partitioning the entire sequence still loads old
+    # KV tiles before masking them and leaves empty leading segments for the
+    # reducer.
     num_segments = NUM_SEGMENTS_PER_SEQ
-    tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+    total_seq_tiles = cdiv_fn(seq_len, TILE_SIZE)
+    if ALL_DECODE and SLIDING_WINDOW > 0:
+        first_allowed_key = tl.maximum(0, seq_len - SLIDING_WINDOW)
+        first_tile = first_allowed_key // TILE_SIZE
+        live_tiles = total_seq_tiles - first_tile
+        tiles_per_segment = cdiv_fn(live_tiles, num_segments)
+        segment_tile_start = first_tile + segm_idx * tiles_per_segment
+    else:
+        tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+        segment_tile_start = segm_idx * tiles_per_segment
 
-    if segm_idx * tiles_per_segment * TILE_SIZE >= seq_len:
+    if segment_tile_start >= total_seq_tiles:
         return
 
     offs_m = tl.arange(0, BLOCK_M)
@@ -686,8 +699,8 @@ def kernel_unified_attention_3d(
 
     # iterate through tiles within current segment
     for j in range(
-        segm_idx * tiles_per_segment,
-        min((segm_idx + 1) * tiles_per_segment, num_tiles),
+        segment_tile_start,
+        min(segment_tile_start + tiles_per_segment, num_tiles),
     ):
         seq_offset = j * TILE_SIZE + offs_t
         if TILE_SIZE == BLOCK_SIZE:
@@ -875,7 +888,9 @@ _reduce_segments_repr = make_kernel_repr(
         "num_query_heads",
         "TILE_SIZE",
         "HEAD_SIZE",
+        "SLIDING_WINDOW",
         "NUM_SEGMENTS_PER_SEQ",
+        "ALL_DECODE",
     ],
 )
 
@@ -900,6 +915,8 @@ def reduce_segments(
     query_start_len_ptr,  # [num_seqs+1]
     BLOCK_Q: tl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
+    SLIDING_WINDOW: tl.constexpr = -1,  # int
+    ALL_DECODE: tl.constexpr = False,  # bool
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -919,10 +936,18 @@ def reduce_segments(
 
     # number of segments for this particular sequence
     num_segments = NUM_SEGMENTS_PER_SEQ
-    tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+    if ALL_DECODE and SLIDING_WINDOW > 0:
+        total_seq_tiles = cdiv_fn(seq_len, TILE_SIZE)
+        first_allowed_key = tl.maximum(0, seq_len - SLIDING_WINDOW)
+        first_tile = first_allowed_key // TILE_SIZE
+        live_tiles = total_seq_tiles - first_tile
+        tiles_per_segment = cdiv_fn(live_tiles, num_segments)
+        act_num_segments = cdiv_fn(live_tiles, tiles_per_segment)
+    else:
+        tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+        act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
 
     # create masks for subsequent loads
-    act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
     segm_mask = tl.arange(0, NUM_SEGMENTS_PER_SEQ) < tl.full(
         [NUM_SEGMENTS_PER_SEQ], act_num_segments, dtype=tl.int32
     )

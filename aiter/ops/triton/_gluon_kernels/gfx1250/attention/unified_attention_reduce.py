@@ -30,6 +30,8 @@ def reduce_segments_gluon(
     D: gl.constexpr,
     D_PAD: gl.constexpr,
     TILE_SIZE: gl.constexpr,
+    SLIDING_WINDOW: gl.constexpr,
+    ALL_DECODE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     IS_FP8_OUT: gl.constexpr,
     FP8_MIN: gl.constexpr,
@@ -39,9 +41,17 @@ def reduce_segments_gluon(
 
     # all-decode: each sequence has exactly one query token, so seq_idx == token
     seq_len = gl.load(seq_lens_ptr + token)
-    tiles_per_segment = (seq_len + S * TILE_SIZE - 1) // (S * TILE_SIZE)
-    denom = tiles_per_segment * TILE_SIZE
-    act_num_segments = (seq_len + denom - 1) // denom
+    # Match the attention kernel's live-tile partition so uninitialized
+    # trailing segment slots remain masked during the reduction.
+    total_seq_tiles = (seq_len + TILE_SIZE - 1) // TILE_SIZE
+    if ALL_DECODE and SLIDING_WINDOW > 0:
+        first_allowed_key = gl.maximum(0, seq_len - SLIDING_WINDOW)
+        first_tile = first_allowed_key // TILE_SIZE
+        active_tiles = total_seq_tiles - first_tile
+    else:
+        active_tiles = total_seq_tiles
+    tiles_per_segment = (active_tiles + S - 1) // S
+    act_num_segments = (active_tiles + tiles_per_segment - 1) // tiles_per_segment
 
     # --- layouts: head axis split across waves, segment axis in-thread ---
     SIZE_H: gl.constexpr = H // NUM_WARPS
