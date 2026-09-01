@@ -1,18 +1,39 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+import contextlib
+
 import torch
 import triton
 import triton.language as tl
+from triton import knobs
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.amd import warp_pipeline_stage
-from triton.experimental.gluon.language.amd.cdna4 import async_copy as async_cp
-from triton.experimental.gluon.language.amd.cdna4 import mfma as mfma_cdna4
+from triton.experimental.gluon.language.amd.cdna4 import async_copy as cdna4_async
+from triton.experimental.gluon.language.amd.cdna4 import mfma as cdna4_mfma
 
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+
+@contextlib.contextmanager
+def _scalarize_packed_fops(enable):
+    # knobs.* is global; guard mutation so concurrent launches/compilations can't see a transient value.
+    import threading
+
+    if not hasattr(_scalarize_packed_fops, "_lock"):
+        _scalarize_packed_fops._lock = threading.Lock()
+    with _scalarize_packed_fops._lock:
+        saved = knobs.amd.scalarize_packed_fops
+        knobs.amd.scalarize_packed_fops = enable
+        try:
+            yield
+        finally:
+            knobs.amd.scalarize_packed_fops = saved
+
 
 # log(2)
 _LN2 = gl.constexpr(0.6931471824645996)
@@ -167,18 +188,12 @@ def dma_layouts_ok(head_dim, block_n, num_warps, elem_bits):
 
 
 @gluon.jit
-def _max_propagating_nan(a, b):
+def _nan_propagating_max(a, b):
     return gl.maximum(a, b, propagate_nan=tl.PropagateNan.ALL)
 
 
 @gluon.jit
-def _row_max(x):
-    """Row-wise reduce-max using IEEE 754 maximum (propagates NaN)."""
-    return gl.reduce(x, 1, _max_propagating_nan)
-
-
-@gluon.jit
-def _softmax_vec1(qk, m_run, QK_SCALE: gl.constexpr, SCALE_ON_Q: gl.constexpr):
+def sc_vec1(qk, m_run, qk_scale: gl.constexpr, SCALE_ON_Q: gl.constexpr):
     """VEC1 -- softmax numerator: new row max, the ``exp2`` burst, and ``alpha``.
 
     Lives in the ``dot2`` cluster: ``exp2`` is the most expensive item in the softmax
@@ -188,21 +203,21 @@ def _softmax_vec1(qk, m_run, QK_SCALE: gl.constexpr, SCALE_ON_Q: gl.constexpr):
     if SCALE_ON_Q:
         # qk already carries the scale (folded into Q before the loop), so the row max
         # needs no multiply and the exponent argument is a plain subtract.
-        m_ij = _row_max(qk)
+        m_ij = gl.reduce(qk, axis=1, combine_fn=_nan_propagating_max)
         m_new = gl.maximum(m_run, m_ij, propagate_nan=tl.PropagateNan.ALL)
         p = gl.exp2(qk - m_new[:, None])
     else:
-        m_ij = _row_max(qk) * QK_SCALE
+        m_ij = gl.reduce(qk, axis=1, combine_fn=_nan_propagating_max) * qk_scale
         m_new = gl.maximum(m_run, m_ij, propagate_nan=tl.PropagateNan.ALL)
         # Fuse the multiply and the subtract at the source (one llvm.fmuladd) rather
         # than leaving an fmul/fsub pair for the backend to contract later.
-        p = gl.exp2(gl.fma(qk, QK_SCALE, -m_new[:, None]))
+        p = gl.exp2(gl.fma(qk, qk_scale, -m_new[:, None]))
     alpha = gl.exp2(m_run - m_new)
     return m_new, p, alpha
 
 
 @gluon.jit
-def _softmax_vec2(acc, l_i, p, alpha, P_LAYOUT: gl.constexpr, DTYPE: gl.constexpr):
+def sc_vec2(acc, l_i, p, alpha, p_dot_layout: gl.constexpr, DTYPE: gl.constexpr):
     """VEC2 -- softmax denominator, accumulator rescale, and the P operand downcast.
 
     Lives in the ``dot1`` cluster, beside the Q@K^T MFMA.  ``p`` and ``alpha`` were
@@ -215,7 +230,7 @@ def _softmax_vec2(acc, l_i, p, alpha, P_LAYOUT: gl.constexpr, DTYPE: gl.constexp
     acc = acc * alpha[:, None]
     l_ij = gl.sum(p, axis=1)
     l_i = l_i * alpha + l_ij
-    p_dot = gl.convert_layout(p.to(DTYPE), P_LAYOUT)
+    p_dot = gl.convert_layout(p.to(DTYPE), p_dot_layout)
     return acc, l_i, p_dot
 
 
@@ -228,10 +243,10 @@ def _softmax_vec2(acc, l_i, p, alpha, P_LAYOUT: gl.constexpr, DTYPE: gl.constexp
 def _dma(smem, base, offsets, mask, HAS_MASK: gl.constexpr):
     """Kick off one global->LDS DMA tile and close its commit group."""
     if HAS_MASK:
-        async_cp.buffer_load_to_shared(smem, base, offsets, mask=mask, other=0.0)
+        cdna4_async.buffer_load_to_shared(smem, base, offsets, mask=mask, other=0.0)
     else:
-        async_cp.buffer_load_to_shared(smem, base, offsets)
-    async_cp.commit_group()
+        cdna4_async.buffer_load_to_shared(smem, base, offsets)
+    cdna4_async.commit_group()
 
 
 @gluon.jit
@@ -361,7 +376,7 @@ def _pipe_tile(
     KT_DOT: gl.constexpr,
     V_DOT: gl.constexpr,
     P_DOT: gl.constexpr,
-    QK_SCALE: gl.constexpr,
+    qk_scale: gl.constexpr,
     SCALE_ON_Q: gl.constexpr,
     DTYPE: gl.constexpr,
     HAS_MASK: gl.constexpr,
@@ -382,24 +397,24 @@ def _pipe_tile(
     """
     with warp_pipeline_stage("dot1"):
         qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=MFMA_LAYOUT)
-        qk = mfma_cdna4(q_dot, kt_dot, qk)
-        acc, l_i, p_dot = _softmax_vec2(acc, l_i, p_c, alpha_c, P_DOT, DTYPE)
+        qk = cdna4_mfma(q_dot, kt_dot, qk)
+        acc, l_i, p_dot = sc_vec2(acc, l_i, p_c, alpha_c, P_DOT, DTYPE)
 
     # wait_group(2) is the depth the pipeline needs, but the backend then derives a
     # too-loose s_waitcnt vmcnt and lets a ds_read race ahead of the copy filling it.
     # Draining one extra group closes that; the group is not needed yet.
-    async_cp.wait_group(1)
+    cdna4_async.wait_group(1)
     with warp_pipeline_stage("mem1"):
-        v_dot = async_cp.load_shared_relaxed(v_smem.index(CUR), V_DOT)
+        v_dot = cdna4_async.load_shared_relaxed(v_smem.index(CUR), V_DOT)
         _dma(kt_smem.index(NXT), k_base + (blk + 3) * kt_step, kt_off, k_mask, HAS_MASK)
 
     with warp_pipeline_stage("dot2"):
-        acc = mfma_cdna4(p_dot, v_dot, acc)
-        m_run, p_c, alpha_c = _softmax_vec1(qk, m_run, QK_SCALE, SCALE_ON_Q)
+        acc = cdna4_mfma(p_dot, v_dot, acc)
+        m_run, p_c, alpha_c = sc_vec1(qk, m_run, qk_scale, SCALE_ON_Q)
 
-    async_cp.wait_group(1)
+    cdna4_async.wait_group(1)
     with warp_pipeline_stage("mem2"):
-        kt_dot = async_cp.load_shared_relaxed(kt_smem.index(CUR), KT_DOT)
+        kt_dot = cdna4_async.load_shared_relaxed(kt_smem.index(CUR), KT_DOT)
         _dma(v_smem.index(CUR), v_base + (blk + 2) * v_step, v_off, v_mask, HAS_MASK)
 
     return acc, l_i, m_run, p_c, alpha_c, kt_dot
@@ -410,7 +425,22 @@ def _pipe_tile(
 # ---------------------------------------------------------------------------
 
 
-@gluon.jit
+_mha_fwd_gluon_kernel_repr = make_kernel_repr(
+    "_mha_fwd_gluon_kernel",
+    [
+        "BLOCK_M",
+        "BLOCK_N",
+        "HEAD_DIM",
+        "IS_CAUSAL",
+        "PIPELINED",
+        "SEQLEN_Q",
+        "SEQLEN_K",
+        "DTYPE",
+    ],
+)
+
+
+@gluon.jit(repr=_mha_fwd_gluon_kernel_repr)
 def _mha_fwd_gluon_kernel(
     Q,
     K,
@@ -448,58 +478,116 @@ def _mha_fwd_gluon_kernel(
     PIPELINED: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
-    NUM_WARPS: gl.constexpr,
 ):
     # ---------------- layouts ----------------
-    mfma: gl.constexpr = gl.amd.AMDMFMALayout(
+    num_warps: gl.constexpr = gl.num_warps()
+    mma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
         instr_shape=[32, 32, 16],
         transposed=True,
-        warps_per_cta=[NUM_WARPS, 1],
+        warps_per_cta=[num_warps, 1],
     )
     q_dot_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=0, parent=mfma, k_width=8
+        operand_index=0, parent=mma_layout, k_width=8
     )
     kt_dot_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=mfma, k_width=8
+        operand_index=1, parent=mma_layout, k_width=8
     )
     p_dot_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=0, parent=mfma, k_width=4
+        operand_index=0, parent=mma_layout, k_width=4
     )
     v_dot_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=mfma, k_width=4
+        operand_index=1, parent=mma_layout, k_width=4
     )
 
-    m_slice: gl.constexpr = gl.SliceLayout(1, mfma)  # per-row vectors (m_i, l_i)
-    n_slice: gl.constexpr = gl.SliceLayout(0, mfma)  # per-column vectors
+    mma_m_layout: gl.constexpr = gl.SliceLayout(
+        1, mma_layout
+    )  # per-row vectors (m_i, l_i)
+    mma_n_layout: gl.constexpr = gl.SliceLayout(0, mma_layout)  # per-column vectors
 
     # Q staging and the O store share one blocked layout: `order=[1, 0]` puts the head
     # dim contiguous and 8 elements per lane is exactly the dwordx4 both the DMA and
     # the store want.
-    q_blocked: gl.constexpr = blocked_row_major([BLOCK_M, HEAD_DIM], 8, NUM_WARPS)
-    q_shared: gl.constexpr = swizzled([1, 0])
-    offs_m_blocked: gl.constexpr = gl.SliceLayout(1, q_blocked)
-    offs_d_blocked: gl.constexpr = gl.SliceLayout(0, q_blocked)
+    blocked_layout: gl.constexpr = blocked_row_major([BLOCK_M, HEAD_DIM], 8, num_warps)
+    q_smem_layout: gl.constexpr = swizzled([1, 0])
+    offs_m_layout: gl.constexpr = gl.SliceLayout(1, blocked_layout)
+    offs_d_layout: gl.constexpr = gl.SliceLayout(0, blocked_layout)
 
     # The LSE store is 1-D over BLOCK_M and wants consecutive rows on consecutive lanes,
-    # so it needs its own M-major arrangement rather than a slice of `q_blocked`, which
+    # so it needs its own M-major arrangement rather than a slice of `blocked_layout`, which
     # would leave only 4 lanes along M and 8 stride-4 stores.
-    lse_blocked: gl.constexpr = gl.BlockedLayout(
-        [1, 8], [16, 4], [NUM_WARPS, 1], [1, 0]
-    )
-    offs_m_lse: gl.constexpr = gl.SliceLayout(1, lse_blocked)
+    lse_layout: gl.constexpr = gl.BlockedLayout([1, 8], [16, 4], [num_warps, 1], [1, 0])
+    offs_m_lse_layout: gl.constexpr = gl.SliceLayout(1, lse_layout)
 
     ELEM_BITS: gl.constexpr = 16
-    KV_VEC: gl.constexpr = dma_vec(HEAD_DIM, BLOCK_N, 0, NUM_WARPS, ELEM_BITS)
+    KV_VEC: gl.constexpr = dma_vec(HEAD_DIM, BLOCK_N, 0, num_warps, ELEM_BITS)
     # K is read transposed -- a [HEAD_DIM, BLOCK_N] tile whose dim 0 (the head dim) is
     # the contiguous one -- while V keeps its natural [BLOCK_N, HEAD_DIM] shape.
-    kt_src: gl.constexpr = dma_source_layout(HEAD_DIM, BLOCK_N, 0, NUM_WARPS, KV_VEC)
-    v_src: gl.constexpr = dma_source_layout(BLOCK_N, HEAD_DIM, 1, NUM_WARPS, KV_VEC)
-    kt_shared: gl.constexpr = dma_shared_layout(HEAD_DIM, BLOCK_N, 0, pad=8)
-    v_shared: gl.constexpr = dma_shared_layout(BLOCK_N, HEAD_DIM, 1, pad=32)
+    #
+    # === _TILE_NON_CAUSAL -- num_warps=8, BLOCK_M=256 ======================
+    #
+    # kt_async_layout = DistributedLinearLayout(
+    #     reg_bases=[[1, 0], [2, 0], [4, 0], [0, 8]],
+    #     lane_bases=[[8, 0], [16, 0], [32, 0], [64, 0], [0, 16], [0, 32]],
+    #     warp_bases=[[0, 1], [0, 2], [0, 4]],
+    #     block_bases=[],
+    #     shape=[HEAD_DIM, BLOCK_N])
+    #
+    # v_async_layout = DistributedLinearLayout(
+    #     reg_bases=[[0, 1], [0, 2], [0, 4], [8, 0]],
+    #     lane_bases=[[0, 8], [0, 16], [0, 32], [0, 64], [16, 0], [32, 0]],
+    #     warp_bases=[[1, 0], [2, 0], [4, 0]],
+    #     block_bases=[],
+    #     shape=[BLOCK_N, HEAD_DIM])
+    #
+    # === _TILE_CAUSAL -- num_warps=4, BLOCK_M=128 ==========================
+    #
+    # kt_async_layout = DistributedLinearLayout(
+    #     reg_bases=[[1, 0], [2, 0], [4, 0], [0, 4], [0, 8]],
+    #     lane_bases=[[8, 0], [16, 0], [32, 0], [64, 0], [0, 16], [0, 32]],
+    #     warp_bases=[[0, 1], [0, 2]],
+    #     block_bases=[],
+    #     shape=[HEAD_DIM, BLOCK_N])
+    #
+    # v_async_layout = DistributedLinearLayout(
+    #     reg_bases=[[0, 1], [0, 2], [0, 4], [4, 0], [8, 0]],
+    #     lane_bases=[[0, 8], [0, 16], [0, 32], [0, 64], [16, 0], [32, 0]],
+    #     warp_bases=[[1, 0], [2, 0]],
+    #     block_bases=[],
+    #     shape=[BLOCK_N, HEAD_DIM])
+    #
+    # === shared layouts -- identical for both tiles ========================
+    # Note the stagger the docstring describes: the strided axis contributes its
+    # HIGH bits ([0, 16], [0, 32]) before its LOW bits ([0, 1] .. [0, 8]), which
+    # is what spreads consecutive strided entries across LDS banks.
+    #
+    # kt_async_smem_layout = PaddedSharedLayout(
+    #     interval_padding_pairs=[[512, 8]],
+    #     offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0],
+    #                   [0, 16], [0, 32], [0, 1], [0, 2], [0, 4], [0, 8]],
+    #     block_bases=[],
+    #     shape=[HEAD_DIM, BLOCK_N])
+    #
+    # v_async_smem_layout = PaddedSharedLayout(
+    #     interval_padding_pairs=[[512, 32]],
+    #     offset_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64],
+    #                   [16, 0], [32, 0], [1, 0], [2, 0], [4, 0], [8, 0]],
+    #     block_bases=[],
+    #     shape=[BLOCK_N, HEAD_DIM])
+    #
+    # v_async_layout / v_async_smem_layout are the same lists with the pair order swapped, since V is
+    # the transpose of the K^T tile shape.
+    kt_async_layout: gl.constexpr = dma_source_layout(
+        HEAD_DIM, BLOCK_N, 0, num_warps, KV_VEC
+    )
+    v_async_layout: gl.constexpr = dma_source_layout(
+        BLOCK_N, HEAD_DIM, 1, num_warps, KV_VEC
+    )
+    kt_async_smem_layout: gl.constexpr = dma_shared_layout(HEAD_DIM, BLOCK_N, 0, pad=8)
+    v_async_smem_layout: gl.constexpr = dma_shared_layout(BLOCK_N, HEAD_DIM, 1, pad=32)
 
     PADDED_HEAD: gl.constexpr = ACTUAL_HEAD_DIM != HEAD_DIM
-    QK_SCALE: gl.constexpr = SM_SCALE * 1.44269504089
+    qk_scale: gl.constexpr = SM_SCALE * 1.44269504089
     BUF_DEPTH: gl.constexpr = 2
 
     # ---------------- program ids ----------------
@@ -523,28 +611,25 @@ def _mha_fwd_gluon_kernel(
 
     if n_blocks <= 0:
         # Every row of this Q block is fully masked: write zeros to O and +inf to LSE.
-        offs_m_z = start_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=offs_m_blocked)
-        offs_d_z = gl.arange(0, HEAD_DIM, layout=offs_d_blocked)
+        offs_m_z = start_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=offs_m_layout)
+        offs_d_z = gl.arange(0, HEAD_DIM, layout=offs_d_layout)
         o_base_z = Out + off_z * stride_oz + off_h_q * stride_oh
         o_offs_z = offs_m_z[:, None] * stride_om + offs_d_z[None, :] * stride_on
         o_mask_z = offs_m_z[:, None] < SEQLEN_Q
         if PADDED_HEAD:
             o_mask_z = o_mask_z & (offs_d_z[None, :] < ACTUAL_HEAD_DIM)
         zeros = gl.zeros(
-            [BLOCK_M, HEAD_DIM], dtype=Out.dtype.element_ty, layout=q_blocked
+            [BLOCK_M, HEAD_DIM], dtype=Out.dtype.element_ty, layout=blocked_layout
         )
         gl.amd.cdna4.buffer_store(zeros, o_base_z, o_offs_z, mask=o_mask_z)
         if WRITE_LSE:
-            offs_l = start_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=offs_m_lse)
+            offs_l = start_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=offs_m_lse_layout)
             l_ptrs = L + (off_z * HQ + off_h_q) * SEQLEN_Q + offs_l
-            # What a row that attends to nothing stores is caller-chosen, because
-            # the callers disagree: flash_attn_3 (fwd_prefill.py's `invalid_mask`
-            # store) and aiter/test_mha_common.py::opus_ref_lse use -inf, while
-            # mha.py's own forward writes 0.0 there.  Live rows are identical
-            # either way.
             gl.store(
                 l_ptrs,
-                gl.full([BLOCK_M], DEAD_ROW_LSE, dtype=gl.float32, layout=offs_m_lse),
+                gl.full(
+                    [BLOCK_M], DEAD_ROW_LSE, dtype=gl.float32, layout=offs_m_lse_layout
+                ),
                 mask=offs_l < SEQLEN_Q,
             )
         return
@@ -553,11 +638,11 @@ def _mha_fwd_gluon_kernel(
     # q_smem's live range ends at the load below, so Triton overlays the K/V buffers on
     # top of it -- which is the only reason a 256x128 Q tile and two double-buffered
     # K/V tiles fit in LDS together.  Keep the read here, before the K/V allocation.
-    q_smem = gl.allocate_shared_memory(DTYPE, [BLOCK_M, HEAD_DIM], q_shared)
+    q_smem = gl.allocate_shared_memory(DTYPE, [BLOCK_M, HEAD_DIM], q_smem_layout)
 
     q_base = Q + off_z * stride_qz + off_h_q * stride_qh
-    q_offs_m = start_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=offs_m_blocked)
-    q_offs_d = gl.arange(0, HEAD_DIM, layout=offs_d_blocked)
+    q_offs_m = start_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=offs_m_layout)
+    q_offs_d = gl.arange(0, HEAD_DIM, layout=offs_d_layout)
     q_offs = q_offs_m[:, None] * stride_qm + q_offs_d[None, :] * stride_qk
     q_mask = q_offs_m[:, None] < SEQLEN_Q
     if PADDED_HEAD:
@@ -566,34 +651,36 @@ def _mha_fwd_gluon_kernel(
         # materialised in LDS.  The masked lanes are always the same ones (the head-dim
         # padding), so zeroing the buffer once up front is enough and keeps the garbage
         # from poisoning the MFMA accumulators.
-        q_smem.store(gl.zeros([BLOCK_M, HEAD_DIM], dtype=DTYPE, layout=q_blocked))
+        q_smem.store(gl.zeros([BLOCK_M, HEAD_DIM], dtype=DTYPE, layout=blocked_layout))
         gl.barrier()
-    async_cp.buffer_load_to_shared(q_smem, q_base, q_offs, mask=q_mask, other=0.0)
-    async_cp.commit_group()
-    async_cp.wait_group(0)
+    cdna4_async.buffer_load_to_shared(q_smem, q_base, q_offs, mask=q_mask, other=0.0)
+    cdna4_async.commit_group()
+    cdna4_async.wait_group(0)
     q_dot = q_smem.load(layout=q_dot_layout)
     if SCALE_ON_Q:
         # Fold qk_scale into the Q operand once, here, rather than into every tile's
         # score matrix inside the loop.  q_dot lives in registers for every iteration,
         # so this is a single pass over 32 VGPRs.
-        q_dot = (q_dot.to(gl.float32) * QK_SCALE).to(DTYPE)
+        q_dot = (q_dot.to(gl.float32) * qk_scale).to(DTYPE)
 
     # ---------------- K / V shared memory and DMA addresses ----------------
     kt_smem = gl.allocate_shared_memory(
-        DTYPE, [BUF_DEPTH, HEAD_DIM, BLOCK_N], kt_shared
+        DTYPE, [BUF_DEPTH, HEAD_DIM, BLOCK_N], kt_async_smem_layout
     )
-    v_smem = gl.allocate_shared_memory(DTYPE, [BUF_DEPTH, BLOCK_N, HEAD_DIM], v_shared)
+    v_smem = gl.allocate_shared_memory(
+        DTYPE, [BUF_DEPTH, BLOCK_N, HEAD_DIM], v_async_smem_layout
+    )
 
     k_base = K + off_z * stride_kz + off_h_k * stride_kh
     v_base = V + off_z * stride_vz + off_h_k * stride_vh
 
     # The intra-tile offset pattern never changes; successive tiles advance the scalar
     # base pointer instead, which keeps the address VALU out of the loop entirely.
-    kt_offs_d = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(1, kt_src))
-    kt_offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, kt_src))
+    kt_offs_d = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(1, kt_async_layout))
+    kt_offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, kt_async_layout))
     kt_off = kt_offs_d[:, None] * stride_kk + kt_offs_n[None, :] * stride_kn
-    v_offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, v_src))
-    v_offs_d = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, v_src))
+    v_offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, v_async_layout))
+    v_offs_d = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, v_async_layout))
     v_off = v_offs_n[:, None] * stride_vn + v_offs_d[None, :] * stride_vk
     kt_step = BLOCK_N * stride_kn
     v_step = BLOCK_N * stride_vn
@@ -605,10 +692,10 @@ def _mha_fwd_gluon_kernel(
         v_head_mask = v_offs_d[None, :] < ACTUAL_HEAD_DIM
         for buf in gl.static_range(BUF_DEPTH):
             kt_smem.index(buf).store(
-                gl.zeros([HEAD_DIM, BLOCK_N], dtype=DTYPE, layout=kt_src)
+                gl.zeros([HEAD_DIM, BLOCK_N], dtype=DTYPE, layout=kt_async_layout)
             )
             v_smem.index(buf).store(
-                gl.zeros([BLOCK_N, HEAD_DIM], dtype=DTYPE, layout=v_src)
+                gl.zeros([BLOCK_N, HEAD_DIM], dtype=DTYPE, layout=v_async_layout)
             )
         gl.barrier()
     else:
@@ -616,12 +703,12 @@ def _mha_fwd_gluon_kernel(
         v_head_mask = None
 
     # ---------------- accumulators ----------------
-    m_i = gl.full([BLOCK_M], float("-inf"), dtype=gl.float32, layout=m_slice)
-    l_i = gl.full([BLOCK_M], 1.0, dtype=gl.float32, layout=m_slice)
-    acc = gl.zeros([BLOCK_M, HEAD_DIM], dtype=gl.float32, layout=mfma)
+    m_i = gl.full([BLOCK_M], float("-inf"), dtype=gl.float32, layout=mma_m_layout)
+    l_i = gl.full([BLOCK_M], 1.0, dtype=gl.float32, layout=mma_m_layout)
+    acc = gl.zeros([BLOCK_M, HEAD_DIM], dtype=gl.float32, layout=mma_layout)
 
-    offs_m = start_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=m_slice)
-    offs_n = gl.arange(0, BLOCK_N, layout=n_slice)
+    offs_m = start_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=mma_m_layout)
+    offs_n = gl.arange(0, BLOCK_N, layout=mma_n_layout)
 
     # ---------------- split into unmasked / masked block ranges ----------------
     IS_MODULO_MN: gl.constexpr = (SEQLEN_K % BLOCK_N == 0) and (SEQLEN_Q % BLOCK_M == 0)
@@ -658,16 +745,16 @@ def _mha_fwd_gluon_kernel(
         _dma(v_smem.index(0), v_base, v_off, v_head_mask, PADDED_HEAD)
         _dma(kt_smem.index(1), k_base + kt_step, kt_off, k_head_mask, PADDED_HEAD)
 
-        async_cp.wait_group(2)  # K[0] has landed
-        kt0 = async_cp.load_shared_relaxed(kt_smem.index(0), kt_dot_layout)
-        qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfma)
-        qk = mfma_cdna4(q_dot, kt0, qk)
-        m_run, p_c, alpha_c = _softmax_vec1(qk, m_i, QK_SCALE, SCALE_ON_Q)
+        cdna4_async.wait_group(2)  # K[0] has landed
+        kt0 = cdna4_async.load_shared_relaxed(kt_smem.index(0), kt_dot_layout)
+        qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mma_layout)
+        qk = cdna4_mfma(q_dot, kt0, qk)
+        m_run, p_c, alpha_c = sc_vec1(qk, m_i, qk_scale, SCALE_ON_Q)
 
         gl.barrier()  # WAR: LRK[0]'s ds_read against K[2]'s write into the same slot
         _dma(kt_smem.index(0), k_base + 2 * kt_step, kt_off, k_head_mask, PADDED_HEAD)
-        async_cp.wait_group(1)  # K[1] has landed
-        kt_dot = async_cp.load_shared_relaxed(kt_smem.index(1), kt_dot_layout)
+        cdna4_async.wait_group(1)  # K[1] has landed
+        kt_dot = cdna4_async.load_shared_relaxed(kt_smem.index(1), kt_dot_layout)
         _dma(v_smem.index(1), v_base + v_step, v_off, v_head_mask, PADDED_HEAD)
 
         # -- Main loop, unrolled 2x so the LDS slots are compile-time constants -----
@@ -698,11 +785,11 @@ def _mha_fwd_gluon_kernel(
                 blk,
                 0,
                 1,
-                mfma,
+                mma_layout,
                 kt_dot_layout,
                 v_dot_layout,
                 p_dot_layout,
-                QK_SCALE,
+                qk_scale,
                 SCALE_ON_Q,
                 DTYPE,
                 PADDED_HEAD,
@@ -730,11 +817,11 @@ def _mha_fwd_gluon_kernel(
                 blk + 1,
                 1,
                 0,
-                mfma,
+                mma_layout,
                 kt_dot_layout,
                 v_dot_layout,
                 p_dot_layout,
-                QK_SCALE,
+                qk_scale,
                 SCALE_ON_Q,
                 DTYPE,
                 PADDED_HEAD,
@@ -766,11 +853,11 @@ def _mha_fwd_gluon_kernel(
                 pairs * 2,
                 0,
                 1,
-                mfma,
+                mma_layout,
                 kt_dot_layout,
                 v_dot_layout,
                 p_dot_layout,
-                QK_SCALE,
+                qk_scale,
                 SCALE_ON_Q,
                 DTYPE,
                 PADDED_HEAD,
@@ -788,32 +875,32 @@ def _mha_fwd_gluon_kernel(
         s_nm2 = (nm2 % BUF_DEPTH).to(tl.int32)
         s_nm1 = (nm1 % BUF_DEPTH).to(tl.int32)
 
-        qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfma)
-        qk = mfma_cdna4(q_dot, kt_dot, qk)
-        async_cp.wait_group(2)
-        v_dot = async_cp.load_shared_relaxed(v_smem.index(s_nm3), v_dot_layout)
-        acc, l_i, p_dot = _softmax_vec2(acc, l_i, p_c, alpha_c, p_dot_layout, DTYPE)
-        acc = mfma_cdna4(p_dot, v_dot, acc)
-        m_run, p_c, alpha_c = _softmax_vec1(qk, m_run, QK_SCALE, SCALE_ON_Q)
+        qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mma_layout)
+        qk = cdna4_mfma(q_dot, kt_dot, qk)
+        cdna4_async.wait_group(2)
+        v_dot = cdna4_async.load_shared_relaxed(v_smem.index(s_nm3), v_dot_layout)
+        acc, l_i, p_dot = sc_vec2(acc, l_i, p_c, alpha_c, p_dot_layout, DTYPE)
+        acc = cdna4_mfma(p_dot, v_dot, acc)
+        m_run, p_c, alpha_c = sc_vec1(qk, m_run, qk_scale, SCALE_ON_Q)
         gl.barrier()  # WAR: LRV[n-3] against V[n-1]'s write into the same slot
         _dma(
             v_smem.index(s_nm1), v_base + nm1 * v_step, v_off, v_head_mask, PADDED_HEAD
         )
-        async_cp.wait_group(2)
-        kt_dot = async_cp.load_shared_relaxed(kt_smem.index(s_nm1), kt_dot_layout)
+        cdna4_async.wait_group(2)
+        kt_dot = cdna4_async.load_shared_relaxed(kt_smem.index(s_nm1), kt_dot_layout)
 
-        qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfma)
-        qk = mfma_cdna4(q_dot, kt_dot, qk)
-        async_cp.wait_group(1)
-        v_dot = async_cp.load_shared_relaxed(v_smem.index(s_nm2), v_dot_layout)
-        acc, l_i, p_dot = _softmax_vec2(acc, l_i, p_c, alpha_c, p_dot_layout, DTYPE)
-        acc = mfma_cdna4(p_dot, v_dot, acc)
-        m_run, p_c, alpha_c = _softmax_vec1(qk, m_run, QK_SCALE, SCALE_ON_Q)
+        qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mma_layout)
+        qk = cdna4_mfma(q_dot, kt_dot, qk)
+        cdna4_async.wait_group(1)
+        v_dot = cdna4_async.load_shared_relaxed(v_smem.index(s_nm2), v_dot_layout)
+        acc, l_i, p_dot = sc_vec2(acc, l_i, p_c, alpha_c, p_dot_layout, DTYPE)
+        acc = cdna4_mfma(p_dot, v_dot, acc)
+        m_run, p_c, alpha_c = sc_vec1(qk, m_run, qk_scale, SCALE_ON_Q)
 
-        async_cp.wait_group(0)
-        v_dot = async_cp.load_shared_relaxed(v_smem.index(s_nm1), v_dot_layout)
-        acc, l_i, p_dot = _softmax_vec2(acc, l_i, p_c, alpha_c, p_dot_layout, DTYPE)
-        acc = mfma_cdna4(p_dot, v_dot, acc)
+        cdna4_async.wait_group(0)
+        v_dot = cdna4_async.load_shared_relaxed(v_smem.index(s_nm1), v_dot_layout)
+        acc, l_i, p_dot = sc_vec2(acc, l_i, p_c, alpha_c, p_dot_layout, DTYPE)
+        acc = cdna4_mfma(p_dot, v_dot, acc)
 
         m_i = m_run
         tail_start = n_full_blocks
@@ -832,10 +919,10 @@ def _mha_fwd_gluon_kernel(
         gl.barrier()
         for buf in gl.static_range(BUF_DEPTH):
             kt_smem.index(buf).store(
-                gl.zeros([HEAD_DIM, BLOCK_N], dtype=DTYPE, layout=kt_src)
+                gl.zeros([HEAD_DIM, BLOCK_N], dtype=DTYPE, layout=kt_async_layout)
             )
             v_smem.index(buf).store(
-                gl.zeros([BLOCK_N, HEAD_DIM], dtype=DTYPE, layout=v_src)
+                gl.zeros([BLOCK_N, HEAD_DIM], dtype=DTYPE, layout=v_async_layout)
             )
         gl.barrier()
 
@@ -893,12 +980,12 @@ def _mha_fwd_gluon_kernel(
                 PADDED_HEAD,
                 MASKED_BLOCKS,
             )
-            async_cp.wait_group(2)  # this tile's K and V have landed
+            cdna4_async.wait_group(2)  # this tile's K and V have landed
 
             start_n = blk * BLOCK_N
-            kt = async_cp.load_shared_relaxed(kt_smem.index(cur), kt_dot_layout)
-            qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mfma)
-            qk = mfma_cdna4(q_dot, kt, qk)
+            kt = cdna4_async.load_shared_relaxed(kt_smem.index(cur), kt_dot_layout)
+            qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=mma_layout)
+            qk = cdna4_mfma(q_dot, kt, qk)
 
             # Only blocks past the unmasked range need masking.  When this loop runs
             # the whole range most of its tiles are full, and the two `where`s would
@@ -912,13 +999,13 @@ def _mha_fwd_gluon_kernel(
                         offs_m[:, None] >= causal_bound[None, :], qk, float("-inf")
                     )
 
-            m_i, p, alpha = _softmax_vec1(qk, m_i, QK_SCALE, SCALE_ON_Q)
-            acc, l_i, p_dot = _softmax_vec2(acc, l_i, p, alpha, p_dot_layout, DTYPE)
+            m_i, p, alpha = sc_vec1(qk, m_i, qk_scale, SCALE_ON_Q)
+            acc, l_i, p_dot = sc_vec2(acc, l_i, p, alpha, p_dot_layout, DTYPE)
 
-            v = async_cp.load_shared_relaxed(v_smem.index(cur), v_dot_layout)
-            acc = mfma_cdna4(p_dot, v, acc)
+            v = cdna4_async.load_shared_relaxed(v_smem.index(cur), v_dot_layout)
+            acc = cdna4_mfma(p_dot, v, acc)
             gl.barrier()  # WAR: this tile's LDS reads against the next prefetch's writes
-        async_cp.wait_group(0)
+        cdna4_async.wait_group(0)
 
     # ---------------- epilogue ----------------
     # Reciprocal on the [BLOCK_M] vector rather than on the [BLOCK_M, HEAD_DIM]
@@ -932,35 +1019,24 @@ def _mha_fwd_gluon_kernel(
         acc = gl.where(offs_m[:, None] >= causal_start_idx, acc, 0.0)
 
     if WRITE_LSE:
-        offs_l = start_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=offs_m_lse)
+        offs_l = start_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=offs_m_lse_layout)
         l_ptrs = L + (off_z * HQ + off_h_q) * SEQLEN_Q + offs_l
-        # m_i and l_i are carried in log2 units, so `* LN2` lands on the natural-log
-        # LSE flash_attn_3 returns: (m*log2(e) + log2(l)) * ln2 == m + ln(l).
-        #
-        # The `where` guards rows that attend to nothing: their running max never
-        # leaves -inf, so `alpha = exp2(m_run - m_new)` is exp2(NaN), which poisons
-        # l_i.  `acc` is scrubbed by the causal `where` above, l_i is not.  Reachable
-        # when an M-block holds live and dead rows at once -- causal with
-        # SEQLEN_Q > SEQLEN_K, the difference not a multiple of BLOCK_M.
-        #
-        # `m_i == -inf` is the *detection* and must stay; DEAD_ROW_LSE is only what
-        # gets stored, and differs per caller (see the early-exit store above).
         lse = gl.where(m_i == float("-inf"), DEAD_ROW_LSE, (m_i + gl.log2(l_i)) * _LN2)
-        lse = gl.convert_layout(lse, offs_m_lse)
+        lse = gl.convert_layout(lse, offs_m_lse_layout)
         gl.store(l_ptrs, lse, mask=offs_l < SEQLEN_Q)
 
     # Downcast first, then convert the layout: a convert out of the MFMA layout goes
     # through LDS, and doing it in fp16/bf16 halves the bytes that round trip.  The
     # blocked destination gives every lane 8 contiguous elements of one row, i.e. one
     # dwordx4 store instead of the MFMA layout's four strided dwordx2.
-    offs_d_o = gl.arange(0, HEAD_DIM, layout=offs_d_blocked)
-    offs_m_o = start_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=offs_m_blocked)
+    offs_d_o = gl.arange(0, HEAD_DIM, layout=offs_d_layout)
+    offs_m_o = start_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=offs_m_layout)
     o_base = Out + off_z * stride_oz + off_h_q * stride_oh
     o_offs = offs_m_o[:, None] * stride_om + offs_d_o[None, :] * stride_on
     o_mask = offs_m_o[:, None] < SEQLEN_Q
     if PADDED_HEAD:
         o_mask = o_mask & (offs_d_o[None, :] < ACTUAL_HEAD_DIM)
-    acc_out = gl.convert_layout(acc.to(Out.dtype.element_ty), q_blocked)
+    acc_out = gl.convert_layout(acc.to(Out.dtype.element_ty), blocked_layout)
     gl.amd.cdna4.buffer_store(acc_out, o_base, o_offs, mask=o_mask)
 
 
@@ -969,38 +1045,21 @@ def _mha_fwd_gluon_kernel(
 # ---------------------------------------------------------------------------
 
 _TL_DTYPE = {torch.float16: "fp16", torch.bfloat16: "bf16"}
-
-# Keeps the accumulators in VGPRs, off the v_accvgpr path.  Only valid when the
-# live set fits without the AGPRs (_fits_arch_vgprs); otherwise the accumulator
-# spills instead.  The tuple form is required -- as a plain string, "0,0" would be
-# split on its comma.
 _AGPR_ATTR = ("amdgpu-agpr-alloc", "0,0")
-
-# The pipeline's prologue and drain hold the accumulator, both score tiles and a
-# K or V tile at once, and LLVM's default schedule spills there.  The
-# minimum-register scheduler removes those spills.  Applied only alongside
-# _AGPR_ATTR: it is a win when the kernel is meant to live in the architected
-# VGPRs, and a large loss when the accumulator must sit in AGPRs.
 _SCHED_ATTR = ("amdgpu-sched-strategy", "iterative-minreg")
-
 _LLVM_FN_ATTRS = (_AGPR_ATTR, _SCHED_ATTR)
-
 _ELEM_BITS = 16
 
 
-# (BLOCK_M, BLOCK_N, num_warps) per masking mode, tuned on gfx950 with
-# op_tests/op_benchmarks/triton/bench_mha.py -impl gluon.  num_warps is not free:
+# (BLOCK_M, BLOCK_N, num_warps) per masking mode.
 # the MFMA tiling fixes BLOCK_M = 32 * num_warps.  Causal takes the narrower M
 # tile, which wastes less work on the diagonal; non-causal takes the wider one,
-# which amortises the pipeline fill/drain better.  Splitting them costs no extra
-# kernel specializations -- IS_CAUSAL is already a constexpr.
+# which amortises the pipeline fill/drain better.
 _TILE_NON_CAUSAL = (256, 64, 8)
 _TILE_CAUSAL = (128, 64, 4)
 
-# Causal crossover, in average full KV blocks per workgroup (see _block_split).
-# Below it flash_attn_3's smaller BLOCK_M wins on the diagonal, so the caller
-# falls back.  Non-causal needs no such floor.
-_CAUSAL_MIN_AVG_FULL_BLOCKS = 24
+# Causal crossover, in average full KV blocks per workgroup.
+_CAUSAL_MIN_AVG_FULL_BLOCKS = 80
 
 
 def _tile(causal: bool) -> tuple[int, int, int]:
@@ -1082,33 +1141,37 @@ def _fits_arch_vgprs(head_dim, block_m, block_n, num_warps, warp_size=64):
     return acc + q_operand + scores + kv + slack <= 256
 
 
-def _shape_and_strides(q, k, v, o, layout):
-    """(batch, hq, hk, sq, sk, head_dim, q/k/v/o strides as (z, h, s, d))."""
+def get_shape_from_layout(q, k, layout):
     if layout == "bhsd":
-        batch, hq, sq, head_dim = q.shape
-        hk, sk = k.shape[1], k.shape[2]
-        perm = (0, 1, 2, 3)
+        batch, nheads_q, _, head_size = q.shape
+        nheads_k = k.shape[1]
     elif layout == "bshd":
-        batch, sq, hq, head_dim = q.shape
-        hk, sk = k.shape[2], k.shape[1]
-        perm = (0, 2, 1, 3)
+        batch, _, nheads_q, head_size = q.shape
+        nheads_k = k.shape[2]
     else:
-        raise ValueError(f"unsupported layout {layout!r} (expected 'bhsd' or 'bshd')")
-    strides = tuple(tuple(t.stride(i) for i in perm) for t in (q, k, v, o))
-    return batch, hq, hk, sq, sk, head_dim, strides
+        raise ValueError(f"Unsupported layout: {layout}")
+    return batch, nheads_q, nheads_k, head_size
 
 
-def is_available() -> bool:
-    """True iff this module is usable on the running device.
+def get_strides_from_layout(q, k, v, o, layout):
+    """Strides reordered to the kernel's (batch, head, seq, dim) convention."""
+    if layout == "bhsd":
+        order = (0, 1, 2, 3)
+    elif layout == "bshd":
+        order = (0, 2, 1, 3)
+    else:
+        raise ValueError(f"Unsupported layout: {layout}")
+    return tuple(tuple(t.stride(i) for i in order) for t in (q, k, v, o))
 
-    Matches the architecture by name rather than through ``arch_info.is_cdna4``:
-    that helper arrived with #4978 and was reverted by #5149, so it is not on
-    main.  ``get_arch`` is the form the other Gluon modules gate on.
-    """
-    return arch_info.get_arch() == "gfx950"
+
+def get_seqlens_from_layout(q, k, layout):
+    """(seqlen_q, seqlen_k).  Not in common.py -- the tutorial carries these on
+    MetaData instead, which aiter has no equivalent of."""
+    seq_dim = 2 if layout == "bhsd" else 1
+    return q.shape[seq_dim], k.shape[seq_dim]
 
 
-def gluon_fwd_supported(
+def is_mha_gluon_avail(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -1117,14 +1180,10 @@ def gluon_fwd_supported(
     layout: str = "bshd",
     **unsupported: object,
 ) -> bool:
-    """Can -- and should -- this shape go through the Gluon forward kernel?
+    """Decide if the platform and kernel inputs are valid for gluon fwd kernel"""
+    if arch_info.get_arch() != "gfx950":
+        return False
 
-    Every keyword in ``unsupported`` is a feature the kernel does not implement
-    (cu_seqlens, page_table, qv, descales, rotary, ...); any of them being set is an
-    immediate no.  Taking them as ``**kwargs`` rather than enumerating them keeps the
-    caller honest: a new argument added to ``flash_attn_3.fwd`` disqualifies the
-    Gluon path until someone handles it deliberately.
-    """
     if any(value is not None and value is not False for value in unsupported.values()):
         return False
     if layout not in ("bshd", "bhsd"):
@@ -1134,15 +1193,12 @@ def gluon_fwd_supported(
     if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
         return False
 
-    # flash_attn_3 allows a V head dim different from Q/K, and head dims that are
-    # not a multiple of 16 (it pads the compute tile).  This kernel does neither:
-    # it carries one head dim, and its masked global->LDS copy has to keep each
-    # lane's 16-byte write whole, which only works on a 16-element boundary.
     head_dim = q.shape[-1]
     if v.shape[-1] != head_dim or head_dim > 256 or head_dim % 16 != 0:
         return False
 
-    _, hq, hk, sq, sk, _, _ = _shape_and_strides(q, k, v, q, layout)
+    _, hq, hk, _ = get_shape_from_layout(q, k, layout)
+    sq, sk = get_seqlens_from_layout(q, k, layout)
     if hq % hk != 0:
         return False
 
@@ -1152,16 +1208,12 @@ def gluon_fwd_supported(
         return False
 
     if causal:
-        # Two conditions have to hold before this kernel beats flash_attn_3 on
-        # causal, where its smaller BLOCK_M wastes less work on the diagonal.
-        #
-        # First, the rotated pipeline has to be buildable at all: a head dim whose
+        # The rotated pipeline has to be buildable at all: a head dim whose
         # accumulator alone is half the register file runs everything through the
-        # generic loop, which has no answer on causal.  (Those head dims still win
-        # on non-causal, where the DMA and layout work pays.)
+        # generic loop, which is not workable on causal.
         if not _fits_arch_vgprs(padded_head_dim, block_m, block_n, num_warps):
             return False
-        # Second, the sequence has to be long enough.  avg_full_blocks accounts for
+        # The sequence has to be long enough. avg_full_blocks accounts for
         # sq != sk and the bottom-right alignment, so the crossover holds for
         # cross-attention shapes too.
         _, avg_full = _block_split(sq, sk, block_m, block_n, causal)
@@ -1176,7 +1228,7 @@ def _gl_dtype(torch_dtype):
     return {torch.float16: gl.float16, torch.bfloat16: gl.bfloat16}[torch_dtype]
 
 
-def gluon_mha_fwd(
+def mha_fwd_gluon(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -1186,28 +1238,20 @@ def gluon_mha_fwd(
     out: torch.Tensor | None = None,
     dead_row_lse: float = float("-inf"),
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Dense FlashAttention forward on gfx950.
-
-    Returns ``(out, softmax_lse)`` in exactly the form ``flash_attn_3.fwd``
-    produces for the dense path: ``out`` shaped like ``q`` in ``q.dtype``, and
-    ``softmax_lse`` shaped ``[batch, nheads_q, seqlen_q]`` in fp32, holding the
-    natural-log LSE with the softmax scale already folded in.
-
-    ``dead_row_lse`` is what a row that attends to nothing stores.  The default
-    ``-inf`` matches flash_attn_3 and ``test_mha_common.opus_ref_lse``; callers
-    replacing ``mha.py``'s own forward must pass ``0.0``, which is what that path
-    writes.  Live rows are identical either way.
-
-    Call :func:`gluon_fwd_supported` first; this function assumes it passed.
-    """
+    """Dense FlashAttention forward on gfx950."""
     if out is None:
         out = torch.empty_like(q)
-    batch, hq, hk, sq, sk, head_dim, strides = _shape_and_strides(q, k, v, out, layout)
+    batch, hq, hk, head_dim = get_shape_from_layout(q, k, layout)
+    sq, sk = get_seqlens_from_layout(q, k, layout)
+    strides = get_strides_from_layout(q, k, v, out, layout)
 
     block_m, block_n, num_warps = _tile(causal)
     padded_head_dim, block_n = _pick_tile(head_dim, block_n, num_warps)
     fits = _fits_arch_vgprs(padded_head_dim, block_m, block_n, num_warps)
     pipelined = fits and _use_pipeline(sq, sk, block_m, block_n, causal)
+    # Only the rotated loop has MFMA shadows for the split scalars to hide in, and
+    # only an unpadded head dim keeps the extra mask/zeroing work out of the way.
+    scalarize = fits and padded_head_dim == head_dim
 
     lse = torch.empty((batch, hq, sq), device=q.device, dtype=torch.float32)
     q_st, k_st, v_st, o_st = strides
@@ -1218,36 +1262,34 @@ def gluon_mha_fwd(
     )
 
     grid = (triton.cdiv(sq, block_m), hq, batch)
-    _mha_fwd_gluon_kernel[grid](
-        q,
-        k,
-        v,
-        out,
-        lse,
-        *q_st,
-        *k_st,
-        *v_st,
-        *o_st,
-        SM_SCALE=softmax_scale,
-        HQ=hq,
-        HK=hk,
-        SEQLEN_Q=sq,
-        SEQLEN_K=sk,
-        ACTUAL_HEAD_DIM=head_dim,
-        HEAD_DIM=padded_head_dim,
-        IS_CAUSAL=causal,
-        WRITE_LSE=True,
-        DEAD_ROW_LSE=dead_row_lse,
-        DTYPE=_gl_dtype(q.dtype),
-        SCALE_ON_Q=True,
-        PIPELINED=pipelined,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        NUM_WARPS=num_warps,
-        num_warps=num_warps,
-        waves_per_eu=2 if fits else 1,
-        # Both attributes or neither; head dims that need the AGPRs keep LLVM's
-        # default schedule (see _SCHED_ATTR).
-        llvm_fn_attrs=_LLVM_FN_ATTRS if fits else (),
-    )
+    with _scalarize_packed_fops(scalarize):
+        _mha_fwd_gluon_kernel[grid](
+            q,
+            k,
+            v,
+            out,
+            lse,
+            *q_st,
+            *k_st,
+            *v_st,
+            *o_st,
+            SM_SCALE=softmax_scale,
+            HQ=hq,
+            HK=hk,
+            SEQLEN_Q=sq,
+            SEQLEN_K=sk,
+            ACTUAL_HEAD_DIM=head_dim,
+            HEAD_DIM=padded_head_dim,
+            IS_CAUSAL=causal,
+            WRITE_LSE=True,
+            DEAD_ROW_LSE=dead_row_lse,
+            DTYPE=_gl_dtype(q.dtype),
+            SCALE_ON_Q=True,
+            PIPELINED=pipelined,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            num_warps=num_warps,
+            waves_per_eu=2 if fits else 1,
+            llvm_fn_attrs=_LLVM_FN_ATTRS if fits else (),
+        )
     return out, lse

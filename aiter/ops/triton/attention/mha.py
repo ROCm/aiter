@@ -8,6 +8,10 @@ import torch
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._gluon_kernels.gfx950.attention.mha_fwd import (
+    is_mha_gluon_avail,
+    mha_fwd_gluon,
+)
 from aiter.ops.triton._triton_kernels.attention.mha import _attn_fwd, _get_config
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
 from aiter.ops.triton.attention.mha_fused_bwd import flash_attn_fused_backward
@@ -17,11 +21,6 @@ from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
-
-from aiter.ops.triton._gluon_kernels.gfx950.attention import mha_fwd as _gluon_fwd
-
-if not _gluon_fwd.is_available():
-    _gluon_fwd = None
 
 _USE_FUSED_BWD_KERNEL = False
 
@@ -97,19 +96,19 @@ def _use_gluon_fwd(
     sink=None,
     config=None,
 ) -> bool:
-    """Should this dense forward go through the Gluon kernel?
+    """Check should this dense forward go through the Gluon kernel
 
-    Each feature the Gluon kernel does not implement is handed to
-    ``gluon_fwd_supported`` as a truthy entry it rejects, rather than being tested
+     Each feature the Gluon kernel does not implement is handed to
+    ``is_mha_gluon_avail`` as a truthy entry it rejects, rather than being tested
     here: that keeps the rejection list in one place, and a feature added to this
     file later disqualifies the Gluon path until someone handles it explicitly.
 
     ``config`` is one of those: an explicit config is a request for a particular
     ``_attn_fwd`` tuning, which this kernel could only ignore.
     """
-    if _gluon_fwd is None or _MHA_IMPL != "default":
+    if _MHA_IMPL != "default":
         return False
-    return _gluon_fwd.gluon_fwd_supported(
+    return is_mha_gluon_avail(
         q,
         k,
         v,
@@ -438,10 +437,7 @@ class _FlashAttnFunc(torch.autograd.Function):
             sink=sink,
             config=config,
         ):
-            # dead_row_lse=0.0 matches what _flash_attn_forward writes for a row
-            # that attends to nothing; the Gluon default is flash_attn_3's -inf.
-            # Live rows are identical either way.
-            out_padded, softmax_lse = _gluon_fwd.gluon_mha_fwd(
+            out_padded, softmax_lse = mha_fwd_gluon(
                 q, k, v, softmax_scale, causal, dead_row_lse=0.0
             )
             # Dropout is rejected by the guard above, so _flash_attn_forward would
