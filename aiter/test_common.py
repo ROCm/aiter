@@ -529,6 +529,7 @@ def checkAllclose(
             b_msked = b[mask]
             delta = (a_msked - b_msked).abs()
         except RuntimeError:
+            a, b = a.to("cpu"), b.to("cpu")
             mask = ~isClose.to("cpu")
             num = int(mask.sum().item())
             printNum = min(printNum, num)

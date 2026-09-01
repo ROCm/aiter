@@ -1369,7 +1369,11 @@ def _zero_fill_attention(
     _CH = 8  # bf16 per b128 store
     cpr = v_hdim // _CH  # b128 chunks per O row
 
-    o_num_records_bytes = (q_start + q_len) * stride_o_seq * fx.Int32(2)
+    # i64: an i32 product (large total_q * stride) can overflow negative, then the
+    # descriptor sign-extends it to a huge bound, defeating the 0x7FFFFFFF OOB drop.
+    o_num_records_bytes = (
+        fx.Int64(q_start + q_len) * fx.Int64(stride_o_seq) * fx.Int64(2)
+    )
     o_rsrc = buffer_ops.create_buffer_resource(
         ptr_O, num_records_bytes=o_num_records_bytes
     )
@@ -1492,7 +1496,9 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
             # LSE is [total_q, nheads_q]: base = q_start*stride_lse_seq; every valid
             # element offset is < (q_start+q_len)*stride_lse_seq (< the 0x7FFFFFFF drop).
             lse_base_elems = q_start * stride_lse_seq
-            lse_num_records_bytes = (q_start + q_len) * stride_lse_seq * fx.Int32(4)
+            lse_num_records_bytes = (
+                fx.Int64(q_start + q_len) * fx.Int64(stride_lse_seq) * fx.Int64(4)
+            )
 
             # An empty batch (no queries OR no keys) must NOT enter the core:
             # kv_len==0 gives an empty softmax denom (d=0) and the epilogue would
@@ -1609,7 +1615,9 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
         # LSE is [B, nheads_q, seq_q]: base = batch*stride_lse_batch; every valid
         # element offset is < base + stride_lse_batch (< the 0x7FFFFFFF drop).
         lse_base_elems = batch * stride_lse_batch
-        lse_num_records_bytes = (lse_base_elems + stride_lse_batch) * fx.Int32(4)
+        lse_num_records_bytes = fx.Int64(lse_base_elems + stride_lse_batch) * fx.Int64(
+            4
+        )
 
         _ca_kw = {
             "qk_hdim": QK_HDIM,

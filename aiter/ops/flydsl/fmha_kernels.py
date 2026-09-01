@@ -242,8 +242,8 @@ def flydsl_flash_attn_varlen_func(
     from ...jit.core import is_experimental_enabled
     from ...jit.utils.chip_info import get_gfx
 
-    # FlyDSL handles only plain MHA. Any unsupported feature (bias, alibi, sink,
-    # dropout, sliding window, paging, probs/deterministic) falls through to
+    # FlyDSL m32x8 serves plain MHA plus attention-sink and sliding-window; other
+    # features (bias, alibi, dropout, paging, return_attn_probs) fall through to
     # CK/Triton instead of being silently dropped.
     #
     # Routing (D_v=128, bf16, gfx1250): our m32x8 kernel is the DEFAULT for qk_hdim 128 and 192.

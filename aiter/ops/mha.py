@@ -2830,9 +2830,9 @@ def flash_attn_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
-    # FlyDSL path returns result if supported, None otherwise. window_size[2] is
-    # the sink size, which the FlyDSL gate does not inspect — screen it here so a
-    # sink request is never silently dropped.
+    # FlyDSL path returns result if supported, None otherwise. window_size[2] (sink
+    # size) is unsupported: the FlyDSL gate rejects it, and this screen keeps it off
+    # the path so a sink-token request is never silently dropped.
     if (
         cu_seqlens_q is None
         and cu_seqlens_kv is None
@@ -3686,7 +3686,7 @@ def flash_attn_varlen_func(
         nhead_k = k.shape[-2]
         if hdim_q not in (64, 128) or hdim_v != hdim_q:
             return False
-        # Experimental FlyDSL m16x8 kernel owns the 128/128 path when enabled;
+        # Experimental FlyDSL m32x8 kernel owns the 128/128 path when enabled;
         # yield so it reaches flydsl_flash_attn_varlen_func below.
         if hdim_q == 128 and is_experimental_enabled():
             return False
@@ -3737,9 +3737,9 @@ def flash_attn_varlen_func(
             sink_ptr,
         )
 
-    # FlyDSL path returns result if supported, None otherwise. window_size[2] is
-    # the sink size, which the FlyDSL gate does not inspect — screen it here so a
-    # sink request is never silently dropped.
+    # FlyDSL path returns result if supported, None otherwise. window_size[2] (sink
+    # size) is unsupported: the FlyDSL gate rejects it, and this screen keeps it off
+    # the path so a sink-token request is never silently dropped.
     if len(window_size) < 3 or window_size[2] == 0:
         from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_func
 

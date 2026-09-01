@@ -1424,7 +1424,11 @@ class OManager16bV1:
             )
         # Bound records to the last valid token so mask-dropped rows (redirected to byte
         # 0x7FFFFFFF) land OOB instead of faulting; every valid write is far below that.
-        o_num_records_bytes = (q_start + q_len) * stride_o_seq * fx.Int32(_BF16_BYTES)
+        # i64: an i32 product can overflow negative -> descriptor sign-extends to a huge
+        # bound, defeating the OOB drop.
+        o_num_records_bytes = (
+            fx.Int64(q_start + q_len) * fx.Int64(stride_o_seq) * fx.Int64(_BF16_BYTES)
+        )
         o_rsrc = buffer_ops.create_buffer_resource(
             ptr_O, num_records_bytes=arith.unwrap(o_num_records_bytes)
         )
