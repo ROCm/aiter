@@ -219,8 +219,11 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
     tokens = x.shape[0]
     output = moe(x, weights, ids)[:tokens]
     _barrier()
+    eager_output = output.clone()
     rel_l2 = -1.0
-    if tokens <= args.accuracy_max_bs:
+    # A zero-token rank must not enter the reference collectives by itself:
+    # peers with non-zero inputs correctly skip this optional accuracy path.
+    if 0 < tokens <= args.accuracy_max_bs:
         reference = _reference(
             x,
             weights,
@@ -258,6 +261,13 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
     _barrier()
     stage2_ms = _time_graph(stage2, device, args.iters)
     e2e_ms = _time_graph(end_to_end, device, args.iters)
+    graph_output = state["output"][:tokens]
+    graph_replay_exact = torch.tensor(
+        int(torch.equal(graph_output, eager_output)), dtype=torch.int32, device=device
+    )
+    dist.all_reduce(graph_replay_exact, op=dist.ReduceOp.MIN)
+    if not int(graph_replay_exact.item()):
+        raise AssertionError(f"bs={tokens} CUDA Graph replay changed the output")
     sbm = int(moe._s1_active_tile_m)
     gemm2_bm = int(moe._g2_active_block_m)
     p2p_quant = moe._active_config.p2p_quant
@@ -265,6 +275,7 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
         print(
             f"[MEGA-V2] bs={tokens} relL2={rel_l2:.6f} "
             f"path={'fixed' if moe._s1_fixed_slot else 'compact'} "
+            f"graph_replay=PASS "
             f"p2p_quant={p2p_quant} SBM={sbm} G2_BM={gemm2_bm} "
             f"stage1={stage1_ms[0]:.4f}/{stage1_ms[1]:.4f}ms "
             f"stage2={stage2_ms[0]:.4f}/{stage2_ms[1]:.4f}ms "
@@ -395,24 +406,21 @@ def main():
             device,
         )
         ref_weights = w1_q, w1_ref_scale, w2_q, w2_ref_scale
+        # MegaMoE's producer/consumer wire geometry is rank-invariant. A
+        # deliberately skewed test therefore selects one configuration that
+        # covers the largest participating rank instead of mixing protocols.
+        config_tokens = args.config_tokens
+        if rank_tokens and not config_tokens:
+            config_tokens = max(1, max(rank_tokens))
+
         shared_moe = None
-        if args.max_tok_per_rank is not None:
-            shared_moe = MegaMoEV2(
-                rank=rank,
-                world_size=world,
-                quant="a8w4",
-                w1=w1,
-                w1_scale=w1_scale,
-                w2=w2,
-                w2_scale=w2_scale,
-                max_tok_per_rank=args.max_tok_per_rank,
-                **network,
-            )
-            _install_config_policy(shared_moe, args.config_tokens, args.unify_fields)
         for batch_size in batch_sizes:
             local_batch_size = rank_tokens[rank] if rank_tokens else batch_size
-            if shared_moe is None:
-                moe = MegaMoEV2(
+            max_tok_per_rank = args.max_tok_per_rank or max(
+                16, _next_power_of_two(batch_size)
+            )
+            if shared_moe is None or args.max_tok_per_rank is None:
+                shared_moe = MegaMoEV2(
                     rank=rank,
                     world_size=world,
                     quant="a8w4",
@@ -420,12 +428,11 @@ def main():
                     w1_scale=w1_scale,
                     w2=w2,
                     w2_scale=w2_scale,
-                    max_tok_per_rank=max(16, _next_power_of_two(batch_size)),
+                    max_tok_per_rank=max_tok_per_rank,
                     **network,
                 )
-                _install_config_policy(moe, args.config_tokens, args.unify_fields)
-            else:
-                moe = shared_moe
+            moe = shared_moe
+            _install_config_policy(moe, config_tokens, args.unify_fields)
             if rank_tokens:
                 selected = moe._select_config(local_batch_size)
                 configs = [None] * world
