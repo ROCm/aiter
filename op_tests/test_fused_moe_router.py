@@ -64,17 +64,44 @@ def _skip_msg():
     return f"fused_moe_router requires gfx950, got {get_gfx()}"
 
 
-def _make_mask(E, ep_rank, ep_size, vllm_shape=False):
+def _expert_slots(E, n_shared, ep):
+    """Expert-id slots the routing map spans; mirrors the C++ expert_slots."""
+    return E + n_shared + (1 if (ep and n_shared) else 0)
+
+
+def _make_mask(E, ep_rank, ep_size, vllm_shape=False, n_shared=0):
     """Linear expert shard, matching vLLM's determine_expert_map.
 
     vllm_shape reproduces the real buffer, which is E+1 long with an
     always-masked sentinel in the trailing slot (expert_map_manager.py).
+    With fused shared experts it is E+n_shared+1: the shared weights are
+    replicated so every rank owns those slots, and the sentinel that
+    non-owning ranks park their shared row on stays masked.
     """
-    n = E + 1 if vllm_shape else E
+    n = E + n_shared + 1 if (vllm_shape or n_shared) else E
     m = torch.zeros(n, dtype=torch.int32)
     per = E // ep_size
     m[ep_rank * per : (ep_rank + 1) * per] = 1
+    m[E : E + n_shared] = 1
     return m
+
+
+def _append_shared(ti, tw, M, E, n_shared, shared_w, ep_rank, ep_size):
+    """Reference for the kernel's shared tail.
+
+    The owner of a token emits ``E+s`` for each shared expert; every other
+    rank emits the masked sentinel, so summing the ranks' outputs yields
+    exactly one copy. ``ep_size == 1`` makes every rank the owner, i.e. the
+    non-EP case, where the sentinel is never used.
+    """
+    owner = (torch.arange(M, device=ti.device) % ep_size) == ep_rank
+    ids = torch.where(
+        owner.view(-1, 1),
+        (E + torch.arange(n_shared, device=ti.device)).view(1, -1).expand(M, -1),
+        torch.full((M, n_shared), E + n_shared, device=ti.device),
+    ).to(torch.int32)
+    w = torch.full((M, n_shared), shared_w, dtype=dtypes.fp32, device=tw.device)
+    return torch.cat([ti, ids], dim=1), torch.cat([tw, w], dim=1)
 
 
 def _deswizzle(osc, nrows):
@@ -107,7 +134,22 @@ def _inputs(M, E, bias_dtype, seed):
     return g, b, h
 
 
-def _run_stock(g, b, h, M, E, topk, unit_size, need_renorm, rsf, mask):
+def _run_stock(
+    g,
+    b,
+    h,
+    M,
+    E,
+    topk,
+    unit_size,
+    need_renorm,
+    rsf,
+    mask,
+    n_shared=0,
+    shared_w=1.0,
+    ep_rank=0,
+    ep_size=1,
+):
     tw = torch.empty(M, topk, dtype=dtypes.fp32)
     ti = torch.empty(M, topk, dtype=torch.int32)
     # The stock wrapper coerces the bias to the gating dtype; the fused kernel
@@ -122,15 +164,21 @@ def _run_stock(g, b, h, M, E, topk, unit_size, need_renorm, rsf, mask):
         need_renorm=need_renorm,
         routed_scaling_factor=rsf,
     )
+    if n_shared:
+        # Appended after the renorm the stock path already did, matching where
+        # the kernel writes them: the renorm must not see the shared weights.
+        ti, tw = _append_shared(ti, tw, M, E, n_shared, shared_w, ep_rank, ep_size)
+    topk_total = topk + n_shared
+    E_tot = _expert_slots(E, n_shared, mask is not None)
     sids, sw, seids, nv, moe_buf = moe_sorting(
-        ti, tw, E, COLS, dtypes.bf16, block_size=unit_size, expert_mask=mask
+        ti, tw, E_tot, COLS, dtypes.bf16, block_size=unit_size, expert_mask=mask
     )
     o4, osc = fused_dynamic_mx_quant_moe_sort(
         h,
         sids,
         nv,
         token_num=M,
-        topk=topk,
+        topk=topk_total,
         block_size=unit_size,
         quant_dtype=dtypes.fp4x2,
         sorted_weights=sw,
@@ -162,7 +210,23 @@ def _alloc(ref, M, topk):
     }
 
 
-def _call_fused(g, b, h, a, E, topk, unit_size, need_renorm, rsf, mask, moe_buf):
+def _call_fused(
+    g,
+    b,
+    h,
+    a,
+    E,
+    topk,
+    unit_size,
+    need_renorm,
+    rsf,
+    mask,
+    moe_buf,
+    n_shared=0,
+    shared_w=1.0,
+    ep_rank=0,
+    ep_size=1,
+):
     fused_moe_router_impl(
         g,
         b,
@@ -184,6 +248,10 @@ def _call_fused(g, b, h, a, E, topk, unit_size, need_renorm, rsf, mask, moe_buf)
         get_fused_moe_router_workspace(g.device, max(g.shape[0], WORKSPACE_MAX_TOKENS)),
         expert_mask=mask,
         moe_buf=moe_buf,
+        num_fused_shared_experts=n_shared,
+        shared_expert_weight=shared_w,
+        ep_rank=ep_rank,
+        ep_size=ep_size,
     )
 
 
@@ -270,22 +338,54 @@ def _compare(ref, got, M, topk, unit_size):
 
 
 def _run_case(
-    M, E, topk, unit_size, bias_dtype, need_renorm, rsf, ep, use_moe_buf, seed=None
+    M,
+    E,
+    topk,
+    unit_size,
+    bias_dtype,
+    need_renorm,
+    rsf,
+    ep,
+    use_moe_buf,
+    seed=None,
+    n_shared=0,
+    shared_w=1.0,
 ):
     """One config, correctness only. Returns the error dict."""
     mask = None
+    ep_rank, ep_size = 0, 1
     if ep is not None:
-        mask = _make_mask(E, ep[0], ep[1], vllm_shape=ep[2])
+        ep_rank, ep_size = ep[0], ep[1]
+        mask = _make_mask(E, ep_rank, ep_size, vllm_shape=ep[2], n_shared=n_shared)
     g, b, h = _inputs(M, E, bias_dtype, M if seed is None else seed)
-    ref = _run_stock(g, b, h, M, E, topk, unit_size, need_renorm, rsf, mask)
-    got = _alloc(ref, M, topk)
+    shared = dict(
+        n_shared=n_shared, shared_w=shared_w, ep_rank=ep_rank, ep_size=ep_size
+    )
+    ref = _run_stock(
+        g, b, h, M, E, topk, unit_size, need_renorm, rsf, mask, **shared
+    )
+    topk_total = topk + n_shared
+    got = _alloc(ref, M, topk_total)
     moe_buf = None
     if use_moe_buf:
         # Poisoned: the kernel is supposed to zero it while routing runs.
         moe_buf = torch.full_like(ref["moe_buf"], 7.0)
-    _call_fused(g, b, h, got, E, topk, unit_size, need_renorm, rsf, mask, moe_buf)
+    _call_fused(
+        g,
+        b,
+        h,
+        got,
+        E,
+        topk,
+        unit_size,
+        need_renorm,
+        rsf,
+        mask,
+        moe_buf,
+        **shared,
+    )
     torch.cuda.synchronize()
-    errs = _compare(ref, got, M, topk, unit_size)
+    errs = _compare(ref, got, M, topk_total, unit_size)
     errs["moe_buf_err"] = int((moe_buf != 0).sum().item()) if use_moe_buf else 0
     return errs, (g, b, h, ref, got, mask)
 
@@ -929,6 +1029,276 @@ def test_graph_replay_survives_workspace_growth():
             ctx = f"M={M} replay {r} after growing to 128"
             _assert_ok(_compare(ref, got, M, topk, unit_size), ctx)
             assert not _tail_errs(got, M, topk, unit_size, ctx)
+
+
+# ---------------------------------------------------------------------------
+# Fused shared experts. The full matrix is {non-EP, EP} x {n_shared 0, 1}:
+# without EP every token owns its shared rows; with EP ownership round-robins
+# so the post-MoE all-reduce sees exactly one copy.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("n_shared", [1])
+@pytest.mark.parametrize("M", [1, 8, 33, 64, 103, 104, 128])
+def test_shared_non_ep(M, n_shared):
+    errs, _ = _run_case(
+        M, 320, 8, 16, dtypes.bf16, True, 1.0, None, False, n_shared=n_shared
+    )
+    _assert_ok(errs, f"M={M} n_shared={n_shared}")
+
+
+@pytest.mark.parametrize("n_shared", [1])
+@pytest.mark.parametrize(
+    "ep", [(0, 4, True), (2, 4, True), (3, 4, True), (0, 1, True)]
+)
+@pytest.mark.parametrize("M", [1, 33, 128])
+def test_shared_ep(M, ep, n_shared):
+    errs, _ = _run_case(
+        M, 320, 8, 16, dtypes.bf16, True, 1.0, ep, False, n_shared=n_shared
+    )
+    _assert_ok(errs, f"M={M} ep={ep} n_shared={n_shared}")
+
+
+# The shared weight is not renormalized and not scaled by rsf: the kernel
+# writes it after the renorm block, so a routed-weight change must not move it.
+@pytest.mark.parametrize("need_renorm,rsf", [(True, 1.0), (True, 2.5), (False, 2.5)])
+@pytest.mark.parametrize("shared_w", [1.0, 0.4])
+def test_shared_weight_untouched_by_renorm(need_renorm, rsf, shared_w):
+    M, E, topk, n_shared = 64, 320, 8, 1
+    errs, (_g, _b, _h, _ref, got, _m) = _run_case(
+        M,
+        E,
+        topk,
+        16,
+        dtypes.bf16,
+        need_renorm,
+        rsf,
+        None,
+        False,
+        n_shared=n_shared,
+        shared_w=shared_w,
+    )
+    _assert_ok(errs, f"renorm={need_renorm} rsf={rsf} w={shared_w}")
+    tail = got["tw"][:, topk:]
+    assert torch.allclose(tail, torch.full_like(tail, shared_w)), tail
+
+
+# The property the round-robin exists for: summed over every rank, each token
+# contributes exactly one row per shared expert. Anything else means the
+# post-MoE all-reduce double-counts (or drops) the shared output.
+@pytest.mark.parametrize("ep_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("n_shared", [1])
+def test_shared_no_double_count(ep_size, n_shared):
+    M, E, topk, unit_size = 128, 320, 8, 16
+    g, b, h = _inputs(M, E, dtypes.bf16, 0)
+    counts = torch.zeros(M, n_shared, dtype=torch.int64, device="cpu")
+    for ep_rank in range(ep_size):
+        mask = _make_mask(E, ep_rank, ep_size, n_shared=n_shared)
+        ref = _run_stock(
+            g,
+            b,
+            h,
+            M,
+            E,
+            topk,
+            unit_size,
+            True,
+            1.0,
+            mask,
+            n_shared,
+            1.0,
+            ep_rank,
+            ep_size,
+        )
+        got = _alloc_poisoned(ref, M, topk + n_shared, ep_rank)
+        _call_fused(
+            g,
+            b,
+            h,
+            got,
+            E,
+            topk,
+            unit_size,
+            True,
+            1.0,
+            mask,
+            None,
+            n_shared,
+            1.0,
+            ep_rank,
+            ep_size,
+        )
+        torch.cuda.synchronize()
+        tail = got["ti"][:, topk:]
+        # Every emitted id is either this rank's owned shared slot or the
+        # sentinel; nothing else is a legal value for the shared lanes.
+        want = E + torch.arange(n_shared, device=tail.device).view(1, -1)
+        assert bool(((tail == want) | (tail == E + n_shared)).all()), tail
+        counts += (tail == want).to(torch.int64).cpu()
+    assert bool((counts == 1).all()), (
+        f"ep_size={ep_size} n_shared={n_shared}: shared rows per token "
+        f"min={int(counts.min())} max={int(counts.max())}, expected exactly 1"
+    )
+
+
+# n_shared == 0 must reach the same instantiation as before the feature
+# existed: the shared lanes fold out and nothing about the output moves.
+@pytest.mark.parametrize("ep", [None, (2, 4, True)])
+@pytest.mark.parametrize("M", [1, 64, 128])
+def test_nshared_zero_unchanged(M, ep):
+    E, topk, unit_size = 320, 8, 16
+    mask = None if ep is None else _make_mask(E, ep[0], ep[1], vllm_shape=ep[2])
+    g, b, h = _inputs(M, E, dtypes.bf16, M)
+    ref = _run_stock(g, b, h, M, E, topk, unit_size, True, 1.0, mask)
+    keys = ("ti", "tw", "sids", "sw", "seids", "nv", "o4", "osc")
+    outs = []
+    # Defaulted vs explicitly-zero shared args, and under ep_size 1 either way.
+    for kwargs in ({}, dict(n_shared=0, shared_w=1.0, ep_rank=0, ep_size=1)):
+        got = _alloc_poisoned(ref, M, topk, M)
+        _call_fused(
+            g, b, h, got, E, topk, unit_size, True, 1.0, mask, None, **kwargs
+        )
+        torch.cuda.synchronize()
+        outs.append({k: got[k].clone() for k in keys})
+    diff = [k for k in keys if not torch.equal(outs[0][k], outs[1][k])]
+    assert not diff, f"M={M} ep={ep}: explicit zero-shared args changed {diff}"
+    _assert_ok(_compare(ref, outs[0], M, topk, unit_size), f"M={M} ep={ep}")
+
+
+@pytest.mark.parametrize("unit_size", [16, 32, 128])
+@pytest.mark.parametrize("M", [1, 23, 64, 128])
+def test_shared_tail_fill_exact(path, M, unit_size):
+    topk, n_shared = 8, 1
+    _, (_g, _b, _h, _ref, got, _m) = _run_case(
+        M, 320, topk, unit_size, dtypes.bf16, True, 1.0, None, False, n_shared=n_shared
+    )
+    ctx = f"{path} M={M} u={unit_size} n_shared={n_shared}"
+    assert not _tail_errs(got, M, topk + n_shared, unit_size, ctx)
+
+
+# Phase 1 places the shared rows on the lanes just past topk, inside the one
+# wave the selection runs in, so topk + n_shared must fit in 64.
+@pytest.mark.parametrize("topk,n_shared,ok", [(63, 1, True), (64, 1, False)])
+def test_shared_topk_total_boundary(topk, n_shared, ok):
+    M, E, unit_size = 8, 320, 16
+    g, b, h = _inputs(M, E, dtypes.bf16, 0)
+    ref = _run_stock(
+        g, b, h, M, E, topk, unit_size, True, 1.0, None, n_shared, 1.0, 0, 1
+    )
+    got = _alloc(ref, M, topk + n_shared)
+    call = lambda: _call_fused(
+        g, b, h, got, E, topk, unit_size, True, 1.0, None, None, n_shared, 1.0, 0, 1
+    )
+    if ok:
+        call()
+        torch.cuda.synchronize()
+        _assert_ok(_compare(ref, got, M, topk + n_shared, unit_size), f"topk={topk}")
+    else:
+        with pytest.raises(RuntimeError):
+            call()
+
+
+# The 512 cap is on routed experts alone. The pair scan reaches 2*BlockSize
+# slots; the fused shared tail past that is filled serially, so a full
+# 512-expert model runs with shared experts fused, under EP too.
+@pytest.mark.parametrize(
+    "E,n_shared,ep,ok",
+    [
+        (512, 0, None, True),
+        (512, 0, (0, 4, False), True),
+        (511, 1, None, True),
+        (512, 1, None, True),
+        (512, 1, (0, 4, False), True),
+        (513, 0, None, False),
+        (513, 1, None, False),
+    ],
+)
+def test_expert_slot_cap(E, n_shared, ep, ok):
+    M, topk, unit_size = 8, 8, 16
+    ep_rank, ep_size = (0, 1) if ep is None else (ep[0], ep[1])
+    mask = None if ep is None else _make_mask(E, ep_rank, ep_size, n_shared=n_shared)
+    g, b, h = _inputs(M, E, dtypes.bf16, 0)
+    shared = dict(n_shared=n_shared, shared_w=1.0, ep_rank=ep_rank, ep_size=ep_size)
+    if not ok:
+        ref = _run_stock(g, b, h, M, 320, topk, unit_size, True, 1.0, None)
+        got = _alloc(ref, M, topk + n_shared)
+        with pytest.raises(RuntimeError):
+            _call_fused(
+                g, b, h, got, E, topk, unit_size, True, 1.0, mask, None, **shared
+            )
+        return
+    ref = _run_stock(g, b, h, M, E, topk, unit_size, True, 1.0, mask, **shared)
+    got = _alloc(ref, M, topk + n_shared)
+    _call_fused(g, b, h, got, E, topk, unit_size, True, 1.0, mask, None, **shared)
+    torch.cuda.synchronize()
+    _assert_ok(_compare(ref, got, M, topk + n_shared, unit_size), f"E={E}")
+
+
+def test_shared_bad_args_rejected():
+    """Configurations the entry cannot serve must be refused, not mis-routed."""
+    M, E, topk, unit_size, n_shared = 16, 320, 8, 16, 1
+    g, b, h = _inputs(M, E, dtypes.bf16, 0)
+    mask = _make_mask(E, 0, 4, n_shared=n_shared)
+    ref = _run_stock(
+        g, b, h, M, E, topk, unit_size, True, 1.0, mask, n_shared, 1.0, 0, 4
+    )
+    got = _alloc(ref, M, topk + n_shared)
+
+    def call(**kw):
+        kw = {"n_shared": n_shared, "shared_w": 1.0, "ep_rank": 0,
+              "ep_size": 4, **kw}
+        a = kw.pop("outs", got)
+        m = kw.pop("mask", mask)
+        _call_fused(g, b, h, a, E, topk, unit_size, True, 1.0, m, None, **kw)
+
+    # More shared experts than the kernel instantiates.
+    with pytest.raises(RuntimeError):
+        call(n_shared=2)
+    # A rank index outside the world it is round-robining over.
+    with pytest.raises(RuntimeError):
+        call(ep_rank=4)
+    with pytest.raises(RuntimeError):
+        call(ep_rank=-1)
+    # ep_size > 1 with no mask has no sentinel slot for a non-owner to park on.
+    with pytest.raises(RuntimeError):
+        call(mask=None)
+    # A mask sized for the routed experts alone leaves the shared slots and the
+    # sentinel unmapped.
+    with pytest.raises(RuntimeError):
+        call(mask=torch.ones(E, dtype=torch.int32))
+    with pytest.raises(RuntimeError):
+        call(mask=torch.ones(E + n_shared, dtype=torch.int32))
+    # topk_ids/topk_weights sized [M, topk] would have every token past the
+    # first write past its row.
+    narrow = dict(got)
+    narrow["ti"] = torch.full((M, topk), -1, dtype=torch.int32)
+    narrow["tw"] = torch.zeros(M, topk, dtype=dtypes.fp32)
+    with pytest.raises(RuntimeError):
+        call(outs=narrow)
+
+
+def test_shared_supported_gate():
+    """`fused_moe_router_supported` must agree with the entry's limits."""
+    from aiter import ActivationType, QuantType
+    from aiter.fused_moe import fused_moe_router_supported
+
+    M, E, topk = 16, 320, 8
+    h = torch.randn(M, COLS, dtype=dtypes.bf16)
+    w1 = torch.empty(E, 512, COLS // 2, dtype=dtypes.fp4x2)
+    w2 = torch.empty(E, COLS, 128, dtype=dtypes.fp4x2)
+    ask = lambda tk, ns: fused_moe_router_supported(
+        h,
+        w1,
+        w2,
+        tk,
+        quant_type=QuantType.per_1x32.value,
+        activation=ActivationType.Silu.value,
+        num_fused_shared_experts=ns,
+    )
+    assert ask(topk, 0)
+    assert ask(topk, 1)
+    assert not ask(topk, 2)
+    assert not ask(64, 1)
 
 
 if __name__ == "__main__":
