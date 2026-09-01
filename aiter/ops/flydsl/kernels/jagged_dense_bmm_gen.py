@@ -18,13 +18,13 @@ from collections import OrderedDict
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels import buffer_ops
 
 from ._buffer_utils import make_bounded_buffer_tensor
+from .tensor_shim import _run_compiled
 
 BLOCK_M = 128
 BLOCK_N = 128
@@ -81,8 +81,8 @@ def _xcd_remap(xy, num_rows, num_cols, C, W, nXCD=NXCD):
     return row, col
 
 
-_COMPILED_CACHE_MAX = 64  # skew compact keys include tot; bound growth
-_COMPILED_CACHE: OrderedDict = OrderedDict()
+_LAUNCHER_CACHE_MAX = 64  # skew compact keys include tot; bound growth
+_LAUNCHER_CACHE: OrderedDict = OrderedDict()
 
 
 def _build_launcher(
@@ -467,23 +467,18 @@ def _build_launcher(
     return _launch
 
 
-def _drop_leaked_ir_contexts() -> None:
-    while ir.Context.current is not None:
-        ir.Context.current.__exit__(None, None, None)
-
-
 def _cache_get(key):
-    cf = _COMPILED_CACHE.get(key)
-    if cf is not None:
-        _COMPILED_CACHE.move_to_end(key)
-    return cf
+    launch = _LAUNCHER_CACHE.get(key)
+    if launch is not None:
+        _LAUNCHER_CACHE.move_to_end(key)
+    return launch
 
 
-def _cache_put(key, cf):
-    _COMPILED_CACHE[key] = cf
-    _COMPILED_CACHE.move_to_end(key)
-    while len(_COMPILED_CACHE) > _COMPILED_CACHE_MAX:
-        _COMPILED_CACHE.popitem(last=False)
+def _cache_put(key, launch):
+    _LAUNCHER_CACHE[key] = launch
+    _LAUNCHER_CACHE.move_to_end(key)
+    while len(_LAUNCHER_CACHE) > _LAUNCHER_CACHE_MAX:
+        _LAUNCHER_CACHE.popitem(last=False)
 
 
 def jagged_dense_bmm(
@@ -572,31 +567,24 @@ def jagged_dense_bmm(
     )
     launch_args = (C, A, B, BIAS, SEQ_OFFSETS, tmap, tot, n_groups, max_seq_len, stream)
 
-    cached = _cache_get(key)
-    if cached is not None:
-        return cached(*launch_args)
-
-    launch = _build_launcher(
-        N,
-        K,
-        bmn,
-        bnn,
-        block_k,
-        STAGES_A,
-        nthreads,
-        bm,
-        n_groups,
-        xcd_c,
-        xcd_w,
-        use_mfma_k32,
-        waves_per_eu,
-        b_stages,
-        compact,
-    )
-    try:
-        _cache_put(key, flyc.compile(launch, *launch_args))
-        return None
-    except Exception:
-        # Mirrors moe_kernels._run_compiled: cleanup leaked ir.Context, re-raise.
-        _drop_leaked_ir_contexts()
-        raise
+    launch = _cache_get(key)
+    if launch is None:
+        launch = _build_launcher(
+            N,
+            K,
+            bmn,
+            bnn,
+            block_k,
+            STAGES_A,
+            nthreads,
+            bm,
+            n_groups,
+            xcd_c,
+            xcd_w,
+            use_mfma_k32,
+            waves_per_eu,
+            b_stages,
+            compact,
+        )
+        _cache_put(key, launch)
+    _run_compiled(launch, *launch_args)
