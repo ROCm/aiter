@@ -228,6 +228,39 @@ def run_perftest(
     return worker(*args, **kwargs)
 
 
+def run_dispatch_loop(func, *args, num_iters=101, num_warmup=3, **kwargs):
+    """Plain back-to-back dispatch loop -- NO torch.profiler, NO cuda events, NO
+    per-iter empty_cache/synchronize.
+
+    Those all deadlock with an external rocprofv3 --att (ATT) run, which intercepts
+    the HSA queue: a hardware counter / thread-trace profiler and torch's
+    event/API-trace profiler cannot both own the same queue (the process hangs on
+    the CPU with the GPU idle). Use this as the kernel *feeder* when the whole
+    process is wrapped by rocprofv3 (pair with --kernel-iteration-range and
+    --kernel-include-regex so only the target dispatch is traced).
+
+    Returns ``(last_output, wall_us_per_iter)``. The timing is **wall-clock**
+    (time.perf_counter across the whole loop, one trailing synchronize -- which is
+    ATT-safe, unlike per-iter sync/events), so it INCLUDES host launch/dispatch
+    overhead and inter-kernel gaps, and is inflated by the SQTT instrumentation
+    when the process is under rocprofv3 --att. It is a coarse sustained-throughput
+    figure, NOT the device-time perf number -- use run_perftest for that.
+    """
+    import time
+
+    out = None
+    for _ in range(num_warmup):
+        out = func(*args, **kwargs)
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(num_iters):
+        out = func(*args, **kwargs)
+    torch.cuda.synchronize()
+    wall = time.perf_counter() - t0
+    us = wall / num_iters * 1e6 if num_iters > 0 else float("nan")
+    return out, us
+
+
 def log_args(func, *args, **kwargs):
     import inspect
 

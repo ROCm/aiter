@@ -34,7 +34,12 @@ from aiter.ops.shuffle import (
     shuffle_mxfp8fp4_b,
     shuffle_mxfp8fp4_scale,
 )
-from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.test_common import (
+    benchmark,
+    checkAllclose,
+    run_dispatch_loop,
+    run_perftest,
+)
 from aiter.utility import fp4_utils
 
 try:
@@ -63,6 +68,18 @@ def _heuristic_tile(M):
     get_heuristic_kernel in asm_mxfp8fp4gemm.cu): M<=64 wastes most of a 256-tall
     tile's rows, so it takes the 64x512 variant; any larger M takes 256x256."""
     return (64, 512) if M <= 64 else (256, 256)
+
+
+def _heuristic_kernel_base(outtype, intype, apre, M):
+    """Mangled-name base the heuristic .co uses for this config, matching the CSV
+    convention (hsa/gfx1250/mxfp8fp4gemm/mxfp8fp4gemm.csv). BOTH the tile and the
+    cluster depend on M: M<=64 -> 64x512 with cluster 4x1, else 256x256 with
+    cluster 4x4 (the cluster is NOT 4x4 for the 64x512 tile). Used for the
+    TG-occupancy label so it names the .co the heuristic actually dispatches to."""
+    middle = "mxfp8fp8" if intype == "a8w8" else "mxfp8fp4"
+    pre = "ABpreShuffle" if apre else "BpreShuffle"
+    tile, cluster = ("64x512", "4x1") if M <= 64 else ("256x256", "4x4")
+    return f"f8gemm_{outtype}_{middle}_{pre}_{tile}_{cluster}_ps"
 
 
 def _report_active_tg(M, N, tile_m, tile_n, label):
@@ -235,10 +252,10 @@ def _prep(
         sA = bench_init.fill_scale_e8m0((M, K // MX_SCALE_BLOCK), scale_init, gen)
         sB = bench_init.fill_scale_e8m0((N, K // MX_SCALE_BLOCK), scale_init, gen)
 
-    # fp32 golden; the caller casts/quantizes it to the requested outtype.
-    # clk-mode skips it: the golden is a ~34 GB fp32 N-by-K matmul (compute-bound,
-    # would dominate the timeline AND pull the sampled clocks up to compute freqs),
-    # and clk-mode doesn't check accuracy.
+    # fp32 golden; the caller casts/quantizes it to the requested outtype. Skipped
+    # when need_ref is False (--skip-ref, or clk/ttrace mode): the golden is a
+    # ~34 GB fp32 N-by-K matmul (compute-bound) that would dominate wall time / VRAM
+    # and, in clk mode, pull the sampled clocks up to compute freqs.
     ref_f32 = _ref(intype, A, B, sA, sB, M, N) if need_ref else None
 
     inp = {
@@ -263,10 +280,16 @@ def test_gemm(
     seed=0,
     mode="perf",
     knl_name=None,
-    clk_mode=False,
-    clk_seconds=40.0,
+    clk_seconds=15.0,
     num_iters_arg=None,
+    skip_ref=False,
 ):
+    # mode selects the harness path (see main's --mode help):
+    #   func/perf/profile -> torch.profiler device-time timing (run_perftest)
+    #   clk               -> short profiled burst + unprofiled soak for clk_trace.py
+    #   ttrace            -> plain dispatch loop for an external rocprofv3 --att wrap
+    clk_mode = mode == "clk"
+    under_rocprof = mode == "ttrace"
     # Skip unfittable shapes up front (before prep/shuffle) so they show as
     # "not support" rather than crashing on a shape assert / missing kernel.
     reason = _support_reason(outtype, apre, M, N, K)
@@ -294,8 +317,13 @@ def test_gemm(
     assert K % MX_SCALE_BLOCK == 0, f"K must be a multiple of {MX_SCALE_BLOCK}"
     out_dtype = _OUT_DTYPE[outtype]
     gen = bench_init.make_generator(seed)  # fixed seed -> bit-identical buffers
+    # Golden skipped when --skip-ref, or implicitly in clk/ttrace mode (clk: the
+    # ~34GB fp32 ref would pull sampled clocks up to compute freqs; ttrace:
+    # rocprofv3 traces only the filtered f8gemm kernel, so the golden is just extra
+    # untraced work). clk/ttrace also don't check accuracy.
+    need_ref = not (skip_ref or clk_mode or under_rocprof)
     inp, ref_f32 = _prep(
-        intype, M, N, K, apre, data_init, scale_init, gen, need_ref=not clk_mode
+        intype, M, N, K, apre, data_init, scale_init, gen, need_ref=need_ref
     )
     ref = ref_f32.to(out_dtype) if ref_f32 is not None else None
     needTrace = mode == "profile"
@@ -305,22 +333,12 @@ def test_gemm(
         num_iters = 5 if mode == "func" else 101
 
     # Single ASM kernel under test, dispatched by intype. Inputs passed as ARGS so
-    # run_perftest can rotate them (defeats the L2 hot-cache). Dispatch is
-    # heuristic by default (kernelName=""); an explicit --knl-name forces that .co.
+    # run_perftest can rotate them (defeats the L2 hot-cache).
     kern = aiter.gemm_a8w4_mxfp8 if intype == "a8w4" else aiter.gemm_a8w8_mxfp8
-    # Dispatch mode. Default (knl_name=None) is heuristic: knl="" lets the op pick
-    # the .co by (b_intype, a_preshuffle). Explicit is opt-in via --knl-name:
-    # "auto" derives this config's mangled name from the CSV convention (see
-    # hsa/gfx1250/mxfp8fp4gemm/mxfp8fp4gemm.csv); any other value is used verbatim.
-    if not knl_name:
-        knl = ""
-    elif knl_name == "auto":
-        middle = "mxfp8fp8" if intype == "a8w8" else "mxfp8fp4"
-        pre = "ABpreShuffle" if apre else "BpreShuffle"
-        base = f"f8gemm_{outtype}_{middle}_{pre}_256x256_4x4_ps"
-        knl = f"_ZN5aiter{len(base)}{base}E"
-    else:
-        knl = knl_name
+    # Dispatch: default (knl_name=None) -> knl="" lets the op pick the .co by
+    # (b_intype, a_preshuffle) AND M (M<=64 -> 64x512, else 256x256). An explicit
+    # --knl-name forces that exact mangled name from the CSV verbatim (dev debug).
+    knl = knl_name or ""
 
     def run_asm(A, B, sA, sB):
         return kern(
@@ -340,21 +358,44 @@ def test_gemm(
 
     ret = {"gfx": get_gfx(), "knl_name": knl_name or "(heuristic)"}
     # Report TG occupancy for the tile the cpp dispatch picks (M<=64 -> 64x512).
-    _middle = "mxfp8fp8" if intype == "a8w8" else "mxfp8fp4"
-    _pre = "ABpreShuffle" if apre else "BpreShuffle"
     _tile_m, _tile_n = _heuristic_tile(M)
-    _label = f"f8gemm_{outtype}_{_middle}_{_pre}_{_tile_m}x{_tile_n}_4x4_ps"
+    _label = _heuristic_kernel_base(outtype, intype, apre, M)
     _report_active_tg(M, N, _tile_m, _tile_n, _label)
 
+    if under_rocprof:
+        # ---- ttrace: rocprofv3 --att feeder (plain dispatch loop) ----
+        # run_dispatch_loop uses no torch.profiler / cuda-event / per-iter sync --
+        # all of those deadlock with ATT's HSA-queue interception. Just launch the
+        # kernel enough times for --kernel-iteration-range to catch it; timing/BW
+        # come from a separate clk/perf run, so report nan.
+        run_asm, cand_args = candidates["asm"]
+        n = num_iters_arg if num_iters_arg is not None else 101
+        out, wall_us = run_dispatch_loop(run_asm, *cand_args, num_iters=n, num_warmup=3)
+        # WALL-CLOCK throughput (incl. host launch overhead + gaps). Meaningful only
+        # when run BARE; under rocprofv3 --att the SQTT trace inflates it. Reported
+        # so a bare `--mode ttrace` still yields a rough flops/BW; for the real
+        # device-time number use --mode perf/clk. Labeled *wall to avoid confusion.
+        io_bytes = in_bytes + out.nbytes
+        ret["asm us"] = round(wall_us, 2)
+        ret["asm TFLOPS"] = round(flops / wall_us / 1e6, 1)
+        ret["asm TB/s"] = round(io_bytes / wall_us / 1e6, 2)
+        ret["asm err"] = float("nan")
+        ret["asm result"] = "ttrace(wall)"
+        aiter.logger.warning(
+            "ttrace: %d dispatches; us/TFLOPS/TB-s are WALL-CLOCK (incl. launch "
+            "overhead, ATT-inflated under rocprofv3) -- use perf/clk for device time",
+            n,
+        )
+        return ret
+
     if clk_mode:
-        # ---- Clock-decoupling soak (DPM experiment Step -1 / Step 0) ----
-        # No golden, no profiler: launch the kernel back-to-back for >= clk_seconds
-        # so an external clk_trace.py --wait-pid can sample a long steady clock
-        # window, and BW + clocks come from the SAME window (discipline #3). The
-        # torch profiler path can't do this -- it buffers every kernel event, so a
-        # 30 s (tens of thousands of iters) run would blow up memory. Reusing the
-        # same args every iter is fine: B is ~4.3 GB, far larger than L2, so nothing
-        # caches and every iter re-reads the full operand from HBM.
+        # ---- Clock-decoupling mode (DPM experiment) ----
+        # Two phases: (1) a SHORT torch-profiled burst for accurate device-time
+        # TFLOPS/BW (same path as normal perf), then (2) an UNPROFILED back-to-back
+        # soak for clk_seconds so an external clk_trace.py --wait-pid samples a steady
+        # clock window. Golden is skipped (memory-bound decode: the ~34GB fp32 ref
+        # would dominate the timeline and pull the clocks up). Reusing the same args
+        # every iter is fine: B is far larger than L2, so every iter re-reads from HBM.
         import time as _time
 
         run_asm, cand_args = candidates["asm"]
@@ -373,38 +414,55 @@ def test_gemm(
             ret["asm result"] = "not support"
             return ret
 
-        CHUNK = 500  # syncs are sparse, so intra-loop GPU idle gaps stay negligible
-        ev0 = torch.cuda.Event(enable_timing=True)
-        ev1 = torch.cuda.Event(enable_timing=True)
-        done = 0
-        ev0.record()
-        t0 = _time.perf_counter()
-        while True:
-            for _ in range(CHUNK):
-                out = run_asm(*cand_args)
-            done += CHUNK
-            torch.cuda.synchronize()
-            if _time.perf_counter() - t0 >= clk_seconds:
-                break
-            if num_iters_arg is not None and done >= num_iters_arg:
-                break
-        ev1.record()
-        torch.cuda.synchronize()
-        wall = _time.perf_counter() - t0
-        us = ev0.elapsed_time(ev1) * 1000.0 / done  # per-iter device us
+        # (1) Per-iter DEVICE time via a SHORT torch-profiled burst -- the SAME path
+        # normal perf uses (run_perftest -> torch profiler -> get_trace_perf), so the
+        # TFLOPS/BW match the standard test and exclude host launch overhead. Only
+        # ~num_iters events are buffered. Profiling the WHOLE soak instead would buffer
+        # one event per launch (1e5-1e6) -> OOM + a giant DataFrame in get_trace_perf,
+        # which is exactly why the soak below stays unprofiled.
+        out, us = run_perftest(run_asm, *cand_args, num_iters=101, num_warmup=2)
         io_bytes = in_bytes + out.nbytes
         ret["asm us"] = round(us, 2)
         ret["asm TFLOPS"] = round(flops / us / 1e6, 1)
         ret["asm TB/s"] = round(io_bytes / us / 1e6, 2)
         ret["asm err"] = float("nan")
-        ret["asm result"] = f"clk-mode {done}it/{wall:.0f}s"
+        ret["asm result"] = "clk-mode"
+
+        # (2) Soak: launch back-to-back for clk_seconds so an external clk_trace can
+        # sample a steady clock window -- and time it (wall-clock) to also report a
+        # SUSTAINED throughput. Unlike the phase-1 device-time number (measured cool,
+        # kernel-only), the soak figure is measured in the SAME thermal/clock window
+        # the sampler sees (so it's consistent with the reported clock, incl. any
+        # throttle) and INCLUDES host launch overhead + inter-kernel gaps -> it is the
+        # realistic sustained decode rate, always <= the phase-1 device-time upper
+        # bound. Same args every iter is fine: B >> L2, so every iter re-reads HBM.
+        CHUNK = 500
+        done = 0
+        t0 = _time.perf_counter()
+        while _time.perf_counter() - t0 < clk_seconds:
+            for _ in range(CHUNK):
+                out = run_asm(*cand_args)
+            done += CHUNK
+            torch.cuda.synchronize()
+            if num_iters_arg is not None and done >= num_iters_arg:
+                break
+        wall = _time.perf_counter() - t0
+        if wall > 0 and done > 0:
+            soak_us = wall / done * 1e6
+            ret["asm soak us"] = round(soak_us, 2)
+            ret["asm soak TFLOPS"] = round(flops / soak_us / 1e6, 1)
+            ret["asm soak TB/s"] = round(io_bytes / soak_us / 1e6, 2)
         aiter.logger.info(
-            "clk-mode soak: %d iters over %.1f s, %.2f us/iter, %.2f TB/s "
-            "(golden skipped, sample clocks with clk_trace during this window)",
+            "clk-mode: device us=%.2f (%.1f TFLOPS, %.2f TB/s, cool/kernel-only via "
+            "torch.profiler); soak %d iters/%.1fs -> %.2f us (%.2f TB/s sustained, "
+            "same window as clk_trace, golden skipped)",
+            us,
+            ret["asm TFLOPS"],
+            ret["asm TB/s"],
             done,
             wall,
-            us,
-            ret["asm TB/s"],
+            ret.get("asm soak us", float("nan")),
+            ret.get("asm soak TB/s", float("nan")),
         )
         return ret
 
@@ -449,19 +507,25 @@ def test_gemm(
         # O(1), so any accumulator (kernel or this ref) lands in [-1,+1] noise
         # purely by summation order -- benign, not a kernel defect. a8w4's
         # coarser fp4 B rarely hits it. atol=1.0 keeps such elements a warning.
-        err = checkAllclose(
-            ref.to(dtypes.fp32),
-            out.to(dtypes.fp32),
-            rtol=1e-1,
-            atol=1.0,
-            msg=f"{intype} {name}",
+        err = (
+            checkAllclose(
+                ref.to(dtypes.fp32),
+                out.to(dtypes.fp32),
+                rtol=1e-1,
+                atol=1.0,
+                msg=f"{intype} {name}",
+            )
+            if ref is not None
+            else float("nan")  # golden skipped (--skip-ref / clk / ttrace)
         )
         io_bytes = in_bytes + out.nbytes
         ret[f"{name} us"] = round(us, 2)
         ret[f"{name} TFLOPS"] = round(flops / us / 1e6, 1)
         ret[f"{name} TB/s"] = round(io_bytes / us / 1e6, 2)
         ret[f"{name} err"] = err
-        ret[f"{name} result"] = _verdict(err)
+        # ref is None under --skip-ref: _verdict(nan) would read as "failed", so
+        # report the skip explicitly instead.
+        ret[f"{name} result"] = _verdict(err) if ref is not None else "no-ref"
         if needTrace:
             ret[f"{name} trace"] = f"./aiter_logs/gpu_id_{torch.cuda.current_device()}"
     return ret
@@ -482,9 +546,22 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=["func", "perf", "profile"],
+        choices=["func", "perf", "profile", "clk", "ttrace"],
         default="perf",
-        help="func=acc only, perf=acc+timing, profile=perf+trace",
+        help="test harness path (one axis; clk/ttrace are no longer separate flags):\n"
+        "  func    = accuracy only\n"
+        "  perf    = accuracy + device-time timing (torch.profiler)\n"
+        "  profile = perf + torch.profiler trace under ./aiter_logs/\n"
+        "  clk     = DPM clock soak: short profiled burst for cool device-time\n"
+        "            TFLOPS/BW, then a timed unprofiled soak for --clk-seconds so an\n"
+        "            external clk_trace.py --wait-pid samples sysfs clocks at 1ms.\n"
+        "            Also reports 'soak' wall-clock sustained TFLOPS/BW measured in\n"
+        "            that same (throttle-exposed) window. Golden skipped. See\n"
+        "            clk_mxfp8fp4gemm.sh.\n"
+        "  ttrace  = plain dispatch loop with the internal torch.profiler OFF so an\n"
+        "            external rocprofv3 --att wrap does not collide. Golden skipped;\n"
+        "            us/TFLOPS/TB-s are wall-clock (ATT-inflated under rocprofv3).\n"
+        "            See ttrace_mxfp8fp4gemm.sh.",
     )
     parser.add_argument(
         "--intype",
@@ -500,7 +577,7 @@ def main():
         choices=[1, 0],
         default=None,
         help="A-preshuffle sweep list: 1 preshuffles A (M%%2), 0 sends it "
-        "row-major (M%%1). Default (unset): perf/profile = [1], func = [1, 0].",
+        "row-major (M%%1). Default (unset): func = [1, 0], all other modes = [1].",
     )
     parser.add_argument(
         "--outtype",
@@ -549,8 +626,9 @@ def main():
         dest="knl_name",
         default=None,
         help="dispatch mode. Default (unset) = heuristic: the aiter op picks the "
-        ".co from mxfp8fp4gemm.csv by (b_intype, a_preshuffle) and shape. Any other "
-        "value = force that exact mangled knl_name for all runs (developer debug).",
+        ".co from mxfp8fp4gemm.csv by (b_intype, a_preshuffle) and M (M<=64 -> "
+        "64x512, else 256x256). Any value = force that exact mangled knl_name from "
+        "the CSV verbatim for all runs (developer debug).",
     )
     # intype x shape is a full product, so each shape is run for both a8w8/a8w4.
     parser.add_argument(
@@ -560,34 +638,46 @@ def main():
         type=dtypes.str2tuple,
         nargs="*",
         default=None,
-        help="(M,N,K) tuples, e.g. -s 16384,16384,8192 128,16384,16384; "
-        "unset uses PERF_SHAPES (perf/profile) or FUNC_SHAPES (func)",
-    )
-    parser.add_argument(
-        "--clk-mode",
-        dest="clk_mode",
-        action="store_true",
-        help="DPM clock-decoupling mode: skip the fp32 golden and run the kernel "
-        "back-to-back for --clk-seconds (no profiler) so an external clk_trace.py "
-        "can sample a long steady clock window. BW is reported from that same "
-        "window; accuracy is NOT checked (err/result show clk-mode).",
+        help="(M,N,K) tuples, e.g. -s 16384,16384,8192 128,16384,16384; unset uses "
+        "FUNC_SHAPES (func), a single memory-bound representative (clk/ttrace), or "
+        "PERF_SHAPES (perf/profile)",
     )
     parser.add_argument(
         "--clk-seconds",
         dest="clk_seconds",
         type=float,
-        default=40.0,
-        help="clk-mode soak duration in seconds (default 40; >= 30 recommended so "
-        "the trace resolves a steady window, not just the ramp)",
+        default=8.0,
+        help="clk-mode soak duration in seconds (default 8). The external "
+        "clk_trace.py samples sysfs at 1ms and drops the ramp via --settle, so a few "
+        "seconds already yield a stable clock median; kept SHORT on purpose so large "
+        "shapes / long runs don't heat into thermal throttle. Raise it only if you "
+        "specifically want to observe the throttle onset.",
     )
     parser.add_argument(
         "--num-iters",
         dest="num_iters",
         type=int,
         default=None,
-        help="override kernel iteration count. Normal mode: replaces the default "
-        "101 (perf) / 5 (func). clk-mode: optional hard cap on soak iters (the "
-        "soak still stops at --clk-seconds, whichever comes first).",
+        help="override kernel iteration count. func/perf/profile: replaces the "
+        "default 101 (perf/profile) / 5 (func). clk: optional hard cap on soak "
+        "iters (still stops at --clk-seconds, whichever first). ttrace: number of "
+        "plain dispatches (default 101).",
+    )
+    parser.add_argument(
+        "--metrics-json",
+        dest="metrics_json",
+        default=None,
+        help="also write the summary table (one record per row, incl. clk-mode "
+        "'soak' throughput) to this JSON path, for clk_merge.py to join against a "
+        "clk_trace.py CSV. Works in any mode; most useful with --mode clk.",
+    )
+    parser.add_argument(
+        "--skip-ref",
+        dest="skip_ref",
+        action="store_true",
+        help="skip the fp32 golden reference (accuracy NOT checked; err/result show "
+        "no-ref). Auto-on for clk/ttrace. Opt-in for func/perf/profile to cut wall "
+        "time and VRAM on large compute-bound shapes.",
     )
     args = parser.parse_args()
 
@@ -598,6 +688,11 @@ def main():
     # list broadcasts against the other axis.
     if args.mode == "func":
         default_di, default_si = ["uniform"], ["auto"]
+    elif args.mode in ("clk", "ttrace"):
+        # clk/ttrace don't check accuracy, and the clock/trace is data-independent
+        # for these memory-bound decode shapes -> a single deterministic pair (no
+        # point multiplying the soak/trace budget across init distributions).
+        default_di, default_si = ["constant"], ["auto"]
     else:
         default_di, default_si = ["constant", "uniform"], ["constant", "auto"]
     di_list = args.data_init if args.data_init is not None else default_di
@@ -613,20 +708,25 @@ def main():
         )
     init_pairs = list(zip(di_list, si_list))
 
-    # A-preshuffle sweep. Mode-aware default when unset: perf/profile exercise only
-    # the preshuffled path ([1]); func sweeps both ([1, 0]).
+    # A-preshuffle sweep. Mode-aware default when unset: func sweeps both ([1, 0]);
+    # every other mode exercises only the preshuffled path ([1]).
     if args.apre is not None:
         apre_list = args.apre
-    elif args.mode in ("perf", "profile"):
-        apre_list = [1]
-    else:
+    elif args.mode == "func":
         apre_list = [1, 0]
+    else:
+        apre_list = [1]
 
     def shapes_for(intype):
         if args.shape is not None:
             return args.shape
         if args.mode == "func":
             return FUNC_SHAPES
+        if args.mode in ("clk", "ttrace"):
+            # DPM decode experiment: sweep only the memory-bound (folded-BS)
+            # representative. The compute-bound shape would just burn the soak /
+            # trace budget and (in clk) pull clocks up to compute freqs.
+            return [PERF_SHAPES[intype][-1]]
         return PERF_SHAPES[intype]
 
     rows = [
@@ -642,9 +742,9 @@ def main():
             seed=args.seed,
             mode=args.mode,
             knl_name=args.knl_name,
-            clk_mode=args.clk_mode,
             clk_seconds=args.clk_seconds,
             num_iters_arg=args.num_iters,
+            skip_ref=args.skip_ref,
         )
         for apre, (di, si), intype, outtype in itertools.product(
             apre_list, init_pairs, args.intype, args.outtype
@@ -652,6 +752,13 @@ def main():
         for (M, N, K) in shapes_for(intype)
     ]
     df = pd.DataFrame(rows)
+    if args.metrics_json:
+        # Full records (incl. M/N/K/intype and clk-mode soak metrics) for clk_merge.
+        import json
+
+        with open(args.metrics_json, "w") as f:
+            json.dump(df.to_dict(orient="records"), f, indent=2, default=str)
+        aiter.logger.info("metrics written to %s", args.metrics_json)
     # Keep knl_name (the actual .co); drop the columns constant within a table.
     df = df.drop(columns=["seed", "gfx", "mode"], errors="ignore")
     aiter.logger.info(
@@ -660,6 +767,16 @@ def main():
     )
     if args.mode == "profile":
         aiter.logger.info("profiler traces written under ./aiter_logs/")
+    elif args.mode == "ttrace":
+        aiter.logger.info(
+            "ttrace: rerun under rocprofv3 --att to capture the thread trace "
+            "(see ttrace_mxfp8fp4gemm.sh); this bare run only emits the dispatches"
+        )
+    elif args.mode == "clk":
+        aiter.logger.info(
+            "clk: pair with clk_trace.py --wait-pid to sample sysfs clocks "
+            "(see clk_mxfp8fp4gemm.sh)"
+        )
 
 
 if __name__ == "__main__":
