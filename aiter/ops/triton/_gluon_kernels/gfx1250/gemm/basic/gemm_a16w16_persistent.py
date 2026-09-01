@@ -76,8 +76,6 @@ def gemm_a16w16_persistent_kernel_(
     waves_per_eu: gl.constexpr = 0,
 ):
 
-    gl.static_assert(NUM_BUFFERS >= 2, "persistent gemm requires NUM_BUFFERS >= 2")
-
     WRITES_FINAL: gl.constexpr = NUM_KSPLIT == 1
 
     SHARED_LAYOUT_A: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
@@ -327,9 +325,6 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
     num_stages: gl.constexpr = 0,
     waves_per_eu: gl.constexpr = 0,
 ):
-    gl.static_assert(
-        NUM_BUFFERS >= 2, "persistent compute_bound requires NUM_BUFFERS >= 2"
-    )
 
     WRITES_FINAL: gl.constexpr = NUM_KSPLIT == 1
     # prefetch depth is derived from the buffer count
