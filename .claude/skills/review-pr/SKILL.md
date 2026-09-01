@@ -1,6 +1,6 @@
 ---
 name: review-pr
-description: Advisory AI code review for aiter and FlyDSL PRs. Catches perf regressions, silent correctness bugs, dispatch gate holes, and AI-generated code patterns, but never acts as a merge gate. Invoke with a PR number (optionally owner/repo#N) and, when one exists, a validation report path; a review without one is static-only and is a supported outcome, not a deficiency. Deterministic validation is reported separately.
+description: Advisory AI code review for aiter and FlyDSL PRs. Catches perf regressions, silent correctness bugs, dispatch gate holes, and AI-generated code patterns, but never acts as a merge gate. Invoke with a PR number (optionally owner/repo#N) and, when one exists, a validation report path. Step 1 triages whether the PR changes runtime surface at all and, when it does and the PR ships a single test target, runs validate-kernel-pr itself; a PR with no runtime surface is reported N/A rather than unvalidated. Deterministic validation is still judged only from a head-matched report.
 argument-hint: <PR number> [owner/repo] [validation-report]
 ---
 
@@ -125,8 +125,160 @@ if [ ! -r "$SCHEMA" ]; then
   exit 1
 fi
 
-# Validation is opt-in and explicit. Never auto-load ./validation_report.json: a stale report
-# from another PR is worse than no report. Reject reports that do not name this exact head.
+# Triage: decide whether this PR needs runtime evidence at all, and if so, what could carry it.
+# This runs HERE, executable, for the same reason the D9 scan does: a judgement the checklist
+# asks for mid-review is a judgement that does not get made. Leaving it to the reviewer also
+# gave the verdict line only two states, so a README fix reported the same
+# "NOT RUN" as an unvalidated kernel rewrite -- which teaches a reader to skip the line.
+python3 - "$WORK/pr_meta.json" "$WORK/pr.diff" "$WORK/validation_requirement.json" <<'PY'
+import json
+import pathlib
+import sys
+
+meta_path, diff_path, out_path = (pathlib.Path(a) for a in sys.argv[1:4])
+paths = [f["path"] for f in json.loads(meta_path.read_text()).get("files", [])]
+
+# Checked in this order: a .md under csrc/ is documentation, and op_tests/ is neither
+# runtime nor documentation.
+TEST_PREFIXES = ("op_tests/",)
+STATIC_PREFIXES = (".github/", ".claude/", ".cursor/", "bin/", "docs/")
+STATIC_SUFFIXES = (".md", ".rst", ".txt", ".toml", ".cfg", ".ini", ".gitignore")
+RUNTIME_PREFIXES = ("csrc/", "hsa/", "aiter/", "gradlib/")
+RUNTIME_SUFFIXES = (".cu", ".cuh", ".hip", ".cpp", ".cc", ".c", ".h", ".hpp", ".s", ".asm")
+
+
+def classify(path):
+    if path.startswith(TEST_PREFIXES):
+        return "test"
+    if path.startswith(STATIC_PREFIXES) or path.endswith(STATIC_SUFFIXES):
+        return "static"
+    if path.startswith(RUNTIME_PREFIXES) or path.endswith(RUNTIME_SUFFIXES):
+        return "runtime"
+    # Unclassified counts as runtime, deliberately. The error to avoid is clearing a kernel
+    # change because nobody put its directory on a list; demanding evidence that turns out
+    # to be unnecessary only costs a run. Note this makes `aiter/configs/*.csv` tuned-shape
+    # edits and `aiter/jit/**` build config runtime, which is correct: both reroute kernels.
+    return "runtime"
+
+
+runtime_paths = sorted(p for p in paths if classify(p) == "runtime")
+required = bool(runtime_paths)
+
+# Added files come from the diff, not from the file list: `gh pr view --json files` reports
+# additions/deletions per path but not status, and "deletions == 0" also matches a file that
+# was only appended to.
+added = set()
+current = None
+for line in diff_path.read_text(errors="replace").splitlines():
+    if line.startswith("diff --git ") and " b/" in line:
+        current = line.split(" b/", 1)[1]
+    elif line.startswith("new file mode") and current:
+        added.add(current)
+
+
+def is_candidate_target(path):
+    name = pathlib.PurePosixPath(path).name
+    # op_benchmarks/ holds bench_*.py perf harnesses; they are not correctness targets and
+    # the validator has no perf stage to give them.
+    return (
+        path.startswith("op_tests/")
+        and "/op_benchmarks/" not in f"/{path}"
+        and name.startswith("test_")
+        and name.endswith(".py")
+    )
+
+
+candidates = sorted(p for p in paths if is_candidate_target(p))
+added_candidates = [p for p in candidates if p in added]
+target = None
+basis = None
+blocker = None
+if not required:
+    blocker = "no runtime surface changed"
+elif len(candidates) == 1:
+    target, basis = candidates[0], "the one test target this PR touches"
+elif len(added_candidates) == 1:
+    target, basis = added_candidates[0], "the one test target this PR adds"
+elif candidates:
+    blocker = (
+        f"{len(candidates)} candidate targets and no unique added one; "
+        "name the target explicitly rather than letting the tool pick"
+    )
+else:
+    blocker = "the PR changes runtime code but ships no test target"
+
+# A target is never inferred from the *kernel* being changed, only from a test the PR itself
+# touches. The validator cannot judge whether a target exercises the diff, so an invented
+# target can return PASS on evidence about unrelated code -- worse than no report, because
+# it reads as clearance.
+out_path.write_text(
+    json.dumps(
+        {
+            "required": required,
+            "families": sorted({classify(p) for p in paths}),
+            "runtime_paths": runtime_paths[:20],
+            "runtime_path_count": len(runtime_paths),
+            "target": target,
+            "target_basis": basis,
+            "candidates": candidates,
+            "blocking_reason": blocker,
+        },
+        indent=2,
+    )
+    + "\n"
+)
+verdict = "REQUIRED" if required else "NOT REQUIRED"
+print(f"validation triage: {verdict} ({', '.join(sorted({classify(p) for p in paths}))})")
+if runtime_paths:
+    print(f"  runtime surface: {len(runtime_paths)} path(s), e.g. {', '.join(runtime_paths[:3])}")
+print(f"  target: {target} — {basis}" if target else f"  no auto target: {blocker}")
+PY
+
+# Validation is opt-in in the sense that matters: a report is never adopted because it happens
+# to be lying in the working directory. A stale report from another PR is worse than none, so
+# every report -- supplied by the caller or produced by the auto-run below -- goes through the
+# same identity gate, and reports that do not name this exact head are rejected.
+#
+# Auto-running the validator is not the same act as trusting a found file. The run below binds
+# its own report to this head, writes it inside this invocation's scratch dir, and then faces
+# the unmodified gate. Set REVIEW_AUTO_VALIDATE=0 to skip it.
+if [ -z "$VALIDATION_REPORT" ] \
+  && [ "${REVIEW_AUTO_VALIDATE:-1}" = 1 ] \
+  && python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); sys.exit(0 if r["required"] and r["target"] else 1)' \
+    "$WORK/validation_requirement.json"; then
+  AUTO_TARGET=$(python3 -c \
+    'import json,sys; print(json.load(open(sys.argv[1]))["target"])' \
+    "$WORK/validation_requirement.json")
+  VALIDATOR_WRAPPER="$PROJECT_ROOT/bin/validate-kernel-pr"
+  if [ ! -x "$VALIDATOR_WRAPPER" ]; then
+    echo "auto-validation skipped: $VALIDATOR_WRAPPER is missing or not executable" >&2
+  else
+    # Route and shape knowledge cannot be derived from a diff, so without these the receipt
+    # and grid stages skip and the run tops out at INCONCLUSIVE by construction. That is a
+    # limit of what a diff tells you, not a defect in the PR -- Step 8 must say so.
+    AUTO_ARGS=()
+    [ -n "${REVIEW_EXPECTED_ROUTE:-}" ] && AUTO_ARGS+=(--expected-route "$REVIEW_EXPECTED_ROUTE")
+    [ -n "${REVIEW_SHAPE_VARS:-}" ] && AUTO_ARGS+=(--shape-vars "$REVIEW_SHAPE_VARS")
+    [ -n "${REVIEW_SHAPE_ENV:-}" ] && AUTO_ARGS+=(--shape-env "$REVIEW_SHAPE_ENV")
+    [ -n "${REVIEW_SHAPE_ARG:-}" ] && AUTO_ARGS+=(--shape-arg "$REVIEW_SHAPE_ARG")
+    [ -n "${REVIEW_GRID:-}" ] && AUTO_ARGS+=(--grid "$REVIEW_GRID")
+    echo "auto-validation: running $AUTO_TARGET for PR #$PR (minutes, needs an idle GPU)"
+    # BLOCK, NEEDS_WORK and INCONCLUSIVE all still write a report worth consuming, so the
+    # exit code must not abort the review; only a missing file means there is nothing to read.
+    set +e
+    "$VALIDATOR_WRAPPER" --pr "$PR" --repo "$REPO" --target "$AUTO_TARGET" \
+      --label "review-pr-auto" --out "$WORK/auto_validation_report.json" "${AUTO_ARGS[@]}"
+    AUTO_RC=$?
+    set -e
+    if [ -r "$WORK/auto_validation_report.json" ]; then
+      VALIDATION_REPORT="$WORK/auto_validation_report.json"
+      echo "auto-validation exited $AUTO_RC; consuming its report through the standard gate"
+    else
+      echo "auto-validation exited $AUTO_RC and wrote no report; the review stays static-only" >&2
+    fi
+  fi
+fi
+
 if [ -n "$VALIDATION_REPORT" ]; then
   python3 - "$WORK/pr_meta.json" "$WORK/base_head.txt" "$WORK/pr.diff" "$SCHEMA" \
     "$VALIDATION_REPORT" "$WORK/validation_report.json" <<'PY'
@@ -322,7 +474,28 @@ print(
 )
 PY
 else
-  echo "validation report not supplied: this is a static-only advisory review"
+  # Distinguish the two reasons there is no report. "Not applicable" and "required but
+  # missing" are different facts about the PR, and collapsing them into one sentence is what
+  # made the old verdict line uninformative.
+  python3 - "$WORK/validation_requirement.json" <<'PY'
+import json
+import pathlib
+import sys
+
+req = json.loads(pathlib.Path(sys.argv[1]).read_text())
+if not req["required"]:
+    print(
+        "validation not applicable: no runtime surface changed "
+        f"({', '.join(req['families'])}); a static-only review is complete here, "
+        "not deficient"
+    )
+else:
+    print(
+        "validation REQUIRED but not run: "
+        f"{req['blocking_reason']}. Report it as a gap in the evidence, and if the reason "
+        "is a missing test target, as a finding about the PR."
+    )
+PY
 fi
 
 # Inline review comments (line-level code comments — often more specific than top-level)
@@ -396,7 +569,7 @@ Check which type(s) apply; these determine which Step 5 categories are mandatory
 - [ ] **Perf / benchmark PR** → P1 (numbers with units), P5 (setup cost excluded?), P2 (production shapes), P3 (reproducible)
 - [ ] **Test / benchmark only** → P2 (production shapes), HK6 (aiter-op-test format)
 - [ ] **Async / multi-stream** → G1 (stream sync missing), G1b (blocking queue.get without timeout in serving code)
-- [ ] **FlyDSL kernel** → D10 (compile result called?), D10b (arith.unwrap() before arith.bitcast?). If an exact-head `validation_report.json` was supplied, use its deterministic stages as evidence. Otherwise mark the result `[static-only advisory review]` (see Step 8) and make no runtime clearance claim; absence of a report is not itself a blocker. Two target classes cannot reach `PASS` by construction, so their `INCONCLUSIVE` is the expected output and not a deficiency: a CPU-only target claims no GPU and therefore no architecture, and a bugfix with no shape dimension has no grid for `correctness_s1_grid` to consume. Never ask such an author for a passing report.
+- [ ] **FlyDSL kernel** → D10 (compile result called?), D10b (arith.unwrap() before arith.bitcast?). A FlyDSL kernel change is runtime surface, so Step 1's triage marks it `REQUIRED` and, when the PR ships exactly one test target, has already run the validator against it. Use whatever report Step 1 accepted as the evidence; where it reached no report, mark the result `[static-only advisory review]` (see Step 8) and make no runtime clearance claim. Absence of a report is not itself a blocker. Two target classes cannot reach `PASS` by construction, so their `INCONCLUSIVE` is the expected output and not a deficiency: a CPU-only target claims no GPU and therefore no architecture, and a bugfix with no shape dimension has no grid for `correctness_s1_grid` to consume. Never ask such an author for a passing report.
 - [ ] **New if/elif dispatch with variable assignment** → D1b (UnboundLocalError on uninitialized path)
 - [ ] **Change to behavior/dispatch of a downstream-consumed op** (mla / fused_moe / attention / mha / quant / gemm_op_a8w8 / moe_op / jit-core) → E4 (is downstream CI triggered or skipped?), E5 (stable-API owner sign-off)
 - [ ] **New `@compile_ops` / `torch.library.custom_op`, or change to an op's return dtype/arity** → D7 (fake/abstract impl exists?), D6 (fake dtype/shape matches real op?)
@@ -875,9 +1048,13 @@ If the answer is yes, add it to the findings. If the answer is no, proceed.
 - If there are no findings, the findings section is omitted entirely.
 - "What it does" must be one sentence, written for a reviewer who hasn't read the diff.
 - **At most 5 findings, ordered most-severe first.** Rank by (severity, then blast radius), keep the top 5, and drop the rest — do not append them as a tail. This is a readability limit, not a measured recall claim; no committed replay corpus currently establishes recall@5.
-- **State the validation evidence** on the line under the verdict:
-  - with an accepted exact-head report: `Validation (deterministic): <verdict>` plus selected target/runner, runtime arch, and failed/skipped stages.
-  - without one: `Validation (deterministic): NOT RUN — no exact-head validation_report.json`. Then no finding may assert runtime behaviour (perf, accuracy, launch failure) as fact; such findings are `[inferred]` and phrased as questions.
+- **State the validation evidence** on the line under the verdict, using the state Step 1's triage
+  actually reached. The three no-report states are different facts and must not be merged:
+  - with an accepted exact-head report: `Validation (deterministic): <verdict>` plus selected target/runner, runtime arch, and failed/skipped stages. Say when the report came from the auto-run, because its ceiling is lower: with no route supplied the receipt and grid stages skip, so `INCONCLUSIVE` there describes what a diff can tell you and is not a finding against the PR.
+  - triage said not required: `Validation (deterministic): N/A — no runtime surface changed`. Do not write `NOT RUN`; there is no gap to report, and a docs or tooling PR carrying an alarming evidence line is what makes the line ignorable.
+  - required, but no target existed to run: `Validation (deterministic): NOT RUN — <triage reason>`. A runtime change shipping no test target is also a finding in its own right.
+  - required and a target existed, but the run could not happen (no idle GPU, validator missing, `REVIEW_AUTO_VALIDATE=0`): `Validation (deterministic): NOT RUN — <reason>`. This is an environment gap, not a PR defect.
+  - In every `NOT RUN` and `N/A` state, no finding may assert runtime behaviour (perf, accuracy, launch failure) as fact; such findings are `[inferred]` and phrased as questions.
 - The review line is always advisory. `🔴 HIGH RISK` requests human attention; it is not a merge gate. A deterministic `Validation: BLOCK` may gate because its reproducer is in the report.
 
 ```
@@ -886,7 +1063,7 @@ If the answer is yes, add it to the findings. If the answer is no, proceed.
 **[One sentence: what this PR does, in plain terms.]**
 
 Review (advisory): [✅ NO FINDINGS | ⚠️ NEEDS WORK | 🔴 HIGH RISK]
-Validation (deterministic): [PASS/NEEDS_WORK/BLOCK/INCONCLUSIVE — target, exact runtime, and skipped-stage evidence | NOT RUN — no exact-head validation_report.json]
+Validation (deterministic): [PASS/NEEDS_WORK/BLOCK/INCONCLUSIVE — target, exact runtime, and skipped-stage evidence | N/A — no runtime surface changed | NOT RUN — reason]
 
 🔴 [specific finding — what, where, why it matters]
 ⚠️ [specific finding]
