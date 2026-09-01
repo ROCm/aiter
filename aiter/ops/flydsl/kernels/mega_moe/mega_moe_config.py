@@ -2,11 +2,9 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 """Static MegaMoEV2 configuration rules for MI355X."""
 
-import hashlib
 from bisect import bisect_left
 from dataclasses import dataclass
 from functools import cache
-from pathlib import Path
 
 TOKEN_BUCKETS = (
     1,
@@ -28,40 +26,8 @@ TOKEN_BUCKETS = (
 P2P_FP8_MIN_MTPR = 1024
 FIXED_SLOT_MAX_MTPR = 255
 MAX_MTPR_CLASS = 32768
-INDEXED_PAYLOAD_MIN_MTPR = 8192
 REFERENCE_EXPERTS_PER_RANK = 48
 EXPERT_CONFIG_GRANULARITY = 64
-
-
-@cache
-def mega_moe_bundle_source_fingerprint() -> str:
-    """Return a deterministic identity for every source used by MegaMoE bundles.
-
-    FlyDSL main does not recursively inspect kernel objects stored in a launcher
-    container.  Capturing this source digest in the launcher makes the disk-cache
-    identity stable across processes while invalidating it for any production
-    dependency change.
-    """
-    mega_dir = Path(__file__).resolve().parent
-    kernel_dir = mega_dir.parent
-    paths = sorted(mega_dir.glob("*.py"))
-    paths.extend(
-        kernel_dir / name
-        for name in (
-            "buffer_ops.py",
-            "communication_ops_utils.py",
-            "mxfp4_gemm_common.py",
-            "tensor_shim.py",
-        )
-    )
-    digest = hashlib.sha256()
-    for path in paths:
-        relative = path.relative_to(kernel_dir).as_posix().encode()
-        digest.update(relative)
-        digest.update(b"\0")
-        digest.update(path.read_bytes())
-        digest.update(b"\0")
-    return digest.hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,17 +46,10 @@ class Stage1Config:
     pipe_weights: bool = True
     swizzle_a: bool = True
     work_shards: int = 8
-    external_grouping: bool = False
-    external_counting: bool = False
     payload_chunk_rows: int = 0
     payload_tile_ready: bool = False
-    deduplicate_payload: bool = False
-
-    def __post_init__(self):
-        if self.deduplicate_payload and not self.payload_tile_ready:
-            raise ValueError(
-                "Stage1 payload deduplication requires tile-ready publication"
-            )
+    prepare_cu: int = 32
+    prepare_quant_cu: int = 64
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,6 +66,12 @@ class Stage2Config:
     ascale_prefetch: bool = True
     spatial_partition: int = 402
     bf16_lds: bool = False
+    aligned_pair: bool = False
+    pair_cu: int = 0
+    pair_block_m: int = 32
+    pair_block_n: int = 256
+    pair_work_weight: int = 2
+    pair_scatter_vec: int = 16
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,14 +95,7 @@ class MegaMoEConfig:
 
 @dataclass(frozen=True, slots=True)
 class Stage2BundleKey:
-    """Compile identity for one Stage2 entry in a MegaMoE bundle.
-
-    Stage2 consumes metadata produced by Stage1.  In particular, ``sbm`` is
-    Stage1's ``sort_block_m`` and is part of the Stage2 kernel ABI even though
-    it is not a field of :class:`Stage2Config`.  Keeping it in this key prevents
-    two otherwise-identical Stage2 configs with different Stage1 layouts from
-    being incorrectly deduplicated.
-    """
+    """Stage2 compile identity, including the Stage1 wire-layout contract."""
 
     config: Stage2Config
     sbm: int
@@ -151,14 +109,10 @@ class Stage2BundleKey:
             )
         if self.p2p_quant not in ("none", "fp8_blockwise_1x32"):
             raise ValueError(f"unsupported p2p_quant={self.p2p_quant!r}")
-        if self.p2p_quant != "none" and self.config.bf16_lds:
-            raise ValueError("FP8 P2P requires Stage2 bf16_lds=False")
 
 
 @dataclass(frozen=True, slots=True)
 class MegaMoEBundleEntry:
-    """One atomic Stage1/Stage2 choice for a token bucket."""
-
     pair_id: int
     token_bucket: int
     config: MegaMoEConfig
@@ -168,8 +122,6 @@ class MegaMoEBundleEntry:
 
 @dataclass(frozen=True, slots=True)
 class MegaMoEBundlePlan:
-    """Deduplicated kernel variants and their inseparable pair mapping."""
-
     mtpr: int
     fixed_slot_dispatch: bool
     entries: tuple[MegaMoEBundleEntry, ...]
@@ -179,9 +131,10 @@ class MegaMoEBundlePlan:
     def entry_for_tokens(self, tokens: int) -> MegaMoEBundleEntry:
         if tokens < 0 or tokens > self.mtpr:
             raise ValueError(f"tokens={tokens} must be in [0, {self.mtpr}]")
-        if tokens == 0:
-            return self.entries[0]
-        bucket = nearest_token_bucket(tokens)
+        # Empty DP ranks must still launch the same collective MegaMoE protocol
+        # as non-empty ranks.  Use the smallest bundle geometry for that rank;
+        # returning early would strand peers that have already entered dispatch.
+        bucket = TOKEN_BUCKETS[0] if tokens == 0 else nearest_token_bucket(tokens)
         for entry in self.entries:
             if entry.token_bucket == bucket:
                 return entry
@@ -191,10 +144,8 @@ class MegaMoEBundlePlan:
 
 
 def nearest_token_bucket(tokens: int) -> int:
-    if tokens < 0:
-        raise ValueError(f"tokens must be non-negative, got {tokens}")
-    if tokens == 0:
-        return TOKEN_BUCKETS[0]
+    if tokens <= 0:
+        raise ValueError(f"tokens must be positive, got {tokens}")
     index = bisect_left(TOKEN_BUCKETS, tokens)
     if index == 0:
         return TOKEN_BUCKETS[0]
@@ -223,11 +174,9 @@ def _scale_dispatch_cu(dispatch_cu: int, experts_per_rank: int) -> int:
 
 def _fixed_dispatch_cu(bucket: int) -> int:
     if bucket <= 1:
-        return 160
-    if bucket <= 4:
-        return 128
+        return 64
     if bucket <= 8:
-        return 32
+        return 128
     if bucket <= 16:
         return 96
     if bucket <= 32:
@@ -235,48 +184,8 @@ def _fixed_dispatch_cu(bucket: int) -> int:
     return min(224, 16 * (bucket.bit_length() + 7))
 
 
-def _compact_dispatch_cu(bucket: int) -> int:
-    if bucket <= 1:
-        return 224
-    if bucket <= 4:
-        return 128
-    if bucket <= 8:
-        return 192
-    if bucket <= 16:
-        return 64
-    if bucket <= 32:
-        return 128
-    if bucket <= 64:
-        return 192
-    return 128
-
-
-def _large_dispatch_cu(bucket: int) -> int:
-    if bucket <= 1:
-        return 224
-    if bucket <= 4:
-        return 128
-    if bucket <= 8:
-        return 192
-    if bucket <= 32:
-        return 64
-    if bucket <= 64:
-        return 160
-    if bucket <= 128:
-        return 192
-    if bucket <= 256:
-        return 160
-    if bucket == 8192:
-        return 96
-    if bucket >= 16384:
-        return 32
-    return 64
-
-
 def _select_fixed_stage1(bucket: int, experts_per_rank: int) -> Stage1Config:
-    grid_mult = (
-        1 if bucket <= 4 else 2 if bucket <= 8 else bucket // 4 if bucket <= 16 else 3
-    )
+    grid_mult = max(1, bucket // 4) if bucket <= 16 else 3
     return Stage1Config(
         sort_block_m=32,
         tile_n=256 if bucket <= 8 else 128,
@@ -310,30 +219,27 @@ def _select_bounded_stage1(
     else:
         raise ValueError(f"bounded MTPR does not support token bucket {bucket}")
 
-    dispatch_cu = (
-        _compact_dispatch_cu(bucket) if bucket <= 128 else 160 if bucket == 256 else 64
-    )
-    tile_resource = bucket == 256
-    b_nt = 0 if bucket == 1 or bucket >= 1024 else 3
-    if mtpr > bucket:
-        if bucket == 32:
-            dispatch_cu = 64
-        elif bucket == 64:
-            dispatch_cu = 160
-        elif bucket == 128:
-            dispatch_cu = 192
-        elif bucket == 512:
-            grid_mult, dispatch_cu, tile_resource, b_nt = 1, 64, True, 0
+    # Compact dispatch uses one preplanned protocol at every bounded size.
+    # A 256-row payload chunk needs at most four producer CTAs per peer, so
+    # 32 producer CTAs cover all eight peers without an idle prefix ahead of
+    # the queued GEMM consumers.
+    dispatch_cu = 32
+    grid_mult = 1
+    tile_resource = True
+    b_nt = 0
     return Stage1Config(
         sort_block_m=sort_block_m,
         tile_n=tile_n,
         num_waves=num_waves,
         grid_mult=grid_mult,
-        num_dispatch_cu=_scale_dispatch_cu(dispatch_cu, experts_per_rank),
+        num_dispatch_cu=dispatch_cu,
         mfma_amajor=mfma_amajor,
         async_a_copy=async_a_copy,
         use_tile_resource=tile_resource,
         b_nt=b_nt,
+        work_shards=4,
+        payload_chunk_rows=256,
+        payload_tile_ready=True,
     )
 
 
@@ -359,26 +265,23 @@ def _select_large_stage1(
     work_shards = 1 if bucket <= 32 else 4
     if bucket == 2048:
         work_shards = 8
-    dispatch_cu = _scale_dispatch_cu(_large_dispatch_cu(bucket), experts_per_rank)
-    # Compact prefill has one scheduling path: low-ID planner/producers retire
-    # after dispatch and a fixed 50% consumer reserve takes over.  Payload
-    # deduplication remains opt-in until its indexed loader beats route-major A.
+    # Quant work grows linearly with tokens.  Keep it below prepare's critical
+    # path without occupying every CU: 64 through 8K, 96 at 16K, 192 at 32K.
+    prepare_quant_cu = max(64, min(192, (3 * bucket) // 512))
     return Stage1Config(
         sort_block_m=sort_block_m,
         tile_n=tile_n,
         num_waves=num_waves,
         grid_mult=1,
-        num_dispatch_cu=dispatch_cu,
+        num_dispatch_cu=32,
         mfma_amajor=mfma_amajor,
         async_a_copy=async_a_copy,
         use_tile_resource=True,
         b_nt=3 if 1 < bucket <= 256 else 0,
         work_shards=work_shards,
-        external_grouping=bucket == 4 or bucket >= 256,
-        external_counting=bucket >= 256,
         payload_chunk_rows=384,
         payload_tile_ready=True,
-        deduplicate_payload=False,
+        prepare_quant_cu=prepare_quant_cu,
     )
 
 
@@ -402,11 +305,19 @@ def _select_bounded_stage2(
     if model_dim < 4096:
         block_n = 128
     persist = bucket >= 128
+    if not persist:
+        persist_cu = 0
+    elif bucket == 256:
+        persist_cu = 128
+    elif bucket == 1024:
+        persist_cu = 256
+    else:
+        persist_cu = 240
     return Stage2Config(
         block_m=64 if bucket >= 4096 else 32,
         block_n=block_n,
         persist=persist,
-        persist_cu=128 if bucket == 256 else 240 if persist else 0,
+        persist_cu=persist_cu,
         use_nt=bucket <= 128,
         persist_strided=512 <= bucket <= 2048,
     )
@@ -415,15 +326,14 @@ def _select_bounded_stage2(
 def _select_large_stage2(
     bucket: int, sort_block_m: int, model_dim: int
 ) -> Stage2Config:
-    if bucket == 1024:
-        persist_cu = 224
-    elif bucket == 2048:
+    if bucket in (1024, 2048):
         persist_cu = 256
     elif bucket == 16384:
         persist_cu = 192
     else:
         persist_cu = 240
     block_n = 128 if bucket == 256 or model_dim < 4096 else 256
+    aligned_pair = bucket == 8192
     return Stage2Config(
         block_m=64 if sort_block_m == 128 else 32,
         block_n=block_n,
@@ -431,7 +341,9 @@ def _select_large_stage2(
         persist_cu=persist_cu,
         use_nt=bucket <= 128,
         persist_strided=512 <= bucket <= 2048,
-        skew_cu=96 if bucket >= 512 else 0,
+        skew_cu=112 if aligned_pair else 96 if bucket >= 512 else 0,
+        aligned_pair=aligned_pair,
+        pair_cu=722 if aligned_pair else 0,
     )
 
 
@@ -492,28 +404,19 @@ def build_mega_moe_bundle_plan(
     model_dim: int = 7168,
     inter_dim: int = 3072,
 ) -> MegaMoEBundlePlan:
-    """Build the atomic Stage1/Stage2 dispatch table for one deployment profile.
-
-    The returned variant lists are deduplicated independently to keep the two
-    GPU modules small, while every public selection remains a ``pair_id``.  A
-    Stage2 variant identity deliberately includes Stage1 SBM and the P2P wire
-    format; callers must never select the two stages independently.
-    """
-
+    """Deduplicate variants while keeping Stage1/Stage2 selection atomic."""
     if mtpr <= 0 or mtpr & (mtpr - 1):
         raise ValueError(f"mtpr={mtpr} must be a positive power of two")
-
-    fixed_slot_dispatch = mtpr <= FIXED_SLOT_MAX_MTPR
     buckets = tuple(bucket for bucket in TOKEN_BUCKETS if bucket <= mtpr)
     if not buckets or buckets[-1] != mtpr:
         raise ValueError(f"mtpr={mtpr} has no exact token bucket")
 
+    fixed_slot_dispatch = mtpr <= FIXED_SLOT_MAX_MTPR
     stage1_variants: list[Stage1Config] = []
     stage2_variants: list[Stage2BundleKey] = []
     stage1_ids: dict[Stage1Config, int] = {}
     stage2_ids: dict[Stage2BundleKey, int] = {}
     entries: list[MegaMoEBundleEntry] = []
-
     for bucket in buckets:
         config = select_mega_moe_config(
             bucket,
@@ -522,24 +425,18 @@ def build_mega_moe_bundle_plan(
             model_dim=model_dim,
             inter_dim=inter_dim,
         )
-        stage1_id = stage1_ids.get(config.stage1)
-        if stage1_id is None:
-            stage1_id = len(stage1_variants)
-            stage1_ids[config.stage1] = stage1_id
+        stage1_id = stage1_ids.setdefault(config.stage1, len(stage1_variants))
+        if stage1_id == len(stage1_variants):
             stage1_variants.append(config.stage1)
-
         stage2_key = Stage2BundleKey(
-            config=config.stage2,
-            sbm=config.stage1.sort_block_m,
-            p2p_quant=config.p2p_quant,
-            fixed_slot_dispatch=fixed_slot_dispatch,
+            config.stage2,
+            config.stage1.sort_block_m,
+            config.p2p_quant,
+            fixed_slot_dispatch,
         )
-        stage2_id = stage2_ids.get(stage2_key)
-        if stage2_id is None:
-            stage2_id = len(stage2_variants)
-            stage2_ids[stage2_key] = stage2_id
+        stage2_id = stage2_ids.setdefault(stage2_key, len(stage2_variants))
+        if stage2_id == len(stage2_variants):
             stage2_variants.append(stage2_key)
-
         entries.append(
             MegaMoEBundleEntry(
                 pair_id=len(entries),
@@ -549,7 +446,6 @@ def build_mega_moe_bundle_plan(
                 stage2_variant_id=stage2_id,
             )
         )
-
     return MegaMoEBundlePlan(
         mtpr=mtpr,
         fixed_slot_dispatch=fixed_slot_dispatch,
