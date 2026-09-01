@@ -23,12 +23,15 @@ import triton
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule import (
     _fused_recurrent_gated_delta_rule_fwd_kernel,
+    chunk_fwd_o_opt_vk,  # noqa: F401  (re-exported public K6 wrapper)
     chunk_gated_delta_rule_fwd,
+    chunk_gated_delta_rule_fwd_h_opt_vk,  # noqa: F401  (re-exported public K5 wrapper)
     chunk_gated_delta_rule_fwd_opt,
     chunk_gated_delta_rule_fwd_opt_vk,
 )
 from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
     GatedDeltaRulePrefillMetadata,
+    K5K6Fusion,
     l2norm_fwd,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -467,6 +470,7 @@ def chunk_gated_delta_rule_opt_vk(
     initial_state_indices: torch.Tensor | None = None,
     inplace_final_state: bool | None = None,
     snapshot_dtype: torch.dtype | None = None,
+    fusion: K5K6Fusion | str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""
     Optimized chunk-based gated delta rule with h layout [V, K] (Forward only).
@@ -520,6 +524,10 @@ def chunk_gated_delta_rule_opt_vk(
             to ``True`` when ``initial_state_indices`` is provided.
         snapshot_dtype (torch.dtype, optional): Temporary chunk snapshot dtype
             (`fp32` or `bf16`). Defaults to `k.dtype`.
+        fusion: ``K5K6Fusion`` policy for the FlyDSL K5+K6 fused path (only
+            relevant when ``use_chunk_flydsl=True``). ``None`` / ``AUTO`` lets
+            the shape heuristic decide; ``ALWAYS`` forces the fused kernel;
+            ``NEVER`` forces the separate K5 + K6 pipeline (rollback path).
 
     Returns:
         tuple[torch.Tensor, torch.Tensor | None]:
@@ -581,6 +589,7 @@ def chunk_gated_delta_rule_opt_vk(
         use_chunk_hip=use_chunk_hip,
         use_chunk_flydsl=use_chunk_flydsl,
         use_prepare_flydsl=use_prepare_flydsl,
+        fusion=fusion,
         state_dtype=state_dtype,
         snapshot_dtype=snapshot_dtype,
         use_exp2=use_exp2,

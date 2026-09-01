@@ -16,6 +16,7 @@ import torch
 
 from ..utils import (
     GatedDeltaRulePrefillMetadata,
+    K5K6Fusion,
     build_gated_delta_rule_prefill_metadata,
     chunk_local_cumsum,
     chunk_scaled_dot_kkt_fwd,
@@ -32,6 +33,15 @@ from .fused_cumsum_kkt import fused_chunk_local_cumsum_scaled_dot_kkt_fwd
 from .fused_solve_tril_recompute import fused_solve_tril_recompute_w_u
 
 _SUPPORTED_GFX12_ARCHS = frozenset({"gfx1200", "gfx1201"})
+
+
+def _get_arch_name(device: torch.device) -> str | None:
+    try:
+        props = torch.cuda.get_device_properties(device)
+        arch = getattr(props, "gcnArchName", "")
+        return arch.split(":")[0] if arch else None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _is_unsupported_gfx12_runtime(device: torch.device) -> bool:
@@ -240,6 +250,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
     use_chunk_hip: bool = False,
     use_chunk_flydsl: bool = False,
     use_prepare_flydsl: bool = False,
+    fusion: K5K6Fusion = K5K6Fusion.AUTO,
     state_dtype: torch.dtype | None = None,
     use_exp2: bool = True,
     o: torch.Tensor | None = None,
@@ -275,11 +286,20 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         initial_state: optional [N, H, V, K] — note transposed h layout
         output_final_state: bool
         cu_seqlens: [N+1] optional
-        use_chunk_hip: bool — use HIP kernel for hidden state
-        use_chunk_flydsl: bool — use FlyDSL kernel for hidden state
+        use_chunk_hip: bool — use HIP kernel for hidden state (K5)
+        use_chunk_flydsl: bool — use the FlyDSL backend for the K5+K6 stage.
         use_prepare_flydsl: bool — use the fused prepare kernel when supported.
             Variable-length input also requires a prefill schedule; otherwise
             the function warns and falls back to Triton.
+        fusion: K5K6Fusion — whether to run the fused FlyDSL K5+K6 kernel (one
+            dispatch producing both the hidden state and the output ``o``) or the
+            separate K5 + K6 pipeline. ``AUTO`` (default) lets the shape heuristic
+            decide (gfx942 only: ``ceil(V/BV)*N*H / CU >= 0.45`` where ``BV`` is
+            the tile size selected by the H×N rule); ``ALWAYS`` forces the fused
+            kernel; ``NEVER`` forces the separate path. When the fused kernel runs
+            it skips the separate K6 call and returns early. ``fusion`` is
+            dependent on the ``use_chunk_flydsl`` flag and requires it to be set
+            to True.
         state_dtype: optional initial/final state dtype (`fp32` or `bf16`),
             supported by both the HIP and Triton hidden-state paths
         use_exp2: bool — use exp2 instead of exp for gate computation
@@ -310,6 +330,11 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             "use_chunk_hip and use_chunk_flydsl are mutually exclusive; "
             "set at most one."
         )
+    # Indexed state pools / in-place write-back ARE supported by the FlyDSL K5
+    # path: its wrapper routes such requests to the kernel that implements them
+    # (see ``_gdn_k5_impl``), so no guard is needed here.
+    fusion = K5K6Fusion.coerce(fusion)
+
     if cu_seqlens is None:
         if seq_lens_cpu is not None or prefill_metadata is not None:
             raise ValueError(
@@ -339,6 +364,59 @@ def chunk_gated_delta_rule_fwd_opt_vk(
                 "use_chunk_flydsl requires bfloat16 inputs with K=128 and V=128; "
                 f"got dtype={k.dtype}, K={k.shape[-1]}, V={v.shape[-1]}."
             )
+
+    # The fused K5+K6 kernel has no state-pool gather and no snapshot-dtype
+    # override (it never materialises the snapshot). Requesting either forces
+    # the separate K5 + K6 pipeline, whose K5 wrapper does implement them.
+    if initial_state_indices is not None:
+        _fused_unsupported_message = (
+            "`initial_state_indices` requires a state-pool gather"
+        )
+    elif inplace_final_state is True:
+        _fused_unsupported_message = (
+            "`inplace_final_state` requires an in-place write-back"
+        )
+    elif snapshot_dtype is not None and snapshot_dtype != k.dtype:
+        _fused_unsupported_message = (
+            f"a `snapshot_dtype` override ({snapshot_dtype}) requires the "
+            f"snapshot to be materialised"
+        )
+    elif not use_chunk_flydsl:
+        # This is the case that used to vanish: an arch guard above can clear
+        # ``use_chunk_flydsl``, and ALWAYS was then dropped without a word.
+        _fused_unsupported_message = (
+            "the FlyDSL path is disabled here (either use_chunk_flydsl=False was "
+            "passed, or this runtime/decode configuration turned it off)"
+        )
+    else:
+        from aiter.ops.flydsl.gdn_fused_gfx942_kernels import (
+            is_fused_k5k6_gfx942_unsupported,
+        )
+
+        _fused_unsupported_message = is_fused_k5k6_gfx942_unsupported()
+
+    # ALWAYS is a hard request: it must either fuse or say why it is not possible.
+    if fusion is K5K6Fusion.ALWAYS and _fused_unsupported_message is not None:
+        raise ValueError(
+            f"fusion=ALWAYS was requested, but the fused FlyDSL K5+K6 kernel "
+            f"cannot be used here: {_fused_unsupported_message}."
+        )
+
+    if _fused_unsupported_message is not None:
+        use_chunk_flydsl_fused = False
+    elif fusion is K5K6Fusion.ALWAYS:
+        use_chunk_flydsl_fused = True
+    elif fusion is K5K6Fusion.AUTO:
+        from aiter.ops.flydsl.gdn_fused_gfx942_kernels import (
+            should_use_fused_k5k6_gfx942,
+        )
+
+        _N = len(cu_seqlens) - 1 - num_decodes if cu_seqlens is not None else v.shape[0]
+        use_chunk_flydsl_fused = should_use_fused_k5k6_gfx942(
+            H=v.shape[2], N=_N, V=v.shape[-1]
+        )
+    else:
+        use_chunk_flydsl_fused = False
 
     if use_prepare_flydsl:
         from aiter.ops.flydsl.linear_attention_prefill_kernels import (
@@ -399,6 +477,37 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             prefill_metadata=prefill_metadata,
         )
 
+    if use_chunk_flydsl_fused:
+        # Fused K5+K6: hidden-state scan and output ``o`` in one dispatch.
+        # ``g_cumsum`` from K1+K2 is head-major [B, H, T] (same convention as
+        # the K5 wrapper). K6 gating uses scalar ``g`` only; the KDA (gk) path
+        # folds its decay into K5 and is not routed through this scalar pipeline.
+        from aiter.ops.flydsl.gdn_fused_gfx942_kernels import (
+            chunk_gated_delta_rule_fwd_h_o_flydsl,
+        )
+
+        if o is None:
+            o = v.new_empty(v.shape)
+
+        o, final_state = chunk_gated_delta_rule_fwd_h_o_flydsl(
+            q=q,
+            k=k,
+            w=w,
+            u=u,
+            g=g_cumsum,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            state_dtype=state_dtype,
+            use_exp2=use_exp2,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            prefill_metadata=prefill_metadata,
+            o=o,
+        )
+        return g_cumsum, o, final_state
+
     if use_chunk_hip:
         from aiter.ops.chunk_gated_delta_rule_fwd_h import (
             chunk_gated_delta_rule_fwd_h_hip_fn,
@@ -424,27 +533,57 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         )
     elif use_chunk_flydsl:
         from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+            _device_cu_count,
+            chunk_gated_delta_rule_fwd_h_flydsl,
             chunk_gated_delta_rule_fwd_h_flydsl_opt,
         )
 
-        h, v_new, final_state = chunk_gated_delta_rule_fwd_h_flydsl_opt(
-            k=k,
-            w=w,
-            u=u,
-            g=g_cumsum,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            cu_seqlens=cu_seqlens,
-            state_dtype=state_dtype,
-            use_exp2=use_exp2,
-            num_decodes=num_decodes,
-            num_decode_tokens=num_decode_tokens,
-            g_head_major=True,
-            prefill_metadata=prefill_metadata,
-            snapshot_dtype=snapshot_dtype,
-            initial_state_indices=initial_state_indices,
-            inplace_final_state=inplace_final_state,
+        # Use the VK kernel on large-CU gfx942 (MI300X/MI325X, ≥304 CUs).
+        # Fall back to flydsl_opt on other chips (e.g. MI308)
+        # and for calls that require flydsl_opt-only features (indexed state
+        # pool, non-default snapshot dtype).
+        # TODO: Benchmark gfx950 to see what kernel is best.
+        _use_vk = (
+            _device_cu_count() >= 304
+            and _get_arch_name(q.device) == "gfx942"
+            and initial_state_indices is None
+            and inplace_final_state is not True
+            and (snapshot_dtype is None or snapshot_dtype == k.dtype)
         )
+        if _use_vk:
+            h, v_new, final_state = chunk_gated_delta_rule_fwd_h_flydsl(
+                k=k,
+                w=w,
+                u=u,
+                g=g_cumsum,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                cu_seqlens=cu_seqlens,
+                state_dtype=state_dtype,
+                use_exp2=use_exp2,
+                num_decodes=num_decodes,
+                num_decode_tokens=num_decode_tokens,
+                prefill_metadata=prefill_metadata,
+            )
+        else:
+            h, v_new, final_state = chunk_gated_delta_rule_fwd_h_flydsl_opt(
+                k=k,
+                w=w,
+                u=u,
+                g=g_cumsum,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                cu_seqlens=cu_seqlens,
+                state_dtype=state_dtype,
+                use_exp2=use_exp2,
+                num_decodes=num_decodes,
+                num_decode_tokens=num_decode_tokens,
+                g_head_major=True,
+                prefill_metadata=prefill_metadata,
+                snapshot_dtype=snapshot_dtype,
+                initial_state_indices=initial_state_indices,
+                inplace_final_state=inplace_final_state,
+            )
     else:
         h, v_new, final_state = chunk_gated_delta_rule_fwd_h_opt_vk(
             k=k,
