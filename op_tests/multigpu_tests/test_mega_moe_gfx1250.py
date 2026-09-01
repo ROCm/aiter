@@ -292,35 +292,35 @@ def moe_forward(
 _WEIGHT_SEED = 70000  # identical on every rank so the global expert set agrees
 
 
-def make_shared_weights(E, hdim, idim, dtype, dev, shared_E=0, seed=_WEIGHT_SEED):
+def _init_data(mode, shape, gen, dev, dtype, const_val=0.0, scale=1.0):
+    """Operand init: zero | const | rand (uniform) | norm (gaussian). rand/norm
+    honor `gen` for reproducibility, then cast to `dtype`; zero/const are exact."""
+    if mode == "zero":
+        return torch.zeros(shape, device=dev, dtype=dtype)
+    if mode == "const":
+        return torch.full(shape, float(const_val), device=dev, dtype=dtype)
+    t = (torch.rand if mode == "rand" else torch.randn)(
+        shape, generator=gen, device=dev, dtype=torch.float32
+    )
+    return (t * scale).to(dtype)
+
+
+def make_shared_weights(
+    E, hdim, idim, dtype, dev, shared_E=0, seed=_WEIGHT_SEED, init="norm", const_val=0.0
+):
     """One weight set reused by every layer. Same seed on all ranks so the global
     expert partition is consistent. Returns bf16 (w1[E,2I,H], w2[E,H,I], sw1, sw2)."""
     gen = torch.Generator(device=dev).manual_seed(seed)
-    w1 = (
-        torch.randn((E, 2 * idim, hdim), generator=gen, device=dev, dtype=torch.float32)
-        / 10
-    ).to(dtype)
-    w2 = (
-        torch.randn((E, hdim, idim), generator=gen, device=dev, dtype=torch.float32)
-        / 10
-    ).to(dtype)
+    w1 = _init_data(init, (E, 2 * idim, hdim), gen, dev, dtype, const_val, scale=0.1)
+    w2 = _init_data(init, (E, hdim, idim), gen, dev, dtype, const_val, scale=0.1)
     sw1 = sw2 = None
     if shared_E > 0:
-        sw1 = (
-            torch.randn(
-                (shared_E, 2 * idim, hdim),
-                generator=gen,
-                device=dev,
-                dtype=torch.float32,
-            )
-            / 10
-        ).to(dtype)
-        sw2 = (
-            torch.randn(
-                (shared_E, hdim, idim), generator=gen, device=dev, dtype=torch.float32
-            )
-            / 10
-        ).to(dtype)
+        sw1 = _init_data(
+            init, (shared_E, 2 * idim, hdim), gen, dev, dtype, const_val, scale=0.1
+        )
+        sw2 = _init_data(
+            init, (shared_E, hdim, idim), gen, dev, dtype, const_val, scale=0.1
+        )
     return w1, w2, sw1, sw2
 
 
@@ -669,7 +669,7 @@ class DeviceMoEPipeline:
     _N_WARMUP = 5
     _N_PROF_REPLAYS = 3  # graph replays captured by torch.profiler in bench()
 
-    def bench(self):
+    def bench(self, n_warmup=None, n_iters=1):
         """Time the ONE-graph N-layer dispatch->gemm->combine chain. The graph
         already contains all N layers, so a single replay IS the per-chain
         measurement -- no separate replay-count knob. 5 warmup replays first.
@@ -685,16 +685,19 @@ class DeviceMoEPipeline:
         If a future build populates device time, prof_us below becomes > 0."""
         import time
 
-        for _ in range(self._N_WARMUP):
+        n_warmup = self._N_WARMUP if n_warmup is None else n_warmup
+        n_iters = max(1, n_iters)
+        for _ in range(n_warmup):
             self.graph.replay()
         torch.cuda.synchronize()
         self.comm.barrier()
 
-        # one full N-layer graph replay == the performance measurement.
+        # n_iters back-to-back graph replays, ONE sync at the end == b2b measure.
         t0 = time.perf_counter()
-        self.graph.replay()
+        for _ in range(n_iters):
+            self.graph.replay()
         torch.cuda.synchronize()
-        total_us = (time.perf_counter() - t0) * 1e6
+        total_us = (time.perf_counter() - t0) * 1e6 / n_iters
         self.comm.barrier()
 
         # torch.profiler breakdown over CUDA-graph replays: roctracer/kineto does
@@ -852,16 +855,18 @@ def main():
         dev,
         shared_E=args.shared_experts,
         seed=_WEIGHT_SEED + args.seed,
+        init=args.init,
+        const_val=args.init_const,
     )
-    x0 = torch.randn(
-        ct,
-        hdim,
-        generator=torch.Generator(device=dev).manual_seed(
-            1000 + dist_ctx.rank + args.seed
-        ),
-        device=dev,
-        dtype=torch.float32,
-    ).to(dtypes.bf16)
+    x0 = _init_data(
+        args.init,
+        (ct, hdim),
+        torch.Generator(device=dev).manual_seed(1000 + dist_ctx.rank + args.seed),
+        dev,
+        dtypes.bf16,
+        args.init_const,
+        scale=1.0,
+    )
     routings = make_routings(
         n_layers, ct, E, topk, dev, seed=4242 + 100 * dist_ctx.rank + args.seed
     )
@@ -885,7 +890,9 @@ def main():
     )
     pipe.setup(x0)
     pipe.capture(x0)
-    total_us, per_layer_us, prof_us = pipe.bench()
+    total_us, per_layer_us, prof_us = pipe.bench(
+        n_warmup=args.warmup, n_iters=args.iters
+    )
     # Aggregate perf across ranks (collective calls -> run on every rank).
     total_us = dist_ctx.allreduce_avg_float(total_us)
     per_layer_us = dist_ctx.allreduce_avg_float(per_layer_us)
@@ -1024,6 +1031,24 @@ def _parse_args():
         default=os.environ.get("COMBINE", "base"),
         help="EP combine mode: base (mori v2 dispatch/combine around fused_moe) "
         "| fused (gemm2-fused P2P scatter; mxfp4 only). Falls back to $COMBINE.",
+    )
+    p.add_argument(
+        "--warmup", type=int, default=5, help="graph-replay warmups before timing"
+    )
+    p.add_argument(
+        "--iters",
+        type=int,
+        default=1,
+        help="timed back-to-back graph replays (b2b; averaged)",
+    )
+    p.add_argument(
+        "--init",
+        choices=("norm", "rand", "zero", "const"),
+        default="norm",
+        help="operand init for weights + activations",
+    )
+    p.add_argument(
+        "--init-const", type=float, default=0.0, help="value for --init const"
     )
     return p.parse_args()
 
