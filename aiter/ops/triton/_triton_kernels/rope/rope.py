@@ -2166,6 +2166,8 @@ _rope_fwd_3d_repr = make_kernel_repr(
         "sp_rank",
         "max_freq_seq_len",
         "s_per_rank",
+        "pad_freq_val_r",
+        "pad_freq_val_i",
         "BLOCK_L",
         "BLOCK_N",
         "BLOCK_C",
