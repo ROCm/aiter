@@ -211,22 +211,11 @@ def fp8_mqa_logits(
         if arch == "gfx950":
             num_buffers = 2
             loop_variant = 0
-            waves_per_eu = 4
+            waves_per_eu = 3
             num_chains = 4 if USE_FOLDED_REDUCTION else 0
-            num_warps = 2 if num_heads <= 32 else 1
-            block_kv = 64 if num_heads <= 32 else 32
-            # BLOCK_M=2 only compiles on the buffer-store path: with plain
-            # stores the AMDGCN backend aborts at JIT time (Sequence.h:275
-            # "Begin must be less or equal to End").
-            block_m = (
-                2 if (num_heads <= 32 and seq_len > 4096 and use_buffer_store) else 1
-            )
-            mfma_nonk_dim = 32 if (head_size <= 64 or num_heads == 32) else 16
-            other = {
-                "USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED,
-                "BLOCK_M": block_m,
-                "MFMA_NONK_DIM": mfma_nonk_dim,
-            }
+            num_warps = 1
+            block_kv = 32
+            other = {"USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED}
         else:
             loop_variant = 1
             waves_per_eu = 1
@@ -237,7 +226,12 @@ def fp8_mqa_logits(
             block_m = 1
             other = {"LOOP_VARIANT": loop_variant}
 
-        _gluon_fp8_mqa_logits_kernel[((seq_len + block_m - 1) // block_m,)](
+        # Buffer ops use a 32-bit byte offset (2 GiB resource descriptor cap).
+        # Fall back to plain global load/store when a tensor exceeds that.
+        BUFFER_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
+        use_buffer_load = KV.numel() * KV.element_size() < BUFFER_LIMIT_BYTES
+        use_buffer_store = logits.numel() * logits.element_size() < BUFFER_LIMIT_BYTES
+        _gluon_fp8_mqa_logits_kernel[(seq_len,)](
             Q_ptr=Q,
             KV_ptr=KV,
             kv_scales_ptr=kv_scales,
