@@ -65,6 +65,7 @@ If `AITER_CONFIGS` is unavailable (e.g. aiter not installed), the test falls bac
 python3 -m unittest op_tests.tuning_tests.test_csv_validation \
   op_tests.tuning_tests.test_tuner_infra \
   op_tests.tuning_tests.test_mp_tuner_logic \
+  op_tests.tuning_tests.test_arch_resolution \
   op_tests.tuning_tests.test_mixed_mxfp_tuning \
   op_tests.tuning_tests.test_online_tune -v
 python3 -m pytest op_tests/tuning_tests/test_fhmoe_tuner.py -v
