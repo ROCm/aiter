@@ -7,7 +7,6 @@ from functools import cache
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import (
     Array,
     Float32,
@@ -26,6 +25,11 @@ from flydsl.expr.typing import T
 # Dynamic row bases and byte bounds are not expressible through a static layout.
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
+from aiter.ops.flydsl.kernels.kernels_common import (
+    atomic_add_i32,
+    uint32_to_int32,
+)
+from aiter.ops.flydsl.kernels.tensor_shim import row_rsrc
 
 _KEY_BITS = 32
 _RADIX_BITS = 11
@@ -52,25 +56,12 @@ def topk_per_row_decode_workspace_shapes(rows: int, stable: bool):
     return (rows, _CHUNKS_PER_ROW, hist_bins), (rows, _STATE_SIZE)
 
 
-def _uint32_to_int32(x: int) -> int:
-    return x - (1 << _KEY_BITS) if x >= (1 << (_KEY_BITS - 1)) else x
-
-
 def _f32_to_ord(val):
     bits = val.bitcast(Int32)
     ords = bits ^ ((bits >> fx.Int32(31)) & fx.Int32(0x7FFFFFFF))
     abs_bits = bits & fx.Int32(0x7FFFFFFF)
     is_nan = arith.cmpi(arith.CmpIPredicate.ugt, abs_bits, fx.Int32(0x7F800000))
     return is_nan.select(fx.Int32(0x7FFFFFFF), ords)
-
-
-def _row_resource(input, row, width, stride):
-    return buffer_ops.create_buffer_resource(
-        input,
-        max_size=False,
-        num_records_bytes=fx.Int64(width) * 4,
-        base_byte_offset=fx.Int64(row) * fx.Int64(stride) * 4,
-    )
 
 
 def _row_length(row, row_ends, width, next_n):
@@ -113,20 +104,6 @@ def _warp_inclusive_prefix_i32(val, lane, wave_size):
         remote = fly_rocdl.ds_bpermute(T.i32, ((lane & 0x30) - 17) * 4, val)
         val = (lane >= fx.Int32(32)).select(val + fx.Int32(remote), val)
     return val
-
-
-def _atomic_add_i32(memref, val, offset, syncscope):
-    ptr = fx.to_llvm_ptr(fx.get_iter(memref) + offset)
-    val = fx.Int32(val) if isinstance(val, int) else val
-    old = llvm.AtomicRMWOp(
-        llvm.AtomicBinOp.add,
-        ptr,
-        as_ir_value(val),
-        llvm.AtomicOrdering.monotonic,
-        syncscope=syncscope,
-        alignment=4,
-    ).result
-    return fx.Int32(old)
 
 
 def _make_hist_storage(max_n_hist_bins: int, num_waves: int):
@@ -181,7 +158,6 @@ def _make_stable_write_storage(num_waves: int):
 
 @cache
 def build_topk_per_row_decode_module(
-    rows: int,
     k: int,
     stable: bool,
     wave_size: int,
@@ -233,7 +209,7 @@ def build_topk_per_row_decode_module(
         chunk = fx.block_idx.y
         tid = fx.thread_idx.x
 
-        input_rsrc = _row_resource(input, row, n, stride0)
+        input_rsrc = row_rsrc(input, row, n, stride0)
         row_indices = fx.slice(indices, (row, None))
         row_values = fx.slice(values, (row, None))
         row_len = _row_length(row, row_ends, n, next_n)
@@ -319,7 +295,7 @@ def build_topk_per_row_decode_module(
                         ords = _f32_to_ord(rvals[vi])
                         if first_pass != 0 or (ords & decided_mask) == prefix:
                             byte_val = ((ords >> shift) & radix_mask) ^ xor_val
-                            _atomic_add_i32(s_hist, 1, byte_val, "workgroup")
+                            atomic_add_i32(s_hist, 1, byte_val, "workgroup")
 
             row_vectors = (row_len + fx.Int32(_VEC - 1)) // fx.Int32(_VEC)
             if stable:
@@ -467,7 +443,7 @@ def build_topk_per_row_decode_module(
         chunk = fx.block_idx.y
         tid = fx.thread_idx.x
 
-        input_rsrc = _row_resource(input, row, n, stride0)
+        input_rsrc = row_rsrc(input, row, n, stride0)
         row_len = _row_length(row, row_ends, n, next_n)
         row_indices = fx.slice(indices, (row, None))
         row_values = fx.slice(values, (row, None))
@@ -501,11 +477,11 @@ def build_topk_per_row_decode_module(
         def gather_value(val, idx, above_idxs, equal_idxs):
             ords = _f32_to_ord(val)
             if ords > threshold:
-                pos = _atomic_add_i32(s_above_count, 1, 0, "workgroup")
+                pos = atomic_add_i32(s_above_count, 1, 0, "workgroup")
                 if pos < fx.Int32(k):
                     above_idxs[pos] = idx
             elif ords == threshold:
-                pos = _atomic_add_i32(s_equal_count, 1, 0, "workgroup")
+                pos = atomic_add_i32(s_equal_count, 1, 0, "workgroup")
                 if pos < fx.Int32(k):
                     equal_idxs[pos] = idx
 
@@ -535,7 +511,7 @@ def build_topk_per_row_decode_module(
                 stored_above = (local_above < fx.Int32(k)).select(
                     local_above, fx.Int32(k)
                 )
-                old_equal = _atomic_add_i32(
+                old_equal = atomic_add_i32(
                     row_state, local_equal, _STATE_EQ_COUNTER, "agent"
                 )
                 equal_room = remaining_k - old_equal
@@ -545,10 +521,10 @@ def build_topk_per_row_decode_module(
                 )
                 s_above_count[0] = stored_above
                 s_equal_count[0] = accepted_equal
-                s_above_base[0] = _atomic_add_i32(
+                s_above_base[0] = atomic_add_i32(
                     row_state, stored_above, _STATE_WRITE_COUNTER, "agent"
                 )
-                s_equal_base[0] = _atomic_add_i32(
+                s_equal_base[0] = atomic_add_i32(
                     row_state, accepted_equal, _STATE_WRITE_COUNTER, "agent"
                 )
             gpu.barrier()
@@ -644,7 +620,7 @@ def build_topk_per_row_decode_module(
         chunk_i32 = fx.Int32(chunk)
         tid_i32 = fx.Int32(tid)
 
-        input_rsrc = _row_resource(input, row_i32, n, stride0)
+        input_rsrc = row_rsrc(input, row_i32, n, stride0)
         row_indices = fx.slice(indices, (row, None))
         row_values = fx.slice(values, (row, None))
         row_len = _row_length(row_i32, row_ends, n, next_n)
@@ -820,6 +796,7 @@ def build_topk_per_row_decode_module(
         n: fx.Int32,
         next_n: fx.Int32,
         stride0: fx.Int32,
+        rows_m: fx.Int32,
         stream: fx.Stream,
     ):
         for pass_idx in range_constexpr(_NUM_RADIX_PASSES):
@@ -856,7 +833,7 @@ def build_topk_per_row_decode_module(
                 write_values,
             )
             histogram.launch(
-                grid=(rows, chunks_per_row, 1),
+                grid=(rows_m, chunks_per_row, 1),
                 block=(block_threads, 1, 1),
                 stream=stream,
             )
@@ -865,12 +842,12 @@ def build_topk_per_row_decode_module(
                 state,
                 fx.Int32(shift),
                 fx.Int32(xor_val),
-                fx.Int32(_uint32_to_int32(radix_mask << shift)),
+                fx.Int32(uint32_to_int32(radix_mask << shift)),
                 num_bins,
                 fx.Int32(pass_idx == 0),
             )
             reduce_select.launch(
-                grid=(rows, 1, 1),
+                grid=(rows_m, 1, 1),
                 block=(reduce_threads, 1, 1),
                 stream=stream,
             )
@@ -878,7 +855,7 @@ def build_topk_per_row_decode_module(
         if stable:
             stable_count_prefix = stable_count_prefix_kernel(partial_hist, state)
             stable_count_prefix.launch(
-                grid=(rows, 1, 1),
+                grid=(rows_m, 1, 1),
                 block=(fused_prefix_threads, 1, 1),
                 stream=stream,
             )
@@ -895,7 +872,7 @@ def build_topk_per_row_decode_module(
                 write_values,
             )
             stable_write.launch(
-                grid=(rows, chunks_per_row, 1),
+                grid=(rows_m, chunks_per_row, 1),
                 block=(block_threads, 1, 1),
                 stream=stream,
             )
@@ -912,7 +889,7 @@ def build_topk_per_row_decode_module(
                 write_values,
             )
             gather.launch(
-                grid=(rows, chunks_per_row, 1),
+                grid=(rows_m, chunks_per_row, 1),
                 block=(block_threads, 1, 1),
                 stream=stream,
             )

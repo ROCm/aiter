@@ -285,7 +285,6 @@ def flydsl_top_k_per_row_decode(
     stream = torch.cuda.current_stream(logits.device)
     if width <= _ONE_WORKGROUP_MAX_ROW_WIDTH:
         launcher = build_topk_per_row_decode_one_workgroup_module(
-            rows,
             k,
             wave_size=wave_size,
             write_values=values is not None,
@@ -299,6 +298,7 @@ def flydsl_top_k_per_row_decode(
             width,
             next_n,
             stride0,
+            rows,
             stream,
         )
         return
@@ -312,7 +312,6 @@ def flydsl_top_k_per_row_decode(
     )
 
     launcher = build_topk_per_row_decode_module(
-        rows,
         k,
         stable,
         wave_size=wave_size,
@@ -329,5 +328,6 @@ def flydsl_top_k_per_row_decode(
         width,
         next_n,
         stride0,
+        rows,
         stream,
     )

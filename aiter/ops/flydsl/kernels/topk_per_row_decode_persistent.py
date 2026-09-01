@@ -10,13 +10,13 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
 
 from .topk_per_row_decode import (
-    _atomic_add_i32,
     _f32_to_ord,
     _load_f32x4,
     _row_length,
-    _row_resource,
     _warp_inclusive_prefix_i32,
 )
+from .kernels_common import atomic_add_i32
+from .tensor_shim import row_rsrc
 
 _BLOCK_THREADS = 1024
 _VEC = 4
@@ -37,7 +37,6 @@ _RUNNING_EQUAL = 7
 
 @cache
 def build_topk_per_row_decode_one_workgroup_module(
-    rows: int,
     k: int,
     wave_size: int,
     write_values: bool = False,
@@ -85,7 +84,7 @@ def build_topk_per_row_decode_one_workgroup_module(
         scan = storage.scan.peek().view(fx.make_layout(num_waves * 2, 1))
         metadata = storage.metadata.peek().view(fx.make_layout(8, 1))
 
-        input_resource = _row_resource(input, row, width, stride0)
+        input_resource = row_rsrc(input, row, width, stride0)
         row_len = _row_length(row, row_ends, width, next_n)
         row_indices = fx.slice(indices, (row, None))
         row_values = fx.slice(values, (row, None))
@@ -195,7 +194,7 @@ def build_topk_per_row_decode_one_workgroup_module(
             for lane_idx in range_constexpr(_VEC):
                 col = col_base + lane_idx
                 if col < row_len:
-                    _atomic_add_i32(
+                    atomic_add_i32(
                         histogram,
                         one,
                         high_bucket(values[lane_idx]),
@@ -208,7 +207,7 @@ def build_topk_per_row_decode_one_workgroup_module(
                 if col < row_len:
                     value = values[lane_idx]
                     if high_bucket(value) == first_threshold:
-                        _atomic_add_i32(
+                        atomic_add_i32(
                             histogram,
                             one,
                             radix_bucket(
@@ -237,7 +236,7 @@ def build_topk_per_row_decode_one_workgroup_module(
                         )
                         == second_threshold
                     ):
-                        _atomic_add_i32(
+                        atomic_add_i32(
                             histogram,
                             one,
                             radix_bucket(value, zero, fx.Int32(_LOW_MASK)),
@@ -430,6 +429,7 @@ def build_topk_per_row_decode_one_workgroup_module(
         width: fx.Int32,
         next_n: fx.Int32,
         stride0: fx.Int32,
+        rows_m: fx.Int32,
         stream: fx.Stream,
     ):
         topk_per_row_decode_one_workgroup_kernel(
@@ -442,7 +442,7 @@ def build_topk_per_row_decode_one_workgroup_module(
             stride0,
             write_values,
         ).launch(
-            grid=(rows, 1, 1),
+            grid=(rows_m, 1, 1),
             block=(_BLOCK_THREADS, 1, 1),
             stream=stream,
         )

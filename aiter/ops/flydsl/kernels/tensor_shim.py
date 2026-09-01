@@ -41,6 +41,16 @@ def ptr_rsrc(ptr):
     return buffer_ops.create_buffer_resource_from_addr(fx.Int64(ptrtoint(ptr)))
 
 
+def row_rsrc(tensor, row, width, stride, elem_bytes=4):
+    """Create a bounded buffer resource for one dynamically selected tensor row."""
+    return buffer_ops.create_buffer_resource(
+        tensor,
+        max_size=False,
+        num_records_bytes=fx.Int64(width) * elem_bytes,
+        base_byte_offset=fx.Int64(row) * fx.Int64(stride) * elem_bytes,
+    )
+
+
 _BUF_COPY_ATOM = {
     16: fx.rocdl.BufferCopy128b,
     8: fx.rocdl.BufferCopy64b,
