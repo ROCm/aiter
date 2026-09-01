@@ -50,6 +50,17 @@ def _load_sage_fwd_tables() -> dict[str, dict]:
         table = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False)
         if table is not None:
             tables[entry.name] = table
+
+    # get_sage_fwd_configs() falls back to this table for every arch that ships
+    # none of its own, and dict.get() evaluates its default eagerly, so a
+    # missing gfx942 file would raise KeyError on *every* arch rather than only
+    # the untuned ones. Fail here instead, naming the file that is absent.
+    assert _FALLBACK_ARCH in tables, (
+        f"no {_CONFIG_NAME} table for the fallback architecture "
+        f"{_FALLBACK_ARCH!r}: expected "
+        f"{resolve_config_dir('attention', _CONFIG_NAME, backend='triton', arch=_FALLBACK_ARCH)}"
+        "/DEFAULT.json"
+    )
     return tables
 
 
