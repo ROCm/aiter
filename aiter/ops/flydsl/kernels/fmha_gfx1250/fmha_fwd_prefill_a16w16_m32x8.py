@@ -146,6 +146,12 @@ LOG2E = 1.4426950408889634
 ENABLE_DEFER_RESCALE = True
 RESCALE_THRESHOLD = 8.0
 
+# Running-max seed: a finite big-negative (not -inf) so a fully-masked row keeps m
+# finite -> softmax's (m_prev - m_new) and fma(s, .., -m) never hit -inf arithmetic
+# (NaN). exp2(big_neg - real) still underflows to 0, so it zeroes the empty seed like
+# -inf did. Masked scores stay -inf (p = exp2(-inf) = 0); only the max seed changes.
+BIG_NEG = -1.0e30
+
 # Compile-time Q/K/V loader select. False = V1 (Q ring async + swizzled LDS; K/V cluster_load_async +
 # swizzled LDS); True = V2 (Q per-warp TDM; K/V TDM global->LDS; all row-major padded LDS, HW OOB,
 # fewer address VGPRs). Gates all three loaders (Q, K and V); O is selected separately by O_VARIANT.
@@ -507,19 +513,11 @@ def _softmax(
             m_new = m_full
 
         # corr = exp(m_prev - m_new); neg_m = -(m_new * log2e) for the fused p exp.
-        if q_min is not None:
-            # Finite-left window: a lane's leading tiles can be wholly masked (row_max=
-            # -inf) while m is still the -inf seed -> corr/neg_m feed NaN into corr/p.
-            # Clamp maxes to a finite floor: all-masked -> corr=1, p=0; once any real key
-            # is seen the clamp is inert (byte-identical to the -inf path).
-            big_neg = fx.Float32(-1.0e30)
-            m_safe = fmax(m_new, big_neg)
-            mp_safe = fmax(m_prev, big_neg)
-            corr = exp2(fmul(fsub(mp_safe, m_safe), log2e))
-            neg_m = fsub(zero, fmul(m_safe, log2e))
-        else:
-            corr = exp2(fmul(fsub(m_prev, m_new), log2e))
-            neg_m = fsub(zero, fmul(m_new, log2e))
+        # m is seeded to BIG_NEG (finite), so m_prev/m_new never reach -inf: a fully
+        # masked row (row_max=-inf) keeps m_new=BIG_NEG, giving corr=exp2(0)=1 and a
+        # finite neg_m (p=exp2(-inf)=0). No (-inf)-(-inf) / -inf+inf, so no clamp needed.
+        corr = exp2(fmul(fsub(m_prev, m_new), log2e))
+        neg_m = fsub(zero, fmul(m_new, log2e))
         m_new_list.append(m_new)
         corr_list.append(corr)
         neg_m_list.append(neg_m)
@@ -899,7 +897,7 @@ def _core_attention(
         ]
         d_init = [fx.Float32(1.0) for _ in range(R)]
     else:
-        m_init = [fx.Float32(float("-inf")) for _ in range(R)]
+        m_init = [fx.Float32(BIG_NEG) for _ in range(R)]
         d_init = [fx.Float32(0.0) for _ in range(R)]
     # _init = R copies of [m, d, O_tile0 .. O_tile{d_tiles-1}] — per q-tile running max,
     # denom, then one v8-f32 O accumulator per 16-wide output-dim tile (this lane's
