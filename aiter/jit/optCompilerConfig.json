@@ -793,6 +793,25 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_msa_sparse_attention": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/sparse_attn/msa/pa_sparse_block_score_decode.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/sparse_attn/msa/pa_sparse_block_score_prefill.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/sparse_attn/msa/pa_sparse_block_topk.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/sparse_attn/msa/pa_sparse_block_select_entry.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "flags_extra_hip_per_source": {
+            "pa_sparse_block_score_*.cu": [
+                "-mllvm -amdgpu-mfma-vgpr-form=1"
+            ]
+        },
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_batched_gemm_bf16_tune": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/batched_gemm_bf16_tune_pybind.cu'",
