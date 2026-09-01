@@ -36,7 +36,7 @@ from test_opus_a8w8_bmm import (
 
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale
+from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale_bpreshuffle
 from aiter.ops.opus.bmm_op import _opus_bmm_a8w8_mxscale_raw
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import run_perftest
@@ -95,16 +95,16 @@ def _run(g, m, n, k, ydt, bench, split_k=1):
     err_plain = _rel_err(_call(KID_PLAIN, W_mx), ref)
 
     # The public entry end to end: guarded custom op -> the preshuffle table
-    # (b_preshuffled=True reads that one, nothing to set) -> a kid that wants the
-    # shuffled weight. Only a shape that table covers can run it, since True
-    # raises by design rather than fall back; an uncovered shape is reported as
-    # off, not failed.
+    # (the entry picks that one, nothing to set) -> a kid that wants the shuffled
+    # weight. Only a shape that table covers can run it, since this entry raises
+    # by design rather than fall back; an uncovered shape is reported as off, not
+    # failed.
     err_pub = None
     if split_k == 1:  # the entry defaults splitK, so only compare where they agree
         try:
             err_pub = _rel_err(
-                batched_gemm_a8w8_mxscale(
-                    O_in, W_sh, xs_in, ws_mx, dtype=ydt, b_preshuffled=True
+                batched_gemm_a8w8_mxscale_bpreshuffle(
+                    O_in, W_sh, xs_in, ws_mx, dtype=ydt
                 ),
                 ref,
             )
@@ -197,7 +197,7 @@ def _check_tables():
 
 
 def _check_dispatch():
-    """b_preshuffled routing at the public entry, without launching anything.
+    """B-layout routing across the two public entries, without launching anything.
 
     None of these outcomes shows up in the output tensor -- a kid mismatched to
     B's layout returns a plausible wrong answer rather than failing -- so this
@@ -235,11 +235,16 @@ def _check_dispatch():
         def _spy(x, wo_a, Y, sfa, sfb, splitK, kernelId):
             seen["kid"] = int(kernelId)
 
+        impl = (
+            bg._batched_gemm_a8w8_mxscale_bpreshuffle_impl
+            if b_preshuffled
+            else bg._batched_gemm_a8w8_mxscale_impl
+        )
         with patch.object(bmm, "_opus_bmm_a8w8_mxscale_raw", _spy), patch.object(
             bg, "lookup_mxscale_bmm_config", lambda *a, **kw: row
         ):
             try:
-                bg._batched_gemm_a8w8_mxscale_impl(*args, b_preshuffled=b_preshuffled)
+                impl(*args)
             except ValueError as err:
                 return err
         return seen["kid"]
@@ -343,7 +348,7 @@ def main():
 
     print("tables: one tuned CSV per B layout", flush=True)
     ok = _check_tables()
-    print("dispatch: b_preshuffled routing at the public entry", flush=True)
+    print("dispatch: B-layout routing across the two public entries", flush=True)
     ok &= _check_dispatch()
     for m in [int(x) for x in args.sizes.split(",")]:
         ok &= _run(args.g, m, args.n, args.k, ydt, args.bench, args.split_k)

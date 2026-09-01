@@ -164,7 +164,7 @@ def batched_gemm_a8w8_CK(
 _TUNED_PERF_COLUMNS = ("us", "tflops", "bw", "errRatio")
 
 
-def _mxscale_bmm_tuned_path(b_preshuffled: bool = False) -> str:
+def _mxscale_bmm_tuned_path(bpreshuffle: bool = False) -> str:
     """The tuned CSV for B in this layout; one table per layout, never merged.
 
     A row's kernelId is only meaningful for the B layout it was tuned on, so the
@@ -173,17 +173,17 @@ def _mxscale_bmm_tuned_path(b_preshuffled: bool = False) -> str:
     every caller in the process.
     """
     cfg = AITER_CONFIGS
-    if b_preshuffled:
+    if bpreshuffle:
         return cfg.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE
     return cfg.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE
 
 
 @functools.cache
 def _load_mxscale_bmm_tuned(
-    libtype: str | None = None, b_preshuffled: bool = False
+    libtype: str | None = None, bpreshuffle: bool = False
 ) -> dict:
     """{(gfx,b,m,n,k): row} from the mxscale BMM tuned CSV; {} if it is missing."""
-    path = _mxscale_bmm_tuned_path(b_preshuffled)
+    path = _mxscale_bmm_tuned_path(bpreshuffle)
     try:
         df = pd.read_csv(path).drop_duplicates()
     except FileNotFoundError:
@@ -202,7 +202,7 @@ def lookup_mxscale_bmm_config(
     k: int,
     *,
     libtype: str | None = None,
-    b_preshuffled: bool = False,
+    bpreshuffle: bool = False,
 ):
     """Exact tuned row for this shape, else one at a padded M, in B's layout table.
 
@@ -224,8 +224,8 @@ def lookup_mxscale_bmm_config(
     reported without this layer knowing which column holds it.
     """
     gfx = get_gfx()
-    path = _mxscale_bmm_tuned_path(b_preshuffled)
-    tuned = _load_mxscale_bmm_tuned(libtype, b_preshuffled)
+    path = _mxscale_bmm_tuned_path(bpreshuffle)
+    tuned = _load_mxscale_bmm_tuned(libtype, bpreshuffle)
 
     row, padded_m = None, m
     for gl in (None, 0, 1):
@@ -282,7 +282,6 @@ def _batched_gemm_a8w8_mxscale_impl(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
-    b_preshuffled: bool = False,
 ) -> Tensor:
     """Eager tuned-CSV lookup + libtype dispatch; returns token-major [M, G, N].
 
@@ -298,17 +297,17 @@ def _batched_gemm_a8w8_mxscale_impl(
     m, g, k = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
     n = int(wo_a.shape[1])
 
-    cfg = lookup_mxscale_bmm_config(g, m, n, k, b_preshuffled=b_preshuffled)
+    cfg = lookup_mxscale_bmm_config(g, m, n, k)
     libtype = cfg["libtype"] if cfg is not None else _MXSCALE_BMM_DEFAULT_LIBTYPE
     if libtype != "opus":
         raise NotImplementedError(
             f"tuned row for B:{g}, M:{m}, N:{n}, K:{k} wants libtype "
-            f"{libtype!r}, which has no batched mxscale backend here yet"
+            f"{libtype!r}, which does not take a raw [G, N, K] weight; "
+            f"{libtype!r} rows are served by batched_gemm_a8w8_mxscale_bpreshuffle"
         )
 
     # Reading opus columns is this branch's job; whether that kernel can run
-    # this M, whether it reads B in the declared layout, and what to do when it
-    # cannot, is the backend's.
+    # this M, and what to do when it cannot, is the backend's.
     return bmm_a8w8_mxscale_opus(
         x,
         wo_a,
@@ -318,7 +317,6 @@ def _batched_gemm_a8w8_mxscale_impl(
         dtype=dtype,
         kernelId=int(cfg["kernelId"]) if cfg is not None else None,
         splitK=int(cfg["splitK"]) if cfg is not None else None,
-        b_preshuffled=b_preshuffled,
     )
 
 
@@ -328,7 +326,6 @@ def _batched_gemm_a8w8_mxscale_fake(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
-    b_preshuffled: bool = False,
 ) -> Tensor:
     # token-major [M, G, N]; mirrors the eager allocation in bmm_a8w8_mxscale_opus.
     return torch.empty(
@@ -345,9 +342,8 @@ def batched_gemm_a8w8_mxscale(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
-    b_preshuffled: bool = False,
 ) -> Tensor:
-    """fp8 e8m0 mxscale (128x128 block-scale) batched GEMM.
+    """fp8 e8m0 mxscale (128x128 block-scale) batched GEMM, row-major weight.
 
     mmajor DSV4 wo_a layout (matches the opus kernels + op test):
 
@@ -372,19 +368,119 @@ def batched_gemm_a8w8_mxscale(
     the backend. No kernel override lives on this entry: how a kernel is named is
     backend-specific, so pin one at the backend (aiter.ops.opus.bmm_op).
 
-    ``b_preshuffled`` is the one exception, and not for tuning reasons: it
-    declares that ``wo_a`` was baked into the (16, 16) MFMA-fragment layout
-    (``aiter.ops.shuffle.shuffle_weight``) at load time, which a serving stack
-    does offline and cannot express any other way. It has to be declared rather
-    than detected -- the shuffled weight has the same shape, dtype and strides as
-    the row-major one, so a kernel mismatched to it reads the right bytes in the
-    wrong order and returns a plausible wrong answer instead of failing. It also
-    picks which tuned CSV is read (see ``_mxscale_bmm_tuned_path``), so the two
-    layouts cannot pull each other's rows, and only kids wanting the declared
-    layout are taken even then.
+    A ``wo_a`` baked into the (16, 16) MFMA-fragment layout goes to
+    ``batched_gemm_a8w8_mxscale_bpreshuffle`` instead. The layout has to be
+    declared by picking the entry rather than detected: a shuffled weight has the
+    same shape, dtype and strides as a row-major one, so the wrong entry reads the
+    right bytes in the wrong order and returns a plausible wrong answer instead of
+    failing.
     """
-    return _batched_gemm_a8w8_mxscale_impl(
-        x, wo_a, x_scale, w_scale, dtype=dtype, b_preshuffled=b_preshuffled
+    return _batched_gemm_a8w8_mxscale_impl(x, wo_a, x_scale, w_scale, dtype=dtype)
+
+
+# Same family, preshuffled weight.
+def _batched_gemm_a8w8_mxscale_bpreshuffle_impl(
+    x: Tensor,
+    wo_a: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+) -> Tensor:
+    """Eager tuned-CSV lookup + libtype dispatch; returns token-major [M, G, N].
+
+    Two backends carry a preshuffled B and they want different activation scale
+    layouts, so the tuned row's libtype decides both which kernel runs and which
+    ``x_scale`` the caller must have produced -- see the public entry.
+    """
+    m, g, k = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
+    n = int(wo_a.shape[1])
+
+    cfg = lookup_mxscale_bmm_config(g, m, n, k, bpreshuffle=True)
+    if cfg is not None:
+        libtype = cfg["libtype"]
+    else:
+        # Untuned shapes: opus carries a shape heuristic, the gfx1250 flydsl path
+        # does not, so the arch picks the fallback.
+        libtype = "flydsl" if get_gfx() == "gfx1250" else _MXSCALE_BMM_DEFAULT_LIBTYPE
+
+    if libtype == "opus":
+        from .opus.bmm_op import bmm_a8w8_mxscale_opus
+
+        # Whether the tuned kernel can run this M, whether it reads B in the
+        # declared layout, and what to do when it cannot, is the backend's job.
+        return bmm_a8w8_mxscale_opus(
+            x,
+            wo_a,
+            x_scale,
+            w_scale,
+            None,
+            dtype=dtype,
+            kernelId=int(cfg["kernelId"]) if cfg is not None else None,
+            splitK=int(cfg["splitK"]) if cfg is not None else None,
+            b_preshuffled=True,
+        )
+
+    if libtype == "flydsl":
+        from .flydsl.batched_gemm_a8w8_gfx1250 import run_bmm_a8w8_mxfp8_128_gfx1250
+
+        return run_bmm_a8w8_mxfp8_128_gfx1250(
+            x,
+            wo_a,
+            x_scale,
+            w_scale,
+            torch.empty((m, g, n), dtype=dtype, device=x.device),
+            kernel_name=str(cfg["kernelName"]) if cfg is not None else None,
+        )
+
+    raise NotImplementedError(
+        f"tuned row for B:{g}, M:{m}, N:{n}, K:{k} wants libtype {libtype!r}, "
+        "which has no preshuffled-B batched GEMM; row-major rows are served by "
+        "batched_gemm_a8w8_mxscale"
+    )
+
+
+@torch_compile_guard(mutates_args=[], gen_fake=_batched_gemm_a8w8_mxscale_fake)
+def batched_gemm_a8w8_mxscale_bpreshuffle(
+    x: Tensor,
+    wo_a: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+) -> Tensor:
+    """fp8 e8m0 mxscale batched GEMM whose ``wo_a`` is already preshuffled.
+
+    Same math as ``batched_gemm_a8w8_mxscale``, but ``wo_a`` was baked into the
+    (16, 16) MFMA-fragment layout (``aiter.ops.shuffle.shuffle_weight``) at load
+    time, which a serving stack does offline and cannot express any other way.
+    That is why it is a separate entry rather than a flag: the shuffled weight
+    has the same shape, dtype and strides as the row-major one, so a mismatched
+    kernel reads the right bytes in the wrong order and returns a plausible wrong
+    answer instead of failing. The entry also picks the tuned CSV, so the two
+    layouts cannot pull each other's rows.
+
+    * ``x``       : [M, G, K] fp8 activation, token-major and contiguous.
+    * ``wo_a``    : [G, N, K] fp8 weight, preshuffled as above.
+    * ``w_scale`` : [G, N/128, K/128] uint8 e8m0.
+    * ``x_scale`` : [M, G, K/128] uint8 e8m0, **in the layout the resolved
+                    backend wants** -- and the two differ:
+
+      - ``flydsl`` (gfx1250): row-major, i.e. ``inverse_rope_group_quant(...,
+        scale_layout="row")``.
+      - ``opus`` (gfx950): the MFMA-tile layout, i.e. ``scale_layout="mfma_tile"``
+        (byte-identical to ``shuffle_scale_a(xs, k, sub=16)``). Its kernels fold
+        the row offset into the tile index, so a per-token scale slab is passed
+        with ``stride(0) == 0`` via ``.expand()``.
+
+      Getting this wrong is the same silent-wrong-answer failure as the weight
+      layout, so the caller has to know which backend its shape resolves to.
+
+    Returns a fresh token-major [M, G, N]. A caller that must write into its own
+    buffer calls the backend directly (both keep ``out=``):
+    ``run_bmm_a8w8_mxfp8_128_gfx1250`` or
+    ``aiter.ops.opus.bmm_op.bmm_a8w8_mxscale_opus``.
+    """
+    return _batched_gemm_a8w8_mxscale_bpreshuffle_impl(
+        x, wo_a, x_scale, w_scale, dtype=dtype
     )
 
 

@@ -93,6 +93,11 @@ AITER_CONFIG_GEMM_A4W4 = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/a4w4_blockscale_tuned_gemm.csv",
 )
 
+AITER_CONFIG_GEMM_A6W6 = os.getenv(
+    "AITER_CONFIG_GEMM_A6W6",
+    f"{AITER_ROOT_DIR}/aiter/configs/a6w6_blockscale_tuned_gemm.csv",
+)
+
 AITER_CONFIG_GEMM_A8W8 = os.getenv(
     "AITER_CONFIG_GEMM_A8W8",
     f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_gemm.csv",
@@ -154,8 +159,8 @@ AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE = os.getenv(
 # layout. Its own env var and filename rather than a flavour of the one above,
 # matching the AITER_CONFIG_GEMM_A8W8[_BLOCKSCALE]_BPRESHUFFLE split: every row
 # here names a kernel that reads B only in that layout, so it is correct for a
-# b_preshuffled=True caller and wrong for any other, and one process can serve
-# both layouts and so has to be able to hold both tables at once.
+# preshuffled caller and wrong for any other, and one process can serve both
+# layouts and so has to be able to hold both tables at once.
 AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE = os.getenv(
     "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
     f"{AITER_ROOT_DIR}/aiter/configs/"
@@ -185,6 +190,14 @@ class AITER_CONFIG:
             "AITER_CONFIG_GEMM_A4W4",
             AITER_CONFIG_GEMM_A4W4,
             "a4w4_blockscale_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A6W6_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A6W6",
+            AITER_CONFIG_GEMM_A6W6,
+            "a6w6_blockscale_tuned_gemm",
         )
 
     @property

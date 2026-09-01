@@ -611,12 +611,12 @@ DEFAULT_OUT = os.path.join(_REPO, "dsv4_bmm_mxscale_retuned.csv")
 # key, and update_config_files answers a collision by rewriting the source files
 # down to the lowest-us row each and then raising. Putting "bpreshuffle" before
 # "tuned" breaks the substring, so this file is invisible to that glob and is
-# instead the default table of the separate _BPRESHUFFLE config entry, which
-# batched_gemm_a8w8_mxscale reads only under b_preshuffled=True. Nothing has to
-# be set to pick it up; override that entry's env var to try another one.
+# instead the default table of the separate _BPRESHUFFLE config entry, which only
+# batched_gemm_a8w8_mxscale_bpreshuffle reads. Nothing has to be set to pick it
+# up; override that entry's env var to try another one.
 #
 # Four of the 133 cells are slower here than the shipped table is with row-major
-# B, and they stay in anyway: a b_preshuffled=True caller has no row-major kernel
+# B, and they stay in anyway: a preshuffled caller has no row-major kernel
 # to fall back to, and each row already names the fastest preshuffled kid the
 # entry can dispatch (re-swept over the whole pool at re-drawn placements). Two of
 # them are twin-vs-twin -- g16/m128/k4096 is kid326 against kid230 (+11%) and
