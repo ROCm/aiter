@@ -13,7 +13,7 @@ import torch
 import aiter
 from aiter import dtypes, per_tensor_quant
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
+from aiter.test_common import benchmark, checkAllclose, perftest
 
 # This test only supports gfx950, skip on gfx942
 if get_gfx() == "gfx942":
@@ -230,6 +230,7 @@ def test_mla_prefill(
     varlen: bool = False,
     is_causal: bool = True,
     qo_len: int | None = None,
+    need_lse: bool = True,
     load_metadata: bool | None = False,
     dump_metadata: bool | None = False,
     profile_ps: bool | None = False,
@@ -358,6 +359,7 @@ def test_mla_prefill(
             kvlen_granularity=kvlen_granularity,
             block_size=block_size,
             is_causal=is_causal,
+            need_lse=need_lse,
         )
         torch.cuda.synchronize()
         start_event = torch.cuda.Event(enable_timing=True)
@@ -380,6 +382,7 @@ def test_mla_prefill(
             kvlen_granularity=kvlen_granularity,
             block_size=block_size,
             is_causal=is_causal,
+            need_lse=need_lse,
         )
         end_event.record()
         end_event.synchronize()
@@ -545,41 +548,46 @@ def test_mla_prefill(
         ret["err fp8"] = err
         ret["acc result"] = status
 
-        # LSE validation: final_lse [total_q, nhead] vs lse_ref [nhead, total_q]
-        # Transpose final_lse to [nhead, total_q] for comparison.
+        # LSE validation: final_lse [total_q, nhead] vs lse_ref [nhead, total_q].
         asm_lse = final_lse.transpose(0, 1)  # [nhead, total_q]
-        valid_mask = lse_ref.isfinite()
-        if valid_mask.any():
-            asm_lse_valid = asm_lse[valid_mask]
-            ref_lse_valid = lse_ref[valid_mask]
-            lse_err = checkAllclose(
-                ref_lse_valid,
-                asm_lse_valid,
-                rtol=5e-2,
-                atol=5e-2,
-                msg="mla_prefill_lse   [torch vs aiter_asm]: us......",
-            )
-            if lse_err == 0:
-                lse_status = "passed"
-            elif 0 < lse_err <= 0.05:
-                lse_status = "warning"
-            else:
-                lse_status = "failed"
+        if not need_lse:
+            ret["err lse"] = 0
+            ret["lse result"] = "skipped"
         else:
-            lse_err = 0
-            lse_status = "passed"
-        ret["err lse"] = lse_err
-        ret["lse result"] = lse_status
-
-        # Detailed LSE stats for debugging
-        if valid_mask.any():
-            lse_diff = (asm_lse_valid - ref_lse_valid).abs()
-            ret["lse max_abs_diff"] = lse_diff.max().item()
-            ret["lse mean_abs_diff"] = lse_diff.mean().item()
-            lse_denom = ref_lse_valid.abs().clamp(min=1e-6)
-            lse_rel = lse_diff / lse_denom
-            ret["lse max_rel_err"] = lse_rel.max().item()
-            ret["lse mean_rel_err"] = lse_rel.mean().item()
+            assert torch.equal(
+                asm_lse.isneginf(), lse_ref.isneginf()
+            ), "final_lse -inf mask mismatch: some tiles did not get an LSE written"
+            valid_mask = lse_ref.isfinite()
+            if valid_mask.any():
+                asm_lse_valid = asm_lse[valid_mask]
+                ref_lse_valid = lse_ref[valid_mask]
+                lse_err = checkAllclose(
+                    ref_lse_valid,
+                    asm_lse_valid,
+                    rtol=5e-2,
+                    atol=5e-2,
+                    msg="mla_prefill_lse   [torch vs aiter_asm]: us......",
+                )
+                if lse_err == 0:
+                    lse_status = "passed"
+                elif 0 < lse_err <= 0.05:
+                    lse_status = "warning"
+                else:
+                    lse_status = "failed"
+                lse_diff = (asm_lse_valid - ref_lse_valid).abs()
+                ret["lse max_abs_diff"] = lse_diff.max().item()
+                ret["lse mean_abs_diff"] = lse_diff.mean().item()
+                lse_denom = ref_lse_valid.abs().clamp(min=1e-6)
+                lse_rel = lse_diff / lse_denom
+                ret["lse max_rel_err"] = lse_rel.max().item()
+                ret["lse mean_rel_err"] = lse_rel.mean().item()
+            else:
+                # All rows fully masked: the isneginf equality above already validated
+                # every entry, so this is a genuine pass, not a vacuous one.
+                lse_err = 0
+                lse_status = "passed"
+            ret["err lse"] = lse_err
+            ret["lse result"] = lse_status
 
     return ret
 
@@ -728,6 +736,15 @@ parser.add_argument(
     help="""skip reference implementation. Default: False.
     --skip_reference # True""",
 )
+parser.add_argument(
+    "--need_lse",
+    type=dtypes.str2bool,
+    default=True,
+    help="""request final_lse from the PS scheduler. Default: True.
+    True routes single-split tiles through reduce so final_lse is written;
+    False keeps the direct-to-O fast path and leaves final_lse unpopulated.
+    e.g.: --need_lse false""",
+)
 
 args = parser.parse_args()
 
@@ -773,6 +790,7 @@ for (
         varlen,
         is_causal,
         qo_len=qo_len,
+        need_lse=args.need_lse,
         load_metadata=args.load_metadata,
         dump_metadata=args.dump_metadata,
         profile_ps=args.profile,

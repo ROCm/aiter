@@ -31,11 +31,11 @@ void generate_reduce_info(int32_t num_work,
                           std::vector<int32_t>& reduce_partial_map)
 {
     std::map<std::vector<int32_t>, std::set<int32_t>> reduce_map; // 2d
-    int32_t q_head_start, q_head_end;
     for(int32_t i = 0; i < num_work; ++i)
     {
         auto work = work_info[i];
-        std::tie(q_head_start, q_head_end) = unpack_dword(work.q_head_range);
+        if(work.partial_o_loc == -1)
+            continue;
 
         auto final_loc   = std::vector<int32_t>({work.qo_start, work.qo_end});
         auto partial_loc = work.partial_o_loc;
@@ -49,6 +49,9 @@ void generate_reduce_info(int32_t num_work,
         auto final_loc = it->first;
         std::vector<uint32_t> partial_loc_vec(it->second.begin(), it->second.end());
         const int32_t num_partials   = partial_loc_vec.size();
+        assert(final_idx + 1 < static_cast<int32_t>(reduce_indptr.size()));
+        assert(final_idx < static_cast<int32_t>(reduce_final_map.size()));
+        assert(partial_idx + num_partials <= static_cast<int32_t>(reduce_partial_map.size()));
         reduce_indptr[final_idx + 1] = reduce_indptr[final_idx] + num_partials;
         reduce_final_map[final_idx]  = FinalLoc{final_loc[0], final_loc[1]};
         std::copy(partial_loc_vec.begin(),
@@ -73,6 +76,7 @@ void kn_generate_ps_metadata(std::vector<int32_t>& seqlens_qo_indptr,
                              const int32_t kvlen_granularity,
                              const int32_t block_size,
                              const bool is_causal,
+                             const bool need_lse,
                              std::vector<int32_t>& work_indptr,
                              std::vector<WorkInfo>& work_info,
                              const int32_t available_tgs = 256,
@@ -182,15 +186,24 @@ void kn_generate_ps_metadata(std::vector<int32_t>& seqlens_qo_indptr,
                     if(remaining_kv_len <= blocks_capacity * block_size + SPLIT_KV_OVERHEAD)
                     {
                         consuming_blocks = remaining_blocks;
-                        // This TG can process all of this qo_tile's remaining_blocks to the causal
-                        // boundary.
-                        // Always emit a partial slot (partial_o_loc) so the mla_reduce_v1 runs and
-                        // populates the final LSE. We must do this even when the number of splits is 1.	
-                        const int32_t partial_o_loc = qlen_granularity * partial_tile_idx++;
+                        // This TG covers this qo_tile's remaining blocks to the causal
+                        // boundary. Direct-to-O (partial_o_loc == -1) means stage-1 writes 
+                        // the final output and no reduce runs:
+                        //  - if need_lse true: emit a real partial slot so mla_reduce_v1 
+                        //    populates final_lse for this tile
+                        //  - a zero-KV tile (consuming_blocks == 0) is always direct-to-O,
+                        //    since it has no partial data and must never enter the reduce map;
+                        //  - current_block_idx != 0 is the final chunk of a cross-TG split
+                        //    so it always gets a real slot.
+                        const bool direct_to_o =
+                            (consuming_blocks == 0) || (!need_lse && current_block_idx == 0);
+                        const int32_t partial_o_loc =
+                            direct_to_o ? -1 : (qlen_granularity * partial_tile_idx++);
                         const int32_t kv_end =
                             std::min(kv_start + consuming_blocks,
                                      pages_kv_indptr[current_tile.batch_idx + 1]);
 
+                        assert(current_work_idx < static_cast<int32_t>(work_info.size()));
                         work_info[current_work_idx++] = {current_tile.batch_idx,
                                                          partial_o_loc,
                                                          current_tile.qo_start,
@@ -217,6 +230,7 @@ void kn_generate_ps_metadata(std::vector<int32_t>& seqlens_qo_indptr,
                             kv_length -
                             (kv_end - pages_kv_indptr[current_tile.batch_idx]) * block_size;
 
+                        assert(current_work_idx < static_cast<int32_t>(work_info.size()));
                         work_info[current_work_idx++] = {current_tile.batch_idx,
                                                          partial_o_loc,
                                                          current_tile.qo_start,
@@ -259,7 +273,8 @@ void get_ps_metadata_v1_2_host(const aiter_tensor_t& seqlens_qo_indptr, // [batc
                                const int32_t qlen_granularity,
                                const int32_t kvlen_granularity,
                                const int32_t block_size,
-                               const bool is_causal)
+                               const bool is_causal,
+                               const bool need_lse)
 {
 
     hipDevice_t dev;
@@ -315,6 +330,7 @@ void get_ps_metadata_v1_2_host(const aiter_tensor_t& seqlens_qo_indptr, // [batc
                                 kvlen_granularity,
                                 block_size,
                                 is_causal,
+                                need_lse,
                                 work_indptr_vec,
                                 work_info_vec,
                                 tgs_per_cluster,

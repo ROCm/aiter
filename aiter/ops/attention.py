@@ -1028,8 +1028,6 @@ def get_ps_metadata_info_v1(
 
     qo_tile_cnt = batch_size * max_qo_split_per_batch
     # TODO: consider split q to reduce max_works & max_partials
-    # partial_o_loc is always set, so each work entry emits one reduce partial.
-    # max_partials is the work count per head and max_works sums it over heads.
     work_per_head = (batch_size + cus_per_cluster - 1) * max_qo_split_per_batch
     max_works = work_per_head * num_head_k
     max_partials = work_per_head
@@ -1062,6 +1060,7 @@ def get_ps_metadata_v1(
     kvlen_granularity: int = 16,
     block_size: int = 16,
     is_causal: bool = True,
+    need_lse: bool = False,
 ) -> None: ...
 
 
