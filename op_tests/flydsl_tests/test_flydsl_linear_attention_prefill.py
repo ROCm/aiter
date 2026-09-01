@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Unit tests for FlyDSL Linear Attention Prefill (chunk_gated_delta_h) regressions.
+"""Unit tests for FlyDSL Linear Attention Prefill (chunk_gated_delta_h_opt) regressions.
 
 Grid: Qwen3.5-35B (Hv=32) and Qwen3.5-397B (Hv=64), TP 1/2/4/8.
 Dense T=1k/2k/4k/8k/16k/32k/64k; varlen total T=16k/32k/64k with seqlen 1k/2k/4k/8k.
@@ -820,24 +820,6 @@ def _normalize_opt_v_new(vn_opt):
     return vn_opt.permute(0, 2, 1, 3).contiguous()
 
 
-def _is_gfx950() -> bool:
-    """Whether the current GPU is CDNA4 / gfx950 (MI350).
-
-    The baseline / ``naive`` / ``naive_opt`` FlyDSL K5 forks emit the
-    ``mfma_f32_16x16x32_bf16`` (K=32 bf16) MFMA and ``mfma32_vk`` emits
-    ``mfma_f32_32x32x16_bf16`` -- both are gfx950-only instructions. On gfx942
-    (CDNA3 / MI300) they fail to compile with an LLVM ``Cannot select``
-    abort, so the perf harness skips them there. The remaining forks
-    (``kv`` / ``opt`` / ``mfma16_2wave_opt1`` / ``mfma16_3wave_opt2``)
-    use the K=16 ``mfma_f32_16x16x16bf16_1k`` and run on both.
-    """
-    try:
-        arch = torch.cuda.get_device_properties(0).gcnArchName
-    except Exception:  # noqa: BLE001
-        return False
-    return "gfx950" in arch
-
-
 def _hip_k5_supported(args: PrefillArgs) -> bool:
     """The HIP K5 kernel only handles K=V=128, bf16 inputs, chunk_size=64."""
     return (
@@ -908,10 +890,7 @@ def chunk_gated_delta_rule_fwd_h_hip_k5(
 
 
 _K5_KERNEL_PREFIXES = [
-    "chunk_gdn_fwd_h_flydsl_vk",
-    "chunk_gdn_fwd_h_flydsl_kv",
     "chunk_gdn_fwd_h_flydsl_opt",
-    "chunk_gdn_fwd_h_flydsl_naive",
     "chunk_gated_delta_rule_fwd_kernel_h",
 ]
 
@@ -953,7 +932,7 @@ def _bench_fn(fn, *args, **kwargs):
     """Average per-iter K5 kernel time (us) via torch.profiler.
 
     Only counts kernels whose name matches ``_K5_KERNEL_PREFIXES``
-    (chunk_gdn_fwd_h_flydsl_vk, chunk_gated_delta_rule_fwd_kernel_h*).
+    (chunk_gdn_fwd_h_flydsl_opt, chunk_gated_delta_rule_fwd_kernel_h*).
     This excludes memset, dtype-cast, and any other non-K5 GPU work.
     """
     fn(*args, **kwargs)
@@ -1080,9 +1059,8 @@ class TestCorrectness:
     """Correctness and integration coverage for the FlyDSL mfma16 K5 backend."""
 
     def test_correctness_flydsl_opt(self, args: PrefillArgs):
-        """K5 opt FlyDSL K5 impl (formerly the "vk" fork): 16x16x16
-        MFMA + HIP warp partition. Same VK public outputs as the baseline flydsl
-        path; only the BV==64 configs exercise the kernel, others fall back."""
+        """K5 opt FlyDSL impl: 16x16x16 MFMA + HIP warp partition, emitting the
+        same VK public outputs as the HIP and Triton backends."""
         context_lens = args.resolve_context_lens()
         k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(
             context_lens, args=args

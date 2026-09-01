@@ -400,7 +400,6 @@ class K5BvTuner(TunerCommon):
 
         _op.reload_tuned_bv_table()
         _op._get_or_compile_opt.cache_clear()
-        _op._compiled_kernels.clear()
 
     def _restore_config_env(self, env_name, old_val, old_rebuild=0):
         super()._restore_config_env(env_name, old_val, old_rebuild)
