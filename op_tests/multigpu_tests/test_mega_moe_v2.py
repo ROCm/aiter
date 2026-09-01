@@ -395,12 +395,9 @@ def main():
             device,
         )
         ref_weights = w1_q, w1_ref_scale, w2_q, w2_ref_scale
-        for batch_size in batch_sizes:
-            local_batch_size = rank_tokens[rank] if rank_tokens else batch_size
-            max_tok_per_rank = args.max_tok_per_rank or max(
-                16, _next_power_of_two(batch_size)
-            )
-            moe = MegaMoEV2(
+        shared_moe = None
+        if args.max_tok_per_rank is not None:
+            shared_moe = MegaMoEV2(
                 rank=rank,
                 world_size=world,
                 quant="a8w4",
@@ -408,10 +405,27 @@ def main():
                 w1_scale=w1_scale,
                 w2=w2,
                 w2_scale=w2_scale,
-                max_tok_per_rank=max_tok_per_rank,
+                max_tok_per_rank=args.max_tok_per_rank,
                 **network,
             )
-            _install_config_policy(moe, args.config_tokens, args.unify_fields)
+            _install_config_policy(shared_moe, args.config_tokens, args.unify_fields)
+        for batch_size in batch_sizes:
+            local_batch_size = rank_tokens[rank] if rank_tokens else batch_size
+            if shared_moe is None:
+                moe = MegaMoEV2(
+                    rank=rank,
+                    world_size=world,
+                    quant="a8w4",
+                    w1=w1,
+                    w1_scale=w1_scale,
+                    w2=w2,
+                    w2_scale=w2_scale,
+                    max_tok_per_rank=max(16, _next_power_of_two(batch_size)),
+                    **network,
+                )
+                _install_config_policy(moe, args.config_tokens, args.unify_fields)
+            else:
+                moe = shared_moe
             if rank_tokens:
                 selected = moe._select_config(local_batch_size)
                 configs = [None] * world
