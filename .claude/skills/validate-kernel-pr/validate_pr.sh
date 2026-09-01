@@ -942,8 +942,39 @@ PY
 )
 jset_string "test_selection.runner" "$TARGET_RUNNER"
 jset_string "test_selection.runner_reason" "$TARGET_RUNNER_REASON"
+# Which channel carries the grid, and the proof that channel exists in the target.
+#
+# The two are resolved to exactly one channel before either is scanned, and --shape-arg wins
+# for a script target, because run_pytest routes the grid onto argv whenever SHAPE_ARG is set.
+# Scanning both and letting the second overwrite the first would credit a channel this run
+# does not use: with both flags supplied the env scan decided GRID_HOOK_OK while argv was what
+# actually carried the shapes, so a proven CLI hook could be reported as missing and an env var
+# the run never set could be reported as proven.
+GRID_CHANNEL=""
+GRID_CHANNEL_KIND="none"
+if [ -n "$SHAPE_ARG" ] && [ "$TARGET_RUNNER" = "script" ]; then
+  GRID_CHANNEL="the target's own $SHAPE_ARG flag"
+  GRID_CHANNEL_KIND="cli-flag"
+elif [ -n "$SHAPE_ENV" ]; then
+  GRID_CHANNEL="the $SHAPE_ENV environment variable"
+  GRID_CHANNEL_KIND="env-var"
+elif [ -n "$SHAPE_ARG" ]; then
+  # argv reaches script targets only. Naming this rather than falling through to "no channel
+  # was configured" keeps the skip a fact about the request, not a false fact about the caller.
+  GRID_CHANNEL="the target's own $SHAPE_ARG flag, which reaches script targets only (this target runs under $TARGET_RUNNER)"
+  GRID_CHANNEL_KIND="cli-flag-unusable"
+fi
+# A grid was *asked for* if both a channel and shapes were named. Everything downstream turns
+# on this distinction: "no grid was configured" is a fact about the caller, while "the hook was
+# not found" is a fact about the target, and reporting the second as the first is the
+# overclaim-by-omission this skill exists to prevent.
+GRID_REQUESTED=0
+if [ -n "$GRID" ] && [ "$GRID_CHANNEL_KIND" != "none" ]; then
+  GRID_REQUESTED=1
+fi
+jset_string "test_selection.grid_channel" "$GRID_CHANNEL_KIND"
 GRID_HOOK_OK=0
-if [ -n "$SHAPE_ARG" ] && [ -n "$GRID" ] && [ "$TARGET_RUNNER" = "script" ] \
+if [ "$GRID_REQUESTED" -eq 1 ] && [ "$GRID_CHANNEL_KIND" = "cli-flag" ] \
     && [ -f "$REPO_WT/$TEST_FILE" ]; then
   GRID_HOOK_OK=$(python3 - "$REPO_WT/$TEST_FILE" "$SHAPE_ARG" <<'PY'
 import ast
@@ -964,7 +995,7 @@ print(int(found))
 PY
 )
 fi
-if [ -n "$SHAPE_ENV" ] && [ -n "$GRID" ] \
+if [ "$GRID_REQUESTED" -eq 1 ] && [ "$GRID_CHANNEL_KIND" = "env-var" ] \
     && [ -f "$REPO_WT/$TEST_FILE" ]; then
   GRID_HOOK_OK=$(python3 - "$REPO_WT/$TEST_FILE" "$SHAPE_ENV" <<'PY'
 import ast
@@ -1004,9 +1035,15 @@ PY
 )
 fi
 
+# Runs the selected target once, whatever its runner is -- the name predates script targets.
+# The second argument is the grid VALUE, not an env assignment: the channel is decided by
+# GRID_CHANNEL_KIND. It used to take "$SHAPE_ENV=$GRID" and re-split on the first `=`, which
+# worked for a CLI-only run only because an unset SHAPE_ENV left a leading `=` that the split
+# then removed -- the shapes were travelling inside a string shaped like the channel they were
+# not using.
 run_pytest() {
   local label="$1"
-  local shape_assignment="$2"
+  local grid_value="$2"
   local log="$WORK/$TARGET_RUNNER-$label.log"
   local phase=${label%%-*}
   local cache_root="$WORK/$phase"
@@ -1046,21 +1083,20 @@ PY
     "AITER_JIT_DIR=$cache_root/aiter-jit"
     "VALIDATION_PHASE=$label"
   )
+  # The grid goes out on whichever channel GRID_CHANNEL_KIND proved, which is the same
+  # decision that credited the hook -- so the run cannot carry its shapes on one channel while
+  # the report attests the other.
   local -a shape_cli=()
-  if [ -n "$shape_assignment" ] && [ -n "$SHAPE_ARG" ] \
-      && [ "$TARGET_RUNNER" = "script" ]; then
+  if [ -n "$grid_value" ] && [ "$GRID_CHANNEL_KIND" = "cli-flag" ]; then
     shape_cli=("$SHAPE_ARG")
-    local _grid_value="${shape_assignment#*=}"
     local _old_ifs="$IFS"
     IFS=';'
-    for _shape in $_grid_value; do
+    for _shape in $grid_value; do
       [ -n "$_shape" ] && shape_cli+=("$_shape")
     done
     IFS="$_old_ifs"
-    shape_assignment=""
-  fi
-  if [ -n "$shape_assignment" ]; then
-    environment+=("$shape_assignment")
+  elif [ -n "$grid_value" ] && [ -n "$SHAPE_ENV" ]; then
+    environment+=("$SHAPE_ENV=$grid_value")
   fi
   if [ "$TARGET_RUNNER" = "pytest" ]; then
     (
@@ -1451,13 +1487,13 @@ else
       if [ "$GRID_HOOK_OK" -eq 1 ]; then
         if [ -f "$REPO_WT/$TEST_FILE" ]; then
           BASE_PROBE_RESULT=$(run_pytest \
-            "base-grid-probe" "$SHAPE_ENV=__VALIDATOR_INVALID_GRID__")
+            "base-grid-probe" "__VALIDATOR_INVALID_GRID__")
           BASE_PROBE_RC=${BASE_PROBE_RESULT%%|*}
           BASE_PROBE_LOG=${BASE_PROBE_RESULT##*|}
           if [ "$BASE_PROBE_RC" -eq 0 ]; then
             BASE_GRID_STATE="hook-not-consumed"
           else
-            BASE_GRID_RESULT=$(run_pytest "base-grid" "$SHAPE_ENV=$GRID")
+            BASE_GRID_RESULT=$(run_pytest "base-grid" "$GRID")
             BASE_GRID_RC=${BASE_GRID_RESULT%%|*}
             BASE_GRID_LOG=${BASE_GRID_RESULT##*|}
             BASE_GRID_STATS=$(target_stats "base-grid" "$BASE_GRID_RC")
@@ -1471,7 +1507,7 @@ else
         else
           BASE_GRID_STATE="target-not-present"
         fi
-      elif [ -n "$SHAPE_ENV" ] && [ -n "$GRID" ]; then
+      elif [ "$GRID_REQUESTED" -eq 1 ]; then
         BASE_GRID_STATE="hook-not-found"
       else
         BASE_GRID_STATE="not-configured"
@@ -1611,20 +1647,20 @@ PY
 
     if [ "$GRID_HOOK_OK" -eq 1 ]; then
       HEAD_PROBE_RESULT=$(run_pytest \
-        "head-grid-probe" "$SHAPE_ENV=__VALIDATOR_INVALID_GRID__")
+        "head-grid-probe" "__VALIDATOR_INVALID_GRID__")
       HEAD_PROBE_RC=${HEAD_PROBE_RESULT%%|*}
       HEAD_PROBE_LOG=${HEAD_PROBE_RESULT##*|}
       if [ "$HEAD_PROBE_RC" -eq 0 ]; then
         stage_note "correctness_s1_grid" "skip" \
-          "target ignores the shape environment variable at runtime"
+          "target ignores $GRID_CHANNEL at runtime"
         stage_note "execution_receipt" "skip" \
-          "shape environment runtime handshake failed"
+          "shape-grid runtime handshake failed on $GRID_CHANNEL"
         jset_json "stages.correctness_s1_grid.hook_probe_exit" "$HEAD_PROBE_RC"
         jset_string "stages.correctness_s1_grid.hook_probe_log" "$HEAD_PROBE_LOG"
         finding "note" "correctness" \
           "the selected target passes an invalid shape-grid probe, so grid consumption is unproven"
       else
-        HEAD_GRID_RESULT=$(run_pytest "head-grid" "$SHAPE_ENV=$GRID")
+        HEAD_GRID_RESULT=$(run_pytest "head-grid" "$GRID")
         HEAD_GRID_RC=${HEAD_GRID_RESULT%%|*}
         HEAD_GRID_LOG=${HEAD_GRID_RESULT##*|}
         HEAD_GRID_STATS=$(target_stats "head-grid" "$HEAD_GRID_RC")
@@ -1691,31 +1727,27 @@ PY
             "route/shape execution receipt was not established; PASS is not permitted"
         fi
       fi
-    elif [ -n "$SHAPE_ENV" ] && [ -n "$GRID" ]; then
-      stage_note "correctness_s1_grid" "skip" \
-        "configured shape environment variable is not referenced by the target"
-      if [ -n "$EXPECTED_ROUTE" ] && [ -f "$WORK/head/execution-receipt.json" ]; then
-        RECEIPT_JSON=$(
-          python3 "$SCRIPT_DIR/validate_evidence.py" receipt \
-            "$WORK/head/execution-receipt.json" \
-            --expected-route "$EXPECTED_ROUTE" --grid ""
-        )
-        jset_json "stages.execution_receipt" "$RECEIPT_JSON"
-        RECEIPT_STATUS=$(python3 -c \
-          'import json,sys; print(json.loads(sys.argv[1])["status"])' "$RECEIPT_JSON")
-        if [ "$RECEIPT_STATUS" != "pass" ]; then
-          finding "note" "execution_receipt" \
-            "route execution receipt was not established; PASS is not permitted"
-        fi
-      else
-        stage_note "execution_receipt" "skip" \
-          "shape-grid hook was not established and no route was supplied"
-      fi
-      finding "note" "correctness" \
-        "the selected target does not consume the configured shape-grid hook"
     else
-      stage_note "correctness_s1_grid" "skip" \
-        "kernel exposes no configured shape override; coverage is repo-default-only"
+      # One grid-less path, two reasons the report must not conflate: a named channel the
+      # target does not expose is a fact about the target, while no channel at all is a fact
+      # about the request. Reporting the first as the second told a reader "no grid was
+      # configured" about a run that configured one and failed to find the hook.
+      if [ "$GRID_REQUESTED" -eq 1 ]; then
+        if [ "$GRID_CHANNEL_KIND" = "cli-flag-unusable" ]; then
+          GRID_SKIP="the configured shape-grid channel cannot reach this target: $GRID_CHANNEL"
+        else
+          GRID_SKIP="the configured shape-grid channel is not referenced by the target: $GRID_CHANNEL"
+        fi
+        RECEIPT_SKIP="shape-grid hook was not established and no route was supplied"
+        GRID_FINDING="the selected target does not consume the configured shape-grid hook"
+      else
+        GRID_SKIP="kernel exposes no configured shape override; coverage is repo-default-only"
+        RECEIPT_SKIP="no shape grid was configured and no route was supplied"
+        GRID_FINDING="no independent shape-grid hook was configured; coverage is limited to repository defaults"
+      fi
+      stage_note "correctness_s1_grid" "skip" "$GRID_SKIP"
+      # The receipt is validated either way. It was already collected, and with no grid it
+      # asserts route execution and nothing about shapes -- all it is then entitled to claim.
       if [ -n "$EXPECTED_ROUTE" ] && [ -f "$WORK/head/execution-receipt.json" ]; then
         RECEIPT_JSON=$(
           python3 "$SCRIPT_DIR/validate_evidence.py" receipt \
@@ -1730,11 +1762,9 @@ PY
             "route execution receipt was not established; PASS is not permitted"
         fi
       else
-        stage_note "execution_receipt" "skip" \
-          "no shape grid was configured and no route was supplied"
+        stage_note "execution_receipt" "skip" "$RECEIPT_SKIP"
       fi
-      finding "note" "correctness" \
-        "no independent shape-grid hook was configured; coverage is limited to repository defaults"
+      finding "note" "correctness" "$GRID_FINDING"
     fi
   else
     stage_note "correctness_repo_tests" "skip" \

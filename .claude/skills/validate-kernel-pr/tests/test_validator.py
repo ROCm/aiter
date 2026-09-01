@@ -33,10 +33,10 @@ REQUIRED_STAGES = {
 # Stages that may be absent without making a report incomplete. `perf` runs only when the
 # target exposes a benchmark harness and both phases completed, so its presence is a
 # property of the PR under test rather than of the validator. Asserting an exact stage set
-# would turn every optional stage into a failure in all 25 tests; asserting a subset plus
-# this allowlist keeps the real intent -- every required stage present and well-formed, and
-# nothing unrecognised sitting alongside them.
-OPTIONAL_STAGES = {"perf", "claims"}
+# would turn every optional stage into a failure in every test in this file; asserting a
+# subset plus this allowlist keeps the real intent -- every required stage present and
+# well-formed, and nothing unrecognised sitting alongside them.
+OPTIONAL_STAGES = {"perf"}
 
 
 def assert_stage_set(stages):
@@ -279,6 +279,8 @@ class ValidatorFixture:
         grid_value="7,257,f32",
         python_bin=None,
         perf=True,
+        shape_env="VALIDATOR_TEST_GRID",
+        shape_arg=None,
     ):
         report = self.root / f"{patch.stem}-report.json"
         command = [
@@ -303,14 +305,11 @@ class ValidatorFixture:
             str(report),
         ]
         if grid:
-            command.extend(
-                [
-                    "--shape-env",
-                    "VALIDATOR_TEST_GRID",
-                    "--grid",
-                    grid_value,
-                ]
-            )
+            command.extend(["--grid", grid_value])
+            if shape_env:
+                command.extend(["--shape-env", shape_env])
+        if shape_arg:
+            command.extend(["--shape-arg", shape_arg])
         if not perf:
             command.append("--no-perf")
         environment = os.environ.copy()
@@ -488,6 +487,43 @@ class ValidateKernelPrTests(unittest.TestCase):
             "script-exit-zero-with-output",
             report["arch_coverage_basis"]["gfx-test"],
         )
+
+    def test_unfound_shape_arg_reports_a_missing_hook_not_an_absent_grid(self):
+        # A --shape-arg naming a flag the target does not accept used to reach the branch that
+        # says "no shape grid was configured" -- a fact about the caller, when what happened is
+        # a fact about the target. Both skip, so only the reason distinguishes a validator that
+        # could not find the hook from a caller that never asked for one, and that reason is
+        # the whole point of a stage that reports its own limits.
+        def add_script_target(repo):
+            (repo / "tests" / "verify_kernel.py").write_text(
+                "def verify_kernel():\n"
+                "    return True\n"
+                "\n"
+                "if __name__ == '__main__':\n"
+                "    assert verify_kernel()\n"
+                "    print('56/56 cases passed')\n"
+            )
+
+        patch = self.fixture.make_patch(add_script_target, "unfound-shape-arg.patch")
+        _, report = self.fixture.validate(
+            patch,
+            tests="tests/verify_kernel.py",
+            shape_env=None,
+            shape_arg="--shapes",
+        )
+
+        # Asserted before the grid_channel field below, so that this test fails on the reason
+        # the skip gives rather than on the field that was added to carry it.
+        self.assertEqual("skip", report["stages"]["correctness_s1_grid"]["status"])
+        note = report["stages"]["correctness_s1_grid"]["note"]
+        self.assertNotIn("no configured shape override", note)
+        self.assertIn("not referenced", note)
+        self.assertIn("--shapes", note)
+        self.assertEqual(
+            "hook-not-found",
+            report["stages"]["baseline_control"]["s1_grid"]["state"],
+        )
+        self.assertEqual("cli-flag", report["test_selection"]["grid_channel"])
 
     def test_script_only_target_failure_is_blocking(self):
         def add_failing_script(repo):
