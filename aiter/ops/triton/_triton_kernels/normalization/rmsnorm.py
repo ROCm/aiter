@@ -419,6 +419,7 @@ _fused_add_rmsnorm_kernel_repr = make_kernel_repr(
     [
         "BLOCK_SIZE",
         "USE_BLOCKED",
+        "NUM_PRGMS",
     ],
 )
 
