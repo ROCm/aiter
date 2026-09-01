@@ -60,3 +60,66 @@ OPUS_BMM_BPRESHUF_INST(opus_bmm_a8w8_mxscale_bpreshuffle_tile_sfa_tdm32_gfx1250)
 OPUS_BMM_BPRESHUF_INST(opus_bmm_a8w8_mxscale_bpreshuffle_tile_sfa_tdm128_gfx1250);
 
 #undef OPUS_BMM_BPRESHUF_INST
+
+// ===========================================================================
+// CLUSTER-LAUNCH, FUSED SPLIT-K instantiations.
+// ===========================================================================
+// Kernel:  gemm_a8w8_mxscale_bpreshuffle_clusterclaunch_kernel_gfx1250
+// Frontend: opus_bmm_a8w8_mxscale_bpreshuffle_clusterclaunch() in opus_bmm.cu
+//
+// THIS IS THE LIST TO EDIT to give a tile the cluster path. Each tile listed
+// here costs |splitK| x |mClusterWg| x 2 dtypes kernels and roughly 2.6 s of
+// build each, which is why the set is deliberately small rather than mirroring
+// all 15 kids of the non-cluster entry point. Adding a tile means: one line
+// here, one case in the opus_bmm.cu switch, and its id in that function's
+// kernelId AITER_CHECK.
+//
+// DataWs follows the C dtype (bf16 C -> bf16 partials, fp32 C -> fp32), which
+// is the frontend's convention -- see the comment on OPUS_BMM_CC_LAUNCH_ONE.
+// Instantiating a bf16-C / fp32-ws mix would be legal but nothing dispatches to
+// it, so it is left out rather than built and never called.
+#include "gfx1250/opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_clusterclaunch_gfx1250.cuh"
+
+// DataWs is fp32_t for BOTH C dtypes, not DC. See the measurement note on
+// OPUS_BMM_CC_LAUNCH_ONE in opus_bmm.cu: bf16 partials put 0.05%-1.3% of cells
+// outside the project's atol gate at splitK>1 through cancellation, while fp32
+// partials are bit-exact. The two sites must agree -- the launcher validates the
+// workspace in bytes against sizeof(DataWs).
+#define OPUS_BMM_BPRESHUF_CC_ONE(TILE, DC, SK, MC)                            \
+    template __global__ void                                                  \
+    gemm_a8w8_mxscale_bpreshuffle_clusterclaunch_kernel_gfx1250<              \
+        TILE<DC>, SK, fp32_t, MC, DC>(opus_gemm_cluster_claunch_kargs_gfx1250)
+
+// splitK 1/2/4/8 at one mClusterWg, both C dtypes.
+#define OPUS_BMM_BPRESHUF_CC_SK(TILE, MC)          \
+    OPUS_BMM_BPRESHUF_CC_ONE(TILE, bf16_t, 1, MC); \
+    OPUS_BMM_BPRESHUF_CC_ONE(TILE, fp32_t, 1, MC); \
+    OPUS_BMM_BPRESHUF_CC_ONE(TILE, bf16_t, 2, MC); \
+    OPUS_BMM_BPRESHUF_CC_ONE(TILE, fp32_t, 2, MC); \
+    OPUS_BMM_BPRESHUF_CC_ONE(TILE, bf16_t, 4, MC); \
+    OPUS_BMM_BPRESHUF_CC_ONE(TILE, fp32_t, 4, MC); \
+    OPUS_BMM_BPRESHUF_CC_ONE(TILE, bf16_t, 8, MC); \
+    OPUS_BMM_BPRESHUF_CC_ONE(TILE, fp32_t, 8, MC)
+
+// PREFILL tiles get mClusterWg 1 and 2: B_M=128, so a real prefill M has more
+// than one M-tile and the B multicast has peers to reach.
+#define OPUS_BMM_BPRESHUF_CC_INST_PREFILL(TILE) \
+    OPUS_BMM_BPRESHUF_CC_SK(TILE, 1);           \
+    OPUS_BMM_BPRESHUF_CC_SK(TILE, 2)
+
+// DECODE tiles get mClusterWg 1 only: B_M=16 and m <= 16 at every shape these
+// exist for, so ceil(M/B_M) is 1 and a second peer would be an out-of-range
+// workgroup with nothing to multicast to. The frontend rejects mClusterWg>1 for
+// these ids, so the missing instantiations are unreachable, not a latent gap.
+#define OPUS_BMM_BPRESHUF_CC_INST_DECODE(TILE) \
+    OPUS_BMM_BPRESHUF_CC_SK(TILE, 1)
+
+OPUS_BMM_BPRESHUF_CC_INST_PREFILL(opus_bmm_a8w8_mxscale_bpreshuffle_tile_gfx1250);
+OPUS_BMM_BPRESHUF_CC_INST_PREFILL(opus_bmm_a8w8_mxscale_bpreshuffle_tile_sfa_gfx1250);
+OPUS_BMM_BPRESHUF_CC_INST_DECODE(opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n32_gfx1250);
+OPUS_BMM_BPRESHUF_CC_INST_DECODE(opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n64_w6_gfx1250);
+
+#undef OPUS_BMM_BPRESHUF_CC_INST_DECODE
+#undef OPUS_BMM_BPRESHUF_CC_INST_PREFILL
+#undef OPUS_BMM_BPRESHUF_CC_SK
+#undef OPUS_BMM_BPRESHUF_CC_ONE

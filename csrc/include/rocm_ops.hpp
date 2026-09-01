@@ -326,6 +326,30 @@ namespace py = pybind11;
           py::arg("w_scale"), \
           py::arg("splitK") = 1, \
           py::arg("kernelId") = 0);
+#define OPUS_BMM_A8W8_MXSCALE_BPRESHUFFLE_CLUSTERCLAUNCH_PYBIND \
+    m.def("opus_bmm_a8w8_mxscale_bpreshuffle_clusterclaunch", \
+          &opus_bmm_a8w8_mxscale_bpreshuffle_clusterclaunch, \
+          "gfx1250 fp8 e8m0 mxscale BMM, cluster-launch fused split-K; " \
+          "pass an EMPTY tensor for ws (splitK==1) or bias (no bias)", \
+          py::arg("O"), \
+          py::arg("wo_a"), \
+          py::arg("Y"), \
+          py::arg("x_scale"), \
+          py::arg("w_scale"), \
+          py::arg("ws"), \
+          py::arg("bias"), \
+          py::arg("splitK") = 1, \
+          py::arg("mClusterWg") = 1, \
+          py::arg("kernelId") = 0); \
+    m.def("opus_bmm_a8w8_mxscale_bpreshuffle_clusterclaunch_ws_numel", \
+          &opus_bmm_a8w8_mxscale_bpreshuffle_clusterclaunch_ws_numel, \
+          "elements the ws tensor must hold (0 when splitK<=1); allocate it " \
+          "with Y's dtype", \
+          py::arg("m"), \
+          py::arg("n"), \
+          py::arg("batch"), \
+          py::arg("splitK"), \
+          py::arg("kernelId") = 0);
 #define OPUS_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_TUNE_PYBIND \
     m.def("opus_gemm_a8w8_blockscale_bpreshuffle_tune",   \
           &opus_gemm_a8w8_blockscale_bpreshuffle_tune,    \

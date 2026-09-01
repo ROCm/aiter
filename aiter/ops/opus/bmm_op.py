@@ -49,6 +49,99 @@ def _opus_bmm_a8w8_mxscale_bpreshuffle_raw(
 ) -> None: ...
 
 
+def _gen_bmm_a8w8_cc_fake_tensors(
+    x: torch.Tensor,
+    wo_a: torch.Tensor,
+    Y: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    ws: torch.Tensor,
+    bias: torch.Tensor,
+    splitK: int = 1,
+    mClusterWg: int = 1,
+    kernelId: int = 0,
+) -> None:
+    # Mutates Y (and scribbles on ws); mirrors the void C++ op so torch.compile
+    # registers a mutating op rather than a tensor-producing one.
+    return None
+
+
+# Cluster-launch, fused split-K sibling of the bpreshuffle binding above.
+#
+# ws / bias are NOT optional at the binding level -- pass an EMPTY tensor for
+# "absent", which is what the C++ side tests for. An Optional[Tensor] would have
+# to survive the compile_ops signature and the fake-tensor path, and an empty
+# tensor costs nothing and cannot be None-dereferenced by accident.
+#
+# Size ws with opus_bmm_a8w8_mxscale_bpreshuffle_clusterclaunch_ws_numel (see
+# bmm_a8w8_mxscale_bpreshuffle_cc_ws below) and allocate it with Y's dtype.
+@compile_ops(
+    "module_deepgemm_opus",
+    fc_name="opus_bmm_a8w8_mxscale_bpreshuffle_clusterclaunch",
+    gen_fake=_gen_bmm_a8w8_cc_fake_tensors,
+    develop=True,
+)
+def _opus_bmm_a8w8_mxscale_bpreshuffle_clusterclaunch_raw(
+    x: torch.Tensor,
+    wo_a: torch.Tensor,
+    Y: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    ws: torch.Tensor,
+    bias: torch.Tensor,
+    splitK: int = 1,
+    mClusterWg: int = 1,
+    kernelId: int = 0,
+) -> None: ...
+
+
+@compile_ops(
+    "module_deepgemm_opus",
+    fc_name="opus_bmm_a8w8_mxscale_bpreshuffle_clusterclaunch_ws_numel",
+    develop=True,
+)
+def _opus_bmm_a8w8_mxscale_bpreshuffle_cc_ws_numel(
+    m: int,
+    n: int,
+    batch: int,
+    splitK: int,
+    kernelId: int = 0,
+) -> int: ...
+
+
+def bmm_a8w8_mxscale_bpreshuffle_cc_ws(
+    m: int,
+    n: int,
+    batch: int,
+    splitK: int,
+    kernelId: int = 0,
+    dtype: torch.dtype = torch.float32,
+    device: str = "cuda",
+) -> torch.Tensor:
+    """Allocate the partial workspace the cluster-launch split-K path needs.
+
+    The size comes from the C++ side (which owns the tile's B_M/B_N) rather than
+    from a table repeated here: the launcher re-checks the byte count and throws
+    on a shortfall, so a duplicated formula would turn a tile change into a
+    launch error instead of just working.
+
+    ``dtype`` must be float32 regardless of Y's dtype: the kernel stores partials
+    as fp32 for BOTH C dtypes. bf16 partials were measured to push 0.05%-1.3% of
+    cells outside the atol=0.5 gate at splitK>1 (cancellation amplifies the
+    per-partial rounding), so the extra workspace bytes buy real accuracy. A
+    bf16 buffer here is half the required BYTES and the launcher will reject it.
+
+    Returns an EMPTY tensor for splitK <= 1, which is exactly what the raw
+    binding reads as "no workspace".
+    """
+    numel = int(
+        _opus_bmm_a8w8_mxscale_bpreshuffle_cc_ws_numel(
+            int(m), int(n), int(batch), int(splitK), int(kernelId)
+        )
+    )
+    return torch.empty(numel, dtype=dtype, device=device)
+
+
 @compile_ops(
     "module_deepgemm_opus",
     fc_name="opus_bmm_a8w8_mxscale",
@@ -187,7 +280,9 @@ def bmm_a8w8_mxscale_opus(
 
 
 __all__ = [
+    "_opus_bmm_a8w8_mxscale_bpreshuffle_clusterclaunch_raw",
     "_opus_bmm_a8w8_mxscale_bpreshuffle_raw",
     "_opus_bmm_a8w8_mxscale_raw",
+    "bmm_a8w8_mxscale_bpreshuffle_cc_ws",
     "bmm_a8w8_mxscale_opus",
 ]

@@ -67,7 +67,63 @@ struct opus_bmm_a8w8_mxscale_kargs_gfx1250 {
     int stride_sfb_batch;
 };
 #endif
-
+#ifndef OPUS_BMM_A8W8_MXSCALE_CLUSTER_CLAUNCH_KARGS_GFX1250_DEFINED
+#define OPUS_BMM_A8W8_MXSCALE_CLUSTER_CLAUNCH_KARGS_GFX1250_DEFINED
+// Kernel arguments for the CLUSTER-LAUNCH, FUSED SPLIT-K variant of the BMM
+// above (opus_gemm_pipeline_a8w8_mxscale_bpreshuffle_clusterclaunch_gfx1250).
+//
+// NAME. This is deliberately NOT opus_gemm_splitk_fuse_kargs_gfx1250: the
+// a16w16 traits header defines a struct by that name with a DIFFERENT layout
+// (no scale pointers, no batch). The two headers have independent include
+// guards, so a translation unit that pulled in both would hit a redefinition --
+// and a TU that saw only one of them would silently agree on the wrong field
+// offsets. One name per layout.
+//
+// Everything the non-split kargs carries, plus the four things the fused
+// split-K epilogue needs:
+//   ptr_ws    -- DataWs partial workspace, tile-major / split-minor:
+//                  partial `s` of tile (gm, gn) of batch `b` lives at
+//                    ((b*num_tiles_m + gm)*num_tiles_n + gn)*(SplitK-1) + s
+//                  tiles of B_M*B_N DataWs elements each. Allocated by the
+//                  caller (torch.empty); see the launcher's ws_elems helper.
+//                  May be null when SplitK == 1, which stores nothing.
+//   ptr_bias  -- bf16 [N] or null. Folded ONCE, by the last split, into its own
+//                fp32 partial -- never into a workspace partial, or SplitK
+//                copies of it would survive the reduce.
+//   num_tiles_m / num_tiles_n
+//             -- ceil(M/B_M) / ceil(N/B_N). The kernel needs them to address
+//                the workspace; it cannot derive them, because the grid is
+//                rounded UP to a whole cluster in the M direction and gridDim
+//                therefore over-counts the M tiles.
+struct opus_gemm_cluster_claunch_kargs_gfx1250
+{
+    const void* __restrict__ ptr_a;     // fp8   O    [M, batch, K]
+    const void* __restrict__ ptr_b;     // fp8   wo_a [batch, N, K], PRESHUFFLED
+    void*       __restrict__ ptr_c;     // D_OUT Y    [M, batch, N] (last split writes)
+    const void* __restrict__ ptr_sfa;   // e8m0
+    const void* __restrict__ ptr_sfb;   // e8m0
+    void*       __restrict__ ptr_ws;    // DataWs partial workspace (null iff SplitK==1)
+    const void* __restrict__ ptr_bias;  // bf16 [N] or null
+    int m;
+    int n;
+    int k;
+    int batch;
+    int split_k;                        // == compile-time SplitK (host cross-check)
+    int stride_a;                       // A row pitch (elements)
+    int stride_b;                       // B row pitch of the UNSHUFFLED weight (= K)
+    int stride_c;                       // C row pitch (elements)
+    int stride_a_batch;
+    int stride_b_batch;
+    int stride_c_batch;
+    int stride_sfa;                     // A scale row pitch (e8m0 bytes)
+    int stride_sfb;                     // B scale row pitch (e8m0 bytes)
+    int stride_sfa_batch;
+    int stride_sfb_batch;
+    int stride_bias_batch;              // 0 (one [N] bias broadcast over batch) or n
+    int num_tiles_m;                    // ceil(M / B_M)
+    int num_tiles_n;                    // ceil(N / B_N)
+};
+#endif
 // -- traits ----------------------------------------------------------------
 // GROUP_K_ = the K extent one e8m0 scale covers:
 //   32  -> MX (one scale per 32 K elements; a WMMA's K=128 needs 4 bytes)

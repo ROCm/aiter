@@ -5,10 +5,41 @@
 //
 //   Y[M, batch, N] = O[M, batch, K] @ wo_a[batch, N, K]^T
 //
-// This file is a SCAFFOLD. The data movement is complete and is a direct port of
-// opus_gemm_pipeline_a16w16_cluster_tdm_splitk_ws_gfx1250.cuh (same 4-wave shape,
-// same per-slot named-barrier protocol, same TDM run-ahead). What is left for you
-// is marked `TODO(kernel)` and is exactly three things:
+// CLUSTER-LAUNCH, FUSED SPLIT-K variant: split-K reduce happens INSIDE this one
+// kernel, with no separate reduce launch and no semaphore.
+//
+// DESIGN
+//   * cluster = __cluster_dims__(SplitK, MClusterWg, 1); grid, in workgroups,
+//       = ( SplitK, round_up(num_tiles_m, MClusterWg), num_tiles_n * batch ).
+//     cluster.x is the k-slice; cluster.y folds MClusterWg ADJACENT M-TILES so
+//     those peers, which share one N-tile and one batch, can TDM-MULTICAST the B
+//     (weight) block -- one global read fans out into all their LDS. Folding M
+//     and multicasting B is the mirror image of the a16w16 splitk_fuse kernel
+//     (which folds N and multicasts A) and is the right way round for a BMM:
+//     the weight is the larger read at decode-ish M, and it also keeps a whole
+//     peer group inside one batch, which the multicast requires.
+//   * Cross-WG split-K sync is a CLUSTER BARRIER (-3), not a semaphore: all
+//     splits of a tile co-reside, so the barrier alone orders every non-last
+//     partial's store before the last WG's read. Deterministic -- no atomics,
+//     bit-identical run to run.
+//   * The K tiles are split BALANCED across the SplitK WGs (the first k_rem
+//     splits take one extra), never ceil-front-loaded, so no split is empty.
+//   * Each NON-LAST split casts its fp32 partial to DataWs and stores it with
+//     gfx12 CPOL TH_WB|SCOPE_DEV so it stays dirty-resident in GL2 and the
+//     reduce read hits L2, not HBM. Workspace layout is tile-major/split-minor:
+//       ((batch*num_tiles_m + gm)*num_tiles_n + gn)*(SplitK-1) + s
+//     tiles of B_M*B_N DataWs elements. The LAST split keeps its own partial in
+//     fp32 registers, folds bias into it, then sums the SplitK-1 published
+//     partials and casts to D_OUT once at the C store.
+//   * Partials use a PRIVATE lane-contiguous scratch layout, not the C fragment
+//     map -- nothing outside this kernel reads them, so the store and reduce need
+//     only agree with each other, and being contiguous per lane makes both sides
+//     16B dwordx4. This is why an unverified C map (below) does not endanger the
+//     split-K plumbing.
+//
+// STILL A SCAFFOLD IN ONE RESPECT. The data movement, the scale path and the
+// whole split-K epilogue are complete, but two fragment maps are still inferred
+// rather than measured, and they are marked `TODO(kernel)`:
 //
 //   1. frag_a / frag_b   -- the LDS -> VGPR fragment maps. The A one is a guess at
 //                           the wave32 WMMA operand layout; the B one additionally
@@ -25,23 +56,33 @@
 //                           earlier round of measurement got the sign wrong.
 //                           The older per-slot T::kSfPanel scaffold is unused
 //                           and hardwired false.
+//                           NOTE for split-K: both panels cover the tile's WHOLE
+//                           K range on EVERY split, so each split redundantly
+//                           fills bytes it will not read. That is deliberate --
+//                           it keeps the panel index absolute, which is why
+//                           consume_slot below takes an ABSOLUTE k_step.
 //   3. store_c           -- the C fragment map, same UNVERIFIED caveat as (1).
 //
-// HOW TO VERIFY (1) AND (3) BEFORE TRUSTING ANY NUMBER. These three maps are the
-// only places this kernel can be wrong while still producing plausible output, so
+// HOW TO VERIFY (1) AND (3) BEFORE TRUSTING ANY NUMBER. These maps are the only
+// places this kernel can be wrong while still producing plausible output, so
 // do not infer them -- measure them. Launch one workgroup on M=N=16, K=128 with
 // A[m][k] = m*128+k, B = identity in the shuffled layout, all scales 0x7F, and
 // print (lane, i) -> value. Anything that disagrees with the constants below is
-// the hardware telling you the layout, and the layout wins.
+// the hardware telling you the layout, and the layout wins. Run the probe at
+// SplitK=1: it isolates the maps from the reduce.
 //
 // The wave split is w0 = A producer, w1 = B producer, and every wave from
-// kNumProducerWaves up is a WMMA consumer. The wave count follows BLOCK_SIZE and
-// is not assumed to be 4 anywhere below: the barrier member counts are expressed
-// in kNumWaves / kNumConsumerWaves and the consumer's wave_m/wave_n come from
-// kTileM/kTileN, which the traits derive from kNumConsumerWaves. See the
-// kNumWaves block in the traits header for why going past 4 waves matters.
-// Every compile-time value comes from the traits header; this file declares no
-// geometry of its own.
+// kNumProducerWaves up is a WMMA consumer. NO WAVE RETURNS EARLY -- unlike the
+// non-cluster sibling, the producers fall through to the cluster barrier, and
+// producer w0 stages the reduce after it. An early return anywhere takes its
+// cluster's barrier quorum with it and hangs the launch.
+//
+// The wave count follows BLOCK_SIZE and is not assumed to be 4 anywhere below:
+// the barrier member counts are expressed in kNumWaves / kNumConsumerWaves and
+// the consumer's wave_m/wave_n come from kTileM/kTileN, which the traits derive
+// from kNumConsumerWaves. See the kNumWaves block in the traits header for why
+// going past 4 waves matters. Every compile-time value comes from the traits
+// header; this file declares no geometry of its own.
 #pragma once
 
 #include "opus_bmm_traits_a8w8_mxscale_bpreshuffle_gfx1250.cuh"
@@ -64,21 +105,65 @@ __host__ __device__ constexpr inline int opus_bmm_mx_min_i(int a, int b) {
 }
 #endif  // OPUS_BMM_MX_SCALAR_HELPERS_DEFINED
 
+// Depth of the last-split reduce LDS ring: how many published partial tiles are
+// staged at once when they do not all fit. Deliberately NOT named
+// kFuseReduceRing -- the a16w16 splitk_fuse header defines a namespace-scope
+// `static constexpr int kFuseReduceRing` with internal linkage, so a TU that
+// included both would hit a redefinition, not a merge.
+static constexpr int kBmmFuseReduceRing = 3;
+
+// gfx12 CPOL for the partial store: TH_WB(3) | SCOPE_DEV(2 << 3) = 19. Keeps the
+// partial dirty-resident in GL2 instead of write-rinsing it to HBM, published at
+// device scope. Same value and same reasoning as the a16w16 sibling's
+// OPUS_SKFUSE_WS_CPOL; separately named so the two can be overridden apart.
+#ifndef OPUS_BMM_MXSK_WS_CPOL
+#define OPUS_BMM_MXSK_WS_CPOL (/*TH_WB*/ 3 | (/*SCOPE_DEV*/ 2 << 3))
+#endif
+
 // launch_bounds comes from the traits, not a literal: the host launcher already
 // sizes the block as dim3(T::BLOCK_SIZE), so a hardcoded bound here is a silent
 // mismatch the moment a tile picks a wave count other than 4 (the register
 // allocator would be budgeting for 128 threads while 192 launch).
-template <typename UserTraits>
+template <typename UserTraits, int SplitK, typename DataWs, int MClusterWg, typename D_OUT>
 __global__ __launch_bounds__(opus::remove_cvref_t<UserTraits>::BLOCK_SIZE, 1)
-void bmm_a8w8_mxscale_bpreshuffle_kernel_gfx1250(opus_bmm_a8w8_mxscale_kargs_gfx1250 kargs) {
+#if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
+    __cluster_dims__(SplitK, MClusterWg, 1)
+#endif
+    void gemm_a8w8_mxscale_bpreshuffle_clusterclaunch_kernel_gfx1250(
+        opus_gemm_cluster_claunch_kargs_gfx1250 kargs)
+{
+    // TWO independent limits, and the second is not implied by the first:
+    //   * the cluster holds at most 16 workgroups  -> the PRODUCT is <= 16;
+    //   * each __cluster_dims__ field is 4 bits    -> each DIMENSION is <= 15.
+    // A 16x1 cluster satisfies the product budget and still fails to encode
+    // ("integer constant expression evaluates to value 16 that cannot be
+    // represented in a 4-bit unsigned integer type"), so spell the per-dimension
+    // bound out here rather than leaving that error to explain itself. Use 8x2
+    // or 4x4 when you want all 16 workgroups.
+    static_assert(SplitK >= 1 && MClusterWg >= 1, "cluster dimensions must be >= 1");
+    static_assert(SplitK <= 15 && MClusterWg <= 15,
+                  "each __cluster_dims__ dimension is a 4-bit field, so SplitK and "
+                  "MClusterWg must each be <= 15 (a 16-WG cluster must be 8x2 or 4x4)");
+    static_assert(SplitK * MClusterWg <= 16, "cluster WG count (SplitK*MClusterWg) must be <= 16");
 #ifdef __HIP_DEVICE_COMPILE__
 #if defined(__gfx1250__)
+    // remove_cvref_t<UserTraits>, NOT ::T -- UserTraits IS the traits struct
+    // (the launcher instantiates opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250
+    // directly), and there is no wrapper with a nested ::T to unwrap.
     using T       = remove_cvref_t<UserTraits>;
     using DataA   = typename T::DataA;
     using DataB   = typename T::DataB;
-    using DataC   = typename T::DataC;
-    using DataAcc = typename T::DataAcc;
+    using DataC   = typename T::DataC;    // traits' declared C dtype
+    using DataAcc = typename T::DataAcc;  // fp32: WMMA acc AND the reduce acc
     using DataSf  = typename T::DataSf;
+    // DataWs and D_OUT are template parameters and are already in scope; a
+    // `using DataWs = DataWs;` would be a self-referential (ill-formed) typedef,
+    // not a re-export.
+    // D_OUT, not DataC, is what the C store writes: the traits' D_C fixes a tile
+    // alias's nominal output dtype, but the fused epilogue keeps its accumulator
+    // in fp32 all the way to the store and casts ONCE, so the caller is free to
+    // ask for fp32 C from a bf16-C tile alias. DataC survives only as the
+    // documented default the launcher hands to D_OUT.
     DECLARE_NAMED_BARRIERS();   // __nbar_1..__nbar_15; we use 1..3*kNumSlots <= 9
 
     // -- named-barrier helpers (compile-time ids) ---------------------------
@@ -135,22 +220,85 @@ void bmm_a8w8_mxscale_bpreshuffle_kernel_gfx1250(opus_bmm_a8w8_mxscale_kargs_gfx
     const int lane_id     = (int)opus::lane_id();
     const bool is_producer = wave_id < T::kNumProducerWaves;
 
-    // -- tile / batch coordinates -------------------------------------------
-    // grid = (M/B_M, N/B_N, batch). Split-K is NOT wired in this scaffold: there
-    // is no fp32 workspace and no reduce kernel, so one WG owns the whole K range
-    // of its tile and stores C directly. Add them the way the a16w16 pipeline does
-    // (ptr_ws + a separate reduce launch) if you need it.
-    const int tile_row = (int)__builtin_amdgcn_workgroup_id_x() * T::kBlockM;
-    const int tile_col = (int)__builtin_amdgcn_workgroup_id_y() * T::kBlockN;
-    const int batch_id = (int)__builtin_amdgcn_workgroup_id_z();
+    // -- cluster / tile / batch coordinates ---------------------------------
+    // CLUSTER = __cluster_dims__(SplitK, MClusterWg, 1), so the launcher's grid,
+    // counted in WORKGROUPS, is
+    //     grid = ( SplitK,
+    //              round_up(num_tiles_m, MClusterWg),
+    //              num_tiles_n * batch )
+    // and the cluster-local ids decompose as
+    //     split_idx = cluster_workgroup_id_x()   0 .. SplitK-1
+    //     local_m   = cluster_workgroup_id_y()   0 .. MClusterWg-1
+    //     gm        = cluster_id_y()*MClusterWg + local_m     (M tile)
+    //     gn, batch = cluster_id_z() split by num_tiles_n     (N tile, batch)
+    //
+    // M-DIRECTION folding, not N. cluster.y groups MClusterWg ADJACENT M-TILES
+    // that share one N-tile and one batch, so the operand their peers hold in
+    // common is B -- the preshuffled weight block -- and B is the one that gets
+    // the TDM multicast below. That is the opposite assignment from the a16w16
+    // splitk_fuse kernel (which folds N and multicasts A), and it is the right
+    // way round HERE because this is a BMM whose A is the activation O[M,batch,K]
+    // and whose B is the weight wo_a[batch,N,K]: at decode-ish M the weight is by
+    // far the larger read, and folding M is also what lets a whole cluster stay
+    // inside one batch (a peer group must share ptr_b's batch slice or the
+    // multicast would fan one batch's weights into another's LDS).
+    //
+    // batch rides in cluster.z BELOW the N tile (gn fastest) so that the peers of
+    // a cluster -- which differ only in cluster.y -- always agree on both gn and
+    // batch. Putting batch in the fast position would still be correct but would
+    // scatter consecutive N tiles of one batch across distant clusters.
+    const int split_idx = (int)__builtin_amdgcn_cluster_workgroup_id_x();  // 0..SplitK-1
+    const int local_m   = (int)__builtin_amdgcn_cluster_workgroup_id_y();  // 0..MClusterWg-1
+    const int gm        = (int)__builtin_amdgcn_cluster_id_y() * MClusterWg + local_m;
+    const int gzn       = (int)__builtin_amdgcn_cluster_id_z();
+    const int gn        = gzn % kargs.num_tiles_n;
+    const int batch_id  = gzn / kargs.num_tiles_n;
+    const int tile_row  = gm * T::kBlockM;
+    const int tile_col  = gn * T::kBlockN;
+    const bool is_last  = (split_idx == SplitK - 1);
 
-    const int k_steps = opus_bmm_mx_ceil_div_i(kargs.k, T::kBlockK);
-    if (k_steps <= 0) return;
+    // B multicast mask: the MClusterWg M-peers at the SAME split (same k-slice)
+    // and the same (gn, batch) all read the identical B block, so one global
+    // fetch fans out into all their LDS. The flat cluster WG id is x-fastest
+    // (local_m*SplitK + split_idx), which is exactly the set peers_along_y names
+    // over cluster dims (SplitK, MClusterWg). MClusterWg==1 folds to mask 0
+    // (multicast off) inside the helper -- issuing a cluster-load from a
+    // one-WG peer group is what the fold exists to prevent.
+    const auto mask_b = opus::tdm_traits::peers_along_y<SplitK, MClusterWg>();
+
+    // A cluster is rounded UP to MClusterWg in M, so the last cluster can carry
+    // peers whose M tile does not exist. They must NOT return: every WG of the
+    // cluster has to reach the -3 barrier below or the ones that do hang. They
+    // run the whole pipeline against a fully out-of-range window (a zero-extent
+    // DMA that touches no memory), and their C store is dropped by the row guard.
+    const bool m_oob = (gm >= kargs.num_tiles_m);
+
+    // -- BALANCED split of the K tiles across the SplitK WGs ----------------
+    // Not ceil front-loading: that starves the trailing splits and can leave them
+    // with ZERO tiles, and a WG with no tiles still has to publish a (zero)
+    // partial and still has to reach the barrier. Here the first k_rem splits
+    // take one extra B_K tile, so every split gets >= 1 tile whenever
+    // SplitK <= k_steps_tot -- which the launcher enforces. The single partial
+    // B_K tile at the global K tail (K % B_K != 0) belongs to whichever split
+    // contains it and is clamped by the producer window's extent, so the tail is
+    // handled by TDM rather than by emptying a WG.
+    const int k_steps_tot = opus_bmm_mx_ceil_div_i(kargs.k, T::kBlockK);
+    const int k_base      = k_steps_tot / SplitK;
+    const int k_rem       = k_steps_tot - k_base * SplitK;   // k_steps_tot % SplitK
+    const int k_step_beg  = split_idx * k_base + opus_bmm_mx_min_i(split_idx, k_rem);
+    const int k_steps     = k_base + (split_idx < k_rem ? 1 : 0);
+
+    // The ONLY early return allowed before the cluster barrier is one every WG in
+    // the cluster takes together. k_steps_tot depends on nothing WG-local, so an
+    // empty K exits the whole cluster uniformly; a per-split `k_steps <= 0` test
+    // here would let some peers leave and hang the rest, which is why the
+    // balanced split above (not the guard) is what keeps splits non-empty.
+    if (k_steps_tot <= 0) return;
 
     // Per-batch bases. Strides are in elements of each tensor's own dtype.
     const DataA* ptr_a  = reinterpret_cast<const DataA*>(kargs.ptr_a)  + (size_t)batch_id * kargs.stride_a_batch;
     const DataB* ptr_b  = reinterpret_cast<const DataB*>(kargs.ptr_b)  + (size_t)batch_id * kargs.stride_b_batch;
-    DataC*       ptr_c  = reinterpret_cast<DataC*>(kargs.ptr_c)        + (size_t)batch_id * kargs.stride_c_batch;
+    D_OUT*       ptr_c  = reinterpret_cast<D_OUT*>(kargs.ptr_c)        + (size_t)batch_id * kargs.stride_c_batch;
     const DataSf* ptr_sfa = reinterpret_cast<const DataSf*>(kargs.ptr_sfa) + (size_t)batch_id * kargs.stride_sfa_batch;
     const DataSf* ptr_sfb = reinterpret_cast<const DataSf*>(kargs.ptr_sfb) + (size_t)batch_id * kargs.stride_sfb_batch;
 
@@ -302,6 +450,74 @@ void bmm_a8w8_mxscale_bpreshuffle_kernel_gfx1250(opus_bmm_a8w8_mxscale_kargs_gfx
     __builtin_amdgcn_s_barrier();
 
     // ---------------------------------------------------------------------
+    // Shared consumer geometry and the fp32 accumulator, HOISTED above the
+    // producer/consumer split because the fused epilogue below runs after the
+    // branches rejoin and both halves index into it: consumers own `acc`, and
+    // producer wave 0 owns the reduce staging that feeds it.
+    // ---------------------------------------------------------------------
+    // TileN: consumers split N (wave_n = wave_split, wave_m = 0).
+    // TileM: consumers split M (wave_m = wave_split, wave_n = 0).
+    // A producer has no C fragment; it is pinned to 0 rather than left negative
+    // so that the workspace offsets below stay in range for every wave, even
+    // where they are computed and then not used.
+    const int wave_split = is_producer ? 0 : (wave_id - T::kNumProducerWaves);
+    const int wave_m = (T::LAYOUT == opus_gfx1250_bmm::kLayoutTileM) ? wave_split : 0;
+    const int wave_n = (T::LAYOUT == opus_gfx1250_bmm::kLayoutTileM) ? 0 : wave_split;
+    // First C column this lane owns. Hoisted with wave_m/wave_n because BOTH
+    // post-rejoin users need it -- the bias fold and the C store -- and they sit
+    // on opposite sides of the consumer branch's closing brace.
+    const int col_base = tile_col + wave_n * (T::kExpN * T::kWmmaN) + (lane_id % T::kWmmaN);
+
+    using Mma = opus::wmma<DataA, DataB, DataAcc, T::kWmmaM, T::kWmmaN, T::kWmmaK>;
+    using FragA = opus::vector_t<opus::i32_t, 16>;   // 64 fp8 per lane
+    using FragB = opus::vector_t<opus::i32_t, 16>;
+    using FragC = typename Mma::vtype_c;             // 8 fp32 per lane
+    constexpr int kFragC = (int)opus::size<FragC>(); // 8
+
+    // fp32 all the way to the store: the last split keeps its OWN partial in
+    // fp32 (no DataWs round-trip) and sums the published ones into it, so the
+    // only rounding is the single cast at the C store. A DataWs accumulator
+    // would round once per partial.
+    FragC acc[T::kExpM][T::kExpN];
+    opus::static_for<T::kExpM>([&](auto im) __attribute__((always_inline)) {
+        opus::static_for<T::kExpN>([&](auto in) __attribute__((always_inline)) {
+            clear(acc[decltype(im)::value][decltype(in)::value]);
+        });
+    });
+
+    // -- workspace addressing ----------------------------------------------
+    // LANE-CONTIGUOUS scratch layout, NOT the (M,N) map the C store uses. The
+    // workspace is private to this kernel: nothing outside reads it, so the only
+    // requirement is that the store side and the reduce side agree. Giving each
+    // (wave_split, lane) a contiguous run makes both sides fully coalesced 16B
+    // dwordx4 traffic, which the real C fragment map (one element per lane along
+    // N, see store_c) could never be.
+    //
+    //   lane run   = kExpM * kExpN * kFragC elements at
+    //                (wave_split*kWarp + lane_id) * kPerLane
+    //   frag (im,in) occupies the kFragC elements at (im*kExpN + in)*kFragC
+    //
+    // The runs tile the B_M x B_N partial exactly:
+    //   kNumConsumerWaves * kWarp * kExpM*kExpN*kFragC
+    //     == (kTileM*kExpM*kWmmaM) * (kTileN*kExpN*kWmmaN) == B_M * B_N.
+    constexpr int kPerLane = T::kExpM * T::kExpN * kFragC;
+    constexpr int kWsChunk = 16 / (int)sizeof(DataWs);   // dwordx4: 8 bf16 / 4 fp32
+    constexpr size_t kWsTileElems = (size_t)T::kBlockM * (size_t)T::kBlockN;
+    static_assert((size_t)T::kNumConsumerWaves * T::kWarp * kPerLane == kWsTileElems,
+                  "workspace lane runs must tile B_M x B_N exactly");
+    static_assert(kFragC % kWsChunk == 0 || kWsChunk % kFragC == 0,
+                  "dwordx4 workspace traffic needs kFragC and kWsChunk commensurate");
+    static_assert(kFragC % kWsChunk == 0,
+                  "a C fragment must be a whole number of dwordx4 chunks");
+    const int ws_lane_base = (wave_split * (int)T::kWarp + lane_id) * kPerLane;
+    // Tile-major, split-minor. Only SplitK-1 partials are ever stored: the last
+    // split keeps its own in registers, which is what makes the workspace
+    // (SplitK-1) tiles rather than SplitK.
+    const size_t ws_tile_idx =
+        ((size_t)batch_id * (size_t)kargs.num_tiles_m + (size_t)gm) * (size_t)kargs.num_tiles_n
+        + (size_t)gn;
+
+    // ---------------------------------------------------------------------
     // Producers. w0 streams A tiles, w1 streams B tiles, into a kNumSlots ring.
     // Unchanged from the a16w16 pipeline except for the window construction, and
     // that difference is the whole point of the preshuffled B -- see below.
@@ -370,13 +586,23 @@ void bmm_a8w8_mxscale_bpreshuffle_kernel_gfx1250(opus_bmm_a8w8_mxscale_kargs_gfx
             }
         };
 
+        // This split's K origin, in each operand's own fast-axis units. A counts
+        // in elements of K; B counts in whole 16-row shuffled BLOCKS of K (see
+        // KStepB), so the same tile index scales by a different stride. Feeding
+        // A's origin to B is the classic version of this bug: it reads the right
+        // number of bytes from the wrong place and produces plausible garbage.
+        const u32_t gk0_a = (u32_t)((size_t)k_step_beg * T::kBlockK);
+        const u32_t gk0_b = (u32_t)((size_t)k_step_beg * T::kBShufBlockElems);
+
         if (wave_id == 0) {
             // A is a plain [M, K] tensor: extents (K, M), row stride = stride_a.
             // Out-of-range M rows and the K tail clamp to a zero-extent DMA, which
             // is where the free OOB handling comes from -- do not add an M guard.
+            // The extents stay the WHOLE tensor's and only the origin moves, so a
+            // split whose range runs past K clamps instead of faulting.
             auto w = opus::make_tdm<WindowA>((u32_t)reinterpret_cast<u64_t>(smem_a), ptr_a,
                                              (u32_t)kargs.k, (u32_t)kargs.m, (u64_t)kargs.stride_a,
-                                             (u32_t)0, (u32_t)tile_row);
+                                             gk0_a, (u32_t)tile_row);
             produce(w, T::kSlotElemsA, KStepA, opus::number<1 + T::kNumSlots>{});
         } else {
             // B is the shuffle_weight(16,16) buffer, read as a tensor of 16-row
@@ -387,41 +613,33 @@ void bmm_a8w8_mxscale_bpreshuffle_kernel_gfx1250(opus_bmm_a8w8_mxscale_kargs_gfx
             const u64_t b_row_stride  = (u64_t)((size_t)kargs.k * T::kBShufBlockN);
             auto w = opus::make_tdm<WindowB>((u32_t)reinterpret_cast<u64_t>(smem_b), ptr_b,
                                              b_fast_extent, b_rows, b_row_stride,
-                                             (u32_t)0, (u32_t)(tile_col / T::kBShufBlockN));
+                                             gk0_b, (u32_t)(tile_col / T::kBShufBlockN));
+            // CLUSTER_LOAD_ASYNC multicast of B across the MClusterWg M-peers.
+            // They share (gn, batch, split), so this exact block is what each of
+            // them would otherwise fetch on its own.
+            w.set_workgroup_mask(mask_b);
             produce(w, T::kSlotElemsB, KStepB, opus::number<1 + 2 * T::kNumSlots>{});
         }
-        __builtin_amdgcn_s_barrier();   // rendezvous; never "signal then exit"
-        return;
-    }
+        // NO `return` here, unlike the non-split sibling. The fused epilogue
+        // needs every wave of every WG to reach the cluster barrier below, and it
+        // needs producer wave 0 alive AFTER that barrier to TDM-stage the
+        // published partials for the reduce. A producer that exits early takes
+        // its cluster's barrier quorum with it and hangs the launch.
+    } else {
 
     // ---------------------------------------------------------------------
     // Consumers (w[kNumProducerWaves] .. w[kNumWaves-1]). wmma accumulates the
     // result of the matrix multiplication.
     // ---------------------------------------------------------------------
-    const int wave_split = wave_id - T::kNumProducerWaves;
-    // TileN: consumers split N (wave_n = wave_split, wave_m = 0).
-    // TileM: consumers split M (wave_m = wave_split, wave_n = 0).
-    const int wave_m = (T::LAYOUT == opus_gfx1250_bmm::kLayoutTileM) ? wave_split : 0;
-    const int wave_n = (T::LAYOUT == opus_gfx1250_bmm::kLayoutTileM) ? 0 : wave_split;
-
     // The A-scale panel was already filled and published in the prologue, above
     // the producer/consumer split. It covers the tile's whole K range, so the
     // entire K loop reads it and nothing ever overwrites it -- no ring slot, no
     // FREE/DATA handshake, and no barrier id past the 9 already in use (the
     // binit/bjs/bjsw chains silently alias anything above 9 to __nbar_9).
 
-    using Mma = opus::wmma<DataA, DataB, DataAcc, T::kWmmaM, T::kWmmaN, T::kWmmaK>;
+    // Mma, FragA/FragB/FragC and `acc` are declared above the producer/consumer
+    // split; only the instance is local to the consumers.
     Mma mma;
-    using FragA = opus::vector_t<opus::i32_t, 16>;   // 64 fp8 per lane
-    using FragB = opus::vector_t<opus::i32_t, 16>;
-    using FragC = typename Mma::vtype_c;             // 8 fp32 per lane
-
-    FragC acc[T::kExpM][T::kExpN];
-    opus::static_for<T::kExpM>([&](auto im) __attribute__((always_inline)) {
-        opus::static_for<T::kExpN>([&](auto in) __attribute__((always_inline)) {
-            clear(acc[decltype(im)::value][decltype(in)::value]);
-        });
-    });
     //auto mma = make_tiled_mma<DataA, DataB, DataAcc>(
     //    seq<T::kExpM, T::kExpN, T::kExpKHalf>{},
     //    seq<T::kTileM, T::kTileN, T::kTileK>{},
@@ -710,28 +928,223 @@ void bmm_a8w8_mxscale_bpreshuffle_kernel_gfx1250(opus_bmm_a8w8_mxscale_kargs_gfx
 
     // Slots are consumed in the same compile-time order the producer signals them,
     // which is what keeps the per-slot signal counts symmetric (asymmetry hangs).
+    //
+    // consume_slot's k_step is ABSOLUTE (k_step_beg + local), not split-relative.
+    // It has to be: the only thing it indexes with it is the scale panel, and
+    // both panels are filled over the tile's WHOLE K range by every split, so a
+    // split-relative step would read split 0's exponents on every split.
     {
         int k = 0;
         for (; k + T::kNumSlots <= k_steps; k += T::kNumSlots) {
-            const int kb = k;
+            const int kb = k_step_beg + k;
             opus::static_for<T::kNumSlots>([&](auto sN) __attribute__((always_inline)) {
                 consume_slot(sN, kb + (int)decltype(sN)::value);
             });
         }
         const int rem = k_steps - k;
-        const int kb  = k;
+        const int kb  = k_step_beg + k;
         opus::static_for<T::kNumSlots>([&](auto sN) __attribute__((always_inline)) {
             if ((int)decltype(sN)::value < rem) consume_slot(sN, kb + (int)decltype(sN)::value);
         });
+    }
+
+    // -- epilogue A (still inside the consumer branch) ----------------------
+    // Two jobs, split by whether this WG owns the last k-slice:
+    //   NOT last -- publish the fp32 partial as DataWs to the global workspace.
+    //   last     -- fold bias into its own fp32 partial and keep it in registers.
+    // Bias is folded HERE and only here, by the last split: folding it into a
+    // published partial instead would let SplitK copies of it survive the sum.
+    // The C write and the reduce both wait for the cluster barrier below.
+    if constexpr (SplitK > 1) {
+        if (!is_last && !m_oob) {
+            DataWs* ws_ptr = reinterpret_cast<DataWs*>(kargs.ptr_ws);
+            const size_t ws_base =
+                (ws_tile_idx * (size_t)(SplitK - 1) + (size_t)split_idx) * kWsTileElems;
+            auto g_ws = opus::make_gmem<DataWs>(
+                ws_ptr + ws_base, (unsigned int)(kWsTileElems * sizeof(DataWs)));
+            // gfx12 CPOL TH_WB(3) | SCOPE_DEV(2<<3): keep the partial DIRTY-RESIDENT
+            // in GL2 rather than write-rinsing it to HBM, published device-wide, so
+            // the last WG's reduce read hits L2. The peers that read it co-reside on
+            // the same device by construction (they are cluster peers), which is what
+            // makes device scope sufficient and a system-scope rinse pure cost.
+            opus::static_for<T::kExpM>([&](auto imN) __attribute__((always_inline)) {
+                constexpr int im = decltype(imN)::value;
+                opus::static_for<T::kExpN>([&](auto inN) __attribute__((always_inline)) {
+                    constexpr int in   = decltype(inN)::value;
+                    const int frag_off = ws_lane_base + (im * T::kExpN + in) * kFragC;
+                    auto reg_ws        = opus::cast<DataWs>(acc[im][in]);
+                    opus::static_for<kFragC / kWsChunk>([&](auto cN) __attribute__((always_inline)) {
+                        constexpr int c = decltype(cN)::value;
+                        g_ws.template store<kWsChunk>(
+                            opus::slice(reg_ws,
+                                        opus::number<c * kWsChunk>{},
+                                        opus::number<c * kWsChunk + kWsChunk>{}),
+                            frag_off + c * kWsChunk,
+                            0,
+                            opus::number<OPUS_BMM_MXSK_WS_CPOL>{});
+                    });
+                });
+            });
+            opus::s_wait_storecnt(opus::number<0>{});
+            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+        }
+    }
+
+    if (is_last && kargs.ptr_bias) {
+        // bf16 [N], broadcast over M. Every element of a C fragment sits in the
+        // SAME column (the map below walks rows with i, columns with in), so one
+        // scalar load per (im, in) covers all kFragC of them -- do not lift this
+        // into the i loop.
+        const opus::bf16_t* pb = reinterpret_cast<const opus::bf16_t*>(kargs.ptr_bias)
+                                 + (size_t)batch_id * kargs.stride_bias_batch;
+        opus::static_for<T::kExpM>([&](auto imN) __attribute__((always_inline)) {
+            constexpr int im = decltype(imN)::value;
+            opus::static_for<T::kExpN>([&](auto inN) __attribute__((always_inline)) {
+                constexpr int in = decltype(inN)::value;
+                const int col    = col_base + in * T::kWmmaN;
+                // Columns past n have their C store dropped anyway; reading 0
+                // rather than clamping keeps a tail column from inheriting the
+                // last real column's bias in any future vectorised store.
+                const float b = (col < kargs.n) ? (float)pb[col] : 0.0f;
+                opus::static_for<kFragC>([&](auto iN) __attribute__((always_inline)) {
+                    acc[im][in][decltype(iN)::value] += b;
+                });
+            });
+        });
+    }
+    }   // end of the consumer branch (producers skipped straight to here)
+
+    // -- CONVERGED cross-WG sync -------------------------------------------
+    // WG s_barrier first (aligns this WG's own waves and retires their memory
+    // state), then the CLUSTER barrier (-3) signalled by wave 0, which aligns all
+    // SplitK*MClusterWg WGs of the cluster. A cluster barrier, not a semaphore:
+    // every split of a tile CO-RESIDES by construction, so the barrier alone is
+    // enough to guarantee each non-last partial is stored before the last WG
+    // reads it, and it is deterministic (no atomics, run-to-run bit-identical).
+    //
+    // Skipped entirely at SplitK == 1, where no WG reads another's data and the
+    // cluster is a single workgroup.
+    // The WG-local barrier is UNCONDITIONAL: it is the same producer/consumer
+    // rendezvous the non-split sibling ran before its C store, and it is what
+    // retires this WG's own memory state before the cluster barrier reads across
+    // WGs. Only the cross-WG half is SplitK-gated.
+    __builtin_amdgcn_s_barrier();
+    if constexpr (SplitK > 1) {
+        if (wave_id == 0)
+            __builtin_amdgcn_s_barrier_signal(-3);
+        __builtin_amdgcn_s_barrier_wait(-3);
+    }
+
+    // -- reduce: the last split sums the SplitK-1 published partials into acc --
+    // Two strategies, picked at compile time by whether a partial tile even fits
+    // the LDS this tile allocated. The a8w8 tiles are byte-typed, so their
+    // kLdsTotalBytes is sized for 1-byte A/B rings and a bf16 B_M x B_N partial
+    // can be several times larger than the whole ring -- which is why this cannot
+    // be the a16w16 sibling's unconditional static_assert on a 3-deep ring.
+    //
+    //   kRing >= 1 : producer w0 TDM bulk-stages partial tiles into LDS (one
+    //                coalesced global read, deep MLP) and the consumers read
+    //                their lane runs back as 16B dwordx4 out of fast LDS.
+    //   kRing == 0 : no tile fits; consumers read their lane runs straight from
+    //                the workspace. Still fully coalesced and still an L2 hit
+    //                (the partials are dirty-resident there), just without the
+    //                staging's latency hiding.
+    if constexpr (SplitK > 1) {
+        constexpr size_t kWsTileBytes = kWsTileElems * sizeof(DataWs);
+        constexpr int kFitTiles       = (int)((size_t)T::kLdsTotalBytes / kWsTileBytes);
+        constexpr int kRing =
+            (kFitTiles >= kBmmFuseReduceRing) ? kBmmFuseReduceRing : kFitTiles;
+
+        if (is_last && !m_oob) {
+            DataWs* ws_ptr = reinterpret_cast<DataWs*>(kargs.ptr_ws);
+            auto ws_base_of = [&](int sp) __attribute__((always_inline)) -> size_t {
+                return (ws_tile_idx * (size_t)(SplitK - 1) + (size_t)sp) * kWsTileElems;
+            };
+            // Add one staged partial into acc, reading through `src` -- either an
+            // LDS slot or the global tile. The (im, in, c) walk is the SAME one the
+            // store used, which is the whole contract between the two sides.
+            auto accumulate = [&](auto& src) __attribute__((always_inline)) {
+                opus::static_for<T::kExpM>([&](auto imN) __attribute__((always_inline)) {
+                    constexpr int im = decltype(imN)::value;
+                    opus::static_for<T::kExpN>([&](auto inN) __attribute__((always_inline)) {
+                        constexpr int in   = decltype(inN)::value;
+                        const int frag_off = ws_lane_base + (im * T::kExpN + in) * kFragC;
+                        opus::static_for<kFragC / kWsChunk>(
+                            [&](auto cN) __attribute__((always_inline)) {
+                                constexpr int c = decltype(cN)::value;
+                                auto vp = src.template load<kWsChunk>(frag_off + c * kWsChunk);
+#pragma unroll
+                                for (int i = 0; i < kWsChunk; ++i)
+                                    acc[im][in][c * kWsChunk + i] += (float)vp[i];
+                            });
+                    });
+                });
+            };
+
+            if constexpr (kRing >= 1) {
+                // Contiguous B_M x B_N DataWs tile: dim0 (N) is the fast axis, the
+                // window is the whole extent, so no LDS padding and no multicast.
+                using WindowWs = opus::tdm<DataWs, opus::seq<T::kBlockN, T::kBlockM>>;
+                DataWs* lds_ws = reinterpret_cast<DataWs*>(lds_buf);
+                auto stage     = [&](int slot, int sp) __attribute__((always_inline)) {
+                    auto w = opus::make_tdm<WindowWs>((u32_t) reinterpret_cast<u64_t>(lds_ws),
+                                                      ws_ptr + ws_base_of(sp),
+                                                      (u32_t)T::kBlockN,
+                                                      (u32_t)T::kBlockM,
+                                                      (u64_t)T::kBlockN);
+                    w.async_load((u32_t)((size_t)slot * kWsTileElems));
+                };
+                // Ring-bounded chunks. Two WG barriers per chunk: the first
+                // publishes the staged tiles, the second keeps the next chunk's
+                // DMA from overwriting slots the consumers are still reading.
+                // When the ring covers every partial this runs once, which is the
+                // stage-all case (max MLP, one barrier pair) without a second
+                // code path for it.
+#pragma unroll 1
+                for (int base = 0; base < SplitK - 1; base += kRing) {
+                    const int chunk = opus_bmm_mx_min_i(kRing, (SplitK - 1) - base);
+                    if (is_producer && wave_id == 0) {
+#pragma unroll 1
+                        for (int j = 0; j < chunk; ++j)
+                            stage(j, base + j);
+                        opus::s_wait_tensorcnt<0>();
+                    }
+                    __builtin_amdgcn_s_barrier();
+                    if (!is_producer) {
+#pragma unroll 1
+                        for (int j = 0; j < chunk; ++j) {
+                            auto s_ws = opus::make_smem(lds_ws + (size_t)j * kWsTileElems);
+                            accumulate(s_ws);
+                        }
+                    }
+                    __builtin_amdgcn_s_barrier();
+                }
+            } else {
+                if (!is_producer) {
+#pragma unroll 1
+                    for (int sp = 0; sp < SplitK - 1; ++sp) {
+                        auto g_ws = opus::make_gmem<DataWs>(
+                            ws_ptr + ws_base_of(sp),
+                            (unsigned int)(kWsTileElems * sizeof(DataWs)));
+                        accumulate(g_ws);
+                    }
+                }
+            }
+        }
     }
 
     // -- TODO(kernel) 3: C fragment map. UNVERIFIED. ------------------------
     // Assumed wave32 WMMA 16x16 C layout: lane l holds column n = l % 16 and rows
     // m = (l / 16) * 8 + i for i in 0..7. Scalar stores, because that map is one
     // element per (lane, i) along N -- vectorise only after the probe.
-    __builtin_amdgcn_s_barrier();
-    {
-        const int col_base = tile_col + wave_n * (T::kExpN * T::kWmmaN) + (lane_id % T::kWmmaN);
+    //
+    // Only the LAST split writes C, and only its consumer waves: `acc` now holds
+    // the full-K sum in fp32 and is cast to D_OUT exactly once, here.
+    //
+    // This is the one map the workspace path does NOT depend on -- the partial
+    // store/reduce uses the private lane-contiguous layout above -- so a probe
+    // that corrects this lambda does not invalidate the split-K plumbing.
+    if (is_last && !is_producer) {
         const int row_half = (lane_id / T::kWmmaN) * (T::kWmmaM / 2);
         opus::static_for<T::kExpM>([&](auto imN) __attribute__((always_inline)) {
             constexpr int im = decltype(imN)::value;
@@ -744,7 +1157,7 @@ void bmm_a8w8_mxscale_bpreshuffle_kernel_gfx1250(opus_bmm_a8w8_mxscale_kargs_gfx
                                   + im * T::kWmmaM + row_half + i;
                     if (row < kargs.m && col < kargs.n)
                         ptr_c[(size_t)row * kargs.stride_c + col] =
-                            (DataC)acc[im][in][i];
+                            (D_OUT)acc[im][in][i];
                 });
             });
         });
