@@ -159,61 +159,65 @@ def test_jdbba(B, D, Kout, Mi, regime, dtype):
     return ret
 
 
-def test_jdbba_block_k(dtype):
-    if get_gfx() not in SUPPORTED_GFX:
-        return {"gfx": get_gfx(), "skipped": True}
-    B, D, Kout, Mi = 64, 256, 256, 2048
+@benchmark()
+def test_jdbba_block_k(B, D, Kout, Mi, block_k, dtype):
     d = _build_inputs(B, D, Kout, Mi, "uniform", dtype)
-    L, N = d["L"], d["N"]
+    L, N, K = d["L"], d["N"], d["K"]
     st = torch.cuda.current_stream()
     ref = run_torch(d["jagged"], d["dense"], d["bias"], d["seq_offsets"], N, dtype)
 
-    jagged_dense_bmm(
-        d["tC"],
-        d["tA"],
-        d["dense_tall"],
-        d["bias_flat"],
-        d["seq_offsets"],
-        n_groups=B,
-        max_seq_len=Mi,
-        stream=st,
-        uniform_seqlen=True,
-        block_k=128,
-    )
-    got = d["out"][:L]
+    def _flydsl():
+        jagged_dense_bmm(
+            d["tC"],
+            d["tA"],
+            d["dense_tall"],
+            d["bias_flat"],
+            d["seq_offsets"],
+            n_groups=B,
+            max_seq_len=Mi,
+            stream=st,
+            uniform_seqlen=True,
+            block_k=block_k,
+        )
+        return d["out"][:L]
+
+    got, us = run_perftest(_flydsl)
     err = checkAllclose(
         ref.to(dtypes.fp32),
         got.to(dtypes.fp32),
         rtol=1e-2,
         atol=1e-2,
-        msg="block_k=128 uniform",
+        msg=f"block_k={block_k} uniform",
     )
+    flops = 2 * L * K * N
+    nbytes = (L * K + B * K * N + B * N + L * N) * d["jagged"].element_size()
     return {
         "gfx": get_gfx(),
-        "block_k": 128,
-        "err": err,
+        "L": L,
+        "flydsl us": us,
+        "flydsl TFLOPS": flops / us / 1e6,
+        "flydsl TB/s": nbytes / us / 1e6,
+        "flydsl err": err,
     }
 
 
-def test_jdbba_skew_varying_L(dtype):
-    if get_gfx() not in SUPPORTED_GFX:
-        return {"gfx": get_gfx(), "skipped": True}
-    B, D, Kout, Mi = 64, 256, 256, 2048
+@benchmark()
+def test_jdbba_skew_varying_L(B, D, Kout, Mi, seed, dtype):
     clear_skew_tile_map_cache()
+    d = _build_inputs(
+        B,
+        D,
+        Kout,
+        Mi,
+        "skew",
+        dtype,
+        seq_offsets=_make_seq_offsets(B, Mi, "skew", seed=seed),
+    )
+    L, N, K = d["L"], d["N"], d["K"]
     st = torch.cuda.current_stream()
-    errs = []
-    for seed in (111, 222):
-        d = _build_inputs(
-            B,
-            D,
-            Kout,
-            Mi,
-            "skew",
-            dtype,
-            seq_offsets=_make_seq_offsets(B, Mi, "skew", seed=seed),
-        )
-        L, N = d["L"], d["N"]
-        ref = run_torch(d["jagged"], d["dense"], d["bias"], d["seq_offsets"], N, dtype)
+    ref = run_torch(d["jagged"], d["dense"], d["bias"], d["seq_offsets"], N, dtype)
+
+    def _flydsl():
         jagged_dense_bmm_dispatched(
             d["tC"],
             d["tA"],
@@ -225,15 +229,26 @@ def test_jdbba_skew_varying_L(dtype):
             stream=st,
             uniform_seqlen=False,
         )
-        err = checkAllclose(
-            ref.to(dtypes.fp32),
-            d["out"][:L].to(dtypes.fp32),
-            rtol=1e-2,
-            atol=1e-2,
-            msg=f"skew varying L seed={seed}",
-        )
-        errs.append(err)
-    return {"gfx": get_gfx(), "err_max": max(errs), "L_seeds": (111, 222)}
+        return d["out"][:L]
+
+    got, us = run_perftest(_flydsl)
+    err = checkAllclose(
+        ref.to(dtypes.fp32),
+        got.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        msg=f"skew varying L seed={seed}",
+    )
+    flops = 2 * L * K * N
+    nbytes = (L * K + B * K * N + B * N + L * N) * d["jagged"].element_size()
+    return {
+        "gfx": get_gfx(),
+        "L": L,
+        "flydsl us": us,
+        "flydsl TFLOPS": flops / us / 1e6,
+        "flydsl TB/s": nbytes / us / 1e6,
+        "flydsl err": err,
+    }
 
 
 @benchmark()
@@ -295,6 +310,27 @@ def _summarize(name, rows):
     aiter.logger.info("%s summary (markdown):\n%s", name, df.to_markdown(index=False))
 
 
+def _expand_shapes(shapes, batch, parser):
+    """Yield (B, D, Kout, Mi). --batch, when given, supplies/overrides B."""
+    out = []
+    for shape in shapes:
+        if not isinstance(shape, tuple):
+            shape = (shape,)
+        if len(shape) == 4:
+            head, rest = (shape[0],), shape[1:]
+        elif len(shape) == 3:
+            head, rest = (), shape
+        else:
+            parser.error(f"shape must be B,D,Kout,Mi or D,Kout,Mi; got {shape}")
+        if batch:
+            out.extend((b, *rest) for b in batch)
+        elif head:
+            out.append((*head, *rest))
+        else:
+            parser.error(f"shape {shape} omits B; pass -b/--batch")
+    return list(dict.fromkeys(out))
+
+
 def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning("jagged_dense_bmm unsupported on %s; skipping", get_gfx())
@@ -319,6 +355,15 @@ def main():
         help="e.g.: -d bf16",
     )
     parser.add_argument(
+        "-b",
+        "--batch",
+        type=int,
+        nargs="*",
+        default=None,
+        help="B (n_groups). Supplies B for 3-tuple -s, or overrides B in 4-tuple -s.\n"
+        "e.g.: -b 120 1024 -s 256,256,7680",
+    )
+    parser.add_argument(
         "-s",
         "--shapes",
         type=dtypes.str2tuple,
@@ -330,7 +375,8 @@ def main():
             (1024, 512, 512, 7680),
             (64, 512, 1024, 8192),
         ],
-        help="e.g.: -s 64,512,1024,8192",
+        help="B,D,Kout,Mi or D,Kout,Mi (requires -b).\n"
+        "e.g.: -s 64,512,1024,8192  or  -s 256,256,7680",
     )
     parser.add_argument(
         "-r",
@@ -355,11 +401,38 @@ def main():
         ],
         help="e.g.: -ds 120,384,384,7680",
     )
+    parser.add_argument(
+        "-k",
+        "--block-k",
+        type=int,
+        nargs="*",
+        default=[64, 128],
+        help="e.g.: -k 64 128",
+    )
+    parser.add_argument(
+        "--seeds",
+        type=int,
+        nargs="*",
+        default=[111, 222],
+        help="e.g.: --seeds 111 222",
+    )
+    parser.add_argument(
+        "-rs",
+        "--regression-shapes",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=[(64, 256, 256, 2048)],
+        help="B,D,Kout,Mi for block_k and skew-varying-L. e.g.: -rs 64,256,256,2048",
+    )
     args = parser.parse_args()
+    shapes = _expand_shapes(args.shapes, args.batch, parser)
+    for shape in args.regression_shapes:
+        if not isinstance(shape, tuple) or len(shape) != 4:
+            parser.error(f"regression shape must be B,D,Kout,Mi; got {shape}")
 
     for dtype in args.dtype:
         rows = []
-        for regime, (B, D, Kout, Mi) in itertools.product(args.regime, args.shapes):
+        for regime, (B, D, Kout, Mi) in itertools.product(args.regime, shapes):
             rows.append(test_jdbba(B, D, Kout, Mi, regime, dtype))
         _summarize("jagged_dense_bmm", rows)
 
@@ -368,13 +441,19 @@ def main():
     ]
     _summarize("jagged_dense_bmm dispatch routing", rows)
 
-    _summarize(
-        "jagged_dense_bmm block_k", [test_jdbba_block_k(dtype) for dtype in args.dtype]
-    )
-    _summarize(
-        "jagged_dense_bmm skew varying L",
-        [test_jdbba_skew_varying_L(dtype) for dtype in args.dtype],
-    )
+    rows = []
+    for dtype, (B, D, Kout, Mi), block_k in itertools.product(
+        args.dtype, args.regression_shapes, args.block_k
+    ):
+        rows.append(test_jdbba_block_k(B, D, Kout, Mi, block_k, dtype))
+    _summarize("jagged_dense_bmm block_k", rows)
+
+    rows = []
+    for dtype, (B, D, Kout, Mi), seed in itertools.product(
+        args.dtype, args.regression_shapes, args.seeds
+    ):
+        rows.append(test_jdbba_skew_varying_L(B, D, Kout, Mi, seed, dtype))
+    _summarize("jagged_dense_bmm skew varying L", rows)
 
 
 if __name__ == "__main__":
