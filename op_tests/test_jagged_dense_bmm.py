@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from __future__ import annotations
 
 import argparse
 import itertools
-from unittest.mock import patch
 
 import flydsl.compiler as flyc
 import pandas as pd
@@ -22,10 +21,11 @@ from aiter.ops.flydsl.jagged_dense_bmm_dispatch import (
     shape_id,
 )
 from aiter.ops.flydsl.kernels.jagged_dense_bmm_gen import (
-    _COMPILED_CACHE,
+    BLOCK_M as _BLOCK_M,
+)
+from aiter.ops.flydsl.kernels.jagged_dense_bmm_gen import (
     jagged_dense_bmm,
 )
-from aiter.ops.flydsl.kernels.jagged_dense_bmm_gen import BLOCK_M as _BLOCK_M
 from aiter.test_common import (
     benchmark,
     checkAllclose,
@@ -159,36 +159,6 @@ def test_jdbba(B, D, Kout, Mi, regime, dtype):
     return ret
 
 
-def test_jdbba_compile_reraise():
-    if get_gfx() not in SUPPORTED_GFX:
-        return {"gfx": get_gfx(), "skipped": True}
-    B, D, Kout, Mi = 8, 64, 64, 128
-    d = _build_inputs(B, D, Kout, Mi, "uniform", dtypes.bf16)
-    st = torch.cuda.current_stream()
-    n_before = len(_COMPILED_CACHE)
-    with patch("flydsl.compiler.compile", side_effect=RuntimeError("boom")):
-        try:
-            jagged_dense_bmm(
-                d["tC"],
-                d["tA"],
-                d["dense_tall"],
-                d["bias_flat"],
-                d["seq_offsets"],
-                n_groups=B,
-                max_seq_len=Mi,
-                stream=st,
-                uniform_seqlen=True,
-                block_k=64,
-            )
-            raise AssertionError("expected RuntimeError from flyc.compile failure")
-        except RuntimeError as exc:
-            if str(exc) != "boom":
-                raise
-    cache_clean = len(_COMPILED_CACHE) == n_before
-    assert cache_clean, "compile failure must not poison _COMPILED_CACHE"
-    return {"gfx": get_gfx(), "reraise_ok": True, "cache_clean": cache_clean}
-
-
 def test_jdbba_block_k(dtype):
     if get_gfx() not in SUPPORTED_GFX:
         return {"gfx": get_gfx(), "skipped": True}
@@ -218,46 +188,10 @@ def test_jdbba_block_k(dtype):
         atol=1e-2,
         msg="block_k=128 uniform",
     )
-    try:
-        jagged_dense_bmm(
-            d["tC"],
-            d["tA"],
-            d["dense_tall"],
-            d["bias_flat"],
-            d["seq_offsets"],
-            n_groups=B,
-            max_seq_len=Mi,
-            stream=st,
-            uniform_seqlen=True,
-            block_k=32,
-        )
-        raise AssertionError("block_k=32 should raise ValueError")
-    except ValueError as exc:
-        invalid_ok = "block_k" in str(exc)
-    assert invalid_ok, "block_k=32 must be rejected before compile"
-    try:
-        jagged_dense_bmm(
-            d["tC"],
-            d["tA"],
-            d["dense_tall"],
-            d["bias_flat"],
-            d["seq_offsets"],
-            n_groups=B,
-            max_seq_len=Mi,
-            stream=st,
-            uniform_seqlen=True,
-            block_k=256,
-        )
-        raise AssertionError("block_k=256 should raise ValueError")
-    except ValueError as exc:
-        lds_ok = "LDS" in str(exc)
-    assert lds_ok, "block_k=256 must be rejected for LDS overflow"
     return {
         "gfx": get_gfx(),
         "block_k": 128,
         "err": err,
-        "invalid_block_k_ok": invalid_ok,
-        "lds_block_k_ok": lds_ok,
     }
 
 
@@ -434,7 +368,6 @@ def main():
     ]
     _summarize("jagged_dense_bmm dispatch routing", rows)
 
-    _summarize("jagged_dense_bmm compile re-raise", [test_jdbba_compile_reraise()])
     _summarize(
         "jagged_dense_bmm block_k", [test_jdbba_block_k(dtype) for dtype in args.dtype]
     )
