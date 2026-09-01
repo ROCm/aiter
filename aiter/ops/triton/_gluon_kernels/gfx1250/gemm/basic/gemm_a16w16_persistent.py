@@ -152,17 +152,17 @@ def gemm_a16w16_persistent_kernel_(
             layout=SHARED_LAYOUT_B,
         )
 
-    SHARED_LAYOUT_C: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[BLOCK_N, 8]], [BLOCK_M, BLOCK_N], [1, 0]
-    )
-    c_buffer = gl.allocate_shared_memory(
-        c_ptr.type.element_ty,
-        shape=[BLOCK_M, BLOCK_N],
-        layout=SHARED_LAYOUT_C,
-    )
-
     # Persistent loop
     for tile_id in range(start_pid, num_tiles, NUM_SMS):
+
+        SHARED_LAYOUT_C: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+                [[BLOCK_N, 8]], [BLOCK_M, BLOCK_N], [1, 0]
+            )
+        c_buffer = gl.allocate_shared_memory(
+                c_ptr.type.element_ty,
+                shape=[BLOCK_M, BLOCK_N],
+                layout=SHARED_LAYOUT_C,
+            )
         # remap tile index
         t = remap_xcd(tile_id, num_tiles, NUM_XCDS=8)
         pid_k = t % NUM_KSPLIT
@@ -407,6 +407,16 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
             layout=SHARED_LAYOUT_B,
         )
 
+    SHARED_LAYOUT_C: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[BLOCK_N, 8]], [BLOCK_M, BLOCK_N], [1, 0]
+    )
+    # one staging buffer shared across all tiles
+    c_buffer = gl.allocate_shared_memory(
+        c_ptr.type.element_ty,
+        shape=[BLOCK_M, BLOCK_N],
+        layout=SHARED_LAYOUT_C,
+    )
+
     # prologue: decode the first unit and prefetch its leading k-tiles
     t = remap_xcd(start_pid, num_tiles, NUM_XCDS=8)
     pid_k = t % NUM_KSPLIT
@@ -546,16 +556,17 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
         if USE_ACTIVATION and WRITES_FINAL:
             accumulator = activation(accumulator)
 
-        offs_cm = m_off + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT))
-        offs_cn = n_off + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT))
-        offs_c = stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-        mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-        gl.amd.gfx1250.buffer_store(
-            accumulator.to(c_ptr.type.element_ty),
-            c_ptr + pid_k.to(gl.int64) * stride_ck,
-            offs_c,
-            mask=mask_c,
+        c_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=c_ptr + pid_k.to(gl.int64) * stride_ck,
+            shape=(M, N),
+            strides=(stride_cm, stride_cn),
+            block_shape=(BLOCK_M, BLOCK_N),
+            layout=SHARED_LAYOUT_C,
         )
+        c_buffer.store(accumulator.to(c_ptr.type.element_ty))
+        gl.barrier()
+        gl.amd.gfx1250.tdm.async_store(c_desc, [m_off, n_off], c_buffer)
+        gl.amd.gfx1250.tdm.async_wait(0)
 
         next_tile_id = tile_id + NUM_SMS
         n_t = remap_xcd(next_tile_id, num_tiles, NUM_XCDS=8)
