@@ -20,9 +20,12 @@ Contents:
   - ``QManager16bV1`` — Q loader (ring-buffered async stage, natural ``ds_load_b128``).
   - ``QManager16bV2`` — Q loader (per-warp TDM into private padded LDS, no ring).
   - ``KManager16bV1`` — K loader (one-block stage, natural ``ds_load_b128`` B-fragment).
+  - ``KManager16bV2`` — K loader (per-warp TDM into row-major padded LDS, HW OOB).
   - ``VManager16bV1`` — V loader (V-specific swizzle, transpose ``ds_load_tr16_b128``).
+  - ``VManager16bV2`` — V loader (per-warp TDM into padded LDS, transpose ``ds_load_tr16_b128``).
   - ``OManager16bV1`` — O writer (WMMA accumulator -> swizzled LDS -> coalesced buffer_store).
-  - ``OManager16bV2`` — O writer (accumulator -> row-major padded LDS -> per-warp TDM store).
+  - ``OManager16bV2`` — O writer (accumulator -> row-major CONTIGUOUS LDS -> per-warp TDM store; TDM store ignores LDS pad).
+  - ``OManager16bV3`` — O writer (padded LDS ``ds_store`` -> async ``global_store_from_lds_b128``).
 
 Target: gfx1250 (MI400 / mi450), wave32, 8 waves per threadgroup (256 threads).
 """
@@ -1520,7 +1523,7 @@ class OManager16bV1:
 
 
 class OManager16bV2:
-    """O epilogue via TDM store. Accumulator (fp32) -> bf16 -> row-major padded private LDS
+    """O epilogue via TDM store. Accumulator (fp32) -> bf16 -> row-major contiguous private LDS
     (``ds_store_b128``) -> global VRAM (per-warp ``tensor_store_from_lds``). No transpose re-read:
     the TDM descriptor does the LDS->global reshape, and HW OOB drops rows ``seq >= q_len``.
 
