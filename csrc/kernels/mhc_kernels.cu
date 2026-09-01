@@ -21,7 +21,7 @@ namespace aiter {
     static constexpr bool mhc_async_load_oob_guard = false;
 #endif
 
-    // is_fn_pack_bf16 selects the bf16 (fn hi/lo split) matrix compute over the fp32
+    // is_res_w_preshuffle_bf16 selects the bf16 (fn hi/lo split) matrix compute over the fp32
     // one. Wave64 CDNA (gfx942/gfx950/gfx9_4_generic) use opus::mfma<bf16,..,16,16,32>
     // (8 bf16/lane) -- native K=32 on gfx950, chained K=16 (mfma_..16x16x16bf16_1k) on
     // gfx942; gfx1250 uses the wave32 wmma_f32_16x16x32_bf16 (16 bf16/lane, UNVERIFIED
@@ -54,6 +54,39 @@ namespace aiter {
 #define MHC_TDM_DRAIN() ((void)0)
 #endif
 
+
+    // Float index of the 4-float run holding hi(K0 .. K0+7); the matching lo run is +8.
+    // Valid for any K0 that is a multiple of 8 -- every consumer's fragment start is.
+    __host__ __device__ constexpr inline int mhc_fn_hi_float(int K0) {
+        return (K0 / 16) * 16 + (K0 % 16) / 2;
+    }
+
+    // ---- pre-shuffled residual layout (is_res_w_preshuffle_bf16) ----
+    //   resS[k / KS][head][row][k % KS],  KS = mhc_res_ks
+    //   strides: kb -> hc_mult*m*KS,  head -> m*KS,  row -> KS,  kk -> 1
+    // KS is a fixed constant, deliberately NOT derived from tile_m/tile_k: the
+    // layout is a caller-visible tensor contract and must not change when the gemm
+    // config does. It must divide tile_k, the per-lane k-run of every consumer
+    // (ds_read_vec, res_vec_size), and hidden_size/split_k.
+    // (row, kk) is one contiguous tile_m*KS run (2 KB at tile_m=32/KS=32/bf16, vs
+    // the 128 B runs of the [row][head][k] layout), so every *read* of the residual
+    // gets longer bursts as KS grows. The gemm's next_residual *write* does not:
+    // its lanes sit 2*KS bytes apart and carry 16 B each, so above KS=8 each
+    // cacheline is only half written (69 / 143 / 205 us of store time at
+    // KS = 8 / 16 / 32). mhc_nres_tdm_store is what removes that, and is what
+    // makes KS=32 the tuned value.
+    static constexpr int mhc_res_ks = 32;
+    // ABLATION KNOB: 0 keeps the plain residual layout while leaving the bf16 fn gemm on,
+    // so the shuffle's own contribution can be measured. Must be kept in lockstep with
+    // MHC_RES_SHUFFLE in aiter/ops/mhc.py.
+    static constexpr bool mhc_res_shuffle = true;
+    // gfx1250 + shuffled residual only: stage next_residual through LDS and write it
+    // out with one 4D TDM store mirroring the residual load, instead of a scattered
+    // buffer_store_b128 per lane. Buys 460 -> 325 us on the gemm at KS=32; costs
+    // n_stages*hc_mult*tile_m*tile_k elements of LDS. Only profitable for KS >= 16 --
+    // at KS=8 the per-lane store is already fully coalesced and this loses ~85 us.
+    static constexpr bool mhc_nres_tdm_store = true;
+
     constexpr int ceil_pow2(int n) {
         if(n <= 1) return 1;
         int p = 1;
@@ -79,12 +112,13 @@ namespace aiter {
 
     // Pre-convert fn (fp32) into a packed dword: hi = bf16(fn) in [31:16], lo = bf16(fn -
     // fp32(hi)) in [15:0]. Same 4-byte width as fp32 so the gemm's load / LDS / swizzle are
-    // unchanged; the bf16 gemm (is_fn_pack_bf16) then bit-extracts hi/lo instead of
+    // unchanged; the bf16 gemm (is_res_w_preshuffle_bf16) then bit-extracts hi/lo instead of
     // recomputing the fp32->bf16 split per (m_block, k) -- the split was redundant work
     // repeated m_blocks times. fn are model weights (constant across forward passes), so
     // this runs once and the packed int32 tensor is reused every forward.
     template <typename DTYPE_I>
-    __global__ void mhc_pre_convert_fn_kernel(uint32_t* fn_packed, const float* fn, int64_t numel)
+    __global__ void mhc_pre_convert_fn_kernel(uint32_t* fn_packed, const float* fn, int64_t numel,
+                                             [[maybe_unused]] int hc_hidden_size)
     {
         int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
         if (i >= numel) return;
@@ -93,91 +127,15 @@ namespace aiter {
         DTYPE_I lo = static_cast<DTYPE_I>(f - static_cast<float>(hi));
         uint32_t hi_bits = __builtin_bit_cast(uint16_t, hi);
         uint32_t lo_bits = __builtin_bit_cast(uint16_t, lo);
-        fn_packed[i] = (hi_bits << 16) | lo_bits;
-    }
-
-    // ---- fn preshuffle for the FUSED post_pre gemm (mhc_pre_shuffle_fn) ----
-    //
-    // Unshuffled, one wave's fn tile is 16 N-rows of tile_k floats each, and
-    // consecutive N are fn_stride = hc_mult*hidden_size floats apart (114 KB at
-    // hidden=7168, hc_mult=4). So a single k-step touches 16 (x hc_mult heads)
-    // separate 128 B segments scattered across the whole weight -- 16 distinct
-    // memory streams for what is logically one tile.
-    //
-    // Reblock so the N dimension sits INSIDE a K block of 32:
-    //     fn[n][Kflat]  ->  fnS[Kflat/32][n][Kflat%32]
-    // A wave's tile then lands in one (or, for tile_k=64, two adjacent)
-    // 16*32*4 = 2 KB contiguous run.
-    //
-    // The block is fixed at 32, not tile_k, on purpose: every K offset the kernel
-    // forms (warp_id*hidden_size, k_split_offset, k*tile_k) is a multiple of 32,
-    // and each lane's vec_tile run lies inside ONE 32-block for both tile_k=32
-    // (vec_tile=16, lane halves at kr 0/16) and tile_k=64 (vec_tile=32, lane
-    // halves in adjacent blocks). So one layout serves every (tile_m, tile_n,
-    // tile_k, warp_size) combo -- no per-config weight copy.
-    //
-    // n is NOT padded: a K block holds exactly hc_mult3 rows. Padding up to the
-    // tile_n=32 the kernel reads would grow fn by 33% (24 -> 32 rows) and that extra
-    // is real read traffic -- fn is re-read by every m-block, so at m=65536 it is
-    // ~5.6 GB, the same order as the residual stream. The kernel instead keeps the
-    // old "OOB N reads 0" behaviour by steering those lanes past the buffer bound.
-    //
-    // pack_bf16 folds in the same hi<<16|lo packing as mhc_pre_convert_fn: the
-    // shuffle is a permutation of elements and the packing a per-element value
-    // transform, so they compose in a single pass over the (constant) weights.
-    template <typename DTYPE_I, bool pack_bf16>
-    __global__ void mhc_pre_shuffle_fn_kernel(
-        uint32_t* out, const float* fn, int hc_mult3, int hc_hidden_size)
-    {
-        int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-        int64_t total = (int64_t)(hc_hidden_size / 32) * hc_mult3 * 32;
-        if (i >= total) return;
-        const int kr = (int)(i % 32);
-        const int n  = (int)((i / 32) % hc_mult3);
-        const int64_t kb = i / (32 * (int64_t)hc_mult3);
-        uint32_t v = 0;
-        {
-            float f = fn[(int64_t)n * hc_hidden_size + kb * 32 + kr];
-            if constexpr (pack_bf16) {
-                DTYPE_I hi = static_cast<DTYPE_I>(f);
-                DTYPE_I lo = static_cast<DTYPE_I>(f - static_cast<float>(hi));
-                v = ((uint32_t)__builtin_bit_cast(uint16_t, hi) << 16)
-                  |  (uint32_t)__builtin_bit_cast(uint16_t, lo);
-            } else {
-                v = __builtin_bit_cast(uint32_t, f);
-            }
-        }
-        out[i] = v;
-    }
-
-    void mhc_pre_shuffle_fn(
-        aiter_tensor_t& fn_shuffled, // (hc_hidden_size/32, hc_mult3, 32) int32/fp32 out
-        aiter_tensor_t& fn,          // (hc_mult3, hc_hidden_size) fp32 in
-        int is_fn_pack_bf16
-    )
-    {
-        AITER_CHECK(fn.dtype() == AITER_DTYPE_fp32, "fn must be fp32");
-        AITER_CHECK(fn.dim() == 2, "fn must be 2D (hc_mult3, hc_hidden_size)");
-        const int hc_mult3 = (int)fn.size(0);
-        const int hc_hidden_size = (int)fn.size(1);
-        AITER_CHECK(hc_hidden_size % 32 == 0, "hc_hidden_size must be divisible by 32");
-        const int64_t total = (int64_t)(hc_hidden_size / 32) * hc_mult3 * 32;
-        AITER_CHECK((int64_t)fn_shuffled.numel() == total,
-                    "fn_shuffled numel must be (hc_hidden_size/32) * hc_mult3 * 32");
-        const int block_size = 256;
-        int64_t grid = (total + block_size - 1) / block_size;
-        const HipDeviceGuard device_guard(fn.device_id);
-        const hipStream_t stream = aiter::getCurrentHIPStream();
-        using DTYPE_I = typename hip2opus<hip_bfloat16>::type;
-        auto* o = reinterpret_cast<uint32_t*>(fn_shuffled.data_ptr());
-        auto* f = reinterpret_cast<const float*>(fn.data_ptr());
-        if (is_fn_pack_bf16) {
-            mhc_pre_shuffle_fn_kernel<DTYPE_I, true><<<grid, block_size, 0, stream>>>(
-                o, f, hc_mult3, hc_hidden_size);
-        } else {
-            mhc_pre_shuffle_fn_kernel<DTYPE_I, false><<<grid, block_size, 0, stream>>>(
-                o, f, hc_mult3, hc_hidden_size);
-        }
+        // Same tensor (int32, (hc_mult3, hc_hidden)) viewed as uint16; hi and lo of one
+        // 16-element k block land as [16 hi][16 lo], i.e. 32 B apart. Total size and row
+        // stride in bytes are unchanged.
+        uint16_t* out16 = reinterpret_cast<uint16_t*>(fn_packed);
+        const int64_t n_row = i / hc_hidden_size;
+        const int64_t k = i % hc_hidden_size;
+        const int64_t base = n_row * (2 * (int64_t)hc_hidden_size) + (k / 16) * 32 + (k % 16);
+        out16[base]      = (uint16_t)hi_bits;
+        out16[base + 16] = (uint16_t)lo_bits;
     }
 
     // The packed hi/lo are encoded as bf16 -- the activation/MFMA element type the gemm
@@ -198,7 +156,7 @@ namespace aiter {
         mhc_pre_convert_fn_kernel<DTYPE_I><<<grid, block_size, 0, stream>>>(
             reinterpret_cast<uint32_t*>(fn_packed.data_ptr()),
             reinterpret_cast<const float*>(fn.data_ptr()),
-            numel);
+            numel, (int)fn.size(1));
     }
 
 // Branch must match mma_pack_size (= warp_size == 64 ? 1 : 2): the MFMA path
@@ -255,7 +213,7 @@ namespace aiter {
     mma_f32_16x16x4_fma((a), (b), (c))
 #endif
 
-    template <typename DTYPE_I, int num_warps, int tile_m, int tile_n, int tile_k, bool is_fn_pack_bf16 = false>
+    template <typename DTYPE_I, int num_warps, int tile_m, int tile_n, int tile_k, bool is_res_w_preshuffle_bf16 = false>
     __global__ __launch_bounds__(num_warps *  opus::get_warp_size(), 2)
     void mhc_pre_gemm_sqrsum_kernel(
         float* out,
@@ -489,32 +447,35 @@ namespace aiter {
         static_assert(!mhc_bf16_mma_avail || vec_tile % 8 == 0,
                       "bf16 path needs vec_tile a multiple of 8");
 #if MHC_BF16_MFMA   // wave64 CDNA bf16 MFMA (gfx942 chained-K16 / gfx950 native K32)
-        auto lds_read_fn_chunk_bf16 = [&](float* s_fn_rd_ptr, float (&raw)[repeat_n][8], int c) {
+        // Block-interleaved fn: this chunk's 8 logical K are consecutive from
+        // K0 = 8*(c*mfma_k + lane/mfma_n), so hi(K0..K0+7) occupies the 4 consecutive
+        // floats at mhc_fn_hi_float(K0) and lo the same run + 8. Each run IS one MFMA
+        // fragment (8 bf16), so no per-element extraction is needed downstream.
+        //
+        // UNVALIDATED: wave64 only. This machine is gfx1250 (wave32), which takes the
+        // WMMA path below, so this arm has been compile-checked but not run. Needs a
+        // gfx942/gfx950 correctness run before it is trusted.
+        auto lds_read_fn_chunk_bf16 = [&](float* s_fn_rd_ptr,
+                                          float (&hi_raw)[repeat_n][4],
+                                          float (&lo_raw)[repeat_n][4], int c) {
             #pragma unroll
             for (int n = 0; n < repeat_n; n++) {
                 int fn_row = n * mfma_n + lane_id % mfma_n;
+                int hi_f = mhc_fn_hi_float((c * mfma_k + lane_id / mfma_n) * 8);
+                int mask = (fn_row & 0xF) << fn_xor_shift;
                 if constexpr (fn_vec_size == 1) {
                     #pragma unroll
-                    for (int e = 0; e < 8; e++) {
-                        int kk = c * 8 + e;
-                        int K_wanted = (kk / 8 * mfma_k + lane_id / mfma_n) * 8 + kk % 8;
-                        raw[n][e] = *(s_fn_rd_ptr + fn_row * tile_k +
-                                      (K_wanted ^ ((fn_row & 0xF) << fn_xor_shift)));
+                    for (int t = 0; t < 4; t++) {
+                        hi_raw[n][t] = *(s_fn_rd_ptr + fn_row * tile_k + ((hi_f + t) ^ mask));
+                        lo_raw[n][t] = *(s_fn_rd_ptr + fn_row * tile_k + ((hi_f + 8 + t) ^ mask));
                     }
                 } else {
-                    #pragma unroll
-                    for (int v = 0; v < 8 / fn_vec_size; v++) {
-                        int kk_base = c * 8 + v * fn_vec_size;
-                        int K_wanted_base = (kk_base / 8 * mfma_k + lane_id / mfma_n) * 8 +
-                                            kk_base % 8;
-                        int K_lds_base = K_wanted_base ^ ((fn_row & 0xF) << fn_xor_shift);
-                        fp32x4_t bf_vec = *(reinterpret_cast<fp32x4_t*>(
-                            s_fn_rd_ptr + fn_row * tile_k + K_lds_base));
-                        #pragma unroll
-                        for (int i = 0; i < fn_vec_size; i++) {
-                            raw[n][v * fn_vec_size + i] = bf_vec[i];
-                        }
-                    }
+                    // fn_vec_size == 4 pairs with fn_xor_shift == 2, so the mask's low two
+                    // bits are zero and a 4-float run stays contiguous under the swizzle.
+                    *reinterpret_cast<fp32x4_t*>(hi_raw[n]) = *(reinterpret_cast<fp32x4_t*>(
+                        s_fn_rd_ptr + fn_row * tile_k + (hi_f ^ mask)));
+                    *reinterpret_cast<fp32x4_t*>(lo_raw[n]) = *(reinterpret_cast<fp32x4_t*>(
+                        s_fn_rd_ptr + fn_row * tile_k + ((hi_f + 8) ^ mask)));
                 }
             }
         };
@@ -545,20 +506,18 @@ namespace aiter {
             float* s_fn_rd_ptr = s_fn + (LDS_SLOT) * tile_n * tile_k;                             \
             _Pragma("unroll")                                                                     \
             for (int c = 0; c < n_chunks_bf16; c++) {                                             \
-                float raw[repeat_n][8];                                                           \
-                lds_read_fn_chunk_bf16(s_fn_rd_ptr, raw, c);                                      \
+                float hi_raw[repeat_n][4], lo_raw[repeat_n][4];                                   \
+                lds_read_fn_chunk_bf16(s_fn_rd_ptr, hi_raw, lo_raw, c);                           \
                 s_wait_all_dscnt(0_I);                                                            \
                 _Pragma("unroll")                                                                 \
                 for (int n = 0; n < repeat_n; n++) {                                              \
-                    opus::vector_t<opus::bf16_t, 8> fn_hi, fn_lo;                                 \
-                    /* fn is pre-packed (hi<<16|lo, from mhc_pre_convert_fn); bit-extract both */  \
-                    /* bf16, no fp32->bf16 split -- the redundant per-(m_block,k) work removed. */ \
-                    _Pragma("unroll")                                                             \
-                    for (int e = 0; e < 8; e++) {                                                 \
-                        uint32_t bits = __builtin_bit_cast(uint32_t, raw[n][e]);                  \
-                        fn_hi[e] = __builtin_bit_cast(opus::bf16_t, (uint16_t)(bits >> 16));      \
-                        fn_lo[e] = __builtin_bit_cast(opus::bf16_t, (uint16_t)(bits & 0xFFFFu));  \
-                    }                                                                             \
+                    /* Block-interleaved fn: the two fragments ARE the float runs. */             \
+                    using f32x4_ = opus::vector_t<float, 4>;                                      \
+                    using bf16x8_ = opus::vector_t<opus::bf16_t, 8>;                              \
+                    bf16x8_ fn_hi = __builtin_bit_cast(bf16x8_,                                   \
+                        *reinterpret_cast<f32x4_*>(hi_raw[n]));                                   \
+                    bf16x8_ fn_lo = __builtin_bit_cast(bf16x8_,                                   \
+                        *reinterpret_cast<f32x4_*>(lo_raw[n]));                                   \
                     v_cf[n] = opus::mfma_f32_16x16x32_bf16{}(fn_hi, x_bf[c], v_cf[n]);            \
                     v_cf[n] = opus::mfma_f32_16x16x32_bf16{}(fn_lo, x_bf[c], v_cf[n]);            \
                     __builtin_amdgcn_sched_barrier(0);                                            \
@@ -578,19 +537,31 @@ namespace aiter {
         static constexpr int n_chunks_bf16_w32 = vec_tile / 16;
         static_assert(!mhc_bf16_mma_avail || vec_tile % 16 == 0,
                       "wave32 bf16 needs vec_tile a multiple of 16");
-        auto lds_read_fn_chunk_bf16_w32 = [&](float* s_fn_rd_ptr, float (&raw)[repeat_n][16], int c) {
+        // Block-interleaved fn. The 16 logical K of one wave32 fragment are TWO runs of 8:
+        //   run r (r=0,1):  K0 = k_group*8 + 32*c + 16*r
+        // (x_vec_size=8, interleave_size=2). Each run's hi is 4 consecutive floats at
+        // mhc_fn_hi_float(K0) and its lo the same run + 8, and the runs land in fragment
+        // order, so hi_raw/lo_raw are the two fragments verbatim.
+        auto lds_read_fn_chunk_bf16_w32 = [&](float* s_fn_rd_ptr,
+                                              float (&hi_raw)[repeat_n][8],
+                                              float (&lo_raw)[repeat_n][8], int c) {
             #pragma unroll
             for (int n = 0; n < repeat_n; n++) {
                 int fn_row = n * mfma_n + lane_id % mfma_n;
                 int k_group = lane_id / mfma_m;
+                int mask = (fn_row & 0xF) << fn_xor_shift;
                 #pragma unroll
-                for (int i = 0; i < 16; i++) {
-                    int kk = c * 16 + i;
-                    int K_wanted = k_group * x_vec_size +
-                                   (kk / x_vec_size) * interleave_size * x_vec_size +
-                                   kk % x_vec_size;
-                    raw[n][i] = *(s_fn_rd_ptr + fn_row * tile_k +
-                                  (K_wanted ^ ((fn_row & 0xF) << fn_xor_shift)));
+                for (int r = 0; r < 2; r++) {
+                    int hi_f = mhc_fn_hi_float(k_group * x_vec_size +
+                                               c * 2 * interleave_size * x_vec_size +
+                                               r * interleave_size * x_vec_size);
+                    #pragma unroll
+                    for (int t = 0; t < 4; t++) {
+                        hi_raw[n][r * 4 + t] =
+                            *(s_fn_rd_ptr + fn_row * tile_k + ((hi_f + t) ^ mask));
+                        lo_raw[n][r * 4 + t] =
+                            *(s_fn_rd_ptr + fn_row * tile_k + ((hi_f + 8 + t) ^ mask));
+                    }
                 }
             }
         };
@@ -619,19 +590,18 @@ namespace aiter {
             float* s_fn_rd_ptr = s_fn + (LDS_SLOT) * tile_n * tile_k;                             \
             _Pragma("unroll")                                                                     \
             for (int c = 0; c < n_chunks_bf16_w32; c++) {                                         \
-                float raw[repeat_n][16];                                                          \
-                lds_read_fn_chunk_bf16_w32(s_fn_rd_ptr, raw, c);                                  \
+                float hi_raw[repeat_n][8], lo_raw[repeat_n][8];                                   \
+                lds_read_fn_chunk_bf16_w32(s_fn_rd_ptr, hi_raw, lo_raw, c);                       \
                 s_wait_all_dscnt(0_I);                                                            \
                 _Pragma("unroll")                                                                 \
                 for (int n = 0; n < repeat_n; n++) {                                              \
-                    opus::vector_t<opus::bf16_t, 16> fn_hi, fn_lo;                                \
-                    /* fn is pre-packed (hi<<16|lo); bit-extract both bf16 -- no fp split. */      \
-                    _Pragma("unroll")                                                             \
-                    for (int i = 0; i < 16; i++) {                                                \
-                        uint32_t bits = __builtin_bit_cast(uint32_t, raw[n][i]);                  \
-                        fn_hi[i] = __builtin_bit_cast(opus::bf16_t, (uint16_t)(bits >> 16));      \
-                        fn_lo[i] = __builtin_bit_cast(opus::bf16_t, (uint16_t)(bits & 0xFFFFu));  \
-                    }                                                                             \
+                    /* Block-interleaved fn: the two fragments ARE the float runs. */             \
+                    using f32x8_ = opus::vector_t<float, 8>;                                      \
+                    using bf16x16_ = opus::vector_t<opus::bf16_t, 16>;                            \
+                    bf16x16_ fn_hi = __builtin_bit_cast(bf16x16_,                                 \
+                        *reinterpret_cast<f32x8_*>(hi_raw[n]));                                   \
+                    bf16x16_ fn_lo = __builtin_bit_cast(bf16x16_,                                 \
+                        *reinterpret_cast<f32x8_*>(lo_raw[n]));                                   \
                     v_cf[n] = opus::wmma_f32_16x16x32_bf16{}(fn_hi, x_bf[c], v_cf[n]);            \
                     v_cf[n] = opus::wmma_f32_16x16x32_bf16{}(fn_lo, x_bf[c], v_cf[n]);            \
                     __builtin_amdgcn_sched_barrier(0);                                            \
@@ -725,20 +695,20 @@ namespace aiter {
                 }                                                                                  \
             }                                                                                      \
         } while (0)
-        // is_fn_pack_bf16: bf16 hi/lo MFMA; otherwise fp32 MFMA. The bf16 body (and the
+        // is_res_w_preshuffle_bf16: bf16 hi/lo MFMA; otherwise fp32 MFMA. The bf16 body (and the
         // gfx950-only mfma_f32_16x16x32_bf16 builtin) exists only in the gfx950 device
         // pass; every other arch compiles the fp32 path unconditionally, so the flag is
         // a no-op there (falls back to fp32).
 #if MHC_BF16_MFMA
 #define MHC_PRE_GEMM_STEP(BUF, LDS_SLOT, k, DO_PREFETCH)                    \
-        if constexpr (is_fn_pack_bf16) {                                   \
+        if constexpr (is_res_w_preshuffle_bf16) {                                   \
             GEMM_LOOP_BODY_BF16(BUF, LDS_SLOT, k, DO_PREFETCH);           \
         } else {                                                          \
             GEMM_LOOP_BODY(BUF, LDS_SLOT, k, DO_PREFETCH);               \
         }
 #elif defined(__gfx1250__)
 #define MHC_PRE_GEMM_STEP(BUF, LDS_SLOT, k, DO_PREFETCH)                    \
-        if constexpr (is_fn_pack_bf16) {                                   \
+        if constexpr (is_res_w_preshuffle_bf16) {                                   \
             GEMM_LOOP_BODY_BF16_W32(BUF, LDS_SLOT, k, DO_PREFETCH);       \
         } else {                                                          \
             GEMM_LOOP_BODY(BUF, LDS_SLOT, k, DO_PREFETCH);               \
@@ -822,9 +792,9 @@ namespace aiter {
         aiter_tensor_t& out, // (split_k, m, hc_mult3) / (m, hc_mult3)
         aiter_tensor_t& sqrsum, // (split_k, m) / (m)
         aiter_tensor_t& x, // (m, hc_hidden_size)
-        aiter_tensor_t& fn, // (hc_mult3, hc_hidden_size) fp32; packed int32 (hi<<16|lo) when is_fn_pack_bf16
+        aiter_tensor_t& fn, // (hc_mult3, hc_hidden_size) fp32; packed int32 (hi<<16|lo) when is_res_w_preshuffle_bf16
         int tile_k = 128,
-        int is_fn_pack_bf16 = 0
+        int is_res_w_preshuffle_bf16 = 0
     )
     {
         AITER_CHECK(out.size(0) == sqrsum.size(0), "out and sqrsum must have the same number of split_k or m");
@@ -843,7 +813,7 @@ namespace aiter {
         const HipDeviceGuard device_guard(x.device_id);
         const hipStream_t stream = aiter::getCurrentHIPStream();
 
-        if (is_fn_pack_bf16) {
+        if (is_res_w_preshuffle_bf16) {
 #define MHC_PRE_BF16 true
             MHC_PRE_GEMM_SQRSUM_KERNEL_DISPATCH(tile_k);
 #undef MHC_PRE_BF16
@@ -899,7 +869,8 @@ namespace aiter {
         float hc_post_mult_value,
         int sinkhorn_repeat,
         int n_splits,
-        int sub_hidden_size
+        int sub_hidden_size,
+        int res_preshuffle
     )
     {
         static constexpr int cache_policy = use_nt ? GROUP_NT : RT;
@@ -1092,13 +1063,52 @@ namespace aiter {
             const int res_row_id = res_rowhc_id / hc_mult;
             const int res_hc_id = res_rowhc_id % hc_mult;
             const int K_swizzled = row_hc_iter * res_vec_size;
+            // Pre-shuffled residual (see mhc_res_ks): resS[k/KS][head][row][k%KS].
+            // Both layouts read res_vec_size/KS runs of KS elements at base + p*stride;
+            // for the plain layout stride == KS, i.e. one contiguous res_vec_size run --
+            // which is exactly the 16-byte chunk sequence load_vector_nbytes already
+            // emitted, so the plain path's codegen is unchanged and no second kernel
+            // instantiation is needed.
+            static constexpr int res_ks = mhc_res_ks;
+            // A thread's res_vec_size elements are read as runs of res_run: KS when the
+            // vector spans whole KS blocks, the whole vector when it fits inside one.
+            static constexpr int res_run = res_vec_size < res_ks ? res_vec_size : res_ks;
+            static_assert(res_vec_size % res_run == 0 && res_ks % res_run == 0,
+                "res_vec_size and mhc_res_ks must be multiples of each other");
+            static constexpr int res_pieces = res_vec_size / res_run;
+            static constexpr int res_piece_bytes = res_run * sizeof(DTYPE_I) % 16 == 0
+                ? 16 : (res_run * sizeof(DTYPE_I) % 8 == 0 ? 8 : 4);
+            using res_piece_t = opus::vector_t<DTYPE_I, res_run>;
+            const int64_t res_head_stride = (int64_t)m * res_ks;
+            const int64_t res_kb_stride = (int64_t)hc_mult * res_head_stride;
+            auto buffer_res_shuf = opus::make_gmem<DTYPE_I>(
+                residual, (unsigned int)((int64_t)hc_mult * m * hidden_size * sizeof(DTYPE_I)));
             auto load_res_loop = [&](int i) {
                 res_vec_t v_res;
                 if (i < out_loop) {
-                    v_res = load_vector_nbytes<DTYPE_I, res_vec_size, res_load_bytes, cache_policy, false>(
-                        buffer_res,
-                        res_row_id * residual_stride + res_hc_id * residual_hc_stride +
-                        i * residual_block + K_swizzled);
+                    const int k0 = k_offset + i * residual_block + K_swizzled;
+                    int base, piece_stride;
+                    if (res_preshuffle) {
+                        // see the rmsnorm kernel: row is interior to the shuffled layout, so
+                        // rows >= m_oob need an explicit OOB offset rather than num_records.
+                        base = res_row_id < m_oob
+                             ? (int)((int64_t)(k0 / res_ks) * res_kb_stride
+                                     + (int64_t)res_hc_id * res_head_stride)
+                               + (m_idx + res_row_id) * res_ks + k0 % res_ks
+                             : -1;
+                        piece_stride = res_row_id < m_oob ? (int)res_kb_stride : 0;
+                    } else {
+                        base = res_row_id * residual_stride + res_hc_id * residual_hc_stride
+                             + i * residual_block + K_swizzled;
+                        piece_stride = res_run;
+                    }
+                    auto& buf = res_preshuffle ? buffer_res_shuf : buffer_res;
+                    res_piece_t* dst = reinterpret_cast<res_piece_t*>(&v_res);
+                    #pragma unroll
+                    for (int p = 0; p < res_pieces; p++) {
+                        dst[p] = load_vector_nbytes<DTYPE_I, res_run, res_piece_bytes, cache_policy, false>(
+                            buf, base + p * piece_stride);
+                    }
                 }
                 return v_res;
             };
@@ -1213,7 +1223,8 @@ namespace aiter {
             hc_post_mult_value, \
             sinkhorn_repeat, \
             n_splits, \
-            sub_hidden_size \
+            sub_hidden_size, \
+            res_preshuffle \
         ); \
     });
 
@@ -1244,7 +1255,8 @@ namespace aiter {
         float hc_pre_eps = 1e-6,
         float hc_sinkhorn_eps = 1e-6,
         float hc_post_mult_value = 1.0,
-        int sinkhorn_repeat = 20
+        int sinkhorn_repeat = 20,
+        int res_preshuffle = 0
     )
     {
         int m = residual.size(0);
@@ -1254,6 +1266,8 @@ namespace aiter {
         int hc_mult = residual.size(1);
         int n_splits = gemm_out_mul.dim() > 2 ? gemm_out_mul.size(0) : 1;
         AITER_CHECK(hc_mult == 4, "hc_mult only supports 4");
+        AITER_CHECK(!res_preshuffle || hidden_size % mhc_res_ks == 0,
+                    "pre-shuffled residual needs hidden_size divisible by mhc_res_ks");
 
         const HipDeviceGuard device_guard(layer_input.device_id);
         const hipStream_t stream = aiter::getCurrentHIPStream();
@@ -1719,7 +1733,8 @@ namespace aiter {
         float hc_sinkhorn_eps,
         float norm_eps,
         float hc_post_mult_value,
-        int sinkhorn_repeat
+        int sinkhorn_repeat,
+        int res_preshuffle
     )
     {
         static constexpr int cache_policy = use_nt ? GROUP_NT : RT;
@@ -1923,13 +1938,52 @@ namespace aiter {
             const int out_loop = hidden_size / residual_block;
             const int K_swizzled = row_hc_iter * res_vec_size;
             float sumsq_per_td = 0.0f;
+            // Pre-shuffled residual (see mhc_res_ks), same base + p*stride formulation as
+            // mhc_pre_big_fuse_kernel. Note the cost: this kernel is row-blocked (num_rows
+            // is 1 or 2), so it can never span the shuffled layout's row-contiguous run and
+            // its per-lane run shrinks from res_vec_size to KS elements. The shuffle is a
+            // win for the gemm, which reads tile_m rows at once; here it is a tax.
+            static constexpr int res_ks = mhc_res_ks;
+            // A thread's res_vec_size elements are read as runs of res_run: KS when the
+            // vector spans whole KS blocks, the whole vector when it fits inside one.
+            static constexpr int res_run = res_vec_size < res_ks ? res_vec_size : res_ks;
+            static_assert(res_vec_size % res_run == 0 && res_ks % res_run == 0,
+                "res_vec_size and mhc_res_ks must be multiples of each other");
+            static constexpr int res_pieces = res_vec_size / res_run;
+            static constexpr int res_piece_bytes = res_run * sizeof(DTYPE_I) % 16 == 0
+                ? 16 : (res_run * sizeof(DTYPE_I) % 8 == 0 ? 8 : 4);
+            using res_piece_t = opus::vector_t<DTYPE_I, res_run>;
+            const int64_t res_head_stride = (int64_t)m * res_ks;
+            const int64_t res_kb_stride = (int64_t)hc_mult * res_head_stride;
+            auto buffer_res_shuf = opus::make_gmem<DTYPE_I>(
+                residual, (unsigned int)((int64_t)hc_mult * m * hidden_size * sizeof(DTYPE_I)));
             auto load_res_loop = [&](int i) {
                 res_vec_t v_res;
-                if (i < out_loop && res_row_id < m_oob) {
-                    v_res = load_vector_nbytes<DTYPE_I, res_vec_size, res_load_bytes, 0, false>(
-                        buffer_res,
-                        res_row_id * residual_stride + res_hc_id * residual_hc_stride +
-                        i * residual_block + K_swizzled);
+                if (i < out_loop) {
+                    const int k0 = i * residual_block + K_swizzled;
+                    int base, piece_stride;
+                    if (res_preshuffle) {
+                        // row is interior to the shuffled layout, so num_records can no
+                        // longer clip rows >= m_oob (they alias the next head). Point every
+                        // piece at a negative offset instead -- buffer loads return 0, which
+                        // is what the plain path gets from its num_records bound.
+                        base = res_row_id < m_oob
+                             ? (int)((int64_t)(k0 / res_ks) * res_kb_stride
+                                     + (int64_t)res_hc_id * res_head_stride)
+                               + (m_idx + res_row_id) * res_ks + k0 % res_ks
+                             : -1;
+                        piece_stride = res_row_id < m_oob ? (int)res_kb_stride : 0;
+                    } else {
+                        base = res_row_id * residual_stride + res_hc_id * residual_hc_stride + k0;
+                        piece_stride = res_run;
+                    }
+                    auto& buf = res_preshuffle ? buffer_res_shuf : buffer_res;
+                    res_piece_t* dst = reinterpret_cast<res_piece_t*>(&v_res);
+                    #pragma unroll
+                    for (int p = 0; p < res_pieces; p++) {
+                        dst[p] = load_vector_nbytes<DTYPE_I, res_run, res_piece_bytes, 0, false>(
+                            buf, base + p * piece_stride);
+                    }
                 }
                 return v_res;
             };
@@ -2153,7 +2207,8 @@ namespace aiter {
             hc_sinkhorn_eps, \
             norm_eps, \
             hc_post_mult_value, \
-            sinkhorn_repeat \
+            sinkhorn_repeat, \
+            res_preshuffle \
         ); \
     });
 
@@ -2217,7 +2272,8 @@ namespace aiter {
         float hc_sinkhorn_eps = 1e-6,
         float norm_eps = 1e-6,
         float hc_post_mult_value = 1.0,
-        int sinkhorn_repeat = 20
+        int sinkhorn_repeat = 20,
+        int res_preshuffle = 0
     )
     {
         int m = residual.size(0);
@@ -2227,6 +2283,8 @@ namespace aiter {
         int hc_mult = residual.size(1);
         int n_splits = gemm_out_mul.dim() > 2 ? gemm_out_mul.size(0) : 1;
         AITER_CHECK(hc_mult == 4, "hc_mult only supports 4");
+        AITER_CHECK(!res_preshuffle || hidden_size % mhc_res_ks == 0,
+                    "pre-shuffled residual needs hidden_size divisible by mhc_res_ks");
 
         const HipDeviceGuard device_guard(out.device_id);
         const hipStream_t stream = aiter::getCurrentHIPStream();
@@ -2235,7 +2293,7 @@ namespace aiter {
         MHC_PRE_BIG_FUSE_RM_KERNEL_DISPATCH(m);
     }
 
-    template <typename DTYPE_I, int num_warps, int hc_mult, int tile_m, int tile_n, int tile_k, bool store_nt, bool is_fn_pack_bf16 = false>
+    template <typename DTYPE_I, int num_warps, int hc_mult, int tile_m, int tile_n, int tile_k, bool store_nt, bool is_res_w_preshuffle_bf16 = false>
     __global__ __launch_bounds__(num_warps * opus::get_warp_size(), 1)
     void mhc_fused_post_pre_gemm_sqrsum_kernel(
         float* out,
@@ -2250,9 +2308,7 @@ namespace aiter {
         int hidden_size,
         int x_stride,
         int out_stride,
-        int split_k = 1,
-        int fn_n_pad = 0   // 0: fn is the plain (hc_mult3, hc_hidden_size) layout;
-                           // >0: fn is preshuffled to (hc_hidden_size/32, fn_n_pad, 32)
+        int split_k = 1
     )
     {
         static constexpr int store_policy = store_nt ? GROUP_NT : RT;
@@ -2271,6 +2327,17 @@ namespace aiter {
         static constexpr int n_stages = 2;
         __shared__ DTYPE_I s_x[n_stages * tile_m * tile_k];
         __shared__ DTYPE_I s_residual[n_stages * tile_m * hc_mult * tile_k];
+#if defined(__gfx1250__)
+        // num_warps > 2: the store must be issued by a warp that owns no TDM load
+        // (warps 0/1 issue residual/x), or that warp would carry n_stages loads +
+        // n_stages stores = 4 tensor ops in flight, over the per-wave limit of 3.
+        static constexpr bool nres_tdm = mhc_nres_tdm_store && is_res_w_preshuffle_bf16
+                                         && mhc_res_shuffle && (num_warps > 2);
+#else
+        static constexpr bool nres_tdm = false;
+#endif
+        // Staging tile for the next_residual TDM store; same layout as s_residual.
+        __shared__ DTYPE_I s_nres[nres_tdm ? n_stages * tile_m * hc_mult * tile_k : 1];
 
         int64_t idx = blockIdx.x * tile_m;
         int n_idx = blockIdx.y * tile_n;
@@ -2295,23 +2362,45 @@ namespace aiter {
         using fp32xmma_t = opus::vector_t<float, mma_pack_size>;
 
         DTYPE_I* x_ptr = x + idx * x_stride;
-        // Preshuffled fn is addressed from its base (n_idx folds into the element
-        // offset below) and needs no N bound: the padded rows are zero-filled.
-        float* fn_ptr  = fn_n_pad ? fn : (fn + n_idx * hc_hidden_size);
+        float* fn_ptr  = fn + n_idx * hc_hidden_size;
         float* out_ptr = out + (static_cast<int64_t>(k_split_idx * m + idx)) * out_stride + n_idx;
         int residual_stride = hc_hidden_size;
         int fn_stride = hc_hidden_size;
-        DTYPE_I* residual_ptr = residual + idx * residual_stride;
-        DTYPE_I* next_residual_ptr = next_residual + idx * residual_stride;
+        // Pre-shuffled residual (see mhc_res_ks): resS[k/KS][head][row][k%KS].
+        static constexpr bool res_shuf = is_res_w_preshuffle_bf16 && mhc_res_shuffle;
+        static constexpr int res_ks = mhc_res_ks;
+        static_assert(tile_k % res_ks == 0, "tile_k must be divisible by mhc_res_ks");
+        static constexpr int res_nkb = tile_k / res_ks;              // kb blocks per k-step
+        static constexpr int res_h_stride_lds = tile_m * res_ks;     // LDS head stride
+        static constexpr int res_kb_stride_lds = hc_mult * tile_m * res_ks;
+        const int64_t res_head_stride = (int64_t)m * res_ks;
+        const int64_t res_kb_stride = (int64_t)hc_mult * res_head_stride;
+        // k_split_offset is a multiple of tile_k, hence of KS.
+        const int64_t res_shuf_off =
+            (int64_t)(k_split_offset / res_ks) * res_kb_stride + idx * res_ks;
+        DTYPE_I* residual_ptr = res_shuf
+            ? residual + res_shuf_off : residual + idx * residual_stride;
+        DTYPE_I* next_residual_ptr = res_shuf
+            ? next_residual + res_shuf_off : next_residual + idx * residual_stride;
         const int m_oob = m < idx + tile_m ? (m - idx) : tile_m;
         const int n_oob = hc_mult3 < (n_idx + tile_n) ? (hc_mult3 - n_idx) : tile_n;
         auto g_x = opus::make_gmem<DTYPE_I>(x_ptr, x_stride * sizeof(DTYPE_I) * m_oob);
-        auto g_fn = opus::make_gmem<float>(
-            fn_ptr, fn_n_pad ? (hc_hidden_size * fn_n_pad * (int)sizeof(float))
-                             : (hc_hidden_size * (int)sizeof(float) * n_oob));
-        // fn_n_pad is the row count actually stored per K block (== hc_mult3, unpadded).
-        auto g_res = opus::make_gmem<DTYPE_I>(residual_ptr, residual_stride * sizeof(DTYPE_I) * m_oob);
-        auto g_nres = opus::make_gmem<DTYPE_I>(next_residual_ptr, residual_stride * sizeof(DTYPE_I) * m_oob);
+        auto g_fn = opus::make_gmem<float>(fn_ptr, hc_hidden_size * (int)sizeof(float) * n_oob);
+        // Shuffled bound: this block touches hidden_size/(split_k*KS) kb blocks, NOT
+        // k_loop of them -- one k-step spans res_nkb blocks. (Using k_loop here clamped
+        // 3/4 of the stores out of bounds and made the kernel look 42% faster at m=16384.)
+        // The row dimension is interior to the layout, so the bound cannot express the
+        // m_oob cut the [row][head][k] layout got for free; rows >= m_oob are dropped by
+        // an explicit predicate on the store and zero-filled by the loader instead.
+        const unsigned int res_shuf_bytes = res_shuf
+            ? (unsigned int)(res_kb_stride * (hidden_size / (split_k * res_ks)) * sizeof(DTYPE_I))
+            : 0u;
+        auto g_res = res_shuf
+            ? opus::make_gmem<DTYPE_I>(residual_ptr, res_shuf_bytes)
+            : opus::make_gmem<DTYPE_I>(residual_ptr, residual_stride * sizeof(DTYPE_I) * m_oob);
+        auto g_nres = res_shuf
+            ? opus::make_gmem<DTYPE_I>(next_residual_ptr, res_shuf_bytes)
+            : opus::make_gmem<DTYPE_I>(next_residual_ptr, residual_stride * sizeof(DTYPE_I) * m_oob);
         auto g_o = opus::make_gmem<float>(out_ptr, out_stride * sizeof(float) * m_oob);
 
         static constexpr int tile_mk = tile_m * tile_k;
@@ -2400,15 +2489,32 @@ namespace aiter {
             // in wait_load_cnt(). make() is 2D-only, so the 3D shape/pitch/origin
             // go in through make_from_layout(), already in D# order (dim0 fastest).
             if (warp_id == 0) {
-                using win_t = opus::tdm<DTYPE_I, opus::seq<tile_k, tile_m, hc_mult>>;
-                uint32_t lds = static_cast<uint32_t>(reinterpret_cast<__UINTPTR_TYPE__>(s_residual));
-                DTYPE_I* g = residual_ptr + k_split_offset + k * tile_k;
-                const opus::u32_t shape[3] = {tile_k, (opus::u32_t)m_oob, hc_mult};
-                const opus::u64_t pitch[2] = {(opus::u64_t)residual_stride, (opus::u64_t)hidden_size};
-                const opus::u32_t coord[3] = {0, 0, 0};
-                win_t win;
-                win.make_from_layout(lds, g, shape, pitch, coord);
-                win.async_load(static_cast<uint32_t>(slot * (hc_mult * tile_mk)));
+                if constexpr (res_shuf) {
+                    // Shuffled: 4D tile kk x row x head x kb. The row pitch is KS, so
+                    // (row, kk) is one contiguous tile_m*KS run; TDM writes
+                    // dim0-fastest, giving LDS [kb][head][row][kk].
+                    using win_t = opus::tdm<DTYPE_I, opus::seq<res_ks, tile_m, hc_mult, res_nkb>>;
+                    uint32_t lds = static_cast<uint32_t>(reinterpret_cast<__UINTPTR_TYPE__>(s_residual));
+                    DTYPE_I* g = residual_ptr + (int64_t)k * res_nkb * res_kb_stride;
+                    const opus::u32_t shape[4] = {res_ks, (opus::u32_t)m_oob, hc_mult, res_nkb};
+                    const opus::u64_t pitch[3] = {(opus::u64_t)res_ks,
+                                                  (opus::u64_t)res_head_stride,
+                                                  (opus::u64_t)res_kb_stride};
+                    const opus::u32_t coord[4] = {0, 0, 0, 0};
+                    win_t win;
+                    win.make_from_layout(lds, g, shape, pitch, coord);
+                    win.async_load(static_cast<uint32_t>(slot * (hc_mult * tile_mk)));
+                } else {
+                    using win_t = opus::tdm<DTYPE_I, opus::seq<tile_k, tile_m, hc_mult>>;
+                    uint32_t lds = static_cast<uint32_t>(reinterpret_cast<__UINTPTR_TYPE__>(s_residual));
+                    DTYPE_I* g = residual_ptr + k_split_offset + k * tile_k;
+                    const opus::u32_t shape[3] = {tile_k, (opus::u32_t)m_oob, hc_mult};
+                    const opus::u64_t pitch[2] = {(opus::u64_t)residual_stride, (opus::u64_t)hidden_size};
+                    const opus::u32_t coord[3] = {0, 0, 0};
+                    win_t win;
+                    win.make_from_layout(lds, g, shape, pitch, coord);
+                    win.async_load(static_cast<uint32_t>(slot * (hc_mult * tile_mk)));
+                }
             }
         };
 #else
@@ -2418,7 +2524,37 @@ namespace aiter {
         static constexpr int r_async_load_vec = 16 / sizeof(DTYPE_I) * warp_size <= tile_mk ? 16 / sizeof(DTYPE_I) : 4 / sizeof(DTYPE_I);
 #endif
         static constexpr int residual_load_waitcnt = tile_mk / (warp_size * r_async_load_vec);
-        auto lds_load_residual_tile = [&](int k, int slot){
+        // Shuffled variant (UNVALIDATED: wave64 only -- this machine is gfx1250, which
+        // takes the TDM path above). Per head the tile is res_nkb contiguous runs of
+        // tile_m*KS elements; walk them linearly so the issue count -- and therefore
+        // residual_load_waitcnt -- is unchanged (res_nkb*tile_m*KS == tile_mk).
+        static_assert(!(res_shuf) || r_async_load_vec <= res_ks,
+                      "shuffled residual load must not cross a KS run");
+        auto lds_load_residual_tile_shuf = [&](int k, int slot){
+            DTYPE_I* s_residual_wr_ptr = s_residual + slot * (hc_mult * tile_mk);
+            const int64_t k_off = (int64_t)k * res_nkb * res_kb_stride;
+            #pragma unroll
+            for(int i = 0; i < residual_load_waitcnt; i++) {
+                const int t = i * (warp_size * r_async_load_vec) + lane_id * r_async_load_vec;
+                const int kb = t / (tile_m * res_ks);
+                const int rem = t % (tile_m * res_ks);
+                const int row = rem / res_ks;
+                const int kk = rem % res_ks;
+                const int s_offset = kb * res_kb_stride_lds + warp_id * res_h_stride_lds
+                                   + row * res_ks + kk;
+                const int g_offset = (int)(k_off + (int64_t)kb * res_kb_stride
+                                     + (int64_t)warp_id * res_head_stride) + row * res_ks + kk;
+                if (row < m_oob) {
+                    async_load<r_async_load_vec>(g_res, s_residual_wr_ptr + s_offset, g_offset, 0, opus::number<0>{}, opus::number<GROUP_NT>{});
+                } else {
+                    #pragma unroll
+                    for (int v = 0; v < r_async_load_vec; v++) {
+                        *(s_residual_wr_ptr + s_offset + v) = static_cast<DTYPE_I>(0);
+                    }
+                }
+            }
+        };
+        auto lds_load_residual_tile_plain = [&](int k, int slot){
             static constexpr int rows_per_load = r_async_load_vec * warp_size / tile_k;
             static constexpr int threads_per_row = tile_k / r_async_load_vec;
             DTYPE_I* s_residual_wr_ptr = s_residual + slot * (hc_mult * tile_mk);
@@ -2443,44 +2579,20 @@ namespace aiter {
                 s_offset += s_offset_i;
             }
         };
+        auto lds_load_residual_tile = [&](int k, int slot){
+            if constexpr (res_shuf) { lds_load_residual_tile_shuf(k, slot); }
+            else { lds_load_residual_tile_plain(k, slot); }
+        };
 #endif
         
         static constexpr int fn_load_vec = 16 / sizeof(float);
         static constexpr int fn_load_waitcnt = tile_n * tile_k / (warp_size * fn_load_vec);
         using fp32xfntile = opus::array<fp32xtile, repeat_n>;
-        // fn_n_pad is a launch-uniform scalar, so this is a scalar branch, not a
-        // per-lane one, and both arms issue the identical vec_tile-wide loads --
-        // only the address arithmetic differs.
-        //
-        // Shuffled (fn_n_pad > 0): fnS[Kflat/32][n][Kflat%32]. Every term of kbase
-        // is a multiple of 32 (see mhc_pre_shuffle_fn), so the block index splits as
-        // kbase/32 + kr0/32 and the in-block offset is just kr0 % 32. Consecutive n
-        // are then mfma_n*32 floats apart (2 KB) instead of mfma_n*fn_stride (1.75 MB).
-        const int fn_kbase = warp_id * hidden_size + k_split_offset;
-        const int fn_kr0   = (lane_id / mfma_n) * vec_tile;
         auto vgpr_load_fn_tile = [&](int k) {
             fp32xfntile v_fn;
-            int offset_base, n_step;
-            if (fn_n_pad) {
-                offset_base = ((fn_kbase + k * tile_k + fn_kr0) / 32) * (fn_n_pad * 32)
-                            + (n_idx + lane_id % mfma_n) * 32 + (fn_kr0 % 32);
-                n_step = mfma_n * 32;
-                // N is not padded, so lanes whose row is >= hc_mult3 must still read 0.
-                // Steer them past the buffer bound (the same mechanism the unshuffled
-                // path gets for free from g_fn's n_oob-derived size) instead of storing
-                // zero rows, which would add 33% to fn's read traffic.
-                const int n_row = n_idx + lane_id % mfma_n;
-                for (int n = 0; n < repeat_n; n++) {
-                    v_fn[n] = (n_row + n * mfma_n) < hc_mult3
-                        ? load_vector_nbytes<float, vec_tile, 16, 0, false>(g_fn, offset_base + n * n_step)
-                        : fp32xtile{};
-                }
-                return v_fn;
-            } else {
-                offset_base = lane_id % mfma_n * fn_stride + fn_kbase + lane_id / mfma_n * vec_tile
-                    + k * tile_k;
-                n_step = mfma_n * fn_stride;
-            }
+            const int offset_base = lane_id % mfma_n * fn_stride + warp_id * hidden_size
+                                  + lane_id / mfma_n * vec_tile + k * tile_k + k_split_offset;
+            const int n_step = mfma_n * fn_stride;
             for(int n = 0; n < repeat_n; n++) {
                 v_fn[n] = load_vector_nbytes<float, vec_tile, 16, 0, false>(g_fn, offset_base + n * n_step);
             }
@@ -2546,8 +2658,23 @@ namespace aiter {
                     using DTYPE_I_vec = opus::vector_t<DTYPE_I, ds_read_vec>;
                     DTYPE_I_vec x_vec = *(reinterpret_cast<DTYPE_I_vec*>(s_x_rd_ptr + s_offset));
                     DTYPE_I_vec residual_vec[hc_mult];
-                    for(int h = 0; h < hc_mult; h++) {
-                        residual_vec[h] = *(reinterpret_cast<DTYPE_I_vec*>(s_residual_rd_ptr + s_offset + h * tile_mk));
+                    // k_local within the k-step; ds_read_vec == KS keeps each read
+                    // inside exactly one kk run, so only the addressing changes.
+                    [[maybe_unused]] const int res_kl = s_offset % tile_k;
+                    [[maybe_unused]] const int res_row = b * mfma_m + lane_id % mfma_m;
+                    if constexpr (res_shuf) {
+                        static_assert(ds_read_vec <= res_ks && res_ks % ds_read_vec == 0,
+                                      "ds_read_vec must divide mhc_res_ks");
+                        const int r_base = (res_kl / res_ks) * res_kb_stride_lds
+                                         + res_row * res_ks + (res_kl % res_ks);
+                        for(int h = 0; h < hc_mult; h++) {
+                            residual_vec[h] = *(reinterpret_cast<DTYPE_I_vec*>(
+                                s_residual_rd_ptr + r_base + h * res_h_stride_lds));
+                        }
+                    } else {
+                        for(int h = 0; h < hc_mult; h++) {
+                            residual_vec[h] = *(reinterpret_cast<DTYPE_I_vec*>(s_residual_rd_ptr + s_offset + h * tile_mk));
+                        }
                     }
                     s_wait_all_dscnt(opus::number<hc_mult>{});
                     for(int k = 0; k < ds_read_vec; k++) {
@@ -2563,11 +2690,37 @@ namespace aiter {
                             sqrsum_part[b] += res[t] * res[t];
                         }
                     }
-                    store_vector<DTYPE_I, float, ds_read_vec, 0, false>(
-                        g_nres, res, (b * mfma_m + lane_id % mfma_m) * residual_stride + warp_id * hidden_size + i * tile_k +
-                        (s_offset % tile_k) + k_split_offset);
+                    if constexpr (nres_tdm) {
+                        // Deposit into this warp's head slice of the same
+                        // [kb][head][row][kk] tile the residual TDM load produces;
+                        // it leaves as one TDM store. Rows past m_oob are written
+                        // here and clipped by tensor_dim1 = m_oob.
+                        DTYPE_I* s_nres_wr = s_nres + slot * (hc_mult * tile_mk);
+                        const int w_off = (res_kl / res_ks) * res_kb_stride_lds
+                                        + warp_id * res_h_stride_lds
+                                        + res_row * res_ks + (res_kl % res_ks);
+                        DTYPE_I_vec nres_v;
+                        for (int e = 0; e < ds_read_vec; e++) {
+                            nres_v[e] = static_cast<DTYPE_I>(res[e]);
+                        }
+                        *(reinterpret_cast<DTYPE_I_vec*>(s_nres_wr + w_off)) = nres_v;
+                    } else if constexpr (res_shuf) {
+                        // Rows past m_oob alias the next head's region (row is interior
+                        // to the layout, so the buffer bound cannot cut them) -- drop
+                        // them with a negative offset, which buffer_store discards.
+                        const int nres_off = res_row < m_oob
+                            ? (int)(((int64_t)i * res_nkb + res_kl / res_ks) * res_kb_stride
+                                    + (int64_t)warp_id * res_head_stride)
+                              + res_row * res_ks + (res_kl % res_ks)
+                            : -1;
+                        store_vector<DTYPE_I, float, ds_read_vec, 0, false>(g_nres, res, nres_off);
+                    } else {
+                        store_vector<DTYPE_I, float, ds_read_vec, 0, false>(
+                            g_nres, res, res_row * residual_stride + warp_id * hidden_size + i * tile_k +
+                            res_kl + k_split_offset);
+                    }
                     s_offset += step;
-                    if constexpr (is_fn_pack_bf16 && mhc_bf16_mma_avail) {
+                    if constexpr (is_res_w_preshuffle_bf16 && mhc_bf16_mma_avail) {
 #if MHC_BF16_MFMA
                         // bf16 MFMA (wave64 CDNA): one mfma_f32_16x16x32_bf16 contracts
                         // ds_read_vec (=8) K-elems/lane x 4 lane-groups = 32 K, replacing
@@ -2583,19 +2736,24 @@ namespace aiter {
                         }
                         for(int n = 0; n < repeat_n; n++) {
                             opus::vector_t<opus::bf16_t, ds_read_vec> fn_hi8, fn_lo8;
-                            // fn is pre-packed (hi<<16|lo, from mhc_pre_convert_fn); bit-extract
-                            // both bf16 -- no fp32->bf16 split recomputed per (m_block, k).
-                            for (int e = 0; e < ds_read_vec; e++) {
-                                float fv = v_fn[n][e + j * ds_read_vec];
-                                uint32_t bits = __builtin_bit_cast(uint32_t, fv);
-                                fn_hi8[e] = __builtin_bit_cast(opus::bf16_t, (uint16_t)(bits >> 16));
-                                fn_lo8[e] = __builtin_bit_cast(opus::bf16_t, (uint16_t)(bits & 0xFFFFu));
+                            {
+                                // Fragment is 8 bf16 = 4 floats; block j/2 is [8 f32 hi][8 f32 lo]
+                                // and the wanted half sits at (j%2)*4 inside each.
+                                using f32x4 = opus::vector_t<float, 4>;
+                                const int off = (j / 2) * 16 + (j % 2) * 4;
+                                f32x4 hi_raw, lo_raw;
+                                for (int e = 0; e < 4; e++) {
+                                    hi_raw[e] = v_fn[n][off + e];
+                                    lo_raw[e] = v_fn[n][off + 8 + e];
+                                }
+                                fn_hi8 = __builtin_bit_cast(opus::vector_t<opus::bf16_t, 8>, hi_raw);
+                                fn_lo8 = __builtin_bit_cast(opus::vector_t<opus::bf16_t, 8>, lo_raw);
                             }
                             v_cf[b][n] = opus::mfma_f32_16x16x32_bf16{}(fn_hi8, res_bf, v_cf[b][n]);
                             v_cf[b][n] = opus::mfma_f32_16x16x32_bf16{}(fn_lo8, res_bf, v_cf[b][n]);
                         }
 #elif defined(__gfx1250__)
-                        // UNVERIFIED (no gfx1250 HW): wave32 WMMA bf16. One
+                        // wave32 WMMA bf16 (validated on gfx1250). One
                         // wmma_f32_16x16x32_bf16 needs 16 K-elems/lane = two band_j steps
                         // combined (2 x ds_read_vec). fn and res are placed at the same
                         // fragment index using the exact (k,j) pairing the fp32 path uses
@@ -2613,16 +2771,25 @@ namespace aiter {
                             }
                             for (int n = 0; n < repeat_n; n++) {
                                 opus::vector_t<opus::bf16_t, 16> fn_hi, fn_lo;
-                                // fn is pre-packed (hi<<16|lo); bit-extract both bf16 -- no fp split.
-                                for (int e = 0; e < ds_read_vec; e++) {
-                                    float fv0 = v_fn[n][e + (j - 1) * ds_read_vec];
-                                    float fv1 = v_fn[n][e + j * ds_read_vec];
-                                    uint32_t b0 = __builtin_bit_cast(uint32_t, fv0);
-                                    uint32_t b1 = __builtin_bit_cast(uint32_t, fv1);
-                                    fn_hi[e]               = __builtin_bit_cast(opus::bf16_t, (uint16_t)(b0 >> 16));
-                                    fn_hi[ds_read_vec + e] = __builtin_bit_cast(opus::bf16_t, (uint16_t)(b1 >> 16));
-                                    fn_lo[e]               = __builtin_bit_cast(opus::bf16_t, (uint16_t)(b0 & 0xFFFFu));
-                                    fn_lo[ds_read_vec + e] = __builtin_bit_cast(opus::bf16_t, (uint16_t)(b1 & 0xFFFFu));
+                                // The 64 B this lane already loaded IS [16 hi][16 lo] for
+                                // this k block, so the two fragments are its halves --
+                                // no shift, no mask, no v_perm. 16 floats per block, hi in
+                                // the first 8, lo in the next 8.
+                                {
+                                    // Move in FLOAT units (whole-VGPR v_mov, foldable by the
+                                    // register allocator) and reinterpret once. Slicing a bf16
+                                    // vector element-wise instead makes the compiler emit
+                                    // sub-register extract/insert -- the very shift+mask this
+                                    // layout exists to remove.
+                                    using f32x8 = opus::vector_t<float, 8>;
+                                    const int off = ((j - 1) * ds_read_vec / 16) * 16;
+                                    f32x8 hi_raw, lo_raw;
+                                    for (int e = 0; e < 8; e++) {
+                                        hi_raw[e] = v_fn[n][off + e];
+                                        lo_raw[e] = v_fn[n][off + 8 + e];
+                                    }
+                                    fn_hi = __builtin_bit_cast(opus::vector_t<opus::bf16_t, 16>, hi_raw);
+                                    fn_lo = __builtin_bit_cast(opus::vector_t<opus::bf16_t, 16>, lo_raw);
                                 }
                                 v_cf[b][n] = opus::wmma_f32_16x16x32_bf16{}(fn_hi, res_bf, v_cf[b][n]);
                                 v_cf[b][n] = opus::wmma_f32_16x16x32_bf16{}(fn_lo, res_bf, v_cf[b][n]);
@@ -2698,13 +2865,44 @@ namespace aiter {
         // proves stage i+s resident ONLY while all n_stages-1 later stages are
         // actually outstanding -- true throughout the steady state, and the reason
         // the tail below falls back to a full drain once the ring stops refilling.
+        // ---- next_residual store via TDM (mirror of lds_load_residual_tile) ----
+        // The same 4D tile kk x row x head x kb, read back out of LDS. Warp 2 owns
+        // no TDM load, so issuing here keeps every wave at n_stages tensor ops. Order
+        // is: deposit (compute_store_tile) -> nres_deposit_fence -> workgroup barrier
+        // -> issue; slot reuse is held behind the store by MHC_TDM_KEEP(n_stages-1)
+        // in wait_load_cnt.
+        auto nres_deposit_fence = [&](){ if constexpr (nres_tdm) { s_wait_all_dscnt(0_I); } };
+#if defined(__gfx1250__)
+        auto tdm_store_nres_tile = [&](int k, int slot){
+            if constexpr (nres_tdm) {
+                if (warp_id == 2) {
+                    using win_t = opus::tdm<DTYPE_I, opus::seq<res_ks, tile_m, hc_mult, res_nkb>>;
+                    uint32_t lds = static_cast<uint32_t>(reinterpret_cast<__UINTPTR_TYPE__>(s_nres));
+                    DTYPE_I* g = next_residual_ptr + (int64_t)k * res_nkb * res_kb_stride;
+                    const opus::u32_t shape[4] = {res_ks, (opus::u32_t)m_oob, hc_mult, res_nkb};
+                    const opus::u64_t pitch[3] = {(opus::u64_t)res_ks,
+                                                  (opus::u64_t)res_head_stride,
+                                                  (opus::u64_t)res_kb_stride};
+                    const opus::u32_t coord[4] = {0, 0, 0, 0};
+                    win_t win;
+                    win.make_from_layout(lds, g, shape, pitch, coord);
+                    win.async_store(static_cast<uint32_t>(slot * (hc_mult * tile_mk)));
+                }
+            }
+        };
+#else
+        auto tdm_store_nres_tile = [](int, int){};
+#endif
+
         int i = 0;
         for(; i + 2 * n_stages - 1 < k_loop; i += n_stages) {
             opus::static_for<n_stages>([&](auto S) {
                 constexpr int s = S.value;
                 wait_load_cnt();
                 compute_store_tile(i + s, s, v_fn[s]);
+                nres_deposit_fence();
                 __builtin_amdgcn_s_barrier();
+                tdm_store_nres_tile(i + s, s);
                 lds_load_x_tile(i + s + n_stages, s);
                 lds_load_residual_tile(i + s + n_stages, s);
                 v_fn[s] = vgpr_load_fn_tile(i + s + n_stages);
@@ -2729,7 +2927,9 @@ namespace aiter {
                 if (k + n_stages < k_loop) {
                     wait_load_cnt();
                     compute_store_tile(k, slot, v_fn[slot]);
+                    nres_deposit_fence();
                     __builtin_amdgcn_s_barrier();
+                    tdm_store_nres_tile(k, slot);
                     lds_load_x_tile(k + n_stages, slot);
                     lds_load_residual_tile(k + n_stages, slot);
                     v_fn[slot] = vgpr_load_fn_tile(k + n_stages);
@@ -2738,9 +2938,16 @@ namespace aiter {
                     MHC_TDM_DRAIN();
                     __builtin_amdgcn_s_barrier();
                     compute_store_tile(k, slot, v_fn[slot]);
+                    if constexpr (nres_tdm) {
+                        nres_deposit_fence();
+                        __builtin_amdgcn_s_barrier();
+                        tdm_store_nres_tile(k, slot);
+                    }
                 }
             }
         });
+        // Every next_residual TDM store must retire before the kernel ends.
+        if constexpr (nres_tdm) { MHC_TDM_DRAIN(); }
 
         // Reduce v_cf (gemm_out_mul) and sqrsum across the hc_mult warps in LDS so
         // only warp 0 writes a single (split_k) partial, instead of each warp
@@ -2829,8 +3036,7 @@ namespace aiter {
                 hidden_size, \
                 x_stride, \
                 out_stride, \
-                split_k, \
-                fn_n_pad); \
+                split_k); \
     });
 
 #define MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL(num_warps, tile_m, tile_n, tile_k) \
@@ -2876,25 +3082,18 @@ namespace aiter {
         int tile_m = 16,
         int tile_n = 32,
         int tile_k = 32,
-        int is_fn_pack_bf16 = 0,
-        // 0: fn is the plain (hc_mult3, hc_hidden_size) layout.
-        // >0: fn came from mhc_pre_shuffle_fn -> (hc_hidden_size/32, fn_n_pad, 32).
-        int fn_n_pad = 0)
+        int is_res_w_preshuffle_bf16 = 0)
     {
         int m = layer_input.size(0);
         int hidden_size = layer_input.size(1);
         int hc_mult = residual_in.size(1);
-        // Preshuffled fn is (hc_hidden_size/32, fn_n_pad, 32), so hc_mult3 / hc_hidden_size
-        // are no longer its dim0/dim1 and its stride(0) is not the K pitch. Derive them
-        // from the shapes that do not change, and check the shuffled shape instead.
-        const bool fn_shuffled = fn_n_pad > 0;
-        int hc_mult3 = fn_shuffled ? (hc_mult * hc_mult + 2 * hc_mult) : (int)fn.size(0);
-        int hc_hidden_size = fn_shuffled ? (hc_mult * hidden_size) : (int)fn.size(1);
+        int hc_mult3 = fn.size(0);
+        int hc_hidden_size = fn.size(1);
         int x_stride = layer_input.stride(0);
         int out_stride = gemm_out_mul.stride(1);
         int split_k = gemm_out_sqrsum.size(0);
         const int res_stride = residual_in.stride(0);
-        const int fn_stride = fn_shuffled ? hc_hidden_size : (int)fn.stride(0);
+        const int fn_stride = (int)fn.stride(0);
 
         AITER_CHECK(hc_mult == 4, "hc_mult only supports 4");
         AITER_CHECK(res_stride == hc_hidden_size,
@@ -2902,14 +3101,6 @@ namespace aiter {
                     hc_hidden_size,
                     "), got ",
                     res_stride);
-        if (fn_shuffled) {
-            AITER_CHECK(fn.dim() == 3 && fn.size(0) == hc_hidden_size / 32 &&
-                            fn.size(1) == fn_n_pad && fn.size(2) == 32,
-                        "preshuffled fn must be (hc_hidden_size/32, fn_n_pad, 32)");
-            AITER_CHECK(fn_n_pad == hc_mult3, "fn_n_pad must equal hc_mult3 (rows per K block)");
-            AITER_CHECK(hc_hidden_size % 32 == 0,
-                        "hc_hidden_size must be divisible by 32 for the preshuffled fn");
-        } else {
             AITER_CHECK(fn_stride == hc_hidden_size,
                         "fn stride(0) must equal hc_hidden_size (",
                         hc_hidden_size,
@@ -2917,7 +3108,6 @@ namespace aiter {
                         fn_stride);
             AITER_CHECK(hc_hidden_size == hc_mult * hidden_size,
                         "fn K dim must equal hc_mult * hidden_size");
-        }
         AITER_CHECK(gemm_out_mul.size(0) == split_k,
                     "gemm_out_mul dim0 must be split_k");
         AITER_CHECK(gemm_out_sqrsum.size(0) == split_k,
@@ -2943,7 +3133,7 @@ namespace aiter {
         const hipStream_t stream = aiter::getCurrentHIPStream();
         dim3 block(block_size);
 
-        if (is_fn_pack_bf16) {
+        if (is_res_w_preshuffle_bf16) {
 #define MHC_FUSED_BF16 true
             MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_DISPATCH(tile_k);
 #undef MHC_FUSED_BF16

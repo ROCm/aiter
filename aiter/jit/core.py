@@ -939,6 +939,14 @@ def build_module(
         if not AITER_DISABLE_KERNARG_PRELOAD:
             flags_hip += ["-mllvm --amdgpu-kernarg-preload-count=32"]
 
+        # AITER_DEBUG_INFO=1 emits device-side DWARF so rocprofv3 ATT can map instructions
+        # back to source lines (the Source column is empty without it). Verified not to
+        # change codegen -- same VGPR count and occupancy with and without -- but it
+        # inflates compile time (~30% on module_mhc) and object size (4.5 MB -> 16 MB),
+        # so it is opt-in rather than always on.
+        if int(os.environ.get("AITER_DEBUG_INFO", "0")) != 0:
+            flags_hip += ["-g"]
+
         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
         hip_version = parse(get_hip_version().split()[-1].rstrip("-").replace("-", "+"))
         if hip_version <= Version("6.3.42132"):

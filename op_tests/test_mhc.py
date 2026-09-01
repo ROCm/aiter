@@ -460,7 +460,7 @@ def mhc_pre_norm_split_hip(
 
 @benchmark()
 def test_mhc_pre(
-    m, hidden_size, hc_mult, test_hc_head=False, fuse_rmsnorm=False, fn_pack_bf16=False
+    m, hidden_size, hc_mult, test_hc_head=False, fuse_rmsnorm=False, res_w_preshuffle_bf16=False
 ):
     if fuse_rmsnorm and test_hc_head:
         raise ValueError("fuse_rmsnorm and hc_head are mutually exclusive")
@@ -527,10 +527,10 @@ def test_mhc_pre(
     ret["hip_us"] = hip_us
 
     # bf16 GEMM path: pre-pack fn (fp32) -> int32 (hi<<16|lo) ONCE via mhc_pre_convert_fn
-    # (fn are constant weights), then run mhc_pre with is_fn_pack_bf16=1 so the gemm
+    # (fn are constant weights), then run mhc_pre with is_res_w_preshuffle_bf16=1 so the gemm
     # bit-extracts hi/lo instead of recomputing the fp32->bf16 split per (m_block, k).
     # On gfx950 this uses the native bf16 MFMA; gfx1250 the wave32 bf16 WMMA (UNVERIFIED).
-    if fn_pack_bf16:
+    if res_w_preshuffle_bf16:
         from aiter.ops.mhc import mhc_pre_convert_fn
 
         fn_packed = torch.empty(
@@ -547,7 +547,7 @@ def test_mhc_pre(
             fn_packed,
             hc_scale,
             hc_base,
-            is_fn_pack_bf16=1,
+            is_res_w_preshuffle_bf16=1,
             **hip_kwargs,
         )
         ret["hip_bf16_err"] = checkAllclose(
@@ -794,13 +794,12 @@ def test_mhc_post_pre(
     hc_mult,
     fuse_rmsnorm=False,
     large_m=False,
-    fn_pack_bf16=False,
-    fn_shuffle=False,
+    res_w_preshuffle_bf16=False,
 ):
     """Fused mhc_post + mhc_pre: HIP ``mhc_fused_post_pre`` vs ref / unfused HIP / Triton.
 
-    --fn_pack_bf16 toggles the gemm compute for ALL HIP paths (unfused, fused, large_m):
-    on -> pre-packed bf16 hi/lo MFMA (is_fn_pack_bf16=1); off -> fp32.
+    --res_w_preshuffle_bf16 toggles the gemm compute for ALL HIP paths (unfused, fused, large_m):
+    on -> pre-packed bf16 hi/lo MFMA (is_res_w_preshuffle_bf16=1); off -> fp32.
     """
     if hidden_size < 512:
         aiter.logger.info(
@@ -857,38 +856,37 @@ def test_mhc_post_pre(
     if fuse_rmsnorm:
         hip_kwargs["norm_weight"] = norm_weight
 
-    ret = {"fuse_rmsnorm": fuse_rmsnorm, "fn_pack_bf16": fn_pack_bf16}
-    if fn_shuffle:
-        ret["fn_shuffle"] = True
+    ret = {"fuse_rmsnorm": fuse_rmsnorm, "res_w_preshuffle_bf16": res_w_preshuffle_bf16}
 
-    # --fn_pack_bf16 toggles the gemm compute for all HIP paths: on -> pre-pack fn (fp32)
-    # into int32 (hi<<16|lo) ONCE via mhc_pre_convert_fn and run with is_fn_pack_bf16=1 so
+    # --res_w_preshuffle_bf16 toggles the gemm compute for all HIP paths: on -> pre-pack fn (fp32)
+    # into int32 (hi<<16|lo) ONCE via mhc_pre_convert_fn and run with is_res_w_preshuffle_bf16=1 so
     # the gemm bit-extracts hi/lo (gfx950 native bf16 MFMA; gfx1250 wave32 bf16 WMMA,
     # UNVERIFIED; other arches fall back to fp32); off -> plain fp32 fn.
-    if fn_pack_bf16:
-        from aiter.ops.mhc import mhc_pre_convert_fn
+    if res_w_preshuffle_bf16:
+        from aiter.ops.mhc import (
+            MHC_RES_SHUFFLE,
+            mhc_pre_convert_fn,
+            mhc_res_shuffle,
+            mhc_res_unshuffle,
+        )
 
         fn_gemm = torch.empty(
             fn.shape[0], fn.shape[1], dtype=torch.int32, device=fn.device
         )
         mhc_pre_convert_fn(fn_gemm, fn)
         pack_flag = 1
+        # The flag also switches the residual to the pre-shuffled layout
+        # res[k/KS][head][row][k%KS], which only the fused path understands. Convert at
+        # the call boundary here; in a real stack the conversion disappears because
+        # next_residual feeds the next layer's residual_in already shuffled. The unfused
+        # reference path below keeps the plain layout.
+        residual_in_fused = (
+            mhc_res_shuffle(residual_in) if MHC_RES_SHUFFLE else residual_in
+        )
     else:
         fn_gemm = fn
         pack_flag = 0
-
-    # --fn_shuffle preshuffles fn for the FUSED gemm only: fn[n][K] -> fnS[K//32][n][K%32]
-    # so a wave's fn tile is one contiguous run instead of 16 segments fn_stride apart.
-    # The unfused mhc_pre path stages fn through LDS with its own XOR swizzle and keeps
-    # the plain layout, so it still gets fn_gemm.
-    if fn_shuffle:
-        from aiter.ops.mhc import mhc_fn_shuffle_n_pad, mhc_pre_shuffle_fn_alloc
-
-        fn_fused = mhc_pre_shuffle_fn_alloc(fn, pack_flag)
-        fused_kwargs = {"fn_n_pad": mhc_fn_shuffle_n_pad(fn.shape[0])}
-    else:
-        fn_fused = fn_gemm
-        fused_kwargs = {}
+        residual_in_fused = residual_in
 
     (
         post_mix_unfused,
@@ -904,7 +902,7 @@ def test_mhc_post_pre(
         fn_gemm,
         hc_scale,
         hc_base,
-        is_fn_pack_bf16=pack_flag,
+        is_res_w_preshuffle_bf16=pack_flag,
         **hip_kwargs,
     )
 
@@ -916,15 +914,14 @@ def test_mhc_post_pre(
     ), fused_us = run_perftest(
         aiter.mhc_fused_post_pre,
         layer_input,
-        residual_in,
+        residual_in_fused,
         post_layer_mix,
         comb_res_mix,
-        fn_fused,
+        fn_gemm,
         hc_scale,
         hc_base,
         force_fused=True,
-        is_fn_pack_bf16=pack_flag,
-        **fused_kwargs,
+        is_res_w_preshuffle_bf16=pack_flag,
         **hip_kwargs,
     )
 
@@ -934,6 +931,8 @@ def test_mhc_post_pre(
         layer_input_ref, layer_input_unfused, msg="unfused/layer_input"
     )
     checkAllclose(next_residual_ref, next_residual_unfused, msg="unfused/next_residual")
+    if res_w_preshuffle_bf16 and MHC_RES_SHUFFLE:
+        next_residual_fused = mhc_res_unshuffle(next_residual_fused)
     checkAllclose(post_mix_ref, post_mix_fused, msg="fused/post_mix")
     checkAllclose(comb_mix_ref, comb_mix_fused, msg="fused/comb_mix")
     hip_fused_err = checkAllclose(
@@ -1015,7 +1014,7 @@ def test_mhc_post_pre(
                 fn_gemm,
                 hc_scale,
                 hc_base,
-                is_fn_pack_bf16=pack_flag,
+                is_res_w_preshuffle_bf16=pack_flag,
                 **hip_kwargs,
             )
             ret["large_m_us"] = large_m_us
@@ -1077,21 +1076,14 @@ parser.add_argument(
     "(gfx950, M>1024, mhc_fused_post_pre_large_m).",
 )
 parser.add_argument(
-    "--fn_pack_bf16",
+    "--res_w_preshuffle_bf16",
     action="store_true",
-    help="Use the bf16 (fn hi/lo pack) compute path (is_fn_pack_bf16=1). For mhc_pre this "
-    "adds hip_bf16_err/hip_bf16_us alongside fp32; for mhc_post_pre it switches ALL HIP "
-    "paths (unfused, fused, large_m) from fp32 to bf16. gfx950 native bf16 MFMA; gfx1250 "
-    "wave32 bf16 WMMA (UNVERIFIED); other arches fall back to fp32.",
-)
-
-parser.add_argument(
-    "--fn_shuffle",
-    action="store_true",
-    help="Preshuffle fn for the FUSED mhc_post_pre gemm (fn[n][K] -> fnS[K//32][n][K%32]) "
-    "so a wave's fn tile is one contiguous run instead of 16 segments fn_stride apart. "
-    "Combines with --fn_pack_bf16. Fused path only; the unfused mhc_pre path keeps the "
-    "plain layout.",
+    help="Pre-shuffled weight + residual bf16 path. fn is converted once by "
+    "mhc_pre_convert_fn into block-interleaved bf16 hi/lo (fn[n][k/16][0|1][k%16]) and the "
+    "gemm contracts it with two bf16 MMAs, no per-element unpacking; the fused path's "
+    "residual_in/next_residual additionally use resS[k/KS][head][row][k%KS] (converted at "
+    "the call boundary here). gfx950 native bf16 MFMA; gfx1250 wave32 bf16 WMMA; other "
+    "arches fall back to fp32.",
 )
 
 args = parser.parse_args()
@@ -1107,7 +1099,7 @@ for dtype in args.dtype:
                     hc_mult=hc_mult,
                     test_hc_head=args.hc_head,
                     fuse_rmsnorm=args.fuse_rmsnorm,
-                    fn_pack_bf16=args.fn_pack_bf16,
+                    res_w_preshuffle_bf16=args.res_w_preshuffle_bf16,
                 )
                 df.append(ret)
 df = pd.DataFrame(df)
@@ -1137,8 +1129,7 @@ if not args.hc_head:
                         hc_mult=hc_mult,
                         fuse_rmsnorm=args.fuse_rmsnorm,
                         large_m=args.largeM,
-                        fn_pack_bf16=args.fn_pack_bf16,
-                        fn_shuffle=args.fn_shuffle,
+                        res_w_preshuffle_bf16=args.res_w_preshuffle_bf16,
                     )
                     if ret.get("skipped"):
                         continue
