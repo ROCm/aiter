@@ -244,7 +244,7 @@ def get_flydsl_stage1_kernels(
                                     if xcd > 0:
                                         base += f"_xcd{xcd}"
                                     # k_wave (intra-block K-slice): only for the
-                                    # small-M tiles (tile_m in {16,32}), no split-K/mock,
+                                    # small-M tiles (tile_m==32, plus 16 on a16w4 only),
                                     # and capped to <=8 total waves (<=512 threads).
                                     num_n_waves = min(4, tn // 32)
                                     _small_m = tm == 32 or (tm == 16 and is_a16w4)
@@ -532,7 +532,8 @@ def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
             for tk in tile_ks:
                 # The kernel splits the 4 waves into (4/kw) N-waves x kw K-waves, so
                 # each N-wave covers tn/(4/kw) cols, a multiple of 16 for the 16x16 MMA
-                # (kw=1 therefore requires tn >= 64); kw > 1 additionally needs
+                # (so kw=1 requires tn % 64 == 0, not merely tn >= 64: 80, 96, 112 and
+                # 160 are all dropped); kw > 1 additionally needs
                 # 4*tn <= tk so the K-slice fits the tile. b_nt=0 (L2-cached W loads)
                 # is registered alongside the default nt/streaming b_nt=2: large-M
                 # weight reuse wants cached, decode wants streamed.
