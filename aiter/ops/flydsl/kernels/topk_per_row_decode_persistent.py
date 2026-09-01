@@ -39,7 +39,6 @@ _RUNNING_EQUAL = 7
 
 @cache
 def build_topk_per_row_decode_one_workgroup_module(
-    rows: int,
     k: int,
     write_values: bool = False,
 ):
@@ -422,6 +421,7 @@ def build_topk_per_row_decode_one_workgroup_module(
         width: fx.Int32,
         next_n: fx.Int32,
         stride0: fx.Int32,
+        rows_m: fx.Int32,
         stream: fx.Stream,
     ):
         topk_per_row_decode_one_workgroup_kernel(
@@ -434,7 +434,7 @@ def build_topk_per_row_decode_one_workgroup_module(
             stride0,
             write_values,
         ).launch(
-            grid=(rows, 1, 1),
+            grid=(rows_m, 1, 1),
             block=(_BLOCK_THREADS, 1, 1),
             stream=stream,
         )

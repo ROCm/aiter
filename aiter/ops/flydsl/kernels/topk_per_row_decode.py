@@ -182,7 +182,6 @@ def _make_stable_write_storage(num_waves: int):
 
 @cache
 def build_topk_per_row_decode_module(
-    rows: int,
     k: int,
     stable: bool,
     write_values: bool = False,
@@ -809,6 +808,7 @@ def build_topk_per_row_decode_module(
         n: fx.Int32,
         next_n: fx.Int32,
         stride0: fx.Int32,
+        rows_m: fx.Int32,
         stream: fx.Stream,
     ):
         for pass_idx in range_constexpr(_NUM_RADIX_PASSES):
@@ -845,7 +845,7 @@ def build_topk_per_row_decode_module(
                 write_values,
             )
             histogram.launch(
-                grid=(rows, chunks_per_row, 1),
+                grid=(rows_m, chunks_per_row, 1),
                 block=(block_threads, 1, 1),
                 stream=stream,
             )
@@ -859,7 +859,7 @@ def build_topk_per_row_decode_module(
                 fx.Int32(pass_idx == 0),
             )
             reduce_select.launch(
-                grid=(rows, 1, 1),
+                grid=(rows_m, 1, 1),
                 block=(reduce_threads, 1, 1),
                 stream=stream,
             )
@@ -867,7 +867,7 @@ def build_topk_per_row_decode_module(
         if stable:
             stable_count_prefix = stable_count_prefix_kernel(partial_hist, state)
             stable_count_prefix.launch(
-                grid=(rows, 1, 1),
+                grid=(rows_m, 1, 1),
                 block=(_FUSED_PREFIX_THREADS, 1, 1),
                 stream=stream,
             )
@@ -884,7 +884,7 @@ def build_topk_per_row_decode_module(
                 write_values,
             )
             stable_write.launch(
-                grid=(rows, chunks_per_row, 1),
+                grid=(rows_m, chunks_per_row, 1),
                 block=(block_threads, 1, 1),
                 stream=stream,
             )
@@ -901,7 +901,7 @@ def build_topk_per_row_decode_module(
                 write_values,
             )
             gather.launch(
-                grid=(rows, chunks_per_row, 1),
+                grid=(rows_m, chunks_per_row, 1),
                 block=(block_threads, 1, 1),
                 stream=stream,
             )
