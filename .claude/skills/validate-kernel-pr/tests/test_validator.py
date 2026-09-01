@@ -30,6 +30,20 @@ REQUIRED_STAGES = {
     "execution_receipt",
     "index_width_scan",
 }
+# Stages that may be absent without making a report incomplete. `perf` runs only when the
+# target exposes a benchmark harness and both phases completed, so its presence is a
+# property of the PR under test rather than of the validator. Asserting an exact stage set
+# would turn every optional stage into a failure in all 25 tests; asserting a subset plus
+# this allowlist keeps the real intent -- every required stage present and well-formed, and
+# nothing unrecognised sitting alongside them.
+OPTIONAL_STAGES = {"perf", "claims"}
+
+
+def assert_stage_set(stages):
+    if missing := REQUIRED_STAGES - set(stages):
+        raise AssertionError(f"required stages missing: {sorted(missing)}")
+    if unknown := set(stages) - REQUIRED_STAGES - OPTIONAL_STAGES:
+        raise AssertionError(f"unrecognised stages present: {sorted(unknown)}")
 
 
 def validate_report_contract(report):
@@ -58,8 +72,7 @@ def validate_report_contract(report):
         "INCONCLUSIVE",
     }:
         raise AssertionError(f"invalid verdict: {report['verdict']}")
-    if set(report["stages"]) != REQUIRED_STAGES:
-        raise AssertionError(f"invalid stage set: {set(report['stages'])}")
+    assert_stage_set(report["stages"])
     for name, stage in report["stages"].items():
         if not isinstance(stage, dict):
             raise TypeError(f"{name} is not an object")
@@ -197,6 +210,63 @@ class ValidatorFixture:
         run(["git", "reset", "--hard", "-q", "HEAD"], cwd=self.repo)
         return patch_path
 
+    BENCH_TARGET = "tests/test_bench.py"
+
+    def add_bench_target(self, scale="1.0"):
+        """Commit a timeable target, so a later patch can change what it costs.
+
+        The perf stage compares base against head, so the target has to exist on BOTH
+        sides. A target the patch *adds* is a different case with its own test below.
+        """
+        (self.repo / self.BENCH_TARGET).write_text(
+            "import argparse\n"
+            "\n"
+            f"SCALE = {scale}\n"
+            "\n"
+            "\n"
+            "def run_kernel(dim):\n"
+            "    return dim * SCALE / 100.0\n"
+            "\n"
+            "\n"
+            "def main():\n"
+            "    parser = argparse.ArgumentParser()\n"
+            "    parser.add_argument('--scenario', default='test',\n"
+            "                        choices=['test', 'bench'])\n"
+            "    parser.parse_args()\n"
+            "    print('| dim | kernel us | reference us |')\n"
+            "    print('|---|---|---|')\n"
+            "    for dim in (1024, 2048, 4096, 8192):\n"
+            "        print(f'| {dim} | {run_kernel(dim)} | {dim / 50.0} |')\n"
+            "    print('4/4 cases passed')\n"
+            "\n"
+            "\n"
+            "if __name__ == '__main__':\n"
+            "    main()\n"
+        )
+        run(["git", "add", "-A"], cwd=self.repo)
+        run(
+            [
+                "git",
+                "-c",
+                "user.name=Validator Test",
+                "-c",
+                "user.email=validator@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "add bench target",
+            ],
+            cwd=self.repo,
+        )
+
+    def rewrite_bench(self, body):
+        """Return a mutate() that replaces the bench target wholesale."""
+
+        def mutate(repo):
+            (repo / self.BENCH_TARGET).write_text(body)
+
+        return mutate
+
     def validate(
         self,
         patch,
@@ -208,6 +278,7 @@ class ValidatorFixture:
         expected_route="test_sample:run_kernel",
         grid_value="7,257,f32",
         python_bin=None,
+        perf=True,
     ):
         report = self.root / f"{patch.stem}-report.json"
         command = [
@@ -240,6 +311,8 @@ class ValidatorFixture:
                     grid_value,
                 ]
             )
+        if not perf:
+            command.append("--no-perf")
         environment = os.environ.copy()
         environment["PICKER"] = str(picker or self.picker)
         environment["PYTHONPATH"] = str(self.fake_modules)
@@ -289,7 +362,7 @@ class ValidateKernelPrTests(unittest.TestCase):
         )
 
     def assert_complete_stage_objects(self, report):
-        self.assertEqual(REQUIRED_STAGES, set(report["stages"]))
+        assert_stage_set(report["stages"])
         for stage in report["stages"].values():
             self.assertIsInstance(stage, dict)
             self.assertIn("status", stage)
@@ -317,9 +390,7 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assert_complete_stage_objects(report)
 
     def test_no_gpu_withholds_correctness_from_a_target_that_needs_a_device(self):
-        patch = self.fixture.make_patch(
-            self.gpu_requiring_change, "needs-device.patch"
-        )
+        patch = self.fixture.make_patch(self.gpu_requiring_change, "needs-device.patch")
         no_gpu_picker = self.fixture.tools / "no-gpu-picker"
         write_executable(no_gpu_picker, "#!/usr/bin/env bash\nexit 1\n")
 
@@ -370,7 +441,7 @@ class ValidateKernelPrTests(unittest.TestCase):
     def test_new_failing_test_is_not_mislabeled_preexisting(self):
         def add_failing_test(repo):
             (repo / "tests" / "test_new.py").write_text(
-                "def test_new():\n" "    assert False, 'candidate failure'\n"
+                "def test_new():\n    assert False, 'candidate failure'\n"
             )
 
         patch = self.fixture.make_patch(add_failing_test, "new-test.patch")
@@ -443,7 +514,7 @@ class ValidateKernelPrTests(unittest.TestCase):
     def test_target_without_entry_point_is_skipped(self):
         def add_library_only_target(repo):
             (repo / "tests" / "kernel_helpers.py").write_text(
-                "def verify_kernel():\n" "    return True\n"
+                "def verify_kernel():\n    return True\n"
             )
 
         patch = self.fixture.make_patch(
@@ -766,6 +837,364 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertEqual("INCONCLUSIVE", report["verdict"])
         self.assertEqual("skip", report["stages"]["merge_sim"]["status"])
 
+    # ---- perf stage -------------------------------------------------------------
+    # A measured regression is the only thing here allowed to change a verdict, so the
+    # tests are weighted toward the false-positive side: one case must fire, four cases
+    # must not. A perf stage that blocks a good PR gets switched off within a week, and
+    # then it catches nothing at all.
+
+    def bench_body(self, scale, trailer=""):
+        self.fixture.add_bench_target()
+        source = (self.fixture.repo / self.fixture.BENCH_TARGET).read_text()
+        return source.replace("SCALE = 1.0", f"SCALE = {scale}") + trailer
+
+    def validate_bench(self, scale, name, trailer=""):
+        body = self.bench_body(scale, trailer)
+        patch = self.fixture.make_patch(self.fixture.rewrite_bench(body), name)
+        return self.fixture.validate(
+            patch,
+            tests=self.fixture.BENCH_TARGET,
+            grid=False,
+            expected_route="test_bench:run_kernel",
+        )
+
+    def test_perf_regression_is_should_fix_and_flips_the_verdict(self):
+        result, report = self.fixture.validate(
+            self.fixture.make_patch(
+                self.fixture.rewrite_bench(self.bench_body("1.25")), "perf-slow.patch"
+            ),
+            tests=self.fixture.BENCH_TARGET,
+            grid=False,
+            expected_route="test_bench:run_kernel",
+        )
+        perf = report["stages"]["perf"]
+        self.assertEqual("fail", perf["status"])
+        self.assertLess(perf["median_ratio"], 0.95)
+        self.assertEqual("NEEDS_WORK", report["verdict"])
+        self.assertEqual(1, result.returncode)
+        self.assertTrue(
+            any(
+                item["stage"] == "perf" and item["severity"] == "should-fix"
+                for item in report["findings"]
+            )
+        )
+        # The untouched reference column must sit at 1.0 and must NOT be what the
+        # verdict was drawn from -- that is the whole reason the gate takes the minimum
+        # across columns rather than the mean.
+        self.assertEqual("kernel us", perf["worst_column"])
+        self.assertAlmostEqual(1.0, perf["columns"]["reference us"]["median_ratio"], 2)
+        # A regression finding has to ship its reproducer, or nobody can check it.
+        self.assertTrue(perf["regressed_rows"])
+        self.assertIn("--scenario bench", perf["command"])
+
+    def test_perf_improvement_does_not_gate(self):
+        result, report = self.validate_bench("0.5", "perf-fast.patch")
+        perf = report["stages"]["perf"]
+        self.assertEqual("pass", perf["status"])
+        self.assertNotEqual("NEEDS_WORK", report["verdict"])
+        self.assertNotEqual(1, result.returncode)
+        self.assertFalse(
+            any(
+                item["stage"] == "perf" and item["severity"] == "should-fix"
+                for item in report["findings"]
+            )
+        )
+
+    def test_perf_ignores_movement_inside_the_threshold(self):
+        # 2% slower is under the 5% bar; firing here would make the stage untrustworthy.
+        _, report = self.validate_bench("1.02", "perf-noise.patch")
+        self.assertEqual("pass", report["stages"]["perf"]["status"])
+
+    def test_perf_never_fires_on_a_nonzero_exit(self):
+        # Head prints a table that looks like a 4x regression and then dies. The table is
+        # truncated at an unknown point, so any ratio drawn from it is meaningless; the
+        # stage must report skip, never fail.
+        _, report = self.validate_bench(
+            "4.0", "perf-crash.patch", trailer="\nraise SystemExit(1)\n"
+        )
+        perf = report["stages"]["perf"]
+        self.assertEqual("skip", perf["status"])
+        self.assertNotIn("median_ratio", perf)
+        self.assertFalse(
+            any(
+                item["stage"] == "perf" and item["severity"] == "should-fix"
+                for item in report["findings"]
+            )
+        )
+
+    def test_perf_is_skipped_when_the_target_has_no_benchmark_harness(self):
+        patch = self.fixture.make_patch(self.harmless_change, "perf-noharness.patch")
+        _, report = self.fixture.validate(patch)
+        perf = report["stages"]["perf"]
+        self.assertEqual("skip", perf["status"])
+        self.assertIn("no benchmark entry point", perf["note"])
+        self.assertNotIn("median_ratio", perf)
+
+    def test_perf_can_be_disabled(self):
+        patch = self.fixture.make_patch(
+            self.fixture.rewrite_bench(self.bench_body("1.25")), "perf-off.patch"
+        )
+        result, report = self.fixture.validate(
+            patch,
+            tests=self.fixture.BENCH_TARGET,
+            grid=False,
+            expected_route="test_bench:run_kernel",
+            perf=False,
+        )
+        self.assertEqual("skip", report["stages"]["perf"]["status"])
+        self.assertIn("--no-perf", report["stages"]["perf"]["note"])
+        self.assertNotEqual("NEEDS_WORK", report["verdict"])
+        self.assertNotEqual(1, result.returncode)
+
+    def run_review_gate(self, report, patch):
+        """Feed a report through review-pr's real identity gate.
+
+        The gate is the seam between the two skills, and it is the only place that can
+        catch a report whose perf fields do not hang together. Extracting the block from
+        SKILL.md rather than restating it means the two cannot drift apart silently.
+        """
+        skill = (SKILL_DIR.parent / "review-pr" / "SKILL.md").read_text()
+        blocks = re.findall(r"<<'PY'\n(.*?)\nPY\n", skill, re.DOTALL)
+        gate = self.fixture.root / "gate.py"
+        gate.write_text(blocks[1])
+        meta = self.fixture.root / "gate-meta.json"
+        meta.write_text(json.dumps({"headRefOid": report["repo"]["head"]}))
+        base = self.fixture.root / "gate-base.txt"
+        base.write_text(report["repo"]["base"] + "\n")
+        target = self.fixture.root / "gate-report.json"
+        target.write_text(json.dumps(report))
+        return run(
+            [
+                sys.executable,
+                str(gate),
+                str(meta),
+                str(base),
+                str(patch),
+                str(SKILL_DIR / "report_schema.json"),
+                str(target),
+                str(self.fixture.root / "gate-out.json"),
+            ],
+            check=False,
+        )
+
+    def test_perf_report_survives_the_review_identity_gate(self):
+        patch = self.fixture.make_patch(
+            self.fixture.rewrite_bench(self.bench_body("1.25")), "perf-gate.patch"
+        )
+        _, report = self.fixture.validate(
+            patch,
+            tests=self.fixture.BENCH_TARGET,
+            grid=False,
+            expected_route="test_bench:run_kernel",
+        )
+        self.assertEqual("fail", report["stages"]["perf"]["status"])
+
+        accepted = self.run_review_gate(report, patch)
+        self.assertEqual(0, accepted.returncode, accepted.stdout + accepted.stderr)
+        self.assertIn("perf stage: fail", accepted.stdout)
+        self.assertIn("median_ratio", accepted.stdout)
+
+    def test_review_gate_rejects_a_perf_result_that_contradicts_itself(self):
+        patch = self.fixture.make_patch(
+            self.fixture.rewrite_bench(self.bench_body("1.25")), "perf-launder.patch"
+        )
+        _, report = self.fixture.validate(
+            patch,
+            tests=self.fixture.BENCH_TARGET,
+            grid=False,
+            expected_route="test_bench:run_kernel",
+        )
+
+        # Every individual field stays well-formed; only the status is flipped. Without a
+        # cross-check the card would print "NO REGRESSION" over a measured 20% regression.
+        laundered = json.loads(json.dumps(report))
+        laundered["stages"]["perf"]["status"] = "pass"
+        laundered["findings"] = [
+            item for item in laundered["findings"] if item["stage"] != "perf"
+        ]
+        laundered["verdict"] = "INCONCLUSIVE"
+        laundered["process_exit_code"] = 2
+        rejected = self.run_review_gate(laundered, patch)
+        self.assertNotEqual(0, rejected.returncode)
+        self.assertIn("contradicts its own numbers", rejected.stdout + rejected.stderr)
+
+        # A perf failure must also keep its finding: drop it and the report is refused.
+        stripped = json.loads(json.dumps(report))
+        stripped["findings"] = [
+            item for item in stripped["findings"] if item["stage"] != "perf"
+        ]
+        stripped["verdict"] = "INCONCLUSIVE"
+        stripped["process_exit_code"] = 2
+        refused = self.run_review_gate(stripped, patch)
+        self.assertNotEqual(0, refused.returncode)
+        self.assertIn("no should-fix finding", refused.stdout + refused.stderr)
+
+    def test_timing_run_does_not_dirty_the_worktree(self):
+        """A bench harness that writes results must not disable correctness validation.
+
+        Real aiter targets are pytest modules whose `__main__` bench drops a results file
+        (tuned_op_bench.csv) in the repo root. The baseline phase asserts a clean worktree
+        after the base runs, so an artifact left behind by the timing run sets BASE_READY=0
+        and the entire head correctness phase is skipped. Caught by measurement, not review:
+        the same target went PASS with --no-perf and INCONCLUSIVE with perf enabled, with
+        head correctness never executed. A perf stage that silently switches off correctness
+        validation is worse than no perf stage at all.
+        """
+        source = (self.fixture.repo / "tests" / "test_sample.py").read_text()
+        source = (
+            "def perftest(fn):\n    return fn\n\n" + source + "\ndef _bench():\n"
+            "    import os\n"
+            "    print('| dim | k us |')\n"
+            "    print('|---|---|')\n"
+            "    for d in (1024, 2048, 4096, 8192):\n"
+            "        print(f'| {d} | {d / 100.0} |')\n"
+            "    open('tuned_op_bench.csv', 'w').write('done\\n')\n"
+            "    os.makedirs('bench_out', exist_ok=True)\n"
+            "    open('bench_out/x.json', 'w').write('{}')\n"
+            "\n@perftest\ndef _timed():\n    return None\n"
+            "\nif __name__ == '__main__':\n    _bench()\n"
+        )
+        (self.fixture.repo / "tests" / "test_sample.py").write_text(source)
+        run(["git", "add", "-A"], cwd=self.fixture.repo)
+        run(
+            [
+                "git",
+                "-c",
+                "user.name=Validator Test",
+                "-c",
+                "user.email=validator@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "bench harness that writes results",
+            ],
+            cwd=self.fixture.repo,
+        )
+
+        patch = self.fixture.make_patch(self.harmless_change, "perf-artifacts.patch")
+        result, report = self.fixture.validate(patch, grid_value="7,257,f32;8,513,bf16")
+
+        self.assertEqual("PASS", report["verdict"])
+        self.assertEqual(0, result.returncode)
+        self.assertEqual("pass", report["stages"]["baseline_control"]["status"])
+        self.assertEqual("pass", report["stages"]["correctness_repo_tests"]["status"])
+        # It must not merely avoid breaking things -- it must actually have measured.
+        self.assertEqual("pass", report["stages"]["perf"]["status"])
+        # Both the stray file and the stray directory are gone.
+        leftover = run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=self.fixture.repo,
+        ).stdout.strip()
+        self.assertEqual("", leftover)
+
+    PERF_LINE_TARGET = "tests/test_perfline.py"
+
+    def add_perf_line_target(self):
+        """Commit a target using aiter's OTHER timing convention.
+
+        The `@benchmark`/`run_perftest` pair prints a markdown table, but the older bare
+        `perftest` decorator's callers hand-roll an f-string per test. Eleven real kernel
+        targets print only this shape -- test_moe.py, test_pa_v1.py, test_rope.py,
+        test_layernorm2d.py among them -- so a scraper that reads tables alone would detect
+        a harness, spend a full base+head run, and then measure nothing.
+        """
+        body = (
+            "def perftest(fn):\n    return fn\n"
+            "SCALE = 1.0\n"
+            "def main():\n"
+            "    for d in ((128, 8192), (256, 4096), (512, 2048), (1024, 1024)):\n"
+            "        c = 13.1 * SCALE\n"
+            "        print(f'[perf] dim: {d!s:<20}, dtype: torch.bfloat16, "
+            "torch avg: {14.2:<8.2f} us, ck avg: {c:<8.2f} us')\n"
+            "    print('4/4 cases passed')\n"
+            "if __name__ == '__main__':\n    main()\n"
+        )
+        (self.fixture.repo / self.PERF_LINE_TARGET).write_text(body)
+        run(["git", "add", "-A"], cwd=self.fixture.repo)
+        run(
+            [
+                "git",
+                "-c",
+                "user.name=Validator Test",
+                "-c",
+                "user.email=validator@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "perf-line target",
+            ],
+            cwd=self.fixture.repo,
+        )
+        return body
+
+    def validate_perf_line(self, body, scale, name):
+        patch = self.fixture.make_patch(
+            lambda repo: (repo / self.PERF_LINE_TARGET).write_text(
+                body.replace("SCALE = 1.0", f"SCALE = {scale}")
+            ),
+            name,
+        )
+        return self.fixture.validate(
+            patch,
+            tests=self.PERF_LINE_TARGET,
+            grid=False,
+            expected_route="test_perfline:main",
+        )
+
+    def test_perf_reads_aiters_perf_line_format(self):
+        body = self.add_perf_line_target()
+        _, report = self.validate_perf_line(body, "1.3", "perfline-slow.patch")
+        perf = report["stages"]["perf"]
+        self.assertEqual("fail", perf["status"])
+        self.assertEqual("ck us", perf["worst_column"])
+        self.assertEqual(4, perf["matched_rows"])
+        # The untouched reference column must not be what the gate fired on.
+        self.assertAlmostEqual(1.0, perf["columns"]["torch us"]["median_ratio"], 2)
+        self.assertEqual("NEEDS_WORK", report["verdict"])
+
+    def test_perf_line_format_does_not_false_positive(self):
+        body = self.add_perf_line_target()
+        _, report = self.validate_perf_line(
+            body, "1.0  # unchanged", "perfline-same.patch"
+        )
+        perf = report["stages"]["perf"]
+        self.assertEqual("pass", perf["status"])
+        self.assertNotEqual("NEEDS_WORK", report["verdict"])
+
+    def test_each_side_is_measured_more_than_once(self):
+        """The 0.95 threshold is only defensible as a best-of-N comparison.
+
+        Measured on this box, five warm repeat runs of an unchanged
+        op_tests/test_layernorm2d.py gave `ck avg` of 13.10 20.98 20.70 13.28 13.17 us --
+        bimodal, 1.60x spread, on code that did not change, while the untouched `torch avg`
+        reference column held to 1.03x. One run per side would land the ratio anywhere in
+        [0.62, 1.60] and fire a false regression roughly half the time. If the repeat count
+        ever silently drops to 1, the threshold stops being defensible.
+        """
+        body = self.add_perf_line_target()
+        _, report = self.validate_perf_line(body, "1.3", "perfline-repeats.patch")
+        repeats = report["stages"]["perf"]["repeats"]
+        self.assertGreaterEqual(repeats["base"], 3)
+        self.assertGreaterEqual(repeats["head"], 3)
+        self.assertIn("min", repeats["reduction"])
+
+    def test_perf_skip_does_not_prevent_a_pass(self):
+        # perf is not in finish_report's required-stage set. A target with no benchmark
+        # harness is the common case -- 26 of the 123 targets in aiter's op_tests/ -- and
+        # it must still be able to reach PASS on correctness alone. If a skipped perf
+        # stage could hold a verdict at INCONCLUSIVE, the stage would be unshippable.
+        patch = self.fixture.make_patch(self.harmless_change, "perf-skip-pass.patch")
+        result, report = self.fixture.validate(patch, grid_value="7,257,f32;8,513,bf16")
+        self.assertEqual("skip", report["stages"]["perf"]["status"])
+        self.assertEqual("PASS", report["verdict"])
+        self.assertEqual(0, result.returncode)
+        self.assertFalse(
+            any(
+                item["stage"] == "perf" and item["severity"] != "note"
+                for item in report["findings"]
+            )
+        )
+
 
 class IndexScannerTests(unittest.TestCase):
     def test_json_count_is_deduplicated(self):
@@ -825,6 +1254,38 @@ class ReviewSkillContractTests(unittest.TestCase):
         self.assertIn("if stats is not None", review_skill)
         self.assertNotIn("downstream-impact-check", review_skill)
         self.assertNotIn("review-flydsl-kernel/scan_", review_skill)
+
+    def test_perf_harness_detection_agrees_across_both_skills(self):
+        """review-pr and the validator must classify a target identically.
+
+        Each file carries a comment telling the next reader to keep the two in step. A
+        comment cannot enforce that. If they drift, review-pr prints a manual recipe for a
+        harness the validator declined to use -- or, worse, prints "no benchmark entry
+        point" for a target the validator happily timed.
+        """
+        review_skill = (SKILL_DIR.parent / "review-pr" / "SKILL.md").read_text()
+        validator = VALIDATOR.read_text()
+
+        review_body = re.search(
+            r"def perf_command\(path\):(.*?)\n\n", review_skill, re.DOTALL
+        )
+        validator_body = re.search(
+            r"perf_detect\(\).*?<<'PY'\n(.*?)\nPY", validator, re.DOTALL
+        )
+        self.assertIsNotNone(review_body)
+        self.assertIsNotNone(validator_body)
+
+        for name, body in (
+            ("review-pr", review_body.group(1)),
+            ("validate_pr.sh", validator_body.group(1)),
+        ):
+            self.assertIn('"--scenario" in text', body, name)
+            self.assertIn('"bench" in text', body, name)
+            self.assertIn('"perftest" in text', body, name)
+            # `run_perftest` is a strict subset of `perftest`, so testing the longer name
+            # only narrows coverage. It missed 12 of aiter's 123 op_tests/ targets, every
+            # one of which does have a timing harness.
+            self.assertNotIn('"run_perftest" in text', body, name)
 
     def test_review_fetch_snippet_parses_as_bash(self):
         review_skill = (SKILL_DIR.parent / "review-pr" / "SKILL.md").read_text()

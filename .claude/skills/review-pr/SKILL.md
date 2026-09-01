@@ -1,6 +1,6 @@
 ---
 name: review-pr
-description: Advisory AI code review for aiter and FlyDSL PRs. Catches perf regressions, silent correctness bugs, dispatch gate holes, and AI-generated code patterns, but never acts as a merge gate. Invoke with a PR number (optionally owner/repo#N) and, when one exists, a validation report path. Step 1 triages whether the PR changes runtime surface at all and, when it does and the PR ships a single test target, runs validate-kernel-pr itself; a PR with no runtime surface is reported N/A rather than unvalidated. Deterministic validation is still judged only from a head-matched report.
+description: Advisory AI code review for aiter and FlyDSL PRs. Catches perf regressions, silent correctness bugs, dispatch gate holes, and AI-generated code patterns, but never acts as a merge gate. Invoke with a PR number (optionally owner/repo#N) and, when one exists, a validation report path. Step 1 triages whether the PR changes runtime surface at all and, when it does and the PR ships a single test target, runs validate-kernel-pr itself; a PR with no runtime surface is reported N/A rather than unvalidated. That run also times the target on base and head back to back on one locked GPU, so a kernel PR's latency is measured rather than assumed. The review line stays advisory; deterministic correctness and perf results are judged only from a head-matched report.
 argument-hint: <PR number> [owner/repo] [validation-report]
 ---
 
@@ -130,13 +130,15 @@ fi
 # asks for mid-review is a judgement that does not get made. Leaving it to the reviewer also
 # gave the verdict line only two states, so a README fix reported the same
 # "NOT RUN" as an unvalidated kernel rewrite -- which teaches a reader to skip the line.
-python3 - "$WORK/pr_meta.json" "$WORK/pr.diff" "$WORK/validation_requirement.json" <<'PY'
+python3 - "$WORK/pr_meta.json" "$WORK/pr.diff" "$WORK/validation_requirement.json" \
+  "$PROJECT_ROOT" <<'PY'
 import json
 import pathlib
 import sys
 
-meta_path, diff_path, out_path = (pathlib.Path(a) for a in sys.argv[1:4])
-paths = [f["path"] for f in json.loads(meta_path.read_text()).get("files", [])]
+meta_path, diff_path, out_path, project_root = (pathlib.Path(a) for a in sys.argv[1:5])
+meta = json.loads(meta_path.read_text())
+paths = [f["path"] for f in meta.get("files", [])]
 
 # Checked in this order: a .md under csrc/ is documentation, and op_tests/ is neither
 # runtime nor documentation.
@@ -178,8 +180,9 @@ for line in diff_path.read_text(errors="replace").splitlines():
 
 def is_candidate_target(path):
     name = pathlib.PurePosixPath(path).name
-    # op_benchmarks/ holds bench_*.py perf harnesses; they are not correctness targets and
-    # the validator has no perf stage to give them.
+    # op_benchmarks/ holds bench_*.py perf harnesses. They are excluded because they are
+    # not correctness targets; the validator's perf stage times the correctness target it
+    # already selected, so it does not need one of these either.
     return (
         path.startswith("op_tests/")
         and "/op_benchmarks/" not in f"/{path}"
@@ -207,6 +210,84 @@ elif candidates:
 else:
     blocker = "the PR changes runtime code but ships no test target"
 
+# ---- Perf triage. A kernel change can be correct and still be a regression --
+# correctness_repo_tests passing says nothing about latency. So the same runtime surface that
+# makes correctness evidence REQUIRED makes perf evidence REQUIRED too, and this decides it
+# here for the reason everything else in this step is executable: in a controlled run the
+# reviewer with a perf-shaped PR in front of it shipped a card with no numbers at all and a
+# finding that stopped at "reviewer should ask" (aiter#4538).
+#
+# The measurement itself belongs to the validator's `perf` stage, which times base and head
+# back to back on one locked GPU and gates on the result. What is computed HERE is only the
+# fallback: which command a human would run if that stage could not. Keep the detection below
+# in step with perf_detect() in validate-kernel-pr/validate_pr.sh -- if the two disagree, this
+# step prints a recipe for a harness the validator declined to use, or vice versa.
+#
+# `perf_claimed` only separates two reports ("the PR's own claim is unverified" vs "no claim
+# was made, but a kernel moved"). It does NOT gate the requirement: a refactor that claims
+# nothing is exactly where an unnoticed regression lands.
+PERF_WORDS = (
+    "perf", "optimiz", "optimis", "faster", "speedup", "speed-up", "latency",
+    "throughput", "tflops", "fuse", "regression", "us/", "µs",
+)
+_blurb = f"{meta.get('title', '')}\n{meta.get('body', '') or ''}".lower()
+perf_claimed = any(w in _blurb for w in PERF_WORDS)
+
+# A perf harness cannot be inferred from the diff alone, so look for aiter's three timing
+# conventions in the target's own text: `--scenario bench` (argparse sweep), the
+# @benchmark/run_perftest pair the aiter-op-test skill mandates, and the older bare `perftest`
+# decorator. A new target's body is in the diff as `+` lines; an
+# existing one is read from the checkout, whose revision may differ but whose entry points do
+# not. Anything else means the PR ships no runnable perf harness -- which is itself the
+# finding, not a reason to stay silent.
+def perf_command(path):
+    text = ""
+    local = project_root / path
+    if local.is_file():
+        text = local.read_text(errors="replace")
+    if not text:
+        want = f" b/{path}"
+        keep = False
+        for line in diff_path.read_text(errors="replace").splitlines():
+            if line.startswith("diff --git "):
+                keep = line.endswith(want)
+            elif keep and line.startswith("+") and not line.startswith("+++"):
+                text += line[1:] + "\n"
+    if not text:
+        return None, "the target's contents could not be read"
+    if "--scenario" in text and "bench" in text:
+        return f"python3 {path} --scenario bench", "target exposes --scenario bench"
+    # `perftest`, not `run_perftest`. aiter carries three timing conventions and the bare
+    # `perftest` decorator is one of them; `perftest` also subsumes `run_perftest` as a
+    # substring, so the shorter test is strictly wider. Measured on the 123 targets in
+    # op_tests/: matching `run_perftest` detects 85 and reports 38 as having no harness;
+    # matching `perftest` detects 97 and reports 26. 11 of the 12 recovered targets have
+    # live `perftest` usage -- test_moe.py, test_pa_v1.py, test_batch_prefill.py,
+    # test_rope.py, test_layernorm2d.py among them. Reporting those as "no benchmark entry
+    # point" reads as "there was nothing to measure" when the truth was that the detector
+    # was too narrow, which is the exact silence this rule exists to break.
+    #
+    # The 12th (test_aiter_sigmoid.py) matches only a commented-out import, because this is
+    # a substring test and not a parse. That direction is the safe one: an over-eager match
+    # runs the target, finds no timing table, and the perf stage reports `skip` -- the same
+    # outcome as not matching, one wasted run later. The opposite error stays silent.
+    # Keep this in step with perf_detect() in validate-kernel-pr/validate_pr.sh.
+    if "perftest" in text or "@benchmark" in text:
+        return f"python3 {path}", "target uses the perftest/@benchmark harness"
+    return None, (
+        "target exposes no benchmark entry point "
+        "(no --scenario bench, no perftest/@benchmark harness)"
+    )
+
+
+perf_cmd = perf_reason = None
+if target:
+    perf_cmd, perf_reason = perf_command(target)
+elif required:
+    perf_reason = f"no perf target for the same reason there is no test target: {blocker}"
+else:
+    perf_reason = "no runtime surface changed"
+
 # A target is never inferred from the *kernel* being changed, only from a test the PR itself
 # touches. The validator cannot judge whether a target exercises the diff, so an invented
 # target can return PASS on evidence about unrelated code -- worse than no report, because
@@ -222,6 +303,10 @@ out_path.write_text(
             "target_basis": basis,
             "candidates": candidates,
             "blocking_reason": blocker,
+            "perf_required": required,
+            "perf_claimed": perf_claimed,
+            "perf_command": perf_cmd,
+            "perf_basis": perf_reason,
         },
         indent=2,
     )
@@ -232,6 +317,18 @@ print(f"validation triage: {verdict} ({', '.join(sorted({classify(p) for p in pa
 if runtime_paths:
     print(f"  runtime surface: {len(runtime_paths)} path(s), e.g. {', '.join(runtime_paths[:3])}")
 print(f"  target: {target} — {basis}" if target else f"  no auto target: {blocker}")
+print(f"perf triage: {verdict}" + (" (PR claims perf)" if perf_claimed else " (no perf claim)"))
+if perf_cmd:
+    print(f"  harness: {perf_reason}")
+    print("  the validator's perf stage runs this on both sides automatically; the form below")
+    print("  is the manual fallback for when stages.perf comes back absent or skip. Run BOTH")
+    print("  sides on this box, same GPU, back to back -- head alone only reproduces the PR's")
+    print("  own comparison and cannot show a regression:")
+    print("    git worktree add --detach $WORK/perf_base $(cat $WORK/base_head.txt)")
+    print(f"    (cd $WORK/perf_base && {perf_cmd})                              # base")
+    print(f"    (cd $WORK/perf_base && git apply $WORK/pr.diff && {perf_cmd})   # head")
+else:
+    print(f"  no perf run possible: {perf_reason}")
 PY
 
 # Validation is opt-in in the sense that matters: a report is never adopted because it happens
@@ -512,12 +609,56 @@ if report.get("process_exit_code") != expected_exit:
         "validation report exit-code contract is inconsistent: "
         f"expected {expected_exit}, got {report.get('process_exit_code')}"
     )
+# perf is optional -- a report without it is valid, and older reports have none. But a perf
+# stage that ASSERTS an outcome has to carry the number it was drawn from, or the card would
+# print "NO REGRESSION" backed by nothing and a reader could not tell the difference.
+perf = report["stages"].get("perf")
+if perf is not None:
+    if perf["status"] in {"pass", "fail"}:
+        if not isinstance(perf.get("median_ratio"), (int, float)):
+            raise SystemExit("perf stage claims a result without a median_ratio")
+        if not isinstance(perf.get("matched_rows"), int) or perf["matched_rows"] < 1:
+            raise SystemExit("perf stage claims a result with no matched rows")
+        if not perf.get("baseline"):
+            raise SystemExit("perf stage claims a result without naming its baseline")
+        # The status has to agree with the number it is standing on. Without this a report
+        # can carry median_ratio 0.80 against threshold 0.95 and still say `pass`, and the
+        # card would print "NO REGRESSION" over the top of a measured 20% regression --
+        # every other check here passes, because each field is individually well-formed.
+        threshold = perf.get("threshold")
+        if isinstance(threshold, (int, float)):
+            regressed = perf["median_ratio"] < threshold
+            if regressed != (perf["status"] == "fail"):
+                raise SystemExit(
+                    "perf stage status contradicts its own numbers: "
+                    f"median_ratio {perf['median_ratio']} vs threshold {threshold} "
+                    f"but status is {perf['status']}"
+                )
+    if perf["status"] == "fail" and not any(
+        item.get("stage") == "perf" and item.get("severity") == "should-fix"
+        for item in findings
+    ):
+        raise SystemExit("perf stage failed but no should-fix finding was recorded")
+    if perf["status"] == "skip" and "median_ratio" in perf:
+        raise SystemExit("perf stage was skipped but still reports a median_ratio")
 out_path.write_text(json.dumps(report, indent=2) + "\n")
 print(
     f"validation report accepted for head {expected_head}; "
     f"target={selection['target']}; "
     f"grid={selection.get('grid') or 'not configured'}"
 )
+# Printed separately and unconditionally, because Step 8 must state a perf line either way:
+# a silent absence here is what produced a card with no numbers on aiter#4538.
+if perf is None:
+    print("perf stage: absent — the card's perf line is advisory (see P6)")
+elif perf["status"] in {"pass", "fail"}:
+    print(
+        f"perf stage: {perf['status']} — median_ratio {perf['median_ratio']} on "
+        f"{perf.get('worst_column')} over {perf['matched_rows']} row(s), "
+        f"threshold {perf.get('threshold')}"
+    )
+else:
+    print(f"perf stage: skip — {perf.get('note', 'no reason recorded')}")
 PY
 else
   # Distinguish the reasons there is no report. "Not applicable" and "required but missing"
@@ -609,16 +750,16 @@ _Answer:_
 
 Check which type(s) apply; these determine which Step 5 categories are mandatory.
 
-- [ ] **New kernel / new Triton op** → B1 (dispatch gate), B2 (tl.load mask), B4 (new routing value unhandled?), A1 (sibling variants), D1 (atomic zero-init), D8 (contiguous check), HK6 (UT)
+- [ ] **New kernel / new Triton op** → B1 (dispatch gate), B2 (tl.load mask), B4 (new routing value unhandled?), A1 (sibling variants), D1 (atomic zero-init), D8 (contiguous check), HK6 (UT), P6 (measure it base-vs-head)
 - [ ] **New constexpr / routing flag / new dtype or arch value added** → B4 (do ALL dispatch branches handle the new value, or assert on it?), C4 (new arch string literal?)
 - [ ] **Tuning config (CSV / YAML)** → D3 (hipblaslt), HK4 (kpack:1)
 - [ ] **Dispatch logic change** → B1 (silent bypass), B3 (string normalization), B4 (new value unhandled?), A3 (scope too broad)
-- [ ] **Replaces existing kernel as default** → D2 (rollback env-var)
+- [ ] **Replaces existing kernel as default** → D2 (rollback env-var), P6 (measure it base-vs-head — a default swap is the case where an unmeasured regression reaches everyone)
 - [ ] **Core file change** (see Tier table below) → full Step 4 risk assessment
 - [ ] **API signature change** (param added / removed / renamed, default changed, return dtype or arity changed) → B6 (propagation to all receivers), E1 (linked consumer PR?), E5 (owner sign-off if stable core API)
 - [ ] **Refactor / rename** → HK2 (unrelated files), variable name mismatch check, B6 (rename breaks all importers)
 - [ ] **FP8 / quantization path** → C1 (fnuz by dtype), C2 (fp8_max hardcoded), D1 (atomic zero-init)
-- [ ] **Perf / benchmark PR** → P1 (numbers with units), P5 (setup cost excluded?), P2 (production shapes), P3 (reproducible)
+- [ ] **Perf / benchmark PR** → P1 (numbers with units), P5 (setup cost excluded?), P2 (production shapes), P3 (reproducible), P6 (re-measure here — P1–P5 only grade the PR's own table)
 - [ ] **Test / benchmark only** → P2 (production shapes), HK6 (aiter-op-test format)
 - [ ] **Async / multi-stream** → G1 (stream sync missing), G1b (blocking queue.get without timeout in serving code)
 - [ ] **FlyDSL kernel** → D10 (compile result called?), D10b (arith.unwrap() before arith.bitcast?). A FlyDSL kernel change is runtime surface, so Step 1's triage marks it `REQUIRED` and, when the PR ships exactly one test target, has already run the validator against it. Use whatever report Step 1 accepted as the evidence; where it reached no report, mark the result `[static-only advisory review]` (see Step 8) and make no runtime clearance claim. Absence of a report is not itself a blocker. Two target classes cannot reach `PASS` by construction, so their `INCONCLUSIVE` is the expected output and not a deficiency: a CPU-only target claims no GPU and therefore no architecture, and a bugfix with no shape dimension has no grid for `correctness_s1_grid` to consume. Never ask such an author for a passing report.
@@ -1013,6 +1154,25 @@ FP self-check (do this before firing): is the excluded cost paid **once per depl
 Counter-example (does NOT trigger P5): aiter#4166 preshuffles the static weight once outside the timing loop and honestly reports a geomean 0.69x result — a correct steady-state benchmark, not a hidden cost. Charging that one-time shuffle against a single call to manufacture a "regression" is itself the false positive this rule must avoid.
 → `⚠️ P5: timing window excludes [cost] that recurs per call / per cold start — re-run including it, or confirm it is one-time amortizable`
 
+**P6 — Kernel change whose cost nobody measured** ⚠️
+P1–P5 all grade the numbers *the PR supplies*. None of them produces a number, so a kernel PR can clear the whole Performance block on the strength of a table nobody re-ran. Correctness evidence does not cover this: `correctness_repo_tests: pass` means the kernel computes the right values and says nothing about how long it takes.
+
+**Where the measurement now comes from.** The validator has a `perf` stage. When it runs, it times the target on base and on head back to back on the same locked GPU — base with the patch reversed out on the same worktree — and reduces the pair to `median_ratio`, the head speedup over base, oriented so `<1` is always a regression. That is a deterministic result, not an advisory one: below `threshold` (default 0.95, over ≥3 matched rows, both sides exiting cleanly) it writes a `should-fix` finding and the report's verdict becomes `NEEDS_WORK`. Read it out of `stages.perf`; do not re-derive it.
+
+Trigger: Step 1's triage printed `perf triage: REQUIRED` — i.e. the PR changes runtime surface — **and** the head-matched report carries no usable `stages.perf` (absent, or `status: skip`). That is the gap P6 exists to name. If `stages.perf` is `pass` or `fail`, the measurement happened; report the number and do not fire.
+
+Why the stage skips, and what each case means for the card:
+- **no benchmark entry point in the target** — the honest common case (26 of aiter's 123 `op_tests/` targets have no timing harness at all). Fire P6, and say the target cannot be timed as written.
+- **the PR adds the target** — base has nothing to compare against. Fire P6 with that reason; a head-only number is not a comparison.
+- **nonzero exit on either side** — deliberately never a regression, because a truncated log yields a meaningless ratio. Fire P6 and treat the crash as the more interesting finding.
+- **fewer than 3 matched rows / no shared timing column** — the two sides measured different things. Fire P6.
+
+**The measurement that counts is base vs head, on this box, back to back.** Running only head against whatever baseline the PR chose reproduces the PR's own comparison; it cannot show a regression, and it silently inherits any staleness in that baseline. When the stage could not run, Step 1 prints the exact two-command manual form for the triaged target.
+What to report: the shapes measured, both sides' numbers with units, and the delta. If nothing ran, say why — no idle GPU, no benchmark entry point, arch not available here — and mark every perf statement in the card `[inferred]`.
+FP self-check: do NOT fire when the triage says NOT REQUIRED (no runtime surface), when `stages.perf` is `pass`/`fail`, when a manual measurement was taken and reported, or when the PR's own harness is the thing under test and has no steady state to measure. A single sample on a shared box is weak evidence — report the spread or the sample count rather than one number.
+Real example (aiter#4538): a FlyDSL kernel whose entire justification was perf was reviewed to `Validation: PASS` with zero timing data; the perf finding stopped at "reviewer should ask", and a maintainer had already posted on the PR that a competing kernel beat it. Measuring afterwards took two `--scenario bench` runs and showed the fused path is where the PR's gain comes from — which the review should have carried in the first place. That gap is what the `perf` stage now closes automatically.
+→ `⚠️ P6: kernel changed and no base-vs-head timing exists — [why the perf stage could not run]; measure [target] on both sides, or mark the perf findings [inferred]`
+
 ---
 
 ### Housekeeping (quick scan)
@@ -1107,6 +1267,28 @@ If the answer is yes, add it to the findings. If the answer is no, proceed.
   - required, but no target existed to run: `Validation (deterministic): NOT RUN — <triage reason>`. A runtime change shipping no test target is also a finding in its own right.
   - required and a target existed, but the run could not happen (no idle GPU, validator missing, `REVIEW_AUTO_VALIDATE=0`): `Validation (deterministic): NOT RUN — <reason>`. This is an environment gap, not a PR defect.
   - In every `NOT RUN` and `N/A` state, no finding may assert runtime behaviour (perf, accuracy, launch failure) as fact; such findings are `[inferred]` and phrased as questions.
+- **State the perf evidence on its own line, always.** A `Validation` verdict covers correctness
+  only, so a card that carries just that line reads as clearance for a kernel whose latency
+  nobody measured. The line goes in the header block, never as a finding — the 5-finding cap
+  must not be able to evict it. Two tiers, and the label says which one you are in:
+  - **the report carries `stages.perf` with status `pass` or `fail`** — this is deterministic
+    evidence, from base vs head on one locked GPU with the patch reversed for base, and it
+    ships its own reproducer. Write `Perf (deterministic): <verdict> — median_ratio <n> on
+    <worst_column> over <matched_rows> rows, threshold <t>`, where the verdict is `REGRESSION`
+    for `fail` and `NO REGRESSION` for `pass`. `median_ratio` is the head speedup over base,
+    so `<1` is slower. Quote `worst_column`: the ratio is the minimum across columns, so
+    naming the column that moved is what makes the number checkable.
+    A `fail` here already produced a `should-fix` finding and put the report at `NEEDS_WORK`;
+    report that as the deterministic result it is, not as a suggestion.
+  - **no usable `stages.perf`** — anything you measured by hand is advisory. Write
+    `Perf (advisory): ...` and use the state Step 1's perf triage reached (see P6):
+    - measured by hand: `Perf (advisory): MEASURED — <shapes>, base <n> vs head <n> <units>, <delta>`. Base and head, same box, back to back. Say how many samples, and say if only head was run — head-only reproduces the PR's own comparison and cannot show a regression.
+    - triage said not required: `Perf (advisory): N/A — no runtime surface changed`.
+    - required, but the target ships no benchmark entry point: `Perf (advisory): NOT RUN — <triage reason>`. A kernel PR with no runnable perf harness is also a finding in its own right.
+    - required and a harness existed, but the run could not happen (no idle GPU, wrong arch, nonzero exit, out of time): `Perf (advisory): NOT RUN — <reason>`. An environment gap, not a PR defect.
+    - In this tier the line is advisory in both directions: a slower hand-measured number is not a gate, and `MEASURED` is not clearance — one run on a shared box is weak evidence, so report the sample count with it.
+  - Never label a hand-run number `(deterministic)`, and never soften a `stages.perf` `fail`
+    into `(advisory)`. The label is the reader's only signal for whether a reproducer exists.
 - The review line is always advisory. `🔴 HIGH RISK` requests human attention; it is not a merge gate. A deterministic `Validation: BLOCK` may gate because its reproducer is in the report.
 
 ```
@@ -1116,6 +1298,9 @@ If the answer is yes, add it to the findings. If the answer is no, proceed.
 
 Review (advisory): [✅ NO FINDINGS | ⚠️ NEEDS WORK | 🔴 HIGH RISK]
 Validation (deterministic): [PASS/NEEDS_WORK/BLOCK/INCONCLUSIVE — target, exact runtime, and skipped-stage evidence | N/A — no runtime surface changed | NOT RUN — reason]
+Perf (deterministic): [REGRESSION | NO REGRESSION — median_ratio N on <worst_column> over N rows, threshold T]
+  ...or, when the report carries no usable stages.perf, this line instead:
+Perf (advisory): [MEASURED — shapes, base vs head with units, delta, sample count | N/A — no runtime surface changed | NOT RUN — reason]
 
 🔴 [specific finding — what, where, why it matters]
 ⚠️ [specific finding]
