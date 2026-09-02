@@ -129,6 +129,11 @@ def kernel_unified_attention_2d(
     SPLIT_UNMASKED_LOOP: tl.constexpr = False,  # bool
     K_WIDTH: tl.constexpr = 0,  # int
 ):
+    tl.static_assert(
+        not (SPLIT_UNMASKED_LOOP and SHUFFLED_KV_CACHE),
+        "SPLIT_UNMASKED_LOOP is incompatible with SHUFFLED_KV_CACHE",
+    )
+
     kv_head_idx = tl.program_id(0)
     q_block_global_idx = tl.program_id(1)
 
