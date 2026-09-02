@@ -4,21 +4,43 @@
 
 from dataclasses import dataclass
 
+import pandas as pd
 import pytest
 import torch
 from torch.profiler import ProfilerActivity, profile
 
+from aiter import logger
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.test_common import run_perftest
 
-if not torch.cuda.is_available():
-    pytest.skip("ROCm not available. Skipping GPU tests.", allow_module_level=True)
-if get_gfx() != "gfx950":
-    pytest.skip("The FlyDSL A16W16 kernel requires gfx950.", allow_module_level=True)
+_IS_GFX950 = torch.cuda.is_available() and get_gfx() == "gfx950"
+pytestmark = pytest.mark.skipif(
+    not _IS_GFX950,
+    reason="The FlyDSL A16W16 kernel requires gfx950",
+)
 
-from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import gemm_a16w16
-from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950_utils import GFX950_DMA_BYTES
+if _IS_GFX950:
+    from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import gemm_a16w16
+    from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950_utils import GFX950_DMA_BYTES
 
 ROTARY_INPUTS_TARGET_BYTES = 8 * 1024**3
+
+
+class _PytestSummaryPlugin:
+    def __init__(self):
+        self.counts = {"passed": 0, "failed": 0, "skipped": 0}
+        self.duration = 0.0
+
+    def pytest_runtest_logreport(self, report):
+        if report.when == "call" or (report.when == "setup" and report.skipped):
+            self.counts[report.outcome] += 1
+            self.duration += report.duration
+
+    def as_row(self):
+        return {
+            **self.counts,
+            "duration (s)": round(self.duration, 2),
+        }
 
 
 @dataclass
@@ -260,6 +282,46 @@ def benchmark(args: _TestArgs, warmup: int = 500, niters: int = 600):
                 run_ref(idx)
             torch.cuda.synchronize()
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
+
+
+def benchmark_summary(args: _TestArgs, warmup: int = 10, niters: int = 20):
+    kwargs = {
+        "block_m": args.block_m,
+        "block_n": args.block_n,
+        "block_k": args.block_k,
+        "stages": args.stages,
+        "m_waves": args.m_waves,
+        "n_waves": args.n_waves,
+        "k_waves": args.k_waves,
+        "group_m": args.group_m,
+        "use_half_tile_interleaved": args.use_half_tile_interleaved,
+        "split_k": args.split_k,
+    }
+    inputs = create_inputs(args)
+    output = create_outputs(args)[0]
+
+    def run(candidate_output):
+        return func(*(inputs + (candidate_output, kwargs, args.layout)))
+
+    _, us = run_perftest(
+        run,
+        output,
+        num_warmup=warmup,
+        num_iters=niters,
+        num_rotate_args=1,
+    )
+    return {
+        "M": args.m,
+        "N": args.n,
+        "K": args.k,
+        "dtype": str(args.dtype).removeprefix("torch."),
+        "policy": "hti" if args.use_half_tile_interleaved else "ft",
+        "split_k": args.split_k,
+        "tile": f"{args.block_m}x{args.block_n}x{args.block_k}",
+        "waves": f"{args.m_waves}x{args.n_waves}x{args.k_waves}",
+        "us": round(us, 3),
+        "TFLOPS": round(2 * args.m * args.n * args.k / us / 1e6, 2),
+    }
 
 
 @pytest.mark.parametrize("layout", ["nn", "nt", "tn", "tt"])
@@ -1159,3 +1221,49 @@ def test_gemm_a16w16_benchmark_smoke(
         layout,
     )
     benchmark(args)
+
+
+def main():
+    summary = _PytestSummaryPlugin()
+    exit_code = pytest.main(
+        [__file__, "-v", "-k", "not benchmark and not acc_bench"],
+        plugins=[summary],
+    )
+    logger.info(
+        "FlyDSL HGEMM test summary (markdown):\n%s",
+        pd.DataFrame([summary.as_row()]).to_markdown(index=False),
+    )
+    if exit_code != pytest.ExitCode.OK or not _IS_GFX950:
+        return int(exit_code)
+
+    rows = [
+        benchmark_summary(
+            _TestArgs(
+                dtype=torch.bfloat16,
+                m=8192,
+                n=8192,
+                k=8192,
+                block_m=256,
+                block_n=256,
+                block_k=64,
+                stages=2,
+                m_waves=2,
+                n_waves=4,
+                k_waves=1,
+                group_m=0,
+                has_bias=True,
+                use_half_tile_interleaved=True,
+                layout="nt",
+                split_k=1,
+            )
+        )
+    ]
+    logger.info(
+        "FlyDSL HGEMM performance summary (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+    return int(exit_code)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
