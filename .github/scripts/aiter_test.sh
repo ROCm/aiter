@@ -128,7 +128,7 @@ for file in "${sharded_files[@]}"; do
                     fi
                     exec env MORI_SHMEM_HEAP_SIZE=40G \
                         torchrun --standalone --nproc_per_node=8 "$test_file" \
-                        --combine scatter_fused --layers 2 --acc_verify 1
+                        --combine fused --layers 2 --acc_verify 1
                 '
                 _ "$file"
             )
@@ -138,6 +138,21 @@ for file in "${sharded_files[@]}"; do
                 echo "Using AITER_MLA_DECODE_PERSISTENT_MAX_BATCH=0 for $file"
             } | tee -a latest_test.log
             test_cmd=(env AITER_MLA_DECODE_PERSISTENT_MAX_BATCH=0 timeout 60m python3 "$file")
+            ;;
+        op_tests/test_gemm_a6w6.py)
+            {
+                echo "Running tuned dispatch plus every compatible A6W6 ASM kernel"
+            } | tee -a latest_test.log
+            test_cmd=(
+                timeout 60m
+                bash -c '
+                    set -euo pipefail
+                    test_file=$1
+                    python3 "$test_file" --all-kernels -mnk 257,513,129
+                    python3 "$test_file"
+                '
+                _ "$file"
+            )
             ;;
     esac
     # Capture start time (nanoseconds since epoch)

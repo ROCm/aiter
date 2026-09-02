@@ -298,6 +298,7 @@ def run_benchmark(custom, args):
                 k_descale=inputs["k_descale"],
                 v_descale=inputs["v_descale"],
                 output_scale=inputs["out_scale"],
+                backend=args.backend,
             )
 
         ms = triton.testing.do_bench_cudagraph(fn)
@@ -444,6 +445,13 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=None,
         help="Sliding window size (default: disabled)",
+    )
+    parser.add_argument(
+        "-backend",
+        type=str,
+        default=None,
+        choices=["triton", "gluon"],
+        help="Kernel backend",
     )
 
     return parser.parse_args(args=args)

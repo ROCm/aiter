@@ -11,15 +11,15 @@ from typing import Any, Literal
 
 import torch
 import triton
-from aiter.ops.triton.mha import (
-    flash_attn_func,
-)
 
 import aiter
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 from aiter.ops.triton.attention.fav3_sage import (
     fav3_sage_wrapper_func,
     get_sage_fwd_configs,
+)
+from aiter.ops.triton.attention.mha import (
+    flash_attn_func,
 )
 from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
 from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
