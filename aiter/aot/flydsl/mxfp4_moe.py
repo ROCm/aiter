@@ -169,17 +169,9 @@ def parse_csv(csv_path: str):
                             "inline_quant": p1["inline_quant"],
                             "prefetch_hidden": p1.get("prefetch_hidden", False),
                             "D_HIDDEN": model_dim,
-                            # Runtime derives D_INTER from the *stored* weight
-                            # width (``w1.shape[1] // 2``), and non-aligned
-                            # shards ship padded to a multiple of 256 with the
-                            # logical width carried separately in
-                            # ``w2.inter_real`` -- the same convention
-                            # ``is_mxfp4_moe_shape_supported`` uses. Keying on
-                            # the raw CSV ``inter_dim`` would miss those rows
-                            # (Kimi-K3: 384 stored as 512). ``d_inter`` is used
-                            # rather than the GEMM2 ``v2_d_inter`` because the
-                            # latter pads to a backend-specific tile_k.
-                            "D_INTER": d_inter,
+                            # Config lookup and runtime GEMM1 both use the
+                            # unpadded logical width represented by this row.
+                            "D_INTER": inter_dim,
                             "NE": expert,
                             "topk": topk,
                             "xcd_swizzle": p1["xcd_swizzle"],
@@ -191,7 +183,9 @@ def parse_csv(csv_path: str):
                             "swiglu_limit": 7.0,
                             "enable_bias": p1["enable_bias"],
                             "interleave": p1["interleave"],
-                            "native_scale_layout": native_scale_layout_for(p1["BM"]),
+                            "native_scale_layout": native_scale_layout_for(
+                                p1["BM"], p1["out_dtype"]
+                            ),
                             "num_waves": p1.get("num_waves", 4),
                             "k_wave": p1.get("k_wave", 1),
                         }

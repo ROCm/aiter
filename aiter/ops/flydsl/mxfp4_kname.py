@@ -43,15 +43,15 @@ MXFP4_G1_VARIANTS = {
 }
 
 
-def native_scale_layout_for(BM: int) -> bool:
-    """The A-scale layout GEMM1 must emit for a given block_m.
+def native_scale_layout_for(BM: int, out_dtype: str) -> bool:
+    """The A-scale layout GEMM1 must emit for a block_m and output dtype.
 
-    This is a GEMM1/GEMM2 contract, not a tuning knob: BM16 writes the native
-    scale layout and the matching GEMM2 reads it back. Every caller (runtime
-    dispatch, AOT warm-up, tuner) must agree, so the rule lives here -- a
-    second, divergent default is what made the tuner emit NaN.
+    This is a GEMM1/GEMM2 contract, not a tuning knob: BM16 FP4 output writes
+    the native scale layout and the matching GEMM2 reads it back. FP8 output
+    uses the regular scale layout. Every caller must agree, so the rule lives
+    here.
     """
-    return int(BM) == 16
+    return int(BM) == 16 and str(out_dtype).lower() == "fp4"
 
 
 _FLYDSL_V2_GEMM2_RE = re.compile(
