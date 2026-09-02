@@ -112,8 +112,8 @@ def _make_seq_offsets(B, Mi, regime, seed=SEED, device="cuda", sparsity=0.95):
     uniform: every group length == Mi.
     skew:    M_i = floor(Mi * U^4), ~20% empty groups, plus one full (Mi) and
              one near-full (0.9*Mi) group.
-    genrec:  M_i = Uniform{1, ..., Mi} * sparsity, clamped >= 1 (local recipe;
-             similar sparsity intent to HSTU's generate_sparse_seq_len, not identical).
+    genrec:  M_i = round(Uniform{1, ..., Mi} * sparsity), clamped >= 1
+             (variable-length groups; sparsity < 1 shrinks lengths toward 1).
     Mi is the max_seq_len envelope, not the per-group length.
     """
     if regime == "uniform":
@@ -737,7 +737,7 @@ def main(argv=None) -> int:
         return 0
     if not _HAS_TRITON:
         aiter.logger.warning(
-            "generative-recommenders Triton baseline unavailable (%s); running flydsl-only",
+            "upstream Triton jagged backward baseline unavailable (%s); running FlyDSL-only",
             _TRITON_ERR,
         )
 
