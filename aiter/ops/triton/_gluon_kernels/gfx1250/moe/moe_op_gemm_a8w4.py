@@ -1683,8 +1683,9 @@ def _moe_gemm_a8w4_decode(
         # ("'tt.make_range' op Failed to infer return type").
         THREADS_PER_WARP: gl.constexpr = 32
         NUM_WARPS: gl.constexpr = gl.num_warps()
+        M_PER_WARP: gl.constexpr = BLOCK_M // NUM_WARPS if BLOCK_M >= NUM_WARPS else 1
         idx_base: gl.constexpr = gl.BlockedLayout(
-            [BLOCK_M, 1], [1, THREADS_PER_WARP], [1, NUM_WARPS], [1, 0]
+            [M_PER_WARP, 1], [1, THREADS_PER_WARP], [NUM_WARPS, 1], [1, 0]
         )
         idx_layout: gl.constexpr = gl.SliceLayout(1, idx_base)
         offs_m_d = BLOCK_M * block_id + gl.arange(0, BLOCK_M, layout=idx_layout)
@@ -2579,8 +2580,9 @@ def _moe_gemm_a8w4_prefill(
         # ("'tt.make_range' op Failed to infer return type").
         THREADS_PER_WARP: gl.constexpr = 32
         NUM_WARPS: gl.constexpr = gl.num_warps()
+        M_PER_WARP: gl.constexpr = BLOCK_M // NUM_WARPS if BLOCK_M >= NUM_WARPS else 1
         idx_base: gl.constexpr = gl.BlockedLayout(
-            [BLOCK_M, 1], [1, THREADS_PER_WARP], [1, NUM_WARPS], [1, 0]
+            [M_PER_WARP, 1], [1, THREADS_PER_WARP], [NUM_WARPS, 1], [1, 0]
         )
         idx_layout: gl.constexpr = gl.SliceLayout(1, idx_base)
         offs_m_d = BLOCK_M * block_id + gl.arange(0, BLOCK_M, layout=idx_layout)
