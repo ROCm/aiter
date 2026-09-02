@@ -13,6 +13,7 @@ way as runtime JIT config lookup.
 Supported kernel families:
   - ``flydsl_gemm2_*``                        split-K HGEMM kernels
   - ``flydsl_bpreshuflle_*``                  a8w8 preshuffle GEMM kernels
+  - ``flydsl_blockscale_bpreshuffle_*``       a8w8 blockscale bpreshuffle GEMM
   - ``flydsl_bpreshuffle_8w_*``               gfx950 8-wave a8w8 ptpc GEMM kernels
   - ``flydsl_bpreshuffle_wmma_*``             gfx1250 a8w8 ptpc GEMM kernels
   - ``flydsl_mxfp8_128_bpreshuffle_wmma_*``   gfx1250 mxfp8_128 GEMM kernels
@@ -50,6 +51,7 @@ from aiter.aot.flydsl.common import (
     run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.bpreshuffle_gemm_gfx1250 import (
     parse_wmma_kernel_name as parse_ptpc_wmma_kernel_name,
 )
@@ -60,6 +62,19 @@ from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import (
 from aiter.ops.flydsl.gemm_kernels import (
     SPLIT_K_SEMAPHORE_MAX_LEN,
     get_flydsl_splitk_hgemm_kernel_params,
+)
+from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_common import (
+    default_dsrd_depth,
+    effective_stage_a_scales,
+)
+from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_common import (
+    parse_kernel_name as _parse_blockscale_kernel_name,
+)
+from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_common import (
+    tile_is_valid as _blockscale_tile_is_valid,
+)
+from aiter.ops.flydsl.kernels.gemm_blockscale_preshuffle import (
+    compile_blockscale_preshuffle_gemm,
 )
 from aiter.ops.flydsl.kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
 from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm
@@ -78,6 +93,7 @@ from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
 from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
     parse_wmma_kernel_name as parse_mxfp8_128_wmma_kernel_name,
 )
+from aiter.utility.dtypes import defaultDtypes
 
 # Keep the default AOT coverage aligned with runtime config resolution.
 DEFAULT_CSVS = [
@@ -154,6 +170,29 @@ def _parse_preshuffle_kernel_name(name: str) -> dict | None:
     }
 
 
+def _parse_blockscale_params(name: str) -> dict | None:
+    """Compile parameters for one blockscale bpreshuffle row.
+
+    The name is parsed by the same module the tuner writes it with, so the two cannot
+    drift. Note there is no out_dtype in the compile key beyond ``dtype``: this kernel
+    takes N and K at compile time and M at runtime, so one entry serves every M.
+    """
+    ki = _parse_blockscale_kernel_name(name)
+    if ki is None:
+        return None
+    return {
+        "kind": "blockscale",
+        "tile_m": ki.tile_m,
+        "tile_n": ki.tile_n,
+        "tile_k": ki.tile_k,
+        "scale_block_k": ki.scale_block_k,
+        "out_dtype": ki.dtype,
+        "num_waves": ki.num_waves,
+        "use_async_copy": ki.use_async_copy,
+        "use_cshuffle_epilog": ki.use_cshuffle_epilog,
+    }
+
+
 def parse_csv(csv_path: str):
     """Parse a GEMM tuned CSV and return a list of unique FlyDSL compile jobs."""
     jobs = []
@@ -173,7 +212,9 @@ def parse_csv(csv_path: str):
             cu_num = int(row.get("cu_num", "0"))
             gfx = row.get("gfx", "").strip()
 
-            if kernel_name.startswith("flydsl_bpreshuflle_"):
+            if kernel_name.startswith("flydsl_blockscale_bpreshuffle_"):
+                params = _parse_blockscale_params(kernel_name)
+            elif kernel_name.startswith("flydsl_bpreshuflle_"):
                 params = _parse_preshuffle_kernel_name(kernel_name)
             elif kernel_name.startswith("flydsl_bpreshuffle_8w_"):
                 params = parse_8wave_kernel_name(kernel_name)
@@ -617,8 +658,92 @@ def _compile_ptpc_wmma_to_cache(
 
 
 def job_arch(cu_num: int = 0, gfx: str = "") -> str:
-    """Target arch a job would compile for -- shared by dispatch and ARCH filtering."""
+    """Target arch a job would compile for; shared by dispatch and ARCH filtering."""
     return gfx or cu_num_to_arch(cu_num, default=GEMM_AOT_ARCH_DEFAULT)
+
+
+def _compile_blockscale_to_cache(
+    *,
+    m: int,
+    n: int,
+    k: int,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    scale_block_k: int,
+    out_dtype: str,
+    num_waves: int = 4,
+    use_async_copy: bool = False,
+    use_cshuffle_epilog: bool = False,
+    target_gfx: str = "",
+    **kwargs,
+):
+    del kwargs
+
+    import torch
+
+    dev = torch.device("cpu")
+    out_torch_dtype = _torch_dtype_for_kernel(out_dtype)
+    scale_k = (k + scale_block_k - 1) // scale_block_k
+    scale_n = (n + 128 - 1) // 128
+
+    # This launcher takes fx.Tensor slots rather than raw pointers, so the shapes and
+    # dtypes here have to be the ones the runtime call passes: a fp8 A and B, flat fp32
+    # scale buffers, and a 2-D output. A mismatch compiles a signature the serving path
+    # then misses on, which is invisible: the kernel simply JITs again at first use.
+    out = torch.empty((m, n), device=dev, dtype=out_torch_dtype)
+    # This launcher takes fx.Tensor slots, not the raw pointers the sibling stubs pass,
+    # so the fp8 flavour is part of the compiled signature: e4m3fnuz on gfx942 but
+    # e4m3fn on gfx950. Hardcoding either prewarms a signature the other arch misses.
+    fp8_dtype = defaultDtypes.get(target_gfx or get_gfx(), {}).get(
+        "fp8", torch.float8_e4m3fnuz
+    )
+    a = torch.empty((m, k), device=dev, dtype=fp8_dtype)
+    b = torch.empty((n, k), device=dev, dtype=fp8_dtype)
+    scale_a = torch.empty((m * scale_k,), device=dev, dtype=torch.float32)
+    scale_b = torch.empty((scale_n * scale_k,), device=dev, dtype=torch.float32)
+    stream = fx.Stream(0)
+
+    # Everything the module name is built from has to match what the serving path
+    # will ask for, or this prewarms an entry the runtime never looks up. The tile and
+    # the flags come from the kernelName; dsrd_depth and stage_a_scales are not in it,
+    # so they are resolved the way flydsl_gemm_a8w8_blockscale_bpreshuffle resolves
+    # them, for the arch being built rather than the host.
+    staged = effective_stage_a_scales(tile_m, tile_k, scale_block_k, use_async_copy)
+    # The tuner and the dispatch both reject an over-budget tile before it compiles, so
+    # a row reaching here should already be servable. Checked anyway: this is the one
+    # path that reads a CSV without either of them in front of it, and the failure it
+    # guards against is a launch that corrupts the context without raising.
+    if not _blockscale_tile_is_valid(
+        tile_m,
+        tile_n,
+        tile_k,
+        n,
+        k,
+        scale_block_k,
+        num_waves=num_waves,
+        use_cshuffle_epilog=use_cshuffle_epilog,
+        stage_a_scales=staged,
+    ):
+        raise RuntimeError(
+            f"tile {tile_m}x{tile_n}x{tile_k} exceeds the LDS budget for "
+            f"N={n} K={k}; refusing to prewarm it"
+        )
+    exe = compile_blockscale_preshuffle_gemm(
+        N=n,
+        K=k,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        scale_block_k=scale_block_k,
+        out_dtype="bf16" if out_torch_dtype == torch.bfloat16 else "fp16",
+        num_waves=num_waves,
+        use_async_copy=use_async_copy,
+        use_cshuffle_epilog=use_cshuffle_epilog,
+        dsrd_depth=default_dsrd_depth(target_gfx or get_gfx()),
+        stage_a_scales=True,
+    )
+    _compile_executable_to_cache(exe, out, a, b, scale_a, scale_b, m, n, stream)
 
 
 def compile_one_config(
@@ -656,6 +781,10 @@ def compile_one_config(
                 _compile_hgemm_to_cache(m=m, n=n, k=k, **hgemm_kwargs)
             elif kind == "preshuffle":
                 _compile_preshuffle_to_cache(m=m, n=n, k=k, **kwargs)
+            elif kind == "blockscale":
+                _compile_blockscale_to_cache(
+                    m=m, n=n, k=k, target_gfx=aot_arch, **kwargs
+                )
             elif kind == "8wave":
                 _compile_8wave_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "mxfp8_128_wmma":
@@ -716,6 +845,7 @@ def main():
 
     hgemm_jobs = [j for j in all_jobs if j["kind"] == "hgemm"]
     preshuffle_jobs = [j for j in all_jobs if j["kind"] == "preshuffle"]
+    blockscale_jobs = [j for j in all_jobs if j["kind"] == "blockscale"]
     eightwave_jobs = [j for j in all_jobs if j["kind"] == "8wave"]
     mxfp8_128_wmma_jobs = [j for j in all_jobs if j["kind"] == "mxfp8_128_wmma"]
     ptpc_wmma_jobs = [j for j in all_jobs if j["kind"] == "ptpc_wmma"]
@@ -727,6 +857,7 @@ def main():
         print(f"  CSV:              {csv_path}")
     print(f"  HGEMM jobs:       {len(hgemm_jobs)}")
     print(f"  Preshuffle jobs:  {len(preshuffle_jobs)}")
+    print(f"  Blockscale jobs:  {len(blockscale_jobs)}")
     print(f"  8wave jobs:       {len(eightwave_jobs)}")
     print(f"  MXFP8_128 wmma jobs: {len(mxfp8_128_wmma_jobs)}")
     print(f"  PTPC wmma jobs:   {len(ptpc_wmma_jobs)}")
@@ -744,6 +875,7 @@ def main():
         compile_one_config,
         hgemm_jobs
         + preshuffle_jobs
+        + blockscale_jobs
         + eightwave_jobs
         + mxfp8_128_wmma_jobs
         + ptpc_wmma_jobs,
