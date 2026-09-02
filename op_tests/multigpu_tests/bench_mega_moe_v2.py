@@ -205,7 +205,6 @@ def main():
     parser.add_argument("--stage1-payload-chunk-rows", type=int, default=0)
     parser.add_argument("--stage1-tile-ready", action="store_true")
     parser.add_argument("--disable-stage1-tile-ready", action="store_true")
-    parser.add_argument("--stage1-internal-grouping", action="store_true")
     parser.add_argument("--stage1-work-shards", type=int, default=0)
     parser.add_argument("--stage1-dispatch-cu", type=int, default=0)
     parser.add_argument("--stage1-grid-mult", type=int, default=0)
@@ -278,7 +277,6 @@ def main():
         or args.stage1_payload_chunk_rows
         or args.stage1_tile_ready
         or args.disable_stage1_tile_ready
-        or args.stage1_internal_grouping
         or args.stage1_work_shards
         or args.stage1_dispatch_cu
         or args.stage1_grid_mult
@@ -298,11 +296,6 @@ def main():
                 stage1_updates["payload_tile_ready"] = True
             if args.disable_stage1_tile_ready:
                 stage1_updates["payload_tile_ready"] = False
-            if args.stage1_internal_grouping:
-                stage1_updates.update(
-                    external_grouping=False,
-                    external_counting=False,
-                )
             if args.stage1_work_shards:
                 stage1_updates["work_shards"] = args.stage1_work_shards
             if args.stage1_dispatch_cu:
