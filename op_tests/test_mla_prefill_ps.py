@@ -564,8 +564,8 @@ def test_mla_prefill(
                 lse_err = checkAllclose(
                     ref_lse_valid,
                     asm_lse_valid,
-                    rtol=5e-2,
-                    atol=5e-2,
+                    rtol=0,
+                    atol=1e-2,
                     msg="mla_prefill_lse   [torch vs aiter_asm]: us......",
                 )
                 if lse_err == 0:
