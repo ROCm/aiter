@@ -192,10 +192,10 @@ _FP8_MIN_NUMEL = 128 * 2048
 # bench reports the same availability aiter does.
 if is_flydsl_available():
     from aiter.ops.flydsl import QRInt4
-    from aiter.ops.flydsl.kernels.all_reduce_1stage import (
+    from aiter.ops.flydsl.kernels.qr_1stage import (
         MAX_PAYLOAD_BYTES as _FLY1S_MAX_BYTES,
     )
-    from aiter.ops.flydsl.kernels.all_reduce_1stage import OneShotAllReduce
+    from aiter.ops.flydsl.kernels.qr_1stage import OneShotAllReduce
     from aiter.ops.flydsl.kernels.qr_int4 import (
         ALGORITHMS,
         MIN_PAYLOAD_BYTES,
@@ -324,7 +324,7 @@ CANDIDATES = (
     Candidate("fly_1stage_g32", "fly1s", 40.0, True, grid_cap=32),
     # A fatter-tile row (atoms=4, a 16 KiB tile, a quarter the blocks and a
     # quarter the flags) belongs here and is deliberately absent: atoms>1 is
-    # currently incorrect, see SUPPORTED_ATOMS in all_reduce_1stage_kernel.py.
+    # currently incorrect, see SUPPORTED_ATOMS in qr_1stage_kernel.py.
     # Fanout order: "atom" spreads consecutive stores across peers instead of
     # handing each destination a contiguous run. Expected to matter on xGMI,
     # where the native packet is 64 B, and to lose on PCIe.

@@ -11,7 +11,7 @@ caller to discover the crossover.
 
 Everything around the kernel -- the IPC inbox, the peer-pointer table, the
 per-block colours -- is ``qr_int4``'s ``_StEngine``, reused as-is. See
-docs/all_reduce_1stage.md.
+docs/qr_1stage.md.
 """
 
 from __future__ import annotations
@@ -25,12 +25,12 @@ from flydsl.expr.typing import Int32, Int64, Stream
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
-from .all_reduce_1stage_kernel import (
+from .qr_1stage_kernel import (
     DEFAULT_ATOMS,
     DEFAULT_FANOUT,
     DEFAULT_GRID_CAP,
     SUPPORTED_ATOMS,
-    make_all_reduce_1stage_kernel,
+    make_qr_1stage_kernel,
 )
 from .qr_int4 import (
     _SUPPORTED_ARCHS,
@@ -61,7 +61,7 @@ MAX_PAYLOAD_BYTES = 256 << 10
 
 
 class OneShotAllReduce:
-    """IPC inbox + launch wrapper for ``all_reduce_1stage``.
+    """IPC inbox + launch wrapper for ``qr_1stage``.
 
     Requires a non-NCCL, single-node process group for IPC metadata exchange,
     the same constraint ``QRInt4`` has and for the same reason.
@@ -70,7 +70,7 @@ class OneShotAllReduce:
     count for a given payload, which is the knob the TP8 data says is *not*
     obviously important -- ``cross_device_reduce`` runs 7-8x more blocks than
     the naive path at no measurable cost -- so they are exposed to be swept
-    rather than pinned to a guess. See docs/all_reduce_1stage.md §6.3.
+    rather than pinned to a guess. See docs/qr_1stage.md §6.3.
 
     ``inbox_memory`` follows ``QRInt4``: ``"auto"`` picks ``uncached`` on xGMI
     hosts and ``finegrained`` on PCIe ones from the KFD topology, because
@@ -126,7 +126,7 @@ class OneShotAllReduce:
         self.fanout = fanout
         self.max_bytes = MAX_PAYLOAD_BYTES if max_bytes is None else int(max_bytes)
 
-        spec = make_all_reduce_1stage_kernel(
+        spec = make_qr_1stage_kernel(
             world_size=self.world_size,
             atoms=self.atoms,
             grid=cap,

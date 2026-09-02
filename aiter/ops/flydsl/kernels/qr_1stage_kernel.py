@@ -4,24 +4,16 @@
 """gfx942/gfx950 TP∈{2,4,8} exact one-shot (1-stage) all-reduce.
 
 Decode-regime kernel: bf16 in, fp32 accumulate, bf16 out, no codec. One
-communication round and **no grid-wide barrier** -- each rank pushes its whole
+communication round and no grid-wide barrier -- each rank pushes its whole
 tile into every peer's inbox, publishes a colour flag, waits for the N flags,
 then reduces N copies out of its own inbox.
 
-Against ``cross_device_reduce_1stage``, which barriers, reads every peer's
-input, reduces, and barriers again, this trades wire volume for round trips:
+This kernel trades wire volume for round trips:
 (N-1)*S pushed rather than (N-1)*S read, but ~2 serialized fabric traversals
-rather than ~6. That is the right trade only while the payload is small, hence
-``MAX_PAYLOAD_BYTES`` on the host -- above it the two-shot's 2(N-1)/N wire
-volume wins and this kernel should not be selected.
+rather than ~6. 
 
-Why there is no LDS here and 9 KiB of it in ``qr_int4_kernel``: quantization
-redistributes data across threads, so a thread's packed output belongs in a
-different peer's packet than the one it loaded from. Without a codec, thread
-``t``'s 16 B lands at the same offset in every destination, so it can be pushed
-straight from registers.
-
-See docs/all_reduce_1stage.md.
+No LDS is needed: thread ``t``'s 16 B lands at the same offset in every destination, 
+so it can be pushed straight from registers.
 """
 
 import flydsl.compiler as flyc
@@ -33,9 +25,7 @@ from flydsl.expr.typing import Int32, Int64, Stream, T
 from . import buffer_ops
 
 # The peer-store/load primitives, the cache-policy table and the inbox-memory
-# taxonomy are shared with the quantized kernels verbatim. Private there by
-# convention, not by intent -- see the same import block in
-# ``qr_int4_ring_kernel``.
+# taxonomy are shared with the quantized kernels verbatim. 
 from .qr_int4_kernel import (
     _CM_SC0,
     _CM_SC1,
@@ -57,7 +47,7 @@ DEFAULT_ATOMS = 1
 # the last partial tile. 1 is the decode default: at TP8/M=1 (14 KiB) it gives
 # 4 blocks, which is already more parallelism than the payload needs.
 #
-# ONLY 1 IS CORRECT TODAY. atoms=4 was measured wrong at TP4 on every shape
+# TODO: ONLY 1 IS CORRECT TODAY. atoms=4 was measured wrong at TP4 on every shape
 # tested (m=1..16): the last rank's output diverges from the others and SQNR is
 # -inf, i.e. the reduction is reading something that is not the payload. atoms=1
 # passes the same test at TP2 and TP4 including the run-ahead loop, so the fault
@@ -70,11 +60,7 @@ DEFAULT_GRID_CAP = 64
 
 # Inbox slots are indexed by ``colour & 1``. Two buffers is exactly enough to
 # let one rank run a whole call ahead of another without overwriting a slot the
-# straggler has not read; see the run-ahead argument in
-# docs/all_reduce_1stage.md §6.2. It is *not* enough to be sloppy about the
-# wait: the proof leans on every rank's publish for call k+1 happening after its
-# own read of call k, which is only true because a kernel launch is ordered
-# against the previous one on the same stream.
+# straggler has not read.
 PARITIES = 2
 # 64 B handshake sector at the tail of each wire slot, as 16 i32 copies of the
 # colour -- one ``dwordx4`` from each of 4 lanes.
@@ -87,16 +73,11 @@ _RECV_POLICY = _CM_SC0 | _CM_SC1
 # Which axis of the (peer, atom) fanout runs fastest across consecutive stores.
 #
 # "peer": a thread pushes all its atoms to one destination before moving to the
-# next, so a wave hands each destination a contiguous ``BLOCK * 16`` B run. This
-# is what PCIe wants -- interleaving destinations costs ~1.5x against >=256 B
-# runs (36.25 vs 54.03 GB/s measured on MI350P, see docs/qr_int4_mi350p.md).
+# next, so a wave hands each destination a contiguous ``BLOCK * 16`` B run.
 #
 # "atom": consecutive stores walk the peers of one atom. On xGMI the native
 # packet is 64 B and there is no per-destination run-length benefit to collect,
 # so spreading across links sooner can start more of them in parallel.
-#
-# Resolved on the host side of the factory because a binding made inside an
-# ``if`` does not survive FlyDSL's trace.
 FANOUT_ORDERS = ("peer", "atom")
 DEFAULT_FANOUT = "peer"
 
@@ -131,7 +112,7 @@ def _atom_f32_to_bf16(acc_f32):
     return acc_f32.to(fx.BFloat16).bitcast(fx.Int32)
 
 
-def make_all_reduce_1stage_kernel(
+def make_qr_1stage_kernel(
     *,
     world_size: int,
     atoms: int = DEFAULT_ATOMS,
@@ -173,7 +154,7 @@ def make_all_reduce_1stage_kernel(
         fanout_pairs = [(p, a) for a in range(atoms) for p in range(world_size)]
 
     @flyc.kernel(known_block_size=[BLOCK, 1, 1])
-    def all_reduce_1stage(
+    def qr_1stage(
         rank: Int32,
         nbytes: Int64,
         num_tiles: Int32,
@@ -394,7 +375,7 @@ def make_all_reduce_1stage_kernel(
     flat_wg = f"{BLOCK},{BLOCK}"
 
     @flyc.jit
-    def launch_all_reduce_1stage(
+    def launch_qr_1stage(
         rank: Int32,
         nbytes: Int64,
         num_tiles: Int32,
@@ -405,7 +386,7 @@ def make_all_reduce_1stage_kernel(
         grid_x: Int32,
         stream: Stream = Stream(None),  # noqa: B008
     ):
-        all_reduce_1stage(
+        qr_1stage(
             rank,
             nbytes,
             num_tiles,
@@ -420,13 +401,13 @@ def make_all_reduce_1stage_kernel(
     # Every compile-time knob that changes the emitted code has to be in the
     # symbol name, or two variants collide in the JIT cache.
     tag = f"ws{world_size}_a{atoms}_{inbox_memory}_{fanout}"
-    launch_all_reduce_1stage.func.__name__ = f"launch_all_reduce_1stage_{tag}"
+    launch_qr_1stage.func.__name__ = f"launch_qr_1stage_{tag}"
     try:
-        all_reduce_1stage.func.__name__ = f"all_reduce_1stage_{tag}"
+        qr_1stage.func.__name__ = f"qr_1stage_{tag}"
     except AttributeError:
         pass
     return {
-        "launch": launch_all_reduce_1stage,
+        "launch": launch_qr_1stage,
         "flags_bytes": 0,
         "data_bytes": data_bytes,
         "lds_bytes": 0,

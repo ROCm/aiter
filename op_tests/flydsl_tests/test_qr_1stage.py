@@ -16,7 +16,7 @@ Three things are checked, and the second and third matter more than the first:
 
 Run directly (these are argparse scripts, not pytest):
 
-    HIP_VISIBLE_DEVICES=0,1 python3 -m op_tests.flydsl_tests.test_all_reduce_1stage -tp 2
+    HIP_VISIBLE_DEVICES=0,1 python3 -m op_tests.flydsl_tests.test_qr_1stage -tp 2
 """
 
 from __future__ import annotations
@@ -60,7 +60,7 @@ def _worker(
         dist.init_process_group(
             backend="gloo", init_method=init_method, rank=rank, world_size=world_size
         )
-        from aiter.ops.flydsl.kernels.all_reduce_1stage import OneShotAllReduce
+        from aiter.ops.flydsl.kernels.qr_1stage import OneShotAllReduce
 
         device = torch.device(f"cuda:{rank}")
         eng = OneShotAllReduce(
