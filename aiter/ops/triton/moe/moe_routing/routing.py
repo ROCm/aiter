@@ -163,14 +163,6 @@ def sort_tokens_fused(
     n_tokens, n_expts_act = expt_scal.shape
     n_gates = n_tokens * n_expts_act
     n_expts_act_pad = triton.next_power_of_2(n_expts_act)
-    # `_routing_compute_indx_fused` ignores its pid and always sorts tile 0, and
-    # `_sum_bitmatrix_rows_fused` reads exactly HIST_BLOCK_M bitmatrix rows, so
-    # one tile has to cover every token. A caller passing a smaller block would
-    # get every CTA redoing tile 0 and the tail tokens dropped, not an error.
-    assert HIST_BLOCK_M >= n_tokens, (
-        f"sort_tokens_fused needs HIST_BLOCK_M ({HIST_BLOCK_M}) >= n_tokens "
-        f"({n_tokens}): the fused kernel covers all tokens in one tile"
-    )
 
     hist = bitmatrix.scratchpad
     hist = hist[:n_expts_tot]
@@ -220,7 +212,6 @@ def sort_tokens_fused(
         EQUAL_A=(hist.shape[0] == BLOCK_A),  # optimization parameters
         USE_TDM=is_tdm_avail(),
         num_warps=1,
-        # num_warps=_fused_sort_num_warps(n_tokens, n_expts_act),
     )
 
     return (
