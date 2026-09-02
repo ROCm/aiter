@@ -195,12 +195,21 @@ on candidates that are individually plausible and collectively diverse.
    For a fixed GEMM1 the layout family offers only ~16 partners, one per stratum,
    so stratifying GEMM2 degenerates to ranking and a top-3 take still missed a
    1.5% win. **`--g2-per-g1 0`** (every legal partner) is the reliable setting.
-3. **Size `top_k` against the number of strata.** Once the prompt is a proper
-   cover, `top_k` is the only remaining lever, and the failures it causes are the
-   model declining to pick a config it *was* shown. Measured on glm5 against
-   exhaustive optima: `top_k` 32 reached the true winner on 7 of 12 shapes and
-   every miss was present in the prompt. `top_k >= strata` makes containment exact
-   by construction, at the cost of the model no longer selecting anything.
+3. **Use `top_k` 64.** Once the prompt is a proper cover, `top_k` is the only
+   remaining lever, and the failures it causes are the model declining to pick a
+   config it *was* shown. Measured on glm5 against exhaustive per-shape optima
+   (2688 pairs each, tokens 1-32768):
+
+   | `top_k` | slate holds the true optimum | distinct GEMM1 offered |
+   |---|---:|---:|
+   | 32 | 10/15 | 31 |
+   | **64** | **15/15** | 63 |
+
+   All five `top_k` 32 misses were present in the prompt and simply not chosen,
+   so this is a selection budget, not coverage. 64 is ~0.9x the ~72 strata; at
+   `top_k >= strata` containment becomes exact by construction, with the model no
+   longer selecting anything. Below 32 it degrades gracefully — a knob, not a
+   cliff.
 4. At `token <= 8` on an inline-quant shape, always include an `_hpf` candidate
    **and its non-`hpf` twin** — that is where the 1.20x lives and the pair makes
    the effect attributable.
@@ -231,7 +240,7 @@ end through L2 displacement of the following GEMM1. If a tuned row's recorded
 # CPU-only: recommend candidates into a CSV
 python csrc/ck_gemm_moe_2stages_codegen/recommend_mxfp4_candidates.py \
   -i aiter/configs/model_configs/kimik3_a4w4_untuned_fmoe.csv \
-  -o /tmp/cand.csv --gfx gfx950 --cu-num 256 --top-k 32 --g2-per-g1 0 \
+  -o /tmp/cand.csv --gfx gfx950 --cu-num 256 --top-k 64 --g2-per-g1 0 \
   --policy .claude/skills/mxfp4-tuning-policy/SKILL.md
 
 # GPU: tune only those candidates
