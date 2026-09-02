@@ -514,8 +514,8 @@ def checkAllclose(
         return 0
     else:
         try:
-            mask = ~isClose
-            num = int(mask.sum().item())
+            mismatch = ~isClose
+            num = int(mismatch.sum().item())
             printNum = min(printNum, num)
             percent = num / denom
             if not printLog:
@@ -525,13 +525,13 @@ def checkAllclose(
                     a, b, max_abs_delta, catastrophic_check
                 )
                 return 1.0 if is_cat else percent
-            a_msked = a[mask]
-            b_msked = b[mask]
+            a_msked = a[mismatch]
+            b_msked = b[mismatch]
             delta = (a_msked - b_msked).abs()
         except RuntimeError:
             a, b = a.to("cpu"), b.to("cpu")
-            mask = ~isClose.to("cpu")
-            num = int(mask.sum().item())
+            mismatch = ~isClose.to("cpu")
+            num = int(mismatch.sum().item())
             printNum = min(printNum, num)
             percent = num / denom
             if not printLog:
@@ -541,8 +541,8 @@ def checkAllclose(
                     a, b, max_abs_delta, catastrophic_check
                 )
                 return 1.0 if is_cat else percent
-            a_msked = a[mask]
-            b_msked = b[mask]
+            a_msked = a[mismatch]
+            b_msked = b[mismatch]
             delta = (a_msked - b_msked).abs()
 
         actual_max_delta = delta.max().item()

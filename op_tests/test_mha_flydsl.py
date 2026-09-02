@@ -30,6 +30,10 @@ if aiter.get_gfx() != "gfx1250":
 HEAD_DIM_QK = 192
 HEAD_DIM_V = 128
 
+# Element dtypes the m32x8 kernel serves (q/k/v share one).
+DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
+DTYPE_NAME = {v: k for k, v in DTYPES.items()}
+
 # (d_qk, d_v) pairs each layout's FlyDSL kernel can serve. Extend as the
 # kernels grow; anything else is rejected up front rather than silently
 # falling through to CK/Triton and testing nothing.
@@ -181,6 +185,7 @@ def run_varlen_test(
     return_lse=False,
     sink=False,
     window_size=(-1, -1),
+    dtype=torch.bfloat16,
     warmup=1,
     repeat=5,
 ):
@@ -198,9 +203,9 @@ def run_varlen_test(
     max_sq = max(cu_q[i + 1] - cu_q[i] for i in range(B))
     max_sk = max(cu_k[i + 1] - cu_k[i] for i in range(B))
 
-    q = torch.randn(total_q, H_q, d_qk, dtype=torch.bfloat16, device=device)
-    k = torch.randn(total_k, H_kv, d_qk, dtype=torch.bfloat16, device=device)
-    v = torch.randn(total_k, H_kv, d_v, dtype=torch.bfloat16, device=device)
+    q = torch.randn(total_q, H_q, d_qk, dtype=dtype, device=device)
+    k = torch.randn(total_k, H_kv, d_qk, dtype=dtype, device=device)
+    v = torch.randn(total_k, H_kv, d_v, dtype=dtype, device=device)
 
     scale = 1.0 / math.sqrt(d_qk)
     # sink is [nheads_q] fp32, per-head logit in the same scaled-score domain.
@@ -239,7 +244,7 @@ def run_varlen_test(
 
     seqs = [cu_q[i + 1] - cu_q[i] for i in range(B)]
     tag = (
-        f"thd B={B} H={H_q}/{H_kv} d={d_qk}/{d_v} seqs={seqs} "
+        f"thd {DTYPE_NAME[dtype]} B={B} H={H_q}/{H_kv} d={d_qk}/{d_v} seqs={seqs} "
         f"causal={causal} lse={return_lse} sink={sink} window={window_size}"
     )
     print(f"  [{tag}] avg: {avg_ms:.3f}ms ({avg_us:.1f} us)  {fwd_tflops:.1f} TFLOPS")
@@ -333,6 +338,7 @@ def run_varlen_test(
     passed = err < 0.05
     ret = {
         "layout": "thd",
+        "dtype": DTYPE_NAME[dtype],
         "B": B,
         "H_q": H_q,
         "H_kv": H_kv,
@@ -409,6 +415,7 @@ def run_batch_test(
     return_lse=False,
     sink=False,
     window_size=(-1, -1),
+    dtype=torch.bfloat16,
     warmup=1,
     repeat=5,
 ):
@@ -420,9 +427,9 @@ def run_batch_test(
     H_kv = H_q if H_kv is None else H_kv
     assert H_q % H_kv == 0, f"nheads_q={H_q} must be a multiple of nheads_kv={H_kv}"
 
-    q = torch.randn(B, sq, H_q, d_qk, dtype=torch.bfloat16, device=device)
-    k = torch.randn(B, sk, H_kv, d_qk, dtype=torch.bfloat16, device=device)
-    v = torch.randn(B, sk, H_kv, d_v, dtype=torch.bfloat16, device=device)
+    q = torch.randn(B, sq, H_q, d_qk, dtype=dtype, device=device)
+    k = torch.randn(B, sk, H_kv, d_qk, dtype=dtype, device=device)
+    v = torch.randn(B, sk, H_kv, d_v, dtype=dtype, device=device)
 
     scale = 1.0 / math.sqrt(d_qk)
     # sink is [nheads_q] fp32, per-head logit in the same scaled-score domain.
@@ -441,7 +448,7 @@ def run_batch_test(
         )
 
     tag = (
-        f"bshd B={B} H={H_q}/{H_kv} d={d_qk}/{d_v} sq={sq} sk={sk} "
+        f"bshd {DTYPE_NAME[dtype]} B={B} H={H_q}/{H_kv} d={d_qk}/{d_v} sq={sq} sk={sk} "
         f"causal={causal} lse={return_lse} sink={sink} window={window_size}"
     )
 
@@ -492,6 +499,7 @@ def run_batch_test(
     passed = err < 0.05
     ret = {
         "layout": "bshd",
+        "dtype": DTYPE_NAME[dtype],
         "B": B,
         "H_q": H_q,
         "H_kv": H_kv,
@@ -539,7 +547,7 @@ def _tflops(flop, ms):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
-        description="FlyDSL MHA unit test & benchmark (gfx1250, bf16).\n"
+        description="FlyDSL MHA unit test & benchmark (gfx1250, bf16/fp16).\n"
         "Runs both the varlen (thd) and batched (bshd) suites by default.",
     )
     parser.add_argument(
@@ -637,6 +645,13 @@ if __name__ == "__main__":
         type=int,
         default=5,
         help="Repeat iterations for benchmark (default 5).",
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default=None,
+        choices=list(DTYPES),
+        help="Element dtype: bf16/fp16. Default runs both.\ne.g.: --dtype fp16",
     )
     parser.add_argument(
         "--varlen",
@@ -835,6 +850,7 @@ if __name__ == "__main__":
     causal_list = [causal_filter] if causal_filter is not None else [False, True]
     lse_list = [lse_filter] if lse_filter is not None else [False, True]
     sink_list = [sink_filter] if sink_filter is not None else [False, True]
+    dtype_list = [DTYPES[args.dtype]] if args.dtype else [torch.bfloat16, torch.float16]
 
     # Sliding-window axis. Default is pure regression (full attention only); with
     # --local, exercise narrow (tile-skipping) and wide bands over single/
@@ -867,50 +883,54 @@ if __name__ == "__main__":
             for shape in base_shapes:
                 cu_q, cu_k, H = shape[:3]
                 H_kv = shape[3] if len(shape) > 3 else H
-                for causal in causal_list:
-                    for return_lse in lse_list:
-                        for sink in _sink_axis(d_qk, d_v):
-                            for window in _window_axis(d_qk, d_v):
-                                tests.append(
-                                    (
-                                        "thd",
-                                        cu_q,
-                                        cu_k,
-                                        H,
-                                        H_kv,
-                                        d_qk,
-                                        d_v,
-                                        causal,
-                                        return_lse,
-                                        sink,
-                                        window,
+                for dtype in dtype_list:
+                    for causal in causal_list:
+                        for return_lse in lse_list:
+                            for sink in _sink_axis(d_qk, d_v):
+                                for window in _window_axis(d_qk, d_v):
+                                    tests.append(
+                                        (
+                                            "thd",
+                                            cu_q,
+                                            cu_k,
+                                            H,
+                                            H_kv,
+                                            d_qk,
+                                            d_v,
+                                            dtype,
+                                            causal,
+                                            return_lse,
+                                            sink,
+                                            window,
+                                        )
                                     )
-                                )
     if run_bshd:
         for d_qk, d_v in args.batch_d_qk_v:
             for shape in batch_shapes:
                 bs, sq_i, sk_i, H = shape[:4]
                 H_kv = shape[4] if len(shape) > 4 else H
-                for causal in causal_list:
-                    for return_lse in lse_list:
-                        for sink in _sink_axis(d_qk, d_v):
-                            for window in _window_axis(d_qk, d_v):
-                                tests.append(
-                                    (
-                                        "bshd",
-                                        bs,
-                                        sq_i,
-                                        sk_i,
-                                        H,
-                                        H_kv,
-                                        d_qk,
-                                        d_v,
-                                        causal,
-                                        return_lse,
-                                        sink,
-                                        window,
+                for dtype in dtype_list:
+                    for causal in causal_list:
+                        for return_lse in lse_list:
+                            for sink in _sink_axis(d_qk, d_v):
+                                for window in _window_axis(d_qk, d_v):
+                                    tests.append(
+                                        (
+                                            "bshd",
+                                            bs,
+                                            sq_i,
+                                            sk_i,
+                                            H,
+                                            H_kv,
+                                            d_qk,
+                                            d_v,
+                                            dtype,
+                                            causal,
+                                            return_lse,
+                                            sink,
+                                            window,
+                                        )
                                     )
-                                )
 
     if args.cmp_triton:
         from aiter.ops.triton.attention.mha import (
@@ -923,7 +943,7 @@ if __name__ == "__main__":
         causal, return_lse, sink, window = case[-4], case[-3], case[-2], case[-1]
         try:
             if case[0] == "thd":
-                _, cu_q, cu_k, H, H_kv, d_qk, d_v, _, _, _, _ = case
+                _, cu_q, cu_k, H, H_kv, d_qk, d_v, dtype, _, _, _, _ = case
                 ok, ret = run_varlen_test(
                     cu_q,
                     cu_k,
@@ -935,6 +955,7 @@ if __name__ == "__main__":
                     return_lse=return_lse,
                     sink=sink,
                     window_size=window,
+                    dtype=dtype,
                     warmup=args.warmup,
                     repeat=args.repeat,
                 )
@@ -945,15 +966,9 @@ if __name__ == "__main__":
                     max_sk = max(cu_k[i + 1] - cu_k[i] for i in range(len(cu_k) - 1))
                     scale = 1.0 / math.sqrt(d_qk)
                     torch.manual_seed(42)
-                    q = torch.randn(
-                        total_q, H, d_qk, dtype=torch.bfloat16, device=device
-                    )
-                    k = torch.randn(
-                        total_k, H_kv, d_qk, dtype=torch.bfloat16, device=device
-                    )
-                    v = torch.randn(
-                        total_k, H_kv, d_v, dtype=torch.bfloat16, device=device
-                    )
+                    q = torch.randn(total_q, H, d_qk, dtype=dtype, device=device)
+                    k = torch.randn(total_k, H_kv, d_qk, dtype=dtype, device=device)
+                    v = torch.randn(total_k, H_kv, d_v, dtype=dtype, device=device)
                     cu_q_t = torch.tensor(cu_q, dtype=torch.int32, device=device)
                     cu_k_t = torch.tensor(cu_k, dtype=torch.int32, device=device)
                     tri_ms = _time_fn(
@@ -976,7 +991,7 @@ if __name__ == "__main__":
                     ret["triton_tflops"] = round(_tflops(fwd_flop, tri_ms), 2)
                     ret["speedup"] = round(tri_ms / ret["avg_us"] * 1000, 2)
             else:
-                _, bs, sq_i, sk_i, H, H_kv, d_qk, d_v, _, _, _, _ = case
+                _, bs, sq_i, sk_i, H, H_kv, d_qk, d_v, dtype, _, _, _, _ = case
                 ok, ret = run_batch_test(
                     bs,
                     sq_i,
@@ -989,6 +1004,7 @@ if __name__ == "__main__":
                     return_lse=return_lse,
                     sink=sink,
                     window_size=window,
+                    dtype=dtype,
                     warmup=args.warmup,
                     repeat=args.repeat,
                 )
