@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 
-"""World-8 correctness test for the M1 fused Ulysses in-hop transport."""
+"""World-8 correctness test for fused Ulysses in-hop and out-hop transport."""
 
 from __future__ import annotations
 
@@ -33,9 +33,45 @@ def _free_port():
 
 
 def _sequence_major_input(rank, heads, seq_len, head_dim, device):
-    numel = heads * seq_len * head_dim
-    values = torch.arange(numel, dtype=torch.int64).view(1, seq_len, heads, head_dim)
-    return (values + rank * numel).to(torch.bfloat16).to(device)
+    generator = torch.Generator(device="cpu").manual_seed(1103 + rank)
+    return (
+        torch.randn(
+            (1, seq_len, heads, head_dim), generator=generator, dtype=torch.float32
+        )
+        .to(torch.bfloat16)
+        .to(device)
+    )
+
+
+def _norm_rope(input_tensor, weight, cos, sin):
+    heads, head_dim = input_tensor.shape[-2:]
+    norm = torch.nn.RMSNorm(
+        heads * head_dim,
+        eps=1.0e-6,
+        elementwise_affine=True,
+        device=input_tensor.device,
+        dtype=torch.float32,
+    )
+    norm.weight.data.copy_(weight.float())
+    values = norm(input_tensor.flatten(-2).float()).view_as(input_tensor.float())
+    even = values[..., 0::2]
+    odd = values[..., 1::2]
+    output = torch.empty_like(values)
+    output[..., 0::2] = even * cos[..., 0::2] - odd * sin[..., 1::2]
+    output[..., 1::2] = even * sin[..., 1::2] + odd * cos[..., 0::2]
+    return output.to(torch.bfloat16)
+
+
+def _metrics(actual, reference):
+    actual = actual.float()
+    reference = reference.float()
+    error = actual - reference
+    sqnr = 10.0 * torch.log10(reference.square().sum() / error.square().sum())
+    rel_mae = error.abs().mean() / reference.abs().mean()
+    cosine = torch.nn.functional.cosine_similarity(
+        actual.flatten(), reference.flatten(), dim=0
+    )
+    return sqnr.item(), rel_mae.item(), cosine.item()
 
 
 def _run_rank(rank, world_size, port):
@@ -55,10 +91,31 @@ def _run_rank(rank, world_size, port):
 
         for case_name, heads, seq_len, head_dim in _CASES:
             q = _sequence_major_input(rank, heads, seq_len, head_dim, device)
-            inputs = (q, q + 1000, q + 2000)
+            k = q * 0.75 + 0.125
+            v = q + 2
+            hd = heads * head_dim
+            norm_q = torch.linspace(0.5, 1.5, hd, device=device).to(torch.bfloat16)
+            norm_k = torch.linspace(1.5, 0.5, hd, device=device).to(torch.bfloat16)
+            angles = (
+                torch.arange(seq_len, device=device, dtype=torch.float32).view(
+                    1, seq_len, 1, 1
+                )
+                * torch.arange(head_dim // 2, device=device, dtype=torch.float32).view(
+                    1, 1, 1, -1
+                )
+                / 10000.0
+            )
+            cos = torch.repeat_interleave(torch.cos(angles), 2, dim=-1).contiguous()
+            sin = torch.repeat_interleave(torch.sin(angles), 2, dim=-1).contiguous()
+            transformed = (
+                _norm_rope(q, norm_q, cos, sin),
+                _norm_rope(k, norm_k, cos, sin),
+                v,
+            )
+            inputs = (q, k, v)
             references = []
             heads_local = heads // world_size
-            for input_tensor in inputs:
+            for input_tensor in transformed:
                 packed = input_tensor.permute(0, 2, 1, 3).contiguous()
                 gathered = funcol.wait_tensor(
                     funcol.all_to_all_single(
@@ -78,27 +135,38 @@ def _run_rank(rank, world_size, port):
                 shape=input_tensor.shape,
                 dtype=input_tensor.dtype,
             )
-            actuals = op(*inputs)
+            actuals = op(*inputs, norm_q, norm_k, cos, sin)
             torch.cuda.synchronize()
             expected_shape = (1, heads_local, world_size * seq_len, head_dim)
+            case_metrics = []
             for tensor_name, actual, reference in zip(
                 "qkv", actuals, references, strict=True
             ):
                 actual = actual.view(reference.shape)
-                if not torch.equal(actual, reference):
-                    mismatch = torch.nonzero(actual != reference, as_tuple=False)[
-                        0
-                    ].flatten()
-                    raise AssertionError(
-                        f"{case_name} {tensor_name} rank {rank}: byte mismatch at "
-                        f"index {mismatch.tolist()}: actual={actual[tuple(mismatch)].item()} "
-                        f"reference={reference[tuple(mismatch)].item()}"
-                    )
                 if tuple(actual.shape) != expected_shape:
                     raise AssertionError(
                         f"{case_name} {tensor_name} rank {rank}: got "
                         f"{tuple(actual.shape)}, expected {expected_shape}"
                     )
+                if tensor_name == "v":
+                    if not torch.equal(actual, reference):
+                        mismatch = torch.nonzero(actual != reference, as_tuple=False)[
+                            0
+                        ].flatten()
+                        raise AssertionError(
+                            f"{case_name} v rank {rank}: byte mismatch at index "
+                            f"{mismatch.tolist()}: actual={actual[tuple(mismatch)].item()} "
+                            f"reference={reference[tuple(mismatch)].item()}"
+                        )
+                else:
+                    sqnr, rel_mae, cosine = _metrics(actual, reference)
+                    if sqnr < 40.0:
+                        raise AssertionError(
+                            f"{case_name} {tensor_name} rank {rank}: SQNR "
+                            f"{sqnr:.2f} dB < 40 dB (rel-MAE={rel_mae:.6g}, "
+                            f"cosine={cosine:.9f})"
+                        )
+                    case_metrics.append((tensor_name, sqnr, rel_mae, cosine))
             out_input = references[0].contiguous()
             out_packed = out_input.permute(2, 0, 1, 3).contiguous()
             out_reference = funcol.wait_tensor(
@@ -126,9 +194,15 @@ def _run_rank(rank, world_size, port):
 
             dist.barrier()
             if rank == 0:
+                metric_text = " ".join(
+                    f"{name}: SQNR={sqnr:.2f}dB rel-MAE={rel_mae:.6g} "
+                    f"cos={cosine:.9f}"
+                    for name, sqnr, rel_mae, cosine in case_metrics
+                )
                 print(
-                    f"PASS {case_name}: in={tuple(input_tensor.shape)} "
-                    f"gathered={expected_shape} out={tuple(out_reference.shape)}"
+                    f"PASS {case_name}: {metric_text} V=byte-identical "
+                    f"in={tuple(input_tensor.shape)} gathered={expected_shape} "
+                    f"out={tuple(out_reference.shape)}"
                 )
     finally:
         try:

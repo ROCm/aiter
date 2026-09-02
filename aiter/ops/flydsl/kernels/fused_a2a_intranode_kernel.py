@@ -8,8 +8,10 @@ from __future__ import annotations
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import mori.ir.flydsl as mori_shmem
-from flydsl.expr import T
-from flydsl.expr.typing import Stream
+from flydsl.expr import T, range_constexpr
+from flydsl.expr import math as fmath
+from flydsl.expr.arith import FastMathFlags
+from flydsl.expr.typing import ReductionOp, Stream
 
 from .buffer_ops import buffer_load, buffer_store, create_buffer_resource_from_addr
 from .communication_ops_utils import (
@@ -18,7 +20,7 @@ from .communication_ops_utils import (
     store_i64_global_system,
 )
 
-_JIT_SCHEMA_VERSION = "v3-fused-in-hop-pack-qkv"
+_JIT_SCHEMA_VERSION = "v4-fused-in-hop-qk-norm-rope"
 
 
 def make_fused_a2a_kernel(
@@ -32,6 +34,13 @@ def make_fused_a2a_kernel(
     seq_full = seq_len * npes
     chunks_per_row = row_nbytes // 16
     total_chunks = heads * seq_len * chunks_per_row
+    vec = 8
+    block_threads = 64
+    hd = heads * head_dim
+    tile = block_threads * vec
+    if hd % tile != 0 or tile % head_dim != 0:
+        raise ValueError(f"unsupported Q/K norm tiling for H={heads}, D={head_dim}")
+    n_tiles = hd // tile
     shared_storage = fx.struct(
         type(
             "_SharedStorage",
@@ -51,6 +60,10 @@ def make_fused_a2a_kernel(
         addr_input_q: fx.Int64,
         addr_input_k: fx.Int64,
         addr_input_v: fx.Int64,
+        addr_norm_q: fx.Int64,
+        addr_norm_k: fx.Int64,
+        addr_cos: fx.Int64,
+        addr_sin: fx.Int64,
         addr_p2p_output_q: fx.Int64,
         addr_p2p_output_k: fx.Int64,
         addr_p2p_output_v: fx.Int64,
@@ -90,6 +103,100 @@ def make_fused_a2a_kernel(
         rsrc_input_q = create_buffer_resource_from_addr(addr_input_q)
         rsrc_input_k = create_buffer_resource_from_addr(addr_input_k)
         rsrc_input_v = create_buffer_resource_from_addr(addr_input_v)
+        rsrc_norm_q = create_buffer_resource_from_addr(addr_norm_q)
+        rsrc_norm_k = create_buffer_resource_from_addr(addr_norm_k)
+        rsrc_cos = create_buffer_resource_from_addr(addr_cos)
+        rsrc_sin = create_buffer_resource_from_addr(addr_sin)
+        fm_fast = FastMathFlags.fast
+
+        def wave_reduce_add(value):
+            result = fx.Float32(value)
+            for shift in (32, 16, 8, 4, 2, 1):
+                result = result.addf(
+                    result.shuffle_xor(shift, block_threads), fastmath=fm_fast
+                )
+            return result
+
+        def process_qk(rsrc_input, rsrc_norm, p2p_bases):
+            for seq in range(global_warp_id, seq_len, global_warp_num):
+                tiles = []
+                sq_acc = fx.Float32(0.0)
+                row_base = seq * hd
+                head_offset = (lane * vec) % head_dim
+                freq_offset = seq * head_dim + head_offset
+                cos_f = fx.Vector(
+                    buffer_load(rsrc_cos, freq_offset, vec_width=4, dtype=T.f32)
+                )
+                cos_f_hi = fx.Vector(
+                    buffer_load(rsrc_cos, freq_offset + 4, vec_width=4, dtype=T.f32)
+                )
+                sin_f = fx.Vector(
+                    buffer_load(rsrc_sin, freq_offset, vec_width=4, dtype=T.f32)
+                )
+                sin_f_hi = fx.Vector(
+                    buffer_load(rsrc_sin, freq_offset + 4, vec_width=4, dtype=T.f32)
+                )
+                for tile_idx in range_constexpr(n_tiles):
+                    element_offset = row_base + tile_idx * tile + lane * vec
+                    values = fx.Vector(
+                        buffer_load(
+                            rsrc_input, element_offset, vec_width=vec, dtype=T.bf16
+                        )
+                    )
+                    tiles.append(values)
+                    values_f = values.to(fx.Float32)
+                    sq_acc = sq_acc.addf(
+                        fx.Float32(
+                            (values_f * values_f).reduce(
+                                ReductionOp.ADD, fastmath=fm_fast
+                            )
+                        ),
+                        fastmath=fm_fast,
+                    )
+                rstd = fmath.rsqrt(
+                    wave_reduce_add(sq_acc) * (1.0 / hd) + 1.0e-6,
+                    fastmath=fm_fast,
+                )
+                for tile_idx in range_constexpr(n_tiles):
+                    col = tile_idx * tile + lane * vec
+                    weights = fx.Vector(
+                        buffer_load(rsrc_norm, col, vec_width=vec, dtype=T.bf16)
+                    ).to(fx.Float32)
+                    values_f = tiles[tile_idx].to(fx.Float32)
+                    scaled = [
+                        values_f[i] * rstd * weights[i] for i in range_constexpr(vec)
+                    ]
+                    rotated = [None] * vec
+                    for pair in range_constexpr(vec // 2):
+                        even = scaled[2 * pair]
+                        odd = scaled[2 * pair + 1]
+                        cos_even = (
+                            cos_f[2 * pair] if pair < 2 else cos_f_hi[2 * pair - 4]
+                        )
+                        sin_odd = (
+                            sin_f[2 * pair + 1] if pair < 2 else sin_f_hi[2 * pair - 3]
+                        )
+                        rotated[2 * pair] = even * cos_even - odd * sin_odd
+                        rotated[2 * pair + 1] = even * sin_odd + odd * cos_even
+                    output = fx.Vector.from_elements(
+                        [value.ir_value() for value in rotated], dtype=fx.Float32
+                    ).to(fx.BFloat16)
+                    head = col // head_dim
+                    row_chunk = (col % head_dim) // vec
+                    dest_pe = head // heads_local
+                    local_head = head % heads_local
+                    dst_row = local_head * seq_full + rank * seq_len + seq
+                    dst_offset = fx.Int64(dst_row * row_nbytes + row_chunk * 16)
+                    peer_base = fx.memref_load(p2p_bases, dest_pe)
+                    buffer_store(
+                        output,
+                        create_buffer_resource_from_addr(peer_base + dst_offset),
+                        0,
+                    )
+
+        process_qk(rsrc_input_q, rsrc_norm_q, p2p_bases_q)
+        process_qk(rsrc_input_k, rsrc_norm_k, p2p_bases_k)
+
         for chunk_idx in range(global_warp_id, total_chunks, global_warp_num):
             row = chunk_idx // chunks_per_row
             row_chunk = chunk_idx % chunks_per_row
@@ -97,20 +204,12 @@ def make_fused_a2a_kernel(
             head = row % heads
             dest_pe = head // heads_local
             local_head = head % heads_local
-            peer_base_q = fx.memref_load(p2p_bases_q, dest_pe)
-            peer_base_k = fx.memref_load(p2p_bases_k, dest_pe)
             peer_base_v = fx.memref_load(p2p_bases_v, dest_pe)
             dst_row = local_head * seq_full + rank * seq_len + seq
             dst_offset = fx.Int64(dst_row * row_nbytes + row_chunk * 16)
-            rsrc_dst_q = create_buffer_resource_from_addr(peer_base_q + dst_offset)
-            rsrc_dst_k = create_buffer_resource_from_addr(peer_base_k + dst_offset)
             rsrc_dst_v = create_buffer_resource_from_addr(peer_base_v + dst_offset)
             i32_offset = chunk_idx * 4
-            value_q = buffer_load(rsrc_input_q, i32_offset, vec_width=4, dtype=T.i32)
-            value_k = buffer_load(rsrc_input_k, i32_offset, vec_width=4, dtype=T.i32)
             value_v = buffer_load(rsrc_input_v, i32_offset, vec_width=4, dtype=T.i32)
-            buffer_store(value_q, rsrc_dst_q, 0)
-            buffer_store(value_k, rsrc_dst_k, 0)
             buffer_store(value_v, rsrc_dst_v, 0)
 
         # All blocks must be resident: this is a grid-wide software barrier.
@@ -169,6 +268,10 @@ def make_fused_a2a_jit(
         addr_input_q: fx.Int64,
         addr_input_k: fx.Int64,
         addr_input_v: fx.Int64,
+        addr_norm_q: fx.Int64,
+        addr_norm_k: fx.Int64,
+        addr_cos: fx.Int64,
+        addr_sin: fx.Int64,
         addr_p2p_output_q: fx.Int64,
         addr_p2p_output_k: fx.Int64,
         addr_p2p_output_v: fx.Int64,
@@ -183,6 +286,10 @@ def make_fused_a2a_jit(
             addr_input_q,
             addr_input_k,
             addr_input_v,
+            addr_norm_q,
+            addr_norm_k,
+            addr_cos,
+            addr_sin,
             addr_p2p_output_q,
             addr_p2p_output_k,
             addr_p2p_output_v,
