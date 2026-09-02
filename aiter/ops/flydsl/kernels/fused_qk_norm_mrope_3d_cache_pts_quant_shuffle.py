@@ -682,7 +682,7 @@ def _build_kv_kernel(
             v_cache_block = fx.Tensor(
                 fx.make_view(fx.get_iter(v_cache) + v_block_base, layout_v_cache)
             )
-            k_lds_runs = k_lds.ptr.view(layout_stage_runs)
+            k_lds_runs = k_lds.view(layout_stage_runs)
             for it in range_constexpr(K_ITERS):
                 r = t + KV_THREADS * it
                 if r < K_TOTAL_RUNS:
