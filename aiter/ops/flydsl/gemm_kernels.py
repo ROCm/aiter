@@ -12,18 +12,16 @@ from itertools import product
 import flydsl.expr as fx
 import torch
 from flydsl.runtime.device import get_rocm_arch
-from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
 from torch import Tensor
 
 from aiter import logger
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
 from .kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
 
 # from .kernels.small_m_hgemm import iter_small_m_registry_configs
 from .kernels.tensor_shim import _run_compiled
-from .utils import get_shared_memory_per_block, is_flydsl_available
 
 __all__ = [
     "flydsl_hgemm",
@@ -42,6 +40,7 @@ FIXED_C_TO_LDS = False
 KERNEL_ASYNC_COPY = get_rocm_arch() != "gfx942"
 KERNEL_FAMILY_HGEMM = "hgemm"
 KERNEL_FAMILY_SMALL_M = "small_m"
+_HGEMM_SUPPORTED_GFX = frozenset(("gfx942", "gfx950"))
 _HGEMM_KERNEL_RE = re.compile(
     r"^flydsl_gemm(?P<stages>\d+)_"
     r"a(?P<a_dtype>[a-z0-9]+)_w(?P<w_dtype>[a-z0-9]+)_(?P<out_dtype>[a-z0-9]+)_"
@@ -311,7 +310,9 @@ def selection_filter(m, n, k, kwargs):
     BLOCK_N_WARPS = kwargs["BLOCK_N_WARPS"]
     BLOCK_K_WARPS = kwargs["BLOCK_K_WARPS"]
     B_TO_LDS = kwargs.get("B_TO_LDS", True)
-    GPU_ARCH = get_rocm_arch()
+    GPU_ARCH = get_rocm_arch().split(":", 1)[0]
+    if GPU_ARCH not in _HGEMM_SUPPORTED_GFX:
+        return False
     DTYPE_BYTES = 2
 
     def get_stage_smem_use(stages_):
@@ -323,7 +324,7 @@ def selection_filter(m, n, k, kwargs):
 
     smem_use_s0 = get_stage_smem_use(STAGES)
     # smem_use_s1 = get_stage_smem_use(STAGES + 3)
-    smem_cap = SMEM_CAPACITY_MAP[GPU_ARCH]
+    smem_cap = get_lds_capacity_bytes(GPU_ARCH)
     if not (smem_use_s0 <= smem_cap):
         return False
     return not (
@@ -371,6 +372,10 @@ def _validate_hgemm_tiling(
         "BLOCK_K_WARPS": block_k_warps,
         "B_TO_LDS": b_to_lds,
     }
+    arch = get_gfx().split(":", 1)[0]
+    if arch not in _HGEMM_SUPPORTED_GFX:
+        raise ValueError(f"FlyDSL HGEMM does not support architecture {arch!r}")
+    lds_limit = get_lds_capacity_bytes(arch)
     if not selection_filter(m, n, k, config):
         raise ValueError(
             f"Invalid tiling configuration for m={m} n={n} k={k}: {config}"
@@ -476,7 +481,6 @@ def _validate_hgemm_tiling(
         block_k_warps=block_k_warps,
         b_to_lds=b_to_lds,
     )
-    lds_limit = get_shared_memory_per_block(fallback_gfx=get_gfx())
     if lds_bytes > lds_limit:
         raise ValueError(
             "Invalid tile combination: estimated LDS usage "
@@ -946,37 +950,22 @@ def flydsl_hgemm(
 # FlyDSL preshuffle GEMM kernel management
 # ---------------------------------------------------------------------------
 
-_flydsl_compile_fn = None
-_flydsl_import_done = False
 
-
+@functools.lru_cache(maxsize=1)
 def _get_compile_fn():
-    """Lazy-import compile_preshuffle_gemm so the module loads even without FlyDSL."""
-    global _flydsl_compile_fn, _flydsl_import_done
-    if _flydsl_import_done:
-        return _flydsl_compile_fn
-    _flydsl_import_done = True
-    if not is_flydsl_available():
-        logger.info("[FlyDSL] not available, will fall back to CK/CKTile")
-        return None
-    try:
-        from .kernels.preshuffle_gemm import compile_preshuffle_gemm
+    """Import the preshuffle compiler on first use."""
+    from .kernels.preshuffle_gemm import compile_preshuffle_gemm
 
-        _flydsl_compile_fn = compile_preshuffle_gemm
-        logger.info("[FlyDSL] loaded preshuffle GEMM compiler")
-    except Exception as e:  # noqa: BLE001
-        logger.info(
-            f"[FlyDSL] preshuffle GEMM not available, will fall back to CK/CKTile: {e}"
-        )
-    return _flydsl_compile_fn
+    logger.info("[FlyDSL] loaded preshuffle GEMM compiler")
+    return compile_preshuffle_gemm
 
 
 # Fixed size rather than one buffer per shape: a shape-keyed cache grows without
 # limit and can evict a buffer a captured CUDA graph still points at. The bounds
 # come from k_split_candidates, which keeps tile_count under CU_NUM and
 # k_split * tile_count at four per CU.
-# Mirrors preshuffle_gemm.PRESHUFFLE_M_MAX; duplicated so this module imports
-# without FlyDSL present.
+# Mirrors preshuffle_gemm.PRESHUFFLE_M_MAX; duplicated to avoid importing the
+# compiler module before the preshuffle path is selected.
 PRESHUFFLE_M_MAX = 65536
 
 PRESHUFFLE_SPLIT_K_MAX_TILES = 256
@@ -1037,8 +1026,6 @@ def flydsl_preshuffle_gemm_a8(
 ) -> Tensor:
     """Compile and run FlyDSL preshuffle GEMM, optionally with fp32 split-K."""
     compile_fn = _get_compile_fn()
-    if compile_fn is None:
-        raise RuntimeError("[FlyDSL] compile function not available")
     dtypes = _get_dtypes()
 
     m, k = XQ.shape[0], XQ.shape[-1]
