@@ -38,6 +38,10 @@ from .mxfp4_gemm_common import _lds_swizzle_mask as lds_swizzle_mask
 
 STORE_CACHE_MODIFIER = 2
 
+# The route-out e8m0 bytes cannot coalesce (a workgroup owns only BN/scale_blk
+# bytes of each row), so keep them cached and let L2 merge the partial writes.
+SCALE_STORE_CACHE_MODIFIER = 0
+
 _FP8_E8M0_SHIFT = 7
 
 _G2_EPI_LANES = 32
@@ -966,7 +970,7 @@ def atomic_bf16_epilog(
     load_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), Float32)
     atomic_bf16x2 = fx.make_copy_atom(fx.rocdl.BufferAtomicPkAdd(BFloat16), BFloat16)
     store_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(STORE_CACHE_MODIFIER), Int32)
-    store_i8 = fx.make_copy_atom(fx.rocdl.BufferCopy8b(STORE_CACHE_MODIFIER), Int8)
+    store_i8 = fx.make_copy_atom(fx.rocdl.BufferCopy8b(SCALE_STORE_CACHE_MODIFIER), Int8)
 
     def load_scalar(atom, src, index, elem_ty):
         frag = fx.make_rmem_tensor(1, elem_ty)
