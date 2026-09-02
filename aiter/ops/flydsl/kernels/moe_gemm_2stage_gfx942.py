@@ -197,12 +197,6 @@ def compile_gemm(
     elif weight_dtype == "fp8":
         weight_dtype = fx.Float8E4M3FNUZ
 
-    def _encode_waitcnt(vmcnt=63, expcnt=7, lgkmcnt=63):
-        """Encode s_waitcnt bitfield for CDNA3 (gfx94x)."""
-        vm_lo = vmcnt & 0xF
-        vm_hi = (vmcnt >> 4) & 0x3
-        return vm_lo | (expcnt << 4) | (lgkmcnt << 8) | (vm_hi << 14)
-
     class TensorWithIndex:
         # view: real tensor
         # tile_m, tile_k: tile size in M/K dimension for each copy from global to shared
@@ -825,7 +819,7 @@ def compile_gemm(
                 b_tensor_thr[None, None, None, k_base + 1],
                 b_frag_retile[1],
             )
-            rocdl.s_waitcnt(_encode_waitcnt(vmcnt=vmcnt_per_prefetch))
+            rocdl.s_waitcnt(vmcnt=vmcnt_per_prefetch)
             rocdl.sched_barrier(0)
             if const_expr(weight_dtype != fx.BFloat16):
                 _cvt_fp8_bf16(b_frag_retile[0], b_frag[0])
@@ -838,7 +832,7 @@ def compile_gemm(
                 b_tensor_thr[None, None, None, k_base + 2],
                 b_frag_retile[0],
             )
-            rocdl.s_waitcnt(_encode_waitcnt(vmcnt=vmcnt_per_prefetch))
+            rocdl.s_waitcnt(vmcnt=vmcnt_per_prefetch)
             rocdl.sched_barrier(0)
             if const_expr(weight_dtype != fx.BFloat16):
                 _cvt_fp8_bf16(b_frag_retile[1], b_frag[1])
@@ -1235,7 +1229,7 @@ def compile_gemm(
         a_idx.copy(buf_cp_atom_r, fx.Int32(0), a_cp_frag)
         fx.copy(buf_cp_atom_r, bl_g2r[None, None, None, fx.Int32(0)], bl_ret_st[0])
         fx.copy(buf_cp_atom_r, br_g2r[None, None, None, fx.Int32(0)], br_ret_st[0])
-        rocdl.s_waitcnt(_encode_waitcnt(vmcnt=0))
+        rocdl.s_waitcnt(vmcnt=0)
         fx.copy(uni_cp_atom, a_cp_frag_retile, a_lds_w[0])
         gpu.barrier()
 

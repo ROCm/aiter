@@ -2532,7 +2532,7 @@ def get_2stage_cfgs(
                 )
 
     bypass_tuned_config = int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0"))
-    kernel_name1 = str(cfg.get("kernelName1", "") or "") if cfg is not None else ""
+    kernel_name1 = kn1 if cfg is not None else ""
     weights_shuffled = (
         is_shuffled if opus_weights_shuffled is None else opus_weights_shuffled
     )

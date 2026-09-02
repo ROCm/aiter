@@ -5814,6 +5814,7 @@ class FmoeTuner(TunerCommon):
         from functools import partial
 
         from aiter.ops.flydsl.fused_moe_gfx942 import (
+            Config,
             get_tune_space,
             run_flydsl_moe_gfx942,
         )
@@ -5917,7 +5918,7 @@ class FmoeTuner(TunerCommon):
             except Exception as e:  # noqa: BLE001
                 print(f"{RED}Error with config {config_string}: {e}{END}")
                 continue
-            block_m = 16
+            block_m = Config.from_string(config_string).BLOCK_M
             ksplit = 0
             run_1stage = 0
             err1 = "0%"
@@ -5939,7 +5940,7 @@ class FmoeTuner(TunerCommon):
                     )
                     continue
                 print(
-                    f"{k['name']} {YELLOW} {float(k['e2e_us_base']):.3f}us -> {float(e2e_us):.3f}us (err: {k['err_ratio']*100:.0f}%) {END} {kernelName1}"
+                    f"{k['name']} {YELLOW} {float(k['e2e_us_base']):.3f}us -> {float(e2e_us):.3f}us (err: {err_ratio*100:.0f}%) {END} {kernelName1}"
                 )
                 if e2e_us < k["e2e_us"]:
                     k["e2e_us"] = e2e_us
