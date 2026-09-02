@@ -570,6 +570,7 @@ def _emit_row_logits(
     BLOCK_M: gl.constexpr,
     MASKED: gl.constexpr,
     M_CHUNK: gl.constexpr = 0,
+    RELAXED_STORE: gl.constexpr = 0,
 ):
     """Reduce + store one KV tile for each of the BLOCK_M query rows in this block."""
     for r in gl.static_range(0, BLOCK_M):
@@ -607,6 +608,25 @@ def _emit_row_logits(
                 )
             else:
                 _store_logits_block(logits_ptr, store_offsets, scores, USE_BUFFER_STORE)
+        elif RELAXED_STORE:
+            # Out-of-window positions are unspecified (clean_logits=False), so
+            # the per-row window mask goes and this is the single-row path. The
+            # union bound stays -- it is what keeps the store inside the row.
+            if MASKED:
+                _store_logits_block(
+                    logits_ptr + r * stride_logits_s,
+                    store_offsets,
+                    scores,
+                    USE_BUFFER_STORE,
+                    mask=store_arange < (end_ind - kv_pos),
+                )
+            else:
+                _store_logits_block(
+                    logits_ptr + r * stride_logits_s,
+                    store_offsets,
+                    scores,
+                    USE_BUFFER_STORE,
+                )
         else:
             # Multi-row: the loop walks the union of the rows ranges, so every
             # store is masked to the part this row owns
@@ -645,6 +665,7 @@ def mqa_logits_loop_double_buf(
     BLOCK_M: gl.constexpr,
     M_CHUNK: gl.constexpr = 0,
     UNROLL: gl.constexpr = 1,  # KV tiles per loop body (1 = backend default)
+    RELAXED_STORE: gl.constexpr = 0,
 ):
     """Double-buffered KV walk shared by BLOCK_M query rows.
 
@@ -717,6 +738,7 @@ def mqa_logits_loop_double_buf(
             BLOCK_M,
             False,
             M_CHUNK,
+            RELAXED_STORE,
         )
 
         kv_scales_off += BLOCK_KV
@@ -764,6 +786,7 @@ def mqa_logits_loop_double_buf(
             BLOCK_M,
             False,
             M_CHUNK,
+            RELAXED_STORE,
         )
 
         kv_scales_off += BLOCK_KV
@@ -806,6 +829,7 @@ def mqa_logits_loop_double_buf(
         BLOCK_M,
         True,
         M_CHUNK,
+        RELAXED_STORE,
     )
 
     kv_scales_off += BLOCK_KV
@@ -847,6 +871,7 @@ def mqa_logits_loop_double_buf(
         BLOCK_M,
         True,
         M_CHUNK,
+        RELAXED_STORE,
     )
 
 
@@ -883,6 +908,7 @@ def _gluon_fp8_mqa_logits_kernel(
     MFMA_NONK_DIM: gl.constexpr = 32,
     M_CHUNK: gl.constexpr = 0,  # heads folded per MFMA group (0 = whole tile)
     UNROLL: gl.constexpr = 1,  # KV tiles per loop body (1 = backend default)
+    RELAXED_STORE: gl.constexpr = 0,  # BLOCK_M > 1: drop the per-row store mask
 ):
 
     gl.static_assert(
@@ -1073,4 +1099,5 @@ def _gluon_fp8_mqa_logits_kernel(
         BLOCK_M,
         M_CHUNK,
         UNROLL,
+        RELAXED_STORE,
     )

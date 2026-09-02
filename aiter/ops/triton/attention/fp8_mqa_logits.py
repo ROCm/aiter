@@ -97,9 +97,9 @@ def fp8_mqa_logits(
     cu_starts:   [seq_len], dtype int32, start indices
     cu_ends:     [seq_len], dtype int32, end indices
     clean_logits: bool. If True, positions outside [cu_starts[i], cu_ends[i]) in row i
-                  are explicitly written as -inf. If False, the kernel skips writing
-                  those positions and leaves whatever was in the output buffer there
-                  (the caller is responsible for pre-filling with -inf or ignoring them).
+                  are explicitly written as -inf. If False those positions are
+                  unspecified -- the kernel may write them, so a caller that wants
+                  -inf there must fill it in after the call, not before.
 
     Returns:
     logits:      [seq_len, seq_len_kv], dtype float32 (must be initialized to -inf, because of causal masking)
@@ -227,6 +227,16 @@ def fp8_mqa_logits(
             # 2 rows of Q at 64 heads is 64 VGPRs, which only fits at 2
             # waves/SIMD, so BLOCK_M=2 is a <=32-head option.
             block_m = 2 if (num_heads <= 32 and seq_len > 4096) else 1
+            # A one-wave workgroup emits no s_barrier. At num_warps=2 the
+            # async copy hands warp w the odd/even KV columns while the MFMA
+            # layout has it consume a contiguous half, so they alias and every
+            # tile costs two barriers -- 8.9% of wave time, 100% stall, per an
+            # ATT capture. Halving BLOCK_KV keeps the per-wave work identical.
+            # The cost is half as many waves, so it only pays past one
+            # occupancy round: 0.98x at seq_len 4096, 1.02-1.06x from 8192 up.
+            if block_m == 1 and seq_len > 4096:
+                num_warps = 1
+                block_kv = 32
             # 32x32x64 over 16x16x128: its output layout leaves only one head
             # bit in lanes, so the head sum needs one cross-lane step instead of
             # two. Needs num_heads >= 32 and BLOCK_KV / num_warps >= 32.
@@ -244,6 +254,12 @@ def fp8_mqa_logits(
             # BLOCK_M=2 needs two -- with one the scheduler spills instead
             # (57 vs 2 slots, 748 vs 605 us on glm5.2 4x8kx8k).
             num_chains = (2 if block_m == 2 else 1) if USE_FOLDED_REDUCTION else 0
+            # BLOCK_M=2 walks the union of both rows' KV ranges, so each store
+            # is masked to the part its row owns -- 14 VALU + 8 SALU per two
+            # tiles. clean_logits=False already makes out-of-window positions
+            # unspecified, so there the mask protects nothing: 1.05x at 32
+            # q-heads. Off for clean_logits=True, which needs the -inf prefill.
+            relaxed_store = 0 if clean_logits else 1
             other = {
                 "USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED,
                 "BLOCK_M": block_m,
@@ -251,6 +267,7 @@ def fp8_mqa_logits(
                 "M_CHUNK": m_chunk,
                 # two KV tiles per loop body for the scheduler to interleave
                 "UNROLL": 2,
+                "RELAXED_STORE": relaxed_store,
             }
         else:
             loop_variant = 1
