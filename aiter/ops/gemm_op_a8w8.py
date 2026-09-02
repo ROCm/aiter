@@ -220,7 +220,14 @@ def gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
     )
 
     return run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
-        XQ, WQ, x_scale, w_scale, Out, kernel_name
+        XQ,
+        WQ,
+        x_scale,
+        w_scale,
+        Out,
+        kernel_name,
+        # Tuned configs never carry this; only an explicit caller can promise it.
+        a_is_preshuffled=bool(config.get("a_preshuffled_input", False)),
     )
 
 
