@@ -10,6 +10,11 @@
  * @Description: This is description.
  */
 
+// This translation unit is torch-free: define AITER_NO_TORCH_TYPES before any
+// aiter header so aiter_opus_plus.h does not pull in the c10 half/bfloat16
+// headers. The kernels use aiter::hip2opus + the _rmTorch dispatch macros, never
+// the t2opus<c10::*> specializations, so nothing here needs torch/ATen/c10.
+#define AITER_NO_TORCH_TYPES
 #include "aiter_dispatch.h"
 #include "hip_reduce.h"
 #include "aiter_hip_common.h"
@@ -19,8 +24,6 @@
 #include "moe_op.h"
 #include <cfloat>
 #include <hip/hip_runtime.h>
-#include <hipcub/hipcub.hpp>
-#include <hipcub/util_type.hpp>
 
 #ifndef AITER_TOPK_SOFTMAX_GROUP_PERMUTE_SCORE
 #define AITER_TOPK_SOFTMAX_GROUP_PERMUTE_SCORE 0
@@ -203,7 +206,7 @@ __device__ constexpr void wave_reduce_argmax2(
 
 __inline__ __device__ void warpReduceMax(float& val_o, int& idx)
 {
-    using kvp = hipcub::KeyValuePair<int, float>;
+    using kvp = aiter::KeyValuePair<int, float>;
     kvp thread_kvp;
     thread_kvp.key       = idx;
     thread_kvp.value     = val_o;
@@ -540,12 +543,6 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
         }
         __syncthreads();
     }
-
-    // using kvp = hipcub::KeyValuePair<int, float>;
-    // using BlockReduce = hipcub::BlockReduce<kvp, WARP_SIZE>;
-    // __shared__ typename BlockReduce::TempStorage tmpStorage;
-    // kvp thread_kvp;
-    // hipcub::ArgMax arg_max;
 
     float sum = 0.0f;
     int topk_indice;

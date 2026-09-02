@@ -4,6 +4,11 @@ import torch
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._gluon_kernels.gfx1250.quant.fused_mxfp4_quant import (
+    _gluon_fused_dynamic_mxfp4_quant_moe_sort_kernel,
+    _gluon_fused_reduce_rms_mxfp4_quant_kernel,
+    _gluon_fused_rms_mxfp4_quant_kernel,
+)
 from aiter.ops.triton._triton_kernels.activation import (
     _get_activation_from_str,
 )
@@ -14,6 +19,8 @@ from aiter.ops.triton._triton_kernels.quant.fused_mxfp4_quant import (
     _fused_reduce_rms_mxfp4_quant_kernel,
     _fused_rms_mxfp4_quant_kernel,
 )
+from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.utility import dtypes
 
@@ -31,6 +38,7 @@ def fused_rms_mxfp4_quant(
     shuffle: bool | None = False,
     scale_shuffle_padding: bool | None = False,
     output_unquantized_inp1=False,
+    inargs: str = "auto",
 ):
     """
     This op contains several steps:
@@ -64,7 +72,7 @@ def fused_rms_mxfp4_quant(
     # as we merge 2 fp4s to 1 uint8
     assert N1 % 2 == 0
     BLOCK_SIZE_M = 1
-    # BLOCK_SIZE_M = 32
+
     BLOCK_SIZE_N = max(BLOCK_SIZE_N, MXFP4_QUANT_BLOCK_SIZE)
     out1_fp4 = torch.empty((M, N1 // 2), dtype=torch.uint8, device=x1.device)
     SCALE_N_valid = triton.cdiv(N1, MXFP4_QUANT_BLOCK_SIZE)
@@ -105,8 +113,21 @@ def fused_rms_mxfp4_quant(
         x2_stride_m = x2.stride(0)
         out2_stride_m = out2.stride(0)
 
-    grid = (triton.cdiv(M, BLOCK_SIZE_M) * (2 if (x2 is not None) else 1),)
-    _fused_rms_mxfp4_quant_kernel[grid](
+    # checks args for either gluon, triton, or auto. auto will check for gfx1250 hardware and set to gluon if it exists, otherwise defaults to triton
+    if inargs == "auto":
+        use_gluon = get_arch() == "gfx1250"
+    elif inargs == "gluon":
+        if get_arch() != "gfx1250":
+            raise RuntimeError("Gluon kernel only supported on gfx1250 hardware")
+        use_gluon = True
+    elif inargs == "triton":
+        use_gluon = False
+    else:
+        raise ValueError(
+            f"Invalid argument: {inargs}. Choose from auto, gluon, or triton"
+        )
+
+    _common_args = (
         x1,
         x1_weight,
         x2,
@@ -130,19 +151,40 @@ def fused_rms_mxfp4_quant(
         out2_stride_m,
         out_res1_stride_m,
         out1_stride_m,
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        BLOCK_SIZE_N2=BLOCK_SIZE_N2,
-        MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
-        HAS_SECOND_INPUT=(x2 is not None),
-        FIRST_INPUT_RES=(res1 is not None),
-        FIRST_INPUT_OUT=output_unquantized_inp1,
-        SCALE_N=SCALE_N_valid,
-        SCALE_M_PAD=(SCALE_M if use_scale_shuffle_padding else 1),
-        SCALE_N_PAD=SCALE_N,
-        SHUFFLE=shuffle,
-        SHUFFLE_PAD=use_scale_shuffle_padding,
     )
+    _common_kwargs = {
+        "BLOCK_SIZE_M": BLOCK_SIZE_M,
+        "BLOCK_SIZE_N": BLOCK_SIZE_N,
+        "BLOCK_SIZE_N2": BLOCK_SIZE_N2,
+        "MXFP4_QUANT_BLOCK_SIZE": MXFP4_QUANT_BLOCK_SIZE,
+        "HAS_SECOND_INPUT": (x2 is not None),
+        "FIRST_INPUT_RES": (res1 is not None),
+        "FIRST_INPUT_OUT": output_unquantized_inp1,
+        "SCALE_N": SCALE_N_valid,
+        "SCALE_M_PAD": (SCALE_M if use_scale_shuffle_padding else 1),
+        "SCALE_N_PAD": SCALE_N,
+        "SHUFFLE": shuffle,
+        "SHUFFLE_PAD": use_scale_shuffle_padding,
+    }
+
+    if use_gluon:
+        # Aim for at least 32 CTAs to keep all WGPs fed.
+        _TARGET_MIN_CTAS = 32
+        ROWS_PER_CTA = max(1, min(8, M // _TARGET_MIN_CTAS))
+        while ROWS_PER_CTA > 1 and M % ROWS_PER_CTA != 0:
+            ROWS_PER_CTA //= 2
+        grid = (triton.cdiv(M, ROWS_PER_CTA) * (1 if x2 is None else 2),)
+        _gluon_fused_rms_mxfp4_quant_kernel[grid](
+            *_common_args,
+            **_common_kwargs,
+            ROWS_PER_CTA=ROWS_PER_CTA,
+        )
+    else:
+        grid = (M * (1 if x2 is None else 2),)
+        _fused_rms_mxfp4_quant_kernel[grid](
+            *_common_args,
+            **_common_kwargs,
+        )
 
     return (out1_fp4, out1_bs), out1, out2, out_res1
 
@@ -382,6 +424,7 @@ def fused_reduce_rms_mxfp4_quant(
     output_unquantized_inp1=False,
     dtype=None,
     out3=None,
+    args: str = "auto",
 ):
     """
     This op contains several steps:
@@ -506,7 +549,21 @@ def fused_reduce_rms_mxfp4_quant(
     elif x2 is not None:
         r = 2
     grid = (triton.cdiv(M, BLOCK_SIZE_M) * r,)
-    _fused_reduce_rms_mxfp4_quant_kernel[grid](
+
+    # check if args is gluon and arch is not gfx1250
+    if args == "gluon" and get_arch() != "gfx1250":
+        _LOGGER.warning(
+            "Gluon kernel is not supported on this arch, defaulting to triton kernel"
+        )
+
+    # select kernel based on args and arch
+    kernel = (
+        _gluon_fused_reduce_rms_mxfp4_quant_kernel
+        if (args in ["gluon", "auto"]) and get_arch() == "gfx1250"
+        else _fused_reduce_rms_mxfp4_quant_kernel
+    )
+
+    kernel[grid](
         x1,
         x1_weight,
         x2,
@@ -567,6 +624,7 @@ def fused_dynamic_mxfp4_quant_moe_sort(
     topk: int,
     block_size: int = 32,
     scaling_mode: str = "even",
+    args: str = "auto",
 ):
     """
     Fusing dynamic_mxfp4_quant and moe_mxfp4_sort
@@ -629,7 +687,17 @@ def fused_dynamic_mxfp4_quant_moe_sort(
     num_pid = triton.cdiv(M, BLOCK_SIZE_Mx) * scaleN + triton.cdiv(
         M_o, BLOCK_SIZE_M
     ) * triton.cdiv(N_i, BLOCK_SIZE_N)
-    _fused_dynamic_mxfp4_quant_moe_sort_kernel[(num_pid,)](
+
+    if args == "gluon" and get_arch() != "gfx1250":
+        raise ValueError("Gluon is only supported on gfx1250")
+
+    kernel = (
+        _gluon_fused_dynamic_mxfp4_quant_moe_sort_kernel
+        if (args in ["gluon", "auto"] and get_arch() == "gfx1250")
+        else _fused_dynamic_mxfp4_quant_moe_sort_kernel
+    )
+
+    kernel[(num_pid,)](
         x,
         x_fp4,
         sorted_ids,
@@ -662,7 +730,18 @@ def fused_dynamic_mxfp4_quant_moe_sort(
     )
 
 
-@triton.jit
+_fused_quant_fp8_sort_repr = make_kernel_repr(
+    "_fused_quant_fp8_sort_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "QUANT_BLOCK_SIZE",
+        "TOPK",
+    ],
+)
+
+
+@triton.jit(repr=_fused_quant_fp8_sort_repr)
 def _fused_quant_fp8_sort_kernel(
     # Pointers
     input_ptr,

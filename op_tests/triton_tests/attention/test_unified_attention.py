@@ -2,10 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from aiter.ops.triton.attention.unified_attention import (
+    _is_gluon_available,
     is_2d_gluon_available,
     unified_attention,
 )
@@ -180,7 +183,6 @@ def generate_data(
     )
     query_scales = None
     if q_dtype == torch.uint8:
-        # NVFP4 query: the kernel consumes packed fp4 + scales, the reference uses e4m3.
         query = query / 10
         maybe_quant_query = query.view(-1, head_size)
         maybe_quant_query, query_scales = torch_dynamic_mxfp4_quant(
@@ -204,7 +206,6 @@ def generate_data(
     )
     value_cache = torch.randn_like(key_cache)
     if kv_dtype == torch.uint8:
-        # NVFP4 KV cache: kernel consumes packed+shuffled cache, reference uses e4m3.
         key_cache_orig = key_cache.to(e4m3_dtype)
         value_cache_orig = value_cache.to(e4m3_dtype)
         key_cache, value_cache = dynamic_nvfp4_quant_kv_cache(
@@ -384,9 +385,8 @@ def ref_paged_attn(
         (torch.bfloat16, e4m3_dtype, torch.bfloat16, 128, False),
         (e4m3_dtype, e4m3_dtype, torch.bfloat16, 128, False),
         (e4m3_dtype, e4m3_dtype, e4m3_dtype, 128, True),
-        # skip NVFP4 KV cache for now as ds_load_tr4 is not yet supported
-        # (e4m3_dtype, torch.uint8, torch.bfloat16, 128, False),
-        # (torch.uint8, torch.uint8, torch.bfloat16, 128, False),
+        (e4m3_dtype, torch.uint8, torch.bfloat16, 128, False),
+        (torch.uint8, torch.uint8, torch.bfloat16, 128, False),
     ],
 )
 @pytest.mark.parametrize("soft_cap", [None])
@@ -436,7 +436,7 @@ def test_triton_unified_attn_3d(
         LDS_limit = 327680 if IS_DEVICE_ARCH_GFX12 else 262144
         if kv_cache_shared_mem_size > LDS_limit:
             pytest.skip(
-                f"Skipping test for KV cache LDS required memory = {kv_cache_shared_mem_size/1024} kB > 320 kB"
+                f"Skipping test for KV cache LDS required memory = {kv_cache_shared_mem_size / 1024} kB > 320 kB"
             )
 
     # TODO: Uncomment after pytorch adds support for manual_seed
@@ -583,6 +583,7 @@ def test_triton_unified_attn_3d(
         False,
     ],
 )
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 @torch.inference_mode()
 def test_triton_unified_attn(
     seq_lens: list[tuple[int, int]],
@@ -599,8 +600,20 @@ def test_triton_unified_attn(
     use_kv_descale: bool,
     use_out_scale: bool,
     shuffled_kv_cache: bool,
+    backend: str,  # "triton" | "gluon"
 ) -> None:
-    use_gluon_2d = is_2d_gluon_available(q_dtype, kv_dtype, soft_cap, False, False)
+    if backend == "gluon" and not _is_gluon_available():
+        pytest.skip(f"skip gluon backend, not available on {DEVICE_ARCH}")
+    use_gluon_2d = is_2d_gluon_available(
+        SimpleNamespace(
+            q_dtype=q_dtype,
+            kv_cache_dtype=kv_dtype,
+            softcap=soft_cap,
+            use_qq_bias=False,
+            use_alibi_slopes=False,
+        ),
+        backend,
+    )
     torch.manual_seed(0)
     # shuffling only supported for gfx1250 gluon kernels
     if shuffled_kv_cache and not use_gluon_2d:
@@ -665,6 +678,7 @@ def test_triton_unified_attn(
         sinks=sinks,
         output_scale=output_scale,
         shuffled_kv_cache=shuffled_kv_cache,
+        backend=backend,
     )
 
     ref_output = ref_paged_attn(
@@ -702,6 +716,7 @@ def test_triton_unified_attn(
             f"(max abs diff {torch.max(torch.abs(output - ref_output))})"
         )
     else:
-        torch.testing.assert_close(
-            output, ref_output, atol=atol, rtol=rtol
-        ), f"{torch.max(torch.abs(output - ref_output))}"
+        (
+            torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol),
+            f"{torch.max(torch.abs(output - ref_output))}",
+        )

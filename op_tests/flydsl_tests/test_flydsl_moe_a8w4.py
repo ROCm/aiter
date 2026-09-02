@@ -25,7 +25,6 @@ from aiter.ops.flydsl.moe_kernels import (
     pick_flydsl_stage2_tile_k,
     resolve_flydsl_stage2_tile_k,
 )
-from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.ops.quant import (
     mxfp4_moe_sort_fwd,
     per_1x32_f4_quant,
@@ -39,7 +38,7 @@ from aiter.utility.fp4_utils import e8m0_shuffle
 Q_TYPE = QuantType.per_1x32
 
 _SKIP_GFX950_FLYDSL = pytest.mark.skipif(
-    get_gfx() not in ("gfx950",) or not is_flydsl_available(),
+    get_gfx() not in ("gfx950",),
     reason="gfx950 FlyDSL required",
 )
 
@@ -335,12 +334,13 @@ def test_flydsl_v2_stage2_a8w4_full_tile(block_m, inter_dim, tile_k):
 
 @_SKIP_GFX950_FLYDSL
 def test_flydsl_stage2_fp8_ep_reduction():
+    from aiter.ops.flydsl.kernels.mxfp4_gemm_common import fp8out_row_bytes
     from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
 
     token, topk, model_dim = 2, 4, 128
     values = torch.tensor([1, 7, 2, 9], dtype=dtypes.fp8, device="cuda")
     target = torch.empty(
-        (token * topk, model_dim + model_dim // 8), dtype=torch.uint8, device="cuda"
+        (token * topk, fp8out_row_bytes(model_dim)), dtype=torch.uint8, device="cuda"
     )
     target[:, :model_dim] = values.repeat(token).view(torch.uint8)[:, None]
     target[:, model_dim:] = 127  # E8M0 scale 1.0

@@ -33,7 +33,6 @@ import argparse
 
 import torch
 
-from aiter.ops.flydsl import is_flydsl_available
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.test_common import run_perftest
 
@@ -187,7 +186,7 @@ def run_case(
     warmup=10,
 ):
     from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4_prefill
-    from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4_prefill import (
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
         compute_prefill_schedule,
     )
 
@@ -494,7 +493,7 @@ def run_varqlen_case(
         flydsl_pa_mqa_logits_fp4_prefill,
         flydsl_pa_mqa_logits_fp4_varqlen,
     )
-    from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4_prefill import (
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
         compute_prefill_schedule,
         compute_varqlen_windows,
     )
@@ -710,10 +709,6 @@ def main():
 
     if get_arch() != "gfx950":
         print(f"[skip] this kernel only supports gfx950 (current: {get_arch()}).")
-        return
-
-    if not is_flydsl_available():
-        print("[skip] flydsl is not available in this environment.")
         return
 
     print("=" * 80)

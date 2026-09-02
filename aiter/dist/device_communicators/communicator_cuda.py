@@ -34,6 +34,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         device: torch.device | None = None,
         device_group: ProcessGroup | None = None,
         unique_name: str = "",
+        reuse_from: "CudaCommunicator | None" = None,
     ):
         self._all2all_manager = None
         self._all2all_manager_created = False
@@ -43,6 +44,34 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         self.use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
         self.use_torch_symm_mem = False
+
+        if reuse_from is not None:
+            # Identical-rank group: share the source's allreduce communicators
+            # instead of allocating a second set. Keeps our own unique_name, so
+            # is_ep_communicator/use_all2all still apply to this group.
+            #
+            # reuse_from is a public kwarg: validate rather than trust the
+            # caller's dedup key, since a mismatch silently addresses the wrong
+            # peers instead of raising.
+            assert reuse_from.world_size == self.world_size, (
+                f"{unique_name}: reuse_from {reuse_from.unique_name} has "
+                f"world_size {reuse_from.world_size}, this group has "
+                f"{self.world_size}"
+            )
+            assert list(reuse_from.ranks) == list(self.ranks), (
+                f"{unique_name}: reuse_from {reuse_from.unique_name} spans "
+                f"{reuse_from.ranks}, this group spans {self.ranks}; reuse "
+                "requires an identical rank list in identical order"
+            )
+            assert reuse_from.device == self.device, (
+                f"{unique_name}: reuse_from {reuse_from.unique_name} is on "
+                f"{reuse_from.device}, this group is on {self.device}"
+            )
+            self.pynccl_comm = reuse_from.pynccl_comm
+            self.ca_comm = reuse_from.ca_comm
+            self.qr_comm = reuse_from.qr_comm
+            self.symm_mem_comm = reuse_from.symm_mem_comm
+            return
 
         # lazy import to avoid documentation build error
         from aiter.dist.device_communicators.custom_all_reduce import (
@@ -779,19 +808,30 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 # Convert negative dim to positive.
                 dim += input_.dim()
 
-            # Note: This will produce an incorrect answer if we don't make
-            # the input_tensor contiguous. Possible bug in reduce_scatter_tensor?
-            input_tensor = input_.movedim(0, dim).contiguous()
+            # pynccl scatters axis 0, so bring the scattered axis there first.
+            # NOTE: this must be movedim(dim, 0) -- movedim(0, dim) moves the
+            # wrong axis for dim >= 2 (it only happens to coincide when dim == 1
+            # for a 3-D tensor). contiguous() is required or the collective reads
+            # a wrong layout.
+            input_tensor = input_.movedim(dim, 0).contiguous()
 
             assert input_tensor.shape[0] % world_size == 0
             chunk_size = input_tensor.shape[0] // world_size
-            output_shape = (chunk_size,) + input_tensor.shape[1:]
-            output_.reshape(output_shape)
+            tmp_shape = (chunk_size,) + input_tensor.shape[1:]
+            # pynccl writes the scattered result with the split axis at 0, so it
+            # needs its own [chunk, ...] buffer -- output_ has the caller's layout
+            # ([..., dim/world_size, ...]) and a different element order. Writing
+            # straight into output_ (as the old code's discarded reshape/movedim
+            # did) produced a transposed, garbage result.
+            tmp = torch.empty(
+                tmp_shape, dtype=input_tensor.dtype, device=input_tensor.device
+            )
+            pynccl_comm.reduce_scatter(tmp, input_tensor)
 
-            pynccl_comm.reduce_scatter(output_, input_tensor)
-
-            # Reshape before returning
-            output_.movedim(0, dim).contiguous()
+            # Move the split axis back to `dim` and copy into the caller's
+            # pre-allocated output_ (element-wise copy handles the permuted,
+            # non-contiguous view).
+            output_.copy_(tmp.movedim(0, dim))
 
     def reduce_scatterv(
         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
@@ -803,9 +843,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # Convert negative dim to positive.
             dim += input_.dim()
 
-        # Note: This will produce an incorrect answer if we don't make
-        # the input_tensor contiguous. Possible bug in reduce_scatter_tensor?
-        input_tensor = input_.movedim(0, dim).contiguous()
+        # Bring the scattered axis to 0 for the collective. Must be
+        # movedim(dim, 0), not movedim(0, dim) -- the latter moves the wrong axis
+        # for dim >= 2 (it only coincides at dim == 1 for a 3-D tensor).
+        # contiguous() is required or the collective reads a wrong layout.
+        input_tensor = input_.movedim(dim, 0).contiguous()
 
         if sizes is not None:
             assert len(sizes) == world_size

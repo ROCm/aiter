@@ -54,7 +54,8 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                                                 bool use_shuffle_layout,
                                                 int64_t block_size,
                                                 int64_t x,
-                                                int64_t rotary_dim = 0);
+                                                int64_t rotary_dim = 0,
+                                                bool v_norm        = false);
 
 void fused_qk_norm_rope_2way(aiter_tensor_t& q0,
                              aiter_tensor_t& k0,
@@ -109,7 +110,9 @@ void fused_qk_norm_rope_1way_fp8_perhead_quant(aiter_tensor_t& q,
                                                aiter_tensor_t& q_descale,
                                                aiter_tensor_t& k_descale,
                                                aiter_tensor_t& q_unquantized,
-                                               aiter_tensor_t& k_unquantized);
+                                               aiter_tensor_t& k_unquantized,
+                                               aiter_tensor_t& q_partial_amax,
+                                               aiter_tensor_t& k_partial_amax);
 
 // Same signature as the pertensor variant, but writes per-(batch, head) descales:
 //   q_descale shape [batch_size, num_heads_q]
@@ -138,19 +141,25 @@ void fused_qk_norm_rope_2way_fp8_perhead_quant(aiter_tensor_t& q0,
                                                aiter_tensor_t& q_descale,
                                                aiter_tensor_t& k_descale,
                                                aiter_tensor_t& q_unquantized,
-                                               aiter_tensor_t& k_unquantized);
+                                               aiter_tensor_t& k_unquantized,
+                                               aiter_tensor_t& q_partial_amax,
+                                               aiter_tensor_t& k_partial_amax);
 
 // Per-(batch, head) FP8 quant for concatenated [v0, v1] without a bf16 cat.
 // v0/v1: [B, T0/T1, H, D]; v_fp8: [B, T0+T1, H, D]; v_descale: [B, H].
+// v_amax: zero-initialized fp32 [B, H] scratch (accumulated via atomic_fmax_pos).
 void v_2way_per_head_fp8_quant(aiter_tensor_t& v0,
                                aiter_tensor_t& v1,
                                aiter_tensor_t& v_fp8,
-                               aiter_tensor_t& v_descale);
+                               aiter_tensor_t& v_descale,
+                               aiter_tensor_t& v_amax);
 
 // Per-(batch, head) FP8 quant for single-stream V [B, T, H, D].
+// v_amax: zero-initialized fp32 [B, H] scratch (accumulated via atomic_fmax_pos).
 void v_1way_per_head_fp8_quant(aiter_tensor_t& v,
                                aiter_tensor_t& v_fp8,
-                               aiter_tensor_t& v_descale);
+                               aiter_tensor_t& v_descale,
+                               aiter_tensor_t& v_amax);
 
 void fused_qk_rmsnorm(aiter_tensor_t& q,
                       aiter_tensor_t& q_weight,
@@ -224,12 +233,16 @@ void fused_qk_norm_rope_group_quant(
     // (Q mirrors K: nope fp8 + inline scale in q_nope_scale_buff, PE bf16 here). Unused for bf16 Q.
     std::optional<aiter_tensor_t> q_rope_buff = std::nullopt,
     // --- Optional fused SWA write (decode-only) ---
-    // swa_nope_scale_buff [num_rows, entry] and swa_rope_buff
-    // [num_rows, pe_dim] are addressed by swa_block_tables[bid, pos/swa_block_size].
+    // swa_nope_scale_buff [num_rows, entry] and swa_rope_buff [num_rows, pe_dim]
+    // are addressed either by swa_block_tables[bid, pos/swa_block_size] (paged)
+    // or by swa_dest_row[token] (rows the caller computed itself, for a window
+    // whose layout this kernel need not know). Pass exactly one of the two.
+    // Either way a token with a negative position is skipped.
     // batch_id_per_token maps token->seq (-1 = CG-pad, skipped).
     std::optional<aiter_tensor_t> swa_nope_scale_buff = std::nullopt,
     std::optional<aiter_tensor_t> swa_rope_buff = std::nullopt,
     std::optional<aiter_tensor_t> swa_block_tables = std::nullopt,
+    std::optional<aiter_tensor_t> swa_dest_row = std::nullopt,
     int64_t swa_block_size = 0,
     std::optional<aiter_tensor_t> batch_id_per_token = std::nullopt);
 
