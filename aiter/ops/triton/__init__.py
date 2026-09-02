@@ -140,11 +140,11 @@ _BACKWARD_COMPAT_MAP = {
     "fused_qkv_split_qk_rope": "rope.fused_qkv_split_qk_rope",
     # Utils modules (utils/)
     "common_utils": "utils.common_utils",
-    "core": "utils.core",
+    "config_utils": "utils.config_utils",
     "device_info": "utils.device_info",
     "gmm_common": "utils.gmm_common",
     "logger": "utils.logger",
-    "mha_kernel_utils": "utils.mha_kernel_utils",
+    "mha_kernel_utils": "utils._triton.mha_kernel_utils",
     "moe_common": "utils.moe_common",
     "types": "utils.types",
     # Quant modules (quant/)

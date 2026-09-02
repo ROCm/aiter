@@ -35,18 +35,14 @@ Block : (BLOCK_THREADS, 1, 1)
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import scf
-from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, range_constexpr
-from flydsl.expr.arith import ArithValue, CmpIPredicate
-from flydsl.expr.typing import Int32, T
+from flydsl.expr import const_expr, range_constexpr
+from flydsl.expr.typing import Int32
 
-from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
-    ptr_rsrc,
+    buf_copy_atom,
+    ptr_buf_tensor,
 )
 
 BLOCK_THREADS = 256
@@ -77,10 +73,8 @@ def build_moe_scatter_copy_token_module(row_bytes: int):
     else:
         vec_width, unit_bytes, use_dword, width_tag = 1, 1, False, "by"
 
-    # Number of vectorized copy units (buffer ops) per row, and the per-row stride
-    # measured in copy-dtype elements (i32 when dword*, i8 otherwise).
+    # Number of vectorized copy units (buffer ops) per row.
     n_units = row_bytes // unit_bytes
-    row_stride_elems = row_bytes // 4 if use_dword else row_bytes
 
     module_name = f"moe_scatter_copy_token_b{row_bytes}_{width_tag}"
 
@@ -91,59 +85,42 @@ def build_moe_scatter_copy_token_module(row_bytes: int):
         dst_src: fx.Pointer,  # (num_dst,) int32  -- src row per dst row, -1=skip
         num_dst: Int32,
     ):
-        i32 = T.i32
-        cdt = T.i32 if use_dword else T.i8
+        cdt = fx.Int32 if use_dword else fx.Int8
 
-        bid = fx.block_idx.x
-        tid = fx.thread_idx.x
-        num_dst_i32 = ArithValue(num_dst)
-        bid_i32 = ArithValue(bid)
-        n_units_i32 = arith.constant(n_units, type=i32)
-        row_stride_i32 = arith.constant(row_stride_elems, type=i32)
+        # Uint32 for the counts/indices (`<` lowers to ult); the source row is
+        # signed because -1 is the "skip this destination row" sentinel.
+        tid_i32 = fx.Uint32(fx.thread_idx.x)
+        bid_i32 = fx.Uint32(fx.block_idx.x)
 
-        dst_valid = arith.cmpi(CmpIPredicate.ult, bid_i32, num_dst_i32)
-        _if_dst = scf.IfOp(dst_valid)
-        with ir.InsertionPoint(_if_dst.then_block):
-            map_rsrc = ptr_rsrc(dst_src)
-            srow = ArithValue(
-                buffer_ops.buffer_load(map_rsrc, bid_i32, vec_width=1, dtype=i32)
-            )
-            row_ok = arith.cmpi(CmpIPredicate.sge, srow, arith.constant(0, type=i32))
-            _if_row = scf.IfOp(row_ok)
-            with ir.InsertionPoint(_if_row.then_block):
-                src_rsrc = ptr_rsrc(src)
-                dst_rsrc = ptr_rsrc(dst)
-                tid_i32 = ArithValue(tid)
-                # Element base of each row, in copy-dtype elements (i32 if dword*, i8 otherwise).
-                src_base = srow * row_stride_i32
-                dst_base = bid_i32 * row_stride_i32
+        if bid_i32 < fx.Uint32(num_dst):
+            srow = ptr_buf_tensor(dst_src)[bid_i32]
+            if fx.Int32(srow) >= fx.Int32(0):
+                # A row is a contiguous run of n_units copy units.
+                if const_expr(vec_width > 1):
+                    src_t = ptr_buf_tensor(src, cdt, unit_elems=vec_width)
+                    dst_t = ptr_buf_tensor(dst, cdt, unit_elems=vec_width)
+                    atom = buf_copy_atom(unit_bytes, cdt)
+                    # Hoisted: a per-iteration fragment costs more than the copy.
+                    frag = fx.make_fragment_like(fx.slice(src_t, (0, None)))
+                else:
+                    src_t = ptr_buf_tensor(src, cdt)
+                    dst_t = ptr_buf_tensor(dst, cdt)
+                src_unit_base = fx.Uint32(srow) * n_units
+                dst_unit_base = bid_i32 * n_units
 
                 for it in range_constexpr(
                     (n_units + BLOCK_THREADS - 1) // BLOCK_THREADS
                 ):
-                    # Each unit copies `vec_width` copy-dtype elements via one buffer op
-                    # (dwordx4 / dwordx2 / dword / byte). Threads stride over the row's units.
-                    uidx = tid_i32 + arith.constant(it * BLOCK_THREADS, type=i32)
-                    u_ok = arith.cmpi(CmpIPredicate.ult, uidx, n_units_i32)
-                    _if_u = scf.IfOp(u_ok)
-                    with ir.InsertionPoint(_if_u.then_block):
-                        # vec_width is a build-time constant, so resolve the unit->element
-                        # offset with a Python ternary (avoid a kernel-level `if` statement).
-                        eidx = (
-                            uidx
-                            if vec_width == 1
-                            else uidx * arith.constant(vec_width, type=i32)
-                        )
-                        v = buffer_ops.buffer_load(
-                            src_rsrc,
-                            src_base + eidx,
-                            vec_width=vec_width,
-                            dtype=cdt,
-                        )
-                        buffer_ops.buffer_store(v, dst_rsrc, dst_base + eidx)
-                        scf.YieldOp([])
-                scf.YieldOp([])
-            scf.YieldOp([])
+                    # One buffer op per unit; threads stride over the row.
+                    uidx = tid_i32 + it * BLOCK_THREADS
+                    if uidx < fx.Uint32(n_units):
+                        s_unit = src_unit_base + uidx
+                        d_unit = dst_unit_base + uidx
+                        if const_expr(vec_width > 1):
+                            fx.copy(atom, fx.slice(src_t, (s_unit, None)), frag)
+                            fx.copy(atom, frag, fx.slice(dst_t, (d_unit, None)))
+                        else:
+                            dst_t[d_unit] = src_t[s_unit]
 
     @flyc.jit
     def launch_scatter_copy(
@@ -153,14 +130,9 @@ def build_moe_scatter_copy_token_module(row_bytes: int):
         num_dst: fx.Int32,
         stream: fx.Stream,
     ):
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            pass
-
-        idx_dst = arith.index_cast(T.index, num_dst)
         launcher = scatter_copy_kernel(src, dst, dst_src, num_dst)
         launcher.launch(
-            grid=(idx_dst, 1, 1),
+            grid=(fx.Int64(num_dst), 1, 1),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
         )

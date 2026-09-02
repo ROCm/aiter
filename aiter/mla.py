@@ -21,17 +21,6 @@ _FLYDSL_MLA_REDUCE_TARGET_H = 16
 _FLYDSL_MLA_REDUCE_TARGET_DV = 512
 
 
-@functools.lru_cache(maxsize=1)
-def _flydsl_mla_reduce_available() -> bool:
-    """Whether the optional FlyDSL package is available on this device."""
-    try:
-        from aiter.ops.flydsl import is_flydsl_available
-
-        return is_flydsl_available()
-    except (ImportError, OSError, RuntimeError):
-        return False
-
-
 def _flydsl_mla_reduce_supported(
     partial_output: torch.Tensor,
     partial_lse: torch.Tensor,
@@ -99,20 +88,14 @@ def _flydsl_mla_reduce_enabled() -> bool:
     use the HIP path; the latter is routed directly by its caller rather than
     inferred from ``max_seqlen_q``. Calls outside the permitted ABI and shape scope
     use the HIP path.
-    Not memoized, so the env var can be toggled at runtime; only the optional
-    package availability probe above is cached.
+    Not memoized, so the env var can be toggled at runtime.
     """
-    try:
-        from flydsl.utils.env import EnvManager, OptBool
+    from flydsl.utils.env import EnvManager, OptBool
 
-        class _Env(EnvManager):
-            enabled = OptBool(False, env_var="AITER_MLA_REDUCE_FLYDSL")
+    class _Env(EnvManager):
+        enabled = OptBool(False, env_var="AITER_MLA_REDUCE_FLYDSL")
 
-        if not _Env().enabled:
-            return False
-        return _flydsl_mla_reduce_available()
-    except (ImportError, OSError, RuntimeError, ValueError):
-        return False
+    return bool(_Env().enabled)
 
 
 def _mla_decode_reduce_v1_dispatch(
@@ -310,8 +293,8 @@ def get_meta_param(
         #   - tg_factor (caller-supplied): the v4 nm wrapper passes
         #     ceil(num_heads/64) so gqa=128 (2 head-group WGs) is counted as 2x.
         #   - wg_per_split (auto, from main): qh128 decode on gfx1250 launches 2
-        #     head-group workgroups per (batch, split) along z (mirrors gdz =
-        #     kv_split*2 in asm_mla.cu).
+        #     head-group workgroups per (batch, split) along x (mirrors gdx = 2
+        #     for gqa=128 in asm_mla.cu, where z stays the plain kv split id).
         # Take the max so either path applies; for V3 callers (tg_factor=1) the
         # gfx1250 auto-rule still kicks in, and for v4 callers the explicit
         # tg_factor governs.
