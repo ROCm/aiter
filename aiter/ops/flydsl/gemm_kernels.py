@@ -10,17 +10,18 @@ import re
 
 import flydsl.expr as fx
 import torch
+from flydsl.runtime.device import get_rocm_arch
 from torch import Tensor
 
 from aiter import logger
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_lds_capacity_bytes
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
 from .kernels.gemm_a16w16_gfx950 import (
     SPLIT_K_SEMAPHORE_MAX_LEN,
     gemm_a16w16,
 )
 from .kernels.tensor_shim import _run_compiled
-from .utils import is_flydsl_available
 
 __all__ = [
     "SPLIT_K_SEMAPHORE_MAX_LEN",
@@ -186,37 +187,22 @@ def flydsl_hgemm(
 # FlyDSL preshuffle GEMM kernel management
 # ---------------------------------------------------------------------------
 
-_flydsl_compile_fn = None
-_flydsl_import_done = False
 
-
+@functools.lru_cache(maxsize=1)
 def _get_compile_fn():
-    """Lazy-import compile_preshuffle_gemm so the module loads without FlyDSL."""
-    global _flydsl_compile_fn, _flydsl_import_done
-    if _flydsl_import_done:
-        return _flydsl_compile_fn
-    _flydsl_import_done = True
-    if not is_flydsl_available():
-        logger.info("[FlyDSL] not available, will fall back to CK/CKTile")
-        return None
-    try:
-        from .kernels.preshuffle_gemm import compile_preshuffle_gemm
+    """Import the preshuffle compiler on first use."""
+    from .kernels.preshuffle_gemm import compile_preshuffle_gemm
 
-        _flydsl_compile_fn = compile_preshuffle_gemm
-        logger.info("[FlyDSL] loaded preshuffle GEMM compiler")
-    except Exception as e:  # noqa: BLE001
-        logger.info(
-            f"[FlyDSL] preshuffle GEMM not available, will fall back to CK/CKTile: {e}"
-        )
-    return _flydsl_compile_fn
+    logger.info("[FlyDSL] loaded preshuffle GEMM compiler")
+    return compile_preshuffle_gemm
 
 
 # Fixed size rather than one buffer per shape: a shape-keyed cache grows without
 # limit and can evict a buffer a captured CUDA graph still points at. The bounds
 # come from k_split_candidates, which keeps tile_count under CU_NUM and
 # k_split * tile_count at four per CU.
-# Mirrors preshuffle_gemm.PRESHUFFLE_M_MAX; duplicated so this module imports
-# without FlyDSL present.
+# Mirrors preshuffle_gemm.PRESHUFFLE_M_MAX; duplicated to avoid importing the
+# compiler module before the preshuffle path is selected.
 PRESHUFFLE_M_MAX = 65536
 
 PRESHUFFLE_SPLIT_K_MAX_TILES = 256
@@ -277,8 +263,6 @@ def flydsl_preshuffle_gemm_a8(
 ) -> Tensor:
     """Compile and run FlyDSL preshuffle GEMM, optionally with fp32 split-K."""
     compile_fn = _get_compile_fn()
-    if compile_fn is None:
-        raise RuntimeError("[FlyDSL] compile function not available")
     dtypes = _get_dtypes()
 
     m, k = XQ.shape[0], XQ.shape[-1]

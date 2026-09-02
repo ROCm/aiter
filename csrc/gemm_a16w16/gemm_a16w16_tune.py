@@ -24,7 +24,13 @@ import aiter
 from aiter import dtypes, logger
 from aiter.jit.core import AITER_CONFIG_GEMM_BF16, get_asm_dir
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
-from aiter.ops.flydsl.utils import is_flydsl_available
+from aiter.ops.flydsl.gemm_a16w16_policy import (
+    get_flydsl_a16w16_configs,
+)
+from aiter.ops.flydsl.gemm_kernels import (
+    flydsl_hgemm,
+    flydsl_hgemm_kernel_name,
+)
 from aiter.ops.gemm_op_a16w16 import ASM_SPLITK_MAX_GRID
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16 as triton_gemm_a16w16
 from aiter.utility.base_tuner import GemmCommonTuner
@@ -33,24 +39,6 @@ from aiter.utility.mp_tuner import mp_tuner
 # ---------------------------------------------------------------------------
 # Optional backend imports
 # ---------------------------------------------------------------------------
-
-FLYDSL_TUNE_ERROR = None
-try:
-    if is_flydsl_available():
-        from aiter.ops.flydsl.gemm_a16w16_policy import (
-            get_flydsl_a16w16_configs,
-        )
-        from aiter.ops.flydsl.gemm_kernels import (
-            flydsl_hgemm,
-            flydsl_hgemm_kernel_name,
-        )
-    else:
-        raise ImportError("flydsl package is not installed")
-except ImportError as exc:
-    flydsl_hgemm = None
-    flydsl_hgemm_kernel_name = None
-    get_flydsl_a16w16_configs = None
-    FLYDSL_TUNE_ERROR = str(exc)
 
 OPUS_TUNE_ERROR = None
 try:
@@ -299,8 +287,6 @@ def run_flydsl_gemm_bf16(
     otype=dtypes.bf16,
     config=None,
 ):
-    if flydsl_hgemm is None:
-        raise RuntimeError(f"flydsl is not available for tuning: {FLYDSL_TUNE_ERROR}")
     if config is None:
         raise ValueError("flydsl tuning requires a kernel config")
     fused_bias = None
@@ -750,10 +736,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
     def _get_flydsl_tasks(
         self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
     ):
-        if flydsl_hgemm is None or flydsl_hgemm_kernel_name is None:
-            logger.warning(f"FlyDSL not available, skip. reason: {FLYDSL_TUNE_ERROR}")
-            return []
-        if scaleAB or is_shuffle or indtype != dtypes.bf16 or get_gfx() != "gfx950":
+        if scaleAB or is_shuffle or indtype != dtypes.bf16:
             return []
         M, N, K = (int(info_keys[2]), int(info_keys[3]), int(info_keys[4]))
         rtol, atol = _default_tol(outdtype)
