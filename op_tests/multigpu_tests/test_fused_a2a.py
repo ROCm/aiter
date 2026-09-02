@@ -29,12 +29,10 @@ def _free_port():
         return sock.getsockname()[1]
 
 
-def _head_major_input(rank, heads, seq_len, head_dim, device):
+def _sequence_major_input(rank, heads, seq_len, head_dim, device):
     numel = heads * seq_len * head_dim
     values = torch.arange(numel, dtype=torch.int64).view(1, seq_len, heads, head_dim)
-    values = values + rank * numel
-    # Match the incumbent Ulysses host-side [B,S,H,D] -> [B,H,S,D] reorder.
-    return values.to(torch.bfloat16).to(device).permute(0, 2, 1, 3).contiguous()
+    return (values + rank * numel).to(torch.bfloat16).to(device)
 
 
 def _run_rank(rank, world_size, port):
@@ -53,11 +51,23 @@ def _run_rank(rank, world_size, port):
         ms.shmem_torch_process_group_init("mori")
 
         for case_name, heads, seq_len, head_dim in _CASES:
-            input_tensor = _head_major_input(rank, heads, seq_len, head_dim, device)
-            flat = input_tensor.view(-1)
-            reference = funcol.wait_tensor(
-                funcol.all_to_all_single(flat, None, None, dist.group.WORLD)
-            )
+            q = _sequence_major_input(rank, heads, seq_len, head_dim, device)
+            inputs = (q, q + 1000, q + 2000)
+            references = []
+            heads_local = heads // world_size
+            for input_tensor in inputs:
+                packed = input_tensor.permute(0, 2, 1, 3).contiguous()
+                gathered = funcol.wait_tensor(
+                    funcol.all_to_all_single(
+                        packed.view(-1), None, None, dist.group.WORLD
+                    )
+                )
+                reference = gathered.view(world_size, 1, heads_local, seq_len, head_dim)
+                references.append(
+                    reference.permute(1, 2, 0, 3, 4).reshape(
+                        1, heads_local, world_size * seq_len, head_dim
+                    )
+                )
 
             op = FusedA2AIntraNodeOp(
                 rank=rank,
@@ -65,26 +75,27 @@ def _run_rank(rank, world_size, port):
                 shape=input_tensor.shape,
                 dtype=input_tensor.dtype,
             )
-            actual = op(input_tensor)
+            actuals = op(*inputs)
             torch.cuda.synchronize()
-            if not torch.equal(actual, reference):
-                mismatch = torch.nonzero(actual != reference, as_tuple=False)[0].item()
-                raise AssertionError(
-                    f"{case_name} rank {rank}: byte mismatch at flat index {mismatch}: "
-                    f"actual={actual[mismatch].item()} reference={reference[mismatch].item()}"
-                )
-
-            heads_local = heads // world_size
-            result = actual.view(world_size, 1, heads_local, seq_len, head_dim)
-            result = result.permute(1, 2, 0, 3, 4).reshape(
-                1, heads_local, world_size * seq_len, head_dim
-            )
             expected_shape = (1, heads_local, world_size * seq_len, head_dim)
-            if tuple(result.shape) != expected_shape:
-                raise AssertionError(
-                    f"{case_name} rank {rank}: got {tuple(result.shape)}, "
-                    f"expected {expected_shape}"
-                )
+            for tensor_name, actual, reference in zip(
+                "qkv", actuals, references, strict=True
+            ):
+                actual = actual.view(reference.shape)
+                if not torch.equal(actual, reference):
+                    mismatch = torch.nonzero(actual != reference, as_tuple=False)[
+                        0
+                    ].flatten()
+                    raise AssertionError(
+                        f"{case_name} {tensor_name} rank {rank}: byte mismatch at "
+                        f"index {mismatch.tolist()}: actual={actual[tuple(mismatch)].item()} "
+                        f"reference={reference[tuple(mismatch)].item()}"
+                    )
+                if tuple(actual.shape) != expected_shape:
+                    raise AssertionError(
+                        f"{case_name} {tensor_name} rank {rank}: got "
+                        f"{tuple(actual.shape)}, expected {expected_shape}"
+                    )
             dist.barrier()
             if rank == 0:
                 print(

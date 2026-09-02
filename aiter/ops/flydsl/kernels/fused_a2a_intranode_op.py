@@ -53,10 +53,10 @@ class FusedA2AIntraNodeOp:
         if rank < 0 or rank >= world_size:
             raise ValueError(f"rank must be in [0, {world_size}), got {rank}")
         if len(shape) != 4 or shape[0] != 1 or shape[-1] != 128:
-            raise ValueError(f"expected input shape [1, H, S, 128], got {tuple(shape)}")
-        if shape[1] % world_size != 0:
+            raise ValueError(f"expected input shape [1, S, H, 128], got {tuple(shape)}")
+        if shape[2] % world_size != 0:
             raise ValueError(
-                f"head count {shape[1]} must be divisible by world_size {world_size}"
+                f"head count {shape[2]} must be divisible by world_size {world_size}"
             )
         if block_num <= 0 or warp_num_per_block <= 0:
             raise ValueError("launch geometry must be positive")
@@ -72,27 +72,30 @@ class FusedA2AIntraNodeOp:
             numel *= dim
         if numel % world_size != 0:
             raise ValueError("input numel must divide evenly across ranks")
-        peer_nbytes = numel * torch.tensor([], dtype=dtype).element_size() // world_size
-        if peer_nbytes % 16 != 0:
-            raise ValueError(
-                f"per-peer chunk must be 16-byte aligned, got {peer_nbytes}"
-            )
+        row_nbytes = shape[-1] * torch.tensor([], dtype=dtype).element_size()
+        if row_nbytes % 16 != 0:
+            raise ValueError(f"head row must be 16-byte aligned, got {row_nbytes}")
 
         self.rank = rank
         self.world_size = world_size
         self.shape = tuple(shape)
         self.dtype = dtype
         self.peer_numel = numel // world_size
-        self.output = mori_shmem_create_tensor((numel,), dtype)
+        self.outputs = tuple(
+            mori_shmem_create_tensor((numel,), dtype) for _ in range(3)
+        )
+        self.output = self.outputs[0]
         self.xdb_mem = mori_shmem_create_tensor((world_size,), torch.int64)
-        self.output.zero_()
+        for output in self.outputs:
+            output.zero_()
         self.xdb_mem.zero_()
         self.xdb_flag = torch.ones(1, dtype=torch.int64, device=self.output.device)
         self.grid_barrier = torch.zeros(1, dtype=torch.int32, device=self.output.device)
 
         ms.shmem_barrier_all()
-        self.p2p_output = _build_p2p_table(
-            self.output, rank, world_size, self.output.device
+        self.p2p_outputs = tuple(
+            _build_p2p_table(output, rank, world_size, self.output.device)
+            for output in self.outputs
         )
         self.p2p_xdb_mem = _build_p2p_table(
             self.xdb_mem, rank, world_size, self.output.device
@@ -102,26 +105,29 @@ class FusedA2AIntraNodeOp:
         self._launch = make_fused_a2a_jit(
             rank=rank,
             npes=world_size,
-            peer_nbytes=peer_nbytes,
+            heads=shape[2],
+            seq_len=shape[1],
+            head_dim=shape[3],
             block_num=block_num,
             warp_num_per_block=warp_num_per_block,
         )
         self._compiled = None
 
-    def __call__(self, input, stream=None):
-        if input.dtype != self.dtype or tuple(input.shape) != self.shape:
-            raise ValueError(
-                f"expected contiguous {self.dtype} tensor with shape {self.shape}, "
-                f"got {input.dtype} {tuple(input.shape)}"
-            )
-        if not input.is_cuda or not input.is_contiguous():
-            raise ValueError("input must be a contiguous CUDA tensor")
+    def __call__(self, q, k, v, stream=None):
+        inputs = (q, k, v)
+        for input in inputs:
+            if input.dtype != self.dtype or tuple(input.shape) != self.shape:
+                raise ValueError(
+                    f"expected contiguous {self.dtype} tensor with shape {self.shape}, "
+                    f"got {input.dtype} {tuple(input.shape)}"
+                )
+            if not input.is_cuda or not input.is_contiguous():
+                raise ValueError("input must be a contiguous CUDA tensor")
 
         stream = Stream(torch.cuda.current_stream() if stream is None else stream)
         args = (
-            input.data_ptr(),
-            self.output.data_ptr(),
-            self.p2p_output.data_ptr(),
+            *(input.data_ptr() for input in inputs),
+            *(table.data_ptr() for table in self.p2p_outputs),
             self.xdb_mem.data_ptr(),
             self.p2p_xdb_mem.data_ptr(),
             self.xdb_flag.data_ptr(),
@@ -136,4 +142,4 @@ class FusedA2AIntraNodeOp:
             )
         else:
             self._compiled(*args)
-        return self.output
+        return self.outputs
