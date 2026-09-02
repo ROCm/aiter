@@ -113,27 +113,37 @@ def _run_rank(rank, world_size, port):
                 v,
             )
             inputs = (q, k, v)
-            references = []
             heads_local = heads // world_size
-            for input_tensor in transformed:
-                packed = input_tensor.permute(0, 2, 1, 3).contiguous()
-                gathered = funcol.wait_tensor(
-                    funcol.all_to_all_single(
-                        packed.view(-1), None, None, dist.group.WORLD
+
+            def a2a_references(tensors, heads_local, seq_len, head_dim):
+                references = []
+                for input_tensor in tensors:
+                    packed = input_tensor.permute(0, 2, 1, 3).contiguous()
+                    gathered = funcol.wait_tensor(
+                        funcol.all_to_all_single(
+                            packed.view(-1), None, None, dist.group.WORLD
+                        )
                     )
-                )
-                reference = gathered.view(world_size, 1, heads_local, seq_len, head_dim)
-                references.append(
-                    reference.permute(1, 2, 0, 3, 4).reshape(
-                        1, heads_local, world_size * seq_len, head_dim
+                    reference = gathered.view(
+                        world_size, 1, heads_local, seq_len, head_dim
                     )
-                )
+                    references.append(
+                        reference.permute(1, 2, 0, 3, 4).reshape(
+                            1, heads_local, world_size * seq_len, head_dim
+                        )
+                    )
+                return references
+
+            references = a2a_references(transformed, heads_local, seq_len, head_dim)
+            transport_references = a2a_references(
+                inputs, heads_local, seq_len, head_dim
+            )
 
             op = FusedA2AIntraNodeOp(
                 rank=rank,
                 world_size=world_size,
-                shape=input_tensor.shape,
-                dtype=input_tensor.dtype,
+                shape=q.shape,
+                dtype=q.dtype,
             )
             actuals = op(*inputs, norm_q, norm_k, cos, sin)
             torch.cuda.synchronize()
@@ -167,6 +177,30 @@ def _run_rank(rank, world_size, port):
                             f"cosine={cosine:.9f})"
                         )
                     case_metrics.append((tensor_name, sqnr, rel_mae, cosine))
+            transport_op = FusedA2AIntraNodeOp(
+                rank=rank,
+                world_size=world_size,
+                shape=q.shape,
+                dtype=q.dtype,
+                fuse_norm_rope=False,
+            )
+            transport_actuals = transport_op(*inputs)
+            torch.cuda.synchronize()
+            for tensor_name, actual, reference in zip(
+                "qkv", transport_actuals, transport_references, strict=True
+            ):
+                actual = actual.view(reference.shape)
+                if not torch.equal(actual, reference):
+                    mismatch = torch.nonzero(actual != reference, as_tuple=False)[
+                        0
+                    ].flatten()
+                    raise AssertionError(
+                        f"{case_name} transport {tensor_name} rank {rank}: byte "
+                        f"mismatch at index {mismatch.tolist()}: "
+                        f"actual={actual[tuple(mismatch)].item()} "
+                        f"reference={reference[tuple(mismatch)].item()}"
+                    )
+
             out_input = references[0].contiguous()
             out_packed = out_input.permute(2, 0, 1, 3).contiguous()
             out_reference = funcol.wait_tensor(
@@ -200,8 +234,9 @@ def _run_rank(rank, world_size, port):
                     for name, sqnr, rel_mae, cosine in case_metrics
                 )
                 print(
-                    f"PASS {case_name}: {metric_text} V=byte-identical "
-                    f"in={tuple(input_tensor.shape)} gathered={expected_shape} "
+                    f"PASS {case_name}: {metric_text} full-V=byte-identical "
+                    f"transport-QKV=byte-identical "
+                    f"in={tuple(q.shape)} gathered={expected_shape} "
                     f"out={tuple(out_reference.shape)}"
                 )
     finally:

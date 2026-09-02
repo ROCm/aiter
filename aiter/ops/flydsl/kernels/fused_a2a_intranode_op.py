@@ -45,6 +45,7 @@ class FusedA2AIntraNodeOp:
         dtype=torch.bfloat16,
         block_num=_DEFAULT_BLOCK_NUM,
         warp_num_per_block=_DEFAULT_WARP_NUM_PER_BLOCK,
+        fuse_norm_rope=True,
     ):
         if dtype != torch.bfloat16:
             raise ValueError(f"only torch.bfloat16 is supported, got {dtype}")
@@ -110,10 +111,14 @@ class FusedA2AIntraNodeOp:
             head_dim=shape[3],
             block_num=block_num,
             warp_num_per_block=warp_num_per_block,
+            fuse_norm_rope=fuse_norm_rope,
         )
+        self.fuse_norm_rope = fuse_norm_rope
         self._compiled = None
 
-    def __call__(self, q, k, v, norm_q, norm_k, cos, sin, stream=None):
+    def __call__(
+        self, q, k, v, norm_q=None, norm_k=None, cos=None, sin=None, stream=None
+    ):
         inputs = (q, k, v)
         for input in inputs:
             if input.dtype != self.dtype or tuple(input.shape) != self.shape:
@@ -123,23 +128,33 @@ class FusedA2AIntraNodeOp:
                 )
             if not input.is_cuda or not input.is_contiguous():
                 raise ValueError("input must be a contiguous CUDA tensor")
-        hd = self.shape[2] * self.shape[3]
-        for name, weight in (("norm_q", norm_q), ("norm_k", norm_k)):
-            if weight.dtype != self.dtype or tuple(weight.shape) != (hd,):
-                raise ValueError(f"{name} must be contiguous bf16 with shape ({hd},)")
-            if not weight.is_cuda or not weight.is_contiguous():
-                raise ValueError(f"{name} must be a contiguous CUDA tensor")
-        expected_freq_shape = (1, self.shape[1], 1, self.shape[3])
-        for name, table in (("cos", cos), ("sin", sin)):
-            if (
-                table.dtype != torch.float32
-                or tuple(table.shape) != expected_freq_shape
-            ):
-                raise ValueError(
-                    f"{name} must be contiguous fp32 with shape {expected_freq_shape}"
-                )
-            if not table.is_cuda or not table.is_contiguous():
-                raise ValueError(f"{name} must be a contiguous CUDA tensor")
+        if self.fuse_norm_rope:
+            hd = self.shape[2] * self.shape[3]
+            for name, weight in (("norm_q", norm_q), ("norm_k", norm_k)):
+                if (
+                    weight is None
+                    or weight.dtype != self.dtype
+                    or tuple(weight.shape) != (hd,)
+                ):
+                    raise ValueError(
+                        f"{name} must be contiguous bf16 with shape ({hd},)"
+                    )
+                if not weight.is_cuda or not weight.is_contiguous():
+                    raise ValueError(f"{name} must be a contiguous CUDA tensor")
+            expected_freq_shape = (1, self.shape[1], 1, self.shape[3])
+            for name, table in (("cos", cos), ("sin", sin)):
+                if (
+                    table is None
+                    or table.dtype != torch.float32
+                    or tuple(table.shape) != expected_freq_shape
+                ):
+                    raise ValueError(
+                        f"{name} must be contiguous fp32 with shape {expected_freq_shape}"
+                    )
+                if not table.is_cuda or not table.is_contiguous():
+                    raise ValueError(f"{name} must be a contiguous CUDA tensor")
+        else:
+            norm_q = norm_k = cos = sin = q
 
         stream = Stream(torch.cuda.current_stream() if stream is None else stream)
         args = (
