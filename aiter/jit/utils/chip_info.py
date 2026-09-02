@@ -459,7 +459,7 @@ def _get_pci_chip_id(device_id=0):
         bdf = buf.value.decode()
         with open(f"/sys/bus/pci/devices/{bdf}/device") as f:
             return int(f.read().strip(), 16)
-    except (OSError, ValueError, UnicodeDecodeError):
+    except (OSError, ValueError, UnicodeDecodeError, AttributeError):
         return None
 
 
