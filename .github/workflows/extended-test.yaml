@@ -4,7 +4,7 @@ run-name: Extended test for PR #${{ github.event.pull_request.number }}
 
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened, ready_for_review, edited, labeled]
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
 
 permissions:
   contents: read
