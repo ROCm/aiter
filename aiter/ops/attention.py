@@ -1027,9 +1027,13 @@ def get_ps_metadata_info_v1(
     max_qo_split_per_batch = math.ceil(max_qlen / qlen_granularity)
 
     qo_tile_cnt = batch_size * max_qo_split_per_batch
+    # a work item is created either
+    #   1. for every qo tile (no split)
+    #   2. every split qo tile, which can be done at most #TG times in total
     # TODO: consider split q to reduce max_works & max_partials
     work_per_head = (batch_size + cus_per_cluster - 1) * max_qo_split_per_batch
     max_works = work_per_head * num_head_k
+    # each work item emits at most one partial
     max_partials = work_per_head
 
     return (
