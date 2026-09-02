@@ -392,22 +392,19 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
 
         pid_n = start_n + compute_idx
         out_smem.store(out_fp8)
-        gl.barrier()
+        bs_smem.store(bs_e8m0)
+        gl.barrier()  # single barrier covers both LDS writes
         gl.amd.gfx1250.tdm.async_store(
             out_desc,
             [pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N],
             out_smem,
         )
-        gl.amd.gfx1250.tdm.async_wait(0)
-
-        bs_smem.store(bs_e8m0)
-        gl.barrier()
         gl.amd.gfx1250.tdm.async_store(
             bs_desc,
             [pid_m * BLOCK_SIZE_M, pid_n * NUM_QUANT_BLOCKS],
             bs_smem,
         )
-        gl.amd.gfx1250.tdm.async_wait(0)
+        gl.amd.gfx1250.tdm.async_wait(0)  # waits for both stores above
         compute_idx += 1
 
     # ---- Epilogue: drain remaining NUM_BUFFERS-1 tiles ----
@@ -426,21 +423,18 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
 
         pid_n = start_n + compute_idx
         out_smem.store(out_fp8)
-        gl.barrier()
+        bs_smem.store(bs_e8m0)
+        gl.barrier()  # single barrier covers both LDS writes
         gl.amd.gfx1250.tdm.async_store(
             out_desc,
             [pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N],
             out_smem,
         )
-        gl.amd.gfx1250.tdm.async_wait(0)
-
-        bs_smem.store(bs_e8m0)
-        gl.barrier()
         gl.amd.gfx1250.tdm.async_store(
             bs_desc,
             [pid_m * BLOCK_SIZE_M, pid_n * NUM_QUANT_BLOCKS],
             bs_smem,
         )
-        gl.amd.gfx1250.tdm.async_wait(0)
+        gl.amd.gfx1250.tdm.async_wait(0)  # waits for both stores above
         compute_idx += 1
 
