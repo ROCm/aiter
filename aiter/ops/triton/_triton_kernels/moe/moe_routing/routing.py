@@ -7,6 +7,7 @@ from aiter.ops.triton._triton_kernels.moe.moe_routing.bitmatrix import (
 from aiter.ops.triton._triton_kernels.moe.moe_routing.expt_data import (
     _expt_data_compute_stage1,
     _expt_data_compute_stage2,
+    _expt_data_compute_stage2_fused,
 )
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -351,11 +352,7 @@ def _combined_routing_fused(
     )
 
     if pid < blocks1a:
-        # General stage2, not the one-tile-per-expert form: an expert can hold
-        # more than tile_dim gates as soon as n_tokens > tile_dim, and writing
-        # only its first tile drops the rest of its gates silently. That bound
-        # is what used to pin this kernel to n_tokens <= 16.
-        _expt_data_compute_stage2(pid, ExpertHist, TileStart, MDTileInfo, tile_dim_log2)
+        _expt_data_compute_stage2_fused(pid, ExpertHist, TileStart, MDTileInfo)
     else:
         _routing_compute_indx_fused(
             GatherIndx,
