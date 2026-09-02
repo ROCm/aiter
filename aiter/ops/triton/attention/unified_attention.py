@@ -1,6 +1,7 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
-from typing import NamedTuple
+import os
+from typing import Literal, NamedTuple
 
 import torch
 import triton
@@ -51,6 +52,56 @@ _GLUON_SUPPORTED_ARCHS = ("gfx1250",)
 
 def _is_gluon_available():
     return any(supported in DEVICE_ARCH for supported in _GLUON_SUPPORTED_ARCHS)
+
+
+# fasttile splits the 2-D prefill tile loop into an unmasked bulk pass (tiles
+# strictly below the causal diagonal) and a masked tail pass, which is what
+# lets the compiler pipeline it. A deeper pipeline is a measured null on the
+# stock masked body, so the published config keeps num_stages at 1 and the
+# restructured loop overrides it with the depth it was certified at.
+_FASTTILE_VALUES = ("off", "nofuse", "on")
+_FASTTILE_ARCHS = ("gfx950",)
+_FASTTILE_NUM_STAGES = 2
+
+_env_fasttile = os.environ.get("AITER_TRITON_UNIFIED_ATTN_FASTTILE", "off")
+if _env_fasttile not in _FASTTILE_VALUES:
+    raise ValueError(
+        f"Invalid AITER_TRITON_UNIFIED_ATTN_FASTTILE value: {_env_fasttile!r}. "
+        f"Must be one of {_FASTTILE_VALUES}."
+    )
+_FASTTILE: Literal["off", "nofuse", "on"] = _env_fasttile
+del _env_fasttile
+
+
+def unified_attention_set_fasttile(value: Literal["off", "nofuse", "on"]):
+    """Select the 2-D prefill tile-loop schedule.
+
+    Args:
+        value: ``"off"`` keeps the stock single masked loop. ``"nofuse"``
+               splits it into an unmasked bulk pass and a masked tail pass.
+               ``"on"`` additionally folds qk_scale into the exp2 argument.
+
+    The restructured schedule was measured and certified on gfx950 prefill
+    only, so on any other architecture -- and for decode or sliding-window
+    layers on gfx950 -- this setting is ignored and the stock loop runs.
+
+    ``"on"`` degrades to ``"nofuse"`` rather than being refused wherever the
+    fold does not apply: softcap, ALiBi and query-query bias all adjust the
+    scaled scores, and a non-positive softmax_scale breaks the monotonicity
+    the folded maximum relies on. Those calls still get the split loop, so
+    expect nofuse-level performance from them, not the fused numbers.
+    """
+    if value not in _FASTTILE_VALUES:
+        raise ValueError(
+            f"Invalid fasttile value: {value!r}. Must be one of {_FASTTILE_VALUES}."
+        )
+    global _FASTTILE
+    _FASTTILE = value
+
+
+def unified_attention_get_fasttile() -> str:
+    """The tile-loop schedule currently selected. See ``set`` for the values."""
+    return _FASTTILE
 
 
 class _UAParams(NamedTuple):
@@ -446,6 +497,29 @@ def is_reduce_gluon_available(params: _UAParams, NUM_SEGMENTS, backend: str):
     return use_gluon and use_gluon_arch
 
 
+def _fasttile_modes(params: _UAParams) -> tuple[bool, bool]:
+    """``(split, fuse)`` for this call.
+
+    The bulk loop drops the sliding-window bound as well as the causal one, so
+    it is only sound where the causal diagonal is the sole per-tile mask. That
+    rules out windowed layers. All-decode carries a single query row and so has
+    no bulk to speak of, and was never certified, so it is excluded too.
+
+    The fold additionally needs a positive effective qk scale: it takes the
+    maximum of the *unscaled* logits and scales that, which is the true maximum
+    only because scaling by a positive constant is monotone. Under a negative
+    scale it would pick the minimum instead and hand exp2 large positive
+    arguments, where the stock path stays stable. The descales are quantization
+    scales and positive by construction, but softmax_scale is caller-supplied,
+    so it is checked here; the split itself is unaffected either way.
+    """
+    if _FASTTILE == "off" or DEVICE_ARCH not in _FASTTILE_ARCHS:
+        return False, False
+    if params.sliding_window > 0 or params.all_decode:
+        return False, False
+    return True, _FASTTILE == "on" and params.softmax_scale > 0
+
+
 def _unified_attention_2d_triton(params: _UAParams):
     if params.shuffled_kv_cache and (
         params.q_dtype == e4m3_dtype and params.kv_cache_dtype == e4m3_dtype
@@ -462,6 +536,12 @@ def _unified_attention_2d_triton(params: _UAParams):
     assert config["BLOCK_Q"] >= 1
     if params.shuffled_kv_cache:
         config["TILE_SIZE"] = params.block_size
+    config["FASTTILE_SPLIT"], config["FASTTILE_FUSE"] = _fasttile_modes(params)
+    if config["FASTTILE_SPLIT"]:
+        # The published entry is tuned for the stock body, where a deeper
+        # pipeline is a measured null; the restructured loop is what makes it
+        # pay, so it carries its own certified depth rather than a tuned one.
+        config["num_stages"] = _FASTTILE_NUM_STAGES
     if params.all_decode:
         total_num_q_blocks = params.num_seqs
     else:
