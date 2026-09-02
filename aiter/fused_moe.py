@@ -70,6 +70,14 @@ AUX_SORT_THREESTAGE = "threestage"
 AUX_SORT_OPUS = "opus"
 
 
+def _validate_output_aux(output_aux):
+    if output_aux and output_aux not in (AUX_SORT_THREESTAGE, AUX_SORT_OPUS):
+        raise ValueError(
+            f"unknown output_aux {output_aux!r}; expected "
+            f"{AUX_SORT_THREESTAGE!r} or {AUX_SORT_OPUS!r}"
+        )
+
+
 def _aux_uses_opus(output_aux, block_size, routed_rows=None, num_experts=None):
     """Pick the auxiliary sort: Opus (one CTA per expert) or the fused one.
 
@@ -1067,11 +1075,7 @@ def _fused_moe_impl(
         metadata = _metadata_transform(metadata)
 
     if output_aux:
-        if output_aux not in (AUX_SORT_THREESTAGE, AUX_SORT_OPUS):
-            raise ValueError(
-                f"unknown output_aux {output_aux!r}; expected "
-                f"{AUX_SORT_THREESTAGE!r} or {AUX_SORT_OPUS!r}"
-            )
+        _validate_output_aux(output_aux)
         # Only a re-selection: configs that do not ask for the aux arrays are
         # left alone, so this cannot switch a non-aux config into the aux path.
         if metadata.output_aux:
@@ -2071,7 +2075,7 @@ def _mxfp4_a4w4_stage1_fw(
         )
     BM = p1["BM"]
     if native_scale_layout is None:
-        native_scale_layout = native_scale_layout_for(BM)
+        native_scale_layout = native_scale_layout_for(BM, p1["out_dtype"])
     inline_quant = p1["inline_quant"]
     if w1.element_size() == 1 and w1.dtype != torch.uint8:
         w1 = w1.view(torch.uint8)
@@ -3394,6 +3398,7 @@ def fused_moe_2stages(
     output_aux: bool | str = False,
     output=None,
 ):
+    _validate_output_aux(output_aux)
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
     token_num, _ = hidden_states.shape
