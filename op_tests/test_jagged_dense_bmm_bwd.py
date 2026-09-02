@@ -15,7 +15,8 @@ in-memory synthetic dispatch table (no committed JSON fixture).
 
 Performance (``main()``, Mi=7680): FlyDSL vs upstream Triton on headline deployment
 shapes, swept over regime and backward component (``jagged`` / ``dense_bias`` / ``all``).
-Split-component timings reuse hoisted output buffers on both sides; Triton
+Split-component FlyDSL timings hoist output buffers and build launchers via
+``resolve_config`` + ``build_backward`` (same knobs as dispatch). Triton
 ``dense_bias`` still allocates ``d_bias`` internally each iteration (upstream API
 has no out-buffer for it), so that component comparison is slightly Triton-heavy
 vs FlyDSL.
@@ -261,14 +262,14 @@ def _build_flydsl_fn(jagged, dense, d_out, seq_offsets, B, Mi, N, K, component):
     """FlyDSL closures for perf timing.
 
     ``component == "all"`` uses the production dispatched wrapper (alloc + all
-    launches). ``jagged`` / ``dense_bias`` use raw launchers over pre-allocated
-    buffers for kernel-only timing. ``jagged`` is directly comparable to Triton;
-    ``dense_bias`` is not fully comparable because Triton allocates ``d_bias``
-    internally each call (see ``_build_triton_fn``).
+    launches). ``jagged`` / ``dense_bias`` hoist buffers and call memoized
+    launchers from ``resolve_config`` + ``build_backward`` (shipped schedule
+    knobs). ``jagged`` is directly comparable to Triton; ``dense_bias`` is not
+    fully comparable because Triton allocates ``d_bias`` internally each call
+    (see ``_build_triton_fn``).
     """
-    _bwd.configure_dim(K)
-    block_m = _bwd.BLOCK_M
-    split = _bwd.SPLIT
+    from aiter.ops.flydsl.jagged_dense_bmm_bwd_dispatch import resolve_config
+
     device = jagged.device
     total_rows = jagged.shape[0]
     stream = torch.cuda.current_stream()
@@ -288,6 +289,16 @@ def _build_flydsl_fn(jagged, dense, d_out, seq_offsets, B, Mi, N, K, component):
 
         return run_all
 
+    cfg = resolve_config(n_groups=B, reduction_k=K, output_n=N, max_seq_len=Mi)
+    bw = _bwd.build_backward(
+        K,
+        split=cfg["split"],
+        gj_stages_a=cfg["gj_stages_a"],
+        coarsen_m=cfg["coarsen_m"],
+    )
+    split = bw.split
+    block_m = _bwd.BLOCK_M
+
     t_d_out = flyc.from_dlpack(d_out).mark_layout_dynamic(leading_dim=1, divisibility=8)
 
     if component == "jagged":
@@ -300,22 +311,28 @@ def _build_flydsl_fn(jagged, dense, d_out, seq_offsets, B, Mi, N, K, component):
         )
 
         def run_jagged():
-            _bwd.grad_jagged(t_dj, t_d_out, dense_kn, seq_offsets, B, Mi, stream=stream)
+            bw.grad_jagged(t_dj, t_d_out, dense_kn, seq_offsets, B, Mi, stream=stream)
             return d_jagged[:total_rows]
 
         return run_jagged
 
     d_dense = torch.empty(B, K, N, dtype=dtypes.bf16, device=device)
     d_dense_v = d_dense.view(B * K, N)
-    dense_partials = torch.empty(B * split * K, N, dtype=torch.float32, device=device)
+    if split >= 2:
+        dense_partials = torch.empty(
+            B * split * K, N, dtype=torch.float32, device=device
+        )
+        bias_partials = torch.empty(B * split, N, dtype=torch.float32, device=device)
+    else:
+        dense_partials = torch.empty(1, N, dtype=torch.float32, device=device)
+        bias_partials = torch.empty(1, N, dtype=torch.float32, device=device)
     d_bias = torch.empty(B, N, dtype=dtypes.bf16, device=device)
-    bias_partials = torch.empty(B * split, N, dtype=torch.float32, device=device)
     t_jagged = flyc.from_dlpack(jagged).mark_layout_dynamic(
         leading_dim=1, divisibility=8
     )
 
     def run_dense_bias():
-        _bwd.grad_dense_bias(
+        bw.grad_dense_bias(
             d_dense_v,
             d_bias,
             t_jagged,
