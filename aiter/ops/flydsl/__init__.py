@@ -56,6 +56,7 @@ if is_flydsl_available():
         flydsl_pa_mqa_logits_fp4_prefill,
         flydsl_pa_mqa_logits_fp4_varqlen,
     )
+    from .gather_kv_b_proj import gather_kv_b_proj_flydsl
     from .kernels.qk_norm_rope_quant import flydsl_qk_norm_rope_quant
     from .mla_reduce_kernels import flydsl_mla_reduce_v1
     from .moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
@@ -77,5 +78,6 @@ if is_flydsl_available():
         "flydsl_pa_mqa_logits_fp4_varqlen",
         "flydsl_preshuffle_gemm_a8",
         "flydsl_qk_norm_rope_quant",
+        "gather_kv_b_proj_flydsl",
         # "flydsl_gdr_decode",
     ]
