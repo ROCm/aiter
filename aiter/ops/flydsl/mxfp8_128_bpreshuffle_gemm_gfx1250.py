@@ -90,6 +90,7 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
     cluster_n: int = 1,
     split_k: int = 1,
     x_scale_transposed: bool = True,
+    a_preshuffle: bool = False,
 ) -> Tensor:
     """Run the gfx1250 WMMA mxfp8_128 bpreshuffle GEMM.
 
@@ -205,6 +206,12 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
                 f"stride(0)={Out.stride(0)}"
             )
 
+    if a_preshuffle and M % 2 != 0:
+        raise RuntimeError(
+            f"[FlyDSL gfx1250 mxfp8_128] a_preshuffle needs M % 2 == 0, got M={M}; "
+            "shuffle_mxfp8fp4_a pairs adjacent A rows"
+        )
+
     if not x_scale_transposed:
         raise RuntimeError(
             "[FlyDSL gfx1250 mxfp8_128] x_scale_transposed=False is not supported "
@@ -252,7 +259,12 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
         True,
     )
     launch = _launch_gemm_a8w8_compute_bound if compute_bound else _launch_gemm_a8w8
-    launch(*launch_args, BLOCK_K, split_k)
+    # a_preshuffle is last on both launchers; the generic one has
+    # batched/preload_ks/batch in between, left at their defaults.
+    if compute_bound:
+        launch(*launch_args, BLOCK_K, split_k, a_preshuffle)
+    else:
+        launch(*launch_args, BLOCK_K, split_k, False, 0, 1, a_preshuffle)
     if partials is not None:
         dense = ldc == N
         _run_compiled(
@@ -272,7 +284,8 @@ NAME_SUFFIX_RE = (
     r"t(?P<tile_m>\d+)x(?P<tile_n>\d+)x(?P<tile_k>\d+)_"
     r"mw(?P<m_warp>\d+)_nw(?P<n_warp>\d+)_"
     r"nb(?P<num_buffers>\d+)_sk(?P<split_k>\d+)_"
-    r"cm(?P<cluster_m>\d+)_cn(?P<cluster_n>\d+)$"
+    r"cm(?P<cluster_m>\d+)_cn(?P<cluster_n>\d+)"
+    r"(?P<a_preshuffle>_apre)?$"
 )
 _KERNEL_NAME_RE = re.compile(rf"^{re.escape(WMMA_NAME_PREFIX)}_{NAME_SUFFIX_RE}")
 _COMPUTE_KERNEL_NAME_RE = re.compile(
@@ -283,9 +296,13 @@ _COMPUTE_KERNEL_NAME_RE = re.compile(
 def parse_wmma_kernel_name(name: str):
     """Parse a generic or compute-bound mxfp8_128 kernelName."""
     match = _COMPUTE_KERNEL_NAME_RE.fullmatch(name) or _KERNEL_NAME_RE.fullmatch(name)
-    return (
-        {key: int(value) for key, value in match.groupdict().items()} if match else None
-    )
+    if match is None:
+        return None
+    groups = match.groupdict()
+    a_preshuffle = groups.pop("a_preshuffle", None) is not None
+    cfg = {key: int(value) for key, value in groups.items()}
+    cfg["a_preshuffle"] = a_preshuffle
+    return cfg
 
 
 def compute_kernel_k_pair(num_buffers: int, tile_n: int) -> int:
@@ -313,12 +330,27 @@ def run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
     w_scale: Tensor,
     Out: Tensor,
     kernel_name: str,
+    a_is_preshuffled: bool = False,
 ) -> Tensor:
-    """Decode a tuned kernelName and dispatch its internal implementation."""
+    """Decode a tuned kernelName and dispatch its internal implementation.
+
+    ``a_is_preshuffled`` is the caller's assertion that XQ is already in
+    shuffle_mxfp8fp4_a's (2, 128) layout. Nothing about a tensor distinguishes
+    that from row-major, so an "_apre" kernel needs this explicit opt-in.
+    """
     cfg = parse_wmma_kernel_name(kernel_name)
     if cfg is None:
         raise ValueError(
             f"[FlyDSL gfx1250 mxfp8_128] unrecognised kernelName: {kernel_name!r}"
+        )
+    if cfg["a_preshuffle"] and not a_is_preshuffled:
+        raise ValueError(
+            f"[FlyDSL gfx1250 mxfp8_128] kernelName {kernel_name!r} selects "
+            "a_preshuffle, but the caller did not declare a preshuffled A. The "
+            "tuned-config dispatch forwards the model's row-major activation, so "
+            "this kernel would read it as (2, 128)-tiled and return wrong results. "
+            "Feed it shuffle_mxfp8fp4_a(A) and pass a_is_preshuffled=True "
+            '(config key "a_preshuffled_input") to opt in.'
         )
     return _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
         XQ,
@@ -337,4 +369,5 @@ def run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
         m_warp=cfg["m_warp"],
         n_warp=cfg["n_warp"],
         x_scale_transposed=True,
+        a_preshuffle=cfg["a_preshuffle"],
     )

@@ -56,9 +56,11 @@ def launch_gemm_a8w8_256x256(
     is_mxscale: Constexpr[bool],
     block_size: Constexpr[int],
     split_k: Constexpr[int] = 1,
+    a_preshuffle: Constexpr[bool] = False,
 ):
-    """N must be a multiple of ``tile_n * cluster_n``; M is unrestricted;
-    K must be divisible by 128 and at least 512 per split."""
+    """N must be a multiple of ``tile_n * cluster_n``; M is unrestricted (a
+    multiple of 2 when ``a_preshuffle``); K must be divisible by 128 and at
+    least 512 per split."""
 
     assert (tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers) in (
         (256, 256, 128, 2, 2, 4),
@@ -96,10 +98,17 @@ def launch_gemm_a8w8_256x256(
     UNROLL = KPAIR * num_buffers
     SUPER_K = tile_k * KPAIR
     LDS_PAD_A = 16
-    A_LDS_ROW = SUPER_K + LDS_PAD_A
+    # A-preshuffle: A is shuffle_mxfp8fp4_a-tiled, [M, K] -> [M/2, K/128, 2, 128],
+    # so the TDM walks tile_m/2 segments of 2*SUPER_K instead of tile_m of SUPER_K.
+    # Only A's LDS addressing changes; the WMMA fragment order does not.
+    A_PAIR = 2 if a_preshuffle else 1
+    assert not a_preshuffle or tile_m % 2 == 0, "a_preshuffle needs an even tile_m"
+    A_LDS_ROWS = tile_m // A_PAIR
+    A_TDM_ROW = A_PAIR * SUPER_K
+    A_LDS_ROW = A_TDM_ROW + LDS_PAD_A
     C_LDS_ROW = tile_n + 8
     B_LDS_ROW = PACK_TK * 16 * KPAIR
-    STAGE_A = tile_m * A_LDS_ROW
+    STAGE_A = A_LDS_ROWS * A_LDS_ROW
     STAGE_B = (tile_n // 16) * B_LDS_ROW
     SC_K = K_WS * KPAIR
     # block128 stages SC_K K-blocks per slot; the TDM lands their rows contiguously.
@@ -125,7 +134,7 @@ def launch_gemm_a8w8_256x256(
     kernel_name = format_kernel_name(
         f"gemm_a8w8_mx{block_size}_compute_t{tile_m}x{tile_n}x{tile_k}"
         f"_mw{m_warp}_nw{n_warp}_nb{num_buffers}_sk{split_k}"
-        f"_cm{cluster_m}_cn{cluster_n}"
+        f"_cm{cluster_m}_cn{cluster_n}" + ("_apre" if a_preshuffle else "")
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
@@ -173,6 +182,9 @@ def launch_gemm_a8w8_256x256(
         blk_m64 = fx.Int64(blk_m)
         blk_n64 = fx.Int64(blk_n)
         mn_oob = i32_m - blk_m  # valid M rows (A / C)
+        # A's TDM bound is in row pairs; C and the A-scale stay on rows. Shift,
+        # not `// 2`, which flydsl lowers with a truncating-division fixup.
+        a_oob = (mn_oob + 1) >> 1 if const_expr(a_preshuffle) else mn_oob
         sa_oob = (i32_m + 31) // 32 - blk_m // 32  # valid M-supers (scale-A)
 
         arena = fx.SharedAllocator(static=False)
@@ -194,7 +206,9 @@ def launch_gemm_a8w8_256x256(
         gB_base = fx.recast_iter(fx.Int8, arg_b)
 
         k_elem0 = kt_base * tile_k
-        a_off0 = blk_m64 * lda64 + k_elem0
+        # (blk_m/2)*(2*lda) == blk_m*lda, so lda stays the unshuffled K; only the
+        # split-K byte offset doubles, K element kk sitting at byte 2*kk of its pair.
+        a_off0 = blk_m64 * lda64 + k_elem0 * A_PAIR
         b_off0 = (blk_n64 // 16) * Kp16 + k_elem0 * 16
         if const_expr(mx32):
             sa_off0 = (blk_m64 // 32) * k64 + k_elem0
@@ -204,7 +218,7 @@ def launch_gemm_a8w8_256x256(
             sa_off0 = blk_m64 + scale_k0 * fx.Int64(i32_stride_ascale_k)
             sb_off0 = (blk_n64 // 128) * (k64 // 128) + scale_k0
 
-        gA = _gv(gA_base, a_off0, (tile_m, tile_k), (tile_k, 1))
+        gA = _gv(gA_base, a_off0, (A_LDS_ROWS, A_PAIR * tile_k), (A_PAIR * tile_k, 1))
         gB = _gv(
             gB_base,
             b_off0,
@@ -237,13 +251,13 @@ def launch_gemm_a8w8_256x256(
                 tensor, offset, shape, lds_stride = (
                     gA,
                     PLANAR_A_BASE,
-                    (tile_m, SUPER_K),
+                    (A_LDS_ROWS, A_TDM_ROW),
                     A_LDS_ROW,
                 )
                 stride, mask, bound, pad, early = (
-                    i32_lda,
+                    i32_lda * A_PAIR,
                     a_mask,
-                    mn_oob,
+                    a_oob,
                     LDS_PAD_A,
                     True,
                 )
@@ -442,7 +456,22 @@ def launch_gemm_a8w8_256x256(
             [],
         )
         sa_row, sb_col = wmb + lane, wnb + lane
-        a_byte = fx.index_cast(T.index, (wmb + lane16) * A_LDS_ROW + kgrp * 16)
+        # Fragment row `wmb + lane16 + idx*16`, K byte `par*128 + kgrp*16 + 32*j`.
+        # Preshuffled, that row is half (row%2) of pair (row//2)'s `par`-th 256B
+        # chunk, so 16 rows is 8 pairs and `par` steps 256B.
+        if const_expr(a_preshuffle):
+            # warp_tile_m is a multiple of 16, so the pair index halves at compile
+            # time and lane16 alone decides parity: shift/mask, not `//` and `%`,
+            # which lower to a signed-division fixup.
+            a_pair = wave_m * (warp_tile_m // 2) + (lane16 >> 1)
+            a_byte = fx.index_cast(
+                T.index,
+                a_pair * A_LDS_ROW + (lane16 & 1) * WMMA_K + kgrp * 16,
+            )
+            a_par_step, a_frag_row_step = A_PAIR * tile_k, (16 // A_PAIR) * A_LDS_ROW
+        else:
+            a_byte = fx.index_cast(T.index, (wmb + lane16) * A_LDS_ROW + kgrp * 16)
+            a_par_step, a_frag_row_step = tile_k, 16 * A_LDS_ROW
         b_byte = fx.index_cast(
             T.index,
             (wnb // 16) * B_LDS_ROW + kgrp * 256 + lane16 * 16,
@@ -466,7 +495,7 @@ def launch_gemm_a8w8_256x256(
         for addr_stage in range_constexpr(UNROLL):
             slot, par = addr_stage // KPAIR, addr_stage % KPAIR
             stage_a_addr.append(
-                _planar_base(PLANAR_A_BASE, STAGE_A, slot) + a_byte + par * tile_k
+                _planar_base(PLANAR_A_BASE, STAGE_A, slot) + a_byte + par * a_par_step
             )
             stage_b_addr.append(
                 _planar_base(PLANAR_B_BASE, STAGE_B, slot) + b_byte + par * PACK_TK * 16
@@ -488,7 +517,7 @@ def launch_gemm_a8w8_256x256(
 
         def _frag_geom(kind, stage):
             if const_expr(kind == "a"):
-                return stage_a_addr[stage], 16 * A_LDS_ROW, 32
+                return stage_a_addr[stage], a_frag_row_step, 32
             return stage_b_addr[stage], B_LDS_ROW, 512
 
         def _join(v):
