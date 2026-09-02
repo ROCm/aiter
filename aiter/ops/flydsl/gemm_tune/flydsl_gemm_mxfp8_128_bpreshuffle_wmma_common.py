@@ -71,6 +71,9 @@ class WmmaKernelInstance:
     m_warp: int = 2
     n_warp: int = 2
     name_prefix: str = NAME_PREFIX
+    # A in shuffle_mxfp8fp4_a's (2, 128) tiling. Opt-in: it constrains M to %2
+    # and needs the caller to hand over an already-shuffled A.
+    a_preshuffle: bool = False
 
     @property
     def name(self) -> str:
@@ -78,6 +81,7 @@ class WmmaKernelInstance:
             f"{self.name_prefix}_t{self.tile_m}x{self.tile_n}x{self.tile_k}_"
             f"mw{self.m_warp}_nw{self.n_warp}_nb{self.num_buffers}_sk{self.split_k}_"
             f"cm{self.cluster_m}_cn{self.cluster_n}"
+            + ("_apre" if self.a_preshuffle else "")
         )
 
 
@@ -140,7 +144,8 @@ def kernel_instance_estimated_lds_bytes(ki: WmmaKernelInstance) -> int:
 
     a_scale_bytes, b_scale_bytes = _mxfp8_128_stage_scale_bytes(ki)
 
-    lds_a_data = ki.tile_m * (ki.tile_k + _LDS_PAD_A_BYTES)
+    a_pair = 2 if ki.a_preshuffle else 1
+    lds_a_data = (ki.tile_m // a_pair) * (a_pair * ki.tile_k + _LDS_PAD_A_BYTES)
     lds_b_data = ki.tile_n * ki.tile_k
     stage_bytes = (
         _align_up(lds_a_data, 16)
@@ -204,6 +209,10 @@ kernels_list: dict[int, WmmaKernelInstance] = _build_kernels_list()
 def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
     """Return True iff ``ki`` can be launched for runtime shape ``(M, N, K)``."""
 
+    # Row pairs need both rows, so an odd M has no valid pairing.
+    if ki.a_preshuffle and M % 2 != 0:
+        return False
+
     if is_compute_kernel(ki):
         profile = (
             ki.tile_m,
@@ -218,6 +227,10 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
         if profile not in _COMPUTE_PROFILES:
             return False
         if (ki.cluster_m, ki.cluster_n) not in _COMPUTE_CLUSTERS:
+            return False
+        # Compute-bound kernels allocate a full tile_m tile; unlike sync WMMA they
+        # must not launch when M < tile_m (cluster barrier hang on decode M).
+        if M < ki.tile_m:
             return False
         if N % (ki.tile_n * ki.cluster_n) != 0:
             return False

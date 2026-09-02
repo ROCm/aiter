@@ -56,10 +56,24 @@ def launch_gemm_a8w8(
     batched: Constexpr[bool] = False,
     preload_ks: Constexpr[int] = 0,
     batch: fx.Int32 = 1,
+    a_preshuffle: Constexpr[bool] = False,
 ):
     mx32 = is_mxscale and block_size == 32
     mx128 = is_mxscale and block_size == 128
     preload = preload_ks > 0
+    # A-preshuffle: A is shuffle_mxfp8fp4_a-tiled, [M, K] -> [M/2, K/128, 2, 128],
+    # so the TDM walks tile_m/2 segments of 2*tile_k instead of tile_m of tile_k.
+    # Only A's LDS addressing changes; the WMMA fragment order does not.
+    A_PAIR = 2 if a_preshuffle else 1
+    if a_preshuffle and batched:
+        raise ValueError(
+            "[FlyDSL gfx1250] a_preshuffle is 2-D only: the batched A layout is "
+            "[M, B, K], which shuffle_mxfp8fp4_a does not describe"
+        )
+    if a_preshuffle and tile_m % 2 != 0:
+        raise ValueError(
+            f"[FlyDSL gfx1250] a_preshuffle needs an even tile_m, got {tile_m}"
+        )
     if batched and not (mx128 and split_k == 1):
         raise ValueError(
             "[FlyDSL gfx1250] the batched path needs mx128 and split_k==1, got "
@@ -90,9 +104,11 @@ def launch_gemm_a8w8(
     block = num_waves * WAVE
 
     LDS_PAD_A = 16
-    A_LDS_ROW = tile_k + LDS_PAD_A
+    A_LDS_ROWS = tile_m // A_PAIR
+    A_TDM_ROW = A_PAIR * tile_k
+    A_LDS_ROW = A_TDM_ROW + LDS_PAD_A
     B_LDS_ROW = tile_k * 16
-    STAGE_A = ((tile_m * A_LDS_ROW + 15) // 16) * 16
+    STAGE_A = ((A_LDS_ROWS * A_LDS_ROW + 15) // 16) * 16
     STAGE_B = (((tile_n // 16) * B_LDS_ROW + 15) // 16) * 16
     ALIGNED_N = tile_n % 128 == 0 or 128 % tile_n == 0
     _period = math.lcm(tile_n, 128)
@@ -148,6 +164,7 @@ def launch_gemm_a8w8(
         f"_cm{cluster_m}_cn{cluster_n}"
         + ("_mbn" if batched else "")
         + (f"_pre{preload_ks}" if preload else "")
+        + ("_apre" if a_preshuffle else "")
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
@@ -189,6 +206,9 @@ def launch_gemm_a8w8(
         blk_m64 = fx.Int64(blk_m)
         blk_n64 = fx.Int64(blk_n)
         mn_oob = i32_m - blk_m  # valid M rows (A / C, and mx128's per-row A-scale)
+        # A's TDM bound is in row pairs; C and the A-scale stay on rows. Shift,
+        # not `// 2`, which flydsl lowers with a truncating-division fixup.
+        a_oob = (mn_oob + 1) >> 1 if const_expr(a_preshuffle) else mn_oob
         nb_oob = stride_ask64 = sa_oob = None
         if const_expr(mx32):
             sa_oob = (i32_m + 31) // 32 - blk_m // 32  # valid M super-rows (scale-A)
@@ -229,14 +249,16 @@ def launch_gemm_a8w8(
             b_off0 = b_off0 + bz64 * fx.Int64(i32_n) * k64
 
         W_A, W_B = 0, 1
-        gA = _gv(gA_base, a_off0, (tile_m, tile_k), (tile_k, 1))
+        # (blk_m/2)*(2*lda) == blk_m*lda, so a_off0 is unchanged and lda stays
+        # the unshuffled K.
+        gA = _gv(gA_base, a_off0, (A_LDS_ROWS, A_TDM_ROW), (A_TDM_ROW, 1))
         atomA = fx.atom_set_value(
             fx.rocdl.make_tdm_atom(
                 gA,
-                [mn_oob, None],
-                strides=[lda64, None],
+                [a_oob, None],
+                strides=[lda64 * A_PAIR, None],
                 num_warps=1,
-                pad_interval=tile_k,
+                pad_interval=A_TDM_ROW,
                 pad_amount=LDS_PAD_A,
                 early_timeout=True,
             ),
@@ -319,7 +341,11 @@ def launch_gemm_a8w8(
             pa = _buf_ptr(s)
             ktg = fx.Int64(kt) if kt_base is None else fx.Int64(kt) + kt_base
             _wcopy(
-                W_A, atomA, gA, _lv(pa, (tile_m, tile_k), (A_LDS_ROW, 1)), ktg * tile_k
+                W_A,
+                atomA,
+                gA,
+                _lv(pa, (A_LDS_ROWS, A_TDM_ROW), (A_LDS_ROW, 1)),
+                ktg * A_TDM_ROW,
             )
             _wcopy(
                 W_B,
@@ -376,10 +402,35 @@ def launch_gemm_a8w8(
         wmb = wave_m * warp_tile_m
         wnb = wave_n * warp_tile_n
 
+        # Hoisted out of load_a so the per-(wm, ks) part stays a Python int and
+        # folds into the ds_load immediate; inline it costs an address VGPR each.
+        # warp_tile_m and WMMA_M are multiples of 16, so the pair index halves at
+        # compile time and lane16 alone decides parity: shift/mask, not `//` and
+        # `%`, which lower to a signed-division fixup in the K loop.
+        a_pair_base = (
+            fx.Int64(
+                (wave_m * (warp_tile_m // 2) + (lane16 >> 1)) * A_LDS_ROW
+                + (lane16 & 1) * WMMA_K
+                + kgrp * 16
+            )
+            if const_expr(a_preshuffle)
+            else None
+        )
+
         def load_a(buf, wm, ks):
-            row = wmb + wm * 16 + lane16
-            b0 = fx.Int64(row * A_LDS_ROW + ks * WMMA_K + kgrp * 16)
-            v = [Vec(lds_load_b128(buf, b0 + 32 * j)) for j in range_constexpr(4)]
+            if const_expr(a_preshuffle):
+                # Byte kb = ks*128 + kgrp*16 + 32*j sits at chunk ks*256 of the
+                # row's pair, then that row's half of the chunk, then kb % 128.
+                b0 = a_pair_base
+                off0 = wm * ((WMMA_M // 2) * A_LDS_ROW) + ks * (2 * WMMA_K)
+            else:
+                row = wmb + wm * 16 + lane16
+                b0 = fx.Int64(row * A_LDS_ROW + ks * WMMA_K + kgrp * 16)
+                off0 = 0
+            v = [
+                Vec(lds_load_b128(buf, b0 + (off0 + 32 * j)))
+                for j in range_constexpr(4)
+            ]
             v01 = v[0].shuffle(v[1], list(range(8)))
             v23 = v[2].shuffle(v[3], list(range(8)))
             return v01.shuffle(v23, list(range(16)))
