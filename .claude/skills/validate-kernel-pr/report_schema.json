@@ -78,6 +78,13 @@
         },
         "junit_xml": {
           "type": "string"
+        },
+        "observed_work": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Route calls counted in this run's own execution receipt. `null` means no route was named, so nothing was watched; 0 means a route was watched for and never reached. A script target's `executed` is a liveness signal and is not a case count."
         }
       }
     },
@@ -350,14 +357,114 @@
           "type": "string",
           "minLength": 1
         },
+        "shape_argnames": {
+          "type": "string",
+          "description": "Comma-separated pytest parameter names the independent grid replaced, or an empty string when another channel or no channel was used."
+        },
         "grid_channel": {
+          "type": "string",
           "enum": [
-            "cli-flag",
-            "env-var",
-            "cli-flag-unusable",
-            "none"
+            "",
+            "cli",
+            "env",
+            "pytest"
           ],
-          "description": "Which channel carried the S1 grid, and therefore which hook was proven. 'cli-flag-unusable' means --shape-arg was named for a target that does not run as a script, so argv never reaches it -- a fact about the request, not about the target."
+          "description": "Which channel actually delivered the independent grid. Empty when none was established. Declared but deliberately NOT required, so reports from earlier validators stay valid."
+        },
+        "grid_channel_reason": {
+          "type": "string",
+          "description": "When no channel was established, names each channel tried and what was found in the target -- so a limit of the validator is never published as a property of the target."
+        },
+        "grid_independence": {
+          "type": "string",
+          "enum": [
+            "adds-coverage",
+            "duplicates-target-defaults",
+            "unknown"
+          ],
+          "description": "Whether the requested grid cells ask for anything outside the target's own declared default for the same channel. A proven hook says the target CONSUMES the grid; this says whether the grid adds coverage."
+        },
+        "grid_independence_reason": {
+          "type": "string"
+        },
+        "axis_state": {
+          "type": "string",
+          "enum": [
+            "none",
+            "declared",
+            "proven",
+            "hook-not-found",
+            "hook-not-consumed",
+            "unusable"
+          ],
+          "description": "How far the requested extra axes got. Only `proven` means every axis flag was observed refusing a deliberately invalid value and its values rode the grid run."
+        },
+        "axis_state_reason": {
+          "type": "string"
+        },
+        "runner_risk": {
+          "type": "string",
+          "description": "A structural reason the SELECTED runner may be unable to run this target, e.g. a module body that parses argv, which pytest executes at collection with its own argv."
+        },
+        "axes": {
+          "type": "array",
+          "description": "Extra independent test axes, each on its own CLI flag. The shape grid is one ordered tuple on one channel; an axis is a separate knob the shape flag cannot reach, such as a head count.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "flag": {
+                "type": "string"
+              },
+              "values": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "hook_proof": {
+                "type": "string",
+                "enum": [
+                  "flag-declared-in-add_argument",
+                  "flag-not-declared",
+                  "malformed-axis-spec",
+                  "not-evaluated"
+                ]
+              },
+              "target_defaults": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "novel_values": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "independence": {
+                "type": "string",
+                "enum": [
+                  "adds-coverage",
+                  "duplicates-target-defaults",
+                  "unknown"
+                ]
+              }
+            },
+            "required": [
+              "name",
+              "flag",
+              "values",
+              "hook_proof"
+            ]
+          }
+        },
+        "runner_risk": {
+          "type": "string",
+          "description": "A structural reason the SELECTED runner may be unable to run this target, e.g. a module body that parses argv, which pytest executes at collection with its own argv."
         }
       }
     },
@@ -562,9 +669,41 @@
                 "type": "string"
               }
             },
+            "shape_namespace": {
+              "type": "string",
+              "minLength": 1
+            },
+            "shape_capture": {
+              "type": "object",
+              "description": "Present only when shape capture was requested and produced no rows. A receipt carrying this asserts route execution and makes no claim about shapes.",
+              "properties": {
+                "requested": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "observed": {
+                  "type": "integer"
+                },
+                "note": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "required": [
+                "requested",
+                "observed",
+                "note"
+              ]
+            },
             "receipt_sha256": {
               "type": "string",
               "pattern": "^[0-9a-f]{64}$"
+            },
+            "receipt_scope": {
+              "type": "string",
+              "description": "Which of the head-phase runs the published receipt describes."
             }
           }
         },
@@ -693,6 +832,27 @@
                   "type": "string"
                 }
               }
+            },
+            "baseline_method": {
+              "type": "string",
+              "enum": [
+                "patch-reversed-same-worktree",
+                "target-transplant"
+              ],
+              "description": "How the baseline was obtained. `target-transplant` copies a PR-added target into the base tree to time the pre-PR implementation through the same harness, and is only reported alongside a control column that reproduced across the two trees."
+            },
+            "control_column": {
+              "type": "string"
+            },
+            "control_ratio": {
+              "type": "number"
+            },
+            "control_note": {
+              "type": "string"
+            },
+            "row_key_basis": {
+              "type": "string",
+              "description": "How rows were paired across base and head; a relaxed key means the target printed an unlabeled measurement column."
             }
           }
         }

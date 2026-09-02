@@ -107,6 +107,12 @@ if [ ! -x "$SCAN" ]; then
   echo "required scanner is missing or not executable: $SCAN" >&2
   exit 1
 fi
+# The scan is an AST pass, so it needs each changed file's post image. The diff names the
+# post-image blob of every hunk, and fetching the PR head puts those blobs in the local object
+# store, where `git cat-file` reaches them without a second worktree. Without this the scan
+# still runs, but reports the files as NOT SCANNED rather than silently reporting no findings.
+git fetch -q origin "refs/pull/$PR/head" 2>/dev/null || \
+  echo "note: could not fetch the PR head; the index-width scan will report unscanned files" >&2
 if ! "$SCAN" --diff "$WORK/pr.diff"; then
   echo "required index-width scan failed; do not report an empty candidate list" >&2
   exit 1
@@ -395,11 +401,21 @@ if [ -z "$VALIDATION_REPORT" ] \
     # Route and shape knowledge cannot be derived from a diff, so without these the receipt
     # and grid stages skip and the run tops out at INCONCLUSIVE by construction. That is a
     # limit of what a diff tells you, not a defect in the PR -- Step 8 must say so.
+    # When a grid is supplied and no channel carries it, the report's
+    # test_selection.grid_channel_reason names each channel tried, what was found in the
+    # target, and which channels the target does offer -- so a wrong guess costs one run
+    # rather than a reading of the target's source.
     AUTO_ARGS=()
     [ -n "${REVIEW_EXPECTED_ROUTE:-}" ] && AUTO_ARGS+=(--expected-route "$REVIEW_EXPECTED_ROUTE")
     [ -n "${REVIEW_SHAPE_VARS:-}" ] && AUTO_ARGS+=(--shape-vars "$REVIEW_SHAPE_VARS")
     [ -n "${REVIEW_SHAPE_ENV:-}" ] && AUTO_ARGS+=(--shape-env "$REVIEW_SHAPE_ENV")
     [ -n "${REVIEW_SHAPE_ARG:-}" ] && AUTO_ARGS+=(--shape-arg "$REVIEW_SHAPE_ARG")
+    # The pytest-parametrization channel reaches targets neither of the other two can: none of
+    # the seven files in op_tests/flydsl_tests/ reads a shape env var or parses a shape flag,
+    # and all of them declare shapes as literals in @pytest.mark.parametrize. Without this the
+    # channel exists but no auto-validated review can use it.
+    [ -n "${REVIEW_SHAPE_ARGNAMES:-}" ] \
+      && AUTO_ARGS+=(--shape-argnames "$REVIEW_SHAPE_ARGNAMES")
     [ -n "${REVIEW_GRID:-}" ] && AUTO_ARGS+=(--grid "$REVIEW_GRID")
     echo "auto-validation: running $AUTO_TARGET for PR #$PR (minutes, needs an idle GPU)"
     # BLOCK, NEEDS_WORK and INCONCLUSIVE all still write a report worth consuming, so the
@@ -547,7 +563,11 @@ for stage_name in ("correctness_repo_tests", "correctness_s1_grid"):
         stat_keys = ("tests", "failures", "errors", "skipped", "executed")
         if any(type(stats.get(key)) is not int for key in stat_keys):
             raise SystemExit(f"{stage_name} has malformed execution counters")
-        if stats["executed"] != stats["tests"] - stats["skipped"]:
+        # errors are collection and fixture failures: the test body never ran, so they are
+        # not executed tests. The two sides of this equality disagreed only when errors > 0 --
+        # which is exactly the shape of a report carrying a real runtime blocker, so a report
+        # that had correctly found one was rejected here and could not be used.
+        if stats["executed"] != stats["tests"] - stats["skipped"] - stats["errors"]:
             raise SystemExit(f"{stage_name} has inconsistent execution counters")
     elif stage["status"] == "pass":
         raise SystemExit(f"{stage_name} passed without execution counters")
@@ -559,13 +579,24 @@ for stage_name in ("correctness_repo_tests", "correctness_s1_grid"):
     ):
         raise SystemExit(f"{stage_name} has a hollow or contradictory pass")
 receipt = report["stages"]["execution_receipt"]
-required_shapes = [shape.strip() for shape in selection.get("grid", "").split(";") if shape.strip()]
+# Only a grid that was actually DELIVERED imposes required shapes. A grid the caller supplied
+# for a target with no channel to receive it was still being turned into a requirement here,
+# so the receipt's honest empty list read as a contradiction and the report was rejected --
+# discarding exactly the runs that carried the accurate "no channel" diagnostic.
+required_shapes = (
+    [shape.strip() for shape in selection.get("grid", "").split(";") if shape.strip()]
+    if selection.get("grid_channel")
+    else []
+)
 if receipt.get("status") == "pass" and (
     receipt.get("producer") != "validate-kernel-pr.validation_probe"
     or receipt.get("route") != selection["expected_route"]
     or selection["expected_route"] not in receipt.get("kernel_symbols", [])
     or sorted(set(receipt.get("required_shapes", []))) != sorted(set(required_shapes))
-    or not set(required_shapes).issubset(set(receipt.get("executed_shapes", [])))
+    or (
+        selection.get("grid_channel") != "pytest"
+        and not set(required_shapes).issubset(set(receipt.get("executed_shapes", [])))
+    )
 ):
     raise SystemExit("execution receipt contradicts the selected route/grid")
 severities = {
@@ -1030,11 +1061,11 @@ Trigger: new Python wrapper that calls a `@compile_ops` or C-extension kernel; c
 **D9 — INT32 overflow in GPU pointer arithmetic** 🔴
 C++ kernel launcher or Python wrapper computes a buffer offset, record count, or index in `int32` (or Python `torch.int32`) when the product of dimensions can exceed 2^31 (~2 billion) at production scale.
 Common patterns: `token_id * (num_heads * head_dim)` overflows at token_id > 16M with H=32, D=128; `seq_start * K` overflows for long-context at seq_start > 256K with K=8192; gfx1250 TDM block descriptor count fields computed as Python int default to int64 — a missing `.to(torch.int32)` cast silently produces wrong offsets.
-Trigger (structural, NOT a name list): any **index-shaped value multiplied by a stride-shaped value** that produces a buffer address, record count, or array index, on a line carrying no explicit 64-bit widening (`tl.int64` / `gl.int64` annotation, `.to(tl.int64)`, `Int64(...)`, `int64_t`, `static_cast<int64_t>`). Index-shaped covers anything ending in `_id`/`_idx`/`pid`, or naming a block, row, token, slot, page, or sequence position; stride-shaped covers `stride_*`, `*_pitch`, and per-element/per-row extents. Also fires on a TDM descriptor field feeding block offset computation without an explicit int32 cast.
-**Why the trigger is structural:** an earlier version of this rule listed the names `token_id`, `seq_start`, `batch_offset`, `total_tokens`. Three real defects used none of them — `stride_out_batch`, `block_id`, `physical_block`, `context_kv_idx` — and the rule stayed silent on all three (aiter#1674 ×2, aiter#3541). Do not narrow it back to a name list.
+Trigger (structural, NOT a name list): a multiplication that feeds pointer or index arithmetic, where at least one operand derives from a **non-`constexpr` parameter of the enclosing kernel** — a value supplied at runtime, which is the only kind that can grow past 2^31 — and no operand is widened to 64 bits, counting a widening applied on an earlier line and carried in through a local name. `constexpr` tile constants bound the product at compile time and are excluded. Also fires on a TDM descriptor field feeding block offset computation without an explicit int32 cast.
+**Why the trigger is structural, and why saying so was not enough:** an earlier version of this rule listed the names `token_id`, `seq_start`, `batch_offset`, `total_tokens`. Three real defects used none of them — `stride_out_batch`, `block_id`, `physical_block`, `context_kv_idx` — and the rule stayed silent on all three (aiter#1674 ×2, aiter#3541). The rule text was then rewritten to say "structural" while still defining index-shaped and stride-shaped by name, and the scanner behind it matched two name lists against operand text. Measured on aiter#4978, the PR that introduced the `moe_wgrad` overflow later fixed by #5132: **0 of the real defect lines were reported**, the one `moe_wgrad` candidate emitted was an already-`int64` line, and 390 candidates were produced overall. The scanner is now an AST pass with no name lists at all; on the same diff it reports 4 of 4, and on #5132 it reports none. Do not narrow it back to a name list.
 **Production scale.** Step 1 printed `validate-kernel-pr/production_scale.md` directly beneath the candidate list: pool sizes, batch limits and stride semantics that the diff does not contain. Use those numbers to name the triggering case the 🔴 gate requires; if none of them puts the product past 2^31, clear the candidate and say so.
 
-**The candidate list is already in context.** Step 1 ran `scan_index_width.py` over the diff and printed every index×stride site with no 64-bit widening, plus every stride-like kernel param with no width annotation. Work that list: clear each candidate, and fire D9 only where you can name the production scale at which the product exceeds 2^31. If the list is empty, say so rather than skipping the category silently.
+**The candidate list is already in context.** Step 1 ran `scan_index_width.py` over the diff and printed, per file, every distinct index×stride expression reaching pointer arithmetic with no 64-bit widening. Work that list: clear each candidate, and fire D9 only where you can name the production scale at which the product exceeds 2^31. If the list is empty, say so rather than skipping the category silently. **If the scan printed a `NOT SCANNED` section, D9 cannot be cleared** — those files were never examined, and an empty candidate list that excluded them is not evidence of absence. Report the unscanned files instead of reporting no candidates.
 Real examples: `out_base = token_id * num_heads * head_dim` in int32 overflows at scale (PR#3844); forward kernel uses `Int32(seq_start) * Int32(K)` while the backward kernel correctly uses int64 (PR#4113).
 → `🔴 D9: [index expr] in int32 — widen [index operand] to int64 before multiplying by [stride], overflows at [concrete production scale]`
 

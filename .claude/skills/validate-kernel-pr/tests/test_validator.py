@@ -1,3 +1,4 @@
+import fcntl
 import json
 import os
 import re
@@ -30,12 +31,11 @@ REQUIRED_STAGES = {
     "execution_receipt",
     "index_width_scan",
 }
+
+
 # Stages that may be absent without making a report incomplete. `perf` runs only when the
-# target exposes a benchmark harness and both phases completed, so its presence is a
-# property of the PR under test rather than of the validator. Asserting an exact stage set
-# would turn every optional stage into a failure in every test in this file; asserting a
-# subset plus this allowlist keeps the real intent -- every required stage present and
-# well-formed, and nothing unrecognised sitting alongside them.
+# target exposes a benchmark harness and both phases completed, so asserting an exact stage
+# set would turn an optional stage into a failure in every test in this file.
 OPTIONAL_STAGES = {"perf"}
 
 
@@ -153,7 +153,7 @@ class ValidatorFixture:
             "def amdsmi_init(): pass\n"
             "def amdsmi_shut_down(): pass\n"
             "def amdsmi_get_processor_handles(): return ['gpu0']\n"
-            "def amdsmi_get_gpu_enumeration_info(handle): return {'hip_id': 7}\n"
+            "def amdsmi_get_gpu_enumeration_info(handle): return {'hip_id': 57}\n"
             "def amdsmi_get_gpu_asic_info(handle):\n"
             "    return {'market_name': 'Synthetic GPU', "
             "'target_graphics_version': 'gfx-test'}\n"
@@ -163,7 +163,11 @@ class ValidatorFixture:
             "    return {'vram_used': 256, 'vram_total': 294912}\n"
         )
         self.picker = self.tools / "pick-idle-gpu.py"
-        write_executable(self.picker, "#!/usr/bin/env bash\nprintf '7\\n'\n")
+        # 57 is deliberately NOT a real device index on any host this suite runs on. The
+        # validator locks /tmp/gpu-<index>.lock for whatever index it claims, so a fixture
+        # that named a real GPU would contend with anything genuinely using that device --
+        # and report NO_GPU for a reason that has nothing to do with the code under test.
+        write_executable(self.picker, "#!/usr/bin/env bash\nprintf '57\\n'\n")
 
     def close(self):
         self.tempdir.cleanup()
@@ -209,6 +213,99 @@ class ValidatorFixture:
         patch_path.write_text(patch)
         run(["git", "reset", "--hard", "-q", "HEAD"], cwd=self.repo)
         return patch_path
+
+    def validate(
+        self,
+        patch,
+        tests="tests/test_sample.py",
+        picker=None,
+        path_prefix=None,
+        pylib=None,
+        grid=True,
+        expected_route="test_sample:run_kernel",
+        grid_value="7,257,f32",
+        python_bin=None,
+        perf=True,
+        shape_env="VALIDATOR_TEST_GRID",
+        shape_arg=None,
+        shape_argnames=None,
+        shape_vars="M,N,dtype_str",
+        tol_table="f32=1e-5,f16=2e-3,bf16=1e-2",
+        use_picker_env=True,
+        cwd=None,
+        axes=(),
+        perf_control_column=None,
+        runner=None,
+    ):
+        report = self.root / f"{patch.stem}-report.json"
+        # `cwd` exists for one reason: the validator has to accept RELATIVE --patch/--out from
+        # whatever directory the caller happens to be in. Passing them absolute, as every other
+        # test does, cannot see a path resolved against the wrong base.
+        patch_arg = os.path.relpath(patch, cwd) if cwd else str(patch)
+        report_arg = os.path.relpath(report, cwd) if cwd else str(report)
+        command = [
+            str(VALIDATOR),
+            "--repo",
+            str(self.repo),
+            "--patch",
+            patch_arg,
+            "--head-sha",
+            "b" * 40,
+            "--target",
+            tests,
+            "--expected-route",
+            expected_route,
+            "--shape-vars",
+            shape_vars,
+            "--tol-table",
+            tol_table,
+            "--label",
+            patch.stem,
+            "--out",
+            report_arg,
+        ]
+        if grid:
+            if shape_env:
+                command.extend(["--shape-env", shape_env])
+            command.extend(["--grid", grid_value])
+        if shape_arg:
+            command.extend(["--shape-arg", shape_arg])
+        if shape_argnames:
+            command.extend(["--shape-argnames", shape_argnames])
+        for axis in axes:
+            command.extend(["--axis", axis])
+        if perf_control_column:
+            command.extend(["--perf-control-column", perf_control_column])
+        if runner:
+            command.extend(["--runner", runner])
+        if not perf:
+            command.append("--no-perf")
+        environment = os.environ.copy()
+        # Some tests exercise the validator's own PICKER resolution order, which only
+        # runs when the caller has not pinned one.
+        if use_picker_env:
+            environment["PICKER"] = str(picker or self.picker)
+        else:
+            environment.pop("PICKER", None)
+        environment["PYTHONPATH"] = str(self.fake_modules)
+        environment["TIMEOUT"] = "30"
+        if python_bin:
+            environment["PYTHON_BIN"] = str(python_bin)
+        if pylib:
+            environment["PYLIB"] = str(pylib)
+        if path_prefix:
+            environment["PATH"] = f"{path_prefix}:{environment['PATH']}"
+        result = run(command, env=environment, cwd=cwd, check=False)
+        if not report.exists():
+            raise AssertionError(
+                f"validator did not write a report\nstdout:\n{result.stdout}\n"
+                f"stderr:\n{result.stderr}"
+            )
+        data = json.loads(report.read_text())
+        validate_report_contract(data)
+        if jsonschema is not None:
+            jsonschema.validate(data, REPORT_SCHEMA)
+        return result, data
 
     BENCH_TARGET = "tests/test_bench.py"
 
@@ -267,73 +364,6 @@ class ValidatorFixture:
 
         return mutate
 
-    def validate(
-        self,
-        patch,
-        tests="tests/test_sample.py",
-        picker=None,
-        path_prefix=None,
-        pylib=None,
-        grid=True,
-        expected_route="test_sample:run_kernel",
-        grid_value="7,257,f32",
-        python_bin=None,
-        perf=True,
-        shape_env="VALIDATOR_TEST_GRID",
-        shape_arg=None,
-    ):
-        report = self.root / f"{patch.stem}-report.json"
-        command = [
-            str(VALIDATOR),
-            "--repo",
-            str(self.repo),
-            "--patch",
-            str(patch),
-            "--head-sha",
-            "b" * 40,
-            "--target",
-            tests,
-            "--expected-route",
-            expected_route,
-            "--shape-vars",
-            "M,N,dtype_str",
-            "--tol-table",
-            "f32=1e-5,f16=2e-3,bf16=1e-2",
-            "--label",
-            patch.stem,
-            "--out",
-            str(report),
-        ]
-        if grid:
-            command.extend(["--grid", grid_value])
-            if shape_env:
-                command.extend(["--shape-env", shape_env])
-        if shape_arg:
-            command.extend(["--shape-arg", shape_arg])
-        if not perf:
-            command.append("--no-perf")
-        environment = os.environ.copy()
-        environment["PICKER"] = str(picker or self.picker)
-        environment["PYTHONPATH"] = str(self.fake_modules)
-        environment["TIMEOUT"] = "30"
-        if python_bin:
-            environment["PYTHON_BIN"] = str(python_bin)
-        if pylib:
-            environment["PYLIB"] = str(pylib)
-        if path_prefix:
-            environment["PATH"] = f"{path_prefix}:{environment['PATH']}"
-        result = run(command, env=environment, check=False)
-        if not report.exists():
-            raise AssertionError(
-                f"validator did not write a report\nstdout:\n{result.stdout}\n"
-                f"stderr:\n{result.stderr}"
-            )
-        data = json.loads(report.read_text())
-        validate_report_contract(data)
-        if jsonschema is not None:
-            jsonschema.validate(data, REPORT_SCHEMA)
-        return result, data
-
 
 class ValidateKernelPrTests(unittest.TestCase):
     def setUp(self):
@@ -389,7 +419,9 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assert_complete_stage_objects(report)
 
     def test_no_gpu_withholds_correctness_from_a_target_that_needs_a_device(self):
-        patch = self.fixture.make_patch(self.gpu_requiring_change, "needs-device.patch")
+        patch = self.fixture.make_patch(
+            self.gpu_requiring_change, "needs-device.patch"
+        )
         no_gpu_picker = self.fixture.tools / "no-gpu-picker"
         write_executable(no_gpu_picker, "#!/usr/bin/env bash\nexit 1\n")
 
@@ -440,7 +472,7 @@ class ValidateKernelPrTests(unittest.TestCase):
     def test_new_failing_test_is_not_mislabeled_preexisting(self):
         def add_failing_test(repo):
             (repo / "tests" / "test_new.py").write_text(
-                "def test_new():\n    assert False, 'candidate failure'\n"
+                "def test_new():\n" "    assert False, 'candidate failure'\n"
             )
 
         patch = self.fixture.make_patch(add_failing_test, "new-test.patch")
@@ -483,47 +515,17 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertFalse(
             any(item["severity"] == "blocker" for item in report["findings"])
         )
+        # The target runs and passes, so correctness stays `pass` and nothing is blamed on
+        # the author. What it does NOT do is earn architecture coverage: this fixture names a
+        # route the script never calls, so the run has positive evidence that no watched work
+        # reached the device. The old contract credited `gfx-test: runtime` here on the basis
+        # `script-exit-zero-with-output`, which is a statement about the process, not the
+        # kernel -- and is exactly what a silently-returning target produces.
+        self.assertNotIn("gfx-test", report["arch_coverage_basis"])
+        self.assertNotIn("gfx-test", report["arch_coverage"])
         self.assertEqual(
-            "script-exit-zero-with-output",
-            report["arch_coverage_basis"]["gfx-test"],
+            0, report["stages"]["correctness_repo_tests"]["stats"]["observed_work"]
         )
-
-    def test_unfound_shape_arg_reports_a_missing_hook_not_an_absent_grid(self):
-        # A --shape-arg naming a flag the target does not accept used to reach the branch that
-        # says "no shape grid was configured" -- a fact about the caller, when what happened is
-        # a fact about the target. Both skip, so only the reason distinguishes a validator that
-        # could not find the hook from a caller that never asked for one, and that reason is
-        # the whole point of a stage that reports its own limits.
-        def add_script_target(repo):
-            (repo / "tests" / "verify_kernel.py").write_text(
-                "def verify_kernel():\n"
-                "    return True\n"
-                "\n"
-                "if __name__ == '__main__':\n"
-                "    assert verify_kernel()\n"
-                "    print('56/56 cases passed')\n"
-            )
-
-        patch = self.fixture.make_patch(add_script_target, "unfound-shape-arg.patch")
-        _, report = self.fixture.validate(
-            patch,
-            tests="tests/verify_kernel.py",
-            shape_env=None,
-            shape_arg="--shapes",
-        )
-
-        # Asserted before the grid_channel field below, so that this test fails on the reason
-        # the skip gives rather than on the field that was added to carry it.
-        self.assertEqual("skip", report["stages"]["correctness_s1_grid"]["status"])
-        note = report["stages"]["correctness_s1_grid"]["note"]
-        self.assertNotIn("no configured shape override", note)
-        self.assertIn("not referenced", note)
-        self.assertIn("--shapes", note)
-        self.assertEqual(
-            "hook-not-found",
-            report["stages"]["baseline_control"]["s1_grid"]["state"],
-        )
-        self.assertEqual("cli-flag", report["test_selection"]["grid_channel"])
 
     def test_script_only_target_failure_is_blocking(self):
         def add_failing_script(repo):
@@ -550,7 +552,7 @@ class ValidateKernelPrTests(unittest.TestCase):
     def test_target_without_entry_point_is_skipped(self):
         def add_library_only_target(repo):
             (repo / "tests" / "kernel_helpers.py").write_text(
-                "def verify_kernel():\n    return True\n"
+                "def verify_kernel():\n" "    return True\n"
             )
 
         patch = self.fixture.make_patch(
@@ -845,6 +847,89 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertEqual("skip", report["stages"]["baseline_control"]["status"])
         self.assertEqual("skip", report["stages"]["correctness_repo_tests"]["status"])
 
+    def test_relative_patch_path_is_not_a_merge_failure(self):
+        """A relative --patch is an invocation detail, not a defect in the PR.
+
+        The path was read from the caller's cwd for the readability check and then handed to
+        `git -C "$REPO_WT" apply`, which resolves it against the WORKTREE. The mismatch
+        surfaced as `merge_sim: patch does not apply to the recorded base` -- a BLOCK verdict
+        published against an author whose patch applies perfectly.
+        """
+        patch = self.fixture.make_patch(self.harmless_change, "relative-patch.patch")
+        # Run from a directory that is neither the repo nor the worktree, with --patch and
+        # --out given relative to it. Nested TWO levels deep on purpose: from one level the
+        # relative path happens to resolve to the same file against the worktree as against
+        # the caller, and the bug is invisible.
+        elsewhere = self.fixture.root / "caller" / "cwd"
+        elsewhere.mkdir(parents=True)
+
+        _, report = self.fixture.validate(patch, cwd=elsewhere)
+
+        merge = report["stages"]["merge_sim"]
+        self.assertEqual("pass", merge["status"])
+        self.assertFalse(
+            [
+                item
+                for item in report["findings"]
+                if item["stage"] == "merge_sim" and item["severity"] == "blocker"
+            ]
+        )
+
+    def test_tol_table_reports_a_tolerance_above_the_loosest_reference(self):
+        """--tol-table was parsed, validated, published -- and compared against nothing.
+
+        The added `rtol = 5e-2` loosens nothing (it is a new assertion, not a widened one), so
+        the `loosened` check stays silent. It is nonetheless above every reference tolerance
+        the caller declared, which is the fact the flag exists to surface: a kernel defect
+        smaller than that gap cannot turn this suite red.
+        """
+
+        def add_loose_tolerance(repo):
+            path = repo / "tests" / "test_sample.py"
+            path.write_text(
+                path.read_text().replace(
+                    "    atol = 1e-5\n",
+                    "    atol = 1e-5\n    rtol = 5e-2\n",
+                )
+            )
+
+        patch = self.fixture.make_patch(add_loose_tolerance, "tol-exceeds.patch")
+
+        _, report = self.fixture.validate(patch)
+
+        policy = report["stages"]["test_policy"]
+        self.assertEqual([0.05], policy["exceeds_reference"])
+        # No tolerance was WIDENED, so the older check must stay quiet -- the two findings are
+        # about different things and one must not stand in for the other.
+        self.assertNotIn("loosened", policy)
+        findings = [
+            item
+            for item in report["findings"]
+            if item["stage"] == "test_policy" and item["severity"] == "should-fix"
+        ]
+        self.assertEqual(1, len(findings))
+        self.assertIn("loosest reference tolerance", findings[0]["detail"])
+
+    def test_tol_table_is_silent_when_every_tolerance_is_within_reference(self):
+        """The other half of the contract: the field is recorded even when empty.
+
+        An absent key and an empty list read the same to a consumer that uses `.get`, so the
+        comparison has to be visible as having been made and found nothing.
+        """
+        patch = self.fixture.make_patch(self.harmless_change, "tol-within.patch")
+
+        _, report = self.fixture.validate(patch)
+
+        policy = report["stages"]["test_policy"]
+        self.assertEqual([], policy["exceeds_reference"])
+        self.assertFalse(
+            [
+                item
+                for item in report["findings"]
+                if item["stage"] == "test_policy" and item["severity"] == "should-fix"
+            ]
+        )
+
     def test_existing_ignored_artifact_rejects_nonisolated_worktree(self):
         (self.fixture.repo / ".gitignore").write_text("ignored-cache/\n")
         run(["git", "add", ".gitignore"], cwd=self.fixture.repo)
@@ -873,11 +958,50 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertEqual("INCONCLUSIVE", report["verdict"])
         self.assertEqual("skip", report["stages"]["merge_sim"]["status"])
 
-    # ---- perf stage -------------------------------------------------------------
-    # A measured regression is the only thing here allowed to change a verdict, so the
-    # tests are weighted toward the false-positive side: one case must fire, four cases
-    # must not. A perf stage that blocks a good PR gets switched off within a week, and
-    # then it catches nothing at all.
+    def test_unfound_shape_arg_reports_a_missing_hook_not_an_absent_grid(self):
+        # A --shape-arg naming a flag the target does not accept used to reach the branch that
+        # says "no shape grid was configured" -- a fact about the caller, when what happened is
+        # a fact about the target. Both skip, so only the reason distinguishes a validator that
+        # could not find the hook from a caller that never asked for one, and that reason is
+        # the whole point of a stage that reports its own limits.
+        def add_script_target(repo):
+            (repo / "tests" / "verify_kernel.py").write_text(
+                "def verify_kernel():\n"
+                "    return True\n"
+                "\n"
+                "if __name__ == '__main__':\n"
+                "    assert verify_kernel()\n"
+                "    print('56/56 cases passed')\n"
+            )
+
+        patch = self.fixture.make_patch(add_script_target, "unfound-shape-arg.patch")
+        _, report = self.fixture.validate(
+            patch,
+            tests="tests/verify_kernel.py",
+            shape_env=None,
+            shape_arg="--shapes",
+        )
+
+        # Asserted before the grid_channel field below, so that this test fails on the reason
+        # the skip gives rather than on the field that was added to carry it.
+        self.assertEqual("skip", report["stages"]["correctness_s1_grid"]["status"])
+        note = report["stages"]["correctness_s1_grid"]["note"]
+        self.assertNotIn("no configured shape override", note)
+        self.assertIn("is not passed to add_argument", note)
+        self.assertIn("tests/verify_kernel.py", note)
+        self.assertIn("--shapes", note)
+        self.assertEqual(
+            "hook-not-found",
+            report["stages"]["baseline_control"]["s1_grid"]["state"],
+        )
+        # `grid_channel` names the channel that actually CARRIED the grid, so a hook
+        # that was requested and not found leaves it empty; the reason field is where
+        # the request survives, and it distinguishes a validator limit from a target
+        # property.
+        self.assertEqual("", report["test_selection"]["grid_channel"])
+        self.assertIn(
+            "--shapes", report["test_selection"]["grid_channel_reason"]
+        )
 
     def bench_body(self, scale, trailer=""):
         self.fixture.add_bench_target()
@@ -1231,100 +1355,812 @@ class ValidateKernelPrTests(unittest.TestCase):
             )
         )
 
+    # ---- last-mile regressions found by running this skill against ROCm/aiter#4538 ----
+    #
+    # Every test below fails against the pre-fix validator, and each names the invariant it
+    # protects rather than the PR that exposed it.
 
-class GpuPickerTests(unittest.TestCase):
-    def test_shipped_picker_returns_translated_hip_index(self):
-        fixture = ValidatorFixture()
+    #: A target shaped like aiter#4538's: a script with its own shape flag, its own
+    #: head-count flag, and a route whose legality depends on the head count. The head-count
+    #: constraint is the point -- it is a configuration the shape flag alone cannot reach.
+    #: The kernel lives in its own module, as aiter#4538's does: a script target run under
+    #: runpy sees its own functions as ``__main__:...``, so a route naming the module is only
+    #: stable for code the target imports.
+    AXIS_KERNEL = (
+        "def run_kernel(M, N, dtype_str, num_heads):\n"
+        "    # The kernel's tile is 32 rows, so a head count below that has no legal\n"
+        "    # mapping. This is the shape of aiter#4538's MFMA_M assertion.\n"
+        "    assert num_heads % 32 == 0, 'heads must be a multiple of 32'\n"
+        "    return M * N\n"
+    )
+
+    AXIS_TARGET = (
+        "import argparse\n"
+        "import os\n"
+        "import sys\n"
+        "\n"
+        "sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))\n"
+        "\n"
+        "from axis_kernel import run_kernel\n"
+        "\n"
+        "\n"
+        "def _shape(text):\n"
+        "    M, N, dtype_str = text.split(',')\n"
+        "    return int(M), int(N), dtype_str\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    parser = argparse.ArgumentParser()\n"
+        "    parser.add_argument('-s', '--shapes', type=_shape, nargs='*',\n"
+        "                        default=[(7, 257, 'f32'), (8, 64, 'f32')])\n"
+        "    parser.add_argument('--num-heads', type=int, nargs='*',\n"
+        "                        default=[64, 128])\n"
+        "    args = parser.parse_args()\n"
+        "    for M, N, dtype_str in args.shapes:\n"
+        "        for num_heads in args.num_heads:\n"
+        "            run_kernel(M, N, dtype_str, num_heads)\n"
+        "    print('%d cases passed' % (len(args.shapes) * len(args.num_heads)))\n"
+        "\n"
+        "\n"
+        "if __name__ == '__main__':\n"
+        "    main()\n"
+    )
+
+    AXIS_TARGET_PATH = "tests/axis_target.py"
+
+    def _axis_patch(self, name, body=None):
+        def mutate(repo):
+            (repo / "tests" / "axis_kernel.py").write_text(self.AXIS_KERNEL)
+            (repo / self.AXIS_TARGET_PATH).write_text(body or self.AXIS_TARGET)
+
+        return self.fixture.make_patch(mutate, name)
+
+    def _validate_axis_target(self, patch, **kwargs):
+        return self.fixture.validate(
+            patch,
+            tests=self.AXIS_TARGET_PATH,
+            expected_route="axis_kernel:run_kernel",
+            shape_env=None,
+            shape_arg="--shapes",
+            perf=False,
+            **kwargs,
+        )
+
+    def test_a_grid_that_duplicates_the_targets_own_defaults_is_not_a_control(self):
+        # SKILL.md calls the S1 grid "a positive control against reporting the same default
+        # test run twice under different stage names". On aiter#4538 all three requested
+        # shapes were already in the target's own --shapes default list, so the stage
+        # reported `pass` for re-running a strict subset of correctness_repo_tests, and the
+        # verdict was PASS. A duplicate grid proves nothing the repository run did not
+        # already prove, so it cannot be credited.
+        patch = self._axis_patch("grid-duplicate.patch")
+        result, report = self._validate_axis_target(patch, grid_value="7,257,f32")
+
+        selection = report["test_selection"]
+        self.assertEqual("duplicates-target-defaults", selection["grid_independence"])
+        self.assertIn("--shapes", selection["grid_independence_reason"])
+        grid_stage = report["stages"]["correctness_s1_grid"]
+        self.assertEqual("skip", grid_stage["status"])
+        self.assertEqual(0, grid_stage["exit"])
+        self.assertEqual("INCONCLUSIVE", report["verdict"])
+        self.assertEqual(2, result.returncode)
+
+    def test_a_duplicate_grid_rescued_by_an_axis_says_so_in_one_place(self):
+        # A duplicate shape grid is rescued when a PROVEN axis asks for values the target
+        # does not run by default -- the configuration reaching the kernel is genuinely new.
+        # But test_selection carries the same two fields and is written before the axes are
+        # proven, so it kept the pre-override answer and the report contradicted itself:
+        # test_selection said "duplicates-target-defaults" while the stage said
+        # "adds-coverage". Observed on ROCm/aiter#5081. One question, one answer.
+        patch = self._axis_patch("duplicate-rescued.patch")
+        _, report = self._validate_axis_target(
+            patch,
+            grid_value="7,257,f32",
+            axes=("num_heads=--num-heads:32;64",),
+        )
+
+        stage = report["stages"]["correctness_s1_grid"]
+        selection = report["test_selection"]
+        self.assertEqual("proven", selection["axis_state"])
+        self.assertEqual("adds-coverage", stage["independence"])
+        self.assertEqual(
+            stage["independence"], selection["grid_independence"]
+        )
+        self.assertEqual(
+            stage["independence_reason"], selection["grid_independence_reason"]
+        )
+        self.assertEqual("pass", stage["status"])
+
+    def test_a_grid_outside_the_targets_defaults_still_counts_as_coverage(self):
+        # The control case for the test above: the fix must not turn every grid into a skip.
+        patch = self._axis_patch("grid-novel.patch")
+        _, report = self._validate_axis_target(patch, grid_value="9,1023,f32")
+
+        self.assertEqual(
+            "adds-coverage", report["test_selection"]["grid_independence"]
+        )
+        self.assertEqual("pass", report["stages"]["correctness_s1_grid"]["status"])
+
+    def test_each_head_run_keeps_its_own_execution_receipt(self):
+        # head-repo and head-grid both ran inside the head phase and shared one receipt
+        # path, so the second run erased the first. With the grid shapes a subset of the
+        # target's defaults -- aiter#4538's case -- a receipt written by EITHER run satisfies
+        # --grid, which makes the grid's own evidence unfalsifiable.
+        patch = self._axis_patch("receipt-split.patch")
+        _, report = self._validate_axis_target(patch, grid_value="9,1023,f32")
+
+        work = Path(report["stages"]["correctness_repo_tests"]["log"]).parent
+        repo_receipt = work / "head" / "execution-receipt-head-repo.json"
+        grid_receipt = work / "head" / "execution-receipt-head-grid.json"
+        self.assertTrue(repo_receipt.exists(), f"missing {repo_receipt}")
+        self.assertTrue(grid_receipt.exists(), f"missing {grid_receipt}")
+
+        repo_shapes = set(json.loads(repo_receipt.read_text())["executed_shapes"])
+        grid_shapes = set(json.loads(grid_receipt.read_text())["executed_shapes"])
+        # The repo run executes the target's defaults; the grid run executes the grid.
+        # Neither may contain the other's shapes, which is only checkable once they are
+        # separate files.
+        self.assertIn("7,257,f32", repo_shapes)
+        self.assertNotIn("9,1023,f32", repo_shapes)
+        self.assertEqual({"9,1023,f32"}, grid_shapes)
+        self.assertIn("head-grid", report["stages"]["execution_receipt"]["receipt_scope"])
+
+    def test_an_extra_axis_reaches_a_configuration_the_shape_grid_cannot_express(self):
+        # The shape channel is one ordered tuple bound to --shape-vars, so on aiter#4538 it
+        # could only ever vary (seq_len, seq_len_kv). num_heads is a separate flag whose
+        # default is [64, 128], and the kernel asserts at num_heads=16 -- a real blocker the
+        # validator had no way to request. --axis is that way.
+        patch = self._axis_patch("axis-blocker.patch")
+        result, report = self._validate_axis_target(
+            patch,
+            grid_value="9,1023,f32",
+            axes=("num_heads=--num-heads:16;32",),
+        )
+
+        selection = report["test_selection"]
+        self.assertEqual("proven", selection["axis_state"])
+        axis = selection["axes"][0]
+        self.assertEqual("num_heads", axis["name"])
+        self.assertEqual("flag-declared-in-add_argument", axis["hook_proof"])
+        self.assertEqual(["16", "32"], axis["values"])
+        self.assertEqual("adds-coverage", axis["independence"])
+        # The configuration the grid alone could never request now fails, loudly, and is
+        # attributed to the PR that adds the target.
+        self.assertEqual("fail", report["stages"]["correctness_s1_grid"]["status"])
+        self.assertEqual(1, result.returncode)
+        self.assertEqual("BLOCK", report["verdict"])
+        self.assertTrue(
+            any(
+                item["severity"] == "blocker" and "shape grid" in item["detail"]
+                for item in report["findings"]
+            ),
+            report["findings"],
+        )
+
+    def test_an_axis_the_target_ignores_is_named_not_silently_dropped(self):
+        # A flag the target declares but does not constrain would let the report claim
+        # coverage of head counts that never reached the kernel. The runtime refusal probe
+        # is what separates "declared" from "consumed", exactly as for --shape-arg, and a
+        # dropped axis has to be visible or the test space narrowed silently.
+        permissive = self.AXIS_TARGET.replace(
+            "parser.add_argument('--num-heads', type=int, nargs='*',\n"
+            "                        default=[64, 128])\n",
+            "parser.add_argument('--num-heads', type=str, nargs='*',\n"
+            "                        default=['64', '128'])\n",
+        ).replace(
+            "            run_kernel(M, N, dtype_str, num_heads)\n",
+            "            run_kernel(M, N, dtype_str, 64)\n",
+        )
+        self.assertNotEqual(permissive, self.AXIS_TARGET)
+        patch = self._axis_patch("axis-ignored.patch", body=permissive)
+        _, report = self._validate_axis_target(
+            patch,
+            grid_value="9,1023,f32",
+            axes=("num_heads=--num-heads:16;32",),
+        )
+
+        selection = report["test_selection"]
+        self.assertEqual("hook-not-consumed", selection["axis_state"])
+        self.assertIn("--num-heads", selection["axis_state_reason"])
+        self.assertTrue(
+            any(
+                "requested test axes were dropped" in item["detail"]
+                for item in report["findings"]
+            ),
+            report["findings"],
+        )
+
+    def test_a_script_that_returns_without_working_earns_no_architecture_credit(self):
+        # aiter#4538's target returns with exit 0 and a log line when the arch is
+        # unsupported or an optional package is missing. That produced
+        # `arch_coverage: {gfx: runtime}` on basis `script-exit-zero-with-output` and
+        # `executed: 1` -- indistinguishable from the run that graded 56 cases.
+        silent = (
+            "import argparse\n"
+            "\n"
+            "\n"
+            "def main():\n"
+            "    parser = argparse.ArgumentParser()\n"
+            "    parser.add_argument('-s', '--shapes', nargs='*', default=['7,257,f32'])\n"
+            "    parser.parse_args()\n"
+            "    print('unsupported arch; skipping')\n"
+            "    return\n"
+            "\n"
+            "\n"
+            "if __name__ == '__main__':\n"
+            "    main()\n"
+        )
+        patch = self._axis_patch("silent-skip.patch", body=silent)
+        result, report = self.fixture.validate(
+            patch,
+            tests=self.AXIS_TARGET_PATH,
+            expected_route="axis_kernel:run_kernel",
+            shape_env=None,
+            shape_arg="--shapes",
+            perf=False,
+            grid=False,
+        )
+
+        stats = report["stages"]["correctness_repo_tests"]["stats"]
+        self.assertEqual(0, stats["observed_work"])
+        self.assertIn("execution receipt", stats["basis"])
+        self.assertEqual({}, report["arch_coverage"])
+        self.assertEqual("INCONCLUSIVE", report["verdict"])
+        self.assertEqual(2, result.returncode)
+
+    #: A target the patch ADDS, which times a kernel that already exists on base against an
+    #: unchanged reference. aiter#4538 is exactly this shape: a new op_tests target whose
+    #: whole point is that the rewritten kernel is faster than what it replaces.
+    NEW_BENCH_TARGET = "tests/bench_added.py"
+
+    def _new_bench_patch(self, name, scale):
+        # `VALUE` already exists on base (the fixture commits `VALUE = 1`), so the
+        # transplanted target imports cleanly there and times the PRE-patch cost. That is
+        # the whole premise: a new target file driving an entry point that is not new.
+        def mutate(repo):
+            (repo / "aiter" / "kernel.py").write_text(f"VALUE = {scale}\n")
+            (repo / self.NEW_BENCH_TARGET).write_text(
+                "import argparse\n"
+                "import os\n"
+                "import sys\n"
+                "\n"
+                "sys.path.insert(0, os.path.dirname(os.path.dirname(\n"
+                "    os.path.abspath(__file__))))\n"
+                "\n"
+                "from aiter.kernel import VALUE\n"
+                "\n"
+                "\n"
+                "def main():\n"
+                "    parser = argparse.ArgumentParser()\n"
+                "    parser.add_argument('--scenario', default='test',\n"
+                "                        choices=['test', 'bench'])\n"
+                "    parser.parse_args()\n"
+                "    print('| dim | kernel us | reference us |')\n"
+                "    print('|---|---|---|')\n"
+                "    for dim in (1024, 2048, 4096, 8192):\n"
+                "        print(f'| {dim} | {dim * VALUE / 100.0} | {dim / 50.0} |')\n"
+                "    print('4/4 cases passed')\n"
+                "\n"
+                "\n"
+                "if __name__ == '__main__':\n"
+                "    main()\n"
+            )
+
+        return self.fixture.make_patch(mutate, name)
+
+    def test_an_added_target_can_still_time_the_code_it_replaces(self):
+        # "The PR adds this target, so base has nothing to time against" ended the perf
+        # stage on aiter#4538 -- a PR whose entire motivation is being faster than the kernel
+        # it replaces. The file being new does not make the code it drives new: copying the
+        # target into the base tree times the pre-PR implementation through the same harness.
+        patch = self._new_bench_patch("added-bench-faster.patch", scale="0.5")
+        _, report = self.fixture.validate(
+            patch,
+            tests=self.NEW_BENCH_TARGET,
+            expected_route="aiter.kernel:main",
+            grid=False,
+            perf=True,
+            perf_control_column="reference us",
+        )
+
+        perf = report["stages"]["perf"]
+        self.assertEqual("target-transplant", perf["baseline_method"])
+        self.assertEqual("pass", perf["status"])
+        # The unchanged reference column has to reproduce across the two trees, or the
+        # cross-tree comparison means nothing.
+        self.assertIn("reproduced within", perf["control_note"])
+        self.assertAlmostEqual(1.0, perf["control_ratio"], places=6)
+        # base VALUE = 1, head VALUE = 0.5 -> head is twice as fast on the kernel column,
+        # while the reference column sits at exactly 1.0. median_ratio is the WORST column
+        # by design, so the improvement is read off the kernel column itself.
+        kernel_column = next(
+            stats
+            for name, stats in perf["columns"].items()
+            if "kernel" in name.lower()
+        )
+        self.assertGreater(kernel_column["median_ratio"], 1.5)
+        self.assertGreaterEqual(perf["median_ratio"], 0.95)
+        self.assertEqual(
+            "target-not-present",
+            report["stages"]["baseline_control"]["repo_tests"]["state"],
+        )
+
+    def test_an_added_target_regression_is_caught_not_skipped(self):
+        # The direction that matters: a NEW target whose kernel got slower must still fail.
+        patch = self._new_bench_patch("added-bench-slower.patch", scale="2.0")
+        result, report = self.fixture.validate(
+            patch,
+            tests=self.NEW_BENCH_TARGET,
+            expected_route="aiter.kernel:main",
+            grid=False,
+            perf=True,
+            perf_control_column="reference us",
+        )
+
+        perf = report["stages"]["perf"]
+        self.assertEqual("target-transplant", perf["baseline_method"])
+        self.assertEqual("fail", perf["status"])
+        self.assertLess(perf["median_ratio"], 0.95)
+        self.assertEqual(1, result.returncode)
+        self.assertTrue(
+            any(
+                item["stage"] == "perf" and item["severity"] == "should-fix"
+                for item in report["findings"]
+            ),
+            report["findings"],
+        )
+
+    def test_a_transplanted_baseline_whose_control_moved_is_not_believed(self):
+        # The gate that makes a cross-tree comparison reportable at all. If a column the
+        # patch does not touch moves between the two trees, the two runs are not comparable
+        # and the kernel ratio means nothing - the stage must skip and say so rather than
+        # publish a confident number drawn from two different machines-in-effect.
+        def mutate(repo):
+            (repo / "aiter" / "kernel.py").write_text("VALUE = 0.5\nREFERENCE = 3.0\n")
+            (repo / self.NEW_BENCH_TARGET).write_text(
+                "import argparse\n"
+                "import os\n"
+                "import sys\n"
+                "\n"
+                "sys.path.insert(0, os.path.dirname(os.path.dirname(\n"
+                "    os.path.abspath(__file__))))\n"
+                "\n"
+                "try:\n"
+                "    from aiter.kernel import REFERENCE\n"
+                "except ImportError:\n"
+                # On base REFERENCE does not exist, so the transplanted target falls back to
+                # a different reference cost -- which is exactly the situation the control
+                # column exists to detect.
+                "    REFERENCE = 1.0\n"
+                "from aiter.kernel import VALUE\n"
+                "\n"
+                "\n"
+                "def main():\n"
+                "    parser = argparse.ArgumentParser()\n"
+                "    parser.add_argument('--scenario', default='test',\n"
+                "                        choices=['test', 'bench'])\n"
+                "    parser.parse_args()\n"
+                "    print('| dim | kernel us | reference us |')\n"
+                "    print('|---|---|---|')\n"
+                "    for dim in (1024, 2048, 4096, 8192):\n"
+                "        print(f'| {dim} | {dim * VALUE / 100.0} "
+                "| {dim * REFERENCE / 50.0} |')\n"
+                "    print('4/4 cases passed')\n"
+                "\n"
+                "\n"
+                "if __name__ == '__main__':\n"
+                "    main()\n"
+            )
+
+        patch = self.fixture.make_patch(mutate, "added-bench-control-moved.patch")
+        _, report = self.fixture.validate(
+            patch,
+            tests=self.NEW_BENCH_TARGET,
+            expected_route="aiter.kernel:main",
+            grid=False,
+            perf=True,
+            perf_control_column="reference us",
+        )
+
+        perf = report["stages"]["perf"]
+        self.assertEqual("target-transplant", perf["baseline_method"])
+        self.assertEqual("skip", perf["status"])
+        self.assertIn("not comparable", perf["control_note"])
+        self.assertNotIn("median_ratio", perf)
+
+    def test_a_transplanted_baseline_without_a_control_column_reports_why(self):
+        # The transplant is a cross-tree comparison. With nothing unchanged to check it
+        # against, the honest outcome is a skip whose reason names the missing evidence --
+        # not a confident ratio, and not the old claim that base had nothing to time.
+        patch = self._new_bench_patch("added-bench-nocontrol.patch", scale="0.5")
+        _, report = self.fixture.validate(
+            patch,
+            tests=self.NEW_BENCH_TARGET,
+            expected_route="aiter.kernel:main",
+            grid=False,
+            perf=True,
+        )
+
+        perf = report["stages"]["perf"]
+        self.assertEqual("skip", perf["status"])
+        self.assertIn("--perf-control-column", perf["note"])
+        self.assertNotIn("nothing to time against", perf["note"])
+
+    #: A pytest-named file that ALSO parses argv in its module body. Found on
+    #: ROCm/aiter#5172: pytest wins the runner selection, imports the module at collection
+    #: with its own argv, and argparse exits the process. The file is green as a script.
+    ARGV_AT_IMPORT_TARGET = (
+        "import argparse\n"
+        "import os\n"
+        "import sys\n"
+        "\n"
+        "sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))\n"
+        "\n"
+        "from axis_kernel import run_kernel\n"
+        "\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('-s', '--shapes', nargs='*', default=['7,257,f32'])\n"
+        "parser.add_argument('--num-heads', type=int, nargs='*', default=[64, 128])\n"
+        "args = parser.parse_args()\n"
+        "\n"
+        "\n"
+        "def test_top_level():\n"
+        "    run_kernel(7, 257, 'f32', 64)\n"
+    )
+
+    #: aiter's dominant op_tests convention: a SCRIPT whose worker happens to be named
+    #: `test_<op>(...)` and is called from main() with real arguments. pytest collects it,
+    #: cannot supply the parameters, and errors. Observed on ROCm/aiter#5081, where the
+    #: validator published "the PR adds this test target and it fails on head" against the
+    #: author for a target that is green as a script with the very shapes the run requested.
+    UNCOLLECTABLE_WORKER_TARGET = (
+        "import argparse\n"
+        "import os\n"
+        "import sys\n"
+        "\n"
+        "sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))\n"
+        "\n"
+        "from axis_kernel import run_kernel\n"
+        "\n"
+        "\n"
+        "def test_worker(M, N, dtype_str, num_heads):\n"
+        "    run_kernel(M, N, dtype_str, num_heads)\n"
+        "    return M * N\n"
+        "\n"
+        "\n"
+        "def _shape(text):\n"
+        "    M, N, dtype_str = text.split(',')\n"
+        "    return int(M), int(N), dtype_str\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    parser = argparse.ArgumentParser()\n"
+        "    parser.add_argument('-s', '--shapes', type=_shape, nargs='*',\n"
+        "                        default=[(7, 257, 'f32'), (8, 64, 'f32')])\n"
+        "    parser.add_argument('--num-heads', type=int, nargs='*',\n"
+        "                        default=[64, 128])\n"
+        "    args = parser.parse_args()\n"
+        "    for M, N, dtype_str in args.shapes:\n"
+        "        for num_heads in args.num_heads:\n"
+        "            test_worker(M, N, dtype_str, num_heads)\n"
+        "    print('%d cases passed' % (len(args.shapes) * len(args.num_heads)))\n"
+        "\n"
+        "\n"
+        "if __name__ == '__main__':\n"
+        "    main()\n"
+    )
+
+    def test_a_test_named_worker_pytest_cannot_collect_runs_as_a_script(self):
+        patch = self._axis_patch(
+            "uncollectable-worker.patch", body=self.UNCOLLECTABLE_WORKER_TARGET
+        )
+        result, report = self._validate_axis_target(
+            patch,
+            grid_value="9,1023,f32",
+            axes=("num_heads=--num-heads:32;64",),
+        )
+
+        selection = report["test_selection"]
+        # "Defines a test* function" is not the same as "pytest can collect it".
+        self.assertEqual("script", selection["runner"])
+        self.assertIn("pytest cannot collect them", selection["runner_reason"])
+        # And because it is a script, the shape grid and the axis both reach it.
+        self.assertEqual("cli", selection["grid_channel"])
+        self.assertEqual("proven", selection["axis_state"])
+        self.assertEqual("pass", report["stages"]["correctness_s1_grid"]["status"])
+        self.assertGreater(
+            report["stages"]["correctness_repo_tests"]["stats"]["observed_work"], 0
+        )
+        # Above all: no blocker charged to an author whose target works.
+        self.assertFalse(
+            any(item["severity"] == "blocker" for item in report["findings"]),
+            report["findings"],
+        )
+        self.assertNotEqual(1, result.returncode)
+
+    def test_a_route_behind_a_wraps_decorator_is_still_observed(self):
+        # A route is written the way a caller reads the source, `module:function`. The
+        # profiler sees frames, and a frame's identity is
+        # f_globals["__name__"] + ":" + f_code.co_name -- not the same thing once the
+        # function is wrapped, because functools.wraps copies __name__ onto the wrapper
+        # object and leaves co_name alone. aiter's entire @compile_ops family therefore
+        # executes as `aiter.jit.core:wrapper`, so naming the op a reviewer cares about
+        # matched nothing and the receipt reported an empty route. Observed on
+        # ROCm/aiter#5081.
+        wrapped_kernel = (
+            "import functools\n"
+            "\n"
+            "\n"
+            "def _dispatch(func):\n"
+            "    @functools.wraps(func)\n"
+            "    def wrapper(*args, **kwargs):\n"
+            "        return func(*args, **kwargs)\n"
+            "\n"
+            "    return wrapper\n"
+            "\n"
+            "\n"
+            "@_dispatch\n"
+            "def run_kernel(M, N, dtype_str, num_heads):\n"
+            "    assert num_heads % 32 == 0, 'heads must be a multiple of 32'\n"
+            "    return M * N\n"
+        )
+
+        def mutate(repo):
+            (repo / "tests" / "axis_kernel.py").write_text(wrapped_kernel)
+            (repo / self.AXIS_TARGET_PATH).write_text(self.AXIS_TARGET)
+
+        patch = self.fixture.make_patch(mutate, "wrapped-route.patch")
+        _, report = self._validate_axis_target(patch, grid_value="9,1023,f32")
+
+        receipt = report["stages"]["execution_receipt"]
+        self.assertEqual("pass", receipt["status"])
+        self.assertEqual("axis_kernel:run_kernel", receipt["route"])
+        self.assertEqual(["9,1023,f32"], sorted(set(receipt["executed_shapes"])))
+        self.assertGreater(
+            report["stages"]["correctness_repo_tests"]["stats"]["observed_work"], 0
+        )
+
+    def test_the_caller_can_force_a_runner_the_classifier_got_wrong(self):
+        patch = self._axis_patch(
+            "forced-runner.patch", body=self.UNCOLLECTABLE_WORKER_TARGET
+        )
+        _, report = self.fixture.validate(
+            patch,
+            tests=self.AXIS_TARGET_PATH,
+            expected_route="axis_kernel:run_kernel",
+            shape_env=None,
+            shape_arg="--shapes",
+            perf=False,
+            grid=False,
+            runner="pytest",
+        )
+
+        selection = report["test_selection"]
+        self.assertEqual("pytest", selection["runner"])
+        self.assertIn("caller forced --runner pytest", selection["runner_reason"])
+        self.assertIn("structural selection said script", selection["runner_reason"])
+
+    def test_a_runner_that_cannot_run_the_target_is_named_as_such(self):
+        # "Red on both sides" is an attribution, not an explanation. When the target carries
+        # a structural reason the SELECTED runner cannot run it, a reader who is not told so
+        # concludes the code is broken when the runner choice is.
+        patch = self._axis_patch("argv-at-import.patch", body=self.ARGV_AT_IMPORT_TARGET)
+        _, report = self.fixture.validate(
+            patch,
+            tests=self.AXIS_TARGET_PATH,
+            expected_route="axis_kernel:run_kernel",
+            shape_env=None,
+            shape_arg="--shapes",
+            grid_value="9,1023,f32",
+            axes=("num_heads=--num-heads:16;32",),
+            perf=False,
+        )
+
+        selection = report["test_selection"]
+        self.assertEqual("pytest", selection["runner"])
+        self.assertIn("parses argv in its module body", selection["runner_risk"])
+        self.assertTrue(
+            any(
+                "under the selected pytest runner" in item["detail"]
+                for item in report["findings"]
+            ),
+            report["findings"],
+        )
+
+        # A requested axis that could not be honoured must still appear. Publishing an empty
+        # `axes` beside a non-`none` axis_state loses the request itself, which is exactly
+        # the silently narrowed test space these fields exist to make visible.
+        self.assertEqual("unusable", selection["axis_state"])
+        self.assertEqual(1, len(selection["axes"]))
+        self.assertEqual("num_heads", selection["axes"][0]["name"])
+        self.assertEqual(["16", "32"], selection["axes"][0]["values"])
+        self.assertEqual("not-evaluated", selection["axes"][0]["hook_proof"])
+
+        # And the grid-independence reason must describe THIS run. The old default claimed
+        # "the channel exposes no declared defaults to compare against" whenever the
+        # comparison did not happen - a statement about the target that this run never
+        # established, and false here: the target declares a default for --shapes.
+        self.assertEqual("unknown", selection["grid_independence"])
+        self.assertNotIn(
+            "no declared defaults", selection["grid_independence_reason"]
+        )
+        # The channel this run established, named -- rather than a claim about the target.
+        self.assertIn(
+            "independence is only computed for the CLI-flag channel",
+            selection["grid_independence_reason"],
+        )
+
+    def test_a_killed_run_leaves_no_stale_verdict_at_the_output_path(self):
+        # The process exit code used to be read back out of `--out` AFTER finish_report, so
+        # `--out` was a fallback source of truth. A run that died before finish_report copied
+        # its own report over the file left the PREVIOUS run's report sitting there, and the
+        # caller -- `review-pr`'s identity gate included -- read a stale `PASS` as this PR's
+        # result. A run owns its output path.
+        patch = self._axis_patch("stale-verdict.patch")
+        report_path = self.fixture.root / "stale-report.json"
+        report_path.write_text(
+            json.dumps(
+                {
+                    "label": "an-earlier-run",
+                    "verdict": "PASS",
+                    "process_exit_code": 0,
+                    "stages": {},
+                    "findings": [],
+                }
+            )
+        )
+        slow_picker = self.fixture.tools / "slow-picker"
+        write_executable(slow_picker, "#!/usr/bin/env bash\nsleep 30\nprintf '97\\n'\n")
+
+        environ = os.environ.copy()
+        environ["PICKER"] = str(slow_picker)
+        environ["PYTHONPATH"] = str(self.fixture.fake_modules)
+        environ["TIMEOUT"] = "30"
+        process = subprocess.Popen(
+            [
+                str(VALIDATOR),
+                "--repo",
+                str(self.fixture.repo),
+                "--patch",
+                str(patch),
+                "--target",
+                self.AXIS_TARGET_PATH,
+                "--expected-route",
+                "axis_kernel:run_kernel",
+                "--no-perf",
+                "--label",
+                "stale-verdict",
+                "--out",
+                str(report_path),
+            ],
+            env=environ,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
         try:
-            environment = os.environ.copy()
-            environment["PYTHONPATH"] = str(fixture.fake_modules)
-            result = run(
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            pass
+        process.kill()
+        process.wait(timeout=30)
+
+        self.assertFalse(
+            report_path.exists(),
+            "a killed run left a previous run's report at --out: "
+            + (report_path.read_text() if report_path.exists() else ""),
+        )
+
+    def test_the_target_cannot_read_the_reviewers_credentials(self):
+        # `env VAR=... cmd` ADDS to the inherited environment. The target is arbitrary code
+        # from an unmerged PR, so every token in the reviewer's shell was readable from
+        # os.environ inside it -- and lands in a stage log the moment the target prints its
+        # environment, which is a perfectly ordinary thing for a test to do on failure.
+        leaky = (
+            "import os\n"
+            "\n"
+            "\n"
+            "def main():\n"
+            "    for name, value in sorted(os.environ.items()):\n"
+            "        print(f'{name}={value}')\n"
+            "\n"
+            "\n"
+            "if __name__ == '__main__':\n"
+            "    main()\n"
+        )
+        patch = self._axis_patch("env-leak.patch", body=leaky)
+        environ = os.environ.copy()
+        environ["VALIDATOR_TEST_GITHUB_TOKEN"] = "leakcanary-token"
+        environ["MY_API_KEY"] = "leakcanary-key"
+        environ["UNRELATED_HOME_DECOR"] = "leakcanary-unrelated"
+
+        report_path = self.fixture.root / "env-leak-report.json"
+        command = [
+            str(VALIDATOR),
+            "--repo",
+            str(self.fixture.repo),
+            "--patch",
+            str(patch),
+            "--target",
+            self.AXIS_TARGET_PATH,
+            "--expected-route",
+            "axis_kernel:run_kernel",
+            "--shape-vars",
+            "M,N,dtype_str",
+            "--no-perf",
+            "--label",
+            "env-leak",
+            "--out",
+            str(report_path),
+        ]
+        environ["PICKER"] = str(self.fixture.picker)
+        environ["PYTHONPATH"] = str(self.fixture.fake_modules)
+        environ["TIMEOUT"] = "30"
+        run(command, env=environ, check=False)
+
+        report = json.loads(report_path.read_text())
+        log = Path(report["stages"]["correctness_repo_tests"]["log"]).read_text()
+        for canary in ("leakcanary-token", "leakcanary-key", "leakcanary-unrelated"):
+            self.assertNotIn(canary, log)
+        for name in ("VALIDATOR_TEST_GITHUB_TOKEN", "MY_API_KEY", "UNRELATED_HOME_DECOR"):
+            self.assertNotIn(name, log)
+        # The policy is a reported fact, not an implicit one.
+        policy = report["isolation"]["target_environment"]
+        self.assertIn("env -i", policy["policy"])
+        self.assertIn("PATH", policy["passed_through"])
+
+    def test_an_unlabeled_measurement_column_does_not_destroy_row_identity(self):
+        # aiter bench tables print columns whose headers carry no unit -- `flydsl rel`,
+        # `triton err`, `speedup`. They are measurements, but `classify()` calls anything
+        # without a unit a KEY column, so they became part of the row's identity. They
+        # differ between base and head by construction, so every row got a unique name on
+        # each side and `matched_rows` was 0: `insufficient` on 56 perfectly comparable
+        # rows. Observed on aiter#4538's real bench logs. The strict key is still tried
+        # first; only when it matches nothing is the relaxed key used, and the result says
+        # which was used.
+        table = (
+            "| s_q | s_k | kernel us | rel err | speedup |\n"
+            "|---|---|---|---|---|\n"
+            "| 1024 | 1024 | {a} | {r1} | {s1} |\n"
+            "| 2048 | 2048 | {b} | {r2} | {s2} |\n"
+            "| 4096 | 4096 | {c} | {r3} | {s3} |\n"
+        )
+        base_log = self.fixture.root / "rowkey-base.log"
+        head_log = self.fixture.root / "rowkey-head.log"
+        base_log.write_text(
+            table.format(
+                a=10.0, b=20.0, c=40.0,
+                r1=1.11e-5, r2=2.22e-5, r3=3.33e-5,
+                s1=1.0101, s2=1.0202, s3=1.0303,
+            )
+        )
+        head_log.write_text(
+            table.format(
+                a=5.0, b=10.0, c=20.0,
+                r1=1.19e-5, r2=2.28e-5, r3=3.37e-5,
+                s1=2.0404, s2=2.0505, s3=2.0606,
+            )
+        )
+
+        result = json.loads(
+            run(
                 [
                     sys.executable,
-                    str(SHIPPED_PICKER),
-                    "--samples",
-                    "1",
-                    "--interval",
-                    "0",
-                    "--quiet",
-                ],
-                env=environment,
-            )
-        finally:
-            fixture.close()
-
-        self.assertEqual("7", result.stdout.strip())
-
-
-class ReviewSkillContractTests(unittest.TestCase):
-    def test_review_skill_is_advisory_and_has_no_dead_scanner_paths(self):
-        review_skill = (SKILL_DIR.parent / "review-pr" / "SKILL.md").read_text()
-
-        self.assertTrue((SKILL_DIR / "validate_evidence.py").is_file())
-        self.assertTrue((SKILL_DIR / "validation_probe.py").is_file())
-        self.assertTrue(SHIPPED_PICKER.is_file())
-        self.assertIn("advisory tier", review_skill)
-        self.assertIn("required scanner is missing or not executable", review_skill)
-        self.assertIn("Validation (deterministic)", review_skill)
-        self.assertIn("baseRefName", review_skill)
-        self.assertIn("base_head.txt", review_skill)
-        self.assertIn("expected_verdict", review_skill)
-        self.assertIn("if stats is not None", review_skill)
-        self.assertNotIn("downstream-impact-check", review_skill)
-        self.assertNotIn("review-flydsl-kernel/scan_", review_skill)
-
-    def test_perf_harness_detection_agrees_across_both_skills(self):
-        """review-pr and the validator must classify a target identically.
-
-        Each file carries a comment telling the next reader to keep the two in step. A
-        comment cannot enforce that. If they drift, review-pr prints a manual recipe for a
-        harness the validator declined to use -- or, worse, prints "no benchmark entry
-        point" for a target the validator happily timed.
-        """
-        review_skill = (SKILL_DIR.parent / "review-pr" / "SKILL.md").read_text()
-        validator = VALIDATOR.read_text()
-
-        review_body = re.search(
-            r"def perf_command\(path\):(.*?)\n\n", review_skill, re.DOTALL
+                    str(SKILL_DIR / "scrape_perf.py"),
+                    "--base",
+                    str(base_log),
+                    "--head",
+                    str(head_log),
+                ]
+            ).stdout
         )
-        validator_body = re.search(
-            r"perf_detect\(\).*?<<'PY'\n(.*?)\nPY", validator, re.DOTALL
-        )
-        self.assertIsNotNone(review_body)
-        self.assertIsNotNone(validator_body)
 
-        for name, body in (
-            ("review-pr", review_body.group(1)),
-            ("validate_pr.sh", validator_body.group(1)),
-        ):
-            self.assertIn('"--scenario" in text', body, name)
-            self.assertIn('"bench" in text', body, name)
-            self.assertIn('"perftest" in text', body, name)
-            # `run_perftest` is a strict subset of `perftest`, so testing the longer name
-            # only narrows coverage. It missed 12 of aiter's 123 op_tests/ targets, every
-            # one of which does have a timing harness.
-            self.assertNotIn('"run_perftest" in text', body, name)
-
-    def test_review_fetch_snippet_parses_as_bash(self):
-        review_skill = (SKILL_DIR.parent / "review-pr" / "SKILL.md").read_text()
-        match = re.search(
-            r"## Step 1 — Fetch.*?```bash\n(.*?)\n```",
-            review_skill,
-            re.DOTALL,
-        )
-        self.assertIsNotNone(match)
-        result = subprocess.run(
-            ["bash", "-n"],
-            input=match.group(1),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self.assertEqual(0, result.returncode, result.stderr)
-
-
-if __name__ == "__main__":
-    unittest.main()
+        self.assertEqual(3, result["matched_rows"])
+        self.assertIn("non-integral", result["row_key_basis"])
+        # The shape columns are integral, so they stay in the key and keep the three rows
+        # distinct -- the relaxed key must not collapse them.
+        self.assertEqual(3, result["base_rows"])
+        self.assertEqual("ok", result["status"])
+        self.assertAlmostEqual(2.0, result["columns"]["kernel us"]["median_ratio"], 3)
 
 
 def new_file_diff(path, source):
@@ -1344,6 +2180,641 @@ def new_file_diff(path, source):
         f"+++ b/{path}\n"
         f"@@ -0,0 +1,{len(lines)} @@\n"
     ) + "".join(f"+{line}\n" for line in lines)
+
+
+class GridChannelTests(unittest.TestCase):
+    """The S1 grid needs a delivery channel; there are three, probed independently."""
+
+    def setUp(self):
+        self.fixture = ValidatorFixture()
+
+    def tearDown(self):
+        self.fixture.close()
+
+    @staticmethod
+    def add_cli_shape_script(repo):
+        """A script target whose shapes arrive on its own CLI flag, and which
+        never reads an environment variable."""
+        (repo / "tests" / "run_shapes.py").write_text(
+            "import argparse\n"
+            "\n"
+            "def run_kernel(M, N, dtype_str):\n"
+            "    assert M > 0 and N > 0 and dtype_str\n"
+            "\n"
+            "def main():\n"
+            "    parser = argparse.ArgumentParser()\n"
+            '    parser.add_argument("--shape", nargs="*", default=["7,257,f32"])\n'
+            "    args = parser.parse_args()\n"
+            "    for shape in args.shape:\n"
+            "        M, N, dtype_str = shape.split(',')\n"
+            "        run_kernel(int(M), int(N), dtype_str)\n"
+            "    print(f'{len(args.shape)}/{len(args.shape)} shapes passed')\n"
+            "\n"
+            "if __name__ == '__main__':\n"
+            "    main()\n"
+        )
+
+    @staticmethod
+    def add_parametrized_target(repo):
+        """A pytest target whose shapes are literals inside its own parametrize mark --
+        the dominant shape in the real repository, and the case neither of the older two
+        channels can reach."""
+        (repo / "tests" / "test_parametrized.py").write_text(
+            "import pytest\n"
+            "\n"
+            "def run_kernel(M, N, dtype_str):\n"
+            "    assert M > 0 and N > 0 and dtype_str\n"
+            "\n"
+            '@pytest.mark.parametrize("M,N,dtype_str", [(3, 5, "f32")])\n'
+            "def test_shapes(M, N, dtype_str):\n"
+            "    run_kernel(M, N, dtype_str)\n"
+        )
+
+    @staticmethod
+    def add_single_name_parametrized_target(repo):
+        """One shape parameter -- the dominant shape in the targets this channel exists for.
+
+        `run_kernel` requires an int so that the invalid-grid probe fails INSIDE the target:
+        the sentinel arrives as a string and the assertion is what rejects it.
+        """
+        (repo / "tests" / "test_one_name.py").write_text(
+            "import pytest\n"
+            "\n"
+            "def run_kernel(m):\n"
+            "    assert isinstance(m, int) and m > 0\n"
+            "\n"
+            '@pytest.mark.parametrize("m", [3])\n'
+            "def test_one_shape(m):\n"
+            "    run_kernel(m)\n"
+        )
+
+    @staticmethod
+    def add_target_with_an_unrelated_parametrize(repo):
+        """Two tests in one file: one the grid replaces, one it must not touch.
+
+        `test_unrelated` binds `m` together with `other`, so the grid cannot be substituted
+        into it without leaving `other` unfilled. Its assertion on its OWN values is what
+        proves the plugin left it alone.
+        """
+        (repo / "tests" / "test_two_marks.py").write_text(
+            "import pytest\n"
+            "\n"
+            "def run_kernel(m, n):\n"
+            "    assert isinstance(m, int) and isinstance(n, int)\n"
+            "    assert m > 0 and n > 0\n"
+            "\n"
+            '@pytest.mark.parametrize("m,n", [(3, 5)])\n'
+            "def test_shapes(m, n):\n"
+            "    run_kernel(m, n)\n"
+            "\n"
+            '@pytest.mark.parametrize("m,other", [(11, "keep")])\n'
+            "def test_unrelated(m, other):\n"
+            "    assert (m, other) == (11, 'keep')\n"
+        )
+
+    @staticmethod
+    def add_target_that_rejects_the_grid_after_the_route_ran(repo):
+        """The repository run reaches the route; the grid run dies before it.
+
+        The guard is on the TEST, ahead of the call, so the grid phase produces a receipt
+        that observed nothing while the repository phase produced one that proved the route.
+        """
+        (repo / "tests" / "test_late_grid.py").write_text(
+            "import pytest\n"
+            "\n"
+            "def run_kernel(m):\n"
+            "    assert m > 0\n"
+            "\n"
+            '@pytest.mark.parametrize("m", [3])\n'
+            "def test_shape(m):\n"
+            '    assert m < 100, "shape unsupported by this target"\n'
+            "    run_kernel(m)\n"
+        )
+
+    def test_single_shape_argname_is_delivered_and_not_published_as_a_defect(self):
+        """The most consequential regression of the batch.
+
+        The plugin unwrapped one-name rows to scalars but passed `argnames` as a LIST, and
+        pytest sets force_tuple only for a `str` argnames. Collection died with "object of
+        type 'int' has no len()", the grid run exited non-zero, and the executor published
+        that crash as `[blocker] the PR adds this target and its independent shape grid
+        fails` -- a BLOCK verdict against three real authors for a fault in the injector.
+        """
+        patch = self.fixture.make_patch(
+            self.add_single_name_parametrized_target, "one-name.patch"
+        )
+
+        _, report = self.fixture.validate(
+            patch,
+            tests="tests/test_one_name.py",
+            expected_route="test_one_name:run_kernel",
+            shape_env=None,
+            shape_argnames="m",
+            shape_vars="m",
+            grid_value="128;256",
+        )
+
+        self.assertEqual("pytest", report["test_selection"]["grid_channel"])
+        self.assertNotEqual("BLOCK", report["verdict"])
+        self.assertEqual(
+            [], [item for item in report["findings"] if item["severity"] == "blocker"]
+        )
+        grid_stage = report["stages"]["correctness_s1_grid"]
+        self.assertEqual("pass", grid_stage["status"])
+        # Both grid rows collected and ran -- not one collection error counted as a test.
+        self.assertEqual(2, grid_stage["stats"]["executed"])
+        # And the injected values, not the target's own literal 3, are what reached the route.
+        receipt = report["stages"]["execution_receipt"]
+        self.assertEqual("pass", receipt["status"])
+        self.assertEqual(["128", "256"], sorted(receipt["executed_shapes"]))
+
+    def test_an_unrelated_parametrize_does_not_disable_the_channel(self):
+        """The partial-overlap guard belongs to a test function, not to a file.
+
+        Evaluated file-wide, `test_unrelated`'s `(m, other)` mark -- which overlaps the
+        requested names without being contained in them -- switched the channel off for every
+        test in the file, and the skip text then blamed the target for taking parameters it
+        demonstrably takes. The plugin has always decided per metafunc; only the executor's
+        reachability probe was file-scoped.
+        """
+        patch = self.fixture.make_patch(
+            self.add_target_with_an_unrelated_parametrize, "two-marks.patch"
+        )
+
+        _, report = self.fixture.validate(
+            patch,
+            tests="tests/test_two_marks.py",
+            expected_route="test_two_marks:run_kernel",
+            shape_env=None,
+            shape_argnames="m,n",
+            shape_vars="m,n",
+            grid_value="128,7;256,9",
+        )
+
+        self.assertEqual("pytest", report["test_selection"]["grid_channel"])
+        self.assertEqual("", report["test_selection"]["grid_channel_reason"])
+        grid_stage = report["stages"]["correctness_s1_grid"]
+        self.assertEqual("pass", grid_stage["status"])
+        # Two grid rows for test_shapes plus the one unrelated case, which kept its own
+        # parametrization: it asserts (11, 'keep') and would have failed had the grid been
+        # substituted into it.
+        self.assertEqual(3, grid_stage["stats"]["executed"])
+        receipt = report["stages"]["execution_receipt"]
+        self.assertEqual(["128,7", "256,9"], sorted(receipt["executed_shapes"]))
+
+    def test_a_failed_grid_run_does_not_erase_the_repository_run_receipt(self):
+        """Receipts are per label, because evidence already collected must not be deleted.
+
+        `head-repo` and `head-grid` shared `$WORK/head/execution-receipt.json`. The grid run
+        starts by removing that path, so a grid phase that observed nothing overwrote a
+        receipt that had already proved the route, and the report then said the route never
+        executed -- an erasure reported as an absence.
+        """
+        patch = self.fixture.make_patch(
+            self.add_target_that_rejects_the_grid_after_the_route_ran,
+            "receipt-erasure.patch",
+        )
+
+        _, report = self.fixture.validate(
+            patch,
+            tests="tests/test_late_grid.py",
+            expected_route="test_late_grid:run_kernel",
+            shape_env=None,
+            shape_argnames="m",
+            shape_vars="m",
+            grid_value="128;256",
+        )
+
+        # The grid phase really did fail; that is the premise, not the thing under test.
+        self.assertEqual("fail", report["stages"]["correctness_s1_grid"]["status"])
+        receipt = report["stages"]["execution_receipt"]
+        self.assertEqual("pass", receipt["status"])
+        self.assertEqual("test_late_grid:run_kernel", receipt["route"])
+        # The receipt that speaks is the repository run's, which observed the route.
+        self.assertEqual(["3"], receipt["executed_shapes"])
+
+    def test_invalid_grid_probe_needs_a_passing_control_before_it_proves_anything(self):
+        """A non-zero probe exit is evidence about the GRID only if the target works without it.
+
+        On a held-out PR whose module could not be imported, the invalid-grid probe failed for
+        that reason and the channel was credited although no shape ever reached the kernel.
+        The break is planted on BASE, so the base control run is red before the grid is ever
+        involved.
+        """
+        path = self.fixture.repo / "tests" / "test_sample.py"
+        path.write_text(
+            "raise ImportError('the module under test cannot be imported')\n"
+            + path.read_text()
+        )
+        run(["git", "add", "-A"], cwd=self.fixture.repo)
+        run(
+            [
+                "git",
+                "-c",
+                "user.name=Validator Test",
+                "-c",
+                "user.email=validator@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "broken base",
+            ],
+            cwd=self.fixture.repo,
+        )
+        patch = self.fixture.make_patch(
+            ValidateKernelPrTests.harmless_change, "broken-control.patch"
+        )
+
+        _, report = self.fixture.validate(patch)
+
+        baseline_grid = report["stages"]["baseline_control"]["s1_grid"]
+        self.assertEqual("hook-not-consumed", baseline_grid["state"])
+        # No base grid run was attempted, so there is no exit code to report for one.
+        self.assertNotIn("exit", baseline_grid)
+        self.assertNotEqual("pass", report["stages"]["correctness_s1_grid"]["status"])
+
+    def test_working_cli_channel_survives_a_second_shape_flag(self):
+        """Supplying --shape-arg AND --shape-env must not discard the CLI channel.
+
+        The two probes describe one target that may have both hooks. An earlier version
+        assigned the env probe's result over the CLI probe's unconditionally, so a
+        caller who named both flags lost a working CLI channel and was then told the env
+        variable's absence was the reason no grid ran.
+        """
+        patch = self.fixture.make_patch(self.add_cli_shape_script, "cli-channel.patch")
+
+        _, report = self.fixture.validate(
+            patch,
+            tests="tests/run_shapes.py",
+            expected_route="__main__:run_kernel",
+            shape_env="UNREAD_GRID_ENV",
+            shape_arg="--shape",
+            # Deliberately NOT the target's own `--shape` default of 7,257,f32. This test is
+            # about which channel carries the grid, but a grid that only re-runs the
+            # target's defaults is now downgraded to `skip` on independence grounds, and
+            # that would mask the channel result this test exists to check.
+            grid_value="9,1023,f32",
+        )
+
+        self.assertEqual("cli", report["test_selection"]["grid_channel"])
+        self.assertEqual("", report["test_selection"]["grid_channel_reason"])
+        self.assertEqual(
+            "adds-coverage", report["test_selection"]["grid_independence"]
+        )
+        grid_stage = report["stages"]["correctness_s1_grid"]
+        self.assertNotEqual("skip", grid_stage["status"])
+        self.assertEqual("pass", grid_stage["status"])
+
+    def test_parametrized_target_runs_the_grid_through_the_pytest_channel(self):
+        """The third channel: pytest's own parametrization.
+
+        The target exposes neither a flag nor an environment variable, so before this
+        channel existed the stage was inert and the skip text blamed the kernel for a
+        limit that belonged to the injector.
+        """
+        patch = self.fixture.make_patch(
+            self.add_parametrized_target, "pytest-channel.patch"
+        )
+
+        _, report = self.fixture.validate(
+            patch,
+            tests="tests/test_parametrized.py",
+            expected_route="test_parametrized:run_kernel",
+            shape_env=None,
+            shape_argnames="M,N,dtype_str",
+            grid_value="7,257,f32;8,513,bf16",
+        )
+
+        self.assertEqual("pytest", report["test_selection"]["grid_channel"])
+        grid_stage = report["stages"]["correctness_s1_grid"]
+        self.assertNotEqual("skip", grid_stage["status"])
+        self.assertEqual("pass", grid_stage["status"])
+        self.assertEqual(2, grid_stage["stats"]["executed"])
+        # The grid actually reached the kernel: the receipt carries the injected shapes,
+        # not the (3, 5, "f32") literal the target parametrizes for itself.
+        receipt = report["stages"]["execution_receipt"]
+        self.assertEqual("pass", receipt["status"])
+        self.assertEqual(
+            ["7,257,f32", "8,513,bf16"], sorted(receipt["executed_shapes"])
+        )
+        # The invalid-grid probe must fail INSIDE THE TARGET. A poisoned row of the
+        # wrong arity would raise in the plugin instead, and its non-zero exit would
+        # credit the channel without the target ever having consumed a shape.
+        probe_log = Path(grid_stage["hook_probe_log"]).read_text()
+        self.assertNotIn("grid rows must have", probe_log)
+        self.assertIn("__VALIDATOR_INVALID_GRID__", probe_log)
+
+    def test_undeliverable_grid_names_the_channel_and_blames_the_right_party(self):
+        """A skip has to say which channel was tried and what was found there.
+
+        --shape-arg against a pytest target is a gap in the validator's own wiring, and
+        publishing it as a property of the target would send a reviewer to fix a kernel
+        that is not broken.
+        """
+        patch = self.fixture.make_patch(
+            ValidateKernelPrTests.harmless_change, "no-channel.patch"
+        )
+
+        _, report = self.fixture.validate(
+            patch,
+            shape_env="UNREAD_GRID_ENV",
+            shape_arg="--shape",
+        )
+
+        self.assertEqual("", report["test_selection"]["grid_channel"])
+        reason = report["test_selection"]["grid_channel_reason"]
+        self.assertIn("a validator limit, not a target property", reason)
+        self.assertIn("--shape", reason)
+        self.assertIn("does not read $UNREAD_GRID_ENV", reason)
+        self.assertEqual("skip", report["stages"]["correctness_s1_grid"]["status"])
+
+
+class ExecutionReceiptTests(unittest.TestCase):
+    """The receipt must not report `pass` beside evidence it never collected."""
+
+    def setUp(self):
+        self.fixture = ValidatorFixture()
+
+    def tearDown(self):
+        self.fixture.close()
+
+    @staticmethod
+    def derive_shapes_in_the_body(repo):
+        """Make the route take one opaque argument and unpack the shape inside itself --
+        the common case for a kernel whose arguments are tensors."""
+        path = repo / "tests" / "test_sample.py"
+        source = path.read_text()
+        source = source.replace(
+            "def run_kernel(M, N, dtype_str):\n"
+            "    assert M > 0 and N > 0 and dtype_str\n",
+            "def run_kernel(spec):\n"
+            "    M, N, dtype_str = spec.split(',')\n"
+            "    M = int(M)\n"
+            "    N = int(N)\n"
+            "    assert M > 0 and N > 0 and dtype_str\n",
+        )
+        source = source.replace(
+            "        M, N, dtype_str = shape.split(',')\n"
+            "        run_kernel(int(M), int(N), dtype_str)\n",
+            "        run_kernel(shape)\n",
+        )
+        path.write_text(source)
+
+    def test_shapes_derived_in_the_route_body_are_captured(self):
+        """Sampling f_locals only on the `call` event sees parameters and nothing else.
+
+        A route that derives its shapes in its body therefore produced an empty
+        executed_shapes while the receipt still reported pass -- an absence published as
+        a confirmation. The probe now samples again on `return`, when body locals are
+        bound.
+        """
+        patch = self.fixture.make_patch(
+            self.derive_shapes_in_the_body, "body-shapes.patch"
+        )
+
+        result, report = self.fixture.validate(patch)
+
+        receipt = report["stages"]["execution_receipt"]
+        self.assertEqual("pass", receipt["status"])
+        self.assertEqual(["7,257,f32"], receipt["executed_shapes"])
+        self.assertNotIn("shape_capture", receipt)
+        self.assertEqual(0, result.returncode)
+        self.assertEqual("PASS", report["verdict"])
+
+
+class ProbeReceiptTests(unittest.TestCase):
+    """Unit-level checks on the probe and the evidence checker it feeds."""
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    def run_probe(self, target_source, shape_vars, route_suffix="run_kernel"):
+        """Generate the probe exactly as validate_pr.sh does and run pytest under it."""
+        directory = Path(self.tempdir.name)
+        target = directory / "test_route.py"
+        target.write_text(target_source)
+        receipt = directory / "execution-receipt.json"
+        route = f"test_route:{route_suffix}"
+        probe = directory / "validation_probe_under_test.py"
+        probe.write_text(
+            (SKILL_DIR / "validation_probe.py").read_text()
+            + f"\n_VALIDATION_EXPECTED_ROUTE = {route!r}\n"
+            + f"_VALIDATION_SHAPE_VARS = {shape_vars!r}\n"
+            + f"_VALIDATION_RECEIPT_PATH = {str(receipt)!r}\n"
+        )
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(directory)
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-p",
+                "validation_probe_under_test",
+                str(target),
+                "-q",
+                "-o",
+                f"cache_dir={directory}/pytest-cache",
+            ],
+            cwd=directory,
+            env=environment,
+        )
+        return route, receipt, json.loads(receipt.read_text())
+
+    def test_two_calls_to_one_route_produce_two_shape_rows(self):
+        """Each call is its own row.
+
+        The pending-capture table is keyed by the frame OBJECT. Keying it by id() would
+        be wrong for exactly this case: a freed frame's address is reused, so the second
+        call's frame can present the identity of the first and be treated as already
+        recorded.
+        """
+        _, _, receipt = self.run_probe(
+            "def run_kernel(spec):\n"
+            "    M, N, dtype_str = spec.split(',')\n"
+            "    M = int(M)\n"
+            "    N = int(N)\n"
+            "    assert M > 0\n"
+            "\n"
+            "def test_two_calls():\n"
+            "    run_kernel('7,257,f32')\n"
+            "    run_kernel('8,513,bf16')\n",
+            "M,N,dtype_str",
+        )
+
+        self.assertEqual(["7,257,f32", "8,513,bf16"], receipt["executed_shapes"])
+
+    def test_requested_but_empty_capture_is_declared_in_the_result(self):
+        """An empty `executed_shapes`, from a route that bound none of the requested
+        names, is an absence of evidence. The result has to say so rather than let a
+        consumer read the empty list as "no shapes were needed"."""
+        route, receipt_path, receipt = self.run_probe(
+            "def run_kernel(payload):\n"
+            "    assert payload\n"
+            "\n"
+            "def test_one_call():\n"
+            "    run_kernel({'shape': (7, 257)})\n",
+            "M,N,dtype_str",
+        )
+        self.assertEqual([], receipt["executed_shapes"])
+        # Carried in the receipt so the checker can tell "no shapes were asked for" from
+        # "shapes were asked for and none arrived".
+        self.assertEqual(["M", "N", "dtype_str"], receipt["shape_vars"])
+
+        result = json.loads(
+            run(
+                [
+                    sys.executable,
+                    str(SKILL_DIR / "validate_evidence.py"),
+                    "receipt",
+                    str(receipt_path),
+                    "--expected-route",
+                    route,
+                    "--grid",
+                    "",
+                ]
+            ).stdout
+        )
+
+        self.assertEqual("pass", result["status"])
+        self.assertEqual([], result["executed_shapes"])
+        self.assertEqual(["M", "N", "dtype_str"], result["shape_capture"]["requested"])
+        self.assertEqual(0, result["shape_capture"]["observed"])
+        self.assertIn("makes no claim", result["shape_capture"]["note"])
+
+
+class EvidenceCheckerTests(unittest.TestCase):
+    """Unit-level checks on validate_evidence.py, where the report's numbers come from."""
+
+    RECEIPT = {
+        "schema_version": 1,
+        "producer": "validate-kernel-pr.validation_probe",
+        "route": "test_route:run_kernel",
+        "kernel_symbols": ["test_route:run_kernel"],
+        "executed_shapes": ["3,5"],
+        "shape_vars": ["m", "n"],
+        "pytest_exitstatus": 0,
+    }
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.directory = Path(self.tempdir.name)
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    def evidence(self, *arguments):
+        return json.loads(
+            run(
+                [sys.executable, str(SKILL_DIR / "validate_evidence.py"), *arguments]
+            ).stdout
+        )
+
+    def test_junit_errors_are_not_counted_as_executed_tests(self):
+        """An error is a collection or fixture failure: the test body never ran.
+
+        Counting it as executed let a target that could not even be imported credit
+        `arch_coverage` with RUNTIME coverage -- on the strength of an "executed test" that
+        was the collection error itself.
+        """
+        junit = self.directory / "junit.xml"
+        junit.write_text(
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<testsuites><testsuite name="pytest" errors="1" failures="0" '
+            'skipped="0" tests="1" time="0.01" /></testsuites>\n'
+        )
+
+        stats = self.evidence("pytest-stats", str(junit))
+
+        self.assertEqual(1, stats["tests"])
+        self.assertEqual(1, stats["errors"])
+        self.assertEqual(0, stats["executed"])
+
+    def test_pytest_channel_receipt_does_not_assert_across_namespaces(self):
+        """The grid is delivered as test PARAMETERS; the receipt records the ROUTE's locals.
+
+        Requiring one to contain the other produced "execution receipt is missing required
+        shapes" on a run whose every grid case passed. The requirement is still recorded and
+        the mismatch is named; only the cross-namespace containment assertion is dropped.
+        """
+        path = self.directory / "receipt.json"
+        path.write_text(json.dumps(self.RECEIPT))
+
+        result = self.evidence(
+            "receipt",
+            str(path),
+            "--expected-route",
+            "test_route:run_kernel",
+            "--grid",
+            "128,7;256,9",
+            "--grid-channel",
+            "pytest",
+        )
+
+        self.assertEqual("pass", result["status"])
+        # The grid's requirement is not discarded, only its containment assertion.
+        self.assertEqual(["128,7", "256,9"], result["required_shapes"])
+        self.assertEqual(["3,5"], result["executed_shapes"])
+        self.assertIn("different vocabularies", result["shape_namespace"])
+
+    def test_a_channel_that_shares_the_receipt_namespace_still_must_contain_the_grid(self):
+        """The control for the test above: without the pytest channel, nothing is relaxed.
+
+        The env and CLI channels put the grid into the same vocabulary the receipt records,
+        so a missing shape there is still a real gap in coverage.
+        """
+        path = self.directory / "receipt.json"
+        path.write_text(json.dumps(self.RECEIPT))
+
+        result = self.evidence(
+            "receipt",
+            str(path),
+            "--expected-route",
+            "test_route:run_kernel",
+            "--grid",
+            "128,7;256,9",
+            "--grid-channel",
+            "env",
+        )
+
+        self.assertEqual("skip", result["status"])
+        self.assertIn("missing required shapes", result["note"])
+
+    def test_empty_native_artifact_list_states_what_it_does_not_mean(self):
+        """`native_artifacts: []` was published as though it were a measurement.
+
+        The probe runs BEFORE the target and imports only the named module, so an empty list
+        describes that import and nothing else. Three real runs recorded it on a host where
+        the runtime demonstrably executed the kernel.
+        """
+        fixture = ValidatorFixture()
+        try:
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = str(fixture.repo)
+            identity = json.loads(
+                run(
+                    [
+                        sys.executable,
+                        str(SKILL_DIR / "validate_evidence.py"),
+                        "runtime",
+                        "aiter",
+                        str(fixture.repo),
+                    ],
+                    env=environment,
+                ).stdout
+            )
+        finally:
+            fixture.close()
+
+        self.assertEqual([], identity["native_artifacts"])
+        basis = identity["native_artifacts_basis"]
+        self.assertTrue(basis)
+        self.assertIn("aiter", basis)
+        self.assertIn("not evidence", basis)
 
 
 class IndexScannerTests(unittest.TestCase):
@@ -1566,6 +3037,109 @@ class IndexScannerTests(unittest.TestCase):
         return path
 
 
+class GpuPickerTests(unittest.TestCase):
+    def test_shipped_picker_returns_translated_hip_index(self):
+        fixture = ValidatorFixture()
+        try:
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = str(fixture.fake_modules)
+            result = run(
+                [
+                    sys.executable,
+                    str(SHIPPED_PICKER),
+                    "--samples",
+                    "1",
+                    "--interval",
+                    "0",
+                    "--quiet",
+                ],
+                env=environment,
+            )
+        finally:
+            fixture.close()
+
+        self.assertEqual("57", result.stdout.strip())
+
+
+class GpuClaimTests(unittest.TestCase):
+    """Claiming a device is evidence, so how it is claimed has to be evidence too."""
+
+    def setUp(self):
+        self.fixture = ValidatorFixture()
+
+    def tearDown(self):
+        self.fixture.close()
+
+    def test_contended_lock_falls_through_to_the_next_idle_gpu(self):
+        """The picker is deterministic, so concurrent validators pick the same device.
+
+        Locking only the first choice meant all but one reported NO_GPU while the rest
+        of the machine sat idle. The claim now walks the whole eligible ranking.
+        """
+        picker = self.fixture.tools / "ranking-picker"
+        # HIP 61 ranks first and is unavailable; 57 is the index the fake amdsmi can map.
+        # Both are deliberately fake indices, so this never contends with a real device.
+        write_executable(
+            picker,
+            "#!/usr/bin/env bash\n"
+            "printf 'idleness-basis: activity+vram\\n' >&2\n"
+            'for arg in "$@"; do\n'
+            '  if [ "$arg" = "--all" ]; then printf \'61\\n57\\n\'; exit 0; fi\n'
+            "done\n"
+            "printf '61\\n'\n",
+        )
+        patch = self.fixture.make_patch(
+            ValidateKernelPrTests.harmless_change, "lock-race.patch"
+        )
+
+        # A real flock on the real path the validator locks, held for the whole run. Taken
+        # in this process rather than a helper: the validator's lock is on its own file
+        # description, so it contends exactly as another validator's would, and there is no
+        # child left holding /tmp/gpu-61.lock if this test is interrupted.
+        holder = open("/tmp/gpu-61.lock", "w")
+        try:
+            fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _, report = self.fixture.validate(patch, picker=picker)
+        finally:
+            fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+            holder.close()
+
+        claim = report["stages"]["gpu_claim"]
+        self.assertEqual("pass", claim["status"])
+        self.assertEqual(57, claim["hip_index"])
+        self.assertNotEqual("NO_GPU", report["degraded_mode"])
+
+    def test_shipped_picker_wins_over_one_earlier_on_path(self):
+        """The shipped picker is part of the evidence contract: it is the thing
+        that prints `idleness-basis:`.
+
+        Resolving PATH first silently substituted a foreign picker that omits that line,
+        and the report then published `idleness_basis: "unknown"` beside a concrete
+        `gfx_activity_before_pct: 0` -- an unavailable reading presented as a measured
+        idle one. An explicit PICKER still wins; this is only the default.
+        """
+        foreign = self.fixture.root / "foreign-bin"
+        foreign.mkdir()
+        write_executable(
+            foreign / "pick-idle-gpu.py",
+            "#!/usr/bin/env bash\nprintf '3\\n'\n",
+        )
+        patch = self.fixture.make_patch(
+            ValidateKernelPrTests.harmless_change, "picker-order.patch"
+        )
+
+        _, report = self.fixture.validate(
+            patch,
+            path_prefix=foreign,
+            use_picker_env=False,
+        )
+
+        claim = report["stages"]["gpu_claim"]
+        self.assertEqual("pass", claim["status"])
+        self.assertEqual(57, claim["hip_index"])
+        self.assertEqual("activity+vram", claim["idleness_basis"])
+
+
 class ScannerScopeTests(unittest.TestCase):
     def _scan(self, source):
         with tempfile.TemporaryDirectory() as directory:
@@ -1604,106 +3178,147 @@ class ScannerScopeTests(unittest.TestCase):
         self.assertEqual(1, payload["host_scope_candidates"], payload)
 
 
-class ProbeReceiptTests(unittest.TestCase):
-    """Unit-level checks on the probe and the evidence checker it feeds."""
+class ShapeGridPluginTests(unittest.TestCase):
+    """The plugin is what substitutes the grid, so its refusals are what keep a target the
+    grid cannot express from being reported as a failing PR."""
 
-    def setUp(self):
-        self.tempdir = tempfile.TemporaryDirectory()
+    def _run_target(self, argnames, grid, target_source):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plugin = root / "sgp.py"
+            plugin.write_text(
+                (SKILL_DIR / "shape_grid_plugin.py").read_text()
+                + f"\n_VALIDATION_SHAPE_ARGNAMES = {argnames!r}\n"
+                + f"_VALIDATION_SHAPE_GRID = {grid!r}\n"
+            )
+            target = root / "test_target.py"
+            target.write_text(target_source)
+            return subprocess.run(
+                [sys.executable, "-m", "pytest", "-p", "sgp", str(target), "-q"],
+                cwd=root, capture_output=True, text=True,
+            )
 
-    def tearDown(self):
-        self.tempdir.cleanup()
-
-    def run_probe(self, target_source, shape_vars, route_suffix="run_kernel"):
-        """Generate the probe exactly as validate_pr.sh does and run pytest under it."""
-        directory = Path(self.tempdir.name)
-        target = directory / "test_route.py"
-        target.write_text(target_source)
-        receipt = directory / "execution-receipt.json"
-        route = f"test_route:{route_suffix}"
-        probe = directory / "validation_probe_under_test.py"
-        probe.write_text(
-            (SKILL_DIR / "validation_probe.py").read_text()
-            + f"\n_VALIDATION_EXPECTED_ROUTE = {route!r}\n"
-            + f"_VALIDATION_SHAPE_VARS = {shape_vars!r}\n"
-            + f"_VALIDATION_RECEIPT_PATH = {str(receipt)!r}\n"
+    def test_dict_valued_parametrize_is_refused_rather_than_poisoned(self):
+        # A target parametrizing one `case: dict` passed the argnames-only gate, the grid
+        # substituted integers, and the target raised TypeError -- which the executor
+        # published as "the PR adds this target and its independent shape grid fails", a
+        # BLOCK against an author whose own suite was green in the same report.
+        result = self._run_target(
+            ("case",),
+            [(1,), (513,)],
+            "import pytest\n"
+            '@pytest.mark.parametrize("case", [{"m": 1}, {"m": 3}])\n'
+            "def test_case(case):\n"
+            "    assert case['m'] > 0\n",
         )
-        environment = os.environ.copy()
-        environment["PYTHONPATH"] = str(directory)
-        environment["PYTHONDONTWRITEBYTECODE"] = "1"
-        run(
-            [
-                sys.executable,
-                "-m",
-                "pytest",
-                "-p",
-                "validation_probe_under_test",
-                str(target),
-                "-q",
-                "-o",
-                f"cache_dir={directory}/pytest-cache",
-            ],
-            cwd=directory,
-            env=environment,
-        )
-        return route, receipt, json.loads(receipt.read_text())
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn("2 passed", result.stdout)
+        self.assertNotIn("TypeError", result.stdout + result.stderr)
 
-    def test_two_calls_to_one_route_produce_two_shape_rows(self):
-        """Each call is its own row.
-
-        The pending-capture table is keyed by the frame OBJECT. Keying it by id() would
-        be wrong for exactly this case: a freed frame's address is reused, so the second
-        call's frame can present the identity of the first and be treated as already
-        recorded.
-        """
-        _, _, receipt = self.run_probe(
-            "def run_kernel(spec):\n"
-            "    M, N, dtype_str = spec.split(',')\n"
-            "    M = int(M)\n"
-            "    N = int(N)\n"
-            "    assert M > 0\n"
-            "\n"
-            "def test_two_calls():\n"
-            "    run_kernel('7,257,f32')\n"
-            "    run_kernel('8,513,bf16')\n",
-            "M,N,dtype_str",
-        )
-
-        self.assertEqual(["7,257,f32", "8,513,bf16"], receipt["executed_shapes"])
-
-    def test_requested_but_empty_capture_is_declared_in_the_result(self):
-        """An empty `executed_shapes`, from a route that bound none of the requested
-        names, is an absence of evidence. The result has to say so rather than let a
-        consumer read the empty list as "no shapes were needed"."""
-        route, receipt_path, receipt = self.run_probe(
-            "def run_kernel(payload):\n"
-            "    assert payload\n"
-            "\n"
-            "def test_one_call():\n"
-            "    run_kernel({'shape': (7, 257)})\n",
-            "M,N,dtype_str",
-        )
-        self.assertEqual([], receipt["executed_shapes"])
-        # Carried in the receipt so the checker can tell "no shapes were asked for" from
-        # "shapes were asked for and none arrived".
-        self.assertEqual(["M", "N", "dtype_str"], receipt["shape_vars"])
-
-        result = json.loads(
-            run(
+    def test_grid_arity_mismatch_is_rejected_at_invocation(self):
+        # The arity check lived in the plugin generator, whose exit status run_pytest never
+        # read: the stale plugin from the previous phase survived, head-grid re-ran the
+        # invalid-grid sentinel, and its failure was published as "the PR adds this target and
+        # its independent shape grid fails" -- a blocker produced by a caller's typo. It is
+        # now refused at argument parsing, before any phase can run.
+        fixture = ValidatorFixture()
+        try:
+            result = subprocess.run(
                 [
-                    sys.executable,
-                    str(SKILL_DIR / "validate_evidence.py"),
-                    "receipt",
-                    str(receipt_path),
-                    "--expected-route",
-                    route,
-                    "--grid",
-                    "",
-                ]
-            ).stdout
-        )
+                    str(VALIDATOR),
+                    "--repo", str(fixture.repo),
+                    "--target", "tests/test_sample.py",
+                    "--shape-argnames", "m",
+                    "--grid", "255,3;512,4",
+                ],
+                capture_output=True, text=True,
+            )
+        finally:
+            fixture.close()
+        self.assertEqual(2, result.returncode, result.stdout + result.stderr)
+        self.assertIn("--grid", result.stderr)
 
-        self.assertEqual("pass", result["status"])
-        self.assertEqual([], result["executed_shapes"])
-        self.assertEqual(["M", "N", "dtype_str"], result["shape_capture"]["requested"])
-        self.assertEqual(0, result["shape_capture"]["observed"])
-        self.assertIn("makes no claim", result["shape_capture"]["note"])
+    def test_a_single_scalar_argname_is_substituted(self):
+        # The same code path with scalar values must still replace the target's own literals,
+        # or the refusal above would have been bought by disabling the channel.
+        result = self._run_target(
+            ("m",),
+            [(3,), (15,), (32,)],
+            "import pytest\n"
+            '@pytest.mark.parametrize("m", [1, 2])\n'
+            "def test_m(m):\n"
+            "    assert m in (3, 15, 32)\n",
+        )
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn("3 passed", result.stdout)
+
+
+class ReviewSkillContractTests(unittest.TestCase):
+    def test_review_skill_is_advisory_and_has_no_dead_scanner_paths(self):
+        review_skill = (SKILL_DIR.parent / "review-pr" / "SKILL.md").read_text()
+
+        self.assertTrue((SKILL_DIR / "validate_evidence.py").is_file())
+        self.assertTrue((SKILL_DIR / "validation_probe.py").is_file())
+        self.assertTrue(SHIPPED_PICKER.is_file())
+        self.assertIn("advisory tier", review_skill)
+        self.assertIn("required scanner is missing or not executable", review_skill)
+        self.assertIn("Validation (deterministic)", review_skill)
+        self.assertIn("baseRefName", review_skill)
+        self.assertIn("base_head.txt", review_skill)
+        self.assertIn("expected_verdict", review_skill)
+        self.assertIn("if stats is not None", review_skill)
+        self.assertNotIn("downstream-impact-check", review_skill)
+        self.assertNotIn("review-flydsl-kernel/scan_", review_skill)
+
+    def test_review_fetch_snippet_parses_as_bash(self):
+        review_skill = (SKILL_DIR.parent / "review-pr" / "SKILL.md").read_text()
+        match = re.search(
+            r"## Step 1 — Fetch.*?```bash\n(.*?)\n```",
+            review_skill,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(match)
+        result = subprocess.run(
+            ["bash", "-n"],
+            input=match.group(1),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_perf_harness_detection_agrees_across_both_skills(self):
+        """review-pr and the validator must classify a target identically.
+
+        Each file carries a comment telling the next reader to keep the two in step. A
+        comment cannot enforce that. If they drift, review-pr prints a manual recipe for a
+        harness the validator declined to use -- or, worse, prints "no benchmark entry
+        point" for a target the validator happily timed.
+        """
+        review_skill = (SKILL_DIR.parent / "review-pr" / "SKILL.md").read_text()
+        validator = VALIDATOR.read_text()
+
+        review_body = re.search(
+            r"def perf_command\(path\):(.*?)\n\n", review_skill, re.DOTALL
+        )
+        validator_body = re.search(
+            r"perf_detect\(\).*?<<'PY'\n(.*?)\nPY", validator, re.DOTALL
+        )
+        self.assertIsNotNone(review_body)
+        self.assertIsNotNone(validator_body)
+
+        for name, body in (
+            ("review-pr", review_body.group(1)),
+            ("validate_pr.sh", validator_body.group(1)),
+        ):
+            self.assertIn('"--scenario" in text', body, name)
+            self.assertIn('"bench" in text', body, name)
+            self.assertIn('"perftest" in text', body, name)
+            # `run_perftest` is a strict subset of `perftest`, so testing the longer name
+            # only narrows coverage. It missed 12 of aiter's 123 op_tests/ targets, every
+            # one of which does have a timing harness.
+            self.assertNotIn('"run_perftest" in text', body, name)
+
+
+if __name__ == "__main__":
+    unittest.main()

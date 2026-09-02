@@ -77,20 +77,48 @@ For a local candidate with no remote head, omit `--head-sha`. The report then re
 | `--shape-vars` | comma-separated local names captured from each route call, in grid order |
 | `--shape-env` `--grid` | env var and shape list for the S1-owned grid |
 | `--shape-arg` | the target's own CLI flag that accepts shapes, for script targets that read no env var |
+| `--shape-argnames` | the pytest parameter names the grid should replace, for targets whose shapes are literals inside `@pytest.mark.parametrize` |
+| `--axis` | repeatable `NAME=FLAG:v1;v2;…` — an extra independent test axis on its own CLI flag (see [`axes`](#axes-when-the-failing-configuration-is-not-a-shape)) |
+| `--runner` | force `pytest` or `script` when the structural classifier gets it wrong; the report records both the forced choice and what selection had said |
+| `--perf-control-column` | a timing column the patch does not touch; required before a transplanted baseline is believed (see [`perf`](#8--perf)) |
 | `--tol-table` | reference tolerances recorded alongside the head-vs-base comparison (see [`test_policy`](#4--test_policy--run-before-the-suite)) |
 | `--perf-args` | benchmark entry point for the timing stage; also forces perf on when detection would decline |
 | `--no-perf` | skip the timing stage entirely |
 | `--label` `--out` | run name and report path (default `./validation_report.json`) |
 
-Environment knobs: `PYLIB` (runtime modules outside the checkout), `PYTHON_BIN` (one interpreter
-used for pytest and script targets), `PICKER` (override the shipped `pick-idle-gpu.py`), and
-`TIMEOUT` (per-target budget, default 1800s). The timing stage adds `PERF_TIMEOUT` (its own budget,
-defaulting to `TIMEOUT`, because a bench sweep is legitimately longer than a correctness run),
-`PERF_REPEAT` (runs per side, default 3), `PERF_THRESHOLD` (head/base ratio that counts as a
-regression, default 0.95) and `PERF_MIN_ROWS` (matched rows required before any ratio is reported,
-default 3). The executor
-overrides `AITER_JIT_DIR` with separate fresh base/head directories and sets
-`PYTHONDONTWRITEBYTECODE=1`, so repository JIT output cannot cross phases or dirty the worktree.
+Several settings are environment variables rather than flags, because they describe the **host**
+rather than the PR under test, and a caller validating many PRs on one machine sets them once:
+
+| env | meaning |
+|---|---|
+| `PYLIB` | runtime modules living outside the checkout |
+| `PYTHON_BIN` | the one interpreter used for both pytest and script targets |
+| `PICKER` | override the shipped `pick-idle-gpu.py`; unset, the **shipped** picker is used, and only then one found on `PATH` |
+| `TIMEOUT` | per-target budget, default 1800s |
+| `PERF_TIMEOUT` | the timing stage's own budget, defaulting to `TIMEOUT`, because a bench sweep is legitimately longer than a correctness run |
+| `PERF_REPEAT` | runs per side, default 3 |
+| `PERF_THRESHOLD` | head/base ratio that counts as a regression, default 0.95 |
+| `PERF_MIN_ROWS` | matched rows required before any ratio is reported, default 3 |
+
+Everything that describes the PR is a flag. The executor also overrides `AITER_JIT_DIR` with
+separate fresh base/head directories and sets `PYTHONDONTWRITEBYTECODE=1`, so repository JIT
+output cannot cross phases or dirty the worktree.
+
+### Which shape channel to name
+
+The three shape flags are alternatives, not a sequence; supply the one the target actually has.
+The report says which channel was established in `test_selection.grid_channel`, and when none
+was, `test_selection.grid_channel_reason` names each channel tried and what was found in the
+target — so a failed guess costs one run, not a reading of this file.
+
+| the target takes its shapes from | flag | what is checked before the channel is credited |
+|---|---|---|
+| an environment variable it reads | `--shape-env` | the source reads that name via `os.getenv` / `os.environ` |
+| its own CLI flag | `--shape-arg` | the source passes that flag literal to `add_argument` |
+| `@pytest.mark.parametrize` literals | `--shape-argnames` | the source binds all those names as test parameters |
+
+All three are then held to the same proof: a deliberately unusable grid must make the target
+**fail**. A target that ignores the grid produces a skip, never a pass.
 
 ---
 
@@ -199,6 +227,13 @@ Runner selection is structural, not assumed:
 - otherwise a file with an `if __name__ == "__main__"` guard runs as `python <file>`;
 - a file with neither is `skip`, never a test failure.
 
+Selection can still pick a runner the target cannot survive. A file that defines `test*` nodes
+**and** parses argv in its module body is collected by pytest, which imports it with pytest's
+own argv — and argparse exits the process, while the same file is green run as a script.
+`test_selection.runner_risk` names that structurally, and a run that executes nothing under
+the selected runner says so: *"red on both sides"* is an attribution, not an explanation, and a
+reader who is not told otherwise concludes the code is broken when the runner choice is.
+
 The report records `test_selection.runner` and `runner_reason`. A script target is profiled the
 same way a pytest target is: the probe is installed by a validator-owned runner that then executes
 the file under `runpy` with `run_name="__main__"`, so `execution_receipt` is reachable for both.
@@ -206,8 +241,20 @@ Nothing about `sys.setprofile` needed pytest; pytest was only where the hook was
 
 Both, and they are reported separately, because the interesting case is when they disagree.
 Pytest runs emit JUnit XML and a zero-executed/all-skipped target is `skip`, never `pass`.
-Script runs record their process exit and whether they produced output under an explicit
-`script-*` evidence basis; those counters are not described as JUnit.
+
+A script target publishes no per-case count, so its `executed` is a liveness signal and
+nothing more — it says the process ran. What it must not do is stand in for work. A target
+that returns silently with exit 0 and a log line (aiter#4538's does, when the arch is
+unsupported or an optional package is missing) produced exactly the same `executed: 1` as
+the run that graded 56 cases, and earned the same `arch_coverage: runtime` on basis
+`script-exit-zero-with-output` — a statement about the process, not the kernel. So:
+
+- `stats.observed_work` carries the only number backed by evidence: route calls counted in
+  **that run's own** execution receipt. It is `null` when no route was named, because
+  nothing was watched;
+- `arch_coverage` credits nothing when `observed_work` is `0` — a route was watched for and
+  never reached the device — and `arch_coverage_basis` prints the count and its provenance
+  rather than implying a measurement.
 
 For a patch run, the validator reverses the exact patch to create the baseline, verifies that the
 worktree is clean, runs both targets under base-only caches, and reapplies the patch before a
@@ -245,6 +292,60 @@ positive control against reporting the same default test run twice under differe
 When the kernel exposes no shape override, the report says `repo-default-only` rather than
 claiming coverage it does not have.
 
+**A proven channel is not the same as added coverage.** A target that consumes the grid can
+still be handed cells it already runs by default. On ROCm/aiter#4538 all three requested
+shapes were in the target's own `--shapes` default list, so the "independent" grid re-ran a
+strict subset of the repository run and the stage reported `pass` — the exact duplication
+this stage exists to prevent, invisible in the report. The grid cells are therefore compared
+against the target's own declared default for the same flag, and
+`test_selection.grid_independence` is one of:
+
+| value | meaning |
+|---|---|
+| `adds-coverage` | at least one cell is outside the target's own default |
+| `duplicates-target-defaults` | every cell is already a default; a passing run is downgraded to `skip` and the verdict to `INCONCLUSIVE`, because a passing duplicate proves only what `correctness_repo_tests` already said |
+| `unknown` | the channel exposes no literal default to compare against (every env-var channel, and a flag whose default is computed) |
+
+A duplicate grid that **fails** keeps its `fail`. The finding is real; what a duplicate
+cannot do is earn a pass.
+
+#### Axes: when the failing configuration is not a shape
+
+`--grid` is one ordered tuple on one channel, which is all a target's shape flag accepts. A
+target whose remaining knobs are separate flags — head counts, dtypes, window modes — could
+not be gridded over them at all, so entire configurations were unreachable however the grid
+was spelled. That is not a missing shape; it is a missing axis.
+
+aiter#4538 is the case: `--shapes` carries `(seq_len, seq_len_kv)` while `--num-heads` is its
+own flag defaulting to `64 128`, and the public API asserts at `num_heads=16` — a real
+blocker the validator had no way to request.
+
+```
+--axis 'num_heads=--num-heads:16;32'
+```
+
+Axes obey the same burden of proof as `--shape-arg`, in two steps, and
+`test_selection.axis_state` names which one it reached:
+
+| state | meaning |
+|---|---|
+| `none` / `unusable` | none requested, or the target is not a script (argv reaches script targets only) |
+| `hook-not-found` | the target's source declares no `add_argument` for that flag |
+| `hook-not-consumed` | the flag was declared but accepted `__VALIDATOR_INVALID_AXIS__`; the axis is **dropped and named**, never dropped quietly |
+| `proven` | every axis flag refused an invalid value, and its values rode the grid run's argv |
+
+Each axis records its own `independence` against the flag's declared default, on the same
+terms as the shape cells. A proven axis that asks for values outside the default makes the
+run independent even when the shape cells duplicate.
+
+A requested axis appears in `test_selection.axes` **whatever** becomes of it, with
+`hook_proof: not-evaluated` when the run never got far enough to scan for the flag. An empty
+`axes` beside a non-`none` `axis_state` would lose the request itself — which is the silently
+narrowed test space these fields exist to make visible. For the same reason
+`grid_independence_reason` names which of the several ways the comparison can be skipped
+actually applied, rather than defaulting to a claim about the target ("the channel exposes no
+declared defaults") that the run never established.
+
 ### 6 — `execution_receipt`
 
 The validator loads its own pytest profiling plugin before test collection. The caller names an
@@ -270,6 +371,33 @@ grid channel could not be established. With no grid it asserts route execution a
 shapes, which is all it is then entitled to claim. Abandoning the receipt along with the grid
 would discard evidence that was already collected.
 
+**One receipt per run, not per phase.** `head-repo` and `head-grid` both execute inside the
+head phase. They shared a receipt path, so the second erased the first, and with the grid
+cells a subset of the target's defaults a receipt written by *either* run satisfied `--grid`
+— which made the grid's own evidence unfalsifiable. Each run now writes
+`execution-receipt-<label>.json`, the stage reads the grid run's own file when a grid ran,
+and `execution_receipt.receipt_scope` names which run the published receipt describes.
+
+**A route is resolved to a code object, not matched as a string.** A frame's identity is
+`f_globals["__name__"] + ":" + f_code.co_name`, which stops being the declared route the
+moment the function is wrapped: `functools.wraps` copies `__name__` onto the wrapper object
+and leaves `co_name` alone, so aiter's entire `@compile_ops` family executes as
+`aiter.jit.core:wrapper` and naming the op a reviewer cares about matched nothing. The probe
+imports the declared module, resolves the attribute, walks its `__wrapped__` chain and matches
+on the resulting code objects; the string match remains as a fallback, so a route into a module
+that cannot be imported behaves exactly as before.
+
+**Shape capture still needs the route's own frame to bind the shape locals.** A dispatch
+wrapper declared `(*args, **kwargs)` binds none of them, so a route through one attests
+execution and nothing about shapes; the receipt then says *"missing required shapes"* rather
+than passing. Naming a route whose frame does carry the shape names is the caller's move.
+
+**A route is not a variant.** The receipt records that
+`…mqa_logits.fp8_mqa_logits:flydsl_fp8_mqa_logits` was entered and with which shape-locals.
+It says nothing about which of that module's 30 registered gfx950 kernel variants the call
+selected, so no variant-coverage claim is supportable from a receipt. Getting one needs the
+variant to be a declared axis or a captured shape-local; see [Not implemented yet](#not-implemented-yet).
+
 ### 7 — `index_width_scan` (informational)
 
 Runs `scan_index_width.py` over the diff and records the count of index×stride multiplies that
@@ -283,10 +411,36 @@ locked GPU, back to back, in the same worktree — the baseline is this PR's own
 reversed, not whatever machine the PR's table was produced on. A head-only number reproduces the
 PR's own comparison and cannot show a regression.
 
+**A PR that adds its own benchmark target is not a PR with no baseline.** "The PR adds this
+target, so base has nothing to time against" ended the stage on aiter#4538 — whose entire
+motivation is being faster than the kernel it replaces, and which was reported `PASS` with no
+number at all. The file being new does not make the code it drives new: when the target only
+exercises an entry point that already exists on base, dropping that exact file into the base
+tree times the pre-PR implementation through the same harness. `perf.baseline_method` says
+which baseline was used, `patch-reversed-same-worktree` or `target-transplant`.
+
+A transplant spans two trees, so it carries one extra burden: `--perf-control-column` names a
+timing column the patch does not touch — typically a reference implementation the target times
+alongside the kernel under test — and the stage `skip`s unless that column reproduces within
+`PERF_CONTROL_TOL` (default 10 %) across the two runs. Without a control the transplant is
+declined rather than guessed at, and the reason names the missing flag instead of claiming
+there was nothing to measure. Note that `median_ratio` remains the *worst* column, so an
+unchanged reference column sitting at 1.0 caps the reported ratio; read `columns` for the
+kernel's own movement.
+
 On by default, because the regression this stage exists to catch is the one nobody suspected and an
 opt-in flag is only ever set by someone who already suspects. The entry point is detected from the
 target (`--scenario bench`, or a `perftest`/`@benchmark` harness); `--perf-args` names it explicitly
 and `--no-perf` turns the stage off.
+
+Rows are matched across the two sides by their identity columns. A header carrying no
+recognised unit is treated as an identity column — but aiter bench tables routinely print
+unlabeled *measurements* (`flydsl rel`, `triton err`, `speedup`), which differ between base
+and head by construction, so every row got a unique name on each side and `matched_rows` was
+`0` on 56 perfectly comparable rows. The strict key is still tried first; only if it matches
+nothing is a relaxed key used, in which identity columns whose cells are non-integral numbers
+are dropped (shape and count columns are integral and stay). `row_key_basis` records which
+key produced the match.
 
 Each side runs `PERF_REPEAT` times and each cell is reduced to its **best** sample, which is what
 makes a threshold as tight as 0.95 usable. Minimum is the correct estimator because contention,
@@ -332,6 +486,16 @@ These are fields, not prose, so a report cannot overclaim by omission:
   an actual architecture-specific compile.
 - **`isolation`** — the real level. Where no container runtime is available it is
   `git-worktree + private caches`, and the report says `container: false`.
+- **`isolation.target_environment`** — the target is unmerged third-party code, so it runs in
+  a **constructed** environment (`env -i` plus a name/prefix allowlist, minus a
+  secret-shaped denylist), not the reviewer's. `env VAR=… cmd` *adds* to the inherited
+  environment; before this, every token in the calling shell was readable from `os.environ`
+  inside the code under review — and reached a stage log the moment a target printed its
+  environment. The report lists the variable names that were passed through.
+- **The process exit code comes from this run.** It is read from a verdict file written
+  inside the run's own `$WORK`, and `--out` is deleted at startup. Deriving it by re-reading
+  `--out` made a previous run's report a fallback source of truth: a run that died before
+  `finish_report` exited on the *earlier* run's verdict.
 - **`degraded_mode`** — `NO_GPU` when no device was claimable; required stages then make the
   verdict `INCONCLUSIVE`.
 - **Every declared stage exists.** A stage that did not run is an object with `status: skip` and
@@ -381,10 +545,31 @@ a seeded defect, and these have not been:
   Choosing the right `--target` from a diff is the unsolved part; an irrelevant target can
   still produce `PASS`. The report names the target so a reviewer can reject that evidence, but
   the executor cannot decide relevance itself.
+- **External grid adapters.** Three channels now exist — `--shape-env`, `--shape-arg`, and
+  `--shape-argnames` for pytest parametrization — and between them they reach the great majority
+  of aiter's `op_tests`. What remains unreachable is a target whose shapes are none of those: a
+  parametrized case whose single parameter is a **dict or object** rather than scalar cells, and
+  a target that takes its shapes from a file or a fixture. The validator still does not accept an
+  independently hashed `--extra-target`, because that harness would have to be bound without
+  changing the PR diff hash or live-base identity. Such runs remain `INCONCLUSIVE`, and
+  `test_selection.grid_channel_reason` says which of these applies.
 - **External grid adapters.** A target that exposes no shape channel at all — neither an env var
-  for `--shape-env` nor a CLI flag for `--shape-arg` — still cannot be given a grid. The validator
+  for `--shape-env`, a CLI flag for `--shape-arg`, nor a flag for `--axis` — still cannot be given
+  a grid. The validator
   does not accept an independently hashed `--extra-target`, because that harness must be bound
   without changing the PR diff hash or live-base identity. Such runs remain `INCONCLUSIVE`.
+- **Axes on the env-var and pytest channels.** `--axis` reaches script targets through argv only.
+  A pytest target's extra knobs are `parametrize` argnames, which needs a different injector, and
+  an env-var channel has no per-axis spelling to prove. Requesting an axis on either is
+  `axis_state: unusable` with the reason, never a silent drop.
+- **Variant attestation.** A receipt proves the route ran; it cannot say which kernel variant
+  the route selected. Until a variant is either a declared axis or a captured shape-local, a
+  report covering a module with N registered variants covers the ones its inputs happen to
+  select, and says so rather than implying N.
+- **Naming the external runtime that executes the kernel.** `runtime_identity` resolves the
+  repository's own package. A FlyDSL kernel reviewed as an aiter PR executes inside an external
+  `flydsl` wheel whose version and hash the report does not record — the most load-bearing
+  artifact in the run is the one it cannot identify.
 - **Cross-architecture compilation.** `arch_coverage: compile-only` is reserved for a future
   stage that actually invokes an architecture-specific compiler. No-GPU mode does not claim it.
 - **Reproducing the PR's stated numbers.** The `perf` stage measures base against head on this

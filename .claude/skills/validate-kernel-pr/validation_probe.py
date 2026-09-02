@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import sys
 import threading
@@ -22,9 +23,54 @@ def _normalize(value) -> str:
     return text
 
 
+def _resolve_route_codes(routes):
+    """Map each declared route to the code object it will actually execute.
+
+    A route is written the way a caller reads the source: `module:function`. The profiler
+    sees frames, and a frame's identity is `f_globals["__name__"] + ":" + f_code.co_name` --
+    which is NOT the same thing whenever the function is wrapped. `functools.wraps` copies
+    `__name__` onto the wrapper object but leaves `co_name` as the wrapper's own, so aiter's
+    entire `@compile_ops` family executes as `aiter.jit.core:wrapper`: naming the op a
+    reviewer actually cares about matched nothing, and the receipt reported an empty route.
+    Observed on ROCm/aiter#5081.
+
+    Resolving the declared route to a code object closes that gap without loosening
+    anything: the match is still an exact identity, just the right one. Import failures are
+    ignored -- the string match below remains, so a route into a module that cannot be
+    imported here behaves exactly as it did before.
+    """
+    codes = {}
+    for route in routes:
+        module_name, _, attribute = route.partition(":")
+        if not module_name or not attribute:
+            continue
+        try:
+            module = importlib.import_module(module_name)
+        except BaseException:  # noqa: BLE001 - a target's import must not break the probe
+            continue
+        target = module
+        for part in attribute.split("."):
+            target = getattr(target, part, None)
+            if target is None:
+                break
+        if target is None:
+            continue
+        # Walk the wrapper chain and register every layer: the caller may be intercepted at
+        # any of them depending on how the decorator is built.
+        seen = set()
+        while target is not None and id(target) not in seen:
+            seen.add(id(target))
+            code = getattr(target, "__code__", None)
+            if code is not None:
+                codes[code] = route
+            target = getattr(target, "__wrapped__", None)
+    return codes
+
+
 def pytest_configure(config):
     expected = _VALIDATION_EXPECTED_ROUTE
     routes = {route.strip() for route in expected.split(",") if route.strip()}
+    route_codes = _resolve_route_codes(routes)
     shape_vars = [
         name.strip() for name in _VALIDATION_SHAPE_VARS.split(",") if name.strip()
     ]
@@ -49,9 +95,11 @@ def pytest_configure(config):
     def profile(frame, event, arg):
         if event not in ("call", "return"):
             return profile
-        route = f"{frame.f_globals.get('__name__', '')}:{frame.f_code.co_name}"
-        if route not in routes:
-            return profile
+        route = route_codes.get(frame.f_code)
+        if route is None:
+            route = f"{frame.f_globals.get('__name__', '')}:{frame.f_code.co_name}"
+            if route not in routes:
+                return profile
         if event == "call":
             observed_routes.add(route)
             # Sampling only here sees parameters and nothing else, so a route that DERIVES
