@@ -443,6 +443,7 @@ def _top_k_per_row_decode(
     k: int = 2048,
     workspace: torch.Tensor | None = None,
     stable: bool = False,
+    values: torch.Tensor | None = None,
 ) -> None: ...
 
 
@@ -456,6 +457,7 @@ def top_k_per_row_decode(
     stride1: int,
     k: int = 2048,
     stable: bool = False,
+    values: torch.Tensor | None = None,
 ) -> None:
     """Per-row top-k (decode). Always uses the one-block kernel; the scratch
     workspace is allocated + cached on the Python side and passed in, so the C++
@@ -463,12 +465,31 @@ def top_k_per_row_decode(
 
     When stable=True, the deterministic ascending-ordered, smallest-index
     tie-break emit is used so every TP rank selects and orders an identical
-    KV set."""
+    KV set.
+
+    When `values` is given (float32, same shape as `indices`), each selected
+    index's logit is written alongside it. Rows shorter than k pad the index
+    with -1 and the score with -inf, so the padding sorts below every real
+    candidate and a consumer that ranks these scores needs no extra mask."""
+    if values is not None:
+        # The C++ side takes values.data_ptr() as a raw float* and writes k
+        # entries per row through it, with no metadata of its own. A wrong
+        # dtype or a short buffer is therefore silent memory corruption, not a
+        # type error -- check here, where the tensor is still a torch object.
+        if values.dtype != torch.float32:
+            raise ValueError(f"values must be float32, got {values.dtype}")
+        if values.shape != indices.shape:
+            raise ValueError(
+                f"values must match indices shape {tuple(indices.shape)}, "
+                f"got {tuple(values.shape)}"
+            )
+        if not values.is_contiguous():
+            raise ValueError("values must be contiguous")
+        if values.device != indices.device:
+            raise ValueError(
+                f"values on {values.device} but indices on {indices.device}"
+            )
     # Decode always takes the ob path (see topk_per_row_kernels.cu).
-    # The original mb dispatch is commented out below for reference:
-    #   if topk_use_mulblocks(numRows, stride0):
-    #       size = topk_mb_workspace_size(numRows, stride0, k, True)
-    #       workspace = get_topk_mb_workspace(logits.device, size)
     size = topk_ob_workspace_size(numRows, stride0, k, True)
     workspace = get_topk_scratch_workspace(logits.device, size)
     return _top_k_per_row_decode(
@@ -482,6 +503,44 @@ def top_k_per_row_decode(
         k,
         workspace,
         stable,
+        values,
+    )
+
+
+def flydsl_dcp_topk_merge(
+    gathered_scores: torch.Tensor,
+    local_idx: torch.Tensor,
+    block_table: torch.Tensor,
+    out_kv_indices: torch.Tensor,
+    out_kv_indptr: torch.Tensor,
+    owned_counts: torch.Tensor,
+    staging: torch.Tensor,
+    dcp_rank: int,
+    world_size: int,
+    topk_tokens: int,
+    page_size: int,
+) -> None:
+    """DCP decode top-k merge: emit this rank's owned KV slots, packed.
+
+    Allocates no device scratch, so it is safe inside a captured CUDAGraph;
+    the first call for a new shape JIT-compiles, so warm up before capturing.
+    """
+    from .flydsl.dcp_topk_merge import (
+        flydsl_dcp_topk_merge as _impl,
+    )
+
+    return _impl(
+        gathered_scores,
+        local_idx,
+        block_table,
+        out_kv_indices,
+        out_kv_indptr,
+        owned_counts,
+        staging,
+        dcp_rank,
+        world_size,
+        topk_tokens,
+        page_size,
     )
 
 
