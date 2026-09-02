@@ -87,7 +87,10 @@ def launch_gemm_a8w4_tdm(
         cluster_n,
     )
     _ = cache_tag
-    WMMA_M = WMMA_N = 16
+    WMMA_M = 16
+    # a4w4 uses the dedicated f4-only 32x16x128 instruction, so its weight (N)
+    # subtile is 32 wide (two stacked 16-wide blocks); a8w4 stays 16x16x128.
+    WMMA_N = 32 if a_is_fp4 else 16
     WMMA_K = 128
     WAVE = 32
     PACK_TK = tile_k // 2
@@ -97,6 +100,12 @@ def launch_gemm_a8w4_tdm(
     wmma_m_rep = warp_tile_m // WMMA_M
     wmma_n_rep = warp_tile_n // WMMA_N
     n_acc = wmma_m_rep * wmma_n_rep
+    # Output is always organized in 16-wide column subtiles; for a4w4 each 32x16
+    # accumulator holds output_fragments_per_acc == WMMA_N // 16 == 2 of them.
+    output_n_rep = warp_tile_n // 16
+    WMMA_VECTOR_DWORDS = WMMA_N // 2
+    if a_is_fp4:
+        assert warp_tile_n % 32 == 0, "a4w4 32x16x128 requires warp_tile_n % 32 == 0"
     num_waves = m_warp * n_warp
     block = num_waves * WAVE
 
@@ -484,14 +493,17 @@ def launch_gemm_a8w4_tdm(
         #   A : row = wmb + wm*16 + lane16 ; immediate = wm*16*A_LDS_ROW + ksl*A_KSTEP (+32*j)
         #   B : immediate = wn*B_LDS_ROW + ksl*1024 (+512)
         #   SA: warp_lds_row = wmb//wmma_m_rep + lane16 ; immediate = (ksl*wmma_m_rep + wm)*4
-        #   SB: wnb%32==0 and 0<=lane16<16 => col_rel//32 == wnb//32 + wn//2,
-        #       col_rel%32 == lane16 + (wn%2)*16 exactly ; immediate = ((wn//2)*SC_INNER
-        #       + ksl*32 + (wn%2)*16)*4
+        #   SB (a8w4, 16x16): col_rel%32 == lane16 + (wn%2)*16 ; immediate =
+        #       ((wn//2)*SC_INNER + ksl*32 + (wn%2)*16)*4, opsel_a picks lanes 0:15.
+        #   SB (a4w4, 32x16): the weight operand is a full 32-col super-row, so
+        #       all 32 lanes carry a distinct scale (lane -> weight col); base uses
+        #       full `lane` and the immediate is (wn*SC_INNER + ksl*32)*4.
         _idx = lambda v: fx.index_cast(T.index, v)
         a_lane = _idx((wmb + lane16) * A_LDS_ROW + kgrp * 16)
         b_lane = _idx(STAGE_A + (wnb // 16) * B_LDS_ROW + kgrp * 256 + lane16 * 16)
         sa_lane = _idx(SA_OFF + (wmb // wmma_m_rep + lane16) * (AS_INNER * 4) + kgrp * 4)
-        sb_lane = _idx(SB_OFF + ((wnb // 32) * SC_INNER + lane16) * 4)
+        sb_col = lane if a_is_fp4 else lane16
+        sb_lane = _idx(SB_OFF + ((wnb // 32) * SC_INNER + sb_col) * 4)
 
         def bases_of(buf):
             return (buf + a_lane, buf + b_lane, buf + sa_lane, buf + sb_lane)
@@ -507,29 +519,77 @@ def launch_gemm_a8w4_tdm(
             return v[0].shuffle(v[1], list(range(8))).shuffle(v[2].shuffle(v[3], list(range(8))), list(range(16)))
 
         def load_b(base, wn, ksl):
-            off = wn * B_LDS_ROW + ksl * 1024
-            return Vec(lds_load_b128_raw(base, fx.Int32(off))).shuffle(
-                Vec(lds_load_b128_raw(base, fx.Int32(off + 512))), list(range(8)))
+            # a4w4: one instruction's weight operand is a 32-wide super-row, i.e.
+            # two adjacent 16-wide subtiles concatenated (16 i32). a8w4: one
+            # 16-wide subtile (8 i32).
+            def load_half(h):
+                off = h * B_LDS_ROW + ksl * 1024
+                return Vec(lds_load_b128_raw(base, fx.Int32(off))).shuffle(
+                    Vec(lds_load_b128_raw(base, fx.Int32(off + 512))), list(range(8)))
+
+            if const_expr(a_is_fp4):
+                return load_half(wn * 2).shuffle(load_half(wn * 2 + 1), list(range(16)))
+            return load_half(wn)
 
         def load_sa(base, wm, ksl):
             return lds_load_b32_raw(base, fx.Int32((ksl * wmma_m_rep + wm) * 4))
 
         def load_sb(base, wn, ksl):
+            if const_expr(a_is_fp4):
+                # 32-wide super-row weight scale; lane already selects the column.
+                return lds_load_b32_raw(base, fx.Int32((wn * SC_INNER + ksl * 32) * 4))
             return lds_load_b32_raw(base, fx.Int32(((wn // 2) * SC_INNER + ksl * 32 + (wn % 2) * 16) * 4))
 
-        wmma_atom = fx.make_mma_atom(
-            fx.rocdl.WMMAScale(
-                WMMA_M, WMMA_N, WMMA_K, fx.Float4E2M1FN, ACT_ELEM, fx.Float32
+        # a4w4 emits the raw 32x16x128_f4 intrinsic directly; only a8w4 uses the
+        # 16x16x128 scaled-WMMA atom.
+        wmma_atom = (
+            None
+            if a_is_fp4
+            else fx.make_mma_atom(
+                fx.rocdl.WMMAScale(
+                    WMMA_M, WMMA_N, WMMA_K, fx.Float4E2M1FN, ACT_ELEM, fx.Float32
+                )
             )
         )
-        c_frags = [fx.make_rmem_tensor(8, fx.Float32) for _ in range_constexpr(n_acc)]
+        c_frags = [
+            fx.make_rmem_tensor(WMMA_VECTOR_DWORDS, fx.Float32)
+            for _ in range_constexpr(n_acc)
+        ]
         for cf in c_frags:
-            cf.store(fx.constant_vector(0.0, T.vec(8, T.f32)))
+            cf.store(fx.constant_vector(0.0, T.vec(WMMA_VECTOR_DWORDS, T.f32)))
 
         def to_rmem(n, v):
             t = fx.make_rmem_tensor(n, fx.Int32)
             t.store(v)
             return t
+
+        # One MMA: a4w4 issues the dedicated 32x16x128 f4 intrinsic (weight = A,
+        # activation = B); a8w4 keeps the 16x16x128 scaled-WMMA atom. wt/act are
+        # rmem tensors; sb_scale is the weight (A) scale, sa_scale the activation.
+        def emit_mma(c_frag, wt_t, act_t, sb_scale, sa_scale):
+            if const_expr(a_is_fp4):
+                c_frag.store(
+                    rocdl.wmma_scale_f32_32x16x128_f4(
+                        T.vec(WMMA_VECTOR_DWORDS, T.f32),
+                        wt_t.load().ir_value(),
+                        act_t.load().ir_value(),
+                        c_frag.load().ir_value(),
+                        sb_scale,
+                        sa_scale,
+                        scaleAType=0,
+                        scaleBType=0,
+                    )
+                )
+            else:
+                fx.gemm(
+                    wmma_atom,
+                    c_frag,
+                    wt_t,
+                    act_t,
+                    c_frag,
+                    scale_a=sb_scale,
+                    scale_b=sa_scale,
+                )
 
         front_wm = (wmma_m_rep + 1) // 2
         FRONT = list(range(front_wm))
@@ -541,15 +601,7 @@ def launch_gemm_a8w4_tdm(
                 for wn_raw in range_constexpr(wmma_n_rep):
                     wn = (wmma_n_rep - 1 - wn_raw) if (wm % 2 == 1) else wn_raw
                     idx = wm * wmma_n_rep + wn
-                    fx.gemm(
-                        wmma_atom,
-                        c_frags[idx],
-                        wt[wn],
-                        act[i],
-                        c_frags[idx],
-                        scale_a=sb_k[wn],
-                        scale_b=sa_k[wm],
-                    )
+                    emit_mma(c_frags[idx], wt[wn], act[i], sb_k[wn], sa_k[wm])
 
         DS_A = 2 if a_is_fp4 else 4
         DS_B = 2
@@ -557,7 +609,7 @@ def launch_gemm_a8w4_tdm(
 
         def load_b_and_scales(buf, ksl):
             _, bb, bsa, bsb = bases_of(buf)
-            wt = [to_rmem(8, load_b(bb, wn, ksl)) for wn in range_constexpr(wmma_n_rep)]
+            wt = [to_rmem(WMMA_VECTOR_DWORDS, load_b(bb, wn, ksl)) for wn in range_constexpr(wmma_n_rep)]
             sb_k = [load_sb(bsb, wn, ksl) for wn in range_constexpr(wmma_n_rep)]
             sa_k = [load_sa(bsa, wm, ksl) for wm in range_constexpr(wmma_m_rep)]
             return wt, sb_k, sa_k
@@ -609,7 +661,7 @@ def launch_gemm_a8w4_tdm(
         PF_OK = (KWS % 2 == 0)
         pf_act = [[fx.make_rmem_tensor(ACT_NDW, fx.Int32) for _ in range_constexpr(wmma_m_rep)]
                   for _ in range_constexpr(2)]
-        pf_wt = [[fx.make_rmem_tensor(8, fx.Int32) for _ in range_constexpr(wmma_n_rep)]
+        pf_wt = [[fx.make_rmem_tensor(WMMA_VECTOR_DWORDS, fx.Int32) for _ in range_constexpr(wmma_n_rep)]
                  for _ in range_constexpr(2)]
         # All scales for a subtile packed into one rmem tensor per ping-pong slot.
         # rmem SSA promotion is built for *vector* store/load; a width-1 vector
@@ -653,8 +705,8 @@ def launch_gemm_a8w4_tdm(
                 for wn_raw in range_constexpr(wmma_n_rep):
                     wn = (wmma_n_rep - 1 - wn_raw) if (wm % 2 == 1) else wn_raw
                     idx = wm * wmma_n_rep + wn
-                    fx.gemm(wmma_atom, c_frags[idx], pf_wt[cur_p][wn], pf_act[cur_p][wm],
-                            c_frags[idx], scale_a=_sb_pf[wn], scale_b=_sa_pf[wm])
+                    emit_mma(c_frags[idx], pf_wt[cur_p][wn], pf_act[cur_p][wm],
+                             _sb_pf[wn], _sa_pf[wm])
 
             # Front-load the next subtile's prefetch ds_reads over the first half
             # of this subtile's n_acc mfmas, then let the tail run compute-dense.
@@ -788,7 +840,20 @@ def launch_gemm_a8w4_tdm(
                     pipeline_fence(outstanding=TDM_PER * (num_buffers - 2 - j))
                     compute_ktile(buf, None)
 
-            accs = [c_frags[idx].load().ir_value() for idx in range_constexpr(n_acc)]
+            # Each accumulator holds output_fragments_per_acc (WMMA_N // 16)
+            # consecutive 16-wide output subtiles; flatten to one 8-wide fragment
+            # per output subtile so the epilogue below indexes by output_n_rep.
+            output_fragments_per_acc = WMMA_N // 16
+            accs = []
+            for idx in range_constexpr(n_acc):
+                acc = Vec(c_frags[idx].load())
+                for fragment in range_constexpr(output_fragments_per_acc):
+                    accs.append(
+                        Vec.from_elements(
+                            [acc[fragment * 8 + i] for i in range_constexpr(8)],
+                            fx.Float32,
+                        ).ir_value()
+                    )
             pipeline_fence(outstanding=0)
             STORE_N = (tile_n // 2) if stage1_act else tile_n
             # b128 passthrough store: stage the C tile into LDS as a dense row-major
@@ -824,7 +889,7 @@ def launch_gemm_a8w4_tdm(
 
                 v2i32_ty = T.vec(2, T.i32)
                 QRPT_LOG2 = int(math.log2(QUANT_ROWS_PER_TILE))
-                N_MX_BLKS = wmma_n_rep // WN_PER_MX_BLOCK
+                N_MX_BLKS = output_n_rep // WN_PER_MX_BLOCK
                 # Total activated elements per wm row = N_MX_BLKS * WN_PER_MX_BLOCK * 4
                 _N_ELEM = N_MX_BLKS * WN_PER_MX_BLOCK * 4
                 for wm in range_constexpr(wmma_m_rep):
@@ -843,7 +908,7 @@ def launch_gemm_a8w4_tdm(
                         pairs = []
                         for sub_wn in range_constexpr(WN_PER_MX_BLOCK):
                             wn = mx_blk * WN_PER_MX_BLOCK + sub_wn
-                            acc = Vec(accs[wm * wmma_n_rep + wn])
+                            acc = Vec(accs[wm * output_n_rep + wn])
                             for p in range_constexpr(4):
                                 pairs.append((acc[2 * p], acc[2 * p + 1]))
 
@@ -919,9 +984,9 @@ def launch_gemm_a8w4_tdm(
                 for wm in range_constexpr(wmma_m_rep):
                     row_rel = wmb + wm * 16 + lane16
                     cur_hv_raws = []
-                    for wn in range_constexpr(wmma_n_rep):
+                    for wn in range_constexpr(output_n_rep):
                         col_rel = wnb + wn * 16 + kgrp * 8
-                        acc = Vec(accs[wm * wmma_n_rep + wn])
+                        acc = Vec(accs[wm * output_n_rep + wn])
                         if const_expr(has_bias):
                             acc = acc + Vec(
                                 fx.ptr_load(
@@ -965,7 +1030,7 @@ def launch_gemm_a8w4_tdm(
                             # each ds_store keeps its small wn immediate.
                             row_byte = wm * 16 * STORE_PITCH * 2
                             spill = const_expr(
-                                row_byte + (wmma_n_rep - 1) * 16 * 2 > 0xFFFF
+                                row_byte + (output_n_rep - 1) * 16 * 2 > 0xFFFF
                             )
                             st_base = (
                                 stC_idx
