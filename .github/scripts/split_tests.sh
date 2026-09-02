@@ -136,6 +136,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_causal_conv1d_prefill_split_qkv.py]=13
     FILE_TIMES[op_tests/test_moe_ep.py]=13
     FILE_TIMES[op_tests/test_moe.py]=12
+    FILE_TIMES[op_tests/test_flydsl_causal_conv1d_update.py]=11
     FILE_TIMES[op_tests/test_gemm_a6w6.py]=11
     FILE_TIMES[op_tests/test_quant_mxfp4.py]=11
     FILE_TIMES[op_tests/test_deepgemm.py]=10
@@ -325,6 +326,7 @@ get_time() {
 # scheduling weight floor so the greedy splitter avoids packing them together.
 declare -A MEMORY_WEIGHT_FLOOR
 if [[ "$TEST_TYPE" == "aiter" ]]; then
+    MEMORY_WEIGHT_FLOOR[op_tests/test_flydsl_causal_conv1d_update.py]=300
     MEMORY_WEIGHT_FLOOR[op_tests/test_flydsl_qk_norm_rope_quant.py]=300
     MEMORY_WEIGHT_FLOOR[op_tests/test_kvcache.py]=300
     MEMORY_WEIGHT_FLOOR[op_tests/test_mla_prefill_ps.py]=300
