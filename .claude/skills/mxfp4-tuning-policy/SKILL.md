@@ -230,9 +230,16 @@ imposes on another kernel. A GEMM2 faster on its own stage can still lose end to
 end through L2 displacement of the following GEMM1. If a tuned row's recorded
 `us1 + us2` improves but e2e does not, suspect this and check with the 2×2 in §5.
 
-> Not yet quantified on this branch: an earlier attempt to measure the `nt`
-> component was run without `AITER_FLYDSL_STAGE2_FP8=1` and is void. The
-> structural blind spot is real; the magnitude is unmeasured.
+Bounded on glm5: an exhaustive 64-shape sweep (2688 pairs each) beat the shipped
+config by a geomean of **1.039** end to end — 37 wins, 19 parity, 8 losses — but
+two shapes went the *other* way by 10-13% (`inter_dim` 512 at tokens 16384 and
+32768: 0.904 and 0.874, own-rep spread 2.9%/1.6%, so real). Those configs won the
+tuner's own `us1 + us2` ranking and still lost end to end, which is the blind spot
+biting. Treat it as a ~10% downside risk on the largest shapes, and re-check a
+sweep winner end to end before shipping it there.
+
+> The `nt` component specifically is still unquantified: an earlier attempt was
+> run without `AITER_FLYDSL_STAGE2_FP8=1` and is void.
 
 ## 8. Wiring
 
