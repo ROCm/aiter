@@ -55,13 +55,11 @@ def _is_gluon_available():
 
 
 # fasttile splits the 2-D prefill tile loop into an unmasked bulk pass (tiles
-# strictly below the causal diagonal) and a masked tail pass, which is what
-# lets the compiler pipeline it. A deeper pipeline is a measured null on the
-# stock masked body, so the published config keeps num_stages at 1 and the
-# restructured loop overrides it with the depth it was certified at.
+# strictly below the causal diagonal) and a masked tail pass, which lets the
+# compiler schedule the bulk tiles without a data-dependent mask between them.
+# The split stands on its own and leaves the tuned launch config alone.
 _FASTTILE_VALUES = ("off", "nofuse", "on")
 _FASTTILE_ARCHS = ("gfx950",)
-_FASTTILE_NUM_STAGES = 2
 
 _env_fasttile = os.environ.get("AITER_TRITON_UNIFIED_ATTN_FASTTILE", "off")
 if _env_fasttile not in _FASTTILE_VALUES:
@@ -537,11 +535,6 @@ def _unified_attention_2d_triton(params: _UAParams):
     if params.shuffled_kv_cache:
         config["TILE_SIZE"] = params.block_size
     config["FASTTILE_SPLIT"], config["FASTTILE_FUSE"] = _fasttile_modes(params)
-    if config["FASTTILE_SPLIT"]:
-        # The published entry is tuned for the stock body, where a deeper
-        # pipeline is a measured null; the restructured loop is what makes it
-        # pay, so it carries its own certified depth rather than a tuned one.
-        config["num_stages"] = _FASTTILE_NUM_STAGES
     if params.all_decode:
         total_num_q_blocks = params.num_seqs
     else:

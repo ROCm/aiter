@@ -837,7 +837,7 @@ def _require_2d_kernel(shape, sliding_window=0):
         pytest.skip("shape routes to the 3-D kernel on this machine")
 
 
-def _run_unified_attention(data):
+def _run_unified_attention(data, shuffled_kv_cache=False):
     (
         query,
         _key_cache_orig,
@@ -879,6 +879,7 @@ def _run_unified_attention(data):
         v_descale=v_descale,
         sinks=sinks,
         output_scale=output_scale,
+        shuffled_kv_cache=shuffled_kv_cache,
         backend="triton",
     )
     return output.clone()
@@ -902,13 +903,9 @@ def _assert_ulp_close(stock, other, label, max_ulps=4.0):
       output element is a softmax-weighted sum of V, so its absolute error is
       bounded by the scale of that sum, not by the element. Elements that come
       out near zero do so by cancellation between O(max|out|) terms and retain
-      no significant digits, so a relative bound on them is meaningless -- the
-      measured worst case is 1.1e5 ULPs at |out| = 3.6e-9, whose absolute error
-      is 1.6e-6. Only such elements fall through to this floor; everything at a
-      magnitude worth measuring is governed by rtol.
-
-    Measured elementwise drift is <= ~3.3 ULPs at p99.99 across every shape and
-    dtype here, so 4 is a real bound rather than a rubber stamp.
+      no significant digits, so a relative bound on them is meaningless. Only
+      such elements fall through to this floor; everything at a magnitude worth
+      measuring is governed by rtol.
 
     Degenerate rows (a query position with no keys in range and no sink) are
     NaN in the *stock* kernel too. ``equal_nan`` makes the NaN pattern part of
@@ -1038,3 +1035,32 @@ def test_fasttile_rejects_unknown_mode(fasttile) -> None:
     """An unusable value must fail loudly rather than silently mean 'off'."""
     with pytest.raises(ValueError, match="Invalid fasttile value"):
         fasttile("fastest")
+
+
+@pytest.mark.skipif(DEVICE_ARCH != "gfx950", reason="fasttile is gfx950-only")
+@pytest.mark.parametrize("dtypes", _FASTTILE_DTYPES, ids=lambda d: d[0])
+@pytest.mark.parametrize("mode", ["nofuse", "on"])
+@torch.inference_mode()
+def test_fasttile_matches_stock_shuffled_kv(fasttile, dtypes, mode) -> None:
+    """The restructure must hold for the pre-shuffled cache layout too.
+
+    Shuffled pages address K and V through a different branch of the tile body
+    -- the block table is indexed once per tile rather than per token, because
+    a shuffled tile is exactly one page -- so the bulk pass exercises code the
+    non-shuffled shapes never reach. The rest of the suite skips shuffled off
+    gfx1250, which left this branch uncovered on the arch the schedule targets.
+    """
+    _, q_dtype, kv_dtype = dtypes
+    shape = dict(_FASTTILE_SHAPES["short"])
+    _require_2d_kernel(shape)
+    data = generate_data(
+        q_dtype=q_dtype, kv_dtype=kv_dtype, shuffled_kv_cache=True, **shape
+    )
+
+    fasttile("off")
+    stock = _run_unified_attention(data, shuffled_kv_cache=True).float()
+
+    fasttile(mode)
+    fast = _run_unified_attention(data, shuffled_kv_cache=True).float()
+
+    _assert_ulp_close(stock, fast, f"fasttile({mode}, {dtypes[0]}, shuffled)")
