@@ -1815,9 +1815,7 @@ def mla_decode_fwd_v4_nm(
     use_valid_split_count_reduce = int(num_kv_splits > 1)
 
     mla_decode_v4_asm = (
-        mla_decode_v4_asm_gfx1250
-        if get_gfx() == "gfx1250"
-        else aiter.mla_decode_v4_asm
+        mla_decode_v4_asm_gfx1250 if get_gfx() == "gfx1250" else aiter.mla_decode_v4_asm
     )
     mla_decode_v4_asm(
         q,

@@ -82,9 +82,7 @@ class Mlagfx1250KernelVariant:
 
 _gfx1250_KERNEL_VARIANTS = [
     Mlagfx1250KernelVariant(name="qh16-q4-16mx4-64nx1-np", nhead=16, decode_qlen=4),
-    Mlagfx1250KernelVariant(
-        name="qh32-q1-32mx1-16nx4-sparse", nhead=32, decode_qlen=1
-    ),
+    Mlagfx1250KernelVariant(name="qh32-q1-32mx1-16nx4-sparse", nhead=32, decode_qlen=1),
     Mlagfx1250KernelVariant(name="qh64-q1-16mx4-64nx1-np", nhead=64, decode_qlen=1),
     Mlagfx1250KernelVariant(name="qh128-q1-16mx4-64nx1-np", nhead=128, decode_qlen=1),
 ]
