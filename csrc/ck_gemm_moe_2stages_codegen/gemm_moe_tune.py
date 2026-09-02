@@ -474,8 +474,7 @@ class FmoeTuner(TunerCommon):
                             getattr(torch, s.strip().removeprefix("torch."))
                         )
                     )
-                    if isinstance(s, str)
-                    and s.strip().startswith("torch.float8_e4m3")
+                    if isinstance(s, str) and s.strip().startswith("torch.float8_e4m3")
                     else s
                 )
             )
