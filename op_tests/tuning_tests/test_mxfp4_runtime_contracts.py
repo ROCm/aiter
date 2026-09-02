@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from aiter.aot.flydsl.mxfp4_moe import parse_csv
+from aiter.aot.flydsl.mxfp4_moe import _compile_v2_stage2, parse_csv
 from aiter.fused_moe import (
     AUX_SORT_OPUS,
     AUX_SORT_THREESTAGE,
@@ -48,6 +48,33 @@ def test_kimik3_aot_stage1_matches_runtime_inter_dim():
     assert stage1_jobs
     assert {job["D_INTER"] for job in stage1_jobs} == {384}
     assert get_inter_dim((896, 768, 1792), (896, 3584, 192)) == (896, 3584, 384)
+
+
+def test_layout_reduce_aot_does_not_require_removed_padding_fields(monkeypatch):
+    from aiter.ops.flydsl import moe_kernels
+    from aiter.ops.flydsl.kernels import mxmoe_dispatcher
+
+    root = Path(__file__).resolve().parents[2]
+    jobs = parse_csv(
+        str(root / "aiter/configs/model_configs/kimik3_a4w4_tuned_fmoe.csv")
+    )
+    job = next(
+        job for job in jobs if job.get("v2_stage2") and job["epilog"] == "reduce"
+    )
+    calls = []
+
+    monkeypatch.setattr(
+        mxmoe_dispatcher, "mxfp4_moe_gemm2", lambda **kwargs: calls.append("gemm2")
+    )
+    monkeypatch.setattr(
+        moe_kernels,
+        "_run_moe_reduction",
+        lambda *args, **kwargs: calls.append("reduce"),
+    )
+
+    assert "model_dim_pad" not in job
+    _compile_v2_stage2(job)
+    assert calls == ["gemm2", "reduce"]
 
 
 @pytest.mark.parametrize(

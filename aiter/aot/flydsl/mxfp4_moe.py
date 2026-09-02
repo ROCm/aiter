@@ -422,7 +422,6 @@ def _compile_v2_stage2(job):
             job["BM"],
             job["topk"],
             job["N_OUT"],
-            model_dim_pad=job["model_dim_pad"],
             expert_mask=None,
             topk_ids=None,
             stream=0,
