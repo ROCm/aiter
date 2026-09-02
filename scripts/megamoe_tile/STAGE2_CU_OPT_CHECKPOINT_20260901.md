@@ -2650,3 +2650,10 @@ Do **not** add or commit `trace_data/`; it remains a local profiling artifact.
 Before committing, run `git diff --check` and inspect the staged file list to
 prove no unrelated files or traces are included. After checkout/commit, append
 the resulting local commit hash here and retain the branch without pushing.
+# Local implementation snapshot (2026-09-02)
+
+The complete tile-group WIP implementation was preserved on local branch
+`dev/stage2_tile_group_ready_wip_20260902` in commit
+`85cd0e78359fe8d59befc1eb7d46ca71c2e2ebda`.  The follow-up documentation
+commit only records this immutable implementation hash.  Nothing was pushed.
+`trace_data/` remains intentionally untracked.
