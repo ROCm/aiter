@@ -319,6 +319,7 @@ jobs:
       actions: read
     env:
       GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
       RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
       RELEASE_VERSION: ${{ needs.prepare.outputs.release_version }}
       RELEASE_KIND: ${{ needs.prepare.outputs.release_kind }}

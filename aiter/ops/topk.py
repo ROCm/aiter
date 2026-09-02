@@ -4,11 +4,12 @@
 # user interface
 
 import functools
+import os
 
 import torch
 
 from ..jit.core import compile_ops
-from ..jit.utils.chip_info import get_cu_num
+from ..jit.utils.chip_info import get_cu_num, get_gfx
 from ..utility import dtypes
 
 
@@ -447,6 +448,138 @@ def _top_k_per_row_decode(
 ) -> None: ...
 
 
+_FLYDSL_TOPK_DECODE_DISABLED = os.environ.get(
+    "AITER_DISABLE_FLYDSL_TOPK_DECODE", "0"
+) in ("1", "true", "True", "yes", "YES")
+
+# Dispatch uses physical width because seq_lens is device-resident; padded rows
+# with short effective lengths may therefore enter a long-row gate.
+# (minimum width, maximum width, maximum rows), with inclusive bounds.
+_FLYDSL_TOPK_DECODE_GATES = {
+    "gfx942": {
+        True: (
+            (0, 20_000, 64),
+            (131_072, None, 16),
+        ),
+        False: ((524_288, None, 32),),
+    },
+    "gfx950": {
+        True: (
+            (0, 20_000, 128),
+            (32_768, 65_535, 16),
+            (65_536, None, 32),
+        ),
+        False: ((131_072, None, 32),),
+    },
+}
+_FLYDSL_TOPK_DECODE_KS = (512, 1024, 2048, 4096)
+
+
+@functools.lru_cache(maxsize=1)
+def _flydsl_topk_decode_available() -> bool:
+    """Whether the optional FlyDSL package is available on this device."""
+    try:
+        from .flydsl.utils import is_flydsl_available
+
+        return is_flydsl_available()
+    except (ImportError, OSError, RuntimeError):
+        return False
+
+
+@functools.lru_cache(maxsize=128)
+def _flydsl_topk_decode_shape_supported(
+    arch: str,
+    stable: bool,
+    width: int,
+    num_rows: int,
+    k: int,
+) -> bool:
+    if k not in _FLYDSL_TOPK_DECODE_KS:
+        return False
+    return any(
+        min_width <= width
+        and (max_width is None or width <= max_width)
+        and 0 < num_rows <= max_rows
+        for min_width, max_width, max_rows in _FLYDSL_TOPK_DECODE_GATES[arch][stable]
+    )
+
+
+def _should_use_flydsl_topk_decode(
+    logits: torch.Tensor,
+    next_n: int,
+    seq_lens: torch.Tensor,
+    indices: torch.Tensor,
+    num_rows: int,
+    stride0: int,
+    stride1: int,
+    k: int,
+    stable: bool,
+    values: torch.Tensor | None = None,
+) -> bool:
+    if (
+        _FLYDSL_TOPK_DECODE_DISABLED
+        or not isinstance(logits, torch.Tensor)
+        or logits.ndim != 2
+    ):
+        return False
+
+    arch = get_gfx()
+    if arch not in _FLYDSL_TOPK_DECODE_GATES or not _flydsl_topk_decode_available():
+        return False
+
+    if not _flydsl_topk_decode_shape_supported(
+        arch,
+        stable,
+        logits.shape[1],
+        num_rows,
+        k,
+    ):
+        return False
+
+    from .flydsl.topk_per_row import is_flydsl_top_k_per_row_decode_supported
+
+    return is_flydsl_top_k_per_row_decode_supported(
+        logits,
+        next_n,
+        seq_lens,
+        indices,
+        num_rows,
+        stride0,
+        stride1,
+        k,
+        values,
+    )
+
+
+def _hip_top_k_per_row_decode(
+    logits: torch.Tensor,
+    next_n: int,
+    seq_lens: torch.Tensor,
+    indices: torch.Tensor,
+    num_rows: int,
+    stride0: int,
+    stride1: int,
+    k: int,
+    stable: bool,
+    values: torch.Tensor | None,
+) -> None:
+    size = topk_ob_workspace_size(num_rows, stride0, k, True)
+    workspace = get_topk_scratch_workspace(logits.device, size)
+    return _top_k_per_row_decode(
+        logits,
+        next_n,
+        seq_lens,
+        indices,
+        num_rows,
+        stride0,
+        stride1,
+        k,
+        workspace,
+        stable,
+        values,
+    )
+
+
 def top_k_per_row_decode(
     logits: torch.Tensor,
     next_n: int,
@@ -471,6 +604,31 @@ def top_k_per_row_decode(
     index's logit is written alongside it. Rows shorter than k pad the index
     with -1 and the score with -inf, so the padding sorts below every real
     candidate and a consumer that ranks these scores needs no extra mask."""
+    if _should_use_flydsl_topk_decode(
+        logits,
+        next_n,
+        seqLens,
+        indices,
+        numRows,
+        stride0,
+        stride1,
+        k,
+        stable,
+        values,
+    ):
+        return flydsl_top_k_per_row_decode(
+            logits,
+            next_n,
+            seqLens,
+            indices,
+            numRows,
+            stride0,
+            stride1,
+            k,
+            stable,
+            values,
+        )
+
     if values is not None:
         # The C++ side takes values.data_ptr() as a raw float* and writes k
         # entries per row through it, with no metadata of its own. A wrong
@@ -489,10 +647,8 @@ def top_k_per_row_decode(
             raise ValueError(
                 f"values on {values.device} but indices on {indices.device}"
             )
-    # Decode always takes the ob path (see topk_per_row_kernels.cu).
-    size = topk_ob_workspace_size(numRows, stride0, k, True)
-    workspace = get_topk_scratch_workspace(logits.device, size)
-    return _top_k_per_row_decode(
+
+    return _hip_top_k_per_row_decode(
         logits,
         next_n,
         seqLens,
@@ -501,7 +657,6 @@ def top_k_per_row_decode(
         stride0,
         stride1,
         k,
-        workspace,
         stable,
         values,
     )
@@ -541,6 +696,41 @@ def flydsl_dcp_topk_merge(
         world_size,
         topk_tokens,
         page_size,
+    )
+
+
+def flydsl_top_k_per_row_decode(
+    logits: torch.Tensor,
+    next_n: int,
+    seqLens: torch.Tensor,
+    indices: torch.Tensor,
+    numRows: int,
+    stride0: int,
+    stride1: int,
+    k: int = 2048,
+    stable: bool = False,
+    values: torch.Tensor | None = None,
+) -> None:
+    """FlyDSL per-row decode TopK with the same call shape as the HIP interface.
+
+    This path is optimized for long-context decode, where its multi-CTA radix
+    selection typically outperforms the HIP one-block implementation.
+    """
+    from .flydsl.topk_per_row import (
+        flydsl_top_k_per_row_decode as _flydsl_top_k_per_row_decode,
+    )
+
+    return _flydsl_top_k_per_row_decode(
+        logits,
+        next_n,
+        seqLens,
+        indices,
+        numRows,
+        stride0,
+        stride1,
+        k,
+        stable,
+        values,
     )
 
 
