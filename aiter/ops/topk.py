@@ -604,24 +604,6 @@ def top_k_per_row_decode(
     index's logit is written alongside it. Rows shorter than k pad the index
     with -1 and the score with -inf, so the padding sorts below every real
     candidate and a consumer that ranks these scores needs no extra mask."""
-    if values is not None:
-        # The C++ side takes values.data_ptr() as a raw float* and writes k
-        # entries per row through it, with no metadata of its own. A wrong
-        # dtype or a short buffer is therefore silent memory corruption, not a
-        # type error -- check here, where the tensor is still a torch object.
-        if values.dtype != torch.float32:
-            raise ValueError(f"values must be float32, got {values.dtype}")
-        if values.shape != indices.shape:
-            raise ValueError(
-                f"values must match indices shape {tuple(indices.shape)}, "
-                f"got {tuple(values.shape)}"
-            )
-        if not values.is_contiguous():
-            raise ValueError("values must be contiguous")
-        if values.device != indices.device:
-            raise ValueError(
-                f"values on {values.device} but indices on {indices.device}"
-            )
     if _should_use_flydsl_topk_decode(
         logits,
         next_n,
@@ -646,6 +628,25 @@ def top_k_per_row_decode(
             stable,
             values,
         )
+
+    if values is not None:
+        # The C++ side takes values.data_ptr() as a raw float* and writes k
+        # entries per row through it, with no metadata of its own. A wrong
+        # dtype or a short buffer is therefore silent memory corruption, not a
+        # type error -- check here, where the tensor is still a torch object.
+        if values.dtype != torch.float32:
+            raise ValueError(f"values must be float32, got {values.dtype}")
+        if values.shape != indices.shape:
+            raise ValueError(
+                f"values must match indices shape {tuple(indices.shape)}, "
+                f"got {tuple(values.shape)}"
+            )
+        if not values.is_contiguous():
+            raise ValueError("values must be contiguous")
+        if values.device != indices.device:
+            raise ValueError(
+                f"values on {values.device} but indices on {indices.device}"
+            )
 
     return _hip_top_k_per_row_decode(
         logits,

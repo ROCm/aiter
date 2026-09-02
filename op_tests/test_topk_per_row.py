@@ -517,28 +517,18 @@ for data_generation in args.data_generation:
             for k in args.top_k:
                 for n in args.next_n:
                     for stable in (False, True):
-                        ret = test_top_k_per_row_decode(
-                            m,
-                            ctx,
-                            k,
-                            n,
-                            data_generation,
-                            stable=stable,
-                        )
-                        df.append(ret)
-                        # `_fast` ASM kernel hardcodes k=2048 and is not stable.
-                        if get_gfx() == "gfx942" and k == 2048 and not stable:
+                        for write_values in (False, True):
                             ret = test_top_k_per_row_decode(
                                 m,
                                 ctx,
                                 k,
                                 n,
                                 data_generation,
-                                fast=True,
+                                stable=stable,
+                                write_values=write_values,
                             )
                             df.append(ret)
-                        if flydsl_available:
-                            for write_values in (False, True):
+                            if flydsl_available:
                                 ret = test_top_k_per_row_decode(
                                     m,
                                     ctx,
@@ -550,6 +540,17 @@ for data_generation in args.data_generation:
                                     write_values=write_values,
                                 )
                                 df.append(ret)
+                        # `_fast` ASM kernel hardcodes k=2048 and is not stable.
+                        if get_gfx() == "gfx942" and k == 2048 and not stable:
+                            ret = test_top_k_per_row_decode(
+                                m,
+                                ctx,
+                                k,
+                                n,
+                                data_generation,
+                                fast=True,
+                            )
+                            df.append(ret)
 
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
