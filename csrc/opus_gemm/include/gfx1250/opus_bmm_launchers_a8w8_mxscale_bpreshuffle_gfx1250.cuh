@@ -34,6 +34,12 @@ template <typename UserTraits>
 __global__ void bmm_a8w8_mxscale_bpreshuffle_kernel_gfx1250(
     opus_bmm_a8w8_mxscale_kargs_gfx1250 kargs);
 
+// The non-specialized variant is a distinct symbol with an identical signature;
+// see opus_bmm_pipeline_a8w8_mxscale_bpreshuffle_nospec_gfx1250.cuh.
+template <typename UserTraits>
+__global__ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(
+    opus_bmm_a8w8_mxscale_kargs_gfx1250 kargs);
+
 // Shape / dtype / layout validation. Same contract as the gfx950 BMM
 // (opus_bmm_a8w8_common_checks) plus the two things the preshuffled B adds.
 static inline void opus_bmm_a8w8_mxscale_bpreshuffle_checks_gfx1250(
@@ -183,6 +189,58 @@ static inline void opus_bmm_a8w8_mxscale_bpreshuffle_launch_gfx1250(
     dim3 block((unsigned)T::BLOCK_SIZE);
     hipStream_t stream = aiter::getCurrentHIPStream();
     bmm_a8w8_mxscale_bpreshuffle_kernel_gfx1250<T><<<grid, block, 0, stream>>>(kargs);
+}
+
+// Non-specialized launch. The checks, the kargs and the grid are the same as the
+// launcher above -- only the kernel symbol differs. The two are kept as separate
+// functions rather than one parameterised by symbol because the K cap the
+// specialized launcher enforces is an SF_A_LDS/SF_B_LDS property, and no NO_SPEC_
+// tile carries those flags today; folding them together would make that
+// coupling implicit. If a NO_SPEC_ tile ever takes a scale panel, move the cap
+// check here too.
+template <typename T>
+static inline void opus_bmm_a8w8_mxscale_bpreshuffle_nospec_launch_gfx1250(
+    aiter_tensor_t& O, aiter_tensor_t& wo_a, aiter_tensor_t& Y,
+    aiter_tensor_t& x_scale, aiter_tensor_t& w_scale, int splitK)
+{
+    static_assert(T::kNoSpec,
+                  "the nospec launcher takes a NO_SPEC_ tile; a specialized "
+                  "tile launched through it would run with no producer waves "
+                  "and read uninitialised LDS");
+    opus_bmm_a8w8_mxscale_bpreshuffle_checks_gfx1250(
+        O, wo_a, Y, x_scale, w_scale,
+        "opus_bmm_a8w8_mxscale_bpreshuffle_nospec");
+    AITER_CHECK(splitK == 1,
+                "opus_bmm_a8w8_mxscale_bpreshuffle_nospec: splitK must be 1");
+
+    const int m = (int)O.size(0), batch = (int)O.size(1), k = (int)O.size(2);
+    const int n = (int)wo_a.size(1);
+
+    opus_bmm_a8w8_mxscale_kargs_gfx1250 kargs{};
+    kargs.ptr_a   = O.data_ptr();
+    kargs.ptr_b   = wo_a.data_ptr();
+    kargs.ptr_c   = Y.data_ptr();
+    kargs.ptr_sfa = x_scale.data_ptr();
+    kargs.ptr_sfb = w_scale.data_ptr();
+    kargs.m = m; kargs.n = n; kargs.k = k; kargs.batch = batch; kargs.split_k = 1;
+    kargs.stride_a = (int)O.stride(0);
+    kargs.stride_b = k;
+    kargs.stride_c = (int)Y.stride(0);
+    kargs.stride_a_batch = (int)O.stride(1);
+    kargs.stride_b_batch = (int)wo_a.stride(0);
+    kargs.stride_c_batch = (int)Y.stride(1);
+    kargs.stride_sfa       = (int)x_scale.stride(0);
+    kargs.stride_sfa_batch = (int)x_scale.stride(1);
+    kargs.stride_sfb       = (int)w_scale.stride(1);
+    kargs.stride_sfb_batch = (int)w_scale.stride(0);
+
+    dim3 grid((unsigned)((m + T::kBlockM - 1) / T::kBlockM),
+              (unsigned)((n + T::kBlockN - 1) / T::kBlockN),
+              (unsigned)batch);
+    dim3 block((unsigned)T::BLOCK_SIZE);
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250<T>
+        <<<grid, block, 0, stream>>>(kargs);
 }
 
 // ===========================================================================

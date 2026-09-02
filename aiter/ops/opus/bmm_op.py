@@ -293,7 +293,7 @@ def _cu_count() -> int:
 # full list (kid 0..10, 13, 14, 17, 18) is documented in csrc/opus_gemm/
 # opus_bmm.cu; the rest are either A/B controls for a tile that won, tiles for
 # the 128x128 blocked w_scale, or -- kid 2 and 3 -- known broken.
-_BPRESHUF_TILE_BN = {0: (128, 128), 6: (16, 128), 7: (16, 256)}
+_BPRESHUF_TILE_BN = {0: (128, 128), 6: (16, 128), 7: (16, 256), 27: (256, 256)}
 # Largest m the decode tiles were swept at. Past it, kid0.
 _BPRESHUF_DECODE_M_MAX = 256
 
@@ -337,15 +337,37 @@ def _heuristic_bpreshuffle_kid(batch: int, m: int, n: int) -> int:
     # -- kid0 is the winner, which is what a 128-row tile should be once m fills
     # it several times over. So the decode tiles are confined to the region they
     # were actually measured in rather than trusted outside it.
+    cus = _cu_count()
     if m > _BPRESHUF_DECODE_M_MAX:
+        # Prefill. Two tiles, split on kid27's own workgroup count.
+        #
+        # kid27 is 256x256x128 with NO producer/consumer split -- 8 waves that
+        # all load and all run WMMA. It is four times kid24's output tile, and
+        # it only exists because dropping the specialization fits 8 consumers
+        # into 256 threads (2 waves/SIMD, 512-VGPR ceiling); the specialized
+        # attempt at the same tile needed 320 threads, landed 3 waves on a SIMD,
+        # and spilled 1353 registers.
+        #
+        # Its grid is a quarter of kid24's per shape, so it is entirely gated on
+        # having enough of it. Swept over batch 1..16 x m 256..8192: every cell
+        # whose kid27 grid reaches the CU count is a kid27 win (1.08x-1.76x over
+        # kid24), and below that it loses, by as much as 2.5x at b=8 m=512 where
+        # a 256x256 tile leaves 64 workgroups on 256 CUs.
+        #
+        # One cell disagrees and is deliberately not fitted: b=1 m=8192 has only
+        # 128 kid27 workgroups yet kid27 wins 1.38x there, while b=2 m=4096 --
+        # same kid27 grid, same kid24 grid, same total rows -- goes the other way
+        # by 3%. Two cells that agree on every count we can name and disagree on
+        # the answer is not a rule, so the band is left to kid24.
+        bm27, bn27 = _BPRESHUF_TILE_BN[27]
+        wg27 = -(-m // bm27) * -(-n // bn27) * batch
+        if wg27 >= cus:
+            return 27
         # kid24: kid0's 128x128x256 tile at 192 threads with a 2x2 consumer-wave
         # grid. Measured 1.33x faster than kid0 at healthy clocks (111.75 vs
-        # 148.36 us, b=8 m=2048), confirmed across decode shapes under both
-        # healthy and degraded clock states with the same ratio. The mechanism is
-        # occupancy 1 -> 2 (538 -> 314 VGPR, zero scratch) from the extra
-        # consumer waves and the squared grid.
+        # 148.36 us, b=8 m=2048). The mechanism is occupancy 1 -> 2 (538 -> 314
+        # VGPR, zero scratch) from the extra consumer waves and the squared grid.
         return 24
-    cus = _cu_count()
     bm6, bn6 = _BPRESHUF_TILE_BN[6]
     wg6 = -(-m // bm6) * -(-n // bn6) * batch
     if wg6 <= cus:

@@ -71,6 +71,27 @@ OPUS_BMM_BPRESHUF_INST(opus_bmm_a8w8_mxscale_bpreshuffle_tile_pf_m256_bk128_gfx1
 #undef OPUS_BMM_BPRESHUF_INST
 
 // ===========================================================================
+// NON-SPECIALIZED instantiations (every wave loads and computes).
+// ===========================================================================
+// Separate kernel symbol and separate pipeline header, so the twenty-five tiles
+// above keep their exact codegen. See the _nospec pipeline's header for why the
+// two cannot simply share a template flag.
+#include "gfx1250/opus_bmm_pipeline_a8w8_mxscale_bpreshuffle_nospec_gfx1250.cuh"
+
+#define OPUS_BMM_BPRESHUF_NS_INST(TILE)                                        \
+    template __global__ void                                                   \
+    bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250<TILE<bf16_t>>(          \
+        opus_bmm_a8w8_mxscale_kargs_gfx1250);                                  \
+    template __global__ void                                                   \
+    bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250<TILE<fp32_t>>(          \
+        opus_bmm_a8w8_mxscale_kargs_gfx1250)
+
+OPUS_BMM_BPRESHUF_NS_INST(opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_gfx1250);
+OPUS_BMM_BPRESHUF_NS_INST(opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns256_gfx1250);
+
+#undef OPUS_BMM_BPRESHUF_NS_INST
+
+// ===========================================================================
 // CLUSTER-LAUNCH, FUSED SPLIT-K instantiations.
 // ===========================================================================
 // Kernel:  gemm_a8w8_mxscale_bpreshuffle_clusterclaunch_kernel_gfx1250

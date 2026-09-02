@@ -197,6 +197,19 @@ void opus_bmm_a8w8_mxscale_bpreshuffle(
           O_, wo_a_, Y_, x_scale_, w_scale_, splitK_);                        \
   }
 
+  // The non-specialized tiles are a DIFFERENT kernel symbol, so they need their
+  // own entry macro; the table type is shared because the launcher signature is.
+#define OPUS_BMM_BPRESHUF_NS_ENTRY(TILE)                                     \
+  +[](aiter_tensor_t &O_, aiter_tensor_t &wo_a_, aiter_tensor_t &Y_,         \
+      aiter_tensor_t &x_scale_, aiter_tensor_t &w_scale_, int splitK_) {     \
+    if (Y_.dtype() == AITER_DTYPE_bf16)                                      \
+      opus_bmm_a8w8_mxscale_bpreshuffle_nospec_launch_gfx1250<TILE<bf16_t>>( \
+          O_, wo_a_, Y_, x_scale_, w_scale_, splitK_);                       \
+    else                                                                     \
+      opus_bmm_a8w8_mxscale_bpreshuffle_nospec_launch_gfx1250<TILE<fp32_t>>( \
+          O_, wo_a_, Y_, x_scale_, w_scale_, splitK_);                       \
+  }
+
   static const std::unordered_map<int, BpreshufLauncher> kBpreshuf = {
     { 0, OPUS_BMM_BPRESHUF_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_gfx1250)},
     { 1, OPUS_BMM_BPRESHUF_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_dec_n32_gfx1250)},
@@ -220,13 +233,16 @@ void opus_bmm_a8w8_mxscale_bpreshuffle(
     {23, OPUS_BMM_BPRESHUF_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_pf_bk128_gfx1250)},
     {24, OPUS_BMM_BPRESHUF_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_pf_w6_2x2_gfx1250)},
     {25, OPUS_BMM_BPRESHUF_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_pf_m256_bk128_gfx1250)},
+    {26, OPUS_BMM_BPRESHUF_NS_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_gfx1250)},
+    {27, OPUS_BMM_BPRESHUF_NS_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns256_gfx1250)},
   };
 #undef OPUS_BMM_BPRESHUF_ENTRY
+#undef OPUS_BMM_BPRESHUF_NS_ENTRY
 
   auto it = kBpreshuf.find(kernelId);
   AITER_CHECK(it != kBpreshuf.end(),
               "opus_bmm_a8w8_mxscale_bpreshuffle: unknown kernelId ", kernelId,
-              "; valid ids: 0..10, 13, 14, 17..25");
+              "; valid ids: 0..10, 13, 14, 17..27");
   it->second(O, wo_a, Y, x_scale, w_scale, splitK);
 #endif  // OPUS_BUILD_HAS_GFX1250
 }

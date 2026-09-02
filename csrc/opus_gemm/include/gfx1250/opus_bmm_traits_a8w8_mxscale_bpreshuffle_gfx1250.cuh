@@ -165,7 +165,15 @@ template<int BLOCK_SIZE_,
          // driven by LAYOUT_; any other value makes the grid TILE_M_ x
          // (kNumConsumerWaves / TILE_M_) and LAYOUT_ is then ignored. See the
          // kTileM/kTileN derivation for why 2D is worth having.
-         int TILE_M_ = 0>
+         int TILE_M_ = 0,
+         // NO WARP SPECIALIZATION. false is the shipped producer/consumer split
+         // (w0 streams A, w1 streams B, the rest run WMMA). true removes the
+         // split: every wave loads its share AND runs WMMA, which is what the
+         // gfx950 sibling of this kernel does and what the prefill end wants --
+         // at b=8 m=2048 that shape uses 6.7% of peak bandwidth, so a wave that
+         // issues no WMMA is one wave's worth of matrix pipe standing idle.
+         // Read by the _nospec pipeline; the specialized pipeline ignores it.
+         bool NO_SPEC_ = false>
 struct opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250 {
     static constexpr int BLOCK_SIZE = BLOCK_SIZE_;
     static constexpr int B_M = B_M_;
@@ -198,8 +206,34 @@ struct opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250 {
     static constexpr int kWarp  = 32;                       // gfx1250 wave size
     static constexpr int kWarpRt = opus::get_warp_size();    // 32 device / 64 host
     static constexpr int kNumWaves = BLOCK_SIZE / kWarp;
-    static constexpr int kNumProducerWaves = 2;              // w0 = A, w1 = B
+    static constexpr bool kNoSpec = NO_SPEC_;
+    // 0 under NO_SPEC_: no dedicated loader waves, every wave computes. Then
+    // kNumConsumerWaves == kNumWaves, and the kTileM/kTileN derivation together
+    // with its `kTileM * kTileN == kNumConsumerWaves` assert follow for free --
+    // which is why this flag needs no other change anywhere in the traits.
+    static constexpr int kNumProducerWaves = NO_SPEC_ ? 0 : 2;   // w0 = A, w1 = B
     static constexpr int kNumConsumerWaves = kNumWaves - kNumProducerWaves;
+
+    // -- load split for the non-specialized pipeline -------------------------
+    // Waves [0, kLoadWavesA) each pull kARowsPerWave rows of the A tile; the
+    // rest each pull kBRowsPerWave of its 16-column blocks. One TDM descriptor
+    // per wave per K-step, splitting BY OPERAND the way
+    // opus_gemm_pipeline_a16w16_4wave_compute_gfx1250.cuh does rather than
+    // having every wave issue both: descriptor SALU cost scales with the number
+    // of issues, not with bytes, so this keeps it at kNumWaves per K-step
+    // instead of 2*kNumWaves.
+    static constexpr int kLoadWavesA = NO_SPEC_ ? (kNumWaves / 2) : 0;
+    static constexpr int kLoadWavesB = NO_SPEC_ ? (kNumWaves - kLoadWavesA) : 0;
+    static constexpr int kARowsPerWave =
+        (NO_SPEC_ && kLoadWavesA) ? B_M_ / kLoadWavesA : 0;
+    static constexpr int kBRowsPerWave =
+        (NO_SPEC_ && kLoadWavesB) ? (B_N_ / 16) / kLoadWavesB : 0;
+    static_assert(!NO_SPEC_ || kNumWaves >= 2,
+                  "NO_SPEC_ needs at least one loader wave per operand");
+    static_assert(!NO_SPEC_ || B_M_ % (kLoadWavesA ? kLoadWavesA : 1) == 0,
+                  "NO_SPEC_: B_M must divide across the A loader waves");
+    static_assert(!NO_SPEC_ || (B_N_ / 16) % (kLoadWavesB ? kLoadWavesB : 1) == 0,
+                  "NO_SPEC_: B_N/16 blocks must divide across the B loader waves");
     static_assert(BLOCK_SIZE % kWarp == 0,
                   "BLOCK_SIZE must be a whole number of wave32 waves");
     static_assert(kNumConsumerWaves >= 1, "need at least one consumer wave");
@@ -1535,6 +1569,46 @@ using opus_bmm_a8w8_mxscale_bpreshuffle_tile_pf_w6_gfx1250 =
         /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
         /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
         /*GROUP_K*/128, /*NUM_SLOTS*/3, /*WG_PER_CU*/1>;
+
+// -- non-specialized tiles (NO_SPEC_, the _nospec pipeline) -----------------
+// 8 waves, 2x4 consumer grid, NO producer waves -- every wave loads its slice
+// and runs WMMA. 256 threads rather than 192 because kTileM * kTileN must equal
+// kNumWaves here, and 6 factors only as 2x3 / 1x6, neither of which divides a
+// 128-wide edge (128 % 48 and 128 % 96 are both nonzero). 8 as 2x4 divides
+// everything: B_M % 32, B_N % 64, and the load split B_M/4 rows and (B_N/16)/4
+// blocks per wave.
+//
+// 8 waves also puts 2 waves on each of the 4 SIMDs, so the per-wave VGPR
+// ceiling is ~512 (see the sizing note above) -- the same ceiling the 192-thread
+// tiles get, not the 336 that 320 threads would impose.
+//
+// kid26: the CONTROL. kid24's exact tile and LDS, so kid26-vs-kid24 is warp
+// specialization ALONE -- 8 waves all computing against 2 producers + 4
+// consumers. Per-wave demand is tiny (acc 64 + A 128 + B 64 = 256 against 512),
+// which is itself the point: the accumulator shrinks as the grid grows.
+template <typename DataC>
+using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_gfx1250 =
+    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
+        /*BLOCK_SIZE*/256, /*B_M*/128, /*B_N*/128, /*B_K*/256,
+        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
+        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
+        /*GROUP_K*/128, /*NUM_SLOTS*/3, /*WG_PER_CU*/1, /*GROUP_N*/1,
+        /*SF_A_LDS*/false, /*SF_B_LDS*/false,
+        /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true>;
+
+// kid27: the TARGET. Four times kid26's output tile at 448 VGPR against the
+// same 512 ceiling -- the budget the shrinking accumulator frees, spent on
+// tile area. B_K is 128 because 256 would need 396 KB of LDS at the mandatory
+// slots=3; kid23 prices that halving separately on the specialized side.
+template <typename DataC>
+using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns256_gfx1250 =
+    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
+        /*BLOCK_SIZE*/256, /*B_M*/256, /*B_N*/256, /*B_K*/128,
+        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
+        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
+        /*GROUP_K*/128, /*NUM_SLOTS*/3, /*WG_PER_CU*/1, /*GROUP_N*/1,
+        /*SF_A_LDS*/false, /*SF_B_LDS*/false,
+        /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true>;
 
 // -- smem -> register read layouts -----------------------------------------
 // Device-only in effect, but compiled on the host pass too so vtype_c matches.
