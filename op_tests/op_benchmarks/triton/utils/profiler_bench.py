@@ -140,9 +140,7 @@ def do_bench_profiler(
         run(i)
     torch.cuda.synchronize()
 
-    with tpf.profile(
-        activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA]
-    ) as prof:
+    with tpf.profile(activities=[tpf.ProfilerActivity.CUDA]) as prof:
         for i in range(num_iters):
             run(i)
         torch.cuda.synchronize()
