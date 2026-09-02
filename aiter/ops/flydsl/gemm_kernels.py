@@ -1103,7 +1103,6 @@ def gemm_decode_bf16(
     return C
 
 
-
 @functools.lru_cache(maxsize=1)
 def _get_compile_fn():
     """Import the preshuffle compiler on first use."""
