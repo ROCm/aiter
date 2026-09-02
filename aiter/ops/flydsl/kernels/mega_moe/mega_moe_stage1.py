@@ -23,9 +23,11 @@ from .dispatch import (
 from .gemm1 import _LdsF32View, build_fused_gemm1
 from .gemm_util import _buffer_load, _buffer_store, _make_buffer, _make_buffer_from_addr
 from .mega_moe_config import (
+    FIXED_GRID_MULT_VALUES,
     INDEXED_PAYLOAD_MIN_MTPR,
     INDEXED_PAYLOAD_MIN_SBM,
     Stage1Config,
+    fixed_stage1_epoch_slot,
 )
 
 _SC0_CACHE = 1
@@ -107,10 +109,9 @@ def compile_mega_moe_stage1(
     n_per_wave = tile_n // NUM_WAVES
     assert (2 * inter_dim) % tile_n == 0, "2*inter_dim must tile evenly by tile_n"
     N_TILES = (2 * inter_dim) // tile_n
-    GRID_MULT_VALUES = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32)
-    assert grid_mult in GRID_MULT_VALUES, "grid_mult out of range"
-    grid_epoch_slot = GRID_MULT_VALUES.index(grid_mult)
     dispatch_blocks = int(num_dispatch_cu)
+    assert grid_mult in FIXED_GRID_MULT_VALUES, "grid_mult out of range"
+    grid_epoch_slot = fixed_stage1_epoch_slot(grid_mult, dispatch_blocks, num_cu)
     payload_chunk_rows = int(payload_chunk_rows)
     tile_state_stride = int(tile_state_stride)
     assert 0 < dispatch_blocks < num_cu, "num_dispatch_cu must be in [1, num_cu)"

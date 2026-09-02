@@ -23,6 +23,7 @@ TOKEN_BUCKETS = (
     16384,
     32768,
 )
+FIXED_GRID_MULT_VALUES = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32)
 P2P_FP8_MIN_MTPR = 1024
 FIXED_SLOT_MAX_MTPR = 255
 MAX_MTPR_CLASS = 32768
@@ -32,6 +33,22 @@ INDEXED_PAYLOAD_MIN_MTPR = MAX_MTPR_CLASS
 INDEXED_PAYLOAD_MIN_SBM = 128
 REFERENCE_EXPERTS_PER_RANK = 48
 EXPERT_CONFIG_GRANULARITY = 64
+MAX_FANOUT_EXPERTS_PER_RANK = 64
+
+
+def fixed_stage1_epoch_slot(grid_mult: int, num_dispatch_cu: int, num_cu: int) -> int:
+    """Return a collision-free fixed-slot epoch counter for one launch geometry."""
+    if grid_mult not in FIXED_GRID_MULT_VALUES:
+        raise ValueError(f"unsupported fixed-slot grid multiplier {grid_mult}")
+    if not 0 < num_dispatch_cu < num_cu:
+        raise ValueError(f"num_dispatch_cu={num_dispatch_cu} must be in [1, {num_cu})")
+    return FIXED_GRID_MULT_VALUES.index(grid_mult) * (num_cu + 1) + num_dispatch_cu
+
+
+def fixed_stage1_epoch_slot_count(num_cu: int) -> int:
+    if num_cu <= 0:
+        raise ValueError(f"num_cu must be positive, got {num_cu}")
+    return len(FIXED_GRID_MULT_VALUES) * (num_cu + 1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -398,8 +415,11 @@ def select_mega_moe_config(
     mtpr_class = mtpr_config_class(mtpr)
     if mtpr_class <= FIXED_SLOT_MAX_MTPR and bucket > 128:
         raise ValueError(f"fixed-slot does not support token bucket {bucket}")
-    if mtpr_class <= FIXED_SLOT_MAX_MTPR and experts_per_rank > 64:
-        raise ValueError("fixed-slot supports at most 64 experts per rank")
+    if experts_per_rank > MAX_FANOUT_EXPERTS_PER_RANK:
+        raise ValueError(
+            "MegaMoE v2 fanout supports at most "
+            f"{MAX_FANOUT_EXPERTS_PER_RANK} experts per rank"
+        )
     return _select_bucket_config(
         bucket, mtpr_class, expert_config_class(experts_per_rank), model_dim, inter_dim
     )

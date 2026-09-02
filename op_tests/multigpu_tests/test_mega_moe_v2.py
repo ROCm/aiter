@@ -136,10 +136,29 @@ def _dequant_expert(weight, scale, rows, cols):
     return values * scales.repeat_interleave(32, dim=-1)
 
 
-def _all_gather(tensor):
-    gathered = [torch.empty_like(tensor) for _ in range(dist.get_world_size())]
+def _all_gather_variable(tensor, token_counts=None):
+    world = dist.get_world_size()
+    if token_counts is None:
+        local_count = torch.tensor(
+            tensor.shape[0], dtype=torch.int64, device=tensor.device
+        )
+        gathered_counts = [torch.empty_like(local_count) for _ in range(world)]
+        dist.all_gather(gathered_counts, local_count)
+        token_counts = [int(count.item()) for count in gathered_counts]
+    max_count = max(token_counts)
+    if tensor.shape[0] < max_count:
+        padding = torch.empty(
+            (max_count - tensor.shape[0], *tensor.shape[1:]),
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+        tensor = torch.cat((tensor, padding))
+    gathered = [torch.empty_like(tensor) for _ in range(world)]
     dist.all_gather(gathered, tensor)
-    return torch.cat(gathered)
+    return (
+        torch.cat([value[:count] for value, count in zip(gathered, token_counts)]),
+        token_counts,
+    )
 
 
 @torch.no_grad()
@@ -155,11 +174,9 @@ def _reference(
     experts,
     swiglu_limit,
 ):
-    x_all, weights_all, ids_all = (
-        _all_gather(x),
-        _all_gather(route_weights),
-        _all_gather(ids),
-    )
+    x_all, token_counts = _all_gather_variable(x)
+    weights_all, _ = _all_gather_variable(route_weights, token_counts)
+    ids_all, _ = _all_gather_variable(ids, token_counts)
     partial = torch.zeros(
         (x_all.shape[0], model_dim), dtype=torch.float32, device=x.device
     )
@@ -185,7 +202,7 @@ def _reference(
         partial.index_add_(0, rows, out)
         del w1, w2, inp, hidden, out
     dist.all_reduce(partial)
-    start = rank * x.shape[0]
+    start = sum(token_counts[:rank])
     return partial[start : start + x.shape[0]]
 
 
@@ -218,17 +235,26 @@ def _time_graph(fn, device, iters):
 def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
     tokens = x.shape[0]
     output = moe(x, weights, ids)[:tokens]
+    if moe._active_config.stage2.aligned_pair:
+        aligned_output = output.clone()
+        full_output = moe(x, weights, ids, slice_output=False)
+        expected_shape = (moe.mtpr, moe.model_dim)
+        if tuple(full_output.shape) != expected_shape:
+            raise AssertionError(
+                f"slice_output=False returned {tuple(full_output.shape)}, "
+                f"expected {expected_shape}"
+            )
+        if not torch.equal(full_output[:tokens], aligned_output):
+            raise AssertionError("slice_output changed aligned-pair valid rows")
+        output = full_output[:tokens]
     _barrier()
     eager_output = output.clone()
     rel_l2 = -1.0
-    # The reference uses fixed-shape all_gather and therefore requires every
-    # rank to make the same decision and contribute the same token count.
-    token_min = torch.tensor(tokens, dtype=torch.int32, device=device)
-    token_max = token_min.clone()
-    dist.all_reduce(token_min, op=dist.ReduceOp.MIN)
+    # Every rank must make the same decision before entering the reference
+    # collectives; the reference itself pads variable token counts for gather.
+    token_max = torch.tensor(tokens, dtype=torch.int32, device=device)
     dist.all_reduce(token_max, op=dist.ReduceOp.MAX)
-    uniform_tokens = int(token_min.item()) == int(token_max.item())
-    if uniform_tokens and 0 < tokens <= args.accuracy_max_bs:
+    if 0 < int(token_max.item()) <= args.accuracy_max_bs:
         reference = _reference(
             x,
             weights,
@@ -241,11 +267,11 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
             moe.experts,
             moe.swiglu_limit,
         )
-        rel_l2 = float(
-            torch.linalg.vector_norm(output.float() - reference)
-            / torch.linalg.vector_norm(reference)
-        )
-        rel_l2 = _reduce_float(rel_l2, device, dist.ReduceOp.MAX)
+        error_sq = torch.sum((output.float() - reference) ** 2)
+        reference_sq = torch.sum(reference**2)
+        dist.all_reduce(error_sq)
+        dist.all_reduce(reference_sq)
+        rel_l2 = float(torch.sqrt(error_sq / reference_sq))
         if rel_l2 >= args.rtol:
             raise AssertionError(f"bs={tokens} relL2={rel_l2:.6f} exceeds {args.rtol}")
 

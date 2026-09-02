@@ -22,6 +22,7 @@ from .mega_moe_config import (
     MegaMoEConfig,
     Stage1Config,
     build_mega_moe_bundle_plan,
+    fixed_stage1_epoch_slot_count,
 )
 from .quant import per_1x32_mx_quant
 
@@ -222,8 +223,19 @@ class MegaMoEV2:
             ),
             "pair_base": torch.empty(total_segments, dtype=torch.int32, device=self.dev),
             "pair_ready": torch.zeros(2, dtype=torch.int32, device=self.dev),
-            "entry_count": torch.zeros(10, dtype=torch.int64, device=self.dev),
-            "epoch_gate": torch.zeros(10, dtype=torch.int32, device=self.dev),
+            # Fixed Stage1 launch size depends on both grid_mult and dispatch CUs.
+            # Keep independent epochs for every role geometry so dynamic shapes
+            # cannot split one physical launch across two generations.
+            "entry_count": torch.zeros(
+                fixed_stage1_epoch_slot_count(self._s1_num_cu),
+                dtype=torch.int64,
+                device=self.dev,
+            ),
+            "epoch_gate": torch.zeros(
+                fixed_stage1_epoch_slot_count(self._s1_num_cu),
+                dtype=torch.int32,
+                device=self.dev,
+            ),
             # Fused prepare is keyed by (route workers, quant workers).  Each
             # key has a fixed launch grid, so its generation counter remains
             # valid when dynamic token shapes alternate under CUDA Graphs.
@@ -804,6 +816,7 @@ class MegaMoEV2:
                 scatter_vec=config.stage2.pair_scatter_vec,
                 pair_main_first=True,
                 pair_m_swizzle=True,
+                slice_output=slice_output,
             )
         ret = self._run_fused_stage2(run_tokens, config, stream)
         out_tok = ret[0] if isinstance(ret, (tuple, list)) else ret
@@ -1256,6 +1269,7 @@ class MegaMoEV2:
         pair_first_submit: bool = False,
         pair_main_first: bool = False,
         pair_m_swizzle: bool = False,
+        slice_output: bool = True,
     ):
         """Run direct-skip plus aligned pair fusion, then the normal combine."""
         pair_mask = (
@@ -1458,4 +1472,4 @@ class MegaMoEV2:
                 .view(cfg.combine_dtype)
                 .view(self.mtpr, cfg.combine_token_view_dim)
             )
-        return out_tok[:run_tokens]
+        return out_tok[:run_tokens] if slice_output else out_tok

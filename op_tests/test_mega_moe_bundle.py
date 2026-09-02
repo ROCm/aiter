@@ -15,6 +15,8 @@ from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
     Stage2BundleKey,
     Stage2Config,
     build_mega_moe_bundle_plan,
+    fixed_stage1_epoch_slot,
+    fixed_stage1_epoch_slot_count,
     select_mega_moe_config,
     stage1_bundle_identity,
 )
@@ -55,6 +57,49 @@ def test_zero_token_quantize_does_not_launch_a_kernel(monkeypatch):
     quant, scale = moe.quantize(x)
     assert quant.shape == (0, 32)
     assert scale.shape == (0, 1)
+
+
+def test_fixed_stage1_epoch_slot_includes_dispatch_geometry():
+    num_cu = 256
+    slots = {}
+    for tokens in (1, 4, 8, 16, 32, 64, 128):
+        stage1 = select_mega_moe_config(tokens, 128).stage1
+        geometry = stage1.grid_mult, stage1.num_dispatch_cu
+        slot = fixed_stage1_epoch_slot(*geometry, num_cu)
+        assert slot < fixed_stage1_epoch_slot_count(num_cu)
+        assert slots.setdefault(slot, geometry) == geometry
+
+    one = select_mega_moe_config(1, 128).stage1
+    four = select_mega_moe_config(4, 128).stage1
+    assert one.grid_mult == four.grid_mult
+    assert fixed_stage1_epoch_slot(
+        one.grid_mult, one.num_dispatch_cu, num_cu
+    ) != fixed_stage1_epoch_slot(four.grid_mult, four.num_dispatch_cu, num_cu)
+
+
+@pytest.mark.parametrize("slice_output", [False, True])
+def test_aligned_pair_stage2_forwards_slice_output(monkeypatch, slice_output):
+    pytest.importorskip("mori.shmem", reason="MegaMoEV2 requires MORI")
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_v2 import MegaMoEV2
+
+    marker = object()
+    observed = []
+
+    def fake_candidate(_self, _run_tokens, _config, _stream, **kwargs):
+        observed.append(kwargs["slice_output"])
+        return marker
+
+    monkeypatch.setattr(MegaMoEV2, "_run_aligned_pair_stage2_candidate", fake_candidate)
+    moe = object.__new__(MegaMoEV2)
+    config = select_mega_moe_config(8192, 8192)
+    assert config.stage2.aligned_pair
+    assert moe._run_stage2(8192, None, slice_output, config) is marker
+    assert observed == [slice_output]
+
+
+def test_compact_fanout_rejects_more_than_64_experts_per_rank():
+    with pytest.raises(ValueError, match="at most 64 experts per rank"):
+        select_mega_moe_config(4096, 32768, experts_per_rank=65)
 
 
 @pytest.mark.parametrize("old_value", [None, "0"])
