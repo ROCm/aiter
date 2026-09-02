@@ -5,11 +5,10 @@ import triton
 
 from aiter.ops.triton._triton_kernels.moe.quant_moe import (
     _downcast_to_mxfp,
-    _downcast_to_static_fp8,
     _smoothquant_fuse_quant_kernel,
     _smoothquant_fuse_quant_kernel_single_pass,
-    _upcast_from_mxfp,
 )
+from aiter.ops.triton.quant.quant import _static_per_tensor_quant_launch
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 
@@ -25,37 +24,20 @@ def downcast_to_static_fp8_3d(x: torch.Tensor, scale: torch.Tensor):
 
 
 def downcast_to_static_fp8(x: torch.Tensor, scale: torch.Tensor):
+    """Quantize ``x`` by a single tensor-wide ``scale`` to the arch's fp8 e4m3.
+
+    Uses the exact-division form of the shared static per-tensor quant kernel
+    (``FAST_CONVERT=False``), which is what this path has always done; the
+    reciprocal form used by ``static_per_tensor_quant_fp8_i8`` differs on a
+    small fraction of inputs.
+    """
     M, N = x.shape
     if get_arch() != "gfx942":
         dtype = torch.float8_e4m3fn
     else:
         dtype = torch.float8_e4m3fnuz
-    y = torch.empty((M, N), dtype=dtype, device="cuda")
-
-    BLOCK_M = min(triton.next_power_of_2(M), 128)
-    if M <= 4096:
-        BLOCK_N = 32
-    else:
-        BLOCK_N = 64
-    grid_m = triton.cdiv(x.shape[0], BLOCK_M)
-    grid_n = triton.cdiv(x.shape[1], BLOCK_N)
-
-    _downcast_to_static_fp8[(grid_m, grid_n)](
-        x,
-        x.stride(0),
-        x.stride(1),
-        y,
-        y.stride(0),
-        y.stride(1),
-        scale,
-        M,
-        N,
-        BLOCK_M,
-        BLOCK_N,
-        num_warps=8,
-    )
-
-    return y
+    y = torch.empty((M, N), dtype=dtype, device=x.device)
+    return _static_per_tensor_quant_launch(y, x, scale, fast_convert=False)
 
 
 class DequantScaleRoundingMode(Enum):
@@ -68,6 +50,7 @@ def downcast_to_mxfp(
     out_quant_type: torch.dtype,
     axis: int,
     DEQUANT_SCALE_ROUNDING_MODE: DequantScaleRoundingMode = DequantScaleRoundingMode.ROUND_UP,
+    pow2_scale: bool = False,
 ):
     """
     Convert the src weights to mx format. The src weight is quantized along the axis dimension.
@@ -77,6 +60,11 @@ def downcast_to_mxfp(
 
     If weight_quant_type is torch.float8_e4m3fn or torch.float8_e5m2, we output mxfp8 with the float8s are stored
     in their respective formats.
+
+    ``pow2_scale`` selects the ``even_round`` scale scheme shared with
+    ``dynamic_mxfp4_quant`` / ``dynamic_mxfp8_quant`` instead of the default
+    ``amax / dtype_max`` one; see :func:`_compute_mx_quant_and_scale`. The two
+    disagree, so a tensor quantized one way must be dequantized the same way.
     """
     ndim = src_tensor.ndim
     assert -ndim <= axis < ndim, f"Invalid axis {axis=}"
@@ -120,68 +108,13 @@ def downcast_to_mxfp(
         BLOCK_OUT_DIM,
         BLOCK_QUANT_DIM,
         DEQUANT_SCALE_ROUNDING_MODE.value,
+        pow2_scale,
         num_warps=8,
     )
 
     out_quant_tensor = out_quant_tensor.transpose(axis, src_tensor.ndim - 1)
     out_scale = out_scale.transpose(axis, src_tensor.ndim - 1)
     return out_quant_tensor, out_scale
-
-
-def upcast_from_mxfp(
-    tensor: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype, axis: int
-):
-    """
-    Upcasts an mxfp (packed) weight tensor back to float16 or bfloat16.
-
-    The function assumes that the tensors were quantized along the given axis.
-    It permutes the tensor so that the quantized axis is last, reshapes to 2D,
-    launches the Triton upcast kernel, and then unpermutes back to the original order.
-    """
-    ndim = tensor.ndim
-    assert -ndim <= axis < ndim, f"Invalid axis {axis=}"
-    axis = axis if axis >= 0 else axis + ndim
-    assert tensor.ndim == scale.ndim, (
-        f"Weight and scale must have the same number of dimensions. "
-        f"Got {tensor.ndim=} and {scale.ndim=}"
-    )
-    # dtype checks
-    assert tensor.dtype in {
-        torch.uint8,
-        torch.float8_e5m2,
-        torch.float8_e4m3fn,
-        torch.float8_e4m3fnuz,
-    }, f"Invalid tensor dtype {tensor.dtype=}"
-    assert scale.dtype == torch.uint8, f"Invalid scale dtype {scale.dtype=}"
-    assert dtype in (torch.float16, torch.bfloat16), f"Invalid output dtype {dtype=}"
-    # upcast
-    logical_quant_dim = tensor.shape[axis] * (2 if tensor.dtype == torch.uint8 else 1)
-    tensor = tensor.transpose(axis, tensor.ndim - 1).contiguous()
-    scale = scale.transpose(axis, scale.ndim - 1).contiguous()
-    out = torch.empty(
-        (*tensor.shape[:-1], logical_quant_dim), dtype=dtype, device=tensor.device
-    )
-    reshaped_out = out.view(-1, out.shape[-1])
-    reshaped_tensor = tensor.view(-1, tensor.shape[-1])
-    reshaped_scale = scale.view(-1, scale.shape[-1])
-    BLOCK_OUT_DIM = 128
-    BLOCK_QUANT_DIM = 32
-    blocks_out_dim = triton.cdiv(reshaped_out.shape[0], BLOCK_OUT_DIM)
-    blocks_quant_dim = triton.cdiv(reshaped_out.shape[1], BLOCK_QUANT_DIM)
-    _upcast_from_mxfp[(blocks_out_dim, blocks_quant_dim)](
-        reshaped_out,
-        *reshaped_out.stride(),
-        reshaped_scale,
-        *reshaped_scale.stride(),
-        reshaped_tensor,
-        *reshaped_tensor.stride(),
-        *reshaped_out.shape,
-        BLOCK_OUT_DIM,
-        BLOCK_QUANT_DIM,
-        num_warps=8,
-    )
-    out = out.transpose(axis, scale.ndim - 1).contiguous()
-    return out
 
 
 def dequant_x_blockscale(x, x_scales, per_row_x_scale, group_shape):
