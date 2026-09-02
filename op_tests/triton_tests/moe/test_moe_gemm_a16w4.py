@@ -282,17 +282,9 @@ def test_op(
     w_tri, w_scale_tri = downcast_to_mxfp(w_tri, weight_dtype, axis=1)
     w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
     if hbm_swizzling:
-        if arch_info.get_arch() == "gfx1250":
-            swizzle_mx_scale = "GFX1250_SCALE"
-            w_scale_tri = shuffle_scale_moe(
-                w_scale_tri, arch="gfx1250", preshuffle_factor=32, scale_kwidth=8
-            )
-        else:
-            assert arch_info.get_arch() == "gfx950"
-            swizzle_mx_scale = "CDNA4_SCALE"
-            w_scale_tri = shuffle_scale_moe(
-                w_scale_tri, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
-            )
+        w_scale_tri, swizzle_mx_scale = shuffle_scale_moe(
+            w_scale_tri, preshuffle_factor=32, scale_kwidth=8, return_layout=True
+        )
     else:
         swizzle_mx_scale = None
 
