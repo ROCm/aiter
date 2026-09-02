@@ -25,6 +25,10 @@ class _NoLaunch:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--rank", type=int, default=0)
+    parser.add_argument("--tokens", type=int, default=128)
+    parser.add_argument(
+        "--max-routes-per-token-per-rank", type=int, default=None
+    )
     parser.add_argument("--worker-blocks", type=int, default=160)
     parser.add_argument(
         "--staged-ring",
@@ -37,9 +41,13 @@ def main():
     # call, whose real pointers/DevComm exist only in the EP16 launcher.
     jfmod._build_call_state = lambda *unused_args, **unused_kwargs: _NoLaunch()
 
-    s1 = Stage1ArenaLayout.create()
+    s1 = Stage1ArenaLayout.create(
+        max_tokens=args.tokens,
+        max_routes_per_token_per_rank=args.max_routes_per_token_per_rank,
+    )
     s2 = Stage2ArenaLayout.create(
-        include_rank_partials=args.staged_ring,
+        max_tokens=args.tokens,
+        include_rank_partials=True,
         include_staged_ring=args.staged_ring,
     )
     combo = TwoKernelArenaLayout.compose(s1, s2)
@@ -51,15 +59,28 @@ def main():
         worker_blocks=args.worker_blocks,
         enable_cco=True,
     )
-    stage2 = compile_megamoe_tile_ep16_stage2_a4w4(combo, rank=args.rank)
+    stage2 = compile_megamoe_tile_ep16_stage2_a4w4(
+        combo,
+        rank=args.rank,
+        final_combine_blocks=4,
+        return_chunk_tokens=8,
+        rail_return_schedule="compact",
+        node_accumulation_mode="rank_local",
+        rank_accumulation_mode="staged_ring" if args.staged_ring else "atomic",
+        node_reduce_blocks=16,
+        node_reduce_vec_bytes=8,
+        node_reduce_load_schedule="load_first",
+        node_reduce_work_schedule="dynamic_head",
+        group_pipeline_schedule="a_double_buffer",
+    )
     s1_args = (
         fx.Int64(0), fx.Int64(0), fx.Int64(0), fx.Int64(0), fx.Int64(0),
-        fx.Int64(0), fx.Int64(0), fx.Int64(0), fx.Int64(0), fx.Int32(128), fx.Int64(1),
+        fx.Int64(0), fx.Int64(0), fx.Int64(0), fx.Int64(0), fx.Int32(args.tokens), fx.Int64(1),
         fx.Stream(None),
     )
     s2_args = (
         fx.Int64(0), fx.Int64(0), fx.Int64(0), fx.Int64(0), fx.Int64(0),
-        fx.Int64(1), fx.Int32(128), fx.Int32(args.worker_blocks), fx.Int64(0),
+        fx.Int64(1), fx.Int32(args.tokens), fx.Int32(args.worker_blocks), fx.Int64(0),
         fx.Stream(None),
     )
     flyc.compile(stage1, *s1_args)

@@ -20,6 +20,7 @@ from aiter.ops.flydsl.kernels.megamoe_tile.stage2 import (
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--rank", type=int, default=0)
+    parser.add_argument("--tokens", type=int, default=128)
     parser.add_argument(
         "--worker-blocks",
         type=int,
@@ -43,6 +44,9 @@ def main():
     parser.add_argument("--final-combine-blocks", type=int, default=14)
     parser.add_argument("--gmm-schedule", default="persistent_queue")
     parser.add_argument("--return-chunk-tokens", type=int, default=8)
+    parser.add_argument(
+        "--ready-granularity", choices=("token", "tile"), default="token"
+    )
     parser.add_argument("--bf16-atomic-kind", default="buffer")
     parser.add_argument(
         "--node-accumulation-mode",
@@ -116,8 +120,10 @@ def main():
             "dynamic_base LDS addressing requires rank_local, vec8, "
             "load_first, static_strided reduction, and rejoin_blocks=0"
         )
-    s1 = Stage1ArenaLayout.create()
+    s1 = Stage1ArenaLayout.create(max_tokens=args.tokens)
     s2 = Stage2ArenaLayout.create(
+        max_tokens=args.tokens,
+        ready_granularity=args.ready_granularity,
         include_route_slots=args.node_accumulation_mode == "route_store",
         include_rank_partials=args.node_accumulation_mode == "rank_local",
         include_staged_reduce=(
@@ -135,6 +141,7 @@ def main():
         final_combine_blocks=args.final_combine_blocks,
         gmm_schedule=args.gmm_schedule,
         return_chunk_tokens=args.return_chunk_tokens,
+        ready_granularity=args.ready_granularity,
         bf16_atomic_kind=args.bf16_atomic_kind,
         node_accumulation_mode=args.node_accumulation_mode,
         rank_accumulation_mode=args.rank_accumulation_mode,
@@ -155,7 +162,7 @@ def main():
         kernel_name_override=args.kernel_name_override,
     )
     dummy = torch.zeros(1, dtype=torch.uint8, device="cuda")
-    output = torch.empty((128, 7168), dtype=torch.bfloat16, device="cuda")
+    output = torch.empty((args.tokens, 7168), dtype=torch.bfloat16, device="cuda")
     stream = torch.cuda.current_stream()
     launch(
         args.worker_blocks,
@@ -164,7 +171,7 @@ def main():
         dummy.data_ptr(),
         dummy.data_ptr(),
         1,
-        128,
+        args.tokens,
         0,
         output.data_ptr(),
         stream=stream,

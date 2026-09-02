@@ -14,8 +14,14 @@ profile_rank="${PROFILE_GLOBAL_RANK:-0}"
 python_bin="${PYTHON_BIN:-python3}"
 
 if [[ "${profile_rank}" != "all" && "${RANK:-unset}" != "${profile_rank}" ]]; then
+  unset FLYDSL_DEBUG_ENABLE_DEBUG_INFO
   exec "${python_bin}" -u "$@"
 fi
+
+# Source-to-ISA DWARF is required only for the rank wrapped by rocprof ATT.
+# Enabling it in the parent torchrun environment makes every peer rebuild the
+# very large rank-specialized Stage-2 kernel.
+export FLYDSL_DEBUG_ENABLE_DEBUG_INFO=1
 
 rocprof_bin="${ROCPROFV3_BIN:-/opt/rocm/bin/rocprofv3}"
 profile_root="${PROFILE_ROOT:?PROFILE_ROOT must name the rank0 output directory}"

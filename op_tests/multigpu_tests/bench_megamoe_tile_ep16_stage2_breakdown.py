@@ -246,9 +246,9 @@ class _StopBeforeStage2(list):
             raise _Stage2Captured
 
 
-def _shape() -> BenchmarkShape:
+def _shape(tokens: int) -> BenchmarkShape:
     shape = BenchmarkShape(
-        tokens=128,
+        tokens=int(tokens),
         hidden=7168,
         inter=3072,
         experts=896,
@@ -345,6 +345,10 @@ class Stage2ModeOperator(MegaMoETileA4W4):
         stage2_rank_epilogue_lds_addressing: str = "expanded",
         stage2_rank_accumulation_mode: str = "atomic",
         stage2_rail_return_schedule: str = "lockstep",
+        stage2_rail_quant_type: str = "none",
+        stage2_gmm_work_swizzle: str = "token_major",
+        stage2_window_n_groups: int = 2,
+        stage2_ready_granularity: str = "token",
         stage2_epilogue_schedule: str = "lane32_meta",
         stage2_n_tile_group: int = 2,
         stage2_group_pipeline_schedule: str = "a_double_buffer",
@@ -352,6 +356,7 @@ class Stage2ModeOperator(MegaMoETileA4W4):
         stage2_atomic_issue_schedule: str = "interleaved",
         stage2_waves_per_eu_hint: int = 2,
         stage2_timeline_instrument: bool = False,
+        stage1_diagnostic_phase: str = "full",
         **kwargs,
     ):
         if stage2_mode not in CANDIDATE_MODES:
@@ -484,6 +489,14 @@ class Stage2ModeOperator(MegaMoETileA4W4):
             raise ValueError("unsupported Stage2 scoreboard schedule")
         if stage2_atomic_issue_schedule not in ("interleaved", "preload_pairs"):
             raise ValueError("unsupported Stage2 atomic issue schedule")
+        if stage2_rail_quant_type not in ("none", "fp8_blockwise"):
+            raise ValueError("unsupported Stage2 rail quant type")
+        if stage2_gmm_work_swizzle not in ("token_major", "n_major_window"):
+            raise ValueError("unsupported Stage2 GMM work swizzle")
+        if int(stage2_window_n_groups) not in (1, 2, 4, 7, 14):
+            raise ValueError("stage2_window_n_groups must be one of 1,2,4,7,14")
+        if stage2_ready_granularity not in ("token", "tile"):
+            raise ValueError("unsupported Stage2 ready granularity")
         if int(stage2_waves_per_eu_hint) not in (1, 2, 3, 4):
             raise ValueError("stage2_waves_per_eu_hint must be in [1,4]")
         self.stage2_mode = str(stage2_mode)
@@ -511,6 +524,10 @@ class Stage2ModeOperator(MegaMoETileA4W4):
         )
         self.stage2_rank_accumulation_mode = str(stage2_rank_accumulation_mode)
         self.stage2_rail_return_schedule = str(stage2_rail_return_schedule)
+        self.stage2_rail_quant_type = str(stage2_rail_quant_type)
+        self.stage2_gmm_work_swizzle = str(stage2_gmm_work_swizzle)
+        self.stage2_window_n_groups = int(stage2_window_n_groups)
+        self.stage2_ready_granularity = str(stage2_ready_granularity)
         self.stage2_epilogue_schedule = str(stage2_epilogue_schedule)
         self.stage2_n_tile_group = int(stage2_n_tile_group)
         self.stage2_group_pipeline_schedule = str(
@@ -519,6 +536,7 @@ class Stage2ModeOperator(MegaMoETileA4W4):
         self.stage2_scoreboard_schedule = str(stage2_scoreboard_schedule)
         self.stage2_atomic_issue_schedule = str(stage2_atomic_issue_schedule)
         self.stage2_waves_per_eu_hint = int(stage2_waves_per_eu_hint)
+        self.stage1_diagnostic_phase = str(stage1_diagnostic_phase)
         self.timeline_instrument = bool(stage2_timeline_instrument)
         if self.timeline_instrument and self.stage2_mode != "full":
             raise ValueError("device timeline requires full Stage2 mode")
@@ -563,6 +581,10 @@ class Stage2ModeOperator(MegaMoETileA4W4):
             < 1 + reduce_role_blocks + self.stage2_final_combine_blocks
         ):
             raise ValueError("return_only requires every communication-role CTA")
+        kwargs["stage2_rail_quant_type"] = self.stage2_rail_quant_type
+        kwargs["stage2_gmm_work_swizzle"] = self.stage2_gmm_work_swizzle
+        kwargs["stage2_window_n_groups"] = self.stage2_window_n_groups
+        kwargs["stage2_ready_granularity"] = self.stage2_ready_granularity
         super().__init__(*args, **kwargs)
         # The base class intentionally fixes production Stage2 at 160.  The
         # diagnostic launcher accepts the grid size as a runtime argument.
@@ -594,6 +616,10 @@ class Stage2ModeOperator(MegaMoETileA4W4):
             rank_epilogue_lds_addressing=self.stage2_rank_epilogue_lds_addressing,
             rank_accumulation_mode=self.stage2_rank_accumulation_mode,
             rail_return_schedule=self.stage2_rail_return_schedule,
+            rail_quant_type=self.stage2_rail_quant_type,
+            gmm_work_swizzle=self.stage2_gmm_work_swizzle,
+            window_n_groups=self.stage2_window_n_groups,
+            ready_granularity=self.stage2_ready_granularity,
             epilogue_schedule=self.stage2_epilogue_schedule,
             n_tile_group=self.stage2_n_tile_group,
             group_pipeline_schedule=self.stage2_group_pipeline_schedule,
@@ -687,6 +713,9 @@ class CandidateStage2Path:
             f"_nrr{operator.stage2_node_reduce_rejoin_blocks}"
             f"_rla{operator.stage2_rank_epilogue_lds_addressing}"
             f"_rr{operator.stage2_rail_return_schedule}"
+            f"_ws{operator.stage2_gmm_work_swizzle}"
+            f"w{operator.stage2_window_n_groups}"
+            f"_rg{operator.stage2_ready_granularity}"
             f"_epi{operator.stage2_epilogue_schedule}"
             f"_ng{operator.stage2_n_tile_group}"
             f"_gp{operator.stage2_group_pipeline_schedule}"
@@ -740,7 +769,10 @@ class CandidateStage2Path:
             max_tokens=op.mtpr,
         )
         if run_tokens != op.mtpr:
-            raise ValueError("Stage2 breakdown requires exactly 128 tokens/rank")
+            raise ValueError(
+                "Stage2 breakdown requires exactly the configured tokens/rank: "
+                f"expected {op.mtpr}, got {run_tokens}"
+            )
         stream = op._flydsl_stream(None)
         if op.timeline_instrument:
             dist.barrier()
@@ -840,9 +872,19 @@ class CandidateStage2Path:
                 raise AssertionError("Stage2 produced non-finite output")
         snapshot = self.operator.debug_direct_tile_snapshot()
         if snapshot["stage2_error_count"] != 0:
-            raise AssertionError("Stage2 diagnostic reported a protocol error")
+            raise AssertionError(
+                "Stage2 diagnostic reported a protocol error: "
+                f"{snapshot}"
+            )
         if self.mode == "full":
-            _validate_direct_tile_debug_snapshot(snapshot)
+            _validate_direct_tile_debug_snapshot(
+                snapshot,
+                expected_routes=self.shape.tokens * self.shape.topk,
+                expected_tokens=self.shape.tokens,
+                expect_rank_token_completion=(
+                    self.operator.stage2_ready_granularity == "token"
+                ),
+            )
         elif self.mode in (
             "atomic_only",
             "gmm2_atomic_only",
@@ -852,15 +894,69 @@ class CandidateStage2Path:
                 self.operator.stage2_node_accumulation_mode == "rank_local"
                 and self.mode == "route_store_only"
             ):
+                if self.operator.stage2_ready_granularity == "tile":
+                    print(
+                        "MEGAMOE_TILE_READY_DEBUG "
+                        + json.dumps(
+                            {
+                                key: snapshot[key]
+                                for key in (
+                                    "rank_local_active_tokens",
+                                    "tile_pending_nonzero",
+                                    "tile_group_arrival_mismatch",
+                                    "tile_rank_ready_missing",
+                                    "tile_reduce_queue_tail",
+                                    "tile_node_arrived_nonzero",
+                                    "node_ready_mask_full_count",
+                                    "tile_partial_ready_count",
+                                    "stage2_error_count",
+                                )
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+                    if snapshot["tile_group_arrival_mismatch"] != 0:
+                        raise AssertionError(
+                            "Stage2 tile group arrival counters did not match route counts"
+                        )
+                    if snapshot["tile_rank_ready_missing"] != 0:
+                        raise AssertionError(
+                            "Stage2 tile rank readiness did not complete"
+                        )
+                    return
                 if snapshot["rank_local_pending_nonzero"] != 0:
                     raise AssertionError(
-                        "Stage2 rank-local pending counters did not drain"
+                        "Stage2 rank-local pending counters did not drain: "
+                        f"{snapshot}"
                     )
                 if snapshot["rank_local_ready_missing"] != 0:
                     raise AssertionError(
                         "Stage2 rank-local readiness did not complete"
                     )
                 return
+            if (
+                self.operator.stage2_ready_granularity == "tile"
+                and self.mode == "gmm2_atomic_only"
+            ):
+                print(
+                    "MEGAMOE_TILE_REDUCER_DEBUG "
+                    + json.dumps(
+                        {
+                            key: snapshot[key]
+                            for key in (
+                                "tile_reduce_queue_tail",
+                                "node_ready_mask_full_count",
+                                "tile_partial_ready_count",
+                                "tile_partial_ready_planes",
+                                "rank_return_counts",
+                                "stage2_error_count",
+                            )
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
             if snapshot["node_expected_done_mismatch"] != 0:
                 raise AssertionError("Stage2 producer scoreboard did not complete")
             readiness_field = (
@@ -1103,11 +1199,39 @@ def _summary(path, result: BreakdownResult, tail_iterations: int) -> dict[str, o
         all_rank_mean[field] = float(
             reduced.item() / (dist.get_world_size() * tail_iterations)
         )
+    local_tail_matrix = torch.tensor(
+        [[sample.stage_us[field] for field in fields] for sample in local_tail],
+        dtype=torch.float64,
+    )
+    gathered_tail = [
+        torch.empty_like(local_tail_matrix) for _ in range(dist.get_world_size())
+    ]
+    dist.all_gather(gathered_tail, local_tail_matrix)
+    per_rank_stats = {}
+    for rank, values in enumerate(gathered_tail):
+        per_rank_stats[str(rank)] = {
+            field: _sample_stats(values[:, field_index].tolist())
+            for field_index, field in enumerate(fields)
+        }
+    rank_min_stats = {
+        field: _sample_stats(
+            [
+                min(
+                    float(gathered_tail[rank][iteration, field_index].item())
+                    for rank in range(dist.get_world_size())
+                )
+                for iteration in range(tail_iterations)
+            ]
+        )
+        for field_index, field in enumerate(fields)
+    }
     summary = {
         "path": path.name,
         "tail_iterations": tail_iterations,
         "tail_rank_max_stats_us": rank_stats,
         "tail_all_rank_sample_mean_us": all_rank_mean,
+        "tail_rank_min_stats_us": rank_min_stats,
+        "tail_per_rank_stats_us": per_rank_stats,
         "rank_max_samples_us": [
             {field: sample.stage_us[field] for field in fields}
             for sample in result.rank_max_samples
@@ -1170,6 +1294,10 @@ def _build_candidate(
     rank_epilogue_lds_addressing,
     rank_accumulation_mode,
     rail_return_schedule,
+    rail_quant_type,
+    gmm_work_swizzle,
+    window_n_groups,
+    ready_granularity,
     epilogue_schedule,
     n_tile_group,
     group_pipeline_schedule,
@@ -1177,8 +1305,26 @@ def _build_candidate(
     atomic_issue_schedule,
     waves_per_eu_hint,
     timeline_instrument,
+    max_routes_per_token_per_rank,
+    stage1_diagnostic_phase,
 ):
     weights = shared.prepared_weights
+    if max_routes_per_token_per_rank is not None:
+        cap = int(max_routes_per_token_per_rank)
+        owners = torch.div(
+            shared.topk_ids,
+            shape.experts // shape.ep_size,
+            rounding_mode="floor",
+        )
+        max_multiplicity = max(
+            int((owners == owner).sum(dim=1).max().item())
+            for owner in range(shape.ep_size)
+        )
+        if max_multiplicity > cap:
+            raise ValueError(
+                "route fixture exceeds max_routes_per_token_per_rank: "
+                f"observed {max_multiplicity}, capacity {cap}"
+            )
     operator = Stage2ModeOperator(
         rank=rank,
         world_size=shape.ep_size,
@@ -1192,9 +1338,12 @@ def _build_candidate(
         w2=weights.w2,
         w2_scale=weights.w2_scale,
         max_tok_per_rank=shape.tokens,
+        max_routes_per_token_per_rank=max_routes_per_token_per_rank,
         mega_scheme="hierarchical",
         swiglu_limit=0.0,
-        stage1_transport="sparse_wqe",
+        # agent: sparse_wqe当前只有每QP 32-bit token bitmap；大capacity
+        # 使用chunked transport，避免把128-token协议误用于512+。
+        stage1_transport="chunked",
         stage2_mode=mode,
         stage2_worker_blocks=workers,
         stage2_accumulator_dtype=accumulator_dtype,
@@ -1212,6 +1361,10 @@ def _build_candidate(
         stage2_rank_epilogue_lds_addressing=rank_epilogue_lds_addressing,
         stage2_rank_accumulation_mode=rank_accumulation_mode,
         stage2_rail_return_schedule=rail_return_schedule,
+        stage2_rail_quant_type=rail_quant_type,
+        stage2_gmm_work_swizzle=gmm_work_swizzle,
+        stage2_window_n_groups=window_n_groups,
+        stage2_ready_granularity=ready_granularity,
         stage2_epilogue_schedule=epilogue_schedule,
         stage2_n_tile_group=n_tile_group,
         stage2_group_pipeline_schedule=group_pipeline_schedule,
@@ -1219,6 +1372,7 @@ def _build_candidate(
         stage2_atomic_issue_schedule=atomic_issue_schedule,
         stage2_waves_per_eu_hint=waves_per_eu_hint,
         stage2_timeline_instrument=timeline_instrument,
+        stage1_diagnostic_phase=stage1_diagnostic_phase,
     )
     return CandidateStage2Path(operator, shared, shape, device, mode)
 
@@ -1228,6 +1382,27 @@ def main() -> int:
     parser.add_argument("--path", choices=("candidate", "mori"), required=True)
     parser.add_argument("--candidate-mode", choices=CANDIDATE_MODES, default="full")
     parser.add_argument("--mori-mode", choices=MORI_MODES, default="gmm2_only")
+    parser.add_argument(
+        "--mori-combine-quant-type",
+        choices=("none", "fp8_direct_cast", "fp8_blockwise", "fp4_blockwise"),
+        default="none",
+    )
+    parser.add_argument("--tokens", type=int, default=128)
+    parser.add_argument(
+        "--max-routes-per-token-per-rank", type=int, default=None
+    )
+    parser.add_argument(
+        "--stage1-diagnostic-phase",
+        choices=(
+            "full",
+            "quant_pack_only",
+            "transport_only",
+            "fanout_only",
+            "quant_core_only",
+            "dispatch_only",
+        ),
+        default="full",
+    )
     parser.add_argument("--stage2-workers", type=int, default=160)
     parser.add_argument(
         "--candidate-accumulator", choices=("fp32", "bf16"), default="bf16"
@@ -1298,6 +1473,27 @@ def main() -> int:
         "--candidate-rail-return-schedule",
         choices=("lockstep", "qp_independent", "qp_prepost", "compact"),
         default="lockstep",
+    )
+    parser.add_argument(
+        "--candidate-rail-quant-type",
+        choices=("none", "fp8_blockwise"),
+        default="none",
+    )
+    parser.add_argument(
+        "--candidate-gmm-work-swizzle",
+        choices=("token_major", "n_major_window"),
+        default="token_major",
+    )
+    parser.add_argument(
+        "--candidate-window-n-groups",
+        type=int,
+        choices=(1, 2, 4, 7, 14),
+        default=2,
+    )
+    parser.add_argument(
+        "--candidate-ready-granularity",
+        choices=("token", "tile"),
+        default="token",
     )
     parser.add_argument(
         "--candidate-epilogue-schedule",
@@ -1376,13 +1572,19 @@ def main() -> int:
         rail_return_schedule=args.candidate_rail_return_schedule,
     )
 
-    shape = _shape()
+    if not 1 <= args.tokens <= 4096:
+        raise ValueError("tokens must be in [1, 4096]")
+    shape = _shape(args.tokens)
     mode = args.candidate_mode if args.path == "candidate" else args.mori_mode
     contract = {
-        "case_label": COMPARISON_CASE_LABEL,
+        "case_label": (
+            f"TPR{shape.tokens}_TopK{shape.topk}_E{shape.experts}_"
+            f"H{shape.hidden}_I{shape.inter}_EP{shape.ep_size}_A4W4"
+        ),
         "shape": shape.__dict__,
         "path": args.path,
         "mode": mode,
+        "mori_combine_quant_type": args.mori_combine_quant_type,
         "route_pattern": "paired-rank-half-remote",
         "candidate_stage1_input": "one frozen physical fused Stage1 H1/scale/route arena",
         "candidate_stage1_timing": "excluded_by_device_sync_and_ep16_barrier",
@@ -1392,7 +1594,17 @@ def main() -> int:
         "candidate_final_combine_blocks": args.candidate_final_combine_blocks,
         "candidate_gmm_schedule": args.candidate_gmm_schedule,
         "candidate_return_chunk_tokens": args.candidate_return_chunk_tokens,
-        "candidate_node_ready_granularity": "token",
+        "candidate_rail_quant_type": args.candidate_rail_quant_type,
+        "candidate_gmm_work_swizzle": args.candidate_gmm_work_swizzle,
+        "candidate_window_n_groups": args.candidate_window_n_groups,
+        "candidate_ready_granularity": args.candidate_ready_granularity,
+        "candidate_ready_group_tiles": args.candidate_n_tile_group,
+        "candidate_ready_group_count": (
+            (shape.hidden // 256 + args.candidate_n_tile_group - 1)
+            // args.candidate_n_tile_group
+        ),
+        "max_routes_per_token_per_rank": args.max_routes_per_token_per_rank,
+        "candidate_node_ready_granularity": args.candidate_ready_granularity,
         "candidate_bf16_atomic_kind": args.candidate_bf16_atomic_kind,
         "candidate_node_accumulation_mode": (
             args.candidate_node_accumulation_mode
@@ -1475,6 +1687,10 @@ def main() -> int:
             args.candidate_rank_epilogue_lds_addressing,
             args.candidate_rank_accumulation_mode,
             args.candidate_rail_return_schedule,
+            args.candidate_rail_quant_type,
+            args.candidate_gmm_work_swizzle,
+            args.candidate_window_n_groups,
+            args.candidate_ready_granularity,
             args.candidate_epilogue_schedule,
             args.candidate_n_tile_group,
             args.candidate_group_pipeline_schedule,
@@ -1482,6 +1698,8 @@ def main() -> int:
             args.candidate_atomic_issue_schedule,
             args.candidate_waves_per_eu_hint,
             args.device_timeline,
+            args.max_routes_per_token_per_rank,
+            args.stage1_diagnostic_phase,
         )
     else:
         baseline = MoriFusedMoeBaselinePath(
@@ -1490,6 +1708,7 @@ def main() -> int:
             rank,
             world,
             valid_recv=shape.tokens * world // 2,
+            combine_quant_type=args.mori_combine_quant_type,
         )
         path = MoriStage2Path(baseline, args.mori_mode)
 

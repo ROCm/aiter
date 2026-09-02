@@ -131,6 +131,23 @@ def compile_megamoe_tile_ep16_stage1(
 
     if not isinstance(layout, Stage1ArenaLayout):
         raise TypeError("layout must be Stage1ArenaLayout")
+    # agent: token capacity来自arena specialization；producer CTA池保持固定，
+    # 避免大batch把resident grid扩张到硬件无法同时驻留的规模。
+    MAX_TOKENS = int(layout.max_tokens)
+    PRODUCER_CTAS = min(128, MAX_TOKENS)
+    ESSENTIAL_CTAS = PRODUCER_FIRST + PRODUCER_CTAS
+    INVALID_SOURCE = WORLD * MAX_TOKENS
+    if not 1 <= MAX_TOKENS <= 4096:
+        raise ValueError("Stage-1 max_tokens must be in [1, 4096]")
+    if MAX_TOKENS > 128 and (
+        cco_geometry == "sparse_wqe"
+        or diagnostic_split_fanout
+        or quant_two_cta_per_token
+    ):
+        raise ValueError(
+            "max_tokens > 128 currently requires chunked transport without "
+            "split fanout or two-CTA quantization"
+        )
     expected = (HIDDEN, INTER, EXPERTS, WORLD, GPUS_PER_NODE, TOPK, MAX_TOKENS, BM, BN)
     actual = (
         layout.hidden,
@@ -322,6 +339,7 @@ def compile_megamoe_tile_ep16_stage1(
     transport_tag = "cco" if enable_cco else "stub"
     kernel_name = (
         f"megamoe_tile_ep16_stage1_k3_a4w4_silu_r{rank}_"
+        f"mt{MAX_TOKENS}_rpc{layout.max_routes_per_token_per_rank}_"
         f"wb{worker_blocks}_ws{work_shards}_{transport_tag}_{MXFP4_SCALE_LAYOUT_TAG}_"
         "scoreboard_v14_tilequeue_rankslots_payload2_qpballot4_no_send_atomic_inputscale_abi3"
         + ("_diagnostic_comm_only" if diagnostic_comm_only else "")
@@ -557,10 +575,14 @@ def compile_megamoe_tile_ep16_stage1(
             comm_ops.fence_system_acquire()
 
         # ------------------------------------------------------------------
-        # One producer CTA owns one local token.  Each thread quantizes one
-        # 1x32 group, so BF16->A4/E8M0 is part of this Stage-1 launch.
+        # A bounded producer CTA pool owns tokens in a strided schedule.  At
+        # capacity 128 this is identical to the historical one-CTA-per-token
+        # mapping; larger capacities reuse the same resident CTA for later
+        # tokens instead of increasing the resident grid.
         # ------------------------------------------------------------------
-        if is_producer:
+        producer_token = ticket - fx.Int32(PRODUCER_FIRST)
+        producer_active = is_producer & (producer_token < ntokens)
+        while producer_active:
             if const_expr(diagnostic_split_fanout):
                 token = (
                     ticket & fx.Int32(127)
@@ -573,7 +595,7 @@ def compile_megamoe_tile_ep16_stage1(
                     else fx.Int32(0)
                 )
             else:
-                token = ticket - fx.Int32(PRODUCER_FIRST)
+                token = producer_token
                 quant_half = fx.Int32(0)
             record_addr = local_addr("dispatch_staging") + fx.Int64(token) * fx.Int64(
                 record_bytes
@@ -919,6 +941,10 @@ def compile_megamoe_tile_ep16_stage1(
                             + fx.Int64(token) * fx.Int64(8),
                             generation,
                         )
+            # agent: 所有wave完成ready发布后才复用LDS处理下一个token。
+            gpu.barrier()
+            producer_token = producer_token + fx.Int32(PRODUCER_CTAS)
+            producer_active = is_producer & (producer_token < ntokens)
 
         # ------------------------------------------------------------------
         # Four waves own four QPs.  Each chunk is one aggregate PUT per QP plus
@@ -1113,13 +1139,15 @@ def compile_megamoe_tile_ep16_stage1(
                 if cco_geometry == "chunked"
                 else 0
             )
-            for batch in range_constexpr(
-                cco_batch_count
+            # agent: batch数量随token capacity增长，必须使用runtime循环，
+            # 避免TPR4096把整段WQE/等待控制流静态复制数百次。
+            for batch in range(
+                fx.Int32(0), fx.Int32(cco_batch_count), fx.Int32(1)
             ):
-                batch_first = batch * cco_chunks_per_flush
+                batch_first = batch * fx.Int32(cco_chunks_per_flush)
                 for batch_item in range_constexpr(cco_chunks_per_flush):
-                    chunk = batch_first + batch_item
-                    first_token = fx.Int32(chunk * records_per_chunk)
+                    chunk = batch_first + fx.Int32(batch_item)
+                    first_token = chunk * fx.Int32(records_per_chunk)
                     # All four waves wait for their four source records.
                     for item in range_constexpr(records_per_qp):
                         token = (
@@ -1270,11 +1298,13 @@ def compile_megamoe_tile_ep16_stage1(
             remote_masks = buffer_ops.create_buffer_resource_from_addr(
                 stage2_addr("node_dest_rank_mask")
             )
-            if tx < fx.Int32(MAX_TOKENS):
+            # agent: CCO CTA用256线程跨步解析全部远端token；capacity大于
+            # THREADS时不能只处理首批256条record。
+            for token in range(tx, ntokens, fx.Int32(THREADS)):
                 remote_record_available = fx.Int32(1)
                 if const_expr(cco_geometry == "sparse_wqe"):
-                    ready_qp = tx % fx.Int32(layout.num_qp)
-                    ready_bit = tx // fx.Int32(layout.num_qp)
+                    ready_qp = token % fx.Int32(layout.num_qp)
+                    ready_bit = token // fx.Int32(layout.num_qp)
                     terminal_ready = fx.Int64(
                         comm_ops.load_i64_global_system(
                             local_addr("sparse_remote_qp_ready")
@@ -1305,7 +1335,7 @@ def compile_megamoe_tile_ep16_stage1(
                 if remote_record_available != fx.Int32(0):
                     remote_record = buffer_ops.create_buffer_resource_from_addr(
                         local_addr("remote_dispatch_rx")
-                        + fx.Int64(tx) * fx.Int64(record_bytes),
+                        + fx.Int64(token) * fx.Int64(record_bytes),
                         num_records_bytes=record_bytes,
                     )
                     for slot in range_constexpr(TOPK):
@@ -1341,7 +1371,7 @@ def compile_megamoe_tile_ep16_stage1(
                 buffer_ops.buffer_store(
                     remote_mask,
                     remote_masks,
-                    fx.Int32(remote_node * MAX_TOKENS) + tx,
+                    fx.Int32(remote_node * MAX_TOKENS) + token,
                 )
                 for ntile in range_constexpr(HIDDEN // 256):
                     buffer_ops.buffer_store(
@@ -1350,7 +1380,7 @@ def compile_megamoe_tile_ep16_stage1(
                         fx.Int32(
                             remote_node * MAX_TOKENS * (HIDDEN // 256)
                         )
-                        + tx * fx.Int32(HIDDEN // 256)
+                        + token * fx.Int32(HIDDEN // 256)
                         + fx.Int32(ntile),
                     )
 
@@ -2346,15 +2376,15 @@ def compile_megamoe_tile_ep16_stage1(
                 if cco_geometry == "chunked"
                 else 0
             )
-            for batch in range_constexpr(
-                credit_batch_count
+            for batch in range(
+                fx.Int32(0), fx.Int32(credit_batch_count), fx.Int32(1)
             ):
-                batch_first = batch * cco_chunks_per_flush
+                batch_first = batch * fx.Int32(cco_chunks_per_flush)
                 # Do not credit any chunk in the batch until every destination
                 # fanout role has consumed all B reciprocal payloads.
                 for batch_item in range_constexpr(cco_chunks_per_flush):
-                    chunk = batch_first + batch_item
-                    consume_index = fx.Int32(chunk * layout.num_qp) + qp
+                    chunk = batch_first + fx.Int32(batch_item)
+                    consume_index = chunk * fx.Int32(layout.num_qp) + qp
                     if lane == fx.Int32(0):
                         consumed_count = fx.Int32(
                             comm_ops.load_i32_global_system(

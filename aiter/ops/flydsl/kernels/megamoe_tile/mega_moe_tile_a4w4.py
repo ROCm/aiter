@@ -28,6 +28,7 @@ import torch
 import torch.distributed as dist
 
 from .stage1_abi import (
+    MAX_FUSED_TOKENS_PER_RANK,
     Stage1ArenaLayout,
     TwoKernelArenaLayout,
     validate_public_stage1_contract,
@@ -94,7 +95,12 @@ class MegaMoETileA4W4:
         experts: int, topk: int, quant: str, w1: torch.Tensor, w1_scale: torch.Tensor,
         w2: torch.Tensor, w2_scale: torch.Tensor, max_tok_per_rank: int,
         mega_scheme: str = "fixedslot", swiglu_limit: float = 0.0,
-        stage1_transport: str = "chunked"):
+        stage1_transport: str = "chunked",
+        max_routes_per_token_per_rank: int | None = None,
+        stage2_rail_quant_type: str = "none",
+        stage2_gmm_work_swizzle: str = "token_major",
+        stage2_window_n_groups: int = 2,
+        stage2_ready_granularity: str = "token"):
     # fmt: on
         self._validate_static_contract(
             rank=rank,
@@ -108,6 +114,11 @@ class MegaMoETileA4W4:
             mega_scheme=mega_scheme,
             swiglu_limit=swiglu_limit,
             stage1_transport=stage1_transport,
+            max_routes_per_token_per_rank=max_routes_per_token_per_rank,
+            stage2_rail_quant_type=stage2_rail_quant_type,
+            stage2_gmm_work_swizzle=stage2_gmm_work_swizzle,
+            stage2_window_n_groups=stage2_window_n_groups,
+            stage2_ready_granularity=stage2_ready_granularity,
         )
         if not torch.cuda.is_available():
             raise RuntimeError("MegaMoETileA4W4 requires a ROCm CUDA device")
@@ -131,6 +142,17 @@ class MegaMoETileA4W4:
         self.mega_scheme = str(mega_scheme)
         self.swiglu_limit = float(swiglu_limit)
         self.stage1_transport = str(stage1_transport)
+        self.stage2_rail_quant_type = str(stage2_rail_quant_type)
+        self.stage2_gmm_work_swizzle = str(stage2_gmm_work_swizzle)
+        self.stage2_window_n_groups = int(stage2_window_n_groups)
+        self.stage2_ready_granularity = str(stage2_ready_granularity)
+        self.max_routes_per_token_per_rank = (
+            self.topk
+            if max_routes_per_token_per_rank is None
+            else int(max_routes_per_token_per_rank)
+        )
+        if self.mtpr > 128 and self.stage1_transport == "sparse_wqe":
+            raise ValueError("sparse_wqe currently supports max_tok_per_rank <= 128")
         self.gpus_per_node = 8
         self.node = self.rank // self.gpus_per_node
         self.local_rank = self.rank % self.gpus_per_node
@@ -172,6 +194,7 @@ class MegaMoETileA4W4:
             gpus_per_node=self.gpus_per_node,
             topk=self.topk,
             max_tokens=self.mtpr,
+            max_routes_per_token_per_rank=self.max_routes_per_token_per_rank,
         )
         stage2_node_accumulation_mode = getattr(
             self, "stage2_node_accumulation_mode", "direct_atomic"
@@ -179,6 +202,14 @@ class MegaMoETileA4W4:
         stage2_rank_accumulation_mode = getattr(
             self, "stage2_rank_accumulation_mode", "atomic"
         )
+        if self.mtpr > 128 and stage2_rank_accumulation_mode in (
+            "staged_reduce",
+            "staged_ring",
+        ):
+            raise ValueError(
+                f"{stage2_rank_accumulation_mode} currently supports "
+                "max_tok_per_rank <= 128"
+            )
         self.stage2_layout = Stage2ArenaLayout.create(
             hidden=self.model_dim,
             topk=self.topk,
@@ -192,6 +223,9 @@ class MegaMoETileA4W4:
                 and stage2_rank_accumulation_mode == "staged_reduce"
             ),
             include_staged_ring=False,
+            rail_quant_type=self.stage2_rail_quant_type,
+            ready_granularity=self.stage2_ready_granularity,
+            ready_group_tiles=int(getattr(self, "stage2_n_tile_group", 2)),
         )
         # One physical registered window, two non-overlapping logical ABIs.
         # Stage1 writes Stage2 metadata directly through stage2_base; there is
@@ -242,6 +276,11 @@ class MegaMoETileA4W4:
         mega_scheme: str,
         swiglu_limit: float,
         stage1_transport: str = "chunked",
+        max_routes_per_token_per_rank: int | None = None,
+        stage2_rail_quant_type: str = "none",
+        stage2_gmm_work_swizzle: str = "token_major",
+        stage2_window_n_groups: int = 2,
+        stage2_ready_granularity: str = "token",
     ) -> None:
         expected = {
             "world_size": (world_size, 16),
@@ -249,7 +288,6 @@ class MegaMoETileA4W4:
             "inter_dim": (inter_dim, 3072),
             "experts": (experts, 896),
             "topk": (topk, 16),
-            "max_tok_per_rank": (max_tok_per_rank, 128),
         }
         bad = {
             name: (int(got), want)
@@ -262,6 +300,32 @@ class MegaMoETileA4W4:
                 for name, (got, want) in bad.items()
             )
             raise ValueError(f"MegaMoETileA4W4 supports only K3 EP16: {detail}")
+        if not 1 <= int(max_tok_per_rank) <= MAX_FUSED_TOKENS_PER_RANK:
+            raise ValueError("max_tok_per_rank must be in [1, 4096]")
+        route_cap = (
+            int(topk)
+            if max_routes_per_token_per_rank is None
+            else int(max_routes_per_token_per_rank)
+        )
+        if not 1 <= route_cap <= int(topk):
+            raise ValueError(
+                "max_routes_per_token_per_rank must be in [1, topk]"
+            )
+        if str(stage2_rail_quant_type) not in ("none", "fp8_blockwise"):
+            raise ValueError(
+                "stage2_rail_quant_type must be 'none' or 'fp8_blockwise'"
+            )
+        if str(stage2_gmm_work_swizzle) not in (
+            "token_major",
+            "n_major_window",
+        ):
+            raise ValueError(
+                "stage2_gmm_work_swizzle must be token_major or n_major_window"
+            )
+        if int(stage2_window_n_groups) not in (1, 2, 4, 7, 14):
+            raise ValueError("stage2_window_n_groups must be one of 1,2,4,7,14")
+        if str(stage2_ready_granularity) not in ("token", "tile"):
+            raise ValueError("stage2_ready_granularity must be token or tile")
         if not 0 <= int(rank) < int(world_size):
             raise ValueError("rank is outside world_size")
         if str(quant).lower() != "a4w4":
@@ -282,6 +346,8 @@ class MegaMoETileA4W4:
             raise ValueError(
                 "stage1_transport must be 'chunked' or 'sparse_wqe'"
             )
+        if int(max_tok_per_rank) > 128 and str(stage1_transport) == "sparse_wqe":
+            raise ValueError("sparse_wqe currently supports max_tok_per_rank <= 128")
 
     def _validate_weight_capacity(
         self,
@@ -392,6 +458,7 @@ class MegaMoETileA4W4:
             waves_per_eu_hint=2,
             diagnostic_split_fanout=sparse,
             cco_geometry=self.stage1_transport,
+            diagnostic_phase=getattr(self, "stage1_diagnostic_phase", "full"),
             tile_pipeline=sparse,
             tile_pipeline_fanout_shards=16,
             timeline_instrument=bool(
@@ -421,7 +488,7 @@ class MegaMoETileA4W4:
                 self, "stage2_rail_return_schedule", "lockstep"
             ),
             epilogue_schedule="lane32_meta",
-            n_tile_group=2,
+            n_tile_group=int(getattr(self, "stage2_n_tile_group", 2)),
             group_pipeline_schedule="a_double_buffer",
             node_accumulation_mode=getattr(
                 self, "stage2_node_accumulation_mode", "direct_atomic"
@@ -457,6 +524,10 @@ class MegaMoETileA4W4:
             timeline_instrument=bool(
                 getattr(self, "timeline_instrument", False)
             ),
+            rail_quant_type=self.stage2_rail_quant_type,
+            gmm_work_swizzle=self.stage2_gmm_work_swizzle,
+            window_n_groups=self.stage2_window_n_groups,
+            ready_granularity=self.stage2_ready_granularity,
         )
 
     def _validate_launcher_contracts(self) -> None:
@@ -549,6 +620,11 @@ class MegaMoETileA4W4:
                 "rank_accumulation_mode": getattr(
                     self, "stage2_rank_accumulation_mode", "atomic"
                 ),
+                "rail_quant_type": self.stage2_rail_quant_type,
+                "gmm_work_swizzle": self.stage2_gmm_work_swizzle,
+                "window_n_groups": self.stage2_window_n_groups,
+                "ready_granularity": self.stage2_ready_granularity,
+                "n_tile_group": int(getattr(self, "stage2_n_tile_group", 2)),
             }
             stage2_mismatch = {
                 name: (getattr(self._stage2, name, "<missing>"), value)
@@ -656,6 +732,12 @@ class MegaMoETileA4W4:
 
         if self._closed:
             raise RuntimeError("MegaMoETileA4W4 is closed")
+        # TODO: enforce max_routes_per_token_per_rank in Stage1 while routing
+        # metadata is already resident on device.  A host-side topk_ids scan
+        # here would add a GPU launch plus synchronization to the two-launch
+        # hot path.  Until the device check lands, compact capacities are a
+        # trusted-input contract: callers must bound the number of expert IDs
+        # owned by any one EP rank for every source token.
         run_tokens = validate_public_stage1_contract(
             x_bf16,
             wts,
@@ -666,7 +748,8 @@ class MegaMoETileA4W4:
         )
         if run_tokens != self.mtpr:
             raise ValueError(
-                "the first strict EP16 kernels require exactly 128 tokens/rank"
+                "the current fused EP16 protocol requires run_tokens to equal "
+                f"the compiled capacity ({self.mtpr}), got {run_tokens}"
             )
         for name, tensor in (
             ("x_bf16", x_bf16),
@@ -850,6 +933,16 @@ class MegaMoETileA4W4:
         rank_local_active_sources: set[int] = set()
         rank_local_pending_nonzero = 0
         rank_local_ready_missing = 0
+        rank_local_pending_values: list[int] = []
+        tile_pending_nonzero = 0
+        tile_group_arrival_mismatch = 0
+        tile_rank_ready_missing = 0
+        tile_reduce_queue_tail = 0
+        tile_node_arrived_nonzero = 0
+        node_ready_mask_full_count = 0
+        tile_partial_ready_count = 0
+        tile_partial_ready_planes = [0, 0]
+        rank_return_counts = [0, 0, 0]
         if self.stage2_layout.include_rank_partials:
             source_capacity = self.world_size * self.mtpr
             rank_pending_raw = list(
@@ -873,10 +966,89 @@ class MegaMoETileA4W4:
                 int(rank_pending[source] != 0)
                 for source in rank_local_active_sources
             )
+            # agent: 保留活跃 token 的 pending 分布，区分“完全未发布”、
+            # “只漏部分 n-group”以及计数下溢，便于定位 persistent hang。
+            rank_local_pending_values = [
+                int(rank_pending[source]) for source in rank_local_active_sources
+            ]
             rank_local_ready_missing = sum(
                 int(int(rank_ready[source]) < generation)
                 for source in rank_local_active_sources
             )
+            if self.stage2_ready_granularity == "tile":
+                ready_groups = self.stage2_layout.ready_group_count
+                tile_pending = list(
+                    read_window_u32(
+                        s2_ptr("rank_tile_pending"),
+                        source_capacity * ready_groups,
+                    )
+                )
+                tile_pending_nonzero = sum(
+                    int(tile_pending[source * ready_groups + group] != 0)
+                    for source in rank_local_active_sources
+                    for group in range(ready_groups)
+                )
+                tile_group_arrival_mismatch = sum(
+                    int(
+                        int(tile_pending[source * ready_groups + group])
+                        != int(rank_pending[source])
+                    )
+                    for source in rank_local_active_sources
+                    for group in range(ready_groups)
+                )
+                tile_ready_values = list(
+                    read_window_u64(
+                        s2_ptr("rank_tile_ready"),
+                        source_capacity * ready_groups,
+                    )
+                )
+                tile_rank_ready_missing = sum(
+                    int(
+                        int(tile_ready_values[source * ready_groups + group])
+                        < generation
+                    )
+                    for source in rank_local_active_sources
+                    for group in range(ready_groups)
+                )
+                tile_reduce_queue_tail = int(
+                    read_window_u32(s2_ptr("tile_reduce_queue_tail"), 1)[0]
+                )
+                node_arrived = list(
+                    read_window_u32(
+                        s2_ptr("node_tile_arrived"),
+                        2 * self.mtpr * ready_groups,
+                    )
+                )
+                tile_node_arrived_nonzero = sum(int(v != 0) for v in node_arrived)
+                ready_masks = list(
+                    read_window_u64(
+                        s2_ptr("node_ready_mask"), 2 * self.mtpr
+                    )
+                )
+                full_mask = (1 << ready_groups) - 1
+                node_ready_mask_full_count = sum(
+                    int(int(v) == full_mask) for v in ready_masks
+                )
+                partial_ready_values = list(
+                    read_window_u64(
+                        s2_ptr("node_partial_ready"), 2 * self.mtpr
+                    )
+                )
+                tile_partial_ready_count = sum(
+                    int(int(v) >= generation) for v in partial_ready_values
+                )
+                tile_partial_ready_planes = [
+                    sum(
+                        int(int(v) >= generation)
+                        for v in partial_ready_values[
+                            plane * self.mtpr : (plane + 1) * self.mtpr
+                        ]
+                    )
+                    for plane in range(2)
+                ]
+                rank_return_counts = list(
+                    read_window_u32(s2_ptr("rank_return_count"), 3)
+                )
         input_rows = list(
             read_window_u32(s1_ptr("tile_row_input"), num_valid)
         )
@@ -1310,7 +1482,23 @@ class MegaMoETileA4W4:
             ),
             "rank_local_active_tokens": len(rank_local_active_sources),
             "rank_local_pending_nonzero": rank_local_pending_nonzero,
+            "rank_local_pending_min": (
+                min(rank_local_pending_values) if rank_local_pending_values else 0
+            ),
+            "rank_local_pending_max": (
+                max(rank_local_pending_values) if rank_local_pending_values else 0
+            ),
+            "rank_local_pending_sum": sum(rank_local_pending_values),
             "rank_local_ready_missing": rank_local_ready_missing,
+            "tile_pending_nonzero": tile_pending_nonzero,
+            "tile_group_arrival_mismatch": tile_group_arrival_mismatch,
+            "tile_rank_ready_missing": tile_rank_ready_missing,
+            "tile_reduce_queue_tail": tile_reduce_queue_tail,
+            "tile_node_arrived_nonzero": tile_node_arrived_nonzero,
+            "node_ready_mask_full_count": node_ready_mask_full_count,
+            "tile_partial_ready_count": tile_partial_ready_count,
+            "tile_partial_ready_planes": tile_partial_ready_planes,
+            "rank_return_counts": rank_return_counts,
             "node_expected_uniform_mismatch": sum(
                 int(len(set(node_expected_all[start : start + ntiles])) != 1)
                 for start in range(0, scoreboard_size, ntiles)

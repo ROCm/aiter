@@ -239,6 +239,7 @@ def _validate_direct_tile_debug_snapshot(
     expected_routes: int = 2048,
     expected_tokens: int = 128,
     block_m: int = 32,
+    expect_rank_token_completion: bool = True,
 ) -> None:
     """Validate a completed prime epoch; this always runs outside timing."""
 
@@ -306,7 +307,10 @@ def _validate_direct_tile_debug_snapshot(
         raise AssertionError("Stage2 must publish whole-token readiness")
     if int(snapshot.get("node_token_done_mismatch", -1)) != 0:
         raise AssertionError("Stage2 token tile-count did not complete")
-    if snapshot.get("node_accumulation_mode") == "rank_local":
+    if (
+        snapshot.get("node_accumulation_mode") == "rank_local"
+        and expect_rank_token_completion
+    ):
         if int(snapshot.get("rank_local_active_tokens", 0)) == 0:
             raise AssertionError("rank-local Stage2 produced no active tokens")
         if int(snapshot.get("rank_local_pending_nonzero", -1)) != 0:
@@ -415,6 +419,7 @@ class MoriFusedMoeBaselinePath:
         world: int,
         *,
         valid_recv: int,
+        combine_quant_type: str = "none",
     ):
         import aiter
         import mori
@@ -440,12 +445,13 @@ class MoriFusedMoeBaselinePath:
             kernel_type=kernel_type,
             rdma_block_num=128,
             gpu_per_node=shape.gpus_per_node,
-            quant_type="none",
+            quant_type=combine_quant_type,
         )
         self.shape = shape
         self.shared = shared
         self.rank = rank
         self.valid_recv = int(valid_recv)
+        self.combine_quant_type = str(combine_quant_type)
         self.op = mori.ops.EpDispatchCombineOp(config)
         self._fused_moe = fused_moe
         self._activation = aiter.ActivationType.Silu

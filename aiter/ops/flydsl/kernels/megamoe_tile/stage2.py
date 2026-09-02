@@ -143,9 +143,13 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
     accumulator_dtype: str = "bf16",
     final_combine_blocks: int = DEFAULT_COMBINE_BLOCKS,
     gmm_schedule: str = "persistent_queue",
+    gmm_work_swizzle: str = "token_major",
+    window_n_groups: int = 2,
     return_chunk_tokens: int = 8,
     bf16_atomic_kind: str = "buffer",
     rail_return_schedule: str = "lockstep",
+    rail_quant_type: str = "none",
+    ready_granularity: str = "token",
     epilogue_schedule: str = "lane32_meta",
     n_tile_group: int = 2,
     group_pipeline_schedule: str = "a_double_buffer",
@@ -176,6 +180,15 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
     s1, s2, s2_window_off = _resolve_layouts(
         arena_layout, stage2_layout, stage2_window_offset
     )
+    # agent: token capacity is a compile-time geometry supplied by the arena,
+    # not a kernel-global 128-token constant.  Keeping it local also makes it
+    # part of the generated specialization/cache identity.
+    MAX_TOKENS = int(s1.max_tokens)
+    SOURCE_CAPACITY = WORLD * MAX_TOKENS
+    if not 1 <= MAX_TOKENS <= 4096:
+        raise ValueError("Stage-2 max_tokens must be in [1, 4096]")
+    if int(s2.max_tokens) != MAX_TOKENS:
+        raise ValueError("Stage-1 and Stage-2 max_tokens must match")
     if (
         s1.hidden,
         s1.inter,
@@ -226,9 +239,19 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
         raise ValueError("final_combine_blocks must be in [1,56]")
     if gmm_schedule not in ("persistent_queue", "static_strided"):
         raise ValueError("gmm_schedule must be persistent_queue or static_strided")
+    if gmm_work_swizzle not in ("token_major", "n_major_window"):
+        raise ValueError("gmm_work_swizzle must be token_major or n_major_window")
+    window_n_groups = int(window_n_groups)
+    if window_n_groups not in (1, 2, 4, 7, 14):
+        raise ValueError("window_n_groups must be one of 1,2,4,7,14")
     return_chunk_tokens = int(return_chunk_tokens)
     if return_chunk_tokens not in (4, 8, 16):
         raise ValueError("return_chunk_tokens must be 4, 8, or 16")
+    if MAX_TOKENS % (s2.num_qp * return_chunk_tokens) != 0:
+        raise ValueError(
+            "max_tokens must be divisible by num_qp * return_chunk_tokens"
+        )
+    return_batch_count = MAX_TOKENS // (s2.num_qp * return_chunk_tokens)
     if return_chunk_tokens > 4 and accumulator_dtype != "bf16":
         raise ValueError("large return chunks require the BF16 accumulator")
     if bf16_atomic_kind not in ("buffer", "global_system"):
@@ -243,6 +266,25 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
             "rail_return_schedule must be lockstep, qp_independent, "
             "qp_prepost, or compact"
         )
+    if rail_quant_type not in ("none", "fp8_blockwise"):
+        raise ValueError("rail_quant_type must be none or fp8_blockwise")
+    if rail_quant_type == "fp8_blockwise" and not (
+        node_accumulation_mode == "rank_local"
+        and rail_return_schedule == "compact"
+    ):
+        raise ValueError(
+            "fp8_blockwise rail requires rank_local accumulation and compact return"
+        )
+    if getattr(s2, "rail_quant_type", "none") != rail_quant_type:
+        raise ValueError("Stage-2 layout rail_quant_type does not match compile option")
+    if ready_granularity not in ("token", "tile"):
+        raise ValueError("ready_granularity must be token or tile")
+    if getattr(s2, "ready_granularity", "token") != ready_granularity:
+        raise ValueError("Stage-2 layout ready_granularity does not match compile option")
+    if ready_granularity == "tile" and n_tile_group != 2:
+        raise ValueError("tile ready granularity currently requires n_tile_group=2")
+    if ready_granularity == "tile" and (HIDDEN // BN) % 4 != 0:
+        raise ValueError("tile ready granularity requires hidden_tiles divisible by 4")
     if rail_return_schedule != "lockstep" and return_chunk_tokens <= 4:
         raise ValueError("independent QP schedules require return_chunk_tokens > 4")
     if rail_return_schedule == "compact" and node_accumulation_mode != "rank_local":
@@ -432,6 +474,10 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
     local_plane = node
     remote_plane = remote_node
     hidden_tiles = HIDDEN // BN
+    ready_groups = (hidden_tiles + n_tile_group - 1) // n_tile_group
+    # agent: CTA 角色按 block id 静态划分。bx=0 负责 QP/RAIL 进度，随后是
+    # node reducer、final combine，剩余 CTA 执行 persistent GMM2。这里的
+    # “角色区间”是逻辑 CTA 编号，并不保证固定映射到某个物理 CU。
     # staged_ring reserves bx=1 for the dedicated local stage reducer.  All
     # existing rank reducers/final/GMM roles are shifted by one CTA only for
     # this opt-in mode; atomic and legacy staged_reduce retain byte-for-byte
@@ -453,8 +499,8 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
     max_m_blocks = s1.max_route_tiles
     wire = Stage2NodePartialWire(HIDDEN, s2.records_per_group)
     return_groups = wire.group_count(MAX_TOKENS)
-    if s2.num_qp != 4 or wire.records_per_group != 4 or return_groups != 32:
-        raise ValueError("direct Stage-2 requires 4 QPs, 4 records/group, 32 groups")
+    if s2.num_qp != 4 or wire.records_per_group != 4:
+        raise ValueError("direct Stage-2 requires 4 QPs and 4 records/group")
 
     # Stage-1 compute outputs and row metadata.
     h1_q_off, h1_q_stride = _parity_parts(s1.region("h1_output_q"), 2)
@@ -524,6 +570,44 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
         rank_reduce_queue_head_off, rank_reduce_queue_head_stride = (
             _parity_parts(s2.region("rank_reduce_queue_head"), 2)
         )
+        if ready_granularity == "tile":
+            rank_tile_pending_off, rank_tile_pending_stride = _parity_parts(
+                s2.region("rank_tile_pending"), 2
+            )
+            rank_tile_ready_off, rank_tile_ready_stride = _parity_parts(
+                s2.region("rank_tile_ready"), 2
+            )
+            node_tile_arrived_off, node_tile_arrived_stride = _parity_parts(
+                s2.region("node_tile_arrived"), 2
+            )
+            node_tile_ready_off, node_tile_ready_stride = _parity_parts(
+                s2.region("node_tile_ready"), 2
+            )
+            node_ready_mask_off, node_ready_mask_stride = _parity_parts(
+                s2.region("node_ready_mask"), 2
+            )
+            tile_reduce_queue_off, tile_reduce_queue_stride = _parity_parts(
+                s2.region("tile_reduce_queue"), 2
+            )
+            tile_reduce_queue_ready_off, tile_reduce_queue_ready_stride = _parity_parts(
+                s2.region("tile_reduce_queue_ready"), 2
+            )
+            tile_reduce_queue_tail_off, tile_reduce_queue_tail_stride = _parity_parts(
+                s2.region("tile_reduce_queue_tail"), 2
+            )
+            tile_reduce_queue_head_off, tile_reduce_queue_head_stride = _parity_parts(
+                s2.region("tile_reduce_queue_head"), 2
+            )
+        else:
+            rank_tile_pending_off = rank_tile_pending_stride = 0
+            rank_tile_ready_off = rank_tile_ready_stride = 0
+            node_tile_arrived_off = node_tile_arrived_stride = 0
+            node_tile_ready_off = node_tile_ready_stride = 0
+            node_ready_mask_off = node_ready_mask_stride = 0
+            tile_reduce_queue_off = tile_reduce_queue_stride = 0
+            tile_reduce_queue_ready_off = tile_reduce_queue_ready_stride = 0
+            tile_reduce_queue_tail_off = tile_reduce_queue_tail_stride = 0
+            tile_reduce_queue_head_off = tile_reduce_queue_head_stride = 0
         if rank_accumulation_mode == "staged_reduce":
             rank_stage_values_off, rank_stage_values_stride = _parity_parts(
                 s2.region("rank_stage_values"), 2
@@ -611,6 +695,15 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
         rank_reduce_queue_ready_off = rank_reduce_queue_ready_stride = 0
         rank_reduce_queue_tail_off = rank_reduce_queue_tail_stride = 0
         rank_reduce_queue_head_off = rank_reduce_queue_head_stride = 0
+        rank_tile_pending_off = rank_tile_pending_stride = 0
+        rank_tile_ready_off = rank_tile_ready_stride = 0
+        node_tile_arrived_off = node_tile_arrived_stride = 0
+        node_tile_ready_off = node_tile_ready_stride = 0
+        node_ready_mask_off = node_ready_mask_stride = 0
+        tile_reduce_queue_off = tile_reduce_queue_stride = 0
+        tile_reduce_queue_ready_off = tile_reduce_queue_ready_stride = 0
+        tile_reduce_queue_tail_off = tile_reduce_queue_tail_stride = 0
+        tile_reduce_queue_head_off = tile_reduce_queue_head_stride = 0
         rank_stage_values_off = rank_stage_values_stride = 0
         rank_stage_slot_generation_off = rank_stage_slot_generation_stride = 0
         rank_stage_group_pending_off = rank_stage_group_pending_stride = 0
@@ -706,12 +799,16 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
     kernel_name = (
         "megamoe_tile_ep16_stage2_direct_node_a4w4_"
         f"r{rank}_h{HIDDEN}_i{INTER}_e{EXPERTS}_bm{BM}_bn{BN}_bk{BK}_q4_direct_v6_gridrelease"
+        f"_mt{MAX_TOKENS}"
         f"_acc{accumulator_dtype}_fc{final_combine_blocks}"
         f"_gs{gmm_schedule}"
+        f"_gws{gmm_work_swizzle}{window_n_groups}"
         f"_rt{return_chunk_tokens}"
         "_nrtoken"
         f"_ba{bf16_atomic_kind}"
         f"_rr{rail_return_schedule}"
+        f"_rq{rail_quant_type}"
+        f"_rg{ready_granularity}"
         f"_epi{epilogue_schedule}"
         f"_ng{n_tile_group}"
         f"_gp{group_pipeline_schedule}"
@@ -751,6 +848,10 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
         grid_threads = grid * fx.Int32(THREADS)
         parity = generation & fx.Int64(1)
         s2_base = arena_ptr + fx.Int64(s2_window_off)
+        runtime_return_batches = (
+            local_tokens
+            + fx.Int32(s2.num_qp * return_chunk_tokens - 1)
+        ) // fx.Int32(s2.num_qp * return_chunk_tokens)
 
         lds_raw = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
         lds_base = fx.Int32(fx.ptrtoint(lds_raw))
@@ -807,6 +908,27 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
         )
         rank_reduce_queue_head_ptr = s2_ptr(
             rank_reduce_queue_head_off, rank_reduce_queue_head_stride
+        )
+        rank_tile_pending_ptr = s2_ptr(
+            rank_tile_pending_off, rank_tile_pending_stride
+        )
+        rank_tile_ready_ptr = s2_ptr(rank_tile_ready_off, rank_tile_ready_stride)
+        node_tile_arrived_ptr = s2_ptr(
+            node_tile_arrived_off, node_tile_arrived_stride
+        )
+        node_tile_ready_ptr = s2_ptr(node_tile_ready_off, node_tile_ready_stride)
+        node_ready_mask_ptr = s2_ptr(node_ready_mask_off, node_ready_mask_stride)
+        tile_reduce_queue_ptr = s2_ptr(
+            tile_reduce_queue_off, tile_reduce_queue_stride
+        )
+        tile_reduce_queue_ready_ptr = s2_ptr(
+            tile_reduce_queue_ready_off, tile_reduce_queue_ready_stride
+        )
+        tile_reduce_queue_tail_ptr = s2_ptr(
+            tile_reduce_queue_tail_off, tile_reduce_queue_tail_stride
+        )
+        tile_reduce_queue_head_ptr = s2_ptr(
+            tile_reduce_queue_head_off, tile_reduce_queue_head_stride
         )
         rank_stage_values_ptr = s2_ptr(
             rank_stage_values_off, rank_stage_values_stride
@@ -999,6 +1121,9 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                 buffer_ops.buffer_store(zero4, acc_rsrc, item * fx.Int32(4))
 
         if const_expr(node_accumulation_mode == "rank_local"):
+            # agent: 当前稳定基线要求每代开始前清零本 rank 的 BF16 累加区。
+            # GMM CTA 随后只向本地显存做 packed-BF16 atomic_add；跨 rank
+            # 数据读取由 reducer CTA 在 token ready 后统一完成。
             # The local rank accumulator covers every global source token.
             # It is intentionally local: only the source-proxy reducer reads it
             # over LSA after this rank has completed the token.
@@ -1013,6 +1138,32 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                 buffer_ops.buffer_store(
                     rank_zero4, rank_acc_rsrc, item * fx.Int32(4)
                 )
+            if const_expr(ready_granularity == "tile"):
+                rank_tile_pending_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                    rank_tile_pending_ptr
+                )
+                node_tile_arrived_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                    node_tile_arrived_ptr
+                )
+                node_ready_mask_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                    node_ready_mask_ptr
+                )
+                tile_pending_items = fx.Int32(SOURCE_CAPACITY * ready_groups)
+                for item in range(global_tx, tile_pending_items, grid_threads):
+                    buffer_ops.buffer_store(
+                        fx.Int32(0), rank_tile_pending_rsrc, item
+                    )
+                node_tile_items = fx.Int32(2 * MAX_TOKENS * ready_groups)
+                for item in range(global_tx, node_tile_items, grid_threads):
+                    buffer_ops.buffer_store(
+                        fx.Int32(0), node_tile_arrived_rsrc, item
+                    )
+                for item in range(
+                    global_tx, fx.Int32(2 * MAX_TOKENS), grid_threads
+                ):
+                    buffer_ops.buffer_store(
+                        fx.Int64(0), node_ready_mask_rsrc, item
+                    )
             if const_expr(rank_accumulation_mode == "staged_reduce"):
                 stage_values_rsrc = buffer_ops.create_buffer_resource_from_addr(
                     rank_stage_values_ptr
@@ -1142,11 +1293,15 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                     buffer_ops.buffer_store(
                         fx.Int32(0), rank_pending_rsrc, item * fx.Int32(16)
                     )
-                if tx < fx.Int32(2 * MAX_TOKENS):
+                # agent: bx0只有THREADS个线程，大capacity必须跨步清完整的
+                # 两个source-plane计数，不能只清前256项。
+                for item in range(
+                    tx, fx.Int32(2 * MAX_TOKENS), fx.Int32(THREADS)
+                ):
                     buffer_ops.buffer_store(
                         fx.Int32(0),
                         rank_partial_done_rsrc,
-                        tx * fx.Int32(16),
+                        item * fx.Int32(16),
                     )
                 if tx == fx.Int32(0):
                     buffer_ops.buffer_store(
@@ -1156,27 +1311,37 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                         buffer_ops.buffer_store(
                             fx.Int32(0), rank_reduce_head_rsrc, fx.Int32(0)
                         )
+                    if const_expr(ready_granularity == "tile"):
+                        comm_ops.store_i32_system(
+                            tile_reduce_queue_tail_ptr, fx.Int32(0), fx.Int32(0)
+                        )
+                        comm_ops.store_i32_system(
+                            tile_reduce_queue_head_ptr, fx.Int32(0), fx.Int32(0)
+                        )
                 rocdl.s_waitcnt(0)
                 gpu.barrier()
                 comm_ops.fence_agent_release()
+            # agent: bx=0 的清零必须先于全网格 pending 累加。否则其他 CTA
+            # 可能先 atomic_add，随后又被 bx=0 的 zero store 覆盖，造成提前
+            # ready。前置 barrier 建立 zero -> increment 的顺序；后面的
+            # barrier 再建立 increment -> producer/reducer 的顺序。
+            grid_sync()
             # The rank-local path also clears shared ring/scratch state from
             # bx=0.  Gate every role before producers or the dedicated
             # reducer can observe partially initialized parity data.
-            # Keep the following metadata initialization active for atomic and
-            # staged modes too; only the ring mode needs the extra grid gate,
-            # but this wrapper is constexpr so all rank-local variants retain
-            # their existing metadata setup.
             if const_expr(True):
-                if const_expr(rank_accumulation_mode == "staged_ring"):
-                    grid_sync()
                 rank_meta_rsrc = buffer_ops.create_buffer_resource_from_addr(
                     arg_stids
                 )
                 rank_num_valid = fx.Int32(
                     global_typed_ptr(arg_nvalid, T.i32)[0]
                 )
+                # agent: 该初始化由整个 resident grid 协作完成。必须使用
+                # global_tx/grid_threads 唯一分片；若使用 tx/THREADS，每个
+                # CTA 都会重复累加同一 route，使 rank_pending 被放大 grid 倍，
+                # reducer 随后将永久等待一个不可能归零的计数。
                 for row in range(
-                    tx, rank_num_valid, fx.Int32(THREADS)
+                    global_tx, rank_num_valid, grid_threads
                 ):
                     packed = buffer_ops.buffer_load(
                         rank_meta_rsrc, row, vec_width=1, dtype=T.i32
@@ -1186,7 +1351,11 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                         comm_ops.atomic_add_agent(
                             rank_pending_ptr
                             + fx.Int64(source) * fx.Int64(64),
-                            fx.Int32(hidden_tiles // n_tile_group),
+                            fx.Int32(
+                                1
+                                if ready_granularity == "tile"
+                                else hidden_tiles // n_tile_group
+                            ),
                         )
                         if const_expr(rank_accumulation_mode == "staged_reduce"):
                             for group in range_constexpr(hidden_tiles // n_tile_group):
@@ -1239,7 +1408,7 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                         )
                         for token in range(
                             fx.Int32(0),
-                            fx.Int32(MAX_TOKENS),
+                            local_tokens,
                             fx.Int32(1),
                         ):
                             local_mask = fx.Int32(
@@ -1359,6 +1528,8 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
         # the rank-local init CTA; close the resident-grid init phase before
         # any producer can reserve a ring slot.
         if const_expr(node_accumulation_mode == "rank_local"):
+            # agent: 该 resident-grid barrier 同时保护累加区清零、pending/
+            # queue 元数据初始化；所有生产和消费角色通过后才能进入主流水。
             grid_sync()
 
         done_rsrc = buffer_ops.create_buffer_resource_from_addr(done_ptr)
@@ -1564,6 +1735,11 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
         ):
             """Pull and publish one ready rank-local reduction queue slot."""
 
+            # agent: queue ready 表示该 token 在相关 producer rank 上均已完成
+            # 本地累加。reducer 先读取参与 rank mask，再经 LSA peer-pull 各
+            # rank_accumulator 行，在寄存器中做 FP32 reduce，最后生成 node
+            # partial；不是每到一个局部贡献就做一次跨 rank reduce。
+
             reduce_elems = node_reduce_vec_bytes // 2
             reduce_i32s = node_reduce_vec_bytes // 4
             tiles_per_wave = hidden_tiles // 4
@@ -1576,17 +1752,30 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
             else:
                 col_iterations = BN // (64 * reduce_elems)
             if tx == fx.Int32(0):
-                wait_ready(
-                    rank_reduce_queue_ready_ptr
-                    + fx.Int64(queue_slot) * fx.Int64(8),
-                    generation,
-                )
-                token_index = fx.Int32(
-                    comm_ops.load_i32_global_system(
-                        rank_reduce_queue_ptr
-                        + fx.Int64(queue_slot) * fx.Int64(4)
+                if const_expr(ready_granularity == "tile"):
+                    wait_ready(
+                        tile_reduce_queue_ready_ptr
+                        + fx.Int64(queue_slot) * fx.Int64(8),
+                        generation,
                     )
-                )
+                    token_index = fx.Int32(
+                        comm_ops.load_i32_global_system(
+                            tile_reduce_queue_ptr
+                            + fx.Int64(queue_slot) * fx.Int64(4)
+                        )
+                    )
+                else:
+                    wait_ready(
+                        rank_reduce_queue_ready_ptr
+                        + fx.Int64(queue_slot) * fx.Int64(8),
+                        generation,
+                    )
+                    token_index = fx.Int32(
+                        comm_ops.load_i32_global_system(
+                            rank_reduce_queue_ptr
+                            + fx.Int64(queue_slot) * fx.Int64(4)
+                        )
+                    )
                 fx.ptr_store(token_index, work_ptr)
             gpu.barrier()
             token_index = fx.Int32(
@@ -1695,6 +1884,20 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                                     )
                                 )
                             )
+                            if const_expr(ready_granularity == "tile"):
+                                if (lane == fx.Int32(0)) & peer_active:
+                                    wait_ready(
+                                        peer_s2
+                                        + fx.Int64(rank_tile_ready_off)
+                                        + parity * fx.Int64(rank_tile_ready_stride)
+                                        + fx.Int64(
+                                            global_source * ready_groups
+                                            + n_block // fx.Int32(n_tile_group)
+                                        )
+                                        * fx.Int64(8),
+                                        generation,
+                                    )
+                                comm_ops.fence_system_acquire()
                             peer_rank_rsrc = buffer_ops.create_buffer_resource_from_addr(
                                 peer_s2
                                 + fx.Int64(rank_accumulator_off)
@@ -1763,6 +1966,20 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                                     )
                                 )
                             )
+                            if const_expr(ready_granularity == "tile"):
+                                if (lane == fx.Int32(0)) & peer_active:
+                                    wait_ready(
+                                        peer_s2
+                                        + fx.Int64(rank_tile_ready_off)
+                                        + parity * fx.Int64(rank_tile_ready_stride)
+                                        + fx.Int64(
+                                            global_source * ready_groups
+                                            + n_block // fx.Int32(n_tile_group)
+                                        )
+                                        * fx.Int64(8),
+                                        generation,
+                                    )
+                                comm_ops.fence_system_acquire()
                             peer_rank_rsrc = buffer_ops.create_buffer_resource_from_addr(
                                 peer_s2
                                 + fx.Int64(rank_accumulator_off)
@@ -1963,7 +2180,172 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                     )
                 reduce_active = has_reduce_work
 
+        def reduce_rank_tile_queue_slot(
+            queue_slot,
+            rank_reduce_acc_rsrc,
+            rank_reduce_tx_rsrc,
+            rank_mask_rsrc,
+            rank_tx_slot_rsrc,
+        ):
+            """Reduce one ready (token, BN256 tile) task."""
+
+            tile_task_lane = fx.Int32(0)
+            if lane == fx.Int32(0):
+                wait_ready(
+                    tile_reduce_queue_ready_ptr
+                    + fx.Int64(queue_slot) * fx.Int64(8),
+                    generation,
+                )
+                tile_task_lane = fx.Int32(
+                    comm_ops.load_i32_global_system(
+                        tile_reduce_queue_ptr
+                        + fx.Int64(queue_slot) * fx.Int64(4)
+                    )
+                )
+            tile_task = fx.Int32(
+                rocdl.readfirstlane(T.i32, tile_task_lane.ir_value())
+            )
+            token_index = tile_task // fx.Int32(hidden_tiles)
+            n_block = tile_task - token_index * fx.Int32(hidden_tiles)
+            token = token_index % fx.Int32(MAX_TOKENS)
+            source_plane = token_index // fx.Int32(MAX_TOKENS)
+            global_source = (
+                source_plane * fx.Int32(GPUS_PER_NODE) + fx.Int32(local_rank)
+            ) * fx.Int32(MAX_TOKENS) + token
+            rank_mask_lane = fx.Int32(0)
+            tx_slot_lane = fx.Int32(0)
+            if lane == fx.Int32(0):
+                rank_mask_lane = fx.Int32(
+                    buffer_ops.buffer_load(
+                        rank_mask_rsrc, token_index, vec_width=1, dtype=T.i32
+                    )
+                ) & fx.Int32(0xFF)
+                tx_slot_lane = fx.Int32(
+                    buffer_ops.buffer_load(
+                        rank_tx_slot_rsrc,
+                        token,
+                        vec_width=1,
+                        dtype=T.i32,
+                        mask=source_plane == fx.Int32(remote_plane),
+                    )
+                )
+            rank_mask = fx.Int32(
+                rocdl.readfirstlane(T.i32, rank_mask_lane.ir_value())
+            )
+            tx_slot = fx.Int32(
+                rocdl.readfirstlane(T.i32, tx_slot_lane.ir_value())
+            )
+            comm_ops.fence_system_acquire()
+
+            lane_active = fx.Int32(1) == fx.Int32(1)
+            col_in_tile = lane * fx.Int32(4)
+            packed_peers = []
+            rank_row_offset_bytes = fx.Int32(
+                rocdl.readfirstlane(
+                    T.i32,
+                    ((global_source * fx.Int32(HIDDEN) + n_block * fx.Int32(BN))
+                     * fx.Int32(2)).ir_value(),
+                )
+            )
+            for source_peer in range_constexpr(GPUS_PER_NODE):
+                peer_active = (
+                    rank_mask & (fx.Int32(1) << fx.Int32(source_peer))
+                ) != fx.Int32(0)
+                peer_s2 = _wave_uniform_i64(
+                    fx.ptr_load(
+                        lds_typed_ptr(
+                            lds_base
+                            + fx.Int32(peer_table_off)
+                            + fx.Int32(source_peer * 8),
+                            T.i64,
+                            align=8,
+                        )
+                    )
+                )
+                peer_rank_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                    peer_s2
+                    + fx.Int64(rank_accumulator_off)
+                    + parity * fx.Int64(rank_accumulator_stride),
+                    num_records_bytes=rank_accumulator_stride,
+                )
+                packed_peers.append(
+                    fx.Vector(
+                        buffer_ops.buffer_load(
+                            peer_rank_rsrc,
+                            col_in_tile // fx.Int32(2),
+                            vec_width=2,
+                            dtype=T.i32,
+                            mask=peer_active & lane_active,
+                            soffset_bytes=rank_row_offset_bytes,
+                        )
+                    )
+                )
+            accum = [fx.Float32(0.0) for _ in range_constexpr(4)]
+            for source_peer in range_constexpr(GPUS_PER_NODE):
+                values = packed_peers[source_peer].bitcast(BFloat16).to(Float32)
+                for vi in range_constexpr(4):
+                    accum[vi] = accum[vi] + fx.Float32(values[vi])
+            output_packed = (
+                fx.Vector.from_elements(accum, Float32)
+                .to(BFloat16)
+                .bitcast(fx.Int32)
+            )
+            output_index = (
+                token_index * fx.Int32(HIDDEN)
+                + n_block * fx.Int32(BN)
+                + col_in_tile
+            )
+            if source_plane == fx.Int32(remote_plane):
+                tx_index = (
+                    tx_slot * fx.Int32(HIDDEN)
+                    + n_block * fx.Int32(BN)
+                    + col_in_tile
+                )
+                buffer_ops.buffer_store(
+                    output_packed,
+                    rank_reduce_tx_rsrc,
+                    tx_index // fx.Int32(2),
+                    mask=lane_active & (rank_mask != fx.Int32(0)),
+                )
+            else:
+                buffer_ops.buffer_store(
+                    output_packed,
+                    rank_reduce_acc_rsrc,
+                    output_index // fx.Int32(2),
+                    mask=lane_active & (rank_mask != fx.Int32(0)),
+                )
+            rocdl.s_waitcnt(0)
+            if (lane == fx.Int32(0)) & (rank_mask != fx.Int32(0)):
+                comm_ops.fence_system_release()
+                comm_ops.store_i64_global_system(
+                    node_tile_ready_ptr + fx.Int64(tile_task) * fx.Int64(8),
+                    generation,
+                )
+                ready_index = (
+                    source_plane == fx.Int32(remote_plane)
+                ).select(
+                    fx.Int32(remote_plane * MAX_TOKENS) + tx_slot,
+                    token_index,
+                )
+                old_mask = fx.Int64(
+                    comm_ops.atomic_add_system(
+                        node_ready_mask_ptr
+                        + fx.Int64(ready_index) * fx.Int64(8),
+                        fx.Int64(1) << fx.Int64(n_block),
+                    )
+                )
+                full_mask = fx.Int64((1 << hidden_tiles) - 1)
+                if (old_mask | (fx.Int64(1) << fx.Int64(n_block))) == full_mask:
+                    comm_ops.store_i64_global_system(
+                        partial_ready_ptr
+                        + fx.Int64(ready_index) * fx.Int64(8),
+                        generation,
+                    )
+
         # ---- Compact active-token return for rank-local accumulation ----
+        # agent: bx=0 的通信角色按 QP wave 消费 reducer 产生的紧凑 TX 行，
+        # 下发 RAIL WQE，并接收远端 node partial。该角色与 GMM/reducer CTA
+        # 并发常驻，但会受到 generation ready 和 CCO quiet/progress 的约束。
         if (bx == fx.Int32(CROSS_BLOCK)) & (role_enabled == fx.Int32(1)) & (
             fx.Int32(1 if rail_return_schedule == "compact" else 0)
             == fx.Int32(1)
@@ -1977,10 +2359,12 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                     count_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32
                 )
             )
-            for batch in range_constexpr(
-                MAX_TOKENS // (s2.num_qp * return_chunk_tokens)
+            for batch in range(
+                fx.Int32(0),
+                runtime_return_batches,
+                fx.Int32(1),
             ):
-                chunk = fx.Int32(batch * s2.num_qp) + qp
+                chunk = batch * fx.Int32(s2.num_qp) + qp
                 first_slot = chunk * fx.Int32(return_chunk_tokens)
                 remaining = tx_count - first_slot
                 chunk_active = remaining > fx.Int32(0)
@@ -2041,9 +2425,11 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                         scope="warp",
                         team=team,
                     )
-                return_phase = (
-                    generation << fx.Int64(3)
-                ) + fx.Int64(batch + 1)
+                # agent: phase跨度随batch count派生，避免大capacity的最后一批
+                # 与下一generation的phase发生碰撞。
+                return_phase = generation * fx.Int64(
+                    return_batch_count + 1
+                ) + fx.Int64(batch) + fx.Int64(1)
                 if lane == fx.Int32(0):
                     comm_ops.fence_system_release()
                     comm_ops.store_i64_global_system(
@@ -2136,10 +2522,12 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
             == fx.Int32(1)
         ):
             qp = wave
-            for batch in range_constexpr(
-                MAX_TOKENS // (s2.num_qp * return_chunk_tokens)
+            for batch in range(
+                fx.Int32(0),
+                runtime_return_batches,
+                fx.Int32(1),
             ):
-                chunk = fx.Int32(batch * s2.num_qp) + qp
+                chunk = batch * fx.Int32(s2.num_qp) + qp
                 first_token = chunk * fx.Int32(return_chunk_tokens)
                 src_rel = (
                     fx.Int64(accumulator_off)
@@ -2172,7 +2560,9 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                         scope="warp",
                         team=team,
                     )
-                    if const_expr(timeline_instrument) and const_expr(batch == 0):
+                    if (fx.Int32(1 if timeline_instrument else 0) == fx.Int32(1)) & (
+                        batch == fx.Int32(0)
+                    ):
                         if (wave == fx.Int32(0)) & (lane == fx.Int32(0)):
                             fx.ptr_store(
                                 fx.Int64(comm_ops.read_wall_clock()),
@@ -2206,7 +2596,9 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                         + fx.Int64(token_ready_index) * fx.Int64(8),
                         generation,
                     )
-                if const_expr(timeline_instrument) and const_expr(batch == 0):
+                if (fx.Int32(1 if timeline_instrument else 0) == fx.Int32(1)) & (
+                    batch == fx.Int32(0)
+                ):
                     if (wave == fx.Int32(0)) & (lane == fx.Int32(0)):
                         fx.ptr_store(
                             fx.Int64(comm_ops.read_wall_clock()),
@@ -2215,9 +2607,9 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                 comm_ops.fence_system_acquire()
                 if const_expr(rail_return_schedule == "qp_independent"):
                     append_return_wqes()
-                return_phase = (
-                    generation << fx.Int64(3)
-                ) + fx.Int64(batch + 1)
+                return_phase = generation * fx.Int64(
+                    return_batch_count + 1
+                ) + fx.Int64(batch) + fx.Int64(1)
                 if lane == fx.Int32(0):
                     comm_ops.fence_system_release()
                     comm_ops.store_i64_global_system(
@@ -2234,9 +2626,14 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                                 return_phase,
                             )
                         comm_ops.fence_system_acquire()
-                        if const_expr(timeline_instrument) and const_expr(
-                            batch == 0
-                        ) and const_expr(stream_qp == 0):
+                        if (
+                            fx.Int32(
+                                1
+                                if timeline_instrument and stream_qp == 0
+                                else 0
+                            )
+                            == fx.Int32(1)
+                        ) & (batch == fx.Int32(0)):
                             if lane == fx.Int32(0):
                                 fx.ptr_store(
                                     fx.Int64(comm_ops.read_wall_clock()),
@@ -2253,9 +2650,14 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                             scope="warp",
                             team=team,
                         )
-                        if const_expr(timeline_instrument) and const_expr(
-                            batch == 0
-                        ) and const_expr(stream_qp == 0):
+                        if (
+                            fx.Int32(
+                                1
+                                if timeline_instrument and stream_qp == 0
+                                else 0
+                            )
+                            == fx.Int32(1)
+                        ) & (batch == fx.Int32(0)):
                             if lane == fx.Int32(0):
                                 fx.ptr_store(
                                     fx.Int64(comm_ops.read_wall_clock()),
@@ -2267,9 +2669,14 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                             request,
                             scope="warp",
                         )
-                        if const_expr(timeline_instrument) and const_expr(
-                            batch == 0
-                        ) and const_expr(stream_qp == 0):
+                        if (
+                            fx.Int32(
+                                1
+                                if timeline_instrument and stream_qp == 0
+                                else 0
+                            )
+                            == fx.Int32(1)
+                        ) & (batch == fx.Int32(0)):
                             if lane == fx.Int32(0):
                                 fx.ptr_store(
                                     fx.Int64(comm_ops.read_wall_clock()),
@@ -2354,10 +2761,12 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
             fx.Int32(1 if return_chunk_tokens > 4 else 0) == fx.Int32(1)
         ):
             qp = wave
-            for batch in range_constexpr(
-                MAX_TOKENS // (s2.num_qp * return_chunk_tokens)
+            for batch in range(
+                fx.Int32(0),
+                runtime_return_batches,
+                fx.Int32(1),
             ):
-                chunk = fx.Int32(batch * s2.num_qp) + qp
+                chunk = batch * fx.Int32(s2.num_qp) + qp
                 first_token = chunk * fx.Int32(return_chunk_tokens)
                 if lane < fx.Int32(return_chunk_tokens):
                     token = first_token + lane
@@ -2369,14 +2778,18 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                         + fx.Int64(token_ready_index) * fx.Int64(8),
                         generation,
                     )
-                if const_expr(timeline_instrument) and const_expr(batch == 0):
+                if (fx.Int32(1 if timeline_instrument else 0) == fx.Int32(1)) & (
+                    batch == fx.Int32(0)
+                ):
                     if lane == fx.Int32(0):
                         fx.ptr_store(
                             fx.Int64(comm_ops.read_wall_clock()),
                             timeline_scratch + wave,
                         )
                 gpu.barrier()
-                if const_expr(timeline_instrument) and const_expr(batch == 0):
+                if (fx.Int32(1 if timeline_instrument else 0) == fx.Int32(1)) & (
+                    batch == fx.Int32(0)
+                ):
                     if tx == fx.Int32(0):
                         fx.ptr_store(
                             fx.Int64(comm_ops.read_wall_clock()),
@@ -2407,14 +2820,18 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                     scope="warp",
                     team=team,
                 )
-                if const_expr(timeline_instrument) and const_expr(batch == 0):
+                if (fx.Int32(1 if timeline_instrument else 0) == fx.Int32(1)) & (
+                    batch == fx.Int32(0)
+                ):
                     if lane == fx.Int32(0):
                         fx.ptr_store(
                             fx.Int64(comm_ops.read_wall_clock()),
                             timeline_scratch + fx.Int32(5) + wave,
                         )
                 gpu.barrier()
-                if const_expr(timeline_instrument) and const_expr(batch == 0):
+                if (fx.Int32(1 if timeline_instrument else 0) == fx.Int32(1)) & (
+                    batch == fx.Int32(0)
+                ):
                     if tx == fx.Int32(0):
                         fx.ptr_store(
                             fx.Int64(comm_ops.read_wall_clock()),
@@ -2439,9 +2856,14 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                             scope="warp",
                             team=team,
                         )
-                        if const_expr(timeline_instrument) and const_expr(
-                            batch == 0
-                        ) and const_expr(stream_qp == 0):
+                        if (
+                            fx.Int32(
+                                1
+                                if timeline_instrument and stream_qp == 0
+                                else 0
+                            )
+                            == fx.Int32(1)
+                        ) & (batch == fx.Int32(0)):
                             if lane == fx.Int32(0):
                                 fx.ptr_store(
                                     fx.Int64(comm_ops.read_wall_clock()),
@@ -2458,9 +2880,14 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                             scope="warp",
                             team=team,
                         )
-                        if const_expr(timeline_instrument) and const_expr(
-                            batch == 0
-                        ) and const_expr(stream_qp == 0):
+                        if (
+                            fx.Int32(
+                                1
+                                if timeline_instrument and stream_qp == 0
+                                else 0
+                            )
+                            == fx.Int32(1)
+                        ) & (batch == fx.Int32(0)):
                             if lane == fx.Int32(0):
                                 fx.ptr_store(
                                     fx.Int64(comm_ops.read_wall_clock()),
@@ -2472,9 +2899,14 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                             request,
                             scope="warp",
                         )
-                        if const_expr(timeline_instrument) and const_expr(
-                            batch == 0
-                        ) and const_expr(stream_qp == 0):
+                        if (
+                            fx.Int32(
+                                1
+                                if timeline_instrument and stream_qp == 0
+                                else 0
+                            )
+                            == fx.Int32(1)
+                        ) & (batch == fx.Int32(0)):
                             if lane == fx.Int32(0):
                                 fx.ptr_store(
                                     fx.Int64(comm_ops.read_wall_clock()),
@@ -2879,7 +3311,11 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
             gpu.barrier()
             if tx == fx.Int32(0):
                 comm_ops.fence_system_release()
-                for source in range_constexpr(SOURCE_CAPACITY):
+                # agent: staged-ring虽是运行时不可达角色，其IR仍会被构建；
+                # source capacity必须使用runtime循环，避免大TPR静态展开。
+                for source in range(
+                    fx.Int32(0), fx.Int32(SOURCE_CAPACITY), fx.Int32(1)
+                ):
                     source_has_routes = fx.Int32(0)
                     for group in range_constexpr(hidden_tiles // 2):
                         source_has_routes = source_has_routes + fx.Int32(
@@ -2904,10 +3340,10 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                             rank_ready_ptr + fx.Int64(source) * fx.Int64(8),
                             generation,
                         )
-                    source_rank = fx.Int32(source) >> fx.Int32(7)
+                    source_rank = fx.Int32(source) // fx.Int32(MAX_TOKENS)
                     source_plane = source_rank >> fx.Int32(3)
                     source_local = source_rank & fx.Int32(7)
-                    token = fx.Int32(source) & fx.Int32(127)
+                    token = fx.Int32(source) - source_rank * fx.Int32(MAX_TOKENS)
                     peer_s2 = fx.Int64(
                         fx.ptr_load(
                             lds_typed_ptr(
@@ -2974,6 +3410,9 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                 )
 
         # ---- Rank-local partial pull/reduction on each source proxy ----
+        # agent: reducer CTA 只处理已经发布到 rank_reduce_queue 的完整 token；
+        # static_strided 或 dynamic_head 仅改变 CTA 领取 slot 的方式，不改变
+        # “收齐一个 token 后一次性 reduce”的语义。
         elif (bx >= fx.Int32(reduce_first)) & (
             bx < fx.Int32(combine_first)
         ) & (reduce_enabled == fx.Int32(1)) & (
@@ -2998,7 +3437,30 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                 num_records_bytes=rank_tx_slot_stride,
             )
             reduce_work_items = load_rank_reduce_work_items()
-            if const_expr(node_reduce_work_schedule == "static_strided"):
+            if const_expr(ready_granularity == "tile"):
+                tile_reduce_active = fx.Int32(1) == fx.Int32(1)
+                while tile_reduce_active:
+                    gpu.barrier()
+                    if tx == fx.Int32(0):
+                        tile_slot = fx.Int32(
+                            comm_ops.atomic_add_agent(
+                                tile_reduce_queue_head_ptr, fx.Int32(1)
+                            )
+                        )
+                        fx.ptr_store(tile_slot, work_ptr)
+                    gpu.barrier()
+                    tile_slot = fx.Int32(fx.ptr_load(work_ptr))
+                    has_tile_work = tile_slot < reduce_work_items
+                    if has_tile_work:
+                        reduce_rank_queue_slot(
+                            tile_slot,
+                            rank_reduce_acc_rsrc,
+                            rank_reduce_tx_rsrc,
+                            rank_mask_rsrc,
+                            rank_tx_slot_rsrc,
+                        )
+                    tile_reduce_active = has_tile_work
+            elif const_expr(node_reduce_work_schedule == "static_strided"):
                 for queue_slot in range(
                     reducer,
                     reduce_work_items,
@@ -3699,6 +4161,9 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                 gpu.barrier()
 
         # ---------------- Source final-combine roles ----------------
+        # agent: final CTA 等待本 node partial 和 RAIL 返回的 remote partial，
+        # 对目标 token 做最终相加/反置换并写 arg_output_bf16。它不参与前面的
+        # GMM 本地 atomic，也不负责 node 内 peer-pull。
         elif (bx >= fx.Int32(combine_first)) & (
             bx < fx.Int32(combine_first + final_combine_blocks)
         ) & (role_enabled == fx.Int32(1)):
@@ -3916,6 +4381,9 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                 active = has_work
 
         # ------------------ Remaining roles: persistent GMM2 ------------------
+        # agent: 剩余 CTA 从 8 个分片的 persistent queue 领取 GMM work。
+        # 每个 work 完成两个 N tile 的计算与 epilogue；rank-local 模式把
+        # 加权 BF16 结果 atomic_add 到本 rank accumulator，再发布完成计数。
         elif (bx >= fx.Int32(gmm_first)) & (compute_enabled == fx.Int32(1)):
             num_valid = fx.Int32(global_typed_ptr(arg_nvalid, T.i32)[0])
             total_m_blocks = num_valid // fx.Int32(BM)
@@ -3955,10 +4423,10 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                         )
                     source = packed & fx.Int32(0x00FFFFFF)
                     if source < fx.Int32(SOURCE_CAPACITY):
-                        source_rank = source >> fx.Int32(7)
+                        source_rank = source // fx.Int32(MAX_TOKENS)
                         source_node = source_rank >> fx.Int32(3)
                         source_local = source_rank & fx.Int32(7)
-                        token = source & fx.Int32(127)
+                        token = source - source_rank * fx.Int32(MAX_TOKENS)
                         peer_base = fx.Int64(
                             fx.ptr_load(
                                 lds_typed_ptr(
@@ -4040,6 +4508,10 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
             def publish_rank_group(m_row, n_group):
                 """Publish one locally accumulated two-N-tile route group."""
 
+                # agent: 每个本地 route group 完成后递减 source token 的
+                # rank_pending。最后一个本地 contributor 负责发布 token ready/
+                # reduce queue 元数据；payload 已经由前面的 atomic epilogue 写入。
+
                 if tx < fx.Int32(BM):
                     packed = buffer_ops.buffer_load(
                         buffer_ops.create_buffer_resource_from_addr(arg_stids),
@@ -4049,15 +4521,123 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                     )
                     source = packed & fx.Int32(0x00FFFFFF)
                     if source < fx.Int32(SOURCE_CAPACITY):
-                        old_pending = fx.Int32(
-                            comm_ops.atomic_add_agent_acq_rel(
-                                rank_pending_ptr
-                                + fx.Int64(source) * fx.Int64(64),
-                                fx.Int32(-1),
+                        if const_expr(ready_granularity == "tile"):
+                            route_expected = fx.Int32(
+                                comm_ops.load_i32_global_system(
+                                    rank_pending_ptr
+                                    + fx.Int64(source) * fx.Int64(64)
+                                )
                             )
-                        )
-                        if old_pending <= fx.Int32(0):
-                            add_error()
+                            group_index = source * fx.Int32(ready_groups) + n_group
+                            old_group = fx.Int32(
+                                comm_ops.atomic_add_agent_acq_rel(
+                                    rank_tile_pending_ptr
+                                    + fx.Int64(group_index) * fx.Int64(4),
+                                    fx.Int32(1),
+                                )
+                            )
+                            if old_group + fx.Int32(1) > route_expected:
+                                add_error()
+                            if old_group + fx.Int32(1) == route_expected:
+                                comm_ops.store_i64_global_system(
+                                    rank_tile_ready_ptr
+                                    + fx.Int64(
+                                        source * ready_groups + n_group
+                                    )
+                                    * fx.Int64(8),
+                                    generation,
+                                )
+                                if n_group == fx.Int32(0):
+                                    source_rank_tile = source // fx.Int32(MAX_TOKENS)
+                                    source_plane_tile = source_rank_tile // fx.Int32(GPUS_PER_NODE)
+                                    source_local_tile = source_rank_tile % fx.Int32(GPUS_PER_NODE)
+                                    source_token_tile = source - source_rank_tile * fx.Int32(MAX_TOKENS)
+                                    token_index_tile = (
+                                        source_plane_tile * fx.Int32(MAX_TOKENS)
+                                        + source_token_tile
+                                    )
+                                    peer_s2_tile = fx.Int64(
+                                        fx.ptr_load(
+                                            lds_typed_ptr(
+                                                lds_base
+                                                + fx.Int32(peer_table_off)
+                                                + source_local_tile * fx.Int32(8),
+                                                T.i64,
+                                                align=8,
+                                            )
+                                        )
+                                    )
+                                    wait_ready(
+                                        peer_s2_tile
+                                        + fx.Int64(stage2_phase_off)
+                                        + parity * fx.Int64(stage2_phase_stride),
+                                        init_phase,
+                                    )
+                                    tile_rank_mask = fx.Int32(
+                                        comm_ops.load_i32_global_system(
+                                            peer_s2_tile
+                                            + fx.Int64(dest_rank_mask_off)
+                                            + parity * fx.Int64(dest_rank_mask_stride)
+                                            + fx.Int64(token_index_tile) * fx.Int64(4)
+                                        )
+                                    ) & fx.Int32(0xFF)
+                                    tile_expected_ranks = fx.Int32(0)
+                                    for tile_peer in range_constexpr(GPUS_PER_NODE):
+                                        tile_expected_ranks = tile_expected_ranks + (
+                                            (tile_rank_mask >> fx.Int32(tile_peer))
+                                            & fx.Int32(1)
+                                        )
+                                    old_arrived = fx.Int32(
+                                        comm_ops.atomic_add_system_acq_rel(
+                                            peer_s2_tile
+                                            + fx.Int64(node_tile_arrived_off)
+                                            + parity * fx.Int64(node_tile_arrived_stride)
+                                            + fx.Int64(
+                                                token_index_tile * ready_groups
+                                            )
+                                            * fx.Int64(4),
+                                            fx.Int32(1),
+                                        )
+                                    )
+                                    if old_arrived + fx.Int32(1) > tile_expected_ranks:
+                                        add_error()
+                                    if (
+                                        old_arrived + fx.Int32(1)
+                                        == tile_expected_ranks
+                                    ):
+                                        tile_queue_slot = fx.Int32(
+                                            comm_ops.atomic_add_system_acq_rel(
+                                                peer_s2_tile
+                                                + fx.Int64(tile_reduce_queue_tail_off)
+                                                + parity * fx.Int64(tile_reduce_queue_tail_stride),
+                                                fx.Int32(1),
+                                            )
+                                        )
+                                        comm_ops.store_i32_system(
+                                            peer_s2_tile
+                                            + fx.Int64(tile_reduce_queue_off)
+                                            + parity * fx.Int64(tile_reduce_queue_stride),
+                                            tile_queue_slot,
+                                            token_index_tile,
+                                        )
+                                        comm_ops.store_i64_global_system(
+                                            peer_s2_tile
+                                            + fx.Int64(tile_reduce_queue_ready_off)
+                                            + parity * fx.Int64(tile_reduce_queue_ready_stride)
+                                            + fx.Int64(tile_queue_slot) * fx.Int64(8),
+                                            generation,
+                                        )
+                            old_pending = fx.Int32(2)
+                        else:
+                            old_pending = fx.Int32(
+                                comm_ops.atomic_add_agent_acq_rel(
+                                    rank_pending_ptr
+                                    + fx.Int64(source) * fx.Int64(64),
+                                    fx.Int32(-1),
+                                )
+                            )
+                            if old_pending <= fx.Int32(0):
+                                add_error()
                         if const_expr(rank_accumulation_mode == "staged_reduce"):
                             old_group_pending = fx.Int32(
                                 comm_ops.atomic_add_agent_acq_rel(
@@ -4140,10 +4720,10 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                                 + fx.Int64(source) * fx.Int64(8),
                                 generation,
                             )
-                            source_rank = source >> fx.Int32(7)
+                            source_rank = source // fx.Int32(MAX_TOKENS)
                             source_plane = source_rank >> fx.Int32(3)
                             source_local = source_rank & fx.Int32(7)
-                            token = source & fx.Int32(127)
+                            token = source - source_rank * fx.Int32(MAX_TOKENS)
                             token_index = (
                                 source_plane * fx.Int32(MAX_TOKENS) + token
                             )
@@ -4265,10 +4845,13 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                         source_row = fx.Int32(packed_row) & fx.Int32(0x00FFFFFF)
                         expected_row = fx.Int32(1)
                         if source_row < fx.Int32(SOURCE_CAPACITY):
-                            source_rank_row = source_row >> fx.Int32(7)
+                            source_rank_row = source_row // fx.Int32(MAX_TOKENS)
                             source_node_row = source_rank_row >> fx.Int32(3)
                             source_local_row = source_rank_row & fx.Int32(7)
-                            token_row = source_row & fx.Int32(127)
+                            token_row = (
+                                source_row
+                                - source_rank_row * fx.Int32(MAX_TOKENS)
+                            )
                             peer_base_row = fx.Int64(
                                 fx.ptr_load(
                                     lds_typed_ptr(
@@ -4396,10 +4979,10 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                         )
                     source = packed & fx.Int32(0x00FFFFFF)
                     if source < fx.Int32(SOURCE_CAPACITY):
-                        source_rank = source >> fx.Int32(7)
+                        source_rank = source // fx.Int32(MAX_TOKENS)
                         source_node = source_rank >> fx.Int32(3)
                         source_local = source_rank & fx.Int32(7)
-                        token = source & fx.Int32(127)
+                        token = source - source_rank * fx.Int32(MAX_TOKENS)
                         if const_expr(node_accumulation_mode == "rank_local"):
                             row_base = (
                                 source * fx.Int32(HIDDEN)
@@ -4550,6 +5133,10 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                 accm, m_row, n_block, cache_metadata, issue_barrier
             ):
                 """Materialize weighted BF16, then store or locally accumulate."""
+
+                # agent: 稳定 rank-local atomic 路径在这里完成反量化、route
+                # weight 乘法和 packed BF16 atomic_add。原子目标仅是本 rank
+                # accumulator，不在 GMM CTA 内直接写远端 rank 的 payload。
 
                 lds_bf16 = lds_typed_ptr(lds_base, T.bf16, align=2)
                 if const_expr(node_accumulation_mode == "rank_local"):
@@ -4853,10 +5440,10 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                                 + ring_index * fx.Int64(8),
                                 ring_seq + fx.Int64(1),
                             )
-                        source_rank = safe_source >> fx.Int32(7)
+                        source_rank = safe_source // fx.Int32(MAX_TOKENS)
                         source_node = source_rank >> fx.Int32(3)
                         source_local = source_rank & fx.Int32(7)
-                        token = safe_source & fx.Int32(127)
+                        token = safe_source - source_rank * fx.Int32(MAX_TOKENS)
                         peer_base = fx.Int64(
                             fx.ptr_load(
                                 lds_typed_ptr(
@@ -5013,8 +5600,41 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
                 return accm, m_row
 
             def run_gmm_work(work):
-                m_block = work // fx.Int32(n_groups)
-                n_group = work - m_block * fx.Int32(n_groups)
+                if const_expr(gmm_work_swizzle == "token_major"):
+                    m_block = work // fx.Int32(n_groups)
+                    n_group = work - m_block * fx.Int32(n_groups)
+                else:
+                    # agent: 在每个N窗口内先推进N方向，再遍历下一个M块。
+                    # window=1即严格N-major；更大的window在更早tile-ready与
+                    # 同一M块局部性之间折中，并正确处理最后一个非整除窗口。
+                    full_windows = n_groups // window_n_groups
+                    tail_groups = n_groups % window_n_groups
+                    full_work = (
+                        fx.Int32(full_windows * window_n_groups) * total_m_blocks
+                    )
+                    in_full = work < full_work
+                    full_span = total_m_blocks * fx.Int32(window_n_groups)
+                    safe_span = (full_span > fx.Int32(0)).select(
+                        full_span, fx.Int32(1)
+                    )
+                    window = work // safe_span
+                    within = work - window * safe_span
+                    full_m = within // fx.Int32(window_n_groups)
+                    full_n = (
+                        window * fx.Int32(window_n_groups)
+                        + within
+                        - full_m * fx.Int32(window_n_groups)
+                    )
+                    tail_work = work - full_work
+                    safe_tail = max(tail_groups, 1)
+                    tail_m = tail_work // fx.Int32(safe_tail)
+                    tail_n = (
+                        fx.Int32(full_windows * window_n_groups)
+                        + tail_work
+                        - tail_m * fx.Int32(safe_tail)
+                    )
+                    m_block = in_full.select(full_m, tail_m)
+                    n_group = in_full.select(full_n, tail_n)
                 n_block0 = n_group * fx.Int32(n_tile_group)
                 group_m_row = m_block * fx.Int32(BM)
                 preloaded_expert = None
@@ -5291,10 +5911,14 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
     launch_megamoe_tile_ep16_stage2.accumulator_dtype = accumulator_dtype
     launch_megamoe_tile_ep16_stage2.final_combine_blocks = final_combine_blocks
     launch_megamoe_tile_ep16_stage2.gmm_schedule = gmm_schedule
+    launch_megamoe_tile_ep16_stage2.gmm_work_swizzle = gmm_work_swizzle
+    launch_megamoe_tile_ep16_stage2.window_n_groups = window_n_groups
     launch_megamoe_tile_ep16_stage2.return_chunk_tokens = return_chunk_tokens
     launch_megamoe_tile_ep16_stage2.node_ready_granularity = "token"
     launch_megamoe_tile_ep16_stage2.bf16_atomic_kind = bf16_atomic_kind
     launch_megamoe_tile_ep16_stage2.rail_return_schedule = rail_return_schedule
+    launch_megamoe_tile_ep16_stage2.rail_quant_type = rail_quant_type
+    launch_megamoe_tile_ep16_stage2.ready_granularity = ready_granularity
     launch_megamoe_tile_ep16_stage2.epilogue_schedule = epilogue_schedule
     launch_megamoe_tile_ep16_stage2.n_tile_group = n_tile_group
     launch_megamoe_tile_ep16_stage2.group_pipeline_schedule = (
@@ -5400,10 +6024,14 @@ def compile_megamoe_tile_ep16_stage2_a4w4(
         "intranode_combine_ctas": final_combine_blocks,
         "diagnostic_mode": diagnostic_mode,
         "gmm_schedule": gmm_schedule,
+        "gmm_work_swizzle": gmm_work_swizzle,
+        "window_n_groups": window_n_groups,
         "return_chunk_tokens": return_chunk_tokens,
         "node_ready_granularity": "token",
         "bf16_atomic_kind": bf16_atomic_kind,
         "rail_return_schedule": rail_return_schedule,
+        "rail_quant_type": rail_quant_type,
+        "ready_granularity": ready_granularity,
         "epilogue_schedule": epilogue_schedule,
         "n_tile_group": n_tile_group,
         "group_pipeline_schedule": group_pipeline_schedule,

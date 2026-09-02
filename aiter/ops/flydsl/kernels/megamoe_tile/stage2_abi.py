@@ -26,6 +26,8 @@ from dataclasses import dataclass
 
 import torch
 
+from .stage1_abi import MAX_FUSED_TOKENS_PER_RANK, MAX_PACKED_SOURCE_CAPACITY
+
 
 STAGE2_TIMELINE_FIELDS = (
     "stage1_entry",
@@ -144,6 +146,10 @@ class Stage2ArenaLayout:
     parity_depth: int
     num_qp: int
     records_per_group: int
+    rail_quant_type: str
+    rail_scale_dim: int
+    ready_granularity: str
+    ready_group_tiles: int
     include_route_slots: bool
     include_rank_partials: bool
     include_staged_reduce: bool
@@ -162,6 +168,10 @@ class Stage2ArenaLayout:
     def return_groups(self) -> int:
         return (self.max_tokens + self.records_per_group - 1) // self.records_per_group
 
+    @property
+    def ready_group_count(self) -> int:
+        return (self.hidden_tiles + self.ready_group_tiles - 1) // self.ready_group_tiles
+
     @classmethod
     def create(
         cls,
@@ -176,6 +186,10 @@ class Stage2ArenaLayout:
         parity_depth: int = 2,
         num_qp: int = 4,
         records_per_group: int = 4,
+        rail_quant_type: str = "none",
+        rail_scale_dim: int | None = None,
+        ready_granularity: str = "token",
+        ready_group_tiles: int = 2,
         include_route_slots: bool = False,
         include_rank_partials: bool = False,
         include_staged_reduce: bool = False,
@@ -193,8 +207,16 @@ class Stage2ArenaLayout:
             "num_qp": num_qp,
             "records_per_group": records_per_group,
         }
+        if not 1 <= int(max_tokens) <= MAX_FUSED_TOKENS_PER_RANK:
+            raise ValueError(
+                "max_tokens must be in [1, 4096] for the fused Stage-2 ABI"
+            )
         if any(int(v) <= 0 for v in values.values()):
             raise ValueError("all Stage-2 geometry values must be positive")
+        if int(world_size) * int(max_tokens) > MAX_PACKED_SOURCE_CAPACITY:
+            raise ValueError(
+                "world_size * max_tokens exceeds the 24-bit packed source capacity"
+            )
         if int(hidden) % int(tile_n):
             raise ValueError("hidden must divide tile_n")
         if int(topk) > 32:
@@ -205,15 +227,43 @@ class Stage2ArenaLayout:
             raise ValueError("world_size must equal source_nodes * gpus_per_node")
         if int(num_qp) not in (1, 2, 4, 8):
             raise ValueError("num_qp must be one of 1,2,4,8")
+        rail_quant_type = str(rail_quant_type)
+        if rail_quant_type not in ("none", "fp8_blockwise"):
+            raise ValueError("rail_quant_type must be 'none' or 'fp8_blockwise'")
+        ready_granularity = str(ready_granularity)
+        if ready_granularity not in ("token", "tile"):
+            raise ValueError("ready_granularity must be 'token' or 'tile'")
+        ready_group_tiles = int(ready_group_tiles)
+        if ready_group_tiles <= 0:
+            raise ValueError("ready_group_tiles must be positive")
+        expected_scale_dim = int(hidden) // 128
+        rail_scale_dim = (
+            (expected_scale_dim if rail_quant_type == "fp8_blockwise" else 0)
+            if rail_scale_dim is None
+            else int(rail_scale_dim)
+        )
+        if rail_quant_type == "none" and rail_scale_dim != 0:
+            raise ValueError("rail_scale_dim must be zero when rail quantization is disabled")
+        if rail_quant_type == "fp8_blockwise" and rail_scale_dim != expected_scale_dim:
+            raise ValueError(
+                "fp8_blockwise rail_scale_dim must equal hidden // 128"
+            )
         if include_staged_reduce and not include_rank_partials:
             raise ValueError("include_staged_reduce requires include_rank_partials")
         if include_staged_ring and not include_rank_partials:
             raise ValueError("include_staged_ring requires include_rank_partials")
         if include_staged_ring and include_staged_reduce:
             raise ValueError("include_staged_ring and include_staged_reduce are mutually exclusive")
+        if int(max_tokens) > 128 and include_staged_reduce:
+            raise ValueError("staged_reduce currently supports max_tokens <= 128")
+        if int(max_tokens) > 128 and include_staged_ring:
+            raise ValueError("staged_ring currently supports max_tokens <= 128")
         wire = Stage2NodePartialWire(int(hidden), int(records_per_group))
         groups = wire.group_count(max_tokens)
         ntiles = int(hidden) // int(tile_n)
+        ready_groups = (ntiles + ready_group_tiles - 1) // ready_group_tiles
+        if ready_granularity == "tile" and ready_groups > 64:
+            raise ValueError("ready_group_count exceeds the 64-bit node_ready_mask")
 
         # name, shape, dtype, alignment. node_expected/masks are Stage-1
         # outputs. Stage-2 clears accumulator/done in its resident all-CTA
@@ -607,6 +657,102 @@ class Stage2ArenaLayout:
                     )
                 )
 
+        # MORI's Stage2 fp8_blockwise combine uses one FP32 scale per 128
+        # hidden values: H7168 therefore has scale_dim=56.  Append after every
+        # optional legacy ABI so enabling quantization changes no old offset.
+        if rail_quant_type == "fp8_blockwise":
+            specs.extend(
+                (
+                    (
+                        "rail_fp8_tx_payload",
+                        (parity_depth, max_tokens, hidden),
+                        torch.uint8,
+                        # Start beyond the complete legacy arena, including
+                        # its final 4-KiB rounding, to keep append-only ABI.
+                        4096,
+                    ),
+                    (
+                        "rail_fp8_rx_payload",
+                        (parity_depth, max_tokens, hidden),
+                        torch.uint8,
+                        256,
+                    ),
+                    (
+                        "rail_fp8_tx_scale",
+                        (parity_depth, max_tokens, rail_scale_dim),
+                        torch.float32,
+                        256,
+                    ),
+                    (
+                        "rail_fp8_rx_scale",
+                        (parity_depth, max_tokens, rail_scale_dim),
+                        torch.float32,
+                        256,
+                    ),
+                )
+            )
+
+        if ready_granularity == "tile":
+            tile_entries = source_nodes * max_tokens * ready_groups
+            specs.extend(
+                (
+                    (
+                        "rank_tile_pending",
+                        (parity_depth, world_size * max_tokens, ready_groups),
+                        torch.int32,
+                        64,
+                    ),
+                    (
+                        "rank_tile_ready",
+                        (parity_depth, world_size * max_tokens, ready_groups),
+                        torch.int64,
+                        64,
+                    ),
+                    (
+                        "node_tile_arrived",
+                        (parity_depth, source_nodes * max_tokens, ready_groups),
+                        torch.int32,
+                        64,
+                    ),
+                    (
+                        "node_tile_ready",
+                        (parity_depth, source_nodes * max_tokens, ready_groups),
+                        torch.int64,
+                        64,
+                    ),
+                    (
+                        "node_ready_mask",
+                        (parity_depth, source_nodes * max_tokens),
+                        torch.int64,
+                        64,
+                    ),
+                    (
+                        "tile_reduce_queue",
+                        (parity_depth, tile_entries),
+                        torch.int32,
+                        64,
+                    ),
+                    (
+                        "tile_reduce_queue_ready",
+                        (parity_depth, tile_entries),
+                        torch.int64,
+                        64,
+                    ),
+                    (
+                        "tile_reduce_queue_tail",
+                        (parity_depth, 16),
+                        torch.int32,
+                        64,
+                    ),
+                    (
+                        "tile_reduce_queue_head",
+                        (parity_depth, 16),
+                        torch.int32,
+                        64,
+                    ),
+                )
+            )
+
         offset = 0
         regions: list[Stage2ArenaRegion] = []
         for name, shape, dtype, alignment in specs:
@@ -638,6 +784,10 @@ class Stage2ArenaLayout:
             parity_depth=int(parity_depth),
             num_qp=int(num_qp),
             records_per_group=int(records_per_group),
+            rail_quant_type=rail_quant_type,
+            rail_scale_dim=rail_scale_dim,
+            ready_granularity=ready_granularity,
+            ready_group_tiles=ready_group_tiles,
             include_route_slots=bool(include_route_slots),
             include_rank_partials=bool(include_rank_partials),
             include_staged_reduce=bool(include_staged_reduce),

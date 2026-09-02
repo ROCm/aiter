@@ -20,6 +20,8 @@ import torch
 
 SPARSE_QP_TOKEN_BITS = 32
 SPARSE_QP_GENERATION_SHIFT = 32
+MAX_FUSED_TOKENS_PER_RANK = 4096
+MAX_PACKED_SOURCE_CAPACITY = (1 << 24) - 1
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -136,6 +138,7 @@ class Stage1ArenaLayout:
     gpus_per_node: int
     topk: int
     max_tokens: int
+    max_routes_per_token_per_rank: int
     block_m: int
     block_n: int
     parity_depth: int
@@ -153,8 +156,10 @@ class Stage1ArenaLayout:
 
     @property
     def route_capacity(self) -> int:
-        # Arbitrary Top-K may place all routes on one destination rank.
-        return self.source_capacity * self.topk
+        # The compact contract bounds how many routes from one source token
+        # may target any one EP rank.  The default equals topk and therefore
+        # preserves the original arbitrary-routing capacity.
+        return self.source_capacity * self.max_routes_per_token_per_rank
 
     @property
     def max_tiles_per_expert(self) -> int:
@@ -200,6 +205,7 @@ class Stage1ArenaLayout:
         gpus_per_node: int = 8,
         topk: int = 16,
         max_tokens: int = 128,
+        max_routes_per_token_per_rank: int | None = None,
         block_m: int = 32,
         block_n: int = 256,
         parity_depth: int = 2,
@@ -212,7 +218,6 @@ class Stage1ArenaLayout:
             "world_size": 16,
             "gpus_per_node": 8,
             "topk": 16,
-            "max_tokens": 128,
             "block_m": 32,
             "block_n": 256,
             "parity_depth": 2,
@@ -243,13 +248,30 @@ class Stage1ArenaLayout:
         gpus_per_node = int(gpus_per_node)
         topk = int(topk)
         max_tokens = int(max_tokens)
+        max_routes_per_token_per_rank = (
+            topk
+            if max_routes_per_token_per_rank is None
+            else int(max_routes_per_token_per_rank)
+        )
         block_m = int(block_m)
         block_n = int(block_n)
         parity_depth = int(parity_depth)
         num_qp = int(num_qp)
+        if not 1 <= max_tokens <= MAX_FUSED_TOKENS_PER_RANK:
+            raise ValueError(
+                "max_tokens must be in [1, 4096] for the fused Stage-1 ABI"
+            )
+        if not 1 <= max_routes_per_token_per_rank <= topk:
+            raise ValueError(
+                "max_routes_per_token_per_rank must be in [1, topk]"
+            )
         local_experts = experts // world_size
         source_capacity = world_size * max_tokens
-        route_capacity = source_capacity * topk
+        if source_capacity > MAX_PACKED_SOURCE_CAPACITY:
+            raise ValueError(
+                "world_size * max_tokens exceeds the 24-bit packed source capacity"
+            )
+        route_capacity = source_capacity * max_routes_per_token_per_rank
         max_route_tiles = (route_capacity + block_m - 1) // block_m + local_experts
         max_route_rows = max_route_tiles * block_m
         max_tiles_per_expert = (route_capacity + block_m - 1) // block_m
@@ -407,6 +429,7 @@ class Stage1ArenaLayout:
             gpus_per_node=gpus_per_node,
             topk=topk,
             max_tokens=max_tokens,
+            max_routes_per_token_per_rank=max_routes_per_token_per_rank,
             block_m=block_m,
             block_n=block_n,
             parity_depth=parity_depth,
@@ -493,6 +516,8 @@ def validate_public_stage1_contract(
 
 
 __all__ = [
+    "MAX_FUSED_TOKENS_PER_RANK",
+    "MAX_PACKED_SOURCE_CAPACITY",
     "SPARSE_QP_GENERATION_SHIFT",
     "SPARSE_QP_TOKEN_BITS",
     "Stage1ArenaLayout",

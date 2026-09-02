@@ -33,6 +33,14 @@ candidate_node_reduce_work_schedule="${29:-static_strided}"
 candidate_node_reduce_rejoin_blocks="${30:-0}"
 candidate_rank_epilogue_lds_addressing="${31:-expanded}"
 candidate_rank_accumulation_mode="${32:-atomic}"
+tokens="${33:-128}"
+max_routes_per_token_per_rank="${34:-}"
+stage1_diagnostic_phase="${35:-full}"
+mori_combine_quant_type="${36:-none}"
+candidate_rail_quant_type="${37:-none}"
+candidate_gmm_work_swizzle="${38:-token_major}"
+candidate_window_n_groups="${39:-2}"
+candidate_ready_granularity="${40:-token}"
 
 log_dir=/home/hzm/logs/megamoe_stage2_breakdown_20260824
 log_file="${log_dir}/${tag}_node${node_rank}.log"
@@ -52,7 +60,10 @@ export MORI_NUM_QP_PER_PE=4
 export MORI_SHMEM_HEAP_SIZE="${MORI_SHMEM_HEAP_SIZE:-40G}"
 export MORI_EP_LAUNCH_CONFIG_MODE=AUTO
 export AMD_SERIALIZE_KERNEL=0
-export FLYDSL_RUNTIME_ENABLE_CACHE=0
+# Performance runs should compile once and let the remaining ranks reuse the
+# generated artifact.  Set this to 0 explicitly only for a cold-compile
+# diagnostic; forcing it off here makes all 16 ranks compile independently.
+export FLYDSL_RUNTIME_ENABLE_CACHE="${FLYDSL_RUNTIME_ENABLE_CACHE:-1}"
 
 if [[ "${path}" == "candidate" ]]; then
   mode_args=(--candidate-mode "${mode}")
@@ -70,6 +81,12 @@ weight_args=()
 if [[ "${direct_packed_weights}" == "1" ]]; then
   weight_args=(--direct-packed-weights)
 fi
+route_capacity_args=()
+if [[ -n "${max_routes_per_token_per_rank}" ]]; then
+  route_capacity_args=(
+    --max-routes-per-token-per-rank "${max_routes_per_token_per_rank}"
+  )
+fi
 timeout --signal=TERM --kill-after=30s 1800s \
   python3 -u -m torch.distributed.run \
     --nnodes=2 \
@@ -84,6 +101,10 @@ timeout --signal=TERM --kill-after=30s 1800s \
     "${mode_args[@]}" \
     "${timeline_args[@]}" \
     "${weight_args[@]}" \
+    "${route_capacity_args[@]}" \
+    --stage1-diagnostic-phase "${stage1_diagnostic_phase}" \
+    --mori-combine-quant-type "${mori_combine_quant_type}" \
+    --tokens "${tokens}" \
     --stage2-workers "${stage2_workers}" \
     --candidate-accumulator "${candidate_accumulator}" \
     --candidate-final-combine-blocks "${candidate_final_combine_blocks}" \
@@ -100,6 +121,10 @@ timeout --signal=TERM --kill-after=30s 1800s \
     --candidate-rank-epilogue-lds-addressing "${candidate_rank_epilogue_lds_addressing}" \
     --candidate-rank-accumulation-mode "${candidate_rank_accumulation_mode}" \
     --candidate-rail-return-schedule "${candidate_rail_return_schedule}" \
+    --candidate-rail-quant-type "${candidate_rail_quant_type}" \
+    --candidate-gmm-work-swizzle "${candidate_gmm_work_swizzle}" \
+    --candidate-window-n-groups "${candidate_window_n_groups}" \
+    --candidate-ready-granularity "${candidate_ready_granularity}" \
     --candidate-epilogue-schedule "${candidate_epilogue_schedule}" \
     --candidate-n-tile-group "${candidate_n_tile_group}" \
     --candidate-group-pipeline-schedule "${candidate_group_pipeline_schedule}" \
