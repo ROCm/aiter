@@ -6,6 +6,8 @@ import os
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
 # Dev-time tuning escape hatch (off by default). See the block below the kernel
 # for what this actually does and why it's not the production path.
 ATTN_RES_TRITON_AUTOTUNE: bool = os.getenv("ATTN_RES_TRITON_AUTOTUNE", "0").lower() in (
@@ -16,10 +18,32 @@ ATTN_RES_TRITON_AUTOTUNE: bool = os.getenv("ATTN_RES_TRITON_AUTOTUNE", "0").lowe
 )
 
 
+_attnres_fwd_kernel_repr = make_kernel_repr(
+    "attnres_fwd_kernel",
+    [
+        "L2",
+        "D",
+        "BL",
+        "BD",
+        "HAS_ONORM",
+        "SAVE_OPRE",
+        "SAVE_STATS",
+        "IS_PACKED",
+        "HAS_PREFIX",
+        "DO_ADD",
+        "DO_ADD2",
+        "WRITE_PREF",
+        "WRITE_BLOCK_CAT",
+        "HAS_W",
+        "QUANT_FP8",
+    ],
+)
+
+
 # num_warps / num_stages / BL come from the static per-token-count table in the
 # wrapper (see _pick_attn_res_config), not from @triton.autotune: a single config
 # per shape keeps compile cost bounded and does not break CUDAGraph capture.
-@triton.jit(do_not_specialize=["L"])
+@triton.jit(repr=_attnres_fwd_kernel_repr, do_not_specialize=["L"])
 def attnres_fwd_kernel(
     q,
     res,
