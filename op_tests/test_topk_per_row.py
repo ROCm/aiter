@@ -6,6 +6,7 @@ import torch
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.test_common import benchmark, perftest
 
 
@@ -15,15 +16,15 @@ def create_random_logits(
     dtype: torch.dtype,
     seed: int,
     data_generation: str = "random",
+    physical_width: int | None = None,
 ) -> torch.Tensor:
     """Create random logits tensor for testing."""
     torch.manual_seed(seed)
     np.random.seed(seed)
+    width = physical_width if physical_width is not None else max(row_ends)
     # Generate logits with some structure to make testing more meaningful
     if data_generation == "random":
-        logits = torch.randn(
-            row_starts.shape[0], max(row_ends), dtype=dtype, device="cuda"
-        )
+        logits = torch.randn(row_starts.shape[0], width, dtype=dtype, device="cuda")
     elif data_generation == "10LSBits" or data_generation == "mixed":
         top_22_bits_mask = 0xFFFFFC00
         last_10_bits_mask = 0x000003FF
@@ -32,7 +33,7 @@ def create_random_logits(
         random_bottom_bits = torch.randint(
             0,
             2**10,
-            (row_starts.shape[0], max(row_ends)),
+            (row_starts.shape[0], width),
             dtype=torch.int32,
             device="cuda",
         )
@@ -44,7 +45,7 @@ def create_random_logits(
 
     if data_generation == "mixed":
         logits_random = torch.randn(
-            row_starts.shape[0], max(row_ends), dtype=dtype, device="cuda"
+            row_starts.shape[0], width, dtype=dtype, device="cuda"
         )
         # Mix the two logits tensors randomly
         mask = torch.randint(0, 2, (row_starts.shape[0], 1), device="cuda").bool()
@@ -74,6 +75,8 @@ def compare_topk_results(
     row_ends: torch.Tensor,
     top_k: int,
     tolerance: float = 1e-5,
+    stable: bool = False,
+    values: torch.Tensor | None = None,
 ) -> bool:
     """
     Compare results from CUDA top_k_per_row with torch.topk.
@@ -120,6 +123,29 @@ def compare_topk_results(
         ):
             return False
 
+    if stable:
+        for row, row_end in enumerate(row_ends.tolist()):
+            valid_count = min(top_k, row_end)
+            if valid_count > 1 and not bool(
+                torch.all(
+                    cuda_indices[row, 1:valid_count]
+                    >= cuda_indices[row, : valid_count - 1]
+                )
+            ):
+                return False
+
+    if values is not None:
+        valid = cuda_indices >= 0
+        gathered = torch.gather(
+            logits,
+            1,
+            cuda_indices.clamp_min(0).to(torch.int64),
+        )
+        if not torch.equal(values[valid], gathered[valid]):
+            return False
+        if not bool(torch.all(torch.isneginf(values[~valid]))):
+            return False
+
     return True
 
 
@@ -162,6 +188,9 @@ def run_top_k_per_row_decode(
     stride1: int,
     fast: bool,
     k: int = 2048,
+    flydsl: bool = False,
+    stable: bool = False,
+    values: torch.Tensor | None = None,
 ) -> None:
     """
     Run the top_k_per_row kernel.
@@ -170,8 +199,23 @@ def run_top_k_per_row_decode(
     precompiled `.co`; it ignores any caller-supplied `k`. The dispatch
     here only allows `_fast` when k == 2048.
     """
-    if fast:
+    if flydsl:
+        assert not fast, "fast and flydsl cannot both be enabled"
+        return aiter.flydsl_top_k_per_row_decode(
+            logits,
+            next_n,
+            seqLens,
+            indices,
+            numRows,
+            stride0,
+            stride1,
+            k,
+            stable,
+            values,
+        )
+    elif fast:
         assert k == 2048, "top_k_per_row_decode_fast only supports k=2048"
+        assert not stable and values is None
         return aiter.top_k_per_row_decode_fast(
             logits,
             next_n,
@@ -191,6 +235,8 @@ def run_top_k_per_row_decode(
             stride0,
             stride1,
             k=k,
+            stable=stable,
+            values=values,
         )
 
 
@@ -255,6 +301,9 @@ def test_top_k_per_row_decode(
     next_n: int,
     data_generation: str = "random",
     fast: bool = False,
+    flydsl: bool = False,
+    stable: bool = False,
+    write_values: bool = False,
 ) -> dict:
     """
     Test top_k_per_row_decode with seq_lens tensor.
@@ -271,11 +320,21 @@ def test_top_k_per_row_decode(
     next_n_offset = torch.arange(num_rows, device="cuda") % next_n
     row_ends = seq_lens[row_indices] - next_n + next_n_offset + 1
     logits = create_random_logits(
-        row_starts, row_ends, torch.float32, 42, data_generation
+        row_starts,
+        row_ends,
+        torch.float32,
+        42,
+        data_generation,
+        physical_width=max(context_len, top_k) if flydsl else None,
     )
 
     # Create output tensors
     indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
+    values = (
+        torch.empty((num_rows, top_k), dtype=torch.float32, device="cuda")
+        if write_values
+        else None
+    )
 
     # Run the kernel
     _, us = run_top_k_per_row_decode(
@@ -288,6 +347,9 @@ def test_top_k_per_row_decode(
         logits.stride(1),
         fast,
         k=top_k,
+        flydsl=flydsl,
+        stable=stable,
+        values=values,
     )
 
     torch.cuda.synchronize()
@@ -301,11 +363,18 @@ def test_top_k_per_row_decode(
 
     # Compare results
     all_close = compare_topk_results(
-        logits, indices, torch_indices, row_starts, row_ends, top_k
+        logits,
+        indices,
+        torch_indices,
+        row_starts,
+        row_ends,
+        top_k,
+        stable=stable,
+        values=values,
     )
 
     # measure performance
-    ret["context_len"] = logits.shape[1]
+    ret["width"] = logits.shape[1]
     ret["all_close"] = all_close
     ret["us"] = us
     ret["fast"] = fast
@@ -441,21 +510,47 @@ aiter.logger.info("topk_per_row_prefill summary (markdown):\n%s", df_md)
 
 
 df = []
+flydsl_available = get_gfx() in ("gfx942", "gfx950") and is_flydsl_available()
 for data_generation in args.data_generation:
     for m in args.decode_batch_size:
         for ctx in args.context_len:
             for k in args.top_k:
                 for n in args.next_n:
-                    ret = test_top_k_per_row_decode(
-                        m, ctx, k, n, data_generation, False
-                    )
-                    df.append(ret)
-                    # `_fast` ASM kernel hardcodes k=2048; skip otherwise.
-                    if get_gfx() == "gfx942" and k == 2048:
-                        ret = test_top_k_per_row_decode(
-                            m, ctx, k, n, data_generation, True
-                        )
-                        df.append(ret)
+                    for stable in (False, True):
+                        for write_values in (False, True):
+                            ret = test_top_k_per_row_decode(
+                                m,
+                                ctx,
+                                k,
+                                n,
+                                data_generation,
+                                stable=stable,
+                                write_values=write_values,
+                            )
+                            df.append(ret)
+                            if flydsl_available:
+                                ret = test_top_k_per_row_decode(
+                                    m,
+                                    ctx,
+                                    k,
+                                    n,
+                                    data_generation,
+                                    flydsl=True,
+                                    stable=stable,
+                                    write_values=write_values,
+                                )
+                                df.append(ret)
+                        # `_fast` ASM kernel hardcodes k=2048 and is not stable.
+                        if get_gfx() == "gfx942" and k == 2048 and not stable:
+                            ret = test_top_k_per_row_decode(
+                                m,
+                                ctx,
+                                k,
+                                n,
+                                data_generation,
+                                fast=True,
+                            )
+                            df.append(ret)
 
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)

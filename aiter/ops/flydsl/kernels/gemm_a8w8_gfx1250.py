@@ -11,9 +11,9 @@ from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.rocdl import cluster, tdm_ops
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
-from flydsl.runtime.device import get_rocm_arch as get_hip_arch
-from flydsl.utils.smem_allocator import check_smem_capacity
+from flydsl.runtime.device import get_rocm_arch
 
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
     make_lds_copy_ops,
     pipeline_fence,
@@ -126,7 +126,15 @@ def launch_gemm_a8w8(
     C_LDS_ROW = tile_n + C_PAD
     C_STORE_B = (tile_m * C_LDS_ROW * 2 + 127) // 128 * 128
     ARENA_B = max(PANEL_OFF + PANEL_A + PANEL_B, C_STORE_B)
-    check_smem_capacity(ARENA_B, str(get_hip_arch()))
+    # The compile target, not the host: AOT cross-compiles these gfx1250
+    # kernels under FLYDSL_GPU_ARCH, which get_rocm_arch() honours.
+    arch = get_rocm_arch().split(":", 1)[0]
+    lds_cap = get_lds_capacity_bytes(arch)
+    if ARENA_B > lds_cap:
+        raise RuntimeError(
+            f"Shared Memory Overflow: requested {ARENA_B} bytes on {arch}, "
+            f"limit is {lds_cap} bytes"
+        )
     use_quadrant = (wmma_m_rep % 2 == 0) and (wmma_n_rep % 2 == 0) and (n_acc >= 8)
     scale_tag = "mx32" if mx32 else ("mx128" if mx128 else "ptpc")
     kernel_name = format_kernel_name(

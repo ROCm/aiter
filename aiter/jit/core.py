@@ -166,6 +166,11 @@ AITER_CONFIG_GEMM_BF16 = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv",
 )
 
+AITER_CONFIG_GDR_DECODE = os.getenv(
+    "AITER_CONFIG_GDR_DECODE",
+    f"{AITER_ROOT_DIR}/aiter/configs/gdr_decode_tuned.csv",
+)
+
 # K5 opt BV tuned config. Per-model tuned rows live under model_configs/
 # (qwen3_5_*_chunk_gdn_h_opt_tuned.csv) and get merged into this canonical file by
 # get_config_file. It ships header-only: with no per-model table present
@@ -265,6 +270,10 @@ class AITER_CONFIG:
         return self.get_config_file(
             "AITER_CONFIG_GEMM_BF16", AITER_CONFIG_GEMM_BF16, "bf16_tuned_gemm"
         )
+
+    @property
+    def AITER_CONFIG_GDR_DECODE_FILE(self):
+        return AITER_CONFIG_GDR_DECODE
 
     @property
     def AITER_CONFIG_GDN_K5_OPT_FILE(self):
