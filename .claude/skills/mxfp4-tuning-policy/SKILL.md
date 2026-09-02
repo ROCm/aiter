@@ -204,22 +204,31 @@ on candidates that are individually plausible and collectively diverse.
    For a fixed GEMM1 the layout family offers only ~16 partners, one per stratum,
    so stratifying GEMM2 degenerates to ranking and a top-3 take still missed a
    1.5% win. **`--g2-per-g1 0`** (every legal partner) is the reliable setting.
-3. **Use `top_k` 64.** Once the prompt is a proper cover, `top_k` is the only
-   remaining lever, and the failures it causes are the model declining to pick a
-   config it *was* shown. Measured on glm5 against exhaustive per-shape optima
-   (2688 pairs each, tokens 1-32768):
+3. **Use `top_k` 64, and do not expect more to help.** Once the prompt is a
+   proper cover, `top_k` is the only remaining lever, and the failures it causes
+   are the model declining to pick a config it *was* shown. Measured on glm5
+   against exhaustive per-shape optima (all 64 shapes, 2688 pairs each):
 
-   | `top_k` | slate holds the true optimum | distinct GEMM1 offered |
-   |---|---:|---:|
-   | 32 | 41/64 | 31 |
-   | **64** | **62/64** | 63 |
+   | `top_k` | best GEMM1 in slate | exact pair | pairs/shape | share of legal |
+   |---|---:|---:|---:|---:|
+   | 32 | 41/64 | 41/64 | 962 | 35% |
+   | **64** | **62/64** | **61/64** | 1954 | 72% |
+   | 80 | 58/64 | 57/64 | 2450 | 91% |
+   | 96 (= prompt) | 64/64 | 64/64 | 2604 | 97% |
 
-   Every miss at both budgets was present in the prompt and simply not chosen, so
-   this is a selection budget, not coverage — including the two that survive at
-   64 (`inter` 2048 tok 256, `inter` 1024 tok 512). 64 is ~0.9x the ~72 strata;
-   at `top_k >= strata` containment becomes exact by construction, with the model
-   no longer selecting anything. Below 32 it degrades gracefully — a knob, not a
-   cliff.
+   **Containment is not monotonic in `top_k`.** 80 scores *worse* than 64, and its
+   six misses are a different set of shapes — it recovers both shapes 64 missed
+   and loses six others. The selection step is a model choosing a subset, not a
+   ranking prefix, so a bigger budget reshuffles which configs get dropped rather
+   than strictly adding. Do not tune `top_k` upward expecting a monotone climb.
+
+   Full reachability exists but is degenerate: at `top_k` >= the prompt budget the
+   model selects nothing, the slate *is* the pruned prompt, and containment is
+   64/64 by construction — at 97% of the legal space, which is to say you have
+   given up pre-selection and are back to an exhaustive sweep. 64 is the knee:
+   97% of the optima for 72% of the space. Choose the last 2 shapes or the
+   pruning, not both.
+
 4. At `token <= 8` on an inline-quant shape, always include an `_hpf` candidate
    **and its non-`hpf` twin** — that is where the 1.20x lives and the pair makes
    the effect attributable.
