@@ -104,7 +104,14 @@ for entry in "${CASES[@]}"; do
   set -e
   printf '%s\n' "$validator_rc" > "$OUT_DIR/$case_id.exit"
 
-  git -C "$ACTIVE_WORKTREE" apply -R "$ACTIVE_PATCH"
+  # validate_pr.sh hands the worktree back in the state it was given, patch already
+  # reversed. An unconditional reverse-apply here therefore fails with "patch does not
+  # apply" on EVERY case, and under `set -e` that aborts the driver before the summary
+  # block that checks the verdicts -- so the mutant suite could never report itself green,
+  # however well the mutants were discriminated. Reverse only if the patch is still applied.
+  if git -C "$ACTIVE_WORKTREE" apply -R --check "$ACTIVE_PATCH" >/dev/null 2>&1; then
+    git -C "$ACTIVE_WORKTREE" apply -R "$ACTIVE_PATCH"
+  fi
   ACTIVE_PATCH=""
   git -C "$FLYDSL_REPO" worktree remove "$ACTIVE_WORKTREE"
   ACTIVE_WORKTREE=""
