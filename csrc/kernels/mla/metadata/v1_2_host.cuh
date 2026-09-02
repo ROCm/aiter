@@ -303,7 +303,7 @@ void get_ps_metadata_v1_2_host(const aiter_tensor_t& seqlens_qo_indptr, // [batc
                        hipMemcpyDefault));
 
     std::vector<int32_t> work_indptr_vec(work_indptr.numel(), 0);
-    std::vector<WorkInfo> work_info_vec(work_info.numel() / SizeWorkInfoInDw, WorkInfo());
+    std::vector<WorkInfo> work_info_vec(work_info.numel() / kSizeWorkInfoInDw, WorkInfo());
     std::vector<int32_t> reduce_indptr_vec(reduce_indptr.numel(), 0);
     std::vector<FinalLoc> reduce_final_map_vec(reduce_final_map.numel() / 2, FinalLoc());
     std::vector<int32_t> reduce_partial_map_vec(reduce_partial_map.numel(), 0);
