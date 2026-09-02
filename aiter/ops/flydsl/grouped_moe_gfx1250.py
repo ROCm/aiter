@@ -227,25 +227,23 @@ def _stage1_compact_dispatch_cu(
         #    64    536.2    518.1    511.7    495.1    484.9    481.9
         #   128    566.7    566.6    525.3    493.3    474.9    469.5
         #   256    817.3    786.3    796.0    796.2    770.9    759.2
-        #   512    932.0    869.9    854.4    998.3    968.6    953.0
-        #  1024   1142.0   1005.7    965.0   1076.6        -   1037.2
+        #   512    950.7    818.8    873.1
+        #  1024   1098.5    947.5    974.2
         #
         # The split at 512 is a payload-size effect, not a bandwidth one. Every
         # dispatch block rejoins the work queue as a GEMM consumer once its own
         # producer work is done, so an over-provisioned count is not wasted at
         # small tpr -- 256 tokens over 252 blocks is one token per block, and it
-        # still wins. From 512 tokens up, the payload is large enough that the
-        # cost of ``group_done`` (every dispatch block must arrive before any of
-        # them may publish readiness) outgrows what the extra blocks contribute,
-        # and 64 blocks -- 512 waves, one token per wave for the token-major
-        # walk -- is the knee.
+        # still wins. From 512 tokens up, (token, peer) dedup adds a local gather
+        # phase and 32 blocks are the knee: fewer under-feed both phases, while
+        # more delay producer rejoin and crowd GEMM consumers.
         _ = (experts_per_rank, model_dim, inter_dim)
         if mtpr > tokens:
-            dispatch_cu = 64
+            dispatch_cu = 32
         elif tokens <= 256:
             dispatch_cu = cu
         else:
-            dispatch_cu = 64
+            dispatch_cu = 32
     if world_size <= 0:
         raise ValueError("compact dispatch needs a positive world size")
     # Leave ticket 0 for the planner and at least one first-wave consumer.

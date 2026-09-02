@@ -498,23 +498,14 @@ class MegaMoEGfx1250:
         # It is slower than recv-slot dispatch at every measured size, so this
         # is a correctness/architecture switch and not a performance one.
         # Per-layer at 4 ranks, e384/topk6/hd7168, recv-slot vs fused:
-        # mtpr 64 311/480us, 128 388/469, 256 590/773, 512 605/856,
-        # 1024 648/960.
+        # mtpr 64 311/496us, 128 388/481, 256 590/780, 512 605/819,
+        # 1024 648/946.
         #
-        # What is left of the gap is the payload producer. At 512 tokens the
-        # producer's row movement prices at 302us (GEMM1 741us against 439us
-        # with the payload stores removed), against 46us for the whole of
-        # ep_dispatch_tdm, and the remaining ~440us is the floor it shares with
-        # the standalone path (GEMM plus the planner's cross-rank handshake).
-        # That 302us is 22.7MB of remote rows at ~75GB/s per rank where the
-        # standalone dispatch gets ~270GB/s, and it is throughput-bound, not
-        # latency-bound: cutting the TDM drain count 6x (the token-major walk)
-        # bought 19us of it, and deeper TDM pipelining bought nothing. Closing
-        # the rest needs fewer fabric bytes, i.e. recv-slot's (token, peer)
-        # dedup plus a destination-side gather pass -- 1.82x on the bytes, paid
-        # for with 45MB of local traffic. mtpr<=64 is the worst ratio because
-        # the planner is close to fixed cost and there is no longer a GEMM big
-        # enough to hide it.
+        # From mtpr=512 up, (token, peer) dedup cuts remote wire traffic from
+        # one row per route to one row per destination and expands it locally;
+        # at 512 this improves the prior direct compact path from 826 to 819us,
+        # and at 1024 from 964 to 951us. Smaller buckets retain direct stores
+        # because the destination gather's fixed cost exceeds the saved bytes.
         use_fused_stage1 = self._config.fused_stage1
         if use_fused_stage1:
             stream = fx.Stream(torch.cuda.current_stream())
@@ -614,7 +605,6 @@ class MegaMoEGfx1250:
             compact_regions = [
                 ("s1_workspace", self._compact_layout.nbytes),
                 ("s1_payload", max_rows * config.hidden_dim),
-                ("s1_row_scale", max_rows * scale_bytes),
                 ("s1_scale", max_rows * scale_bytes),
                 ("s1_rowmap", (max_rows + 1) * 2 * 4),
                 ("s1_m_tile_map", config.experts_per_rank * 4),
@@ -1040,7 +1030,9 @@ class MegaMoEGfx1250:
             arena_handle=self._arena.handle,
             workspace_offset=self._arena.offset("s1_workspace"),
             payload_offset=self._arena.offset("s1_payload"),
-            row_scale_offset=self._arena.offset("s1_row_scale"),
+            # Reuse recv-slot dispatch output as the deduplicated landing wire.
+            # This region is idle whenever fused stage1 bypasses _make_dispatch.
+            row_scale_offset=self._arena.offset("disp_out"),
             scale_offset=self._arena.offset("s1_scale"),
             rowmap_offset=self._arena.offset("s1_rowmap"),
             m_tile_map_offset=self._arena.offset("s1_m_tile_map"),

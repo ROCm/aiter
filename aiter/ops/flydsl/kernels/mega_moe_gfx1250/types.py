@@ -87,10 +87,10 @@ class Stage1DispatchContext:
     """Resources for compact dispatch fused into gfx1250 GEMM1.
 
     The sender-side wire remains row-major ``[fp8 payload | e8m0 scales]``.
-    Dispatch producers use the destination-owned compact plan to write each
-    route directly into the receiver's final contiguous-M payload/scale/rowmap
-    slots. GEMM1 therefore consumes ``payload`` directly; it does not gather
-    from recv slots.
+    Small buckets write each route directly into the receiver's final grouped
+    slots. Large buckets send one wire row per distinct (token, peer) into a
+    fixed landing region; destination-side workgroups expand it into the same
+    final ``payload``/``scale`` layout before GEMM1 consumes it.
 
     Arena offsets name the same regions on every rank. ``workspace`` and all
     output tensors are local views of those regions, passed explicitly so the
@@ -100,6 +100,8 @@ class Stage1DispatchContext:
     arena_handle: int
     workspace_offset: int
     payload_offset: int
+    # Legacy ABI slot; compact fused stage1 binds the reusable ``disp_out``
+    # region here as its deduplicated landing wire.
     row_scale_offset: int
     scale_offset: int
     rowmap_offset: int

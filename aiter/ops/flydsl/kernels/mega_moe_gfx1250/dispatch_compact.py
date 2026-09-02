@@ -9,68 +9,40 @@ can assign its first arrival to :func:`emit_compact_planner` and subsequent
 arrivals to :func:`emit_compact_payload`; every workgroup then rejoins the work
 queue as a consumer and gates each tile on :func:`emit_compact_wait_tile`.
 
-There is no pull phase and no receive-slot reservation.  A route is copied
-straight to the final tile-aligned row assigned by the destination planner.
-All symmetric addresses are formed with ``Window.lsa_ptr(peer, arena_offset)``;
-there is intentionally no P2P pointer table.
+Large token buckets use a fixed source-major landing layout. A wire row is sent
+once per distinct ``(token, destination peer)`` and destination-local gather
+expands it into every final grouped row. Small buckets retain direct-to-grouped
+stores because their fixed gather cost exceeds the saved fabric bytes. All
+symmetric addresses use ``Window.lsa_ptr``; there is no P2P pointer table.
 
 Synchronization invariants
 --------------------------
-* ``expected`` is a non-zero, monotonically changing generation value and
-  ``parity == generation & 1``.  ``count_done``, ``plan_ready`` and
-  ``pair_ready`` are generation values.  ``group_done`` is the one counter: the
-  planner clears it before publishing ``pair_ready`` and each producer adds one
-  once it has finished its token slice, so ``producer_blocks`` means both
-  ``pair_order`` and every row's payload are complete.
+* ``expected`` is a non-zero generation and ``parity == generation & 1``.
+  ``count_done``, ``plan_ready``, ``pair_ready`` and ``landing_done`` carry it.
+  ``group_done`` joins payload producers; ``metadata_done`` joins rowmap writers.
 * A source publishes its count-matrix stores with a system release store to
   ``count_done[parity, source]``.  A destination acquires every source slot
   before computing row bases.
 * The destination clears its current-parity tile-row counters before publishing
   ``plan_ready``. Payload producers cannot race that clear:
   they wait for that destination's plan-ready generation first.
-* Producers publish completed row counts per destination M-tile. A tile becomes
-  readable once its counter reaches that tile's valid-row count.
-* TDM tensor counters and remote scale stores are drained before tile progress
-  is incremented, so the tile counter is the only GEMM-readiness gate.
+* In dedup mode, source rank S stores token T at fixed landing slot
+  ``S*max_tokens+T``. After all source metadata is visible, up to 32 local
+  gather workgroups materialize grouped payload/scale rows.
+* Gatherers release tile-row counters only after local TDM stores drain, so the
+  existing tile counter remains GEMM's only readiness gate.
 
-Why the payload walk is token-major and readiness is not
--------------------------------------------------------
-A remote row store costs its bytes plus two TDM tensor drains.  The split was
-measured directly: issuing a second, identical (idempotent) payload store per
-row doubles the fabric bytes for +75us, while the drained store it duplicates
-costs 252us, so ~70% of a row move is drain latency and the descriptors
-themselves are nearly free -- adding the 224B scale store to an already-drained
-row costs 3.4us.
-
-So the payload walk is token-major: the wire row is staged once and stored to
-every grouped row that token owns, across peers, sharing one drain.  That takes
-the drain count from twice per route (6144 at tpr=512) to twice per token
-(1024).  This is the same effect that makes ``dispatch_tdm``'s recv-slot
-dispatch cheap -- one load, one drain, one store per distinct peer -- obtained
-without its (token, peer) slot layout, so the destination row stays the final
-compact row and no gather pass is needed.
-
-Readiness stays destination-major, in a second pass.  A tile's counter can only
-be published with one atomic by a walk whose rows are contiguous in the
-destination; token order scatters each row into a different tile.  Publishing
-inline with a token-major payload walk therefore needs a per-row atomic, which
-is what made the earlier token-major attempt cost 1747us against 1038us per
-layer and was misread at the time as a write-locality result.
-
-The input wire scale is row-major.  Payload producers stage one whole wire row
-in LDS and split it into a tightly packed payload store plus the trailing e8m0
-scales, so each expert is GEMM-readable the instant its readiness counter fires.
-Where the row-major grouped scale layout is wired up (the fused default) the
-scales are one contiguous run per grouped row and ride the same TDM engine as
-the payload.  Otherwise they scatter into the ``(Mtile, K//128, wmma_rep, 16,
-4)`` WMMA-interleaved layout with the exact address helper from
-``moe_fused_route_quant_scatter``, which cannot be contiguous and so stays on
-the vector-memory path.
+The rowmap already encodes ``source*max_tokens*topk + token*topk + k_slot``.
+Gather divides that value by ``topk`` to recover the landing slot, avoiding a
+second per-route map and its remote traffic. Row-major scales ride the TDM
+engine with payload; the forced interleaved fallback reads scales from landing
+and applies the existing WMMA address transform locally.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 
 import flydsl.expr as fx
 import mori.cco.device.flydsl as cco
@@ -100,6 +72,15 @@ LOG2_WAVE = 5
 DEFAULT_WORK_HEADS = 8
 DEFAULT_ALIGNMENT = 128
 TILE_READY_GRANULARITY = 16
+
+
+def _dedup_enabled(max_tokens: int) -> bool:
+    raw = os.environ.get("AITER_STAGE1_DEDUP", "auto").strip().lower()
+    if raw == "auto":
+        return max_tokens >= 512
+    if raw not in ("0", "1"):
+        raise ValueError("AITER_STAGE1_DEDUP must be auto, 0, or 1")
+    return raw == "1"
 
 
 def _align(value: int, alignment: int) -> int:
@@ -136,6 +117,8 @@ class CompactWorkspaceLayout:
     pair_order: int
     pair_ready: int
     group_done: int
+    metadata_done: int
+    landing_done: int
     plan_ready: int
     payload_ready: int
     tile_rows_ready: int
@@ -193,6 +176,8 @@ class CompactWorkspaceLayout:
         # of ``pair_order``; own cache line so the spin does not thrash the
         # neighbouring readiness flags.
         put("group_done", 2 * 4, alignment)
+        put("metadata_done", 2 * 4, alignment)
+        put("landing_done", 2 * npes * 4, alignment)
         put("plan_ready", 2 * npes * 4)
         put("payload_ready", 2 * experts_per_rank * 4)
         put("tile_rows_ready", 2 * tile_ready_capacity * 4)
@@ -225,6 +210,8 @@ class CompactWorkspaceLayout:
             "pair_order",
             "pair_ready",
             "group_done",
+            "metadata_done",
+            "landing_done",
             "plan_ready",
             "payload_ready",
             "tile_rows_ready",
@@ -382,6 +369,8 @@ def emit_compact_planner(
     local_cursor = _local(window, rank, arena_offset, layout.local_cursor)
     pair_ready = _local(window, rank, arena_offset, layout.pair_ready)
     group_done = _local(window, rank, arena_offset, layout.group_done)
+    metadata_done = _local(window, rank, arena_offset, layout.metadata_done)
+    landing_done = _local(window, rank, arena_offset, layout.landing_done)
     plan_ready = _local(window, rank, arena_offset, layout.plan_ready)
     payload_ready = _local(window, rank, arena_offset, layout.payload_ready)
     tile_rows_ready = _local(window, rank, arena_offset, layout.tile_rows_ready)
@@ -402,6 +391,13 @@ def emit_compact_planner(
         # Producers only touch this after they observe ``pair_ready``, which this
         # workgroup publishes strictly later, so zeroing it here cannot race.
         _store_i32(group_done, fx.Int32(parity), 0)
+        _store_i32(metadata_done, fx.Int32(parity), 0)
+    if tid < fx.Int32(npes):
+        _store_i32(
+            landing_done,
+            fx.Int32(parity) * fx.Int32(npes) + tid,
+            0,
+        )
     active_tiles = capacity_rows // tile_m
     for tile in range(tid, active_tiles, block_threads):
         _store_i32(
@@ -561,6 +557,8 @@ def emit_compact_payload(
     payload_offset: int,
     grouped_scale_offset: int,
     rowmap_offset: int,
+    landing_offset: int,
+    m_tile_map_offset: int,
     num_valid_offset: int,
     wire_stride: int,
     payload_bytes: int,
@@ -582,22 +580,12 @@ def emit_compact_payload(
     ``[payload_bytes | scale_bytes | optional wire padding]``.
     ``addr_in_weights`` is flattened f32 ``[tokens, topk]``.
 
-    The body is two passes over one block, separated by a ``group_done``
-    barrier.  The first is token-major, one token per wave: it groups that
-    token's routes into ``pair_order`` and, from the single staged wire row,
-    stores every grouped row the token owns -- so it needs every destination's
-    row plan, not just one.  The second is ``(destination, expert)``-major and
-    only writes the rowmap and publishes per-M-tile readiness; ``producer_slot``
-    partitions it by destination first, which is why at least ``npes`` producer
-    blocks are required and why ``producer_blocks`` must divide by ``npes``.
-    See the module docstring for why the two passes are split.
-
-    The full wire row is loaded by one TDM descriptor into each wave's LDS tile.
-    A TDM store lands the tightly packed grouped payload; the e8m0 scales that
-    trail it in the wire row are scattered straight into the destination's
-    WMMA-interleaved ``(Mtile, K//128, wmma_rep, 16, 4)`` layout via the shared
-    ``_scale_row_dword_base`` helper, so no separate finalize pass is needed and
-    each expert becomes GEMM-readable the moment its readiness counter fires.
+    The first pass is token-major and groups routes while sending one wire row
+    per distinct destination. The second is ``(destination, expert)``-major and
+    writes coalesced rowmap metadata. After source generations arrive, up to 32
+    workgroups gather local landing rows into grouped payload/scale, then publish
+    tile readiness. Below the automatic dedup knee, the first pass writes final
+    grouped rows directly and the second pass publishes readiness as before.
 
     ``srcmap[row]`` is ``(rank*max_tokens_per_rank + token) | (k_slot << 24)``.
     This is the format decoded by MegaMoE gemm2
@@ -630,6 +618,7 @@ def emit_compact_payload(
         )
     if topk > 1 << 8:
         raise ValueError("top-k slot encoding exceeds 8 bits")
+    dedup_on = _dedup_enabled(max_tokens_per_rank)
 
     window = cco.Window(fx.Int64(arena_handle))
     tid = fx.Int32(fx.thread_idx.x)
@@ -647,6 +636,10 @@ def emit_compact_payload(
     plan_ready = _local(window, rank, arena_offset, layout.plan_ready)
     pair_ready = _local(window, rank, arena_offset, layout.pair_ready)
     group_done = _local(window, rank, arena_offset, layout.group_done)
+    metadata_done = _local(window, rank, arena_offset, layout.metadata_done)
+    landing_done = _local(window, rank, arena_offset, layout.landing_done)
+    landing_wire = _local(window, rank, arena_offset, landing_offset)
+    local_rowmap = _local(window, rank, arena_offset, rowmap_offset)
 
     # A token's routes can land on any peer, so this block needs every
     # destination's row plan, not just the one it publishes readiness for.
@@ -698,12 +691,20 @@ def emit_compact_payload(
             wire_desc,
         )
 
-    def emit_flush(tile, source_token, destination_row, dest_pe):
-        """Store one gathered row: payload and its trailing e8m0 scales.
+    def emit_landing(tile, source_token, dest_pe):
+        """Store one wire row once for this (token, destination) pair."""
+        slot = fx.Int32(rank * max_tokens_per_rank) + source_token
+        TDM.tdm_store(
+            TDM.tdm_group0(
+                tile,
+                _peer(window, dest_pe, arena_offset, landing_offset)
+                + fx.Int64(slot) * fx.Int64(wire_stride),
+            ),
+            wire_desc,
+        )
 
-        ``dest_pe`` is a runtime peer: the walk is token-major, so consecutive
-        stores out of the one staged wire row go to different destinations.
-        """
+    def emit_direct_store(tile, source_token, destination_row, dest_pe):
+        """Legacy direct-to-grouped row path used below the dedup knee."""
         TDM.tdm_store(
             TDM.tdm_group0(
                 tile,
@@ -712,9 +713,53 @@ def emit_compact_payload(
             ),
             payload_desc,
         )
+        dst_scale = _peer(window, dest_pe, arena_offset, grouped_scale_offset)
+        if const_expr(scale_rowmajor):
+            TDM.tdm_store(
+                TDM.tdm_group0(
+                    tile + fx.Int32(payload_bytes),
+                    dst_scale + fx.Int64(destination_row) * fx.Int64(scale_bytes),
+                ),
+                scale_desc,
+            )
+        else:
+            scale_dwords = scale_bytes // 4
+            wire_scale_dw_base = fx.Int32(source_token) * fx.Int32(
+                wire_stride // 4
+            ) + fx.Int32(payload_bytes // 4)
+            for dw in range_constexpr(0, scale_dwords, WAVE):
+                dword = fx.Int32(dw) + lane
+                if dword < fx.Int32(scale_dwords):
+                    value = buffer_ops.buffer_load(
+                        _rsrc(fx.Int64(addr_in_wire)),
+                        wire_scale_dw_base + dword,
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                    row_base = _scale_row_dword_base(
+                        fx.Uint32(destination_row),
+                        c_rows_per_tile=fx.Int32(rows_per_tile),
+                        c_dst_scale_dwords_per_row=fx.Int32(dst_scale_dwords_per_row),
+                        c16_i32=fx.Int32(16),
+                    )
+                    dst_dword = row_base + fx.Uint32(dword) * fx.Uint32(rows_per_tile)
+                    buffer_ops.buffer_store(
+                        value, _rsrc(dst_scale), fx.Int32(dst_dword)
+                    )
+
+    def emit_gather_store(tile, landing_slot, destination_row):
+        """Materialize one local grouped row from its deduplicated landing row."""
+        TDM.tdm_store(
+            TDM.tdm_group0(
+                tile,
+                _local(window, rank, arena_offset, payload_offset)
+                + fx.Int64(destination_row) * fx.Int64(payload_bytes),
+            ),
+            payload_desc,
+        )
         # The e8m0 scales trail the payload in the wire row, so they arrive in LDS
         # with it and only the destination layout decides how they leave.
-        dst_scale = _peer(window, dest_pe, arena_offset, grouped_scale_offset)
+        dst_scale = _local(window, rank, arena_offset, grouped_scale_offset)
         scale_dwords = scale_bytes // 4
         if const_expr(scale_rowmajor):
             # Grouped row r's e8m0 run is contiguous at ``r*scale_bytes``, which
@@ -731,14 +776,14 @@ def emit_compact_payload(
         else:
             # The interleaved layout scatters with a ``rows_per_tile`` stride, so
             # it cannot be one contiguous run and stays on the vector path.
-            wire_scale_dw_base = fx.Int32(source_token) * fx.Int32(
+            wire_scale_dw_base = fx.Int32(landing_slot) * fx.Int32(
                 wire_stride // 4
             ) + fx.Int32(payload_bytes // 4)
             for dw in range_constexpr(0, scale_dwords, WAVE):
                 dword = fx.Int32(dw) + lane
                 if dword < fx.Int32(scale_dwords):
                     value = buffer_ops.buffer_load(
-                        _rsrc(fx.Int64(addr_in_wire)),
+                        _rsrc(landing_wire),
                         wire_scale_dw_base + dword,
                         vec_width=1,
                         dtype=T.i32,
@@ -807,13 +852,10 @@ def emit_compact_payload(
     # Phase 1: group this rank's routes by global expert and move their payload,
     # in one token-major pass, one token per wave.
     #
-    # The wire row is staged once per token and then stored to every grouped row
-    # that token owns, across peers. That is the whole point: a remote row store
-    # costs its bytes plus two tensor drains, and doubling the bytes of one store
-    # measured +75us against the +252us a second drained store costs, so the
-    # drains -- not the fabric -- were ~70% of the move. Walking routes drains
-    # twice per row (6144 times at tpr=512); walking tokens drains twice per
-    # token (1024), because the topk stores out of one staged row share a drain.
+    # The wire row is staged once per token and sent once per distinct
+    # destination peer. Multiple routes of that token to experts on the same
+    # peer share the fixed [source, token] landing row; phase 3 expands it into
+    # the final grouped rows locally.
     #
     # Grouping is fused in rather than run as its own pass so that ``position``
     # stays in a register: the store address needs the route's rank within its
@@ -859,14 +901,33 @@ def emit_compact_payload(
             if ballot(T.i32, live) != fx.Int32(0):
                 emit_load(tile, token)
                 TDM.tdm_wait(0)
-                for l in range_constexpr(topk):
-                    if readlane(T.i32, live_i, l) != fx.Int32(0):
-                        emit_flush(
-                            tile,
-                            token,
-                            fx.Int32(readlane(T.i32, destination_row, l)),
-                            fx.Int32(readlane(T.i32, dest_pe, l)),
-                        )
+                if const_expr(dedup_on):
+                    for l in range_constexpr(topk):
+                        live_l = fx.Int32(readlane(T.i32, live_i, l))
+                        dest_l = fx.Int32(readlane(T.i32, dest_pe, l))
+                        first_for_peer = live_l != fx.Int32(0)
+                        for earlier in range_constexpr(l):
+                            earlier_live = fx.Int32(
+                                readlane(T.i32, live_i, earlier)
+                            )
+                            earlier_dest = fx.Int32(
+                                readlane(T.i32, dest_pe, earlier)
+                            )
+                            first_for_peer = first_for_peer & (
+                                (earlier_live == fx.Int32(0))
+                                | (earlier_dest != dest_l)
+                            )
+                        if first_for_peer:
+                            emit_landing(tile, token, dest_l)
+                else:
+                    for l in range_constexpr(topk):
+                        if readlane(T.i32, live_i, l) != fx.Int32(0):
+                            emit_direct_store(
+                                tile,
+                                token,
+                                fx.Int32(readlane(T.i32, destination_row, l)),
+                                fx.Int32(readlane(T.i32, dest_pe, l)),
+                            )
                 # The next token reloads into this same tile.
                 TDM.tdm_wait(0)
         token = token + fx.Int32(producer_blocks * num_waves)
@@ -887,56 +948,186 @@ def emit_compact_payload(
     fx.barrier()
     comm_ops.fence_system_acquire()
 
-    # Phase 2: write the rowmap and publish readiness, per (destination, expert)
-    # task. This stays destination-major even though the payload no longer is:
-    # readiness is a per-M-tile counter, and only a walk whose rows are
-    # contiguous in the destination can publish a whole segment with one atomic.
-    # Token order would scatter each row into a different tile and force a
-    # per-row atomic, which is what made the earlier token-major payload attempt
-    # (with readiness still inline) cost 1747us against 1038us per layer.
-    task = destination_group
-    while task < fx.Int32(experts_per_rank):
-        ge = destination * fx.Int32(experts_per_rank) + task
-        source_count = _load_i32(local_hist, ge)
-        source_base = _load_i32(pair_base, ge)
-        destination_base = _load_i32(task_row_base, ge)
+    # Phase 2: write rowmap and grouped-row -> landing-row metadata remotely.
+    # This stays destination-major so each workgroup emits coalesced metadata.
+    def walk_segments(emit):
+        """Call ``emit(tile_id, segment_row, segment_count, base, dst_base)``.
 
-        # Publish progress at M-tile granularity. A source's rows for one expert
-        # are contiguous but can cross tile boundaries; complete and signal one
-        # segment before moving to the next so GEMM need not wait for the tail.
-        segment_row = fx.Int32(0)
-        while segment_row < source_count:
-            segment_dst = destination_base + segment_row
-            tile_id = segment_dst // fx.Int32(tile_m)
-            tile_end = (tile_id + fx.Int32(1)) * fx.Int32(tile_m)
-            rows_left = source_count - segment_row
-            room = tile_end - segment_dst
-            segment_count = (rows_left < room).select(rows_left, room)
+        A source's rows for one expert are contiguous in the destination but can
+        cross an M-tile boundary, and readiness is per tile, so the run is cut at
+        those boundaries.
+        """
+        task = destination_group
+        while task < fx.Int32(experts_per_rank):
+            ge = destination * fx.Int32(experts_per_rank) + task
+            source_count = _load_i32(local_hist, ge)
+            source_base = _load_i32(pair_base, ge)
+            destination_base = _load_i32(task_row_base, ge)
+            segment_row = fx.Int32(0)
+            while segment_row < source_count:
+                segment_dst = destination_base + segment_row
+                tile_id = segment_dst // fx.Int32(tile_m)
+                tile_end = (tile_id + fx.Int32(1)) * fx.Int32(tile_m)
+                rows_left = source_count - segment_row
+                room = tile_end - segment_dst
+                segment_count = (rows_left < room).select(rows_left, room)
+                emit(
+                    tile_id,
+                    segment_row,
+                    segment_count,
+                    source_base,
+                    destination_base,
+                )
+                segment_row = segment_row + segment_count
+            task = task + fx.Int32(producers_per_destination)
 
+    walk_segments(
+        lambda tile_id, segment_row, segment_count, source_base, destination_base: (
             emit_segment_rowmap(
                 segment_row, segment_count, source_base, destination_base
             )
+        )
+    )
 
-            # One elected publisher per segment, not one per wave: the release
-            # fence and the remote atomic are both far more expensive than the
-            # barrier that lets thread 0 speak for the workgroup (publishing
-            # per-wave counts instead measured 1455us against 806us).
-            comm_ops.waitcnt_all()
-            fx.barrier()
-            if tid == fx.Int32(0):
-                comm_ops.fence_system_release()
-                remote_tile_ready = _peer(
-                    window, destination, arena_offset, layout.tile_rows_ready
+    remote_tile_ready = _peer(
+        window, destination, arena_offset, layout.tile_rows_ready
+    )
+
+    def publish_direct(tile_id, segment_row, segment_count, source_base, dst_base):
+        if tid == fx.Int32(0):
+            slot = fx.Int32(parity) * fx.Int32(layout.tile_ready_capacity) + tile_id
+            comm_ops.atomic_add_system(
+                remote_tile_ready + fx.Int64(slot) * 4, segment_count
+            )
+
+    if const_expr(not dedup_on):
+        comm_ops.waitcnt_all()
+        fx.barrier()
+        if tid == fx.Int32(0):
+            comm_ops.fence_system_release()
+        walk_segments(publish_direct)
+
+    # Every source publishes one completion generation after all of its landing
+    # rows and metadata are system-visible. Destination gatherers consume only
+    # local memory after acquiring all source generations.
+    if const_expr(dedup_on):
+        comm_ops.waitcnt_all()
+        fx.barrier()
+        if tid == fx.Int32(0):
+            comm_ops.fence_system_release()
+            comm_ops.atomic_add_agent(
+                metadata_done + fx.Int64(parity) * 4, fx.Int32(1)
+            )
+            comm_ops.spin_until_eq_i32(
+                metadata_done + fx.Int64(parity) * 4, fx.Int32(producer_blocks)
+            )
+            if fx.Int32(producer_slot) == fx.Int32(0):
+                for d in range_constexpr(npes):
+                    remote_done = _peer(
+                        window, fx.Int32(d), arena_offset, layout.landing_done
+                    )
+                    slot = fx.Int32(parity) * fx.Int32(npes) + fx.Int32(rank)
+                    comm_ops.store_i32_system(
+                        remote_done, slot, fx.Int32(expected)
+                    )
+        fx.barrier()
+
+    # Phase 3: destination-local expansion. Wait until every source has landed
+    # its deduplicated rows and row mapping, then materialize grouped contiguous
+    # M. Each expert is owned by one workgroup, so its tile-ready values can be
+    # released with stores rather than contended atomics.
+    m_tile_map = _local(window, rank, arena_offset, m_tile_map_offset)
+    tile_rows_ready = _local(
+        window, rank, arena_offset, layout.tile_rows_ready
+    )
+    gather_blocks = min(32, producer_blocks) if dedup_on else 0
+    gather_active = fx.Int32(producer_slot) < fx.Int32(gather_blocks)
+    if gather_active:
+        if tid == fx.Int32(0):
+            for source in range_constexpr(npes):
+                slot = fx.Int32(parity) * fx.Int32(npes) + fx.Int32(source)
+                comm_ops.spin_until_eq_i32(
+                    landing_done + fx.Int64(slot) * 4, expected
                 )
-                slot = (
+        fx.barrier()
+        comm_ops.fence_system_acquire()
+
+    expert = gather_active.select(
+        fx.Int32(producer_slot), fx.Int32(experts_per_rank)
+    )
+    while expert < fx.Int32(experts_per_rank):
+        prev_index = (expert == fx.Int32(0)).select(
+            fx.Int32(0), expert - fx.Int32(1)
+        )
+        prev_end = _load_i32(m_tile_map, prev_index)
+        expert_start = (expert == fx.Int32(0)).select(
+            fx.Int32(0),
+            ((prev_end + fx.Int32(tile_m - 1)) // fx.Int32(tile_m))
+            * fx.Int32(tile_m),
+        )
+        expert_end = _load_i32(m_tile_map, expert)
+        expert_rows = expert_end - expert_start
+
+        row = wave
+        while row < expert_rows:
+            destination_row = expert_start + row
+            source_encoding = _load_i32(
+                local_rowmap, destination_row * fx.Int32(2)
+            )
+            landing_slot = source_encoding // fx.Int32(topk)
+            TDM.tdm_load(
+                TDM.tdm_group0(
+                    tile,
+                    landing_wire + fx.Int64(landing_slot) * fx.Int64(wire_stride),
+                ),
+                wire_desc,
+            )
+            TDM.tdm_wait(0)
+            emit_gather_store(tile, landing_slot, destination_row)
+            TDM.tdm_wait(0)
+            row = row + fx.Int32(num_waves)
+        expert = expert + fx.Int32(gather_blocks)
+
+    if gather_active:
+        comm_ops.waitcnt_all()
+        fx.barrier()
+        if tid == fx.Int32(0):
+            comm_ops.fence_system_release()
+        fx.barrier()
+
+    # Publish after the block has materialized all of its experts. This pays one
+    # system release per gather block rather than one per expert.
+    expert = gather_active.select(
+        fx.Int32(producer_slot), fx.Int32(experts_per_rank)
+    )
+    while expert < fx.Int32(experts_per_rank):
+        if tid == fx.Int32(0):
+            prev_index = (expert == fx.Int32(0)).select(
+                fx.Int32(0), expert - fx.Int32(1)
+            )
+            prev_end = _load_i32(m_tile_map, prev_index)
+            expert_start = (expert == fx.Int32(0)).select(
+                fx.Int32(0),
+                ((prev_end + fx.Int32(tile_m - 1)) // fx.Int32(tile_m))
+                * fx.Int32(tile_m),
+            )
+            expert_end = _load_i32(m_tile_map, expert)
+            segment_start = expert_start
+            while segment_start < expert_end:
+                tile_id = segment_start // fx.Int32(tile_m)
+                tile_end = (tile_id + fx.Int32(1)) * fx.Int32(tile_m)
+                segment_end = (expert_end < tile_end).select(expert_end, tile_end)
+                ready_slot = (
                     fx.Int32(parity) * fx.Int32(layout.tile_ready_capacity)
                     + tile_id
                 )
-                comm_ops.atomic_add_system(
-                    remote_tile_ready + fx.Int64(slot) * 4, segment_count
+                comm_ops.store_i32_system(
+                    tile_rows_ready,
+                    ready_slot,
+                    segment_end - segment_start,
                 )
-            segment_row = segment_row + segment_count
-        task = task + fx.Int32(producers_per_destination)
+                segment_start = segment_end
+        expert = expert + fx.Int32(gather_blocks)
 
 
 @traced

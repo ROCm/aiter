@@ -846,6 +846,12 @@ def launch_gemm_a8w4_tdm(
                         rowmap_offset=(
                             dispatch_rowmap_offset - dispatch_workspace_offset
                         ),
+                        landing_offset=(
+                            dispatch_row_scale_offset - dispatch_workspace_offset
+                        ),
+                        m_tile_map_offset=(
+                            dispatch_m_tile_map_offset - dispatch_workspace_offset
+                        ),
                         num_valid_offset=(
                             dispatch_num_valid_offset - dispatch_workspace_offset
                         ),
