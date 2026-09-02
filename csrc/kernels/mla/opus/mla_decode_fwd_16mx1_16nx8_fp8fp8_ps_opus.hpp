@@ -17,20 +17,28 @@
 //       LDS by ds_read_b64_tr_b8 straight into the PV MFMA operand; descale_k is applied
 //       once, on the output.
 //
-// Software pipeline: 4 LDS slots, one phase per KV tile, 4 stages, exactly ONE s_barrier
-// per phase (stage0). Phases are unrolled in pairs so the two score buffers alternate as
-// compile-time v_s[0]/v_s[1], never a runtime index. Softmax is split head/tail so its
-// VALU rides in a neighbouring MFMA's shadow. Per phase, tile t:
-//   stage0 [mem]     s_waitcnt_vmcnt + barrier (publishes tile t+1); ds_read K(t); fetch
-//                    the page index for t+3, giving that gmem load a full phase of slack
-//   stage1 [compute] gemm0 QK(t) [12 MFMA]  || softmax-tail(t-1) [4 EXP + ~18 VALU]
-//   stage2 [mem]     tr_load V(t-1); mask S(t) before stage3 folds it into the softmax
-//   stage3 [compute] gemm1 PV(t-1) [32 MFMA] || softmax-head(t) + the tile t+2 prefetch,
-//                    chopped into per-d-slice chunks that ride the MFMA shadows
-// slot_of(t) = (t - tile_begin) & 3; four slots is the minimum for the distance-2
-// prefetch, since t-1 (PV still pending, and V reads out of that K slot), t (QK now),
-// t+1 (landed) and t+2 (in flight) are all resident at once. The prologue primes slots
-// 0..2 and runs a partial phase for tile_begin; the epilogue drains the last tail + PV.
+// Software pipeline: 2 LDS slots, one phase per KV tile, 4 stages, TWO s_barrier per phase.
+// Phases are unrolled in pairs so the two score buffers and the two slots alternate as
+// compile-time indices, never runtime ones. A phase runs tile t's GEMM0 against tile t-1's
+// softmax and GEMM1, so each MFMA region has independent VALU next to it. Per phase, tile t:
+//   stage0 [mem]     ds_read K(t) and tr_load V(t) out of the slot the previous phase's
+//                    barrier published; fetch the page index for t+3, one phase further out
+//                    than the tile this phase prefetches (see the two-deep page index below)
+//   stage1 [compute] gemm0 QK(t) [5 MFMA] || softmax(t-1): row max (+ the one cross-wave
+//                    exchange and its barrier), scale-sub, 8 EXP, wave-local row sum; then
+//                    P(t-1) to LDS, issue the t+2 prefetch into this slot, barrier
+//   stage2 [mem]     P(t-1) back out of LDS as GEMM1's A operand [4 ds_read_b64]
+//   stage3 [compute] gemm1 PV(t-1) [4 MFMA] || mask S(t), which stage1 of the next phase
+//                    then folds into the softmax
+// Two slots is all that fits (see the launch site), and all a phase needs: V is pulled into
+// registers in stage0, so a slot is dead after that and tile t+2 can be issued into it in
+// stage1. The prologue primes both slots and runs a partial phase for tile_begin; the
+// epilogue drains the last softmax + PV and merges the row sums.
+//
+// The row-max exchange is the only cross-wave rendezvous inside a phase, and it is
+// load-bearing twice over: it publishes the merged max, and its lgkmcnt(0) is what
+// guarantees every wave has finished reading the slot before stage1 DMAs tile t+2 into it.
+// The row SUM used to have a second exchange of its own; it does not need one (merge_row_sum).
 //
 // WHERE THE TIME GOES AT THE SHAPES THIS KERNEL IS DISPATCHED FOR: not here. At
 // b=256 c=8192 page_size=1 the kernel runs at 228 us and moves 1.35 GB of DRAM read traffic
@@ -71,17 +79,20 @@
 // (the mask sits behind a scalar branch only the last tile takes), and stage1's prefetch is
 // ~27 issue-bound instructions with no MFMA in reach -- but every way of filling them is a
 // regression, measured best-of-3 at b=32/128/256 and at page_size 1 and 4:
-//   * KV prefetch into stage3's PV shadow: +1.4%. Into the QK shadow above softmax: +10%.
-//     Neither is a scheduling failure. `nxt_page` is a gmem load, so consuming it forces a
-//     vmcnt(0) that also drains the PREVIOUS phase's prefetch -- issue point to drain point
-//     is what sets that prefetch's latency window, and at the end of stage1 it is a full
-//     phase. Anywhere else it is shorter, and the KV stream cannot afford it.
+//   * MOVING the KV prefetch: into stage3's PV shadow, +1.4%; into the QK shadow above
+//     softmax, +10%. `nxt_page` used to be loaded and spent inside the same phase, so
+//     consuming it forced a vmcnt(0) that also drained the previous phase's prefetch, and
+//     issue point to drain point is what sets that prefetch's latency window. Moving the
+//     prefetch shortens that window and the KV stream cannot afford it. Do not move it --
+//     but note that the vmcnt(0) itself was not inherent: loading the page index a phase
+//     early (the two-deep `nxt_page` below) removes it and is worth ~1.1%.
 //   * Reusing the phase's own barriers for the two cross-wave softmax exchanges (push the
 //     row max from stage3, pull the row sum in stage2), which removes two of the seven
 //     barriers per phase and merges stage1 into one scheduling region: 4-6% slower on every
 //     shape. A barrier here is not the cost it looks like -- the wave waiting at one has a
-//     SIMD partner that is computing -- and the exchanges are part of what keeps the two
-//     wave groups' STAGGER skew from collapsing.
+//     SIMD partner that is computing. Note this is not the same as DELETING the row-sum
+//     exchange, which is what merge_row_sum does and which is worth ~1.1%: restructuring
+//     where an exchange happens costs more than the exchange, removing one outright does not.
 //   * sched_group_barrier hints (MFMA/EXP/VALU, the fmha hd192 sched_mfma_exp_valu recipe)
 //     on the QK and PV regions, at several MFMA/VALU budget splits: 0 to -0.4%, i.e. noise
 //     to slightly worse, with VGPR and spill unchanged. They do move instructions -- the
@@ -728,6 +739,15 @@ __device__ inline auto make_layout_o(int warp_id, int lane_id, int stride_o_h)
 //
 // The caller merges the raw (unscaled) max; the temperature is applied to the single scalar
 // afterwards, which commutes with max because it is positive.
+//
+// The KV prefetch is gated on this barrier too (it is what proves every wave is done reading
+// the slot the prefetch overwrites) and today sits ~59 instructions below it, at the bottom
+// of the softmax. Splitting this function so the prefetch can be issued in the barrier's
+// shadow instead was measured: pinning it 13 instructions after the barrier with a
+// sched_barrier changes nothing (+0.06%, sign varies by shape), and letting source order
+// alone place it is 9% WORSE, because the scheduler hoists the ds_read below over it and
+// sinks the prefetch 153 instructions downstream. The issue point is not a limiter at this
+// distance -- the memory queues absorb it -- so keep the simple shape.
 template <typename T, typename V, typename S>
 __device__ inline typename T::D_ACC attn_row_max(const V& v_s, S& s_m, int warp_id, int lane_id)
 {
@@ -781,10 +801,11 @@ __device__ inline void attn_exp2_slice(V& v_s)
 // in a different order and therefore rounds differently, which is harmless here: every
 // term is a positive exp2 result.
 //
-// Then the same cross-wave merge attn_row_max does, through s_l: the l_row that normalises
-// O has to cover every wave's tokens, since GEMM1 contracted over all of them.
-template <typename T, typename V, typename S>
-__device__ inline typename T::D_ACC attn_row_sum(const V& v_s, S& s_l, int warp_id, int lane_id)
+// Wave-local only: the two permlane swaps fold a query row's four lane groups together, and
+// that is where this stops. Unlike the row max, the sum is NOT merged across waves here --
+// see merge_row_sum.
+template <typename T, typename V>
+__device__ inline typename T::D_ACC attn_row_sum_local(const V& v_s)
 {
     using D_ACC                   = typename T::D_ACC;
     constexpr opus::index_t s_len = opus::vector_traits<V>::size();
@@ -806,15 +827,35 @@ __device__ inline typename T::D_ACC attn_row_sum(const V& v_s, S& s_l, int warp_
     opus::vector_t<opus::u32_t, 2> res16 = __builtin_amdgcn_permlane16_swap(
         std::bit_cast<opus::u32_t>(row_sum), std::bit_cast<opus::u32_t>(row_sum), false, true);
     row_sum = std::bit_cast<float>(res16.x) + std::bit_cast<float>(res16.y);
+    return row_sum;
+}
 
+// Cross-wave sum merge, run ONCE for the whole tile range rather than once per tile.
+//
+// The max has to be merged every tile -- the next tile's exp2 is taken against it and the
+// rescale of O follows from it -- but the sum does not. Every wave's running l_row is
+// already expressed against the same m_row, because the row-max exchange merged the max and the
+// rescale factor exp2(m_old - m_new) derived from it is therefore wave-uniform; partial sums
+// sharing an exponent stay additive, and nothing reads l_row before the normalisation at the
+// end of the work item. So the per-tile exchange bought nothing and cost a barrier, an LDS
+// round trip and the lgkmcnt(0) drain in front of it on every tile. The hand-written asm
+// kernel splits max and sum exactly this way.
+//
+// No barrier is needed in front of the store: s_l is written only here, so there is no WAR
+// to cover, and the barrier after it is what publishes all T_N slots to every wave.
+template <typename T, typename S>
+__device__ inline typename T::D_ACC
+merge_row_sum(typename T::D_ACC l_row, S& s_l, int warp_id, int lane_id)
+{
+    using D_ACC   = typename T::D_ACC;
     const int row = lane_id % T::W_M;
-    opus::store(s_l, row_sum, row * T::T_N + warp_id);
+    opus::store(s_l, l_row, row * T::T_N + warp_id);
     opus::s_waitcnt_lgkmcnt(0_I);
     __builtin_amdgcn_s_barrier();
     auto sum_warps = opus::load<T::T_N>(s_l, row * T::T_N);
-    row_sum        = D_ACC(0.0f);
-    opus::static_for<T::T_N>([&](auto i) { row_sum += sum_warps[i.value]; });
-    return row_sum;
+    D_ACC total    = D_ACC(0.0f);
+    opus::static_for<T::T_N>([&](auto i) { total += sum_warps[i.value]; });
+    return total;
 }
 
 template <typename T, typename V>
@@ -1136,7 +1177,7 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
         }
         attn_exp2_slice<T, 0, s_len>(vs);
         asm volatile("" : "+v"(vs)::);
-        l_row += attn_row_sum<T>(vs, s_l, warp_id, lane_id);
+        l_row += attn_row_sum_local<T>(vs);
     };
 
     auto stage_end_barrier = [&]() {
@@ -1153,35 +1194,37 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
         __builtin_amdgcn_sched_barrier(sched_masks::KEEP_DS_READ_ORDER);
     };
 
-    // async_load q and kv
+    // --- Prologue: stage Q and the first two KV tiles ---
+    //
+    // Indices past the end read as 0 through the kv_indices descriptor and land in a slot
+    // nobody reads.
     set_slice(v_q, vector_t<D_Q, T::VEC_Q>{0}, number<qk_rope_end>{}, number<qk_pad_end>{});
     set_slice(v_k, vector_t<D_K, T::VEC_KV>{0}, number<qk_rope_end>{}, number<qk_pad_end>{});
 
+    const int page0 = load_kv_page(tile_begin);
+    const int page1 = load_kv_page(min(tile_begin + 1, tile_end - 1));
+    int cur_page    = load_kv_page(min(tile_begin + 2, tile_end - 1));
+    int nxt_page    = load_kv_page(min(tile_begin + 3, tile_end - 1));
+
     async_load<T::VEC_Q>(g_q_nope, s_q.ptr, u_gq_nope, u_sq_nope);
-    async_load_kv(s_kv[0].ptr, load_kv_page(tile_begin));
-    s_waitcnt_vmcnt(
-        number<T::kv_buffer_load_insts>{}); // slot 0 is read below, so drain it outright
+    auto v_q_rope = load<T::VEC_Q>(g_q_rope, u_gq_rope);
+
+    // The only wait these two cost is one for the four index loads above; the Q loads issued
+    // after them stay in flight, so both tiles are on the wire within a single round trip.
+    async_load_kv(s_kv[0].ptr, page0);
+    async_load_kv(s_kv[1].ptr, page1);
+
+    // Q has landed: everything except the two KV tiles.
+    s_waitcnt_vmcnt(number<2 * T::kv_buffer_load_insts>{});
     stage_end_barrier();
 
-    // load q from smem
     set_slice(v_q, load<T::VEC_Q>(s_q, u_rq_nope), 0_I, number<qk_nope_len>{});
-    set_slice(
-        v_q, load<T::VEC_Q>(g_q_rope, u_gq_rope), number<qk_nope_len>{}, number<qk_rope_end>{});
+    set_slice(v_q, v_q_rope, number<qk_nope_len>{}, number<qk_rope_end>{});
 
-    async_load_kv(s_kv[1].ptr, load_kv_page(min(tile_begin + 1, tile_end - 1)));
+    // Slot 0 has landed; slot 1 is still in flight and is drained below.
     s_waitcnt_lgkmcnt(0_I);
     s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
     stage_end_barrier();
-
-    // if constexpr(STAGGER)
-    // {
-    //     stage_end();
-    // }
-    // Page index the first phase prefetches (tile_begin + 2, the one after the two the
-    // prologue has already staged). Indices past the end read as 0 through the kv_indices
-    // descriptor and land in a slot nobody reads.
-    int cur_page = load_kv_page(min(tile_begin + 2, tile_end - 1));
-    int nxt_page = cur_page;
 
     set_slice(v_k, load<T::VEC_KV>(s_kv[0], u_rk), 0_I, number<qk_rope_end>{});
     s_waitcnt_lgkmcnt(0_I);
@@ -1199,51 +1242,44 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     stage_end_barrier();
 
     async_load_kv(s_kv[0].ptr, cur_page);
+    constexpr int kv_read_wait = T::v_ds_read_insts < 15 ? T::v_ds_read_insts : 15;
 
     auto run_phase = [&](auto& vs_cur, auto& vs_prev, int cur_slot, int prev_slot, int t) {
-        // stage0 [mem]: load k.
+        // stage0 [mem]: K and V of tile t out of the slot the last barrier published, and the
+        // page index for t+3 -- one phase further out than the tile this phase prefetches,
+        // so the cur_page it hands on is a value that landed a phase ago.
         set_slice(v_k, load<T::VEC_KV>(s_kv[cur_slot], u_rk), 0_I, number<qk_rope_end>{});
         v_v[cur_slot] = tr_load<T::VEC_TR_V>(s_kv[cur_slot], u_rv);
-        nxt_page      = load_kv_page(t + 2);
-        s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
+        cur_page      = nxt_page;
+        nxt_page      = load_kv_page(t + 3);
+        s_waitcnt_lgkmcnt(number<kv_read_wait>{});
 
-        // stage1 [compute]: gemm0 QK(t) [12 MFMA] || softmax-tail(t-1), the whole exp side of
-        // it -- scale-sub, both halves of the exp, and the row sum. QK is 12 MFMA against
-        // PV's 4, and it neither reads nor writes tile t-1's scores, so this is the shadow
-        // worth filling. m_row already covers tile t-1: its head ran in the last stage3.
+        // stage1 [compute]: gemm0 QK(t) [5 MFMA] || the whole softmax of t-1 -- the row max
+        // and its one cross-wave exchange, scale-sub, the exp, and the wave-local row sum.
+        // QK neither reads nor writes tile t-1's scores, so this is the shadow worth filling.
         __builtin_amdgcn_s_setprio(1);
         vs_cur = mma0(v_q, v_k, 0, 0);
-        // if constexpr(!STAGGER)
-        // {
-        //     stage_end();
-        // }
         softmax_tile(vs_prev);
         auto p_prev = cast<D_K>(vs_prev);
         store<T::VEC_WRITE_P>(s_p, p_prev, u_sp);
-        async_load_kv(s_kv[cur_slot].ptr, nxt_page);
+        // Safe only after softmax_tile's barrier: its lgkmcnt(0) is what proves every wave
+        // has finished reading this slot in its stage0. Issuing it earlier, in that barrier's
+        // shadow, was measured and is not worth it -- see attn_row_max.
+        async_load_kv(s_kv[cur_slot].ptr, cur_page);
         s_waitcnt_lgkmcnt(0_I);
         s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
         stage_end_barrier();
 
-        // stage2 [mem]: V(t-1); mask S(t) before stage4's softmax head folds it in.
-        // if constexpr(STAGGER)
-        // {
-        //     stage_end();
-        // }
+        // stage2 [mem]: P(t-1) back out of LDS as GEMM1's A operand.
         load_p(v_p);
         s_waitcnt_lgkmcnt(0_I);
 
-        // stage3 [compute]: gemm1 PV(t-1) [4 MFMA] || softmax-head(t) -- the row max of the
-        // scores stage2 has just masked, and the rebase of O and l that follows from it.
-        // This is the only part of the softmax that can sit here at all: it reads tile t,
-        // which only becomes readable in stage2, and everything after it needs its result.
-        // Leaving PV bare would waste 4 MFMA outright.
+        // stage3 [compute]: gemm1 PV(t-1) [4 MFMA] || the mask of S(t), which the next
+        // phase's stage1 folds into the softmax. Leaving PV bare would waste 4 MFMA outright.
         __builtin_amdgcn_s_setprio(1);
         v_o = mma1(v_p, v_v[prev_slot], v_o, 0, 0);
         mask_oob_scores(vs_cur, t);
         __builtin_amdgcn_s_setprio(0);
-        // nxt_page was the tile just issued into cur_slot; unused after that -- next phase
-        // recomputes its own from t+2.
     };
 
     // --- Main loop: tiles tile_begin+1 .. tile_end-1, two phases unrolled per iteration ---
@@ -1281,10 +1317,6 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     // Only this part is under the parity branch; keeping the V read and the PV outside it
     // is what keeps v_o off scratch.
     auto epilogue_tail = [&](auto& vs_last, int last_slot) {
-        // if constexpr(!STAGGER)
-        // {
-        //     stage_end();
-        // }
         softmax_tile(vs_last);
         store<T::VEC_WRITE_P>(s_p, cast<D_K>(vs_last), u_sp);
         s_waitcnt_lgkmcnt(0_I);
@@ -1304,6 +1336,10 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
         epilogue_tail(v_s[1], 1);
     else
         epilogue_tail(v_s[0], 0);
+
+    // The one cross-wave sum exchange for the whole range; until here l_row is this wave's
+    // own tokens only.
+    l_row = merge_row_sum<T>(l_row, s_l, warp_id, lane_id);
 }
 
 // --- One work item: load Q, run the tile range, normalize and store O (+ LSE) ---
