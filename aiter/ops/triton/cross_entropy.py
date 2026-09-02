@@ -45,9 +45,9 @@ def cross_entropy_forward(
     Args:
         _input:  Logits shard for this TP rank — ``[B, SQ, V_local]``.
         target:  Label indices — ``[B, SQ]``  (global vocab ids).
-        label_smoothing:  Label-smoothing factor (0 = standard CE). Only
-            correct for single-GPU (``dist_group is None``); under tensor
-            parallelism the smoothing term uses only the local vocab shard.
+        label_smoothing:  Label-smoothing factor (0 = standard CE). Must be 0
+            when ``world_size > 1`` — the smoothing term only sums the local
+            vocab shard, so it is asserted against under tensor parallelism.
         reduce_loss:  If ``True``, return a scalar loss and gradient averaged
             over the *non-ignored* rows (matching ``F.cross_entropy`` mean),
             not over all ``B*SQ`` rows.
@@ -77,12 +77,32 @@ def cross_entropy_forward(
         target = target.contiguous()
 
     rank = 0 if dist_group is None else dist.get_rank(dist_group)
+    world_size = 1 if dist_group is None else dist.get_world_size(dist_group)
+
+    # The distributed label-smoothing term only sums this rank's vocab shard,
+    # so it is incorrect under TP. Guard the known-wrong combination until a
+    # multi-process TP test covers it.
+    assert not (label_smoothing > 0 and world_size > 1), (
+        "label_smoothing > 0 is not supported with world_size > 1: the "
+        "smoothing term only covers the local vocab shard"
+    )
+
+    # Validate targets: an out-of-range label leaves X_y = -inf on every rank,
+    # which silently yields +inf loss. This is one reduction over [B*SQ] ints
+    # (a host sync), paid once per forward to avoid silent corruption.
+    valid_target = (target == ignore_idx) | ((target >= 0) & (target < V * world_size))
+    assert valid_target.all(), (
+        f"target out of range: expected in [0, {V * world_size}) or == "
+        f"ignore_idx ({ignore_idx})"
+    )
 
     # For reduce_loss, both the loss and the in-kernel gradient normalization
     # divide by the count of non-ignored rows (matching F.cross_entropy mean),
     # not by n_rows. Kept on-device as a 0-d tensor to avoid a CPU sync.
+    # clamp_min(1): an all-ignored batch would divide by 0 -> inf grad / nan
+    # loss; clamping keeps the gradient finite (0), matching PyTorch.
     if reduce_loss:
-        n_valid = (target != ignore_idx).sum()
+        n_valid = (target != ignore_idx).sum().clamp_min(1)
     else:
         n_valid = torch.ones((), dtype=torch.int64, device=_input.device)
 
@@ -99,7 +119,6 @@ def cross_entropy_forward(
         num_warps=NUM_WARPS,
     )
 
-    world_size = 1 if dist_group is None else dist.get_world_size(dist_group)
     if world_size > 1:
         gathered = torch.zeros(
             n_rows * 3 * world_size, dtype=torch.float32, device=_input.device
@@ -191,10 +210,26 @@ def cross_entropy_forward_chunked(
     world_size = 1 if dist_group is None else dist.get_world_size(dist_group)
     rank = 0 if dist_group is None else dist.get_rank(dist_group)
 
+    # See cross_entropy_forward: label smoothing is only correct single-shard.
+    assert not (label_smoothing > 0 and world_size > 1), (
+        "label_smoothing > 0 is not supported with world_size > 1: the "
+        "smoothing term only covers the local vocab shard"
+    )
+
+    # See cross_entropy_forward: reject out-of-range labels (silent +inf loss).
+    valid_target = (target_1d == ignore_idx) | (
+        (target_1d >= 0) & (target_1d < V * world_size)
+    )
+    assert valid_target.all(), (
+        f"target out of range: expected in [0, {V * world_size}) or == "
+        f"ignore_idx ({ignore_idx})"
+    )
+
     # Global non-ignored row count — every chunk normalizes its gradient by the
     # same denominator so the result matches the non-chunked reduce path.
+    # clamp_min(1): avoid divide-by-zero for an all-ignored batch (see forward).
     if reduce_loss:
-        n_valid = (target_1d != ignore_idx).sum()
+        n_valid = (target_1d != ignore_idx).sum().clamp_min(1)
     else:
         n_valid = torch.ones((), dtype=torch.int64, device=_input.device)
 
@@ -270,24 +305,22 @@ def cross_entropy_backward(
     grad_output: torch.Tensor,
     is_cg_capturable: bool = False,
 ):
-    """Backward pass: scale pre-computed gradient by ``grad_output``.
+    """Backward pass: scale the pre-computed gradient by ``grad_output``.
 
-    If ``grad_output`` is a scalar 1.0 (and not CUDA-graph capturable),
-    the multiplication is skipped as an optimisation.
+    Always launches the scale kernel. A ``grad_output == 1.0`` fast path is
+    deliberately avoided: detecting it needs ``torch.equal`` (a host sync on
+    every backward, and a dtype-sensitive miss under bf16) which costs more
+    than the single elementwise multiply it would skip.
 
     Args:
         _input:  Gradient tensor stored during forward (``[B, SQ, V_local]``).
         grad_output:  Upstream gradient.
-        is_cg_capturable:  Whether the operation must be CUDA-graph safe.
+        is_cg_capturable:  Retained for call-site compatibility; the kernel
+            launch is CUDA-graph safe regardless, so it no longer gates a path.
 
     Returns:
         Gradient w.r.t. the logits, same shape as ``_input``.
     """
-    if not is_cg_capturable and torch.equal(
-        grad_output, torch.tensor(1.0, device=grad_output.device)
-    ):
-        return _input
-
     B, SQ, V = _input.shape
     n_rows = B * SQ
 

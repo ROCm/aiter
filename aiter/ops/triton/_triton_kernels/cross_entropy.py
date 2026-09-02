@@ -19,8 +19,21 @@ Three kernels are provided:
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-@triton.jit
+# repr keys are the integer/bool constexprs that select the compiled variant;
+# label_smoothing (a float) is intentionally excluded — a fractional value would
+# put a "." in the trace name.
+_ce_local_softmax_stats_kernel_repr = make_kernel_repr(
+    "_ce_local_softmax_stats_kernel", ["BLOCK_SIZE"]
+)
+_ce_fused_loss_grad_kernel_repr = make_kernel_repr(
+    "_ce_fused_loss_grad_kernel", ["BLOCK_SIZE", "reduce_loss"]
+)
+_ce_grad_scale_kernel_repr = make_kernel_repr("_ce_grad_scale_kernel", ["BLOCK_SIZE"])
+
+
+@triton.jit(repr=_ce_local_softmax_stats_kernel_repr)
 def _ce_local_softmax_stats_kernel(
     X_ptr,
     X_stride,
@@ -72,7 +85,7 @@ def _ce_local_softmax_stats_kernel(
     tl.store(m_d_Xy_ptr + base + 2 * m_d_Xy_stride, X_y)
 
 
-@triton.jit
+@triton.jit(repr=_ce_fused_loss_grad_kernel_repr)
 def _ce_fused_loss_grad_kernel(
     X_ptr,
     X_stride,
@@ -135,6 +148,11 @@ def _ce_fused_loss_grad_kernel(
             m_new - tl.maximum(m, m_new)
         )
         m = tl.maximum(m, m_new)
+        # Recover the target logit by max across ranks: only the owning rank
+        # loaded the real X_y; every other rank wrote -inf (see the stats
+        # kernel), so the max picks the true value. A genuinely -inf target
+        # logit (a masked vocab entry) is indistinguishable from "not my
+        # shard" — an accepted limitation of the sentinel.
         ori_Xy = tl.maximum(ori_Xy, Xy_new)
 
     n_valid: tl.float32 = 1.0
@@ -177,7 +195,7 @@ def _ce_fused_loss_grad_kernel(
     tl.store(loss_ptr, loss)
 
 
-@triton.jit
+@triton.jit(repr=_ce_grad_scale_kernel_repr)
 def _ce_grad_scale_kernel(
     X_ptr,
     X_stride,

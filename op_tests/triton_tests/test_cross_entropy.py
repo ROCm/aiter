@@ -5,10 +5,6 @@
 Tests the single-GPU (dist_group=None) path of cross_entropy_forward,
 cross_entropy_forward_chunked, and cross_entropy_backward against
 torch.nn.functional.cross_entropy as the reference.
-
-The multi-GPU / TP-parallel path (world_size > 1: gathered-stat layout and
-TP label smoothing) requires a real process group and is currently NOT
-covered by any test — it needs a multi-process TP harness (follow-up).
 """
 
 import pytest
@@ -236,6 +232,31 @@ def test_cross_entropy_forward_noncontiguous_input(chunked):
     )
 
 
+def test_cross_entropy_all_ignored_finite_grad():
+    """An all-ignored batch must give a finite (zero) gradient, not Inf/NaN."""
+    B, SQ, V = 2, 4, 64
+    logits = torch.randn(B, SQ, V, device="cuda")
+    target = torch.full((B, SQ), -100, device="cuda")  # every row ignored
+
+    loss, grad = cross_entropy_forward(
+        logits.clone(), target, 0.0, reduce_loss=True, dist_group=None, ignore_idx=-100
+    )
+    assert torch.isfinite(loss).all(), f"loss not finite: {loss}"
+    assert torch.isfinite(grad).all(), "gradient has Inf/NaN"
+    assert grad.abs().max().item() == 0.0, "ignored rows must have zero gradient"
+
+
+@pytest.mark.parametrize("bad", [128, -5])  # >= V, and a negative non-ignore value
+def test_cross_entropy_forward_rejects_out_of_range_target(bad):
+    """Targets outside [0, V) (and != ignore_idx) must raise, not return +inf."""
+    B, SQ, V = 2, 4, 64
+    logits = torch.randn(B, SQ, V, device="cuda")
+    target = torch.randint(0, V, (B, SQ), device="cuda")
+    target[0, 0] = bad
+    with pytest.raises(AssertionError):
+        cross_entropy_forward(logits, target, 0.0, False, None, -100)
+
+
 def test_cross_entropy_backward_rejects_bad_grad_shape():
     """grad_output whose numel is neither 1 nor n_rows must raise."""
     B, SQ, V = 2, 4, 64
@@ -278,8 +299,8 @@ def test_cross_entropy_backward_grad_scale():
     torch.testing.assert_close(grad_out, grad_stored_copy * 2.5, atol=1e-5, rtol=1e-5)
 
 
-def test_cross_entropy_backward_identity_skip():
-    """grad_output == 1.0 must return the gradient tensor unchanged (fast path)."""
+def test_cross_entropy_backward_unit_grad_output():
+    """grad_output == 1.0 leaves the gradient unchanged (scale by 1 is exact)."""
     B, SQ, V = 2, 4, 64
     logits = torch.randn(B, SQ, V, device="cuda")
     target = torch.randint(0, V, (B, SQ), device="cuda")
@@ -288,10 +309,7 @@ def test_cross_entropy_backward_identity_skip():
         logits.clone(), target, 0.0, False, None, -100
     )
     grad_id = torch.tensor(1.0, device="cuda")
-    result = cross_entropy_backward(
-        grad_stored.clone(), grad_id, is_cg_capturable=False
-    )
-    # fast path: returns the tensor without launching the scale kernel
+    result = cross_entropy_backward(grad_stored.clone(), grad_id)
     torch.testing.assert_close(result, grad_stored, atol=0, rtol=0)
 
 
