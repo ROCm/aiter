@@ -192,6 +192,10 @@ _FP8_MIN_NUMEL = 128 * 2048
 # bench reports the same availability aiter does.
 if is_flydsl_available():
     from aiter.ops.flydsl import QRInt4
+    from aiter.ops.flydsl.kernels.all_reduce_1stage import (
+        MAX_PAYLOAD_BYTES as _FLY1S_MAX_BYTES,
+    )
+    from aiter.ops.flydsl.kernels.all_reduce_1stage import OneShotAllReduce
     from aiter.ops.flydsl.kernels.qr_int4 import (
         ALGORITHMS,
         MIN_PAYLOAD_BYTES,
@@ -202,7 +206,9 @@ if is_flydsl_available():
     HAS_FLY_INT4 = True
 else:
     QRInt4 = None
+    OneShotAllReduce = None
     MIN_PAYLOAD_BYTES = 0
+    _FLY1S_MAX_BYTES = 0
     _FLY_MIN_BYTES = {}
     has_xgmi_peer_links = None
     HAS_FLY_INT4 = False
@@ -274,11 +280,20 @@ class Candidate:
     # own IPC inbox, so two rows can differ only in tuning.
     super_tile: int | None = None
     grid_cap: int | None = None
+    # OneShotAllReduce tuning knobs, family == "fly1s". Same rule: a distinct
+    # value means a distinct engine with its own inbox.
+    atoms: int | None = None
+    fanout: str | None = None
 
     @property
     def fly_cfg(self) -> tuple:
         """Identity of the QRInt4 engine this candidate needs."""
         return (self.algorithm, self.super_tile, self.grid_cap)
+
+    @property
+    def fly1s_cfg(self) -> tuple:
+        """Identity of the OneShotAllReduce engine this candidate needs."""
+        return (self.atoms, self.grid_cap, self.fanout)
 
 
 # Floors sit ~5 dB below what each candidate measures on a healthy gfx950 build
@@ -296,6 +311,24 @@ CANDIDATES = (
     Candidate("qr_int4", "qr", 14.0, False, quant="INT4"),  # 18.3 / 18.3
     Candidate("qr_int3", "qr", 8.0, False, quant="INT3"),  # 12.2 / 12.2
     Candidate("fly_int4", "fly", 15.0, False),  # 19.2 / n/a
+    # Exact FlyDSL one-shot: no codec, fp32 accumulate, one rounding, so it
+    # lands at the same bf16 floor as cdr and shares its 40 dB gate and its
+    # `exact=True` checkAllclose. Decode-only -- it pushes the whole payload to
+    # every peer, so it is gated *above* by MAX_PAYLOAD_BYTES rather than below
+    # like the quantized rows.
+    Candidate("fly_1stage", "fly1s", 40.0, True),  # 55 / n/a
+    # Block-count sweep. The TP8 data says cdr runs 7-8x more blocks than
+    # cdr_naive at no measurable cost, which is evidence *against* the
+    # small-grid theory -- these rows re-test it on a kernel we control.
+    Candidate("fly_1stage_g8", "fly1s", 40.0, True, grid_cap=8),
+    Candidate("fly_1stage_g32", "fly1s", 40.0, True, grid_cap=32),
+    # A fatter-tile row (atoms=4, a 16 KiB tile, a quarter the blocks and a
+    # quarter the flags) belongs here and is deliberately absent: atoms>1 is
+    # currently incorrect, see SUPPORTED_ATOMS in all_reduce_1stage_kernel.py.
+    # Fanout order: "atom" spreads consecutive stores across peers instead of
+    # handing each destination a contiguous run. Expected to matter on xGMI,
+    # where the native packet is 64 B, and to lose on PCIe.
+    Candidate("fly_1stage_fa", "fly1s", 40.0, True, fanout="atom"),
     # Same kernel family, ring schedule. Its floor is lower than fly_int4's
     # because the ring's reduce-scatter lap requantizes N-1 times where two-shot
     # requantizes once; measured 18.7 dB at TP4 (against 19.2), and *better*
@@ -414,6 +447,16 @@ def applicable(cand: Candidate, world_size: int, dtype, numel: int, nbytes: int)
             and world_size in _FLY_WORLDS
             and dtype == dtypes.bf16
             and nbytes >= floor
+        )
+    if cand.family == "fly1s":
+        # Gated from above, not below: OneShotAllReduce.allreduce refuses
+        # payloads over its ceiling because wire volume is (N-1)x the message.
+        return (
+            HAS_FLY_INT4
+            and get_gfx() in _FLY_ARCHS
+            and world_size in _FLY_WORLDS
+            and dtype == dtypes.bf16
+            and nbytes <= _FLY1S_MAX_BYTES
         )
     return True  # rccl
 
@@ -552,7 +595,7 @@ def production_path(ca_comm, qr_comm, x, world_size: int, prod_regime: str | Non
     return "rccl"
 
 
-def _build_thunks(cands, *, ca_comm, qr_comm, fly, group, x):
+def _build_thunks(cands, *, ca_comm, qr_comm, fly, fly1s, group, x):
     """Zero-arg thunks, one per candidate, each returning the all-reduced tensor.
 
     Every candidate owns its output buffer so none of them alias, and the QR
@@ -590,6 +633,13 @@ def _build_thunks(cands, *, ca_comm, qr_comm, fly, group, x):
                 return o
 
             thunks[cand.key] = _fly
+        elif cand.family == "fly1s":
+
+            def _fly1s(o=out, eng=fly1s[cand.fly1s_cfg]):
+                eng.allreduce(x, o)
+                return o
+
+            thunks[cand.key] = _fly1s
         else:
 
             def _rccl(o=out):
@@ -615,6 +665,7 @@ def _bench_shape(
     ca_comm,
     qr_comm,
     fly,
+    fly1s,
     keys,
     prod_regime,
 ):
@@ -630,9 +681,16 @@ def _bench_shape(
         and applicable(c, tp_size, dtype, x.numel(), nbytes)
         and not (c.family == "qr" and qr_comm is None)
         and not (c.family == "fly" and c.fly_cfg not in fly)
+        and not (c.family == "fly1s" and c.fly1s_cfg not in fly1s)
     ]
     thunks, buffers = _build_thunks(
-        cands, ca_comm=ca_comm, qr_comm=qr_comm, fly=fly, group=group, x=x
+        cands,
+        ca_comm=ca_comm,
+        qr_comm=qr_comm,
+        fly=fly,
+        fly1s=fly1s,
+        group=group,
+        x=x,
     )
 
     # fp32 sum of every rank's contribution, accumulated one peer at a time so
@@ -807,6 +865,47 @@ def _worker(
             fly[cfg].compile(warm, torch.empty_like(warm))
         del warm
 
+    fly1s = {}  # (atoms, grid_cap, fanout) -> OneShotAllReduce engine
+    # Same rules as the QRInt4 engines above: one per distinct config, each with
+    # its own IPC inbox, constructed in a total order because the handle
+    # exchange is a collective.
+    wanted_1s = sorted(
+        {c.fly1s_cfg for c in CANDIDATES if c.family == "fly1s" and c.key in keys},
+        key=lambda c: (
+            -1 if c[0] is None else c[0],
+            -1 if c[1] is None else c[1],
+            "" if c[2] is None else c[2],
+        ),
+    )
+    if (
+        wanted_1s
+        and HAS_FLY_INT4
+        and get_gfx() in _FLY_ARCHS
+        and tp_size in _FLY_WORLDS
+        and dtype == dtypes.bf16
+    ):
+        for cfg in wanted_1s:
+            atoms, cap, fan = cfg
+            kw = {}
+            if atoms is not None:
+                kw["atoms"] = atoms
+            if cap is not None:
+                kw["grid_cap"] = cap
+            if fan is not None:
+                kw["fanout"] = fan
+            fly1s[cfg] = OneShotAllReduce(
+                group=tp_group.cpu_group,
+                device=device,
+                rank=rank,
+                world_size=tp_size,
+                **kw,
+            )
+        warm = torch.zeros((8, DSV4_HIDDEN), dtype=dtypes.bf16, device=device)
+        for cfg in wanted_1s:
+            dist.barrier(group=group)
+            fly1s[cfg].compile(warm, torch.empty_like(warm))
+        del warm
+
     try:
         rows = [
             _bench_shape(
@@ -822,6 +921,7 @@ def _worker(
                 ca_comm=ca_comm,
                 qr_comm=qr_comm,
                 fly=fly,
+                fly1s=fly1s,
                 keys=keys,
                 prod_regime=prod_regime,
             )

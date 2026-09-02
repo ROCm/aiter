@@ -127,6 +127,9 @@ WIRE_RATIO = {
     "qr_int3": 3.0 / 16.0,
     "fly_int4": 4.0 / 16.0,
     "fly_int4_ring": 4.0 / 16.0,
+    # Exact, bf16 on the wire -- no codec, so the payload dtype is the wire
+    # dtype. The (N-1)x fan-out of a one-shot is in the *pattern*, not here.
+    "fly_1stage": 1.0,
     "rccl": 1.0,
 }
 
@@ -151,6 +154,10 @@ _FIXED_PATTERN = {
     "qr_int3": "2stage",
     "fly_int4": "2stage",
     "fly_int4_ring": "ring",
+    # Pinned rather than inherited from *predicted*: this kernel is one-shot at
+    # every size it accepts, while the cross_device_reduce dispatch it would
+    # otherwise follow switches to 2stage at 80-160 KiB.
+    "fly_1stage": "1stage",
     "rccl": "2stage",
 }
 
@@ -220,7 +227,11 @@ def round16(nbytes) -> int:
     return max(16, (int(nbytes) // 16) * 16)
 
 
-_ST_SUFFIX = re.compile(r"_st\d+$")
+# Tuning suffixes that never change the wire shape: ``_st<N>`` (two-shot/ring
+# super-tile), ``_g<N>`` (grid cap), ``_a<N>`` (atoms per thread), ``_fa``
+# (fanout order). All of them change how the bytes are scheduled, none of them
+# change how many there are or which pattern is driven.
+_ST_SUFFIX = re.compile(r"(?:_st\d+|_g\d+|_a\d+|_fa)$")
 
 
 def base_key(cand_key: str) -> str:
@@ -229,6 +240,8 @@ def base_key(cand_key: str) -> str:
     ``fly_int4_ring_st16`` puts exactly the bytes on the wire that
     ``fly_int4_ring`` does and drives the same pattern -- the super-tile changes
     how many tiles a block batches behind one publish, never the wire format.
+    The one-shot variants (``_g<N>``, ``_a<N>``, ``_fa``) are the same story:
+    block count and store order, not wire format.
 
     Resolving by prefix matters because both lookups below fall back to a
     *silent* default (ratio 1.0, pattern two-shot). A variant added in
