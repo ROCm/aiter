@@ -19,7 +19,6 @@ from typing import Any, ClassVar
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from aiter.ops.flydsl.utils import is_flydsl_available
 
 import aiter
 from aiter import dtypes, logger
@@ -36,17 +35,14 @@ from aiter.utility.mp_tuner import mp_tuner
 
 FLYDSL_TUNE_ERROR = None
 try:
-    if is_flydsl_available():
-        from aiter.ops.flydsl.gemm_kernels import (
-            SPLIT_K_SEMAPHORE_MAX_LEN,
-            flydsl_hgemm,
-            gemm_decode_bf16,
-            gemm_decode_kernel_name,
-            get_flydsl_splitk_hgemm_kernels,
-            iter_gemm_decode_configs,
-        )
-    else:
-        raise ImportError("flydsl package is not installed")
+    from aiter.ops.flydsl.gemm_kernels import (
+        SPLIT_K_SEMAPHORE_MAX_LEN,
+        flydsl_hgemm,
+        gemm_decode_bf16,
+        gemm_decode_kernel_name,
+        get_flydsl_splitk_hgemm_kernels,
+        iter_gemm_decode_configs,
+    )
 except ImportError as exc:
     flydsl_hgemm = None
     SPLIT_K_SEMAPHORE_MAX_LEN = 256
