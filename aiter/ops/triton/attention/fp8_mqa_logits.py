@@ -11,6 +11,7 @@ from aiter.ops.triton.utils._triton import arch_info
 
 TRITON_VERSION = Version(triton.__version__)
 TRITON_GE_36 = TRITON_VERSION >= Version("3.6.0")
+TRITON_GE_38 = TRITON_VERSION >= Version("3.8.0")
 
 arch = arch_info.get_arch()
 _gluon_fp8_mqa_logits_kernel = None
@@ -214,7 +215,8 @@ def fp8_mqa_logits(
             use_buffer_store = True
             num_buffers = 2
             loop_variant = 0
-            waves_per_eu = 3
+            # Temporary workaround to handle register spill
+            waves_per_eu = 2 if TRITON_GE_38 else 3
             num_warps = 2
             block_kv = 64
             block_m = 2 if (num_heads <= 32 and seq_len > 4096) else 1
