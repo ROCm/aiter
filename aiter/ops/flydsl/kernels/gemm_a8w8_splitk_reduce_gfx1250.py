@@ -11,6 +11,10 @@ from flydsl.expr import gpu, ptrtoint, range_constexpr
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels.kernels_common import format_kernel_name
+from aiter.ops.flydsl.kernels.tensor_shim import (
+    AITER_FLYDSL_KERNARG_PRELOAD,
+    AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+)
 
 BLOCK = 512
 VEC = 8  # 16B per thread per slice: one BufferCopy128b in, one out
@@ -115,4 +119,8 @@ def compile_gemm_a8w8_splitk_reduce(
             stream=stream,
         )
 
+    launch.compile_hints["llvm_options"] = {
+        "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+        "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    }
     return launch
