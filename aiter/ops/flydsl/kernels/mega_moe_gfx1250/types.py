@@ -84,9 +84,11 @@ class Stage1PrequantContext:
 
 @dataclass(frozen=True, slots=True)
 class Stage1DispatchContext:
-    """Resources for compact dispatch fused into gfx1250 GEMM1.
+    """Resources shared by send-side quant+planner and gfx1250 GEMM1 stage1.
 
     The sender-side wire remains row-major ``[fp8 payload | e8m0 scales]``.
+    The existing wire-quant kernel also publishes the destination plan.
+    Stage1 then runs payload producers alongside GEMM1 consumers.
     Small buckets write each route directly into the receiver's final grouped
     slots. Large buckets send one wire row per distinct (token, peer) into a
     fixed landing region; destination-side workgroups expand it into the same

@@ -3,10 +3,9 @@
 """Wave32 compact EP dispatch emitters for the gfx1250 MegaMoE pipeline.
 
 This is the compact (destination-owned row plan) counterpart of
-``mega_moe.dispatch``.  It is deliberately a collection of emitters rather than
-a launch wrapper: the persistent kernel in ``mxfp4_preshuffle_gfx1250_tdm.py``
-can assign its first arrival to :func:`emit_compact_planner` and subsequent
-arrivals to :func:`emit_compact_payload`; every workgroup then rejoins the work
+``mega_moe.dispatch``. Send-side quant fuses :func:`emit_compact_planner` into
+the existing wire kernel; the persistent GEMM1 kernel then assigns its first
+arrivals to :func:`emit_compact_payload`. Every workgroup rejoins the work
 queue as a consumer and gates each tile on :func:`emit_compact_wait_tile`.
 
 Large token buckets use a fixed source-major landing layout. A wire row is sent
@@ -123,6 +122,7 @@ class CompactWorkspaceLayout:
     payload_ready: int
     tile_rows_ready: int
     launch_ready: int
+    prepare_ticket: int
     entry_ticket: int
     epoch_gate: int
     work_heads: int
@@ -182,6 +182,9 @@ class CompactWorkspaceLayout:
         put("payload_ready", 2 * experts_per_rank * 4)
         put("tile_rows_ready", 2 * tile_ready_capacity * 4)
         put("launch_ready", npes * 4)
+        # Quant+planner and stage1 are separate launches, so each needs its own
+        # never-reset ticket. Their generations advance once per invocation.
+        put("prepare_ticket", 8, 8)
         put("entry_ticket", 8, 8)
         put("epoch_gate", 4)
         # One cache line per queue shard/head.
@@ -216,6 +219,7 @@ class CompactWorkspaceLayout:
             "payload_ready",
             "tile_rows_ready",
             "launch_ready",
+            "prepare_ticket",
             "entry_ticket",
             "epoch_gate",
             "work_heads",
@@ -398,6 +402,12 @@ def emit_compact_planner(
             fx.Int32(parity) * fx.Int32(npes) + tid,
             0,
         )
+    if tid < fx.Int32(layout.work_head_count):
+        _store_i32(
+            _local(window, rank, arena_offset, layout.work_heads),
+            tid,
+            0,
+        )
     active_tiles = capacity_rows // tile_m
     for tile in range(tid, active_tiles, block_threads):
         _store_i32(
@@ -533,6 +543,7 @@ def emit_compact_planner(
     # from this one workgroup cost 48us that every producer waited through, while
     # the producers between them have two orders of magnitude more threads idle at
     # that moment.
+
 
 
 @traced

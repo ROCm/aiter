@@ -508,17 +508,10 @@ class MegaMoEGfx1250:
         # because the destination gather's fixed cost exceeds the saved bytes.
         use_fused_stage1 = self._config.fused_stage1
         if use_fused_stage1:
-            stream = fx.Stream(torch.cuda.current_stream())
-            warps = self._wire_quant.warps_per_block
-            self._wire_quant(
-                ptr_arg(hidden_states),
-                ptr_arg(self._wire),
-                token_count,
-                (token_count + warps - 1) // warps,
-                stream=stream,
-            )
             stage1_dispatch = self._stage1_dispatch_context()
-            recv_x = stage1_dispatch.payload
+            # grouped_moe launches the existing send-side quant kernel, now
+            # fused with the compact planner, before GEMM1 payload production.
+            recv_x = hidden_states
             recv_weights = topk_weights
             recv_ids = topk_ids
             total_recv = stage1_dispatch.num_valid[:1]
@@ -659,9 +652,10 @@ class MegaMoEGfx1250:
                 dtype=torch.uint8,
                 device=device,
             )
-            self._wire_quant = build_moe_quant_wire_module(
-                config.hidden_dim, config.wire_nbytes, "fp8"
-            )
+            if not config.fused_stage1:
+                self._wire_quant = build_moe_quant_wire_module(
+                    config.hidden_dim, config.wire_nbytes, "fp8"
+                )
 
         if config.dispatch_backend == "mori":
             # mori's geometry is a compile-time Cfg field, so it brings its own

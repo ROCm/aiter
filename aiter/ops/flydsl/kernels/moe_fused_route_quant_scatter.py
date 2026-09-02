@@ -1663,7 +1663,11 @@ def build_moe_fused_quant_preshuffle_module(
 
 
 def build_moe_quant_wire_module(
-    feat_dim: int, wire_stride: int, quant_mode: str = "fp8"
+    feat_dim: int,
+    wire_stride: int,
+    quant_mode: str = "fp8",
+    *,
+    compact_planner: dict | None = None,
 ):
     """Return a JIT launcher that quantizes tokens into an EP dispatch wire row.
 
@@ -1677,9 +1681,18 @@ def build_moe_quant_wire_module(
     receiver assigns them only after it has sorted every peer's routes by
     expert. The consumer applies it while gathering.
 
-    Launcher signature::
+    ``compact_planner`` fuses gfx1250 compact counting/planning into this same
+    kernel: workgroup 0 runs the planner, remaining workgroups keep the original
+    one-warp-per-token quant. The launch still takes ``grid_blocks`` as the
+    quant grid; the extra planner workgroup is appended here.
+
+    Launcher signature without planner::
 
         (hidden_in, wire_out, n_rows, grid_blocks, stream=...)
+
+    Launcher signature with planner::
+
+        (hidden_in, wire_out, topk_ids, n_rows, grid_blocks, stream=...)
 
       hidden_in : (n_rows*feat_dim,) bf16
       wire_out  : (n_rows*wire_stride,) uint8, per row: payload then e8m0 scales
@@ -1704,106 +1717,271 @@ def build_moe_quant_wire_module(
     block_iters = L.block_iters
     amax_shuffle_dists = L.amax_shuffle_dists
 
+    planner_on = compact_planner is not None
+    if planner_on:
+        from aiter.ops.flydsl.kernels.mega_moe_gfx1250.dispatch_compact import (
+            _load_i32,
+            _local,
+            _store_i32,
+            emit_compact_planner,
+        )
+        import mori.cco.device.flydsl as cco
+
+        planner_waves = BLOCK_THREADS // wave_size
+        if planner_waves < 2:
+            raise ValueError("compact planner fused into quant needs at least two waves")
+
     module_name = (
         f"moe_quant_wire_fd{feat_dim}_s{wire_stride}_{quant_mode}_{L.native_tag}"
+        + (
+            f"_qplan_tm{int(compact_planner['tile_m'])}"
+            f"_r{int(compact_planner['rank'])}w{int(compact_planner['npes'])}"
+            if planner_on
+            else ""
+        )
     )
 
-    @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
-    def wire_kernel(
-        hidden_in: fx.Pointer,  # (n_rows*feat_dim,) bf16
-        wire_out: fx.Pointer,  # (n_rows*wire_stride,) uint8 out
-        n_rows: Int32,
-    ):
-        i32 = T.i32
-        f32 = T.f32
+    if not planner_on:
 
-        c0_i32 = arith.constant(0, type=i32)
-        c1_i32 = arith.constant(1, type=i32)
-        c4_i32 = arith.constant(4, type=i32)
-        c23_i32 = arith.constant(23, type=i32)
-        c254_i32 = arith.constant(254, type=i32)
-        c0_f32 = arith.constant(0.0, type=f32)
+        @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
+        def wire_kernel(
+            hidden_in: fx.Pointer,  # (n_rows*feat_dim,) bf16
+            wire_out: fx.Pointer,  # (n_rows*wire_stride,) uint8 out
+            n_rows: Int32,
+        ):
+            i32 = T.i32
+            f32 = T.f32
 
-        c_wave = arith.constant(wave_size, type=i32)
-        c_payload_bytes_per_block = arith.constant(payload_bytes_per_block, type=i32)
-        c_payload_bytes_per_lane = arith.constant(payload_bytes_per_lane, type=i32)
-        c_lanes_per_block = arith.constant(lanes_per_mx_block, type=i32)
-        c_elems_per_lane = arith.constant(elems_per_lane, type=i32)
-        c_wire_stride = arith.constant(wire_stride, type=i32)
-        c_scale_row_off = arith.constant(scale_row_off, type=i32)
+            c0_i32 = arith.constant(0, type=i32)
+            c1_i32 = arith.constant(1, type=i32)
+            c4_i32 = arith.constant(4, type=i32)
+            c23_i32 = arith.constant(23, type=i32)
+            c254_i32 = arith.constant(254, type=i32)
+            c0_f32 = arith.constant(0.0, type=f32)
 
-        tid = fx.Uint32(fx.thread_idx.x)
-        bid = fx.Uint32(fx.block_idx.x)
-        warp_in_block = tid // c_wave
-        lane = tid - warp_in_block * c_wave
-        row = bid * arith.constant(warps_per_block, type=i32) + warp_in_block
+            c_wave = arith.constant(wave_size, type=i32)
+            c_payload_bytes_per_block = arith.constant(payload_bytes_per_block, type=i32)
+            c_payload_bytes_per_lane = arith.constant(payload_bytes_per_lane, type=i32)
+            c_lanes_per_block = arith.constant(lanes_per_mx_block, type=i32)
+            c_elems_per_lane = arith.constant(elems_per_lane, type=i32)
+            c_wire_stride = arith.constant(wire_stride, type=i32)
+            c_scale_row_off = arith.constant(scale_row_off, type=i32)
 
-        # Taken before the row guard: inside it the rewriter hands the branch
-        # body its captures as memrefs, which ptrtoint / the resource builder
-        # will not take.
-        wire_base = fx.Int64(ptrtoint(wire_out))
-        hidden_base = fx.Int64(ptrtoint(hidden_in))
-        wire_rsrc = ptr_rsrc(wire_out)
+            tid = fx.Uint32(fx.thread_idx.x)
+            bid = fx.Uint32(fx.block_idx.x)
+            warp_in_block = tid // c_wave
+            lane = tid - warp_in_block * c_wave
+            row = bid * arith.constant(warps_per_block, type=i32) + warp_in_block
 
-        row_in_range = fx.Uint32(row) < fx.Uint32(n_rows)
-        if row_in_range:
-            block_in_wave = fx.Uint32(lane) // fx.Uint32(c_lanes_per_block)
-            lane_in_block = lane - block_in_wave * c_lanes_per_block
-            c = SimpleNamespace(
-                i32=i32,
-                f32=f32,
-                block_iters=block_iters,
-                mx_blocks_per_wave_iter=mx_blocks_per_wave_iter,
-                mx_blocks_per_row=mx_blocks_per_row,
-                amax_shuffle_dists=amax_shuffle_dists,
-                is_fp8=is_fp8,
-                use_native=use_native,
-                use_pk8=use_pk8,
-                mx_dtype=mx_dtype,
-                c0_i32=c0_i32,
-                c1_i32=c1_i32,
-                c4_i32=c4_i32,
-                c23_i32=c23_i32,
-                c254_i32=c254_i32,
-                c0_f32=c0_f32,
-                c_wave=c_wave,
-                c_elems_per_lane=c_elems_per_lane,
-                c_payload_bytes_per_block=c_payload_bytes_per_block,
-                c_payload_bytes_per_lane=c_payload_bytes_per_lane,
-                block_in_wave=block_in_wave,
-                lane_in_block=lane_in_block,
-                is_block_lead=lane_in_block == c0_i32,
-                plain_scale=True,
-                dests=[
-                    SimpleNamespace(
-                        payload_row_i32=row,
-                        scale_row_byte_base=row * c_wire_stride + c_scale_row_off,
-                    )
-                ],
-                # Payload and scales share the row, so the payload's row stride
-                # is the whole wire row rather than just its own bytes.
-                payload_base=wire_base,
-                payload_bytes_per_row=wire_stride,
-                hidden_base=hidden_base,
-                feat_bytes_per_row=feat_dim * 2,
-                feat_row_i32=row,
-                scale_rsrc=wire_rsrc,
+            # Taken before the row guard: inside it the rewriter hands the branch
+            # body its captures as memrefs, which ptrtoint / the resource builder
+            # will not take.
+            wire_base = fx.Int64(ptrtoint(wire_out))
+            hidden_base = fx.Int64(ptrtoint(hidden_in))
+            wire_rsrc = ptr_rsrc(wire_out)
+
+            row_in_range = fx.Uint32(row) < fx.Uint32(n_rows)
+            if row_in_range:
+                block_in_wave = fx.Uint32(lane) // fx.Uint32(c_lanes_per_block)
+                lane_in_block = lane - block_in_wave * c_lanes_per_block
+                c = SimpleNamespace(
+                    i32=i32,
+                    f32=f32,
+                    block_iters=block_iters,
+                    mx_blocks_per_wave_iter=mx_blocks_per_wave_iter,
+                    mx_blocks_per_row=mx_blocks_per_row,
+                    amax_shuffle_dists=amax_shuffle_dists,
+                    is_fp8=is_fp8,
+                    use_native=use_native,
+                    use_pk8=use_pk8,
+                    mx_dtype=mx_dtype,
+                    c0_i32=c0_i32,
+                    c1_i32=c1_i32,
+                    c4_i32=c4_i32,
+                    c23_i32=c23_i32,
+                    c254_i32=c254_i32,
+                    c0_f32=c0_f32,
+                    c_wave=c_wave,
+                    c_elems_per_lane=c_elems_per_lane,
+                    c_payload_bytes_per_block=c_payload_bytes_per_block,
+                    c_payload_bytes_per_lane=c_payload_bytes_per_lane,
+                    block_in_wave=block_in_wave,
+                    lane_in_block=lane_in_block,
+                    is_block_lead=lane_in_block == c0_i32,
+                    plain_scale=True,
+                    dests=[
+                        SimpleNamespace(
+                            payload_row_i32=row,
+                            scale_row_byte_base=row * c_wire_stride + c_scale_row_off,
+                        )
+                    ],
+                    payload_base=wire_base,
+                    payload_bytes_per_row=wire_stride,
+                    hidden_base=hidden_base,
+                    feat_bytes_per_row=feat_dim * 2,
+                    feat_row_i32=row,
+                    scale_rsrc=wire_rsrc,
+                )
+                _emit_quant_block_loop(c)
+
+        @flyc.jit
+        def launch_wire(
+            hidden_in: fx.Pointer,
+            wire_out: fx.Pointer,
+            n_rows: fx.Int32,
+            grid_blocks: fx.Int32,
+            stream: fx.Stream = fx.Stream(None),  # noqa: B008
+        ):
+            wire_kernel(hidden_in, wire_out, n_rows).launch(
+                grid=(arith.index_cast(T.index, grid_blocks), 1, 1),
+                block=(BLOCK_THREADS, 1, 1),
+                stream=stream,
             )
-            _emit_quant_block_loop(c)
 
-    @flyc.jit
-    def launch_wire(
-        hidden_in: fx.Pointer,
-        wire_out: fx.Pointer,
-        n_rows: fx.Int32,
-        grid_blocks: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),  # noqa: B008
-    ):
-        wire_kernel(hidden_in, wire_out, n_rows).launch(
-            grid=(arith.index_cast(T.index, grid_blocks), 1, 1),
-            block=(BLOCK_THREADS, 1, 1),
-            stream=stream,
-        )
+    else:
+        planner = compact_planner
+        layout = planner["layout"]
+        arena_handle = int(planner["arena_handle"])
+        arena_offset = int(planner["arena_offset"])
+        rank = int(planner["rank"])
+        npes = int(planner["npes"])
+        experts_per_rank = int(planner["experts_per_rank"])
+        topk = int(planner["topk"])
+        max_tokens = int(planner["max_tokens"])
+        tile_m = int(planner["tile_m"])
+        capacity_rows = int(planner["capacity_rows"])
+        m_tile_map_offset = int(planner["m_tile_map_offset"])
+        num_valid_offset = int(planner["num_valid_offset"])
+
+        @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
+        def wire_kernel(
+            hidden_in: fx.Pointer,
+            wire_out: fx.Pointer,
+            topk_ids: fx.Pointer,
+            n_rows: Int32,
+        ):
+            tid = fx.Int32(fx.thread_idx.x)
+            bid = fx.Int32(fx.block_idx.x)
+            window = cco.Window(fx.Int64(arena_handle))
+
+            if bid == fx.Int32(0):
+                epoch_addr = _local(window, rank, arena_offset, layout.epoch_gate)
+                if tid == fx.Int32(0):
+                    ticket_addr = _local(
+                        window, rank, arena_offset, layout.prepare_ticket
+                    )
+                    generation = fx.Int64(
+                        comm_ops.atomic_add_agent(ticket_addr, fx.Int64(1))
+                    )
+                    _store_i32(epoch_addr, fx.Int32(0), fx.Int32(generation))
+                comm_ops.waitcnt_all()
+                fx.barrier()
+                generation = _load_i32(epoch_addr, fx.Int32(0))
+                emit_compact_planner(
+                    arena_handle=arena_handle,
+                    arena_offset=arena_offset,
+                    layout=layout,
+                    rank=rank,
+                    npes=npes,
+                    experts_per_rank=experts_per_rank,
+                    topk=topk,
+                    max_tokens=max_tokens,
+                    tile_m=tile_m,
+                    capacity_rows=capacity_rows,
+                    num_waves=planner_waves,
+                    addr_in_idx=fx.Int64(ptrtoint(topk_ids)),
+                    cur_tokens=n_rows,
+                    m_tile_map_offset=m_tile_map_offset,
+                    num_valid_offset=num_valid_offset,
+                    parity=generation & fx.Int32(1),
+                    expected=generation + fx.Int32(1),
+                )
+            else:
+                i32 = T.i32
+                f32 = T.f32
+                c0_i32 = arith.constant(0, type=i32)
+                c1_i32 = arith.constant(1, type=i32)
+                c4_i32 = arith.constant(4, type=i32)
+                c23_i32 = arith.constant(23, type=i32)
+                c254_i32 = arith.constant(254, type=i32)
+                c0_f32 = arith.constant(0.0, type=f32)
+                c_wave = arith.constant(wave_size, type=i32)
+                c_payload_bytes_per_block = arith.constant(
+                    payload_bytes_per_block, type=i32
+                )
+                c_payload_bytes_per_lane = arith.constant(
+                    payload_bytes_per_lane, type=i32
+                )
+                c_lanes_per_block = arith.constant(lanes_per_mx_block, type=i32)
+                c_elems_per_lane = arith.constant(elems_per_lane, type=i32)
+                c_wire_stride = arith.constant(wire_stride, type=i32)
+                c_scale_row_off = arith.constant(scale_row_off, type=i32)
+
+                warp_in_block = tid // c_wave
+                lane = tid - warp_in_block * c_wave
+                row = (bid - fx.Int32(1)) * fx.Int32(warps_per_block) + warp_in_block
+                wire_base = fx.Int64(ptrtoint(wire_out))
+                hidden_base = fx.Int64(ptrtoint(hidden_in))
+                wire_rsrc = ptr_rsrc(wire_out)
+                if fx.Uint32(row) < fx.Uint32(n_rows):
+                    block_in_wave = fx.Uint32(lane) // fx.Uint32(c_lanes_per_block)
+                    lane_in_block = lane - block_in_wave * c_lanes_per_block
+                    c = SimpleNamespace(
+                        i32=i32,
+                        f32=f32,
+                        block_iters=block_iters,
+                        mx_blocks_per_wave_iter=mx_blocks_per_wave_iter,
+                        mx_blocks_per_row=mx_blocks_per_row,
+                        amax_shuffle_dists=amax_shuffle_dists,
+                        is_fp8=is_fp8,
+                        use_native=use_native,
+                        use_pk8=use_pk8,
+                        mx_dtype=mx_dtype,
+                        c0_i32=c0_i32,
+                        c1_i32=c1_i32,
+                        c4_i32=c4_i32,
+                        c23_i32=c23_i32,
+                        c254_i32=c254_i32,
+                        c0_f32=c0_f32,
+                        c_wave=c_wave,
+                        c_elems_per_lane=c_elems_per_lane,
+                        c_payload_bytes_per_block=c_payload_bytes_per_block,
+                        c_payload_bytes_per_lane=c_payload_bytes_per_lane,
+                        block_in_wave=block_in_wave,
+                        lane_in_block=lane_in_block,
+                        is_block_lead=lane_in_block == c0_i32,
+                        plain_scale=True,
+                        dests=[
+                            SimpleNamespace(
+                                payload_row_i32=row,
+                                scale_row_byte_base=(
+                                    row * c_wire_stride + c_scale_row_off
+                                ),
+                            )
+                        ],
+                        payload_base=wire_base,
+                        payload_bytes_per_row=wire_stride,
+                        hidden_base=hidden_base,
+                        feat_bytes_per_row=feat_dim * 2,
+                        feat_row_i32=row,
+                        scale_rsrc=wire_rsrc,
+                    )
+                    _emit_quant_block_loop(c)
+
+        @flyc.jit
+        def launch_wire(
+            hidden_in: fx.Pointer,
+            wire_out: fx.Pointer,
+            topk_ids: fx.Pointer,
+            n_rows: fx.Int32,
+            grid_blocks: fx.Int32,
+            stream: fx.Stream = fx.Stream(None),  # noqa: B008
+        ):
+            wire_kernel(hidden_in, wire_out, topk_ids, n_rows).launch(
+                grid=(arith.index_cast(T.index, grid_blocks + fx.Int32(1)), 1, 1),
+                block=(BLOCK_THREADS, 1, 1),
+                stream=stream,
+            )
 
     launch_wire.compile_hints = {
         "llvm_options": {
@@ -1815,6 +1993,7 @@ def build_moe_quant_wire_module(
     # by. Published because a caller that guesses low silently drops the rows
     # past its grid -- the kernel's own bound check cannot tell the difference.
     launch_wire.warps_per_block = warps_per_block
+    launch_wire.fuses_compact_planner = planner_on
 
     return launch_wire
 

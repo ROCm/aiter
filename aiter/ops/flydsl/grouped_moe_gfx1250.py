@@ -10,10 +10,17 @@ import csv
 import functools
 import os
 
+import flydsl.expr as fx
 import torch
 
 from aiter import ActivationType, QuantType, dtypes, logger
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.kernels.mega_moe_gfx1250.dispatch_compact import (
+    compact_workspace_layout,
+)
+from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+    build_moe_quant_wire_module,
+)
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import (
     Stage1DispatchContext,
     Stage1PrequantContext,
@@ -24,6 +31,52 @@ from aiter.ops.flydsl.kernels.mxfp4_preshuffle_gfx1250_tdm import (
     WORK_QUEUE_SHARDS,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+
+
+@functools.cache
+def _fused_quant_planner_module(
+    feat_dim: int,
+    wire_stride: int,
+    arena_handle: int,
+    arena_offset: int,
+    rank: int,
+    npes: int,
+    experts_per_rank: int,
+    topk: int,
+    max_tokens: int,
+    tile_m: int,
+    max_rows: int,
+    m_tile_map_offset: int,
+    num_valid_offset: int,
+):
+    """JIT cache for send-side quant fused with the compact planner."""
+    layout = compact_workspace_layout(
+        npes=npes,
+        experts_per_rank=experts_per_rank,
+        max_tokens=max_tokens,
+        topk=topk,
+        max_rows=max_rows,
+        work_head_count=WORK_QUEUE_SHARDS,
+    )
+    return build_moe_quant_wire_module(
+        feat_dim,
+        wire_stride,
+        "fp8",
+        compact_planner={
+            "arena_handle": arena_handle,
+            "arena_offset": arena_offset,
+            "layout": layout,
+            "rank": rank,
+            "npes": npes,
+            "experts_per_rank": experts_per_rank,
+            "topk": topk,
+            "max_tokens": max_tokens,
+            "tile_m": tile_m,
+            "capacity_rows": max_rows,
+            "m_tile_map_offset": m_tile_map_offset,
+            "num_valid_offset": num_valid_offset,
+        },
+    )
 
 # Opt-in switch for the gfx1250 FlyDSL grouped-GEMM path.
 _TRUTHY_ENV = ("1", "true", "True", "yes", "YES")
@@ -212,8 +265,8 @@ def _stage1_compact_dispatch_cu(
     """Dispatch producer CTAs for fused compact Stage1.
 
     MegaMoE v2 keeps ``0 < num_dispatch_cu < num_cu`` so producers cannot fill
-    the first CU wave. The planner occupies ticket 0; the remaining
-    fused grid slots are assigned from one arrival-ticket sequence.
+    the first CU wave. The compact planner now runs in prepare; stage1 assigns
+    producer and consumer roles from its own arrival-ticket sequence.
     Override with ``AITER_FLYDSL_STAGE1_PRODUCER_BLOCKS``.
     """
     cu = _device_cu_count(device)
@@ -246,7 +299,8 @@ def _stage1_compact_dispatch_cu(
             dispatch_cu = 32
     if world_size <= 0:
         raise ValueError("compact dispatch needs a positive world size")
-    # Leave ticket 0 for the planner and at least one first-wave consumer.
+    # Keep at least one first-wave GEMM consumer. World-size divisibility leaves
+    # the same practical upper bound as the former planner-reserved layout.
     max_dispatch = cu - 2
     max_dispatch -= max_dispatch % world_size
     if max_dispatch < world_size:
@@ -276,6 +330,7 @@ def _stage1_grid_plan(
     work_queue: bool,
     gemm1_tiles: int,
     compact_dispatch: bool = False,
+    compact_plan_external: bool = False,
     grid_mult: int | None = None,
 ) -> tuple[int, bool]:
     """Persistent grid width for gemm1 and whether the plan can be fused in.
@@ -314,13 +369,13 @@ def _stage1_grid_plan(
         persist = min(persist, gemm1_tiles)
     if persist < WORK_QUEUE_SHARDS:
         persist = 0
-    # Ticket 0 plans and the next producer_blocks tickets dispatch. Compact
-    # dispatch additionally requires producers strictly below the CU count
-    # (first-wave ``producer + consumer = CU - 1``) and at least one initial
-    # consumer, matching MegaMoE v2's ``num_dispatch_cu < num_cu`` /
-    # ``grid_x > 0`` invariants. Producers and the planner rejoin that pool
-    # after their first role completes.
-    role_blocks = producer_blocks + 1
+    # The external compact prepare removes the planner ticket from stage1.
+    # Compact dispatch still keeps producers strictly below the CU count and
+    # leaves at least one initial consumer. In-kernel plans retain their
+    # original leading planner role.
+    role_blocks = producer_blocks + (
+        0 if compact_dispatch and compact_plan_external else 1
+    )
     if compact_dispatch and persist:
         cu = _device_cu_count(device)
         if producer_blocks >= cu:
@@ -965,11 +1020,12 @@ def _grouped_a8w4_tdm_moe(
         work_queue=_work_queue,
         gemm1_tiles=_gemm1_tiles,
         compact_dispatch=dispatch_on,
+        compact_plan_external=dispatch_on,
         grid_mult=_dispatch_grid_mult,
     )
     _cu = _device_cu_count(device)
     _initial_consumers = (
-        _persist - 1 - _dispatch_blocks if dispatch_on and _persist else 0
+        _persist - _dispatch_blocks if dispatch_on and _persist else 0
     )
     _first_wave_consumers = (
         max(0, _cu - 1 - _dispatch_blocks) if dispatch_on else 0
@@ -1124,6 +1180,7 @@ def _grouped_a8w4_tdm_moe(
             "dispatch_topk_ids": topk_ids,
             "dispatch_weights": topk_weight,
             "dispatch_cur_tokens": int(token_num),
+            "dispatch_plan_external": 1,
             "producer_topk": int(topk),
         }
     elif _producer_blocks:
@@ -1725,6 +1782,35 @@ def grouped_gemm_gfx1250_a8w4(
             _tdm_kw["n_warp"] = _base_nw
             _tdm_kw["m_warp2"] = _ov_mw2 if _ov_mw2 is not None else _base_mw
             _tdm_kw["n_warp2"] = _ov_nw2 if _ov_nw2 is not None else _base_nw
+        if stage1_dispatch is not None:
+            prepare_tile_m = int(_tdm_kw.get("tile_m", tile_m))
+            quant = _fused_quant_planner_module(
+                int(model_dim),
+                int(stage1_dispatch.wire_stride_bytes),
+                int(stage1_dispatch.arena_handle),
+                int(stage1_dispatch.workspace_offset),
+                int(stage1_dispatch.rank),
+                int(stage1_dispatch.world_size),
+                int(stage1_dispatch.experts_per_rank),
+                int(topk),
+                int(stage1_dispatch.max_tokens_per_rank),
+                prepare_tile_m,
+                int(stage1_dispatch.max_rows),
+                int(stage1_dispatch.m_tile_map_offset)
+                - int(stage1_dispatch.workspace_offset),
+                int(stage1_dispatch.num_valid_offset)
+                - int(stage1_dispatch.workspace_offset),
+            )
+            quant_warps = int(quant.warps_per_block)
+            quant(
+                ptr_arg(hidden_states),
+                ptr_arg(stage1_dispatch.wire),
+                ptr_arg(topk_ids),
+                int(token_num),
+                (int(token_num) + quant_warps - 1) // quant_warps,
+                stream=fx.Stream(torch.cuda.current_stream()),
+            )
+
         return _grouped_a8w4_tdm_moe(
             hidden_states,
             w1,

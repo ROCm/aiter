@@ -129,6 +129,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     dispatch_topk_ids=None,
     dispatch_weights=None,
     dispatch_cur_tokens=0,
+    dispatch_plan_external=0,
     plan_in_kernel=0,
     plan_route_max_m=0,
     plan_numel=0,
@@ -300,6 +301,7 @@ def flydsl_grouped_gemm_a8w4_masked(
             else 0
         ),
         dispatch_cur_tokens=int(dispatch_cur_tokens),
+        dispatch_plan_external=int(dispatch_plan_external),
         arg_dispatch_wire=ptr_arg(
             dispatch_context.wire if dispatch_context is not None else a
         ),
