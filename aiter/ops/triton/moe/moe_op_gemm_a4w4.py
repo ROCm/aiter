@@ -27,17 +27,9 @@ from aiter.ops.triton.moe.reduce import (
     validate_reduce_out,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.config_utils import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
-
-
-@functools.lru_cache
-def _get_a4w4_dispatch(arch: str) -> dict:
-    fpath = f"{AITER_TRITON_CONFIGS_PATH}/moe/{arch}-A4W4.json"
-    if os.path.exists(fpath):
-        with open(fpath, "r") as f:
-            return json.load(f)
-    return {}
+from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
 
 
 # -----------------------------------------------------------------------------
@@ -194,11 +186,11 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     num_xcds = 1
 
     arch = get_arch()
-    tuned = _get_a4w4_dispatch(arch)
-    key = f"bm{block_m}_n{n}_k{k}_{m2bucket(m)}"
+    bucket = m2bucket(m)
+    tuned = get_moe_dispatch("A4W4", arch, "gluon")
+    key = f"bm{block_m}_n{n}_k{k}_{bucket}"
     if key not in tuned:
         key = f"bm{block_m}_any"
-    assert key in tuned, f"no a4w4 gluon config for {arch}: {key}"
     cfg = tuned[key]
     block_n, block_k, num_buffers, num_warps = (
         cfg["block_n"],
