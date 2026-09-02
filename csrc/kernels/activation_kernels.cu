@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+// This translation unit is torch-free: define AITER_NO_TORCH_TYPES before any
+// aiter header so aiter_opus_plus.h does not pull in the c10 half/bfloat16
+// headers. The kernels use aiter::hip2opus + the _rmTorch dispatch macros, never
+// the t2opus<c10::*> specializations, so nothing here needs torch/ATen/c10.
+#define AITER_NO_TORCH_TYPES
 #include <cmath>
 
 #include "aiter_hip_common.h"
@@ -647,6 +652,404 @@ __global__ void act_and_mul_quant_kernel(
     int store_row_offset = is_fp4 ? row_offset / 2 : row_offset;
     store_vector<DTYPE_O_STORE, float, VEC_SIZE_I, 0, false, WARP_SIZE, 1, DTYPE_O>(
         buffer_out, result_float, store_row_offset, quant_scale);
+}
+
+__device__ __forceinline__ float situv2_bf16_mul_lo(uint32_t packed, float scale)
+{
+#if defined(__gfx1250__)
+    float out;
+    asm("v_fma_mix_f32_bf16 %0, %1, %2, neg(0) op_sel_hi:[1,0,0]"
+        : "=v"(out)
+        : "v"(packed), "s"(scale));
+    return out;
+#else
+    return __builtin_bit_cast(float, packed << 16) * scale;
+#endif
+}
+
+__device__ __forceinline__ float situv2_bf16_mul_hi(uint32_t packed, float scale)
+{
+#if defined(__gfx1250__)
+    float out;
+    asm("v_fma_mix_f32_bf16 %0, %1, %2, neg(0) "
+        "op_sel:[1,0,0] op_sel_hi:[1,0,0]"
+        : "=v"(out)
+        : "v"(packed), "s"(scale));
+    return out;
+#else
+    return __builtin_bit_cast(float, packed & 0xffff0000U) * scale;
+#endif
+}
+
+template <int32_t VecSize>
+__device__ __forceinline__ opus::vector_t<float, VecSize>
+situv2_activate_packed(const opus::vector_t<opus::bf16_t, VecSize>& gate,
+                       const opus::vector_t<opus::bf16_t, VecSize>& up,
+                       float beta,
+                       float gate_tanh_mul,
+                       float linear_beta,
+                       float up_tanh_mul,
+                       float& thread_max)
+{
+    static_assert(VecSize == 4 || VecSize == 8, "packed SiTUv2 supports VecSize 4 or 8");
+    constexpr float neg_log2e = -1.4426950408889634f;
+    using packed_bf16x2       = opus::vector_t<uint32_t, VecSize / 2>;
+    const auto gate_words     = __builtin_bit_cast(packed_bf16x2, gate);
+    const auto up_words       = __builtin_bit_cast(packed_bf16x2, up);
+    opus::vector_t<float, VecSize> sigmoid_g{};
+    opus::vector_t<float, VecSize> tanh_g{};
+    opus::vector_t<float, VecSize> tanh_u{};
+    opus::vector_t<float, VecSize> activated{};
+
+#pragma unroll
+    for(int j = 0; j < VecSize; j += 2)
+    {
+        const int word = j / 2;
+        sigmoid_g[j]   = situv2_bf16_mul_lo(gate_words[word], neg_log2e);
+        tanh_g[j]      = situv2_bf16_mul_lo(gate_words[word], gate_tanh_mul);
+        tanh_u[j]      = situv2_bf16_mul_lo(up_words[word], up_tanh_mul);
+        sigmoid_g[j + 1] = situv2_bf16_mul_hi(gate_words[word], neg_log2e);
+        tanh_g[j + 1]    = situv2_bf16_mul_hi(gate_words[word], gate_tanh_mul);
+        tanh_u[j + 1]    = situv2_bf16_mul_hi(up_words[word], up_tanh_mul);
+    }
+    __builtin_amdgcn_sched_barrier(0);
+
+#pragma unroll
+    for(int j = 0; j < VecSize; ++j)
+    {
+        sigmoid_g[j] = __builtin_amdgcn_exp2f(sigmoid_g[j]);
+        tanh_g[j]    = __builtin_amdgcn_exp2f(tanh_g[j]);
+        tanh_u[j]    = __builtin_amdgcn_exp2f(tanh_u[j]);
+    }
+    __builtin_amdgcn_sched_barrier(0);
+
+#pragma unroll
+    for(int j = 0; j < VecSize; ++j)
+    {
+        sigmoid_g[j] = 1.0f + sigmoid_g[j];
+        tanh_g[j]    = 1.0f + tanh_g[j];
+        tanh_u[j]    = 1.0f + tanh_u[j];
+    }
+    __builtin_amdgcn_sched_barrier(0);
+
+#pragma unroll
+    for(int j = 0; j < VecSize; ++j)
+    {
+        sigmoid_g[j] = __builtin_amdgcn_rcpf(sigmoid_g[j]);
+        tanh_g[j]    = __builtin_amdgcn_rcpf(tanh_g[j]);
+        tanh_u[j]    = __builtin_amdgcn_rcpf(tanh_u[j]);
+    }
+    __builtin_amdgcn_sched_barrier(0);
+
+#pragma unroll
+    for(int j = 0; j < VecSize; ++j)
+    {
+        const float value = (beta * (2.0f * tanh_g[j] - 1.0f) * sigmoid_g[j]) *
+                            (linear_beta * (2.0f * tanh_u[j] - 1.0f));
+        activated[j] = value;
+        thread_max   = fmaxf(thread_max, fabsf(value));
+    }
+    return activated;
+}
+
+// Scalar form of the same activation, for VecSize values the packed path does
+// not cover. The three transcendentals per element are batched into separate
+// unrolled loops with sched_barriers between them so the compiler issues the
+// exp2 block back to back instead of interleaving it with the multiplies.
+template <int32_t VecSize>
+__device__ __forceinline__ opus::vector_t<float, VecSize>
+situv2_activate_scalar(const opus::vector_t<opus::bf16_t, VecSize>& gate,
+                       const opus::vector_t<opus::bf16_t, VecSize>& up,
+                       float beta,
+                       float gate_tanh_mul,
+                       float linear_beta,
+                       float up_tanh_mul,
+                       float& thread_max)
+{
+    constexpr float neg_log2e = -1.4426950408889634f;
+    opus::vector_t<float, VecSize> activated{};
+    float trans[3 * VecSize];
+
+#pragma unroll
+    for(int j = 0; j < VecSize; ++j)
+    {
+        const float g    = opus::cast<float>(gate[j]);
+        const float u    = opus::cast<float>(up[j]);
+        trans[3 * j]     = g * neg_log2e;
+        trans[3 * j + 1] = g * gate_tanh_mul;
+        trans[3 * j + 2] = u * up_tanh_mul;
+    }
+    __builtin_amdgcn_sched_barrier(0);
+
+#pragma unroll
+    for(int j = 0; j < 3 * VecSize; ++j)
+    {
+        trans[j] = __builtin_amdgcn_exp2f(trans[j]);
+    }
+    __builtin_amdgcn_sched_barrier(0);
+
+#pragma unroll
+    for(int j = 0; j < 3 * VecSize; ++j)
+    {
+        trans[j] = 1.0f + trans[j];
+    }
+    __builtin_amdgcn_sched_barrier(0);
+
+#pragma unroll
+    for(int j = 0; j < 3 * VecSize; ++j)
+    {
+        trans[j] = __builtin_amdgcn_rcpf(trans[j]);
+    }
+    __builtin_amdgcn_sched_barrier(0);
+
+#pragma unroll
+    for(int j = 0; j < VecSize; ++j)
+    {
+        const float sigmoid_g = trans[3 * j];
+        const float tanh_g    = 2.0f * trans[3 * j + 1] - 1.0f;
+        const float tanh_u    = 2.0f * trans[3 * j + 2] - 1.0f;
+        const float value     = (beta * tanh_g * sigmoid_g) * (linear_beta * tanh_u);
+        activated[j]          = value;
+        thread_max            = fmaxf(thread_max, fabsf(value));
+    }
+    return activated;
+}
+
+// Fused SiTUv2 with per-token FP8 quantization.
+//
+// SiTUv2(g, u) =
+//   beta * tanh(g / beta) * sigmoid(g)
+//        * linear_beta * tanh(u / linear_beta)
+//
+// One CTA owns one token row. When one chunk per thread covers the row
+// (single pass) the activations stay in VGPRs; otherwise they are staged in
+// FP32 LDS. WARP_SIZE is a device compile-time constant (32 on gfx12, 64 on
+// gfx9/gfx950), so the reduction follows the native wave topology on both, and
+// a single-wave block skips the cross-wave stage entirely.
+template <int32_t BlockSize, int32_t VecSize, int32_t StaticD = 0, bool SinglePass = false>
+__global__ __launch_bounds__(BlockSize) void situv2_and_mul_quant_kernel(
+    opus::fp8_t* __restrict__ out,
+    const opus::bf16_t* __restrict__ input,
+    float* __restrict__ scale,
+    const int d,
+    const float beta,
+    const float gate_tanh_mul,
+    const float linear_beta,
+    const float up_tanh_mul)
+{
+    static_assert(VecSize == 4 || VecSize == 8 || VecSize == 16,
+                  "SiTUv2 supports VecSize 4, 8 or 16");
+    static_assert(StaticD == 0 || StaticD > 0, "StaticD must be non-negative");
+    // 448 on OCP e4m3fn, 240 on the gfx942 fnuz format -- derive it from the
+    // output type rather than hard coding the OCP bound.
+    constexpr float fp8_max   = opus::finfo<opus::fp8_t>::max();
+    const int dim             = StaticD == 0 ? d : StaticD;
+    // One chunk per thread covers the whole row, so activations stay live in
+    // VGPRs across the reduction and the full-row LDS round trip disappears.
+    // The host passes SinglePass whenever d <= BlockSize * VecSize; a static d
+    // proves it at compile time. This is independent of wave size.
+    constexpr bool register_resident =
+        SinglePass || (StaticD > 0 && BlockSize * VecSize >= StaticD);
+    // A single-wave block needs no cross-wave stage at all: the DPP wave
+    // reduction broadcasts the row max to every lane with no LDS and no
+    // barrier. BlockSize is always a whole number of waves (checked host side),
+    // because the DPP reduction cannot handle a partly populated wave.
+    constexpr bool single_wave  = BlockSize <= WARP_SIZE;
+    constexpr int32_t num_waves = BlockSize / WARP_SIZE;
+
+    const int64_t token_idx = blockIdx.x;
+    const auto* gate_ptr    = input + token_idx * 2 * dim;
+    const auto* up_ptr      = gate_ptr + dim;
+    auto* out_ptr           = out + token_idx * dim;
+
+    static constexpr int32_t load_bytes = sizeof(opus::bf16_t) * VecSize;
+    static constexpr int32_t load_chunk_bytes =
+        load_bytes % 16 == 0 ? 16 : (load_bytes % 8 == 0 ? 8 : 4);
+    auto gate_buffer = opus::make_gmem<opus::bf16_t>(
+        gate_ptr, dim * sizeof(opus::bf16_t));
+    auto up_buffer = opus::make_gmem<opus::bf16_t>(
+        up_ptr, dim * sizeof(opus::bf16_t));
+    auto out_buffer = opus::make_gmem<opus::fp8_t>(
+        out_ptr, dim * sizeof(opus::fp8_t));
+
+    extern __shared__ float activated[];
+    auto* reduce_scratch = activated + (register_resident ? 0 : dim);
+    float thread_max = 0.0f;
+    using vec_f       = opus::vector_t<float, VecSize>;
+    vec_f register_values{};
+
+    auto activate_chunk = [&](int idx) {
+        auto gate = load_vector_nbytes<
+            opus::bf16_t, VecSize, load_chunk_bytes, GROUP_NT>(gate_buffer, idx);
+        auto up = load_vector_nbytes<
+            opus::bf16_t, VecSize, load_chunk_bytes, GROUP_NT>(up_buffer, idx);
+
+        vec_f act_values{};
+        if constexpr(StaticD == 768 && (VecSize == 8 || VecSize == 4))
+        {
+            act_values = situv2_activate_packed<VecSize>(gate,
+                                                         up,
+                                                         beta,
+                                                         gate_tanh_mul,
+                                                         linear_beta,
+                                                         up_tanh_mul,
+                                                         thread_max);
+        }
+        else
+        {
+            act_values = situv2_activate_scalar<VecSize>(
+                gate, up, beta, gate_tanh_mul, linear_beta, up_tanh_mul, thread_max);
+        }
+        if constexpr(register_resident)
+        {
+            register_values = act_values;
+        }
+        else if constexpr(VecSize == 8 && StaticD != 0)
+        {
+            using vec_f4 = opus::vector_t<float, 4>;
+            auto* dst    = reinterpret_cast<vec_f4*>(activated + idx);
+            const auto* src = reinterpret_cast<const vec_f4*>(&act_values);
+            dst[0]          = src[0];
+            dst[1]          = src[1];
+        }
+        else
+        {
+            *reinterpret_cast<vec_f*>(activated + idx) = act_values;
+        }
+    };
+    if constexpr(register_resident)
+    {
+        const int idx = threadIdx.x * VecSize;
+        if(idx < dim)
+        {
+            activate_chunk(idx);
+        }
+    }
+    else if constexpr(StaticD != 0)
+    {
+        constexpr int32_t iterations =
+            (StaticD + BlockSize * VecSize - 1) / (BlockSize * VecSize);
+#pragma unroll
+        for(int iter = 0; iter < iterations; ++iter)
+        {
+            const int idx =
+                threadIdx.x * VecSize + iter * BlockSize * VecSize;
+            if(idx < StaticD)
+            {
+                activate_chunk(idx);
+            }
+        }
+    }
+    else
+    {
+        for(int idx = threadIdx.x * VecSize; idx < dim;
+            idx += BlockSize * VecSize)
+        {
+            activate_chunk(idx);
+        }
+    }
+
+    const int32_t lane_id = threadIdx.x % WARP_SIZE;
+    const int32_t wave_id = threadIdx.x / WARP_SIZE;
+    auto max_f            = [](float a, float b) { return fmaxf(a, b); };
+
+    float row_max;
+    if constexpr(single_wave)
+    {
+        // Broadcasting wave reduction: no LDS, no barrier.
+        row_max =
+            wave_reduce<float, decltype(max_f), WARP_SIZE, true>(thread_max, max_f);
+    }
+    else
+    {
+        float wave_max =
+            wave_reduce<float, decltype(max_f), WARP_SIZE, false>(thread_max, max_f);
+        if(lane_id == WARP_SIZE - 1)
+        {
+            reduce_scratch[wave_id] = wave_max;
+        }
+        __syncthreads();
+
+        if(wave_id == 0)
+        {
+            float block_max = lane_id < num_waves ? reduce_scratch[lane_id] : 0.0f;
+            block_max =
+                wave_reduce<float, decltype(max_f), WARP_SIZE, true>(block_max, max_f);
+            if(lane_id == 0)
+            {
+                reduce_scratch[0] = block_max;
+            }
+        }
+        __syncthreads();
+        row_max = reduce_scratch[0];
+    }
+
+    const float row_scale = row_max * (1.0f / fp8_max);
+    const float inv_scale =
+        row_max > 0.0f ? fp8_max * __builtin_amdgcn_rcpf(row_max) : 0.0f;
+    if(threadIdx.x == 0)
+    {
+        scale[token_idx] = row_scale;
+    }
+
+    auto quantize_chunk = [&](int idx) {
+        vec_f values{};
+        if constexpr(register_resident)
+        {
+            values = register_values;
+        }
+        else if constexpr(VecSize == 8 && StaticD != 0)
+        {
+            using vec_f4 = opus::vector_t<float, 4>;
+            const auto* src = reinterpret_cast<const vec_f4*>(activated + idx);
+            auto* dst       = reinterpret_cast<vec_f4*>(&values);
+            dst[0]          = src[0];
+            dst[1]          = src[1];
+        }
+        else
+        {
+            values = *reinterpret_cast<const vec_f*>(activated + idx);
+        }
+        store_vector<opus::fp8_t,
+                     float,
+                     VecSize,
+                     0,
+                     false,
+                     WARP_SIZE,
+                     1,
+                     opus::fp8_t>(out_buffer, values, idx, inv_scale);
+    };
+    if constexpr(register_resident)
+    {
+        const int idx = threadIdx.x * VecSize;
+        if(idx < dim)
+        {
+            quantize_chunk(idx);
+        }
+    }
+    else if constexpr(StaticD != 0)
+    {
+        constexpr int32_t iterations =
+            (StaticD + BlockSize * VecSize - 1) / (BlockSize * VecSize);
+#pragma unroll
+        for(int iter = 0; iter < iterations; ++iter)
+        {
+            const int idx =
+                threadIdx.x * VecSize + iter * BlockSize * VecSize;
+            if(idx < StaticD)
+            {
+                quantize_chunk(idx);
+            }
+        }
+    }
+    else
+    {
+        for(int idx = threadIdx.x * VecSize; idx < dim;
+            idx += BlockSize * VecSize)
+        {
+            quantize_chunk(idx);
+        }
+    }
 }
 
 template <typename T>
@@ -1327,6 +1730,211 @@ void silu_and_mul_quant(const aiter_tensor_t& out,
     {
         AITER_CHECK(false, "silu_and_mul_quant: only fp8 and fp4 output types are supported");
     }
+}
+
+template <int32_t BlockSize, int32_t VecSize, int32_t StaticD = 0, bool SinglePass = false>
+static void launch_situv2_and_mul_quant(const aiter_tensor_t& out,
+                                        const aiter_tensor_t& input,
+                                        const aiter_tensor_t& scale,
+                                        int d,
+                                        int64_t num_tokens,
+                                        float beta,
+                                        float linear_beta,
+                                        hipStream_t stream)
+{
+    constexpr float two_log2e = 2.8853900817779268f;
+    const float gate_tanh_mul = -two_log2e / beta;
+    const float up_tanh_mul   = -two_log2e / linear_beta;
+    const uint32_t wave_size = get_warp_size_func();
+    // The DPP wave reduction reads every lane of the hardware wave, so a block
+    // that is not a whole number of waves would fold in never-launched lanes
+    // and silently produce a wrong row max (measured: BlockSize 96 and 224 on
+    // wave64). Fail loudly instead.
+    AITER_CHECK(BlockSize % wave_size == 0,
+                "situv2_and_mul_quant: block size must be a whole number of waves");
+    // Must mirror the kernel's own predicates exactly, or LDS is mis-sized.
+    const bool register_resident =
+        SinglePass || (StaticD > 0 && BlockSize * VecSize >= StaticD);
+    const bool single_wave  = BlockSize <= wave_size;
+    const size_t num_waves  = (BlockSize + wave_size - 1) / wave_size;
+    // Activations need d floats unless they stay in registers; the cross-wave
+    // scratch needs num_waves floats unless the block is a single wave.
+    const size_t lds_bytes = (static_cast<size_t>(register_resident ? 0 : d) +
+                              (single_wave ? 0 : num_waves)) *
+                             sizeof(float);
+    // Both live in one dynamic allocation, so a wide row plus its scratch can
+    // outgrow the 64 KB budget even though d alone fits. Catch it here instead
+    // of at the launch, which would only report hipErrorInvalidValue.
+    AITER_CHECK(lds_bytes <= static_cast<size_t>(opus::get_smem_size()),
+                "situv2_and_mul_quant: d is too large for the LDS budget");
+    situv2_and_mul_quant_kernel<BlockSize, VecSize, StaticD, SinglePass>
+        <<<dim3(num_tokens), dim3(BlockSize), lds_bytes, stream>>>(
+            reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
+            reinterpret_cast<const opus::bf16_t*>(input.data_ptr()),
+            reinterpret_cast<float*>(scale.data_ptr()),
+            d,
+            beta,
+            gate_tanh_mul,
+            linear_beta,
+            up_tanh_mul);
+}
+
+void situv2_and_mul_quant(const aiter_tensor_t& out,
+                          const aiter_tensor_t& input,
+                          const aiter_tensor_t& scale,
+                          int group_size,
+                          float beta,
+                          float linear_beta,
+                          bool shuffle_scale)
+{
+    AITER_CHECK(!shuffle_scale,
+                "situv2_and_mul_quant: shuffle_scale is not supported");
+    AITER_CHECK(input.dim() > 0,
+                "situv2_and_mul_quant: input must have at least one dimension");
+    AITER_CHECK(input.is_gpu() && out.is_gpu() && scale.is_gpu(),
+                "situv2_and_mul_quant: all tensors must be on a GPU");
+    AITER_CHECK(input.is_contiguous() && out.is_contiguous() && scale.is_contiguous(),
+                "situv2_and_mul_quant: all tensors must be contiguous");
+    AITER_CHECK(input.dtype() == AITER_DTYPE_bf16,
+                "situv2_and_mul_quant: input must be BF16");
+    AITER_CHECK(out.dtype() == AITER_DTYPE_fp8,
+                "situv2_and_mul_quant: output must be the aiter FP8 dtype");
+    AITER_CHECK(scale.dtype() == AITER_DTYPE_fp32,
+                "situv2_and_mul_quant: scale must be FP32");
+    AITER_CHECK(input.size(-1) > 0 && input.size(-1) % 2 == 0,
+                "situv2_and_mul_quant: input last dimension must be positive and even");
+    AITER_CHECK(std::isfinite(beta) && std::isfinite(linear_beta) && beta > 0.0f &&
+                    linear_beta > 0.0f,
+                "situv2_and_mul_quant: beta and linear_beta must be finite and positive");
+
+    const int d              = input.size(-1) / 2;
+    const int64_t num_tokens = input.numel() / input.size(-1);
+    // Beyond 4096 the row no longer fits one chunk per thread, so it is staged
+    // in FP32 LDS instead. 16384 floats fill the 64 KB budget exactly, but the
+    // multi-pass path also needs one float per wave of cross-wave scratch out
+    // of the same allocation -- four of them for the widest such block (256
+    // threads on wave64) -- so the usable bound is the largest multiple of 8
+    // below 16384 - 4.
+    AITER_CHECK(d > 0 && d <= 16376 && d % 8 == 0,
+                "situv2_and_mul_quant: d must be divisible by 8 and in (0, 16376]");
+    AITER_CHECK(group_size == d,
+                "situv2_and_mul_quant: only per-token quantization "
+                "(group_size == d) is implemented");
+    AITER_CHECK(out.numel() == num_tokens * d,
+                "situv2_and_mul_quant: output shape mismatch");
+    AITER_CHECK(scale.numel() == num_tokens,
+                "situv2_and_mul_quant: expected one scale per token");
+    AITER_CHECK(out.device_id == input.device_id && scale.device_id == input.device_id,
+                "situv2_and_mul_quant: all tensors must be on the same device");
+    if(num_tokens == 0)
+    {
+        return;
+    }
+
+    HipDeviceGuard device_guard(input.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+    const uint32_t wave_size = get_warp_size_func();
+
+#define LAUNCH_SITUV2(BLOCK_SIZE, VEC_SIZE, STATIC_D)                                      \
+    launch_situv2_and_mul_quant<BLOCK_SIZE, VEC_SIZE, STATIC_D, false>(                    \
+        out, input, scale, d, num_tokens, beta, linear_beta, stream)
+// Single-pass variant: caller has proven d <= BLOCK_SIZE * VEC_SIZE, so the
+// activations stay in registers instead of round-tripping through LDS.
+#define LAUNCH_SITUV2_SP(BLOCK_SIZE, VEC_SIZE, STATIC_D)                                   \
+    launch_situv2_and_mul_quant<BLOCK_SIZE, VEC_SIZE, STATIC_D, true>(                     \
+        out, input, scale, d, num_tokens, beta, linear_beta, stream)
+
+    if(d == 768)
+    {
+        if(wave_size != 32)
+        {
+            // 64 x 16 = 1024 >= 768: single pass in a single wave64, so the
+            // row max reduces with pure DPP -- no LDS, no barrier.
+            LAUNCH_SITUV2_SP(64, 16, 768);
+            return;
+        }
+        if(num_tokens <= 128)
+        {
+            LAUNCH_SITUV2(96, 8, 768);
+        }
+        else
+        {
+            LAUNCH_SITUV2(192, 4, 768);
+        }
+        return;
+    }
+
+    if(wave_size == 32)
+    {
+        if(d <= 1024)
+        {
+            LAUNCH_SITUV2_SP(128, 8, 0);
+        }
+        else
+        {
+            LAUNCH_SITUV2(96, 8, 0);
+        }
+    }
+    // wave64 (gfx9/gfx950), tuned by sweep on gfx950. Two rules explain the
+    // whole table: size the block so one chunk per thread covers the row
+    // (single pass, activations stay in VGPRs), and make the block no wider
+    // than that -- surplus threads only sit idle and cost bandwidth. d <= 1024
+    // additionally fits in one wave, which drops LDS and both barriers.
+    // VecSize 16 needs d % 16 == 0 so a chunk never straddles the row end.
+    else if(d <= 512)
+    {
+        LAUNCH_SITUV2_SP(64, 8, 0);
+    }
+    else if(d <= 1024)
+    {
+        if(d % 16 == 0)
+        {
+            LAUNCH_SITUV2_SP(64, 16, 0);
+        }
+        else
+        {
+            LAUNCH_SITUV2_SP(128, 8, 0);
+        }
+    }
+    else if(d <= 2048)
+    {
+        LAUNCH_SITUV2_SP(256, 8, 0);
+    }
+    else if(d <= 4096)
+    {
+        if(d % 16 == 0)
+        {
+            LAUNCH_SITUV2_SP(256, 16, 0);
+        }
+        else
+        {
+            LAUNCH_SITUV2_SP(512, 8, 0);
+        }
+    }
+    // Past 4096 only VecSize 8 can still cover the row in one chunk per thread,
+    // and only with a block wider than 512. Step the block up so it stays close
+    // to d / 8 -- a loose fit leaves whole waves idle (measured at d = 4224:
+    // 5184 GB/s with 576 threads against 4440 with 1024).
+    else if(d <= 4608)
+    {
+        LAUNCH_SITUV2_SP(576, 8, 0);
+    }
+    else if(d <= 6144)
+    {
+        LAUNCH_SITUV2_SP(768, 8, 0);
+    }
+    else if(d <= 8192)
+    {
+        LAUNCH_SITUV2_SP(1024, 8, 0);
+    }
+    // Wider than any legal block: stage through LDS and sweep the row in a loop.
+    else
+    {
+        LAUNCH_SITUV2(256, 8, 0);
+    }
+
+#undef LAUNCH_SITUV2
+#undef LAUNCH_SITUV2_SP
 }
 
 void gelu_and_mul(const aiter_tensor_t& out,   // [..., d]

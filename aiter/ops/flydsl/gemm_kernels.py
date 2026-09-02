@@ -12,18 +12,16 @@ from itertools import product
 import flydsl.expr as fx
 import torch
 from flydsl.runtime.device import get_rocm_arch
-from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
 from torch import Tensor
 
 from aiter import logger
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
 from .kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
 
 # from .kernels.small_m_hgemm import iter_small_m_registry_configs
 from .kernels.tensor_shim import _run_compiled
-from .utils import get_shared_memory_per_block, is_flydsl_available
 
 __all__ = [
     "flydsl_hgemm",
@@ -42,6 +40,7 @@ FIXED_C_TO_LDS = False
 KERNEL_ASYNC_COPY = get_rocm_arch() != "gfx942"
 KERNEL_FAMILY_HGEMM = "hgemm"
 KERNEL_FAMILY_SMALL_M = "small_m"
+_HGEMM_SUPPORTED_GFX = frozenset(("gfx942", "gfx950"))
 _HGEMM_KERNEL_RE = re.compile(
     r"^flydsl_gemm(?P<stages>\d+)_"
     r"a(?P<a_dtype>[a-z0-9]+)_w(?P<w_dtype>[a-z0-9]+)_(?P<out_dtype>[a-z0-9]+)_"
@@ -311,7 +310,9 @@ def selection_filter(m, n, k, kwargs):
     BLOCK_N_WARPS = kwargs["BLOCK_N_WARPS"]
     BLOCK_K_WARPS = kwargs["BLOCK_K_WARPS"]
     B_TO_LDS = kwargs.get("B_TO_LDS", True)
-    GPU_ARCH = get_rocm_arch()
+    GPU_ARCH = get_rocm_arch().split(":", 1)[0]
+    if GPU_ARCH not in _HGEMM_SUPPORTED_GFX:
+        return False
     DTYPE_BYTES = 2
 
     def get_stage_smem_use(stages_):
@@ -323,7 +324,7 @@ def selection_filter(m, n, k, kwargs):
 
     smem_use_s0 = get_stage_smem_use(STAGES)
     # smem_use_s1 = get_stage_smem_use(STAGES + 3)
-    smem_cap = SMEM_CAPACITY_MAP[GPU_ARCH]
+    smem_cap = get_lds_capacity_bytes(GPU_ARCH)
     if not (smem_use_s0 <= smem_cap):
         return False
     return not (
@@ -371,6 +372,10 @@ def _validate_hgemm_tiling(
         "BLOCK_K_WARPS": block_k_warps,
         "B_TO_LDS": b_to_lds,
     }
+    arch = get_gfx().split(":", 1)[0]
+    if arch not in _HGEMM_SUPPORTED_GFX:
+        raise ValueError(f"FlyDSL HGEMM does not support architecture {arch!r}")
+    lds_limit = get_lds_capacity_bytes(arch)
     if not selection_filter(m, n, k, config):
         raise ValueError(
             f"Invalid tiling configuration for m={m} n={n} k={k}: {config}"
@@ -476,7 +481,6 @@ def _validate_hgemm_tiling(
         block_k_warps=block_k_warps,
         b_to_lds=b_to_lds,
     )
-    lds_limit = get_shared_memory_per_block(fallback_gfx=get_gfx())
     if lds_bytes > lds_limit:
         raise ValueError(
             "Invalid tile combination: estimated LDS usage "
@@ -946,29 +950,62 @@ def flydsl_hgemm(
 # FlyDSL preshuffle GEMM kernel management
 # ---------------------------------------------------------------------------
 
-_flydsl_compile_fn = None
-_flydsl_import_done = False
 
-
+@functools.lru_cache(maxsize=1)
 def _get_compile_fn():
-    """Lazy-import compile_preshuffle_gemm so the module loads even without FlyDSL."""
-    global _flydsl_compile_fn, _flydsl_import_done
-    if _flydsl_import_done:
-        return _flydsl_compile_fn
-    _flydsl_import_done = True
-    if not is_flydsl_available():
-        logger.info("[FlyDSL] not available, will fall back to CK/CKTile")
-        return None
-    try:
-        from .kernels.preshuffle_gemm import compile_preshuffle_gemm
+    """Import the preshuffle compiler on first use."""
+    from .kernels.preshuffle_gemm import compile_preshuffle_gemm
 
-        _flydsl_compile_fn = compile_preshuffle_gemm
-        logger.info("[FlyDSL] loaded preshuffle GEMM compiler")
-    except Exception as e:  # noqa: BLE001
-        logger.info(
-            f"[FlyDSL] preshuffle GEMM not available, will fall back to CK/CKTile: {e}"
+    logger.info("[FlyDSL] loaded preshuffle GEMM compiler")
+    return compile_preshuffle_gemm
+
+
+# Fixed size rather than one buffer per shape: a shape-keyed cache grows without
+# limit and can evict a buffer a captured CUDA graph still points at. The bounds
+# come from k_split_candidates, which keeps tile_count under CU_NUM and
+# k_split * tile_count at four per CU.
+# Mirrors preshuffle_gemm.PRESHUFFLE_M_MAX; duplicated to avoid importing the
+# compiler module before the preshuffle path is selected.
+PRESHUFFLE_M_MAX = 65536
+
+PRESHUFFLE_SPLIT_K_MAX_TILES = 256
+PRESHUFFLE_SPLIT_K_MAX_TILE_ELEMS = 32 * 128
+PRESHUFFLE_SPLIT_K_WORKSPACE_ELEMS = (
+    4 * PRESHUFFLE_SPLIT_K_MAX_TILES * PRESHUFFLE_SPLIT_K_MAX_TILE_ELEMS
+)
+
+
+@functools.lru_cache(maxsize=128)
+def _get_preshuffle_split_buffers(
+    device: torch.device,
+    stream: torch.cuda.Stream,
+) -> tuple[Tensor, Tensor]:
+    # Safe to reuse: launches on a stream are ordered and the reduction hands
+    # the semaphore back zeroed.
+    workspace = torch.empty(
+        PRESHUFFLE_SPLIT_K_WORKSPACE_ELEMS, dtype=torch.float32, device=device
+    )
+    semaphore = torch.zeros(
+        PRESHUFFLE_SPLIT_K_MAX_TILES, dtype=torch.int32, device=device
+    )
+    return workspace, semaphore
+
+
+def _check_preshuffle_split_capacity(
+    m: int, n: int, tile_m: int, tile_n: int, split_k: int
+) -> None:
+    tiles = ((m + tile_m - 1) // tile_m) * (n // tile_n)
+    if tiles > PRESHUFFLE_SPLIT_K_MAX_TILES:
+        raise RuntimeError(
+            f"[FlyDSL] split_k needs {tiles} tile semaphores, "
+            f"more than {PRESHUFFLE_SPLIT_K_MAX_TILES}"
         )
-    return _flydsl_compile_fn
+    elems = split_k * m * n
+    if elems > PRESHUFFLE_SPLIT_K_WORKSPACE_ELEMS:
+        raise RuntimeError(
+            f"[FlyDSL] split_k needs a {elems}-element fp32 workspace, "
+            f"more than {PRESHUFFLE_SPLIT_K_WORKSPACE_ELEMS}"
+        )
 
 
 def flydsl_preshuffle_gemm_a8(
@@ -985,24 +1022,33 @@ def flydsl_preshuffle_gemm_a8(
     xcd_swizzle: int = 0,
     lds_stage: int = 2,
     enable_scheduler: bool = True,
+    split_k: int = 1,
 ) -> Tensor:
-    """Compile (cached via lru_cache) and run a FlyDSL preshuffle GEMM kernel."""
+    """Compile and run FlyDSL preshuffle GEMM, optionally with fp32 split-K."""
     compile_fn = _get_compile_fn()
-    if compile_fn is None:
-        raise RuntimeError("[FlyDSL] compile function not available")
     dtypes = _get_dtypes()
 
     m, k = XQ.shape[0], XQ.shape[-1]
     n = WQ.shape[0]
 
+    if m > PRESHUFFLE_M_MAX:
+        raise RuntimeError(
+            f"[FlyDSL] M ({m}) exceeds {PRESHUFFLE_M_MAX}; the preshuffle kernel "
+            f"views A and C through a layout bounded by that many rows."
+        )
     if n % tile_n != 0:
         raise RuntimeError(
             f"[FlyDSL] N ({n}) is not a multiple of tile_n ({tile_n}). "
             f"Arguments not supported! Skipping gemm!"
         )
-    if k % tile_k != 0:
+    if split_k < 1 or k % split_k != 0:
         raise RuntimeError(
-            f"[FlyDSL] K ({k}) is not a multiple of tile_k ({tile_k}). "
+            f"[FlyDSL] K ({k}) must be divisible by split_k ({split_k})."
+        )
+    if (k // split_k) % tile_k != 0:
+        raise RuntimeError(
+            f"[FlyDSL] K/split_k ({k // split_k}) is not a multiple of "
+            f"tile_k ({tile_k}). "
             f"Arguments not supported! Skipping gemm!"
         )
 
@@ -1037,6 +1083,7 @@ def flydsl_preshuffle_gemm_a8(
         enable_scheduler=bool(enable_scheduler),
         xcd_swizzle=int(xcd_swizzle),
         lds_stage=int(lds_stage),
+        split_k=int(split_k),
     )
 
     def _as_i8(t):
@@ -1047,12 +1094,24 @@ def flydsl_preshuffle_gemm_a8(
     # epilogue != "none"). Pass an empty tensor as a placeholder for the
     # default epilogue="none" path.
     _dummy_bias = torch.empty(0, dtype=Out.dtype, device=Out.device)
+    if split_k > 1:
+        _check_preshuffle_split_capacity(m, n, tile_m, tile_n, split_k)
+        workspace, semaphore = _get_preshuffle_split_buffers(
+            Out.device, torch.cuda.current_stream(device=Out.device)
+        )
+    else:
+        workspace = out_contig
+        # dtype is part of the executable's cache signature, so this must match
+        # what the AOT pre-compile passes or every non-split-K kernel misses it.
+        semaphore = torch.empty(0, dtype=torch.int32, device=Out.device)
     # The layout-API launcher (PR #754) takes fx.Tensor args (it builds views via
     # fx.get_iter/make_view), so pass flat torch tensors directly rather than raw
     # pointers.
     _run_compiled(
         exe,
+        workspace.view(-1),
         out_contig.view(-1),
+        semaphore,
         _as_i8(XQ.contiguous()).view(-1),
         _as_i8(WQ.contiguous()).view(-1),
         x_scale.contiguous().view(-1),
