@@ -202,13 +202,14 @@ on candidates that are individually plausible and collectively diverse.
 
    | `top_k` | slate holds the true optimum | distinct GEMM1 offered |
    |---|---:|---:|
-   | 32 | 10/15 | 31 |
-   | **64** | **15/15** | 63 |
+   | 32 | 41/64 | 31 |
+   | **64** | **62/64** | 63 |
 
-   All five `top_k` 32 misses were present in the prompt and simply not chosen,
-   so this is a selection budget, not coverage. 64 is ~0.9x the ~72 strata; at
-   `top_k >= strata` containment becomes exact by construction, with the model no
-   longer selecting anything. Below 32 it degrades gracefully — a knob, not a
+   Every miss at both budgets was present in the prompt and simply not chosen, so
+   this is a selection budget, not coverage — including the two that survive at
+   64 (`inter` 2048 tok 256, `inter` 1024 tok 512). 64 is ~0.9x the ~72 strata;
+   at `top_k >= strata` containment becomes exact by construction, with the model
+   no longer selecting anything. Below 32 it degrades gracefully — a knob, not a
    cliff.
 4. At `token <= 8` on an inline-quant shape, always include an `_hpf` candidate
    **and its non-`hpf` twin** — that is where the 1.20x lives and the pair makes
