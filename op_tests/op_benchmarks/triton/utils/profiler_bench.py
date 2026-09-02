@@ -2,13 +2,15 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Torch-profiler based timing, filtered by GPU kernel name.
 
-``triton.testing.do_bench`` times the callable from the host, so everything
-``fn`` does besides the kernel of interest (setup, reference ops, the cache
-flush itself) ends up in the number. Here only the device time of the named
-kernels is summed, which also works when an op launches several kernels or
-sits inside a larger wrapper.
+triton.testing.do_bench times the callable from the host, so everything fn does
+besides the kernel of interest ends up in the number.
+Here only the device time of the named kernels is summed,
+which also works when an op launches several kernels or sits inside a larger
+wrapper.
 """
 
+import math
+import re
 import statistics
 import warnings
 from collections.abc import Callable, Sequence
@@ -23,6 +25,30 @@ _REDUCE = {
     "min": min,
     "max": max,
 }
+_PERCENTILE = re.compile(r"p(\d+(?:\.\d+)?)")
+
+# Usable as argparse choices; any other "pNN" percentile is accepted too.
+RETURN_MODES = (*_REDUCE, "p25", "p50", "p75", "p90", "p99")
+
+
+def _percentile(values, q):
+    """Linear interpolation between the closest ranks, as numpy.percentile does."""
+    values = sorted(values)
+    idx = (len(values) - 1) * q / 100
+    lo, hi = math.floor(idx), math.ceil(idx)
+    return values[lo] + (values[hi] - values[lo]) * (idx - lo)
+
+
+def _reducer(return_mode):
+    if return_mode in _REDUCE:
+        return _REDUCE[return_mode]
+    match = _PERCENTILE.fullmatch(str(return_mode))
+    if match and 0 <= float(match.group(1)) <= 100:
+        return lambda values: _percentile(values, float(match.group(1)))
+    raise ValueError(
+        f"unknown return_mode {return_mode!r}: expected one of {list(RETURN_MODES)}, "
+        "or any percentile 'pNN'"
+    )
 
 
 def _is_device_event(ev) -> bool:
@@ -39,7 +65,7 @@ def _call(fn, data):
     return fn(data)
 
 
-def _reduce(times_us, num_iters, return_mode):
+def _reduce(times_us, num_iters, reduce_fns, single):
     """Sum the launches belonging to one iteration, then reduce across iterations."""
     if len(times_us) % num_iters != 0:
         warnings.warn(
@@ -47,12 +73,14 @@ def _reduce(times_us, num_iters, return_mode):
             "per iteration is not constant, falling back to mean.",
             stacklevel=3,
         )
-        return sum(times_us) / num_iters / 1000
-    per_iter = len(times_us) // num_iters
-    totals = [
-        sum(times_us[i * per_iter : (i + 1) * per_iter]) for i in range(num_iters)
-    ]
-    return _REDUCE[return_mode](totals) / 1000
+        values = [sum(times_us) / num_iters / 1000] * len(reduce_fns)
+    else:
+        per_iter = len(times_us) // num_iters
+        totals = [
+            sum(times_us[i * per_iter : (i + 1) * per_iter]) for i in range(num_iters)
+        ]
+        values = [fn(totals) / 1000 for fn in reduce_fns]
+    return values[0] if single else values
 
 
 def do_bench_profiler(
@@ -64,26 +92,37 @@ def do_bench_profiler(
     cache_size_mb: int = 512,
     data_gen: Callable[[], Any] | None = None,
     num_copies: int = 1,
-    return_mode: str = "mean",
+    return_mode: str | Sequence[str] = "mean",
     per_kernel: bool = False,
 ):
-    """Time the kernels named in ``kernel_names`` while running ``fn``.
+    """Time the kernels named in kernel_names while running fn.
 
-    A kernel is selected when one of ``kernel_names`` is a substring of its
-    profiler name, so launch overhead, cache flushes and everything else ``fn``
-    does are left out of the measurement.
+    A kernel is selected when one of kernel_names is a substring of its profiler
+    name, so launch overhead, cache flushes and everything else fn does are left
+    out of the measurement.
 
-    Pass ``data_gen`` to rotate over ``num_copies`` input sets built up front
-    instead of flushing: iteration ``i`` gets copy ``i % num_copies``, called as
-    ``fn(*data)`` for a tuple, ``fn(**data)`` for a dict, else ``fn(data)``.
+    The flush is itself a fill kernel over an int8 buffer, so keep kernel_names
+    narrow enough not to match it.
 
-    Returns the per-iteration time in ms, or, with ``per_kernel=True``, one
-    ``{name: ms}`` entry per name in ``kernel_names``.
+    Pass data_gen to rotate over num_copies input sets built up front instead of
+    flushing: iteration i gets copy i % num_copies, called as fn(*data) for a
+    tuple, fn(**data) for a dict, else fn(data).
+
+    return_mode is one of RETURN_MODES: mean, median, min, max, or a percentile
+    such as p25/p50/p75 (any pNN works). Pass a list of modes, e.g.
+    ["mean", "p50", "p90"], to get one value back per mode.
+
+    Returns the per-iteration time in ms, or, with per_kernel=True, one
+    {name: ms} entry per name in kernel_names. Each ms is a list of ms when
+    return_mode is a list.
     """
     if isinstance(kernel_names, str):
         kernel_names = [kernel_names]
     assert num_iters > 0, "num_iters must be > 0"
-    assert return_mode in _REDUCE, f"return_mode must be one of {list(_REDUCE)}"
+    single = isinstance(return_mode, str)
+    modes = [return_mode] if single else list(return_mode)
+    assert modes, "return_mode must not be empty"
+    reduce_fns = [_reducer(mode) for mode in modes]
 
     copies = [data_gen() for _ in range(max(num_copies, 1))] if data_gen else None
     flush_buf = (
@@ -122,7 +161,9 @@ def do_bench_profiler(
 
     if per_kernel:
         return {
-            key: _reduce([t for k, t in matched if k == key], num_iters, return_mode)
+            key: _reduce(
+                [t for k, t in matched if k == key], num_iters, reduce_fns, single
+            )
             for key in dict.fromkeys(k for k, _ in matched)
         }
-    return _reduce([t for _, t in matched], num_iters, return_mode)
+    return _reduce([t for _, t in matched], num_iters, reduce_fns, single)
