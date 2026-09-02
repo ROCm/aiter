@@ -18,6 +18,11 @@ __all__ = [
 ]
 
 
+_DECODE_PAGE_SIZE = 64
+_DECODE_NUM_Q_HEADS = (64, 128)
+_DECODE_HEADS_PER_BLOCK = 64
+
+
 def _require(condition, message):
     if not condition:
         raise ValueError(message)
@@ -276,8 +281,6 @@ def _pick_num_splits(
         meta_seqlen_q,
         torch.float8_e4m3fn,
     )
-    # The kernel hands page p to split p % num_splits, so splits beyond the page
-    # count would idle; the heuristic works in tokens and does not know that.
     pages_per_seq = max(1, (max_seqlen_kv + page_size - 1) // page_size)
     return max(1, min(num_splits, pages_per_seq))
 
@@ -303,9 +306,9 @@ def flydsl_mla_decode_workspace(
 
 
 def flydsl_mla_decode_fwd(
-    q,  # [total_tokens, 128, 576] fp8, contiguous
-    kv_buffer,  # [num_blocks, 64, 1, 576] fp8, contiguous
-    out,  # [total_tokens, 128, 512]
+    q,  # [total_tokens, 64 or 128, 576] fp8, contiguous
+    kv_buffer,  # token-major [num_blocks, 64, 1, 576] or shuffled [.., 1, 64, ..]
+    out,  # [total_tokens, num_heads, 512]
     cu_seqlens_q,  # [batch + 1] int32
     seqused_k,  # [batch] int32
     max_seqlen_kv,
@@ -319,38 +322,33 @@ def flydsl_mla_decode_fwd(
     num_splits=None,
     skip_reduce=False,
     workspace=None,
+    shuffled_kv_cache=False,
     stream=None,
 ):
-    """FlyDSL gfx1250 MLA decode on the signature of ``mla_decode_fwd``.
-
-    Positional arguments mirror ``aiter.ops.triton.attention.mla.mla_decode_fwd``
-    up to ``kv_descale`` so the two backends are interchangeable. ``num_splits``
-    is an extension: the Triton path derives its segment count internally and
-    offers no override, whereas here the split count is a real launch parameter.
-
-    Writes into ``out`` and returns it. With ``skip_reduce`` the merge is left to
-    the caller and ``(split_data, split_lse)`` is returned instead.
-
-    ``workspace`` is a ``(split_data, split_lse)`` pair for the per-split
-    partials, obtainable from :func:`flydsl_mla_decode_workspace`. Passing one is
-    strongly preferred: the stage-1 kernel is launched on a raw stream handle
-    that the caching allocator does not track, so partials allocated per call can
-    be handed back to the allocator while the kernel is still writing them.
-    """
+    """FlyDSL gfx1250 MLA decode on the signature of ``mla_decode_fwd``."""
     from .kernels.mla_gfx1250.mla_decode_gfx1250 import (
         launch_mla_decode_pagesize64_fp8_fp8_gluon,
     )
 
-    batch, total_tokens, num_tokens_per_seq = _validate_flydsl_decode_inputs(
-        q, kv_buffer, out, seqused_k, kv_lora_rank, qk_rope_head_dim, causal
+    batch, total_tokens, num_tokens_per_seq, num_q_heads, page_size = (
+        _validate_flydsl_decode_inputs(
+            q,
+            kv_buffer,
+            out,
+            seqused_k,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            causal,
+            shuffled_kv_cache,
+        )
     )
     resolved_splits = _pick_num_splits(
         batch,
         num_tokens_per_seq,
         max_seqlen_kv,
-        kv_buffer.size(1),
+        page_size,
         num_splits,
-        num_heads=q.size(1),
+        num_heads=num_q_heads,
     )
 
     device = q.device
@@ -359,7 +357,7 @@ def flydsl_mla_decode_fwd(
             total_tokens,
             resolved_splits,
             device,
-            num_heads=q.size(1),
+            num_heads=num_q_heads,
             v_head_dim=out.size(-1),
         )
     split_data, split_lse = workspace
@@ -385,6 +383,8 @@ def flydsl_mla_decode_fwd(
         resolved_splits,
         block_tables.stride(0),
         num_tokens_per_seq,
+        num_q_heads,
+        int(bool(shuffled_kv_cache)),
         int(resolved_splits == 1),
         stream=stream,
     )
@@ -406,16 +406,42 @@ def flydsl_mla_decode_fwd(
 
 
 def _validate_flydsl_decode_inputs(
-    q, kv_buffer, out, seqused_k, kv_lora_rank, qk_rope_head_dim, causal
+    q,
+    kv_buffer,
+    out,
+    seqused_k,
+    kv_lora_rank,
+    qk_rope_head_dim,
+    causal,
+    shuffled_kv_cache=False,
 ):
 
-    qk_head_dim = kv_lora_rank + qk_rope_head_dim
+    page_dim = 2 if shuffled_kv_cache else 1
+    head_dim = 1 if shuffled_kv_cache else 2
     _require(
-        q.size(-1) == qk_head_dim
-        and kv_buffer.size(-1) == qk_head_dim
-        and out.size(-1) == kv_lora_rank,
-        f"head dims: q/kv last dim {qk_head_dim}, out last dim {kv_lora_rank}; "
-        f"got q {list(q.shape)} kv {list(kv_buffer.shape)} out {list(out.shape)}",
+        kv_buffer.dim() == 4 and kv_buffer.size(head_dim) == 1,
+        f"kv_buffer: expected 4D with a single KV head on dim {head_dim}, "
+        f"got {list(kv_buffer.shape)} (shuffled_kv_cache={bool(shuffled_kv_cache)})",
+    )
+    page_size = kv_buffer.size(page_dim)
+    _require(
+        page_size == _DECODE_PAGE_SIZE,
+        f"kv_buffer: expected page size {_DECODE_PAGE_SIZE} on dim {page_dim}, "
+        f"got {page_size} from {list(kv_buffer.shape)}",
+    )
+    _require(
+        kv_buffer.is_contiguous(),
+        f"kv_buffer: expected a contiguous tensor, got stride "
+        f"{list(kv_buffer.stride())}",
+    )
+    num_q_heads = q.size(1)
+    _require(
+        num_q_heads in _DECODE_NUM_Q_HEADS,
+        f"q: expected one of {list(_DECODE_NUM_Q_HEADS)} heads, got {num_q_heads}",
+    )
+    _require(
+        out.size(1) == num_q_heads,
+        f"out: expected {num_q_heads} heads to match q, got {out.size(1)}",
     )
     total_tokens = q.size(0)
     batch = seqused_k.numel()
@@ -423,4 +449,4 @@ def _validate_flydsl_decode_inputs(
         batch > 0 and total_tokens % batch == 0,
         f"q/seqused_k: total_tokens {total_tokens} must be a multiple of batch {batch}",
     )
-    return batch, total_tokens, total_tokens // batch
+    return batch, total_tokens, total_tokens // batch, num_q_heads, page_size

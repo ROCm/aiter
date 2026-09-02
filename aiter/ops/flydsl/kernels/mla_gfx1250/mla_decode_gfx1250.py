@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""gfx1250 MLA page-size-64 FP8 stage-1 kernel gluon api"""
+"""gfx1250 MLA page-size-64 FP8 stage-1 kernel on the Gluon API"""
 
 import math
 
@@ -18,9 +18,9 @@ from .mla_common import _xor16_f32
 BLOCK_THREADS = 128
 WAVE_SIZE = 32
 NUM_WAVES = BLOCK_THREADS // WAVE_SIZE
-NUM_HEAD_GROUPS = 2
 HEADS_PER_WAVE = 16
 HEADS_PER_GROUP = NUM_WAVES * HEADS_PER_WAVE
+SUPPORTED_NUM_Q_HEADS = (64, 128)
 Q_NOPE_FRAGMENT_COUNT = 4
 Q_NOPE_FRAGMENT_DWORDS = 16
 Q_ROPE_FRAGMENT_DWORDS = 8
@@ -28,7 +28,6 @@ QK_N_TILES = 4
 QK_TILE_DS_OPS = Q_NOPE_FRAGMENT_COUNT * 4 + 2
 PV_D_TILES = 32
 PV_LOAD_DEPTH = 8
-NUM_Q_HEADS = 128
 QK_NOPE_HEAD_DIM = 512
 QK_ROPE_HEAD_DIM = 64
 QK_HEAD_DIM = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM
@@ -36,7 +35,6 @@ V_HEAD_DIM = QK_NOPE_HEAD_DIM
 Q_HEAD_STRIDE = QK_HEAD_DIM
 QK_ACC_DWORDS = 8
 PACKED_PROB_WORDS = 8
-Q_ROW_STRIDE = NUM_Q_HEADS * Q_HEAD_STRIDE
 Q_GROUP_STRIDE = HEADS_PER_GROUP * Q_HEAD_STRIDE
 Q_WAVE_STRIDE = HEADS_PER_WAVE * Q_HEAD_STRIDE
 PAGE_SIZE = 64
@@ -51,12 +49,33 @@ KV_PAD_AMOUNT = 16
 KV_ROW_STRIDE = QK_HEAD_DIM + KV_PAD_AMOUNT * (QK_HEAD_DIM // KV_PAD_INTERVAL)
 KV_NUM_STAGES = 5
 KV_STAGE_BYTES = HEADS_PER_WAVE * KV_ROW_STRIDE
+
+KV_SHUFFLE_TOKENS = HEADS_PER_WAVE
+KV_SHUFFLE_UNIT = 16
+KV_SHUFFLE_CHUNK_BYTES = KV_SHUFFLE_TOKENS * KV_SHUFFLE_UNIT
+KV_SHUFFLE_NOPE_BYTES = (QK_NOPE_HEAD_DIM // KV_SHUFFLE_UNIT) * KV_SHUFFLE_CHUNK_BYTES
+KV_SHUFFLE_ROPE_BYTES = (QK_ROPE_HEAD_DIM // KV_SHUFFLE_UNIT) * KV_SHUFFLE_CHUNK_BYTES
+KV_SHUFFLE_STAGE_BYTES = KV_SHUFFLE_NOPE_BYTES + KV_SHUFFLE_ROPE_BYTES
+KV_SHUFFLE_ROPE_PAGE_BASE = PAGE_SIZE * QK_NOPE_HEAD_DIM
+KV_SHUFFLE_NOPE_GROUP_BYTES = KV_SHUFFLE_TOKENS * QK_NOPE_HEAD_DIM
+KV_SHUFFLE_ROPE_GROUP_BYTES = KV_SHUFFLE_TOKENS * QK_ROPE_HEAD_DIM
+
 LOG2E = math.log2(math.e)
 _DEFAULT_STREAM = fx.Stream(None)
 
 
 def kv_row_offset(data_offset: int) -> int:
     return data_offset + KV_PAD_AMOUNT * (data_offset // KV_PAD_INTERVAL)
+
+
+def kv_shuffle_row_offset(data_offset: int) -> int:
+    """Byte offset of dim ``data_offset`` within token 0 of a shuffled group."""
+    if data_offset < QK_NOPE_HEAD_DIM:
+        region_base, dim = 0, data_offset
+    else:
+        region_base, dim = KV_SHUFFLE_NOPE_BYTES, data_offset - QK_NOPE_HEAD_DIM
+    chunk, byte = divmod(dim, KV_SHUFFLE_UNIT)
+    return region_base + chunk * KV_SHUFFLE_CHUNK_BYTES + byte
 
 
 @flyc.jit
@@ -75,9 +94,31 @@ def launch_mla_decode_pagesize64_fp8_fp8_gluon(
     num_splits: fx.Int32,
     block_tables_stride: fx.Int32,
     num_tokens_per_seq: fx.Int32,
+    num_q_heads: fx.Constexpr[int],
+    kv_shuffled: fx.Constexpr[int],
     out_16_nosplit: fx.Constexpr[int],
     stream: fx.Stream = _DEFAULT_STREAM,
 ):
+    if num_q_heads not in SUPPORTED_NUM_Q_HEADS:
+        raise ValueError(
+            f"num_q_heads: expected one of {list(SUPPORTED_NUM_Q_HEADS)}, "
+            f"got {num_q_heads}"
+        )
+    num_head_groups = num_q_heads // HEADS_PER_GROUP
+    log2_head_groups = num_head_groups.bit_length() - 1
+    q_row_stride = num_q_heads * Q_HEAD_STRIDE
+
+    kv_stage_bytes = KV_SHUFFLE_STAGE_BYTES if kv_shuffled else KV_STAGE_BYTES
+    kv_token_stride = KV_SHUFFLE_UNIT if kv_shuffled else KV_ROW_STRIDE
+    kv_unit_step = KV_SHUFFLE_CHUNK_BYTES if kv_shuffled else KV_SHUFFLE_UNIT
+    kv_dim_offset = kv_shuffle_row_offset if kv_shuffled else kv_row_offset
+
+    kv_copies_per_page = 2 if kv_shuffled else 1
+    if KV_NUM_STAGES * kv_stage_bytes > LDS_WAVE_BYTES:
+        raise ValueError(
+            f"KV ring needs {KV_NUM_STAGES * kv_stage_bytes} B per wave, "
+            f"only {LDS_WAVE_BYTES} B available"
+        )
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
     def kernel(
@@ -153,8 +194,8 @@ def launch_mla_decode_pagesize64_fp8_fp8_gluon(
         token_id = fx.Int32(token_block)
         batch_i32 = fx.Int32(batch_id)
 
-        head_group = z & 1
-        split_id = z >> 1
+        head_group = z & (num_head_groups - 1)
+        split_id = z >> log2_head_groups
         wave_id = rocdl.readfirstlane(T.i32, tid >> 5)
         lane_id = tid & (WAVE_SIZE - 1)
         head_in_wave = lane_id & (HEADS_PER_WAVE - 1)
@@ -174,7 +215,7 @@ def launch_mla_decode_pagesize64_fp8_fp8_gluon(
         gpu.barrier()
 
         q_row = qo_t[batch_i32] + token_id
-        q_row_base = fx.Int64(q_row) * Q_ROW_STRIDE
+        q_row_base = fx.Int64(q_row) * q_row_stride
         q_tile_base = (
             q_row_base
             + fx.Int64(head_group) * Q_GROUP_STRIDE
@@ -259,56 +300,94 @@ def launch_mla_decode_pagesize64_fp8_fp8_gluon(
         negative_inf = fx.Float32(float("-inf"))
         zero_out = Vec.filled(PV_ACC_DWORDS, 0.0, fx.Float32)
 
-        @flyc.jit
-        def issue_kv_page(physical_page, kv_stage):
-            kv_page_base = fx.Int64(physical_page) * KV_PAGE_ELEMENTS
-            kv_lds_ptr = fx.recast_iter(
+        def kv_stage_lds_ptr(kv_stage, byte_offset):
+            return fx.recast_iter(
                 fx.Int8,
                 fx.add_offset(
                     lds_base,
-                    wave_id * LDS_WAVE_BYTES + kv_stage * KV_STAGE_BYTES,
+                    wave_id * LDS_WAVE_BYTES + kv_stage * kv_stage_bytes + byte_offset,
                 ),
             )
-            kv_lds = fx.Tensor(
-                fx.make_view(
-                    kv_lds_ptr,
-                    fx.make_layout(
-                        (HEADS_PER_WAVE, QK_HEAD_DIM),
-                        (KV_ROW_STRIDE, 1),
+
+        @flyc.jit
+        def issue_kv_page(physical_page, kv_stage):
+            kv_page_base = fx.Int64(physical_page) * KV_PAGE_ELEMENTS
+            if const_expr(kv_shuffled):
+                rocdl.sched_barrier(0)
+                for region_bytes, global_base, lds_base_off in (
+                    (
+                        KV_SHUFFLE_NOPE_GROUP_BYTES,
+                        fx.Int64(wave_id) * KV_SHUFFLE_NOPE_GROUP_BYTES,
+                        0,
                     ),
+                    (
+                        KV_SHUFFLE_ROPE_GROUP_BYTES,
+                        KV_SHUFFLE_ROPE_PAGE_BASE
+                        + fx.Int64(wave_id) * KV_SHUFFLE_ROPE_GROUP_BYTES,
+                        KV_SHUFFLE_NOPE_BYTES,
+                    ),
+                ):
+                    region_lds = fx.Tensor(
+                        fx.make_view(
+                            kv_stage_lds_ptr(kv_stage, lds_base_off),
+                            fx.make_layout((region_bytes,), (1,)),
+                        )
+                    )
+                    region_global = fx.Tensor(
+                        fx.make_view(
+                            fx.add_offset(ptr_kv, kv_page_base + global_base),
+                            fx.make_layout((region_bytes,), (1,)),
+                        )
+                    )
+                    region_atom = fx.rocdl.make_tdm_atom(
+                        region_global,
+                        [None],
+                        num_warps=1,
+                    )
+                    fx.copy(region_atom, region_global, region_lds)
+                rocdl.sched_barrier(0)
+            else:
+                kv_lds = fx.Tensor(
+                    fx.make_view(
+                        kv_stage_lds_ptr(kv_stage, 0),
+                        fx.make_layout(
+                            (HEADS_PER_WAVE, QK_HEAD_DIM),
+                            (KV_ROW_STRIDE, 1),
+                        ),
+                    )
                 )
-            )
-            kv_global = fx.Tensor(
-                fx.make_view(
-                    fx.add_offset(
-                        ptr_kv,
-                        kv_page_base + fx.Int64(token_begin) * KV_TOKEN_ELEMENTS,
-                    ),
-                    fx.make_layout(
-                        (HEADS_PER_WAVE, QK_HEAD_DIM),
-                        (KV_TOKEN_ELEMENTS, 1),
-                    ),
+                kv_global = fx.Tensor(
+                    fx.make_view(
+                        fx.add_offset(
+                            ptr_kv,
+                            kv_page_base + fx.Int64(token_begin) * KV_TOKEN_ELEMENTS,
+                        ),
+                        fx.make_layout(
+                            (HEADS_PER_WAVE, QK_HEAD_DIM),
+                            (KV_TOKEN_ELEMENTS, 1),
+                        ),
+                    )
                 )
-            )
-            kv_tdm_atom = fx.rocdl.make_tdm_atom(
-                kv_global,
-                [HEADS_PER_WAVE, None],
-                strides=[KV_TOKEN_ELEMENTS, None],
-                num_warps=1,
-                pad_interval=KV_PAD_INTERVAL,
-                pad_amount=KV_PAD_AMOUNT,
-            )
-            rocdl.sched_barrier(0)
-            fx.copy(kv_tdm_atom, kv_global, kv_lds)
-            rocdl.sched_barrier(0)
+                kv_tdm_atom = fx.rocdl.make_tdm_atom(
+                    kv_global,
+                    [HEADS_PER_WAVE, None],
+                    strides=[KV_TOKEN_ELEMENTS, None],
+                    num_warps=1,
+                    pad_interval=KV_PAD_INTERVAL,
+                    pad_amount=KV_PAD_AMOUNT,
+                )
+                rocdl.sched_barrier(0)
+                fx.copy(kv_tdm_atom, kv_global, kv_lds)
+                rocdl.sched_barrier(0)
 
         @flyc.jit
         def wait_kv_page(has_next, has_second_next):
+            # Counts are in TDM ops, and a shuffled page costs two of them.
             if has_second_next:
-                tdm_ops.tensor_wait(2)
+                tdm_ops.tensor_wait(2 * kv_copies_per_page)
             else:
                 if has_next:
-                    tdm_ops.tensor_wait(1)
+                    tdm_ops.tensor_wait(1 * kv_copies_per_page)
                 else:
                     tdm_ops.tensor_wait(0)
 
@@ -383,10 +462,10 @@ def launch_mla_decode_pagesize64_fp8_fp8_gluon(
                 for token_tile in range_constexpr(QK_N_TILES):
                     v_byte_offset = (
                         lds_segment_byte(token_tile)
-                        + pending_stage * KV_STAGE_BYTES
-                        + v_row * KV_ROW_STRIDE
+                        + pending_stage * kv_stage_bytes
+                        + v_row * kv_token_stride
                         + v_col
-                        + const_expr(kv_row_offset(dv_tile * 16))
+                        + const_expr(kv_dim_offset(dv_tile * KV_SHUFFLE_UNIT))
                     )
                     v_ptr = fx.add_offset(lds_base, v_byte_offset)
                     v_tr8_chunks.append(
@@ -541,22 +620,26 @@ def launch_mla_decode_pagesize64_fp8_fp8_gluon(
             rocdl.s_barrier_wait(-1)
 
             def issue_k_tile_loads(n_tile):
+                # lane_half selects the second 16-byte dim chunk of the pair this
+                # lane covers, so it advances by one chunk, which is 16 bytes when
+                # token-major and KV_SHUFFLE_CHUNK_BYTES when shuffled.
+                k_row_base = (
+                    lds_segment_byte(n_tile)
+                    + kv_stage * kv_stage_bytes
+                    + head_in_wave * kv_token_stride
+                    + lane_half * kv_unit_step
+                )
+
                 k_fragment_groups = []
                 for k_fragment in range_constexpr(Q_NOPE_FRAGMENT_COUNT):
                     k_fragment_chunks = []
-                    k_row_base = (
-                        lds_segment_byte(n_tile)
-                        + kv_stage * KV_STAGE_BYTES
-                        + head_in_wave * KV_ROW_STRIDE
-                        + lane_half * 16
-                    )
                     for chunk in range_constexpr(4):
                         k_fragment_chunks.append(
                             Vec(
                                 lds_load_b128(
                                     k_row_base
                                     + const_expr(
-                                        kv_row_offset(k_fragment * 128 + chunk * 32)
+                                        kv_dim_offset(k_fragment * 128 + chunk * 32)
                                     ),
                                 )
                             )
@@ -564,20 +647,13 @@ def launch_mla_decode_pagesize64_fp8_fp8_gluon(
                     k_fragment_groups.append(k_fragment_chunks)
 
                 k_rope_fragment = []
-                # RoPE now sits in the tail of the same row as its token's NoPE.
-                k_rope_row_base = (
-                    lds_segment_byte(n_tile)
-                    + kv_stage * KV_STAGE_BYTES
-                    + head_in_wave * KV_ROW_STRIDE
-                    + lane_half * 16
-                )
                 for chunk in range_constexpr(2):
                     k_rope_fragment.append(
                         Vec(
                             lds_load_b128(
-                                k_rope_row_base
+                                k_row_base
                                 + const_expr(
-                                    kv_row_offset(QK_NOPE_HEAD_DIM + chunk * 32)
+                                    kv_dim_offset(QK_NOPE_HEAD_DIM + chunk * 32)
                                 ),
                             )
                         )
@@ -827,7 +903,7 @@ def launch_mla_decode_pagesize64_fp8_fp8_gluon(
             output_scale = kv_scale_t[0] * inv_page_sum
             output_base = (
                 (fx.Int64(q_row) * fx.Int64(num_splits) + fx.Int64(split_id))
-                * NUM_Q_HEADS
+                * num_q_heads
                 + fx.Int64(head)
             ) * V_HEAD_DIM
             if const_expr(out_16_nosplit):
@@ -864,7 +940,7 @@ def launch_mla_decode_pagesize64_fp8_fp8_gluon(
                     head_group * HEADS_PER_GROUP + wave_id * HEADS_PER_WAVE
                 )
                 output_tile_base = (
-                    fx.Int64(q_row) * NUM_Q_HEADS + fx.Int64(output_head_begin)
+                    fx.Int64(q_row) * num_q_heads + fx.Int64(output_head_begin)
                 ) * V_HEAD_DIM
                 output_global = fx.Tensor(
                     fx.make_view(
@@ -907,7 +983,7 @@ def launch_mla_decode_pagesize64_fp8_fp8_gluon(
             if lane_half == fx.Int32(0):
                 lse_offset = (
                     fx.Int64(q_row) * fx.Int64(num_splits) + fx.Int64(split_id)
-                ) * NUM_Q_HEADS + fx.Int64(head)
+                ) * num_q_heads + fx.Int64(head)
                 lse = running_max * score_scale + fmath.log(running_sum)
                 lse_t[fx.Int32(lse_offset)] = lse
 
@@ -926,7 +1002,7 @@ def launch_mla_decode_pagesize64_fp8_fp8_gluon(
         block_tables_stride,
         num_tokens_per_seq,
     ).launch(
-        grid=(num_tokens_per_seq, batch, NUM_HEAD_GROUPS * num_splits),
+        grid=(num_tokens_per_seq, batch, num_head_groups * num_splits),
         block=(BLOCK_THREADS, 1, 1),
         stream=stream,
     )
