@@ -237,9 +237,7 @@ class MQAAsyncKVLoader:
         offs_n = gl.arange(
             0, kv_cfg.BLOCK_KV, layout=gl.SliceLayout(0, kv_cfg.blocked)
         )[None, :]
-        # base_offset stays i32 on purpose -- it is the offset *into* the
-        # rebased descriptor, at most BLOCK_KV * stride_kv_s elements. Only the
-        # per-tile base advance below needs the full 64-bit range.
+        # Advance the pointer instead of having large offset to enable buffer ops
         base_offset = offs_d * stride_kv_d + offs_n * stride_kv_s
         return MQAAsyncKVLoader(
             kv_cfg,
@@ -507,10 +505,6 @@ def _row_logits_split(
     M_CHUNK: gl.constexpr,
 ):
     """One query row's logits, folding each head chunk as its MFMA retires.
-
-    `_row_logits` materialises all NUM_HEADS accumulators before reducing;
-    chunking keeps one chunk live, which is what keeps the wider 32x32 tile off
-    the spill path at 64 heads.
     """
     NCHUNK: gl.constexpr = NUM_HEADS // M_CHUNK
     acc = None

@@ -217,9 +217,6 @@ def fp8_mqa_logits(
             waves_per_eu = 3
             num_warps = 2
             block_kv = 64
-            # main gates this on use_buffer_store, because BLOCK_M=2 with plain
-            # stores aborts the AMDGCN backend at JIT time. Vacuous here: the
-            # rebasing above makes buffer stores unconditional on gfx950.
             block_m = 2 if (num_heads <= 32 and seq_len > 4096) else 1
             # Single warp to save barrier cycles
             if block_m == 1 and seq_len > 4096:
