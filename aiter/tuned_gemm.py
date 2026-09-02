@@ -21,29 +21,26 @@ import os
 import pandas as pd
 import torch
 import torch.nn.functional as F
+from torch import Tensor
 
-import aiter
 from aiter import dtypes, gemm_a16w16_asm, hipb_create_extension, hipb_mm, logger
 from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
-
-try:
-    from aiter.ops.flydsl.utils import is_flydsl_available
-except ImportError:
-
-    def is_flydsl_available():
-        return False
-
-
-from torch import Tensor
-
 from aiter.ops.gemm_op_common import get_padded_m
 
 try:
     from aiter.ops.opus.gemm_op_a16w16 import opus_gemm_a16w16_tune as _opus_tune
 except Exception:  # noqa: BLE001  blanket catch is intentional here
     _opus_tune = None
+
+
+@functools.lru_cache(maxsize=1)
+def _get_flydsl_gemm_kernels():
+    from aiter.ops.flydsl import gemm_kernels
+
+    return gemm_kernels
+
 
 # NOTE: gfx1250 split-K kids allocate their partial-sum workspace as a plain
 # torch.empty tensor (see aiter.ops.opus.gemm_op_a16w16._get_opus_workspace)
@@ -161,17 +158,18 @@ def get_GEMM_A16W16_config(
         )
         if config is not None:
             if config["libtype"] == "flydsl":
-                if is_flydsl_available():
-                    flydsl_config = aiter.ops.flydsl.gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
+                flydsl_config = (
+                    _get_flydsl_gemm_kernels().get_flydsl_splitk_hgemm_kernel_params(
                         config["kernelName"]
                     )
-                    if flydsl_config is None:
-                        logger.warning(
-                            f"FlyDSL kernel '{config['kernelName']}' from tuned config is not "
-                            "recognized by the current catalog; falling back to next candidate."
-                        )
-                        config = None
-                else:
+                )
+                # None means the tuned CSV names a kernel absent from this
+                # catalog version; it is unrelated to FlyDSL import availability.
+                if flydsl_config is None:
+                    logger.warning(
+                        f"FlyDSL kernel '{config['kernelName']}' from tuned config is not "
+                        "recognized by the current catalog; falling back to next candidate."
+                    )
                     config = None
             if config is None:
                 continue
@@ -206,14 +204,28 @@ def get_GEMM_A16W16_config(
                 assert (
                     False
                 ), f"no solution for {M=} {N=} {K=} {dtype=} {bias=}, {scaleAB=}, {bpreshuffle=}"
-        elif is_skinny_default_shape(M, N, K, dtype, cu_num):
-            # soltype, solution_idx = 3, 2
+        elif gfx in ("gfx90a", "gfx942", "gfx950") and is_skinny_default_shape(
+            M, N, K, dtype, cu_num
+        ):
             default_config["libtype"] = "skinny"
             default_config["solidx"] = 2
             default_config["kernelName"] = ""
         if not default_config:
-            default_config["libtype"] = "torch"
-            default_config["solidx"] = 0
+            # gfx1250 has no tuned ASM/skinny/hipblaslt bf16 kernels, so the
+            # torch fallback lands on hipBLASLt, which is markedly slower than
+            # the Triton (gluon) a16w16 kernel for these shapes. Prefer Triton
+            # for unscaled bf16/fp16 GEMMs; explicit tuned CSV entries still win
+            # since they are matched before this fallback is reached.
+            if (
+                gfx == "gfx1250"
+                and not scaleAB
+                and eval(dtype) in (dtypes.bf16, dtypes.fp16)
+            ):
+                default_config["libtype"] = "triton"
+                default_config["solidx"] = 0
+            else:
+                default_config["libtype"] = "torch"
+                default_config["solidx"] = 0
         logger.info(
             f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, {bpreshuffle=}, not found tuned config in {AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE}, will use default config! using {default_config['libtype']} solution:{default_config['solidx']}"
         )
@@ -472,8 +484,9 @@ def flydsl_gemm(
     assert (
         scale_a is None and scale_b is None and scale_c is None
     ), "FlyDSL hgemm does not support scaling yet."
-    flydsl_config = aiter.ops.flydsl.gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
-        config["kernelName"]
+    flydsl_gemm_kernels = _get_flydsl_gemm_kernels()
+    flydsl_config = flydsl_gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
+        config["kernelName"],
     )
     stages = flydsl_config.get("stages", flydsl_config.get("stage", 2))
     fused_bias = None
@@ -483,7 +496,7 @@ def flydsl_gemm(
         and bias.dtype == inp.dtype
     ):
         fused_bias = bias
-    out = aiter.ops.flydsl.gemm_kernels.flydsl_hgemm(
+    out = flydsl_gemm_kernels.flydsl_hgemm(
         inp,
         weights,
         bias=fused_bias,

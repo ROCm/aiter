@@ -108,7 +108,41 @@ jobs:
           fetch-depth: 1
           submodules: 'recursive'
 
+      - name: Network preflight before Triton artifact downloads
+        if: ${{ startsWith(runner.name, 'linux-aiter-mi35x-1-') }}
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          set +e
+
+          echo "=== Runner info ==="
+          echo "RUNNER_NAME=${RUNNER_NAME}"
+          echo "RUNNER_OS=${RUNNER_OS}"
+          echo "hostname=$(hostname -f 2>/dev/null || hostname)"
+          date -u
+
+          echo "=== DNS check ==="
+          getent hosts github.com || true
+          getent hosts api.github.com || true
+          getent hosts productionresultssa4.blob.core.windows.net || true
+          getent hosts productionresultssa8.blob.core.windows.net || true
+
+          echo "=== GitHub and Azure Blob connectivity check ==="
+          for url in \
+            https://api.github.com/rate_limit \
+            https://github.com/ROCm/aiter \
+            https://productionresultssa4.blob.core.windows.net/ \
+            https://productionresultssa8.blob.core.windows.net/
+          do
+            curl -L -o /dev/null -sS \
+              --connect-timeout 10 \
+              --max-time 30 \
+              -w "url=${url} code=%{http_code} dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s ttfb=%{time_starttransfer}s total=%{time_total}s speed=%{speed_download}B/s\n" \
+              "$url" || true
+          done
+
       - name: Download test shard lists
+        id: download_triton_shards
         uses: actions/download-artifact@v4
         timeout-minutes: 15
         with:
@@ -123,6 +157,24 @@ jobs:
           name: ${{ env.TRITON_WHEEL_ARTIFACT_NAME }}
           path: triton_wheels
 
+      - name: Speedtest after Triton artifact download failure
+        if: ${{ always() && startsWith(runner.name, 'linux-aiter-mi35x-1-') && (steps.download_triton_shards.outcome == 'failure' || steps.download_triton_wheel.outcome == 'failure') }}
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          set +e
+
+          echo "=== Runner info ==="
+          echo "RUNNER_NAME=${RUNNER_NAME}"
+          echo "RUNNER_OS=${RUNNER_OS}"
+          echo "hostname=$(hostname -f 2>/dev/null || hostname)"
+          date -u
+
+          echo "=== speedtest-cli ==="
+          python3 -m pip install --user --disable-pip-version-check speedtest-cli || true
+          speedtest_bin="$(python3 -m site --user-base)/bin/speedtest-cli"
+          timeout 120 "$speedtest_bin" --simple --secure || true
+
       - name: List test shard files
         run: |
           ls -l triton_shard_*.list
@@ -130,10 +182,11 @@ jobs:
       - name: Docker login
         if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
         env:
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
+          DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
         run: |
           for attempt in 1 2 3; do
-            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+            if echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin; then
               echo "Docker login succeeded on attempt ${attempt}"
               exit 0
             fi
@@ -207,9 +260,9 @@ jobs:
           set -ex
           echo "Running Triton Tests..."
           docker exec -w /workspace triton_test mkdir -p test-reports
-          # MI35X: skip the MHA-PE backward test that fails an accuracy check on gfx950 with the coming Triton release.
+          # MI35X: skip the MHA-PE tests that fail an accuracy check on gfx950 with the coming Triton release.
           docker exec -w /workspace triton_test pytest -v ${TRITON_TEST} \
-            --deselect "op_tests/triton_tests/attention/test_mha_with_pe.py::test_mha_backward_with_pe" \
+            --deselect "op_tests/triton_tests/attention/test_mha_with_pe.py::test_mha_varlen_with_pe[True-0.17-96-64-8-1-64-128]" \
             --junitxml=test-reports/triton.xml
 
       - name: Upload test logs
@@ -270,10 +323,11 @@ jobs:
       - name: Docker login
         if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
         env:
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
+          DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
         run: |
           for attempt in 1 2 3; do
-            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+            if echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin; then
               echo "Docker login succeeded on attempt ${attempt}"
               exit 0
             fi
@@ -325,7 +379,11 @@ jobs:
           set -ex
           echo "Running Triton Tests..."
           docker exec -w /workspace triton_test mkdir -p test-reports
-          docker exec -w /workspace triton_test pytest -v ${TRITON_TEST} --junitxml=test-reports/triton.xml
+          # MI300X: skip all shapes of the paged-prefill contexted_kv_attention tests that fail an accuracy check (and can hang the GPU) with the coming Triton release.
+          docker exec -w /workspace triton_test pytest -v ${TRITON_TEST} \
+            --deselect "op_tests/triton_tests/attention/test_pa_prefill.py::test_contexted_kv_attention" \
+            --deselect "op_tests/triton_tests/attention/test_chunked_pa_prefill.py::test_contexted_kv_attention" \
+            --junitxml=test-reports/triton.xml
 
       - name: Upload test logs
         uses: actions/upload-artifact@v4

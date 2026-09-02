@@ -15,7 +15,7 @@ from aiter.ops.chunk_gated_delta_rule_fwd_h import (
     chunk_gated_delta_rule_fwd_h_hip_fn,
 )
 from aiter.ops.flydsl.linear_attention_prefill_kernels import (
-    chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip,
+    chunk_gated_delta_rule_fwd_h_flydsl_opt,
 )
 from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
@@ -1030,7 +1030,7 @@ def test_chunk_opt_varlen_hip(
                 ),
                 pytest.mark.skipif(
                     _is_gfx12_runtime(),
-                    reason="FlyDSL mfma16_hip K5 kernel does not support gfx12!",
+                    reason="FlyDSL opt K5 kernel does not support gfx12!",
                 ),
             ],
         ),
@@ -1093,13 +1093,13 @@ def test_chunk_opt_vk_indice(
             pytest.skip(reason="HIP kernel requires D=128 and bfloat16")
         extra_kwargs = {"g_head_major": True}
     elif backend == "flydsl":
-        fwd_h = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip
-        # FlyDSL mfma16_hip is likewise specialized for K=V=128 / bf16. It now
+        fwd_h = chunk_gated_delta_rule_fwd_h_flydsl_opt
+        # FlyDSL opt is likewise specialized for K=V=128 / bf16. It now
         # mirrors the HIP g-layout contract (default token-major), and this test
         # feeds a 3-D head-major [B, H, T] gate, so pass g_head_major=True like
         # the HIP backend above.
         if D != 128:
-            pytest.skip(reason="FlyDSL mfma16_hip kernel requires D=128 and bfloat16")
+            pytest.skip(reason="FlyDSL opt kernel requires D=128 and bfloat16")
         extra_kwargs = {"g_head_major": True}
     else:
         fwd_h = chunk_gated_delta_rule_fwd_h_opt_vk
@@ -1349,27 +1349,29 @@ def test_chunk_opt_vk_preserves_legacy_positional_optional_arguments():
     initial_state_ref = torch.randn(B, H, D, D, dtype=torch.float32, device=device)
     initial_state = initial_state_ref.transpose(-1, -2).contiguous()
 
-    # Keep this call positional through num_decode_tokens. On the base API,
-    # False is use_exp2; inserting snapshot_dtype before it binds False to a
-    # dtype and raises ValueError.
+    # Keep this call positional through num_decode_tokens: it guards the
+    # positional binding of the trailing optionals, so inserting a parameter
+    # ahead of them shifts every argument right and (for example) binds False
+    # to state_dtype, which raises ValueError.
     out, final_state = chunk_gated_delta_rule_opt_vk(
         q,
         k,
         v,
-        None,
+        None,  # o
         g,
         beta,
-        None,
+        None,  # scale
         initial_state,
-        True,
-        False,
-        None,
-        False,
-        False,
-        torch.float32,
-        False,
-        0,
-        0,
+        True,  # output_final_state
+        False,  # use_qk_l2norm_in_kernel
+        None,  # cu_seqlens
+        False,  # use_chunk_hip
+        False,  # use_chunk_flydsl
+        False,  # use_prepare_flydsl
+        torch.float32,  # state_dtype
+        False,  # use_exp2
+        0,  # num_decodes
+        0,  # num_decode_tokens
     )
     ref, ref_final_state = recurrent_gated_delta_rule_ref(
         q=q,
@@ -1788,20 +1790,6 @@ def test_chunk_opt_vk_k5_hip_matches_triton_tail_gfx12():
         atol=1e-3,
     )
     assert_close("tail state HIP vs Triton", final_state_triton, final_state_hip, 0.005)
-
-
-def test_chunk_opt_vk_rejects_indexed_flydsl_state_pool():
-    with pytest.raises(ValueError, match="not supported by the FlyDSL K5 path"):
-        chunk_gated_delta_rule_opt_vk(
-            q=torch.empty(1, 1, 1, 128),
-            k=torch.empty(1, 1, 1, 128),
-            v=torch.empty(1, 1, 1, 128),
-            g=torch.empty(1, 1, 1),
-            beta=torch.empty(1, 1, 1),
-            initial_state=torch.empty(1, 1, 128, 128),
-            initial_state_indices=torch.zeros(1, dtype=torch.int32),
-            use_chunk_flydsl=True,
-        )
 
 
 def test_chunk_opt_vk_rejects_dense_index_count_mismatch():

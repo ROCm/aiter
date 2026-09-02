@@ -3,8 +3,10 @@
 
 import functools
 import os
+import re
 import sys
 import tempfile
+from pathlib import Path
 from typing import Any, ClassVar
 
 import pandas as pd
@@ -51,6 +53,15 @@ from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_LINEAR_BETA,
     get_flydsl_activation_name,
 )
+from aiter.ops.flydsl.moe_kernels import (
+    flydsl_moe_stage1,
+    flydsl_moe_stage2,
+    get_flydsl_stage1_kernels,
+    get_flydsl_stage1_kernels_int4_bf16,
+    get_flydsl_stage2_kernels,
+    get_flydsl_stage2_kernels_int4_bf16,
+    get_flydsl_stage2_v2_kernels,
+)
 from aiter.ops.flydsl.mxfp4_kname import (
     _parse_mxfp4_g1_kname,
     parse_g2_kname_any,
@@ -68,43 +79,23 @@ from aiter.utility import fp4_utils
 from aiter.utility.base_tuner import TunerCommon
 from aiter.utility.fp4_utils import moe_mxfp4_sort
 from aiter.utility.mp_tuner import mp_tuner
-
-try:
-    from aiter.ops.flydsl.utils import is_flydsl_available
-except ImportError:
-
-    def is_flydsl_available():
-        return False
-
-
-if is_flydsl_available():
-    try:
-        from aiter.ops.flydsl.moe_kernels import (
-            flydsl_moe_stage1,
-            flydsl_moe_stage2,
-            get_flydsl_stage1_kernels,
-            get_flydsl_stage1_kernels_int4_bf16,
-            get_flydsl_stage2_kernels,
-            get_flydsl_stage2_kernels_int4_bf16,
-            get_flydsl_stage2_v2_kernels,
-        )
-        from aiter.ops.flydsl.mxfp4_v2_tune_utils import (
-            build_v2_inputs as _v2_build_inputs,
-        )
-        from aiter.ops.flydsl.mxfp4_v2_tune_utils import (
-            gen as _v2_gen,
-        )
-        from aiter.ops.flydsl.mxfp4_v2_tune_utils import (
-            populate_v2_intermediate_from_ref as _v2_populate_stage2,
-        )
-        from aiter.ops.flydsl.mxfp4_v2_tune_utils import (
-            v2_stage1_sorted_ref as _v2_stage1_ref,
-        )
-    except ImportError:
-
-        def is_flydsl_available():
-            return False
-
+from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
+    build_v2_inputs as _v2_build_inputs,
+)
+from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
+    gen as _v2_gen,
+)
+from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
+    populate_v2_intermediate_from_ref as _v2_populate_stage2,
+)
+from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
+    v2_stage1_sorted_ref as _v2_stage1_ref,
+)
+from csrc.opus_moe.opus_moe_common import (
+    OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT,
+    get_opus_a8w4_stage2_kernels,
+    opus_a8w4_stage1_instances_for_shape,
+)
 
 sys.path.insert(0, f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/")
 from gemm_moe_ck2stages_common import get_gemm1_kernels_list, get_gemm2_kernels_list
@@ -138,6 +129,47 @@ def _a16w_sorted_cos(ref, res, msg="", printLog=True):
         tag = "passed~" if cos_diff < COS_DIFF_THRESHOLD else "failed!"
         print(f"{msg}[cosine_diff={cos_diff:.6f} {tag}]")
     return cos_diff
+
+
+def _candidate_dump_tag(
+    gfx,
+    cu_num,
+    token,
+    model_dim,
+    inter_dim,
+    expert,
+    topk,
+    act_type,
+    dtype,
+    q_dtype_a,
+    q_dtype_w,
+    q_type,
+    use_g1u1,
+    doweight_stage1,
+):
+    return re.sub(
+        r"[^0-9A-Za-z_.-]+",
+        "_",
+        (
+            f"{gfx}_cu{cu_num}_t{token}_h{model_dim}_i{inter_dim}_e{expert}_k{topk}"
+            f"_act{act_type}_dtype{dtype}_qa{q_dtype_a}_qw{q_dtype_w}_qt{q_type}"
+            f"_g1u1{int(use_g1u1)}_dw{int(doweight_stage1)}"
+        ),
+    )
+
+
+def _dump_prefilter_candidates(profile_df, args, stage_tag):
+    root = os.environ.get("AITER_TUNE_CANDIDATE_DUMP_DIR")
+    if not root:
+        return
+    out = profile_df.copy()
+    out["passed_err_ratio"] = out["err"] <= args.errRatio
+    out["filter_reason"] = ""
+    invalid_time = out["us"].isin([float("inf"), float("-inf"), -1])
+    out.loc[invalid_time, "filter_reason"] = "invalid_time"
+    out.loc[(out["err"] > args.errRatio) & ~invalid_time, "filter_reason"] = "err_ratio"
+    Path(root).mkdir(parents=True, exist_ok=True)
+    out.to_csv(Path(root) / f"{stage_tag}.csv", index=False)
 
 
 def _manifest_flat_by_kernel(df: pd.DataFrame) -> dict:
@@ -399,15 +431,12 @@ class FmoeTuner(TunerCommon):
     }
 
     def _clear_op_caches(self):
-        try:
-            import aiter.fused_moe as fmoe_module
+        import aiter.fused_moe as fmoe_module
 
-            if hasattr(fmoe_module, "cfg_2stages"):
-                fmoe_module.cfg_2stages = None
-            if hasattr(fmoe_module, "get_2stage_cfgs"):
-                fmoe_module.get_2stage_cfgs.cache_clear()
-        except ImportError:
-            pass
+        if hasattr(fmoe_module, "cfg_2stages"):
+            fmoe_module.cfg_2stages = None
+        if hasattr(fmoe_module, "get_2stage_cfgs"):
+            fmoe_module.get_2stage_cfgs.cache_clear()
 
     def _setup_specific_arguments(self):
 
@@ -858,6 +887,7 @@ class FmoeTuner(TunerCommon):
         topk,
         blockM,
         adtype,
+        b_dtype,
         act_type,
         device="cuda",
     ):
@@ -874,6 +904,7 @@ class FmoeTuner(TunerCommon):
             topk,
             blockM,
             adtype=adtype,
+            b_dtype=b_dtype,
             activation=act_type,
             situ_beta=DEFAULT_SITUV2_BETA,
             situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
@@ -887,9 +918,11 @@ class FmoeTuner(TunerCommon):
             token_num=token,
             block_size=blockM,
         )
-        # Match the normal FlyDSL _fp8 tune variant: a_scale_one=True expects
-        # an unscaled bf16 -> fp8 cast, not a per-1x32 quantized activation.
-        a1_qt_fp8_cast = d["inp"].to(dtypes.fp8) if adtype == "fp8" else None
+        # The a8w4 a_scale_one=True variant uses an unscaled bf16->fp8 cast.
+        # The a8w8 path uses the real per-1x32 payload and E8M0 scale instead.
+        a1_qt_fp8_cast = (
+            d["inp"].to(dtypes.fp8) if adtype == "fp8" and b_dtype == "fp4" else None
+        )
         return {
             "a1_qt": d["a1_qt"],
             "a1_qt_fp8_cast": a1_qt_fp8_cast,
@@ -968,6 +1001,7 @@ class FmoeTuner(TunerCommon):
         topk,
         blockM,
         adtype,
+        b_dtype,
         act_type,
         device="cuda",
     ):
@@ -979,6 +1013,7 @@ class FmoeTuner(TunerCommon):
             topk,
             blockM,
             adtype=adtype,
+            b_dtype=b_dtype,
             activation=act_type,
             situ_beta=DEFAULT_SITUV2_BETA,
             situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
@@ -996,7 +1031,7 @@ class FmoeTuner(TunerCommon):
             "swt": v["swt"],
             "n": v["n"],
             "max_sorted": v["max_sorted"],
-            "ref2": d["ref2"],
+            "ref2": d["ref2_quantized"] if b_dtype == "fp8" else d["ref2"],
         }
 
     @staticmethod
@@ -1054,12 +1089,11 @@ class FmoeTuner(TunerCommon):
             BK=kparams["tile_k"],
             use_nt=kparams["use_nt"],
             a_dtype=kparams["a_dtype"],
+            b_dtype=kparams["b_dtype"],
             epilog=epilog,
             SBM=sbm,
             persist=kparams["persist"],
             n_sorted_padded=n,
-            model_dim_pad=0,
-            inter_dim_pad=0,
         )
         if epilog == "reduce":
             from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
@@ -1160,8 +1194,8 @@ class FmoeTuner(TunerCommon):
         # The tuner's blockM is the moe_sorting block_m (== the kid's
         # SORT_BLOCK_M); the kernel's own B_M is kparams["kernel_block_m"].
         from aiter.ops.opus.moe_stage2_a8w4 import (
-            opus_moe_stage2_a8w4_decode_fwd,
-            opus_moe_stage2_reduce_token_slot_route_output_fwd,
+            opus_moe_stage2_a8w4_fwd,
+            stage2_launch_config,
         )
 
         block_n = int(kparams.get("kernel_block_n"))
@@ -1173,41 +1207,20 @@ class FmoeTuner(TunerCommon):
                 f"block_n={kparams.get('kernel_block_n')}"
             )
         kid = kparams["kid"]
-        reduce_block_n = kparams.get("reduce_block_n")
-        route_shape = {"token_num": int(moe_buf.shape[0]), "topk": int(topk)}
         # w2_qt / w2_scale here are ALREADY the a16w4 MFMA-tile shuffle:
         # gen_opus_2stages_task feeds "w2_qt_shffle_ck" (shuffle_weight_a16w4)
         # and "w2_scale_aiter" (shuffle_scale_a16w4). opus consumes them as-is.
         w2_use = w2_qt
         w2_scale_opus = w2_scale
-        if kparams["route_out"]:
-            route_out = opus_moe_stage2_a8w4_decode_fwd(
-                a2_qt,
-                w2_use,
-                a2_scale,
-                w2_scale_opus,
-                sorted_ids,
-                sorted_weights,
-                sorted_expert_ids,
-                num_valid_ids,
-                block_m=blockM,
-                kernel_id=kid,
-                inter_dim_pad=0,
-                return_per_slot=True,
-                **route_shape,
+        launch = stage2_launch_config(kid)
+        if launch.sort_block_m != int(blockM):
+            raise ValueError(
+                f"Opus A8W4 stage2 kid {kid} requires sort block_m="
+                f"{launch.sort_block_m}, got {blockM}"
             )
-            if route_out.dtype == torch.uint8:  # MXFP8 route_out
-                return opus_moe_stage2_reduce_token_slot_route_output_fwd(
-                    route_out, out=moe_buf, topk=int(topk), block_n=reduce_block_n
-                )
-            return opus_moe_stage2_reduce_token_slot_route_output_fwd(
-                route_out.view(moe_buf.shape[0], int(topk), moe_buf.shape[1]),
-                out=moe_buf,
-                topk=int(topk),
-                block_n=reduce_block_n,
-            )
-        moe_buf.zero_()
-        return opus_moe_stage2_a8w4_decode_fwd(
+        if not launch.route_out:
+            moe_buf.zero_()
+        return opus_moe_stage2_a8w4_fwd(
             a2_qt,
             w2_use,
             a2_scale,
@@ -1216,11 +1229,11 @@ class FmoeTuner(TunerCommon):
             sorted_weights,
             sorted_expert_ids,
             num_valid_ids,
+            launch=launch,
             out=moe_buf,
-            block_m=blockM,
-            kernel_id=kid,
             inter_dim_pad=0,
-            **route_shape,
+            token_num=int(moe_buf.shape[0]),
+            topk=int(topk),
         )
 
     @staticmethod
@@ -3391,8 +3404,6 @@ class FmoeTuner(TunerCommon):
 
     def gen_flydsl_2stages_task(self, info, blockMs):
         tasks_flydsl = []
-        if not is_flydsl_available():
-            return tasks_flydsl
         (
             _gfx,
             _cu_num,
@@ -3438,7 +3449,8 @@ class FmoeTuner(TunerCommon):
         )
 
         for blockM in blockMs:
-            if blockM not in [32, 64, 128] or not use_g1u1:
+            # 16 included: a16w4/a8w4 emit t16 names, s1_tile_m drops the rest.
+            if blockM not in [16, 32, 64, 128] or not use_g1u1:
                 continue
             for kname, kparams in flydsl_s1_kernels.items():
                 is_splitk = kparams.get("k_batch", 1) > 1
@@ -3468,7 +3480,8 @@ class FmoeTuner(TunerCommon):
                 # otherwise pick it. Require num_acc_n >= 1 for a16w4.
                 if a_dtype_str == "bf16":
                     _n_waves = max(1, 4 // _kw)
-                    if (kparams["tile_n"] // _n_waves) < 16:
+                    # Match the kernel assert; a floor divide lets tile_n=96 through.
+                    if kparams["tile_n"] % (16 * _n_waves) != 0:
                         continue
 
                 # (kernel_name, kparams, is_fp4, is_fp8)
@@ -3635,13 +3648,13 @@ class FmoeTuner(TunerCommon):
                 # Skip a16w-mix stage2 candidates the port can't run correctly:
                 #  - _sbm (tile_m<blockM) re-tiles the SORTED [sorted_size, inter]
                 #    stream finer than the moe_sorting padding -> queue fault;
-                #  - tile_n=256 over-allocates LDS at large tile_m (compile failure
-                #    that takes the worker pool down); tile_n=128 covers the shape;
+                #  - LDS is tile_m*(tile_k*2 + tile_n*4); over 160 KiB the build fails;
                 #  - tile_k must divide inter_dim (K); tile_k=256 on non-256 inter
                 #    (e.g. 384) is parsed verbatim by the wrapper -> OOB/wrong out.
+                _s2_lds = s2_tile_m * (kparams["tile_k"] * 2 + kparams["tile_n"] * 4)
                 if a_dtype_str == "bf16" and (
                     s2_tile_m != blockM
-                    or kparams["tile_n"] == 256
+                    or _s2_lds > 160 * 1024
                     or inter_dim % kparams["tile_k"] != 0
                 ):
                     continue
@@ -3745,8 +3758,6 @@ class FmoeTuner(TunerCommon):
 
     def gen_flydsl_v2_2stages_task(self, info, blockMs):
         tasks = []
-        if not is_flydsl_available():
-            return tasks
         (
             _gfx,
             _cu_num,
@@ -3756,31 +3767,35 @@ class FmoeTuner(TunerCommon):
             expert,
             topk,
             act_type,
-            _dtype,
+            dtype,
             q_dtype_a,
             q_dtype_w,
             q_type,
             use_g1u1,
-            _doweight_stage1,
+            doweight_stage1,
         ) = info
-        # gate: per_1x32, fp4 weight + fp4/fp8 activation (fused), use_g1u1 (design 4.3)
+        if dtype != dtypes.bf16:
+            return tasks
+        if doweight_stage1:
+            return tasks
         if q_type != QuantType.per_1x32 or not use_g1u1:
             return tasks
-        if q_dtype_w != dtypes.fp4x2:
+        if q_dtype_a == dtypes.fp4x2 and q_dtype_w == dtypes.fp4x2:
+            adtype, bdtype = "fp4", "fp4"
+        elif q_dtype_a == dtypes.fp8 and q_dtype_w == dtypes.fp4x2:
+            adtype, bdtype = "fp8", "fp4"
+        elif q_dtype_a == dtypes.fp8 and q_dtype_w == dtypes.fp8:
+            adtype, bdtype = "fp8", "fp8"
+        else:
             return tasks
-        adtype = (
-            "fp4"
-            if q_dtype_a == dtypes.fp4x2
-            else ("fp8" if q_dtype_a == dtypes.fp8 else None)
-        )
-        if adtype is None:
-            return tasks
-
-        from aiter.ops.flydsl.mxfp4_v2_tune_utils import v2_stage1_dequant_cosine_err
 
         # v2 always fuses quant; dtype is bf16 out layout at the flydsl kernel level.
         out_dtype_str = "bf16"
-        s1_kernels = get_flydsl_stage1_kernels(adtype, "fp4", out_dtype_str)
+        s1_kernels = get_flydsl_stage1_kernels(adtype, bdtype, out_dtype_str)
+
+        from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
+            v2_stage1_dequant_cosine_err,
+        )
 
         for blockM in blockMs:
             if blockM not in (32, 64, 128):
@@ -3806,13 +3821,15 @@ class FmoeTuner(TunerCommon):
                     s1_params = {
                         **kparams,
                         "out_dtype": "fp8",
-                        "a_scale_one": True,
+                        "a_scale_one": bdtype == "fp4",
                         "gate_mode": "interleave",
                     }
                 else:
                     s1_name = kname + "_fp4"
                     s1_params = {**kparams, "out_dtype": "fp4"}
-                a1_key = "a1_qt_fp8_cast" if adtype == "fp8" else "a1_qt"
+                a1_key = (
+                    "a1_qt_fp8_cast" if adtype == "fp8" and bdtype == "fp4" else "a1_qt"
+                )
                 # info tag: (..., blockM, flat_flag=0, v2=1) -- tail[3]=flat (post_process int(tail[3]) default), tail[4]=v2 marker
                 tasks.append(
                     (
@@ -3826,6 +3843,7 @@ class FmoeTuner(TunerCommon):
                             topk,
                             blockM,
                             adtype,
+                            bdtype,
                             act_type,
                         ),
                         FmoeTuner.run_flydsl_v2_stage1_out,
@@ -3867,7 +3885,12 @@ class FmoeTuner(TunerCommon):
                 )
             # ---- v2 stage2 tasks ----
             for kn2, kp in get_flydsl_stage2_v2_kernels(
-                adtype, "fp4", "bf16", blockM, model_dim=model_dim, inter_dim=inter_dim
+                adtype,
+                bdtype,
+                "bf16",
+                blockM,
+                model_dim=model_dim,
+                inter_dim=inter_dim,
             ).items():
                 kp = {**kp, "a_dtype": adtype}
                 # flat=0, v2=1
@@ -3883,6 +3906,7 @@ class FmoeTuner(TunerCommon):
                             topk,
                             blockM,
                             adtype,
+                            bdtype,
                             act_type,
                         ),
                         FmoeTuner.run_flydsl_v2_stage2_out,
@@ -3941,16 +3965,6 @@ class FmoeTuner(TunerCommon):
             use_g1u1,
             doweight_stage1,
         ) = info
-
-        from aiter.ops.opus.moe_stage2_a8w4_meta import (
-            OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT,
-            get_opus_a8w4_stage2_kernels,
-        )
-
-        sys.path.insert(0, f"{AITER_CSRC_DIR}/opus_moe/")
-        from opus_moe_common import (
-            opus_a8w4_stage1_instances_for_shape,
-        )
 
         k_step_packed = (
             OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT.bk_logical
@@ -4224,8 +4238,6 @@ class FmoeTuner(TunerCommon):
 
     def gen_flydsl_i4_2stages_task(self, info, blockMs):
         tasks_flydsl = []
-        if not is_flydsl_available():
-            return tasks_flydsl
         (
             _gfx,
             _cu_num,
@@ -4900,8 +4912,9 @@ class FmoeTuner(TunerCommon):
             # TUNE_ONLY: comma-list subset gate to isolate sources, e.g.
             #   TUNE_ONLY=flydsl  -> only gen_flydsl_2stages_task
             #   TUNE_ONLY=opus    -> only gen_opus_2stages_task
-            # empty = all (subject to OPUS_ONLY / OPUS_SKIP_CKTILE below).
-            _tune_only = {s for s in os.environ.get("TUNE_ONLY", "").split(",") if s}
+            # unset = flydslv2; empty = all (subject to OPUS_ONLY / OPUS_SKIP_CKTILE).
+            tune_only = os.environ.get("TUNE_ONLY", "flydslv2")
+            _tune_only = {s for s in tune_only.split(",") if s}
 
             def _want(name, _opus_only=_opus_only, _tune_only=_tune_only):
                 if _tune_only:
@@ -5127,6 +5140,34 @@ class FmoeTuner(TunerCommon):
                 ],
             )
             prorfiles.append(profileDF)
+
+            dump_tag = _candidate_dump_tag(
+                gfx,
+                cu_num,
+                token,
+                model_dim,
+                inter_dim,
+                expert,
+                topk,
+                act_type,
+                dtype,
+                q_dtype_a,
+                q_dtype_w,
+                q_type,
+                use_g1u1,
+                doweight_stage1,
+            )
+            _dump_prefilter_candidates(profileDF, args, dump_tag)
+            if args.verbose:
+                invalid_time = profileDF["us"].isin([float("inf"), float("-inf"), -1])
+                passed = profileDF["err"] <= args.errRatio
+                eligible = passed & ~invalid_time
+                print(
+                    "  candidate summary: "
+                    f"generated={len(profileDF)} passed={int(passed.sum())} "
+                    f"timed={int((~invalid_time).sum())} "
+                    f"filtered={int((~eligible).sum())}"
+                )
 
             ## remove invalid candidate
             profileDF = profileDF[

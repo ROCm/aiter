@@ -1,10 +1,7 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_ogs.py
 
-import functools
 import itertools
-import json
-import os
 
 import torch
 import triton
@@ -22,25 +19,8 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a4w4 import (
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
-
-GLUON_SUPPORTED_ARCHS = {"gfx1250"}
-
-
-def is_gluon_supported():
-    arch = get_arch()
-    return arch in GLUON_SUPPORTED_ARCHS
-
-
-@functools.lru_cache
-def _get_a4w4_dispatch(arch: str) -> dict:
-    fpath = f"{AITER_TRITON_CONFIGS_PATH}/moe/{arch}-A4W4.json"
-    if os.path.exists(fpath):
-        with open(fpath, "r") as f:
-            return json.load(f)
-    return {}
-
+from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
 
 # -----------------------------------------------------------------------------
 #                    Matrix Multiplication + Outer Gather/Scatter
@@ -164,7 +144,7 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     num_xcds = 1
 
     arch = get_arch()
-    tuned = _get_a4w4_dispatch(arch)
+    tuned = get_moe_dispatch("A4W4", arch, "gluon")
     key = f"bm{block_m}_n{n}_k{k}_{m2bucket(m)}"
     if key not in tuned:
         key = f"bm{block_m}_any"
@@ -271,7 +251,7 @@ def moe_gemm_a4w4(
     swiglu_add_residual=True,
     unpadded_N=None,
     unpadded_K=None,
-    backend=None,  # "triton" | "gluon"
+    backend=None,
 ):
     """
     Y[:, :] = 0.
@@ -279,18 +259,17 @@ def moe_gemm_a4w4(
         Y[idxs_y_m(e), :] += matmul(X[idxs_x_m(e), :], W[e, :, :])
     """
     if backend is None:
-        # default to gluon backend if supported
-        backend = "gluon" if is_gluon_supported() else "triton"
-    assert backend in ["triton", "gluon"], f"Invalid backend: {backend}"
+        backend = "gluon" if get_arch() == "gfx1250" else "triton"
+    assert backend in ("triton", "gluon"), f"Invalid backend: {backend}"
     if backend == "gluon":
-        # make sure gluon backend is supported on this architecture
         assert (
-            is_gluon_supported()
-        ), f"Gluon backend is not supported on this architecture: {get_arch()}"
+            get_arch() == "gfx1250"
+        ), f"Gluon backend requires gfx1250, got {get_arch()}"
     use_gluon = backend == "gluon"
-
     if preshuffle_weights:
-        assert use_gluon, "Preshuffled weights are only supported on gluon backend"
+        assert (
+            use_gluon
+        ), "preshuffled weights are only supported by the gluon (gfx1250) kernel"
 
     assert w.stride(-2) == 1, "`w` must be column-major when it has data-type mxfp"
     assert x.stride(-1) == 1, "'x' must be row-major when it has data-type mxfp"
@@ -372,7 +351,7 @@ def moe_gemm_a4w4(
     grid = grid_m * grid_n * split_k
 
     # launch kernel
-    if use_gluon and get_arch() == "gfx1250" and block_m == 16:
+    if use_gluon and block_m == 16:
         layouts = get_moe_a4w4_layouts_decode(
             BLOCK_M=config["block_m"],
             BLOCK_N=config["block_n"],
@@ -435,7 +414,7 @@ def moe_gemm_a4w4(
             **layouts,
             num_warps=config["num_warps"],
         )
-    elif use_gluon and get_arch() == "gfx1250":
+    elif use_gluon:
         # layouts
         layouts = get_moe_a4w4_layouts_prefill(
             BLOCK_M=config["block_m"],
