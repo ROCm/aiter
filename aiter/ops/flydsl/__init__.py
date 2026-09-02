@@ -38,16 +38,16 @@ if is_flydsl_available():
         )
 
     from .fmha_kernels import flydsl_flash_attn_func
-    from .gemm_kernels import flydsl_hgemm, flydsl_preshuffle_gemm_a8
-    from .kernels.mqa_logits.fp8_mqa_logits import (
+    from .fp8_mqa_logits_kernels import (
         DEFAULT_VARIANT as FP8_MQA_LOGITS_DEFAULT_VARIANT,
     )
-    from .kernels.mqa_logits.fp8_mqa_logits import (
+    from .fp8_mqa_logits_kernels import (
         KERNEL_VARIANTS as FP8_MQA_LOGITS_VARIANTS,
     )
-    from .kernels.mqa_logits.fp8_mqa_logits import (
+    from .fp8_mqa_logits_kernels import (
         flydsl_fp8_mqa_logits,
     )
+    from .gemm_kernels import flydsl_hgemm, flydsl_preshuffle_gemm_a8
     from .kernels.mqa_logits.pa_mqa_logits_fp4 import (
         flydsl_pa_mqa_logits_fp4,
     )

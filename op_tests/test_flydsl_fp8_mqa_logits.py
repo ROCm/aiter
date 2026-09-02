@@ -401,12 +401,17 @@ def bench_fp8_mqa_logits(
     ref_mask = ref == float("-inf")
 
     flops = cost.item() * num_heads * head_dim * 2
+    # clean_logits=True writes the full [s_q, s_k] matrix (window + -inf fill);
+    # clean_logits=False writes only the selected window (`cost` positions), so
+    # counting s_q*s_k there would claim full-output bandwidth even when the
+    # window is empty and nothing was written at all.
+    out_elems = s_q * s_k if clean_logits else cost.item()
     nbytes = (
         s_q * num_heads * head_dim
         + s_k * head_dim  # Q + KV (fp8)
         + (s_k + s_q * num_heads) * 4  # scales + weights
         + 2 * s_q * 4  # ks + ke
-        + s_q * s_k * 4  # output
+        + out_elems * 4  # output
     )
 
     ret = {"gfx": get_gfx(), "status": "ok"}
@@ -418,8 +423,9 @@ def bench_fp8_mqa_logits(
         ret[f"{name} us"] = us
         # NaN, not 0, when the windows select nothing: every row of this sweep
         # with an empty window has flops == 0, and a 0 in a TFLOPS column reads
-        # as a broken measurement rather than as "there was no work to do". The
-        # kernel still writes the -inf fill, so TB/s stays meaningful.
+        # as a broken measurement rather than as "there was no work to do".
+        # TB/s stays meaningful either way: clean_logits=True still counts the
+        # -inf fill traffic via out_elems == s_q*s_k above.
         ret[f"{name} TFLOPS"] = flops / us / 1e6 if flops > 0 else float("nan")
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = err
@@ -584,7 +590,7 @@ def main():
             (1024, 1000),
         ],
     )
-    parser.add_argument("--num-heads", type=int, nargs="*", default=[64, 128])
+    parser.add_argument("--num-heads", type=int, nargs="*", default=[32, 64, 128])
     parser.add_argument("--head-dim", type=int, nargs="*", default=[64, 128])
     parser.add_argument(
         "--q-dtype",
