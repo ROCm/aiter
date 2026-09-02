@@ -25,7 +25,6 @@ from aiter.ops.flydsl.moe_kernels import (
     pick_flydsl_stage2_tile_k,
     resolve_flydsl_stage2_tile_k,
 )
-from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.ops.quant import (
     mxfp4_moe_sort_fwd,
     per_1x32_f4_quant,
@@ -39,7 +38,7 @@ from aiter.utility.fp4_utils import e8m0_shuffle
 Q_TYPE = QuantType.per_1x32
 
 _SKIP_GFX950_FLYDSL = pytest.mark.skipif(
-    get_gfx() not in ("gfx950",) or not is_flydsl_available(),
+    get_gfx() not in ("gfx950",),
     reason="gfx950 FlyDSL required",
 )
 

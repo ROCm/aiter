@@ -2,6 +2,8 @@ import torch
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
 # =====================================================================
 # Utility
 # =====================================================================
@@ -261,12 +263,23 @@ def _get_prefill_autotune_configs():
     ]
 
 
+_sparse_attn_prefill_kernel_repr = make_kernel_repr(
+    "_sparse_attn_prefill_kernel",
+    [
+        "HAS_ATTN_SINK",
+        "BLOCK_H",
+        "BLOCK_D",
+        "BLOCK_K",
+    ],
+)
+
+
 @triton.autotune(
     configs=_get_prefill_autotune_configs(),
     key=["num_heads", "head_dim", "HAS_ATTN_SINK"],
     prune_configs_by={"early_config_prune": _prefill_prune_configs},
 )
-@triton.jit
+@triton.jit(repr=_sparse_attn_prefill_kernel_repr)
 def _sparse_attn_prefill_kernel(
     q_ptr,  # [num_queries, num_heads, head_dim]
     kv_ptr,  # [num_kv, head_dim]

@@ -1,10 +1,18 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
 
+_mha_v4_per_tensor_amax_repr = make_kernel_repr(
+    "mha_v4_per_tensor_amax_kernel",
+    [
+        "BLOCK_SIZE",
+    ],
+)
 
-@triton.jit
+
+@triton.jit(repr=_mha_v4_per_tensor_amax_repr)
 def mha_v4_per_tensor_amax_kernel(
     input_ptr,
     partial_ptr,
@@ -19,7 +27,15 @@ def mha_v4_per_tensor_amax_kernel(
     tl.store(partial_ptr + block, tl.max(tl.abs(values), axis=0))
 
 
-@triton.jit
+_mha_v4_per_tensor_scale_repr = make_kernel_repr(
+    "mha_v4_per_tensor_scale_kernel",
+    [
+        "BLOCK_SIZE",
+    ],
+)
+
+
+@triton.jit(repr=_mha_v4_per_tensor_scale_repr)
 def mha_v4_per_tensor_scale_kernel(
     partial_ptr,
     scale_ptr,
@@ -35,7 +51,16 @@ def mha_v4_per_tensor_scale_kernel(
     tl.store(scale_ptr, scale)
 
 
-@triton.jit
+_mha_v4_per_tensor_quant_repr = make_kernel_repr(
+    "mha_v4_per_tensor_quant_kernel",
+    [
+        "IS_INT8",
+        "BLOCK_SIZE",
+    ],
+)
+
+
+@triton.jit(repr=_mha_v4_per_tensor_quant_repr)
 def mha_v4_per_tensor_quant_kernel(
     input_ptr,
     output_ptr,
@@ -182,7 +207,16 @@ def _compute_mx_quant_and_scale_rne(
     return out_tensor, dequant_scale_exponent
 
 
-@triton.jit
+_sage_quant_v_repr = make_kernel_repr(
+    "sage_quant_v_kernel",
+    [
+        "D",
+        "BLK_K",
+    ],
+)
+
+
+@triton.jit(repr=_sage_quant_v_repr)
 def sage_quant_v_kernel(
     V_Input,
     V_Output,
@@ -229,7 +263,16 @@ def sage_quant_v_kernel(
     tl.store(v_output_ptrs, v_quant, mask=offs_kn[:, None] < SEQLEN_K)
 
 
-@triton.jit
+_sage_quant_v_amax_partial_repr = make_kernel_repr(
+    "sage_quant_v_amax_partial_kernel",
+    [
+        "D",
+        "BLOCK_K",
+    ],
+)
+
+
+@triton.jit(repr=_sage_quant_v_amax_partial_repr)
 def sage_quant_v_amax_partial_kernel(
     V_Input,
     Partial_Max,
@@ -266,7 +309,17 @@ def sage_quant_v_amax_partial_kernel(
     tl.store(Partial_Max + out, partial)
 
 
-@triton.jit
+_sage_quant_v_amax_finalize_repr = make_kernel_repr(
+    "sage_quant_v_amax_finalize_kernel",
+    [
+        "D",
+        "BLOCK_N",
+        "BLOCK_D",
+    ],
+)
+
+
+@triton.jit(repr=_sage_quant_v_amax_finalize_repr)
 def sage_quant_v_amax_finalize_kernel(
     Partial_Max,
     V_Scale,
@@ -496,7 +549,19 @@ def sage_quant_v_mxfp4_colmajor_kernel(
     )
 
 
-@triton.jit
+_rotate_quantize_q_repr = make_kernel_repr(
+    "_rotate_quantize_q_kernel",
+    [
+        "q_smoothing",
+        "hadamard_rotation",
+        "BLOCK_M",
+        "BLOCK_R",
+        "D",
+    ],
+)
+
+
+@triton.jit(repr=_rotate_quantize_q_repr)
 def _rotate_quantize_q_kernel(
     Q,
     Q_q,
@@ -620,7 +685,19 @@ def _rotate_quantize_q_kernel(
     )
 
 
-@triton.jit
+_rotate_quantize_k_repr = make_kernel_repr(
+    "_rotate_quantize_k_kernel",
+    [
+        "q_smoothing",
+        "hadamard_rotation",
+        "BLOCK_M",
+        "BLOCK_R",
+        "D",
+    ],
+)
+
+
+@triton.jit(repr=_rotate_quantize_k_repr)
 def _rotate_quantize_k_kernel(
     Q,
     Q_q,
@@ -922,7 +999,17 @@ def _rotate_quantize_qk_kernel(
     )
 
 
-@triton.jit
+_rot_q_repr = make_kernel_repr(
+    "_rot_q_kernel",
+    [
+        "q_smoothing",
+        "BLOCK_M",
+        "BLOCK_D",
+    ],
+)
+
+
+@triton.jit(repr=_rot_q_repr)
 def _rot_q_kernel(
     Q,
     Q_rot,
@@ -1022,7 +1109,16 @@ def _rot_q_kernel(
     )
 
 
-@triton.jit
+_rot_k_only_repr = make_kernel_repr(
+    "_rot_k_only_kernel",
+    [
+        "BLOCK_M",
+        "BLOCK_D",
+    ],
+)
+
+
+@triton.jit(repr=_rot_k_only_repr)
 def _rot_k_only_kernel(
     K,
     K_rot,
@@ -1090,7 +1186,15 @@ def _rot_k_only_kernel(
     )
 
 
-@triton.jit
+_compute_delta_s_repr = make_kernel_repr(
+    "_compute_delta_s_kernel",
+    [
+        "BLOCK_N",
+    ],
+)
+
+
+@triton.jit(repr=_compute_delta_s_repr)
 def _compute_delta_s_kernel(
     Q_mean,
     K_rot,
@@ -1165,7 +1269,16 @@ def _compute_delta_s_kernel(
     tl.store(s_ptr, acc, mask=offs_n < seq_k)
 
 
-@triton.jit
+_q_smooth_int8_repr = make_kernel_repr(
+    "_q_smooth_int8_kernel",
+    [
+        "BLOCK_M",
+        "BLOCK_D",
+    ],
+)
+
+
+@triton.jit(repr=_q_smooth_int8_repr)
 def _q_smooth_int8_kernel(
     Q,
     Q_out,
@@ -1239,7 +1352,19 @@ def _q_smooth_int8_kernel(
     )
 
 
-@triton.jit
+_sage_quant_repr = make_kernel_repr(
+    "sage_quant_kernel",
+    [
+        "SEQLEN_K_PADDED",
+        "INT8_MAX",
+        "D",
+        "BLK_Q",
+        "BLK_K",
+    ],
+)
+
+
+@triton.jit(repr=_sage_quant_repr)
 def sage_quant_kernel(
     Q_Input,
     Q_Output,
