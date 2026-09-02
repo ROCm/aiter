@@ -20,7 +20,8 @@ from .communication_ops_utils import (
     store_i64_global_system,
 )
 
-_JIT_SCHEMA_VERSION = "v4-fused-in-hop-qk-norm-rope"
+_JIT_SCHEMA_VERSION = "v5-batched-push-depth-16"
+_PUSH_PIPELINE_DEPTH = 16
 
 
 def make_fused_a2a_kernel(
@@ -157,60 +158,95 @@ def make_fused_a2a_kernel(
                     wave_reduce_add(sq_acc) * (1.0 / hd) + 1.0e-6,
                     fastmath=fm_fast,
                 )
-                for tile_idx in range_constexpr(n_tiles):
-                    col = tile_idx * tile + lane * vec
-                    weights = fx.Vector(
-                        buffer_load(rsrc_norm, col, vec_width=vec, dtype=T.bf16)
-                    ).to(fx.Float32)
-                    values_f = tiles[tile_idx].to(fx.Float32)
-                    scaled = [
-                        values_f[i] * rstd * weights[i] for i in range_constexpr(vec)
-                    ]
-                    rotated = [None] * vec
-                    for pair in range_constexpr(vec // 2):
-                        even = scaled[2 * pair]
-                        odd = scaled[2 * pair + 1]
-                        cos_even = (
-                            cos_f[2 * pair] if pair < 2 else cos_f_hi[2 * pair - 4]
+                for batch_start in range_constexpr(0, n_tiles, _PUSH_PIPELINE_DEPTH):
+                    outputs = []
+                    destinations = []
+                    batch_size = min(_PUSH_PIPELINE_DEPTH, n_tiles - batch_start)
+                    for batch_idx in range_constexpr(batch_size):
+                        tile_idx = batch_start + batch_idx
+                        col = tile_idx * tile + lane * vec
+                        weights = fx.Vector(
+                            buffer_load(rsrc_norm, col, vec_width=vec, dtype=T.bf16)
+                        ).to(fx.Float32)
+                        values_f = tiles[tile_idx].to(fx.Float32)
+                        scaled = [
+                            values_f[i] * rstd * weights[i]
+                            for i in range_constexpr(vec)
+                        ]
+                        rotated = [None] * vec
+                        for pair in range_constexpr(vec // 2):
+                            even = scaled[2 * pair]
+                            odd = scaled[2 * pair + 1]
+                            cos_even = (
+                                cos_f[2 * pair] if pair < 2 else cos_f_hi[2 * pair - 4]
+                            )
+                            sin_odd = (
+                                sin_f[2 * pair + 1]
+                                if pair < 2
+                                else sin_f_hi[2 * pair - 3]
+                            )
+                            rotated[2 * pair] = even * cos_even - odd * sin_odd
+                            rotated[2 * pair + 1] = even * sin_odd + odd * cos_even
+                        outputs.append(
+                            fx.Vector.from_elements(
+                                [value.ir_value() for value in rotated],
+                                dtype=fx.Float32,
+                            ).to(fx.BFloat16)
                         )
-                        sin_odd = (
-                            sin_f[2 * pair + 1] if pair < 2 else sin_f_hi[2 * pair - 3]
+                        head = col // head_dim
+                        row_chunk = (col % head_dim) // vec
+                        dest_pe = head // heads_local
+                        local_head = head % heads_local
+                        dst_row = local_head * seq_full + rank * seq_len + seq
+                        dst_offset = fx.Int64(dst_row * row_nbytes + row_chunk * 16)
+                        peer_base = fx.memref_load(p2p_bases, dest_pe)
+                        destinations.append(
+                            create_buffer_resource_from_addr(peer_base + dst_offset)
                         )
-                        rotated[2 * pair] = even * cos_even - odd * sin_odd
-                        rotated[2 * pair + 1] = even * sin_odd + odd * cos_even
-                    output = fx.Vector.from_elements(
-                        [value.ir_value() for value in rotated], dtype=fx.Float32
-                    ).to(fx.BFloat16)
-                    head = col // head_dim
-                    row_chunk = (col % head_dim) // vec
-                    dest_pe = head // heads_local
-                    local_head = head % heads_local
-                    dst_row = local_head * seq_full + rank * seq_len + seq
-                    dst_offset = fx.Int64(dst_row * row_nbytes + row_chunk * 16)
-                    peer_base = fx.memref_load(p2p_bases, dest_pe)
-                    buffer_store(
-                        output,
-                        create_buffer_resource_from_addr(peer_base + dst_offset),
-                        0,
-                    )
+                    for batch_idx in range_constexpr(batch_size):
+                        buffer_store(outputs[batch_idx], destinations[batch_idx], 0)
 
         process_qk(rsrc_input_q, rsrc_norm_q, p2p_bases_q)
         process_qk(rsrc_input_k, rsrc_norm_k, p2p_bases_k)
 
-        for chunk_idx in range(global_warp_id, total_chunks, global_warp_num):
-            row = chunk_idx // chunks_per_row
-            row_chunk = chunk_idx % chunks_per_row
-            seq = row // heads
-            head = row % heads
-            dest_pe = head // heads_local
-            local_head = head % heads_local
-            peer_base_v = fx.memref_load(p2p_bases_v, dest_pe)
-            dst_row = local_head * seq_full + rank * seq_len + seq
-            dst_offset = fx.Int64(dst_row * row_nbytes + row_chunk * 16)
-            rsrc_dst_v = create_buffer_resource_from_addr(peer_base_v + dst_offset)
-            i32_offset = chunk_idx * 4
-            value_v = buffer_load(rsrc_input_v, i32_offset, vec_width=4, dtype=T.i32)
-            buffer_store(value_v, rsrc_dst_v, 0)
+        chunk_step = global_warp_num * _PUSH_PIPELINE_DEPTH
+        for chunk_base in range(global_warp_id, total_chunks, chunk_step):
+            values_v = []
+            destinations_v = []
+            for batch_idx in range_constexpr(_PUSH_PIPELINE_DEPTH):
+                chunk_idx = chunk_base + batch_idx * global_warp_num
+                valid = chunk_idx < total_chunks
+                safe_chunk_idx = valid.select(chunk_idx, 0)
+                row = safe_chunk_idx // chunks_per_row
+                row_chunk = safe_chunk_idx % chunks_per_row
+                seq = row // heads
+                head = row % heads
+                dest_pe = head // heads_local
+                local_head = head % heads_local
+                peer_base_v = fx.memref_load(p2p_bases_v, dest_pe)
+                dst_row = local_head * seq_full + rank * seq_len + seq
+                dst_offset = fx.Int64(dst_row * row_nbytes + row_chunk * 16)
+                values_v.append(
+                    buffer_load(
+                        rsrc_input_v,
+                        safe_chunk_idx * 4,
+                        vec_width=4,
+                        dtype=T.i32,
+                    )
+                )
+                destinations_v.append(
+                    create_buffer_resource_from_addr(peer_base_v + dst_offset)
+                )
+            for batch_idx in range_constexpr(_PUSH_PIPELINE_DEPTH):
+                chunk_idx = chunk_base + batch_idx * global_warp_num
+                buffer_store(
+                    values_v[batch_idx],
+                    destinations_v[batch_idx],
+                    0,
+                    mask=chunk_idx < total_chunks,
+                )
+
+        fx.rocdl.s_waitcnt(vmcnt=0)
 
         # All blocks must be resident: this is a grid-wide software barrier.
         fx.barrier()
@@ -352,20 +388,40 @@ def make_fused_a2a_out_kernel(
         fx.barrier()
 
         rsrc_input = create_buffer_resource_from_addr(addr_input)
-        for chunk_idx in range(global_warp_id, total_chunks, global_warp_num):
-            dest_pe = chunk_idx // peer_chunks
-            dest_chunk = chunk_idx % peer_chunks
-            seq = dest_chunk // (heads_local * chunks_per_row)
-            head_chunk = dest_chunk % (heads_local * chunks_per_row)
-            local_head = head_chunk // chunks_per_row
-            row_chunk = head_chunk % chunks_per_row
-            src_row = local_head * seq_full + dest_pe * seq_local + seq
-            src_offset = src_row * chunks_per_row * 4 + row_chunk * 4
-            value = buffer_load(rsrc_input, src_offset, vec_width=4, dtype=T.i32)
-            peer_base = fx.memref_load(p2p_bases, dest_pe)
-            dst_addr = peer_base + fx.Int64(rank * peer_chunks * 16 + dest_chunk * 16)
-            buffer_store(value, create_buffer_resource_from_addr(dst_addr), 0)
+        chunk_step = global_warp_num * _PUSH_PIPELINE_DEPTH
+        for chunk_base in range(global_warp_id, total_chunks, chunk_step):
+            values = []
+            destinations = []
+            for batch_idx in range_constexpr(_PUSH_PIPELINE_DEPTH):
+                chunk_idx = chunk_base + batch_idx * global_warp_num
+                valid = chunk_idx < total_chunks
+                safe_chunk_idx = valid.select(chunk_idx, 0)
+                dest_pe = safe_chunk_idx // peer_chunks
+                dest_chunk = safe_chunk_idx % peer_chunks
+                seq = dest_chunk // (heads_local * chunks_per_row)
+                head_chunk = dest_chunk % (heads_local * chunks_per_row)
+                local_head = head_chunk // chunks_per_row
+                row_chunk = head_chunk % chunks_per_row
+                src_row = local_head * seq_full + dest_pe * seq_local + seq
+                src_offset = src_row * chunks_per_row * 4 + row_chunk * 4
+                values.append(
+                    buffer_load(rsrc_input, src_offset, vec_width=4, dtype=T.i32)
+                )
+                peer_base = fx.memref_load(p2p_bases, dest_pe)
+                dst_addr = peer_base + fx.Int64(
+                    rank * peer_chunks * 16 + dest_chunk * 16
+                )
+                destinations.append(create_buffer_resource_from_addr(dst_addr))
+            for batch_idx in range_constexpr(_PUSH_PIPELINE_DEPTH):
+                chunk_idx = chunk_base + batch_idx * global_warp_num
+                buffer_store(
+                    values[batch_idx],
+                    destinations[batch_idx],
+                    0,
+                    mask=chunk_idx < total_chunks,
+                )
 
+        fx.rocdl.s_waitcnt(vmcnt=0)
         fx.barrier()
         if tid == 0:
             atomic_add_global_at(addr_grid_barrier, 1)
