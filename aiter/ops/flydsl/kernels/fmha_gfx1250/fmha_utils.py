@@ -6,7 +6,7 @@ from flydsl._mlir.dialects import fly as fly_d
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import rocdl as rocdl_dialect
 from flydsl._mlir.dialects import scf
-from flydsl.expr import arith, rocdl
+from flydsl.expr import rocdl
 from flydsl.expr.primitive import const_expr, range_constexpr
 from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import Float32, T
@@ -316,8 +316,9 @@ def emit_void(inst_str, operands=None, constraints="", **kwargs):
 
 
 def sched_barrier(mask=0):
-    mask_val = arith.constant(mask, type=T.i32)
-    llvm_dialect.call_intrinsic(None, "llvm.amdgcn.sched.barrier", [mask_val], [], [])
+    llvm_dialect.call_intrinsic(
+        None, "llvm.amdgcn.sched.barrier", [fx.Int32(mask).ir_value()], [], []
+    )
 
 
 def get_types():
@@ -349,7 +350,7 @@ def _wmma_bf16(mlir_types, src_a, src_b, acc):
     ).result
 
 
-class Atom:
+class ScheduleAtom:
     @staticmethod
     def wmma_init(mlir_types, src_a, src_b):
         return _wmma_bf16(
@@ -441,7 +442,7 @@ class Atom:
     @staticmethod
     def cvt_pk_bf16_f32(a):
         sched_barrier(0)
-        return arith.truncf(T.vec(2, T.bf16), a)
+        return a.truncf(T.vec(2, T.bf16))
 
     @staticmethod
     def s_wait_dscnt(cnt):
@@ -493,27 +494,27 @@ class Softmax:
         ops = []
 
         def op_save_old_max():
-            ss["old_max"][msb] = Atom.mov_b32(ss["local_max"][msb])
+            ss["old_max"][msb] = ScheduleAtom.mov_b32(ss["local_max"][msb])
             sched_barrier(0)
             _scl = sgpr["s_log2e_scl"]
             ss["vgpr_log2e_scl_pair"][msb] = Vec.from_elements([_scl, _scl], Float32)
             sched_barrier(0)
 
         def op_cur_max():
-            ss["cur_max_log2e"][msb] = Atom.mul_f32(
+            ss["cur_max_log2e"][msb] = ScheduleAtom.mul_f32(
                 ss["local_max"][msb], sgpr["s_log2e_scl"]
             )
 
         def op_exp_delta():
-            ss["exp_delta"][msb] = Atom.exp_f32(ss["delta"][msb])
+            ss["exp_delta"][msb] = ScheduleAtom.exp_f32(ss["delta"][msb])
 
         def op_cur_max_1():
-            ss["cur_max_log2e_1"][msb] = Atom.mul_f32(
+            ss["cur_max_log2e_1"][msb] = ScheduleAtom.mul_f32(
                 ss["local_max"][msb], sgpr["s_log2e_scl"]
             )
 
         def op_mul_old_max():
-            ss["cur_max_log2e_scalar"][msb] = Atom.mul_f32(
+            ss["cur_max_log2e_scalar"][msb] = ScheduleAtom.mul_f32(
                 ss["old_max"][msb], sgpr["s_log2e_scl"]
             )
 
@@ -522,7 +523,7 @@ class Softmax:
             ss["cur_max_log2e_dup"][msb] = make_v2f32(_v, _v)
 
         def op_exp_delta_dup():
-            ss["exp_delta_dup"][msb] = Atom.mov_b32(ss["exp_delta"][msb])
+            ss["exp_delta_dup"][msb] = ScheduleAtom.mov_b32(ss["exp_delta"][msb])
 
         ops += [
             op_save_old_max,
@@ -535,7 +536,7 @@ class Softmax:
         ]
 
         def op_rescale_sum():
-            ss["row_sums"][msb] = Atom.mul_f32(
+            ss["row_sums"][msb] = ScheduleAtom.mul_f32(
                 ss["exp_delta"][msb], ss["row_sums"][msb]
             )
 
@@ -543,7 +544,7 @@ class Softmax:
         for i in range_constexpr(N_SP_PAIRS):
 
             def op_pkfma(idx=i):
-                sp_pairs[idx] = Atom.pk_fma_f32_neg_c(
+                sp_pairs[idx] = ScheduleAtom.pk_fma_f32_neg_c(
                     sp_pairs[idx],
                     ss["vgpr_log2e_scl_pair"][msb],
                     ss["cur_max_log2e_dup"][msb],
@@ -584,13 +585,13 @@ class Softmax:
         for i in range_constexpr(N_SP_PAIRS):
 
             def op_cvt(cidx=i):
-                ss["p_bf16"][msb].append(Atom.cvt_pk_bf16_f32(sp_pairs[cidx]))
+                ss["p_bf16"][msb].append(ScheduleAtom.cvt_pk_bf16_f32(sp_pairs[cidx]))
 
             ops.append(op_cvt)
         for i in range_constexpr(N_SP_PAIRS // 2):
 
             def op_pkadd(idx=i):
-                sum_tmps[idx] = Atom.pk_add_f32(
+                sum_tmps[idx] = ScheduleAtom.pk_add_f32(
                     sp_pairs[idx * 2], sp_pairs[idx * 2 + 1]
                 )
 
@@ -598,7 +599,7 @@ class Softmax:
         for j in range_constexpr(N_SP_PAIRS // 4):
 
             def op_sum_l0(j_val=j):
-                sum_l0[j_val] = Atom.pk_add_f32(
+                sum_l0[j_val] = ScheduleAtom.pk_add_f32(
                     sum_tmps[j_val * 2], sum_tmps[j_val * 2 + 1]
                 )
 
@@ -606,21 +607,21 @@ class Softmax:
         for j in range_constexpr(2):
 
             def op_sum_l1(j_val=j):
-                sum_l1[j_val] = Atom.pk_add_f32(
+                sum_l1[j_val] = ScheduleAtom.pk_add_f32(
                     sum_l0[j_val * 2], sum_l0[j_val * 2 + 1]
                 )
 
             ops.append(op_sum_l1)
 
         def op_sum_l2():
-            sum_l2[0] = Atom.pk_add_f32(sum_l1[0], sum_l1[1])
+            sum_l2[0] = ScheduleAtom.pk_add_f32(sum_l1[0], sum_l1[1])
 
         def op_sum_split():
             lo, hi = split_v2f32(sum_l2[0])
-            final_sum[0] = Atom.add_f32(lo, hi)
+            final_sum[0] = ScheduleAtom.add_f32(lo, hi)
 
         def op_sum_accum():
-            ss["row_sums"][msb] = Atom.add_f32(ss["row_sums"][msb], final_sum[0])
+            ss["row_sums"][msb] = ScheduleAtom.add_f32(ss["row_sums"][msb], final_sum[0])
 
         ops += [op_sum_l2, op_sum_split, op_sum_accum]
         return ops
@@ -651,7 +652,7 @@ class Softmax:
 
             def op_init_max3(k_=k):
                 base = k_ * VALID_GROUP_STRIDE
-                tmps[k_] = Atom.max3_num_f32(
+                tmps[k_] = ScheduleAtom.max3_num_f32(
                     _get_sp(base), _get_sp(base + 1), _get_sp(base + 2)
                 )
 
@@ -662,43 +663,43 @@ class Softmax:
                 def op_cross_col(k_=k, j_=j):
                     base = k_ * VALID_GROUP_STRIDE
                     s0 = base + 3 + j_ * 2
-                    tmps[k_] = Atom.max3_num_f32(_get_sp(s0), _get_sp(s0 + 1), tmps[k_])
+                    tmps[k_] = ScheduleAtom.max3_num_f32(_get_sp(s0), _get_sp(s0 + 1), tmps[k_])
 
                 ops.append(op_cross_col)
         for k in range_constexpr(CNT_SU):
 
             def op_last_elem(k_=k):
                 base = k_ * VALID_GROUP_STRIDE
-                tmps[k_] = Atom.max3_num_f32(_get_sp(base + 7), tmps[k_], _get_sp(base))
+                tmps[k_] = ScheduleAtom.max3_num_f32(_get_sp(base + 7), tmps[k_], _get_sp(base))
 
             ops.append(op_last_elem)
 
         def op_merge1():
-            tmps[0] = Atom.max3_num_f32(tmps[0], tmps[1], tmps[2])
+            tmps[0] = ScheduleAtom.max3_num_f32(tmps[0], tmps[1], tmps[2])
 
         def op_merge2():
-            tmps[0] = Atom.max3_num_f32(tmps[0], tmps[3], tmps[1])
+            tmps[0] = ScheduleAtom.max3_num_f32(tmps[0], tmps[3], tmps[1])
 
         tmps_perm = [None]
-        _zero_f32 = arith.constant(0.0, type=T.f32)
+        _zero_f32 = fx.Float32(0.0).ir_value()
 
         def op_perm_prep(z=_zero_f32):
-            tmps_perm[0] = Atom.add_f32(tmps[0], z)
+            tmps_perm[0] = ScheduleAtom.add_f32(tmps[0], z)
 
         def op_perm():
-            tmps[1] = Atom.permlanex16(
+            tmps[1] = ScheduleAtom.permlanex16(
                 tmps_perm[0],
-                arith.constant(PERM_SEL_LO, type=T.i32),
-                arith.constant(PERM_SEL_HI, type=T.i32),
+                fx.Int32(PERM_SEL_LO).ir_value(),
+                fx.Int32(PERM_SEL_HI).ir_value(),
             )
 
         def op_pre_max():
-            ss["pre_max_log2e_scl"][msb] = Atom.mul_f32(
+            ss["pre_max_log2e_scl"][msb] = ScheduleAtom.mul_f32(
                 ss["old_max"][msb], sgpr["s_log2e_scl"]
             )
 
         def op_cur_max():
-            ss["local_max"][msb] = Atom.max3_num_f32(
+            ss["local_max"][msb] = ScheduleAtom.max3_num_f32(
                 tmps[0], tmps[1], ss["old_max"][msb]
             )
 
@@ -711,26 +712,26 @@ class Softmax:
         ops = []
 
         def op_max01():
-            ss["local_max"][0] = Atom.max3_num_f32(
+            ss["local_max"][0] = ScheduleAtom.max3_num_f32(
                 ss["local_max"][0], ss["local_max"][1], ss["pre_max_log2e_scl"][0]
             )
 
         def op_max23():
-            ss["local_max"][2] = Atom.max3_num_f32(
+            ss["local_max"][2] = ScheduleAtom.max3_num_f32(
                 ss["local_max"][2], ss["local_max"][3], ss["pre_max_log2e_scl"][2]
             )
 
         def op_mov1():
-            ss["local_max"][1] = Atom.mov_b32(ss["local_max"][0])
+            ss["local_max"][1] = ScheduleAtom.mov_b32(ss["local_max"][0])
 
         def op_mov3():
-            ss["local_max"][3] = Atom.mov_b32(ss["local_max"][2])
+            ss["local_max"][3] = ScheduleAtom.mov_b32(ss["local_max"][2])
 
         ops += [op_max01, op_max23, op_mov1, op_mov3]
         for msb in [0, 2, 1, 3]:
 
             def op_fma_delta(b=msb):
-                ss["delta"][b] = Atom.fma_f32_neg_src0(
+                ss["delta"][b] = ScheduleAtom.fma_f32_neg_src0(
                     ss["local_max"][b],
                     sgpr["s_log2e_scl"],
                     ss["pre_max_log2e_scl"][b],
@@ -882,7 +883,7 @@ class Fragment:
         lds_schedule = Pipeline.build_lds_k_schedule(blk, su)
         for lds_op in lds_schedule:
             kv_raw = Pipeline.emit_lds_load(mlir_types, lds_op, kv_lds_addrs, kv_raw)
-        Atom.s_wait_dscnt(0)
+        ScheduleAtom.s_wait_dscnt(0)
         sched_barrier(0)
         return Fragment.pair_k_tiles(kv_raw)
 
@@ -901,7 +902,7 @@ class Fragment:
             for op in sched1:
                 if const_expr(op["msb"] == msb):
                     raw1 = Pipeline.emit_lds_load(mlir_types, op, kv_lds_addrs, raw1)
-        Atom.s_wait_dscnt(0)
+        ScheduleAtom.s_wait_dscnt(0)
         sched_barrier(0)
         return raw0, raw1
 
@@ -982,9 +983,9 @@ class Pipeline:
         src_a = kv_tiles[wmma_op["k_msb"]][k_frag]
         src_b = q_tiles[wmma_op["q_msb"]][wmma_op["k_iter"] % Q_WMMA_PER_MSB]
         if const_expr(wmma_op["is_init"]):
-            sp_tiles[sp_msb][n_iter] = Atom.wmma_init(mlir_types, src_a, src_b)
+            sp_tiles[sp_msb][n_iter] = ScheduleAtom.wmma_init(mlir_types, src_a, src_b)
         else:
-            sp_tiles[sp_msb][n_iter] = Atom.wmma_accum(
+            sp_tiles[sp_msb][n_iter] = ScheduleAtom.wmma_accum(
                 mlir_types, src_a, src_b, sp_tiles[sp_msb][n_iter]
             )
         return sp_tiles
@@ -992,7 +993,7 @@ class Pipeline:
     @staticmethod
     def emit_pv_wmma(mlir_types, wmma_op, v_tiles, p_tiles, o_tiles):
         d_msb, n = wmma_op["d_msb"], wmma_op["n"]
-        o_tiles[d_msb][n] = Atom.wmma_accum(
+        o_tiles[d_msb][n] = ScheduleAtom.wmma_accum(
             mlir_types,
             v_tiles[wmma_op["v_msb"]][n],
             p_tiles[wmma_op["sp_msb"]],
@@ -1004,12 +1005,12 @@ class Pipeline:
     def emit_lds_load(mlir_types, lds_op, kv_lds_addrs, kv_tiles_out):
         msb, offset, v_idx = lds_op["msb"], lds_op["offset"], lds_op["v_idx"]
         if const_expr(lds_op["load_type"] == "b128"):
-            kv_tiles_out[msb][v_idx] = Atom.ds_load_b128(
+            kv_tiles_out[msb][v_idx] = ScheduleAtom.ds_load_b128(
                 mlir_types, kv_lds_addrs[msb], offset
             )
         else:
             hp = lds_op["half_p"]
-            kv_tiles_out[msb][v_idx] = Atom.ds_load_tr16_b128(
+            kv_tiles_out[msb][v_idx] = ScheduleAtom.ds_load_tr16_b128(
                 mlir_types, kv_lds_addrs[NUM_MSB + msb * 2 + (1 if hp else 0)], offset
             )
         return kv_tiles_out
@@ -1055,41 +1056,20 @@ TDM_D_TILE_DIM0 = 128 * 2
 WV_SUBQD = 32
 LDS_D_WV_SIZE = WV_SUBQD * TDM_D_TILE_DIM0 + 1024
 
-NUW_ATTR = None
-
-
-def get_nuw():
-    global NUW_ATTR
-    if NUW_ATTR is None:
-        NUW_ATTR = ir.Attribute.parse("#arith.overflow<nuw>")
-    return NUW_ATTR
-
-
-def _ensure_ir_value(v):
-    if isinstance(v, ir.Value):
-        return v
-    if hasattr(v, "ir_value"):
-        return v.ir_value()
-    return v
-
 
 def add_nuw(a, b):
-    return arith.addi(
-        _ensure_ir_value(a), _ensure_ir_value(b), overflow_flags=get_nuw()
-    )
+    return a + b
 
 
 def mul_nuw(a, b):
-    return arith.muli(
-        _ensure_ir_value(a), _ensure_ir_value(b), overflow_flags=get_nuw()
-    )
+    return a * b
 
 
 def setreg(hwreg_enc, value):
     llvm_dialect.call_intrinsic(
         None,
         "llvm.amdgcn.s.setreg",
-        [arith.constant(hwreg_enc, type=T.i32), arith.constant(value, type=T.i32)],
+        [fx.Int32(hwreg_enc).ir_value(), fx.Int32(value).ir_value()],
         [],
         [],
     )
@@ -1103,7 +1083,7 @@ def load_q_tiles(lane_id, q_rsrc, stride_q_seq, wave_id, q_tile_offset_bytes=Non
         lane_lo * stride_q_seq + lane_hi * 16 + (wave_id * 32) * stride_q_seq
     ) >> 2
     vec4i32_ty = T.vec(4, T.i32)
-    soff_zero = arith.constant(0, type=T.i32)
+    soff_zero = fx.Int32(0)
     q_base_bytes = mul_nuw(q_elem_off, fx.Int32(4))
     if q_tile_offset_bytes is not None:
         q_base_bytes = add_nuw(q_tile_offset_bytes, q_base_bytes)
@@ -1147,8 +1127,8 @@ def head_index_div(workgroup_id, num_heads):
 
 def split_i64_to_lo_hi(val_i64):
     return (
-        arith.trunci(T.i32, val_i64),
-        arith.trunci(T.i32, val_i64 >> 32) | -2147483648,
+        val_i64.trunci(T.i32),
+        (val_i64 >> 32).trunci(T.i32) | -2147483648,
     )
 
 
@@ -1180,20 +1160,18 @@ def compute_global_addr(tensor, byte_offset, wave_id, stride_32):
 def extract_lds_base_i32(memref_base):
     from flydsl._mlir.dialects import memref as _memref_d
 
-    return arith.index_cast(
-        T.i32, _memref_d.extract_aligned_pointer_as_index(memref_base)
-    )
+    return fx.index_cast(T.i32, _memref_d.extract_aligned_pointer_as_index(memref_base))
 
 
 def build_kv_lds_addrs(lane_id, k_base_i32, v_base_i32):
     k_crd = idx2crd(lane_id, fx.make_layout((16, 2), (1, 16)))
-    k_row = arith.index_cast(T.i32, k_crd[0])
-    k_col = arith.index_cast(T.i32, k_crd[1])
+    k_row = fx.index_cast(T.i32, k_crd[0])
+    k_col = fx.index_cast(T.i32, k_crd[1])
     k_dh0 = k_base_i32 + k_row * K_ROW_BYTES + k_col * 16
     k_dh1 = k_dh0 + K_SU_HALF_OFFSET
     v_crd = idx2crd(lane_id, fx.make_layout((8, 2, 2), (1, 8, 16)))
-    v_row = arith.index_cast(T.i32, v_crd[0]) + arith.index_cast(T.i32, v_crd[2]) * 8
-    v_dh0 = v_base_i32 + v_row * V_ROW_BYTES + arith.index_cast(T.i32, v_crd[1]) * 16
+    v_row = fx.index_cast(T.i32, v_crd[0]) + fx.index_cast(T.i32, v_crd[2]) * 8
+    v_dh0 = v_base_i32 + v_row * V_ROW_BYTES + fx.index_cast(T.i32, v_crd[1]) * 16
     v_dh1 = v_dh0 + V_SU_HALF_OFFSET
     rocdl.sched_barrier(0)
     v_addrs = []
@@ -1216,7 +1194,7 @@ def load_initial_kv_tiles(mlir_types, kv_lds_addrs, blk, su):
     for msb in range(NUM_MSB):
         for v_idx in range(N_LDS_PER_MSB):
             offset = v_idx * 32 + su_off
-            kv_raw[msb][v_idx] = Atom.ds_load_b128(
+            kv_raw[msb][v_idx] = ScheduleAtom.ds_load_b128(
                 mlir_types, kv_lds_addrs[msb], offset
             )
     rocdl.s_wait_dscnt(0)
@@ -1231,14 +1209,14 @@ def _dispatch_tdm_at_wmma0(tdm_type, tdm_state, has_fallback=True):
         _tdm_di = tdm_state[f"{tdm_key}_desc_idx"]
         for _ in range_constexpr(TDM_LOADS_PER_STAGE):
             if const_expr(_tdm_di < len(descs)):
-                Atom.tdm_load(descs[_tdm_di][0], descs[_tdm_di][1])
+                ScheduleAtom.tdm_load(descs[_tdm_di][0], descs[_tdm_di][1])
                 _tdm_di += 1
         tdm_state[f"{tdm_key}_desc_idx"] = _tdm_di
     elif const_expr(has_fallback):
         if const_expr(tdm_type == KV_V):
-            Atom.tdm_load(tdm_state["v_g0"], tdm_state["v_g1"])
+            ScheduleAtom.tdm_load(tdm_state["v_g0"], tdm_state["v_g1"])
         else:
-            Atom.tdm_load(tdm_state["k_g0"], tdm_state["k_g1"])
+            ScheduleAtom.tdm_load(tdm_state["k_g0"], tdm_state["k_g1"])
     sched_barrier(0)
 
 
@@ -1298,12 +1276,12 @@ def gemm1_interleaved_stage(
         sched_barrier(0)
         sched_barrier(0)
         if const_expr(gemm_idx == GEMM_INST_COUNT // 4 - 1):
-            Atom.s_wait_dscnt(ds_issued)
+            ScheduleAtom.s_wait_dscnt(ds_issued)
         sched_barrier(0)
         if const_expr(gemm_idx == 0 and has_tdm):
             _dispatch_tdm_at_wmma0(tdm_type, tdm_state, has_fallback=True)
         if const_expr(tdm_barrier and gemm_idx == GEMM_INST_COUNT - 1):
-            Atom.s_wait_tensorcnt(4)
+            ScheduleAtom.s_wait_tensorcnt(4)
             rocdl.s_barrier_signal(-1)
         _g1_row = GEMM1_SCHEDULE[stage][gemm_idx]
         _g1_half = len(_g1_row) // 2
@@ -1334,7 +1312,7 @@ def gemm1_interleaved_stage(
                     )
         sched_barrier(0)
         if const_expr(gemm_idx == GEMM_INST_COUNT - 1):
-            Atom.s_wait_dscnt(LDS_INST_COUNT // 2)
+            ScheduleAtom.s_wait_dscnt(LDS_INST_COUNT // 2)
         sched_barrier(0)
         for _i in range_constexpr(len(_g1_row)):
             if const_expr(_g1_half <= _i < len(_g1_row)):
@@ -1457,12 +1435,12 @@ def gemm2_interleaved_stage(
                 sched_barrier(0)
         sched_barrier(0)
         if const_expr(gemm_idx == PV_GEMM_INST_COUNT // 4 - 1):
-            Atom.s_wait_dscnt(ds_issued)
+            ScheduleAtom.s_wait_dscnt(ds_issued)
         sched_barrier(0)
         if const_expr(gemm_idx == 0 and has_tdm):
             _dispatch_tdm_at_wmma0(tdm_type, tdm_state, has_fallback=False)
         if const_expr(tdm_barrier and gemm_idx == PV_GEMM_INST_COUNT - 1):
-            Atom.s_wait_tensorcnt(4)
+            ScheduleAtom.s_wait_tensorcnt(4)
             rocdl.s_barrier_signal(-1)
         _g2_row = GEMM2_SCHEDULE[stage][gemm_idx]
         _g2_half = len(_g2_row) // 2
@@ -1483,7 +1461,7 @@ def gemm2_interleaved_stage(
                 )
         sched_barrier(0)
         if const_expr(gemm_idx == PV_GEMM_INST_COUNT - 1):
-            Atom.s_wait_dscnt(LDS_INST_COUNT // 2)
+            ScheduleAtom.s_wait_dscnt(LDS_INST_COUNT // 2)
         sched_barrier(0)
         for _i in range_constexpr(len(_g2_row)):
             if const_expr(_g2_half <= _i < len(_g2_row)):
@@ -1561,10 +1539,7 @@ class TDM:
     @staticmethod
     def per_warp_oob_dim1(total_rows_i32, wave_id, rows_per_warp=8):
         remaining = total_rows_i32 - wave_id * rows_per_warp
-        return arith.minsi(
-            arith.maxsi(remaining, arith.constant(0, type=T.i32)),
-            arith.constant(rows_per_warp, type=T.i32),
-        )
+        return fx.min(fx.max(remaining, fx.Int32(0)), fx.Int32(rows_per_warp))
 
     @staticmethod
     def make_kv_dg1(is_k, stride_seq_elems):
@@ -1594,10 +1569,7 @@ class TDM:
         oob_dim1_raw,
         dim0_stride=None,
     ):
-        _sgpr2 = arith.shli(
-            arith.andi(oob_dim1_raw, arith.constant(0xFFFF, type=T.i32)),
-            arith.constant(16, type=T.i32),
-        )
+        _sgpr2 = (oob_dim1_raw & fx.Int32(0xFFFF)) << fx.Int32(16)
         if dim0_stride is None:
             dim0_stride = dim0_elems
         return Vec.from_elements(
@@ -1821,8 +1793,8 @@ def prologue_tile0(
     """Prologue: K(tile0) load -> QK GEMM -> V(tile0) load -> masks -> softmax PART0/1/2."""
     wave_id = ctx["wave_id"]
     zero_v8f32 = fx.constant_vector(0.0, T.vec(8, T.f32))
-    zero_f32 = arith.constant(0.0, type=T.f32)
-    neg_inf = arith.constant(float("-inf"), type=T.f32)
+    zero_f32 = fx.Float32(0.0).ir_value()
+    neg_inf = fx.Float32(float("-inf")).ir_value()
     rocdl.sched_barrier(0)
     TDM.load_kv(
         True,
@@ -1892,19 +1864,17 @@ def compute_num_tiles(
         sk_sq_tiles = (sk_sq_diff + (TILE_N - 1)) // TILE_N
         bx_plus_1 = bx + 1
         causal_tiles = bx_plus_1 + sk_sq_tiles
-        num_tiles = arith.minui(causal_tiles.ir_value(), kv_tiles_avail)
+        num_tiles = fx.min(causal_tiles, kv_tiles_avail)
     else:
         num_tiles = kv_tiles_avail
-    num_tiles_idx = arith.index_cast(T.index, num_tiles)
+    num_tiles_idx = fx.index_cast(T.index, num_tiles)
     num_tiles_minus1 = num_tiles - 1
-    num_tiles_minus1_idx = arith.index_cast(T.index, num_tiles_minus1)
+    num_tiles_minus1_idx = fx.index_cast(T.index, num_tiles_minus1)
     if const_expr(IS_CAUSAL):
         first_causal_tile = bx + causal_offset // TILE_N
-        first_causal_tile = arith.maxsi(
-            first_causal_tile.ir_value(), arith.constant(1, type=T.i32)
-        )
-        first_causal_tile = arith.minui(first_causal_tile, num_tiles_minus1)
-        first_causal_tile_idx = arith.index_cast(T.index, first_causal_tile)
+        first_causal_tile = fx.max(first_causal_tile, fx.Int32(1))
+        first_causal_tile = fx.min(first_causal_tile, num_tiles_minus1)
+        first_causal_tile_idx = fx.index_cast(T.index, first_causal_tile)
     else:
         first_causal_tile_idx = num_tiles_minus1_idx
     return num_tiles, num_tiles_idx, num_tiles_minus1_idx, first_causal_tile_idx
@@ -2188,7 +2158,7 @@ def execute_tile_pipeline(
     ptr_V = ctx["ptr_V"]
     wave_id = ctx["wave_id"]
 
-    Atom.s_wait_dscnt(LDS_INST_COUNT // 2)
+    ScheduleAtom.s_wait_dscnt(LDS_INST_COUNT // 2)
 
     v_tiles_out = None
     blk = 0
@@ -2449,7 +2419,7 @@ def tile_iteration(ctx, tile_idx, iter_args, causal_n_start=None):
         sp_pairs_prev=prev_partial_sp_pairs,
     )
     tdm_state = _make_empty_tdm_state()
-    tile_idx_i32 = arith.index_cast(T.i32, tile_idx)
+    tile_idx_i32 = fx.index_cast(T.i32, tile_idx)
     cur_v_offset = v_offset + tile_idx_i32 * (TILE_N * stride_v_seq)
     next_tile = tile_idx_i32 + 1
     next_k_offset = k_offset + next_tile * (TILE_N * stride_k_seq)
@@ -2599,8 +2569,8 @@ def epilogue_write_output(
     v8bf16 = T.vec(8, T.bf16)
     rsf = list(sfx["row_sums"])
     lmf = list(sfx["local_max"])
-    slo = arith.constant(PERM_SEL_LO, type=T.i32)
-    shi = arith.constant(PERM_SEL_HI, type=T.i32)
+    slo = fx.Int32(PERM_SEL_LO).ir_value()
+    shi = fx.Int32(PERM_SEL_HI).ir_value()
     for mb in fx.range_constexpr(0, NUM_MSB, 2):
         sm = rsf[mb] + rsf[mb + 1]
         pm = rocdl_dialect.permlanex16(
@@ -2645,7 +2615,7 @@ def epilogue_write_output(
         rv8 = vector.broadcast(T.vec(8, T.f32), rcp)
         obf16.append(
             [
-                arith.truncf(v8bf16, o_tiles[msb][n] * rv8)
+                (o_tiles[msb][n] * rv8).truncf(v8bf16)
                 for n in fx.range_constexpr(N_PV_WMMA_N)
             ]
         )
@@ -2656,8 +2626,8 @@ def epilogue_write_output(
     db32 = extract_lds_base_i32(lds_alloc_v_a.get_base())
     dw = db32 + wave_id * LDS_D_WV_SIZE
     d_crd = idx2crd(lane_id, fx.make_layout((16, 2), (1, 16)))
-    llo = arith.index_cast(T.i32, d_crd[0])
-    lhi = arith.index_cast(T.i32, d_crd[1])
+    llo = fx.index_cast(T.i32, d_crd[0])
+    lhi = fx.index_cast(T.i32, d_crd[1])
     loff = llo * TDM_D_TILE_DIM0 + lhi * 16
     for msb in fx.range_constexpr(NUM_MSB):
         for n in fx.range_constexpr(N_PV_WMMA_N):
@@ -2676,8 +2646,8 @@ def epilogue_write_output(
     alo, ahi = split_i64_to_lo_hi(oadr64)
     olds2 = db32 + wsgpr * LDS_D_WV_SIZE
     _dg0 = Vec.from_elements([fx.Int32(1), olds2, alo, ahi], fx.Int32)
-    _td1_lo_o = arith.andi(o_oob_dim1, arith.constant(0xFFFF, type=T.i32))
-    _g2 = arith.shli(_td1_lo_o, arith.constant(16, type=T.i32))
+    _td1_lo_o = o_oob_dim1 & fx.Int32(0xFFFF)
+    _g2 = _td1_lo_o << fx.Int32(16)
     _dg1 = Vec.from_elements(
         [
             fx.Int32(1 << 16),

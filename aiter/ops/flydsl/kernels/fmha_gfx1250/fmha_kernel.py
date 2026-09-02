@@ -12,7 +12,7 @@ import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, rocdl
+from flydsl.expr import rocdl
 from flydsl.expr.primitive import const_expr
 from flydsl.expr.typing import T
 
@@ -84,7 +84,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
         v_oob_dg1 = TDM.build_oob_dg1_list(
             v_tdm_cfg, 128, v_stride_elems, actual_kv_len, wave_id
         )
-        q_remain_o = arith.maxsi(actual_q_len - m_start, fx.Int32(0).ir_value())
+        q_remain_o = fx.max(actual_q_len - m_start, fx.Int32(0))
         o_oob_dim1 = TDM.per_warp_oob_dim1(q_remain_o, wave_id, 32)
 
         # ── Zero-fill output when KV is empty (seqlen_k == 0) ──
