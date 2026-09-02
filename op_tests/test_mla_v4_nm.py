@@ -1417,6 +1417,121 @@ def test_v4_nm_out_16_nosplit_accuracy_and_perf():
     )
 
 
+def _run_pad_poison_point(fill, poison_q, poison_kv, gqa_ratio, kv_seq_lens, batch):
+    """Run one decode with the packed rows' PAD bytes overwritten by `fill`.
+
+    Packed row layout (`_native_to_2buff_for_asm`):
+        [ nope 448 fp8 | scale 14 e8m0 | pad 50 ]  = 512 B
+    so the padding starts at _QUANT_D_NOPE + _QUANT_NUM_SCALE_BYTES = 462.
+
+    The packer allocates with `torch.zeros`, so in every other test the padding
+    is 0x00. A served model reuses these buffers and the padding carries junk,
+    which is a different input the kernel has never been shown here.
+    """
+    inputs = _build_bf16_inputs(
+        batch=batch,
+        kv_seq_lens=kv_seq_lens,
+        q_seq_logical=1,
+        seed=0,
+        gqa_ratio=gqa_ratio,
+        attn_sink=True,
+    )
+    sm_scale = 1.0 / (_QUANT_D**0.5)
+    q_packed, q_rope = _native_to_2buff_for_asm(inputs["q_bf16"])
+    kv_packed, kv_rope = _native_to_2buff_for_asm(inputs["kv_bf16"])
+
+    pad_off = _QUANT_D_NOPE + _QUANT_NUM_SCALE_BYTES
+    if poison_q:
+        q_packed.view(torch.uint8)[..., pad_off:] = fill
+    if poison_kv:
+        kv_packed.view(torch.uint8)[..., pad_off:] = fill
+
+    # Reference consumes the same poisoned buffers; it reads only the 448+14
+    # defined bytes, so its result must not move.
+    out_ref, _ = _torch_attn_decode_fp8_dequant_ref(
+        q_packed,
+        q_rope,
+        kv_packed,
+        kv_rope,
+        inputs["qo_indptr"],
+        inputs["kv_indptr"],
+        inputs["kv_page_indices"],
+        inputs["kv_last_page_lens"],
+        sm_scale,
+        attn_sink=inputs["sink"],
+    )
+
+    total_q = inputs["q_bf16"].size(0)
+    output = torch.empty(
+        (total_q, gqa_ratio, V_HEAD_DIM), dtype=dtypes.bf16, device="cuda"
+    )
+    logits, _ = aiter.mla.mla_decode_fwd_v4_nm(
+        q=q_packed,
+        qrope=q_rope.contiguous(),
+        kv_buffer=kv_packed,
+        kvrope=kv_rope.contiguous(),
+        output=output,
+        qo_indptr=inputs["qo_indptr"],
+        kv_indptr=inputs["kv_indptr"],
+        kv_page_indices=inputs["kv_page_indices"],
+        kv_last_page_lens=inputs["kv_last_page_lens"],
+        split_indptr=None,
+        max_seqlen_q=inputs["max_seqlen_q"],
+        sink=inputs["sink"],
+        sm_scale=sm_scale,
+        out_16_nosplit=0,
+        num_kv_splits=None,
+    )
+    resolved = logits.shape[1]
+    out_asm = (output if resolved > 1 else logits[:, 0]).float()
+
+    who = "+".join([n for n, on in (("Q", poison_q), ("KV", poison_kv)) if on])
+    # Check NaN explicitly and FIRST: `nan > tol` is False, so an all-NaN
+    # result sails through any abs-difference tolerance check with zero
+    # mismatching rows. 0xFF in a byte the kernel wrongly treats as an e8m0
+    # scale is exactly the NaN encoding, so that is the failure this guards.
+    assert torch.isfinite(out_asm).all(), (
+        f"v4 nm: {who} pad byte 0x{fill:02X} produced non-finite output — the "
+        f"kernel is reading past the {_QUANT_NUM_SCALE_BYTES}-byte scale field "
+        f"at offset {_QUANT_D_NOPE} into the padding at {pad_off}."
+    )
+    checkAllclose(
+        out_ref.float(),
+        out_asm,
+        rtol=3e-2,
+        atol=3e-2,
+        tol_err_ratio=0.02,
+        msg=f"mla_v4_nm {who} pad=0x{fill:02X} [fp8_dequant_ref vs asm]",
+    )
+
+
+@needs_gfx950
+def test_v4_nm_packed_pad_poison():
+    """Padding bytes of the packed Q/KV rows must not change the result.
+
+    Regression for a kernel that read 16 e8m0 scale bytes where only 14 are
+    defined, pulling in packed-row bytes 462/463. 0xFF there is the e8m0 NaN
+    encoding, so the whole row came out NaN. It reproduced only with a served
+    model, which reuses the Q buffer and leaves junk in the padding; every
+    synthetic test missed it because `_native_to_2buff_for_asm` builds the row
+    with `torch.zeros` and the padding is therefore always 0x00.
+
+    Poisons Q, KV and both, with 0xFF (the e8m0 NaN encoding) and with a random
+    fill, across the three shipped (gqa, q_seq_logical) entry points.
+    """
+    for gqa in (16, 64, 128):
+        for fill in (0xFF, 0xA5):
+            for poison_q, poison_kv in ((True, False), (False, True), (True, True)):
+                _run_pad_poison_point(
+                    fill=fill,
+                    poison_q=poison_q,
+                    poison_kv=poison_kv,
+                    gqa_ratio=gqa,
+                    kv_seq_lens=1024,
+                    batch=4,
+                )
+
+
 # ---------------------------------------------------------------------------
 # ATOM-API wrapper (future drop-in replacement for ATOM's
 # `sparse_attn_v4_paged_decode`). Lives in the test file as a *proof of API
