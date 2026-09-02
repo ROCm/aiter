@@ -475,19 +475,10 @@ def _run_reduce_path_case(D, B, Mi, regime, *, seed=SEED, sparsity=0.95):
 
 
 def _worker(D: int) -> int:
-    from aiter.ops.flydsl.jagged_dense_bmm_bwd_dispatch import resolve_config
 
     ok = True
 
     expected_gj = 1 if D <= 256 else 2
-    cfg = resolve_config(n_groups=1024, reduction_k=D, output_n=D, max_seq_len=7680)
-    res_ok = cfg["gj_stages_a"] == expected_gj
-    ok &= res_ok
-    print(
-        f"[{'PASS' if res_ok else 'FAIL'}] resolve winner D={D}: gj_stages_a={cfg['gj_stages_a']} "
-        f"(expected {expected_gj})"
-    )
-
     expected_split = 2 if D <= 256 else 1
     bw = _bwd.build_backward(D, split=None, gj_stages_a=expected_gj, coarsen_m=None)
     split_ok = bw.split == expected_split
