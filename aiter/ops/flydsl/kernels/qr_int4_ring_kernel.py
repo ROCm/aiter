@@ -3,25 +3,19 @@
 
 """gfx942/gfx950 TP∈{2,4,8} INT4 **ring** all-reduce.
 
-Same codec, tiling, IPC inbox and colour handshake as the two-shot kernel in
+Same codec, tiling, IPC inbox, and colour handshake as the two-shot kernel in
 ``qr_int4_kernel`` -- only the schedule differs. Instead of each rank pushing to
 all ``N-1`` peers twice, the ranks form a cycle and every step is a single
-contiguous run into exactly *one* peer's inbox:
+contiguous run into exactly one peer's inbox:
 
 * ``2(N-1)`` hops instead of 2, so ``2(N-1)`` handshakes instead of 2.
-* The same ``2(N-1)/N`` of the payload on the wire -- a ring is bandwidth
-  optimal (Patarasuk & Yuan, JPDC 69(2), 2009), so nothing is paid for the extra
-  hops in volume.
-* **One destination per store.** That is the point. On a PCIe host a GPU has a
-  single shared x16 uplink, and the two-shot fanout hands it 64 B per
-  destination round-robin; coarsening to >=256 B runs against one destination
-  measured 54.03 GB/s against 36.25 (MI350P, cached memory, 3 peers). A ring
-  step writes ``rank_atoms * 1152 B`` to one peer, in address order, with no
-  destination switch at all.
+* The same ``2(N-1)/N`` of the payload on the wire. The ring is bandwidth
+  optimal (Patarasuk & Yuan, JPDC 69(2), 2009).
+* One destination per store. On a PCIe host, a GPU has a single shared x16 uplink, 
+  and a ring step writes ``rank_atoms * 1152 B`` to one peer, in address order, with no
+  destination switch.
 
-Everything the codec does is imported from ``qr_int4_kernel`` rather than
-restated: there must be exactly one INT4 + group-16 E4M3 implementation in the
-tree, or the two kernels can drift into disagreeing about the wire format.
+The INT4 codec is imported from ``qr_int4_kernel``.
 """
 
 import flydsl.compiler as flyc
@@ -70,47 +64,25 @@ from .qr_int4_kernel import (
     _to_sgpr_i64,
 )
 
-# Super-tile values the ring accepts. Deliberately the same as the two-shot's.
+# Super-tile values the ring accepts.
 #
-# The ring publishes 2(N-1) times per super-tile against the two-shot's 2, and
-# on a cacheable inbox every publish is a full L2 writeback. Publishes per rank
+# The ring publishes 2(N-1) times per super-tile
+# On a cacheable inbox every publish is a full L2 writeback. Publishes per rank
 # are ``num_tiles / ST * 2(N-1)`` -- independent of the block count, so ST is
-# the *only* knob that reduces them, and it pays for them in parallelism:
+# the only tunable knob that reduces them, and it pays for them in parallelism:
 # ``_grid_x`` derives blocks from ``num_tiles / ST``.
 #
 # The optimum is payload-dependent, so it is not a single value -- see
 # ``RING_ST_LADDER`` below, which is what the host actually selects from. These
-# are the values a caller may *pin* with ``super_tile=``.
+# are the values a caller may pin with ``super_tile=``.
 #
-# Mind the buffer when pinning a large one: it is
+# The buffer size is
 # ``2(N-1) * grid * (ST * rank_atoms * 1152 + 64)`` bytes, so ST=16 at the
-# default cap of 1216 is ~269 MB per rank against 28 MB at cap 128, and the two
-# measure the same (671 vs 673 us). Pin ``grid_cap`` alongside ``super_tile``.
+# default cap of 1216 is ~269 MB per rank against 28 MB at cap 128. 
+# Pin ``grid_cap`` alongside ``super_tile``.
 RING_SUPER_TILES = (1, 8, 16, 32)
 
 # Payload-size ladder: ``(min_bytes, super_tile, grid_cap)``, ascending.
-#
-# ``QRInt4`` builds one engine per rung and picks by payload at ``allreduce``
-# time, because the caller does not know the size at construction time and a JIT
-# inside a collective deadlocks. Sited on MI350P, TP4, bf16, hidden 7168 -- best
-# ST per size, us:
-#
-#     MiB    ST=8    ST=16   ST=32      MiB    ST=8    ST=16   ST=32
-#      14   236.6    253.8   255.2       56   855.8    681.0   690.6
-#      21   321.7    307.9   339.6       64  1098      800.8   792.6
-#      28   416.5    368.9   416.4       84  1365     1186    1044
-#      42   629.0    504.3   503.4      112  1813     1421    1330
-#
-# 8 -> 16 crosses between 14 and 21 MiB; 16 -> 32 is inside noise from 42 to
-# 64 MiB (<= 1.5%) and decisive by 84 MiB, so the boundary is placed where 32
-# first wins rather than where it first ties.
-#
-# Every rung caps the grid at 128, which is not a compromise: ``_grid_x`` already
-# limits blocks to ``ceil(num_tiles / ST)``, and over each rung's size range that
-# is <= 128 for ST=8 and ST=16. Only ST=32 is clamped, and it costs 0.7%
-# (1310 us at cap 64, 1301 at 128, 1292 at 256 for 112 MiB) for half the memory.
-# The whole ladder is ~101 MB per rank -- *less* than the single ST=8 engine at
-# the default cap of 1216, which is 135 MB on its own.
 RING_ST_LADDER = (
     (0, 8, 128),
     (18 << 20, 16, 128),
@@ -121,10 +93,8 @@ RING_ST_LADDER = (
 #
 # The all-gather lap is always INT4 and is not listed here: it forwards the
 # bytes it received without touching them (see ``_ring_body``), so it has no
-# format of its own to choose. Widening the RS lap to INT6 is the planned
-# response if measured SQNR at TP8 lands below the two-shot's ~18 dB gate --
-# see the plan; not implemented yet, which is why "int6" is absent rather than
-# accepted-and-broken.
+# format of its own to choose. Widening the RS lap to INT6 is option for improving accuracy
+# for large TP (8, etc.) values.
 RS_CODECS = ("int4",)
 
 # 64 quads of 4 lanes; one quad writes one 64 B fabric sector.
@@ -132,11 +102,8 @@ QUADS_PER_BLOCK = BLOCK // QUAD_LANES
 
 # Cache policy for reading a rank-tile out of our own inbox.
 #
-# The two-shot reads its inbox `nt`, which is only a non-temporal *hint* -- it
-# does not bypass. It gets away with that because a payload it reads was
-# published two hops and a full grid of unrelated traffic ago. The ring reads a
-# slot the predecessor wrote microseconds earlier, on the same line, with the
-# flag arriving write-through right behind it, so a hint is not enough:
+# The two-shot reads its inbox `nt`, which is only a non-temporal hint -- it
+# does not bypass. For the ring algorithm, a hint is not enough:
 # `sc0 sc1` makes the load actually go to memory.
 _RECV_POLICY = _CM_SC0 | _CM_SC1
 
@@ -512,13 +479,7 @@ def make_qr_int4_ring_kernel(
             # flag is already present on the first read the loop body never
             # runs, and the payload loads below can be served stale.
             #
-            # This is why the bug scaled with block count. At high occupancy
-            # unrelated traffic evicts the stale lines and the reads happen to
-            # be correct; at one block nothing evicts them and whole chunks come
-            # back as a predecessor's earlier state, or as zero.
-            #
-            # Write back *before* invalidating. Unlike the two-shot, which does
-            # all of a tile's output stores after its last wait, the ring stores
+            # Write back *before* invalidating. The ring stores
             # one chunk per all-gather op and then waits again -- so an acquire
             # here sits directly on top of dirty output lines, and discarding
             # them silently loses whole chunks.
@@ -558,7 +519,7 @@ def make_qr_int4_ring_kernel(
                     _lds_write_packet(j, packed, word, leader)
             elif k == world_size:
                 # Last reduce. Every rank has now contributed, so this is the
-                # final sum for our own chunk: store it from the *unquantized*
+                # final sum for our own chunk: store it from the unquantized
                 # accumulator, since it never makes another wire hop. The same
                 # value is quantized once for the all-gather's first send.
                 atoms = _load_chunk_atoms(tile, chunk)
@@ -570,10 +531,9 @@ def make_qr_int4_ring_kernel(
                     _lds_write_packet(j, packed, word, leader)
             elif k < n_ops:
                 # All-gather: the chunk is already final, so decode it for our
-                # own output and forward the bytes we received *unmodified*. Not
+                # own output and forward the bytes we received unmodified. Not
                 # dequantizing-and-requantizing is what keeps this lap free of
-                # additional error -- the ring's one accuracy advantage over the
-                # two-shot, which requantizes its reduced slice to broadcast it.
+                # additional error.
                 for j in range_constexpr(rank_atoms):
                     packed_in, word_in = _recv_raw(k - 2, sub, j)
                     _store_chunk_atom(
@@ -601,14 +561,6 @@ def make_qr_int4_ring_kernel(
             ``if/else`` on the Python op number, never as a bare ``if`` guarding
             a compile-time-dead block. See ``_op_substep`` for why.
 
-            The op loop is ``range_constexpr``, **not** ``range``. Inside a
-            ``@flyc.kernel`` body a plain ``range`` lowers to a *device* loop
-            with a runtime induction variable, which collapses the ``2N-1`` op
-            bodies into one and quietly demotes every compile-time decision
-            keyed on ``k`` -- which chunk, which branch, which wire slot. It
-            does not fail loudly: the kernel still runs and most tiles still
-            come out right. The tell is the instruction count (2 peer stores
-            emitted at TP4 where 12 are needed).
             """
             for _ki in range_constexpr(n_ops):
                 k = _ki + 1
@@ -635,7 +587,7 @@ def make_qr_int4_ring_kernel(
                 else:
                     pass
 
-        # Stride by the *launched* grid, not the compile-time cap: the host
+        # Stride by the launched grid, not the compile-time cap: the host
         # launches fewer blocks than `grid` when it wants each block to own a
         # whole super-tile, and striding by the cap would silently leave every
         # tile above n_blocks unprocessed.
