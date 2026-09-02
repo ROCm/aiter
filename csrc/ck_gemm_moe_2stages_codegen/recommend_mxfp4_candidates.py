@@ -424,10 +424,14 @@ def _strata(row, candidate):
         configs. kimi-k3 cannot expose this (3584/256 = 14 is not divisible by
         4, so its k_wave space is thin), which is exactly why an axis must be
         covered rather than predicted from one config's behaviour.
-      - use_nt: the last outstanding miss (kimi-k2 token 2048, inter 256,
-        `32x256x256_nt_xcd4`) sat at index 32 of a 64-candidate cell because
-        `_rank_key` penalises `use_nt` against its target, so no prompt budget
-        reached it. Every GEMM1 axis the name encodes is now a stratum.
+      - use_nt: kimi-k2 token 2048 inter 256 (`32x256x256_nt_xcd4`) sat at index
+        32 of a 64-candidate cell because `_rank_key` penalises `use_nt` against
+        its target, so no prompt budget reached it.
+      - num_waves: `_rank_key` penalises num_waves != 4, and a config carrying
+        `_w2` (kimi-k3 token 4, `32x64x256_situv2_kw2_w2`) was absent from the
+        prompt at budgets of 96, 128 and even 192. Adding it completes the set:
+        every GEMM1 axis the kernel name encodes is now a stratum, which is the
+        only construction under which a wrong prior cannot hide a config.
     """
     g1 = _g1_features(candidate)
     g2 = _g2_features(candidate)
@@ -439,6 +443,7 @@ def _strata(row, candidate):
         g1["prefetch_hidden"],
         g1["k_wave"],
         g1["use_nt"],
+        g1["num_waves"],
         str(epilog),
     )
 

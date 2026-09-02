@@ -173,7 +173,12 @@ of near-identical kernels wastes the sweep.
 
 1. **Stratify, do not sort.** Allocate the budget round-robin across every GEMM1
    axis the kernel name encodes -- `block_m`, `BN`, `xcd_swizzle`,
-   `prefetch_hidden`, `k_wave`, `use_nt` -- crossed with the GEMM2 epilog. Each
+   `prefetch_hidden`, `k_wave`, `use_nt`, `num_waves` -- crossed with the GEMM2
+   epilog. That is *every* axis the GEMM1 name encodes, and the completeness is
+   the point: each axis was added only after a shipped config was measured to be
+   hiding behind it, and the last one (`num_waves`) surfaced only when an
+   upstream commit retuned a shape onto a `_w2` config that no prompt budget --
+   96, 128, even 192 -- could reach. Each
    of those was added only after it was *measured* to be hiding a shipped
    config; none was added speculatively. Budget ~96 candidates (about 1.3x the
    ~72 cells) so every legal tier is represented. A global
@@ -220,8 +225,9 @@ The rules above were derived on kimi-k3 and then checked, unchanged, against the
 `block_m` transferred perfectly and GEMM1 reached 98%, so the stratification
 rules are not kimi-k3 artefacts. The single residual miss (kimi-k2 token 2048,
 inter 256, `32x256x256_nt_xcd4`) sat at index 32 of a 64-candidate cell -- no
-prompt budget could reach it -- because `use_nt` was not yet a stratum. Adding it
-takes **prompt-level coverage to 76/76 across all four model configs**: with a
+prompt budget could reach it -- because `use_nt` was not yet a stratum. Adding it, and then `num_waves`,
+takes **prompt-level coverage to 64/64 distinct shapes across all four model
+configs**: with a
 96-candidate budget, every shipped GEMM1 is now offered to the model for every
 shape it changes. That is the ceiling; `top_k` relative to the cell count converts it into slate
 containment. Both remaining slate misses were re-run against the fully
