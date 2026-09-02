@@ -6,7 +6,7 @@
 //   gfx950  -- kernels compiled from the device templates in
 //              `pa_sparse_prefill_opus.h` (single-header, IMPL-guarded).
 //   gfx1250 -- kernels loaded from the prebuilt code objects in
-//              `hsa/gfx1250/mla_v4_opus/`, one per precision.
+//              `hsa/gfx1250/mla_v4_opus/`, one per precision and wave layout.
 
 #define PA_SPARSE_PREFILL_OPUS_IMPL
 #include "pa_sparse_prefill_opus.h"
@@ -364,6 +364,10 @@ constexpr int kGfx1250BlockSize   = kGfx1250NumWarps * kGfx1250WarpSize;
 constexpr int kGfx1250HeadsPerBlk = kGfx1250QTileSize * kGfx1250NumWarps;
 constexpr int kGfx1250MaxClusterY = 2;
 
+// Narrow-head bf16 variants: T_M=1, so heads per workgroup is Q_TILE_SIZE alone.
+constexpr int kGfx1250Heads16mx1 = 16;
+constexpr int kGfx1250Heads32mx1 = 32;
+
 // fp8 split-precision head layout.
 constexpr int kGfx1250DNopePadded = 512;
 constexpr int kGfx1250DRope       = 64;
@@ -372,6 +376,10 @@ constexpr int kGfx1250DHead       = 512;
 // Symbol names match each code object's file stem, as elsewhere under hsa/.
 constexpr const char* kGfx1250A16W16Co =
     "mla_v4_opus/mla_prefill_a16w16_16mx4_64nx1.co";
+constexpr const char* kGfx1250A16W16Co16mx1 =
+    "mla_v4_opus/mla_prefill_a16w16_16mx1_16nx4.co";
+constexpr const char* kGfx1250A16W16Co32mx1 =
+    "mla_v4_opus/mla_prefill_a16w16_32mx1_16nx4.co";
 constexpr const char* kGfx1250A8W8Co = "mla_v4_opus/mla_prefill_a8w8_16mx4_64nx1.co";
 
 // aiter's prebuilt-code-object loader. Its name comes from the hand-written
@@ -475,7 +483,39 @@ void pa_sparse_prefill_gfx1250_opus_fwd(aiter_tensor_t& q,
     HipDeviceGuard guard(q.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    size_t arg_size        = sizeof(args);
+    size_t arg_size = sizeof(args);
+
+    // 16mx1_16nx4 for H <= 16, 32mx1_16nx4 for H <= 32, else the clustered 16mx4_64nx1.
+    if(H <= kGfx1250Heads16mx1)
+    {
+        static PrebuiltKernel impl("mla_prefill_a16w16_16mx1_16nx4", kGfx1250A16W16Co16mx1);
+        impl.launch_kernel({&args,
+                            &arg_size,
+                            N,
+                            ceil_div(H, kGfx1250Heads16mx1),
+                            1,
+                            kGfx1250BlockSize,
+                            1,
+                            1,
+                            stream});
+        return;
+    }
+
+    if(H <= kGfx1250Heads32mx1)
+    {
+        static PrebuiltKernel impl("mla_prefill_a16w16_32mx1_16nx4", kGfx1250A16W16Co32mx1);
+        impl.launch_kernel({&args,
+                            &arg_size,
+                            N,
+                            ceil_div(H, kGfx1250Heads32mx1),
+                            1,
+                            kGfx1250BlockSize,
+                            1,
+                            1,
+                            stream});
+        return;
+    }
+
     const int num_h_blocks = ceil_div(H, kGfx1250HeadsPerBlk);
     const int cluster_y    = gfx1250_pick_cluster_y(num_h_blocks);
 
