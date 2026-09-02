@@ -231,44 +231,51 @@ def _mhc_fused_config_gfx942_80(m, hidden_size, num_cu):
 
 
 def _mhc_fused_config_gfx1250_256(m, hidden_size, num_cu):
+    """Tuned on the pair (this gemm + the mhc_pre_big_fuse reduction that always
+    follows it), not on the gemm alone. The reduction reads (split_k, m, hc_mult3)
+    and (split_k, m), so its cost grows with split_k: tuning the gemm in isolation
+    picks split_k up to 4x too deep and loses ~1.06x end-to-end at m<=512.
+
+    Thresholds below were measured at num_cu=256 only; they are written relative to
+    num_cu because they are occupancy-driven, not because the scaling was verified.
+    """
     tile_k = 32 if hidden_size % 32 == 0 else 64
-    valid = _mhc_fused_valid_splitk(hidden_size, tile_k, num_cu)
+    # k_loop >= 1 is enough: the LDS/fn ring guards every prefetch against k_loop
+    # (verified bit-exact against split_k=1), and small m wants a deep split.
+    valid = _mhc_fused_valid_splitk(hidden_size, tile_k, num_cu, prefetch_stages=1)
     if not valid:
         return 1, 16, 32, tile_k
 
-    tile_n = 32
-    # Re-tuned on gfx1250/256 (TDM residual load): fn-reuse (tile_m=32) wins from
-    # m=512 up; m<=256 is launch-bound and stays on tile_m=16.
-    tile_m = 16 if m <= 256 else 32
+    tile_n = 32  # re-measured over tile_n in {16, 32}: 16 never wins
 
-    # (m upper bound, target split_k) measured per (m, hidden) then merged; the
-    # target is snapped to a legal divisor below so it stays valid for any hidden.
-    # Mid/large m follows blocks_m*split_k ~= 4*cu (~128*cu/m); small m is
-    # launch-bound (high split_k, config barely matters); very large m goes deeper.
-    if hidden_size >= 7168:
-        table = [
-            (128, 32),
-            (256, 32),
-            (512, 32),
-            (1024, 32),
-            (2048, 16),
-            (4096, 8),
-            (8192, 14),
-            (1 << 30, 7),
-        ]
+    # split_k, snapped DOWN to a legal divisor -- never to the geometrically nearest
+    # one, which on a coarse lattice overshoots badly (hidden=5120, m=512: split_k=80
+    # is 1.48x slower than 40).
+    if m <= num_cu:
+        # launch-bound: the optimum holds split_k*m ~= 32*num_cu. Deeper stops paying
+        # (the reduction grows with split_k), shallower starves the gemm grid.
+        target = max(1, 32 * num_cu // m)
+    elif m <= 2 * num_cu:
+        target = num_cu // 8  # short plateau between the two regimes
     else:
-        table = [
-            (128, 64),
-            (256, 32),
-            (512, 32),
-            (1024, 32),
-            (2048, 16),
-            (4096, 8),
-            (8192, 8),
-            (1 << 30, 8),
-        ]
-    target = next(t for ub, t in table if m <= ub)
-    splitk = min(valid, key=lambda s: (abs(math.log(s) - math.log(target)), -s))
+        # the optimum tracks the largest power of two <= 128*num_cu/m; flooring to a
+        # power of two matters (a plain geometric snap overshoots at every m that is
+        # not one, e.g. m=3072 wants 8, not 14)
+        ideal = int(max(1.0, 128.0 * num_cu / m))
+        target = 1 << (ideal.bit_length() - 1)
+    below = [sk for sk in valid if sk <= target]
+    splitk = max(below) if below else min(valid)
+
+    # tile_m. Small m keeps 16: with the pair's shallower split_k the fn-reuse grid no
+    # longer fills the device (this is the opposite of what tuning the gemm alone says).
+    # tile_m=64 pays off (up to 1.07x at m=8192/16384) only where its grid tiles whole
+    # waves exactly; at m=6144 or 12288, where it does not, it loses up to 1.09x.
+    if m <= 1.5 * num_cu:
+        tile_m = 16
+    elif m >= 16 * num_cu and m % 64 == 0 and ((m // 64) * splitk) % num_cu == 0:
+        tile_m = 64
+    else:
+        tile_m = 32
     return splitk, tile_m, tile_n, tile_k
 
 
