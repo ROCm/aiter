@@ -615,6 +615,24 @@ def test_flydsl_fp8_quant_fp16_rotation_uses_fp16_matrix(monkeypatch):
     assert seen_dtypes == [torch.float16]
 
 
+def test_flydsl_hadamard_matrix_uses_target_device():
+    """Build the rotation matrix directly on the requested non-current GPU."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires >=2 visible GPUs")
+
+    from aiter.ops.flydsl import fmha_kernels
+
+    current_device = torch.cuda.current_device()
+    try:
+        torch.cuda.set_device(0)
+        target = torch.device("cuda:1")
+        fmha_kernels._HADAMARD_CACHE.clear()
+        rotation = fmha_kernels._hadamard_matrix(128, target, torch.bfloat16)
+        assert rotation.device == target
+    finally:
+        torch.cuda.set_device(current_device)
+
+
 def test_flydsl_fp8_quant_rejects_unknown_backend():
     q, k, v = _make_qkv(1, 128, 2, 128, torch.bfloat16)
     with pytest.raises(ValueError, match="unsupported fp8 quant backend"):

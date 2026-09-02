@@ -96,7 +96,12 @@ def _hadamard_matrix(head_dim: int, device, dtype):
             from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
                 create_hadamard_matrix,
             )
-        R = (create_hadamard_matrix(head_dim, dtype=dtype) / (head_dim**0.5)).to(device)
+        try:
+            R = create_hadamard_matrix(head_dim, device=device, dtype=dtype)
+        except TypeError:
+            # Compatibility with older helper variants without a device argument.
+            R = create_hadamard_matrix(head_dim, dtype=dtype).to(device)
+        R = R / (head_dim**0.5)
     except ImportError:
         H = torch.ones((1, 1), dtype=torch.float32, device=device)
         while H.shape[0] < head_dim:

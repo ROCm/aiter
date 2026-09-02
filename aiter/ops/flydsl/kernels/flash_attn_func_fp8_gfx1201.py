@@ -55,7 +55,6 @@ from flydsl.expr import (
     rocdl,
 )
 from flydsl.expr.typing import Vector as Vec
-from flydsl.expr.utils.arith import ArithValue
 from flydsl.expr.utils.arith import _to_raw as _raw
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
@@ -440,7 +439,7 @@ def build_flash_attn_func_module(
         # to `v_cmp_gt_u64_e64` and cause an ISA hash drift even though both
         # variants are semantically equivalent for non-negative offsets.
         q_in_bounds = arith.cmpi(arith.CmpIPredicate.slt, _raw(q_row), _raw(seq_len_v))
-        q_row_safe = fx.Index(ArithValue(q_in_bounds).select(q_row, fx.Index(0)))
+        q_row_safe = fx.Index(q_in_bounds.select(q_row, fx.Index(0)))
 
         c_zero_v2i32_vec = Vec.filled(2, 0, fx.Int32).ir_value()
         q_b_packs = []
@@ -449,7 +448,7 @@ def build_flash_attn_func_module(
             g_idx = global_idx(q_row_safe, q_col)
             # fp8-input: Q already fp8 — load 8 fp8 bytes as v2i32 WMMA-B frag direct.
             raw = _load_global_fp8(q_ptr, g_idx, v2i32_type)
-            raw_safe = ArithValue(q_in_bounds).select(raw, c_zero_v2i32_vec)
+            raw_safe = q_in_bounds.select(raw, c_zero_v2i32_vec)
             q_b_packs.append([_raw(Vec(raw_safe)[0]), _raw(Vec(raw_safe)[1])])
 
         # ---- Constants ----
@@ -463,9 +462,7 @@ def build_flash_attn_func_module(
         c_zero_v8f32 = Vec.filled(8, 0.0, fx.Float32)
         _q_end = q_start + BLOCK_M
         if const_expr(CAUSAL):
-            kv_upper = fx.Index(
-                ArithValue(_q_end < seq_len_v).select(_q_end, seq_len_v)
-            )
+            kv_upper = fx.Index((_q_end < seq_len_v).select(_q_end, seq_len_v))
         else:
             kv_upper = seq_len_real_v
 
