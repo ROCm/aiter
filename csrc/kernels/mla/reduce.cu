@@ -778,7 +778,7 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
                                                   p_lds);
             }
         }
-        // num_split==1 with real partial slot (!=1) means need_lse has been set 
+        // num_split==1 with real partial slot (!=1) means need_lse has been set
         // so we need to reduce even this single split tile to get a correct final_lse
         else if(num_splits > 1 ||
                 (num_splits == 1 && params.p_reduce_partial_map[reduce_tile_start] != -1))
@@ -877,7 +877,7 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
                 p_lds);
         }
     }
-    // num_split==1 with real partial slot (!=1) means need_lse has been set 
+    // num_split==1 with real partial slot (!=1) means need_lse has been set
     // so we need to reduce even this single split tile to get a correct final_lse
     else if(num_splits > 1 ||
             (num_splits == 1 && params.p_reduce_partial_map[reduce_tile_start] != -1))

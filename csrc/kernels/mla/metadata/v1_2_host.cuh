@@ -186,7 +186,7 @@ void kn_generate_ps_metadata(std::vector<int32_t>& seqlens_qo_indptr,
                     if(remaining_kv_len <= blocks_capacity * block_size + SPLIT_KV_OVERHEAD)
                     {
                         consuming_blocks = remaining_blocks;
-                        // When we need LSE we cannot skip reduce, as final_lse is only produced 
+                        // When we need LSE we cannot skip reduce, as final_lse is only produced
                         // by the reduce kernel.
                         const bool skip_reduce =
                             (consuming_blocks == 0) || (!need_lse && current_block_idx == 0);
