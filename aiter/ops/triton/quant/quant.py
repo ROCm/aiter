@@ -42,6 +42,53 @@ _MXFP8_LEGACY_BLOCK_SIZE = 128
 _LOGGER = AiterTritonLogger()
 
 
+def _static_per_tensor_quant_launch(qx, x_in, scale_in, fast_convert: bool):
+    """Shared launch for the static per-tensor quant kernel.
+
+    Picks a tile shape from the row width: narrow rows get several rows per
+    program so the grid stays large enough, wide rows (the MoE expert-weight
+    case, where a whole row will not fit in registers) get split across
+    programs along the row instead.
+    """
+    # Callers may hand in an output that still has the input's pre-flattened
+    # shape (per_tensor_quant_triton does exactly that: 2D x, N-D qx), so view
+    # both as 2D rather than trusting qx.stride(0). .view keeps it a view, so
+    # the kernel still writes into the caller's buffer.
+    x2d = x_in if x_in.ndim == 2 else x_in.view(-1, x_in.shape[-1])
+    q2d = qx if qx.ndim == 2 else qx.view(-1, qx.shape[-1])
+    assert x2d.shape == q2d.shape, f"{tuple(x2d.shape)=} != {tuple(q2d.shape)=}"
+
+    rows, cols = x2d.shape
+    cols_pow2 = triton.next_power_of_2(cols)
+    if cols_pow2 >= 2048:
+        # Wide rows: one program per row segment, as many columns at a time as
+        # fit. Packing rows on top of this only shrinks the grid.
+        BLOCK_N = min(cols_pow2, 4096)
+        BLOCK_M = 1
+    else:
+        # Narrow rows: a row per program leaves the grid too small and each
+        # program too short, so stack rows up to a ~2K-element tile.
+        BLOCK_N = min(cols_pow2, 512)
+        BLOCK_M = max(1, min(triton.next_power_of_2(rows), 2048 // BLOCK_N))
+    grid = (triton.cdiv(rows, BLOCK_M), triton.cdiv(cols, BLOCK_N))
+    _static_per_tensor_quant_fp8_i8_kernel[grid](
+        q2d,
+        x2d,
+        scale_in,
+        rows,
+        cols,
+        x2d.stride(0),
+        x2d.stride(1),
+        q2d.stride(0),
+        q2d.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        FAST_CONVERT=fast_convert,
+        num_warps=4,
+    )
+    return qx
+
+
 def static_per_tensor_quant_fp8_i8(
     qx: torch.Tensor, x_in: torch.Tensor, scale_in: torch.Tensor
 ):
@@ -58,15 +105,7 @@ def static_per_tensor_quant_fp8_i8(
     """
     _LOGGER.info(f"STAIC_PER_TENSOR_QUANT_FP8_I8: x={tuple(x_in.shape)}")
     assert scale_in.numel() == 1  # only single scale value
-    rows = x_in.shape[0]
-    cols = x_in.shape[1]
-    NUM_COL_POW2 = triton.next_power_of_2(cols)
-    grid = (rows,)
-    _static_per_tensor_quant_fp8_i8_kernel[grid](
-        qx, x_in, scale_in, cols, x_in.stride(0), NUM_COL_POW2=NUM_COL_POW2
-    )
-
-    return qx
+    return _static_per_tensor_quant_launch(qx, x_in, scale_in, fast_convert=True)
 
 
 def dynamic_per_tensor_quant_fp8_i8(
@@ -88,8 +127,7 @@ def dynamic_per_tensor_quant_fp8_i8(
     rows = x_in.shape[0]
     cols = x_in.shape[1]
     NUM_COL_POW2 = triton.next_power_of_2(cols)
-    grid = (rows,)
-    _dynamic_per_tensor_quant_fp8_i8_kernel[grid](
+    _dynamic_per_tensor_quant_fp8_i8_kernel[(rows,)](
         x_in,
         scale_out,
         cols,
@@ -102,9 +140,7 @@ def dynamic_per_tensor_quant_fp8_i8(
         ),
     )
 
-    _static_per_tensor_quant_fp8_i8_kernel[grid](
-        qx, x_in, scale_out, cols, x_in.stride(0), NUM_COL_POW2=NUM_COL_POW2
-    )
+    _static_per_tensor_quant_launch(qx, x_in, scale_out, fast_convert=True)
 
     return qx, scale_out
 
@@ -150,7 +186,10 @@ def dynamic_per_token_quant_fp8_i8(
 
 
 def dynamic_mxfp4_quant(
-    x: torch.Tensor, scaling_mode: str = "even"
+    x: torch.Tensor,
+    scaling_mode: str = "even",
+    x_fp4: torch.Tensor | None = None,
+    blockscale_e8m0: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to MX FP4 format.
@@ -160,6 +199,11 @@ def dynamic_mxfp4_quant(
         scaling_mode: The method to calculate MX block scaling.
             - "even" (default): `even_round` in `quark.torch.quantization.utils`.
             - etc.
+        x_fp4: Optional pre-allocated uint8 output of shape (M, N // 2). Allocated
+            here when omitted.
+        blockscale_e8m0: Optional pre-allocated uint8 scale output of shape
+            (M, N // 32). Allocated here when omitted, in a column-major layout;
+            callers that need row-major scales (the MoE a4w4 path) pass their own.
     Returns:
         A tuple of (x_fp4, blockscale_e8m0).
     """
@@ -171,12 +215,22 @@ def dynamic_mxfp4_quant(
 
     # This is fixed by spec for MXFP4. Do not tune this.
     MXFP4_QUANT_BLOCK_SIZE = 32
-    x_fp4 = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
-    blockscale_e8m0 = torch.empty(
-        ((N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE, M),
-        dtype=torch.uint8,
-        device=x.device,
-    ).T
+    if x_fp4 is None:
+        x_fp4 = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
+    else:
+        assert x_fp4.shape == (M, N // 2) and x_fp4.dtype == torch.uint8
+    n_scales = (N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
+    if blockscale_e8m0 is None:
+        blockscale_e8m0 = torch.empty(
+            (n_scales, M),
+            dtype=torch.uint8,
+            device=x.device,
+        ).T
+    else:
+        assert (
+            blockscale_e8m0.shape == (M, n_scales)
+            and blockscale_e8m0.dtype == torch.uint8
+        )
 
     # for large N values
     if M <= 32:

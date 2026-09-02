@@ -17,16 +17,13 @@ from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
 from aiter.ops.triton.moe.moe_routing.routing import routing
 
 # numerics utilities
-from aiter.ops.triton.moe.quant_moe import (
-    # downcast_to_static_fp8,
-    downcast_to_mxfp,
-    upcast_from_mxfp,
-)
+from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 
 # target-specific utilities
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 from aiter.ops.triton.utils.types import str_to_torch_dtype
+from op_tests.triton_tests.utils.mxfp_ref import upcast_from_mxfp
 
 # ---------------
 # initialize data

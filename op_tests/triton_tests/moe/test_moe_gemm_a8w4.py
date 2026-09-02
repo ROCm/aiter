@@ -21,12 +21,12 @@ from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.moe.quant_moe import (
     downcast_to_mxfp,
     downcast_to_static_fp8,
-    upcast_from_mxfp,
 )
 
 # target-specific utilities
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.shuffle import moe_weight_decode_view, shuffle_scale_moe
+from op_tests.triton_tests.utils.mxfp_ref import upcast_from_mxfp
 
 
 def preshuffle_moe_weight(w: torch.Tensor) -> torch.Tensor:

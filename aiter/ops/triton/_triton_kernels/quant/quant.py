@@ -10,24 +10,59 @@ def _static_per_tensor_quant_fp8_i8_kernel(
     qx_ptr,
     x_in_ptr,
     scale_in_ptr,
+    rows: int,
     cols: int,
-    x_in_stride_r: int,
-    NUM_COL_POW2: tl.constexpr,
+    stride_x_m,
+    stride_x_n,
+    stride_q_m,
+    stride_q_n,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    FAST_CONVERT: tl.constexpr,
 ):
-    pid = tl.program_id(axis=0)
-    tl.assume(pid > 0)
-    tl.assume(x_in_stride_r > 0)
+    """Quantize x by a single tensor-wide scale into the dtype of ``qx_ptr``
+    (fp8 e4m3/e5m2 or int8).
 
-    offs = pid * x_in_stride_r + tl.arange(0, NUM_COL_POW2)
-    mask = tl.arange(0, NUM_COL_POW2) < cols
-    x = tl.load(x_in_ptr + offs, mask=mask, cache_modifier=".cg")
+    FAST_CONVERT picks how the scale is applied:
+
+    * ``True``  -- multiply by the reciprocal. One v_mul per element, the
+      reciprocal computed once per program.
+    * ``False`` -- divide. A correctly-rounded fp32 division per element, so it
+      matches an ``x / scale`` reference exactly.
+
+    The two agree on nearly every input but not all of them: with scale=448.0 a
+    dense bf16 sweep puts them 1 fp8 ulp apart on ~0.2% of elements, because a
+    reciprocal that is half an fp32 ulp off can land on the far side of an fp8
+    rounding boundary.
+    """
+    # Fold the block origin into the base pointers in int64 so only the in-tile
+    # offsets, which always fit, stay 32-bit.
+    start_m = tl.program_id(axis=0).to(tl.int64) * BLOCK_M
+    start_n = tl.program_id(axis=1).to(tl.int64) * BLOCK_N
+    x_in_ptr += start_m * stride_x_m + start_n * stride_x_n
+    qx_ptr += start_m * stride_q_m + start_n * stride_q_n
+
+    offs_m = tl.arange(0, BLOCK_M)[:, None]
+    offs_n = tl.arange(0, BLOCK_N)[None, :]
+    mask = (start_m + offs_m < rows) & (start_n + offs_n < cols)
+
+    x = tl.load(
+        x_in_ptr + offs_m * stride_x_m + offs_n * stride_x_n,
+        mask=mask,
+        cache_modifier=".cg",
+    )
 
     scale = tl.load(scale_in_ptr)
-    scale_recip = 1 / scale
+    if FAST_CONVERT:
+        qx = x * (1 / scale)
+    else:
+        qx = x.to(tl.float32) / scale
 
-    qx = (x * scale_recip).to(qx_ptr.dtype.element_ty)
-
-    tl.store(qx_ptr + offs, qx, mask=mask)
+    tl.store(
+        qx_ptr + offs_m * stride_q_m + offs_n * stride_q_n,
+        qx.to(qx_ptr.dtype.element_ty),
+        mask=mask,
+    )
 
 
 @triton.jit
@@ -377,19 +412,24 @@ def _dynamic_mxfp4_quant_kernel(
 
 
 @triton.jit
-def _mxfp8_quant_op(x_grouped, QUANT_AXIS: tl.constexpr):
+def _mxfp8_quant_op(
+    x_grouped, QUANT_AXIS: tl.constexpr, LOG2_DTYPE_MAX: tl.constexpr = 8
+):
     """Shared MXFP8 (1x32 e8m0) scale derivation.
 
     Given a fp32 tile where the QUANT_AXIS dim is sized QUANT_BLOCK_SIZE (=32),
     returns (scale_e8m0, quant_scale): the per-group uint8 e8m0 scale and the
     matching fp32 multiplicative scale. Both outputs keep QUANT_AXIS with size 1
     so they broadcast against the input for in-place quantization.
+
+    LOG2_DTYPE_MAX is log2 of the largest power of two the target dtype holds:
+    8 for e4m3 (max 448 -> 256) and 15 for e5m2 (max 57344 -> 32768).
     """
     amax = tl.max(tl.abs(x_grouped), axis=QUANT_AXIS, keep_dims=True)
     amax_i32 = amax.to(tl.int32, bitcast=True)
     amax_i32 = (amax_i32 + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
     amax_p2 = amax_i32.to(tl.float32, bitcast=True)
-    scale_unbiased = tl.log2(amax_p2).floor() - 8
+    scale_unbiased = tl.log2(amax_p2).floor() - LOG2_DTYPE_MAX
     scale_unbiased = tl.clamp(scale_unbiased, min=-127, max=127)
     scale_e8m0 = (scale_unbiased.to(tl.int32) + 127).to(tl.uint8)
     quant_scale = tl.exp2(-scale_unbiased)
