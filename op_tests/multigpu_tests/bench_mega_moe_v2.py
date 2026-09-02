@@ -211,7 +211,6 @@ def main():
     parser.add_argument("--stage1-grid-mult", type=int, default=0)
     parser.add_argument("--stage1-b-nt", type=int, default=-1)
     parser.add_argument("--stage1-tile-resource", action="store_true")
-    parser.add_argument("--stage1-dedup", choices=("auto", "on", "off"), default="auto")
     parser.add_argument("--check-variant", action="store_true")
     parser.add_argument("--profile-dir", default="")
     parser.add_argument("--mega-only", action="store_true")
@@ -285,7 +284,6 @@ def main():
         or args.stage1_grid_mult
         or args.stage1_b_nt >= 0
         or args.stage1_tile_resource
-        or args.stage1_dedup != "auto"
         or args.config_tokens
     ):
 
@@ -299,10 +297,7 @@ def main():
             if args.stage1_tile_ready:
                 stage1_updates["payload_tile_ready"] = True
             if args.disable_stage1_tile_ready:
-                stage1_updates.update(
-                    payload_tile_ready=False,
-                    deduplicate_payload=False,
-                )
+                stage1_updates["payload_tile_ready"] = False
             if args.stage1_internal_grouping:
                 stage1_updates.update(
                     external_grouping=False,
@@ -318,13 +313,6 @@ def main():
                 stage1_updates["b_nt"] = args.stage1_b_nt
             if args.stage1_tile_resource:
                 stage1_updates["use_tile_resource"] = True
-            if args.stage1_dedup == "on":
-                stage1_updates.update(
-                    deduplicate_payload=True,
-                    payload_tile_ready=True,
-                )
-            elif args.stage1_dedup == "off":
-                stage1_updates.update(deduplicate_payload=False)
             if stage1_updates:
                 stage1 = replace(stage1, **stage1_updates)
             if (

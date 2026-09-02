@@ -18,7 +18,6 @@ from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
     select_mega_moe_config,
     stage1_bundle_identity,
 )
-from aiter.ops.flydsl.kernels.mega_moe.mega_moe_v2 import MegaMoEV2
 
 
 def test_preload_compiled_prefers_native_no_dispatch_api(monkeypatch):
@@ -40,6 +39,9 @@ def test_preload_compiled_prefers_native_no_dispatch_api(monkeypatch):
 
 
 def test_zero_token_quantize_does_not_launch_a_kernel(monkeypatch):
+    pytest.importorskip("mori.shmem", reason="MegaMoEV2 requires MORI")
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_v2 import MegaMoEV2
+
     moe = object.__new__(MegaMoEV2)
     moe._s1_quant_x = torch.empty((1, 32), dtype=torch.uint8)
     moe._s1_quant_scale = torch.empty((1, 1), dtype=torch.uint8)
@@ -134,16 +136,6 @@ def test_role_retirement_is_not_a_configurable_stage1_variant():
         stage1 = plan.entry_for_tokens(bucket).config.stage1
         assert not hasattr(stage1, "retire_control_ctas")
         assert stage1.payload_tile_ready
-
-
-def test_default_prefill_keeps_payload_deduplication_disabled():
-    plan = build_mega_moe_bundle_plan(8192)
-    rank_tokens = (1, 8, 32, 128, 256, 512, 4096, 8192)
-    configs = tuple(
-        plan.entry_for_tokens(tokens).config.stage1 for tokens in rank_tokens
-    )
-
-    assert all(not getattr(config, "deduplicate_payload", False) for config in configs)
 
 
 @pytest.mark.parametrize("mtpr", [8192, 16384, 32768])

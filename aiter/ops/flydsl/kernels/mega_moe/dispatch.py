@@ -58,11 +58,6 @@ class DispatchSlot(IntEnum):
     P2P_PAYLOAD_READY_ROWS = 40
     PAYLOAD_BLOCKS_PER_DESTINATION = 41
     PAYLOAD_CHUNKS_PER_DESTINATION = 42
-    WINNER_ROW = 43
-    P2P_WINNER_ROW = 44
-    WINNER_READY = 45
-    P2P_WINNER_READY = 46
-    EXPANDED_TILE_READY = 47
     TILE_INPUT_BASE = 48
     GROUP_TASK_BASE = 49
     P2P_GROUP_TASK_BASE = 50
@@ -164,76 +159,6 @@ def _wave_reduce_max_i32(value, lane):
 def _increment_i32(rsrc, index):
     value = buffer_ops.buffer_load(rsrc, index, vec_width=1, dtype=fx.Int32)
     buffer_ops.buffer_store(value + fx.Int32(1), rsrc, index)
-
-
-@flyc.jit
-def _classify_fanout_route(
-    r_idx,
-    route,
-    expert,
-    addr_pair_config,
-    parity,
-    *,
-    fz_k,
-    fz_epr,
-    fz_total_experts,
-    fz_npes,
-    fanout_masks,
-    runtime_fanout,
-):
-    """Map one logical route to a normal expert or one shared segment.
-
-    A selected mask may be a subset of the token's destination-local fanout.
-    Its least-significant expert is the sole physical-payload producer; other
-    selected members remain logical rows emitted by that shared task.
-    """
-    destination = expert // fx.Int32(fz_epr)
-    local_expert = expert - destination * fx.Int32(fz_epr)
-    selected_mask, canonical = _load_fanout_pair(
-        addr_pair_config,
-        destination,
-        parity,
-        npes=fz_npes,
-        fanout_masks=fanout_masks,
-        runtime_fanout=runtime_fanout,
-    )
-
-    token = route // fx.Int32(fz_k)
-    token_mask = fx.Int64(0)
-    member_slots = fx.Int32(0)
-    for slot in range_constexpr(fz_k):
-        peer_expert = buffer_ops.buffer_load(
-            r_idx,
-            token * fx.Int32(fz_k) + fx.Int32(slot),
-            vec_width=1,
-            dtype=fx.Int32,
-        )
-        valid = (peer_expert >= fx.Int32(0)) & (
-            peer_expert < fx.Int32(fz_total_experts)
-        )
-        same_destination = peer_expert // fx.Int32(fz_epr) == destination
-        peer_local = peer_expert - destination * fx.Int32(fz_epr)
-        safe_local = (valid & same_destination).select(peer_local, fx.Int32(0))
-        peer_bit = fx.Int64(1) << fx.Int64(safe_local)
-        token_mask = (valid & same_destination).select(
-            token_mask | peer_bit, token_mask
-        )
-        selected_member = valid & same_destination
-        selected_member = selected_member & (
-            ((selected_mask >> fx.Int64(safe_local)) & fx.Int64(1)) != fx.Int64(0)
-        )
-        member_slots = selected_member.select(
-            member_slots | fx.Int32(1 << slot), member_slots
-        )
-
-    selected = selected_mask != fx.Int64(0)
-    matched = selected & ((token_mask & selected_mask) == selected_mask)
-    member_bit = (selected_mask >> fx.Int64(local_expert)) & fx.Int64(1)
-    shared_member = matched & (member_bit != fx.Int64(0))
-    emit = (~shared_member) | (local_expert == canonical)
-    shared_segment = fx.Int32(fz_total_experts) + destination
-    segment = shared_member.select(shared_segment, expert)
-    return segment, emit, member_slots
 
 
 @flyc.jit
@@ -469,34 +394,6 @@ def _copy_token_row(source_rsrc, destination_rsrc, lane, *, fz_safe_end_i32, fz_
                 source_rsrc, column, vec_width=4, dtype=fx.Int32
             )
             buffer_ops.buffer_store(value, destination_rsrc, column)
-
-
-@flyc.jit
-def _is_payload_winner(
-    r_idx,
-    source_token,
-    topk_slot,
-    destination,
-    *,
-    fz_k,
-    fz_epr,
-    fz_total_experts,
-):
-    """Return one for the first valid top-k route targeting destination."""
-    is_winner = fx.Int32(1)
-    for prior_slot in range_constexpr(fz_k):
-        prior_expert = buffer_ops.buffer_load(
-            r_idx,
-            source_token * fx.Int32(fz_k) + fx.Int32(prior_slot),
-            vec_width=1,
-            dtype=fx.Int32,
-        )
-        prior_valid = fx.Int32(prior_slot) < topk_slot
-        prior_valid = prior_valid & (prior_expert >= fx.Int32(0))
-        prior_valid = prior_valid & (prior_expert < fx.Int32(fz_total_experts))
-        same_destination = prior_expert // fx.Int32(fz_epr) == destination
-        is_winner = (prior_valid & same_destination).select(fx.Int32(0), is_winner)
-    return is_winner
 
 
 @flyc.jit
@@ -1619,9 +1516,7 @@ def emit_dispatch_payload(
     payload_tile_ready=False,
     ready_tile_queue=False,
     tile_state_stride=0,
-    deduplicate_payload=False,
     indexed_payload=False,
-    retire_control_ctas=False,
     fanout_masks=(),
     runtime_fanout=False,
 ):
@@ -1664,11 +1559,6 @@ def emit_dispatch_payload(
         p_ready_tile_queue = dp(DispatchSlot.P2P_READY_TILE_QUEUE)
         p_ready_tile_epoch = dp(DispatchSlot.P2P_READY_TILE_EPOCH)
         p_ready_tile_tail = dp(DispatchSlot.P2P_READY_TILE_TAIL)
-    p_winner_row = fx.Int64(0)
-    p_winner_ready = fx.Int64(0)
-    if const_expr(deduplicate_payload):
-        p_winner_row = dp(DispatchSlot.P2P_WINNER_ROW)
-        p_winner_ready = dp(DispatchSlot.P2P_WINNER_READY)
     addr_pair_config = fx.Int64(0)
     if const_expr(fanout_enabled):
         addr_pair_config = dp(DispatchSlot.FANOUT_PAIR_CONFIG)
@@ -1682,7 +1572,7 @@ def emit_dispatch_payload(
     r_gb = crfa(a_gb)
     r_pair = crfa(a_pair_order)
     r_idx = crfa(fx.Int64(0))
-    if const_expr(fanout_enabled or deduplicate_payload):
+    if const_expr(fanout_enabled):
         r_idx = crfa(addr_in_idx)
     r_wts = crfa(addr_in_wts)
     r_chunk_done = crfa(a_chunk_done)
@@ -1712,7 +1602,7 @@ def emit_dispatch_payload(
     num_destinations = fz_total_experts // fz_epr
     segments_per_destination = fz_epr + (1 if fanout_enabled else 0)
     payload_epoch = fx.Int32(0)
-    if const_expr(ready_tile_queue or deduplicate_payload):
+    if const_expr(ready_tile_queue):
         payload_epoch = (expected // fx.Int32(num_destinations)) * fx.Int32(2) - parity
     if const_expr(payload_chunk_rows > 0):
         assert dispatch_blocks % num_destinations == 0
@@ -1814,19 +1704,10 @@ def emit_dispatch_payload(
             chunk_active = fx.Int32(0) == fx.Int32(0)
             row_begin = fx.Int32(0)
             row_end = source_count
-        winner_row_remote = fx.Int64(0)
-        winner_ready_remote = fx.Int64(0)
         if const_expr(hoist_remote_resources):
             wts_remote_rsrc = crfa(buffer_ops.buffer_load(crfa(p_wts), destination, vec_width=1, dtype=fx.Int64))
             srcmap_remote_rsrc = crfa(buffer_ops.buffer_load(crfa(p_sm), destination, vec_width=1, dtype=fx.Int64))
             token_remote = buffer_ops.buffer_load(crfa(p_rx), destination, vec_width=1, dtype=fx.Int64)
-            if const_expr(deduplicate_payload):
-                winner_row_remote = buffer_ops.buffer_load(
-                    crfa(p_winner_row), destination, vec_width=1, dtype=fx.Int64
-                )
-                winner_ready_remote = buffer_ops.buffer_load(
-                    crfa(p_winner_ready), destination, vec_width=1, dtype=fx.Int64
-                )
             if const_expr(fz_enable_scales):
                 scale_remote_rsrc = crfa(
                     buffer_ops.buffer_load(crfa(p_sc), destination, vec_width=1, dtype=fx.Int64)
@@ -1892,64 +1773,25 @@ def emit_dispatch_payload(
                 else:
                     _copy_route_header(wk, destination_row)
 
-            copy_payload = fx.Int32(1)
-            if const_expr(deduplicate_payload):
-                if lane == fx.Int32(0):
-                    copy_payload = _is_payload_winner(
-                        r_idx,
-                        source_token,
-                        topk_slot,
-                        destination,
-                        fz_k=fz_k,
-                        fz_epr=fz_epr,
-                        fz_total_experts=fz_total_experts,
-                    )
-                copy_payload = fx.Int32(fx.rocdl.readfirstlane(T.i32, copy_payload))
-
-            if const_expr(not deduplicate_payload) or copy_payload != fx.Int32(0):
-                payload_row = destination_row
-                if const_expr(indexed_payload):
-                    payload_row = source_key
-                if const_expr(fz_enable_scales):
-                    scale_lane = lane
-                    if const_expr(fz_scale_n_i32 % 4 == 0):
-                        scale_offset = scale_lane * fx.Int32(4)
-                        if scale_offset < fx.Int32(fz_scale_n_i32):
-                            scale = buffer_ops.buffer_load(
-                                crfa(addr_in_sc),
-                                source_token * fx.Int32(fz_scale_n_i32) + scale_offset,
-                                vec_width=4,
-                                dtype=fx.Int32,
-                            )
-                            if const_expr(hoist_remote_resources):
-                                buffer_ops.buffer_store(
-                                    scale,
-                                    scale_remote_rsrc,
-                                    payload_row * fx.Int32(fz_scale_n_i32) + scale_offset,
-                                )
-                            else:
-                                row_scale_remote = crfa(
-                                    buffer_ops.buffer_load(
-                                        crfa(p_sc), destination, vec_width=1, dtype=fx.Int64
-                                    )
-                                )
-                                buffer_ops.buffer_store(
-                                    scale,
-                                    row_scale_remote,
-                                    payload_row * fx.Int32(fz_scale_n_i32) + scale_offset,
-                                )
-                    elif scale_lane < fx.Int32(fz_scale_n_i32):
+            payload_row = destination_row
+            if const_expr(indexed_payload):
+                payload_row = source_key
+            if const_expr(fz_enable_scales):
+                scale_lane = lane
+                if const_expr(fz_scale_n_i32 % 4 == 0):
+                    scale_offset = scale_lane * fx.Int32(4)
+                    if scale_offset < fx.Int32(fz_scale_n_i32):
                         scale = buffer_ops.buffer_load(
                             crfa(addr_in_sc),
-                            source_token * fx.Int32(fz_scale_n_i32) + scale_lane,
-                            vec_width=1,
+                            source_token * fx.Int32(fz_scale_n_i32) + scale_offset,
+                            vec_width=4,
                             dtype=fx.Int32,
                         )
                         if const_expr(hoist_remote_resources):
                             buffer_ops.buffer_store(
                                 scale,
                                 scale_remote_rsrc,
-                                payload_row * fx.Int32(fz_scale_n_i32) + scale_lane,
+                                payload_row * fx.Int32(fz_scale_n_i32) + scale_offset,
                             )
                         else:
                             row_scale_remote = crfa(
@@ -1960,78 +1802,51 @@ def emit_dispatch_payload(
                             buffer_ops.buffer_store(
                                 scale,
                                 row_scale_remote,
-                                payload_row * fx.Int32(fz_scale_n_i32) + scale_lane,
+                                payload_row * fx.Int32(fz_scale_n_i32) + scale_offset,
                             )
-                source_rsrc = crfa(addr_in_tok + fx.Int64(source_token) * fx.Int64(fz_nbytes))
-                if const_expr(hoist_remote_resources):
-                    destination_rsrc = crfa(
-                        token_remote + fx.Int64(payload_row) * fx.Int64(fz_nbytes)
+                elif scale_lane < fx.Int32(fz_scale_n_i32):
+                    scale = buffer_ops.buffer_load(
+                        crfa(addr_in_sc),
+                        source_token * fx.Int32(fz_scale_n_i32) + scale_lane,
+                        vec_width=1,
+                        dtype=fx.Int32,
                     )
-                else:
-                    row_token_remote = buffer_ops.buffer_load(
-                        crfa(p_rx), destination, vec_width=1, dtype=fx.Int64
-                    )
-                    destination_rsrc = crfa(
-                        row_token_remote + fx.Int64(payload_row) * fx.Int64(fz_nbytes)
-                    )
-                _copy_token_row(
-                    source_rsrc,
-                    destination_rsrc,
-                    lane,
-                    fz_safe_end_i32=fz_safe_end_i32,
-                    fz_n_i32=fz_n_i32,
+                    if const_expr(hoist_remote_resources):
+                        buffer_ops.buffer_store(
+                            scale,
+                            scale_remote_rsrc,
+                            payload_row * fx.Int32(fz_scale_n_i32) + scale_lane,
+                        )
+                    else:
+                        row_scale_remote = crfa(
+                            buffer_ops.buffer_load(
+                                crfa(p_sc), destination, vec_width=1, dtype=fx.Int64
+                            )
+                        )
+                        buffer_ops.buffer_store(
+                            scale,
+                            row_scale_remote,
+                            payload_row * fx.Int32(fz_scale_n_i32) + scale_lane,
+                        )
+            source_rsrc = crfa(addr_in_tok + fx.Int64(source_token) * fx.Int64(fz_nbytes))
+            if const_expr(hoist_remote_resources):
+                destination_rsrc = crfa(
+                    token_remote + fx.Int64(payload_row) * fx.Int64(fz_nbytes)
                 )
-
-        if const_expr(deduplicate_payload):
-            # Drain the whole chunk once before publishing any winner.  A
-            # per-row waitcnt/fence serializes the 7-KiB row copies and erases
-            # the benefit of deduplication.  The second, metadata-only pass is
-            # cheap and preserves the release chain:
-            # payload/header stores -> waitcnt -> system release -> ready epoch.
-            fx.rocdl.s_waitcnt(0)
-            fx.barrier()
-            comm_ops.fence_system_release()
-            for row in range(row_begin + row0, row_end, row_stride):
-                wk_lane = fx.Int32(0)
-                if lane == fx.Int32(0):
-                    wk_lane = buffer_ops.buffer_load(
-                        r_pair, source_base + row, vec_width=1, dtype=fx.Int32
-                    )
-                wk = fx.Int32(fx.rocdl.readfirstlane(T.i32, wk_lane))
-                source_token = wk // fx.Int32(fz_k)
-                topk_slot = wk % fx.Int32(fz_k)
-                if lane == fx.Int32(0):
-                    copy_payload = _is_payload_winner(
-                        r_idx,
-                        source_token,
-                        topk_slot,
-                        destination,
-                        fz_k=fz_k,
-                        fz_epr=fz_epr,
-                        fz_total_experts=fz_total_experts,
-                    )
-                    if copy_payload != fx.Int32(0):
-                        if const_expr(not hoist_remote_resources):
-                            winner_row_remote = buffer_ops.buffer_load(
-                                crfa(p_winner_row),
-                                destination,
-                                vec_width=1,
-                                dtype=fx.Int64,
-                            )
-                            winner_ready_remote = buffer_ops.buffer_load(
-                                crfa(p_winner_ready),
-                                destination,
-                                vec_width=1,
-                                dtype=fx.Int64,
-                            )
-                        source_key = fx.Int32(fz_rank * fz_mtpr) + source_token
-                        destination_row = destination_base + row
-                        comm_ops.store_i32_system(
-                            winner_row_remote, source_key, destination_row
-                        )
-                        comm_ops.store_i32_system(
-                            winner_ready_remote, source_key, payload_epoch
-                        )
+            else:
+                row_token_remote = buffer_ops.buffer_load(
+                    crfa(p_rx), destination, vec_width=1, dtype=fx.Int64
+                )
+                destination_rsrc = crfa(
+                    row_token_remote + fx.Int64(payload_row) * fx.Int64(fz_nbytes)
+                )
+            _copy_token_row(
+                source_rsrc,
+                destination_rsrc,
+                lane,
+                fz_safe_end_i32=fz_safe_end_i32,
+                fz_n_i32=fz_n_i32,
+            )
 
         if chunk_active:
             fx.rocdl.s_waitcnt(0)
@@ -2106,134 +1921,3 @@ def emit_dispatch_payload(
                         )
                 _finish_task(destination, local_expert, segment, num_chunks)
             fx.barrier()
-
-
-# fmt: off
-@flyc.jit
-def emit_expand_payload(
-    *, num_waves, fz_npes, fz_mtpr, fz_rank, fz_tile_m, fz_nbytes, fz_n_i32,
-    fz_safe_end_i32, fz_scale_n_i32, fz_enable_scales, addr_disp, expander_slot,
-    expand_blocks, parity, expected,
-):
-# fmt: on
-    """Expand deduplicated local payloads back into the route-major GEMM layout."""
-    crfa = buffer_ops.create_buffer_resource_from_addr
-    rdisp = crfa(addr_disp)
-
-    def dp(i):
-        return buffer_ops.buffer_load(rdisp, fx.Int32(int(i)), vec_width=1, dtype=fx.Int64)
-
-    p_rx = dp(DispatchSlot.P2P_TOKEN)
-    p_sc = dp(DispatchSlot.P2P_SCALE)
-    a_srcmap = dp(DispatchSlot.SRCMAP)
-    a_num_valid = dp(DispatchSlot.NUM_VALID)
-    a_plan_ready = dp(DispatchSlot.PLAN_READY)
-    a_tile_ready = dp(DispatchSlot.TILE_READY)
-    a_tile_expected = dp(DispatchSlot.TILE_EXPECTED)
-    a_winner_row = dp(DispatchSlot.WINNER_ROW)
-    a_winner_ready = dp(DispatchSlot.WINNER_READY)
-    a_expanded_tile_ready = dp(DispatchSlot.EXPANDED_TILE_READY)
-
-    tid = fx.thread_idx.x
-    lane = tid & fx.Int32(63)
-    warp = tid >> fx.Int32(6)
-    route_token = buffer_ops.buffer_load(crfa(p_rx), fx.Int32(fz_rank), vec_width=1, dtype=fx.Int64)
-    route_scale = fx.Int64(0)
-    if const_expr(fz_enable_scales):
-        route_scale = buffer_ops.buffer_load(
-            crfa(p_sc), fx.Int32(fz_rank), vec_width=1, dtype=fx.Int64
-        )
-    ready_index = parity * fx.Int32(fz_npes) + fx.Int32(fz_rank)
-    if tid == fx.Int32(0):
-        comm_ops.wait_i32_until_equals(
-            a_plan_ready + fx.Int64(ready_index) * fx.Int64(4), expected
-        )
-        comm_ops.fence_system_acquire()
-    fx.barrier()
-
-    num_valid = buffer_ops.buffer_load(crfa(a_num_valid), fx.Int32(0), vec_width=1, dtype=fx.Int32)
-    num_tiles = (num_valid + fx.Int32(fz_tile_m - 1)) // fx.Int32(fz_tile_m)
-    payload_epoch = (expected // fx.Int32(fz_npes)) * fx.Int32(2) - parity
-    source_key_limit = fx.Int32(fz_npes * fz_mtpr)
-    for tile in range(expander_slot, num_tiles, fx.Int32(expand_blocks)):
-        if tid == fx.Int32(0):
-            expected_parts = buffer_ops.buffer_load(
-                crfa(a_tile_expected), tile, vec_width=1, dtype=fx.Int32
-            )
-            comm_ops.wait_i32_until_equals(
-                a_tile_ready + fx.Int64(tile) * fx.Int64(4), expected_parts
-            )
-            comm_ops.fence_system_acquire()
-        fx.barrier()
-
-        tile_row = tile * fx.Int32(fz_tile_m)
-        for row_offset in range(warp, fz_tile_m, num_waves):
-            source_row_lane = source_key_limit
-            winner_row_lane = fx.Int32(0)
-            if lane == fx.Int32(0):
-                packed = buffer_ops.buffer_load(
-                    crfa(a_srcmap), tile_row + row_offset, vec_width=1, dtype=fx.Int32
-                )
-                source_row_lane = packed & fx.Int32(0xFFFFFF)
-                if source_row_lane < source_key_limit:
-                    comm_ops.wait_i32_until_equals(
-                        a_winner_ready + fx.Int64(source_row_lane) * fx.Int64(4),
-                        payload_epoch,
-                    )
-                    comm_ops.fence_system_acquire()
-                    winner_row_lane = buffer_ops.buffer_load(
-                        crfa(a_winner_row), source_row_lane, vec_width=1, dtype=fx.Int32
-                    )
-            source_row = fx.Int32(fx.rocdl.readfirstlane(T.i32, source_row_lane))
-            winner_row = fx.Int32(fx.rocdl.readfirstlane(T.i32, winner_row_lane))
-            if source_row < source_key_limit:
-                destination_row = tile_row + row_offset
-                winner_valid = (winner_row >= fx.Int32(0)) & (winner_row < num_valid)
-                if winner_valid & (winner_row != destination_row):
-                    if const_expr(fz_enable_scales):
-                        scale_offset = lane * fx.Int32(4)
-                        if const_expr(fz_scale_n_i32 % 4 == 0):
-                            if scale_offset < fx.Int32(fz_scale_n_i32):
-                                scale = buffer_ops.buffer_load(
-                                    crfa(route_scale),
-                                    winner_row * fx.Int32(fz_scale_n_i32) + scale_offset,
-                                    vec_width=4,
-                                    dtype=fx.Int32,
-                                )
-                                buffer_ops.buffer_store(
-                                    scale,
-                                    crfa(route_scale),
-                                    destination_row * fx.Int32(fz_scale_n_i32) + scale_offset,
-                                )
-                        elif lane < fx.Int32(fz_scale_n_i32):
-                            scale = buffer_ops.buffer_load(
-                                crfa(route_scale),
-                                winner_row * fx.Int32(fz_scale_n_i32) + lane,
-                                vec_width=1,
-                                dtype=fx.Int32,
-                            )
-                            buffer_ops.buffer_store(
-                                scale,
-                                crfa(route_scale),
-                                destination_row * fx.Int32(fz_scale_n_i32) + lane,
-                            )
-                    source_rsrc = crfa(
-                        route_token + fx.Int64(winner_row) * fx.Int64(fz_nbytes)
-                    )
-                    destination_rsrc = crfa(
-                        route_token + fx.Int64(destination_row) * fx.Int64(fz_nbytes)
-                    )
-                    _copy_token_row(
-                        source_rsrc,
-                        destination_rsrc,
-                        lane,
-                        fz_safe_end_i32=fz_safe_end_i32,
-                        fz_n_i32=fz_n_i32,
-                    )
-
-        fx.rocdl.s_waitcnt(0)
-        fx.barrier()
-        if tid == fx.Int32(0):
-            comm_ops.fence_system_release()
-            comm_ops.store_i32_system(a_expanded_tile_ready, tile, payload_epoch)
-        fx.barrier()
