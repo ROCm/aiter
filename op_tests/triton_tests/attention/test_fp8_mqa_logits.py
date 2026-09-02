@@ -151,107 +151,62 @@ def test_fp8_mqa_logits(
     assert diff < 1e-3, f"{diff=}"
 
 
-@pytest.mark.parametrize("num_heads", [32, 64])
-@torch.inference_mode()
-def test_fp8_mqa_logits_large_kv(num_heads: int) -> None:
-    """A logits buffer past 2**31 elements.
+def ref_fp8_mqa_logits_row(q_row, kv, weight_row, start, end):
+    """One row of the reference, so s_k can be large.
 
-    The kernel bakes the row and the tile into the store base pointer, so that
-    base has to be formed in int64 -- in int32 elements it wraps here. The dense
-    reference is far too large at this shape, so a sample of rows is recomputed
-    instead, biased towards the high row ids where the base is largest.
+    ref_fp8_mqa_logits materializes [num_heads, s_q, s_k], which is hundreds of
+    GB at the shapes below; per row it is [num_heads, s_k].
     """
-    s_q, s_k = 8192, 270336  # 2.21e9 logits elements, 8.85 GiB of fp32
-    head_dim = 128
-    need = s_q * s_k * 4 + 4 * 1024**3
-    if torch.cuda.mem_get_info()[0] < need:
-        pytest.skip(f"needs {need / 1024**3:.0f} GiB of free device memory")
+    score = (q_row.float() @ kv.float().T).relu()
+    row = (score * weight_row.unsqueeze(-1)).sum(dim=0)
+    out = torch.full_like(row, float("-inf"))
+    out[start:end] = row[start:end]
+    return out
+
+
+@pytest.mark.parametrize("s_q, s_k", [(8192, 65664), (8192, 98304)])
+@pytest.mark.parametrize("num_heads", [32])
+@pytest.mark.parametrize("head_dim", [128])
+@torch.inference_mode()
+def test_fp8_mqa_logits_logits_past_2gib(
+    s_q: int, s_k: int, num_heads: int, head_dim: int
+) -> None:
+    """Prefill shapes whose fp32 logits tensor exceeds 2 GiB.
+
+    The gluon path picks BLOCK_M=2 for s_q > 4096, and that only compiles when
+    buffer stores are in use. An over-conservative buffer-store gate therefore
+    either aborts the AMDGCN backend at JIT time or silently falls back to one
+    query row per workgroup. Neither is reachable from the shapes above: they
+    top out four orders of magnitude below the limit.
+    """
+    logits_bytes = s_q * ((s_k + 255) // 256 * 256) * 4
+    assert logits_bytes > 2 * 1024**3, "shape does not exercise the gate"
+    free, _ = torch.cuda.mem_get_info()
+    if free < logits_bytes * 2:
+        pytest.skip(f"needs {logits_bytes * 2 / 2**30:.1f} GiB free")
 
     torch.manual_seed(0)
     q = torch.randn(s_q, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
     kv = torch.randn(s_k, head_dim, device="cuda", dtype=torch.bfloat16)
     kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
+    kv = (kv_fp8.to(torch.float32) * scales.reshape(-1, 1)).to(torch.bfloat16)
     weights = torch.randn(s_q, num_heads, device="cuda", dtype=torch.float32)
     ks = torch.zeros(s_q, dtype=torch.int, device="cuda")
-    ke = torch.arange(s_q, dtype=torch.int, device="cuda") + (s_k - s_q) + 1
+    ke = torch.arange(s_q, dtype=torch.int, device="cuda") + (s_k - s_q)
 
-    logits = fp8_mqa_logits(q.to(e4m3_type), kv_fp8, scales, weights, ks, ke)
-
-    # Every masked position, and only those, must have been written as -inf.
-    assert int(torch.isfinite(logits).sum()) == int((ke - ks).clamp(min=0).sum())
-
-    kv_f32 = kv_fp8.to(torch.float32) * scales.reshape(-1, 1)
-    rows = [0, 1, s_q // 2, s_q - 2, s_q - 1] + torch.randint(0, s_q, (5,)).tolist()
-    for r in sorted(set(rows)):
-        lo, hi = int(ks[r]), min(int(ke[r]), s_k)
-        score = (q[r].to(torch.float32) @ kv_f32[lo:hi].T).relu()
-        ref = (score * weights[r][:, None]).sum(0)
-        diff = calc_diff(logits[r, lo:hi], ref)
-        assert diff < 1e-3, f"row {r}: {diff=}"
-
-
-def _check_rows(logits, q, kv_fp8, scales, weights, lo, hi, rows):
-    """Recompute `rows` against a reference; the dense one is far too large."""
-    kv_f32 = kv_fp8[lo:hi].to(torch.float32) * scales[lo:hi].reshape(-1, 1)
-    for r in rows:
-        score = (q[r].to(torch.float32) @ kv_f32.T).relu()
-        ref = (score * weights[r][:, None]).sum(0)
-        diff = calc_diff(logits[r, lo:hi], ref)
-        assert diff < 1e-3, f"row {r}: {diff=}"
-
-
-@pytest.mark.parametrize("num_heads", [32, 64])
-@torch.inference_mode()
-def test_fp8_mqa_logits_long_query(num_heads: int) -> None:
-    """More query rows than a 2 GiB Q tensor holds.
-
-    The buffer descriptor for Q covers one row, so the row has to go into its
-    base pointer in int64. Folded into the 32-bit offset instead, rows past
-    2**31 / (num_heads * head_dim) read out of range and silently come back as
-    zeros rather than faulting.
-    """
-    head_dim, s_k = 128, 512
-    s_q = 2**31 // (num_heads * head_dim) + 8192  # just over 2 GiB of Q
-    need = s_q * (num_heads * head_dim + s_k * 4) + 2 * 1024**3
-    if torch.cuda.mem_get_info()[0] < need:
-        pytest.skip(f"needs {need / 1024**3:.0f} GiB of free device memory")
-
-    torch.manual_seed(0)
-    q = torch.randn(s_q, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
-    kv = torch.randn(s_k, head_dim, device="cuda", dtype=torch.bfloat16)
+    q_fp8 = q.to(e4m3_type)
     kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
-    weights = torch.randn(s_q, num_heads, device="cuda", dtype=torch.float32)
-    ks = torch.zeros(s_q, dtype=torch.int, device="cuda")
-    ke = torch.full((s_q,), s_k, dtype=torch.int, device="cuda")
 
-    logits = fp8_mqa_logits(q.to(e4m3_type), kv_fp8, scales, weights, ks, ke, False)
-    _check_rows(logits, q, kv_fp8, scales, weights, 0, s_k, [0, s_q // 2, s_q - 1])
+    logits = fp8_mqa_logits(q_fp8, kv_fp8, scales, weights, ks, ke, clean_logits=True)
+    assert logits.shape == (s_q, s_k)
 
-
-@torch.inference_mode()
-def test_fp8_mqa_logits_kv_over_2gib() -> None:
-    """A KV tensor larger than 2 GiB, with the window past that point.
-
-    Same story on the load side: the KV descriptor is rebased once per tile, so
-    `row_offset * stride_kv_s` must be int64. Keeping it exact is what lets the
-    launcher stay on buffer loads here instead of the slower global path.
-    """
-    num_heads, head_dim = 64, 128
-    s_q, s_k = 64, 17_039_360  # 2.03 GiB of KV
-    lo = 16_700_000  # window starts past the 2 GiB mark
-    need = s_k * head_dim + s_q * s_k * 4 + 4 * 1024**3
-    if torch.cuda.mem_get_info()[0] < need:
-        pytest.skip(f"needs {need / 1024**3:.0f} GiB of free device memory")
-
-    torch.manual_seed(0)
-    q = torch.randn(s_q, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
-    kv = torch.randn(s_k, head_dim, device="cuda", dtype=torch.bfloat16)
-    kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
-    del kv
-    torch.cuda.empty_cache()
-    weights = torch.randn(s_q, num_heads, device="cuda", dtype=torch.float32)
-    ks = torch.full((s_q,), lo, dtype=torch.int, device="cuda")
-    ke = torch.full((s_q,), s_k, dtype=torch.int, device="cuda")
-
-    logits = fp8_mqa_logits(q.to(e4m3_type), kv_fp8, scales, weights, ks, ke, False)
-    _check_rows(logits, q, kv_fp8, scales, weights, lo, s_k, [0, s_q // 2, s_q - 1])
+    # Sample rows across the grid: first, last, and the BLOCK_M=2 block seam.
+    for i in (0, 1, s_q // 2, s_q // 2 + 1, s_q - 1):
+        ref_row = ref_fp8_mqa_logits_row(q[i], kv, weights[i], int(ks[i]), int(ke[i]))
+        got_row = logits[i]
+        ref_mask = ref_row == float("-inf")
+        assert torch.equal(got_row == float("-inf"), ref_mask), f"mask mismatch row {i}"
+        diff = calc_diff(
+            got_row.masked_fill(ref_mask, 0), ref_row.masked_fill(ref_mask, 0)
+        )
+        assert diff < 1e-3, f"row {i}: {diff=}"

@@ -3035,6 +3035,101 @@ def test_pts_quant_shuffle_block_layout_parity(
     }
 
 
+@benchmark()
+def test_fused_qk_norm_rope_cache_pts_v_norm(
+    dtype,
+    head_size,
+    v_norm,
+    cache_dtype,
+    v_scale,
+    eps=1e-6,
+):
+    """fused_qk_norm_rope_cache_pts_quant_shuffle must write a weightless
+    RMS-normalized V to the cache when v_norm=True (Gemma4), and raw V otherwise.
+    Covers head_dim 256 (sliding) and 512 (full-attention) layers.
+
+    The per-tensor v_scale only divides V on the fp8 quant write path -- a
+    same-dtype cache copies V verbatim (scale is a no-op). So the fp8 +
+    v_scale!=1 case is what actually exercises norm-then-quantize ordering: a
+    scale/norm misorder would only surface once both are active."""
+    dev = "cuda"
+    nt, hq, hk, hv = 1, 1, 1, 1
+    num_heads = hq + hk + hv
+    block_size = 1
+    is_fp8 = cache_dtype not in (torch.bfloat16, torch.float16)
+
+    qkv = torch.randn(nt, num_heads * head_size, dtype=dtype, device=dev)
+    qw = torch.randn(head_size, dtype=dtype, device=dev)
+    kw = torch.randn(head_size, dtype=dtype, device=dev)
+    cos_sin = torch.randn(8, head_size, dtype=dtype, device=dev)
+    positions = torch.zeros(nt, dtype=torch.int64, device=dev)
+    q_out = torch.empty(nt, hq * head_size, dtype=dtype, device=dev)
+    # NHD contiguous cache: [num_blocks, block_size, num_heads, head_size]
+    k_cache = torch.zeros(1, block_size, hk, head_size, dtype=cache_dtype, device=dev)
+    v_cache = torch.zeros(1, block_size, hv, head_size, dtype=cache_dtype, device=dev)
+    slot_mapping = torch.zeros(nt, dtype=torch.int64, device=dev)
+    k_scale = torch.ones(1, dtype=torch.float32, device=dev)
+    v_scale_t = torch.full((1,), v_scale, dtype=torch.float32, device=dev)
+    x = 16 // k_cache.element_size()
+
+    aiter.fused_qk_norm_rope_cache_pts_quant_shuffle(
+        qkv.clone(),
+        qw,
+        kw,
+        cos_sin,
+        positions,
+        nt,
+        hq,
+        hk,
+        hv,
+        head_size,
+        True,  # is_neox_style
+        eps,
+        q_out,
+        k_cache,
+        v_cache,
+        slot_mapping,
+        k_scale,
+        v_scale_t,
+        None,  # k_out
+        None,  # v_out
+        False,  # return_kv
+        False,  # use_shuffle_layout
+        block_size,
+        x,
+        0,  # rotary_dim
+        v_norm,
+    )
+
+    v_in = qkv[:, (hq + hk) * head_size :].view(nt, hv, head_size).float()
+    v_ref = (
+        v_in * torch.rsqrt(v_in.pow(2).mean(-1, keepdim=True) + eps) if v_norm else v_in
+    )
+    # Dequantize the fp8 cache (from_ stored V / v_scale); the same-dtype cache
+    # stored V verbatim, so leave it as-is.
+    v_got = v_cache.view(nt, hv, head_size).float()
+    if is_fp8:
+        v_got = v_got * v_scale
+    # fp8 e4m3 rounding is coarse -- loosen tolerance on the quantized path.
+    tol = 0.1 if is_fp8 else 1e-2
+    err = checkAllclose(
+        v_ref,
+        v_got,
+        rtol=tol,
+        atol=tol,
+        tol_err_ratio=0.1 if is_fp8 else 0.05,
+        msg=f"pts v_norm={v_norm} D={head_size} cache={cache_dtype} v_scale={v_scale}",
+    )
+    return {
+        "dtype": str(dtype),
+        "head_size": head_size,
+        "v_norm": "1" if v_norm else "0",
+        "cache_dtype": str(cache_dtype),
+        "v_scale": v_scale,
+        "err": err,
+    }
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -3452,5 +3547,32 @@ if __name__ == "__main__":
     df = pd.DataFrame(df)
     aiter.logger.info(
         "pts_quant_shuffle_block_layout parity summary (markdown):\n%s",
+        df.to_markdown(index=False),
+    )
+
+    # Weightless V-norm (Gemma4): head_dim 256 (sliding) + 512 (full attention),
+    # v_norm on/off. (cache_dtype, v_scale) pairs: a same-dtype cache (scale is a
+    # no-op) plus fp8 at unit and non-trivial scale to check norm-then-quantize.
+    fp8 = get_dtype_fp8()
+    df = []
+    for head_size in (256, 512):
+        for v_norm in (False, True):
+            for cache_dtype, v_scale in (
+                (torch.bfloat16, 1.0),
+                (fp8, 1.0),
+                (fp8, 0.5),
+            ):
+                df.append(
+                    test_fused_qk_norm_rope_cache_pts_v_norm(
+                        torch.bfloat16,
+                        head_size,
+                        v_norm,
+                        cache_dtype,
+                        v_scale,
+                    )
+                )
+    df = pd.DataFrame(df)
+    aiter.logger.info(
+        "fused_qk_norm_rope_cache_pts_v_norm summary (markdown):\n%s",
         df.to_markdown(index=False),
     )

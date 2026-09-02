@@ -6,9 +6,10 @@ from dataclasses import dataclass, fields
 import pytest
 import torch
 
+from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
+
 # matmul utilities
 from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
-    is_gluon_supported,
     moe_gemm_a4w4,
     moe_gemm_torch,
     mxfp4_quant,
@@ -25,7 +26,29 @@ from aiter.ops.triton.moe.quant_moe import (
 
 # target-specific utilities
 from aiter.ops.triton.utils._triton.arch_info import get_arch, is_fp4_avail
-from aiter.ops.triton.utils.shuffle import shuffle_scale_moe, shuffle_weight
+from aiter.ops.triton.utils.shuffle import moe_weight_decode_view, shuffle_scale_moe
+
+
+def preshuffle_moe_weight(w: torch.Tensor) -> torch.Tensor:
+    """``(E, K, N)`` -> the gfx1250 WMMA TDM view ``(E, K*16, N//16)``.
+
+    ``moe_shuffle_weight`` takes the ``(E, N, K)`` MoE weight orientation and
+    returns the shuffled buffer in that same shape; ``moe_weight_decode_view``
+    then reinterprets it (zero-copy) as the flattened view the kernel loads.
+    """
+    return moe_weight_decode_view(moe_shuffle_weight(w.transpose(-1, -2)))
+
+
+def preshuffle_moe_wscale(s: torch.Tensor) -> torch.Tensor:
+    """``(E, K//32, N)`` B-scale -> gfx1250 n32k4 layout, same orientation back.
+
+    ``moe_shuffle_scale`` is the n32k4 tile (preshuffle 32, scale kwidth 4) and
+    takes the ``(E, N, K//32)`` orientation, so transpose in and back out. This
+    is the kwidth-4 counterpart of ``shuffle_scale_moe(..., scale_kwidth=4)``
+    and must stay in step with ``SCALE_KWIDTH`` in the gfx1250 gluon kernels.
+    """
+    return moe_shuffle_scale(s.transpose(-1, -2)).transpose(-1, -2)
+
 
 # ---------------
 # initialize data
@@ -217,7 +240,7 @@ class Case:
 )
 @pytest.mark.parametrize("has_y_gammas", [False, True])
 @pytest.mark.parametrize("apply_swiglu", [False, True])
-@pytest.mark.parametrize("backend", ["triton", "gluon"])
+@pytest.mark.parametrize("backend", ["gluon", "triton"])
 def test_op(
     m,
     n,
@@ -233,27 +256,35 @@ def test_op(
     backend,
     device="cuda",
 ):
+    if get_arch() != "gfx950" and get_arch() != "gfx1250":
+        pytest.skip("Kernel not supported on this GPU.")
     if not is_fp4_avail():
         pytest.skip(f"FP4 kernels are not supported on {get_arch()}.")
-    if hbm_swizzling and (n % 32 != 0 or k % (32 * 8) != 0):
-        pytest.skip(
-            f"Shape {m}x{n}x{k} is not supported for scale swizzling on AMD GPU"
-        )
+
+    if backend == "gluon" and get_arch() != "gfx1250":
+        pytest.skip(f"Gluon backend requires gfx1250, got {get_arch()}.")
+    if hbm_swizzling:
+        if get_arch() == "gfx950" and (n % 32 != 0 or k % (32 * 8) != 0):
+            pytest.skip(
+                f"Shape {m}x{n}x{k} is not supported for scale swizzling on gfx950."
+            )
+        # gfx1250 uses the n32k4 layout (scale kwidth 4), so K only needs
+        # K//32 divisible by 4; gfx950 still needs 8.
+        if get_arch() == "gfx1250" and (n % 32 != 0 or k % (32 * 4) != 0):
+            pytest.skip(
+                f"Shape {m}x{n}x{k} is not supported for scale swizzling on gfx1250."
+            )
 
     if preshuffle_weights:
         if get_arch() != "gfx1250":
             pytest.skip("Preshuffling weights is only supported on gfx1250")
-        if backend != "gluon":
-            pytest.skip("Preshuffling weights is only supported on gluon backend")
+        if backend == "triton":
+            pytest.skip("Preshuffled weights are decoded by the gluon kernel only")
         if n % 16 != 0 or (k // 2) % 32 != 0:
             pytest.skip(
                 f"Preshuffling weights requires n divisible by 16 and k//2 divisible "
                 f"by 32, got n={n}, k//2={k // 2}"
             )
-
-    # skip gluon backend if not supported
-    if backend == "gluon" and not is_gluon_supported():
-        pytest.skip(f"Gluon backend is not supported on {get_arch()}")
 
     torch.manual_seed(0)
 
@@ -285,25 +316,21 @@ def test_op(
     if hbm_swizzling:
         if get_arch() == "gfx1250":
             swizzle_mx_scale = "GFX1250_SCALE"
-            w_scale_tri = shuffle_scale_moe(
-                w_scale_tri, arch="gfx1250", preshuffle_factor=32, scale_kwidth=8
-            )
+            w_scale_tri = preshuffle_moe_wscale(w_scale_tri)
         elif get_arch() == "gfx950":
-            swizzle_mx_scale = "CDNA4_SCALE"
-            w_scale_tri = shuffle_scale_moe(
-                w_scale_tri, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+            w_scale_tri, swizzle_mx_scale = shuffle_scale_moe(
+                w_scale_tri,
+                arch="gfx950",
+                preshuffle_factor=32,
+                scale_kwidth=8,
+                return_layout=True,
             )
         else:
             assert False, "Unsupported architecture"
     else:
         swizzle_mx_scale = None
     if preshuffle_weights:
-        E, K, N = w_tri.shape
-        w_tri = (
-            shuffle_weight(w_tri, arch="gfx1250")
-            .view(E, N // 16, K * 16)
-            .transpose(-1, -2)
-        )
+        w_tri = preshuffle_moe_weight(w_tri)
 
     x_tri, x_mx_scales_tri = mxfp4_quant(x_tri)
     x_ref = upcast_from_mxfp(x_tri, x_mx_scales_tri, torch.bfloat16, axis=-1)

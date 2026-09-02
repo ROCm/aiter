@@ -30,20 +30,10 @@ from flydsl._mlir.dialects import llvm, memref, scf
 from flydsl._mlir.dialects.arith import CmpIPredicate
 from flydsl._mlir.extras import types as _mT
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import range_constexpr
-from flydsl.runtime.device import get_rocm_arch as get_hip_arch
-
-try:
-    from flydsl.runtime.device import supports_bf16_global_atomics
-except ImportError:
-
-    def supports_bf16_global_atomics(arch: str) -> bool:
-        return str(arch).startswith(("gfx94", "gfx95", "gfx12"))
-
-
-from flydsl.expr import arith, const_expr, gpu, rocdl
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.gpu import lds_space as _lds_space
 from flydsl.expr.typing import T
+from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 from aiter.ops.flydsl.kernels import buffer_ops, vector
@@ -138,8 +128,6 @@ def compile_mixed_moe_gemm1_common(
     b_dtype: str = "fp4",
     out_dtype: str = "f16",
     act: str = "silu",
-    situ_beta: float = 1.0,
-    situ_linear_beta: float = 1.0,
     use_cshuffle_epilog: bool | None = None,
     enable_bias: bool = False,
     model_dim_pad: int = 0,
@@ -171,11 +159,6 @@ def compile_mixed_moe_gemm1_common(
         raise ValueError(f"a_dtype must be one of ('fp8','fp4'), got {a_dtype!r}")
     if b_dtype not in ("fp8", "fp4"):
         raise ValueError(f"b_dtype must be one of ('fp8','fp4'), got {b_dtype!r}")
-    if situ_beta <= 0.0:
-        raise ValueError(f"situ_beta must be > 0, got {situ_beta!r}")
-    if situ_linear_beta <= 0.0:
-        raise ValueError(f"situ_linear_beta must be > 0, got {situ_linear_beta!r}")
-
     is_f8_a = a_dtype == "fp8"
     is_f4_a = a_dtype == "fp4"
     is_f4_b = b_dtype == "fp4"
@@ -287,21 +270,14 @@ def compile_mixed_moe_gemm1_common(
     as1_tag = "_as1" if a_scale_one else ""
     xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
     v2out_tag = "_v2out" if v2_output_layout else ""
-    # Keep the historical name for silu (no cache churn); swiglu/situv2 get a
-    # distinct symbol so they can't alias the silu kernel on disk. beta is
-    # compile-time for situv2 (folded via arith.constant), so two different betas
-    # must map to two different on-disk symbols; bake them into the name (the
-    # lru_cache above already separates them in-process, but the on-disk kernel
-    # cache keys only by the @flyc.kernel symbol name).
+    # Keep the historical name for silu; swiglu/situv2 get distinct symbols so
+    # they cannot alias. SiTUv2 beta values are runtime kernel arguments and
+    # therefore must not be part of the on-disk symbol/cache identity.
     act_tag = "" if act == "silu" else f"_{act}"
-    if act == "situv2":
-
-        def _beta_tag(v):
-            return repr(float(v)).replace("-", "m").replace(".", "p")
-
-        act_tag += f"_sb{_beta_tag(situ_beta)}_slb{_beta_tag(situ_linear_beta)}"
     heterogeneous_tag = f"_shared_fp8_e{shared_expert_id}" if heterogeneous_b else ""
-    kernel_version = 33 if heterogeneous_b else 32
+    # ABI v33 adds four runtime SiTUv2 beta scalars; heterogeneous ABI tracks one
+    # version ahead of the ordinary kernel.
+    kernel_version = 34 if heterogeneous_b else 33
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
         f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}_v{kernel_version}"
@@ -473,6 +449,10 @@ def compile_mixed_moe_gemm1_common(
             i32_n_in: fx.Int32,
             i32_k_in: fx.Int32,
             i32_size_expert_ids_in: fx.Int32,
+            f32_situ_beta: fx.Float32,
+            f32_situ_beta_rcp: fx.Float32,
+            f32_situ_linear_beta: fx.Float32,
+            f32_situ_linear_beta_rcp: fx.Float32,
             f32_swiglu_limit: fx.Float32,
         ):
 
@@ -2103,24 +2083,16 @@ def compile_mixed_moe_gemm1_common(
 
                 def situ_elem(g):
                     """situ(x) = beta * tanh(x / beta) * sigmoid(x)"""
-                    situ_beta_f32 = arith.constant(float(situ_beta), type=f32)
-                    situ_beta_rcp_f32 = arith.constant(1.0 / float(situ_beta), type=f32)
                     return (
-                        situ_beta_f32
-                        * tanh_elem(g * situ_beta_rcp_f32)
+                        f32_situ_beta
+                        * tanh_elem(g * f32_situ_beta_rcp)
                         * sigmoid_elem(g)
                     )
 
                 def situ_up_elem(u):
                     """linear_beta * tanh(up / linear_beta)."""
-                    situ_linear_beta_f32 = arith.constant(
-                        float(situ_linear_beta), type=f32
-                    )
-                    situ_linear_beta_rcp_f32 = arith.constant(
-                        1.0 / float(situ_linear_beta), type=f32
-                    )
-                    return situ_linear_beta_f32 * tanh_elem(
-                        u * situ_linear_beta_rcp_f32
+                    return f32_situ_linear_beta * tanh_elem(
+                        u * f32_situ_linear_beta_rcp
                     )
 
                 def _clamp_gate(x):
@@ -2842,8 +2814,6 @@ def compile_mixed_moe_gemm1_common(
                             )
 
                     default_epilog(
-                        arith=arith,
-                        range_constexpr=range_constexpr,
                         m_repeat=m_repeat,
                         lane_div_16=lane_div_16,
                         bx_m=bx_m,
@@ -2921,11 +2891,6 @@ def compile_mixed_moe_gemm1_common(
                     gui_by_n = by_n // arith.constant(2, index=True)
                     gui_n_tile_base = n_tile_base // arith.constant(2, index=True)
                     c_shuffle_epilog(
-                        arith=arith,
-                        vector=vector,
-                        gpu=gpu,
-                        scf=scf,
-                        range_constexpr=range_constexpr,
                         tile_m=tile_m,
                         tile_n=gui_tile_n,
                         e_vec=e_vec,
@@ -2949,11 +2914,6 @@ def compile_mixed_moe_gemm1_common(
                     eff_e_vec = e_vec_sk
                     acc = acc_gate
                     c_shuffle_epilog(
-                        arith=arith,
-                        vector=vector,
-                        gpu=gpu,
-                        scf=scf,
-                        range_constexpr=range_constexpr,
                         tile_m=tile_m,
                         tile_n=tile_n,
                         e_vec=eff_e_vec,
@@ -2980,11 +2940,6 @@ def compile_mixed_moe_gemm1_common(
                     acc = acc_gate
                     sk_n_offset[0] = 0
                     c_shuffle_epilog(
-                        arith=arith,
-                        vector=vector,
-                        gpu=gpu,
-                        scf=scf,
-                        range_constexpr=range_constexpr,
                         tile_m=tile_m,
                         tile_n=tile_n,
                         e_vec=eff_e_vec,
@@ -3011,11 +2966,6 @@ def compile_mixed_moe_gemm1_common(
                     acc = acc_up
                     sk_n_offset[0] = inter_dim
                     c_shuffle_epilog(
-                        arith=arith,
-                        vector=vector,
-                        gpu=gpu,
-                        scf=scf,
-                        range_constexpr=range_constexpr,
                         tile_m=tile_m,
                         tile_n=tile_n,
                         e_vec=eff_e_vec,
@@ -3038,11 +2988,6 @@ def compile_mixed_moe_gemm1_common(
                     )
                 else:
                     c_shuffle_epilog(
-                        arith=arith,
-                        vector=vector,
-                        gpu=gpu,
-                        scf=scf,
-                        range_constexpr=range_constexpr,
                         tile_m=tile_m,
                         tile_n=tile_n,
                         e_vec=e_vec,
@@ -3106,6 +3051,10 @@ def compile_mixed_moe_gemm1_common(
             i32_n_in: fx.Int32,
             i32_k_in: fx.Int32,
             i32_size_expert_ids_in: fx.Int32,
+            f32_situ_beta: fx.Float32,
+            f32_situ_beta_rcp: fx.Float32,
+            f32_situ_linear_beta: fx.Float32,
+            f32_situ_linear_beta_rcp: fx.Float32,
             f32_swiglu_limit: fx.Float32,
         ):
             _emit_moe_gemm1(
@@ -3126,6 +3075,10 @@ def compile_mixed_moe_gemm1_common(
                 i32_n_in,
                 i32_k_in,
                 i32_size_expert_ids_in,
+                f32_situ_beta,
+                f32_situ_beta_rcp,
+                f32_situ_linear_beta,
+                f32_situ_linear_beta_rcp,
                 f32_swiglu_limit,
             )
 
@@ -3148,6 +3101,10 @@ def compile_mixed_moe_gemm1_common(
             i32_n_in: fx.Int32,
             i32_k_in: fx.Int32,
             i32_size_expert_ids_in: fx.Int32,
+            f32_situ_beta: fx.Float32,
+            f32_situ_beta_rcp: fx.Float32,
+            f32_situ_linear_beta: fx.Float32,
+            f32_situ_linear_beta_rcp: fx.Float32,
             f32_swiglu_limit: fx.Float32,
         ):
             _emit_moe_gemm1(
@@ -3168,6 +3125,10 @@ def compile_mixed_moe_gemm1_common(
                 i32_n_in,
                 i32_k_in,
                 i32_size_expert_ids_in,
+                f32_situ_beta,
+                f32_situ_beta_rcp,
+                f32_situ_linear_beta,
+                f32_situ_linear_beta_rcp,
                 f32_swiglu_limit,
             )
 
@@ -3181,8 +3142,6 @@ def compile_mixed_moe_gemm1_common(
         tile_k,
         doweight_stage1,
         act,
-        situ_beta,
-        situ_linear_beta,
         enable_bias,
         model_dim_pad,
         inter_dim_pad,
@@ -3217,6 +3176,10 @@ def compile_mixed_moe_gemm1_common(
         i32_inter_in: fx.Int32,
         i32_k_in: fx.Int32,
         i32_size_expert_ids_in: fx.Int32,
+        f32_situ_beta: fx.Float32,
+        f32_situ_beta_rcp: fx.Float32,
+        f32_situ_linear_beta: fx.Float32,
+        f32_situ_linear_beta_rcp: fx.Float32,
         f32_swiglu_limit: fx.Float32,
         stream: fx.Stream,
     ):
@@ -3275,6 +3238,10 @@ def compile_mixed_moe_gemm1_common(
                 i32_inter_in,
                 i32_k_in,
                 i32_size_expert_ids_in,
+                f32_situ_beta,
+                f32_situ_beta_rcp,
+                f32_situ_linear_beta,
+                f32_situ_linear_beta_rcp,
                 f32_swiglu_limit,
             )
         else:
@@ -3294,6 +3261,10 @@ def compile_mixed_moe_gemm1_common(
                 i32_inter_in,
                 i32_k_in,
                 i32_size_expert_ids_in,
+                f32_situ_beta,
+                f32_situ_beta_rcp,
+                f32_situ_linear_beta,
+                f32_situ_linear_beta_rcp,
                 f32_swiglu_limit,
             )
         if const_expr(heterogeneous_b and waves_per_eu is not None):
@@ -3326,6 +3297,10 @@ def compile_mixed_moe_gemm1_common(
             i32_inter_in: fx.Int32,
             i32_k_in: fx.Int32,
             i32_size_expert_ids_in: fx.Int32,
+            f32_situ_beta: fx.Float32,
+            f32_situ_beta_rcp: fx.Float32,
+            f32_situ_linear_beta: fx.Float32,
+            f32_situ_linear_beta_rcp: fx.Float32,
             f32_swiglu_limit: fx.Float32,
             stream: fx.Stream,
         ):
@@ -3347,6 +3322,10 @@ def compile_mixed_moe_gemm1_common(
                 i32_inter_in,
                 i32_k_in,
                 i32_size_expert_ids_in,
+                f32_situ_beta,
+                f32_situ_beta_rcp,
+                f32_situ_linear_beta,
+                f32_situ_linear_beta_rcp,
                 f32_swiglu_limit,
                 stream,
             )
@@ -3370,6 +3349,10 @@ def compile_mixed_moe_gemm1_common(
             i32_inter_in: fx.Int32,
             i32_k_in: fx.Int32,
             i32_size_expert_ids_in: fx.Int32,
+            f32_situ_beta: fx.Float32,
+            f32_situ_beta_rcp: fx.Float32,
+            f32_situ_linear_beta: fx.Float32,
+            f32_situ_linear_beta_rcp: fx.Float32,
             f32_swiglu_limit: fx.Float32,
             stream: fx.Stream,
         ):
@@ -3391,6 +3374,10 @@ def compile_mixed_moe_gemm1_common(
                 i32_inter_in,
                 i32_k_in,
                 i32_size_expert_ids_in,
+                f32_situ_beta,
+                f32_situ_beta_rcp,
+                f32_situ_linear_beta,
+                f32_situ_linear_beta_rcp,
                 f32_swiglu_limit,
                 stream,
             )
@@ -5352,11 +5339,6 @@ def compile_mixed_moe_gemm2_common(
                 e_vec = 2 if accumulate else min(body_tile_n // 32, 8)
                 rocdl.s_setprio(3)
                 c_shuffle_epilog(
-                    arith=arith,
-                    vector=vector,
-                    gpu=gpu,
-                    scf=scf,
-                    range_constexpr=range_constexpr,
                     tile_m=tile_m,
                     tile_n=body_tile_n,
                     e_vec=e_vec,

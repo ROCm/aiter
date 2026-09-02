@@ -193,14 +193,20 @@ def fp8_mqa_logits(
             matrix_instr_nonkdim=matrix_instr_nonkdim,
         )
     else:
+        # The buffer path keeps the row strides 32-bit and re-bases the pointer
+        # per row and per KV tile, so what must fit in int32 is the largest
+        # element offset the kernel forms, not the tensor's byte size. The
+        # fallback path widens those strides to int64 instead.
+        INT32_MAX = 2**31 - 1
+        max_kv_offset = (seq_len_kv - 1) * stride_kv_s + (head_size - 1) * stride_kv_d
+        max_logits_offset = (seq_len - 1) * stride_logits_s + (
+            seq_len_kv - 1
+        ) * stride_logits_k
+        use_buffer_load = max_kv_offset <= INT32_MAX
+        use_buffer_store = max_logits_offset <= INT32_MAX
+
         num_buffers = 2
         USE_FOLDED_REDUCTION = FOLDED_REDUCTED_SUPPORT and num_heads > 16
-        # Buffer ops address through a resource descriptor whose window is a
-        # 32-bit byte offset (2 GiB). Fall back to plain global load/store when
-        # a descriptor would have to span more than that.
-        BUFFER_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
-        use_buffer_load = KV.numel() * KV.element_size() < BUFFER_LIMIT_BYTES
-        use_buffer_store = logits.numel() * logits.element_size() < BUFFER_LIMIT_BYTES
         if arch == "gfx950":
             # Buffer store/load issues are resolved via changing pointer arithmetic
             # so offsets are localized on a shifted pointer
@@ -211,6 +217,9 @@ def fp8_mqa_logits(
             waves_per_eu = 3
             num_warps = 2
             block_kv = 64
+            # main gates this on use_buffer_store, because BLOCK_M=2 with plain
+            # stores aborts the AMDGCN backend at JIT time. Vacuous here: the
+            # rebasing above makes buffer stores unconditional on gfx950.
             block_m = 2 if (num_heads <= 32 and seq_len > 4096) else 1
             # Single warp to save barrier cycles
             if block_m == 1 and seq_len > 4096:
