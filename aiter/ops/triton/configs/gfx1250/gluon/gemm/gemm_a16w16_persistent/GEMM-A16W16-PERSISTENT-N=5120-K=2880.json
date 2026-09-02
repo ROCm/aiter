@@ -19,7 +19,7 @@
         "BLOCK_M": 128,
         "BLOCK_N": 64,
         "BLOCK_K": 256,
-        "NUM_BUFFERS": 3,
+        "NUM_BUFFERS": 2,
         "num_warps": 2,
         "GROUP_SIZE_M": 2
     },
