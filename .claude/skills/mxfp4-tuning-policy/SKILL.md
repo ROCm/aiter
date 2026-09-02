@@ -349,10 +349,24 @@ Two kinds of shipped row this tuner cannot propose:
   flydsl family, dispatched by `fused_moe.py:2905` on the bare `flydsl_` prefix
   and tuned by a different path. Not a hole in the mxmoe space -- a different
   family. Re-tuning such a row here migrates it into the port.
-- **`_sp<N>` GEMM2 variants.** `get_flydsl_stage2_v2_kernels` enumerates no
-  spatial-partition names, so a shipped row naming `_sp801`/`_sp1601` (kimi-k3
-  tokens 4096-32768) cannot be reproduced exactly. A bare name resolves to the
-  dispatcher default `MXFP4_G2_SPART=402`, so the sweep explores 402 only.
+- **`_sp<N>` GEMM2 variants -- accepted limitation, decided.**
+  `get_flydsl_stage2_v2_kernels` enumerates no spatial-partition names, so a
+  shipped row naming `_sp801`/`_sp1601` (kimi-k3 tokens 4096-32768) cannot be
+  reproduced. A bare name resolves to the dispatcher default
+  `MXFP4_G2_SPART=402`, so the sweep explores 402 only.
+
+  This is deliberate, not an oversight. `spart` was measured to be worth
+  **1.6-5.7%** on those shapes -- each shipped `_sp` config against its
+  byte-identical no-`_sp` twin, three repeats: 0.943 / 0.984 / 0.984 / 0.979
+  (tokens 4096 / 8192 / 16384 / 32768). Adding a `sp` parameter to
+  `build_flydslv2_gemm2_name` plus a `spart_values` axis would make them
+  reachable (measured 11/17 -> 15/17 kimi-k3 containment) at the cost of
+  tripling the GEMM2 axis. **The call was to accept the gap instead.**
+
+  Consequence to keep in mind: those four rows ship configs the tuner cannot
+  propose, so a future kimi-k3 re-tune will replace them with non-`_sp`
+  equivalents that are 1.6-5.7% slower. That is expected. Do not treat it as a
+  regression, and do not re-open the axis without a fresh decision.
 
 11 of kimi-k3's 17 shipped rows are exactly reachable; the rest are the
 `flydsl_moe1_*` pair and the four `_sp` rows.
