@@ -1031,10 +1031,11 @@ def get_ps_metadata_info_v1(
     #   1. for every qo tile (no split)
     #   2. every split qo tile, which can be done at most #TG times in total
     # TODO: consider split q to reduce max_works & max_partials
-    work_per_head = (batch_size + cus_per_cluster - 1) * max_qo_split_per_batch
-    max_works = work_per_head * num_head_k
-    # each work item emits at most one partial
-    max_partials = work_per_head
+    max_works = (batch_size + cus_per_cluster - 1) * max_qo_split_per_batch * num_head_k
+    max_partials = (
+        (batch_size + cus_per_cluster - 1)
+        * max_qo_split_per_batch
+    )
 
     return (
         (2, torch.uint64),  # work_metadata_ptrs
