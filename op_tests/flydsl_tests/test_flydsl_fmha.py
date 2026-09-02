@@ -9,15 +9,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-pytest.importorskip("flydsl")
 from aiter.ops.flydsl import (
     flydsl_flash_attn_func,
     flydsl_fp8_quant,
-    is_flydsl_available,
 )
-
-if not is_flydsl_available():
-    pytest.skip("flydsl is not available", allow_module_level=True)
 
 
 def _is_gfx1201() -> bool:
