@@ -233,6 +233,9 @@ class ValidatorFixture:
         tol_table="f32=1e-5,f16=2e-3,bf16=1e-2",
         use_picker_env=True,
         cwd=None,
+        axes=(),
+        perf_control_column=None,
+        runner=None,
     ):
         report = self.root / f"{patch.stem}-report.json"
         # `cwd` exists for one reason: the validator has to accept RELATIVE --patch/--out from
@@ -269,6 +272,12 @@ class ValidatorFixture:
             command.extend(["--shape-arg", shape_arg])
         if shape_argnames:
             command.extend(["--shape-argnames", shape_argnames])
+        for axis in axes:
+            command.extend(["--axis", axis])
+        if perf_control_column:
+            command.extend(["--perf-control-column", perf_control_column])
+        if runner:
+            command.extend(["--runner", runner])
         if not perf:
             command.append("--no-perf")
         environment = os.environ.copy()
@@ -506,9 +515,16 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertFalse(
             any(item["severity"] == "blocker" for item in report["findings"])
         )
+        # The target runs and passes, so correctness stays `pass` and nothing is blamed on
+        # the author. What it does NOT do is earn architecture coverage: this fixture names a
+        # route the script never calls, so the run has positive evidence that no watched work
+        # reached the device. The old contract credited `gfx-test: runtime` here on the basis
+        # `script-exit-zero-with-output`, which is a statement about the process, not the
+        # kernel -- and is exactly what a silently-returning target produces.
+        self.assertNotIn("gfx-test", report["arch_coverage_basis"])
+        self.assertNotIn("gfx-test", report["arch_coverage"])
         self.assertEqual(
-            "script-exit-zero-with-output",
-            report["arch_coverage_basis"]["gfx-test"],
+            0, report["stages"]["correctness_repo_tests"]["stats"]["observed_work"]
         )
 
     def test_script_only_target_failure_is_blocking(self):
@@ -1339,6 +1355,525 @@ class ValidateKernelPrTests(unittest.TestCase):
             )
         )
 
+    # ---- last-mile regressions found by running this skill against ROCm/aiter#4538 ----
+    #
+    # Every test below fails against the pre-fix validator, and each names the invariant it
+    # protects rather than the PR that exposed it.
+
+    #: A target shaped like aiter#4538's: a script with its own shape flag, its own
+    #: head-count flag, and a route whose legality depends on the head count. The head-count
+    #: constraint is the point -- it is a configuration the shape flag alone cannot reach.
+    #: The kernel lives in its own module, as aiter#4538's does: a script target run under
+    #: runpy sees its own functions as ``__main__:...``, so a route naming the module is only
+    #: stable for code the target imports.
+    AXIS_KERNEL = (
+        "def run_kernel(M, N, dtype_str, num_heads):\n"
+        "    # The kernel's tile is 32 rows, so a head count below that has no legal\n"
+        "    # mapping. This is the shape of aiter#4538's MFMA_M assertion.\n"
+        "    assert num_heads % 32 == 0, 'heads must be a multiple of 32'\n"
+        "    return M * N\n"
+    )
+
+    AXIS_TARGET = (
+        "import argparse\n"
+        "import os\n"
+        "import sys\n"
+        "\n"
+        "sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))\n"
+        "\n"
+        "from axis_kernel import run_kernel\n"
+        "\n"
+        "\n"
+        "def _shape(text):\n"
+        "    M, N, dtype_str = text.split(',')\n"
+        "    return int(M), int(N), dtype_str\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    parser = argparse.ArgumentParser()\n"
+        "    parser.add_argument('-s', '--shapes', type=_shape, nargs='*',\n"
+        "                        default=[(7, 257, 'f32'), (8, 64, 'f32')])\n"
+        "    parser.add_argument('--num-heads', type=int, nargs='*',\n"
+        "                        default=[64, 128])\n"
+        "    args = parser.parse_args()\n"
+        "    for M, N, dtype_str in args.shapes:\n"
+        "        for num_heads in args.num_heads:\n"
+        "            run_kernel(M, N, dtype_str, num_heads)\n"
+        "    print('%d cases passed' % (len(args.shapes) * len(args.num_heads)))\n"
+        "\n"
+        "\n"
+        "if __name__ == '__main__':\n"
+        "    main()\n"
+    )
+
+    AXIS_TARGET_PATH = "tests/axis_target.py"
+
+    def _axis_patch(self, name, body=None):
+        def mutate(repo):
+            (repo / "tests" / "axis_kernel.py").write_text(self.AXIS_KERNEL)
+            (repo / self.AXIS_TARGET_PATH).write_text(body or self.AXIS_TARGET)
+
+        return self.fixture.make_patch(mutate, name)
+
+    def _validate_axis_target(self, patch, **kwargs):
+        return self.fixture.validate(
+            patch,
+            tests=self.AXIS_TARGET_PATH,
+            expected_route="axis_kernel:run_kernel",
+            shape_env=None,
+            shape_arg="--shapes",
+            perf=False,
+            **kwargs,
+        )
+
+    def test_a_grid_that_duplicates_the_targets_own_defaults_is_not_a_control(self):
+        # SKILL.md calls the S1 grid "a positive control against reporting the same default
+        # test run twice under different stage names". On aiter#4538 all three requested
+        # shapes were already in the target's own --shapes default list, so the stage
+        # reported `pass` for re-running a strict subset of correctness_repo_tests, and the
+        # verdict was PASS. A duplicate grid proves nothing the repository run did not
+        # already prove, so it cannot be credited.
+        patch = self._axis_patch("grid-duplicate.patch")
+        result, report = self._validate_axis_target(patch, grid_value="7,257,f32")
+
+        selection = report["test_selection"]
+        self.assertEqual("duplicates-target-defaults", selection["grid_independence"])
+        self.assertIn("--shapes", selection["grid_independence_reason"])
+        grid_stage = report["stages"]["correctness_s1_grid"]
+        self.assertEqual("skip", grid_stage["status"])
+        self.assertEqual(0, grid_stage["exit"])
+        self.assertEqual("INCONCLUSIVE", report["verdict"])
+        self.assertEqual(2, result.returncode)
+
+    def test_a_grid_outside_the_targets_defaults_still_counts_as_coverage(self):
+        # The control case for the test above: the fix must not turn every grid into a skip.
+        patch = self._axis_patch("grid-novel.patch")
+        _, report = self._validate_axis_target(patch, grid_value="9,1023,f32")
+
+        self.assertEqual(
+            "adds-coverage", report["test_selection"]["grid_independence"]
+        )
+        self.assertEqual("pass", report["stages"]["correctness_s1_grid"]["status"])
+
+    def test_each_head_run_keeps_its_own_execution_receipt(self):
+        # head-repo and head-grid both ran inside the head phase and shared one receipt
+        # path, so the second run erased the first. With the grid shapes a subset of the
+        # target's defaults -- aiter#4538's case -- a receipt written by EITHER run satisfies
+        # --grid, which makes the grid's own evidence unfalsifiable.
+        patch = self._axis_patch("receipt-split.patch")
+        _, report = self._validate_axis_target(patch, grid_value="9,1023,f32")
+
+        work = Path(report["stages"]["correctness_repo_tests"]["log"]).parent
+        repo_receipt = work / "head" / "execution-receipt-head-repo.json"
+        grid_receipt = work / "head" / "execution-receipt-head-grid.json"
+        self.assertTrue(repo_receipt.exists(), f"missing {repo_receipt}")
+        self.assertTrue(grid_receipt.exists(), f"missing {grid_receipt}")
+
+        repo_shapes = set(json.loads(repo_receipt.read_text())["executed_shapes"])
+        grid_shapes = set(json.loads(grid_receipt.read_text())["executed_shapes"])
+        # The repo run executes the target's defaults; the grid run executes the grid.
+        # Neither may contain the other's shapes, which is only checkable once they are
+        # separate files.
+        self.assertIn("7,257,f32", repo_shapes)
+        self.assertNotIn("9,1023,f32", repo_shapes)
+        self.assertEqual({"9,1023,f32"}, grid_shapes)
+        self.assertIn("head-grid", report["stages"]["execution_receipt"]["receipt_scope"])
+
+    def test_an_extra_axis_reaches_a_configuration_the_shape_grid_cannot_express(self):
+        # The shape channel is one ordered tuple bound to --shape-vars, so on aiter#4538 it
+        # could only ever vary (seq_len, seq_len_kv). num_heads is a separate flag whose
+        # default is [64, 128], and the kernel asserts at num_heads=16 -- a real blocker the
+        # validator had no way to request. --axis is that way.
+        patch = self._axis_patch("axis-blocker.patch")
+        result, report = self._validate_axis_target(
+            patch,
+            grid_value="9,1023,f32",
+            axes=("num_heads=--num-heads:16;32",),
+        )
+
+        selection = report["test_selection"]
+        self.assertEqual("proven", selection["axis_state"])
+        axis = selection["axes"][0]
+        self.assertEqual("num_heads", axis["name"])
+        self.assertEqual("flag-declared-in-add_argument", axis["hook_proof"])
+        self.assertEqual(["16", "32"], axis["values"])
+        self.assertEqual("adds-coverage", axis["independence"])
+        # The configuration the grid alone could never request now fails, loudly, and is
+        # attributed to the PR that adds the target.
+        self.assertEqual("fail", report["stages"]["correctness_s1_grid"]["status"])
+        self.assertEqual(1, result.returncode)
+        self.assertEqual("BLOCK", report["verdict"])
+        self.assertTrue(
+            any(
+                item["severity"] == "blocker" and "shape grid" in item["detail"]
+                for item in report["findings"]
+            ),
+            report["findings"],
+        )
+
+    def test_an_axis_the_target_ignores_is_named_not_silently_dropped(self):
+        # A flag the target declares but does not constrain would let the report claim
+        # coverage of head counts that never reached the kernel. The runtime refusal probe
+        # is what separates "declared" from "consumed", exactly as for --shape-arg, and a
+        # dropped axis has to be visible or the test space narrowed silently.
+        permissive = self.AXIS_TARGET.replace(
+            "parser.add_argument('--num-heads', type=int, nargs='*',\n"
+            "                        default=[64, 128])\n",
+            "parser.add_argument('--num-heads', type=str, nargs='*',\n"
+            "                        default=['64', '128'])\n",
+        ).replace(
+            "            run_kernel(M, N, dtype_str, num_heads)\n",
+            "            run_kernel(M, N, dtype_str, 64)\n",
+        )
+        self.assertNotEqual(permissive, self.AXIS_TARGET)
+        patch = self._axis_patch("axis-ignored.patch", body=permissive)
+        _, report = self._validate_axis_target(
+            patch,
+            grid_value="9,1023,f32",
+            axes=("num_heads=--num-heads:16;32",),
+        )
+
+        selection = report["test_selection"]
+        self.assertEqual("hook-not-consumed", selection["axis_state"])
+        self.assertIn("--num-heads", selection["axis_state_reason"])
+        self.assertTrue(
+            any(
+                "requested test axes were dropped" in item["detail"]
+                for item in report["findings"]
+            ),
+            report["findings"],
+        )
+
+    def test_a_script_that_returns_without_working_earns_no_architecture_credit(self):
+        # aiter#4538's target returns with exit 0 and a log line when the arch is
+        # unsupported or an optional package is missing. That produced
+        # `arch_coverage: {gfx: runtime}` on basis `script-exit-zero-with-output` and
+        # `executed: 1` -- indistinguishable from the run that graded 56 cases.
+        silent = (
+            "import argparse\n"
+            "\n"
+            "\n"
+            "def main():\n"
+            "    parser = argparse.ArgumentParser()\n"
+            "    parser.add_argument('-s', '--shapes', nargs='*', default=['7,257,f32'])\n"
+            "    parser.parse_args()\n"
+            "    print('unsupported arch; skipping')\n"
+            "    return\n"
+            "\n"
+            "\n"
+            "if __name__ == '__main__':\n"
+            "    main()\n"
+        )
+        patch = self._axis_patch("silent-skip.patch", body=silent)
+        result, report = self.fixture.validate(
+            patch,
+            tests=self.AXIS_TARGET_PATH,
+            expected_route="axis_kernel:run_kernel",
+            shape_env=None,
+            shape_arg="--shapes",
+            perf=False,
+            grid=False,
+        )
+
+        stats = report["stages"]["correctness_repo_tests"]["stats"]
+        self.assertEqual(0, stats["observed_work"])
+        self.assertIn("execution receipt", stats["basis"])
+        self.assertEqual({}, report["arch_coverage"])
+        self.assertEqual("INCONCLUSIVE", report["verdict"])
+        self.assertEqual(2, result.returncode)
+
+    #: A target the patch ADDS, which times a kernel that already exists on base against an
+    #: unchanged reference. aiter#4538 is exactly this shape: a new op_tests target whose
+    #: whole point is that the rewritten kernel is faster than what it replaces.
+    NEW_BENCH_TARGET = "tests/bench_added.py"
+
+    def _new_bench_patch(self, name, scale):
+        # `VALUE` already exists on base (the fixture commits `VALUE = 1`), so the
+        # transplanted target imports cleanly there and times the PRE-patch cost. That is
+        # the whole premise: a new target file driving an entry point that is not new.
+        def mutate(repo):
+            (repo / "aiter" / "kernel.py").write_text(f"VALUE = {scale}\n")
+            (repo / self.NEW_BENCH_TARGET).write_text(
+                "import argparse\n"
+                "import os\n"
+                "import sys\n"
+                "\n"
+                "sys.path.insert(0, os.path.dirname(os.path.dirname(\n"
+                "    os.path.abspath(__file__))))\n"
+                "\n"
+                "from aiter.kernel import VALUE\n"
+                "\n"
+                "\n"
+                "def main():\n"
+                "    parser = argparse.ArgumentParser()\n"
+                "    parser.add_argument('--scenario', default='test',\n"
+                "                        choices=['test', 'bench'])\n"
+                "    parser.parse_args()\n"
+                "    print('| dim | kernel us | reference us |')\n"
+                "    print('|---|---|---|')\n"
+                "    for dim in (1024, 2048, 4096, 8192):\n"
+                "        print(f'| {dim} | {dim * VALUE / 100.0} | {dim / 50.0} |')\n"
+                "    print('4/4 cases passed')\n"
+                "\n"
+                "\n"
+                "if __name__ == '__main__':\n"
+                "    main()\n"
+            )
+
+        return self.fixture.make_patch(mutate, name)
+
+    def test_an_added_target_can_still_time_the_code_it_replaces(self):
+        # "The PR adds this target, so base has nothing to time against" ended the perf
+        # stage on aiter#4538 -- a PR whose entire motivation is being faster than the kernel
+        # it replaces. The file being new does not make the code it drives new: copying the
+        # target into the base tree times the pre-PR implementation through the same harness.
+        patch = self._new_bench_patch("added-bench-faster.patch", scale="0.5")
+        _, report = self.fixture.validate(
+            patch,
+            tests=self.NEW_BENCH_TARGET,
+            expected_route="aiter.kernel:main",
+            grid=False,
+            perf=True,
+            perf_control_column="reference us",
+        )
+
+        perf = report["stages"]["perf"]
+        self.assertEqual("target-transplant", perf["baseline_method"])
+        self.assertEqual("pass", perf["status"])
+        # The unchanged reference column has to reproduce across the two trees, or the
+        # cross-tree comparison means nothing.
+        self.assertIn("reproduced within", perf["control_note"])
+        self.assertAlmostEqual(1.0, perf["control_ratio"], places=6)
+        # base VALUE = 1, head VALUE = 0.5 -> head is twice as fast on the kernel column,
+        # while the reference column sits at exactly 1.0. median_ratio is the WORST column
+        # by design, so the improvement is read off the kernel column itself.
+        kernel_column = next(
+            stats
+            for name, stats in perf["columns"].items()
+            if "kernel" in name.lower()
+        )
+        self.assertGreater(kernel_column["median_ratio"], 1.5)
+        self.assertGreaterEqual(perf["median_ratio"], 0.95)
+        self.assertEqual(
+            "target-not-present",
+            report["stages"]["baseline_control"]["repo_tests"]["state"],
+        )
+
+    def test_an_added_target_regression_is_caught_not_skipped(self):
+        # The direction that matters: a NEW target whose kernel got slower must still fail.
+        patch = self._new_bench_patch("added-bench-slower.patch", scale="2.0")
+        result, report = self.fixture.validate(
+            patch,
+            tests=self.NEW_BENCH_TARGET,
+            expected_route="aiter.kernel:main",
+            grid=False,
+            perf=True,
+            perf_control_column="reference us",
+        )
+
+        perf = report["stages"]["perf"]
+        self.assertEqual("target-transplant", perf["baseline_method"])
+        self.assertEqual("fail", perf["status"])
+        self.assertLess(perf["median_ratio"], 0.95)
+        self.assertEqual(1, result.returncode)
+        self.assertTrue(
+            any(
+                item["stage"] == "perf" and item["severity"] == "should-fix"
+                for item in report["findings"]
+            ),
+            report["findings"],
+        )
+
+    def test_a_transplanted_baseline_without_a_control_column_reports_why(self):
+        # The transplant is a cross-tree comparison. With nothing unchanged to check it
+        # against, the honest outcome is a skip whose reason names the missing evidence --
+        # not a confident ratio, and not the old claim that base had nothing to time.
+        patch = self._new_bench_patch("added-bench-nocontrol.patch", scale="0.5")
+        _, report = self.fixture.validate(
+            patch,
+            tests=self.NEW_BENCH_TARGET,
+            expected_route="aiter.kernel:main",
+            grid=False,
+            perf=True,
+        )
+
+        perf = report["stages"]["perf"]
+        self.assertEqual("skip", perf["status"])
+        self.assertIn("--perf-control-column", perf["note"])
+        self.assertNotIn("nothing to time against", perf["note"])
+
+    def test_a_killed_run_leaves_no_stale_verdict_at_the_output_path(self):
+        # The process exit code used to be read back out of `--out` AFTER finish_report, so
+        # `--out` was a fallback source of truth. A run that died before finish_report copied
+        # its own report over the file left the PREVIOUS run's report sitting there, and the
+        # caller -- `review-pr`'s identity gate included -- read a stale `PASS` as this PR's
+        # result. A run owns its output path.
+        patch = self._axis_patch("stale-verdict.patch")
+        report_path = self.fixture.root / "stale-report.json"
+        report_path.write_text(
+            json.dumps(
+                {
+                    "label": "an-earlier-run",
+                    "verdict": "PASS",
+                    "process_exit_code": 0,
+                    "stages": {},
+                    "findings": [],
+                }
+            )
+        )
+        slow_picker = self.fixture.tools / "slow-picker"
+        write_executable(slow_picker, "#!/usr/bin/env bash\nsleep 30\nprintf '97\\n'\n")
+
+        environ = os.environ.copy()
+        environ["PICKER"] = str(slow_picker)
+        environ["PYTHONPATH"] = str(self.fixture.fake_modules)
+        environ["TIMEOUT"] = "30"
+        process = subprocess.Popen(
+            [
+                str(VALIDATOR),
+                "--repo",
+                str(self.fixture.repo),
+                "--patch",
+                str(patch),
+                "--target",
+                self.AXIS_TARGET_PATH,
+                "--expected-route",
+                "axis_kernel:run_kernel",
+                "--no-perf",
+                "--label",
+                "stale-verdict",
+                "--out",
+                str(report_path),
+            ],
+            env=environ,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            pass
+        process.kill()
+        process.wait(timeout=30)
+
+        self.assertFalse(
+            report_path.exists(),
+            "a killed run left a previous run's report at --out: "
+            + (report_path.read_text() if report_path.exists() else ""),
+        )
+
+    def test_the_target_cannot_read_the_reviewers_credentials(self):
+        # `env VAR=... cmd` ADDS to the inherited environment. The target is arbitrary code
+        # from an unmerged PR, so every token in the reviewer's shell was readable from
+        # os.environ inside it -- and lands in a stage log the moment the target prints its
+        # environment, which is a perfectly ordinary thing for a test to do on failure.
+        leaky = (
+            "import os\n"
+            "\n"
+            "\n"
+            "def main():\n"
+            "    for name, value in sorted(os.environ.items()):\n"
+            "        print(f'{name}={value}')\n"
+            "\n"
+            "\n"
+            "if __name__ == '__main__':\n"
+            "    main()\n"
+        )
+        patch = self._axis_patch("env-leak.patch", body=leaky)
+        environ = os.environ.copy()
+        environ["VALIDATOR_TEST_GITHUB_TOKEN"] = "leakcanary-token"
+        environ["MY_API_KEY"] = "leakcanary-key"
+        environ["UNRELATED_HOME_DECOR"] = "leakcanary-unrelated"
+
+        report_path = self.fixture.root / "env-leak-report.json"
+        command = [
+            str(VALIDATOR),
+            "--repo",
+            str(self.fixture.repo),
+            "--patch",
+            str(patch),
+            "--target",
+            self.AXIS_TARGET_PATH,
+            "--expected-route",
+            "axis_kernel:run_kernel",
+            "--shape-vars",
+            "M,N,dtype_str",
+            "--no-perf",
+            "--label",
+            "env-leak",
+            "--out",
+            str(report_path),
+        ]
+        environ["PICKER"] = str(self.fixture.picker)
+        environ["PYTHONPATH"] = str(self.fixture.fake_modules)
+        environ["TIMEOUT"] = "30"
+        run(command, env=environ, check=False)
+
+        report = json.loads(report_path.read_text())
+        log = Path(report["stages"]["correctness_repo_tests"]["log"]).read_text()
+        for canary in ("leakcanary-token", "leakcanary-key", "leakcanary-unrelated"):
+            self.assertNotIn(canary, log)
+        for name in ("VALIDATOR_TEST_GITHUB_TOKEN", "MY_API_KEY", "UNRELATED_HOME_DECOR"):
+            self.assertNotIn(name, log)
+        # The policy is a reported fact, not an implicit one.
+        policy = report["isolation"]["target_environment"]
+        self.assertIn("env -i", policy["policy"])
+        self.assertIn("PATH", policy["passed_through"])
+
+    def test_an_unlabeled_measurement_column_does_not_destroy_row_identity(self):
+        # aiter bench tables print columns whose headers carry no unit -- `flydsl rel`,
+        # `triton err`, `speedup`. They are measurements, but `classify()` calls anything
+        # without a unit a KEY column, so they became part of the row's identity. They
+        # differ between base and head by construction, so every row got a unique name on
+        # each side and `matched_rows` was 0: `insufficient` on 56 perfectly comparable
+        # rows. Observed on aiter#4538's real bench logs. The strict key is still tried
+        # first; only when it matches nothing is the relaxed key used, and the result says
+        # which was used.
+        table = (
+            "| s_q | s_k | kernel us | rel err | speedup |\n"
+            "|---|---|---|---|---|\n"
+            "| 1024 | 1024 | {a} | {r1} | {s1} |\n"
+            "| 2048 | 2048 | {b} | {r2} | {s2} |\n"
+            "| 4096 | 4096 | {c} | {r3} | {s3} |\n"
+        )
+        base_log = self.fixture.root / "rowkey-base.log"
+        head_log = self.fixture.root / "rowkey-head.log"
+        base_log.write_text(
+            table.format(
+                a=10.0, b=20.0, c=40.0,
+                r1=1.11e-5, r2=2.22e-5, r3=3.33e-5,
+                s1=1.0101, s2=1.0202, s3=1.0303,
+            )
+        )
+        head_log.write_text(
+            table.format(
+                a=5.0, b=10.0, c=20.0,
+                r1=1.19e-5, r2=2.28e-5, r3=3.37e-5,
+                s1=2.0404, s2=2.0505, s3=2.0606,
+            )
+        )
+
+        result = json.loads(
+            run(
+                [
+                    sys.executable,
+                    str(SKILL_DIR / "scrape_perf.py"),
+                    "--base",
+                    str(base_log),
+                    "--head",
+                    str(head_log),
+                ]
+            ).stdout
+        )
+
+        self.assertEqual(3, result["matched_rows"])
+        self.assertIn("non-integral", result["row_key_basis"])
+        # The shape columns are integral, so they stay in the key and keep the three rows
+        # distinct -- the relaxed key must not collapse them.
+        self.assertEqual(3, result["base_rows"])
+        self.assertEqual("ok", result["status"])
+        self.assertAlmostEqual(2.0, result["columns"]["kernel us"]["median_ratio"], 3)
+
 
 def new_file_diff(path, source):
     """A diff that CREATES `path` with `source`.
@@ -1626,10 +2161,18 @@ class GridChannelTests(unittest.TestCase):
             expected_route="__main__:run_kernel",
             shape_env="UNREAD_GRID_ENV",
             shape_arg="--shape",
+            # Deliberately NOT the target's own `--shape` default of 7,257,f32. This test is
+            # about which channel carries the grid, but a grid that only re-runs the
+            # target's defaults is now downgraded to `skip` on independence grounds, and
+            # that would mask the channel result this test exists to check.
+            grid_value="9,1023,f32",
         )
 
         self.assertEqual("cli", report["test_selection"]["grid_channel"])
         self.assertEqual("", report["test_selection"]["grid_channel_reason"])
+        self.assertEqual(
+            "adds-coverage", report["test_selection"]["grid_independence"]
+        )
         grid_stage = report["stages"]["correctness_s1_grid"]
         self.assertNotEqual("skip", grid_stage["status"])
         self.assertEqual("pass", grid_stage["status"])

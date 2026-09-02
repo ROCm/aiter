@@ -178,8 +178,33 @@ def parse_perf_lines(text):
             yield row_key, values
 
 
-def scrape(text):
-    """Reduce a log to {(table_signature, row_key): {column: value}}."""
+def is_identity_cell(cell):
+    """Is this cell safe to use as part of a row's identity?
+
+    Non-numeric cells (`fn`, `causal`, `False`, `ok`) always are. A numeric cell is only an
+    identity if it is integral: shape and count columns (`s_q`, `num_heads`) are integers
+    and reproduce exactly across two runs, while an unlabeled MEASUREMENT column -- the
+    `flydsl rel`, `triton err` and `speedup` columns an aiter bench table routinely prints --
+    is a float that differs by construction between base and head. Treating those as part of
+    the key gives every row a unique name on each side and matches nothing.
+    """
+    text = cell.strip().replace(",", "").replace("%", "")
+    text = re.sub(r"[a-zA-Zµμ/]+$", "", text).strip()
+    if not NUMERIC_RE.match(text):
+        return True
+    try:
+        value = float(text)
+    except ValueError:
+        return True
+    return value.is_integer()
+
+
+def scrape(text, stable_keys_only=False):
+    """Reduce a log to {(table_signature, row_key): {column: value}}.
+
+    With `stable_keys_only`, identity columns whose cells are non-integral numbers are
+    dropped from the signature and the row key. See `is_identity_cell`.
+    """
     measurements = {}
     for row_key, values in parse_perf_lines(text):
         # Distinct signature so a `[perf]` line can never collide with a table row.
@@ -195,11 +220,16 @@ def scrape(text):
         # match count to zero, and report `insufficient` for exactly the kind of change
         # most worth measuring. Timing columns are intersected per-column further down,
         # so an added one is dropped there instead.
-        signature = "|".join(
-            headers[i].strip().lower() for i, kind in enumerate(kinds) if kind == "key"
-        )
+        key_indices = [i for i, kind in enumerate(kinds) if kind == "key"]
+        if stable_keys_only:
+            key_indices = [
+                i
+                for i in key_indices
+                if all(is_identity_cell(cells[i]) for cells in rows if i < len(cells))
+            ]
+        signature = "|".join(headers[i].strip().lower() for i in key_indices)
         for cells in rows:
-            key_parts = [cells[i] for i, kind in enumerate(kinds) if kind == "key"]
+            key_parts = [cells[i] for i in key_indices if i < len(cells)]
             values = {}
             for i, kind in enumerate(kinds):
                 if kind == "key":
@@ -253,9 +283,33 @@ def reduce_repeats(runs):
 
 
 def compare(base_texts, head_texts, threshold, min_rows):
+    # Strict identity first, so a table whose key columns are all genuinely identifying keeps
+    # exactly the behaviour it had. Only when that matches NOTHING is the relaxed key tried:
+    # a table carrying an unlabeled measurement column (an error, a relative error, a
+    # speedup) gives every row a unique name on each side, so `matched_rows: 0` there is an
+    # artefact of the row-key rule and not a fact about the two runs. Reporting
+    # `insufficient` in that case silently disables the perf gate for every target that
+    # prints such a column -- which is most aiter bench tables.
     base, base_repeats = reduce_repeats([scrape(text) for text in base_texts])
     head, head_repeats = reduce_repeats([scrape(text) for text in head_texts])
     shared = sorted(set(base) & set(head))
+    row_key_basis = "all key columns"
+    if not shared:
+        relaxed_base, relaxed_base_repeats = reduce_repeats(
+            [scrape(text, stable_keys_only=True) for text in base_texts]
+        )
+        relaxed_head, relaxed_head_repeats = reduce_repeats(
+            [scrape(text, stable_keys_only=True) for text in head_texts]
+        )
+        relaxed_shared = sorted(set(relaxed_base) & set(relaxed_head))
+        if relaxed_shared:
+            base, base_repeats = relaxed_base, relaxed_base_repeats
+            head, head_repeats = relaxed_head, relaxed_head_repeats
+            shared = relaxed_shared
+            row_key_basis = (
+                "key columns excluding non-integral numeric cells, because the strict key "
+                "matched no row across the two sides"
+            )
 
     per_column = {}
     rows = []
@@ -301,6 +355,7 @@ def compare(base_texts, head_texts, threshold, min_rows):
         "base_runs": len(base_texts),
         "head_runs": len(head_texts),
         "matched_rows": matched_rows,
+        "row_key_basis": row_key_basis,
         "threshold": threshold,
         "min_rows": min_rows,
         "columns": columns,

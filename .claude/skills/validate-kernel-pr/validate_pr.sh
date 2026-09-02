@@ -30,6 +30,16 @@ EXPECTED_ROUTE=""
 SHAPE_VARS=""
 SHAPE_ARG=""
 SHAPE_ARGNAMES=""
+# Extra independent test axes, each `NAME=FLAG:v1;v2;...`. The shape grid is one ordered
+# tuple on one channel, which is the whole of what a target's shape flag accepts; a target
+# whose remaining knobs are separate flags -- head counts, dtypes, window modes -- could not
+# be gridded over them at all, so entire failing configurations were unreachable however the
+# grid was spelled. On ROCm/aiter#4538 that is `--num-heads`, whose default is `64 128`, and
+# the public API asserts at num_heads=16 in a configuration the validator could not request.
+AXES=()
+AXIS_CLI=()
+AXIS_CLI_OVERRIDE=()
+AXIS_REPORT="[]"
 TOL_TABLE=""
 LABEL="run"
 OUT=""
@@ -58,6 +68,13 @@ PERF_REPEAT="${PERF_REPEAT:-3}"
 # matched rows and never on a nonzero exit, so a crashed or truncated run reports `skip`.
 PERF_THRESHOLD="${PERF_THRESHOLD:-0.95}"
 PERF_MIN_ROWS="${PERF_MIN_ROWS:-3}"
+# Name of a timing column the patch does not touch -- typically a reference implementation
+# the target times alongside the kernel under test. Required before a TRANSPLANTED baseline
+# is believed, because that comparison spans two trees and this column is the only evidence
+# that the two runs are comparable at all. Unused for the ordinary same-worktree baseline.
+PERF_CONTROL_COLUMN=""
+PERF_CONTROL_TOL="${PERF_CONTROL_TOL:-0.10}"
+PERF_BASELINE_METHOD="patch-reversed-same-worktree"
 TARGET_PYTHON="${PYTHON_BIN:-$(command -v python3 || command -v python || true)}"
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
@@ -81,10 +98,12 @@ while [ "$#" -gt 0 ]; do
     --shape-vars) need_value "$@"; SHAPE_VARS="$2"; shift 2;;
     --shape-arg) need_value "$@"; SHAPE_ARG="$2"; shift 2;;
     --shape-argnames) need_value "$@"; SHAPE_ARGNAMES="$2"; shift 2;;
+    --axis) need_value "$@"; AXES+=("$2"); shift 2;;
     --tol-table) need_value "$@"; TOL_TABLE="$2"; shift 2;;
     --label) need_value "$@"; LABEL="$2"; shift 2;;
     --out) need_value "$@"; OUT="$2"; shift 2;;
     --perf-args) need_value "$@"; PERF_ARGS="$2"; PERF_ARGS_SET=1; shift 2;;
+    --perf-control-column) need_value "$@"; PERF_CONTROL_COLUMN="$2"; shift 2;;
     --no-perf) PERF_ENABLED=0; shift;;
     *) echo "unknown arg $1" >&2; exit 2;;
   esac
@@ -168,6 +187,11 @@ fi
 
 : "${OUT:=$PWD/validation_report.json}"
 mkdir -p "$(dirname "$OUT")"
+# A run OWNS its output path. Leaving a previous run's report in place made `--out` a
+# fallback source of truth: the process exit code was read back out of that file, so if this
+# run died before finish_report copied its own report over it, the shell exited on the
+# PREVIOUS run's verdict -- a stale `PASS` published as this PR's result.
+rm -f "$OUT"
 WORK=$(mktemp -d "/tmp/validate-kernel-pr-XXXXXX")
 JSON="$WORK/report.json"
 PROBE_DIR="$WORK/probe"
@@ -268,6 +292,14 @@ if stats["executed"] < 1:
     raise SystemExit(0)
 if runner == "script" and pathlib.Path(log_path).stat().st_size == 0:
     raise SystemExit(0)
+# A script that exits 0 with output has proved that a process ran, not that an architecture
+# was exercised: aiter#4538's own target returns silently with exit 0 and a log line when the
+# arch is unsupported or an optional package is missing. When a route WAS named and the run's
+# receipt observed no call to it, there is positive evidence that no work reached the device,
+# so no runtime credit is issued. With no route named nothing was observed either way, and
+# the basis below says so instead of implying a measurement.
+if runner == "script" and stats.get("observed_work") == 0:
+    raise SystemExit(0)
 data = json.load(open(report_path))
 gpu = data["stages"].get("gpu_claim", {})
 arch = gpu.get("arch")
@@ -276,10 +308,15 @@ if gpu.get("status") == "pass" and arch:
     data.setdefault("arch_coverage_basis", {})[arch] = (
         f"pytest-junit-executed:{stats['executed']}"
         if runner == "pytest"
+        # "script-exit-zero-with-output" described the process, not the work: a target that
+        # printed one line and returned earned the same architecture credit as one that
+        # graded 56 cases. The basis now names the count the stats carry and where it came
+        # from, so a reader can see whether an architecture was exercised or merely visited.
         else (
-            "script-exit-zero-with-output"
+            f"script-observed-work:{stats.get('observed_work')} "
+            f"({stats.get('basis', 'unknown basis')})"
             if stats["failures"] == 0
-            else "script-nonzero-with-output"
+            else f"script-nonzero-with-output ({stats.get('basis', 'unknown basis')})"
         )
     )
     json.dump(data, open(report_path, "w"), indent=2)
@@ -290,6 +327,7 @@ finish_report() {
   python3 - "$JSON" "$OUT" <<'PY'
 import datetime
 import json
+import pathlib
 import shutil
 import sys
 
@@ -351,6 +389,10 @@ data["finished_utc"] = datetime.datetime.now(datetime.timezone.utc).strftime(
 )
 json.dump(data, open(source, "w"), indent=2)
 shutil.copyfile(source, output)
+# The exit code is derived from THIS run's verdict, recorded here, next to the write that
+# earned it. Reading it back out of `--out` made the caller's exit status depend on a file
+# any earlier run could have left behind.
+pathlib.Path(source).with_name("verdict").write_text(verdict + "\n")
 print(f"verdict={verdict}  findings={len(data['findings'])}  -> {output}")
 for item in data["findings"]:
     print(f"  [{item['severity']}] {item['stage']}: {item['detail'][:150]}")
@@ -1364,6 +1406,217 @@ PY
   GRID_CHANNEL_REASON="$GRID_CHANNEL_REASON what this target does offer -> $GRID_CHANNEL_OFFERS"
 fi
 jset_string "test_selection.grid_channel_reason" "$GRID_CHANNEL_REASON"
+# ---- Is the grid actually independent of what the target already runs?
+#
+# A proven hook says the target CONSUMES the grid. It says nothing about whether the grid
+# asks for anything the target would not have run anyway. On ROCm/aiter#4538 all three
+# requested shapes were already in the target's own `--shapes` default list, so the "S1
+# grid" re-ran a strict subset of the repository run and the report presented it as
+# independent coverage -- the exact duplication SKILL.md says this stage exists to prevent.
+# The check is a comparison against the target's own declared defaults for the same flag, so
+# it is a property of the request and the target, not of any one repository.
+GRID_INDEPENDENCE="unknown"
+GRID_INDEPENDENCE_REASON="the channel exposes no declared defaults to compare against"
+if [ -n "$GRID" ] && [ "$GRID_CHANNEL" = "cli" ] \
+    && [ "$GRID_HOOK_OK" -eq 1 ] && [ -f "$REPO_WT/$TEST_FILE" ]; then
+  GRID_INDEPENDENCE_JSON=$(python3 - "$REPO_WT/$TEST_FILE" "$SHAPE_ARG" "$GRID" <<'PY'
+import ast
+import json
+import sys
+
+path, flag, grid = sys.argv[1:4]
+requested = [cell.strip() for cell in grid.split(";") if cell.strip()]
+
+
+def literal_cells(node):
+    """Render an add_argument default as the argv spellings it stands for."""
+    try:
+        value = ast.literal_eval(node)
+    except (ValueError, SyntaxError):
+        return None
+    if not isinstance(value, (list, tuple)):
+        value = [value]
+    cells = []
+    for item in value:
+        if isinstance(item, (list, tuple)):
+            cells.append(",".join(str(part) for part in item))
+        else:
+            cells.append(str(item))
+    return cells
+
+
+defaults = None
+tree = ast.parse(open(path, encoding="utf-8").read())
+for node in ast.walk(tree):
+    if not isinstance(node, ast.Call):
+        continue
+    if getattr(node.func, "attr", "") != "add_argument":
+        continue
+    if not any(
+        isinstance(arg, ast.Constant) and arg.value == flag for arg in node.args
+    ):
+        continue
+    for keyword in node.keywords:
+        if keyword.arg == "default":
+            defaults = literal_cells(keyword.value)
+
+if defaults is None:
+    print(json.dumps({
+        "independence": "unknown",
+        "reason": f"the target declares no literal default for {flag}",
+    }))
+    raise SystemExit(0)
+
+novel = [cell for cell in requested if cell not in defaults]
+if not requested:
+    result = {"independence": "unknown", "reason": "no grid cells were requested"}
+elif not novel:
+    result = {
+        "independence": "duplicates-target-defaults",
+        "reason": (
+            f"every requested cell is already in the target's own {flag} default "
+            f"({', '.join(requested)}); this grid re-runs a subset of the repository "
+            "target and is not an independent control"
+        ),
+        "target_defaults": defaults,
+        "novel_cells": [],
+    }
+else:
+    result = {
+        "independence": "adds-coverage",
+        "reason": (
+            f"{len(novel)} of {len(requested)} requested cells are outside the target's "
+            f"own {flag} default: {', '.join(novel)}"
+        ),
+        "target_defaults": defaults,
+        "novel_cells": novel,
+    }
+print(json.dumps(result))
+PY
+)
+  GRID_INDEPENDENCE=$(python3 -c \
+    'import json,sys; print(json.loads(sys.argv[1])["independence"])' \
+    "$GRID_INDEPENDENCE_JSON")
+  GRID_INDEPENDENCE_REASON=$(python3 -c \
+    'import json,sys; print(json.loads(sys.argv[1])["reason"])' \
+    "$GRID_INDEPENDENCE_JSON")
+fi
+jset_string "test_selection.grid_independence" "$GRID_INDEPENDENCE"
+jset_string "test_selection.grid_independence_reason" "$GRID_INDEPENDENCE_REASON"
+
+# ---- Extra axes.
+#
+# Parsed and structurally proven here, next to the shape channel, because they obey the same
+# rule: a channel is credited only when the target's own source declares it, and it is
+# believed only after the target has been observed REFUSING a deliberately invalid value.
+# The difference from --grid is arity, not trust: --grid is one tuple on one flag, an axis is
+# one named knob on its own flag, and a target's failing configuration frequently lives on a
+# knob the shape flag cannot reach.
+AXIS_STATE="none"
+AXIS_STATE_REASON="no extra axes were requested"
+if [ "${#AXES[@]}" -gt 0 ]; then
+  if [ "$TARGET_RUNNER" != "script" ]; then
+    AXIS_STATE="unusable"
+    AXIS_STATE_REASON="extra axes reach script targets only (this target runs under $TARGET_RUNNER)"
+  elif [ ! -f "$REPO_WT/$TEST_FILE" ]; then
+    AXIS_STATE="unusable"
+    AXIS_STATE_REASON="the target file is not present, so no axis flag could be proven"
+  else
+    AXIS_STATE="declared"
+    AXIS_STATE_REASON="${#AXES[@]} axis/axes requested"
+  fi
+fi
+AXIS_UNPROVEN=""
+if [ "$AXIS_STATE" = "declared" ]; then
+  AXIS_REPORT=$(python3 - "$REPO_WT/$TEST_FILE" "${AXES[@]}" <<'PY'
+import ast
+import json
+import sys
+
+path = sys.argv[1]
+tree = ast.parse(open(path, encoding="utf-8").read())
+
+declared = {}
+for node in ast.walk(tree):
+    if not isinstance(node, ast.Call):
+        continue
+    if getattr(node.func, "attr", "") != "add_argument":
+        continue
+    flags = [a.value for a in node.args if isinstance(a, ast.Constant)]
+    default = None
+    for keyword in node.keywords:
+        if keyword.arg == "default":
+            try:
+                default = ast.literal_eval(keyword.value)
+            except (ValueError, SyntaxError):
+                default = None
+    for flag in flags:
+        declared[flag] = default
+
+axes = []
+for spec in sys.argv[2:]:
+    name, _, rest = spec.partition("=")
+    flag, _, values = rest.partition(":")
+    cells = [cell.strip() for cell in values.split(";") if cell.strip()]
+    entry = {
+        "name": name.strip(),
+        "flag": flag.strip(),
+        "values": cells,
+        # `hook_proof` is the STRUCTURAL half only. Nothing downstream may treat it as
+        # consumption: the runtime refusal probe decides that, exactly as for --shape-arg.
+        "hook_proof": "flag-declared-in-add_argument"
+        if flag.strip() in declared
+        else "flag-not-declared",
+    }
+    if not entry["name"] or not entry["flag"] or not cells:
+        entry["hook_proof"] = "malformed-axis-spec"
+    if entry["hook_proof"] == "flag-declared-in-add_argument":
+        default = declared.get(entry["flag"])
+        if default is not None:
+            rendered = default if isinstance(default, (list, tuple)) else [default]
+            rendered = [str(item) for item in rendered]
+            entry["target_defaults"] = rendered
+            novel = [cell for cell in cells if cell not in rendered]
+            entry["novel_values"] = novel
+            entry["independence"] = (
+                "adds-coverage" if novel else "duplicates-target-defaults"
+            )
+        else:
+            entry["independence"] = "unknown"
+    axes.append(entry)
+
+print(json.dumps(axes))
+PY
+)
+  AXIS_UNPROVEN=$(python3 -c '
+import json
+import sys
+
+axes = json.loads(sys.argv[1])
+bad = [a["name"] or "(unnamed)" for a in axes
+       if a["hook_proof"] != "flag-declared-in-add_argument"]
+print(",".join(bad))
+' "$AXIS_REPORT")
+  if [ -n "$AXIS_UNPROVEN" ]; then
+    AXIS_STATE="hook-not-found"
+    AXIS_STATE_REASON="the target declares no argparse flag for: $AXIS_UNPROVEN"
+  else
+    while IFS= read -r token; do
+      [ -n "$token" ] && AXIS_CLI+=("$token")
+    done < <(python3 -c '
+import json
+import sys
+
+for axis in json.loads(sys.argv[1]):
+    print(axis["flag"])
+    for value in axis["values"]:
+        print(value)
+' "$AXIS_REPORT")
+  fi
+fi
+jset_json "test_selection.axes" "$AXIS_REPORT"
+jset_string "test_selection.axis_state" "$AXIS_STATE"
+jset_string "test_selection.axis_state_reason" "$AXIS_STATE_REASON"
 
 # Runs the selected target once, whatever its runner is -- the name predates script targets.
 # The second argument is the grid VALUE, not an env assignment: the channel is decided by
@@ -1502,10 +1755,20 @@ PY
   elif [ -n "$grid_value" ] && [ "$GRID_CHANNEL" = "env" ]; then
     environment+=("$SHAPE_ENV=$grid_value")
   fi
+  # Extra axes ride on the same argv as the shape grid, so the run that carries the grid is
+  # the run that carries the axes and one receipt describes both. AXIS_CLI_OVERRIDE exists
+  # only for the per-axis refusal probes, which must send one deliberately invalid value and
+  # nothing else.
+  if [ "${#AXIS_CLI_OVERRIDE[@]}" -gt 0 ]; then
+    shape_cli+=("${AXIS_CLI_OVERRIDE[@]}")
+  elif [ -n "$grid_value" ] && [ "${#AXIS_CLI[@]}" -gt 0 ] \
+      && [ "$GRID_CHANNEL" = "cli" ]; then
+    shape_cli+=("${AXIS_CLI[@]}")
+  fi
   if [ "$TARGET_RUNNER" = "pytest" ]; then
     (
       cd "$REPO_WT" \
-        && env "${environment[@]}" timeout "$TIMEOUT" \
+        && env -i "${TARGET_BASE_ENV[@]}" "${environment[@]}" timeout "$TIMEOUT" \
           "$TARGET_PYTHON" -m pytest -p "$PROBE_MODULE" "${shape_plugin[@]}" \
             "$TESTS" -x -q \
             --junitxml="$junit" -o "cache_dir=$cache_root/pytest-cache"
@@ -1513,14 +1776,14 @@ PY
   elif [ -n "$EXPECTED_ROUTE" ]; then
     (
       cd "$REPO_WT" \
-        && env "${environment[@]}" timeout "$TIMEOUT" \
+        && env -i "${TARGET_BASE_ENV[@]}" "${environment[@]}" timeout "$TIMEOUT" \
           "$TARGET_PYTHON" "$SCRIPT_DIR/run_script_with_probe.py" \
             "$PROBE_MODULE" "$TEST_FILE" "${shape_cli[@]}"
     ) >"$log" 2>&1
   else
     (
       cd "$REPO_WT" \
-        && env "${environment[@]}" timeout "$TIMEOUT" \
+        && env -i "${TARGET_BASE_ENV[@]}" "${environment[@]}" timeout "$TIMEOUT" \
           "$TARGET_PYTHON" "$TEST_FILE" "${shape_cli[@]}"
     ) >"$log" 2>&1
   fi
@@ -1722,7 +1985,7 @@ run_perf() {
   IFS="$_old_ifs"
   (
     cd "$REPO_WT" \
-      && env "${environment[@]}" timeout "$PERF_TIMEOUT" \
+      && env -i "${TARGET_BASE_ENV[@]}" "${environment[@]}" timeout "$PERF_TIMEOUT" \
         "$TARGET_PYTHON" "$TEST_FILE" "${extra[@]}"
   ) >"$log" 2>&1
   local result=$?
@@ -1735,18 +1998,54 @@ target_stats() {
   local phase=${label%%-*}
   local junit="$WORK/$phase/junit-$label.xml"
   if [ "$TARGET_RUNNER" = "script" ]; then
-    python3 - "$result" <<'PY'
+    # A script target publishes no per-case count, so "executed" used to be hard-coded to 1
+    # and stood for "the process ran". That is the number a silently-returning target also
+    # produces -- aiter#4538's own target returns with exit 0 and log output when the arch is
+    # unsupported or an optional package is missing -- so a run that graded 56 cases and a run
+    # that graded none were indistinguishable, and both credited runtime architecture
+    # coverage. When a route was named, the run's own receipt carries observable work, and
+    # that count is used instead. With no route named there is still nothing to observe, and
+    # the basis says so rather than implying a case count.
+    python3 - "$result" "$WORK/$phase/execution-receipt-$label.json" "$EXPECTED_ROUTE" <<'PY'
 import json
 import sys
 
 result = int(sys.argv[1])
+receipt_path, expected_route = sys.argv[2], sys.argv[3]
+# `executed` keeps its old meaning for everything that consumes it as a liveness signal
+# (the no-GPU requirement probe, the pass/skip decision), because a script that ran is a
+# script that ran. What changes is that it no longer PRETENDS to be a case count, and that
+# `observed_work` -- the only number here backed by evidence -- is published beside it.
+observed = None
+basis = "script process exit; no route was named, so no executed work could be counted"
+if expected_route:
+    try:
+        with open(receipt_path) as handle:
+            receipt = json.load(handle)
+    except (OSError, ValueError):
+        receipt = None
+    if receipt is None:
+        observed = 0
+        basis = (
+            "script process exit; a route was named and this run wrote no execution "
+            "receipt, so no executed work was observed"
+        )
+    else:
+        symbols = len(receipt.get("kernel_symbols") or [])
+        shapes = len(receipt.get("executed_shapes") or [])
+        observed = max(symbols, shapes)
+        basis = (
+            "observed route calls in this run's own execution receipt "
+            f"({symbols} symbol(s), {shapes} shape record(s))"
+        )
 print(json.dumps({
     "tests": 1,
     "failures": int(result != 0),
     "errors": 0,
     "skipped": 0,
     "executed": 1,
-    "basis": "script process exit",
+    "observed_work": observed,
+    "basis": basis,
 }))
 PY
   elif [ -f "$junit" ]; then
@@ -1776,6 +2075,66 @@ print(0 if json.load(open(sys.argv[1])).get("route") else 1)
   fi
   printf '%s\n' "$grid"
 }
+
+# ---------- credential-free execution isolation ----------
+#
+# The target is arbitrary code from an unmerged pull request, and it used to run with the
+# reviewer's whole environment attached: `env VAR=... <cmd>` ADDS to the inherited
+# environment, it does not replace it. Any GITHUB_TOKEN, GH_TOKEN, API key, SSH agent socket
+# or provider credential in the reviewer's shell was readable from `os.environ` inside the
+# code under review, and would land in a log the moment a target printed its environment.
+#
+# So the target's environment is CONSTRUCTED, not inherited. Everything a ROCm/PyTorch run
+# legitimately needs is passed by name or prefix; everything else is dropped; and anything
+# that looks like a secret is dropped even if a prefix would have kept it, because the
+# allowlist is about function and the denylist is about consequence.
+ENV_ALLOW_PREFIXES=(
+  PATH LD_LIBRARY_PATH LIBRARY_PATH CPATH TMPDIR TZ LANG LC_ TERM
+  USER LOGNAME HOSTNAME
+  ROCM HIP HSA HCC AMD GPU_ ROCR RCCL NCCL OMP_ MKL_ OPENBLAS NUMEXPR
+  CUDA TORCH PYTORCH TRITON FLYDSL AITER
+  VIRTUAL_ENV CC CXX CMAKE MAX_JOBS
+)
+ENV_DENY_RE='TOKEN|SECRET|PASSWD|PASSWORD|CREDENTIAL|_KEY|APIKEY|API_KEY|COOKIE|SESSION|AUTH|PRIVATE|GH_|GITHUB|SSH_|GPG_|NETRC'
+TARGET_BASE_ENV=()
+
+build_target_environment() {
+  # Emits NUL-separated NAME=VALUE pairs for the passthrough set.
+  python3 - "$ENV_DENY_RE" "${ENV_ALLOW_PREFIXES[@]}" <<'PY'
+import os
+import re
+import sys
+
+deny = re.compile(sys.argv[1])
+prefixes = tuple(sys.argv[2:])
+out = []
+for name, value in os.environ.items():
+    if not name.startswith(prefixes):
+        continue
+    if deny.search(name.upper()):
+        continue
+    out.append(f"{name}={value}")
+sys.stdout.write("\0".join(out))
+PY
+}
+
+mapfile -d '' -t TARGET_BASE_ENV < <(build_target_environment)
+jset_json "isolation.target_environment" "$(python3 - "${TARGET_BASE_ENV[@]}" <<'PY'
+import json
+import sys
+
+names = sorted(pair.split("=", 1)[0] for pair in sys.argv[1:])
+print(json.dumps({
+    "policy": "constructed (env -i + name/prefix allowlist + secret-shaped denylist)",
+    "passed_through": names,
+    "note": (
+        "the target is unmerged third-party code; it runs with a built environment rather "
+        "than the reviewer's, so a credential in the calling shell is not readable from it "
+        "and cannot reach a log"
+    ),
+}))
+PY
+)"
 
 stats_field() {
   python3 - "$1" "$2" <<'PY'
@@ -1867,6 +2226,19 @@ if [ "$CAN_TEST" -eq 0 ]; then
   finding "note" "correctness" "$SKIP_REASON; this report makes no correctness claim"
 else
   BASE_READY=0
+  # Keep a copy of the head target before the patch is reversed. A PR that ADDS its target
+  # leaves base with nothing to time, which used to end the perf stage outright -- on
+  # aiter#4538, a PR whose entire motivation is being faster than the kernel it replaces.
+  # But "the file is new" is not the same as "the code it exercises is new": when the target
+  # only drives an entry point that already exists on base, dropping this exact file into the
+  # base tree times the OLD implementation through the SAME harness. That transplant is a
+  # cross-tree comparison and is only attributable if something the patch does not touch
+  # reproduces across it, which is what --perf-control-column requires below.
+  PERF_TRANSPLANT_SRC=""
+  if [ -n "$PATCHF" ] && [ "$PERF_ENABLED" -eq 1 ] && [ -f "$REPO_WT/$TEST_FILE" ]; then
+    PERF_TRANSPLANT_SRC="$WORK/transplant-target"
+    cp "$REPO_WT/$TEST_FILE" "$PERF_TRANSPLANT_SRC"
+  fi
   if [ -n "$PATCHF" ]; then
     if git -C "$REPO_WT" apply -R --check "$PATCHF" >/dev/null 2>&1 \
         && git -C "$REPO_WT" apply -R "$PATCHF" >/dev/null 2>&1; then
@@ -1896,8 +2268,30 @@ else
       # number taken later, or on another box, or from the PR description, reintroduces
       # exactly the variance a 0.95 threshold is too tight to absorb.
       if [ "$PERF_ENABLED" -eq 1 ]; then
-        if [ "$BASE_REPO_STATE" = "target-not-present" ]; then
-          PERF_SKIP_REASON="the PR adds this target, so base has nothing to time against"
+        if [ "$BASE_REPO_STATE" = "target-not-present" ] \
+            && [ -z "$PERF_CONTROL_COLUMN" ]; then
+          PERF_SKIP_REASON="the PR adds this target, so a base timing requires transplanting it into the base tree; that comparison spans two trees and is only attributable when a column the patch does not touch reproduces across it, so --perf-control-column is required and was not supplied"
+        elif [ "$BASE_REPO_STATE" = "target-not-present" ] \
+            && [ -n "$PERF_TRANSPLANT_SRC" ] && [ -r "$PERF_TRANSPLANT_SRC" ]; then
+          mkdir -p "$(dirname "$REPO_WT/$TEST_FILE")"
+          cp "$PERF_TRANSPLANT_SRC" "$REPO_WT/$TEST_FILE"
+          PERF_BASELINE_METHOD="target-transplant"
+          if [ "$PERF_ARGS_SET" -eq 1 ] || perf_detect; then
+            perf_snapshot base
+            run_perf_repeats base
+            PERF_BASE_RC=$PERF_RUN_RC
+            PERF_BASE_LOGS=("${PERF_RUN_LOGS[@]}")
+            PERF_BASE_LOG="${PERF_BASE_LOGS[0]}"
+            perf_restore base
+          else
+            PERF_SKIP_REASON="$PERF_BASIS"
+          fi
+          # The transplanted file is not part of the base tree and must not be left in it:
+          # the cleanliness check that guards the head phase would otherwise fail and take
+          # the whole correctness phase down with it.
+          rm -f "$REPO_WT/$TEST_FILE"
+        elif [ "$BASE_REPO_STATE" = "target-not-present" ]; then
+          PERF_SKIP_REASON="the PR adds this target and no copy of it was available to transplant onto base"
         elif [ "$PERF_ARGS_SET" -eq 1 ] || perf_detect; then
           perf_snapshot base
           run_perf_repeats base
@@ -2094,20 +2488,97 @@ PY
         finding "note" "correctness" \
           "the selected target passes an invalid shape-grid probe, so grid consumption is unproven"
       else
+        # Every requested axis must be observed REFUSING an invalid value before its values
+        # are allowed onto the grid run's argv. Without this an axis flag the target declares
+        # but ignores -- or one whose value it silently clamps -- would let the report claim
+        # coverage of head counts or dtypes that never reached the kernel. An axis that fails
+        # the probe is dropped from the run and named in the report; it is never dropped
+        # quietly, because a silently narrowed test space is the failure this stage exists to
+        # prevent.
+        if [ "$AXIS_STATE" = "declared" ]; then
+          AXIS_REFUSED_OK=1
+          AXIS_PROBE_FAILED=""
+          for _axis_flag in $(python3 -c '
+import json
+import sys
+
+for axis in json.loads(sys.argv[1]):
+    print(axis["flag"])
+' "$AXIS_REPORT"); do
+            AXIS_CLI_OVERRIDE=("$_axis_flag" "__VALIDATOR_INVALID_AXIS__")
+            AXIS_PROBE_RESULT=$(run_pytest "head-axisprobe" "")
+            AXIS_CLI_OVERRIDE=()
+            if [ "${AXIS_PROBE_RESULT%%|*}" -eq 0 ]; then
+              AXIS_REFUSED_OK=0
+              AXIS_PROBE_FAILED="$AXIS_PROBE_FAILED $_axis_flag"
+            fi
+          done
+          if [ "$AXIS_REFUSED_OK" -eq 1 ]; then
+            AXIS_STATE="proven"
+            AXIS_STATE_REASON="every axis flag rejected a deliberately invalid value"
+          else
+            AXIS_STATE="hook-not-consumed"
+            AXIS_STATE_REASON="these axis flags accepted a deliberately invalid value, so the target does not consume them:$AXIS_PROBE_FAILED"
+            AXIS_CLI=()
+            finding "note" "correctness" \
+              "requested test axes were dropped: $AXIS_STATE_REASON"
+          fi
+          jset_string "test_selection.axis_state" "$AXIS_STATE"
+          jset_string "test_selection.axis_state_reason" "$AXIS_STATE_REASON"
+        fi
         HEAD_GRID_RESULT=$(run_pytest "head-grid" "$GRID")
         HEAD_GRID_RC=${HEAD_GRID_RESULT%%|*}
         HEAD_GRID_LOG=${HEAD_GRID_RESULT##*|}
         HEAD_GRID_STATS=$(target_stats "head-grid" "$HEAD_GRID_RC")
         HEAD_GRID_EXECUTED=$(stats_field "$HEAD_GRID_STATS" executed)
-        python3 - "$JSON" "$HEAD_GRID_RC" "$GRID" "$HEAD_GRID_LOG" \
-          "$HEAD_GRID_STATS" "$HEAD_PROBE_RC" "$HEAD_PROBE_LOG" <<'PY'
+        # A proven axis that asks for values outside the target's own defaults makes the run
+        # independent even when the shape cells duplicate: the configuration reaching the
+        # kernel is one the repository target never runs.
+        AXIS_ADDS_COVERAGE=0
+        if [ "$AXIS_STATE" = "proven" ]; then
+          AXIS_ADDS_COVERAGE=$(python3 -c '
 import json
 import sys
 
-path, exit_code, grid, log, raw_stats, probe_exit, probe_log = sys.argv[1:8]
+axes = json.loads(sys.argv[1])
+print(int(any(a.get("independence") == "adds-coverage" for a in axes)))
+' "$AXIS_REPORT")
+        fi
+        if [ "$AXIS_ADDS_COVERAGE" -eq 1 ] \
+            && [ "$GRID_INDEPENDENCE" = "duplicates-target-defaults" ]; then
+          GRID_INDEPENDENCE="adds-coverage"
+          GRID_INDEPENDENCE_REASON="the shape cells duplicate the target's defaults, but a proven extra axis requests values the target does not run by default"
+        fi
+        python3 - "$JSON" "$HEAD_GRID_RC" "$GRID" "$HEAD_GRID_LOG" \
+          "$HEAD_GRID_STATS" "$HEAD_PROBE_RC" "$HEAD_PROBE_LOG" \
+          "$GRID_INDEPENDENCE" "$GRID_INDEPENDENCE_REASON" <<'PY'
+import json
+import sys
+
+(
+    path,
+    exit_code,
+    grid,
+    log,
+    raw_stats,
+    probe_exit,
+    probe_log,
+    independence,
+    independence_reason,
+) = sys.argv[1:10]
 data = json.load(open(path))
 stats = json.loads(raw_stats)
 status = "fail" if int(exit_code) else ("pass" if stats["executed"] else "skip")
+note = ""
+if status == "skip":
+    note = "shape-grid target completed with no executed tests"
+# A red grid is still a red grid: a duplicate grid that FAILS is reporting a real defect in
+# the target and must keep its "fail". What a duplicate cannot do is earn a pass, because the
+# only thing a passing duplicate proves is that the repository run passed -- which
+# correctness_repo_tests already said.
+if status == "pass" and independence == "duplicates-target-defaults":
+    status = "skip"
+    note = independence_reason
 data["stages"]["correctness_s1_grid"] = {
     "status": status,
     "exit": int(exit_code),
@@ -2116,14 +2587,19 @@ data["stages"]["correctness_s1_grid"] = {
     "stats": stats,
     "hook_probe_exit": int(probe_exit),
     "hook_probe_log": probe_log,
+    "independence": independence,
+    "independence_reason": independence_reason,
 }
-if status == "skip":
-    data["stages"]["correctness_s1_grid"]["note"] = (
-        "shape-grid target completed with no executed tests"
-    )
+if note:
+    data["stages"]["correctness_s1_grid"]["note"] = note
 json.dump(data, open(path, "w"), indent=2)
 PY
         mark_runtime_coverage "$HEAD_GRID_STATS" "$TARGET_RUNNER" "$HEAD_GRID_LOG"
+        if [ "$GRID_INDEPENDENCE" = "duplicates-target-defaults" ] \
+            && [ "$HEAD_GRID_RC" -eq 0 ]; then
+          finding "note" "correctness" \
+            "the independent shape grid was not independent: $GRID_INDEPENDENCE_REASON"
+        fi
         if [ "$HEAD_GRID_RC" -eq 0 ] && [ "$HEAD_GRID_EXECUTED" -eq 0 ]; then
           finding "note" "correctness" \
             "shape-grid target executed no tests; no grid claim is made"
@@ -2143,6 +2619,11 @@ PY
               "the independent grid is red on both baseline and head; attribution is inconclusive"
           fi
         fi
+        # The grid's OWN receipt, not whichever head run wrote last. The grid exists to be a
+        # positive control against re-reporting the repo-default run under a second stage
+        # name; reading a shared receipt made that control unfalsifiable, because a receipt
+        # written by the default run satisfies --grid whenever the grid shapes are a subset
+        # of the target's own defaults.
         RECEIPT_JSON=$(
           python3 "$SCRIPT_DIR/validate_evidence.py" receipt \
             "$(head_receipt)" \
@@ -2150,6 +2631,8 @@ PY
             --grid-channel "$GRID_CHANNEL"
         )
         jset_json "stages.execution_receipt" "$RECEIPT_JSON"
+        jset_string "stages.execution_receipt.receipt_scope" \
+          "the head-grid run only; the head-repo run has its own receipt"
         RECEIPT_STATUS=$(python3 - "$RECEIPT_JSON" <<'PY'
 import json
 import sys
@@ -2172,6 +2655,8 @@ PY
             --expected-route "$EXPECTED_ROUTE" --grid "" --grid-channel ""
         )
         jset_json "stages.execution_receipt" "$RECEIPT_JSON"
+        jset_string "stages.execution_receipt.receipt_scope" \
+          "the head-repo run only; no grid run took place"
         RECEIPT_STATUS=$(python3 -c \
           'import json,sys; print(json.loads(sys.argv[1])["status"])' "$RECEIPT_JSON")
         if [ "$RECEIPT_STATUS" != "pass" ]; then
@@ -2331,21 +2816,84 @@ else
       "base and head both produced benchmark logs, but they could not be compared"
   else
     python3 - "$JSON" "$PERF_JSON" "$PERF_BASE_LOG" "$PERF_HEAD_LOG" \
-      "$BASE_SHA" "$PERF_ARGS" "$PERF_BASIS" <<'PY'
+      "$BASE_SHA" "$PERF_ARGS" "$PERF_BASIS" \
+      "$PERF_BASELINE_METHOD" "$PERF_CONTROL_COLUMN" "$PERF_CONTROL_TOL" <<'PY'
 import json
 import sys
 
-report_path, compare_path, base_log, head_log, base_sha, command, basis = sys.argv[1:8]
+(
+    report_path,
+    compare_path,
+    base_log,
+    head_log,
+    base_sha,
+    command,
+    basis,
+    baseline_method,
+    control_column,
+    control_tol,
+) = sys.argv[1:11]
 data = json.load(open(report_path))
 result = json.load(open(compare_path))
 
+# A transplanted baseline is only attributable if a column the patch does not touch
+# reproduces across the two trees. Without that agreement the difference could be anything
+# -- a different harness path, a different allocation, a different clock state -- and a
+# number nobody can attribute is worse than no number, so the stage skips and says why.
+control_note = ""
+control_ratio = None
+if baseline_method == "target-transplant":
+    columns = result.get("columns") or {}
+    match = None
+    for name in columns:
+        if control_column.lower() in name.lower():
+            match = name
+            break
+    if match is None:
+        control_note = (
+            f"the named control column {control_column!r} is not present in both logs, so "
+            "this cross-tree comparison cannot be attributed"
+        )
+        result["status"] = "insufficient"
+        result["reason"] = control_note
+    else:
+        control_ratio = columns[match].get("median_ratio")
+        tolerance = float(control_tol)
+        if control_ratio is None or abs(control_ratio - 1.0) > tolerance:
+            control_note = (
+                f"the control column {match!r} moved by "
+                f"{'unknown' if control_ratio is None else f'{abs(control_ratio - 1.0):.1%}'}"
+                f" across the two trees (tolerance {tolerance:.0%}); the patch does not "
+                "touch it, so the two runs are not comparable and no ratio is reported"
+            )
+            result["status"] = "insufficient"
+            result["reason"] = control_note
+        else:
+            control_note = (
+                f"control column {match!r} reproduced within "
+                f"{abs(control_ratio - 1.0):.1%} across the two trees"
+            )
+
 stage = {
     "status": {"regression": "fail", "ok": "pass"}.get(result["status"], "skip"),
-    "baseline": f"{base_sha} with the candidate patch reversed, same worktree and GPU",
+    "baseline_method": baseline_method,
+    "baseline": (
+        f"{base_sha} with the candidate patch reversed, same worktree and GPU"
+        if baseline_method != "target-transplant"
+        else (
+            f"{base_sha} with the candidate patch reversed and this PR's own target file "
+            "copied in, same worktree and GPU; the target drives an entry point that exists "
+            "on both sides, so this times the pre-PR implementation through the same harness"
+        )
+    ),
     "command": command or "(target's default entry point)",
     "harness": basis,
     "threshold": result.get("threshold"),
     "matched_rows": result.get("matched_rows", 0),
+    # How rows were paired across the two sides. A relaxed key is a fact a reader needs: it
+    # means the target printed an unlabeled measurement column that the strict key would
+    # have treated as part of each row's identity.
+    "row_key_basis": result.get("row_key_basis", "unknown"),
     "columns": result.get("columns", {}),
     # Repeat count is part of the claim, not trivia: the threshold is only defensible
     # because each cell is a best-of-N, so a reader has to be able to see N.
@@ -2358,6 +2906,11 @@ stage = {
     "head_log": head_log,
     "note": result.get("reason") or "",
 }
+if control_note:
+    stage["control_column"] = control_column
+    stage["control_note"] = control_note
+    if control_ratio is not None:
+        stage["control_ratio"] = control_ratio
 # median_ratio is omitted, never nulled, when there is no measurement: report_schema.json
 # types it as a number, and a null would fail validation at review-pr's identity gate --
 # turning "we could not measure" into "this report is malformed".
@@ -2400,13 +2953,16 @@ fi
 
 record_gpu_activity_after
 finish_report
-FINAL_VERDICT=$(python3 - "$OUT" <<'PY'
-import json
-import sys
-
-print(json.load(open(sys.argv[1]))["verdict"])
-PY
-)
+# `$WORK/verdict` is written by finish_report in the same breath as the report it
+# describes, and `$WORK` belongs to this process alone. If it is absent, finish_report did
+# not complete and there is no verdict to report -- which is INCONCLUSIVE, not whatever
+# `--out` happens to hold.
+FINAL_VERDICT=""
+if [ -r "$WORK/verdict" ]; then
+  FINAL_VERDICT=$(cat "$WORK/verdict")
+else
+  echo "validator internal error: no verdict was recorded for this run" >&2
+fi
 case "$FINAL_VERDICT" in
   PASS) exit 0;;
   BLOCK|NEEDS_WORK) exit 1;;
