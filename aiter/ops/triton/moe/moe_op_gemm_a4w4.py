@@ -1,10 +1,7 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_ogs.py
 
-import functools
 import itertools
-import json
-import os
 
 import torch
 import triton
@@ -27,10 +24,8 @@ from aiter.ops.triton.moe.reduce import (
     validate_reduce_out,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.config_utils import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
 from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
-
 
 # -----------------------------------------------------------------------------
 #                    Matrix Multiplication + Outer Gather/Scatter
