@@ -458,7 +458,7 @@ def test_mla_prefill(
             2.0
             * batch_size
             * num_head_q
-            * ctx_len
+            * (qo_len if qo_len is not None else ctx_len)
             * (qk_head_dim * ctx_len + v_head_dim * ctx_len)
         ) / g_div
         tflops_mla_prefill_asm = ops / us_mla_prefill_asm / (1e6)
