@@ -368,6 +368,11 @@ Two kinds of shipped row this tuner cannot propose:
   equivalents that are 1.6-5.7% slower. That is expected. Do not treat it as a
   regression, and do not re-open the axis without a fresh decision.
 
+  With that gap accepted, candidate reachability is complete everywhere it is
+  achievable: 64/64 prompt coverage against every shipped a4w4 config across the
+  four model files, and 8/8 against glm5 optima found by exhaustive search. The
+  four `_sp` rows are the only configs outside the space, by choice.
+
 11 of kimi-k3's 17 shipped rows are exactly reachable; the rest are the
 `flydsl_moe1_*` pair and the four `_sp` rows.
 
