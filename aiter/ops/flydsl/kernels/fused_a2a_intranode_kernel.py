@@ -20,7 +20,7 @@ from .communication_ops_utils import (
     store_i64_global_system,
 )
 
-_JIT_SCHEMA_VERSION = "v4-fused-in-hop-qk-norm-rope"
+_JIT_SCHEMA_VERSION = "v5-overlap-v-with-qk"
 
 
 def make_fused_a2a_kernel(
@@ -117,8 +117,8 @@ def make_fused_a2a_kernel(
                 )
             return result
 
-        def process_qk(rsrc_input, rsrc_norm, p2p_bases):
-            for seq in range(global_warp_id, seq_len, global_warp_num):
+        def process_qk(rsrc_input, rsrc_norm, p2p_bases, qk_warp_id, qk_warp_num):
+            for seq in range(qk_warp_id, seq_len, qk_warp_num):
                 tiles = []
                 sq_acc = fx.Float32(0.0)
                 row_base = seq * hd
@@ -194,23 +194,64 @@ def make_fused_a2a_kernel(
                         0,
                     )
 
-        process_qk(rsrc_input_q, rsrc_norm_q, p2p_bases_q)
-        process_qk(rsrc_input_k, rsrc_norm_k, p2p_bases_k)
+        v_warps_per_block = max(1, warp_num_per_block // 4)
+        qk_warps_per_block = warp_num_per_block - v_warps_per_block
 
-        for chunk_idx in range(global_warp_id, total_chunks, global_warp_num):
-            row = chunk_idx // chunks_per_row
-            row_chunk = chunk_idx % chunks_per_row
-            seq = row // heads
-            head = row % heads
-            dest_pe = head // heads_local
-            local_head = head % heads_local
-            peer_base_v = fx.memref_load(p2p_bases_v, dest_pe)
-            dst_row = local_head * seq_full + rank * seq_len + seq
-            dst_offset = fx.Int64(dst_row * row_nbytes + row_chunk * 16)
-            rsrc_dst_v = create_buffer_resource_from_addr(peer_base_v + dst_offset)
-            i32_offset = chunk_idx * 4
-            value_v = buffer_load(rsrc_input_v, i32_offset, vec_width=4, dtype=T.i32)
-            buffer_store(value_v, rsrc_dst_v, 0)
+        def process_v(v_warp_id, v_warp_num):
+            for chunk_idx in range(v_warp_id, total_chunks, v_warp_num):
+                row = chunk_idx // chunks_per_row
+                row_chunk = chunk_idx % chunks_per_row
+                seq = row // heads
+                head = row % heads
+                dest_pe = head // heads_local
+                local_head = head % heads_local
+                peer_base_v = fx.memref_load(p2p_bases_v, dest_pe)
+                dst_row = local_head * seq_full + rank * seq_len + seq
+                dst_offset = fx.Int64(dst_row * row_nbytes + row_chunk * 16)
+                rsrc_dst_v = create_buffer_resource_from_addr(peer_base_v + dst_offset)
+                i32_offset = chunk_idx * 4
+                value_v = buffer_load(
+                    rsrc_input_v, i32_offset, vec_width=4, dtype=T.i32
+                )
+                buffer_store(value_v, rsrc_dst_v, 0)
+
+        if warp_num_per_block == 1:
+            process_qk(
+                rsrc_input_q,
+                rsrc_norm_q,
+                p2p_bases_q,
+                global_warp_id,
+                global_warp_num,
+            )
+            process_qk(
+                rsrc_input_k,
+                rsrc_norm_k,
+                p2p_bases_k,
+                global_warp_id,
+                global_warp_num,
+            )
+            process_v(global_warp_id, global_warp_num)
+        elif warp < qk_warps_per_block:
+            qk_warp_id = bid * qk_warps_per_block + warp
+            qk_warp_num = block_num * qk_warps_per_block
+            process_qk(
+                rsrc_input_q,
+                rsrc_norm_q,
+                p2p_bases_q,
+                qk_warp_id,
+                qk_warp_num,
+            )
+            process_qk(
+                rsrc_input_k,
+                rsrc_norm_k,
+                p2p_bases_k,
+                qk_warp_id,
+                qk_warp_num,
+            )
+        else:
+            v_warp_id = bid * v_warps_per_block + warp - qk_warps_per_block
+            v_warp_num = block_num * v_warps_per_block
+            process_v(v_warp_id, v_warp_num)
 
         # All blocks must be resident: this is a grid-wide software barrier.
         fx.barrier()
