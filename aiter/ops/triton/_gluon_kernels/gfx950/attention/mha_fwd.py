@@ -610,7 +610,7 @@ def _mha_fwd_gluon_kernel(
         n_blocks = min(n_blocks, n_blocks_seqlen)
 
     if n_blocks <= 0:
-        # Every row of this Q block is fully masked: write zeros to O and +inf to LSE.
+        # Every row of this Q block is fully masked: write zeros to O and DEAD_ROW_LSE to LSE.
         offs_m_z = start_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=offs_m_layout)
         offs_d_z = gl.arange(0, HEAD_DIM, layout=offs_d_layout)
         o_base_z = Out + off_z * stride_oz + off_h_q * stride_oh

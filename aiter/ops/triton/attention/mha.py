@@ -8,10 +8,15 @@ import torch
 import triton
 import triton.language as tl
 
-from aiter.ops.triton._gluon_kernels.gfx950.attention.mha_fwd import (
-    is_mha_gluon_avail,
-    mha_fwd_gluon,
-)
+try:
+    from aiter.ops.triton._gluon_kernels.gfx950.attention.mha_fwd import (
+        is_mha_gluon_avail,
+        mha_fwd_gluon,
+    )
+except:  # noqa: E722
+    is_mha_gluon_avail = lambda **kwargs: False
+    mha_fwd_gluon = None
+
 from aiter.ops.triton._triton_kernels.attention.mha import _attn_fwd, _get_config
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
 from aiter.ops.triton.attention.mha_fused_bwd import flash_attn_fused_backward
