@@ -152,7 +152,7 @@ def conv2d(x, w_oihw, bias=None, stride=(1,1), padding=(0,0), dilation=(1,1),
 The semi-public method-specific functions (`conv2d_nchw_cblocked`,
 `conv2d_winograd_f4x3_cblocked`, …) take an internal `block_k=64` channel-block
 and padding granularity. It is intentionally not surfaced on the public
-`conv2d` — every shipped config in `configs/conv/` was tuned with 64, so the
+`conv2d` — every shipped conv config was tuned with 64, so the
 parameter has no good user story.
 
 `x.dtype` is validated at entry: anything other than `torch.float16` /
@@ -247,7 +247,7 @@ into the user's chosen output layout.
 
 ### 5.0 A platform note on `num_stages`
 
-Every shipped config in `configs/conv/` pins **`num_stages=1`**. That is
+Every shipped conv config pins **`num_stages=1`**. That is
 deliberate.
 
 The `num_stages > 1` Triton knob is meant to lower to a software-pipelined
@@ -281,7 +281,7 @@ The kernel fuses this with the index unwrap `m → (n, p, q)` and a
 Highlights:
 
 - **Tile shape:** `BLOCK_M × BLOCK_N × BLOCK_K`, set per-arch in
-  `aiter/ops/triton/configs/conv/{arch}-CONV-1X1.json` and loaded at launch
+  `aiter/ops/triton/configs/{arch}/triton/conv/conv_1x1/DEFAULT.json` and loaded at launch
   via `get_conv_config("CONV-1X1")`. `num_stages=1` always — see 5.0.
 - **L2 cache swizzle.** Tiles are reordered into super-groups of
   `GROUP_SIZE_M` along the `M` axis so each weight (`N`-axis) tile is reused
@@ -312,7 +312,7 @@ NHWC-native 3×3 with **K-major weight layout** `W3[K_out, 9, C_pad]`:
   emits one vectorized load per row.
 - **Same L2 swizzle as 5.1**: workgroups are reordered into super-groups of
   `GROUP_SIZE_M` along the `M` axis (set to 4 or 8 in
-  `configs/conv/{arch}-CONV-3X3-NHWC.json`) so each weight (`N`-axis) tile
+  `configs/{arch}/triton/conv/conv_3x3_nhwc/DEFAULT.json`) so each weight (`N`-axis) tile
   stays hot in L2 across `GROUP_SIZE_M` consecutive workgroups.
 
 ### 5.3 `_conv2d_3x3_cblocked_kernel`
@@ -559,7 +559,7 @@ The main input and packed-weight layouts are:
 | `[36, K_out, C_pad]` (Winograd weight) | `winograd_f4x3_*` | `prepack_winograd_filter_f4x3` | LRU 256, `_PACK_CACHE_WINOGRAD_F4X3` |
 
 The fused NCHWc launcher in `_launch.py` loads its parameters from
-`configs/conv/{arch}-CONV-PREPACK.json`. It uses the canonical key
+`configs/{arch}/triton/conv/conv_prepack/DEFAULT.json`. It uses the canonical key
 `N=...,C=...,H=...,W=...,CB=...`; exact pins cover tuned shapes, then
 architecture-specific `M_LEQ_*` buckets and `any` cover unseen shapes by
 spatial size.
@@ -647,11 +647,22 @@ If a new kernel needs the Winograd bump, mark it `is_winograd=True` in
 Each kernel fetches its launch parameters (tile sizes, `num_warps`, etc.) at
 launch time via `get_conv_config(...)` in
 `aiter/ops/triton/utils/conv_config_utils.py`, which reads the per-arch JSON in
-`configs/conv/{arch}-CONV-{KERNEL}.json`. There is **no runtime autotune on the
+`configs/{arch}/triton/conv/<d_type>/DEFAULT.json`, `<d_type>` being the config
+name lowercased with dashes folded to underscores (`CONV-3X3-NHWC` →
+`conv_3x3_nhwc`). There is **no runtime autotune on the
 hot path** — the search already happened offline and its winners are frozen in
 JSON, so first-call latency and CI compile time stay predictable. Candidate
 search spaces are maintained by offline tuning tooling, outside the production
 package.
+
+The directory itself is built by `resolve_config_dir("conv", config_name,
+backend="triton")` in `utils/config_utils.py` — the same deterministic path
+builder every op family uses. Conv is triton-only, so it always declares
+`backend="triton"`; there is no probing and no cross-arch search, and an arch
+that ships no file for a required table raises with that exact path in the
+message. Optional tables (the direct-NCHW route) are probed instead with
+`has_conv_config()`, which loads with `required=False` and reports whether the
+running arch ships one at all.
 
 ### The JSON is a keyed lookup, not a list of layers
 
@@ -730,8 +741,9 @@ Concretely, to add (say) a `winograd_f6x3` variant:
 
 1. **Implement the kernel.** New file under `aiter/ops/triton/_triton_kernels/conv/`.
    Add a `_get_config()` helper that calls `get_conv_config("CONV-<NAME>")`,
-   and ship `{arch}-CONV-<NAME>.json` files under `aiter/ops/triton/configs/conv/`
-   for each supported arch.
+   and ship a `DEFAULT.json` under
+   `aiter/ops/triton/configs/{arch}/triton/conv/conv_<name>/` for each supported
+   arch.
 2. **Add a launch wrapper** in `_launch.py` (`_launch_winograd_f6x3`) that
    sets up the grid and turns Python ints into Triton constexprs.
 3. **Add a public function** in `conv2d.py`
