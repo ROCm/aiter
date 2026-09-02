@@ -308,6 +308,20 @@ def emit_cvt_scalef32_pk8_fp8_f32(src_v8f32, scale_f32, *, v2i32_ty, rocdl):
     )
 
 
+def emit_cvt_scalef32_pk8_fp4_f32(src_v8f32, scale_f32, *, i32_ty, rocdl):
+    """Native gfx1250 ``v_cvt_scalef32_pk8_fp4_f32``: 8 f32 -> 8 fp4 e2m1.
+
+    Same contract as the fp8 form, except the eight 4-bit values pack into one
+    i32 instead of two. Also no bf16 round-trip, which the ``_bf16`` variant
+    below would cost -- and fp4 has too little mantissa to spend on that.
+    """
+    return rocdl.cvt_scalef32_pk8_fp4_f32(
+        i32_ty,
+        _raw(src_v8f32),
+        _raw(scale_f32),
+    )
+
+
 def emit_cvt_scalef32_pk8_fp4_bf16(src_v8bf16, scale_f32, *, i32_ty):
     """Native gfx1250 scaled conversion of eight bf16 values to packed FP4."""
     return rocdl.cvt_scalef32_pk8_fp4_bf16(
