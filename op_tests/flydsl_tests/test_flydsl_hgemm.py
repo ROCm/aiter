@@ -9,15 +9,9 @@ import torch
 from torch.profiler import ProfilerActivity, profile
 
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.utils import is_flydsl_available
 
 if not torch.cuda.is_available():
     pytest.skip("ROCm not available. Skipping GPU tests.", allow_module_level=True)
-if not is_flydsl_available():
-    pytest.skip(
-        "flydsl is not installed. Skipping FlyDSL HGEMM tests.",
-        allow_module_level=True,
-    )
 if get_gfx() != "gfx950":
     pytest.skip("The FlyDSL A16W16 kernel requires gfx950.", allow_module_level=True)
 

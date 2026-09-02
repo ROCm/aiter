@@ -159,7 +159,7 @@ def get_GEMM_A16W16_config(
         if config is not None:
             if config["libtype"] == "flydsl":
                 flydsl_config = (
-                    aiter.ops.flydsl.gemm_kernels.get_flydsl_hgemm_kernel_params(
+                    _get_flydsl_gemm_kernels().get_flydsl_hgemm_kernel_params(
                         config["kernelName"]
                     )
                 )
@@ -484,7 +484,8 @@ def flydsl_gemm(
     assert (
         scale_a is None and scale_b is None and scale_c is None
     ), "FlyDSL hgemm does not support scaling yet."
-    flydsl_config = aiter.ops.flydsl.gemm_kernels.get_flydsl_hgemm_kernel_params(
+    flydsl_gemm_kernels = _get_flydsl_gemm_kernels()
+    flydsl_config = flydsl_gemm_kernels.get_flydsl_hgemm_kernel_params(
         config["kernelName"]
     )
     fused_bias = None

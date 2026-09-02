@@ -10,12 +10,10 @@ import re
 
 import flydsl.expr as fx
 import torch
-from flydsl.runtime.device import get_rocm_arch
 from torch import Tensor
 
 from aiter import logger
-from aiter.jit.utils.chip_info import get_gfx, get_lds_capacity_bytes
-from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+from aiter.jit.utils.chip_info import get_gfx
 
 from .kernels.gemm_a16w16_gfx950 import (
     SPLIT_K_SEMAPHORE_MAX_LEN,
