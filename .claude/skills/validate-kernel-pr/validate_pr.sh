@@ -10,9 +10,13 @@
 #   * a green pytest with loosened tolerances is not a pass -- tolerances are policy-checked
 #   * GPU is claimed over a sampling window and locked (kernel-profiling-optimization skill)
 #
+#   * correctness is not performance -- a kernel PR can compute the right values and still
+#     be a regression, so base and head are also timed, on the same locked GPU, back to back
+#
 # usage: validate_pr.sh --repo <worktree> --target <test file or pytest node> [--patch p.patch]
 #                       [--head-sha <expected PR head>] [--shape-env VAR]
 #                       [--grid "M,N,dt;..."] [--tol-table f32=1e-5,...]
+#                       [--perf-args "--scenario bench"] [--no-perf]
 #                       --expected-route NAME [--label NAME] [--out report.json]
 set -uo pipefail
 
@@ -31,6 +35,29 @@ LABEL="run"
 OUT=""
 PYLIB="${PYLIB:-}"
 TIMEOUT="${TIMEOUT:-1800}"
+# Perf measurement is on by default. It has to be: the regression this stage exists to catch
+# is the one nobody suspected, and an opt-in flag is only ever set by someone who already
+# suspects. --no-perf turns it off for the cases where it genuinely cannot work.
+PERF_ENABLED=1
+PERF_ARGS=""
+PERF_ARGS_SET=0
+PERF_BASIS=""
+# A bench sweep is legitimately longer than a correctness run, so it gets its own budget.
+PERF_TIMEOUT="${PERF_TIMEOUT:-$TIMEOUT}"
+# Each side is run PERF_REPEAT times and each cell reduced to its best sample. This is not
+# belt-and-braces, it is what makes a 0.95 threshold usable. Measured here: five warm repeat
+# runs of an unchanged op_tests/test_layernorm2d.py gave `ck avg` of
+# 13.10 20.98 20.70 13.28 13.17 us -- bimodal, 1.60x spread, on code that did not change,
+# while the untouched `torch avg` reference column held to 1.03x. One run per side would put
+# the ratio anywhere in [0.62, 1.60] and fire a false regression about half the time.
+# Minimum-over-three collapses that same data to 1.014x. Minimum is the correct estimator
+# because contention, clock ramp and scheduling only ever ADD time.
+PERF_REPEAT="${PERF_REPEAT:-3}"
+# 0.95 is the user-facing sensitivity knob and holds only because of the reduction above.
+# Both guards below exist because the threshold is tight -- it fires on >= PERF_MIN_ROWS
+# matched rows and never on a nonzero exit, so a crashed or truncated run reports `skip`.
+PERF_THRESHOLD="${PERF_THRESHOLD:-0.95}"
+PERF_MIN_ROWS="${PERF_MIN_ROWS:-3}"
 TARGET_PYTHON="${PYTHON_BIN:-$(command -v python3 || command -v python || true)}"
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
@@ -57,6 +84,8 @@ while [ "$#" -gt 0 ]; do
     --tol-table) need_value "$@"; TOL_TABLE="$2"; shift 2;;
     --label) need_value "$@"; LABEL="$2"; shift 2;;
     --out) need_value "$@"; OUT="$2"; shift 2;;
+    --perf-args) need_value "$@"; PERF_ARGS="$2"; PERF_ARGS_SET=1; shift 2;;
+    --no-perf) PERF_ENABLED=0; shift;;
     *) echo "unknown arg $1" >&2; exit 2;;
   esac
 done
@@ -113,6 +142,23 @@ if [ -n "$HEAD_SHA" ] && [[ ! "$HEAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
 fi
 if [[ ! "$TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
   echo "TIMEOUT must be a positive integer" >&2
+  exit 2
+fi
+if [[ ! "$PERF_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+  echo "PERF_TIMEOUT must be a positive integer" >&2
+  exit 2
+fi
+if [[ ! "$PERF_MIN_ROWS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "PERF_MIN_ROWS must be a positive integer" >&2
+  exit 2
+fi
+if [[ ! "$PERF_REPEAT" =~ ^[1-9][0-9]*$ ]]; then
+  echo "PERF_REPEAT must be a positive integer" >&2
+  exit 2
+fi
+if ! python3 -c 'import sys; v=float(sys.argv[1]); sys.exit(0 if 0 < v <= 2 else 1)' \
+    "$PERF_THRESHOLD" 2>/dev/null; then
+  echo "PERF_THRESHOLD must be a number in (0, 2]" >&2
   exit 2
 fi
 if [ -z "$TARGET_PYTHON" ] || [ ! -x "$TARGET_PYTHON" ]; then
@@ -1319,9 +1365,16 @@ PY
 fi
 jset_string "test_selection.grid_channel_reason" "$GRID_CHANNEL_REASON"
 
+# Runs the selected target once, whatever its runner is -- the name predates script targets.
+# The second argument is the grid VALUE, not an env assignment: the channel is decided by
+# the channel that probed positive. It used to take "$SHAPE_ENV=$GRID" and re-split on the
+# first `=`, which
+# worked for a CLI-only run only because an unset SHAPE_ENV left a leading `=` that the split
+# then removed -- the shapes were travelling inside a string shaped like the channel they were
+# not using.
 run_pytest() {
   local label="$1"
-  local shape_assignment="$2"
+  local grid_value="$2"
   local log="$WORK/$TARGET_RUNNER-$label.log"
   local phase=${label%%-*}
   local cache_root="$WORK/$phase"
@@ -1367,8 +1420,8 @@ PY
   # The pytest channel needs its plugin generated per run, with the grid baked in, so the
   # tested PR can neither read nor forge it.
   local -a shape_plugin=()
-  if [ "$GRID_CHANNEL" = "pytest" ] && [ -n "$shape_assignment" ]; then
-    local _grid_value="${shape_assignment#*=}"
+  if [ "$GRID_CHANNEL" = "pytest" ] && [ -n "$grid_value" ]; then
+    local _grid_value="$grid_value"
     # Remove first: a generator that fails must not leave the PREVIOUS phase's plugin in
     # place, or the next phase silently re-runs the grid it was carrying.
     rm -f "$PROBE_DIR/${PROBE_MODULE}_shapes.py"
@@ -1431,25 +1484,23 @@ PY
       return 0
     fi
     shape_plugin=(-p "${PROBE_MODULE}_shapes")
-    shape_assignment=""
+    # The plugin now carries the grid; nothing may also send it on argv or in the env.
+    grid_value=""
   fi
   local -a shape_cli=()
   # Dispatch on the channel that actually probed positive, not on "--shape-arg was supplied".
   # With both flags given and only the env channel real, the old condition still routed the
   # grid through the CLI flag the target does not parse.
-  if [ -n "$shape_assignment" ] && [ "$GRID_CHANNEL" = "cli" ]; then
+  if [ -n "$grid_value" ] && [ "$GRID_CHANNEL" = "cli" ]; then
     shape_cli=("$SHAPE_ARG")
-    local _grid_value="${shape_assignment#*=}"
     local _old_ifs="$IFS"
     IFS=';'
-    for _shape in $_grid_value; do
+    for _shape in $grid_value; do
       [ -n "$_shape" ] && shape_cli+=("$_shape")
     done
     IFS="$_old_ifs"
-    shape_assignment=""
-  fi
-  if [ -n "$shape_assignment" ]; then
-    environment+=("$shape_assignment")
+  elif [ -n "$grid_value" ] && [ "$GRID_CHANNEL" = "env" ]; then
+    environment+=("$SHAPE_ENV=$grid_value")
   fi
   if [ "$TARGET_RUNNER" = "pytest" ]; then
     (
@@ -1473,6 +1524,207 @@ PY
           "$TARGET_PYTHON" "$TEST_FILE" "${shape_cli[@]}"
     ) >"$log" 2>&1
   fi
+  local result=$?
+  echo "$result|$log"
+}
+
+# Decide whether the target can be timed at all, and with what arguments. A perf harness
+# cannot be inferred from the diff, only from the target's own text, and aiter carries three
+# conventions for it.
+perf_detect() {
+  local file="$REPO_WT/$TEST_FILE"
+  if [ ! -f "$file" ]; then
+    PERF_BASIS="the target file is not present in this checkout"
+    return 1
+  fi
+  local detected
+  detected=$(python3 - "$file" <<'PY'
+import pathlib
+import sys
+
+text = pathlib.Path(sys.argv[1]).read_text(errors="replace")
+if "--scenario" in text and "bench" in text:
+    print("--scenario bench")
+elif "perftest" in text or "@benchmark" in text:
+    # `perftest`, not `run_perftest`. aiter has three timing conventions and the bare
+    # `perftest` decorator is one of them; matching only the longer name misses 12 of the
+    # 123 targets in op_tests/, 11 of which have live `perftest` usage. Reporting those as
+    # "no benchmark entry point" reads as "there was nothing to measure" when the truth is
+    # that the detector was too narrow -- the failure mode this whole stage exists to avoid.
+    # This is a substring test, not a parse, so it also matches a commented-out import (the
+    # 12th target). That error is the safe one: the run finds no timing table and the stage
+    # reports `skip`, which is where it would have landed anyway.
+    print("")
+else:
+    raise SystemExit(3)
+PY
+  )
+  if [ $? -ne 0 ]; then
+    PERF_BASIS="the target exposes no benchmark entry point (no --scenario bench, no perftest/@benchmark harness)"
+    return 1
+  fi
+  PERF_ARGS="$detected"
+  if [ -n "$detected" ]; then
+    PERF_BASIS="target exposes --scenario bench"
+  else
+    PERF_BASIS="target uses the perftest/@benchmark harness"
+  fi
+  return 0
+}
+
+# The timing counterpart to run_pytest. Three things differ, and each difference is the point:
+#   * no probe module is injected. The receipt probe wraps every route call to record shapes;
+#     a traced kernel is not the kernel whose latency we are about to report.
+#   * the phase cache root is shared with that phase's correctness run, so the JIT cache is
+#     already warm and the table measures the kernel rather than a compile.
+#   * PERF_TIMEOUT is separate from TIMEOUT, because silently killing a legitimately long
+#     sweep would produce an empty log -- indistinguishable from "this target has no harness".
+# A bench harness routinely writes its results next to the code -- aiter targets drop a
+# tuned_op_bench.csv in the repo root. The baseline phase asserts a CLEAN worktree after the
+# base runs, so an artifact left by the timing run sets BASE_READY=0 and skips the entire head
+# correctness phase: measured, the same target went PASS with --no-perf and INCONCLUSIVE with
+# perf on, with head correctness never executed. A perf stage that silently disables
+# correctness validation is far worse than no perf stage, so the timing run has to leave the
+# worktree exactly as it found it.
+#
+# Scoped deliberately: only paths whose git status CHANGED across the timing run are touched.
+# Anything already dirty beforehand is somebody else's and is left alone.
+perf_snapshot() {
+  git -C "$REPO_WT" status --porcelain --untracked-files=all \
+    >"$WORK/perf-worktree-$1.txt" 2>/dev/null || : >"$WORK/perf-worktree-$1.txt"
+}
+
+perf_restore() {
+  local before="$WORK/perf-worktree-$1.txt"
+  [ -r "$before" ] || return 0
+  python3 - "$REPO_WT" "$before" <<'PY'
+import pathlib
+import shutil
+import subprocess
+import sys
+
+root = pathlib.Path(sys.argv[1]).resolve()
+
+
+def parse(text):
+    entries = {}
+    for line in text.splitlines():
+        if len(line) > 3:
+            entries[line[3:]] = line[:2]
+    return entries
+
+
+before = parse(pathlib.Path(sys.argv[2]).read_text(errors="replace"))
+current = parse(
+    subprocess.run(
+        ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=all"],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout
+)
+
+removed, reverted, skipped = [], [], []
+for path, code in current.items():
+    if before.get(path) == code:
+        continue
+    # git quotes paths with unusual characters. Un-quoting them correctly is fiddly and
+    # this code deletes files, so refuse to guess and report instead.
+    if path.startswith('"'):
+        skipped.append(path)
+        continue
+    target = root / path
+    try:
+        resolved = target.resolve()
+    except OSError:
+        skipped.append(path)
+        continue
+    if root != resolved and root not in resolved.parents:
+        skipped.append(path)
+        continue
+    if code == "??":
+        if resolved.is_dir() and not resolved.is_symlink():
+            shutil.rmtree(resolved, ignore_errors=True)
+        else:
+            try:
+                resolved.unlink()
+            except OSError:
+                skipped.append(path)
+                continue
+        removed.append(path)
+    else:
+        subprocess.run(
+            ["git", "-C", str(root), "checkout", "--", path],
+            capture_output=True,
+            check=False,
+        )
+        reverted.append(path)
+
+if removed or reverted or skipped:
+    print(
+        f"timing run artifacts cleaned: removed={removed} "
+        f"reverted={reverted} skipped={skipped}"
+    )
+PY
+}
+
+# Run one side PERF_REPEAT times. Results go to globals rather than a packed string because
+# the log list is variable-length and re-splitting it on the caller side is how paths with
+# awkward characters get mangled.
+PERF_RUN_LOGS=()
+PERF_RUN_RC=0
+run_perf_repeats() {
+  local phase="$1"
+  local index result rc
+  PERF_RUN_LOGS=()
+  PERF_RUN_RC=0
+  for ((index = 1; index <= PERF_REPEAT; index++)); do
+    result=$(run_perf "$phase-perf-$index")
+    rc=${result%%|*}
+    PERF_RUN_LOGS+=("${result##*|}")
+    # Any failed repeat poisons the side: the reduction takes a minimum, so one truncated
+    # run could contribute an impossibly fast sample and manufacture a regression on the
+    # other side. Report the failure instead.
+    if [ "$rc" -ne 0 ]; then
+      PERF_RUN_RC=$rc
+    fi
+  done
+}
+
+run_perf() {
+  local label="$1"
+  local log="$WORK/perf-$label.log"
+  local phase=${label%%-*}
+  local cache_root="$WORK/$phase"
+  mkdir -p "$cache_root/home" "$cache_root/xdg-cache" \
+    "$cache_root/flydsl-cache" "$cache_root/triton-cache" \
+    "$cache_root/torch-extensions" "$cache_root/aiter-jit"
+  local -a environment=(
+    "HIP_VISIBLE_DEVICES=$PICK"
+    "PYTHONPATH=$TEST_PYTHONPATH"
+    "PYTHONDONTWRITEBYTECODE=1"
+    "HOME=$cache_root/home"
+    "XDG_CACHE_HOME=$cache_root/xdg-cache"
+    "FLYDSL_CACHE_DIR=$cache_root/flydsl-cache"
+    "FLYDSL_RUNTIME_CACHE_DIR=$cache_root/flydsl-cache"
+    "TRITON_CACHE_DIR=$cache_root/triton-cache"
+    "TORCH_EXTENSIONS_DIR=$cache_root/torch-extensions"
+    "AITER_JIT_DIR=$cache_root/aiter-jit"
+    "VALIDATION_PHASE=$label"
+  )
+  local -a extra=()
+  local _old_ifs="$IFS"
+  IFS=' '
+  local _word
+  for _word in $PERF_ARGS; do
+    [ -n "$_word" ] && extra+=("$_word")
+  done
+  IFS="$_old_ifs"
+  (
+    cd "$REPO_WT" \
+      && env "${environment[@]}" timeout "$PERF_TIMEOUT" \
+        "$TARGET_PYTHON" "$TEST_FILE" "${extra[@]}"
+  ) >"$log" 2>&1
   local result=$?
   echo "$result|$log"
 }
@@ -1576,6 +1828,13 @@ fi
 
 CAN_TEST=1
 SKIP_REASON=""
+PERF_BASE_RC=""
+PERF_BASE_LOG=""
+PERF_BASE_LOGS=()
+PERF_HEAD_RC=""
+PERF_HEAD_LOG=""
+PERF_HEAD_LOGS=()
+PERF_SKIP_REASON=""
 if [ -z "$PICK" ] && [ "$GPU_REQUIREMENT" != "not-required" ]; then
   CAN_TEST=0
   SKIP_REASON="no verified-idle GPU was claimed"
@@ -1632,10 +1891,28 @@ else
       else
         BASE_REPO_STATE="target-not-present"
       fi
+      # Time the baseline HERE, inside the base phase. This is the only window in which the
+      # patch is reversed out on this worktree, and the same locked GPU is still held. A base
+      # number taken later, or on another box, or from the PR description, reintroduces
+      # exactly the variance a 0.95 threshold is too tight to absorb.
+      if [ "$PERF_ENABLED" -eq 1 ]; then
+        if [ "$BASE_REPO_STATE" = "target-not-present" ]; then
+          PERF_SKIP_REASON="the PR adds this target, so base has nothing to time against"
+        elif [ "$PERF_ARGS_SET" -eq 1 ] || perf_detect; then
+          perf_snapshot base
+          run_perf_repeats base
+          PERF_BASE_RC=$PERF_RUN_RC
+          PERF_BASE_LOGS=("${PERF_RUN_LOGS[@]}")
+          PERF_BASE_LOG="${PERF_BASE_LOGS[0]}"
+          perf_restore base
+        else
+          PERF_SKIP_REASON="$PERF_BASIS"
+        fi
+      fi
       if [ "$GRID_HOOK_OK" -eq 1 ]; then
         if [ -f "$REPO_WT/$TEST_FILE" ]; then
           BASE_PROBE_RESULT=$(run_pytest \
-            "base-grid-probe" "$SHAPE_ENV=__VALIDATOR_INVALID_GRID__")
+            "base-grid-probe" "__VALIDATOR_INVALID_GRID__")
           BASE_PROBE_RC=${BASE_PROBE_RESULT%%|*}
           BASE_PROBE_LOG=${BASE_PROBE_RESULT##*|}
           # A non-zero probe exit is only evidence that the GRID was consumed when the same
@@ -1645,7 +1922,7 @@ else
           if [ "$BASE_PROBE_RC" -eq 0 ] || [ "${BASE_REPO_RC:-1}" -ne 0 ]; then
             BASE_GRID_STATE="hook-not-consumed"
           else
-            BASE_GRID_RESULT=$(run_pytest "base-grid" "$SHAPE_ENV=$GRID")
+            BASE_GRID_RESULT=$(run_pytest "base-grid" "$GRID")
             BASE_GRID_RC=${BASE_GRID_RESULT%%|*}
             BASE_GRID_LOG=${BASE_GRID_RESULT##*|}
             BASE_GRID_STATS=$(target_stats "base-grid" "$BASE_GRID_RC")
@@ -1659,7 +1936,7 @@ else
         else
           BASE_GRID_STATE="target-not-present"
         fi
-      elif [ -n "$SHAPE_ENV" ] && [ -n "$GRID" ]; then
+      elif [ -n "$GRID" ]; then
         BASE_GRID_STATE="hook-not-found"
       else
         BASE_GRID_STATE="not-configured"
@@ -1783,26 +2060,41 @@ PY
       fi
     fi
 
+    # Head's timing run pairs with the base one and is skipped outright when base produced
+    # nothing: a head-only number reproduces the PR's own comparison and cannot show a
+    # regression, which is the single thing this stage is for.
+    if [ "$PERF_ENABLED" -eq 1 ] && [ -n "$PERF_BASE_LOG" ]; then
+      perf_snapshot head
+      run_perf_repeats head
+      PERF_HEAD_RC=$PERF_RUN_RC
+      PERF_HEAD_LOGS=("${PERF_RUN_LOGS[@]}")
+      PERF_HEAD_LOG="${PERF_HEAD_LOGS[0]}"
+      # Symmetric with base: the grid run and the caller's worktree both follow this point,
+      # and neither should inherit a results file the timing run happened to drop.
+      perf_restore head
+    fi
+
+
     # Same causality requirement as the base side: a probe that fails because the target
     # is broken proves nothing about the grid. On a held-out PR whose module could not be
     # imported at all, the probe's non-zero exit credited the channel although no shape
     # ever reached the kernel. Require the unpoisoned head run to have passed first.
     if [ "$GRID_HOOK_OK" -eq 1 ] && [ "${HEAD_RC:-1}" -eq 0 ]; then
       HEAD_PROBE_RESULT=$(run_pytest \
-        "head-grid-probe" "$SHAPE_ENV=__VALIDATOR_INVALID_GRID__")
+        "head-grid-probe" "__VALIDATOR_INVALID_GRID__")
       HEAD_PROBE_RC=${HEAD_PROBE_RESULT%%|*}
       HEAD_PROBE_LOG=${HEAD_PROBE_RESULT##*|}
       if [ "$HEAD_PROBE_RC" -eq 0 ]; then
         stage_note "correctness_s1_grid" "skip" \
-          "target ignores the shape environment variable at runtime"
+          "target ignores $GRID_CHANNEL at runtime"
         stage_note "execution_receipt" "skip" \
-          "shape environment runtime handshake failed"
+          "shape-grid runtime handshake failed on $GRID_CHANNEL"
         jset_json "stages.correctness_s1_grid.hook_probe_exit" "$HEAD_PROBE_RC"
         jset_string "stages.correctness_s1_grid.hook_probe_log" "$HEAD_PROBE_LOG"
         finding "note" "correctness" \
           "the selected target passes an invalid shape-grid probe, so grid consumption is unproven"
       else
-        HEAD_GRID_RESULT=$(run_pytest "head-grid" "$SHAPE_ENV=$GRID")
+        HEAD_GRID_RESULT=$(run_pytest "head-grid" "$GRID")
         HEAD_GRID_RC=${HEAD_GRID_RESULT%%|*}
         HEAD_GRID_LOG=${HEAD_GRID_RESULT##*|}
         HEAD_GRID_STATS=$(target_stats "head-grid" "$HEAD_GRID_RC")
@@ -1989,6 +2281,120 @@ PY
       finding "note" "index_width_scan" \
         "$SCAN_COUNT index/stride candidates carry no explicit 64-bit widening; review each against production scale"
     fi
+  fi
+fi
+
+# ---- perf stage.
+#
+# Emitted last because it is the only stage needing results from both the baseline phase and
+# the head phase. It is deliberately NOT in finish_report's required-stage set: `complete` is
+# computed from the nine correctness stages, so a perf run that could not happen downgrades
+# nothing and a PASS stays a PASS. What it can do is append a should-fix finding, which
+# finish_report turns into NEEDS_WORK and exit 1 -- a measured regression is a real result,
+# not an advisory note, and the whole point of putting it in the deterministic layer is that
+# it ships its own reproducer (both logs, both exit codes, the command) with it.
+#
+# Every path that is not "both sides ran clean and the numbers disagree" reports `skip`.
+# A timeout, a crash, a missing harness and a one-row table must never be able to look like
+# a regression, because a false regression here blocks a good PR and would get the stage
+# switched off within a week.
+if [ "$PERF_ENABLED" -ne 1 ]; then
+  stage_note "perf" "skip" "perf measurement was disabled with --no-perf"
+elif [ -n "$PERF_SKIP_REASON" ]; then
+  stage_note "perf" "skip" "$PERF_SKIP_REASON"
+  finding "note" "perf" \
+    "no base-vs-head timing was taken: $PERF_SKIP_REASON"
+elif [ -z "$PERF_BASE_LOG" ] || [ -z "$PERF_HEAD_LOG" ]; then
+  PERF_WHY="the run did not reach both a baseline and a head phase"
+  [ "$CAN_TEST" -eq 0 ] && PERF_WHY="${SKIP_REASON:-$PERF_WHY}"
+  stage_note "perf" "skip" "$PERF_WHY"
+  finding "note" "perf" "no base-vs-head timing was taken: $PERF_WHY"
+elif [ "$PERF_BASE_RC" -ne 0 ] || [ "$PERF_HEAD_RC" -ne 0 ]; then
+  # Deliberately not a regression. A nonzero exit means the log is truncated at an unknown
+  # point, so any ratio drawn from it compares whatever happened to print before the crash.
+  PERF_WHY="benchmark run exited nonzero (base=$PERF_BASE_RC head=$PERF_HEAD_RC); timings from a truncated run are not comparable"
+  stage_note "perf" "skip" "$PERF_WHY"
+  jset_string "stages.perf.base_log" "$PERF_BASE_LOG"
+  jset_string "stages.perf.head_log" "$PERF_HEAD_LOG"
+  finding "note" "perf" "$PERF_WHY"
+else
+  PERF_JSON="$WORK/perf-compare.json"
+  "$SCRIPT_DIR/scrape_perf.py" \
+    --base "${PERF_BASE_LOGS[@]}" --head "${PERF_HEAD_LOGS[@]}" \
+    --threshold "$PERF_THRESHOLD" --min-rows "$PERF_MIN_ROWS" \
+    --out "$PERF_JSON" >/dev/null 2>"$WORK/perf-compare.err"
+  PERF_CMP_RC=$?
+  if [ "$PERF_CMP_RC" -ne 0 ] || [ ! -r "$PERF_JSON" ]; then
+    stage_note "perf" "skip" \
+      "the benchmark comparison failed: $(log_excerpt "$WORK/perf-compare.err")"
+    finding "note" "perf" \
+      "base and head both produced benchmark logs, but they could not be compared"
+  else
+    python3 - "$JSON" "$PERF_JSON" "$PERF_BASE_LOG" "$PERF_HEAD_LOG" \
+      "$BASE_SHA" "$PERF_ARGS" "$PERF_BASIS" <<'PY'
+import json
+import sys
+
+report_path, compare_path, base_log, head_log, base_sha, command, basis = sys.argv[1:8]
+data = json.load(open(report_path))
+result = json.load(open(compare_path))
+
+stage = {
+    "status": {"regression": "fail", "ok": "pass"}.get(result["status"], "skip"),
+    "baseline": f"{base_sha} with the candidate patch reversed, same worktree and GPU",
+    "command": command or "(target's default entry point)",
+    "harness": basis,
+    "threshold": result.get("threshold"),
+    "matched_rows": result.get("matched_rows", 0),
+    "columns": result.get("columns", {}),
+    # Repeat count is part of the claim, not trivia: the threshold is only defensible
+    # because each cell is a best-of-N, so a reader has to be able to see N.
+    "repeats": {
+        "base": result.get("base_runs", 1),
+        "head": result.get("head_runs", 1),
+        "reduction": "best sample per cell (min latency / max throughput)",
+    },
+    "base_log": base_log,
+    "head_log": head_log,
+    "note": result.get("reason") or "",
+}
+# median_ratio is omitted, never nulled, when there is no measurement: report_schema.json
+# types it as a number, and a null would fail validation at review-pr's identity gate --
+# turning "we could not measure" into "this report is malformed".
+if result.get("median_ratio") is not None:
+    stage["median_ratio"] = result["median_ratio"]
+if result.get("worst_column"):
+    stage["worst_column"] = result["worst_column"]
+if result.get("regressed_rows"):
+    stage["regressed_rows"] = result["regressed_rows"]
+data["stages"]["perf"] = stage
+
+if result["status"] == "regression":
+    rows = ", ".join(
+        f"{row['row']}: {row['base']:g} -> {row['head']:g}"
+        for row in result.get("regressed_rows", [])[:3]
+    )
+    data["findings"].append(
+        {
+            "severity": "should-fix",
+            "stage": "perf",
+            "detail": (
+                "head is slower than base on the same locked GPU -- "
+                + result["reason"]
+                + (f"; worst rows: {rows}" if rows else "")
+            ),
+        }
+    )
+elif result["status"] == "insufficient":
+    data["findings"].append(
+        {
+            "severity": "note",
+            "stage": "perf",
+            "detail": f"no perf comparison was made: {result['reason']}",
+        }
+    )
+json.dump(data, open(report_path, "w"), indent=2)
+PY
   fi
 fi
 

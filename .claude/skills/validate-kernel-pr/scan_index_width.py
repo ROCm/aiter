@@ -62,7 +62,7 @@ WIDEN_ATTRS = {"int64", "int64_t", "long"}
 
 def _is_widen_name(name):
     return name.lower() in WIDEN_ATTRS
-WIDEN_CALL_RE = re.compile(r"\bint64\b|\bint64_t\b|\bstatic_cast<\s*int64_t")
+
 
 HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 INDEX_RE = re.compile(r"^index ([0-9a-f]+)\.\.([0-9a-f]+)")
@@ -73,7 +73,7 @@ PY_EXT = (".py",)
 class FileDiff:
     def __init__(self, path):
         self.path = path
-        self.added_lines = set()   # line numbers in the POST image
+        self.added_lines = set()  # line numbers in the POST image
         self.post_blob = None
         self.is_new = False
         self.new_text_from_diff = []
@@ -157,7 +157,8 @@ def read_post_image(fd, source_root):
     if fd.post_blob:
         result = subprocess.run(
             ["git", "cat-file", "-p", fd.post_blob],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         if result.returncode == 0:
             return result.stdout, None
@@ -277,7 +278,9 @@ class KernelScopeScanner(ast.NodeVisitor):
         scanned and reported separately rather than dropped, and the reviewer sees both lists.
         """
         for arg in (
-            list(node.args.posonlyargs) + list(node.args.args) + list(node.args.kwonlyargs)
+            list(node.args.posonlyargs)
+            + list(node.args.args)
+            + list(node.args.kwonlyargs)
         ):
             if KernelScopeScanner._is_constexpr(getattr(arg, "annotation", None)):
                 return True
@@ -303,7 +306,9 @@ class KernelScopeScanner(ast.NodeVisitor):
             params.append(args.kwarg)
 
         runtime_params = {
-            a.arg for a in params if not self._is_constexpr(getattr(a, "annotation", None))
+            a.arg
+            for a in params
+            if not self._is_constexpr(getattr(a, "annotation", None))
         }
         constexpr_params = {
             a.arg for a in params if self._is_constexpr(getattr(a, "annotation", None))
@@ -321,7 +326,9 @@ class KernelScopeScanner(ast.NodeVisitor):
         outer_constexpr = set(getattr(self, "_enclosing_constexpr", set()))
         outer_widened = set(getattr(self, "_enclosing_widened", set()))
         self._scope = (
-            "device" if (outer_scope == "device" or self._device_scope(node)) else "host"
+            "device"
+            if (outer_scope == "device" or self._device_scope(node))
+            else "host"
         )
         # A nested helper closes over the enclosing kernel's parameters, so provenance and
         # widening both follow the scope chain.
@@ -392,6 +399,16 @@ class KernelScopeScanner(ast.NodeVisitor):
 
     def _scan_body(self, func, runtime_params, constexpr_params, widened_locals):
         for sub in self._own_nodes(func):
+            # `a_ptrs += BLOCK_K * stride_ak` builds the same address as
+            # `a_ptrs = a_ptrs + BLOCK_K * stride_ak`, but an AugAssign is not a BinOp, so
+            # matching only BinOp(Add) left the standard Triton pointer-advance idiom
+            # unscanned. The constexpr filter in _is_compile_time was written for exactly
+            # this shape and could never reach it.
+            if isinstance(sub, ast.AugAssign) and isinstance(sub.op, ast.Add):
+                self._check_mult(
+                    sub.value, runtime_params, constexpr_params, widened_locals
+                )
+                continue
             if not isinstance(sub, ast.BinOp) or not isinstance(sub.op, ast.Add):
                 continue
             # Each addend of an address-building chain.
@@ -468,7 +485,9 @@ def get_diff(args):
             return handle.read()
     result = subprocess.run(
         ["gh", "pr", "diff", args.pr, "--repo", args.repo],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     )
     return result.stdout
 
@@ -533,7 +552,13 @@ def main():
     }
     if args.json:
         print(json.dumps(payload))
-        return 0 if not unscanned else 0
+        # Always 0: an unscanned file is reported in the `unscanned` field, and a --json
+        # caller is expected to read it. Turning it into a non-zero exit would be the
+        # honest signal for the plain-text caller, which has nothing but the exit status --
+        # but validate_pr.sh reads this JSON and does not inspect `unscanned` yet, so
+        # raising here would only convert a silent gap into a skipped stage. Wire
+        # --source-root and an `unscanned` check into validate_pr.sh first.
+        return 0
 
     # Per-file rollup first. A reviewer clears index arithmetic a file at a time, and a PR
     # that adds a generated kernel family can carry a hundred distinct sites in one file;

@@ -126,9 +126,7 @@ def sample(amdsmi, count: int, interval: float) -> tuple[list[dict], int]:
                 "used_gib": used,
                 "free_gib": total - used,
                 "peak_gfx": max(gpu["gfx"]) if gpu["gfx"] else None,
-                "mean_gfx": (
-                    sum(gpu["gfx"]) / len(gpu["gfx"]) if gpu["gfx"] else None
-                ),
+                "mean_gfx": (sum(gpu["gfx"]) / len(gpu["gfx"]) if gpu["gfx"] else None),
                 "peak_umc": max(gpu["umc"]) if gpu["umc"] else None,
             }
         )
