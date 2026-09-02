@@ -282,7 +282,13 @@ def kernel_unified_attention_2d(
         v_descale = None
     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
 
-    if USE_PREFILL_FAST_PATH and SLIDING_WINDOW <= 0 and not ALL_DECODE:
+    if (
+        USE_PREFILL_FAST_PATH
+        and HEAD_SIZE == 128
+        and SLIDING_WINDOW <= 0
+        and not ALL_DECODE
+        and not SHUFFLED_KV_CACHE
+    ):
         min_query_key_limit = context_len + q_block_local_idx * BLOCK_Q + 1
         unmasked_tile_end = tl.minimum(min_query_key_limit // TILE_SIZE, tile_end)
         unmasked_tile_end = tl.maximum(unmasked_tile_end, tile_start)
