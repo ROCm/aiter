@@ -197,3 +197,140 @@ def make_fused_a2a_jit(
         )
 
     return launch
+
+
+def make_fused_a2a_out_kernel(
+    *, rank, npes, heads_local, seq_local, head_dim, block_num, warp_num_per_block
+):
+    row_nbytes = head_dim * 2
+    seq_full = seq_local * npes
+    chunks_per_row = row_nbytes // 16
+    peer_chunks = seq_local * heads_local * chunks_per_row
+    total_chunks = npes * peer_chunks
+    shared_storage = fx.struct(
+        type(
+            "_OutSharedStorage",
+            (),
+            {"__annotations__": {"p2p_bases": fx.Array[fx.Int64, npes, 16]}},
+        )
+    )
+
+    @flyc.kernel(known_block_size=[warp_num_per_block * 64, 1, 1])
+    def fused_a2a_out_push(
+        addr_input: fx.Int64,
+        addr_p2p_output: fx.Int64,
+        addr_xdb_mem: fx.Int64,
+        addr_p2p_xdb_mem: fx.Int64,
+        addr_xdb_flag: fx.Int64,
+        addr_grid_barrier: fx.Int64,
+    ):
+        tid = fx.thread_idx.x
+        bid = fx.block_idx.x
+        lane = tid & 63
+        warp = tid >> 6
+        global_warp_id = bid * warp_num_per_block + warp
+        global_warp_num = block_num * warp_num_per_block
+        grid_thread_id = bid * (warp_num_per_block * 64) + tid
+
+        rsrc_p2p_output = create_buffer_resource_from_addr(addr_p2p_output)
+        rsrc_p2p_xdb = create_buffer_resource_from_addr(addr_p2p_xdb_mem)
+        rsrc_xdb_flag = create_buffer_resource_from_addr(addr_xdb_flag)
+        rsrc_grid_barrier = create_buffer_resource_from_addr(addr_grid_barrier)
+
+        shared = fx.SharedAllocator().allocate(shared_storage).peek()
+        p2p_bases = shared.p2p_bases.view(fx.make_layout(npes, 1))
+        if lane < npes:
+            peer_base = buffer_load(rsrc_p2p_output, lane, vec_width=1, dtype=T.i64)
+            fx.memref_store(peer_base, p2p_bases, lane)
+        fx.barrier()
+
+        rsrc_input = create_buffer_resource_from_addr(addr_input)
+        for chunk_idx in range(global_warp_id, total_chunks, global_warp_num):
+            dest_pe = chunk_idx // peer_chunks
+            dest_chunk = chunk_idx % peer_chunks
+            seq = dest_chunk // (heads_local * chunks_per_row)
+            head_chunk = dest_chunk % (heads_local * chunks_per_row)
+            local_head = head_chunk // chunks_per_row
+            row_chunk = head_chunk % chunks_per_row
+            src_row = local_head * seq_full + dest_pe * seq_local + seq
+            src_offset = src_row * chunks_per_row * 4 + row_chunk * 4
+            value = buffer_load(rsrc_input, src_offset, vec_width=4, dtype=T.i32)
+            peer_base = fx.memref_load(p2p_bases, dest_pe)
+            dst_addr = peer_base + fx.Int64(rank * peer_chunks * 16 + dest_chunk * 16)
+            buffer_store(value, create_buffer_resource_from_addr(dst_addr), 0)
+
+        fx.barrier()
+        if tid == 0:
+            atomic_add_global_at(addr_grid_barrier, 1)
+
+        xdb_cur_flag = buffer_load(rsrc_xdb_flag, 0, vec_width=1, dtype=T.i64)
+        if grid_thread_id < npes:
+            mori_shmem.int32_wait_until_equals(addr_grid_barrier, block_num)
+            fence_system_acquire()
+            buffer_store(fx.Int32(0), rsrc_grid_barrier, 0)
+            xdb_remote_addr = (
+                buffer_load(rsrc_p2p_xdb, grid_thread_id, vec_width=1, dtype=T.i64)
+                + fx.Int64(rank) * 8
+            )
+            store_i64_global_system(xdb_remote_addr, xdb_cur_flag)
+
+        if grid_thread_id == 0:
+            atomic_add_global_at(addr_xdb_flag, fx.Int64(1))
+
+        if tid < npes:
+            peer_slot = addr_xdb_mem + fx.Int64(tid) * 8
+            mori_shmem.uint64_wait_until_equals(peer_slot, xdb_cur_flag)
+            fence_system_acquire()
+        fx.barrier()
+
+    return fused_a2a_out_push
+
+
+def make_fused_a2a_out_jit(
+    *, rank, npes, heads_local, seq_local, head_dim, block_num, warp_num_per_block
+):
+    kernel = make_fused_a2a_out_kernel(
+        rank=rank,
+        npes=npes,
+        heads_local=heads_local,
+        seq_local=seq_local,
+        head_dim=head_dim,
+        block_num=block_num,
+        warp_num_per_block=warp_num_per_block,
+    )
+    key = (
+        rank,
+        npes,
+        heads_local,
+        seq_local,
+        head_dim,
+        block_num,
+        warp_num_per_block,
+        "v1-fused-out-hop",
+    )
+
+    @flyc.jit
+    def launch(
+        addr_input: fx.Int64,
+        addr_p2p_output: fx.Int64,
+        addr_xdb_mem: fx.Int64,
+        addr_p2p_xdb_mem: fx.Int64,
+        addr_xdb_flag: fx.Int64,
+        addr_grid_barrier: fx.Int64,
+        stream: Stream = Stream(None),  # noqa: B008
+    ):
+        _ = key
+        kernel(
+            addr_input,
+            addr_p2p_output,
+            addr_xdb_mem,
+            addr_p2p_xdb_mem,
+            addr_xdb_flag,
+            addr_grid_barrier,
+        ).launch(
+            grid=(block_num, 1, 1),
+            block=(warp_num_per_block * 64, 1, 1),
+            stream=stream,
+        )
+
+    return launch

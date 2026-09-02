@@ -14,7 +14,10 @@ import torch.distributed._functional_collectives as funcol
 import torch.multiprocessing as mp
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.ops.flydsl.kernels.fused_a2a_intranode_op import FusedA2AIntraNodeOp
+from aiter.ops.flydsl.kernels.fused_a2a_intranode_op import (
+    FusedA2AIntraNodeOp,
+    FusedA2AOutIntraNodeOp,
+)
 
 _WORLD_SIZE = 8
 _CASES = (
@@ -96,10 +99,36 @@ def _run_rank(rank, world_size, port):
                         f"{case_name} {tensor_name} rank {rank}: got "
                         f"{tuple(actual.shape)}, expected {expected_shape}"
                     )
+            out_input = references[0].contiguous()
+            out_packed = out_input.permute(2, 0, 1, 3).contiguous()
+            out_reference = funcol.wait_tensor(
+                funcol.all_to_all_single(
+                    out_packed.view(-1), None, None, dist.group.WORLD
+                )
+            ).view(1, seq_len, heads, head_dim)
+            out_op = FusedA2AOutIntraNodeOp(
+                rank=rank,
+                world_size=world_size,
+                shape=out_input.shape,
+                dtype=out_input.dtype,
+            )
+            out_actual = out_op(out_input).view(out_reference.shape)
+            torch.cuda.synchronize()
+            if not torch.equal(out_actual, out_reference):
+                mismatch = torch.nonzero(out_actual != out_reference, as_tuple=False)[
+                    0
+                ].flatten()
+                raise AssertionError(
+                    f"{case_name} out rank {rank}: byte mismatch at index "
+                    f"{mismatch.tolist()}: actual={out_actual[tuple(mismatch)].item()} "
+                    f"reference={out_reference[tuple(mismatch)].item()}"
+                )
+
             dist.barrier()
             if rank == 0:
                 print(
-                    f"PASS {case_name}: input={tuple(input_tensor.shape)} output={expected_shape}"
+                    f"PASS {case_name}: in={tuple(input_tensor.shape)} "
+                    f"gathered={expected_shape} out={tuple(out_reference.shape)}"
                 )
     finally:
         try:
