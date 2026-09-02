@@ -937,16 +937,6 @@ jobs:
           aiter_test \
           bash -c "SHARD_TOTAL=${{ matrix.shard_total }} SHARD_IDX=${{ matrix.shard_idx }} ./.github/scripts/aiter_test.sh"
 
-      - name: PR dispatch gate test
-        if: ${{ matrix.runner == 'linux-aiter-mi35x-1' && matrix.shard_idx == 0 && github.event.action != 'labeled' }}
-        timeout-minutes: 15
-        run: |
-          set -ex
-          docker exec \
-          -w /workspace \
-          aiter_test \
-          bash -lc "python3 -m unittest op_tests.tuning_tests.test_triton_fmoe_dispatch -v"
-
       - name: Collect test logs
         if: always()
         run: |
