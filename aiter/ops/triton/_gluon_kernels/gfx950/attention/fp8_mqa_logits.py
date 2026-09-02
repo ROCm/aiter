@@ -609,9 +609,8 @@ def _emit_row_logits(
             else:
                 _store_logits_block(logits_ptr, store_offsets, scores, USE_BUFFER_STORE)
         elif RELAXED_STORE:
-            # Out-of-window positions are unspecified (clean_logits=False), so
-            # the per-row window mask goes and this is the single-row path. The
-            # union bound stays -- it is what keeps the store inside the row.
+            # Out-of-window positions are unspecified (clean_logits=False),
+            # The union bound stays, it is what keeps the store inside the row.
             if MASKED:
                 _store_logits_block(
                     logits_ptr + r * stride_logits_s,
@@ -937,12 +936,6 @@ def _gluon_fp8_mqa_logits_kernel(
         # rows when seq_len is not a multiple of BLOCK_M
         row_id = gl.minimum(block_id * BLOCK_M, seq_len - BLOCK_M)
 
-    # Every row stride here feeds a base *pointer*, never a buffer offset, so
-    # all of them are promoted: in i32 elements they wrap at 2**31. Each buffer
-    # descriptor is then rebuilt from such a base, which leaves its i32 offset
-    # spanning one tile -- one KV tile, one query row -- rather than the whole
-    # tensor. That, not the tensor size, is what the 2 GiB buffer window has to
-    # cover, which is why USE_BUFFER_LOAD/STORE hold at any size.
     stride_q_s = stride_q_s.to(gl.int64)
     stride_w_s = stride_w_s.to(gl.int64)
     stride_logits_s = stride_logits_s.to(gl.int64)

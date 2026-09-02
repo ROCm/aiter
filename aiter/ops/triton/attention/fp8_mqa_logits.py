@@ -203,62 +203,31 @@ def fp8_mqa_logits(
         use_buffer_load = KV.numel() * KV.element_size() < BUFFER_LIMIT_BYTES
         use_buffer_store = logits.numel() * logits.element_size() < BUFFER_LIMIT_BYTES
         if arch == "gfx950":
-            # This kernel never spans a tensor with one descriptor: it rebuilds
-            # every descriptor from an i64 base pointer that already has the
-            # row and the tile baked in, so the i32 offset only covers one KV
-            # tile or one query row. Nothing here scales with the tensor, so
-            # the 2 GiB window cannot be reached and both flags hold at any
-            # size. That also keeps BLOCK_M=2 available everywhere: a masked
-            # *global* store lowers to a branch, and two of them per KV tile
-            # trip an assert in LLVM's SIInsertWaitcnts.
+            # Buffer store/load issues are resolved via changing pointer arithmetic
+            # so offsets are localized on a shifted pointer
             use_buffer_load = True
             use_buffer_store = True
             num_buffers = 2
             loop_variant = 0
-            # Tuned on gfx950. The kernel is VALU bound, not MFMA bound -- the
-            # per-head relu + weighted sum dominates -- so these pick the
-            # lowest register pressure rather than the highest occupancy.
-            # waves_per_eu is the VGPR budget (512/waves): 3 gives the ~168
-            # the tile below wants; 4 caps it at 128 and spills hard (measured
-            # on glm5.2 4x8kx8k: 612 us at 3, 1106 us at 4).
             waves_per_eu = 3
             num_warps = 2
             block_kv = 64
-            # 2 rows of Q at 64 heads is 64 VGPRs, which only fits at 2
-            # waves/SIMD, so BLOCK_M=2 is a <=32-head option.
             block_m = 2 if (num_heads <= 32 and seq_len > 4096) else 1
-            # A one-wave workgroup emits no s_barrier. At num_warps=2 the
-            # async copy hands warp w the odd/even KV columns while the MFMA
-            # layout has it consume a contiguous half, so they alias and every
-            # tile costs two barriers -- 8.9% of wave time, 100% stall, per an
-            # ATT capture. Halving BLOCK_KV keeps the per-wave work identical.
-            # The cost is half as many waves, so it only pays past one
-            # occupancy round: 0.98x at seq_len 4096, 1.02-1.06x from 8192 up.
+            # Single warp to save barrier cycles
             if block_m == 1 and seq_len > 4096:
                 num_warps = 1
                 block_kv = 32
             # 32x32x64 over 16x16x128: its output layout leaves only one head
-            # bit in lanes, so the head sum needs one cross-lane step instead of
-            # two. Needs num_heads >= 32 and BLOCK_KV / num_warps >= 32.
+            # bit in lanes, so the head sum needs one cross-lane step
             mfma_nonk_dim = 32 if (head_size <= 64 or num_heads >= 32) else 16
-            # Fold one head chunk at a time so only that chunk's accumulators
-            # are live; without it the wider 32x32 tile spills and loses more
-            # than the layout gains. BLOCK_M=2 loads its second row unchunked.
+            # Fold one head chunk at a time to lower reg. pressure
             m_chunk = (
                 mfma_nonk_dim
                 if (num_heads > mfma_nonk_dim and block_m == 1 and mfma_nonk_dim == 32)
                 else 0
             )
-            # BLOCK_M=1 wants one chain; a second only costs live registers
-            # (glm5.2 1x4kx4k 55.7 -> 53.8 us, dsv4 4x8kx8k 1143 -> 1039 us).
-            # BLOCK_M=2 needs two -- with one the scheduler spills instead
-            # (57 vs 2 slots, 748 vs 605 us on glm5.2 4x8kx8k).
             num_chains = (2 if block_m == 2 else 1) if USE_FOLDED_REDUCTION else 0
-            # BLOCK_M=2 walks the union of both rows' KV ranges, so each store
-            # is masked to the part its row owns -- 14 VALU + 8 SALU per two
-            # tiles. clean_logits=False already makes out-of-window positions
-            # unspecified, so there the mask protects nothing: 1.05x at 32
-            # q-heads. Off for clean_logits=True, which needs the -inf prefill.
+            # relax the store masking if we dont have to provide clean logits
             relaxed_store = 0 if clean_logits else 1
             other = {
                 "USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED,
