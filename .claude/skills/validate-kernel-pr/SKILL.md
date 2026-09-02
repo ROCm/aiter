@@ -79,6 +79,7 @@ For a local candidate with no remote head, omit `--head-sha`. The report then re
 | `--shape-arg` | the target's own CLI flag that accepts shapes, for script targets that read no env var |
 | `--shape-argnames` | the pytest parameter names the grid should replace, for targets whose shapes are literals inside `@pytest.mark.parametrize` |
 | `--axis` | repeatable `NAME=FLAG:v1;v2;…` — an extra independent test axis on its own CLI flag (see [`axes`](#axes-when-the-failing-configuration-is-not-a-shape)) |
+| `--runner` | force `pytest` or `script` when the structural classifier gets it wrong; the report records both the forced choice and what selection had said |
 | `--perf-control-column` | a timing column the patch does not touch; required before a transplanted baseline is believed (see [`perf`](#8--perf)) |
 | `--tol-table` | reference tolerances recorded alongside the head-vs-base comparison (see [`test_policy`](#4--test_policy--run-before-the-suite)) |
 | `--perf-args` | benchmark entry point for the timing stage; also forces perf on when detection would decline |
@@ -376,6 +377,20 @@ cells a subset of the target's defaults a receipt written by *either* run satisf
 — which made the grid's own evidence unfalsifiable. Each run now writes
 `execution-receipt-<label>.json`, the stage reads the grid run's own file when a grid ran,
 and `execution_receipt.receipt_scope` names which run the published receipt describes.
+
+**A route is resolved to a code object, not matched as a string.** A frame's identity is
+`f_globals["__name__"] + ":" + f_code.co_name`, which stops being the declared route the
+moment the function is wrapped: `functools.wraps` copies `__name__` onto the wrapper object
+and leaves `co_name` alone, so aiter's entire `@compile_ops` family executes as
+`aiter.jit.core:wrapper` and naming the op a reviewer cares about matched nothing. The probe
+imports the declared module, resolves the attribute, walks its `__wrapped__` chain and matches
+on the resulting code objects; the string match remains as a fallback, so a route into a module
+that cannot be imported behaves exactly as before.
+
+**Shape capture still needs the route's own frame to bind the shape locals.** A dispatch
+wrapper declared `(*args, **kwargs)` binds none of them, so a route through one attests
+execution and nothing about shapes; the receipt then says *"missing required shapes"* rather
+than passing. Naming a route whose frame does carry the shape names is the caller's move.
 
 **A route is not a variant.** The receipt records that
 `…mqa_logits.fp8_mqa_logits:flydsl_fp8_mqa_logits` was entered and with which shape-locals.

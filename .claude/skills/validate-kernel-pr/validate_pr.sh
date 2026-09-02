@@ -36,6 +36,10 @@ SHAPE_ARGNAMES=""
 # be gridded over them at all, so entire failing configurations were unreachable however the
 # grid was spelled. On ROCm/aiter#4538 that is `--num-heads`, whose default is `64 128`, and
 # the public API asserts at num_heads=16 in a configuration the validator could not request.
+# Force the runner instead of inferring it. The classifier is structural and can be
+# wrong in both directions; when it is, a caller who can see the target should be able
+# to say so rather than having a runner-selection artefact charged to the PR author.
+RUNNER_OVERRIDE=""
 AXES=()
 AXIS_CLI=()
 AXIS_CLI_OVERRIDE=()
@@ -99,6 +103,7 @@ while [ "$#" -gt 0 ]; do
     --shape-arg) need_value "$@"; SHAPE_ARG="$2"; shift 2;;
     --shape-argnames) need_value "$@"; SHAPE_ARGNAMES="$2"; shift 2;;
     --axis) need_value "$@"; AXES+=("$2"); shift 2;;
+    --runner) need_value "$@"; RUNNER_OVERRIDE="$2"; shift 2;;
     --tol-table) need_value "$@"; TOL_TABLE="$2"; shift 2;;
     --label) need_value "$@"; LABEL="$2"; shift 2;;
     --out) need_value "$@"; OUT="$2"; shift 2;;
@@ -1047,14 +1052,55 @@ else:
     except (OSError, SyntaxError) as error:
         result = {"runner": "none", "reason": f"target AST is not readable: {error}"}
     else:
-        has_pytest = any(
-            (
-                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and node.name.startswith("test")
-            )
-            or (isinstance(node, ast.ClassDef) and node.name.startswith("Test"))
+        # "Defines a test* function" is not the same as "pytest can collect it". aiter's
+        # dominant op_tests convention is a SCRIPT whose worker happens to be named
+        # `test_<op>(m, d, dtype)` and is called from `main()` with real arguments. pytest
+        # collects it, cannot supply the parameters, and errors -- and the validator then
+        # published "the PR adds this test target and it fails on head" against the author,
+        # on a target that is green run as a script with the very shapes the run requested.
+        # Observed on ROCm/aiter#5081 and, in its argv-parsing variant, on ROCm/aiter#5172.
+        def decorator_names(node):
+            names = []
+            for decorator in node.decorator_list:
+                current = decorator.func if isinstance(decorator, ast.Call) else decorator
+                parts = []
+                while isinstance(current, ast.Attribute):
+                    parts.append(current.attr)
+                    current = current.value
+                if isinstance(current, ast.Name):
+                    parts.append(current.id)
+                names.append(".".join(reversed(parts)))
+            return names
+
+        def collectable(node):
+            if any(
+                "parametrize" in name or "fixture" in name or "usefixtures" in name
+                for name in decorator_names(node)
+            ):
+                return True
+            spec = node.args
+            required = [*spec.posonlyargs, *spec.args]
+            defaults = spec.defaults or []
+            if defaults:
+                required = required[: len(required) - len(defaults)]
+            # A required positional parameter can still be a fixture, but a fixture the
+            # module itself does not define and does not import is not one pytest will find
+            # in a bare op_tests file. Being conservative in the other direction -- calling
+            # such a target collectable -- is what produced the false blocker.
+            return not required
+
+        pytest_nodes = [
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name.startswith("test")
+        ]
+        has_test_class = any(
+            isinstance(node, ast.ClassDef) and node.name.startswith("Test")
             for node in tree.body
         )
+        has_pytest = has_test_class or any(collectable(node) for node in pytest_nodes)
+        uncollectable_only = bool(pytest_nodes) and not has_pytest
         has_main = any(
             isinstance(node, ast.If)
             and isinstance(node.test, ast.Compare)
@@ -1090,7 +1136,22 @@ else:
                     "of the runner selection, not necessarily of the code under test"
                 )
         elif has_main:
-            result = {"runner": "script", "reason": "target has a __main__ entry point"}
+            reason = "target has a __main__ entry point"
+            if uncollectable_only:
+                reason += (
+                    "; its test* functions take required positional parameters and carry no"
+                    " parametrize/fixture decorator, so pytest cannot collect them"
+                )
+            result = {"runner": "script", "reason": reason}
+        elif uncollectable_only:
+            result = {
+                "runner": "none",
+                "reason": (
+                    "target's only test* functions take required positional parameters with"
+                    " no parametrize/fixture decorator, and it has no __main__ entry point,"
+                    " so neither runner can execute it"
+                ),
+            }
         else:
             result = {"runner": "none", "reason": "target has no pytest nodes or __main__ entry point"}
 print(json.dumps(result))
@@ -1111,6 +1172,18 @@ print(json.loads(sys.argv[1])["reason"])
 PY
 )
 jset_string "test_selection.runner" "$TARGET_RUNNER"
+if [ -n "$RUNNER_OVERRIDE" ] && [ "$TARGET_RUNNER" != "none" ]; then
+  case "$RUNNER_OVERRIDE" in
+    pytest|script)
+      if [ "$RUNNER_OVERRIDE" != "$TARGET_RUNNER" ]; then
+        TARGET_RUNNER_REASON="caller forced --runner $RUNNER_OVERRIDE (structural selection said $TARGET_RUNNER: $TARGET_RUNNER_REASON)"
+        TARGET_RUNNER="$RUNNER_OVERRIDE"
+        jset_string "test_selection.runner" "$TARGET_RUNNER"
+      fi
+      ;;
+    *) echo "--runner must be pytest or script" >&2; exit 2;;
+  esac
+fi
 jset_string "test_selection.runner_reason" "$TARGET_RUNNER_REASON"
 TARGET_RUNNER_RISK=$(python3 -c \
   'import json,sys; print(json.loads(sys.argv[1]).get("runner_risk",""))' "$RUNNER_JSON")
@@ -2616,6 +2689,13 @@ print(int(any(a.get("independence") == "adds-coverage" for a in axes)))
             && [ "$GRID_INDEPENDENCE" = "duplicates-target-defaults" ]; then
           GRID_INDEPENDENCE="adds-coverage"
           GRID_INDEPENDENCE_REASON="the shape cells duplicate the target's defaults, but a proven extra axis requests values the target does not run by default"
+          # test_selection carries the same two fields and was written before the axes were
+          # proven. Leaving it holding the pre-override value put two contradicting answers
+          # in one report -- `test_selection.grid_independence: duplicates-target-defaults`
+          # beside `stages.correctness_s1_grid.independence: adds-coverage`. Observed on
+          # ROCm/aiter#5081. One question, one answer.
+          jset_string "test_selection.grid_independence" "$GRID_INDEPENDENCE"
+          jset_string "test_selection.grid_independence_reason" "$GRID_INDEPENDENCE_REASON"
         fi
         python3 - "$JSON" "$HEAD_GRID_RC" "$GRID" "$HEAD_GRID_LOG" \
           "$HEAD_GRID_STATS" "$HEAD_PROBE_RC" "$HEAD_PROBE_LOG" \
@@ -2982,6 +3062,13 @@ if control_note:
 # median_ratio is omitted, never nulled, when there is no measurement: report_schema.json
 # types it as a number, and a null would fail validation at review-pr's identity gate --
 # turning "we could not measure" into "this report is malformed".
+# A stage the control gate rejected must not carry the numbers it rejected. Publishing a
+# median_ratio and a regressed_rows list beside `status: skip` reads as a regression that
+# was merely not acted on, when what happened is that the comparison was found
+# unattributable and no ratio is claimed at all.
+if control_note and result["status"] == "insufficient":
+    for field in ("median_ratio", "worst_column", "regressed_rows"):
+        result.pop(field, None)
 if result.get("median_ratio") is not None:
     stage["median_ratio"] = result["median_ratio"]
 if result.get("worst_column"):

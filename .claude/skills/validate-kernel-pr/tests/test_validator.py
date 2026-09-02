@@ -1445,6 +1445,32 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertEqual("INCONCLUSIVE", report["verdict"])
         self.assertEqual(2, result.returncode)
 
+    def test_a_duplicate_grid_rescued_by_an_axis_says_so_in_one_place(self):
+        # A duplicate shape grid is rescued when a PROVEN axis asks for values the target
+        # does not run by default -- the configuration reaching the kernel is genuinely new.
+        # But test_selection carries the same two fields and is written before the axes are
+        # proven, so it kept the pre-override answer and the report contradicted itself:
+        # test_selection said "duplicates-target-defaults" while the stage said
+        # "adds-coverage". Observed on ROCm/aiter#5081. One question, one answer.
+        patch = self._axis_patch("duplicate-rescued.patch")
+        _, report = self._validate_axis_target(
+            patch,
+            grid_value="7,257,f32",
+            axes=("num_heads=--num-heads:32;64",),
+        )
+
+        stage = report["stages"]["correctness_s1_grid"]
+        selection = report["test_selection"]
+        self.assertEqual("proven", selection["axis_state"])
+        self.assertEqual("adds-coverage", stage["independence"])
+        self.assertEqual(
+            stage["independence"], selection["grid_independence"]
+        )
+        self.assertEqual(
+            stage["independence_reason"], selection["grid_independence_reason"]
+        )
+        self.assertEqual("pass", stage["status"])
+
     def test_a_grid_outside_the_targets_defaults_still_counts_as_coverage(self):
         # The control case for the test above: the fix must not turn every grid into a skip.
         patch = self._axis_patch("grid-novel.patch")
@@ -1684,6 +1710,64 @@ class ValidateKernelPrTests(unittest.TestCase):
             report["findings"],
         )
 
+    def test_a_transplanted_baseline_whose_control_moved_is_not_believed(self):
+        # The gate that makes a cross-tree comparison reportable at all. If a column the
+        # patch does not touch moves between the two trees, the two runs are not comparable
+        # and the kernel ratio means nothing - the stage must skip and say so rather than
+        # publish a confident number drawn from two different machines-in-effect.
+        def mutate(repo):
+            (repo / "aiter" / "kernel.py").write_text("VALUE = 0.5\nREFERENCE = 3.0\n")
+            (repo / self.NEW_BENCH_TARGET).write_text(
+                "import argparse\n"
+                "import os\n"
+                "import sys\n"
+                "\n"
+                "sys.path.insert(0, os.path.dirname(os.path.dirname(\n"
+                "    os.path.abspath(__file__))))\n"
+                "\n"
+                "try:\n"
+                "    from aiter.kernel import REFERENCE\n"
+                "except ImportError:\n"
+                # On base REFERENCE does not exist, so the transplanted target falls back to
+                # a different reference cost -- which is exactly the situation the control
+                # column exists to detect.
+                "    REFERENCE = 1.0\n"
+                "from aiter.kernel import VALUE\n"
+                "\n"
+                "\n"
+                "def main():\n"
+                "    parser = argparse.ArgumentParser()\n"
+                "    parser.add_argument('--scenario', default='test',\n"
+                "                        choices=['test', 'bench'])\n"
+                "    parser.parse_args()\n"
+                "    print('| dim | kernel us | reference us |')\n"
+                "    print('|---|---|---|')\n"
+                "    for dim in (1024, 2048, 4096, 8192):\n"
+                "        print(f'| {dim} | {dim * VALUE / 100.0} "
+                "| {dim * REFERENCE / 50.0} |')\n"
+                "    print('4/4 cases passed')\n"
+                "\n"
+                "\n"
+                "if __name__ == '__main__':\n"
+                "    main()\n"
+            )
+
+        patch = self.fixture.make_patch(mutate, "added-bench-control-moved.patch")
+        _, report = self.fixture.validate(
+            patch,
+            tests=self.NEW_BENCH_TARGET,
+            expected_route="aiter.kernel:main",
+            grid=False,
+            perf=True,
+            perf_control_column="reference us",
+        )
+
+        perf = report["stages"]["perf"]
+        self.assertEqual("target-transplant", perf["baseline_method"])
+        self.assertEqual("skip", perf["status"])
+        self.assertIn("not comparable", perf["control_note"])
+        self.assertNotIn("median_ratio", perf)
+
     def test_a_transplanted_baseline_without_a_control_column_reports_why(self):
         # The transplant is a cross-tree comparison. With nothing unchanged to check it
         # against, the honest outcome is a skip whose reason names the missing evidence --
@@ -1723,6 +1807,138 @@ class ValidateKernelPrTests(unittest.TestCase):
         "def test_top_level():\n"
         "    run_kernel(7, 257, 'f32', 64)\n"
     )
+
+    #: aiter's dominant op_tests convention: a SCRIPT whose worker happens to be named
+    #: `test_<op>(...)` and is called from main() with real arguments. pytest collects it,
+    #: cannot supply the parameters, and errors. Observed on ROCm/aiter#5081, where the
+    #: validator published "the PR adds this test target and it fails on head" against the
+    #: author for a target that is green as a script with the very shapes the run requested.
+    UNCOLLECTABLE_WORKER_TARGET = (
+        "import argparse\n"
+        "import os\n"
+        "import sys\n"
+        "\n"
+        "sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))\n"
+        "\n"
+        "from axis_kernel import run_kernel\n"
+        "\n"
+        "\n"
+        "def test_worker(M, N, dtype_str, num_heads):\n"
+        "    run_kernel(M, N, dtype_str, num_heads)\n"
+        "    return M * N\n"
+        "\n"
+        "\n"
+        "def _shape(text):\n"
+        "    M, N, dtype_str = text.split(',')\n"
+        "    return int(M), int(N), dtype_str\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        "    parser = argparse.ArgumentParser()\n"
+        "    parser.add_argument('-s', '--shapes', type=_shape, nargs='*',\n"
+        "                        default=[(7, 257, 'f32'), (8, 64, 'f32')])\n"
+        "    parser.add_argument('--num-heads', type=int, nargs='*',\n"
+        "                        default=[64, 128])\n"
+        "    args = parser.parse_args()\n"
+        "    for M, N, dtype_str in args.shapes:\n"
+        "        for num_heads in args.num_heads:\n"
+        "            test_worker(M, N, dtype_str, num_heads)\n"
+        "    print('%d cases passed' % (len(args.shapes) * len(args.num_heads)))\n"
+        "\n"
+        "\n"
+        "if __name__ == '__main__':\n"
+        "    main()\n"
+    )
+
+    def test_a_test_named_worker_pytest_cannot_collect_runs_as_a_script(self):
+        patch = self._axis_patch(
+            "uncollectable-worker.patch", body=self.UNCOLLECTABLE_WORKER_TARGET
+        )
+        result, report = self._validate_axis_target(
+            patch,
+            grid_value="9,1023,f32",
+            axes=("num_heads=--num-heads:32;64",),
+        )
+
+        selection = report["test_selection"]
+        # "Defines a test* function" is not the same as "pytest can collect it".
+        self.assertEqual("script", selection["runner"])
+        self.assertIn("pytest cannot collect them", selection["runner_reason"])
+        # And because it is a script, the shape grid and the axis both reach it.
+        self.assertEqual("cli", selection["grid_channel"])
+        self.assertEqual("proven", selection["axis_state"])
+        self.assertEqual("pass", report["stages"]["correctness_s1_grid"]["status"])
+        self.assertGreater(
+            report["stages"]["correctness_repo_tests"]["stats"]["observed_work"], 0
+        )
+        # Above all: no blocker charged to an author whose target works.
+        self.assertFalse(
+            any(item["severity"] == "blocker" for item in report["findings"]),
+            report["findings"],
+        )
+        self.assertNotEqual(1, result.returncode)
+
+    def test_a_route_behind_a_wraps_decorator_is_still_observed(self):
+        # A route is written the way a caller reads the source, `module:function`. The
+        # profiler sees frames, and a frame's identity is
+        # f_globals["__name__"] + ":" + f_code.co_name -- not the same thing once the
+        # function is wrapped, because functools.wraps copies __name__ onto the wrapper
+        # object and leaves co_name alone. aiter's entire @compile_ops family therefore
+        # executes as `aiter.jit.core:wrapper`, so naming the op a reviewer cares about
+        # matched nothing and the receipt reported an empty route. Observed on
+        # ROCm/aiter#5081.
+        wrapped_kernel = (
+            "import functools\n"
+            "\n"
+            "\n"
+            "def _dispatch(func):\n"
+            "    @functools.wraps(func)\n"
+            "    def wrapper(*args, **kwargs):\n"
+            "        return func(*args, **kwargs)\n"
+            "\n"
+            "    return wrapper\n"
+            "\n"
+            "\n"
+            "@_dispatch\n"
+            "def run_kernel(M, N, dtype_str, num_heads):\n"
+            "    assert num_heads % 32 == 0, 'heads must be a multiple of 32'\n"
+            "    return M * N\n"
+        )
+
+        def mutate(repo):
+            (repo / "tests" / "axis_kernel.py").write_text(wrapped_kernel)
+            (repo / self.AXIS_TARGET_PATH).write_text(self.AXIS_TARGET)
+
+        patch = self.fixture.make_patch(mutate, "wrapped-route.patch")
+        _, report = self._validate_axis_target(patch, grid_value="9,1023,f32")
+
+        receipt = report["stages"]["execution_receipt"]
+        self.assertEqual("pass", receipt["status"])
+        self.assertEqual("axis_kernel:run_kernel", receipt["route"])
+        self.assertEqual(["9,1023,f32"], sorted(set(receipt["executed_shapes"])))
+        self.assertGreater(
+            report["stages"]["correctness_repo_tests"]["stats"]["observed_work"], 0
+        )
+
+    def test_the_caller_can_force_a_runner_the_classifier_got_wrong(self):
+        patch = self._axis_patch(
+            "forced-runner.patch", body=self.UNCOLLECTABLE_WORKER_TARGET
+        )
+        _, report = self.fixture.validate(
+            patch,
+            tests=self.AXIS_TARGET_PATH,
+            expected_route="axis_kernel:run_kernel",
+            shape_env=None,
+            shape_arg="--shapes",
+            perf=False,
+            grid=False,
+            runner="pytest",
+        )
+
+        selection = report["test_selection"]
+        self.assertEqual("pytest", selection["runner"])
+        self.assertIn("caller forced --runner pytest", selection["runner_reason"])
+        self.assertIn("structural selection said script", selection["runner_reason"])
 
     def test_a_runner_that_cannot_run_the_target_is_named_as_such(self):
         # "Red on both sides" is an attribution, not an explanation. When the target carries
@@ -1768,8 +1984,10 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertNotIn(
             "no declared defaults", selection["grid_independence_reason"]
         )
+        # The channel this run established, named -- rather than a claim about the target.
         self.assertIn(
-            "cli-flag-unusable", selection["grid_independence_reason"]
+            "independence is only computed for the CLI-flag channel",
+            selection["grid_independence_reason"],
         )
 
     def test_a_killed_run_leaves_no_stale_verdict_at_the_output_path(self):
