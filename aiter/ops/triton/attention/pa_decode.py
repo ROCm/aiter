@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
 import math
 
 import torch
@@ -21,8 +22,35 @@ from aiter.ops.triton._triton_kernels.attention.pa_decode import (
     _paged_attn_decode_v2_wo_dot_reduce_kernel_per_token_quant,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.tuned_config_utils import get_tuned_kernel_config
 
 _LOGGER = AiterTritonLogger()
+
+# Launch-param tuning for the GQA dot-product decode kernels lives in the
+# nested-layout config tree (configs/<arch>/triton/attention/pa_decode/
+# DEFAULT.json), not hardcoded here. Its only lever is ``waves_per_eu``:
+# triton 3.8 inflated the GQA dot kernel to 202 VGPR (occupancy 3->2), and
+# raising the VGPR budget to 256 (waves_per_eu=2) lets regalloc pipeline LDS
+# reads deeper (~+42% on llama3 decode). The v2_w_dot path is deliberately
+# left out -- there waves_per_eu=2 spills and regresses ~-15% on llama3-405B.
+# Only the config ``kwargs`` (i.e. waves_per_eu) are applied at launch;
+# num_warps/num_stages are left to the AMD backend defaults, exactly as the
+# original launch did, so any arch without a published config is unchanged.
+_PA_DECODE_CONFIG_NAME = "PA_DECODE"
+_PA_DECODE_FALLBACK_CONFIG = triton.Config({})
+
+
+@functools.lru_cache(maxsize=None)
+def _get_pa_decode_config(kernel_name: str) -> triton.Config:
+    """This device's tuned launch config for a pa_decode kernel, from the
+    published config JSON, falling back to the AMD backend defaults."""
+    return get_tuned_kernel_config(
+        "attention",
+        _PA_DECODE_CONFIG_NAME,
+        kernel_name,
+        _PA_DECODE_FALLBACK_CONFIG,
+    )
+
 
 # This code is derived from sglang and FLASHNN projects
 # https://github.com/AlibabaPAI/FLASHNN/blob/main/flashnn/triton_kernels/paged_attn.py
@@ -221,6 +249,7 @@ def paged_attn_decode_v1(
             query_grp_sz_pow2 = 16
         else:
             query_grp_sz_pow2 = triton.next_power_of_2(query_grp_sz)
+        _v1_w_dot_config = _get_pa_decode_config("_paged_attn_decode_v1_w_dot_kernel")
         _paged_attn_decode_v1_w_dot_kernel[grid](
             output,
             query,
@@ -249,12 +278,9 @@ def paged_attn_decode_v1(
             QUERY_GRP_SZ_POW2=query_grp_sz_pow2,
             KV_BLK_SZ=kv_blk_sz,
             KV_BLK_SZ_POW2=kv_blk_sz,
-            # triton 3.8 inflated this GQA dot kernel to 202 VGPR (occ 3->2).
-            # Raising the VGPR budget to 256 (waves_per_eu=2) lets regalloc pipeline
-            # LDS reads deeper: s_waitcnt lgkmcnt(0) 72->50, s_nop 36->9, ~+42% on
-            # llama3 decode. NOTE: v2_w_dot is intentionally NOT changed -- there
-            # waves_per_eu=2 spills and regresses ~-15% on llama3-405B.
-            waves_per_eu=2,
+            # waves_per_eu comes from the config JSON; see _get_pa_decode_config
+            # above. num_warps/num_stages stay at the backend defaults.
+            **_v1_w_dot_config.kwargs,
         )
 
 
@@ -511,6 +537,9 @@ def paged_attn_decode_v1_per_token_quant(
             query_grp_sz_pow2 = 16
         else:
             query_grp_sz_pow2 = triton.next_power_of_2(query_grp_sz)
+        _v1_w_dot_config = _get_pa_decode_config(
+            "_paged_attn_decode_v1_w_dot_kernel_per_token_quant"
+        )
         _paged_attn_decode_v1_w_dot_kernel_per_token_quant[grid](
             output,
             query,
@@ -542,10 +571,9 @@ def paged_attn_decode_v1_per_token_quant(
             QUERY_GRP_SZ_POW2=query_grp_sz_pow2,
             KV_BLK_SZ=kv_blk_sz,
             KV_BLK_SZ_POW2=kv_blk_sz,
-            # Same VGPR-budget fix as the non-quant v1_w_dot path above: this is the
-            # identical GQA dot compute kernel (per-token FP8 scale loads only), so
-            # the occ 3->2 inflation and the waves_per_eu=2 recovery apply equally.
-            waves_per_eu=2,
+            # Same config-driven waves_per_eu as the non-quant v1_w_dot path
+            # above; this is the identical GQA dot compute kernel.
+            **_v1_w_dot_config.kwargs,
         )
 
 
