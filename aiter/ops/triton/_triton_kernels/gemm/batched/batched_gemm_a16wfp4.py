@@ -165,9 +165,8 @@ def _batched_gemm_a16wfp4_kernel(
             + offs_bn[None, :] * stride_bn
         )
         # Create pointers for the first block of A and B scales
-        offs_ks = (pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE)) + tl.arange(
-            0, BLOCK_SIZE_K // SCALE_GROUP_SIZE
-        )
+        offs_scale_k = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
+        offs_ks = (pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE)) + offs_scale_k
         # B scales are N x K even though B operand is K x N.
         b_scale_ptrs = (
             b_scales_ptr
@@ -179,15 +178,22 @@ def _batched_gemm_a16wfp4_kernel(
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
         for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
-            b_scales = tl.load(b_scale_ptrs)
             # a_scales = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K//SCALE_GROUP_SIZE), 127, dtype=tl.uint8)
             # b_scales = tl.full((BLOCK_SIZE_N, BLOCK_SIZE_K//SCALE_GROUP_SIZE), 127, dtype=tl.uint8)
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:
+                b_scales = tl.load(b_scale_ptrs)
                 a_bf16 = tl.load(a_ptrs)
                 b = tl.load(b_ptrs, cache_modifier=cache_modifier)
             else:
+                # OOB scale bytes are not guaranteed to be zero, and 0xFF is NaN
+                # in e8m0, which dot_scaled propagates even where the masked-off
+                # data is zero. Read those groups as 127, a scale of 2^0.
+                scale_mask = offs_scale_k[None, :] < (
+                    2 * K // SCALE_GROUP_SIZE - k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE)
+                )
+                b_scales = tl.load(b_scale_ptrs, mask=scale_mask, other=127)
                 a_bf16 = tl.load(
                     a_ptrs,
                     mask=offs_k_bf16[None, :] < 2 * K - k * BLOCK_SIZE_K,
