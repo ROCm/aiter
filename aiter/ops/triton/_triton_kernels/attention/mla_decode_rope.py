@@ -326,7 +326,7 @@ def _fwd_grouped_kernel_stage1_rope(
 
 
 _fwd_kernel_stage2_repr = make_kernel_repr(
-    "_fwd_kernel_stage2",
+    "mla_decode_rope_fwd_kernel_stage2",
     [
         "NUM_KV_SPLITS",
         "BLOCK_DV",
