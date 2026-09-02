@@ -49,7 +49,7 @@ jobs:
     name: Prepare release target
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
     outputs:
       should_run: ${{ steps.resolve.outputs.should_run }}
       skip_reason: ${{ steps.resolve.outputs.skip_reason }}
@@ -60,15 +60,25 @@ jobs:
       previous_tag: ${{ steps.resolve.outputs.previous_tag }}
       expected_wheel_count: ${{ steps.resolve.outputs.expected_wheel_count }}
     steps:
+      - name: Generate release GitHub App token
+        id: release_app_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.AITER_CI_APP_ID }}
+          private-key: ${{ secrets.AITER_CI_APP_PRIVATE_KEY }}
+          owner: ROCm
+          repositories: aiter
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          token: ${{ steps.release_app_token.outputs.token }}
           fetch-depth: 0
 
       - name: Resolve release target
         id: resolve
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.release_app_token.outputs.token }}
           EVENT_NAME: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
           INPUT_RELEASE_TAG: ${{ github.event.inputs.release_tag || '' }}

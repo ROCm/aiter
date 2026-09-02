@@ -61,7 +61,6 @@ def _job_key(job: dict) -> tuple:
             job["SBM"],
             job["persist"],
             job["cu_num"] if job["persist"] else 0,
-            job["has_pad"],
             job["out_dtype"],
             job.get("enable_bias", False),
             job.get("g2_spart"),
@@ -135,6 +134,7 @@ def parse_csv(csv_path: str):
         for row in csv.DictReader(f):
             token = int(row["token"])
             topk = int(row["topk"])
+            # Shape comes from CSV columns; layout-v2 uses the exact K.
             model_dim = int(row["model_dim"])
             expert = int(row["expert"])
             inter_dim = int(row["inter_dim"])
@@ -145,12 +145,9 @@ def parse_csv(csv_path: str):
             kn2 = (row.get("kernelName2") or "").strip()
             v2_g2 = parse_flydsl_v2_gemm2_kernel(kn2)
             if v2_g2 is not None:
-                bk = v2_g2["tile_k"]
-                v2_d_inter = ((inter_dim + bk - 1) // bk) * bk
-                v2_d_inter_real = inter_dim if inter_dim != v2_d_inter else None
+                v2_d_inter = inter_dim
             else:
                 v2_d_inter = d_inter
-                v2_d_inter_real = d_inter_real
 
             if _is_mxfp4_kname(kn1):
                 p1 = _parse_mxfp4_g1_kname(kn1)
@@ -202,8 +199,6 @@ def parse_csv(csv_path: str):
 
             if v2_g2 is not None:
                 bm = v2_g2["tile_m"]
-                inter_dim_pad = v2_d_inter - inter_dim
-                model_dim_pad = 0
                 out_dtype = (
                     "fp8"
                     if v2_g2["epilog"] == "reduce" and _STAGE2_FP8_ROUTE_OUT
@@ -229,16 +224,12 @@ def parse_csv(csv_path: str):
                             "N_OUT": model_dim,
                             "epilog": v2_g2["epilog"],
                             "D_INTER": v2_d_inter,
-                            "D_INTER_REAL": v2_d_inter_real,
                             "topk": topk,
                             "SBM": v2_g2["sort_block_m"] or bm,
                             "persist": v2_g2["persist"],
                             "cu_num": int(row.get("cu_num", "0") or "0"),
                             "a_dtype": v2_g2["a_dtype"],
                             "b_dtype": v2_g2["b_dtype"],
-                            "inter_dim_pad": inter_dim_pad,
-                            "model_dim_pad": model_dim_pad,
-                            "has_pad": inter_dim_pad > 0 or model_dim_pad > 0,
                             "out_dtype": out_dtype,
                             "enable_bias": enable_bias,
                             "g2_spart": v2_g2["spart"],
@@ -422,8 +413,6 @@ def _compile_v2_stage2(job):
         persist=job["persist"],
         cu_num=job["cu_num"],
         n_sorted_padded=max_sorted,
-        inter_dim_pad=job["inter_dim_pad"],
-        model_dim_pad=job["model_dim_pad"],
         out_dtype=job["out_dtype"],
         g2_spart=job.get("g2_spart"),
         g2_bf16_lds=job.get("g2_bf16_lds"),

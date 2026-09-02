@@ -987,6 +987,9 @@ def _fused_moe_impl(
                 doweight_stage1=doweight_stage1,
                 w1_scale=w1_scale,
                 w2_scale=w2_scale,
+                # A quantizing EP dispatch puts the caller's e8m0 row here;
+                # the gfx1250 path uses it to skip a quant it would redo.
+                a1_scale=a1_scale,
                 expert_mask=expert_mask,
                 hidden_pad=hidden_pad,
                 intermediate_pad=intermediate_pad,
@@ -2166,8 +2169,6 @@ def _mxfp4_a4w4_stage2_fw(
     bias2=None,
     kernelName2="",
     reverse_sorted=None,
-    inter_dim_pad: int = 0,
-    model_dim_pad: int = 0,
     **_kwargs,
 ):
 
@@ -2189,20 +2190,15 @@ def _mxfp4_a4w4_stage2_fw(
         # with gemm2_body_v2's native-BM scale-chunk layout at SBM=BM (verified
         # for BM in {16,32,64,128} x epilog {atomic,reduce}).
         if inter_real is not None and inter_real != D_INTER:
-            if not 0 < inter_real < D_INTER:
-                raise ValueError(
-                    f"Invalid w2.inter_real={inter_real} for D_INTER={D_INTER}"
-                )
-            inferred_pad = D_INTER - int(inter_real)
-            if inter_dim_pad not in (0, inferred_pad):
-                raise ValueError(
-                    f"inter_dim_pad={inter_dim_pad} disagrees with "
-                    f"w2.inter_real={inter_real} and D_INTER={D_INTER}"
-                )
-            # Some callers only preserve the tensor metadata, while others
-            # pass the fused_moe pad explicitly. Accept either source when
-            # they describe the same physical-K layout.
-            inter_dim_pad = inferred_pad
+            # This path does not thread the v2 gemm2's K-pad skip (has_pad +
+            # i32_kpad), so the pad columns would be accumulated instead of
+            # skipped. v2 needs K aligned only to its BK, so an unpadded shard
+            # is the intended input here.
+            raise NotImplementedError(
+                f"FlyDSL v2 stage2 requires an unpadded inter_dim shard, got "
+                f"w2.inter_real={inter_real} with D_INTER={D_INTER}. Use a "
+                f"native flydsl_mxmoe_g2 kernelName2 for pre-padded weights."
+            )
         return _flydsl_v2_stage2_wrapper(
             inter_states=inter_states,
             w1=None,
@@ -2221,8 +2217,6 @@ def _mxfp4_a4w4_stage2_fw(
             sorted_weights=sorted_weights,
             topk_weights=topk_weights,
             bias2=bias2,
-            inter_dim_pad=inter_dim_pad,
-            model_dim_pad=model_dim_pad,
             block_m=block_m,
         )
     if bias2 is not None:
@@ -2292,8 +2286,6 @@ def _flydsl_v2_stage2_wrapper(
     a2_scale=None,
     sorted_weights=None,
     bias2=None,
-    inter_dim_pad: int = 0,
-    model_dim_pad: int = 0,
     block_m=None,
     expert_mask=None,
     topk_ids=None,
@@ -2392,8 +2384,6 @@ def _flydsl_v2_stage2_wrapper(
         epilog=epilog,
         SBM=sbm,
         persist=cfg["persist"],
-        inter_dim_pad=inter_dim_pad,
-        model_dim_pad=model_dim_pad,
         g2_bf16_lds=cfg["bf16_lds"],
         g2_spart=cfg["spart"],
         out_dtype="fp8" if _s2_fp8_inter else "bf16",
@@ -2408,7 +2398,6 @@ def _flydsl_v2_stage2_wrapper(
             token_num,
             topk,
             model_dim_runtime,
-            model_dim_pad=model_dim_pad,
             expert_mask=expert_mask,
             topk_ids=topk_ids,
             is_fp8=_s2_fp8_inter,
@@ -2849,8 +2838,6 @@ def get_2stage_cfgs(
         stage2_func = functools.partial(
             _mxfp4_a4w4_stage2_fw,
             kernelName2=kernelName2,
-            inter_dim_pad=intermediate_pad,
-            model_dim_pad=hidden_pad,
         )
         runtime_interleave = gate_mode == GateMode.INTERLEAVE
         if _p1["interleave"] != runtime_interleave:
@@ -2953,8 +2940,6 @@ def get_2stage_cfgs(
                 model_dim=model_dim,
                 inter_dim=inter_dim,
                 num_experts=expert,
-                inter_dim_pad=intermediate_pad,
-                model_dim_pad=hidden_pad,
             )
         elif is_flydsl2:
             stage2_func = functools.partial(
