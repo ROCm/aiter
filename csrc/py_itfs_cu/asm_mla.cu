@@ -1281,7 +1281,7 @@ void mla_prefill_asm_fwd(
     
     int ps = 0; // prefill without persistent scheduling
     int prefill = 1; // prefill stage
-    int causal_flag = 0;
+    int causal_flag = 1;
     int qseqlen = 0;
     std::string kernelName = get_heuristic_kernel_mla(q_type, kv_type, gqa_ratio, ps, prefill, causal_flag, qseqlen, arch_id, config_map);
     
