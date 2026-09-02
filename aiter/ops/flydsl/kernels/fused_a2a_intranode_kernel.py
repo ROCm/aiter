@@ -20,10 +20,10 @@ from .communication_ops_utils import (
     store_i64_global_system,
 )
 
-_JIT_SCHEMA_VERSION = "v6-out-peer-striped-depth-16"
+_JIT_SCHEMA_VERSION = "v7-in-out-peer-striped-depth-16"
 _PUSH_PIPELINE_DEPTH = 16
-_OUT_CHANNEL_COUNT = 8
-_OUT_CHANNEL_DEPTH = _PUSH_PIPELINE_DEPTH // _OUT_CHANNEL_COUNT
+_CHANNEL_COUNT = 8
+_CHANNEL_DEPTH = _PUSH_PIPELINE_DEPTH // _CHANNEL_COUNT
 
 
 def make_fused_a2a_kernel(
@@ -36,7 +36,6 @@ def make_fused_a2a_kernel(
     heads_local = heads // npes
     seq_full = seq_len * npes
     chunks_per_row = row_nbytes // 16
-    total_chunks = heads * seq_len * chunks_per_row
     vec = 8
     block_threads = 64
     hd = heads * head_dim
@@ -120,34 +119,22 @@ def make_fused_a2a_kernel(
                 )
             return result
 
+        channel_warp_num = global_warp_num // _CHANNEL_COUNT
+        channel_id = global_warp_id % _CHANNEL_COUNT
+        channel_warp_id = global_warp_id // _CHANNEL_COUNT
+
         def process_qk(rsrc_input, rsrc_norm, p2p_bases):
-            for seq in range(global_warp_id, seq_len, global_warp_num):
-                tiles = []
+            channel_chunks = heads_local * chunks_per_row
+            for seq in range(channel_warp_id, seq_len, channel_warp_num):
                 sq_acc = fx.Float32(0.0)
                 row_base = seq * hd
-                head_offset = (lane * vec) % head_dim
-                freq_offset = seq * head_dim + head_offset
-                cos_f = fx.Vector(
-                    buffer_load(rsrc_cos, freq_offset, vec_width=4, dtype=T.f32)
-                )
-                cos_f_hi = fx.Vector(
-                    buffer_load(rsrc_cos, freq_offset + 4, vec_width=4, dtype=T.f32)
-                )
-                sin_f = fx.Vector(
-                    buffer_load(rsrc_sin, freq_offset, vec_width=4, dtype=T.f32)
-                )
-                sin_f_hi = fx.Vector(
-                    buffer_load(rsrc_sin, freq_offset + 4, vec_width=4, dtype=T.f32)
-                )
                 for tile_idx in range_constexpr(n_tiles):
                     element_offset = row_base + tile_idx * tile + lane * vec
-                    values = fx.Vector(
+                    values_f = fx.Vector(
                         buffer_load(
                             rsrc_input, element_offset, vec_width=vec, dtype=T.bf16
                         )
-                    )
-                    tiles.append(values)
-                    values_f = values.to(fx.Float32)
+                    ).to(fx.Float32)
                     sq_acc = sq_acc.addf(
                         fx.Float32(
                             (values_f * values_f).reduce(
@@ -160,17 +147,63 @@ def make_fused_a2a_kernel(
                     wave_reduce_add(sq_acc) * (1.0 / hd) + 1.0e-6,
                     fastmath=fm_fast,
                 )
-                for batch_start in range_constexpr(0, n_tiles, _PUSH_PIPELINE_DEPTH):
+                for chunk_base in range_constexpr(
+                    0, channel_chunks, block_threads * _CHANNEL_DEPTH
+                ):
                     outputs = []
                     destinations = []
-                    batch_size = min(_PUSH_PIPELINE_DEPTH, n_tiles - batch_start)
-                    for batch_idx in range_constexpr(batch_size):
-                        tile_idx = batch_start + batch_idx
-                        col = tile_idx * tile + lane * vec
+                    for batch_idx in range_constexpr(_CHANNEL_DEPTH):
+                        channel_chunk = chunk_base + batch_idx * block_threads + lane
+                        valid = channel_chunk < channel_chunks
+                        safe_channel_chunk = valid.select(channel_chunk, 0)
+                        local_head = safe_channel_chunk // chunks_per_row
+                        row_chunk = safe_channel_chunk % chunks_per_row
+                        head = channel_id * heads_local + local_head
+                        head_offset = row_chunk * vec
+                        col = head * head_dim + head_offset
+                        values_f = fx.Vector(
+                            buffer_load(
+                                rsrc_input,
+                                row_base + col,
+                                vec_width=vec,
+                                dtype=T.bf16,
+                            )
+                        ).to(fx.Float32)
                         weights = fx.Vector(
                             buffer_load(rsrc_norm, col, vec_width=vec, dtype=T.bf16)
                         ).to(fx.Float32)
-                        values_f = tiles[tile_idx].to(fx.Float32)
+                        cos_f = fx.Vector(
+                            buffer_load(
+                                rsrc_cos,
+                                seq * head_dim + head_offset,
+                                vec_width=4,
+                                dtype=T.f32,
+                            )
+                        )
+                        cos_f_hi = fx.Vector(
+                            buffer_load(
+                                rsrc_cos,
+                                seq * head_dim + head_offset + 4,
+                                vec_width=4,
+                                dtype=T.f32,
+                            )
+                        )
+                        sin_f = fx.Vector(
+                            buffer_load(
+                                rsrc_sin,
+                                seq * head_dim + head_offset,
+                                vec_width=4,
+                                dtype=T.f32,
+                            )
+                        )
+                        sin_f_hi = fx.Vector(
+                            buffer_load(
+                                rsrc_sin,
+                                seq * head_dim + head_offset + 4,
+                                vec_width=4,
+                                dtype=T.f32,
+                            )
+                        )
                         scaled = [
                             values_f[i] * rstd * weights[i]
                             for i in range_constexpr(vec)
@@ -195,43 +228,50 @@ def make_fused_a2a_kernel(
                                 dtype=fx.Float32,
                             ).to(fx.BFloat16)
                         )
-                        head = col // head_dim
-                        row_chunk = (col % head_dim) // vec
-                        dest_pe = head // heads_local
-                        local_head = head % heads_local
                         dst_row = local_head * seq_full + rank * seq_len + seq
                         dst_offset = fx.Int64(dst_row * row_nbytes + row_chunk * 16)
-                        peer_base = fx.memref_load(p2p_bases, dest_pe)
+                        peer_base = fx.memref_load(p2p_bases, channel_id)
                         destinations.append(
                             create_buffer_resource_from_addr(peer_base + dst_offset)
                         )
-                    for batch_idx in range_constexpr(batch_size):
-                        buffer_store(outputs[batch_idx], destinations[batch_idx], 0)
+                    for batch_idx in range_constexpr(_CHANNEL_DEPTH):
+                        channel_chunk = chunk_base + batch_idx * block_threads + lane
+                        buffer_store(
+                            outputs[batch_idx],
+                            destinations[batch_idx],
+                            0,
+                            mask=channel_chunk < channel_chunks,
+                        )
 
         process_qk(rsrc_input_q, rsrc_norm_q, p2p_bases_q)
         process_qk(rsrc_input_k, rsrc_norm_k, p2p_bases_k)
 
-        chunk_step = global_warp_num * _PUSH_PIPELINE_DEPTH
-        for chunk_base in range(global_warp_id, total_chunks, chunk_step):
+        peer_chunks = seq_len * heads_local * chunks_per_row
+        channel_base = channel_id * peer_chunks
+        channel_end = channel_base + peer_chunks
+        chunk_step = channel_warp_num * _CHANNEL_DEPTH
+        for chunk_base in range(
+            channel_base + channel_warp_id, channel_end, chunk_step
+        ):
             values_v = []
             destinations_v = []
-            for batch_idx in range_constexpr(_PUSH_PIPELINE_DEPTH):
-                chunk_idx = chunk_base + batch_idx * global_warp_num
-                valid = chunk_idx < total_chunks
-                safe_chunk_idx = valid.select(chunk_idx, 0)
-                row = safe_chunk_idx // chunks_per_row
-                row_chunk = safe_chunk_idx % chunks_per_row
-                seq = row // heads
-                head = row % heads
-                dest_pe = head // heads_local
-                local_head = head % heads_local
-                peer_base_v = fx.memref_load(p2p_bases_v, dest_pe)
+            for batch_idx in range_constexpr(_CHANNEL_DEPTH):
+                chunk_idx = chunk_base + batch_idx * channel_warp_num
+                valid = chunk_idx < channel_end
+                safe_chunk_idx = valid.select(chunk_idx, channel_base)
+                channel_chunk = safe_chunk_idx - channel_base
+                seq = channel_chunk // (heads_local * chunks_per_row)
+                head_chunk = channel_chunk % (heads_local * chunks_per_row)
+                local_head = head_chunk // chunks_per_row
+                row_chunk = head_chunk % chunks_per_row
+                src_row = seq * heads + channel_id * heads_local + local_head
+                peer_base_v = fx.memref_load(p2p_bases_v, channel_id)
                 dst_row = local_head * seq_full + rank * seq_len + seq
                 dst_offset = fx.Int64(dst_row * row_nbytes + row_chunk * 16)
                 values_v.append(
                     buffer_load(
                         rsrc_input_v,
-                        safe_chunk_idx * 4,
+                        src_row * chunks_per_row * 4 + row_chunk * 4,
                         vec_width=4,
                         dtype=T.i32,
                     )
@@ -239,13 +279,13 @@ def make_fused_a2a_kernel(
                 destinations_v.append(
                     create_buffer_resource_from_addr(peer_base_v + dst_offset)
                 )
-            for batch_idx in range_constexpr(_PUSH_PIPELINE_DEPTH):
-                chunk_idx = chunk_base + batch_idx * global_warp_num
+            for batch_idx in range_constexpr(_CHANNEL_DEPTH):
+                chunk_idx = chunk_base + batch_idx * channel_warp_num
                 buffer_store(
                     values_v[batch_idx],
                     destinations_v[batch_idx],
                     0,
-                    mask=chunk_idx < total_chunks,
+                    mask=chunk_idx < channel_end,
                 )
 
         fx.rocdl.s_waitcnt(vmcnt=0)
@@ -389,10 +429,10 @@ def make_fused_a2a_out_kernel(
         fx.barrier()
 
         rsrc_input = create_buffer_resource_from_addr(addr_input)
-        channel_warp_num = global_warp_num // _OUT_CHANNEL_COUNT
-        channel_id = global_warp_id % _OUT_CHANNEL_COUNT
-        channel_warp_id = global_warp_id // _OUT_CHANNEL_COUNT
-        chunk_step = channel_warp_num * _OUT_CHANNEL_DEPTH
+        channel_warp_num = global_warp_num // _CHANNEL_COUNT
+        channel_id = global_warp_id % _CHANNEL_COUNT
+        channel_warp_id = global_warp_id // _CHANNEL_COUNT
+        chunk_step = channel_warp_num * _CHANNEL_DEPTH
         channel_base = channel_id * peer_chunks
         channel_end = channel_base + peer_chunks
         for chunk_base in range(
@@ -400,7 +440,7 @@ def make_fused_a2a_out_kernel(
         ):
             values = []
             destinations = []
-            for batch_idx in range_constexpr(_OUT_CHANNEL_DEPTH):
+            for batch_idx in range_constexpr(_CHANNEL_DEPTH):
                 chunk_idx = chunk_base + batch_idx * channel_warp_num
                 valid = chunk_idx < channel_end
                 safe_chunk_idx = valid.select(chunk_idx, channel_base)
@@ -419,7 +459,7 @@ def make_fused_a2a_out_kernel(
                     rank * peer_chunks * 16 + dest_chunk * 16
                 )
                 destinations.append(create_buffer_resource_from_addr(dst_addr))
-            for batch_idx in range_constexpr(_OUT_CHANNEL_DEPTH):
+            for batch_idx in range_constexpr(_CHANNEL_DEPTH):
                 chunk_idx = chunk_base + batch_idx * channel_warp_num
                 buffer_store(
                     values[batch_idx],
