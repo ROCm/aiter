@@ -7,6 +7,7 @@
 #include "custom_all_reduce.cuh"
 #include "mla.h"
 #include "opus/opus.hpp"
+#include <cassert>
 #include <cstdio>
 #include <optional>
 #include <sstream>
@@ -460,8 +461,9 @@ __device__ void mla_reduce_v1_impl_massive(const MlaReduceKernelV1Params& params
     __syncthreads();
 
     const int32_t reduce_partial_map_0 = p_lds_reduce_partial_map[0];
-    // Defensive: only [0, num_splits) is staged; guard slot [1] (this path runs at
-    // num_splits >= kMassiveThreshold today, but keep it correct if that changes).
+    // single-split tiles must come with reduce_final_map, i.e. with need_lse
+    assert(num_splits > 1 || params.use_reduce_final_map);
+    // slot [1] isn't loaded when num_splits == 1
     const int32_t reduce_partial_map_1 =
         (num_splits > 1) ? p_lds_reduce_partial_map[1] : reduce_partial_map_0;
     const MlaPartialTileInfo final_loc = [&]() {
@@ -577,8 +579,9 @@ __device__ void mla_reduce_v1_impl_simple(const MlaReduceKernelV1Params& params,
     __syncthreads();
 
     const int32_t reduce_partial_map_0 = p_lds_reduce_partial_map[0];
-    // Only [0, num_splits) was staged into LDS above; for a single split, slot [1] is
-    // stale. It is consumed only on the !use_reduce_final_map branch, so guard the read.
+    // single-split tiles must come with reduce_final_map, i.e. with need_lse
+    assert(num_splits > 1 || params.use_reduce_final_map);
+    // slot [1] isn't loaded when num_splits == 1
     const int32_t reduce_partial_map_1 =
         (num_splits > 1) ? p_lds_reduce_partial_map[1] : reduce_partial_map_0;
     const MlaPartialTileInfo final_loc = [&]() {
@@ -776,7 +779,7 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
             }
         }
         // num_split==1 with real partial slot (!=1) means need_lse has been set 
-        // so we need to reduce to get a correct final lse
+        // so we need to reduce even this single split tile to get a correct final_lse
         else if(num_splits > 1 ||
                 (num_splits == 1 && params.p_reduce_partial_map[reduce_tile_start] != -1))
         {
@@ -875,7 +878,7 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
         }
     }
     // num_split==1 with real partial slot (!=1) means need_lse has been set 
-    // so we need to reduce to get a correct final lse
+    // so we need to reduce even this single split tile to get a correct final_lse
     else if(num_splits > 1 ||
             (num_splits == 1 && params.p_reduce_partial_map[reduce_tile_start] != -1))
     {

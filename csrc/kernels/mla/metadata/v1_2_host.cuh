@@ -186,19 +186,12 @@ void kn_generate_ps_metadata(std::vector<int32_t>& seqlens_qo_indptr,
                     if(remaining_kv_len <= blocks_capacity * block_size + SPLIT_KV_OVERHEAD)
                     {
                         consuming_blocks = remaining_blocks;
-                        // This TG covers this qo_tile's remaining blocks to the causal
-                        // boundary. Direct-to-O (partial_o_loc == -1) means stage-1 writes 
-                        // the final output and no reduce runs:
-                        //  - if need_lse true: emit a real partial slot so mla_reduce_v1 
-                        //    populates final_lse for this tile
-                        //  - a zero-KV tile (consuming_blocks == 0) is always direct-to-O,
-                        //    since it has no partial data and must never enter the reduce map;
-                        //  - current_block_idx != 0 is the final chunk of a cross-TG split
-                        //    so it always gets a real slot.
-                        const bool direct_to_o =
+                        // When we need LSE we cannot skip reduce, as final_lse is only produced 
+                        // by the reduce kernel.
+                        const bool skip_reduce =
                             (consuming_blocks == 0) || (!need_lse && current_block_idx == 0);
                         const int32_t partial_o_loc =
-                            direct_to_o ? -1 : (qlen_granularity * partial_tile_idx++);
+                            skip_reduce ? -1 : (qlen_granularity * partial_tile_idx++);
                         const int32_t kv_end =
                             std::min(kv_start + consuming_blocks,
                                      pages_kv_indptr[current_tile.batch_idx + 1]);
@@ -310,7 +303,7 @@ void get_ps_metadata_v1_2_host(const aiter_tensor_t& seqlens_qo_indptr, // [batc
                        hipMemcpyDefault));
 
     std::vector<int32_t> work_indptr_vec(work_indptr.numel(), 0);
-    std::vector<WorkInfo> work_info_vec(work_info.numel() / kSizeWorkInfoInDw, WorkInfo());
+    std::vector<WorkInfo> work_info_vec(work_info.numel() / SizeWorkInfoInDw, WorkInfo());
     std::vector<int32_t> reduce_indptr_vec(reduce_indptr.numel(), 0);
     std::vector<FinalLoc> reduce_final_map_vec(reduce_final_map.numel() / 2, FinalLoc());
     std::vector<int32_t> reduce_partial_map_vec(reduce_partial_map.numel(), 0);
