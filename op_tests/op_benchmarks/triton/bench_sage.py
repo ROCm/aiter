@@ -61,7 +61,6 @@ from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
 )
 from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
 from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
-from aiter.ops.triton.quant.mxfp6_fmha_pack import pack_fp6_v_data_scale_views
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     create_hadamard_matrix,
     sage_quant,
@@ -125,51 +124,96 @@ arg_to_torch_dtype = {
 }
 
 
-KernelName = Literal[
-    "sage_fp8",
-    "sage_mxfp4",
-    "fav3_fp8",
-    "aiter_bf16",
-    "mha4_bf16",
-    "mha4_bf16fp8",
-    "mha4_i8fp8",
-    "mha4_mxfp8",
-    "mha4_fp8",
-    "mha4_f8f6",
-    "mha4_mxfp6",
-    "mha4_f6f4",
-    "mha4_mxfp4",
-    "mha4_f4f4",
-]
+@dataclass(frozen=True)
+class KernelSpec:
+    # Logical Q/K/V payload bytes. Scale metadata and tile padding are excluded.
+    payload_bytes: tuple[float, float, float]
+    quantized: bool = False
+    supports_block_sparse: bool = False
+    uses_hadamard: bool = False
+    supports_causal: bool = True
+    include_in_all: bool = False
 
-ALL_KERNELS: list[str] = [
-    "aiter_bf16",
-    "mha4_bf16",
-    "mha4_bf16fp8",
-    "mha4_i8fp8",
-    "mha4_mxfp8",
-    "mha4_fp8",
-    "mha4_f8f6",
-    "mha4_mxfp6",
-    "mha4_f6f4",
-    "mha4_mxfp4",
-    "mha4_f4f4",
-]
 
-QUANT_KERNELS = {
-    "sage_fp8",
-    "sage_mxfp4",
-    "fav3_fp8",
-    "mha4_i8fp8",
-    "mha4_mxfp8",
-    "mha4_fp8",
-    "mha4_f8f6",
-    "mha4_mxfp6",
-    "mha4_f6f4",
-    "mha4_mxfp4",
-    "mha4_f4f4",
-    "mha4_bf16fp8",
+def _mha_v4_spec(
+    payload_bytes: tuple[float, float, float],
+    *,
+    quantized: bool = True,
+    supports_block_sparse: bool = False,
+    uses_hadamard: bool = False,
+) -> KernelSpec:
+    return KernelSpec(
+        payload_bytes,
+        quantized=quantized,
+        supports_block_sparse=supports_block_sparse,
+        uses_hadamard=uses_hadamard,
+        supports_causal=False,
+        include_in_all=True,
+    )
+
+
+KERNEL_SPECS = {
+    "sage_fp8": KernelSpec(
+        (1.0, 1.0, 1.0),
+        quantized=True,
+        supports_block_sparse=True,
+        uses_hadamard=True,
+    ),
+    "sage_mxfp4": KernelSpec(
+        (0.5, 0.5, 1.0),
+        quantized=True,
+        supports_block_sparse=True,
+        uses_hadamard=True,
+    ),
+    "fav3_fp8": KernelSpec(
+        (1.0, 1.0, 1.0), quantized=True, uses_hadamard=True
+    ),
+    "aiter_bf16": KernelSpec((2.0, 2.0, 2.0), include_in_all=True),
+    "mha4_bf16": _mha_v4_spec((2.0, 2.0, 2.0), quantized=False),
+    "mha4_bf16fp8": _mha_v4_spec((2.0, 2.0, 1.0)),
+    "mha4_i8fp8": _mha_v4_spec(
+        (1.0, 1.0, 1.0), supports_block_sparse=True
+    ),
+    "mha4_mxfp8": _mha_v4_spec(
+        (1.0, 1.0, 1.0),
+        supports_block_sparse=True,
+        uses_hadamard=True,
+    ),
+    "mha4_fp8": _mha_v4_spec(
+        (1.0, 1.0, 1.0),
+        supports_block_sparse=True,
+        uses_hadamard=True,
+    ),
+    "mha4_f8f6": _mha_v4_spec(
+        (1.0, 1.0, 0.75),
+        supports_block_sparse=True,
+        uses_hadamard=True,
+    ),
+    "mha4_mxfp6": _mha_v4_spec(
+        (0.75, 0.75, 1.0),
+        supports_block_sparse=True,
+        uses_hadamard=True,
+    ),
+    "mha4_f6f4": _mha_v4_spec(
+        (0.75, 0.75, 0.5),
+        supports_block_sparse=True,
+        uses_hadamard=True,
+    ),
+    "mha4_mxfp4": _mha_v4_spec(
+        (0.5, 0.5, 1.0),
+        supports_block_sparse=True,
+        uses_hadamard=True,
+    ),
+    "mha4_f4f4": _mha_v4_spec(
+        (0.5, 0.5, 0.5),
+        supports_block_sparse=True,
+        uses_hadamard=True,
+    ),
 }
+
+ALL_KERNELS = tuple(
+    kernel for kernel, spec in KERNEL_SPECS.items() if spec.include_in_all
+)
 
 
 @dataclass
@@ -600,7 +644,7 @@ def load_block_mask_from_json(
     return None
 
 
-def kernel_block_sizes(kernel: KernelName) -> tuple[int, int]:
+def kernel_block_sizes(kernel: str) -> tuple[int, int]:
     # MHA v4's sparse tile is set by its manifest row, not by the Triton configs
     # below: 256x128 on gfx950 but 256x64 on gfx942.
     if kernel.startswith("mha4_"):
@@ -673,7 +717,7 @@ def build_block_mask(
 
 
 def sparse_flops_from_lut(
-    kernel: KernelName,
+    kernel: str,
     block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     shape: ShapeSpec,
 ) -> tuple[float, float]:
@@ -713,34 +757,6 @@ def fp8_quantize(
     q_quant, q_descale = quantize_qk(q)
     k_quant, k_descale = quantize_qk(k)
     v_quant, v_descale = quantize_fp8(v)
-    return q_quant, k_quant, v_quant, q_descale, k_descale, v_descale
-
-
-def f8f6_quantize(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    rotate_qk: bool = True,
-    v_scale_mode: Literal["block", "tensor", "head"] = "block",
-) -> tuple[
-    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-]:
-    quantize_qk = quantize_fp8_rotated if rotate_qk else quantize_fp8
-    q_quant, q_descale = quantize_qk(q)
-    k_quant, k_descale = quantize_qk(k)
-    if v_scale_mode == "block":
-        v_quant, v_descale = quantize_v_mxfp6(v)
-    else:
-        reduce_dims = (0, 1, 2, 3) if v_scale_mode == "tensor" else (1, 3)
-        amax = v.abs().to(torch.float32).amax(dim=reduce_dims, keepdim=True)
-        scale = torch.clamp(amax / 7.5, min=torch.finfo(torch.float32).tiny)
-        v_quant, v_descale = pack_fp6_v_data_scale_views(
-            v.to(torch.float32) / scale, fixed_e8m0=True
-        )
-        batch, _, heads, _ = v.shape
-        scale_by_head = scale.expand(batch, 1, heads, 1)[:, 0, :, 0].contiguous()
-        scale_bytes = scale_by_head.view(torch.uint8).reshape(batch, heads, 4)
-        v_descale.view(batch, heads, -1)[..., :4] = scale_bytes
     return q_quant, k_quant, v_quant, q_descale, k_descale, v_descale
 
 
@@ -893,17 +909,6 @@ def make_fav3_fp8_runner(
         v_descale,
         softmax_scale,
         causal,
-    )
-
-
-def make_torch_ref_runner(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    causal: bool,
-) -> Any:
-    return lambda: attention_ref(
-        q, k, v, dropout_p=0.0, dropout_mask=None, causal=causal
     )
 
 
@@ -1104,7 +1109,7 @@ def make_kernel_runner(
         )
 
     if args.kernel == "mha4_bf16":
-        return lambda: mha_v4(
+        return lambda: launch_mha_v4(
             q_bshd,
             k_bshd,
             v_bshd,
@@ -1116,7 +1121,7 @@ def make_kernel_runner(
 
     if args.kernel == "mha4_bf16fp8":
         if args.e2e:
-            return lambda: mha_v4(
+            return lambda: launch_mha_v4(
                 q_bshd,
                 k_bshd,
                 v_bshd,
@@ -1130,7 +1135,7 @@ def make_kernel_runner(
         bf16fp8_scale_modes = scale_modes_for_formats(
             AttentionFormat.BF16, AttentionFormat.BF16, fp8_format
         )
-        return lambda: mha_v4_packed(
+        return lambda: launch_mha_v4_packed(
             q_bshd,
             k_bshd,
             v_quantized,
@@ -1145,8 +1150,10 @@ def make_kernel_runner(
         )
 
     if args.kernel == "mha4_fp8":
+        if args.hadamard_rotate and args.block_r != 128:
+            raise ValueError("mha4_fp8 Hadamard preprocessing requires block_r=128")
         if args.e2e and args.hadamard_rotate:
-            return lambda: mha_v4(
+            return lambda: launch_mha_v4(
                 q_bshd,
                 k_bshd,
                 v_bshd,
@@ -1157,7 +1164,7 @@ def make_kernel_runner(
             )
 
         if args.e2e:
-            return lambda: mha_v4_packed(
+            return lambda: launch_mha_v4_packed(
                 *fp8_quantize(
                     q_bshd,
                     k_bshd,
@@ -1191,7 +1198,7 @@ def make_kernel_runner(
         )
 
         if args.e2e:
-            return lambda: mha_v4_packed(
+            return lambda: launch_mha_v4_packed(
                 *_production_quantize_mxfp8(q_bshd, k_bshd, v_bshd, softmax_scale),
                 fp8_format,
                 fp8_format,
@@ -1211,15 +1218,10 @@ def make_kernel_runner(
         )
 
     if args.kernel == "mha4_f8f6":
-        if (
-            args.qsmooth
-            or not args.hadamard_rotate
-            or args.block_r != 128
-            or args.f8f6_v_scale != "block"
-        ):
+        if args.qsmooth or not args.hadamard_rotate or args.block_r != 128:
             raise ValueError(
-                "mha4_f8f6 requires block_r=128 Hadamard preprocessing, "
-                "block V scales, and does not support --qsmooth"
+                "mha4_f8f6 requires block_r=128 Hadamard preprocessing "
+                "and does not support --qsmooth"
             )
         if args.e2e:
             return lambda: launch_mha_v4(
@@ -1234,7 +1236,12 @@ def make_kernel_runner(
 
         q_quantized, q_descale = quantize_fp8_rotated(q_bshd)
         k_quantized, k_descale = quantize_fp8_rotated(k_bshd)
-        v_quantized, v_descale = quantize_v_mxfp6_fp6_p(v_bshd)
+        if block_lut is None:
+            v_quantized, v_descale = quantize_v_mxfp6_fp6_p(v_bshd)
+            v_pack = AttentionPack.V_FOR_FP6_P
+        else:
+            v_quantized, v_descale = quantize_v_mxfp6(v_bshd)
+            v_pack = AttentionPack.DEFAULT
         return lambda: launch_mha_v4_packed(
             q_quantized,
             k_quantized,
@@ -1247,7 +1254,7 @@ def make_kernel_runner(
             AttentionFormat.MXFP6,
             *f8f6_scale_modes,
             softmax_scale=softmax_scale,
-            v_pack=AttentionPack.V_FOR_FP6_P,
+            v_pack=v_pack,
         )
 
     if args.kernel == "mha4_i8fp8":
@@ -1446,29 +1453,24 @@ def check_output_against_reference(
     current: torch.Tensor,
     reference: torch.Tensor,
 ) -> None:
-    print(current.flatten()[:20], reference.flatten()[:20])
-    # Guard against NaN/Inf in the kernel output before any accuracy stats are
-    # computed (a non-finite output silently wrecks cosine/MAE and is the usual
-    # symptom of softmax tail overflow -- see the "latesink" input distribution).
-    import os as _os
-
-    if _os.environ.get("DUMP_PROBE"):
+    if os.environ.get("DUMP_PROBE"):
         torch.save(
             {
                 "current": current.detach().float().cpu(),
                 "reference": reference.detach().float().cpu(),
             },
-            _os.environ["DUMP_PROBE"],
+            os.environ["DUMP_PROBE"],
         )
-        print(f"[DUMP_PROBE] saved to {_os.environ['DUMP_PROBE']}")
+        print(f"[DUMP_PROBE] saved to {os.environ['DUMP_PROBE']}")
     n_nan = int(torch.isnan(current).sum().item())
     n_inf = int(torch.isinf(current).sum().item())
     if n_nan or n_inf:
-        print(f"[NAN-CHECK] FAIL kernel={args.kernel} nan={n_nan} inf={n_inf}")
-    else:
-        print(f"[NAN-CHECK] PASS kernel={args.kernel} (output finite)")
+        raise AssertionError(
+            f"non-finite output from {args.kernel}: nan={n_nan}, inf={n_inf}"
+        )
+    print(f"[NAN-CHECK] PASS kernel={args.kernel} (output finite)")
     compare_accuracy(current, reference)
-    if args.kernel in QUANT_KERNELS:
+    if KERNEL_SPECS[args.kernel].quantized:
         check_attention_outputs(
             current,
             reference,
@@ -1543,23 +1545,43 @@ def make_reference_output(
             )
         )
 
-    return primary_output(make_torch_ref_runner(q_bshd, k_bshd, v_bshd, args.causal)())
+    return primary_output(
+        attention_ref(
+            q_bshd,
+            k_bshd,
+            v_bshd,
+            dropout_p=0.0,
+            dropout_mask=None,
+            causal=args.causal,
+        )
+    )
 
 
 def compute_memory_bytes(
     shape: ShapeSpec,
-    q_element_size: int,
-    k_element_size: int,
-    v_element_size: int,
+    q_bytes_per_value: float,
+    k_bytes_per_value: float,
+    v_bytes_per_value: float,
 ) -> float:
     total_num_tokens_q = shape.batch * shape.n_ctx_q
     total_num_tokens_k = shape.batch * shape.n_ctx_k
 
-    q_size = total_num_tokens_q * shape.hq * shape.d_head * q_element_size
-    k_size = total_num_tokens_k * shape.hk * shape.d_head * k_element_size
-    v_size = total_num_tokens_k * shape.hk * shape.d_head_v * v_element_size
-    o_size = total_num_tokens_q * shape.hq * shape.d_head_v * q_element_size
+    q_size = total_num_tokens_q * shape.hq * shape.d_head * q_bytes_per_value
+    k_size = total_num_tokens_k * shape.hk * shape.d_head * k_bytes_per_value
+    v_size = total_num_tokens_k * shape.hk * shape.d_head_v * v_bytes_per_value
+    o_size = total_num_tokens_q * shape.hq * shape.d_head_v * 2.0
     return q_size + k_size + v_size + o_size
+
+
+def benchmark_payload_bytes(
+    args: argparse.Namespace,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> tuple[float, float, float]:
+    if args.e2e:
+        return float(q.element_size()), float(k.element_size()), float(v.element_size())
+    return KERNEL_SPECS[args.kernel].payload_bytes
 
 
 def benchmark_single_case(
@@ -1618,47 +1640,24 @@ def benchmark_single_case(
         * (shape.d_head + shape.d_head_v)
     )
 
-    if args.kernel in QUANT_KERNELS:
-        q_elem_size = 1
-        k_elem_size = 1
-    else:
-        q_elem_size = q.element_size()
-        k_elem_size = k.element_size()
-
-    v_elem_size = (
-        1
-        if args.kernel
-        in (
-            "fav3_fp8",
-            "mha4_mxfp8",
-            "mha4_fp8",
-            "mha4_f8f6",
-            "mha4_i8fp8",
-            "mha4_mxfp4",
-            "mha4_mxfp6",
-            "mha4_f6f4",
-            "mha4_f4f4",
-        )
-        else v.element_size()
-    )
-    mem = compute_memory_bytes(shape, q_elem_size, k_elem_size, v_elem_size)
+    mem = compute_memory_bytes(shape, *benchmark_payload_bytes(args, q, k, v))
 
     sparse_flops = None
     if block_lut is not None:
         sparse_flops, _ = sparse_flops_from_lut(args.kernel, block_lut, shape)
 
-    if "time(ms)" in provider:
+    if provider == "time(ms)":
         return ms
-    if "sparse_throughput(TFLOPS)" in provider:
+    if provider == "sparse_throughput(TFLOPS)":
         flops = sparse_flops if sparse_flops is not None else total_flops
         return flops / ms * 1e-9
-    if "throughput(TFLOPS)" in provider:
+    if provider == "throughput(TFLOPS)":
         return total_flops / ms * 1e-9
-    if "bandwidth(GB/s)" in provider:
+    if provider == "bandwidth(GB/s)":
         return mem / ms * 1e-6
-    if "arithmetic_intensity(FLOP/byte)" in provider:
+    if provider == "arithmetic_intensity(FLOP/byte)":
         return total_flops / mem
-    return ms
+    raise ValueError(f"Unknown benchmark provider: {provider}")
 
 
 def metric_lines(args: argparse.Namespace, include_sparse_metric: bool) -> list[str]:
@@ -1722,7 +1721,6 @@ def create_single_shape_config(args: argparse.Namespace) -> list[Any]:
                 "D_HEAD_V": d_head_v,
                 "dtype": arg_to_torch_dtype[args.dtype],
                 "layout": args.layout,
-                "causal": args.causal,
             },
         )
     ]
@@ -1775,7 +1773,6 @@ def create_mask_list_config(
                 "D_HEAD_V": args.dv,
                 "dtype": arg_to_torch_dtype[args.dtype],
                 "layout": args.layout,
-                "causal": args.causal,
                 "args": args,
                 "HQ": args.hq,
                 "HK": hk,
@@ -1818,12 +1815,26 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.block_sparsity is not None and args.block_mask_file:
         logger.info("Using --block-mask-file; ignoring --block-sparsity")
 
+    spec = None if args.kernel == "all" else KERNEL_SPECS[args.kernel]
+    sparse_requested = args.block_sparsity is not None or bool(args.block_mask_file)
+    if sparse_requested and (spec is None or not spec.supports_block_sparse):
+        raise ValueError(f"{args.kernel} does not support block-sparse mode")
+
+    if sparse_requested and args.causal:
+        raise ValueError("block-sparse mode supports non-causal attention only")
+
+    if args.n_repetitions is not None and (
+        args.block_sparsity is None or args.block_mask_file
+    ):
+        raise ValueError(
+            "--n-repetitions requires random --block-sparsity without "
+            "--block-mask-file"
+        )
+
     if args.ref not in ("torch", "aiter_bf16"):
         raise ValueError("--ref must be one of: torch, aiter_bf16")
 
     if args.kernel == "all":
-        if args.block_sparsity is not None or args.block_mask_file:
-            raise ValueError("--kernel=all does not support block-sparse mode")
         if args.load_captured:
             raise ValueError("--kernel=all does not support --load-captured")
         if not args.hadamard_rotate:
@@ -1832,27 +1843,20 @@ def validate_args(args: argparse.Namespace) -> None:
                 "--hadamard-rotate=1"
             )
 
-    if args.e2e and args.kernel not in QUANT_KERNELS and args.kernel != "all":
+    if args.causal and (spec is None or not spec.supports_causal):
+        raise ValueError(f"{args.kernel} supports non-causal attention only")
+
+    if args.qsmooth and args.kernel != "sage_mxfp4":
+        raise ValueError("--qsmooth is supported only by sage_mxfp4")
+
+    if args.n_repetitions is not None and args.n_repetitions <= 0:
+        raise ValueError("--n-repetitions must be positive")
+
+    if args.e2e and spec is not None and not spec.quantized:
         logger.warning("--e2e has no effect for kernel %s", args.kernel)
 
-    _hadamard_kernels = (
-        "sage_fp8",
-        "sage_mxfp4",
-        "fav3_fp8",
-        "mha4_mxfp8",
-        "mha4_fp8",
-        "mha4_f8f6",
-        "mha4_mxfp6",
-        "mha4_f6f4",
-        "mha4_mxfp4",
-        "mha4_f4f4",
-        "all",
-    )
-
-    if args.kernel not in _hadamard_kernels and (
-        args.qsmooth or args.hadamard_rotate is False
-    ):
-        logger.warning("Hadamard/qsmooth flags are ignored for kernel %s", args.kernel)
+    if spec is not None and not spec.uses_hadamard and not args.hadamard_rotate:
+        logger.warning("--hadamard-rotate is ignored for kernel %s", args.kernel)
 
 
 def run_benchmark_generated(
@@ -1870,7 +1874,6 @@ def run_benchmark_generated(
         D_HEAD_V,
         dtype,
         layout,
-        causal,
         provider,
         device="cuda",
     ):
@@ -1942,7 +1945,6 @@ def run_benchmark_mask_list(args: argparse.Namespace, masks: list[LoadedMask]) -
         D_HEAD_V,
         dtype,
         layout,
-        causal,
         args,
         HQ,
         HK,
@@ -2169,24 +2171,11 @@ def parse_args() -> argparse.Namespace:
         "--kernel",
         type=str,
         default="sage_fp8",
-        choices=[
-            "sage_fp8",
-            "sage_mxfp4",
-            "fav3_fp8",
-            "aiter_bf16",
-            "mha4_bf16",
-            "mha4_bf16fp8",
-            "mha4_i8fp8",
-            "mha4_mxfp8",
-            "mha4_fp8",
-            "mha4_f8f6",
-            "mha4_mxfp6",
-            "mha4_f6f4",
-            "mha4_mxfp4",
-            "mha4_f4f4",
-            "all",
-        ],
-        help="Kernel implementation to benchmark. Use 'all' to compare all backends.",
+        choices=[*KERNEL_SPECS, "all"],
+        help=(
+            "Kernel implementation to benchmark. Use 'all' to compare the "
+            "configured production MHA variants"
+        ),
     )
 
     parser.add_argument("--b", type=int, default=0, help="Batch size")
@@ -2231,12 +2220,6 @@ def parse_args() -> argparse.Namespace:
         help="Clip factor applied to Q and K absmax before int8 quantization for mha4_i8fp8",
     )
     parser.add_argument(
-        "--f8f6-v-scale",
-        choices=["block", "tensor", "head"],
-        default="block",
-        help="F8F6 V quantization scale granularity",
-    )
-    parser.add_argument(
         "--q-clip",
         type=float,
         default=None,
@@ -2260,7 +2243,10 @@ def parse_args() -> argparse.Namespace:
             "arithint",
             "sparseput",
         ],
-        help="Metric(s) to report (default: time+throughput only; 'all' does not include bandwidth/arithint)",
+        help=(
+            "Metric to report. 'all' reports dense throughput and, in sparse mode, "
+            "effective sparse throughput"
+        ),
     )
 
     parser.add_argument("-o", action="store_true", help="Write Triton output CSV")
@@ -2368,9 +2354,6 @@ def parse_args() -> argparse.Namespace:
         value = getattr(args, name)
         if value is not None and value <= 0.0:
             parser.error(f"--{name.replace('_', '-')} must be > 0")
-    args.f8f6_v_scale = os.environ.get("AITER_F8F6_V_SCALE", args.f8f6_v_scale)
-    if args.f8f6_v_scale not in ("block", "tensor", "head"):
-        parser.error("AITER_F8F6_V_SCALE must be one of: block, tensor, head")
     return args
 
 
@@ -2444,7 +2427,7 @@ def benchmark_all_kernel_row(
     k: torch.Tensor,
     v: torch.Tensor,
     total_flops: float,
-    ref_primary: torch.Tensor | None,
+    ref_primary: torch.Tensor,
 ) -> AllKernelRow:
     saved_kernel = args.kernel
     args.kernel = kernel_name
@@ -2452,11 +2435,9 @@ def benchmark_all_kernel_row(
         fn = make_kernel_runner(args, q, k, v, block_lut=None)
         ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
         tflops = total_flops / ms * 1e-9
-        accuracy = None
-        if ref_primary is not None:
-            current_primary = primary_output(fn())
-            current_primary = to_bshd_output_if_needed(current_primary, args.layout)
-            accuracy = compute_accuracy_metrics(current_primary, ref_primary)
+        current_primary = primary_output(fn())
+        current_primary = to_bshd_output_if_needed(current_primary, args.layout)
+        accuracy = compute_accuracy_metrics(current_primary, ref_primary)
         return AllKernelRow(kernel_name, ms, tflops, accuracy)
     finally:
         args.kernel = saved_kernel
@@ -2466,20 +2447,7 @@ def skipped_all_kernel_row(kernel_name: str) -> AllKernelRow:
     return AllKernelRow(kernel_name, float("nan"), float("nan"), None)
 
 
-def print_all_kernel_table(
-    rows: list[AllKernelRow],
-    include_accuracy: bool,
-) -> None:
-    if not include_accuracy:
-        print(f"{'kernel':<16} {'time(ms)':>10} {'TFLOPS':>10}")
-        print("-" * 38)
-        for row in rows:
-            if row.ms != row.ms:  # nan
-                print(f"{row.kernel:<16} {'SKIP':>10} {'SKIP':>10}")
-            else:
-                print(f"{row.kernel:<16} {row.ms:>10.4f} {row.tflops:>10.2f}")
-        return
-
+def print_all_kernel_table(rows: list[AllKernelRow]) -> None:
     print(
         f"{'kernel':<16} {'time(ms)':>10} {'TFLOPS':>10} {'MAE':>12} {'MaxE':>12} {'Cosine':>12}"
     )
@@ -2498,7 +2466,7 @@ def print_all_kernel_table(
 
 
 def run_all_kernels(args: argparse.Namespace) -> None:
-    """Run all backends on the same QKV inputs and print a comparison table."""
+    """Run the configured production MHA variants on shared QKV inputs."""
     dtype = arg_to_torch_dtype[args.dtype]
     device = "cuda"
     hk = args.hk if args.hk else args.hq
@@ -2557,7 +2525,7 @@ def run_all_kernels(args: argparse.Namespace) -> None:
     print(
         f"\nbench_sage --kernel=all  (b={args.b} hq={args.hq} sq={args.sq} sk={sk} d={d_head} input={args.input_distribution}):"
     )
-    print_all_kernel_table(rows, include_accuracy=True)
+    print_all_kernel_table(rows)
 
 
 def run_with_optional_vgpr(args: argparse.Namespace, runner: Any) -> int:
