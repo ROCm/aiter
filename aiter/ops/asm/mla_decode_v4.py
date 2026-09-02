@@ -144,6 +144,11 @@ def mla_decode_v4_asm_gfx1250_eager(
     del split_indptr  # not part of the compact preload kernarg
 
     # ---- contract checks (mirror the AITER_CHECKs in the .cu) --------------
+    if out_16_nosplit != 0 and splitData.data_ptr() != output.data_ptr():
+        raise ValueError(
+            "mla_decode_v4_asm_gfx1250: when out_16_nosplit!=0, the kernel "
+            "writes through splitData (ptr_R); splitData must alias output"
+        )
     if sink is None or sink.data_ptr() == 0:
         raise ValueError("mla_decode_v4_asm_gfx1250: `sink` must not be NULL")
     if not (Q.is_contiguous() and KV.is_contiguous()):
