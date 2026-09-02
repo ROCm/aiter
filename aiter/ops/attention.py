@@ -1890,7 +1890,9 @@ def mtp_verify_attn_num_segments(num_seqs: int, num_kv_heads: int) -> int:
     """Split-KV segments per sequence so the grid (segments, seqs, kv heads)
     fills the GPU in one round of 1-work-group-per-CU. Any value in [1, 64] is
     valid; empty segments are written neutrally by the kernel."""
-    num_cus = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    num_cus = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
     segs = max(1, num_cus // max(1, num_seqs * num_kv_heads))
     segs = 1 << (segs.bit_length() - 1)
     return max(1, min(64, segs))
@@ -1929,14 +1931,34 @@ def mtp_verify_attn_fwd_asm(
     if num_segments is None:
         num_segments = mtp_verify_attn_num_segments(num_seqs, num_kv_heads)
     segm_out = torch.empty(
-        num_tokens, num_q_heads, num_segments, head_size, dtype=torch.float32, device=q.device
+        num_tokens,
+        num_q_heads,
+        num_segments,
+        head_size,
+        dtype=torch.float32,
+        device=q.device,
     )
-    segm_max = torch.empty(num_tokens, num_q_heads, num_segments, dtype=torch.float32, device=q.device)
+    segm_max = torch.empty(
+        num_tokens, num_q_heads, num_segments, dtype=torch.float32, device=q.device
+    )
     segm_expsum = torch.empty_like(segm_max)
     if out is None:
-        out = torch.empty(num_tokens, num_q_heads, head_size, dtype=q.dtype, device=q.device)
+        out = torch.empty(
+            num_tokens, num_q_heads, head_size, dtype=q.dtype, device=q.device
+        )
     _mtp_verify_attn_fwd(
-        q, k_cache, v_cache, block_tables, seq_lens, cu_seqlens_q,
-        k_descale, v_descale, segm_out, segm_max, segm_expsum, out, float(softmax_scale),
+        q,
+        k_cache,
+        v_cache,
+        block_tables,
+        seq_lens,
+        cu_seqlens_q,
+        k_descale,
+        v_descale,
+        segm_out,
+        segm_max,
+        segm_expsum,
+        out,
+        float(softmax_scale),
     )
     return out
