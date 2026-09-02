@@ -70,6 +70,7 @@ _kernel_unified_attention_2d_repr = make_kernel_repr(
         "BLOCK_M",
         "ALL_DECODE",
         "SHUFFLED_KV_CACHE",
+        "SPLIT_UNMASKED_LOOP",
         "K_WIDTH",
     ],
 )
@@ -125,7 +126,7 @@ def kernel_unified_attention_2d(
     FP8_MAX: tl.constexpr = float8_info.max,
     ALL_DECODE: tl.constexpr = False,  # bool
     SHUFFLED_KV_CACHE: tl.constexpr = False,  # bool
-    USE_PREFILL_FAST_PATH: tl.constexpr = False,  # bool
+    SPLIT_UNMASKED_LOOP: tl.constexpr = False,  # bool
     K_WIDTH: tl.constexpr = 0,  # int
 ):
     kv_head_idx = tl.program_id(0)
@@ -282,13 +283,7 @@ def kernel_unified_attention_2d(
         v_descale = None
     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
 
-    if (
-        USE_PREFILL_FAST_PATH
-        and HEAD_SIZE == 128
-        and SLIDING_WINDOW <= 0
-        and not ALL_DECODE
-        and not SHUFFLED_KV_CACHE
-    ):
+    if SPLIT_UNMASKED_LOOP:
         min_query_key_limit = context_len + q_block_local_idx * BLOCK_Q + 1
         unmasked_tile_end = tl.minimum(min_query_key_limit // TILE_SIZE, tile_end)
         unmasked_tile_end = tl.maximum(unmasked_tile_end, tile_start)
