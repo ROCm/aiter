@@ -93,6 +93,72 @@ def check_support(dtype, kv_dtype, nhead):
     return not (dtype == dtypes.bf16 and nhead == 32 and get_gfx() == "gfx942")
 
 
+def test_fold_seqlen_indptr_cuda_graph_capture(fold_factor, num_batches=(1, 8, 37)):
+    """Regression test: _fold_seqlen_indptr must be safe to capture into a
+    CUDA graph.
+
+    mla_decode_fwd's nhead-folding branch (nhead in range(32, 128+1, 16),
+    persistent_mode) calls _fold_seqlen_indptr to build the folded qo/kv
+    indptrs. It used to build its output with:
+        out = torch.empty(...)
+        out[0] = 0
+        out[1:] = torch.cumsum(...)
+    `out[0] = 0` assigns a Python scalar into a CUDA tensor, which lowers
+    to an unpinned host->device copy -- illegal while a CUDA graph is
+    being captured. Real callers (e.g. vLLM) capture this exact branch
+    during CUDA-graph warmup/memory-profiling, so this crashed in
+    production despite passing eager-mode-only accuracy tests.
+
+    This captures the helper directly (with the documented side-stream
+    warmup prerequisite for torch.cuda.graph()), replays with DIFFERENT
+    indptr contents than were captured, and checks the replayed result
+    against an eager-mode reference -- following the same pattern as
+    test_moe_sorting_flydsl_cuda_graph_capture (itself a regression test
+    for an analogous .item()/host-copy capture-safety bug).
+    """
+    device = "cuda"
+    dtype = torch.int32  # matches qo_indptr/kv_indptr dtype used in practice
+
+    def make_indptr(batch_size, seed):
+        g = torch.Generator(device=device).manual_seed(seed)
+        seqlens = torch.randint(0, 4096, (batch_size,), device=device, generator=g)
+        indptr = torch.zeros(batch_size + 1, dtype=dtype, device=device)
+        indptr[1:] = torch.cumsum(seqlens, dim=0).to(dtype)
+        return indptr
+
+    for batch_size in num_batches:
+        capture_indptr = make_indptr(batch_size, seed=0)
+
+        # Standard torch.cuda.graph() prerequisite: warm up on a side stream.
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(3):
+                aiter.mla._fold_seqlen_indptr(capture_indptr, fold_factor)
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = aiter.mla._fold_seqlen_indptr(capture_indptr, fold_factor)
+        torch.cuda.synchronize()
+
+        # Replay with different *contents* at the same address -- indptr is
+        # captured by reference, so mutating it (not the tensor object) is
+        # what a real decode step does across replays with a new batch.
+        replay_indptr = make_indptr(batch_size, seed=1)
+        capture_indptr.copy_(replay_indptr)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        ref = aiter.mla._fold_seqlen_indptr(replay_indptr, fold_factor)
+        assert torch.equal(out, ref), (
+            f"_fold_seqlen_indptr cuda-graph replay mismatch "
+            f"(fold_factor={fold_factor}, batch_size={batch_size}): "
+            f"captured/replayed={out}, eager_ref={ref}"
+        )
+
+
 def init_3buffer_kv_cache(
     num_page: int,
     page_size: int,
@@ -2080,3 +2146,18 @@ for nhead, decode_qlen in args.nhead:
     # df.to_csv(f"mla_nhead{nhead}decode_qlen{decode_qlen}.csv")
     df_md = df.to_markdown(index=False)
     aiter.logger.info("mla_persistent summary (markdown):\n%s", df_md)
+
+# CUDA-graph capture-safety regression check for the nhead-folding branch
+# (nhead in range(32, 128+1, 16), persistent_mode) -- runs for whichever fold
+# factors the requested -n/--nhead configs actually exercise.
+tested_fold_factors = sorted(
+    {nhead // 16 for nhead, _ in args.nhead if nhead in range(32, 128 + 1, 16)}
+)
+for fold_factor in tested_fold_factors:
+    test_fold_seqlen_indptr_cuda_graph_capture(fold_factor)
+if tested_fold_factors:
+    aiter.logger.info(
+        "_fold_seqlen_indptr cuda-graph capture/replay: all passed "
+        "(fold_factor=%s)",
+        tested_fold_factors,
+    )
