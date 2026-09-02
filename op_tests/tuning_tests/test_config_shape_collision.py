@@ -269,7 +269,7 @@ class TestConfigShapeCollision(unittest.TestCase):
                     os.environ[env_name] = old_value
                 _cache_clear()
                 policy._load_mxscale_bmm_tuned.cache_clear()
- 
+
     def test_batched_gemm_a8w8_blockscale_mxscale_bpreshuffle(self):
         self._check_family(
             "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",

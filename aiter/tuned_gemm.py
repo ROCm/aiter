@@ -34,7 +34,7 @@ try:
 except Exception:  # noqa: BLE001  blanket catch is intentional here
     _opus_launch = None
 
- 
+
 @functools.lru_cache(maxsize=1)
 def _get_flydsl_gemm_kernels():
     from aiter.ops.flydsl import gemm_kernels

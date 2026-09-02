@@ -5,11 +5,13 @@
 from __future__ import annotations
 
 import inspect
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from aiter import dtypes
+from aiter.ops import batched_gemm_op_a8w8 as batched_a8w8
 from aiter.ops import gemm_op_a8w8 as general_a8w8
 from aiter.ops.opus import gemm_op_a8w8 as opus_a8w8
 from aiter.ops.opus import opus_gemm
@@ -214,3 +216,70 @@ def test_bpreshuffle_uses_opus_for_tuned_row(monkeypatch):
     assert opus_calls[0]["x_scale"] is x_scale
     assert opus_calls[0]["w_scale"] is w_scale
     assert ck_calls == []
+
+
+def test_mxscale_launch_plan_cache_is_bounded(monkeypatch):
+    calls = []
+
+    def resolve(g, m, n, k):
+        calls.append((g, m, n, k))
+        return 8000, 1
+
+    monkeypatch.setattr(
+        batched_a8w8,
+        "_resolve_a8w8_mxscale_bmm_plan",
+        resolve,
+    )
+    batched_a8w8._get_mxscale_bmm_launch_plan.cache_clear()
+    try:
+        for m in range(1025):
+            assert batched_a8w8._get_mxscale_bmm_launch_plan(2, m, 1024, 4096) == (
+                8000,
+                1,
+            )
+
+        cache = batched_a8w8._get_mxscale_bmm_launch_plan.cache_info()
+        assert cache.maxsize == 1024
+        assert cache.currsize == 1024
+        assert len(calls) == 1025
+    finally:
+        batched_a8w8._get_mxscale_bmm_launch_plan.cache_clear()
+
+
+def test_mxscale_invalid_tuned_kid_warns_and_uses_heuristic(
+    monkeypatch,
+    tmp_path,
+):
+    from aiter.ops.opus import policy
+
+    config_path = tmp_path / "mxscale.csv"
+    config_path.write_text(
+        "gfx,b,m,n,k,libtype,kernelId,splitK\n" "gfx950,2,1,1024,4096,opus,8001,1\n"
+    )
+    warnings = []
+    monkeypatch.setattr(
+        policy,
+        "AITER_CONFIGS",
+        SimpleNamespace(
+            AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE=str(config_path)
+        ),
+    )
+    monkeypatch.setattr(policy, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(policy, "get_padded_m", lambda m, _n, _k, _gl: m)
+    monkeypatch.setattr(
+        policy.logger,
+        "warning",
+        lambda *args, **_kwargs: warnings.append(args),
+    )
+    policy._load_mxscale_bmm_tuned.cache_clear()
+    policy.lookup_mxscale_bmm_config.cache_clear()
+    try:
+        assert policy.resolve_a8w8_mxscale_bmm_plan(2, 1, 1024, 4096) == (
+            8640,
+            1,
+        )
+        assert len(warnings) == 1
+        assert warnings[0][0].startswith("Skipping %d invalid OPUS row")
+    finally:
+        policy.lookup_mxscale_bmm_config.cache_clear()
+        policy._load_mxscale_bmm_tuned.cache_clear()

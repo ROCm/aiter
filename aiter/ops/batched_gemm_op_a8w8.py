@@ -18,10 +18,10 @@ from ..jit.utils.chip_info import get_cu_num
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
+from .gemm_op_common import get_padded_m
 from .opus.policy import (
     resolve_a8w8_mxscale_bmm_plan as _resolve_a8w8_mxscale_bmm_plan,
 )
-from .gemm_op_common import get_padded_m
 
 
 def gen_batched_gemm_a8w8_fake_tensors(
@@ -255,9 +255,14 @@ def lookup_mxscale_bmm_config(
     return row
 
 
-_MXSCALE_BMM_LAUNCH_PLANS: dict[
-    tuple[int, int, int, int], tuple[object, object, int, int]
-] = {}
+@functools.lru_cache(maxsize=1024)
+def _get_mxscale_bmm_launch_plan(
+    g: int,
+    m: int,
+    n: int,
+    k: int,
+) -> tuple[int, int]:
+    return _resolve_a8w8_mxscale_bmm_plan(g, m, n, k)
 
 
 def _batched_gemm_a8w8_mxscale_impl(
@@ -272,18 +277,8 @@ def _batched_gemm_a8w8_mxscale_impl(
     # Python int() conversions on every short BMM launch.
     m, g, k = x.shape
     n = wo_a.shape[1]
-    plan_key = (g, m, n, k)
-    try:
-        raw_launch, opus_bmm, kid, split_k = _MXSCALE_BMM_LAUNCH_PLANS[plan_key]
-    except KeyError:
-        raw_launch, opus_bmm = _get_mxscale_bmm_launchers()
-        kid, split_k = _resolve_a8w8_mxscale_bmm_plan(g, m, n, k)
-        _MXSCALE_BMM_LAUNCH_PLANS[plan_key] = (
-            raw_launch,
-            opus_bmm,
-            kid,
-            split_k,
-        )
+    raw_launch, opus_bmm = _get_mxscale_bmm_launchers()
+    kid, split_k = _get_mxscale_bmm_launch_plan(g, m, n, k)
 
     Y = torch.empty((m, g, n), dtype=dtype, device=x.device)
     if split_k <= 1:

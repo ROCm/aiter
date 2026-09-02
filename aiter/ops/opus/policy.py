@@ -568,7 +568,6 @@ def resolve_a16w16_caller_candidate(
 
 _MXSCALE_BMM_KID_OFFSET = 8000
 _MXSCALE_BMM_LOCAL_KID_MAX = 653
-_MXSCALE_BMM_GLOBAL_KID_MAX = _MXSCALE_BMM_KID_OFFSET + _MXSCALE_BMM_LOCAL_KID_MAX
 _TUNED_PERF_COLUMNS = ("us", "tflops", "bw", "errRatio")
 
 
@@ -586,35 +585,42 @@ def _load_mxscale_bmm_tuned(libtype: str | None = None) -> dict:
     if missing:
         raise ValueError(f"MXFP8 BMM tuned CSV is missing columns {sorted(missing)}")
 
-    # The checked-in tuned data uses the original local OPUS ids (0..653),
-    # while the unified public dispatcher owns the 8000 band. Keep the source
-    # CSV unchanged and translate only OPUS rows in memory.
+    if libtype is not None and "libtype" in df.columns:
+        df = df[df["libtype"] == libtype].copy()
+
     opus_rows = (
         df["libtype"].eq("opus")
         if "libtype" in df.columns
         else pd.Series(True, index=df.index, dtype=bool)
     )
-    legacy_opus_rows = opus_rows & df["kernelId"].between(0, _MXSCALE_BMM_LOCAL_KID_MAX)
-    df.loc[legacy_opus_rows, "kernelId"] += _MXSCALE_BMM_KID_OFFSET
 
-    if libtype is not None and "libtype" in df.columns:
-        df = df[df["libtype"] == libtype]
+    # Checked-in rows predate the unified dispatcher and use local ids. Convert
+    # those ids in memory, then require an exact registry entry; a numeric band
+    # reserves identities but does not prove that a kernel is registered.
+    opus_kids = pd.to_numeric(df.loc[opus_rows, "kernelId"], errors="coerce")
+    legacy_rows = opus_kids.between(0, _MXSCALE_BMM_LOCAL_KID_MAX)
+    opus_kids.loc[legacy_rows] += _MXSCALE_BMM_KID_OFFSET
+    integer_kids = (
+        opus_kids.notna() & opus_kids.lt(float("inf")) & opus_kids.eq(opus_kids.round())
+    )
+    registered_kids = pd.Series(False, index=opus_kids.index, dtype=bool)
+    for index in opus_kids.index[integer_kids]:
+        kid = int(opus_kids.at[index])
+        arch = str(df.at[index, "gfx"]).lower().split(":", 1)[0]
+        if get_kernel_instance(arch, "a8w8_mxscale_bmm", kid) is not None:
+            df.at[index, "kernelId"] = kid
+            registered_kids.at[index] = True
 
-    selected_opus_rows = (
-        df["libtype"].eq("opus")
-        if "libtype" in df.columns
-        else pd.Series(True, index=df.index, dtype=bool)
-    )
-    invalid_opus_kids = selected_opus_rows & ~df["kernelId"].between(
-        _MXSCALE_BMM_KID_OFFSET, _MXSCALE_BMM_GLOBAL_KID_MAX
-    )
-    if invalid_opus_kids.any():
-        raise ValueError(
-            "MXFP8 BMM tuned CSV must contain global OPUS kids in the "
-            f"{_MXSCALE_BMM_KID_OFFSET}-{_MXSCALE_BMM_GLOBAL_KID_MAX} range "
-            "or legacy local OPUS kids in the "
-            f"0-{_MXSCALE_BMM_LOCAL_KID_MAX} range"
+    invalid_opus_rows = opus_rows.copy()
+    invalid_opus_rows.loc[opus_rows] = ~registered_kids
+    if invalid_opus_rows.any():
+        logger.warning(
+            "Skipping %d invalid OPUS row(s) in MXFP8 BMM tuned CSV %r: "
+            "kernelId must resolve to a registered MXFP8 BMM kernel",
+            int(invalid_opus_rows.sum()),
+            path,
         )
+        df = df.loc[~invalid_opus_rows].copy()
 
     shape_keys = ["gfx", "b", "m", "n", "k"]
     duplicate_shapes = df.duplicated(subset=shape_keys, keep=False)
