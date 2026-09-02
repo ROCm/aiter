@@ -33,7 +33,7 @@ from .qr_int4_kernel import (
     SUPPORTED_WORLDS,
     _i32_to_bytes,
     _invalidate_l1,
-    _store_v4i32_peer,
+    _store_v4i32_peer_multi,
     _to_sgpr_i64,
 )
 
@@ -47,15 +47,20 @@ DEFAULT_ATOMS = 1
 # the last partial tile. 1 is the decode default: at TP8/M=1 (14 KiB) it gives
 # 4 blocks, which is already more parallelism than the payload needs.
 #
-# TODO: ONLY 1 IS CORRECT TODAY. atoms=4 was measured wrong at TP4 on every shape
-# tested (m=1..16): the last rank's output diverges from the others and SQNR is
-# -inf, i.e. the reduction is reading something that is not the payload. atoms=1
-# passes the same test at TP2 and TP4 including the run-ahead loop, so the fault
-# is in the multi-atom addressing -- the per-atom stride is used in three places
-# (``_fanout``, ``_reduce`` and the ``hbm_layout`` slice) and they are not yet
-# proven to agree. Listed as (1,) rather than left open so the broken values are
-# rejected at construction instead of silently producing garbage.
-SUPPORTED_ATOMS = (1,)
+# ``atoms>1`` used to be gated off here as incorrect. The diagnosis blamed the
+# per-atom stride in ``_fanout`` / ``_reduce`` / ``hbm_layout``; that was wrong,
+# those three always agreed. The real fault was a VMEM store hazard the fanout
+# only exposes under the register pressure of several atoms -- see
+# ``_store_v4i32_peer_multi`` in ``qr_int4_kernel.py``, which now carries the
+# whole fanout in one asm block. Passes at TP2 and TP4 for 1, 2 and 4 including
+# the run-ahead loop.
+#
+# Correct is not the same as useful: 2 and 4 are both measurably SLOWER than 1
+# at every decode shape (TP4/xGMI, ~+3 and ~+7 us), because a fatter tile buys
+# fewer blocks and this kernel is already short of them -- atoms=4 at M=1 is a
+# single block. They stay supported so the lever is testable at other payload
+# sizes and world sizes; 1 remains the default.
+SUPPORTED_ATOMS = (1, 2, 4)
 DEFAULT_GRID_CAP = 64
 
 # Inbox slots are indexed by ``colour & 1``. Two buffers is exactly enough to
@@ -80,6 +85,24 @@ _RECV_POLICY = _CM_SC0 | _CM_SC1
 # so spreading across links sooner can start more of them in parallel.
 FANOUT_ORDERS = ("peer", "atom")
 DEFAULT_FANOUT = "peer"
+
+# Measurement-only build variants. "sync" keeps the colour loop, the flag
+# publish and the flag wait but touches no payload, so it times the floor this
+# schedule cannot go below: launch path + one flag round trip + rank-arrival
+# skew. It computes a wrong answer by construction and must never be dispatched
+# to; ``OneShotAllReduce`` refuses to run a probe build through ``allreduce``.
+PROBE_MODES = ("full", "sync")
+
+# ``s_sleep`` interval for the flag spin, 0 to spin flat out.
+#
+# Measured and left off. TP4/xGMI, m in {1,4,8,16}: 1 and 2 land within
+# +-0.35 us of no backoff, which is under this bench's noise, and 32 is
+# consistently *worse* at every shape (+0.3 to +0.6 us). That is what the floor
+# probe predicts -- the whole handshake is only 1.5-2.5 us of an ~11.6 us wall
+# at m=1, so there is nothing here to win. Kept as a knob rather than deleted
+# because the interesting case is TP8, where arrival skew and flag traffic are
+# both much worse and none of this has been measured.
+DEFAULT_SPIN_SLEEP = 0
 
 
 def _load_v4i32_at(rsrc, elem_off, policy):
@@ -119,6 +142,8 @@ def make_qr_1stage_kernel(
     grid: int,
     inbox_memory: str = "uncached",
     fanout: str = DEFAULT_FANOUT,
+    probe: str = "full",
+    spin_sleep: int = DEFAULT_SPIN_SLEEP,
 ):
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(
@@ -132,6 +157,10 @@ def make_qr_1stage_kernel(
         )
     if fanout not in FANOUT_ORDERS:
         raise ValueError(f"fanout must be one of {FANOUT_ORDERS}, got {fanout!r}")
+    if probe not in PROBE_MODES:
+        raise ValueError(f"probe must be one of {PROBE_MODES}, got {probe!r}")
+    if not 0 <= int(spin_sleep) <= 0xFFFF:
+        raise ValueError(f"spin_sleep must fit s_sleep's imm16, got {spin_sleep!r}")
     if grid < 1:
         raise ValueError(f"grid must be positive, got {grid}")
 
@@ -262,17 +291,25 @@ def make_qr_1stage_kernel(
             receive loop uniform over ``world_size``. Dropping it is a tuning
             lever, not a correctness one.
             """
-            for peer, atom in fanout_pairs:
-                elem = (
-                    _slot_i32(parity, rank)
-                    + fx.Int32(atom * BLOCK * ATOM_I32)
-                    + tid * fx.Int32(ATOM_I32)
-                )
-                _store_v4i32_peer(
-                    peer_vec[peer] + _i32_to_bytes(elem),
-                    my_atoms[atom],
-                    payload_policy,
-                )
+            # One asm block for the whole fanout: the stores must not have
+            # their data VGPRs recycled before ``vmcnt`` retires them, and
+            # LLVM cannot see that through inline asm. See
+            # ``_store_v4i32_peer_multi``.
+            _store_v4i32_peer_multi(
+                [
+                    (
+                        peer_vec[peer]
+                        + _i32_to_bytes(
+                            _slot_i32(parity, rank)
+                            + fx.Int32(atom * BLOCK * ATOM_I32)
+                            + tid * fx.Int32(ATOM_I32)
+                        ),
+                        my_atoms[atom],
+                    )
+                    for peer, atom in fanout_pairs
+                ],
+                payload_policy,
+            )
 
         def _publish(parity, color):
             """Drain the payload stores, then write *color* into every peer.
@@ -288,19 +325,29 @@ def make_qr_1stage_kernel(
             if release_writeback is not None:
                 llvm.InlineAsmOp(None, [], release_writeback, "", has_side_effects=True)
                 rocdl.s_waitcnt(vmcnt=0)
-            limit = fx.Int32(world_size * 4)
-            safe = (tid < limit).select(tid, fx.Int32(0))
-            if tid < limit:
-                # 4 lanes per destination, one dwordx4 each -> the 64 B sector.
-                peer = safe // fx.Int32(4)
+            # 4 lanes, one dwordx4 each -> the 64 B sector, unrolled over the
+            # destinations. The peer index must be a trace-time constant: an
+            # earlier version keyed it off the lane (``peer = tid // 4``, 4 lanes
+            # per destination), which made ``peer_vec[peer]`` a *lane-varying*
+            # extract from a 4xi64 vector. That lowers to a scratch round-trip,
+            # and at ``atoms>1`` the register pressure made it land in the
+            # payload: 8 B of peer pointer at 16 B stride over a 64 B span, once
+            # per 256 B, in atom 0 of the highest-numbered rank's inbox. See the
+            # ``SUPPORTED_ATOMS`` note. ``_fanout`` always unrolled; this is now
+            # consistent with it.
+            if tid < fx.Int32(4):
                 elem = (
                     _slot_i32(parity, rank)
                     + fx.Int32(tile_i32)
                     + lane_in_quad * fx.Int32(4)
                 )
                 v4 = fx.Vector.from_elements([color, color, color, color], fx.Int32)
-                _store_v4i32_peer(
-                    peer_vec[peer] + _i32_to_bytes(elem), v4, flag_policy
+                _store_v4i32_peer_multi(
+                    [
+                        (peer_vec[peer] + _i32_to_bytes(elem), v4)
+                        for peer in range(world_size)
+                    ],
+                    flag_policy,
                 )
 
         def _wait(parity, color):
@@ -320,6 +367,14 @@ def make_qr_1stage_kernel(
                 )
                 current = _load_i32_at(flag_rsrc, fx.Int32(0), _CM_SC1)
                 while current != color:
+                    if spin_sleep:
+                        # Back off between polls. Each iteration costs an L1
+                        # invalidate plus an sc1 load, and under arrival skew
+                        # that runs for the whole skew window against the same
+                        # line the peer is trying to write.
+                        llvm.InlineAsmOp(
+                            None, [], f"s_sleep {spin_sleep}", "", has_side_effects=True
+                        )
                     current = _load_i32_at(flag_rsrc, fx.Int32(0), _CM_SC1)
                     _invalidate_l1()
             gpu.barrier()
@@ -360,11 +415,18 @@ def make_qr_1stage_kernel(
         for i in range(fx.Int32(0), n_block_tiles, fx.Int32(1)):
             tile = bid + i * n_blocks
             parity = color & fx.Int32(1)
-            my_atoms = _load_tile(tile)
-            _fanout(parity, my_atoms)
+            # ``probe`` is a trace-time constant, so only one arm is emitted.
+            # "sync" is measurement-only: the handshake with no payload
+            # touched, so the wall time is the launch path plus the flag round
+            # trip plus rank-arrival skew. Nothing this schedule does to the
+            # data movement can go below it. Output is garbage.
+            if probe == "full":
+                my_atoms = _load_tile(tile)
+                _fanout(parity, my_atoms)
             _publish(parity, color)
             _wait(parity, color)
-            _store_tile(tile, _reduce(parity))
+            if probe == "full":
+                _store_tile(tile, _reduce(parity))
             color = color + fx.Int32(1)
             if color == fx.Int32(0):  # 0 is the unset sentinel
                 color = fx.Int32(1)
@@ -401,6 +463,10 @@ def make_qr_1stage_kernel(
     # Every compile-time knob that changes the emitted code has to be in the
     # symbol name, or two variants collide in the JIT cache.
     tag = f"ws{world_size}_a{atoms}_{inbox_memory}_{fanout}"
+    if probe != "full":
+        tag += f"_{probe}"
+    if spin_sleep:
+        tag += f"_sl{spin_sleep}"
     launch_qr_1stage.func.__name__ = f"launch_qr_1stage_{tag}"
     try:
         qr_1stage.func.__name__ = f"qr_1stage_{tag}"
@@ -424,6 +490,8 @@ def make_qr_1stage_kernel(
         "world_size": world_size,
         "inbox_memory": inbox_memory,
         "fanout": fanout,
+        "probe": probe,
+        "spin_sleep": spin_sleep,
         "grid": grid,
         "block": BLOCK,
     }

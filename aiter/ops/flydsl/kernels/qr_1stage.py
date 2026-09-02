@@ -29,6 +29,7 @@ from .qr_1stage_kernel import (
     DEFAULT_ATOMS,
     DEFAULT_FANOUT,
     DEFAULT_GRID_CAP,
+    DEFAULT_SPIN_SLEEP,
     SUPPORTED_ATOMS,
     make_qr_1stage_kernel,
 )
@@ -52,12 +53,19 @@ logger = logging.getLogger("aiter")
 # round-trip saving dominates and the extra bytes are free; well above it they
 # are not.
 #
-# 256 KiB is a provisional boundary chosen to cover the decode range of interest
-# (M<=16 at hidden 7168 is 224 KiB) and stop short of where the extra volume can
-# plausibly matter. It has NOT been measured -- the crossover sweep is a tuning
-# task, and until it is run this number should be treated as a guard rail rather
-# than a tuned threshold.
-MAX_PAYLOAD_BYTES = 256 << 10
+# Measured at TP4 on xGMI, hidden 7168, sweeping 64 KiB -> 4 MiB against
+# cdr:2stage. Taking the min over three runs -- which is the honest read of cdr
+# here, because the intermittent cliff of docs/qr_1stage.md 5.2 fires almost
+# every run in this size range and inflates its mean by 15-20 us -- one-shot
+# wins through 210 KiB (1.03-1.18x) and loses from 224 KiB (0.92x), falling to
+# 0.60x by 2 MiB. So the crossover sits at ~215 KiB and the previous 256 KiB
+# guess was admitting sizes where this kernel is the wrong choice.
+#
+# 192 KiB rather than 215: the measurement is TP4-only, and TP8 is strictly
+# worse for a one-shot (7S of wire volume against a two-shot's 1.75S, versus
+# 3S/1.5S here), so the true crossover moves *down* with world size. The margin
+# is deliberate until TP8 is measured.
+MAX_PAYLOAD_BYTES = 192 << 10
 
 
 class OneShotAllReduce:
@@ -89,6 +97,8 @@ class OneShotAllReduce:
         inbox_memory: str = "auto",
         fanout: str = DEFAULT_FANOUT,
         max_bytes: int | None = None,
+        probe: str = "full",
+        spin_sleep: int = DEFAULT_SPIN_SLEEP,
     ):
         if world_size not in SUPPORTED_WORLDS:
             raise ValueError(
@@ -125,6 +135,8 @@ class OneShotAllReduce:
         self.inbox_memory = resolved_inbox
         self.fanout = fanout
         self.max_bytes = MAX_PAYLOAD_BYTES if max_bytes is None else int(max_bytes)
+        self.probe = probe
+        self.spin_sleep = int(spin_sleep)
 
         spec = make_qr_1stage_kernel(
             world_size=self.world_size,
@@ -132,6 +144,8 @@ class OneShotAllReduce:
             grid=cap,
             inbox_memory=resolved_inbox,
             fanout=fanout,
+            probe=probe,
+            spin_sleep=int(spin_sleep),
         )
         self._eng = _StEngine(
             spec=spec,
@@ -208,6 +222,12 @@ class OneShotAllReduce:
         return int(nbytes) <= self.max_bytes
 
     def allreduce(self, inp, out, stream=None):
+        if self.probe != "full":
+            raise RuntimeError(
+                f"OneShotAllReduce was built with probe={self.probe!r}, a "
+                "measurement-only variant that does not move the payload and "
+                "computes a wrong answer. Use compile()/_launch() to time it."
+            )
         live_bytes = self._check_payload(inp, out)
         if not self.is_beneficial(live_bytes):
             raise ValueError(

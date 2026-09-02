@@ -322,9 +322,15 @@ CANDIDATES = (
     # small-grid theory -- these rows re-test it on a kernel we control.
     Candidate("fly_1stage_g8", "fly1s", 40.0, True, grid_cap=8),
     Candidate("fly_1stage_g32", "fly1s", 40.0, True, grid_cap=32),
-    # A fatter-tile row (atoms=4, a 16 KiB tile, a quarter the blocks and a
-    # quarter the flags) belongs here and is deliberately absent: atoms>1 is
-    # currently incorrect, see SUPPORTED_ATOMS in qr_1stage_kernel.py.
+    # Fatter tiles: atoms=2 is an 8 KiB tile and atoms=4 a 16 KiB one, so half
+    # and a quarter the blocks and the flags for a given payload. Measured at
+    # TP4/xGMI and kept as evidence rather than as a candidate to ship: both
+    # LOSE at every decode shape, by ~3 us (a2) and ~7 us (a4), a consistent
+    # sign well outside the 0.15-0.93 us cdr spread. Fatter tiles are just
+    # another way to spend blocks, and a4 at M=1 buys a *single* block -- the
+    # same too-few-blocks cliff grid_cap=8 falls off.
+    Candidate("fly_1stage_a2", "fly1s", 40.0, True, atoms=2),
+    Candidate("fly_1stage_a4", "fly1s", 40.0, True, atoms=4),
     # Fanout order: "atom" spreads consecutive stores across peers instead of
     # handing each destination a contiguous run. Expected to matter on xGMI,
     # where the native packet is 64 B, and to lose on PCIe.
@@ -456,9 +462,21 @@ def applicable(cand: Candidate, world_size: int, dtype, numel: int, nbytes: int)
             and get_gfx() in _FLY_ARCHS
             and world_size in _FLY_WORLDS
             and dtype == dtypes.bf16
-            and nbytes <= _FLY1S_MAX_BYTES
+            and nbytes <= _fly1s_ceiling()
         )
     return True  # rccl
+
+
+def _fly1s_ceiling() -> int:
+    """Payload ceiling for the one-shot rows, overridable for the sweep.
+
+    ``MAX_PAYLOAD_BYTES`` is a *policy*, not a correctness limit -- the kernel
+    is exact at every size -- so measuring where the policy should sit means
+    lifting it. ``AITER_BENCH_FLY1S_MAX_KB`` does that for one run without
+    editing the shipped constant.
+    """
+    kb = os.environ.get("AITER_BENCH_FLY1S_MAX_KB")
+    return int(kb) << 10 if kb else _FLY1S_MAX_BYTES
 
 
 def sqnr_db(got: torch.Tensor, ref: torch.Tensor) -> float:
@@ -898,6 +916,7 @@ def _worker(
                 device=device,
                 rank=rank,
                 world_size=tp_size,
+                max_bytes=_fly1s_ceiling(),
                 **kw,
             )
         warm = torch.zeros((8, DSV4_HIDDEN), dtype=dtypes.bf16, device=device)

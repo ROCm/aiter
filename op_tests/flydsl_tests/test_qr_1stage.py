@@ -36,6 +36,14 @@ HIDDEN = 7168
 # per block at a small grid cap.
 SHAPES = [1, 2, 3, 5, 8, 11, 16]
 
+# The single-block corner, which HIDDEN=7168 cannot reach: at atoms=1 the tile
+# is 4096 B, so even m=1 there is 4 tiles and 4 blocks. This protocol has failed
+# at exactly one block before ("5.3 seconds at 1 block, invisible at 448",
+# qr_int4_kernel.py), so the release/invalidate pairing needs its own case.
+# (rows, hidden) pairs sized in bf16 against a 4096 B tile: one exact tile, one
+# partial tile, and one that is two tiles so the block loops twice.
+NARROW_SHAPES = [(1, 2048), (1, 1024), (1, 3072), (2, 2048)]
+
 
 def _sqnr_db(ref: torch.Tensor, got: torch.Tensor) -> float:
     ref = ref.double()
@@ -71,18 +79,24 @@ def _worker(
             atoms=atoms,
             grid_cap=grid_cap,
             fanout=fanout,
+            # MAX_PAYLOAD_BYTES is a speed policy, not a correctness limit --
+            # the kernel is exact at every size -- so it must not decide what
+            # this test covers. Lifted so the shape list stays free to include
+            # sizes production would route elsewhere.
+            max_bytes=1 << 30,
         )
 
         warm = torch.zeros(1, HIDDEN, dtype=torch.bfloat16, device=device)
         eng.compile(warm, torch.empty_like(warm))
 
-        failures = []
-        for m in SHAPES:
-            torch.manual_seed(1234 + m)
+        def _check(m, hidden, tag):
+            """One shape: accuracy against fp32, then bit-identity across ranks."""
+            bad = []
+            torch.manual_seed(1234 + m * 8191 + hidden)
             # Same seed on every rank, then a per-rank shift, so the reference
             # can be computed locally without another collective.
             parts = [
-                torch.randn(m, HIDDEN, dtype=torch.bfloat16, device=device) * (r + 1)
+                torch.randn(m, hidden, dtype=torch.bfloat16, device=device) * (r + 1)
                 for r in range(world_size)
             ]
             inp = parts[rank].contiguous()
@@ -90,13 +104,13 @@ def _worker(
             eng.allreduce(inp, out)
             torch.cuda.synchronize()
 
-            ref = torch.zeros(m, HIDDEN, dtype=torch.float32, device=device)
+            ref = torch.zeros(m, hidden, dtype=torch.float32, device=device)
             for p in parts:
                 ref += p.float()
 
             db = _sqnr_db(ref, out)
             if db < 45.0:
-                failures.append(f"m={m}: SQNR {db:.2f} dB below the 45 dB bf16 floor")
+                bad.append(f"{tag}: SQNR {db:.2f} dB below the 45 dB bf16 floor")
 
             # Bit-identity across ranks: gather the raw bits, compare exactly.
             # Widened to int32 because gloo rejects int16 ("Invalid scalar
@@ -107,11 +121,21 @@ def _worker(
             for r, g in enumerate(gathered):
                 if not torch.equal(g, gathered[0]):
                     n = int((g != gathered[0]).sum())
-                    failures.append(
-                        f"m={m}: rank {r} differs from rank 0 in {n} bf16 lanes "
+                    bad.append(
+                        f"{tag}: rank {r} differs from rank 0 in {n} bf16 lanes "
                         "(accumulation order is not rank-stable)"
                     )
                     break
+            return bad
+
+        failures = []
+        for m in SHAPES:
+            failures += _check(m, HIDDEN, f"m={m}")
+        # Single-block corner. Reported with the block count so a failure names
+        # the regime rather than just the shape.
+        for m, hidden in NARROW_SHAPES:
+            nb = eng._grid_x(eng._num_tiles(m * hidden * 2))
+            failures += _check(m, hidden, f"{m}x{hidden} ({nb} block(s))")
 
         # Run-ahead: many back-to-back calls with one rank deliberately late.
         m = 5
