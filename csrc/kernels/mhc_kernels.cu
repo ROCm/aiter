@@ -1688,17 +1688,67 @@ namespace aiter {
     }
 
 
+
+    // k_blocks must divide nblk exactly (the kernel has no tail loop), so the pick
+    // is over the divisor lattice of nblk.  Splitting K grows the grid to
+    // m * k_blocks and shrinks each work-group's loop to hidden_size / k_blocks:
+    // useful until the machine is full, pure prologue cost after.  So aim for
+    // cu_num * (work-groups per CU), and take the divisor nearest that in ratio.
+    //
+    // Two fixes over the old heuristic, worth geomean 1.055x / max 1.63x with no
+    // regression on gfx1250 (256 CU), over m in [64, 8192] x hidden in
+    // {1280, 2560, 4096, 7168}:
+    //   - occupancy: it hardcoded 32 / (block_size / WARP_SIZE), i.e. "32 waves per
+    //     CU" -- 2048 threads only at 64 threads per wave, half the real figure on
+    //     wave32.  Query the device instead.
+    //   - search: it walked DOWN to the first exact divisor, which collapses to 1 on
+    //     a coarse lattice (hidden 7168, residual_block 1024 => nblk 7 => k in
+    //     {1, 7}, so m = 512 ran 512 work-groups on 256 CUs).
+    // Work-groups a CU can hold: thread-limited here, not LDS-limited (20 KB per
+    // work-group at residual_block 1024, against 320 KB per CU on gfx1250).
+    static inline int mhc_post_wgs_per_cu(int block_size)
+    {
+        static const int threads_per_cu = []() {
+            hipDevice_t dev;
+            hipDeviceProp_t dev_prop;
+            HIP_CALL(hipGetDevice(&dev));
+            HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
+            return (int)dev_prop.maxThreadsPerMultiProcessor;
+        }();
+        const int wgs = threads_per_cu / block_size;
+        return wgs > 0 ? wgs : 1;
+    }
+
+    static inline int mhc_post_pick_kblocks(
+        int m, int hidden_size, int residual_block, int cu_num, int block_size)
+    {
+        const int nblk        = hidden_size / residual_block;
+        const int grid_target = cu_num * mhc_post_wgs_per_cu(block_size);
+        const int target      = (m > 0 && grid_target / m > 0) ? grid_target / m : 1;
+        int best              = 1;
+        int64_t best_score    = -1;
+        for(int k = 1; k <= nblk; k++)
+        {
+            if(nblk % k)
+                continue;
+            // Ratio, not difference: against a target of 4, k = 7 fits better than
+            // k = 1 though both are 3 away.
+            const int64_t score =
+                (k >= target) ? (int64_t)k * 1024 / target : (int64_t)target * 1024 / k;
+            if(best_score < 0 || score <= best_score) // ties resolve toward more parallelism
+            {
+                best_score = score;
+                best       = k;
+            }
+        }
+        return best;
+    }
+
 #define MHC_POST_KERNEL_IMPL_RAW_(kernel_name, hidden_size, residual_block, store_nt) \
     AITER_CHECK(hidden_size % residual_block == 0, "hidden_size must be divisible by residual_block"); \
     AITER_CHECK(hidden_size >= residual_block * 2, "hidden_size must be >= residual_block * 2 stages prefetch"); \
     int block_size = 4 * WARP_SIZE; \
-    int num_tg_cu = 32 / (block_size / WARP_SIZE); \
-    int max_k_blocks = min(cu_num * num_tg_cu / m, hidden_size / (residual_block)); \
-    if (max_k_blocks < 1) max_k_blocks = 1; \
-    int k_blocks = max_k_blocks; \
-    for(; k_blocks > 1; k_blocks--) { \
-        if (hidden_size % (k_blocks * residual_block) == 0 && hidden_size / k_blocks >= residual_block) break; \
-    } \
+    int k_blocks = mhc_post_pick_kblocks(m, hidden_size, residual_block, cu_num, block_size); \
     int sub_hidden_size = hidden_size / k_blocks; \
     dim3 grid(m, k_blocks); \
     dim3 block(block_size); \
@@ -1722,13 +1772,7 @@ namespace aiter {
     AITER_CHECK(hidden_size % residual_block == 0, "hidden_size must be divisible by residual_block"); \
     AITER_CHECK(hidden_size >= residual_block * 2, "hidden_size must be >= residual_block * 2 stages prefetch"); \
     int block_size = 4 * WARP_SIZE; \
-    int num_tg_cu = 32 / (block_size / WARP_SIZE); \
-    int max_k_blocks = min(cu_num * num_tg_cu / m, hidden_size / (residual_block)); \
-    if (max_k_blocks < 1) max_k_blocks = 1; \
-    int k_blocks = max_k_blocks; \
-    for(; k_blocks > 1; k_blocks--) { \
-        if (hidden_size % (k_blocks * residual_block) == 0 && hidden_size / k_blocks >= residual_block) break; \
-    } \
+    int k_blocks = mhc_post_pick_kblocks(m, hidden_size, residual_block, cu_num, block_size); \
     int sub_hidden_size = hidden_size / k_blocks; \
     dim3 grid(m, k_blocks); \
     dim3 block(block_size); \
