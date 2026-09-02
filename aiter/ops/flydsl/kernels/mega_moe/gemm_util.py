@@ -229,7 +229,6 @@ class ATileLoader:
             lds_dst.ptr,
         )
         total_chunks = self._sort_block_m * 16
-        source_index = 0
         for round_base in range_constexpr(
             0,
             total_chunks,
@@ -244,9 +243,9 @@ class ATileLoader:
                 logical_chunk = physical_chunk
             source_row = row
             if const_expr(self._indexed_input):
+                source_index = round_base // self._total_threads
                 source_byte = self._chunks[source_index][1]
                 source_row = source_byte // fx.Int32(self._row_bytes)
-            source_index += 1
             src_byte = (
                 source_row * fx.Int32(self._row_bytes)
                 + koff
