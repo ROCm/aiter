@@ -274,26 +274,26 @@ def _stage1_compact_dispatch_cu(
     if raw != "auto":
         dispatch_cu = max(0, int(raw))
     else:
-        # Per-layer us on gfx1250 (61-layer, world=4), sweeping this count:
+        # Per-layer us on gfx1250 (61-layer, world=4), fused vs recv-slot.
+        # Recv-slot: tpr64=315, 128=375, 256=590. Cap producers so the
+        # persistent grid still has a first wave of GEMM CTAs -- but only
+        # once payload is long enough that those CTAs are not just spinning
+        # on tile_ready.
         #
-        #   tpr    pb=16    pb=32    pb=64   pb=128   pb=192   pb=252
-        #    64    536.2    518.1    511.7    495.1    484.9    481.9
-        #   128    566.7    566.6    525.3    493.3    474.9    469.5
-        #   256    817.3    786.3    796.0    796.2    770.9    759.2
-        #   512    950.7    818.8    873.1
-        #  1024   1098.5    947.5    974.2
+        #   tpr    pb=16    pb=32    pb=64   pb=128   pb=252(auto-old)
+        #    64    520.0    498.1    487.0    499.1    486.2
+        #   128    519.0    487.5    477.8    488.5    472.4
+        #   256    790.3    736.9    777.2    784.4    755.1
         #
-        # The split at 512 is a payload-size effect, not a bandwidth one. Every
-        # dispatch block rejoins the work queue as a GEMM consumer once its own
-        # producer work is done, so an over-provisioned count is not wasted at
-        # small tpr -- 256 tokens over 252 blocks is one token per block, and it
-        # still wins. From 512 tokens up, (token, peer) dedup adds a local gather
-        # phase and 32 blocks are the knee: fewer under-feed both phases, while
-        # more delay producer rejoin and crowd GEMM consumers.
+        # At tpr<=128 payload is short: extra producers finish it sooner and
+        # rejoin, and cutting to 32/64 loses to filling the first wave.
+        # At tpr>=256 payload lasts long enough that 252 producers leave only
+        # ~4 first-wave GEMM CTAs; 32 is the knee (16 under-feeds, 64+ delays
+        # rejoin). Dedup gather at tpr>=512 keeps the same 32.
         _ = (experts_per_rank, model_dim, inter_dim)
         if mtpr > tokens:
             dispatch_cu = 32
-        elif tokens <= 256:
+        elif tokens <= 128:
             dispatch_cu = cu
         else:
             dispatch_cu = 32

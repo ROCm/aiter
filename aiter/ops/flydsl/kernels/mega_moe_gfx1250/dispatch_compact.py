@@ -252,18 +252,19 @@ def compact_workspace_layout(**kwargs) -> CompactWorkspaceLayout:
     return CompactWorkspaceLayout.make(**kwargs)
 
 
-def compact_payload_lds_bytes(*, wire_stride: int, num_waves: int) -> int:
-    """LDS bytes required by :func:`emit_compact_payload`: one wire row per wave.
+def compact_payload_lds_bytes(
+    *, wire_stride: int, num_waves: int, pipeline_depth: int = 1
+) -> int:
+    """LDS bytes required by :func:`emit_compact_payload`.
 
     The producer owns a private LDS region, disjoint from the GEMM A/B/C arena,
-    so every extra tile it stages costs GEMM occupancy.  One is enough: the walk
-    is token-major, so a staged row feeds all of that token's remote stores
-    before the next token overwrites it, and deeper batching bought nothing --
-    two tiles per wave measured 912us against 743us.
+    so every extra tile it stages costs GEMM occupancy unless the caller overlays
+    it with a lifetime-disjoint arena. Depth two lets the next wire-row load
+    overlap the current row's remote stores.
     """
-    if wire_stride <= 0 or num_waves <= 0:
-        raise ValueError("wire_stride and num_waves must be positive")
-    return _align(wire_stride, 128) * num_waves
+    if wire_stride <= 0 or num_waves <= 0 or pipeline_depth <= 0:
+        raise ValueError("wire_stride, num_waves and pipeline_depth must be positive")
+    return _align(wire_stride, 128) * num_waves * pipeline_depth
 
 
 def _local(window, rank: int, arena_offset: int, local_offset: int):
@@ -579,6 +580,7 @@ def emit_compact_payload(
     parity,
     expected,
     scale_rowmajor: bool = False,
+    tdm_pipeline_depth: int = 1,
 ) -> None:
     """Emit one compact payload-producer workgroup.
 
@@ -629,6 +631,8 @@ def emit_compact_payload(
         )
     if topk > 1 << 8:
         raise ValueError("top-k slot encoding exceeds 8 bits")
+    if tdm_pipeline_depth not in (1, 2):
+        raise ValueError("compact payload TDM pipeline depth must be 1 or 2")
     dedup_on = _dedup_enabled(max_tokens_per_rank)
 
     window = cco.Window(fx.Int64(arena_handle))
@@ -654,21 +658,40 @@ def emit_compact_payload(
 
     # A token's routes can land on any peer, so this block needs every
     # destination's row plan, not just the one it publishes readiness for.
-    if tid == fx.Int32(0):
+    # Let wave 0's first ``npes`` lanes wait on one destination each. LLVM
+    # scalarized a vector<4xi32> polling load back into four serial scalar-load
+    # loops; lane-parallel polling preserves one dynamic loop in final ISA.
+    if const_expr(
+        npes <= WAVE
+        and os.environ.get("AITER_STAGE1_READY_PARALLEL", "1") == "1"
+    ):
+        if wave == fx.Int32(0):
+            if lane < fx.Int32(npes):
+                ready_slot = fx.Int32(parity) * fx.Int32(npes) + lane
+                comm_ops.spin_until_eq_i32(
+                    plan_ready + fx.Int64(ready_slot) * 4, expected
+                )
+            if lane == fx.Int32(0):
+                comm_ops.spin_until_eq_i32(
+                    pair_ready + fx.Int64(parity) * 4, expected
+                )
+    elif tid == fx.Int32(0):
         for d in range_constexpr(npes):
             comm_ops.spin_until_eq_i32(
-                plan_ready + fx.Int64(fx.Int32(parity) * fx.Int32(npes) + d) * 4,
+                plan_ready
+                + fx.Int64(fx.Int32(parity) * fx.Int32(npes) + d) * 4,
                 expected,
             )
-        comm_ops.spin_until_eq_i32(pair_ready + fx.Int64(parity) * 4, expected)
+        comm_ops.spin_until_eq_i32(
+            pair_ready + fx.Int64(parity) * 4, expected
+        )
     fx.barrier()
     comm_ops.fence_system_acquire()
 
-    # One complete wire row per wave-tile.  128B alignment preserves
+    # One complete wire row per wave-stage. 128B alignment preserves
     # descriptor/LDS alignment even when wire_stride itself is not a power of
-    # two.  One tile per wave is enough because the walk is token-major: every
-    # store a staged row feeds is issued before it is reloaded, so the tile is
-    # reused rather than double-buffered.
+    # two. The overlay path uses two stages so the next load overlaps stores
+    # sourced from the current stage; the disjoint-LDS fallback uses one.
     tile_bytes = _align(wire_stride, 128)
     wire_desc = TDM.tdm_group1(wire_stride, 1, 1)
     payload_desc = TDM.tdm_group1(payload_bytes, 1, 1)
@@ -686,10 +709,12 @@ def emit_compact_payload(
     rows_per_tile = wmma_rep * 16
     dst_scale_dwords_per_row = (scale_bytes // 4) * wmma_rep
 
-    def wave_tile():
-        """LDS byte address of this wave's wire tile."""
-        return fx.Int32(lds_base_i32) + readfirstlane(T.i32, wave) * fx.Int32(
-            tile_bytes
+    def wave_tile(stage=0):
+        """LDS byte address of this wave's wire tile at ``stage``."""
+        return (
+            fx.Int32(lds_base_i32)
+            + fx.Int32(stage * num_waves * tile_bytes)
+            + readfirstlane(T.i32, wave) * fx.Int32(tile_bytes)
         )
 
     def emit_load(tile, source_token):
@@ -875,9 +900,17 @@ def emit_compact_payload(
     # ``producer_blocks`` barrier.
     total_experts = npes * experts_per_rank
     idx_rsrc = _rsrc(addr_in_idx)
-    tile = wave_tile()
+    token_stride = fx.Int32(producer_blocks * num_waves)
     token = fx.Int32(producer_slot) * fx.Int32(num_waves) + wave
+    stage = fx.Int32(0)
+    if const_expr(tdm_pipeline_depth == 2):
+        # Prime the first row. Subsequent iterations issue the next local load
+        # before the current remote stores, then one FIFO drain covers both.
+        if token < fx.Int32(cur_tokens):
+            emit_load(wave_tile(stage), token)
+            TDM.tdm_wait(0)
     while token < fx.Int32(cur_tokens):
+        tile = wave_tile(stage)
         route = token * fx.Int32(topk) + lane
         in_range = lane < fx.Int32(topk)
         expert = fx.Int32(
@@ -908,10 +941,17 @@ def emit_compact_payload(
         )
         dest_pe = safe_expert // fx.Int32(experts_per_rank)
         live_i = live.select(fx.Int32(1), fx.Int32(0))
+        wave_has_live = ballot(T.i32, live) != fx.Int32(0)
         if overflow_any == fx.Int32(0):  # noqa: SIM102 - device predicates
-            if ballot(T.i32, live) != fx.Int32(0):
-                emit_load(tile, token)
-                TDM.tdm_wait(0)
+            if const_expr(tdm_pipeline_depth == 2):
+                next_token = token + token_stride
+                next_stage = fx.Int32(1) - stage
+                if next_token < fx.Int32(cur_tokens):
+                    emit_load(wave_tile(next_stage), next_token)
+            if wave_has_live:
+                if const_expr(tdm_pipeline_depth == 1):
+                    emit_load(tile, token)
+                    TDM.tdm_wait(0)
                 if const_expr(dedup_on):
                     for l in range_constexpr(topk):
                         live_l = fx.Int32(readlane(T.i32, live_i, l))
@@ -939,9 +979,16 @@ def emit_compact_payload(
                                 fx.Int32(readlane(T.i32, destination_row, l)),
                                 fx.Int32(readlane(T.i32, dest_pe, l)),
                             )
-                # The next token reloads into this same tile.
+            if const_expr(tdm_pipeline_depth == 2):
+                # The next local load and this token's remote stores are
+                # independent TDM transfers and can make progress together.
                 TDM.tdm_wait(0)
-        token = token + fx.Int32(producer_blocks * num_waves)
+            elif wave_has_live:
+                # Depth one reloads into this same tile.
+                TDM.tdm_wait(0)
+        token = token + token_stride
+        if const_expr(tdm_pipeline_depth == 2):
+            stage = fx.Int32(1) - stage
 
     # Phase 2 cannot start until every block's phase 1 is done: a segment's
     # readiness covers rows whose payload and ``pair_order`` entry were produced
@@ -1054,9 +1101,18 @@ def emit_compact_payload(
     gather_blocks = min(32, producer_blocks) if dedup_on else 0
     gather_active = fx.Int32(producer_slot) < fx.Int32(gather_blocks)
     if gather_active:
-        if tid == fx.Int32(0):
+        if const_expr(npes <= WAVE):
+            if wave == fx.Int32(0):
+                if lane < fx.Int32(npes):
+                    slot = fx.Int32(parity) * fx.Int32(npes) + lane
+                    comm_ops.spin_until_eq_i32(
+                        landing_done + fx.Int64(slot) * 4, expected
+                    )
+        elif tid == fx.Int32(0):
             for source in range_constexpr(npes):
-                slot = fx.Int32(parity) * fx.Int32(npes) + fx.Int32(source)
+                slot = (
+                    fx.Int32(parity) * fx.Int32(npes) + fx.Int32(source)
+                )
                 comm_ops.spin_until_eq_i32(
                     landing_done + fx.Int64(slot) * 4, expected
                 )
@@ -1080,23 +1136,71 @@ def emit_compact_payload(
         expert_rows = expert_end - expert_start
 
         row = wave
-        while row < expert_rows:
-            destination_row = expert_start + row
-            source_encoding = _load_i32(
-                local_rowmap, destination_row * fx.Int32(2)
-            )
-            landing_slot = source_encoding // fx.Int32(topk)
-            TDM.tdm_load(
-                TDM.tdm_group0(
-                    tile,
-                    landing_wire + fx.Int64(landing_slot) * fx.Int64(wire_stride),
-                ),
-                wire_desc,
-            )
-            TDM.tdm_wait(0)
-            emit_gather_store(tile, landing_slot, destination_row)
-            TDM.tdm_wait(0)
-            row = row + fx.Int32(num_waves)
+        if const_expr(tdm_pipeline_depth == 2):
+            stage = fx.Int32(0)
+            if row < expert_rows:
+                destination_row = expert_start + row
+                source_encoding = _load_i32(
+                    local_rowmap, destination_row * fx.Int32(2)
+                )
+                landing_slot = source_encoding // fx.Int32(topk)
+                TDM.tdm_load(
+                    TDM.tdm_group0(
+                        wave_tile(stage),
+                        landing_wire
+                        + fx.Int64(landing_slot) * fx.Int64(wire_stride),
+                    ),
+                    wire_desc,
+                )
+                TDM.tdm_wait(0)
+            while row < expert_rows:
+                tile = wave_tile(stage)
+                destination_row = expert_start + row
+                source_encoding = _load_i32(
+                    local_rowmap, destination_row * fx.Int32(2)
+                )
+                landing_slot = source_encoding // fx.Int32(topk)
+                next_row = row + fx.Int32(num_waves)
+                next_stage = fx.Int32(1) - stage
+                if next_row < expert_rows:
+                    next_destination_row = expert_start + next_row
+                    next_encoding = _load_i32(
+                        local_rowmap, next_destination_row * fx.Int32(2)
+                    )
+                    next_slot = next_encoding // fx.Int32(topk)
+                    TDM.tdm_load(
+                        TDM.tdm_group0(
+                            wave_tile(next_stage),
+                            landing_wire
+                            + fx.Int64(next_slot) * fx.Int64(wire_stride),
+                        ),
+                        wire_desc,
+                    )
+                emit_gather_store(tile, landing_slot, destination_row)
+                # FIFO order is [next load, current stores], so this drain
+                # overlaps both and leaves the old stage safe to reuse.
+                TDM.tdm_wait(0)
+                row = next_row
+                stage = next_stage
+        else:
+            while row < expert_rows:
+                destination_row = expert_start + row
+                source_encoding = _load_i32(
+                    local_rowmap, destination_row * fx.Int32(2)
+                )
+                landing_slot = source_encoding // fx.Int32(topk)
+                TDM.tdm_load(
+                    TDM.tdm_group0(
+                        wave_tile(),
+                        landing_wire
+                        + fx.Int64(landing_slot) * fx.Int64(wire_stride),
+                    ),
+                    wire_desc,
+                )
+                TDM.tdm_wait(0)
+                emit_gather_store(wave_tile(), landing_slot, destination_row)
+                TDM.tdm_wait(0)
+                row = row + fx.Int32(num_waves)
         expert = expert + fx.Int32(gather_blocks)
 
     if gather_active:

@@ -79,18 +79,24 @@ REMAP_DONE_OFF = PLAN_GATE_OFF + PLAN_GATE_DWORDS
 TICKET_SLOTS = REMAP_DONE_OFF + REMAP_DONE_DWORDS
 
 
-def _check_dispatch_lds(dispatch_on, wire_stride, num_waves, budget_bytes):
-    """Assert the compact producer's one wire tile per wave fits in the GEMM arena.
+def _check_dispatch_lds(
+    dispatch_on, wire_stride, num_waves, pipeline_depth, budget_bytes
+):
+    """Assert the compact producer's wire stages fit in the GEMM arena.
 
     Dispatch and GEMM use this storage at different times in a workgroup:
     producers finish their copy before rejoining the GEMM queue.
     """
     if not dispatch_on:
         return
-    need = compact_payload_lds_bytes(wire_stride=wire_stride, num_waves=num_waves)
+    need = compact_payload_lds_bytes(
+        wire_stride=wire_stride,
+        num_waves=num_waves,
+        pipeline_depth=pipeline_depth,
+    )
     if need > budget_bytes:
         raise ValueError(
-            f"one compact dispatch wire tile per wave needs {need}B of LDS, "
+            f"compact dispatch depth {pipeline_depth} needs {need}B of LDS, "
             f"above the {budget_bytes}B GEMM arena available for overlay"
         )
 
@@ -522,9 +528,22 @@ def launch_gemm_a8w4_tdm(
     _DISPATCH_LDS_OVERLAY = (
         dispatch_on and os.environ.get("AITER_STAGE1_LDS_OVERLAY", "1") == "1"
     )
+    # Two lifetime-disjoint wire stages overlap the next local load with the
+    # current remote stores. The disjoint-LDS debug fallback keeps depth one
+    # because the extra stage would exceed its residual LDS budget.
+    _DISPATCH_TDM_DEPTH = (
+        2
+        if (
+            _DISPATCH_LDS_OVERLAY
+            and os.environ.get("AITER_STAGE1_TDM_PIPELINE", "1") == "1"
+        )
+        else 1
+    )
     _DISPATCH_LDS_B = (
         compact_payload_lds_bytes(
-            wire_stride=dispatch_wire_stride, num_waves=num_waves
+            wire_stride=dispatch_wire_stride,
+            num_waves=num_waves,
+            pipeline_depth=_DISPATCH_TDM_DEPTH,
         )
         if dispatch_on
         else 0
@@ -545,7 +564,11 @@ def launch_gemm_a8w4_tdm(
         )
     )
     _check_dispatch_lds(
-        dispatch_on, dispatch_wire_stride, num_waves, _DISPATCH_LDS_BUDGET_B
+        dispatch_on,
+        dispatch_wire_stride,
+        num_waves,
+        _DISPATCH_TDM_DEPTH,
+        _DISPATCH_LDS_BUDGET_B,
     )
     # The planner scans in the arena rather than in LDS of its own: the plan
     # runs before the first tile is staged, so the space is free, and taking a
@@ -604,12 +627,13 @@ def launch_gemm_a8w4_tdm(
     )
     _rms = "_rms" if _stage1_rowmajor_scale else ""
     _lds_overlay = "_ldsol" if _DISPATCH_LDS_OVERLAY else ""
+    _tdm_pipe = "_tdmp2" if _DISPATCH_TDM_DEPTH == 2 else ""
     _kname = (
         f"a8w4_tdm_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_K{K}"
         f"{_grouped}{_act}{_bias}{_qout}{_cl}{_next_stage}{_waves_per_tensor}{_ep}"
-        f"{_prod}{_disp}{_rms}{_lds_overlay}"
+        f"{_prod}{_disp}{_rms}{_lds_overlay}{_tdm_pipe}"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
@@ -875,6 +899,7 @@ def launch_gemm_a8w4_tdm(
                         scale_rowmajor=_stage1_rowmajor_scale,
                         parity=entry_gen & fx.Int32(1),
                         expected=entry_gen + fx.Int32(1),
+                        tdm_pipeline_depth=_DISPATCH_TDM_DEPTH,
                     )
                 # Producers now scatter WMMA-interleaved scales per expert, so
                 # there is no global scale-finalize phase and no launch_ready
