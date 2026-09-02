@@ -14,6 +14,7 @@ import aiter
 from aiter import dtypes
 from aiter.jit.core import is_experimental_enabled
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.ops.asm.mla_decode_v4 import mla_decode_v4_asm_gfx1250
 from aiter.ops.attention import get_mla_decode_fwd_max_splits
 
 _FLYDSL_MLA_REDUCE_TARGET_GFX = ("gfx942", "gfx950")
@@ -1630,7 +1631,8 @@ def mla_decode_fwd_v4_nm(
 ):
     """v4 MLA decode forward.
 
-    Routes through the canonical aiter JIT C-ABI module
+    On gfx1250, loads and launches the shipped `.co` directly from Python.
+    Other architectures keep using the canonical aiter JIT C-ABI module
     `module_mla_v4_asm` (csrc/py_itfs_cu/asm_mla_v4.cu). Returns
     `(logits, attn_lse)` -- both 4D, in **kernel-native layout**:
         logits:   [total_q, num_kv_splits, num_heads, v_head_dim]   FP32
@@ -1812,7 +1814,12 @@ def mla_decode_fwd_v4_nm(
 
     use_valid_split_count_reduce = int(num_kv_splits > 1)
 
-    aiter.mla_decode_v4_asm(
+    mla_decode_v4_asm = (
+        mla_decode_v4_asm_gfx1250
+        if get_gfx() == "gfx1250"
+        else aiter.mla_decode_v4_asm
+    )
+    mla_decode_v4_asm(
         q,
         qrope,
         kv_buffer,

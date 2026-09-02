@@ -69,10 +69,9 @@ _SEED = 0
 # gfx1250 v4 nm kernel variants. In this (num_kv_heads=1) test:
 #   nhead       == gqa_ratio        (num query heads)
 #   decode_qlen == q_seq_logical    (logical Q rows per sequence)
-# The single shipped sparse .co (mla_a8w8_qh64_1tg_16mx4_64nx1_sparse) has a
-# 64 q-row tile, so it serves exactly the three "16mx4-64nx1" entries that
-# satisfy nhead*decode_qlen == 64: (16,4), (64,1), (128,1). The sweep
-# auto-skips any combo the dispatcher can't resolve.
+# The qh64 sparse .co has a 64 q-row tile and serves the "16mx4-64nx1"
+# entries (16,4), (64,1), and (128,1). The dedicated qh32 sparse .co has a
+# 32 q-row tile and serves (32,1).
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class Mlagfx1250KernelVariant:
@@ -83,6 +82,9 @@ class Mlagfx1250KernelVariant:
 
 _gfx1250_KERNEL_VARIANTS = [
     Mlagfx1250KernelVariant(name="qh16-q4-16mx4-64nx1-np", nhead=16, decode_qlen=4),
+    Mlagfx1250KernelVariant(
+        name="qh32-q1-32mx1-16nx4-sparse", nhead=32, decode_qlen=1
+    ),
     Mlagfx1250KernelVariant(name="qh64-q1-16mx4-64nx1-np", nhead=64, decode_qlen=1),
     Mlagfx1250KernelVariant(name="qh128-q1-16mx4-64nx1-np", nhead=128, decode_qlen=1),
 ]
@@ -91,11 +93,8 @@ _gfx1250_VARIANT_BY_KEY = {
 }
 _gfx1250_VARIANT_BY_KEY_NAME = {v.name: v for v in _gfx1250_KERNEL_VARIANTS}
 
-# The shipped qh64 .co has a 64 q-row tile; the dispatcher
-# (csrc/py_itfs_cu/asm_mla_v4.cu) picks sub_Q=64 and launches
-# gdx=ceil(gqa*max_seqlen_q/64) WGs, so a single .co covers three
-# (gqa, q_seq_logical) entry points. Anything else is not shipped.
-_SHIPPED_TILE_VARIANTS = {(16, 4), (64, 1), (128, 1)}
+# Entries shipped in hsa/gfx1250/mla_v4/mla_v4_asm.csv.
+_SHIPPED_TILE_VARIANTS = {(16, 4), (32, 1), (64, 1), (128, 1)}
 
 # Default sweep grids (mirrors test_mla_gfx1250_triton.py).
 _gfx1250_CTX_LENS = [13, 61, 128 + 3, 256 + 67, 1024, 4096, 16384]
