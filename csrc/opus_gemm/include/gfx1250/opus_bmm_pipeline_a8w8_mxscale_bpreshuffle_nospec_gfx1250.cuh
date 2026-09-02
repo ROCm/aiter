@@ -610,31 +610,79 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
             if constexpr (T::kSfAEarly) { fill_sa(); }
             if constexpr (T::kSfBEarly) { fill_sb(); }
 
+            // FRONT/BACK SPLIT + EXPLICIT SCHEDULING, copied in structure from
+            // FlyDSL's gemm_a8w8_gfx1250 inner loop, which is 2x this kernel on
+            // the same shapes with the same WMMAScale instruction.
+            //
+            // A per-row staggered s_wait_dscnt was tried first and bought
+            // exactly nothing (+-1% across nine shapes). The ISA says why: the
+            // compiler clusters every ds_read together and then every WMMA
+            // together, so moving the WAIT around inside that layout changes
+            // nothing -- what has to move is the INSTRUCTIONS. FlyDSL does that
+            // with sched_group_barrier and gets ~33 cycles per WMMA against our
+            // ~86.
+            //
+            // Two halves, so the second half's loads are in flight under the
+            // first half's WMMAs:
+            //   issue B frags, then A-front, then A-back
+            //   wait until only A-back is outstanding   -> front WMMAs
+            //   wait 0                                  -> back WMMAs
+            // and then TELL the scheduler that is the order, with a group
+            // barrier chain the solver has to honour. Without the chain the
+            // waits are correct and the schedule is still wrong.
+            constexpr int kDsPerFrag = (int)sizeof(FragA) / 16;   // b128 is the widest LDS read
+            constexpr int kFront = (T::kExpM + 1) / 2;
+            constexpr int kBack  = T::kExpM - kFront;
+            constexpr unsigned kDsRead = 0x100u, kMfma = 0x08u;
+
             FragA va[T::kExpM];
             FragB vb[T::kExpN];
-            opus::static_for<T::kExpM>([&](auto imN) __attribute__((always_inline)) {
-                va[decltype(imN)::value] = frag_a(s, decltype(imN)::value, ik);
-            });
             opus::static_for<T::kExpN>([&](auto inN) __attribute__((always_inline)) {
                 vb[decltype(inN)::value] = frag_b(s, decltype(inN)::value, ik);
             });
-            opus::s_wait_dscnt(opus::number<0>{});
-
-            if constexpr (!T::kSfBEarly) { fill_sb(); }
-
             opus::static_for<T::kExpM>([&](auto imN) __attribute__((always_inline)) {
-                constexpr int im = decltype(imN)::value;
-                // On the late path each row's A scale is issued here rather than
-                // in one batch up front, so its latency is covered by the WMMAs of
-                // the previous im iteration -- that staggering is exactly what the
-                // high-kSfLoadsPerK tiles lose if they go early.
-                if constexpr (!T::kSfAEarly) sa_v[im] = pack_sfa(im);
-                opus::static_for<T::kExpN>([&](auto inN) __attribute__((always_inline)) {
-                    constexpr int in = decltype(inN)::value;
-                    acc[im][in] = mma(va[im], vb[in], acc[im][in], sa_v[im], sb_v[in],
-                                      opus::number<0>{}, opus::number<0>{});
-                });
+                va[decltype(imN)::value] = frag_a(s, decltype(imN)::value, ik);
             });
+
+            if constexpr (!T::kSfBEarly) {
+                opus::s_wait_dscnt(opus::number<0>{});
+                fill_sb();
+            }
+
+            auto mma_rows = [&](auto FirstN, auto CountN) __attribute__((always_inline)) {
+                opus::static_for<CountN.value>([&](auto jN) __attribute__((always_inline)) {
+                    constexpr int im = FirstN.value + decltype(jN)::value;
+                    if constexpr (!T::kSfAEarly) sa_v[im] = pack_sfa(im);
+                    // Serpentine in N: the last column of one row is the first of
+                    // the next, so consecutive WMMAs share a B operand.
+                    opus::static_for<T::kExpN>([&](auto jnN) __attribute__((always_inline)) {
+                        constexpr int raw = decltype(jnN)::value;
+                        constexpr int in  = (im % 2 == 1) ? (T::kExpN - 1 - raw) : raw;
+                        acc[im][in] = mma(va[im], vb[in], acc[im][in], sa_v[im], sb_v[in],
+                                          opus::number<0>{}, opus::number<0>{});
+                    });
+                });
+            };
+
+            // Front: everything but A-back has to have landed.
+            opus::s_wait_dscnt(opus::number<kDsPerFrag * kBack < 15
+                                            ? kDsPerFrag * kBack : 15>{});
+            mma_rows(opus::number<0>{}, opus::number<kFront>{});
+            if constexpr (kBack > 0) {
+                opus::s_wait_dscnt(opus::number<0>{});
+                mma_rows(opus::number<kFront>{}, opus::number<kBack>{});
+            }
+
+            // The order the solver must produce. Counts are what the code above
+            // issues: B frags and A-front before the front WMMAs, A-back before
+            // the back ones.
+            __builtin_amdgcn_sched_group_barrier(
+                kDsRead, kDsPerFrag * (T::kExpN + kFront), 0);
+            __builtin_amdgcn_sched_group_barrier(kMfma, kFront * T::kExpN, 0);
+            if constexpr (kBack > 0) {
+                __builtin_amdgcn_sched_group_barrier(kDsRead, kDsPerFrag * kBack, 0);
+                __builtin_amdgcn_sched_group_barrier(kMfma, kBack * T::kExpN, 0);
+            }
             __builtin_amdgcn_sched_barrier(0);
         });
 

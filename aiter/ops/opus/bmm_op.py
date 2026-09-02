@@ -293,13 +293,30 @@ def _cu_count() -> int:
 # full list (kid 0..10, 13, 14, 17, 18) is documented in csrc/opus_gemm/
 # opus_bmm.cu; the rest are either A/B controls for a tile that won, tiles for
 # the 128x128 blocked w_scale, or -- kid 2 and 3 -- known broken.
-_BPRESHUF_TILE_BN = {0: (128, 128), 6: (16, 128), 7: (16, 256), 27: (256, 256)}
+_BPRESHUF_TILE_BN = {
+    0: (128, 128), 6: (16, 128), 7: (16, 256),
+    27: (256, 256),                      # per-column prefill, wide
+    28: (256, 256), 29: (128, 128),      # 128x128 blocked prefill
+}
 # Largest m the decode tiles were swept at. Past it, kid0.
 _BPRESHUF_DECODE_M_MAX = 256
 
 
-def _heuristic_bpreshuffle_kid(batch: int, m: int, n: int) -> int:
-    """Tile picker for the per-column-w_scale bpreshuffle BMM.
+def _heuristic_bpreshuffle_kid(
+    batch: int, m: int, n: int, blocked: bool = False
+) -> int:
+    """Tile picker for the bpreshuffle BMM.
+
+    ``blocked`` selects the w_scale family: False is a per-column scale
+    ([G, N, K/128], GROUP_N=1), True the DSV4 128x128 block scale
+    ([G, N/128, K/128], GROUP_N=128). THE BLOCKED FAMILY IS THE ONE THE MODEL
+    RUNS -- the tuned table is dsv4_batched_gemm_a8w8_blockscale_mxscale_tuned
+    and FlyDSL's batched_gemm_a8w8_mxscale_bpreshuffle takes exactly that shape.
+    Measured on the wide prefill tile, the blocked scale is worth 1.27x over the
+    per-column one (1609 vs 1262 TFLOP/s at b=8 m=2048): at GROUP_N=128 with
+    kExpN=4 the wave's 64-column span sits inside one scale block, so
+    kSfBUniformOverN goes true and the per-lane gather collapses to one
+    broadcast read per WMMA.
 
     Measured on gfx1250 (256 CU) over batch 1..16 x m 1..256 at n=1024 k=4096,
     on KERNEL time -- a host dispatch costs ~8 us there and the kernels are
@@ -338,6 +355,30 @@ def _heuristic_bpreshuffle_kid(batch: int, m: int, n: int) -> int:
     # it several times over. So the decode tiles are confined to the region they
     # were actually measured in rather than trusted outside it.
     cus = _cu_count()
+    if blocked:
+        # Blocked-scale family. Only the prefill pair has been swept; the decode
+        # tiles at GROUP_N=128 (kid 8/9/10) are 16-row and were never measured
+        # against these, so a small m gets the narrow prefill tile rather than a
+        # guess at a decode one.
+        #
+        # kid28 is 256x256x128 and kid29 128x128x256, both non-specialized on 8
+        # waves. Swept over batch 1..16 x m 256..8192: every cell whose kid28
+        # grid reaches the CU count is a kid28 win by 1.50x-2.02x. At exactly
+        # half the CU count the band splits on batch -- kid28 still wins at
+        # b<=2 (1.62x at b=1 m=8192, 1.23x at b=2 m=4096) and loses at b>=8 --
+        # so that half is taken only for the narrow batches.
+        #
+        # The batch term is fitted to two cells and is NOT understood: b=1
+        # m=8192 and b=16 m=512 have the same kid29 grid, the same kid28 grid
+        # and the same total rows, yet kid29 runs 119.0 us on the first and
+        # 59.6 on the second. Something about a tall single-batch A is costing
+        # 2x and no counter here explains it. The margin is large enough to take
+        # and the mechanism is an open question.
+        bm28, bn28 = _BPRESHUF_TILE_BN[28]
+        wg28 = -(-m // bm28) * -(-n // bn28) * batch
+        if wg28 >= cus or (wg28 * 2 >= cus and batch <= 2):
+            return 28
+        return 29
     if m > _BPRESHUF_DECODE_M_MAX:
         # Prefill. Two tiles, split on kid27's own workgroup count.
         #
@@ -399,11 +440,9 @@ def bmm_a8w8_mxscale_bpreshuffle_opus(
     run it verbatim, which is what a tile sweep wants.
     _opus_bmm_a8w8_mxscale_bpreshuffle_raw is the entry with no selection at all.
 
-    Only the per-column w_scale family is dispatched here. A 128x128 blocked
-    w_scale needs a GROUP_N=128 tile (kid 8/9/10) and none of those has been
-    swept, so it must name its kernelId rather than get a guess -- the launcher
-    would otherwise reject the scale shape with a message about GROUP_N that
-    says nothing about why no id was chosen.
+    Both w_scale families are dispatched: the row count of ``w_scale`` selects
+    between the per-column tiles and the 128x128 blocked ones, which is the
+    family the model actually runs.
     """
     # Only the grid is decided here; K and every layout rule are the
     # launcher's, which checks them against the tile it is handed.
@@ -415,14 +454,23 @@ def bmm_a8w8_mxscale_bpreshuffle_opus(
     )
 
     if kernelId is None:
-        if int(w_scale.shape[1]) != n:
+        # The w_scale's row count IS the scale family: N rows is per-column,
+        # ceil(N/128) is the 128x128 block scale. Deriving it beats a flag --
+        # the launcher checks the same quantity against the tile's GROUP_N, so a
+        # disagreement here would surface as a shape error rather than silently
+        # reading the wrong scale.
+        rows = int(w_scale.shape[1])
+        if rows == n:
+            blocked = False
+        elif rows == -(-n // 128):
+            blocked = True
+        else:
             raise ValueError(
                 "bmm_a8w8_mxscale_bpreshuffle_opus: w_scale.shape[1] is "
-                f"{int(w_scale.shape[1])}, not N={n}, so this is a blocked "
-                "(GROUP_N>1) scale. Only the per-column tiles have been swept; "
-                "pass kernelId explicitly (8/9/10 are the GROUP_N=128 tiles)."
+                f"{rows}, which is neither N={n} (per-column scale) nor "
+                f"ceil(N/128)={-(-n // 128)} (128x128 block scale)."
             )
-        kernelId = _heuristic_bpreshuffle_kid(batch, m, n)
+        kernelId = _heuristic_bpreshuffle_kid(batch, m, n, blocked)
 
     _opus_bmm_a8w8_mxscale_bpreshuffle_raw(
         x, wo_a, Y, x_scale, w_scale, int(splitK or 1), int(kernelId)

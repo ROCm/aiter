@@ -468,7 +468,11 @@ struct opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250 {
     static constexpr int kSlotElemsB = kBRows * kSmemPitchB;
 
     static constexpr int kNumSlots = NUM_SLOTS_;    // prefetch depth P
-    static_assert(kNumSlots == 2 || kNumSlots == 3, "prefetch depth must be 2 or 3");
+    static_assert(kNumSlots >= 2 && kNumSlots <= 4,
+                  "prefetch depth must be 2..4; note 2 DEADLOCKS in the shipped "
+                  "producer ring (see the NUM_SLOTS note below) -- the bound is "
+                  "widened to 4 for the non-specialized pipeline, whose loop "
+                  "owns its own sync");
 
     static constexpr int kWgPerCu = WG_PER_CU_;
     static_assert(kWgPerCu == 1 || kWgPerCu == 2, "kWgPerCu must be 1 or 2");
@@ -1608,6 +1612,130 @@ using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns256_gfx1250 =
         /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
         /*GROUP_K*/128, /*NUM_SLOTS*/3, /*WG_PER_CU*/1, /*GROUP_N*/1,
         /*SF_A_LDS*/false, /*SF_B_LDS*/false,
+        /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true>;
+
+// kid28: kid27 at the DSV4 128x128 BLOCK scale instead of a per-column one.
+//
+// Why this exists. Measured against FlyDSL's batched_gemm_a8w8_mxscale_bpreshuffle
+// on identical shapes and the same harness, kid27 runs at ~1300 TFLOP/s while
+// FlyDSL reaches 4654 -- and our number is FLAT across every shape from
+// (1,1024) to (16,8192), which is the signature of a fixed per-WMMA cost rather
+// than a tuning miss. Backing the WMMA issue cadence out of the throughput
+// (1024 SIMDs x 65536 FLOP x 2.3 GHz) puts FlyDSL at about one WMMA every 33
+// cycles and us at about one every 119.
+//
+// The obvious suspect is the one thing that differs between the two by
+// construction: FlyDSL takes w_scale as [G, N/128, K/128] and reads ONE
+// broadcast value per WMMA, while kid27 is GROUP_N=1 and every lane gathers its
+// own byte out of an N-row tensor. kid28 makes that side identical, and
+// kid28-vs-kid27 is therefore the price of the per-column scale on its own.
+//
+// The mechanism is already in the traits: at kGroupN=128 with kExpN=4 the span
+// is 64 columns, 128 % 64 == 0, so kSfBUniformOverN goes true and
+// kSfBLoadsPerK collapses from kExpN to 1. Everything else -- tile, grid, wave
+// count, LDS -- is kid27's.
+template <typename DataC>
+using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns256_gn128_gfx1250 =
+    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
+        /*BLOCK_SIZE*/256, /*B_M*/256, /*B_N*/256, /*B_K*/128,
+        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
+        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
+        /*GROUP_K*/128, /*NUM_SLOTS*/3, /*WG_PER_CU*/1, /*GROUP_N*/128,
+        /*SF_A_LDS*/false, /*SF_B_LDS*/false,
+        /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true>;
+
+// kid29: the same swap on the narrower tile, so the per-column price can be
+// read at kid24's geometry too rather than only where the wide tile applies.
+template <typename DataC>
+using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_gn128_gfx1250 =
+    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
+        /*BLOCK_SIZE*/256, /*B_M*/128, /*B_N*/128, /*B_K*/256,
+        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
+        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
+        /*GROUP_K*/128, /*NUM_SLOTS*/3, /*WG_PER_CU*/1, /*GROUP_N*/128,
+        /*SF_A_LDS*/false, /*SF_B_LDS*/false,
+        /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true>;
+
+// kid30/kid31: kid28/kid29 with BOTH scale panels staged in LDS.
+//
+// The ISA says why. In kid28's steady state a WMMA is followed by
+// `s_wait_loadcnt 0x6` and the loop carries global_load_u8 -- the e8m0 scales
+// are fetched from GLOBAL every K-step and the WMMA waits on them. The whole
+// WMMA span is only 470 instructions for 96 WMMAs (4.9 each), so at a measured
+// ~86 cycles per WMMA the kernel is STALLED, not instruction-bound, and this is
+// the stall with a name.
+//
+// The panel machinery already exists and was measured on the specialized side
+// (kid13 = A staged, kid14 = A and B): 1.068 and 1.096 against the global path
+// on the prefill tile, growing to 1.18 at k=16384. It was never turned on for
+// the non-specialized tiles because those were built to answer a different
+// question. SF_B_LDS is cheap here in particular: at GROUP_N=128 a B_N=256 tile
+// spans two scale blocks, so the B panel is three rows.
+//
+// Caps K at kSfAPanelKG * GROUP_K = 16384, enforced in the launcher.
+template <typename DataC>
+using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns256_gn128_sf_gfx1250 =
+    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
+        /*BLOCK_SIZE*/256, /*B_M*/256, /*B_N*/256, /*B_K*/128,
+        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
+        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
+        /*GROUP_K*/128, /*NUM_SLOTS*/3, /*WG_PER_CU*/1, /*GROUP_N*/128,
+        /*SF_A_LDS*/true, /*SF_B_LDS*/true,
+        /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true>;
+
+template <typename DataC>
+using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_gn128_sf_gfx1250 =
+    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
+        /*BLOCK_SIZE*/256, /*B_M*/128, /*B_N*/128, /*B_K*/256,
+        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
+        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
+        /*GROUP_K*/128, /*NUM_SLOTS*/3, /*WG_PER_CU*/1, /*GROUP_N*/128,
+        /*SF_A_LDS*/true, /*SF_B_LDS*/true,
+        /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true>;
+
+// kid32/kid33: the FlyDSL design point -- FEWER waves, a bigger per-wave tile.
+//
+// Read off FlyDSL's own config picker at the shapes we care about: at
+// b=16 m=8192 it runs tile 256x256x128 with warps 2x2 -- FOUR waves, on exactly
+// kid30's tile, where kid30 uses eight. At b=8 m=512 it runs 128x128x256 with
+// 2x2 and num_buffers=4. Its whole shape is the opposite of the direction this
+// file has been walking: we kept ADDING waves to shrink the accumulator, it
+// keeps waves low and spends the freed VGPR ceiling on per-wave tile area,
+// then hides latency with a deeper LDS ring instead.
+//
+// The ceiling makes that legal. Four waves put ONE wave on each SIMD, so the
+// per-wave budget is ~1024 VGPR rather than the ~512 that eight waves impose:
+//
+//              waves  waves/SIMD  ceiling   kExpM kExpN   acc   A    B   total
+//   kid30        8        2         512       8     4    256  128   64    448
+//   kid32        4        1        1024       8     8    512  128  128    768
+//
+// So kid32 holds four times kid30's accumulator per lane and still fits, which
+// is the trade FlyDSL is making. LDS is 204 KB at slots=3 and 272 KB at
+// slots=4; kid33 is the 4-buffer version because that is what FlyDSL picks on
+// this tile and the ring depth is the other half of its story.
+template <typename DataC>
+using opus_bmm_a8w8_mxscale_bpreshuffle_tile_fly256_gfx1250 =
+    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
+        /*BLOCK_SIZE*/128, /*B_M*/256, /*B_N*/256, /*B_K*/128,
+        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
+        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
+        /*GROUP_K*/128, /*NUM_SLOTS*/3, /*WG_PER_CU*/1, /*GROUP_N*/128,
+        /*SF_A_LDS*/true, /*SF_B_LDS*/true,
+        /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true>;
+
+// kid33: the same at FlyDSL's own ring depth. NUM_SLOTS=4 has never been built
+// in this file -- 3 is everywhere and 2 deadlocks -- so this also tests whether
+// the producer ring's "keep 2 in flight" steady step generalises upward the way
+// it fails to generalise downward.
+template <typename DataC>
+using opus_bmm_a8w8_mxscale_bpreshuffle_tile_fly256_nb4_gfx1250 =
+    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
+        /*BLOCK_SIZE*/128, /*B_M*/256, /*B_N*/256, /*B_K*/128,
+        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
+        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
+        /*GROUP_K*/128, /*NUM_SLOTS*/4, /*WG_PER_CU*/1, /*GROUP_N*/128,
+        /*SF_A_LDS*/true, /*SF_B_LDS*/true,
         /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true>;
 
 // -- smem -> register read layouts -----------------------------------------
