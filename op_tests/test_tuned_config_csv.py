@@ -4,9 +4,9 @@
 Validates that tuned-config CSVs contain no rows redundant under the
 get_CKGEMM_config fallback chain (gl=None → gl=0 fine-grained → gl=1 coarse).
 
-A row is redundant if removing it would still yield the same kernelName via
-the fallback — it wastes space and can mask a wrong kernel being committed for
-the gl=0/gl=1-aligned M value.
+A CK row is redundant if removing it would still yield the same CK kernel via
+the fallback. Explicit Triton rows are retained as dispatch barriers: removing
+one could allow a padded-shape CK row to override the measured Triton winner.
 
 Redundancy mirrors get_CKGEMM_config exactly: the runtime probes keys
 [gl=None (M itself), gl=0, gl=1] and returns the FIRST one that EXISTS
@@ -84,12 +84,14 @@ def _find_redundant_rows(csv_path: str):
                 int(r["N"]),
                 int(r["K"]),
             )
-            rows[key] = r["kernelName"]
+            rows[key] = (r["libtype"], r["kernelName"])
 
     redundant = []
-    for (gfx, cu, M, N, K), kernel in rows.items():
+    for (gfx, cu, M, N, K), route in rows.items():
+        if route[0] == "triton":
+            continue
         target = _fallback_target(rows, gfx, cu, M, N, K)
-        if target is not None and target[1] == kernel:
+        if target is not None and target[1] == route:
             pm = target[0]
             redundant.append(
                 (gfx, cu, M, N, K, f"same kernel as existing padded M={pm}")
@@ -110,3 +112,16 @@ def test_no_redundant_rows(csv_path):
             f"{csv_path}: {len(redundant)} redundant row(s) that are reachable via"
             f" fallback with same kernel:\n{lines}"
         )
+
+
+@pytest.mark.parametrize("csv_path", TUNED_CONFIG_CSVS)
+def test_explicit_triton_rows_are_well_formed(csv_path):
+    with open(REPO_ROOT / csv_path) as f:
+        rows = list(csv.DictReader(f))
+    invalid = [
+        (r["M"], r["N"], r["K"])
+        for r in rows
+        if r["libtype"] == "triton"
+        and (int(r["kernelId"]) != -1 or r["kernelName"] != "triton")
+    ]
+    assert not invalid, f"malformed explicit Triton rows: {invalid}"
