@@ -9,6 +9,7 @@ from aiter.ops.triton._triton_kernels.moe.moe_routing.expt_data import (
     _expt_data_compute_stage2,
     _expt_data_compute_stage2_fused,
 )
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 
 @triton.jit
@@ -181,7 +182,23 @@ def _routing_compute_indx_fused(
         tl.store(GateScal + gates, gate_scal, mask=mask)
 
 
-@triton.jit
+_combined_routing_repr = make_kernel_repr(
+    "_combined_routing",
+    [
+        "BLOCK_M",
+        "EVEN_M",
+        "N_EXPTS_ACT",
+        "N_EXPTS_ACT_PAD",
+        "n_expts_tot",
+        "tile_dim_log2",
+        "BLOCK_A",
+        "EQUAL_A",
+        "USE_TDM",
+    ],
+)
+
+
+@triton.jit(repr=_combined_routing_repr)
 def _combined_routing(
     GatherIndx,
     ScatterIndx,
@@ -210,6 +227,10 @@ def _combined_routing(
 ):
 
     pid = tl.program_id(0)
+
+    if pid != 0 and pid < blocks1a:  # noqa: SIM102
+        if tl.load(ExpertHist + pid) == 0:
+            return
 
     _expt_data_compute_stage1(
         pid,
@@ -249,7 +270,24 @@ def _combined_routing(
         )
 
 
-@triton.jit
+_combined_routing_fused_repr = make_kernel_repr(
+    "_combined_routing_fused",
+    [
+        "BLOCK_M",
+        "EVEN_M",
+        "N_EXPTS_ACT",
+        "N_EXPTS_ACT_PAD",
+        "N_EXPTS_TOT",
+        "N_BLKS_BITMATRIX",
+        "tile_dim_log2",
+        "BLOCK_A",
+        "EQUAL_A",
+        "USE_TDM",
+    ],
+)
+
+
+@triton.jit(repr=_combined_routing_fused_repr)
 def _combined_routing_fused(
     GatherIndx,
     ScatterIndx,

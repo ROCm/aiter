@@ -29,39 +29,19 @@ from gemm_a8w8_bpreshuffle_cktile_common import (
     kernels_list as kernels_list_cktile,
 )
 
-# Both a8w8 bpreshuffle pipelines live in one common and are enumerated through
-# FLYDSL_PIPELINES. The guard that kept a broken 8wave table from disabling
-# preshuffle moved into that module, around the 8wave op-module import; the
-# per-table aliases below are only for the runners and get_kernel_name.
-try:
-    from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
-        PIPELINES as FLYDSL_PIPELINES,
-    )
-    from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
-        k_split_candidates,
-    )
-    from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
-        kernels_list as kernels_list_flydsl,
-    )
-    from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
-        kernels_list_8wave as kernels_list_flydsl_8wave,
-    )
-except ImportError:
-    print(
-        "[FlyDSL] flydsl_gemm_a8w8_bpreshuffle_common.py not found, flydsl tuning disabled"
-    )
-    FLYDSL_PIPELINES = ()
-    kernels_list_flydsl = {}
-    kernels_list_flydsl_8wave = {}
-
-    def k_split_candidates(*_a, **_kw):
-        return []
-
-
-from aiter.ops.flydsl.utils import is_flydsl_available
-
-if is_flydsl_available():
-    from aiter.ops.flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
+from aiter.ops.flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
+from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
+    PIPELINES as FLYDSL_PIPELINES,
+)
+from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
+    k_split_candidates,
+)
+from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
+    kernels_list as kernels_list_flydsl,
+)
+from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
+    kernels_list_8wave as kernels_list_flydsl_8wave,
+)
 
 
 def get_valid_asm_splitK_list(K: int, max_splitK: int, tile_k: int = 128):
@@ -178,20 +158,12 @@ def run_gemm_flydsl_8wave(
     return out
 
 
-# Pipeline name -> (runner, is-it-usable-right-now). The availability probe is a
-# callable, and deliberately different per pipeline: preshuffle needs the symbol
-# the is_flydsl_available() gate above binds at import, while 8wave imports its
-# entry point lazily inside its runner.
 _FLYDSL_PIPELINE_RUNNERS = {
-    "preshuffle": (
-        run_gemm_flydsl,
-        lambda: "flydsl_preshuffle_gemm_a8" in globals(),
-    ),
-    "8wave": (run_gemm_flydsl_8wave, is_flydsl_available),
+    "preshuffle": run_gemm_flydsl,
+    "8wave": run_gemm_flydsl_8wave,
 }
 
-# The tuner speaks torch dtypes, Pipeline.q_dtypes_w speaks names (that module
-# must stay importable without torch).
+# The tuner speaks torch dtypes while Pipeline.q_dtypes_w uses short names.
 _Q_DTYPE_W_NAMES = {dtypes.fp8: "fp8", dtypes.i8: "int8"}
 
 
@@ -548,10 +520,10 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
             if runner_entry is None:
                 print(f"[FlyDSL] no runner registered for pipeline {pipe.name!r}")
                 continue
-            runner, is_available = runner_entry
+            runner = runner_entry
             if q_dtype_name not in pipe.q_dtypes_w:
                 continue
-            if not pipe.kernels_list or not is_available():
+            if not pipe.kernels_list:
                 continue
             for i in sorted(pipe.kernels_list.keys()):
                 ki = pipe.kernels_list[i]
@@ -602,17 +574,13 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                 f"[FlyDSL][gfx1250] WMMA ptpc supports fp8 only, skipping {q_dtype_w}"
             )
             return []
-        if not is_flydsl_available():
-            return []
-        try:
-            from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_wmma_common import (
-                kernel_fits_shape as kernel_fits_shape_wmma,
-            )
-            from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_wmma_common import (
-                kernels_list as kernels_list_flydsl_wmma,
-            )
-        except ImportError:
-            return []
+        from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_wmma_common import (
+            kernel_fits_shape as kernel_fits_shape_wmma,
+        )
+        from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_wmma_common import (
+            kernels_list as kernels_list_flydsl_wmma,
+        )
+
         if not kernels_list_flydsl_wmma:
             return []
         gemm_keys = ["x", "weight_shuffle", "x_scale", "w_scale", "out"]
