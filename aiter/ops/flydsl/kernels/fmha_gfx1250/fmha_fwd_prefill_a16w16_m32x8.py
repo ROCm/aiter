@@ -116,7 +116,6 @@ DEFAULT_V_HDIM = 128
 DEFAULT_DTYPE = "bf16"
 _DTYPE_MAP = {"bf16": fx.BFloat16, "fp16": fx.Float16}
 _TORCH_DTYPE_MAP = {"bf16": torch.bfloat16, "fp16": torch.float16}
-_ELEM_DTYPE = fx.BFloat16
 SUPPORTED_QK_HDIM = (128, 192, 256)
 
 # KV sequence block (columns of one QK GEMM tile). Configurable; 64 for now.
@@ -261,15 +260,15 @@ def _packed_tile_indices(gqa_ratio, warp_idx, lane_idx):
 
 def _wmma(a, b, c):
     """v_wmma_f32_16x16x32_{bf16,f16} (gfx1250, wave32): C[16x16 f32] = A[16x32] @
-    B[32x16] + C, intrinsic picked by the build-time _ELEM_DTYPE. No fdsl wrapper
-    exists for this op (only mfma/fp8/f4), so we call the raw ODS builder locally.
+    B[32x16] + C. No fdsl wrapper exists for this op (only mfma/fp8/f4), so we call
+    the raw ODS builder locally.
 
     a/b: v16 16-bit fragments; c: v8 f32 accumulator; returns the v8 f32 result
     (raw MLIR value, feed straight back as ``c`` to accumulate)."""
     v8f32 = fx.Vector.make_type(8, fx.Float32)
     wmma = (
         rocdl_dialect.wmma_f32_16x16x32_f16
-        if _ELEM_DTYPE is fx.Float16
+        if a.dtype is fx.Float16
         else rocdl_dialect.wmma_f32_16x16x32_bf16
     )
     # modC defaults to WMMACModifier::none (== the old modC=0); omit it.
@@ -365,6 +364,7 @@ def _softmax(
     q_max_list=None,
     q_min_list=None,
     kv_len=None,
+    elem_dtype,
 ):
     """Online-softmax update for one KV tile, for ALL R q-WMMA-tiles this wave owns.
 
@@ -498,14 +498,12 @@ def _softmax(
         # divergent branch). ORDERED OGT: a fully-masked lane's -inf - -inf = NaN never
         # forces a rescale. Safe stale path: row_max - m_prev <= 8 -> p <= e^8, no overflow.
         if ENABLE_DEFER_RESCALE and RESCALE_THRESHOLD >= 0.0:
-            need = arith.cmpf(
-                arith.CmpFPredicate.OGT,
-                _raw(fsub(row_max, m_prev)),
-                _raw(fx.Float32(RESCALE_THRESHOLD)),
-            )
-            mask = rocdl.ballot(ir.IntegerType.get_signless(32), need)
-            do_rescale = arith.cmpi(arith.CmpIPredicate.ne, mask, _raw(fx.Int32(0)))
-            m_new = fx.Float32(arith.select(do_rescale, _raw(m_full), _raw(m_prev)))
+            # `>` lowers to ordered OGT, so a fully-masked lane's -inf - -inf = NaN
+            # compares false and never forces a rescale.
+            need = fsub(row_max, m_prev) > fx.Float32(RESCALE_THRESHOLD)
+            mask = rocdl.ballot(fx.Int32.ir_type, need)
+            do_rescale = fx.Int32(mask) != fx.Int32(0)
+            m_new = do_rescale.select(m_full, m_prev)
         else:
             do_rescale = None
             m_new = m_full
@@ -537,7 +535,7 @@ def _softmax(
                 pe.append(pj)
                 p_flat.append(pj)
                 idx += 1
-            p.append(fx.Vector.from_elements(pe, fx.Float32).to(_ELEM_DTYPE))
+            p.append(fx.Vector.from_elements(pe, fx.Float32).to(elem_dtype))
         p_list.append(p)
         p_flat_list.append(p_flat)
 
@@ -674,6 +672,7 @@ def _core_attention(
     warp_idx,  # runtime fx.Int32 wave index
     warp_type,  # compile-time WarpType (LO_WARP / HI_WARP)
     lds_base,  # LDS base (fx.Int32), allocated once by the caller (_alloc_lds)
+    elem_dtype,  # compile-time fx.BFloat16 / fx.Float16 for Q/K/V/P/O fragments
 ):
     """Layout-agnostic m32x8 compute — empty scaffold.
 
@@ -700,16 +699,16 @@ def _core_attention(
             gqa_ratio=gqa_ratio,
             num_waves=NUM_WAVES,
             q_tiles_per_wave=WMMA_ROW_PER_WAVE,
-            elem_dtype=_ELEM_DTYPE,
+            elem_dtype=elem_dtype,
         )
         k_mgr = KManager16bV2(
             qk_hdim=qk_hdim,
             n_block=n_block,
             num_waves=NUM_WAVES,
-            elem_dtype=_ELEM_DTYPE,
+            elem_dtype=elem_dtype,
         )
         v_mgr = VManager16bV2(
-            v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES, elem_dtype=_ELEM_DTYPE
+            v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES, elem_dtype=elem_dtype
         )
     else:
         q_mgr = QManager16bV1(
@@ -717,16 +716,16 @@ def _core_attention(
             gqa_ratio=gqa_ratio,
             num_waves=NUM_WAVES,
             q_tiles_per_wave=WMMA_ROW_PER_WAVE,
-            elem_dtype=_ELEM_DTYPE,
+            elem_dtype=elem_dtype,
         )
         k_mgr = KManager16bV1(
             qk_hdim=qk_hdim,
             n_block=n_block,
             num_waves=NUM_WAVES,
-            elem_dtype=_ELEM_DTYPE,
+            elem_dtype=elem_dtype,
         )
         v_mgr = VManager16bV1(
-            v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES, elem_dtype=_ELEM_DTYPE
+            v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES, elem_dtype=elem_dtype
         )
     k_blk_bytes = max(k_mgr.get_lds_size_in_byte(), MIN_KV_BLK_BYTES)
     v_blk_bytes = max(v_mgr.get_lds_size_in_byte(), MIN_KV_BLK_BYTES)
@@ -1122,6 +1121,7 @@ def _core_attention(
             q_max_list=q_max_list,
             q_min_list=q_min_list,
             kv_len=kv_len,
+            elem_dtype=elem_dtype,
         )
 
         # ---- Rescale each q-tile's running O by its corr, then GEMM2 accumulates this
@@ -1273,7 +1273,7 @@ def _core_attention(
         gqa_ratio=gqa_ratio,
         num_waves=NUM_WAVES,
         q_tiles_per_wave=R,
-        elem_dtype=_ELEM_DTYPE,
+        elem_dtype=elem_dtype,
     )
     assert (
         o_mgr.get_lds_size_in_byte() <= slot_bytes
@@ -1372,6 +1372,7 @@ def _zero_fill_attention(
     lse_num_records_bytes,
     q_start,
     q_len,
+    elem_dtype,
 ):
     """q_len>0 with kv_len==0 (cross-attention): softmax over an empty KV set, so O=0 for
     this WG's valid query rows. LSE=-inf, or (with a sink) LSE=sink[head] since the only
@@ -1392,7 +1393,7 @@ def _zero_fill_attention(
     o_rsrc = buffer_ops.create_buffer_resource(
         ptr_O, num_records_bytes=o_num_records_bytes
     )
-    zero_o = fx.Vector.filled(_CH, 0.0, _ELEM_DTYPE)
+    zero_o = fx.Vector.filled(_CH, 0.0, elem_dtype)
     for r in range(BLOCK_M * cpr // BLOCK_SIZE):
         cix = fx.Int32(r * BLOCK_SIZE) + tid  # flat b128-chunk index this round
         prow = row0 + cix // fx.Int32(cpr)
@@ -1458,8 +1459,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
     assert (
         dtype_str in _DTYPE_MAP
     ), f"dtype_str must be in {list(_DTYPE_MAP)}, got {dtype_str!r}"
-    global _ELEM_DTYPE
-    _ELEM_DTYPE = _DTYPE_MAP[dtype_str]
+    ELEM_DTYPE = _DTYPE_MAP[dtype_str]
     assert gqa_ratio >= 1, f"gqa_ratio must be >= 1, got {gqa_ratio}"
     assert (
         n_block in N_BLOCK_CHOICES
@@ -1559,6 +1559,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
                     "kv_len": kv_len,
                     "window_left": window_left,
                     "window_right": window_right,
+                    "elem_dtype": ELEM_DTYPE,
                 }
                 # Warp specialization: LO warp (waves 0..N/2-1) vs HI warp (N/2..N-1).
                 lds_base = _alloc_lds()
@@ -1594,6 +1595,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
                     lse_num_records_bytes=lse_num_records_bytes,
                     q_start=q_start,
                     q_len=q_len,
+                    elem_dtype=ELEM_DTYPE,
                 )
 
         return kn_fmha_fwd_prefill_a16w16_m32x8_thd
@@ -1672,6 +1674,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
             "kv_len": seq_len_k,
             "window_left": window_left,
             "window_right": window_right,
+            "elem_dtype": ELEM_DTYPE,
         }
         # Warp specialization: LO warp (waves 0..N/2-1) vs HI warp (N/2..N-1).
         lds_base = _alloc_lds()

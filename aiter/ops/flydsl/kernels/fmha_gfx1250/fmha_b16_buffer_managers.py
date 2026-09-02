@@ -426,8 +426,8 @@ class QManager16bV1:
         scale_bf16 = scale.to(self.elem_dtype)
 
         def _read_tile(ds_ptrs, tile):
-            lo = fx.Vector(llvm_dialect.load(v8_ty, ds_ptrs[2 * tile]))
-            hi = fx.Vector(llvm_dialect.load(v8_ty, ds_ptrs[2 * tile + 1]))
+            lo = fx.ptr_load(ds_ptrs[2 * tile], result_type=v8_ty)
+            hi = fx.ptr_load(ds_ptrs[2 * tile + 1], result_type=v8_ty)
             return lo, hi
 
         if lds_tiles == k_tiles:
