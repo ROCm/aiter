@@ -310,7 +310,32 @@ when choosing 31. So once the prompt is a proper cover, `top_k` relative to the
 number of strata is the only remaining lever: `top_k >= strata` makes containment
 exact by construction, at the cost of the model no longer selecting anything.
 
-## 7. Known blind spot
+## 7. Prompt coverage is a ceiling, not the answer
+
+Two different numbers get confused, and only one of them is reachability:
+
+- **Prompt coverage** -- is the config in the pruned candidate list the model is
+  shown? This is what stratification controls, and it is 64/64 against every
+  shipped a4w4 config.
+- **Slate containment** -- did the model actually *pick* it? This is what the
+  tuner ends up benchmarking, and it is strictly lower.
+
+Measured against **ground truth** rather than shipped configs: for the 12 glm5
+shapes where an exhaustive 2688-pair sweep had finished, the recommender at
+`top_k` 32 / prompt 96 / `--g2-per-g1 0` put the true optimum in the slate for
+**7 of 12**. Exact `(GEMM1, GEMM2)` containment equalled GEMM1 containment,
+confirming `--g2-per-g1 0` behaves as intended.
+
+The diagnosis matters more than the ratio: **all 5 misses were in the prompt and
+simply not chosen** -- 0 were missing through coverage. So stratification had
+done its job and the residual is entirely `top_k`. The same lever was measured on
+kimi-k3: two shapes missed at `top_k` 32 and both were recovered at `top_k` 64.
+
+Practical reading: stratify to raise the ceiling, then buy the last few
+percentage points with `top_k`. Do not quote prompt coverage as if it were
+reachability -- it is the best case, not the delivered slate.
+
+## 8. Known blind spot
 
 The tuner ranks GEMM2 by its **isolated `us2`** and cannot see a cost a GEMM2
 imposes on another kernel. A GEMM2 that is faster on its own stage can still lose
@@ -322,7 +347,7 @@ recorded `us1 + us2` improves but e2e does not, suspect this and check with the
 > component of that effect was run without `AITER_FLYDSL_STAGE2_FP8=1` and is
 > void. The structural blind spot is real; the magnitude is unmeasured.
 
-## 8. Wiring
+## 9. Wiring
 
 ```bash
 # CPU-only: recommend candidates into a CSV
@@ -341,7 +366,7 @@ python csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py --mxfp4-flydsl \
 rows (`aiter/utility/base_tuner.py:369`); the recommender may run on a different
 host, and the tuner errors if the CSV's arch does not match.
 
-## 9. Known coverage limits
+## 10. Known coverage limits
 
 Two kinds of shipped row this tuner cannot propose:
 
@@ -368,10 +393,10 @@ Two kinds of shipped row this tuner cannot propose:
   equivalents that are 1.6-5.7% slower. That is expected. Do not treat it as a
   regression, and do not re-open the axis without a fresh decision.
 
-  With that gap accepted, candidate reachability is complete everywhere it is
-  achievable: 64/64 prompt coverage against every shipped a4w4 config across the
-  four model files, and 8/8 against glm5 optima found by exhaustive search. The
-  four `_sp` rows are the only configs outside the space, by choice.
+  With that gap accepted, the four `_sp` rows are the only configs outside the
+  search space, by choice. Coverage of everything else is quantified in §10 --
+  and note the distinction drawn there between what the prompt *offers* and what
+  the slate *delivers*.
 
 11 of kimi-k3's 17 shipped rows are exactly reachable; the rest are the
 `flydsl_moe1_*` pair and the four `_sp` rows.
