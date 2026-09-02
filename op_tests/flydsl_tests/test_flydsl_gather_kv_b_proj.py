@@ -24,7 +24,6 @@ import torch
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.gather_kv_b_proj import gather_kv_b_proj_flydsl
-from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gather_kv_b_proj import (
     gather_kv_b_proj as triton_gather_kv_b_proj,
@@ -37,8 +36,8 @@ QK_NOPE_HEAD_DIM = 128
 V_HEAD_DIM = 128
 
 _SKIP = pytest.mark.skipif(
-    get_gfx() not in ("gfx950",) or not is_flydsl_available(),
-    reason="gfx950 + FlyDSL required",
+    get_gfx() not in ("gfx950",),
+    reason="gfx950 FlyDSL required",
 )
 
 
@@ -111,20 +110,20 @@ def _make_case(
     v_prefix = torch.zeros(
         (alloc, n_heads, V_HEAD_DIM), device=device, dtype=torch.bfloat16
     )
-    return dict(
-        k_buffer=k_buffer,
-        k_scale=k_scale,
-        kv_indptr=kv_indptr,
-        kv_indices=kv_indices,
-        cu_seqlens_k=cu_seqlens_k,
-        weight=weight,
-        weight_scale=weight_scale,
-        k_prefix=k_prefix,
-        v_prefix=v_prefix,
-        num_tokens=num_tokens,
-        n_heads=n_heads,
-        scale_mode=scale_mode,
-    )
+    return {
+        "k_buffer": k_buffer,
+        "k_scale": k_scale,
+        "kv_indptr": kv_indptr,
+        "kv_indices": kv_indices,
+        "cu_seqlens_k": cu_seqlens_k,
+        "weight": weight,
+        "weight_scale": weight_scale,
+        "k_prefix": k_prefix,
+        "v_prefix": v_prefix,
+        "num_tokens": num_tokens,
+        "n_heads": n_heads,
+        "scale_mode": scale_mode,
+    }
 
 
 def _torch_ref(case):
@@ -298,8 +297,8 @@ def test_gather_kv_b_proj_flydsl_row_major_weight(num_tokens):
 @pytest.mark.parametrize(
     "kwargs, needle",
     [
-        (dict(shuffled_kv_cache=True), "shuffled_kv_cache"),
-        (dict(block_m=192), "BLOCK_M"),
+        ({"shuffled_kv_cache": True}, "shuffled_kv_cache"),
+        ({"block_m": 192}, "BLOCK_M"),
     ],
 )
 def test_gather_kv_b_proj_flydsl_rejects_unsupported(kwargs, needle):
@@ -328,7 +327,13 @@ def test_gather_kv_b_proj_flydsl_determinism_large_m(num_tokens, block_m):
 @_SKIP
 @pytest.mark.parametrize("block_m", [128, 256, 384])
 def test_gather_kv_b_proj_flydsl_rope_is_complete(block_m):
-    """Every rope row must be written, and be a bitwise copy, for any BLOCK_M. """
+    """Every rope row must be written, and be a bitwise copy, for any BLOCK_M.
+
+    The fused rope copy maps 512 threads onto 256 rows per pass, so BLOCK_M > 256
+    needs more than one pass. A single pass leaves rows 256.. of every tile
+    unwritten while the GEMM half stays perfectly correct -- silent missing data
+    that an accuracy check on k_nope / v cannot see.
+    """
     # 1536 is divisible by all three block_m under test, so no tail masking
     # confounds the completeness check.
     case = _make_case(1536, 12)

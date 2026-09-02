@@ -13,7 +13,7 @@ import functools
 import torch
 from torch import Tensor
 
-from .utils import get_shared_memory_per_block
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
 # Fixed by the kernel: MFMA_Scale(16, 16, 128) over a 128-deep K tile, and the
 # MLA latent layout.
@@ -77,8 +77,12 @@ def _validate(
             f"[FlyDSL gather_kv_b_proj] waves_per_eu must be >=1 (the kernel always "
             f"emits the rocdl.waves_per_eu attribute), got {waves_per_eu}"
         )
+    # Local import: this module stays importable without flydsl, matching
+    # gemm_a8w8_bpreshuffle_8wave.py.
+    from flydsl.runtime.device import get_rocm_arch
+
     need = lds_bytes(block_m, block_n)
-    have = get_shared_memory_per_block(fallback_gfx="gfx950")
+    have = get_lds_capacity_bytes(get_rocm_arch().split(":", 1)[0])
     if need > have:
         raise ValueError(
             f"[FlyDSL gather_kv_b_proj] BLOCK_M={block_m} needs {need} B of LDS, "
