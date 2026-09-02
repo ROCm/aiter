@@ -649,6 +649,9 @@ def fused_moe(
             stage2_scatter.max_tokens_per_rank if enable_ep_scatter else 0
         ),
         ep_world_size=stage2_scatter.world_size if enable_ep_scatter else 0,
+        ep_combine_quant=(
+            int(stage2_scatter.combine_quant_bits) if enable_ep_scatter else 0
+        ),
         ep_source_token_map=scatter_source_map,
         output=output,
     )
@@ -687,6 +690,7 @@ def fused_moe_fake(
     ep_slot_stride_bytes: int = 0,
     ep_max_tokens_per_rank: int = 0,
     ep_world_size: int = 0,
+    ep_combine_quant: int = 0,
     ep_source_token_map: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -744,6 +748,7 @@ def fused_moe_(
     ep_slot_stride_bytes: int = 0,
     ep_max_tokens_per_rank: int = 0,
     ep_world_size: int = 0,
+    ep_combine_quant: int = 0,
     ep_source_token_map: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -756,6 +761,7 @@ def fused_moe_(
             max_tokens_per_rank=ep_max_tokens_per_rank,
             world_size=ep_world_size,
             source_token_map=ep_source_token_map,
+            combine_quant_bits=int(ep_combine_quant),
         )
     return _fused_moe_impl(
         hidden_states=hidden_states,
