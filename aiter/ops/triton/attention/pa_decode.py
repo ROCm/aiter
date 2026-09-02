@@ -40,7 +40,7 @@ _PA_DECODE_CONFIG_NAME = "PA_DECODE"
 _PA_DECODE_FALLBACK_CONFIG = triton.Config({})
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _get_pa_decode_config(kernel_name: str) -> triton.Config:
     """This device's tuned launch config for a pa_decode kernel, from the
     published config JSON, falling back to the AMD backend defaults."""
