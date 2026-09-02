@@ -11,6 +11,7 @@ import mori.ir.flydsl as mori_shmem
 from flydsl.expr import T, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import FastMathFlags
+from flydsl.expr.rocdl import readfirstlane
 from flydsl.expr.typing import ReductionOp, Stream
 
 from .buffer_ops import buffer_load, buffer_store, create_buffer_resource_from_addr
@@ -20,7 +21,7 @@ from .communication_ops_utils import (
     store_i64_global_system,
 )
 
-_JIT_SCHEMA_VERSION = "v7-out-lane-strided"
+_JIT_SCHEMA_VERSION = "v8-in-addressing"
 _PUSH_PIPELINE_DEPTH = 16
 _OUT_CHANNEL_COUNT = 8
 _OUT_CHANNEL_DEPTH = 1
@@ -195,58 +196,88 @@ def make_fused_a2a_kernel(
                                 dtype=fx.Float32,
                             ).to(fx.BFloat16)
                         )
-                        head = col // head_dim
-                        row_chunk = (col % head_dim) // vec
-                        dest_pe = head // heads_local
-                        local_head = head % heads_local
-                        dst_row = local_head * seq_full + rank * seq_len + seq
-                        dst_offset = fx.Int64(dst_row * row_nbytes + row_chunk * 16)
-                        peer_base = fx.memref_load(p2p_bases, dest_pe)
-                        destinations.append(
-                            create_buffer_resource_from_addr(peer_base + dst_offset)
-                        )
+                        destinations.append(tile_idx)
+                    lane_group = lane >> 4
+                    lane_in_group = lane & 15
                     for batch_idx in range_constexpr(batch_size):
-                        buffer_store(outputs[batch_idx], destinations[batch_idx], 0)
+                        tile_idx = destinations[batch_idx]
+                        for group in range_constexpr(4):
+                            if lane_group == group:
+                                head = tile_idx * 4 + group
+                                dest_pe = head // heads_local
+                                local_head = head % heads_local
+                                dst_row = local_head * seq_full + rank * seq_len + seq
+                                peer_base = fx.memref_load(p2p_bases, dest_pe)
+                                dst_addr = fx.Uint64(
+                                    peer_base + fx.Int64(dst_row * row_nbytes)
+                                )
+                                dst_addr_lo = readfirstlane(T.i32, fx.Uint32(dst_addr))
+                                dst_addr_hi = readfirstlane(
+                                    T.i32, fx.Uint32(dst_addr >> 32)
+                                )
+                                uniform_dst_addr = (
+                                    fx.Uint64(dst_addr_hi) << 32
+                                ) | fx.Uint64(dst_addr_lo)
+                                rsrc_dst = create_buffer_resource_from_addr(
+                                    uniform_dst_addr, num_records_bytes=row_nbytes
+                                )
+                                buffer_store(
+                                    outputs[batch_idx], rsrc_dst, lane_in_group * 8
+                                )
 
         process_qk(rsrc_input_q, rsrc_norm_q, p2p_bases_q)
         process_qk(rsrc_input_k, rsrc_norm_k, p2p_bases_k)
 
-        chunk_step = global_warp_num * _PUSH_PIPELINE_DEPTH
-        for chunk_base in range(global_warp_id, total_chunks, chunk_step):
+        peer_chunks = total_chunks // npes
+        peer_group_count = (peer_chunks + 63) // 64
+        peer_warp_num = global_warp_num // npes
+        dest_pe = global_warp_id % npes
+        peer_warp_id = global_warp_id // npes
+        peer_base_v = fx.Uint64(fx.memref_load(p2p_bases_v, dest_pe))
+        peer_base_v_lo = readfirstlane(T.i32, fx.Uint32(peer_base_v))
+        peer_base_v_hi = readfirstlane(T.i32, fx.Uint32(peer_base_v >> 32))
+        uniform_peer_base_v = (fx.Uint64(peer_base_v_hi) << 32) | fx.Uint64(
+            peer_base_v_lo
+        )
+        rsrc_dst_v = create_buffer_resource_from_addr(
+            uniform_peer_base_v, num_records_bytes=total_chunks * 16
+        )
+        group_step = peer_warp_num * _PUSH_PIPELINE_DEPTH
+        for group_base in range(peer_warp_id, peer_group_count, group_step):
             values_v = []
             destinations_v = []
+            valid_v = []
             for batch_idx in range_constexpr(_PUSH_PIPELINE_DEPTH):
-                chunk_idx = chunk_base + batch_idx * global_warp_num
-                valid = chunk_idx < total_chunks
-                safe_chunk_idx = valid.select(chunk_idx, 0)
-                row = safe_chunk_idx // chunks_per_row
-                row_chunk = safe_chunk_idx % chunks_per_row
-                seq = row // heads
-                head = row % heads
-                dest_pe = head // heads_local
-                local_head = head % heads_local
-                peer_base_v = fx.memref_load(p2p_bases_v, dest_pe)
-                dst_row = local_head * seq_full + rank * seq_len + seq
-                dst_offset = fx.Int64(dst_row * row_nbytes + row_chunk * 16)
+                group_idx = group_base + batch_idx * peer_warp_num
+                dest_chunk = group_idx * 64 + lane
+                valid = dest_chunk < peer_chunks
+                safe_dest_chunk = valid.select(dest_chunk, 0)
+                local_head = safe_dest_chunk // (seq_len * chunks_per_row)
+                seq_chunk = safe_dest_chunk % (seq_len * chunks_per_row)
+                seq = seq_chunk // chunks_per_row
+                row_chunk = seq_chunk % chunks_per_row
+                head = dest_pe * heads_local + local_head
+                src_chunk = (seq * heads + head) * chunks_per_row + row_chunk
                 values_v.append(
                     buffer_load(
                         rsrc_input_v,
-                        safe_chunk_idx * 4,
+                        src_chunk * 4,
                         vec_width=4,
                         dtype=T.i32,
                     )
                 )
-                destinations_v.append(
-                    create_buffer_resource_from_addr(peer_base_v + dst_offset)
+                dst_chunk = (
+                    local_head * seq_full * chunks_per_row
+                    + (rank * seq_len + seq) * chunks_per_row
+                    + row_chunk
                 )
+                destinations_v.append(dst_chunk * 4)
+                valid_v.append(valid)
             for batch_idx in range_constexpr(_PUSH_PIPELINE_DEPTH):
-                chunk_idx = chunk_base + batch_idx * global_warp_num
-                buffer_store(
-                    values_v[batch_idx],
-                    destinations_v[batch_idx],
-                    0,
-                    mask=chunk_idx < total_chunks,
-                )
+                if valid_v[batch_idx]:
+                    buffer_store(
+                        values_v[batch_idx], rsrc_dst_v, destinations_v[batch_idx]
+                    )
 
         fx.rocdl.s_waitcnt(vmcnt=0)
 
