@@ -3,6 +3,8 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
 
 @triton.jit
 def _rmsmorm_op(row, weight, n_cols, epsilon):
@@ -14,7 +16,13 @@ def _rmsmorm_op(row, weight, n_cols, epsilon):
     return rms_norm
 
 
-@gluon.jit
+_gluon_fused_add_rmsnorm_pad_kernel_repr = make_kernel_repr(
+    "_gluon_fused_add_rmsnorm_pad_kernel",
+    ["BLOCK_SIZE_N", "HAS_RES", "num_warps"],
+)
+
+
+@gluon.jit(repr=_gluon_fused_add_rmsnorm_pad_kernel_repr)
 def _gluon_fused_add_rmsnorm_pad_kernel(
     x_ptr,
     res_ptr,
@@ -35,6 +43,7 @@ def _gluon_fused_add_rmsnorm_pad_kernel(
     res_out_stride_n,
     HAS_RES: gl.constexpr,
     BLOCK_SIZE_N: gl.constexpr,
+    num_warps: gl.constexpr,
 ):
     start_pid = gl.program_id(0)
     NUM_WARPS: gl.constexpr = gl.num_warps()
@@ -114,34 +123,39 @@ def _gluon_fused_add_rmsnorm_pad_kernel(
 
     # load x, res (if applicable), and weights
     gl.amd.gfx1250.tdm.async_load(x_desc, [start_pid, 0], smemX)
-    gl.amd.gfx1250.tdm.async_load(weights_desc, [0, 0], smemWeights)
     if HAS_RES:
         gl.amd.gfx1250.tdm.async_load(res_desc, [start_pid, 0], smemRes)
-    gl.amd.gfx1250.tdm.async_wait(0)
+    gl.amd.gfx1250.tdm.async_load(weights_desc, [0, 0], smemWeights)
+
+    if HAS_RES:
+        gl.amd.gfx1250.tdm.async_wait(2)
+    else:
+        gl.amd.gfx1250.tdm.async_wait(1)
+
     smemX_1d = smemX.reshape([BLOCK_SIZE_N])
     x = smemX_1d.load(n_offs_layout).to(gl.float32)
 
     # reshape res and add to x if applicable
     if HAS_RES:
+        gl.amd.gfx1250.tdm.async_wait(1)
         smemRes_1d = smemRes.reshape([BLOCK_SIZE_N])
         res = smemRes_1d.load(n_offs_layout).to(gl.float32)
         x = x + res
+        smemResOut.store(x.reshape([1, BLOCK_SIZE_N]).to(res_out_ptr.dtype.element_ty))
+        gl.amd.gfx1250.tdm.async_store(res_out_desc, [start_pid, 0], smemResOut)
+
+    if HAS_RES:
+        gl.amd.gfx1250.tdm.async_wait(1)
+    else:
+        gl.amd.gfx1250.tdm.async_wait(0)
 
     smemWeights_1d = smemWeights.reshape([BLOCK_SIZE_N])
     w = smemWeights_1d.load(n_offs_layout).to(gl.float32)
     # compute rmsnorm
     out = _rmsmorm_op(x, w, N, eps).to(out_ptr.dtype.element_ty)
-    out = out.reshape([1, BLOCK_SIZE_N])
-
     # write out to LDS
-    smemOut.store(out.to(out_ptr.dtype.element_ty))
-    if HAS_RES:
-        x = x.reshape([1, BLOCK_SIZE_N])
-        smemResOut.store(x.to(res_out_ptr.dtype.element_ty))
-
+    smemOut.store(out.reshape([1, BLOCK_SIZE_N]))
     gl.amd.gfx1250.tdm.async_store(out_desc, [start_pid, 0], smemOut)
-    if HAS_RES:
-        gl.amd.gfx1250.tdm.async_store(res_out_desc, [start_pid, 0], smemResOut)
 
     gl.amd.gfx1250.tdm.async_wait(0)
 

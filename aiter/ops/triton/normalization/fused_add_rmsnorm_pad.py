@@ -58,7 +58,7 @@ def fused_add_rmsnorm_pad(
                 assert N == N2, "Shape error!"
                 res_out = torch.empty((M, N), dtype=res.dtype, device=res.device)
             BLOCK_SIZE_N = triton.next_power_of_2(N_out)
-            NUM_WARPS = 4
+            NUM_WARPS = 8
 
             _KERNEL_MAP[kernel_type][(M,)](
                 x,
