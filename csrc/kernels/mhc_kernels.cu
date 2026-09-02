@@ -86,6 +86,15 @@ namespace aiter {
     // n_stages*hc_mult*tile_m*tile_k elements of LDS. Only profitable for KS >= 16 --
     // at KS=8 the per-lane store is already fully coalesced and this loses ~85 us.
     static constexpr bool mhc_nres_tdm_store = true;
+    // gfx1250: stage mhc_pre_gemm_sqrsum_kernel's x tile through LDS with one 2D TDM
+    // per k-step instead of a per-lane strided buffer_load into VGPRs. Frees the 32 VGPRs
+    // x used to live in (+1 wave/SIMD) at the cost of an LDS round trip, so it wins on
+    // deep k_loop and loses on shallow: 7168x8192 -30%, small m +10..37%.
+    static constexpr bool mhc_pre_x_tdm = true;
+    // One 16 B read vector of pad per row. The consumer reads a column of mfma_m rows at
+    // once, and an unpadded tile_k*sizeof(DTYPE_I) pitch is a power of two, which puts
+    // those rows in the same LDS bank. 0 measures the conflict.
+    static constexpr bool mhc_pre_x_tdm_pad = true;
 
     constexpr int ceil_pow2(int n) {
         if(n <= 1) return 1;
@@ -238,6 +247,26 @@ namespace aiter {
         static constexpr int mfma_k = 4;
         static constexpr int ovec = mfma_m * mfma_n / warp_size;
         __shared__ float s_fn[tile_n * tile_k * 2];
+        // Ring depth of the staged x tile; must match the gemm loop's k+2 prefetch
+        // distance and the MHC_TDM_KEEP that guards slot reuse.
+        static constexpr int x_tdm_stages = 2;
+        static constexpr int x_pad_elems = mhc_pre_x_tdm_pad ? 16 / (int)sizeof(DTYPE_I) : 0;
+        static constexpr int x_lds_pitch = tile_k + x_pad_elems;
+        static constexpr int x_tdm_lds_bytes =
+            (int)sizeof(s_fn) + x_tdm_stages * tile_m * x_lds_pitch * (int)sizeof(DTYPE_I);
+#if defined(__gfx1250__)
+        // bf16-only by measurement, not by any data dependence: the fp32 fallback's live
+        // set (v_af is vec_tile floats against x_bf's bf16 half) pays more for the LDS
+        // round trip than it wins back (332.7 -> 337.1 us at 7168x8192).
+        // The LDS test keeps tile_k=128 -- 67584 B/workgroup, past the 64 KiB limit --
+        // degrading to the per-lane load instead of failing to launch, should gfx1250
+        // ever dispatch it (get_mhc_pre_splitk offers only 64 off gfx9).
+        static constexpr bool x_tdm = mhc_pre_x_tdm && is_res_w_preshuffle_bf16
+                                      && (x_tdm_lds_bytes <= 64 * 1024);
+#else
+        static constexpr bool x_tdm = false;
+#endif
+        __shared__ DTYPE_I s_x[x_tdm ? x_tdm_stages * tile_m * x_lds_pitch : 1];
         static_assert(tile_k % warp_size == 0, "tile_k must be divisible by warp_size");
         static_assert(tile_n % warp_per_block == 0, "tile_n must be divisible by (block_size / warp_size)");
         static_assert(tile_k % (mfma_k * 8) == 0, "tile_k must be divisible by (mfma_k * 8)");
@@ -360,23 +389,123 @@ namespace aiter {
         };
 
         static constexpr int x_vec_size = 8;
-        static constexpr int x_load_waitcnt = vec_tile / x_vec_size;
+        // TDM tracks x on TENSORcnt, not loadcnt; -1 suppresses s_wait_loadcnt (0 would
+        // emit a spurious one).
+        static constexpr int x_load_waitcnt = x_tdm ? 0 : vec_tile / x_vec_size;
+        static constexpr int x_wait_idle = x_tdm ? -1 : 0;
+        static constexpr int x_wait_prefetch = x_tdm ? -1 : 2 * x_load_waitcnt;
+        static constexpr int x_chunks = vec_tile / x_vec_size;
         static constexpr int fn_lds_load_waitcnt =
             ((tile_n / warp_per_block) * (tile_k / fn_vec_size) + warp_size - 1) / warp_size;
+
+        // 2D tile: dim0 = hidden (tile_k, contiguous), dim1 = row (tile_m, stride
+        // x_stride). TDM writes dim0-fastest, so it lands at row * x_lds_pitch + kk.
+        // Both extents are the real tensor's, with this tile's start as the origin, so
+        // tensor_dimN = what remains and a short k tail or m tail clips itself.
+        // Issued by warp 0 alone -- TDM is a wave-level DMA, not per-lane -- which keeps
+        // x_tdm_stages ops in flight, inside the <= 3 per-wave budget. Rebuilt per issue
+        // rather than walked with move(): measured a wash, and move() would tie
+        // correctness to the issue order staying exactly k order.
+        [[maybe_unused]] auto lds_load_x_tile = [&](int k, int slot) {
+#if defined(__gfx1250__)
+            if constexpr (x_tdm) {
+                if (warp_id == 0) {
+                    // padding<T, tile_k, 0> is not "no padding": a nonzero interval reads
+                    // as enabled, and the tag then rejects the zero amount.
+                    using pad_t = std::conditional_t<(x_pad_elems > 0),
+                                      opus::tdm_traits::padding<DTYPE_I, tile_k, x_pad_elems>,
+                                      opus::tdm_traits::padding<>>;
+                    static_assert(x_lds_pitch == (x_pad_elems > 0 ? pad_t::pitch_elements : tile_k),
+                                  "x_lds_pitch must match the D#'s own LDS row pitch");
+                    using win_t = opus::tdm<DTYPE_I, opus::seq<tile_k, tile_m>, pad_t>;
+                    uint32_t lds = static_cast<uint32_t>(reinterpret_cast<__UINTPTR_TYPE__>(s_x));
+                    auto win = opus::make_tdm<win_t>(
+                        lds, x_ptr,
+                        static_cast<opus::u32_t>(hc_hidden_size),
+                        static_cast<opus::u32_t>(m_oob),
+                        static_cast<opus::u64_t>(x_stride),
+                        static_cast<opus::u32_t>(k_split_offset + k * tile_k),
+                        0u);
+                    win.async_load(static_cast<uint32_t>(slot * (tile_m * x_lds_pitch)));
+                }
+            }
+#endif
+        };
+        // Reproduces exactly what load_vector_nbytes<..., interleave> put in v_a: chunk i
+        // is the 8 elements at k = (lane/mfma_m)*x_vec_size + i*interleave_size*x_vec_size.
+        [[maybe_unused]] auto lds_read_x_tile = [&](halfxtile& dst, int slot) {
+            if constexpr (x_tdm) {
+                const DTYPE_I* p = s_x + slot * (tile_m * x_lds_pitch)
+                                 + (warp_id * mfma_m + lane_id % mfma_m) * x_lds_pitch
+                                 + (lane_id / mfma_m) * x_vec_size;
+                #pragma unroll
+                for (int i = 0; i < x_chunks; i++) {
+                    reinterpret_cast<halfx8_t*>(&dst)[i] =
+                        *reinterpret_cast<const halfx8_t*>(p + i * interleave_size * x_vec_size);
+                }
+            }
+        };
+
         halfxtile v_a[2];
-        v_a[0] = load_vector_nbytes<DTYPE_I, vec_tile, 8 * sizeof(DTYPE_I), 0, true, interleave_size>(g_a, ga_offset);
-        __builtin_amdgcn_sched_barrier(0);
-        lds_load_fn_tile(0);
-        v_a[1] = load_vector_nbytes<DTYPE_I, vec_tile, 8 * sizeof(DTYPE_I), 0, true, interleave_size>(g_a, ga_offset + tile_k);
-        lds_load_fn_tile(1);
-        
+        if constexpr (x_tdm) {
+            lds_load_x_tile(0, 0);
+            lds_load_fn_tile(0);
+            lds_load_x_tile(1, 1);
+            lds_load_fn_tile(1);
+        } else {
+            v_a[0] = load_vector_nbytes<DTYPE_I, vec_tile, 8 * sizeof(DTYPE_I), 0, true, interleave_size>(g_a, ga_offset);
+            __builtin_amdgcn_sched_barrier(0);
+            lds_load_fn_tile(0);
+            v_a[1] = load_vector_nbytes<DTYPE_I, vec_tile, 8 * sizeof(DTYPE_I), 0, true, interleave_size>(g_a, ga_offset + tile_k);
+            lds_load_fn_tile(1);
+        }
+
         fp32xovec_t v_cf[repeat_n];
         for (int n = 0; n < repeat_n; n++) {
             opus::clear(v_cf[n]);
         }
-        s_wait_all_loadcnt(opus::number<x_load_waitcnt>{}, opus::number<2 * fn_lds_load_waitcnt>{});
+        s_wait_all_loadcnt(opus::number<x_tdm ? -1 : x_load_waitcnt>{}, opus::number<2 * fn_lds_load_waitcnt>{});
         const int k_loop = hc_hidden_size / (split_k * tile_k);
 
+        // Consumed in two places: the per-lane path already has v_a[BUF] on entry, the
+        // TDM path only after the barrier that publishes the stage. Hoisted so the two
+        // call sites cannot drift apart.
+#define MHC_PRE_X_CONSUME_F32(BUF)                                                                \
+            for (int i = 0; i < vec_tile; i++)                                                    \
+                v_af[i] = static_cast<float>(v_a[BUF][i]);                                        \
+            if (n_idx == 0) {                                                                     \
+                for (int i = 0; i < vec_tile; i++)                                                \
+                    sqrsum_part += v_af[i] * v_af[i];                                             \
+            }                                                                                     
+#define MHC_PRE_X_CONSUME_W32(BUF)                                                                \
+            if (n_idx == 0) {                                                                     \
+                for (int i = 0; i < vec_tile; i++) {                                              \
+                    float xv = static_cast<float>(v_a[BUF][i]);                                   \
+                    sqrsum_part += xv * xv;                                                       \
+                }                                                                                 \
+            }                                                                                     \
+            _Pragma("unroll")                                                                     \
+            for (int c = 0; c < n_chunks_bf16_w32; c++)                                           \
+                for (int i = 0; i < 16; i++)                                                      \
+                    x_bf[c][i] = opus::fp32_to_bf16(static_cast<float>(v_a[BUF][c * 16 + i]));
+
+
+        // TDMs are issued in k order and a body prefetches at its very end, so on entry
+        // to the body reading step k at most ONE later TDM -- TDM(k+1) -- is in flight.
+        // KEEP is right whenever that one was issued; only a step with no successor
+        // drains. In-loop steps always have one; the last step never does; the
+        // second-to-last has one iff k_loop is even (for k_loop == 2 it comes from the
+        // prologue). Deriving this from DO_PREFETCH instead drains both steps whenever
+        // k_loop == 2, which is every small-m shape.
+#define MHC_X_WAIT_KEEP                                                                           \
+            do { if constexpr (x_tdm) { MHC_TDM_KEEP(x_tdm_stages - 1); } } while (0)
+#define MHC_X_WAIT_DRAIN                                                                          \
+            do { if constexpr (x_tdm) { MHC_TDM_DRAIN(); } } while (0)
+#define MHC_X_WAIT_TAIL                                                                           \
+            do { if constexpr (x_tdm) {                                                           \
+                if ((k_loop & 1) == 0) { MHC_TDM_KEEP(x_tdm_stages - 1); }                        \
+                else                   { MHC_TDM_DRAIN(); }                                       \
+            } } while (0)
         static constexpr int gemm_steps = tile_k / mfma_k * repeat_n;
         static constexpr int bf_kk_per_window = 8 / repeat_n;
         static constexpr int bf_vecs_per_n = bf_kk_per_window / fn_vec_size;
@@ -526,6 +655,8 @@ namespace aiter {
             if (DO_PREFETCH) {                                                                    \
                 __syncthreads();                                                                  \
                 lds_load_fn_tile((k) + 2);                                                        \
+                /* Same slot; the __syncthreads above holds the refill behind every read. */      \
+                if constexpr (x_tdm) { lds_load_x_tile((k) + 2, (LDS_SLOT)); }                    \
             }                                                                                     \
         } while (0)
 #endif // MHC_BF16_MFMA (wave64 bf16 path)
@@ -565,28 +696,27 @@ namespace aiter {
                 }
             }
         };
-#define GEMM_LOOP_BODY_BF16_W32(BUF, LDS_SLOT, k, DO_PREFETCH)                                    \
+#define GEMM_LOOP_BODY_BF16_W32(BUF, LDS_SLOT, k, DO_PREFETCH, X_WAIT)                            \
         do {                                                                                      \
-            if (n_idx == 0) {                                                                     \
-                for (int i = 0; i < vec_tile; i++) {                                              \
-                    float xv = static_cast<float>(v_a[BUF][i]);                                   \
-                    sqrsum_part += xv * xv;                                                       \
-                }                                                                                 \
-            }                                                                                     \
             opus::vector_t<opus::bf16_t, 16> x_bf[n_chunks_bf16_w32];                             \
-            _Pragma("unroll")                                                                     \
-            for (int c = 0; c < n_chunks_bf16_w32; c++)                                           \
-                for (int i = 0; i < 16; i++)                                                      \
-                    x_bf[c][i] = opus::fp32_to_bf16(static_cast<float>(v_a[BUF][c * 16 + i]));    \
+            if constexpr (!x_tdm) { MHC_PRE_X_CONSUME_W32(BUF) }                                  \
             if (DO_PREFETCH) {                                                                    \
-                v_a[BUF] = load_vector_nbytes<DTYPE_I, vec_tile, 8 * sizeof(DTYPE_I),             \
-                                                0, true, interleave_size>(                        \
-                    g_a, ga_offset + ((k) + 2) * tile_k);                                         \
-                s_wait_all_loadcnt(opus::number<2 * x_load_waitcnt>{}, opus::number<fn_lds_load_waitcnt>{}); \
+                if constexpr (!x_tdm) {                                                           \
+                    v_a[BUF] = load_vector_nbytes<DTYPE_I, vec_tile, 8 * sizeof(DTYPE_I),         \
+                                                    0, true, interleave_size>(                    \
+                        g_a, ga_offset + ((k) + 2) * tile_k);                                     \
+                }                                                                                 \
+                s_wait_all_loadcnt(opus::number<x_wait_prefetch>{}, opus::number<fn_lds_load_waitcnt>{}); \
             } else {                                                                              \
-                s_wait_all_loadcnt(0_I, 0_I);                                                     \
+                s_wait_all_loadcnt(opus::number<x_wait_idle>{}, 0_I);                             \
             }                                                                                     \
+            X_WAIT;                                                                               \
             __builtin_amdgcn_s_barrier();                                                         \
+            if constexpr (x_tdm) {                                                                \
+                lds_read_x_tile(v_a[BUF], (LDS_SLOT));                                            \
+                s_wait_all_dscnt(0_I);                                                            \
+                MHC_PRE_X_CONSUME_W32(BUF)                                                        \
+            }                                                                                     \
             float* s_fn_rd_ptr = s_fn + (LDS_SLOT) * tile_n * tile_k;                             \
             _Pragma("unroll")                                                                     \
             for (int c = 0; c < n_chunks_bf16_w32; c++) {                                         \
@@ -610,28 +740,33 @@ namespace aiter {
             if (DO_PREFETCH) {                                                                    \
                 __syncthreads();                                                                  \
                 lds_load_fn_tile((k) + 2);                                                        \
+                /* Same slot; the __syncthreads above holds the refill behind every read. */      \
+                if constexpr (x_tdm) { lds_load_x_tile((k) + 2, (LDS_SLOT)); }                    \
             }                                                                                     \
         } while (0)
 #endif // __gfx1250__ (bf16 path)
 
-#define GEMM_LOOP_BODY(BUF, LDS_SLOT, k, DO_PREFETCH)                                             \
+#define GEMM_LOOP_BODY(BUF, LDS_SLOT, k, DO_PREFETCH, X_WAIT)                                     \
         do {                                                                                      \
             fp32xtile v_af;                                                                       \
-            for (int i = 0; i < vec_tile; i++)                                                    \
-                v_af[i] = static_cast<float>(v_a[BUF][i]);                                        \
-            if (n_idx == 0) {                                                                     \
-                for (int i = 0; i < vec_tile; i++)                                                \
-                    sqrsum_part += v_af[i] * v_af[i];                                             \
-            }                                                                                     \
+            if constexpr (!x_tdm) { MHC_PRE_X_CONSUME_F32(BUF) }                                  \
             if (DO_PREFETCH) {                                                                    \
-                v_a[BUF] = load_vector_nbytes<DTYPE_I, vec_tile, 8 * sizeof(DTYPE_I),             \
-                                                0, true, interleave_size>(                        \
-                    g_a, ga_offset + ((k) + 2) * tile_k);                                         \
-                s_wait_all_loadcnt(opus::number<2 * x_load_waitcnt>{}, opus::number<fn_lds_load_waitcnt>{}); \
+                if constexpr (!x_tdm) {                                                           \
+                    v_a[BUF] = load_vector_nbytes<DTYPE_I, vec_tile, 8 * sizeof(DTYPE_I),         \
+                                                    0, true, interleave_size>(                    \
+                        g_a, ga_offset + ((k) + 2) * tile_k);                                     \
+                }                                                                                 \
+                s_wait_all_loadcnt(opus::number<x_wait_prefetch>{}, opus::number<fn_lds_load_waitcnt>{}); \
             } else {                                                                              \
-                s_wait_all_loadcnt(0_I, 0_I);                                                     \
+                s_wait_all_loadcnt(opus::number<x_wait_idle>{}, 0_I);                             \
             }                                                                                     \
+            X_WAIT;                                                                               \
             __builtin_amdgcn_s_barrier();                                                         \
+            if constexpr (x_tdm) {                                                                \
+                lds_read_x_tile(v_a[BUF], (LDS_SLOT));                                            \
+                s_wait_all_dscnt(0_I);                                                            \
+                MHC_PRE_X_CONSUME_F32(BUF)                                                        \
+            }                                                                                      \
             float* s_fn_rd_ptr = s_fn + (LDS_SLOT) * tile_n * tile_k;                             \
             float v_bf[2][8];                                                                      \
             if constexpr (warp_size == 32) {                                                       \
@@ -694,45 +829,55 @@ namespace aiter {
                     v_cf[n_old] = MMA_F32_16X16X4(b_pack, a_pack, v_cf[n_old]);                    \
                 }                                                                                  \
             }                                                                                      \
+            /* At the end of the body, not beside the fn prefetch: the tail MMAs still             \
+               read v_af, which under x_tdm came out of this very slot. */                         \
+            if (DO_PREFETCH) {                                                                     \
+                if constexpr (x_tdm) { lds_load_x_tile((k) + 2, (LDS_SLOT)); }                     \
+            }                                                                                      \
         } while (0)
         // is_res_w_preshuffle_bf16: bf16 hi/lo MFMA; otherwise fp32 MFMA. The bf16 body (and the
         // gfx950-only mfma_f32_16x16x32_bf16 builtin) exists only in the gfx950 device
         // pass; every other arch compiles the fp32 path unconditionally, so the flag is
         // a no-op there (falls back to fp32).
 #if MHC_BF16_MFMA
-#define MHC_PRE_GEMM_STEP(BUF, LDS_SLOT, k, DO_PREFETCH)                    \
+#define MHC_PRE_GEMM_STEP(BUF, LDS_SLOT, k, DO_PREFETCH, X_WAIT)                    \
         if constexpr (is_res_w_preshuffle_bf16) {                                   \
             GEMM_LOOP_BODY_BF16(BUF, LDS_SLOT, k, DO_PREFETCH);           \
         } else {                                                          \
-            GEMM_LOOP_BODY(BUF, LDS_SLOT, k, DO_PREFETCH);               \
+            GEMM_LOOP_BODY(BUF, LDS_SLOT, k, DO_PREFETCH, X_WAIT);               \
         }
 #elif defined(__gfx1250__)
-#define MHC_PRE_GEMM_STEP(BUF, LDS_SLOT, k, DO_PREFETCH)                    \
+#define MHC_PRE_GEMM_STEP(BUF, LDS_SLOT, k, DO_PREFETCH, X_WAIT)                    \
         if constexpr (is_res_w_preshuffle_bf16) {                                   \
-            GEMM_LOOP_BODY_BF16_W32(BUF, LDS_SLOT, k, DO_PREFETCH);       \
+            GEMM_LOOP_BODY_BF16_W32(BUF, LDS_SLOT, k, DO_PREFETCH, X_WAIT);       \
         } else {                                                          \
-            GEMM_LOOP_BODY(BUF, LDS_SLOT, k, DO_PREFETCH);               \
+            GEMM_LOOP_BODY(BUF, LDS_SLOT, k, DO_PREFETCH, X_WAIT);               \
         }
 #else
-#define MHC_PRE_GEMM_STEP(BUF, LDS_SLOT, k, DO_PREFETCH)                    \
-        GEMM_LOOP_BODY(BUF, LDS_SLOT, k, DO_PREFETCH)
+#define MHC_PRE_GEMM_STEP(BUF, LDS_SLOT, k, DO_PREFETCH, X_WAIT)                    \
+        GEMM_LOOP_BODY(BUF, LDS_SLOT, k, DO_PREFETCH, X_WAIT)
 #endif
         for (int k = 0; k < k_loop - 2; k += 2) {
-            MHC_PRE_GEMM_STEP(0, k % 2, k, 1);
+            MHC_PRE_GEMM_STEP(0, k % 2, k, 1, MHC_X_WAIT_KEEP);
             if (k + 3 < k_loop) {
-                MHC_PRE_GEMM_STEP(1, (k + 1) % 2, k + 1, 1);
+                MHC_PRE_GEMM_STEP(1, (k + 1) % 2, k + 1, 1, MHC_X_WAIT_KEEP);
             } else {
-                MHC_PRE_GEMM_STEP(1, (k + 1) % 2, k + 1, 0);
+                MHC_PRE_GEMM_STEP(1, (k + 1) % 2, k + 1, 0, MHC_X_WAIT_KEEP);
             }
         }
-        MHC_PRE_GEMM_STEP(0, 0, 0, 0);
+        MHC_PRE_GEMM_STEP(0, 0, 0, 0, MHC_X_WAIT_TAIL);
         if ((k_loop & 1) == 0) {
-            MHC_PRE_GEMM_STEP(1, 1, 0, 0);
+            MHC_PRE_GEMM_STEP(1, 1, 0, 0, MHC_X_WAIT_DRAIN);
         }
 #undef MHC_PRE_GEMM_STEP
 #undef GEMM_LOOP_BODY
 #undef GEMM_LOOP_BODY_BF16
 #undef GEMM_LOOP_BODY_BF16_W32
+#undef MHC_PRE_X_CONSUME_F32
+#undef MHC_PRE_X_CONSUME_W32
+#undef MHC_X_WAIT_KEEP
+#undef MHC_X_WAIT_DRAIN
+#undef MHC_X_WAIT_TAIL
 
         if (n_idx == 0) {
             float sqrsum_ = cross_row_sum_4(sqrsum_part, lane_id);
