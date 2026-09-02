@@ -42,7 +42,6 @@ env:
   DISAGG_SCRIPTS_STAGE: ${{ inputs.disagg_scripts_stage || '/data/xinhuang/vllm-disagg-logs/' }}
   SPUR_NODE_POOL: ${{ inputs.spur_node_pool || 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' }}
   AITER_GPU_ARCHS: gfx950
-  AITER_BUILD_MAX_JOBS: "64"
   AITER_WHEEL_ARTIFACT_NAME: aiter-vllm-disagg-wheel-${{ github.run_id }}
 
 jobs:
@@ -101,7 +100,6 @@ jobs:
             -e AITER_USE_SYSTEM_TRITON=1 \
             -e GPU_ARCHS="${AITER_GPU_ARCHS}" \
             -e PREBUILD_KERNELS=0 \
-            -e MAX_JOBS="${AITER_BUILD_MAX_JOBS}" \
             --entrypoint /bin/bash \
             "${BASE_IMAGE}" \
             -lc '
@@ -129,7 +127,7 @@ jobs:
                 "flydsl==${flydsl_version}"
               echo "Prebuilding the gfx950 CKTile A8W8 blockscale module"
               python3 .github/scripts/prebuild_vllm_disagg_cktile.py
-              echo "Building AITER wheel for GPU_ARCHS=${GPU_ARCHS}, PREBUILD_KERNELS=${PREBUILD_KERNELS}, MAX_JOBS=${MAX_JOBS}"
+              echo "Building AITER wheel for GPU_ARCHS=${GPU_ARCHS}, PREBUILD_KERNELS=${PREBUILD_KERNELS}"
               python setup.py bdist_wheel 2>&1 | tee .aiter-build.log
               ls -lh dist/*.whl
               aiter_wheels=(dist/amd_aiter-*.whl)

@@ -559,7 +559,7 @@ for it). Five landed rounds of optimization, in order:
    unroll the same way they did before, just under the
    explicit pragma instead of the heuristic.
 
-**Headline** (128-core demon_test, ROCm 7.2.2, `MAX_JOBS=102`,
+**Headline** (128-core demon_test, ROCm 7.2.2, `AITER_MAX_JOBS=102`,
 3-trial average over `AITER_REBUILD=1` with cleared build dir):
 
 | Build | wall time |
@@ -577,7 +577,7 @@ Rounds 6 + 7 together flipped the build's critical path. Round
 6 (dedicated reduce TU) doesn't move end-to-end wall on its own
 because round 7's eventual fix is in the slowest kid's main
 kernel, but it cuts ~9s of duplicated reduce codegen across all
-splitk TUs (a real win on hardware with smaller MAX_JOBS).
+splitk TUs (a real win on hardware with smaller `AITER_MAX_JOBS`).
 Round 7 cracks the slowest-TU bottleneck the previous five
 rounds had left untouched: every splitk TU drops to
 ~1.2-1.5s wall (vs the worst's 7.7s before), and the new
@@ -857,8 +857,9 @@ path.
 
 **What did NOT help** on this hardware:
 
-- **MAX_JOBS tweaks**: aiter already auto-sets it to
-  `min(80% × cpu_count, free_mem / 0.5 GB)` = 102 on the test host;
+- **AITER_MAX_JOBS tweaks**: aiter already auto-selects
+  `min(80% × process CPUs, free_mem / 1.5 GB)` = 102
+  on the test host;
   CPU saturation isn't the bottleneck — the host TU's serial parse
   of `<torch/extension.h>` is.
 
@@ -959,7 +960,7 @@ Practical ceiling on this hardware (post-round-7):
 - If item 2 (CSV-driven kid trimming) lands and removes
   ~5 unused splitk variants: probably **~10s** end-to-end
   (slow TUs are already fast, savings are linear in TU count
-  and amortized across MAX_JOBS=102 parallelism).
+  and amortized across `AITER_MAX_JOBS=102` parallelism).
 - Removing the pybind TU entirely (e.g. via a C-API shim
   similar to the dispatcher's torch-free refactor) would
   bring this to ~7-8s but requires wider-scope changes to
