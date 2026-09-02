@@ -98,8 +98,7 @@ def fp8_mqa_logits(
     cu_ends:     [seq_len], dtype int32, end indices
     clean_logits: bool. If True, positions outside [cu_starts[i], cu_ends[i]) in row i
                   are explicitly written as -inf. If False those positions are
-                  unspecified -- the kernel may write them, so a caller that wants
-                  -inf there must fill it in after the call, not before.
+                  unspecified.
 
     Returns:
     logits:      [seq_len, seq_len_kv], dtype float32 (must be initialized to -inf, because of causal masking)
