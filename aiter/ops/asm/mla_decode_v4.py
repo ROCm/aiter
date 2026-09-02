@@ -135,7 +135,8 @@ def mla_decode_v4_asm_gfx1250_eager(
     preload path. Same call signature; ``softmax_scale`` and ``split_indptr``
     are accepted for parity but unused on this ABI (the preload kernarg carries
     neither: the kernel hardcodes 1/sqrt(512) and derives splits from
-    s_kv_split).
+    s_kv_split). ``out_16_nosplit`` is derived from ``num_kv_splits`` to match
+    the canonical dispatcher.
 
     This is the raw launcher: lowest host overhead, but opaque to TorchDynamo.
     Prefer the :func:`mla_decode_v4_asm_gfx1250` dispatcher, which routes to the
@@ -144,6 +145,7 @@ def mla_decode_v4_asm_gfx1250_eager(
     del split_indptr  # not part of the compact preload kernarg
 
     # ---- contract checks (mirror the AITER_CHECKs in the .cu) --------------
+    out_16_nosplit = 1 if int(num_kv_splits) == 1 else 0
     if out_16_nosplit != 0 and splitData.data_ptr() != output.data_ptr():
         raise ValueError(
             "mla_decode_v4_asm_gfx1250: when out_16_nosplit!=0, the kernel "
