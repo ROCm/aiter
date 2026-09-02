@@ -111,7 +111,12 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
         if const_expr(not g2_bf16_lds):
             weight = rocdl.readfirstlane(T.f32, weight.ir_value())
         t = p & fx.Int32(0x00FFFFFF)
-        s = p >> fx.Int32(24)
+        if const_expr(topk <= 8):
+            # Preserve the established DSV4-Pro instruction sequence.
+            s = p >> fx.Int32(24)
+        else:
+            # Slots 8..15 set bit 31, so decode the high byte as unsigned.
+            s = p.shrui(fx.Int32(24)) & fx.Int32(0xFF)
         dest_pe = t >> fx.Int32(log2_max_tok)
         dest_lid = t & fx.Int32(mask_max_tok)
         valid = (t < fx.Int32(recv_cap)) & (s < fx.Int32(topk)) & (dest_pe < fx.Int32(npes))

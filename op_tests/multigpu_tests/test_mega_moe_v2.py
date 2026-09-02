@@ -29,6 +29,16 @@ NETWORKS = {
         "topk": 6,
         "swiglu_limit": 10.0,
     },
+    # Kimi-K3 routing/weight geometry.  This exercises topk16 and EP8/epr112;
+    # the numerical reference intentionally keeps MegaMoEV2's current bounded
+    # SwiGLU activation while the K3 activation integration remains separate.
+    "kimi_k3_route": {
+        "model_dim": 3584,
+        "inter_dim": 512,
+        "experts": 896,
+        "topk": 16,
+        "swiglu_limit": 10.0,
+    },
 }
 
 
@@ -70,7 +80,19 @@ def _next_power_of_two(value):
     return 1 << (int(value) - 1).bit_length()
 
 
-def _make_inputs(tokens, model_dim, experts, topk, rank, seed, device):
+def _make_inputs(
+    tokens,
+    model_dim,
+    experts,
+    topk,
+    rank,
+    seed,
+    device,
+    *,
+    force_fanout_boundary,
+    inject_invalid_route,
+    force_padding_boundary,
+):
     generator = torch.Generator(device=device).manual_seed(seed + rank)
     x = torch.randn(
         (tokens, model_dim), dtype=torch.bfloat16, device=device, generator=generator
@@ -79,6 +101,38 @@ def _make_inputs(tokens, model_dim, experts, topk, rank, seed, device):
         (tokens, experts), dtype=torch.float32, device=device, generator=generator
     )
     values, ids = torch.topk(scores, topk, dim=-1)
+    if force_fanout_boundary or inject_invalid_route or force_padding_boundary:
+        if topk != 16 or experts % dist.get_world_size():
+            raise ValueError("fanout adversarial cases require topk=16 and EP")
+        world = dist.get_world_size()
+        local_experts = experts // world
+        if local_experts < 112:
+            raise ValueError("fanout adversarial cases require at least 112 epr")
+        token = torch.arange(tokens, dtype=torch.int64, device=device)[:, None]
+        slot = torch.arange(topk, dtype=torch.int64, device=device)[None, :]
+        if force_padding_boundary:
+            if tokens != 1:
+                raise ValueError("--force-padding-boundary requires one token")
+            local = (rank * topk + slot) % local_experts
+            ids = local.expand(tokens, -1).clone()
+            if rank == world - 1:
+                ids[:, :-2] = torch.arange(
+                    1, topk - 1, dtype=torch.int64, device=device
+                )
+                ids[:, -2] = 0
+                ids[:, -1] = local_experts - 1
+        else:
+            destination = (token + rank) % world
+            local = (token * 17 + slot * 7) % (local_experts - 2)
+            if inject_invalid_route:
+                local = local + 1
+            ids = destination * local_experts + local
+            if inject_invalid_route:
+                ids[:, -2] = -1
+                ids[:, -1] = destination[:, 0] * local_experts + local_experts - 1
+            else:
+                ids[:, -2] = destination[:, 0] * local_experts + local_experts - 2
+                ids[:, -1] = destination[:, 0] * local_experts + local_experts - 1
     return (
         x.contiguous(),
         values.softmax(dim=-1).contiguous(),
@@ -385,7 +439,21 @@ def main():
     parser.add_argument("--config-tokens", type=int, default=0)
     parser.add_argument("--unify-fields", default="")
     parser.add_argument("--burst-depth", type=int, default=0)
+    parser.add_argument("--force-fanout-boundary", action="store_true")
+    parser.add_argument("--inject-invalid-route", action="store_true")
+    parser.add_argument("--force-padding-boundary", action="store_true")
     args = parser.parse_args()
+    if (
+        sum(
+            (
+                args.force_fanout_boundary,
+                args.inject_invalid_route,
+                args.force_padding_boundary,
+            )
+        )
+        > 1
+    ):
+        raise ValueError("fanout adversarial flags are mutually exclusive")
     batch_sizes = [int(value) for value in args.bs_list.split(",")]
     if not batch_sizes or min(batch_sizes) <= 0:
         raise ValueError("--bs-list must contain positive integers")
@@ -432,6 +500,9 @@ def main():
             rank,
             args.seed,
             device,
+            force_fanout_boundary=args.force_fanout_boundary,
+            inject_invalid_route=args.inject_invalid_route,
+            force_padding_boundary=args.force_padding_boundary,
         )
         ref_weights = w1_q, w1_ref_scale, w2_q, w2_ref_scale
         # MegaMoE's producer/consumer wire geometry is rank-invariant. A
@@ -448,6 +519,17 @@ def main():
                 16, _next_power_of_two(batch_size)
             )
             if shared_moe is None or args.max_tok_per_rank is None:
+                fanout_masks = ()
+                if args.force_fanout_boundary:
+                    pair_mask = (1 << (local_experts - 2)) | (1 << (local_experts - 1))
+                    fanout_masks = (pair_mask,) * world
+                elif args.inject_invalid_route or args.force_padding_boundary:
+                    pair_mask = 1 | (1 << (local_experts - 1))
+                    fanout_masks = (
+                        (pair_mask,) + (0,) * (world - 1)
+                        if args.force_padding_boundary
+                        else (pair_mask,) * world
+                    )
                 shared_moe = MegaMoEV2(
                     rank=rank,
                     world_size=world,
@@ -457,6 +539,7 @@ def main():
                     w2=w2,
                     w2_scale=w2_scale,
                     max_tok_per_rank=max_tok_per_rank,
+                    fanout_masks=fanout_masks,
                     **network,
                 )
             moe = shared_moe

@@ -423,10 +423,12 @@ class FlyDSLDispatchGroupMajorOp:
         self.row_bytes = _token_bytes_for(data_type, hidden_dim)
         self.row_view = _token_view_dim_for(data_type, hidden_dim)
 
-        # Compact capacity includes worst-case routes plus per-expert padding.
+        # Compact fanout may materialize the shared pair as two independently
+        # padded expert sections in addition to every normal expert section.
         if self.compact:
             num_valid_max = (
-                world_size * max_tok_per_rank * topk + experts_per_rank * unit_size
+                world_size * max_tok_per_rank * topk
+                + (experts_per_rank + 2) * unit_size
             )
         else:
             num_valid_max = experts_per_rank * self.ll_cap + 256

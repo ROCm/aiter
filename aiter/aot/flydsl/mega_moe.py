@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""AOT profile bundles for the DeepSeek-V4-Pro MegaMoE A8W4 path."""
+"""AOT profile bundles for MegaMoE A8W4 deployment shapes."""
 
 from __future__ import annotations
 
@@ -35,29 +35,63 @@ _DEFAULT_COMBINE_BLOCK_NUM = 128
 _DEFAULT_COMBINE_WARP_NUM = 8
 
 
-def _tile_state_stride(mtpr, experts_per_rank):
-    """Match ``FlyDSLDispatchGroupMajorOp`` compact metadata capacity."""
-    num_valid_max = WORLD_SIZE * mtpr * TOPK + experts_per_rank * 128
-    return (num_valid_max + 31) // 32
+def _group_major_geometry(
+    mtpr,
+    experts_per_rank,
+    *,
+    world_size=WORLD_SIZE,
+    topk=TOPK,
+    fixed_slot_dispatch=False,
+):
+    """Match the runtime group-major capacity and metadata allocation."""
+    unit = 32 if fixed_slot_dispatch else 128
+    max_tokens_per_expert = world_size * mtpr
+    ll_cap = (max_tokens_per_expert + unit - 1) // unit * unit
+    if fixed_slot_dispatch:
+        num_valid_max = experts_per_rank * ll_cap + 256
+    else:
+        num_valid_max = world_size * mtpr * topk + (experts_per_rank + 2) * unit
+    tile_state_stride = (num_valid_max + 31) // 32
+    return ll_cap, num_valid_max, tile_state_stride
 
 
 def default_jobs(
     mtprs=DEFAULT_MTPRS,
     experts_per_ranks=DEFAULT_EXPERTS_PER_RANKS,
+    *,
+    world_size=WORLD_SIZE,
+    topk=TOPK,
+    model_dim=MODEL_DIM,
+    inter_dim=INTER_DIM,
+    swiglu_limit=SWIGLU_LIMIT,
 ):
+    shape_suffix = ""
+    if (world_size, topk, model_dim, inter_dim) != (
+        WORLD_SIZE,
+        TOPK,
+        MODEL_DIM,
+        INTER_DIM,
+    ):
+        shape_suffix = f"_w{world_size}_k{topk}_d{model_dim}_i{inter_dim}"
     return [
         {
             "kernel_name": (
-                f"mega_moe_stage{stage}_bundle_mtpr{mtpr}_epr{experts_per_rank}_rank{rank}"
+                f"mega_moe_stage{stage}_bundle_mtpr{mtpr}_epr{experts_per_rank}"
+                f"_rank{rank}{shape_suffix}"
             ),
             "stage": stage,
             "mtpr": mtpr,
             "experts_per_rank": experts_per_rank,
             "rank": rank,
+            "world_size": world_size,
+            "topk": topk,
+            "model_dim": model_dim,
+            "inter_dim": inter_dim,
+            "swiglu_limit": swiglu_limit,
         }
         for mtpr in mtprs
         for experts_per_rank in experts_per_ranks
-        for rank in range(WORLD_SIZE)
+        for rank in range(world_size)
         for stage in (1, 2)
     ]
 
@@ -66,7 +100,18 @@ def _tensor(shape, dtype):
     return torch.empty(shape, dtype=dtype, device="cpu")
 
 
-def _compile_stage1(mtpr, experts_per_rank, rank, plan):
+def _compile_stage1(
+    mtpr,
+    experts_per_rank,
+    rank,
+    plan,
+    *,
+    world_size,
+    topk,
+    model_dim,
+    inter_dim,
+    swiglu_limit,
+):
     from aiter.ops.flydsl.kernels.mega_moe.mega_moe_prepare import (
         preload_mega_moe_prepare,
     )
@@ -75,8 +120,14 @@ def _compile_stage1(mtpr, experts_per_rank, rank, plan):
     )
     from aiter.ops.flydsl.kernels.mega_moe.quant import _get_launcher
 
-    tile_state_stride = _tile_state_stride(mtpr, experts_per_rank)
-    scale_dim = MODEL_DIM // 32
+    fuse_cap, _, tile_state_stride = _group_major_geometry(
+        mtpr,
+        experts_per_rank,
+        world_size=world_size,
+        topk=topk,
+        fixed_slot_dispatch=plan.fixed_slot_dispatch,
+    )
+    scale_dim = model_dim // 32
     seen_prepare = set()
     for entry in plan.entries:
         config = entry.config.stage1
@@ -111,15 +162,15 @@ def _compile_stage1(mtpr, experts_per_rank, rank, plan):
                 fx.Stream(None),
                 rank=rank,
                 experts_per_rank=experts_per_rank,
-                fuse_npes=WORLD_SIZE,
-                fuse_topk=TOPK,
+                fuse_npes=world_size,
+                fuse_topk=topk,
                 fuse_mtpr=mtpr,
                 sort_block_m=config.sort_block_m,
                 num_dispatch_cu=config.num_dispatch_cu,
                 num_prepare_cu=prepare_blocks,
                 num_quant_cu=num_quant_cu,
                 quant_cu_capacity=NUM_CU,
-                model_dim=MODEL_DIM,
+                model_dim=model_dim,
                 payload_chunk_rows=config.payload_chunk_rows,
                 payload_tile_ready=config.payload_tile_ready,
                 tile_state_stride=tile_state_stride,
@@ -133,9 +184,9 @@ def _compile_stage1(mtpr, experts_per_rank, rank, plan):
     # the validation/per-stage benchmark invokes it to isolate Stage1 timing.
     quant_rows = 2
     quant_groups = quant_rows * scale_dim
-    _get_launcher(MODEL_DIM, "fp8")(
-        _tensor((quant_rows, MODEL_DIM), torch.bfloat16),
-        _tensor((quant_rows, MODEL_DIM), torch.float8_e4m3fn),
+    _get_launcher(model_dim, "fp8")(
+        _tensor((quant_rows, model_dim), torch.bfloat16),
+        _tensor((quant_rows, model_dim), torch.float8_e4m3fn),
         _tensor((quant_rows, scale_dim), torch.uint8),
         quant_rows,
         (quant_groups + 63) // 64,
@@ -143,30 +194,30 @@ def _compile_stage1(mtpr, experts_per_rank, rank, plan):
     )
 
     launch = compile_mega_moe_stage1_bundle(
-        model_dim=MODEL_DIM,
-        inter_dim=INTER_DIM,
+        model_dim=model_dim,
+        inter_dim=inter_dim,
         rank=rank,
         experts_per_rank=experts_per_rank,
-        fuse_npes=WORLD_SIZE,
-        fuse_topk=TOPK,
-        fuse_cap=WORLD_SIZE * mtpr,
+        fuse_npes=world_size,
+        fuse_topk=topk,
+        fuse_cap=fuse_cap,
         fuse_mtpr=mtpr,
-        fuse_scale_dim=MODEL_DIM // 32,
+        fuse_scale_dim=model_dim // 32,
         fixed_slot_dispatch=plan.fixed_slot_dispatch,
         num_cu=NUM_CU,
         tile_state_stride=tile_state_stride,
         variants=plan.stage1_variants,
-        swiglu_limit=SWIGLU_LIMIT,
+        swiglu_limit=swiglu_limit,
     )
     launch(
-        _tensor((1, INTER_DIM), torch.float8_e4m3fn),
-        _tensor((1, MODEL_DIM), torch.float8_e4m3fn),
+        _tensor((1, inter_dim), torch.float8_e4m3fn),
+        _tensor((1, model_dim), torch.float8_e4m3fn),
         # Keep every non-unit dimension larger than one so FlyDSL records the
         # same contiguous-stride signature as the runtime weight tensor.  An
         # all-ones placeholder makes the first dimension look unit-strided and
         # produces an AOT cache key that the real tensor can never reuse.
         _tensor((2, 2, 2), torch.uint8),
-        _tensor((1, MODEL_DIM // 128), torch.int32),
+        _tensor((1, model_dim // 128), torch.int32),
         _tensor((2, 2), torch.uint8),
         _tensor((1,), torch.int32),
         _tensor((1,), torch.int32),
@@ -181,7 +232,17 @@ def _compile_stage1(mtpr, experts_per_rank, rank, plan):
     )
 
 
-def _compile_stage2(mtpr, experts_per_rank, rank, plan):
+def _compile_stage2(
+    mtpr,
+    experts_per_rank,
+    rank,
+    plan,
+    *,
+    world_size,
+    topk,
+    model_dim,
+    inter_dim,
+):
     from aiter.ops.flydsl.kernels.mega_moe.mega_moe_stage2 import (
         preload_mega_moe_stage2,
     )
@@ -189,25 +250,32 @@ def _compile_stage2(mtpr, experts_per_rank, rank, plan):
         preload_mega_moe_stage2_aligned_pair,
     )
 
+    _, num_valid_max, _ = _group_major_geometry(
+        mtpr,
+        experts_per_rank,
+        world_size=world_size,
+        topk=topk,
+        fixed_slot_dispatch=plan.fixed_slot_dispatch,
+    )
     for key in plan.stage2_variants:
         stage2 = key.config
         row_bytes = (
-            MODEL_DIM + MODEL_DIM // 32
+            model_dim + model_dim // 32
             if key.p2p_quant == "fp8_blockwise_1x32"
-            else MODEL_DIM * 2
+            else model_dim * 2
         )
         common = {
-            "model_dim": MODEL_DIM,
-            "inter_dim": INTER_DIM,
+            "model_dim": model_dim,
+            "inter_dim": inter_dim,
             "experts": experts_per_rank,
-            "topk": TOPK,
+            "topk": topk,
             "rank": rank,
-            "npes": WORLD_SIZE,
+            "npes": world_size,
             "max_tok": mtpr,
-            "recv_cap": WORLD_SIZE * mtpr,
-            "comb_inp_nbytes": mtpr * TOPK * row_bytes,
-            "HIDDEN_MAX": MODEL_DIM,
-            "INTER_MAX": INTER_DIM,
+            "recv_cap": world_size * mtpr,
+            "comb_inp_nbytes": mtpr * topk * row_bytes,
+            "HIDDEN_MAX": model_dim,
+            "INTER_MAX": inter_dim,
             "cu_num": NUM_CU,
             "p2p_quant_type": key.p2p_quant,
             "fixed_slot_dispatch": key.fixed_slot_dispatch,
@@ -219,9 +287,9 @@ def _compile_stage2(mtpr, experts_per_rank, rank, plan):
         )
         preload_mega_moe_stage2(
             *([fx.Int64(0)] * 15),
-            WORLD_SIZE * mtpr * TOPK + experts_per_rank * 128,
-            fx.Int32(INTER_DIM),
-            fx.Int32(MODEL_DIM),
+            num_valid_max,
+            fx.Int32(inter_dim),
+            fx.Int32(model_dim),
             fx.Stream(None),
             BM=residual.block_m,
             SBM=key.sbm,
@@ -244,26 +312,26 @@ def _compile_stage2(mtpr, experts_per_rank, rank, plan):
             continue
         preload_mega_moe_stage2_aligned_pair(
             *([fx.Int64(0)] * 14),
-            WORLD_SIZE * mtpr * TOPK + experts_per_rank * 128,
-            fx.Int32(INTER_DIM),
-            fx.Int32(MODEL_DIM),
+            num_valid_max,
+            fx.Int32(inter_dim),
+            fx.Int32(model_dim),
             fx.Stream(None),
-            model_dim=MODEL_DIM,
-            inter_dim=INTER_DIM,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
             experts=experts_per_rank,
-            topk=TOPK,
+            topk=topk,
             rank=rank,
-            npes=WORLD_SIZE,
+            npes=world_size,
             max_tok=mtpr,
-            recv_cap=WORLD_SIZE * mtpr,
-            comb_inp_nbytes=mtpr * TOPK * row_bytes,
+            recv_cap=world_size * mtpr,
+            comb_inp_nbytes=mtpr * topk * row_bytes,
             pair_mask=0,
             runtime_pair=True,
             BM=stage2.pair_block_m,
             SBM=key.sbm,
             BN=stage2.pair_block_n,
             BK=stage2.block_k,
-            INTER_MAX=INTER_DIM,
+            INTER_MAX=inter_dim,
             use_nt=stage2.use_nt,
             cu_num=stage2.pair_cu,
             g2_bhoist=stage2.b_hoist,
@@ -293,9 +361,9 @@ def _compile_stage2(mtpr, experts_per_rank, rank, plan):
     tuning = GeometryTuningTable.from_tuning_file(
         tuning_path,
         dtype="fp8_ocp",
-        hidden_dim=MODEL_DIM,
+        hidden_dim=model_dim,
         zero_copy=False,
-        topk=TOPK,
+        topk=topk,
         local_expert_num=experts_per_rank,
         combine_dtype="bf16",
     )
@@ -313,9 +381,9 @@ def _compile_stage2(mtpr, experts_per_rank, rank, plan):
         seen_combine.add(identity)
         launch = make_combine_jit(
             rank=rank,
-            npes=WORLD_SIZE,
-            experts_per_token=TOPK,
-            hidden_dim=MODEL_DIM,
+            npes=world_size,
+            experts_per_token=topk,
+            hidden_dim=model_dim,
             max_tok_per_rank=mtpr,
             block_num=block_num,
             warp_num_per_block=warp_num,
@@ -328,7 +396,7 @@ def _compile_stage2(mtpr, experts_per_rank, rank, plan):
             blockwise_fp8_transport=blockwise_fp8,
             # MegaMoE uses the fixed destination-slot contract and only needs
             # one receive-count slot per peer for combine metadata.
-            max_recv=WORLD_SIZE,
+            max_recv=world_size,
         )
         launch(
             *([fx.Int64(0)] * 18),
@@ -341,17 +409,42 @@ def compile_one_config(**job):
     result = {**job, "compile_time": None}
     started = time.time()
     try:
+        world_size = job.get("world_size", WORLD_SIZE)
+        topk = job.get("topk", TOPK)
+        model_dim = job.get("model_dim", MODEL_DIM)
+        inter_dim = job.get("inter_dim", INTER_DIM)
+        swiglu_limit = job.get("swiglu_limit", SWIGLU_LIMIT)
         plan = build_mega_moe_bundle_plan(
             job["mtpr"],
             experts_per_rank=job["experts_per_rank"],
-            model_dim=MODEL_DIM,
-            inter_dim=INTER_DIM,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            world_size=world_size,
         )
         with compile_only_env(), override_env("FLYDSL_GPU_ARCH", "gfx950"):
             if job["stage"] == 1:
-                _compile_stage1(job["mtpr"], job["experts_per_rank"], job["rank"], plan)
+                _compile_stage1(
+                    job["mtpr"],
+                    job["experts_per_rank"],
+                    job["rank"],
+                    plan,
+                    world_size=world_size,
+                    topk=topk,
+                    model_dim=model_dim,
+                    inter_dim=inter_dim,
+                    swiglu_limit=swiglu_limit,
+                )
             else:
-                _compile_stage2(job["mtpr"], job["experts_per_rank"], job["rank"], plan)
+                _compile_stage2(
+                    job["mtpr"],
+                    job["experts_per_rank"],
+                    job["rank"],
+                    plan,
+                    world_size=world_size,
+                    topk=topk,
+                    model_dim=model_dim,
+                    inter_dim=inter_dim,
+                )
         result["compile_time"] = time.time() - started
     except Exception as error:  # noqa: BLE001
         print(f"  [FAIL] {job['kernel_name']}: {error}")
@@ -368,8 +461,21 @@ def main():
         default=list(DEFAULT_EXPERTS_PER_RANKS),
         help="deployment profiles to compile (for example 48 52 56 for r0/r32/r64)",
     )
+    parser.add_argument("--world-size", type=int, default=WORLD_SIZE)
+    parser.add_argument("--topk", type=int, default=TOPK)
+    parser.add_argument("--model-dim", type=int, default=MODEL_DIM)
+    parser.add_argument("--inter-dim", type=int, default=INTER_DIM)
+    parser.add_argument("--swiglu-limit", type=float, default=SWIGLU_LIMIT)
     args = parser.parse_args()
-    jobs = default_jobs(tuple(args.mtpr), tuple(args.experts_per_rank))
+    jobs = default_jobs(
+        tuple(args.mtpr),
+        tuple(args.experts_per_rank),
+        world_size=args.world_size,
+        topk=args.topk,
+        model_dim=args.model_dim,
+        inter_dim=args.inter_dim,
+        swiglu_limit=args.swiglu_limit,
+    )
     results = run_jobs_parallel(compile_one_config, jobs)
     failed = sum(result["compile_time"] is None for result in results)
     print(f"Compiled: {len(results) - failed} ok, {failed} failed")

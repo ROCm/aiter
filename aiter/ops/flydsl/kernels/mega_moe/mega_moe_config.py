@@ -33,7 +33,11 @@ INDEXED_PAYLOAD_MIN_MTPR = MAX_MTPR_CLASS
 INDEXED_PAYLOAD_MIN_SBM = 128
 REFERENCE_EXPERTS_PER_RANK = 48
 EXPERT_CONFIG_GRANULARITY = 64
-MAX_FANOUT_EXPERTS_PER_RANK = 64
+# Compact route metadata dedicates ten bits to the global expert/group segment.
+# Under the EP8 protocol this admits 8 * 127 expert segments plus 8 group
+# segments.  The next expert would require segment 1024 and cannot be encoded.
+MAX_FANOUT_SEGMENTS = 1024
+MAX_FANOUT_EXPERTS_PER_RANK = 256
 
 
 def fixed_stage1_epoch_slot(grid_mult: int, num_dispatch_cu: int, num_cu: int) -> int:
@@ -375,7 +379,12 @@ def _select_large_stage2(
 
 @cache
 def _select_bucket_config(
-    bucket: int, mtpr_class: int, experts_per_rank: int, model_dim: int, inter_dim: int
+    bucket: int,
+    mtpr_class: int,
+    experts_per_rank: int,
+    model_dim: int,
+    inter_dim: int,
+    fixed_slot_dispatch: bool,
 ) -> MegaMoEConfig:
     if mtpr_class == MAX_MTPR_CLASS:
         stage1 = _select_large_stage1(bucket, experts_per_rank, inter_dim)
@@ -384,7 +393,7 @@ def _select_bucket_config(
             stage1=stage1, stage2=stage2, p2p_quant="fp8_blockwise_1x32"
         )
 
-    fixed_slot = mtpr_class <= FIXED_SLOT_MAX_MTPR
+    fixed_slot = fixed_slot_dispatch
     if fixed_slot:
         stage1 = _select_fixed_stage1(bucket, experts_per_rank)
     else:
@@ -402,6 +411,7 @@ def select_mega_moe_config(
     experts_per_rank: int = REFERENCE_EXPERTS_PER_RANK,
     model_dim: int = 7168,
     inter_dim: int = 3072,
+    world_size: int = 8,
 ) -> MegaMoEConfig:
     if mtpr <= 0 or mtpr & (mtpr - 1):
         raise ValueError(f"mtpr={mtpr} must be a positive power of two")
@@ -409,19 +419,37 @@ def select_mega_moe_config(
         raise ValueError(f"tokens={tokens} exceeds mtpr={mtpr}")
     if experts_per_rank <= 0:
         raise ValueError(f"experts_per_rank must be positive, got {experts_per_rank}")
+    if not 0 < world_size <= 8:
+        raise ValueError(f"world_size must be in [1, 8], got {world_size}")
     if model_dim <= 0 or inter_dim <= 0:
         raise ValueError(f"invalid model shape {model_dim}x{inter_dim}")
-    bucket = nearest_token_bucket(tokens)
-    mtpr_class = mtpr_config_class(mtpr)
-    if mtpr_class <= FIXED_SLOT_MAX_MTPR and bucket > 128:
-        raise ValueError(f"fixed-slot does not support token bucket {bucket}")
     if experts_per_rank > MAX_FANOUT_EXPERTS_PER_RANK:
         raise ValueError(
-            "MegaMoE v2 fanout supports at most "
+            "MegaMoE v2 fanout pair ids support at most "
             f"{MAX_FANOUT_EXPERTS_PER_RANK} experts per rank"
         )
+    bucket = nearest_token_bucket(tokens)
+    mtpr_class = mtpr_config_class(mtpr)
+    fixed_slot_dispatch = (
+        mtpr_class <= FIXED_SLOT_MAX_MTPR
+        and world_size == 8
+        and experts_per_rank == REFERENCE_EXPERTS_PER_RANK
+    )
+    if fixed_slot_dispatch and bucket > 128:
+        raise ValueError(f"fixed-slot does not support token bucket {bucket}")
+    total_segments = world_size * experts_per_rank + world_size
+    if total_segments > MAX_FANOUT_SEGMENTS:
+        raise ValueError(
+            f"MegaMoE v2 fanout needs {total_segments} segments, exceeding "
+            f"the {MAX_FANOUT_SEGMENTS}-segment route metadata limit"
+        )
     return _select_bucket_config(
-        bucket, mtpr_class, expert_config_class(experts_per_rank), model_dim, inter_dim
+        bucket,
+        mtpr_class,
+        expert_config_class(experts_per_rank),
+        model_dim,
+        inter_dim,
+        fixed_slot_dispatch,
     )
 
 
@@ -432,6 +460,7 @@ def build_mega_moe_bundle_plan(
     experts_per_rank: int = REFERENCE_EXPERTS_PER_RANK,
     model_dim: int = 7168,
     inter_dim: int = 3072,
+    world_size: int = 8,
 ) -> MegaMoEBundlePlan:
     """Deduplicate variants while keeping Stage1/Stage2 selection atomic."""
     if mtpr <= 0 or mtpr & (mtpr - 1):
@@ -440,7 +469,11 @@ def build_mega_moe_bundle_plan(
     if not buckets or buckets[-1] != mtpr:
         raise ValueError(f"mtpr={mtpr} has no exact token bucket")
 
-    fixed_slot_dispatch = mtpr <= FIXED_SLOT_MAX_MTPR
+    fixed_slot_dispatch = (
+        mtpr <= FIXED_SLOT_MAX_MTPR
+        and world_size == 8
+        and experts_per_rank == REFERENCE_EXPERTS_PER_RANK
+    )
     stage1_variants: list[Stage1Config] = []
     stage2_variants: list[Stage2BundleKey] = []
     stage1_ids: dict[Stage1Config, int] = {}
@@ -453,6 +486,7 @@ def build_mega_moe_bundle_plan(
             experts_per_rank=experts_per_rank,
             model_dim=model_dim,
             inter_dim=inter_dim,
+            world_size=world_size,
         )
         stage1_key = stage1_bundle_identity(config.stage1)
         stage1_id = stage1_ids.setdefault(stage1_key, len(stage1_variants))

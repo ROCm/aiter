@@ -8,7 +8,7 @@ import torch
 
 os.environ.setdefault("AITER_AOT_IMPORT", "1")
 
-from aiter.aot.flydsl.mega_moe import default_jobs
+from aiter.aot.flydsl.mega_moe import _group_major_geometry, default_jobs
 from aiter.ops.flydsl.kernels import tensor_shim
 from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
     TOKEN_BUCKETS,
@@ -97,9 +97,39 @@ def test_aligned_pair_stage2_forwards_slice_output(monkeypatch, slice_output):
     assert observed == [slice_output]
 
 
-def test_compact_fanout_rejects_more_than_64_experts_per_rank():
-    with pytest.raises(ValueError, match="at most 64 experts per rank"):
-        select_mega_moe_config(4096, 32768, experts_per_rank=65)
+def test_compact_fanout_accepts_kimi_k3_ep8_expert_count():
+    config = select_mega_moe_config(
+        4096,
+        32768,
+        experts_per_rank=112,
+        model_dim=3584,
+        inter_dim=512,
+    )
+
+    assert config.stage1.num_dispatch_cu == 32
+
+
+def test_compact_fanout_rejects_segment_overflow():
+    with pytest.raises(ValueError, match="1032 segments"):
+        select_mega_moe_config(4096, 32768, experts_per_rank=128)
+
+
+def test_compact_fanout_rejects_pair_id_overflow():
+    with pytest.raises(ValueError, match="at most 256 experts per rank"):
+        select_mega_moe_config(4096, 32768, experts_per_rank=257, world_size=1)
+
+
+@pytest.mark.parametrize("experts_per_rank", [56, 112])
+def test_non_reference_expert_profiles_use_compact_small_mtpr(experts_per_rank):
+    plan = build_mega_moe_bundle_plan(
+        128,
+        experts_per_rank=experts_per_rank,
+        model_dim=3584,
+        inter_dim=512,
+    )
+
+    assert not plan.fixed_slot_dispatch
+    assert all(not key.fixed_slot_dispatch for key in plan.stage2_variants)
 
 
 @pytest.mark.parametrize("old_value", [None, "0"])
@@ -147,6 +177,39 @@ def test_aot_jobs_can_cover_r0_r32_r64_expert_profiles():
 
     assert len(jobs) == len(identities) == 3 * 8 * 2
     assert {job["experts_per_rank"] for job in jobs} == {48, 52, 56}
+
+
+def test_aot_jobs_can_describe_kimi_k3_ep8_profile():
+    jobs = default_jobs(
+        (8192,),
+        (112,),
+        world_size=8,
+        topk=16,
+        model_dim=3584,
+        inter_dim=512,
+    )
+
+    assert len(jobs) == 8 * 2
+    assert {job["topk"] for job in jobs} == {16}
+    assert {job["experts_per_rank"] for job in jobs} == {112}
+    assert all("_w8_k16_d3584_i512" in job["kernel_name"] for job in jobs)
+
+
+def test_aot_geometry_matches_small_mtpr_runtime_layouts():
+    assert _group_major_geometry(
+        1,
+        112,
+        world_size=8,
+        topk=16,
+        fixed_slot_dispatch=False,
+    ) == (128, 14720, 460)
+    assert _group_major_geometry(
+        128,
+        48,
+        world_size=8,
+        topk=6,
+        fixed_slot_dispatch=True,
+    ) == (1024, 49408, 1544)
 
 
 def test_bundle_selection_matches_production_config_for_every_token():

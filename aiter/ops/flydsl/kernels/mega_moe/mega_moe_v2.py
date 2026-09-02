@@ -16,7 +16,6 @@ from ..flydsl_dispatch_combine_intranode_op import (
 )
 from .dispatch import DISPATCH_TABLE_SIZE, DispatchSlot
 from .mega_moe_config import (
-    FIXED_SLOT_MAX_MTPR,
     INDEXED_PAYLOAD_MIN_MTPR,
     INDEXED_PAYLOAD_MIN_SBM,
     MegaMoEConfig,
@@ -74,6 +73,8 @@ class MegaMoEV2:
         self.experts = int(experts)
         self.epr = int(experts // world_size)
         self.topk = int(topk)
+        if not 0 < self.topk <= 16:
+            raise ValueError(f"MegaMoEV2 topk must be in [1, 16], got {self.topk}")
         self.mtpr = int(max_tok_per_rank)
         self.swiglu_limit = float(swiglu_limit)
         self._bundle_plan = build_mega_moe_bundle_plan(
@@ -81,6 +82,7 @@ class MegaMoEV2:
             experts_per_rank=self.epr,
             model_dim=self.model_dim,
             inter_dim=self.inter_dim,
+            world_size=self.world_size,
         )
         self._active_bundle_entry = None
         debug_fanout = os.environ.get("MEGA_DEBUG_FANOUT_MASKS", "")
@@ -95,7 +97,7 @@ class MegaMoEV2:
             raise ValueError("swiglu_limit must be non-negative")
         self.dev = torch.device("cuda", rank)
         self.max_recv = self.world_size * self.mtpr
-        compact = self.mtpr > FIXED_SLOT_MAX_MTPR
+        compact = not self._bundle_plan.fixed_slot_dispatch
         # Compact Stage1 always uses the deterministic runtime fanout protocol.
         # Keeping this wire format identical for every MAX-MTPR bucket is what
         # makes uneven-rank dynamic prefill safe.
