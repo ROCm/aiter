@@ -20,8 +20,10 @@ from .communication_ops_utils import (
     store_i64_global_system,
 )
 
-_JIT_SCHEMA_VERSION = "v5-batched-push-depth-16"
+_JIT_SCHEMA_VERSION = "v6-out-peer-striped-depth-16"
 _PUSH_PIPELINE_DEPTH = 16
+_OUT_CHANNEL_COUNT = 8
+_OUT_CHANNEL_DEPTH = _PUSH_PIPELINE_DEPTH // _OUT_CHANNEL_COUNT
 
 
 def make_fused_a2a_kernel(
@@ -349,7 +351,6 @@ def make_fused_a2a_out_kernel(
     seq_full = seq_local * npes
     chunks_per_row = row_nbytes // 16
     peer_chunks = seq_local * heads_local * chunks_per_row
-    total_chunks = npes * peer_chunks
     shared_storage = fx.struct(
         type(
             "_OutSharedStorage",
@@ -388,37 +389,43 @@ def make_fused_a2a_out_kernel(
         fx.barrier()
 
         rsrc_input = create_buffer_resource_from_addr(addr_input)
-        chunk_step = global_warp_num * _PUSH_PIPELINE_DEPTH
-        for chunk_base in range(global_warp_id, total_chunks, chunk_step):
+        channel_warp_num = global_warp_num // _OUT_CHANNEL_COUNT
+        channel_id = global_warp_id % _OUT_CHANNEL_COUNT
+        channel_warp_id = global_warp_id // _OUT_CHANNEL_COUNT
+        chunk_step = channel_warp_num * _OUT_CHANNEL_DEPTH
+        channel_base = channel_id * peer_chunks
+        channel_end = channel_base + peer_chunks
+        for chunk_base in range(
+            channel_base + channel_warp_id, channel_end, chunk_step
+        ):
             values = []
             destinations = []
-            for batch_idx in range_constexpr(_PUSH_PIPELINE_DEPTH):
-                chunk_idx = chunk_base + batch_idx * global_warp_num
-                valid = chunk_idx < total_chunks
-                safe_chunk_idx = valid.select(chunk_idx, 0)
-                dest_pe = safe_chunk_idx // peer_chunks
-                dest_chunk = safe_chunk_idx % peer_chunks
+            for batch_idx in range_constexpr(_OUT_CHANNEL_DEPTH):
+                chunk_idx = chunk_base + batch_idx * channel_warp_num
+                valid = chunk_idx < channel_end
+                safe_chunk_idx = valid.select(chunk_idx, channel_base)
+                dest_chunk = safe_chunk_idx - channel_base
                 seq = dest_chunk // (heads_local * chunks_per_row)
                 head_chunk = dest_chunk % (heads_local * chunks_per_row)
                 local_head = head_chunk // chunks_per_row
                 row_chunk = head_chunk % chunks_per_row
-                src_row = local_head * seq_full + dest_pe * seq_local + seq
+                src_row = local_head * seq_full + channel_id * seq_local + seq
                 src_offset = src_row * chunks_per_row * 4 + row_chunk * 4
                 values.append(
                     buffer_load(rsrc_input, src_offset, vec_width=4, dtype=T.i32)
                 )
-                peer_base = fx.memref_load(p2p_bases, dest_pe)
+                peer_base = fx.memref_load(p2p_bases, channel_id)
                 dst_addr = peer_base + fx.Int64(
                     rank * peer_chunks * 16 + dest_chunk * 16
                 )
                 destinations.append(create_buffer_resource_from_addr(dst_addr))
-            for batch_idx in range_constexpr(_PUSH_PIPELINE_DEPTH):
-                chunk_idx = chunk_base + batch_idx * global_warp_num
+            for batch_idx in range_constexpr(_OUT_CHANNEL_DEPTH):
+                chunk_idx = chunk_base + batch_idx * channel_warp_num
                 buffer_store(
                     values[batch_idx],
                     destinations[batch_idx],
                     0,
-                    mask=chunk_idx < total_chunks,
+                    mask=chunk_idx < channel_end,
                 )
 
         fx.rocdl.s_waitcnt(vmcnt=0)
@@ -469,7 +476,7 @@ def make_fused_a2a_out_jit(
         head_dim,
         block_num,
         warp_num_per_block,
-        "v1-fused-out-hop",
+        _JIT_SCHEMA_VERSION,
     )
 
     @flyc.jit
