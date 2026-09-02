@@ -142,6 +142,15 @@ Silu configs (kimik2, glm5, qwen) reach a4w4 by default; neither flag applies.
 
 ## 5. Measurement protocol
 
+**`run_config`'s `Kernel(us)` column is not a measurement.** It echoes the input
+CSV's recorded `us`, so comparing two arms on it compares what each CSV already
+claimed — a circular result that looks like a benchmark. The tell is that repeated
+runs come back bit-identical (`37.0 / 37.0 / 37.0`). `E2E(us)` in the same table
+*is* measured live, but includes host time and is destroyed by CPU contention.
+For per-kernel numbers use rocprofv3 (below), and note that a call-count filter
+does not separate the torch reference: `at::native*`, `rocprim*`, `Cijk_*`
+(hipBLASLt) and `fillBufferAligned` loop too. Filter by kernel role name instead.
+
 **Never diff recorded `us1`/`us2` across CSVs.** Those columns come from whichever
 harness produced them and are not comparable. Re-measure both arms in one
 harness. Observed: a row whose CSV claimed a 27 µs GEMM2 win measured 1.3 µs.
