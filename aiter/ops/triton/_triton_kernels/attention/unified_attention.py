@@ -283,77 +283,78 @@ def kernel_unified_attention_2d(
         v_descale = None
     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
 
+    masked_tile_start = tile_start
     if SPLIT_UNMASKED_LOOP:
         min_query_key_limit = context_len + q_block_local_idx * BLOCK_Q + 1
         unmasked_tile_end = tl.minimum(min_query_key_limit // TILE_SIZE, tile_end)
         unmasked_tile_end = tl.maximum(unmasked_tile_end, tile_start)
-    else:
-        unmasked_tile_end = tile_start
 
-    for j in range(tile_start, unmasked_tile_end):
-        seq_offset = j * TILE_SIZE + offs_t
+        for j in range(tile_start, unmasked_tile_end):
+            seq_offset = j * TILE_SIZE + offs_t
 
-        physical_block_idx = tl.load(
-            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
-        ).to(tl.int64)
-        v_offset = (
-            physical_block_idx[:, None] * stride_v_cache_0
-            + kv_head_idx * stride_v_cache_2
-            + offs_d[None, :] * stride_v_cache_3
-            + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
-        )
-        k_offset = (
-            physical_block_idx[None, :] * stride_k_cache_0
-            + kv_head_idx * stride_k_cache_2
-            + offs_d[:, None] * stride_k_cache_3
-            + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-        )
-
-        K_load = tl.load(
-            key_cache_ptr + k_offset,
-            mask=dim_mask[:, None],
-            other=0.0,
-            cache_modifier=KV_cache_modifier,
-        )
-        K = K_load.to(Q.dtype)
-
-        V_load = tl.load(
-            value_cache_ptr + v_offset,
-            mask=dim_mask[None, :],
-            other=0.0,
-            cache_modifier=KV_cache_modifier,
-        )
-        V = V_load.to(Q.dtype)
-
-        S = qk_scale * tl.dot(Q, K)
-
-        if USE_SOFTCAP:
-            S = apply_softcap(S, softcap) * RCP_LN2
-
-        if USE_ALIBI_SLOPES:
-            S += alibi_slope[:, None] * (seq_offset - context_len) * RCP_LN2
-
-        if USE_QQ_BIAS:
-            key_rel_pos = seq_offset - context_len
-            is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
-            qq_bias = tl.load(
-                qq_bias_row_ptrs + key_rel_pos[None, :],
-                mask=is_query_key[None, :],
-                other=0.0,
+            physical_block_idx = tl.load(
+                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+            ).to(tl.int64)
+            v_offset = (
+                physical_block_idx[:, None] * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_2
+                + offs_d[None, :] * stride_v_cache_3
+                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
             )
-            S += qq_bias * RCP_LN2
+            k_offset = (
+                physical_block_idx[None, :] * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_2
+                + offs_d[:, None] * stride_k_cache_3
+                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+            )
 
-        m_j = tl.maximum(M, tl.max(S, axis=1))
-        m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
-        P = tl.math.exp2(S - m_j[:, None])
-        l_j = tl.sum(P, axis=1)
-        alpha = tl.math.exp2(M - m_j)
-        acc = acc * alpha[:, None]
-        L = L * alpha + l_j
-        M = m_j
-        acc = tl.dot(P.to(V.dtype), V, acc=acc)
+            K_load = tl.load(
+                key_cache_ptr + k_offset,
+                mask=dim_mask[:, None],
+                other=0.0,
+                cache_modifier=KV_cache_modifier,
+            )
+            K = K_load.to(Q.dtype)
 
-    for j in range(unmasked_tile_end, tile_end):
+            V_load = tl.load(
+                value_cache_ptr + v_offset,
+                mask=dim_mask[None, :],
+                other=0.0,
+                cache_modifier=KV_cache_modifier,
+            )
+            V = V_load.to(Q.dtype)
+
+            S = qk_scale * tl.dot(Q, K)
+
+            if USE_SOFTCAP:
+                S = apply_softcap(S, softcap) * RCP_LN2
+
+            if USE_ALIBI_SLOPES:
+                S += alibi_slope[:, None] * (seq_offset - context_len) * RCP_LN2
+
+            if USE_QQ_BIAS:
+                key_rel_pos = seq_offset - context_len
+                is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
+                qq_bias = tl.load(
+                    qq_bias_row_ptrs + key_rel_pos[None, :],
+                    mask=is_query_key[None, :],
+                    other=0.0,
+                )
+                S += qq_bias * RCP_LN2
+
+            m_j = tl.maximum(M, tl.max(S, axis=1))
+            m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
+            P = tl.math.exp2(S - m_j[:, None])
+            l_j = tl.sum(P, axis=1)
+            alpha = tl.math.exp2(M - m_j)
+            acc = acc * alpha[:, None]
+            L = L * alpha + l_j
+            M = m_j
+            acc = tl.dot(P.to(V.dtype), V, acc=acc)
+
+        masked_tile_start = unmasked_tile_end
+
+    for j in range(masked_tile_start, tile_end):
         seq_offset = j * TILE_SIZE + offs_t
         # to reduce the masking effect when not needed
         if TILE_SIZE == BLOCK_SIZE:
