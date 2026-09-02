@@ -408,7 +408,8 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
                 run_pipeline_stage(read_stage=0, next_k=NRED_TILES - 1)
                 run_pipeline_stage(read_stage=1, next_k=None, read_next=False)
 
-                # Epilogue: fp32 accumulators -> bf16, masked store (no bias in backward).
+                # Epilogue: fp32 accumulators -> bf16; bounded C_buf drops OOB tail
+                # stores in hardware (no bias in backward).
                 mma_frag_C_bf16 = fx.make_fragment_like(mma_frag_C, fx.BFloat16.ir_type)
                 thr_copy_r2g_C = fx.make_tiled_copy_C(
                     fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16), tiled_mma
