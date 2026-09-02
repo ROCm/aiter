@@ -504,8 +504,7 @@ def _row_logits_split(
     NUM_CHAINS: gl.constexpr,
     M_CHUNK: gl.constexpr,
 ):
-    """One query row's logits, folding each head chunk as its MFMA retires.
-    """
+    """One query row's logits, folding each head chunk as its MFMA retires."""
     NCHUNK: gl.constexpr = NUM_HEADS // M_CHUNK
     acc = None
     for c in gl.static_range(0, NCHUNK):
