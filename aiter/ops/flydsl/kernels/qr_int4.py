@@ -181,17 +181,26 @@ def has_xgmi_peer_links() -> bool:
     opposite on the two. KFD exposes the real link type per peer pair, so read
     that instead of guessing from the SKU.
 
+    Both ``io_links`` and ``p2p_links`` have to be scanned. KFD only populates
+    ``p2p_links`` for peers reachable indirectly (through a host bridge), so on
+    a directly-connected mesh it holds nothing but the PCIe links to the CPU
+    nodes and the xGMI peers appear solely under ``io_links``. Reading
+    ``p2p_links`` alone reports "PCIe" on an 8-GPU all-xGMI MI350X, which flips
+    ``inbox_memory="auto"`` to the fine-grained heap and silently costs the
+    uncached fanout the kernel was designed around.
+
     Returns True when the topology cannot be read, which keeps the historical
     uncached allocation on any host we cannot classify -- the failure mode of
     guessing "PCIe" on an xGMI box is a silent perf regression on hardware
     where the current design is already optimal.
     """
     try:
-        for props in _KFD_NODES.glob("*/p2p_links/*/properties"):
-            for line in props.read_text().splitlines():
-                field, _, value = line.partition(" ")
-                if field == "type" and int(value) == _HSA_IOLINK_TYPE_XGMI:
-                    return True
+        for subdir in ("io_links", "p2p_links"):
+            for props in _KFD_NODES.glob(f"*/{subdir}/*/properties"):
+                for line in props.read_text().splitlines():
+                    field, _, value = line.partition(" ")
+                    if field == "type" and int(value) == _HSA_IOLINK_TYPE_XGMI:
+                        return True
         return False
     except (OSError, ValueError):
         logger.debug("QRInt4: cannot read KFD topology; assuming xGMI", exc_info=True)
