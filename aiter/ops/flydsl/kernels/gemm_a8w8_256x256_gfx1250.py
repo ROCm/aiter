@@ -24,6 +24,10 @@ from .gemm_common_gfx1250 import (
 )
 from .gfx1250_cluster import compute_mcast_masks
 from .kernels_common import format_kernel_name
+from .tensor_shim import (
+    AITER_FLYDSL_KERNARG_PRELOAD,
+    AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+)
 
 
 @flyc.jit
@@ -976,4 +980,6 @@ def launch_gemm_a8w8_256x256(
 
 launch_gemm_a8w8_256x256.compile_hints["llvm_options"] = {
     "amdgpu-expert-scheduling-mode": True,
+    "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+    "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
 }
