@@ -88,6 +88,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_activation.py]=90
     FILE_TIMES[op_tests/test_flydsl_qk_norm_rope_quant.py]=88
     FILE_TIMES[op_tests/test_kvcache.py]=73
+    FILE_TIMES[op_tests/test_flydsl_gdr_mtp.py]=73
     FILE_TIMES[op_tests/test_gemm_a8w8_blockscale.py]=69
     FILE_TIMES[op_tests/test_jit_dir_with_enum.py]=69
     FILE_TIMES[op_tests/test_mhc.py]=68
@@ -313,6 +314,7 @@ get_time() {
 declare -A MEMORY_WEIGHT_FLOOR
 if [[ "$TEST_TYPE" == "aiter" ]]; then
     MEMORY_WEIGHT_FLOOR[op_tests/test_flydsl_causal_conv1d_update.py]=300
+    MEMORY_WEIGHT_FLOOR[op_tests/test_flydsl_gdr_mtp.py]=300
     MEMORY_WEIGHT_FLOOR[op_tests/test_flydsl_qk_norm_rope_quant.py]=300
     MEMORY_WEIGHT_FLOOR[op_tests/test_kvcache.py]=300
     MEMORY_WEIGHT_FLOOR[op_tests/test_mla_prefill_ps.py]=300
