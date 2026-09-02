@@ -338,16 +338,21 @@ def _heuristic_bpreshuffle_kid(batch: int, m: int, n: int) -> int:
     # it several times over. So the decode tiles are confined to the region they
     # were actually measured in rather than trusted outside it.
     if m > _BPRESHUF_DECODE_M_MAX:
-        return 0
+        # kid24: kid0's 128x128x256 tile at 192 threads with a 2x2 consumer-wave
+        # grid. Measured 1.33x faster than kid0 at healthy clocks (111.75 vs
+        # 148.36 us, b=8 m=2048), confirmed across decode shapes under both
+        # healthy and degraded clock states with the same ratio. The mechanism is
+        # occupancy 1 -> 2 (538 -> 314 VGPR, zero scratch) from the extra
+        # consumer waves and the squared grid.
+        return 24
     cus = _cu_count()
-    # kid6's grid, the quantity both branches of the trade are measured against.
     bm6, bn6 = _BPRESHUF_TILE_BN[6]
     wg6 = -(-m // bm6) * -(-n // bn6) * batch
     if wg6 <= cus:
         return 6
     if wg6 <= 2 * cus:
         return 7
-    return 0
+    return 24
 
 
 def bmm_a8w8_mxscale_bpreshuffle_opus(
