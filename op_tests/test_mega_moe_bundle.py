@@ -243,3 +243,7 @@ def test_empty_rank_uses_smallest_collective_bundle_entry():
 def test_bundle_rejects_out_of_range_tokens(tokens):
     with pytest.raises(ValueError, match="must be in"):
         build_mega_moe_bundle_plan(8192).entry_for_tokens(tokens)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
