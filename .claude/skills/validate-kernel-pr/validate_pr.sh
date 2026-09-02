@@ -1067,8 +1067,28 @@ else:
             and node.test.comparators[0].value == "__main__"
             for node in tree.body
         )
+        # A module that parses argv in its BODY cannot be collected by pytest: the import
+        # pytest performs runs that call with pytest's own argv and argparse exits the
+        # process. Observed on ROCm/aiter#5172, whose target defines test nodes AND parses
+        # argv at module level -- it is green as a script and dies in collection, and the
+        # report described it as a red target with no hint that the runner was the cause.
+        parses_argv_at_import = any(
+            isinstance(node, ast.Call)
+            and getattr(node.func, "attr", "") in {"parse_args", "parse_known_args"}
+            for statement in tree.body
+            if not isinstance(
+                statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            )
+            for node in ast.walk(statement)
+        )
         if has_pytest:
             result = {"runner": "pytest", "reason": "target defines pytest test nodes"}
+            if parses_argv_at_import:
+                result["runner_risk"] = (
+                    "the target parses argv in its module body, which pytest executes at "
+                    "collection with its own argv; a collection error here is a property "
+                    "of the runner selection, not necessarily of the code under test"
+                )
         elif has_main:
             result = {"runner": "script", "reason": "target has a __main__ entry point"}
         else:
@@ -1092,6 +1112,11 @@ PY
 )
 jset_string "test_selection.runner" "$TARGET_RUNNER"
 jset_string "test_selection.runner_reason" "$TARGET_RUNNER_REASON"
+TARGET_RUNNER_RISK=$(python3 -c \
+  'import json,sys; print(json.loads(sys.argv[1]).get("runner_risk",""))' "$RUNNER_JSON")
+if [ -n "$TARGET_RUNNER_RISK" ]; then
+  jset_string "test_selection.runner_risk" "$TARGET_RUNNER_RISK"
+fi
 # Two independent channels can carry the S1 grid: the target's own CLI flag (--shape-arg)
 # and an environment variable it reads (--shape-env). They are probed separately and the
 # results are combined, because a caller who supplies both is describing one target that has
@@ -1416,7 +1441,20 @@ jset_string "test_selection.grid_channel_reason" "$GRID_CHANNEL_REASON"
 # The check is a comparison against the target's own declared defaults for the same flag, so
 # it is a property of the request and the target, not of any one repository.
 GRID_INDEPENDENCE="unknown"
-GRID_INDEPENDENCE_REASON="the channel exposes no declared defaults to compare against"
+# The default reason must describe THIS run, not a hypothetical target. Publishing "the
+# channel exposes no declared defaults" whenever the comparison did not happen states a
+# fact about the target that the run never established -- observed on ROCm/aiter#5172,
+# whose `-c` flag does declare a default list, while the channel had been demoted for an
+# unrelated reason. Say which of the several ways this comparison can be skipped applied.
+if [ -z "$GRID" ]; then
+  GRID_INDEPENDENCE_REASON="no shape grid was requested, so there was nothing to compare"
+elif [ "$GRID_CHANNEL" != "cli" ]; then
+  GRID_INDEPENDENCE_REASON="independence is only computed for the CLI-flag channel (this run established '${GRID_CHANNEL:-none}'); the target's own defaults were not read"
+elif [ "$GRID_HOOK_OK" -ne 1 ]; then
+  GRID_INDEPENDENCE_REASON="the shape flag's hook was not established, so the target's own defaults were not read"
+else
+  GRID_INDEPENDENCE_REASON="the target file is not present, so its defaults could not be read"
+fi
 if [ -n "$GRID" ] && [ "$GRID_CHANNEL" = "cli" ] \
     && [ "$GRID_HOOK_OK" -eq 1 ] && [ -f "$REPO_WT/$TEST_FILE" ]; then
   GRID_INDEPENDENCE_JSON=$(python3 - "$REPO_WT/$TEST_FILE" "$SHAPE_ARG" "$GRID" <<'PY'
@@ -1527,6 +1565,29 @@ if [ "${#AXES[@]}" -gt 0 ]; then
   fi
 fi
 AXIS_UNPROVEN=""
+if [ "${#AXES[@]}" -gt 0 ]; then
+  # Record what was ASKED FOR before deciding whether it could be honoured. An empty `axes`
+  # beside a non-`none` axis_state loses the request itself: a reader could not see that a
+  # head-count axis had been requested and dropped -- which is precisely the silently
+  # narrowed test space this stage exists to make visible.
+  AXIS_REPORT=$(python3 - "${AXES[@]}" <<'PY'
+import json
+import sys
+
+axes = []
+for spec in sys.argv[1:]:
+    name, _, rest = spec.partition("=")
+    flag, _, values = rest.partition(":")
+    axes.append({
+        "name": name.strip(),
+        "flag": flag.strip(),
+        "values": [cell.strip() for cell in values.split(";") if cell.strip()],
+        "hook_proof": "not-evaluated",
+    })
+print(json.dumps(axes))
+PY
+)
+fi
 if [ "$AXIS_STATE" = "declared" ]; then
   AXIS_REPORT=$(python3 - "$REPO_WT/$TEST_FILE" "${AXES[@]}" <<'PY'
 import ast
@@ -2451,6 +2512,13 @@ PY
       else
         finding "note" "correctness" \
           "the test target is red on both baseline and head; the failure is not attributed without matching failure evidence"
+      fi
+      # "Red on both sides" is an attribution, not an explanation. When the target carries a
+      # structural reason the selected RUNNER cannot run it, that reason belongs in the
+      # report -- otherwise a reader concludes the code is broken when the runner choice is.
+      if [ -n "$TARGET_RUNNER_RISK" ] && [ "$HEAD_EXECUTED" -eq 0 ]; then
+        finding "note" "correctness" \
+          "the target executed nothing under the selected $TARGET_RUNNER runner, and $TARGET_RUNNER_RISK"
       fi
     fi
 

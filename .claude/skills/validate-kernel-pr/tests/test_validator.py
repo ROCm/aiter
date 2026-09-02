@@ -1702,6 +1702,76 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertIn("--perf-control-column", perf["note"])
         self.assertNotIn("nothing to time against", perf["note"])
 
+    #: A pytest-named file that ALSO parses argv in its module body. Found on
+    #: ROCm/aiter#5172: pytest wins the runner selection, imports the module at collection
+    #: with its own argv, and argparse exits the process. The file is green as a script.
+    ARGV_AT_IMPORT_TARGET = (
+        "import argparse\n"
+        "import os\n"
+        "import sys\n"
+        "\n"
+        "sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))\n"
+        "\n"
+        "from axis_kernel import run_kernel\n"
+        "\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('-s', '--shapes', nargs='*', default=['7,257,f32'])\n"
+        "parser.add_argument('--num-heads', type=int, nargs='*', default=[64, 128])\n"
+        "args = parser.parse_args()\n"
+        "\n"
+        "\n"
+        "def test_top_level():\n"
+        "    run_kernel(7, 257, 'f32', 64)\n"
+    )
+
+    def test_a_runner_that_cannot_run_the_target_is_named_as_such(self):
+        # "Red on both sides" is an attribution, not an explanation. When the target carries
+        # a structural reason the SELECTED runner cannot run it, a reader who is not told so
+        # concludes the code is broken when the runner choice is.
+        patch = self._axis_patch("argv-at-import.patch", body=self.ARGV_AT_IMPORT_TARGET)
+        _, report = self.fixture.validate(
+            patch,
+            tests=self.AXIS_TARGET_PATH,
+            expected_route="axis_kernel:run_kernel",
+            shape_env=None,
+            shape_arg="--shapes",
+            grid_value="9,1023,f32",
+            axes=("num_heads=--num-heads:16;32",),
+            perf=False,
+        )
+
+        selection = report["test_selection"]
+        self.assertEqual("pytest", selection["runner"])
+        self.assertIn("parses argv in its module body", selection["runner_risk"])
+        self.assertTrue(
+            any(
+                "under the selected pytest runner" in item["detail"]
+                for item in report["findings"]
+            ),
+            report["findings"],
+        )
+
+        # A requested axis that could not be honoured must still appear. Publishing an empty
+        # `axes` beside a non-`none` axis_state loses the request itself, which is exactly
+        # the silently narrowed test space these fields exist to make visible.
+        self.assertEqual("unusable", selection["axis_state"])
+        self.assertEqual(1, len(selection["axes"]))
+        self.assertEqual("num_heads", selection["axes"][0]["name"])
+        self.assertEqual(["16", "32"], selection["axes"][0]["values"])
+        self.assertEqual("not-evaluated", selection["axes"][0]["hook_proof"])
+
+        # And the grid-independence reason must describe THIS run. The old default claimed
+        # "the channel exposes no declared defaults to compare against" whenever the
+        # comparison did not happen - a statement about the target that this run never
+        # established, and false here: the target declares a default for --shapes.
+        self.assertEqual("unknown", selection["grid_independence"])
+        self.assertNotIn(
+            "no declared defaults", selection["grid_independence_reason"]
+        )
+        self.assertIn(
+            "cli-flag-unusable", selection["grid_independence_reason"]
+        )
+
     def test_a_killed_run_leaves_no_stale_verdict_at_the_output_path(self):
         # The process exit code used to be read back out of `--out` AFTER finish_report, so
         # `--out` was a fallback source of truth. A run that died before finish_report copied

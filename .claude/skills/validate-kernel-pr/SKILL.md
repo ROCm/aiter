@@ -226,6 +226,13 @@ Runner selection is structural, not assumed:
 - otherwise a file with an `if __name__ == "__main__"` guard runs as `python <file>`;
 - a file with neither is `skip`, never a test failure.
 
+Selection can still pick a runner the target cannot survive. A file that defines `test*` nodes
+**and** parses argv in its module body is collected by pytest, which imports it with pytest's
+own argv — and argparse exits the process, while the same file is green run as a script.
+`test_selection.runner_risk` names that structurally, and a run that executes nothing under
+the selected runner says so: *"red on both sides"* is an attribution, not an explanation, and a
+reader who is not told otherwise concludes the code is broken when the runner choice is.
+
 The report records `test_selection.runner` and `runner_reason`. A script target is profiled the
 same way a pytest target is: the probe is installed by a validator-owned runner that then executes
 the file under `runpy` with `run_name="__main__"`, so `execution_receipt` is reachable for both.
@@ -329,6 +336,14 @@ Axes obey the same burden of proof as `--shape-arg`, in two steps, and
 Each axis records its own `independence` against the flag's declared default, on the same
 terms as the shape cells. A proven axis that asks for values outside the default makes the
 run independent even when the shape cells duplicate.
+
+A requested axis appears in `test_selection.axes` **whatever** becomes of it, with
+`hook_proof: not-evaluated` when the run never got far enough to scan for the flag. An empty
+`axes` beside a non-`none` `axis_state` would lose the request itself — which is the silently
+narrowed test space these fields exist to make visible. For the same reason
+`grid_independence_reason` names which of the several ways the comparison can be skipped
+actually applied, rather than defaulting to a claim about the target ("the channel exposes no
+declared defaults") that the run never established.
 
 ### 6 — `execution_receipt`
 

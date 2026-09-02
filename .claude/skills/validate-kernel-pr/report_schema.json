@@ -461,6 +461,10 @@
               "hook_proof"
             ]
           }
+        },
+        "runner_risk": {
+          "type": "string",
+          "description": "A structural reason the SELECTED runner may be unable to run this target, e.g. a module body that parses argv, which pytest executes at collection with its own argv."
         }
       }
     },
