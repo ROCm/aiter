@@ -3,13 +3,15 @@
 
 """Unified correctness + performance test for jagged_dense_bmm backward (jdbba bwd).
 
-Correctness (pytest, Mi=512): dispatch config resolution, checkAllclose vs torch-eager
+Correctness (pytest, Mi=512): checkAllclose vs torch-eager
 reference on all three grads (dJagged, dDense, dBias), empty-group zero checks in skew
 regime, tail-over-read regression,
 forced split=2 reduce-path coverage, end-to-end autograd at headline shapes,
 multi-device backward (cuda:1 tensors, current device cuda:0), large-B
 (n_groups>=8192) int32 offset boundary at D=512, and deployment-shape
 (B=1024, Mi=7680, D=512) int64 seq_start rebase (L*D > 2^31).
+Host-only ``resolve_config`` precedence (kwarg > winner > fallback) via an
+in-memory synthetic dispatch table (no committed JSON fixture).
 
 Performance (``main()``, Mi=7680): FlyDSL vs upstream Triton on headline deployment
 shapes, swept over regime and backward component (``jagged`` / ``dense_bias`` / ``all``).
@@ -76,7 +78,7 @@ except ModuleNotFoundError as _exc:  # pragma: no cover
     _TRITON_ERR = _exc
 
 # Headline correctness cases per D: (B, Mi, regime). Mi is modest to bound eager-ref
-# cost; deployment Mi is exercised via resolve_config (7680) and the perf sweep.
+# cost; deployment Mi is exercised by the int64-rebase test and the perf sweep.
 _HEADLINE = [
     (120, 512, "uniform"),
     (120, 512, "genrec"),
@@ -557,6 +559,44 @@ _requires_backend = pytest.mark.skipif(
     not _backend_ready(),
     reason="jdbba backward requires flydsl on gfx942/gfx950",
 )
+
+# In-memory dispatch table for test_jdbba_bwd_resolve_config_precedence (not prod JSON).
+_SYNTHETIC_JDBBA_BWD_DISPATCH = {
+    "gfx": "gfx942",
+    "winners": {"B7D128K128N42": {"gj_stages_a": 9}},
+    "fallback": {
+        "by_d_bucket": {
+            "d_le_256": {"config": {"gj_stages_a": 3}},
+            "d_gt_256": {"config": {"gj_stages_a": 4}},
+        }
+    },
+}
+
+
+@pytest.mark.skipif(not _HAS_FLYDSL, reason="needs aiter.ops.flydsl dispatch module")
+def test_jdbba_bwd_resolve_config_precedence(monkeypatch):
+    """Host-only: kwarg > JSON winner > D-bucket fallback."""
+    import aiter.ops.flydsl.jagged_dense_bmm_bwd_dispatch as disp
+
+    monkeypatch.setattr(disp, "_DISPATCH_TABLE", _SYNTHETIC_JDBBA_BWD_DISPATCH)
+
+    cfg = disp.resolve_config(n_groups=7, reduction_k=128, output_n=128, max_seq_len=42)
+    assert cfg["gj_stages_a"] == 9
+
+    cfg = disp.resolve_config(n_groups=7, reduction_k=128, output_n=128, max_seq_len=99)
+    assert cfg["gj_stages_a"] == 3
+
+    cfg = disp.resolve_config(n_groups=7, reduction_k=384, output_n=384, max_seq_len=99)
+    assert cfg["gj_stages_a"] == 4
+
+    cfg = disp.resolve_config(
+        n_groups=7,
+        reduction_k=128,
+        output_n=128,
+        max_seq_len=42,
+        gj_stages_a=1,
+    )
+    assert cfg["gj_stages_a"] == 1
 
 
 @_requires_backend
