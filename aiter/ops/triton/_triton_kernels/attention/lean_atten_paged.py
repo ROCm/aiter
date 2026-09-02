@@ -17,6 +17,8 @@ TO be added features:
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
 
 @triton.jit
 def find_group(x):
@@ -29,7 +31,23 @@ def find_group(x):
     return group_id, group_size, total_blocks
 
 
-@triton.jit
+_la_persistent_paged_repr = make_kernel_repr(
+    "la_persistent_paged",
+    [
+        "HEAD_DIM",
+        "BLOCK_M",
+        "BLOCK_N",
+        "batch_size",
+        "num_m_blocks",
+        "high_load_wgs",
+        "max_tiles_per_wg",
+        "tiles_per_head",
+        "num_splits",
+    ],
+)
+
+
+@triton.jit(repr=_la_persistent_paged_repr)
 def la_persistent_paged(
     Q,
     K,

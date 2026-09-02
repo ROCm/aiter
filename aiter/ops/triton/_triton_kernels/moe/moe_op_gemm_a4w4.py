@@ -127,7 +127,18 @@ def unswizzle_mx_scale_gfx1250(
     return scale_buffer_slice
 
 
-@triton.jit
+_mxfp4_quant_kernel_repr = make_kernel_repr(
+    "_mxfp4_quant_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "MXFP4_QUANT_BLOCK_SIZE",
+        "EVEN_M_N",
+    ],
+)
+
+
+@triton.jit(repr=_mxfp4_quant_kernel_repr)
 def _mxfp4_quant_kernel(
     x_ptr,
     x_fp4_ptr,
