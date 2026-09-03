@@ -6,22 +6,74 @@ import logging
 import multiprocessing
 import os
 import socket
+import threading
 import time
 
 logger = logging.getLogger("aiter")
 
 
+def _pid_namespace():
+    """Identity of this process's PID namespace, e.g. ``pid:[4026532567]``.
+
+    Containers get distinct namespaces even when they share the host's network
+    (and therefore its hostname), which is exactly the case pid+host cannot
+    tell apart. Empty string where the kernel does not expose it.
+    """
+    try:
+        return os.readlink("/proc/self/ns/pid")
+    except OSError:
+        return ""
+
+
+def _process_start_time(pid):
+    """Field 22 of ``/proc/<pid>/stat``: start time in clock ticks since boot.
+
+    Distinguishes a live process from a recycled pid. Empty string where
+    unavailable (non-Linux, hidden procfs).
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            data = f.read()
+        # comm may contain spaces/parens; everything after the last ')' is safe
+        return data[data.rindex(b")") + 2 :].split()[19].decode()
+    except (OSError, IndexError, ValueError):
+        return ""
+
+
 class FileBaton:
     """A primitive, file-based synchronization utility.
 
-    The lock file records the owning ``pid`` and host so that a crashed or
-    killed builder (which never reaches :meth:`release`) leaves behind a
-    *stale* lock that waiters can detect and break, instead of deadlocking
-    forever. This also covers the empty/0-byte lock left when a process dies
-    between creating and writing the file.
+    The lock file records the owning ``pid``, host, **PID namespace and process
+    start time** so that a crashed or killed builder (which never reaches
+    :meth:`release`) leaves behind a *stale* lock that waiters can detect and
+    break, instead of deadlocking forever. This also covers the empty/0-byte
+    lock left when a process dies between creating and writing the file.
+
+    ``pid`` + host alone is not an identity. Two cases where it is ambiguous,
+    both of which deadlock a build in practice:
+
+    * **Containers sharing the host network** (``docker run --network host``,
+      the normal way to run a tuner) report the *host's* hostname while keeping
+      their own PID namespace, and every container has a pid 1 and low worker
+      pids. A lock leaked by a killed container therefore looks alive to the
+      next one, forever -- and with a host-mounted build cache it survives
+      restarts, so the wedge is permanent until someone deletes the file.
+    * **PID reuse** after the holder dies, on any host.
+
+    The namespace id and start time disambiguate both. For a holder in another
+    namespace, whose liveness cannot be checked from here at all, the holder
+    heartbeats the lock's mtime while it works, so waiters can fall back to
+    "has not been touched in ``heartbeat_stale_seconds``".
     """
 
-    def __init__(self, lock_file_path, wait_seconds=0.2, stale_grace_seconds=10.0):
+    def __init__(
+        self,
+        lock_file_path,
+        wait_seconds=0.2,
+        stale_grace_seconds=10.0,
+        heartbeat_seconds=5.0,
+        heartbeat_stale_seconds=60.0,
+    ):
         """
         Create a new :class:`FileBaton`.
 
@@ -33,11 +85,20 @@ class FileBaton:
                 info (e.g. a 0-byte lock from a crash), how old it must be
                 before being treated as stale. Protects the brief window
                 between create and write in a healthy builder.
+            heartbeat_seconds: How often the holder touches the lock while it
+                works, so that waiters in another PID namespace can tell a
+                working builder from a dead one.
+            heartbeat_stale_seconds: How long a lock held by a holder in
+                another PID namespace may go untouched before it is considered
+                stale. Must be comfortably larger than heartbeat_seconds.
         """
         self.lock_file_path = lock_file_path
         self.wait_seconds = wait_seconds
         self.stale_grace_seconds = stale_grace_seconds
+        self.heartbeat_seconds = heartbeat_seconds
+        self.heartbeat_stale_seconds = heartbeat_stale_seconds
         self.fd = None
+        self._stop_heartbeat = None
 
     def try_acquire(self):
         """
@@ -52,10 +113,18 @@ class FileBaton:
         except FileExistsError:
             return False
         try:
-            os.write(self.fd, f"{os.getpid()}\n{socket.gethostname()}\n".encode())
+            pid = os.getpid()
+            os.write(
+                self.fd,
+                (
+                    f"{pid}\n{socket.gethostname()}\n"
+                    f"{_pid_namespace()}\n{_process_start_time(pid)}\n"
+                ).encode(),
+            )
             os.fsync(self.fd)
         except OSError:
             pass
+        self._start_heartbeat()
         return True
 
     def wait(self):
@@ -85,6 +154,9 @@ class FileBaton:
 
     def release(self):
         """Release the baton and remove its file."""
+        if self._stop_heartbeat is not None:
+            self._stop_heartbeat.set()
+            self._stop_heartbeat = None
         if self.fd is not None:
             os.close(self.fd)
             self.fd = None
@@ -93,18 +165,43 @@ class FileBaton:
         except FileNotFoundError:
             pass
 
+    def _start_heartbeat(self):
+        """Touch the lock while we hold it, so waiters that cannot check our
+        pid (another PID namespace) can still tell we are alive."""
+        if self.heartbeat_seconds <= 0:
+            return
+        stop = threading.Event()
+        path = self.lock_file_path
+        interval = self.heartbeat_seconds
+
+        def _beat():
+            while not stop.wait(interval):
+                try:
+                    os.utime(path, None)
+                except OSError:
+                    return  # lock gone or unwritable: nothing useful to do
+
+        threading.Thread(target=_beat, name="aiter-baton-heartbeat", daemon=True).start()
+        self._stop_heartbeat = stop
+
     # ---- stale-lock detection ----
 
     def _read_owner(self):
-        """Return (pid, host) recorded in the lock file, or (None, None)."""
+        """Return (pid, host, ns, start_time) from the lock file.
+
+        Locks written by an older AITER carry only pid + host; they parse with
+        ns and start_time empty and keep the previous behaviour.
+        """
         try:
             with open(self.lock_file_path, "r") as f:
                 lines = f.read().splitlines()
         except (FileNotFoundError, OSError):
-            return None, None
+            return None, None, "", ""
         if len(lines) < 2 or not lines[0].strip().isdigit():
-            return None, None
-        return int(lines[0].strip()), lines[1].strip()
+            return None, None, "", ""
+        ns = lines[2].strip() if len(lines) > 2 else ""
+        start = lines[3].strip() if len(lines) > 3 else ""
+        return int(lines[0].strip()), lines[1].strip(), ns, start
 
     @staticmethod
     def _pid_alive(pid):
@@ -116,10 +213,17 @@ class FileBaton:
             return True  # exists but owned by another user
         return True
 
+    def _untouched_for(self):
+        """Seconds since the lock file was last touched, or None."""
+        try:
+            return time.time() - os.path.getmtime(self.lock_file_path)
+        except OSError:
+            return None
+
     def _is_stale(self):
         """A lock is stale if its recorded holder is dead, or if it carries no
         owner info and has outlived the grace period (orphaned/0-byte lock)."""
-        pid, host = self._read_owner()
+        pid, host, ns, start = self._read_owner()
         if pid is None:
             # No readable owner: only trust mtime, and only for our own host
             # cannot be verified, so fall back to an age-based grace window.
@@ -132,7 +236,21 @@ class FileBaton:
             # Different host (e.g. shared filesystem): can't check liveness,
             # never steal — avoid breaking a live remote builder's lock.
             return False
-        return not self._pid_alive(pid)
+        my_ns = _pid_namespace()
+        if ns and my_ns and ns != my_ns:
+            # Same host, different PID namespace: the recorded pid means
+            # nothing here (every container has a pid 1 and low worker pids),
+            # so pid liveness would be a coin flip that reliably says "alive".
+            # Decide on the holder's heartbeat instead.
+            untouched = self._untouched_for()
+            return untouched is not None and untouched > self.heartbeat_stale_seconds
+        if not self._pid_alive(pid):
+            return True
+        if start:
+            # Same pid, different start time: the original holder died and the
+            # pid was recycled.
+            return _process_start_time(pid) != start
+        return False
 
     def _try_break_stale(self):
         """Atomically break a stale lock. A secondary ``.steal`` lock ensures
