@@ -8,14 +8,16 @@ import torch
 import triton
 import triton.language as tl
 
-from .index import prepare_chunk_indices
-from .utils import (
+from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils import (
     autotune_cache_kwargs,
     check_shared_mem,
     chunk_delta_attn_autotune_configs,
     exp,
     input_guard,
     softplus,
+)
+from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.index import (
+    prepare_chunk_indices,
 )
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]

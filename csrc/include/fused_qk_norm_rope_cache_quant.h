@@ -54,7 +54,8 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                                                 bool use_shuffle_layout,
                                                 int64_t block_size,
                                                 int64_t x,
-                                                int64_t rotary_dim = 0);
+                                                int64_t rotary_dim = 0,
+                                                bool v_norm        = false);
 
 void fused_qk_norm_rope_2way(aiter_tensor_t& q0,
                              aiter_tensor_t& k0,
@@ -109,7 +110,9 @@ void fused_qk_norm_rope_1way_fp8_perhead_quant(aiter_tensor_t& q,
                                                aiter_tensor_t& q_descale,
                                                aiter_tensor_t& k_descale,
                                                aiter_tensor_t& q_unquantized,
-                                               aiter_tensor_t& k_unquantized);
+                                               aiter_tensor_t& k_unquantized,
+                                               aiter_tensor_t& q_partial_amax,
+                                               aiter_tensor_t& k_partial_amax);
 
 // Same signature as the pertensor variant, but writes per-(batch, head) descales:
 //   q_descale shape [batch_size, num_heads_q]
@@ -138,19 +141,25 @@ void fused_qk_norm_rope_2way_fp8_perhead_quant(aiter_tensor_t& q0,
                                                aiter_tensor_t& q_descale,
                                                aiter_tensor_t& k_descale,
                                                aiter_tensor_t& q_unquantized,
-                                               aiter_tensor_t& k_unquantized);
+                                               aiter_tensor_t& k_unquantized,
+                                               aiter_tensor_t& q_partial_amax,
+                                               aiter_tensor_t& k_partial_amax);
 
 // Per-(batch, head) FP8 quant for concatenated [v0, v1] without a bf16 cat.
 // v0/v1: [B, T0/T1, H, D]; v_fp8: [B, T0+T1, H, D]; v_descale: [B, H].
+// v_amax: zero-initialized fp32 [B, H] scratch (accumulated via atomic_fmax_pos).
 void v_2way_per_head_fp8_quant(aiter_tensor_t& v0,
                                aiter_tensor_t& v1,
                                aiter_tensor_t& v_fp8,
-                               aiter_tensor_t& v_descale);
+                               aiter_tensor_t& v_descale,
+                               aiter_tensor_t& v_amax);
 
 // Per-(batch, head) FP8 quant for single-stream V [B, T, H, D].
+// v_amax: zero-initialized fp32 [B, H] scratch (accumulated via atomic_fmax_pos).
 void v_1way_per_head_fp8_quant(aiter_tensor_t& v,
                                aiter_tensor_t& v_fp8,
-                               aiter_tensor_t& v_descale);
+                               aiter_tensor_t& v_descale,
+                               aiter_tensor_t& v_amax);
 
 void fused_qk_rmsnorm(aiter_tensor_t& q,
                       aiter_tensor_t& q_weight,

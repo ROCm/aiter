@@ -14,16 +14,17 @@
 // the shared arch-router template instantiation and are never invoked for
 // gfx1250 (opus_gemm.cu forces <fp32_t> for split-K kids).
 //
-// Included exactly once, by opus_gemm.cu, AFTER gfx950's arch header so the
-// shared flat-array helpers in opus_gfx950_detail are visible (reused here).
+// Included exactly once, by opus_gemm.cu. Self-contained: the shared flat-array
+// dispatch types live in opus_gfx1250_detail (opus_gemm_heuristic_dispatch_
+// gfx1250.cuh), so this header does NOT depend on any gfx950 header and a
+// gfx1250-only build compiles without OPUS_BUILD_HAS_GFX950.
 #pragma once
 
 #include "../opus_gemm_arch.cuh"
 #include "../opus_gemm_common.cuh"
-#include "gfx950/opus_gemm_heuristic_dispatch_gfx950.cuh"   // OpusA16W16NoscaleKernel + opus_gfx950_detail::*
-#include "opus_gemm_heuristic_dispatch_gfx1250.cuh"          // opus_a16w16_heuristic_kid_gfx1250
-#include "opus_gemm_lookup.h"                                // GENERATE_OPUS_LOOKUP_TABLE_FP32
-#include "opus_gemm_a16w16_tune_lookup.h"                    // GENERATE_A16W16_TUNE_LOOKUP_FP32
+#include "opus_gemm_heuristic_dispatch_gfx1250.cuh"          // OpusA16W16NoscaleKernel + opus_gfx1250_detail::* + opus_a16w16_heuristic_kid_gfx1250
+#include "opus_gemm_lookup.h"                                // GENERATE_OPUS_LOOKUP_TABLE_FP32_GFX1250
+#include "opus_gemm_a16w16_tune_lookup.h"                    // GENERATE_A16W16_TUNE_LOOKUP_FP32_GFX1250
 #include "opus_gemm_manifest.h"                              // launcher symbols
 #include "../opus_gemm_utils.cuh"                            // bf16_t / fp32_t
 
@@ -36,20 +37,21 @@
 // would be an empty array in a gfx1250-only build) and is never called.
 
 template <typename CDataType>
-inline opus_gfx950_detail::OpusA16W16TuneKernel
+inline opus_gfx1250_detail::OpusA16W16TuneKernel
 opus_a16w16_tune_dispatch_gfx1250(int id);
 
 template <>
-inline opus_gfx950_detail::OpusA16W16TuneKernel
+inline opus_gfx1250_detail::OpusA16W16TuneKernel
 opus_a16w16_tune_dispatch_gfx1250<fp32_t>(int id)
 {
-    using namespace opus_gfx950_detail;
+    using namespace opus_gfx1250_detail;
     static constexpr OpusA16W16TuneEntry kTune[] = {
-        GENERATE_A16W16_TUNE_LOOKUP_FP32(fp32_t)
+        GENERATE_A16W16_TUNE_LOOKUP_FP32_GFX1250(fp32_t)
     };
     constexpr size_t kSize = sizeof(kTune) / sizeof(kTune[0]);
     OpusA16W16TuneEntry needle{id, nullptr};
-    auto it = std::lower_bound(kTune, kTune + kSize, needle, tune_entry_less);
+    auto it = std::lower_bound(kTune, kTune + kSize, needle,
+                               kid_entry_less<OpusA16W16TuneEntry>);
     AITER_CHECK(it != kTune + kSize && it->kid == id,
                 "Kernel id ", id,
                 " not found in a16w16 fp32 tune lookup table (gfx1250)");
@@ -57,7 +59,7 @@ opus_a16w16_tune_dispatch_gfx1250<fp32_t>(int id)
 }
 
 template <>
-inline opus_gfx950_detail::OpusA16W16TuneKernel
+inline opus_gfx1250_detail::OpusA16W16TuneKernel
 opus_a16w16_tune_dispatch_gfx1250<bf16_t>(int id)
 {
     // gfx1250 split-K kids are emitted <fp32_t> only; the reduce kernel handles
@@ -67,6 +69,52 @@ opus_a16w16_tune_dispatch_gfx1250<bf16_t>(int id)
                 "opus_gemm gfx1250: a16w16 <bf16_t> tune dispatch is not used "
                 "(split-K kids are fp32-workspace; bf16 Y is produced by the "
                 "reduce kernel). kid=", id);
+    return nullptr;
+}
+
+// ── a16w16 pre-compiled .co dispatch ────────────────────────────────────────
+// Two tables, mirroring the split-K pair above: id-based for the explicit
+// kernelId / tuner path, (M, N, K) for the tuned-CSV production path. Both hold
+// OpusA16W16CoKernel (no workspace argument -- see the type's comment), and both
+// are bf16-out only: the kernel writes bf16 C directly, with no reduce kernel in
+// the way to cast anything else.
+inline opus_gfx1250_detail::OpusA16W16CoKernel
+opus_a16w16_co_tune_dispatch_gfx1250(int id)
+{
+    using namespace opus_gfx1250_detail;
+    static constexpr OpusA16W16CoTuneEntry kTune[] = {
+        GENERATE_A16W16_CO_TUNE_LOOKUP_GFX1250()
+    };
+    constexpr size_t kSize = sizeof(kTune) / sizeof(kTune[0]);
+    OpusA16W16CoTuneEntry needle{id, nullptr};
+    auto it = std::lower_bound(kTune, kTune + kSize, needle,
+                               kid_entry_less<OpusA16W16CoTuneEntry>);
+    AITER_CHECK(it != kTune + kSize && it->kid == id,
+                "Kernel id ", id,
+                " not found in the a16w16 pre-compiled (.co) tune lookup table "
+                "(gfx1250). Either it is not in this build's compile set, or "
+                "the build saw no gen_co/co_kernels.json / no matching "
+                "gen_co/<arch>/*.co and the whole family is empty (the loader "
+                "drops kids whose image is missing).");
+    return it->func;
+}
+
+// (M, N, K) -> pre-compiled kernel, nullptr on miss. No heuristic fallback: the
+// shape heuristic never returns a .co kid, so a miss just means "this shape has
+// no tuned .co winner" and the caller carries on with the split-K path.
+inline opus_gfx1250_detail::OpusA16W16CoKernel
+opus_a16w16_co_dispatch_gfx1250(int M, int N, int K)
+{
+    using namespace opus_gfx1250_detail;
+    static constexpr OpusA16W16CoRuntimeEntry kLookup[] = {
+        GENERATE_OPUS_LOOKUP_TABLE_CO_GFX1250()
+    };
+    constexpr size_t kSize = sizeof(kLookup) / sizeof(kLookup[0]);
+    OpusA16W16CoRuntimeEntry needle{{M, N, K}, nullptr};
+    auto it = std::lower_bound(kLookup, kLookup + kSize, needle,
+                               shape_entry_less<OpusA16W16CoRuntimeEntry>);
+    if (it != kLookup + kSize && shape_entry_eq(*it, needle))
+        return it->func;
     return nullptr;
 }
 
@@ -92,21 +140,22 @@ inline void check_shape_4g(int M, int N, int K, size_t c_elem_bytes)
 }  // namespace opus_gfx1250_detail
 
 template <typename CDataType>
-inline OpusA16W16NoscaleKernel
+inline opus_gfx1250_detail::OpusA16W16NoscaleKernel
 opus_dispatch_a16w16_gfx1250(int M, int N, int K, int batch, bool has_bias = false);
 
 template <>
-inline OpusA16W16NoscaleKernel
+inline opus_gfx1250_detail::OpusA16W16NoscaleKernel
 opus_dispatch_a16w16_gfx1250<bf16_t>(int M, int N, int K, int batch, bool has_bias)
 {
-    using namespace opus_gfx950_detail;
+    using namespace opus_gfx1250_detail;
     static constexpr OpusA16W16RuntimeEntry kLookup[] = {
-        GENERATE_OPUS_LOOKUP_TABLE_BF16(bf16_t)
+        GENERATE_OPUS_LOOKUP_TABLE_BF16_GFX1250(bf16_t)
     };
     constexpr size_t kSize = sizeof(kLookup) / sizeof(kLookup[0]);
     OpusA16W16RuntimeEntry needle{{M, N, K}, nullptr};
-    auto it = std::lower_bound(kLookup, kLookup + kSize, needle, entry_less);
-    if (it != kLookup + kSize && entry_eq(*it, needle))
+    auto it = std::lower_bound(kLookup, kLookup + kSize, needle,
+                               shape_entry_less<OpusA16W16RuntimeEntry>);
+    if (it != kLookup + kSize && shape_entry_eq(*it, needle))
         return it->func;
     (void)batch;
     opus_gfx1250_detail::check_shape_4g(M, N, K, sizeof(bf16_t));
@@ -115,17 +164,18 @@ opus_dispatch_a16w16_gfx1250<bf16_t>(int M, int N, int K, int batch, bool has_bi
 }
 
 template <>
-inline OpusA16W16NoscaleKernel
+inline opus_gfx1250_detail::OpusA16W16NoscaleKernel
 opus_dispatch_a16w16_gfx1250<fp32_t>(int M, int N, int K, int batch, bool has_bias)
 {
-    using namespace opus_gfx950_detail;
+    using namespace opus_gfx1250_detail;
     static constexpr OpusA16W16RuntimeEntry kLookup[] = {
-        GENERATE_OPUS_LOOKUP_TABLE_FP32(fp32_t)
+        GENERATE_OPUS_LOOKUP_TABLE_FP32_GFX1250(fp32_t)
     };
     constexpr size_t kSize = sizeof(kLookup) / sizeof(kLookup[0]);
     OpusA16W16RuntimeEntry needle{{M, N, K}, nullptr};
-    auto it = std::lower_bound(kLookup, kLookup + kSize, needle, entry_less);
-    if (it != kLookup + kSize && entry_eq(*it, needle))
+    auto it = std::lower_bound(kLookup, kLookup + kSize, needle,
+                               shape_entry_less<OpusA16W16RuntimeEntry>);
+    if (it != kLookup + kSize && shape_entry_eq(*it, needle))
         return it->func;
     (void)batch;
     opus_gfx1250_detail::check_shape_4g(M, N, K, sizeof(fp32_t));

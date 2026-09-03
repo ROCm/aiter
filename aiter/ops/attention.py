@@ -10,6 +10,7 @@ import triton.language as tl
 from aiter import dtypes
 from aiter.ops.enum import Enum, MlaVersion, QuantType
 from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
+from aiter.utility.dtypes import _aiter_dtype_id
 from csrc.cpp_itfs.pa.pa import paged_attention_rocm as paged_attention_rocm_core
 from csrc.cpp_itfs.pa.pa_ragged import (
     paged_attention_ragged as paged_attention_ragged_core,
@@ -935,7 +936,7 @@ def get_pa_metadata_info_v1(
     )
 
 
-@compile_ops("module_pa_metadata")
+@compile_ops("module_pa_metadata", develop=True)
 def get_pa_metadata_v1(
     seqlens_qo_indptr: torch.Tensor,
     pages_kv_indptr: torch.Tensor,
@@ -1043,7 +1044,7 @@ def get_ps_metadata_info_v1(
     )
 
 
-@compile_ops("module_ps_metadata")
+@compile_ops("module_ps_metadata", develop=True)
 def get_ps_metadata_v1(
     seqlens_qo_indptr: torch.Tensor,
     pages_kv_indptr: torch.Tensor,
@@ -1223,6 +1224,12 @@ def get_mla_metadata_info_v1(
         and kv_dtype == dtypes.bf16
         and q_dtype == dtypes.bf16
         and num_head_qo != 48
+    ) or (
+        get_gfx() == "gfx950"
+        and q_dtype == dtypes.fp8
+        and kv_dtype == dtypes.fp8
+        and num_head_qo == 96
+        and effective_seqlen_qo <= 6
     ):
         if num_head_qo * 2 > 128:
             max_qo_tiles_per_batch = effective_seqlen_qo
@@ -1277,7 +1284,7 @@ def get_mla_metadata_info_v1(
         )
 
 
-@compile_ops("module_mla_metadata", fc_name="get_mla_metadata_v1")
+@compile_ops("module_mla_metadata", fc_name="get_mla_metadata_v1", develop=True)
 def _get_mla_metadata_v1_impl(
     seqlens_qo_indptr: torch.Tensor,
     seqlens_kv_indptr: torch.Tensor,
@@ -1301,10 +1308,10 @@ def _get_mla_metadata_v1_impl(
     intra_batch_mode: bool = False,
     is_cp_round_robin: bool = False,
     mla_version: int = MlaVersion.V32.value,
-    dtype_q_nope: torch.dtype | None = None,
-    dtype_q_rope: torch.dtype | None = None,
-    dtype_kv_nope: torch.dtype | None = None,
-    dtype_kv_rope: torch.dtype | None = None,
+    dtype_q_nope: int | None = None,
+    dtype_q_rope: int | None = None,
+    dtype_kv_nope: int | None = None,
+    dtype_kv_rope: int | None = None,
 ) -> None:
     """Compiled binding for ``get_mla_metadata_v1`` (bound via ``fc_name``).
 
@@ -1407,6 +1414,14 @@ def get_mla_metadata_v1(
         if dtype_kv_rope is None:
             dtype_kv_rope = dtype_kv
 
+    # develop=True auto-converts torch.Tensor args to aiter_tensor_t but NOT
+    # torch.dtype, so map the per-component dtypes to their AiterDtype enum ids
+    # here (None stays None -> C++ defaults to bf16). Both fp8 torch variants
+    # (e4m3fnuz / e4m3fn) collapse to the single AITER_DTYPE_fp8 id, matching the
+    # C++ side which only distinguishes "is fp8".
+    def _dtype_id(d):
+        return _aiter_dtype_id(d) if d is not None else None
+
     return _get_mla_metadata_v1_impl(
         seqlens_qo_indptr,
         seqlens_kv_indptr,
@@ -1429,50 +1444,12 @@ def get_mla_metadata_v1(
         max_split_per_batch=max_split_per_batch,
         intra_batch_mode=intra_batch_mode,
         is_cp_round_robin=is_cp_round_robin,
-        mla_version=mla_version,
-        dtype_q_nope=dtype_q_nope,
-        dtype_q_rope=dtype_q_rope,
-        dtype_kv_nope=dtype_kv_nope,
-        dtype_kv_rope=dtype_kv_rope,
+        mla_version=int(mla_version),
+        dtype_q_nope=_dtype_id(dtype_q_nope),
+        dtype_q_rope=_dtype_id(dtype_q_rope),
+        dtype_kv_nope=_dtype_id(dtype_kv_nope),
+        dtype_kv_rope=_dtype_id(dtype_kv_rope),
     )
-
-
-@compile_ops("module_mla_metadata")
-def get_mla_metadata_v1_no_redundant(
-    seqlens_qo_indptr: torch.Tensor,
-    seqlens_kv_indptr: torch.Tensor,
-    num_heads_per_head_k: int,
-    num_heads_k: int,
-    is_causal: bool,
-    kv_granularity: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Arguments:
-        cumulated seqlens of q/o: (batch_size + 1), dtype torch.int32.
-        cumulated seqlens of k/v: (batch_size + 1), dtype torch.int32.
-        num_heads_per_head_k: Equals to num_heads_q // num_heads_k.
-        num_heads_k: num_heads_k.
-        is_causal: whether causal mask is enabled.
-        kv_granularity: the granularity on kv sequence length when cutting batch.
-    Returns:
-        [0] work_metadata_ptrs  (2)                  Two 64-bits pointers point to the 1st element of work_indptr and
-                                                     work_info.
-        [1] work_indptr:        (#work_cu + 1),      The IDs of work handled by each cu_part.
-        [2] work_info           (#work, 8)
-        [2.0] bs_index:         (#work),             The index of batch handled by each work.
-        [2.1] partial_index:    (#work),             The index of tile in output buffer when splits. -1 means no split.
-        [2.2] q_start:          (#work),             The global index in seq where q/o starts. Use global index here can
-                                                     reduce memory access count in kernel.
-        [2.3] q_end:            (#work),             The global index in seq where q/o ends (not included).
-        [2.4] kv_start:         (#work),             The global index in seq where k/v starts.
-        [2.5] kv_end:           (#work),             The global index in seq where k/v ends (not included).
-        [2.6] pad               (#work, 2),          Pad to 8 DWs.
-        [3] reduce_indptr:      (#reduce_tiles + 1), The IDs in reduce_partial_map indicates the tiles should be merged
-                                                     together.
-        [4] reduce_final_map:   (#reduce_tiles),     The final output location of each group of tiles.
-        [5] reduce_partial_map: (#partial_tiles),    The locations in partial buffer of partial tiles waiting for being
-                                                     reduced.
-    """
 
 
 @compile_ops("module_mla_reduce", develop=True)
@@ -1662,6 +1639,13 @@ def decode_update_mla_metadata_v1(
             and num_heads_per_head_k == 128
             and q_is_fp8
             and kv_is_fp8
+        )
+        or (
+            arch_id == "gfx950"
+            and num_heads_per_head_k == 96
+            and q_is_fp8
+            and kv_is_fp8
+            and max_seqlen_qo <= 6
         )
     )
     cu_num = work_indptr.shape[0] - 1
@@ -1855,4 +1839,28 @@ def mla_decode_stage1_opus_fwd_ds32(
     final_lse: torch.Tensor,
     q_scale: torch.Tensor,  # [B, H, D_SCALE]         uint8 (E8M0)
     kv_scale: torch.Tensor,  # [total_tokens, D_SCALE] uint8
+) -> None: ...
+
+
+@compile_ops("module_opus_mla", ffi_type="ctypes")
+def mla_decode_fwd_opus_stage1(
+    q: torch.Tensor,  # [B, H, 576]           fp8 (merged nope+rope)
+    kv: torch.Tensor,  # [total_tokens, 576]   fp8 (merged nope+rope)
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_last_page_lens: torch.Tensor,
+    work_indptr: torch.Tensor,
+    work_info_set: torch.Tensor,
+    max_seqlen_q: int,
+    page_size: int,
+    nhead_kv: int,
+    softmax_scale: float,
+    logits: torch.Tensor,  # aiter split_output [num_partials,1,H,512] fp32
+    attn_lse: torch.Tensor,  # aiter split_lse    [num_partials,1,H,1]   fp32
+    out: torch.Tensor,  # final [B, H, 512] bf16
+    final_lse: torch.Tensor | None = None,  # [B, H] fp32
+    q_scale: torch.Tensor | None = None,  # float[1] per-tensor descale
+    kv_scale: torch.Tensor | None = None,  # float[1] per-tensor descale
+    causal: bool = True,  # mask across the max_seqlen_q query tokens
 ) -> None: ...

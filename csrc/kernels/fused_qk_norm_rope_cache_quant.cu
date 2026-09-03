@@ -14,6 +14,11 @@
  * limitations under the License.
  */
 
+// This translation unit is torch-free: define AITER_NO_TORCH_TYPES before any
+// aiter header so aiter_opus_plus.h does not pull in the c10 half/bfloat16
+// headers. The kernels use aiter::hip2opus + the _rmTorch dispatch macros, never
+// the t2opus<c10::*> specializations, so nothing here needs torch/ATen/c10.
+#define AITER_NO_TORCH_TYPES
 #include <cmath>
 #include <cstdlib>
 #include <type_traits>
@@ -3266,7 +3271,8 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                                                 bool use_shuffle_layout,
                                                 int64_t block_size,
                                                 int64_t x,
-                                                int64_t rotary_dim)
+                                                int64_t rotary_dim,
+                                                bool v_norm)
 {
     AITER_CHECK(qkv.is_contiguous() && qw.is_contiguous() && kw.is_contiguous() &&
                 cos_sin.is_contiguous());
@@ -3335,7 +3341,8 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                     k_cache_token_stride,
                     k_cache_head_stride,
                     v_cache_token_stride,
-                    v_cache_head_stride);
+                    v_cache_head_stride,
+                    v_norm);
             }
             else
             {
@@ -3386,7 +3393,8 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                             k_cache_token_stride,
                             k_cache_head_stride,
                             v_cache_token_stride,
-                            v_cache_head_stride);
+                            v_cache_head_stride,
+                            v_norm);
                     }
                     else
                     {
@@ -3433,7 +3441,8 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                             k_cache_token_stride,
                             k_cache_head_stride,
                             v_cache_token_stride,
-                            v_cache_head_stride);
+                            v_cache_head_stride,
+                            v_norm);
                     }
                 }
                 else
@@ -3633,7 +3642,9 @@ void fused_qk_norm_rope_1way_fp8_perhead_quant(aiter_tensor_t& q,
                                                aiter_tensor_t& q_descale,
                                                aiter_tensor_t& k_descale,
                                                aiter_tensor_t& q_unquantized,
-                                               aiter_tensor_t& k_unquantized)
+                                               aiter_tensor_t& k_unquantized,
+                                               aiter_tensor_t& q_partial_amax,
+                                               aiter_tensor_t& k_partial_amax)
 {
     AITER_CHECK(q.is_contiguous() && k.is_contiguous());
     AITER_CHECK(w_q.is_contiguous() && w_k.is_contiguous());
@@ -3647,6 +3658,9 @@ void fused_qk_norm_rope_1way_fp8_perhead_quant(aiter_tensor_t& q,
     AITER_CHECK(q.dtype() == q_unquantized.dtype() && k.dtype() == k_unquantized.dtype());
     AITER_CHECK(q_fp8.dtype() == AITER_DTYPE_fp8 && k_fp8.dtype() == AITER_DTYPE_fp8);
     AITER_CHECK(q_descale.dtype() == AITER_DTYPE_fp32 && k_descale.dtype() == AITER_DTYPE_fp32);
+    AITER_CHECK(q_partial_amax.dtype() == AITER_DTYPE_fp32 &&
+                    k_partial_amax.dtype() == AITER_DTYPE_fp32,
+                "q/k_partial_amax scratch must be float32");
     AITER_CHECK(get_gpu_arch() == "gfx942",
                 "fused_qk_norm_rope_1way_fp8_perhead_quant is validated only on gfx942/MI308 "
                 "because this path uses fp8_e4m3fnuz with fp8_max=240");
@@ -3675,11 +3689,6 @@ void fused_qk_norm_rope_1way_fp8_perhead_quant(aiter_tensor_t& q,
     const int num_warps_per_block = block_size / warp_size;
     dim3 threadsPerBlock(block_size);
     dim3 numBlocks((total_warps + num_warps_per_block - 1) / num_warps_per_block, batch_size);
-
-    AiterTensor q_partial_amax =
-        AiterTensor::empty({batch_size, total_warps}, AITER_DTYPE_fp32, q.device_id, stream);
-    AiterTensor k_partial_amax =
-        AiterTensor::empty({batch_size, total_warps}, AITER_DTYPE_fp32, q.device_id, stream);
 
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
         q.dtype(), "fused_qk_norm_rope_1way_fp8_perhead_amax", [&] {
@@ -3847,7 +3856,9 @@ void fused_qk_norm_rope_2way_fp8_perhead_quant(aiter_tensor_t& q0,
                                                aiter_tensor_t& q_descale,
                                                aiter_tensor_t& k_descale,
                                                aiter_tensor_t& q_unquantized,
-                                               aiter_tensor_t& k_unquantized)
+                                               aiter_tensor_t& k_unquantized,
+                                               aiter_tensor_t& q_partial_amax,
+                                               aiter_tensor_t& k_partial_amax)
 {
     AITER_CHECK(q0.is_contiguous() && k0.is_contiguous() && q1.is_contiguous() &&
                 k1.is_contiguous());
@@ -3863,6 +3874,9 @@ void fused_qk_norm_rope_2way_fp8_perhead_quant(aiter_tensor_t& q0,
     AITER_CHECK(q0.dtype() == q_unquantized.dtype() && k0.dtype() == k_unquantized.dtype());
     AITER_CHECK(q_fp8.dtype() == AITER_DTYPE_fp8 && k_fp8.dtype() == AITER_DTYPE_fp8);
     AITER_CHECK(q_descale.dtype() == AITER_DTYPE_fp32 && k_descale.dtype() == AITER_DTYPE_fp32);
+    AITER_CHECK(q_partial_amax.dtype() == AITER_DTYPE_fp32 &&
+                    k_partial_amax.dtype() == AITER_DTYPE_fp32,
+                "q/k_partial_amax scratch must be float32");
 
     HipDeviceGuard device_guard(q0.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
@@ -3871,11 +3885,6 @@ void fused_qk_norm_rope_2way_fp8_perhead_quant(aiter_tensor_t& q0,
     constexpr int block_size = 256;
     constexpr int warp_size  = 32;
     int num_warps_per_block  = block_size / warp_size;
-
-    AiterTensor q_partial_amax =
-        AiterTensor::empty({batch_size, total_warps}, AITER_DTYPE_fp32, q0.device_id, stream);
-    AiterTensor k_partial_amax =
-        AiterTensor::empty({batch_size, total_warps}, AITER_DTYPE_fp32, q0.device_id, stream);
 
     dim3 threadsPerBlock(block_size);
     dim3 numBlocks((total_warps + num_warps_per_block - 1) / num_warps_per_block, batch_size);
@@ -4091,7 +4100,8 @@ __global__ void __launch_bounds__(256) v_2way_per_head_quant_tiled_kernel(
 void v_2way_per_head_fp8_quant(aiter_tensor_t& v0,
                                aiter_tensor_t& v1,
                                aiter_tensor_t& v_fp8,
-                               aiter_tensor_t& v_descale)
+                               aiter_tensor_t& v_descale,
+                               aiter_tensor_t& v_amax)
 {
     AITER_CHECK(v0.is_contiguous() && v1.is_contiguous());
     AITER_CHECK(v_fp8.is_contiguous() && v_descale.is_contiguous());
@@ -4109,12 +4119,12 @@ void v_2way_per_head_fp8_quant(aiter_tensor_t& v0,
     AITER_CHECK(v0.dtype() == v1.dtype(), "v0/v1 dtype must match");
     AITER_CHECK(v_fp8.dtype() == AITER_DTYPE_fp8, "v_fp8 must be fp8");
     AITER_CHECK(v_descale.dtype() == AITER_DTYPE_fp32, "v_descale must be fp32");
+    // v_amax is accumulated with atomic_fmax_pos, so the caller must pass a
+    // zero-initialized fp32 [batch_size, num_heads] scratch buffer.
+    AITER_CHECK(v_amax.dtype() == AITER_DTYPE_fp32, "v_amax scratch must be float32");
 
     HipDeviceGuard device_guard(v0.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
-
-    AiterTensor v_amax =
-        AiterTensor::empty({batch_size, num_heads}, AITER_DTYPE_fp32, v0.device_id, stream);
 
     constexpr int TILE_T    = 128;
     constexpr int HEAD_SIZE = 128;
@@ -4224,7 +4234,8 @@ __global__ void __launch_bounds__(256) v_1way_per_head_quant_tiled_kernel(
 
 void v_1way_per_head_fp8_quant(aiter_tensor_t& v,
                                aiter_tensor_t& v_fp8,
-                               aiter_tensor_t& v_descale)
+                               aiter_tensor_t& v_descale,
+                               aiter_tensor_t& v_amax)
 {
     AITER_CHECK(v.is_contiguous() && v_fp8.is_contiguous() && v_descale.is_contiguous());
     AITER_CHECK(v.ndim == 4, "v must be 4D [B, T, H, D]");
@@ -4238,12 +4249,12 @@ void v_1way_per_head_fp8_quant(aiter_tensor_t& v,
     AITER_CHECK(get_gpu_arch() == "gfx942",
                 "v_1way_per_head_fp8_quant is validated only on gfx942/MI308 because this path "
                 "uses fp8_e4m3fnuz with fp8_max=240");
+    // v_amax is accumulated with atomic_fmax_pos, so the caller must pass a
+    // zero-initialized fp32 [batch_size, num_heads] scratch buffer.
+    AITER_CHECK(v_amax.dtype() == AITER_DTYPE_fp32, "v_amax scratch must be float32");
 
     HipDeviceGuard device_guard(v.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
-
-    AiterTensor v_amax =
-        AiterTensor::zeros({batch_size, num_heads}, AITER_DTYPE_fp32, v.device_id, stream);
 
     constexpr int TILE_T    = 128;
     constexpr int HEAD_SIZE = 128;

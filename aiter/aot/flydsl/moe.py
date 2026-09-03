@@ -57,6 +57,7 @@ from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
 # Keep the default AOT coverage aligned with runtime config resolution.
 DEFAULT_CSVS = [
     AITER_CONFIGS.AITER_CONFIG_FMOE_FILE,
+    AITER_CONFIGS.AITER_CONFIG_FHMOE_FILE,
 ]
 MOE_AOT_ARCH_DEFAULT = "gfx950"
 
@@ -68,8 +69,8 @@ def parse_csv(csv_path: str):
         kernel_name, stage, model_dim, inter_dim, experts, topk,
         doweight_stage1 (for stage1), and all params from get_flydsl_kernel_params.
 
-    Deduplicates by
-    (kernel_name, model_dim, inter_dim, experts, topk, doweight_stage1).
+    Deduplicates with ``job_identity``, including token bucket, block size, and
+    the shared-expert ID when present.
     """
     jobs = []
     seen = set()
@@ -85,6 +86,7 @@ def parse_csv(csv_path: str):
             doweight_stage1 = bool(int(row.get("doweight_stage1", "0")))
             cu_num = int(row.get("cu_num", "0"))
             block_m = int(row.get("block_m", "0") or "0")
+            shared_expert_id = int(row.get("shared_expert_id", "-1") or "-1")
             act_type = row.get("act_type", "")
             act_name = act_type.strip().split(".")[-1].lower()
             act = act_name if act_name in ("swiglu", "situv2") else "silu"
@@ -99,7 +101,11 @@ def parse_csv(csv_path: str):
                 and dtype in ("torch.bfloat16", "torch.float16")
                 and "float4_e2m1fn_x2" in q_dtype_w
             )
-            enable_bias_options = [False, True] if bias_supported else [False]
+            enable_bias_options = (
+                [False]
+                if shared_expert_id >= 0
+                else ([False, True] if bias_supported else [False])
+            )
 
             # Detect stage1's fuse_quant from kernel suffix to align stage2's
             # a2_scale shape with what runtime actually passes.
@@ -173,6 +179,8 @@ def parse_csv(csv_path: str):
                         "token_num": token,
                         "block_m": block_m,
                     }
+                    if shared_expert_id >= 0:
+                        job["shared_expert_id"] = shared_expert_id
                     # Stage2 needs to know whether stage1 fuses fp4/fp8 quant —
                     # this changes the shape of a2_scale (sorted scale buffer
                     # vs separate quant call output).
@@ -194,9 +202,7 @@ def parse_csv(csv_path: str):
 
                     jobs.append(full_job)
 
-    from aiter.aot.flydsl.fhmoe import extend_fhmoe_jobs
-
-    return extend_fhmoe_jobs(csv_path, jobs, seen)
+    return jobs
 
 
 def _precompile_to_cache(
@@ -260,7 +266,6 @@ def _precompile_to_cache(
 
     dev = torch.device("cpu")
     use_mx_gemm = b_dtype in ("fp4", "fp8")
-    is_int4_weight = b_dtype == "int4"
     tokens = token_num if token_num > 0 else tile_m
     E = experts
     _sort_block_m = sort_block_m if sort_block_m > 0 else tile_m
@@ -278,15 +283,10 @@ def _precompile_to_cache(
             return torch.float16
         if dtype == "bf16":
             return torch.bfloat16
-        if dtype == "int4":
-            return torch.int4 if hasattr(torch, "int4") else torch.uint8
         return torch.int8
 
     def _alloc(shape, dtype):
-        # torch.zeros doesn't support sub-byte dtypes (int4); use empty for those.
         # Cache key only depends on shape+dtype+strides — values don't matter.
-        if dtype == getattr(torch, "int4", None):
-            return torch.empty(shape, device=dev, dtype=dtype)
         return torch.zeros(shape, device=dev, dtype=dtype)
 
     def _user_a_shape():
@@ -299,16 +299,11 @@ def _precompile_to_cache(
         # User-level w1 shape: (E, 2*inter_dim, model_dim) in storage dtype.
         if b_dtype == "fp4":
             return (E, 2 * inter_dim, model_dim // 2)
-        if b_dtype == "int4":
-            # int4 packed: 2 elements per byte
-            return (E, 2 * inter_dim, model_dim // 2)
         return (E, 2 * inter_dim, model_dim)
 
     def _user_w2_shape():
         # User-level w2 shape: (E, model_dim, inter_dim) in storage dtype.
         if b_dtype == "fp4":
-            return (E, model_dim, inter_dim // 2)
-        if b_dtype == "int4":
             return (E, model_dim, inter_dim // 2)
         return (E, model_dim, inter_dim)
 
@@ -328,9 +323,6 @@ def _precompile_to_cache(
     def _make_a1_scale():
         """Mirror fused_moe_2stages a1_scale construction (per_1x32 + fp4-weight path)."""
         if not use_mx_gemm:
-            if is_int4_weight:
-                # a16wi4: bf16 activations, int4 weights — no activation scale.
-                return None
             return None
         if a_dtype == "fp8":
             if a_scale_one:
@@ -511,13 +503,6 @@ def _precompile_to_cache(
             # w1_scale: per-32 group along K dimension. Storage size in bytes.
             if use_mx_gemm:
                 w1_scale = _make_w_scale(E * 2 * inter_dim * (model_dim // 32))
-            elif is_int4_weight:
-                # a16wi4: bf16 groupwise scale over (E, K//32, N).
-                w1_scale = torch.zeros(
-                    E * (model_dim // 32) * (2 * inter_dim),
-                    device=dev,
-                    dtype=torch.bfloat16,
-                )
             else:
                 w1_scale = torch.zeros(1, device=dev, dtype=torch.float32)
 
@@ -669,6 +654,10 @@ def _precompile_to_cache(
                         _ptr_view_safe(torch.empty(0, device=dev, dtype=torch.float32)),
                         tokens,
                         sorted_token_ids.shape[0],
+                        1.0,
+                        1.0,
+                        1.0,
+                        1.0,
                         runtime_swiglu_limit(None, act),
                         0,
                     ),
@@ -692,12 +681,6 @@ def _precompile_to_cache(
             a2_scale = _make_a2_scale_for_stage2()
             if use_mx_gemm:
                 w2_scale = _make_w_scale(E * model_dim * (inter_dim // 32))
-            elif is_int4_weight:
-                w2_scale = torch.zeros(
-                    E * (inter_dim // 32) * model_dim,
-                    device=dev,
-                    dtype=torch.bfloat16,
-                )
             else:
                 w2_scale = torch.zeros(1, device=dev, dtype=torch.float32)
 
@@ -860,9 +843,10 @@ def _precompile_a16w4_to_cache(
     b_nt: int = 2,
     xcd_swizzle: int = 0,
     k_wave: int = 1,
+    b_dtype: str = "fp4",
     **kwargs,
 ):
-    """AOT for the folded a16w4 (bf16 A x fp4 W) port (moe_2stage_a16wmix).
+    """AOT for the folded a16w-mix port (moe_2stage_a16wmix): a16w4 / a16wi4.
 
     The port launch ABI (raw fx.Int64 device pointers) differs from the generic MX
     gemm (``_s1_args_fp4``), so it can't reuse ``_precompile_to_cache``'s arg
@@ -910,6 +894,7 @@ def _precompile_a16w4_to_cache(
                 tile_k=tile_k,
                 k_wave=k_wave,
                 act=("situv2" if act in ("situv2", "situ") else act),
+                w_dtype=b_dtype,
                 w_layout="standard",
                 **common,
             )
@@ -937,7 +922,7 @@ def _precompile_a16w4_to_cache(
                 max_sorted=1,
                 tile_n=g2_tile_n,
                 tile_k=g2_tile_k,
-                w_dtype="fp4",
+                w_dtype=b_dtype,
                 **common,
             )
 
@@ -980,7 +965,7 @@ def _precompile_epilogue_to_cache(act: str, inter_dim: int, topk: int):
             return
 
         exe = _get_compiled_silu_fused(
-            inter_dim, topk, quant_mode="none", gui_layout=True, act="silu"
+            inter_dim, topk, quant_mode="none", gui_layout=True, act=act
         )
         x = torch.zeros((rows, inter_dim * 2), dtype=torch.bfloat16, device=dev)
         out = torch.zeros((rows, inter_dim), dtype=torch.bfloat16, device=dev)
@@ -1001,6 +986,10 @@ def _precompile_epilogue_to_cache(act: str, inter_dim: int, topk: int):
                 _ptr_view_safe(empty_f32),
                 rows,
                 sorted_token_ids.shape[0],
+                1.0,  # situ_beta
+                1.0,  # 1 / situ_beta
+                1.0,  # situ_linear_beta
+                1.0,  # 1 / situ_linear_beta
                 float("inf"),  # swiglu_limit (unused for silu)
                 0,  # stream: null/default (compile-only, kernel is never launched)
             ),
@@ -1043,19 +1032,19 @@ def compile_one_config(
 
     from torch._subclasses.fake_tensor import FakeTensorMode
 
-    # The folded a16w4 (bf16 A x fp4 W) port takes raw .data_ptr() device
+    # The folded a16w-mix port (a16w4 fp4 / a16wi4 int4) takes raw .data_ptr() device
     # pointers, which FakeTensors don't have; drive its dedicated precompile with
     # real (COMPILE_ONLY) tensors outside FakeTensorMode.
-    is_a16w4 = (
+    is_a16w_port = (
         not is_epilogue
         and kwargs.get("shared_expert_id", -1) < 0
         and kwargs.get("a_dtype") == "bf16"
-        and kwargs.get("b_dtype") == "fp4"
+        and kwargs.get("b_dtype") in ("fp4", "int4")
     )
 
     t0 = time.time()
     try:
-        if is_a16w4:
+        if is_a16w_port:
             with override_env("FLYDSL_GPU_ARCH", aot_arch):
                 _precompile_a16w4_to_cache(
                     model_dim=model_dim,

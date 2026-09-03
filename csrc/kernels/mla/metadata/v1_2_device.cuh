@@ -24,6 +24,40 @@ struct MlaMetadataV12Traits
 
 static constexpr int32_t MLA_V12_FILL_WARPS = 8;
 
+// Scales the sqrt(workload) split-K law; absorbs the arch reduction/compute
+// cost ratio. 1.2 tuned on gfx950; retune per arch if needed.
+static constexpr float MLA_V12_SPLIT_COEF = 1.2f;
+
+// Workload-adaptive KV-split count for "auto" mode (max_split_per_batch < 0).
+// The legacy cap of 16 under-splits long ctx, so the count is derived from the
+// workload instead. Both terms of the cost are spread over the machine: stage1
+// wall ~ a*W/e (e workgroups run concurrently, W = sum_blocks total) and the
+// reduction wall ~ b*e/num_clusters (e partials over the same clusters), so the
+// optimum is e* = sqrt((a/b) * W * num_clusters) -- it scales with the WIDTH of
+// the machine, not just the work. In auto mode num_splits is num_clusters, so it
+// doubles as that width here. eff is clamped to [1, num_splits]; eff <=
+// num_splits keeps the reduce-buffer worst-case reservation valid (CUDA-graph
+// safe). coef is MLA_V12_SPLIT_COEF.
+//
+// A per-unit sum(sqrt(w_i)) instead of sqrt(W * num_clusters) is only equivalent
+// when the unit count already equals num_clusters; with n units it is off by
+// sqrt(num_clusters / n), i.e. 16x low for a single unit on a 256-CU part, which
+// starves exactly the low-concurrency decode it is meant to serve.
+//
+// Explicit (>= 0) requests keep the exact count asked for.
+__device__ __forceinline__ int32_t
+mla_v12_effective_splits(const MlaMetadataV1KernelParameter& params, const int32_t sum_blocks)
+{
+    if(!params.auto_split)
+    {
+        return params.num_splits;
+    }
+    const float work = static_cast<float>(max(1, sum_blocks)) *
+                       static_cast<float>(max(1, params.num_splits));
+    int32_t eff = static_cast<int32_t>(lrintf(MLA_V12_SPLIT_COEF * sqrtf(work)));
+    return max(1, min(eff, params.num_splits));
+}
+
 template <typename Traits>
 __device__ __forceinline__ int32_t mla_v12_num_qo_tiles(const MlaMetadataV1KernelParameter& params,
                                                         QoState<Traits>& qo_state,
@@ -74,7 +108,8 @@ mla_v12_compute_sum_blocks(const MlaMetadataV1KernelParameter& params,
         const int32_t num_blocks = integer_divide_ceil_power2(
             seqlen_kv, params.kv_granularity, params.kv_granularity_log2);
         const int32_t num_qo_tiles = mla_v12_num_qo_tiles<Traits>(params, qo_state, bid);
-        sum_blocks += (num_blocks + params.fixed_over_head_num_blocks) * num_qo_tiles;
+        const int32_t unit_blocks  = num_blocks + params.fixed_over_head_num_blocks;
+        sum_blocks += unit_blocks * num_qo_tiles;
 
         if constexpr(QoState<Traits>::is_unique() == false)
         {
@@ -136,7 +171,8 @@ __launch_bounds__(opus::get_warp_size() * MLA_V12_FILL_WARPS, 1) __global__
                                                                       num_batches,
                                                                       lane_idx);
 
-        const int32_t payload       = integer_divide_ceil(sum_blocks, params.num_splits) + overhead;
+        const int32_t eff_splits    = mla_v12_effective_splits(params, sum_blocks);
+        const int32_t payload       = integer_divide_ceil(sum_blocks, eff_splits) + overhead;
         const int32_t blocks_per_cu = payload - overhead;
 
         if(lane_idx == 0)
@@ -395,8 +431,13 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
 
     MlaWorkInfo* p_work_info_set = reinterpret_cast<MlaWorkInfo*>(params.p_work_info_set_raw);
 
-    const int32_t sum_blocks = mla_v12_compute_sum_blocks<Traits>(
-        params, qo_state, p_lds_seqlens_qo, p_lds_seqlens_kv, ori_seqlen_qo, num_batches, lane_idx);
+    const int32_t sum_blocks = mla_v12_compute_sum_blocks<Traits>(params,
+                                                                  qo_state,
+                                                                  p_lds_seqlens_qo,
+                                                                  p_lds_seqlens_kv,
+                                                                  ori_seqlen_qo,
+                                                                  num_batches,
+                                                                  lane_idx);
 
     if(lane_idx == 0)
     {
@@ -408,9 +449,10 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
             static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p_work_info_set));
     }
 
-    // expected payload handled by each cu part.
+    // same eff_splits as the phase-1 count so fill and count agree
+    const int32_t eff_splits = mla_v12_effective_splits(params, sum_blocks);
     const int32_t payload =
-        integer_divide_ceil(sum_blocks, params.num_splits) + params.fixed_over_head_num_blocks;
+        integer_divide_ceil(sum_blocks, eff_splits) + params.fixed_over_head_num_blocks;
     const int32_t page_size   = params.page_size;
     int32_t curr_batch        = 0; // batch ID of the batch which is under review
     int32_t curr_kv_block     = 0; // #blocks handled by previous cu part(s)
@@ -761,15 +803,13 @@ static inline int32_t mla_metadata_cluster_multiplier(const std::string& arch_id
                                                       const int32_t num_heads,
                                                       const int32_t max_seqlen_qo,
                                                       const MlaVersion mla_version,
-                                                      const at::ScalarType q_nope_dtype,
-                                                      const at::ScalarType q_rope_dtype,
-                                                      const at::ScalarType kv_nope_dtype,
-                                                      const at::ScalarType kv_rope_dtype)
+                                                      const AiterDtype q_nope_dtype,
+                                                      const AiterDtype q_rope_dtype,
+                                                      const AiterDtype kv_nope_dtype,
+                                                      const AiterDtype kv_rope_dtype)
 {
-    auto is_fp8 = [](const at::ScalarType dtype) {
-        return dtype == at::ScalarType::Float8_e4m3fnuz || dtype == at::ScalarType::Float8_e4m3fn;
-    };
-    auto is_bf16 = [](const at::ScalarType dtype) { return dtype == at::ScalarType::BFloat16; };
+    auto is_fp8  = [](const AiterDtype dtype) { return dtype == AITER_DTYPE_fp8; };
+    auto is_bf16 = [](const AiterDtype dtype) { return dtype == AITER_DTYPE_bf16; };
 
     const bool dtype_ok =
         ((mla_version == MlaVersion::V32) && is_fp8(q_nope_dtype) && is_fp8(q_rope_dtype) &&
@@ -783,9 +823,9 @@ static inline int32_t mla_metadata_cluster_multiplier(const std::string& arch_id
     return is_hk_m16x4 ? 2 : 1;
 }
 
-void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [batch size + 1]
-                                  const torch::Tensor& seqlens_kv_indptr, // [batch size + 1]
-                                  const torch::Tensor& kv_last_page_lens, // [batch size]
+void get_mla_metadata_v1_2_device(const aiter_tensor_t& seqlens_qo_indptr, // [batch size + 1]
+                                  const aiter_tensor_t& seqlens_kv_indptr, // [batch size + 1]
+                                  const aiter_tensor_t& kv_last_page_lens, // [batch size]
                                   const int32_t num_heads_per_head_k,
                                   const int32_t num_heads_k,
                                   const bool is_causal,
@@ -795,20 +835,20 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
                                   const int32_t ori_uni_seqlen_qo,
                                   const int32_t topk,
                                   const int32_t max_split_per_batch,
-                                  const at::ScalarType q_dtype,
-                                  const at::ScalarType kv_dtype,
-                                  const at::ScalarType q_rope_dtype,
-                                  const at::ScalarType kv_rope_dtype,
+                                  const AiterDtype q_dtype,
+                                  const AiterDtype kv_dtype,
+                                  const AiterDtype q_rope_dtype,
+                                  const AiterDtype kv_rope_dtype,
                                   const bool is_cp_round_robin,
                                   const MlaVersion mla_version,
-                                  torch::Tensor& work_metadata_ptrs,
-                                  torch::Tensor& work_info_set,
-                                  torch::Tensor& work_indptr,
-                                  torch::Tensor& reduce_indptr,
-                                  torch::Tensor& reduce_final_map,
-                                  torch::Tensor& reduce_partial_map)
+                                  aiter_tensor_t& work_metadata_ptrs,
+                                  aiter_tensor_t& work_info_set,
+                                  aiter_tensor_t& work_indptr,
+                                  aiter_tensor_t& reduce_indptr,
+                                  aiter_tensor_t& reduce_final_map,
+                                  aiter_tensor_t& reduce_partial_map)
 {
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     hipDevice_t dev;
     hipDeviceProp_t dev_prop;
@@ -827,10 +867,8 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
 
     // In the following cases, we use #head=16 to simulate cases which is not natively supported by
     // mla main kernel.
-    const bool q_is_fp8 =
-        (q_dtype == at::ScalarType::Float8_e4m3fnuz || q_dtype == at::ScalarType::Float8_e4m3fn);
-    const bool kv_is_fp8 =
-        (kv_dtype == at::ScalarType::Float8_e4m3fnuz || kv_dtype == at::ScalarType::Float8_e4m3fn);
+    const bool q_is_fp8  = (q_dtype == AITER_DTYPE_fp8);
+    const bool kv_is_fp8 = (kv_dtype == AITER_DTYPE_fp8);
 
     const bool enable_experimental = std::getenv("AITER_ENABLE_EXPERIMENTAL") != nullptr &&
                                      std::atoi(std::getenv("AITER_ENABLE_EXPERIMENTAL")) != 0;
@@ -864,6 +902,8 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
         ((arch_id == "gfx942") && (num_heads == 128) && q_is_fp8 && kv_is_fp8) ||
         ((arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 &&
          ((num_heads == 32) || (num_heads == 64) || (num_heads == 128))) ||
+        ((arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 && (num_heads == 96) &&
+         (max_seqlen_qo <= 6)) ||
         hk_mtp_experimental;
 
     if(!natively_supported && (num_heads % 16 == 0))
@@ -873,7 +913,7 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
         num_batches *= qk_batch_ratio;
     }
 
-    TORCH_CHECK(
+    AITER_CHECK(
         natively_supported || (num_heads == 16) || (num_heads == 128) ||
             ((num_heads == 32) && q_is_fp8 && kv_is_fp8) ||
             ((num_heads == 64) && q_is_fp8 && kv_is_fp8 && (max_seqlen_qo == 1)) ||
@@ -889,26 +929,30 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
         __func__,
         ": only supports #heads in [16, 64, 128], or (#head, uni_seqlen_qo) = (16*N, 1) where "
         "N is in [2, 8), or (#head, max_seqlen_qo) = (8, 4) where q and kv are fp8, "
-        "or q and kv are bf16 on gfx950")
+        "or q and kv are bf16 on gfx950");
 
     int32_t num_splits = max_split_per_batch < 0
                              ? num_clusters
                              : min(num_clusters, max_split_per_batch * num_batches);
 
+    // auto mode: device derives the split count; num_splits above only caps it
+    const bool auto_split = (max_split_per_batch < 0);
+
     MlaMetadataV1KernelParameter params = {};
-    params.p_work_metadata_ptrs         = work_metadata_ptrs.data_ptr<uint64_t>();
-    params.p_work_indptr                = work_indptr.data_ptr<int32_t>();
-    params.p_work_info_set_raw          = work_info_set.data_ptr<int32_t>();
-    params.p_reduce_indptr              = reduce_indptr.data_ptr<int32_t>();
-    params.p_reduce_final_map           = reduce_final_map.data_ptr<int32_t>();
-    params.p_reduce_partial_map         = reduce_partial_map.data_ptr<int32_t>();
-    params.p_seqlens_qo_indptr          = seqlens_qo_indptr.data_ptr<int32_t>();
-    params.p_seqlens_kv_indptr          = seqlens_kv_indptr.data_ptr<int32_t>();
-    params.p_kv_last_page_lens          = kv_last_page_lens.data_ptr<int32_t>();
+    params.p_work_metadata_ptrs         = static_cast<uint64_t*>(work_metadata_ptrs.data_ptr());
+    params.p_work_indptr                = static_cast<int32_t*>(work_indptr.data_ptr());
+    params.p_work_info_set_raw          = static_cast<int32_t*>(work_info_set.data_ptr());
+    params.p_reduce_indptr              = static_cast<int32_t*>(reduce_indptr.data_ptr());
+    params.p_reduce_final_map           = static_cast<int32_t*>(reduce_final_map.data_ptr());
+    params.p_reduce_partial_map         = static_cast<int32_t*>(reduce_partial_map.data_ptr());
+    params.p_seqlens_qo_indptr          = static_cast<int32_t*>(seqlens_qo_indptr.data_ptr());
+    params.p_seqlens_kv_indptr          = static_cast<int32_t*>(seqlens_kv_indptr.data_ptr());
+    params.p_kv_last_page_lens          = static_cast<int32_t*>(kv_last_page_lens.data_ptr());
     params.num_batches                  = num_batches;
     params.num_heads                    = num_heads;
     params.num_cu                       = num_clusters;
     params.num_splits                   = num_splits;
+    params.auto_split                   = auto_split;
     params.reduce_indptr_size           = reduce_indptr.size(0);
     params.page_size                    = page_size;
     params.kv_granularity               = kv_granularity;
