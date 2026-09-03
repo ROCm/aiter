@@ -1,0 +1,264 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# ruff: noqa: BLE001, PYI034, S110, UP035, UP037
+"""AMD GPU metrics monitor using amdsmi.
+
+Usage (context manager):
+    with GpuMonitor(device_index=0, interval_s=0.05) as mon:
+        run_workload()
+    samples = mon.samples   # list[dict]
+
+Usage (explicit start/stop):
+    mon = GpuMonitor(device_index=0, interval_s=0.05)
+    mon.start()
+    run_workload()
+    mon.stop()
+    samples = mon.samples
+"""
+
+from __future__ import annotations
+
+import ctypes
+import threading
+import time
+from contextlib import contextmanager
+from typing import Generator
+
+try:
+    import amdsmi
+
+    _AMDSMI_AVAILABLE = True
+except ImportError:
+    _AMDSMI_AVAILABLE = False
+
+
+# ------------------------------------------------------------------
+# HIP device -> amdsmi handle via PCIe BDF
+# ------------------------------------------------------------------
+
+
+def _hip_device_bdf(hip_device: int) -> str:
+    """Return the PCIe BDF string for a HIP device index, e.g. '0000:03:00.0'.
+
+    Calls ``hipDeviceGetPCIBusId`` via ctypes so there is no hard dependency on
+    PyTorch or the hip-python package.
+    """
+    import glob as _glob
+
+    candidates = ["libamdhip64.so"] + sorted(
+        _glob.glob("/opt/rocm/lib/libamdhip64.so.*"), reverse=True
+    )
+    libhip = None
+    for name in candidates:
+        try:
+            libhip = ctypes.CDLL(name)
+            break
+        except OSError:
+            continue
+    if libhip is None:
+        raise RuntimeError(
+            "libamdhip64.so not found (tried unversioned and /opt/rocm/lib/libamdhip64.so.*); "
+            "is ROCm installed?"
+        )
+    buf = ctypes.create_string_buffer(64)
+    ret = libhip.hipDeviceGetPCIBusId(buf, ctypes.c_int(64), ctypes.c_int(hip_device))
+    if ret != 0:
+        raise RuntimeError(f"hipDeviceGetPCIBusId failed with error code {ret}")
+    return buf.value.decode().lower().strip()
+
+
+def _amdsmi_bdf_str(handle) -> str:
+    """Normalise the BDF returned by amdsmi into 'dddd:bb:dd.f' lowercase."""
+    raw = amdsmi.amdsmi_get_gpu_device_bdf(handle)
+    if isinstance(raw, str):
+        return raw.lower().strip()
+    # Some amdsmi versions return a dict: {'domain': 0, 'bus': 3, 'device': 0, 'function': 0}
+    return (
+        f"{raw['domain']:04x}:{raw['bus']:02x}:{raw['device']:02x}.{raw['function']:x}"
+    )
+
+
+def hip_device_to_amdsmi_handle(hip_device: int):
+    """Return the amdsmi processor handle that corresponds to a HIP device index.
+
+    Uses PCIe BDF as the stable identifier linking the two numbering schemes.
+
+    Args:
+        hip_device: HIP device ordinal (as used by ``torch.cuda`` / HIP runtime).
+
+    Returns:
+        The amdsmi processor handle for that GPU.
+
+    Raises:
+        RuntimeError: if no amdsmi handle matches the HIP device's BDF.
+        ImportError: if amdsmi is not available.
+    """
+    if not _AMDSMI_AVAILABLE:
+        raise ImportError("amdsmi is not installed or not importable")
+
+    target_bdf = _hip_device_bdf(hip_device)
+
+    amdsmi.amdsmi_init()
+    try:
+        handles = amdsmi.amdsmi_get_processor_handles()
+        for handle in handles:
+            if _amdsmi_bdf_str(handle) == target_bdf:
+                return handle
+    finally:
+        amdsmi.amdsmi_shut_down()
+
+    raise RuntimeError(
+        f"No amdsmi handle found with BDF {target_bdf!r} "
+        f"(HIP device {hip_device})"
+    )
+
+
+def _collect_sample(handle) -> dict:
+    """Collect one snapshot from a single GPU handle."""
+    sample: dict = {"timestamp_s": time.perf_counter()}
+    try:
+        metrics = amdsmi.amdsmi_get_gpu_metrics_info(handle)
+        sample["gfx_clk_mhz"] = metrics.get("current_gfxclk", None)
+        sample["soc_clk_mhz"] = metrics.get("current_socclk", None)
+        sample["power_w"] = metrics.get("current_socket_power", None)
+        sample["temp_hotspot_c"] = metrics.get("temperature_hotspot", None)
+    except Exception:
+        pass
+    try:
+        info = amdsmi.amdsmi_get_gpu_activity(handle)
+        sample["gfx_activity_pct"] = info.get("gfx_activity", None)
+        sample["umc_activity_pct"] = info.get("umc_activity", None)
+    except Exception:
+        pass
+    try:
+        mem = amdsmi.amdsmi_get_gpu_memory_usage(handle, amdsmi.AmdSmiMemoryType.VRAM)
+        sample["vram_used_mb"] = mem / 1024 / 1024
+    except Exception:
+        pass
+    return sample
+
+
+class GpuMonitor:
+    """Poll AMD GPU metrics on a background thread.
+
+    Args:
+        device_index: Integer ordinal of the GPU to monitor (default 0), or a
+                      pre-resolved amdsmi processor handle (e.g. from
+                      ``hip_device_to_amdsmi_handle``).
+        interval_s:   Polling interval in seconds (default 0.05 = 50 ms).
+    """
+
+    def __init__(self, device_index: int = 0, interval_s: float = 0.05) -> None:
+        if not _AMDSMI_AVAILABLE:
+            raise ImportError("amdsmi is not installed or not importable")
+        self._device_index = device_index
+        self._interval_s = interval_s
+        self._samples: list[dict] = []
+        self._thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def start(self) -> None:
+        """Begin background polling. Safe to call only once per instance."""
+        if self._thread is not None and self._thread.is_alive():
+            raise RuntimeError("GpuMonitor is already running")
+        self._samples = []
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop background polling and wait for the thread to finish."""
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join()
+            self._thread = None
+
+    @property
+    def samples(self) -> list[dict]:
+        """Collected samples; each is a dict with 'timestamp_s' plus metric keys."""
+        return list(self._samples)
+
+    def summary(self) -> dict:
+        """Return min/mean/median/max for every numeric metric across all samples."""
+        if not self._samples:
+            return {}
+        keys = [k for k in self._samples[0] if k != "timestamp_s"]
+        result: dict = {}
+        for key in keys:
+            vals = sorted(
+                s[key]
+                for s in self._samples
+                if s.get(key) is not None and s[key] != "N/A"
+            )
+            if not vals:
+                continue
+            n = len(vals)
+            mid = n // 2
+            median = vals[mid] if n % 2 else (vals[mid - 1] + vals[mid]) / 2
+            result[key] = {
+                "min": vals[0],
+                "mean": sum(vals) / n,
+                "median": median,
+                "max": vals[-1],
+                "n": n,
+            }
+        return result
+
+    # ------------------------------------------------------------------
+    # Context manager
+    # ------------------------------------------------------------------
+
+    def __enter__(self) -> "GpuMonitor":
+        self.start()
+        return self
+
+    def __exit__(self, *_) -> None:
+        self.stop()
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _poll_loop(self) -> None:
+        amdsmi.amdsmi_init()
+        try:
+            if isinstance(self._device_index, int):
+                devices = amdsmi.amdsmi_get_processor_handles()
+                handle = devices[self._device_index]
+            else:
+                handle = self._device_index
+            while not self._stop_event.is_set():
+                t0 = time.perf_counter()
+                self._samples.append(_collect_sample(handle))
+                elapsed = time.perf_counter() - t0
+                remaining = self._interval_s - elapsed
+                if remaining > 0:
+                    self._stop_event.wait(timeout=remaining)
+        finally:
+            amdsmi.amdsmi_shut_down()
+
+
+# ------------------------------------------------------------------
+# Module-level convenience functions
+# ------------------------------------------------------------------
+
+
+@contextmanager
+def monitor_gpu(
+    device_index: int = 0, interval_s: float = 0.05
+) -> Generator[GpuMonitor, None, None]:
+    """Context manager that yields a running GpuMonitor.
+
+    Example::
+
+        with monitor_gpu(device_index=0) as mon:
+            run_workload()
+        print(mon.summary())
+    """
+    mon = GpuMonitor(device_index=device_index, interval_s=interval_s)
+    with mon:
+        yield mon

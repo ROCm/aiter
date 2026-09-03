@@ -81,6 +81,36 @@ Other variables:
                                        lose it outright -- see _pin_arch. Set
                                        either yourself and yours wins.
 
+Optional GPU telemetry wraps the whole selected-op sweep, never an individual
+kernel timing region:
+
+    python op_tests/bench_gfx1250_combo.py --dsv4 \
+      --smi-monitor --smi-device 0 --smi-interval 0.05
+
+The monitor uses the Python ``amdsmi`` package and prints min/mean/median/max
+for the collected clocks, power, temperature, activity and VRAM metrics after
+the sweep.
+
+Supported operator inputs can be overridden consistently with:
+
+    --data-init zero|constant|uniform|norm [more ...]
+    --scale-init zero|constant|uniform|norm|auto|pow2_binomial [more ...]
+    --seed N
+
+Operators whose underlying UT has no configurable initializer print an explicit
+notice when these flags are supplied; the setting is never silently claimed.
+The current passthrough matrix is:
+
+    DATA + SCALE + seed   moe, gemm, f8gemm, a8w8_blockscale
+    DATA + seed           a16w16, mega_moe, mhc, qk_norm
+    DATA mapping only     mha (norm -> randn, constant -> const0.25)
+    native init only      mla_v4_decode, mla_v4_prefill, score_qk,
+                          inverse_rope, mori_ep
+
+``--scale-init`` is reported as not applicable for operators without a scale
+operand. ``mla_v4_prefill`` still receives ``--seed`` because its native data
+generator exposes that control even though it does not expose a distribution.
+
 mega_moe at tokens/rank=65536 fails in setup(), asking 7.5 GB for cco's VMM
 arena against a 4 GiB default. MORI_SHMEM_HEAP_SIZE does not reach that arena
 (see run_mega_moe), so exporting it changes nothing -- and exporting it
@@ -230,6 +260,8 @@ import sys
 import tempfile
 import warnings
 
+from smi_monitor import monitor_gpu
+
 warnings.filterwarnings("ignore")
 
 
@@ -277,7 +309,12 @@ with _silence():
     import aiter
     from aiter import dtypes
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx
-    from aiter.test_common import run_perftest
+    from aiter.test_common import (
+        DATA_DISTS,
+        E8M0_SCALE_DISTS,
+        make_generator,
+        run_perftest,
+    )
 
 SUPPORTED_GFX = ["gfx1250"]
 # a16w16 N shapes at K=7168: attention/router projections, then lm_head twice
@@ -311,6 +348,58 @@ def _tokens(default=None):
     if raw:
         return tuple(int(t) for t in raw.replace(",", " ").split())
     return tuple(default) if default is not None else None
+
+
+def _init_pairs(args, *, defaults):
+    """Broadcast combo DATA/SCALE lists using the child-UT pairing contract."""
+
+    data = (
+        list(args.data_init)
+        if args.data_init is not None
+        else [pair[0] for pair in defaults]
+    )
+    scale = (
+        list(args.scale_init)
+        if args.scale_init is not None
+        else [pair[1] for pair in defaults]
+    )
+    if len(data) == 1:
+        data *= len(scale)
+    if len(scale) == 1:
+        scale *= len(data)
+    if len(data) != len(scale):
+        raise ValueError(
+            "--data-init and --scale-init must have equal length "
+            "(a length-1 side broadcasts)"
+        )
+    return tuple(zip(data, scale))
+
+
+def _unsupported_init(args, op):
+    """Make unsupported explicit init requests visible without blocking a sweep."""
+
+    requested = []
+    if args.data_init is not None:
+        requested.append("--data-init")
+    if args.scale_init is not None:
+        requested.append("--scale-init")
+    if requested:
+        print(
+            f"[data init] {op}: underlying UT does not support "
+            f"{', '.join(requested)}; using its native initializer",
+            flush=True,
+        )
+
+
+def _unused_scale_init(args, op):
+    """Report a scale initializer passed to an op without a scale operand."""
+
+    if args.scale_init is not None:
+        print(
+            f"[data init] {op}: --scale-init is not applicable; "
+            "the operator has no scale input",
+            flush=True,
+        )
 
 
 # The in-process ops call their UT per shape, so they need a sweep to iterate;
@@ -493,6 +582,9 @@ _MHA_SHAPES = [
 ]
 _MOE_KEEP = [
     "data_format",
+    "data_init",
+    "scale_init",
+    "seed",
     "act",
     "token",
     "model_dim",
@@ -532,6 +624,7 @@ _GEMM_KEEP = [
     "outtype",
     "data_init",
     "scale_init",
+    "seed",
     "knl_name",
     "asm us",
     "asm TFLOPS",
@@ -999,9 +1092,21 @@ def _run_child(name, cmd, cwd, env=None, extract=None, timeout=None, tail=30,
 
 def run_mha(args):
     # perf-only fn (no torch ref): sq==sk, hq=64, hk=8(d64)/4(d128), batch=1.
+    _unused_scale_init(args, "mha")
+    if args.data_init is None:
+        inits = args.mha_init
+    else:
+        init_map = {"norm": "randn", "constant": "const0.25"}
+        unsupported = [dist for dist in args.data_init if dist not in init_map]
+        if unsupported:
+            raise ValueError(
+                "mha only exposes randn and const0.25 initialization; "
+                f"cannot map --data-init {' '.join(unsupported)}"
+            )
+        inits = [init_map[dist] for dist in args.data_init]
     rows = []
     with _silence():
-        for init in args.mha_init:
+        for init in inits:
             for head_dim, seqlen, causal in _MHA_SHAPES:
                 hk = 8 if head_dim == 64 else 4
                 rows.append(
@@ -1020,7 +1125,10 @@ def run_moe(args):
     activation = moe_mod.ActivationType.Silu
     rows = []
     data_formats = ["a8w4"] if args.suite == "dsv4" else _MOE_DATA_FORMATS
-    for tokens, fmt in itertools.product(cfg["tokens"], data_formats):
+    init_pairs = _init_pairs(args, defaults=(("uniform", "auto"),))
+    for tokens, fmt, (data_init, scale_init) in itertools.product(
+        cfg["tokens"], data_formats, init_pairs
+    ):
         with _capture() as box:
             moe_mod.set_data_format(fmt)
             metrics = moe_mod.run_moe(
@@ -1033,6 +1141,9 @@ def run_moe(args):
                 activation=activation,
                 use_bias=cfg["use_bias"],
                 kernel_bench=True,
+                seed=args.seed,
+                data_init=data_init,
+                scale_init=scale_init,
                 check_aot_cache=False,
                 raise_on_fail=False,
             )
@@ -1071,6 +1182,9 @@ def run_moe(args):
                 "inter_dim": cfg["inter_dim"],
                 "E": cfg["experts"],
                 "topk": cfg["topk"],
+                "data_init": data_init,
+                "scale_init": scale_init,
+                "seed": args.seed,
                 "pass": metrics["passed"],
                 "gemm1_us": us1,
                 "gemm1 TFLOPS": _tflops(flop1, us1),
@@ -1090,7 +1204,9 @@ def run_moe(args):
 def run_gemm(args):
     # Hardware throughput sweep only. Functional/UT mode belongs in the source
     # op test and is intentionally not exposed by this performance driver.
-    init_pairs = [("constant", "constant"), ("uniform", "auto")]
+    init_pairs = _init_pairs(
+        args, defaults=(("constant", "constant"), ("uniform", "auto"))
+    )
     rows = []
     with _silence():
         for (M, N, K), (di, si), intype, outtype in itertools.product(
@@ -1109,6 +1225,7 @@ def run_gemm(args):
                     outtype,
                     di,
                     si,
+                    seed=args.seed,
                     mode="perf",
                 )
             )
@@ -1123,7 +1240,10 @@ def run_f8gemm(args):
         cases = [
             ("hardware", intype, M, N, K, di, si)
             for (di, si), intype in itertools.product(
-                [("constant", "constant"), ("uniform", "auto")],
+                _init_pairs(
+                    args,
+                    defaults=(("constant", "constant"), ("uniform", "auto")),
+                ),
                 ["a8w8", "a8w4"],
             )
             for M, N, K in _F8GEMM_PERF_SHAPES[intype]
@@ -1137,6 +1257,7 @@ def run_f8gemm(args):
                 1,
                 data_init=di,
                 scale_init=si,
+                seed=args.seed,
                 mode="perf",
             )
             if row is not None:
@@ -1145,7 +1266,7 @@ def run_f8gemm(args):
     _print_table(f"mxfp8fp4gemm ({args.suite})", rows, keep=_GEMM_KEEP)
 
 
-def run_a8w8_blockscale(_args):
+def run_a8w8_blockscale(args):
     """Run DSv4 FP8 blockscale linear projections at M=512."""
     # AITER_LOG_MORE=1 is set at module scope for the FlyDSL MoE ops, and a
     # child started with env=None inherits this process's whole environ. In this
@@ -1173,25 +1294,43 @@ def run_a8w8_blockscale(_args):
             "--ck_preshuffle",
             "True",
             "--flydsl",
+            *(
+                ["--data-init", *args.data_init]
+                if args.data_init is not None
+                else []
+            ),
+            *(
+                ["--scale-init", *args.scale_init]
+                if args.scale_init is not None
+                else []
+            ),
+            "--seed",
+            str(args.seed),
         ],
         cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         env=env,
     )
 
 
-def run_a16w16(_args):
+def run_a16w16(args):
     """Run the DSv4 BF16 linear shapes through the Opus GEMM UT."""
     # test_a16w16 returns only the error; its timing is printed as
     #   [a16w16] batch=1 M=512 N=64 K=7168 dtype=... | 7.8us | 12.05 TFLOPs | err=0
     # so capture the block and parse that line back out.
     batch, K = 1, 7168
     rows = []
-    for M, n in itertools.product(_A16W16_MS, _A16W16_NS):
+    _unused_scale_init(args, "a16w16")
+    data_inits = args.data_init or ["norm"]
+    generators = {dist: make_generator(args.seed) for dist in data_inits}
+    for data_init, M, n in itertools.product(
+        data_inits, _A16W16_MS, _A16W16_NS
+    ):
         # N=32320/129280 is lm_head (the DeepSeek vocab, whole and TP4-sharded).
         # See _A16W16_WIDE_N: this is the one shape rule left here, and it is
         # about what DSv4 runs, not about what the kernel can do.
         if n > _A16W16_WIDE_N and M > _A16W16_WIDE_N_MAX_M:
-            rows.append({"batch": batch, "M": M, "N": n, "K": K,
+            rows.append({"data_init": data_init, "seed": args.seed,
+                         "batch": batch, "M": M, "N": n, "K": K,
                          "err_msg": f"skipped: N>{_A16W16_WIDE_N} is lm_head, "
                                     f"capped at M<={_A16W16_WIDE_N_MAX_M}"})
             continue
@@ -1207,13 +1346,22 @@ def run_a16w16(_args):
         # raise and record that instead.
         try:
             with _capture() as box:
-                err = a16w16_mod.test_a16w16(batch=batch, M=M, N=n, K=K)
+                err = a16w16_mod.test_a16w16(
+                    batch=batch,
+                    M=M,
+                    N=n,
+                    K=K,
+                    dist=data_init,
+                    gen=generators[data_init],
+                )
         except Exception as exc:  # noqa: BLE001 - one shape must not end the sweep
-            rows.append({"batch": batch, "M": M, "N": n, "K": K,
+            rows.append({"data_init": data_init, "seed": args.seed,
+                         "batch": batch, "M": M, "N": n, "K": K,
                          "err_msg": f"{type(exc).__name__}: {exc}"})
             continue
         captured = box[0].splitlines()
-        row = {"batch": batch, "M": M, "N": n, "K": K, "err": err}
+        row = {"data_init": data_init, "seed": args.seed,
+               "batch": batch, "M": M, "N": n, "K": K, "err": err}
         # float(): checkAllclose returns a bare 0 for a clean compare but a
         # numpy/torch scalar for a mismatch, and only one of those formats.
         if err is not None and float(err) > _A16W16_MAX_ERR:
@@ -1236,11 +1384,11 @@ def run_a16w16(_args):
     _print_table(
         "gemm_a16w16_opus (DSv4)",
         rows,
-        keep=["batch", "M", "N", "K", "us", "TFLOPS", "kernel", "err"],
+        keep=["data_init", "seed", "batch", "M", "N", "K", "us", "TFLOPS", "kernel", "err"],
     )
 
 
-def run_mega_moe(_args):
+def run_mega_moe(args):
     """Run the four-rank DSv4 Mega MoE path vs its base combine, a4w4 and a8w4."""
     # The child ranks need GPU 0 as well. Release any cached allocations held by
     # this orchestration process before torchrun starts the four workers.
@@ -1286,14 +1434,30 @@ def run_mega_moe(_args):
     # AITER_FORCE_A8W4 selects the grouped kernel's ACTIVATION dtype (0 -> fp4,
     # 1 -> fp8); the weights are mxfp4 either way and -q only picks their layout,
     # so the env var and the quant key have to move together.
-    for tokens, (quant, force_a8w4), (label, combine) in itertools.product(
+    data_inits = args.data_init or [None]
+    _unused_scale_init(args, "mega_moe")
+    for tokens, (quant, force_a8w4), (label, combine), data_init in itertools.product(
         _MEGA_MOE_TOKENS,
         (("a4w4_mxfp4", "0"), ("a8w4_mxfp4", "1")),
         (("non-Mega", "base"), ("Mega", "fused")),
+        data_inits,
     ):
+        init_label = data_init or "native-default"
         _run_child(
-            f"mega_moe (tokens/rank={tokens}, {quant}, {label}, combine={combine})",
-            [*base_cmd, "-tpr", str(tokens), "-q", quant, "--combine", combine],
+            f"mega_moe (tokens/rank={tokens}, {quant}, {label}, "
+            f"combine={combine}, init={init_label}, seed={args.seed})",
+            [
+                *base_cmd,
+                "-tpr",
+                str(tokens),
+                "-q",
+                quant,
+                "--combine",
+                combine,
+                *(["--data-init", data_init] if data_init else []),
+                "--seed",
+                str(args.seed),
+            ],
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             env={**env, "AITER_FORCE_A8W4": force_a8w4},
             extract=_md_kernel_table,
@@ -1301,8 +1465,9 @@ def run_mega_moe(_args):
         )
 
 
-def run_mhc(_args):
+def run_mhc(args):
     """Run the DSv4 mHC fused-RMSNorm benchmark at M=512, N=7168."""
+    _unused_scale_init(args, "mhc")
     _run_child(
         "mhc (DSv4, fused RMSNorm)",
         [
@@ -1313,6 +1478,13 @@ def run_mhc(_args):
             "-m",
             *map(str, _TOKENS),
             "--fuse_rmsnorm",
+            *(
+                ["--data-init", *args.data_init]
+                if args.data_init is not None
+                else []
+            ),
+            "--seed",
+            str(args.seed),
         ],
         cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         extract=_md_tables(
@@ -1323,7 +1495,7 @@ def run_mhc(_args):
     )
 
 
-def run_qk_norm(_args):
+def run_qk_norm(args):
     """Run DSv4 QK norm + RoPE for prefill and decode token counts."""
     base_cmd = [
         sys.executable,
@@ -1338,19 +1510,30 @@ def run_qk_norm(_args):
         "--qweight",
     ]
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    _run_child(
-        "qk_norm",
-        [*base_cmd, "-T", *map(str, _TOKENS)],
-        cwd=repo_root,
-        extract=_md_tables(
-            (("quant_group_size",), "rope + quant"),
-            (("rows_written",), "fused SWA write"),
-        ),
-    )
+    _unused_scale_init(args, "qk_norm")
+    for data_init in args.data_init or [None]:
+        qk_init = "normal" if data_init == "norm" else data_init
+        _run_child(
+            f"qk_norm (init={qk_init or 'native-default'}, seed={args.seed})",
+            [
+                *base_cmd,
+                "-T",
+                *map(str, _TOKENS),
+                *(["--init", qk_init] if qk_init else []),
+                "--seed",
+                str(args.seed),
+            ],
+            cwd=repo_root,
+            extract=_md_tables(
+                (("quant_group_size",), "rope + quant"),
+                (("rows_written",), "fused SWA write"),
+            ),
+        )
 
 
-def run_score_qk(_args):
+def run_score_qk(args):
     """Run DSv4 decode score-QK at batch 512 for short and long CSA KV."""
+    _unsupported_init(args, "score_qk")
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     base_cmd = [
         sys.executable,
@@ -1385,8 +1568,9 @@ def run_score_qk(_args):
         )
 
 
-def run_mori_ep(_args):
+def run_mori_ep(args):
     """Run MORI EPv2 dispatch/combine at the DSv4 MoE shape."""
+    _unsupported_init(args, "mori_ep")
     # Runs whatever mori the image provides; keeping it current is the image's
     # job. Updating it from here moved the measurement target between runs and
     # needed a dev ROCm toolchain the pip-wheel images do not ship.
@@ -1549,6 +1733,7 @@ def _bench_mla_v4_asm_staged(gqa, batch, ctx, split_kv, num_iters, num_warmup):
 
 def run_mla_v4_decode(args):
     # Side-by-side asm (kargpreld) vs Triton sparse decode on the same shape grid.
+    _unsupported_init(args, "mla_v4_decode")
     iters = args.mla_v4_kargpreld_iters
     warmup = args.mla_v4_kargpreld_warmup
     mla_v4_triton_mod._PERF["num_iters"] = iters
@@ -1595,8 +1780,9 @@ def run_mla_v4_decode(args):
     print("\n".join(_kernel_digest(box[0].splitlines())), flush=True)
 
 
-def run_inverse_rope(_args):
+def run_inverse_rope(args):
     """Run DSv4 inverse RoPE + group quant at the tp1 attention-output shape."""
+    _unsupported_init(args, "inverse_rope")
     # -b is (n_local_heads, n_local_groups); 128,16 is V4-Pro at dp/tp1. The UT
     # defaults to the two smallest configs instead, which never reach the shape
     # the model runs, so name it explicitly.
@@ -1617,8 +1803,9 @@ def run_inverse_rope(_args):
     )
 
 
-def run_mla_v4_prefill(_args):
+def run_mla_v4_prefill(args):
     """Run DSv4 prefill across two precisions, pools and CSR modes."""
+    _unsupported_init(args, "mla_v4_prefill")
     for tokens in _MLA_PREFILL_TOKENS:
         _run_child(
             f"mla_v4 prefill (M={tokens}, prec=fp8/bf16, pages=4096/16384)",
@@ -1646,6 +1833,8 @@ def run_mla_v4_prefill(_args):
                 "dense",
                 "sparse",
                 "--no-verify",
+                "--seed",
+                str(args.seed),
             ],
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             # Not _table_row: the UT has no "latency_us" column (it prints
@@ -1791,6 +1980,43 @@ def main():
             "on this arch (default: suite defaults)"
         ),
     )
+    p.add_argument(
+        "--data-init",
+        nargs="+",
+        choices=list(DATA_DISTS),
+        default=None,
+        help="override DATA initialization for supported ops",
+    )
+    p.add_argument(
+        "--scale-init",
+        nargs="+",
+        choices=list(E8M0_SCALE_DISTS),
+        default=None,
+        help="override SCALE initialization for supported quantized ops",
+    )
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="RNG seed forwarded to supported ops (default: 0)",
+    )
+    p.add_argument(
+        "--smi-monitor",
+        action="store_true",
+        help="sample power/clocks/temperature/utilization for the whole sweep",
+    )
+    p.add_argument(
+        "--smi-device",
+        type=int,
+        default=0,
+        help="HIP device ordinal sampled by amdsmi (default: 0)",
+    )
+    p.add_argument(
+        "--smi-interval",
+        type=float,
+        default=0.05,
+        help="amdsmi sampling interval in seconds (default: 0.05)",
+    )
     # mha (SWA fwd asm) — fixed 4-shape grid; init sweep only
     p.add_argument(
         "--mha-init",
@@ -1823,6 +2049,10 @@ def main():
         help="mla_v4_kargpreld warmup iterations (default: 2)",
     )
     args = p.parse_args()
+    if args.smi_device < 0:
+        p.error("--smi-device must be non-negative")
+    if args.smi_interval <= 0:
+        p.error("--smi-interval must be positive")
 
     args.suite = "dsv4" if args.dsv4 else "perf"
     default_ops = DSV4_OPS if args.dsv4 else PERF_OPS
@@ -1831,9 +2061,27 @@ def main():
     # runnable by name to check whether a newer image fixed it. argparse already
     # rejects names outside OPS.
     selected_ops = args.ops or default_ops
-    for name in selected_ops:
-        with _keep_going(name):
-            OPS[name](args)
+    monitor_context = (
+        monitor_gpu(device_index=args.smi_device, interval_s=args.smi_interval)
+        if args.smi_monitor
+        else contextlib.nullcontext(None)
+    )
+    with monitor_context as monitor:
+        for name in selected_ops:
+            with _keep_going(name):
+                OPS[name](args)
+
+    if monitor is not None:
+        rows = [
+            {"metric": metric, **stats}
+            for metric, stats in monitor.summary().items()
+        ]
+        _print_table(
+            f"amdsmi (device={args.smi_device}, interval={args.smi_interval}s, "
+            f"samples={len(monitor.samples)})",
+            rows,
+            keep=["metric", "min", "mean", "median", "max", "n"],
+        )
 
     if _FAILURES:
         print(f"\n===== {len(_FAILURES)} failed, "
