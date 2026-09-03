@@ -58,14 +58,21 @@ boundary, whatever the file layout.)
 | `report.py init \| set \| stage \| finding \| finish` | the report itself. `finish` computes the verdict from the stages actually recorded, validates against `report_schema.json`, and is the **sole** writer of `verdict` and of the process exit code. |
 | `pick-idle-gpu.py` | the sampling window that decides a GPU is idle, and the `idleness-basis:` line saying how it knows. |
 | `gpu_probe.py` | which device the run actually holds — arch, BDF, activity — asked of amd-smi, never turning an unreadable reading into an idle one. |
-| `run-target.sh` | one target, one phase. Patch state, private caches, the constructed environment, the receipt probe, and the exit code plus JUnit counts that come back. |
+| `target_run.py` | the decisions around one target run: what goes into the receipt probe, how a grid cell becomes a Python value, what a script target's exit code may be counted as, and which environment variables the target is allowed to see. |
 | `scrape_perf.py` | parsing a benchmark's rows into comparable numbers. |
 | `scan_index_width.py` | the 32-bit index-width scan. |
 
-The GPU **lock** is deliberately not on this list. It is a `flock` on a file descriptor held open
-by the entry point for the whole run, and a descriptor dies with the process that opened it — so a
-child that claimed the device would release it on exit, and every concurrent validator would then
-pick the same one. The lock stays with whoever runs the tests, not with a tool that can be called.
+Two things are deliberately **not** on this list, for the same reason: they cannot survive being a
+separate process.
+
+The GPU **lock** is a `flock` on a file descriptor held open by the entry point for the whole run,
+and a descriptor dies with the process that opened it — so a child that claimed the device would
+release it on exit, and every concurrent validator would then pick the same one.
+
+**Launching the target** needs that locked device, the private cache roots, and the constructed
+environment assembled together at `env -i` time; handing all of it to a child would just move the
+assembly, not isolate it. So the entry point spawns the target, and `target_run.py` owns
+everything that had to be *decided* around the launch.
 
 You choose what to run and you explain why. You do not hand-write a stage result, and you do not
 compute the verdict — `finish` does, from what is on record.
@@ -122,7 +129,7 @@ caller validating many PRs on one machine sets them once and never thinks about 
 | `PERF_THRESHOLD` | head/base ratio that counts as a regression, default 0.95 |
 | `PERF_MIN_ROWS` | matched rows required before any ratio is reported, default 3 |
 
-`run-target.sh` additionally gives each phase a fresh private `AITER_JIT_DIR` and sets
+Each phase additionally gets a fresh private `AITER_JIT_DIR` and sets
 `PYTHONDONTWRITEBYTECODE=1`, so JIT output cannot cross between base and head or dirty the
 worktree.
 

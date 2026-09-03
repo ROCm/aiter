@@ -3921,6 +3921,131 @@ class GpuProbeTests(unittest.TestCase):
         self.assertTrue(hasattr(picker, "import_amdsmi"))
 
 
+class TargetRunTests(unittest.TestCase):
+    """The decisions around one target run, which used to live inside bash heredocs.
+
+    Each of these had end-to-end coverage only, through a full validator run that took four
+    minutes and could not say which of a dozen decisions had gone wrong.
+    """
+
+    def setUp(self):
+        sys.path.insert(0, str(SKILL_DIR))
+        self.addCleanup(sys.path.remove, str(SKILL_DIR))
+        import target_run
+
+        self.tool = target_run
+
+    def test_a_boolean_cell_arrives_as_a_boolean(self):
+        # "False" is a non-empty string, so it is truthy, and every row of a boolean dimension
+        # silently ran the True branch -- a grid that looked like it covered both.
+        self.assertIs(False, self.tool.coerce("False"))
+        self.assertIs(True, self.tool.coerce("True"))
+        self.assertIsNone(self.tool.coerce("None"))
+
+    def test_a_shape_cell_arrives_as_a_number_and_a_dtype_as_text(self):
+        # A test that indexes or allocates with a shape argument needs an int, not "128".
+        self.assertEqual(128, self.tool.coerce("128"))
+        self.assertIsInstance(self.tool.coerce("128"), int)
+        self.assertEqual(1.5, self.tool.coerce("1.5"))
+        self.assertEqual("bf16", self.tool.coerce("bf16"))
+
+    def test_the_invalid_grid_sentinel_keeps_the_arity_it_poisons(self):
+        # The probe must reach the TARGET, not crash the plugin: a row of the wrong arity
+        # raises inside pytest's parametrize, and that non-zero exit would credit the channel
+        # without the target ever having consumed a shape.
+        rows = self.tool.grid_rows(self.tool.SENTINEL, ("M", "N", "dtype"))
+        self.assertEqual([(self.tool.SENTINEL,) * 3], rows)
+
+    def test_a_row_that_does_not_match_the_argnames_is_refused(self):
+        with self.assertRaises(SystemExit) as caught:
+            self.tool.grid_rows("7,257", ("M", "N", "dtype"))
+        self.assertIn("3 cells", str(caught.exception))
+
+    def test_a_script_run_reports_observed_work_not_a_case_count(self):
+        # aiter#4538's target returns 0 with log output when the arch is unsupported, so a run
+        # that graded 56 cases and one that graded none both reported executed=1. The count
+        # that is backed by evidence is published beside it.
+        with tempfile.TemporaryDirectory() as root:
+            receipt = Path(root) / "receipt.json"
+            receipt.write_text(
+                json.dumps(
+                    {"kernel_symbols": ["a", "b"], "executed_shapes": [1, 2, 3, 4]}
+                )
+            )
+            stats = self.tool.script_stats(0, str(receipt), "mod:run")
+        self.assertEqual(1, stats["executed"])
+        self.assertEqual(4, stats["observed_work"])
+        self.assertIn("execution receipt", stats["basis"])
+
+    def test_a_named_route_that_wrote_no_receipt_observed_zero_not_nothing(self):
+        # Zero is a finding: a route was named and the run never reached it. That is different
+        # from no route having been named, where there is nothing to observe either way.
+        stats = self.tool.script_stats(0, "/nonexistent/receipt.json", "mod:run")
+        self.assertEqual(0, stats["observed_work"])
+        self.assertIn("wrote no execution receipt", stats["basis"])
+
+        unnamed = self.tool.script_stats(0, "/nonexistent/receipt.json", "")
+        self.assertIsNone(unnamed["observed_work"])
+        self.assertIn("no route was named", unnamed["basis"])
+
+    def test_a_phase_that_observed_nothing_does_not_speak_over_one_that_did(self):
+        with tempfile.TemporaryDirectory() as root:
+            grid = Path(root) / "grid.json"
+            repo = Path(root) / "repo.json"
+            repo.write_text(json.dumps({"route": "mod:run"}))
+
+            # No grid receipt at all: the repository run's stands.
+            self.assertEqual(
+                str(repo), self.tool.preferred_receipt(str(grid), str(repo))
+            )
+
+            # A grid receipt that proves no route does not displace it either.
+            grid.write_text(json.dumps({"route": None}))
+            self.assertEqual(
+                str(repo), self.tool.preferred_receipt(str(grid), str(repo))
+            )
+
+            # One that does prove the route is the run that exercised the injected shapes.
+            grid.write_text(json.dumps({"route": "mod:run"}))
+            self.assertEqual(
+                str(grid), self.tool.preferred_receipt(str(grid), str(repo))
+            )
+
+    def test_a_credential_in_the_calling_shell_is_not_readable_from_the_target(self):
+        # `env VAR=... <cmd>` ADDS to the inherited environment. The target is unmerged
+        # third-party code, and anything in the reviewer's shell was readable from os.environ
+        # inside it -- and would land in a log the moment a target printed its environment.
+        environ = {
+            "ROCM_PATH": "/opt/rocm",
+            "HIP_VISIBLE_DEVICES": "3",
+            "GITHUB_TOKEN": "ghp_secret",
+            "AITER_API_KEY": "sk-secret",
+            "TORCH_AUTH_COOKIE": "c",
+            "SSH_AUTH_SOCK": "/tmp/agent",
+            "EDITOR": "vim",
+        }
+        kept = self.tool.passthrough(environ)
+        self.assertIn("ROCM_PATH=/opt/rocm", kept)
+        self.assertIn("HIP_VISIBLE_DEVICES=3", kept)
+        # AITER_ and TORCH_ are on the allowlist; the denylist is about consequence and wins.
+        for leaked in (
+            "GITHUB_TOKEN",
+            "AITER_API_KEY",
+            "TORCH_AUTH_COOKIE",
+            "SSH_AUTH_SOCK",
+        ):
+            self.assertFalse(
+                any(pair.startswith(leaked + "=") for pair in kept), f"{leaked} leaked"
+            )
+        # And nothing outside the allowlist rides along just because it looks harmless.
+        self.assertFalse(any(pair.startswith("EDITOR=") for pair in kept))
+
+    def test_the_isolation_record_names_what_was_passed(self):
+        summary = self.tool.environment_summary(["B=2", "A=1"])
+        self.assertEqual(["A", "B"], summary["passed_through"])
+        self.assertIn("env -i", summary["policy"])
+
+
 def report_module_status(report, stage):
     return report.SATISFYING_STATUS.get(stage, report.DEFAULT_SATISFYING_STATUS)
 
