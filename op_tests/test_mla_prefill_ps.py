@@ -565,7 +565,7 @@ def test_mla_prefill(
                     ref_lse_valid,
                     asm_lse_valid,
                     rtol=0,
-                    # fp8 rounding noise can give +-0.02, so keep tolerance just above this 
+                    # fp8 rounding noise can give +-0.02, so keep tolerance just above this
                     atol=3e-2,
                     msg="mla_prefill_lse   [torch vs aiter_asm]: us......",
                 )
