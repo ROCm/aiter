@@ -17,6 +17,7 @@ from ..jit.core import (
     compile_ops,
 )
 from ..jit.utils.chip_info import get_cu_num
+from ..utility.untuned_shapes import record as _record_untuned_shape
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..ops.gemm_op_common import get_padded_m
@@ -487,6 +488,9 @@ def get_CKGEMM_config(M: int, N: int, K: int, tuned_file=None):
         logger.info(
             f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in {tuned_file}, will use default config!"
         )
+        # AITER_TUNE_GEMM=1 -> collect the miss in this family's untuned schema,
+        # so a serving run yields a ready-to-tune shape list (see #5267).
+        _record_untuned_shape(tuned_file, {"M": M, "N": N, "K": K})
     return config
 
 
@@ -549,6 +553,9 @@ def get_GEMM_config_with_quant_type(
     if config is None:
         logger.info(
             f"shape is M:{M}, N:{N}, K:{K}, q_dtype_w:{q_dtype_w}, not found tuned config in {tuned_file}, will use default config!"
+        )
+        _record_untuned_shape(
+            tuned_file, {"M": M, "N": N, "K": K, "q_dtype_w": q_dtype_w}
         )
     return config
 

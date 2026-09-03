@@ -12,6 +12,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from ..jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG, compile_ops
 from ..jit.utils.chip_info import get_cu_num
+from ..utility.untuned_shapes import record as _record_untuned_shape
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..ops.gemm_op_common import get_padded_m
 from ..utility import dtypes
@@ -75,6 +76,7 @@ def get_GEMM_config(M: int, N: int, K: int):
         logger.info(
             f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in {tuned_file}, will use default config!"
         )
+        _record_untuned_shape(tuned_file, {"M": M, "N": N, "K": K})
     return config
 
 
