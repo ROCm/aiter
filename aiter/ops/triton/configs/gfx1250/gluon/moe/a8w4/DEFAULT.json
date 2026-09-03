@@ -771,8 +771,8 @@
     },
     "bm32_n7168_k3072_xlarge": {
         "block_n": 512,
-        "block_k": 512,
-        "num_buffers": 1,
+        "block_k": 256,
+        "num_buffers": 2,
         "num_warps": 4,
         "persistent_iters": 1
     },

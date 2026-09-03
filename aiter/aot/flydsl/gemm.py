@@ -11,7 +11,7 @@ through ``AITER_CONFIGS`` so model-specific tuned CSVs can be merged the same
 way as runtime JIT config lookup.
 
 Supported kernel families:
-  - ``flydsl_gemm2_*``                        split-K HGEMM kernels
+  - ``flydsl_hgemm_*``                        gfx950 A16W16 GEMM kernels
   - ``flydsl_bpreshuflle_*``                  a8w8 preshuffle GEMM kernels
   - ``flydsl_bpreshuffle_8w_*``               gfx950 8-wave a8w8 ptpc GEMM kernels
   - ``flydsl_bpreshuffle_wmma_*``             gfx1250 a8w8 ptpc GEMM kernels
@@ -38,7 +38,9 @@ import os
 import re
 import sys
 import time
+from contextlib import nullcontext
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 
 from aiter.aot.flydsl.common import (
@@ -59,9 +61,17 @@ from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import (
 )
 from aiter.ops.flydsl.gemm_kernels import (
     SPLIT_K_SEMAPHORE_MAX_LEN,
-    get_flydsl_splitk_hgemm_kernel_params,
+    get_flydsl_hgemm_kernel_params,
 )
-from aiter.ops.flydsl.kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
+from aiter.ops.flydsl.kernels.common import run_cached
+from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import (
+    GEMM_A16W16_DTYPE_BF16,
+    GEMM_A16W16_DTYPE_FP16,
+    GEMM_A16W16_DTYPE_FP32,
+    _dynamic_tensor_arg,
+    gemm_a16w16_gfx950,
+    make_gemm_a16w16_param_and_validate,
+)
 from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm
 from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
     BLOCK_K as SCALE_BLOCK_SIZE,
@@ -195,8 +205,8 @@ def parse_csv(csv_path: str):
                 if params is not None:
                     params = dict(params)
                     params["kind"] = "ptpc_wmma"
-            elif kernel_name.startswith("flydsl_gemm"):
-                params = get_flydsl_splitk_hgemm_kernel_params(kernel_name)
+            elif kernel_name.startswith("flydsl_hgemm"):
+                params = get_flydsl_hgemm_kernel_params(kernel_name)
                 if params is not None:
                     params = dict(params)
                     params["kind"] = "hgemm"
@@ -236,6 +246,8 @@ def _torch_dtype_for_kernel(dtype_name: str):
         "bf16": torch.bfloat16,
         "f16": torch.float16,
         "fp16": torch.float16,
+        "f32": torch.float32,
+        "fp32": torch.float32,
     }
     if dtype_name not in mapping:
         raise ValueError(f"Unsupported torch dtype name for GEMM AOT: {dtype_name!r}")
@@ -260,87 +272,108 @@ def _compile_hgemm_to_cache(
     k: int,
     dtype: str,
     out_dtype: str,
-    tile_m: int,
-    tile_n: int,
-    tile_k: int,
+    block_m: int,
+    block_n: int,
+    block_k: int,
     stages: int,
     split_k: int,
-    block_m_warps: int,
-    block_n_warps: int,
-    block_k_warps: int,
-    n_tile_repeat: int = 1,
-    persistent_n_tiles: int = 1,
-    waves_per_eu: int = 0,
-    b_to_lds_unroll: int = 0,
-    async_copy: bool,
-    b_to_lds: bool,
-    b_preshuffle: bool,
-    c_to_lds: bool,
+    m_waves: int,
+    n_waves: int,
+    k_waves: int,
+    group_m: int,
+    use_half_tile_interleaved: bool,
+    has_bias: bool,
     target_gfx: str,
-    kernel_family: str = "hgemm",
-    has_bias: bool = False,
     **kwargs,
 ):
-    del kwargs, out_dtype
+    del kwargs
 
     import torch
 
-    dev = torch.device("cpu")
+    if target_gfx != "gfx950":
+        raise ValueError(
+            f"The FlyDSL A16W16 kernel only supports gfx950, got {target_gfx}"
+        )
+
     torch_dtype = _torch_dtype_for_kernel(dtype)
+    torch_out_dtype = _torch_dtype_for_kernel(out_dtype)
+    if torch_out_dtype not in (torch_dtype, torch.float32):
+        raise ValueError(
+            f"Unsupported output dtype {out_dtype!r} for input dtype {dtype!r}"
+        )
+    in_dtype_id = (
+        GEMM_A16W16_DTYPE_FP16
+        if torch_dtype == torch.float16
+        else GEMM_A16W16_DTYPE_BF16
+    )
+    out_dtype_id = (
+        GEMM_A16W16_DTYPE_FP32 if torch_out_dtype == torch.float32 else in_dtype_id
+    )
+    config = {
+        "in_dtype_id": in_dtype_id,
+        "out_dtype_id": out_dtype_id,
+        "block_m": block_m,
+        "block_n": block_n,
+        "block_k": block_k,
+        "stages": stages,
+        "split_k": split_k,
+        "m_waves": m_waves,
+        "n_waves": n_waves,
+        "k_waves": k_waves,
+        "group_m": group_m,
+        "use_half_tile_interleaved": use_half_tile_interleaved,
+        "a_is_transposed": False,
+        "b_is_transposed": True,
+        "has_bias": has_bias,
+    }
+    param = make_gemm_a16w16_param_and_validate(m, n, k, config)
+    if param is None:
+        raise ValueError(
+            f"Invalid FlyDSL A16W16 config for M={m}, N={n}, K={k}: {config}"
+        )
 
-    out = torch.empty((m, n), device=dev, dtype=torch_dtype)
-    a = torch.empty((m, k), device=dev, dtype=torch_dtype)
-    b = torch.empty((n, k), device=dev, dtype=torch_dtype)
-    bias = torch.empty((n,), device=dev, dtype=torch_dtype)
-    semaphore = torch.zeros(
-        (SPLIT_K_SEMAPHORE_MAX_LEN,),
-        device=dev,
-        dtype=torch.int32,
-    )
-    signal = torch.zeros(
-        (SPLIT_K_SEMAPHORE_MAX_LEN,),
-        device=dev,
-        dtype=torch.int32,
-    )
-    stream = fx.Stream(0)
-
-    exe = compile_flydsl_hgemm_kernel(
-        dtype,
-        n,
-        k,
-        kernel_family=kernel_family,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        stages=stages,
-        split_k=split_k,
-        block_m_warps=block_m_warps,
-        block_n_warps=block_n_warps,
-        block_k_warps=block_k_warps,
-        n_tile_repeat=n_tile_repeat,
-        persistent_n_tiles=persistent_n_tiles,
-        waves_per_eu=waves_per_eu,
-        b_to_lds_unroll=b_to_lds_unroll,
-        async_copy=async_copy,
-        b_to_lds=b_to_lds,
-        b_preshuffle=b_preshuffle,
-        c_to_lds=c_to_lds,
-        has_bias=has_bias,
-    )
-    # FlyDSL JIT does not accept None for tensor slots; pass real buffers for
-    # optional bias and split-K sync tensors.
-    launch_bias = bias if has_bias else b
-    _compile_executable_to_cache(
-        exe,
-        _ptr_view_safe(out),
-        _ptr_view_safe(a),
-        _ptr_view_safe(b),
-        _ptr_view_safe(launch_bias),
-        m,
-        _ptr_view_safe(semaphore),
-        _ptr_view_safe(signal),
-        stream,
-    )
+    # Layout-dynamic arguments make this compile independent of M/N/K. Small
+    # real CPU tensors avoid materializing model-sized buffers during AOT.
+    with compile_only_env():
+        dev = torch.device("cpu")
+        representative_extent = 8
+        a = torch.empty((1, representative_extent), device=dev, dtype=torch_dtype)
+        b = torch.empty(
+            (representative_extent, representative_extent),
+            device=dev,
+            dtype=torch_dtype,
+        ).t()
+        out = torch.empty((1, representative_extent), device=dev, dtype=torch_out_dtype)
+        bias = torch.empty((representative_extent,), device=dev, dtype=torch_dtype)
+        semaphore = torch.zeros(
+            (SPLIT_K_SEMAPHORE_MAX_LEN,), device=dev, dtype=torch.int32
+        )
+        signal = torch.zeros(
+            (SPLIT_K_SEMAPHORE_MAX_LEN,), device=dev, dtype=torch.int32
+        )
+        stream = fx.Stream(0)
+        a_arg = _dynamic_tensor_arg(a, 1)
+        b_arg = _dynamic_tensor_arg(b, 0)
+        out_arg = _dynamic_tensor_arg(out, 1)
+        bias_arg = a_arg if not has_bias else _dynamic_tensor_arg(bias, 0)
+        dispatch_args = (
+            out_arg,
+            a_arg,
+            b_arg,
+            bias_arg,
+            semaphore,
+            signal,
+            split_k,
+            param,
+            stream,
+        )
+        run_cached(
+            gemm_a16w16_gfx950,
+            *dispatch_args,
+            constexpr_param=param,
+            compiler=flyc.compile,
+            dispatch_args=dispatch_args,
+        )
 
 
 def _compile_preshuffle_to_cache(
@@ -646,9 +679,10 @@ def compile_one_config(
 
     t0 = time.time()
     try:
+        tensor_context = nullcontext() if kind == "hgemm" else FakeTensorMode()
         with (
             override_env("FLYDSL_GPU_ARCH", aot_arch),
-            FakeTensorMode(),
+            tensor_context,
         ):
             if kind == "hgemm":
                 hgemm_kwargs = dict(kwargs)

@@ -30,20 +30,10 @@ from flydsl._mlir.dialects import llvm, memref, scf
 from flydsl._mlir.dialects.arith import CmpIPredicate
 from flydsl._mlir.extras import types as _mT
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import range_constexpr
-from flydsl.runtime.device import get_rocm_arch as get_hip_arch
-
-try:
-    from flydsl.runtime.device import supports_bf16_global_atomics
-except ImportError:
-
-    def supports_bf16_global_atomics(arch: str) -> bool:
-        return str(arch).startswith(("gfx94", "gfx95", "gfx12"))
-
-
-from flydsl.expr import arith, const_expr, gpu, rocdl
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.gpu import lds_space as _lds_space
 from flydsl.expr.typing import T
+from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 from aiter.ops.flydsl.kernels import buffer_ops, vector
