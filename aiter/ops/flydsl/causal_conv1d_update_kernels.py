@@ -209,6 +209,21 @@ def _is_supported_arch(device: torch.device) -> bool:
     return arch.split(":")[0] in _SUPPORTED_ARCHS
 
 
+def _require_state_dtype(x: torch.Tensor, conv_state: torch.Tensor, fn: str) -> None:
+    """Refuse an ``x`` the kernel would reinterpret rather than convert.
+
+    Casting it here instead would cost the caller the update twice over: the
+    kernel would write into the cast copy, leaving the buffer upstream
+    overwrites in place untouched, and it would write the state's dtype into an
+    ``out`` the caller sized for its own.
+    """
+    if x.dtype != conv_state.dtype:
+        raise ValueError(
+            f"{fn}: `x` dtype {x.dtype} must match `conv_state` dtype "
+            f"{conv_state.dtype}."
+        )
+
+
 def _shapes_supported(
     x: torch.Tensor,
     conv_state: torch.Tensor,
@@ -221,19 +236,18 @@ def _shapes_supported(
 ) -> bool:
     """Shape / dtype / placement checks shared by both interfaces.
 
-    One ``dtype_str`` specializes the whole kernel, so every tensor it reads is
-    interpreted as that one dtype. ``x`` is cast to the state's dtype by the
-    wrapper, but ``weight`` and ``bias`` are read as-is: were they allowed to
-    differ, their bytes would be reinterpreted rather than converted, which is a
-    wrong answer instead of a refusal.
+    One ``dtype_str`` specializes the whole kernel, so every tensor it touches
+    is interpreted as that one dtype. Were any of them allowed to differ, its
+    bytes would be reinterpreted rather than converted, which is a wrong answer
+    instead of a refusal.
     """
     if x.dim() not in (2, 3) or conv_state.dim() != 3 or weight.dim() != 2:
         return False
     if is_varlen and (x.dim() != 2 or max_query_len <= 0):
         return False
-    if conv_state.dtype not in _SUPPORTED_DTYPES or x.dtype not in _SUPPORTED_DTYPES:
+    if conv_state.dtype not in _SUPPORTED_DTYPES:
         return False
-    if weight.dtype != conv_state.dtype:
+    if x.dtype != conv_state.dtype or weight.dtype != conv_state.dtype:
         return False
     if bias is not None and bias.dtype != conv_state.dtype:
         return False
@@ -401,8 +415,7 @@ def causal_conv1d_update_flydsl(
         )
     silu = _resolve_activation(activation)
 
-    original_dtype = x.dtype
-    x = x.to(conv_state.dtype)
+    _require_state_dtype(x, conv_state, "causal_conv1d_update_flydsl")
 
     if out is None:
         out = x  # upstream overwrites the input rather than allocating
@@ -411,7 +424,7 @@ def causal_conv1d_update_flydsl(
             raise ValueError(
                 f"`out` shape {tuple(out.shape)} must match `x` shape {tuple(x.shape)}."
             )
-        if out.dtype != original_dtype or out.device != x.device:
+        if out.dtype != x.dtype or out.device != x.device:
             raise ValueError("`out` must have the same dtype and device as `x`.")
 
     unsqueeze = not is_varlen and x.dim() == 2
@@ -529,7 +542,7 @@ def causal_conv1d_update_flydsl(
 
     if unsqueeze:
         out = out.squeeze(-1)
-    return out.to(original_dtype)
+    return out
 
 
 def _is_dedup_conv_window(window: torch.Tensor, width: int) -> bool:
@@ -609,8 +622,7 @@ def causal_conv1d_update_sglang_flydsl(
         )
     silu = _resolve_activation(activation)
 
-    original_dtype = x.dtype
-    x = x.to(conv_state.dtype)
+    _require_state_dtype(x, conv_state, "causal_conv1d_update_sglang_flydsl")
 
     unsqueeze = x.dim() == 2
     if unsqueeze:
@@ -666,9 +678,7 @@ def causal_conv1d_update_sglang_flydsl(
                 f"{tuple(want_shape)}."
             )
         if out.dtype != x.dtype or out.device != x.device:
-            raise ValueError(
-                "`out` must have the conv_state dtype and the device of `x`."
-            )
+            raise ValueError("`out` must have the same dtype and device as `x`.")
         if unsqueeze:
             out = out.unsqueeze(-1)
 
@@ -788,4 +798,4 @@ def causal_conv1d_update_sglang_flydsl(
 
     if unsqueeze:
         out = out.squeeze(-1)
-    return out.to(original_dtype)
+    return out

@@ -13,6 +13,7 @@ from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.runtime.device import get_rocm_arch
 
 from aiter.jit.core import AITER_CONFIGS
+from aiter.ops.triton.utils.device_info import get_num_sms
 
 from .kernels.gdr_decode import (
     MTP_MODE_CHAIN,
@@ -145,14 +146,6 @@ _MTP_MAX_V_SPLIT = 8
 # that still pays.
 _MTP_BLOCKS_PER_CU = 4
 _MTP_WARPS = 4
-_CU_COUNT = {}
-
-
-def _cu_count(device):
-    idx = 0 if device.index is None else device.index
-    if idx not in _CU_COUNT:
-        _CU_COUNT[idx] = torch.cuda.get_device_properties(idx).multi_processor_count
-    return _CU_COUNT[idx]
 
 
 def _mtp_warps(tile_v, warp_threads_v):
@@ -230,7 +223,6 @@ def _mtp_kwargs(
     num_v_heads,
     head_k_dim,
     head_v_dim,
-    device,
     variant,
 ):
     """Pick a tiling for the MTP kernel, then let the tuned table override it.
@@ -252,7 +244,7 @@ def _mtp_kwargs(
         head_k_dim,
         head_v_dim,
         state_dtype,
-        _MTP_BLOCKS_PER_CU * _cu_count(device),
+        _MTP_BLOCKS_PER_CU * get_num_sms(),
     )
     if d is None:
         # No tiling fits; hand back the decode default and let the builder be
@@ -409,6 +401,17 @@ def _unit_strided(t: torch.Tensor) -> bool:
     return any(s == 1 for s in t.stride())
 
 
+def _on_device(device: torch.device, *tensors: torch.Tensor | None) -> bool:
+    """Whether every tensor given sits on ``device``.
+
+    The launch hands the index vectors to the kernel as device addresses, and
+    nothing downstream checks them: the operand assertions cover the value
+    tensors only. A host tensor is then not a slow path but an invalid one, and
+    these are the arguments a caller most easily leaves on the host.
+    """
+    return all(t.device == device for t in tensors if t is not None)
+
+
 def _mtp_shapes_supported(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -431,7 +434,7 @@ def _mtp_shapes_supported(
         return False
     if not (query.is_cuda and state.is_cuda):
         return False
-    if query.device != state.device or query.device != value.device:
+    if not _on_device(query.device, key, value, state):
         return False
     if query.stride(-1) != 1 or key.stride(-1) != 1:
         return False
@@ -485,6 +488,8 @@ def _flydsl_gdr_mtp_supported(
     if num_accepted_tokens.dtype != torch.int32:
         return False
     if not _unit_strided(ssm_state_indices) or not _unit_strided(num_accepted_tokens):
+        return False
+    if not _on_device(query.device, ssm_state_indices, num_accepted_tokens):
         return False
     return _mtp_shapes_supported(query, key, value, state)
 
@@ -540,6 +545,14 @@ def _flydsl_gdr_mtp_sglang_supported(
             return False
         if not _unit_strided(retrieve_parent_token):
             return False
+    if not _on_device(
+        query.device,
+        initial_state_indices,
+        intermediate_states_buffer,
+        intermediate_state_indices,
+        retrieve_parent_token,
+    ):
+        return False
     return _mtp_shapes_supported(query, key, value, state)
 
 
