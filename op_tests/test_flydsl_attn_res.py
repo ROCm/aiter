@@ -259,7 +259,7 @@ def test_flydsl_attn_res_rejects_unsupported_hidden_size_before_empty_return():
 
 @pytest.mark.parametrize(
     "layout",
-    ("pad7", "non_unit_trailing_stride", "misaligned_base"),
+    ("pad7", "non_unit_trailing_stride", "misaligned_base", "misaligned_weight"),
 )
 def test_flydsl_attn_res_rejects_unsupported_layouts(layout: str):
     """Reject layouts that cannot safely use 128-bit vector copies."""
@@ -271,6 +271,9 @@ def test_flydsl_attn_res_rejects_unsupported_layouts(layout: str):
     elif layout == "misaligned_base":
         parent = torch.randn(1, _D + 8, dtype=torch.bfloat16)
         prefix = parent[:, 1 : 1 + _D]
+    elif layout == "misaligned_weight":
+        parent = torch.randn(_D + 8, dtype=torch.bfloat16)
+        norm_weight = parent[1 : 1 + _D]
 
     with pytest.raises(ValueError):
         flydsl_attn_res(
@@ -284,6 +287,28 @@ def test_flydsl_attn_res_rejects_unsupported_layouts(layout: str):
             -1,
             _EPS,
             _EPS,
+        )
+
+
+def test_flydsl_attn_res_rejects_rows_per_wg_over_block_limit():
+    """Reject packed blocks that exceed _MAX_BLOCK_THREADS."""
+    prefix, _, blocks, norm_weight, qk_weight, _, _ = _make_inputs(
+        1, hidden_size=_D_SMALL
+    )
+
+    with pytest.raises(ValueError, match="exceeds max"):
+        flydsl_attn_res(
+            prefix,
+            None,
+            blocks,
+            norm_weight,
+            qk_weight,
+            None,
+            0,
+            -1,
+            _EPS,
+            _EPS,
+            rows_per_wg=17,
         )
 
 

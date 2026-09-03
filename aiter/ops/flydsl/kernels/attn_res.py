@@ -32,6 +32,8 @@ from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import ReductionOp, Stream, T
 
+from aiter.jit.utils.chip_info import get_gfx
+
 from . import dpp_utils
 from .tensor_shim import _run_compiled
 
@@ -42,6 +44,7 @@ _WARP_SIZE = 64
 _VEC_WIDTH = 8  # 8 bf16 values = one 128-bit global-memory transaction.
 _TILE_CANDIDATES = (2, 4, 8, 1)
 _MAX_BLOCK_THREADS = 1024
+_ALLOWED_GFX = ("gfx942", "gfx950")
 _SMALL_D_ROWS_PER_WG = 1
 # Extra block sources kept outstanding during consume_source. Value 3 means
 # sources i+1, i+2, i+3 are already issued when reducing source i. Prefix is
@@ -217,6 +220,12 @@ def _resolve_rows_per_wg(row_threads: int, rows_per_wg: int | None) -> int:
             "packing multiple rows per workgroup is only supported for "
             f"one-wave rows ({_WARP_SIZE} threads), got row_threads={row_threads}"
         )
+    max_rows = _MAX_BLOCK_THREADS // row_threads
+    if rows_per_wg > max_rows:
+        raise ValueError(
+            f"rows_per_wg={rows_per_wg} exceeds max {max_rows} "
+            f"for row_threads={row_threads} (block limit {_MAX_BLOCK_THREADS})"
+        )
     return rows_per_wg
 
 
@@ -301,9 +310,20 @@ def _build_attn_res(
         num_tokens: fx.Int32,
     ):
         tid = fx.thread_idx.x
-        local_tid = tid % row_threads
-        token = fx.block_idx.x * rows_per_wg + tid // row_threads
+        row_owner = fx.make_layout((rows_per_wg, row_threads), (row_threads, 1))
+        row_coord = fx.idx2crd(fx.Int32(tid), row_owner)
+        wg_row = fx.Int32(fx.get(row_coord, 0))
+        local_tid = fx.Int32(fx.get(row_coord, 1))
+        token = fx.block_idx.x * rows_per_wg + wg_row
         fm_fast = arith.FastMathFlags.fast
+        vec_layout = fx.make_layout(
+            (tiles_per_thread, row_threads), (row_threads, 1)
+        )
+
+        def vector_index_for(tile):
+            return fx.Int32(
+                fx.get_scalar(fx.crd2idx((tile, local_tid), vec_layout))
+            )
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         pingpong_layout = fx.make_layout(
@@ -423,7 +443,7 @@ def _build_attn_res(
                 handles = []
                 for tile in range_constexpr(tiles_per_thread):
                     handles.append(
-                        issue_bf16_vec(block_div, local_tid + tile * row_threads)
+                        issue_bf16_vec(block_div, vector_index_for(tile))
                     )
                 return handles
 
@@ -447,7 +467,7 @@ def _build_attn_res(
             q_local = []
             prefix_local = []
             for tile in range_constexpr(tiles_per_thread):
-                vector_index = local_tid + tile * row_threads
+                vector_index = vector_index_for(tile)
                 gamma = load_bf16_vec(norm_weight_div, vector_index).to(fx.Float32)
                 weight = load_bf16_vec(qk_weight_div, vector_index).to(fx.Float32)
                 q_local.append(gamma * weight)
@@ -464,7 +484,7 @@ def _build_attn_res(
                 block_out_row = fx.slice(blocks_buf, (token, block_write_idx, None))
                 block_out_div = fx.logical_divide(block_out_row, vector_layout)
                 for tile in range_constexpr(tiles_per_thread):
-                    vector_index = local_tid + tile * row_threads
+                    vector_index = vector_index_for(tile)
                     store_bf16_vec(prefix_local[tile], block_out_div, vector_index)
 
             mixed_local = [
@@ -589,7 +609,7 @@ def _build_attn_res(
                     output_norm_weight_buf, vector_layout
                 )
                 for tile in range_constexpr(tiles_per_thread):
-                    vector_index = local_tid + tile * row_threads
+                    vector_index = vector_index_for(tile)
                     output_gamma = load_bf16_vec(
                         output_norm_weight_div, vector_index
                     ).to(fx.Float32)
@@ -598,7 +618,7 @@ def _build_attn_res(
             else:
                 inverse_denominator = 1.0 / denominator
                 for tile in range_constexpr(tiles_per_thread):
-                    vector_index = local_tid + tile * row_threads
+                    vector_index = vector_index_for(tile)
                     result = (mixed_local[tile] * inverse_denominator).to(fx.BFloat16)
                     store_bf16_vec(result, out_div, vector_index)
 
@@ -687,12 +707,14 @@ def flydsl_attn_res(
 
     Multi-dimensional inputs must have unit trailing stride, positive leading
     strides that are multiples of ``_VEC_WIDTH``, and a 16-byte-aligned base
-    pointer for ``BufferCopy128b``. Weight vectors must have ``stride(0) == 1``.
-    ``D`` must be a positive multiple of ``_VEC_WIDTH`` with a wave-aligned
-    row size; D=7168 uses 448 threads and one row per workgroup, while D=1024
-    defaults to one 64-thread row per workgroup. ``rows_per_wg=4`` packs four
-    independent D=1024 rows into a 256-thread workgroup; multi-wave rows reject
-    any value other than 1.
+    pointer for ``BufferCopy128b``. Weight vectors must satisfy the same
+    vector-copy layout rules. Requires gfx942 or gfx950 (wave64). ``D`` must
+    be a positive multiple of ``_VEC_WIDTH`` with a wave-aligned row size;
+    D=7168 uses 448 threads and one row per workgroup, while D=1024 defaults
+    to one 64-thread row per workgroup. ``rows_per_wg=4`` packs four
+    independent D=1024 rows into a 256-thread workgroup; packing is rejected
+    when ``row_threads * rows_per_wg`` exceeds ``_MAX_BLOCK_THREADS``, and
+    multi-wave rows reject any value other than 1.
     """
     has_delta = delta is not None
     apply_output_norm = output_norm_weight is not None
@@ -757,23 +779,22 @@ def flydsl_attn_res(
     if not all(t.is_cuda for t in tensors):
         raise ValueError("all tensors must be CUDA tensors")
 
+    gfx = get_gfx()
+    if gfx not in _ALLOWED_GFX:
+        raise ValueError(
+            f"flydsl_attn_res requires wave64 CDNA ({', '.join(_ALLOWED_GFX)}); "
+            f"got {gfx}. This kernel uses _WARP_SIZE={_WARP_SIZE} DPP "
+            "reductions and readlane(..., 63)."
+        )
+
     _check_row_layout(prefix, "prefix")
     _check_row_layout(blocks, "blocks")
     if has_delta:
         _check_row_layout(delta, "delta")
-    for tensor, name in (
-        (norm_weight, "norm_weight"),
-        (qk_weight, "qk_weight"),
-    ):
-        if tensor.stride(0) != 1:
-            raise ValueError(
-                f"{name}.stride(0) must be 1, got strides {tensor.stride()}"
-            )
-    if apply_output_norm and output_norm_weight.stride(0) != 1:
-        raise ValueError(
-            "output_norm_weight.stride(0) must be 1, got strides "
-            f"{output_norm_weight.stride()}"
-        )
+    _check_row_layout(norm_weight, "norm_weight")
+    _check_row_layout(qk_weight, "qk_weight")
+    if apply_output_norm:
+        _check_row_layout(output_norm_weight, "output_norm_weight")
 
     out = torch.empty(prefix.shape, device=prefix.device, dtype=prefix.dtype)
     if prefix.shape[0] == 0:
