@@ -244,10 +244,12 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
     state = {}
 
     def stage1():
-        moe._run_fused_stage1(x_q, weights, scale, ids)
+        moe._backend._run_fused_stage1(x_q, weights, scale, ids)
 
     def stage2():
-        state["output"] = moe._run_stage2(tokens, None, True, moe._active_config)
+        state["output"] = moe._backend._run_stage2(
+            tokens, None, True, moe._backend._active_config
+        )
 
     def end_to_end():
         state["output"] = moe(x, weights, ids)
@@ -257,13 +259,13 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
     _barrier()
     stage2_ms = _time_graph(stage2, device, args.iters)
     e2e_ms = _time_graph(end_to_end, device, args.iters)
-    sbm = int(moe._s1_active_tile_m)
-    gemm2_bm = int(moe._g2_active_block_m)
-    p2p_quant = moe._active_config.p2p_quant
+    sbm = int(moe._backend._s1_active_tile_m)
+    gemm2_bm = int(moe._backend._g2_active_block_m)
+    p2p_quant = moe._backend._active_config.p2p_quant
     if rank == 0:
         print(
             f"[MEGA-V2] bs={tokens} relL2={rel_l2:.6f} "
-            f"path={'fixed' if moe._s1_fixed_slot else 'compact'} "
+            f"path={'fixed' if moe._backend._s1_fixed_slot else 'compact'} "
             f"p2p_quant={p2p_quant} SBM={sbm} G2_BM={gemm2_bm} "
             f"stage1={stage1_ms[0]:.4f}/{stage1_ms[1]:.4f}ms "
             f"stage2={stage2_ms[0]:.4f}/{stage2_ms[1]:.4f}ms "
@@ -285,14 +287,14 @@ def _run_burst(moe, x, weights, ids, depth, rank):
 def _install_config_policy(moe, config_tokens, unify_fields):
     if not config_tokens:
         return
-    reference = moe._select_config(config_tokens)
-    original_select = moe._select_config
+    reference = moe._backend._select_config(config_tokens)
+    original_select = moe._backend._select_config
     fields = [field for field in unify_fields.split(",") if field]
 
     if not fields:
 
         def select_config(_tokens):
-            moe._active_config = reference
+            moe._backend._active_config = reference
             return reference
 
     else:
@@ -319,10 +321,10 @@ def _install_config_policy(moe, config_tokens, unify_fields):
                 stage2=replace(local.stage2, **stage2_updates),
                 p2p_quant=p2p_quant,
             )
-            moe._active_config = config
+            moe._backend._active_config = config
             return config
 
-    moe._select_config = select_config
+    moe._backend._select_config = select_config
 
 
 def main():
@@ -405,7 +407,7 @@ def main():
             )
             _install_config_policy(moe, args.config_tokens, args.unify_fields)
             if rank_tokens:
-                selected = moe._select_config(local_batch_size)
+                selected = moe._backend._select_config(local_batch_size)
                 configs = [None] * world
                 dist.all_gather_object(
                     configs,

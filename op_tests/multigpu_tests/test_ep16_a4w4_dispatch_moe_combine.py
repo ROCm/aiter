@@ -307,7 +307,7 @@ def _run_one_bs(
 
     # Diagnostic-only staged call through the private backend. This preserves
     # per-stage profiling without adding stage methods to MegaMoEV2's public API.
-    backend = op._inter_node
+    backend = op._backend
     assert backend is not None
     dispatched = backend.dispatch_prequant(x_fp4_bs, x_scale_bs, topk_weights_bs, topk_ids_bs)
     recv_tok_fp4 = dispatched.tokens
