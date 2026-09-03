@@ -9,9 +9,15 @@ from ..jit.core import compile_ops
 MD_NAME = "module_fused_moe_router"
 
 
+def _fused_moe_router_impl_fake(*args, **kwargs) -> None:
+    """No-op fake: every output is an in-place out-param, and the op returns
+    None. Without it, tracing falls through to the real JIT kernel."""
+    return
+
+
 # The C++ entry takes torch::Tensor directly (see fused_moe_router_entry.cu),
 # so no develop=True aiter_tensor_t conversion.
-@compile_ops("module_fused_moe_router")
+@compile_ops("module_fused_moe_router", gen_fake=_fused_moe_router_impl_fake)
 def fused_moe_router_impl(
     gating: torch.Tensor,
     bias: torch.Tensor,
