@@ -1488,3 +1488,127 @@ def test_flash_attn_func_opus_oversized_buffer(
         causal=causal,
         with_sink=True,
     )
+
+
+# ─── out= passthrough: dense entry, and the single-seq varlen router ──────────────
+# The buffer must be written IN PLACE (avoiding a hidden copy is the point) and the
+# routed result must stay bit-identical to the dense op.
+
+_OPUS_OUT_SHAPE = {
+    "seqlen_q": 128,
+    "seqlen_kv": 300,
+    "nheads": 8,
+    "nheads_k": 2,
+    "d": 64,
+}
+
+
+def _opus_out_qkv(seqlen_q, seqlen_kv, nheads, nheads_k, d, packed):
+    torch.manual_seed(0)
+    qs = (seqlen_q, nheads, d) if packed else (1, seqlen_q, nheads, d)
+    kvs = (seqlen_kv, nheads_k, d) if packed else (1, seqlen_kv, nheads_k, d)
+    return (
+        torch.randn(*qs, device="cuda", dtype=dtypes.bf16),
+        torch.randn(*kvs, device="cuda", dtype=dtypes.bf16),
+        torch.randn(*kvs, device="cuda", dtype=dtypes.bf16),
+    )
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_attn_func_out_param(causal):
+    """flash_attn_func(out=...) fills the caller's buffer in place and returns it.
+
+    Deliberately NOT gated on gfx950: every backend in _flash_attn_forward receives
+    `out`, so this also covers the CK fallback on other parts.
+    """
+    q, k, v = _opus_out_qkv(**_OPUS_OUT_SHAPE, packed=False)
+    with torch.no_grad():
+        ref = aiter.flash_attn_func(q, k, v, causal=causal)
+        out = torch.empty_like(ref)
+        got = aiter.flash_attn_func(q, k, v, causal=causal, out=out)
+    got = got[0] if isinstance(got, (tuple, list)) else got
+    assert got.data_ptr() == out.data_ptr(), "out= was not written in place"
+    assert torch.equal(out, ref), "out= changed the result"
+
+
+@pytest.mark.parametrize("with_sink", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_attn_func_opus_varlen_out_param(causal, with_sink, monkeypatch):
+    """A single-seq varlen call carrying out= still routes to dense OPUS, with the
+    caller's buffer written in place (no copy)."""
+    if get_gfx() != "gfx950":
+        pytest.skip("opus symmetric kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    s = _OPUS_OUT_SHAPE
+    q, k, v = _opus_out_qkv(**s, packed=True)
+    sink = _opus_sink(s["nheads"], with_sink)
+    cu_q = torch.tensor([0, s["seqlen_q"]], dtype=torch.int32, device="cuda")
+    cu_k = torch.tensor([0, s["seqlen_kv"]], dtype=torch.int32, device="cuda")
+    out = torch.empty(
+        s["seqlen_q"], s["nheads"], s["d"], device="cuda", dtype=dtypes.bf16
+    )
+
+    with torch.no_grad():
+        got = aiter.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            s["seqlen_q"],
+            s["seqlen_kv"],
+            causal=causal,
+            sink_ptr=sink,
+            out=out,
+        )
+        ref = fmha_fwd_bf16_opus_fwd(
+            q.unsqueeze(0),
+            k.unsqueeze(0),
+            v.unsqueeze(0),
+            softmax_scale=s["d"] ** -0.5,
+            causal=causal,
+            sink=sink,
+        )
+    got = got[0] if isinstance(got, (tuple, list)) else got
+    tag = f"opus-varlen-out-d{s['d']}"
+    assert (
+        got.data_ptr() == out.data_ptr()
+    ), f"{tag}: out= buffer was copied, not filled"
+    assert torch.equal(
+        out, ref.squeeze(0)
+    ), f"{tag}: out= path did not route to the dense OPUS kernel"
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_attn_func_opus_varlen_out_param_declines(causal, monkeypatch):
+    """An out= buffer with more rows than Q must be DECLINED, not silently accepted:
+    a varlen call returns one row per query row, so routing an oversized out would
+    leave a stale tail. Declining has to remain numerically correct."""
+    if get_gfx() != "gfx950":
+        pytest.skip("opus symmetric kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    s = _OPUS_OUT_SHAPE
+    q, k, v = _opus_out_qkv(**s, packed=True)
+    cu_q = torch.tensor([0, s["seqlen_q"]], dtype=torch.int32, device="cuda")
+    cu_k = torch.tensor([0, s["seqlen_kv"]], dtype=torch.int32, device="cuda")
+    # 64 extra rows, poisoned: if the router accepted this, the tail would survive.
+    out = torch.full(
+        (s["seqlen_q"] + 64, s["nheads"], s["d"]),
+        99.0,
+        device="cuda",
+        dtype=dtypes.bf16,
+    )
+
+    with torch.no_grad():
+        got = aiter.flash_attn_varlen_func(
+            q, k, v, cu_q, cu_k, s["seqlen_q"], s["seqlen_kv"], causal=causal, out=out
+        )
+    got = got[0] if isinstance(got, (tuple, list)) else got
+    assert got.shape[0] == s["seqlen_q"], f"declined path returned {tuple(got.shape)}"
+
+    qd, kd, vd = q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0)
+    ref, _, _ = attention_ref(qd, kd, vd, causal=causal)
+    pt, _, _ = attention_ref(qd, kd, vd, causal=causal, upcast=False, reorder_ops=True)
+    tol = max(2 * (pt - ref).abs().max().item(), 0.01)
+    diff = (got - ref.squeeze(0)).abs().max().item()
+    assert diff <= tol, f"declined out= path is wrong: {diff} > {tol}"
