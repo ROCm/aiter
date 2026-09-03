@@ -9,7 +9,6 @@ from flydsl.expr import gpu, ptrtoint
 
 from .. import communication_ops_utils as comm_ops
 
-
 TP = 8
 FLAT_VA_RANK_STRIDE = 1 << 32
 
@@ -38,9 +37,7 @@ def compile_epoch_barrier():
         gpu.barrier()
         if tid < fx.Int32(TP):
             peer_addr = peer_base(flat_base, tid)
-            comm_ops.wait_i64_system_until_at_least(
-                peer_addr + ready_offset, expected
-            )
+            comm_ops.wait_i64_system_until_at_least(peer_addr + ready_offset, expected)
             comm_ops.fence_system_acquire()
 
     @flyc.jit

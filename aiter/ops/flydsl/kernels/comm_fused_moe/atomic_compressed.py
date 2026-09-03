@@ -22,16 +22,13 @@ from .collectives import (
     pack_fp8_words,
     store_fp8_words,
 )
-from .full_width import BLOCK, H, TP
+from .full_width import BLOCK, TP, H
 from .sync import peer_base
-
 
 VECTOR_WIDTH = 16
 QUANT_BLOCK = 256
 GROUPS_PER_ROW = H // 32
-COLUMN_TILES = (H + QUANT_BLOCK * VECTOR_WIDTH - 1) // (
-    QUANT_BLOCK * VECTOR_WIDTH
-)
+COLUMN_TILES = (H + QUANT_BLOCK * VECTOR_WIDTH - 1) // (QUANT_BLOCK * VECTOR_WIDTH)
 
 
 @dataclass(frozen=True)
@@ -48,10 +45,9 @@ class Config:
 def _emit_quantize_item(m, local, partial, item):
     token = item // fx.Int32(COLUMN_TILES)
     tile = item - token * fx.Int32(COLUMN_TILES)
-    column = (
-        tile * fx.Int32(QUANT_BLOCK * VECTOR_WIDTH)
-        + fx.Int32(gpu.thread_idx.x) * fx.Int32(VECTOR_WIDTH)
-    )
+    column = tile * fx.Int32(QUANT_BLOCK * VECTOR_WIDTH) + fx.Int32(
+        gpu.thread_idx.x
+    ) * fx.Int32(VECTOR_WIDTH)
     active = scf.IfOp(arith.cmpi(CmpIPredicate.ult, column, fx.Int32(H)))
     with ir.InsertionPoint(active.then_block):
         local_row = buffer_ops.create_buffer_resource_from_addr(
@@ -147,10 +143,7 @@ def _store_bf16(resource, offset, values):
     for chunk in range_constexpr(VECTOR_WIDTH // 8):
         buffer_ops.buffer_store(
             fx.Vector.from_elements(
-                [
-                    values[chunk * 8 + element]
-                    for element in range_constexpr(8)
-                ],
+                [values[chunk * 8 + element] for element in range_constexpr(8)],
                 fx.BFloat16,
             ),
             resource,
@@ -176,8 +169,7 @@ def compile_stage2_tp_reduce_scatter(config: Config):
     ):
         start = arith.index_cast(
             T.index,
-            fx.Int32(gpu.block_idx.x) * fx.Int32(BLOCK)
-            + fx.Int32(gpu.thread_idx.x),
+            fx.Int32(gpu.block_idx.x) * fx.Int32(BLOCK) + fx.Int32(gpu.thread_idx.x),
         )
         loop = scf.ForOp(
             start,
@@ -190,17 +182,12 @@ def compile_stage2_tp_reduce_scatter(config: Config):
             pack_in_group = item - group_item * fx.Int32(packs_per_group)
             local_token = group_item // fx.Int32(GROUPS_PER_ROW)
             group = group_item - local_token * fx.Int32(GROUPS_PER_ROW)
-            column = (
-                group * fx.Int32(32)
-                + pack_in_group * fx.Int32(VECTOR_WIDTH)
-            )
+            column = group * fx.Int32(32) + pack_in_group * fx.Int32(VECTOR_WIDTH)
             global_token = rank * fx.Int32(config.shard_rows) + local_token
             lane = fx.Int32(gpu.thread_idx.x) & fx.Int32(63)
             acc = fx.Vector.filled(VECTOR_WIDTH, 0.0, fx.Float32)
             for source_round in range_constexpr(TP):
-                source = (
-                    rank + local_token + fx.Int32(source_round)
-                ) % fx.Int32(TP)
+                source = (rank + local_token + fx.Int32(source_round)) % fx.Int32(TP)
                 source_base = peer_base(partial_base, source)
                 source_row = buffer_ops.create_buffer_resource_from_addr(
                     source_base + fx.Int64(global_token) * fx.Int64(H),
@@ -242,8 +229,7 @@ def compile_stage2_tp_reduce_scatter(config: Config):
             packed = pack_fp8_words(acc, quant_scale, VECTOR_WIDTH // 4)
 
             payload_row = buffer_ops.create_buffer_resource_from_addr(
-                fx.Int64(ptrtoint(payload))
-                + fx.Int64(local_token) * fx.Int64(H),
+                fx.Int64(ptrtoint(payload)) + fx.Int64(local_token) * fx.Int64(H),
                 num_records_bytes=H,
             )
             store_fp8_words(
@@ -270,8 +256,7 @@ def compile_stage2_tp_reduce_scatter(config: Config):
                 (fx.Uint32(e8m0) << fx.Uint32(23)).bitcast(fx.Float32),
             )
             output_row = buffer_ops.create_buffer_resource_from_addr(
-                fx.Int64(ptrtoint(output))
-                + fx.Int64(local_token) * fx.Int64(H * 2),
+                fx.Int64(ptrtoint(output)) + fx.Int64(local_token) * fx.Int64(H * 2),
                 num_records_bytes=H * 2,
             )
             _store_bf16(output_row, column, decoded)

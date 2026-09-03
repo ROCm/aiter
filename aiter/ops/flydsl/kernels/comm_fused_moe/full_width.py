@@ -26,7 +26,6 @@ from .collectives import (
     store_fp8_words,
 )
 
-
 H = 7168
 I = 384
 E = 384
@@ -35,9 +34,7 @@ TP = 8
 BLOCK = 256
 VECTOR_WIDTH = 8
 GROUPS_PER_ROW = H // 32
-LOCAL_COLUMN_TILES = (H + BLOCK * VECTOR_WIDTH - 1) // (
-    BLOCK * VECTOR_WIDTH
-)
+LOCAL_COLUMN_TILES = (H + BLOCK * VECTOR_WIDTH - 1) // (BLOCK * VECTOR_WIDTH)
 
 
 @dataclass(frozen=True)
@@ -97,24 +94,20 @@ def _emit_local_reduce(m, route, partial, shared, token, column_base):
         for route_slot in range_constexpr(TOPK):
             words = load_fp8_words(
                 route_row,
-                fx.Int32(route_slot * (route_row_bytes // 4))
-                + column // fx.Int32(4),
+                fx.Int32(route_slot * (route_row_bytes // 4)) + column // fx.Int32(4),
                 word_count=2,
                 load_width=2,
                 cache_modifier=2,
             )
             scale = load_e8m0_scale(
                 route_row,
-                fx.Int32(route_slot * route_row_bytes + H)
-                + column // fx.Int32(8),
+                fx.Int32(route_slot * route_row_bytes + H) + column // fx.Int32(8),
                 2,
             )
             values = decode_scaled_fp8_f32(words, scale)
             acc = acc + fx.Vector.from_elements(values, fx.Float32)
 
-        shared_addr = fx.Int64(ptrtoint(shared)) + fx.Int64(token) * fx.Int64(
-            H * 2
-        )
+        shared_addr = fx.Int64(ptrtoint(shared)) + fx.Int64(token) * fx.Int64(H * 2)
         shared_row = buffer_ops.create_buffer_resource_from_addr(
             shared_addr, num_records_bytes=H * 2
         )
@@ -130,9 +123,7 @@ def _emit_local_reduce(m, route, partial, shared, token, column_base):
         acc = acc + shared_values
 
         lane = tid & fx.Int32(63)
-        local_max = fx.Float32(1e-10).maximumf(
-            fmath.absf(acc).reduce(ReductionOp.MAX)
-        )
+        local_max = fx.Float32(1e-10).maximumf(fmath.absf(acc).reduce(ReductionOp.MAX))
         max_bits = local_max.bitcast(fx.Int32)
         for xor_lane in (1, 2):
             remote_bits = fx.rocdl.ds_bpermute(
@@ -140,16 +131,12 @@ def _emit_local_reduce(m, route, partial, shared, token, column_base):
                 (lane ^ fx.Int32(xor_lane)) * fx.Int32(4),
                 max_bits,
             )
-            local_max = local_max.maximumf(
-                fx.Int32(remote_bits).bitcast(fx.Float32)
-            )
+            local_max = local_max.maximumf(fx.Int32(remote_bits).bitcast(fx.Float32))
             max_bits = local_max.bitcast(fx.Int32)
         e8m0, quant_scale = e8m0_scale(local_max)
         packed_words = pack_fp8_words(acc, quant_scale, 2)
 
-        payload_addr = fx.Int64(ptrtoint(partial)) + fx.Int64(token) * fx.Int64(
-            H
-        )
+        payload_addr = fx.Int64(ptrtoint(partial)) + fx.Int64(token) * fx.Int64(H)
         payload_row = buffer_ops.create_buffer_resource_from_addr(
             payload_addr, num_records_bytes=H
         )
@@ -209,10 +196,7 @@ def compile_stage2_local_reduce(config: Config):
     local_workers = config.local_workers
 
     @flyc.kernel(
-        name=(
-            f"flydsl_fused_moe_full_lr_sr{config.shard_rows}"
-            f"_lw{local_workers}"
-        ),
+        name=(f"flydsl_fused_moe_full_lr_sr{config.shard_rows}" f"_lw{local_workers}"),
         known_block_size=[BLOCK, 1, 1],
     )
     def kernel(
@@ -243,8 +227,7 @@ def compile_stage2_tp_reduce_scatter(config: Config):
 
     @flyc.kernel(
         name=(
-            f"flydsl_fused_moe_full_rs_sr{shard_rows}"
-            f"_g{config.reduce_scatter_grid}"
+            f"flydsl_fused_moe_full_rs_sr{shard_rows}" f"_g{config.reduce_scatter_grid}"
         ),
         known_block_size=[BLOCK, 1, 1],
     )
@@ -285,14 +268,10 @@ def compile_stage2_tp_reduce_scatter(config: Config):
 @functools.cache
 def compile_stage2_tp_all_gather(config: Config):
     """Compile the TP all-gather of reduced shards."""
-    m = config.m
     shard_rows = config.shard_rows
 
     @flyc.kernel(
-        name=(
-            f"flydsl_fused_moe_full_ag_sr{shard_rows}"
-            f"_g{config.all_gather_grid}"
-        ),
+        name=(f"flydsl_fused_moe_full_ag_sr{shard_rows}" f"_g{config.all_gather_grid}"),
         known_block_size=[BLOCK, 1, 1],
     )
     def kernel(

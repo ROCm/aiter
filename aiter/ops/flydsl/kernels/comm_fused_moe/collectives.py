@@ -13,9 +13,7 @@ from .sync import peer_base
 
 
 def e8m0_scale(local_max):
-    working = (
-        local_max * fx.Int32(0x3B124925).bitcast(fx.Float32)
-    ).bitcast(fx.Int32)
+    working = (local_max * fx.Int32(0x3B124925).bitcast(fx.Float32)).bitcast(fx.Int32)
     mantissa = working & fx.Int32(0x7FFFFF)
     exponent = (working >> fx.Int32(23)) & fx.Int32(0xFF)
     e8m0 = (mantissa != fx.Int32(0)).select(exponent + fx.Int32(1), exponent)
@@ -48,9 +46,7 @@ def pack_fp8_words(values, scale, word_count):
 
 
 def quantize_group32(acc):
-    local_max = fx.Float32(1e-10).maximumf(
-        fmath.absf(acc).reduce(ReductionOp.MAX)
-    )
+    local_max = fx.Float32(1e-10).maximumf(fmath.absf(acc).reduce(ReductionOp.MAX))
     e8m0, scale = e8m0_scale(local_max)
     return e8m0, pack_fp8_words(acc, scale, 8)
 
@@ -126,9 +122,7 @@ def store_fp8_words(resource, offset, packed, store_width):
     for chunk in range_constexpr(len(packed) // store_width):
         begin = chunk * store_width
         buffer_ops.buffer_store(
-            fx.Vector.from_elements(
-                packed[begin : begin + store_width], fx.Int32
-            ),
+            fx.Vector.from_elements(packed[begin : begin + store_width], fx.Int32),
             resource,
             offset + fx.Int32(begin * 4),
             offset_is_bytes=True,
