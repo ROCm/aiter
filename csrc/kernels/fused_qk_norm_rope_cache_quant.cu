@@ -4402,6 +4402,50 @@ namespace aiter {
 
 
     // ============================================================================
+    // Vectorised RoPE cos/sin table read.
+    //
+    // Every RoPE site reads a CONTIGUOUS, NATURALLY-ALIGNED run of the cos/sin
+    // tables: GPT-J takes vec_size/2 entries at (pe_local_tid*vec_size)>>1, NeoX
+    // takes vec_size entries at pe_local_tid*vec_size -- in both cases a multiple
+    // of N elements. The table pointers are themselves aligned: cos_ptr =
+    // cos_cache + rope_pos*(pe_dim/2), and pe_dim/2 = 32 elements, so the offset
+    // is a multiple of 64B on top of a torch base (256B).
+    //
+    // Written elementwise (`cos_ptr[cos_i]`) the compiler cannot see any of that:
+    // a `const scalar_t*` kernel parameter carries only alignof(scalar_t) == 2, so
+    // LLVM refuses to merge and emits one global_load_u16 per entry plus ~4 VALU
+    // of 64-bit address math per pair. Measured on the gfx1250 decode FG kernel:
+    // 48 global_load_u16 where 4 global_load_b128 would do.
+    //
+    // Reading through an ext_vector_type asserts the alignment that is actually
+    // there, so the run collapses to a single b128 (bf16 N=8) load.
+    // ============================================================================
+    template <typename scalar_t, int N>
+    __device__ inline void load_rope_cos_sin(
+        const scalar_t* __restrict__ cos_ptr, const scalar_t* __restrict__ sin_ptr,
+        int base, float (&c)[N], float (&s)[N]) {
+#ifndef AITER_VEC_ROPE_TABLE
+#define AITER_VEC_ROPE_TABLE 1
+#endif
+      if constexpr (AITER_VEC_ROPE_TABLE != 0) {
+        using vecN = opus::vector_t<scalar_t, N>;
+        const vecN vc = *reinterpret_cast<const vecN*>(cos_ptr + base);
+        const vecN vs = *reinterpret_cast<const vecN*>(sin_ptr + base);
+        #pragma unroll
+        for (int i = 0; i < N; ++i) {
+          c[i] = static_cast<float>(vc[i]);
+          s[i] = static_cast<float>(vs[i]);
+        }
+      } else {
+        #pragma unroll
+        for (int i = 0; i < N; ++i) {
+          c[i] = static_cast<float>(cos_ptr[base + i]);
+          s[i] = static_cast<float>(sin_ptr[base + i]);
+        }
+      }
+    }
+
+    // ============================================================================
     // K wave body (shared between fuse_qk_norm_rope_group_quant_cache_kernel_impl
     // and the K-only fuse_kv_norm_rope_group_quant_cache_kernel). RMSNorm over
     // the full head_dim, 1xG e8m0 group-quant on NoPE (writing nope fp8 +
@@ -4899,6 +4943,14 @@ namespace aiter {
       float pe_cos[vec_size_i], pe_sin[vec_size_i];
       if (is_pe_thread) {
         const int32_t pe_local_tid = tid - pe_tid_start;
+        // NOT vectorised, deliberately. The same load_rope_cos_sin<> treatment that
+        // is worth -12% on the FG (decode) kernel MEASURED AS A REGRESSION here:
+        // paired op_test, 5 clean pairs, H=32 -> T=16384 +1.95% (CI +0.23..+3.67,
+        // 1/5 negative) and T=1024 -0.72%. The coarse kernel already hoists this
+        // read ONCE PER WAVE and reuses it across the HPW-head loop, so there are
+        // only vec_size_i scalar loads per wave to begin with (not per head) --
+        // nothing to recover -- while the packed-index form it requires perturbs
+        // the scheduling of the much longer head loop. Left elementwise.
         if constexpr (is_neox) {
           constexpr int32_t half_pe_threads = pe_dim / vec_size_i / 2;  // 4
           const bool is_x_half = (pe_local_tid < half_pe_threads);
@@ -5158,23 +5210,30 @@ namespace aiter {
       if constexpr (is_neox) {
         constexpr int half_pe_threads = pe_dim / vec_size_i / 2;
         const bool is_x_half = (pe_local_tid < half_pe_threads);
+        // NeoX: vec_size_i contiguous entries at (is_x_half ? tid : tid-half)*vec_size_i.
+        const int cos_base =
+            (is_x_half ? pe_local_tid : (pe_local_tid - half_pe_threads)) * vec_size_i;
+        float f32_cos_v[vec_size_i], f32_sin_v[vec_size_i];
+        load_rope_cos_sin<scalar_t, vec_size_i>(cos_ptr, sin_ptr, cos_base, f32_cos_v, f32_sin_v);
         #pragma unroll
         for (int i = 0; i < vec_size_i; i++) {
-          const int cos_i = is_x_half ? (pe_local_tid * vec_size_i + i)
-                                      : ((pe_local_tid - half_pe_threads) * vec_size_i + i);
-          float f32_cos = static_cast<float>(cos_ptr[cos_i]);
-          float f32_sin = static_cast<float>(sin_ptr[cos_i]);
+          const float f32_cos = f32_cos_v[i];
+          const float f32_sin = f32_sin_v[i];
           float my_val = normed[i];
           float pair_val = __shfl_xor(my_val, half_pe_threads, WARP_SIZE);
           out[i] = is_x_half ? (my_val * f32_cos - pair_val * f32_sin)
                              : (my_val * f32_cos + pair_val * f32_sin);
         }
       } else {
+        // GPT-J: vec_size_i/2 contiguous entries at pe_local_tid*(vec_size_i/2).
+        constexpr int kHalf = vec_size_i / 2;
+        float f32_cos_v[kHalf], f32_sin_v[kHalf];
+        load_rope_cos_sin<scalar_t, kHalf>(cos_ptr, sin_ptr, pe_local_tid * kHalf,
+                                           f32_cos_v, f32_sin_v);
         #pragma unroll
         for (int i = 0; i < vec_size_i; i += 2) {
-          const int cos_i = (pe_local_tid * vec_size_i + i) >> 1;
-          float f32_cos = static_cast<float>(cos_ptr[cos_i]);
-          float f32_sin = static_cast<float>(sin_ptr[cos_i]);
+          const float f32_cos = f32_cos_v[i >> 1];
+          const float f32_sin = f32_sin_v[i >> 1];
           float fqx = normed[i];
           float fqy = normed[i + 1];
           out[i]     = fqx * f32_cos - fqy * f32_sin;
@@ -5509,36 +5568,54 @@ namespace aiter {
           if constexpr (is_neox) {
             constexpr int32_t half_pe_threads = pe_dim / vec_size_i / 2;
             const bool is_x_half = (pe_local_tid < half_pe_threads);
+            const int32_t cos_base =
+                (is_x_half ? pe_local_tid : (pe_local_tid - half_pe_threads)) * vec_size_i;
+            float kc[vec_size_i], ks[vec_size_i];
+            load_rope_cos_sin<scalar_t, vec_size_i>(cos_ptr, sin_ptr, cos_base, kc, ks);
+            // Accumulate into a register vector and store ONCE: the elementwise
+            // `k_out_rope[..+i] = rot_s` form compiled to vec_size_i global_store_b16.
+            opus_vec_i vrot;
             #pragma unroll
             for (int i = 0; i < vec_size_i; i++) {
               float my_val = k_normed[i];
               float pair_val = __shfl_xor(my_val, half_pe_threads, WARP_SIZE);
-              int32_t cos_i = is_x_half ? (pe_local_tid * vec_size_i + i)
-                                        : ((pe_local_tid - half_pe_threads) * vec_size_i + i);
-              float f32_cos = static_cast<float>(cos_ptr[cos_i]);
-              float f32_sin = static_cast<float>(sin_ptr[cos_i]);
-              float rot = is_x_half ? (my_val * f32_cos - pair_val * f32_sin)
-                                    : (my_val * f32_cos + pair_val * f32_sin);
-              const scalar_t rot_s = static_cast<scalar_t>(rot);
-              k_out_rope[pe_local_tid * vec_size_i + i] = rot_s;
-              if (write_swa) swa_out_rope[pe_local_tid * vec_size_i + i] = rot_s;
+              float rot = is_x_half ? (my_val * kc[i] - pair_val * ks[i])
+                                    : (my_val * kc[i] + pair_val * ks[i]);
+              vrot[i] = static_cast<scalar_t>(rot);
+            }
+            *reinterpret_cast<opus_vec_i*>(&k_out_rope[pe_local_tid * vec_size_i]) = vrot;
+            // k_out_rope is safe to vectorise: its row stride is the kernel's own
+            // pe_dim=64 layout (128B). swa_out_rope is NOT -- swa_rope_row_stride
+            // comes from swa_rope_buff->stride(0), a runtime tensor stride with no
+            // 32B guarantee, so a vector store there could fault. Left elementwise.
+            if (write_swa) {
+              #pragma unroll
+              for (int i = 0; i < vec_size_i; ++i)
+                swa_out_rope[pe_local_tid * vec_size_i + i] = vrot[i];
             }
           } else {
+            constexpr int32_t kHalf = vec_size_i / 2;
+            float kc[kHalf], ks[kHalf];
+            load_rope_cos_sin<scalar_t, kHalf>(cos_ptr, sin_ptr, pe_local_tid * kHalf, kc, ks);
+            opus_vec_i vrot;
             #pragma unroll
             for (int i = 0; i < vec_size_i; i += 2) {
               float fkx = k_normed[i];
               float fky = k_normed[i + 1];
-              int32_t cos_i = (pe_local_tid * vec_size_i + i) >> 1;
-              float f32_cos = static_cast<float>(cos_ptr[cos_i]);
-              float f32_sin = static_cast<float>(sin_ptr[cos_i]);
-              const scalar_t r0 = static_cast<scalar_t>(fkx * f32_cos - fky * f32_sin);
-              const scalar_t r1 = static_cast<scalar_t>(fky * f32_cos + fkx * f32_sin);
-              k_out_rope[pe_local_tid * vec_size_i + i]     = r0;
-              k_out_rope[pe_local_tid * vec_size_i + i + 1] = r1;
-              if (write_swa) {
-                swa_out_rope[pe_local_tid * vec_size_i + i]     = r0;
-                swa_out_rope[pe_local_tid * vec_size_i + i + 1] = r1;
-              }
+              const float f32_cos = kc[i >> 1];
+              const float f32_sin = ks[i >> 1];
+              vrot[i]     = static_cast<scalar_t>(fkx * f32_cos - fky * f32_sin);
+              vrot[i + 1] = static_cast<scalar_t>(fky * f32_cos + fkx * f32_sin);
+            }
+            *reinterpret_cast<opus_vec_i*>(&k_out_rope[pe_local_tid * vec_size_i]) = vrot;
+            // k_out_rope is safe to vectorise: its row stride is the kernel's own
+            // pe_dim=64 layout (128B). swa_out_rope is NOT -- swa_rope_row_stride
+            // comes from swa_rope_buff->stride(0), a runtime tensor stride with no
+            // 32B guarantee, so a vector store there could fault. Left elementwise.
+            if (write_swa) {
+              #pragma unroll
+              for (int i = 0; i < vec_size_i; ++i)
+                swa_out_rope[pe_local_tid * vec_size_i + i] = vrot[i];
             }
           }
         }
