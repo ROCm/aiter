@@ -24,9 +24,12 @@ import aiter
 from aiter import dtypes, logger
 from aiter.jit.core import AITER_CONFIG_GEMM_BF16, get_asm_dir
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.ops.flydsl.gemm_a16w16_policy import (
+    get_flydsl_a16w16_configs,
+)
 from aiter.ops.flydsl.gemm_kernels import (
     flydsl_hgemm,
-    get_flydsl_splitk_hgemm_kernels,
+    flydsl_hgemm_kernel_name,
 )
 from aiter.ops.gemm_op_a16w16 import ASM_SPLITK_MAX_GRID
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16 as triton_gemm_a16w16
@@ -276,10 +279,16 @@ def run_skinny_gemm_a16w16(input, weight, bias=None, otype=dtypes.bf16):
     return native_skinny_gemm(input, weight, 2, bias=bias, otype=otype)
 
 
-def run_flydsl_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, config=None):
+def run_flydsl_gemm_bf16(
+    input,
+    weight,
+    out,
+    bias=None,
+    otype=dtypes.bf16,
+    config=None,
+):
     if config is None:
         raise ValueError("flydsl tuning requires a kernel config")
-    stages = config.get("stages", config.get("stage", 2))
     fused_bias = None
     if (
         bias is not None
@@ -290,25 +299,19 @@ def run_flydsl_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, config=Non
     out = flydsl_hgemm(
         input,
         weight,
+        out=out,
         bias=fused_bias,
-        kernel_family=config.get("kernel_family"),
-        tile_m=config["tile_m"],
-        tile_n=config["tile_n"],
-        tile_k=config["tile_k"],
+        block_m=config["block_m"],
+        block_n=config["block_n"],
+        block_k=config["block_k"],
         split_k=config["split_k"],
-        block_m_warps=config["block_m_warps"],
-        block_n_warps=config["block_n_warps"],
-        block_k_warps=config["block_k_warps"],
-        n_tile_repeat=config.get("n_tile_repeat", 1),
-        persistent_n_tiles=config.get("persistent_n_tiles", 1),
-        waves_per_eu=config.get("waves_per_eu", 0),
-        b_to_lds_unroll=config.get("b_to_lds_unroll", 0),
-        stages=stages,
-        async_copy=config.get("async_copy", False),
-        b_to_lds=config["b_to_lds"],
-        b_preshuffle=config.get("b_preshuffle", False),
-        auto_shuffle_b=False,
-        c_to_lds=config.get("c_to_lds", False),
+        m_waves=config["m_waves"],
+        n_waves=config["n_waves"],
+        k_waves=config["k_waves"],
+        stages=config["stages"],
+        group_m=config["group_m"],
+        policy="ht" if config["use_half_tile_interleaved"] else "ft",
+        out_dtype=otype,
     )
     if bias is not None and fused_bias is None:
         out = out.to(bias.dtype) + bias
@@ -323,8 +326,33 @@ def run_flydsl_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, config=Non
 
 
 @lru_cache(maxsize=1)
-def get_flydsl_bf16_catalog(m: int, n: int, k: int):
-    kernels = get_flydsl_splitk_hgemm_kernels("bf16", "bf16", m=m, n=n, k=k)
+def get_flydsl_bf16_catalog(
+    m: int,
+    n: int,
+    k: int,
+    out_dtype: torch.dtype,
+    has_bias: bool,
+):
+    if flydsl_hgemm_kernel_name is None:
+        return []
+    fused_bias = bool(has_bias and out_dtype == torch.bfloat16)
+    configs = get_flydsl_a16w16_configs(
+        m,
+        n,
+        k,
+        torch.bfloat16,
+        out_dtype,
+        fused_bias,
+    )
+    kernels = {
+        flydsl_hgemm_kernel_name(
+            dtype=torch.bfloat16,
+            out_dtype=out_dtype,
+            config=config,
+            has_bias=fused_bias,
+        ): config
+        for config in configs
+    }
     catalog = [
         (idx, name, dict(kernels[name])) for idx, name in enumerate(sorted(kernels))
     ]
@@ -708,32 +736,13 @@ class GemmA16W16Tuner(GemmCommonTuner):
     def _get_flydsl_tasks(
         self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
     ):
-        if scaleAB or indtype != dtypes.bf16:
+        if scaleAB or is_shuffle or indtype != dtypes.bf16:
             return []
-        M, N, K = info_keys[2], info_keys[3], info_keys[4]
+        M, N, K = (int(info_keys[2]), int(info_keys[3]), int(info_keys[4]))
         rtol, atol = _default_tol(outdtype)
-        flydsl_catalog = get_flydsl_bf16_catalog(M, N, K)
-        weight_key = "shuffleweights" if is_shuffle else "weights"
-        min_tile_m = min((c["tile_m"] for _, _, c in flydsl_catalog), default=16)
+        flydsl_catalog = get_flydsl_bf16_catalog(M, N, K, outdtype, has_bias)
         tasks = []
         for solidx, kernel_name, config in flydsl_catalog:
-            if config.get("b_preshuffle", False) != is_shuffle:
-                continue
-            if config["tile_m"] > max(M, min_tile_m):
-                continue
-            if N < config["tile_n"] or N % config["tile_n"] != 0:
-                continue
-            if K % config["split_k"] != 0:
-                continue
-            ks = K // config["split_k"]
-            if ks < config["tile_k"] or ks % config["tile_k"] != 0:
-                continue
-            if config["split_k"] > 1:
-                counters = ((M + config["tile_m"] - 1) // config["tile_m"]) * (
-                    N // config["tile_n"]
-                )
-                if counters > 128:
-                    continue
             info = (
                 info_keys,
                 solidx,
@@ -748,7 +757,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
                     generate_data,
                     (M, N, K, indtype, outdtype, scaleAB, is_shuffle, 0, has_bias),
                     run_flydsl_gemm_bf16,
-                    (["inp", weight_key, "bias"], outdtype, config),
+                    (["inp", "weights", "out_asm", "bias"], outdtype, config),
                     dict(run_kwargs),
                     get_gemm_ref,
                     (
@@ -760,6 +769,9 @@ class GemmA16W16Tuner(GemmCommonTuner):
                     None,
                     rtol,
                     atol,
+                    None,
+                    None,
+                    ("out_asm",),
                 )
             )
         logger.info(f"FlyDSL candidate count for M={M}, N={N}, K={K}: {len(tasks)}")
