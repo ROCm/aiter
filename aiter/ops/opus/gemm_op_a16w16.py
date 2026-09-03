@@ -490,6 +490,23 @@ def _launch_a16w16_bmm(
     )
 
 
+def opus_gemm_a16w16_tune(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    Y: torch.Tensor,
+    kernelId: int = 0,
+    splitK: int = 0,
+) -> torch.Tensor:
+    """Launch the legacy A16W16 GEMM interface by exact kernel id."""
+    return _execute_a16w16(
+        XQ,
+        WQ,
+        Y,
+        kid=int(kernelId),
+        split_k=int(splitK),
+    )
+
+
 def _prepare_shape_driven_a16w16(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -640,4 +657,4 @@ def gemm_a16w16_opus(
     return _launch_a16w16_bmm(XQ, WQ, Y, kid=kid, bias=bias, split_k=split_k)
 
 
-__all__ = ["gemm_a16w16_opus"]
+__all__ = ["gemm_a16w16_opus", "opus_gemm_a16w16_tune"]

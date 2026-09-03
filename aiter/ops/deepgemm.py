@@ -6,7 +6,7 @@ DeepGEMM front-end (CK backend).
 Hosts the CK-backed `deepgemm_ck` binding plus a thin `deepgemm()`
 wrapper. Opus entries have been extracted under `aiter.ops.opus.*`;
 see `aiter.ops.opus.gemm_a16w16_opus` for BF16 matmul and
-`aiter.ops.opus.opus_gemm` for exact-id kernel selection.
+`aiter.ops.opus.opus_gemm_a16w16_tune` for id-based kernel selection.
 
 `opus_gemm_a16w16_tune` is kept here as a deprecation shim for one
 release to ease migration from the old aggregate entry.
@@ -18,7 +18,7 @@ import torch
 from torch import Tensor
 
 from ..jit.core import compile_ops
-from . import opus as _opus
+from .opus.gemm_op_a16w16 import opus_gemm_a16w16_tune as _opus_tune
 
 
 @compile_ops("module_deepgemm", fc_name="deepgemm")
@@ -52,22 +52,12 @@ def opus_gemm_a16w16_tune(
 ) -> torch.Tensor:
     warnings.warn(
         "aiter.ops.deepgemm.opus_gemm_a16w16_tune has moved to "
-        "aiter.ops.opus.opus_gemm; this "
+        "aiter.ops.opus.gemm_op_a16w16.opus_gemm_a16w16_tune; this "
         "shim will be removed in a future release.",
         DeprecationWarning,
         stacklevel=2,
     )
-    if all(tensor.dim() == 3 and tensor.size(0) == 1 for tensor in (XQ, WQ, Y)):
-        _opus.opus_gemm(
-            XQ.squeeze(0),
-            WQ.squeeze(0),
-            Y.squeeze(0),
-            kid=kernelId,
-            split_k=splitK,
-        )
-    else:
-        _opus.opus_bmm(XQ, WQ, Y, kid=kernelId, split_k=splitK)
-    return Y
+    return _opus_tune(XQ, WQ, Y, kernelId, splitK)
 
 
 __all__ = [

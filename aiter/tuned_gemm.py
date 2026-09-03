@@ -159,6 +159,7 @@ def get_GEMM_A16W16_config(
     padded_M = M
     config = None
     gfx = get_gfx()
+    warned_invalid_opus = set()
     for gl in [None, 0, 1]:
         padded_M = M if gl is None else get_padded_m(M, N, K, gl)
         config = cfg.get(
@@ -209,6 +210,24 @@ def get_GEMM_A16W16_config(
                 if resolved is None:
                     # Discard the whole stale (kid, split-K) pair before
                     # trying another padded row or the default fallback.
+                    invalid_row = (
+                        padded_M,
+                        config.get("solidx"),
+                        config.get("splitK"),
+                    )
+                    if invalid_row not in warned_invalid_opus:
+                        logger.warning(
+                            "Ignoring invalid OPUS tuned row for gfx=%s, "
+                            "shape=(%d,%d,%d), kid=%r, splitK=%r; trying "
+                            "the next padded row or default backend",
+                            gfx,
+                            padded_M,
+                            N,
+                            K,
+                            config.get("solidx"),
+                            config.get("splitK"),
+                        )
+                        warned_invalid_opus.add(invalid_row)
                     config = None
                     continue
                 config = dict(config)

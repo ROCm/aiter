@@ -480,6 +480,7 @@ def test_gfx1250_bf16_output_accepts_fp32_bias():
 def test_global_a16_stale_opus_row_keeps_framework_fallback(monkeypatch):
     import aiter.tuned_gemm as tuned
 
+    warnings = []
     key = (
         "gfx942",
         304,
@@ -497,6 +498,11 @@ def test_global_a16_stale_opus_row_keeps_framework_fallback(monkeypatch):
     monkeypatch.setattr(tuned, "get_gfx", lambda: "gfx942")
     monkeypatch.setattr(tuned, "get_cu_num", lambda: 304)
     monkeypatch.setattr(tuned, "_opus_launch", object())
+    monkeypatch.setattr(
+        tuned.logger,
+        "warning",
+        lambda message, *args: warnings.append(message % args),
+    )
     tuned.get_GEMM_A16W16_config.cache_clear()
     try:
         config = tuned.get_GEMM_A16W16_config(
@@ -511,6 +517,8 @@ def test_global_a16_stale_opus_row_keeps_framework_fallback(monkeypatch):
         tuned.get_GEMM_A16W16_config.cache_clear()
 
     assert (config["libtype"], config["solidx"]) == ("torch", 0)
+    assert len(warnings) == 1
+    assert "kid=200, splitK=2" in warnings[0]
 
 
 def _capture_shape_driven_opus_launch(monkeypatch, *, arch, tuned_config):
@@ -699,6 +707,45 @@ def test_shape_driven_opus_selection_and_rank_route(monkeypatch):
     )
     with pytest.raises(ValueError, match="unknown OPUS kid -1"):
         opus.gemm_a16w16_opus(A, B)
+
+
+def test_legacy_a16w16_tune_routes_to_family_executor(monkeypatch):
+    from aiter.ops import deepgemm
+    from aiter.ops.opus import gemm_op_a16w16
+
+    calls = []
+
+    def capture(XQ, WQ, Y, bias=None, **kwargs):
+        calls.append((XQ, WQ, Y, bias, kwargs))
+        return Y
+
+    monkeypatch.setattr(gemm_op_a16w16, "_execute_a16w16", capture)
+    monkeypatch.setattr(
+        gemm_op_a16w16,
+        "_launch_a16w16_gemm",
+        lambda *_args, **_kwargs: pytest.fail("compatibility used public GEMM route"),
+    )
+    monkeypatch.setattr(
+        gemm_op_a16w16,
+        "_launch_a16w16_bmm",
+        lambda *_args, **_kwargs: pytest.fail("GEMM compatibility used BMM"),
+    )
+    XQ = torch.empty((1, 8, 16), device="meta", dtype=torch.bfloat16)
+    WQ = torch.empty((1, 32, 16), device="meta", dtype=torch.bfloat16)
+    Y = torch.empty((1, 8, 32), device="meta", dtype=torch.bfloat16)
+
+    assert gemm_op_a16w16.opus_gemm_a16w16_tune(XQ, WQ, Y, 206, 3) is Y
+    assert gemm_op_a16w16.opus_gemm_a16w16_tune(XQ, WQ, Y, 207, splitK=4) is Y
+    with pytest.warns(DeprecationWarning, match="has moved"):
+        assert deepgemm.opus_gemm_a16w16_tune(XQ, WQ, Y, 208, 5) is Y
+    assert [
+        (tuple(xq.shape), tuple(wq.shape), tuple(y.shape), bias, kwargs)
+        for xq, wq, y, bias, kwargs in calls
+    ] == [
+        ((1, 8, 16), (1, 32, 16), (1, 8, 32), None, {"kid": 206, "split_k": 3}),
+        ((1, 8, 16), (1, 32, 16), (1, 8, 32), None, {"kid": 207, "split_k": 4}),
+        ((1, 8, 16), (1, 32, 16), (1, 8, 32), None, {"kid": 208, "split_k": 5}),
+    ]
 
 
 @pytest.mark.parametrize("arch", ("gfx950", "gfx1250"))
