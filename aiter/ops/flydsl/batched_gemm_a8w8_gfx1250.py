@@ -22,10 +22,9 @@ import re
 import torch
 from torch import Tensor
 
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_lds_capacity_bytes
 
 from .mxfp8_128_bpreshuffle_gemm_gfx1250 import NAME_SUFFIX_RE
-from .utils import get_shared_memory_per_block
 
 BLOCK_K = 128
 BLOCK_N = 128
@@ -34,7 +33,7 @@ BMM_WMMA_NAME_PREFIX = "flydsl_bmm_mxfp8_128_wmma"
 _OUT_DTYPE_NAME = {torch.bfloat16: "bf16", torch.float16: "f16"}
 _PRELOAD_MIN_TILE_M = 128
 _MAX_HEURISTIC_TILE_M = 128
-_LDS_BYTES = get_shared_memory_per_block(fallback_gfx="gfx1250")
+_LDS_BYTES = get_lds_capacity_bytes("gfx1250")
 _SUFFIX_RE = NAME_SUFFIX_RE.removesuffix("$")
 _BMM_KERNEL_NAME_RE = re.compile(
     rf"^{re.escape(BMM_WMMA_NAME_PREFIX)}_{_SUFFIX_RE}(?P<preload>_pre)?$"

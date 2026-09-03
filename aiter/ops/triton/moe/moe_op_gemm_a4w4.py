@@ -103,7 +103,7 @@ def get_kernel_config_triton(m, n, k, routing_data):
         # for scale preshuffling
         block_n = 512
         block_k = 256
-        num_warps = 8
+        num_warps = 4
     num_stages = pick_gemm_num_stages(
         arch, block_m, block_n, block_k, 4, 4, use_async_padding=True
     )

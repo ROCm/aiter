@@ -73,7 +73,7 @@ def _make_bf16_converter(trunc: bool):
     return lambda v: v.to(fx.BFloat16)
 
 
-def compile_chunk_gated_delta_h_opt(
+def compile_chunk_gated_delta_h(
     *,
     K: int,
     V: int,
@@ -105,8 +105,8 @@ def compile_chunk_gated_delta_h_opt(
     """
     # BT=64 is baked into the wave mapping / load batching / BT_STEPS, gated_v
     # alias-reuses h_state panel 1, and the LDS layout is validated at K=V=128.
-    assert BT == 64, f"chunk_gated_delta_h_opt only supports BT=64, got BT={BT}"
-    assert K == 128, f"chunk_gated_delta_h_opt only supports K=128, got K={K}"
+    assert BT == 64, f"chunk_gated_delta_h only supports BT=64, got BT={BT}"
+    assert K == 128, f"chunk_gated_delta_h only supports K=128, got K={K}"
     assert BV % 16 == 0, f"BV must be a multiple of the MFMA N of 16, got BV={BV}"
     NUM_K_BLOCKS = K // 64
 
@@ -964,8 +964,7 @@ def compile_chunk_gated_delta_h_opt(
 
 # NOTE: the host wrapper, BV autotune and kernel cache live in
 # ``aiter.ops.flydsl.linear_attention_prefill_kernels`` (no torch/triton here).
+# This file is the device kernel; sibling ``gdn_prepare.py`` is the prepare stage.
 
 
-__all__ = [
-    "compile_chunk_gated_delta_h_opt",
-]
+__all__ = ["compile_chunk_gated_delta_h"]

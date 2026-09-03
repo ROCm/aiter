@@ -6,7 +6,6 @@ import os
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from enum import Enum
 
 import torch
 
@@ -32,20 +31,7 @@ from aiter.jit.utils.chip_info import (
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
-
-try:
-    from aiter.ops.flydsl.moe_common import GateMode
-    from aiter.ops.flydsl.utils import is_flydsl_available
-except ImportError:
-
-    class GateMode(Enum):
-        SEPARATED = "separated"
-        INTERLEAVE = "interleave"
-
-    def is_flydsl_available():
-        return False
-
-
+from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.flydsl.mxfp4_kname import (
     _is_mxfp4_kname,
     _parse_mxfp4_g1_kname,
@@ -58,10 +44,18 @@ from aiter.ops.opus.moe_stage1_a8w4 import (
     opus_a8w4_stage1_wrapper as _opus_a8w4_stage1_wrapper,
 )
 
+
+@functools.lru_cache(maxsize=1)
+def _get_flydsl_moe_kernels():
+    from aiter.ops.flydsl import moe_kernels
+
+    return moe_kernels
+
+
 BLOCK_SIZE_M = 32
 
 # Sorting backend flags (mutually exclusive; CK > FlyDSL > Opus priority).
-# Default is Opus.  Set AITER_USE_FLYDSL_MOE_SORTING=1 to prefer FlyDSL when available.
+# Default is Opus. Set AITER_USE_FLYDSL_MOE_SORTING=1 to prefer FlyDSL.
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") == "1"
 # "adaptive sort" backend selection (mxfp4 sort as a general World-1 backend):
@@ -75,6 +69,9 @@ _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
+# On the heuristic FlyDSL fallback, fold stage 2's mxfp8 quant into stage 1's
+# fp8 epilogue. On by default; set to 0 to keep the separate quant kernel.
+_FUSE_STAGE1_FP8_QUANT = os.environ.get("AITER_MOE_FUSE_STAGE1_FP8_QUANT", "1") != "0"
 
 # Opt-in kernel-bench hook: a caller sets a list here to collect (name, callable)
 # per-kernel launches in fused_moe_2stages ("stage1"/"stage2"); None in production
@@ -431,7 +428,6 @@ def moe_sorting(
     if (
         not _USE_CK_MOE_SORTING
         and _USE_FLYDSL_MOE_SORTING
-        and is_flydsl_available()
         and not return_local_topk_ids
         and not flat
         and not output_aux
@@ -504,7 +500,7 @@ def stage2_uses_route_reduce(stage2: Callable) -> bool:
     func = getattr(stage2, "func", stage2)
     kernel_name = getattr(stage2, "keywords", {}).get("kernelName", "")
     if func is _flydsl_stage2_wrapper or getattr(func, "_is_flydsl_stage2", False):
-        parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernel_name)
+        parsed = _get_flydsl_moe_kernels().get_flydsl_kernel_params(kernel_name)
         if parsed is None:
             return False
         # a16w4 (bf16 A x mxfp4 W) down-proj only supports atomic scatter into a
@@ -923,50 +919,44 @@ def _fused_moe_impl(
         q_dtype_a = _q_dtype_a
 
     grouped_a8w4_out = None
-    if is_flydsl_available():
-        try:
-            from aiter.ops.flydsl.grouped_moe_gfx1250 import (
-                grouped_gemm_gfx1250_a8w4,
-            )
-        except ImportError:
-            grouped_gemm_gfx1250_a8w4 = None
+    from aiter.ops.flydsl.grouped_moe_gfx1250 import grouped_gemm_gfx1250_a8w4
 
-        # grouped_gemm_gfx1250_a8w4 reads GUGU (gate/up row-interleaved) w1 only,
-        # so it is reachable exclusively from GateMode.INTERLEAVE. SEPARATED
-        # weights fall through to the generic MoE below.
-        if grouped_gemm_gfx1250_a8w4 is not None and gate_mode == GateMode.INTERLEAVE:
-            grouped_a8w4_out = grouped_gemm_gfx1250_a8w4(
-                hidden_states,
-                w1,
-                w2,
-                topk_weight,
-                topk_ids,
-                E=E,
-                model_dim=model_dim,
-                inter_dim=inter_dim,
-                dtype=dtype,
-                activation=activation,
-                quant_type=quant_type,
-                q_dtype_a=q_dtype_a,
-                q_dtype_w=q_dtype_w,
-                isG1U1=isG1U1,
-                doweight_stage1=doweight_stage1,
-                w1_scale=w1_scale,
-                w2_scale=w2_scale,
-                # A quantizing EP dispatch puts the caller's e8m0 row here;
-                # the gfx1250 path uses it to skip a quant it would redo.
-                a1_scale=a1_scale,
-                expert_mask=expert_mask,
-                hidden_pad=hidden_pad,
-                intermediate_pad=intermediate_pad,
-                bias1=bias1,
-                bias2=bias2,
-                swiglu_limit=swiglu_limit,
-                num_local_tokens=num_local_tokens,
-                situ_beta=1.0 if beta is None else float(beta),
-                situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
-                stage2_scatter=stage2_scatter,
-            )
+    # grouped_gemm_gfx1250_a8w4 reads GUGU (gate/up row-interleaved) w1 only,
+    # so it is reachable exclusively from GateMode.INTERLEAVE. SEPARATED
+    # weights fall through to the generic MoE below.
+    if gate_mode == GateMode.INTERLEAVE:
+        grouped_a8w4_out = grouped_gemm_gfx1250_a8w4(
+            hidden_states,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+            E=E,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            dtype=dtype,
+            activation=activation,
+            quant_type=quant_type,
+            q_dtype_a=q_dtype_a,
+            q_dtype_w=q_dtype_w,
+            isG1U1=isG1U1,
+            doweight_stage1=doweight_stage1,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            # A quantizing EP dispatch puts the caller's e8m0 row here;
+            # the gfx1250 path uses it to skip a quant it would redo.
+            a1_scale=a1_scale,
+            expert_mask=expert_mask,
+            hidden_pad=hidden_pad,
+            intermediate_pad=intermediate_pad,
+            bias1=bias1,
+            bias2=bias2,
+            swiglu_limit=swiglu_limit,
+            num_local_tokens=num_local_tokens,
+            situ_beta=1.0 if beta is None else float(beta),
+            situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
+            stage2_scatter=stage2_scatter,
+        )
 
     if grouped_a8w4_out is not None:
         return _return_output(grouped_a8w4_out, output)
@@ -981,10 +971,10 @@ def _fused_moe_impl(
     if _is_a16w4_situv2:
         for _bad, _why in (
             (
-                get_gfx() not in ("gfx942", "gfx950") or not is_flydsl_available(),
+                get_gfx() not in ("gfx942", "gfx950"),
                 (
                     f"requires the FlyDSL kernel on CDNA gfx942/gfx950 "
-                    f"(gfx={get_gfx()!r}, flydsl_available={is_flydsl_available()})"
+                    f"(gfx={get_gfx()!r})"
                 ),
             ),
             (bias1 is not None or bias2 is not None, "per-expert bias"),
@@ -1549,7 +1539,8 @@ def _flydsl_stage1_wrapper(
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
         inter_dim_pad, model_dim_pad, bias1
     )
-    parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
+    moe_kernels = _get_flydsl_moe_kernels()
+    parsed = moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
     if out_dtype is not None:
@@ -1563,7 +1554,7 @@ def _flydsl_stage1_wrapper(
     else:
         raise ValueError(f"Unsupported activation for FlyDSL MoE stage1: {activation}")
     _a_scale_one = parsed.get("a_scale_one", False)
-    return aiter.ops.flydsl.flydsl_moe_stage1(
+    return moe_kernels.flydsl_moe_stage1(
         a=hidden_states,
         w1=w1,
         sorted_token_ids=sorted_token_ids,
@@ -1585,7 +1576,8 @@ def _flydsl_stage1_wrapper(
         sorted_weights=sorted_weights,
         use_async_copy=True,
         k_batch=parsed.get("k_batch", 1),
-        waves_per_eu=parsed.get("waves_per_eu", 3),
+        # None, matching stage 2: the int4 registry emits no waves_per_eu key.
+        waves_per_eu=parsed.get("waves_per_eu", None),
         b_nt=parsed.get("b_nt", 2),
         gate_mode=parsed.get("gate_mode", "separated"),
         inter_dim_pad=inter_dim_pad,
@@ -1633,10 +1625,11 @@ def _flydsl_stage2_wrapper(
     # already baked into this dict, so the `parsed.get(..., default)`
     # calls below pick up the registered values for that kernel name
     # rather than always falling back to defaults.
-    parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
+    moe_kernels = _get_flydsl_moe_kernels()
+    parsed = moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
-    return aiter.ops.flydsl.flydsl_moe_stage2(
+    return moe_kernels.flydsl_moe_stage2(
         inter_states=inter_states,
         w2=w2,
         sorted_token_ids=sorted_token_ids,
@@ -2664,7 +2657,7 @@ def get_2stage_cfgs(
     is_opus1 = isinstance(kernelName1, str) and kernelName1.startswith("opus_moe1_")
     is_cktile2 = isinstance(kernelName2, str) and kernelName2.startswith("cktile_")
     is_opus2 = _opus_a8w4.is_opus_a8w4_stage2_kernel(kernelName2)
-    if is_opus1 or ((is_flydsl1 or is_flydsl2) and is_flydsl_available()):
+    if is_opus1 or is_flydsl1 or is_flydsl2:
         enable_bias = (
             _needs_swiglu_bias_support(dtype, q_type) and q_dtype_w == dtypes.fp4x2
         )
@@ -2790,11 +2783,7 @@ def get_2stage_cfgs(
         and q_dtype_w == dtypes.fp4x2
         and is_shuffled
     )
-    if (
-        q_type == QuantType.per_1x32
-        and q_dtype_w == dtypes.i4x2
-        and is_flydsl_available()
-    ):
+    if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
         # Untuned a16wi4 fallback: one shape-safe config on the shared a16w-mix port.
         # Tiles belong in the tuned CSV, not in a heuristic here. ksplit is 0 because
         # the port has no grid split-K (it uses intra-block k_wave); asking for it
@@ -2843,7 +2832,6 @@ def get_2stage_cfgs(
         and is_shuffled
         and use_g1u1
         and not doweight_stage1
-        and is_flydsl_available()
     )
     use_mxfp4_flydsl = _is_a16w4_situv2 or (
         dtype in [dtypes.bf16, dtypes.fp16]
@@ -2859,7 +2847,6 @@ def get_2stage_cfgs(
         and is_shuffled
         and use_g1u1
         and not doweight_stage1
-        and is_flydsl_available()
     )
     if use_mxfp4_flydsl:
         from aiter.ops.flydsl.moe_kernels import (
@@ -2911,9 +2898,19 @@ def get_2stage_cfgs(
         if get_flydsl_kernel_params(kn2) is None:
             kn2 = _base_kn2
 
+        # Fuse stage 2's mxfp8 quant into stage 1's "_fp8" epilogue variant when
+        # that kernel exists (see AITER_MOE_FUSE_STAGE1_FP8_QUANT).
+        _fb_fuse_quant = ""
+        if _a_type == "fp8" and _FUSE_STAGE1_FP8_QUANT:
+            _kn1_fp8q = f"{kn1}_fp8"
+            if get_flydsl_kernel_params(_kn1_fp8q) is not None:
+                kn1 = _kn1_fp8q
+                _fb_fuse_quant = "fp8"
+
         logger.warning(
             f"[fused_moe] no tuned FlyDSL config for {keys}, "
-            f"using heuristic FlyDSL fallback ({kn1=}, {kn2=})"
+            f"using heuristic FlyDSL fallback ({kn1=}, {kn2=}, "
+            f"fuse_quant={_fb_fuse_quant or 'none'})"
         )
         enable_bias = _needs_swiglu_bias_support(dtype, q_type)
         return MOEMetadata(
@@ -2934,6 +2931,7 @@ def get_2stage_cfgs(
             -1,  # split_k = -1
             False,
             has_bias=enable_bias,
+            fuse_quant=_fb_fuse_quant,
             stage2_has_bias=enable_bias,
         )
     if (
@@ -3026,7 +3024,7 @@ def get_2stage_cfgs(
             ]
         )
     ):
-        if kernelName2 and kernelName2.startswith("flydsl_") and is_flydsl_available():
+        if kernelName2 and kernelName2.startswith("flydsl_"):
             stage2_func = functools.partial(
                 _flydsl_stage2_wrapper,
                 kernelName=kernelName2,
