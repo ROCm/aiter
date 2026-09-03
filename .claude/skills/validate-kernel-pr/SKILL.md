@@ -234,49 +234,55 @@ row, not a substitute for noticing one.
 
 ### 5 — `correctness` — the repo's tests, then a grid the repo does not run
 
-Runner selection is structural, not assumed:
+Two runs, reported separately, because the interesting case is when they disagree: what the PR's
+own suite says, and what a grid the PR never runs says.
 
-- an explicit `path::node`, or a file defining `test*`/`Test*`, uses pytest;
-- otherwise a file with an `if __name__ == "__main__"` guard runs as `python <file>`;
-- a file with neither is `skip`, never a test failure.
+#### Choosing how to run the target
 
-Selection can still pick a runner the target cannot survive. A file that defines `test*` nodes
-**and** parses argv in its module body is collected by pytest, which imports it with pytest's
-own argv — and argparse exits the process, while the same file is green run as a script.
-`test_selection.runner_risk` names that structurally, and a run that executes nothing under
-the selected runner says so: *"red on both sides"* is an attribution, not an explanation, and a
-reader who is not told otherwise concludes the code is broken when the runner choice is.
+Read the file. An explicit `path::node`, or a file defining `test*`/`Test*`, is pytest; a file
+with an `if __name__ == "__main__"` guard runs as a script; a file with neither is `skip`, never a
+test failure.
 
-The report records `test_selection.runner` and `runner_reason`. A script target is profiled the
-same way a pytest target is: the probe is installed by a validator-owned runner that then executes
-the file under `runpy` with `run_name="__main__"`, so `execution_receipt` is reachable for both.
-Nothing about `sys.setprofile` needed pytest; pytest was only where the hook was installed.
+The trap is a file that is **both**. It defines `test*` nodes *and* parses argv in its module
+body: pytest collects it, imports it with pytest's own argv, argparse exits the process — and the
+same file is green when run as a script. So when a run executes nothing, say that in those words.
+*"Red on both sides"* is an attribution, not an explanation, and a reader who is not told
+otherwise concludes the code is broken when the runner choice is.
 
-Both, and they are reported separately, because the interesting case is when they disagree.
-Pytest runs emit JUnit XML and a zero-executed/all-skipped target is `skip`, never `pass`.
+Record which runner ran and why. Both runners are profiled identically — the probe is installed by
+a validator-owned wrapper that then executes the file under `runpy` with `run_name="__main__"`,
+because nothing about `sys.setprofile` ever needed pytest; pytest was only where the hook was
+convenient to install.
 
-A script target publishes no per-case count, so its `executed` is a liveness signal and
-nothing more — it says the process ran. What it must not do is stand in for work. A target
-that returns silently with exit 0 and a log line (aiter#4538's does, when the arch is
-unsupported or an optional package is missing) produced exactly the same `executed: 1` as
-the run that graded 56 cases, and earned the same `arch_coverage: runtime` on basis
-`script-exit-zero-with-output` — a statement about the process, not the kernel. So:
+#### What counts as having run
 
-- `stats.observed_work` carries the only number backed by evidence: route calls counted in
-  **that run's own** execution receipt. It is `null` when no route was named, because
-  nothing was watched;
-- `arch_coverage` credits nothing when `observed_work` is `0` — a route was watched for and
-  never reached the device — and `arch_coverage_basis` prints the count and its provenance
-  rather than implying a measurement.
+Pytest emits JUnit XML, and a zero-executed or all-skipped target is `skip`, never `pass`.
 
-For a patch run, the validator reverses the exact patch to create the baseline, verifies that the
-worktree is clean, runs both targets under base-only caches, and reapplies the patch before a
-head run with separate caches. This removes new files too; a PR-added failing test is therefore
-`target-not-present` on base, not falsely classified as a pre-existing failure. Any worktree
-artifact, reverse/reapply failure, or cache-isolation failure aborts the head run and produces
-`INCONCLUSIVE`.
+A script publishes no per-case count, so its `executed` is a **liveness signal only** — the
+process ran. It must never stand in for work. aiter#4538's target returns silently with exit 0 and
+a log line when the arch is unsupported or an optional package is missing; that produced exactly
+the same `executed: 1` as the run which graded 56 cases, and earned the same `arch_coverage` on a
+basis that described the process rather than the kernel. Hence:
 
-The S1-owned grid must cover three classes the PR's own tests routinely miss:
+- `observed_work` is the only number backed by evidence — route calls counted in **that run's
+  own** receipt. It is `null` when no route was named, because nothing was watched.
+- `arch_coverage` credits nothing when `observed_work` is `0`: a route was watched for and never
+  reached the device. The basis line prints the count and where it came from, rather than
+  implying a measurement.
+
+#### The baseline must be the same tree minus the patch
+
+Reverse the exact patch, confirm the worktree is clean, run base under base-only caches, reapply,
+run head under separate caches.
+
+Reversing removes **new files too**, which is the point: a test the PR added is `target-not-present`
+on base, not a pre-existing failure. Any leftover artifact, any reverse/reapply failure, any cache
+bleed aborts the head run into `INCONCLUSIVE` — a baseline you cannot trust makes the comparison
+worthless in the direction that clears the PR.
+
+#### The grid
+
+Cover three classes the PR's own tests routinely miss:
 
 | class | why |
 |---|---|
@@ -284,80 +290,82 @@ The S1-owned grid must cover three classes the PR's own tests routinely miss:
 | boundary / odd | odd N, N not a multiple of the tile — where tail masks fail |
 | long-context / large M | where 32-bit index arithmetic wraps |
 
-The grid reaches the target through whichever channel that target actually reads, and the channel
-must be proven structurally before it is used:
+Then decide how the grid reaches the target. These are alternatives — pick the one the target
+actually has, and say what in the source told you so:
 
-| channel | flag | proof the hook exists |
-|---|---|---|
-| environment variable | `--shape-env` | the source references `os.getenv(VAR)` / `os.environ[VAR]` |
-| the target's own CLI flag | `--shape-arg` | the source passes that flag literal to `add_argument` |
+| the target takes its shapes from | what to look for |
+|---|---|
+| an environment variable | the source reads that name via `os.getenv` / `os.environ` |
+| its own CLI flag | the source passes that flag literal to `add_argument` |
+| `@pytest.mark.parametrize` literals | the source binds those names as test parameters; the shipped plugin replaces them |
 
-Injecting through an env var only would have made this stage permanently inert for repositories
-whose tests take shapes on the command line — a limit of the injector, not of the target. The flag
-is named by the caller rather than guessed, because a wrong guess appends argv the target silently
-ignores. Neither channel is trusted on the strength of the AST scan alone: the stage re-runs the
-target with a deliberately invalid grid value and requires it to fail. A target that passes with
-garbage shapes is not consuming the grid, so the stage is `skip`, never credited.
+The third channel exists because the first two require the target to have been *written* for a
+validator. Zero of the seven files in aiter's `op_tests/flydsl_tests/` expose an env var or a shape
+flag; every one declares shapes as parametrize literals. Four consecutive real FlyDSL kernel PRs
+reached `INCONCLUSIVE` for that reason alone, and the skip text blamed the kernel for a limit that
+belonged to the injector.
 
-With no channel configured the stage is `skip` and the verdict is `INCONCLUSIVE`. This is a
-positive control against reporting the same default test run twice under different stage names.
+**Reading the source is never enough to credit the channel.** Re-run the target with a
+deliberately invalid grid and require it to **fail**. A target that passes with garbage shapes is
+not consuming the grid — whatever the source looked like — so the stage is `skip`, never credited.
+This one probe is what makes every channel equally trustworthy, so do not skip it because the AST
+evidence looked convincing.
 
-When the kernel exposes no shape override, the report says `repo-default-only` rather than
-claiming coverage it does not have.
+With no channel at all the stage is `skip` and the verdict `INCONCLUSIVE`. That is a positive
+control: without it, the same default test run gets reported twice under two stage names. When the
+kernel exposes no shape override at all, say `repo-default-only` rather than claim coverage that
+does not exist.
 
-**A proven channel is not the same as added coverage.** A target that consumes the grid can
-still be handed cells it already runs by default. On ROCm/aiter#4538 all three requested
-shapes were in the target's own `--shapes` default list, so the "independent" grid re-ran a
-strict subset of the repository run and the stage reported `pass` — the exact duplication
-this stage exists to prevent, invisible in the report. The grid cells are therefore compared
-against the target's own declared default for the same flag, and
-`test_selection.grid_independence` is one of:
+#### A proven channel is not the same as added coverage
+
+A target can consume the grid faithfully and still be handed cells it already runs by default. On
+ROCm/aiter#4538 all three requested shapes were in the target's own default list, so the
+"independent" grid re-ran a strict subset of the repository run and the stage reported `pass` —
+exactly the duplication this stage exists to prevent, and invisible in the report.
+
+So compare the cells against the target's own declared default and record which case holds:
 
 | value | meaning |
 |---|---|
 | `adds-coverage` | at least one cell is outside the target's own default |
-| `duplicates-target-defaults` | every cell is already a default; a passing run is downgraded to `skip` and the verdict to `INCONCLUSIVE`, because a passing duplicate proves only what `correctness_repo_tests` already said |
-| `unknown` | the channel exposes no literal default to compare against (every env-var channel, and a flag whose default is computed) |
+| `duplicates-target-defaults` | every cell is already a default. A **passing** run is downgraded to `skip` and the verdict to `INCONCLUSIVE`, because it proves only what the repo-tests stage already said |
+| `unknown` | there is no literal default to compare against — every env-var channel, and any flag whose default is computed |
 
-A duplicate grid that **fails** keeps its `fail`. The finding is real; what a duplicate
-cannot do is earn a pass.
+A duplicate grid that **fails** keeps its `fail`. The finding is real; what a duplicate cannot do
+is earn a pass.
+
+And say *which* of the several ways the comparison can be skipped actually applied. Defaulting to
+a claim about the target — "the channel exposes no declared defaults" — asserts something the run
+never established.
 
 #### Axes: when the failing configuration is not a shape
 
-`--grid` is one ordered tuple on one channel, which is all a target's shape flag accepts. A
-target whose remaining knobs are separate flags — head counts, dtypes, window modes — could
-not be gridded over them at all, so entire configurations were unreachable however the grid
-was spelled. That is not a missing shape; it is a missing axis.
+A grid is one ordered tuple on one channel, which is all a shape flag accepts. A target whose
+remaining knobs are separate flags — head counts, dtypes, window modes — cannot be gridded over
+them at all, so entire configurations stay unreachable however the grid is spelled. That is not a
+missing shape; it is a missing axis.
 
-aiter#4538 is the case: `--shapes` carries `(seq_len, seq_len_kv)` while `--num-heads` is its
-own flag defaulting to `64 128`, and the public API asserts at `num_heads=16` — a real
-blocker the validator had no way to request.
+aiter#4538 again: the shape flag carries `(seq_len, seq_len_kv)` while `--num-heads` is its own
+flag defaulting to `64 128`, and the public API asserts at `num_heads=16` — a real blocker no grid
+could have requested.
 
-```
---axis 'num_heads=--num-heads:16;32'
-```
-
-Axes obey the same burden of proof as `--shape-arg`, in two steps, and
-`test_selection.axis_state` names which one it reached:
+An axis is a name, a flag, and its values, and it carries the same burden of proof as a shape
+channel, in two steps. Record which step it reached:
 
 | state | meaning |
 |---|---|
-| `none` / `unusable` | none requested, or the target is not a script (argv reaches script targets only) |
-| `hook-not-found` | the target's source declares no `add_argument` for that flag |
-| `hook-not-consumed` | the flag was declared but accepted `__VALIDATOR_INVALID_AXIS__`; the axis is **dropped and named**, never dropped quietly |
+| `none` / `unusable` | none requested, or the target is not a script — argv reaches script targets only |
+| `hook-not-found` | the source declares no `add_argument` for that flag |
+| `hook-not-consumed` | the flag was declared but accepted a deliberately invalid value; the axis is **dropped and named**, never dropped quietly |
 | `proven` | every axis flag refused an invalid value, and its values rode the grid run's argv |
 
-Each axis records its own `independence` against the flag's declared default, on the same
-terms as the shape cells. A proven axis that asks for values outside the default makes the
-run independent even when the shape cells duplicate.
+Each axis is judged for independence against its flag's declared default on the same terms as the
+shape cells — and a proven axis asking for values outside the default makes the run independent
+even when the shape cells duplicate.
 
-A requested axis appears in `test_selection.axes` **whatever** becomes of it, with
-`hook_proof: not-evaluated` when the run never got far enough to scan for the flag. An empty
-`axes` beside a non-`none` `axis_state` would lose the request itself — which is the silently
-narrowed test space these fields exist to make visible. For the same reason
-`grid_independence_reason` names which of the several ways the comparison can be skipped
-actually applied, rather than defaulting to a claim about the target ("the channel exposes no
-declared defaults") that the run never established.
+A requested axis is recorded **whatever becomes of it**, including when the run never got far
+enough to look for the flag. Dropping the request itself is precisely the silently narrowed test
+space this is here to make visible.
 
 ### 6 — `execution_receipt`
 
