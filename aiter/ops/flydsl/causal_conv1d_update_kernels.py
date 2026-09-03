@@ -72,7 +72,7 @@ _SGLANG_WIDTHS = range(2, 5)
 #: admitting them would dispatch where nothing has been validated.
 _SUPPORTED_ARCHS = ("gfx942", "gfx950")
 
-#: Narrowest channel tile: below one wavefront a workgroup wastes lanes.
+#: Narrowest channel tile.
 _WAVEFRONT = 64
 
 #: Widest first; :func:`_pick_block_n` scans in order.
@@ -464,15 +464,13 @@ def causal_conv1d_update_flydsl(
     null_block_arg = null_block_id if has_null_block else -1
 
     if channels_per_thread <= 0:
-        # Deliberately not _pick_cpt(), unlike the SGLang sibling: CPT > 1 is a
-        # wash at these shapes, so the default leaves it unspent.
+        # Deliberately not _pick_cpt(), unlike the SGLang sibling.
         channels_per_thread = 1
     if block_n <= 0:
         block_n = _pick_block_n(batch, dim, x.device, channels_per_thread)
 
-    # Vectorize the per-channel stores when the token axis is contiguous. An odd
-    # channel stride misaligns half the lanes but still comes out ahead, so an
-    # even stride is not required.
+    # Vectorize the per-channel stores when the token axis is contiguous; an even
+    # channel stride is not required.
     cs_vec = bool(conv_state.stride(2) == 1)
     # Never under varlen: the packed layout leaves a channel's tokens dim apart.
     o_vec = bool(stride_o_tok == 1)
@@ -669,8 +667,8 @@ def causal_conv1d_update_sglang_flydsl(
         out = torch.empty_like(x)  # SGLang allocates rather than overwriting x
     else:
         # Held to the contract vLLM defines for its own `out`: same shape, dtype
-        # and device as the input. x is already cast and unsqueezed by now, so
-        # compare against the caller's shape.
+        # and device as the input. x is already unsqueezed by now, so compare
+        # against the caller's shape.
         want_shape = x.shape[:-1] if unsqueeze else x.shape
         if out.shape != want_shape:
             raise ValueError(
@@ -694,8 +692,7 @@ def causal_conv1d_update_sglang_flydsl(
             batch, dim, x.device, channels_per_thread, env="AITER_FLYDSL_CONV1D_BN"
         )
 
-    # Vectorize the per-channel stores when the token axis is contiguous; see the
-    # vLLM sibling above. i_vec is the same for the snapshot's W-1 tap slots.
+    # As in the vLLM sibling above; i_vec covers the snapshot's W-1 tap slots.
     cs_vec = bool(conv_state.stride(2) == 1)
     o_vec = bool(out.stride(2) == 1)
     i_vec = bool(save_inter and intermediate_conv_window.stride(3) == 1)

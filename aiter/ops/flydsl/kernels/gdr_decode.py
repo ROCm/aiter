@@ -575,6 +575,9 @@ def create_vk_gdr_decode_kernel(
     return launch_gdr_decode_kernel
 
 
+# Non-temporal bit for GTensor stores; loads do not forward it.
+NT_STORE = 2
+
 MTP_MODE_CHAIN = "chain"
 MTP_MODE_SNAPSHOT = "snapshot"
 
@@ -613,25 +616,17 @@ def create_vk_gdr_mtp_kernel(
 ):
     """Gated delta rule over a speculative draft window.
 
-    Verify has to be able to undo the tokens the target model rejects, so it
-    needs both a rollback point and a per-token record. The two upstreams keep
-    that record in different places, and ``mode`` picks between them.
+    Undoing a rejected token needs a rollback point and a per-token record;
+    ``mode`` picks whose contract to follow.
 
-    ``MTP_MODE_CHAIN`` is vLLM's. The draft is a linear chain, the rollback
-    point is ``state_indices[n, num_accepted - 1]``, and the record is the state
-    pool itself: every token checkpoints into ``state_indices[n, t]``. The last
-    token's checkpoint is the final store, so there is no separate one.
+    ``MTP_MODE_CHAIN`` is vLLM's: rollback at
+    ``state_indices[n, num_accepted - 1]``, and every token checkpoints into
+    ``state_indices[n, t]``, the last of which is the final store.
 
-    ``MTP_MODE_SNAPSHOT`` is SGLang's. The rollback point is the sequence's one
-    slot ``state_indices[n]`` and the record lives in
-    ``intermediate_states_buffer``. With ``has_tree`` the draft is an EAGLE tree,
-    so each token restarts from its parent's snapshot rather than from its
-    predecessor; ``disable_state_update`` suppresses the write-back, which is
-    how a verify pass leaves the committed state alone.
-
-    Buffer offsets are 32 bits, so any term scaling with the state pool or the
-    snapshot buffer belongs in the 64-bit descriptor base, with both factors
-    widened before the multiply.
+    ``MTP_MODE_SNAPSHOT`` is SGLang's: rollback at ``state_indices[n]``, record
+    in ``intermediate_states_buffer``. ``has_tree`` makes the draft an EAGLE
+    tree, each token restarting from its parent's snapshot;
+    ``disable_state_update`` suppresses the write-back.
     """
     assert mode in (MTP_MODE_CHAIN, MTP_MODE_SNAPSHOT), f"unknown MTP mode {mode!r}"
     CHAIN = mode == MTP_MODE_CHAIN
@@ -642,8 +637,7 @@ def create_vk_gdr_mtp_kernel(
     assert not TREE or len(inter_strides) == 5, "tree needs a snapshot buffer"
     SAVE_INTER = SNAPSHOT and len(inter_strides) == 5
 
-    # A snapshot read back returns the accumulator that was written only at f32.
-    # At a narrower dtype the reload is a rounding, so the tree cannot skip it.
+    # Only an f32 snapshot reloads exactly; a narrower one rounds.
     LOSSLESS_SNAPSHOT = TREE and "f32" in inter_dtype
 
     SCALE_VALUE = float(1.0 / (float(head_k_dim) ** 0.5))
@@ -670,13 +664,7 @@ def create_vk_gdr_mtp_kernel(
     assert TILE_V >= 1 and head_v_dim % NUM_BLOCKS_PER_V_DIM == 0
     assert WARP_TILE_V_ITERS >= 1 and TILE_V % WARP_GROUP_TILE_V == 0
 
-    # Registers the resident state occupies. Every other live value in the token
-    # body is a scalar or a single K vector.
     STATE_REGS = WARP_TILE_V_ITERS * WARP_TILE_K_ITERS * VALUES_PER_THREAD_K
-
-    # A wave64 SIMD has a 512-register vector file, so four resident waves is
-    # 128 each. A tiling whose state alone reaches that leaves nothing for
-    # scheduling freedom.
     VGPR_PER_WAVE_AT_4 = 512 // 4
 
     WARP_THREADS_K_SHFL_OFFSETS = []
@@ -689,9 +677,6 @@ def create_vk_gdr_mtp_kernel(
     STATE_BYTES = get_dtype_bytes(state_dtype)
     INTER_BYTES = get_dtype_bytes(inter_dtype) if SAVE_INTER else 0
 
-    # The snapshot reuses the state's lane count, which is picked so the state
-    # vector is 16 bytes. A wider snapshot element overruns what one buffer op
-    # carries, and this is the layer that cannot express the store.
     assert not SAVE_INTER or VALUES_PER_THREAD_K * INTER_BYTES <= 16, (
         f"a {state_dtype} state splits K {VALUES_PER_THREAD_K} ways, so a "
         f"{inter_dtype} snapshot needs a "
@@ -729,8 +714,6 @@ def create_vk_gdr_mtp_kernel(
     ):
         scale = fx.Float32(SCALE_VALUE)
         softplus_beta_ = fx.Float32(softplus_beta)
-        # Reciprocal of a builder constant, so the token body holds a multiply
-        # and not a divide. At the default beta of 1.0 it folds away entirely.
         inv_softplus_beta_ = fx.Float32(1.0 / softplus_beta)
         softplus_threshold_ = fx.Float32(softplus_threshold)
 
@@ -758,30 +741,19 @@ def create_vk_gdr_mtp_kernel(
         warp_k_vec_start = w_tid % WARP_THREADS_K * VALUES_PER_THREAD_K
         global_v_start = tile_v_start + wid * WARP_TILE_V + w_tid // WARP_THREADS_K
 
-        # Flat views: the index tensors are addressed with the caller's strides
-        # rather than a shape, so a 1-D [B] and a 2-D [B, T] map the same way.
+        # Addressed with the caller's strides, so 1-D [B] and 2-D [B, T] both map.
         si_tensor = GTensor(state_indices, dtype=T.i32, shape=(-1,))
 
-        # Every token's checkpoint slot, read together in the prologue that is
-        # already waiting on the rollback lookup, so one wait covers all of them
-        # at a cost of `seq_length` registers. The snapshot contract has one
-        # slot per sequence, so there is nothing to spread.
         if const_expr(CHAIN):
             token_slots = [
                 fx.Int32(si_tensor[b_i * si_strides[0] + t * si_strides[1]])
                 for t in range_constexpr(seq_length)
             ]
 
-        # The two contracts spell a dead slot differently: SGLang pads with a
-        # negative sentinel and slot 0 is ordinary, while vLLM reserves slot 0
-        # as its null block and aiter's Triton passes a negative sentinel
-        # through the same entry point. So the chain rejects both and the
-        # snapshot mode must not reject slot 0.
+        # vLLM reserves slot 0 as its null block; SGLang's slot 0 is ordinary and
+        # a dead slot is a negative sentinel instead.
         MIN_LIVE_SLOT = 1 if CHAIN else 0
 
-        # Rollback point. The chain rolls back to the last accepted token's
-        # checkpoint; the snapshot mode's sequence has a single slot and rolls
-        # back through the snapshot buffer instead.
         if const_expr(CHAIN):
             nacc_tensor = GTensor(num_accepted, dtype=T.i32, shape=(-1,))
             read_token = fx.Int32(nacc_tensor[b_i]) - fx.Int32(1)
@@ -833,12 +805,9 @@ def create_vk_gdr_mtp_kernel(
             out, dtype=dtype_, shape=(-1, seq_length, num_v_heads, head_v_dim)
         )
 
+        # Any term scaling with the pool or the snapshot buffer goes in the
+        # 64-bit base; the buffer offset is 32 bits.
         def _state_at(slot):
-            """State-pool view whose descriptor base already carries the slot.
-
-            ``slot * state_strides[0]`` scales with the pool, so it cannot sit
-            in the 32-bit buffer offset. Both factors are widened first.
-            """
             return GTensor(
                 state,
                 dtype=state_dtype_,
@@ -849,16 +818,11 @@ def create_vk_gdr_mtp_kernel(
                 * STATE_BYTES,
             )
 
-        def _inter_at(slot, step):
-            """Snapshot view for one (sequence slot, draft step).
-
-            A slot here spans ``cache_steps`` states where a pool slot spans
-            one, so it crosses 2^31 elements that much sooner. Slot and step go
-            into the 64-bit base for the same reason the pool's does.
-            """
+        def _inter_at(slot, step, cache_modifier=0):
             inter_dtype_ = get_dtype_in_kernel(inter_dtype)
             return GTensor(
                 inter_buffer,
+                cache_modifier=cache_modifier,
                 dtype=inter_dtype_,
                 shape=(num_v_heads, head_v_dim, head_k_dim),
                 stride=(inter_strides[2], inter_strides[3], inter_strides[4]),
@@ -869,21 +833,11 @@ def create_vk_gdr_mtp_kernel(
                 * INTER_BYTES,
             )
 
-        # The inputs that do not depend on the rollback slot are issued ahead of
-        # the dead-slot test, so their latency runs under the lookup's:
-        # `read_slot` is two dependent round trips deep -- `num_accepted[b_i]`
-        # names the token, that token's entry names the slot -- while the decay
-        # scalars and token 0's taps are addressed by `b_i` and `hv_i` alone.
-        #
-        # A dead sequence issues these reads and discards them. They are in
-        # bounds either way, which is why the slot loads above are unguarded.
-        #
-        # Chain contracts only: the tree emits the body once per snapshot arm,
-        # so a hoisted value is live across both copies.
+        # The tree emits the body once per arm, so a hoisted value is live across both.
         HOIST_ENTRY = not TREE
 
         def _taps(sq):
-            """The gate and value scalars one token reads, issued together."""
+            """The gate and value scalars one token reads."""
             return (
                 a_tensor[b_i, sq, hv_i],
                 b_tensor[b_i, sq, hv_i],
@@ -901,15 +855,8 @@ def create_vk_gdr_mtp_kernel(
             entry_dt_bias = dt_bias_tensor[hv_i].extf(T.f32)
             entry_taps = _taps(0)
 
-        # Skip pad slots (a negative sentinel). The guarded body is a closure so
-        # the runtime `if` sees an opaque call rather than a GTensor to thread
-        # through an scf.if yield.
-        #
-        # ``reload_parents`` and ``snapshot`` are traced flags, not runtime
-        # ones: the parent reload produces the running state, and a value
+        # reload_parents and snapshot are traced flags, not runtime ones: a value
         # defined inside an scf.if does not dominate its use after it.
-        # ``cache_idx`` is fixed for the whole kernel, so the test sits at the
-        # entry and neither traced body carries a per-token snapshot guard.
         def _do_mtp(reload_parents=False, snapshot="no"):
             if const_expr(not HOIST_ENTRY):
                 if const_expr("f32" in A_log_dtype):
@@ -939,28 +886,20 @@ def create_vk_gdr_mtp_kernel(
                             vi * WARP_TILE_K_ITERS + ki
                         ].extf(acc_vec_t)
 
-            # Each token issues the next token's reads before its own work. A
-            # token ends by storing its state, and nothing tells the compiler
-            # that store cannot land on the gate or value inputs, so a read
-            # placed where it is used cannot be hoisted over it. Taking the
-            # value reads as a group lets one wait cover the whole v loop.
-            #
-            # Depth stays at one: depth d costs
-            # `d * (2 + WARP_TILE_V_ITERS)` registers, and one token of work
-            # already covers the round trip.
             taps = entry_taps if const_expr(HOIST_ENTRY) else _taps(0)
 
             for sq_i in range_constexpr(seq_length):
-                # EAGLE tree: restart from the parent token's snapshot. Token 0
-                # has no parent and keeps the rollback state loaded above.
-                #
-                # Token 1's parent needs no read: token 0 is the only token
-                # before it and that state is still in registers, so the
-                # snapshot round trip is skipped where it returns the
-                # accumulator exactly (LOSSLESS_SNAPSHOT). Any later token can
-                # have any earlier parent, which would take a runtime test
-                # carrying the whole state out through an scf.if yield.
-                held = LOSSLESS_SNAPSHOT and sq_i == 1
+                # Token 1's parent is token 0, still in registers; any later
+                # token's parent is only known at runtime.
+                held = reload_parents and sq_i == 1
+                if const_expr(held and not LOSSLESS_SNAPSHOT):
+                    snap_vec_t = T.vec(
+                        VALUES_PER_THREAD_K, get_dtype_in_kernel(inter_dtype)
+                    )
+                    for si in range_constexpr(WARP_TILE_V_ITERS * WARP_TILE_K_ITERS):
+                        state_vecs[si] = (
+                            state_vecs[si].truncf(snap_vec_t).extf(acc_vec_t)
+                        )
                 if const_expr(reload_parents and sq_i != 0 and not held):
                     parent_step = fx.Int32(
                         parent_tensor[
@@ -991,9 +930,7 @@ def create_vk_gdr_mtp_kernel(
                 x = r_a + r_dt_bias
                 beta_x = softplus_beta_ * x
 
-                # softplus with the large-x identity: for beta_x > threshold,
-                # softplus(x) == x. Both arms are computed and the overflowing
-                # one discarded.
+                # For beta_x > threshold, softplus(x) == x; both arms run and one is dropped.
                 softplus_big = inv_softplus_beta_ * _fast_log1p(_fast_exp(beta_x))
                 softplus_x = (beta_x <= softplus_threshold_).select(softplus_big, x)
 
@@ -1011,12 +948,8 @@ def create_vk_gdr_mtp_kernel(
                 scale_vec = fx.Vector.filled(VALUES_PER_THREAD_K, scale, fx.Float32)
 
                 if const_expr(STATE_REGS >= VGPR_PER_WAVE_AT_4):
-                    # Only where the state already fills the register file: the
-                    # gate arithmetic and the L2-norm reduction are kept from
-                    # interleaving, whose register cost decides whether a
-                    # fourth wave stays resident. The mask exempts every memory
-                    # class, so the load pipeline that limits this kernel keeps
-                    # its freedom and only the arithmetic is held.
+                    # Only the arithmetic is held; the mask exempts every
+                    # memory class.
                     rocdl.sched_barrier(
                         "all_vmem|vmem_read|vmem_write|all_ds|ds_read|ds_write"
                     )
@@ -1135,16 +1068,13 @@ def create_vk_gdr_mtp_kernel(
 
                     sum_hq = sum_hq.to(fx_dtype_)
 
-                    # Only k-vec lane 0 writes the q output; closure keeps the
-                    # GTensor store opaque to the runtime-if state analysis.
+                    # Closure keeps the store opaque to the runtime-if state analysis.
                     def _write_q(_sum_hq=sum_hq, _gv=global_v_i, _sq=sq_i):
                         out_tensor[b_i, _sq, hv_i, _gv] = _sum_hq
 
                     if warp_k_vec_start == 0:
                         _write_q()
 
-                # Per-token record: without it a later rejection has nothing to
-                # roll back to.
                 if const_expr(CHAIN):
                     write_slot = token_slots[sq_i]
                     write_view = _state_at(write_slot)
@@ -1167,7 +1097,14 @@ def create_vk_gdr_mtp_kernel(
                         _checkpoint()
 
                 if const_expr(snapshot != "no"):
-                    snap_view = _inter_at(cache_idx, sq_i)
+                    # The tree rereads a step when it walks to a child; nothing
+                    # descends from the last.
+                    keeps_reading = reload_parents and sq_i != seq_length - 1
+                    snap_view = _inter_at(
+                        cache_idx,
+                        sq_i,
+                        cache_modifier=0 if keeps_reading else NT_STORE,
+                    )
                     inter_vec_t = T.vec(
                         VALUES_PER_THREAD_K, get_dtype_in_kernel(inter_dtype)
                     )
@@ -1192,9 +1129,7 @@ def create_vk_gdr_mtp_kernel(
                         if cache_idx >= 0:
                             _snapshot()
 
-            # The chain's last token already checkpointed into its own slot, so
-            # only the snapshot mode has a final store left, and a verify pass
-            # asks for it to be suppressed.
+            # The chain's last token already checkpointed into its own slot.
             if const_expr(SNAPSHOT and not NO_STATE_WRITE):
                 write_view = _state_at(read_slot)
                 for vi in range_constexpr(WARP_TILE_V_ITERS):
@@ -1212,10 +1147,7 @@ def create_vk_gdr_mtp_kernel(
                             VALUES_PER_THREAD_K,
                         )
 
-        # One entry test per traced body, flat rather than nested, so no scf.if
-        # has to carry a value out of itself. The tree's two arms are
-        # complementary: with a snapshot slot a sequence reloads its parents,
-        # without one it has nothing to reload and nothing to record.
+        # Flat rather than nested, so no scf.if carries a value out of itself.
         if const_expr(TREE):
             if (read_slot >= MIN_LIVE_SLOT) & (cache_idx >= 0):
                 _do_mtp(reload_parents=True, snapshot="always")

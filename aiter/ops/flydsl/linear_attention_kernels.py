@@ -524,8 +524,6 @@ def _flydsl_gdr_mtp_sglang_supported(
             return False
         if intermediate_states_buffer.dtype not in _SUPPORTED_STATE_DTYPES:
             return False
-        # The snapshot reuses the state's lane count, so a wider element asks
-        # for a store the buffer ops cannot express.
         if intermediate_states_buffer.dtype.itemsize > state.dtype.itemsize:
             return False
         if intermediate_states_buffer.shape[1] < query.shape[1]:
@@ -626,7 +624,6 @@ def _mtp_launch(
         num_v_heads,
         head_k_dim,
         head_v_dim,
-        query.device,
         _mtp_variant(mode, has_tree),
     )
 
