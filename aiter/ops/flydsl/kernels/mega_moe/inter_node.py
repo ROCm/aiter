@@ -46,6 +46,7 @@ class MegaMoEInterNodeBackend:
         self.epr = self.experts // self.world_size
         self.topk = int(topk)
         self.mtpr = int(max_tok_per_rank)
+        self.capacity_mtpr = 1 << (self.mtpr - 1).bit_length()
         self.dev = torch.device("cuda", torch.cuda.current_device())
         self.w1 = w1
         self.w1_scale = w1_scale
@@ -65,7 +66,7 @@ class MegaMoEInterNodeBackend:
             hidden_dim=self.model_dim,
             scale_dim=self.model_dim // 32,
             scale_type_size=1,
-            max_num_inp_token_per_rank=self.mtpr,
+            max_num_inp_token_per_rank=self.capacity_mtpr,
             num_experts_per_rank=self.epr,
             num_experts_per_token=self.topk,
             max_token_type_size=2,

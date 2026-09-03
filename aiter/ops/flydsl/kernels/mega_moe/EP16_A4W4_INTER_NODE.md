@@ -95,3 +95,29 @@ EP16 路径。当前 token=2048 行改为已验证支持 EP 的
 100 次取末 20 次时，BS128 的 MoE 从 313.0 us 降到 258.7 us；但由于同一个
 `max_tok_per_rank=128` 实例始终使用 token=2048 配置，小 batch 的 MoE 反而变慢。
 后续应让配置选择依据本轮有效接收规模，而不是固定接收 buffer 容量。
+
+尝试按 DSV4 的 3072 intermediate shape 使用
+`flydsl_mxmoe_g1_a4w4_128x256x256` 与
+`flydsl_moe2_layout_afp4_wfp4_bf16_t64x256x256_atomic_sbm128`。配置能够命中，
+但前者的 output-aux sorting 不支持 EP `expert_mask`；将全局 expert id 预映射为
+local/fake id 并移除 mask 后仍触发 GPU `SIGABRT`。因此在不修改 fused_moe/sorting
+实现的前提下，该 GEMM1 系列不能安全用于当前 MORI EP16 路径，工作树已恢复到
+上述通过精度验证的 `flydsl_moe1_afp4_*` 安全组合。
+
+MORI arena 的 `max_num_inp_token_per_rank` 对非 2 次幂容量存在截断风险；backend
+现在内部向上取整容量，同时仍按调用方给出的 `max_tok_per_rank` 检查逻辑输入上限。
+BS96 修复后每 rank 正确接收 1536 条 route，relL2=0.069804。
+
+按单 BS 构造实例后的当前配置与 20 次/末 10 次初筛结果如下：
+
+| BS | tune token | MoE fallback | MoE tuned |
+|---:|---:|---:|---:|
+| 16 | 256 | 220.0 us | 192.3 us |
+| 32 | 512 | 231.7 us | 218.5 us |
+| 64 | 1024 | 246.5 us | 243.9 us |
+| 96 | 2048 | 298.3 us | 237.4 us |
+| 128 | 2048 | 307.2 us | 302.0 us |
+
+BS96/128 共享 padded token=2048 key，当前共同配置采用 M32；它同时优于两者的
+fallback。若只偏向 BS128，M64 配置可到约 254.5--258.7 us，但会使 BS96 回退到
+约 376--381 us。各档精度均通过，relL2 约 0.0698--0.06994。

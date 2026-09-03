@@ -395,6 +395,39 @@ def test_fmoe(
     if ref_dtype == "fp32":
         stage1_ref_dtype = dtypes.fp32
 
+    if kernel_bench:
+        fused_kwargs = {
+            "w1_scale": w1_scale_aiter, "w2_scale": w2_scale_aiter,
+            "quant_type": qType, "activation": actType,
+            "doweight_stage1": doweight_stage1,
+            "intermediate_pad": intermediate_pad, "hidden_pad": hidden_pad,
+            "bias1": exp_bias1_aiter, "bias2": exp_bias2_aiter,
+            "swiglu_limit": swiglu_limit, "beta": beta,
+            "linear_beta": linear_beta, "gate_mode": gateMode,
+        }
+        kernel_bench_callable = []
+        aiter.fused_moe.kernel_bench_callable = kernel_bench_callable
+        try:
+            fused_moe(
+                input, w1_qt_aiter, w2_qt_aiter, topk_weights, topk_ids,
+                **fused_kwargs,
+            )
+        finally:
+            aiter.fused_moe.kernel_bench_callable = None
+        kernel_us = {}
+        for name, call in kernel_bench_callable:
+            _, elapsed_us = run_perftest(call, num_iters=20, num_warmup=3)
+            kernel_us[name] = elapsed_us
+        us1 = kernel_us.get("stage1")
+        us2_stage = kernel_us.get("stage2")
+        logger.info(
+            "kernel_bench: stage1=%s us, stage2=%s us (quant:%s)",
+            "n/a" if us1 is None else f"{us1:.2f}",
+            "n/a" if us2_stage is None else f"{us2_stage:.2f}", AQDType,
+        )
+        return {"us": (us1 or 0.0) + (us2_stage or 0.0),
+                "us_stage1": us1, "us_stage2": us2_stage}
+
     out1_ref = torch_moe_stage1(
         a1_qt,
         w1_qt,
