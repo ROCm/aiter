@@ -800,6 +800,9 @@ def _grouped_a8w4_tdm_moe(
             "route_max_m": int(max_m),
         }
     else:
+        # _align_m, not tile_m: gemm2 may tile M more coarsely than gemm1, and a
+        # start aligned only to tile_m would let a gemm2 tile cross an expert
+        # boundary (see the divisibility check above).
         _starts, psum, _ = contiguous_psum_remap(
             _masked_m,
             topids_to_rows,
