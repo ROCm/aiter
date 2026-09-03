@@ -1421,6 +1421,12 @@ def contiguous_psum_remap(
             stream=torch.cuda.current_stream(),
         )
         return starts, psum, contiguous_m_t
+    from aiter.ops.flydsl.kernels.moe_contiguous_psum import MAX_REMAP_EXPERTS
+
+    assert experts <= MAX_REMAP_EXPERTS, (
+        f"contiguous_psum_remap holds one start per expert in LDS: "
+        f"experts={experts} exceeds MAX_REMAP_EXPERTS={MAX_REMAP_EXPERTS}"
+    )
     launch = _get_compiled_contiguous_psum_remap()
     launch(
         ptr_arg(masked_m_i32),

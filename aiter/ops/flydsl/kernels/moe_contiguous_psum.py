@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""DeepGEMM-contiguous M-tile prefix sum (FlyDSL), single-block parallel scan.
+"""DeepGEMM-contiguous M-tile prefix sum (FlyDSL).
 
 Computes tile-aligned exclusive prefix sum of per-expert counts for the
-contiguous grouped-GEMM scheduler. Single-block parallel scan replaces
-torch.cumsum (avoids rocprim trampoline overhead for small E).
+contiguous grouped-GEMM scheduler. The parallel scan replaces torch.cumsum
+(avoids rocprim trampoline overhead for small E).
 
 The block is ``MAX_EXPERTS_PER_BLOCK`` threads wide but E is not bounded by it:
 the scan sweeps the experts in block-sized chunks and carries the running offset
@@ -27,11 +27,18 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
 
 MAX_EXPERTS_PER_BLOCK = 512
 
-# The ep_rowmap remap+scatter is grid-strided across this many blocks. Each block
-# re-derives the tiny per-expert prefix sum in LDS (barrier-free across blocks), so
-# no cross-block sync is needed. Sized to fill the 256-CU gfx1250; the grid-stride
-# loop stays correct for any token count.
-EP_REMAP_NBLK = 256
+# The row remap is grid-strided across this many blocks. Each block re-derives the
+# tiny per-expert prefix sum in LDS (barrier-free across blocks), so no cross-block
+# sync is needed. Sized to fill the 256-CU gfx1250; the grid-stride loop stays
+# correct for any token count. Shared by the plain and the ep_rowmap remap.
+REMAP_NBLK = 256
+EP_REMAP_NBLK = REMAP_NBLK
+
+# Widest E the remap can serve: it keeps one exclusive start per expert in LDS so
+# the scatter never reads them back from global. The bound is LDS, not the
+# 512-lane scan -- the scan already sweeps E in chunks. 2048 starts cost 8KB of
+# the 320KB budget, against Kimi-K3's E=896 as the widest routed MoE we ship.
+MAX_REMAP_EXPERTS = 2048
 
 
 @fx.struct
@@ -73,6 +80,22 @@ class _PsumRemapEpStorage:
 
     lds0: fx.Array[fx.Int32, MAX_EXPERTS_PER_BLOCK, 16]
     lds1: fx.Array[fx.Int32, MAX_EXPERTS_PER_BLOCK, 16]
+
+
+@fx.struct
+class _PsumRemapStorage:
+    """LDS for the grid-strided remap kernel.
+
+    The ping-pong buffers and ``carry`` are the chunked scan's, as in
+    :class:`_PsumStorage`. ``starts`` is what lets the blocks stay independent:
+    each one keeps the full exclusive-start table, so the remap resolves
+    ``starts[expert]`` from LDS and never waits on another block's scan.
+    """
+
+    lds0: fx.Array[fx.Int32, MAX_EXPERTS_PER_BLOCK, 16]
+    lds1: fx.Array[fx.Int32, MAX_EXPERTS_PER_BLOCK, 16]
+    carry: fx.Array[fx.Int32, 1, 16]
+    starts: fx.Array[fx.Int32, MAX_REMAP_EXPERTS, 16]
 
 
 # The chunked scan below is written out in both kernels rather than shared:
@@ -202,7 +225,17 @@ def build_moe_contiguous_psum_module():
 
 
 def build_moe_contiguous_psum_remap_module():
-    """JIT launcher: contiguous psum + in-place masked-to-contiguous row remap."""
+    """JIT launcher: contiguous psum + in-place masked-to-contiguous row remap.
+
+    The scan spans E and costs nothing; the remap walks every route. Running both
+    in one workgroup would pin the remap to a single CU, so instead every block
+    re-runs the scan into its own LDS start table and the remap is grid-strided
+    over ``REMAP_NBLK`` blocks -- reading starts from LDS is what keeps the blocks
+    independent. Only block 0 writes the global starts/psum/contiguous_m.
+
+    Requires ``experts <= MAX_REMAP_EXPERTS`` (the LDS table); the scan itself is
+    chunked, so it is not bounded by ``MAX_EXPERTS_PER_BLOCK``.
+    """
 
     @flyc.kernel(
         name="moe_contiguous_psum_remap",
@@ -218,18 +251,20 @@ def build_moe_contiguous_psum_remap_module():
         experts: Int32,
         route_max_m: Int32,
         tile_m: Int32,
-        num_valid_routes: fx.Pointer,  # (1,) int32: only remap routes < this (EP dead-tail skip)
+        num_valid_routes: fx.Pointer,
     ):
-        # Uint32: every value here is a non-negative count/index, so `<`, `>=`
-        # and `//` lower to ult/uge/divui rather than their signed forms.
         tid = fx.Uint32(fx.thread_idx.x)
+        bid = fx.Uint32(fx.block_idx.x)
+        gtid = bid * MAX_EXPERTS_PER_BLOCK + tid
+        is_blk0 = bid == fx.Uint32(0)
         tile_v = fx.Uint32(tile_m)
         tile_minus_1 = tile_v - 1
 
-        lds = fx.SharedAllocator().allocate(_PsumStorage).peek()
+        lds = fx.SharedAllocator().allocate(_PsumRemapStorage).peek()
         lds0 = lds.lds0.ptr
         lds1 = lds.lds1.ptr
         carry = lds.carry.ptr
+        starts_lds = lds.starts.ptr
 
         m_p = ptr_buf_tensor(masked_m)
         rows_p = ptr_buf_tensor(topids_to_rows)
@@ -243,6 +278,7 @@ def build_moe_contiguous_psum_remap_module():
         gpu.barrier()
 
         # Chunked scan; see psum_kernel for why E is swept in block-sized chunks.
+        # Every block runs it, and each chunk's starts also land in the LDS table.
         for base in range(0, experts, MAX_EXPERTS_PER_BLOCK):
             e = fx.Uint32(base) + tid
             in_expert = e < fx.Uint32(experts)
@@ -273,8 +309,12 @@ def build_moe_contiguous_psum_remap_module():
                 if is_not_first:
                     excl = src[tid - 1]
                 start = excl + base_off
-                s_p[e] = start
-                p_p[e] = start + fx.Int32(m_e)
+                starts_lds[e] = start
+                # One block owns the global outputs; the other 255 only need the
+                # LDS table, and duplicate stores would just burn bandwidth.
+                if is_blk0:
+                    s_p[e] = start
+                    p_p[e] = start + fx.Int32(m_e)
 
             # Fold this chunk's total in before the next one overwrites lds0.
             chunk_total = src[MAX_EXPERTS_PER_BLOCK - 1]
@@ -283,38 +323,38 @@ def build_moe_contiguous_psum_remap_module():
                 carry[0] = base_off + chunk_total
             gpu.barrier()
 
-        if is_lane0:
+        if is_blk0 & is_lane0:
             total = carry[0]
             gt = total > fx.Int32(tile_v)
             c_p[0] = gt.select(total, tile_v)
 
         gpu.barrier()
 
-        # Only remap valid routes ([0, valid_route_count)); dead-tail routes
-        # hold unwritten/garbage rows from the route kernel and must NOT be used
-        # as a row index (would OOB-read starts[expert]). They are never read
-        # downstream. When truncation is disabled the caller passes a null pointer
-        # instead of a (1,) tensor, so the load must not run unconditionally.
+        # Only remap valid routes ([0, valid_route_count)); dead-tail routes hold
+        # unwritten rows from the route kernel and must not be used as a row index.
+        # When truncation is disabled the caller passes a null pointer instead of a
+        # (1,) tensor, so the load must not run unconditionally.
         num_valid_routes_is_set = fx.Int64(ptrtoint(num_valid_routes)) != 0
         valid_route_count = fx.Uint32(numel)
         if num_valid_routes_is_set:
             valid_route_count = fx.Uint32(
                 ptr_buf_tensor(num_valid_routes)[fx.Uint32(0)]
             )
-        for route_i32 in range(tid, valid_route_count, MAX_EXPERTS_PER_BLOCK):
-            row_raw = rows_p[route_i32]
+        for route in range(
+            gtid, valid_route_count, REMAP_NBLK * MAX_EXPERTS_PER_BLOCK
+        ):
+            row_raw = rows_p[route]
             # An EP route with no grouped row carries the negative
             # DROPPED_ROUTE_ROW sentinel: the row math would turn it into a wild
-            # expert index (OOB starts[] read), and downstream consumers check for
-            # the sentinel, so leave the slot untouched.
+            # expert index, and downstream consumers check for the sentinel, so
+            # leave the slot untouched.
             row_is_mapped = fx.Int32(row_raw) >= fx.Int32(0)
             if row_is_mapped:
                 row = fx.Uint32(row_raw)
                 m = fx.Uint32(route_max_m)
                 expert = row // m
                 slot = row - expert * m
-                start = fx.Uint32(s_p[expert])
-                rows_p[route_i32] = start + slot
+                rows_p[route] = fx.Uint32(starts_lds[expert]) + slot
 
     @flyc.jit
     def launch_psum_remap(
@@ -342,7 +382,7 @@ def build_moe_contiguous_psum_remap_module():
             tile_m,
             num_valid_routes,
         ).launch(
-            grid=(1, 1, 1),
+            grid=(REMAP_NBLK, 1, 1),
             block=(MAX_EXPERTS_PER_BLOCK, 1, 1),
             stream=stream,
         )
