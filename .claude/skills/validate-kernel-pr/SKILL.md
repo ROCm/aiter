@@ -418,8 +418,9 @@ variant to be a declared axis or a captured shape-local; see [Not implemented ye
 ### 7 — `index_width_scan` (informational)
 
 Runs `scan_index_width.py` over the diff and records the count of index×stride multiplies that
-carry no 64-bit widening. Candidates, not verdicts — the reviewer judges each. See
-[Why this stage exists](#why-the-index-width-scan-is-a-separate-stage).
+carry no 64-bit widening. Candidates, not verdicts — see
+[Reading the index-width candidates](#reading-the-index-width-candidates) for how to judge one,
+and do not let the count stand in for that judgement in either direction.
 
 ### 8 — `perf`
 
@@ -515,10 +516,10 @@ These are fields, not prose, so a report cannot overclaim by omission:
   environment; before this, every token in the calling shell was readable from `os.environ`
   inside the code under review — and reached a stage log the moment a target printed its
   environment. The report lists the variable names that were passed through.
-- **The process exit code comes from this run.** It is read from a verdict file written
-  inside the run's own `$WORK`, and `--out` is deleted at startup. Deriving it by re-reading
-  `--out` made a previous run's report a fallback source of truth: a run that died before
-  `finish_report` exited on the *earlier* run's verdict.
+- **The process exit code comes from this run.** It is read from a verdict file inside the run's
+  own working directory, and the report path is deleted at startup. Deriving the exit code by
+  re-reading the report made a previous run's file a fallback source of truth: a run that died
+  before finishing exited on the *earlier* run's verdict.
 - **`degraded_mode`** — `NO_GPU` when no device was claimable; required stages then make the
   verdict `INCONCLUSIVE`.
 - **Every declared stage exists.** A stage that did not run is an object with `status: skip` and
@@ -535,27 +536,21 @@ These are fields, not prose, so a report cannot overclaim by omission:
 
 ---
 
-## Why the index-width scan is a separate stage
+## Reading the index-width candidates
 
-Rule `D9` in `review-pr` covers 32-bit overflow in pointer arithmetic. Its original trigger was
-a list of variable names (`token_id`, `seq_start`, `batch_offset`, `total_tokens`). Real defects
-used other names, so the rule stayed silent:
+The scan reports index×stride multiplies added by the diff that carry no 64-bit widening. They are
+**candidates, not verdicts**, and the count alone means nothing — the same expression is a defect
+at one deployment scale and correct at another.
 
-| defect | expression | consequence |
-|---|---|---|
-| aiter#1674 | `stride_out_batch` not `tl.int64` | output offset wraps at large MTP batch; tail rows keep stale sparse-KV indices |
-| aiter#1674 | `block_id * stride` with no `.to(int64)` | every block past INT32_MAX returns logits of exactly 0.0, silently |
-| aiter#3541 | `ArithValue(physical_block) * stride` | wraps on a ~150M-row KV pool; the wrapped offset still lands inside the allocation, so no fault |
+So judge each one against `production_scale.md`, which holds the numbers the diff does not contain.
+A candidate is a defect only if you can name a shape that reaches it and show the product exceeding
+2^31 there. If the scale table cannot settle it, say the candidate is unresolved rather than
+guessing in either direction — and note that the table's first three rows are in-sample, drawn from
+the problem statements of the fix PRs that supplied the defect labels, so they demonstrate the
+arithmetic is decidable without establishing that it generalizes.
 
-The scan is D9's structural pre-filter instead — an index-shaped value multiplied by a
-stride-shaped value on a line with no widening — and is deliberately noisy in the safe
-direction. Its candidate count is deterministic and informational; production scale still
-determines whether a candidate is a defect.
-
-```bash
-.claude/skills/validate-kernel-pr/scan_index_width.py ROCm/aiter 1674
-.claude/skills/validate-kernel-pr/scan_index_width.py --diff /tmp/pr.diff
-```
+`scan_index_width.py`'s docstring carries why the scanner exists and why its trigger is structural
+rather than a list of variable names.
 
 ---
 
@@ -564,27 +559,20 @@ determines whether a candidate is a defect.
 Deliberately absent rather than half-built — everything shipped here has been observed failing on
 a seeded defect, and these have not been:
 
-- **PR fetch orchestration.** There is no `--pr N`. The caller creates the worktree, as above.
-  Choosing the right `--target` from a diff is the unsolved part; an irrelevant target can
-  still produce `PASS`. The report names the target so a reviewer can reject that evidence, but
-  the executor cannot decide relevance itself.
-- **External grid adapters.** Three channels now exist — `--shape-env`, `--shape-arg`, and
-  `--shape-argnames` for pytest parametrization — and between them they reach the great majority
-  of aiter's `op_tests`. What remains unreachable is a target whose shapes are none of those: a
-  parametrized case whose single parameter is a **dict or object** rather than scalar cells, and
-  a target that takes its shapes from a file or a fixture. The validator still does not accept an
-  independently hashed `--extra-target`, because that harness would have to be bound without
-  changing the PR diff hash or live-base identity. Such runs remain `INCONCLUSIVE`, and
-  `test_selection.grid_channel_reason` says which of these applies.
-- **External grid adapters.** A target that exposes no shape channel at all — neither an env var
-  for `--shape-env`, a CLI flag for `--shape-arg`, nor a flag for `--axis` — still cannot be given
-  a grid. The validator
-  does not accept an independently hashed `--extra-target`, because that harness must be bound
-  without changing the PR diff hash or live-base identity. Such runs remain `INCONCLUSIVE`.
-- **Axes on the env-var and pytest channels.** `--axis` reaches script targets through argv only.
-  A pytest target's extra knobs are `parametrize` argnames, which needs a different injector, and
-  an env-var channel has no per-axis spelling to prove. Requesting an axis on either is
-  `axis_state: unusable` with the reason, never a silent drop.
+- **Target relevance.** Nothing checks that the target you chose exercises the diff. An irrelevant
+  target can still produce `PASS`, and the only guard is that the report names it so a reviewer can
+  reject the evidence. This is the load-bearing judgement in the whole skill and it is entirely
+  yours.
+- **External grid adapters.** The three channels reach the great majority of aiter's `op_tests`;
+  what stays unreachable is a target whose shapes are none of them — a parametrized case whose
+  parameter is a **dict or object** rather than scalar cells, and a target taking shapes from a
+  file or a fixture. Supplying a separate harness of our own is not the answer either: it would
+  have to be bound without changing the PR's diff hash or its live-base identity. Such runs stay
+  `INCONCLUSIVE`, and the reason says which case applied.
+- **Axes on the env-var and pytest channels.** An axis rides argv, so it reaches script targets
+  only. A pytest target's extra knobs are `parametrize` argnames, needing a different injector,
+  and an env-var channel has no per-axis spelling to prove against. Requesting an axis on either
+  is `unusable` **with the reason**, never a silent drop.
 - **Variant attestation.** A receipt proves the route ran; it cannot say which kernel variant
   the route selected. Until a variant is either a declared axis or a captured shape-local, a
   report covering a module with N registered variants covers the ones its inputs happen to
@@ -641,6 +629,14 @@ The replay fails unless the control is `PASS`, the tail-mask and vector-index mu
 
 ## Adding a stage
 
-A new stage must be able to **fail on a seeded defect**. Before adding one, seed the defect it is
-meant to catch, confirm the stage goes red and the clean baseline stays green, and record both in
-the PR. A stage that has never been observed failing is not a check — it is decoration.
+A new stage must be able to **fail on a seeded defect**. Seed the defect it is meant to catch,
+confirm the stage goes red *and* that the clean baseline stays green, and put both runs in the PR.
+Only the pair is evidence: red on a seeded defect could be a stage that is red on everything. A
+stage never observed failing is not a check, it is decoration.
+
+Then decide where it belongs, which is the same question this file keeps asking. If the stage is a
+**judgement** — reading a diff, weighing whether something is a defect at this scale — it is prose
+here, and its output is a finding you record with a reason. If it is a **ledger entry** — did this
+run, what did it exit with — it is a command, and it must be declared so that `finish` requires it.
+An undeclared stage is one nobody notices the absence of, which is exactly how a report comes to
+overclaim by omission.
