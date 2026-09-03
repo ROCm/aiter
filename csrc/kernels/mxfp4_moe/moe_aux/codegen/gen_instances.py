@@ -15,6 +15,7 @@ SHAPES = [
     (384, 7168, 512, 8),  # Kimi-K2 TP=4, TOPK=8 (kimik2_a)
     (385, 7168, 256, 9),  # Kimi-K2.5 D_INTER=256 (kimik2_b)
     (32, 7168, 2048, 8),  # dsv3_a
+    (33, 7168, 2048, 8),  # dsv3_a shared-expert variant
     (256, 3072, 1536, 8),  # minimax_a (H=3072)
     (256, 3072, 768, 8),  # minimax_b (H=3072)
     (512, 4096, 256, 10),  # qwen35_397b (H=4096, TOPK=10)
