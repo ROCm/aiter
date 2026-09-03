@@ -82,26 +82,32 @@ class FusedA2AIntraNodeOp:
         self.shape = tuple(shape)
         self.dtype = dtype
         self.peer_numel = numel // world_size
-        self.outputs = tuple(
-            mori_shmem_create_tensor((numel,), dtype) for _ in range(3)
+        self.outputs_sets = tuple(
+            tuple(mori_shmem_create_tensor((numel,), dtype) for _ in range(3))
+            for _ in range(2)
         )
-        self.output = self.outputs[0]
+        self.output = self.outputs_sets[0][0]
         self.xdb_mem = mori_shmem_create_tensor((world_size,), torch.int64)
-        for output in self.outputs:
-            output.zero_()
+        for outputs in self.outputs_sets:
+            for output in outputs:
+                output.zero_()
         self.xdb_mem.zero_()
         self.xdb_flag = torch.ones(1, dtype=torch.int64, device=self.output.device)
         self.grid_barrier = torch.zeros(1, dtype=torch.int32, device=self.output.device)
 
         ms.shmem_barrier_all()
-        self.p2p_outputs = tuple(
-            _build_p2p_table(output, rank, world_size, self.output.device)
-            for output in self.outputs
+        self.p2p_outputs_sets = tuple(
+            tuple(
+                _build_p2p_table(output, rank, world_size, self.output.device)
+                for output in outputs
+            )
+            for outputs in self.outputs_sets
         )
         self.p2p_xdb_mem = _build_p2p_table(
             self.xdb_mem, rank, world_size, self.output.device
         )
         ms.shmem_barrier_all()
+        self._epoch = 0
 
         self._launch = make_fused_a2a_jit(
             rank=rank,
@@ -156,6 +162,8 @@ class FusedA2AIntraNodeOp:
         else:
             norm_q = norm_k = cos = sin = q
 
+        parity = self._epoch % 2
+        outputs = self.outputs_sets[parity]
         stream = Stream(torch.cuda.current_stream() if stream is None else stream)
         args = (
             *(input.data_ptr() for input in inputs),
@@ -163,7 +171,7 @@ class FusedA2AIntraNodeOp:
             norm_k.data_ptr(),
             cos.data_ptr(),
             sin.data_ptr(),
-            *(table.data_ptr() for table in self.p2p_outputs),
+            *(table.data_ptr() for table in self.p2p_outputs_sets[parity]),
             self.xdb_mem.data_ptr(),
             self.p2p_xdb_mem.data_ptr(),
             self.xdb_flag.data_ptr(),
@@ -178,7 +186,8 @@ class FusedA2AIntraNodeOp:
             )
         else:
             self._compiled(*args)
-        return self.outputs
+        self._epoch += 1
+        return outputs
 
 
 class FusedA2AOutIntraNodeOp:
@@ -216,21 +225,27 @@ class FusedA2AOutIntraNodeOp:
             numel *= dim
         self.shape = tuple(shape)
         self.dtype = dtype
-        self.output = mori_shmem_create_tensor((numel,), dtype)
+        self.outputs = tuple(
+            mori_shmem_create_tensor((numel,), dtype) for _ in range(2)
+        )
+        self.output = self.outputs[0]
         self.xdb_mem = mori_shmem_create_tensor((world_size,), torch.int64)
-        self.output.zero_()
+        for output in self.outputs:
+            output.zero_()
         self.xdb_mem.zero_()
         self.xdb_flag = torch.ones(1, dtype=torch.int64, device=self.output.device)
         self.grid_barrier = torch.zeros(1, dtype=torch.int32, device=self.output.device)
 
         ms.shmem_barrier_all()
-        self.p2p_output = _build_p2p_table(
-            self.output, rank, world_size, self.output.device
+        self.p2p_outputs = tuple(
+            _build_p2p_table(output, rank, world_size, self.output.device)
+            for output in self.outputs
         )
         self.p2p_xdb_mem = _build_p2p_table(
             self.xdb_mem, rank, world_size, self.output.device
         )
         ms.shmem_barrier_all()
+        self._epoch = 0
 
         self._launch = make_fused_a2a_out_jit(
             rank=rank,
@@ -252,10 +267,12 @@ class FusedA2AOutIntraNodeOp:
         if not input.is_cuda or not input.is_contiguous():
             raise ValueError("input must be a contiguous CUDA tensor")
 
+        parity = self._epoch % 2
+        output = self.outputs[parity]
         stream = Stream(torch.cuda.current_stream() if stream is None else stream)
         args = (
             input.data_ptr(),
-            self.p2p_output.data_ptr(),
+            self.p2p_outputs[parity].data_ptr(),
             self.xdb_mem.data_ptr(),
             self.p2p_xdb_mem.data_ptr(),
             self.xdb_flag.data_ptr(),
@@ -270,4 +287,5 @@ class FusedA2AOutIntraNodeOp:
             )
         else:
             self._compiled(*args)
-        return self.output
+        self._epoch += 1
+        return output
