@@ -79,7 +79,51 @@ def _torch_ref(A: torch.Tensor, B: torch.Tensor, out_dtype):
     return torch.bmm(A.float(), B.float().transpose(-1, -2)).to(out_dtype)
 
 
-def _make_b(batch: int, N: int, K: int) -> torch.Tensor:
+# --------------------------------------------------------------------------- #
+# Data initialization (bf16 operands) + seed
+# --------------------------------------------------------------------------- #
+DATA_INITS = ("zero", "constant", "uniform", "norm")
+
+
+def _make_generator(seed):
+    """Seeded CUDA generator, or None for the default (unseeded) RNG.
+
+    A fixed seed reproduces both operands bit-for-bit; None keeps the previous
+    behavior where every call draws fresh values.
+    """
+    if seed is None:
+        return None
+    return torch.Generator(device="cuda").manual_seed(int(seed))
+
+
+def _make_tensor(shape, dist="norm", gen=None, const_val=1.0):
+    """Build a bf16 operand under the requested distribution.
+
+    zero     : all zeros
+    constant : filled with ``const_val``
+    uniform  : U(-1, 1)
+    norm     : N(0, 1)   [default; matches the original torch.randn path]
+
+    ``gen`` seeds the sampled dists (uniform/norm); zero/constant ignore it.
+    """
+    if dist == "zero":
+        return torch.zeros(shape, device="cuda", dtype=torch.bfloat16)
+    if dist == "constant":
+        return torch.full(shape, const_val, device="cuda", dtype=torch.bfloat16)
+    if dist == "uniform":
+        return torch.empty(shape, device="cuda", dtype=torch.bfloat16).uniform_(
+            -1.0, 1.0, generator=gen
+        )
+    if dist == "norm":
+        return torch.empty(shape, device="cuda", dtype=torch.bfloat16).normal_(
+            0.0, 1.0, generator=gen
+        )
+    raise ValueError(f"data-init {dist!r}; choose from {DATA_INITS}")
+
+
+def _make_b(
+    batch: int, N: int, K: int, dist: str = "norm", gen=None, const_val: float = 1.0
+) -> torch.Tensor:
     """Build a B that gemm_a16w16_opus accepts for both batch=1 and batch>1.
 
     The wrapper rejects 2D B + batch>1 because the opus launcher hardcodes
@@ -87,19 +131,61 @@ def _make_b(batch: int, N: int, K: int) -> torch.Tensor:
     common "shared weight across batch" case, materialize an explicit
     `[batch, N, K]` tensor via the contiguous broadcast pattern.
     """
-    B2D = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
+    B2D = _make_tensor((N, K), dist, gen, const_val)
     if batch == 1:
         return B2D
     return B2D.unsqueeze(0).expand(batch, -1, -1).contiguous()
 
 
+def _make_a(
+    batch: int, M: int, K: int, dist: str = "norm", gen=None, const_val: float = 1.0
+) -> torch.Tensor:
+    """Build the [batch, M, K] bf16 activation under the requested dist."""
+    return _make_tensor((batch, M, K), dist, gen, const_val)
+
+
+# --------------------------------------------------------------------------- #
+# FLOPS + Bandwidth
+# --------------------------------------------------------------------------- #
+def _tflops(batch, M, N, K, us):
+    """GEMM TFLOPS (2*b*M*N*K FLOP) from microseconds (None-safe)."""
+    return (2.0 * batch * M * N * K / us / 1e6) if us else None
+
+
+def _tbs(batch, M, N, K, us, out_bytes=2):
+    """Operand traffic in TB/s (None-safe).
+
+    Bytes moved = A[b,M,K]@bf16 + B@bf16 + out[b,M,N]@out_bytes. B is read once
+    per batch when materialized (batch>1) and once as a shared weight (batch=1).
+    bytes / (us*1e-6) / 1e12 == bytes / us / 1e6.
+    """
+    if not us:
+        return None
+    a = batch * M * K * 2
+    b = (batch * N * K if batch > 1 else N * K) * 2
+    o = batch * M * N * out_bytes
+    return (a + b + o) / us / 1e6
+
+
 def test_a16w16(
-    batch: int, M: int, N: int, K: int, out_dtype=torch.bfloat16, use_graph=False
+    batch: int,
+    M: int,
+    N: int,
+    K: int,
+    out_dtype=torch.bfloat16,
+    use_graph=False,
+    *,
+    dist="norm",
+    gen=None,
+    const_val=1.0,
+    iters=101,
+    warmup=2,
+    rotate=0,
 ):
     # gemm_a16w16_opus accepts either 2D or 3D A; test 3D to exercise the
     # batched reshape path. B is 2D when batch==1, 3D contiguous otherwise.
-    A = torch.randn(batch, M, K, device="cuda", dtype=torch.bfloat16)
-    B = _make_b(batch, N, K)
+    A = _make_a(batch, M, K, dist, gen, const_val)
+    B = _make_b(batch, N, K, dist, gen, const_val)
 
     ref = _torch_ref(A, B, out_dtype)
 
@@ -110,6 +196,9 @@ def test_a16w16(
         None,
         out_dtype,
         testGraph=use_graph,
+        num_iters=iters,
+        num_warmup=warmup,
+        num_rotate_args=rotate,
     )
 
     err = checkAllclose(
@@ -119,11 +208,11 @@ def test_a16w16(
         rtol=0.1,
         atol=0.5,
     )
-    flops = 2.0 * batch * M * N * K
-    tflops = flops / us / 1e6
+    tflops = _tflops(batch, M, N, K, us)
+    tbs = _tbs(batch, M, N, K, us, out_bytes=Y.element_size())
     print(
         f"[a16w16] batch={batch} M={M} N={N} K={K} dtype={out_dtype} "
-        f"| {us:.1f}us | {tflops:.2f} TFLOPs | err={err}"
+        f"| {us:.1f}us | {tflops:.2f} TFLOPs | {tbs:.3f} TB/s | err={err}"
     )
     return err
 
@@ -171,11 +260,17 @@ def load_opus_shapes(csv_path, gfx, N=None, K=None):
     sub = sub.sort_values("M").drop_duplicates(subset="M", keep="first")
     rows = []
     for _, r in sub.iterrows():
+        # splitK may be blank/NaN in some rows; keep it as an int when present.
+        try:
+            splitk = int(r["splitK"]) if not pd.isna(r.get("splitK")) else None
+        except (KeyError, ValueError, TypeError):
+            splitk = None
         rows.append(
             {
                 "M": int(r["M"]),
                 "csv_us": float(r["us"]),
                 "kernelName": str(r.get("kernelName", "")),
+                "splitK": splitk,
             }
         )
     return rows
@@ -188,6 +283,13 @@ def test_opus_shapes_graph(
     K=7168,
     batch=1,
     out_dtype=torch.bfloat16,
+    *,
+    dist="norm",
+    gen=None,
+    const_val=1.0,
+    iters=101,
+    warmup=2,
+    rotate=0,
 ):
     """CUDA-graph-mode opus_gemm sweep with golden check.
 
@@ -209,13 +311,16 @@ def test_opus_shapes_graph(
 
     passed = failed = 0
     perf_rows = []
+    out_bytes = torch.empty((), dtype=out_dtype).element_size()
     for r in rows:
         M = r["M"]
         csv_us = r["csv_us"]
+        kid = r.get("kernelName") or ""
+        splitk = r.get("splitK")
         tag = f"a16w16-graph b={batch} M={M} N={N} K={K}"
         try:
-            A = torch.randn(batch, M, K, device="cuda", dtype=torch.bfloat16)
-            B = _make_b(batch, N, K)
+            A = _make_a(batch, M, K, dist, gen, const_val)
+            B = _make_b(batch, N, K, dist, gen, const_val)
             ref = _torch_ref(A, B, out_dtype)
             # opus split-K workspace must be grown on the capture stream before
             # run_perftest's graph mode captures this shape.
@@ -227,57 +332,94 @@ def test_opus_shapes_graph(
                 None,
                 out_dtype,
                 testGraph=True,
+                num_iters=iters,
+                num_warmup=warmup,
+                num_rotate_args=rotate,
             )
             err = checkAllclose(Y, ref, msg=tag, rtol=0.1, atol=0.5)
-            tflops = 2.0 * batch * M * N * K / us / 1e6
+            tflops = _tflops(batch, M, N, K, us)
+            tbs = _tbs(batch, M, N, K, us, out_bytes=out_bytes)
             # Ratio of measured graph latency to the tuned CSV reference.
             ratio = (us / csv_us) if csv_us else float("nan")
+            splitk_str = "" if splitk in (None, "") else str(splitk)
             print(
                 f"[PASS] {tag} | {us:.1f}us (csv {csv_us:.1f}us, "
-                f"{ratio:.2f}x) | {tflops:.2f} TFLOPs | err={err}"
+                f"{ratio:.2f}x) | {tflops:.2f} TFLOPs | {tbs:.3f} TB/s | err={err} "
+                f"| splitK={splitk_str or '-'} | kid={kid or '-'}"
             )
-            perf_rows.append((M, us, csv_us, ratio))
+            perf_rows.append((M, us, csv_us, ratio, tflops, tbs, splitk, kid))
             passed += 1
         except Exception as e:  # noqa: BLE001
             print(f"[FAIL] {tag} | {type(e).__name__}: {e}")
             failed += 1
 
     if perf_rows:
-        print(f"\n{'-' * 64}")
+        print(f"\n{'-' * 88}")
         print(f"latency vs tuned CSV [{gfx}] N={N} K={K} batch={batch}")
-        print(f"{'-' * 64}")
-        print(f"{'M':>6} | {'graph us':>10} | {'csv us':>10} | {'ratio':>7} | note")
-        for M, us, csv_us, ratio in perf_rows:
+        print(f"{'-' * 88}")
+        print(
+            f"{'M':>6} | {'graph us':>10} | {'csv us':>10} | {'ratio':>7} | "
+            f"{'TFLOPs':>9} | {'TB/s':>7} | {'splitK':>6} | note | kernel(kid)"
+        )
+        for M, us, csv_us, ratio, tflops, tbs, splitk, kid in perf_rows:
             # >20% slower than the tuned reference is flagged for a closer look.
             note = "" if ratio <= 1.20 else "SLOW >1.20x"
-            print(f"{M:>6} | {us:>10.2f} | {csv_us:>10.2f} | {ratio:>6.2f}x | {note}")
+            splitk_str = "-" if splitk in (None, "") else str(splitk)
+            print(
+                f"{M:>6} | {us:>10.2f} | {csv_us:>10.2f} | {ratio:>6.2f}x | "
+                f"{tflops:>9.2f} | {tbs:>7.3f} | {splitk_str:>6} | "
+                f"{note or '':<10} | {kid or '-'}"
+            )
 
     print(f"\nSummary: {passed} passed, {failed} failed out of {len(rows)}")
     return failed == 0
 
 
-def test_a16w16_csv_sweep(csv_path: str, batch: int = 1):
+def test_a16w16_csv_sweep(
+    csv_path: str,
+    batch: int = 1,
+    *,
+    out_dtype=torch.bfloat16,
+    dist="norm",
+    gen=None,
+    const_val=1.0,
+    iters=101,
+    warmup=2,
+    rotate=0,
+    use_graph=False,
+):
     shapes = load_shapes_from_csv(csv_path)
     print(f"\n{'=' * 80}")
     print(f"a16w16 sweep from {csv_path}: {len(shapes)} unique shapes, batch={batch}")
     print("=" * 80)
     passed = failed = 0
+    out_bytes = torch.empty((), dtype=out_dtype).element_size()
     for M, N, K in shapes:
         tag = f"a16w16 b={batch} M={M} N={N} K={K}"
         try:
-            A = torch.randn(batch, M, K, device="cuda", dtype=torch.bfloat16)
-            B = _make_b(batch, N, K)
-            ref = _torch_ref(A, B, torch.bfloat16)
+            A = _make_a(batch, M, K, dist, gen, const_val)
+            B = _make_b(batch, N, K, dist, gen, const_val)
+            ref = _torch_ref(A, B, out_dtype)
+            if use_graph:
+                _prewarm_opus_graph_workspace(A, B, out_dtype)
             Y, us = run_perftest(
                 gemm_a16w16_opus,
                 A,
                 B,
                 None,
-                torch.bfloat16,
+                out_dtype,
+                testGraph=use_graph,
+                num_iters=iters,
+                num_warmup=warmup,
+                num_rotate_args=rotate,
             )
             err = checkAllclose(Y, ref, msg=tag, rtol=0.1, atol=0.5)
-            tflops = 2.0 * batch * M * N * K / us / 1e6
-            print(f"[PASS] {tag} | {us:.1f}us | {tflops:.2f} TFLOPs | err={err}")
+            tflops = _tflops(batch, M, N, K, us)
+            tbs = _tbs(batch, M, N, K, us, out_bytes=out_bytes)
+            print(
+                f"[PASS] {tag} | {us:.1f}us | {tflops:.2f} TFLOPs | "
+                f"{tbs:.3f} TB/s | err={err}"
+            )
             passed += 1
         except Exception as e:  # noqa: BLE001
             print(f"[FAIL] {tag} | {type(e).__name__}: {e}")
@@ -358,9 +500,62 @@ if __name__ == "__main__":
         action="store_true",
         help="Use CUDA-graph mode for the single-shape / --csv_file paths too.",
     )
+    # --- warmup / iteration controls ---
+    parser.add_argument(
+        "--iters",
+        type=int,
+        default=101,
+        help="Timed iterations passed to run_perftest (default: 101).",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=2,
+        help="Warmup iterations passed to run_perftest (default: 2).",
+    )
+    # --- rotating tensors ---
+    parser.add_argument(
+        "--rotate",
+        type=int,
+        default=0,
+        help=(
+            "num_rotate_args for run_perftest: number of rotated input copies "
+            "used to defeat L2 caching. 0 (default) lets the framework auto-size "
+            "the rotation from the L2 cache; 1 disables rotation."
+        ),
+    )
+    # --- data initialization + seed ---
+    parser.add_argument(
+        "--data-init",
+        type=str,
+        default="norm",
+        choices=list(DATA_INITS),
+        help="Operand init distribution: zero/constant/uniform/norm (default: norm).",
+    )
+    parser.add_argument(
+        "--const-val",
+        type=float,
+        default=1.0,
+        help="Fill value used by --data-init constant (default: 1.0).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="RNG seed; fixed => bit-identical operands. Unset => fresh each run.",
+    )
     args = parser.parse_args()
 
     out_dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
+    gen = _make_generator(args.seed)
+    init_kwargs = dict(
+        dist=args.data_init,
+        gen=gen,
+        const_val=args.const_val,
+        iters=args.iters,
+        warmup=args.warmup,
+        rotate=args.rotate,
+    )
 
     # Default action (no -m and no --csv_file): auto-sweep the opus shapes in
     # CUDA-graph mode and print the vs-CSV latency table. So a bare
@@ -377,10 +572,17 @@ if __name__ == "__main__":
             K=args.k if args.k is not None else 7168,
             batch=batch,
             out_dtype=out_dtype,
+            **init_kwargs,
         )
         sys.exit(0 if ok else 1)
     elif args.csv_file is not None:
-        test_a16w16_csv_sweep(args.csv_file, batch=(args.batch or 8))
+        test_a16w16_csv_sweep(
+            args.csv_file,
+            batch=(args.batch or 8),
+            out_dtype=out_dtype,
+            use_graph=args.graph,
+            **init_kwargs,
+        )
     else:
         # Clamp K>=128 so every kid the heuristic picks has K>=B_K (smallest is 128).
         k_eff = max(args.k if args.k is not None else 256, 128)
@@ -391,4 +593,5 @@ if __name__ == "__main__":
             k_eff,
             out_dtype=out_dtype,
             use_graph=args.graph,
+            **init_kwargs,
         )
