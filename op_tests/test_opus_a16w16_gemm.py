@@ -27,7 +27,14 @@ if not _arch_ok:
     sys.exit(0)
 
 from aiter.ops.opus import gemm_a16w16_opus
-from aiter.test_common import checkAllclose, run_perftest
+from aiter.test_common import (
+    DATA_DISTS,
+    add_data_init_args,
+    checkAllclose,
+    fill,
+    make_generator,
+    run_perftest,
+)
 
 try:
     from aiter.ops.opus import opus_gemm_workspace_init
@@ -82,18 +89,10 @@ def _torch_ref(A: torch.Tensor, B: torch.Tensor, out_dtype):
 # --------------------------------------------------------------------------- #
 # Data initialization (bf16 operands) + seed
 # --------------------------------------------------------------------------- #
-DATA_INITS = ("zero", "constant", "uniform", "norm")
-
-
-def _make_generator(seed):
-    """Seeded CUDA generator, or None for the default (unseeded) RNG.
-
-    A fixed seed reproduces both operands bit-for-bit; None keeps the previous
-    behavior where every call draws fresh values.
-    """
-    if seed is None:
-        return None
-    return torch.Generator(device="cuda").manual_seed(int(seed))
+# The distributions and the seeded generator come from aiter.test_common (the
+# shared data-init API); a16w16 only needs bf16 DATA operands, so it wraps
+# ``fill`` and reuses ``make_generator`` / ``add_data_init_args`` verbatim.
+DATA_INITS = DATA_DISTS
 
 
 def _make_tensor(shape, dist="norm", gen=None, const_val=1.0):
@@ -104,21 +103,19 @@ def _make_tensor(shape, dist="norm", gen=None, const_val=1.0):
     uniform  : U(-1, 1)
     norm     : N(0, 1)   [default; matches the original torch.randn path]
 
-    ``gen`` seeds the sampled dists (uniform/norm); zero/constant ignore it.
+    Delegates to ``test_common.fill`` so the operand init matches every other
+    op test; ``gen`` seeds the sampled dists (uniform/norm), zero/constant
+    ignore it.
     """
-    if dist == "zero":
-        return torch.zeros(shape, device="cuda", dtype=torch.bfloat16)
-    if dist == "constant":
-        return torch.full(shape, const_val, device="cuda", dtype=torch.bfloat16)
-    if dist == "uniform":
-        return torch.empty(shape, device="cuda", dtype=torch.bfloat16).uniform_(
-            -1.0, 1.0, generator=gen
-        )
-    if dist == "norm":
-        return torch.empty(shape, device="cuda", dtype=torch.bfloat16).normal_(
-            0.0, 1.0, generator=gen
-        )
-    raise ValueError(f"data-init {dist!r}; choose from {DATA_INITS}")
+    return fill(
+        shape,
+        dist,
+        gen,
+        dtype=torch.bfloat16,
+        device="cuda",
+        uniform=(-1.0, 1.0),
+        constant=const_val,
+    )
 
 
 def _make_b(
@@ -524,32 +521,26 @@ if __name__ == "__main__":
             "the rotation from the L2 cache; 1 disables rotation."
         ),
     )
-    # --- data initialization + seed ---
-    parser.add_argument(
-        "--data-init",
-        type=str,
-        default="norm",
-        choices=list(DATA_INITS),
-        help="Operand init distribution: zero/constant/uniform/norm (default: norm).",
-    )
+    # --- data initialization + seed (shared aiter.test_common API) ---
+    # add_data_init_args attaches --data-init / --scale-init / --seed; a16w16
+    # has no scale operand, so --scale-init is accepted but unused. Default the
+    # DATA dist to norm to preserve the original torch.randn init.
+    add_data_init_args(parser, default_dist="norm")
     parser.add_argument(
         "--const-val",
         type=float,
         default=1.0,
         help="Fill value used by --data-init constant (default: 1.0).",
     )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="RNG seed; fixed => bit-identical operands. Unset => fresh each run.",
-    )
     args = parser.parse_args()
 
     out_dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
-    gen = _make_generator(args.seed)
+    gen = make_generator(args.seed)
+    # add_data_init_args makes --data-init a list (nargs="*"); a16w16 sweeps a
+    # single operand dist, so take the first entry.
+    data_init = args.data_init[0] if isinstance(args.data_init, list) else args.data_init
     init_kwargs = {
-        "dist": args.data_init,
+        "dist": data_init,
         "gen": gen,
         "const_val": args.const_val,
         "iters": args.iters,
