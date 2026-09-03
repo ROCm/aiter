@@ -114,7 +114,7 @@ def _na3d_flash_fwd(
 
     t_ws = tl.minimum(tl.maximum(prog_t - KT // 2, 0), T - KT)  # scalar
     h_ws = tl.minimum(tl.maximum(prog_h - KH // 2, 0), H - KH)  # scalar
-    w_lo = tl.min(tl.where(q_mask, q_w_ws, 999999))
+    w_lo = tl.min(tl.where(q_mask, q_w_ws, W))
 
     hd_offs = tl.arange(0, HD)
     kv_offs = tl.arange(0, BLOCK_KV)
