@@ -107,27 +107,60 @@ def get_gfx_runtime() -> str:
     return gfx_arch
 
 
-@functools.lru_cache(maxsize=1)
-def get_asic_revision() -> int:
-    """Silicon stepping of the live GPU: 0=A0, 1=B0, 2=C0, ...
-
-    Parsed from rocminfo (same source as get_gfx_runtime) so it stays stable
-    across ROCm releases and always reflects the actual running GPU.
-    """
+def _current_hip_device() -> int:
+    """Current HIP device index (honours HIP_VISIBLE_DEVICES / set_device)."""
     try:
-        rocminfo = executable_path("rocminfo")
-        result = subprocess.run([rocminfo], capture_output=True, text=True, check=True)
-        in_gpu = False
-        for line in result.stdout.splitlines():
-            if re.search(r"Name:\s*gfx", line):
-                in_gpu = True
-            elif in_gpu:
-                match = re.search(r"ASIC Revision:\s*(\d+)", line)
-                if match:
-                    return int(match.group(1))
-    except Exception as e:
-        raise RuntimeError(f"Get ASIC revision from rocminfo failed: {e}") from e
-    raise RuntimeError("No ASIC Revision found in rocminfo output.")
+        import torch
+
+        if torch.cuda.is_available():
+            return torch.cuda.current_device()
+    except Exception:  # noqa: BLE001
+        return 0
+    return 0
+
+
+def _asic_revision_via_hip(device_id: int) -> int:
+    # CDLL(None): resolve HIP symbols already loaded by torch, not by soname
+    # (libamdhip64.so isn't under /opt/rocm in a torch-wheel container).
+    # 10012 = hipDeviceAttributeAsicRevision on the ROCm 7.x line aiter targets.
+    import ctypes
+
+    import torch  # noqa: F401  ensure HIP is loaded into the process
+
+    lib = ctypes.CDLL(None)
+    rev = ctypes.c_int(-1)
+    hipDeviceAttributeAsicRevision = 10012
+    err = lib.hipDeviceGetAttribute(
+        ctypes.byref(rev), hipDeviceAttributeAsicRevision, int(device_id)
+    )
+    if err != 0:
+        raise RuntimeError(f"hipDeviceGetAttribute(AsicRevision) failed: {err}")
+    return rev.value
+
+
+def _asic_revision_via_torch(device_id: int) -> int | None:
+    # Version-proof if torch ever exposes asicRevision; None otherwise.
+    try:
+        import torch
+
+        rev = getattr(torch.cuda.get_device_properties(device_id), "asicRevision", None)
+        return None if rev is None else int(rev)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+@functools.cache
+def _asic_revision_cached(device_id: int) -> int:
+    rev = _asic_revision_via_torch(device_id)
+    return rev if rev is not None else _asic_revision_via_hip(device_id)
+
+
+def get_asic_revision() -> int:
+    """Stepping of the current HIP device via HIP (not rocminfo): 0=A0, 1=B0, ...
+
+    Raises on total failure so the asm gate can fail closed.
+    """
+    return _asic_revision_cached(_current_hip_device())
 
 
 # Backfill map for legacy tuned configs that predate the `gfx` column.
