@@ -1,11 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-import contextlib
-
 import torch
 import triton
 import triton.language as tl
-from triton import knobs
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.amd import warp_pipeline_stage
@@ -17,22 +14,6 @@ from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
-
-
-@contextlib.contextmanager
-def _scalarize_packed_fops(enable):
-    # knobs.* is global; guard mutation so concurrent launches/compilations can't see a transient value.
-    import threading
-
-    if not hasattr(_scalarize_packed_fops, "_lock"):
-        _scalarize_packed_fops._lock = threading.Lock()
-    with _scalarize_packed_fops._lock:
-        saved = knobs.amd.scalarize_packed_fops
-        knobs.amd.scalarize_packed_fops = enable
-        try:
-            yield
-        finally:
-            knobs.amd.scalarize_packed_fops = saved
 
 
 # log(2)
@@ -300,6 +281,7 @@ def _generic_dma(
     ACTUAL_HEAD_DIM: gl.constexpr,
     PADDED_HEAD: gl.constexpr,
     MASKED_BLOCKS: gl.constexpr,
+    USE_INT64_STRIDES: gl.constexpr,
 ):
     """Stage tile ``blk`` of K and V into LDS slot ``slot`` for the generic loop.
 
@@ -308,8 +290,11 @@ def _generic_dma(
     which is a property of the tensor rather than of the block.
     """
     start_n = blk * BLOCK_N
+    if USE_INT64_STRIDES:
+        start_n = start_n.to(tl.int64)
     k_ptr = k_base + start_n * stride_kn
     v_ptr = v_base + start_n * stride_vn
+    start_n = blk * BLOCK_N  # back to i32 for the masks below
     if MASKED_BLOCKS > 0:
         if blk >= n_full_blocks:
             _dma(
@@ -424,6 +409,9 @@ def _pipe_tile(
 # Kernel
 # ---------------------------------------------------------------------------
 
+# Perf note: splitting the packed f32 ops into scalar ones lets the halves fill
+# the MFMA shadows to co-exec with MFMA inst, which is worth a few percent (4~6%).
+# Export AMDGCN_SCALARIZE_PACKED_FOPS=1 to turn it on.
 
 _mha_fwd_gluon_kernel_repr = make_kernel_repr(
     "_mha_fwd_gluon_kernel",
@@ -436,6 +424,7 @@ _mha_fwd_gluon_kernel_repr = make_kernel_repr(
         "SEQLEN_Q",
         "SEQLEN_K",
         "DTYPE",
+        "USE_INT64_STRIDES",
     ],
 )
 
@@ -478,6 +467,7 @@ def _mha_fwd_gluon_kernel(
     PIPELINED: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
+    USE_INT64_STRIDES: gl.constexpr,
 ):
     # ---------------- layouts ----------------
     num_warps: gl.constexpr = gl.num_warps()
@@ -592,14 +582,23 @@ def _mha_fwd_gluon_kernel(
 
     # ---------------- program ids ----------------
     start_m = gl.program_id(0)
-    off_h_q = gl.program_id(1)
-    off_z = gl.program_id(2)
+    off_h_q_32 = gl.program_id(1)
+    off_z_32 = gl.program_id(2)
     GROUP_SIZE: gl.constexpr = HQ // HK
-    off_h_k = off_h_q // GROUP_SIZE
+    off_h_k_32 = off_h_q_32 // GROUP_SIZE
 
     gl.assume(start_m >= 0)
-    gl.assume(off_h_q >= 0)
-    gl.assume(off_z >= 0)
+    gl.assume(off_h_q_32 >= 0)
+    gl.assume(off_z_32 >= 0)
+
+    if USE_INT64_STRIDES:
+        off_z = off_z_32.to(tl.int64)
+        off_h_q = off_h_q_32.to(tl.int64)
+        off_h_k = off_h_k_32.to(tl.int64)
+    else:
+        off_z = off_z_32
+        off_h_q = off_h_q_32
+        off_h_k = off_h_k_32
 
     # ---------------- how many KV blocks does this workgroup touch? ----------------
     n_blocks = gl.cdiv(SEQLEN_K, BLOCK_N)
@@ -682,8 +681,12 @@ def _mha_fwd_gluon_kernel(
     v_offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, v_async_layout))
     v_offs_d = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, v_async_layout))
     v_off = v_offs_n[:, None] * stride_vn + v_offs_d[None, :] * stride_vk
-    kt_step = BLOCK_N * stride_kn
-    v_step = BLOCK_N * stride_vn
+    if USE_INT64_STRIDES:
+        kt_step = BLOCK_N * stride_kn.to(tl.int64)
+        v_step = BLOCK_N * stride_vn.to(tl.int64)
+    else:
+        kt_step = BLOCK_N * stride_kn
+        v_step = BLOCK_N * stride_vn
 
     if PADDED_HEAD:
         # buffer_load_to_shared broadcasts the mask against the offsets, so a mask
@@ -949,6 +952,7 @@ def _mha_fwd_gluon_kernel(
             ACTUAL_HEAD_DIM,
             PADDED_HEAD,
             MASKED_BLOCKS,
+            USE_INT64_STRIDES,
         )
 
         for blk in range(tail_start, n_blocks):
@@ -979,6 +983,7 @@ def _mha_fwd_gluon_kernel(
                 ACTUAL_HEAD_DIM,
                 PADDED_HEAD,
                 MASKED_BLOCKS,
+                USE_INT64_STRIDES,
             )
             cdna4_async.wait_group(2)  # this tile's K and V have landed
 
@@ -1171,6 +1176,21 @@ def get_seqlens_from_layout(q, k, layout):
     return q.shape[seq_dim], k.shape[seq_dim]
 
 
+def _needs_int64_strides(*tensors):
+    """Check if the base-pointer offsets need 64-bit arithmetic for these tensors"""
+    limit = 2**31 - 1
+    return any(
+        sum((t.shape[d] - 1) * t.stride(d) for d in range(t.dim())) > limit
+        for t in tensors
+    )
+
+
+def _buffer_offset_fits_int32(rows, cols, stride_row, stride_col, elem_bits=_ELEM_BITS):
+    """Check if a 2-D voffset pattern fit a buffer op's 32-bit offset field"""
+    span = (rows - 1) * stride_row + (cols - 1) * stride_col
+    return span * (elem_bits // 8) <= 2**31 - 1
+
+
 def is_mha_gluon_avail(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1197,6 +1217,9 @@ def is_mha_gluon_avail(
     if v.shape[-1] != head_dim or head_dim > 256 or head_dim % 16 != 0:
         return False
 
+    if any(t.stride(-1) != 1 for t in (q, k, v)):
+        return False
+
     _, hq, hk, _ = get_shape_from_layout(q, k, layout)
     sq, sk = get_seqlens_from_layout(q, k, layout)
     if hq % hk != 0:
@@ -1205,6 +1228,16 @@ def is_mha_gluon_avail(
     block_m, block_n, num_warps = _tile(causal)
     padded_head_dim, block_n = _pick_tile(head_dim, block_n, num_warps)
     if not dma_layouts_ok(padded_head_dim, block_n, num_warps, _ELEM_BITS):
+        return False
+
+    # buffer_load uses scalar base + 32-bit offsets, out of range addressing will be rejected.
+    q_st, k_st, v_st, _ = get_strides_from_layout(q, k, v, q, layout)
+    padded_sq = triton.cdiv(sq, block_m) * block_m
+    if not (
+        _buffer_offset_fits_int32(padded_sq, padded_head_dim, q_st[2], q_st[3])
+        and _buffer_offset_fits_int32(padded_head_dim, block_n, k_st[3], k_st[2])
+        and _buffer_offset_fits_int32(block_n, padded_head_dim, v_st[2], v_st[3])
+    ):
         return False
 
     if causal:
@@ -1249,9 +1282,7 @@ def mha_fwd_gluon(
     padded_head_dim, block_n = _pick_tile(head_dim, block_n, num_warps)
     fits = _fits_arch_vgprs(padded_head_dim, block_m, block_n, num_warps)
     pipelined = fits and _use_pipeline(sq, sk, block_m, block_n, causal)
-    # Only the rotated loop has MFMA shadows for the split scalars to hide in, and
-    # only an unpadded head dim keeps the extra mask/zeroing work out of the way.
-    scalarize = fits and padded_head_dim == head_dim
+    use_int64 = _needs_int64_strides(q, k, v, out)
 
     lse = torch.empty((batch, hq, sq), device=q.device, dtype=torch.float32)
     q_st, k_st, v_st, o_st = strides
@@ -1262,34 +1293,34 @@ def mha_fwd_gluon(
     )
 
     grid = (triton.cdiv(sq, block_m), hq, batch)
-    with _scalarize_packed_fops(scalarize):
-        _mha_fwd_gluon_kernel[grid](
-            q,
-            k,
-            v,
-            out,
-            lse,
-            *q_st,
-            *k_st,
-            *v_st,
-            *o_st,
-            SM_SCALE=softmax_scale,
-            HQ=hq,
-            HK=hk,
-            SEQLEN_Q=sq,
-            SEQLEN_K=sk,
-            ACTUAL_HEAD_DIM=head_dim,
-            HEAD_DIM=padded_head_dim,
-            IS_CAUSAL=causal,
-            WRITE_LSE=True,
-            DEAD_ROW_LSE=dead_row_lse,
-            DTYPE=_gl_dtype(q.dtype),
-            SCALE_ON_Q=True,
-            PIPELINED=pipelined,
-            BLOCK_M=block_m,
-            BLOCK_N=block_n,
-            num_warps=num_warps,
-            waves_per_eu=2 if fits else 1,
-            llvm_fn_attrs=_LLVM_FN_ATTRS if fits else (),
-        )
+    _mha_fwd_gluon_kernel[grid](
+        q,
+        k,
+        v,
+        out,
+        lse,
+        *q_st,
+        *k_st,
+        *v_st,
+        *o_st,
+        SM_SCALE=softmax_scale,
+        HQ=hq,
+        HK=hk,
+        SEQLEN_Q=sq,
+        SEQLEN_K=sk,
+        ACTUAL_HEAD_DIM=head_dim,
+        HEAD_DIM=padded_head_dim,
+        IS_CAUSAL=causal,
+        WRITE_LSE=True,
+        DEAD_ROW_LSE=dead_row_lse,
+        DTYPE=_gl_dtype(q.dtype),
+        SCALE_ON_Q=True,
+        PIPELINED=pipelined,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        USE_INT64_STRIDES=use_int64,
+        num_warps=num_warps,
+        waves_per_eu=2 if fits else 1,
+        llvm_fn_attrs=_LLVM_FN_ATTRS if fits else (),
+    )
     return out, lse
