@@ -761,7 +761,6 @@ def main():
             "num_iters",
             "test_graph",
             "num_rotate",
-            "cluster",
         ],
         errors="ignore",
     )
