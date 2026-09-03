@@ -202,16 +202,8 @@ JSON="$WORK/report.json"
 PROBE_DIR="$WORK/probe"
 PROBE_MODULE="validation_probe_${RANDOM}_${RANDOM}"
 mkdir -p "$PROBE_DIR"
-python3 - "$LABEL" "$JSON" <<'PY'
-import json
-import sys
-
-json.dump(
-    {"label": sys.argv[1], "stages": {}, "findings": []},
-    open(sys.argv[2], "w"),
-    indent=2,
-)
-PY
+REPORT_TOOL="$SCRIPT_DIR/report.py"
+python3 "$REPORT_TOOL" init "$JSON" "$LABEL"
 
 jset_json() {
   python3 - "$JSON" "$1" "$2" <<'PY'
@@ -329,79 +321,7 @@ PY
 }
 
 finish_report() {
-  python3 - "$JSON" "$OUT" <<'PY'
-import datetime
-import json
-import pathlib
-import shutil
-import sys
-
-source, output = sys.argv[1:3]
-data = json.load(open(source))
-required_stages = (
-    "merge_sim",
-    "gpu_claim",
-    "runtime_compat",
-    "test_policy",
-    "baseline_control",
-    "correctness_repo_tests",
-    "correctness_s1_grid",
-    "execution_receipt",
-    "index_width_scan",
-)
-for name in required_stages:
-    if name not in data["stages"]:
-        data["stages"][name] = {
-            "status": "skip",
-            "note": "validator internal error: stage did not record a result",
-        }
-        data["findings"].append(
-            {
-                "severity": "note",
-                "stage": name,
-                "detail": "stage result was missing; validation is inconclusive",
-            }
-        )
-
-severities = {finding["severity"] for finding in data["findings"]}
-complete = (
-    isinstance(data.get("runtime_identity"), dict)
-    and bool(data["runtime_identity"].get("module_path"))
-    and data["stages"]["merge_sim"]["status"] == "pass"
-    and data["stages"]["gpu_claim"]["status"] == "pass"
-    and data["stages"]["runtime_compat"]["status"] == "pass"
-    and data["stages"]["test_policy"]["status"] == "pass"
-    and data["stages"]["baseline_control"]["status"] == "pass"
-    and data["stages"]["correctness_repo_tests"]["status"] == "pass"
-    and data["stages"]["correctness_s1_grid"]["status"] == "pass"
-    and data["stages"]["execution_receipt"]["status"] == "pass"
-    and data["stages"]["index_width_scan"]["status"] == "info"
-)
-if "blocker" in severities:
-    verdict = "BLOCK"
-elif "should-fix" in severities:
-    verdict = "NEEDS_WORK"
-elif not complete:
-    verdict = "INCONCLUSIVE"
-else:
-    verdict = "PASS"
-data["verdict"] = verdict
-data["process_exit_code"] = (
-    0 if verdict == "PASS" else (2 if verdict == "INCONCLUSIVE" else 1)
-)
-data["finished_utc"] = datetime.datetime.now(datetime.timezone.utc).strftime(
-    "%Y-%m-%dT%H:%M:%SZ"
-)
-json.dump(data, open(source, "w"), indent=2)
-shutil.copyfile(source, output)
-# The exit code is derived from THIS run's verdict, recorded here, next to the write that
-# earned it. Reading it back out of `--out` made the caller's exit status depend on a file
-# any earlier run could have left behind.
-pathlib.Path(source).with_name("verdict").write_text(verdict + "\n")
-print(f"verdict={verdict}  findings={len(data['findings'])}  -> {output}")
-for item in data["findings"]:
-    print(f"  [{item['severity']}] {item['stage']}: {item['detail'][:150]}")
-PY
+  python3 "$REPORT_TOOL" finish "$JSON" "$OUT"
 }
 
 # Two independent facts about the supplied worktree:
