@@ -419,9 +419,7 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assert_complete_stage_objects(report)
 
     def test_no_gpu_withholds_correctness_from_a_target_that_needs_a_device(self):
-        patch = self.fixture.make_patch(
-            self.gpu_requiring_change, "needs-device.patch"
-        )
+        patch = self.fixture.make_patch(self.gpu_requiring_change, "needs-device.patch")
         no_gpu_picker = self.fixture.tools / "no-gpu-picker"
         write_executable(no_gpu_picker, "#!/usr/bin/env bash\nexit 1\n")
 
@@ -472,7 +470,7 @@ class ValidateKernelPrTests(unittest.TestCase):
     def test_new_failing_test_is_not_mislabeled_preexisting(self):
         def add_failing_test(repo):
             (repo / "tests" / "test_new.py").write_text(
-                "def test_new():\n" "    assert False, 'candidate failure'\n"
+                "def test_new():\n    assert False, 'candidate failure'\n"
             )
 
         patch = self.fixture.make_patch(add_failing_test, "new-test.patch")
@@ -552,7 +550,7 @@ class ValidateKernelPrTests(unittest.TestCase):
     def test_target_without_entry_point_is_skipped(self):
         def add_library_only_target(repo):
             (repo / "tests" / "kernel_helpers.py").write_text(
-                "def verify_kernel():\n" "    return True\n"
+                "def verify_kernel():\n    return True\n"
             )
 
         patch = self.fixture.make_patch(
@@ -999,9 +997,7 @@ class ValidateKernelPrTests(unittest.TestCase):
         # the request survives, and it distinguishes a validator limit from a target
         # property.
         self.assertEqual("", report["test_selection"]["grid_channel"])
-        self.assertIn(
-            "--shapes", report["test_selection"]["grid_channel_reason"]
-        )
+        self.assertIn("--shapes", report["test_selection"]["grid_channel_reason"])
 
     def bench_body(self, scale, trailer=""):
         self.fixture.add_bench_target()
@@ -1463,9 +1459,7 @@ class ValidateKernelPrTests(unittest.TestCase):
         selection = report["test_selection"]
         self.assertEqual("proven", selection["axis_state"])
         self.assertEqual("adds-coverage", stage["independence"])
-        self.assertEqual(
-            stage["independence"], selection["grid_independence"]
-        )
+        self.assertEqual(stage["independence"], selection["grid_independence"])
         self.assertEqual(
             stage["independence_reason"], selection["grid_independence_reason"]
         )
@@ -1476,9 +1470,7 @@ class ValidateKernelPrTests(unittest.TestCase):
         patch = self._axis_patch("grid-novel.patch")
         _, report = self._validate_axis_target(patch, grid_value="9,1023,f32")
 
-        self.assertEqual(
-            "adds-coverage", report["test_selection"]["grid_independence"]
-        )
+        self.assertEqual("adds-coverage", report["test_selection"]["grid_independence"])
         self.assertEqual("pass", report["stages"]["correctness_s1_grid"]["status"])
 
     def test_each_head_run_keeps_its_own_execution_receipt(self):
@@ -1503,7 +1495,9 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertIn("7,257,f32", repo_shapes)
         self.assertNotIn("9,1023,f32", repo_shapes)
         self.assertEqual({"9,1023,f32"}, grid_shapes)
-        self.assertIn("head-grid", report["stages"]["execution_receipt"]["receipt_scope"])
+        self.assertIn(
+            "head-grid", report["stages"]["execution_receipt"]["receipt_scope"]
+        )
 
     def test_an_extra_axis_reaches_a_configuration_the_shape_grid_cannot_express(self):
         # The shape channel is one ordered tuple bound to --shape-vars, so on aiter#4538 it
@@ -1674,9 +1668,7 @@ class ValidateKernelPrTests(unittest.TestCase):
         # while the reference column sits at exactly 1.0. median_ratio is the WORST column
         # by design, so the improvement is read off the kernel column itself.
         kernel_column = next(
-            stats
-            for name, stats in perf["columns"].items()
-            if "kernel" in name.lower()
+            stats for name, stats in perf["columns"].items() if "kernel" in name.lower()
         )
         self.assertGreater(kernel_column["median_ratio"], 1.5)
         self.assertGreaterEqual(perf["median_ratio"], 0.95)
@@ -1944,7 +1936,9 @@ class ValidateKernelPrTests(unittest.TestCase):
         # "Red on both sides" is an attribution, not an explanation. When the target carries
         # a structural reason the SELECTED runner cannot run it, a reader who is not told so
         # concludes the code is broken when the runner choice is.
-        patch = self._axis_patch("argv-at-import.patch", body=self.ARGV_AT_IMPORT_TARGET)
+        patch = self._axis_patch(
+            "argv-at-import.patch", body=self.ARGV_AT_IMPORT_TARGET
+        )
         _, report = self.fixture.validate(
             patch,
             tests=self.AXIS_TARGET_PATH,
@@ -1981,9 +1975,7 @@ class ValidateKernelPrTests(unittest.TestCase):
         # comparison did not happen - a statement about the target that this run never
         # established, and false here: the target declares a default for --shapes.
         self.assertEqual("unknown", selection["grid_independence"])
-        self.assertNotIn(
-            "no declared defaults", selection["grid_independence_reason"]
-        )
+        self.assertNotIn("no declared defaults", selection["grid_independence_reason"])
         # The channel this run established, named -- rather than a claim about the target.
         self.assertIn(
             "independence is only computed for the CLI-flag channel",
@@ -2101,7 +2093,11 @@ class ValidateKernelPrTests(unittest.TestCase):
         log = Path(report["stages"]["correctness_repo_tests"]["log"]).read_text()
         for canary in ("leakcanary-token", "leakcanary-key", "leakcanary-unrelated"):
             self.assertNotIn(canary, log)
-        for name in ("VALIDATOR_TEST_GITHUB_TOKEN", "MY_API_KEY", "UNRELATED_HOME_DECOR"):
+        for name in (
+            "VALIDATOR_TEST_GITHUB_TOKEN",
+            "MY_API_KEY",
+            "UNRELATED_HOME_DECOR",
+        ):
             self.assertNotIn(name, log)
         # The policy is a reported fact, not an implicit one.
         policy = report["isolation"]["target_environment"]
@@ -2128,16 +2124,28 @@ class ValidateKernelPrTests(unittest.TestCase):
         head_log = self.fixture.root / "rowkey-head.log"
         base_log.write_text(
             table.format(
-                a=10.0, b=20.0, c=40.0,
-                r1=1.11e-5, r2=2.22e-5, r3=3.33e-5,
-                s1=1.0101, s2=1.0202, s3=1.0303,
+                a=10.0,
+                b=20.0,
+                c=40.0,
+                r1=1.11e-5,
+                r2=2.22e-5,
+                r3=3.33e-5,
+                s1=1.0101,
+                s2=1.0202,
+                s3=1.0303,
             )
         )
         head_log.write_text(
             table.format(
-                a=5.0, b=10.0, c=20.0,
-                r1=1.19e-5, r2=2.28e-5, r3=3.37e-5,
-                s1=2.0404, s2=2.0505, s3=2.0606,
+                a=5.0,
+                b=10.0,
+                c=20.0,
+                r1=1.19e-5,
+                r2=2.28e-5,
+                r3=3.37e-5,
+                s1=2.0404,
+                s2=2.0505,
+                s3=2.0606,
             )
         )
 
@@ -2458,9 +2466,7 @@ class GridChannelTests(unittest.TestCase):
 
         self.assertEqual("cli", report["test_selection"]["grid_channel"])
         self.assertEqual("", report["test_selection"]["grid_channel_reason"])
-        self.assertEqual(
-            "adds-coverage", report["test_selection"]["grid_independence"]
-        )
+        self.assertEqual("adds-coverage", report["test_selection"]["grid_independence"])
         grid_stage = report["stages"]["correctness_s1_grid"]
         self.assertNotEqual("skip", grid_stage["status"])
         self.assertEqual("pass", grid_stage["status"])
@@ -2761,7 +2767,9 @@ class EvidenceCheckerTests(unittest.TestCase):
         self.assertEqual(["3,5"], result["executed_shapes"])
         self.assertIn("different vocabularies", result["shape_namespace"])
 
-    def test_a_channel_that_shares_the_receipt_namespace_still_must_contain_the_grid(self):
+    def test_a_channel_that_shares_the_receipt_namespace_still_must_contain_the_grid(
+        self,
+    ):
         """The control for the test above: without the pytest channel, nothing is relaxed.
 
         The env and CLI channels put the grid into the same vocabulary the receipt records,
@@ -3195,7 +3203,9 @@ class ShapeGridPluginTests(unittest.TestCase):
             target.write_text(target_source)
             return subprocess.run(
                 [sys.executable, "-m", "pytest", "-p", "sgp", str(target), "-q"],
-                cwd=root, capture_output=True, text=True,
+                cwd=root,
+                capture_output=True,
+                text=True,
             )
 
     def test_dict_valued_parametrize_is_refused_rather_than_poisoned(self):
@@ -3226,12 +3236,17 @@ class ShapeGridPluginTests(unittest.TestCase):
             result = subprocess.run(
                 [
                     str(VALIDATOR),
-                    "--repo", str(fixture.repo),
-                    "--target", "tests/test_sample.py",
-                    "--shape-argnames", "m",
-                    "--grid", "255,3;512,4",
+                    "--repo",
+                    str(fixture.repo),
+                    "--target",
+                    "tests/test_sample.py",
+                    "--shape-argnames",
+                    "m",
+                    "--grid",
+                    "255,3;512,4",
                 ],
-                capture_output=True, text=True,
+                capture_output=True,
+                text=True,
             )
         finally:
             fixture.close()
@@ -3318,6 +3333,141 @@ class ReviewSkillContractTests(unittest.TestCase):
             # only narrows coverage. It missed 12 of aiter's 123 op_tests/ targets, every
             # one of which does have a timing harness.
             self.assertNotIn('"run_perftest" in text', body, name)
+
+
+class ReportToolTests(unittest.TestCase):
+    """The verdict rule, exercised directly.
+
+    Reached only through a full validation run, each branch of this rule cost minutes to
+    observe, so most of them never were. These are the cases that decide whether a PASS means
+    anything.
+    """
+
+    def setUp(self):
+        sys.path.insert(0, str(SKILL_DIR))
+        self.addCleanup(sys.path.remove, str(SKILL_DIR))
+        import report
+
+        self.report = report
+        self.required = report.required_stages(REPORT_SCHEMA)
+
+    def complete_report(self):
+        return {
+            "runtime_identity": {"module_path": "/somewhere/aiter"},
+            "stages": {
+                name: {
+                    "status": report_module_status(self.report, name),
+                    "note": "recorded",
+                }
+                for name in self.required
+            },
+            "findings": [],
+        }
+
+    def test_required_stages_come_from_the_schema(self):
+        # The list existed in four copies and nothing compared them. This test is the
+        # comparison, so a stage added to the schema alone can no longer leave the verdict
+        # rule behind.
+        self.assertEqual(set(self.required), REQUIRED_STAGES)
+
+    def test_a_complete_run_passes(self):
+        self.assertEqual(
+            self.report.compute_verdict(self.complete_report(), self.required), "PASS"
+        )
+
+    def test_each_required_stage_can_withhold_a_pass(self):
+        # Asserting one stage would leave the other eight untested, which is how a term can
+        # be dropped from the rule without any test noticing.
+        for name in self.required:
+            with self.subTest(stage=name):
+                data = self.complete_report()
+                data["stages"][name] = {"status": "skip", "note": "did not run"}
+                self.assertEqual(
+                    self.report.compute_verdict(data, self.required), "INCONCLUSIVE"
+                )
+
+    def test_the_scan_passes_on_info_and_not_on_pass(self):
+        # index_width_scan is informational: it reports "info", and a "pass" there would mean
+        # some other stage had written it.
+        data = self.complete_report()
+        data["stages"]["index_width_scan"] = {"status": "pass", "note": "wrong status"}
+        self.assertEqual(
+            self.report.compute_verdict(data, self.required), "INCONCLUSIVE"
+        )
+
+    def test_a_missing_runtime_identity_withholds_a_pass(self):
+        data = self.complete_report()
+        data["runtime_identity"] = {}
+        self.assertEqual(
+            self.report.compute_verdict(data, self.required), "INCONCLUSIVE"
+        )
+
+    def test_findings_outrank_completeness(self):
+        for severity, expected in (("blocker", "BLOCK"), ("should-fix", "NEEDS_WORK")):
+            with self.subTest(severity=severity):
+                data = self.complete_report()
+                data["findings"].append(
+                    {"severity": severity, "stage": "correctness", "detail": "d"}
+                )
+                self.assertEqual(
+                    self.report.compute_verdict(data, self.required), expected
+                )
+
+    def test_a_blocker_outranks_a_should_fix(self):
+        data = self.complete_report()
+        data["findings"] = [
+            {"severity": "should-fix", "stage": "perf", "detail": "d"},
+            {"severity": "blocker", "stage": "correctness", "detail": "d"},
+        ]
+        self.assertEqual(self.report.compute_verdict(data, self.required), "BLOCK")
+
+    def test_an_absent_stage_is_recorded_as_a_skip(self):
+        # A stage that never ran and never appears reads exactly like one that passed.
+        data = {"stages": {}, "findings": []}
+        self.report.backfill_missing_stages(data, self.required)
+        self.assertEqual(set(data["stages"]), set(self.required))
+        for name in self.required:
+            self.assertEqual(data["stages"][name]["status"], "skip")
+        self.assertEqual(len(data["findings"]), len(self.required))
+
+    def test_exit_codes_follow_the_verdict(self):
+        self.assertEqual(self.report.exit_code_for("PASS"), 0)
+        self.assertEqual(self.report.exit_code_for("INCONCLUSIVE"), 2)
+        self.assertEqual(self.report.exit_code_for("BLOCK"), 1)
+        self.assertEqual(self.report.exit_code_for("NEEDS_WORK"), 1)
+
+    def test_a_schema_violation_is_detected(self):
+        # The producer never checked the schema, so this is the first thing standing between
+        # a malformed report and a consumer reading a field that is no longer written.
+        broken = {"label": "x", "stages": {}, "findings": []}
+        self.assertIsNotNone(self.report._schema_violation(broken, REPORT_SCHEMA))
+
+    def test_a_schema_violation_downgrades_a_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, out = root / "report.json", root / "out.json"
+            data = self.complete_report()
+            # Complete enough to earn PASS from the verdict rule, and nowhere near what the
+            # schema requires -- which is the combination the gate exists for.
+            source.write_text(json.dumps(data))
+            result = run(
+                [sys.executable, str(SKILL_DIR / "report.py"), "finish"]
+                + [str(source), str(out)],
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            published = json.loads(out.read_text())
+            self.assertEqual(published["verdict"], "INCONCLUSIVE")
+            self.assertEqual(published["process_exit_code"], 2)
+            self.assertEqual((root / "verdict").read_text().strip(), "INCONCLUSIVE")
+            self.assertTrue(
+                any(f["stage"] == "report" for f in published["findings"]),
+                published["findings"],
+            )
+
+
+def report_module_status(report, stage):
+    return report.SATISFYING_STATUS.get(stage, report.DEFAULT_SATISFYING_STATUS)
 
 
 if __name__ == "__main__":
