@@ -87,6 +87,38 @@ __all__ = [
 ]
 
 
+_LAZY_IMPORTS.update(
+    {
+        "ActivationSource": (".gemm_kernels", "ActivationSource"),
+        "BlockMfmaDecodeConfig": (".gemm_kernels", "BlockMfmaDecodeConfig"),
+        "ContractionMode": (".gemm_kernels", "ContractionMode"),
+        "DecodeConfig": (".gemm_kernels", "DecodeConfig"),
+        "OutputRounding": (".gemm_kernels", "OutputRounding"),
+        "ReductionMode": (".gemm_kernels", "ReductionMode"),
+        "WaveDecodeConfig": (".gemm_kernels", "WaveDecodeConfig"),
+        "compile_gemm_decode_bf16": (".gemm_kernels", "compile_gemm_decode_bf16"),
+        "flydsl_small_m_hgemm": (".gemm_kernels", "flydsl_small_m_hgemm"),
+        "gemm_decode_bf16": (".gemm_kernels", "gemm_decode_bf16"),
+        "get_decode_arch_traits": (".gemm_kernels", "get_decode_arch_traits"),
+        "iter_gemm_decode_configs": (".gemm_kernels", "iter_gemm_decode_configs"),
+    }
+)
+__all__ += [
+    "ActivationSource",
+    "BlockMfmaDecodeConfig",
+    "ContractionMode",
+    "DecodeConfig",
+    "OutputRounding",
+    "ReductionMode",
+    "WaveDecodeConfig",
+    "compile_gemm_decode_bf16",
+    "flydsl_small_m_hgemm",
+    "gemm_decode_bf16",
+    "get_decode_arch_traits",
+    "iter_gemm_decode_configs",
+]
+
+
 def __getattr__(name: str):
     try:
         module_name, attr_name = _LAZY_IMPORTS[name]

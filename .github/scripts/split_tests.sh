@@ -51,6 +51,16 @@ TEST_DIR="${TEST_DIR%/}"
 # ------------------------------
 if [[ "$TEST_TYPE" == "aiter" ]]; then
     mapfile -t ALL_FILES < <(find "$TEST_DIR" -maxdepth 1 -name 'test_*.py' -type f | LC_ALL=C sort)
+    FLYDSL_GEMM_TESTS=(
+        "op_tests/flydsl_tests/test_flydsl_decode_gemm.py"
+        "op_tests/flydsl_tests/test_flydsl_small_m_hgemm.py"
+        "op_tests/flydsl_tests/test_flydsl_preshuffle_gemm_splitk.py"
+    )
+    for test_file in "${FLYDSL_GEMM_TESTS[@]}"; do
+        if [[ -f "$test_file" ]]; then
+            ALL_FILES+=("$test_file")
+        fi
+    done
 elif [[ "$TEST_TYPE" == "triton" ]]; then
     mapfile -t ALL_FILES < <(find "$TEST_DIR" -name 'test_*.py' -type f | LC_ALL=C sort)
 fi
@@ -87,6 +97,9 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_moe_topk_gating.py]=104
     FILE_TIMES[op_tests/test_activation.py]=90
     FILE_TIMES[op_tests/test_flydsl_qk_norm_rope_quant.py]=88
+    FILE_TIMES[op_tests/flydsl_tests/test_flydsl_preshuffle_gemm_splitk.py]=60
+    FILE_TIMES[op_tests/flydsl_tests/test_flydsl_decode_gemm.py]=45
+    FILE_TIMES[op_tests/flydsl_tests/test_flydsl_small_m_hgemm.py]=30
     FILE_TIMES[op_tests/test_kvcache.py]=73
     FILE_TIMES[op_tests/test_gemm_a8w8_blockscale.py]=69
     FILE_TIMES[op_tests/test_jit_dir_with_enum.py]=69

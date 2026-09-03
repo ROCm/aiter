@@ -42,6 +42,9 @@ from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
 from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
     kernels_list_8wave as kernels_list_flydsl_8wave,
 )
+from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
+    kernels_list_splitk as kernels_list_flydsl_splitk,
+)
 
 
 def get_valid_asm_splitK_list(K: int, max_splitK: int, tile_k: int = 128):
@@ -158,9 +161,37 @@ def run_gemm_flydsl_8wave(
     return out
 
 
+def run_gemm_flydsl_splitk(x, weight_shuffle, x_scale, w_scale, out, kernel_id):
+    from aiter.ops.flydsl.kernels.preshuffle_gemm_splitk_op import (
+        flydsl_preshuffle_gemm_splitk_a8,
+    )
+
+    ki = kernels_list_flydsl_splitk[kernel_id]
+    flydsl_preshuffle_gemm_splitk_a8(
+        x,
+        weight_shuffle,
+        x_scale,
+        w_scale,
+        out,
+        ki.tile_m,
+        ki.tile_n,
+        ki.tile_k,
+        ki.split_k,
+        use_async_copy=ki.use_async_copy,
+        waves_per_eu=ki.waves_per_eu,
+        xcd_swizzle=ki.xcd_swizzle,
+        lds_stage=ki.lds_stage,
+        enable_scheduler=ki.enable_scheduler,
+        scale_mode=ki.scale_mode,
+        use_m_bounded_store=ki.use_m_bounded_store,
+    )
+    return out
+
+
 _FLYDSL_PIPELINE_RUNNERS = {
     "preshuffle": run_gemm_flydsl,
     "8wave": run_gemm_flydsl_8wave,
+    "splitk": run_gemm_flydsl_splitk,
 }
 
 # The tuner speaks torch dtypes while Pipeline.q_dtypes_w uses short names.

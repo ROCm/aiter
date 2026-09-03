@@ -19,6 +19,9 @@ from ..jit.core import (
 from ..jit.utils.chip_info import get_cu_num
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
+from ..ops.flydsl.splitk_bpreshuffle_common import (
+    dispatch_flydsl_splitk,
+)
 from ..ops.gemm_op_common import get_padded_m
 from ..utility import dtypes
 
@@ -152,6 +155,42 @@ def _parse_flydsl_kernel_name(kernel_name: str):
     return (tm, tn, tk, acp, wpe, xcd_swizzle, lds_stage, scheduler, k_split)
 
 
+_SPLITK_SCALE_MODE_FROM_CODE = {"bs": "blockscale", "mx": "mx128"}
+
+
+def _parse_flydsl_splitk_kernel_name(kernel_name: str):
+    """Parse a flydsl split-K kernelName into (tile_m, tile_n, tile_k, split_k,
+    async_copy, waves_per_eu, xcd_swizzle, lds_stage, scheduler, scale_mode,
+    use_m_bounded_store), or None."""
+    import re
+
+    m = re.match(
+        r"flydsl_bpreshuffle_splitk_(\d+)x(\d+)x(\d+)_sk(\d+)_\w+_\w+_\w+_(\d+)x(\d+)(?:x(\d+))?(?:x(\d+))?(?:_([A-Za-z][A-Za-z0-9]*))?(?:_sm(ep|bs|mx))?(?:_mb([01]))?$",
+        kernel_name,
+    )
+    if m is None:
+        return None
+    tm, tn, tk, sk, acp, wpe = (int(m.group(i)) for i in range(1, 7))
+    xcd_swizzle = int(m.group(7)) if m.group(7) else 0
+    lds_stage = int(m.group(8)) if m.group(8) else 2
+    scheduler = m.group(9) if m.group(9) else "Default"
+    scale_mode = _SPLITK_SCALE_MODE_FROM_CODE.get(m.group(10), "epilogue")
+    use_m_bounded_store = bool(int(m.group(11))) if m.group(11) else False
+    return (
+        tm,
+        tn,
+        tk,
+        sk,
+        acp,
+        wpe,
+        xcd_swizzle,
+        lds_stage,
+        scheduler,
+        scale_mode,
+        use_m_bounded_store,
+    )
+
+
 def gemm_a8w8_bpreshuffle_flydsl(
     XQ: Tensor,
     WQ: Tensor,
@@ -174,6 +213,42 @@ def gemm_a8w8_bpreshuffle_flydsl(
 
         return run_gemm_a8w8_bpreshuffle_8wave(
             XQ, WQ, x_scale, w_scale, Out, kernel_name
+        )
+
+    if kernel_name.startswith("flydsl_bpreshuffle_splitk_"):
+        parsed = _parse_flydsl_splitk_kernel_name(kernel_name)
+        if parsed is None:
+            return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Out)
+        (
+            tm,
+            tn,
+            tk,
+            sk,
+            acp,
+            wpe,
+            xcd_swizzle,
+            lds_stage,
+            scheduler,
+            scale_mode,
+            use_m_bounded_store,
+        ) = parsed
+        return dispatch_flydsl_splitk(
+            XQ,
+            WQ,
+            x_scale,
+            w_scale,
+            Out,
+            tm,
+            tn,
+            tk,
+            sk,
+            use_async_copy=acp,
+            waves_per_eu=wpe,
+            xcd_swizzle=xcd_swizzle,
+            lds_stage=lds_stage,
+            scheduler=scheduler,
+            scale_mode=scale_mode,
+            use_m_bounded_store=use_m_bounded_store,
         )
 
     from .flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
@@ -1103,6 +1178,40 @@ def gemm_a8w8_blockscale_bpreshuffle(
                 XQ, WQ, x_scale, w_scale, Y, kernelId=kernelId
             )
         elif libtype == "flydsl":
+            if kernelName.startswith("flydsl_bpreshuffle_splitk_"):
+                parsed = _parse_flydsl_splitk_kernel_name(kernelName)
+                if parsed is not None:
+                    (
+                        tm,
+                        tn,
+                        tk,
+                        sk,
+                        acp,
+                        wpe,
+                        xcd_swizzle,
+                        lds_stage,
+                        scheduler,
+                        scale_mode,
+                        use_m_bounded_store,
+                    ) = parsed
+                    return dispatch_flydsl_splitk(
+                        XQ,
+                        WQ,
+                        x_scale,
+                        w_scale,
+                        Y,
+                        tm,
+                        tn,
+                        tk,
+                        sk,
+                        use_async_copy=acp,
+                        waves_per_eu=wpe,
+                        xcd_swizzle=xcd_swizzle,
+                        lds_stage=lds_stage,
+                        scheduler=scheduler,
+                        scale_mode=scale_mode,
+                        use_m_bounded_store=use_m_bounded_store,
+                    )
             return gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
                 XQ, WQ, x_scale, w_scale, Y, config
             )
