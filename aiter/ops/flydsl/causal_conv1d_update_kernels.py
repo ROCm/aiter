@@ -209,19 +209,58 @@ def _is_supported_arch(device: torch.device) -> bool:
     return arch.split(":")[0] in _SUPPORTED_ARCHS
 
 
-def _require_state_dtype(x: torch.Tensor, conv_state: torch.Tensor, fn: str) -> None:
-    """Refuse an ``x`` the kernel would reinterpret rather than convert.
+def _dtype_out_of_scope(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> str | None:
+    """Why no kernel can be built for these dtypes, or ``None`` if one can.
 
-    Casting it here instead would cost the caller the update twice over: the
-    kernel would write into the cast copy, leaving the buffer upstream
-    overwrites in place untouched, and it would write the state's dtype into an
-    ``out`` the caller sized for its own.
+    One ``dtype_str`` specializes the whole kernel, so every tensor it touches
+    is interpreted as that one dtype. Were any of them allowed to differ, its
+    bytes would be reinterpreted rather than converted, which is a wrong answer
+    instead of a refusal; casting instead would cost the caller the update twice
+    over, since the kernel would write into the cast copy and leave the buffer
+    upstream overwrites in place untouched.
+
+    The single source for both refusals: :func:`_shapes_supported` turns it into
+    the ``False`` the dispatch seam falls through on, and the entry points raise
+    it. Stating the rule once is what keeps those two from disagreeing.
     """
-    if x.dtype != conv_state.dtype:
-        raise ValueError(
-            f"{fn}: `x` dtype {x.dtype} must match `conv_state` dtype "
-            f"{conv_state.dtype}."
+    if conv_state.dtype not in _SUPPORTED_DTYPES:
+        return (
+            f"`conv_state` dtype {conv_state.dtype} is outside the specialized "
+            f"{list(_SUPPORTED_DTYPES)}"
         )
+    for name, t in (("x", x), ("weight", weight), ("bias", bias)):
+        if t is not None and t.dtype != conv_state.dtype:
+            return (
+                f"`{name}` dtype {t.dtype} must match `conv_state` dtype "
+                f"{conv_state.dtype}, which is what the kernel would read it as"
+            )
+    return None
+
+
+def _require_in_scope(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    fn: str,
+) -> None:
+    """Refuse at the entry point what the seam would have fallen through on.
+
+    The ``_..._supported`` predicates are private, so a caller holding only the
+    public entry point has no way to ask whether its problem is in scope. That
+    makes the entry point the one place left to say no, as it already does for
+    an out-of-range width.
+    """
+    reason = _dtype_out_of_scope(x, conv_state, weight, bias)
+    if reason is None and not _is_supported_arch(x.device):
+        reason = f"{x.device} is not one of the built {list(_SUPPORTED_ARCHS)}"
+    if reason is not None:
+        raise NotImplementedError(f"{fn}: {reason}")
 
 
 def _shapes_supported(
@@ -234,22 +273,12 @@ def _shapes_supported(
     max_query_len: int = -1,
     bias: torch.Tensor | None = None,
 ) -> bool:
-    """Shape / dtype / placement checks shared by both interfaces.
-
-    One ``dtype_str`` specializes the whole kernel, so every tensor it touches
-    is interpreted as that one dtype. Were any of them allowed to differ, its
-    bytes would be reinterpreted rather than converted, which is a wrong answer
-    instead of a refusal.
-    """
+    """Shape / dtype / placement checks shared by both interfaces."""
     if x.dim() not in (2, 3) or conv_state.dim() != 3 or weight.dim() != 2:
         return False
     if is_varlen and (x.dim() != 2 or max_query_len <= 0):
         return False
-    if conv_state.dtype not in _SUPPORTED_DTYPES:
-        return False
-    if x.dtype != conv_state.dtype or weight.dtype != conv_state.dtype:
-        return False
-    if bias is not None and bias.dtype != conv_state.dtype:
+    if _dtype_out_of_scope(x, conv_state, weight, bias) is not None:
         return False
     if not (x.is_cuda and conv_state.is_cuda and weight.is_cuda):
         return False
@@ -415,7 +444,7 @@ def causal_conv1d_update_flydsl(
         )
     silu = _resolve_activation(activation)
 
-    _require_state_dtype(x, conv_state, "causal_conv1d_update_flydsl")
+    _require_in_scope(x, conv_state, weight, bias, "causal_conv1d_update_flydsl")
 
     if out is None:
         out = x  # upstream overwrites the input rather than allocating
@@ -620,7 +649,7 @@ def causal_conv1d_update_sglang_flydsl(
         )
     silu = _resolve_activation(activation)
 
-    _require_state_dtype(x, conv_state, "causal_conv1d_update_sglang_flydsl")
+    _require_in_scope(x, conv_state, weight, bias, "causal_conv1d_update_sglang_flydsl")
 
     unsqueeze = x.dim() == 2
     if unsqueeze:

@@ -1273,8 +1273,13 @@ def test_out_of_scope_is_refused_rather_than_mishandled():
 
     Two different refusals, and the distinction matters. The predicates return
     False so the dispatch seam can fall through to Triton, which is how an
-    unsupported *configuration* is handled. The wrapper raises when the call
-    itself is malformed, because there is nothing to fall through to.
+    unsupported *configuration* is handled. The wrapper raises, because a caller
+    holding only the public entry point cannot reach those predicates and so has
+    nothing to fall through to.
+
+    Both are checked against the same out-of-scope input where one exists: the
+    two encoded the dtype rule separately once, and only the predicate's copy
+    was complete.
     """
     t = _make_inputs(4, 256, 4, 1, spec=False, seed=29)
     qsl = torch.zeros(5, dtype=torch.int32, device=DEVICE)
@@ -1328,6 +1333,16 @@ def test_out_of_scope_is_refused_rather_than_mishandled():
         causal_conv1d_update_sglang_flydsl(t["x"], state_wide, wide)
     with pytest.raises(NotImplementedError):
         causal_conv1d_update_flydsl(t["x"], state_wider, wider)
+    # The dtypes the predicates refuse above. Left to run, `dtype_str` falls
+    # through to "fp16" and the kernel reads fp32 bytes as fp16, which is the
+    # silent wrong answer the whole scope check exists to prevent.
+    for entry in (causal_conv1d_update_flydsl, causal_conv1d_update_sglang_flydsl):
+        with pytest.raises(NotImplementedError):
+            entry(t["x"].float(), t["conv_state"].float(), t["weight"].float())
+        with pytest.raises(NotImplementedError):
+            entry(t["x"], t["conv_state"], t["weight"].to(other))
+        with pytest.raises(NotImplementedError):
+            entry(t["x"], t["conv_state"], t["weight"], bias=t["bias"].to(other))
     # Packed x hides both the batch and the per-sequence budget, so dropping
     # either one leaves the kernel with no way to size the launch.
     with pytest.raises(ValueError):
