@@ -575,10 +575,9 @@ def _grouped_a8w4_tdm_moe(
             "max_tok": int(stage2_scatter.max_tokens_per_rank),
             "slot_stride": int(stage2_scatter.max_tokens_per_rank) * int(topk),
         }
-    # Align expert starts to the larger of the two tile heights: gemm2 may tile M
-    # more coarsely than gemm1 (it also runs the EP scatter, which shifts its
-    # optimum), and a start aligned only to tile_m would let a gemm2 tile cross an
-    # expert boundary.
+    # _align_m, not tile_m: gemm2 may tile M more coarsely than gemm1, and a
+    # start aligned only to tile_m would let a gemm2 tile cross an expert
+    # boundary (see the divisibility check above).
     _starts, psum, _ = contiguous_psum_remap(
         _masked_m,
         topids_to_rows,

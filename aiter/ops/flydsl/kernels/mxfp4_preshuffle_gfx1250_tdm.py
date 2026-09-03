@@ -47,20 +47,10 @@ TDM_DESCRIPTOR_VERSION = 1
 # fixed rather than tied to tile_n so the wire does not drift with the GEMM
 # tuning table.
 #
-# The planes used to be interleaved per 256-element chunk, each chunk padded to
-# 384 bytes so payload and scale formed one cache-line-aligned interval that a
-# single TDM descriptor moved together. That pad was 33% of the wire. Splitting
-# the planes drops it and costs a second gather-store here plus a second TDM
-# load in the reduce.
-#
-# Only the reduce's read gets smaller. A tile contributes tile_n/32 scale bytes
-# per row, far under the 128-byte store granularity, so this side writes the
-# same number of lines either way: splitting a chunk's store into 256B+8B
-# rather than 256B+128B moved 82.6MB less and ran within noise (1089.1 vs
-# 1084.9us). Both plane bases stay line-aligned -- N is a multiple of 128 and
-# the slot stride is a power of two -- and that must not slip; an earlier
-# 272-byte chunk pitch started every row mid-line and cost 123us/layer at 16k
-# tokens/rank despite moving 41% fewer bytes.
+# Both plane bases stay cache-line aligned -- N is a multiple of 128 and the slot
+# stride is a power of two -- and that must not slip: an earlier 272-byte chunk
+# pitch started every row mid-line and cost 123us/layer at 16k tokens/rank
+# despite moving 41% fewer bytes.
 EP_SCALE_BLOCK = 32
 # GEMM2 has no activation, so one acc holds 8 f32 -> 2 wn subtiles per lane give
 # 16 values, and the two kgrp halves merge into the full 32-element MX block.
@@ -187,10 +177,11 @@ def launch_gemm_a8w4_tdm(
         if not enable_ep_scatter:
             raise ValueError("ep_quant_bits requires enable_ep_scatter")
         # A tile row must hold whole scale blocks, else its slice of the scale
-        # plane is not a whole number of bytes. 128 rather than EP_SCALE_BLOCK so
-        # the tile's slice of each plane also starts on a cache line. The tuning
-        # table only emits tile_n2 in {256, 512}, but env overrides (*_N2) bypass
-        # it.
+        # plane is not a whole number of bytes. 256 rather than EP_SCALE_BLOCK so
+        # each plane's slice also starts on a cache line: on the fp4 wire the
+        # payload row is tile_n/2 bytes, so only a multiple of 256 keeps that a
+        # multiple of 128. The tuning table only emits tile_n2 in {256, 512}, but
+        # env overrides (*_N2) bypass it.
         if tile_n % 256 != 0:
             raise ValueError(f"ep_quant_bits requires tile_n % 256 == 0, got {tile_n}")
         # Each MX block is WN_PER_MX_BLOCK_EP wn-subtiles wide (2 kgrp halves

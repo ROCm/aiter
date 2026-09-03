@@ -28,35 +28,22 @@ _MAX_EXPERTS_PER_RANK = 512
 _COMBINE_QUANT_MODES = ("none", "mxfp8", "mxfp4")
 # MX combine wire, kept in sync with the gemm2 scatter epilogue and the combine
 # reduce kernel: a slot is a payload plane of hidden fp8 bytes -- or half that
-# many fp4 bytes -- followed by a scale plane of hidden/32 e8m0 bytes. 256 stays
-# the reduce's lane-tile unit but is no longer a wire structure.
+# many fp4 bytes -- followed by a scale plane of hidden/32 e8m0 bytes. 256 is
+# the reduce's lane-tile unit, not a wire structure.
 _COMBINE_CHUNK_ELEMS = 256
 _COMBINE_SCALE_BLOCK = 32
-# Lane tile for the TDM combine: T tokens x C chunks per block iteration. The
-# reduce needs T*C*256/16 lanes, which is why the quantized path runs a wider
-# block than the bf16 one.
-#
-# On the bf16 wire C=1 is what matters and T only sets the tile height. Now that
-# the reduce double-buffers both tiles, the iteration count barely registers --
-# T=32 measured the same 89us as T=16 at 16k tokens/rank despite halving the
-# trip count, and it no longer fits the LDS budget anyway (176KB with two tiles
-# a side). C, on the other hand, decides the LDS read pattern.
+# Lane tile for the TDM combine: T tokens x C chunks per block iteration, which
+# the reduce turns into T*C*256/16 lanes -- so the quantized path runs a wider
+# block than the bf16 one. On the bf16 wire C=1 is enough and T only sets the
+# tile height.
 _COMBINE_TOKENS_PER_BLOCK = 16
 _COMBINE_CHUNKS_PER_ITER = 1
-# The MXFP8 wire flips that. Its scale plane puts only C*8 bytes in a TDM row,
-# so a small C makes that load pull a whole line per row for a handful of bytes,
-# handing back what splitting the planes won. C wants to be as large as two
-# constraints allow: it must divide the chunk count, and -- conservatively, as
-# how a TDM copy splits rows over its warps is not visible from here -- the
-# tile's T*topk rows should divide evenly by its T*C/4 warps, which reduces to C
-# dividing 4*topk. At topk=6 over 28 chunks that leaves C=4: a 32-byte scale
-# row, so the plane still costs a line per row, but a quarter as many rows. T
-# then takes the tile as high as the 160KB budget allows.
-#
-# C>1 was not available on the interleaved wire: chunks were padded to 384B
-# there, so a wave straddling two of them cost 24us (T=4/C=4 measured 113us
-# against T=16/C=1's 89 at the same LDS footprint and lane count). Splitting the
-# planes makes the payload region contiguous, which is what removes that.
+# The MXFP8 wire wants a larger C: its scale plane puts only C*8 bytes in a TDM
+# row, so a small C makes that load pull a whole cache line per row for a
+# handful of bytes. C must divide the chunk count, and -- conservatively, as how
+# a TDM copy splits rows over its warps is not visible from here -- also divide
+# 4*topk, so the tile's T*topk rows spread evenly over its T*C/4 warps. T then
+# takes the tile as high as the reduce's 160KB LDS budget allows.
 _COMBINE_QUANT_TOKENS_PER_BLOCK = 8
 _COMBINE_QUANT_CHUNKS_PER_ITER = 4
 
@@ -702,6 +689,14 @@ class MegaMoEGfx1250:
             ],
         )
         self._arena.zero()
+        if os.environ.get("MEGA_DEBUG_POISON_COMB_INP", "0") == "1":
+            # Diagnostic: 0xFF bytes read back as bf16 NaN, so any comb_inp slot
+            # the scatter never writes shows up as NaN in the combine output.
+            _from_gpu_ptr(
+                self._arena.local_ptr("comb_inp"),
+                (self._arena._sizes["comb_inp"],),
+                torch.int8,
+            ).fill_(-1)
 
         self._token_destination_map = torch.full(
             (config.max_tokens_per_rank * config.topk,),
@@ -1026,6 +1021,11 @@ class MegaMoEGfx1250:
             self._config.rank,
             stream,
         )
+        _delay = int(os.environ.get("MEGA_DEBUG_COMBINE_DELAY", "0"))
+        if _delay:
+            # Diagnostic: graph-capturable GPU-side spin between the barrier and
+            # the reduce, to see whether in-flight P2P writes are the race.
+            torch.cuda._sleep(_delay)
         self._combine_variants[spec](
             self._arena.local_ptr("comb_inp"),
             self._combine_output.data_ptr(),
