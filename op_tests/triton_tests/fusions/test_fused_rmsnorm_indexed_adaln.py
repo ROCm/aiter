@@ -9,12 +9,17 @@ from aiter.ops.triton.fusions.fused_rmsnorm_indexed_adaln import (
 )
 
 
-def reference(x, weight, shift, scale, indices, eps):
-    """What the fused op replaces: a norm, then a gathered affine."""
-    normed = torch.nn.functional.rms_norm(x, (x.shape[-1],), weight, eps)
-    return normed * (1.0 + scale.index_select(0, indices)) + shift.index_select(
-        0, indices
+def reference(x, weight, shift, scale, indices, eps, round_intermediate=False):
+    """What the fused op replaces, with optional eager-style store rounding."""
+    normed = torch.nn.functional.rms_norm(
+        x.float(), (x.shape[-1],), weight.float(), eps
     )
+    if round_intermediate:
+        normed = normed.to(x.dtype).float()
+    modulated = normed * (1.0 + scale.index_select(0, indices).float())
+    if round_intermediate:
+        modulated = modulated.to(x.dtype).float()
+    return (modulated + shift.index_select(0, indices).float()).to(x.dtype)
 
 
 def make(M, N, G, dtype, device, *, runs=True, seed=0):
@@ -37,6 +42,7 @@ def make(M, N, G, dtype, device, *, runs=True, seed=0):
     return x, weight, shift, scale, indices
 
 
+@pytest.mark.parametrize("round_intermediate", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize(
     "M,N,G",
@@ -50,16 +56,41 @@ def make(M, N, G, dtype, device, *, runs=True, seed=0):
     ],
 )
 @pytest.mark.parametrize("runs", [True, False])
-def test_matches_norm_then_gathered_affine(dtype, M, N, G, runs):
+def test_matches_norm_then_gathered_affine(dtype, M, N, G, runs, round_intermediate):
     dev = "cuda"
     x, weight, shift, scale, indices = make(M, N, G, dtype, dev, runs=runs)
-    got = fused_rmsnorm_indexed_adaln(x, weight, shift, scale, indices, eps=1e-5)
-    want = reference(x, weight, shift, scale, indices, 1e-5)
+    got = fused_rmsnorm_indexed_adaln(
+        x,
+        weight,
+        shift,
+        scale,
+        indices,
+        eps=1e-5,
+        round_intermediate=round_intermediate,
+    )
+    want = reference(
+        x, weight, shift, scale, indices, 1e-5, round_intermediate=round_intermediate
+    )
 
     assert got.shape == x.shape and got.dtype == x.dtype
-    # The fused path keeps the row in fp32 across the norm and the affine, so it
-    # is nearer the fp32 result than the reference is, not further.
-    tol = {torch.float32: 2e-6, torch.float16: 4e-3, torch.bfloat16: 3e-2}[dtype]
+    if round_intermediate and dtype != torch.float32:
+        full_precision = reference(
+            x, weight, shift, scale, indices, 1e-5, round_intermediate=False
+        )
+        assert not torch.equal(
+            want, full_precision
+        ), "test input does not expose intermediate rounding"
+        unrounded = fused_rmsnorm_indexed_adaln(
+            x, weight, shift, scale, indices, eps=1e-5, round_intermediate=False
+        )
+        assert not torch.equal(
+            got, unrounded
+        ), "round_intermediate=True did not change the kernel output"
+        tol = 2 * torch.finfo(dtype).eps
+    else:
+        # Without intermediate rounding the kernel keeps the row in fp32 across
+        # the norm and affine, so compare against the fp32-intermediate reference.
+        tol = {torch.float32: 2e-6, torch.float16: 4e-3, torch.bfloat16: 3e-2}[dtype]
     torch.testing.assert_close(got.float(), want.float(), atol=tol, rtol=tol)
 
 
