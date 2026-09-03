@@ -6,6 +6,8 @@
 后端。通信使用 MORI `InterNodeV1LL`，激活在 dispatch 前按 `1x32`
 blockwise MXFP4 量化，dispatch 在网络上传输 packed FP4；本地计算直接将 packed
 FP4 和 E8M0 scale 传给 A4W4 `fused_moe`，combine 传输 BF16 输出。
+BF16 入口复用 MegaMoEV2 的 FlyDSL `per_1x32_mx_quant(..., quant_mode="fp4")`，
+不再调用通用 `get_torch_quant`；预量化入口则直接使用调用方提供的 FP4 与 scale。
 后端会设置 `AITER_SITUV2_A4W4=1` 并关闭冲突的 A8W4 selector，调用方不需要
 额外配置这一内部实现开关。
 

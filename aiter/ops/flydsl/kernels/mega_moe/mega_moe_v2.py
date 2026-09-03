@@ -281,7 +281,8 @@ class MegaMoEV2:
         return self._s1_active_tile_m
 
     def quantize(self, x_bf16):
-        return per_1x32_mx_quant(x_bf16, quant_mode="fp8")
+        quant_mode = "fp4" if self.quant == "a4w4" else "fp8"
+        return per_1x32_mx_quant(x_bf16, quant_mode=quant_mode)
 
     def _run_joint(self, x, scales, wts, topk_ids, run_tokens, stream, slice_output):
         config = self._select_config(run_tokens)

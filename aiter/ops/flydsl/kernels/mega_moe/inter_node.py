@@ -121,16 +121,13 @@ class MegaMoEInterNodeBackend:
         return dispatched
 
     def dispatch(self, x_bf16, weights, topk_ids):
-        from aiter import QuantType, dtypes, get_torch_quant
-
         if x_bf16.dtype != torch.bfloat16 or not x_bf16.is_contiguous():
             raise ValueError("x_bf16 must be contiguous bfloat16")
         if tuple(x_bf16.shape) != (int(x_bf16.shape[0]), self.owner.model_dim):
             raise ValueError(f"x_bf16 must have shape (tokens, {self.owner.model_dim})")
         if x_bf16.device != self.owner.dev:
             raise ValueError(f"x_bf16 must be on current device {self.owner.dev}")
-        x_fp4, x_scale = get_torch_quant(QuantType.per_1x32)(x_bf16, quant_dtype=dtypes.fp4x2)
-        x_fp4 = x_fp4.view(x_bf16.shape[0], self.owner.model_dim // 2)
+        x_fp4, x_scale = self.owner.quantize(x_bf16)
         return self.dispatch_prequant(x_fp4, x_scale, weights, topk_ids)
 
     def fused_moe(self, dispatched: MegaMoEInterNodeContext):
