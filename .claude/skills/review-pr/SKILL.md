@@ -738,9 +738,44 @@ for c in comments:
 
 Read the diff and PR body before proceeding.
 
-**Cross-file verification — do this before reporting any kernel/dispatch finding.** The diff shows changed lines, not the whole story. Grep the *entire* symbol family, not just files in the diff:
-- Sync/fence/atomics, or the "other half" of a scatter, may live in a `.cuh`/`.h` rather than the `.cu` in the diff. Grep `.cu` + `.cuh` + `.h` together before claiming "no synchronization" or "no bounds check." (aiter#3802: a "kernel has no sync" finding was a false positive — the signal barrier was in the `.cuh`.)
-- Read the actual function in the head file, not just the diff hunk, before claiming a branch/else is missing. (aiter#4098: a "compares raw uint8 vs float" finding was false — the reader had a conditional `maybe_view_fp8()` the diff never showed.)
+### Step 1b — Derive the applicable rules, and collect the evidence they need
+
+```bash
+# Which rule families this diff actually triggers. Step 3 used to be a prose
+# checklist the model ticked itself; measured over 597 open aiter PRs that meant
+# reading all 44 rules every time. Derived structurally it is 12 at the median.
+PR_TITLE=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('title') or '')" \
+           "$WORK/pr_meta.json")
+"$SKILLS_ROOT/review-pr/triage.py" rules "$WORK/pr.diff" "$PR_TITLE" | tee "$WORK/rules.txt"
+
+# For the families that turn on cross-file context, fetch that context NOW rather
+# than reminding the reviewer to go and read it. A deleted guard is judged by how
+# the symbol is handled on head, not by the hunk that removed it.
+if grep -q "invariant-removed\|api-signature" "$WORK/rules.txt"; then
+  HEAD_FILES=$(git -C "$PROJECT_ROOT" diff --name-only "$BASE_SHA...$HEAD_SHA" \
+               | sed "s|^|$PROJECT_ROOT/|")
+  "$SKILLS_ROOT/review-pr/triage.py" evidence "$WORK/pr.diff" $HEAD_FILES \
+    | tee "$WORK/evidence.txt"
+fi
+```
+
+**Read only the rules in `$WORK/rules.txt`.** They are derived from paths, added/deleted
+lines and the title, and the derivation is conservative — a family it cannot decide
+structurally is included, never dropped. Over 597 open PRs every one matched at least one
+family, and no family fired on more than half of them.
+
+**Cross-file verification — `$WORK/evidence.txt` already holds it; read that file before
+writing any finding about a removed guard or a changed signature.** The diff shows changed
+lines, not the whole story, and prose telling you to go and grep is not enough: it was in
+this skill already and was read and not acted on, producing a `q_out is not None` finding on
+aiter#5143 that was withdrawn once head was read (`q_out` is `std::optional` on both sides,
+every call site is `has_value() ? data_ptr() : nullptr`, and the kernel guards
+`if(is_q && q_out != nullptr)`). The collector puts those three lines in front of you.
+Where it produced nothing, grep the *entire* symbol family yourself — `.cu` + `.cuh` + `.h`
+together, since sync/fence/atomics or the other half of a scatter often live in the header
+(aiter#3802: a "kernel has no sync" finding was false, the barrier was in the `.cuh`;
+aiter#4098: "compares raw uint8 vs float" was false, the reader had a conditional
+`maybe_view_fp8()` the diff never showed).
 
 **Classify every CI failure before blaming the PR.** A red check is not automatically the PR's fault:
 - Read the failed *step*. `check-signal` / "Wait for Checks" timeouts, "Expected exactly one wheel artifact", and dep-resolver noise are **infra flakes**, not code failures (aiter#3593, #4171).
@@ -778,7 +813,15 @@ _Answer:_
 
 ## Step 3 — PR Type Classification
 
-Check which type(s) apply; these determine which Step 5 categories are mandatory.
+**Step 1b already derived this — read `$WORK/rules.txt` and work only those families.**
+The table below documents the type → rule mapping that `triage.py` implements; it is
+here so the mapping is reviewable and so a missing family can be added. Do not tick it by
+hand. Self-application was the failure mode: the list is 20 types over 44 rules, and a model
+that reads all of them attends to none of them.
+
+Measured over 597 open aiter PRs: median 12 rules per PR against a 44-rule full set (26%),
+every PR matched at least one family, and the most common family fired on 48%. The expensive
+full Step 4 assessment fires on 6% rather than on everything that touches `aiter/ops/`.
 
 - [ ] **New kernel / new Triton op** → B1 (dispatch gate), B2 (tl.load mask), B4 (new routing value unhandled?), A1 (sibling variants), D1 (atomic zero-init), D8 (contiguous check), HK6 (UT), P6 (measure it base-vs-head)
 - [ ] **New constexpr / routing flag / new dtype or arch value added** → B4 (do ALL dispatch branches handle the new value, or assert on it?), C4 (new arch string literal?)
@@ -831,7 +874,8 @@ Backbone files ranked by git commit frequency (2025–2026) and blast radius:
 |------|------|-------------|-------------|--------------|
 | **1** | `aiter/jit/core.py` | 182 | **ALL ops** — JIT compilation engine | Any import of aiter fails; zero ops load |
 | **1** | `aiter/__init__.py` | 52 | **ALL** vLLM/SGLang/ATOM users | `ImportError` or silent namespace truncation below broken import |
-| **1** | `aiter/ops/*.py` (any) | varies | All consumers of that op | `AttributeError` at call time in downstream |
+| **1** | `aiter/jit/core.py`, `aiter/__init__.py` only | — | **ALL** ops / all consumers | `import aiter` itself fails |
+| **3** | `aiter/ops/*.py` (a single op's wrapper) | varies | Consumers of that one op | `AttributeError` at call time in downstream |
 | **2** | `aiter/fused_moe.py` | 119 | All MoE models (DeepSeek, Kimi, MiniMax) | Wrong expert routing, silent accuracy drop |
 | **2** | `aiter/ops/mha.py` | 89 | All MHA attention paths | Wrong attention output, crash |
 | **2** | `aiter/ops/attention.py` | 66 | MLA/paged attention dispatch | Wrong KV, accuracy drop |
@@ -841,6 +885,16 @@ Backbone files ranked by git commit frequency (2025–2026) and blast radius:
 | **2** | `aiter/ops/moe_op.py` | 51 | MoE op dispatch table | Wrong dispatch, wrong expert weights |
 | **2** | `aiter/ops/quant.py` | 49 | All quantization paths | Wrong scale, silent accuracy drop |
 | **3** | Individual kernel `.py`/`.cu` | — | Ops using that kernel | Depends on kernel type |
+
+**Why `aiter/ops/*.py` is Tier 3 and not Tier 1**: by the Q1 test it looks like Tier 1 —
+`__init__.py` does `from .ops.xxx import *`, so breaking any one of them breaks `import aiter`.
+But there are 200+ files under `aiter/ops/`, and putting every single-kernel wrapper in the
+same tier as `jit/core.py` empties the tier of meaning: measured over 597 open PRs, a Tier-1
+rule written that way fires on 71% of them and the mandatory full assessment stops being
+performed at all. A wrapper's real blast radius is its own op, which is Tier 3; what it does
+share with Tier 1 is the import-chain risk, and that is covered by the B6 export check
+`triage.py` attaches to the `ops-wrapper` family. Reserve Tier 1 for the two files
+whose failure mode is *every* op, not *one* op.
 
 **`aiter/__init__.py` special rule**: The import block must NOT be wrapped in try/except.
 Any new import added here → check the imported module for bare `ImportError` paths that
@@ -852,7 +906,7 @@ Changes here require e2e smoke test across all GPU arch targets.
 
 **Mandatory backbone checks — must be answered before writing the verdict:**
 
-For **Tier 1** files (jit/core.py, __init__.py, ops/*.py):
+For **Tier 1** files (`jit/core.py`, `__init__.py` — these two only):
 - [ ] List every public symbol changed. Grep for all callers across aiter itself: `grep -rn '<symbol>' aiter/`. If a caller is not covered by the PR's test, flag it.
 - [ ] For `__init__.py`: does the new import have a bare `ImportError` path that could silently truncate the namespace?
 - [ ] For `jit/core.py`: is there an e2e smoke test that loads all kernels on gfx942 AND gfx950 after this change?
@@ -1058,7 +1112,15 @@ Python wrapper passes tensor to C++ / HIP kernel but doesn't assert `.is_contigu
 Trigger: new Python wrapper that calls a `@compile_ops` or C-extension kernel; check that non-trivially-shaped inputs (anything other than a freshly allocated `torch.empty`) are either asserted contiguous or explicitly made contiguous before the call.
 → `⚠️ D8: [tensor] passed to [kernel] without contiguous check — add .contiguous() or assert .is_contiguous()`
 
-**D9 — INT32 overflow in GPU pointer arithmetic** 🔴
+**D9 — INT32 overflow in GPU pointer arithmetic** 🔴 *(scanner-backed — read the scan output, not this prose)*
+
+`scan_index_width.py` decides this family structurally and its candidate list is the input to
+the finding; `triage.py` therefore does not put D9 on the read list. The text below
+documents what the scanner looks for and what still needs a human — naming the production
+scale at which the product exceeds 2^31. A rule that has a scanner should be consumed through
+the scanner: re-reading the prose adds nothing and costs attention that the families without
+one need.
+
 C++ kernel launcher or Python wrapper computes a buffer offset, record count, or index in `int32` (or Python `torch.int32`) when the product of dimensions can exceed 2^31 (~2 billion) at production scale.
 Common patterns: `token_id * (num_heads * head_dim)` overflows at token_id > 16M with H=32, D=128; `seq_start * K` overflows for long-context at seq_start > 256K with K=8192; gfx1250 TDM block descriptor count fields computed as Python int default to int64 — a missing `.to(torch.int32)` cast silently produces wrong offsets.
 Trigger (structural, NOT a name list): a multiplication that feeds pointer or index arithmetic, where at least one operand derives from a **non-`constexpr` parameter of the enclosing kernel** — a value supplied at runtime, which is the only kind that can grow past 2^31 — and no operand is widened to 64 bits, counting a widening applied on an earlier line and carried in through a local name. `constexpr` tile constants bound the product at compile time and are excluded. Also fires on a TDM descriptor field feeding block offset computation without an explicit int32 cast.
