@@ -69,9 +69,6 @@ _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
-# On the heuristic FlyDSL fallback, fold stage 2's mxfp8 quant into stage 1's
-# fp8 epilogue. On by default; set to 0 to keep the separate quant kernel.
-_FUSE_STAGE1_FP8_QUANT = os.environ.get("AITER_MOE_FUSE_STAGE1_FP8_QUANT", "1") != "0"
 
 # Opt-in kernel-bench hook: a caller sets a list here to collect (name, callable)
 # per-kernel launches in fused_moe_2stages ("stage1"/"stage2"); None in production
@@ -2898,19 +2895,9 @@ def get_2stage_cfgs(
         if get_flydsl_kernel_params(kn2) is None:
             kn2 = _base_kn2
 
-        # Fuse stage 2's mxfp8 quant into stage 1's "_fp8" epilogue variant when
-        # that kernel exists (see AITER_MOE_FUSE_STAGE1_FP8_QUANT).
-        _fb_fuse_quant = ""
-        if _a_type == "fp8" and _FUSE_STAGE1_FP8_QUANT:
-            _kn1_fp8q = f"{kn1}_fp8"
-            if get_flydsl_kernel_params(_kn1_fp8q) is not None:
-                kn1 = _kn1_fp8q
-                _fb_fuse_quant = "fp8"
-
         logger.warning(
             f"[fused_moe] no tuned FlyDSL config for {keys}, "
-            f"using heuristic FlyDSL fallback ({kn1=}, {kn2=}, "
-            f"fuse_quant={_fb_fuse_quant or 'none'})"
+            f"using heuristic FlyDSL fallback ({kn1=}, {kn2=})"
         )
         enable_bias = _needs_swiglu_bias_support(dtype, q_type)
         return MOEMetadata(
@@ -2931,7 +2918,6 @@ def get_2stage_cfgs(
             -1,  # split_k = -1
             False,
             has_bias=enable_bias,
-            fuse_quant=_fb_fuse_quant,
             stage2_has_bias=enable_bias,
         )
     if (
