@@ -30,6 +30,8 @@ import os
 
 import torch
 
+from aiter.ops.triton.utils.device_info import get_num_sms
+
 from .kernels.causal_conv1d_update import (
     compile_causal_conv1d_update,
     compile_causal_conv1d_update_sglang,
@@ -90,7 +92,7 @@ _MIN_CHANNELS_TO_SPLIT = 1024
 #: A ratio, not a count, so it carries across parts unchanged.
 _TARGET_WG_PER_CU = 2
 
-_CU_COUNT_CACHE: dict[int, int | None] = {}
+_CU_COUNT_CACHE: dict[tuple[str, int], int | None] = {}
 _ENV_OVERRIDE_CACHE: dict[str, int | None] = {}
 
 
@@ -121,11 +123,20 @@ def _env_int(name: str | None) -> int | None:
 
 
 def _n_cu(device: torch.device) -> int | None:
-    """Compute-unit count of ``device``, or ``None`` if it could not be queried."""
-    key = device.index if device.index is not None else 0
+    """Compute-unit count of ``device``, or ``None`` if it could not be queried.
+
+    Through ``get_num_sms()`` rather than the device properties directly, so the
+    ``CU_NUM`` override the tuning dispatch keys on reaches these heuristics too
+    and the two ports cannot end up sizing their launches for different
+    machines.
+    """
+    # Keyed on the type as well, or a device that cannot be queried at all takes
+    # the answer cached for ``cuda:0``: both spell their index ``None``.
+    key = (device.type, device.index if device.index is not None else 0)
     if key not in _CU_COUNT_CACHE:
         try:
-            count = torch.cuda.get_device_properties(device).multi_processor_count
+            with torch.cuda.device(device):
+                count = get_num_sms()
         except Exception:  # noqa: BLE001 - no live device, or a meta/CPU tensor
             count = None
         _CU_COUNT_CACHE[key] = count
