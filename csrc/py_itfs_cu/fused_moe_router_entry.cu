@@ -8,6 +8,7 @@
 #include <torch/extension.h>
 #include <hip/hip_runtime.h>
 #include <ATen/hip/HIPContext.h>
+#include "aiter_hip_common.h"
 #include "aiter_stream.h"
 
 // Include dirs are csrc/include, not csrc, so reach the kernel relatively.
@@ -168,20 +169,27 @@ void fused_moe_router_impl(
                     "fused_moe_router_impl: expert_mask must be int32");
         TORCH_CHECK(expert_mask->is_contiguous(),
                     "fused_moe_router_impl: expert_mask must be contiguous");
+        TORCH_CHECK(expert_mask->device() == gating.device(),
+                    "fused_moe_router_impl: expert_mask is on ",
+                    expert_mask->device(), " but the inputs are on ",
+                    gating.device());
         mask_ptr = expert_mask->data_ptr<int>();
     }
 
+    // Both the stream and the properties must come from the device the tensors
+    // are on, not whichever one is ambient.
+    const HipDeviceGuard device_guard(gating.device().index());
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     // Grid width multiplies barrier cost, so size it to the work and keep it
     // under num_cu so every block stays resident. Phase 1 wants one block per
     // token; phase 3's rows do not shrink with M, so small M still needs width
     // -- hence the floor.
-    int GRID = std::max(M, 16);
+    int GRID   = std::max(M, 16);
     int dev_id = 0;
-    hipGetDevice(&dev_id);
+    HIP_CALL(hipGetDevice(&dev_id));
     hipDeviceProp_t prop;
-    hipGetDeviceProperties(&prop, dev_id);
+    HIP_CALL(hipGetDeviceProperties(&prop, dev_id));
     GRID = std::max(1, std::min(GRID, prop.multiProcessorCount));
 
     const int total_routed_rows = M * topk_total;
