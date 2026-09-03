@@ -25,11 +25,6 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 _LOGGER = AiterTritonLogger()
 
 
-# ---------------------------------------------------------------------------
-# Public launcher
-# ---------------------------------------------------------------------------
-
-
 def na3d_flash_attn(
     q: torch.Tensor,
     k: torch.Tensor,

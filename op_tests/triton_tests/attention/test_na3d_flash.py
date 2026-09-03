@@ -24,7 +24,18 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.triton.attention.na3d_flash import na3d_flash_attn
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
-torch.set_default_device("cuda")
+
+@pytest.fixture(autouse=True)
+def _na3d_default_device():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device required for na3d_flash tests")
+    prev_device = torch.get_default_device()
+    try:
+        torch.set_default_device("cuda")
+        yield
+    finally:
+        torch.set_default_device(prev_device)
+
 
 SUPPORTED_GFX = ["gfx942", "gfx950"]
 

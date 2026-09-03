@@ -46,11 +46,12 @@ def _prune_configs(configs, named_args, **kwargs):
     so the KV tile covers the union of all BLOCK_Q query windows.
     """
     W = named_args["W"]
-    KW = named_args["KW"]
+    KW = kwargs.get("KW")  # constexpr in kwargs
     return [
         c
         for c in configs
-        if c.kwargs["BLOCK_Q"] <= W and c.kwargs["BLOCK_KV"] >= c.kwargs["BLOCK_Q"] + KW - 1
+        if c.kwargs["BLOCK_Q"] <= W
+        and (KW is None or c.kwargs["BLOCK_KV"] >= c.kwargs["BLOCK_Q"] + KW - 1)
     ]
 
 
