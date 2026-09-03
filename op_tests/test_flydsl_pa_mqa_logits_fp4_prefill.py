@@ -62,6 +62,14 @@ _E2M1_INV_LUT = [7, 8, 9, 10, 11, 12, 13, 14, 7, 6, 5, 4, 3, 2, 1, 0]
 KVS_NTPW = 4
 
 
+def test_prefill_compile_cache_does_not_evict_launchers():
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
+        compile_pa_mqa_logits_fp4_prefill,
+    )
+
+    assert compile_pa_mqa_logits_fp4_prefill.cache_info().maxsize is None
+
+
 # ── FP4 quant / dequant ──────────────────────────────────────────────
 
 
@@ -710,6 +718,8 @@ def main():
     if get_arch() != "gfx950":
         print(f"[skip] this kernel only supports gfx950 (current: {get_arch()}).")
         return
+
+    test_prefill_compile_cache_does_not_evict_launchers()
 
     print("=" * 80)
     print("[test] FP4 paged prefill MQA logits")
