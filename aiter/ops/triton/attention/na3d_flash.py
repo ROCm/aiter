@@ -246,8 +246,9 @@ def na3d_flash_attn(
     q_f, k_f, v_f = _flat(q), _flat(k), _flat(v)
     out_f = torch.empty_like(q_f)
 
-    # Lambda grid: Triton passes the autotuned BLOCK_Q via meta.
-    grid = lambda meta: (triton.cdiv(SEQ, meta["BLOCK_Q"]), B * NH)
+    # Grid: one program per (t, h) row per W-block.  This guarantees each
+    # program covers queries from exactly one (t, h) row regardless of W % BLOCK_Q.
+    grid = lambda meta: (T * H * triton.cdiv(W, meta["BLOCK_Q"]), B * NH)
 
     _na3d_flash_fwd[grid](
         q_f,
@@ -259,7 +260,6 @@ def na3d_flash_attn(
         T,
         H,
         W,
-        SEQ,
         HD=HD,
         KT=KT,
         KH=KH,

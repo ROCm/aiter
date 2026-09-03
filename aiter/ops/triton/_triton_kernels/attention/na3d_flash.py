@@ -4,10 +4,10 @@
 
 Each query token attends to the (KT x KH x KW) neighborhood centered on its
 (t, h, w) grid position, with inward border-shift so every window has the full
-KT x KH x KW keys.  The kernel processes BLOCK_Q consecutive queries per program;
-all queries in one block share the same (t, h) row (requires W >= BLOCK_Q).
+KT x KH x KW keys.
 
 Algorithm:
+- Grid dim[0] = T × H × ⌈W / BLOCK_Q⌉; each program covers one (t, h) row.
 - Q is loaded once into registers and held for all KT x KH inner iterations.
 - Each iteration loads one (t_kv, h_kv) row of K and V at the shared W window.
 - Running online softmax in log2 space (exp2, log2(e) folded into scale).
@@ -41,7 +41,9 @@ _CONFIGS = [
 def _prune_configs(configs, named_args, **kwargs):
     """Remove configs where BLOCK_Q > W.
 
-    Ensures all queries in one block share the same (t, h) row (W >= BLOCK_Q required).
+    Performance constraint: BLOCK_Q > W would leave most of every block masked,
+    wasting compute.  Correctness is guaranteed by the row-decomposed grid
+    regardless of whether W is divisible by BLOCK_Q.
     """
     W = named_args["W"]
     return [c for c in configs if c.kwargs["BLOCK_Q"] <= W]
@@ -69,7 +71,6 @@ def _na3d_flash_fwd(
     T,
     H,
     W,
-    SEQ,
     HD: tl.constexpr,  # head dimension: any power-of-2 value
     KT: tl.constexpr,  # neighborhood depth: constexpr -> static loop bound
     KH: tl.constexpr,  # neighborhood height: constexpr -> static loop bound
@@ -77,33 +78,37 @@ def _na3d_flash_fwd(
     BLOCK_Q: tl.constexpr,
     BLOCK_KV: tl.constexpr,  # power-of-2, >= BLOCK_Q + KW - 1
 ):
-    """Flash-attention inner kernel. Requires W >= BLOCK_Q (same (t,h) row per block).
+    """Flash-attention inner kernel. Grid dim[0] = T*H*ceil(W/BLOCK_Q).
 
-    See _prune_configs for the W >= BLOCK_Q constraint.
+    Each program is assigned to exactly one (t, h) row via decomposition of
+    pid_q into (row_idx, w_block_idx).  This guarantees a shared (t, h) window
+    start regardless of whether W is divisible by BLOCK_Q.
     """
     pid_q = tl.program_id(0)
     pid_bnh = tl.program_id(1)
     HW = H * W
 
-    q_start = pid_q * BLOCK_Q
-    q_offs = tl.arange(0, BLOCK_Q)
-    q_idx = q_start + q_offs
-    q_mask = q_idx < SEQ
+    # Decompose pid_q into (t,h) row and W-block within that row.
+    W_blocks = (W + BLOCK_Q - 1) // BLOCK_Q  # programs per (t,h) row
+    row_idx = pid_q // W_blocks  # which (t,h) row  (t*H + h)
+    w_bid = pid_q % W_blocks  # which W-block in that row
 
-    q_t = q_idx // HW
-    q_h = (q_idx % HW) // W
-    q_w = q_idx % W
+    prog_t = row_idx // H  # scalar: same t for every query in this program
+    prog_h = row_idx % H  # scalar: same h for every query in this program
+
+    q_offs = tl.arange(0, BLOCK_Q)
+    q_w = w_bid * BLOCK_Q + q_offs  # W positions for this block
+    q_mask = q_w < W  # last block in a row may be partial
+
+    q_idx = prog_t * HW + prog_h * W + q_w  # for Q load and Out store
 
     # Inward-shifted centered neighborhood window starts.
-    q_t_ws = tl.minimum(tl.maximum(q_t - KT // 2, 0), T - KT)
-    q_h_ws = tl.minimum(tl.maximum(q_h - KH // 2, 0), H - KH)
+    # prog_t / prog_h are scalars; t_ws / h_ws need no tl.min reduction.
     q_w_ws = tl.minimum(tl.maximum(q_w - KW // 2, 0), W - KW)
 
-    # Scalar window starts (shared across all BLOCK_Q queries in this block).
-    INF_I = 999999
-    t_ws = tl.min(tl.where(q_mask, q_t_ws, INF_I))
-    h_ws = tl.min(tl.where(q_mask, q_h_ws, INF_I))
-    w_lo = tl.min(tl.where(q_mask, q_w_ws, INF_I))
+    t_ws = tl.minimum(tl.maximum(prog_t - KT // 2, 0), T - KT)  # scalar
+    h_ws = tl.minimum(tl.maximum(prog_h - KH // 2, 0), H - KH)  # scalar
+    w_lo = tl.min(tl.where(q_mask, q_w_ws, 999999))
 
     hd_offs = tl.arange(0, HD)
     kv_offs = tl.arange(0, BLOCK_KV)

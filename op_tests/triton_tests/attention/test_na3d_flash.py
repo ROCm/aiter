@@ -116,6 +116,8 @@ _DEFAULT_SHAPES = [
     (1, 16, 16, 16, 4, 64, 11, 11, 11),
     # B > 1: tests pid_bnh addressing across batch elements.
     (2, 16, 16, 32, 4, 64, 3, 5, 5),
+    # Cross-(t,h)-row: W=33 is not a multiple of BLOCK_Q=16.
+    (1, 4, 8, 33, 4, 64, 3, 5, 5),
 ]
 
 
