@@ -52,53 +52,80 @@ import from the categorized path** (`aiter.ops.triton.gemm.basic.gemm_a16w16`).
 
 ## Tuned configs
 
-### Two layouts are live; only one accepts new files
+### One layout, one path builder
 
-The config tree is mid-migration from a flat, arch-prefixed layout to a nested
-one. The legacy flat layout is **deprecated — treat it as read-only history**:
+Every tuned JSON file lives in a single nested tree, keyed by architecture,
+backend, op and config family:
 
 ```text
-# Target layout (all new GEMM configs go here)
 configs/<arch>/<backend>/<op>/<d_type>/DEFAULT.json
 configs/<arch>/<backend>/<op>/<d_type>/<CONFIG_NAME>-<suffix>.json
 #        gfx950   triton    gemm  gemm_afp4wfp4
-#                 gluon     moe
-
-# Legacy layout (deprecated, pending removal)
-configs/gemm/<arch>-<CONFIG_NAME>[-<suffix>].json
-configs/moe/<arch>-MOE-<dtype_str>.json
+#        gfx1250  gluon     moe   a8w4
 ```
+
+`<op>` is one of `gemm`, `moe`, `conv`, `mhc`, `attention`, `gmm`, `fusions`.
+The flat, arch-prefixed directories (`configs/gemm/`, `configs/moe/`,
+`configs/conv/`, the loose files at the top of `configs/`) and the fallback
+code that reached them are gone.
 
 Rules that follow from the layout:
 
 - `<d_type>` is `config_name.lower().replace("-", "_")` (`GEMM-AFP4WFP4` →
-  `gemm_afp4wfp4`, see `gemm_config_utils._dtype_dir()`). New config names must
+  `gemm_afp4wfp4`, see `config_utils._dtype_dir()`). New config names must
   stay distinct under that fold — `GEMM-FOO-BAR` and `GEMM-FOO_BAR` collide.
 - Files inside `configs/<arch>/...` carry **no arch prefix**; the default file
   is named exactly `DEFAULT.json`.
-- A `<d_type>/` directory without a `DEFAULT.json` is **invisible** — the
-  resolver probes only for the default file, so its specialized files are
-  silently ignored. Never split a config family across the two layouts; a
-  family migrates wholesale or not at all (`git mv`, 100% rename similarity,
-  content changes in a separate commit).
-- `<arch>/<backend>/moe/` directories exist but are `.gitkeep` placeholders.
-  **MOE has no nested-layout resolver yet** — MOE configs stay in
-  `configs/moe/` with the arch prefix until `get_moe_config()` lands
-  (design in `configs/CLAUDE.md` §5).
-- `kpack` is deprecated starting from gfx950: the Triton AMD backend warns
-  and force-overrides `kpack = 1` there, and the parameter is slated for
-  removal. Configs for gfx950 and newer must not carry it; only gfx942
-  configs may still set it.
+- A required `DEFAULT.json` that is missing raises naming that exact path.
+  There is no probe to fall through, so a misplaced file surfaces as an error
+  instead of silently resolving somewhere else.
+- Moves and renames go in a pure `git mv` commit (100% rename similarity),
+  with content changes in a follow-up.
+- `kpack` is deprecated on CDNA4: the Triton AMD backend warns and
+  force-overrides `kpack = 1` on gfx950, and the parameter is slated for
+  removal. No gfx950 config carries it and none should; gfx942 configs still
+  may. Existing `kpack` entries in the RDNA trees predate the rule — do not
+  add new ones.
+
+All of it is built by one function in `utils/config_utils.py`:
+
+```python
+resolve_config_dir(op, config_name, backend="triton", arch=None) -> str
+```
+
+It **builds** the path — no probing, no candidate list, no cross-backend or
+cross-arch search — and validates every argument against a whitelist, so a bad
+value fails closed with an `AssertionError` rather than resolving to an
+escaped or wrong directory. `backend` is declared by the caller (gluon kernels
+and gluon dispatch paths pass `"gluon"`; everything else takes the `"triton"`
+default), because the two backends take disjoint config params and borrowing
+across them would be a bug. `arch=` overrides the running architecture only
+where a loader deliberately retries elsewhere — today just MHC's documented
+gfx942 fallback.
+
+`config_utils.py` is the shared core; each family keeps its own small loader
+module on top of it, and every function has exactly one home:
+
+| Module | Entry points |
+| ------ | ------------ |
+| `utils/config_utils.py` | `resolve_config_dir`, `load_config_json`, path constants |
+| `utils/gemm_config_utils.py` | `get_gemm_config`, `compute_splitk_params`, `add_default_gemm_config_params`, `pick_gemm_num_stages` |
+| `utils/conv_config_utils.py` | `get_conv_config` + the shape-key formatters and table probes |
+| `utils/mhc_config_utils.py` | `get_mhc_config`, `get_mhc_post_config` |
+| `utils/moe_config_utils.py` | `get_moe_dispatch` — the only MOE config fetcher |
+| `utils/tuned_config_utils.py` | `get_tuned_kernel_config` |
+
+Attention and GMM kernels read their single `DEFAULT.json` straight off the
+core (`resolve_config_dir()` + `load_config_json()`); a family module earns
+its place once a family grows real selection logic.
 
 ### How GEMM configs resolve — `get_gemm_config()`
 
 All GEMM-family kernels load configs through one function,
 `utils/gemm_config_utils.py::get_gemm_config(config_name, M, N=None, K=None,
-bounds=None, specialized_filename=None, backend=None, B=None)`. It probes
-candidate directories for the default file and takes the first hit
-(`backend=None` → `<arch>/triton/gemm/` → `<arch>/gluon/gemm/` → legacy
-`configs/gemm/`), then reads specialized files from that same directory.
-It returns `(config, is_tuned)`:
+bounds=None, specialized_filename=None, backend="triton", B=None)`. It reads
+`<arch>/<backend>/gemm/<d_type>/DEFAULT.json` (required), overlays a
+specialized file when one matches, and returns `(config, is_tuned)`:
 
 - the config is a fresh deep copy, safe to mutate;
 - `is_tuned` is `True` only when a specialized (`N=…-K=…`, `B=…-N=…-K=…`, or
@@ -118,6 +145,11 @@ def _get_config(M: int, N: int, K: int):
     config, is_tuned = get_gemm_config("GEMM-A16W16", M, N, K)
     return compute_splitk_params(config, K), is_tuned
 ```
+
+A kernel-level `_get_config()` that takes a `backend` argument defaults it to
+`"triton"`, never to `None` — `None` is not a backend and the resolver rejects
+it. Public wrappers that expose `backend: str | None = None` normalize it
+(typically `"gluon"` on gfx1250, `"triton"` elsewhere) before calling down.
 
 Split-K kernels also share one common second-stage reduce —
 `_gemm_splitk_reduce_kernel` (and `_batched_gemm_splitk_reduce_kernel`) in
@@ -152,20 +184,27 @@ Gluon. New split-K kernels import it from there.
 
 No `setdefault(...)` blocks, no inline config dict literals, no
 arch-conditional constants, no hardcoded fallback configs in `.py` files. If a
-value is missing at runtime, the fix is in the JSON. MOE still has legacy
-Python fallbacks (`get_optimal_moe_config()`, the `moe_op_gemm_a8w4` dispatch
-tiers) — fix them as you touch them, and do not add more.
+value is missing at runtime, the fix is in the JSON. The MOE a8w4 triton
+dispatch still ends in a Python default after its tuned lookup and its
+same-`(N, K)` proxy — that last tier shrinks as coverage grows; do not add
+more like it.
 
 ### Loading is unified — `load_config_json()`
 
-Every config-file read goes through `utils/core.py::load_config_json(fpath,
-required=...)`. It is cached per path **including negative results**:
-a config file added at runtime is not picked up without
-`load_config_json.cache_clear()` or a process restart. Do not hand-roll
-`json.load(open(...))` or function-attribute caches, and prefer the resolvers
-(`get_gemm_config` / `get_tuned_kernel_config`) over hand-built
-`f"{AITER_TRITON_CONFIGS_PATH}/..."` paths — hand-built paths break silently
-when a family migrates and must be grepped for during every migration.
+Every config-file read goes through
+`utils/config_utils.py::load_config_json(fpath, required=...)`.
+`required=True` (the default) raises `FileNotFoundError` naming the exact
+nested path; `required=False` returns `None` for genuinely optional tables and
+the caller handles it. It is cached per path **including negative results**: a
+config file added at runtime is not picked up without
+`load_config_json.cache_clear()` or a process restart. The dict it returns is
+the shared cached object — copy before mutating (the family loaders already do
+this for their callers).
+
+Do not hand-roll `json.load(open(...))` or function-attribute caches, and
+prefer the family loaders over hand-built
+`f"{AITER_TRITON_CONFIGS_PATH}/..."` paths — a hand-built path is a second
+place the layout is encoded, and it goes stale silently.
 
 Kernels that carry a Python autotune search space (opt-in tuning) pin their
 single default tile per arch via
@@ -181,19 +220,21 @@ kernel_name, fallback, backend)`, which reads the nested-layout
 | Batched GEMM     | `BATCHED_GEMM-A{x}W{y}`, specialized `-B={B}-N={N}-K={K}`       |
 | Fused ops        | `FUSED-GEMM-{operation}`                                        |
 | Feed-forward     | `FF-A{x}W{y}-fused`                                             |
-| MOE              | `MOE-<dtype_str>` (`DEFAULT`, `FP8_W8A8`, `MX_FP4`, ...)        |
+| MOE              | `A8W4`, `A4W4` — dispatch tables, one `DEFAULT.json` per backend |
 
 - **`K` in AFP4WFP4 filenames is the logical K, i.e. `2 * K_bytes`** — the
   wrapper doubles K before calling `get_gemm_config`. Tuning output named by
   the packed byte width will never be found.
-- MOE files use `small_M` / `medium_M` / `large_M` (thresholds 256 / 1024 in
-  `moe_config_utils.py`). Never mix that scheme with the GEMM
+- MOE dispatch tables are keyed `bm<block_m>_n<N>_k<K>` on the triton path and
+  `bm<block_m>_n<N>_k<K>_<bucket>` (plus a `bm<block_m>_any` tier) on the
+  gluon path — a different scheme per backend, which is why `backend` is a
+  caller-declared argument. Never mix a MOE dispatch key with the GEMM
   `M_LEQ_x`/`M_GEQ_y` scheme in either direction.
 - `configs/gemm/aot/` and `configs/paged_mqa_logits/aot/` are runtime AOT
   caches, not tuning configs — never check them in or migrate them.
 
-For migrating a family into the nested layout, follow the playbook in
-`configs/CLAUDE.md` §6 step by step. For the manual tuning flow, see
+For adding a config, seeding a new arch, and the per-family key schemes, follow
+`configs/CLAUDE.md` (§5 and §6). For the manual tuning flow, see
 `utils/_triton/tunning/README.md`.
 
 ---
@@ -253,8 +294,8 @@ decide, and use `return_layout=True` instead of hardcoding swizzle labels.
 
 ## Architecture naming
 
-Key behavior off GPU architecture identifiers, never product names — in config
-filenames (`gfx950-...`), directory names (`configs/gfx950/...`), and code:
+Key behavior off GPU architecture identifiers, never product names — in
+directory names (`configs/gfx950/...`) and in code:
 
 ```python
 DEVICE_ARCH = arch_info.get_arch()
