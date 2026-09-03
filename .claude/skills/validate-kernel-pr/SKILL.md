@@ -388,15 +388,25 @@ aiter#4538 again: the shape flag carries `(seq_len, seq_len_kv)` while `--num-he
 flag defaulting to `64 128`, and the public API asserts at `num_heads=16` — a real blocker no grid
 could have requested.
 
-An axis is a name, a flag, and its values, and it carries the same burden of proof as a shape
-channel, in two steps. Record which step it reached:
+An axis is a name, a flag, and its values: `--axis num_heads=--num-heads:16;32`. **You read the
+target to find the flag; the validator does not check that it exists.** If you name a flag the
+target does not take, the grid run dies at argument parsing — see the shape-channel section above
+for why that failure is reported without charging anyone.
+
+What the validator does enforce is the same burden of proof a shape channel carries: every axis
+flag is fed `__VALIDATOR_INVALID_AXIS__` and **must fail**. A flag that is declared but ignored,
+or whose value is silently clamped, would otherwise let the report claim coverage of head counts
+that never reached the kernel.
 
 | state | meaning |
 |---|---|
 | `none` / `unusable` | none requested, or the target is not a script — argv reaches script targets only |
-| `hook-not-found` | the source declares no `add_argument` for that flag |
-| `hook-not-consumed` | the flag was declared but accepted a deliberately invalid value; the axis is **dropped and named**, never dropped quietly |
-| `proven` | every axis flag refused an invalid value, and its values rode the grid run's argv |
+| `malformed-spec` | the `name=--flag:v1;v2` spelling does not parse; nothing is guessed from it |
+| `hook-not-consumed` | a flag accepted the invalid value; the axis is **dropped and named**, never dropped quietly |
+| `proven` | every axis flag refused the invalid value, and its values rode the grid run's argv |
+
+Each axis also carries `hook_proof`, the probe's verdict for that one flag. It is the only
+evidence that an axis reached the kernel; a flag existing in the source is not.
 
 When it is a proven axis rather than the shape cells that makes the run independent, say so in
 `--grid-novelty` — that is one sentence, in one place, instead of two fields that can disagree.
