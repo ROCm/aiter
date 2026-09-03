@@ -10,6 +10,8 @@ the same inward-shifted centered window.  TFLOPS and TB/s are reported per shape
 """
 
 import argparse
+import functools
+import math
 
 import pandas as pd
 import pytest
@@ -19,7 +21,7 @@ import torch.nn.functional as F
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.triton.attention.na3d_flash import _na3d_sdpa_exact, na3d_flash_attn
+from aiter.ops.triton.attention.na3d_flash import na3d_flash_attn
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -94,6 +96,141 @@ def na3d_sdpa_ref(
 
 
 # ---------------------------------------------------------------------------
+# GPU-grouped exact reference (fast alternative to na3d_sdpa_ref)
+# ---------------------------------------------------------------------------
+
+
+@functools.lru_cache(maxsize=256)
+def _na3d_sdpa_mask(
+    rel_bounds: tuple[tuple[tuple[int, ...], tuple[int, ...]], ...],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Cached additive ``[1, 1, Nq, Nk]`` mask for one tile-geometry group."""
+    bools = []
+    for starts, ends in rel_bounds:
+        st = torch.tensor(starts, device=device)
+        en = torch.tensor(ends, device=device)
+        kj = torch.arange(max(ends), device=device)
+        bools.append((kj[None, :] >= st[:, None]) & (kj[None, :] < en[:, None]))
+    visible = (
+        bools[0][:, None, None, :, None, None]
+        & bools[1][None, :, None, None, :, None]
+        & bools[2][None, None, :, None, None, :]
+    )
+    nq = math.prod(visible.shape[:3])
+    nk = math.prod(visible.shape[3:])
+    mask = torch.zeros((nq, nk), dtype=dtype, device=device)
+    mask.masked_fill_(~visible.reshape(nq, nk), torch.finfo(dtype).min)
+    return mask.reshape(1, 1, nq, nk)
+
+
+def _na3d_sdpa_exact(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kernel_size: tuple[int, int, int],
+    w_offset: int = 0,
+) -> torch.Tensor:
+    """Exact per-query 3D neighborhood attention via grouped tiled SDPA.
+
+    Generic GPU-grouped reference function.  With ``w_offset=0`` and full
+    ``q/k/v`` this computes exact neighborhood attention for all W positions
+    and is equivalent to ``na3d_sdpa_ref`` but GPU-accelerated with cached masks.
+
+    Args:
+        q          : ``(B, T, H, W_sub, NH, HD)`` bfloat16, Q pre-scaled.
+        k, v       : ``(B, T, H, W_full, NH, HD)`` bfloat16.
+        kernel_size: ``(KT, KH, KW)`` neighborhood window.
+        w_offset   : Global W start of q; 0 for a full-tensor call.
+
+    Returns:
+        ``(B, T, H, W_sub, NH, HD)`` bfloat16.
+    """
+    B, T, H, W_sub, NH, HD = q.shape
+    W_full = k.shape[3]
+    KT, KH, KW = kernel_size
+    device = q.device
+
+    bt = _window_bounds(T, min(KT, T))
+    bh = _window_bounds(H, min(KH, H))
+    bw = _window_bounds(W_full, min(KW, W_full))
+
+    eff_kt, eff_kh, eff_kw = min(KT, T), min(KH, H), min(KW, W_full)
+
+    def _cost(ts: list[int]) -> int:
+        tile_t, tile_h, tile_w = ts
+        nq = tile_t * tile_h * tile_w
+        nk_t = min(T, tile_t + eff_kt - 1)
+        nk_h = min(H, tile_h + eff_kh - 1)
+        nk_w = min(W_full, tile_w + eff_kw - 1)
+        return nq * nk_t * nk_h * nk_w
+
+    tiles = [T, H, W_sub]
+    while _cost(tiles) > 2**25 and max(tiles) > 1:
+        i = max(range(3), key=lambda a: tiles[a] / [eff_kt, eff_kh, eff_kw][a])
+        if tiles[i] <= 1:
+            break
+        tiles[i] = max(1, (tiles[i] + 1) // 2)
+    tile_t, tile_h, tile_w = tiles
+
+    groups: dict = {}
+    for t0 in range(0, T, tile_t):
+        t1 = min(t0 + tile_t, T)
+        rt0, rt1 = bt[0][t0], bt[1][t1 - 1]
+        rel_t = (
+            tuple(s - rt0 for s in bt[0][t0:t1]),
+            tuple(e - rt0 for e in bt[1][t0:t1]),
+        )
+        for h0 in range(0, H, tile_h):
+            h1 = min(h0 + tile_h, H)
+            rh0, rh1 = bh[0][h0], bh[1][h1 - 1]
+            rel_h = (
+                tuple(s - rh0 for s in bh[0][h0:h1]),
+                tuple(e - rh0 for e in bh[1][h0:h1]),
+            )
+            for w0 in range(0, W_sub, tile_w):
+                w1 = min(w0 + tile_w, W_sub)
+                w0g, w1g = w_offset + w0, w_offset + w1 - 1
+                rw0, rw1 = bw[0][w0g], bw[1][w1g]
+                rel_w = (
+                    tuple(s - rw0 for s in bw[0][w0g : w1g + 1]),
+                    tuple(e - rw0 for e in bw[1][w0g : w1g + 1]),
+                )
+                groups.setdefault((rel_t, rel_h, rel_w), []).append(
+                    (
+                        (slice(t0, t1), slice(h0, h1), slice(w0, w1)),
+                        (slice(rt0, rt1), slice(rh0, rh1), slice(rw0, rw1)),
+                    )
+                )
+
+    out = torch.empty((B, T, H, W_sub, NH, HD), device=device, dtype=v.dtype)
+    kv_budget = 2**28
+    for rel, tiles_list in groups.items():
+        mask = _na3d_sdpa_mask(rel, q.dtype, device)
+        nq, nk = mask.shape[2], mask.shape[3]
+        g_max = max(1, kv_budget // max(1, B * NH * nk * HD * 2))
+        qs0, _ = tiles_list[0]
+        tq = qs0[0].stop - qs0[0].start
+        th_sz = qs0[1].stop - qs0[1].start
+        tw_sz = qs0[2].stop - qs0[2].start
+        for c0 in range(0, len(tiles_list), g_max):
+            chunk = tiles_list[c0 : c0 + g_max]
+            g = len(chunk)
+            q_s = torch.stack([q[:, qs[0], qs[1], qs[2]] for qs, _ in chunk])
+            k_s = torch.stack([k[:, rs[0], rs[1], rs[2]] for _, rs in chunk])
+            v_s = torch.stack([v[:, rs[0], rs[1], rs[2]] for _, rs in chunk])
+            q_s = q_s.permute(0, 1, 5, 2, 3, 4, 6).reshape(g * B, NH, nq, HD)
+            k_s = k_s.permute(0, 1, 5, 2, 3, 4, 6).reshape(g * B, NH, nk, HD)
+            v_s = v_s.permute(0, 1, 5, 2, 3, 4, 6).reshape(g * B, NH, nk, HD)
+            o = F.scaled_dot_product_attention(q_s, k_s, v_s, attn_mask=mask, scale=1.0)
+            o = o.view(g, B, NH, tq, th_sz, tw_sz, HD).permute(0, 1, 3, 4, 5, 2, 6)
+            for i, (qs, _) in enumerate(chunk):
+                out[:, qs[0], qs[1], qs[2]] = o[i]
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Default LTX-2.5 and edge-case shapes
 # ---------------------------------------------------------------------------
 # Each tuple: (B, T, H, W, NH, HD, KT, KH, KW)
@@ -135,17 +272,6 @@ _SDPA_FAST_SHAPES = [
     (1, 11, 16, 16, 4, 64, 11, 11, 11),  # edge: T == KT         (SEQ = 2 816)
     (1, 16, 16, 16, 4, 64, 11, 11, 11),  # edge: W == 16         (SEQ = 4 096)
     (2, 16, 16, 32, 4, 64, 3, 5, 5),  # edge: B > 1           (SEQ = 8 192)
-]
-
-
-# ---------------------------------------------------------------------------
-# Shapes to test correct_rightmost_block
-# ---------------------------------------------------------------------------
-_CORRECTION_SHAPES = [
-    (1, 16, 80, 32, 4, 64, 11, 11, 11),  # diff-5 small tile
-    (1, 16, 80, 192, 4, 64, 11, 11, 11),  # diff-5 wide tile
-    (1, 18, 32, 48, 32, 64, 3, 7, 7),  # det-0
-    (1, 36, 64, 96, 8, 64, 3, 5, 5),  # det-2
 ]
 
 
@@ -253,65 +379,6 @@ def test_na3d_sdpa_exact_vs_ref(B, T, H, W, NH, HD, KT, KH, KW):
         atol=5e-2,
         msg=f"_na3d_sdpa_exact vs na3d_sdpa_ref (T={T},H={H},W={W},k=({KT},{KH},{KW}))",
     )
-
-
-@pytest.mark.parametrize("B,T,H,W,NH,HD,KT,KH,KW", _CORRECTION_SHAPES)
-def test_correct_rightmost_block(B, T, H, W, NH, HD, KT, KH, KW):
-    """Verify the ``correct_rightmost_block`` docstring claim.
-
-    Asserts:
-    1. Interior W positions are bit-identical before and after correction.
-    2. Rightmost W positions differ (correction fires and changes output).
-    3. Corrected rightmost positions match ``_na3d_sdpa_exact`` applied to
-       just those queries, confirming the kv_ok=False BF16(0) MFMA divergence
-       is eliminated.
-    """
-    if get_gfx() not in SUPPORTED_GFX:
-        pytest.skip(f"na3d_flash unsupported on {get_gfx()}")
-
-    scale = HD**-0.5
-    q = torch.randn(B, T, H, W, NH, HD, dtype=torch.bfloat16) * scale
-    k = torch.randn(B, T, H, W, NH, HD, dtype=torch.bfloat16)
-    v = torch.randn(B, T, H, W, NH, HD, dtype=torch.bfloat16)
-
-    out_base = na3d_flash_attn(q, k, v, (KT, KH, KW), correct_rightmost_block=False)
-    out_corr = na3d_flash_attn(q, k, v, (KT, KH, KW), correct_rightmost_block=True)
-
-    import aiter.ops.triton.attention.na3d_flash as na3d_flash_mod
-
-    actual_bq = na3d_flash_mod._na3d_flash_fwd.best_config.kwargs["BLOCK_Q"]
-    W_last = ((W - 1) // actual_bq) * actual_bq
-
-    diff = (out_corr.float() - out_base.float()).abs()
-
-    if W_last > 0:
-        # Claim 1: interior positions unchanged.
-        interior_max = diff[:, :, :, :W_last, :, :].max().item()
-        assert interior_max == 0.0, (
-            f"Interior W positions changed (max_diff={interior_max:.6f}) - "
-            f"correction must not touch positions 0..{W_last - 1}"
-        )
-
-        # Claim 2: rightmost positions differ (correction fired).
-        rightmost_max = diff[:, :, :, W_last:, :, :].max().item()
-        assert rightmost_max > 0.0, (
-            f"Rightmost W positions unchanged - "
-            f"T*H*(W-W_last)={T*H*(W-W_last)} should be <= 100_000 so correction fires"
-        )
-
-        # Claim 3: corrected positions match _na3d_sdpa_exact.
-        q_right = q[:, :, :, W_last:, :, :]
-        exact_right = _na3d_sdpa_exact(q_right, k, v, (KT, KH, KW), w_offset=W_last)
-        checkAllclose(
-            exact_right.float(),
-            out_corr[:, :, :, W_last:, :, :].float(),
-            rtol=1e-2,
-            atol=5e-2,
-            msg=(
-                f"corrected rightmost vs _na3d_sdpa_exact "
-                f"(T={T},H={H},W={W},W_last={W_last},k=({KT},{KH},{KW}))"
-            ),
-        )
 
 
 def main():
