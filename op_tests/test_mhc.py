@@ -11,8 +11,11 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.test_common import (
+    add_data_init_args,
     benchmark,
     checkAllclose,
+    fill,
+    make_generator,
     run_perftest,
 )
 
@@ -37,7 +40,6 @@ except ImportError:
 TRITON_MHC_POST_PRE_MAX_M = 4096
 
 torch.set_default_device("cuda")
-# torch.cuda.manual_seed_all(0)
 # torch.set_printoptions(precision=3, linewidth=200, sci_mode=False)
 
 
@@ -460,7 +462,15 @@ def mhc_pre_norm_split_hip(
 
 @benchmark()
 def test_mhc_pre(
-    m, hidden_size, hc_mult, test_hc_head=False, fuse_rmsnorm=False, fn_pack_bf16=False
+    m,
+    hidden_size,
+    hc_mult,
+    test_hc_head=False,
+    fuse_rmsnorm=False,
+    fn_pack_bf16=False,
+    dtype=dtypes.bf16,
+    data_init="norm",
+    seed=0,
 ):
     if fuse_rmsnorm and test_hc_head:
         raise ValueError("fuse_rmsnorm and hc_head are mutually exclusive")
@@ -468,13 +478,14 @@ def test_mhc_pre(
     hc_mult2 = hc_mult * hc_mult
     hc_mult3 = hc_mult * 2 + hc_mult2 if not test_hc_head else hc_mult
     hc_hidden_size = hc_mult * hidden_size
-    residual = torch.randn(m, hc_mult, hidden_size, dtype=dtypes.bf16)
-    fn = torch.randn(hc_mult3, hc_hidden_size, dtype=dtypes.fp32)
-    hc_scale = torch.randn((3,), dtype=dtypes.fp32) * 0.1
-    hc_base = torch.randn((hc_mult3,), dtype=dtypes.fp32) * 0.1
+    gen = make_generator(seed)
+    residual = fill((m, hc_mult, hidden_size), data_init, gen, dtype=dtype)
+    fn = fill((hc_mult3, hc_hidden_size), data_init, gen, dtype=dtypes.fp32)
+    hc_scale = fill((3,), data_init, gen, dtype=dtypes.fp32) * 0.1
+    hc_base = fill((hc_mult3,), data_init, gen, dtype=dtypes.fp32) * 0.1
     norm_weight = None
     if fuse_rmsnorm:
-        norm_weight = torch.randn(hidden_size, dtype=dtypes.bf16)
+        norm_weight = fill((hidden_size,), data_init, gen, dtype=dtype)
     extra_args = {
         "rms_eps": 1e-6,
         "hc_pre_eps": 1e-6,
@@ -680,11 +691,12 @@ def mhc_post_ref(
 
 
 @benchmark()
-def test_mhc_post(m, hidden_size, hc_mult):
-    x = torch.randn(m, hidden_size, dtype=dtypes.bf16)
-    residual = torch.randn(m, hc_mult, hidden_size, dtype=dtypes.bf16)
-    post_layer_mix = torch.randn(m, hc_mult, 1, dtype=dtypes.fp32)
-    comb_res_mix = torch.randn(m, hc_mult, hc_mult, dtype=dtypes.fp32)
+def test_mhc_post(m, hidden_size, hc_mult, dtype=dtypes.bf16, data_init="norm", seed=0):
+    gen = make_generator(seed)
+    x = fill((m, hidden_size), data_init, gen, dtype=dtype)
+    residual = fill((m, hc_mult, hidden_size), data_init, gen, dtype=dtype)
+    post_layer_mix = fill((m, hc_mult, 1), data_init, gen, dtype=dtypes.fp32)
+    comb_res_mix = fill((m, hc_mult, hc_mult), data_init, gen, dtype=dtypes.fp32)
     out_ref = mhc_post_ref(x, residual, post_layer_mix, comb_res_mix)
     out_hip, hip_us = run_perftest(
         mhc_post_hip,
@@ -784,7 +796,15 @@ def mhc_post_pre_unfused_hip(
 
 @benchmark()
 def test_mhc_post_pre(
-    m, hidden_size, hc_mult, fuse_rmsnorm=False, large_m=False, fn_pack_bf16=False
+    m,
+    hidden_size,
+    hc_mult,
+    fuse_rmsnorm=False,
+    large_m=False,
+    fn_pack_bf16=False,
+    dtype=dtypes.bf16,
+    data_init="norm",
+    seed=0,
 ):
     """Fused mhc_post + mhc_pre: HIP ``mhc_fused_post_pre`` vs ref / unfused HIP / Triton."""
     if hidden_size < 512:
@@ -800,16 +820,17 @@ def test_mhc_post_pre(
     hc_mult3 = hc_mult * 2 + hc_mult2
     hc_hidden_size = hc_mult * hidden_size
 
-    layer_input = torch.randn(m, hidden_size, dtype=dtypes.bf16)
-    residual_in = torch.randn(m, hc_mult, hidden_size, dtype=dtypes.bf16)
-    post_layer_mix = torch.randn(m, hc_mult, 1, dtype=dtypes.fp32)
-    comb_res_mix = torch.randn(m, hc_mult, hc_mult, dtype=dtypes.fp32)
-    fn = torch.randn(hc_mult3, hc_hidden_size, dtype=dtypes.fp32)
-    hc_scale = torch.randn((3,), dtype=dtypes.fp32) * 0.1
-    hc_base = torch.randn((hc_mult3,), dtype=dtypes.fp32) * 0.1
+    gen = make_generator(seed)
+    layer_input = fill((m, hidden_size), data_init, gen, dtype=dtype)
+    residual_in = fill((m, hc_mult, hidden_size), data_init, gen, dtype=dtype)
+    post_layer_mix = fill((m, hc_mult, 1), data_init, gen, dtype=dtypes.fp32)
+    comb_res_mix = fill((m, hc_mult, hc_mult), data_init, gen, dtype=dtypes.fp32)
+    fn = fill((hc_mult3, hc_hidden_size), data_init, gen, dtype=dtypes.fp32)
+    hc_scale = fill((3,), data_init, gen, dtype=dtypes.fp32) * 0.1
+    hc_base = fill((hc_mult3,), data_init, gen, dtype=dtypes.fp32) * 0.1
     norm_weight = None
     if fuse_rmsnorm:
-        norm_weight = torch.randn(hidden_size, dtype=dtypes.bf16)
+        norm_weight = fill((hidden_size,), data_init, gen, dtype=dtype)
 
     extra_args = {
         "rms_eps": 1e-6,
@@ -1065,23 +1086,28 @@ parser.add_argument(
     "(mhc_post_pre). gfx950 native bf16 MFMA; gfx1250 wave32 bf16 WMMA (UNVERIFIED); "
     "other arches fall back to fp32.",
 )
+add_data_init_args(parser, default_dist="norm")
 
 args = parser.parse_args()
 
 df = []
 for dtype in args.dtype:
-    for hidden_size in args.hidden_size:
-        for m in args.m:
-            for hc_mult in [4]:
-                ret = test_mhc_pre(
-                    m=m,
-                    hidden_size=hidden_size,
-                    hc_mult=hc_mult,
-                    test_hc_head=args.hc_head,
-                    fuse_rmsnorm=args.fuse_rmsnorm,
-                    fn_pack_bf16=args.fn_pack_bf16,
-                )
-                df.append(ret)
+    for data_init in args.data_init:
+        for hidden_size in args.hidden_size:
+            for m in args.m:
+                for hc_mult in [4]:
+                    ret = test_mhc_pre(
+                        m=m,
+                        hidden_size=hidden_size,
+                        hc_mult=hc_mult,
+                        test_hc_head=args.hc_head,
+                        fuse_rmsnorm=args.fuse_rmsnorm,
+                        fn_pack_bf16=args.fn_pack_bf16,
+                        dtype=dtype,
+                        data_init=data_init,
+                        seed=args.seed,
+                    )
+                    df.append(ret)
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("mhc_pre summary (markdown):\n%s", df_md)
@@ -1089,31 +1115,43 @@ aiter.logger.info("mhc_pre summary (markdown):\n%s", df_md)
 if not args.hc_head:
     df = []
     for dtype in args.dtype:
-        for hidden_size in args.hidden_size:
-            for m in args.m:
-                for hc_mult in [4]:
-                    ret = test_mhc_post(m=m, hidden_size=hidden_size, hc_mult=hc_mult)
-                    df.append(ret)
+        for data_init in args.data_init:
+            for hidden_size in args.hidden_size:
+                for m in args.m:
+                    for hc_mult in [4]:
+                        ret = test_mhc_post(
+                            m=m,
+                            hidden_size=hidden_size,
+                            hc_mult=hc_mult,
+                            dtype=dtype,
+                            data_init=data_init,
+                            seed=args.seed,
+                        )
+                        df.append(ret)
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
     aiter.logger.info("mhc_post summary (markdown):\n%s", df_md)
 
     df = []
     for dtype in args.dtype:
-        for hidden_size in args.hidden_size:
-            for m in args.m:
-                for hc_mult in [4]:
-                    ret = test_mhc_post_pre(
-                        m=m,
-                        hidden_size=hidden_size,
-                        hc_mult=hc_mult,
-                        fuse_rmsnorm=args.fuse_rmsnorm,
-                        large_m=args.largeM,
-                        fn_pack_bf16=args.fn_pack_bf16,
-                    )
-                    if ret.get("skipped"):
-                        continue
-                    df.append(ret)
+        for data_init in args.data_init:
+            for hidden_size in args.hidden_size:
+                for m in args.m:
+                    for hc_mult in [4]:
+                        ret = test_mhc_post_pre(
+                            m=m,
+                            hidden_size=hidden_size,
+                            hc_mult=hc_mult,
+                            fuse_rmsnorm=args.fuse_rmsnorm,
+                            large_m=args.largeM,
+                            fn_pack_bf16=args.fn_pack_bf16,
+                            dtype=dtype,
+                            data_init=data_init,
+                            seed=args.seed,
+                        )
+                        if ret.get("skipped"):
+                            continue
+                        df.append(ret)
     if df:
         df = pd.DataFrame(df)
         df_md = df.to_markdown(index=False)
