@@ -39,14 +39,19 @@ _CONFIGS = [
 
 
 def _prune_configs(configs, named_args, **kwargs):
-    """Remove configs where BLOCK_Q > W.
+    """Remove configs where BLOCK_Q > W or BLOCK_KV is too small for KW.
 
     Performance constraint: BLOCK_Q > W would leave most of every block masked,
-    wasting compute.  Correctness is guaranteed by the row-decomposed grid
-    regardless of whether W is divisible by BLOCK_Q.
+    wasting compute. Correctness also requires BLOCK_KV >= (BLOCK_Q + KW - 1)
+    so the KV tile covers the union of all BLOCK_Q query windows.
     """
     W = named_args["W"]
-    return [c for c in configs if c.kwargs["BLOCK_Q"] <= W]
+    KW = named_args["KW"]
+    return [
+        c
+        for c in configs
+        if c.kwargs["BLOCK_Q"] <= W and c.kwargs["BLOCK_KV"] >= c.kwargs["BLOCK_Q"] + KW - 1
+    ]
 
 
 _na3d_flash_fwd_repr = make_kernel_repr(
