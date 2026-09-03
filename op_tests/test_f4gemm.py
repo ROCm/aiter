@@ -307,6 +307,10 @@ def test_gemm(
     seed=0,
     mode="perf",
     knl_name=None,
+    num_warmup=2,
+    num_iters=None,
+    test_graph=False,
+    num_rotate=0,
 ):
     # Skip unsupported combos up front (before prep/shuffle) so they show as
     # "not support" rather than crashing on a shape assert.
@@ -328,6 +332,8 @@ def test_gemm(
         return {
             "gfx": get_gfx(),
             "knl_name": actual_knl,
+            "tile": "256x256",
+            "cluster": "4x4",
             "asm us": float("nan"),
             "asm TFLOPS": float("nan"),
             "asm TB/s": float("nan"),
@@ -349,7 +355,8 @@ def test_gemm(
     else:
         ref = ref_f32.to(out_dtype)
     needTrace = mode == "profile"
-    num_iters = 5 if mode == "func" else 101
+    # --iters overrides; unset keeps the mode default (func=5, perf/profile=101).
+    num_iters = num_iters if num_iters is not None else (5 if mode == "func" else 101)
 
     # Kernel/.co base name for this config (used for logging, and to derive the
     # mangled knl_name when an explicit dispatch is requested). See
@@ -419,7 +426,11 @@ def test_gemm(
     # the verbatim knl_name otherwise (kept in the table, see main()).
     actual_knl = knl_name if (knl_name and knl_name != "auto") else base
     ret = {"gfx": get_gfx(), "knl_name": actual_knl}
-    # F4GEMM tiles are always 256x256 (see f4gemm.csv). Report TG occupancy.
+    # Structured algo details (f4gemm.csv columns): F4GEMM tiles are always
+    # 256x256 with a 4x4 (cluster_x x cluster_y) cluster; no splitk/unroll axis.
+    ret["tile"] = "256x256"
+    ret["cluster"] = "4x4"
+    # Report TG occupancy for the 256x256 tile.
     _report_active_tg(M, N, 256, 256, base)
     # Only a missing .co is reported as "not support"; any other failure (OOM,
     # memory fault, shape assert, ...) must propagate, not show as a green cell.
@@ -431,7 +442,13 @@ def test_gemm(
     for name, (fn, fn_args) in candidates.items():
         try:
             out, us = run_perftest(
-                fn, *fn_args, num_iters=num_iters, needTrace=needTrace
+                fn,
+                *fn_args,
+                num_iters=num_iters,
+                num_warmup=num_warmup,
+                testGraph=test_graph,
+                num_rotate_args=num_rotate,
+                needTrace=needTrace,
             )
         except Exception as e:
             if not any(m in str(e) for m in _NOT_SUPPORTED_MARKERS):
@@ -609,6 +626,39 @@ def main():
         help="RNG seed; same seed -> bit-identical data/scale buffers",
     )
     parser.add_argument(
+        "--warmup",
+        type=int,
+        default=2,
+        help="warmup iterations before timing (run_perftest num_warmup)",
+    )
+    parser.add_argument(
+        "--iters",
+        type=int,
+        default=None,
+        help="timed iterations (run_perftest num_iters); unset -> mode default "
+        "(func=5, perf/profile=101)",
+    )
+    parser.add_argument(
+        "--graph",
+        action="store_true",
+        help="also time via HIP graph replay (run_perftest testGraph), "
+        "minimizing inter-kernel gaps",
+    )
+    parser.add_argument(
+        "--rotate",
+        type=int,
+        default=0,
+        help="rotating input-buffer copies to defeat the L2 hot-cache "
+        "(run_perftest num_rotate_args); 0 = auto-size from L2",
+    )
+    parser.add_argument(
+        "--json",
+        dest="json_out",
+        default=None,
+        help="also write the full summary table (all columns) as JSON records "
+        "to this path, for CI/regression",
+    )
+    parser.add_argument(
         "--knl-name",
         dest="knl_name",
         default=None,
@@ -682,14 +732,39 @@ def main():
             seed=args.seed,
             mode=args.mode,
             knl_name=args.knl_name,
+            num_warmup=args.warmup,
+            num_iters=args.iters,
+            test_graph=args.graph,
+            num_rotate=args.rotate,
         )
         for apre, (di, si), intype, outtype, (M, N, K) in itertools.product(
             apre_list, init_pairs, args.intype, args.outtype, shapes
         )
     ]
-    df = pd.DataFrame(rows)
-    # Keep knl_name (the actual .co); drop the columns constant within a table.
-    df = df.drop(columns=["seed", "gfx", "mode"], errors="ignore")
+    df_full = pd.DataFrame(rows)
+    # JSON keeps every column (config + algo details + results) so each record is
+    # self-describing for CI/regression; the markdown table below drops columns
+    # that are constant within a run for readability.
+    if args.json_out:
+        df_full.to_json(args.json_out, orient="records", indent=2)
+        aiter.logger.info(
+            "wrote JSON summary (%d rows) to %s", len(df_full), args.json_out
+        )
+    # Keep knl_name (the actual .co) + tile; drop columns constant within a table
+    # (cluster is always 4x4).
+    df = df_full.drop(
+        columns=[
+            "seed",
+            "gfx",
+            "mode",
+            "num_warmup",
+            "num_iters",
+            "test_graph",
+            "num_rotate",
+            "cluster",
+        ],
+        errors="ignore",
+    )
     aiter.logger.info(
         "gemm_a4w4 (F4GEMM) summary (markdown):\n%s",
         df.to_markdown(index=False),
