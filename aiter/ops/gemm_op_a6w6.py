@@ -21,6 +21,28 @@ from ..utility import dtypes
 # match exactly what the `f6gemm_dmabig_kernel_func` kernel consumes.
 _KERNEL_NAME = "f6gemm_dmabig_kernel_func"
 _SAFE_FALLBACK_KERNEL_NAME = "f6gemm_dmabig_swz0_kernel_func"
+# Kernels that fold a row-broadcast bias into their store epilogue. The whole
+# dmabig/stnt family does; of the imported mxfp6-gemms-opt variants only the
+# `_bias` rebuilds do, since that branch has no bias epilogue of its own. A
+# kernel absent from this set ignores the bias slots rather than rejecting them,
+# so the check at the entry point is the only thing standing between a mis-tuned
+# row and a silently unbiased result.
+_LOG_BIAS_USE = os.environ.get("AITER_LOG_A6W6_BIAS_USE", "")
+_BIAS_CAPABLE_KERNELS = frozenset(
+    {
+        "f6gemm_dmabig_kernel_func",
+        "f6gemm_dmabig_swz0_kernel_func",
+        "f6gemm_dmabig_grp16_kernel_func",
+        "f6gemm_dmabig_grp64_kernel_func",
+        "f6gemm_dmabig_allk_kernel_func",
+        "f6gemm_stnt_kernel_func",
+        "f6gemm_stnt_allk_kernel_func",
+        "aiter_a6w6_m256n256_persistent_bias",
+        "aiter_a6w6_m256n256_persistent_prefetch10_bias",
+        "aiter_a6w6_m256n512_persistent_bias",
+        "aiter_a6w6_m256n512_persistent_row_stage_bias",
+    }
+)
 _TILE = 256
 _K_TILE = 128
 _SCALE_GROUP_SIZE = 32
@@ -851,6 +873,28 @@ def gemm_a6w6_asm(
         if out.ndim != 2:
             raise ValueError("gemm_a6w6_asm expects a 2D [M, N] output tensor.")
         kernelName = _default_gemm_a6w6_kernel(*out.shape, K)
+    if _LOG_BIAS_USE:
+        # Which call sites actually pass a bias is not something the shape table can
+        # be derived from by reading the model: with the fused MLP on, fc1's bias
+        # goes into the packer's GELU prologue and fc2's is handed back for the
+        # residual add, so neither MLP GEMM passes one even though both linears
+        # have a bias. Set AITER_LOG_A6W6_BIAS_USE=<path> to record the truth.
+        with open(_LOG_BIAS_USE, "a") as _handle:
+            _handle.write(
+                f"{out.shape[0]},{out.shape[1]},{int(K)},"
+                f"{int(bias is not None)},{kernelName}\n"
+            )
+    if bias is not None and kernelName not in _BIAS_CAPABLE_KERNELS:
+        # A kernel with no bias epilogue ignores the ptr_C and stride_C1 slots the
+        # bias rides in, so it would run to completion and return an unbiased
+        # result. That is a silent wrong answer rather than a failure, and a tuned
+        # record keys on (M, N, K) alone -- it cannot express "only when unbiased"
+        # -- so a key any biased GEMM can reach must name a bias-capable kernel.
+        raise ValueError(
+            f"gemm_a6w6_asm was given a bias but {kernelName!r} has no bias "
+            f"epilogue, which would silently drop it. Tune this shape to a "
+            f"bias-capable kernel: {sorted(_BIAS_CAPABLE_KERNELS)}"
+        )
     _gemm_a6w6_asm(
         A,
         B,
