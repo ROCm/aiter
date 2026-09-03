@@ -9,12 +9,14 @@ Key primitives:
 """
 
 from __future__ import annotations
+
 from dataclasses import dataclass
+
+import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects.arith import CmpIPredicate
-from flydsl.expr.typing import T
 from flydsl.expr import arith as _arith
-import flydsl.expr as fx
+from flydsl.expr.typing import T
 
 
 def crd2idx(crd, layout):
@@ -355,8 +357,8 @@ def _int4_to_bf16x4_i64_gfx950(
     omitted and must be applied later (e.g. in the epilogue).  This saves VALU
     in the hot loop and uses v_cvt_pk_bf16_f32 for proper f32→bf16 conversion.
     """
-    from flydsl.expr import rocdl
     from flydsl._mlir.dialects._arith_ops_gen import MulFOp as _MulFOp
+    from flydsl.expr import rocdl
 
     _uw = _arith._to_raw
     _av = _arith.ArithValue

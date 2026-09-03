@@ -41,31 +41,30 @@ import re
 import statistics
 import subprocess
 import sys
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
 import triton
 
+from aiter.ops.triton.conv._prepack import prepack_nchw_to_cblocked
 from aiter.ops.triton.conv._utils import (
     BLOCK_K,
-    _out_hw,
     _is_1x1_conv,
     _is_3x3_conv,
+    _out_hw,
 )
-from aiter.ops.triton.conv._prepack import prepack_nchw_to_cblocked
 from aiter.ops.triton.conv.conv2d import (
+    _resolve_route,
     conv2d,
     conv2d_nchw,
     conv2d_nchw_cblocked,
     conv2d_nhwc,
     conv2d_winograd_f4x3,
     conv2d_winograd_f4x3_cblocked,
-    _resolve_route,
 )
 from op_tests.triton_tests.conv._helpers import (
-    dynamic_conv_tolerances,
     _winograd_tolerances,
+    dynamic_conv_tolerances,
 )
 
 
@@ -73,14 +72,33 @@ def flops_conv(N, C, K_out, R, S, P, Q):
     return 2.0 * N * P * Q * K_out * C * R * S
 
 
-def which_kernel(x, w_oihw, stride=(1, 1), dilation=(1, 1), layout="nchw"):
+def which_kernel(
+    x,
+    w_oihw,
+    stride=(1, 1),
+    dilation=(1, 1),
+    layout="nchw",
+    padding=(0, 0),
+):
     """Name of the Triton kernel ``conv2d`` would route to for these shapes,
     without launching anything. Delegates to the production ``_resolve_route``
     (the same decision the router uses), so the label can never drift from
     dispatch. Bench-only: used to label rows and pick correctness tolerances."""
     N, C, H, W_in = x.shape
     K_out, _, R, S = w_oihw.shape
-    route = _resolve_route(R, S, stride, dilation, N, C, H, W_in, K_out, layout.lower())
+    route = _resolve_route(
+        R,
+        S,
+        stride,
+        dilation,
+        N,
+        C,
+        H,
+        W_in,
+        K_out,
+        layout.lower(),
+        padding=padding,
+    )
     return route.value
 
 
@@ -181,7 +199,6 @@ def precompute_miopen_solvers(shapes, dtype: torch.dtype) -> None:
 
     Cache populated as a side effect. Use _get_miopen_solver to read.
     """
-    global _miopen_solver_cache
 
     unique = []
     seen = set()
@@ -225,6 +242,7 @@ def precompute_miopen_solvers(shapes, dtype: torch.dtype) -> None:
             text=True,
             timeout=120,
             env={**os.environ, "MIOPEN_LOG_LEVEL": "6"},
+            check=False,
         )
     except subprocess.TimeoutExpired:
         print(
@@ -233,7 +251,7 @@ def precompute_miopen_solvers(shapes, dtype: torch.dtype) -> None:
             file=sys.stderr,
         )
         return
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(
             f"[miopen-detect] WARNING: subprocess failed ({e!r}); "
             f"MIOpen solver column will be empty.",
@@ -251,7 +269,7 @@ def precompute_miopen_solvers(shapes, dtype: torch.dtype) -> None:
         )
         return
 
-    pending: Optional[str] = None
+    pending: str | None = None
     attributed: dict = {}
     orphan = 0
     shape_done_re = re.compile(r"^SHAPE_DONE:(\d+)\s*$")
@@ -369,7 +387,14 @@ def bench_one_shape(
     y_tri = run_triton()
     torch.cuda.synchronize()
     if method in ("auto", "default") or layout == "nhwc":
-        kernel_name = which_kernel(x_in, w, stride, dilation, layout=layout)
+        kernel_name = which_kernel(
+            x_in,
+            w,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            layout=layout,
+        )
     else:
         kernel_name = method
     is_winograd = "winograd" in kernel_name.lower() or "wino" in kernel_name.lower()
@@ -506,7 +531,7 @@ def run_single_shape(args) -> None:
 # ----------------------------------------------------------------------------
 
 
-def _box_table(headers, rows, align: Optional[list] = None) -> str:
+def _box_table(headers, rows, align: list | None = None) -> str:
     """Render a list of header-string + row-tuples into a box-drawn table.
 
     align: per-column alignment, "l" (left, default) or "r" (right).
@@ -813,7 +838,7 @@ def run_sweep(args) -> None:
                 bias=not args.no_bias,
                 measure_repack=True,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"  {name:<24} ERROR: {type(e).__name__}: {e}", file=sys.stderr)
             continue
         miopen = (
@@ -856,7 +881,7 @@ def run_sweep(args) -> None:
 # ----------------------------------------------------------------------------
 
 
-def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="bench_conv2d",
         description="Benchmark aiter.ops.triton.conv.conv2d (single shape or sweep).",
@@ -962,7 +987,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     return args
 
 
-def main(argv: Optional[list[str]] = None) -> None:
+def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     if args.single_shape:
         run_single_shape(args)

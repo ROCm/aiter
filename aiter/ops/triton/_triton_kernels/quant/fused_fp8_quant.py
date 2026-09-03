@@ -1,6 +1,8 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
 try:
     from triton.language.extra.libdevice import fast_dividef, fast_expf
 except ImportError:
@@ -39,7 +41,19 @@ def _fp8_quant_op(
     return x, scale_out
 
 
-@triton.jit
+_fused_rms_fp8_per_tensor_static_quant_repr = make_kernel_repr(
+    "_fused_rms_fp8_per_tensor_static_quant_kernel",
+    [
+        "BLOCK_SIZE_N",
+        "HAVE_SECOND_INPUT",
+        "FIRST_INPUT_RES",
+        "FIRST_INPUT_OUT",
+        "RMSNORM_CONVERT_TO_INP1_TYPE",
+    ],
+)
+
+
+@triton.jit(repr=_fused_rms_fp8_per_tensor_static_quant_repr)
 def _fused_rms_fp8_per_tensor_static_quant_kernel(
     inp1_ptr,
     weight1_ptr,
@@ -148,7 +162,30 @@ def _fused_rms_fp8_per_tensor_static_quant_kernel(
         )
 
 
-@triton.jit
+_fused_rms_fp8_group_quant_repr = make_kernel_repr(
+    "_fused_rms_fp8_group_quant_kernel",
+    [
+        "BLOCK_SIZE_N",
+        "QUANT_BLOCK_SIZE",
+        "HAVE_SECOND_INPUT",
+        "FIRST_INPUT_RES",
+        "FIRST_INPUT_OUT",
+        "GATED_RMS_FP8",
+        "RMS_TILE",
+        "ROWS_PER_BLOCK",
+        "GROUP_SIZE_GATED",
+        "NUM_GROUPS_GATED",
+        "BLOCK_G",
+        "HAS_BIAS_GATED",
+        "HAS_Z_GATED",
+        "NORM_BEFORE_GATE",
+        "USE_UE8M0",
+        "ACTIVATION",
+    ],
+)
+
+
+@triton.jit(repr=_fused_rms_fp8_group_quant_repr)
 def _fused_rms_fp8_group_quant_kernel(
     inp1_ptr,
     weight1_ptr,
@@ -246,9 +283,7 @@ def _fused_rms_fp8_group_quant_kernel(
             if HAS_Z_GATED and (not NORM_BEFORE_GATE):
                 Z_base = Z + rows[:, None] * stride_z_row + col_offsets
                 z_el = tl.load(Z_base, mask=mask_r, other=0.0).to(tl.float32)
-                if ACTIVATION == "swish":
-                    x_el = x_el * (z_el * tl.sigmoid(z_el))
-                elif ACTIVATION == "silu":
+                if ACTIVATION == "swish" or ACTIVATION == "silu":
                     x_el = x_el * (z_el * tl.sigmoid(z_el))
                 elif ACTIVATION == "sigmoid":
                     x_el = x_el * tl.sigmoid(z_el)
@@ -272,9 +307,7 @@ def _fused_rms_fp8_group_quant_kernel(
             if HAS_Z_GATED and (not NORM_BEFORE_GATE):
                 Z_base = Z + rows[:, None] * stride_z_row + col_offsets
                 z_el = tl.load(Z_base, mask=mask_g, other=0.0).to(tl.float32)
-                if ACTIVATION == "swish":
-                    x_el = x_el * (z_el * tl.sigmoid(z_el))
-                elif ACTIVATION == "silu":
+                if ACTIVATION == "swish" or ACTIVATION == "silu":
                     x_el = x_el * (z_el * tl.sigmoid(z_el))
                 elif ACTIVATION == "sigmoid":
                     x_el = x_el * tl.sigmoid(z_el)
@@ -292,9 +325,7 @@ def _fused_rms_fp8_group_quant_kernel(
             if HAS_Z_GATED and NORM_BEFORE_GATE:
                 Z_base = Z + rows[:, None] * stride_z_row + col_offsets
                 z_el = tl.load(Z_base, mask=mask_g, other=0.0).to(tl.float32)
-                if ACTIVATION == "swish":
-                    y_el = y_el * (z_el * tl.sigmoid(z_el))
-                elif ACTIVATION == "silu":
+                if ACTIVATION == "swish" or ACTIVATION == "silu":
                     y_el = y_el * (z_el * tl.sigmoid(z_el))
                 elif ACTIVATION == "sigmoid":
                     y_el = y_el * tl.sigmoid(z_el)
@@ -392,7 +423,16 @@ def _fused_rms_fp8_group_quant_kernel(
             )
 
 
-@triton.jit
+_fused_flatten_fp8_group_quant_repr = make_kernel_repr(
+    "_fused_flatten_fp8_group_quant_kernel",
+    [
+        "BLOCK_SIZE_N2",
+        "QUANT_BLOCK_SIZE",
+    ],
+)
+
+
+@triton.jit(repr=_fused_flatten_fp8_group_quant_repr)
 def _fused_flatten_fp8_group_quant_kernel(
     x_ptr,
     out_ptr,
@@ -446,7 +486,22 @@ def _fused_flatten_fp8_group_quant_kernel(
     )
 
 
-@triton.jit
+_fused_reduce_act_mul_fp8_group_quant_repr = make_kernel_repr(
+    "_fused_reduce_act_mul_fp8_group_quant",
+    [
+        "BLOCK_SIZE_M2",
+        "BLOCK_SIZE_N1",
+        "BLOCK_SIZE_N2",
+        "QUANT_BLOCK_SIZE",
+        "X_HAS_SPLITK",
+        "X_NUM_KSPLIT",
+        "X_NUM_KSPLIT_POW2",
+        "X_MASK",
+    ],
+)
+
+
+@triton.jit(repr=_fused_reduce_act_mul_fp8_group_quant_repr)
 def _fused_reduce_act_mul_fp8_group_quant(
     x_ptr,
     y_ptr,
@@ -595,7 +650,27 @@ def _fused_reduce_act_mul_fp8_group_quant(
     )
 
 
-@triton.jit
+_fused_reduce_rms_fp8_group_quant_repr = make_kernel_repr(
+    "_fused_reduce_rms_fp8_group_quant_kernel",
+    [
+        "BLOCK_SIZE_N1",
+        "BLOCK_SIZE_N2",
+        "BLOCK_SIZE_N3",
+        "N_MASK1",
+        "N_MASK2",
+        "N_MASK3",
+        "QUANT_BLOCK_SIZE",
+        "HAVE_SECOND_INPUT",
+        "FIRST_INPUT_RES",
+        "FIRST_INPUT_OUT",
+        "HAS_SPLITK",
+        "NUM_SPLITK",
+        "NUM_SPLITK_POW2",
+    ],
+)
+
+
+@triton.jit(repr=_fused_reduce_rms_fp8_group_quant_repr)
 def _fused_reduce_rms_fp8_group_quant_kernel(
     inp1_ptr,
     weight1_ptr,
@@ -843,7 +918,16 @@ def _fused_reduce_rms_fp8_group_quant_kernel(
             )
 
 
-@triton.jit
+_fused_silu_mul_fp8_per_tensor_static_quant_repr = make_kernel_repr(
+    "_fused_silu_mul_fp8_per_tensor_static_quant_kernel",
+    [
+        "BLOCK_SIZE_N",
+        "SILU_CONVERT_TO_INP_TYPE",
+    ],
+)
+
+
+@triton.jit(repr=_fused_silu_mul_fp8_per_tensor_static_quant_repr)
 def _fused_silu_mul_fp8_per_tensor_static_quant_kernel(
     inp_ptr,
     out_fp8_ptr,

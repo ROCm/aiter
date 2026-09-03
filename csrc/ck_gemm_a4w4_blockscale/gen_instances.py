@@ -2,8 +2,8 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 import argparse
 import os
-import sys
 import shutil
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -17,17 +17,16 @@ AITER_CORE_DIR = (
     else os.path.abspath(f"{this_dir}/../../aiter/jit/utils")
 )
 sys.path.insert(0, AITER_CORE_DIR)
-from chip_info import (  # noqa: E402
+from chip_info import (
     build_tune_dict,
     write_lookup_header,
     write_name_keyed_lookup_header,
 )
-
-from gemm_a4w4_blockscale_common import (  # noqa: E402
+from gemm_a4w4_blockscale_common import (
     default_kernels_dict,
     kernelInstance,
-    kernels_list,
     kernels_by_name,
+    kernels_list,
 )
 
 """
@@ -82,11 +81,11 @@ aiter_tensor_t&
             {k.AK1}, {k.BK1},
             {k.MPerXDL}, {k.NPerXDL},
             {k.WAVE_MAP_M}, {k.WAVE_MAP_N},
-            S<{(", ").join(map(lambda x:str(x),k.ABLOCK_TRANSFER))}>,
-            S<{(", ").join(map(lambda x:str(x),k.BBLOCK_TRANSFER))}>,
+            S<{(", ").join(str(x) for x in k.ABLOCK_TRANSFER)}>,
+            S<{(", ").join(str(x) for x in k.BBLOCK_TRANSFER)}>,
             {k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE},
             {k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE},
-            S<{(", ").join(map(lambda x:str(x),k.CBLOCK_TRANSFER))}>,
+            S<{(", ").join(str(x) for x in k.CBLOCK_TRANSFER)}>,
             {k.CBLOCK_SPV},
             ck::BlockGemmPipelineScheduler::{k.PIPELINE_Sched},
             ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
@@ -248,8 +247,10 @@ aiter_tensor_t&
             os.path.join(self.working_path, "gemm_a4w4_blockscale_manifest.h"), "w"
         ) as f:
             f.write(MAINFEST_head)
-            for mnk, k in kernels_dict.items():
-                f.write(MAINFEST_template.format(kernel_name=k.name))
+            f.writelines(
+                MAINFEST_template.format(kernel_name=k.name)
+                for mnk, k in kernels_dict.items()
+            )
             f.write(MAINFEST_end)
 
     def gen_instances(self, kernels_dict):
@@ -260,7 +261,7 @@ aiter_tensor_t&
             shutil.rmtree(self.instances_path)
         os.mkdir(self.instances_path)
 
-        for mnk, k in kernels_dict.items():
+        for k in kernels_dict.values():
             self.gen_instance(k)
 
         self.gen_lookup_dict(kernels_dict)

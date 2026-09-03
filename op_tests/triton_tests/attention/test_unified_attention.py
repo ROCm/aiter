@@ -1,22 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import Optional
+
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from aiter.ops.triton.attention.unified_attention import (
-    unified_attention,
+    _is_gluon_available,
     is_2d_gluon_available,
+    unified_attention,
 )
-from aiter.ops.triton.utils.shuffle import shuffle_weight, shuffle_scale_batched
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.shuffle import shuffle_scale_batched, shuffle_weight
+from aiter.ops.triton.utils.types import e4m3_dtype
+from aiter.test_common import checkAllclose
 from op_tests.triton_tests.quant.test_quant_mxfp4 import (
     torch_dynamic_mxfp4_quant,
 )
-from aiter.ops.triton.utils.types import e4m3_dtype
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.test_common import checkAllclose
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
@@ -181,7 +183,6 @@ def generate_data(
     )
     query_scales = None
     if q_dtype == torch.uint8:
-        # NVFP4 query: the kernel consumes packed fp4 + scales, the reference uses e4m3.
         query = query / 10
         maybe_quant_query = query.view(-1, head_size)
         maybe_quant_query, query_scales = torch_dynamic_mxfp4_quant(
@@ -205,7 +206,6 @@ def generate_data(
     )
     value_cache = torch.randn_like(key_cache)
     if kv_dtype == torch.uint8:
-        # NVFP4 KV cache: kernel consumes packed+shuffled cache, reference uses e4m3.
         key_cache_orig = key_cache.to(e4m3_dtype)
         value_cache_orig = value_cache.to(e4m3_dtype)
         key_cache, value_cache = dynamic_nvfp4_quant_kv_cache(
@@ -293,13 +293,13 @@ def ref_paged_attn(
     block_tables: torch.Tensor,
     scale: float,
     out_dtype: torch.dtype,
-    sliding_window: Optional[int] = None,
-    soft_cap: Optional[float] = None,
-    sinks: Optional[torch.Tensor] = None,
-    q_descale: Optional[torch.Tensor] = None,
-    k_descale: Optional[torch.Tensor] = None,
-    v_descale: Optional[torch.Tensor] = None,
-    output_scale: Optional[torch.Tensor] = None,
+    sliding_window: int | None = None,
+    soft_cap: float | None = None,
+    sinks: torch.Tensor | None = None,
+    q_descale: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
+    output_scale: torch.Tensor | None = None,
     causal: int = 1,
 ) -> torch.Tensor:
     num_seqs = len(query_lens)
@@ -385,9 +385,8 @@ def ref_paged_attn(
         (torch.bfloat16, e4m3_dtype, torch.bfloat16, 128, False),
         (e4m3_dtype, e4m3_dtype, torch.bfloat16, 128, False),
         (e4m3_dtype, e4m3_dtype, e4m3_dtype, 128, True),
-        # skip NVFP4 KV cache for now as ds_load_tr4 is not yet supported
-        # (e4m3_dtype, torch.uint8, torch.bfloat16, 128, False),
-        # (torch.uint8, torch.uint8, torch.bfloat16, 128, False),
+        (e4m3_dtype, torch.uint8, torch.bfloat16, 128, False),
+        (torch.uint8, torch.uint8, torch.bfloat16, 128, False),
     ],
 )
 @pytest.mark.parametrize("soft_cap", [None])
@@ -398,9 +397,9 @@ def test_triton_unified_attn_3d(
     seq_lens: list[tuple[int, int]],
     num_heads: tuple[int, int],
     head_size: int,
-    sliding_window: Optional[int],
+    sliding_window: int | None,
     block_size: int,
-    soft_cap: Optional[float],
+    soft_cap: float | None,
     num_blocks: int,
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
@@ -437,7 +436,7 @@ def test_triton_unified_attn_3d(
         LDS_limit = 327680 if IS_DEVICE_ARCH_GFX12 else 262144
         if kv_cache_shared_mem_size > LDS_limit:
             pytest.skip(
-                f"Skipping test for KV cache LDS required memory = {kv_cache_shared_mem_size/1024} kB > 320 kB"
+                f"Skipping test for KV cache LDS required memory = {kv_cache_shared_mem_size / 1024} kB > 320 kB"
             )
 
     # TODO: Uncomment after pytorch adds support for manual_seed
@@ -557,7 +556,7 @@ def test_triton_unified_attn_3d(
     ],
 )
 @pytest.mark.parametrize("num_heads", [(8, 8), (8, 1)])
-@pytest.mark.parametrize("head_size", [64, 128])
+@pytest.mark.parametrize("head_size", [64, 128, 256, 512])
 @pytest.mark.parametrize("block_size", [16, 64])
 @pytest.mark.parametrize("sliding_window", [None, 256])
 @pytest.mark.parametrize(
@@ -584,14 +583,15 @@ def test_triton_unified_attn_3d(
         False,
     ],
 )
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 @torch.inference_mode()
 def test_triton_unified_attn(
     seq_lens: list[tuple[int, int]],
     num_heads: tuple[int, int],
     head_size: int,
-    sliding_window: Optional[int],
+    sliding_window: int | None,
     block_size: int,
-    soft_cap: Optional[float],
+    soft_cap: float | None,
     num_blocks: int,
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
@@ -600,8 +600,20 @@ def test_triton_unified_attn(
     use_kv_descale: bool,
     use_out_scale: bool,
     shuffled_kv_cache: bool,
+    backend: str,  # "triton" | "gluon"
 ) -> None:
-    use_gluon_2d = is_2d_gluon_available(q_dtype, kv_dtype, soft_cap, False, False)
+    if backend == "gluon" and not _is_gluon_available():
+        pytest.skip(f"skip gluon backend, not available on {DEVICE_ARCH}")
+    use_gluon_2d = is_2d_gluon_available(
+        SimpleNamespace(
+            q_dtype=q_dtype,
+            kv_cache_dtype=kv_dtype,
+            softcap=soft_cap,
+            use_qq_bias=False,
+            use_alibi_slopes=False,
+        ),
+        backend,
+    )
     torch.manual_seed(0)
     # shuffling only supported for gfx1250 gluon kernels
     if shuffled_kv_cache and not use_gluon_2d:
@@ -666,6 +678,7 @@ def test_triton_unified_attn(
         sinks=sinks,
         output_scale=output_scale,
         shuffled_kv_cache=shuffled_kv_cache,
+        backend=backend,
     )
 
     ref_output = ref_paged_attn(
@@ -703,6 +716,7 @@ def test_triton_unified_attn(
             f"(max abs diff {torch.max(torch.abs(output - ref_output))})"
         )
     else:
-        torch.testing.assert_close(
-            output, ref_output, atol=atol, rtol=rtol
-        ), f"{torch.max(torch.abs(output - ref_output))}"
+        (
+            torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol),
+            f"{torch.max(torch.abs(output - ref_output))}",
+        )

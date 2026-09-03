@@ -63,6 +63,9 @@ def _install_stubs():
         "aiter", dtypes=dtypes_mod, logger=logging.getLogger("aiter")
     )
 
+    def _empty_flydsl_catalog(*args, **kwargs):
+        return {}
+
     stubs = {
         "aiter": aiter_mod,
         "aiter.dtypes": dtypes_mod,
@@ -81,9 +84,10 @@ def _install_stubs():
         ),
         "aiter.ops": _make_stub("aiter.ops"),
         "aiter.ops.flydsl": _make_stub("aiter.ops.flydsl"),
-        "aiter.ops.flydsl.utils": _make_stub(
-            "aiter.ops.flydsl.utils",
-            is_flydsl_available=lambda: False,
+        "aiter.ops.flydsl.gemm_kernels": _make_stub(
+            "aiter.ops.flydsl.gemm_kernels",
+            flydsl_hgemm=lambda *a, **kw: None,
+            get_flydsl_splitk_hgemm_kernels=_empty_flydsl_catalog,
         ),
         "aiter.ops.gemm_op_a16w16": _make_stub(
             "aiter.ops.gemm_op_a16w16",
@@ -134,14 +138,14 @@ def _install_stubs():
             continue
         try:
             importlib.import_module(name)
-        except Exception:
+        except Exception:  # noqa: BLE001
             sys.modules[name] = mod
 
 
 _install_stubs()
 
 sys.path.insert(0, str(_REPO_ROOT / "csrc" / "gemm_a16w16"))
-from gemm_a16w16_tune import GemmA16W16Tuner  # noqa: E402
+from gemm_a16w16_tune import GemmA16W16Tuner
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -185,7 +189,7 @@ def _make_tuner():
 
 
 def _call_get_asm_tasks(tuner, m, n, k, asm_kernels):
-    import aiter.dtypes as dtypes
+    from aiter import dtypes
 
     info_keys = (
         "gfx942",
@@ -200,17 +204,18 @@ def _call_get_asm_tasks(tuner, m, n, k, asm_kernels):
         False,
     )
     run_kwargs = {"num_warmup": 0, "num_iters": 1}
-    with patch("gemm_a16w16_tune.get_asm_kernels", return_value=asm_kernels):
-        with patch("gemm_a16w16_tune.get_gfx", return_value="gfx942"):
-            return tuner._get_asm_tasks(
-                info_keys,
-                False,
-                dtypes.bf16,
-                dtypes.fp32,
-                False,
-                False,
-                run_kwargs,
-            )
+    with patch("gemm_a16w16_tune.get_asm_kernels", return_value=asm_kernels), patch(
+        "gemm_a16w16_tune.get_gfx", return_value="gfx942"
+    ):
+        return tuner._get_asm_tasks(
+            info_keys,
+            False,
+            dtypes.bf16,
+            dtypes.fp32,
+            False,
+            False,
+            run_kwargs,
+        )
 
 
 # ---------------------------------------------------------------------------

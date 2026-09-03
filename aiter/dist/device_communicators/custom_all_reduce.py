@@ -18,7 +18,7 @@
 import os
 import pickle
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, ClassVar
 
 import torch
 import torch.distributed as dist
@@ -27,20 +27,18 @@ from torch.distributed import ProcessGroup
 # import vllm.envs as envs
 # from vllm import _custom_ops as ops
 import aiter as ops
-from aiter.dist.parallel_state import in_the_same_node_as
 from aiter import logger
+from aiter.dist.parallel_state import in_the_same_node_as
+from aiter.dist.utils import env_flag
 from aiter.utility.dtypes import fp8
+
 from .rocm_version import get_rocm_version
-
-
-def _env_flag(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _detect_gfx1250() -> bool:
     # Escape hatch for validating the old-arch (IPC + old kernel) path on gfx1250
     # hardware: forces the non-gfx1250 code path end to end.
-    if _env_flag("AITER_CUSTOM_AR_DISABLE_GFX1250"):
+    if env_flag("AITER_CUSTOM_AR_DISABLE_GFX1250"):
         return False
     try:
         import torch
@@ -49,8 +47,58 @@ def _detect_gfx1250() -> bool:
             return False
         props = torch.cuda.get_device_properties(torch.cuda.current_device())
         return "gfx1250" in getattr(props, "gcnArchName", "")
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
+
+
+# PyTorch allocator-config env vars that may carry expandable_segments, in
+# PyTorch's own precedence order (the first one that is set wins; they are not
+# merged). Used only as a fallback when the allocator snapshot is unavailable.
+_ALLOC_CONF_ENV_VARS = (
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "PYTORCH_HIP_ALLOC_CONF",
+    "PYTORCH_ALLOC_CONF",
+)
+
+
+def _parse_expandable_segments(conf: str) -> bool:
+    """Extract ``expandable_segments:<bool>`` from a PyTorch alloc-conf string."""
+    for field in conf.split(","):
+        key, _, value = field.partition(":")
+        if key.strip() == "expandable_segments":
+            return value.strip().lower() in ("1", "true", "yes", "on")
+    return False
+
+
+def _expandable_segments_enabled() -> bool:
+    """Whether PyTorch's caching allocator has expandable segments active.
+
+    Under expandable_segments the allocator hands out virtual-memory-managed
+    pointers that cannot be exported through hipIpcGetMemHandle (issue #4174).
+    The classic IPC graph-capture path binds the input tensor's own pointer as
+    an IPC handle, so it would fail; detecting this lets us force the copy-in
+    path instead, which stages into the plain-hipMalloc input pool.
+
+    The allocator snapshot is authoritative — it reflects programmatic changes
+    (e.g. torch.cuda.memory._set_allocator_settings) and, importantly, whether
+    the platform actually honors the setting. Environment parsing is only a
+    fallback for PyTorch builds whose snapshot lacks the field.
+    """
+    try:
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            settings = torch.cuda.memory._snapshot().get("allocator_settings")
+        if settings is not None and "expandable_segments" in settings:
+            return bool(settings["expandable_segments"])
+    except Exception as e:  # noqa: BLE001
+        logger.debug("Allocator snapshot unavailable (%s); falling back to env.", e)
+    for name in _ALLOC_CONF_ENV_VARS:
+        raw = os.environ.get(name, "").strip()
+        if raw:
+            return _parse_expandable_segments(raw)
+    return False
 
 
 # ROCm release at which hipIpc is reported to work on gfx1250. Below this we fall
@@ -197,9 +245,9 @@ def _should_use_vmm(is_gfx1250: bool) -> bool:
     """
     if not is_gfx1250:
         return False
-    if _env_flag("AITER_CUSTOM_AR_FORCE_IPC"):
+    if env_flag("AITER_CUSTOM_AR_FORCE_IPC"):
         return False
-    if _env_flag("AITER_CUSTOM_AR_FORCE_VMM"):
+    if env_flag("AITER_CUSTOM_AR_FORCE_VMM"):
         return True
     v = get_rocm_version()
     if v is None:
@@ -228,7 +276,7 @@ try:
     else:
         ops.meta_size()
     custom_ar = True
-except Exception as e:
+except Exception as e:  # noqa: BLE001
     # For CPUs
     custom_ar = False
     logger.warning(f"Custom allreduce is disabled: {e}")
@@ -348,11 +396,17 @@ class IPCBuffer:
     device address.  All IPC handle / broadcast / registration logic lives
     in IPCBufferPool.
 
-    When *uncached* is False (default), memory is allocated through PyTorch's
-    caching allocator (torch.empty).  When True, memory is allocated via
-    hipExtMallocWithFlags with hipDeviceMallocUncached, bypassing the cache.
-    Uncached buffers are suitable for cross-GPU synchronization metadata and
-    signal buffers where cache coherence overhead is undesirable.
+    Three allocation modes:
+      * uncached=True: raw device memory via hipExtMallocWithFlags with
+        hipDeviceMallocUncached, bypassing the cache. Suitable for cross-GPU
+        synchronization metadata and signal buffers.
+      * raw_cached=True: raw *cached* device memory via a plain hipMalloc. Like
+        uncached it is a raw allocation (no torch tensor view), but it keeps the
+        cache. Used for the IPC input pool, which must be exportable via
+        hipIpcGetMemHandle even under PyTorch expandable segments — where
+        torch.empty pointers live in a hipMallocAsync pool and cannot be
+        exported (see issue #4174).
+      * neither (default): PyTorch's caching allocator (torch.empty).
     """
 
     def __init__(
@@ -360,15 +414,21 @@ class IPCBuffer:
         size: int,
         device: torch.device,
         uncached: bool = False,
+        raw_cached: bool = False,
         alloc_fn=None,
         free_fn=None,
     ):
         self._size = size
         self._uncached = uncached
+        self._raw_cached = raw_cached
         self._free_fn = free_fn or ops.free_meta_buffer
         if uncached:
             self._buffer = None
             _alloc = alloc_fn or ops.allocate_meta_buffer
+            self._raw_ptr = _alloc(size)
+        elif raw_cached:
+            self._buffer = None
+            _alloc = alloc_fn or ops.allocate_data_buffer
             self._raw_ptr = _alloc(size)
         else:
             self._buffer = torch.empty(size, dtype=torch.uint8, device=device)
@@ -395,7 +455,7 @@ class IPCBuffer:
         return self._uncached
 
     def __del__(self):
-        if self._uncached and self._raw_ptr:
+        if (self._uncached or self._raw_cached) and self._raw_ptr:
             self._free_fn(self._raw_ptr)
             self._raw_ptr = 0
 
@@ -435,12 +495,13 @@ class IPCBufferPool:
         self._group = group
         self._rank = dist.get_rank(group=group)
         self._world_size = dist.get_world_size(group=group)
-        self._buffers: Dict[str, IPCBuffer] = {}
+        self._buffers: dict[str, IPCBuffer] = {}
         self._ipc_handle_fn = ipc_handle_fn or ops.get_meta_buffer_ipc_handle
         self._graph_count_fn = graph_count_fn or ops.get_graph_buffer_count
         self._graph_ipc_meta_fn = graph_ipc_meta_fn or ops.get_graph_buffer_ipc_meta
         self._graph_register_fn = graph_register_fn or ops.register_graph_buffers
         self._alloc_fn = alloc_fn or ops.allocate_meta_buffer
+        self._data_alloc_fn = ops.allocate_data_buffer
         self._free_fn = free_fn or ops.free_meta_buffer
 
         self._store = dist.distributed_c10d._get_default_store()
@@ -467,22 +528,30 @@ class IPCBufferPool:
 
     # ---- Buffer lifecycle ----
 
-    def create(self, key: str, size: int, uncached: bool = False) -> IPCBuffer:
+    def create(
+        self, key: str, size: int, uncached: bool = False, raw_cached: bool = False
+    ) -> IPCBuffer:
         """Allocate a new IPCBuffer and store it under *key*.
 
         Args:
             key: unique name for this buffer in the pool.
             size: buffer size in bytes.
-            uncached: if True, allocate via hipMalloc (uncached);
-                      if False (default), allocate via torch.empty (cached).
+            uncached: if True, allocate raw uncached device memory
+                      (hipDeviceMallocUncached).
+            raw_cached: if True, allocate raw cached device memory (hipMalloc),
+                      IPC-exportable under expandable segments. Mutually
+                      exclusive with uncached.
+            (if neither is set, allocate via torch.empty).
         """
         if key in self._buffers:
             raise KeyError(f"IPCBuffer '{key}' already exists in the pool")
+        assert not (uncached and raw_cached), "uncached and raw_cached are exclusive"
         buf = IPCBuffer(
             size,
             self._device,
             uncached=uncached,
-            alloc_fn=self._alloc_fn,
+            raw_cached=raw_cached,
+            alloc_fn=self._data_alloc_fn if raw_cached else self._alloc_fn,
             free_fn=self._free_fn,
         )
         self._buffers[key] = buf
@@ -496,14 +565,14 @@ class IPCBufferPool:
 
     # ---- Eager mode: named buffer IPC meta ----
 
-    def get_ipc_meta(self, key: str) -> Tuple[List, List]:
+    def get_ipc_meta(self, key: str) -> tuple[list, list]:
         """Broadcast IPC handles for the named buffer across all ranks."""
         buf = self._buffers[key]
         return self._broadcast_ipc(buf.data_ptr)
 
     # ---- Graph mode: external buffer IPC meta ----
 
-    def get_external_ipc_meta(self, tensor: torch.Tensor) -> Tuple[List, List]:
+    def get_external_ipc_meta(self, tensor: torch.Tensor) -> tuple[list, list]:
         """Broadcast IPC handles for an arbitrary external tensor."""
         return self._broadcast_ipc(tensor.data_ptr())
 
@@ -531,13 +600,13 @@ class IPCBufferPool:
 
     # ---- Private IPC primitives ----
 
-    def _broadcast_ipc(self, data_ptr: int) -> Tuple[List, List]:
+    def _broadcast_ipc(self, data_ptr: int) -> tuple[list, list]:
         """Get IPC handle for *data_ptr* and broadcast across all ranks."""
         handle = torch.empty(64, dtype=torch.uint8)  # sizeof(hipIpcMemHandle_t)
         self._ipc_handle_fn(data_ptr, handle.data_ptr())
         return self._gather_ipc_meta((handle, 0))
 
-    def _gather_ipc_meta(self, shard_data) -> Tuple[List, List]:
+    def _gather_ipc_meta(self, shard_data) -> tuple[list, list]:
         """Exchange IPC metadata (handle + offset) across all ranks via TCP store.
 
         Each rank writes its serialised *shard_data* under a unique key, then
@@ -603,8 +672,9 @@ class _GFX1250BufferProxy:
 
     def get_external_ipc_meta(self, tensor):
         """Exchange a tensor's pointer across ranks using VMM."""
-        from .vmm_allocator import VMMBuffer, vmm_exchange, load_hip_runtime
         import torch.distributed as dist
+
+        from .vmm_allocator import VMMBuffer, load_hip_runtime, vmm_exchange
 
         ca = self._ca
         store = dist.distributed_c10d._get_default_store()
@@ -640,8 +710,7 @@ class _GFX1250BufferProxy:
 
 
 class CustomAllreduce:
-
-    _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
+    _SUPPORTED_WORLD_SIZES: ClassVar[list[Any]] = [2, 4, 6, 8]
 
     def _select_ops(self):
         """Select the ops backend.
@@ -696,7 +765,7 @@ class CustomAllreduce:
     def __init__(
         self,
         group: ProcessGroup,
-        device: Union[int, str, torch.device],
+        device: int | str | torch.device,
         max_size=1024 * 1024 * 1024,  # 2GB bf16/half
         enable_register_for_capturing: bool = True,
     ) -> None:
@@ -814,6 +883,21 @@ class CustomAllreduce:
         # kernel (arch), so both VMM and IPC gfx1250 paths use copy-in.
         if self._is_gfx1250:
             enable_register_for_capturing = False
+        # PyTorch expandable_segments hands out VMM-managed pointers that cannot
+        # be exported via hipIpcGetMemHandle (issue #4174). The classic IPC
+        # capture path binds the input tensor's own pointer as an IPC handle, so
+        # it would fail. Force the copy-in path, which stages into the plain
+        # hipMalloc input pool (IPC-exportable). The VMM transport does its own
+        # pointer exchange and is unaffected, so only guard the IPC path.
+        if not self._use_vmm and _expandable_segments_enabled():
+            if enable_register_for_capturing:
+                logger.warning(
+                    "PyTorch expandable_segments is enabled; forcing custom "
+                    "allreduce copy-in during CUDA graph capture because "
+                    "expandable-segment pointers cannot be IPC-exported "
+                    "(issue #4174)."
+                )
+            enable_register_for_capturing = False
         self.enable_register_for_capturing = enable_register_for_capturing
         # This is a buffer for storing the tuples of pointers pointing to
         # IPC buffers from all ranks. Each registered tuple has size of
@@ -846,7 +930,7 @@ class CustomAllreduce:
         """gfx1250 VMM init: used when hipIpc is unusable (ROCm < 7.15). Shares
         GPU buffers across processes via the HIP VMM API (exported fd + Unix
         socket) instead of IPC handles."""
-        from .vmm_allocator import VMMBuffer, vmm_exchange, load_hip_runtime
+        from .vmm_allocator import VMMBuffer, load_hip_runtime, vmm_exchange
 
         meta_sz = self._ops_meta_size()
         # gfx1250 is 1-stage only — no tmp buffer after Signal needed
@@ -964,7 +1048,35 @@ class CustomAllreduce:
         # Create IPC buffer pool and allocate all named buffers.
         self._pool = IPCBufferPool(self.device, self.group, **pool_kwargs)
         self._pool.create("meta", meta_size, uncached=True)
-        self._pool.create("input", max_size)
+        # The input pool is IPC-exported via hipIpcGetMemHandle. That fails on
+        # PyTorch expandable-segment pool pointers (issue #4174), so when
+        # expandable_segments is on we back the pool with a plain (cached)
+        # hipMalloc allocation, which stays exportable. Otherwise keep the
+        # default torch.empty allocation so the pool remains tracked by the
+        # PyTorch caching allocator (its memory accounting is what downstream
+        # consumers profile against). Gated on the same condition as the
+        # capture copy-in path above; _init_ipc only runs for non-VMM.
+        # AITER_CUSTOM_AR_RAW_INPUT_POOL forces the raw pool without
+        # expandable segments. Its use case is co-resident engines on one node
+        # (#4921): a second engine's torch.empty input pool can fail
+        # hipIpcGetMemHandle outright, and the raw pool sidesteps that while
+        # everything else (meta pool, capture-time outputs) stays exportable
+        # under the default allocator.
+        raw_cached = _expandable_segments_enabled() or env_flag(
+            "AITER_CUSTOM_AR_RAW_INPUT_POOL"
+        )
+        self._pool.create("input", max_size, raw_cached=raw_cached)
+        # One line per rank so every run self-documents which pool it actually
+        # got: a silently-inert trigger is indistinguishable from a working one
+        # by behaviour alone (both serve fine single-engine), and this class of
+        # bug (#4921) was reachable only in specific pool modes.
+        logger.info(
+            "CustomAllreduce input pool: %s (expandable_segments=%s, "
+            "AITER_CUSTOM_AR_RAW_INPUT_POOL=%s)",
+            "raw_cached/hipMalloc" if raw_cached else "torch.empty",
+            _expandable_segments_enabled(),
+            env_flag("AITER_CUSTOM_AR_RAW_INPUT_POOL"),
+        )
 
         handles, offsets = self._pool.get_ipc_meta("meta")
         self._ptr = self._ops_init_custom_ar(
@@ -1086,7 +1198,7 @@ class CustomAllreduce:
         self,
         inp: torch.Tensor,
         *,
-        out: Optional[torch.Tensor] = None,
+        out: torch.Tensor | None = None,
         use_new: bool = True,
         open_fp8_quant: bool = False,
         registered_input: bool = False,
@@ -1115,7 +1227,7 @@ class CustomAllreduce:
 
     def custom_all_reduce(
         self, input: torch.Tensor, use_new: bool = True, open_fp8_quant: bool = False
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
             return None
@@ -1226,7 +1338,7 @@ class CustomAllreduce:
 
     def custom_reduce_scatter(
         self, input: torch.Tensor, output: torch.Tensor, dim: int = 0
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         # when custom allreduce is disabled or this shape/dim is unsupported,
         # this will be None and the caller is expected to fall back to an
         # external reduce_scatter implementation (NCCL / pynccl / torch.dist).
@@ -1322,15 +1434,13 @@ class CustomAllreduce:
     # all-gather kernel is pure memcpy parametrized only by sizeof(T). View
     # ints as same-size floats so callers gathering token-id tensors work
     # (e.g. DeepSeek-V4-Pro hash-gate gathers int32 across DP ranks).
-    _INT_TO_FP_VIEW = {
+    _INT_TO_FP_VIEW: ClassVar[dict[str, Any]] = {
         torch.int64: torch.float64,
         torch.int32: torch.float32,
         torch.int16: torch.float16,
     }
 
-    def custom_all_gather(
-        self, inp: torch.Tensor, dim: int = 0
-    ) -> Optional[torch.Tensor]:
+    def custom_all_gather(self, inp: torch.Tensor, dim: int = 0) -> torch.Tensor | None:
         orig_dtype = inp.dtype
         view_dtype = self._INT_TO_FP_VIEW.get(orig_dtype) or orig_dtype
 
@@ -1360,9 +1470,9 @@ class CustomAllreduce:
         inp: torch.Tensor,
         res_inp: torch.Tensor,
         *,
-        res_out: Optional[torch.Tensor] = None,
-        out: Optional[torch.Tensor] = None,
-        scale_out: Optional[torch.Tensor] = None,
+        res_out: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
+        scale_out: torch.Tensor | None = None,
         w: torch.Tensor,
         eps: float,
         registered: bool = False,
@@ -1460,7 +1570,7 @@ class CustomAllreduce:
         use_1stage: bool,
         out_hidden_dim: int = 0,
         gemma_norm: bool = False,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
             return None
@@ -1471,7 +1581,7 @@ class CustomAllreduce:
                     residual_inp,
                     w=weight,
                     eps=eps,
-                    registered=True,
+                    registered=self.enable_register_for_capturing,
                     use_1stage=use_1stage,
                     out_hidden_dim=out_hidden_dim,
                     gemma_norm=gemma_norm,
@@ -1512,7 +1622,7 @@ class CustomAllreduce:
         out_hidden_dim: int = 0,
         prefill_support: bool = False,
         gemma_norm: bool = False,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         # Let the C++ wrapper pack supported last-dim sliced views directly
         # into the registered IPC buffer so eager and graph paths both avoid
         # materializing an intermediate contiguous tensor in Python.
@@ -1575,7 +1685,7 @@ class CustomAllreduce:
                     residual_inp,
                     w=weight,
                     eps=eps,
-                    registered=True,
+                    registered=self.enable_register_for_capturing,
                     use_1stage=use_1stage,
                     post_per_token_quant=True,
                     gemma_norm=gemma_norm,
@@ -1618,6 +1728,7 @@ class CustomAllreduce:
         registered: bool = False,
         use_1stage: bool = False,
         emit_bf16: bool = False,
+        transpose_scale: bool = False,
     ):
         K = inp.shape[-1]
         # Fail fast on bad ``group_size`` at the Python boundary. Mirrors
@@ -1629,9 +1740,15 @@ class CustomAllreduce:
         res_out = torch.empty_like(inp)
         num_groups = K // group_size
         out = torch.empty(inp.shape, dtype=fp8, device=inp.device)
-        scale_out = torch.empty(
-            inp.shape[:-1] + (num_groups,), dtype=torch.float32, device=inp.device
-        )
+        if transpose_scale:
+            M = inp.shape[0]
+            scale_out = torch.empty(
+                (num_groups, M), dtype=torch.float32, device=inp.device
+            ).transpose(0, 1)
+        else:
+            scale_out = torch.empty(
+                inp.shape[:-1] + (num_groups,), dtype=torch.float32, device=inp.device
+            )
         # Optional bf16/fp16 mirror of the pre-quantization normed output.
         # Requested by GDN-style layers that also need an unquantized view
         # (e.g. Qwen3.5 in_proj_ba). Zero-overhead when not requested
@@ -1657,6 +1774,7 @@ class CustomAllreduce:
             reg_bytes,
             use_1stage,
             bf16_ptr,
+            transpose_scale,
         )
         if emit_bf16:
             return out, res_out, scale_out, bf16_out
@@ -1765,7 +1883,7 @@ class CustomAllreduce:
                     q_w,
                     k_w,
                     eps,
-                    registered=True,
+                    registered=self.enable_register_for_capturing,
                 )
             else:
                 return (
@@ -1834,7 +1952,7 @@ class CustomAllreduce:
                     head_dim,
                     rotary_dim,
                     eps,
-                    registered=True,
+                    registered=self.enable_register_for_capturing,
                 )
             else:
                 return (
@@ -1924,6 +2042,7 @@ class CustomAllreduce:
         group_size: int = 128,
         use_1stage: bool = False,
         emit_bf16: bool = False,
+        transpose_scale: bool = False,
     ):
         if self.disabled or not self.should_custom_ar(input):
             return None
@@ -1935,19 +2054,26 @@ class CustomAllreduce:
                     w=weight,
                     eps=eps,
                     group_size=group_size,
-                    registered=True,
+                    registered=self.enable_register_for_capturing,
                     use_1stage=use_1stage,
                     emit_bf16=emit_bf16,
+                    transpose_scale=transpose_scale,
                 )
             else:
                 K = input.shape[-1]
                 num_groups = K // group_size
                 dummy_out = torch.zeros(input.shape, dtype=fp8, device=input.device)
-                dummy_scale = torch.zeros(
-                    input.shape[:-1] + (num_groups,),
-                    dtype=torch.float32,
-                    device=input.device,
-                )
+                if transpose_scale:
+                    M = input.shape[0]
+                    dummy_scale = torch.zeros(
+                        (num_groups, M), dtype=torch.float32, device=input.device
+                    ).transpose(0, 1)
+                else:
+                    dummy_scale = torch.zeros(
+                        input.shape[:-1] + (num_groups,),
+                        dtype=torch.float32,
+                        device=input.device,
+                    )
                 if emit_bf16:
                     return (
                         dummy_out,
@@ -1966,6 +2092,7 @@ class CustomAllreduce:
                 registered=False,
                 use_1stage=use_1stage,
                 emit_bf16=emit_bf16,
+                transpose_scale=transpose_scale,
             )
 
     def custom_fused_ar_rms_mxfp4_quant(
@@ -1986,7 +2113,7 @@ class CustomAllreduce:
                     residual_inp,
                     w=weight,
                     eps=eps,
-                    registered=True,
+                    registered=self.enable_register_for_capturing,
                     use_1stage=use_1stage,
                     emit_bf16=emit_bf16,
                 )

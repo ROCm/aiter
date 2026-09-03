@@ -2,6 +2,8 @@ import torch
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
 # =====================================================================
 # Utility
 # =====================================================================
@@ -261,12 +263,23 @@ def _get_prefill_autotune_configs():
     ]
 
 
+_sparse_attn_prefill_kernel_repr = make_kernel_repr(
+    "_sparse_attn_prefill_kernel",
+    [
+        "HAS_ATTN_SINK",
+        "BLOCK_H",
+        "BLOCK_D",
+        "BLOCK_K",
+    ],
+)
+
+
 @triton.autotune(
     configs=_get_prefill_autotune_configs(),
     key=["num_heads", "head_dim", "HAS_ATTN_SINK"],
     prune_configs_by={"early_config_prune": _prefill_prune_configs},
 )
-@triton.jit
+@triton.jit(repr=_sparse_attn_prefill_kernel_repr)
 def _sparse_attn_prefill_kernel(
     q_ptr,  # [num_queries, num_heads, head_dim]
     kv_ptr,  # [num_kv, head_dim]
@@ -291,7 +304,12 @@ def _sparse_attn_prefill_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    query_idx = tl.program_id(0)
+    # 64-bit before the multiply, same reasoning as `slot_off` below: the
+    # program id fits 32 bits, but `query_idx * q_stride_t` does not once
+    # num_queries passes 32K, because q_stride_t is num_heads * head_dim
+    # (128 * 512 = 65536) in the V4 layout. Unlike the pool read, the wrapped
+    # offset lands outside the q/out allocations, so it page-faults.
+    query_idx = tl.program_id(0).to(tl.int64)
     pid_h = tl.program_id(1)
 
     head_offsets = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
@@ -327,8 +345,17 @@ def _sparse_attn_prefill_kernel(
         in_range = k_pos < kv_len
         valid = in_range & (slot >= 0) & (slot < num_kv)
 
+        # 64-bit before the multiply, same as the decode kernel: a slot index
+        # fits 32 bits (the index buffer is int32 by ABI) but `slot *
+        # kv_stride_n` does not once the unified V4 pool runs to ~150M rows.
+        # The wrapped offset still lands inside the same allocation, so the
+        # bad read is silent.
+        slot_off = slot.to(tl.int64)
+
         kv = tl.load(
-            kv_ptr + slot[:, None] * kv_stride_n + dim_offsets[None, :] * kv_stride_d,
+            kv_ptr
+            + slot_off[:, None] * kv_stride_n
+            + dim_offsets[None, :] * kv_stride_d,
             mask=valid[:, None] & dim_mask[None, :],
             other=0.0,
         )

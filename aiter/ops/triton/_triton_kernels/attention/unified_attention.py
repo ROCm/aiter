@@ -1,10 +1,11 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
+import torch
 import triton
 import triton.language as tl
-import torch
-from aiter.ops.triton.utils.types import e4m3_dtype
+
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.types import e4m3_dtype
 
 float8_info = torch.finfo(e4m3_dtype)
 
@@ -51,7 +52,30 @@ def find_seq_idx(
     return left - 1
 
 
-@triton.jit
+_kernel_unified_attention_2d_repr = make_kernel_repr(
+    "kernel_unified_attention_2d",
+    [
+        "num_query_heads",
+        "num_queries_per_kv",
+        "BLOCK_SIZE",
+        "TILE_SIZE",
+        "HEAD_SIZE",
+        "HEAD_SIZE_PADDED",
+        "USE_ALIBI_SLOPES",
+        "USE_QQ_BIAS",
+        "USE_SOFTCAP",
+        "USE_SINKS",
+        "SLIDING_WINDOW",
+        "BLOCK_Q",
+        "BLOCK_M",
+        "ALL_DECODE",
+        "SHUFFLED_KV_CACHE",
+        "K_WIDTH",
+    ],
+)
+
+
+@triton.jit(repr=_kernel_unified_attention_2d_repr)
 def kernel_unified_attention_2d(
     output_ptr,  # [num_tokens, num_query_heads, head_size]
     query_ptr,  # [num_tokens, num_query_heads, head_size]

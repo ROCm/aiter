@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import aiter
-from aiter.test_common import checkAllclose, perftest
+import argparse
 import itertools
 from enum import IntEnum
-import argparse
+
+import torch
+
+import aiter
 from aiter import dtypes
+from aiter.test_common import checkAllclose, perftest
 
 
 @perftest()
@@ -580,8 +582,8 @@ def test_rope_sbhd(
     input_msg = f"""
 dtype: {input.dtype}, \
 freq_dtype: {freqs.dtype}, \
-dim_input: {str(input.shape):<20}, \
-dim_freqs: {str(freqs.shape):<20}, \
+dim_input: {input.shape!s:<20}, \
+dim_freqs: {freqs.shape!s:<20}, \
 rotate_style: {rotate_style.value}, \
 reuse_freqs_front_part: {reuse_freqs_front_part}, \
 nope_first: {nope_first}, \
@@ -683,8 +685,8 @@ def test_rope_sbhd_2c(
     input_msg = f"""
 dtype: {input_x.dtype}, \
 freq_dtype: {freqs.dtype}, \
-dim_input: {str(input_x.shape):<20} - {str(input_y.shape):<20}, \
-dim_freqs: {str(freqs.shape):<20}, \
+dim_input: {input_x.shape!s:<20} - {input_y.shape!s:<20}, \
+dim_freqs: {freqs.shape!s:<20}, \
 rotate_style: {rotate_style.value}, \
 reuse_freqs_front_part: {reuse_freqs_front_part}, \
 nope_first: {nope_first}, \
@@ -837,9 +839,9 @@ def test_rope_sbhd_1c_positions(
     input_msg = f"""
 dtype: {input.dtype}, \
 freq_dtype: {freqs.dtype}, \
-dim_input: {str(input.shape):<20}, \
-dim_freqs: {str(freqs.shape):<20}, \
-dim_positions: {str(positions.shape):<20}, \
+dim_input: {input.shape!s:<20}, \
+dim_freqs: {freqs.shape!s:<20}, \
+dim_positions: {positions.shape!s:<20}, \
 positions_dtype: {positions.dtype}, \
 dim_offsets: {str(offsets.shape) if offsets is not None else 'None'}, \
 rotate_style: {rotate_style.value}, \
@@ -912,9 +914,9 @@ def test_rope_sbhd_2c_positions(
     input_msg = f"""
 dtype: {input_x.dtype}, \
 freq_dtype: {freqs.dtype}, \
-dim_input: {str(input_x.shape):<20} - {str(input_y.shape):<20}, \
-dim_freqs: {str(freqs.shape):<20}, \
-dim_positions: {str(positions.shape):<20}, \
+dim_input: {input_x.shape!s:<20} - {input_y.shape!s:<20}, \
+dim_freqs: {freqs.shape!s:<20}, \
+dim_positions: {positions.shape!s:<20}, \
 positions_dtype: {positions.dtype}, \
 dim_offsets: {str(offsets.shape) if offsets is not None else 'None'}, \
 rotate_style: {rotate_style.value}, \
@@ -1007,9 +1009,9 @@ def compare_rope_sbhd_2c_positions_with_legacy(
 ):
     input_msg = f"""dtype: {input_x.dtype}, \
 freq_dtype: {freqs.dtype}, \
-dim_input: {str(input_x.shape):<20} - {str(input_y.shape):<20}, \
-dim_freqs: {str(freqs.shape):<20}, \
-dim_positions: {str(positions.shape):<20}, \
+dim_input: {input_x.shape!s:<20} - {input_y.shape!s:<20}, \
+dim_freqs: {freqs.shape!s:<20}, \
+dim_positions: {positions.shape!s:<20}, \
 positions_dtype: {positions.dtype}, \
 dim_offsets: {str(offsets.shape) if offsets is not None else 'None'}, \
 rotate_style: {rotate_style.value}, \
@@ -1183,8 +1185,8 @@ def test_rope_thd(
     input_msg = f"""
 dtype: {input.dtype}, \
 freq_dtype: {freqs.dtype}, \
-dim_input: {str(input.shape):<20}, \
-dim_freqs: {str(freqs.shape):<20}, \
+dim_input: {input.shape!s:<20}, \
+dim_freqs: {freqs.shape!s:<20}, \
 rotate_style: {rotate_style.value}, \
 reuse_freqs_front_part: {reuse_freqs_front_part}, \
 nope_first: {nope_first}, \
@@ -1231,8 +1233,8 @@ def test_rope_2d(input, height, width, freqs_h, freqs_w, grad):
     input_msg = f"""
 dtype: {input.dtype}, \
 freq_dtype: {freqs_h.dtype}, \
-dim_input: {str(input.shape):<20}, \
-dim_freqs: {str(freqs_h.shape):<20}
+dim_input: {input.shape!s:<20}, \
+dim_freqs: {freqs_h.shape!s:<20}
 """
 
     cos_h = freqs_h.cos()

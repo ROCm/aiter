@@ -1,12 +1,14 @@
 from enum import Enum
-import triton
+
 import torch
+import triton
+
 from aiter.ops.triton._triton_kernels.moe.quant_moe import (
-    _downcast_to_static_fp8,
     _downcast_to_mxfp,
-    _upcast_from_mxfp,
+    _downcast_to_static_fp8,
     _smoothquant_fuse_quant_kernel,
     _smoothquant_fuse_quant_kernel_single_pass,
+    _upcast_from_mxfp,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 

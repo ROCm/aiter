@@ -4,13 +4,26 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
 
 @triton.jit
 def _sum_combine(a, b):
     return a + b
 
 
-@triton.jit
+_deepgemm_fp8_paged_mqa_logits_stage1_ragged_k_repr = make_kernel_repr(
+    "_deepgemm_fp8_paged_mqa_logits_stage1_ragged_k",
+    [
+        "ChunkQ",
+        "ChunkK",
+        "HiddenDim",
+        "SplitKV",
+    ],
+)
+
+
+@triton.jit(repr=_deepgemm_fp8_paged_mqa_logits_stage1_ragged_k_repr)
 def _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k(
     batch_size,
     next_n,
@@ -106,7 +119,18 @@ def _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k(
         )
 
 
-@triton.jit
+_deepgemm_fp8_paged_mqa_logits_ragged_k_repr = make_kernel_repr(
+    "_deepgemm_fp8_paged_mqa_logits_ragged_k",
+    [
+        "ChunkQ",
+        "ChunkK",
+        "HiddenDim",
+        "SplitKV",
+    ],
+)
+
+
+@triton.jit(repr=_deepgemm_fp8_paged_mqa_logits_ragged_k_repr)
 def _deepgemm_fp8_paged_mqa_logits_ragged_k(
     batch_size,
     next_n,
@@ -201,7 +225,19 @@ def _deepgemm_fp8_paged_mqa_logits_ragged_k(
         )
 
 
-@triton.jit
+_deepgemm_fp8_paged_mqa_logits_stage1_repr = make_kernel_repr(
+    "_deepgemm_fp8_paged_mqa_logits_stage1",
+    [
+        "ChunkQ",
+        "ChunkK",
+        "HiddenDim",
+        "KVBlockSize",
+        "SplitKV",
+    ],
+)
+
+
+@triton.jit(repr=_deepgemm_fp8_paged_mqa_logits_stage1_repr)
 def _deepgemm_fp8_paged_mqa_logits_stage1(
     batch_size,
     next_n,
@@ -211,9 +247,11 @@ def _deepgemm_fp8_paged_mqa_logits_stage1(
     stride_q_next_n: tl.int64,
     stride_q_heads: tl.int64,
     KV_buffer,
-    stride_k_seq: tl.int64,
+    stride_k_block: tl.int64,
+    stride_k_token: tl.int64,
     scale_buffer,
-    stride_scale_seq: tl.int64,
+    stride_scale_block: tl.int64,
+    stride_scale_token: tl.int64,
     context_len_ptr,
     kv_indices,
     weights,
@@ -226,6 +264,7 @@ def _deepgemm_fp8_paged_mqa_logits_stage1(
     ChunkQ: tl.constexpr,
     ChunkK: tl.constexpr,
     HiddenDim: tl.constexpr,
+    KVBlockSize: tl.constexpr,
     SplitKV: tl.constexpr = 1,
 ):
     pid = tl.program_id(0)
@@ -262,21 +301,31 @@ def _deepgemm_fp8_paged_mqa_logits_stage1(
     for context_idx in range(
         split_context_start, split_context_start + split_context_length, ChunkK
     ):
-        mask_kv = context_idx + tl.arange(0, ChunkK) < context_length
-        context_kv_idx = tl.load(
-            kv_indices + pid_batch * max_blk_len + context_idx + tl.arange(0, ChunkK),
+        logical_kv_idx = context_idx + tl.arange(0, ChunkK)
+        logical_block_idx = logical_kv_idx // KVBlockSize
+        mask_kv = (logical_kv_idx < context_length) & (logical_block_idx < max_blk_len)
+        physical_block_idx = tl.load(
+            kv_indices + pid_batch * max_blk_len + logical_block_idx,
             mask=mask_kv,
             other=0,
         )
+        block_offset = logical_kv_idx % KVBlockSize
 
         k = tl.load(
             KV_buffer
-            + context_kv_idx[:, None] * stride_k_seq
+            + physical_block_idx[:, None] * stride_k_block
+            + block_offset[:, None] * stride_k_token
             + tl.arange(0, HiddenDim)[None, :],
             mask=mask_kv[:, None],
             other=0.0,
         )
-        k_scale_f = tl.load(scale_buffer + context_kv_idx[:, None] * stride_scale_seq)
+        k_scale_f = tl.load(
+            scale_buffer
+            + physical_block_idx[:, None] * stride_scale_block
+            + block_offset[:, None] * stride_scale_token,
+            mask=mask_kv[:, None],
+            other=0.0,
+        )
 
         o = tl.dot(q, k.T)
         o = o * k_scale_f.T
@@ -298,7 +347,17 @@ def _deepgemm_fp8_paged_mqa_logits_stage1(
         )
 
 
-@triton.jit
+_deepgemm_fp8_paged_mqa_logits_varctx_schedule_repr = make_kernel_repr(
+    "_deepgemm_fp8_paged_mqa_logits_varctx_schedule",
+    [
+        "ChunkK",
+        "AlignedBatchSize",
+        "TryCount",
+    ],
+)
+
+
+@triton.jit(repr=_deepgemm_fp8_paged_mqa_logits_varctx_schedule_repr)
 def _deepgemm_fp8_paged_mqa_logits_varctx_schedule(
     batch_size,
     context_len_ptr,
@@ -344,7 +403,19 @@ def _deepgemm_fp8_paged_mqa_logits_varctx_schedule(
         tl.store(safe_chunks_per_cta_ptr, safe_seg_lens)
 
 
-@triton.jit
+_deepgemm_fp8_paged_mqa_logits_repr = make_kernel_repr(
+    "_deepgemm_fp8_paged_mqa_logits",
+    [
+        "ChunkQ",
+        "ChunkK",
+        "HiddenDim",
+        "KVBlockSize",
+        "SplitKV",
+    ],
+)
+
+
+@triton.jit(repr=_deepgemm_fp8_paged_mqa_logits_repr)
 def _deepgemm_fp8_paged_mqa_logits(
     batch_size,
     next_n,
@@ -354,9 +425,11 @@ def _deepgemm_fp8_paged_mqa_logits(
     stride_q_next_n,
     stride_q_heads,
     KV_buffer,
-    stride_k_seq,
+    stride_k_block,
+    stride_k_token,
     scale_buffer,
-    stride_scale_seq,
+    stride_scale_block,
+    stride_scale_token,
     context_len_ptr,
     kv_indices,
     weights,
@@ -368,6 +441,7 @@ def _deepgemm_fp8_paged_mqa_logits(
     ChunkQ: tl.constexpr,
     ChunkK: tl.constexpr,
     HiddenDim: tl.constexpr,
+    KVBlockSize: tl.constexpr,
     SplitKV: tl.constexpr = 1,
 ):
     pid = tl.program_id(0)
@@ -404,21 +478,31 @@ def _deepgemm_fp8_paged_mqa_logits(
     for context_idx in range(
         split_context_start, split_context_start + split_context_length, ChunkK
     ):
-        mask_kv = context_idx + tl.arange(0, ChunkK) < context_length
-        context_kv_idx = tl.load(
-            kv_indices + pid_batch * max_blk_len + context_idx + tl.arange(0, ChunkK),
+        logical_kv_idx = context_idx + tl.arange(0, ChunkK)
+        logical_block_idx = logical_kv_idx // KVBlockSize
+        mask_kv = (logical_kv_idx < context_length) & (logical_block_idx < max_blk_len)
+        physical_block_idx = tl.load(
+            kv_indices + pid_batch * max_blk_len + logical_block_idx,
             mask=mask_kv,
             other=0,
         )
+        block_offset = logical_kv_idx % KVBlockSize
 
         k = tl.load(
             KV_buffer
-            + context_kv_idx[:, None] * stride_k_seq
+            + physical_block_idx[:, None] * stride_k_block
+            + block_offset[:, None] * stride_k_token
             + tl.arange(0, HiddenDim)[None, :],
             mask=mask_kv[:, None],
             other=0.0,
         )
-        k_scale_f = tl.load(scale_buffer + context_kv_idx[:, None] * stride_scale_seq)
+        k_scale_f = tl.load(
+            scale_buffer
+            + physical_block_idx[:, None] * stride_scale_block
+            + block_offset[:, None] * stride_scale_token,
+            mask=mask_kv[:, None],
+            other=0.0,
+        )
 
         o = tl.dot(q, k.T)
         o = o * k_scale_f.T

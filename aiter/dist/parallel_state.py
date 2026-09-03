@@ -22,22 +22,23 @@ If you only need to use the distributed environment without model/pipeline
 """
 
 import contextlib
+import os
 import pickle
 import weakref
 from collections import namedtuple
+from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from multiprocessing import shared_memory
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Optional
 from unittest.mock import patch
 
 import torch
 import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
-import os
-from aiter import logger
-from aiter import torch_compile_guard
+from aiter import logger, torch_compile_guard
+from aiter.dist.utils import env_flag
 
 
 def supports_custom_op():
@@ -53,15 +54,15 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
 
 def _split_tensor_dict(
-    tensor_dict: Dict[str, Union[torch.Tensor, Any]],
-) -> Tuple[List[Tuple[str, Any]], List[torch.Tensor]]:
+    tensor_dict: dict[str, torch.Tensor | Any],
+) -> tuple[list[tuple[str, Any]], list[torch.Tensor]]:
     """Split the tensor dictionary into two parts:
     1. A list of (key, value) pairs. If the value is a tensor, it is replaced
          by its metadata.
     2. A list of tensors.
     """
-    metadata_list: List[Tuple[str, Any]] = []
-    tensor_list: List[torch.Tensor] = []
+    metadata_list: list[tuple[str, Any]] = []
+    tensor_list: list[torch.Tensor] = []
     for key, value in tensor_dict.items():
         if isinstance(value, torch.Tensor):
             # Note: we cannot use `value.device` here,
@@ -78,7 +79,7 @@ def _split_tensor_dict(
     return metadata_list, tensor_list
 
 
-_group_name_counter: Dict[str, int] = {}
+_group_name_counter: dict[str, int] = {}
 
 
 def _get_unique_name(name: str) -> str:
@@ -94,7 +95,7 @@ def _get_unique_name(name: str) -> str:
     return newname
 
 
-_groups: Dict[str, Callable[[], "GroupCoordinator"]] = {}
+_groups: dict[str, Callable[[], "GroupCoordinator"]] = {}
 
 
 def _register_group(group: "GroupCoordinator") -> None:
@@ -496,7 +497,7 @@ class GroupCoordinator:
 
     # available attributes:
     rank: int  # global rank
-    ranks: List[int]  # global ranks in the group
+    ranks: list[int]  # global ranks in the group
     world_size: int  # size of the group
     # difference between `local_rank` and `rank_in_group`:
     # if we have a group of size 4 across two nodes:
@@ -512,19 +513,29 @@ class GroupCoordinator:
     use_pynccl: bool  # a hint of whether to use PyNccl
     use_custom_allreduce: bool  # a hint of whether to use CustomAllreduce
     # communicators are only created for world size > 1
-    pynccl_comm: Optional[Any]  # PyNccl communicator
-    ca_comm: Optional[Any]  # Custom allreduce communicator
-    qr_comm: Optional[Any]  # Quick allreduce communicator
-    mq_broadcaster: Optional[Any]  # shared memory broadcaster
+    pynccl_comm: Any | None  # PyNccl communicator
+    ca_comm: Any | None  # Custom allreduce communicator
+    qr_comm: Any | None  # Quick allreduce communicator
+    mq_broadcaster: Any | None  # shared memory broadcaster
+    # Group this one borrows process groups / communicators from; None if it
+    # allocated its own.
+    reuse_from: "GroupCoordinator | None"
+    # Teardown ownership: a borrowed resource is destroyed only by its owner
+    # (a second destroy_process_group() raises). Set on both paths; no default.
+    _owns_cpu_group: bool
+    _owns_device_group: bool
+    _owns_device_communicator: bool
 
     def __init__(
         self,
-        group_ranks: List[List[int]],
+        group_ranks: list[list[int]],
         local_rank: int,
-        torch_distributed_backend: Union[str, Backend],
+        torch_distributed_backend: str | Backend,
         use_device_communicator: bool,  # whether to use device communicator
         use_message_queue_broadcaster: bool = False,
-        group_name: Optional[str] = None,
+        group_name: str | None = None,
+        reuse_from: "GroupCoordinator | None" = None,
+        is_ep: bool = False,
     ):
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
@@ -533,54 +544,128 @@ class GroupCoordinator:
         self.rank = torch.distributed.get_rank()
         self.local_rank = local_rank
 
-        self_device_group = None
-        self_cpu_group = None
+        self.reuse_from = reuse_from
 
-        for ranks in group_ranks:
-            device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
+        # --- Acquire process groups: borrow from `reuse_from`, or create. -----
+        # Only acquisition differs; the shared tail below runs for both.
+        if reuse_from is not None:
+            # Identical-rank group: share the source's process groups and
+            # communicators instead of allocating a second set over the same
+            # ranks. Stays a distinct object with its own unique_name.
+            my_ranks = next((r for r in group_ranks if self.rank in r), None)
+            assert (
+                my_ranks is not None
+            ), f"{self.unique_name}: rank {self.rank} is in none of {group_ranks}"
+            # ranks/rank_in_group are inherited verbatim, so a source with a
+            # different rank list -- or the same one reordered -- silently
+            # addresses the wrong peers. Validate, don't trust the caller.
+            assert list(reuse_from.ranks) == list(my_ranks), (
+                f"{self.unique_name}: reuse_from {reuse_from.unique_name} spans "
+                f"{reuse_from.ranks}, but this group spans {my_ranks}"
             )
-            # a group with `gloo` backend, to allow direct coordination between
-            # processes through the CPU.
-            cpu_group = torch.distributed.new_group(ranks, backend="gloo")
-            if self.rank in ranks:
-                self.ranks = ranks
-                self.world_size = len(ranks)
-                self.rank_in_group = ranks.index(self.rank)
-                self_device_group = device_group
-                self_cpu_group = cpu_group
+            assert reuse_from.local_rank == local_rank, (
+                f"{self.unique_name}: reuse_from {reuse_from.unique_name} has "
+                f"local_rank {reuse_from.local_rank}, this group has {local_rank}; "
+                "the inherited device would not match"
+            )
+            self.ranks = reuse_from.ranks
+            self.world_size = reuse_from.world_size
+            self.rank_in_group = reuse_from.rank_in_group
+            self.device_group = reuse_from.device_group
+            self.device = reuse_from.device
+            self._owns_device_group = False
 
-        assert self_cpu_group is not None
-        assert self_device_group is not None
+            if is_ep and use_device_communicator and self.world_size > 1:
+                # mori registers this group under a fixed name and bootstraps
+                # on it, assuming exclusive use. A gloo PG holds none of the
+                # NCCL/CA/QR buffers reuse saves, so EP keeps a private one.
+                self.cpu_group = None
+                for ranks in group_ranks:
+                    cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+                    if self.rank in ranks:
+                        self.cpu_group = cpu_group
+                assert self.cpu_group is not None
+                self._owns_cpu_group = True
+            else:
+                self.cpu_group = reuse_from.cpu_group
+                self._owns_cpu_group = False
+        else:
+            self_device_group = None
+            self_cpu_group = None
 
-        self.cpu_group = self_cpu_group
-        self.device_group = self_device_group
+            for ranks in group_ranks:
+                device_group = torch.distributed.new_group(
+                    ranks, backend=torch_distributed_backend
+                )
+                # a group with `gloo` backend, to allow direct coordination
+                # between processes through the CPU.
+                cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+                if self.rank in ranks:
+                    self.ranks = ranks
+                    self.world_size = len(ranks)
+                    self.rank_in_group = ranks.index(self.rank)
+                    self_device_group = device_group
+                    self_cpu_group = cpu_group
 
-        self.device = torch.device(f"cuda:{local_rank}")
+            assert self_cpu_group is not None
+            assert self_device_group is not None
 
+            self.cpu_group = self_cpu_group
+            self.device_group = self_device_group
+            self.device = torch.device(f"cuda:{local_rank}")
+            self._owns_cpu_group = True
+            self._owns_device_group = True
+
+        # --- Shared tail: identical for borrowed and freshly created groups. --
         self.use_device_communicator = use_device_communicator
         logger.debug(
             f"Initialized GroupCoordinator {self.unique_name} with "
             f"ranks={self.ranks}, local_rank={self.local_rank}, "
             f"world_size={self.world_size}, "
             f"torch_distributed_backend={torch_distributed_backend}, "
-            f"use_device_communicator={self.use_device_communicator}"
+            f"use_device_communicator={self.use_device_communicator}, "
+            f"reuse_from={reuse_from.unique_name if reuse_from else None}"
         )
+
         self.device_communicator = None
+        self._owns_device_communicator = False
         if use_device_communicator and self.world_size > 1:
-            from .device_communicators.communicator_cuda import CudaCommunicator
+            src_dc = reuse_from.device_communicator if reuse_from is not None else None
+            if src_dc is not None and not is_ep:
+                # Non-EP collectives ignore unique_name: share it wholesale.
+                assert not src_dc.is_ep_communicator, (
+                    f"{self.unique_name}: refusing to share EP communicator "
+                    f"{src_dc.unique_name}; use_all2all / all2all_manager state "
+                    "is per-EP-group and must not be inherited by a non-EP group"
+                )
+                self.device_communicator = src_dc
+            else:
+                from .device_communicators.communicator_cuda import CudaCommunicator
 
-            self.device_communicator = CudaCommunicator(
-                cpu_group=self.cpu_group,
-                device=self.device,
-                device_group=self.device_group,
-                unique_name=self.unique_name,
-            )
-
-        from .shm_broadcast import MessageQueue
+                # EP needs its own ep-named communicator (is_ep_communicator /
+                # use_all2all), but still shares handles via reuse_from.
+                self.device_communicator = CudaCommunicator(
+                    cpu_group=self.cpu_group,
+                    device=self.device,
+                    device_group=self.device_group,
+                    unique_name=self.unique_name,
+                    reuse_from=src_dc,
+                )
+                # Ours to destroy; for a borrower that only drops references.
+                self._owns_device_communicator = True
 
         self.mq_broadcaster = None
         if use_message_queue_broadcaster and self.world_size > 1:
+            if reuse_from is not None:
+                # The shm ring has a single write cursor and its
+                # broadcast_object path hard-asserts src == 0, so it cannot be
+                # shared. Unreachable today (TP is built first, never borrows).
+                raise NotImplementedError(
+                    f"{self.unique_name}: use_message_queue_broadcaster is not "
+                    "supported on a group that borrows another group's cpu_group"
+                )
+            from .shm_broadcast import MessageQueue
+
             self.mq_broadcaster = MessageQueue.create_from_process_group(
                 self.cpu_group, 1 << 22, 6
             )
@@ -620,9 +705,7 @@ class GroupCoordinator:
         return self.ranks[(rank_in_group - 1) % world_size]
 
     @contextmanager
-    def graph_capture(
-        self, graph_capture_context: Optional[GraphCaptureContext] = None
-    ):
+    def graph_capture(self, graph_capture_context: GraphCaptureContext | None = None):
         if graph_capture_context is None:
             stream = torch.cuda.Stream()
             graph_capture_context = GraphCaptureContext(stream)
@@ -1099,7 +1182,7 @@ class GroupCoordinator:
 
     def gather(
         self, input_: torch.Tensor, dst: int = 0, dim: int = -1
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         """
         NOTE: We assume that the input tensor is on the same device across
         all the ranks.
@@ -1145,7 +1228,7 @@ class GroupCoordinator:
         )
         return input_
 
-    def broadcast_object(self, obj: Optional[Any] = None, src: int = 0):
+    def broadcast_object(self, obj: Any | None = None, src: int = 0):
         """Broadcast the input object.
         NOTE: `src` is the local rank of the source rank.
         """
@@ -1170,7 +1253,7 @@ class GroupCoordinator:
             return recv[0]
 
     def broadcast_object_list(
-        self, obj_list: List[Any], src: int = 0, group: Optional[ProcessGroup] = None
+        self, obj_list: list[Any], src: int = 0, group: ProcessGroup | None = None
     ):
         """Broadcast the input object list.
         NOTE: `src` is the local rank of the source rank.
@@ -1211,8 +1294,6 @@ class GroupCoordinator:
         # Send object
         torch.distributed.send(object_tensor, dst=self.ranks[dst], group=self.cpu_group)
 
-        return None
-
     def recv_object(self, src: int) -> Any:
         """Receive the input object list from the source rank."""
         """NOTE: `src` is the local rank of the source rank."""
@@ -1251,11 +1332,11 @@ class GroupCoordinator:
 
     def broadcast_tensor_dict(
         self,
-        tensor_dict: Optional[Dict[str, Union[torch.Tensor, Any]]] = None,
+        tensor_dict: dict[str, torch.Tensor | Any] | None = None,
         src: int = 0,
-        group: Optional[ProcessGroup] = None,
-        metadata_group: Optional[ProcessGroup] = None,
-    ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
+        group: ProcessGroup | None = None,
+        metadata_group: ProcessGroup | None = None,
+    ) -> dict[str, torch.Tensor | Any] | None:
         """Broadcast the input tensor dictionary.
         NOTE: `src` is the local rank of the source rank.
         """
@@ -1269,7 +1350,7 @@ class GroupCoordinator:
 
         rank_in_group = self.rank_in_group
         if rank_in_group == src:
-            metadata_list: List[Tuple[Any, Any]] = []
+            metadata_list: list[tuple[Any, Any]] = []
             assert isinstance(
                 tensor_dict, dict
             ), f"Expecting a dictionary, got {type(tensor_dict)}"
@@ -1333,10 +1414,10 @@ class GroupCoordinator:
 
     def send_tensor_dict(
         self,
-        tensor_dict: Dict[str, Union[torch.Tensor, Any]],
-        dst: Optional[int] = None,
+        tensor_dict: dict[str, torch.Tensor | Any],
+        dst: int | None = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
-    ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
+    ) -> dict[str, torch.Tensor | Any] | None:
         """Send the input tensor dictionary.
         NOTE: `dst` is the local rank of the source rank.
         """
@@ -1356,7 +1437,7 @@ class GroupCoordinator:
             dst = (self.rank_in_group + 1) % self.world_size
         assert dst < self.world_size, f"Invalid dst rank ({dst})"
 
-        metadata_list: List[Tuple[Any, Any]] = []
+        metadata_list: list[tuple[Any, Any]] = []
         assert isinstance(
             tensor_dict, dict
         ), f"Expecting a dictionary, got {type(tensor_dict)}"
@@ -1386,9 +1467,9 @@ class GroupCoordinator:
 
     def recv_tensor_dict(
         self,
-        src: Optional[int] = None,
+        src: int | None = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
-    ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
+    ) -> dict[str, torch.Tensor | Any] | None:
         """Recv the input tensor dictionary.
         NOTE: `src` is the local rank of the source rank.
         """
@@ -1409,7 +1490,7 @@ class GroupCoordinator:
         assert src < self.world_size, f"Invalid src rank ({src})"
 
         recv_metadata_list = self.recv_object(src=src)
-        tensor_dict: Dict[str, Any] = {}
+        tensor_dict: dict[str, Any] = {}
         for key, value in recv_metadata_list:
             if isinstance(value, TensorMetadata):
                 tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
@@ -1455,7 +1536,7 @@ class GroupCoordinator:
         """
         torch.distributed.barrier(group=self.cpu_group)
 
-    def send(self, tensor: torch.Tensor, dst: Optional[int] = None) -> None:
+    def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
         """Sends a tensor to the destination rank in a non-blocking way"""
         """NOTE: `dst` is the local rank of the destination rank."""
         if dst is None:
@@ -1468,7 +1549,7 @@ class GroupCoordinator:
             torch.distributed.send(tensor, self.ranks[dst], self.device_group)
 
     def recv(
-        self, size: torch.Size, dtype: torch.dtype, src: Optional[int] = None
+        self, size: torch.Size, dtype: torch.dtype, src: int | None = None
     ) -> torch.Tensor:
         """Receives a tensor from the source rank."""
         """NOTE: `src` is the local rank of the source rank."""
@@ -1488,19 +1569,31 @@ class GroupCoordinator:
             self.device_communicator.prepare_communication_buffer_for_model(model)
 
     def destroy(self):
+        """Release what this group owns.
+
+        A ``reuse_from`` group borrows its process groups and (unless EP) its
+        device_communicator; only the owner tears those down, since a second
+        destroy raises and aborts teardown part-way.
+        """
         if hasattr(self, "device_group"):
-            torch.distributed.destroy_process_group(self.device_group)
+            if self._owns_device_group:
+                torch.distributed.destroy_process_group(self.device_group)
             del self.device_group
         if hasattr(self, "cpu_group"):
-            torch.distributed.destroy_process_group(self.cpu_group)
+            if self._owns_cpu_group:
+                torch.distributed.destroy_process_group(self.cpu_group)
             del self.cpu_group
         if self.device_communicator is not None:
-            self.device_communicator.destroy()
+            if self._owns_device_communicator:
+                self.device_communicator.destroy()
+            # Drop it either way: a kept reference would route collectives into
+            # process groups that are destroyed by now.
+            self.device_communicator = None
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
 
 
-_WORLD: Optional[GroupCoordinator] = None
+_WORLD: GroupCoordinator | None = None
 
 
 def get_world_group() -> GroupCoordinator:
@@ -1509,7 +1602,7 @@ def get_world_group() -> GroupCoordinator:
 
 
 def init_world_group(
-    ranks: List[int], local_rank: int, backend: str
+    ranks: list[int], local_rank: int, backend: str
 ) -> GroupCoordinator:
     return GroupCoordinator(
         group_ranks=[ranks],
@@ -1521,12 +1614,14 @@ def init_world_group(
 
 
 def init_model_parallel_group(
-    group_ranks: List[List[int]],
+    group_ranks: list[list[int]],
     local_rank: int,
     backend: str,
     use_device_communicator: bool = True,
     use_message_queue_broadcaster: bool = False,
-    group_name: Optional[str] = None,
+    group_name: str | None = None,
+    reuse_from: "GroupCoordinator | None" = None,
+    is_ep: bool = False,
 ) -> GroupCoordinator:
     return GroupCoordinator(
         group_ranks=group_ranks,
@@ -1535,10 +1630,12 @@ def init_model_parallel_group(
         use_device_communicator=use_device_communicator,
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
+        reuse_from=reuse_from,
+        is_ep=is_ep,
     )
 
 
-_TP: Optional[GroupCoordinator] = None
+_TP: GroupCoordinator | None = None
 
 
 def get_tp_group() -> GroupCoordinator:
@@ -1549,7 +1646,7 @@ def get_tp_group() -> GroupCoordinator:
 # kept for backward compatibility
 get_tensor_model_parallel_group = get_tp_group
 
-_PCP: Optional[GroupCoordinator] = None
+_PCP: GroupCoordinator | None = None
 
 
 def get_pcp_group() -> GroupCoordinator:
@@ -1567,7 +1664,7 @@ def get_prefill_context_model_parallel_rank() -> int:
     return get_pcp_group().rank_in_group if _PCP is not None else 0
 
 
-_PP: Optional[GroupCoordinator] = None
+_PP: GroupCoordinator | None = None
 
 
 def get_pp_group() -> GroupCoordinator:
@@ -1575,7 +1672,7 @@ def get_pp_group() -> GroupCoordinator:
     return _PP
 
 
-_DP: Optional[GroupCoordinator] = None
+_DP: GroupCoordinator | None = None
 
 
 def get_dp_group() -> GroupCoordinator:
@@ -1583,7 +1680,7 @@ def get_dp_group() -> GroupCoordinator:
     return _DP
 
 
-_EP: Optional[GroupCoordinator] = None
+_EP: GroupCoordinator | None = None
 
 
 def get_ep_group() -> GroupCoordinator:
@@ -1591,7 +1688,7 @@ def get_ep_group() -> GroupCoordinator:
     return _EP
 
 
-_DCP: Optional[GroupCoordinator] = None
+_DCP: GroupCoordinator | None = None
 
 
 def get_dcp_group() -> GroupCoordinator:
@@ -1627,29 +1724,29 @@ class CustomGroupConfig:
     """
 
     def __init__(self):
-        self._groups: Dict[str, List] = {}
+        self._groups: dict[str, list] = {}
 
     def add_group(
         self,
         name: str,
-        ranks: List,
+        ranks: list,
     ) -> "CustomGroupConfig":
         assert name not in self._groups, f"custom group '{name}' already exists"
         assert ranks, f"custom group '{name}': ranks list must not be empty"
         self._groups[name] = ranks
         return self
 
-    def data(self) -> Dict[str, List]:
+    def data(self) -> dict[str, list]:
         assert self._groups, "no custom groups have been added"
         return dict(self._groups)
 
 
-_CUSTOM: Dict[str, "GroupCoordinator"] = {}
+_CUSTOM: dict[str, "GroupCoordinator"] = {}
 
 
 def get_custom_group(
-    name: Optional[str] = None,
-) -> "Union[GroupCoordinator, Dict[str, GroupCoordinator]]":
+    name: str | None = None,
+) -> "GroupCoordinator | dict[str, GroupCoordinator]":
     """Get custom group coordinator(s).
 
     - If only one custom group is initialized, returns the GroupCoordinator
@@ -1773,11 +1870,11 @@ def init_distributed_environment(
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
-    decode_context_model_parallel_size: Optional[int] = 1,
-    backend: Optional[str] = None,
+    decode_context_model_parallel_size: int | None = 1,
+    backend: str | None = None,
     data_parallel_size: int = 1,
     prefill_context_model_parallel_size: int = 1,
-    custom_group_config: Optional[Dict[str, List]] = None,
+    custom_group_config: dict[str, list] | None = None,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -1807,6 +1904,19 @@ def initialize_model_parallel(
     are on the same DGX box. For example if we are using 2 DGX-1 boxes
     with a total of 16 GPUs, rank 0 to 7 belong to the first box and
     ranks 8 to 15 belong to the second box.
+
+    Environment:
+        AITER_REUSE_IDENTICAL_COMM_GROUPS (default off; 1/true/yes/on): a group
+            whose rank list exactly matches an already-built one borrows that
+            group's process groups and allreduce communicators instead of
+            allocating a second set (with tp == dcp == ep == world_size, DCP and
+            EP borrow TP). The groups stay distinct objects with their own
+            unique_name; EP keeps its own EP-named device_communicator and a
+            private CPU group. Borrowed resources are released only by their
+            owner, in destroy().
+
+    Collective: all ranks must call this together (it all_reduces to check that
+    they agree on the reuse flag).
     """
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
@@ -1840,95 +1950,128 @@ def initialize_model_parallel(
         pipeline_model_parallel_size,
         prefill_context_model_parallel_size,
         tensor_model_parallel_size,
-    )  # noqa
+    )
 
     # When custom groups are provided, all communication goes through them
     # (standard ops assert via _assert_no_custom_group). Skip expensive
     # CudaCommunicator allocation for standard TP/PP/DP/EP groups.
     need_std_comm = custom_group_config is None
 
-    # Build the tensor model-parallel groups.
-    global _TP
-    assert _TP is None, "tensor model parallel group is already initialized"
-    group_ranks = all_ranks.view(-1, tensor_model_parallel_size).unbind(0)
-    group_ranks = [x.tolist() for x in group_ranks]
+    # When on, a group whose rank list matches an earlier one shares its
+    # communicators instead of allocating duplicates.
+    reuse_identical_rank_groups = env_flag("AITER_REUSE_IDENTICAL_COMM_GROUPS")
 
+    # Declared here so the precondition reads below are legal (a name cannot
+    # be used before its `global`).
+    global _TP, _DCP, _PCP, _PP, _DP, _EP
+
+    # Before the collective below: a second (or partial-rank) call must keep
+    # failing fast and locally instead of blocking in gloo forever.
+    assert _TP is None, "tensor model parallel group is already initialized"
+    assert _DCP is None, "decode context model parallel group is already initialized"
+    assert _PCP is None, "prefill context parallel group is already initialized"
+    assert _PP is None, "pipeline model parallel group is already initialized"
+    assert _DP is None, "data parallel group is already initialized"
+    assert _EP is None, "expert parallel group is already initialized"
+    assert not _CUSTOM, "custom allreduce group is already initialized"
+
+    # Set on only some ranks, those ranks skip new_group() for DCP/EP while the
+    # rest call it, and the job deadlocks in init with no output. Check
+    # unanimity to turn that into an error -- but only where reuse can happen
+    # (need_std_comm False => guaranteed no-op, don't charge every startup).
+    if need_std_comm and world_size > 1:
+        _flag = torch.tensor(
+            [1 if reuse_identical_rank_groups else 0], dtype=torch.int64
+        )
+        torch.distributed.all_reduce(_flag, group=get_world_group().cpu_group)
+        _n_set = int(_flag.item())
+        if _n_set not in (0, world_size):
+            # Not an assert: `python -O` would strip this guard.
+            raise RuntimeError(
+                f"AITER_REUSE_IDENTICAL_COMM_GROUPS disagrees across ranks "
+                f"({_n_set}/{world_size} ranks have it enabled); it must be set "
+                "identically on every rank. Note it accepts 1/true/yes/on, so a "
+                "mixed launcher using different spellings is still unanimous."
+            )
+        if rank == 0:
+            logger.info(
+                f"AITER_REUSE_IDENTICAL_COMM_GROUPS resolved to "
+                f"{reuse_identical_rank_groups}"
+            )
+
+    # Dedup helper: a group whose rank set matches an already-built one reuses it
+    # (reuse_from). The first builder is the source. Only multi-rank groups are
+    # tracked (single-rank groups hold no communicator). No-op when the flag is off.
+    _local_rank = get_world_group().local_rank
+    _built_by_ranks: dict[tuple[int, ...], GroupCoordinator] = {}
+
+    def _build_group(group_name, group_ranks, use_message_queue_broadcaster=False):
+        group_ranks = [x.tolist() for x in group_ranks]
+        my_ranks = next((r for r in group_ranks if rank in r), None)
+        # Key on the ordered rank tuple, not the sorted set: a reusing group
+        # inherits the source's ranks/rank_in_group verbatim, so reuse is only
+        # correct when the rank *order* is identical. Two groups sharing the
+        # same rank set but a different order (e.g. a future non-ascending
+        # slice) must NOT collapse -- that would corrupt order-dependent ops
+        # (all_gather layout, reduce_scatter, send/recv neighbors).
+        key = tuple(my_ranks) if my_ranks is not None else None
+        dedup = (
+            reuse_identical_rank_groups
+            and need_std_comm
+            and key is not None
+            and len(my_ranks) > 1
+        )
+        source = _built_by_ranks.get(key) if dedup else None
+        group = init_model_parallel_group(
+            group_ranks,
+            _local_rank,
+            backend,
+            use_device_communicator=need_std_comm,
+            use_message_queue_broadcaster=use_message_queue_broadcaster,
+            group_name=group_name,
+            reuse_from=source,
+            # Pass the EP role explicitly rather than duplicating the
+            # "ep" in unique_name rule DeviceCommunicatorBase already owns; a
+            # missed EP group silently loses all2all and returns wrong outputs.
+            is_ep=group_name == "ep",
+        )
+        if dedup and source is None:
+            _built_by_ranks[key] = group
+        return group
+
+    # Build the tensor model-parallel groups.
+    group_ranks = all_ranks.view(-1, tensor_model_parallel_size).unbind(0)
     # message queue broadcaster is only used in tensor model parallel group
-    _TP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        use_device_communicator=need_std_comm,
-        use_message_queue_broadcaster=True,
-        group_name="tp",
-    )
+    _TP = _build_group("tp", group_ranks, use_message_queue_broadcaster=True)
 
     # Build the DCP model-parallel groups.
-    global _DCP
-    assert _DCP is None, "decode context model parallel group is already initialized"
     # Note(hc): In the current implementation of decode context parallel,
     # dcp_size must not exceed tp_size, because the world size does not
     # change by DCP, it simply reuses the GPUs of TP group, and split one
     # TP group into tp_size//dcp_size DCP groups.
     group_ranks = all_ranks.reshape(-1, decode_context_model_parallel_size).unbind(0)
-    group_ranks = [x.tolist() for x in group_ranks]
-    _DCP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        use_device_communicator=need_std_comm,
-        group_name="dcp",
-    )
+    _DCP = _build_group("dcp", group_ranks)
 
     # Build the prefill context-parallel (PCP) groups.
     # PCP is an INDEPENDENT dimension (world = ... x pcp x tp), unlike the
     # commented-out DCP above which reuses TP GPUs. PCP sits just outside TP,
     # so transpose(3, 4) brings the PCP dim innermost. DO NOT touch _DCP.
-    global _PCP
-    assert _PCP is None, "prefill context parallel group is already initialized"
     group_ranks = (
         all_ranks.transpose(3, 4)
         .reshape(-1, prefill_context_model_parallel_size)
         .unbind(0)
     )
-    group_ranks = [x.tolist() for x in group_ranks]
-    _PCP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        use_device_communicator=need_std_comm,
-        group_name="pcp",
-    )
+    _PCP = _build_group("pcp", group_ranks)
 
     # Build the pipeline model-parallel groups.
-    global _PP
-    assert _PP is None, "pipeline model parallel group is already initialized"
     group_ranks = (
         all_ranks.transpose(2, 4).reshape(-1, pipeline_model_parallel_size).unbind(0)
     )
-    group_ranks = [x.tolist() for x in group_ranks]
-    _PP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        use_device_communicator=need_std_comm,
-        group_name="pp",
-    )
+    _PP = _build_group("pp", group_ranks)
 
-    global _DP
-    assert _DP is None, "data parallel group is already initialized"
     group_ranks = all_ranks.transpose(1, 4).reshape(-1, data_parallel_size).unbind(0)
-    group_ranks = [x.tolist() for x in group_ranks]
-    _DP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        use_device_communicator=need_std_comm,
-        group_name="dp",
-    )
+    _DP = _build_group("dp", group_ranks)
 
-    global _EP
-    assert _EP is None, "expert parallel group is already initialized"
     group_ranks = (
         all_ranks.transpose(1, 2)
         .reshape(
@@ -1939,18 +2082,9 @@ def initialize_model_parallel(
         )
         .unbind(0)
     )
-    group_ranks = [x.tolist() for x in group_ranks]
-    _EP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        use_device_communicator=need_std_comm,
-        group_name="ep",
-    )
+    _EP = _build_group("ep", group_ranks)
 
     # Build the custom allreduce group(s) (optional).
-    global _CUSTOM
-    assert not _CUSTOM, "custom allreduce group is already initialized"
     if custom_group_config is not None:
         for gname, ranks in custom_group_config.items():
             assert (
@@ -2016,11 +2150,11 @@ def initialize_model_parallel(
 def ensure_model_parallel_initialized(
     tensor_model_parallel_size: int,
     pipeline_model_parallel_size: int,
-    decode_context_model_parallel_size: Optional[int] = 1,
-    backend: Optional[str] = None,
+    decode_context_model_parallel_size: int | None = 1,
+    backend: str | None = None,
     data_parallel_size: int = 1,
     prefill_context_model_parallel_size: int = 1,
-    custom_group_config: Optional[Dict[str, List]] = None,
+    custom_group_config: dict[str, list] | None = None,
 ) -> None:
     """Helper to initialize model parallel groups if they are not initialized,
     or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
@@ -2142,7 +2276,7 @@ def destroy_distributed_environment():
         torch.distributed.destroy_process_group()
 
 
-def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:
+def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> list[bool]:
     """
     This is a collective operation that returns if each rank is in the same node
     as the source rank. It tests if processes are attached to the same
@@ -2194,7 +2328,7 @@ def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:
                     shm = shared_memory.SharedMemory(name=name)
                 if shm.buf[: len(magic_message)] == magic_message:
                     is_in_the_same_node[rank] = 1
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.error("Error ignored in is_in_the_same_node: %s", e)
     finally:
         if shm:
@@ -2226,7 +2360,6 @@ def is_global_first_rank() -> bool:
     """
     try:
         # If world group is available, use it for the most accurate check
-        global _WORLD
         if _WORLD is not None:
             return _WORLD.is_first_rank
 
@@ -2237,7 +2370,7 @@ def is_global_first_rank() -> bool:
         # Fallback to torch's global rank
         return torch.distributed.get_rank() == 0
 
-    except Exception:
+    except Exception:  # noqa: BLE001
         # If anything goes wrong, assume this is the first rank
         return True
 

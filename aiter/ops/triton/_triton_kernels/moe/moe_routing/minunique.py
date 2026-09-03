@@ -1,8 +1,22 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-@triton.jit
+_keepk_sort0_repr = make_kernel_repr(
+    "_keepk_sort0",
+    [
+        "HIST_BLOCK_M",
+        "KP1",
+        "KP1_PAD",
+        "K",
+        "APPLY_SOFTMAX",
+        "APPLY_RENORM",
+    ],
+)
+
+
+@triton.jit(repr=_keepk_sort0_repr)
 def _keepk_sort0(
     Vin,
     Iin,
@@ -46,7 +60,7 @@ def _keepk_sort0(
     negpop = tl.where(m, -cp, -3.0e38)
     maxnp = tl.max(negpop, axis=0)
     is_mp = negpop == maxnp
-    finite = (val == val) & (val < 3.0e38) & (val > -3.0e38)
+    finite = (val == val) & (val < 3.0e38) & (val > -3.0e38)  # noqa: PLR0124
     valc = tl.where(finite, val, -3.0e38)
     negval = tl.where(is_mp, -valc, -3.0e38)
     maxnv = tl.max(negval, axis=0)

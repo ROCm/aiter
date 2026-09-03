@@ -1,13 +1,15 @@
 import os
+from dataclasses import dataclass, field
+
 import torch
 import triton
-from dataclasses import dataclass, field
+
 from aiter.ops.triton._triton_kernels.moe.moe_routing.routing import (
     _combined_routing,
     _combined_routing_fused,
 )
-from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
 from aiter.ops.triton.moe.moe_routing.topk import grouped_topk
+from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
 
 # HERD (Hot-Expert Routing for Decode): when AITER_TRITON_USE_HERD is set, the flat-topk
 # path uses fused min-unique routing (top-(k+1) -> drop least-batch-popular -> keep-k)
@@ -127,10 +129,10 @@ def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOC
         hist,
         n_expts_tot,
         token_offs_raw,
-        token_offs_pad,  #
+        token_offs_pad,
         blocks1a,
         block_pid_map,
-        block_pid_map.shape[0],  #
+        block_pid_map.shape[0],
         block_m_log2,
         BLOCK_A=BLOCK_A,
         EQUAL_A=(hist.shape[0] == BLOCK_A),  # optimization parameters
@@ -199,10 +201,10 @@ def sort_tokens_fused(
         n_expts_tot,
         hist,
         token_offs_raw,
-        token_offs_pad,  #
+        token_offs_pad,
         blocks1a,
         block_pid_map,
-        block_pid_map.shape[0],  #
+        block_pid_map.shape[0],
         block_m_log2,
         BLOCK_A=BLOCK_A,
         EQUAL_A=(hist.shape[0] == BLOCK_A),  # optimization parameters
@@ -311,10 +313,10 @@ def routing(
         # HERD: env-gated fused min-unique routing (decode-sized batches only;
         # prefill / large M falls through to the stock top-k path below).
         if _USE_HERD and _HERD_MIN_M <= num_tokens <= _HERD_MAX_M:
-            from .minunique import routing_minunique
+            from aiter.ops.triton.moe.moe_routing.minunique import routing_minunique
 
             return routing_minunique(logits, n_expts_act, sm_first=sm_first)
-        from .topk import topk
+        from aiter.ops.triton.moe.moe_routing.topk import topk
 
         HIST_BLOCK_M = 32
         if sm_first:
@@ -341,7 +343,14 @@ def routing(
         ) = sort_fn(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOCK_M)
         expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
         return (
-            RoutingData(block_m, gate_scal, hist, n_expts_tot, n_expts_act, expt_data),
+            RoutingData(
+                block_m,
+                gate_scal,
+                hist,
+                n_expts_tot,
+                n_expts_act,
+                expt_data,
+            ),
             topk_indx,
             gate_indx,
         )
@@ -353,7 +362,7 @@ def routing(
     # HERD: env-gated fused min-unique routing for decode-sized batches.
     # Only for non-grouped-topk (DSv4 flat topk with sqrtsoftplus).
     if _USE_HERD and _HERD_MIN_M <= num_tokens <= _HERD_MAX_M and not use_grouped_topk:
-        from .minunique import routing_minunique_fused
+        from aiter.ops.triton.moe.moe_routing.minunique import routing_minunique_fused
 
         return routing_minunique_fused(
             logits,
@@ -383,7 +392,7 @@ def routing(
             HIST_BLOCK_M=32,
         )
     else:
-        from .topk import topk
+        from aiter.ops.triton.moe.moe_routing.topk import topk
 
         expt_scal, expt_indx, bitmatrix = topk(
             logits,
@@ -443,7 +452,7 @@ def routing_from_hash(
     Replaces the Python ``_hash_topk`` + multi-kernel ``fused_routing_from_topk``
     counting-sort + ``compute_expt_data`` (with memset) chain entirely.
     """
-    from .topk import hash_routing
+    from aiter.ops.triton.moe.moe_routing.topk import hash_routing
 
     n_tokens, n_expts_tot = router_logits.shape
 

@@ -3,8 +3,9 @@
 
 import triton
 import triton.language as tl
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
+
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 
 _fused_gemm_afp4wfp4_split_cat_repr = make_kernel_repr(
     "_fused_gemm_afp4wfp4_split_cat",
@@ -577,7 +578,19 @@ def _fused_gemm_afp4wfp4_preshuffle_split_cat(
             tl.store(c1_ptrs, c, mask=c1_mask)
 
 
-@triton.jit
+_fused_gemm_afp4wfp4_split_cat_reduce_repr = make_kernel_repr(
+    "_fused_gemm_afp4wfp4_split_cat_reduce",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_S3",
+        "ACTUAL_KSPLIT",
+        "MAX_KSPLIT",
+    ],
+)
+
+
+@triton.jit(repr=_fused_gemm_afp4wfp4_split_cat_reduce_repr)
 def _fused_gemm_afp4wfp4_split_cat_reduce(
     c_ptr,
     c1_ptr,

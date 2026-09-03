@@ -4,31 +4,56 @@
 import torch
 import triton
 
-from aiter.ops.triton.conv._utils import _out_hw, _is_winograd_eligible
-from aiter.ops.triton.utils.conv_config_utils import format_shape_key
 from aiter.ops.triton._triton_kernels.conv.conv_1x1 import (
     _conv2d_1x1_kernel,
+)
+from aiter.ops.triton._triton_kernels.conv.conv_1x1 import (
     _get_config as _get_config_1x1,
+)
+from aiter.ops.triton._triton_kernels.conv.conv_3x3 import (
+    _conv2d_3x3_cblocked_kernel,
+    _conv2d_3x3_nchw_kernel,
+    _conv2d_3x3_nhwc_kernel,
+    _get_config_cblocked,
+    _get_config_nchw,
+    _get_config_nhwc,
+)
+from aiter.ops.triton._triton_kernels.conv.conv_3x3_winograd_f4x3 import (
+    _get_config_gemm as _get_config_wino_gemm,
+)
+from aiter.ops.triton._triton_kernels.conv.conv_3x3_winograd_f4x3 import (
+    _get_config_input as _get_config_wino_input,
+)
+from aiter.ops.triton._triton_kernels.conv.conv_3x3_winograd_f4x3 import (
+    _get_config_output as _get_config_wino_output,
+)
+from aiter.ops.triton._triton_kernels.conv.conv_3x3_winograd_f4x3 import (
+    _winograd_f4x3_batched_gemm_kernel,
+    _winograd_f4x3_cblocked_input_transform_kernel,
+    _winograd_f4x3_input_transform_kernel,
+    _winograd_f4x3_output_transform_kernel,
 )
 from aiter.ops.triton._triton_kernels.conv.conv_general import (
     _conv2d_general_kernel,
+)
+from aiter.ops.triton._triton_kernels.conv.conv_general import (
     _get_config as _get_config_general,
 )
-from aiter.ops.triton._triton_kernels.conv.conv_3x3 import (
-    _conv2d_3x3_nhwc_kernel,
-    _conv2d_3x3_cblocked_kernel,
-    _get_config_nhwc,
-    _get_config_cblocked,
+from aiter.ops.triton._triton_kernels.conv.nchw_to_cblocked import (
+    _get_config as _get_config_prepack,
 )
-from aiter.ops.triton._triton_kernels.conv.conv_3x3_winograd_f4x3 import (
-    _winograd_f4x3_input_transform_kernel,
-    _winograd_f4x3_cblocked_input_transform_kernel,
-    _winograd_f4x3_batched_gemm_kernel,
-    _winograd_f4x3_output_transform_kernel,
-    _get_config_input as _get_config_wino_input,
-    _get_config_gemm as _get_config_wino_gemm,
-    _get_config_output as _get_config_wino_output,
+from aiter.ops.triton._triton_kernels.conv.nchw_to_cblocked import (
+    _nchw_to_cblocked_kernel,
 )
+from aiter.ops.triton.utils.conv_config_utils import (
+    format_prepack_shape_key,
+    format_shape_key,
+)
+
+
+def _kernel_activation(activation):
+    """Map the public Conv2D GELU name to its existing tanh approximation."""
+    return "gelu_tanh" if activation == "gelu" else activation
 
 
 def _make_mn_grid(M_total, K_out):
@@ -76,28 +101,25 @@ def _make_wino_output_grid(T, K_out):
     return grid
 
 
-def _select_3x3_method(N, C, H, W, K_out, stride, dilation):
-    """Pick the best 3x3 kernel method based on shape heuristics.
-
-    Decision tree (from benchmark sweep on RDNA4):
-    1. Non-Winograd-eligible (stride>1, dilation>1, or C<4) -> cblocked
-    2. Winograd only wins when BOTH C and K >= 512 with enough tiles (T >= 98).
-       At 256x256 channels, cblocked is tied or slightly better.
-    3. Among Winograd variants: WF4cb (NCHWc input) beats WF4 (NCHW input)
-       when T >= 392 (large batch * spatial gives more coalescing benefit).
-       Below that, WF4 is slightly faster (less repacking overhead).
-    """
-    if not _is_winograd_eligible(3, 3, stride, dilation, C):
-        return "cblocked"
-    P, Q = _out_hw(H, W, 3, 3, stride, (1, 1), dilation)
-    tile_H = (P + 3) // 4
-    tile_W = (Q + 3) // 4
-    T = N * tile_H * tile_W
-    if C >= 512 and K_out >= 512 and T >= 98:
-        if T >= 392:
-            return "winograd_f4x3_cblocked"
-        return "winograd_f4x3"
-    return "cblocked"
+def _launch_nchw_to_cblocked(x, x_blocked, N, C, H, W, C_pad, block_c):
+    """Launch the fused NCHW-to-NCHWc activation pack."""
+    HW = H * W
+    shape_key = format_prepack_shape_key(N, C, H, W, block_c)
+    config = _get_config_prepack(shape_key=shape_key, M=HW)
+    grid = lambda meta: (
+        triton.cdiv(HW, meta["BLOCK_M"]),
+        triton.cdiv(C_pad, meta["BLOCK_C"]),
+        N,
+    )
+    _nchw_to_cblocked_kernel[grid](
+        x,
+        x_blocked,
+        C,
+        HW,
+        C_PAD=C_pad,
+        CB=block_c,
+        **config,
+    )
 
 
 def _launch_1x1(
@@ -142,7 +164,11 @@ def _launch_1x1(
         dh=1,
         dw=1,
     )
-    config = _get_config_1x1(shape_key=shape_key, M=M_total)
+    config = _get_config_1x1(
+        shape_key=shape_key,
+        M=M_total,
+        variants=(layout,),
+    )
 
     _conv2d_1x1_kernel[_make_mn_grid(M_total, K_out)](
         x,
@@ -162,7 +188,7 @@ def _launch_1x1(
         pw,
         M_total,
         HAS_BIAS=bias_fp32 is not None,
-        ACTIVATION=activation,
+        ACTIVATION=_kernel_activation(activation),
         LAYOUT=layout,
         **config,
     )
@@ -208,7 +234,10 @@ def _launch_3x3_nhwc(
         dh=dh,
         dw=dw,
     )
-    config = _get_config_nhwc(shape_key=shape_key, M=M_total)
+    config = _get_config_nhwc(
+        shape_key=shape_key,
+        M=M_total,
+    )
 
     _conv2d_3x3_nhwc_kernel[_make_mn_grid(M_total, K_out)](
         x,
@@ -231,7 +260,7 @@ def _launch_3x3_nhwc(
         dw,
         M_total,
         HAS_BIAS=bias_fp32 is not None,
-        ACTIVATION=activation,
+        ACTIVATION=_kernel_activation(activation),
         **config,
     )
 
@@ -255,7 +284,7 @@ def _launch_3x3_cblocked(
     dilation,
     activation,
 ):
-    """Launch specialized 3x3 kernel for channel-blocked input."""
+    """Launch the 3x3 kernel for a materialized 5-D NCHWc input."""
     sh, sw = stride
     ph, pw = padding
     dh, dw = dilation
@@ -277,7 +306,10 @@ def _launch_3x3_cblocked(
         dh=dh,
         dw=dw,
     )
-    config = _get_config_cblocked(shape_key=shape_key, M=M_total)
+    config = _get_config_cblocked(
+        shape_key=shape_key,
+        M=M_total,
+    )
 
     _conv2d_3x3_cblocked_kernel[_make_mn_grid(M_total, K_out)](
         x_blocked,
@@ -301,7 +333,75 @@ def _launch_3x3_cblocked(
         dw,
         M_total,
         HAS_BIAS=bias_fp32 is not None,
-        ACTIVATION=activation,
+        ACTIVATION=_kernel_activation(activation),
+        **config,
+    )
+
+
+def _launch_3x3_nchw(
+    x,
+    w_3x3,
+    bias,
+    y,
+    N,
+    C,
+    H,
+    W_in,
+    K_out,
+    P,
+    Q,
+    C_pad,
+    stride,
+    padding,
+    dilation,
+    activation,
+):
+    """Launch the repack-free kernel on a contiguous NCHW activation."""
+    sh, sw = stride
+    ph, pw = padding
+    dh, dw = dilation
+    M_total = N * P * Q
+    shape_key = format_shape_key(
+        N=N,
+        C=C,
+        H=H,
+        W=W_in,
+        K=K_out,
+        R=3,
+        S=3,
+        sh=sh,
+        sw=sw,
+        ph=ph,
+        pw=pw,
+        dh=dh,
+        dw=dw,
+    )
+    config = _get_config_nchw(shape_key=shape_key, M=M_total)
+    row_aligned = "BLOCK_M" in config and Q % config["BLOCK_M"] == 0
+
+    _conv2d_3x3_nchw_kernel[_make_mn_grid(M_total, K_out)](
+        x,
+        w_3x3,
+        bias,
+        y,
+        N,
+        C,
+        H,
+        W_in,
+        K_out,
+        P,
+        Q,
+        C_pad,
+        sh,
+        sw,
+        ph,
+        pw,
+        dh,
+        dw,
+        M_total,
+        HAS_BIAS=bias is not None,
+        ACTIVATION=_kernel_activation(activation),
+        ROW_ALIGNED=row_aligned,
         **config,
     )
 
@@ -352,7 +452,11 @@ def _launch_general(
         dh=dh,
         dw=dw,
     )
-    config = _get_config_general(shape_key=shape_key, M=M_total)
+    config = _get_config_general(
+        shape_key=shape_key,
+        M=M_total,
+        variants=(layout,),
+    )
 
     _conv2d_general_kernel[_make_mn_grid(M_total, K_out)](
         x,
@@ -377,7 +481,7 @@ def _launch_general(
         dw,
         M_total,
         HAS_BIAS=bias_fp32 is not None,
-        ACTIVATION=activation,
+        ACTIVATION=_kernel_activation(activation),
         LAYOUT=layout,
         **config,
     )
@@ -471,7 +575,7 @@ def _launch_winograd_f4x3(
         tile_W,
         T,
         HAS_BIAS=bias_fp32 is not None,
-        ACTIVATION=activation,
+        ACTIVATION=_kernel_activation(activation),
         LAYOUT=layout,
         **output_config,
     )
@@ -495,7 +599,7 @@ def _launch_winograd_f4x3_cblocked(
     activation,
     block_k,
 ):
-    """Launch Winograd F(4x4,3x3) with NCHWc input layout: cblocked input transform -> batched GEMM -> output transform."""
+    """Launch Winograd F(4x4,3x3) with a materialized NCHWc input."""
     ph, pw = padding
     tile_H = (P + 3) // 4
     tile_W = (Q + 3) // 4
@@ -565,6 +669,6 @@ def _launch_winograd_f4x3_cblocked(
         tile_W,
         T,
         HAS_BIAS=bias_fp32 is not None,
-        ACTIVATION=activation,
+        ACTIVATION=_kernel_activation(activation),
         **output_config,
     )

@@ -36,24 +36,25 @@ import random
 import traceback
 from collections import namedtuple
 from dataclasses import dataclass
-from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
 
 from aiter.ops.triton.conv._utils import (
-    _out_hw,
     _is_1x1_conv,
     _is_3x3_conv,
+    _out_hw,
 )
-from aiter.ops.triton.conv._launch import _select_3x3_method
 from aiter.ops.triton.conv.conv2d import (
+    _select_3x3_method,
     conv2d_nchw,
+    conv2d_nchw_3x3_direct,
     conv2d_nchw_cblocked,
     conv2d_nhwc,
     conv2d_winograd_f4x3,
     conv2d_winograd_f4x3_cblocked,
 )
+from aiter.ops.triton.utils.conv_config_utils import has_conv_config
 
 
 def dynamic_conv_tolerances(dtype: torch.dtype, K_red: int):
@@ -103,7 +104,7 @@ def apply_activation(y: torch.Tensor, activation: str):
 # correctness tests can run on CDNA hardware without being skipped.
 # AITER Triton CI relies on CDNA runners.
 SUPPORTED_ARCHS = {
-    "RDNA": {"gfx1200", "gfx1201", "gfx1250"},
+    "RDNA": {"gfx1100", "gfx1151", "gfx1200", "gfx1201", "gfx1250"},
     "CDNA": {"gfx942", "gfx950"},
 }
 
@@ -122,6 +123,10 @@ def _3x3_guard(R, S, stride, dilation, C):
     return _is_3x3_conv(R, S)
 
 
+def _direct_3x3_guard(R, S, stride, dilation, C):
+    return _is_3x3_conv(R, S) and has_conv_config("CONV-3X3-NCHW")
+
+
 def _wino_guard(R, S, stride, dilation, C):
     # _is_winograd_eligible signature varies by upstream — keep the flag tight
     from aiter.ops.triton.conv._utils import _is_winograd_eligible
@@ -131,6 +136,9 @@ def _wino_guard(R, S, stride, dilation, C):
 
 METHOD_REGISTRY = {
     "default": MethodEntry(conv2d_nchw, None, False, "", "default"),
+    "direct": MethodEntry(
+        conv2d_nchw_3x3_direct, _direct_3x3_guard, False, "[direct]", "direct"
+    ),
     "cblocked": MethodEntry(
         conv2d_nchw_cblocked, _3x3_guard, False, "[cblocked]", "cblocked"
     ),
@@ -180,16 +188,16 @@ class TestSuite:
         self.verbose = verbose
         self.print_shapes = print_shapes
         self.layout_mode = layout_mode
-        self.results: List[TestResult] = []
+        self.results: list[TestResult] = []
 
     def check_close(
         self,
         name: str,
         got: torch.Tensor,
         ref: torch.Tensor,
-        K_red: Optional[int] = None,
-        rtol: Optional[float] = None,
-        atol: Optional[float] = None,
+        K_red: int | None = None,
+        rtol: float | None = None,
+        atol: float | None = None,
     ) -> TestResult:
         got32 = got.float()
         ref32 = ref.float()
@@ -218,7 +226,7 @@ class TestSuite:
     def all_passed(self) -> bool:
         return all(r.passed for r in self.results)
 
-    def failed_results(self) -> List[TestResult]:
+    def failed_results(self) -> list[TestResult]:
         return [r for r in self.results if not r.passed]
 
 
@@ -241,7 +249,7 @@ def run_all_methods(
     suite: TestSuite,
     x: torch.Tensor,
     w: torch.Tensor,
-    b: Optional[torch.Tensor],
+    b: torch.Tensor | None,
     stride,
     padding,
     dilation,
@@ -357,6 +365,7 @@ def get_edge_case_shapes():
 
 
 def run_edge_cases(suite: TestSuite, activation: str = "none", method: str = "default"):
+    torch.manual_seed(0)
     for (
         N,
         C,
@@ -393,6 +402,7 @@ def run_edge_cases(suite: TestSuite, activation: str = "none", method: str = "de
 def run_activations(
     suite: TestSuite, method: str = "default", activation: str = "relu"
 ):
+    torch.manual_seed(0)
     N, C, H, W, K_out = 2, 32, 16, 16, 64
     R, S = 3, 3
     stride, padding, dilation = (1, 1), (1, 1), (1, 1)
@@ -414,6 +424,7 @@ def run_activations(
 
 
 def run_no_bias(suite: TestSuite, method: str = "default"):
+    torch.manual_seed(0)
     shapes = [
         (1, 64, 8, 8, 128, 1, 1, (1, 1), (0, 0), (1, 1), "1x1 no bias"),
         (2, 32, 16, 16, 64, 3, 3, (1, 1), (1, 1), (1, 1), "3x3 no bias"),
@@ -443,6 +454,7 @@ def run_cross_method(suite: TestSuite):
     cross-kernel equivalence: if kernel A and B both match the same
     F.conv2d output within tolerance, they match each other within ~2x.
     """
+    torch.manual_seed(0)
     for N, C, H, W, K_out, R, S, stride, padding, dilation, desc in COMMON_SHAPES:
         x = torch.randn((N, C, H, W), device=suite.device, dtype=suite.dtype)
         w = torch.randn((K_out, C, R, S), device=suite.device, dtype=suite.dtype)
@@ -473,6 +485,7 @@ def run_random_fuzzing(
     for ad-hoc development sweeps.
     """
     random.seed(seed)
+    torch.manual_seed(seed)
     for i in range(num_tests):
         N = random.randint(1, 8)
         C = random.choice([1, 3, 16, 32, 64, 128, 256])
@@ -507,7 +520,7 @@ def run_random_fuzzing(
                 method=method,
                 activation=activation,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             tb = traceback.format_exc()
             suite.results.append(
                 TestResult(

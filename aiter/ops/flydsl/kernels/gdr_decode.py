@@ -5,25 +5,35 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-
-from flydsl.expr.typing import T
 from flydsl._mlir.dialects import (
     gpu as mlir_gpu,
-    math as mlir_math,
-    vector as mlir_vector,
 )
-from flydsl.expr import range_constexpr, const_expr, arith, vector, rocdl
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import scf
+from flydsl.expr import const_expr, range_constexpr, rocdl
+from flydsl.expr.typing import T
 
 from .tensor_shim import (
-    get_dtype_in_kernel,
-    get_dtype_bytes,
-    GTensor,
     _to_raw,
 )
 
-fm_fast = arith.FastMathFlags.fast
+
+def _gview(tensor, base, shape, stride):
+    it = fx.get_iter(fx.rocdl.make_buffer_tensor(tensor, max_size=True))
+    if base is not None:
+        it = fx.add_offset(it, base)
+    return fx.Tensor(fx.make_view(it, fx.make_layout(shape, stride)))
+
+
+def _load_vec(atom, tile, width, numeric):
+    frag = fx.make_rmem_tensor(width, numeric)
+    fx.copy(atom, tile, frag)
+    vec = frag.load()
+    return vec[0] if width == 1 else vec
+
+
+def _store_vec(atom, tile, value, width, numeric):
+    frag = fx.make_rmem_tensor(width, numeric)
+    frag.store(fx.Vector.from_elements([value], dtype=numeric) if width == 1 else value)
+    fx.copy(atom, frag, tile)
 
 
 @functools.lru_cache(maxsize=1024)
@@ -36,6 +46,9 @@ def create_vk_gdr_decode_kernel(
     num_v_heads: int,
     head_k_dim: int,
     head_v_dim: int,
+    q_strides: tuple,
+    k_strides: tuple,
+    v_strides: tuple,
     state_strides: tuple,
     a_strides: tuple,
     b_strides: tuple,
@@ -53,6 +66,17 @@ def create_vk_gdr_decode_kernel(
         VALUES_PER_THREAD_K = 4  # 16B
     else:
         VALUES_PER_THREAD_K = 8  # 16B
+    data_num = fx.BFloat16 if dtype == "bf16" else fx.Float16
+    A_log_num = {
+        "f32": fx.Float32,
+        "f16": fx.Float16,
+        "bf16": fx.BFloat16,
+    }[A_log_dtype]
+    state_num = {
+        "f32": fx.Float32,
+        "f16": fx.Float16,
+        "bf16": fx.BFloat16,
+    }[state_dtype]
 
     WARP_SIZE = WARP_THREADS_V * WARP_THREADS_K
     BLOCK_THREADS = NUM_WARPS * WARP_SIZE
@@ -96,24 +120,19 @@ def create_vk_gdr_decode_kernel(
         b: fx.Tensor,
         dt_bias: fx.Tensor,
         A_log: fx.Tensor,
-        indices: fx.Tensor,
+        read_indices: fx.Tensor,
+        write_indices: fx.Tensor,
         state: fx.Tensor,
         out: fx.Tensor,
         batch_size: fx.Int32,
     ):
-        scale = arith.constant(SCALE_VALUE, type=T.f32)
-        softplus_beta_ = arith.constant(softplus_beta, type=T.f32)
-        softplus_threshold_ = arith.constant(softplus_threshold, type=T.f32)
+        scale = fx.Float32(SCALE_VALUE)
+        softplus_beta_ = fx.Float32(softplus_beta)
+        softplus_threshold_ = fx.Float32(softplus_threshold)
 
-        dtype_ = get_dtype_in_kernel(dtype)
-        A_log_dtype_ = get_dtype_in_kernel(A_log_dtype)
-        state_dtype_ = get_dtype_in_kernel(state_dtype)
-        # i32_0 = arith.constant(0, type=T.i32)
-        f32_0 = arith.constant(0.0, type=T.f32)
-        f32_1 = arith.constant(1.0, type=T.f32)
-        width_i32 = arith.constant(WARP_SIZE, type=T.i32)
-        vec_t = T.vec(VALUES_PER_THREAD_K, dtype_)
-        acc_vec_t = T.vec(VALUES_PER_THREAD_K, T.f32)
+        f32_0 = fx.Float32(0.0)
+        f32_1 = fx.Float32(1.0)
+        width_i32 = _to_raw(fx.Int32(WARP_SIZE))
 
         tidx = fx.thread_idx.x
         bidx = fx.block_idx.x
@@ -130,129 +149,232 @@ def create_vk_gdr_decode_kernel(
         warp_k_vec_start = w_tid % WARP_THREADS_K * VALUES_PER_THREAD_K
         global_v_start = tile_v_start + wid * WARP_TILE_V + w_tid // WARP_THREADS_K
 
-        indices_tensor = GTensor(indices, dtype=T.i32, shape=(-1,))
-        pool_idx = fx.Int32(indices_tensor[b_i])
+        cp_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
+        cp_data = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), data_num)
+        cp_data_vec = fx.make_copy_atom(
+            fx.rocdl.BufferCopy(data_num.width * VALUES_PER_THREAD_K), data_num
+        )
+        cp_A_log = fx.make_copy_atom(fx.rocdl.BufferCopy(A_log_num.width), A_log_num)
+        cp_state_vec = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), state_num)
 
-        q_tensor = GTensor(
-            query, dtype=dtype_, shape=(-1, seq_length, num_k_heads, head_k_dim)
+        read_indices_view = _gview(read_indices, None, (batch_size, 1), (1, 1))
+        write_indices_view = _gview(write_indices, None, (batch_size, 1), (1, 1))
+        read_pool_idx = _load_vec(
+            cp_i32, fx.slice(read_indices_view, (b_i, None)), 1, fx.Int32
         )
-        k_tensor = GTensor(
-            key, dtype=dtype_, shape=(-1, seq_length, num_k_heads, head_k_dim)
+        write_pool_idx = _load_vec(
+            cp_i32, fx.slice(write_indices_view, (b_i, None)), 1, fx.Int32
         )
-        v_tensor = GTensor(
-            value, dtype=dtype_, shape=(-1, seq_length, num_v_heads, head_v_dim)
+
+        q_view = _gview(
+            query,
+            None,
+            (
+                batch_size,
+                seq_length,
+                num_k_heads,
+                head_k_dim // VALUES_PER_THREAD_K,
+                VALUES_PER_THREAD_K,
+            ),
+            (*q_strides[:-1], VALUES_PER_THREAD_K, 1),
         )
-        a_tensor = GTensor(
+        k_view = _gview(
+            key,
+            None,
+            (
+                batch_size,
+                seq_length,
+                num_k_heads,
+                head_k_dim // VALUES_PER_THREAD_K,
+                VALUES_PER_THREAD_K,
+            ),
+            (*k_strides[:-1], VALUES_PER_THREAD_K, 1),
+        )
+        v_view = _gview(
+            value,
+            None,
+            (batch_size, seq_length, num_v_heads, head_v_dim, 1),
+            (*v_strides, 1),
+        )
+        a_view = _gview(
             a,
-            dtype=dtype_,
-            stride=(a_strides[0], a_strides[1], a_strides[2]),
-            shape=(-1, seq_length, num_v_heads),
+            None,
+            (batch_size, seq_length, num_v_heads, 1),
+            (*a_strides, 1),
         )
-        b_tensor = GTensor(
+        b_view = _gview(
             b,
-            dtype=dtype_,
-            stride=(b_strides[0], b_strides[1], b_strides[2]),
-            shape=(-1, seq_length, num_v_heads),
+            None,
+            (batch_size, seq_length, num_v_heads, 1),
+            (*b_strides, 1),
         )
-        dt_bias_tensor = GTensor(dt_bias, dtype=dtype_, shape=(num_v_heads,))
-        A_log_tensor = GTensor(A_log, dtype=A_log_dtype_, shape=(num_v_heads,))
-        out_tensor = GTensor(
-            out, dtype=dtype_, shape=(-1, seq_length, num_v_heads, head_v_dim)
+        dt_bias_view = _gview(dt_bias, None, (num_v_heads, 1), (1, 1))
+        A_log_view = _gview(A_log, None, (num_v_heads, 1), (1, 1))
+        out_view = _gview(
+            out,
+            None,
+            (batch_size, seq_length, num_v_heads, head_v_dim, 1),
+            (
+                seq_length * num_v_heads * head_v_dim,
+                num_v_heads * head_v_dim,
+                head_v_dim,
+                1,
+                1,
+            ),
         )
-        state_tensor = GTensor(
+
+        state_shape = (
+            num_v_heads,
+            head_v_dim,
+            head_k_dim // VALUES_PER_THREAD_K,
+            VALUES_PER_THREAD_K,
+        )
+        state_stride = (
+            state_strides[1],
+            state_strides[2],
+            VALUES_PER_THREAD_K,
+            1,
+        )
+        read_state_view = _gview(
             state,
-            dtype=state_dtype_,
-            shape=(num_v_heads, head_v_dim, head_k_dim),
-            stride=(state_strides[1], state_strides[2], state_strides[3]),
-            static_bytes_offset_i64=fx.Index(pool_idx)
-            * fx.Index(state_strides[0])
-            * get_dtype_bytes(state_dtype),
+            fx.Int64(read_pool_idx) * fx.Int64(state_strides[0]),
+            state_shape,
+            state_stride,
+        )
+        write_state_view = _gview(
+            state,
+            fx.Int64(write_pool_idx) * fx.Int64(state_strides[0]),
+            state_shape,
+            state_stride,
         )
 
         def fast_exp(x, use_exp2=True):
             if const_expr(use_exp2):
                 log2e = 1.4426950408889634
-                out = rocdl.exp2(T.f32, x * log2e)
-                return out
-            return mlir_math.exp(x, fastmath=fm_fast)
+                return rocdl.exp2(T.f32, _to_raw(fx.Float32(x) * log2e))
+            return fx.math.exp(x, fastmath=fx.FastMathFlags.fast)
 
         def fast_log1p(x):
-            return mlir_math.log1p(x, fastmath=fm_fast)
+            return fx.math.log1p(x, fastmath=fx.FastMathFlags.fast)
 
-        cond_valid = arith.cmpi(arith.CmpIPredicate.sge, pool_idx, fx.Int32(0))
-        cond_valid_if = scf.IfOp(cond_valid, results_=[], has_else=False)
-        with ir.InsertionPoint(cond_valid_if.then_block):
-
-            if const_expr("f32" in A_log_dtype):
-                r_A_log = A_log_tensor[hv_i]
-            else:
-                r_A_log = A_log_tensor[hv_i].extf(T.f32)
-            r_dt_bias = dt_bias_tensor[hv_i].extf(T.f32)
+        # Skip CG-pad slots (indices sentinel < 0). The guarded body is a
+        # closure so the runtime `if` sees an opaque call and lowers to scf.if.
+        def _do_decode():
+            r_A_log = _load_vec(
+                cp_A_log, fx.slice(A_log_view, (hv_i, None)), 1, A_log_num
+            )
+            if const_expr("f32" not in A_log_dtype):
+                r_A_log = r_A_log.to(fx.Float32)
+            r_dt_bias = _load_vec(
+                cp_data, fx.slice(dt_bias_view, (hv_i, None)), 1, data_num
+            ).to(fx.Float32)
 
             state_vecs = [0] * (WARP_TILE_V_ITERS * WARP_TILE_K_ITERS)
             for vi in range_constexpr(WARP_TILE_V_ITERS):
                 global_v_i = global_v_start + vi * WARP_GROUP_TILE_V
                 for ki in range_constexpr(WARP_TILE_K_ITERS):
                     warp_k_vec_i = warp_k_vec_start + ki * WARP_TILE_K
-                    state_vecs[vi * WARP_TILE_K_ITERS + ki] = state_tensor.vec_load(
-                        (hv_i, global_v_i, warp_k_vec_i), VALUES_PER_THREAD_K
+                    state_vecs[vi * WARP_TILE_K_ITERS + ki] = _load_vec(
+                        cp_state_vec,
+                        fx.slice(
+                            read_state_view,
+                            (
+                                hv_i,
+                                global_v_i,
+                                warp_k_vec_i // VALUES_PER_THREAD_K,
+                                None,
+                            ),
+                        ),
+                        VALUES_PER_THREAD_K,
+                        state_num,
                     )
-                    if const_expr("f32" in state_dtype):
-                        pass
-                    else:
+                    if const_expr("f32" not in state_dtype):
                         state_vecs[vi * WARP_TILE_K_ITERS + ki] = state_vecs[
                             vi * WARP_TILE_K_ITERS + ki
-                        ].extf(acc_vec_t)
+                        ].to(fx.Float32)
 
             for sq_i in range_constexpr(seq_length):
-
-                r_a = a_tensor[b_i, sq_i, hv_i].extf(T.f32)
-                r_b = b_tensor[b_i, sq_i, hv_i].extf(T.f32)
+                r_a = _load_vec(
+                    cp_data,
+                    fx.slice(a_view, (b_i, sq_i, hv_i, None)),
+                    1,
+                    data_num,
+                ).to(fx.Float32)
+                r_b = _load_vec(
+                    cp_data,
+                    fx.slice(b_view, (b_i, sq_i, hv_i, None)),
+                    1,
+                    data_num,
+                ).to(fx.Float32)
                 x = r_a + r_dt_bias
                 beta_x = softplus_beta_ * x
 
-                cond_sp = arith.cmpf(
-                    arith.CmpFPredicate.OLE, beta_x, fx.Float32(softplus_threshold_)
-                )
-                cond_sp_if = scf.IfOp(cond_sp, results_=[T.f32], has_else=True)
-                with ir.InsertionPoint(cond_sp_if.then_block):
-                    softplus_x_ = (f32_1 / softplus_beta_) * fast_log1p(
-                        fast_exp(beta_x)
-                    )
-                    scf.YieldOp([softplus_x_])
-                with ir.InsertionPoint(cond_sp_if.else_block):
-                    softplus_x_ = x
-                    scf.YieldOp([softplus_x_])
-                softplus_x = cond_sp_if.results[0]
+                # softplus with the large-x identity: for beta_x > threshold,
+                # softplus(x) == x. select computes both arms (the overflow arm
+                # is discarded) -> bit-identical to the old branch.
+                softplus_big = (f32_1 / softplus_beta_) * fast_log1p(fast_exp(beta_x))
+                softplus_x = (
+                    fx.Float32(beta_x) <= fx.Float32(softplus_threshold_)
+                ).select(softplus_big, x)
 
                 r_g_value = -fast_exp(r_A_log) * softplus_x
                 r_beta = f32_1 / (f32_1 + fast_exp(-r_b))
                 r_g = fast_exp(r_g_value)
 
-                r_g_vec = vector.BroadcastOp(acc_vec_t, r_g).vector
+                r_g_vec = fx.Vector.filled(
+                    VALUES_PER_THREAD_K, fx.Float32(r_g), fx.Float32
+                )
 
                 sq_vecs = [0] * WARP_TILE_K_ITERS
                 sk_vecs = [0] * WARP_TILE_K_ITERS
 
-                scale_vec = vector.BroadcastOp(acc_vec_t, scale).vector
+                scale_vec = fx.Vector.filled(
+                    VALUES_PER_THREAD_K, fx.Float32(scale), fx.Float32
+                )
 
                 for ki in range_constexpr(WARP_TILE_K_ITERS):
                     warp_k_vec_i = warp_k_vec_start + ki * WARP_TILE_K
-                    q_vec = q_tensor.vec_load(
-                        (b_i, sq_i, hk_i, warp_k_vec_i), VALUES_PER_THREAD_K
+                    q_vec = _load_vec(
+                        cp_data_vec,
+                        fx.slice(
+                            q_view,
+                            (
+                                b_i,
+                                sq_i,
+                                hk_i,
+                                warp_k_vec_i // VALUES_PER_THREAD_K,
+                                None,
+                            ),
+                        ),
+                        VALUES_PER_THREAD_K,
+                        data_num,
                     )
-                    k_vec = k_tensor.vec_load(
-                        (b_i, sq_i, hk_i, warp_k_vec_i), VALUES_PER_THREAD_K
+                    k_vec = _load_vec(
+                        cp_data_vec,
+                        fx.slice(
+                            k_view,
+                            (
+                                b_i,
+                                sq_i,
+                                hk_i,
+                                warp_k_vec_i // VALUES_PER_THREAD_K,
+                                None,
+                            ),
+                        ),
+                        VALUES_PER_THREAD_K,
+                        data_num,
                     )
-                    sq_vecs[ki] = q_vec.extf(acc_vec_t)
-                    sk_vecs[ki] = k_vec.extf(acc_vec_t)
+                    sq_vecs[ki] = q_vec.to(fx.Float32)
+                    sk_vecs[ki] = k_vec.to(fx.Float32)
 
                 if const_expr(use_qk_l2norm):
-                    sum_q_partial_vec = vector.from_elements(
-                        acc_vec_t, [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)]
+                    sum_q_partial_vec = fx.Vector.from_elements(
+                        [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)],
+                        fx.Float32,
                     )
-                    sum_k_partial_vec = vector.from_elements(
-                        acc_vec_t, [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)]
+                    sum_k_partial_vec = fx.Vector.from_elements(
+                        [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)],
+                        fx.Float32,
                     )
                     for ki in range_constexpr(WARP_TILE_K_ITERS):
                         sum_q_partial_vec = (
@@ -261,47 +383,39 @@ def create_vk_gdr_decode_kernel(
                         sum_k_partial_vec = (
                             sum_k_partial_vec + sk_vecs[ki] * sk_vecs[ki]
                         )
-                    sum_q_partial = mlir_vector.ReductionOp(
-                        T.f32, vector.CombiningKind.ADD, sum_q_partial_vec
-                    ).dest
-                    sum_k_partial = mlir_vector.ReductionOp(
-                        T.f32, vector.CombiningKind.ADD, sum_k_partial_vec
-                    ).dest
+                    sum_q_partial = fx.Vector(sum_q_partial_vec).reduce(
+                        fx.ReductionOp.ADD
+                    )
+                    sum_k_partial = fx.Vector(sum_k_partial_vec).reduce(
+                        fx.ReductionOp.ADD
+                    )
                     for offset in WARP_THREADS_K_SHFL_OFFSETS:
-                        sum_q_partial = (
-                            sum_q_partial
-                            + mlir_gpu.ShuffleOp(
-                                sum_q_partial,
-                                _to_raw(arith.constant(offset, type=T.i32)),
-                                width_i32,
-                                mode="xor",
-                            ).shuffleResult
+                        sum_q_partial = sum_q_partial + sum_q_partial.shuffle_xor(
+                            offset, WARP_SIZE
                         )
-                        sum_k_partial = (
-                            sum_k_partial
-                            + mlir_gpu.ShuffleOp(
-                                sum_k_partial,
-                                _to_raw(arith.constant(offset, type=T.i32)),
-                                width_i32,
-                                mode="xor",
-                            ).shuffleResult
+                        sum_k_partial = sum_k_partial + sum_k_partial.shuffle_xor(
+                            offset, WARP_SIZE
                         )
                     local_sum_q = mlir_gpu.ShuffleOp(
-                        sum_q_partial,
+                        _to_raw(sum_q_partial),
                         _to_raw(fx.Int32(w_tid // WARP_THREADS_K * WARP_THREADS_K)),
                         width_i32,
                         mode="idx",
                     ).shuffleResult
                     local_sum_k = mlir_gpu.ShuffleOp(
-                        sum_k_partial,
+                        _to_raw(sum_k_partial),
                         _to_raw(fx.Int32(w_tid // WARP_THREADS_K * WARP_THREADS_K)),
                         width_i32,
                         mode="idx",
                     ).shuffleResult
-                    inv_norm_q = mlir_math.rsqrt(local_sum_q + 1e-6)
-                    inv_norm_k = mlir_math.rsqrt(local_sum_k + 1e-6)
-                    inv_norm_q_vec = vector.BroadcastOp(acc_vec_t, inv_norm_q).vector
-                    inv_norm_k_vec = vector.BroadcastOp(acc_vec_t, inv_norm_k).vector
+                    inv_norm_q = fx.math.rsqrt(local_sum_q + 1e-6)
+                    inv_norm_k = fx.math.rsqrt(local_sum_k + 1e-6)
+                    inv_norm_q_vec = fx.Vector.filled(
+                        VALUES_PER_THREAD_K, fx.Float32(inv_norm_q), fx.Float32
+                    )
+                    inv_norm_k_vec = fx.Vector.filled(
+                        VALUES_PER_THREAD_K, fx.Float32(inv_norm_k), fx.Float32
+                    )
                     for ki in range_constexpr(WARP_TILE_K_ITERS):
                         sq_vecs[ki] = sq_vecs[ki] * inv_norm_q_vec * scale_vec
                         sk_vecs[ki] = sk_vecs[ki] * inv_norm_k_vec
@@ -309,92 +423,82 @@ def create_vk_gdr_decode_kernel(
                     for ki in range_constexpr(WARP_TILE_K_ITERS):
                         sq_vecs[ki] = sq_vecs[ki] * scale_vec
 
-                dot_kq_vec = vector.from_elements(
-                    acc_vec_t, [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)]
+                dot_kq_vec = fx.Vector.from_elements(
+                    [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)], fx.Float32
                 )
                 for ki in range_constexpr(WARP_TILE_K_ITERS):
-                    dot_kq_vec = vector.FMAOp(
-                        sk_vecs[ki], sq_vecs[ki], dot_kq_vec
-                    ).result
-                dot_kq = mlir_vector.ReductionOp(
-                    T.f32, vector.CombiningKind.ADD, dot_kq_vec
-                ).dest
+                    dot_kq_vec = fx.math.fma(sk_vecs[ki], sq_vecs[ki], dot_kq_vec)
+                dot_kq = dot_kq_vec.reduce(fx.ReductionOp.ADD)
                 for offset in WARP_THREADS_K_SHFL_OFFSETS:
-                    dot_kq = (
-                        dot_kq
-                        + mlir_gpu.ShuffleOp(
-                            dot_kq, _to_raw(fx.Int32(offset)), width_i32, mode="xor"
-                        ).shuffleResult
-                    )
+                    dot_kq = dot_kq + dot_kq.shuffle_xor(offset, WARP_SIZE)
 
                 for vi in range_constexpr(WARP_TILE_V_ITERS):
-
                     global_v_i = global_v_start + vi * WARP_GROUP_TILE_V
-                    r_v = v_tensor[b_i, sq_i, hv_i, global_v_i].extf(T.f32)
+                    r_v = _load_vec(
+                        cp_data,
+                        fx.slice(v_view, (b_i, sq_i, hv_i, global_v_i, None)),
+                        1,
+                        data_num,
+                    ).to(fx.Float32)
 
-                    sum_hk = vector.from_elements(
-                        acc_vec_t, [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)]
+                    sum_hk = fx.Vector.from_elements(
+                        [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)],
+                        fx.Float32,
                     )
-                    sum_hq_old = vector.from_elements(
-                        acc_vec_t, [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)]
+                    sum_hq_old = fx.Vector.from_elements(
+                        [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)],
+                        fx.Float32,
                     )
 
                     for ki in range_constexpr(WARP_TILE_K_ITERS):
                         state_vecs[vi * WARP_TILE_K_ITERS + ki] *= r_g_vec
                         h_cur = state_vecs[vi * WARP_TILE_K_ITERS + ki]
-                        sum_hk = vector.FMAOp(h_cur, sk_vecs[ki], sum_hk).result
-                        sum_hq_old = vector.FMAOp(h_cur, sq_vecs[ki], sum_hq_old).result
+                        sum_hk = fx.math.fma(h_cur, sk_vecs[ki], sum_hk)
+                        sum_hq_old = fx.math.fma(h_cur, sq_vecs[ki], sum_hq_old)
 
-                    sum_hk = mlir_vector.ReductionOp(
-                        T.f32, vector.CombiningKind.ADD, sum_hk
-                    ).dest
-                    sum_hq_old = mlir_vector.ReductionOp(
-                        T.f32, vector.CombiningKind.ADD, sum_hq_old
-                    ).dest
+                    sum_hk = sum_hk.reduce(fx.ReductionOp.ADD)
+                    sum_hq_old = sum_hq_old.reduce(fx.ReductionOp.ADD)
 
                     for offset in WARP_THREADS_K_SHFL_OFFSETS:
-                        sum_hk = (
-                            sum_hk
-                            + mlir_gpu.ShuffleOp(
-                                sum_hk, _to_raw(fx.Int32(offset)), width_i32, mode="xor"
-                            ).shuffleResult
-                        )
-                        sum_hq_old = (
-                            sum_hq_old
-                            + mlir_gpu.ShuffleOp(
-                                sum_hq_old,
-                                _to_raw(fx.Int32(offset)),
-                                width_i32,
-                                mode="xor",
-                            ).shuffleResult
+                        sum_hk = sum_hk + sum_hk.shuffle_xor(offset, WARP_SIZE)
+                        sum_hq_old = sum_hq_old + sum_hq_old.shuffle_xor(
+                            offset, WARP_SIZE
                         )
 
                     v_new = (r_v - sum_hk) * r_beta
                     v_new = mlir_gpu.ShuffleOp(
-                        v_new,
+                        _to_raw(v_new),
                         _to_raw(fx.Int32(w_tid // WARP_THREADS_K * WARP_THREADS_K)),
                         width_i32,
                         mode="idx",
                     ).shuffleResult
                     sum_hq = sum_hq_old + v_new * dot_kq
-                    v_new_bcast = vector.BroadcastOp(acc_vec_t, v_new)
+                    v_new_bcast = fx.Vector.filled(
+                        VALUES_PER_THREAD_K, fx.Float32(v_new), fx.Float32
+                    )
 
                     for ki in range_constexpr(WARP_TILE_K_ITERS):
-                        h_new = vector.FMAOp(
+                        h_new = fx.math.fma(
                             sk_vecs[ki],
                             v_new_bcast,
                             state_vecs[vi * WARP_TILE_K_ITERS + ki],
-                        ).result
+                        )
                         state_vecs[vi * WARP_TILE_K_ITERS + ki] = h_new
 
-                    sum_hq = sum_hq.truncf(dtype_)
-                    write_cond = arith.cmpi(
-                        arith.CmpIPredicate.eq, fx.Index(warp_k_vec_start), fx.Index(0)
-                    )
-                    write_cond_if = scf.IfOp(write_cond, results_=[], has_else=False)
-                    with ir.InsertionPoint(write_cond_if.then_block):
-                        out_tensor[b_i, sq_i, hv_i, global_v_i] = sum_hq
-                        scf.YieldOp([])
+                    sum_hq = sum_hq.to(data_num)
+
+                    # Only k-vec lane 0 writes the q output.
+                    def _write_q(_sum_hq=sum_hq, _gv=global_v_i, _sq=sq_i):
+                        _store_vec(
+                            cp_data,
+                            fx.slice(out_view, (b_i, _sq, hv_i, _gv, None)),
+                            _sum_hq,
+                            1,
+                            data_num,
+                        )
+
+                    if warp_k_vec_start == 0:
+                        _write_q()
 
             for vi in range_constexpr(WARP_TILE_V_ITERS):
                 global_v_i = global_v_start + vi * WARP_GROUP_TILE_V
@@ -403,12 +507,25 @@ def create_vk_gdr_decode_kernel(
                     if const_expr("f32" in state_dtype):
                         out_vec = state_vecs[vi * WARP_TILE_K_ITERS + ki]
                     else:
-                        out_vec = state_vecs[vi * WARP_TILE_K_ITERS + ki].truncf(vec_t)
-                    state_tensor.vec_store(
-                        (hv_i, global_v_i, warp_k_vec_i), out_vec, VALUES_PER_THREAD_K
+                        out_vec = state_vecs[vi * WARP_TILE_K_ITERS + ki].to(state_num)
+                    _store_vec(
+                        cp_state_vec,
+                        fx.slice(
+                            write_state_view,
+                            (
+                                hv_i,
+                                global_v_i,
+                                warp_k_vec_i // VALUES_PER_THREAD_K,
+                                None,
+                            ),
+                        ),
+                        out_vec,
+                        VALUES_PER_THREAD_K,
+                        state_num,
                     )
-            scf.YieldOp([])
-        return
+
+        if (read_pool_idx >= 0) & (write_pool_idx >= 0):
+            _do_decode()
 
     @flyc.jit
     def launch_gdr_decode_kernel(
@@ -419,11 +536,12 @@ def create_vk_gdr_decode_kernel(
         b: fx.Tensor,
         dt_bias: fx.Tensor,
         A_log: fx.Tensor,
-        indices: fx.Tensor,
+        read_indices: fx.Tensor,
+        write_indices: fx.Tensor,
         state: fx.Tensor,
         out: fx.Tensor,
         batch_size: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream,
     ):
         gx = batch_size * num_v_heads * NUM_BLOCKS_PER_V_DIM
         gdr_decode_kernel._func.__name__ = KERNEL_NAME
@@ -435,7 +553,8 @@ def create_vk_gdr_decode_kernel(
             b,
             dt_bias,
             A_log,
-            indices,
+            read_indices,
+            write_indices,
             state,
             out,
             batch_size,
