@@ -328,11 +328,22 @@ flag; every one declares shapes as parametrize literals. Four consecutive real F
 reached `INCONCLUSIVE` for that reason alone, and the skip text blamed the kernel for a limit that
 belonged to the injector.
 
+**You name the channel; the validator does not read the file to check you.** It records
+`grid_channel_basis: declared-by-caller`, because your naming it is a claim, not a measurement.
+
 **Reading the source is never enough to credit the channel.** Re-run the target with a
 deliberately invalid grid and require it to **fail**. A target that passes with garbage shapes is
 not consuming the grid — whatever the source looked like — so the stage is `skip`, never credited.
-This one probe is what makes every channel equally trustworthy, so do not skip it because the AST
-evidence looked convincing.
+This one probe is what makes every channel equally trustworthy, and it is the *only* thing that
+credits one, so it is where a channel you named wrongly gets caught.
+
+It catches the quiet case: a name the target ignores changes nothing, the invalid grid passes, and
+the stage skips. The loud case it cannot resolve — a flag the target does not define makes argparse
+exit non-zero, which looks exactly like a grid that found a shape the kernel crashes on. Nothing in
+the evidence tells those apart, so the run does not guess: the grid stays `fail`, the note names
+both possibilities, and **no blocker is charged**, because a receipt that observed no call to the
+routed work never saw the author's code fail at all. Check the flag yourself before you name it;
+the run will not do it for you.
 
 With no channel at all the stage is `skip` and the verdict `INCONCLUSIVE`. That is a positive
 control: without it, the same default test run gets reported twice under two stage names. When the
