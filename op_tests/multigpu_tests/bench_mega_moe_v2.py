@@ -506,6 +506,7 @@ def main():
         dist.all_reduce(rel_l2, op=dist.ReduceOp.MAX)
 
     tp_rel_l2 = None
+    tp_ms = (float("nan"), float("nan"))
     if args.tp:
         if rank_tokens:
             raise ValueError(
@@ -525,25 +526,33 @@ def main():
             (world_tokens, args.topk), dtype=torch.float32, device=device
         )
         ids_g = torch.empty((world_tokens, args.topk), dtype=torch.int32, device=device)
-        dist.all_gather_into_tensor(x_g, x.contiguous())
-        dist.all_gather_into_tensor(route_weights_g, route_weights.contiguous())
-        dist.all_gather_into_tensor(ids_g, ids.contiguous())
-        tp_out = fused_moe(
-            x_g,
-            w1_tp,
-            w2_tp,
-            route_weights_g,
-            ids_g,
-            quant_type=aiter.QuantType.per_1x32,
-            w1_scale=w1_scale_tp,
-            w2_scale=w2_scale_tp,
-            a1_scale=None,
-            dtype=torch.bfloat16,
-            swiglu_limit=SWIGLU_LIMIT,
-            gate_mode=GateMode.INTERLEAVE.value,
-        )
-        dist.all_reduce(tp_out, op=dist.ReduceOp.SUM)
-        tp_local = tp_out[rank * tokens : (rank + 1) * tokens]
+
+        def tp_body():
+            dist.all_gather_into_tensor(x_g, x.contiguous())
+            dist.all_gather_into_tensor(route_weights_g, route_weights.contiguous())
+            dist.all_gather_into_tensor(ids_g, ids.contiguous())
+            tp_out = fused_moe(
+                x_g,
+                w1_tp,
+                w2_tp,
+                route_weights_g,
+                ids_g,
+                quant_type=aiter.QuantType.per_1x32,
+                w1_scale=w1_scale_tp,
+                w2_scale=w2_scale_tp,
+                a1_scale=None,
+                dtype=torch.bfloat16,
+                swiglu_limit=SWIGLU_LIMIT,
+                gate_mode=GateMode.INTERLEAVE.value,
+            )
+            dist.all_reduce(tp_out, op=dist.ReduceOp.SUM)
+            holders["tp"] = tp_out
+
+        tp_graph = capture(tp_body)
+        print(f"[STEP] rank={rank} tp-capture-done", flush=True)
+        tp_ms = time_graph(tp_graph, args.iters, device)
+
+        tp_local = holders["tp"][rank * tokens : (rank + 1) * tokens]
         barrier()
         mori_graph.replay()
         torch.cuda.synchronize()
@@ -597,7 +606,8 @@ def main():
             f"mori_e2e={mori_ms[0]:.4f}/{mori_ms[1]:.4f}ms "
             f"mega_e2e={mega_ms[0]:.4f}/{mega_ms[1]:.4f}ms speedup={speedup:.2f}% "
             f"stage1={stage1_ms[0]:.4f}/{stage1_ms[1]:.4f}ms "
-            f"stage2_combine={stage2_ms[0]:.4f}/{stage2_ms[1]:.4f}ms rank-mean/max",
+            f"stage2_combine={stage2_ms[0]:.4f}/{stage2_ms[1]:.4f}ms "
+            f"tp_e2e={tp_ms[0]:.4f}/{tp_ms[1]:.4f}ms rank-mean/max",
             flush=True,
         )
         if guard_floor is not None:
