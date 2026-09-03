@@ -224,18 +224,35 @@ def launch_gemm_a8w4_tdm(
     C_STORE_B = ((tile_m * (tile_n + store_pad) * 2 + 127) // 128) * 128
     AS_FULL_OFF = num_buffers * PITCH
     AS_FULL_B = ((AS_SUPERS * AS_FULL_INNER * 4 + 127) // 128) * 128
-    ARENA_B = max(
-        AS_FULL_OFF + (AS_FULL_B if tdm_as_in_prologue else 0), C_STORE_B
+    INPUT_ARENA_B = AS_FULL_OFF + (AS_FULL_B if tdm_as_in_prologue else 0)
+    # Persistent workers overlap the preceding task's asynchronous output store
+    # with the next task's input pipeline. Keep the store source disjoint from
+    # every input-ring slot so the next task may refill/reuse the ring while the
+    # store is still reading LDS.
+    STORE_LDS_OFF = (
+        ((INPUT_ARENA_B + 127) // 128) * 128
+        if max_tasks_per_worker > 0
+        else 0
+    )
+    ARENA_B = (
+        STORE_LDS_OFF + C_STORE_B
+        if max_tasks_per_worker > 0
+        else max(INPUT_ARENA_B, C_STORE_B)
     )
     # The first drain tile permanently releases its ring slot. Reuse that slot
     # for the next N tile's K0 while the remaining drain tiles compute.
     NEXT_TASK_PREFETCH_SLOT = (K // tile_k - 1 - num_buffers) % num_buffers
+    # When the drain starts at the final ring slot, its following releases match
+    # the next task's K1/K2 slots. Carry at most three stages across the task
+    # boundary so WPT=4 wait immediates remain below the 16-operation window.
+    NEXT_TASK_PREFETCH_STAGES = (
+        min(3, num_buffers)
+        if NEXT_TASK_PREFETCH_SLOT == num_buffers - 1
+        else 1
+    )
     if max_tasks_per_worker > 0:
         assert num_buffers >= 2, (
             "next-task prefetch requires at least two LDS slots"
-        )
-        assert C_STORE_B <= NEXT_TASK_PREFETCH_SLOT * PITCH, (
-            "next-task prefetch slot overlaps the C epilogue arena"
         )
 
     # Quant epilogue compile-time constants.
@@ -395,7 +412,7 @@ def launch_gemm_a8w4_tdm(
             def ptr_to_idx(p):
                 return fx.index_cast(T.index, fx.ptrtoint(p))
 
-            stC_idx = ptr_to_idx(base_ptr)
+            stC_idx = ptr_to_idx(base_ptr + STORE_LDS_OFF)
             if const_expr(enable_ep_scatter):
                 # Persistent (survives the mainloop) LDS slot for the prefetched
                 # rowmap: tile_m rows x 8 bytes (dst_i32 | weight_bits_i32). Bumped
@@ -1112,14 +1129,37 @@ def launch_gemm_a8w4_tdm(
                     )
                 if const_expr(max_tasks_per_worker > 0):
                     # K0 lives in a ring slot that is dead during the previous task's
-                    # final K tile. The first task fills it locally; subsequent tasks
-                    # consume the previous task's tail prefetch.
+                    # drain. The first task fills K0 and every non-aliasing ring slot
+                    # locally; subsequent tasks consume K0/K1/K2 prefetched while
+                    # the previous task drained.
                     if is_first_task:
                         issue(NEXT_TASK_PREFETCH_SLOT, 0)
-                    # First task waits for its local K0 issue; later tasks wait for
-                    # the preceding task's output store and next-task K0 prefetch.
-                    tdm_ops.tensor_wait(0)
+                        # Fill every non-aliasing regular-ring slot before fencing
+                        # K0. K0 (and the optional resident As prologue preceding
+                        # it) is older, so leave those newer stages outstanding.
+                        for i in range_constexpr(num_buffers):
+                            if const_expr(i != NEXT_TASK_PREFETCH_SLOT):
+                                issue(i, i + 1)
+                        tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
+                    else:
+                        # K0/K1/K2 were issued before the previous task's output
+                        # store. Reap K0 while leaving the newer prefetched stages
+                        # and that one store outstanding.
+                        tdm_ops.tensor_wait(
+                            TDM_PER * (NEXT_TASK_PREFETCH_STAGES - 1) + 1
+                        )
                     workgroup_barrier()
+                    if is_first_task:
+                        pass
+                    else:
+                        # Fill non-aliasing stages not carried across the task
+                        # boundary and overlap them with K0 compute.
+                        for i in range_constexpr(num_buffers):
+                            if const_expr(
+                                i >= NEXT_TASK_PREFETCH_STAGES - 1
+                                and i != NEXT_TASK_PREFETCH_SLOT
+                            ):
+                                issue(i, i + 1)
                     next_task_prefetch_buf = ptr_to_idx(
                         buf_ptr(NEXT_TASK_PREFETCH_SLOT)
                     )
@@ -1127,15 +1167,28 @@ def launch_gemm_a8w4_tdm(
                     workgroup_barrier()
 
                     # The regular ring carries K1..Kend with the same pipeline shape
-                    # for every task in this worker.
-                    for i in range_constexpr(num_buffers):
-                        issue(i, i + 1)
+                    # for every task in this worker. K0 aliases this last ring slot,
+                    # so it is the only stage that must wait until K0 is consumed.
+                    issue(
+                        NEXT_TASK_PREFETCH_SLOT,
+                        NEXT_TASK_PREFETCH_SLOT + 1,
+                    )
                     remaining_tiles = K_TILES - 1
                     n_steady = remaining_tiles - num_buffers
 
                     # Prime K1.K128-0. Every later current-task tile receives this
                     # register state from its predecessor's final K128.
-                    pipeline_fence(outstanding=TDM_PER * (num_buffers - 1))
+                    if is_first_task:
+                        pipeline_fence(outstanding=TDM_PER * (num_buffers - 1))
+                    else:
+                        # When K1/K2 crossed the task boundary, the previous store
+                        # is newer than them and may remain live while K1 becomes
+                        # ready. The first steady fence retires it and restores the
+                        # regular stage-only tensor-count shape.
+                        pipeline_fence(
+                            outstanding=TDM_PER * (num_buffers - 1)
+                            + (1 if NEXT_TASK_PREFETCH_STAGES > 1 else 0)
+                        )
                     load_state(
                         rmem_slots[0],
                         ptr_to_idx(buf_ptr(0)),
@@ -1177,13 +1230,12 @@ def launch_gemm_a8w4_tdm(
                             drain_outstanding = TDM_PER * max(
                                 0, num_buffers - 2 - j
                             )
-                            if const_expr(j > 0):
-                                if has_next_task:
-                                    pipeline_fence(
-                                        outstanding=drain_outstanding + TDM_PER
-                                    )
-                                else:
-                                    pipeline_fence(outstanding=drain_outstanding)
+                            if has_next_task:
+                                pipeline_fence(
+                                    outstanding=drain_outstanding
+                                    + TDM_PER
+                                    * min(j, NEXT_TASK_PREFETCH_STAGES)
+                                )
                             else:
                                 pipeline_fence(outstanding=drain_outstanding)
 
@@ -1199,13 +1251,12 @@ def launch_gemm_a8w4_tdm(
                                 else None
                             ),
                         )
-                        if const_expr(j == 0):
-                            # This slot is now dead for the current task. Refill it
-                            # with next-task K0 and overlap the request with all
-                            # remaining drain tiles.
+                        if const_expr(j < NEXT_TASK_PREFETCH_STAGES):
+                            # This slot is now dead for the current task. Refill the
+                            # first three released slots with next-task K0/K1/K2.
                             if has_next_task:
                                 workgroup_barrier()
-                                issue(NEXT_TASK_PREFETCH_SLOT, 0, n_delta=1)
+                                issue(kt_rel % num_buffers, j, n_delta=1)
                                 rocdl.sched_barrier(0)
                 # Post-compute wins for decode and for shallow pipelines: at
                 # num_buffers<=2 mid-compute prefetches one tile and under-overlaps.
@@ -1365,10 +1416,23 @@ def launch_gemm_a8w4_tdm(
                 # The epilogue restages C in this arena. Draining our own tensorcnt
                 # suffices: peer multicast loads are pairwise matched with ours.
                 # Persistent drain already completed every current-task load. Its
-                # only possible outstanding operation is next-task K0 in the
-                # disjoint prefetch slot, which the epilogue's final wait will reap.
+                # only possible current-input survivors are next-task K0/K1/K2 in
+                # released ring slots, which dependency-counted waits preserve.
                 if const_expr(max_tasks_per_worker == 0):
                     pipeline_fence(outstanding=0)
+                else:
+                    # Retire the previous output store before overwriting Store
+                    # LDS. If another task follows, its prefetched K0/K1/K2 groups
+                    # are newer and may remain outstanding.
+                    if is_first_task:
+                        pass
+                    else:
+                        if has_next_task:
+                            tdm_ops.tensor_wait(
+                                TDM_PER * NEXT_TASK_PREFETCH_STAGES
+                            )
+                        else:
+                            tdm_ops.tensor_wait(0)
                 is_fp4_quant = bool(stage1_quant_out and a_is_fp4)
                 STORE_N = tile_n // (4 if is_fp4_quant else 2) if stage1_act else tile_n
                 # Unpadded, a row is STORE_N/2 dwords (a multiple of 32), so the 16
@@ -1653,7 +1717,7 @@ def launch_gemm_a8w4_tdm(
                         _comb_iter, 0, (_oob, STORE_N), (_stride_elems, 1)
                     )
                     _lds_c = lds_view(
-                        fx.recast_iter(oc, base_ptr),
+                        fx.recast_iter(oc, base_ptr + STORE_LDS_OFF),
                         (tile_m, STORE_PITCH),
                         (STORE_PITCH, 1),
                     )
@@ -1694,10 +1758,10 @@ def launch_gemm_a8w4_tdm(
                             )
                             tensor_store_gather(desc)
                     if const_expr(max_tasks_per_worker > 0):
-                        if has_next_task:
-                            pass
-                        else:
-                            tdm_ops.tensor_wait(0)
+                        # A following task protects Store LDS at its reuse point;
+                        # the final task relies on kernel completion to drain its
+                        # last asynchronous global store.
+                        pass
                     else:
                         tdm_ops.tensor_wait(0)
                 else:
@@ -1719,7 +1783,7 @@ def launch_gemm_a8w4_tdm(
                         gtC = global_view(c_iter, c_off_rt, (tile_m, STORE_N), (STORE_N, 1))
                         atomC = make_tdm_store(gtC, mn_oob, out_stride)
                         src = lds_view(
-                            fx.recast_iter(oc_store, base_ptr),
+                            fx.recast_iter(oc_store, base_ptr + STORE_LDS_OFF),
                             (tile_m, STORE_N),
                             (STORE_N, 1),
                         )
@@ -1736,7 +1800,7 @@ def launch_gemm_a8w4_tdm(
                             num_warps=num_waves,
                         )
                         src = lds_view(
-                            fx.recast_iter(oc_store, base_ptr),
+                            fx.recast_iter(oc_store, base_ptr + STORE_LDS_OFF),
                             (tile_m, STORE_PITCH),
                             (STORE_PITCH, 1),
                         )
@@ -1744,10 +1808,10 @@ def launch_gemm_a8w4_tdm(
                     if const_expr(stage1_quant_out and stage1_act):
                         rocdl.s_wait_storecnt(0)
                     if const_expr(max_tasks_per_worker > 0):
-                        if has_next_task:
-                            pass
-                        else:
-                            tdm_ops.tensor_wait(0)
+                        # A following task protects Store LDS at its reuse point;
+                        # the final task relies on kernel completion to drain its
+                        # last asynchronous global store.
+                        pass
                     else:
                         tdm_ops.tensor_wait(0)
 
@@ -1766,7 +1830,6 @@ def launch_gemm_a8w4_tdm(
                     is_first_task=n_tile == n_begin,
                     has_next_task=n_tile + 1 < n_end,
                 )
-                workgroup_barrier()
                 n_tile += 1
         else:
             m_tile, n_tile = get_static_task(
