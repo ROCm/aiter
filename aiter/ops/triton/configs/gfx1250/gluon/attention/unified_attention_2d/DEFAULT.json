@@ -1,0 +1,120 @@
+{
+  "decode": {
+    "bf16": {
+      "any": {
+        "TILE_SIZE": 64,
+        "LOOP_VARIANT": 0,
+        "NUM_BUFFERS": 2,
+        "num_warps": 1,
+        "waves_per_eu": 2
+      }
+    },
+    "fp8": {
+      "any": {
+        "TILE_SIZE": 128,
+        "LOOP_VARIANT": 0,
+        "NUM_BUFFERS": 2,
+        "num_warps": 1,
+        "waves_per_eu": 2
+      }
+    }
+  },
+  "prefill_sliding_window": {
+    "bf16": {
+      "any": {
+        "TILE_SIZE": 64,
+        "BLOCK_M": 64,
+        "LOOP_VARIANT": 0,
+        "NUM_BUFFERS": 2,
+        "num_warps": 4,
+        "waves_per_eu": 4
+      }
+    },
+    "fp8": {
+      "any": {
+        "TILE_SIZE": 128,
+        "BLOCK_M": 64,
+        "LOOP_VARIANT": 0,
+        "NUM_BUFFERS": 2,
+        "num_warps": 4,
+        "waves_per_eu": 4
+      }
+    }
+  },
+  "prefill_short_kv": {
+    "bf16": {
+      "any": {
+        "TILE_SIZE": 64,
+        "BLOCK_M": 64,
+        "LOOP_VARIANT": 0,
+        "NUM_BUFFERS": 2,
+        "num_warps": 1,
+        "waves_per_eu": 2
+      }
+    },
+    "fp8": {
+      "any": {
+        "TILE_SIZE": 128,
+        "BLOCK_M": 64,
+        "LOOP_VARIANT": 0,
+        "NUM_BUFFERS": 2,
+        "num_warps": 2,
+        "waves_per_eu": 2
+      }
+    }
+  },
+  "prefill": {
+    "bf16": {
+      "HEAD_SIZE_LEQ_64": {
+        "TILE_SIZE": 64,
+        "BLOCK_M": 128,
+        "LOOP_VARIANT": 2,
+        "NUM_BUFFERS": 2,
+        "num_warps": 4,
+        "waves_per_eu": 2
+      },
+      "HEAD_SIZE_LEQ_128": {
+        "TILE_SIZE": 64,
+        "BLOCK_M": 128,
+        "LOOP_VARIANT": 0,
+        "NUM_BUFFERS": 2,
+        "num_warps": 4,
+        "waves_per_eu": 2
+      },
+      "any": {
+        "TILE_SIZE": 64,
+        "BLOCK_M": 128,
+        "LOOP_VARIANT": 2,
+        "NUM_BUFFERS": 2,
+        "num_warps": 4,
+        "waves_per_eu": 2
+      }
+    },
+    "fp8": {
+      "HEAD_SIZE_LEQ_64": {
+        "TILE_SIZE": 128,
+        "BLOCK_M": 128,
+        "LOOP_VARIANT": 1,
+        "NUM_BUFFERS": 2,
+        "num_warps": 4,
+        "waves_per_eu": 2
+      },
+      "HEAD_SIZE_LEQ_128": {
+        "TILE_SIZE": 128,
+        "BLOCK_M": 128,
+        "LOOP_VARIANT": 0,
+        "NUM_BUFFERS": 2,
+        "num_warps": 4,
+        "waves_per_eu": 2
+      },
+      "any": {
+        "TILE_SIZE": 128,
+        "BLOCK_M": 128,
+        "LOOP_VARIANT": 2,
+        "NUM_BUFFERS": 2,
+        "num_warps": 4,
+        "waves_per_eu": 2
+      }
+    }
+  }
+}

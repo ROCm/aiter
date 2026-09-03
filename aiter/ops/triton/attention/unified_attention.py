@@ -10,6 +10,7 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     kernel_unified_attention_3d,
     reduce_segments,
 )
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 from aiter.ops.triton.utils.device_info import get_num_sms
 
 try:
@@ -777,6 +778,30 @@ def unified_attention(
         return out
 
 
+def _get_gfx1250_2d_config(all_decode, sliding_window, max_seqlen_k, head_size, fp8):
+    """Tuning for the gfx1250 gluon 2d kernel, keyed by dispatch path, dtype, head size."""
+    cfg_dir = resolve_config_dir("attention", "UNIFIED_ATTENTION_2D", backend="gluon")
+    config = load_config_json(f"{cfg_dir}/DEFAULT.json")
+
+    if all_decode:
+        path = "decode"
+    elif sliding_window > 0:
+        path = "prefill_sliding_window"
+    elif max_seqlen_k < 2048:
+        path = "prefill_short_kv"
+    else:
+        path = "prefill"
+
+    buckets = config[path]["fp8" if fp8 else "bf16"]
+    limits = sorted(
+        int(k.rsplit("_", 1)[1]) for k in buckets if k.startswith("HEAD_SIZE_LEQ_")
+    )
+    for limit in limits:
+        if head_size <= limit:
+            return buckets[f"HEAD_SIZE_LEQ_{limit}"].copy()
+    return buckets["any"].copy()
+
+
 def _gfx1250_unified_attention_2d(
     q,
     k,
@@ -837,40 +862,21 @@ def _gfx1250_unified_attention_2d(
     SLIDING_WINDOW = 1 + window_size[0]
     ALL_DECODE = max_seqlen_q == 1
     NUM_QUERIES_PER_KV = NUM_Q_HEADS // NUM_KV_HEADS
-    num_buffers = None
-    if ALL_DECODE:
-        sel_loop_variant = 0
-        BLOCK_M = (
-            16
-            if NUM_QUERIES_PER_KV <= 16
-            else triton.next_power_of_2(NUM_QUERIES_PER_KV)
-        )
-        num_warps = 1
-        waves_per_eu = 2
-        TILE_SIZE = 128 if (Q_FP8 and KV_FP8) else 64
-    elif SLIDING_WINDOW > 0:
-        # Prefill, sliding window
-        sel_loop_variant = 0
-        BLOCK_M = 64
-        num_warps = 4
-        waves_per_eu = 4
-        TILE_SIZE = 128 if (Q_FP8 and KV_FP8) else 64
-    else:
-        # Prefill, full attention
-        sel_loop_variant = 2
-        BLOCK_M = 128
-        num_warps = 4
-        waves_per_eu = 2
-        TILE_SIZE = 128 if (Q_FP8 and KV_FP8) else 64
-        num_buffers = 2
+    config = _get_gfx1250_2d_config(
+        ALL_DECODE, SLIDING_WINDOW, max_seqlen_k, HEAD_SIZE, Q_FP8 and KV_FP8
+    )
+    TILE_SIZE = config["TILE_SIZE"]
+    num_warps = config["num_warps"]
+    waves_per_eu = config["waves_per_eu"]
+    num_buffers = config["NUM_BUFFERS"]
+    # decode packs one tile per kv head, so BLOCK_M follows the GQA ratio
+    BLOCK_M = (
+        (16 if NUM_QUERIES_PER_KV <= 16 else triton.next_power_of_2(NUM_QUERIES_PER_KV))
+        if ALL_DECODE
+        else config["BLOCK_M"]
+    )
 
-        if max_seqlen_k < 2048:
-            BLOCK_M = 64
-            num_warps = 2 if (Q_FP8 and KV_FP8) else 1
-            sel_loop_variant = 0
-            num_buffers = 2
-
-    loop_variant = sel_loop_variant if loop_variant is None else loop_variant
+    loop_variant = config["LOOP_VARIANT"] if loop_variant is None else loop_variant
     # Non-shuffled KV can't use TDM gather (KV layout), so a tile is one page
     if not shuffled_kv_cache or TILE_SIZE < BLOCK_SIZE:
         TILE_SIZE = BLOCK_SIZE
@@ -899,9 +905,9 @@ def _gfx1250_unified_attention_2d(
     else:
         total_query_blocks = NUM_SEQS
     NUM_WARPS = num_warps
-    if num_buffers is None:
-        num_buffers = 2 if loop_variant == 0 else 3
-        num_buffers = 2 if ALL_DECODE else num_buffers
+    # loop variant 0 is double-buffered only (kernel static_assert)
+    if loop_variant == 0:
+        num_buffers = 2
 
     kv_size = k.nelement() * k.element_size()
     MAX_INT32 = 2**31 - 1
