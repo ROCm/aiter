@@ -402,11 +402,11 @@
             "none",
             "declared",
             "proven",
-            "hook-not-found",
+            "malformed-spec",
             "hook-not-consumed",
             "unusable"
           ],
-          "description": "How far the requested extra axes got. Only `proven` means every axis flag was observed refusing a deliberately invalid value and its values rode the grid run."
+          "description": "How far the requested extra axes got. Only `proven` means every axis flag was observed refusing a deliberately invalid value and its values rode the grid run. The validator does not read the target to see whether a flag exists; a flag that does not exist shows up as the grid run failing, not as a state here."
         },
         "axis_state_reason": {
           "type": "string"
@@ -432,31 +432,12 @@
               "hook_proof": {
                 "type": "string",
                 "enum": [
-                  "flag-declared-in-add_argument",
-                  "flag-not-declared",
+                  "not-evaluated",
                   "malformed-axis-spec",
-                  "not-evaluated"
-                ]
-              },
-              "target_defaults": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                }
-              },
-              "novel_values": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                }
-              },
-              "independence": {
-                "type": "string",
-                "enum": [
-                  "adds-coverage",
-                  "duplicates-target-defaults",
-                  "unknown"
-                ]
+                  "refused-invalid-value",
+                  "accepted-invalid-value"
+                ],
+                "description": "The runtime refusal probe's verdict for this axis. 'not-evaluated' means the probe never ran. Nothing else is evidence that the axis reached the kernel."
               }
             },
             "required": [

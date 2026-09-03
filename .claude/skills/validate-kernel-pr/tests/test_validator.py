@@ -1566,9 +1566,10 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertEqual("proven", selection["axis_state"])
         axis = selection["axes"][0]
         self.assertEqual("num_heads", axis["name"])
-        self.assertEqual("flag-declared-in-add_argument", axis["hook_proof"])
+        # The probe's own verdict, not a reading of the source: this flag was fed an
+        # invalid value and refused it.
+        self.assertEqual("refused-invalid-value", axis["hook_proof"])
         self.assertEqual(["16", "32"], axis["values"])
-        self.assertEqual("adds-coverage", axis["independence"])
         # The configuration the grid alone could never request now fails, loudly, and is
         # attributed to the PR that adds the target.
         self.assertEqual("fail", report["stages"]["correctness_s1_grid"]["status"])
@@ -1607,6 +1608,10 @@ class ValidateKernelPrTests(unittest.TestCase):
         selection = report["test_selection"]
         self.assertEqual("hook-not-consumed", selection["axis_state"])
         self.assertIn("--num-heads", selection["axis_state_reason"])
+        # And the axis itself carries the probe's verdict. The source declares --num-heads
+        # perfectly well, so a structural reading called this axis proven; only the refusal
+        # probe can tell that the value never reached the kernel.
+        self.assertEqual("accepted-invalid-value", selection["axes"][0]["hook_proof"])
         self.assertTrue(
             any(
                 "requested test axes were dropped" in item["detail"]
@@ -1614,6 +1619,26 @@ class ValidateKernelPrTests(unittest.TestCase):
             ),
             report["findings"],
         )
+
+    def test_an_axis_spelled_wrong_is_refused_rather_than_guessed_at(self):
+        # --axis takes name=--flag:v1;v2. A spec missing any of the three used to be folded
+        # in with the flags the source did not declare and reported as a fact about the
+        # TARGET; it is the caller's own argument that is wrong, and the values must not be
+        # half-guessed onto the run's argv either way.
+        patch = self._axis_patch("axis-malformed.patch")
+        _, report = self._validate_axis_target(
+            patch,
+            grid_value="9,1023,f32",
+            axes=("num_heads=--num-heads",),
+        )
+
+        selection = report["test_selection"]
+        self.assertEqual("malformed-spec", selection["axis_state"])
+        self.assertIn("num_heads", selection["axis_state_reason"])
+        self.assertEqual("malformed-axis-spec", selection["axes"][0]["hook_proof"])
+        # The request survives in the report; what does not happen is a run pretending to
+        # cover an axis it never delivered.
+        self.assertEqual([], selection["axes"][0]["values"])
 
     def test_a_script_that_returns_without_working_earns_no_architecture_credit(self):
         # aiter#4538's target returns with exit 0 and a log line when the arch is
@@ -2105,6 +2130,7 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertEqual(1, len(selection["axes"]))
         self.assertEqual("num_heads", selection["axes"][0]["name"])
         self.assertEqual(["16", "32"], selection["axes"][0]["values"])
+        # The refusal probe never ran for this target, and nothing else may stand in for it.
         self.assertEqual("not-evaluated", selection["axes"][0]["hook_proof"])
 
         # And the grid-independence reason must describe THIS run. The old default claimed

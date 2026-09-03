@@ -929,29 +929,20 @@ jset_string "test_selection.grid_independence_basis" "$GRID_INDEPENDENCE_BASIS"
 
 # ---- Extra axes.
 #
-# Parsed and structurally proven here, next to the shape channel, because they obey the same
-# rule: a channel is credited only when the target's own source declares it, and it is
-# believed only after the target has been observed REFUSING a deliberately invalid value.
-# The difference from --grid is arity, not trust: --grid is one tuple on one flag, an axis is
-# one named knob on its own flag, and a target's failing configuration frequently lives on a
-# knob the shape flag cannot reach.
+# A grid is one ordered tuple on one flag. A target whose remaining knobs are separate flags
+# -- head counts, dtypes, window modes -- cannot be gridded over them at all, so on aiter#4538
+# the kernel's assert at num_heads=16 was unreachable however the shape grid was spelled. An
+# axis is a name, a flag, and its values, and the caller supplies all three.
+#
+# Whether the target declares that flag is a reading of its source and is left to the caller.
+# What is NOT left to the caller is the proof: further down, every axis flag must be observed
+# REFUSING a deliberately invalid value before its values are allowed onto the grid run's
+# argv. A flag the target declares but ignores, or silently clamps, would otherwise let the
+# report claim coverage of head counts that never reached the kernel.
 AXIS_STATE="none"
 AXIS_STATE_REASON="no extra axes were requested"
 if [ "${#AXES[@]}" -gt 0 ]; then
-  if [ "$TARGET_RUNNER" != "script" ]; then
-    AXIS_STATE="unusable"
-    AXIS_STATE_REASON="extra axes reach script targets only (this target runs under $TARGET_RUNNER)"
-  elif [ ! -f "$REPO_WT/$TEST_FILE" ]; then
-    AXIS_STATE="unusable"
-    AXIS_STATE_REASON="the target file is not present, so no axis flag could be proven"
-  else
-    AXIS_STATE="declared"
-    AXIS_STATE_REASON="${#AXES[@]} axis/axes requested"
-  fi
-fi
-AXIS_UNPROVEN=""
-if [ "${#AXES[@]}" -gt 0 ]; then
-  # Record what was ASKED FOR before deciding whether it could be honoured. An empty `axes`
+  # Record what was ASKED FOR before deciding whether it can be honoured. An empty `axes`
   # beside a non-`none` axis_state loses the request itself: a reader could not see that a
   # head-count axis had been requested and dropped -- which is precisely the silently
   # narrowed test space this stage exists to make visible.
@@ -963,90 +954,37 @@ axes = []
 for spec in sys.argv[1:]:
     name, _, rest = spec.partition("=")
     flag, _, values = rest.partition(":")
-    axes.append({
-        "name": name.strip(),
-        "flag": flag.strip(),
-        "values": [cell.strip() for cell in values.split(";") if cell.strip()],
-        "hook_proof": "not-evaluated",
-    })
-print(json.dumps(axes))
-PY
-)
-fi
-if [ "$AXIS_STATE" = "declared" ]; then
-  AXIS_REPORT=$(python3 - "$REPO_WT/$TEST_FILE" "${AXES[@]}" <<'PY'
-import ast
-import json
-import sys
-
-path = sys.argv[1]
-tree = ast.parse(open(path, encoding="utf-8").read())
-
-declared = {}
-for node in ast.walk(tree):
-    if not isinstance(node, ast.Call):
-        continue
-    if getattr(node.func, "attr", "") != "add_argument":
-        continue
-    flags = [a.value for a in node.args if isinstance(a, ast.Constant)]
-    default = None
-    for keyword in node.keywords:
-        if keyword.arg == "default":
-            try:
-                default = ast.literal_eval(keyword.value)
-            except (ValueError, SyntaxError):
-                default = None
-    for flag in flags:
-        declared[flag] = default
-
-axes = []
-for spec in sys.argv[2:]:
-    name, _, rest = spec.partition("=")
-    flag, _, values = rest.partition(":")
     cells = [cell.strip() for cell in values.split(";") if cell.strip()]
     entry = {
         "name": name.strip(),
         "flag": flag.strip(),
         "values": cells,
-        # `hook_proof` is the STRUCTURAL half only. Nothing downstream may treat it as
-        # consumption: the runtime refusal probe decides that, exactly as for --shape-arg.
-        "hook_proof": "flag-declared-in-add_argument"
-        if flag.strip() in declared
-        else "flag-not-declared",
+        # Filled in by the runtime refusal probe, which is the only thing that decides an
+        # axis is consumed. Until it runs, nothing here may be read as proof.
+        "hook_proof": "not-evaluated",
     }
     if not entry["name"] or not entry["flag"] or not cells:
         entry["hook_proof"] = "malformed-axis-spec"
-    if entry["hook_proof"] == "flag-declared-in-add_argument":
-        default = declared.get(entry["flag"])
-        if default is not None:
-            rendered = default if isinstance(default, (list, tuple)) else [default]
-            rendered = [str(item) for item in rendered]
-            entry["target_defaults"] = rendered
-            novel = [cell for cell in cells if cell not in rendered]
-            entry["novel_values"] = novel
-            entry["independence"] = (
-                "adds-coverage" if novel else "duplicates-target-defaults"
-            )
-        else:
-            entry["independence"] = "unknown"
     axes.append(entry)
-
 print(json.dumps(axes))
 PY
 )
-  AXIS_UNPROVEN=$(python3 -c '
+  AXIS_MALFORMED=$(python3 -c '
 import json
 import sys
 
-axes = json.loads(sys.argv[1])
-bad = [a["name"] or "(unnamed)" for a in axes
-       if a["hook_proof"] != "flag-declared-in-add_argument"]
-print(",".join(bad))
+print(",".join(a["name"] or "(unnamed)" for a in json.loads(sys.argv[1])
+                if a["hook_proof"] == "malformed-axis-spec"))
 ' "$AXIS_REPORT")
-  if [ -n "$AXIS_UNPROVEN" ]; then
-    AXIS_STATE="hook-not-found"
-    AXIS_STATE_REASON="the target declares no argparse flag for: $AXIS_UNPROVEN"
+  if [ -n "$AXIS_MALFORMED" ]; then
+    AXIS_STATE="malformed-spec"
+    AXIS_STATE_REASON="--axis wants name=--flag:v1;v2, and these do not parse: $AXIS_MALFORMED"
+  elif [ "$TARGET_RUNNER" != "script" ]; then
+    AXIS_STATE="unusable"
+    AXIS_STATE_REASON="extra axes ride argv, which reaches script targets only (this target runs under $TARGET_RUNNER)"
   else
+    AXIS_STATE="declared"
+    AXIS_STATE_REASON="${#AXES[@]} axis/axes requested"
     while IFS= read -r token; do
       [ -n "$token" ] && AXIS_CLI+=("$token")
     done < <(python3 -c '
@@ -1777,7 +1715,9 @@ else
           BASE_GRID_STATE="target-not-present"
         fi
       elif [ -n "$GRID" ]; then
-        BASE_GRID_STATE="hook-not-found"
+        # Not "hook-not-found": nothing was looked for. A grid was requested and no channel
+        # was declared to carry it.
+        BASE_GRID_STATE="no-channel-declared"
       else
         BASE_GRID_STATE="not-configured"
       fi
@@ -1980,6 +1920,22 @@ for axis in json.loads(sys.argv[1]):
             finding "note" "correctness" \
               "requested test axes were dropped: $AXIS_STATE_REASON"
           fi
+          # `hook_proof` carries the probe's own verdict per axis. It used to hold a
+          # structural reading of the target's source, which said nothing about whether the
+          # value arrived; the only evidence that ever counted is this refusal.
+          AXIS_REPORT=$(python3 -c '
+import json
+import sys
+
+failed = set(sys.argv[2].split())
+axes = json.loads(sys.argv[1])
+for axis in axes:
+    axis["hook_proof"] = (
+        "accepted-invalid-value" if axis["flag"] in failed else "refused-invalid-value"
+    )
+print(json.dumps(axes))
+' "$AXIS_REPORT" "$AXIS_PROBE_FAILED")
+          jset_json "test_selection.axes" "$AXIS_REPORT"
           jset_string "test_selection.axis_state" "$AXIS_STATE"
           jset_string "test_selection.axis_state_reason" "$AXIS_STATE_REASON"
         fi
