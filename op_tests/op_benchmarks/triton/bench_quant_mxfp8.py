@@ -46,8 +46,8 @@ def benchmark(args):
         ms = triton.testing.do_bench(fn, warmup=25, rep=100)
         if args.metric == "time":
             return ms
-        # bytes: read input + write output (fp8 for `to`, high-precision for `from`)
-        gb = M * N * (in_dtype.itemsize + 1) * 1e-9
+        # bytes: high-precision payload + fp8 payload + one e8m0 scale byte per 32
+        gb = (M * N * (in_dtype.itemsize + 1) + M * triton.cdiv(N, 32)) * 1e-9
         return gb / (ms * 1e-3)
 
     _run.run(save_path="." if args.o else None, print_data=True, show_plots=False)

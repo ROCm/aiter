@@ -49,8 +49,21 @@ def convert_to_mxfp8(
         and scales has uint8 dtype with e8m0 format.
     """
     _LOGGER.info(f"CONVERT_TO_MXFP8: x={tuple(x.shape)}")
+    # The ASM path (v_cvt_scalef32_*) is gfx950-only and _pack_fp8 only accepts
+    # e4m3fn; anything else must take the portable path.
+    asm_supported = (
+        arch_info.get_arch() == "gfx950" and fp8_dtype == torch.float8_e4m3fn
+    )
     if use_asm is None:
-        use_asm = arch_info.get_arch() == "gfx950"
+        use_asm = asm_supported
+    elif use_asm and not asm_supported:
+        raise ValueError(
+            "use_asm=True requires gfx950 and fp8_dtype=torch.float8_e4m3fn"
+        )
+    # Stochastic rounding on the ASM path passes mismatched RNG/operand shapes
+    # and cannot compile; only the portable path supports it for now.
+    if use_sr and use_asm:
+        raise ValueError("use_sr=True is not supported with use_asm=True")
     assert x.ndim == 2, "Input must be 2D"
     M, N = x.shape
     # The kernel loads/stores full [block_m, block_n] tiles without masking and
@@ -120,8 +133,13 @@ def convert_from_mxfp8(
         Dequantized tensor with output_dtype.
     """
     _LOGGER.info(f"CONVERT_FROM_MXFP8: x={tuple(x.shape)}")
+    # The ASM path (v_cvt_scalef32_*) is gfx950-only and _unpack_fp8 only accepts
+    # e4m3fn input; anything else must take the portable path.
+    asm_supported = arch_info.get_arch() == "gfx950" and x.dtype == torch.float8_e4m3fn
     if use_asm is None:
-        use_asm = arch_info.get_arch() == "gfx950"
+        use_asm = asm_supported
+    elif use_asm and not asm_supported:
+        raise ValueError("use_asm=True requires gfx950 and x.dtype=torch.float8_e4m3fn")
     assert x.ndim == 2, "Input must be 2D"
     M, N = x.shape
     # Kernel loads/stores full [block_m, block_n] tiles without masking.
@@ -129,6 +147,17 @@ def convert_from_mxfp8(
         f"MXFP8 convert requires M,N aligned to tile ({block_m},{block_n}); "
         f"got ({M},{N})"
     )
+    # The scale tensor is read with unmasked full-tile loads, so its shape must
+    # match exactly what convert_to_mxfp8 produced.
+    expected_scale_shape = (
+        triton.cdiv(M, quant_block_size) if is_2d_block else M,
+        triton.cdiv(N, quant_block_size),
+    )
+    assert (
+        tuple(s.shape) == expected_scale_shape
+    ), f"scale shape {tuple(s.shape)} != {expected_scale_shape}"
+    assert s.dtype == torch.uint8, f"scale dtype must be uint8, got {s.dtype}"
+    assert s.device == x.device, "input and scale must be on the same device"
 
     y = torch.empty((M, N), dtype=output_dtype, device=x.device)
 
