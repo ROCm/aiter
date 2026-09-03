@@ -99,10 +99,10 @@ def na3d_sdpa_ref(
 # Each tuple: (B, T, H, W, NH, HD, KT, KH, KW)
 _DEFAULT_SHAPES = [
     # --- LTX-2.5 default shapes (B=1) ---
-    (1, 18, 32, 48, 32, 64, 3, 7, 7),      # det-0 full vol
-    (1, 36, 64, 96, 8, 64, 3, 5, 5),       # det-2 full vol
-    (1, 40, 96, 96, 8, 64, 3, 5, 5),       # det-3 tile (T=40, H=W=96)
-    (1, 16, 80, 32, 4, 64, 11, 11, 11),    # diff-5 small tile
+    (1, 18, 32, 48, 32, 64, 3, 7, 7),  # det-0 full vol
+    (1, 36, 64, 96, 8, 64, 3, 5, 5),  # det-2 full vol
+    (1, 40, 96, 96, 8, 64, 3, 5, 5),  # det-3 tile (T=40, H=W=96)
+    (1, 16, 80, 32, 4, 64, 11, 11, 11),  # diff-5 small tile
     (1, 79, 192, 192, 4, 64, 11, 11, 11),  # diff-5 dominant tile
     # --- Edge cases for correctness ---
     # SEQ % 16 != 0: exercises q_mask for the partial last program block.
@@ -127,12 +127,12 @@ _DEFAULT_SHAPES = [
 # are already exercised in test_na3d_flash via the faster _na3d_sdpa_exact ref.
 # ---------------------------------------------------------------------------
 _SDPA_FAST_SHAPES = [
-    (1, 18, 32, 48, 32, 64, 3, 7, 7),      # det-0 (SEQ = 27 648)
-    (1, 16, 80, 32, 4, 64, 11, 11, 11),    # diff-5 small tile (SEQ = 40 960)
-    (1, 3, 5, 17, 4, 64, 3, 5, 5),         # edge: SEQ % 16 != 0  (SEQ = 255)
-    (1, 11, 16, 16, 4, 64, 11, 11, 11),    # edge: T == KT         (SEQ = 2 816)
-    (1, 16, 16, 16, 4, 64, 11, 11, 11),    # edge: W == 16         (SEQ = 4 096)
-    (2, 16, 16, 32, 4, 64, 3, 5, 5),       # edge: B > 1           (SEQ = 8 192)
+    (1, 18, 32, 48, 32, 64, 3, 7, 7),  # det-0 (SEQ = 27 648)
+    (1, 16, 80, 32, 4, 64, 11, 11, 11),  # diff-5 small tile (SEQ = 40 960)
+    (1, 3, 5, 17, 4, 64, 3, 5, 5),  # edge: SEQ % 16 != 0  (SEQ = 255)
+    (1, 11, 16, 16, 4, 64, 11, 11, 11),  # edge: T == KT         (SEQ = 2 816)
+    (1, 16, 16, 16, 4, 64, 11, 11, 11),  # edge: W == 16         (SEQ = 4 096)
+    (2, 16, 16, 32, 4, 64, 3, 5, 5),  # edge: B > 1           (SEQ = 8 192)
 ]
 
 
@@ -140,10 +140,10 @@ _SDPA_FAST_SHAPES = [
 # Shapes to test correct_rightmost_block
 # ---------------------------------------------------------------------------
 _CORRECTION_SHAPES = [
-    (1, 16, 80,  32, 4, 64, 11, 11, 11),   # diff-5 small tile
-    (1, 16, 80, 192, 4, 64, 11, 11, 11),   # diff-5 wide tile
-    (1, 18, 32,  48, 32, 64, 3,  7,  7),   # det-0
-    (1, 36, 64,  96,  8, 64, 3,  5,  5),   # det-2
+    (1, 16, 80, 32, 4, 64, 11, 11, 11),  # diff-5 small tile
+    (1, 16, 80, 192, 4, 64, 11, 11, 11),  # diff-5 wide tile
+    (1, 18, 32, 48, 32, 64, 3, 7, 7),  # det-0
+    (1, 36, 64, 96, 8, 64, 3, 5, 5),  # det-2
 ]
 
 
@@ -224,6 +224,7 @@ def bench_na3d_flash(B, T, H, W, NH, HD, KT, KH, KW, dtype):
 # _na3d_sdpa_exact tests
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.parametrize("B,T,H,W,NH,HD,KT,KH,KW", _SDPA_FAST_SHAPES)
 def test_na3d_sdpa_exact_vs_ref(B, T, H, W, NH, HD, KT, KH, KW):
     """``_na3d_sdpa_exact`` agrees with ``na3d_sdpa_ref`` (FP32 per-query loop).
@@ -275,6 +276,7 @@ def test_correct_rightmost_block(B, T, H, W, NH, HD, KT, KH, KW):
     out_corr = na3d_flash_attn(q, k, v, (KT, KH, KW), correct_rightmost_block=True)
 
     import aiter.ops.triton.attention.na3d_flash as na3d_flash_mod
+
     actual_bq = na3d_flash_mod._na3d_flash_fwd.best_config.kwargs["BLOCK_Q"]
     W_last = ((W - 1) // actual_bq) * actual_bq
 

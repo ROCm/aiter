@@ -33,6 +33,7 @@ _LOGGER = AiterTritonLogger()
 # Exact per-query neighborhood SDPA (generic; used for rightmost-block correction)
 # ---------------------------------------------------------------------------
 
+
 def _window_bounds_1d(length: int, kernel: int) -> tuple[list[int], list[int]]:
     """Inward-shifted window (start, end) for each position along one axis."""
     lo = length - kernel
@@ -107,7 +108,7 @@ def _na3d_sdpa_exact(
     bh = _window_bounds_1d(H, min(KH, H))
     bw = _window_bounds_1d(W_full, min(KW, W_full))  # global W bounds
 
-    # Pick tile sizes based on q_right, 
+    # Pick tile sizes based on q_right,
     # but estimate K/V union sizes using the full W.
     eff_kt, eff_kh = min(KT, T), min(KH, H)
     eff_kw = min(KW, W_full)
@@ -188,6 +189,7 @@ def _na3d_sdpa_exact(
 # Public launcher
 # ---------------------------------------------------------------------------
 
+
 def na3d_flash_attn(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -203,10 +205,10 @@ def na3d_flash_attn(
         kernel_size : ``(KT, KH, KW)`` neighborhood window.
         correct_rightmost_block : When True, overwrite the last W-block
             (``W_last:``) with per-query exact SDPA (via _na3d_sdpa_exact),
-            where ``W_last = floor((W - 1) / BLOCK_Q) * BLOCK_Q`` for 
-            the autotuned BLOCK_Q. The flash kernel loads ``BF16(0)`` for 
+            where ``W_last = floor((W - 1) / BLOCK_Q) * BLOCK_Q`` for
+            the autotuned BLOCK_Q. The flash kernel loads ``BF16(0)`` for
             out-of-bounds K/V positions in the last W-block (``kv_ok=False``),
-            which causes a ~0.002 rounding divergence from AOTriton 
+            which causes a ~0.002 rounding divergence from AOTriton
             at those positions.  Off by default.
 
     Returns:
@@ -225,13 +227,15 @@ def na3d_flash_attn(
     )
 
     assert q.dtype == torch.bfloat16, "na3d_flash_attn: inputs must be bfloat16"
-    assert k.dtype == q.dtype and v.dtype == q.dtype, "na3d_flash_attn: q/k/v must share dtype"
-    assert k.shape == q.shape and v.shape == q.shape, (
-        "na3d_flash_attn: q/k/v must have shape (B, T, H, W, NH, HD)"
-    )
-    assert KT <= T and KH <= H and KW <= W, (
-        f"na3d_flash_attn: kernel_size=({KT},{KH},{KW}) must be <= (T,H,W)=({T},{H},{W})"
-    )
+    assert (
+        k.dtype == q.dtype and v.dtype == q.dtype
+    ), "na3d_flash_attn: q/k/v must share dtype"
+    assert (
+        k.shape == q.shape and v.shape == q.shape
+    ), "na3d_flash_attn: q/k/v must have shape (B, T, H, W, NH, HD)"
+    assert (
+        KT <= T and KH <= H and KW <= W
+    ), f"na3d_flash_attn: kernel_size=({KT},{KH},{KW}) must be <= (T,H,W)=({T},{H},{W})"
     assert HD & (HD - 1) == 0, f"head_dim {HD} must be a power of 2"
     assert W >= 16, f"W={W} is too small; kernel requires W >= BLOCK_Q (default 16)."
 

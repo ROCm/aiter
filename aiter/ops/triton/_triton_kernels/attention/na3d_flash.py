@@ -18,6 +18,7 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
 # Autotune configs.
 # BLOCK_KV = next_pow2(BLOCK_Q + KW - 1) covers the union of all BLOCK_Q
 # queries' W windows in one chunk:
@@ -45,10 +46,12 @@ def _prune_configs(configs, named_args, **kwargs):
     W = named_args["W"]
     return [c for c in configs if c.kwargs["BLOCK_Q"] <= W]
 
+
 _na3d_flash_fwd_repr = make_kernel_repr(
     "_na3d_flash_fwd",
     ["BLOCK_Q", "BLOCK_KV", "KT", "KH", "KW", "HD"],
 )
+
 
 @triton.autotune(
     configs=_CONFIGS,
