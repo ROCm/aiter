@@ -6432,7 +6432,7 @@ void fused_qk_norm_rope_group_quant(
       // floor and the serial load -> wave_reduce -> store chain leaves MLP at 1.
       // gfx1250-only; the LDS ring costs DEPTH*512*2 B per wave.
 #ifndef AITER_COARSE_Q_TDM_DEPTH
-#define AITER_COARSE_Q_TDM_DEPTH 1
+#define AITER_COARSE_Q_TDM_DEPTH 3
 #endif
       constexpr int q_tdm_depth_val = AITER_COARSE_Q_TDM_DEPTH;
       if constexpr (q_tdm_depth_val > 0) {
