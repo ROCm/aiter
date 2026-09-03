@@ -205,62 +205,22 @@ mkdir -p "$PROBE_DIR"
 REPORT_TOOL="$SCRIPT_DIR/report.py"
 python3 "$REPORT_TOOL" init "$JSON" "$LABEL"
 
+# Every write to the report goes through report.py, which is its only writer. These wrappers
+# keep the call sites unchanged; `--` guards values that begin with a dash.
 jset_json() {
-  python3 - "$JSON" "$1" "$2" <<'PY'
-import json
-import sys
-
-path, key, raw = sys.argv[1:4]
-data = json.load(open(path))
-current = data
-parts = key.split(".")
-for part in parts[:-1]:
-    current = current.setdefault(part, {})
-current[parts[-1]] = json.loads(raw)
-json.dump(data, open(path, "w"), indent=2)
-PY
+  python3 "$REPORT_TOOL" set --json -- "$JSON" "$1" "$2"
 }
 
 jset_string() {
-  python3 - "$JSON" "$1" "$2" <<'PY'
-import json
-import sys
-
-path, key, value = sys.argv[1:4]
-data = json.load(open(path))
-current = data
-parts = key.split(".")
-for part in parts[:-1]:
-    current = current.setdefault(part, {})
-current[parts[-1]] = value
-json.dump(data, open(path, "w"), indent=2)
-PY
+  python3 "$REPORT_TOOL" set -- "$JSON" "$1" "$2"
 }
 
 stage_note() {
-  python3 - "$JSON" "$1" "$2" "$3" <<'PY'
-import json
-import sys
-
-path, name, status, note = sys.argv[1:5]
-data = json.load(open(path))
-data["stages"][name] = {"status": status, "note": note}
-json.dump(data, open(path, "w"), indent=2)
-PY
+  python3 "$REPORT_TOOL" stage -- "$JSON" "$1" "$2" "$3"
 }
 
 finding() {
-  python3 - "$JSON" "$1" "$2" "$3" <<'PY'
-import json
-import sys
-
-path, severity, stage, detail = sys.argv[1:5]
-data = json.load(open(path))
-data["findings"].append(
-    {"severity": severity, "stage": stage, "detail": detail}
-)
-json.dump(data, open(path, "w"), indent=2)
-PY
+  python3 "$REPORT_TOOL" finding -- "$JSON" "$1" "$2" "$3"
 }
 
 log_excerpt() {
@@ -278,46 +238,7 @@ PY
 }
 
 mark_runtime_coverage() {
-  python3 - "$JSON" "$1" "$2" "$3" <<'PY'
-import json
-import pathlib
-import sys
-
-report_path, raw_stats, runner, log_path = sys.argv[1:5]
-stats = json.loads(raw_stats)
-if stats["executed"] < 1:
-    raise SystemExit(0)
-if runner == "script" and pathlib.Path(log_path).stat().st_size == 0:
-    raise SystemExit(0)
-# A script that exits 0 with output has proved that a process ran, not that an architecture
-# was exercised: aiter#4538's own target returns silently with exit 0 and a log line when the
-# arch is unsupported or an optional package is missing. When a route WAS named and the run's
-# receipt observed no call to it, there is positive evidence that no work reached the device,
-# so no runtime credit is issued. With no route named nothing was observed either way, and
-# the basis below says so instead of implying a measurement.
-if runner == "script" and stats.get("observed_work") == 0:
-    raise SystemExit(0)
-data = json.load(open(report_path))
-gpu = data["stages"].get("gpu_claim", {})
-arch = gpu.get("arch")
-if gpu.get("status") == "pass" and arch:
-    data["arch_coverage"][arch] = "runtime"
-    data.setdefault("arch_coverage_basis", {})[arch] = (
-        f"pytest-junit-executed:{stats['executed']}"
-        if runner == "pytest"
-        # "script-exit-zero-with-output" described the process, not the work: a target that
-        # printed one line and returned earned the same architecture credit as one that
-        # graded 56 cases. The basis now names the count the stats carry and where it came
-        # from, so a reader can see whether an architecture was exercised or merely visited.
-        else (
-            f"script-observed-work:{stats.get('observed_work')} "
-            f"({stats.get('basis', 'unknown basis')})"
-            if stats["failures"] == 0
-            else f"script-nonzero-with-output ({stats.get('basis', 'unknown basis')})"
-        )
-    )
-    json.dump(data, open(report_path, "w"), indent=2)
-PY
+  python3 "$REPORT_TOOL" coverage -- "$JSON" "$1" "$2" "$3"
 }
 
 finish_report() {

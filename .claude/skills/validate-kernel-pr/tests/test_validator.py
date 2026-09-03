@@ -3466,6 +3466,178 @@ class ReportToolTests(unittest.TestCase):
             )
 
 
+class RuntimeCreditTests(unittest.TestCase):
+    """When a run may claim it exercised an architecture.
+
+    These three refusals lived inside a shell heredoc, where no test could reach them, and had
+    none. Each one exists because a run once took credit it had not earned.
+    """
+
+    def setUp(self):
+        sys.path.insert(0, str(SKILL_DIR))
+        self.addCleanup(sys.path.remove, str(SKILL_DIR))
+        import report
+
+        self.report = report
+
+    def stats(self, **overrides):
+        base = {"executed": 4, "failures": 0, "observed_work": 12, "basis": "receipt"}
+        base.update(overrides)
+        return base
+
+    def refusal(self, stats, runner="script", log_size=100):
+        return self.report.runtime_credit_refusal(stats, runner, log_size)
+
+    def test_work_earns_credit(self):
+        self.assertIsNone(self.refusal(self.stats()))
+        self.assertIsNone(self.refusal(self.stats(), runner="pytest", log_size=0))
+
+    def test_nothing_executed_earns_nothing(self):
+        self.assertIsNotNone(self.refusal(self.stats(executed=0), runner="pytest"))
+
+    def test_a_silent_script_earns_nothing(self):
+        # aiter#4538: the target returns exit 0 on an unsupported arch. An exit code is not
+        # evidence that work reached the device.
+        self.assertIsNotNone(self.refusal(self.stats(), log_size=0))
+
+    def test_a_named_route_never_called_earns_nothing(self):
+        self.assertIsNotNone(self.refusal(self.stats(observed_work=0)))
+
+    def test_an_unnamed_route_is_not_a_refusal(self):
+        # Absent is not zero: with no route named, nothing was observed either way, and the
+        # basis string says so rather than implying a measurement.
+        stats = self.stats()
+        del stats["observed_work"]
+        self.assertIsNone(self.refusal(stats))
+
+    def test_the_basis_names_the_count_not_the_exit_code(self):
+        self.assertEqual(
+            self.report.runtime_credit_basis(self.stats(), "pytest"),
+            "pytest-junit-executed:4",
+        )
+        self.assertIn(
+            "observed-work:12", self.report.runtime_credit_basis(self.stats(), "script")
+        )
+        self.assertIn(
+            "nonzero",
+            self.report.runtime_credit_basis(self.stats(failures=2), "script"),
+        )
+
+    def test_credit_is_withheld_end_to_end(self):
+        for label, stats, expected in [
+            ("earned", self.stats(), {"gfx942": "runtime"}),
+            ("refused", self.stats(observed_work=0), {}),
+        ]:
+            with self.subTest(label), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "report.json"
+                log = Path(directory) / "run.log"
+                log.write_text("output\n")
+                path.write_text(
+                    json.dumps(
+                        {
+                            "stages": {
+                                "gpu_claim": {"status": "pass", "arch": "gfx942"}
+                            },
+                            "findings": [],
+                            "arch_coverage": {},
+                        }
+                    )
+                )
+                run(
+                    [sys.executable, str(SKILL_DIR / "report.py"), "coverage", "--"]
+                    + [str(path), json.dumps(stats), "script", str(log)],
+                    check=True,
+                )
+                self.assertEqual(
+                    json.loads(path.read_text())["arch_coverage"], expected
+                )
+
+    def test_credit_needs_a_claimed_gpu(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.json"
+            log = Path(directory) / "run.log"
+            log.write_text("output\n")
+            path.write_text(
+                json.dumps(
+                    {
+                        "stages": {"gpu_claim": {"status": "fail", "arch": "gfx942"}},
+                        "findings": [],
+                        "arch_coverage": {},
+                    }
+                )
+            )
+            run(
+                [sys.executable, str(SKILL_DIR / "report.py"), "coverage", "--"]
+                + [str(path), json.dumps(self.stats()), "script", str(log)],
+                check=True,
+            )
+            self.assertEqual(json.loads(path.read_text())["arch_coverage"], {})
+
+
+class ReportWriterTests(unittest.TestCase):
+    """The four write paths the shell used to own a heredoc apiece."""
+
+    def setUp(self):
+        sys.path.insert(0, str(SKILL_DIR))
+        self.addCleanup(sys.path.remove, str(SKILL_DIR))
+        import report
+
+        self.report = report
+
+    def test_a_dotted_key_creates_the_path(self):
+        data = {}
+        self.report.assign(data, "stages.gpu_claim.arch", "gfx942")
+        self.assertEqual(data, {"stages": {"gpu_claim": {"arch": "gfx942"}}})
+
+    def test_a_dotted_key_keeps_its_siblings(self):
+        data = {"stages": {"gpu_claim": {"status": "pass"}}}
+        self.report.assign(data, "stages.gpu_claim.arch", "gfx942")
+        self.assertEqual(data["stages"]["gpu_claim"]["status"], "pass")
+
+    def test_writes_survive_a_leading_dash(self):
+        # The call sites pass notes and numbers verbatim; a value beginning with "-" must not
+        # be read as an option by the tool that replaced the heredocs.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.json"
+            path.write_text(json.dumps({"stages": {}, "findings": []}))
+            tool = [sys.executable, str(SKILL_DIR / "report.py")]
+            run(tool + ["set", "--", str(path), "note", "-dashed"], check=True)
+            run(tool + ["set", "--json", "--", str(path), "count", "-1"], check=True)
+            run(
+                tool + ["stage", "--", str(path), "merge_sim", "fail", "-dashed"],
+                check=True,
+            )
+            run(
+                tool + ["finding", "--", str(path), "note", "merge_sim", "-dashed"],
+                check=True,
+            )
+            data = json.loads(path.read_text())
+            self.assertEqual(data["note"], "-dashed")
+            self.assertEqual(data["count"], -1)
+            self.assertEqual(data["stages"]["merge_sim"]["note"], "-dashed")
+            self.assertEqual(data["findings"][0]["detail"], "-dashed")
+
+    def test_a_stage_replaces_rather_than_merges(self):
+        # stage_note has always overwritten the whole entry; keys set under a stage before it
+        # records a status do not survive, and callers order their writes accordingly.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.json"
+            path.write_text(
+                json.dumps(
+                    {"stages": {"gpu_claim": {"arch": "gfx942"}}, "findings": []}
+                )
+            )
+            run(
+                [sys.executable, str(SKILL_DIR / "report.py"), "stage", "--"]
+                + [str(path), "gpu_claim", "pass", "claimed"],
+                check=True,
+            )
+            self.assertEqual(
+                json.loads(path.read_text())["stages"]["gpu_claim"],
+                {"status": "pass", "note": "claimed"},
+            )
+
+
 def report_module_status(report, stage):
     return report.SATISFYING_STATUS.get(stage, report.DEFAULT_SATISFYING_STATUS)
 
