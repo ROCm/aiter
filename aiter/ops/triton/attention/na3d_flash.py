@@ -61,7 +61,7 @@ def _na3d_sdpa_mask(
     for starts, ends in rel_bounds:
         st = torch.tensor(starts, device=device)
         en = torch.tensor(ends, device=device)
-        kj = torch.arange(int(en.max()), device=device)
+        kj = torch.arange(max(ends), device=device)
         bools.append((kj[None, :] >= st[:, None]) & (kj[None, :] < en[:, None]))
     visible = (
         bools[0][:, None, None, :, None, None]
@@ -107,16 +107,18 @@ def _na3d_sdpa_exact(
     bh = _window_bounds_1d(H, min(KH, H))
     bw = _window_bounds_1d(W_full, min(KW, W_full))  # global W bounds
 
-    # Pick tile sizes relative to q_right's actual dims (W_sub is small).
-    eff_kt, eff_kh, eff_kw = min(KT, T), min(KH, H), min(KW, W_sub)
+    # Pick tile sizes based on q_right, 
+    # but estimate K/V union sizes using the full W.
+    eff_kt, eff_kh = min(KT, T), min(KH, H)
+    eff_kw = min(KW, W_full)
 
     def _cost(ts: list[int]) -> int:
-        nq = math.prod(ts)
-        nk = math.prod(
-            min(d, t + kk - 1)
-            for t, kk, d in zip(ts, [eff_kt, eff_kh, eff_kw], [T, H, W_sub])
-        )
-        return nq * nk
+        tile_t, tile_h, tile_w = ts
+        nq = tile_t * tile_h * tile_w
+        nk_t = min(T, tile_t + eff_kt - 1)
+        nk_h = min(H, tile_h + eff_kh - 1)
+        nk_w = min(W_full, tile_w + eff_kw - 1)
+        return nq * nk_t * nk_h * nk_w
 
     tiles = [T, H, W_sub]
     while _cost(tiles) > 2**25 and max(tiles) > 1:
@@ -199,11 +201,13 @@ def na3d_flash_attn(
         q, k, v     : ``(B, T, H, W, NH, HD)`` bfloat16, channels-last.
                       Q is expected to be pre-scaled by ``head_dim ** -0.5``.
         kernel_size : ``(KT, KH, KW)`` neighborhood window.
-        correct_rightmost_block : When True, overwrite the rightmost BLOCK_Q W
-            positions with per-query exact SDPA (via _na3d_sdpa_exact).
-            The flash kernel loads ``BF16(0)`` for out-of-bounds K/V positions in the
-            last W-block (``kv_ok=False``), which causes a ~0.002 rounding divergence
-            from AOTriton at those positions.  Off by default.
+        correct_rightmost_block : When True, overwrite the last W-block
+            (``W_last:``) with per-query exact SDPA (via _na3d_sdpa_exact),
+            where ``W_last = floor((W - 1) / BLOCK_Q) * BLOCK_Q`` for 
+            the autotuned BLOCK_Q. The flash kernel loads ``BF16(0)`` for 
+            out-of-bounds K/V positions in the last W-block (``kv_ok=False``),
+            which causes a ~0.002 rounding divergence from AOTriton 
+            at those positions.  Off by default.
 
     Returns:
         Output tensor ``(B, T, H, W, NH, HD)`` bfloat16.
