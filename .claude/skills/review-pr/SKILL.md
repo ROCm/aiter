@@ -58,6 +58,12 @@ case "$1" in
     ;;
 esac
 
+# Every git fetch below names this URL, never the remote called `origin`. A clone whose
+# origin is a fork -- the normal state for anyone who has ever pushed a branch -- resolves
+# `origin refs/pull/N/head` against the FORK's pull refs, silently fetching a different PR
+# or none at all. The repo under review is $REPO and nothing else.
+REPO_URL="https://github.com/$REPO"
+
 # Full metadata
 gh pr view "$PR" --repo "$REPO" \
   --json title,body,number,labels,files,author,reviews,comments,baseRefName,headRefOid \
@@ -111,8 +117,17 @@ fi
 # post-image blob of every hunk, and fetching the PR head puts those blobs in the local object
 # store, where `git cat-file` reaches them without a second worktree. Without this the scan
 # still runs, but reports the files as NOT SCANNED rather than silently reporting no findings.
-git fetch -q origin "refs/pull/$PR/head" 2>/dev/null || \
+git fetch -q "$REPO_URL" "refs/pull/$PR/head" 2>/dev/null || \
   echo "note: could not fetch the PR head; the index-width scan will report unscanned files" >&2
+
+# Both SHAs, from the API rather than from local refs, and defined ONCE here so every later
+# step names the same two commits. Step 1b referenced $BASE_SHA/$HEAD_SHA without either ever
+# being assigned: under `set -u` that aborts the whole block, so the cross-file evidence
+# collector never ran for anybody, and neither did anything after it.
+BASE_SHA=$(cat "$WORK/base_head.txt")
+HEAD_SHA=$(python3 -c \
+  'import json,sys; print(json.load(open(sys.argv[1]))["headRefOid"])' \
+  "$WORK/pr_meta.json")
 if ! "$SCAN" --diff "$WORK/pr.diff"; then
   echo "required index-width scan failed; do not report an empty candidate list" >&2
   exit 1
@@ -381,7 +396,7 @@ if [ -z "$VALIDATION_REPORT" ] \
   # failing to materialise it leaves the review static-only rather than aborting it.
   set +e
   git -C "$PROJECT_ROOT" cat-file -e "${AUTO_BASE}^{commit}" 2>/dev/null \
-    || git -C "$PROJECT_ROOT" fetch -q origin "$AUTO_BASE" 2>/dev/null
+    || git -C "$PROJECT_ROOT" fetch -q "$REPO_URL" "$AUTO_BASE" 2>/dev/null
   git -C "$PROJECT_ROOT" worktree add --detach "$AUTO_WT" "$AUTO_BASE" >/dev/null 2>&1
   AUTO_WT_RC=$?
   set -e
@@ -752,24 +767,48 @@ PR_TITLE=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('t
 # than reminding the reviewer to go and read it. A deleted guard is judged by how
 # the symbol is handled on head, not by the hunk that removed it.
 if grep -q "invariant-removed\|api-signature" "$WORK/rules.txt"; then
-  HEAD_FILES=$(git -C "$PROJECT_ROOT" diff --name-only "$BASE_SHA...$HEAD_SHA" \
-               | sed "s|^|$PROJECT_ROOT/|")
-  "$SKILLS_ROOT/review-pr/triage.py" evidence "$WORK/pr.diff" $HEAD_FILES \
-    | tee "$WORK/evidence.txt"
+  # Materialise the PR's own head images under $WORK. Prefixing the changed paths with
+  # $PROJECT_ROOT read the reviewer's WORKING TREE instead -- whatever branch they happen to
+  # have checked out, with whatever uncommitted edits -- so the same PR produced different
+  # evidence on two machines, and evidence for a PR that was never checked out at all.
+  mkdir -p "$WORK/head"
+  HEAD_FILES=""
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    dst="$WORK/head/$f"
+    mkdir -p "$(dirname "$dst")"
+    if git -C "$PROJECT_ROOT" cat-file -e "$HEAD_SHA:$f" 2>/dev/null \
+       && git -C "$PROJECT_ROOT" show "$HEAD_SHA:$f" > "$dst" 2>/dev/null; then
+      HEAD_FILES="$HEAD_FILES $dst"
+    else
+      echo "note: $f unavailable at head $HEAD_SHA; not in the evidence set" >&2
+    fi
+  done < <(git -C "$PROJECT_ROOT" diff --name-only "$BASE_SHA...$HEAD_SHA" 2>/dev/null \
+           || grep '^+++ b/' "$WORK/pr.diff" | sed 's|^+++ b/||')
+  if [ -n "$HEAD_FILES" ]; then
+    "$SKILLS_ROOT/review-pr/triage.py" evidence "$WORK/pr.diff" $HEAD_FILES \
+      | tee "$WORK/evidence.txt"
+  else
+    echo "SKIPPED: no head images available; cross-file evidence not collected" \
+      | tee "$WORK/evidence.txt"
+  fi
 fi
 
 # Every first-party import the diff ADDS, resolved against the branch this PR merges
 # INTO -- fetched fresh, not the PR base and not whatever is on disk. A stale root
 # makes this check silently pass; that is the whole failure mode it exists to catch.
-MERGE_TARGET="${MERGE_TARGET:-$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('base',{}).get('ref') or 'main')" "$WORK/pr_meta.json")}"
-git -C "$PROJECT_ROOT" fetch -q origin "$MERGE_TARGET" 2>/dev/null || true
+# $BASE_SHA is the base branch tip read from the API in Step 1, not a local ref and not the
+# PR's historical merge base -- the two differ by exactly the window in which this class of
+# breakage happens.
+git -C "$PROJECT_ROOT" cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null \
+  || git -C "$PROJECT_ROOT" fetch -q "$REPO_URL" "$BASE_SHA" 2>/dev/null || true
 TARGET_WT="$WORK/merge-target"
-if git -C "$PROJECT_ROOT" worktree add --detach "$TARGET_WT" FETCH_HEAD >/dev/null 2>&1; then
+if git -C "$PROJECT_ROOT" worktree add --detach "$TARGET_WT" "$BASE_SHA" >/dev/null 2>&1; then
   "$SKILLS_ROOT/review-pr/triage.py" symbols "$WORK/pr.diff" "$TARGET_WT" \
     | tee "$WORK/symbols.txt"
   git -C "$PROJECT_ROOT" worktree remove --force "$TARGET_WT" >/dev/null 2>&1 || true
 else
-  echo "SKIPPED: could not check out $MERGE_TARGET; symbol sweep not run" \
+  echo "SKIPPED: could not check out base $BASE_SHA; symbol sweep not run" \
     | tee "$WORK/symbols.txt"
 fi
 ```
