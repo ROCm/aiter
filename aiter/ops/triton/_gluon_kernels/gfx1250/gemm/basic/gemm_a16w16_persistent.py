@@ -25,6 +25,7 @@ _GLUON_REPR_KEYS = [
     "ADD_BIAS",
     "SKIP_REDUCE",
     "NUM_SMS",
+    "NUM_PID_N",
     "num_warps",
     "num_stages",
     "waves_per_eu",
@@ -71,6 +72,7 @@ def gemm_a16w16_persistent_kernel_(
     ADD_BIAS: gl.constexpr,
     SKIP_REDUCE: gl.constexpr,
     NUM_SMS: gl.constexpr,
+    NUM_PID_N: gl.constexpr,
     num_warps: gl.constexpr,
     num_stages: gl.constexpr = 0,
     waves_per_eu: gl.constexpr = 0,
@@ -104,7 +106,8 @@ def gemm_a16w16_persistent_kernel_(
     )
 
     start_pid = gl.program_id(axis=0)
-    num_pid_n = gl.cdiv(N, BLOCK_N)
+    # taken out of kernel to reduce sgpr spills
+    num_pid_n: gl.constexpr = NUM_PID_N
 
     a_buffer = gl.allocate_shared_memory(
         a_ptr.type.element_ty,
@@ -321,6 +324,7 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
     ADD_BIAS: gl.constexpr,
     SKIP_REDUCE: gl.constexpr,
     NUM_SMS: gl.constexpr,
+    NUM_PID_N: gl.constexpr,
     num_warps: gl.constexpr,
     num_stages: gl.constexpr = 0,
     waves_per_eu: gl.constexpr = 0,
@@ -356,7 +360,8 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
     )
 
     start_pid = gl.program_id(axis=0)
-    num_pid_n = gl.cdiv(N, BLOCK_N)
+    # taken out of kernel to reduce sgpr spills
+    num_pid_n: gl.constexpr = NUM_PID_N
 
     a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=a_ptr,
@@ -387,6 +392,7 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
         [[BLOCK_N, 8]], [BLOCK_M, BLOCK_N], [1, 0]
     )
 
+    # iterate over tiles
     tile_id = start_pid
     while tile_id < num_tiles:
         # allocations done within the loop, this is very slow but allows prefetching
@@ -420,7 +426,7 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
             gl.minimum(sk_start + SPLITK_BLOCK_SIZE, K) - sk_start, BLOCK_K
         )
 
-        # prologue: prefetch this tile's leading PD k-tiles at the top of the loop
+        # prologue
         for pf in gl.static_range(PD):
             gl.amd.gfx1250.tdm.async_load(
                 a_desc,
@@ -511,7 +517,7 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
             cur_b = next_b
             compute_idx += 1
 
-        # epilogue: drain remaining prefetched k-tiles
+        # epilogue
         for i in gl.static_range(PD - 1):
             gl.amd.gfx1250.tdm.async_wait((PD - 2 - i) * 2)
 

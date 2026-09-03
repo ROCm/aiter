@@ -250,7 +250,10 @@ def gemm_a16w16_(
             _LOGGER.info(
                 f"GEMM_A16W16 [gluon, persistent]: x={tuple(x.shape)} w={tuple(w.shape)}"
             )
-            num_mn_tiles = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
+
+            # sgpr spills to 0
+            num_pid_n = triton.cdiv(N, BLOCK_N)
+            num_mn_tiles = triton.cdiv(M, BLOCK_M) * num_pid_n
             num_tiles = num_mn_tiles * NUM_KSPLIT
 
             out_ptr = y if NUM_KSPLIT == 1 else y_pp
@@ -287,6 +290,7 @@ def gemm_a16w16_(
                 ADD_BIAS=(bias is not None),
                 SKIP_REDUCE=bool(skip_reduce),
                 NUM_SMS=NUM_SMS,
+                NUM_PID_N=num_pid_n,
                 num_warps=num_warps,
                 num_stages=num_stages,
                 waves_per_eu=waves_per_eu,
