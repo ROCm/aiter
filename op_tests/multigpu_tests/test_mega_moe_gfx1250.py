@@ -28,6 +28,12 @@ Launch (4x gfx1250; every env knob below is already the script's default):
 
 Env / CLI: --layers --logits_tol --acc_verify --dispatch_wire --combine
            -tpr -hd -id -e -k --shared_E -q
+           --data-init --seed --warmup --iters --prof_replays
+
+``--data-init`` / ``--scale-init`` / ``--seed`` are the shared ubench knobs from
+``aiter.test_common.add_data_init_args``. ``--scale-init`` is accepted for CLI
+compatibility but unused here: every scale is derived by quantizing the
+generated weights, never drawn independently.
 """
 
 import argparse
@@ -49,6 +55,7 @@ from aiter import (
 from aiter.fused_moe import fused_moe
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.shuffle import moe_shuffle_scale, shuffle_weight
+from aiter.test_common import add_data_init_args, fill, make_generator
 from aiter.utility import fp4_utils
 
 try:
@@ -77,6 +84,9 @@ os.environ.setdefault("FLYDSL_GPU_ARCH", get_gfx())
 _FP8_DTYPE = dtypes.fp8
 QUANT_KEYS = ["No", "per_Token", "per_128x128", "a8w4_mxfp4", "a4w4_mxfp4"]
 _MXFP4_KEYS = ("a8w4_mxfp4", "a4w4_mxfp4")
+# add_data_init_args' --scale-init default. Kept here so main() can tell whether
+# the caller asked for a scale distribution this test cannot honour.
+_DEFAULT_SCALE_INIT = "constant"
 
 
 def _import_mori_comm():
@@ -159,6 +169,20 @@ def resolve_dispatch_wire(wire, quant_key):
             "would hand the GEMM the wrong payload width"
         )
     return wire
+
+
+def resolve_data_init(data_init):
+    """``--data-init`` is the shared ubench list form, meant to sweep several
+    distributions in one invocation. Here the weights are quantized and the whole
+    N-layer chain is captured into a CUDA graph once per process, so a run takes
+    exactly one distribution -- sweep by launching the script per distribution."""
+    dists = list(data_init) if isinstance(data_init, (list, tuple)) else [data_init]
+    if len(dists) != 1:
+        raise ValueError(
+            f"--data-init takes a single distribution here, got {dists}: the "
+            "weight quant and the graph capture are both per-run"
+        )
+    return dists[0]
 
 
 # Weight quantization + shuffle (device path) / dequant (reference)
@@ -301,37 +325,33 @@ def moe_forward(
 
 # Shared setup (fed to BOTH reference and device path)
 _WEIGHT_SEED = 70000  # identical on every rank so the global expert set agrees
+_WEIGHT_AMPL = 0.1  # weight amplitude, was the literal `/ 10` below
 
 
-def make_shared_weights(E, hdim, idim, dtype, dev, shared_E=0, seed=_WEIGHT_SEED):
+def make_shared_weights(
+    E, hdim, idim, dtype, dev, shared_E=0, seed=_WEIGHT_SEED, data_dist="norm"
+):
     """One weight set reused by every layer. Same seed on all ranks so the global
-    expert partition is consistent. Returns bf16 (w1[E,2I,H], w2[E,H,I], sw1, sw2)."""
-    gen = torch.Generator(device=dev).manual_seed(seed)
-    w1 = (
-        torch.randn((E, 2 * idim, hdim), generator=gen, device=dev, dtype=torch.float32)
-        / 10
-    ).to(dtype)
-    w2 = (
-        torch.randn((E, hdim, idim), generator=gen, device=dev, dtype=torch.float32)
-        / 10
-    ).to(dtype)
+    expert partition is consistent. Returns bf16 (w1[E,2I,H], w2[E,H,I], sw1, sw2).
+
+    ``data_dist`` is a ``--data-init`` distribution. Every mode is scaled down by
+    _WEIGHT_AMPL: at unit amplitude the narrow fp4/fp8 activation quant saturates
+    and the N-layer residual chain diverges to NaN after a few layers."""
+    gen = make_generator(seed, device=dev)
+
+    def _w(experts, rows, cols):
+        # fill() only row-chunks its fp32 staging for 2-D shapes, so ask for the
+        # flat [experts*rows, cols] and view it back: at E=384 that caps the
+        # staging near 1 GiB instead of materializing the set in fp32.
+        w = fill((experts * rows, cols), data_dist, gen, dtype=dtype, device=dev)
+        return w.mul_(_WEIGHT_AMPL).view(experts, rows, cols)
+
+    w1 = _w(E, 2 * idim, hdim)
+    w2 = _w(E, hdim, idim)
     sw1 = sw2 = None
     if shared_E > 0:
-        sw1 = (
-            torch.randn(
-                (shared_E, 2 * idim, hdim),
-                generator=gen,
-                device=dev,
-                dtype=torch.float32,
-            )
-            / 10
-        ).to(dtype)
-        sw2 = (
-            torch.randn(
-                (shared_E, hdim, idim), generator=gen, device=dev, dtype=torch.float32
-            )
-            / 10
-        ).to(dtype)
+        sw1 = _w(shared_E, 2 * idim, hdim)
+        sw2 = _w(shared_E, hdim, idim)
     return w1, w2, sw1, sw2
 
 
@@ -660,13 +680,19 @@ class DeviceMoEPipeline:
         return x
 
     # ---- CUDA graph capture (all N layers in ONE graph) ---- #
+    # Eager passes before the capture. NOT a measurement knob, hence not on the
+    # CLI: they prime the fused_moe lru_cache, the JIT and the allocator, and
+    # without them that work would land inside the capture and fail it. 3 is what
+    # torch's own CUDA-graph guidance warms up with.
+    _CAPTURE_WARMUP = 3
+
     def capture(self, x0):
         self.x0_static = x0.clone()
         # warmup on a side stream: primes fused_moe lru_cache + allocator.
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
-            for _ in range(3):
+            for _ in range(self._CAPTURE_WARMUP):
                 self._pipeline(self.x0_static)
         torch.cuda.current_stream().wait_stream(s)
         torch.cuda.synchronize()
@@ -679,18 +705,18 @@ class DeviceMoEPipeline:
         self.comm.barrier()
 
     # ---- perf: torch.profiler breakdown + graph-replay wall-clock ---- #
-    _N_WARMUP = 5
-    _N_PROF_REPLAYS = 3  # graph replays captured by torch.profiler in bench()
-
-    def bench(self):
+    def bench(self, warmup=5, iters=10, prof_replays=3):
         """Time the ONE-graph N-layer dispatch->gemm->combine chain. The graph
-        already contains all N layers, so a single replay IS the per-chain
-        measurement -- no separate replay-count knob. 5 warmup replays first.
-        Returns (total_us for all N layers, per_layer_us, prof_us).
+        already contains all N layers, so ONE replay is one full chain; `iters` of
+        them are timed individually after `warmup` untimed ones.
+        Returns (stats, prof_us) with stats = {min, median, mean, max} in us.
 
-        - total_us = host wall-clock of one graph replay (one sync after; not
+        - a sample is the host wall-clock of one graph replay (one sync after; not
           cuda.Event). For a GPU-bound MoE chain this ~= GPU time.
-        - torch.profiler over one EAGER pipeline pass for the per-op breakdown.
+        - min is the closest to an undisturbed replay, median to the steady state
+          of a GPU held at full load; the two drifting apart is what a straggler
+          rank or a throttled clock looks like, hence both are reported.
+        - torch.profiler over `prof_replays` replays for the per-op breakdown.
 
         NOTE: this ROCm torch build reports self_device_time_total == 0 for every
         event (verified even for a plain matmul), so torch.profiler cannot give a
@@ -698,17 +724,29 @@ class DeviceMoEPipeline:
         If a future build populates device time, prof_us below becomes > 0."""
         import time
 
-        for _ in range(self._N_WARMUP):
+        assert iters >= 1, f"--iters must time at least one replay, got {iters}"
+
+        for _ in range(warmup):
             self.graph.replay()
         torch.cuda.synchronize()
         self.comm.barrier()
 
-        # one full N-layer graph replay == the performance measurement.
-        t0 = time.perf_counter()
-        self.graph.replay()
-        torch.cuda.synchronize()
-        total_us = (time.perf_counter() - t0) * 1e6
+        # each full N-layer graph replay is one measurement.
+        samples = []
+        for _ in range(iters):
+            t0 = time.perf_counter()
+            self.graph.replay()
+            torch.cuda.synchronize()
+            samples.append((time.perf_counter() - t0) * 1e6)
         self.comm.barrier()
+
+        samples.sort()
+        stats = {
+            "min": samples[0],
+            "median": samples[len(samples) // 2],
+            "mean": sum(samples) / len(samples),
+            "max": samples[-1],
+        }
 
         # torch.profiler breakdown over CUDA-graph replays: roctracer/kineto does
         # surface the per-kernel timeline inside the graph on this build, so we
@@ -717,13 +755,13 @@ class DeviceMoEPipeline:
         with tprof.profile(
             activities=[tprof.ProfilerActivity.CPU, tprof.ProfilerActivity.CUDA]
         ) as prof:
-            for _ in range(self._N_PROF_REPLAYS):
+            for _ in range(prof_replays):
                 self.graph.replay()
             torch.cuda.synchronize()
         self.comm.barrier()
         self._prof = prof
         prof_us = sum(_event_device_us(e) for e in prof.key_averages())
-        return total_us, total_us / self.n_layers, prof_us
+        return stats, prof_us
 
     def final_output(self):
         self.graph.replay()
@@ -849,19 +887,31 @@ def main():
         E % dist_ctx.world == 0
     ), f"E={E} must be divisible by world_size={dist_ctx.world}"
 
+    data_dist = resolve_data_init(args.data_init)
+
     if dist_ctx.rank == 0:
         print(
             f"[cfg] world={dist_ctx.world} layers={n_layers} tokens/rank={ct} hidden={hdim} "
             f"inter={idim} E={E} topk={topk} EPR={E // dist_ctx.world} quant={args.quant_type} "
             f"combine={args.combine} dispatch_wire={spec['dispatch_wire']} "
             f"force_a8w4={os.environ['AITER_FORCE_A8W4']} "
-            f"gate={spec['gate_mode'].name} shared_E={args.shared_experts} gfx={get_gfx()}",
+            f"gate={spec['gate_mode'].name} shared_E={args.shared_experts} "
+            f"data_init={data_dist} seed={args.seed} gfx={get_gfx()}",
             flush=True,
         )
+        if list(args.scale_init) != [_DEFAULT_SCALE_INIT]:
+            print(
+                f"# note: --scale-init {' '.join(args.scale_init)} is ignored -- "
+                "every scale here comes from quantizing the generated weights",
+                flush=True,
+            )
 
     # ---- shared inputs: weights (same on all ranks) + this rank's tokens/routing.
     # args.seed shifts all RNG; weights stay rank-independent (identical global
     # experts), tokens/routing vary per rank. Default keeps runs reproducible.
+    # --data-init picks how the weights and the layer-0 tokens are filled; the
+    # routing stays random in every mode, since a zero/constant routing would
+    # collapse every token onto expert 0 and stop measuring dispatch/combine.
     w1_bf, w2_bf, sw1, sw2 = make_shared_weights(
         E,
         hdim,
@@ -870,16 +920,15 @@ def main():
         dev,
         shared_E=args.shared_experts,
         seed=_WEIGHT_SEED + args.seed,
+        data_dist=data_dist,
     )
-    x0 = torch.randn(
-        ct,
-        hdim,
-        generator=torch.Generator(device=dev).manual_seed(
-            1000 + dist_ctx.rank + args.seed
-        ),
+    x0 = fill(
+        (ct, hdim),
+        data_dist,
+        make_generator(1000 + dist_ctx.rank + args.seed, device=dev),
+        dtype=dtypes.bf16,
         device=dev,
-        dtype=torch.float32,
-    ).to(dtypes.bf16)
+    )
     routings = make_routings(
         n_layers, ct, E, topk, dev, seed=4242 + 100 * dist_ctx.rank + args.seed
     )
@@ -903,17 +952,20 @@ def main():
     )
     pipe.setup(x0)
     pipe.capture(x0)
-    total_us, per_layer_us, prof_us = pipe.bench()
-    # Aggregate perf across ranks (collective calls -> run on every rank).
-    total_us = dist_ctx.allreduce_avg_float(total_us)
-    per_layer_us = dist_ctx.allreduce_avg_float(per_layer_us)
+    stats, prof_us = pipe.bench(
+        warmup=args.warmup, iters=args.iters, prof_replays=args.prof_replays
+    )
+    # Aggregate perf across ranks (collective calls -> run on every rank, and the
+    # dict is built in the same order everywhere so the allreduces stay in step).
+    stats = {k: dist_ctx.allreduce_avg_float(v) for k, v in stats.items()}
+    per_layer_us = stats["median"] / n_layers
     prof_us = dist_ctx.allreduce_avg_float(prof_us)
     tbl = None
     if args.profile_table:
         tbl = _aggregate_prof_table(
             pipe._prof,
             dist_ctx,
-            per_layer_denom=pipe._N_PROF_REPLAYS * n_layers,
+            per_layer_denom=args.prof_replays * n_layers,
         )
         # Save a chrome/perfetto timeline per rank so the actual kernel timeline
         # (and any gaps) can be inspected directly. Opt-in (--save_trace): the
@@ -938,8 +990,10 @@ def main():
         )
         print(
             f"# MEGA-MOE layers={n_layers} tokens/rank={ct}: "
-            f"total={total_us:.1f} us per_layer={per_layer_us:.1f} us "
-            f"(avg over {dist_ctx.world} ranks; dispatch+gemm+combine, 1 graph replay) "
+            f"median={stats['median']:.1f} us per_layer={per_layer_us:.1f} us "
+            f"(min={stats['min']:.1f} mean={stats['mean']:.1f} max={stats['max']:.1f} us "
+            f"over {args.iters} timed replays after {args.warmup} warmup, avg over "
+            f"{dist_ctx.world} ranks; dispatch+gemm+combine, 1 replay = {n_layers} layers) "
             f"{prof_note}",
             flush=True,
         )
@@ -1006,11 +1060,28 @@ def _parse_args():
     p.add_argument("-k", "--topk", type=int, default=6, help="top-k")
     p.add_argument("--shared_experts", type=int, default=0, help="dense shared experts")
     p.add_argument("--layers", type=int, default=61, help="number of MoE layers")
+    # The shared ubench data-init knobs: --data-init, --scale-init and --seed.
+    # default_dist=norm reproduces the historical N(0,1)*0.1 weights, which is
+    # what the _ACC_TOL budget was calibrated against.
+    add_data_init_args(p, default_dist="norm", default_scale=_DEFAULT_SCALE_INIT)
     p.add_argument(
-        "--seed",
+        "--warmup",
         type=int,
-        default=0,
-        help="base RNG seed for weights/tokens/routing (optional; default 0)",
+        default=5,
+        help="untimed graph replays before the timed ones",
+    )
+    p.add_argument(
+        "--iters",
+        type=int,
+        default=1,
+        help="timed graph replays; each one is a full --layers chain, reported as "
+        "min/median/mean/max",
+    )
+    p.add_argument(
+        "--prof_replays",
+        type=int,
+        default=3,
+        help="graph replays profiled for the --profile_table breakdown",
     )
     p.add_argument(
         "--logits_tol",
