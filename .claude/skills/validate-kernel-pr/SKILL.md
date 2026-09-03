@@ -1,7 +1,7 @@
 ---
 name: validate-kernel-pr
-description: Reproducible validation executor for kernel PRs. Applies an explicit base-to-head patch in an isolated worktree, runs it on a verified-idle GPU, compares the same targets against base, policy-checks the test diff, and emits a head-bound validation_report.json. Missing environment evidence is INCONCLUSIVE, never PASS.
-argument-hint: --repo <worktree> --target <script file or pytest target>
+description: Run a kernel PR's tests as evidence rather than as a claim. Apply the base-to-head patch in an isolated worktree, run it on a locked idle GPU, compare the same targets against base, and record every result in a head-bound validation_report.json. You supply the judgement — which target exercises the diff, how it takes its shapes, whether a tolerance was loosened; the ledger and the verdict are computed by tools you cannot narrate around. Missing environment evidence is INCONCLUSIVE, never PASS. Use when validating, reproducing, or gathering runtime evidence for a kernel PR in aiter or FlyDSL.
+argument-hint: <pr number or owner/repo#N>
 ---
 
 # validate-kernel-pr
@@ -29,65 +29,81 @@ not get from a report.
 
 ---
 
-## Invocation
+## You may judge; you may not keep the books
 
-The caller supplies a clean base checkout, the base-to-head patch, the exact head OID, and the
-test target; this script does not fetch PRs itself (see
-[Not implemented yet](#not-implemented-yet)).
+Most of the work below is judgement, and it is yours. Which target actually exercises the diff.
+How that target takes its shapes. Whether a changed tolerance was loosened or merely moved.
+Whether a grid cell is anything other than the default the target would have run anyway. These
+were once an AST scanner and a nineteen-flag command line, and the encoding was the mistake: a
+scanner that guesses wrong is wrong silently, whereas you can read the target and say why.
+
+The ledger is not yours. Whether a stage ran, what it exited with, which GPU held the lock, which
+route the profiler observed, and what verdict follows — those are written by the tools below and
+read back out of the report. The reason is narrow and non-negotiable: a model asked to report on
+its own execution will report success it did not observe, and that is the single failure this
+skill exists to prevent. So every fact that could clear a PR is recorded by a process separate
+from the one narrating it.
+
+The practical rule: **reason in prose, record through a command.** If a claim ends up in
+`validation_report.json`, a command put it there.
+
+## The command surface
+
+These are the only ways a fact reaches the report. (They are being carved out of the current
+`validate_pr.sh`, which is still the shipped entry point; the responsibilities below are the
+boundary, whatever the file layout.)
+
+| command | what it owns |
+|---|---|
+| `report.py init \| set \| stage \| finding \| finish` | the report itself. `finish` computes the verdict from the stages actually recorded, validates against `report_schema.json`, and is the **sole** writer of `verdict` and of the process exit code. |
+| `claim-gpu.sh` | picking an idle GPU, the sampling window that decided it was idle, and a `flock` held for the whole run. Records the idleness basis, not just the device id. |
+| `run-target.sh` | one target, one phase. Patch state, private caches, the constructed environment, the receipt probe, and the exit code plus JUnit counts that come back. |
+| `scrape_perf.py` | parsing a benchmark's rows into comparable numbers. |
+| `scan_index_width.py` | the 32-bit index-width scan. |
+
+You choose what to run and you explain why. You do not hand-write a stage result, and you do not
+compute the verdict — `finish` does, from what is on record.
+
+## Establishing the run's identity
+
+Four facts pin a run, and a report missing any of them is evidence about nothing in particular:
+the **base commit** it was compared against, the **patch** and its SHA-256, the exact **head OID**
+the patch represents, and the **target**.
 
 ```bash
-# Example for a FlyDSL softmax PR.
 REPO=ROCm/FlyDSL
-PR="${PR:?set PR to the open softmax PR number}"
+PR="${PR:?set PR to the PR number}"
 
-# 1. pin the PR identity and put its base in an isolated worktree
 BASE_REF=$(gh pr view "$PR" --repo "$REPO" --json baseRefName --jq .baseRefName)
 BASE_REF_PATH=$(python3 -c \
   'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' \
   "$BASE_REF")
 BASE=$(gh api "repos/$REPO/branches/$BASE_REF_PATH" --jq .commit.sha)
 HEAD=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid)
+
 git worktree add --detach "/tmp/pr-$PR" "$BASE"
 gh pr diff "$PR" --repo "$REPO" > "/tmp/pr-$PR.patch"
-
-# 2. validate base and head under the same runner and GPU lock
-.claude/skills/validate-kernel-pr/validate_pr.sh \
-    --repo "/tmp/pr-$PR" \
-    --patch "/tmp/pr-$PR.patch" \
-    --head-sha "$HEAD" \
-    --target tests/kernels/test_softmax.py \
-    --expected-route kernels.softmax_kernel:build_softmax_module \
-    --shape-vars M,N,dtype_str \
-    --shape-env ROCDSL_SOFTMAX_SHAPES \
-    --grid "64,2048,f32;64,2000,f32" \
-    --tol-table "f32=1e-5,f16=2e-3,bf16=1e-2" \
-    --out validation_report.json
 ```
 
-For a local candidate with no remote head, omit `--head-sha`. The report then records
-`repo.head: null`; it remains useful locally but `review-pr` will reject it as PR evidence.
+Take the base from the **branch tip**, not from `baseRefOid`. `baseRefOid` is where the branch
+stood when the PR was opened; comparing against it attributes every intervening merge on the base
+branch to this PR's author.
 
-| flag | meaning |
-|---|---|
-| `--repo` | worktree to validate (required) |
-| `--target` | script file or pytest node/file the PR ships (`--tests` remains an alias) |
-| `--patch` | patch to apply first; conflict is a blocker |
-| `--head-sha` | exact remote PR head represented by the patch |
-| `--expected-route` | exact `module:function` route the validator-owned profiler must observe |
-| `--shape-vars` | comma-separated local names captured from each route call, in grid order |
-| `--shape-env` `--grid` | env var and shape list for the S1-owned grid |
-| `--shape-arg` | the target's own CLI flag that accepts shapes, for script targets that read no env var |
-| `--shape-argnames` | the pytest parameter names the grid should replace, for targets whose shapes are literals inside `@pytest.mark.parametrize` |
-| `--axis` | repeatable `NAME=FLAG:v1;v2;…` — an extra independent test axis on its own CLI flag (see [`axes`](#axes-when-the-failing-configuration-is-not-a-shape)) |
-| `--runner` | force `pytest` or `script` when the structural classifier gets it wrong; the report records both the forced choice and what selection had said |
-| `--perf-control-column` | a timing column the patch does not touch; required before a transplanted baseline is believed (see [`perf`](#8--perf)) |
-| `--tol-table` | reference tolerances recorded alongside the head-vs-base comparison (see [`test_policy`](#4--test_policy--run-before-the-suite)) |
-| `--perf-args` | benchmark entry point for the timing stage; also forces perf on when detection would decline |
-| `--no-perf` | skip the timing stage entirely |
-| `--label` `--out` | run name and report path (default `./validation_report.json`) |
+Validate in a worktree you created, and leave it as you found it — the patch is applied and
+reverted around each phase, and a run that dies mid-phase must still restore the base. A dirty
+worktree makes the next phase's result unattributable.
 
-Several settings are environment variables rather than flags, because they describe the **host**
-rather than the PR under test, and a caller validating many PRs on one machine sets them once:
+If there is no remote head — a local candidate — record `repo.head: null` rather than inventing
+one. The report stays useful locally, and `review-pr` correctly refuses it as PR evidence.
+
+Choose the target by reading the diff, not by pattern-matching a filename. A target that does not
+touch the changed code can return `PASS` on evidence about something else entirely, and that reads
+to a reviewer as clearance — worse than no report at all.
+
+## Host settings
+
+These stay environment variables because they describe the **host**, not the PR under test — a
+caller validating many PRs on one machine sets them once and never thinks about them again:
 
 | env | meaning |
 |---|---|
@@ -100,25 +116,9 @@ rather than the PR under test, and a caller validating many PRs on one machine s
 | `PERF_THRESHOLD` | head/base ratio that counts as a regression, default 0.95 |
 | `PERF_MIN_ROWS` | matched rows required before any ratio is reported, default 3 |
 
-Everything that describes the PR is a flag. The executor also overrides `AITER_JIT_DIR` with
-separate fresh base/head directories and sets `PYTHONDONTWRITEBYTECODE=1`, so repository JIT
-output cannot cross phases or dirty the worktree.
-
-### Which shape channel to name
-
-The three shape flags are alternatives, not a sequence; supply the one the target actually has.
-The report says which channel was established in `test_selection.grid_channel`, and when none
-was, `test_selection.grid_channel_reason` names each channel tried and what was found in the
-target — so a failed guess costs one run, not a reading of this file.
-
-| the target takes its shapes from | flag | what is checked before the channel is credited |
-|---|---|---|
-| an environment variable it reads | `--shape-env` | the source reads that name via `os.getenv` / `os.environ` |
-| its own CLI flag | `--shape-arg` | the source passes that flag literal to `add_argument` |
-| `@pytest.mark.parametrize` literals | `--shape-argnames` | the source binds all those names as test parameters |
-
-All three are then held to the same proof: a deliberately unusable grid must make the target
-**fail**. A target that ignores the grid produces a skip, never a pass.
+`run-target.sh` additionally gives each phase a fresh private `AITER_JIT_DIR` and sets
+`PYTHONDONTWRITEBYTECODE=1`, so JIT output cannot cross between base and head or dirty the
+worktree.
 
 ---
 
