@@ -274,8 +274,8 @@ def test_correct_rightmost_block(B, T, H, W, NH, HD, KT, KH, KW):
     out_base = na3d_flash_attn(q, k, v, (KT, KH, KW), correct_rightmost_block=False)
     out_corr = na3d_flash_attn(q, k, v, (KT, KH, KW), correct_rightmost_block=True)
 
-    from aiter.ops.triton._triton_kernels.attention.na3d_flash import _na3d_flash_fwd
-    actual_bq = _na3d_flash_fwd.best_config.kwargs["BLOCK_Q"]
+    import aiter.ops.triton.attention.na3d_flash as na3d_flash_mod
+    actual_bq = na3d_flash_mod._na3d_flash_fwd.best_config.kwargs["BLOCK_Q"]
     W_last = ((W - 1) // actual_bq) * actual_bq
 
     diff = (out_corr.float() - out_base.float()).abs()
