@@ -148,8 +148,8 @@ def _na3d_flash_fwd(
         t_kv = t_ws + dt
         h_kv = h_ws + dh
 
-        row_base = t_kv * HW + h_kv * W
-        kv_flat = row_base + kv_w
+        row_base = t_kv * HW + h_kv.to(tl.int64) * W64
+        kv_flat = row_base + kv_w.to(tl.int64)
 
         K_T = tl.load(
             K_ptr + base + kv_flat[None, :] * stride_seq + hd_offs[:, None],
