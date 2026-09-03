@@ -83,3 +83,15 @@ iteration 重建实例。当前接口假设同一实例同一时刻只有一条 
   `run_1stage=0, xbf16=0, flat=0`，但尚未实机复测是否命中和性能收益。
 - 下一步恢复后：先以 `max_tok_per_rank=128` 运行 BS16/128，检查日志明确显示指定
   kernelName 且无 `heuristic fallback`；精度通过后再跑 100 次末 20 次性能对比。
+
+### Tune 验证结果
+
+直接复用 GLM5 的 `flydsl_mxmoe_g1_*` stage1 不支持 `expert_mask`，不能用于本
+EP16 路径。当前 token=2048 行改为已验证支持 EP 的
+`flydsl_moe1_afp4_wfp4_bf16_t64x128x256_w3_bnt0`，并保留 tuned
+`flydsl_moe2_layout_afp4_wfp4_bf16_t64x256x128_atomic_persist_sbm64`。
+
+该组合已确认命中且精度通过（BS16 relL2=0.069867，BS128 relL2=0.069787）。
+100 次取末 20 次时，BS128 的 MoE 从 313.0 us 降到 258.7 us；但由于同一个
+`max_tok_per_rank=128` 实例始终使用 token=2048 配置，小 batch 的 MoE 反而变慢。
+后续应让配置选择依据本轮有效接收规模，而不是固定接收 buffer 容量。

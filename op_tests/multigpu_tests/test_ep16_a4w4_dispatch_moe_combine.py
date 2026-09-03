@@ -328,7 +328,9 @@ def _run_one_bs(
     combine_out, combine_out_wts = backend.combine(moe_out, dispatched)
     torch.cuda.synchronize()
     diagnostic_out = combine_out[:bs]
-    torch.testing.assert_close(out, diagnostic_out, rtol=0, atol=0)
+    # GEMM2 uses atomic accumulation, so two otherwise identical launches are
+    # not bitwise deterministic. Keep this as a tight BF16 consistency check.
+    torch.testing.assert_close(out, diagnostic_out, rtol=1e-2, atol=1.25e-1)
 
     # ---- correctness (only below accuracy_max_bs, all-gather ref is O(bs*world)) ----
     rel_l2 = -1.0
