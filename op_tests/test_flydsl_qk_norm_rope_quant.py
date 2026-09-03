@@ -17,6 +17,9 @@ Usage:
     python op_tests/test_flydsl_qk_norm_rope_quant.py
     python op_tests/test_flydsl_qk_norm_rope_quant.py -T 64 256 1024 -q fp8_1x128_e8m0
     python op_tests/test_flydsl_qk_norm_rope_quant.py --no-quant   # bf16 only
+    python op_tests/test_flydsl_qk_norm_rope_quant.py --init zero
+    python op_tests/test_flydsl_qk_norm_rope_quant.py --init constant --init-val 0.5
+    python op_tests/test_flydsl_qk_norm_rope_quant.py --seed 42 --init uniform --init-scale 0.2
 """
 
 import argparse
@@ -44,6 +47,21 @@ _EPS = 1e-6
 _SQRT2 = math.sqrt(2.0)
 _FP8_DTYPE = dtypes.fp8
 _FP8_MAX = float(torch.finfo(_FP8_DTYPE).max)
+
+# Data-initialisation modes
+_INIT_MODES = ("normal", "uniform", "zero", "constant")
+
+
+def _make_data(shape, *, dtype, device, mode="normal", scale=0.1, val=1.0):
+    """Create a data tensor in the requested initialisation mode."""
+    if mode == "zero":
+        return torch.zeros(shape, dtype=dtype, device=device)
+    if mode == "constant":
+        return torch.full(shape, val, dtype=dtype, device=device)
+    if mode == "uniform":
+        t = torch.empty(shape, dtype=torch.float32, device=device).uniform_(-1, 1)
+        return (t * scale).to(dtype)
+    return torch.randn(shape, dtype=dtype, device=device) * scale
 
 
 # ============================================================================
@@ -219,8 +237,12 @@ def test_flydsl_qk_norm_rope_quant(
     scale_dtype,
     q_weighted,
     quant,
+    seed=0,
+    init_mode="normal",
+    init_scale=0.1,
+    init_val=1.0,
 ):
-    torch.manual_seed(0)
+    torch.manual_seed(seed)
     device = torch.device("cuda")
 
     # Build cos/sin via a YaRN-style table covering all positions in T.
@@ -231,10 +253,17 @@ def test_flydsl_qk_norm_rope_quant(
     cos = freqs.cos().to(torch.bfloat16).contiguous()
     sin = freqs.sin().to(torch.bfloat16).contiguous()
 
-    q = torch.randn(T, H * D, dtype=torch.bfloat16, device=device) * 0.1
+    _ikw = {
+        "dtype": torch.bfloat16,
+        "device": device,
+        "mode": init_mode,
+        "scale": init_scale,
+        "val": init_val,
+    }
+    q = _make_data((T, H * D), **_ikw)
     # Mimic V4 KV split: kv = strided view into a wider tensor
     Q_LORA = 1536
-    qkv_a = torch.randn(T, Q_LORA + D, dtype=torch.bfloat16, device=device) * 0.1
+    qkv_a = _make_data((T, Q_LORA + D), **_ikw)
     _, kv = torch.split(qkv_a, [Q_LORA, D], dim=-1)
     kv_w = torch.randn(D, dtype=torch.bfloat16, device=device).abs() + 0.5
     q_w = (
@@ -525,8 +554,10 @@ def _build_swa_case(T, mode, *, device):
 
 
 @benchmark()
-def test_flydsl_swa_write(T, H, D, RD, mode):
-    torch.manual_seed(0)
+def test_flydsl_swa_write(
+    T, H, D, RD, mode, *, seed=0, init_mode="normal", init_scale=0.1, init_val=1.0
+):
+    torch.manual_seed(seed)
     device = torch.device("cuda")
 
     bid, pos, index_t, num_rows, dest = _build_swa_case(T, mode, device=device)
@@ -538,11 +569,18 @@ def test_flydsl_swa_write(T, H, D, RD, mode):
     cos = freqs.cos().to(torch.bfloat16).contiguous()
     sin = freqs.sin().to(torch.bfloat16).contiguous()
 
-    q = torch.randn(T, H * D, dtype=torch.bfloat16, device=device) * 0.1
+    _ikw = {
+        "dtype": torch.bfloat16,
+        "device": device,
+        "mode": init_mode,
+        "scale": init_scale,
+        "val": init_val,
+    }
+    q = _make_data((T, H * D), **_ikw)
     # Mimic the V4 KV split: kv is a strided view into a wider tensor, exactly
     # as the model hands it over.
     Q_LORA = 1536
-    qkv_a = torch.randn(T, Q_LORA + D, dtype=torch.bfloat16, device=device) * 0.1
+    qkv_a = _make_data((T, Q_LORA + D), **_ikw)
     _, kv = torch.split(qkv_a, [Q_LORA, D], dim=-1)
     kv_w = torch.randn(D, dtype=torch.bfloat16, device=device).abs() + 0.5
 
@@ -742,6 +780,31 @@ def main():
         action="store_true",
         help="bf16 only (ignore -q).",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="random seed for data initialisation (default: 0).",
+    )
+    parser.add_argument(
+        "--init",
+        type=str,
+        choices=list(_INIT_MODES),
+        default="normal",
+        help="data initialisation mode: normal, uniform, zero, constant (default: normal).",
+    )
+    parser.add_argument(
+        "--init-scale",
+        type=float,
+        default=0.1,
+        help="multiplicative scale for normal/uniform data (default: 0.1).",
+    )
+    parser.add_argument(
+        "--init-val",
+        type=float,
+        default=1.0,
+        help="fill value for constant mode (default: 1.0).",
+    )
     args = parser.parse_args()
 
     # Smoke-test the advertised 4D cos/sin layout once before sweeping.
@@ -749,6 +812,12 @@ def main():
 
     quant_keys = ["bf16"] if args.no_quant else args.quant
     qweight_modes = [False, True] if args.qweight else [False]
+    init_kw = {
+        "seed": args.seed,
+        "init_mode": args.init,
+        "init_scale": args.init_scale,
+        "init_val": args.init_val,
+    }
 
     rows = []
     for key, qw_mode, H, D, T in itertools.product(
@@ -765,6 +834,7 @@ def main():
                 scale_dtype=scale_dtype,
                 q_weighted=qw_mode,
                 quant=quant,
+                **init_kw,
             )
         )
     aiter.logger.info(
@@ -784,7 +854,7 @@ def main():
         # reserved for the out-of-window sentinel).
         [t for t in args.T if 8 <= t <= 96] or [16, 64],
     ):
-        swa_rows.append(test_flydsl_swa_write(T, H, D, args.RD, mode))
+        swa_rows.append(test_flydsl_swa_write(T, H, D, args.RD, mode, **init_kw))
     aiter.logger.info(
         "flydsl_qk_norm_rope_quant fused SWA write summary (markdown):\n%s",
         pd.DataFrame(swa_rows).to_markdown(index=False),
