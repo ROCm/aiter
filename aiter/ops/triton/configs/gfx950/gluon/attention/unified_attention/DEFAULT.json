@@ -3,8 +3,7 @@
     "attn_2d": [
       "D",
       "SW",
-      "DT",
-      "BS"
+      "DT"
     ],
     "attn_3d": [
       "D",
@@ -52,15 +51,6 @@
       "waves_per_eu": 2,
       "TILE_SIZE_MIN": 64,
       "TILE_SIZE_MAX": 64
-    },
-    "D_GEQ_256.BS_GEQ_32": {
-      "BLOCK_M": 64,
-      "num_warps": 2,
-      "MFMA_DIM": 32,
-      "NUM_BUFFERS": 2,
-      "waves_per_eu": 1,
-      "TILE_SIZE_MIN": 32,
-      "TILE_SIZE_MAX": 32
     },
     "D_GEQ_256": {
       "BLOCK_M": 128,
