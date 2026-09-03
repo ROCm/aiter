@@ -9,6 +9,7 @@ import csv
 import functools
 
 import torch
+from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.runtime.device import get_rocm_arch
 
 from aiter.jit.core import AITER_CONFIGS
@@ -78,11 +79,16 @@ def _tuned_config(
                 d_str, sd_str = obj["dtype"], obj["state_dtype"]
                 var = obj.get("variant") or GDR_VARIANT_DECODE
                 if float(obj["duration"]) < 10000.0:
-                    _dict[(d_str, sd_str, arch, var, b, sq, nkh, nvh, khd, vhd)] = {
+                    row = {
                         "NUM_BLOCKS_PER_V_DIM": int(obj["NUM_BLOCKS_PER_V_DIM"]),
                         "NUM_WARPS": int(obj["NUM_WARPS"]),
                         "WARP_THREADS_K": int(obj["WARP_THREADS_K"]),
                     }
+                    # Optional trailing column, so rows written before it stay
+                    # readable. Zero leaves the choice to the compiler.
+                    if obj.get("waves_per_eu"):
+                        row["WAVES_PER_EU"] = int(obj["waves_per_eu"])
+                    _dict[(d_str, sd_str, arch, var, b, sq, nkh, nvh, khd, vhd)] = row
         GDR_GLOBAL_CONFIG_MAP = _dict
     return GDR_GLOBAL_CONFIG_MAP.get(
         (
@@ -127,6 +133,8 @@ def get_default_kwargs(
     )
     if config:
         d.update(config)
+    # The decode builder takes tiling keys only; WAVES_PER_EU is the MTP path's.
+    d.pop("WAVES_PER_EU", None)
     return d
 
 
@@ -616,51 +624,60 @@ def _mtp_launch(
     inter_strides = tuple(inter_buffer.stride()) if inter_buffer is not None else ()
     parent_strides = tuple(parent_tokens.stride()) if parent_tokens is not None else ()
 
-    exe = create_vk_gdr_mtp_kernel(
-        get_dtype_str(query.dtype),
-        get_dtype_str(A_log.dtype),
-        get_dtype_str(state.dtype),
-        get_dtype_str(inter_buffer.dtype) if inter_buffer is not None else "f32",
-        seq_length,
-        num_k_heads,
-        num_v_heads,
-        head_k_dim,
-        head_v_dim,
-        query.stride(),
-        key.stride(),
-        value.stride(),
-        state.stride(),
-        a.stride(),
-        b.stride(),
-        tuple(state_indices.stride()) + ((1,) if state_indices.dim() == 1 else ()),
-        inter_strides,
-        parent_strides,
-        use_qk_l2norm,
-        mode,
-        has_tree,
-        disable_state_update,
-        **kwargs_,
-    )
-    with torch.cuda.device(query.device.index):
-        _run_compiled(
-            exe,
-            query,
-            key,
-            value,
-            a,
-            b,
-            dt_bias.contiguous(),
-            A_log.contiguous(),
-            state_indices,
-            num_accepted if num_accepted is not None else filler,
-            inter_indices if inter_indices is not None else filler,
-            parent_tokens if parent_tokens is not None else filler,
-            state,
-            inter_buffer if inter_buffer is not None else state,
-            out,
-            batch_size,
-            stream,
+    # Measured per shape, so it rides in with the tuned tiling rather than
+    # being derived here.
+    waves_per_eu = kwargs_.get("WAVES_PER_EU", 0)
+    build_hints = {"waves_per_eu": waves_per_eu} if waves_per_eu else {}
+
+    with CompilationContext.compile_hints(build_hints):
+        exe = create_vk_gdr_mtp_kernel(
+            get_dtype_str(query.dtype),
+            get_dtype_str(A_log.dtype),
+            get_dtype_str(state.dtype),
+            get_dtype_str(inter_buffer.dtype) if inter_buffer is not None else "f32",
+            seq_length,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            query.stride(),
+            key.stride(),
+            value.stride(),
+            state.stride(),
+            a.stride(),
+            b.stride(),
+            tuple(state_indices.stride()) + ((1,) if state_indices.dim() == 1 else ()),
+            inter_strides,
+            parent_strides,
+            use_qk_l2norm,
+            mode,
+            has_tree,
+            disable_state_update,
+            **kwargs_,
         )
+
+        # The jit compiles on first call, not on build, so the hint has to still
+        # be in scope here.
+        with torch.cuda.device(query.device.index):
+            _run_compiled(
+                exe,
+                query,
+                key,
+                value,
+                a,
+                b,
+                dt_bias.contiguous(),
+                A_log.contiguous(),
+                state_indices,
+                num_accepted if num_accepted is not None else filler,
+                inter_indices if inter_indices is not None else filler,
+                parent_tokens if parent_tokens is not None else filler,
+                state,
+                inter_buffer if inter_buffer is not None else state,
+                out,
+                batch_size,
+                stream,
+            )
 
 
 def flydsl_gdr_mtp(

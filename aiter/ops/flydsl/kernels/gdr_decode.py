@@ -599,6 +599,8 @@ def create_vk_gdr_mtp_kernel(
     NUM_BLOCKS_PER_V_DIM: int = 1,
     NUM_WARPS: int = 4,
     WARP_THREADS_K: int = 8,
+    # Unused here; a parameter so it joins the cache key.
+    WAVES_PER_EU: int = 0,
 ):
     """Gated delta rule over a speculative draft window.
 
