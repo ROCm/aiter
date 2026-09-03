@@ -18,6 +18,8 @@ from .tensor_shim import (
     get_dtype_in_kernel,
 )
 
+_LOG2E = 1.4426950408889634
+
 
 def _gview(tensor, base, shape, stride):
     it = fx.get_iter(fx.rocdl.make_buffer_tensor(tensor, max_size=True))
@@ -37,6 +39,22 @@ def _store_vec(atom, tile, value, width, numeric):
     frag = fx.make_rmem_tensor(width, numeric)
     frag.store(fx.Vector.from_elements([value], dtype=numeric) if width == 1 else value)
     fx.copy(atom, frag, tile)
+
+
+def _fast_exp(x):
+    return rocdl.exp2(T.f32, _to_raw(fx.Float32(x) * _LOG2E))
+
+
+def _fast_log1p(x):
+    return fx.math.log1p(x, fastmath=fx.FastMathFlags.fast)
+
+
+def _fast_rsqrt(x):
+    return rocdl.rsq(T.f32, _to_raw(fx.Float32(x)))
+
+
+def _fast_rcp(x):
+    return rocdl.rcp(T.f32, _to_raw(fx.Float32(x)))
 
 
 @functools.lru_cache(maxsize=1024)
@@ -251,15 +269,6 @@ def create_vk_gdr_decode_kernel(
             state_stride,
         )
 
-        def fast_exp(x, use_exp2=True):
-            if const_expr(use_exp2):
-                log2e = 1.4426950408889634
-                return rocdl.exp2(T.f32, _to_raw(fx.Float32(x) * log2e))
-            return fx.math.exp(x, fastmath=fx.FastMathFlags.fast)
-
-        def fast_log1p(x):
-            return fx.math.log1p(x, fastmath=fx.FastMathFlags.fast)
-
         # Skip CG-pad slots (indices sentinel < 0). The guarded body is a
         # closure so the runtime `if` sees an opaque call and lowers to scf.if.
         def _do_decode():
@@ -315,14 +324,14 @@ def create_vk_gdr_decode_kernel(
                 # softplus with the large-x identity: for beta_x > threshold,
                 # softplus(x) == x. select computes both arms (the overflow arm
                 # is discarded) -> bit-identical to the old branch.
-                softplus_big = (f32_1 / softplus_beta_) * fast_log1p(fast_exp(beta_x))
+                softplus_big = (f32_1 / softplus_beta_) * _fast_log1p(_fast_exp(beta_x))
                 softplus_x = (
                     fx.Float32(beta_x) <= fx.Float32(softplus_threshold_)
                 ).select(softplus_big, x)
 
-                r_g_value = -fast_exp(r_A_log) * softplus_x
-                r_beta = f32_1 / (f32_1 + fast_exp(-r_b))
-                r_g = fast_exp(r_g_value)
+                r_g_value = -_fast_exp(r_A_log) * softplus_x
+                r_beta = f32_1 / (f32_1 + _fast_exp(-r_b))
+                r_g = _fast_exp(r_g_value)
 
                 r_g_vec = fx.Vector.filled(
                     VALUES_PER_THREAD_K, fx.Float32(r_g), fx.Float32
@@ -860,31 +869,6 @@ def create_vk_gdr_mtp_kernel(
                 * INTER_BYTES,
             )
 
-        def fast_exp(x, use_exp2=True):
-            if const_expr(use_exp2):
-                log2e = 1.4426950408889634
-                return rocdl.exp2(T.f32, _to_raw(fx.Float32(x) * log2e))
-            return fx.math.exp(x, fastmath=fx.FastMathFlags.fast)
-
-        def fast_log1p(x):
-            return fx.math.log1p(x, fastmath=fx.FastMathFlags.fast)
-
-        def fast_rsqrt(x):
-            """Hardware reciprocal square root, good to about one ULP.
-
-            That is well inside a body which already takes exp as exp2 and
-            log1p under fast math, and far inside a bf16 output.
-            """
-            return rocdl.rsq(T.f32, _to_raw(fx.Float32(x)))
-
-        def fast_rcp(x):
-            """Hardware reciprocal, at the accuracy of `fast_rsqrt`.
-
-            The sigmoid gate's denominator is itself an exp2, so a correctly
-            rounded divide on top of it is finer than the input supports.
-            """
-            return rocdl.rcp(T.f32, _to_raw(fx.Float32(x)))
-
         # The inputs that do not depend on the rollback slot are issued ahead of
         # the dead-slot test, so their latency runs under the lookup's:
         # `read_slot` is two dependent round trips deep -- `num_accepted[b_i]`
@@ -1010,12 +994,12 @@ def create_vk_gdr_mtp_kernel(
                 # softplus with the large-x identity: for beta_x > threshold,
                 # softplus(x) == x. Both arms are computed and the overflowing
                 # one discarded.
-                softplus_big = inv_softplus_beta_ * fast_log1p(fast_exp(beta_x))
+                softplus_big = inv_softplus_beta_ * _fast_log1p(_fast_exp(beta_x))
                 softplus_x = (beta_x <= softplus_threshold_).select(softplus_big, x)
 
-                r_g_value = -fast_exp(r_A_log) * softplus_x
-                r_beta = fast_rcp(f32_1 + fast_exp(-r_b))
-                r_g = fast_exp(r_g_value)
+                r_g_value = -_fast_exp(r_A_log) * softplus_x
+                r_beta = _fast_rcp(f32_1 + _fast_exp(-r_b))
+                r_g = _fast_exp(r_g_value)
 
                 r_g_vec = fx.Vector.filled(
                     VALUES_PER_THREAD_K, fx.Float32(r_g), fx.Float32
@@ -1080,8 +1064,8 @@ def create_vk_gdr_mtp_kernel(
                     lane0 = w_tid // WARP_THREADS_K * WARP_THREADS_K
                     local_sum_q = fx.shuffle_idx(sum_q_partial, lane0, WARP_SIZE)
                     local_sum_k = fx.shuffle_idx(sum_k_partial, lane0, WARP_SIZE)
-                    inv_norm_q = fast_rsqrt(local_sum_q + 1e-6)
-                    inv_norm_k = fast_rsqrt(local_sum_k + 1e-6)
+                    inv_norm_q = _fast_rsqrt(local_sum_q + 1e-6)
+                    inv_norm_k = _fast_rsqrt(local_sum_k + 1e-6)
                     inv_norm_q_vec = fx.Vector.filled(
                         VALUES_PER_THREAD_K, fx.Float32(inv_norm_q), fx.Float32
                     )
