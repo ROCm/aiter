@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Kernel comparison benchmark for aiter's all-reduce implementations.
@@ -38,8 +40,10 @@ production path (``prod collective``, ``prod time (us)``). The floor defaults
 to ``DEFAULT_MIN_SQNR`` and exists so a codec that is fast only because it
 barely transmits anything cannot win the column; ``--min-sqnr`` moves it, and
 ``fastest collective SQNR dB`` prints what the winning choice actually cost.
-The per-candidate latency and accuracy tables below it are the full picture
-the summary collapses -- a candidate below the floor still appears there.
+The ``latency & accuracy by case`` tables below it are the full picture the
+summary collapses: one small table per shape, one row per candidate, latency
+(``us``, speedup vs the baseline) and accuracy (``SQNR dB``) side by side --
+a candidate below the floor still appears there.
 
 Because the candidates are **not accuracy-equivalent**, every one is graded on
 SQNR against a common fp32 reference and asserted against its own floor in
@@ -47,8 +51,8 @@ SQNR against a common fp32 reference and asserted against its own floor in
 the candidate is in. The exact kernels land at the bf16 rounding floor (~55 dB;
 RCCL a little lower since it reduces in bf16 rather than accumulating in fp32),
 the quantized ones at their codec's floor. Speed alone is a misleading read for
-everything in the "exact = no" rows above -- the table prints ``us`` and
-``SQNR dB`` as two aligned tables for exactly that reason.
+everything in the "exact = no" rows above -- each case's table prints ``us``
+next to ``SQNR dB`` for exactly that reason.
 
 ``busbw`` (``--busbw``) is always computed on the payload dtype, including for
 the quantizing candidates whose wire format is several times smaller: the
@@ -989,11 +993,20 @@ def _row(tp_size, tokens, hidden, dtype, rank_rets):
         row[f"{cand.key} us"] = us
         row[f"{cand.key} busbw GB/s"] = busbw
         row[f"{cand.key} SQNR dB"] = min(r[f"{cand.key}_sqnr"] for r in rank_rets)
-        if cand.key == PRIMARY:
-            # Rank spread is the skew indicator, and skew is a property of the
-            # barrier rather than of any one candidate -- reporting it once for
-            # the kernel under study keeps the table readable.
-            row[f"{PRIMARY} spread us"] = us - min(per_rank)
+        # Rank spread, per candidate. Reported for every row rather than only
+        # for PRIMARY: skew is mostly a property of the barrier, but not
+        # entirely, and a candidate that compiles a *different kernel per rank*
+        # -- the ring bakes rank into its cache key where two-shot passes it as
+        # a runtime argument -- can in principle land one rank with worse code
+        # than the others. That shows up here and nowhere else in the report.
+        #
+        # Read it knowing what it cannot see: these collectives are
+        # barrier-synchronised, so a slow rank stalls its peers in the
+        # handshake and they all retire together. A near-zero spread therefore
+        # means "no skew *outside* the collective", not "every rank did equal
+        # work". A large spread is still worth chasing; a small one does not
+        # by itself acquit a straggler.
+        row[f"{cand.key} spread us"] = us - min(per_rank)
     return row
 
 
@@ -1095,23 +1108,28 @@ def _mark_na(out, cols):
             out[col] = out[col].astype(object).where(out[col].notna(), None)
 
 
-def latency_table(df, baseline: str, keys):
-    """``us`` per candidate plus a speedup column against *baseline*.
+def case_tables(df, keys, baseline: str):
+    """One latency/accuracy table per case (shape x TP x dtype), candidates as rows.
+
+    The predecessor of this function, ``latency_table``, stacked every case
+    into one wide table with a column per candidate, and accuracy sat in a
+    second wide table of its own keyed the same way. With the full candidate
+    set that grid is wider than a screen, so comparing implementations at one
+    shape meant scanning across a giant row in one table, then finding the
+    matching row in another. This stacks the other way: one small table per
+    case -- its title carries the identity (TP, dtype, M, payload size,
+    predicted kernel, prod path) that used to be repeated as leading columns
+    on every row -- with one row per candidate that actually ran here, latency
+    and SQNR side by side, so comparing implementations is reading down a
+    short column instead.
 
     Ratio is ``baseline_us / candidate_us``, so **> 1.0 means the candidate is
-    faster than the baseline**. The baseline gets no column of its own (it would
-    be 1.0 everywhere). The baseline name is in the column header so a saved
-    report stays self-describing when the flag changes.
-
-    Speed is only half the comparison -- the quantizing candidates buy their
-    ratio with tens of dB of SQNR. Read this table next to the accuracy one.
+    faster than the baseline**; the baseline's own row reads 1.0. A candidate
+    not applicable to a given case (see ``applicable()``) is simply absent as
+    a row rather than an ``n/a`` cell -- a wide table needs the placeholder to
+    keep its grid rectangular, a stacked one does not.
     """
-    cols = [c for c in ID_COLUMNS if c in df] + [
-        f"{k} us" for k in keys if f"{k} us" in df
-    ]
-    if f"{PRIMARY} spread us" in df:
-        cols.append(f"{PRIMARY} spread us")
-    out = df[cols].copy()
+    live = [k for k in keys if f"{k} us" in df.columns]
     base_col = f"{baseline} us"
     if base_col not in df.columns:
         logger.warning(
@@ -1119,15 +1137,44 @@ def latency_table(df, baseline: str, keys):
             "this sweep); skipping speedup columns",
             baseline,
         )
-        _mark_na(out, [f"{k} us" for k in keys])
-        return out
-    for k in keys:
-        col = f"{k} us"
-        if k == baseline or col not in df.columns:
-            continue
-        out[f"{k} vs {baseline}"] = df[base_col] / df[col]
-    _mark_na(out, [f"{k} us" for k in keys] + [f"{k} vs {baseline}" for k in keys])
-    return out
+
+    tables = []
+    for _, r in df.iterrows():
+        bits = [
+            f"TP{int(r['TP'])}",
+            r["dtype"],
+            f"M={int(r['M'])}",
+            f"{r['payload size (KiB)']:.4g} KiB",
+            f"kernel={r['kernel']}",
+        ]
+        if r["naive"] != r["kernel"]:
+            bits.append(f"naive={r['naive']}")
+        bits.append(f"prod={r['prod path']}")
+        title = ", ".join(bits)
+
+        base_us = r.get(base_col)
+        base_us = base_us if pd.notna(base_us) else None
+
+        rows = []
+        for k in live:
+            us = r.get(f"{k} us")
+            if us is None or not pd.notna(us):
+                continue
+            row = {"candidate": k, "us": us}
+            if base_us is not None:
+                row[f"vs {baseline}"] = base_us / us
+            row["SQNR dB"] = r.get(f"{k} SQNR dB", float("nan"))
+            row["busbw GB/s"] = r.get(f"{k} busbw GB/s", float("nan"))
+            spread = r.get(f"{k} spread us")
+            if spread is not None and pd.notna(spread):
+                row["spread us"] = spread
+            rows.append(row)
+        if not rows:
+            rows = [{"candidate": "-", "us": float("nan")}]
+        cdf = pd.DataFrame(rows)
+        _mark_na(cdf, ["spread us"])
+        tables.append((title, cdf))
+    return tables
 
 
 def metric_table(df, suffix: str, keys):
@@ -1232,14 +1279,15 @@ def summary_table(df, keys, min_sqnr: float = DEFAULT_MIN_SQNR, roofline=None):
       sweep is already exact, since it would just repeat ``fastest
       collective``.
 
-    A candidate excluded by the floor is not hidden: it keeps its column in the
-    latency table, and the count of rows where the floor changed the winner is
-    logged, so the default can never silently bury a result.
+    A candidate excluded by the floor is not hidden: it keeps its row in that
+    shape's ``latency & accuracy by case`` table, and the count of rows where
+    the floor changed the winner is logged, so the default can never silently
+    bury a result.
 
     Both ratios are ``prod time (us) / fastest time (us)``, so **> 1.0 means
-    faster than production**, matching ``latency_table``. A row whose winner
-    *is* the production path reads 1.0, which is the useful answer that
-    nothing beat it.
+    faster than production**, matching ``case_tables``'s ``vs <baseline>``
+    convention. A row whose winner *is* the production path reads 1.0, which
+    is the useful answer that nothing beat it.
 
     *roofline*, when given the ``measured`` lookup from ``measure_roofline``,
     adds a ``prod eff`` / ``fastest eff`` / ``fastest exact eff`` column next
@@ -1330,7 +1378,7 @@ def summary_table(df, keys, min_sqnr: float = DEFAULT_MIN_SQNR, roofline=None):
     for k, n in sorted(gated.items(), key=lambda kv: -kv[1]):
         logger.info(
             "summary: %s was fastest on %d/%d row(s) but is below the "
-            "%g dB floor; see the latency table for its timings",
+            "%g dB floor; see the latency & accuracy by case tables for its timings",
             k,
             n,
             len(df),
@@ -1493,14 +1541,14 @@ def _write_report(
     lines += [
         f"- command: {' '.join(sys.argv)}",
         "",
-        "Candidates are not accuracy-equivalent --",
-        "read the latency table alongside the SQNR one, never alone.",
+        "Candidates are not accuracy-equivalent -- each `latency & accuracy by",
+        "case` table below prints `us` next to `SQNR dB` for exactly that reason.",
         "The summary table's `fastest collective` column is the fastest candidate",
         "clearing the accuracy floor above, with `fastest collective SQNR dB`",
         "beside it showing what that choice costs; `fastest exact collective` is",
         "the fastest option that leaves the model's numerics untouched.",
         "Candidates below the floor are excluded from `fastest collective` only --",
-        "their timings are still in the latency table.",
+        "their timings are still in the per-case tables.",
         "",
     ]
     if roofline_cus is not None:
@@ -1592,7 +1640,7 @@ def main():
         "which admits int4 (~18 dB) and excludes int3 (~12 dB, ~25%% relative\n"
         "error). Raise it to ask a deployment question ('fastest thing above\n"
         "25 dB'); pass 0 to rank on speed alone. Excluded candidates keep\n"
-        "their columns in the latency and accuracy tables either way.",
+        "their rows in the latency & accuracy by case tables either way.",
     )
     parser.add_argument(
         "--roofline",
@@ -1711,9 +1759,22 @@ def main():
                 f"{dtype_name} summary",
                 summary_table(df, keys, args.min_sqnr, measured),
             ),
-            (f"{dtype_name} latency", latency_table(df, args.baseline, keys)),
-            (f"{dtype_name} accuracy", metric_table(df, "SQNR dB", keys)),
         ]
+        for title, table in tables:
+            md = table.to_markdown(index=False, floatfmt=".4g", missingval="n/a")
+            logger.info("all-reduce %s (markdown):\n%s", title, md)
+            sections.append((title, md))
+
+        case_title = f"{dtype_name} latency & accuracy by case"
+        case_md = "\n\n".join(
+            f"### {title}\n\n"
+            + cdf.to_markdown(index=False, floatfmt=".4g", missingval="n/a")
+            for title, cdf in case_tables(df, keys, args.baseline)
+        )
+        logger.info("all-reduce %s (markdown):\n%s", case_title, case_md)
+        sections.append((case_title, case_md))
+
+        tables = []
         if args.busbw:
             tables.append((f"{dtype_name} busbw", metric_table(df, "busbw GB/s", keys)))
         if measured is not None:
