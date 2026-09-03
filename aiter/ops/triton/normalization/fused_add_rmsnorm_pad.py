@@ -1,6 +1,9 @@
 import torch
 import triton
 
+from aiter.ops.triton._gluon_kernels.gfx1250.norm.fused_add_rmsnorm_pad import (
+    _gluon_fused_add_rmsnorm_pad_kernel,
+)
 from aiter.ops.triton._triton_kernels.normalization.fused_add_rmsnorm_pad import (
     _fused_add_rmsnorm_pad,
 )
@@ -16,7 +19,6 @@ def fused_add_rmsnorm_pad(
     epsilon: float,
     res: torch.Tensor = None,
     x_pad_to_multiple: int = 0,
-    kernel_type: str = "tdm",
     backend: str | None = None,
 ):
     M, N = x.shape
@@ -32,18 +34,6 @@ def fused_add_rmsnorm_pad(
 
     if backend == "gluon":
         if get_arch() == "gfx1250":
-            from aiter.ops.triton._gluon_kernels.gfx1250.norm.fused_add_rmsnorm_pad import (
-                _KERNEL_MAP,
-            )
-
-            assert (
-                kernel_type in _KERNEL_MAP
-            ), f"Unknown kernel_type '{kernel_type}', must be one of {list(_KERNEL_MAP.keys())}"
-
-            _LOGGER.info(
-                f"FUSED_ADD_RMSNORM_PAD [gluon/gfx1250]: x={tuple(x.shape)} weight={tuple(weight.shape)} "
-                f"kernel={kernel_type}"
-            )
 
             if x_pad_to_multiple > 0:
                 N_out = triton.cdiv(N, x_pad_to_multiple) * x_pad_to_multiple
@@ -58,9 +48,9 @@ def fused_add_rmsnorm_pad(
                 assert N == N2, "Shape error!"
                 res_out = torch.empty((M, N), dtype=res.dtype, device=res.device)
             BLOCK_SIZE_N = triton.next_power_of_2(N_out)
-            NUM_WARPS = 8
+            NUM_WARPS = min(8, max(1, BLOCK_SIZE_N // 32))
 
-            _KERNEL_MAP[kernel_type][(M,)](
+            _gluon_fused_add_rmsnorm_pad_kernel[(M,)](
                 x,
                 res,
                 out,

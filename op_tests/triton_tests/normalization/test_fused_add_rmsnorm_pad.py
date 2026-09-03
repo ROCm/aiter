@@ -38,12 +38,6 @@ def run_torch(x, weight, eps=1e-6, res=None, pad_to_multiple=0):
 @pytest.mark.parametrize("has_res", [False, True])
 @pytest.mark.parametrize("pad_to_multiple", [0, 256])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize(
-    "kernel_type",
-    [
-        "tdm",
-    ],
-)
 @pytest.mark.parametrize("backend", [None, "gluon", "triton"])
 def test_mul_add(
     M: int,
@@ -51,7 +45,6 @@ def test_mul_add(
     has_res: bool,
     pad_to_multiple: int,
     dtype,
-    kernel_type: str,
     backend: str,
 ):
 
@@ -63,13 +56,11 @@ def test_mul_add(
     if has_res:
         x_torch, res_torch = run_torch(x, weight, 1e-6, res, pad_to_multiple)
         x_triton, res_triton = fused_add_rmsnorm_pad(
-            x, weight, 1e-6, res, pad_to_multiple, kernel_type, backend
+            x, weight, 1e-6, res, pad_to_multiple, backend
         )
     else:
         x_torch = run_torch(x, weight, 1e-6, res, pad_to_multiple)
-        x_triton = fused_add_rmsnorm_pad(
-            x, weight, 1e-6, res, pad_to_multiple, kernel_type, backend
-        )
+        x_triton = fused_add_rmsnorm_pad(x, weight, 1e-6, res, pad_to_multiple, backend)
 
     torch.testing.assert_close(x_torch.to(dtype), x_triton)
     if has_res:
