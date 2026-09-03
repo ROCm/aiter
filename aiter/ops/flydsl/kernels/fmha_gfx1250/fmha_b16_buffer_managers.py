@@ -1066,12 +1066,24 @@ class QManager16bV2:
         ``stride_q_head`` are in ELEMENTS (host convention). Drain + read in ``load_q_to_vgpr_part2``.
         """
         gqa = self.gqa_ratio
-        n_seq = self.rows_per_warp // gqa
+        # A wave holds rows_per_warp contiguous packed rows (seq outer, head inner).
+        # When gqa <= rows_per_warp it spans n_seq=rows_per_warp/gqa whole head-groups
+        # starting at head 0; when gqa > rows_per_warp it holds a single seq's partial
+        # head-slice of n_head=rows_per_warp heads at offset packed_row0%gqa. Requires no
+        # seq-straddle within the wave (gqa | rows_per_warp or rows_per_warp | gqa).
+        assert (
+            gqa % self.rows_per_warp == 0 or self.rows_per_warp % gqa == 0
+        ), f"gqa_ratio={gqa} must divide or be a multiple of rows_per_warp={self.rows_per_warp}"
+        n_head = min(gqa, self.rows_per_warp)
+        n_seq = self.rows_per_warp // n_head
         packed_row0 = block_x * fx.Int32(self.block_m) + warp_idx * fx.Int32(
             self.rows_per_warp
         )
         seq0 = packed_row0 // fx.Int32(gqa)
-        head0 = kv_head * fx.Int32(gqa)
+        if gqa > self.rows_per_warp:
+            head0 = kv_head * fx.Int32(gqa) + packed_row0 % fx.Int32(gqa)
+        else:
+            head0 = kv_head * fx.Int32(gqa)
         rem = q_len - seq0
         n_seq_valid = fx.max(rem, fx.Int32(0))
 
@@ -1091,7 +1103,9 @@ class QManager16bV2:
         for c0, w in _pow2_segments(self.qk_hdim):
             gbase = fx.add_offset(base_iter, off + fx.Int64(c0))
             g_view = fx.Tensor(
-                fx.make_view(gbase, fx.make_layout((n_seq, gqa, w), (gqa * w, w, 1)))
+                fx.make_view(
+                    gbase, fx.make_layout((n_seq, n_head, w), (n_head * w, w, 1))
+                )
             )
             atom = fx.rocdl.make_tdm_atom(
                 g_view,
@@ -1106,7 +1120,7 @@ class QManager16bV2:
                 fx.make_view(
                     lds_iter,
                     fx.make_layout(
-                        (n_seq, gqa, w), (gqa * self.row_elems, self.row_elems, 1)
+                        (n_seq, n_head, w), (n_head * self.row_elems, self.row_elems, 1)
                     ),
                 )
             )
