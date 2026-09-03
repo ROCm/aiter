@@ -183,5 +183,5 @@ def _get_config(
     N: int,
     K: int,
 ):
-    config, is_tunned = get_gemm_config("GEMM-A16W16", M, N, K, backend="triton")
-    return compute_splitk_params(config, K), is_tunned
+    config, is_tuned = get_gemm_config("GEMM-A16W16", M, N, K, backend="triton")
+    return compute_splitk_params(config, K), is_tuned

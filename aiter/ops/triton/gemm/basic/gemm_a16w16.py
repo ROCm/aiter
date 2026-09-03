@@ -104,10 +104,7 @@ def gemm_a16w16_(
             results. Returns shape (NUM_KSPLIT, M, N) instead of (M, N).
         kernel_type (str): [gluon only] Kernel variant ("bandwidth_bound", "compute_bound").
         backend (Optional[str]): "triton", "gluon", or None (auto-detect).
-        persistent (bool): Use the persistent kernel, which launches one workgroup
-            per CU and walks a strided subset of the output tiles, instead of one
-            workgroup per tile. Reads the GEMM-A16W16-PERSISTENT config family and
-            does not support split-K (so it is incompatible with skip_reduce).
+        persistent (bool): Use the persistent kernel, NUM_SMS workgroups
 
     Returns:
         torch.Tensor: Output with shape (M, N) or (NUM_KSPLIT, M, N) if skip_reduce=True.
