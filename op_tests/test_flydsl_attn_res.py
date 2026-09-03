@@ -409,6 +409,7 @@ def benchmark_flydsl_attn_res(
     pad: int = 0,
     hidden_size: int = _D,
     rows_per_wg: int = 1,
+    rotate_inputs: bool = False,
 ):
     """Validate and measure one supported prefill flag specialization."""
     block_write_idx = num_blocks if write_block else -1
@@ -434,6 +435,8 @@ def benchmark_flydsl_attn_res(
         output_norm_weight,
         _,
     ) = _make_inputs(tokens, hidden_size=hidden_size, pad=pad)
+    # num_rotate_args=1 reuses one arg set (cache-resident, PR-table method).
+    # num_rotate_args=0 auto-rotates tensors for cold HBM (--rotate-inputs).
     _, us = run_perftest(
         flydsl_attn_res,
         prefix,
@@ -447,6 +450,7 @@ def benchmark_flydsl_attn_res(
         _EPS,
         _EPS,
         rows_per_wg,
+        num_rotate_args=0 if rotate_inputs else 1,
     )
 
     # k source reads, optional delta read + prefix write, optional snapshot
@@ -491,6 +495,11 @@ def main():
         default=[1, 4, 17, 320],
         help="Prefill token counts to test and benchmark",
     )
+    parser.add_argument(
+        "--rotate-inputs",
+        action="store_true",
+        help="Rotate tensor args so each timed iteration reads cold HBM",
+    )
     args = parser.parse_args()
     large_d_configs = (
         (_D, _MAX_BLOCKS, False, False, False, 0, 1),
@@ -522,6 +531,7 @@ def main():
             pad=pad,
             hidden_size=hidden_size,
             rows_per_wg=rows_per_wg,
+            rotate_inputs=args.rotate_inputs,
         )
         for (
             hidden_size,
