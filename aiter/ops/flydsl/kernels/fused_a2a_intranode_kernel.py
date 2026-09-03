@@ -21,7 +21,7 @@ from .communication_ops_utils import (
     store_i64_global_system,
 )
 
-_JIT_SCHEMA_VERSION = "v9-transport-only-qkv"
+_JIT_SCHEMA_VERSION = "v10-head-major-output"
 _PUSH_PIPELINE_DEPTH = 16
 _OUT_CHANNEL_COUNT = 8
 _OUT_CHANNEL_DEPTH = 1
@@ -462,10 +462,10 @@ def make_fused_a2a_out_kernel(
                 dest_chunk = group_idx * 64 + lane
                 valid = dest_chunk < peer_chunks
                 safe_dest_chunk = valid.select(dest_chunk, 0)
-                seq = safe_dest_chunk // (heads_local * chunks_per_row)
-                head_chunk = safe_dest_chunk % (heads_local * chunks_per_row)
-                local_head = head_chunk // chunks_per_row
-                row_chunk = head_chunk % chunks_per_row
+                local_head = safe_dest_chunk // (seq_local * chunks_per_row)
+                seq_chunk = safe_dest_chunk % (seq_local * chunks_per_row)
+                seq = seq_chunk // chunks_per_row
+                row_chunk = seq_chunk % chunks_per_row
                 src_row = local_head * seq_full + channel_id * seq_local + seq
                 src_offset = src_row * chunks_per_row * 4 + row_chunk * 4
                 values.append(
