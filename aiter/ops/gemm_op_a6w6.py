@@ -830,6 +830,7 @@ def _gemm_a6w6_asm(
     K: int,  # logical contraction dim
     kernelName: str | None = None,
     alpha: float = 1.0,
+    bias: Tensor | None = None,  # optional bias:[N] bf16, added in the store epilogue
 ) -> None: ...
 
 
@@ -842,6 +843,7 @@ def gemm_a6w6_asm(
     K: int,
     kernelName: str | None = None,
     alpha: float = 1.0,
+    bias: Tensor | None = None,
 ) -> Tensor:
     if float(alpha) != 1.0:
         raise ValueError("gemm_a6w6 currently supports only alpha=1.0.")
@@ -858,6 +860,7 @@ def gemm_a6w6_asm(
         int(K),
         kernelName,
         float(alpha),
+        bias,
     )
     return out
 
@@ -873,13 +876,19 @@ def gemm_a6w6(
     dtype: torch.dtype = dtypes.bf16,
     alpha: float = 1.0,
     kernelName: str | None = None,
+    bias: Tensor | None = None,
 ) -> Tensor:
-    """A6W6 (mxfp6 E2M3, per-1x32 blockscale) GEMM: D = A * B^T.
+    """A6W6 (mxfp6 E2M3, per-1x32 blockscale) GEMM: D = A * B^T (+ bias).
 
     A/B and their scales must be pre-packed with `quant_mxfp6_gemm`. M/N/K are
     the logical (unpadded) dims. Unless ``kernelName`` explicitly overrides it,
     a shape-tuned kernel is selected before the launch is padded. The result is
     sliced back to [M, N].
+
+    ``bias`` is an optional bf16 [N] vector added in the GEMM's store epilogue,
+    which costs nothing measurable and saves a separate pass over the output.
+    It needs no padding to match the padded N: the kernel bounds-checks it and
+    reads zeros on the padding columns, which are sliced away.
     """
     if dtype != dtypes.bf16:
         raise ValueError(
@@ -887,10 +896,14 @@ def gemm_a6w6(
         )
     if float(alpha) != 1.0:
         raise ValueError("gemm_a6w6 currently supports only alpha=1.0.")
+    if bias is not None and bias.numel() != N:
+        raise ValueError(
+            f"gemm_a6w6 bias must have length N={N}, got {bias.numel()}."
+        )
     selected_kernel = _select_gemm_a6w6_kernel(M, N, K, kernelName)
     padM, padN, padK = _ceil(M, _TILE), _ceil(N, _TILE), _ceil(K, _K_TILE)
     out = torch.empty((padM, padN), dtype=dtype, device=A.device)
-    gemm_a6w6_asm(A, B, A_scale, B_scale, out, padK, selected_kernel, alpha)
+    gemm_a6w6_asm(A, B, A_scale, B_scale, out, padK, selected_kernel, alpha, bias)
     if padM != M or padN != N:
         return out[:M, :N]
     return out

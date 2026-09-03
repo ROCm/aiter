@@ -21,8 +21,10 @@ constexpr char kDefaultKernelName[] = "f6gemm_dmabig_kernel_func";
 
 // KernelArgs layout is identical to the a4w4 asm gemm ABI; the mxfp6 dmabig
 // kernel was assembled against the same kernarg struct (0x180 bytes). Fields
-// the fp6 kernel does not consume (ptr_C, beta, A/B strides, k-split) are left
-// zeroed and ignored by the kernel.
+// the fp6 kernel does not consume (beta, A/B strides, k-split) are left
+// zeroed and ignored by the kernel. ptr_C and stride_C1 used to be two of
+// them and now carry the optional bias vector and its byte length, which is
+// why adding a bias epilogue needed no ABI change on either side.
 struct __attribute__((packed)) KernelArgs
 {
     void* ptr_D;
@@ -109,8 +111,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      int K,                   // padded contraction dim consumed by the packed layout
      const char* kernelName,
      float alpha,
+     aiter_tensor_t* bias,    // optional bias:[N] bf16, folded into the store epilogue
      hipStream_t stream),
-    (A, B, A_scale, B_scale, out, K, kernelName, alpha, stream))
+    (A, B, A_scale, B_scale, out, K, kernelName, alpha, bias, stream))
 {
     AITER_CHECK(out->dtype() == AITER_DTYPE_bf16, __func__, " only support BFloat16 output now!");
     AITER_CHECK(out->dim() == 2 && out->is_contiguous(),
@@ -150,10 +153,35 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                 __func__,
                 " packed scale buffer sizes must exactly match the launch dimensions");
 
+    // The bias rides in ptr_C and its byte length in stride_C1, both slots this ABI carries and
+    // the fp6 kernel used to ignore. The kernel bounds-checks against that length, so a length
+    // of zero is the unbiased path at no cost and one code object serves both. Nothing to select
+    // here, and nothing to pad: a bias shorter than a padded N reads zeros past its end.
+    //
+    // ptr_C as the bias pointer follows a4w4, which already does exactly that. The length goes
+    // in stride_C1 rather than stride_C0 because a4w4 sets stride_C0 to the output row stride,
+    // and one offset must not carry two readings across families that share this struct.
+    unsigned int bias_bytes = 0;
+    if(bias != nullptr)
+    {
+        AITER_CHECK(bias->dtype() == AITER_DTYPE_bf16,
+                    __func__,
+                    " bias must be BFloat16 to match the output");
+        AITER_CHECK(bias->dim() == 1 && bias->is_contiguous(),
+                    __func__,
+                    " bias must be a contiguous 1D tensor");
+        AITER_CHECK(bias->numel() <= Ndim, __func__, " bias length must not exceed N");
+        AITER_CHECK(bias->device_id == A->device_id,
+                    __func__,
+                    " bias must be on the same GPU as the operands");
+        bias_bytes = static_cast<unsigned int>(bias->numel() * 2);
+    }
+
     KernelArgs args{};
     size_t arg_size     = sizeof(args);
     args.ptr_D          = out->ptr;
-    args.ptr_C          = nullptr;
+    args.ptr_C          = bias != nullptr ? bias->ptr : nullptr;
+    args.stride_C1      = bias_bytes;
     args.ptr_A          = A->ptr;
     args.ptr_B          = B->ptr;
     args.alpha          = alpha;
