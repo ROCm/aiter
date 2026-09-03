@@ -393,14 +393,88 @@ def audit_ledger(rules_text, verdicts_text):
     return missing, thin
 
 
+def expand_rules(rules_text, rules_md):
+    """Full text of exactly the derived rules, each under its category heading.
+
+    The derivation cut which rules the reviewer is TOLD to check from 44 to a median
+    of 12, but every rule's text still shipped in SKILL.md and loaded on every review:
+    383 lines of rule bodies against a median need of 103. Telling a reader to ignore
+    73% of what is in front of them is not the same as not putting it there."""
+    want = set(expected_rules(rules_text))
+    lines = rules_md.split("\n")
+    starts = [(i, m.group(1)) for i, l in enumerate(lines)
+              if (m := re.match(r"\*\*([A-Z]+\d+[a-z]?) — ", l))]
+    heading, head_at = None, {}
+    for i, l in enumerate(lines):
+        if l.startswith("### "):
+            heading = l
+        head_at[i] = heading
+    # Housekeeping rules are documented as table rows, not `**HKn — **` blocks, and STEP4
+    # names Step 4 rather than a rule body. Treating either as a missing body reported 277
+    # of 600 PRs as drifted when nothing had drifted.
+    table_rows, table_head = {}, []
+    in_hk = False
+    for i, l in enumerate(lines):
+        if l.startswith("### Housekeeping"):
+            in_hk = True
+            continue
+        if in_hk and l.startswith("### "):
+            in_hk = False
+        if not in_hk:
+            continue
+        if l.startswith("|") and len(table_head) < 2:
+            table_head.append(l)
+        for rid in re.findall(r"\b(HK\d+)\b", l):
+            if l.startswith("|"):
+                table_rows.setdefault(rid, l)
+
+    out, emitted, last_head = [], [], None
+    for (i, rid), (j, _) in zip(starts, starts[1:] + [(len(lines), "")]):
+        if rid not in want:
+            continue
+        k = i
+        while k < j and not lines[k].startswith(("### ", "## ")):
+            k += 1
+        if head_at[i] and head_at[i] != last_head:
+            last_head = head_at[i]
+            out.append(head_at[i])
+            out.append("")
+        out.extend(lines[i:k])
+        emitted.append(rid)
+
+    hk = [r for r in sorted(want) if r in table_rows]
+    if hk:
+        out += ["", "### Housekeeping (quick scan)", ""] + table_head
+        out += [table_rows[r] for r in hk]
+        emitted += hk
+
+    unresolved = sorted(want - set(emitted) - {"STEP4"})
+    return "\n".join(out).rstrip() + "\n", emitted, unresolved
+
+
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
-    if mode not in ("rules", "evidence", "symbols", "ledger"):
+    if mode not in ("rules", "evidence", "symbols", "ledger", "expand"):
         print("usage: triage.py rules <diff> [title]\n"
               "       triage.py evidence <diff> <head-file>...\n"
               "       triage.py symbols <diff> <merge-target-root>\n"
-              "       triage.py ledger <rules.txt> <verdicts.txt> [diff]", file=sys.stderr)
+              "       triage.py ledger <rules.txt> <verdicts.txt> [diff]\n"
+              "       triage.py expand <rules.txt> <rules.md>", file=sys.stderr)
         raise SystemExit(2)
+
+    if mode == "expand":
+        rules_text = open(sys.argv[2], errors="replace").read()
+        rules_md = open(sys.argv[3], errors="replace").read()
+        text, emitted, missing = expand_rules(rules_text, rules_md)
+        sys.stdout.write(text)
+        if missing:
+            # A derived rule with no body is a rules.md that drifted from the deriver.
+            # Say so loudly: silently emitting 11 of 12 reads exactly like emitting 12.
+            print(f"\nMISSING-RULE-TEXT: {' '.join(missing)} derived but not found in "
+                  f"{sys.argv[3]}", file=sys.stderr)
+            raise SystemExit(1)
+        print(f"\n({len(emitted)} rule bodies)", file=sys.stderr)
+        raise SystemExit(0)
 
     if mode == "ledger":
         rules_text = open(sys.argv[2], errors="replace").read()

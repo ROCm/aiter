@@ -20,6 +20,16 @@ VALIDATOR = SKILL_DIR / "validate_pr.sh"
 SCANNER = SKILL_DIR / "scan_index_width.py"
 SHIPPED_PICKER = SKILL_DIR / "pick-idle-gpu.py"
 REPORT_SCHEMA = json.loads((SKILL_DIR / "report_schema.json").read_text())
+REVIEW_DIR = SKILL_DIR.parent / "review-pr"
+
+
+def review_skill_text():
+    """The review-pr skill's text: SKILL.md AND fetch.sh.
+
+    Step 1 moved out of the document into a program, so a contract test that reads only
+    SKILL.md now sees the prose and none of the implementation it is asserting about. The
+    seam between the two skills is the code, wherever it lives."""
+    return (REVIEW_DIR / "SKILL.md").read_text() + "\n" + (REVIEW_DIR / "fetch.sh").read_text()
 REQUIRED_STAGES = {
     "merge_sim",
     "gpu_claim",
@@ -1106,19 +1116,25 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertNotEqual("NEEDS_WORK", report["verdict"])
         self.assertNotEqual(1, result.returncode)
 
-    def run_review_gate(self, report, patch):
+    def run_review_gate(self, report, patch, head_override=None):
         """Feed a report through review-pr's real identity gate.
 
         The gate is the seam between the two skills, and it is the only place that can
         catch a report whose perf fields do not hang together. Extracting the block from
         SKILL.md rather than restating it means the two cannot drift apart silently.
         """
-        skill = (SKILL_DIR.parent / "review-pr" / "SKILL.md").read_text()
-        blocks = re.findall(r"<<'PY'\n(.*?)\nPY\n", skill, re.DOTALL)
+        skill = review_skill_text()
+        blocks = [b for b in re.findall(r"<<'PY'\n(.*?)\nPY\n", skill, re.DOTALL)
+                  if "expected_verdict" in b]
+        # Selected by what the block IS, not by its position. Indexing into the heredocs
+        # made this test depend on how many unrelated Python blocks happened to precede
+        # the gate, which is not a property anyone maintains.
+        self.assertEqual(1, len(blocks), "expected exactly one identity-gate PY block")
         gate = self.fixture.root / "gate.py"
-        gate.write_text(blocks[1])
+        gate.write_text(blocks[0])
         meta = self.fixture.root / "gate-meta.json"
-        meta.write_text(json.dumps({"headRefOid": report["repo"]["head"]}))
+        meta.write_text(json.dumps(
+            {"headRefOid": head_override or report["repo"]["head"]}))
         base = self.fixture.root / "gate-base.txt"
         base.write_text(report["repo"]["base"] + "\n")
         target = self.fixture.root / "gate-report.json"
@@ -1136,6 +1152,30 @@ class ValidateKernelPrTests(unittest.TestCase):
             ],
             check=False,
         )
+
+    def test_review_gate_rejects_a_report_for_another_head(self):
+        """The gate's stated purpose: "reports that do not name this exact head are
+        rejected". Every existing test fed it `headRefOid` copied from the report under
+        test, so the comparison was never exercised -- replacing it with `if False` left
+        the suite green. A stale report from the previous push is the exact artifact this
+        is supposed to stop, and it is worse than no report at all.
+        """
+        patch = self.fixture.make_patch(
+            self.fixture.rewrite_bench(self.bench_body("1.25")), "stale-head.patch"
+        )
+        _, report = self.fixture.validate(
+            patch,
+            tests=self.fixture.BENCH_TARGET,
+            grid=False,
+            expected_route="test_bench:run_kernel",
+        )
+        other_head = "0" * 40
+        self.assertNotEqual(other_head, report["repo"]["head"])
+        result = self.run_review_gate(report, patch, head_override=other_head)
+        self.assertNotEqual(0, result.returncode,
+                            "gate accepted a report naming a different head")
+        combined = (result.stdout or "") + (result.stderr or "")
+        self.assertIn("stale or for another checkout", combined)
 
     def test_perf_report_survives_the_review_identity_gate(self):
         patch = self.fixture.make_patch(
@@ -3255,7 +3295,7 @@ class ShapeGridPluginTests(unittest.TestCase):
 
 class ReviewSkillContractTests(unittest.TestCase):
     def test_review_skill_is_advisory_and_has_no_dead_scanner_paths(self):
-        review_skill = (SKILL_DIR.parent / "review-pr" / "SKILL.md").read_text()
+        review_skill = review_skill_text()
 
         self.assertTrue((SKILL_DIR / "validate_evidence.py").is_file())
         self.assertTrue((SKILL_DIR / "validation_probe.py").is_file())
@@ -3271,21 +3311,27 @@ class ReviewSkillContractTests(unittest.TestCase):
         self.assertNotIn("review-flydsl-kernel/scan_", review_skill)
 
     def test_review_fetch_snippet_parses_as_bash(self):
-        review_skill = (SKILL_DIR.parent / "review-pr" / "SKILL.md").read_text()
-        match = re.search(
-            r"## Step 1 — Fetch.*?```bash\n(.*?)\n```",
-            review_skill,
-            re.DOTALL,
-        )
-        self.assertIsNotNone(match)
+        """Step 1 is fetch.sh now. Parsing the three-line call site proves nothing, so
+        parse the program, and check the document still reaches it."""
+        fetch = REVIEW_DIR / "fetch.sh"
+        self.assertTrue(fetch.is_file(), "review-pr/fetch.sh is missing")
         result = subprocess.run(
-            ["bash", "-n"],
-            input=match.group(1),
-            capture_output=True,
-            text=True,
-            check=False,
+            ["bash", "-n", str(fetch)], capture_output=True, text=True, check=False
         )
         self.assertEqual(0, result.returncode, result.stderr)
+
+        review_skill = (REVIEW_DIR / "SKILL.md").read_text()
+        match = re.search(r"## Step 1 — Fetch.*?```bash\n(.*?)\n```", review_skill, re.DOTALL)
+        self.assertIsNotNone(match, "Step 1 no longer carries a bash block")
+        # A comment mentioning fetch.sh satisfied `assertIn` on the whole block, so
+        # breaking the call site left this test green. Require an executable line.
+        invocations = [ln for ln in match.group(1).split("\n")
+                       if "fetch.sh" in ln and not ln.lstrip().startswith("#")]
+        self.assertTrue(invocations, "Step 1 mentions fetch.sh but never calls it")
+        called = subprocess.run(
+            ["bash", "-n"], input=match.group(1), capture_output=True, text=True, check=False
+        )
+        self.assertEqual(0, called.returncode, called.stderr)
 
     def test_perf_harness_detection_agrees_across_both_skills(self):
         """review-pr and the validator must classify a target identically.
@@ -3295,7 +3341,7 @@ class ReviewSkillContractTests(unittest.TestCase):
         harness the validator declined to use -- or, worse, prints "no benchmark entry
         point" for a target the validator happily timed.
         """
-        review_skill = (SKILL_DIR.parent / "review-pr" / "SKILL.md").read_text()
+        review_skill = review_skill_text()
         validator = VALIDATOR.read_text()
 
         review_body = re.search(
