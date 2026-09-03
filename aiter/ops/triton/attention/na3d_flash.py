@@ -221,6 +221,13 @@ def na3d_flash_attn(
     )
 
     assert q.dtype == torch.bfloat16, "na3d_flash_attn: inputs must be bfloat16"
+    assert k.dtype == q.dtype and v.dtype == q.dtype, "na3d_flash_attn: q/k/v must share dtype"
+    assert k.shape == q.shape and v.shape == q.shape, (
+        "na3d_flash_attn: q/k/v must have shape (B, T, H, W, NH, HD)"
+    )
+    assert KT <= T and KH <= H and KW <= W, (
+        f"na3d_flash_attn: kernel_size=({KT},{KH},{KW}) must be <= (T,H,W)=({T},{H},{W})"
+    )
     assert HD & (HD - 1) == 0, f"head_dim {HD} must be a power of 2"
     assert W >= 16, f"W={W} is too small; kernel requires W >= BLOCK_Q (default 16)."
 
