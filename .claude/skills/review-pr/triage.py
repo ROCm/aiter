@@ -139,14 +139,149 @@ def evidence(sym, files):
             out.append((f, hits))
     return out
 
+
+# ---------------------------------------------------------------- symbol sweep
+STDLIB_OR_THIRD_PARTY = re.compile(
+    r"^(torch|pytest|numpy|np|pandas|einops|triton|typing|dataclasses|functools|"
+    r"itertools|pathlib|argparse|logging|os|sys|re|json|math|time|random|"
+    r"collections|contextlib|subprocess|warnings|abc|enum|copy|__future__)\b")
+
+
+def added_imports(diff_text):
+    """(module, [names], line) for every import line the diff ADDS."""
+    out = []
+    for ln in diff_text.splitlines():
+        if not ln.startswith("+") or ln.startswith("+++"):
+            continue
+        body = ln[1:].strip()
+        m = re.match(r"from\s+([\w.]+)\s+import\s+(.+)$", body)
+        if m:
+            mod, names = m.group(1), m.group(2)
+            names = names.split("#")[0].replace("(", "").replace(")", "")
+            out.append((mod, [n.strip().split(" as ")[0] for n in names.split(",") if n.strip()], body))
+            continue
+        m = re.match(r"import\s+([\w.]+)", body)
+        if m:
+            out.append((m.group(1), [], body))
+    return out
+
+
+def resolve_module(mod, root):
+    """Path of the .py/package backing a dotted module, or None.
+
+    A directory with no __init__.py is a namespace package and imports fine --
+    aiter/utility is one. Requiring __init__.py reported it as hallucinated."""
+    rel = mod.replace(".", "/")
+    for cand in (root / f"{rel}.py", root / rel / "__init__.py"):
+        if cand.exists():
+            return cand
+    d = root / rel
+    if d.is_dir():
+        return d          # namespace package: exists, symbols unresolvable here
+    return None
+
+
+def symbol_defined(path, name):
+    if path.is_dir():
+        return True       # namespace package: cannot disprove without walking it
+    # `from pkg import sub` binds a SUBMODULE, which need not be named in
+    # __init__.py at all. Searching only the __init__ text called four real
+    # imports invented across the 600-PR corpus -- aiter.jit/core,
+    # aiter.jit.utils/chip_info, flydsl.kernels/{buffer_ops,vector}.
+    if path.name == "__init__.py":
+        pkg = path.parent
+        if (pkg / f"{name}.py").exists() or (pkg / name).is_dir():
+            return True
+    try:
+        src = path.read_text(errors="replace")
+    except Exception:
+        return True   # unreadable: do not accuse
+    if re.search(rf"^\s*(def|class)\s+{re.escape(name)}\b", src, re.M):
+        return True
+    if re.search(rf"^\s*{re.escape(name)}\s*[:=]", src, re.M):
+        return True
+    # re-exported through a star import or __all__; cannot disprove statically
+    if "import *" in src or "__all__" in src:
+        return True
+    return False
+
+
+def sweep_symbols(diff_text, root):
+    """Imports the diff adds that cannot be resolved against `root`. Conservative:
+    anything not clearly first-party, or not clearly absent, is left alone.
+
+    `root` MUST be a checkout of the branch this PR will merge INTO, fetched fresh --
+    not the PR base, and not whatever the reviewer happens to have on disk. The tree
+    you resolve against decides whether this check fires at all, and a stale root
+    silently reports nothing. aiter#4994 is the worked example: it added
+    `from aiter.ops.flydsl.utils import is_flydsl_available`, and #5116 (3b2a9ce6)
+    had deleted that module from main 19 hours earlier. Run against the PR's own base
+    the import resolves and this returns clean; run against main-at-merge-time it
+    reports. #4994 merged green and was reverted 5.5 hours later (283e1d4b).
+
+    A hit is therefore a REBASE signal, not an accusation of invention -- the import
+    may well have been valid when it was written.
+
+    Files the diff ITSELF adds count as existing. The tree available here is the
+    base, not head, so without this every PR that adds a module and imports it --
+    32% of open aiter PRs, measured -- is reported as unresolved. The check
+    that matters is 'this symbol exists nowhere, including in the PR', not 'this
+    symbol is missing from base'."""
+    bad = []
+    added_paths, cur = set(), None
+    for ln in diff_text.splitlines():
+        m = re.match(r"^diff --git a/(\S+) b/(\S+)", ln)
+        if m:
+            cur = m.group(2)
+        elif ln.startswith("new file mode") and cur:
+            added_paths.add(cur)
+    added_syms = set()
+    for ln in diff_text.splitlines():
+        if ln.startswith("+") and not ln.startswith("+++"):
+            m = re.match(r"\s*(?:def|class)\s+(\w+)", ln[1:])
+            if m:
+                added_syms.add(m.group(1))
+            m = re.match(r"\s*(\w+)\s*[:=]", ln[1:])
+            if m:
+                added_syms.add(m.group(1))
+    for mod, names, line in added_imports(diff_text):
+        if STDLIB_OR_THIRD_PARTY.match(mod) or mod.startswith("."):
+            continue
+        top = mod.split(".")[0]
+        if not (root / top).exists() and not (root / f"{top}.py").exists():
+            continue          # not a first-party module -- out of scope
+        rel = mod.replace(".", "/")
+        if f"{rel}.py" in added_paths or f"{rel}/__init__.py" in added_paths:
+            continue          # this PR adds the module
+        target = resolve_module(mod, root)
+        if target is None:
+            bad.append((line, f"module '{mod}' exists neither in the tree nor in this diff"))
+            continue
+        for n in names:
+            if n in added_syms:
+                continue      # this PR defines the symbol
+            if not symbol_defined(target, n):
+                bad.append((line, f"'{n}' is defined neither in {target.relative_to(root)} nor in this diff"))
+    return bad
+
+
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
-    if mode not in ("rules", "evidence"):
+    if mode not in ("rules", "evidence", "symbols"):
         print("usage: triage.py rules <diff> [title]\n"
-              "       triage.py evidence <diff> <head-file>...", file=sys.stderr)
+              "       triage.py evidence <diff> <head-file>...\n"
+              "       triage.py symbols <diff> <merge-target-root>", file=sys.stderr)
         raise SystemExit(2)
 
     diff = open(sys.argv[2], errors="replace").read()
+
+    if mode == "symbols":
+        root = pathlib.Path(sys.argv[3] if len(sys.argv) > 3 else ".")
+        bad = sweep_symbols(diff, root)
+        for line, why in bad:
+            print(f"UNRESOLVED-IMPORT: {why}")
+            print(f"  added by: {line}")
+        raise SystemExit(0)
 
     if mode == "evidence":
         for s in deleted_guard_symbols(diff):

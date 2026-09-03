@@ -757,7 +757,32 @@ if grep -q "invariant-removed\|api-signature" "$WORK/rules.txt"; then
   "$SKILLS_ROOT/review-pr/triage.py" evidence "$WORK/pr.diff" $HEAD_FILES \
     | tee "$WORK/evidence.txt"
 fi
+
+# Every first-party import the diff ADDS, resolved against the branch this PR merges
+# INTO -- fetched fresh, not the PR base and not whatever is on disk. A stale root
+# makes this check silently pass; that is the whole failure mode it exists to catch.
+MERGE_TARGET="${MERGE_TARGET:-$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('base',{}).get('ref') or 'main')" "$WORK/pr_meta.json")}"
+git -C "$PROJECT_ROOT" fetch -q origin "$MERGE_TARGET" 2>/dev/null || true
+TARGET_WT="$WORK/merge-target"
+if git -C "$PROJECT_ROOT" worktree add --detach "$TARGET_WT" FETCH_HEAD >/dev/null 2>&1; then
+  "$SKILLS_ROOT/review-pr/triage.py" symbols "$WORK/pr.diff" "$TARGET_WT" \
+    | tee "$WORK/symbols.txt"
+  git -C "$PROJECT_ROOT" worktree remove --force "$TARGET_WT" >/dev/null 2>&1 || true
+else
+  echo "SKIPPED: could not check out $MERGE_TARGET; symbol sweep not run" \
+    | tee "$WORK/symbols.txt"
+fi
 ```
+
+**`$WORK/symbols.txt` is a rebase signal, not a hallucination finding.** Each
+`UNRESOLVED-IMPORT` line names a first-party import the PR adds that does not resolve
+against today's merge target. The import was very likely valid when it was written; the
+module moved or was deleted underneath it, and both PRs pass CI alone. aiter#4994 is the
+worked case — it added `from aiter.ops.flydsl.utils import is_flydsl_available`, #5116
+(3b2a9ce6) had deleted that module from main 19 hours earlier, #4994 merged green
+(83571d9b) and was reverted 5.5 hours later (283e1d4b). Report it as *needs rebase +
+re-run*, never as invented code. A `SKIPPED:` line means the sweep did not run and the PR
+is unchecked on this axis — say so rather than reading silence as clean.
 
 **Read only the rules in `$WORK/rules.txt`.** They are derived from paths, added/deleted
 lines and the title, and the derivation is conservative — a family it cannot decide
