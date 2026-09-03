@@ -19,6 +19,7 @@ from csrc.cpp_itfs.pa.pa_v1 import paged_attention_v1 as paged_attention_v1_core
 from csrc.cpp_itfs.torch_utils import direct_register_custom_op
 
 from ..jit.core import compile_ops, is_experimental_enabled
+from ..jit.utils.asm_guard import require_gfx1250_asm
 from ..jit.utils.chip_info import get_cu_num, get_gfx
 
 MD_NAME = "module_attention"
@@ -471,6 +472,7 @@ def pa_decode_bf16_asm(
         this slot, so when `sink` is None a -inf buffer is allocated, making the
         sink a numerical no-op.
     """
+    require_gfx1250_asm("pa_decode_bf16_asm")
     device = Q.device
     kv_head_num = K.shape[1]
     q_head_num = kv_head_num * gqa
