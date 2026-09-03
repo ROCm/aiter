@@ -1580,10 +1580,13 @@ def test_flash_attn_func_opus_varlen_out_param(causal, with_sink, monkeypatch):
 
 
 @pytest.mark.parametrize("causal", [False, True])
-def test_flash_attn_func_opus_varlen_out_param_declines(causal, monkeypatch):
-    """An out= buffer with more rows than Q must be DECLINED, not silently accepted:
-    a varlen call returns one row per query row, so routing an oversized out would
-    leave a stale tail. Declining has to remain numerically correct."""
+def test_flash_attn_func_opus_varlen_out_param_oversized_rejected(causal, monkeypatch):
+    """An out= with more rows than Q must never be silently accepted.
+
+    A varlen call returns one row per query row, so an oversized out would leave a stale
+    tail. Both OPUS gates decline it and CK rejects it too, so the observable contract is
+    that the call RAISES rather than returning a truncated buffer.
+    """
     if get_gfx() != "gfx950":
         pytest.skip("opus symmetric kernel requires gfx950")
     monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
@@ -1591,7 +1594,6 @@ def test_flash_attn_func_opus_varlen_out_param_declines(causal, monkeypatch):
     q, k, v = _opus_out_qkv(**s, packed=True)
     cu_q = torch.tensor([0, s["seqlen_q"]], dtype=torch.int32, device="cuda")
     cu_k = torch.tensor([0, s["seqlen_kv"]], dtype=torch.int32, device="cuda")
-    # 64 extra rows, poisoned: if the router accepted this, the tail would survive.
     out = torch.full(
         (s["seqlen_q"] + 64, s["nheads"], s["d"]),
         99.0,
@@ -1599,19 +1601,10 @@ def test_flash_attn_func_opus_varlen_out_param_declines(causal, monkeypatch):
         dtype=dtypes.bf16,
     )
 
-    with torch.no_grad():
-        got = aiter.flash_attn_varlen_func(
+    with torch.no_grad(), pytest.raises(RuntimeError):
+        aiter.flash_attn_varlen_func(
             q, k, v, cu_q, cu_k, s["seqlen_q"], s["seqlen_kv"], causal=causal, out=out
         )
-    got = got[0] if isinstance(got, (tuple, list)) else got
-    assert got.shape[0] == s["seqlen_q"], f"declined path returned {tuple(got.shape)}"
-
-    qd, kd, vd = q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0)
-    ref, _, _ = attention_ref(qd, kd, vd, causal=causal)
-    pt, _, _ = attention_ref(qd, kd, vd, causal=causal, upcast=False, reorder_ops=True)
-    tol = max(2 * (pt - ref).abs().max().item(), 0.01)
-    diff = (got - ref.squeeze(0)).abs().max().item()
-    assert diff <= tol, f"declined out= path is wrong: {diff} > {tol}"
 
 
 # ─── group (varlen) mode on the symmetric OPUS kernel ────────────────────────────

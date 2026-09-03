@@ -314,12 +314,9 @@ inline bool fmha_fwd_bf16_opus_launch(const fmha_fwd_bf16_opus_args& a, hipStrea
         return false;
     }
 
-    const bool is_group = (a.seqstart_q_ptr != nullptr);
-
     if(a.hdim_q == a.hdim_v && (a.hdim_q == 64 || a.hdim_q == 128))
     {
-        if(is_group)
-            return false;
+        // Batch and group both supported; launch_d128 selects on a.seqstart_q_ptr.
         return fmha_fwd_bf16_opus_detail::launch_d128(a, stream);
     }
     if(a.hdim_q == 192 && a.hdim_v == 128)

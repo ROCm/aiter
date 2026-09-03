@@ -3122,6 +3122,19 @@ def _flash_attn_varlen_forward(
                 and sink_ptr.is_contiguous()
             )
         )
+        # The launcher requires out exactly [total_q, nhead_q, hdim_v]; decline anything
+        # else so a mis-shaped buffer falls back instead of tripping its TORCH_CHECK.
+        ret = ret and (
+            out is None
+            or (
+                out.dim() == 3
+                and out.shape[0] == q.shape[0]
+                and out.shape[1] == nhead_q
+                and out.shape[2] == hdim_v
+                and out.dtype == q.dtype
+                and out.stride(-1) == 1
+            )
+        )
         # KV extent >= 2^32 wraps the kernel's 32-bit soffset. Packed, so stride(0);
         # max_seqlen_k bounds every group (each is rebased to its own row offset).
         if ret:
