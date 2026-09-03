@@ -42,7 +42,28 @@ _MXFP8_LEGACY_BLOCK_SIZE = 128
 _LOGGER = AiterTritonLogger()
 
 
-def _static_per_tensor_quant_launch(qx, x_in, scale_in, fast_convert: bool):
+def static_per_tensor_quant_fp8_i8(
+    qx: torch.Tensor,
+    x_in: torch.Tensor,
+    scale_in: torch.Tensor,
+    fast_convert: bool = True,
+):
+    """
+    Quantizes tensor using the provided scale to int8 or fp8
+
+    Parameters:
+    - qx: Output tensor of same shape as x_in. Must be fp8 or int8 dtype and allocated by the caller
+    - x_in: Input tensor of shape (M, N).
+    - scale_in: Input Scale tensor of shape (1,) and dtype fp32
+    - fast_convert: multiply by the reciprocal of the scale instead of dividing
+        by it. Cheaper, and differs from the division on a small fraction of
+        inputs; see the kernel.
+
+    Returns:
+    - qx: Quantized output values.
+    """
+    _LOGGER.info(f"STAIC_PER_TENSOR_QUANT_FP8_I8: x={tuple(x_in.shape)}")
+    assert scale_in.numel() == 1  # only single scale value
     # per_tensor_quant_triton hands in a 2D x with an N-D qx, so view both as 2D
     # rather than trusting qx.stride(0); .view still writes the caller's buffer.
     x2d = x_in if x_in.ndim == 2 else x_in.view(-1, x_in.shape[-1])
@@ -80,25 +101,6 @@ def _static_per_tensor_quant_launch(qx, x_in, scale_in, fast_convert: bool):
     return qx
 
 
-def static_per_tensor_quant_fp8_i8(
-    qx: torch.Tensor, x_in: torch.Tensor, scale_in: torch.Tensor
-):
-    """
-    Quantizes tensor using the provided scale to int8 or fp8
-
-    Parameters:
-    - qx: Output tensor of same shape as x_in. Must be fp8 or int8 dtype and allocated by the caller
-    - x_in: Input tensor of shape (M, N).
-    - scale_in: Input Scale tensor of shape (1,) and dtype fp32
-
-    Returns:
-    - qx: Quantized output values.
-    """
-    _LOGGER.info(f"STAIC_PER_TENSOR_QUANT_FP8_I8: x={tuple(x_in.shape)}")
-    assert scale_in.numel() == 1  # only single scale value
-    return _static_per_tensor_quant_launch(qx, x_in, scale_in, fast_convert=True)
-
-
 def dynamic_per_tensor_quant_fp8_i8(
     qx: torch.Tensor, x_in: torch.Tensor, scale_out: torch.Tensor
 ):
@@ -131,7 +133,7 @@ def dynamic_per_tensor_quant_fp8_i8(
         ),
     )
 
-    _static_per_tensor_quant_launch(qx, x_in, scale_out, fast_convert=True)
+    static_per_tensor_quant_fp8_i8(qx, x_in, scale_out)
 
     return qx, scale_out
 
