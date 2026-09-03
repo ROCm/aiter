@@ -131,6 +131,21 @@ def _as_i8(t: Tensor) -> Tensor:
     return t.view(torch.int8) if "float8" in str(t.dtype) else t
 
 
+_NUM_XCDS = 8
+
+
+def _default_xcd(m_rows: int) -> int:
+    """Pick xcd_swizzle -- the ``wgm`` of the XCD tile remap -- from the row count."""
+    num_pid_m = -(-int(m_rows) // 256)
+    if num_pid_m <= 8:
+        return 0
+    if num_pid_m <= 48:
+        return 2
+    if num_pid_m <= 64:
+        return 4
+    return _NUM_XCDS
+
+
 def gather_kv_b_proj_flydsl(
     k_buffer: Tensor,  # [num_blocks, 1, 576] fp8
     k_scale: Tensor,  # [1] fp32, per-tensor activation scale
@@ -147,7 +162,7 @@ def gather_kv_b_proj_flydsl(
     shuffled_kv_cache: bool = False,
     block_m: int = 256,
     waves_per_eu: int = 2,
-    xcd_swizzle: int = 1,
+    xcd_swizzle: int | None = None,
 ) -> None:
     """Fused gather + kv_b_proj + rope copy. Writes k_prefix / v_prefix in place.
 
@@ -160,6 +175,11 @@ def gather_kv_b_proj_flydsl(
     workspace at its maximum; it defaults to ``k_prefix.shape[0]``. Rows past it
     are neither read nor written -- their gathered indices are clamped by the
     kv_indices descriptor and their stores are dropped by the output descriptor.
+
+    ``xcd_swizzle`` defaults to ``None``, which lets :func:`_default_xcd` pick
+    it from the live row count; pass an int to pin it. It is a compile-time
+    constant, so a workload spanning several row counts compiles one kernel per
+    distinct value.
     """
 
     if shuffled_kv_cache:
@@ -263,6 +283,8 @@ def gather_kv_b_proj_flydsl(
     scale = kv_proj_scale.reshape(-1)
     if scale.dtype != torch.float32:
         scale = scale.to(torch.float32)
+
+    xcd_swizzle = _default_xcd(m_rows) if xcd_swizzle is None else int(xcd_swizzle)
 
     _validate(
         n_heads=n_heads,
