@@ -19,6 +19,8 @@ import pandas as pd
 import pytest
 import torch
 
+import aiter
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import flydsl_attn_res
 from aiter.ops.torch_ref.attn_res import attn_res as attn_res_reference
 from aiter.test_common import benchmark, checkAllclose, run_perftest
@@ -32,7 +34,23 @@ _MAX_BLOCKS = 8
 _EPS = 1e-5
 _ATOL = 8e-2
 _RTOL = 3e-2
-_PEAK_BW_GBPS_GFX950 = 8000.0
+# Measured cache-bypassed BF16 bandwidth floor from the PR (TB/s).
+_FLOOR_BW_TBPS = 6.26
+_BF16_ULP_REL = 3.863e-3
+_SUPPORTED_GFX = ("gfx942", "gfx950")
+
+
+def _supported_gfx() -> bool:
+    try:
+        return get_gfx() in _SUPPORTED_GFX
+    except Exception:
+        return False
+
+
+_skip_unsupported_gfx = pytest.mark.skipif(
+    not _supported_gfx(),
+    reason="flydsl_attn_res requires gfx942 or gfx950",
+)
 
 
 def _make_inputs(tokens: int, hidden_size: int = _D, pad: int = 0):
@@ -119,8 +137,8 @@ def _run_and_check(
     torch.cuda.synchronize()
 
     error = checkAllclose(
-        reference,
-        output,
+        reference.to(torch.bfloat16).to(torch.float32),
+        output.to(torch.float32),
         atol=_ATOL,
         rtol=_RTOL,
         msg=(
@@ -148,6 +166,7 @@ def _run_and_check(
     return error
 
 
+@_skip_unsupported_gfx
 def test_flydsl_attn_res_correctness():
     """Cover the flag surface and source-count endpoints at the prefill grid."""
     for flags in itertools.product((False, True), repeat=3):
@@ -169,6 +188,7 @@ def test_flydsl_attn_res_correctness():
         _run_and_check(tokens, _MAX_BLOCKS - 1, True, True, True)
 
 
+@_skip_unsupported_gfx
 def test_flydsl_attn_res_empty_returns_without_side_effects():
     """T=0 returns an empty contiguous tensor without launching a kernel."""
     (
@@ -204,6 +224,7 @@ def test_flydsl_attn_res_empty_returns_without_side_effects():
     assert torch.equal(blocks, blocks_before), "empty path mutated blocks"
 
 
+@_skip_unsupported_gfx
 @pytest.mark.parametrize(
     ("num_blocks", "block_write_idx", "error_type"),
     (
@@ -236,6 +257,7 @@ def test_flydsl_attn_res_rejects_invalid_specializations(
         )
 
 
+@_skip_unsupported_gfx
 def test_flydsl_attn_res_rejects_unsupported_hidden_size_before_empty_return():
     """Reject an unsupported D even when T=0 would otherwise skip the launch."""
     prefix, _, blocks, norm_weight, qk_weight, _, _ = _make_inputs(
@@ -257,6 +279,7 @@ def test_flydsl_attn_res_rejects_unsupported_hidden_size_before_empty_return():
         )
 
 
+@_skip_unsupported_gfx
 @pytest.mark.parametrize(
     "layout",
     ("pad7", "non_unit_trailing_stride", "misaligned_base", "misaligned_weight"),
@@ -290,6 +313,7 @@ def test_flydsl_attn_res_rejects_unsupported_layouts(layout: str):
         )
 
 
+@_skip_unsupported_gfx
 def test_flydsl_attn_res_rejects_rows_per_wg_over_block_limit():
     """Reject packed blocks that exceed _MAX_BLOCK_THREADS."""
     prefix, _, blocks, norm_weight, qk_weight, _, _ = _make_inputs(
@@ -310,6 +334,69 @@ def test_flydsl_attn_res_rejects_rows_per_wg_over_block_limit():
             _EPS,
             rows_per_wg=17,
         )
+
+
+@_skip_unsupported_gfx
+@pytest.mark.parametrize("hidden_size", (_D, _D_SMALL))
+@pytest.mark.parametrize(
+    ("num_blocks", "has_delta", "write_block", "apply_output_norm"),
+    (
+        (_MAX_BLOCKS, False, False, False),
+        (_MAX_BLOCKS - 1, True, True, True),
+    ),
+)
+def test_flydsl_attn_res_float64_oracle(
+    hidden_size: int,
+    num_blocks: int,
+    has_delta: bool,
+    write_block: bool,
+    apply_output_norm: bool,
+):
+    """Compare the kernel against a float64 scoring/mix oracle (untimed)."""
+    tokens = 17
+    block_write_idx = num_blocks if write_block else -1
+    prefix, delta, blocks, norm_weight, qk_weight, output_norm_weight, _ = _make_inputs(
+        tokens, hidden_size=hidden_size
+    )
+    delta_arg = delta if has_delta else None
+    output_norm_weight_arg = output_norm_weight if apply_output_norm else None
+
+    oracle, _ = attn_res_reference(
+        prefix.clone(),
+        delta_arg,
+        blocks.clone(),
+        norm_weight,
+        qk_weight,
+        output_norm_weight_arg,
+        num_blocks,
+        _EPS,
+        _EPS,
+        dtype=torch.float64,
+    )
+    output = flydsl_attn_res(
+        prefix,
+        delta_arg,
+        blocks,
+        norm_weight,
+        qk_weight,
+        output_norm_weight_arg,
+        num_blocks,
+        block_write_idx,
+        _EPS,
+        _EPS,
+    )
+    torch.cuda.synchronize()
+
+    kernel_f64 = output.to(torch.float64)
+    row_peak = oracle.abs().amax(dim=-1, keepdim=True).clamp_min(1e-6)
+    max_rel = ((kernel_f64 - oracle).abs() / row_peak).max().item()
+    assert max_rel < _BF16_ULP_REL, (
+        "float64 oracle max relative error vs row peak "
+        f"{max_rel:.6e} exceeds {_BF16_ULP_REL:.6e} "
+        f"(D={hidden_size}, k={num_blocks + 1}, "
+        f"delta={has_delta}, write={write_block}, "
+        f"output_norm={apply_output_norm})"
+    )
 
 
 @benchmark()
@@ -367,9 +454,12 @@ def benchmark_flydsl_attn_res(
     k = num_blocks + 1
     rows = k + 2 * int(has_delta) + int(write_block) + 1
     moved_bytes = rows * tokens * hidden_size * 2
-    gbps = moved_bytes / (us * 1e-6) / 1e9
-    floor_us = moved_bytes / (_PEAK_BW_GBPS_GFX950 * 1e9) * 1e6
+    tbps = moved_bytes / (us * 1e-6) / 1e12
+    floor_us = moved_bytes / (_FLOOR_BW_TBPS * 1e12) * 1e6
+    # ~4D (sumsq + dot) + 2D mix per source; optional output RMS ~4D.
+    flops = tokens * hidden_size * (6 * k + 4 * int(apply_output_norm))
     return {
+        "gfx": get_gfx(),
         "D": hidden_size,
         "k": k,
         "has_delta": has_delta,
@@ -378,15 +468,21 @@ def benchmark_flydsl_attn_res(
         "pad": pad,
         "rows_per_wg": rows_per_wg,
         "us": round(us, 3),
-        "GB/s": round(gbps, 0),
-        "%peak": round(gbps / _PEAK_BW_GBPS_GFX950 * 100, 1),
+        "TFLOPS": round(flops / us / 1e6, 2),
+        "TB/s": round(tbps, 3),
         "floor_us": round(floor_us, 3),
         "efficiency": round(floor_us / us, 3),
-        "flydsl err": err,
+        "err": err,
     }
 
 
 def main():
+    if get_gfx() not in _SUPPORTED_GFX:
+        aiter.logger.warning(
+            "flydsl_attn_res unsupported on %s; skipping", get_gfx()
+        )
+        return
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--tokens",
@@ -440,7 +536,10 @@ def main():
             args.tokens,
         )
     ]
-    print(pd.DataFrame(results).to_string(index=False))
+    aiter.logger.info(
+        "flydsl_attn_res summary (markdown):\n%s",
+        pd.DataFrame(results).to_markdown(index=False),
+    )
 
 
 if __name__ == "__main__":
