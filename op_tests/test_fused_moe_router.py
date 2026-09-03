@@ -358,12 +358,13 @@ def _run_case(
         ep_rank, ep_size = ep[0], ep[1]
         mask = _make_mask(E, ep_rank, ep_size, vllm_shape=ep[2], n_shared=n_shared)
     g, b, h = _inputs(M, E, bias_dtype, M if seed is None else seed)
-    shared = dict(
-        n_shared=n_shared, shared_w=shared_w, ep_rank=ep_rank, ep_size=ep_size
-    )
-    ref = _run_stock(
-        g, b, h, M, E, topk, unit_size, need_renorm, rsf, mask, **shared
-    )
+    shared = {
+        "n_shared": n_shared,
+        "shared_w": shared_w,
+        "ep_rank": ep_rank,
+        "ep_size": ep_size,
+    }
+    ref = _run_stock(g, b, h, M, E, topk, unit_size, need_renorm, rsf, mask, **shared)
     topk_total = topk + n_shared
     got = _alloc(ref, M, topk_total)
     moe_buf = None
@@ -1048,15 +1049,13 @@ def test_shared_non_ep(M, n_shared):
 
 
 @pytest.mark.parametrize("n_shared", [1])
-@pytest.mark.parametrize(
-    "ep", [(0, 4, True), (2, 4, True), (3, 4, True), (0, 1, True)]
-)
+@pytest.mark.parametrize("ep", [(0, 4, True), (2, 4, True), (3, 4, True), (0, 1, True)])
 @pytest.mark.parametrize("M", [1, 33, 128])
-def test_shared_ep(M, ep, n_shared):
+def test_shared_ep(path, M, ep, n_shared):
     errs, _ = _run_case(
         M, 320, 8, 16, dtypes.bf16, True, 1.0, ep, False, n_shared=n_shared
     )
-    _assert_ok(errs, f"M={M} ep={ep} n_shared={n_shared}")
+    _assert_ok(errs, f"{path} M={M} ep={ep} n_shared={n_shared}")
 
 
 # The shared weight is not renormalized and not scaled by rsf: the kernel
@@ -1086,10 +1085,13 @@ def test_shared_weight_untouched_by_renorm(need_renorm, rsf, shared_w):
 # The property the round-robin exists for: summed over every rank, each token
 # contributes exactly one row per shared expert. Anything else means the
 # post-MoE all-reduce double-counts (or drops) the shared output.
+# M=3 leaves the high ranks owning nothing, M=33 leaves a ragged tail; M=128
+# is divisible by every ep_size here and so exercises neither.
+@pytest.mark.parametrize("M", [3, 33, 128])
 @pytest.mark.parametrize("ep_size", [1, 2, 4, 8])
 @pytest.mark.parametrize("n_shared", [1])
-def test_shared_no_double_count(ep_size, n_shared):
-    M, E, topk, unit_size = 128, 320, 8, 16
+def test_shared_no_double_count(ep_size, n_shared, M):
+    E, topk, unit_size = 320, 8, 16
     g, b, h = _inputs(M, E, dtypes.bf16, 0)
     counts = torch.zeros(M, n_shared, dtype=torch.int64, device="cpu")
     for ep_rank in range(ep_size):
@@ -1153,11 +1155,9 @@ def test_nshared_zero_unchanged(M, ep):
     keys = ("ti", "tw", "sids", "sw", "seids", "nv", "o4", "osc")
     outs = []
     # Defaulted vs explicitly-zero shared args, and under ep_size 1 either way.
-    for kwargs in ({}, dict(n_shared=0, shared_w=1.0, ep_rank=0, ep_size=1)):
+    for kwargs in ({}, {"n_shared": 0, "shared_w": 1.0, "ep_rank": 0, "ep_size": 1}):
         got = _alloc_poisoned(ref, M, topk, M)
-        _call_fused(
-            g, b, h, got, E, topk, unit_size, True, 1.0, mask, None, **kwargs
-        )
+        _call_fused(g, b, h, got, E, topk, unit_size, True, 1.0, mask, None, **kwargs)
         torch.cuda.synchronize()
         outs.append({k: got[k].clone() for k in keys})
     diff = [k for k in keys if not torch.equal(outs[0][k], outs[1][k])]
@@ -1218,7 +1218,12 @@ def test_expert_slot_cap(E, n_shared, ep, ok):
     ep_rank, ep_size = (0, 1) if ep is None else (ep[0], ep[1])
     mask = None if ep is None else _make_mask(E, ep_rank, ep_size, n_shared=n_shared)
     g, b, h = _inputs(M, E, dtypes.bf16, 0)
-    shared = dict(n_shared=n_shared, shared_w=1.0, ep_rank=ep_rank, ep_size=ep_size)
+    shared = {
+        "n_shared": n_shared,
+        "shared_w": 1.0,
+        "ep_rank": ep_rank,
+        "ep_size": ep_size,
+    }
     if not ok:
         ref = _run_stock(g, b, h, M, 320, topk, unit_size, True, 1.0, None)
         got = _alloc(ref, M, topk + n_shared)
@@ -1245,8 +1250,7 @@ def test_shared_bad_args_rejected():
     got = _alloc(ref, M, topk + n_shared)
 
     def call(**kw):
-        kw = {"n_shared": n_shared, "shared_w": 1.0, "ep_rank": 0,
-              "ep_size": 4, **kw}
+        kw = {"n_shared": n_shared, "shared_w": 1.0, "ep_rank": 0, "ep_size": 4, **kw}
         a = kw.pop("outs", got)
         m = kw.pop("mask", mask)
         _call_fused(g, b, h, a, E, topk, unit_size, True, 1.0, m, None, **kw)
@@ -1299,6 +1303,26 @@ def test_shared_supported_gate():
     assert ask(topk, 1)
     assert not ask(topk, 2)
     assert not ask(64, 1)
+
+
+@pytest.mark.parametrize("n_shared", [0, 1])
+@pytest.mark.parametrize("ep", [False, True])
+def test_cfg_topk_matches_stock(ep, n_shared):
+    """The tuned-config key must be the one the unfused path would build.
+
+    Stock takes topk from `topk_ids.shape[1]`, which the caller widens by the
+    shared slots and, under EP + shared fusion, one fake slot; `get_2stage_cfgs`
+    then strips the fake slot back off. This path builds `topk_ids` itself, so
+    `_cfg_topk` has to re-add what the strip removes.
+    """
+    from aiter.fused_moe import _cfg_topk
+
+    topk = 8
+    mask = torch.empty(1, dtype=dtypes.i32) if ep else None
+    # What vLLM allocates for the stock path (init_aiter_topK_meta_data).
+    stock_width = topk + n_shared + (1 if (ep and n_shared) else 0)
+    # Both sides lose int(is_ep) inside get_2stage_cfgs, so compare pre-strip.
+    assert _cfg_topk(topk, n_shared, mask) == stock_width
 
 
 if __name__ == "__main__":
