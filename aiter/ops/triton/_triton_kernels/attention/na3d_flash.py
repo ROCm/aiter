@@ -122,8 +122,8 @@ def _na3d_flash_fwd(
     hd_offs = tl.arange(0, HD)
     kv_offs = tl.arange(0, BLOCK_KV)
 
-    # Cast to int64: pid_bnh (int32) x stride_bnh can exceed int32 range.
-    base = pid_bnh.to(tl.int64) * stride_bnh
+    # Cast to int64 to avoid exceeding int32 range
+    base = pid_bnh.to(tl.int64) * stride_bnh.to(tl.int64)
     kv_w = w_lo + kv_offs
     kv_ok = kv_w < W  # W-boundary guard, constant across the KT x KH loop
 
