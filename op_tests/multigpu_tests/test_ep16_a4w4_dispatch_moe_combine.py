@@ -298,8 +298,18 @@ def _run_one_bs(
     topk_weights_bs = topk_weights[:bs].contiguous()
     topk_ids_bs = topk_ids[:bs].contiguous()
 
-    # ---- one live call: dispatch -> dequant -> fused_moe -> combine ----
-    dispatched = op.dispatch_prequant(x_fp4_bs, x_scale_bs, topk_weights_bs, topk_ids_bs)
+    # Public MegaMoEV2 contract: the facade owns the complete inter-node
+    # dispatch -> fused_moe -> combine sequence.
+    out = op.forward_prequant(x_fp4_bs, x_scale_bs, topk_weights_bs, topk_ids_bs).clone()
+    torch.cuda.synchronize()
+    assert out.shape == (bs, model_dim)
+    assert torch.isfinite(out.float()).all(), "MegaMoEV2 output has non-finite values"
+
+    # Diagnostic-only staged call through the private backend. This preserves
+    # per-stage profiling without adding stage methods to MegaMoEV2's public API.
+    backend = op._inter_node
+    assert backend is not None
+    dispatched = backend.dispatch_prequant(x_fp4_bs, x_scale_bs, topk_weights_bs, topk_ids_bs)
     recv_tok_fp4 = dispatched.tokens
     recv_wts = dispatched.weights
     recv_scale = dispatched.scales
@@ -308,16 +318,17 @@ def _run_one_bs(
     torch.cuda.synchronize()
     total_recv = int(recv_num_token[0].item())
 
-    moe_out = op.fused_moe(dispatched)
+    moe_out = backend.fused_moe(dispatched)
 
     # combine()'s indices/weights must be THIS rank's own [tokens, topk]
     # routing passed to dispatch() -- NOT dispatch()'s returned recv_idx/
     # recv_wts (ROCm/mori#475). weights=None: fused_moe already applied
     # topk weighting in stage2 (same convention as
     # test_dispatch_combine_internode.py's run_combine).
-    combine_out, combine_out_wts = op.combine(moe_out, dispatched)
+    combine_out, combine_out_wts = backend.combine(moe_out, dispatched)
     torch.cuda.synchronize()
-    out = combine_out[:bs]
+    diagnostic_out = combine_out[:bs]
+    torch.testing.assert_close(out, diagnostic_out, rtol=0, atol=0)
 
     # ---- correctness (only below accuracy_max_bs, all-gather ref is O(bs*world)) ----
     rel_l2 = -1.0
@@ -342,8 +353,8 @@ def _run_one_bs(
         rel_l2 = _reduce_float(rel_l2, dist.ReduceOp.MAX)
         if rel_l2 >= rtol:
             raise AssertionError(f"bs={bs} moe relL2={rel_l2:.6f} exceeds rtol={rtol}")
-        assert out.shape == (bs, model_dim)
-        assert torch.isfinite(out.float()).all(), "combine output has non-finite values"
+        assert diagnostic_out.shape == (bs, model_dim)
+        assert torch.isfinite(diagnostic_out.float()).all(), "combine output has non-finite values"
 
     # ---- logical GEMM row count: (received row, local expert slot) pairs ----
     # actually computed by fused_moe's grouped GEMM -- exact, not an estimate.
@@ -393,16 +404,16 @@ def _run_one_bs(
     for i in range(iters):
         event_base = 4 * i
         events[event_base].record()
-        dispatched = op.dispatch_prequant(x_fp4_bs, x_scale_bs, topk_weights_bs, topk_ids_bs)
+        dispatched = backend.dispatch_prequant(x_fp4_bs, x_scale_bs, topk_weights_bs, topk_ids_bs)
         recv_tok_fp4 = dispatched.tokens
         recv_wts = dispatched.weights
         recv_scale = dispatched.scales
         recv_idx = dispatched.expert_ids
         recv_num_token = dispatched.num_tokens
         events[event_base + 1].record()
-        moe_out = op.fused_moe(dispatched)
+        moe_out = backend.fused_moe(dispatched)
         events[event_base + 2].record()
-        combine_out, combine_out_wts = op.combine(moe_out, dispatched)
+        combine_out, combine_out_wts = backend.combine(moe_out, dispatched)
         events[event_base + 3].record()
     torch.cuda.synchronize()
 

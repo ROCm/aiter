@@ -10,7 +10,7 @@ import torch
 
 
 @dataclass
-class MegaMoEDispatchResult:
+class MegaMoEInterNodeContext:
     """Dispatch payload plus the private source-side state needed by combine."""
 
     tokens: torch.Tensor
@@ -65,8 +65,8 @@ class MegaMoEInterNodeBackend:
         self._active_dispatch = None
 
     def _validate_active_dispatch(self, dispatched):
-        if not isinstance(dispatched, MegaMoEDispatchResult):
-            raise TypeError("dispatched must be MegaMoEDispatchResult")
+        if not isinstance(dispatched, MegaMoEInterNodeContext):
+            raise TypeError("dispatched must be MegaMoEInterNodeContext")
         if dispatched._owner_id != self._owner_id:
             raise ValueError("dispatch result belongs to a different MegaMoEV2 instance")
         if dispatched._generation != self._generation or dispatched is not self._active_dispatch:
@@ -112,7 +112,7 @@ class MegaMoEInterNodeBackend:
             raise ValueError(f"x_fp4 and x_scale must be on current device {o.dev}")
         recv = self.op.dispatch(x_fp4, weights, x_scale, topk_ids)
         self._generation += 1
-        dispatched = MegaMoEDispatchResult(
+        dispatched = MegaMoEInterNodeContext(
             tokens=recv[0], weights=recv[1], scales=recv[2], expert_ids=recv[3],
             num_tokens=recv[4], _source_topk_ids=topk_ids, _source_tokens=tokens,
             _owner_id=self._owner_id, _generation=self._generation,
@@ -133,7 +133,7 @@ class MegaMoEInterNodeBackend:
         x_fp4 = x_fp4.view(x_bf16.shape[0], self.owner.model_dim // 2)
         return self.dispatch_prequant(x_fp4, x_scale, weights, topk_ids)
 
-    def fused_moe(self, dispatched: MegaMoEDispatchResult):
+    def fused_moe(self, dispatched: MegaMoEInterNodeContext):
         from aiter import ActivationType, QuantType, dtypes
         from aiter.fused_moe import fused_moe as run_fused_moe
         from aiter.ops.flydsl.moe_common import GateMode
@@ -152,7 +152,7 @@ class MegaMoEInterNodeBackend:
             num_local_tokens=dispatched.num_tokens[:1].to(dtypes.i32), dtype=torch.bfloat16,
         )
 
-    def combine(self, local_output, dispatched: MegaMoEDispatchResult):
+    def combine(self, local_output, dispatched: MegaMoEInterNodeContext):
         self._validate_active_dispatch(dispatched)
         if dispatched._source_topk_ids.device != self.owner.dev or tuple(
             dispatched._source_topk_ids.shape

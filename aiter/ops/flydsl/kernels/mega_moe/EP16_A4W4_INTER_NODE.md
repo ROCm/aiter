@@ -12,28 +12,23 @@ FP4 和 E8M0 scale 传给 A4W4 `fused_moe`，combine 传输 BF16 输出。
 原有 EP8 A8W4 FlyDSL fused stage1/stage2 路径保持不变。A4W4 入口会严格检查
 gfx950、world size 16、hidden dimension 可被 32 整除，以及 experts 可被 EP 整除。
 
-## API
+## 对外 API
 
 ```python
 moe = MegaMoEV2(..., quant="a4w4", max_tok_per_rank=max_tokens)
-
-# BF16 输入，由后端执行 blockwise FP4 量化
-dispatched = moe.dispatch(x_bf16, topk_weights, topk_ids)
-
-# 或者输入已经量化的 packed FP4 和 E8M0 scale
-dispatched = moe.dispatch_prequant(x_fp4, x_scale, topk_weights, topk_ids)
-
-local_output = moe.fused_moe(dispatched)
-output, output_weights = moe.combine(local_output, dispatched)
+output = moe(x_bf16, topk_weights, topk_ids)
+# 或使用原有预量化入口：
+output = moe.forward_prequant(x_fp4, x_scale, topk_weights, topk_ids)
 ```
 
-`MegaMoEDispatchResult` 保存接收 token、scale、权重、expert id、有效 token 数，
+`MegaMoEInterNodeContext` 保存接收 token、scale、权重、expert id、有效 token 数，
 并在内部保存 source rank 原始 `topk_ids` 和生命周期状态。MORI combine 必须使用
 源侧路由，不能使用 dispatch 返回的接收侧 expert id。当前只有一种 result 生命周期，
 因此不再额外暴露一个 routing class。
 
-直接调用 `moe(x, weights, ids)` 仍可完成 dispatch、A4W4 fused_moe、combine
-全流程；独立接口用于后续把通信与计算分别调度或测量。
+MegaMoEV2 不对外暴露独立 dispatch、fused_moe、combine 方法；EP16 backend 在
+`forward`/`forward_prequant` 内部依次完成三个阶段。专项测试可以直接检查内部 backend，
+但这不属于稳定的用户接口。
 
 ## Rank 与设备
 

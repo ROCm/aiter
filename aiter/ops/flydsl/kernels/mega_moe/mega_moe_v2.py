@@ -331,26 +331,6 @@ class MegaMoEV2:
     forward_bf16 = forward
     __call__ = forward
 
-    def dispatch(self, x_bf16, wts, topk_ids):
-        if self._inter_node is None:
-            raise NotImplementedError("standalone dispatch is currently available for EP16 A4W4")
-        return self._inter_node.dispatch(x_bf16, wts, topk_ids)
-
-    def dispatch_prequant(self, x_q, scales, wts, topk_ids):
-        if self._inter_node is None:
-            raise NotImplementedError("standalone dispatch is currently available for EP16 A4W4")
-        return self._inter_node.dispatch_prequant(x_q, scales, wts, topk_ids)
-
-    def fused_moe(self, dispatched):
-        if self._inter_node is None:
-            raise NotImplementedError("standalone fused_moe is currently available for EP16 A4W4")
-        return self._inter_node.fused_moe(dispatched)
-
-    def combine(self, local_output, routing):
-        if self._inter_node is None:
-            raise NotImplementedError("standalone combine is currently available for EP16 A4W4")
-        return self._inter_node.combine(local_output, routing)
-
     def _build_fused_stage2(self):
         from .mega_moe_stage2 import run_mega_moe_stage2
 
