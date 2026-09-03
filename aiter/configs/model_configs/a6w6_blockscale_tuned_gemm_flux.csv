@@ -2,9 +2,9 @@ gfx,cu_num,M,N,K,kernelId,splitK,us,kernelName,tflops,bw,errRatio
 gfx950,256,3072,3072,8192,6,0,55.2446,f6gemm_stnt_allk_kernel_func,2798.81,1024.95,0.0
 gfx950,256,3072,3072,16384,6,0,103.2083,f6gemm_stnt_allk_kernel_func,2996.25,914.38,0.0
 gfx950,256,3072,3072,32768,6,0,200.1889,f6gemm_stnt_allk_kernel_func,3089.46,848.55,0.0
-gfx950,256,8192,3072,3072,0,0,57.195,f6gemm_dmabig_kernel_func,2703.36,1333.75,0.0
+gfx950,256,8192,3072,3072,6,0,57.91,f6gemm_stnt_allk_kernel_func,2669.64,1317.28,0.0
 gfx950,256,8192,3072,9216,6,0,139.7301,f6gemm_stnt_allk_kernel_func,3319.66,917.4,0.0
-gfx950,256,8192,3072,12288,5,0,188.1074,f6gemm_stnt_kernel_func,3287.88,819.43,0.0
+gfx950,256,8192,3072,12288,4,0,190.34,f6gemm_dmabig_allk_kernel_func,3249.32,809.83,0.0
 gfx950,256,9216,3072,8192,6,0,133.6504,f6gemm_stnt_allk_kernel_func,3470.67,988.55,0.0
 gfx950,256,9216,3072,16384,6,0,253.6368,f6gemm_stnt_allk_kernel_func,3657.64,818.56,0.0
 gfx950,256,9216,3072,32768,5,0,521.8362,f6gemm_stnt_kernel_func,3555.57,687.21,0.0
