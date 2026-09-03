@@ -2,11 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from aiter.ops.triton.attention.unified_attention import (
-    is_2d_gfx1250_gluon_available,
+    _is_gluon_available,
+    is_2d_gluon_available,
     unified_attention,
 )
 from aiter.ops.triton.utils._triton import arch_info
@@ -433,7 +436,7 @@ def test_triton_unified_attn_3d(
         LDS_limit = 327680 if IS_DEVICE_ARCH_GFX12 else 262144
         if kv_cache_shared_mem_size > LDS_limit:
             pytest.skip(
-                f"Skipping test for KV cache LDS required memory = {kv_cache_shared_mem_size/1024} kB > 320 kB"
+                f"Skipping test for KV cache LDS required memory = {kv_cache_shared_mem_size / 1024} kB > 320 kB"
             )
 
     # TODO: Uncomment after pytorch adds support for manual_seed
@@ -580,6 +583,7 @@ def test_triton_unified_attn_3d(
         False,
     ],
 )
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 @torch.inference_mode()
 def test_triton_unified_attn(
     seq_lens: list[tuple[int, int]],
@@ -596,9 +600,22 @@ def test_triton_unified_attn(
     use_kv_descale: bool,
     use_out_scale: bool,
     shuffled_kv_cache: bool,
+    backend: str,  # "triton" | "gluon"
 ) -> None:
-    use_gluon_2d = is_2d_gfx1250_gluon_available(
-        q_dtype, kv_dtype, soft_cap, False, False
+    if backend == "gluon" and not _is_gluon_available():
+        pytest.skip(f"skip gluon backend, not available on {DEVICE_ARCH}")
+    use_gluon_2d = is_2d_gluon_available(
+        SimpleNamespace(
+            q_dtype=q_dtype,
+            kv_cache_dtype=kv_dtype,
+            softcap=soft_cap,
+            use_qq_bias=False,
+            use_alibi_slopes=False,
+            head_size=head_size,
+            head_size_v=head_size,
+            shuffled_kv_cache=shuffled_kv_cache,
+        ),
+        backend,
     )
     torch.manual_seed(0)
     # shuffling only supported for gfx1250 gluon kernels
@@ -664,6 +681,7 @@ def test_triton_unified_attn(
         sinks=sinks,
         output_scale=output_scale,
         shuffled_kv_cache=shuffled_kv_cache,
+        backend=backend,
     )
 
     ref_output = ref_paged_attn(
@@ -701,6 +719,7 @@ def test_triton_unified_attn(
             f"(max abs diff {torch.max(torch.abs(output - ref_output))})"
         )
     else:
-        torch.testing.assert_close(
-            output, ref_output, atol=atol, rtol=rtol
-        ), f"{torch.max(torch.abs(output - ref_output))}"
+        (
+            torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol),
+            f"{torch.max(torch.abs(output - ref_output))}",
+        )
