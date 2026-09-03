@@ -526,6 +526,9 @@ def main():
             (world_tokens, args.topk), dtype=torch.float32, device=device
         )
         ids_g = torch.empty((world_tokens, args.topk), dtype=torch.int32, device=device)
+        tp_local_out = torch.empty(
+            (tokens, args.model_dim), dtype=torch.bfloat16, device=device
+        )
 
         def tp_body():
             dist.all_gather_into_tensor(x_g, x.contiguous())
@@ -545,14 +548,17 @@ def main():
                 swiglu_limit=SWIGLU_LIMIT,
                 gate_mode=GateMode.INTERLEAVE.value,
             )
-            dist.all_reduce(tp_out, op=dist.ReduceOp.SUM)
-            holders["tp"] = tp_out
+            # Only this rank's [rank*tokens:(rank+1)*tokens) slice of the fully-reduced
+            # output is ever used, so replace all_reduce (= reduce_scatter + all_gather)
+            # with just reduce_scatter to skip the unneeded all_gather half.
+            dist.reduce_scatter_tensor(tp_local_out, tp_out, op=dist.ReduceOp.SUM)
+            holders["tp"] = tp_local_out
 
         tp_graph = capture(tp_body)
         print(f"[STEP] rank={rank} tp-capture-done", flush=True)
         tp_ms = time_graph(tp_graph, args.iters, device)
 
-        tp_local = holders["tp"][rank * tokens : (rank + 1) * tokens]
+        tp_local = holders["tp"]
         barrier()
         mori_graph.replay()
         torch.cuda.synchronize()
