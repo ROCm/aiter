@@ -40,6 +40,7 @@ SHAPE_ARGNAMES=""
 # wrong in both directions; when it is, a caller who can see the target should be able
 # to say so rather than having a runner-selection artefact charged to the PR author.
 RUNNER_OVERRIDE=""
+RUNNER_REASON=""
 AXES=()
 AXIS_CLI=()
 AXIS_CLI_OVERRIDE=()
@@ -104,6 +105,7 @@ while [ "$#" -gt 0 ]; do
     --shape-argnames) need_value "$@"; SHAPE_ARGNAMES="$2"; shift 2;;
     --axis) need_value "$@"; AXES+=("$2"); shift 2;;
     --runner) need_value "$@"; RUNNER_OVERRIDE="$2"; shift 2;;
+    --runner-reason) need_value "$@"; RUNNER_REASON="$2"; shift 2;;
     --tol-table) need_value "$@"; TOL_TABLE="$2"; shift 2;;
     --label) need_value "$@"; LABEL="$2"; shift 2;;
     --out) need_value "$@"; OUT="$2"; shift 2;;
@@ -809,162 +811,42 @@ fi
 TEST_PYTHONPATH="$PROBE_DIR:$SCRIPT_DIR:$TEST_PYTHONPATH"
 TEST_FILE=${TESTS%%::*}
 TARGET_PATH="$REPO_WT/$TEST_FILE"
-RUNNER_JSON=$(python3 - "$TARGET_PATH" "$TESTS" <<'PY'
-import ast
-import json
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1])
-selector = sys.argv[2]
-if "::" in selector:
-    result = {"runner": "pytest", "reason": "explicit pytest node selector"}
-elif not path.is_file():
-    result = {"runner": "none", "reason": "target file does not exist on head"}
-else:
-    try:
-        tree = ast.parse(path.read_text())
-    except (OSError, SyntaxError) as error:
-        result = {"runner": "none", "reason": f"target AST is not readable: {error}"}
-    else:
-        # "Defines a test* function" is not the same as "pytest can collect it". aiter's
-        # dominant op_tests convention is a SCRIPT whose worker happens to be named
-        # `test_<op>(m, d, dtype)` and is called from `main()` with real arguments. pytest
-        # collects it, cannot supply the parameters, and errors -- and the validator then
-        # published "the PR adds this test target and it fails on head" against the author,
-        # on a target that is green run as a script with the very shapes the run requested.
-        # Observed on ROCm/aiter#5081 and, in its argv-parsing variant, on ROCm/aiter#5172.
-        def decorator_names(node):
-            names = []
-            for decorator in node.decorator_list:
-                current = decorator.func if isinstance(decorator, ast.Call) else decorator
-                parts = []
-                while isinstance(current, ast.Attribute):
-                    parts.append(current.attr)
-                    current = current.value
-                if isinstance(current, ast.Name):
-                    parts.append(current.id)
-                names.append(".".join(reversed(parts)))
-            return names
-
-        def collectable(node):
-            if any(
-                "parametrize" in name or "fixture" in name or "usefixtures" in name
-                for name in decorator_names(node)
-            ):
-                return True
-            spec = node.args
-            required = [*spec.posonlyargs, *spec.args]
-            defaults = spec.defaults or []
-            if defaults:
-                required = required[: len(required) - len(defaults)]
-            # A required positional parameter can still be a fixture, but a fixture the
-            # module itself does not define and does not import is not one pytest will find
-            # in a bare op_tests file. Being conservative in the other direction -- calling
-            # such a target collectable -- is what produced the false blocker.
-            return not required
-
-        pytest_nodes = [
-            node
-            for node in tree.body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name.startswith("test")
-        ]
-        has_test_class = any(
-            isinstance(node, ast.ClassDef) and node.name.startswith("Test")
-            for node in tree.body
-        )
-        has_pytest = has_test_class or any(collectable(node) for node in pytest_nodes)
-        uncollectable_only = bool(pytest_nodes) and not has_pytest
-        has_main = any(
-            isinstance(node, ast.If)
-            and isinstance(node.test, ast.Compare)
-            and isinstance(node.test.left, ast.Name)
-            and node.test.left.id == "__name__"
-            and len(node.test.ops) == 1
-            and isinstance(node.test.ops[0], ast.Eq)
-            and len(node.test.comparators) == 1
-            and isinstance(node.test.comparators[0], ast.Constant)
-            and node.test.comparators[0].value == "__main__"
-            for node in tree.body
-        )
-        # A module that parses argv in its BODY cannot be collected by pytest: the import
-        # pytest performs runs that call with pytest's own argv and argparse exits the
-        # process. Observed on ROCm/aiter#5172, whose target defines test nodes AND parses
-        # argv at module level -- it is green as a script and dies in collection, and the
-        # report described it as a red target with no hint that the runner was the cause.
-        parses_argv_at_import = any(
-            isinstance(node, ast.Call)
-            and getattr(node.func, "attr", "") in {"parse_args", "parse_known_args"}
-            for statement in tree.body
-            if not isinstance(
-                statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-            )
-            for node in ast.walk(statement)
-        )
-        if has_pytest:
-            result = {"runner": "pytest", "reason": "target defines pytest test nodes"}
-            if parses_argv_at_import:
-                result["runner_risk"] = (
-                    "the target parses argv in its module body, which pytest executes at "
-                    "collection with its own argv; a collection error here is a property "
-                    "of the runner selection, not necessarily of the code under test"
-                )
-        elif has_main:
-            reason = "target has a __main__ entry point"
-            if uncollectable_only:
-                reason += (
-                    "; its test* functions take required positional parameters and carry no"
-                    " parametrize/fixture decorator, so pytest cannot collect them"
-                )
-            result = {"runner": "script", "reason": reason}
-        elif uncollectable_only:
-            result = {
-                "runner": "none",
-                "reason": (
-                    "target's only test* functions take required positional parameters with"
-                    " no parametrize/fixture decorator, and it has no __main__ entry point,"
-                    " so neither runner can execute it"
-                ),
-            }
-        else:
-            result = {"runner": "none", "reason": "target has no pytest nodes or __main__ entry point"}
-print(json.dumps(result))
-PY
-)
-TARGET_RUNNER=$(python3 - "$RUNNER_JSON" <<'PY'
-import json
-import sys
-
-print(json.loads(sys.argv[1])["runner"])
-PY
-)
-TARGET_RUNNER_REASON=$(python3 - "$RUNNER_JSON" <<'PY'
-import json
-import sys
-
-print(json.loads(sys.argv[1])["reason"])
-PY
-)
-jset_string "test_selection.runner" "$TARGET_RUNNER"
-if [ -n "$RUNNER_OVERRIDE" ] && [ "$TARGET_RUNNER" != "none" ]; then
+# The runner is DECLARED by the caller, not derived here. Reading the target and deciding
+# whether pytest can collect it is judgement, and judgement belongs in the prompt -- but a
+# declaration is not a measurement, so the report records which of the two it got. A reader who
+# cannot tell "the validator determined this" from "the caller asserted this" cannot weigh a
+# runner-caused failure correctly, and that failure gets charged to the PR author.
+TARGET_RUNNER="none"
+TARGET_RUNNER_REASON=""
+TARGET_RUNNER_BASIS=""
+if [ ! -f "$TARGET_PATH" ]; then
+  TARGET_RUNNER="none"
+  TARGET_RUNNER_REASON="target file does not exist on head"
+  TARGET_RUNNER_BASIS="target-missing"
+elif [ "$TESTS" != "${TESTS%%::*}" ]; then
+  # A `path::node` selector is not a judgement about the file; nothing can run that string as a
+  # script. This one fact stays here because it is syntax, not analysis.
+  TARGET_RUNNER="pytest"
+  TARGET_RUNNER_REASON="explicit pytest node selector"
+  TARGET_RUNNER_BASIS="explicit-node-selector"
+elif [ -n "$RUNNER_OVERRIDE" ]; then
   case "$RUNNER_OVERRIDE" in
-    pytest|script)
-      if [ "$RUNNER_OVERRIDE" != "$TARGET_RUNNER" ]; then
-        TARGET_RUNNER_REASON="caller forced --runner $RUNNER_OVERRIDE (structural selection said $TARGET_RUNNER: $TARGET_RUNNER_REASON)"
-        TARGET_RUNNER="$RUNNER_OVERRIDE"
-        jset_string "test_selection.runner" "$TARGET_RUNNER"
-      fi
-      ;;
-    *) echo "--runner must be pytest or script" >&2; exit 2;;
+    pytest|script|none) TARGET_RUNNER="$RUNNER_OVERRIDE" ;;
+    *) echo "--runner must be pytest, script, or none" >&2; exit 2;;
   esac
+  TARGET_RUNNER_REASON="${RUNNER_REASON:-declared by the caller, which stated no reason}"
+  TARGET_RUNNER_BASIS="declared-by-caller"
+else
+  # Refusing to guess is the whole point. A default of "pytest" here is what published a
+  # collection error as the PR's test failing on head.
+  TARGET_RUNNER="none"
+  TARGET_RUNNER_REASON="no --runner was declared for this target, so it was not run"
+  TARGET_RUNNER_BASIS="undeclared"
 fi
+jset_string "test_selection.runner" "$TARGET_RUNNER"
 jset_string "test_selection.runner_reason" "$TARGET_RUNNER_REASON"
-TARGET_RUNNER_RISK=$(python3 -c \
-  'import json,sys; print(json.loads(sys.argv[1]).get("runner_risk",""))' "$RUNNER_JSON")
-if [ -n "$TARGET_RUNNER_RISK" ]; then
-  jset_string "test_selection.runner_risk" "$TARGET_RUNNER_RISK"
-fi
+jset_string "test_selection.runner_basis" "$TARGET_RUNNER_BASIS"
+
 # Two independent channels can carry the S1 grid: the target's own CLI flag (--shape-arg)
 # and an environment variable it reads (--shape-env). They are probed separately and the
 # results are combined, because a caller who supplies both is describing one target that has
@@ -2361,12 +2243,11 @@ PY
         finding "note" "correctness" \
           "the test target is red on both baseline and head; the failure is not attributed without matching failure evidence"
       fi
-      # "Red on both sides" is an attribution, not an explanation. When the target carries a
-      # structural reason the selected RUNNER cannot run it, that reason belongs in the
-      # report -- otherwise a reader concludes the code is broken when the runner choice is.
-      if [ -n "$TARGET_RUNNER_RISK" ] && [ "$HEAD_EXECUTED" -eq 0 ]; then
+      # "Red on both sides" is an attribution, not an explanation. A reader who is not told
+      # that the runner could be the cause concludes the code is broken when the choice was.
+      if [ "$HEAD_EXECUTED" -eq 0 ]; then
         finding "note" "correctness" \
-          "the target executed nothing under the selected $TARGET_RUNNER runner, and $TARGET_RUNNER_RISK"
+          "the target executed nothing under the $TARGET_RUNNER runner ($TARGET_RUNNER_BASIS); a runner that cannot collect or execute this target produces exactly this result, so the runner selection is a candidate cause and the code is not the only one"
       fi
     fi
 

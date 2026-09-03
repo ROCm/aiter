@@ -402,10 +402,6 @@
         "axis_state_reason": {
           "type": "string"
         },
-        "runner_risk": {
-          "type": "string",
-          "description": "A structural reason the SELECTED runner may be unable to run this target, e.g. a module body that parses argv, which pytest executes at collection with its own argv."
-        },
         "axes": {
           "type": "array",
           "description": "Extra independent test axes, each on its own CLI flag. The shape grid is one ordered tuple on one channel; an axis is a separate knob the shape flag cannot reach, such as a head count.",
@@ -462,9 +458,15 @@
             ]
           }
         },
-        "runner_risk": {
+        "runner_basis": {
           "type": "string",
-          "description": "A structural reason the SELECTED runner may be unable to run this target, e.g. a module body that parses argv, which pytest executes at collection with its own argv."
+          "enum": [
+            "declared-by-caller",
+            "explicit-node-selector",
+            "target-missing",
+            "undeclared"
+          ],
+          "description": "Where the runner came from. The validator no longer classifies the target, so 'declared-by-caller' marks the runner as the caller's claim rather than a measurement -- a distinction a reader needs to weigh a failure that the runner choice, not the code, produced."
         }
       }
     },

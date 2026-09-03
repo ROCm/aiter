@@ -235,7 +235,10 @@ class ValidatorFixture:
         cwd=None,
         axes=(),
         perf_control_column=None,
-        runner=None,
+        # The validator no longer classifies the target; the caller declares how to run it. This
+        # default matches the fixture target, and a test whose subject is a script target says so
+        # explicitly -- the same obligation a real caller now has.
+        runner="pytest",
     ):
         report = self.root / f"{patch.stem}-report.json"
         # `cwd` exists for one reason: the validator has to accept RELATIVE --patch/--out from
@@ -503,6 +506,7 @@ class ValidateKernelPrTests(unittest.TestCase):
         result, report = self.fixture.validate(
             patch,
             tests="tests/verify_kernel.py",
+            runner="script",
             grid=False,
         )
 
@@ -539,6 +543,7 @@ class ValidateKernelPrTests(unittest.TestCase):
         result, report = self.fixture.validate(
             patch,
             tests="tests/verify_kernel.py",
+            runner="script",
             grid=False,
         )
 
@@ -561,6 +566,9 @@ class ValidateKernelPrTests(unittest.TestCase):
             patch,
             tests="tests/kernel_helpers.py",
             grid=False,
+            # Neither runner can execute a library-only file, so a caller reading it declares
+            # nothing -- and a target nobody can run is a skip, never a test failure.
+            runner=None,
         )
 
         self.assertEqual(2, result.returncode)
@@ -976,6 +984,7 @@ class ValidateKernelPrTests(unittest.TestCase):
         _, report = self.fixture.validate(
             patch,
             tests="tests/verify_kernel.py",
+            runner="script",
             shape_env=None,
             shape_arg="--shapes",
         )
@@ -1412,6 +1421,9 @@ class ValidateKernelPrTests(unittest.TestCase):
         return self.fixture.make_patch(mutate, name)
 
     def _validate_axis_target(self, patch, **kwargs):
+        # This target takes its shapes on its own CLI flag and runs from __main__: a script, and
+        # the caller is the one who has to say so now.
+        kwargs.setdefault("runner", "script")
         return self.fixture.validate(
             patch,
             tests=self.AXIS_TARGET_PATH,
@@ -1592,6 +1604,7 @@ class ValidateKernelPrTests(unittest.TestCase):
             shape_env=None,
             shape_arg="--shapes",
             perf=False,
+            runner="script",
             grid=False,
         )
 
@@ -1853,9 +1866,11 @@ class ValidateKernelPrTests(unittest.TestCase):
         )
 
         selection = report["test_selection"]
-        # "Defines a test* function" is not the same as "pytest can collect it".
+        # "Defines a test* function" is not the same as "pytest can collect it" -- that
+        # judgement now lives in SKILL.md and arrives as a declaration, which the report marks
+        # as one so a reader can weigh it.
         self.assertEqual("script", selection["runner"])
-        self.assertIn("pytest cannot collect them", selection["runner_reason"])
+        self.assertEqual("declared-by-caller", selection["runner_basis"])
         # And because it is a script, the shape grid and the axis both reach it.
         self.assertEqual("cli", selection["grid_channel"])
         self.assertEqual("proven", selection["axis_state"])
@@ -1912,7 +1927,10 @@ class ValidateKernelPrTests(unittest.TestCase):
             report["stages"]["correctness_repo_tests"]["stats"]["observed_work"], 0
         )
 
-    def test_the_caller_can_force_a_runner_the_classifier_got_wrong(self):
+    def test_a_declared_runner_is_recorded_as_a_declaration(self):
+        # The validator does not classify the target any more, so the runner in the report is
+        # the caller's claim. A reader who cannot tell a claim from a measurement cannot weigh
+        # a runner-caused failure, and that failure lands on the PR author.
         patch = self._axis_patch(
             "forced-runner.patch", body=self.UNCOLLECTABLE_WORKER_TARGET
         )
@@ -1929,13 +1947,45 @@ class ValidateKernelPrTests(unittest.TestCase):
 
         selection = report["test_selection"]
         self.assertEqual("pytest", selection["runner"])
-        self.assertIn("caller forced --runner pytest", selection["runner_reason"])
-        self.assertIn("structural selection said script", selection["runner_reason"])
+        self.assertEqual("declared-by-caller", selection["runner_basis"])
+
+    def test_an_undeclared_runner_runs_nothing_rather_than_guessing(self):
+        # The guess is what this replaced: classifying an op_tests script as pytest published
+        # a collection error as "the PR's own test fails on head" (ROCm/aiter#5081). Refusing
+        # is inconclusive, which is the honest word for it.
+        patch = self._axis_patch(
+            "undeclared-runner.patch", body=self.UNCOLLECTABLE_WORKER_TARGET
+        )
+        result, report = self.fixture.validate(
+            patch,
+            tests=self.AXIS_TARGET_PATH,
+            expected_route="axis_kernel:run_kernel",
+            shape_env=None,
+            shape_arg="--shapes",
+            perf=False,
+            grid=False,
+            runner=None,
+        )
+
+        selection = report["test_selection"]
+        self.assertEqual("none", selection["runner"])
+        self.assertEqual("undeclared", selection["runner_basis"])
+        self.assertIn("no --runner was declared", selection["runner_reason"])
+        self.assertEqual("INCONCLUSIVE", report["verdict"])
+        self.assertEqual(2, result.returncode)
+        # Refusing to run is not the same as finding a defect, and must never be charged to
+        # the author as one.
+        self.assertFalse(
+            any(item["severity"] == "blocker" for item in report["findings"]),
+            report["findings"],
+        )
 
     def test_a_runner_that_cannot_run_the_target_is_named_as_such(self):
-        # "Red on both sides" is an attribution, not an explanation. When the target carries
-        # a structural reason the SELECTED runner cannot run it, a reader who is not told so
-        # concludes the code is broken when the runner choice is.
+        # "Red on both sides" is an attribution, not an explanation. This target parses argv in
+        # its module body, so pytest dies at collection while the same file is green as a
+        # script (ROCm/aiter#5172). The validator no longer detects that shape -- it now says
+        # so whenever NOTHING executed, which covers this case and every other one where the
+        # runner, not the code, is the candidate cause.
         patch = self._axis_patch(
             "argv-at-import.patch", body=self.ARGV_AT_IMPORT_TARGET
         )
@@ -1948,14 +1998,14 @@ class ValidateKernelPrTests(unittest.TestCase):
             grid_value="9,1023,f32",
             axes=("num_heads=--num-heads:16;32",),
             perf=False,
+            runner="pytest",
         )
 
         selection = report["test_selection"]
         self.assertEqual("pytest", selection["runner"])
-        self.assertIn("parses argv in its module body", selection["runner_risk"])
         self.assertTrue(
             any(
-                "under the selected pytest runner" in item["detail"]
+                "the runner selection is a candidate cause" in item["detail"]
                 for item in report["findings"]
             ),
             report["findings"],
@@ -2074,6 +2124,8 @@ class ValidateKernelPrTests(unittest.TestCase):
             str(patch),
             "--target",
             self.AXIS_TARGET_PATH,
+            "--runner",
+            "script",
             "--expected-route",
             "axis_kernel:run_kernel",
             "--shape-vars",
@@ -2454,6 +2506,7 @@ class GridChannelTests(unittest.TestCase):
         _, report = self.fixture.validate(
             patch,
             tests="tests/run_shapes.py",
+            runner="script",
             expected_route="__main__:run_kernel",
             shape_env="UNREAD_GRID_ENV",
             shape_arg="--shape",
