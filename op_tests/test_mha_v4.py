@@ -665,6 +665,11 @@ def test_mha_v4_mxfp4_fp6_p_pack_matches_permuted_canonical(sequence):
     assert torch.equal(scale, expected_scale)
     assert torch.equal(production_raw, expected_raw)
     assert torch.equal(production_scale, expected_scale)
+    assert production_scale.untyped_storage().nbytes() == production_scale.numel() + 512
+    assert torch.equal(
+        production_scale.as_strided((512,), (1,), production_scale.numel()),
+        torch.zeros(512, device="cuda", dtype=torch.uint8),
+    )
     assert torch.equal(compiled_raw, expected_raw)
     assert torch.equal(compiled_scale, expected_scale)
 
@@ -728,6 +733,11 @@ def test_mha_v4_mxfp4_k_coalesced_layout(sequence):
     assert torch.equal(raw[raw_offset], expected)
 
     assert torch.equal(scale, dense_scale)
+    assert scale.untyped_storage().nbytes() == scale.numel() + 4
+    assert torch.equal(
+        scale.as_strided((4,), (1,), scale.numel()),
+        torch.zeros(4, device="cuda", dtype=torch.uint8),
+    )
     assert coalesced.stride() == (3 * tiles * 8192, 64, tiles * 8192, 1)
 
 

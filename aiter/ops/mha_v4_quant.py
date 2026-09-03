@@ -37,6 +37,10 @@ MHA_V4_MXFP4_V_TILE_TOKENS = FP4_V_TILE_TOKENS
 MHA_V4_MXFP4_V_PACKED_ROW_BYTES = FP4_V_PACKED_BYTES_PER_TOKEN
 MHA_V4_MXFP4_V_SCALE_TILE_BYTES = 512
 MHA_V4_MXFP4_V_BUFFER_SLACK_BYTES = FP4_V_BUFFER_SLACK_BYTES
+# Dense kernels speculatively gather the overlapping final K-scale dword and one lookahead V-scale
+# tile. Keep those reads mapped and zero without changing either scale tensor's logical shape.
+MHA_V4_MXFP4_K_SCALE_SLACK_BYTES = 4
+MHA_V4_MXFP4_V_SCALE_SLACK_BYTES = MHA_V4_MXFP4_V_SCALE_TILE_BYTES
 MHA_V4_MXFP6_V_TILE_TOKENS = 128
 MHA_V4_MXFP6_V_PACKED_ROW_BYTES = 96
 MHA_V4_MXFP6_V_TILE_BYTES = (
@@ -313,7 +317,14 @@ def quantize_mxfp4_k(input: Tensor) -> tuple[Tensor, Tensor]:
     raw = input.new_empty(
         (mxfp4_k_raw_buffer_size(batch, sequence, heads),), dtype=torch.uint8
     )
-    scale = input.new_empty((batch, sequence, heads, head_dim // 32), dtype=torch.uint8)
+    scale_elements = batch * sequence * heads * (head_dim // 32)
+    scale_storage = input.new_empty(
+        (scale_elements + MHA_V4_MXFP4_K_SCALE_SLACK_BYTES,), dtype=torch.uint8
+    )
+    scale_storage[scale_elements:].zero_()
+    scale = scale_storage[:scale_elements].view(
+        batch, sequence, heads, head_dim // 32
+    )
     rotate_activation_mxfp4_quant_k(raw, scale, input)
     return raw, scale
 
@@ -321,9 +332,13 @@ def quantize_mxfp4_k(input: Tensor) -> tuple[Tensor, Tensor]:
 @quantize_mxfp4_k.register_fake
 def _quantize_mxfp4_k_fake(input: Tensor) -> tuple[Tensor, Tensor]:
     batch, sequence, heads, head_dim = input.shape
+    scale_elements = batch * sequence * heads * (head_dim // 32)
+    scale_storage = input.new_empty(
+        (scale_elements + MHA_V4_MXFP4_K_SCALE_SLACK_BYTES,), dtype=torch.uint8
+    )
     return input.new_empty(
         (mxfp4_k_raw_buffer_size(batch, sequence, heads),), dtype=torch.uint8
-    ), input.new_empty((batch, sequence, heads, head_dim // 32), dtype=torch.uint8)
+    ), scale_storage[:scale_elements].view(batch, sequence, heads, head_dim // 32)
 
 
 def mxfp4_k_view(raw: Tensor, scale: Tensor) -> Tensor:
@@ -489,8 +504,13 @@ def quantize_v_mxfp4_fp6_p(input: Tensor) -> tuple[Tensor, Tensor]:
     raw = input.new_empty(
         (mxfp4_v_raw_buffer_size(batch, sequence, heads),), dtype=torch.uint8
     )
-    scale = input.new_empty(
-        (batch, heads, tiles * MHA_V4_MXFP4_V_SCALE_TILE_BYTES), dtype=torch.uint8
+    scale_elements = batch * heads * tiles * MHA_V4_MXFP4_V_SCALE_TILE_BYTES
+    scale_storage = input.new_empty(
+        (scale_elements + MHA_V4_MXFP4_V_SCALE_SLACK_BYTES,), dtype=torch.uint8
+    )
+    scale_storage[scale_elements:].zero_()
+    scale = scale_storage[:scale_elements].view(
+        batch, heads, tiles * MHA_V4_MXFP4_V_SCALE_TILE_BYTES
     )
     _quantize_v_mxfp4_fp6_p_hip(raw, scale, input)
     return raw, scale
@@ -498,7 +518,17 @@ def quantize_v_mxfp4_fp6_p(input: Tensor) -> tuple[Tensor, Tensor]:
 
 @quantize_v_mxfp4_fp6_p.register_fake
 def _quantize_v_mxfp4_fp6_p_raw_fake(input: Tensor) -> tuple[Tensor, Tensor]:
-    return _quantize_v_mxfp4_raw_fake(input)
+    batch, sequence, heads, _ = input.shape
+    tiles = mxfp4_v_tiles(sequence)
+    scale_elements = batch * heads * tiles * MHA_V4_MXFP4_V_SCALE_TILE_BYTES
+    scale_storage = input.new_empty(
+        (scale_elements + MHA_V4_MXFP4_V_SCALE_SLACK_BYTES,), dtype=torch.uint8
+    )
+    return input.new_empty(
+        (mxfp4_v_raw_buffer_size(batch, sequence, heads),), dtype=torch.uint8
+    ), scale_storage[:scale_elements].view(
+        batch, heads, tiles * MHA_V4_MXFP4_V_SCALE_TILE_BYTES
+    )
 
 
 @torch.library.custom_op("aiter::mha_v4_quantize_v_mxfp6", mutates_args=())
