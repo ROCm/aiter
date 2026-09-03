@@ -33,10 +33,7 @@ from aiter.utility.base_tuner import TunerCommon, _read_csv
 CHUNK_SIZE = 64
 BV_CANDIDATES = (16, 32, 64)
 _K5_TEST_PATH = (
-    Path(AITER_ROOT_DIR)
-    / "op_tests"
-    / "flydsl_tests"
-    / "test_flydsl_linear_attention_prefill.py"
+    Path(AITER_ROOT_DIR) / "op_tests" / "test_flydsl_linear_attention_prefill.py"
 )
 LOOKUP_KEYS = (
     "gfx",
@@ -400,7 +397,6 @@ class K5BvTuner(TunerCommon):
 
         _op.reload_tuned_bv_table()
         _op._get_or_compile_opt.cache_clear()
-        _op._compiled_kernels.clear()
 
     def _restore_config_env(self, env_name, old_val, old_rebuild=0):
         super()._restore_config_env(env_name, old_val, old_rebuild)

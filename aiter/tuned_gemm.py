@@ -21,29 +21,26 @@ import os
 import pandas as pd
 import torch
 import torch.nn.functional as F
+from torch import Tensor
 
-import aiter
 from aiter import dtypes, gemm_a16w16_asm, hipb_create_extension, hipb_mm, logger
 from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.jit.utils.torch_guard import torch_compile_guard
-
-try:
-    from aiter.ops.flydsl.utils import is_flydsl_available
-except ImportError:
-
-    def is_flydsl_available():
-        return False
-
-
-from torch import Tensor
-
 from aiter.ops.gemm_op_common import get_padded_m
 
 try:
     from aiter.ops.opus.gemm_op_a16w16 import opus_gemm_a16w16_tune as _opus_tune
 except Exception:  # noqa: BLE001  blanket catch is intentional here
     _opus_tune = None
+
+
+@functools.lru_cache(maxsize=1)
+def _get_flydsl_gemm_kernels():
+    from aiter.ops.flydsl import gemm_kernels
+
+    return gemm_kernels
+
 
 # NOTE: gfx1250 split-K kids allocate their partial-sum workspace as a plain
 # torch.empty tensor (see aiter.ops.opus.gemm_op_a16w16._get_opus_workspace)
@@ -161,37 +158,36 @@ def get_GEMM_A16W16_config(
         )
         if config is not None:
             if config["libtype"] == "flydsl":
-                if is_flydsl_available():
-                    flydsl_config = aiter.ops.flydsl.gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
+                flydsl_config = (
+                    _get_flydsl_gemm_kernels().get_flydsl_splitk_hgemm_kernel_params(
                         config["kernelName"]
                     )
-                    name_n = None if flydsl_config is None else flydsl_config.get("n")
-                    name_k = None if flydsl_config is None else flydsl_config.get("k")
-                    shape_mismatch = (
-                        name_n is not None
-                        and name_k is not None
-                        and (name_n != N or name_k != K)
+                )
+                name_n = None if flydsl_config is None else flydsl_config.get("n")
+                name_k = None if flydsl_config is None else flydsl_config.get("k")
+                shape_mismatch = (
+                    name_n is not None
+                    and name_k is not None
+                    and (name_n != N or name_k != K)
+                )
+                if (
+                    flydsl_config is None
+                    or flydsl_config.get("target_gfx") != gfx
+                    or shape_mismatch
+                    or int(config["splitK"]) != flydsl_config.get("split_k")
+                ):
+                    logger.warning(
+                        f"FlyDSL kernel '{config['kernelName']}' from tuned config is not "
+                        "recognized or has incompatible architecture/split-K metadata; "
+                        "falling back to next candidate."
                     )
-                    if (
-                        flydsl_config is None
-                        or flydsl_config.get("target_gfx") != gfx
-                        or shape_mismatch
-                        or int(config["splitK"]) != flydsl_config.get("split_k")
-                    ):
-                        logger.warning(
-                            f"FlyDSL kernel '{config['kernelName']}' from tuned config is not "
-                            "recognized or has incompatible architecture/split-K metadata; "
-                            "falling back to next candidate."
-                        )
-                        config = None
-                else:
                     config = None
             elif config["libtype"] == "flydsl_decode":
                 if padded_M != M:
                     # Decode kernels are exact-M specializations. Never reuse a
                     # padded CSV row or introduce a runtime M-tail.
                     config = None
-                elif is_flydsl_available():
+                else:
                     try:
                         from aiter.ops.flydsl.gemm_kernels import (
                             parse_gemm_decode_kernel_name,
@@ -220,8 +216,6 @@ def get_GEMM_A16W16_config(
                             config = None
                     except (ImportError, ValueError):
                         config = None
-                else:
-                    config = None
             if config is None:
                 continue
             if AITER_LOG_TUNED_CONFIG:
@@ -535,8 +529,9 @@ def flydsl_gemm(
     assert (
         scale_a is None and scale_b is None and scale_c is None
     ), "FlyDSL hgemm does not support scaling yet."
-    flydsl_config = aiter.ops.flydsl.gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
-        config["kernelName"]
+    flydsl_gemm_kernels = _get_flydsl_gemm_kernels()
+    flydsl_config = flydsl_gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
+        config["kernelName"],
     )
     runtime_shape = (int(weights.shape[0]), int(inp.shape[1]))
     parsed_n = None if flydsl_config is None else flydsl_config.get("n")
@@ -558,7 +553,7 @@ def flydsl_gemm(
         and bias.dtype == inp.dtype
     ):
         fused_bias = bias
-    out = aiter.ops.flydsl.gemm_kernels.flydsl_hgemm(
+    out = flydsl_gemm_kernels.flydsl_hgemm(
         inp,
         weights,
         bias=fused_bias,

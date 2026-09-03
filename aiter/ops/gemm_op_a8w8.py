@@ -21,7 +21,6 @@ from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..ops.flydsl.splitk_bpreshuffle_common import (
     dispatch_flydsl_splitk,
-    is_flydsl_available,
 )
 from ..ops.gemm_op_common import get_padded_m
 from ..utility import dtypes
@@ -821,12 +820,12 @@ def gemm_a8w8_bpreshuffle(
             return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, splitK)
         elif libtype == "cktile":
             return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y, splitK)
-        elif libtype == "flydsl" and is_flydsl_available():
+        elif libtype == "flydsl":
             if w_k > k:
                 XQ = F.pad(XQ.contiguous(), (0, w_k - k), value=0)
             return gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
 
-    if get_gfx() == "gfx1250" and is_flydsl_available():
+    if get_gfx() == "gfx1250":
         from ..ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_wmma_common import (
             kernel_fits_shape,
             kernels_list,
@@ -1056,10 +1055,6 @@ def gemm_a8w8_blockscale_bpreshuffle(
                 is_x_scale_transposed=True,
                 backend=backend,
             )
-        if not is_flydsl_available():
-            raise RuntimeError(
-                "gfx1250 mxfp8_128 bpreshuffle (fp8_e8m0 scales) requires FlyDSL"
-            )
         if config is not None and config["libtype"] == "flydsl":
             return gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
                 XQ, WQ, x_scale, w_scale, Y, config
@@ -1182,44 +1177,44 @@ def gemm_a8w8_blockscale_bpreshuffle(
             return opus_gemm_a8w8_blockscale_bpreshuffle_tune(
                 XQ, WQ, x_scale, w_scale, Y, kernelId=kernelId
             )
-        elif (
-            libtype == "flydsl"
-            and is_flydsl_available()
-            and kernelName.startswith("flydsl_bpreshuffle_splitk_")
-        ):
-            parsed = _parse_flydsl_splitk_kernel_name(kernelName)
-            if parsed is not None:
-                (
-                    tm,
-                    tn,
-                    tk,
-                    sk,
-                    acp,
-                    wpe,
-                    xcd_swizzle,
-                    lds_stage,
-                    scheduler,
-                    scale_mode,
-                    use_m_bounded_store,
-                ) = parsed
-                return dispatch_flydsl_splitk(
-                    XQ,
-                    WQ,
-                    x_scale,
-                    w_scale,
-                    Y,
-                    tm,
-                    tn,
-                    tk,
-                    sk,
-                    use_async_copy=acp,
-                    waves_per_eu=wpe,
-                    xcd_swizzle=xcd_swizzle,
-                    lds_stage=lds_stage,
-                    scheduler=scheduler,
-                    scale_mode=scale_mode,
-                    use_m_bounded_store=use_m_bounded_store,
-                )
+        elif libtype == "flydsl":
+            if kernelName.startswith("flydsl_bpreshuffle_splitk_"):
+                parsed = _parse_flydsl_splitk_kernel_name(kernelName)
+                if parsed is not None:
+                    (
+                        tm,
+                        tn,
+                        tk,
+                        sk,
+                        acp,
+                        wpe,
+                        xcd_swizzle,
+                        lds_stage,
+                        scheduler,
+                        scale_mode,
+                        use_m_bounded_store,
+                    ) = parsed
+                    return dispatch_flydsl_splitk(
+                        XQ,
+                        WQ,
+                        x_scale,
+                        w_scale,
+                        Y,
+                        tm,
+                        tn,
+                        tk,
+                        sk,
+                        use_async_copy=acp,
+                        waves_per_eu=wpe,
+                        xcd_swizzle=xcd_swizzle,
+                        lds_stage=lds_stage,
+                        scheduler=scheduler,
+                        scale_mode=scale_mode,
+                        use_m_bounded_store=use_m_bounded_store,
+                    )
+            return gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
+                XQ, WQ, x_scale, w_scale, Y, config
+            )
     try:
         return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
     except RuntimeError as e:
