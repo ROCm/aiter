@@ -48,6 +48,12 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 _CONFIG_NAME = "UNIFIED-ATTENTION"
 _OPS = ("attn_2d", "attn_3d", "reduce", "kv_split")
 
+_ARCH_ALIAS = {
+    "gfx1101": "gfx1100",
+    "gfx1102": "gfx1100",
+    "gfx1150": "gfx1151",
+}
+
 _SEP = "."
 
 _AXIS_KIND = {
@@ -209,7 +215,9 @@ def _axis_values(
 
 def _load(op: str, backend, arch) -> tuple:
     """Return ``(table, axes, cfg_dir)`` for one op."""
-    cfg_dir = resolve_config_dir("attention", _CONFIG_NAME, backend=backend, arch=arch)
+    cfg_dir = resolve_config_dir(
+        "attention", _CONFIG_NAME, backend=backend, arch=_ARCH_ALIAS.get(arch, arch)
+    )
     config = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False)
     if config is None:
         raise AssertionError(
