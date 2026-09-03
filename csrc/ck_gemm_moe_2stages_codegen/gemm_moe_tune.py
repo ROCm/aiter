@@ -6576,25 +6576,28 @@ class Mxfp4FlydslTuner(FmoeTuner):
             return [self._tune_one_shape(row, args) for row in rows]
 
         # One fresh process per shape (memory fully released between shapes),
-        # spread across mp_num GPUs. A shared queue hands out distinct GPU ids so
-        # the mp_num concurrent workers never collide on the same device.
+        # spread across mp_num GPUs, each on a distinct device.
         import multiprocessing as _mp
 
         print(
             f"[mxfp4-port] tuning {len(rows)} shapes across {mp_num} GPUs", flush=True
         )
         ctx = _mp.get_context("spawn")
-        mgr = ctx.Manager()
-        gpu_q = mgr.Queue()
-        for g in range(mp_num):
-            gpu_q.put(g)
-        payloads = [(self.keys, row, args, gpu_q) for row in rows]
-        with ctx.Pool(processes=mp_num, maxtasksperchild=1) as pool:
-            # chunksize=1 so each shape is its own task: with maxtasksperchild=1
-            # the worker is torn down after every shape (memory fully released,
-            # and one process never spans multiple GPUs via the shared queue).
-            results = pool.map(_mxfp4_tune_shape_worker, payloads, chunksize=1)
-        return results
+        payloads = [(self.keys, row, args, None) for row in rows]
+        results = _run_shapes_isolated(payloads, mp_num, ctx)
+        # A None means the shape's process died mid-shape (e.g. a C++ abort()).
+        # Report it as a failed shape rather than dropping it, so the run
+        # finishes and the failure shows up in the summary.
+        return [
+            (
+                res
+                if res is not None
+                else _mxfp4_failed_row(
+                    self.keys, row, args, "FAILED: worker died mid-shape"
+                )
+            )
+            for row, res in zip(rows, results)
+        ]
 
     def post_process(self, results, args, topk=-1, fast_mode=False):
         del args, topk, fast_mode
@@ -6623,10 +6626,10 @@ class Mxfp4FlydslTuner(FmoeTuner):
 
 
 def _mxfp4_tune_shape_worker(payload):
-    """Spawned worker: tune one shape on a queue-assigned GPU (for --mxfp4-flydsl
-    --mp). Rebuilds a minimal tuner since the instance need only carry ``keys``."""
-    keys, row, args, gpu_q = payload
-    gpu = gpu_q.get()
+    """Spawned worker: tune one shape on the parent-assigned GPU (for
+    --mxfp4-flydsl --mp). Rebuilds a minimal tuner since the instance need only
+    carry ``keys``."""
+    keys, row, args, gpu = payload
     try:
         torch.cuda.set_device(gpu)
         tuner = Mxfp4FlydslTuner.__new__(Mxfp4FlydslTuner)
@@ -6639,17 +6642,90 @@ def _mxfp4_tune_shape_worker(payload):
         return tuner._tune_one_shape(row, args)
     except Exception as exc:  # noqa: BLE001
         # Catastrophic (non per-candidate) failure: record as a failed shape so
-        # the pool keeps going instead of aborting the whole run.
-        best = Mxfp4FlydslTuner.__new__(Mxfp4FlydslTuner)
-        best.keys = keys
-        best._candidate_csv = getattr(args, "candidate_csv", "")
-        cand = best._candidate_rows(row)[0]
-        cand["us"] = Mxfp4FlydslTuner.INVALID_TIME
-        cand["kernelName1"] = (f"FAILED(GPU{gpu}): {exc}")[:240]
+        # the run keeps going instead of aborting.
         print(f"[mxfp4-port] shape failed on GPU{gpu}: {exc}", flush=True)
-        return cand
-    finally:
-        gpu_q.put(gpu)
+        return _mxfp4_failed_row(keys, row, args, f"FAILED(GPU{gpu}): {exc}")
+
+
+def _mxfp4_failed_row(keys, row, args, reason):
+    """A tuned-CSV row standing in for a shape that produced no timing.
+
+    Carries `args` only to hand _candidate_rows the same candidate source the
+    shape would have been tuned from, so an agent-recommended CSV still governs
+    the placeholder instead of it falling back to the full sweep.
+    """
+    tuner = Mxfp4FlydslTuner.__new__(Mxfp4FlydslTuner)
+    tuner.keys = keys
+    tuner._candidate_csv = getattr(args, "candidate_csv", "")
+    cand = tuner._candidate_rows(row)[0]
+    cand["us"] = Mxfp4FlydslTuner.INVALID_TIME
+    cand["kernelName1"] = reason[:240]
+    return cand
+
+
+def _mxfp4_shape_proc(payload, out_q, idx):
+    """Child entry point: post the shape's result so the parent can tell a
+    finished shape apart from a worker that died mid-shape."""
+    out_q.put((idx, _mxfp4_tune_shape_worker(payload)))
+
+
+def _run_shapes_isolated(payloads, mp_num, ctx, entry=_mxfp4_shape_proc):
+    """Run each payload in its own fresh process, at most ``mp_num`` at a time.
+
+    Returns one entry per payload: the worker's result, or None if its process
+    died without producing one.
+
+    Why not Pool.map: a pool worker that dies mid-task (a C++ ``abort()`` is not
+    catchable from Python, so an unsupported shape takes the process down with
+    it) is never noticed -- the result simply never arrives and map() waits
+    forever, while the pool quietly spawns idle replacements. Owning the
+    processes lets us read ``exitcode`` and turn a dead worker into a reported
+    failure. GPU ids come from a parent-held free list rather than a shared
+    queue for the same reason: a killed child cannot leak the id it was holding
+    and starve every later shape.
+    """
+    import queue as _queue
+
+    out_q = ctx.Queue()
+    results = [None] * len(payloads)
+    running = {}  # idx -> (Process, gpu)
+    free_gpus = list(range(mp_num))
+    done, nxt = set(), 0
+
+    while len(done) < len(payloads):
+        while nxt < len(payloads) and free_gpus:
+            gpu = free_gpus.pop(0)
+            keys, row, args, _ = payloads[nxt]
+            proc = ctx.Process(
+                target=entry, args=((keys, row, args, gpu), out_q, nxt), daemon=True
+            )
+            proc.start()
+            running[nxt] = (proc, gpu)
+            nxt += 1
+
+        def _reap(idx):
+            proc, gpu = running.pop(idx)
+            proc.join()
+            free_gpus.append(gpu)
+            done.add(idx)
+
+        try:
+            idx, res = out_q.get(timeout=1.0)
+            results[idx] = res
+            _reap(idx)
+        except _queue.Empty:
+            # Nothing arrived for a full second, so any result a just-exited
+            # child had queued would already be here: an exited-but-unreported
+            # index really did die mid-shape.
+            for idx, (proc, _gpu) in list(running.items()):
+                if not proc.is_alive():
+                    print(
+                        f"[mxfp4-port] worker for shape {idx} died "
+                        f"(exitcode={proc.exitcode}) without a result",
+                        flush=True,
+                    )
+                    _reap(idx)
+    return results
 
 
 if __name__ == "__main__":
