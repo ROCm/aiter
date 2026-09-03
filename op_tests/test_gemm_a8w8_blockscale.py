@@ -23,6 +23,7 @@ from aiter.utility import fp4_utils
 
 block_shape = (128, 128)
 TEST_NUM_ITERS = 100
+RANDOM_DISTRIBUTIONS = ("uniform", "norm")
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
@@ -87,16 +88,49 @@ def run_triton(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16, backend=No
 
 
 @benchmark()
-def test_gemm(dtype, m, n, k, ck_preshuffle=True, use_flydsl=False):
+def test_gemm(
+    dtype,
+    m,
+    n,
+    k,
+    ck_preshuffle=True,
+    use_flydsl=False,
+    random_distribution="uniform",
+    const_init=None,
+    seed=0,
+):
     ret = {}
     block_shape_n, block_shape_k = block_shape
     scale_m = m
     scale_n = (n + block_shape_n - 1) // block_shape_n
     scale_k = (k + block_shape_k - 1) // block_shape_k
-    x = (torch.rand((m, k), dtype=dtypes.fp32, device="cuda") / 10).to(dtypes.fp8)
-    weight = (torch.rand((n, k), dtype=dtypes.fp32, device="cuda") / 10).to(dtypes.fp8)
-    x_scale = torch.rand([scale_m, scale_k], dtype=dtypes.fp32, device="cuda")
-    w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device="cuda")
+    torch.manual_seed(seed)
+    if const_init is not None:
+        x = torch.full((m, k), float(const_init), dtype=dtypes.fp32, device="cuda").to(
+            dtypes.fp8
+        )
+        weight = torch.full(
+            (n, k), float(const_init), dtype=dtypes.fp32, device="cuda"
+        ).to(dtypes.fp8)
+        x_scale = torch.full(
+            [scale_m, scale_k], float(const_init), dtype=dtypes.fp32, device="cuda"
+        )
+        w_scale = torch.full(
+            [scale_n, scale_k], float(const_init), dtype=dtypes.fp32, device="cuda"
+        )
+    else:
+        random_fn = torch.rand if random_distribution == "uniform" else torch.randn
+        data_scale = 0.1 if random_distribution == "uniform" else 1.0
+        x = (random_fn((m, k), dtype=dtypes.fp32, device="cuda") * data_scale).to(
+            dtypes.fp8
+        )
+        weight = (random_fn((n, k), dtype=dtypes.fp32, device="cuda") * data_scale).to(
+            dtypes.fp8
+        )
+        # E8M0 block scales must be nonnegative, so retain their existing
+        # uniform initialization for both data distributions.
+        x_scale = torch.rand([scale_m, scale_k], dtype=dtypes.fp32, device="cuda")
+        w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device="cuda")
     use_flydsl_fp8_scale = use_flydsl and ck_preshuffle
     if use_flydsl_fp8_scale:
         FP8_E4M3_MAX = 448.0
@@ -305,6 +339,31 @@ parser.add_argument(
     e.g.: -nk 24576,1536""",
 )
 parser.add_argument(
+    "-r",
+    "--random-distribution",
+    choices=RANDOM_DISTRIBUTIONS,
+    default="uniform",
+    help="input and weight distribution: uniform preserves the existing "
+    "torch.rand initialization; norm uses torch.randn with mean 0 and "
+    "standard deviation 1 (default: uniform)",
+)
+parser.add_argument(
+    "--const-init",
+    type=float,
+    nargs="?",
+    const=0.0,
+    default=None,
+    metavar="VALUE",
+    help="initialize input, weight, and scales with VALUE instead of "
+    "--random-distribution; bare --const-init uses 0.0",
+)
+parser.add_argument(
+    "--seed",
+    type=int,
+    default=0,
+    help="RNG seed for input, weight, and scales (default: 0)",
+)
+parser.add_argument(
     "--ck_preshuffle",
     type=dtypes.str2bool,
     nargs="*",
@@ -364,6 +423,9 @@ if args.csv is not None:
                     int(row["K"]),
                     ck_preshuffle=preshuffle,
                     use_flydsl=args.flydsl,
+                    random_distribution=args.random_distribution,
+                    const_init=args.const_init,
+                    seed=args.seed,
                 )
                 df.append(ret)
 else:
@@ -372,7 +434,15 @@ else:
             for n, k in args.nk:
                 for ck_p in l_preshuffle:
                     ret = test_gemm(
-                        dtype, m, n, k, ck_preshuffle=ck_p, use_flydsl=args.flydsl
+                        dtype,
+                        m,
+                        n,
+                        k,
+                        ck_preshuffle=ck_p,
+                        use_flydsl=args.flydsl,
+                        random_distribution=args.random_distribution,
+                        const_init=args.const_init,
+                        seed=args.seed,
                     )
                     df.append(ret)
 
