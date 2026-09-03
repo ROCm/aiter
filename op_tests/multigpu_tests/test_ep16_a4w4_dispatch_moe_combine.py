@@ -31,8 +31,8 @@ import torch.distributed as dist
 
 import aiter
 from aiter import ActivationType, QuantType, dtypes
-from aiter.fused_moe import fused_moe, fused_topk, torch_moe
-from aiter.ops.flydsl.moe_common import GateMode
+from aiter.fused_moe import fused_topk, situv2
+from aiter.ops.flydsl.kernels.mega_moe import MegaMoEV2
 from aiter.ops.shuffle import shuffle_weight
 from aiter.utility import fp4_utils
 
@@ -235,6 +235,30 @@ def _dequant_tokens(tok_fp4, scale, hidden_dim):
     return (wf * sf).to(torch.bfloat16)
 
 
+def _torch_moe_situv2_reference(x, w1, w2, weights, global_ids, expert_mask):
+    """Local EP reference following test_moe_2stage's SiTUv2 definition."""
+    compute_type = torch.float32
+    batch, model_dim = x.shape
+    topk = weights.shape[1]
+    inter_dim = w2.shape[2]
+    local_hash = expert_mask.cumsum(0, dtype=dtypes.i32) - 1
+    local_hash[expert_mask == 0] = -1
+    local_ids = local_hash[global_ids.long()]
+    x_routes = x.to(compute_type).view(batch, 1, model_dim).expand(-1, topk, -1)
+    out = torch.zeros((batch, topk, model_dim), dtype=compute_type, device=x.device)
+    w1 = w1.to(compute_type)
+    w2 = w2.to(compute_type)
+    for expert_id in range(w1.shape[0]):
+        mask = local_ids == expert_id
+        if mask.any():
+            gate, up = (x_routes[mask] @ w1[expert_id].transpose(0, 1)).split(
+                [inter_dim, inter_dim], dim=-1
+            )
+            hidden = situv2(gate, up, beta=1.0, linear_beta=1.0)
+            out[mask] = hidden @ w2[expert_id].transpose(0, 1)
+    return (out * weights.view(batch, topk, 1)).sum(dim=1).to(x.dtype)
+
+
 def _build_expert_mask(experts, local_expert_start, local_expert_end, device):
     expert_mask = torch.zeros((experts + 1,), dtype=dtypes.i32, device=device)
     expert_mask[local_expert_start:local_expert_end] = 1
@@ -275,41 +299,23 @@ def _run_one_bs(
     topk_ids_bs = topk_ids[:bs].contiguous()
 
     # ---- one live call: dispatch -> dequant -> fused_moe -> combine ----
-    (
-        recv_tok_fp4,
-        recv_wts,
-        recv_scale,
-        recv_idx,
-        recv_num_token,
-    ) = op.dispatch(x_fp4_bs, topk_weights_bs, x_scale_bs, topk_ids_bs)
+    dispatched = op.dispatch_prequant(x_fp4_bs, x_scale_bs, topk_weights_bs, topk_ids_bs)
+    recv_tok_fp4 = dispatched.tokens
+    recv_wts = dispatched.weights
+    recv_scale = dispatched.scales
+    recv_idx = dispatched.expert_ids
+    recv_num_token = dispatched.num_tokens
     torch.cuda.synchronize()
     total_recv = int(recv_num_token[0].item())
 
-    num_local_tokens = recv_num_token[:1].to(dtypes.i32)
-
-    moe_out = fused_moe(
-        recv_tok_fp4,
-        w1_a,
-        w2_a,
-        recv_wts,
-        recv_idx,
-        expert_mask=expert_mask,
-        activation=ActivationType.Silu,
-        gate_mode=GateMode.SEPARATED.value,
-        quant_type=QuantType.per_1x32,
-        w1_scale=w1_s,
-        w2_scale=w2_s,
-        a1_scale=recv_scale,
-        num_local_tokens=num_local_tokens,
-        dtype=torch.bfloat16,
-    )
+    moe_out = op.fused_moe(dispatched)
 
     # combine()'s indices/weights must be THIS rank's own [tokens, topk]
     # routing passed to dispatch() -- NOT dispatch()'s returned recv_idx/
     # recv_wts (ROCm/mori#475). weights=None: fused_moe already applied
     # topk weighting in stage2 (same convention as
     # test_dispatch_combine_internode.py's run_combine).
-    combine_out, combine_out_wts = op.combine(moe_out, None, topk_ids_bs)
+    combine_out, combine_out_wts = op.combine(moe_out, dispatched)
     torch.cuda.synchronize()
     out = combine_out[:bs]
 
@@ -321,14 +327,13 @@ def _run_one_bs(
         recv_tok_bf16 = _dequant_tokens(recv_tok_fp4, recv_scale, model_dim)
         w1_deq = _dequant_weight(w1_qt, w1_scale, (local_experts, 2 * inter_dim, model_dim))
         w2_deq = _dequant_weight(w2_qt, w2_scale, (local_experts, model_dim, inter_dim))
-        ref_moe_out = torch_moe(
+        ref_moe_out = _torch_moe_situv2_reference(
             recv_tok_bf16[:total_recv],
             w1_deq,
             w2_deq,
             recv_wts[:total_recv],
             recv_idx[:total_recv],
-            expert_mask=expert_mask,
-            activation=ActivationType.Silu,
+            expert_mask,
         )
         rel_l2 = float(
             torch.linalg.vector_norm((moe_out[:total_recv] - ref_moe_out).float())
@@ -388,33 +393,16 @@ def _run_one_bs(
     for i in range(iters):
         event_base = 4 * i
         events[event_base].record()
-        (
-            recv_tok_fp4,
-            recv_wts,
-            recv_scale,
-            recv_idx,
-            recv_num_token,
-        ) = op.dispatch(x_fp4_bs, topk_weights_bs, x_scale_bs, topk_ids_bs)
+        dispatched = op.dispatch_prequant(x_fp4_bs, x_scale_bs, topk_weights_bs, topk_ids_bs)
+        recv_tok_fp4 = dispatched.tokens
+        recv_wts = dispatched.weights
+        recv_scale = dispatched.scales
+        recv_idx = dispatched.expert_ids
+        recv_num_token = dispatched.num_tokens
         events[event_base + 1].record()
-        num_local_tokens = recv_num_token[:1].to(dtypes.i32)
-        moe_out = fused_moe(
-            recv_tok_fp4,
-            w1_a,
-            w2_a,
-            recv_wts,
-            recv_idx,
-            expert_mask=expert_mask,
-            activation=ActivationType.Silu,
-            gate_mode=GateMode.SEPARATED.value,
-            quant_type=QuantType.per_1x32,
-            w1_scale=w1_s,
-            w2_scale=w2_s,
-            a1_scale=recv_scale,
-            num_local_tokens=num_local_tokens,
-            dtype=torch.bfloat16,
-        )
+        moe_out = op.fused_moe(dispatched)
         events[event_base + 2].record()
-        combine_out, combine_out_wts = op.combine(moe_out, None, topk_ids_bs)
+        combine_out, combine_out_wts = op.combine(moe_out, dispatched)
         events[event_base + 3].record()
     torch.cuda.synchronize()
 
@@ -643,25 +631,20 @@ def run_ep16_a4w4(
         x_fp4, x_scale = torch_quant_act(x, quant_dtype=dtypes.fp4x2)
         x_fp4 = x_fp4.view(max_bs, model_dim // 2)
 
-        config = mori.ops.EpDispatchCombineConfig(
-            data_type=dtypes.fp4x2,
+        op = MegaMoEV2(
             rank=rank,
             world_size=world_size,
-            hidden_dim=model_dim,
-            scale_dim=model_dim // 32,
-            scale_type_size=1,
-            max_num_inp_token_per_rank=max_bs,
-            num_experts_per_rank=local_experts,
-            num_experts_per_token=topk,
-            max_token_type_size=2,
-            kernel_type=mori.ops.EpDispatchCombineKernelType.InterNodeV1LL,
-            gpu_per_node=gpu_per_node,
-            num_qp_per_pe=2,
-            rdma_block_num=64,
-            block_num=96,
-            warp_num_per_block=8,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            quant="a4w4",
+            w1=w1_a,
+            w1_scale=w1_s,
+            w2=w2_a,
+            w2_scale=w2_s,
+            max_tok_per_rank=max_bs,
         )
-        op = mori.ops.EpDispatchCombineOp(config)
 
         _barrier()
 

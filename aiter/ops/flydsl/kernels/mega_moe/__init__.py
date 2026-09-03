@@ -8,6 +8,7 @@ import importlib
 _LAZY = {
     "MegaMoEConfig": "mega_moe_config",
     "MegaMoEV2": "mega_moe_v2",
+    "MegaMoEDispatchResult": "inter_node",
     "Stage1Config": "mega_moe_config",
     "Stage2Config": "mega_moe_config",
     "compile_gemm1": "gemm1",
