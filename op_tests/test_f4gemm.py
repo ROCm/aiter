@@ -33,15 +33,16 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.gemm_op_a4w4 import MXFP8_OUT_SCALE_BLOCK, unpack_mxfp8_out_scale
 from aiter.ops.shuffle import shuffle_scale_f4, shuffle_weight_f4
-from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.test_common import (
+    benchmark,
+    checkAllclose,
+    fill_fp4,
+    fill_scale_e4m3,
+    fill_scale_e8m0,
+    make_generator,
+    run_perftest,
+)
 from aiter.utility import fp4_utils
-
-try:
-    import bench_init
-except ImportError as e:
-    if e.name != "bench_init":
-        raise
-    from op_tests import bench_init
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -249,21 +250,14 @@ def run_torch_nvfp4(xq, wq, xs, ws, gA, gB):
 
 def _prep_mxfp4(M, N, K, apre, data_init, scale_init, gen):
     # DATA (fp4 e2m1, packed 2/byte). data & scale are sampled *independently*.
-    if data_init == "constant":
-        # f4gemm.cpp data_init=0: A=0x22, B=0x33 (fixed representable e2m1).
-        xq = torch.full((M, K // 2), 0x22, dtype=torch.uint8)
-        wq = torch.full((N, K // 2), 0x33, dtype=torch.uint8)
-    else:  # uniform / gaussian / trig / random
-        xq = bench_init.fill_fp4((M, K), data_init, gen)
-        wq = bench_init.fill_fp4((N, K), data_init, gen)
-    # SCALE (e8m0 per-32). auto -> pow2_binomial for E8M0.
-    if scale_init == "constant":
-        # neutral e8m0 scale 0x7F (exp 0 -> 2^0 = 1.0).
-        xs = torch.full((M, K // MXFP4_SCALE_BLOCK), 0x7F, dtype=torch.uint8)
-        ws = torch.full((N, K // MXFP4_SCALE_BLOCK), 0x7F, dtype=torch.uint8)
-    else:  # auto / pow2_binomial / random
-        xs = bench_init.fill_scale_e8m0((M, K // MXFP4_SCALE_BLOCK), scale_init, gen)
-        ws = bench_init.fill_scale_e8m0((N, K // MXFP4_SCALE_BLOCK), scale_init, gen)
+    # constant is built inside fill_fp4 via constant=; f4gemm.cpp data_init=0
+    # keeps A=0x22, B=0x33 (fixed representable e2m1).
+    xq = fill_fp4((M, K), data_init, gen, constant=0x22)
+    wq = fill_fp4((N, K), data_init, gen, constant=0x33)
+    # SCALE (e8m0 per-32). auto -> pow2_binomial for E8M0; constant default is
+    # the neutral e8m0 byte 0x7F (exp 0 -> 2^0 = 1.0).
+    xs = fill_scale_e8m0((M, K // MXFP4_SCALE_BLOCK), scale_init, gen)
+    ws = fill_scale_e8m0((N, K // MXFP4_SCALE_BLOCK), scale_init, gen)
     ref = run_torch_mxfp4(xq, wq, xs, ws)
     inp = {
         "A": shuffle_weight_f4(xq) if apre else xq,
@@ -277,23 +271,16 @@ def _prep_mxfp4(M, N, K, apre, data_init, scale_init, gen):
 
 
 def _prep_nvfp4(M, N, K, apre, data_init, scale_init, gen):
-    # DATA (fp4 e2m1). data & scale sampled independently (bench_init).
-    if data_init == "constant":
-        # f4gemm.cpp data_init=0: A=0x22, B=0x33 (fixed representable e2m1).
-        xq = torch.full((M, K // 2), 0x22, dtype=torch.uint8)
-        wq = torch.full((N, K // 2), 0x33, dtype=torch.uint8)
-    else:  # uniform / gaussian / trig / random
-        xq = bench_init.fill_fp4((M, K), data_init, gen)
-        wq = bench_init.fill_fp4((N, K), data_init, gen)
-    # SCALE (e4m3 per-16). auto -> gaussian(0.34375,0.08) for E4M3.
-    if scale_init == "constant":
-        # neutral e4m3 scale 0x38 (exp 7 = bias -> 1.0).
-        xs = torch.full((M, K // NVFP4_SCALE_BLOCK), 0x38, dtype=torch.uint8)
-        ws = torch.full((N, K // NVFP4_SCALE_BLOCK), 0x38, dtype=torch.uint8)
-    else:  # auto / gaussian / random
-        xs = bench_init.fill_scale_e4m3((M, K // NVFP4_SCALE_BLOCK), scale_init, gen)
-        ws = bench_init.fill_scale_e4m3((N, K // NVFP4_SCALE_BLOCK), scale_init, gen)
-    # Per-tensor global scale is NOT part of bench_init: keep neutral.
+    # DATA (fp4 e2m1). data & scale sampled independently (test_common).
+    # constant built inside fill_fp4 via constant=; f4gemm.cpp data_init=0 keeps
+    # A=0x22, B=0x33 (fixed representable e2m1).
+    xq = fill_fp4((M, K), data_init, gen, constant=0x22)
+    wq = fill_fp4((N, K), data_init, gen, constant=0x33)
+    # SCALE (e4m3 per-16). auto -> gaussian(0.34375,0.08) for E4M3; constant
+    # default is the neutral e4m3 byte 0x38 (exp 7 = bias -> 1.0).
+    xs = fill_scale_e4m3((M, K // NVFP4_SCALE_BLOCK), scale_init, gen)
+    ws = fill_scale_e4m3((N, K // NVFP4_SCALE_BLOCK), scale_init, gen)
+    # Per-tensor global scale is NOT part of the init helpers: keep neutral.
     gA = gB = 1.0
     ref = run_torch_nvfp4(xq, wq, xs, ws, gA, gB)
     inp = {
@@ -320,6 +307,10 @@ def test_gemm(
     seed=0,
     mode="perf",
     knl_name=None,
+    num_warmup=2,
+    num_iters=None,
+    test_graph=False,
+    num_rotate=0,
 ):
     # Skip unsupported combos up front (before prep/shuffle) so they show as
     # "not support" rather than crashing on a shape assert.
@@ -341,6 +332,8 @@ def test_gemm(
         return {
             "gfx": get_gfx(),
             "knl_name": actual_knl,
+            "tile": "256x256",
+            "cluster": "4x4",
             "asm us": float("nan"),
             "asm TFLOPS": float("nan"),
             "asm TB/s": float("nan"),
@@ -352,7 +345,7 @@ def test_gemm(
     assert K % block == 0, f"K must be a multiple of {block}"
     out_fp8 = outtype == "fp8"
     out_dtype = _OUT_DTYPE[outtype]
-    gen = bench_init.make_generator(seed)  # fixed seed -> bit-identical buffers
+    gen = make_generator(seed)  # fixed seed -> bit-identical buffers
     prep = _prep_mxfp4 if intype == "mxfp4" else _prep_nvfp4
     inp, ref_f32 = prep(M, N, K, apre, data_init, scale_init, gen)
     # Reference in the kernel's output form: block-scaled (fp8 e4m3 data + e8m0
@@ -362,7 +355,8 @@ def test_gemm(
     else:
         ref = ref_f32.to(out_dtype)
     needTrace = mode == "profile"
-    num_iters = 5 if mode == "func" else 101
+    # --iters overrides; unset keeps the mode default (func=5, perf/profile=101).
+    num_iters = num_iters if num_iters is not None else (5 if mode == "func" else 101)
 
     # Kernel/.co base name for this config (used for logging, and to derive the
     # mangled knl_name when an explicit dispatch is requested). See
@@ -432,7 +426,11 @@ def test_gemm(
     # the verbatim knl_name otherwise (kept in the table, see main()).
     actual_knl = knl_name if (knl_name and knl_name != "auto") else base
     ret = {"gfx": get_gfx(), "knl_name": actual_knl}
-    # F4GEMM tiles are always 256x256 (see f4gemm.csv). Report TG occupancy.
+    # Structured algo details (f4gemm.csv columns): F4GEMM tiles are always
+    # 256x256 with a 4x4 (cluster_x x cluster_y) cluster; no splitk/unroll axis.
+    ret["tile"] = "256x256"
+    ret["cluster"] = "4x4"
+    # Report TG occupancy for the 256x256 tile.
     _report_active_tg(M, N, 256, 256, base)
     # Only a missing .co is reported as "not support"; any other failure (OOM,
     # memory fault, shape assert, ...) must propagate, not show as a green cell.
@@ -444,7 +442,13 @@ def test_gemm(
     for name, (fn, fn_args) in candidates.items():
         try:
             out, us = run_perftest(
-                fn, *fn_args, num_iters=num_iters, needTrace=needTrace
+                fn,
+                *fn_args,
+                num_iters=num_iters,
+                num_warmup=num_warmup,
+                testGraph=test_graph,
+                num_rotate_args=num_rotate,
+                needTrace=needTrace,
             )
         except Exception as e:
             if not any(m in str(e) for m in _NOT_SUPPORTED_MARKERS):
@@ -587,39 +591,72 @@ def main():
         "--data-init",
         dest="data_init",
         nargs="*",
-        choices=["constant", "uniform", "gaussian", "trig", "random"],
+        choices=["zero", "constant", "uniform", "norm"],
         default=None,
-        help="DATA init distribution(s) (mblas-style; sampled independently of scale).\n"
+        help="DATA init distribution(s) (sampled independently of scale).\n"
         "Paired position-wise with --scale-init (length-1 broadcasts).\n"
         "Default (unset): perf/profile = 'constant uniform', func = 'uniform'\n"
         "(func drops constant: its exact-boundary values trigger e8m0/e4m3\n"
         "edge rounding that shows as spurious warnings).\n"
+        "  zero     = all-zero e2m1 codes\n"
+        "  constant = A=0x22, B=0x33 (deterministic)\n"
         "  uniform  = FP4 U(-3,3)\n"
-        "  gaussian = N(0,1)                 [norm-dist / LLM-like]\n"
-        "  trig     = trig_float in [-2,2]   [optimistic pattern]\n"
-        "  random   = pure random e2m1 codes [overly pessimistic]\n"
-        "  constant = A=0x22, B=0x33 (deterministic)",
+        "  norm     = N(0,1)                 [norm-dist / LLM-like]",
     )
     parser.add_argument(
         "--scale-init",
         dest="scale_init",
         nargs="*",
-        choices=["auto", "pow2_binomial", "gaussian", "random", "constant"],
+        choices=["auto", "pow2_binomial", "zero", "constant", "uniform", "norm"],
         default=None,
         help="SCALE init distribution(s) (by scale format)\n"
         "Default (unset): perf/profile = 'constant auto', func = 'auto'\n"
         "  auto          = format-recommended: mxfp4/E8M0 -> pow2_binomial,\n"
         "                  nvfp4/E4M3 -> gaussian(0.34375,0.08)\n"
         "  pow2_binomial = 2^(Binomial(21,0.5)-11)   [E8M0 only]\n"
-        "  gaussian      = N(0.34375,0.08)           [E4M3 only]\n"
-        "  random        = random on-wire byte, modest range\n"
-        "  constant      = neutral scale (2^0 = 1.0)",
+        "  zero          = all-zero scale bytes\n"
+        "  constant      = neutral scale (2^0 = 1.0)\n"
+        "  uniform       = U(0.5,2) -> nearest on-wire byte\n"
+        "  norm          = N(1,0.25) -> nearest on-wire byte",
     )
     parser.add_argument(
         "--seed",
         type=int,
         default=0,
         help="RNG seed; same seed -> bit-identical data/scale buffers",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=2,
+        help="warmup iterations before timing (run_perftest num_warmup)",
+    )
+    parser.add_argument(
+        "--iters",
+        type=int,
+        default=None,
+        help="timed iterations (run_perftest num_iters); unset -> mode default "
+        "(func=5, perf/profile=101)",
+    )
+    parser.add_argument(
+        "--graph",
+        action="store_true",
+        help="also time via HIP graph replay (run_perftest testGraph), "
+        "minimizing inter-kernel gaps",
+    )
+    parser.add_argument(
+        "--rotate",
+        type=int,
+        default=0,
+        help="rotating input-buffer copies to defeat the L2 hot-cache "
+        "(run_perftest num_rotate_args); 0 = auto-size from L2",
+    )
+    parser.add_argument(
+        "--json",
+        dest="json_out",
+        default=None,
+        help="also write the full summary table (all columns) as JSON records "
+        "to this path, for CI/regression",
     )
     parser.add_argument(
         "--knl-name",
@@ -695,14 +732,38 @@ def main():
             seed=args.seed,
             mode=args.mode,
             knl_name=args.knl_name,
+            num_warmup=args.warmup,
+            num_iters=args.iters,
+            test_graph=args.graph,
+            num_rotate=args.rotate,
         )
         for apre, (di, si), intype, outtype, (M, N, K) in itertools.product(
             apre_list, init_pairs, args.intype, args.outtype, shapes
         )
     ]
-    df = pd.DataFrame(rows)
-    # Keep knl_name (the actual .co); drop the columns constant within a table.
-    df = df.drop(columns=["seed", "gfx", "mode"], errors="ignore")
+    df_full = pd.DataFrame(rows)
+    # JSON keeps every column (config + algo details + results) so each record is
+    # self-describing for CI/regression; the markdown table below drops columns
+    # that are constant within a run for readability.
+    if args.json_out:
+        df_full.to_json(args.json_out, orient="records", indent=2)
+        aiter.logger.info(
+            "wrote JSON summary (%d rows) to %s", len(df_full), args.json_out
+        )
+    # Keep knl_name (the actual .co) + tile; drop columns constant within a table
+    # (cluster is always 4x4).
+    df = df_full.drop(
+        columns=[
+            "seed",
+            "gfx",
+            "mode",
+            "num_warmup",
+            "num_iters",
+            "test_graph",
+            "num_rotate",
+        ],
+        errors="ignore",
+    )
     aiter.logger.info(
         "gemm_a4w4 (F4GEMM) summary (markdown):\n%s",
         df.to_markdown(index=False),
