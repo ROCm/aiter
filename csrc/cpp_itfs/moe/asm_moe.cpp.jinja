@@ -68,12 +68,17 @@ static const unsigned char hsaco[{{bin_size}}] = { {{bin_data}} };
 class FMoeKernel
 {
 private:
+    // First in the init list: gate on A0 before asm_kernel loads the .co.
+    struct Gfx1250AsmGate
+    {
+        explicit Gfx1250AsmGate(const char* name) { require_gfx1250_asm_or_throw(name); }
+    } gfx1250_gate;
     AiterAsmKernelFast asm_kernel;
     uint32_t sub_GU = 512;
     bool is_int4 = false;
 
 public:
-    FMoeKernel() : asm_kernel("{{kernel_name}}", hsaco)
+    FMoeKernel() : gfx1250_gate("{{kernel_name}}"), asm_kernel("{{kernel_name}}", hsaco)
     {
         this->sub_GU = {{selected_tile}};
     };

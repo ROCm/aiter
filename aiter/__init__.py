@@ -144,6 +144,12 @@ else:
     from .ops.gdr_decode_packed_bf16 import *
     from . import mla  # noqa: F401
 
+    # gfx1250 B0-only asm capability predicate (frameworks select on this).
+    from .jit.utils.asm_guard import (  # noqa: F401
+        is_gfx1250_asm_supported,
+        require_gfx1250_asm,
+    )
+
     # isort: on
 
 # Import Triton-based communication primitives from ops.triton.comms (optional, only if Iris is available)
