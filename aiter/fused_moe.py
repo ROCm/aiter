@@ -968,7 +968,26 @@ def _fused_moe_impl(
         and q_dtype_a == dtypes.bf16
         and activation == ActivationType.Situv2
     )
-    if _is_a16w4_situv2:
+    # Swiglu with a non-256-aligned inter_dim is re-routed off CK-Tile onto the
+    # same a16w4 FlyDSL kernels (see cktile_mxfp4_ok in get_2stage_cfgs), so it
+    # inherits their constraints and has to be validated here too -- otherwise
+    # the re-routed shape reaches a kernel that cannot honour the request. The
+    # trailing three terms mirror get_2stage_cfgs' _flydsl_can_take_over: when
+    # they do not hold the shape stays on CK-Tile and must not be rejected here.
+    _is_a16w4_swiglu_rerouted = (
+        quant_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.fp4x2
+        and q_dtype_a == dtypes.bf16
+        and activation == ActivationType.Swiglu
+        and inter_dim % 256 != 0
+        and isShuffled
+        and isG1U1
+        and not doweight_stage1
+    )
+    if _is_a16w4_situv2 or _is_a16w4_swiglu_rerouted:
+        _a16w4_why = (
+            "SiTUv2" if _is_a16w4_situv2 else f"Swiglu with inter_dim={inter_dim}"
+        )
         for _bad, _why in (
             (
                 get_gfx() not in ("gfx942", "gfx950"),
@@ -986,7 +1005,8 @@ def _fused_moe_impl(
         ):
             if _bad:
                 raise NotImplementedError(
-                    f"a16w4 (bf16 A x MXFP4 W) SiTUv2 is not supported: {_why}."
+                    f"a16w4 (bf16 A x MXFP4 W) {_a16w4_why} is not supported: "
+                    f"{_why}."
                 )
 
     metadata = get_2stage_cfgs(
@@ -2748,12 +2768,36 @@ def get_2stage_cfgs(
             skip_inter_quant="_moe2_layout_" in str(kernelName2),
             **route_bucket_metadata,
         )
+    # CK-Tile's 2-stage MXFP4 stage-2 (moe_cktile2stages_gemm2) reduces over
+    # inter_dim and indexes its e8m0 weight scales in groups of 8 blocks
+    # (8 * 32 = 256 elements). When inter_dim is not a multiple of 256 the host
+    # pads the scale group dimension (shuffle_scale rounds it up to a multiple
+    # of 8) and the kernel reads the wrong groups, silently returning a badly
+    # wrong result. Stage-1 is unaffected -- it reduces over model_dim.
+    _cktile_mxfp4_unsafe = q_dtype_w == dtypes.fp4x2 and inter_dim % 256 != 0
+    # Only steer away from CK-Tile when a FlyDSL path can actually take the
+    # shape, otherwise it would be left with no backend at all. These are the
+    # preconditions shared by the a16w4 (bf16 A) and a4w4/a8w4 (fp4/fp8 A)
+    # branches below; note fp16 A has no FlyDSL mxfp4 kernel here, so it keeps
+    # its current routing.
+    _flydsl_can_take_over = (
+        dtype in [dtypes.bf16, dtypes.fp16]
+        and q_type == QuantType.per_1x32
+        and q_dtype_a in (dtypes.bf16, dtypes.fp4x2, dtypes.fp8)
+        and is_shuffled
+        and use_g1u1
+        and not doweight_stage1
+    )
+    # True for every shape CK-Tile handles correctly today, so all of those keep
+    # their existing routing unchanged.
+    cktile_mxfp4_ok = not (_cktile_mxfp4_unsafe and _flydsl_can_take_over)
     if (
         gate_mode != GateMode.SEPARATED
         and dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
         and activation == ActivationType.Swiglu
         and q_dtype_w != dtypes.fp8
+        and cktile_mxfp4_ok
     ):
         return MOEMetadata(
             functools.partial(
@@ -2782,6 +2826,7 @@ def get_2stage_cfgs(
         and q_dtype_a in [dtypes.bf16, dtypes.fp16]
         and q_dtype_w == dtypes.fp4x2
         and is_shuffled
+        and cktile_mxfp4_ok
     )
     if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
         # Untuned a16wi4 fallback: one shape-safe config on the shared a16w-mix port.
@@ -2833,7 +2878,24 @@ def get_2stage_cfgs(
         and use_g1u1
         and not doweight_stage1
     )
-    use_mxfp4_flydsl = _is_a16w4_situv2 or (
+    # bf16 A x mxfp4 W with Swiglu normally takes the CK-Tile branch above. When
+    # cktile_mxfp4_ok is False that branch is skipped, and the shape needs the
+    # same a16w4 FlyDSL kernels as SiTUv2 -- there is no A quantisation either
+    # way, so _a_type below is "bf16" for both. Gated on `not cktile_mxfp4_ok`,
+    # so it is False for every shape CK-Tile already handles.
+    _is_a16w4_swiglu_rerouted = (
+        not cktile_mxfp4_ok
+        and dtype in [dtypes.bf16, dtypes.fp16]
+        and q_type == QuantType.per_1x32
+        and activation == ActivationType.Swiglu
+        and q_dtype_a == dtypes.bf16
+        and q_dtype_w == dtypes.fp4x2
+        and is_shuffled
+        and use_g1u1
+        and not doweight_stage1
+    )
+    _is_a16w4 = _is_a16w4_situv2 or _is_a16w4_swiglu_rerouted
+    use_mxfp4_flydsl = _is_a16w4 or (
         dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
         and (
@@ -2857,10 +2919,11 @@ def get_2stage_cfgs(
 
         _out_type = "bf16" if dtype == dtypes.bf16 else "f16"
         # a-dtype routing:
-        #   "bf16" => a16w4 bf16/fp4 (no A quant, SiTUv2)
+        #   "bf16" => a16w4 bf16/fp4 (no A quant; SiTUv2, or Swiglu re-routed
+        #             off CK-Tile because inter_dim is not 256-aligned)
         #   "fp4"  => a4w4 fp4/fp4
         #   "fp8"  => a8w4 fp8/fp4 (or a8w8 with w=fp8)
-        if _is_a16w4_situv2:
+        if _is_a16w4:
             _a_type = "bf16"
         elif q_dtype_a == dtypes.fp4x2:
             _a_type = "fp4"
