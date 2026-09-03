@@ -43,6 +43,43 @@ from .tensor_shim import (
 TDM_DESCRIPTOR_VERSION = 1
 
 
+@flyc.jit
+def _build_static_task(block_id, total_m_tiles, total_n_tiles, cluster_n):
+    """Return the grouped-M swizzled task coordinates for one workgroup."""
+    tiles_per_group = 16
+    swizzled_id = block_id // cluster_n if cluster_n > 1 else block_id
+    local_n = block_id - swizzled_id * cluster_n if cluster_n > 1 else None
+    n_units = total_n_tiles // cluster_n if cluster_n > 1 else total_n_tiles
+    blocks_per_group = n_units * tiles_per_group
+    group = swizzled_id // blocks_per_group
+    group_first_m = group * tiles_per_group
+    in_group = swizzled_id - group * blocks_per_group
+    remaining_m = total_m_tiles - group_first_m
+    group_m = (remaining_m < tiles_per_group).select(
+        remaining_m, tiles_per_group
+    )
+    m_tile = group_first_m + in_group % group_m
+    n_unit = in_group // group_m
+    n_tile = n_unit * cluster_n + local_n if cluster_n > 1 else n_unit
+    return m_tile, n_tile
+
+
+@flyc.jit
+def _build_persistent_task_range(block_id, total_n_tiles, max_tasks_per_worker):
+    """Return one worker's fixed M tile and balanced contiguous N range."""
+    workers_per_m = (
+        total_n_tiles + max_tasks_per_worker - 1
+    ) // max_tasks_per_worker
+    m_tile = block_id // workers_per_m
+    n_worker = block_id - m_tile * workers_per_m
+    base_tasks = total_n_tiles // workers_per_m
+    extra_workers = total_n_tiles - base_tasks * workers_per_m
+    extra_before = (n_worker < extra_workers).select(n_worker, extra_workers)
+    task_count = base_tasks + fx.Int32(n_worker < extra_workers)
+    n_begin = n_worker * base_tasks + extra_before
+    return m_tile, n_begin, n_begin + task_count
+
+
 def _build_gemm_task(
     K: Constexpr[int],
     tile_m: Constexpr[int],
@@ -61,6 +98,7 @@ def _build_gemm_task(
     cluster_n: Constexpr[int],
     next_stage_on: Constexpr[int],
     num_waves_per_tensor_tdm: Constexpr[int],
+    tdm_b_th: Constexpr[int],
     enable_ep_scatter: Constexpr[int],
     ep_arena_handle: Constexpr[int],
     ep_combine_input_offset: Constexpr[int],
@@ -296,6 +334,7 @@ def _build_gemm_task(
             pad=None,
             wg_mask=0,
             split_inner=False,
+            cache_modifier=0,
         ):
             split_i = split_inner and len(wv) > 1
             if const_expr(len(wv) > 1):
@@ -323,6 +362,7 @@ def _build_gemm_task(
                 # Descriptor bit 21: release to the peers already present and
                 # re-broadcast later, so early arrivals are not held for a merge.
                 early_timeout=bool(wg_mask),
+                cache_modifier=cache_modifier,
                 **pad_kw,
             )
             if wg_mask:
@@ -370,6 +410,7 @@ def _build_gemm_task(
             lds_row=B_LDS_ROW,
             k_adv=PACK_TK * 16,
             wv=waves[1],
+            cache_modifier=tdm_b_th,
         )
         add_tdm_loads(
             gSA_base,
@@ -1335,6 +1376,8 @@ def launch_gemm_a8w4_tdm(
     cluster_n: Constexpr[int] = 1,
     next_stage_prefetch: Constexpr[int] = 0,
     num_waves_per_tensor_tdm: Constexpr[int] = 2,
+    tdm_b_th: Constexpr[int] = 0,
+    max_tasks_per_worker: Constexpr[int] = 0,
     enable_ep_scatter: Constexpr[int] = 0,
     ep_arena_handle: Constexpr[int] = 0,
     ep_combine_input_offset: Constexpr[int] = 0,
@@ -1395,6 +1438,8 @@ def launch_gemm_a8w4_tdm(
         cluster_n,
         next_stage_on,
         num_waves_per_tensor_tdm,
+        tdm_b_th,
+        max_tasks_per_worker,
         enable_ep_scatter,
         ep_arena_handle,
         ep_combine_input_offset,
@@ -1408,6 +1453,8 @@ def launch_gemm_a8w4_tdm(
             raise ValueError("enable_ep_scatter is gemm2-only (stage1_act must be 0)")
         if stage1_quant_out:
             raise ValueError("enable_ep_scatter is incompatible with stage1_quant_out")
+    if max_tasks_per_worker > 0:
+        assert cluster_n == 1, "persistent-N requires cluster_n=1"
     num_waves = m_warp * n_warp
     block = num_waves * 32
 
@@ -1422,12 +1469,14 @@ def launch_gemm_a8w4_tdm(
     _waves_per_tensor = (
         f"_wpt{num_waves_per_tensor_tdm}" if num_waves_per_tensor_tdm != 2 else ""
     )
+    _persistent = f"_mtpw{max_tasks_per_worker}" if max_tasks_per_worker else ""
     _ep = "_epscatter" if enable_ep_scatter else ""
     _kname = (
         f"a8w4_tdm_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_K{K}"
-        f"{_grouped}{_act}{_bias}{_qout}{_cl}{_next_stage}{_waves_per_tensor}{_ep}"
+        f"{_grouped}{_act}{_bias}{_qout}{_cl}{_next_stage}{_waves_per_tensor}"
+        f"{_persistent}{_ep}"
     )
 
     gemm_task = _build_gemm_task(
@@ -1448,6 +1497,7 @@ def launch_gemm_a8w4_tdm(
         cluster_n,
         next_stage_on,
         num_waves_per_tensor_tdm,
+        tdm_b_th,
         enable_ep_scatter,
         ep_arena_handle,
         ep_combine_input_offset,
@@ -1473,41 +1523,40 @@ def launch_gemm_a8w4_tdm(
         f32_situ_beta: fx.Float32,
         f32_situ_linear_beta: fx.Float32,
     ):
-        bid_x = fx.block_idx.x
-        # DeepGEMM contiguous-M swizzle, run at cluster granularity so peers land
-        # on one m_tile. Ternaries, not `if`: the rewriter would trace a branch.
-        TILES_PER_GROUP = 16
         total_n_tiles = (i32_n + (tile_n - 1)) // tile_n
         total_m_tiles = (i32_m + (tile_m - 1)) // tile_m
-        swz_id = bid_x // cluster_n if cluster_n > 1 else bid_x
-        local_n = bid_x - swz_id * cluster_n if cluster_n > 1 else None
-        n_units = total_n_tiles // cluster_n if cluster_n > 1 else total_n_tiles
-        blocks_per_group = n_units * TILES_PER_GROUP
-        group = swz_id // blocks_per_group
-        group_first_tile = group * TILES_PER_GROUP
-        in_group = swz_id - group * blocks_per_group
-        rem_tiles = total_m_tiles - group_first_tile
-        group_tiles = (rem_tiles < TILES_PER_GROUP).select(rem_tiles, TILES_PER_GROUP)
-        m_tile = group_first_tile + (in_group - (in_group // group_tiles) * group_tiles)
-        n_unit = in_group // group_tiles
-        n_tile = n_unit * cluster_n + local_n if cluster_n > 1 else n_unit
-        gemm_task(
-            arg_c,
-            arg_a,
-            arg_b,
-            arg_scale_a,
-            arg_scale_b,
-            arg_m_tile_map,
-            arg_bias,
-            arg_quant_scale,
-            arg_ep_row_map,
-            i32_n,
-            m_tile,
-            n_tile,
-            f32_swiglu_limit,
-            f32_situ_beta,
-            f32_situ_linear_beta,
-        )
+
+        def run_task(m_tile, n_tile):
+            gemm_task(
+                arg_c,
+                arg_a,
+                arg_b,
+                arg_scale_a,
+                arg_scale_b,
+                arg_m_tile_map,
+                arg_bias,
+                arg_quant_scale,
+                arg_ep_row_map,
+                i32_n,
+                m_tile,
+                n_tile,
+                f32_swiglu_limit,
+                f32_situ_beta,
+                f32_situ_linear_beta,
+            )
+
+        if const_expr(max_tasks_per_worker > 0):
+            m_tile, n_tile, n_end = _build_persistent_task_range(
+                fx.block_idx.x, total_n_tiles, max_tasks_per_worker
+            )
+            while n_tile < n_end:
+                run_task(m_tile, n_tile)
+                n_tile += 1
+        else:
+            m_tile, n_tile = _build_static_task(
+                fx.block_idx.x, total_m_tiles, total_n_tiles, cluster_n
+            )
+            run_task(m_tile, n_tile)
 
     m_tiles = (i32_m + (tile_m - 1)) // tile_m
     n_tiles = (N + (tile_n - 1)) // tile_n
@@ -1529,7 +1578,13 @@ def launch_gemm_a8w4_tdm(
         f32_situ_beta,
         f32_situ_linear_beta,
     )
-    grid = (m_tiles * n_tiles, 1, 1)
+    grid_x = (
+        m_tiles
+        * ((n_tiles + max_tasks_per_worker - 1) // max_tasks_per_worker)
+        if max_tasks_per_worker > 0
+        else m_tiles * n_tiles
+    )
+    grid = (grid_x, 1, 1)
     if cluster_n > 1:
         # Geometry must reach BOTH the definition and the launch site, or the
         # cluster never forms and the TDM loads silently fall back to per-load.

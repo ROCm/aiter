@@ -26,6 +26,31 @@ def _select_next_stage_prefetch(csv_next_stage_prefetch: int) -> int:
     return int(value)
 
 
+def _select_tdm_b_th(csv_tdm_b_th: int) -> int:
+    """Selects the B-only TDM temporal hint."""
+    value = os.environ.get("AITER_TDM_B_TH")
+    th = int(csv_tdm_b_th) if value is None else int(value.strip())
+    if not 0 <= th <= 6:
+        raise ValueError("AITER_TDM_B_TH must be between 0 and 6")
+    return th
+
+
+def _select_max_tasks_per_worker(config_max_tasks: int | None) -> int:
+    """Selects an explicit task cap or falls back to the environment."""
+    value = (
+        os.environ.get("AITER_FLYDSL_MAX_TASKS_PER_WORKER")
+        if config_max_tasks is None
+        else config_max_tasks
+    )
+    try:
+        max_tasks = 0 if value is None else int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("max_tasks_per_worker must be a nonnegative integer") from exc
+    if max_tasks < 0:
+        raise ValueError("max_tasks_per_worker must be nonnegative")
+    return max_tasks
+
+
 def _select_cluster_n(n_tiles: int, csv_cluster_n: int) -> int:
     """Selects the environment override or CSV cluster degree."""
     env_cluster_n = os.environ.get("AITER_FLYDSL_MXFP4_CLUSTER_N")
@@ -91,6 +116,8 @@ def flydsl_grouped_gemm_a8w4_masked(
     cluster_n=-1,
     waves_per_tensor_tdm=-1,
     next_stage_prefetch=0,
+    tdm_b_th=1,
+    max_tasks_per_worker=None,
     stage2_scatter: Stage2ScatterContext | None = None,
     ep_destination_stride=0,
     ep_row_map=None,
@@ -114,12 +141,18 @@ def flydsl_grouped_gemm_a8w4_masked(
     n_tiles = (N + tile_n - 1) // tile_n
     cluster_n = _select_cluster_n(n_tiles, cluster_n)
     waves_per_tensor_tdm = _select_num_waves_per_tensor_tdm(waves_per_tensor_tdm)
+    tdm_b_th = _select_tdm_b_th(tdm_b_th)
+    max_tasks_per_worker = _select_max_tasks_per_worker(max_tasks_per_worker)
+    enable_ep_scatter = stage2_scatter is not None
+    if max_tasks_per_worker and cluster_n > 1:
+        raise ValueError("persistent-N requires cluster_n=1")
+    if max_tasks_per_worker and enable_ep_scatter:
+        raise ValueError("persistent-N does not yet support EP scatter")
     if cluster_n > 1 and n_tiles % cluster_n:
         raise ValueError(
             f"[grouped-moe tdm] cluster_n={cluster_n} needs n_tiles={n_tiles} "
             f"(N={N}, tile_n={tile_n}) to be an exact multiple"
         )
-    enable_ep_scatter = stage2_scatter is not None
     ep_row_map_tensor = ep_row_map if ep_row_map is not None else out
     launch_gemm_a8w4_tdm(
         out,
@@ -151,6 +184,8 @@ def flydsl_grouped_gemm_a8w4_masked(
         cluster_n,
         _select_next_stage_prefetch(next_stage_prefetch),
         waves_per_tensor_tdm,
+        tdm_b_th,
+        max_tasks_per_worker,
         enable_ep_scatter=int(enable_ep_scatter),
         ep_arena_handle=(int(stage2_scatter.arena_handle) if enable_ep_scatter else 0),
         ep_combine_input_offset=(
