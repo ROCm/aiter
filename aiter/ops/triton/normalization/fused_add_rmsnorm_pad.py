@@ -8,9 +8,20 @@ from aiter.ops.triton._triton_kernels.normalization.fused_add_rmsnorm_pad import
     _fused_add_rmsnorm_pad,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH, load_config_json
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+
+def _get_config(block_size_n: int, backend: str) -> dict:
+    arch = get_arch()
+    base = f"{AITER_TRITON_CONFIGS_PATH}/{arch}/{backend}/normalization/fused_add_rmsnorm_pad"
+    raw = load_config_json(f"{base}/DEFAULT.json", required=True)
+    for bound in sorted(int(k[len("N_LEQ_") :]) for k in raw if k.startswith("N_LEQ_")):
+        if block_size_n <= bound:
+            return dict(raw[f"N_LEQ_{bound}"])
+    return dict(raw["any"])
 
 
 def fused_add_rmsnorm_pad(
@@ -48,8 +59,8 @@ def fused_add_rmsnorm_pad(
                 assert N == N2, "Shape error!"
                 res_out = torch.empty((M, N), dtype=res.dtype, device=res.device)
             BLOCK_SIZE_N = triton.next_power_of_2(N_out)
-            NUM_WARPS = min(8, max(1, BLOCK_SIZE_N // 32))
-
+            config = _get_config(BLOCK_SIZE_N, "gluon")
+            NUM_WARPS = config["num_warps"]
             _gluon_fused_add_rmsnorm_pad_kernel[(M,)](
                 x,
                 res,
