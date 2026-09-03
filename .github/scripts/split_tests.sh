@@ -119,6 +119,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_kvcache_blockscale.py]=28
     FILE_TIMES[op_tests/test_moe_blockscale.py]=28
     FILE_TIMES[op_tests/test_sample.py]=27
+    FILE_TIMES[op_tests/test_mha_flydsl_varlen_bwd.py]=25
     FILE_TIMES[op_tests/test_mla_ltx.py]=25
     FILE_TIMES[op_tests/test_mla_prefill_ps.py]=24
     FILE_TIMES[op_tests/test_fused_qk_norm_rope_group_quant.py]=22
