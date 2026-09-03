@@ -1,6 +1,6 @@
 ---
 name: mxfp4-tuning-policy
-description: How to choose MXFP4 a4w4 MoE candidate kernels for a given shape on gfx950 — the legal GEMM1/GEMM2 search space and its constraint interactions, which axes actually pay and which have no trustworthy prior, and the stratification/top_k rules for building a candidate slate. Use when writing the --policy file for recommend_mxfp4_candidates.py, or when picking candidates for gemm_moe_tune.py --mxfp4-flydsl. For running and trusting the resulting numbers (env vars, accuracy gates, measurement protocol) see mxfp4-moe-benchmarking.
+description: How to choose MXFP4 a4w4 MoE candidate kernels for a given shape on gfx950 — the legal GEMM1/GEMM2 search space and its constraint interactions, which axes actually pay and which have no trustworthy prior, and the stratification/top_k rules for building a candidate slate. Use when writing the --policy file for recommend_mxfp4_candidates.py, or when deciding which candidates a shape should be tuned over. For running and trusting the resulting numbers (env vars, accuracy gates, measurement protocol) see mxfp4-moe-benchmarking.
 argument-hint: [model config name, e.g. kimik3_a4w4, or a tuned_fmoe.csv path]
 ---
 
@@ -175,22 +175,3 @@ on candidates that are individually plausible and collectively diverse.
    `_kw2`; adding the stratum recovered 8 of 9. kimi-k3 could not have revealed
    this — its k_wave space is thin (§1). Never generalise an axis prior from one
    model config.
-
-## 4. Wiring
-
-```bash
-python csrc/ck_gemm_moe_2stages_codegen/recommend_mxfp4_candidates.py \
-  -i aiter/configs/model_configs/kimik3_a4w4_untuned_fmoe.csv \
-  -o /tmp/cand.csv --gfx gfx950 --cu-num 256 --top-k 64 --g2-per-g1 0 \
-  --policy .claude/skills/mxfp4-tuning-policy/SKILL.md
-
-python csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py --mxfp4-flydsl \
-  -i <untuned.csv> -o <tuned.csv> --candidate-csv /tmp/cand.csv
-```
-
-`--gfx`/`--cu-num` are required because the tuner injects the *runtime* arch into
-rows (`aiter/utility/base_tuner.py:369`); the recommender may run on a different
-host, and the tuner errors if the CSV's arch does not match. The tuning run needs
-env vars set — see `mxfp4-moe-benchmarking`.
-
-Related: `aiter-config-shape` (landing the tuned CSV without duplicate shapes).
