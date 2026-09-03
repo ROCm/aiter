@@ -196,6 +196,26 @@ def make_weights_tp(experts, model_dim, inter_dim, world, rank, device):
     return w1_q, w1_scale, w2_q, w2_scale
 
 
+class TpGroupShim:
+    """Minimal ``tp_group`` for ``comm_fused_moe_host``.
+
+    The comm-fused host runtime only needs the rank/world/device triple plus an
+    object broadcast to hand out the MORI communicator id, so the bench uses the
+    default process group directly instead of standing up
+    ``aiter.dist.parallel_state``.
+    """
+
+    def __init__(self, rank, world, device):
+        self.rank_in_group = rank
+        self.world_size = world
+        self.device = device
+
+    def broadcast_object(self, obj=None, src=0):
+        payload = [obj]
+        dist.broadcast_object_list(payload, src=src)
+        return payload[0]
+
+
 def capture(body):
     barrier()
     body()
@@ -507,6 +527,7 @@ def main():
 
     tp_rel_l2 = None
     tp_ms = (float("nan"), float("nan"))
+    tp_comm_fused = os.environ.get("AITER_TP_COMM_FUSED", "0") == "1"
     if args.tp:
         if rank_tokens:
             raise ValueError(
@@ -530,10 +551,72 @@ def main():
             (tokens, args.model_dim), dtype=torch.bfloat16, device=device
         )
 
+        # AITER_TP_COMM_FUSED=1 replaces the `fused_moe` + NCCL reduce_scatter
+        # pair with the comm-fused Stage2: the ordinary Stage2 GEMM still runs,
+        # but its BF16 result is MXFP8-quantized and reduce-scattered by FlyDSL
+        # kernels over MORI symmetric memory. Only the ReduceScatter half runs -
+        # DP consumes just this rank's shard, so the AllGather is skipped.
+        fused_runner = None
+        if tp_comm_fused:
+            from aiter.fused_moe import _fused_moe_impl, get_padded_M
+            from aiter.ops.flydsl.comm_fused_moe_host import (
+                create_flydsl_comm_fused_runners,
+            )
+
+            bucket = int(get_padded_M(world_tokens))
+            if bucket != world_tokens:
+                raise ValueError(
+                    f"AITER_TP_COMM_FUSED needs an exact padded-M bucket, but "
+                    f"world_tokens={world_tokens} pads to {bucket}"
+                )
+            runners = create_flydsl_comm_fused_runners(
+                tp_group=TpGroupShim(rank, world, device),
+                model_dim=args.model_dim,
+                inter_dim=args.inter_dim // world,
+                experts=args.experts,
+                topk=args.topk,
+            )
+            if bucket not in runners:
+                raise ValueError(f"no comm-fused config for M={bucket}")
+            # Instantiate here: the symmetric-memory allocation and MORI window
+            # registration must happen outside CUDA Graph capture.
+            fused_runner = runners[bucket]
+            print(f"[STEP] rank={rank} tp-comm-fused-runner m={bucket}", flush=True)
+
+        def tp_stage2_override(*, ordinary_stage2, stage2_args, stage2_kwargs):
+            # stage2_args[6] is the framework's moe_out, already zeroed by
+            # moe_sorting for the accumulating Stage2. There is no shared expert
+            # here, so it doubles as the runner's `shared_partial` and no extra
+            # buffer or per-replay zeroing is needed.
+            return fused_runner(
+                stage2_args=stage2_args,
+                stage2_kwargs=stage2_kwargs,
+                shared_partial=stage2_args[6],
+                ordinary_stage2=ordinary_stage2,
+                all_gather=False,
+            )
+
         def tp_body():
             dist.all_gather_into_tensor(x_g, x.contiguous())
             dist.all_gather_into_tensor(route_weights_g, route_weights.contiguous())
             dist.all_gather_into_tensor(ids_g, ids.contiguous())
+            if fused_runner is not None:
+                holders["tp"] = _fused_moe_impl(
+                    x_g,
+                    w1_tp,
+                    w2_tp,
+                    route_weights_g,
+                    ids_g,
+                    quant_type=aiter.QuantType.per_1x32.value,
+                    w1_scale=w1_scale_tp,
+                    w2_scale=w2_scale_tp,
+                    a1_scale=None,
+                    dtype=torch.bfloat16,
+                    swiglu_limit=SWIGLU_LIMIT,
+                    gate_mode=GateMode.INTERLEAVE.value,
+                    _stage2_override=tp_stage2_override,
+                )
+                return
             tp_out = fused_moe(
                 x_g,
                 w1_tp,
@@ -613,7 +696,8 @@ def main():
             f"mega_e2e={mega_ms[0]:.4f}/{mega_ms[1]:.4f}ms speedup={speedup:.2f}% "
             f"stage1={stage1_ms[0]:.4f}/{stage1_ms[1]:.4f}ms "
             f"stage2_combine={stage2_ms[0]:.4f}/{stage2_ms[1]:.4f}ms "
-            f"tp_e2e={tp_ms[0]:.4f}/{tp_ms[1]:.4f}ms rank-mean/max",
+            f"tp_e2e={tp_ms[0]:.4f}/{tp_ms[1]:.4f}ms "
+            f"tp_path={'comm_fused_rs' if tp_comm_fused else 'nccl_rs'} rank-mean/max",
             flush=True,
         )
         if guard_floor is not None:
