@@ -24,13 +24,6 @@ def downcast_to_static_fp8_3d(x: torch.Tensor, scale: torch.Tensor):
 
 
 def downcast_to_static_fp8(x: torch.Tensor, scale: torch.Tensor):
-    """Quantize ``x`` by a single tensor-wide ``scale`` to the arch's fp8 e4m3.
-
-    Uses the exact-division form of the shared static per-tensor quant kernel
-    (``FAST_CONVERT=False``), which is what this path has always done; the
-    reciprocal form used by ``static_per_tensor_quant_fp8_i8`` differs on a
-    small fraction of inputs.
-    """
     M, N = x.shape
     if get_arch() != "gfx942":
         dtype = torch.float8_e4m3fn
@@ -60,11 +53,6 @@ def downcast_to_mxfp(
 
     If weight_quant_type is torch.float8_e4m3fn or torch.float8_e5m2, we output mxfp8 with the float8s are stored
     in their respective formats.
-
-    ``pow2_scale`` selects the ``even_round`` scale scheme shared with
-    ``dynamic_mxfp4_quant`` / ``dynamic_mxfp8_quant`` instead of the default
-    ``amax / dtype_max`` one; see :func:`_compute_mx_quant_and_scale`. The two
-    disagree, so a tensor quantized one way must be dequantized the same way.
     """
     ndim = src_tensor.ndim
     assert -ndim <= axis < ndim, f"Invalid axis {axis=}"

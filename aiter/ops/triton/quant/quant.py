@@ -43,17 +43,8 @@ _LOGGER = AiterTritonLogger()
 
 
 def _static_per_tensor_quant_launch(qx, x_in, scale_in, fast_convert: bool):
-    """Shared launch for the static per-tensor quant kernel.
-
-    Picks a tile shape from the row width: narrow rows get several rows per
-    program so the grid stays large enough, wide rows (the MoE expert-weight
-    case, where a whole row will not fit in registers) get split across
-    programs along the row instead.
-    """
-    # Callers may hand in an output that still has the input's pre-flattened
-    # shape (per_tensor_quant_triton does exactly that: 2D x, N-D qx), so view
-    # both as 2D rather than trusting qx.stride(0). .view keeps it a view, so
-    # the kernel still writes into the caller's buffer.
+    # per_tensor_quant_triton hands in a 2D x with an N-D qx, so view both as 2D
+    # rather than trusting qx.stride(0); .view still writes the caller's buffer.
     x2d = x_in if x_in.ndim == 2 else x_in.view(-1, x_in.shape[-1])
     q2d = qx if qx.ndim == 2 else qx.view(-1, qx.shape[-1])
     assert x2d.shape == q2d.shape, f"{tuple(x2d.shape)=} != {tuple(q2d.shape)=}"
@@ -199,11 +190,8 @@ def dynamic_mxfp4_quant(
         scaling_mode: The method to calculate MX block scaling.
             - "even" (default): `even_round` in `quark.torch.quantization.utils`.
             - etc.
-        x_fp4: Optional pre-allocated uint8 output of shape (M, N // 2). Allocated
-            here when omitted.
-        blockscale_e8m0: Optional pre-allocated uint8 scale output of shape
-            (M, N // 32). Allocated here when omitted, in a column-major layout;
-            callers that need row-major scales (the MoE a4w4 path) pass their own.
+        x_fp4, blockscale_e8m0: Optional pre-allocated uint8 outputs, shaped
+            (M, N // 2) and (M, N // 32); allocated column-major when omitted.
     Returns:
         A tuple of (x_fp4, blockscale_e8m0).
     """

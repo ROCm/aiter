@@ -20,21 +20,6 @@ def _static_per_tensor_quant_fp8_i8_kernel(
     BLOCK_N: tl.constexpr,
     FAST_CONVERT: tl.constexpr,
 ):
-    """Quantize x by a single tensor-wide scale into the dtype of ``qx_ptr``
-    (fp8 e4m3/e5m2 or int8).
-
-    FAST_CONVERT picks how the scale is applied:
-
-    * ``True``  -- multiply by the reciprocal. One v_mul per element, the
-      reciprocal computed once per program.
-    * ``False`` -- divide. A correctly-rounded fp32 division per element, so it
-      matches an ``x / scale`` reference exactly.
-
-    The two agree on nearly every input but not all of them: with scale=448.0 a
-    dense bf16 sweep puts them 1 fp8 ulp apart on ~0.2% of elements, because a
-    reciprocal that is half an fp32 ulp off can land on the far side of an fp8
-    rounding boundary.
-    """
     # Fold the block origin into the base pointers in int64 so only the in-tile
     # offsets, which always fit, stay 32-bit.
     start_m = tl.program_id(axis=0).to(tl.int64) * BLOCK_M
@@ -53,6 +38,9 @@ def _static_per_tensor_quant_fp8_i8_kernel(
     )
 
     scale = tl.load(scale_in_ptr)
+    # FAST_CONVERT multiplies by the reciprocal, one v_mul per element, instead of
+    # a correctly-rounded division. Not equivalent: a reciprocal half an fp32 ulp
+    # off can land on the far side of an fp8 rounding boundary.
     if FAST_CONVERT:
         qx = x * (1 / scale)
     else:
@@ -421,9 +409,6 @@ def _mxfp8_quant_op(
     returns (scale_e8m0, quant_scale): the per-group uint8 e8m0 scale and the
     matching fp32 multiplicative scale. Both outputs keep QUANT_AXIS with size 1
     so they broadcast against the input for in-place quantization.
-
-    LOG2_DTYPE_MAX is log2 of the largest power of two the target dtype holds:
-    8 for e4m3 (max 448 -> 256) and 15 for e5m2 (max 57344 -> 32768).
     """
     amax = tl.max(tl.abs(x_grouped), axis=QUANT_AXIS, keep_dims=True)
     amax_i32 = amax.to(tl.int32, bitcast=True)

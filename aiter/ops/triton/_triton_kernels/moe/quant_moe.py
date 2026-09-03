@@ -36,25 +36,6 @@ def _compute_mx_quant_and_scale(
     DEQUANT_SCALE_ROUNDING_MODE: tl.constexpr = 0,
     POW2_SCALE: tl.constexpr = False,
 ):
-    """Quantize a [OUT_DIM, QUANT_DIM] fp32/bf16/fp16 tile to MXFP4 or MXFP8.
-
-    Two scale-derivation schemes, selected by POW2_SCALE:
-
-    * ``POW2_SCALE=False`` (default): ``scale = amax / dtype_max`` with the
-      exponent rounded per DEQUANT_SCALE_ROUNDING_MODE. Never saturates, but
-      leaves up to 2x of the dtype's range unused when amax sits just above a
-      power of two.
-    * ``POW2_SCALE=True``: the ``even_round`` scheme shared with
-      :func:`_mxfp4_quant_op` / :func:`_mxfp8_quant_op` -- amax is rounded to the
-      nearest power of two and the scale is taken relative to the largest power
-      of two the dtype holds (4 for e2m1, 256 for e4m3, 32768 for e5m2). Uses
-      the range better in the bulk at the cost of clipping the odd outlier.
-
-    The two are NOT bit-compatible: they disagree on roughly 12% of fp4 block
-    scales and 0.3% of fp8 ones, so a tensor quantized with one must be
-    dequantized against the same one. DEQUANT_SCALE_ROUNDING_MODE is ignored
-    when POW2_SCALE is set.
-    """
     is_fp8: tl.constexpr = (
         mx_tensor_dtype == tl.float8e4nv or mx_tensor_dtype == tl.float8e5
     )
@@ -62,6 +43,10 @@ def _compute_mx_quant_and_scale(
     BLOCK_SIZE_QUANT_DIM: tl.constexpr = src_tensor.shape[1]
     BLOCK_SIZE_QUANT_MX_SCALE: tl.constexpr = src_tensor.shape[1] // 32
 
+    # POW2_SCALE picks the scale scheme: False (default) is amax / dtype_max with
+    # the exponent rounded per DEQUANT_SCALE_ROUNDING_MODE, True is the even_round
+    # scheme shared with _mxfp4_quant_op / _mxfp8_quant_op. The two are not
+    # bit-compatible, so a tensor must be dequantized against whichever made it.
     if POW2_SCALE:
         # Padding lanes are zeroed rather than set to -1: zero is neutral for the
         # group amax and is also what the tile stores for them either way.

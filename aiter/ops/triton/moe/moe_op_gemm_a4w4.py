@@ -183,13 +183,6 @@ def mxfp4_quant(
     x: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Quantize a 2D tensor `x` of shape [M, N] (bf16/fp16/fp32) to MXFP4 (E2M1) format
-    quantized along the N dimension.
-
-    Thin wrapper over :func:`aiter.ops.triton.quant.quant.dynamic_mxfp4_quant`; it
-    exists only to hand that op the row-major scale buffer the a4w4 GEMM expects
-    (``dynamic_mxfp4_quant`` allocates a column-major one by default).
-
     Returns:
     - A packed MXFP4 tensor `x_fp4` of shape [M, N // 2] (stored as uint8), where
         each byte stores two 4-bit values.
