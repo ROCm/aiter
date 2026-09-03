@@ -1,4 +1,4 @@
-arch,variant,dtype,state_dtype,b,sq,num_k_heads,num_v_heads,head_k_dim,head_v_dim,NUM_BLOCKS_PER_V_DIM,NUM_WARPS,WARP_THREADS_K,duration
+arch,variant,dtype,state_dtype,b,sq,num_k_heads,num_v_heads,head_k_dim,head_v_dim,NUM_BLOCKS_PER_V_DIM,NUM_WARPS,WARP_THREADS_K,duration,waves_per_eu
 gfx942,decode,torch.bfloat16,torch.bfloat16,1,1,4,8,128,128,8,4,16,5.418999999999869
 gfx942,decode,torch.bfloat16,torch.bfloat16,2,1,4,8,128,128,4,4,8,6.139000000000124
 gfx942,decode,torch.bfloat16,torch.bfloat16,3,1,4,8,128,128,4,4,8,7.238999999999578
@@ -5495,3 +5495,6 @@ gfx950,snapshot_tree,torch.bfloat16,torch.float32,128,2,4,8,128,128,1,2,8,39.591
 gfx950,chain,torch.bfloat16,torch.float32,8,4,4,8,128,128,4,4,8,9.4
 gfx950,chain,torch.bfloat16,torch.float32,32,2,4,8,128,128,4,2,8,11.19
 gfx950,chain,torch.bfloat16,torch.float32,128,4,4,8,128,128,8,1,16,55.72
+gfx950,snapshot,torch.bfloat16,torch.bfloat16,128,4,2,4,128,128,2,2,8,19.84
+gfx950,snapshot,torch.bfloat16,torch.float32,128,4,2,4,128,128,4,8,16,32.18
+gfx950,snapshot_tree,torch.bfloat16,torch.bfloat16,128,4,8,16,128,128,1,4,8,94.11,3
