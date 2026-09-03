@@ -331,6 +331,46 @@ def expected_rules(rules_text):
     return sorted(set(ids))
 
 
+CITATION = re.compile(r"([\w./-]+\.(?:py|cu|cuh|hip|h|hpp|cpp|cc|csv|json|yaml|yml))"
+                      r"(?::(\d+))?")
+
+
+def changed_paths(diff_text):
+    return set(re.findall(r"^diff --git a/\S+ b/(\S+)", diff_text, re.M))
+
+
+def check_citations(verdicts_text, diff_text):
+    """Verdict lines whose cited file is not in this PR's changed set.
+
+    A reason is free text, so the gate can only check the part of it that refers to
+    something outside the model: the path. A FIRE on a file the diff never touched is
+    either a stale citation carried over from another review or invented, and both are
+    worth stopping.
+
+    Only FIRE is checked. A CLEAR legitimately cites files this PR does not touch --
+    "E5 CLEAR: aiter/__init__.py unchanged" is a correct reason precisely because that
+    file is absent from the diff, and flagging it would teach the reviewer to stop
+    citing anything, which is worse than not checking. Reasons naming no file are not
+    flagged either. This narrows the gap; it does not close it."""
+    if not diff_text:
+        return []
+    touched = changed_paths(diff_text)
+    bad = []
+    for ln in verdicts_text.splitlines():
+        m = ADJUDICATION.match(ln)
+        if not m:
+            continue
+        rule, verdict, reason = m.groups()
+        if verdict != "FIRE":
+            continue
+        for path, _line in CITATION.findall(reason):
+            base = path.lstrip("./")
+            if any(t == base or t.endswith("/" + base) for t in touched):
+                continue
+            bad.append((rule, verdict, path))
+    return bad
+
+
 def audit_ledger(rules_text, verdicts_text):
     """(missing, thin) -- rules never adjudicated, and rules adjudicated without
     evidence. Empty/empty means the rule pass actually happened.
@@ -359,7 +399,7 @@ if __name__ == "__main__":
         print("usage: triage.py rules <diff> [title]\n"
               "       triage.py evidence <diff> <head-file>...\n"
               "       triage.py symbols <diff> <merge-target-root>\n"
-              "       triage.py ledger <rules.txt> <verdicts.txt>", file=sys.stderr)
+              "       triage.py ledger <rules.txt> <verdicts.txt> [diff]", file=sys.stderr)
         raise SystemExit(2)
 
     if mode == "ledger":
@@ -369,6 +409,13 @@ if __name__ == "__main__":
         except OSError:
             verdicts_text = ""
         missing, thin = audit_ledger(rules_text, verdicts_text)
+        diff_text = ""
+        if len(sys.argv) > 4:
+            try:
+                diff_text = open(sys.argv[4], errors="replace").read()
+            except OSError:
+                diff_text = ""
+        stale = check_citations(verdicts_text, diff_text)
         want = expected_rules(rules_text)
         if not want:
             # Fail closed. An empty or unreadable rules file is the state produced by a
@@ -381,9 +428,13 @@ if __name__ == "__main__":
             print(f"UNADJUDICATED: {r} was derived for this diff and has no verdict line")
         for r, v in thin:
             print(f"NO-EVIDENCE: {r} is marked {v} with no reason given")
-        if missing or thin:
+        for r, v, path in stale:
+            print(f"UNTOUCHED-CITATION: {r} is marked {v} citing {path}, "
+                  f"which this PR does not change")
+        if missing or thin or stale:
             print(f"LEDGER INCOMPLETE: {len(want) - len(missing) - len(thin)}/{len(want)} "
-                  f"rules adjudicated with evidence", file=sys.stderr)
+                  f"rules adjudicated with evidence, {len(stale)} citing untouched files",
+                  file=sys.stderr)
             raise SystemExit(1)
         print(f"LEDGER COMPLETE: {len(want)}/{len(want)} rules adjudicated with evidence")
         raise SystemExit(0)

@@ -1497,14 +1497,18 @@ If the answer is yes, add it to the findings. If the answer is no, proceed.
 happen; go back to Step 5 rather than reporting.**
 
 ```bash
-"$SKILLS_ROOT/review-pr/triage.py" ledger "$WORK/rules.txt" "$WORK/verdicts.txt" || {
+"$SKILLS_ROOT/review-pr/triage.py" ledger "$WORK/rules.txt" "$WORK/verdicts.txt" \
+  "$WORK/pr.diff" || {
   echo "rule pass incomplete — the card must not be written yet" >&2
   exit 1
 }
 ```
 
-It lists each derived rule with no verdict line (`UNADJUDICATED`) and each verdict with no
-reason (`NO-EVIDENCE`), and it fails closed: an empty or missing `rules.txt` is the state of
+It lists each derived rule with no verdict line (`UNADJUDICATED`), each verdict with no
+reason (`NO-EVIDENCE`), and each `FIRE` whose reason cites a file this PR does not change
+(`UNTOUCHED-CITATION`) — a defect claimed against untouched code is a stale or invented
+citation. `CLEAR` may cite anything: "E5 CLEAR: `aiter/__init__.py` unchanged" is correct
+*because* that file is absent from the diff. The gate fails closed: an empty or missing `rules.txt` is the state of
 a run whose Step 1b never happened, so it exits non-zero rather than waving the run through.
 The gate checks that each rule was answered, not that the answer is right — it closes the
 cheapest failure, which is not answering.
