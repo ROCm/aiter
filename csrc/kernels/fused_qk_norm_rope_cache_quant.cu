@@ -6224,7 +6224,17 @@ void fused_qk_norm_rope_group_quant(
   // (HPW=16) lands at 36,864 WGs / 147,456 waves with 16 heads/wave -- essentially
   // flydsl's shape -- and coarse already carries the Q-head TDM ring.
 #ifndef AITER_XLARGE_USE_COARSE
-#define AITER_XLARGE_USE_COARSE 0
+// MEASURED gfx1250 H=128 T=16384, paired op_test, 6/6 clean pairs, sd 0.50pp:
+//   569.59 -> 348.50 us, -38.82% (CI -39.21..-38.42).
+// That moves H=128 from the worst cell measured against flydsl (2.52x) to the
+// same 1.54x the other head counts already sat at, which is the whole point:
+// H=128 was never slow because of the head count, it was slow because
+// FG_MANY_HEADS_MIN=128 routed it to the FG kernel at one (token,head) row per
+// wave -- 2,113,536 single-wave workgroups, each paying its own kernarg read,
+// positions chase, cos/sin setup and descriptor build. coarse gives a wave 16
+// heads and amortises all of that 16x, landing at 36,864 WGs / 147,456 waves.
+// FG_MANY_HEADS_MIN is an MI355 constant and is actively harmful here.
+#define AITER_XLARGE_USE_COARSE 1
 #endif
   const bool use_finegrained =
       (num_tokens <= 65535)

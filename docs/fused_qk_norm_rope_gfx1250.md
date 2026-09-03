@@ -47,6 +47,7 @@ serial per-head dependency chain is twice as long.
 | change | knob | measured |
 |---|---|---|
 | Q-head TDM prefetch ring in the **coarse** kernel | `AITER_COARSE_Q_TDM_DEPTH=3` | **−11.3%** @H=32 T=1024, **−15.8%** @H=32 T=16384 |
+| route the **xlarge** tier to coarse | `AITER_XLARGE_USE_COARSE=1` | **−38.8%** @H=128 T=16384 (6/6, sd 0.50pp) |
 | `%peak` column made arch-aware | (test file) | fixes a 2.2x overstatement |
 
 Both paired `op_test`, idle GPU, CI excluding zero.
@@ -92,7 +93,6 @@ All default to the original behaviour. Turn on with `-D<NAME>=<value>`.
 | knob | default | status |
 |---|---|---|
 | `AITER_FG_USE_TDM` | 0 | **Validated −11.32% at xlarge** (H=128 T=16384, 570.07→505.56, 3 clean pairs, sd 0.10pp) but the same flag reaches **decode**, where TDM is neutral-to-harmful (a wave owns one head, so there is no second tile to overlap). One unclean run had H=16 T=64 at 6.99→10.26 us. Needs a per-tier gate before it can default on. |
-| `AITER_XLARGE_USE_COARSE` | 0 | Never run. Routes the xlarge tier to coarse. Motivation in §4. |
 | `AITER_COARSE_SCALE_ALL_LANES` | 0 | Never run. Drops the `tid % Q_REDUCE == 0` dedup on the Q scale store. |
 | `AITER_FG_TOKENS_PER_WG` | 1 | Measured noise (−1.68% / +3.55%, CIs cross zero). |
 | `AITER_FG_HEADS_PER_WAVE` | 1 | **Regression +20%** at decode (VGPR 66→86, occupancy 14→11, wave count halved). |
@@ -122,9 +122,14 @@ H=16/32 (large -> coarse, 8 rows/wave) are 1.53–1.66x.
 
 `AITER_XLARGE_USE_COARSE=1` routes xlarge to coarse, landing at 36,864 WGs /
 147,456 waves with 16 heads/wave — essentially flydsl's shape — and coarse
-already carries the TDM ring. **Built, never run.** Note `FG_MANY_HEADS_MIN=128`
-exists precisely to send H>=128 to FG on MI355, so this reverses an MI355
-decision and needs correctness plus perf validation.
+already carries the TDM ring.
+
+**Measured: 569.59 -> 348.50 us, −38.8%** (6/6 clean pairs, sd 0.50pp,
+CI −39.21..−38.42), moving H=128 from 2.52x flydsl to **1.54x** — the same band
+H=16/32 already occupied. This confirms the diagnosis: H=128 was never slow
+because of its head count, only because `FG_MANY_HEADS_MIN=128` routed it into
+the one-row-per-wave path. That constant is an MI355 artefact and is actively
+harmful on gfx1250. **Default is now on.**
 
 ---
 
