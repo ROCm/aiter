@@ -63,6 +63,13 @@ def na3d_flash_attn(
     assert (
         KT <= T and KH <= H and KW <= W
     ), f"na3d_flash_attn: kernel_size=({KT},{KH},{KW}) must be <= (T,H,W)=({T},{H},{W})"
+    assert (
+        KT <= T and KH <= H and KW <= W
+    ), f"na3d_flash_attn: kernel_size=({KT},{KH},{KW}) must be <= (T,H,W)=({T},{H},{W})"
+    assert KW <= 33, (
+        f"na3d_flash_attn: KW={KW} is too large for the current autotune configs "
+        f"(max supported KW is 33 with BLOCK_Q=32/BLOCK_KV=64)."
+    )
     assert HD & (HD - 1) == 0, f"head_dim {HD} must be a power of 2"
     assert W >= 16, f"W={W} is too small; kernel requires W >= BLOCK_Q (default 16)."
 
