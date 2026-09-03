@@ -28,7 +28,7 @@ from aiter.ops.triton.comms.all_gather import _all_gather_impl
 from aiter.ops.triton.comms.reduce_scatter import _reduce_scatter_impl
 
 if TYPE_CHECKING:
-    from ..iris import IrisCommContext
+    from aiter.ops.triton.comms.iris import IrisCommContext
 
 
 # If we got here, iris is available

@@ -15,6 +15,7 @@ _gemm_afp8wfp8_repr = make_kernel_repr(
         "BLOCK_SIZE_N",
         "BLOCK_SIZE_K",
         "GROUP_SIZE_M",
+        "A_SCALE_K_GROUP",
         "num_warps",
         "num_stages",
         "waves_per_eu",
@@ -57,6 +58,7 @@ def _gemm_afp8wfp8_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    A_SCALE_K_GROUP: tl.constexpr,
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
@@ -69,7 +71,11 @@ def _gemm_afp8wfp8_kernel(
     """
     Kernel for computing the matmul C = A x B.
     A and B inputs are FP8 e4m3 (1 byte per element).
-    A_scales are e8m0 (uint8) with shape (M, K // 32).
+    A_scales are e8m0 (uint8) with shape (M, K // A_SCALE_K_GROUP), where
+    A_SCALE_K_GROUP is 32 for MX activations or 128 for blockscale activations;
+    coarser-than-32 scales are broadcast to the 32-element groups tl.dot_scaled
+    requires. The caller folds a transposed scale buffer into stride_asm /
+    stride_ask, so both layouts are handled here identically.
     B_scales are stored compact e8m0 (uint8) with shape (N // 128, K // 128),
     representing 128x128 weight blocks. Broadcast inside kernel to (N, K // 32).
     A has shape (M, K), B has shape (K, N) and C has shape (M, N).
@@ -131,15 +137,10 @@ def _gemm_afp8wfp8_kernel(
             offs_k_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
         )
 
-        # A-scale pointers: per-row (M) and per scale group (K // 32). Shift
-        # along the K-scale axis by the split's start in scale groups.
-        offs_ks_a = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
-        offs_ks_a_split = pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE) + offs_ks_a
-        a_scale_ptrs = (
-            a_scales_ptr
-            + offs_am[:, None] * stride_asm
-            + offs_ks_a_split[None, :] * stride_ask
-        )
+        # A-scale row offsets. The K index is computed per-iteration below from
+        # absolute K, so a scale group coarser than 32 is simply read by several
+        # of the 32-element groups (and split-K addresses the right group).
+        offs_asm = offs_am * stride_asm
 
         # B-scale pointers: compact (N // 128, K // 128) — broadcast inside the kernel
         # Each scale covers a 128(N) x 128(K) block. Computed per-iteration below
@@ -153,7 +154,13 @@ def _gemm_afp8wfp8_kernel(
             # K base for this iteration (in elements, absolute).
             k_base = k * BLOCK_SIZE_K
 
-            # ---- Load A scales (M, BLOCK_SIZE_K // 32) ----
+            # ---- Load A scales (BLOCK_SIZE_M, BLOCK_SIZE_K // 32) ----
+            offs_ask = (
+                k_base + offs_scale_k_a * SCALE_GROUP_SIZE
+            ) // A_SCALE_K_GROUP  # (BLOCK_SIZE_K // 32,)
+            a_scale_ptrs = (
+                a_scales_ptr + offs_asm[:, None] + offs_ask[None, :] * stride_ask
+            )
             if EVEN_K:
                 a_scales = tl.load(a_scale_ptrs)
             else:
@@ -204,10 +211,10 @@ def _gemm_afp8wfp8_kernel(
                 a, a_scales, "e4m3", b, b_scales, "e4m3", accumulator
             )
 
-            # Advance the ptrs to the next K block.
+            # Advance the ptrs to the next K block (scale ptrs are rebuilt from
+            # absolute K each iteration).
             a_ptrs += BLOCK_SIZE_K * stride_ak
             b_ptrs += BLOCK_SIZE_K * stride_bk
-            a_scale_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_SIZE) * stride_ask
 
         c = accumulator.to(c_ptr.type.element_ty)
 
@@ -232,6 +239,7 @@ _gemm_afp8wfp8_preshuffle_repr = make_kernel_repr(
         "BLOCK_SIZE_N",
         "BLOCK_SIZE_K",
         "GROUP_SIZE_M",
+        "A_SCALE_K_GROUP",
         "num_warps",
         "num_stages",
         "waves_per_eu",
@@ -274,6 +282,7 @@ def _gemm_afp8wfp8_preshuffle_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    A_SCALE_K_GROUP: tl.constexpr,
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
@@ -352,15 +361,10 @@ def _gemm_afp8wfp8_preshuffle_kernel(
             offs_bn_shuffle[:, None] * stride_bn + offs_k_shuffle[None, :] * stride_bk
         )
 
-        # A-scale pointers: per-row M, per 32-K group. Shift along the K-scale
-        # axis by the split's start in scale groups.
-        offs_ks_a = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
-        offs_ks_a_split = pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE) + offs_ks_a
-        a_scale_ptrs = (
-            a_scales_ptr
-            + offs_am[:, None] * stride_asm
-            + offs_ks_a_split[None, :] * stride_ask
-        )
+        # A-scale row offsets. The K index is computed per-iteration below from
+        # absolute K, so a scale group coarser than 32 is simply read by several
+        # of the 32-element groups (and split-K addresses the right group).
+        offs_asm = offs_am * stride_asm
 
         # B-scale pointers: compact (N // 128, K // 128). The N index needs the
         # ORIGINAL (logical) row, not the shuffled row index.
@@ -373,7 +377,11 @@ def _gemm_afp8wfp8_preshuffle_kernel(
         for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
             k_base = k * BLOCK_SIZE_K  # absolute K base
 
-            # Load A scales.
+            # Load A scales (broadcast when A_SCALE_K_GROUP > 32).
+            offs_ask = (k_base + offs_scale_k_a * SCALE_GROUP_SIZE) // A_SCALE_K_GROUP
+            a_scale_ptrs = (
+                a_scales_ptr + offs_asm[:, None] + offs_ask[None, :] * stride_ask
+            )
             if EVEN_K:
                 a_scales = tl.load(a_scale_ptrs)
             else:
@@ -439,10 +447,9 @@ def _gemm_afp8wfp8_preshuffle_kernel(
                 a, a_scales, "e4m3", b, b_scales, "e4m3", accumulator
             )
 
-            # Advance pointers.
+            # Advance pointers (scale ptrs are rebuilt from absolute K each iter).
             a_ptrs += BLOCK_SIZE_K * stride_ak
             b_ptrs += BLOCK_SIZE_K * 16 * stride_bk
-            a_scale_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_SIZE) * stride_ask
 
         c = accumulator.to(c_ptr.type.element_ty)
 
@@ -463,8 +470,11 @@ def _get_config(
     N: int,
     K: int,
     shuffle: bool = False,
+    backend: str = "triton",
 ):
+    # backend selects the per-backend config dir (<arch>/<backend>/gemm/), so the
+    # triton and gluon kernels can carry different tuning keys for the same shape.
     if shuffle:
-        return get_gemm_config("GEMM-AFP8WFP8_PRESHUFFLED", M, N, K)
+        return get_gemm_config("GEMM-AFP8WFP8_PRESHUFFLED", M, N, K, backend=backend)
     else:
-        return get_gemm_config("GEMM-AFP8WFP8", M, N, K)
+        return get_gemm_config("GEMM-AFP8WFP8", M, N, K, backend=backend)

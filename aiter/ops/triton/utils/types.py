@@ -1,7 +1,7 @@
 import torch
 import triton.language as tl
 
-from ._triton import arch_info
+from aiter.ops.triton.utils._triton import arch_info
 
 
 def get_dtype_max(dtype):
@@ -69,6 +69,17 @@ torch_to_triton_dtype = {
     torch.int8: tl.int8,
     torch.uint8: tl.uint8,
 }
+
+
+def get_scaled_dot_format_string(dtype: tl.dtype):
+    mapping = {
+        tl.float16: "fp16",
+        tl.bfloat16: "bf16",
+        tl.uint8: "e2m1",
+        tl.float8e4nv: "e4m3",
+        tl.float8e5: "e5m2",
+    }
+    return mapping[dtype]
 
 
 def _is_fp8(x):

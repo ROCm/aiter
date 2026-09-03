@@ -105,4 +105,7 @@ void quant_mxfp4(const aiter_tensor_t& inp,
                  bool a16w4_shuffle      = false,
                  bool gate_up            = false,
                  bool shuffle_weight     = false);
+void quant_mxfp6_gemm_hip(const aiter_tensor_t& input,
+                          aiter_tensor_t& packed,
+                          aiter_tensor_t& packed_scale);
 } // namespace aiter

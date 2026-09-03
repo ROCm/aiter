@@ -403,7 +403,14 @@ __global__ void radix_kernel_persistent(T const* in,
             {
                 out_idx_ptr[i] = (i < row_len) ? (in_idx_buf ? in_idx_buf[i] : (i + rowStart)) : IdxT(-1);
                 if(WRITE_TOPK_VALUES)
-                    out_ptr[i] = (i < row_len) ? in_buf[i] : T(0);
+                    // -inf, matching the one-block kernel: the index padded to
+                    // -1, so the score must sort below every real one. Which of
+                    // the two kernels runs is a perf heuristic
+                    // (should_use_mulblocks), so the padding they write has to
+                    // agree or the same call gains a different meaning at a
+                    // batch-size boundary.
+                    out_ptr[i] = (i < row_len) ? in_buf[i]
+                                               : -std::numeric_limits<T>::infinity();
             }
         }
         return;
@@ -489,6 +496,13 @@ __global__ void radix_kernel_persistent(T const* in,
                 atomicAdd(histogram + i, histogram_smem[i]);
             }
         }
+        // Every wave drains its own no-return histogram atomics before
+        // thread 0 participates in the cross-block arrival counter.
+#if defined(__gfx1250__)
+        asm volatile("s_wait_storecnt 0" ::: "memory");
+#else
+        asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#endif
         __syncthreads();
 
         // Cross-block barrier via atomicInc + spin-wait.
@@ -502,22 +516,26 @@ __global__ void radix_kernel_persistent(T const* in,
         {
             if(threadIdx.x == 0)
             {
-                __atomic_store_n(reinterpret_cast<volatile unsigned int*>(&counter->pass_done),
-                                 static_cast<unsigned int>(pass + 1), __ATOMIC_RELEASE);
+                __hip_atomic_store(&counter->pass_done,
+                                   static_cast<unsigned int>(pass + 1),
+                                   __ATOMIC_RELEASE,
+                                   __HIP_MEMORY_SCOPE_AGENT);
             }
         }
-        else
+        if(threadIdx.x == 0)
         {
-            if(threadIdx.x == 0)
+            unsigned int target = static_cast<unsigned int>(pass + 1);
+            while(__hip_atomic_load(&counter->pass_done,
+                                    __ATOMIC_RELAXED,
+                                    __HIP_MEMORY_SCOPE_AGENT) < target)
             {
-                unsigned int target = static_cast<unsigned int>(pass + 1);
-                while(__atomic_load_n(reinterpret_cast<volatile unsigned int*>(&counter->pass_done), __ATOMIC_ACQUIRE) < target)
-                {
-                    __builtin_amdgcn_s_sleep(1);
-                }
+                __builtin_amdgcn_s_sleep(1);
             }
-            __syncthreads();
+            // One acquire/invalidate per block after relaxed polling observes
+            // the released pass value.
+            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
         }
+        __syncthreads();
 
         // Each block independently computes scan + choose_bucket (same result, no sync needed).
         for(int i = threadIdx.x; i < num_buckets; i += blockDim.x)
@@ -2227,7 +2245,13 @@ __global__ void radix_topk_one_block_kernel(T const* in,
             out_idx[rowIt] = rowIt < row_len ? rowIt + rowStart : -1;
             if(WRITE_TOPK_VALUES)
             {
-                out[rowIt] = rowIt < row_len ? in[rowIt] : 0;
+                // Pad with -inf, not 0: the index gets -1, so the score must
+                // sort BELOW every real one. Logits are routinely negative, and
+                // a 0.0 pad outranks them -- a consumer that ranks these scores
+                // (DCP merges the exchanged top-k across ranks) would let
+                // padding steal real candidates' slots.
+                out[rowIt] = rowIt < row_len ? in[rowIt]
+                                             : -std::numeric_limits<T>::infinity();
             }
         }
         return;
@@ -2934,7 +2958,8 @@ void top_k_per_row_decode(const aiter_tensor_t& logits,
                           int64_t /*stride1*/,
                           int64_t k = 2048,
                           std::optional<aiter_tensor_t> workspace = std::nullopt,
-                          bool stable = false)
+                          bool stable = false,
+                          std::optional<aiter_tensor_t> values = std::nullopt)
 {
     if (numRows <= 0) return;
 
@@ -2950,6 +2975,23 @@ void top_k_per_row_decode(const aiter_tensor_t& logits,
     float* logits_ptr = static_cast<float*>(logits.data_ptr());
     int* indices_ptr  = static_cast<int*>(indices.data_ptr());
     int* seq_lens_ptr = static_cast<int*>(seqLens.data_ptr());
+    const bool write_vals = values.has_value();
+    if(write_vals)
+    {
+        // The kernel writes k floats per row through this pointer and carries
+        // no metadata of its own, so a wrong dtype or a short buffer is silent
+        // memory corruption rather than a type error. The Python wrapper checks
+        // the same things, but the pybind op is reachable directly.
+        const auto& v = values.value();
+        AITER_CHECK(v.dtype() == AITER_DTYPE_fp32,
+                    "top_k_per_row_decode: values must be fp32");
+        AITER_CHECK(v.is_contiguous(), "top_k_per_row_decode: values must be contiguous");
+        AITER_CHECK(v.numel() >= static_cast<size_t>(numRows) * static_cast<size_t>(k),
+                    "top_k_per_row_decode: values must hold numRows * k entries");
+        AITER_CHECK(v.device_id == indices.device_id,
+                    "top_k_per_row_decode: values must be on the same device as indices");
+    }
+    float* values_ptr = write_vals ? static_cast<float*>(values.value().data_ptr()) : nullptr;
 
     AITER_CHECK(workspace.has_value(),
                 "top_k_per_row_decode requires a caller-provided workspace "
@@ -2960,36 +3002,37 @@ void top_k_per_row_decode(const aiter_tensor_t& logits,
     // stable=true: deterministic ascending-ordered, smallest-index tie-break
     // emit so every TP rank selects and orders an identical KV set.
     if (stable) {
-        aiter::ob::dispatch_topk_oneblock<float, int, 1024, false, aiter::ob::Phase::Decode, /*STABLE=*/true>(
+        if (write_vals) {
+            aiter::ob::dispatch_topk_oneblock<float, int, 1024, true, aiter::ob::Phase::Decode, /*STABLE=*/true>(
+                ws_ptr, buf_size, logits_ptr, static_cast<int*>(nullptr),
+                batch, stride0,
+                /*rowStarts=*/nullptr, /*rowEnds=*/seq_lens_ptr,
+                kTopK, values_ptr, indices_ptr,
+                select_min, stream, /*sorted=*/true, static_cast<int>(next_n));
+        } else {
+            aiter::ob::dispatch_topk_oneblock<float, int, 1024, false, aiter::ob::Phase::Decode, /*STABLE=*/true>(
+                ws_ptr, buf_size, logits_ptr, static_cast<int*>(nullptr),
+                batch, stride0,
+                /*rowStarts=*/nullptr, /*rowEnds=*/seq_lens_ptr,
+                kTopK, /*out=*/nullptr, indices_ptr,
+                select_min, stream, /*sorted=*/true, static_cast<int>(next_n));
+        }
+        return;
+    }
+    if (write_vals) {
+        aiter::ob::dispatch_topk_oneblock<float, int, 1024, true, aiter::ob::Phase::Decode>(
+            ws_ptr, buf_size, logits_ptr, static_cast<int*>(nullptr),
+            batch, stride0,
+            /*rowStarts=*/nullptr, /*rowEnds=*/seq_lens_ptr,
+            kTopK, values_ptr, indices_ptr,
+            select_min, stream, /*sorted=*/true, static_cast<int>(next_n));
+    } else {
+        aiter::ob::dispatch_topk_oneblock<float, int, 1024, false, aiter::ob::Phase::Decode>(
             ws_ptr, buf_size, logits_ptr, static_cast<int*>(nullptr),
             batch, stride0,
             /*rowStarts=*/nullptr, /*rowEnds=*/seq_lens_ptr,
             kTopK, /*out=*/nullptr, indices_ptr,
             select_min, stream, /*sorted=*/true, static_cast<int>(next_n));
-        return;
     }
-    aiter::ob::dispatch_topk_oneblock<float, int, 1024, false, aiter::ob::Phase::Decode>(
-        ws_ptr, buf_size, logits_ptr, static_cast<int*>(nullptr),
-        batch, stride0,
-        /*rowStarts=*/nullptr, /*rowEnds=*/seq_lens_ptr,
-        kTopK, /*out=*/nullptr, indices_ptr,
-        select_min, stream, /*sorted=*/true, static_cast<int>(next_n));
 
-    // --- Original mb/ob dispatch (commented out for reference) ---
-    // Both branches take the caller-provided `workspace` (no device allocation
-    // here); the mb buffer is zeroed + self_reset by the kernel (prezeroed=true).
-    // if (aiter::should_use_mulblocks(batch, stride0)) {
-    //     aiter::mb::standalone_stable_radix_topk<float, int, false, true, aiter::mb::Phase::Decode>(
-    //         ws_ptr, buf_size, logits_ptr, batch, stride0,
-    //         /*rowStarts=*/nullptr, /*rowEnds=*/seq_lens_ptr,
-    //         kTopK, /*out=*/nullptr, indices_ptr,
-    //         is_largest, stream, static_cast<int>(next_n), /*prezeroed=*/true);
-    // } else {
-    //     aiter::ob::dispatch_topk_oneblock<float, int, 1024, false, aiter::ob::Phase::Decode>(
-    //         ws_ptr, buf_size, logits_ptr, static_cast<int*>(nullptr),
-    //         batch, stride0,
-    //         /*rowStarts=*/nullptr, /*rowEnds=*/seq_lens_ptr,
-    //         kTopK, /*out=*/nullptr, indices_ptr,
-    //         select_min, stream, /*sorted=*/true, static_cast<int>(next_n));
-    // }
 }

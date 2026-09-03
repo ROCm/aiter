@@ -277,6 +277,11 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
             "`initial_state_indices` requires in-place update; "
             "leave `inplace_final_state` unset or set it to True."
         )
+    if has_indices and not output_final_state:
+        raise ValueError(
+            "`initial_state_indices` requires `output_final_state=True` "
+            "(the indexed path writes the final state back into the pool)."
+        )
 
     k_hip = k.contiguous()
     w_hip = w.contiguous()

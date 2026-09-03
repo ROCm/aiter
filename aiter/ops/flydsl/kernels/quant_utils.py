@@ -35,7 +35,7 @@ view to :func:`emit_mx_e8m0_scale` -- both round-trip through
 from __future__ import annotations
 
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import arith
+from flydsl.expr import arith, rocdl
 from flydsl.expr.arith import CmpIPredicate
 from flydsl.expr.typing import T
 
@@ -304,5 +304,14 @@ def emit_cvt_scalef32_pk8_fp8_f32(src_v8f32, scale_f32, *, v2i32_ty, rocdl):
     return rocdl.cvt_scalef32_pk8_fp8_f32(
         v2i32_ty,
         _raw(src_v8f32),
+        _raw(scale_f32),
+    )
+
+
+def emit_cvt_scalef32_pk8_fp4_bf16(src_v8bf16, scale_f32, *, i32_ty):
+    """Native gfx1250 scaled conversion of eight bf16 values to packed FP4."""
+    return rocdl.cvt_scalef32_pk8_fp4_bf16(
+        i32_ty,
+        _raw(src_v8bf16),
         _raw(scale_f32),
     )

@@ -5,24 +5,30 @@
 
 ## Current Status
 
-Dense BF16-output MHA v4 is implemented and validated on gfx950. A gfx942 signed INT8/FP8 row is
-also preserved under v4.
+Dense BF16-output MHA v4 is implemented and validated on gfx950. Sorted block-sparse dispatch
+(mask/LUT APIs, `mode=1` manifest rows) is wired on the same family; sparse `.co` files are
+deployed next to the dense objects. Gfx942 native FP8/FP8 and signed INT8/FP8 have both dense
+and sorted-sparse rows under v4 (256×64 tiles).
 
-The public raw and packed APIs support six dense combinations:
+The public raw and packed APIs support eight dense combinations:
 
 | Q/K | V | Output |
 |---|---|---|
+| BF16 | BF16 | BF16 |
 | INT8 | FP8 | BF16 |
 | FP8 | FP8 | BF16 |
+| MXFP8 | FP8 | BF16 |
 | MXFP6 E2M3 | FP8 | BF16 |
 | MXFP4 E2M1 | FP8 | BF16 |
 | MXFP6 E2M3 | MXFP4 E2M1 | BF16 |
 | MXFP4 E2M1 | MXFP4 E2M1 | BF16 |
 
-Current scope is batched, dense, non-causal MHA with matching Q/KV head counts, BF16 raw inputs,
-head dimension 128, and BF16 output. It is inference-only: no backward, dropout, RNG state, LSE,
-GQA, varlen, or sparse metadata. Unsupported requests fail explicitly and never fall back to
-`aiter.ops.mha`.
+Current scope is batched, non-causal MHA with BF16 raw inputs, head dimension 128, and BF16
+output. Dense and sorted block-sparse execution both support grouped-query head ratios; sparse
+LUT rows are one per query head. Sparse ships on gfx950 (all eight packed recipes, 256×128)
+and gfx942 (native FP8/FP8 and INT8/FP8, 256×64). It is inference-only: no backward,
+dropout, RNG state, LSE, or varlen. Unsupported requests fail explicitly and never fall back
+to `aiter.ops.mha`.
 
 ## Stable Decisions And Ownership
 
@@ -47,8 +53,9 @@ GQA, varlen, or sparse metadata. Unsupported requests fail explicitly and never 
 The current implementation is intentionally one module, `aiter/ops/mha_v4.py`; a speculative
 subpackage split is not part of the design. It exports:
 
-- `mha_v4` and `mha_v4_packed`;
-- `AttentionFormat`, `AttentionScaleMode`, `native_fp8_format`, and `scale_modes_for_formats`;
+- `mha_v4`, `mha_v4_mxfp8`, and `mha_v4_packed`;
+- `AttentionFormat`, `AttentionScaleMode`, `native_fp8_format`, `mha_v4_kv_tile`, and
+  `scale_modes_for_formats`;
 - canonical per-tensor, MX Q/K, and V quantizers;
 - `mxfp4_k_view`, `mxfp6_k_view`, and `mxfp4_v_view` for raw-buffer reconstruction;
 - `mha_v4_q_multiplier` for the MX Q scaling recipe.
@@ -67,18 +74,18 @@ migration, and distributed integration are complete. Callers can delegate quanti
 scaling, scale recipes, and packed views to MHA v4 while retaining separate Q/K/V custom ops for
 communication overlap.
 
-Validation includes eager accuracy for all six combinations, fullgraph eager/compiled parity,
+Validation includes eager accuracy for all eight combinations, fullgraph eager/compiled parity,
 finite outputs, allocator churn with downstream consumers, explicit code-object dispatch,
 unaligned and unequal sequence lengths, retained model captures, and balanced multi-GPU target-shape
 benchmarks. Focused coverage lives in `op_tests/test_mha_v4.py`.
 
 Still deferred:
 
-- sparse ragged-LUT execution, VSA/Sparge compatibility, and ring/LSE support;
+- VSA/Sparge compatibility adapters and 128x128 sparse tiles;
 - low-precision output with an explicit data/scale ABI;
-- approximate BF16 input under a distinct identity from v3 BF16;
-- GQA, causal, varlen, other head dimensions, and more Q/K/V/O combinations;
-- broader gfx942, CDNA5, and RDNA manifest/code-object coverage.
+- additional BF16 kernel variants with distinct manifest identities;
+- causal, varlen, other head dimensions, and more Q/K/V/O combinations;
+- remaining gfx942 recipes (MX, BF16 sparse), plus CDNA5 and RDNA coverage.
 
 ## Current Dense Performance
 
@@ -116,6 +123,7 @@ output = mha_v4(
     softmax_scale=None,
     return_lse=False,
     out=None,
+    block_mask=None,
 )
 ```
 
@@ -123,6 +131,26 @@ Inputs are contiguous BF16 BSHD tensors. The requested formats select canonical 
 preprocessing and an explicit ASM row; unsupported combinations fail. Q/K must currently match.
 Output is BF16, and a supplied `out` must match Q's shape/device. Q, K, and V preprocessing remain
 separate custom ops so distributed schedulers can overlap each with its input communication.
+The canonical FP8 Q/K recipe applies normalized hd128 Walsh-Hadamard rotation before per-tensor
+quantization on both gfx942 and gfx950; V uses unrotated per-tensor FP8 quantization.
+Optional `block_mask` is a boolean tile mask at the architecture's sparse geometry (256×128 on
+gfx950, 256×64 on gfx942): `[B, H, Qtiles, KVtiles]` or `[B, Qtiles, KVtiles]` (broadcast across
+heads). Use `mha_v4_kv_tile()` for the KV dimension. It is converted internally to a ragged LUT;
+the host work table is not a Python argument.
+
+#### Grouped-Query Attention
+
+Both raw entrypoints (`mha_v4` and `mha_v4_mxfp8`) and `mha_v4_packed` accept GQA directly. Q uses
+shape `[batch, query_length, query_heads, 128]`; K and V use
+`[batch, key_value_length, kv_heads, 128]`. K and V must have the same head count, `query_heads`
+must be divisible by `kv_heads`, and the ratio `query_heads / kv_heads` must be one of
+`1, 2, 4, 8, 16`. Ratio 1 is ordinary multi-head attention. The kernel maps each contiguous group
+of query heads to one K/V head; callers must not expand K or V to `query_heads`. Output retains Q's
+batch, sequence, and head dimensions.
+
+For example, Q with 32 heads and K/V with 8 heads selects GQA ratio 4. Q and K still use the same
+number format and canonical quantization recipe; "Q/K formats must match" refers to their encoding,
+not their head counts. Ratios outside the supported power-of-two set fail explicitly.
 
 ### Packed Expert API
 
@@ -146,12 +174,18 @@ output = mha_v4_packed(
     softmax_scale=1.0,
     return_lse=False,
     out=None,
+    kv_block_indices=None,
+    lut_start=None,
+    lut_count=None,
 )
 ```
 
 The packed API takes each operand's data, descale, format, and scale mode explicitly. It validates
 the complete recipe plus dtype, shape, and layout before launching. Call
 `scale_modes_for_formats()` for the production recipe rather than duplicating mode triples.
+The optional LUT triple (`kv_block_indices`, `lut_start`, `lut_count`) must be all set or all
+omitted; do not pass a dataclass and do not pass a mask to the packed API. Sparse launch uses
+manifest `mode=1`; the work table is built inside the sparse custom op.
 
 MX Q/K/V producers return contiguous raw buffers where the ASM layout is not an ordinary tensor
 layout. `mxfp4_k_view`, `mxfp6_k_view`, and `mxfp4_v_view` reconstruct logical views. Raw buffers,
@@ -289,27 +323,52 @@ code_object
 
 Kernel cache identity is `(kernel_symbol, code_object)`, never the symbol alone.
 
-The approximate BF16 kernel uses a distinct symbol, code-object slot, and manifest row, for example
-`fwd_hd128_bf16_approx.co`. It must not overwrite or reuse generic `fwd_hd128_bf16.co` dispatch.
+BF16 dispatch uses the same explicit format and scale-mode key as other rows. Each architecture
+owns its manifest row and code object under `hsa/<arch>/fmha_v4_fwd/`; adding gfx942 BF16 support
+does not require a Python-side architecture branch.
 
 ## Sparse Contract
 
-Sparse support is deferred. The proposed common descriptor is:
+Sorted block-sparse execution is implemented for gfx950 hd128 rows (256×128) and for gfx942
+native FP8/FP8 plus INT8/FP8 (256×64). Other gfx942 recipes stay dense-only.
 
-```python
-@dataclass(frozen=True)
-class AttentionBlockSparseLut:
-    kv_block_indices: torch.Tensor
-    lut_start: torch.Tensor
-    lut_count: torch.Tensor
-    query_block_size: int = 256
-    kv_block_size: int = 128
-```
+Selection is an explicit manifest dimension (`mode=0` dense, `mode=1` sorted-sparse), not
+inferred from pointers or redirected from a dense request. Dense and sparse use separate
+launchers so the dense kernarg layout stays frozen.
 
-The tensors are contiguous device `int32`; start/count have one entry per
-`(batch, query_head, query_block)`. LUT creation must avoid data-dependent allocations. Sparse
-selection is an explicit manifest dimension and ABI, never an inference from extra pointers or a
-silent redirect from a dense request.
+Raw API: optional boolean `block_mask` at query-tile 256 × `mha_v4_kv_tile()` (128 on gfx950,
+64 on gfx942). Convert with
+`block_attn_mask_to_ragged_lut(..., num_heads=q.shape[2], return_none_if_dense=False)`.
+An all-True mask still takes the sparse row. GQA uses the same ratio as dense; LUT and work-table
+rows are one per query head. A 3-D mask broadcasts across query heads; a 4-D mask may give grouped
+query heads different KV-tile lists.
+
+Packed API: optional int32 LUT triple. `lut_start` / `lut_count` have one entry per
+`(batch, query_head, query_block)`. `kv_block_indices` is 1-D and may be over-allocated to
+`B*H*Qtiles*KVtiles` to avoid data-dependent allocations. Key length must be a multiple of the
+architecture KV tile (128 on gfx950, 64 on gfx942).
+
+The host builds a work table inside the sparse custom op. If every `lut_count` is equal
+(uniform / top-k sparsity), visit order stays raster; otherwise rows are ordered
+longest-LUT-first (LPT).
+
+Up to 8192 entries one fused kernel ranks and packs the table; past that the sort falls back to
+ATen. The limit is where the 8-byte keys fill the 64 KB of LDS a workgroup gets.
+
+A LUT row may select nothing. `lut_count == 0` is a no-op that writes a zero output tile, so an
+all-False `block_mask` row is valid input: the ASM clamps the row's prologue reads in bounds and
+skips the KV traversal, and the epilogue's zero-row-sum path zeroes the tile. That makes the entry
+count unbounded below, so the only bound the launcher can check without reading device data is that
+`kv_block_indices` is non-empty (the kernels dereference the row base even for an empty row, and
+read speculatively up to one entry past the row they traverse). Set `AITER_MHA_V4_VALIDATE_LUT=1` to
+also check starts, counts, and index ranges device-side, which costs a synchronization per launch
+and is off by default.
+
+Sparse code objects live next to dense ones: `hsa/gfx950/fmha_v4_fwd/` (for example
+`fwd_hd128_fp8_sparse.co`) and `hsa/gfx942/fmha_v4_fwd/MI300/` for the two gfx942 recipes.
+
+Do not add optional LUT arguments to the dense MXFP4/MXFP6 launch custom ops; sparse MX goes
+through `mha_v4_packed` after reconstructing views.
 
 ### VSA Compatibility
 
@@ -359,12 +418,12 @@ Fix offsets with the first implementing kernel; existing v1 binaries retain thei
 
 ## Forward Roadmap
 
-1. Add sparse manifest rows, ragged-LUT validation, and exact 256x128/128x128 execution paths.
-2. Add VSA/Sparge adapters over the shared sparse descriptor and packed executor.
-3. Add LSE under a stable output schema for ring attention.
-4. Add approximate BF16 under a distinct symbol and code object from generic v3 BF16.
-5. Add a versioned low-precision-output ABI once data/scale ownership is concrete.
-6. Expand architectures, head dimensions, sequence modes, and format combinations only through
+1. Add VSA/Sparge adapters over the shared sparse LUT and packed executor, plus a 128x128 sparse
+    tile if adjacent VSA 128-query rows differ.
+2. Add LSE under a stable output schema for ring attention.
+3. Add approximate BF16 under a distinct symbol and code object from generic v3 BF16.
+4. Add a versioned low-precision-output ABI once data/scale ownership is concrete.
+5. Expand architectures, head dimensions, sequence modes, and format combinations only through
     explicit manifest rows.
 
 ## Required Validation

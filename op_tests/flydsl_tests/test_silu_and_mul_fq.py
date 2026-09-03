@@ -4,7 +4,6 @@ import torch
 from aiter import dtypes
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 from aiter.ops.flydsl.moe_kernels import _get_compiled_silu_fused, _run_compiled
-from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.ops.quant import per_1x32_f4_quant
 from aiter.utility.fp4_utils import moe_mxfp4_sort
 
@@ -31,9 +30,6 @@ def _situv2_ref(
 
 @pytest.mark.parametrize("beta, linear_beta", [(1.0, 1.0), (4.0, 25.0)])
 def test_flydsl_situv2_fused_uses_runtime_betas(beta: float, linear_beta: float):
-    if not is_flydsl_available():
-        pytest.skip("FlyDSL is not available")
-
     torch.manual_seed(0)
     device = torch.device("cuda")
     token_num, topk, inter_dim = 4, 2, 256
@@ -87,8 +83,6 @@ def test_flydsl_swiglu_fused_fp4_quant_matches_reference(
 ):
     if not hasattr(torch, "float4_e2m1fn_x2"):
         pytest.skip("MXFP4 is not available in this torch build")
-    if not is_flydsl_available():
-        pytest.skip("FlyDSL is not available")
 
     torch.manual_seed(0)
     device = torch.device("cuda")

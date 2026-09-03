@@ -1,36 +1,92 @@
 ---
 name: review-pr
-description: AI code review for aiter PRs. Catches perf regressions, silent correctness bugs, dispatch gate holes, and AI-generated code patterns. Invoke with a PR number; works through fetch → semantic understanding → rule checklist → verdict. Add new rules here as patterns emerge from real reviews.
-argument-hint: <PR number>
+description: Advisory AI code review for aiter and FlyDSL PRs. Catches perf regressions, silent correctness bugs, dispatch gate holes, and AI-generated code patterns, but never acts as a merge gate. Invoke with a PR number (optionally owner/repo#N) and, when one exists, a validation report path. Step 1 triages whether the PR changes runtime surface at all and, when it does and the PR ships a single test target, runs validate-kernel-pr itself; a PR with no runtime surface is reported N/A rather than unvalidated. That run also times the target on base and head back to back on one locked GPU, so a kernel PR's latency is measured rather than assumed. The review line stays advisory; deterministic correctness and perf results are judged only from a head-matched report.
+argument-hint: <PR number> [owner/repo] [validation-report]
 ---
 
-# aiter PR Review
+# aiter PR Review — advisory tier
+
+This skill supplies hints to a human reviewer. Its judgement is stochastic and never blocks a
+merge. Only a reproducible blocker from an explicitly supplied, head-matched
+`validation_report.json` may be used as a deterministic gate.
+
+## Promotion bar
+
+This skill is advisory now and stays advisory until both conditions below hold. Neither holds today,
+so no part of it may gate a merge.
+
+- **False clearance is measured and near zero for every family that raises a red verdict.** The
+  number that matters is not recall, and not a spot check: it is the rate at which the tool reports
+  nothing wrong when something is wrong. No committed replay corpus establishes it, so that number
+  does not currently exist.
+- **The judgement relied on is not an LLM's.** An LLM judgement never gates a merge, whatever its
+  measured accuracy. Only a reproducible blocker carried by a head-matched `validation_report.json`
+  may gate, because the report ships its reproducer with it.
+
+Until then `🔴 HIGH RISK` requests human attention and nothing more. Whoever proposes a rule edit as
+an improvement, or proposes letting this tool gate a merge, owns building the corpus and measuring
+against it. This bar lives in the header rather than in an issue because a header is read on every
+use and an issue sinks.
 
 ---
 
 ## Step 1 — Fetch
 
 ```bash
+set -euo pipefail
+
+# Per-invocation scratch dir. Fixed /tmp paths collide: two reviews running at once
+# overwrite each other's pr.diff between the write and the read, and the second review
+# silently analyses the first one's diff under its own PR number. Observed.
+WORK=$(mktemp -d /tmp/review-pr-XXXXXX)
+PROJECT_ROOT=$(git rev-parse --show-toplevel) || {
+  echo "review-pr must run inside the repository that owns .claude/skills" >&2
+  exit 1
+}
+SKILLS_ROOT="$PROJECT_ROOT/.claude/skills"
+
 PR=$1  # PR number from skill argument
-REPO="ROCm/aiter"
+# Second argument, or a PR given as owner/repo#N, selects the repository. FlyDSL kernels
+# are reviewed from their own repo, so this must not be hard-coded to aiter.
+REPO="${2:-ROCm/aiter}"
+VALIDATION_REPORT="${3:-}"
+case "$1" in
+  */*#*)
+    REPO="${1%#*}"
+    PR="${1##*#}"
+    VALIDATION_REPORT="${2:-}"
+    ;;
+esac
 
 # Full metadata
-gh pr view $PR --repo $REPO --json title,body,number,labels,files,author,reviews,comments > /tmp/pr_meta.json
+gh pr view "$PR" --repo "$REPO" \
+  --json title,body,number,labels,files,author,reviews,comments,baseRefName,headRefOid \
+  > "$WORK/pr_meta.json"
 
 # Diff
-gh pr diff $PR --repo $REPO > /tmp/pr.diff
+gh pr diff "$PR" --repo "$REPO" > "$WORK/pr.diff"
+
+# Current base branch tip. PR metadata's base OID can remain the historical merge base after
+# main advances, so it is not sufficient for stale merge-simulation detection.
+BASE_REF=$(python3 -c \
+  'import json,sys; print(json.load(open(sys.argv[1]))["baseRefName"])' \
+  "$WORK/pr_meta.json")
+BASE_REF_PATH=$(python3 -c \
+  'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' \
+  "$BASE_REF")
+gh api "repos/$REPO/branches/$BASE_REF_PATH" --jq .commit.sha > "$WORK/base_head.txt"
 
 # Linked issue (extract from body "fix: #NNN" or "close #NNN")
-ISSUE=$(cat /tmp/pr_meta.json | python3 -c "
+ISSUE=$(cat "$WORK/pr_meta.json" | python3 -c "
 import json,re,sys
 body = json.load(sys.stdin).get('body','') or ''
 m = re.search(r'(?:fix|close|resolve)[s]?[: ]*#(\d+)', body, re.I)
 print(m.group(1) if m else '')
 ")
-[ -n "$ISSUE" ] && gh issue view $ISSUE --repo $REPO --json title,body > /tmp/pr_issue.json
+[ -n "$ISSUE" ] && gh issue view "$ISSUE" --repo "$REPO" --json title,body > "$WORK/pr_issue.json"
 
 # Prior reviewer comments (top-level)
-cat /tmp/pr_meta.json | python3 -c "
+cat "$WORK/pr_meta.json" | python3 -c "
 import json,sys
 d = json.load(sys.stdin)
 for r in d.get('reviews',[]):
@@ -40,6 +96,630 @@ for c in d.get('comments',[]):
     b = (c.get('body','') or '').strip()
     if b: print(f'[COMMENT {c[\"author\"][\"login\"]}] {b[:200]}')
 "
+
+# Mechanical pre-filter for rule D9 (index x stride with no 64-bit widening).
+# It runs HERE, inside the fetch step, and not where D9 is described in Step 5. A scan that
+# Step 5 asks for mid-checklist does not happen: in a 14-PR controlled run the revised D9 text
+# caught 0 of 3 known overflow defects and no run invoked the scanner at all. Put the candidate
+# list in context before the rule pass instead of relying on the reviewer to remember it.
+SCAN="$SKILLS_ROOT/validate-kernel-pr/scan_index_width.py"
+if [ ! -x "$SCAN" ]; then
+  echo "required scanner is missing or not executable: $SCAN" >&2
+  exit 1
+fi
+# The scan is an AST pass, so it needs each changed file's post image. The diff names the
+# post-image blob of every hunk, and fetching the PR head puts those blobs in the local object
+# store, where `git cat-file` reaches them without a second worktree. Without this the scan
+# still runs, but reports the files as NOT SCANNED rather than silently reporting no findings.
+git fetch -q origin "refs/pull/$PR/head" 2>/dev/null || \
+  echo "note: could not fetch the PR head; the index-width scan will report unscanned files" >&2
+if ! "$SCAN" --diff "$WORK/pr.diff"; then
+  echo "required index-width scan failed; do not report an empty candidate list" >&2
+  exit 1
+fi
+# The candidates above cannot be judged without deployment scale, and the scale facts are
+# useless 400 lines away from them -- print both together.
+SCALE="$SKILLS_ROOT/validate-kernel-pr/production_scale.md"
+if [ ! -r "$SCALE" ]; then
+  echo "required production-scale evidence is missing: $SCALE" >&2
+  exit 1
+fi
+cat "$SCALE"
+SCHEMA="$SKILLS_ROOT/validate-kernel-pr/report_schema.json"
+if [ ! -r "$SCHEMA" ]; then
+  echo "required validation report schema is missing: $SCHEMA" >&2
+  exit 1
+fi
+
+# Triage: decide whether this PR needs runtime evidence at all, and if so, what could carry it.
+# This runs HERE, executable, for the same reason the D9 scan does: a judgement the checklist
+# asks for mid-review is a judgement that does not get made. Leaving it to the reviewer also
+# gave the verdict line only two states, so a README fix reported the same
+# "NOT RUN" as an unvalidated kernel rewrite -- which teaches a reader to skip the line.
+python3 - "$WORK/pr_meta.json" "$WORK/pr.diff" "$WORK/validation_requirement.json" \
+  "$PROJECT_ROOT" <<'PY'
+import json
+import pathlib
+import sys
+
+meta_path, diff_path, out_path, project_root = (pathlib.Path(a) for a in sys.argv[1:5])
+meta = json.loads(meta_path.read_text())
+paths = [f["path"] for f in meta.get("files", [])]
+
+# Checked in this order: a .md under csrc/ is documentation, and op_tests/ is neither
+# runtime nor documentation.
+TEST_PREFIXES = ("op_tests/",)
+STATIC_PREFIXES = (".github/", ".claude/", ".cursor/", "bin/", "docs/")
+STATIC_SUFFIXES = (".md", ".rst", ".txt", ".toml", ".cfg", ".ini", ".gitignore")
+RUNTIME_PREFIXES = ("csrc/", "hsa/", "aiter/", "gradlib/")
+RUNTIME_SUFFIXES = (".cu", ".cuh", ".hip", ".cpp", ".cc", ".c", ".h", ".hpp", ".s", ".asm")
+
+
+def classify(path):
+    if path.startswith(TEST_PREFIXES):
+        return "test"
+    if path.startswith(STATIC_PREFIXES) or path.endswith(STATIC_SUFFIXES):
+        return "static"
+    if path.startswith(RUNTIME_PREFIXES) or path.endswith(RUNTIME_SUFFIXES):
+        return "runtime"
+    # Unclassified counts as runtime, deliberately. The error to avoid is clearing a kernel
+    # change because nobody put its directory on a list; demanding evidence that turns out
+    # to be unnecessary only costs a run. Note this makes `aiter/configs/*.csv` tuned-shape
+    # edits and `aiter/jit/**` build config runtime, which is correct: both reroute kernels.
+    return "runtime"
+
+
+runtime_paths = sorted(p for p in paths if classify(p) == "runtime")
+required = bool(runtime_paths)
+
+# Added files come from the diff, not from the file list: `gh pr view --json files` reports
+# additions/deletions per path but not status, and "deletions == 0" also matches a file that
+# was only appended to.
+added = set()
+current = None
+for line in diff_path.read_text(errors="replace").splitlines():
+    if line.startswith("diff --git ") and " b/" in line:
+        current = line.split(" b/", 1)[1]
+    elif line.startswith("new file mode") and current:
+        added.add(current)
+
+
+def is_candidate_target(path):
+    name = pathlib.PurePosixPath(path).name
+    # op_benchmarks/ holds bench_*.py perf harnesses. They are excluded because they are
+    # not correctness targets; the validator's perf stage times the correctness target it
+    # already selected, so it does not need one of these either.
+    return (
+        path.startswith("op_tests/")
+        and "/op_benchmarks/" not in f"/{path}"
+        and name.startswith("test_")
+        and name.endswith(".py")
+    )
+
+
+candidates = sorted(p for p in paths if is_candidate_target(p))
+added_candidates = [p for p in candidates if p in added]
+target = None
+basis = None
+blocker = None
+if not required:
+    blocker = "no runtime surface changed"
+elif len(candidates) == 1:
+    target, basis = candidates[0], "the one test target this PR touches"
+elif len(added_candidates) == 1:
+    target, basis = added_candidates[0], "the one test target this PR adds"
+elif candidates:
+    blocker = (
+        f"{len(candidates)} candidate targets and no unique added one; "
+        "name the target explicitly rather than letting the tool pick"
+    )
+else:
+    blocker = "the PR changes runtime code but ships no test target"
+
+# ---- Perf triage. A kernel change can be correct and still be a regression --
+# correctness_repo_tests passing says nothing about latency. So the same runtime surface that
+# makes correctness evidence REQUIRED makes perf evidence REQUIRED too, and this decides it
+# here for the reason everything else in this step is executable: in a controlled run the
+# reviewer with a perf-shaped PR in front of it shipped a card with no numbers at all and a
+# finding that stopped at "reviewer should ask" (aiter#4538).
+#
+# The measurement itself belongs to the validator's `perf` stage, which times base and head
+# back to back on one locked GPU and gates on the result. What is computed HERE is only the
+# fallback: which command a human would run if that stage could not. Keep the detection below
+# in step with perf_detect() in validate-kernel-pr/validate_pr.sh -- if the two disagree, this
+# step prints a recipe for a harness the validator declined to use, or vice versa.
+#
+# `perf_claimed` only separates two reports ("the PR's own claim is unverified" vs "no claim
+# was made, but a kernel moved"). It does NOT gate the requirement: a refactor that claims
+# nothing is exactly where an unnoticed regression lands.
+PERF_WORDS = (
+    "perf", "optimiz", "optimis", "faster", "speedup", "speed-up", "latency",
+    "throughput", "tflops", "fuse", "regression", "us/", "µs",
+)
+_blurb = f"{meta.get('title', '')}\n{meta.get('body', '') or ''}".lower()
+perf_claimed = any(w in _blurb for w in PERF_WORDS)
+
+# A perf harness cannot be inferred from the diff alone, so look for aiter's three timing
+# conventions in the target's own text: `--scenario bench` (argparse sweep), the
+# @benchmark/run_perftest pair the aiter-op-test skill mandates, and the older bare `perftest`
+# decorator. A new target's body is in the diff as `+` lines; an
+# existing one is read from the checkout, whose revision may differ but whose entry points do
+# not. Anything else means the PR ships no runnable perf harness -- which is itself the
+# finding, not a reason to stay silent.
+def perf_command(path):
+    text = ""
+    local = project_root / path
+    if local.is_file():
+        text = local.read_text(errors="replace")
+    if not text:
+        want = f" b/{path}"
+        keep = False
+        for line in diff_path.read_text(errors="replace").splitlines():
+            if line.startswith("diff --git "):
+                keep = line.endswith(want)
+            elif keep and line.startswith("+") and not line.startswith("+++"):
+                text += line[1:] + "\n"
+    if not text:
+        return None, "the target's contents could not be read"
+    if "--scenario" in text and "bench" in text:
+        return f"python3 {path} --scenario bench", "target exposes --scenario bench"
+    # `perftest`, not `run_perftest`. aiter carries three timing conventions and the bare
+    # `perftest` decorator is one of them; `perftest` also subsumes `run_perftest` as a
+    # substring, so the shorter test is strictly wider. Measured on the 123 targets in
+    # op_tests/: matching `run_perftest` detects 85 and reports 38 as having no harness;
+    # matching `perftest` detects 97 and reports 26. 11 of the 12 recovered targets have
+    # live `perftest` usage -- test_moe.py, test_pa_v1.py, test_batch_prefill.py,
+    # test_rope.py, test_layernorm2d.py among them. Reporting those as "no benchmark entry
+    # point" reads as "there was nothing to measure" when the truth was that the detector
+    # was too narrow, which is the exact silence this rule exists to break.
+    #
+    # The 12th (test_aiter_sigmoid.py) matches only a commented-out import, because this is
+    # a substring test and not a parse. That direction is the safe one: an over-eager match
+    # runs the target, finds no timing table, and the perf stage reports `skip` -- the same
+    # outcome as not matching, one wasted run later. The opposite error stays silent.
+    # Keep this in step with perf_detect() in validate-kernel-pr/validate_pr.sh.
+    if "perftest" in text or "@benchmark" in text:
+        return f"python3 {path}", "target uses the perftest/@benchmark harness"
+    return None, (
+        "target exposes no benchmark entry point "
+        "(no --scenario bench, no perftest/@benchmark harness)"
+    )
+
+
+perf_cmd = perf_reason = None
+if target:
+    perf_cmd, perf_reason = perf_command(target)
+elif required:
+    perf_reason = f"no perf target for the same reason there is no test target: {blocker}"
+else:
+    perf_reason = "no runtime surface changed"
+
+# A target is never inferred from the *kernel* being changed, only from a test the PR itself
+# touches. The validator cannot judge whether a target exercises the diff, so an invented
+# target can return PASS on evidence about unrelated code -- worse than no report, because
+# it reads as clearance.
+out_path.write_text(
+    json.dumps(
+        {
+            "required": required,
+            "families": sorted({classify(p) for p in paths}),
+            "runtime_paths": runtime_paths[:20],
+            "runtime_path_count": len(runtime_paths),
+            "target": target,
+            "target_basis": basis,
+            "candidates": candidates,
+            "blocking_reason": blocker,
+            "perf_required": required,
+            "perf_claimed": perf_claimed,
+            "perf_command": perf_cmd,
+            "perf_basis": perf_reason,
+        },
+        indent=2,
+    )
+    + "\n"
+)
+verdict = "REQUIRED" if required else "NOT REQUIRED"
+print(f"validation triage: {verdict} ({', '.join(sorted({classify(p) for p in paths}))})")
+if runtime_paths:
+    print(f"  runtime surface: {len(runtime_paths)} path(s), e.g. {', '.join(runtime_paths[:3])}")
+print(f"  target: {target} — {basis}" if target else f"  no auto target: {blocker}")
+print(f"perf triage: {verdict}" + (" (PR claims perf)" if perf_claimed else " (no perf claim)"))
+if perf_cmd:
+    print(f"  harness: {perf_reason}")
+    print("  the validator's perf stage runs this on both sides automatically; the form below")
+    print("  is the manual fallback for when stages.perf comes back absent or skip. Run BOTH")
+    print("  sides on this box, same GPU, back to back -- head alone only reproduces the PR's")
+    print("  own comparison and cannot show a regression:")
+    print("    git worktree add --detach $WORK/perf_base $(cat $WORK/base_head.txt)")
+    print(f"    (cd $WORK/perf_base && {perf_cmd})                              # base")
+    print(f"    (cd $WORK/perf_base && git apply $WORK/pr.diff && {perf_cmd})   # head")
+else:
+    print(f"  no perf run possible: {perf_reason}")
+PY
+
+# Validation is opt-in in the sense that matters: a report is never adopted because it happens
+# to be lying in the working directory. A stale report from another PR is worse than none, so
+# every report -- supplied by the caller or produced by the auto-run below -- goes through the
+# same identity gate, and reports that do not name this exact head are rejected.
+#
+# Auto-running the validator is not the same act as trusting a found file. The run below binds
+# its own report to this head, writes it inside this invocation's scratch dir, and then faces
+# the unmodified gate. Set REVIEW_AUTO_VALIDATE=0 to skip it.
+#
+# Each way the auto-run can give up records why, because "required but not run" is only useful
+# to a reader if it names the reason. Triage's own blocker covers the cases where no run was
+# ever attempted; this file covers the ones where it was.
+if [ "${REVIEW_AUTO_VALIDATE:-1}" != 1 ]; then
+  echo "auto-validation is disabled (REVIEW_AUTO_VALIDATE=0)" \
+    >"$WORK/auto_validation_outcome.txt"
+fi
+if [ -z "$VALIDATION_REPORT" ] \
+  && [ "${REVIEW_AUTO_VALIDATE:-1}" = 1 ] \
+  && python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); sys.exit(0 if r["required"] and r["target"] else 1)' \
+    "$WORK/validation_requirement.json"; then
+  AUTO_TARGET=$(python3 -c \
+    'import json,sys; print(json.load(open(sys.argv[1]))["target"])' \
+    "$WORK/validation_requirement.json")
+  # The validator is invoked directly, with the base and head this step already holds. A
+  # PR-number front end that re-fetched the diff and re-resolved the base tip would reopen the
+  # window the gate below closes: main can advance between the two `gh api` calls, and the report
+  # would then name a base this same review rejects as stale. Calling it in place also keeps the
+  # dependency inside .claude/skills, alongside the scanner and the schema above.
+  VALIDATOR="$SKILLS_ROOT/validate-kernel-pr/validate_pr.sh"
+  if [ ! -x "$VALIDATOR" ]; then
+    echo "required validator is missing or not executable: $VALIDATOR" >&2
+    exit 1
+  fi
+  # repo.base in the report is `git rev-parse HEAD` inside the worktree handed over, so that
+  # worktree has to sit on the base recorded above for the two to agree.
+  AUTO_BASE=$(cat "$WORK/base_head.txt")
+  AUTO_HEAD=$(python3 -c \
+    'import json,sys; print(json.load(open(sys.argv[1]))["headRefOid"])' \
+    "$WORK/pr_meta.json")
+  AUTO_WT="$WORK/base_repo"
+  # A PR reviewed from another repository resolves a base this checkout has never seen, so
+  # failing to materialise it leaves the review static-only rather than aborting it.
+  set +e
+  git -C "$PROJECT_ROOT" cat-file -e "${AUTO_BASE}^{commit}" 2>/dev/null \
+    || git -C "$PROJECT_ROOT" fetch -q origin "$AUTO_BASE" 2>/dev/null
+  git -C "$PROJECT_ROOT" worktree add --detach "$AUTO_WT" "$AUTO_BASE" >/dev/null 2>&1
+  AUTO_WT_RC=$?
+  set -e
+  if [ "$AUTO_WT_RC" -ne 0 ]; then
+    echo "base $AUTO_BASE cannot be checked out in $PROJECT_ROOT, which is expected for a PR" \
+      "reviewed from another repository" >"$WORK/auto_validation_outcome.txt"
+    echo "auto-validation skipped: $(cat "$WORK/auto_validation_outcome.txt")" >&2
+  else
+    # Removal is on a trap because a run interrupted mid-validation would otherwise leave the
+    # worktree registered. The validator reverts its candidate patch on every exit path, so
+    # this disposes of the review's own scratch checkout and is not a dirty-tree repair.
+    remove_auto_worktree() {
+      git -C "$PROJECT_ROOT" worktree remove --force "$AUTO_WT" >/dev/null 2>&1 || true
+      git -C "$PROJECT_ROOT" worktree prune
+    }
+    trap remove_auto_worktree EXIT
+    # Route and shape knowledge cannot be derived from a diff, so without these the receipt
+    # and grid stages skip and the run tops out at INCONCLUSIVE by construction. That is a
+    # limit of what a diff tells you, not a defect in the PR -- Step 8 must say so.
+    # When a grid is supplied and no channel carries it, the report's
+    # test_selection.grid_channel_reason names each channel tried, what was found in the
+    # target, and which channels the target does offer -- so a wrong guess costs one run
+    # rather than a reading of the target's source.
+    AUTO_ARGS=()
+    [ -n "${REVIEW_EXPECTED_ROUTE:-}" ] && AUTO_ARGS+=(--expected-route "$REVIEW_EXPECTED_ROUTE")
+    [ -n "${REVIEW_SHAPE_VARS:-}" ] && AUTO_ARGS+=(--shape-vars "$REVIEW_SHAPE_VARS")
+    [ -n "${REVIEW_SHAPE_ENV:-}" ] && AUTO_ARGS+=(--shape-env "$REVIEW_SHAPE_ENV")
+    [ -n "${REVIEW_SHAPE_ARG:-}" ] && AUTO_ARGS+=(--shape-arg "$REVIEW_SHAPE_ARG")
+    # The pytest-parametrization channel reaches targets neither of the other two can: none of
+    # the seven files in op_tests/flydsl_tests/ reads a shape env var or parses a shape flag,
+    # and all of them declare shapes as literals in @pytest.mark.parametrize. Without this the
+    # channel exists but no auto-validated review can use it.
+    [ -n "${REVIEW_SHAPE_ARGNAMES:-}" ] \
+      && AUTO_ARGS+=(--shape-argnames "$REVIEW_SHAPE_ARGNAMES")
+    [ -n "${REVIEW_GRID:-}" ] && AUTO_ARGS+=(--grid "$REVIEW_GRID")
+    echo "auto-validation: running $AUTO_TARGET for PR #$PR (minutes, needs an idle GPU)"
+    # BLOCK, NEEDS_WORK and INCONCLUSIVE all still write a report worth consuming, so the
+    # exit code must not abort the review; only a missing file means there is nothing to read.
+    set +e
+    "$VALIDATOR" --repo "$AUTO_WT" --patch "$WORK/pr.diff" --head-sha "$AUTO_HEAD" \
+      --target "$AUTO_TARGET" --label "review-pr-auto" \
+      --out "$WORK/auto_validation_report.json" "${AUTO_ARGS[@]}"
+    AUTO_RC=$?
+    set -e
+    if [ -r "$WORK/auto_validation_report.json" ]; then
+      VALIDATION_REPORT="$WORK/auto_validation_report.json"
+      echo "auto-validation exited $AUTO_RC; consuming its report through the standard gate"
+    else
+      echo "the validator exited $AUTO_RC without writing a report" \
+        >"$WORK/auto_validation_outcome.txt"
+      echo "auto-validation exited $AUTO_RC and wrote no report; the review stays static-only" >&2
+    fi
+  fi
+fi
+
+if [ -n "$VALIDATION_REPORT" ]; then
+  python3 - "$WORK/pr_meta.json" "$WORK/base_head.txt" "$WORK/pr.diff" "$SCHEMA" \
+    "$VALIDATION_REPORT" "$WORK/validation_report.json" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+meta_path, base_path, diff_path, schema_path, report_path, out_path = map(
+    pathlib.Path, sys.argv[1:]
+)
+meta = json.loads(meta_path.read_text())
+report = json.loads(report_path.read_text())
+try:
+    import jsonschema
+except ImportError as error:
+    raise SystemExit(f"jsonschema is required to consume validation evidence: {error}")
+jsonschema.validate(report, json.loads(schema_path.read_text()))
+expected_head = meta["headRefOid"]
+actual_head = report.get("repo", {}).get("head")
+if actual_head != expected_head:
+    raise SystemExit(
+        "validation report is stale or for another checkout: "
+        f"expected head {expected_head}, got {actual_head}"
+    )
+expected_base = base_path.read_text().strip()
+actual_base = report.get("repo", {}).get("base")
+if actual_base != expected_base:
+    raise SystemExit(
+        "validation report used a stale merge base: "
+        f"expected {expected_base}, got {actual_base}"
+    )
+expected_patch = hashlib.sha256(diff_path.read_bytes()).hexdigest()
+actual_patch = report.get("repo", {}).get("patch_sha256")
+if actual_patch != expected_patch:
+    raise SystemExit(
+        "validation report patch does not match the current PR diff: "
+        f"expected {expected_patch}, got {actual_patch}"
+    )
+required_stages = {
+    "merge_sim",
+    "gpu_claim",
+    "runtime_compat",
+    "test_policy",
+    "baseline_control",
+    "correctness_repo_tests",
+    "correctness_s1_grid",
+    "execution_receipt",
+    "index_width_scan",
+}
+missing = required_stages - report.get("stages", {}).keys()
+if missing:
+    raise SystemExit(f"validation report omits required stages: {sorted(missing)}")
+for name in required_stages:
+    stage = report["stages"][name]
+    if not isinstance(stage, dict) or stage.get("status") not in {
+        "pass",
+        "fail",
+        "skip",
+        "info",
+    }:
+        raise SystemExit(f"validation stage {name} is malformed: {stage!r}")
+if report.get("verdict") not in {"PASS", "NEEDS_WORK", "BLOCK", "INCONCLUSIVE"}:
+    raise SystemExit(f"validation report has an invalid verdict: {report.get('verdict')!r}")
+findings = report.get("findings")
+if not isinstance(findings, list):
+    raise SystemExit("validation report findings must be a list")
+for finding in findings:
+    if (
+        not isinstance(finding, dict)
+        or finding.get("severity") not in {"blocker", "should-fix", "note"}
+        or not finding.get("stage")
+        or not finding.get("detail")
+    ):
+        raise SystemExit(f"validation report has a malformed finding: {finding!r}")
+selection = report.get("test_selection", {})
+if not selection.get("target"):
+    raise SystemExit("validation report does not name the test target it selected")
+if not selection.get("expected_route"):
+    raise SystemExit("validation report does not name the expected kernel route")
+if not selection.get("shape_vars"):
+    raise SystemExit("validation report does not name the route-call shape variables")
+if selection.get("runner") not in {"pytest", "script", "none", "unresolved"}:
+    raise SystemExit("validation report has no supported target runner")
+if not selection.get("runner_reason"):
+    raise SystemExit("validation report does not explain its runner selection")
+identity = report.get("runtime_identity")
+if (
+    not isinstance(identity, dict)
+    or not identity.get("module_path")
+    or not identity.get("python_executable")
+    or not isinstance(identity.get("native_artifacts"), list)
+):
+    raise SystemExit("validation report has no runtime build identity")
+coverage = report.get("arch_coverage", {})
+coverage_basis = report.get("arch_coverage_basis", {})
+if any(arch not in coverage_basis for arch, level in coverage.items() if level == "runtime"):
+    raise SystemExit("runtime architecture coverage has no evidence basis")
+gpu_arch = report["stages"]["gpu_claim"].get("arch")
+if coverage and coverage != {gpu_arch: "runtime"}:
+    raise SystemExit("runtime architecture coverage does not match the claimed GPU")
+if set(coverage_basis) != set(coverage):
+    raise SystemExit("architecture coverage and evidence-basis keys differ")
+if coverage:
+    basis = coverage_basis[gpu_arch]
+    if selection["runner"] == "pytest":
+        grid_stats = report["stages"]["correctness_s1_grid"].get("stats", {})
+        basis_stage = (
+            report["stages"]["correctness_s1_grid"]
+            if grid_stats.get("executed", 0) > 0
+            else report["stages"]["correctness_repo_tests"]
+        )
+        expected_basis = (
+            f"pytest-junit-executed:{basis_stage.get('stats', {}).get('executed', 0)}"
+        )
+        if basis != expected_basis:
+            raise SystemExit("pytest architecture coverage basis is inconsistent")
+    elif selection["runner"] == "script" and not basis.startswith("script-"):
+        raise SystemExit("script architecture coverage basis is inconsistent")
+for stage_name in ("correctness_repo_tests", "correctness_s1_grid"):
+    stage = report["stages"][stage_name]
+    stats = stage.get("stats")
+    if stats is not None:
+        stat_keys = ("tests", "failures", "errors", "skipped", "executed")
+        if any(type(stats.get(key)) is not int for key in stat_keys):
+            raise SystemExit(f"{stage_name} has malformed execution counters")
+        # errors are collection and fixture failures: the test body never ran, so they are
+        # not executed tests. The two sides of this equality disagreed only when errors > 0 --
+        # which is exactly the shape of a report carrying a real runtime blocker, so a report
+        # that had correctly found one was rejected here and could not be used.
+        if stats["executed"] != stats["tests"] - stats["skipped"] - stats["errors"]:
+            raise SystemExit(f"{stage_name} has inconsistent execution counters")
+    elif stage["status"] == "pass":
+        raise SystemExit(f"{stage_name} passed without execution counters")
+    if stage["status"] == "pass" and (
+        stage.get("exit") != 0
+        or stats.get("executed", 0) < 1
+        or stats.get("failures", 0) != 0
+        or stats.get("errors", 0) != 0
+    ):
+        raise SystemExit(f"{stage_name} has a hollow or contradictory pass")
+receipt = report["stages"]["execution_receipt"]
+# Only a grid that was actually DELIVERED imposes required shapes. A grid the caller supplied
+# for a target with no channel to receive it was still being turned into a requirement here,
+# so the receipt's honest empty list read as a contradiction and the report was rejected --
+# discarding exactly the runs that carried the accurate "no channel" diagnostic.
+required_shapes = (
+    [shape.strip() for shape in selection.get("grid", "").split(";") if shape.strip()]
+    if selection.get("grid_channel")
+    else []
+)
+if receipt.get("status") == "pass" and (
+    receipt.get("producer") != "validate-kernel-pr.validation_probe"
+    or receipt.get("route") != selection["expected_route"]
+    or selection["expected_route"] not in receipt.get("kernel_symbols", [])
+    or sorted(set(receipt.get("required_shapes", []))) != sorted(set(required_shapes))
+    or (
+        selection.get("grid_channel") != "pytest"
+        and not set(required_shapes).issubset(set(receipt.get("executed_shapes", [])))
+    )
+):
+    raise SystemExit("execution receipt contradicts the selected route/grid")
+severities = {
+    finding.get("severity")
+    for finding in findings
+}
+complete = (
+    selection["runner"] in {"pytest", "script"}
+    and bool(coverage)
+    and bool(coverage_basis)
+    and report["stages"]["merge_sim"]["status"] == "pass"
+    and report["stages"]["gpu_claim"]["status"] == "pass"
+    and report["stages"]["runtime_compat"]["status"] == "pass"
+    and report["stages"]["test_policy"]["status"] == "pass"
+    and report["stages"]["baseline_control"]["status"] == "pass"
+    and report["stages"]["correctness_repo_tests"]["status"] == "pass"
+    and report["stages"]["correctness_s1_grid"]["status"] == "pass"
+    and report["stages"]["execution_receipt"]["status"] == "pass"
+    and report["stages"]["index_width_scan"]["status"] == "info"
+)
+expected_verdict = (
+    "BLOCK"
+    if "blocker" in severities
+    else "NEEDS_WORK"
+    if "should-fix" in severities
+    else "PASS"
+    if complete
+    else "INCONCLUSIVE"
+)
+if report["verdict"] != expected_verdict:
+    raise SystemExit(
+        "validation verdict contradicts its stages/findings: "
+        f"expected {expected_verdict}, got {report['verdict']}"
+    )
+expected_exit = 0 if expected_verdict == "PASS" else (
+    2 if expected_verdict == "INCONCLUSIVE" else 1
+)
+if report.get("process_exit_code") != expected_exit:
+    raise SystemExit(
+        "validation report exit-code contract is inconsistent: "
+        f"expected {expected_exit}, got {report.get('process_exit_code')}"
+    )
+# perf is optional -- a report without it is valid, and older reports have none. But a perf
+# stage that ASSERTS an outcome has to carry the number it was drawn from, or the card would
+# print "NO REGRESSION" backed by nothing and a reader could not tell the difference.
+perf = report["stages"].get("perf")
+if perf is not None:
+    if perf["status"] in {"pass", "fail"}:
+        if not isinstance(perf.get("median_ratio"), (int, float)):
+            raise SystemExit("perf stage claims a result without a median_ratio")
+        if not isinstance(perf.get("matched_rows"), int) or perf["matched_rows"] < 1:
+            raise SystemExit("perf stage claims a result with no matched rows")
+        if not perf.get("baseline"):
+            raise SystemExit("perf stage claims a result without naming its baseline")
+        # The status has to agree with the number it is standing on. Without this a report
+        # can carry median_ratio 0.80 against threshold 0.95 and still say `pass`, and the
+        # card would print "NO REGRESSION" over the top of a measured 20% regression --
+        # every other check here passes, because each field is individually well-formed.
+        threshold = perf.get("threshold")
+        if isinstance(threshold, (int, float)):
+            regressed = perf["median_ratio"] < threshold
+            if regressed != (perf["status"] == "fail"):
+                raise SystemExit(
+                    "perf stage status contradicts its own numbers: "
+                    f"median_ratio {perf['median_ratio']} vs threshold {threshold} "
+                    f"but status is {perf['status']}"
+                )
+    if perf["status"] == "fail" and not any(
+        item.get("stage") == "perf" and item.get("severity") == "should-fix"
+        for item in findings
+    ):
+        raise SystemExit("perf stage failed but no should-fix finding was recorded")
+    if perf["status"] == "skip" and "median_ratio" in perf:
+        raise SystemExit("perf stage was skipped but still reports a median_ratio")
+out_path.write_text(json.dumps(report, indent=2) + "\n")
+print(
+    f"validation report accepted for head {expected_head}; "
+    f"target={selection['target']}; "
+    f"grid={selection.get('grid') or 'not configured'}"
+)
+# Printed separately and unconditionally, because Step 8 must state a perf line either way:
+# a silent absence here is what produced a card with no numbers on aiter#4538.
+if perf is None:
+    print("perf stage: absent — the card's perf line is advisory (see P6)")
+elif perf["status"] in {"pass", "fail"}:
+    print(
+        f"perf stage: {perf['status']} — median_ratio {perf['median_ratio']} on "
+        f"{perf.get('worst_column')} over {perf['matched_rows']} row(s), "
+        f"threshold {perf.get('threshold')}"
+    )
+else:
+    print(f"perf stage: skip — {perf.get('note', 'no reason recorded')}")
+PY
+else
+  # Distinguish the reasons there is no report. "Not applicable" and "required but missing"
+  # are different facts about the PR, and collapsing them into one sentence is what made the
+  # old verdict line uninformative. Triage's blocker explains the runs never attempted; the
+  # outcome file explains the ones that were, and one of the two is always present.
+  python3 - "$WORK/validation_requirement.json" "$WORK/auto_validation_outcome.txt" <<'PY'
+import json
+import pathlib
+import sys
+
+req = json.loads(pathlib.Path(sys.argv[1]).read_text())
+outcome = pathlib.Path(sys.argv[2])
+if not req["required"]:
+    print(
+        "validation not applicable: no runtime surface changed "
+        f"({', '.join(req['families'])}); a static-only review is complete here, "
+        "not deficient"
+    )
+else:
+    reason = req["blocking_reason"]
+    if not reason and outcome.is_file():
+        reason = outcome.read_text().strip()
+    print(
+        "validation REQUIRED but not run: "
+        f"{reason or 'reason unrecorded, which is itself a defect in this step'}. "
+        "Report it as a gap in the evidence, and if the reason is a missing test target, "
+        "as a finding about the PR."
+    )
+PY
+fi
 
 # Inline review comments (line-level code comments — often more specific than top-level)
 gh api "repos/$REPO/pulls/$PR/comments" | python3 -c "
@@ -100,19 +780,19 @@ _Answer:_
 
 Check which type(s) apply; these determine which Step 5 categories are mandatory.
 
-- [ ] **New kernel / new Triton op** → B1 (dispatch gate), B2 (tl.load mask), B4 (new routing value unhandled?), A1 (sibling variants), D1 (atomic zero-init), D8 (contiguous check), HK6 (UT)
+- [ ] **New kernel / new Triton op** → B1 (dispatch gate), B2 (tl.load mask), B4 (new routing value unhandled?), A1 (sibling variants), D1 (atomic zero-init), D8 (contiguous check), HK6 (UT), P6 (measure it base-vs-head)
 - [ ] **New constexpr / routing flag / new dtype or arch value added** → B4 (do ALL dispatch branches handle the new value, or assert on it?), C4 (new arch string literal?)
 - [ ] **Tuning config (CSV / YAML)** → D3 (hipblaslt), HK4 (kpack:1)
 - [ ] **Dispatch logic change** → B1 (silent bypass), B3 (string normalization), B4 (new value unhandled?), A3 (scope too broad)
-- [ ] **Replaces existing kernel as default** → D2 (rollback env-var)
+- [ ] **Replaces existing kernel as default** → D2 (rollback env-var), P6 (measure it base-vs-head — a default swap is the case where an unmeasured regression reaches everyone)
 - [ ] **Core file change** (see Tier table below) → full Step 4 risk assessment
 - [ ] **API signature change** (param added / removed / renamed, default changed, return dtype or arity changed) → B6 (propagation to all receivers), E1 (linked consumer PR?), E5 (owner sign-off if stable core API)
 - [ ] **Refactor / rename** → HK2 (unrelated files), variable name mismatch check, B6 (rename breaks all importers)
 - [ ] **FP8 / quantization path** → C1 (fnuz by dtype), C2 (fp8_max hardcoded), D1 (atomic zero-init)
-- [ ] **Perf / benchmark PR** → P1 (numbers with units), P5 (setup cost excluded?), P2 (production shapes), P3 (reproducible)
+- [ ] **Perf / benchmark PR** → P1 (numbers with units), P5 (setup cost excluded?), P2 (production shapes), P3 (reproducible), P6 (re-measure here — P1–P5 only grade the PR's own table)
 - [ ] **Test / benchmark only** → P2 (production shapes), HK6 (aiter-op-test format)
 - [ ] **Async / multi-stream** → G1 (stream sync missing), G1b (blocking queue.get without timeout in serving code)
-- [ ] **FlyDSL kernel** → D10 (compile result called?), D10b (arith.unwrap() before arith.bitcast?)
+- [ ] **FlyDSL kernel** → D10 (compile result called?), D10b (arith.unwrap() before arith.bitcast?). A FlyDSL kernel change is runtime surface, so Step 1's triage marks it `REQUIRED` and, when the PR ships exactly one test target, has already run the validator against it. Use whatever report Step 1 accepted as the evidence; where it reached no report, mark the result `[static-only advisory review]` (see Step 8) and make no runtime clearance claim. Absence of a report is not itself a blocker. Two target classes cannot reach `PASS` by construction, so their `INCONCLUSIVE` is the expected output and not a deficiency: a CPU-only target claims no GPU and therefore no architecture, and a bugfix with no shape dimension has no grid for `correctness_s1_grid` to consume. Never ask such an author for a passing report.
 - [ ] **New if/elif dispatch with variable assignment** → D1b (UnboundLocalError on uninitialized path)
 - [ ] **Change to behavior/dispatch of a downstream-consumed op** (mla / fused_moe / attention / mha / quant / gemm_op_a8w8 / moe_op / jit-core) → E4 (is downstream CI triggered or skipped?), E5 (stable-API owner sign-off)
 - [ ] **New `@compile_ops` / `torch.library.custom_op`, or change to an op's return dtype/arity** → D7 (fake/abstract impl exists?), D6 (fake dtype/shape matches real op?)
@@ -189,9 +869,11 @@ For **Tier 2** files (fused_moe, mha, attention, gemm, mla, tuned_gemm, quant):
 
 ## Step 5 — Rule Checklist
 
-Six failure categories — work all six in order. Severity per finding: 🔴 block / ⚠️ should fix / 📝 note.
+Six failure categories — work all six in order. Advisory severity per finding:
+🔴 high risk / ⚠️ should fix / 📝 note. These labels prioritize human attention; they do not
+themselves gate a merge.
 
-**🔴 gate — before firing any 🔴, write down the concrete input that triggers it.** Name the specific shape / scale / dtype / arch / value that makes the finding fire (e.g. "at `token_id` > 16M with H=32, D=128 the int32 product exceeds 2^31", or "when `arch=='gfx1250'` with fp4 input the branch assumes fp8"). If you cannot state a concrete triggering case, the 🔴 is unproven — **downgrade to ⚠️ ("worth checking") or drop it.** A 🔴 that reads as a definite blocker but names no demonstrable triggering input is exactly how a false positive lands on a maintainer's PR. This gate applies to every rule below — including those whose own text omits an explicit FP self-check (e.g. D9): the same index expression is safe in a capped/small-batch kernel and unsafe only at a scale you must actually exhibit.
+**🔴 evidence threshold — before firing any 🔴, write down the concrete input that triggers it.** Name the specific shape / scale / dtype / arch / value that makes the finding fire (e.g. "at `token_id` > 16M with H=32, D=128 the int32 product exceeds 2^31", or "when `arch=='gfx1250'` with fp4 input the branch assumes fp8"). If you cannot state a concrete triggering case, the 🔴 is unproven — **downgrade to ⚠️ ("worth checking") or drop it.** A 🔴 that reads as a definite defect but names no demonstrable triggering input is exactly how a false positive lands on a maintainer's PR. This threshold applies to every rule below — including those whose own text omits an explicit FP self-check (e.g. D9): the same index expression is safe in a capped/small-batch kernel and unsafe only at a scale you must actually exhibit.
 
 | Category | Core question | Key triggers |
 |---|---|---|
@@ -379,9 +1061,13 @@ Trigger: new Python wrapper that calls a `@compile_ops` or C-extension kernel; c
 **D9 — INT32 overflow in GPU pointer arithmetic** 🔴
 C++ kernel launcher or Python wrapper computes a buffer offset, record count, or index in `int32` (or Python `torch.int32`) when the product of dimensions can exceed 2^31 (~2 billion) at production scale.
 Common patterns: `token_id * (num_heads * head_dim)` overflows at token_id > 16M with H=32, D=128; `seq_start * K` overflows for long-context at seq_start > 256K with K=8192; gfx1250 TDM block descriptor count fields computed as Python int default to int64 — a missing `.to(torch.int32)` cast silently produces wrong offsets.
-Trigger: any arithmetic involving `token_id`, `seq_start`, `batch_offset`, or `total_tokens` that produces a buffer address or array index without an explicit widening to int64 before the multiply; or a TDM descriptor field that feeds into block offset computation without an explicit int32 cast.
+Trigger (structural, NOT a name list): a multiplication that feeds pointer or index arithmetic, where at least one operand derives from a **non-`constexpr` parameter of the enclosing kernel** — a value supplied at runtime, which is the only kind that can grow past 2^31 — and no operand is widened to 64 bits, counting a widening applied on an earlier line and carried in through a local name. `constexpr` tile constants bound the product at compile time and are excluded. Also fires on a TDM descriptor field feeding block offset computation without an explicit int32 cast.
+**Why the trigger is structural, and why saying so was not enough:** an earlier version of this rule listed the names `token_id`, `seq_start`, `batch_offset`, `total_tokens`. Three real defects used none of them — `stride_out_batch`, `block_id`, `physical_block`, `context_kv_idx` — and the rule stayed silent on all three (aiter#1674 ×2, aiter#3541). The rule text was then rewritten to say "structural" while still defining index-shaped and stride-shaped by name, and the scanner behind it matched two name lists against operand text. Measured on aiter#4978, the PR that introduced the `moe_wgrad` overflow later fixed by #5132: **0 of the real defect lines were reported**, the one `moe_wgrad` candidate emitted was an already-`int64` line, and 390 candidates were produced overall. The scanner is now an AST pass with no name lists at all; on the same diff it reports 4 of 4, and on #5132 it reports none. Do not narrow it back to a name list.
+**Production scale.** Step 1 printed `validate-kernel-pr/production_scale.md` directly beneath the candidate list: pool sizes, batch limits and stride semantics that the diff does not contain. Use those numbers to name the triggering case the 🔴 gate requires; if none of them puts the product past 2^31, clear the candidate and say so.
+
+**The candidate list is already in context.** Step 1 ran `scan_index_width.py` over the diff and printed, per file, every distinct index×stride expression reaching pointer arithmetic with no 64-bit widening. Work that list: clear each candidate, and fire D9 only where you can name the production scale at which the product exceeds 2^31. If the list is empty, say so rather than skipping the category silently. **If the scan printed a `NOT SCANNED` section, D9 cannot be cleared** — those files were never examined, and an empty candidate list that excluded them is not evidence of absence. Report the unscanned files instead of reporting no candidates.
 Real examples: `out_base = token_id * num_heads * head_dim` in int32 overflows at scale (PR#3844); forward kernel uses `Int32(seq_start) * Int32(K)` while the backward kernel correctly uses int64 (PR#4113).
-→ `🔴 D9: [expr] in int32 — widen [token_id / seq_start / total_tokens] to int64 before multiplying by [stride]`
+→ `🔴 D9: [index expr] in int32 — widen [index operand] to int64 before multiplying by [stride], overflows at [concrete production scale]`
 
 **D10 — FlyDSL compile result stored but never called** 🔴
 `flyc.compile(exe, *args)` on a cache-miss path compiles and stores the `CompiledFunction` object (`exe._cf = cf`) but does NOT call it — `cf(*args)` is absent. Every first-invocation of a new (shape, arch, dtype) combination silently no-ops the entire kernel launch and returns the uninitialized `torch.empty` output to the caller with no error.
@@ -498,6 +1184,25 @@ FP self-check (do this before firing): is the excluded cost paid **once per depl
 Counter-example (does NOT trigger P5): aiter#4166 preshuffles the static weight once outside the timing loop and honestly reports a geomean 0.69x result — a correct steady-state benchmark, not a hidden cost. Charging that one-time shuffle against a single call to manufacture a "regression" is itself the false positive this rule must avoid.
 → `⚠️ P5: timing window excludes [cost] that recurs per call / per cold start — re-run including it, or confirm it is one-time amortizable`
 
+**P6 — Kernel change whose cost nobody measured** ⚠️
+P1–P5 all grade the numbers *the PR supplies*. None of them produces a number, so a kernel PR can clear the whole Performance block on the strength of a table nobody re-ran. Correctness evidence does not cover this: `correctness_repo_tests: pass` means the kernel computes the right values and says nothing about how long it takes.
+
+**Where the measurement now comes from.** The validator has a `perf` stage. When it runs, it times the target on base and on head back to back on the same locked GPU — base with the patch reversed out on the same worktree — and reduces the pair to `median_ratio`, the head speedup over base, oriented so `<1` is always a regression. That is a deterministic result, not an advisory one: below `threshold` (default 0.95, over ≥3 matched rows, both sides exiting cleanly) it writes a `should-fix` finding and the report's verdict becomes `NEEDS_WORK`. Read it out of `stages.perf`; do not re-derive it.
+
+Trigger: Step 1's triage printed `perf triage: REQUIRED` — i.e. the PR changes runtime surface — **and** the head-matched report carries no usable `stages.perf` (absent, or `status: skip`). That is the gap P6 exists to name. If `stages.perf` is `pass` or `fail`, the measurement happened; report the number and do not fire.
+
+Why the stage skips, and what each case means for the card:
+- **no benchmark entry point in the target** — the honest common case (26 of aiter's 123 `op_tests/` targets have no timing harness at all). Fire P6, and say the target cannot be timed as written.
+- **the PR adds the target** — base has nothing to compare against. Fire P6 with that reason; a head-only number is not a comparison.
+- **nonzero exit on either side** — deliberately never a regression, because a truncated log yields a meaningless ratio. Fire P6 and treat the crash as the more interesting finding.
+- **fewer than 3 matched rows / no shared timing column** — the two sides measured different things. Fire P6.
+
+**The measurement that counts is base vs head, on this box, back to back.** Running only head against whatever baseline the PR chose reproduces the PR's own comparison; it cannot show a regression, and it silently inherits any staleness in that baseline. When the stage could not run, Step 1 prints the exact two-command manual form for the triaged target.
+What to report: the shapes measured, both sides' numbers with units, and the delta. If nothing ran, say why — no idle GPU, no benchmark entry point, arch not available here — and mark every perf statement in the card `[inferred]`.
+FP self-check: do NOT fire when the triage says NOT REQUIRED (no runtime surface), when `stages.perf` is `pass`/`fail`, when a manual measurement was taken and reported, or when the PR's own harness is the thing under test and has no steady state to measure. A single sample on a shared box is weak evidence — report the spread or the sample count rather than one number.
+Real example (aiter#4538): a FlyDSL kernel whose entire justification was perf was reviewed to `Validation: PASS` with zero timing data; the perf finding stopped at "reviewer should ask", and a maintainer had already posted on the PR that a competing kernel beat it. Measuring afterwards took two `--scenario bench` runs and showed the fused path is where the PR's gain comes from — which the review should have carried in the first place. That gap is what the `perf` stage now closes automatically.
+→ `⚠️ P6: kernel changed and no base-vs-head timing exists — [why the perf stage could not run]; measure [target] on both sides, or mark the perf findings [inferred]`
+
 ---
 
 ### Housekeeping (quick scan)
@@ -584,13 +1289,48 @@ If the answer is yes, add it to the findings. If the answer is no, proceed.
 - Output ONLY the card below. Nothing before it, nothing after it.
 - If there are no findings, the findings section is omitted entirely.
 - "What it does" must be one sentence, written for a reviewer who hasn't read the diff.
+- **At most 5 findings, ordered most-severe first.** Rank by (severity, then blast radius), keep the top 5, and drop the rest — do not append them as a tail. This is a readability limit, not a measured recall claim; no committed replay corpus currently establishes recall@5.
+- **State the validation evidence** on the line under the verdict, using the state Step 1's triage
+  actually reached. The three no-report states are different facts and must not be merged:
+  - with an accepted exact-head report: `Validation (deterministic): <verdict>` plus selected target/runner, runtime arch, and failed/skipped stages. Say when the report came from the auto-run, because its ceiling is lower: with no route supplied the receipt and grid stages skip, so `INCONCLUSIVE` there describes what a diff can tell you and is not a finding against the PR.
+  - triage said not required: `Validation (deterministic): N/A — no runtime surface changed`. Do not write `NOT RUN`; there is no gap to report, and a docs or tooling PR carrying an alarming evidence line is what makes the line ignorable.
+  - required, but no target existed to run: `Validation (deterministic): NOT RUN — <triage reason>`. A runtime change shipping no test target is also a finding in its own right.
+  - required and a target existed, but the run could not happen (no idle GPU, validator missing, `REVIEW_AUTO_VALIDATE=0`): `Validation (deterministic): NOT RUN — <reason>`. This is an environment gap, not a PR defect.
+  - In every `NOT RUN` and `N/A` state, no finding may assert runtime behaviour (perf, accuracy, launch failure) as fact; such findings are `[inferred]` and phrased as questions.
+- **State the perf evidence on its own line, always.** A `Validation` verdict covers correctness
+  only, so a card that carries just that line reads as clearance for a kernel whose latency
+  nobody measured. The line goes in the header block, never as a finding — the 5-finding cap
+  must not be able to evict it. Two tiers, and the label says which one you are in:
+  - **the report carries `stages.perf` with status `pass` or `fail`** — this is deterministic
+    evidence, from base vs head on one locked GPU with the patch reversed for base, and it
+    ships its own reproducer. Write `Perf (deterministic): <verdict> — median_ratio <n> on
+    <worst_column> over <matched_rows> rows, threshold <t>`, where the verdict is `REGRESSION`
+    for `fail` and `NO REGRESSION` for `pass`. `median_ratio` is the head speedup over base,
+    so `<1` is slower. Quote `worst_column`: the ratio is the minimum across columns, so
+    naming the column that moved is what makes the number checkable.
+    A `fail` here already produced a `should-fix` finding and put the report at `NEEDS_WORK`;
+    report that as the deterministic result it is, not as a suggestion.
+  - **no usable `stages.perf`** — anything you measured by hand is advisory. Write
+    `Perf (advisory): ...` and use the state Step 1's perf triage reached (see P6):
+    - measured by hand: `Perf (advisory): MEASURED — <shapes>, base <n> vs head <n> <units>, <delta>`. Base and head, same box, back to back. Say how many samples, and say if only head was run — head-only reproduces the PR's own comparison and cannot show a regression.
+    - triage said not required: `Perf (advisory): N/A — no runtime surface changed`.
+    - required, but the target ships no benchmark entry point: `Perf (advisory): NOT RUN — <triage reason>`. A kernel PR with no runnable perf harness is also a finding in its own right.
+    - required and a harness existed, but the run could not happen (no idle GPU, wrong arch, nonzero exit, out of time): `Perf (advisory): NOT RUN — <reason>`. An environment gap, not a PR defect.
+    - In this tier the line is advisory in both directions: a slower hand-measured number is not a gate, and `MEASURED` is not clearance — one run on a shared box is weak evidence, so report the sample count with it.
+  - Never label a hand-run number `(deterministic)`, and never soften a `stages.perf` `fail`
+    into `(advisory)`. The label is the reader's only signal for whether a reproducer exists.
+- The review line is always advisory. `🔴 HIGH RISK` requests human attention; it is not a merge gate. A deterministic `Validation: BLOCK` may gate because its reproducer is in the report.
 
 ```
-## aiter PR #NNN — [title]
+## [repo] PR #NNN — [title]
 
 **[One sentence: what this PR does, in plain terms.]**
 
-[✅ LGTM | ⚠️ NEEDS WORK | 🔴 BLOCK]
+Review (advisory): [✅ NO FINDINGS | ⚠️ NEEDS WORK | 🔴 HIGH RISK]
+Validation (deterministic): [PASS/NEEDS_WORK/BLOCK/INCONCLUSIVE — target, exact runtime, and skipped-stage evidence | N/A — no runtime surface changed | NOT RUN — reason]
+Perf (deterministic): [REGRESSION | NO REGRESSION — median_ratio N on <worst_column> over N rows, threshold T]
+  ...or, when the report carries no usable stages.perf, this line instead:
+Perf (advisory): [MEASURED — shapes, base vs head with units, delta, sample count | N/A — no runtime surface changed | NOT RUN — reason]
 
 🔴 [specific finding — what, where, why it matters]
 ⚠️ [specific finding]

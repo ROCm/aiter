@@ -1,4 +1,6 @@
+# mode: 0 = dense 3-D grid, 1 = sorted block-sparse (flat grid + 752-byte kernarg, work_table @ 0x2D0)
 q_format,k_format,v_format,o_format,q_scale_mode,k_scale_mode,v_scale_mode,o_scale_mode,hdim_q,hdim_v,mask,mode,ts_qo,ts_kv,knl_name,co_name
+2,2,2,2,0,0,0,0,128,128,0,0,256,64,_ZN5aiter19fmha_fwd_hd128_bf16E,fwd_hd128_bf16.co
 10,10,3,2,1,1,1,0,128,128,0,0,256,128,_ZN5aiter28fmha_fwd_hd128_i8fp8_gfx950E,fwd_hd128_i8fp8.co
 3,3,3,2,5,5,1,0,128,128,0,0,256,128,_ZN5aiter28fmha_fwd_hd128_mxfp8_gfx950E,fwd_hd128_mxfp8.co
 3,3,3,2,1,1,1,0,128,128,0,0,256,128,_ZN5aiter24fmha_fwd_hd128_fp8_gfx950E,fwd_hd128_fp8.co
@@ -7,3 +9,11 @@ q_format,k_format,v_format,o_format,q_scale_mode,k_scale_mode,v_scale_mode,o_sca
 7,7,9,2,5,5,5,0,128,128,0,0,256,128,_ZN5aiter28fmha_fwd_hd128_f6f4_gfx950E,fwd_hd128_f6f4.co
 9,9,3,2,5,5,4,0,128,128,0,0,256,128,_ZN5aiter28fmha_fwd_hd128_mxfp4_gfx950E,fwd_hd128_mxfp4.co
 9,9,9,2,5,5,5,0,128,128,0,0,256,128,_ZN5aiter28fmha_fwd_hd128_f4f4_gfx950E,fwd_hd128_f4f4.co
+10,10,3,2,1,1,1,0,128,128,0,1,256,128,_ZN5aiter34fmha_fwd_hd128_i8fp8_sparse_gfx950E,fwd_hd128_i8fp8_sparse.co
+3,3,3,2,5,5,1,0,128,128,0,1,256,128,_ZN5aiter34fmha_fwd_hd128_mxfp8_sparse_gfx950E,fwd_hd128_mxfp8_sparse.co
+3,3,3,2,1,1,1,0,128,128,0,1,256,128,_ZN5aiter32fmha_fwd_hd128_fp8_sparse_gfx950E,fwd_hd128_fp8_sparse.co
+3,3,7,2,1,1,5,0,128,128,0,1,256,128,_ZN5aiter33fmha_fwd_hd128_f8f6_sparse_gfx950E,fwd_hd128_f8f6_sparse.co
+7,7,3,2,5,5,4,0,128,128,0,1,256,128,_ZN5aiter34fmha_fwd_hd128_mxfp6_sparse_gfx950E,fwd_hd128_mxfp6_sparse.co
+7,7,9,2,5,5,5,0,128,128,0,1,256,128,_ZN5aiter33fmha_fwd_hd128_f6f4_sparse_gfx950E,fwd_hd128_f6f4_sparse.co
+9,9,3,2,5,5,4,0,128,128,0,1,256,128,_ZN5aiter34fmha_fwd_hd128_mxfp4_sparse_gfx950E,fwd_hd128_mxfp4_sparse.co
+9,9,9,2,5,5,5,0,128,128,0,1,256,128,_ZN5aiter33fmha_fwd_hd128_f4f4_sparse_gfx950E,fwd_hd128_f4f4_sparse.co

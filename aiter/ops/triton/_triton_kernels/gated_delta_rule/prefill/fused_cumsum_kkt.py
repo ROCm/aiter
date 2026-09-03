@@ -54,45 +54,40 @@ def _fused_cumsum_kkt_kernel(
 
     o_t = tl.arange(0, BT)
 
-    p_g = tl.make_block_ptr(
-        g_ptr + bos * H + i_h, (T_seq,), (H,), (i_t * BT,), (BT,), (0,)
-    )
-    b_g = tl.load(p_g, boundary_check=(0,)).to(tl.float32)
+    # Plain pointer arithmetic rather than tl.make_block_ptr, which is not
+    # available in every Triton build we target.
+    o_abs = i_t * BT + o_t
+    m_t = o_abs < T_seq
+    o_k = tl.arange(0, K)
+
+    b_g = tl.load(g_ptr + bos * H + i_h + o_abs * H, mask=m_t, other=0.0).to(tl.float32)
     b_g_cumsum = tl.cumsum(b_g, axis=0)
-    p_g_out = tl.make_block_ptr(
-        g_cumsum_ptr + bos * H + i_h, (T_seq,), (H,), (i_t * BT,), (BT,), (0,)
-    )
-    tl.store(p_g_out, b_g_cumsum.to(p_g_out.dtype.element_ty), boundary_check=(0,))
+    g_out_ptrs = g_cumsum_ptr + bos * H + i_h + o_abs * H
+    tl.store(g_out_ptrs, b_g_cumsum.to(g_cumsum_ptr.dtype.element_ty), mask=m_t)
 
-    p_beta = tl.make_block_ptr(
-        beta_ptr + bos * H + i_h, (T_seq,), (H,), (i_t * BT,), (BT,), (0,)
+    b_beta = tl.load(beta_ptr + bos * H + i_h + o_abs * H, mask=m_t, other=0.0).to(
+        tl.float32
     )
-    b_beta = tl.load(p_beta, boundary_check=(0,)).to(tl.float32)
 
-    p_k = tl.make_block_ptr(
-        k_ptr + (bos * Hg + i_h // (H // Hg)) * K,
-        (T_seq, K),
-        (Hg * K, 1),
-        (i_t * BT, 0),
-        (BT, K),
-        (1, 0),
-    )
-    b_k = tl.load(p_k, boundary_check=(0, 1)).to(tl.float32)
+    b_k = tl.load(
+        k_ptr
+        + (bos * Hg + i_h // (H // Hg)) * K
+        + o_abs[:, None] * (Hg * K)
+        + o_k[None, :],
+        mask=m_t[:, None],
+        other=0.0,
+    ).to(tl.float32)
 
     b_A = tl.dot(b_k, tl.trans(b_k))
     b_g_diff = b_g_cumsum[:, None] - b_g_cumsum[None, :]
     b_A = b_A * safe_exp(b_g_diff) * b_beta[:, None]
     b_A = tl.where(o_t[:, None] > o_t[None, :], b_A, 0.0)
 
-    p_A = tl.make_block_ptr(
-        A_ptr + (bos * H + i_h) * BT,
-        (T_seq, BT),
-        (BT * H, 1),
-        (i_t * BT, 0),
-        (BT, BT),
-        (1, 0),
+    tl.store(
+        A_ptr + (bos * H + i_h) * BT + o_abs[:, None] * (BT * H) + o_t[None, :],
+        b_A.to(A_ptr.dtype.element_ty),
+        mask=m_t[:, None],
     )
-    tl.store(p_A, b_A.to(A_ptr.dtype.element_ty), boundary_check=(0, 1))
 
 
 def fused_cumsum_kkt(
@@ -215,8 +210,9 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel(
     o_t = i_t * BT + tl.arange(0, BT)
     m_t = o_t < T
 
-    p_g = tl.make_block_ptr(g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
-    b_g = tl.load(p_g, boundary_check=(0,)).to(tl.float32)
+    # Plain pointer arithmetic rather than tl.make_block_ptr, which is not
+    # available in every Triton build we target.
+    b_g = tl.load(g + bos * H + i_h + o_t * H, mask=m_t, other=0.0).to(tl.float32)
     b_g_cumsum = tl.cumsum(b_g, axis=0)
     # Store g_cumsum in log2 space when downstream kernels consume it with exp2:
     # exp2(x * RCP_LN2) == exp(x), keeping results identical. The scale arrives
@@ -233,25 +229,24 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel(
         g_out_base = g_cumsum_out + i_h * T_flat + bos
     else:
         g_out_base = g_cumsum_out + (i_b * H + i_h) * T_flat
-    p_go = tl.make_block_ptr(g_out_base, (T,), (1,), (i_t * BT,), (BT,), (0,))
-    tl.store(p_go, b_g_cumsum.to(p_go.dtype.element_ty), boundary_check=(0,))
-
-    p_beta = tl.make_block_ptr(
-        beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
+    tl.store(
+        g_out_base + o_t,
+        b_g_cumsum.to(g_out_base.dtype.element_ty),
+        mask=m_t,
     )
-    b_beta = tl.load(p_beta, boundary_check=(0,))
+
+    b_beta = tl.load(beta + bos * H + i_h + o_t * H, mask=m_t, other=0.0)
 
     b_A = tl.zeros([BT, BT], dtype=tl.float32)
+    k_base = k + (bos * Hg + i_h // (H // Hg)) * K
     for i_k in range(tl.cdiv(K, BK)):
-        p_k = tl.make_block_ptr(
-            k + (bos * Hg + i_h // (H // Hg)) * K,
-            (T, K),
-            (Hg * K, 1),
-            (i_t * BT, i_k * BK),
-            (BT, BK),
-            (1, 0),
+        o_k = i_k * BK + tl.arange(0, BK)
+        m_k = o_k < K
+        b_k = tl.load(
+            k_base + o_t[:, None] * (Hg * K) + o_k[None, :],
+            mask=m_t[:, None] & m_k[None, :],
+            other=0.0,
         )
-        b_k = tl.load(p_k, boundary_check=(0, 1))
         b_kb = b_k * b_beta[:, None]
         b_A = tl.dot(b_kb.to(b_k.dtype), tl.trans(b_k), acc=b_A)
 
@@ -260,15 +255,12 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel(
     b_gate = tl.math.exp2(b_g_diff) if USE_EXP2 else exp(b_g_diff)
     b_A = tl.where(m_A, b_A * b_gate, 0.0)
 
-    p_A = tl.make_block_ptr(
-        A_out + (bos * H + i_h) * BT,
-        (T, BT),
-        (BT * H, 1),
-        (i_t * BT, 0),
-        (BT, BT),
-        (1, 0),
+    o_bt = tl.arange(0, BT)
+    tl.store(
+        A_out + (bos * H + i_h) * BT + o_t[:, None] * (BT * H) + o_bt[None, :],
+        b_A.to(A_out.dtype.element_ty),
+        mask=m_t[:, None],
     )
-    tl.store(p_A, b_A.to(A_out.dtype.element_ty), boundary_check=(0, 1))
 
 
 def fused_chunk_local_cumsum_scaled_dot_kkt_fwd(

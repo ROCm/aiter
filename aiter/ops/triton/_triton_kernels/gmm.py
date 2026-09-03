@@ -12,11 +12,10 @@ import functools
 import triton
 import triton.language as tl
 
-from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 
 # AITER
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH, load_config_json
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 # Kernel config.
 # ------------------------------------------------------------------------------
@@ -31,8 +30,8 @@ def get_config(
         "ptgmm",
         "nptgmm",
     }, f"'{gmm_type}' is an invalid GMM variant."
-    dev = arch_info.get_arch()
-    config_dict = load_config_json(f"{AITER_TRITON_CONFIGS_PATH}/{dev}-GMM.json")
+    cfg_dir = resolve_config_dir("gmm", "GMM", backend="triton")
+    config_dict = load_config_json(f"{cfg_dir}/DEFAULT.json")
     assert all(
         variant in config_dict for variant in ("gmm", "ptgmm", "nptgmm")
     ), "Not all GMM variants are present in the configuration file."

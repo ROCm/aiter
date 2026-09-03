@@ -46,24 +46,36 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import arith, const_expr, gpu, range_constexpr
+from flydsl.expr import arith, const_expr, fastmath, gpu, range_constexpr
 from flydsl.expr import math as fmath
-from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
 from flydsl.expr.typing import Int32, Stream, T
-
-from aiter.ops.flydsl.kernels import buffer_ops, vector
 
 from .fused_compress_attn_common import (
     block_base_bytes_i64,
     emit_group_fp8_nm_asm_scatter,
     state_slot_byte_offset,
 )
-from .tensor_shim import _run_compiled, _to_raw
+from .tensor_shim import _run_compiled, _to_raw, ptr_buf_tensor
 
 BLOCK_THREADS = 64  # 1 wave64
 SLICE = 64  # head_dim elements per block (grid-Y split)
 _NEG_INF = float("-inf")
 _LOG2E = math.log2(math.e)
+
+
+def _ptr_at_byte_off(tensor, base_i64):
+    """Global byte pointer at ``tensor``'s base + ``base_i64`` (64-bit byte offset).
+
+    Used to fold a slot/block rebase into the pointer handed to
+    ``ptr_buf_tensor``, which re-derives the descriptor's element type -- so the
+    i8 carrier type here only carries the address and the ptrtoint/inttoptr
+    roundtrip folds away pre-ISA, keeping the emitted V# identical to the old
+    ``buf_tensor(base_i64=...)`` descriptor.
+    """
+    pt = fx.PointerType.get(T.i8, address_space=fx.AddressSpace.Global, alignment=1)
+    return fx.inttoptr(
+        pt, fx.Int64(fx.ptrtoint(fx.get_iter(tensor))) + fx.Int64(base_i64)
+    )
 
 
 # ============================================================================
@@ -149,7 +161,6 @@ def _build_compress_forward_kernel(
     _kname = (
         f"hca_compress_forward_D{D}_R{ratio}_NW{NW}_SL{SLICE_SZ}_S{state_size}_flydsl"
     )
-    fm_fast = arith.FastMathFlags.fast
 
     @flyc.kernel(name=_kname, known_block_size=[BLOCK_TH, 1, 1])
     def kernel(
@@ -176,193 +187,163 @@ def _build_compress_forward_kernel(
         sid = fx.block_idx.y
         tid = fx.thread_idx.x  # 0..BLOCK_TH-1
 
-        c_zero_i32 = arith.constant(0, type=i32)
-        c_one_i32 = arith.constant(1, type=i32)
-        c_64 = arith.constant(64, type=i32)
+        # -inf sentinel + its 0.0 partner feed the softmax maximumf / == compare,
+        # which must stay non-fast (a plain fx const would take ambient fast_fp_math
+        # and corrupt the -inf guard) -- keep both raw.
         c_neg_inf = arith.constant(_NEG_INF, type=f32)
         c_zero_f32 = arith.constant(0.0, type=f32)
-        c_log2e = arith.constant(_LOG2E, type=f32)
-        c_K_m1 = arith.constant(K - 1, type=i32)
-        c_K_per_wave = arith.constant(K_PER_WAVE, type=i32)
-        c_ratio = arith.constant(ratio, type=i32)
-        c_DIM_FULL = arith.constant(DIM_FULL, type=i32)
-        c_SLICE = arith.constant(SLICE_SZ, type=i32)
-        c_VEC = arith.constant(VEC, type=i32)
-        c_state_size = arith.constant(state_size, type=i32)
+        c_log2e = fx.Float32(_LOG2E)
 
         def fexp_f32(x):
-            return fx.rocdl.exp2(f32, x * c_log2e)
+            # x is fx.Float32; exp2 needs a raw operand -> wrap once here.
+            return fx.rocdl.exp2(f32, _to_raw(x * c_log2e))
 
         # Per-thread wave / lane (block-local).
-        wid = arith.divsi(_to_raw(tid), c_64)  # ? [0, NW)
-        lid = arith.remui(_to_raw(tid), c_64)  # ? [0, 64)
+        wid = fx.Int32(tid) // 64  # -> [0, NW)
+        lid = fx.Int32(tid) % 64  # -> [0, 64)
 
         # -- Load plan row ----------------------------------------------
-        plan_rsrc = buffer_ops.create_buffer_resource(plan, max_size=True)
-        plan_base = ArithValue(pid) * arith.constant(4, type=i32)
-        plan_vec = buffer_ops.buffer_load(plan_rsrc, plan_base, vec_width=4, dtype=i32)
-        ragged_id = vector.extract(plan_vec, static_position=[0], dynamic_position=[])
-        batch_id = vector.extract(plan_vec, static_position=[1], dynamic_position=[])
-        position = vector.extract(plan_vec, static_position=[2], dynamic_position=[])
-        window_len = vector.extract(plan_vec, static_position=[3], dynamic_position=[])
+        plan_buf = ptr_buf_tensor(fx.get_iter(plan), fx.Int32)
+        plan_vec = fx.Vector(
+            fx.add_offset(fx.get_iter(plan_buf), fx.Int32(pid) * 4).load(T.vec(4, i32))
+        )
+        ragged_id = plan_vec[0]
+        batch_id = plan_vec[1]
+        position = plan_vec[2]
+        window_len = plan_vec[3]
 
         # Sentinel-skip: run the whole body only for position >= 0, as a closure
         # under a runtime `if` (rewriter sees an opaque call -> scf.if).
         def _body():
             # Per-thread head_dim base: each thread owns VEC contiguous
             # elements starting at slice_base + lid * VEC.
-            slice_base_i32 = ArithValue(sid) * c_SLICE
-            col_off_base = slice_base_i32 + ArithValue(lid) * c_VEC
+            col_off_base = fx.Int32(sid) * SLICE_SZ + fx.Int32(lid) * VEC
 
-            slot_map_rsrc = buffer_ops.create_buffer_resource(
-                state_slot_mapping, max_size=True
-            )
-            slot = buffer_ops.buffer_load(
-                slot_map_rsrc, batch_id, vec_width=1, dtype=i32
-            )
+            slot_map_buf = ptr_buf_tensor(fx.get_iter(state_slot_mapping), fx.Int32)
+            slot = fx.add_offset(fx.get_iter(slot_map_buf), batch_id).load(i32)
 
-            kv_in_rsrc = buffer_ops.create_buffer_resource(kv_in, max_size=True)
-            score_in_rsrc = buffer_ops.create_buffer_resource(score_in, max_size=True)
-            # Rebased onto this program's slot — see `state_slot_byte_offset`.
-            kv_state_rsrc = buffer_ops.create_buffer_resource(
-                kv_state,
-                max_size=True,
-                base_byte_offset=state_slot_byte_offset(slot, kv_state_slot_stride),
+            # bf16 inputs are read as i32 dwords (unaligned bit-extract) -> i32 buf.
+            kv_in_buf = ptr_buf_tensor(fx.get_iter(kv_in), fx.Int32)
+            score_in_buf = ptr_buf_tensor(fx.get_iter(score_in), fx.Int32)
+            # Rebased onto this program's slot — the 64-bit slot byte offset is
+            # folded into the descriptor base (see `state_slot_byte_offset`).
+            kv_state_buf = ptr_buf_tensor(
+                _ptr_at_byte_off(
+                    kv_state, state_slot_byte_offset(slot, kv_state_slot_stride)
+                ),
+                fx.Float32,
             )
-            score_state_rsrc = buffer_ops.create_buffer_resource(
-                score_state,
-                max_size=True,
-                base_byte_offset=state_slot_byte_offset(slot, score_state_slot_stride),
+            score_state_buf = ptr_buf_tensor(
+                _ptr_at_byte_off(
+                    score_state, state_slot_byte_offset(slot, score_state_slot_stride)
+                ),
+                fx.Float32,
             )
-            ape_rsrc = buffer_ops.create_buffer_resource(ape, max_size=True)
+            ape_buf = ptr_buf_tensor(fx.get_iter(ape), fx.Float32)
 
-            def _load_bf16_vec_to_f32(rsrc, base_off_elems_i32):
+            def _load_bf16_vec_to_f32(buf, base_off_elems_i32):
                 """Load VEC contiguous bf16 elements starting at
                 ``base_off_elems_i32`` -> list of VEC f32 values.
 
                 VEC=1: unaligned-safe scalar via dword + bit-extract.
-                VEC>=2: vectorized i32 buffer_load + bitcast to bf16.
+                VEC>=2: vectorized i32 load + bitcast to bf16.
                 """
+                base_off = fx.Int32(base_off_elems_i32)
                 if const_expr(VEC == 1):
-                    off_dw = ArithValue(base_off_elems_i32) >> c_one_i32
-                    lane_in_dw = arith.andi(_to_raw(base_off_elems_i32), c_one_i32)
-                    raw_s = buffer_ops.buffer_load(rsrc, off_dw, vec_width=1, dtype=i32)
-                    hi = ArithValue(raw_s) >> arith.constant(16, type=i32)
-                    lo_or_hi = arith.select(
-                        arith.cmpi(CmpIPredicate.eq, lane_in_dw, c_zero_i32),
-                        raw_s,
-                        _to_raw(hi),
-                    )
-                    lo16 = arith.andi(lo_or_hi, arith.constant(0xFFFF, type=i32))
-                    lo16_v = vector.from_elements(T.vec(1, T.i32), [lo16])
-                    bf16_pair = vector.bitcast(T.vec(2, T.bf16), lo16_v)
-                    bf16_v = vector.extract(
-                        bf16_pair, static_position=[0], dynamic_position=[]
-                    )
-                    return [arith.extf(f32, bf16_v)]
+                    off_dw = base_off >> 1
+                    lane_in_dw = base_off & 1
+                    raw_s = fx.Int32(fx.add_offset(fx.get_iter(buf), off_dw).load(i32))
+                    # logical (unsigned) shift for the hi-word extract: fx Int32 >>
+                    # is arithmetic -> use Uint32 to keep v_lshrrev_b32.
+                    hi = fx.Int32((fx.Uint32(raw_s) >> 16).ir_value())
+                    lo_or_hi = (lane_in_dw == fx.Int32(0)).select(raw_s, hi)
+                    lo16 = lo_or_hi & 0xFFFF
+                    lo16_v = fx.Vector.from_elements([lo16], dtype=fx.Int32)
+                    bf16_pair = lo16_v.bitcast(fx.BFloat16)
+                    return [bf16_pair[0].to(fx.Float32)]
                 else:
                     # base must be VEC-aligned (caller guarantees by
                     # col_off_base = sid*SLICE + lid*VEC, both multiples of VEC).
-                    off_dw = ArithValue(base_off_elems_i32) >> c_one_i32
+                    off_dw = base_off >> 1
                     dwords = VEC // 2  # VEC bf16 = VEC*2 bytes
                     if const_expr(dwords == 1):
-                        # buffer_load(vec_width=1) returns scalar i32; wrap
-                        # into vec<1xi32> before bitcast to vec<2xbf16>.
-                        raw_s = buffer_ops.buffer_load(
-                            rsrc, off_dw, vec_width=1, dtype=i32
+                        # vec_width=1 returns scalar i32; wrap into vec<1xi32>
+                        # before bitcast to vec<2xbf16>.
+                        raw = fx.Vector.from_elements(
+                            [fx.add_offset(fx.get_iter(buf), off_dw).load(i32)],
+                            dtype=fx.Int32,
                         )
-                        raw = vector.from_elements(T.vec(1, T.i32), [raw_s])
                     else:
-                        raw = buffer_ops.buffer_load(
-                            rsrc, off_dw, vec_width=dwords, dtype=i32
+                        raw = fx.Vector(
+                            fx.add_offset(fx.get_iter(buf), off_dw).load(
+                                T.vec(dwords, i32)
+                            )
                         )
-                    vec_bf16 = vector.bitcast(T.vec(VEC, T.bf16), raw)
-                    out = []
-                    for i in range_constexpr(VEC):
-                        bf16_v = vector.extract(
-                            vec_bf16, static_position=[i], dynamic_position=[]
-                        )
-                        out.append(arith.extf(f32, bf16_v))
-                    return out
+                    vec_bf16 = raw.bitcast(fx.BFloat16)
+                    return [vec_bf16[i].to(fx.Float32) for i in range_constexpr(VEC)]
 
-            def _load_f32_vec(rsrc, base_off_elems_i32):
+            def _load_f32_vec(buf, base_off_elems_i32):
                 """Load VEC f32 starting at base -> list of VEC f32 values."""
                 if const_expr(VEC <= 4):
-                    raw = buffer_ops.buffer_load(
-                        rsrc, base_off_elems_i32, vec_width=VEC, dtype=f32
-                    )
                     if const_expr(VEC == 1):
-                        # vec_width=1 returns scalar, not 1-vec.
-                        return [raw]
-                    return [
-                        vector.extract(raw, static_position=[i], dynamic_position=[])
-                        for i in range(VEC)
-                    ]
+                        # width=1 returns scalar, not 1-vec.
+                        return [
+                            fx.Float32(
+                                fx.add_offset(
+                                    fx.get_iter(buf), base_off_elems_i32
+                                ).load(f32)
+                            )
+                        ]
+                    raw = fx.Vector(
+                        fx.add_offset(fx.get_iter(buf), base_off_elems_i32).load(
+                            T.vec(VEC, f32)
+                        )
+                    )
+                    return [raw[i] for i in range(VEC)]
                 else:
                     # VEC == 8: AMD HW max is dwordx4 -> 2 loads.
                     assert VEC == 8
                     half = VEC // 2
-                    r0 = buffer_ops.buffer_load(
-                        rsrc, base_off_elems_i32, vec_width=half, dtype=f32
+                    base = fx.Int32(base_off_elems_i32)
+                    r0 = fx.Vector(
+                        fx.add_offset(fx.get_iter(buf), base).load(T.vec(half, f32))
                     )
-                    r1 = buffer_ops.buffer_load(
-                        rsrc,
-                        ArithValue(base_off_elems_i32) + arith.constant(half, type=i32),
-                        vec_width=half,
-                        dtype=f32,
+                    r1 = fx.Vector(
+                        fx.add_offset(fx.get_iter(buf), base + half).load(
+                            T.vec(half, f32)
+                        )
                     )
-                    out = []
-                    for i in range_constexpr(half):
-                        out.append(
-                            vector.extract(r0, static_position=[i], dynamic_position=[])
-                        )
-                    for i in range_constexpr(half):
-                        out.append(
-                            vector.extract(r1, static_position=[i], dynamic_position=[])
-                        )
-                    return out
+                    return [r0[i] for i in range(half)] + [r1[i] for i in range(half)]
 
             def _issue_phase2_loads(k_i32):
                 """Phase 2 (ragged input) loads. Returns (kv_list, sc_list,
                 ape_list) each of length VEC."""
-                ape_row = arith.remui(k_i32, c_ratio)
-                tmp = arith.subi(c_K_m1, k_i32)
-                in_row_raw = arith.subi(_to_raw(ragged_id), tmp)
-                in_row = arith.maxsi(in_row_raw, c_zero_i32)
-                base_in_off = (
-                    ArithValue(in_row) * ArithValue(kv_in_row_stride) + col_off_base
-                )
-                base_sc_off = (
-                    ArithValue(in_row) * ArithValue(score_in_row_stride) + col_off_base
-                )
-                base_ape_off = ArithValue(ape_row) * c_DIM_FULL + col_off_base
-                kv = _load_bf16_vec_to_f32(kv_in_rsrc, base_in_off)
-                sc = _load_bf16_vec_to_f32(score_in_rsrc, base_sc_off)
-                ape_v = _load_f32_vec(ape_rsrc, base_ape_off)
+                k = fx.Int32(k_i32)
+                ape_row = k % ratio
+                in_row_raw = fx.Int32(ragged_id) - (fx.Int32(K - 1) - k)
+                in_row = (in_row_raw > fx.Int32(0)).select(in_row_raw, fx.Int32(0))
+                base_in_off = in_row * fx.Int32(kv_in_row_stride) + col_off_base
+                base_sc_off = in_row * fx.Int32(score_in_row_stride) + col_off_base
+                base_ape_off = ape_row * DIM_FULL + col_off_base
+                kv = _load_bf16_vec_to_f32(kv_in_buf, base_in_off)
+                sc = _load_bf16_vec_to_f32(score_in_buf, base_sc_off)
+                ape_v = _load_f32_vec(ape_buf, base_ape_off)
                 return kv, sc, ape_v
 
             def _issue_phase1_loads(k_i32):
                 """Phase 1 (state cache) loads. Returns (kv_list, sc_padded_list)
                 each of length VEC. Score is -inf when s < 0."""
-                s = arith.addi(
-                    arith.subi(_to_raw(position), c_K_m1),
-                    k_i32,
-                )
-                is_pad = arith.cmpi(CmpIPredicate.slt, s, c_zero_i32)
-                s_safe = arith.select(is_pad, c_zero_i32, s)
-                ring = arith.remui(s_safe, c_state_size)
+                s = fx.Int32(position) - fx.Int32(K - 1) + fx.Int32(k_i32)
+                is_pad = s < fx.Int32(0)
+                s_safe = is_pad.select(fx.Int32(0), s)
+                ring = s_safe % state_size
                 # Slot term already folded into the descriptor base.
-                base_kv_off = (
-                    ArithValue(ring) * ArithValue(kv_state_pos_stride) + col_off_base
-                )
-                base_sc_off = (
-                    ArithValue(ring) * ArithValue(score_state_pos_stride) + col_off_base
-                )
-                kv_list = _load_f32_vec(kv_state_rsrc, base_kv_off)
-                sc_list = _load_f32_vec(score_state_rsrc, base_sc_off)
-                sc_padded = [
-                    arith.select(is_pad, c_neg_inf, sc_list[i]) for i in range(VEC)
-                ]
+                base_kv_off = ring * fx.Int32(kv_state_pos_stride) + col_off_base
+                base_sc_off = ring * fx.Int32(score_state_pos_stride) + col_off_base
+                kv_list = _load_f32_vec(kv_state_buf, base_kv_off)
+                sc_list = _load_f32_vec(score_state_buf, base_sc_off)
+                neg_inf = fx.Float32(c_neg_inf)
+                sc_padded = [is_pad.select(neg_inf, sc_list[i]) for i in range(VEC)]
                 return kv_list, sc_padded
 
             def _softmax_step_padded(
@@ -373,40 +354,38 @@ def _build_compress_forward_kernel(
                 is also -inf). Safe in both Phase 1 (padding can occur) and
                 Phase 2 (score finite -> pad-select branch is dead code).
                 """
+                neg_inf = fx.Float32(c_neg_inf)
+                zero = fx.Float32(c_zero_f32)
                 new_m, new_kv, new_w = [], [], []
                 for i in range_constexpr(VEC):
-                    m_old = m_old_list[i]
-                    kv_old = kv_old_list[i]
-                    w_old = w_old_list[i]
-                    score_k = score_k_list[i]
-                    kv_k = kv_k_list[i]
-                    m_new = arith.maximumf(m_old, score_k)
-                    is_first = arith.cmpf(CmpFPredicate.OEQ, m_old, c_neg_inf)
-                    scale_active = fexp_f32(arith.subf(m_old, m_new))
-                    scale_v = arith.select(is_first, c_zero_f32, scale_active)
-                    wk_active = fexp_f32(arith.subf(score_k, m_new))
-                    is_pad_score = arith.cmpf(CmpFPredicate.OEQ, score_k, c_neg_inf)
-                    w_k = arith.select(is_pad_score, c_zero_f32, wk_active)
-                    new_kv.append(
-                        arith.AddFOp(
-                            arith.MulFOp(kv_old, scale_v, fastmath=fm_fast).result,
-                            arith.MulFOp(w_k, kv_k, fastmath=fm_fast).result,
-                            fastmath=fm_fast,
-                        ).result
-                    )
-                    new_w.append(
-                        arith.AddFOp(
-                            arith.MulFOp(w_old, scale_v, fastmath=fm_fast).result,
-                            w_k,
-                            fastmath=fm_fast,
-                        ).result
-                    )
-                    new_m.append(m_new)
+                    m_old = fx.Float32(m_old_list[i])
+                    kv_old = fx.Float32(kv_old_list[i])
+                    w_old = fx.Float32(w_old_list[i])
+                    score_k = fx.Float32(score_k_list[i])
+                    kv_k = fx.Float32(kv_k_list[i])
+                    # maximumf keeps the ambient fast_fp_math (matches the old
+                    # raw maximumf, which resolved fastmath<fast>). The OEQ
+                    # compares against -inf MUST emit fastmath<none> -- ambient
+                    # fast carries ninf, which lets `x == -inf` fold to false
+                    # and drops the sentinel select -- so scope only the `==`
+                    # to fastmath(None) (== the old raw cmpf, no fastmath).
+                    m_new = m_old.maximumf(score_k)
+                    with fastmath(None):
+                        is_first = m_old == neg_inf
+                    scale_active = fx.Float32(fexp_f32(m_old - m_new))
+                    scale_v = is_first.select(zero, scale_active)
+                    wk_active = fx.Float32(fexp_f32(score_k - m_new))
+                    with fastmath(None):
+                        is_pad_score = score_k == neg_inf
+                    w_k = is_pad_score.select(zero, wk_active)
+                    new_kv.append((kv_old * scale_v + w_k * kv_k).ir_value())
+                    new_w.append((w_old * scale_v + w_k).ir_value())
+                    new_m.append(m_new.ir_value())
                 return new_m, new_kv, new_w
 
             # -- Wave's K range: [wid * K_PER_WAVE, (wid+1) * K_PER_WAVE) --
-            k_start_i32 = ArithValue(wid) * c_K_per_wave
-            k_end_i32 = k_start_i32 + c_K_per_wave
+            k_start_i32 = fx.Int32(wid) * K_PER_WAVE
+            k_end_i32 = k_start_i32 + K_PER_WAVE
 
             # Split point inside this wave's K range. Each wave sees a
             # window_len-dependent slice of Phase 1 followed by Phase 2.
@@ -417,9 +396,9 @@ def _build_compress_forward_kernel(
             # ``split`` = clamp(wl, k_start, k_end) gives the boundary;
             # both sub-loops are empty when their bound collapses, so any
             # of the three cases naturally falls out.
-            wl_i32 = _to_raw(window_len)
-            split_lo = arith.maxsi(wl_i32, _to_raw(k_start_i32))
-            split_i32 = arith.minsi(split_lo, _to_raw(k_end_i32))
+            wl = fx.Int32(window_len)
+            split_lo = (wl > k_start_i32).select(wl, k_start_i32)
+            split_i32 = (split_lo < k_end_i32).select(split_lo, k_end_i32)
 
             # State is 3*VEC scalars: m_lane[VEC] + kv_lane[VEC] + w_lane[VEC].
             init_m = [c_neg_inf for _ in range(VEC)]
@@ -431,12 +410,12 @@ def _build_compress_forward_kernel(
             # cache; padded softmax (score can be -inf).
             phase1_local = init_state
             for k_static, state in range(
-                _to_raw(k_start_i32), _to_raw(split_i32), 1, init=init_state
+                k_start_i32.ir_value(), split_i32.ir_value(), 1, init=init_state
             ):
                 m_lane = list(state[0:VEC])
                 kv_lane = list(state[VEC : 2 * VEC])
                 w_lane = list(state[2 * VEC : 3 * VEC])
-                k_i32 = arith.index_cast(i32, _to_raw(k_static))
+                k_i32 = fx.Int32(k_static)
                 kv_v, sc_v = _issue_phase1_loads(k_i32)
                 new_m, new_kv, new_w = _softmax_step_padded(
                     m_lane, kv_lane, w_lane, sc_v, kv_v
@@ -449,16 +428,15 @@ def _build_compress_forward_kernel(
             # Carry Phase 1's accumulator through as init.
             final = phase1_local
             for k_static, state in range(
-                _to_raw(split_i32), _to_raw(k_end_i32), 1, init=phase1_local
+                split_i32.ir_value(), k_end_i32.ir_value(), 1, init=phase1_local
             ):
                 m_lane = list(state[0:VEC])
                 kv_lane = list(state[VEC : 2 * VEC])
                 w_lane = list(state[2 * VEC : 3 * VEC])
-                k_i32 = arith.index_cast(i32, _to_raw(k_static))
+                k_i32 = fx.Int32(k_static)
                 p2_kv, p2_sc, p2_ape = _issue_phase2_loads(k_i32)
                 p2_score = [
-                    arith.AddFOp(p2_sc[i], p2_ape[i], fastmath=fm_fast).result
-                    for i in range(VEC)
+                    (fx.Float32(p2_sc[i]) + p2_ape[i]).ir_value() for i in range(VEC)
                 ]
                 new_m, new_kv, new_w = _softmax_step_padded(
                     m_lane, kv_lane, w_lane, p2_score, p2_kv
@@ -477,12 +455,12 @@ def _build_compress_forward_kernel(
             lds_m_ptr = lds.lds_m.ptr
             lds_kv_ptr = lds.lds_kv.ptr
             lds_w_ptr = lds.lds_w.ptr
-            lds_thread_base = ArithValue(wid) * c_SLICE + ArithValue(lid) * c_VEC
+            lds_thread_base = fx.Int32(wid) * SLICE_SZ + fx.Int32(lid) * VEC
             for i in range_constexpr(VEC):
-                idx_i = lds_thread_base + arith.constant(i, type=i32)
-                fx.ptr_store(m_local[i], lds_m_ptr + fx.Int32(idx_i))
-                fx.ptr_store(kv_local[i], lds_kv_ptr + fx.Int32(idx_i))
-                fx.ptr_store(w_local[i], lds_w_ptr + fx.Int32(idx_i))
+                idx_i = lds_thread_base + i
+                fx.ptr_store(m_local[i], lds_m_ptr + idx_i)
+                fx.ptr_store(kv_local[i], lds_kv_ptr + idx_i)
+                fx.ptr_store(w_local[i], lds_w_ptr + idx_i)
 
             gpu.barrier()
 
@@ -494,13 +472,13 @@ def _build_compress_forward_kernel(
             def _wave0():
                 comp_list = []
                 for i in range_constexpr(VEC):
-                    lane_off = ArithValue(lid) * c_VEC + arith.constant(i, type=i32)
+                    lane_off = fx.Int32(lid) * VEC + i
                     # Global max across NW waves for this element.
                     m_g = fx.Float32(c_neg_inf)
                     m_arr = []
                     for w in range_constexpr(NW):
-                        idx_w = arith.constant(w * SLICE_SZ, type=i32) + lane_off
-                        m_w = fx.ptr_load(lds_m_ptr + fx.Int32(idx_w))
+                        idx_w = w * SLICE_SZ + lane_off
+                        m_w = fx.ptr_load(lds_m_ptr + idx_w)
                         m_arr.append(m_w)
                         m_g = m_g.maximumf(m_w)
 
@@ -508,41 +486,34 @@ def _build_compress_forward_kernel(
                     kv_sum = fx.Float32(0.0)
                     w_sum = fx.Float32(0.0)
                     for w in range_constexpr(NW):
-                        idx_w = arith.constant(w * SLICE_SZ, type=i32) + lane_off
-                        kv_w = fx.ptr_load(lds_kv_ptr + fx.Int32(idx_w))
-                        w_w = fx.ptr_load(lds_w_ptr + fx.Int32(idx_w))
+                        idx_w = w * SLICE_SZ + lane_off
+                        kv_w = fx.ptr_load(lds_kv_ptr + idx_w)
+                        w_w = fx.ptr_load(lds_w_ptr + idx_w)
                         m_w = m_arr[w]
-                        scale_w = fx.Float32(fexp_f32(_to_raw(m_w - m_g)))
+                        scale_w = fx.Float32(fexp_f32(m_w - m_g))
                         kv_sum = kv_sum + kv_w * scale_w
                         w_sum = w_sum + w_w * scale_w
-                    rcp_w = fx.Float32(fx.rocdl.rcp(f32, _to_raw(w_sum)))
-                    comp_list.append(_to_raw(kv_sum * rcp_w))
+                    rcp_w = fx.Float32(fx.rocdl.rcp(f32, w_sum.ir_value()))
+                    comp_list.append(kv_sum * rcp_w)
 
                 # -- Vectorized write of VEC f32 comp values --
-                out_rsrc = buffer_ops.create_buffer_resource(
-                    kv_compressed, max_size=True
-                )
+                out_buf = ptr_buf_tensor(fx.get_iter(kv_compressed), fx.Float32)
                 out_off = (
-                    ArithValue(pid) * ArithValue(kv_compressed_row_stride)
-                    + col_off_base
+                    fx.Int32(pid) * fx.Int32(kv_compressed_row_stride) + col_off_base
                 )
                 if const_expr(VEC == 1):
-                    buffer_ops.buffer_store(comp_list[0], out_rsrc, out_off)
+                    fx.add_offset(fx.get_iter(out_buf), out_off).store(comp_list[0])
                 elif const_expr(VEC <= 4):
-                    out_vec = vector.from_elements(T.vec(VEC, T.f32), comp_list)
-                    buffer_ops.buffer_store(out_vec, out_rsrc, out_off)
+                    out_vec = fx.Vector.from_elements(comp_list, dtype=fx.Float32)
+                    fx.add_offset(fx.get_iter(out_buf), out_off).store(out_vec)
                 else:
                     # VEC == 8: AMD HW max is dwordx4 -> 2 stores.
                     assert VEC == 8
                     half = VEC // 2
-                    v0 = vector.from_elements(T.vec(half, T.f32), comp_list[0:half])
-                    v1 = vector.from_elements(T.vec(half, T.f32), comp_list[half:VEC])
-                    buffer_ops.buffer_store(v0, out_rsrc, out_off)
-                    buffer_ops.buffer_store(
-                        v1,
-                        out_rsrc,
-                        ArithValue(out_off) + arith.constant(half, type=i32),
-                    )
+                    v0 = fx.Vector.from_elements(comp_list[0:half], dtype=fx.Float32)
+                    v1 = fx.Vector.from_elements(comp_list[half:VEC], dtype=fx.Float32)
+                    fx.add_offset(fx.get_iter(out_buf), out_off).store(v0)
+                    fx.add_offset(fx.get_iter(out_buf), out_off + half).store(v1)
 
             if wid == 0:
                 _wave0()
@@ -678,36 +649,32 @@ def _build_norm_rope_scatter_kernel(
     ):
         f32 = T.f32
         i32 = T.i32
-        vecVf32 = T.vec(VEC, T.f32)
 
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
         # Pack KW plan rows per block: wave_id picks the row, lane indexes head_dim.
-        wave_id = ArithValue(tid) >> arith.constant(log2_wave, type=T.i32)
-        lane = ArithValue(tid) & arith.constant(WAVE - 1, type=T.i32)
-        pid = ArithValue(bid) * arith.constant(KW, type=T.i32) + wave_id
+        # logical shift (tid >= 0); fx Int32 >> is arithmetic -> use Uint32.
+        wave_id = fx.Int32((fx.Uint32(tid) >> log2_wave).ir_value())
+        lane = fx.Int32(tid) & (WAVE - 1)
+        pid = fx.Int32(bid) * KW + wave_id
 
-        c_zero_i32 = arith.constant(0, type=i32)
-        c_one_i32 = arith.constant(1, type=i32)
-        c_eps = arith.constant(rms_eps, type=f32)
-        c_inv_D = arith.constant(1.0 / D, type=f32)
-        c_ratio = arith.constant(ratio, type=i32)
-        c_k_per_block = arith.constant(k_per_block, type=i32)
+        c_eps = fx.Float32(rms_eps)
+        c_inv_D = fx.Float32(1.0 / D)
 
         def wave_reduce_add(x):
-            w = _to_raw(x)
+            w = fx.Float32(x)
             for sh_exp in range_constexpr(log2_wave):
                 off = WAVE // (2 << sh_exp)
-                peer = _to_raw(ArithValue(w).shuffle_xor(off, WAVE))
-                w = arith.AddFOp(w, peer, fastmath=fm_fast).result
+                w = w + w.shuffle_xor(off, WAVE)
             return w
 
         # -- Load plan row --
-        plan_rsrc = buffer_ops.create_buffer_resource(plan, max_size=True)
-        plan_base = ArithValue(pid) * arith.constant(4, type=i32)
-        plan_vec = buffer_ops.buffer_load(plan_rsrc, plan_base, vec_width=4, dtype=i32)
-        batch_id = vector.extract(plan_vec, static_position=[1], dynamic_position=[])
-        position = vector.extract(plan_vec, static_position=[2], dynamic_position=[])
+        plan_buf = ptr_buf_tensor(fx.get_iter(plan), fx.Int32)
+        plan_vec = fx.Vector(
+            fx.add_offset(fx.get_iter(plan_buf), pid * 4).load(T.vec(4, i32))
+        )
+        batch_id = plan_vec[1]
+        position = plan_vec[2]
 
         # active = real plan row (position>=0 sentinel) AND within capacity (tail
         # waves of the last block have pid>=cap and must bail; their plan load is
@@ -716,170 +683,117 @@ def _build_norm_rope_scatter_kernel(
 
         # Whole body as a closure under the runtime guard (opaque call -> scf.if).
         def _body():
-            tid_x_vec = ArithValue(lane) * arith.constant(VEC, type=i32)
+            tid_x_vec = lane * VEC
 
             # -- Load kv_compressed[pid, tid*VEC : tid*VEC + VEC] --
-            kvc_rsrc = buffer_ops.create_buffer_resource(kv_compressed, max_size=True)
-            base_off = (
-                ArithValue(pid) * ArithValue(kv_compressed_row_stride) + tid_x_vec
-            )
+            kvc_buf = ptr_buf_tensor(fx.get_iter(kv_compressed), fx.Float32)
+            base_off = pid * fx.Int32(kv_compressed_row_stride) + tid_x_vec
             # VEC ? {2, 4, 8}: VEC <= 4 -> single dwordx{VEC}; VEC=8 -> 2x dwordx4.
             if const_expr(VEC <= 4):
-                raw = buffer_ops.buffer_load(
-                    kvc_rsrc, base_off, vec_width=VEC, dtype=f32
+                raw = fx.Vector(
+                    fx.add_offset(fx.get_iter(kvc_buf), base_off).load(T.vec(VEC, f32))
                 )
-                comp_lane = [
-                    vector.extract(raw, static_position=[i], dynamic_position=[])
-                    for i in range(VEC)
-                ]
+                comp_lane = [raw[i] for i in range(VEC)]
             else:
                 assert VEC == 8
                 half = 4
-                r0 = buffer_ops.buffer_load(
-                    kvc_rsrc, base_off, vec_width=half, dtype=f32
+                r0 = fx.Vector(
+                    fx.add_offset(fx.get_iter(kvc_buf), base_off).load(T.vec(half, f32))
                 )
-                r1 = buffer_ops.buffer_load(
-                    kvc_rsrc,
-                    ArithValue(base_off) + arith.constant(half, type=i32),
-                    vec_width=half,
-                    dtype=f32,
+                r1 = fx.Vector(
+                    fx.add_offset(fx.get_iter(kvc_buf), base_off + half).load(
+                        T.vec(half, f32)
+                    )
                 )
-                comp_lane = [
-                    vector.extract(r0, static_position=[i], dynamic_position=[])
-                    for i in range(half)
-                ] + [
-                    vector.extract(r1, static_position=[i], dynamic_position=[])
-                    for i in range(half)
-                ]
+                comp_lane = [r0[i] for i in range(half)] + [r1[i] for i in range(half)]
 
             # -- RMSNorm (wave reduce-add of squares / D + eps; rsqrt) --
-            sq_local = arith.constant(0.0, type=f32)
+            sq_local = fx.Float32(0.0)
             for i in range_constexpr(VEC):
-                sq_local = arith.AddFOp(
-                    sq_local,
-                    arith.MulFOp(comp_lane[i], comp_lane[i], fastmath=fm_fast).result,
-                    fastmath=fm_fast,
-                ).result
+                sq_local = sq_local + comp_lane[i] * comp_lane[i]
             sq_full = wave_reduce_add(sq_local)
-            var = arith.MulFOp(sq_full, c_inv_D, fastmath=fm_fast).result
-            rrms = fmath.rsqrt(
-                arith.AddFOp(var, c_eps, fastmath=fm_fast).result, fastmath=fm_fast
-            )
+            var = sq_full * c_inv_D
+            rrms = fmath.rsqrt((var + c_eps).ir_value(), fastmath=fm_fast)
 
             # rms_weight load
-            rmsw_rsrc = buffer_ops.create_buffer_resource(rms_weight, max_size=True)
             if const_expr(rms_weight_is_bf16):
+                # bf16 weights read as i32 dwords -> i32 buf.
+                rmsw_buf = ptr_buf_tensor(fx.get_iter(rms_weight), fx.Int32)
                 dwords = (VEC + 1) // 2
-                off_dw = ArithValue(tid_x_vec) >> c_one_i32
+                off_dw = fx.Int32((fx.Uint32(tid_x_vec) >> 1).ir_value())
                 if const_expr(dwords == 1):
-                    raw_s = buffer_ops.buffer_load(
-                        rmsw_rsrc, off_dw, vec_width=1, dtype=i32
+                    raw = fx.Vector.from_elements(
+                        [fx.add_offset(fx.get_iter(rmsw_buf), off_dw).load(i32)],
+                        dtype=fx.Int32,
                     )
-                    raw = vector.from_elements(T.vec(1, T.i32), [raw_s])
                 else:
-                    raw = buffer_ops.buffer_load(
-                        rmsw_rsrc, off_dw, vec_width=dwords, dtype=i32
+                    raw = fx.Vector(
+                        fx.add_offset(fx.get_iter(rmsw_buf), off_dw).load(
+                            T.vec(dwords, i32)
+                        )
                     )
-                vec_bf16 = vector.bitcast(T.vec(VEC, T.bf16), raw)
-                rmsw_lane = []
-                for i in range_constexpr(VEC):
-                    bf16_v = vector.extract(
-                        vec_bf16, static_position=[i], dynamic_position=[]
-                    )
-                    rmsw_lane.append(arith.extf(f32, bf16_v))
+                vec_bf16 = raw.bitcast(fx.BFloat16)
+                rmsw_lane = [vec_bf16[i].to(fx.Float32) for i in range_constexpr(VEC)]
             else:
+                rmsw_buf = ptr_buf_tensor(fx.get_iter(rms_weight), fx.Float32)
                 if const_expr(VEC <= 4):
-                    raw = buffer_ops.buffer_load(
-                        rmsw_rsrc, tid_x_vec, vec_width=VEC, dtype=f32
+                    raw = fx.Vector(
+                        fx.add_offset(fx.get_iter(rmsw_buf), tid_x_vec).load(
+                            T.vec(VEC, f32)
+                        )
                     )
-                    rmsw_lane = [
-                        vector.extract(raw, static_position=[i], dynamic_position=[])
-                        for i in range(VEC)
-                    ]
+                    rmsw_lane = [raw[i] for i in range(VEC)]
                 else:
                     half = 4
-                    r0 = buffer_ops.buffer_load(
-                        rmsw_rsrc, tid_x_vec, vec_width=half, dtype=f32
+                    r0 = fx.Vector(
+                        fx.add_offset(fx.get_iter(rmsw_buf), tid_x_vec).load(
+                            T.vec(half, f32)
+                        )
                     )
-                    r1 = buffer_ops.buffer_load(
-                        rmsw_rsrc,
-                        ArithValue(tid_x_vec) + arith.constant(half, type=i32),
-                        vec_width=half,
-                        dtype=f32,
+                    r1 = fx.Vector(
+                        fx.add_offset(fx.get_iter(rmsw_buf), tid_x_vec + half).load(
+                            T.vec(half, f32)
+                        )
                     )
-                    rmsw_lane = [
-                        vector.extract(r0, static_position=[i], dynamic_position=[])
-                        for i in range(half)
-                    ] + [
-                        vector.extract(r1, static_position=[i], dynamic_position=[])
-                        for i in range(half)
+                    rmsw_lane = [r0[i] for i in range(half)] + [
+                        r1[i] for i in range(half)
                     ]
 
-            normed_lane = [
-                arith.MulFOp(
-                    arith.MulFOp(comp_lane[i], rrms, fastmath=fm_fast).result,
-                    rmsw_lane[i],
-                    fastmath=fm_fast,
-                ).result
-                for i in range(VEC)
-            ]
+            normed_lane = [comp_lane[i] * rrms * rmsw_lane[i] for i in range(VEC)]
 
             # -- GPT-J RoPE on RD tail --
-            comp_pos_i32 = arith.muli(arith.divsi(_to_raw(position), c_ratio), c_ratio)
-            cos_rsrc = buffer_ops.create_buffer_resource(cos_cache, max_size=True)
-            sin_rsrc = buffer_ops.create_buffer_resource(sin_cache, max_size=True)
-            c_half_rd = arith.constant(RD // 2, type=i32)
-            cos_row_base = ArithValue(comp_pos_i32) * c_half_rd
+            comp_pos_i32 = (fx.Int32(position) // ratio) * ratio
+            cos_buf = ptr_buf_tensor(fx.get_iter(cos_cache), fx.BFloat16)
+            sin_buf = ptr_buf_tensor(fx.get_iter(sin_cache), fx.BFloat16)
+            cos_row_base = comp_pos_i32 * (RD // 2)
 
-            is_rope_t = arith.cmpi(
-                CmpIPredicate.sge,
-                _to_raw(lane),
-                arith.constant(ROPE_THREAD_LO, type=i32),
-            )
-            rope_rel_raw = ArithValue(lane) - arith.constant(ROPE_THREAD_LO, type=i32)
-            rope_rel = arith.maxsi(rope_rel_raw, c_zero_i32)
-            cs_lo = ArithValue(rope_rel) * arith.constant(PAIRS_PER_THREAD, type=i32)
+            is_rope_t = lane >= fx.Int32(ROPE_THREAD_LO)
+            rope_rel_raw = lane - ROPE_THREAD_LO
+            rope_rel = (rope_rel_raw > fx.Int32(0)).select(rope_rel_raw, fx.Int32(0))
+            cs_lo = rope_rel * PAIRS_PER_THREAD
 
             if const_expr(PAIRS_PER_THREAD == 1):
-                cos_b = buffer_ops.buffer_load(
-                    cos_rsrc, cos_row_base + cs_lo, vec_width=1, dtype=T.bf16
+                cos_b = fx.add_offset(fx.get_iter(cos_buf), cos_row_base + cs_lo).load(
+                    T.bf16
                 )
-                sin_b = buffer_ops.buffer_load(
-                    sin_rsrc, cos_row_base + cs_lo, vec_width=1, dtype=T.bf16
+                sin_b = fx.add_offset(fx.get_iter(sin_buf), cos_row_base + cs_lo).load(
+                    T.bf16
                 )
-                cos_vals = [arith.extf(f32, cos_b)]
-                sin_vals = [arith.extf(f32, sin_b)]
+                cos_vals = [fx.BFloat16(cos_b).to(fx.Float32)]
+                sin_vals = [fx.BFloat16(sin_b).to(fx.Float32)]
             else:
-                cos_vec = buffer_ops.buffer_load(
-                    cos_rsrc,
-                    cos_row_base + cs_lo,
-                    vec_width=PAIRS_PER_THREAD,
-                    dtype=T.bf16,
-                )
-                sin_vec = buffer_ops.buffer_load(
-                    sin_rsrc,
-                    cos_row_base + cs_lo,
-                    vec_width=PAIRS_PER_THREAD,
-                    dtype=T.bf16,
-                )
-                cos_vals = [
-                    arith.extf(
-                        f32,
-                        vector.extract(
-                            cos_vec, static_position=[i], dynamic_position=[]
-                        ),
+                cos_vec = fx.Vector(
+                    fx.add_offset(fx.get_iter(cos_buf), cos_row_base + cs_lo).load(
+                        T.vec(PAIRS_PER_THREAD, T.bf16)
                     )
-                    for i in range(PAIRS_PER_THREAD)
-                ]
-                sin_vals = [
-                    arith.extf(
-                        f32,
-                        vector.extract(
-                            sin_vec, static_position=[i], dynamic_position=[]
-                        ),
+                )
+                sin_vec = fx.Vector(
+                    fx.add_offset(fx.get_iter(sin_buf), cos_row_base + cs_lo).load(
+                        T.vec(PAIRS_PER_THREAD, T.bf16)
                     )
-                    for i in range(PAIRS_PER_THREAD)
-                ]
+                )
+                cos_vals = [cos_vec[i].to(fx.Float32) for i in range(PAIRS_PER_THREAD)]
+                sin_vals = [sin_vec[i].to(fx.Float32) for i in range(PAIRS_PER_THREAD)]
 
             rotated_lane = list(normed_lane)
             for k in range_constexpr(PAIRS_PER_THREAD):
@@ -887,59 +801,47 @@ def _build_norm_rope_scatter_kernel(
                 o = normed_lane[2 * k + 1]
                 c = cos_vals[k]
                 s = sin_vals[k]
-                new_e = arith.subf(
-                    arith.MulFOp(e, c, fastmath=fm_fast).result,
-                    arith.MulFOp(o, s, fastmath=fm_fast).result,
-                )
-                new_o = arith.AddFOp(
-                    arith.MulFOp(e, s, fastmath=fm_fast).result,
-                    arith.MulFOp(o, c, fastmath=fm_fast).result,
-                    fastmath=fm_fast,
-                ).result
-                rotated_lane[2 * k] = new_e
-                rotated_lane[2 * k + 1] = new_o
+                rotated_lane[2 * k] = e * c - o * s
+                rotated_lane[2 * k + 1] = e * s + o * c
 
             # -- Paged scatter dest (shared by bf16 / fp8) --
-            ci = arith.divsi(_to_raw(position), c_ratio)
-            block_in_seq = arith.divsi(ci, c_k_per_block)
-            slot_in_block = arith.remui(ci, c_k_per_block)
-            bt_rsrc = buffer_ops.create_buffer_resource(block_table, max_size=True)
-            bt_off = ArithValue(batch_id) * ArithValue(
-                block_table_seq_stride
-            ) + ArithValue(block_in_seq)
-            physical_block = buffer_ops.buffer_load(
-                bt_rsrc, bt_off, vec_width=1, dtype=i32
+            ci = fx.Int32(position) // ratio
+            block_in_seq = ci // k_per_block
+            slot_in_block = ci % k_per_block
+            bt_buf = ptr_buf_tensor(fx.get_iter(block_table), fx.Int32)
+            bt_off = (
+                fx.Int32(batch_id) * fx.Int32(block_table_seq_stride) + block_in_seq
             )
+            physical_block = fx.add_offset(fx.get_iter(bt_buf), bt_off).load(i32)
             # The block term rides on the descriptor's base, not on the
             # 32-bit offset -- see `block_base_bytes_i64`. What is left is one
             # block's worth, which fits by construction.
-            out_rsrc = buffer_ops.create_buffer_resource(
-                kv_cache,
-                max_size=True,
-                base_byte_offset=block_base_bytes_i64(
-                    physical_block, kv_cache_block_stride, 1 if quant else 2
-                ),
+            # The block term rides on the descriptor's base (i64 fold), so the
+            # 32-bit voffset only spans one block. `block_base_bytes_i64` elem_bytes:
+            # fp8 kv_cache=1, bf16 kv_cache=2.
+            cache_block_base = block_base_bytes_i64(
+                physical_block, kv_cache_block_stride, 1 if quant else 2
             )
-            cache_base = ArithValue(slot_in_block) * ArithValue(kv_cache_token_stride)
+            cache_base = slot_in_block * fx.Int32(kv_cache_token_stride)
 
             if const_expr(quant):
                 # -- group_fp8 (V4 nm-asm) via shared emitter (single source of truth
-                # shared with the CSA single-kernel; fp8 entry layout stays identical). --
-                _krope_base = ArithValue(slot_in_block) * ArithValue(krope_token_stride)
+                # shared with the CSA single-kernel; fp8 entry layout stays identical).
+                # The emitter stores through direct global pointers built from the
+                # i64 block base (kv_cache / k_rope) we pass below. --
+                _krope_base = slot_in_block * fx.Int32(krope_token_stride)
                 emit_group_fp8_nm_asm_scatter(
-                    normed_lane=normed_lane,
-                    rotated_lane=rotated_lane,
-                    lane=lane,
-                    is_rope_t=is_rope_t,
-                    cache_base=_to_raw(cache_base),
-                    out_rsrc=out_rsrc,
-                    krope_base=_to_raw(_krope_base),
-                    krope_rsrc=buffer_ops.create_buffer_resource(
-                        k_rope_buff,
-                        max_size=True,
-                        base_byte_offset=block_base_bytes_i64(
-                            physical_block, krope_block_stride, 2
-                        ),
+                    normed_lane=[v.ir_value() for v in normed_lane],
+                    rotated_lane=[v.ir_value() for v in rotated_lane],
+                    lane=lane.ir_value(),
+                    is_rope_t=is_rope_t.ir_value(),
+                    cache_base=cache_base.ir_value(),
+                    out_base_i64=fx.Int64(fx.ptrtoint(fx.get_iter(kv_cache)))
+                    + fx.Int64(cache_block_base),
+                    krope_base=_krope_base.ir_value(),
+                    krope_base_i64=fx.Int64(fx.ptrtoint(fx.get_iter(k_rope_buff)))
+                    + fx.Int64(
+                        block_base_bytes_i64(physical_block, krope_block_stride, 2)
                     ),
                     VEC=VEC,
                     NOPE=NOPE,
@@ -947,29 +849,31 @@ def _build_norm_rope_scatter_kernel(
                     log2_rts=log2_rts,
                     ROPE_THREAD_LO=ROPE_THREAD_LO,
                     wave_width=WAVE,
-                    vecVf32=vecVf32,
-                    fm_fast=fm_fast,
                 )
             else:
                 # ---- BF16 single-buffer scatter (nope + rope contiguous) ----
+                # bf16 kv_cache written as i32 dwords -> i32 buf, block base folded.
+                out_buf = ptr_buf_tensor(
+                    _ptr_at_byte_off(kv_cache, cache_block_base),
+                    fx.Int32,
+                )
                 out_lane = [
-                    arith.select(is_rope_t, rotated_lane[i], normed_lane[i])
+                    is_rope_t.select(rotated_lane[i], normed_lane[i])
                     for i in range_constexpr(VEC)
                 ]
-                cache_off = ArithValue(cache_base) + tid_x_vec
-                out_vec_t = T.vec(VEC, T.bf16)
-                raw_vec = vector.from_elements(vecVf32, out_lane)
-                bf16_vec = raw_vec.truncf(out_vec_t)
-                cache_off_dw = ArithValue(cache_off) >> c_one_i32
+                cache_off = cache_base + tid_x_vec
+                bf16_vec = fx.Vector.from_elements(out_lane, dtype=fx.Float32).to(
+                    fx.BFloat16
+                )
+                bf16_as_i32 = bf16_vec.bitcast(fx.Int32)
+                cache_off_dw = fx.Int32((fx.Uint32(cache_off) >> 1).ir_value())
                 dwords = (VEC + 1) // 2
-                bf16_as_i32 = vector.bitcast(T.vec(dwords, T.i32), bf16_vec)
                 if const_expr(dwords == 1):
-                    scalar_i32 = vector.extract(
-                        bf16_as_i32, static_position=[0], dynamic_position=[]
+                    fx.add_offset(fx.get_iter(out_buf), cache_off_dw).store(
+                        bf16_as_i32[0]
                     )
-                    buffer_ops.buffer_store(scalar_i32, out_rsrc, cache_off_dw)
                 else:
-                    buffer_ops.buffer_store(bf16_as_i32, out_rsrc, cache_off_dw)
+                    fx.add_offset(fx.get_iter(out_buf), cache_off_dw).store(bf16_as_i32)
 
         if is_active:
             _body()
@@ -994,11 +898,7 @@ def _build_norm_rope_scatter_kernel(
         stream: fx.Stream,
     ):
         # grid = ceil(cap / KW): KW plan rows packed per block.
-        cap_raw = _to_raw(plan_capacity)
-        nblocks = arith.divsi(
-            arith.addi(cap_raw, arith.constant(KW - 1, type=T.i32)),
-            arith.constant(KW, type=T.i32),
-        )
+        nblocks = (fx.Int32(plan_capacity) + (KW - 1)) // KW
         idx_p = fx.Int64(nblocks)
         k = kernel(
             kv_compressed,

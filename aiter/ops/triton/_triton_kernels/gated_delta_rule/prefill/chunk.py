@@ -292,7 +292,8 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             preferred path when multiple layers process the same batch.
         initial_state_indices: Optional ``[N]`` state-pool slot indices. When
             provided, K5 gathers from and writes back to ``initial_state`` in
-            place. Supported by the HIP and Triton VK K5 paths only.
+            place; this requires ``output_final_state=True``. Supported by
+            every K5 path (HIP, FlyDSL, Triton VK).
         inplace_final_state: Controls in-place K5 state-pool write-back. It
             defaults to ``True`` when ``initial_state_indices`` is provided.
         snapshot_dtype: optional temporary chunk snapshot dtype (`fp32` or
@@ -308,13 +309,6 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         raise ValueError(
             "use_chunk_hip and use_chunk_flydsl are mutually exclusive; "
             "set at most one."
-        )
-    if use_chunk_flydsl and (
-        initial_state_indices is not None or inplace_final_state is True
-    ):
-        raise ValueError(
-            "Indexed state pools and in-place final-state write-back are not "
-            "supported by the FlyDSL K5 path."
         )
     if cu_seqlens is None:
         if seq_lens_cpu is not None or prefill_metadata is not None:
@@ -336,7 +330,9 @@ def chunk_gated_delta_rule_fwd_opt_vk(
     ):
         use_chunk_hip = False
     if use_chunk_flydsl:
-        if _is_unsupported_gfx12_runtime(q.device):
+        if _is_unsupported_gfx12_runtime(q.device) or (
+            num_decodes > 0 and prefill_metadata is None
+        ):
             use_chunk_flydsl = False
         elif k.dtype != torch.bfloat16 or k.shape[-1] != 128 or v.shape[-1] != 128:
             raise ValueError(
@@ -427,17 +423,11 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             inplace_final_state=inplace_final_state,
         )
     elif use_chunk_flydsl:
-        if snapshot_dtype is not None and snapshot_dtype != k.dtype:
-            raise ValueError(
-                "FlyDSL K5 does not support overriding `snapshot_dtype`; "
-                "omit it or pass `k.dtype`."
-            )
-        # Prepare emits head-major ``g_cumsum``.
         from aiter.ops.flydsl.linear_attention_prefill_kernels import (
-            chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip,
+            chunk_gated_delta_rule_fwd_h_flydsl_opt,
         )
 
-        h, v_new, final_state = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+        h, v_new, final_state = chunk_gated_delta_rule_fwd_h_flydsl_opt(
             k=k,
             w=w,
             u=u,
@@ -451,6 +441,9 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             num_decode_tokens=num_decode_tokens,
             g_head_major=True,
             prefill_metadata=prefill_metadata,
+            snapshot_dtype=snapshot_dtype,
+            initial_state_indices=initial_state_indices,
+            inplace_final_state=inplace_final_state,
         )
     else:
         h, v_new, final_state = chunk_gated_delta_rule_fwd_h_opt_vk(

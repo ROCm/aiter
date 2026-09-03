@@ -2,7 +2,6 @@
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_ogs.py
 
 import itertools
-import warnings
 
 import torch
 import triton
@@ -25,19 +24,9 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w4 import (
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH, load_config_json
 from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
-
-
-def _get_a8w4_dispatch(arch: str) -> dict:
-    """Per-(block_m, N, K) dispatch table for moe_gemm_a8w4. Returns {} if no
-    tuned file is shipped for this arch (caller uses the safe-default fallback).
-    Mirrors get_moe_configs() in utils/moe_config_utils.py."""
-    dispatch = load_config_json(
-        f"{AITER_TRITON_CONFIGS_PATH}/moe/{arch}-A8W4.json", required=False
-    )
-    return dispatch if dispatch is not None else {}
+from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
 
 
 def can_overflow_int32(tensor: torch.Tensor):
@@ -95,10 +84,10 @@ def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
     split_k = 1
 
     # Tuned dispatch: per-(block_m, N, K) winners from a sweep tuner.
-    # Schema mirrors sister files like gfx950-MOE-FP8_W8A8.json (BLOCK_SIZE_N,
-    # BLOCK_SIZE_K, num_warps, …) except BLOCK_SIZE_M is omitted because block_m
-    # is the dispatch key, not a tunable (routing decides block_m for the layer).
-    tuned = _get_a8w4_dispatch(arch).get(f"bm{block_m}_n{n}_k{k}")
+    # Entries carry BLOCK_SIZE_N, BLOCK_SIZE_K, num_warps, num_stages, … but
+    # omit BLOCK_SIZE_M because block_m is the dispatch key, not a tunable
+    # (routing decides block_m for the layer).
+    tuned = get_moe_dispatch("A8W4", arch, "triton").get(f"bm{block_m}_n{n}_k{k}")
     if tuned is not None:
         return {
             "block_m": block_m,
@@ -120,7 +109,7 @@ def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
     # geometry and num_stages from that entry are a better starting point than
     # a generic default, and avoid regressing to num_stages=1 on gfx950.
     # Under CDNA4 swizzle, skip BLOCK_K<256 entries since unswizzle can't compile them.
-    dispatch = _get_a8w4_dispatch(arch)
+    dispatch = get_moe_dispatch("A8W4", arch, "triton")
     proxy = next(
         (
             v
@@ -284,24 +273,18 @@ def get_kernel_config_gluon(m, n, k, routing_data, out_mx_quant=False):
     w_cache_modifier = ".cg" if block_m <= 32 else None
     split_k = 1
 
-    if block_m == 16 and k <= 768:
-        use_persistent = True
-        persistent_iters = 3
-    else:
-        use_persistent = False
-        persistent_iters = 0
-
     bucket = m2bucket(m)
-    tuned = _get_a8w4_dispatch(get_arch())
+    tuned = get_moe_dispatch("A8W4", get_arch(), "gluon")
     key = f"bm{block_m}_n{n}_k{k}_{bucket}"
     if key not in tuned:
         key = f"bm{block_m}_any"
     cfg = tuned[key]
-    block_n, block_k, num_buffers, num_warps = (
+    block_n, block_k, num_buffers, num_warps, persistent_iters = (
         cfg["block_n"],
         cfg["block_k"],
         cfg["num_buffers"],
         cfg["num_warps"],
+        cfg["persistent_iters"],
     )
 
     num_buffers = min(num_buffers, triton.cdiv(k, block_k))
@@ -318,7 +301,6 @@ def get_kernel_config_gluon(m, n, k, routing_data, out_mx_quant=False):
         "split_k": split_k,
         "w_cache_modifier": w_cache_modifier,
         "waves_per_eu": 0,
-        "use_persistent": use_persistent,
         "persistent_iters": persistent_iters,
         "num_ctas": num_ctas,
         "ctas_per_cga": ctas_per_cga,
@@ -359,13 +341,21 @@ def moe_gemm_a8w4(
     # External residual to fold into reduce_grouped writeback (saves the
     # standalone routed+shared elementwise add).
     residual=None,
+    backend=None,
 ):
     """
     Y[:, :] = 0.
     for e in num_experts:
         Y[idxs_y_m(e), :] += matmul(X[idxs_x_m(e), :], W[e, :, :])
     """
-    use_gluon = get_arch() == "gfx1250"
+    if backend is None:
+        backend = "gluon" if get_arch() == "gfx1250" else "triton"
+    assert backend in ("triton", "gluon"), f"Invalid backend: {backend}"
+    if backend == "gluon":
+        assert (
+            get_arch() == "gfx1250"
+        ), f"Gluon backend requires gfx1250, got {get_arch()}"
+    use_gluon = backend == "gluon"
     if preshuffled:
         assert (
             use_gluon
@@ -479,12 +469,12 @@ def moe_gemm_a8w4(
     # pid grid
     grid_m = routing_data.n_blocks(M, config["block_m"])
     grid_n = triton.cdiv(N, config["block_n"])
-    if use_gluon and config["use_persistent"]:
+    if use_gluon and config["persistent_iters"] > 1:
         num_blocks_n = grid_n
         grid_n = triton.cdiv(num_blocks_n, config["persistent_iters"])
     grid = grid_m * grid_n * config["split_k"]
     # launch kernel
-    if use_gluon and config["use_persistent"]:
+    if use_gluon and config["persistent_iters"] > 1:
         _moe_gemm_a8w4_decode_persistent_gluon[(grid,)](
             y,
             y.stride(1),

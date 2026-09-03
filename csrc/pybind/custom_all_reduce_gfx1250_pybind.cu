@@ -1,12 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+#include "rocm_ops.hpp"
 #include "aiter_stream.h"
 #include "custom_all_reduce_gfx1250.h"
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
-#include <torch/extension.h>
-
-namespace py = pybind11;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {

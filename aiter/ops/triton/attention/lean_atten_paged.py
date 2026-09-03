@@ -11,8 +11,13 @@ TO be added features:
 - Add GQA support
 - Misc
     - N_CTX with non-integer number of BLOCK_N (pad zeros or add mask)
-    -
+
+
+UPDATE:
+`lean Attention + Paged Attention` enhanced kernel is a candidate for deprecation from AITER repo in 2026/09
 """
+
+import warnings
 
 import torch
 
@@ -43,6 +48,11 @@ def persistent_lean_attention_paged(
     num_warps: int,
     waves_per_eu: int,
 ):
+    warnings.warn(
+        "Lean Attention + Paged Attention operator is deprecated and will be removed in near future.",
+        category=DeprecationWarning,
+        stacklevel=2,  # attributes warning to the caller
+    )
     _LOGGER.info(
         f"LEAN_ATTEN_PAGED: q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)} Mp={tuple(Mp.shape)} Lp={tuple(Lp.shape)}  Op={tuple(Op.shape)}"
     )

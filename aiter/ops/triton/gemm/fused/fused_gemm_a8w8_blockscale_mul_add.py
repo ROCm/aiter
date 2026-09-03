@@ -26,6 +26,10 @@ def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
     # heuristics for make "EVEN_K == True" as much as possible
     NUM_KSPLIT_STEP = 2
     BLOCK_SIZE_K_STEP = 2
+    # Both decrements floor-divide, so they must be clamped: a NUM_KSPLIT below
+    # NUM_KSPLIT_STEP would go to 0 and the next cdiv(K, NUM_KSPLIT) would
+    # divide by zero, and BLOCK_SIZE_K can fall under the 16 that
+    # compute_splitk_params() enforces everywhere else.
     SPLITK_BLOCK_SIZE = (
         triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
     )
@@ -37,14 +41,14 @@ def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
         ):
             break
         elif K % (SPLITK_BLOCK_SIZE // 2) != 0 and NUM_KSPLIT > 1:
-            NUM_KSPLIT = NUM_KSPLIT // NUM_KSPLIT_STEP
+            NUM_KSPLIT = max(NUM_KSPLIT // NUM_KSPLIT_STEP, 1)
         elif SPLITK_BLOCK_SIZE % BLOCK_SIZE_K != 0:
             if NUM_KSPLIT > 1:
-                NUM_KSPLIT = NUM_KSPLIT // NUM_KSPLIT_STEP
+                NUM_KSPLIT = max(NUM_KSPLIT // NUM_KSPLIT_STEP, 1)
             elif BLOCK_SIZE_K > 16:
-                BLOCK_SIZE_K = BLOCK_SIZE_K // BLOCK_SIZE_K_STEP
+                BLOCK_SIZE_K = max(BLOCK_SIZE_K // BLOCK_SIZE_K_STEP, 16)
         elif K % (BLOCK_SIZE_K // 2) != 0 and BLOCK_SIZE_K > 16:
-            BLOCK_SIZE_K = BLOCK_SIZE_K // BLOCK_SIZE_K_STEP
+            BLOCK_SIZE_K = max(BLOCK_SIZE_K // BLOCK_SIZE_K_STEP, 16)
         else:
             break
 

@@ -7,14 +7,13 @@ import torch
 import triton
 import triton.language as tl
 
-from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
 from aiter.ops.triton.utils._triton.pid_preprocessing import (
     remap_workgroup_spatial,
     remap_xcd,
 )
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH, load_config_json
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 
 @triton.jit
@@ -952,8 +951,8 @@ def _get_config(
     has_pe: bool = False,
     head_dim_v: int | None = None,
 ):
-    dev = arch_info.get_arch()
-    config = load_config_json(f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MHA-DEFAULT.json")
+    cfg_dir = resolve_config_dir("attention", "MHA", backend="triton")
+    config = load_config_json(f"{cfg_dir}/DEFAULT.json")
     fwd_cfg = config["fwd"]
     has_dropout_or_fp32 = enable_dropout or dtype == torch.float32
     # TODO: pe + dropout is not tuned

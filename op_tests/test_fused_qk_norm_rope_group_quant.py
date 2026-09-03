@@ -39,17 +39,10 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl import flydsl_qk_norm_rope_quant
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility.fp4_utils import f32_to_mx_e8m0_scale
 from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
-
-try:
-    from aiter.ops.flydsl import flydsl_qk_norm_rope_quant
-
-    _FLYDSL_IMPORT_ERROR = None
-except Exception as e:  # noqa: BLE001
-    flydsl_qk_norm_rope_quant = None
-    _FLYDSL_IMPORT_ERROR = e
 
 torch.set_default_device("cuda")
 
@@ -329,7 +322,7 @@ def test_fused_qk_norm_rope_group_quant(
     #   q_fp8=False -> flydsl bf16 (quant off)  [both write bf16 Q]
     # (comparing bf16-Q against fp8-flydsl would just measure the 2x Q write.)
     fly_us = float("nan")
-    if compare_flydsl and flydsl_qk_norm_rope_quant is not None:
+    if compare_flydsl:
         try:
             _, fly_us = run_perftest(
                 flydsl_qk_norm_rope_quant,
@@ -699,30 +692,29 @@ def test_fused_qk_norm_rope_group_quant_swa(T, H, D, RD, *, is_neox, q_fp8, G, G
     # moves less K-write traffic (bf16 512B vs our 448+14 fp8 + 128 bf16), so treat the
     # ratio as indicative of kernel efficiency, not a same-output benchmark.
     fly_us = float("nan")
-    if flydsl_qk_norm_rope_quant is not None:
-        try:
-            swa_kv_fly = torch.zeros(num_rows, D, dtype=torch.bfloat16, device=_DEV)
-            _, fly_us = run_perftest(
-                flydsl_qk_norm_rope_quant,
-                q.view(T, H * D),
-                kv.view(T, D),
-                kw,
-                cos,
-                sin,
-                pos,
-                num_q_heads=H,
-                head_dim=D,
-                rope_head_dim=RD,
-                quant=False,
-                scale_dtype="fp32",
-                swa_kv=swa_kv_fly,
-                batch_id_per_token=bid,
-                swa_block_tables=swa_block_tables,
-                swa_block_size=block_size,
-                num_rotate_args=_ROTATE,
-            )
-        except Exception:  # noqa: BLE001
-            fly_us = float("nan")
+    try:
+        swa_kv_fly = torch.zeros(num_rows, D, dtype=torch.bfloat16, device=_DEV)
+        _, fly_us = run_perftest(
+            flydsl_qk_norm_rope_quant,
+            q.view(T, H * D),
+            kv.view(T, D),
+            kw,
+            cos,
+            sin,
+            pos,
+            num_q_heads=H,
+            head_dim=D,
+            rope_head_dim=RD,
+            quant=False,
+            scale_dtype="fp32",
+            swa_kv=swa_kv_fly,
+            batch_id_per_token=bid,
+            swa_block_tables=swa_block_tables,
+            swa_block_size=block_size,
+            num_rotate_args=_ROTATE,
+        )
+    except Exception:  # noqa: BLE001
+        fly_us = float("nan")
     # RMSNorm ~4 flop/elem + GPT-J RoPE ~3 flop/elem over the RD tail, on the Q
     # and K rows alike. Bytes: read q+kv, write the fp8 entry (+dup e8m0) and
     # the bf16 rope buffer, plus the scattered SWA rows.
@@ -824,12 +816,6 @@ def main():
         help="skip the fused paged-SWA write test.",
     )
     args = parser.parse_args()
-
-    if not args.no_flydsl and _FLYDSL_IMPORT_ERROR is not None:
-        aiter.logger.warning(
-            "flydsl comparison disabled: %s. Use --no-flydsl to silence this warning.",
-            _FLYDSL_IMPORT_ERROR,
-        )
 
     neox_modes = [False, True] if args.neox else [False]
 

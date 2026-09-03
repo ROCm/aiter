@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import glob
 import os
 import shutil
 import subprocess
@@ -13,7 +14,7 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 OPT_COMPILER_CONFIG = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
 PACKAGE_NAME = "amd-aiter"
 
-FLYDSL_VERSION = "flydsl==0.3.1"
+FLYDSL_VERSION = "flydsl==0.3.2"
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", "0"))
@@ -164,7 +165,14 @@ def prepare_packaging():
     else:
         os.makedirs("aiter_meta/hsa", exist_ok=True)
     shutil.copytree("gradlib", "aiter_meta/gradlib")
+    # The .co files under csrc/opus_gemm/gen_co/<arch>/ ARE needed at runtime, so
+    # csrc is copied wholesale -- but the asm/ dumps next to them are analysis
+    # output (a couple of MB of .s/.dis per rebuild). Being .gitignored does
+    # nothing here: this is a filesystem copy, so a tree that has ever run
+    # build_co.py would otherwise ship them.
     shutil.copytree("csrc", "aiter_meta/csrc")
+    for asm_dir in glob.glob("aiter_meta/csrc/opus_gemm/gen_co/*/asm"):
+        shutil.rmtree(asm_dir, ignore_errors=True)
     open("aiter_meta/__init__.py", "w").close()
     write_install_mode()
 
@@ -285,8 +293,6 @@ if PREBUILD_KERNELS != 0:
             "skip precompilation in this environment"
         )
     else:
-        import glob
-
         from jit.utils.mha_recipes import (
             get_mha_varlen_prebuild_variants_by_names,
         )
@@ -371,7 +377,7 @@ if PREBUILD_KERNELS != 0:
                 flags_extra_hip=flags_hip,
                 blob_gen_cmd=one_opt_args["blob_gen_cmd"],
                 extra_include=one_opt_args["extra_include"],
-                extra_ldflags=None,
+                extra_ldflags=one_opt_args.get("extra_ldflags"),
                 verbose=False,
                 is_python_module=True,
                 is_standalone=False,

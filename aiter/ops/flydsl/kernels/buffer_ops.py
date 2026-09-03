@@ -74,13 +74,11 @@ def _get_buffer_flags(arch=None):
 
 
 __all__ = [
-    "BufferResourceDescriptor",
     "buffer_load",
     "buffer_store",
     "create_buffer_resource",
     "create_buffer_resource_from_addr",
     "create_llvm_ptr",
-    "extract_base_index",
     "get_element_ptr",
 ]
 
@@ -177,30 +175,6 @@ def create_llvm_ptr(value, address_space: int = 0) -> ir.Value:
         value = _unwrap_value(std_arith.IndexCastOp(i64_type, value).result)
     ptr_type = ir.Type.parse(f"!llvm.ptr<{address_space}>")
     return llvm.IntToPtrOp(ptr_type, value).result
-
-
-@dsl_loc_tracing
-def extract_base_index(tensor, address_space: int = 1) -> ir.Value:
-    """Extract the base address of a fly.memref as an index value.
-
-    Inverse of :func:`create_llvm_ptr` (index -> ptr). Useful when ISA
-    requires a raw pointer instead of a buffer resource descriptor
-    (e.g. global_atomic_pk_add_bf16 on gfx942).
-    """
-    from flydsl._mlir.dialects import fly as _fly
-    from flydsl._mlir.dialects import memref as _memref
-
-    raw = _unwrap_value(tensor)
-    try:
-        ir.MemRefType(raw.type)
-        return _memref.extract_aligned_pointer_as_index(raw)
-    except ValueError:
-        pass
-
-    ptr_type = ir.Type.parse(f"!llvm.ptr<{address_space}>")
-    ptr = _fly.extract_aligned_pointer_as_index(ptr_type, raw)
-    i64_val = llvm.PtrToIntOp(ir.IntegerType.get_signless(64), ptr).result
-    return _unwrap_value(std_arith.IndexCastOp(ir.IndexType.get(), i64_val).result)
 
 
 @dsl_loc_tracing

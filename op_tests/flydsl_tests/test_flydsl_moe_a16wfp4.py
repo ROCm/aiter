@@ -28,11 +28,10 @@ from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import fused_moe, fused_topk, torch_moe_stage1, torch_moe_stage2
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.moe_common import GateMode
-from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 
 _SKIP = pytest.mark.skipif(
-    get_gfx() not in ("gfx942", "gfx950") or not is_flydsl_available(),
+    get_gfx() not in ("gfx942", "gfx950"),
     reason="CDNA (gfx942/gfx950) + FlyDSL required for a16w4 SiTUv2",
 )
 

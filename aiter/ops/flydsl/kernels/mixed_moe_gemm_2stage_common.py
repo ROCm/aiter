@@ -30,20 +30,10 @@ from flydsl._mlir.dialects import llvm, memref, scf
 from flydsl._mlir.dialects.arith import CmpIPredicate
 from flydsl._mlir.extras import types as _mT
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import range_constexpr
-from flydsl.runtime.device import get_rocm_arch as get_hip_arch
-
-try:
-    from flydsl.runtime.device import supports_bf16_global_atomics
-except ImportError:
-
-    def supports_bf16_global_atomics(arch: str) -> bool:
-        return str(arch).startswith(("gfx94", "gfx95", "gfx12"))
-
-
-from flydsl.expr import arith, const_expr, gpu, rocdl
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.gpu import lds_space as _lds_space
 from flydsl.expr.typing import T
+from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 from aiter.ops.flydsl.kernels import buffer_ops, vector
@@ -2824,8 +2814,6 @@ def compile_mixed_moe_gemm1_common(
                             )
 
                     default_epilog(
-                        arith=arith,
-                        range_constexpr=range_constexpr,
                         m_repeat=m_repeat,
                         lane_div_16=lane_div_16,
                         bx_m=bx_m,
@@ -2903,11 +2891,6 @@ def compile_mixed_moe_gemm1_common(
                     gui_by_n = by_n // arith.constant(2, index=True)
                     gui_n_tile_base = n_tile_base // arith.constant(2, index=True)
                     c_shuffle_epilog(
-                        arith=arith,
-                        vector=vector,
-                        gpu=gpu,
-                        scf=scf,
-                        range_constexpr=range_constexpr,
                         tile_m=tile_m,
                         tile_n=gui_tile_n,
                         e_vec=e_vec,
@@ -2931,11 +2914,6 @@ def compile_mixed_moe_gemm1_common(
                     eff_e_vec = e_vec_sk
                     acc = acc_gate
                     c_shuffle_epilog(
-                        arith=arith,
-                        vector=vector,
-                        gpu=gpu,
-                        scf=scf,
-                        range_constexpr=range_constexpr,
                         tile_m=tile_m,
                         tile_n=tile_n,
                         e_vec=eff_e_vec,
@@ -2962,11 +2940,6 @@ def compile_mixed_moe_gemm1_common(
                     acc = acc_gate
                     sk_n_offset[0] = 0
                     c_shuffle_epilog(
-                        arith=arith,
-                        vector=vector,
-                        gpu=gpu,
-                        scf=scf,
-                        range_constexpr=range_constexpr,
                         tile_m=tile_m,
                         tile_n=tile_n,
                         e_vec=eff_e_vec,
@@ -2993,11 +2966,6 @@ def compile_mixed_moe_gemm1_common(
                     acc = acc_up
                     sk_n_offset[0] = inter_dim
                     c_shuffle_epilog(
-                        arith=arith,
-                        vector=vector,
-                        gpu=gpu,
-                        scf=scf,
-                        range_constexpr=range_constexpr,
                         tile_m=tile_m,
                         tile_n=tile_n,
                         e_vec=eff_e_vec,
@@ -3020,11 +2988,6 @@ def compile_mixed_moe_gemm1_common(
                     )
                 else:
                     c_shuffle_epilog(
-                        arith=arith,
-                        vector=vector,
-                        gpu=gpu,
-                        scf=scf,
-                        range_constexpr=range_constexpr,
                         tile_m=tile_m,
                         tile_n=tile_n,
                         e_vec=e_vec,
@@ -5376,11 +5339,6 @@ def compile_mixed_moe_gemm2_common(
                 e_vec = 2 if accumulate else min(body_tile_n // 32, 8)
                 rocdl.s_setprio(3)
                 c_shuffle_epilog(
-                    arith=arith,
-                    vector=vector,
-                    gpu=gpu,
-                    scf=scf,
-                    range_constexpr=range_constexpr,
                     tile_m=tile_m,
                     tile_n=body_tile_n,
                     e_vec=e_vec,

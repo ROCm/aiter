@@ -12,11 +12,28 @@ from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from .tensor_shim import (
-    GTensor,
     _to_raw,
-    get_dtype_bytes,
-    get_dtype_in_kernel,
 )
+
+
+def _gview(tensor, base, shape, stride):
+    it = fx.get_iter(fx.rocdl.make_buffer_tensor(tensor, max_size=True))
+    if base is not None:
+        it = fx.add_offset(it, base)
+    return fx.Tensor(fx.make_view(it, fx.make_layout(shape, stride)))
+
+
+def _load_vec(atom, tile, width, numeric):
+    frag = fx.make_rmem_tensor(width, numeric)
+    fx.copy(atom, tile, frag)
+    vec = frag.load()
+    return vec[0] if width == 1 else vec
+
+
+def _store_vec(atom, tile, value, width, numeric):
+    frag = fx.make_rmem_tensor(width, numeric)
+    frag.store(fx.Vector.from_elements([value], dtype=numeric) if width == 1 else value)
+    fx.copy(atom, frag, tile)
 
 
 @functools.lru_cache(maxsize=1024)
@@ -49,6 +66,17 @@ def create_vk_gdr_decode_kernel(
         VALUES_PER_THREAD_K = 4  # 16B
     else:
         VALUES_PER_THREAD_K = 8  # 16B
+    data_num = fx.BFloat16 if dtype == "bf16" else fx.Float16
+    A_log_num = {
+        "f32": fx.Float32,
+        "f16": fx.Float16,
+        "bf16": fx.BFloat16,
+    }[A_log_dtype]
+    state_num = {
+        "f32": fx.Float32,
+        "f16": fx.Float16,
+        "bf16": fx.BFloat16,
+    }[state_dtype]
 
     WARP_SIZE = WARP_THREADS_V * WARP_THREADS_K
     BLOCK_THREADS = NUM_WARPS * WARP_SIZE
@@ -102,15 +130,9 @@ def create_vk_gdr_decode_kernel(
         softplus_beta_ = fx.Float32(softplus_beta)
         softplus_threshold_ = fx.Float32(softplus_threshold)
 
-        dtype_ = get_dtype_in_kernel(dtype)
-        fx_dtype_ = fx.BFloat16 if dtype == "bf16" else fx.Float16
-        A_log_dtype_ = get_dtype_in_kernel(A_log_dtype)
-        state_dtype_ = get_dtype_in_kernel(state_dtype)
         f32_0 = fx.Float32(0.0)
         f32_1 = fx.Float32(1.0)
         width_i32 = _to_raw(fx.Int32(WARP_SIZE))
-        vec_t = T.vec(VALUES_PER_THREAD_K, dtype_)
-        acc_vec_t = T.vec(VALUES_PER_THREAD_K, T.f32)
 
         tidx = fx.thread_idx.x
         bidx = fx.block_idx.x
@@ -127,63 +149,103 @@ def create_vk_gdr_decode_kernel(
         warp_k_vec_start = w_tid % WARP_THREADS_K * VALUES_PER_THREAD_K
         global_v_start = tile_v_start + wid * WARP_TILE_V + w_tid // WARP_THREADS_K
 
-        read_indices_tensor = GTensor(read_indices, dtype=T.i32, shape=(-1,))
-        write_indices_tensor = GTensor(write_indices, dtype=T.i32, shape=(-1,))
-        read_pool_idx = fx.Int32(read_indices_tensor[b_i])
-        write_pool_idx = fx.Int32(write_indices_tensor[b_i])
+        cp_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
+        cp_data = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), data_num)
+        cp_data_vec = fx.make_copy_atom(
+            fx.rocdl.BufferCopy(data_num.width * VALUES_PER_THREAD_K), data_num
+        )
+        cp_A_log = fx.make_copy_atom(fx.rocdl.BufferCopy(A_log_num.width), A_log_num)
+        cp_state_vec = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), state_num)
 
-        q_tensor = GTensor(
+        read_indices_view = _gview(read_indices, None, (batch_size, 1), (1, 1))
+        write_indices_view = _gview(write_indices, None, (batch_size, 1), (1, 1))
+        read_pool_idx = _load_vec(
+            cp_i32, fx.slice(read_indices_view, (b_i, None)), 1, fx.Int32
+        )
+        write_pool_idx = _load_vec(
+            cp_i32, fx.slice(write_indices_view, (b_i, None)), 1, fx.Int32
+        )
+
+        q_view = _gview(
             query,
-            dtype=dtype_,
-            shape=(-1, seq_length, num_k_heads, head_k_dim),
-            stride=q_strides,
+            None,
+            (
+                batch_size,
+                seq_length,
+                num_k_heads,
+                head_k_dim // VALUES_PER_THREAD_K,
+                VALUES_PER_THREAD_K,
+            ),
+            (*q_strides[:-1], VALUES_PER_THREAD_K, 1),
         )
-        k_tensor = GTensor(
+        k_view = _gview(
             key,
-            dtype=dtype_,
-            shape=(-1, seq_length, num_k_heads, head_k_dim),
-            stride=k_strides,
+            None,
+            (
+                batch_size,
+                seq_length,
+                num_k_heads,
+                head_k_dim // VALUES_PER_THREAD_K,
+                VALUES_PER_THREAD_K,
+            ),
+            (*k_strides[:-1], VALUES_PER_THREAD_K, 1),
         )
-        v_tensor = GTensor(
+        v_view = _gview(
             value,
-            dtype=dtype_,
-            shape=(-1, seq_length, num_v_heads, head_v_dim),
-            stride=v_strides,
+            None,
+            (batch_size, seq_length, num_v_heads, head_v_dim, 1),
+            (*v_strides, 1),
         )
-        a_tensor = GTensor(
+        a_view = _gview(
             a,
-            dtype=dtype_,
-            stride=(a_strides[0], a_strides[1], a_strides[2]),
-            shape=(-1, seq_length, num_v_heads),
+            None,
+            (batch_size, seq_length, num_v_heads, 1),
+            (*a_strides, 1),
         )
-        b_tensor = GTensor(
+        b_view = _gview(
             b,
-            dtype=dtype_,
-            stride=(b_strides[0], b_strides[1], b_strides[2]),
-            shape=(-1, seq_length, num_v_heads),
+            None,
+            (batch_size, seq_length, num_v_heads, 1),
+            (*b_strides, 1),
         )
-        dt_bias_tensor = GTensor(dt_bias, dtype=dtype_, shape=(num_v_heads,))
-        A_log_tensor = GTensor(A_log, dtype=A_log_dtype_, shape=(num_v_heads,))
-        out_tensor = GTensor(
-            out, dtype=dtype_, shape=(-1, seq_length, num_v_heads, head_v_dim)
+        dt_bias_view = _gview(dt_bias, None, (num_v_heads, 1), (1, 1))
+        A_log_view = _gview(A_log, None, (num_v_heads, 1), (1, 1))
+        out_view = _gview(
+            out,
+            None,
+            (batch_size, seq_length, num_v_heads, head_v_dim, 1),
+            (
+                seq_length * num_v_heads * head_v_dim,
+                num_v_heads * head_v_dim,
+                head_v_dim,
+                1,
+                1,
+            ),
         )
-        read_state_tensor = GTensor(
+
+        state_shape = (
+            num_v_heads,
+            head_v_dim,
+            head_k_dim // VALUES_PER_THREAD_K,
+            VALUES_PER_THREAD_K,
+        )
+        state_stride = (
+            state_strides[1],
+            state_strides[2],
+            VALUES_PER_THREAD_K,
+            1,
+        )
+        read_state_view = _gview(
             state,
-            dtype=state_dtype_,
-            shape=(num_v_heads, head_v_dim, head_k_dim),
-            stride=(state_strides[1], state_strides[2], state_strides[3]),
-            static_bytes_offset_i64=fx.Int64(read_pool_idx)
-            * fx.Int64(state_strides[0])
-            * get_dtype_bytes(state_dtype),
+            fx.Int64(read_pool_idx) * fx.Int64(state_strides[0]),
+            state_shape,
+            state_stride,
         )
-        write_state_tensor = GTensor(
+        write_state_view = _gview(
             state,
-            dtype=state_dtype_,
-            shape=(num_v_heads, head_v_dim, head_k_dim),
-            stride=(state_strides[1], state_strides[2], state_strides[3]),
-            static_bytes_offset_i64=fx.Int64(write_pool_idx)
-            * fx.Int64(state_strides[0])
-            * get_dtype_bytes(state_dtype),
+            fx.Int64(write_pool_idx) * fx.Int64(state_strides[0]),
+            state_shape,
+            state_stride,
         )
 
         def fast_exp(x, use_exp2=True):
@@ -196,35 +258,54 @@ def create_vk_gdr_decode_kernel(
             return fx.math.log1p(x, fastmath=fx.FastMathFlags.fast)
 
         # Skip CG-pad slots (indices sentinel < 0). The guarded body is a
-        # closure so the runtime `if` sees an opaque call (no GTensor "state"
-        # to thread through an scf.if yield) -- lowers to scf.if, no raw region.
+        # closure so the runtime `if` sees an opaque call and lowers to scf.if.
         def _do_decode():
-            if const_expr("f32" in A_log_dtype):
-                r_A_log = A_log_tensor[hv_i]
-            else:
-                r_A_log = A_log_tensor[hv_i].extf(T.f32)
-            r_dt_bias = dt_bias_tensor[hv_i].extf(T.f32)
+            r_A_log = _load_vec(
+                cp_A_log, fx.slice(A_log_view, (hv_i, None)), 1, A_log_num
+            )
+            if const_expr("f32" not in A_log_dtype):
+                r_A_log = r_A_log.to(fx.Float32)
+            r_dt_bias = _load_vec(
+                cp_data, fx.slice(dt_bias_view, (hv_i, None)), 1, data_num
+            ).to(fx.Float32)
 
             state_vecs = [0] * (WARP_TILE_V_ITERS * WARP_TILE_K_ITERS)
             for vi in range_constexpr(WARP_TILE_V_ITERS):
                 global_v_i = global_v_start + vi * WARP_GROUP_TILE_V
                 for ki in range_constexpr(WARP_TILE_K_ITERS):
                     warp_k_vec_i = warp_k_vec_start + ki * WARP_TILE_K
-                    state_vecs[vi * WARP_TILE_K_ITERS + ki] = (
-                        read_state_tensor.vec_load(
-                            (hv_i, global_v_i, warp_k_vec_i), VALUES_PER_THREAD_K
-                        )
+                    state_vecs[vi * WARP_TILE_K_ITERS + ki] = _load_vec(
+                        cp_state_vec,
+                        fx.slice(
+                            read_state_view,
+                            (
+                                hv_i,
+                                global_v_i,
+                                warp_k_vec_i // VALUES_PER_THREAD_K,
+                                None,
+                            ),
+                        ),
+                        VALUES_PER_THREAD_K,
+                        state_num,
                     )
-                    if const_expr("f32" in state_dtype):
-                        pass
-                    else:
+                    if const_expr("f32" not in state_dtype):
                         state_vecs[vi * WARP_TILE_K_ITERS + ki] = state_vecs[
                             vi * WARP_TILE_K_ITERS + ki
-                        ].extf(acc_vec_t)
+                        ].to(fx.Float32)
 
             for sq_i in range_constexpr(seq_length):
-                r_a = a_tensor[b_i, sq_i, hv_i].extf(T.f32)
-                r_b = b_tensor[b_i, sq_i, hv_i].extf(T.f32)
+                r_a = _load_vec(
+                    cp_data,
+                    fx.slice(a_view, (b_i, sq_i, hv_i, None)),
+                    1,
+                    data_num,
+                ).to(fx.Float32)
+                r_b = _load_vec(
+                    cp_data,
+                    fx.slice(b_view, (b_i, sq_i, hv_i, None)),
+                    1,
+                    data_num,
+                ).to(fx.Float32)
                 x = r_a + r_dt_bias
                 beta_x = softplus_beta_ * x
 
@@ -253,14 +334,38 @@ def create_vk_gdr_decode_kernel(
 
                 for ki in range_constexpr(WARP_TILE_K_ITERS):
                     warp_k_vec_i = warp_k_vec_start + ki * WARP_TILE_K
-                    q_vec = q_tensor.vec_load(
-                        (b_i, sq_i, hk_i, warp_k_vec_i), VALUES_PER_THREAD_K
+                    q_vec = _load_vec(
+                        cp_data_vec,
+                        fx.slice(
+                            q_view,
+                            (
+                                b_i,
+                                sq_i,
+                                hk_i,
+                                warp_k_vec_i // VALUES_PER_THREAD_K,
+                                None,
+                            ),
+                        ),
+                        VALUES_PER_THREAD_K,
+                        data_num,
                     )
-                    k_vec = k_tensor.vec_load(
-                        (b_i, sq_i, hk_i, warp_k_vec_i), VALUES_PER_THREAD_K
+                    k_vec = _load_vec(
+                        cp_data_vec,
+                        fx.slice(
+                            k_view,
+                            (
+                                b_i,
+                                sq_i,
+                                hk_i,
+                                warp_k_vec_i // VALUES_PER_THREAD_K,
+                                None,
+                            ),
+                        ),
+                        VALUES_PER_THREAD_K,
+                        data_num,
                     )
-                    sq_vecs[ki] = q_vec.extf(acc_vec_t)
-                    sk_vecs[ki] = k_vec.extf(acc_vec_t)
+                    sq_vecs[ki] = q_vec.to(fx.Float32)
+                    sk_vecs[ki] = k_vec.to(fx.Float32)
 
                 if const_expr(use_qk_l2norm):
                     sum_q_partial_vec = fx.Vector.from_elements(
@@ -329,7 +434,12 @@ def create_vk_gdr_decode_kernel(
 
                 for vi in range_constexpr(WARP_TILE_V_ITERS):
                     global_v_i = global_v_start + vi * WARP_GROUP_TILE_V
-                    r_v = v_tensor[b_i, sq_i, hv_i, global_v_i].extf(T.f32)
+                    r_v = _load_vec(
+                        cp_data,
+                        fx.slice(v_view, (b_i, sq_i, hv_i, global_v_i, None)),
+                        1,
+                        data_num,
+                    ).to(fx.Float32)
 
                     sum_hk = fx.Vector.from_elements(
                         [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)],
@@ -375,12 +485,17 @@ def create_vk_gdr_decode_kernel(
                         )
                         state_vecs[vi * WARP_TILE_K_ITERS + ki] = h_new
 
-                    sum_hq = sum_hq.to(fx_dtype_)
+                    sum_hq = sum_hq.to(data_num)
 
-                    # Only k-vec lane 0 writes the q output; closure keeps the
-                    # GTensor store opaque to the runtime-if state analysis.
+                    # Only k-vec lane 0 writes the q output.
                     def _write_q(_sum_hq=sum_hq, _gv=global_v_i, _sq=sq_i):
-                        out_tensor[b_i, _sq, hv_i, _gv] = _sum_hq
+                        _store_vec(
+                            cp_data,
+                            fx.slice(out_view, (b_i, _sq, hv_i, _gv, None)),
+                            _sum_hq,
+                            1,
+                            data_num,
+                        )
 
                     if warp_k_vec_start == 0:
                         _write_q()
@@ -392,9 +507,21 @@ def create_vk_gdr_decode_kernel(
                     if const_expr("f32" in state_dtype):
                         out_vec = state_vecs[vi * WARP_TILE_K_ITERS + ki]
                     else:
-                        out_vec = state_vecs[vi * WARP_TILE_K_ITERS + ki].truncf(vec_t)
-                    write_state_tensor.vec_store(
-                        (hv_i, global_v_i, warp_k_vec_i), out_vec, VALUES_PER_THREAD_K
+                        out_vec = state_vecs[vi * WARP_TILE_K_ITERS + ki].to(state_num)
+                    _store_vec(
+                        cp_state_vec,
+                        fx.slice(
+                            write_state_view,
+                            (
+                                hv_i,
+                                global_v_i,
+                                warp_k_vec_i // VALUES_PER_THREAD_K,
+                                None,
+                            ),
+                        ),
+                        out_vec,
+                        VALUES_PER_THREAD_K,
+                        state_num,
                     )
 
         if (read_pool_idx >= 0) & (write_pool_idx >= 0):

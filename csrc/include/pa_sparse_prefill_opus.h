@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// OPUS-based sparse paged prefill attention for DeepSeek-V4 on gfx950.
+// OPUS-based sparse paged prefill attention for DeepSeek-V4 (gfx950, gfx1250).
 // Self-contained, single-header:
 //   * Public API (always visible).
 //   * Host plumbing (`pa_sparse_prefill_kargs` / `pa_prefill_*_traits<...>`) inside the
@@ -25,18 +25,34 @@
 //   attn_sink          : [H] fp32 (per-head softmax-denominator bias)
 //   out                : [N, H, D]   same dtype as q (caller-allocated)
 // `softmax_scale` is forwarded to the kernel as-is (no implicit 1/sqrt(D)).
-void pa_sparse_prefill_opus_fwd(aiter_tensor_t& q,
-                                aiter_tensor_t& unified_kv,
-                                aiter_tensor_t& kv_indices_prefix,
-                                aiter_tensor_t& kv_indptr_prefix,
-                                aiter_tensor_t& kv,
-                                aiter_tensor_t& kv_indices_extend,
-                                aiter_tensor_t& kv_indptr_extend,
-                                aiter_tensor_t& attn_sink,
-                                aiter_tensor_t& out,
-                                float softmax_scale);
+//
+// One entry point per target: gfx950 runs the kernel compiled from the device
+// templates below, gfx1250 runs a prebuilt code object. The Python layer picks
+// one based on the running GPU.
+void pa_sparse_prefill_gfx950_opus_fwd(aiter_tensor_t& q,
+                                       aiter_tensor_t& unified_kv,
+                                       aiter_tensor_t& kv_indices_prefix,
+                                       aiter_tensor_t& kv_indptr_prefix,
+                                       aiter_tensor_t& kv,
+                                       aiter_tensor_t& kv_indices_extend,
+                                       aiter_tensor_t& kv_indptr_extend,
+                                       aiter_tensor_t& attn_sink,
+                                       aiter_tensor_t& out,
+                                       float softmax_scale);
 
-// Public API: split-precision prefill attention for DeepSeek-V4 DSA on gfx950.
+// gfx1250: only the bf16 variant is built into the code object.
+void pa_sparse_prefill_gfx1250_opus_fwd(aiter_tensor_t& q,
+                                        aiter_tensor_t& unified_kv,
+                                        aiter_tensor_t& kv_indices_prefix,
+                                        aiter_tensor_t& kv_indptr_prefix,
+                                        aiter_tensor_t& kv,
+                                        aiter_tensor_t& kv_indices_extend,
+                                        aiter_tensor_t& kv_indptr_extend,
+                                        aiter_tensor_t& attn_sink,
+                                        aiter_tensor_t& out,
+                                        float softmax_scale);
+
+// Public API: split-precision prefill attention for DeepSeek-V4 DSA.
 //
 // Q/KV are split into a NoPE part (fp8 MXFP8 with embedded E8M0 block scales) and
 // a RoPE part (bf16).
@@ -55,19 +71,33 @@ void pa_sparse_prefill_opus_fwd(aiter_tensor_t& q,
 //   attn_sink          : [H] fp32 (per-head softmax-denominator bias)
 //   out                : [N, H, 512] bf16 (caller-allocated)
 // `softmax_scale` is forwarded to the kernel as-is (no implicit 1/sqrt(D)).
-void pa_sparse_prefill_fp8_opus_fwd(aiter_tensor_t& q_nope,
-                                    aiter_tensor_t& q_rope,
-                                    aiter_tensor_t& unified_kv_nope,
-                                    aiter_tensor_t& unified_kv_rope,
-                                    aiter_tensor_t& kv_indices_prefix,
-                                    aiter_tensor_t& kv_indptr_prefix,
-                                    aiter_tensor_t& kv_nope,
-                                    aiter_tensor_t& kv_rope,
-                                    aiter_tensor_t& kv_indices_extend,
-                                    aiter_tensor_t& kv_indptr_extend,
-                                    aiter_tensor_t& attn_sink,
-                                    aiter_tensor_t& out,
-                                    float softmax_scale);
+void pa_sparse_prefill_fp8_gfx950_opus_fwd(aiter_tensor_t& q_nope,
+                                           aiter_tensor_t& q_rope,
+                                           aiter_tensor_t& unified_kv_nope,
+                                           aiter_tensor_t& unified_kv_rope,
+                                           aiter_tensor_t& kv_indices_prefix,
+                                           aiter_tensor_t& kv_indptr_prefix,
+                                           aiter_tensor_t& kv_nope,
+                                           aiter_tensor_t& kv_rope,
+                                           aiter_tensor_t& kv_indices_extend,
+                                           aiter_tensor_t& kv_indptr_extend,
+                                           aiter_tensor_t& attn_sink,
+                                           aiter_tensor_t& out,
+                                           float softmax_scale);
+
+void pa_sparse_prefill_fp8_gfx1250_opus_fwd(aiter_tensor_t& q_nope,
+                                            aiter_tensor_t& q_rope,
+                                            aiter_tensor_t& unified_kv_nope,
+                                            aiter_tensor_t& unified_kv_rope,
+                                            aiter_tensor_t& kv_indices_prefix,
+                                            aiter_tensor_t& kv_indptr_prefix,
+                                            aiter_tensor_t& kv_nope,
+                                            aiter_tensor_t& kv_rope,
+                                            aiter_tensor_t& kv_indices_extend,
+                                            aiter_tensor_t& kv_indptr_extend,
+                                            aiter_tensor_t& attn_sink,
+                                            aiter_tensor_t& out,
+                                            float softmax_scale);
 
 #ifdef PA_SPARSE_PREFILL_OPUS_IMPL
 // ============================================================================

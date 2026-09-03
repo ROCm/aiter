@@ -10,6 +10,7 @@ from flydsl._mlir.dialects import arith as _std_arith
 from flydsl._mlir.dialects import builtin
 from flydsl._mlir.dialects import gpu as _gpu
 from flydsl._mlir.dialects import llvm as _llvm
+from flydsl.expr import as_ir_value
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch, is_rdna_arch
 
@@ -25,6 +26,26 @@ def format_kernel_name(name: str) -> str:
     ``.amdhsa_kernel`` directive and the whole module fails to link.
     """
     return name.replace("-", "_")
+
+
+def uint32_to_int32(x: int) -> int:
+    """Return the signed int32 value with the same low 32-bit pattern."""
+    return x - (1 << 32) if x >= (1 << 31) else x
+
+
+def atomic_add_i32(memref, val, offset, syncscope):
+    """Atomically add an int32 value and return the previous value."""
+    ptr = fx.to_llvm_ptr(fx.get_iter(memref) + offset)
+    val = fx.Int32(val) if isinstance(val, int) else val
+    old = _llvm.AtomicRMWOp(
+        _llvm.AtomicBinOp.add,
+        ptr,
+        as_ir_value(val),
+        _llvm.AtomicOrdering.monotonic,
+        syncscope=syncscope,
+        alignment=4,
+    ).result
+    return fx.Int32(old)
 
 
 def get_warp_size(arch=None):

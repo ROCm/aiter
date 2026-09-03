@@ -63,25 +63,27 @@ def chunk_local_cumsum_scalar_kernel(
     else:
         bos, eos = i_b * T, i_b * T + T
 
+    # Plain pointer arithmetic rather than tl.make_block_ptr, which is not
+    # available in every Triton build we target.
+    o_t = i_t * BT + tl.arange(0, BT)
+    m_t = o_t < T
     if HEAD_FIRST:
-        p_s = tl.make_block_ptr(
-            s + bos * H + i_h * T, (T,), (1,), (i_t * BT,), (BT,), (0,)
-        )
-        p_o = tl.make_block_ptr(
-            o + bos * H + i_h * T, (T,), (1,), (i_t * BT,), (BT,), (0,)
-        )
+        s_base = s + bos * H + i_h * T
+        o_base = o + bos * H + i_h * T
+        stride_t = 1
     else:
-        p_s = tl.make_block_ptr(s + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
-        p_o = tl.make_block_ptr(o + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
+        s_base = s + bos * H + i_h
+        o_base = o + bos * H + i_h
+        stride_t = H
     # [BT]
-    b_s = tl.load(p_s, boundary_check=(0,)).to(tl.float32)
+    b_s = tl.load(s_base + o_t * stride_t, mask=m_t, other=0.0).to(tl.float32)
     b_o = tl.cumsum(b_s, axis=0)
     if REVERSE:
         b_z = tl.sum(b_s, axis=0)
         b_o = -b_o + b_z[None] + b_s
     if HAS_SCALE:
         b_o *= scale
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0,))
+    tl.store(o_base + o_t * stride_t, b_o.to(o_base.dtype.element_ty), mask=m_t)
 
 
 @triton.heuristics(
@@ -130,49 +132,29 @@ def chunk_local_cumsum_vector_kernel(
     else:
         bos, eos = i_b * T, i_b * T + T
 
+    # Plain pointer arithmetic rather than tl.make_block_ptr, which is not
+    # available in every Triton build we target.
+    o_t = i_t * BT + tl.arange(0, BT)
+    o_s = i_s * BS + tl.arange(0, BS)
+    msk = (o_t < T)[:, None] & (o_s < S)[None, :]
     if HEAD_FIRST:
-        p_s = tl.make_block_ptr(
-            s + (bos * H + i_h * T) * S,
-            (T, S),
-            (S, 1),
-            (i_t * BT, i_s * BS),
-            (BT, BS),
-            (1, 0),
-        )
-        p_o = tl.make_block_ptr(
-            o + (bos * H + i_h * T) * S,
-            (T, S),
-            (S, 1),
-            (i_t * BT, i_s * BS),
-            (BT, BS),
-            (1, 0),
-        )
+        s_base = s + (bos * H + i_h * T) * S
+        o_base = o + (bos * H + i_h * T) * S
+        stride_t = S
     else:
-        p_s = tl.make_block_ptr(
-            s + (bos * H + i_h) * S,
-            (T, S),
-            (H * S, 1),
-            (i_t * BT, i_s * BS),
-            (BT, BS),
-            (1, 0),
-        )
-        p_o = tl.make_block_ptr(
-            o + (bos * H + i_h) * S,
-            (T, S),
-            (H * S, 1),
-            (i_t * BT, i_s * BS),
-            (BT, BS),
-            (1, 0),
-        )
+        s_base = s + (bos * H + i_h) * S
+        o_base = o + (bos * H + i_h) * S
+        stride_t = H * S
+    offs = o_t[:, None] * stride_t + o_s[None, :]
     # [BT, BS]
-    b_s = tl.load(p_s, boundary_check=(0, 1)).to(tl.float32)
+    b_s = tl.load(s_base + offs, mask=msk, other=0.0).to(tl.float32)
     if REVERSE:
         b_o = tl.cumsum(b_s, axis=0, reverse=True)
     else:
         b_o = tl.cumsum(b_s, axis=0)
     if HAS_SCALE:
         b_o *= scale
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(o_base + offs, b_o.to(o_base.dtype.element_ty), mask=msk)
 
 
 def chunk_local_cumsum_scalar(

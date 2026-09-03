@@ -9,6 +9,10 @@
 // #endif
 
 #include "rocsolgemm.cuh"
+#include "aiter_stream.h"
+#include "aiter_hip_common.h"  // g_aiter_can_throw, AITER_CHECK
+#include "rocm_ops.hpp"        // pybind11 + namespace py + aiter_tensor_t caster
+#include <array>
 
 // #ifdef USE_ROCM
 // #define PYTORCH_ROCBLAS_VERSION_DECIMAL (ROCBLAS_VERSION_MAJOR * 100 + ROCBLAS_VERSION_MINOR)
@@ -254,24 +258,20 @@ std::endl;
 }
 */
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
-std::vector<rocblas_int> RocFindAllSolIdxBlas(const torch::Tensor& mat1, const torch::Tensor& mat2)
+std::vector<rocblas_int>
+RocFindAllSolIdxBlas(const aiter_tensor_t& mat1, const aiter_tensor_t& mat2, aiter_tensor_t& result)
 {
-    auto mat1_strides{mat1.strides()};
-    auto mat2_strides{mat2.strides()};
-    auto mat1_sizes{mat1.sizes()};
-    auto mat2_sizes{mat2.sizes()};
+    aiter_detail::g_aiter_can_throw = true;  // throw (not abort) on AITER_CHECK in pybind path
+    std::array<int64_t, 2> mat1_strides{mat1.stride(0), mat1.stride(1)};
+    std::array<int64_t, 2> mat2_strides{mat2.stride(0), mat2.stride(1)};
+    std::array<int64_t, 2> mat1_sizes{mat1.size(0), mat1.size(1)};
+    std::array<int64_t, 2> mat2_sizes{mat2.size(0), mat2.size(1)};
 
-    TORCH_CHECK(mat1.dim() == 2 && mat2.dim() == 2, "tensors must be 2-D");
-    TORCH_CHECK(mat1.dtype() == mat2.dtype(),
-                "expected mat1 and mat2 to have the same dtype, but got: ",
-                mat1.dtype(),
-                " != ",
-                mat2.dtype());
-    TORCH_CHECK(mat1_sizes[1] == mat2_sizes[0], "mat1 dim 1 must match mat2 dim 0");
+    AITER_CHECK(mat1.dim() == 2 && mat2.dim() == 2, "tensors must be 2-D");
+    AITER_CHECK(mat1.dtype() == mat2.dtype(), "expected mat1 and mat2 to have the same dtype");
+    AITER_CHECK(mat1_sizes[1] == mat2_sizes[0], "mat1 dim 1 must match mat2 dim 0");
 
-    auto abcType{mat1.options().dtype()};
-    auto options{at::TensorOptions().dtype(abcType).device(at::kCUDA)};
-    auto result{torch::empty({mat1_sizes[0], mat2_sizes[1]}, options)};
+    auto abcType = mat1.dtype();
 
     bool transpose_result = true;
     bool transpose_mat1;
@@ -305,10 +305,10 @@ std::vector<rocblas_int> RocFindAllSolIdxBlas(const torch::Tensor& mat1, const t
         bool tmp       = transpose_mat1;
         transpose_mat1 = !transpose_mat2;
         transpose_mat2 = !tmp;
-        mat1_strides   = mat2.strides();
-        mat2_strides   = mat1.strides();
-        mat1_sizes     = mat2.sizes();
-        mat2_sizes     = mat1.sizes();
+        mat1_strides   = {mat2.stride(0), mat2.stride(1)};
+        mat2_strides   = {mat1.stride(0), mat1.stride(1)};
+        mat1_sizes     = {mat2.size(0), mat2.size(1)};
+        mat2_sizes     = {mat1.size(0), mat1.size(1)};
     }
     float one{1.0f};
     float zero{0.0f};
@@ -322,20 +322,20 @@ std::vector<rocblas_int> RocFindAllSolIdxBlas(const torch::Tensor& mat1, const t
     void* ptrA{static_cast<void*>((transpose_result ? mat2 : mat1).data_ptr())};
     void* ptrB{static_cast<void*>((transpose_result ? mat1 : mat2).data_ptr())};
     void* ptrC{static_cast<void*>(result.data_ptr())};
-    auto current_stream{torch::hip::getCurrentHIPStream().stream()};
+    auto current_stream{aiter::getCurrentHIPStream()};
 
     rocblas_set_stream(r_handle, current_stream);
     uint32_t flags{0};
     rocblas_datatype abcRtype;
-    if(abcType == at::kHalf)
+    if(abcType == AITER_DTYPE_fp16)
     {
         abcRtype = rocblas_datatype_f16_r;
     }
-    else if(abcType == at::kBFloat16)
+    else if(abcType == AITER_DTYPE_bf16)
     {
         abcRtype = rocblas_datatype_bf16_r;
     }
-    else if(abcType == at::kFloat)
+    else if(abcType == AITER_DTYPE_fp32)
     {
         abcRtype = rocblas_datatype_f32_r;
     }
@@ -398,28 +398,22 @@ std::vector<rocblas_int> RocFindAllSolIdxBlas(const torch::Tensor& mat1, const t
     return validSolutions;
 }
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
-torch::Tensor
-RocSolIdxBlas(const torch::Tensor& mat1, const torch::Tensor& mat2, const int32_t solution_index)
+void RocSolIdxBlas(const aiter_tensor_t& mat1,
+                   const aiter_tensor_t& mat2,
+                   aiter_tensor_t& result,
+                   const int32_t solution_index)
 {
-    auto mat1_strides{mat1.strides()};
-    auto mat2_strides{mat2.strides()};
-    auto mat1_sizes{mat1.sizes()};
-    auto mat2_sizes{mat2.sizes()};
-    // std::cout << " | mat1 info: size: " << mat1_sizes << " stride: " << mat1_strides << std::endl
-    //           << " | mat2 info: size: " << mat2_sizes << " stride: " << mat2_strides <<
-    //           std::endl;
+    aiter_detail::g_aiter_can_throw = true;  // throw (not abort) on AITER_CHECK in pybind path
+    std::array<int64_t, 2> mat1_strides{mat1.stride(0), mat1.stride(1)};
+    std::array<int64_t, 2> mat2_strides{mat2.stride(0), mat2.stride(1)};
+    std::array<int64_t, 2> mat1_sizes{mat1.size(0), mat1.size(1)};
+    std::array<int64_t, 2> mat2_sizes{mat2.size(0), mat2.size(1)};
 
-    TORCH_CHECK(mat1.dim() == 2 && mat2.dim() == 2, "tensors must be 2-D");
-    TORCH_CHECK(mat1.dtype() == mat2.dtype(),
-                "expected mat1 and mat2 to have the same dtype, but got: ",
-                mat1.dtype(),
-                " != ",
-                mat2.dtype());
-    TORCH_CHECK(mat1_sizes[1] == mat2_sizes[0], "mat1 dim 1 must match mat2 dim 0");
+    AITER_CHECK(mat1.dim() == 2 && mat2.dim() == 2, "tensors must be 2-D");
+    AITER_CHECK(mat1.dtype() == mat2.dtype(), "expected mat1 and mat2 to have the same dtype");
+    AITER_CHECK(mat1_sizes[1] == mat2_sizes[0], "mat1 dim 1 must match mat2 dim 0");
 
-    auto abcType{mat1.options().dtype()};
-    auto options{at::TensorOptions().dtype(abcType).device(at::kCUDA)};
-    auto result{torch::empty({mat1_sizes[0], mat2_sizes[1]}, options)};
+    auto abcType = mat1.dtype();
     // std::cout << " | result info: size: " << result.sizes() << " stride: " << result.strides() <<
     // std::endl;
 
@@ -456,10 +450,10 @@ RocSolIdxBlas(const torch::Tensor& mat1, const torch::Tensor& mat2, const int32_
         bool tmp       = transpose_mat1;
         transpose_mat1 = !transpose_mat2;
         transpose_mat2 = !tmp;
-        mat1_strides   = mat2.strides();
-        mat2_strides   = mat1.strides();
-        mat1_sizes     = mat2.sizes();
-        mat2_sizes     = mat1.sizes();
+        mat1_strides   = {mat2.stride(0), mat2.stride(1)};
+        mat2_strides   = {mat1.stride(0), mat1.stride(1)};
+        mat1_sizes     = {mat2.size(0), mat2.size(1)};
+        mat2_sizes     = {mat1.size(0), mat1.size(1)};
     }
     // std::cout << " | transpose_result: " << (transpose_result ? "true" : "false") << std::endl
     //           << " | transpose_A: " << (transpose_mat1 ? "true" : "false") << std::endl
@@ -482,11 +476,11 @@ RocSolIdxBlas(const torch::Tensor& mat1, const torch::Tensor& mat2, const int32_
     /*
     int flag { 0 };
     hipblasDiagType_t hipblasType;
-    if (abcType == at::kHalf) {
+    if (abcType == AITER_DTYPE_fp16) {
       hipblasType = HIPBLAS_R_16F;
-    } else if (abcType == at::kBFloat16) {
+    } else if (abcType == AITER_DTYPE_bf16) {
       hipblasType = HIPBLAS_R_16B;
-    } else if (abcType == at::kFloat) {
+    } else if (abcType == AITER_DTYPE_fp32) {
       hipblasType = HIPBLAS_R_32F;
     } else {
       assert(false && "Wrong datatype!");
@@ -495,7 +489,7 @@ RocSolIdxBlas(const torch::Tensor& mat1, const torch::Tensor& mat2, const int32_
     void* ptrA{static_cast<void*>((transpose_result ? mat2 : mat1).data_ptr())};
     void* ptrB{static_cast<void*>((transpose_result ? mat1 : mat2).data_ptr())};
     void* ptrC{static_cast<void*>(result.data_ptr())};
-    auto current_stream{torch::hip::getCurrentHIPStream().stream()};
+    auto current_stream{aiter::getCurrentHIPStream()};
     /*
 
     CHECK_HIPBLAS_ERROR(hipblasLtMatmul_wrapper(
@@ -515,15 +509,15 @@ RocSolIdxBlas(const torch::Tensor& mat1, const torch::Tensor& mat2, const int32_
     uint32_t flags{0};
     // int32_t solution_index {0};
     rocblas_datatype abcRtype;
-    if(abcType == at::kHalf)
+    if(abcType == AITER_DTYPE_fp16)
     {
         abcRtype = rocblas_datatype_f16_r;
     }
-    else if(abcType == at::kBFloat16)
+    else if(abcType == AITER_DTYPE_bf16)
     {
         abcRtype = rocblas_datatype_bf16_r;
     }
-    else if(abcType == at::kFloat)
+    else if(abcType == AITER_DTYPE_fp32)
     {
         abcRtype = rocblas_datatype_f32_r;
     }
@@ -558,8 +552,6 @@ RocSolIdxBlas(const torch::Tensor& mat1, const torch::Tensor& mat2, const int32_
                     solution_index,
                     flags);
     //);
-
-    return result;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -605,8 +597,20 @@ void rocb_destroy_extension()
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
+    AITER_SET_STREAM_PYBIND;
     m.def("rocb_create_extension", &rocb_create_extension, "create_extension");
     m.def("rocb_destroy_extension", &rocb_destroy_extension, "destroy_extension");
-    m.def("rocb_mm", &RocSolIdxBlas, "mm");
-    m.def("rocb_findallsols", &RocFindAllSolIdxBlas, "rocblas_find_all_sols");
+    m.def("rocb_mm",
+          &RocSolIdxBlas,
+          "mm",
+          py::arg("mat1"),
+          py::arg("mat2"),
+          py::arg("result"),
+          py::arg("solution_index") = 0);
+    m.def("rocb_findallsols",
+          &RocFindAllSolIdxBlas,
+          "rocblas_find_all_sols",
+          py::arg("mat1"),
+          py::arg("mat2"),
+          py::arg("result"));
 }

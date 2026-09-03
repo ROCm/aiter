@@ -30,6 +30,14 @@ _GFX942_A16W16_TAGS = (
     )
     + _NOSPLIT
 )
+# Pre-compiled (.co) a16w16 families: device code comes from an offline build
+# (csrc/opus_gemm/gen_co), not from the JIT. They are a16w16 tags like any other
+# -- same input dtypes, same tune-lookup machinery -- but they get their own
+# launcher signature and their own dispatch table, because none of them needs
+# the workspace argument the gfx1250 split-K families carry. A future split-K
+# .co family would drop out of this tuple and back into the workspace ABI.
+_A16W16_CO_TAGS = ("a16w16_4wave_co", "a16w16_4wave_wl_co")
+
 _A16W16_TAGS = (
     "a16w16",
     "a16w16_flatmm",
@@ -43,6 +51,7 @@ _A16W16_TAGS = (
     # gfx1250 FUSED single-kernel in-cluster split-K reduce (no reduce kernel);
     # B multicast + GL2-resident partial workspace + cluster-barrier sync.
     "a16w16_clusterlaunch_tdm_splitk_fuse",
+    *_A16W16_CO_TAGS,
 ) + _GFX942_A16W16_TAGS
 
 EMIT_REGISTRY = {}

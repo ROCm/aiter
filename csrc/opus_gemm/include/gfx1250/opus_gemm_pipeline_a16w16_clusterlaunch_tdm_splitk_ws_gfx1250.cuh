@@ -486,13 +486,9 @@ void gemm_a16w16_clusterlaunch_tdm_splitk_ws_kernel_gfx1250(opus_gemm_cluster_td
 
     // ---- Store the partial into ws[split_idx][padded_m][padded_n]. ----
     // bias is folded once by the reduce kernel (not here).
-    // OPUS_WS_BF16 (default 1): downcast the fp32 accumulator to bf16 (DataA) so
-    // the split-K-dominated reduce READ moves half the bytes (reduce re-accumulates
-    // in fp32). The reduce kernel is instantiated with the matching D_WS.
-#ifndef OPUS_WS_BF16
-#define OPUS_WS_BF16 1
-#endif
-    using DataWs          = typename std::conditional<(OPUS_WS_BF16 != 0), DataA, DataAcc>::type;
+    // The partial type is the traits' D_C -- per kid (splitk_workspace_dtype), and
+    // the reduce is instantiated with the same D_C so the two cannot diverge.
+    using DataWs          = typename T::DataC;
     constexpr int kCVec   = T::kCVec; // 4 (fp32 dwordx4 / bf16 dwordx2)
     DataWs* ws_ptr        = reinterpret_cast<DataWs*>(kargs.ptr_ws);
     const size_t ws_split = (size_t)split_idx * (size_t)kargs.stride_ws_batch;

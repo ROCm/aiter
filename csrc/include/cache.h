@@ -106,7 +106,10 @@ void indexer_qk_rope_quant_and_cache(
     const std::string& scale_fmt,
     double weights_scale,
     bool preshuffle = false,
-    bool is_neox = true);
+    bool is_neox = true,
+    // false: slot<0 skips Q and K; true (DCP): compute Q for every row and
+    // guard only the owner-specific K-cache write.
+    bool compute_all_q_rope = false);
 
 void cp_gather_indexer_k_quant_cache(
     const aiter_tensor_t& kv_cache,     // [num_blocks, block_size, cache_stride]

@@ -14,6 +14,11 @@
  * limitations under the License.
  */
 
+// This translation unit is torch-free: define AITER_NO_TORCH_TYPES before any
+// aiter header so aiter_opus_plus.h does not pull in the c10 half/bfloat16
+// headers. The kernels use aiter::hip2opus + the _rmTorch dispatch macros, never
+// the t2opus<c10::*> specializations, so nothing here needs torch/ATen/c10.
+#define AITER_NO_TORCH_TYPES
 #include <cmath>
 #include <cstdlib>
 #include <type_traits>
@@ -3266,7 +3271,8 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                                                 bool use_shuffle_layout,
                                                 int64_t block_size,
                                                 int64_t x,
-                                                int64_t rotary_dim)
+                                                int64_t rotary_dim,
+                                                bool v_norm)
 {
     AITER_CHECK(qkv.is_contiguous() && qw.is_contiguous() && kw.is_contiguous() &&
                 cos_sin.is_contiguous());
@@ -3335,7 +3341,8 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                     k_cache_token_stride,
                     k_cache_head_stride,
                     v_cache_token_stride,
-                    v_cache_head_stride);
+                    v_cache_head_stride,
+                    v_norm);
             }
             else
             {
@@ -3386,7 +3393,8 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                             k_cache_token_stride,
                             k_cache_head_stride,
                             v_cache_token_stride,
-                            v_cache_head_stride);
+                            v_cache_head_stride,
+                            v_norm);
                     }
                     else
                     {
@@ -3433,7 +3441,8 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                             k_cache_token_stride,
                             k_cache_head_stride,
                             v_cache_token_stride,
-                            v_cache_head_stride);
+                            v_cache_head_stride,
+                            v_norm);
                     }
                 }
                 else

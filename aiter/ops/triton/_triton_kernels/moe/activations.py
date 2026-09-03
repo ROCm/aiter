@@ -1,5 +1,6 @@
 import triton
 import triton.language as tl
+from triton.language.extra.libdevice import fast_dividef
 
 
 @triton.jit
@@ -25,7 +26,7 @@ def _swiglu(input, alpha, limit, ADD_RESIDUAL: tl.constexpr):
     linear = linear.to(tl.float32)
     if limit is not None:
         linear = clip(linear, limit, clip_lower=True)
-    s = gelu / (1 + tl.exp2(-1.44269504089 * alpha * gelu))
+    s = fast_dividef(gelu, 1 + tl.exp2(-1.44269504089 * alpha * gelu))
     if ADD_RESIDUAL:
         return tl.fma(s, linear, s)  # s * (linear + 1)
     else:

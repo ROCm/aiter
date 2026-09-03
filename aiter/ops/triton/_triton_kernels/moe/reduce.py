@@ -2,9 +2,24 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
+_reduce_grouped_repr = make_kernel_repr(
+    "_reduce_grouped",
+    [
+        "BLOCK_N",
+        "EVEN_N",
+        "K",
+        "APPLY_SWIGLU",
+        "ACTIVATION_REDUCTION_N",
+        "SWIGLU_ADD_RESIDUAL",
+        "USE_TDM",
+        "HAS_EXT_RESIDUAL",
+    ],
+)
 
 
-@triton.jit
+@triton.jit(repr=_reduce_grouped_repr)
 def _reduce_grouped(
     X,
     stride_xb: tl.uint64,

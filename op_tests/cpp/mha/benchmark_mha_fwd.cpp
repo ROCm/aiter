@@ -7,6 +7,14 @@
 #include "rotary.hpp"
 #include "utils.hpp"
 
+// -fwd_v3=2 reaches the opus kernels. Their entry point `fmha_fwd_bf16_opus_fwd` is
+// torch-facing while libmha_fwd is built torch-free, so both it and this benchmark go
+// through the shared launch layer below, and this executable owns its own device kernel
+// instantiation. Off gfx950 the kernels expand to an empty stub, which keeps the build
+// working on every other arch.
+#define FMHA_FWD_BF16_OPUS_LAUNCH_IMPL
+#include "fmha_fwd_bf16_opus_launch.h"
+
 #include <array>
 #include <cstring>
 #include <functional>
@@ -108,7 +116,10 @@ auto create_args(int argc, char* argv[])
         .insert("v3_bf16_cvt",
                 "1",
                 "float to bf16 convert type when bwd_v3 is set to 1, 0:RTNE; 1:RTNA; 2:RTZ")
-        .insert("fwd_v3", "0", "if set to 1, some cases will call the fwd v3 kernel")
+        .insert("fwd_v3",
+                "0",
+                "0: not used, 1: some cases will call the fwd v3(asm) kernel,\n"
+                "2: call the opus kernel")
         .insert("is_v3_check",
                 "0",
                 "if set to 1, check whether the input scenarios is supported by the asm kernel.");
@@ -426,7 +437,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
     int stream_warmup = arg_parser.get_int("warmup");
     int stream_repeat = arg_parser.get_int("repeat");
     bool kname        = arg_parser.get_bool("kname");
-    bool fwd_v3       = arg_parser.get_bool("fwd_v3");
+    int fwd_v3        = arg_parser.get_int("fwd_v3");
     bool is_v3_check  = arg_parser.get_bool("is_v3_check");
     int v3_bf16_cvt   = arg_parser.get_int("v3_bf16_cvt");
 
@@ -1024,7 +1035,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
                 {
                     args.drop_seed_offset = std::make_pair(drop_seed, drop_offset);
                 }
-                args.use_asm_v3          = fwd_v3;
+                args.use_asm_v3          = (fwd_v3 == 1);
                 args.how_v3_bf16_cvt     = v3_bf16_cvt;
                 args.v3_api_check        = is_v3_check;
                 args.data_type           = data_type;
@@ -1124,6 +1135,69 @@ bool run(const ck_tile::ArgParser& arg_parser)
     };
 
     const float fwd_ave_time = [&] {
+        if(fwd_v3 == 2)
+        {
+            const bool is_group = (mode == mode_enum::group);
+
+            fmha_fwd_bf16_opus_args opus_args{};
+            opus_args.q_ptr     = q_buf.GetDeviceBuffer();
+            opus_args.k_ptr     = k_buf.GetDeviceBuffer();
+            opus_args.v_ptr     = v_buf.GetDeviceBuffer();
+            opus_args.o_ptr     = o_buf.GetDeviceBuffer();
+            opus_args.lse_ptr   = (lse ? lse_buf.GetDeviceBuffer() : nullptr);
+            opus_args.data_type = data_type;
+
+            // seqstart_q/k already hold the padded starts when a padded seqlen_k was asked
+            // for, so the same pair covers the real and the physical role either way.
+            if(is_group)
+            {
+                const int* sq            = static_cast<const int*>(seqstart_q.GetDeviceBuffer());
+                const int* sk            = static_cast<const int*>(seqstart_k.GetDeviceBuffer());
+                opus_args.seqstart_q_ptr = sq;
+                opus_args.seqstart_k_ptr = sk;
+                opus_args.seqstart_q_pad_ptr = sq;
+                opus_args.seqstart_k_pad_ptr = sk;
+            }
+
+            opus_args.batch    = batch;
+            opus_args.nhead    = nhead;
+            opus_args.nhead_k  = nhead_k;
+            opus_args.seqlen_q = (is_group ? max_seqlen_q : shape_seqlen_q);
+            opus_args.seqlen_k = (is_group ? max_seqlen_k : shape_seqlen_k);
+            opus_args.hdim_q   = hdim_q;
+            opus_args.hdim_v   = hdim_v;
+
+            // Same layout arithmetic init_args uses: iperm/operm pick bhsd over bshd. Group
+            // mode packs every sequence into one buffer and locates the group through
+            // seqstart, so the batch stride drops out there.
+            opus_args.stride_q_n = (i_perm ? hdim_q : nhead * hdim_q);
+            opus_args.stride_q_h = (i_perm ? shape_seqlen_q * hdim_q : hdim_q);
+            opus_args.stride_k_n = (i_perm ? hdim_q : nhead_k * hdim_q);
+            opus_args.stride_k_h = (i_perm ? shape_seqlen_k * hdim_q : hdim_q);
+            opus_args.stride_v_n = (i_perm ? hdim_v : nhead_k * hdim_v);
+            opus_args.stride_v_h = (i_perm ? shape_seqlen_k * hdim_v : hdim_v);
+            opus_args.stride_o_n = (o_perm ? hdim_v : nhead * hdim_v);
+            opus_args.stride_o_h = (o_perm ? shape_seqlen_q * hdim_v : hdim_v);
+            opus_args.stride_q_b = (is_group ? 0 : nhead * shape_seqlen_q * hdim_q);
+            opus_args.stride_k_b = (is_group ? 0 : nhead_k * shape_seqlen_k * hdim_q);
+            opus_args.stride_v_b = (is_group ? 0 : nhead_k * shape_seqlen_k * hdim_v);
+            opus_args.stride_o_b = (is_group ? 0 : nhead * shape_seqlen_q * hdim_v);
+
+            // lse is [batch, nhead, seqlen_q] here, which collapses to [nhead, total_q] in
+            // group mode because shape_batch is 1 there.
+            opus_args.stride_lse_b = (is_group ? 0 : nhead * shape_seqlen_q);
+            opus_args.stride_lse_h = shape_seqlen_q;
+
+            opus_args.softmax_scale = scale_s;
+            opus_args.causal        = (mask.type != mask_enum::no_mask);
+
+            bool launched = true;
+            const float t =
+                ck_tile::launch_kernel(stream_config, [&](const ck_tile::stream_config& s_) {
+                    launched = fmha_fwd_bf16_opus_launch(opus_args, s_.stream_id_);
+                });
+            return launched ? t : -1.f;
+        }
 #if CK_TILE_FMHA_FWD_SPLITKV_API
         if(1 < num_splits || use_kvcache)
         {

@@ -337,7 +337,7 @@ def _run_grouped_via_fused_moe(
     """Build mxfp4 weights + routing, dispatch through ``fused_moe``.
 
     Stage1 weights are always laid out GUGU (gate/up row-interleaved) paired
-    with ``GateMode.INTERLEAVE``, which is the only layout the felix TDM grouped
+    with ``GateMode.INTERLEAVE``, which is the only layout the TDM grouped
     GEMM reads. The PyTorch reference evaluates the GGUU logical weights, so the
     numerical result is unchanged.
 
@@ -805,7 +805,7 @@ def _mock_grouped_gemm() -> None:
     scale preshuffle, m-tile map, gather-reduce) run on any arch (e.g. gfx942
     via AITER_FORCE_GFX1250=1):
 
-    1. Replace the felix TDM grouped GEMM with a no-op -- the GEMM executes
+    1. Replace the TDM grouped GEMM with a no-op -- the GEMM executes
        nothing; stage outputs are left as-is.
     2. Route the fp4 a1/a2 quant through the Triton implementation, since the
        HIP ``per_1x32_f4_quant_hip`` has no fp4x2 output support off gfx1250.

@@ -17,6 +17,8 @@ import torch
 from flydsl.runtime.device import get_rocm_arch
 from mori.shmem import mori_shmem_create_tensor
 
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+
 from .communication_ops_utils import GeometryTuningTable
 from .flydsl_dispatch_combine_intranode_kernel import (
     make_combine_jit,
@@ -880,8 +882,6 @@ class FlyDSLDispatchCombineIntraNodeOp:
 
     def _check_lds_capacity(self):
         """Reject configs whose combine-kernel LDS overflows the GPU."""
-        from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
-
         cfg = self.cfg
 
         # Mirror make_combine_jit's LDS layout: two 8B-aligned i64[npes] tables.
@@ -894,8 +894,11 @@ class FlyDSLDispatchCombineIntraNodeOp:
         lds_bytes = max(_align(ptr, 128), 128)
 
         arch = get_rocm_arch()
-        limit = SMEM_CAPACITY_MAP.get(arch)
-        if limit is not None and lds_bytes > limit:
+        try:
+            limit = get_lds_capacity_bytes(arch)
+        except ValueError:
+            return
+        if lds_bytes > limit:
             raise RuntimeError(
                 f"combine kernel LDS needs {lds_bytes} B "
                 f"(2 x i64[world_size={cfg.world_size}] P2P tables + 128 B arena), "

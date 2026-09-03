@@ -1,25 +1,28 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""GEMM config loading: ``get_gemm_config()`` plus the splitk / num-stages
+helpers, on top of the shared core in ``config_utils``.
+"""
+
 import copy
 import functools
 import itertools
-import os
 
 import triton
 
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.core import (
-    AITER_TRITON_CONFIGS_PATH,
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+logger = AiterTritonLogger()
+
+from aiter.ops.triton.utils.config_utils import (
     USE_LRU_CACHE,
     load_config_json,
+    resolve_config_dir,
 )
 
-# Standard bounds for M_LEQ_x keys (tuple for hashability with LRU cache)
 STANDARD_M_BOUNDS = (1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
-
-
-def _dtype_dir(config_name: str) -> str:
-    """Nested-layout directory for a config family:
-    ``GEMM-AFP4WFP4`` -> ``gemm_afp4wfp4``."""
-    return config_name.lower().replace("-", "_")
 
 
 @functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
@@ -30,7 +33,7 @@ def _get_gemm_config_cached(
     K: int | None = None,
     bounds: tuple[int, ...] | None = None,
     specialized_filename: str | None = None,
-    backend: str | None = None,
+    backend: str = "triton",
     B: int | None = None,
 ) -> tuple[dict, bool]:
     """
@@ -39,8 +42,8 @@ def _get_gemm_config_cached(
     callers can freely mutate the returned dict without polluting the cache.
 
     Resolves from ``<arch>/<backend>/gemm/<d_type>/`` (prefix-less filenames,
-    default named ``DEFAULT.json``) first; ``backend=None`` tries triton then
-    gluon. Falls back to the legacy flat ``gemm/`` layout (arch-prefixed) for unmigrated configs.
+    default named ``DEFAULT.json``). ``backend`` is declared by the caller and
+    defaults to ``"triton"``; there is no cross-backend fallback.
     """
     # Input validation
     assert M >= 0, "M must be positive."
@@ -52,45 +55,13 @@ def _get_gemm_config_cached(
         and all(x < y for x, y in itertools.pairwise(bounds))
     ), "When provided, bounds must be a non-empty tuple of strictly increasing positive numbers."
 
-    dev = arch_info.get_arch()
-
-    # Nested layout <arch>/<backend>/gemm/<d_type>/ (no arch prefix, default
-    # named DEFAULT.json) first, then legacy flat gemm/ (arch-prefixed) for unmigrated configs.
-    # TODO(satya): drop the legacy dirs once all configs are migrated.
-    dtype_dir = _dtype_dir(config_name)
-    arch_prefix = f"{dev}-"
-    if backend is None:
-        candidate_dirs = [
-            (f"{AITER_TRITON_CONFIGS_PATH}/{dev}/triton/gemm/{dtype_dir}", ""),
-            (f"{AITER_TRITON_CONFIGS_PATH}/{dev}/gluon/gemm/{dtype_dir}", ""),
-            (
-                f"{AITER_TRITON_CONFIGS_PATH}/gemm",
-                arch_prefix,
-            ),  # TODO(satya): legacy, remove
-        ]
-    else:
-        candidate_dirs = [
-            (f"{AITER_TRITON_CONFIGS_PATH}/{dev}/{backend}/gemm/{dtype_dir}", ""),
-            (
-                f"{AITER_TRITON_CONFIGS_PATH}/gemm/{backend}",
-                arch_prefix,
-            ),  # TODO(satya): legacy, remove
-            (
-                f"{AITER_TRITON_CONFIGS_PATH}/gemm",
-                arch_prefix,
-            ),  # TODO(satya): legacy, remove
-        ]
-    cfg_dir, name_prefix = candidate_dirs[-1]
-    default_stem = f"{name_prefix}{config_name}"
-    for _dir, _prefix in candidate_dirs:
-        # Nested dirs (empty prefix) name their default DEFAULT.json.
-        _stem = f"{_prefix}{config_name}" if _prefix else "DEFAULT"
-        if os.path.exists(f"{_dir}/{_stem}.json"):
-            cfg_dir, name_prefix, default_stem = _dir, _prefix, _stem
-            break
+    # Every GEMM family lives in the nested layout <arch>/<backend>/gemm/
+    # <d_type>/ (no arch prefix, default named DEFAULT.json); the shared path
+    # builder lives in resolve_config_dir().
+    cfg_dir = resolve_config_dir("gemm", config_name, backend=backend)
 
     # Load default config (must exist)
-    default_fpath = f"{cfg_dir}/{default_stem}.json"
+    default_fpath = f"{cfg_dir}/DEFAULT.json"
     config_dict = load_config_json(default_fpath, required=False)
     if config_dict is None:
         raise AssertionError(f"Required config file doesn't exist: {default_fpath}")
@@ -109,7 +80,7 @@ def _get_gemm_config_cached(
     is_tuned = False
     for suffix in specialized_suffixes:
         specialized_config = load_config_json(
-            f"{cfg_dir}/{name_prefix}{config_name}-{suffix}.json", required=False
+            f"{cfg_dir}/{config_name}-{suffix}.json", required=False
         )
         if specialized_config is not None:
             config_dict, is_tuned = specialized_config, True
@@ -146,7 +117,7 @@ def get_gemm_config(
     K: int | None = None,
     bounds: tuple[int, ...] | None = None,
     specialized_filename: str | None = None,
-    backend: str | None = None,
+    backend: str = "triton",
     B: int | None = None,
 ) -> tuple[dict, bool]:
     """
@@ -154,7 +125,7 @@ def get_gemm_config(
 
     This function provides a unified way to load GEMM configs across all kernels.
     It uses the following logic:
-    1. Load default config file: <d_type>/DEFAULT.json (legacy: {arch}-{config_name}.json)
+    1. Load default config file: <d_type>/DEFAULT.json
     2. If B, N and K are provided, try B-specialized config: {config_name}-B={B}-N={N}-K={K}.json
     3. If N and K are provided, try to load specialized config: {config_name}-N={N}-K={K}.json
        Or if specialized_filename is provided, use: {config_name}-{specialized_filename}.json
@@ -169,7 +140,9 @@ def get_gemm_config(
         K: K dimension of the GEMM (optional)
         bounds: Custom bounds to use instead of STANDARD_M_BOUNDS (optional)
         specialized_filename: Custom specialized filename suffix (optional)
-        backend: Backend name for per-backend config subdirectory (optional)
+        backend: Backend whose config directory to read, "triton" (default)
+            or "gluon". Declared by the caller; there is no fallback to
+            the other backend.
         B: Batch dimension for batched GEMM (optional)
 
     Returns:

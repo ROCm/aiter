@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+// This translation unit is torch-free: define AITER_NO_TORCH_TYPES before any
+// aiter header so aiter_opus_plus.h does not pull in the c10 half/bfloat16
+// headers. The kernels use aiter::hip2opus + the _rmTorch dispatch macros, never
+// the t2opus<c10::*> specializations, so nothing here needs torch/ATen/c10.
+#define AITER_NO_TORCH_TYPES
 #include "aiter_hip_common.h"
 #include "aiter_dispatch.h"
 #include "aiter_opus_plus.h"
@@ -1157,9 +1162,9 @@ __global__ void norm_rope_hadamard_rotate_activation_fp4quant_kvcache_kernel(DTY
     const int m_oob            = m - row_base < m_block ? m - row_base : m_block;
     const int64_t row_offset   = static_cast<int64_t>(row_base) * stride;
     const int load_offset      = threadIdx.x * vec_size;
-    const int store_offset     = std::is_same_v<DTYPE_O, opus::fp4_t> ? load_offset / 2 : load_offset;
     const int row_in_block     = load_offset / dim;
     const int col_offset       = load_offset - row_in_block * dim;
+    const int store_offset     = std::is_same_v<DTYPE_O, opus::fp4_t> ? col_offset / 2 : col_offset;
     const int32_t row_idx      = row_base + row_in_block;
     const int32_t safe_row_idx = row_idx < m ? row_idx : m - 1;
     const int32_t token_id     = safe_row_idx >> log2_head_num;

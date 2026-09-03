@@ -406,8 +406,10 @@ PR titles carry two kinds of bracket tags.
 **Component tags — applied automatically.** A GitHub Action
 (`.github/workflows/pr-title-tags.yaml`) derives these from the files the PR
 changes and keeps them in sync on every push, so you don't need to add them
-yourself. Hand-written variants (`[TRITON]`, `[Gluon]`, `[CK_TILE]`, `[Doc]`,
-...) are normalized to the canonical forms:
+yourself. The same components are also applied as PR labels (the title shows
+at most three; the labels carry the full set). Hand-written variants
+(`[TRITON]`, `[Gluon]`, `[CK_TILE]`, `[Doc]`, ...) are normalized to the
+canonical forms:
 
 * `[Triton/Gluon]` - Triton/Gluon kernels (`aiter/ops/triton/`, `aiter/aot/triton/`, triton tests and benchmarks)
 * `[ASM]` - assembly kernels (`hsa/`, `*_asm.py`)

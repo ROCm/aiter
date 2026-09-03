@@ -48,6 +48,23 @@ def gemm_a8w4_mxfp8(
     ``B.shape == [N, K/2]``."""
     M = A.shape[0]
     N = B.shape[0]
+    K = A.shape[1]
+    if dtype != dtypes.bf16:
+        raise NotImplementedError(
+            f"gfx1250 a8w4 MXFP8xMXFP4 GEMM: unsupported output dtype {dtype}"
+        )
+    if K % 128 != 0:  # A (m/2,k/128) preshuffle
+        raise NotImplementedError(
+            f"gfx1250 a8w4 MXFP8xMXFP4 GEMM requires K%128==0, got K={K}"
+        )
+    if N % 16 != 0:  # B 16x16 preshuffle
+        raise NotImplementedError(
+            f"gfx1250 a8w4 MXFP8xMXFP4 GEMM requires N%16==0, got N={N}"
+        )
+    if a_preshuffle and M % 2 != 0:  # A (m/2,k/128) preshuffle
+        raise NotImplementedError(
+            f"gfx1250 a8w4 MXFP8xMXFP4 GEMM a_preshuffle requires M%2==0, got M={M}"
+        )
     out = torch.empty((M, N), dtype=dtype, device=A.device)
     _mxfp8_mxfp4_gemm_asm(
         A,

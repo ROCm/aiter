@@ -68,6 +68,26 @@ def get_gfx():
     return GFX_MAP.get(gfx_num, "unknown")
 
 
+_LDS_CAPACITY_BYTES = {
+    "gfx90a": 64 * 1024,
+    "gfx942": 64 * 1024,
+    "gfx950": 160 * 1024,
+    "gfx1100": 64 * 1024,
+    "gfx1151": 64 * 1024,
+    "gfx1201": 64 * 1024,
+    "gfx1250": 320 * 1024,
+}
+
+
+def get_lds_capacity_bytes(gfx: str | None = None) -> int:
+    """Return the architectural LDS capacity for one workgroup."""
+    arch = (gfx or get_gfx()).split(":", 1)[0].lower()
+    try:
+        return _LDS_CAPACITY_BYTES[arch]
+    except KeyError as exc:
+        raise ValueError(f"Unknown LDS capacity for architecture {arch!r}") from exc
+
+
 @functools.lru_cache(maxsize=1)
 def get_gfx_runtime() -> str:
     """Return the arch of the live GPU, always via rocminfo.

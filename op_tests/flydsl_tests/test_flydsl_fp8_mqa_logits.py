@@ -10,6 +10,7 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl import flydsl_fp8_mqa_logits
 from aiter.ops.triton.attention.fp8_mqa_logits import fp8_mqa_logits as triton_logits
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from op_tests.triton_tests.attention.test_fp8_mqa_logits import (
@@ -24,11 +25,6 @@ torch.set_default_device("cuda")
 
 SUPPORTED_GFX = ["gfx942"]
 DTYPE_MAP = {"fnuz": e4m3_type, "fn": torch.float8_e4m3fn}
-
-try:
-    from aiter.ops.flydsl import flydsl_fp8_mqa_logits
-except ImportError:
-    flydsl_fp8_mqa_logits = None
 
 
 def _make_windows(s_q, s_k, mode):
@@ -144,9 +140,6 @@ def _cp_eligible(s_q, s_k):
 def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning("fp8_mqa_logits unsupported on %s; skipping", get_gfx())
-        return
-    if flydsl_fp8_mqa_logits is None:
-        aiter.logger.warning("flydsl package not installed; skipping")
         return
 
     parser = argparse.ArgumentParser(
