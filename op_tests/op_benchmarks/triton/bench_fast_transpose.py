@@ -24,9 +24,9 @@ def benchmark(args):
         x_names=["M", "N"],
         x_vals=x_vals,
         line_arg="provider",
-        line_vals=["triton"],
-        line_names=[f"fast_transpose ({unit})"],
-        styles=[("green", "-")],
+        line_vals=["triton", "torch"],
+        line_names=[f"fast_transpose ({unit})", f"torch t().contiguous() ({unit})"],
+        styles=[("green", "-"), ("blue", "-")],
         ylabel=unit,
         plot_name=get_caller_name_no_ext(),
         args={},
@@ -35,7 +35,11 @@ def benchmark(args):
     @triton.testing.perf_report([config])
     def _run(M, N, provider):
         x = torch.randn(M, N, device="cuda").to(dtype)
-        ms = triton.testing.do_bench(lambda: fast_transpose_2d(x), warmup=25, rep=100)
+        if provider == "torch":
+            fn = lambda: x.t().contiguous()
+        else:
+            fn = lambda: fast_transpose_2d(x)
+        ms = triton.testing.do_bench(fn, warmup=25, rep=100)
         if args.metric == "time":
             return ms
         # read M*N + write N*M elements
