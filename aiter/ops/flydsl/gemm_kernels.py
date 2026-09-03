@@ -701,8 +701,13 @@ def _register_all_configs():
 _register_all_configs()
 
 
+# Captured split-K semaphore/signal workspaces are kept alive for the process
+# lifetime so the graph-recorded zero-fill has valid backing storage on replay.
+_captured_split_k_keepalive: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+
 @functools.lru_cache(maxsize=128)
-def _get_split_k_tensors(
+def _get_split_k_tensors_cached(
     device: torch.device,
     stream: torch.cuda.Stream,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -711,6 +716,31 @@ def _get_split_k_tensors(
     )
     signal = torch.zeros((SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int32, device=device)
     return semaphore, signal
+
+
+def _get_split_k_tensors(
+    device: torch.device,
+    stream: torch.cuda.Stream,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # During CUDA-graph capture the stream-cached buffers are unsafe: their
+    # zero-init ran once, eagerly, before capture, so it is not part of the graph.
+    # The split-K reduction decrements these counters as workgroups retire; on
+    # graph *replay* they are never re-zeroed, so the "last workgroup" reduction
+    # handshake never re-arms and the kernel hangs (the same failure mode fixed
+    # for the a16w16 ASM GEMM path in ROCm/aiter#4494). Allocate a fresh, zeroed
+    # workspace per capture so the zero-fill is recorded as a graph node and
+    # re-establishes the initial state on every replay; keep it alive for the
+    # process lifetime.
+    if torch.cuda.is_current_stream_capturing():
+        semaphore = torch.zeros(
+            (SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int32, device=device
+        )
+        signal = torch.zeros(
+            (SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int32, device=device
+        )
+        _captured_split_k_keepalive.append((semaphore, signal))
+        return semaphore, signal
+    return _get_split_k_tensors_cached(device, stream)
 
 
 def _check_split_k_semaphore_capacity(
