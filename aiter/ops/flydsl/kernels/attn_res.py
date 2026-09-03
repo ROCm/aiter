@@ -316,14 +316,10 @@ def _build_attn_res(
         local_tid = fx.Int32(fx.get(row_coord, 1))
         token = fx.block_idx.x * rows_per_wg + wg_row
         fm_fast = arith.FastMathFlags.fast
-        vec_layout = fx.make_layout(
-            (tiles_per_thread, row_threads), (row_threads, 1)
-        )
+        vec_layout = fx.make_layout((tiles_per_thread, row_threads), (row_threads, 1))
 
         def vector_index_for(tile):
-            return fx.Int32(
-                fx.get_scalar(fx.crd2idx((tile, local_tid), vec_layout))
-            )
+            return fx.Int32(fx.get_scalar(fx.crd2idx((tile, local_tid), vec_layout)))
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         pingpong_layout = fx.make_layout(
@@ -442,9 +438,7 @@ def _build_attn_res(
                 block_div = fx.logical_divide(block_row, vector_layout)
                 handles = []
                 for tile in range_constexpr(tiles_per_thread):
-                    handles.append(
-                        issue_bf16_vec(block_div, vector_index_for(tile))
-                    )
+                    handles.append(issue_bf16_vec(block_div, vector_index_for(tile)))
                 return handles
 
             def load_issued_source(handles):

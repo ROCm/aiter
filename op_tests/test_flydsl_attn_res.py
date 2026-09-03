@@ -43,7 +43,7 @@ _SUPPORTED_GFX = ("gfx942", "gfx950")
 def _supported_gfx() -> bool:
     try:
         return get_gfx() in _SUPPORTED_GFX
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -482,9 +482,7 @@ def benchmark_flydsl_attn_res(
 
 def main():
     if get_gfx() not in _SUPPORTED_GFX:
-        aiter.logger.warning(
-            "flydsl_attn_res unsupported on %s; skipping", get_gfx()
-        )
+        aiter.logger.warning("flydsl_attn_res unsupported on %s; skipping", get_gfx())
         return
 
     parser = argparse.ArgumentParser(description=__doc__)
