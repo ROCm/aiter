@@ -338,59 +338,17 @@ def run_vllm_wvsplitk_bf16(input, weight, bias=None, otype=dtypes.bf16):
     return _VLLM_WVSPLITK_OP(weight, input, bias, get_cu_num())
 
 
-_flydsl_decode_graphs = {}
-
-
 def run_flydsl_decode_bf16(input, weight, output, bias, otype, arch, config):
     """Run one exact-shape unified decode candidate for the shared tuner."""
+    del arch
     if gemm_decode_bf16 is None:
         raise RuntimeError(f"flydsl is not available for tuning: {FLYDSL_TUNE_ERROR}")
     if otype != dtypes.bf16:
         raise ValueError("FlyDSL decode candidates require BF16 output")
-    m, k = input.shape
-    n = weight.shape[0]
-    key = (
-        input.data_ptr(),
-        weight.data_ptr(),
-        output.data_ptr(),
-        None if bias is None else bias.data_ptr(),
-        arch,
-        m,
-        n,
-        k,
-        config,
-    )
-    graph = _flydsl_decode_graphs.get(key)
-    if graph is None:
-        # mp_tuner evaluates candidates serially within one shape group. Keep
-        # only the active capture so exhaustive registries do not retain one
-        # graph allocation per configuration.
-        _flydsl_decode_graphs.clear()
-        current = torch.cuda.current_stream()
-        stream = torch.cuda.Stream()
-        stream.wait_stream(current)
-        gemm_decode_bf16(
-            input,
-            weight,
-            output,
-            config,
-            bias=bias,
-            stream=stream,
-        )
-        stream.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            gemm_decode_bf16(
-                input,
-                weight,
-                output,
-                config,
-                bias=bias,
-                stream=stream,
-            )
-        current.wait_stream(stream)
-        _flydsl_decode_graphs[key] = graph
-    graph.replay()
+    # Launch directly, like every other provider. Wrapping the kernel in a
+    # one-launch HIP graph made each timed sample carry a full graph replay,
+    # which dominates any decode shape below roughly 14 us.
+    gemm_decode_bf16(input, weight, output, config, bias=bias)
     return output
 
 
@@ -895,14 +853,10 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 f"but the runtime device is {runtime_arch}"
             )
         tasks = []
+        # Decode shares the tuner's timing settings with every other provider.
+        # Giving it its own timing backend and iteration counts made its numbers
+        # incomparable to the candidates it is ranked against.
         decode_run_kwargs = dict(run_kwargs)
-        # PyTorch profiler timing does not observe FlyDSL's direct HIP launch.
-        # Keep the existing mp_tuner flow and CUDA/HIP-event backend; capture
-        # one kernel into a HIP graph so replay times a single launch without
-        # a shared mp_tuner timing divisor.
-        decode_run_kwargs["use_cuda_event"] = True
-        decode_run_kwargs["num_warmup"] = 1
-        decode_run_kwargs["num_iters"] = 3
         # Decode has a deliberately stricter absolute/relative correctness gate
         # than the general GEMM catalog. Every candidate is rejected independently.
         configs = list(
@@ -1143,14 +1097,14 @@ class GemmA16W16Tuner(GemmCommonTuner):
         _VLLM_WVSPLITK_OP = _try_vllm_wvsplitk() if with_vllm_wvsplitk else None
         gfx = self.get_gfx()
         cu_num = self.get_cu_num()
-        # Direct HIP launches and several eager providers are not reliably
-        # visible to the PyTorch profiler on this stack. A zero-duration sample
-        # can otherwise beat every real candidate and poison the tuned CSV.
-        # Use one CUDA/HIP-event backend for all providers in this tuner.
+        # Time every provider on the shared profiler path, which reports
+        # self_device_time_total (GPU kernel time) and excludes host launch
+        # gaps. Per-call wall clock charges each provider its own host launch
+        # cost, which differs between backends and therefore does not cancel
+        # when candidates are ranked against each other.
         run_kwargs = {
             "num_warmup": 10,
             "num_iters": 101,
-            "use_cuda_event": True,
         }
 
         task = []
