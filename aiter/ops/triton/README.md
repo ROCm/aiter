@@ -27,8 +27,9 @@ aiter/ops/triton/
 ├── fusions/               # small fused glue kernels (mul+add, clamp-act-mul, KV-cache fusions, ...)
 ├── comms/                 # multi-GPU communication kernels (all-gather, reduce-scatter, comm+compute fusions)
 ├── conv/                  # convolution kernels (see conv/README.md and conv/DESIGN.md)
-├── gated_delta_net/       # Gated DeltaNet ops (gated delta rule, causal conv1d prefill/decode)
-├── kimi_delta_attn/       # Kimi Delta Attention (chunked delta attention)
+├── linear_attention/      # Chunked recurrent mixers (state-carrying, not softmax)
+│   ├── gated_delta_rule/  # Gated DeltaRule / DeltaNet + causal conv1d prefill/decode
+│   └── chunk_delta_attn/  # Kimi Delta Attention (KDA)
 ├── gluon/                 # Gluon-backend wrappers
 ├── _triton_kernels/       # @triton.jit kernel bodies (mirrors the wrapper layout)
 ├── _gluon_kernels/        # Gluon kernel bodies

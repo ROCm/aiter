@@ -27,14 +27,14 @@ import triton
 from flydsl.runtime.device import get_rocm_arch
 
 from aiter.jit.core import AITER_CONFIGS
-
-from ..triton._triton_kernels.gated_delta_rule.utils import (
+from aiter.ops.triton._triton_kernels.linear_attention.gated_delta_rule.utils import (
     GatedDeltaRulePrefillMetadata,
     build_gated_delta_rule_prefill_metadata,
     prepare_chunk_offsets,
     prepare_num_chunks,
     prepare_rebased_cu_seqlens,
 )
+
 from .kernels.gdr_prefill import compile_gdn_prepare
 from .kernels.tensor_shim import _run_compiled
 
