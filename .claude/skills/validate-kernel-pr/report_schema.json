@@ -467,6 +467,14 @@
             "undeclared"
           ],
           "description": "Where the runner came from. The validator no longer classifies the target, so 'declared-by-caller' marks the runner as the caller's claim rather than a measurement -- a distinction a reader needs to weigh a failure that the runner choice, not the code, produced."
+        },
+        "grid_channel_basis": {
+          "type": "string",
+          "enum": [
+            "declared-by-caller",
+            ""
+          ],
+          "description": "Where the grid channel came from. The validator no longer reads the target to confirm a channel exists; the caller names it and the invalid-grid probe proves at runtime that the target consumes it."
         }
       }
     },

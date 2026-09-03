@@ -793,10 +793,11 @@ class ValidateKernelPrTests(unittest.TestCase):
 
         self.assertEqual("INCONCLUSIVE", report["verdict"])
         self.assertEqual("skip", report["stages"]["correctness_s1_grid"]["status"])
-        self.assertIn(
-            "not referenced",
-            report["stages"]["correctness_s1_grid"]["note"],
-        )
+        # The channel is no longer refuted by reading the file, but by running the target with
+        # a deliberately invalid grid and watching it not care.
+        note = report["stages"]["correctness_s1_grid"]["note"]
+        self.assertIn("was not consumed", note)
+        self.assertIn("no shape reached the kernel", note)
 
     def test_grid_pass_requires_runtime_shape_handshake(self):
         def ignore_grid_value(repo):
@@ -994,19 +995,26 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertEqual("skip", report["stages"]["correctness_s1_grid"]["status"])
         note = report["stages"]["correctness_s1_grid"]["note"]
         self.assertNotIn("no configured shape override", note)
-        self.assertIn("is not passed to add_argument", note)
-        self.assertIn("tests/verify_kernel.py", note)
-        self.assertIn("--shapes", note)
+        # The skip names the channel and what was observed, and it does NOT say the target
+        # ignores it: a caller who named a flag that does not exist gets the same runtime
+        # evidence, and blaming the target for that publishes the caller's mistake as a
+        # property of someone's code.
+        self.assertIn("was not consumed", note)
+        self.assertIn("cli", note)
+        self.assertNotIn("target ignores", note)
+        # This target is ADDED by the patch, so on base it does not exist. The old static
+        # probe read a missing file and called the result "hook-not-found", stating something
+        # about a flag in a file it never opened; the base side now says which it was.
         self.assertEqual(
-            "hook-not-found",
+            "target-not-present",
             report["stages"]["baseline_control"]["s1_grid"]["state"],
         )
-        # `grid_channel` names the channel that actually CARRIED the grid, so a hook
-        # that was requested and not found leaves it empty; the reason field is where
-        # the request survives, and it distinguishes a validator limit from a target
-        # property.
-        self.assertEqual("", report["test_selection"]["grid_channel"])
-        self.assertIn("--shapes", report["test_selection"]["grid_channel_reason"])
+        # `grid_channel` records the channel the caller declared, and the run is what refutes
+        # it. Erasing the declaration before the run lost the request itself.
+        self.assertEqual("cli", report["test_selection"]["grid_channel"])
+        self.assertEqual(
+            "declared-by-caller", report["test_selection"]["grid_channel_basis"]
+        )
 
     def bench_body(self, scale, trailer=""):
         self.fixture.add_bench_target()
@@ -1949,6 +1957,54 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertEqual("pytest", selection["runner"])
         self.assertEqual("declared-by-caller", selection["runner_basis"])
 
+    def test_a_channel_that_does_not_exist_is_not_charged_to_the_target(self):
+        # The channel is the caller's declaration and is no longer checked against the file. A
+        # flag the target does not define makes argparse exit non-zero, which from the exit
+        # code alone is indistinguishable from a red kernel -- and publishing it as one bills
+        # the caller's typo to the PR author.
+        #
+        # The run separates them without reading the source: this same target passed its
+        # repository run moments earlier, so it imports and executes. If the grid run then does
+        # no work at all, the delivery is what broke.
+        patch = self._axis_patch("bogus-channel.patch")
+        _, report = self.fixture.validate(
+            patch,
+            tests=self.AXIS_TARGET_PATH,
+            expected_route="axis_kernel:run_kernel",
+            shape_env=None,
+            shape_arg="--no-such-shape-flag",
+            grid_value="9,1023,f32",
+            perf=False,
+            runner="script",
+        )
+
+        grid = report["stages"]["correctness_s1_grid"]
+        # A red grid stays red -- the run did fail, and hiding that would be its own lie.
+        self.assertEqual("fail", grid["status"])
+        # But the note refuses to pick between the two things this looks like, because the
+        # evidence does not distinguish them.
+        self.assertIn("never seen failing on these shapes", grid["note"])
+        # Both explanations must be named. Asserting only that the note mentions a missing
+        # channel would still pass if the note went on to declare that the single cause --
+        # which is the judgement the evidence cannot support.
+        self.assertIn("channel this target does not have", grid["note"])
+        self.assertIn("crashes before the route", grid["note"])
+        self.assertIn("both look exactly like this", grid["note"])
+        # And nothing is charged to the author: the kernel was never observed running.
+        self.assertFalse(
+            any(item["severity"] == "blocker" for item in report["findings"]),
+            report["findings"],
+        )
+        self.assertTrue(
+            any(
+                "without reaching the routed work" in item["detail"]
+                for item in report["findings"]
+            ),
+            report["findings"],
+        )
+        # And the repository run, which did do work, keeps its own result.
+        self.assertEqual("pass", report["stages"]["correctness_repo_tests"]["status"])
+
     def test_an_undeclared_runner_runs_nothing_rather_than_guessing(self):
         # The guess is what this replaced: classifying an op_tests script as pytest published
         # a collection error as "the PR's own test fails on head" (ROCm/aiter#5081). Refusing
@@ -2580,12 +2636,20 @@ class GridChannelTests(unittest.TestCase):
             shape_arg="--shape",
         )
 
-        self.assertEqual("", report["test_selection"]["grid_channel"])
-        reason = report["test_selection"]["grid_channel_reason"]
-        self.assertIn("a validator limit, not a target property", reason)
-        self.assertIn("--shape", reason)
-        self.assertIn("does not read $UNREAD_GRID_ENV", reason)
+        selection = report["test_selection"]
+        # The caller named an env var this target does not read. That claim is now recorded AS
+        # a claim and refuted by the run, rather than silently erased before the run --
+        # a reader can see both what was asked for and what happened to it.
+        self.assertEqual("env", selection["grid_channel"])
+        self.assertEqual("declared-by-caller", selection["grid_channel_basis"])
         self.assertEqual("skip", report["stages"]["correctness_s1_grid"]["status"])
+        note = report["stages"]["correctness_s1_grid"]["note"]
+        self.assertIn("was not consumed", note)
+        # And the blame still lands nowhere: not on the kernel, which is not broken.
+        self.assertFalse(
+            any(item["severity"] == "blocker" for item in report["findings"]),
+            report["findings"],
+        )
 
 
 class ExecutionReceiptTests(unittest.TestCase):
