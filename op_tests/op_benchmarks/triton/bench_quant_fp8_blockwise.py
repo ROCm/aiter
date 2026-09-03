@@ -81,8 +81,20 @@ def benchmark(args):
         ms = triton.testing.do_bench(fn, warmup=25, rep=100)
         if args.metric == "time":
             return ms
-        gb = M * N * (x.element_size() + 1) * 1e-9  # read hp + write fp8
-        return gb / (ms * 1e-3)
+        # Per-provider bytes moved (hp=2, fp8=1, scale fp32=4), incl. scales.
+        hp, fp8, f32 = x.element_size(), 1, 4
+        nb, mb = math.ceil(N / _BS), math.ceil(M / _BS)
+        if provider == "blockwise":
+            b = M * N * hp + M * N * fp8 + M * nb * f32
+        elif provider == "weight":
+            b = M * N * hp + M * N * fp8 + mb * nb * f32
+        elif provider == "act_grad":
+            b = M * N * hp + 2 * M * N * fp8 + M * nb * f32 + mb * N * f32
+        elif provider == "requant":  # reads fp8 + row scales, writes fp8 + col scales
+            b = M * N * fp8 + M * nb * f32 + M * N * fp8 + mb * N * f32
+        else:  # segment_m
+            b = M * N * hp + M * N * fp8 + mb * N * f32
+        return b * 1e-9 / (ms * 1e-3)
 
     _run.run(save_path="." if args.o else None, print_data=True, show_plots=False)
 

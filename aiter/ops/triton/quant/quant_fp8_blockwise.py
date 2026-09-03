@@ -25,6 +25,18 @@ _FP8_MAX = torch.finfo(torch.float8_e4m3fnuz).max
 _BLOCK_SIZE = 128
 
 
+def _check_block_fp8(block_size: int, fp8_max: float) -> None:
+    # BLOCK_SIZE feeds tl.arange(0, BLOCK_SIZE), which needs a power of two.
+    assert (
+        block_size > 0 and (block_size & (block_size - 1)) == 0
+    ), f"block_size must be a positive power of two, got {block_size}"
+    # Output is float8_e4m3fnuz; a bound above its max would clamp against a
+    # range the payload cannot represent.
+    assert (
+        0 < fp8_max <= _FP8_MAX
+    ), f"fp8_max must be in (0, {_FP8_MAX}] for float8_e4m3fnuz, got {fp8_max}"
+
+
 def quant_fp8_blockwise(
     x: torch.Tensor,
     block_size: int = _BLOCK_SIZE,
@@ -34,9 +46,10 @@ def quant_fp8_blockwise(
     """Block-wise FP8 quantization of a 2-D tensor.
 
     Args:
-        x:          Input tensor ``[M, N]``, any float dtype.
-        block_size: Quantization block size along both axes.
-        fp8_max:    FP8 dynamic range maximum (default: e4m3fnuz max).
+        x:          Contiguous input tensor ``[M, N]``, any float dtype.
+        block_size: Quantization block size (positive power of two).
+        fp8_max:    FP8 dynamic range maximum (default: e4m3fnuz max); must be
+                    in ``(0, e4m3fnuz max]``.
         axis:       Scale axis — ``1`` = row-wise (one scale per row-block),
                     ``0`` = col-wise (one scale per col-block).
 
@@ -44,7 +57,13 @@ def quant_fp8_blockwise(
         ``(x_fp8, scales)`` where ``x_fp8`` is ``[M, N]`` float8_e4m3fnuz and
         ``scales`` are the per-block *inverse* quantisation scales.
     """
-    assert x.ndim == 2, f"expected 2-D input, got shape {x.shape}"
+    # The kernel flat-indexes x as contiguous; a strided tensor would read/write
+    # the wrong layout silently.
+    assert (
+        x.ndim == 2 and x.is_contiguous()
+    ), f"expected 2-D contiguous input, got shape {x.shape} strides {x.stride()}"
+    assert axis in (0, 1), f"axis must be 0 or 1, got {axis}"
+    _check_block_fp8(block_size, fp8_max)
     M, N = x.shape
     x_fp8 = torch.empty_like(x, dtype=torch.float8_e4m3fnuz)
     if axis == 1:
@@ -96,13 +115,18 @@ def quant_fp8_blockwise_segment_m(
                            offsets per segment.
         scales_seg_indptr: ``[batch_size + 1]`` int tensor of cumulative
                            row-block counts per segment.
+        block_size:        Quantization block size (positive power of two).
+        fp8_max:           FP8 bound in ``(0, e4m3fnuz max]``.
 
     Returns:
         ``(x_fp8, scales)`` where ``x_fp8`` is ``[M, N]`` float8_e4m3fnuz and
         ``scales`` is ``[ceil(M / block_size) + batch_size, N]`` (an upper bound
         on the total row-block count; unused trailing rows are left untouched).
     """
-    assert x.ndim == 2 and x.is_contiguous(), "expected 2-D contiguous input"
+    assert (
+        x.ndim == 2 and x.is_contiguous()
+    ), f"expected 2-D contiguous input, got shape {x.shape} strides {x.stride()}"
+    _check_block_fp8(block_size, fp8_max)
     M, N = x.shape
     x_fp8 = torch.empty_like(x, dtype=torch.float8_e4m3fnuz)
     scales = torch.empty(
@@ -134,16 +158,22 @@ def quant_fp8_blockwise_for_weight(
     """Block-wise FP8 quantization for a batched weight tensor.
 
     Args:
-        w:          Weight tensor ``[B, M, N]`` or ``[M, N]``.
-        block_size: Quantization block size.
-        fp8_max:    FP8 dynamic range maximum.
+        w:          Contiguous weight tensor ``[B, M, N]`` or ``[M, N]``.
+        block_size: Quantization block size (positive power of two).
+        fp8_max:    FP8 bound in ``(0, e4m3fnuz max]``.
 
     Returns:
         ``(w_fp8, scales)`` where each block has its own scale.
     """
     if w.ndim == 2:
         w = w.unsqueeze(0)
-    assert w.ndim == 3, f"expected 2-D or 3-D weight, got {w.shape}"
+    # The kernel addresses w as dense [B, M, N] (bid*M*N + row*N + col); a
+    # transposed/sliced weight would be quantized with the wrong layout.
+    assert w.ndim == 3 and w.is_contiguous(), (
+        f"expected contiguous 2-D or 3-D weight, got shape {w.shape} "
+        f"strides {w.stride()}"
+    )
+    _check_block_fp8(block_size, fp8_max)
     B, M, N = w.shape
     w_fp8 = torch.empty_like(w, dtype=torch.float8_e4m3fnuz)
     scales = torch.empty(
@@ -176,10 +206,18 @@ def quant_fp8_blockwise_for_act_grad(
     Produces both a row-wise (1×BLOCK) and col-wise (BLOCK×1) FP8 copy of
     the input in a single pass — needed by blockwise WGrad backward.
 
+    Args:
+        x:          Contiguous input tensor ``[M, N]``.
+        block_size: Quantization block size (positive power of two).
+        fp8_max:    FP8 bound in ``(0, e4m3fnuz max]``.
+
     Returns:
         ``(x_fp8_row, scales_row, x_fp8_col, scales_col)``
     """
-    assert x.ndim == 2, f"expected 2-D input, got {x.shape}"
+    assert (
+        x.ndim == 2 and x.is_contiguous()
+    ), f"expected 2-D contiguous input, got shape {x.shape} strides {x.stride()}"
+    _check_block_fp8(block_size, fp8_max)
     M, N = x.shape
     x_fp8_row = torch.empty_like(x, dtype=torch.float8_e4m3fnuz)
     x_fp8_col = torch.empty_like(x, dtype=torch.float8_e4m3fnuz)
@@ -221,15 +259,29 @@ def requant_fp8_row_to_col(
     axis without a BF16 roundtrip.  Used in blockwise WGrad backward.
 
     Args:
-        x_fp8:    ``[M, K]`` FP8 input with row-wise block quantisation.
-        x_scales: ``[M, K // block_size]`` dequant scales for ``x_fp8``.
+        x_fp8:    ``[M, K]`` contiguous FP8 input with row-wise block
+                  quantisation.
+        x_scales: ``[M, ceil(K / block_size)]`` dequant scales for ``x_fp8``.
+        block_size: Quantization block size (positive power of two).
+        fp8_max:    FP8 bound in ``(0, e4m3fnuz max]``.
 
     Returns:
         ``(y_fp8, y_scales)`` col-wise quantised, shapes ``[M, K]`` and
-        ``[M // block_size, K]``.
+        ``[ceil(M / block_size), K]``.
     """
-    assert x_fp8.ndim == 2, f"expected 2-D input, got {x_fp8.shape}"
+    assert x_fp8.ndim == 2 and x_fp8.is_contiguous(), (
+        f"expected 2-D contiguous input, got shape {x_fp8.shape} "
+        f"strides {x_fp8.stride()}"
+    )
+    _check_block_fp8(block_size, fp8_max)
     M, K = x_fp8.shape
+    # x_scales is read with flat contiguous indexing at [M, ceil(K/block)].
+    expected_scale_shape = (M, math.ceil(K / block_size))
+    assert x_scales.is_contiguous() and tuple(x_scales.shape) == expected_scale_shape, (
+        f"x_scales shape {tuple(x_scales.shape)} != {expected_scale_shape} "
+        "or not contiguous"
+    )
+    assert x_scales.device == x_fp8.device, "x_fp8 and x_scales must share a device"
     y_fp8 = torch.empty_like(x_fp8)
     y_scales = torch.empty(
         math.ceil(M / block_size), K, dtype=torch.float32, device=x_fp8.device

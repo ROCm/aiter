@@ -33,6 +33,13 @@ from aiter.ops.triton.quant.quant import (
     fp8_legacy_to_mxfp8,
     static_per_tensor_quant_fp8_i8,
 )
+from aiter.ops.triton.quant.quant_fp8_blockwise import (
+    quant_fp8_blockwise,
+    quant_fp8_blockwise_for_act_grad,
+    quant_fp8_blockwise_for_weight,
+    quant_fp8_blockwise_segment_m,
+    requant_fp8_row_to_col,
+)
 
 __all__ = [
     "_mxfp4_quant_op",
@@ -64,6 +71,12 @@ __all__ = [
     # fused_mxfp8_quant.py exports
     "fused_rms_mxfp8_quant",
     "get_fp8_min_max_bounds",
+    # quant_fp8_blockwise.py exports
+    "quant_fp8_blockwise",
+    "quant_fp8_blockwise_for_act_grad",
+    "quant_fp8_blockwise_for_weight",
+    "quant_fp8_blockwise_segment_m",
+    "requant_fp8_row_to_col",
     # quant.py exports
     "static_per_tensor_quant_fp8_i8",
 ]

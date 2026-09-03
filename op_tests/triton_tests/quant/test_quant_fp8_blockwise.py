@@ -174,3 +174,46 @@ def test_requant_fp8_row_to_col(M, K):
         deq_col[i * bs : (i + 1) * bs, :] *= s_col[i : i + 1, :]
 
     _assert_fp8_close(deq_col, deq_row)
+
+
+def test_public_package_import():
+    """The wrappers must be importable from the quant package, not just the module."""
+    from aiter.ops.triton.quant import (
+        quant_fp8_blockwise as pkg_blockwise,
+    )
+    from aiter.ops.triton.quant import (
+        quant_fp8_blockwise_for_act_grad,
+        quant_fp8_blockwise_for_weight,
+        quant_fp8_blockwise_segment_m,
+    )
+    from aiter.ops.triton.quant import (
+        requant_fp8_row_to_col as pkg_requant,
+    )
+
+    for fn in (
+        pkg_blockwise,
+        quant_fp8_blockwise_for_act_grad,
+        quant_fp8_blockwise_for_weight,
+        quant_fp8_blockwise_segment_m,
+        pkg_requant,
+    ):
+        assert callable(fn)
+
+
+def test_quant_fp8_blockwise_rejects_bad_inputs():
+    """Non-contiguous input, out-of-range fp8_max, and non-pow2 block must raise."""
+    x = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(AssertionError):
+        quant_fp8_blockwise(x.t())  # non-contiguous
+    with pytest.raises(AssertionError):
+        quant_fp8_blockwise(x, fp8_max=1e9)  # above e4m3fnuz max
+    with pytest.raises(AssertionError):
+        quant_fp8_blockwise(x, block_size=100)  # not a power of two
+    with pytest.raises(AssertionError):
+        quant_fp8_blockwise(x, axis=2)  # invalid axis
+
+
+def test_quant_fp8_blockwise_for_weight_rejects_noncontiguous():
+    w = torch.randn(2, 128, 256, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    with pytest.raises(AssertionError):
+        quant_fp8_blockwise_for_weight(w)
