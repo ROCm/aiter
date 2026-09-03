@@ -36,6 +36,7 @@ import pytest
 import torch
 
 from aiter import ActivationType, QuantType, logger
+from aiter import test_common as bench_init
 from aiter.aot.flydsl.common import run_only_env
 from aiter.fused_moe import (
     fused_moe,
@@ -47,7 +48,6 @@ from aiter.ops.flydsl.moe_common import GateMode, apply_gate_up
 from aiter.ops.quant import per_1x32_f4_quant
 from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
 from aiter.utility import dtypes, fp4_utils
-from op_tests import bench_init
 
 # Build every tensor straight on the device (like op_tests/test_moe_2stage.py) so
 # the test body has no `.cuda()` / `.float().cuda()` plumbing.

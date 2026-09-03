@@ -102,14 +102,13 @@ notice when these flags are supplied; the setting is never silently claimed.
 The current passthrough matrix is:
 
     DATA + SCALE + seed   moe, gemm, f8gemm, a8w8_blockscale
-    DATA + seed           a16w16, mega_moe, mhc, qk_norm
+    DATA + seed           a16w16, mega_moe, mhc, qk_norm, inverse_rope,
+                          score_qk, mla_v4_decode, mla_v4_prefill
     DATA mapping only     mha (norm -> randn, constant -> const0.25)
-    native init only      mla_v4_decode, mla_v4_prefill, score_qk,
-                          inverse_rope, mori_ep
+    native init only      mori_ep
 
 ``--scale-init`` is reported as not applicable for operators without a scale
-operand. ``mla_v4_prefill`` still receives ``--seed`` because its native data
-generator exposes that control even though it does not expose a distribution.
+operand.
 
 mega_moe at tokens/rank=65536 fails in setup(), asking 7.5 GB for cco's VMM
 arena against a 4 GiB default. MORI_SHMEM_HEAP_SIZE does not reach that arena
@@ -683,6 +682,8 @@ _MLA_V4_DSV4_SHAPES = [
 ]
 _MLA_V4_COMPARE_KEEP = [
     "dtype",
+    "data_init",
+    "seed",
     "gqa_ratio",
     "batch",
     "kv_seq_lens",
@@ -1533,7 +1534,7 @@ def run_qk_norm(args):
 
 def run_score_qk(args):
     """Run DSv4 decode score-QK at batch 512 for short and long CSA KV."""
-    _unsupported_init(args, "score_qk")
+    _unused_scale_init(args, "score_qk")
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     base_cmd = [
         sys.executable,
@@ -1549,16 +1550,23 @@ def run_score_qk(args):
         "64",
     ]
     # None => let the UT pick the batch, so run the KV lengths once each.
-    for tokens, (label, kv_length) in itertools.product(
-        _SCORE_QK_TOKENS or (None,), _SCORE_QK_KV_LENGTHS
+    for tokens, (label, kv_length), data_init in itertools.product(
+        _SCORE_QK_TOKENS or (None,),
+        _SCORE_QK_KV_LENGTHS,
+        args.data_init or ["norm"],
     ):
         _run_child(
-            f"score_qk (decode, B={tokens or 'UT default'}, {label} CSA KV={kv_length})",
+            f"score_qk (decode, B={tokens or 'UT default'}, {label} "
+            f"CSA KV={kv_length}, init={data_init}, seed={args.seed})",
             [
                 *base_cmd,
                 *(["--batch", str(tokens)] if tokens else []),
                 "-kv_length",
                 kv_length,
+                "--data-init",
+                data_init,
+                "--seed",
+                str(args.seed),
             ],
             cwd=repo_root,
             extract=_md_from_pandas(
@@ -1629,7 +1637,9 @@ def _perf_ratio(num, den):
     return f"{num / den:.2f}x"
 
 
-def _bench_mla_v4_asm_staged(gqa, batch, ctx, split_kv, num_iters, num_warmup):
+def _bench_mla_v4_asm_staged(
+    gqa, batch, ctx, split_kv, num_iters, num_warmup, data_init, seed
+):
     """Asm kernel (s1) + merge (s2) + total; lives in combo bench only."""
     mod = mla_v4_kargpreld_mod
     q_seq = 1
@@ -1645,7 +1655,8 @@ def _bench_mla_v4_asm_staged(gqa, batch, ctx, split_kv, num_iters, num_warmup):
         batch=batch,
         kv_seq_lens=ctx,
         q_seq_logical=q_seq,
-        seed=mod._SEED,
+        seed=seed,
+        data_init=data_init,
         gqa_ratio=gqa,
         attn_sink=True,
     )
@@ -1733,7 +1744,7 @@ def _bench_mla_v4_asm_staged(gqa, batch, ctx, split_kv, num_iters, num_warmup):
 
 def run_mla_v4_decode(args):
     # Side-by-side asm (kargpreld) vs Triton sparse decode on the same shape grid.
-    _unsupported_init(args, "mla_v4_decode")
+    _unused_scale_init(args, "mla_v4_decode")
     iters = args.mla_v4_kargpreld_iters
     warmup = args.mla_v4_kargpreld_warmup
     mla_v4_triton_mod._PERF["num_iters"] = iters
@@ -1744,22 +1755,38 @@ def run_mla_v4_decode(args):
         else _MLA_V4_KARGPRELD_SHAPES
     )
     shapes = args.mla_v4_kargpreld_shapes or default_shapes
+    data_inits = args.data_init or ["norm"]
     rows = []
     with _capture() as box:
-        for gqa, batch, ctx, split_kv in shapes:
+        for (gqa, batch, ctx, split_kv), data_init in itertools.product(
+            shapes, data_inits
+        ):
             row = {
+                "data_init": data_init,
+                "seed": args.seed,
                 "gqa_ratio": gqa,
                 "batch": batch,
                 "kv_seq_lens": ctx,
                 "num_kv_splits": split_kv,
             }
             try:
-                asm = _bench_mla_v4_asm_staged(gqa, batch, ctx, split_kv, iters, warmup)
+                asm = _bench_mla_v4_asm_staged(
+                    gqa,
+                    batch,
+                    ctx,
+                    split_kv,
+                    iters,
+                    warmup,
+                    data_init,
+                    args.seed,
+                )
                 tri = mla_v4_triton_mod.test_mla_v4_triton_staged(
                     gqa_ratio=gqa,
                     batch=batch,
                     kv_seq_lens=ctx,
                     num_kv_splits=split_kv,
+                    data_init=data_init,
+                    seed=args.seed,
                 )
                 row.update(asm)
                 row.update(tri)
@@ -1782,7 +1809,7 @@ def run_mla_v4_decode(args):
 
 def run_inverse_rope(args):
     """Run DSv4 inverse RoPE + group quant at the tp1 attention-output shape."""
-    _unsupported_init(args, "inverse_rope")
+    _unused_scale_init(args, "inverse_rope")
     # -b is (n_local_heads, n_local_groups); 128,16 is V4-Pro at dp/tp1. The UT
     # defaults to the two smallest configs instead, which never reach the shape
     # the model runs, so name it explicitly.
@@ -1798,6 +1825,13 @@ def run_inverse_rope(args):
             "n32k4",
             "--group-size",
             "32",
+            *(
+                ["--data-init", *args.data_init]
+                if args.data_init is not None
+                else []
+            ),
+            "--seed",
+            str(args.seed),
         ],
         cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     )
@@ -1805,7 +1839,7 @@ def run_inverse_rope(args):
 
 def run_mla_v4_prefill(args):
     """Run DSv4 prefill across two precisions, pools and CSR modes."""
-    _unsupported_init(args, "mla_v4_prefill")
+    _unused_scale_init(args, "mla_v4_prefill")
     for tokens in _MLA_PREFILL_TOKENS:
         _run_child(
             f"mla_v4 prefill (M={tokens}, prec=fp8/bf16, pages=4096/16384)",
@@ -1835,6 +1869,11 @@ def run_mla_v4_prefill(args):
                 "--no-verify",
                 "--seed",
                 str(args.seed),
+                *(
+                    ["--data-init", *args.data_init]
+                    if args.data_init is not None
+                    else []
+                ),
             ],
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             # Not _table_row: the UT has no "latency_us" column (it prints

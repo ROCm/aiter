@@ -39,7 +39,14 @@ import aiter
 import aiter.mla  # main no longer auto-imports submodules; need explicit
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.test_common import (
+    DATA_DISTS,
+    benchmark,
+    checkAllclose,
+    fill,
+    make_generator,
+    run_perftest,
+)
 
 torch.set_default_device("cuda")
 
@@ -62,7 +69,6 @@ V_HEAD_DIM = 512  # logical V head dim = args.dim = kv_lora_rank
 # Perf iteration counts (kept out of the @benchmark signature so they don't
 # become table columns). main() overrides these from --iters / --warmup.
 _PERF = {"num_iters": 2, "num_warmup": 1}
-_SEED = 0
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +303,7 @@ def _build_bf16_inputs(
     kv_seq_lens=64,
     q_seq_logical=4,
     seed=0,
+    data_init="norm",
     device="cuda",
     gqa_ratio=GQA_RATIO,
     attn_sink=True,
@@ -311,19 +318,24 @@ def _build_bf16_inputs(
                mismatch shows up as an err blowup, not a silent pass.
       False -> per-head -inf ("no sink" no-op: exp(-inf - max) = 0).
     """
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    gen = make_generator(seed, device=device)
     total_q = batch * q_seq_logical
     num_page = batch * (kv_seq_lens // PAGE_SIZE)
 
-    q_bf16 = torch.randn(
-        (total_q, gqa_ratio, _QUANT_D), dtype=dtypes.bf16, device=device
-    )
-    kv_bf16 = torch.randn(
-        (num_page, PAGE_SIZE, NUM_KV_HEADS, _QUANT_D),
+    q_bf16 = fill(
+        (total_q * gqa_ratio, _QUANT_D),
+        data_init,
+        gen,
         dtype=dtypes.bf16,
         device=device,
-    )
+    ).view(total_q, gqa_ratio, _QUANT_D)
+    kv_bf16 = fill(
+        (num_page * PAGE_SIZE * NUM_KV_HEADS, _QUANT_D),
+        data_init,
+        gen,
+        dtype=dtypes.bf16,
+        device=device,
+    ).view(num_page, PAGE_SIZE, NUM_KV_HEADS, _QUANT_D)
 
     qo_indptr = (
         torch.arange(0, batch + 1, dtype=torch.int32, device=device) * q_seq_logical
@@ -345,7 +357,16 @@ def _build_bf16_inputs(
     if attn_sink:
         # randn*10 so the sink contributes materially (~15%) to the softmax;
         # well above tolerance, so a dropped/mis-scaled sink is a hard mismatch.
-        sink = torch.randn(num_heads, dtype=torch.float32, device=device) * 10.0
+        sink = (
+            fill(
+                (num_heads,),
+                data_init,
+                gen,
+                dtype=torch.float32,
+                device=device,
+            )
+            * 10.0
+        )
     else:
         sink = torch.full(
             (num_heads,), float("-inf"), dtype=torch.float32, device=device
@@ -377,6 +398,8 @@ def test_mla_v4_nm(
     num_kv_splits=1,
     gqa_ratio=GQA_RATIO,
     attn_sink=True,
+    data_init="norm",
+    seed=0,
 ):
     """Time each v4 nm kernel candidate, check it against the torch fp8-dequant
     reference, and return per-candidate `us` / `TFLOPS` / `TB/s` / `err`.
@@ -413,7 +436,8 @@ def test_mla_v4_nm(
         batch=batch,
         kv_seq_lens=kv_seq_lens,
         q_seq_logical=q_seq_logical,
-        seed=_SEED,
+        seed=seed,
+        data_init=data_init,
         gqa_ratio=gqa_ratio,
         attn_sink=attn_sink,
     )
@@ -733,13 +757,18 @@ def main():
         default=[True],
         help="attn sink value(s) to sweep. e.g. --attn-sink True False",
     )
+    parser.add_argument(
+        "--data-init",
+        nargs="+",
+        choices=list(DATA_DISTS),
+        default=["norm"],
+        help="DATA initialization distribution(s) for Q, KV and attention sink",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--iters", type=int, default=50, help="Perf timed iterations")
     parser.add_argument("--warmup", type=int, default=2, help="Perf warmup iterations")
     args = parser.parse_args()
 
-    global _SEED
-    _SEED = args.seed
     _PERF["num_iters"] = args.iters
     _PERF["num_warmup"] = args.warmup
 
@@ -752,8 +781,20 @@ def main():
     ]
 
     df = []
-    for (nhead, decode_qlen), batch, kv_seq_lens, split_kv, sink in itertools.product(
-        nhead_combos, args.batch, args.kv_seq_lens, args.split_kv, args.attn_sink
+    for (
+        (nhead, decode_qlen),
+        batch,
+        kv_seq_lens,
+        split_kv,
+        sink,
+        data_init,
+    ) in itertools.product(
+        nhead_combos,
+        args.batch,
+        args.kv_seq_lens,
+        args.split_kv,
+        args.attn_sink,
+        args.data_init,
     ):
         try:
             df.append(
@@ -764,6 +805,8 @@ def main():
                     num_kv_splits=split_kv,
                     gqa_ratio=nhead,
                     attn_sink=sink,
+                    data_init=data_init,
+                    seed=args.seed,
                 )
             )
         except (RuntimeError, AssertionError) as exc:

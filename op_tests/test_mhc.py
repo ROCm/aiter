@@ -1039,7 +1039,7 @@ parser.add_argument(
     choices=[dtypes.d_dtypes["fp16"], dtypes.d_dtypes["bf16"]],
     nargs="*",
     metavar="{fp16, bf16}",
-    default=["bf16"],
+    default=[dtypes.bf16],
     help="""Data type.
     e.g.: -d bf16""",
 )
