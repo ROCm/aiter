@@ -440,6 +440,8 @@ def _grouped_a8w4_tdm_moe(
     cluster_n=-1,
     waves_per_tensor_tdm=-1,
     next_stage_prefetch=0,
+    tdm_b_th=1,
+    max_tasks_per_worker=None,
     data_format="a8w4",
     expert_mask=None,
     num_local_tokens=None,
@@ -697,6 +699,7 @@ def _grouped_a8w4_tdm_moe(
             cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
             next_stage_prefetch=next_stage_prefetch,
+            max_tasks_per_worker=0,
             **_situ_kw,
         )
     else:
@@ -727,6 +730,7 @@ def _grouped_a8w4_tdm_moe(
             cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
             next_stage_prefetch=next_stage_prefetch,
+            max_tasks_per_worker=0,
             **_situ_kw,
         )
         a2_payload, a2_scale = flydsl_moe_fused_quant_preshuffle(
@@ -766,6 +770,8 @@ def _grouped_a8w4_tdm_moe(
         cluster_n=cluster_n,
         waves_per_tensor_tdm=waves_per_tensor_tdm,
         next_stage_prefetch=next_stage_prefetch,
+        tdm_b_th=tdm_b_th,
+        max_tasks_per_worker=max_tasks_per_worker,
         **_ep_gemm2_kwargs,
     )
 
@@ -803,6 +809,7 @@ def _grouped_a8w4_tdm_moe(
                         cluster_n=cluster_n,
                         waves_per_tensor_tdm=waves_per_tensor_tdm,
                         next_stage_prefetch=next_stage_prefetch,
+                        max_tasks_per_worker=0,
                         **_situ_kw,
                     ),
                 )
@@ -837,6 +844,7 @@ def _grouped_a8w4_tdm_moe(
                         cluster_n=cluster_n,
                         waves_per_tensor_tdm=waves_per_tensor_tdm,
                         next_stage_prefetch=next_stage_prefetch,
+                        max_tasks_per_worker=0,
                         **_situ_kw,
                     ),
                 )
@@ -869,6 +877,8 @@ def _grouped_a8w4_tdm_moe(
                     cluster_n=cluster_n,
                     waves_per_tensor_tdm=waves_per_tensor_tdm,
                     next_stage_prefetch=next_stage_prefetch,
+                    tdm_b_th=tdm_b_th,
+                    max_tasks_per_worker=max_tasks_per_worker,
                 ),
             )
         )
@@ -1120,6 +1130,11 @@ def grouped_gemm_gfx1250_a8w4(
             _tdm_kw["next_stage_prefetch"] = _as_int(
                 cfg_row.get("next_stage_prefetch"), 0
             )
+            _tdm_kw["tdm_b_th"] = _as_int(cfg_row.get("tdm_b_th"), 1)
+            if cfg_row.get("max_tasks_per_worker") is not None:
+                _tdm_kw["max_tasks_per_worker"] = _as_int(
+                    cfg_row.get("max_tasks_per_worker"), 0
+                )
 
         # Env overrides for tuning (present-check so any set value wins over CSV /
         # defaults). Stage2 (*2) falls back to the stage1 value when unset. Set
