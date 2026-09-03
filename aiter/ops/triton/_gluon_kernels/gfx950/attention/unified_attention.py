@@ -135,13 +135,25 @@ def _make_cdna4_kv_load_layouts(
         # padding: copy the bytes straight in and un-shuffle with a view on read.
         CONTIGUITY = 16 if FP8_KV else 8
         flat = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
-        blocked = gl.BlockedLayout(
-            size_per_thread=[1, CONTIGUITY],
-            threads_per_warp=[1, WARP_SIZE],
-            warps_per_cta=[1, NUM_WARPS],
-            order=[1, 0],
+
+        # One warp covers WARP_SIZE * CONTIGUITY elements of a row; put the rest of
+        # the warps on whichever axis still has room, or each lane needs two loads.
+        def _blocked(cols):
+            per_warp = WARP_SIZE * CONTIGUITY
+            along_1 = max(1, min(NUM_WARPS, cols // per_warp))
+            return gl.BlockedLayout(
+                size_per_thread=[1, CONTIGUITY],
+                threads_per_warp=[1, WARP_SIZE],
+                warps_per_cta=[NUM_WARPS // along_1, along_1],
+                order=[1, 0],
+            )
+
+        return (
+            _blocked(TILE_SIZE * CONTIGUITY),
+            _blocked(HEAD_SIZE * CONTIGUITY),
+            flat,
+            flat,
         )
-        return blocked, blocked, flat, flat
 
     if TRITON_BEYOND_37 and ASYNC_COPY_SUPPORTS_DISTRIBUTED:
         CONTIGUITY = 16 if FP8_KV else 8  # elements per 128-bit vector load
@@ -341,7 +353,15 @@ class AttentionConfig:
         if MFMA_DIM == 32:
             mfma_instr = [32, 32, 16] if not self.DOT_FP8 else [32, 32, 64]
             self.K_WIDTH_QK = gl.constexpr(16) if self.DOT_FP8 else gl.constexpr(8)
-            self.K_WIDTH_PV = gl.constexpr(16) if self.DOT_FP8 else gl.constexpr(4)
+            if self.DOT_FP8:
+                self.K_WIDTH_PV = gl.constexpr(16)
+            elif SHUFFLED_KV_CACHE:
+                # The cache is shuffled in 16-byte groups, so the PV operand has to
+                # read in the same width or the un-shuffle stops being an inverse
+                # and the ds_read picks up 40% bank conflicts.
+                self.K_WIDTH_PV = gl.constexpr(8)
+            else:
+                self.K_WIDTH_PV = gl.constexpr(4)
         else:
             mfma_instr = [16, 16, 32] if not self.DOT_FP8 else [16, 16, 128]
             self.K_WIDTH_QK = gl.constexpr(16) if self.DOT_FP8 else gl.constexpr(8)
