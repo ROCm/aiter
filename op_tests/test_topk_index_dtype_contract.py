@@ -147,3 +147,11 @@ def test_moe_fused_gate_rejects_int64_ids():
         " GROUPS, 2, TOPK, 0)",
         "topk_ids must be int32",
     )
+
+
+if __name__ == "__main__":
+    # The op-test CI runs these files as `python3 <file>` rather than through
+    # pytest (.github/scripts/aiter_test.sh:85). Without this the module would
+    # define nine tests, run none of them, and exit 0 -- reported as a pass.
+    # Which is the same failure mode this whole file exists to rule out.
+    sys.exit(pytest.main([__file__, "-v"]))
