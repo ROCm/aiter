@@ -108,41 +108,6 @@ def is_skinny_default_shape(
     )
 
 
-def _resolve_opus_a16w16_tuned_candidate(
-    *,
-    gfx: str,
-    cu_num: int,
-    M: int,
-    N: int,
-    K: int,
-    bias: bool,
-    dtype,
-    otype,
-    requested_kid,
-    requested_split_k=0,
-):
-    """Validate one tuned OPUS row before the exact public call."""
-    if _opus_launch is None:
-        return None
-    from aiter.ops.opus.policy import (
-        resolve_a16w16_tuned_candidate,
-    )
-
-    return resolve_a16w16_tuned_candidate(
-        arch=gfx,
-        M=M,
-        N=N,
-        K=K,
-        batch=1,
-        cu_num=cu_num,
-        has_bias=bias,
-        input_dtype=dtype,
-        output_dtype=otype,
-        requested_kid=requested_kid,
-        requested_split_k=requested_split_k,
-    )
-
-
 @functools.lru_cache(maxsize=4096)
 def get_GEMM_A16W16_config(
     M: int,
@@ -195,18 +160,26 @@ def get_GEMM_A16W16_config(
             if config is None:
                 continue
             if config["libtype"] == "opus":
-                resolved = _resolve_opus_a16w16_tuned_candidate(
-                    gfx=gfx,
-                    cu_num=cu_num,
-                    M=M,
-                    N=N,
-                    K=K,
-                    bias=bias,
-                    dtype=eval(dtype),
-                    otype=eval(otype),
-                    requested_kid=config.get("solidx"),
-                    requested_split_k=config.get("splitK"),
-                )
+                if _opus_launch is None:
+                    resolved = None
+                else:
+                    from aiter.ops.opus.policy import (
+                        resolve_a16w16_tuned_candidate,
+                    )
+
+                    resolved = resolve_a16w16_tuned_candidate(
+                        arch=gfx,
+                        M=M,
+                        N=N,
+                        K=K,
+                        batch=1,
+                        cu_num=cu_num,
+                        has_bias=bias,
+                        input_dtype=eval(dtype),
+                        output_dtype=eval(otype),
+                        requested_kid=config.get("solidx"),
+                        requested_split_k=config.get("splitK"),
+                    )
                 if resolved is None:
                     # Discard the whole stale (kid, split-K) pair before
                     # trying another padded row or the default fallback.

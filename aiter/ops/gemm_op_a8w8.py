@@ -1051,10 +1051,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
     )
     # Triton path first: it allocates its own output, so skip the Y buffer the
     # ck/asm paths below need.
-    if (config is not None and config["libtype"] == "triton") or (
-        get_gfx() == "gfx1250"
-        and not (config is not None and config["libtype"] == "opus")
-    ):
+    if (config is not None and config["libtype"] == "triton") or get_gfx() == "gfx1250":
         # kernelName optionally carries the backend hint ("triton"/"gluon");
         # anything else -> None (auto gluon->triton detection). config=None lets
         # the triton impl load its own tuned config internally. WQ is already
@@ -1097,15 +1094,14 @@ def gemm_a8w8_blockscale_bpreshuffle(
                 XQ, WQ, Y, x_scale, w_scale, splitK=splitK, kernelName=kernelName
             )
         elif libtype == "opus":
-            # Only an OPUS-tuned row enters the OPUS exact-kid interface.
-            kid = int(config["kernelId"])
+            kernelId = int(config["kernelId"])
             from aiter.ops.opus import opus_gemm
 
             return opus_gemm(
                 XQ,
                 WQ,
                 Y,
-                kid=kid,
+                kid=kernelId,
                 layout="bpreshuffle",
                 x_scale=x_scale,
                 w_scale=w_scale,
