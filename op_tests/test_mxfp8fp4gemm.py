@@ -34,15 +34,16 @@ from aiter.ops.shuffle import (
     shuffle_mxfp8fp4_b,
     shuffle_mxfp8fp4_scale,
 )
-from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.test_common import (
+    benchmark,
+    checkAllclose,
+    fill_fp4,
+    fill_fp8,
+    fill_scale_e8m0,
+    make_generator,
+    run_perftest,
+)
 from aiter.utility import fp4_utils
-
-try:
-    import bench_init
-except ImportError as e:
-    if e.name != "bench_init":
-        raise
-    from op_tests import bench_init
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -188,44 +189,31 @@ def _ref(intype, A, B, sA, sB, M, N):
     return (A_f32 * sA_f) @ (B_f32 * sB_f).T
 
 
-def _const_mxfp8(rows: int, k: int, val: float) -> torch.Tensor:
-    # Constant mxfp8 (e4m3): a single representable value, deterministic for perf.
-    return torch.full((rows, k), val, dtype=torch.float32).to(torch.float8_e4m3fn)
-
-
 def _prep(
     intype: str, M: int, N: int, K: int, apre: int, data_init: str, scale_init: str, gen
 ):
     """Build raw + shuffled device tensors and the f32 golden reference.
 
-    DATA and SCALE are sampled *independently* (bench_init), selected by
+    DATA and SCALE are sampled *independently* (test_common), selected by
     ``data_init`` / ``scale_init``:
-      data_init  : uniform (FP8 U(-6,6) / FP4 U(-3,3)) [default] | gaussian |
-                   trig | random | constant (A/B = 0.5)
+      data_init  : uniform (FP8 U(-6,6) / FP4 U(-3,3)) [default] | norm |
+                   zero | constant (A/B = 0.5)
       scale_init : auto (E8M0 -> pow2_binomial) [default] | pow2_binomial |
-                   random | constant (neutral 0x7F -> 2^0 = 1.0)
+                   zero | uniform | norm | constant (neutral 0x7F -> 2^0 = 1.0)
     """
     # DATA: A is mxfp8 (e4m3); B is mxfp4 (e2m1 packed) for a8w4, else mxfp8.
-    if data_init == "constant":
-        A = _const_mxfp8(M, K, 0.5)
-        if intype == "a8w4":
-            B = torch.full((N, K // 2), 0x11, dtype=torch.uint8)  # e2m1 nibble 0.5
-        else:
-            B = _const_mxfp8(N, K, 0.5)
-    else:  # uniform / gaussian / trig / random
-        A = bench_init.fill_fp8((M, K), data_init, gen)
-        if intype == "a8w4":
-            B = bench_init.fill_fp4((N, K), data_init, gen)
-        else:
-            B = bench_init.fill_fp8((N, K), data_init, gen)
+    # constant is built inside fill_fp8/fill_fp4 via constant=: A/B = 0.5, and
+    # the a8w4 fp4 B uses the e2m1 nibble byte 0x11 (= 0.5).
+    A = fill_fp8((M, K), data_init, gen, constant=0.5)
+    if intype == "a8w4":
+        B = fill_fp4((N, K), data_init, gen, constant=0x11)
+    else:
+        B = fill_fp8((N, K), data_init, gen, constant=0.5)
 
-    # SCALE: e8m0 per-32 for both operands. auto -> pow2_binomial for E8M0.
-    if scale_init == "constant":
-        sA = torch.full((M, K // MX_SCALE_BLOCK), 0x7F, dtype=torch.uint8)
-        sB = torch.full((N, K // MX_SCALE_BLOCK), 0x7F, dtype=torch.uint8)
-    else:  # auto / pow2_binomial / random
-        sA = bench_init.fill_scale_e8m0((M, K // MX_SCALE_BLOCK), scale_init, gen)
-        sB = bench_init.fill_scale_e8m0((N, K // MX_SCALE_BLOCK), scale_init, gen)
+    # SCALE: e8m0 per-32 for both operands. auto -> pow2_binomial for E8M0;
+    # constant default is the neutral e8m0 byte 0x7F (2^0 = 1.0).
+    sA = fill_scale_e8m0((M, K // MX_SCALE_BLOCK), scale_init, gen)
+    sB = fill_scale_e8m0((N, K // MX_SCALE_BLOCK), scale_init, gen)
 
     # fp32 golden; the caller casts/quantizes it to the requested outtype.
     ref_f32 = _ref(intype, A, B, sA, sB, M, N)
@@ -279,7 +267,7 @@ def test_gemm(
 
     assert K % MX_SCALE_BLOCK == 0, f"K must be a multiple of {MX_SCALE_BLOCK}"
     out_dtype = _OUT_DTYPE[outtype]
-    gen = bench_init.make_generator(seed)  # fixed seed -> bit-identical buffers
+    gen = make_generator(seed)  # fixed seed -> bit-identical buffers
     inp, ref_f32 = _prep(intype, M, N, K, apre, data_init, scale_init, gen)
     ref = ref_f32.to(out_dtype)
     needTrace = mode == "profile"
@@ -432,29 +420,30 @@ def main():
         "--data-init",
         dest="data_init",
         nargs="*",
-        choices=["constant", "uniform", "gaussian", "trig", "random"],
+        choices=["zero", "constant", "uniform", "norm"],
         default=None,
-        help="DATA init distribution(s) (mblas-style; sampled independently of scale).\n"
+        help="DATA init distribution(s) (sampled independently of scale).\n"
         "Paired position-wise with --scale-init (length-1 broadcasts).\n"
         "Default (unset): perf/profile = 'constant uniform', func = 'uniform'\n"
+        "  zero     = all-zero on-wire codes\n"
+        "  constant = A/B = 0.5 (deterministic)\n"
         "  uniform  = FP8 U(-6,6) / FP4 U(-3,3)  [default]\n"
-        "  gaussian = N(0,1)                     [norm-dist / LLM-like]\n"
-        "  trig     = trig_float in [-2,2]       [optimistic pattern]\n"
-        "  random   = pure random on-wire codes  [overly pessimistic]\n"
-        "  constant = A/B = 0.5 (deterministic)",
+        "  norm     = N(0,1)                     [norm-dist / LLM-like]",
     )
     parser.add_argument(
         "--scale-init",
         dest="scale_init",
         nargs="*",
-        choices=["auto", "pow2_binomial", "random", "constant"],
+        choices=["auto", "pow2_binomial", "zero", "constant", "uniform", "norm"],
         default=None,
         help="SCALE init distribution(s) (e8m0 for both operands)\n"
         "Default (unset): perf/profile = 'constant auto', func = 'auto'\n"
         "  auto          = E8M0 -> pow2_binomial          [default]\n"
         "  pow2_binomial = 2^(Binomial(21,0.5)-11)\n"
-        "  random        = random e8m0 byte, exp in [-2,2]\n"
-        "  constant      = neutral scale 0x7F (2^0 = 1.0)",
+        "  zero          = all-zero e8m0 bytes\n"
+        "  constant      = neutral scale 0x7F (2^0 = 1.0)\n"
+        "  uniform       = U(0.5,2) -> nearest e8m0 byte\n"
+        "  norm          = N(1,0.25) -> nearest e8m0 byte",
     )
     parser.add_argument(
         "--seed",

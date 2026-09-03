@@ -33,15 +33,16 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.gemm_op_a4w4 import MXFP8_OUT_SCALE_BLOCK, unpack_mxfp8_out_scale
 from aiter.ops.shuffle import shuffle_scale_f4, shuffle_weight_f4
-from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.test_common import (
+    benchmark,
+    checkAllclose,
+    fill_fp4,
+    fill_scale_e4m3,
+    fill_scale_e8m0,
+    make_generator,
+    run_perftest,
+)
 from aiter.utility import fp4_utils
-
-try:
-    import bench_init
-except ImportError as e:
-    if e.name != "bench_init":
-        raise
-    from op_tests import bench_init
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -249,21 +250,14 @@ def run_torch_nvfp4(xq, wq, xs, ws, gA, gB):
 
 def _prep_mxfp4(M, N, K, apre, data_init, scale_init, gen):
     # DATA (fp4 e2m1, packed 2/byte). data & scale are sampled *independently*.
-    if data_init == "constant":
-        # f4gemm.cpp data_init=0: A=0x22, B=0x33 (fixed representable e2m1).
-        xq = torch.full((M, K // 2), 0x22, dtype=torch.uint8)
-        wq = torch.full((N, K // 2), 0x33, dtype=torch.uint8)
-    else:  # uniform / gaussian / trig / random
-        xq = bench_init.fill_fp4((M, K), data_init, gen)
-        wq = bench_init.fill_fp4((N, K), data_init, gen)
-    # SCALE (e8m0 per-32). auto -> pow2_binomial for E8M0.
-    if scale_init == "constant":
-        # neutral e8m0 scale 0x7F (exp 0 -> 2^0 = 1.0).
-        xs = torch.full((M, K // MXFP4_SCALE_BLOCK), 0x7F, dtype=torch.uint8)
-        ws = torch.full((N, K // MXFP4_SCALE_BLOCK), 0x7F, dtype=torch.uint8)
-    else:  # auto / pow2_binomial / random
-        xs = bench_init.fill_scale_e8m0((M, K // MXFP4_SCALE_BLOCK), scale_init, gen)
-        ws = bench_init.fill_scale_e8m0((N, K // MXFP4_SCALE_BLOCK), scale_init, gen)
+    # constant is built inside fill_fp4 via constant=; f4gemm.cpp data_init=0
+    # keeps A=0x22, B=0x33 (fixed representable e2m1).
+    xq = fill_fp4((M, K), data_init, gen, constant=0x22)
+    wq = fill_fp4((N, K), data_init, gen, constant=0x33)
+    # SCALE (e8m0 per-32). auto -> pow2_binomial for E8M0; constant default is
+    # the neutral e8m0 byte 0x7F (exp 0 -> 2^0 = 1.0).
+    xs = fill_scale_e8m0((M, K // MXFP4_SCALE_BLOCK), scale_init, gen)
+    ws = fill_scale_e8m0((N, K // MXFP4_SCALE_BLOCK), scale_init, gen)
     ref = run_torch_mxfp4(xq, wq, xs, ws)
     inp = {
         "A": shuffle_weight_f4(xq) if apre else xq,
@@ -277,23 +271,16 @@ def _prep_mxfp4(M, N, K, apre, data_init, scale_init, gen):
 
 
 def _prep_nvfp4(M, N, K, apre, data_init, scale_init, gen):
-    # DATA (fp4 e2m1). data & scale sampled independently (bench_init).
-    if data_init == "constant":
-        # f4gemm.cpp data_init=0: A=0x22, B=0x33 (fixed representable e2m1).
-        xq = torch.full((M, K // 2), 0x22, dtype=torch.uint8)
-        wq = torch.full((N, K // 2), 0x33, dtype=torch.uint8)
-    else:  # uniform / gaussian / trig / random
-        xq = bench_init.fill_fp4((M, K), data_init, gen)
-        wq = bench_init.fill_fp4((N, K), data_init, gen)
-    # SCALE (e4m3 per-16). auto -> gaussian(0.34375,0.08) for E4M3.
-    if scale_init == "constant":
-        # neutral e4m3 scale 0x38 (exp 7 = bias -> 1.0).
-        xs = torch.full((M, K // NVFP4_SCALE_BLOCK), 0x38, dtype=torch.uint8)
-        ws = torch.full((N, K // NVFP4_SCALE_BLOCK), 0x38, dtype=torch.uint8)
-    else:  # auto / gaussian / random
-        xs = bench_init.fill_scale_e4m3((M, K // NVFP4_SCALE_BLOCK), scale_init, gen)
-        ws = bench_init.fill_scale_e4m3((N, K // NVFP4_SCALE_BLOCK), scale_init, gen)
-    # Per-tensor global scale is NOT part of bench_init: keep neutral.
+    # DATA (fp4 e2m1). data & scale sampled independently (test_common).
+    # constant built inside fill_fp4 via constant=; f4gemm.cpp data_init=0 keeps
+    # A=0x22, B=0x33 (fixed representable e2m1).
+    xq = fill_fp4((M, K), data_init, gen, constant=0x22)
+    wq = fill_fp4((N, K), data_init, gen, constant=0x33)
+    # SCALE (e4m3 per-16). auto -> gaussian(0.34375,0.08) for E4M3; constant
+    # default is the neutral e4m3 byte 0x38 (exp 7 = bias -> 1.0).
+    xs = fill_scale_e4m3((M, K // NVFP4_SCALE_BLOCK), scale_init, gen)
+    ws = fill_scale_e4m3((N, K // NVFP4_SCALE_BLOCK), scale_init, gen)
+    # Per-tensor global scale is NOT part of the init helpers: keep neutral.
     gA = gB = 1.0
     ref = run_torch_nvfp4(xq, wq, xs, ws, gA, gB)
     inp = {
@@ -352,7 +339,7 @@ def test_gemm(
     assert K % block == 0, f"K must be a multiple of {block}"
     out_fp8 = outtype == "fp8"
     out_dtype = _OUT_DTYPE[outtype]
-    gen = bench_init.make_generator(seed)  # fixed seed -> bit-identical buffers
+    gen = make_generator(seed)  # fixed seed -> bit-identical buffers
     prep = _prep_mxfp4 if intype == "mxfp4" else _prep_nvfp4
     inp, ref_f32 = prep(M, N, K, apre, data_init, scale_init, gen)
     # Reference in the kernel's output form: block-scaled (fp8 e4m3 data + e8m0
@@ -587,33 +574,33 @@ def main():
         "--data-init",
         dest="data_init",
         nargs="*",
-        choices=["constant", "uniform", "gaussian", "trig", "random"],
+        choices=["zero", "constant", "uniform", "norm"],
         default=None,
-        help="DATA init distribution(s) (mblas-style; sampled independently of scale).\n"
+        help="DATA init distribution(s) (sampled independently of scale).\n"
         "Paired position-wise with --scale-init (length-1 broadcasts).\n"
         "Default (unset): perf/profile = 'constant uniform', func = 'uniform'\n"
         "(func drops constant: its exact-boundary values trigger e8m0/e4m3\n"
         "edge rounding that shows as spurious warnings).\n"
+        "  zero     = all-zero e2m1 codes\n"
+        "  constant = A=0x22, B=0x33 (deterministic)\n"
         "  uniform  = FP4 U(-3,3)\n"
-        "  gaussian = N(0,1)                 [norm-dist / LLM-like]\n"
-        "  trig     = trig_float in [-2,2]   [optimistic pattern]\n"
-        "  random   = pure random e2m1 codes [overly pessimistic]\n"
-        "  constant = A=0x22, B=0x33 (deterministic)",
+        "  norm     = N(0,1)                 [norm-dist / LLM-like]",
     )
     parser.add_argument(
         "--scale-init",
         dest="scale_init",
         nargs="*",
-        choices=["auto", "pow2_binomial", "gaussian", "random", "constant"],
+        choices=["auto", "pow2_binomial", "zero", "constant", "uniform", "norm"],
         default=None,
         help="SCALE init distribution(s) (by scale format)\n"
         "Default (unset): perf/profile = 'constant auto', func = 'auto'\n"
         "  auto          = format-recommended: mxfp4/E8M0 -> pow2_binomial,\n"
         "                  nvfp4/E4M3 -> gaussian(0.34375,0.08)\n"
         "  pow2_binomial = 2^(Binomial(21,0.5)-11)   [E8M0 only]\n"
-        "  gaussian      = N(0.34375,0.08)           [E4M3 only]\n"
-        "  random        = random on-wire byte, modest range\n"
-        "  constant      = neutral scale (2^0 = 1.0)",
+        "  zero          = all-zero scale bytes\n"
+        "  constant      = neutral scale (2^0 = 1.0)\n"
+        "  uniform       = U(0.5,2) -> nearest on-wire byte\n"
+        "  norm          = N(1,0.25) -> nearest on-wire byte",
     )
     parser.add_argument(
         "--seed",
