@@ -245,20 +245,37 @@ own suite says, and what a grid the PR never runs says.
 
 #### Choosing how to run the target
 
-Read the file. An explicit `path::node`, or a file defining `test*`/`Test*`, is pytest; a file
-with an `if __name__ == "__main__"` guard runs as a script; a file with neither is `skip`, never a
-test failure.
+**You decide this, and you must say so: `--runner pytest|script` with `--runner-reason`.** The
+validator no longer guesses, and with nothing declared it runs nothing and says the runner was
+never declared. A wrong guess here is not a wrong guess about style — it publishes *"the PR's own
+test fails on head"* against the author, on a target that is green.
 
-The trap is a file that is **both**. It defines `test*` nodes *and* parses argv in its module
-body: pytest collects it, imports it with pytest's own argv, argparse exits the process — and the
-same file is green when run as a script. So when a run executes nothing, say that in those words.
-*"Red on both sides"* is an attribution, not an explanation, and a reader who is not told
-otherwise concludes the code is broken when the runner choice is.
+Read the file. A file defining `test*`/`Test*` is usually pytest; a file with an
+`if __name__ == "__main__"` guard runs as a script; a file with neither is `skip`, never a test
+failure. Only `path::node` decides itself — nothing can run that string as a script.
 
-Record which runner ran and why. Both runners are profiled identically — the probe is installed by
-a validator-owned wrapper that then executes the file under `runpy` with `run_name="__main__"`,
-because nothing about `sys.setprofile` ever needed pytest; pytest was only where the hook was
-convenient to install.
+Two traps, both of which have already produced that false blocker:
+
+- **"Defines a `test*` function" is not "pytest can collect it."** aiter's dominant `op_tests`
+  convention is a *script* whose worker happens to be named `test_<op>(m, d, dtype)` and is called
+  from `main()` with real arguments. pytest collects it, cannot supply the parameters, and errors.
+  So look at the parameters: **required positional parameters, and no `parametrize`/`fixture`/
+  `usefixtures` decorator, means pytest cannot run it** — a required positional can be a fixture,
+  but not one the file neither defines nor imports. When in doubt call it a script; being wrong in
+  that direction costs a run, being wrong in the other direction blames a person.
+  (ROCm/aiter#5081.)
+- **A module that parses argv in its body cannot be collected**, even if it does define real test
+  nodes: pytest imports it during collection with pytest's own argv, and argparse exits the
+  process. The same file is green as a script. (ROCm/aiter#5172.)
+
+So when a run executes nothing, say that in those words. *"Red on both sides"* is an attribution,
+not an explanation, and a reader who is not told otherwise concludes the code is broken when the
+runner choice was. The report records `runner_basis` — whether the runner was your declaration or
+a fact about the target — so that a reader can tell your claim from a measurement.
+
+Both runners are profiled identically: the probe is installed by a validator-owned wrapper that
+then executes the file under `runpy` with `run_name="__main__"`, because nothing about
+`sys.setprofile` ever needed pytest; pytest was only where the hook was convenient to install.
 
 #### What counts as having run
 
