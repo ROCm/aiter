@@ -1648,6 +1648,14 @@ FUSED_MOE_ROUTER_MAX_TOPK = 64  # kWaveSize
 FUSED_MOE_ROUTER_MAX_EXPERTS = 512  # 2 * BlockSize
 
 
+def _cfg_topk(topk: int, n_shared: int, expert_mask: torch.Tensor | None) -> int:
+    """Tuned-config topk key: the width the unfused path would look up.
+
+    get_2stage_cfgs strips the EP fake slot back off, so add it here.
+    """
+    return topk + n_shared + int(expert_mask is not None and n_shared > 0)
+
+
 def fused_moe_router_arch_supported() -> bool:
     """Whether this GPU can run :func:`fused_moe_router` at all.
 
@@ -1708,15 +1716,15 @@ def fused_moe_router_supported(
     :func:`fused_moe_router_config_supported`, so it depends on the actual
     call and has to be re-checked on every forward.
     """
-    # gating_output is not passed in, so bound global_E by the shapes. The mask
-    # spans every emitted id -- routed, then the shared slots, then the
-    # always-masked sentinel the fused-shared path adds -- so dropping those
-    # trailing slots gives an upper bound, which is the safe side of the cap.
-    # Without a mask there is no EP and w1 holds routed plus shared.
+    # gating_output is not passed in, so derive global_E from the shapes. The
+    # mask spans every emitted id -- routed, then the shared slots, then the
+    # sentinel, which callers allocate whether or not shared fusion is on --
+    # so drop those trailing slots. Without a mask there is no EP and w1 holds
+    # routed plus shared.
     n_shared = num_fused_shared_experts
     local_E = w1.shape[0]
     if expert_mask is not None:
-        global_E = expert_mask.numel() - n_shared - (1 if n_shared else 0)
+        global_E = expert_mask.numel() - n_shared - 1
     else:
         global_E = local_E - n_shared
     if not (
@@ -1737,10 +1745,11 @@ def fused_moe_router_supported(
         # the one wave the top-k selects in.
         and 0 <= n_shared <= 1
         and topk + n_shared <= FUSED_MOE_ROUTER_MAX_TOPK
-        # Mirror the entry's expert-count checks; stage1 also needs a weight
-        # row per emitted expert.
+        # Mirror the entry's expert-count checks. topk is global, so it goes
+        # against global_E; only the shared rows live in this rank's w1.
         and global_E <= FUSED_MOE_ROUTER_MAX_EXPERTS
-        and local_E >= max(topk, n_shared)
+        and topk <= global_E
+        and local_E >= n_shared
     ):
         return False
 
@@ -1764,7 +1773,7 @@ def fused_moe_router_supported(
         model_dim,
         inter_dim,
         E,
-        topk + num_fused_shared_experts,
+        _cfg_topk(topk, n_shared, expert_mask),
         dtype,
         q_dtype_a,
         q_dtype_w,
@@ -1777,6 +1786,8 @@ def fused_moe_router_supported(
         getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False),
         gate_mode,
         is_ep=expert_mask is not None,
+        opus_weights_shuffled=getattr(w1, "is_shuffled", False)
+        and getattr(w2, "is_shuffled", False),
     )
     return not metadata.run_1stage and not metadata.flat
 
@@ -1882,14 +1893,12 @@ def fused_moe_router(
         M, hidden_states, w1, quant_type, activation, gate_mode, a1_scale, dtype
     )
 
-    # topk_total, not topk: the shared rows go through the same GEMM, so they
-    # are what the config is sized for downstream.
     metadata = get_2stage_cfgs(
         get_padded_M(M),
         model_dim,
         inter_dim,
         E,
-        topk_total,
+        _cfg_topk(topk, n_shared, expert_mask),
         dtype,
         q_dtype_a,
         q_dtype_w,
@@ -1902,6 +1911,8 @@ def fused_moe_router(
         isShuffled,
         gate_mode,
         is_ep=expert_mask is not None,
+        opus_weights_shuffled=getattr(w1, "is_shuffled", False)
+        and getattr(w2, "is_shuffled", False),
     )
     block_size_M = int(metadata.block_m)
 
@@ -1920,17 +1931,18 @@ def fused_moe_router(
         num_expert_group == 1 and topk_group == 1
     ), f"fused_moe_router: {num_expert_group=} {topk_group=}, only 1/1 is fused"
     assert not doweight_stage1, "fused_moe_router: doweight_stage1 is not fused"
+    # The kernel routes all M rows and reports num_valid_ids[1] = M, so a
+    # device-side valid-row count would leave the padding rows routed.
+    assert num_local_tokens is None, "fused_moe_router: num_local_tokens is not honored"
     # Mirrors the entry's routed-expert check; assert here so the failure names
     # the gating width rather than surfacing from C++.
-    assert (
-        global_E <= FUSED_MOE_ROUTER_MAX_EXPERTS
-    ), (
+    assert global_E <= FUSED_MOE_ROUTER_MAX_EXPERTS, (
         f"fused_moe_router: num_experts must be <= "
         f"{FUSED_MOE_ROUTER_MAX_EXPERTS}, got {global_E}"
     )
-    assert 0 <= n_shared <= 1, (
-        f"fused_moe_router: num_fused_shared_experts must be 0 or 1, got {n_shared}"
-    )
+    assert (
+        0 <= n_shared <= 1
+    ), f"fused_moe_router: num_fused_shared_experts must be 0 or 1, got {n_shared}"
     # The shared experts get their own weight rows, appended after the local
     # routed ones (matching vLLM's expert_map). Without them stage1 would index
     # past the last expert for every shared row.
@@ -2043,6 +2055,7 @@ def fused_moe_router(
         gate_mode=gate_mode,
         expert_mask=expert_mask,
         a1_prequant=(a1, a1_scale_sorted),
+        _metadata=metadata,
     )
 
 
@@ -4439,6 +4452,8 @@ def fused_moe_2stages(
     routing_num_experts: int | None = None,
     # (a1, a1_scale) already quantized+sorted by the caller; skips stage1 quant.
     a1_prequant=None,
+    # Final config from a caller that already looked it up.
+    _metadata: MOEMetadata | None = None,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
@@ -4459,50 +4474,57 @@ def fused_moe_2stages(
     config_situ_beta, config_situ_linear_beta, normalized_swiglu_limit = (
         _normalize_mxfp4_activation_params(activation, beta, linear_beta, swiglu_limit)
     )
-    metadata = get_2stage_cfgs(
-        get_padded_M(token_num),  # consider token_num > 1024 as prefill
-        model_dim,
-        inter_dim,
-        E,
-        topk,
-        dtype,
-        q_dtype_a,
-        q_dtype_w,
-        quant_type,
-        isG1U1,
-        activation,
-        doweight_stage1,
-        hidden_pad,
-        intermediate_pad,
-        is_shuffled,
-        gate_mode,
-        is_ep=expert_mask is not None,
-        has_stage1_bias=bias1 is not None,
-        has_stage2_bias=bias2 is not None,
-        situ_beta=config_situ_beta,
-        situ_linear_beta=config_situ_linear_beta,
-        swiglu_limit=swiglu_limit,
-        opus_weights_shuffled=getattr(w1, "is_shuffled", False)
-        and getattr(w2, "is_shuffled", False),
-        config_file=_metadata_config_file,
-        input_dtype=hidden_states.dtype,
-    )
-    if _metadata_transform is not None:
-        metadata = _metadata_transform(metadata)
-    if (
-        getattr(metadata.stage1, "func", metadata.stage1) is _mxfp4_a4w4_stage1_fw
-        and metadata.output_aux == AUX_SORT_OPUS
-        # Prequant is a property of GEMM1, not of the sort: block_m 16 is the
-        # only inline-quant ("_f16in") a4w4 variant, and that kernel reads raw
-        # bf16 hidden_states and ignores the A buffers entirely. Handing it a
-        # prequantized fp4 A plus scales faults with an illegal address. Keep
-        # this keyed on block_m rather than on _aux_uses_opus, which now sends
-        # block_m 16 to Opus for the sort alone.
-        and int(metadata.block_m) != 16
-    ):
-        # Main's fused prequant already writes the E8M0 scale layout consumed by
-        # replacement GEMM1 on the default Opus auxiliary path.
-        metadata = replace(metadata, prequant=True)
+    # _metadata is already final, so a transform would be silently dropped.
+    assert (
+        _metadata is None or _metadata_transform is None
+    ), "fused_moe_2stages: _metadata and _metadata_transform are exclusive"
+    if _metadata is not None:
+        metadata = _metadata
+    else:
+        metadata = get_2stage_cfgs(
+            get_padded_M(token_num),  # consider token_num > 1024 as prefill
+            model_dim,
+            inter_dim,
+            E,
+            topk,
+            dtype,
+            q_dtype_a,
+            q_dtype_w,
+            quant_type,
+            isG1U1,
+            activation,
+            doweight_stage1,
+            hidden_pad,
+            intermediate_pad,
+            is_shuffled,
+            gate_mode,
+            is_ep=expert_mask is not None,
+            has_stage1_bias=bias1 is not None,
+            has_stage2_bias=bias2 is not None,
+            situ_beta=config_situ_beta,
+            situ_linear_beta=config_situ_linear_beta,
+            swiglu_limit=swiglu_limit,
+            opus_weights_shuffled=getattr(w1, "is_shuffled", False)
+            and getattr(w2, "is_shuffled", False),
+            config_file=_metadata_config_file,
+            input_dtype=hidden_states.dtype,
+        )
+        if _metadata_transform is not None:
+            metadata = _metadata_transform(metadata)
+        if (
+            getattr(metadata.stage1, "func", metadata.stage1) is _mxfp4_a4w4_stage1_fw
+            and metadata.output_aux == AUX_SORT_OPUS
+            # Prequant is a property of GEMM1, not of the sort: block_m 16 is the
+            # only inline-quant ("_f16in") a4w4 variant, and that kernel reads raw
+            # bf16 hidden_states and ignores the A buffers entirely. Handing it a
+            # prequantized fp4 A plus scales faults with an illegal address. Keep
+            # this keyed on block_m rather than on _aux_uses_opus, which now sends
+            # block_m 16 to Opus for the sort alone.
+            and int(metadata.block_m) != 16
+        ):
+            # Main's fused prequant already writes the E8M0 scale layout consumed
+            # by replacement GEMM1 on the default Opus auxiliary path.
+            metadata = replace(metadata, prequant=True)
     if a1_prequant is not None:
         a1, a1_scale = a1_prequant
     elif not metadata.prequant:
