@@ -17,12 +17,12 @@ void topk_sigmoid(torch::Tensor topk_weights,   // [tokens, topk]
                   torch::Tensor topk_indices,   // [tokens, topk]
                   torch::Tensor gating_output)  // [tokens, experts] 
 {
-    // The kernel writes 32-bit ids and weights through the raw data_ptr(); a
-    // wider buffer is written 4 bytes per element and its remaining bytes keep
-    // whatever the caller allocated.
-    TORCH_CHECK(topk_weights.dtype() == torch::kFloat32,
-                "topk_sigmoid: topk_weights must be float32, got ",
-                topk_weights.dtype());
+    // Only the index buffer has a fixed width here: it is written through the
+    // raw data_ptr() as 32-bit, so a wider buffer would get 4 bytes per element
+    // and keep whatever the caller allocated in the rest. The weight buffer is
+    // not fixed -- weight_prec below is derived from topk_weights.dtype() and
+    // the kernel writes at the selected width -- so fp16/bf16/fp32 are all
+    // legitimate there and must not be rejected.
     TORCH_CHECK(topk_indices.dtype() == torch::kInt32,
                 "topk_sigmoid: topk_indices must be int32, got ",
                 topk_indices.dtype());
