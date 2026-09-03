@@ -2637,6 +2637,7 @@ class FlashAttnFunc(torch.autograd.Function):
         cu_seqlens_kv: torch.Tensor | None = None,
         sink_ptr: Tensor | None = None,
         num_splits: int = 0,
+        out: torch.Tensor | None = None,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
@@ -2648,6 +2649,12 @@ class FlashAttnFunc(torch.autograd.Function):
             k = torch.nn.functional.pad(k, [0, 8 - head_size_q_og % 8])
         if head_size_v_og % 8 != 0:
             v = torch.nn.functional.pad(v, [0, 8 - head_size_v_og % 8])
+        # A padded head dim would make out_padded wider than the caller's buffer.
+        if out is not None and head_size_v_og % 8 != 0:
+            raise NotImplementedError(
+                "flash_attn_func: out= requires head_dim_v to be a multiple of 8, got "
+                f"{head_size_v_og}"
+            )
         out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
             q,
             k,
@@ -2670,6 +2677,7 @@ class FlashAttnFunc(torch.autograd.Function):
             cu_seqlens_kv=cu_seqlens_kv,
             sink_ptr=sink_ptr,  # fwd kernel still uses sink_ptr naming
             num_splits=num_splits,
+            out=out,
         )
         if is_grad:
             assert return_lse
@@ -2797,6 +2805,7 @@ def flash_attn_func(
     cu_seqlens_kv: torch.Tensor | None = None,
     sink_ptr: Tensor | None = None,
     num_splits: int = 0,
+    out: Tensor | None = None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -2844,6 +2853,8 @@ def flash_attn_func(
             0 (default) lets aiter decide via a heuristic; 1 disables split-K (uses the
             standard CK/ASM dispatch); >=2 forces the native split-K kernel with that many
             splits when that path is applicable, otherwise num_splits is ignored.
+        out: (batch_size, seqlen, nheads, headdim_v). Optional caller-owned output buffer,
+            written in place and returned; mirrors `flash_attn_varlen_func`'s `out`.
     Return:
         out: (batch_size, seqlen, nheads, headdim_v).
         softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen). The
@@ -2883,6 +2894,11 @@ def flash_attn_func(
             return _flydsl_result
 
     if not ENABLE_CK:
+        # The triton entry has no out=; fail loudly rather than leave it unwritten.
+        if out is not None:
+            raise NotImplementedError(
+                "flash_attn_func: out= is not supported on the triton path (ENABLE_CK=0)"
+            )
         from .triton.attention.mha import flash_attn_func as flash_attn_func_triton
 
         return flash_attn_func_triton(
@@ -2920,6 +2936,7 @@ def flash_attn_func(
         cu_seqlens_kv,
         sink_ptr,
         num_splits,
+        out,
     )
 
 
@@ -3799,11 +3816,16 @@ def flash_attn_varlen_func(
             return False
         if k.shape[0] < max_seqlen_k or v.shape[0] < max_seqlen_k:
             return False
-        # flash_attn_func has no `out` parameter, and routing here with a caller
-        # buffer would mean a hidden extra copy -- decline instead. (vLLM's extend
-        # path does not pass out=.)
+        # Forwarded to the dense entry as a view, so no copy. Requires exactly one output
+        # row per query row (an oversized out would leave a stale tail), plus matching
+        # dtype/heads and contiguity so the unsqueeze below stays a view.
         if out is not None:
-            return False
+            if out.dim() != 3 or out.shape[0] != q.shape[0]:
+                return False
+            if out.shape[-2] != q.shape[-2] or out.shape[-1] != v.shape[-1]:
+                return False
+            if out.dtype != q.dtype or not out.is_contiguous():
+                return False
         # everything the dense OPUS gate also rejects
         if block_table is not None or bias is not None or alibi_slopes is not None:
             return False
@@ -3832,6 +3854,7 @@ def flash_attn_varlen_func(
             deterministic=deterministic,
             return_lse=return_lse,
             sink_ptr=sink_ptr,
+            out=None if out is None else out.unsqueeze(0),
         )
         # Output is [1, max_seqlen_q, H, D]; varlen callers expect [total_q, H, D], and
         # total_q == max_seqlen_q for one sequence, so squeeze yields the right extent.
