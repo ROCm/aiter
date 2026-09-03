@@ -85,7 +85,7 @@ for file in "${sharded_files[@]}"; do
     test_cmd=(timeout 60m python3 "$file")
     case "$file" in
         op_tests/flydsl_tests/test_flydsl_*.py)
-            test_cmd=(python3 -m pytest "$file")
+            test_cmd=(timeout 60m python3 -m pytest "$file")
             ;;
         op_tests/multigpu_tests/test_mega_moe_gfx1250.py)
             {

@@ -315,7 +315,7 @@ def main():
         type=dtypes.str2Dtype,
         choices=[dtypes.d_dtypes["bf16"]],
         nargs="*",
-        default="bf16,",
+        default=[dtypes.d_dtypes["bf16"]],
         metavar="{bf16}",
         help="""Data type.
     e.g.: -d bf16""",

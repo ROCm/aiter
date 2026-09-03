@@ -598,8 +598,9 @@ def flydsl_decode_gemm(
         raise ValueError("FlyDSL decode does not support scaling")
     if bpreshuffle:
         raise ValueError("FlyDSL decode does not support preshuffled weights")
-    if (otype or inp.dtype) != torch.bfloat16:
-        raise ValueError("FlyDSL decode requires BF16 output")
+    out_dtype = otype or inp.dtype
+    if inp.dtype != torch.bfloat16 or out_dtype != torch.bfloat16:
+        raise ValueError("FlyDSL decode requires BF16 input and output")
     from aiter.ops.flydsl.gemm_kernels import (
         gemm_decode_bf16,
         parse_gemm_decode_kernel_name,

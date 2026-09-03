@@ -357,10 +357,12 @@ def shuffle_scale_w4_cdna4(src: torch.Tensor) -> torch.Tensor:
     n, k_bytes = src.shape
     n_lane, n_pack, k_pack = 16, 2, 2
     k_lane = 64 // n_lane
-    assert n % (n_lane * n_pack) == 0, f"N={n} must be a multiple of 32"
-    assert (
-        k_bytes % (k_pack * k_lane) == 0
-    ), f"scale K extent {k_bytes} must be a multiple of 8 (256 K values)"
+    if not (n % (n_lane * n_pack) == 0):
+        raise ValueError(f"N={n} must be a multiple of 32")
+    if not (k_bytes % (k_pack * k_lane) == 0):
+        raise ValueError(
+            f"scale K extent {k_bytes} must be a multiple of 8 (256 K values)"
+        )
     n1 = n // (n_lane * n_pack)
     k1 = k_bytes // (k_pack * k_lane)
     out = src.view(n1, n_pack, n_lane, k1, k_pack, k_lane)
