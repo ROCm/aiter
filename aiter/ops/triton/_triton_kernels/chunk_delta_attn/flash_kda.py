@@ -494,17 +494,30 @@ def _flash_kda_segment_kernel(
     if STORE_FINAL:  # noqa: SIM102
         if tl.load(seg_is_last + i_seg) == 1:
             i_n = tl.load(seg_seq + i_seg).to(tl.int64)
+            dt_s = final_state.dtype.element_ty
             if STATE_V_FIRST:
                 f_off = (i_n * H + i_h) * V * K + o_w[None, :] * K
-                tl.store(final_state + f_off + o_k1[:, None], b_h1, mask=m_w[None, :])
-                tl.store(final_state + f_off + o_k2[:, None], b_h2, mask=m_w[None, :])
+                tl.store(
+                    final_state + f_off + o_k1[:, None],
+                    b_h1.to(dt_s),
+                    mask=m_w[None, :],
+                )
+                tl.store(
+                    final_state + f_off + o_k2[:, None],
+                    b_h2.to(dt_s),
+                    mask=m_w[None, :],
+                )
             else:
                 f_off = (i_n * H + i_h) * K * V + o_w[None, :]
                 tl.store(
-                    final_state + f_off + o_k1[:, None] * V, b_h1, mask=m_w[None, :]
+                    final_state + f_off + o_k1[:, None] * V,
+                    b_h1.to(dt_s),
+                    mask=m_w[None, :],
                 )
                 tl.store(
-                    final_state + f_off + o_k2[:, None] * V, b_h2, mask=m_w[None, :]
+                    final_state + f_off + o_k2[:, None] * V,
+                    b_h2.to(dt_s),
+                    mask=m_w[None, :],
                 )
 
 

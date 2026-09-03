@@ -100,8 +100,9 @@ def chunk_kimi_delta_attn(
             recurrence accumulates in fp32 whatever the state is stored as. For
             equal-length inputs `N` equals the batch size `B`. Default: `None`.
         output_final_state (bool):
-            Whether to return the final state, same shape and dtype as
-            `initial_state`. Default: `False`.
+            Whether to return the final state, same shape as `initial_state`.
+            Its dtype is `initial_state`'s on the FlashKDA path and fp32 on the
+            default pipeline. Default: `False`.
         use_qk_l2norm_in_kernel (bool):
             Whether to L2-normalize `q` and `k` before the recurrence.
         use_gate_in_kernel (bool):
@@ -197,6 +198,10 @@ def chunk_kimi_delta_attn(
                 f"of input sequences, i.e., {len(cu_seqlens) - 1} rather than "
                 f"{initial_state.shape[0]}."
             )
+    if initial_state is not None and not initial_state.is_floating_point():
+        raise ValueError(
+            f"`initial_state` must be a float tensor, got {initial_state.dtype}."
+        )
     if use_gate_in_kernel and A_log is None:
         raise ValueError("`A_log` must be provided when `use_gate_in_kernel=True`.")
     if safe_gate and use_gate_in_kernel:
