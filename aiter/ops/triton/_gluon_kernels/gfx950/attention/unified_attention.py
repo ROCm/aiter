@@ -691,24 +691,8 @@ class AsyncGatherKVLoader:
 
     @gluon.jit
     def load_k_to_shared(self, k_offset, buffer_id=0):
-        # k_offset is the tile index. Map each element's sequence position to its
-        # physical block and within-block row, then gather.
-        seq_offset_k = k_offset * self.cfg.TILE_SIZE + self.offs_n_k
-        block_table_idx = gl.minimum(
-            seq_offset_k // self.cfg.BLOCK_SIZE, self.cfg.block_table_stride - 1
-        )
-        within_block_k = (
-            seq_offset_k % self.cfg.BLOCK_SIZE
-        ) * self.cfg.stride_k_cache_1
-        block_ids = gl.amd.cdna4.buffer_load(
-            ptr=self.block_tables_ptr_shifted, offsets=block_table_idx
-        )
-        # Widen the block index for >2 GB caches (constexpr stride stays baked in).
-        if self.cfg.USE_LOAD_BUFFER_OP:
-            block_base_k = block_ids * self.cfg.stride_k_cache_0
-        else:
-            block_base_k = block_ids.to(gl.int64) * self.cfg.stride_k_cache_0
-        k_offset_tensor = self.k_head_d_offset + within_block_k + block_base_k
+        # load_block_ids returns the (k, v) offset pair
+        k_offset_tensor = k_offset[0]
         if self.cfg.USE_LOAD_BUFFER_OP:
             gl.amd.cdna4.async_copy.buffer_load_to_shared(
                 self.k_shared.index(buffer_id),
@@ -726,22 +710,7 @@ class AsyncGatherKVLoader:
 
     @gluon.jit
     def load_v_to_shared(self, v_offset, buffer_id=0):
-        seq_offset_v = v_offset * self.cfg.TILE_SIZE + self.offs_n_v
-        block_table_idx = gl.minimum(
-            seq_offset_v // self.cfg.BLOCK_SIZE, self.cfg.block_table_stride - 1
-        )
-        within_block_v = (
-            seq_offset_v % self.cfg.BLOCK_SIZE
-        ) * self.cfg.stride_v_cache_1
-        block_ids = gl.amd.cdna4.buffer_load(
-            ptr=self.block_tables_ptr_shifted, offsets=block_table_idx
-        )
-        # Widen the block index for >2 GB caches (constexpr stride stays baked in).
-        if self.cfg.USE_LOAD_BUFFER_OP:
-            block_base_v = block_ids * self.cfg.stride_v_cache_0
-        else:
-            block_base_v = block_ids.to(gl.int64) * self.cfg.stride_v_cache_0
-        v_offset_tensor = self.v_head_d_offset + within_block_v + block_base_v
+        v_offset_tensor = v_offset[1]
         if self.cfg.USE_LOAD_BUFFER_OP:
             gl.amd.cdna4.async_copy.buffer_load_to_shared(
                 self.v_shared.index(buffer_id),
@@ -799,9 +768,41 @@ class AsyncGatherKVLoader:
 
     @gluon.jit
     def load_block_ids(self, i):
-        # Per-element block lookups happen in load_{k,v}_to_shared; pass the tile
-        # index through.
-        return i
+        # The loop calls this two tiles ahead of the copy that uses it. vmcnt is
+        # in-order, so gathering next to the async copy would drop the wait to
+        # vmcnt(0) and drain the KV copies the double buffer is overlapping.
+        seq_offset_k = i * self.cfg.TILE_SIZE + self.offs_n_k
+        seq_offset_v = i * self.cfg.TILE_SIZE + self.offs_n_v
+        # clamp so the loop's j+2 prefetch never reads past the block table
+        block_table_idx_k = gl.minimum(
+            seq_offset_k // self.cfg.BLOCK_SIZE, self.cfg.block_table_stride - 1
+        )
+        block_table_idx_v = gl.minimum(
+            seq_offset_v // self.cfg.BLOCK_SIZE, self.cfg.block_table_stride - 1
+        )
+        block_ids_k = gl.amd.cdna4.buffer_load(
+            ptr=self.block_tables_ptr_shifted, offsets=block_table_idx_k
+        )
+        block_ids_v = gl.amd.cdna4.buffer_load(
+            ptr=self.block_tables_ptr_shifted, offsets=block_table_idx_v
+        )
+        within_block_k = (
+            seq_offset_k % self.cfg.BLOCK_SIZE
+        ) * self.cfg.stride_k_cache_1
+        within_block_v = (
+            seq_offset_v % self.cfg.BLOCK_SIZE
+        ) * self.cfg.stride_v_cache_1
+        # Widen the block index for >2 GB caches (constexpr stride stays baked in).
+        if self.cfg.USE_LOAD_BUFFER_OP:
+            block_base_k = block_ids_k * self.cfg.stride_k_cache_0
+            block_base_v = block_ids_v * self.cfg.stride_v_cache_0
+        else:
+            block_base_k = block_ids_k.to(gl.int64) * self.cfg.stride_k_cache_0
+            block_base_v = block_ids_v.to(gl.int64) * self.cfg.stride_v_cache_0
+        return (
+            self.k_head_d_offset + within_block_k + block_base_k,
+            self.v_head_d_offset + within_block_v + block_base_v,
+        )
 
 
 @aggregate
