@@ -21,7 +21,6 @@ import torch
 
 from aiter import ActivationType, QuantType, dtypes, fused_moe
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.utils import is_flydsl_available
 
 # DeepSeek-V4 shape: the fallback is what DSv4 at EP8 actually takes.
 MODEL_DIM = 7168
@@ -32,7 +31,6 @@ TOKEN = 64
 
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a ROCm device"),
-    pytest.mark.skipif(not is_flydsl_available(), reason="needs FlyDSL"),
     pytest.mark.skipif(get_gfx() not in ("gfx950",), reason="mxfp4 a8w4 is gfx950"),
 ]
 
