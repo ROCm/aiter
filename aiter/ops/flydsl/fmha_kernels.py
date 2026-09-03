@@ -272,3 +272,49 @@ def flydsl_flash_attn_varlen_func(
         out=out,
         return_lse=return_lse,
     )
+
+
+# ---------------------------------------------------------------------------
+# Expose flydsl_flash_attn_func to the PyTorch dispatcher
+# (torch.ops.aiter.flydsl_flash_attn_func).
+# ---------------------------------------------------------------------------
+import functools as _ft
+import inspect as _insp
+
+from csrc.cpp_itfs.torch_utils import direct_register_custom_op
+
+_orig_flydsl_flash_attn_func = flydsl_flash_attn_func
+_faf_sig = _insp.signature(_orig_flydsl_flash_attn_func)
+
+
+@_ft.wraps(_orig_flydsl_flash_attn_func)
+def _flydsl_flash_attn_func_op(*args, **kwargs):
+    kwargs.pop("stream", None)
+    bound = _flydsl_flash_attn_func_op.__signature__.bind(*args, **kwargs)
+    bound.apply_defaults()
+    return _orig_flydsl_flash_attn_func(**bound.arguments)
+
+
+_flydsl_flash_attn_func_op.__signature__ = _faf_sig.replace(
+    parameters=[p for n, p in _faf_sig.parameters.items() if n != "stream"]
+)
+_flydsl_flash_attn_func_op.__annotations__ = {
+    k: v
+    for k, v in _orig_flydsl_flash_attn_func.__annotations__.items()
+    if k != "stream"
+}
+
+if not hasattr(torch.ops.aiter, "flydsl_flash_attn_func"):
+    direct_register_custom_op(
+        "flydsl_flash_attn_func",
+        _flydsl_flash_attn_func_op,
+        mutates_args=[],
+        fake_impl=lambda q, k, v, *a_, **k_: torch.empty_like(q),
+    )
+
+
+def flydsl_flash_attn_func(*args, **kwargs):
+    if kwargs.get("stream") is not None:
+        return _orig_flydsl_flash_attn_func(*args, **kwargs)
+    kwargs.pop("stream", None)
+    return torch.ops.aiter.flydsl_flash_attn_func(*args, **kwargs)
