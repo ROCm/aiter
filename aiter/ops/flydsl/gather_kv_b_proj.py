@@ -10,14 +10,17 @@ scale, per-tensor activation scale, page_size 1, bf16 outputs, gfx950.
 
 import functools
 
+import flydsl.expr as fx
 import torch
+from flydsl.runtime.device import get_rocm_arch
 from torch import Tensor
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
-# Fixed by the kernel: MFMA_Scale(16, 16, 128) over a 128-deep K tile, and the
-# MLA latent layout.
-BLOCK_K = 128
+from .kernels.gather_kv_b_proj_8wave import compile_gather_kv_b_proj_8w
+from .kernels.tensor_shim import _run_compiled
+
+# The MLA latent layout, fixed by the model.
 KV_C_DIM = 512
 KV_PE_DIM = 64
 KV_ROW_ELEMS = KV_C_DIM + KV_PE_DIM
@@ -25,24 +28,6 @@ KV_ROW_ELEMS = KV_C_DIM + KV_PE_DIM
 # LDS = 4 A buffers of (BM/2)x128 plus 4 B buffers of (BN/2)x128, 1 byte/elem.
 _LDS_BYTES_PER_BLOCK_UNIT = 256
 _I32_MAX = 2**31
-
-_compile_gather_8w = None
-_run_compiled = None
-_fx = None
-
-
-def _lazy_import() -> None:
-    global _compile_gather_8w, _run_compiled, _fx
-    if _compile_gather_8w is not None:
-        return
-    import flydsl.expr as fx_mod
-
-    from .kernels.gather_kv_b_proj_8wave import compile_gather_kv_b_proj_8w
-    from .kernels.tensor_shim import _run_compiled as run_compiled
-
-    _compile_gather_8w = compile_gather_kv_b_proj_8w
-    _run_compiled = run_compiled
-    _fx = fx_mod
 
 
 def lds_bytes(block_m: int, block_n: int) -> int:
@@ -77,10 +62,6 @@ def _validate(
             f"[FlyDSL gather_kv_b_proj] waves_per_eu must be >=1 (the kernel always "
             f"emits the rocdl.waves_per_eu attribute), got {waves_per_eu}"
         )
-    # Local import: this module stays importable without flydsl, matching
-    # gemm_a8w8_bpreshuffle_8wave.py.
-    from flydsl.runtime.device import get_rocm_arch
-
     need = lds_bytes(block_m, block_n)
     have = get_lds_capacity_bytes(get_rocm_arch().split(":", 1)[0])
     if need > have:
@@ -119,7 +100,6 @@ def compile_gather_kv_b_proj(
     per_row_scale: bool,
 ):
     """Compile (and memoize) a gather+proj launcher."""
-    _lazy_import()
     _validate(
         n_heads=n_heads,
         nope=nope,
@@ -127,7 +107,7 @@ def compile_gather_kv_b_proj(
         block_m=block_m,
         waves_per_eu=waves_per_eu,
     )
-    return _compile_gather_8w(
+    return compile_gather_kv_b_proj_8w(
         n_heads=int(n_heads),
         nope=int(nope),
         v_dim=int(v_dim),
@@ -181,7 +161,6 @@ def gather_kv_b_proj_flydsl(
     are neither read nor written -- their gathered indices are clamped by the
     kv_indices descriptor and their stores are dropped by the output descriptor.
     """
-    _lazy_import()
 
     if shuffled_kv_cache:
         raise ValueError(
@@ -316,5 +295,5 @@ def gather_kv_b_proj_flydsl(
         k_prefix.view(-1),
         v_prefix.view(-1),
         m_rows,
-        _fx.Stream(torch.cuda.current_stream(device=k_buffer.device)),
+        fx.Stream(torch.cuda.current_stream(device=k_buffer.device)),
     )

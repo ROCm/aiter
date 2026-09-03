@@ -12,8 +12,8 @@ Checked against two independent references:
   * the Triton op on the same preshuffled weight -- the two backends consume the
     same preshuffled tensor, which is itself the thing being asserted.
 Usage:
-    pytest op_tests/flydsl_tests/test_flydsl_gather_kv_b_proj.py -q
-    python op_tests/flydsl_tests/test_flydsl_gather_kv_b_proj.py      # + perf
+    pytest op_tests/test_flydsl_gather_kv_b_proj.py -q
+    python op_tests/test_flydsl_gather_kv_b_proj.py      # + perf
 """
 
 import argparse

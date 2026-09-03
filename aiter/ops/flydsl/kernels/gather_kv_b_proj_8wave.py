@@ -121,7 +121,6 @@ class BlockScale:
         ]
         self.fk = sk[k_iters - 1]
         self.fv = sv[k_iters - 1]
-        self.k_iters = k_iters
 
     def rescale(self, frags_k0, frags_k1, frags_v0, frags_v1, kt):
         """Renormalise all four accumulator groups before tile ``kt`` (kt >= 1)."""
@@ -136,12 +135,6 @@ class BlockScale:
         ):
             out.append([Vec(x) * r for x in frags])
         return out
-
-    def final_k(self):
-        return self.fk
-
-    def final_v(self):
-        return self.fv
 
 
 class StoreKV:
@@ -296,31 +289,23 @@ def _rope_copy(
         out_base = (
             (m_base + row_local) * kp_row + head * (nope + KV_PE_DIM) + nope + half * 32
         )
-        _rope_pass(
-            a_div, kp_div, src_base, out_base, ld, st, src_reg, dst_reg, ks4, v2f32
-        )
-
-
-def _rope_pass(a_div, kp_div, src_base, out_base, ld, st, src_reg, dst_reg, ks4, v2f32):
-    """One 32-element rope chunk: 32 fp8 in -> 32 bf16 out."""
-
-    for sub in range_constexpr(2):  # 2 x 16 fp8 = the 32 elements this lane owns
-        fx.copy(ld, fx.slice(a_div, (None, src_base + sub * 16)), src_reg)
-        words = Vec(fx.memref_load_vec(src_reg)).bitcast(fx.Int32)  # 4 x i32
-        outs = []
-        for w in range_constexpr(4):  # each i32 packs 4 fp8
-            lo = cvt_pk_f32_fp8(res=v2f32, src=words[w], word_sel=False)
-            hi = cvt_pk_f32_fp8(res=v2f32, src=words[w], word_sel=True)
-            outs.append((Vec(lo.shuffle(hi, [0, 1, 2, 3])) * ks4).to(fx.BFloat16))
-        for p in range_constexpr(2):  # 2 x 8 bf16 = 2 x 16 B stores
-            fx.memref_store_vec(
-                outs[2 * p].shuffle(outs[2 * p + 1], list(range(8))), dst_reg
-            )
-            fx.copy(
-                st,
-                dst_reg,
-                fx.slice(kp_div, (None, out_base + sub * 16 + p * 8)),
-            )
+        for sub in range_constexpr(2):  # 2 x 16 fp8 = the 32 elements this lane owns
+            fx.copy(ld, fx.slice(a_div, (None, src_base + sub * 16)), src_reg)
+            words = Vec(fx.memref_load_vec(src_reg)).bitcast(fx.Int32)  # 4 x i32
+            outs = []
+            for w in range_constexpr(4):  # each i32 packs 4 fp8
+                lo = cvt_pk_f32_fp8(res=v2f32, src=words[w], word_sel=False)
+                hi = cvt_pk_f32_fp8(res=v2f32, src=words[w], word_sel=True)
+                outs.append((Vec(lo.shuffle(hi, [0, 1, 2, 3])) * ks4).to(fx.BFloat16))
+            for p in range_constexpr(2):  # 2 x 8 bf16 = 2 x 16 B stores
+                fx.memref_store_vec(
+                    outs[2 * p].shuffle(outs[2 * p + 1], list(range(8))), dst_reg
+                )
+                fx.copy(
+                    st,
+                    dst_reg,
+                    fx.slice(kp_div, (None, out_base + sub * 16 + p * 8)),
+                )
 
 
 def compile_gather_kv_b_proj_8w(
@@ -476,8 +461,8 @@ def compile_gather_kv_b_proj_8w(
             per_row_scale=per_row_scale,
         )
         if const_expr(not per_row_scale):
-            store.block_scale_k = blk.final_k() * store.k_scale
-            store.block_scale_v = blk.final_v() * store.k_scale
+            store.block_scale_k = blk.fk * store.k_scale
+            store.block_scale_v = blk.fv * store.k_scale
 
         c00_frag = [mfma.zero_value] * N_ACCUMS
         c01_frag = [mfma.zero_value] * N_ACCUMS
