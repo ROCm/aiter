@@ -205,8 +205,26 @@ def _gluon_rms_norm_kernel(
         # preload the weights as they all fit within the shared memory
         gl.amd.gfx1250.tdm.async_load(weights_desc, [0], smemWeights)
         gl.amd.gfx1250.tdm.async_load(input_desc, [row_start, 0], smemInput.index(0))
+        
+        # preload the next row's input
+        gl.amd.gfx1250.tdm.async_load(input_desc, [row_start + NUM_PROG, 0], smemInput.index(1))
+        gl.amd.gfx1250.tdm.async_wait(1)
 
-        for row_idx in range(row_start, n_rows, NUM_PROG):
+        # compute the rms norm for the first row
+        smemInput_1d = smemInput.index(0).reshape([BLOCK_SIZE])
+        a = smemInput_1d.load(col_layout).to(gl.float32)
+        weights = smemWeights.load(col_layout).to(gl.float32)
+        row_sq_sum = gl.sum(a * a, axis=0)
+        norm_factor = gl.rsqrt((row_sq_sum / n_cols) + epsilon)
+
+        rms_norm = a * norm_factor * weights
+        gl.store(rsigma_ptr + row_start, norm_factor.to(rsigma_ptr.dtype.element_ty))
+        smemOutput1d = smemOutput.index(0).reshape([BLOCK_SIZE])
+        smemOutput1d.store(rms_norm.to(output_ptr.dtype.element_ty))
+        gl.amd.gfx1250.tdm.async_store(output_desc, [row_start, 0], smemOutput.index(0))
+
+
+        for row_idx in range(row_start + NUM_PROG, n_rows, NUM_PROG):
             # determine the current and next stage
             current_stage = ((row_idx - row_start) // NUM_PROG) % 2
             next_stage = 1 - current_stage
@@ -214,15 +232,13 @@ def _gluon_rms_norm_kernel(
             gl.amd.gfx1250.tdm.async_load(
                 input_desc, [row_idx + NUM_PROG, 0], smemInput.index(next_stage)
             )
-            gl.amd.gfx1250.tdm.async_wait(1)
+            gl.amd.gfx1250.tdm.async_wait(2)
 
             smemInput_1d = smemInput.index(current_stage).reshape([BLOCK_SIZE])
             a = smemInput_1d.load(col_layout).to(gl.float32)
             weights = smemWeights.load(col_layout).to(gl.float32)
-            # compute the square of the input
-            sum_sq = a * a
             # compute the sum of the square of the input
-            row_sq_sum = gl.sum(sum_sq, axis=0)
+            row_sq_sum = gl.sum(a * a, axis=0)
             # compute the norm factor
             norm_factor = gl.rsqrt((row_sq_sum / n_cols) + epsilon)
 
@@ -235,4 +251,4 @@ def _gluon_rms_norm_kernel(
             gl.amd.gfx1250.tdm.async_store(
                 output_desc, [row_idx, 0], smemOutput.index(current_stage)
             )
-            gl.amd.gfx1250.tdm.async_wait(0)
+        gl.amd.gfx1250.tdm.async_wait(0)
