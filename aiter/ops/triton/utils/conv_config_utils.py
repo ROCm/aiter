@@ -1,17 +1,25 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import copy
+"""Conv config loading: ``get_conv_config()`` with the variant-aware
+four-tier walk, the shape-key formatters, and the optional-table probes,
+on top of the shared core in ``config_utils``.
+"""
+
 import functools
 
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.core import (
-    AITER_TRITON_CONFIGS_PATH,
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+logger = AiterTritonLogger()
+
+from aiter.ops.triton.utils.config_utils import (
     USE_LRU_CACHE,
     load_config_json,
+    resolve_config_dir,
 )
 
-STANDARD_M_BOUNDS: tuple[int, ...] = (
+CONV_STANDARD_M_BOUNDS: tuple[int, ...] = (
     4,
     8,
     16,
@@ -56,31 +64,53 @@ def format_shape_key(
     )
 
 
+def format_prepack_shape_key(N: int, C: int, H: int, W: int, CB: int) -> str:
+    """Canonical key for an NCHW-to-NCHWc activation pack."""
+    return f"N={N},C={C},H={H},W={W},CB={CB}"
+
+
+def _conv_config_path(config_name: str) -> str:
+    # Nested layout <arch>/triton/conv/<d_type>/DEFAULT.json; the shared probe
+    # lives in resolve_config_dir().
+    cfg_dir = resolve_config_dir("conv", config_name, backend="triton")
+    return f"{cfg_dir}/DEFAULT.json"
+
+
+def _get_conv_config_file(config_name: str) -> dict:
+    return load_config_json(_conv_config_path(config_name))
+
+
 @functools.lru_cache(maxsize=512 if USE_LRU_CACHE else 0)
 def _get_conv_config_cached(
     config_name: str,
     shape_key: str | None,
     M: int | None,
+    variants: tuple[str, ...],
 ) -> dict:
-    """Three-tier walk: literal shape entry -> M_LEQ bucket -> 'any'."""
+    """Config walk: variant shape entries, generic shape, M bucket, any."""
     dev = arch_info.get_arch()
-    config_dict = load_config_json(
-        f"{AITER_TRITON_CONFIGS_PATH}/conv/{dev}-{config_name}.json"
-    )
+    config_dict = _get_conv_config_file(config_name)
 
-    # Tier 1: literal shape key.
+    # Tier 1: optional variant-specific exact-shape pins.
+    if shape_key is not None:
+        for variant in variants:
+            shapes = config_dict.get(f"shapes_{variant}", {})
+            if shape_key in shapes:
+                return shapes[shape_key]
+
+    # Tier 2: generic exact-shape pin.
     shapes = config_dict.get("shapes", {})
     if shape_key is not None and shape_key in shapes:
         return shapes[shape_key]
 
-    # Tier 2: M-bucket walk.
+    # Tier 3: M-bucket walk.
     if M is not None and M >= 0:
-        for bound in STANDARD_M_BOUNDS:
+        for bound in CONV_STANDARD_M_BOUNDS:
             key = f"M_LEQ_{bound}"
             if M <= bound and key in config_dict:
                 return config_dict[key]
 
-    # Tier 3: any fallback.
+    # Tier 4: any fallback.
     if "any" in config_dict:
         return config_dict["any"]
 
@@ -90,23 +120,45 @@ def _get_conv_config_cached(
     )
 
 
+@functools.lru_cache(maxsize=64 if USE_LRU_CACHE else 0)
+def has_conv_config(config_name: str) -> bool:
+    """Return whether the running architecture ships this optional table."""
+    config = load_config_json(_conv_config_path(config_name), required=False)
+    return config is not None
+
+
+def conv_config_uses_exact_routes(config_name: str) -> bool:
+    """Return whether routing is restricted to exact shape entries."""
+    return bool(_get_conv_config_file(config_name).get("route_exact_only"))
+
+
+def has_exact_conv_config(config_name: str, shape_key: str) -> bool:
+    """Return whether a config has an exact generic shape entry."""
+    config_dict = _get_conv_config_file(config_name)
+    return shape_key in config_dict.get("shapes", {})
+
+
 def get_conv_config(
     config_name: str,
     shape_key: str | None = None,
     M: int | None = None,
+    variants: tuple[str, ...] = (),
 ) -> dict:
     """Load a conv kernel config for the running GPU arch.
 
     Walk order (first hit wins):
-        1. ``shapes[shape_key]`` — exact-shape pin from the offline sweep.
-        2. ``M_LEQ_<n>`` — row-count bucket walk (M_total for GEMM-like
+        1. ``shapes_<variant>[shape_key]`` — optional variant-specific pin.
+        2. ``shapes[shape_key]`` — generic exact-shape pin.
+        3. ``M_LEQ_<n>`` — row-count bucket walk (M_total for GEMM-like
            kernels, T for Winograd).
-        3. ``"any"`` — global fallback.
+        4. ``"any"`` — global fallback.
 
-    Returns a fresh deep-copy of the config dict; safe to mutate.
+    Returns a fresh shallow copy of the config dict; safe to mutate. Conv
+    entries are flat mappings of scalar tuning values, so a deep copy only
+    adds hot-path overhead.
 
     Modeled on :func:`get_gemm_config` but with conv-native (shape-key first)
     dispatch and no splitk / N=K= specialization.
     """
-    config = _get_conv_config_cached(config_name, shape_key, M)
-    return copy.deepcopy(config)
+    config = _get_conv_config_cached(config_name, shape_key, M, variants)
+    return dict(config)

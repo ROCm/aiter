@@ -1,10 +1,7 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_ogs.py
 
-import functools
 import itertools
-import json
-import os
 
 import torch
 import triton
@@ -22,18 +19,8 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a4w4 import (
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
-
-
-@functools.lru_cache
-def _get_a4w4_dispatch(arch: str) -> dict:
-    fpath = f"{AITER_TRITON_CONFIGS_PATH}/moe/{arch}-A4W4.json"
-    if os.path.exists(fpath):
-        with open(fpath, "r") as f:
-            return json.load(f)
-    return {}
-
+from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
 
 # -----------------------------------------------------------------------------
 #                    Matrix Multiplication + Outer Gather/Scatter
@@ -116,7 +103,7 @@ def get_kernel_config_triton(m, n, k, routing_data):
         # for scale preshuffling
         block_n = 512
         block_k = 256
-        num_warps = 8
+        num_warps = 4
     num_stages = pick_gemm_num_stages(
         arch, block_m, block_n, block_k, 4, 4, use_async_padding=True
     )
@@ -157,7 +144,7 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     num_xcds = 1
 
     arch = get_arch()
-    tuned = _get_a4w4_dispatch(arch)
+    tuned = get_moe_dispatch("A4W4", arch, "gluon")
     key = f"bm{block_m}_n{n}_k{k}_{m2bucket(m)}"
     if key not in tuned:
         key = f"bm{block_m}_any"

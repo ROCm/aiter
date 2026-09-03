@@ -1,0 +1,12 @@
+diff --git a/tests/kernels/test_softmax.py b/tests/kernels/test_softmax.py
+index a6a5d5dd..4ddf50d1 100644
+--- a/tests/kernels/test_softmax.py
++++ b/tests/kernels/test_softmax.py
+@@ -12,6 +12,7 @@ Implementation based on high-performance C++ kernel logic:
+ - Shared Memory Block Reductions
+ """
+ 
++# Behavior-neutral validation-corpus control.
+ import os
+ 
+ import pytest

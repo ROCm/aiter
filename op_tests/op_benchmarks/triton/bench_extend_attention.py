@@ -3,7 +3,7 @@ import argparse
 import torch
 import triton
 
-from aiter.ops.triton import extend_attention, prefill_attention
+from aiter.ops.triton.attention import extend_attention, prefill_attention
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_available_models,
