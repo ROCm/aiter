@@ -987,6 +987,24 @@ For **Tier 2** files (fused_moe, mha, attention, gemm, mla, tuned_gemm, quant):
 
 ## Step 5 — Rule Checklist
 
+**Adjudicate every rule in `$WORK/rules.txt`, one line each, into `$WORK/verdicts.txt`.**
+The derivation already cut the list to what this diff can actually trigger — 12 rules at the
+median over 597 PRs, 14 on the Triton subset — so there is no rule here you may pass over
+because the list looked long. Format, one per rule id:
+
+```
+<RULE-ID> FIRE|CLEAR|N/A — <the specific reason, naming file:line, symbol, or the condition>
+```
+
+`CLEAR` means you looked and it does not apply *to this diff*; it is a claim, and the reason
+is what makes it checkable. "ok", "n/a", "fine" are not reasons — Step 8's gate rejects them.
+
+Step 8 will not let you write a verdict card until every derived rule has a line with a
+reason. This is the same move as running the D9 scan inside Step 1 rather than asking for it
+mid-checklist: on a 14-PR controlled run the revised D9 prose caught 0 of 3 known overflow
+defects and the scanner it names was never once invoked. A checklist a reviewer marks off to
+itself decays under load, silently, and the queue ahead is large.
+
 Six failure categories — work all six in order. Advisory severity per finding:
 🔴 high risk / ⚠️ should fix / 📝 note. These labels prioritize human attention; they do not
 themselves gate a merge.
@@ -1409,6 +1427,22 @@ If the answer is yes, add it to the findings. If the answer is no, proceed.
 ---
 
 ## Step 8 — Verdict
+
+**Before writing the card, run the ledger gate. A red gate means the rule pass did not
+happen; go back to Step 5 rather than reporting.**
+
+```bash
+"$SKILLS_ROOT/review-pr/triage.py" ledger "$WORK/rules.txt" "$WORK/verdicts.txt" || {
+  echo "rule pass incomplete — the card must not be written yet" >&2
+  exit 1
+}
+```
+
+It lists each derived rule with no verdict line (`UNADJUDICATED`) and each verdict with no
+reason (`NO-EVIDENCE`), and it fails closed: an empty or missing `rules.txt` is the state of
+a run whose Step 1b never happened, so it exits non-zero rather than waving the run through.
+The gate checks that each rule was answered, not that the answer is right — it closes the
+cheapest failure, which is not answering.
 
 **Output rules (strictly enforced):**
 - Run Steps 1–7 internally. Do NOT narrate steps, do NOT show checklists, do NOT show which rules fired.

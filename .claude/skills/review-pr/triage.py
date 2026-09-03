@@ -265,13 +265,78 @@ def sweep_symbols(diff_text, root):
     return bad
 
 
+# ------------------------------------------------------------------ rule ledger
+ADJUDICATION = re.compile(
+    r"^\s*([A-Z]+\d+[a-z]?)\s+(FIRE|CLEAR|N/A)\s*(?:--|—|:)\s*(.+?)\s*$")
+MIN_EVIDENCE = 12
+
+
+def expected_rules(rules_text):
+    """Rule ids `rules` mode derived for this diff."""
+    ids = []
+    for ln in rules_text.splitlines():
+        m = re.match(r"\s*\[[\w-]+\s*\]\s*(.+)$", ln)
+        if m:
+            ids.extend(t for t in m.group(1).split() if re.fullmatch(r"[A-Z]+\d+[a-z]?", t))
+    return sorted(set(ids))
+
+
+def audit_ledger(rules_text, verdicts_text):
+    """(missing, thin) -- rules never adjudicated, and rules adjudicated without
+    evidence. Empty/empty means the rule pass actually happened.
+
+    This exists because the skill's own history says prose does not survive contact
+    with a busy reviewer: the revised D9 text caught 0 of 3 known overflow defects
+    across a 14-PR run and the scanner it names was never once invoked. A checklist
+    the model marks off to itself degrades under load, and the load is about to be
+    large. This is the same move as running the D9 scan inside Step 1 -- make the
+    step produce an artifact something else can check."""
+    want = expected_rules(rules_text)
+    seen = {}
+    for ln in verdicts_text.splitlines():
+        m = ADJUDICATION.match(ln)
+        if m:
+            seen[m.group(1)] = (m.group(2), m.group(3))
+    missing = [r for r in want if r not in seen]
+    thin = [(r, seen[r][0]) for r in want
+            if r in seen and len(seen[r][1].strip()) < MIN_EVIDENCE]
+    return missing, thin
+
+
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
-    if mode not in ("rules", "evidence", "symbols"):
+    if mode not in ("rules", "evidence", "symbols", "ledger"):
         print("usage: triage.py rules <diff> [title]\n"
               "       triage.py evidence <diff> <head-file>...\n"
-              "       triage.py symbols <diff> <merge-target-root>", file=sys.stderr)
+              "       triage.py symbols <diff> <merge-target-root>\n"
+              "       triage.py ledger <rules.txt> <verdicts.txt>", file=sys.stderr)
         raise SystemExit(2)
+
+    if mode == "ledger":
+        rules_text = open(sys.argv[2], errors="replace").read()
+        try:
+            verdicts_text = open(sys.argv[3], errors="replace").read()
+        except OSError:
+            verdicts_text = ""
+        missing, thin = audit_ledger(rules_text, verdicts_text)
+        want = expected_rules(rules_text)
+        if not want:
+            # Fail closed. An empty or unreadable rules file is the state produced by a
+            # Step 1b that never ran, which is precisely the run that must not reach a
+            # verdict -- passing here would make skipping the derivation the cheapest path.
+            print("LEDGER UNUSABLE: no rules parsed from "
+                  f"{sys.argv[2]}; Step 1b did not produce a rule set", file=sys.stderr)
+            raise SystemExit(1)
+        for r in missing:
+            print(f"UNADJUDICATED: {r} was derived for this diff and has no verdict line")
+        for r, v in thin:
+            print(f"NO-EVIDENCE: {r} is marked {v} with no reason given")
+        if missing or thin:
+            print(f"LEDGER INCOMPLETE: {len(want) - len(missing) - len(thin)}/{len(want)} "
+                  f"rules adjudicated with evidence", file=sys.stderr)
+            raise SystemExit(1)
+        print(f"LEDGER COMPLETE: {len(want)}/{len(want)} rules adjudicated with evidence")
+        raise SystemExit(0)
 
     diff = open(sys.argv[2], errors="replace").read()
 
