@@ -16,10 +16,7 @@ from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..ops.flydsl.gemm_tune.flydsl_gemm_a4w4_bpreshuffle_common import (
     parse_a4w4_splitk_kernel_name as _parse_flydsl_a4w4_splitk_kernel_name,
 )
-from ..ops.flydsl.splitk_bpreshuffle_common import (
-    dispatch_flydsl_splitk,
-    is_flydsl_available,
-)
+from ..ops.flydsl.splitk_bpreshuffle_common import dispatch_flydsl_splitk
 from ..ops.gemm_op_common import get_padded_m
 from ..utility import dtypes
 
@@ -235,11 +232,7 @@ def gemm_a4w4(
         splitK = ck_config.get("splitK", None)
         kernelName = ck_config["kernelName"]
         libtype = ck_config.get("libtype", "")
-    if (
-        libtype == "flydsl"
-        and is_flydsl_available()
-        and kernelName.startswith("flydsl_a4w4_splitk_")
-    ):
+    if libtype == "flydsl" and kernelName.startswith("flydsl_a4w4_splitk_"):
         parsed = _parse_flydsl_a4w4_splitk_kernel_name(kernelName)
         if parsed is not None and n % 32 == 0:
             (

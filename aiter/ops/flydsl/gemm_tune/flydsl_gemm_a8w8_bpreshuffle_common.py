@@ -175,7 +175,7 @@ def max_lds_bytes_for_tune() -> int:
     times per shape). The arch is resolved once at import below, so a
     process-lifetime cache changes nothing.
     """
-    return get_lds_capacity_bytes(get_gfx())
+    return get_lds_capacity_bytes(get_gfx().split(":", 1)[0])
 
 
 def _padded_m(M: int) -> int:

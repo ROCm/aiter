@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Dispatch-side helpers shared by the a8w8 and a4w4 FlyDSL split-K bpreshuffle
-paths: ``is_flydsl_available`` (was copy-defined verbatim in
-``gemm_op_a8w8.py`` and ``gemm_op_a4w4.py``) and ``dispatch_flydsl_splitk``
-(the parsed-kernelName -> ``flydsl_preshuffle_gemm_splitk_a8`` call, shared by
+"""Dispatch-side helper shared by the a8w8 and a4w4 FlyDSL split-K bpreshuffle
+paths: ``dispatch_flydsl_splitk`` (the parsed-kernelName ->
+``flydsl_preshuffle_gemm_splitk_a8`` call, shared by
 ``gemm_op_a8w8.gemm_a8w8_bpreshuffle_flydsl``, the inline split-K branch in
 ``gemm_op_a8w8.gemm_a8w8_blockscale_bpreshuffle``, and
 ``gemm_op_a4w4.gemm_a4w4``).
@@ -20,14 +19,6 @@ not a second copy of the dispatch body.
 from collections.abc import Callable
 
 import torch
-
-
-def is_flydsl_available() -> bool:
-    try:
-        from .utils import is_flydsl_available as _is_flydsl_available
-    except ImportError:
-        return False
-    return _is_flydsl_available()
 
 
 def dispatch_flydsl_splitk(

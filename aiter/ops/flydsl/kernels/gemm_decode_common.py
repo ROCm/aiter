@@ -18,8 +18,8 @@ from flydsl.expr import arith, range_constexpr
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T
 
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels import buffer_ops, vector
-from aiter.ops.flydsl.utils import addressable_lds_bytes_for_gfx
 
 from .tensor_shim import _to_raw as raw
 
@@ -197,7 +197,7 @@ class BlockMfmaDecodeConfig:
             raise ValueError("stochastic BF16 conversion requires gfx950")
         if self.activation_source == ActivationSource.FULL_LDS:
             required = block_mfma_lds_bytes(m, k)
-            lds_limit = addressable_lds_bytes_for_gfx(arch)
+            lds_limit = get_lds_capacity_bytes(arch.split(":", 1)[0])
             if required > lds_limit:
                 raise ValueError(
                     f"full A LDS requires {required} bytes, exceeding the "

@@ -46,8 +46,8 @@ from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch
 
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels import vector
-from aiter.ops.flydsl.utils import addressable_lds_bytes_for_gfx
 
 from .splitk_hgemm import (
     OnlineScheduler,
@@ -109,7 +109,7 @@ def small_m_arch_params(arch: str) -> dict:
 def small_m_max_lds_bytes(arch: str) -> int:
     """Return the addressable per-workgroup LDS budget for ``arch``."""
     _require_small_m_arch(arch)
-    return addressable_lds_bytes_for_gfx(arch)
+    return get_lds_capacity_bytes(arch.split(":", 1)[0])
 
 
 def small_m_tile_k_is_swizzle_safe(tile_k: int) -> bool:
