@@ -548,14 +548,14 @@ if __name__ == "__main__":
 
     out_dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
     gen = _make_generator(args.seed)
-    init_kwargs = dict(
-        dist=args.data_init,
-        gen=gen,
-        const_val=args.const_val,
-        iters=args.iters,
-        warmup=args.warmup,
-        rotate=args.rotate,
-    )
+    init_kwargs = {
+        "dist": args.data_init,
+        "gen": gen,
+        "const_val": args.const_val,
+        "iters": args.iters,
+        "warmup": args.warmup,
+        "rotate": args.rotate,
+    }
 
     # Default action (no -m and no --csv_file): auto-sweep the opus shapes in
     # CUDA-graph mode and print the vs-CSV latency table. So a bare
