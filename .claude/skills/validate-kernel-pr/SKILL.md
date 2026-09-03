@@ -56,10 +56,16 @@ boundary, whatever the file layout.)
 | command | what it owns |
 |---|---|
 | `report.py init \| set \| stage \| finding \| finish` | the report itself. `finish` computes the verdict from the stages actually recorded, validates against `report_schema.json`, and is the **sole** writer of `verdict` and of the process exit code. |
-| `claim-gpu.sh` | picking an idle GPU, the sampling window that decided it was idle, and a `flock` held for the whole run. Records the idleness basis, not just the device id. |
+| `pick-idle-gpu.py` | the sampling window that decides a GPU is idle, and the `idleness-basis:` line saying how it knows. |
+| `gpu_probe.py` | which device the run actually holds — arch, BDF, activity — asked of amd-smi, never turning an unreadable reading into an idle one. |
 | `run-target.sh` | one target, one phase. Patch state, private caches, the constructed environment, the receipt probe, and the exit code plus JUnit counts that come back. |
 | `scrape_perf.py` | parsing a benchmark's rows into comparable numbers. |
 | `scan_index_width.py` | the 32-bit index-width scan. |
+
+The GPU **lock** is deliberately not on this list. It is a `flock` on a file descriptor held open
+by the entry point for the whole run, and a descriptor dies with the process that opened it — so a
+child that claimed the device would release it on exit, and every concurrent validator would then
+pick the same one. The lock stays with whoever runs the tests, not with a tool that can be called.
 
 You choose what to run and you explain why. You do not hand-write a stage result, and you do not
 compute the verdict — `finish` does, from what is on record.

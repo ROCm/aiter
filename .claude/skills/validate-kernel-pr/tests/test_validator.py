@@ -3638,6 +3638,117 @@ class ReportWriterTests(unittest.TestCase):
             )
 
 
+class StubAmdSmi:
+    """Enough amd-smi to answer the two questions gpu_probe asks."""
+
+    def __init__(self, devices):
+        self.devices = devices
+
+    def amdsmi_get_processor_handles(self):
+        return list(range(len(self.devices)))
+
+    def amdsmi_get_gpu_enumeration_info(self, handle):
+        return {"hip_id": self.devices[handle]["hip_id"]}
+
+    def amdsmi_get_gpu_asic_info(self, handle):
+        return self.devices[handle].get("asic", {})
+
+    def amdsmi_get_gpu_device_bdf(self, handle):
+        return self.devices[handle].get("bdf", "0000:00:00.0")
+
+
+class StubPicker:
+    def __init__(self, gfx):
+        self.gfx = gfx
+
+    def read_activity(self, amdsmi, handle):
+        return self.gfx, None
+
+
+class GpuProbeTests(unittest.TestCase):
+    """What the report is told about the device this run claimed.
+
+    Both queries lived in heredocs and could only be exercised on a host with the hardware, so
+    on any other host they were never exercised at all.
+    """
+
+    def setUp(self):
+        sys.path.insert(0, str(SKILL_DIR))
+        self.addCleanup(sys.path.remove, str(SKILL_DIR))
+        import gpu_probe
+
+        self.probe = gpu_probe
+        # amd-smi orders devices independently of HIP, so the two indices differ here on
+        # purpose: a probe that returned one where the report wants the other would look
+        # correct on any machine whose orders happen to agree.
+        self.amdsmi = StubAmdSmi(
+            [
+                {"hip_id": 3},
+                {"hip_id": 0},
+                {
+                    "hip_id": 1,
+                    "asic": {
+                        "market_name": "MI300X",
+                        "target_graphics_version": "gfx942",
+                    },
+                    "bdf": "0000:c5:00.0",
+                },
+            ]
+        )
+
+    def test_the_device_is_found_by_hip_index_not_position(self):
+        info = self.probe.describe(self.amdsmi, StubPicker(7), 1, "host-a")
+        self.assertEqual(info["hip_index"], 1)
+        self.assertEqual(info["amd_smi_index"], 2)
+        self.assertEqual(info["arch"], "gfx942")
+        self.assertEqual(info["model"], "MI300X")
+        self.assertEqual(info["bdf"], "0000:c5:00.0")
+        self.assertEqual(info["gfx_activity_before_pct"], 7)
+        self.assertEqual(info["host"], "host-a")
+        self.assertEqual(info["status"], "pass")
+
+    def test_an_unmapped_hip_index_raises(self):
+        # The shell turns a nonzero exit into "GPU identity could not be verified" and makes no
+        # runtime claim. Returning a device that is not the one locked would be worse than
+        # failing.
+        with self.assertRaises(RuntimeError):
+            self.probe.describe(self.amdsmi, StubPicker(0), 9, "host-a")
+
+    def test_a_device_missing_asic_fields_says_unknown(self):
+        info = self.probe.describe(self.amdsmi, StubPicker(0), 3, "host-a")
+        self.assertEqual(info["arch"], "unknown")
+        self.assertEqual(info["model"], "unknown")
+
+    def test_unreadable_activity_is_not_reported_as_idle(self):
+        # The distinction the whole probe exists to preserve: a query that failed must not
+        # arrive at the report as a measured 0.
+        self.assertEqual(
+            self.probe.activity(self.amdsmi, StubPicker(None), 1),
+            self.probe.ACTIVITY_UNAVAILABLE,
+        )
+        self.assertEqual(self.probe.activity(self.amdsmi, StubPicker(0), 1), "0")
+
+    def test_a_measured_zero_survives_as_a_number(self):
+        # "0" and "unavailable" take different branches in the shell; only the first is
+        # recorded as a percentage.
+        self.assertRegex(
+            self.probe.activity(self.amdsmi, StubPicker(0), 1), r"^[0-9]+$"
+        )
+        self.assertNotRegex(
+            self.probe.activity(self.amdsmi, StubPicker(None), 1), r"^[0-9]+$"
+        )
+
+    def test_the_shipped_picker_is_the_one_borrowed(self):
+        # The picker is the thing that knows how to read activity without reporting unknown as
+        # idle; loading a different copy from PATH is the substitution stage 2 already records
+        # having been burned by.
+        self.assertEqual(self.probe.PICKER_PATH.parent, SKILL_DIR)
+        self.assertTrue(self.probe.PICKER_PATH.exists())
+        picker = self.probe.load_picker()
+        self.assertTrue(hasattr(picker, "read_activity"))
+        self.assertTrue(hasattr(picker, "import_amdsmi"))
+
+
 def report_module_status(report, stage):
     return report.SATISFYING_STATUS.get(stage, report.DEFAULT_SATISFYING_STATUS)
 

@@ -284,30 +284,7 @@ record_gpu_activity_after() {
   if [ -z "$PICK" ]; then
     return
   fi
-  ACTIVITY_AFTER=$(HIP_ID="$PICK" python3 - "$SCRIPT_DIR/pick-idle-gpu.py" <<'PY'
-import importlib.util
-import os
-import sys
-
-spec = importlib.util.spec_from_file_location("validation_gpu_picker", sys.argv[1])
-picker = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(picker)
-amdsmi = picker.import_amdsmi()
-
-requested = int(os.environ["HIP_ID"])
-amdsmi.amdsmi_init()
-try:
-    for handle in amdsmi.amdsmi_get_processor_handles():
-        if amdsmi.amdsmi_get_gpu_enumeration_info(handle).get("hip_id") == requested:
-            gfx, _ = picker.read_activity(amdsmi, handle)
-            print("unavailable" if gfx is None else gfx)
-            break
-    else:
-        raise RuntimeError(f"HIP index {requested} has no amd-smi mapping")
-finally:
-    amdsmi.amdsmi_shut_down()
-PY
-  )
+  ACTIVITY_AFTER=$(python3 "$SCRIPT_DIR/gpu_probe.py" activity "$PICK")
   if [[ "$ACTIVITY_AFTER" =~ ^[0-9]+$ ]]; then
     jset_json "stages.gpu_claim.gfx_activity_after_pct" "$ACTIVITY_AFTER"
   elif [ "$ACTIVITY_AFTER" = "unavailable" ]; then
@@ -467,50 +444,7 @@ else
       jset_string "degraded_mode" "NO_GPU"
       finding "note" "gpu_claim" "GPU claim raced with another process; no runtime correctness claim is made"
     else
-      GPU_INFO=$(HIP_ID="$PICK" python3 - "$SCRIPT_DIR/pick-idle-gpu.py" <<'PY'
-import importlib.util
-import json
-import os
-import socket
-import sys
-
-spec = importlib.util.spec_from_file_location("validation_gpu_picker", sys.argv[1])
-picker = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(picker)
-amdsmi = picker.import_amdsmi()
-
-requested = int(os.environ["HIP_ID"])
-amdsmi.amdsmi_init()
-try:
-    match = None
-    for smi_index, handle in enumerate(amdsmi.amdsmi_get_processor_handles()):
-        enumeration = amdsmi.amdsmi_get_gpu_enumeration_info(handle)
-        if enumeration.get("hip_id") == requested:
-            match = (smi_index, handle)
-            break
-    if match is None:
-        raise RuntimeError(f"HIP index {requested} has no amd-smi mapping")
-    smi_index, handle = match
-    asic = amdsmi.amdsmi_get_gpu_asic_info(handle)
-    gfx_activity, _ = picker.read_activity(amdsmi, handle)
-    print(
-        json.dumps(
-            {
-                "status": "pass",
-                "hip_index": requested,
-                "amd_smi_index": smi_index,
-                "model": asic.get("market_name", "unknown"),
-                "arch": asic.get("target_graphics_version", "unknown"),
-                "bdf": amdsmi.amdsmi_get_gpu_device_bdf(handle),
-                "gfx_activity_before_pct": gfx_activity,
-                "host": socket.gethostname(),
-            }
-        )
-    )
-finally:
-    amdsmi.amdsmi_shut_down()
-PY
-)
+      GPU_INFO=$(python3 "$SCRIPT_DIR/gpu_probe.py" identify "$PICK")
       GPU_INFO_RC=$?
       if [ "$GPU_INFO_RC" -ne 0 ]; then
         flock -u "$GPU_LOCK_FD"
