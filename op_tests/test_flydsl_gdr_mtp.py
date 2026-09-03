@@ -9,21 +9,13 @@ tree on top of it. A verify pass has to be able to undo the tokens the target
 model rejects, and what each upstream keeps where is documented on
 ``create_vk_gdr_mtp_kernel``.
 
-The reference is the upstream kernel itself
--------------------------------------------
 Each contract is checked against the kernel it claims to replace: vLLM's fused
 gating plus its ``fused_recurrent_gated_delta_rule``, and SGLang's
 ``fused_sigmoid_gating_delta_rule_update``, vendored verbatim into
-``op_tests/triton_tests/utils/gdr_mtp_refs.py``. Nothing here re-derives what
-the recurrence should do.
-
-Nothing imports ``vllm`` or ``sglang``: the suite must not depend on either
-being installed, and a live import would re-point the oracle whenever the
-installed version moved.
-
-aiter's own Triton kernel implements the chain contract only, so it is a
-candidate in the perf table and the incumbent at the dispatch seam, but never
-the oracle.
+``op_tests/triton_tests/utils/gdr_mtp_refs.py``. Nothing imports ``vllm`` or
+``sglang``. aiter's own Triton kernel implements the chain contract only, so it
+is a candidate in the perf table and the incumbent at the dispatch seam, but
+never the oracle.
 
 Each upstream is run three times per case -- at the tested dtype, at fp32 for
 the spec, and at fp32 on absolute values for a conditioning scale. ``_Oracle``
@@ -269,10 +261,9 @@ def _chain_parents(batch, seqlen):
 def _magnitudes(p: _Problem, *, init_slots, use_qk_l2norm=True, parents=None):
     """The size of the terms the recurrence sums, in fp64.
 
-    An error budget has to be scaled by how big the intermediate terms are, not
-    by how big the answer is: the delta rule subtracts ``k @ h`` from ``v``, so
-    an output near zero can be the difference of two large numbers and a budget
-    read off the output would be far too tight there.
+    An error budget has to be scaled by the intermediate terms, not the answer:
+    the delta rule subtracts ``k @ h`` from ``v``, so an output near zero can be
+    the difference of two large numbers.
 
     Re-running upstream on ``abs()``-ed inputs does not give that number.
     ``g = -exp(A_log) * softplus(a + dt_bias)`` is negative by construction, so
@@ -603,8 +594,7 @@ def _assert_no_worse_than(
 
     The two backends round differently, so requiring them to agree would pin the
     less accurate one's error. A few steps of the element's own conditioning are
-    allowed as slack, so a rounding tie cannot fail this while a real regression
-    still does.
+    allowed as slack.
 
     ``slack_steps`` is how many of those steps a difference in summation order
     alone can account for. Two is right for a value both sides round to a narrow
@@ -1007,13 +997,12 @@ def _one_tiling_for_every_contract():
     """Drop every contract onto the same tiling, leaving addressing the only
     difference between them.
 
-    The tuned table is keyed by contract, so at a shape where one contract has
-    a row and another does not, the two run different tilings -- and a tiling
-    sets how the recurrence is split across lanes, so it sets the order the
-    partial products are summed in. Different orders differ by a few ulp, which
-    is arithmetic, not placement, and it would sit on top of exactly the signal
-    the bit-exact comparison below is reading. Emptying the table drops both
-    onto the rule, which does not take a contract and so answers both the same.
+    The tuned table is keyed by contract, so at a shape where one contract has a
+    row and another does not the two run different tilings -- and a tiling sets
+    the order the partial products are summed in. Different orders differ by a
+    few ulp, which would sit on top of exactly the signal the bit-exact
+    comparison below is reading. Emptying the table drops both onto the rule,
+    which does not take a contract.
     """
     import aiter.ops.flydsl.linear_attention_kernels as lak
 
@@ -1035,16 +1024,13 @@ def test_chain_checkpoints_and_snapshots_are_the_same_state():
     Both modes run one identical recurrence over the same tokens. The chain
     writes h after token t into ``state[indices[n, t]]`` through ``_state_at``;
     the snapshot mode writes the same registers into ``inter[cache[n], t]``
-    through ``_inter_at``. So they are the same bytes reached two ways, and must
-    agree exactly.
+    through ``_inter_at``. Same bytes reached two ways, so they must agree
+    exactly.
 
-    A value check cannot do this job: if an address wraps, the read and the
-    write wrap together, the arithmetic still closes, and only the placement is
-    wrong. Holding two independent address computations against each other is
-    what makes the wrap observable.
-
-    Both runs are held to one tiling so that the comparison stays a comparison
-    of addresses; see ``_one_tiling_for_every_contract``.
+    A value check cannot do this job: if an address wraps, the read and the write
+    wrap together and only the placement is wrong. Both runs are held to one
+    tiling so the comparison stays one of addresses; see
+    ``_one_tiling_for_every_contract``.
     """
     for batch, seqlen in ((1, 2), (4, 4), (3, 8)):
         p = _make_problem(batch, seqlen, seed=batch * 5 + seqlen, accepted="first")
@@ -1390,9 +1376,8 @@ def test_gdr_mtp_perf(
 
     ``repeats`` above one times every candidate that many times and reports the
     median, warning on any cell whose samples disagree by more than
-    ``_SPREAD_WARN_PCT``. One sample is enough to see a candidate that has
-    fallen off a cliff, which is all the pytest entry needs, but not to support
-    a claim of a few percent.
+    ``_SPREAD_WARN_PCT``. One sample sees a candidate that has fallen off a
+    cliff, but does not support a claim of a few percent.
 
     Each mode is measured against the upstream that defines its interface:
 
@@ -1404,9 +1389,8 @@ def test_gdr_mtp_perf(
 
     A blank is a call the kernel cannot express, not a gap: aiter's Triton
     implements the chain contract only, and neither upstream implements the
-    other's. The candidate set is therefore a property of the mode, which is
-    why the sweep emits one table per mode rather than their NaN-scattered
-    union.
+    other's. The candidate set is therefore a property of the mode, which is why
+    the sweep emits one table per mode.
     """
     p = _make_problem(
         batch,

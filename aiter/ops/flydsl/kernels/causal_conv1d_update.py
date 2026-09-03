@@ -14,44 +14,13 @@ same convolution behind two shells:
   **tree** path convolves along each token's parent chain instead of its linear
   predecessor, fusing the ``retrieve_parent_token`` mapping out.
 
+Each builder covers every mode of the kernel it ports: for vLLM varlen packing
+and prefix-caching copy-on-write, including both at once, which is how its
+speculative sites call it; for SGLang the snapshots and the EAGLE tree.
+``cache_seqlens`` (circular buffer) is unimplemented, matching SGLang.
+
 Torch-facing wrappers live in ``aiter.ops.flydsl.causal_conv1d_update_kernels``,
 keeping this module torch-free.
-
-Design (shared by both)
------------------------
-* One thread owns ``C`` feature channels (``C`` = ``channels_per_thread``).
-  ``grid = (batch, cdiv(dim, BLOCK_N * C))``, ``block = (BLOCK_N, 1, 1)``, and
-  channel ``c`` of a thread is ``pid_y * (BLOCK_N * C) + c * BLOCK_N + tid`` so
-  neighbouring lanes touch neighbouring channels and the loads stay coalesced.
-  This resolves the upstreams' ``idx_feats`` down to single channels, so the
-  convolution runs entirely in registers with no shared memory.
-* ``seqlen`` and the effective ``state_len`` are compile-time constants, as they
-  are ``tl.constexpr`` upstream, so every loop is unrolled.
-* Channel-independent work -- the cache-line index, the rollback offset, the
-  tree parent chain -- is computed once and shared by the ``C`` channels.
-* Addressing splits the way vLLM's does, in both kernels: terms scaling with the
-  batch or the cache size (the ones vLLM casts to ``tl.int64``) are folded into
-  the 64-bit descriptor base, leaving the per-channel and per-token remainder in
-  the 32-bit offset. Without the split a conv_state, packed ``x`` or snapshot
-  above 4 GiB wraps and reads or writes the wrong lines with no fault. A
-  descriptor base must be uniform, so the indices feeding one are loaded scalar
-  (see ``_cache_line`` and ``cs_line``).
-
-The upstream STEP 1-5 map across directly: read the ``width-1`` history columns
-at the rollback point (1), slide the conv_state window by ``1 if spec else
-seqlen`` and blend in the new ``x`` tokens (2), preload the weight taps, bias
-and tree chains (3/4), then convolve token by token, apply SiLU and store (5).
-
-Scope
------
-Each builder covers every mode of the kernel it ports: for vLLM that includes
-varlen packing and prefix-caching copy-on-write, including both at once, which
-is how its speculative sites call it; for SGLang the snapshots and the EAGLE
-tree. ``cache_seqlens`` (circular buffer) is unimplemented, matching SGLang.
-
-Upstream's ``NP2_STATELEN`` / ``NP2_SEQLEN`` have no counterpart because they
-pad Triton's power-of-two tiles, which unrolled loops do not need, and
-``USE_GDC`` / ``launch_pdl`` gate a CUDA-only launch mode.
 """
 
 from __future__ import annotations
@@ -101,8 +70,7 @@ def build_causal_conv1d_update_module(
     slots still fed by ``conv_state`` -- a compile-time constant either way.
 
     ``channels_per_thread`` (CPT) makes one thread own that many feature
-    channels, trading workgroup count for more independent loads in flight per
-    thread; see this module's docstring for the channel mapping.
+    channels.
     """
     assert 2 <= width <= 6
     assert seqlen >= 1
@@ -138,9 +106,7 @@ def build_causal_conv1d_update_module(
     # vec_width supports 2/4; other widths keep the scalar path.
     WEIGHT_VEC = bool(weight_contig) and W in (2, 4)
 
-    # With a contiguous token axis one channel's written slots are adjacent and
-    # collapse into a few vector stores plus a scalar remainder. The wrapper
-    # decides; see it for why an odd channel stride is still worth vectorizing.
+    # Only valid when the token axis is contiguous; the wrapper decides.
     CS_VEC = bool(cs_vec)
     O_VEC = bool(o_vec)
 
@@ -189,16 +155,10 @@ def build_causal_conv1d_update_module(
         def _rsrc(ptr):
             return buffer_ops.create_buffer_resource_from_addr(ptr)
 
+        # A term scaling with the batch or the cache size goes in the 64-bit base;
+        # the buffer offset is 32 bits. Both factors widen separately, their
+        # product being what overflows.
         def _rsrc_at(ptr, index, stride):
-            """Descriptor whose base already includes ``index * stride`` elements.
-
-            The buffer offset operand is 32 bits wide in hardware, so a term that
-            scales with the batch or the cache size cannot live there. Folding it
-            into the descriptor base instead is the same split vLLM makes when it
-            promotes exactly these quantities to ``tl.int64`` and leaves the
-            per-channel arithmetic in 32 bits. The two factors are widened
-            separately: their product is what overflows.
-            """
             byte_offset = (
                 index.to(fx.Int64) * stride.to(fx.Int64) * fx.Int64(ELEM_BYTES)
             )
@@ -222,18 +182,14 @@ def build_causal_conv1d_update_module(
         pid_y = fx.Int32(fx.block_idx.y)
 
         # ============ sequence-level work, shared by the CPT channels ========
-        # Everything here depends only on block_idx.x, so with CPT > 1 it is
-        # computed once instead of once per channel.
 
         # Cache line(s) for this sequence. Without APC one index serves both the
         # history load and the write-back; with APC conv_state_indices is 2D and
         # the ends differ, the history coming from the block the state was last
         # computed into and the rolled window going to the block scheduled for
         # this step, which is what makes a prefix-cached block copy-on-write.
-        #
-        # Loaded scalar because the result reaches a descriptor base, which must
-        # be uniform. A per-lane load does not tell the compiler that, and it
-        # answers by serializing every access built on the result.
+        # Loaded scalar: the result reaches a descriptor base, which must be
+        # uniform.
         def _cache_line(block_offset):
             return fx.Int32(
                 buffer_ops.buffer_load(
@@ -293,9 +249,7 @@ def build_causal_conv1d_update_module(
             x_seq_idx, x_seq_stride = idx_seq, sx_seq
             o_seq_idx, o_seq_stride = idx_seq, so_seq
 
-        # Sequence-level address terms go into the 64-bit descriptor base; the
-        # per-channel and per-token remainder stays in the 32-bit offset. Read and
-        # write bases differ only under APC.
+        # Read and write bases differ only under APC.
         x_r = _rsrc_at(x_ptr, x_seq_idx, x_seq_stride)
         o_r = _rsrc_at(o_ptr, o_seq_idx, o_seq_stride)
         cs_r = _rsrc_at(cs_ptr, in_coord, scs_seq)
@@ -339,9 +293,6 @@ def build_causal_conv1d_update_module(
         # ================= per-channel work ==================================
         def _channel(gfeat):
             # active guard: valid feature, in-range cache line, non-null block.
-            # The cache-line half is loop-invariant across the CPT channels but is
-            # left here rather than hoisted, which CSE already covers and which
-            # measured worse.
             feat_ok = gfeat < dim
             active = feat_ok & (in_coord < num_cache_lines)
             if fx.const_expr(HAS_NULL_BLOCK):
@@ -358,11 +309,6 @@ def build_causal_conv1d_update_module(
             o_base = gfeat * so_dim
 
             # ============ PHASE 1: issue ALL loads up front ==================
-            # Every load is issued before any convert or compute, so they stay in
-            # flight together. The conv_state addresses depend on csi and nacc,
-            # which are themselves still in flight, so the loads independent of
-            # those go first to overlap that round-trip. In decode offset_dyn is
-            # constant and the ordering is merely harmless.
 
             # The S new x tokens, loaded once and reused for both the rolled
             # conv_state slots and the convolution.
@@ -452,10 +398,8 @@ def build_causal_conv1d_update_module(
                 for j in fx.range_constexpr(W):
                     acc = acc + w_col[j] * win[j]
                 if fx.const_expr(SILU):
-                    # The bare intrinsics, which is what the Triton oracles lower
-                    # to and what keeps the parity suite bit-exact. Deliberately
-                    # not fx.math.exp2, whose denormal/range fixup this kernel
-                    # never needs.
+                    # The bare intrinsic is what the Triton oracles lower to, so
+                    # it is what keeps the parity suite bit-exact.
                     f32_ty = fx.Float32.ir_type
                     ex = fx.Float32(
                         rocdl.exp2(f32_ty, (acc * fx.Float32(-_LOG2E)).ir_value())
@@ -591,11 +535,7 @@ def compile_causal_conv1d_update(
     is_apc_enabled: bool = False,
     is_varlen: bool = False,
 ):
-    """Memoized :func:`build_causal_conv1d_update_module`.
-
-    Every argument is a compile-time specialization, so one launcher is built
-    per distinct configuration and reused for the life of the process.
-    """
+    """Memoized :func:`build_causal_conv1d_update_module`."""
     return build_causal_conv1d_update_module(
         width,
         seqlen,
@@ -735,16 +675,8 @@ def build_causal_conv1d_update_sglang_module(
         def _rsrc(ptr):
             return buffer_ops.create_buffer_resource_from_addr(ptr)
 
+        # Same 64/32 split as the vLLM-shaped kernel above.
         def _rsrc_at(ptr, index, stride):
-            """Descriptor whose base already includes ``index * stride`` elements.
-
-            The same 64/32 split the vLLM-shaped kernel makes: the hardware
-            buffer offset is 32 bits, so a term scaling with the cache size
-            cannot live there. conv_state and the snapshot both cross that line
-            at realistic cache sizes, the snapshot first because each of its
-            lines is ``seqlen * (width - 1)`` times larger. The two factors are
-            widened separately: their product is what overflows.
-            """
             byte_offset = (
                 index.to(fx.Int64) * stride.to(fx.Int64) * fx.Int64(ELEM_BYTES)
             )
@@ -779,9 +711,6 @@ def build_causal_conv1d_update_sglang_module(
         pid_y = fx.Int32(fx.block_idx.y)
 
         # ============ channel-independent prologue (shared by CPT lanes) =====
-        # The cache-line address is workgroup-uniform, so decode loads it scalar
-        # rather than having every lane repeat the same load. Verify keeps the
-        # per-lane load, which measured better inside its longer pipeline.
         in_coord = _load_i32(csi_r, idx_seq * scsi, is_scalar=not IS_SPEC)
 
         seq_ok = in_coord < num_cache_lines
@@ -789,8 +718,8 @@ def build_causal_conv1d_update_sglang_module(
             seq_ok = seq_ok & (in_coord != null_block_id)
 
         # A descriptor base must be uniform, and verify's per-lane copy above
-        # cannot feed one. Take a scalar copy for the base and leave the
-        # predicate reading the per-lane value the pipeline was tuned around.
+        # cannot feed one, so the base takes a scalar copy while the predicate
+        # keeps reading the per-lane value.
         cs_line = (
             _load_i32(csi_r, idx_seq * scsi, is_scalar=True)
             if fx.const_expr(IS_SPEC)
@@ -878,9 +807,6 @@ def build_causal_conv1d_update_sglang_module(
             o_base = gfeat * so_dim
 
             # ============ PHASE 1: issue ALL loads up front ==================
-            # All loads before any compute, so they stay in flight together. The
-            # conv_state addresses depend on csi/nacc, still in flight, so the
-            # loads independent of those go first to hide that round-trip.
             x_raw = [
                 _load_elem(x_r, x_base + fx.Int32(tok) * sx_tok)
                 for tok in fx.range_constexpr(S)
@@ -936,10 +862,8 @@ def build_causal_conv1d_update_sglang_module(
                 return acc + (w * v).to(elem_dtype).to(fx.Float32)
 
             def _silu(acc):
-                # The bare intrinsics, which is what the Triton oracle lowers to
-                # and what keeps the parity suite bit-exact. Deliberately not
-                # fx.math.exp2, whose denormal/range fixup this kernel never
-                # needs.
+                # The bare intrinsic is what the Triton oracle lowers to, so it
+                # is what keeps the parity suite bit-exact.
                 f32_ty = fx.Float32.ir_type
                 ex = fx.Float32(
                     rocdl.exp2(f32_ty, (acc * fx.Float32(-_LOG2E)).ir_value())
@@ -1189,11 +1113,7 @@ def compile_causal_conv1d_update_sglang(
     has_tree: bool,
     channels_per_thread: int,
 ):
-    """Memoized :func:`build_causal_conv1d_update_sglang_module`.
-
-    Every argument is a compile-time specialization, so one launcher is built
-    per distinct configuration and reused for the life of the process.
-    """
+    """Memoized :func:`build_causal_conv1d_update_sglang_module`."""
     return build_causal_conv1d_update_sglang_module(
         width,
         seqlen,
