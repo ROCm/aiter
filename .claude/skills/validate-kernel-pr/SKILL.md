@@ -124,100 +124,113 @@ worktree.
 
 ## Stages
 
-Each stage writes its own status into the report. A stage that cannot run says `skip` with a
-reason — it never reports `pass` for work it did not do.
+Every stage records its own status. A stage that could not run says `skip` and names the fact the
+skip rests on; it never says `pass` for work it did not do. Record each one as you finish it —
+`finish` builds the verdict from what is on record, so a stage you reasoned about but never wrote
+down counts as not run.
 
 ### 1 — `merge_sim`
 
-Apply the PR head on top of the current base. A conflict is a blocker and short-circuits: no
-number produced downstream would describe the merged code. Known collision surfaces worth a
-second look because they are edited by many PRs at once: tuning CSVs (duplicate shape rows),
-`csrc/include/rocm_ops.hpp`, `aiter/jit/optCompilerConfig.json`.
+Apply the head patch onto the base you pinned. **A conflict is a blocker and stops the run**: no
+number produced after it would describe the merged code, so continuing would generate evidence
+about a tree nobody will ship.
 
-The supplied worktree must be clean. The report records the base commit, patch SHA-256, and the
-caller-supplied head OID. A direct head checkout without a patch can run diagnostics, but cannot
-prove mergeability or base attribution and therefore cannot produce `PASS`.
+The worktree must be clean going in, and the patch must be reverted on the way out — on interrupt
+and on every degraded path, not just the happy one. Otherwise the next run in that worktree sees a
+dirty tree and reports it against the wrong author.
 
-The patch is reverted when the process exits, including on interrupt and on every degraded path,
-so the worktree is handed back in the state it was supplied. Consecutive runs in the same worktree
-are therefore supported; a run that left the patch applied would make the next one report
-`not isolated-clean` and blame the caller.
+Look twice at files many PRs edit at once, because that is where silent semantic collisions live
+even when git merges cleanly: tuning CSVs (duplicate shape rows), `csrc/include/rocm_ops.hpp`,
+`aiter/jit/optCompilerConfig.json`.
+
+A head checkout with no patch can still run diagnostics, but it proves neither mergeability nor
+base attribution, and so cannot reach `PASS`.
 
 ### 2 — `gpu_claim`
 
-Claim a GPU over a **sampling window**, not one instantaneous reading, and acquire a non-blocking
-lock immediately after selection. Hold that file descriptor for the whole run:
+Claim a GPU over a **sampling window** rather than one instantaneous reading, then take a
+non-blocking lock and hold that file descriptor for the entire run — a GPU that was idle when you
+looked is not the same as a GPU nobody else takes while you measure.
 
-```bash
-PICK=$(python3 .claude/skills/validate-kernel-pr/pick-idle-gpu.py \
-    --samples 10 --interval 1 --quiet)
-flock /tmp/gpu-$PICK.lock <command>
-```
+Two things about the recording are easy to get wrong, and both were:
 
-The report records host, HIP index, matching AMD SMI index, BDF, market name, architecture, and
-GFX activity before the run. `pick-idle-gpu.py` emits the **translated HIP index**; the validator
-maps it back through AMD SMI enumeration instead of incorrectly using it as an AMD SMI index.
+- The picker emits a **translated HIP index**, which is not an AMD SMI index. Using it as one
+  identifies the wrong device in the report.
+- `amdsmi_get_gpu_activity` is unavailable on some driver/amd-smi combinations — it fails or
+  returns `N/A` while enumeration, BDF, ASIC and VRAM all answer fine. So the claim records
+  *what it rests on*: `activity+vram` when busy percentages were really measured, `vram-only` when
+  only resident VRAM separated the devices. In the second case activity is `null`, meaning
+  unknown — **never 0**, which would read as an observed idle GPU.
 
-`amdsmi_get_gpu_activity` is not available everywhere — some driver and amd-smi combinations fail
-it outright or report `N/A` while enumeration, BDF, ASIC and VRAM queries all work. Activity is
-therefore treated as optional, and `gpu_claim.idleness_basis` names the evidence the claim rests
-on: `activity+vram` when busy percentages were measured, `vram-only` when only resident VRAM
-separated the devices. In the `vram-only` case `gfx_activity_before_pct` is `null`, which means
-unknown, not zero — an unavailable metric is never reported as an observed idle GPU.
+If nothing stays idle, `gpu_claim` is `skip` with `degraded_mode: NO_GPU`. Say which fact the skip
+rests on: no GPUs on this host, or GPUs present but all busy, are facts about the environment;
+AMD SMI being unqueryable says nothing about the GPUs at all, and the three must not collapse into
+one message.
 
-If no GPU stays idle, `gpu_claim` is `skip`, `degraded_mode` is `NO_GPU`, and the script performs no
-architecture-specific compile in this branch, so it does not call the result `compile-only`. That
-skip names which fact it rests on: no GPUs on this host (picker exit 3) and GPUs present but none
-idle (exit 1) are environment facts, while AMD SMI being unqueryable (exit 2) says nothing about the
-GPUs at all.
+**Then ask whether the target even needed one.** Run it once with no visible device.
+`gpu_requirement` is `not-required` only if it passes **and executes at least one test** — a suite
+guarded by `skipif(not torch.cuda.is_available())` also exits 0 while proving nothing, so the
+executed count is what makes this evidence rather than an assumption.
 
-When no GPU was claimed, the target is then asked whether it needs one: it is run once with no
-visible device, and `test_selection.gpu_requirement` becomes `not-required` only if it **passes and
-executes at least one test**. The executed count is what makes this evidence — a suite guarded by
-`skipif(not torch.cuda.is_available())` also exits 0 while proving nothing. This is deliberately an
-observation rather than a judgement about the diff: a Python-level dispatch change reroutes kernels
-without touching kernel source, and ROCm/aiter#5089 decides whether 34 gfx950 kernels compile from a
-seven-line helper, so no static rule over changed paths could settle it.
+Resist the urge to decide this from the diff instead. A Python-level dispatch change reroutes
+kernels without touching kernel source, and ROCm/aiter#5089 decided whether 34 gfx950 kernels
+compile from a seven-line helper — no rule over changed paths would have settled either.
 
-A `not-required` target runs its correctness stages instead of skipping them, which is the evidence
-a CPU-only fix is able to supply. It still claims nothing further: `arch_coverage` stays empty
-because only a passing `gpu_claim` credits an architecture, and `PASS` is unchanged — it continues
-to require `gpu_claim: pass`, so this path cannot produce a clearance that was previously
-unreachable.
+A `not-required` target runs its correctness stages rather than skipping them; that is the evidence
+a CPU-only fix can honestly supply. It earns nothing more: `arch_coverage` stays empty, because
+only a passing `gpu_claim` credits an architecture, and `PASS` still requires one.
 
 ### 3 — `runtime_compat`
 
-Does the repository's own package import from the supplied checkout against the runtime that is
-actually installed? The probe is repository-aware: Aiter resolves `aiter` from the checkout;
-FlyDSL resolves the pinned package from `PYLIB` (when supplied) and compares its version with the
-checkout's `python/flydsl`. This keeps compiled `_mlir` bindings available without pretending an
-unrelated FlyDSL install validates an Aiter checkout. A pinned prebuilt runtime can drift behind
-the tree, and the resulting `ImportError` looks exactly like a defect in the PR. A mismatch is an
-environment fact: `runtime_compat` and correctness are skipped, the verdict is `INCONCLUSIVE`,
-and nothing is attributed to the author.
+Does the repository's own package import, from *this* checkout, against the runtime actually
+installed here?
 
-The report records the Python executable/version, resolved package path/version, and SHA-256
-identities for native libraries loaded by the runtime probe.
-If a FlyDSL PR changes Python, C++/MLIR bindings, headers, CMake, or packaging inputs, a prebuilt
-`PYLIB` is not accepted: trusted build-system provenance is not implemented, and caller-authored
-metadata cannot prove which source produced a binary. Such runs return `INCONCLUSIVE` instead of
-testing a stale package.
+Resolve it the way the repository does. Aiter resolves `aiter` from the checkout. FlyDSL resolves
+the pinned package from `PYLIB` and compares its version against the checkout's `python/flydsl` —
+which keeps compiled `_mlir` bindings reachable without pretending an unrelated FlyDSL install
+validates an Aiter checkout.
 
-This matters most for FlyDSL kernels: the Python kernels import symbols from a compiled runtime,
-so "one fresh container per PR" would mean rebuilding MLIR/LLVM per PR. The workable shape is a
-pinned prebuilt image plus this compatibility gate.
+The reason this is a gate and not a footnote: a pinned prebuilt runtime drifts behind the tree, and
+the `ImportError` that follows is indistinguishable from a defect in the PR. So a mismatch is
+recorded as an **environment fact** — `runtime_compat` and correctness skip, verdict `INCONCLUSIVE`,
+nothing attributed to the author.
 
-### 4 — `test_policy` — run **before** the suite
+One refusal is absolute: if a FlyDSL PR touches Python, C++/MLIR bindings, headers, CMake, or
+packaging inputs, **a prebuilt `PYLIB` is not accepted**. Trusted build provenance does not exist
+here, and caller-authored metadata cannot prove which source produced a binary. Return
+`INCONCLUSIVE` rather than test a stale package and call it the PR's.
 
-A suite that cannot fail is worse than no suite, because it produces a green report. Two checks:
+This is why the whole gate exists: FlyDSL kernels import symbols from a compiled runtime, so "one
+fresh container per PR" would mean rebuilding MLIR/LLVM per PR. A pinned image plus this gate is
+the workable shape.
 
-- **Tolerance, compared head-vs-base.** Repos legitimately differ per kernel; the question is
-  whether *this change* loosened what was there. A test-only widening is a deterministic blocker.
-  If kernel code changed too, the widening is `NEEDS_WORK` pending numerical justification rather
-  than a false deterministic block.
-- **Commented-out shape rows, compared head-vs-base.** Existing rows are recorded as coverage
-  context; only rows newly disabled by the change produce `NEEDS_WORK`. The independent grid
-  remains visible either way.
+### 4 — `test_policy` — reason about this **before** you trust the suite
+
+A suite that cannot fail is worse than no suite, because it returns green. So establish that this
+suite can still fail before its result means anything — afterwards, a green run has already made
+the question feel answered.
+
+This stage is judgement, and it is yours. Read the test files' head-vs-base diff and ask two
+questions.
+
+**Was a tolerance loosened?** Not "is this tolerance loose" — repositories legitimately differ per
+kernel, and an absolute threshold would flag half the tree. The question is whether *this change*
+widened what was already there. Note that a comparison can be weakened without any number moving:
+switching `assert_close` for `allclose`, dropping a `rtol=` argument so the default applies, or
+comparing against a value the kernel itself produced. Then attribute it:
+
+- **test-only change** → blocker. Nothing else in the PR explains the widening.
+- **kernel code changed too** → `NEEDS_WORK` pending numerical justification, not a blocker. The
+  looser tolerance may be the honest consequence of a new algorithm, and calling that a
+  deterministic failure was a false block worth avoiding.
+
+**Were shape rows disabled?** Compare head against base again. Rows already commented out in base
+are coverage context — record them, they tell a reviewer what this suite never covered — but only
+rows *this change* disabled produce `NEEDS_WORK`. The distinction matters because the pre-existing
+ones are usually numerous and would drown the one that is actually the PR's doing.
+
+Either way, the independent grid in the next stage stays visible: it is the answer to a disabled
+row, not a substitute for noticing one.
 
 ### 5 — `correctness` — the repo's tests, then a grid the repo does not run
 
