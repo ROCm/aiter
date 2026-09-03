@@ -1,0 +1,38 @@
+{
+  "repository": "https://github.com/ROCm/FlyDSL.git",
+  "base": "421935cc6f09fd9b27d5d5ae52e0960e18834bd5",
+  "tests": "tests/kernels/test_softmax.py",
+  "shape_env": "ROCDSL_SOFTMAX_SHAPES",
+  "grid": "64,2000,f32;32,257,f32;128,1024,f32;1024,8192,bf16",
+  "tolerance_table": "f32=1e-5,f16=1e-2,bf16=2e-2",
+  "cases": [
+    {
+      "id": "m0-clean-control",
+      "patch": "m0-clean-control.patch",
+      "expected_verdict": "PASS",
+      "expected_stage": null,
+      "defect": null
+    },
+    {
+      "id": "m1-drop-tail-mask",
+      "patch": "m1-drop-tail-mask.patch",
+      "expected_verdict": "BLOCK",
+      "expected_stage": "correctness",
+      "defect": "The generic store loses its idx < N tail guard; N=2000 writes 48 lanes past the row."
+    },
+    {
+      "id": "m2-loosen-tolerance",
+      "patch": "m2-loosen-tolerance.patch",
+      "expected_verdict": "BLOCK",
+      "expected_stage": "test_policy",
+      "defect": "The kernel is unchanged while f32/f16/bf16 tolerances are widened enough that the suite cannot enforce its prior bound."
+    },
+    {
+      "id": "m3-vector-vs-element-index",
+      "patch": "m3-vector-vs-element-index.patch",
+      "expected_verdict": "BLOCK",
+      "expected_stage": "correctness",
+      "defect": "The vectorized store scales an element index by vec_width and writes the wrong addresses."
+    }
+  ]
+}
