@@ -99,6 +99,7 @@ def _build_gemm_task(
     next_stage_on: Constexpr[int],
     num_waves_per_tensor_tdm: Constexpr[int],
     tdm_b_th: Constexpr[int],
+    max_tasks_per_worker: Constexpr[int],
     enable_ep_scatter: Constexpr[int],
     ep_arena_handle: Constexpr[int],
     ep_combine_input_offset: Constexpr[int],
@@ -160,7 +161,34 @@ def _build_gemm_task(
     c_lds_pad_elems = (_lds_row_bytes - C_ROW_BYTES) // 2 if enable_ep_scatter else 0
     store_pad = c_lds_pad_elems if enable_ep_scatter else 16
     C_STORE_B = ((tile_m * (tile_n + store_pad) * 2 + 127) // 128) * 128
-    ARENA_B = max(num_buffers * PITCH, C_STORE_B)
+    INPUT_ARENA_B = num_buffers * PITCH
+    # Persistent workers overlap the preceding task's asynchronous output store
+    # with the next task's input pipeline. Keep the store source disjoint from
+    # every input-ring slot so the next task may refill/reuse the ring while the
+    # store is still reading LDS.
+    STORE_LDS_OFF = (
+        ((INPUT_ARENA_B + 127) // 128) * 128
+        if max_tasks_per_worker > 0
+        else 0
+    )
+    ARENA_B = (
+        STORE_LDS_OFF + C_STORE_B
+        if max_tasks_per_worker > 0
+        else max(INPUT_ARENA_B, C_STORE_B)
+    )
+    # The first drain tile permanently releases its ring slot. Reuse that slot
+    # for the next N tile's K0 while the remaining drain tiles compute.
+    NEXT_TASK_PREFETCH_SLOT = (K // tile_k - 1 - num_buffers) % num_buffers
+    # When the drain starts at the final ring slot, its following releases match
+    # the next task's K1/K2 slots. Carry at most three stages across the task
+    # boundary so WPT=4 wait immediates remain below the 16-operation window.
+    NEXT_TASK_PREFETCH_STAGES = (
+        min(3, num_buffers)
+        if NEXT_TASK_PREFETCH_SLOT == num_buffers - 1
+        else 1
+    )
+    if max_tasks_per_worker > 0:
+        assert num_buffers >= 2, "next-task prefetch requires at least two LDS slots"
 
     # Quant epilogue compile-time constants.
     QUANT_ROWS_PER_TILE = quant_wmma_rep * 16
@@ -189,8 +217,11 @@ def _build_gemm_task(
         f32_swiglu_limit: fx.Float32,
         f32_situ_beta: fx.Float32,
         f32_situ_linear_beta: fx.Float32,
+        is_first_task=False,
+        has_next_task=False,
     ):
-        # rocdl.disable_xdl_arb_stall()
+        """Runs one M/N output tile using the shared GEMM pipeline."""
+
         K_TILES = K // tile_k
         A_KROW = K // A_PACK
         Kp16 = (K // 2) * 16
@@ -249,7 +280,7 @@ def _build_gemm_task(
         def ptr_to_idx(p):
             return fx.index_cast(T.index, fx.ptrtoint(p))
 
-        stC_idx = ptr_to_idx(base_ptr)
+        stC_idx = ptr_to_idx(base_ptr + STORE_LDS_OFF)
         if const_expr(enable_ep_scatter):
             # Persistent (survives the mainloop) LDS slot for the prefetched
             # rowmap: tile_m rows x 8 bytes (dst_i32 | weight_bits_i32). Bumped
@@ -314,7 +345,7 @@ def _build_gemm_task(
         # Waves in one ``wv`` differ only in runtime atom state, so the whole list
         # collapses to one atom: ``wv`` is the smallest unit needing its own code.
         Job = namedtuple(
-            "Job", "atom gt on_i32 lds_off lds_row inner outer k_adv waves"
+            "Job", "atom gt on_i32 lds_off lds_row inner outer k_adv n_adv waves"
         )
         jobs = []
 
@@ -330,6 +361,7 @@ def _build_gemm_task(
             lds_off,
             lds_row,
             k_adv,
+            n_adv,
             wv,
             pad=None,
             wg_mask=0,
@@ -379,6 +411,7 @@ def _build_gemm_task(
                     inner_seg,
                     seg,
                     k_adv,
+                    n_adv,
                     wv,
                 )
             )
@@ -394,6 +427,7 @@ def _build_gemm_task(
             lds_off=0,
             lds_row=A_LDS_ROW,
             k_adv=A_ROW_B,
+            n_adv=0,
             wv=waves[0],
             pad=(A_ROW_B, LDS_PAD_A),
             wg_mask=a_mcast_mask,
@@ -409,6 +443,7 @@ def _build_gemm_task(
             lds_off=STAGE_A,
             lds_row=B_LDS_ROW,
             k_adv=PACK_TK * 16,
+            n_adv=(tile_n // 16) * Kp16,
             wv=waves[1],
             cache_modifier=tdm_b_th,
         )
@@ -423,6 +458,7 @@ def _build_gemm_task(
             lds_off=SA_OFF // 4,
             lds_row=AS_INNER,
             k_adv=AS_INNER * 4,
+            n_adv=0,
             wv=waves[2],
             split_inner=AS_SUPERS < len(waves[2]),
         )
@@ -437,6 +473,7 @@ def _build_gemm_task(
             lds_off=SB_OFF // 4,
             lds_row=SC_INNER,
             k_adv=SC_INNER * 4,
+            n_adv=(tile_n // 32) * SB_OUTER_STRIDE * 4,
             wv=waves[3],
         )
 
@@ -451,7 +488,7 @@ def _build_gemm_task(
                 pred = pred | (wave == w)
             return pred
 
-        def issue(s, kt, my_jobs=None):
+        def issue(s, kt, my_jobs=None, n_delta=0):
             pa = fx.recast_iter(p8_shared, buf_ptr(s))
             so4 = s * (PITCH // 4)
 
@@ -462,7 +499,8 @@ def _build_gemm_task(
                     (j.outer, j.inner),
                     (j.lds_row, 1),
                 )
-                fx.copy(j.atom, j.gt, dst, imm_offset=fx.Int64(kt * j.k_adv))
+                byte_offset = kt * j.k_adv + n_delta * j.n_adv
+                fx.copy(j.atom, j.gt, dst, imm_offset=fx.Int64(byte_offset))
 
             if const_expr(my_jobs is not None):
                 for j in my_jobs:
@@ -676,11 +714,14 @@ def _build_gemm_task(
             next_rmem=None,
             load_nxt_fn=None,
             num_outstanding_tdm=None,
+            fence_fn=None,
             issue_fn=None,
         ):
             """Compute one k128 while optionally loading the next LDS slot."""
             reuse_cur_rmem = load_nxt_fn is not None and next_rmem is cur_rmem
-            if const_expr(num_outstanding_tdm is not None):
+            if const_expr(fence_fn is not None):
+                fence_fn()
+            elif const_expr(num_outstanding_tdm is not None):
                 pipeline_fence(outstanding=num_outstanding_tdm)
             if const_expr(issue_fn is not None):
                 issue_fn()
@@ -700,6 +741,8 @@ def _build_gemm_task(
             next_stage_buf=None,
             my_jobs=None,
             next_stage_wait=None,
+            next_stage_fence_fn=None,
+            prefetch_slot=None,
         ):
             """Compute one k-tile, carrying one k128 of A/B/scales across tiles.
 
@@ -711,14 +754,27 @@ def _build_gemm_task(
             exposes those ds_reads. ``next_stage_wait`` is the tensorcnt that fences
             ``next_stage_buf``, emitted at that last k128 instead of by the caller
             at the tile top; pass None only when an earlier fence already covers it.
+            ``next_stage_fence_fn`` supplies a runtime-uniform variant of that
+            fence without branching around the accumulator update.
 
             ``my_jobs`` is the owner list already selected by
             ``dispatch_wave_job``; it only reaches ``issue`` and is unused when
             ``prefetch_kt`` is None.
+            ``prefetch_slot`` overrides the static path's K-modulo ring mapping;
+            persistent K1-based rings refill the slot the current tile releases.
+
             """
 
             def do_issue():
-                issue(prefetch_kt % num_buffers, prefetch_kt, my_jobs)
+                issue(
+                    (
+                        prefetch_slot
+                        if const_expr(prefetch_slot is not None)
+                        else prefetch_kt % num_buffers
+                    ),
+                    prefetch_kt,
+                    my_jobs,
+                )
 
             def spread(total, slots):
                 counts = []
@@ -744,7 +800,9 @@ def _build_gemm_task(
                 # Spread the tail issue's TDMs over the WMMA groups: one burst
                 # would block the MFMA pipe for its whole descriptor setup.
                 tdm_schedule = spread(
-                    TDM_PER if (prefetch_kt is not None and ksl + 1 == KWS) else 0,
+                    TDM_PER
+                    if (prefetch_kt is not None and ksl + 1 == KWS)
+                    else 0,
                     schedule_slots,
                 )
                 for i in range_constexpr(schedule_slots):
@@ -779,6 +837,11 @@ def _build_gemm_task(
                     load_nxt_fn,
                     num_outstanding_tdm=(
                         next_stage_wait if const_expr(carries) else None
+                    ),
+                    fence_fn=(
+                        next_stage_fence_fn
+                        if const_expr(carries)
+                        else None
                     ),
                     issue_fn=(
                         do_issue
@@ -820,9 +883,137 @@ def _build_gemm_task(
                 _rm_dst = lds_view(
                     fx.recast_iter(p32_shared, _rowmap_lds_ptr), (tile_m, 2), (2, 1)
                 )
+            if const_expr(max_tasks_per_worker > 0):
+                # K0 lives in a ring slot that is dead during the previous task's
+                # drain. The first task fills K0 and every non-aliasing ring slot
+                # locally; subsequent tasks consume K0/K1/K2 prefetched while
+                # the previous task drained.
+                if is_first_task:
+                    issue(NEXT_TASK_PREFETCH_SLOT, 0)
+                    # Fill every non-aliasing regular-ring slot before fencing
+                    # K0. K0 (and the optional resident As prologue preceding
+                    # it) is older, so leave those newer stages outstanding.
+                    for i in range_constexpr(num_buffers):
+                        if const_expr(i != NEXT_TASK_PREFETCH_SLOT):
+                            issue(i, i + 1)
+                    tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
+                else:
+                    # K0/K1/K2 were issued before the previous task's output
+                    # store. Reap K0 while leaving the newer prefetched stages
+                    # and that one store outstanding.
+                    tdm_ops.tensor_wait(
+                        TDM_PER * (NEXT_TASK_PREFETCH_STAGES - 1) + 1
+                    )
+                workgroup_barrier()
+                if is_first_task:
+                    pass
+                else:
+                    # Fill non-aliasing stages not carried across the task
+                    # boundary and overlap them with K0 compute.
+                    for i in range_constexpr(num_buffers):
+                        if const_expr(
+                            i >= NEXT_TASK_PREFETCH_STAGES - 1
+                            and i != NEXT_TASK_PREFETCH_SLOT
+                        ):
+                            issue(i, i + 1)
+                next_task_prefetch_buf = ptr_to_idx(
+                    buf_ptr(NEXT_TASK_PREFETCH_SLOT)
+                )
+                compute_ktile(next_task_prefetch_buf, None)
+                workgroup_barrier()
+
+                # The regular ring carries K1..Kend with the same pipeline shape
+                # for every task in this worker. K0 aliases this last ring slot,
+                # so it is the only stage that must wait until K0 is consumed.
+                issue(
+                    NEXT_TASK_PREFETCH_SLOT,
+                    NEXT_TASK_PREFETCH_SLOT + 1,
+                )
+                remaining_tiles = K_TILES - 1
+                n_steady = remaining_tiles - num_buffers
+
+                # Prime K1.K128-0. Every later current-task tile receives this
+                # register state from its predecessor's final K128.
+                if is_first_task:
+                    pipeline_fence(outstanding=TDM_PER * (num_buffers - 1))
+                else:
+                    # When K1/K2 crossed the task boundary, the previous store
+                    # is newer than them and may remain live while K1 becomes
+                    # ready. The first steady fence retires it and restores the
+                    # regular stage-only tensor-count shape.
+                    pipeline_fence(
+                        outstanding=TDM_PER * (num_buffers - 1)
+                        + (1 if NEXT_TASK_PREFETCH_STAGES > 1 else 0)
+                    )
+                load_state(
+                    rmem_slots[0],
+                    ptr_to_idx(buf_ptr(0)),
+                    0,
+                )
+
+                def steady_persistent(my_jobs):
+                    for kt_rel in range(n_steady):
+                        slot = kt_rel % num_buffers
+                        buf = ptr_to_idx(buf_ptr(slot))
+                        next_buf = ptr_to_idx(
+                            buf_ptr((kt_rel + 1) % num_buffers)
+                        )
+                        compute_ktile(
+                            buf,
+                            kt_rel + num_buffers + 1,
+                            rmem_preloaded=True,
+                            next_stage_buf=next_buf,
+                            my_jobs=my_jobs,
+                            next_stage_wait=TDM_PER * (num_buffers - 2),
+                            prefetch_slot=slot,
+                        )
+
+                dispatch_wave_job(steady_persistent)
+
+                for j in range_constexpr(num_buffers):
+                    kt_rel = n_steady + j
+                    buf = ptr_to_idx(buf_ptr(kt_rel % num_buffers))
+                    has_next_drain_tile = j + 1 < num_buffers
+                    next_buf = (
+                        ptr_to_idx(buf_ptr((kt_rel + 1) % num_buffers))
+                        if const_expr(has_next_drain_tile)
+                        else None
+                    )
+
+                    def drain_fence():
+                        drain_outstanding = TDM_PER * max(
+                            0, num_buffers - 2 - j
+                        )
+                        if has_next_task:
+                            pipeline_fence(
+                                outstanding=drain_outstanding
+                                + TDM_PER
+                                * min(j, NEXT_TASK_PREFETCH_STAGES)
+                            )
+                        else:
+                            pipeline_fence(outstanding=drain_outstanding)
+
+                    compute_ktile(
+                        buf,
+                        None,
+                        rmem_preloaded=True,
+                        next_stage_buf=next_buf,
+                        next_stage_fence_fn=(
+                            drain_fence
+                            if const_expr(has_next_drain_tile)
+                            else None
+                        ),
+                    )
+                    if const_expr(j < NEXT_TASK_PREFETCH_STAGES):
+                        # This slot is now dead for the current task. Refill the
+                        # first three released slots with next-task K0/K1/K2.
+                        if has_next_task:
+                            workgroup_barrier()
+                            issue(kt_rel % num_buffers, j, n_delta=1)
+                            rocdl.sched_barrier(0)
             # Post-compute wins for decode and for shallow pipelines: at
             # num_buffers<=2 mid-compute prefetches one tile and under-overlaps.
-            if const_expr(tile_m <= 64 or num_buffers <= 2):
+            elif const_expr(tile_m <= 64 or num_buffers <= 2):
                 # Post-compute issue: better for decode (small tile_m).
                 for i in range_constexpr(num_buffers):
                     issue(i, i)
@@ -971,7 +1162,24 @@ def _build_gemm_task(
                     )
             # The epilogue restages C in this arena. Draining our own tensorcnt
             # suffices: peer multicast loads are pairwise matched with ours.
-            pipeline_fence(outstanding=0)
+            # Persistent drain already completed every current-task load. Its
+            # only possible current-input survivors are next-task K0/K1/K2 in
+            # released ring slots, which dependency-counted waits preserve.
+            if const_expr(max_tasks_per_worker == 0):
+                pipeline_fence(outstanding=0)
+            else:
+                # Retire the previous output store before overwriting Store
+                # LDS. If another task follows, its prefetched K0/K1/K2 groups
+                # are newer and may remain outstanding.
+                if is_first_task:
+                    pass
+                else:
+                    if has_next_task:
+                        tdm_ops.tensor_wait(
+                            TDM_PER * NEXT_TASK_PREFETCH_STAGES
+                        )
+                    else:
+                        tdm_ops.tensor_wait(0)
             is_fp4_quant = bool(stage1_quant_out and a_is_fp4)
             STORE_N = tile_n // (4 if is_fp4_quant else 2) if stage1_act else tile_n
             # Unpadded, a row is STORE_N/2 dwords (a multiple of 32), so the 16
@@ -1256,7 +1464,7 @@ def _build_gemm_task(
                     _comb_iter, 0, (_oob, STORE_N), (_stride_elems, 1)
                 )
                 _lds_c = lds_view(
-                    fx.recast_iter(oc, base_ptr),
+                    fx.recast_iter(oc, base_ptr + STORE_LDS_OFF),
                     (tile_m, STORE_PITCH),
                     (STORE_PITCH, 1),
                 )
@@ -1296,7 +1504,13 @@ def _build_gemm_task(
                             global_byte_offset=_gboff,
                         )
                         tensor_store_gather(desc)
-                tdm_ops.tensor_wait(0)
+                if const_expr(max_tasks_per_worker > 0):
+                    # A following task protects Store LDS at its reuse point;
+                    # the final task relies on kernel completion to drain its
+                    # last asynchronous global store.
+                    pass
+                else:
+                    tdm_ops.tensor_wait(0)
             else:
                 if const_expr(stage1_act):
                     out_divisor = 4 if is_fp4_quant else 2
@@ -1316,7 +1530,7 @@ def _build_gemm_task(
                     gtC = global_view(c_iter, c_off_rt, (tile_m, STORE_N), (STORE_N, 1))
                     atomC = make_tdm_store(gtC, mn_oob, out_stride)
                     src = lds_view(
-                        fx.recast_iter(oc_store, base_ptr),
+                        fx.recast_iter(oc_store, base_ptr + STORE_LDS_OFF),
                         (tile_m, STORE_N),
                         (STORE_N, 1),
                     )
@@ -1333,14 +1547,20 @@ def _build_gemm_task(
                         num_warps=num_waves,
                     )
                     src = lds_view(
-                        fx.recast_iter(oc_store, base_ptr),
+                        fx.recast_iter(oc_store, base_ptr + STORE_LDS_OFF),
                         (tile_m, STORE_PITCH),
                         (STORE_PITCH, 1),
                     )
                 fx.copy(atomC, src, gtC)
                 if const_expr(stage1_quant_out and stage1_act):
                     rocdl.s_wait_storecnt(0)
-                tdm_ops.tensor_wait(0)
+                if const_expr(max_tasks_per_worker > 0):
+                    # A following task protects Store LDS at its reuse point;
+                    # the final task relies on kernel completion to drain its
+                    # last asynchronous global store.
+                    pass
+                else:
+                    tdm_ops.tensor_wait(0)
 
     return gemm_task
 
@@ -1498,6 +1718,7 @@ def launch_gemm_a8w4_tdm(
         next_stage_on,
         num_waves_per_tensor_tdm,
         tdm_b_th,
+        max_tasks_per_worker,
         enable_ep_scatter,
         ep_arena_handle,
         ep_combine_input_offset,
@@ -1526,7 +1747,7 @@ def launch_gemm_a8w4_tdm(
         total_n_tiles = (i32_n + (tile_n - 1)) // tile_n
         total_m_tiles = (i32_m + (tile_m - 1)) // tile_m
 
-        def run_task(m_tile, n_tile):
+        def run_task(m_tile, n_tile, is_first_task=False, has_next_task=False):
             gemm_task(
                 arg_c,
                 arg_a,
@@ -1543,14 +1764,22 @@ def launch_gemm_a8w4_tdm(
                 f32_swiglu_limit,
                 f32_situ_beta,
                 f32_situ_linear_beta,
+                is_first_task,
+                has_next_task,
             )
 
         if const_expr(max_tasks_per_worker > 0):
             m_tile, n_tile, n_end = _build_persistent_task_range(
                 fx.block_idx.x, total_n_tiles, max_tasks_per_worker
             )
+            n_begin = n_tile
             while n_tile < n_end:
-                run_task(m_tile, n_tile)
+                run_task(
+                    m_tile,
+                    n_tile,
+                    is_first_task=n_tile == n_begin,
+                    has_next_task=n_tile + 1 < n_end,
+                )
                 n_tile += 1
         else:
             m_tile, n_tile = _build_static_task(
