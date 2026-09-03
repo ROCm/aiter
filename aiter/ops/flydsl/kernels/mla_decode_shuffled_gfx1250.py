@@ -5,12 +5,9 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly as _fly
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import (
-    arith,
     gpu,
     range_constexpr,
     rocdl,
@@ -19,32 +16,33 @@ from flydsl.expr import math as fmath
 from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import ReductionOp, T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
-from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+from flydsl.utils.smem_allocator import check_smem_capacity
 
-from aiter.ops.flydsl.kernels import buffer_ops
+# V# flags word (bits 127:96): DATA_FORMAT=7, NUM_FORMAT=4 — LLVM
+# makeBufferRsrc()'s non-RDNA form (is_rdna_arch("gfx1250") is False).
+_V4I32_RSRC_FLAGS = (7 << 12) | (4 << 15)
 
 
-def _build_v4i32_buffer_rsrc(tensor, num_records_bytes=0xFFFFFFFF, arch=None):
+def _build_v4i32_buffer_rsrc(tensor):
     """Build a ``<4 x i32>`` V# (buffer resource descriptor) for ``s_buffer_load``.
 
     ``s_buffer_load`` intrinsics take the legacy ``<4 x i32>`` descriptor;
-    ``rocdl.make.buffer.rsrc`` (the modern op used by
-    ``buffer_ops.create_buffer_resource``) only produces ``!llvm.ptr<8>``, so
-    we assemble the V# manually here.
+    ``rocdl.make.buffer.rsrc`` (the op behind ``fx.rocdl.make_buffer_ptr``)
+    only produces ``!llvm.ptr<8>``, so we assemble the V# manually here.
 
     AMDGPU V# layout (low to high):
       word0: base[31:0]
       word1: base[47:32] (low 16) | stride<<16 (high 16)
-      word2: num_records (bytes)
+      word2: num_records (bytes; max = no bounds checking)
       word3: flags (DATA_FORMAT, NUM_FORMAT, OOB_SELECT, etc.)
     """
-    base_i64 = fx.Int64(buffer_ops.extract_base_index(tensor, address_space=1))
+    base_i64 = fx.Int64(fx.ptrtoint(fx.get_iter(tensor)))
     w0 = base_i64.to(fx.Int32)
     # word 1: only base[47:32] is meaningful for addresses, and stride=0 leaves
     # the high 16 bits zero.
     w1 = (base_i64 >> 32).to(fx.Int32)
-    w2 = fx.Int32(num_records_bytes)
-    w3 = fx.Int32(buffer_ops._get_buffer_flags(arch))
+    w2 = fx.Int32(0xFFFFFFFF)
+    w3 = fx.Int32(_V4I32_RSRC_FLAGS)
     return fx.Vector.from_elements([w0, w1, w2, w3], fx.Int32)
 
 
@@ -96,14 +94,10 @@ def _s_buffer_load_vec(rsrc_v4i32, byte_offset_i32, width):
     )
 
 
-# fmath.exp2 lowers to llvm.exp2.f32, which adds extra instructions to guard
-# x < -126 underflow. The softmax sum's ULP is big enough that the guard buys
-# nothing here, so use the bare hardware exp2.
-def _amdgcn_exp2_f32(x):
-    return _llvm.call_intrinsic(
-        T.f32, "llvm.amdgcn.exp2.f32", [fx.Float32(x).ir_value()], [], []
-    )
-
+# Ambient fastmath for all f32 ops (via compile_hints); afn lets fmath.exp2
+# lower to bare hardware exp2. No nnan/ninf: the softmax's -inf sentinels
+# need IEEE inf semantics.
+_KERNEL_FASTMATH = "reassoc,arcp,contract,afn,nsz"
 
 WAVE_SIZE = 32
 WMMA_M = 16
@@ -274,14 +268,15 @@ def compile_mla_decode_main(
     kv_lora_bytes = kv_lora_elems * elem_bytes
     kv_rope_bytes = kv_rope_elems * elem_bytes
 
-    allocator = SmemAllocator(
-        None, arch=gpu_arch, global_sym_name="mla_decode_shuf_lds"
-    )
     q_lora_elems = QGSP_PADDED * Q_LORA_ROW
     q_rope_elems = QGSP_PADDED * Q_ROPE_ROW
 
-    kv_lora_off = allocator._align(allocator.ptr, 16)
-    kv_rope_off = allocator._align(kv_lora_off + NUM_KV_STAGES * kv_lora_bytes, 16)
+    def _align16(n):
+        return (n + 15) & ~15
+
+    # Region byte offsets into one LDS arena.
+    kv_lora_off = 0
+    kv_rope_off = _align16(kv_lora_off + NUM_KV_STAGES * kv_lora_bytes)
     kv_end = kv_rope_off + NUM_KV_STAGES * kv_rope_bytes
 
     # Q is read from LDS exactly once (prologue -> registers) and never touched again, so its
@@ -295,7 +290,8 @@ def compile_mla_decode_main(
     q_lora_off = kv_lora_off if Q_ON_STAGE0 else kv_lora_off + kv_lora_bytes
     q_rope_off = q_lora_off + q_lora_elems * elem_bytes
     assert q_lora_off % 16 == 0 and q_rope_off % 16 == 0, "aliased Q offsets misaligned"
-    allocator.ptr = max(kv_end, q_rope_off + q_rope_elems * elem_bytes)
+    LDS_TOTAL_BYTES = max(kv_end, q_rope_off + q_rope_elems * elem_bytes)
+    check_smem_capacity(LDS_TOTAL_BYTES, gpu_arch)
 
     @flyc.kernel
     def kernel_mla_decode_main(
@@ -324,10 +320,7 @@ def compile_mla_decode_main(
             wave_id * (NQGSP_LOCAL * WMMA_M) if WARP_HEAD_SPLIT else fx.Index(0)
         )
 
-        sl_rsrc = buffer_ops.create_buffer_resource(arg_seq_lens, max_size=True)
-        seq_len_i32 = fx.Int32(
-            buffer_ops.buffer_load(sl_rsrc, seq_idx, vec_width=1, dtype=T.i32)
-        )
+        seq_len_i32 = fx.Int32((fx.get_iter(arg_seq_lens) + seq_idx).load())
         seq_len = fx.Index(seq_len_i32)
 
         elem_ty = T.bf16 if dtype == "bf16" else T.f16
@@ -364,21 +357,42 @@ def compile_mla_decode_main(
         stride_lse_part = NUM_Q_HEADS
         stride_bt_seq = fx.Index(i32_max_blocks_per_seq)
 
-        bt_rsrc_v4i32 = _build_v4i32_buffer_rsrc(arg_block_tables, arch=gpu_arch)
+        bt_rsrc_v4i32 = _build_v4i32_buffer_rsrc(arg_block_tables)
 
-        base = allocator.get_base()
-        q_lora_lds = SmemPtr(base, q_lora_off, elem_ty, shape=(q_lora_elems,))
-        q_rope_lds = SmemPtr(base, q_rope_off, elem_ty, shape=(q_rope_elems,))
-        kv_lora_lds = SmemPtr(
-            base, kv_lora_off, elem_ty, shape=(NUM_KV_STAGES * kv_lora_elems,)
+        # One static-LDS arena at the byte offsets computed above (Q aliased
+        # over the KV slabs). Must be static: a dynamic-shared base defeats
+        # ds_load pipelining (full DS wait per fragment).
+        lds_base = fx.SharedAllocator().allocate(LDS_TOTAL_BYTES).peek().ptr
+        kv_lora_off_e = kv_lora_off // elem_bytes
+        kv_rope_off_e = kv_rope_off // elem_bytes
+        q_lora_off_e = q_lora_off // elem_bytes
+        q_rope_off_e = q_rope_off // elem_bytes
+
+        def _i64_off(off):
+            # index-typed Numerics crash add_offset's int-tuple inference
+            return off if isinstance(off, int) else fx.Int64(off)
+
+        lds_eptr = fx.recast_iter(
+            fx.PointerType.get(
+                elem_ty=elem_ty,
+                address_space=fx.AddressSpace.Shared,
+                alignment=16,
+            ),
+            lds_base,
         )
-        kv_rope_lds = SmemPtr(
-            base, kv_rope_off, elem_ty, shape=(NUM_KV_STAGES * kv_rope_elems,)
-        )
-        q_lora_lds.get()
-        q_rope_lds.get()
-        kv_lora_lds.get()
-        kv_rope_lds.get()
+
+        def _lds_frag8(elem_off):
+            # One ds_load_b128 (8 x 16-bit elems). A plain ptr load keeps DS
+            # waits scheduler-counted (copy-atom+rmem drains per fragment).
+            return fx.Vector(
+                fx.ptr_load(lds_eptr + _i64_off(elem_off), T.vec(8, elem_ty))
+            )
+
+        def _lds_tr16(elem_off):
+            # rocdl.lds_transpose_load only takes an LDS memref (just for its
+            # base address); the arena is pointer-based, so feed the raw op a ptr.
+            ptr = fx.to_llvm_ptr(fx.add_offset(lds_eptr, _i64_off(elem_off)))
+            return fx.Vector(rocdl.ds_load_tr16_b128(T.vec(8, elem_ty), ptr))
 
         # We multiply scale by log2e so we can use exp2 later for softmax (exp2 op faster than exp)
         LOG2E = 1.4426950408889634
@@ -393,23 +407,21 @@ def compile_mla_decode_main(
         neg_finite_max_f32 = fx.Float32(NEG_FINITE_MAX)
 
         # Loads one 16-row x 32-K WMMA fragment for Q from Q LDS.
-        def _load_q_frag(lds_ptr, row_base_idx, k_base_elem, row_stride):
-            lds_mem = lds_ptr.get()
+        def _load_q_frag(region_off, row_base_idx, k_base_elem, row_stride):
             chunks = []
             for k0 in range_constexpr(2):
                 kk_base = (lane_kgrp + k0 * 2) * 8 + k_base_elem
                 elem_off = row_base_idx * row_stride + kk_base
-                chunks.append(fx.Vector.load(T.vec(8, elem_ty), lds_mem, [elem_off]))
+                chunks.append(_lds_frag8(region_off + elem_off))
             return chunks[0].shuffle(chunks[1], list(range(16)))
 
         # ---- shuffled K fragment loader (straight ds_load_b128) ----
-        def _load_shuf_K(lds_ptr, n_tile, ks, bsg_stride, stage_off):
-            lds_mem = lds_ptr.get()
+        def _load_shuf_K(region_off, n_tile, ks, bsg_stride, stage_off):
             base_t = stage_off + n_tile * bsg_stride
             o0 = base_t + (2 * ks) * 256 + lane_id * 8
             o1 = base_t + (2 * ks + 1) * 256 + lane_id * 8
-            c0 = fx.Vector.load(T.vec(8, elem_ty), lds_mem, [o0])
-            c1 = fx.Vector.load(T.vec(8, elem_ty), lds_mem, [o1])
+            c0 = _lds_frag8(region_off + o0)
+            c1 = _lds_frag8(region_off + o1)
             return c0.shuffle(c1, list(range(16)))
 
         # ---- shuffled V fragment loader (transpose ds_load_tr16_b128) ----
@@ -417,16 +429,11 @@ def compile_mla_decode_main(
         lane_ngrp = lane16 / 8
 
         def _load_shuf_V_tr(pv_n_global, ks, stage_off):
-            lds_mem = kv_lora_lds.get()
             base = pv_n_global * 256 + lane_ngrp * 128 + (lane_kgrp * 8 + lane8) * 8
             o0 = stage_off + (2 * ks) * LORA_BSG_STRIDE + base
             o1 = stage_off + (2 * ks + 1) * LORA_BSG_STRIDE + base
-            v0 = fx.Vector(
-                rocdl.lds_transpose_load(T.vec(8, elem_ty), lds_mem, o0, elem_bytes)
-            )
-            v1 = fx.Vector(
-                rocdl.lds_transpose_load(T.vec(8, elem_ty), lds_mem, o1, elem_bytes)
-            )
+            v0 = _lds_tr16(kv_lora_off_e + o0)
+            v1 = _lds_tr16(kv_lora_off_e + o1)
             return v0.shuffle(v1, list(range(16)))
 
         # ---- block table -> physical page IDs ----
@@ -471,79 +478,112 @@ def compile_mla_decode_main(
                 else fx.Index(0)
             )
 
+        # ---- TDM copies: atoms + fx.copy over ELEMENT-typed views. Byte units
+        # overflow the 16-bit tile_dim0 at NUM_WARPS=1 (a 65536-byte page blob
+        # silently becomes a 0-wide load); element units (32768) fit.
+        kv_iter = fx.get_iter(arg_kv_cache)
+        q_iter = fx.get_iter(arg_query)
+        lds_elems = fx.recast_iter(elem_dtype, lds_base)
+
+        def _gv(it, elem_off, shape, strides):
+            return fx.Tensor(
+                fx.make_view(
+                    fx.add_offset(it, _i64_off(elem_off)),
+                    fx.make_layout(shape, strides),
+                )
+            )
+
+        def _lv(elem_off, shape, strides):
+            return fx.Tensor(
+                fx.make_view(
+                    fx.add_offset(lds_elems, _i64_off(elem_off)),
+                    fx.make_layout(shape, strides),
+                )
+            )
+
+        # KV blobs are rank-1 element runs; page gather + OOB page-0 clamp live
+        # in the view offset, so no extent clamp.
+        kv_lora_atom = fx.rocdl.make_tdm_atom(
+            _gv(kv_iter, 0, (lora_compute_block_elems,), (1,)),
+            [None],
+            num_warps=NUM_WARPS,
+        )
+        kv_rope_atom = fx.rocdl.make_tdm_atom(
+            _gv(kv_iter, 0, (rope_compute_block_elems,), (1,)),
+            [None],
+            num_warps=NUM_WARPS,
+        )
+        q_lora_atom = fx.rocdl.make_tdm_atom(
+            _gv(q_iter, 0, (NUM_Q_HEADS, KV_LORA_RANK), (QK_HEAD_DIM, 1)),
+            [None, None],
+            strides=[QK_HEAD_DIM, None],
+            num_warps=NUM_WARPS,
+            pad_interval=KV_LORA_RANK,
+            pad_amount=Q_LORA_PAD,
+        )
+        q_rope_atom = fx.rocdl.make_tdm_atom(
+            _gv(q_iter, 0, (NUM_Q_HEADS, QK_ROPE_HEAD_DIM), (QK_HEAD_DIM, 1)),
+            [None, None],
+            strides=[QK_HEAD_DIM, None],
+            num_warps=NUM_WARPS,
+            pad_interval=QK_ROPE_HEAD_DIM,
+            pad_amount=Q_ROPE_PAD,
+        )
+
         def _issue_kv_load_single_block(
-            phys_blk, lora_byte_off, rope_byte_off, sub_tok
+            phys_blk, lora_elem_off, rope_elem_off, sub_tok
         ):
-            lora_desc = tdm_ops.make_tensor_descriptor_2d(
-                global_ptr=arg_kv_cache,
-                lds_memref=kv_lora_lds.get(),
-                global_offset=(phys_blk, sub_tok * KV_LORA_RANK),
-                tensor_shape=(1, lora_compute_block_elems),
-                strides=(BLOCK_STRIDE, 1),
-                tile_shape=(1, lora_compute_block_elems),
-                elem_bytes=elem_bytes,
-                num_warps=NUM_WARPS,
-                lds_byte_offset=lora_byte_off,
-            )
-            tdm_ops.tensor_load_2d(lora_desc)
-            rope_desc = tdm_ops.make_tensor_descriptor_2d(
-                global_ptr=arg_kv_cache,
-                lds_memref=kv_rope_lds.get(),
-                global_offset=(
-                    phys_blk,
-                    sub_tok * QK_ROPE_HEAD_DIM + page_lora_elems,
+            g_base = phys_blk * BLOCK_STRIDE
+            fx.copy(
+                kv_lora_atom,
+                _gv(
+                    kv_iter,
+                    g_base + sub_tok * KV_LORA_RANK,
+                    (lora_compute_block_elems,),
+                    (1,),
                 ),
-                tensor_shape=(1, rope_compute_block_elems),
-                strides=(BLOCK_STRIDE, 1),
-                tile_shape=(1, rope_compute_block_elems),
-                elem_bytes=elem_bytes,
-                num_warps=NUM_WARPS,
-                lds_byte_offset=rope_byte_off,
+                _lv(kv_lora_off_e + lora_elem_off, (lora_compute_block_elems,), (1,)),
             )
-            tdm_ops.tensor_load_2d(rope_desc)
+            fx.copy(
+                kv_rope_atom,
+                _gv(
+                    kv_iter,
+                    g_base + page_lora_elems + sub_tok * QK_ROPE_HEAD_DIM,
+                    (rope_compute_block_elems,),
+                    (1,),
+                ),
+                _lv(kv_rope_off_e + rope_elem_off, (rope_compute_block_elems,), (1,)),
+            )
 
         # Issue loads for a whole compute tile
         def _issue_kv_tile_loads(
             phys_blks_list, lora_stage_off, rope_stage_off, sub_tok
         ):
-            lora_block_bytes = lora_compute_block_elems * elem_bytes
-            rope_block_bytes = rope_compute_block_elems * elem_bytes
             for b in range_constexpr(BLOCKS_PER_COMPUTE):
                 _issue_kv_load_single_block(
                     phys_blks_list[b],
-                    lora_stage_off + b * lora_block_bytes,
-                    rope_stage_off + b * rope_block_bytes,
+                    lora_stage_off + b * lora_compute_block_elems,
+                    rope_stage_off + b * rope_compute_block_elems,
                     sub_tok,
                 )
 
         def _issue_q_load():
-            q_outer_off = seq_idx * NUM_Q_HEADS
-            lora_desc = tdm_ops.make_tensor_descriptor_2d(
-                global_ptr=arg_query,
-                lds_memref=q_lora_lds.get(),
-                global_offset=(q_outer_off, fx.Index(0)),
-                tensor_shape=(NUM_Q_HEADS, KV_LORA_RANK),
-                strides=(QK_HEAD_DIM, 1),
-                tile_shape=(NUM_Q_HEADS, KV_LORA_RANK),
-                elem_bytes=elem_bytes,
-                pad_interval=KV_LORA_RANK,
-                pad_amount=Q_LORA_PAD,
-                num_warps=NUM_WARPS,
+            g_off = seq_idx * (NUM_Q_HEADS * QK_HEAD_DIM)
+            fx.copy(
+                q_lora_atom,
+                _gv(q_iter, g_off, (NUM_Q_HEADS, KV_LORA_RANK), (QK_HEAD_DIM, 1)),
+                _lv(q_lora_off_e, (NUM_Q_HEADS, KV_LORA_RANK), (Q_LORA_ROW, 1)),
             )
-            tdm_ops.tensor_load_2d(lora_desc)
-            rope_desc = tdm_ops.make_tensor_descriptor_2d(
-                global_ptr=arg_query,
-                lds_memref=q_rope_lds.get(),
-                global_offset=(q_outer_off, fx.Index(KV_LORA_RANK)),
-                tensor_shape=(NUM_Q_HEADS, QK_ROPE_HEAD_DIM),
-                strides=(QK_HEAD_DIM, 1),
-                tile_shape=(NUM_Q_HEADS, QK_ROPE_HEAD_DIM),
-                elem_bytes=elem_bytes,
-                pad_interval=QK_ROPE_HEAD_DIM,
-                pad_amount=Q_ROPE_PAD,
-                num_warps=NUM_WARPS,
+            fx.copy(
+                q_rope_atom,
+                _gv(
+                    q_iter,
+                    g_off + KV_LORA_RANK,
+                    (NUM_Q_HEADS, QK_ROPE_HEAD_DIM),
+                    (QK_HEAD_DIM, 1),
+                ),
+                _lv(q_rope_off_e, (NUM_Q_HEADS, QK_ROPE_HEAD_DIM), (Q_ROPE_ROW, 1)),
             )
-            tdm_ops.tensor_load_2d(rope_desc)
 
         # ---- prologue ----
         # we issue Q load first if it is small enough to fit within second kv buffer we issue
@@ -567,11 +607,11 @@ def compile_mla_decode_main(
             q_row = head_row_off + qt * WMMA_M + lane16
             for ks in range_constexpr(K_QK_LORA_TILES):
                 q_lora_frags[qt][ks] = _load_q_frag(
-                    q_lora_lds, q_row, ks * WMMA_K, Q_LORA_ROW
+                    q_lora_off_e, q_row, ks * WMMA_K, Q_LORA_ROW
                 )
             for ks in range_constexpr(K_QK_ROPE_TILES):
                 q_rope_frags[qt][ks] = _load_q_frag(
-                    q_rope_lds, q_row, ks * WMMA_K, Q_ROPE_ROW
+                    q_rope_off_e, q_row, ks * WMMA_K, Q_ROPE_ROW
                 )
 
         rocdl.s_wait_dscnt(0)
@@ -624,8 +664,8 @@ def compile_mla_decode_main(
 
             cur_stage = fx.Index(state[si])
             nxt_stage = fx.Index(1) - cur_stage
-            nxt_lora_byte_off = nxt_stage * kv_lora_bytes
-            nxt_rope_byte_off = nxt_stage * kv_rope_bytes
+            nxt_lora_elem_off = nxt_stage * kv_lora_elems
+            nxt_rope_elem_off = nxt_stage * kv_rope_elems
             cur_lora_elem_off = cur_stage * kv_lora_elems
             cur_rope_elem_off = cur_stage * kv_rope_elems
 
@@ -651,8 +691,8 @@ def compile_mla_decode_main(
                 next_phys = _phys_blks_for_compute(g + 1)
                 _issue_kv_tile_loads(
                     next_phys,
-                    nxt_lora_byte_off,
-                    nxt_rope_byte_off,
+                    nxt_lora_elem_off,
+                    nxt_rope_elem_off,
                     _sub_tok(g + 1),
                 )
                 tdm_ops.tensor_wait(K_OPS_PER_WAVE)
@@ -667,7 +707,7 @@ def compile_mla_decode_main(
             for ks in range_constexpr(K_QK_LORA_TILES):
                 for n_tile in range_constexpr(NQK_LOCAL):
                     k_frag = _load_shuf_K(
-                        kv_lora_lds, n_tile, ks, LORA_BSG_STRIDE, qk_lora_off
+                        kv_lora_off_e, n_tile, ks, LORA_BSG_STRIDE, qk_lora_off
                     )
                     for qt in range_constexpr(NQGSP_LOCAL):
                         qk_accs[qt][n_tile] = _wmma(
@@ -676,7 +716,7 @@ def compile_mla_decode_main(
             for ks in range_constexpr(K_QK_ROPE_TILES):
                 for n_tile in range_constexpr(NQK_LOCAL):
                     k_frag = _load_shuf_K(
-                        kv_rope_lds, n_tile, ks, ROPE_BSG_STRIDE, qk_rope_off
+                        kv_rope_off_e, n_tile, ks, ROPE_BSG_STRIDE, qk_rope_off
                     )
                     for qt in range_constexpr(NQGSP_LOCAL):
                         qk_accs[qt][n_tile] = _wmma(
@@ -725,31 +765,22 @@ def compile_mla_decode_main(
                 l_state = l_list[qt]
                 local_max = qk_accs[qt][0].reduce(ReductionOp.MAX)
                 for n_tile in range_constexpr(1, NQK_LOCAL):
-                    local_max = arith.maximumf(
+                    local_max = fx.max(
                         local_max, qk_accs[qt][n_tile].reduce(ReductionOp.MAX)
                     )
                 peer = gpu.shuffle_xor(local_max, 16, WAVE_SIZE)
-                row_max = arith.maximumf(local_max, peer)
+                row_max = fx.max(local_max, peer)
 
-                new_m = fx.Float32(arith.maximumf(m_state, row_max))
+                new_m = fx.max(m_state, row_max)
 
-                alpha = fx.Float32(_amdgcn_exp2_f32(m_state - new_m))
+                alpha = fx.Float32(fmath.exp2(m_state - new_m))
 
                 # Probabilities p = exp2(score - new_m)
                 row_sum_partial = zero_f32
                 for n_tile in range_constexpr(NQK_LOCAL):
-                    diff = qk_accs[qt][n_tile] - new_m
-                    p_vec = fx.Vector.from_elements(
-                        [
-                            fx.Float32(_amdgcn_exp2_f32(diff[mi]))
-                            for mi in range_constexpr(8)
-                        ],
-                        fx.Float32,
-                    )
+                    p_vec = fx.Vector(fmath.exp2(qk_accs[qt][n_tile] - new_m))
                     qk_accs[qt][n_tile] = p_vec
-                    row_sum_partial = row_sum_partial + p_vec.reduce(
-                        ReductionOp.ADD, fastmath=arith.FastMathFlags.fast
-                    )
+                    row_sum_partial = row_sum_partial + p_vec.reduce(ReductionOp.ADD)
 
                 # Complete the row sum across the two half-waves, then update running l and m.
                 peer = gpu.shuffle_xor(row_sum_partial, 16, WAVE_SIZE)
@@ -794,10 +825,18 @@ def compile_mla_decode_main(
             pv_final.append([fx.Vector(v) for v in results[si : si + P]])
             si += P
 
-        out_rsrc = buffer_ops.create_buffer_resource(arg_out, max_size=True)
-
+        # Global stores via aligned typed pointers (scalar elem type; the stored
+        # value sets the vector width). Offsets are in elements.
         if WRITE_FINAL_OUTPUT:
             # since only one partition we normalize here so no need to call reduce kernel
+            out_ptr = fx.recast_iter(
+                fx.PointerType.get(
+                    elem_ty=elem_ty,
+                    address_space=fx.AddressSpace.Global,
+                    alignment=16,
+                ),
+                fx.get_iter(arg_out),
+            )
             out_seq_base = seq_idx * stride_o_seq
             is_empty = seq_len == 0
             zero_vec_half = fx.Vector.filled(8, 0.0, elem_dtype)
@@ -814,12 +853,20 @@ def compile_mla_decode_main(
                     vec_half = (pv_final[qt][pv_n] * inv_l).to(elem_dtype)
                     vec_half = fx.Vector(is_empty.select(zero_vec_half, vec_half))
                     if row_valid:
-                        buffer_ops.buffer_store(
-                            vec_half, out_rsrc, row_base + head_col_base
+                        fx.ptr_store(
+                            vec_half, out_ptr + _i64_off(row_base + head_col_base)
                         )
         else:
-            ml_rsrc = buffer_ops.create_buffer_resource(arg_max_logits, max_size=True)
-            es_rsrc = buffer_ops.create_buffer_resource(arg_exp_sums, max_size=True)
+            out_f32_ptr = fx.recast_iter(
+                fx.PointerType.get(
+                    elem_ty=T.f32,
+                    address_space=fx.AddressSpace.Global,
+                    alignment=16,
+                ),
+                fx.get_iter(arg_out),
+            )
+            ml_iter = fx.get_iter(arg_max_logits)
+            es_iter = fx.get_iter(arg_exp_sums)
 
             part_idx = seg_idx * SPLIT + (wave_id if WARP_TOKEN_SPLIT else 0)
             out_base = seq_idx * stride_o_seq + part_idx * stride_o_part
@@ -833,17 +880,16 @@ def compile_mla_decode_main(
                     pv_n_global = wave_id * P + pv_n if WARP_DC_SPLIT else pv_n
                     head_col_base = pv_n_global * WMMA_M + lane_kgrp * 8
                     off_lo = out_base + row * stride_o_row + head_col_base
-                    off_hi = off_lo + 4
                     lo = pv_final[qt][pv_n].shuffle(pv_final[qt][pv_n], [0, 1, 2, 3])
                     hi = pv_final[qt][pv_n].shuffle(pv_final[qt][pv_n], [4, 5, 6, 7])
                     if row_valid:
-                        buffer_ops.buffer_store(lo, out_rsrc, off_lo)
-                        buffer_ops.buffer_store(hi, out_rsrc, off_hi)
+                        fx.ptr_store(lo, out_f32_ptr + _i64_off(off_lo))
+                        fx.ptr_store(hi, out_f32_ptr + _i64_off(off_lo + 4))
 
                 off_lse = lse_base + row
                 if row_valid:
-                    buffer_ops.buffer_store(m_final[qt], ml_rsrc, off_lse)
-                    buffer_ops.buffer_store(l_final[qt], es_rsrc, off_lse)
+                    fx.ptr_store(m_final[qt], ml_iter + _i64_off(off_lse))
+                    fx.ptr_store(l_final[qt], es_iter + _i64_off(off_lse))
 
     cache_tag = (
         KV_LORA_RANK,
@@ -875,11 +921,6 @@ def compile_mla_decode_main(
         stream: fx.Stream,
     ):
         _ = cache_tag
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator.finalized = False
-            allocator.finalize()
-
         launcher = kernel_mla_decode_main(
             arg_out,
             arg_max_logits,
@@ -901,9 +942,11 @@ def compile_mla_decode_main(
             stream=stream,
         )
 
+    hints = {"fastmath": _KERNEL_FASTMATH}
     # Occupancy hint: target this many waves resident per execution unit.
     if waves_per_eu is not None and int(waves_per_eu) >= 1:
-        launch_mla_decode_main.compile_hints = {"waves_per_eu": int(waves_per_eu)}
+        hints["waves_per_eu"] = int(waves_per_eu)
+    launch_mla_decode_main.compile_hints = hints
 
     return launch_mla_decode_main
 
@@ -931,7 +974,7 @@ def compile_mla_decode_reduce(
     SPLIT = ATTN_NUM_WARPS if WARP_TOKEN_SPLIT else 1
     NUM_PARTITIONS = NUM_SEGS * SPLIT
     V_HEAD_DIM = KV_LORA_RANK
-    VEC = 4  # f32 cols per lane per chunk -> 128-bit buffer load/store
+    VEC = 4  # f32 cols per lane per chunk -> 128-bit loads
     if V_HEAD_DIM % (WAVE_SIZE * VEC) != 0:
         raise ValueError(
             f"V_HEAD_DIM ({V_HEAD_DIM}) must be a multiple of WAVE_SIZE*VEC "
@@ -963,6 +1006,7 @@ def compile_mla_decode_reduce(
         arg_seq_lens: fx.Tensor,
         i32_num_seqs: fx.Int32,
     ):
+        elem_ty = T.bf16 if dtype == "bf16" else T.f16
         elem_dtype = fx.BFloat16 if dtype == "bf16" else fx.Float16
 
         tx = gpu.thread_id("x")
@@ -970,10 +1014,7 @@ def compile_mla_decode_reduce(
         warp_id = tx / WAVE_SIZE
         lane_id = tx % WAVE_SIZE
 
-        sl_rsrc = buffer_ops.create_buffer_resource(arg_seq_lens, max_size=True)
-        seq_len = fx.Index(
-            buffer_ops.buffer_load(sl_rsrc, seq_idx, vec_width=1, dtype=T.i32)
-        )
+        seq_len = fx.Index(fx.Int32((fx.get_iter(arg_seq_lens) + seq_idx).load()))
 
         # Re-derive the main kernel's tiling
         num_tiles = (seq_len + (KV_COMPUTE_BLOCK_SIZE - 1)) // KV_COMPUTE_BLOCK_SIZE
@@ -990,10 +1031,25 @@ def compile_mla_decode_reduce(
         stride_out_seq = NUM_Q_HEADS * V_HEAD_DIM
         stride_out_row = V_HEAD_DIM
 
-        tmp_rsrc = buffer_ops.create_buffer_resource(arg_tmp_out, max_size=True)
-        out_rsrc = buffer_ops.create_buffer_resource(arg_out, max_size=True)
-        ml_rsrc_v4i32 = _build_v4i32_buffer_rsrc(arg_max_logits, arch=gpu_arch)
-        es_rsrc_v4i32 = _build_v4i32_buffer_rsrc(arg_exp_sums, arch=gpu_arch)
+        # Aligned scalar-elem pointers; the loaded/stored value sets the width.
+        tmp_ptr = fx.recast_iter(
+            fx.PointerType.get(
+                elem_ty=T.f32,
+                address_space=fx.AddressSpace.Global,
+                alignment=16,
+            ),
+            fx.get_iter(arg_tmp_out),
+        )
+        out_ptr = fx.recast_iter(
+            fx.PointerType.get(
+                elem_ty=elem_ty,
+                address_space=fx.AddressSpace.Global,
+                alignment=VEC * elem_dtype.width // 8,
+            ),
+            fx.get_iter(arg_out),
+        )
+        ml_rsrc_v4i32 = _build_v4i32_buffer_rsrc(arg_max_logits)
+        es_rsrc_v4i32 = _build_v4i32_buffer_rsrc(arg_exp_sums)
 
         zero_f32 = fx.Float32(0.0)
         neg_inf_f32 = fx.Float32(float("-inf"))
@@ -1024,13 +1080,10 @@ def compile_mla_decode_reduce(
                 l_f = l_i32.bitcast(fx.Float32)
                 v_chunks = []
                 for c in range_constexpr(N_COL_CHUNKS):
-                    col = _lane_col(c)
-                    tmp_off = tmp_row_base + p_idx * stride_tmp_seg + col  # noqa: B023
+                    tmp_off = tmp_row_base + p_idx * stride_tmp_seg  # noqa: B023
                     v_chunks.append(
                         fx.Vector(
-                            buffer_ops.buffer_load(
-                                tmp_rsrc, tmp_off, vec_width=VEC, dtype=T.f32
-                            )
+                            (tmp_ptr + tmp_off + _lane_col(c)).load(T.vec(VEC, T.f32))
                         )
                     )
                 return m_f, l_f, v_chunks
@@ -1059,13 +1112,9 @@ def compile_mla_decode_reduce(
                 next_p_py = min(p + 1, NUM_PARTITIONS - 1)
                 m_p_next, l_p_next, v_p_next, valid_next = _prefetch_clamped(next_p_py)
 
-                new_m = arith.maximumf(m_state, m_p)
-                alpha_old = fmath.exp2(
-                    m_state - new_m, fastmath=arith.FastMathFlags.fast
-                )
-                alpha_this_raw = fmath.exp2(
-                    m_p - new_m, fastmath=arith.FastMathFlags.fast
-                )
+                new_m = fx.max(m_state, m_p)
+                alpha_old = fmath.exp2(m_state - new_m)
+                alpha_this_raw = fmath.exp2(m_p - new_m)
                 alpha_this = fx.Float32(valid.select(alpha_this_raw, zero_f32))
                 new_l = alpha_old * l_state + alpha_this * l_p
 
@@ -1092,7 +1141,7 @@ def compile_mla_decode_reduce(
                 out_vec_half = out_vec_f32.to(elem_dtype)
                 out_vec_half = fx.Vector(is_empty.select(zero_vec_half, out_vec_half))
                 out_off = seq_idx * stride_out_seq + r * stride_out_row + _lane_col(c)
-                buffer_ops.buffer_store(out_vec_half, out_rsrc, out_off)
+                fx.ptr_store(out_vec_half, out_ptr + out_off)
 
     cache_tag = (
         KV_LORA_RANK,
@@ -1131,6 +1180,8 @@ def compile_mla_decode_reduce(
             block=(block_threads, 1, 1),
             stream=stream,
         )
+
+    launch_mla_decode_reduce.compile_hints = {"fastmath": _KERNEL_FASTMATH}
 
     return launch_mla_decode_reduce
 
