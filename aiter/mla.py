@@ -402,13 +402,8 @@ def _fold_seqlen_indptr(indptr, fold_factor):
     """Repeat each batch's seqlen ``fold_factor`` times (head-folding pseudo-batches)."""
     lens = indptr[1:] - indptr[:-1]
     folded_lens = lens.repeat_interleave(fold_factor)
-    out = torch.empty(
-        indptr.shape[0] + (fold_factor - 1) * (indptr.shape[0] - 1),
-        dtype=indptr.dtype,
-        device=indptr.device,
-    )
-    out[0] = 0
-    out[1:] = torch.cumsum(folded_lens, dim=0).to(indptr.dtype)
+    cumsum = torch.cumsum(folded_lens, dim=0).to(indptr.dtype)
+    out = torch.nn.functional.pad(cumsum, (1, 0), value=0)
     return out
 
 
