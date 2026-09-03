@@ -239,6 +239,11 @@ class ValidatorFixture:
         # default matches the fixture target, and a test whose subject is a script target says so
         # explicitly -- the same obligation a real caller now has.
         runner="pytest",
+        # Likewise the validator no longer reads the target to see whether the grid duplicates
+        # its own defaults -- the caller declares what the cells cover. This default keeps that
+        # obligation met for every test whose subject is something else; the tests that ARE
+        # about independence pass grid_novelty=None to exercise the undeclared path.
+        grid_novelty="these cells are outside the fixture target's own defaults",
     ):
         report = self.root / f"{patch.stem}-report.json"
         # `cwd` exists for one reason: the validator has to accept RELATIVE --patch/--out from
@@ -271,6 +276,8 @@ class ValidatorFixture:
             if shape_env:
                 command.extend(["--shape-env", shape_env])
             command.extend(["--grid", grid_value])
+            if grid_novelty:
+                command.extend(["--grid-novelty", grid_novelty])
         if shape_arg:
             command.extend(["--shape-arg", shape_arg])
         if shape_argnames:
@@ -1442,56 +1449,80 @@ class ValidateKernelPrTests(unittest.TestCase):
             **kwargs,
         )
 
-    def test_a_grid_that_duplicates_the_targets_own_defaults_is_not_a_control(self):
+    def test_an_undeclared_grid_is_not_credited_as_a_control(self):
         # SKILL.md calls the S1 grid "a positive control against reporting the same default
         # test run twice under different stage names". On aiter#4538 all three requested
         # shapes were already in the target's own --shapes default list, so the stage
         # reported `pass` for re-running a strict subset of correctness_repo_tests, and the
-        # verdict was PASS. A duplicate grid proves nothing the repository run did not
-        # already prove, so it cannot be credited.
-        patch = self._axis_patch("grid-duplicate.patch")
-        result, report = self._validate_axis_target(patch, grid_value="7,257,f32")
+        # verdict was PASS.
+        #
+        # The validator no longer reads --shapes to catch that, so it cannot tell a duplicate
+        # grid from a novel one -- which is exactly why silence cannot be credited. A caller
+        # who has not said what their cells cover gets the same answer aiter#4538's duplicate
+        # would have got.
+        patch = self._axis_patch("grid-undeclared.patch")
+        result, report = self._validate_axis_target(
+            patch, grid_value="9,1023,f32", grid_novelty=None
+        )
 
         selection = report["test_selection"]
-        self.assertEqual("duplicates-target-defaults", selection["grid_independence"])
-        self.assertIn("--shapes", selection["grid_independence_reason"])
+        self.assertEqual("unknown", selection["grid_independence"])
+        self.assertEqual("undeclared", selection["grid_independence_basis"])
+        self.assertIn("--grid-novelty", selection["grid_independence_reason"])
         grid_stage = report["stages"]["correctness_s1_grid"]
-        self.assertEqual("skip", grid_stage["status"])
+        # The run itself was green. It is the missing claim, not a failure, that costs it.
         self.assertEqual(0, grid_stage["exit"])
+        self.assertEqual("skip", grid_stage["status"])
         self.assertEqual("INCONCLUSIVE", report["verdict"])
         self.assertEqual(2, result.returncode)
 
-    def test_a_duplicate_grid_rescued_by_an_axis_says_so_in_one_place(self):
-        # A duplicate shape grid is rescued when a PROVEN axis asks for values the target
-        # does not run by default -- the configuration reaching the kernel is genuinely new.
-        # But test_selection carries the same two fields and is written before the axes are
-        # proven, so it kept the pre-override answer and the report contradicted itself:
-        # test_selection said "duplicates-target-defaults" while the stage said
-        # "adds-coverage". Observed on ROCm/aiter#5081. One question, one answer.
-        patch = self._axis_patch("duplicate-rescued.patch")
+    def test_a_declared_grid_is_recorded_as_a_declaration_in_one_place(self):
+        # The caller's sentence is published verbatim, marked as their claim rather than a
+        # measurement, and written to ONE place. test_selection and the stage used to be
+        # filled in at different moments and could disagree -- test_selection saying
+        # "duplicates-target-defaults" beside a stage saying "adds-coverage", observed on
+        # ROCm/aiter#5081. One question, one answer.
+        patch = self._axis_patch("grid-declared.patch")
         _, report = self._validate_axis_target(
             patch,
-            grid_value="7,257,f32",
-            axes=("num_heads=--num-heads:32;64",),
+            grid_value="9,1023,f32",
+            grid_novelty="9,1023 is outside the target's own --shapes default of 7,257",
         )
 
-        stage = report["stages"]["correctness_s1_grid"]
         selection = report["test_selection"]
-        self.assertEqual("proven", selection["axis_state"])
-        self.assertEqual("adds-coverage", stage["independence"])
+        stage = report["stages"]["correctness_s1_grid"]
+        self.assertEqual("adds-coverage", selection["grid_independence"])
+        self.assertEqual("declared-by-caller", selection["grid_independence_basis"])
+        self.assertEqual(
+            "9,1023 is outside the target's own --shapes default of 7,257",
+            selection["grid_independence_reason"],
+        )
         self.assertEqual(stage["independence"], selection["grid_independence"])
         self.assertEqual(
             stage["independence_reason"], selection["grid_independence_reason"]
         )
         self.assertEqual("pass", stage["status"])
 
-    def test_a_grid_outside_the_targets_defaults_still_counts_as_coverage(self):
-        # The control case for the test above: the fix must not turn every grid into a skip.
-        patch = self._axis_patch("grid-novel.patch")
-        _, report = self._validate_axis_target(patch, grid_value="9,1023,f32")
+    def test_a_red_grid_stays_red_even_when_nobody_declared_what_it_covers(self):
+        # The downgrade is a refusal to CREDIT, not a way to make a failure disappear. A grid
+        # that fails is reporting a defect whatever the caller did or did not say about it.
+        # The target runs its defaults fine and dies on the shape only the grid asks for --
+        # after calling the route, so the failure is the kernel's, not a delivery problem.
+        red = self.AXIS_TARGET.replace(
+            "            run_kernel(M, N, dtype_str, num_heads)\n",
+            "            run_kernel(M, N, dtype_str, num_heads)\n"
+            "            if N == 1023:\n"
+            "                raise SystemExit('kernel is wrong at N=1023')\n",
+        )
+        patch = self._axis_patch("grid-red-undeclared.patch", body=red)
+        _, report = self._validate_axis_target(
+            patch, grid_value="9,1023,f32", grid_novelty=None
+        )
 
-        self.assertEqual("adds-coverage", report["test_selection"]["grid_independence"])
-        self.assertEqual("pass", report["stages"]["correctness_s1_grid"]["status"])
+        stage = report["stages"]["correctness_s1_grid"]
+        self.assertEqual("unknown", report["test_selection"]["grid_independence"])
+        self.assertEqual("fail", stage["status"])
+        self.assertNotEqual(0, stage["exit"])
 
     def test_each_head_run_keeps_its_own_execution_receipt(self):
         # head-repo and head-grid both ran inside the head phase and shared one receipt
@@ -2079,14 +2110,12 @@ class ValidateKernelPrTests(unittest.TestCase):
         # And the grid-independence reason must describe THIS run. The old default claimed
         # "the channel exposes no declared defaults to compare against" whenever the
         # comparison did not happen - a statement about the target that this run never
-        # established, and false here: the target declares a default for --shapes.
-        self.assertEqual("unknown", selection["grid_independence"])
+        # established, and false here: the target declares a default for --shapes. Now the
+        # reason is either the caller's own sentence or the absence of one, and the basis
+        # says which, so a reader is never handed a finding about the target on the
+        # validator's authority.
+        self.assertEqual("declared-by-caller", selection["grid_independence_basis"])
         self.assertNotIn("no declared defaults", selection["grid_independence_reason"])
-        # The channel this run established, named -- rather than a claim about the target.
-        self.assertIn(
-            "independence is only computed for the CLI-flag channel",
-            selection["grid_independence_reason"],
-        )
 
     def test_a_killed_run_leaves_no_stale_verdict_at_the_output_path(self):
         # The process exit code used to be read back out of `--out` AFTER finish_report, so

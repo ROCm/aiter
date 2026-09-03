@@ -357,20 +357,25 @@ ROCm/aiter#4538 all three requested shapes were in the target's own default list
 "independent" grid re-ran a strict subset of the repository run and the stage reported `pass` —
 exactly the duplication this stage exists to prevent, and invisible in the report.
 
-So compare the cells against the target's own declared default and record which case holds:
+**You state what the grid covers; the validator does not read the target to check you.** Before
+you pick the cells, read the target's own default for the channel you are using, and pass
+`--grid-novelty "<which cells are outside it, and what they exercise>"`. That reason is published
+verbatim as `grid_independence_reason` with `grid_independence_basis: declared-by-caller`, so a
+reader can see it is your claim and go check it against the same source you read.
 
 | value | meaning |
 |---|---|
-| `adds-coverage` | at least one cell is outside the target's own default |
-| `duplicates-target-defaults` | every cell is already a default. A **passing** run is downgraded to `skip` and the verdict to `INCONCLUSIVE`, because it proves only what the repo-tests stage already said |
-| `unknown` | there is no literal default to compare against — every env-var channel, and any flag whose default is computed |
+| `adds-coverage` | you declared `--grid-novelty`. Only this earns a `pass` |
+| `unknown` | you declared nothing. A **passing** run is downgraded to `skip` and the verdict to `INCONCLUSIVE` |
 
-A duplicate grid that **fails** keeps its `fail`. The finding is real; what a duplicate cannot do
-is earn a pass.
+There is no separate `duplicates-target-defaults` verdict, because the validator no longer derives
+one. Silence and duplication get the same answer, and that is the point: a caller who cannot say
+what their grid covers has not shown it covers anything. Do not reach for `--grid-novelty` to
+quiet the downgrade — an inaccurate reason is worse than the `skip`, which at least reports
+honestly that nothing was established.
 
-And say *which* of the several ways the comparison can be skipped actually applied. Defaulting to
-a claim about the target — "the channel exposes no declared defaults" — asserts something the run
-never established.
+A grid that **fails** keeps its `fail` whatever you declared. The finding is real; what an
+undeclared grid cannot do is earn a pass.
 
 #### Axes: when the failing configuration is not a shape
 
@@ -393,9 +398,8 @@ channel, in two steps. Record which step it reached:
 | `hook-not-consumed` | the flag was declared but accepted a deliberately invalid value; the axis is **dropped and named**, never dropped quietly |
 | `proven` | every axis flag refused an invalid value, and its values rode the grid run's argv |
 
-Each axis is judged for independence against its flag's declared default on the same terms as the
-shape cells — and a proven axis asking for values outside the default makes the run independent
-even when the shape cells duplicate.
+When it is a proven axis rather than the shape cells that makes the run independent, say so in
+`--grid-novelty` — that is one sentence, in one place, instead of two fields that can disagree.
 
 A requested axis is recorded **whatever becomes of it**, including when the run never got far
 enough to look for the flag. Dropping the request itself is precisely the silently narrowed test

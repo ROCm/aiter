@@ -382,10 +382,19 @@
             "duplicates-target-defaults",
             "unknown"
           ],
-          "description": "Whether the requested grid cells ask for anything outside the target's own declared default for the same channel. A proven hook says the target CONSUMES the grid; this says whether the grid adds coverage."
+          "description": "Whether the requested grid cells ask for anything outside the target's own defaults. The validator does not read the target to decide; the caller declares it with --grid-novelty. Only 'adds-coverage' can earn a pass for correctness_s1_grid."
         },
         "grid_independence_reason": {
           "type": "string"
+        },
+        "grid_independence_basis": {
+          "type": "string",
+          "enum": [
+            "declared-by-caller",
+            "undeclared",
+            "no-grid"
+          ],
+          "description": "Where grid_independence came from. 'declared-by-caller' marks it as the caller's claim rather than a measurement; 'undeclared' means nobody stated what the grid covers, which is why an otherwise green grid is not credited."
         },
         "axis_state": {
           "type": "string",

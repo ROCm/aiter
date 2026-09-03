@@ -41,6 +41,7 @@ SHAPE_ARGNAMES=""
 # to say so rather than having a runner-selection artefact charged to the PR author.
 RUNNER_OVERRIDE=""
 RUNNER_REASON=""
+GRID_NOVELTY=""
 AXES=()
 AXIS_CLI=()
 AXIS_CLI_OVERRIDE=()
@@ -106,6 +107,7 @@ while [ "$#" -gt 0 ]; do
     --axis) need_value "$@"; AXES+=("$2"); shift 2;;
     --runner) need_value "$@"; RUNNER_OVERRIDE="$2"; shift 2;;
     --runner-reason) need_value "$@"; RUNNER_REASON="$2"; shift 2;;
+    --grid-novelty) need_value "$@"; GRID_NOVELTY="$2"; shift 2;;
     --tol-table) need_value "$@"; TOL_TABLE="$2"; shift 2;;
     --label) need_value "$@"; LABEL="$2"; shift 2;;
     --out) need_value "$@"; OUT="$2"; shift 2;;
@@ -898,114 +900,32 @@ fi
 jset_string "test_selection.grid_channel_reason" "$GRID_CHANNEL_REASON"
 # ---- Is the grid actually independent of what the target already runs?
 #
-# A proven hook says the target CONSUMES the grid. It says nothing about whether the grid
+# A consumed channel says the target READS the grid. It says nothing about whether the grid
 # asks for anything the target would not have run anyway. On ROCm/aiter#4538 all three
-# requested shapes were already in the target's own `--shapes` default list, so the "S1
-# grid" re-ran a strict subset of the repository run and the report presented it as
-# independent coverage -- the exact duplication SKILL.md says this stage exists to prevent.
-# The check is a comparison against the target's own declared defaults for the same flag, so
-# it is a property of the request and the target, not of any one repository.
+# requested shapes were already in the target's own `--shapes` default list, so the "S1 grid"
+# re-ran a strict subset of the repository run and the report presented it as independent
+# coverage -- the exact duplication this stage exists to prevent.
+#
+# Which cells are novel is a reading of the target's source, so the caller states it and the
+# validator records it as a declaration. What the validator still enforces is the consequence:
+# only a grid DECLARED to add coverage can earn a pass. An undeclared grid is `unknown`, and
+# `unknown` is not credited -- the caller who cannot say what their grid covers has not shown
+# it covers anything.
 GRID_INDEPENDENCE="unknown"
-# The default reason must describe THIS run, not a hypothetical target. Publishing "the
-# channel exposes no declared defaults" whenever the comparison did not happen states a
-# fact about the target that the run never established -- observed on ROCm/aiter#5172,
-# whose `-c` flag does declare a default list, while the channel had been demoted for an
-# unrelated reason. Say which of the several ways this comparison can be skipped applied.
+GRID_INDEPENDENCE_BASIS="undeclared"
 if [ -z "$GRID" ]; then
   GRID_INDEPENDENCE_REASON="no shape grid was requested, so there was nothing to compare"
-elif [ "$GRID_CHANNEL" != "cli" ]; then
-  GRID_INDEPENDENCE_REASON="independence is only computed for the CLI-flag channel (this run established '${GRID_CHANNEL:-none}'); the target's own defaults were not read"
-elif [ "$GRID_HOOK_OK" -ne 1 ]; then
-  GRID_INDEPENDENCE_REASON="the shape flag's hook was not established, so the target's own defaults were not read"
+  GRID_INDEPENDENCE_BASIS="no-grid"
+elif [ -n "$GRID_NOVELTY" ]; then
+  GRID_INDEPENDENCE="adds-coverage"
+  GRID_INDEPENDENCE_REASON="$GRID_NOVELTY"
+  GRID_INDEPENDENCE_BASIS="declared-by-caller"
 else
-  GRID_INDEPENDENCE_REASON="the target file is not present, so its defaults could not be read"
-fi
-if [ -n "$GRID" ] && [ "$GRID_CHANNEL" = "cli" ] \
-    && [ "$GRID_HOOK_OK" -eq 1 ] && [ -f "$REPO_WT/$TEST_FILE" ]; then
-  GRID_INDEPENDENCE_JSON=$(python3 - "$REPO_WT/$TEST_FILE" "$SHAPE_ARG" "$GRID" <<'PY'
-import ast
-import json
-import sys
-
-path, flag, grid = sys.argv[1:4]
-requested = [cell.strip() for cell in grid.split(";") if cell.strip()]
-
-
-def literal_cells(node):
-    """Render an add_argument default as the argv spellings it stands for."""
-    try:
-        value = ast.literal_eval(node)
-    except (ValueError, SyntaxError):
-        return None
-    if not isinstance(value, (list, tuple)):
-        value = [value]
-    cells = []
-    for item in value:
-        if isinstance(item, (list, tuple)):
-            cells.append(",".join(str(part) for part in item))
-        else:
-            cells.append(str(item))
-    return cells
-
-
-defaults = None
-tree = ast.parse(open(path, encoding="utf-8").read())
-for node in ast.walk(tree):
-    if not isinstance(node, ast.Call):
-        continue
-    if getattr(node.func, "attr", "") != "add_argument":
-        continue
-    if not any(
-        isinstance(arg, ast.Constant) and arg.value == flag for arg in node.args
-    ):
-        continue
-    for keyword in node.keywords:
-        if keyword.arg == "default":
-            defaults = literal_cells(keyword.value)
-
-if defaults is None:
-    print(json.dumps({
-        "independence": "unknown",
-        "reason": f"the target declares no literal default for {flag}",
-    }))
-    raise SystemExit(0)
-
-novel = [cell for cell in requested if cell not in defaults]
-if not requested:
-    result = {"independence": "unknown", "reason": "no grid cells were requested"}
-elif not novel:
-    result = {
-        "independence": "duplicates-target-defaults",
-        "reason": (
-            f"every requested cell is already in the target's own {flag} default "
-            f"({', '.join(requested)}); this grid re-runs a subset of the repository "
-            "target and is not an independent control"
-        ),
-        "target_defaults": defaults,
-        "novel_cells": [],
-    }
-else:
-    result = {
-        "independence": "adds-coverage",
-        "reason": (
-            f"{len(novel)} of {len(requested)} requested cells are outside the target's "
-            f"own {flag} default: {', '.join(novel)}"
-        ),
-        "target_defaults": defaults,
-        "novel_cells": novel,
-    }
-print(json.dumps(result))
-PY
-)
-  GRID_INDEPENDENCE=$(python3 -c \
-    'import json,sys; print(json.loads(sys.argv[1])["independence"])' \
-    "$GRID_INDEPENDENCE_JSON")
-  GRID_INDEPENDENCE_REASON=$(python3 -c \
-    'import json,sys; print(json.loads(sys.argv[1])["reason"])' \
-    "$GRID_INDEPENDENCE_JSON")
+  GRID_INDEPENDENCE_REASON="no --grid-novelty was declared, so this run has no statement of what these cells cover that the target's own defaults do not"
 fi
 jset_string "test_selection.grid_independence" "$GRID_INDEPENDENCE"
 jset_string "test_selection.grid_independence_reason" "$GRID_INDEPENDENCE_REASON"
+jset_string "test_selection.grid_independence_basis" "$GRID_INDEPENDENCE_BASIS"
 
 # ---- Extra axes.
 #
@@ -2068,31 +1988,6 @@ for axis in json.loads(sys.argv[1]):
         HEAD_GRID_LOG=${HEAD_GRID_RESULT##*|}
         HEAD_GRID_STATS=$(target_stats "head-grid" "$HEAD_GRID_RC")
         HEAD_GRID_EXECUTED=$(stats_field "$HEAD_GRID_STATS" executed)
-        # A proven axis that asks for values outside the target's own defaults makes the run
-        # independent even when the shape cells duplicate: the configuration reaching the
-        # kernel is one the repository target never runs.
-        AXIS_ADDS_COVERAGE=0
-        if [ "$AXIS_STATE" = "proven" ]; then
-          AXIS_ADDS_COVERAGE=$(python3 -c '
-import json
-import sys
-
-axes = json.loads(sys.argv[1])
-print(int(any(a.get("independence") == "adds-coverage" for a in axes)))
-' "$AXIS_REPORT")
-        fi
-        if [ "$AXIS_ADDS_COVERAGE" -eq 1 ] \
-            && [ "$GRID_INDEPENDENCE" = "duplicates-target-defaults" ]; then
-          GRID_INDEPENDENCE="adds-coverage"
-          GRID_INDEPENDENCE_REASON="the shape cells duplicate the target's defaults, but a proven extra axis requests values the target does not run by default"
-          # test_selection carries the same two fields and was written before the axes were
-          # proven. Leaving it holding the pre-override value put two contradicting answers
-          # in one report -- `test_selection.grid_independence: duplicates-target-defaults`
-          # beside `stages.correctness_s1_grid.independence: adds-coverage`. Observed on
-          # ROCm/aiter#5081. One question, one answer.
-          jset_string "test_selection.grid_independence" "$GRID_INDEPENDENCE"
-          jset_string "test_selection.grid_independence_reason" "$GRID_INDEPENDENCE_REASON"
-        fi
         python3 - "$JSON" "$HEAD_GRID_RC" "$GRID" "$HEAD_GRID_LOG" \
           "$HEAD_GRID_STATS" "$HEAD_PROBE_RC" "$HEAD_PROBE_LOG" \
           "$GRID_INDEPENDENCE" "$GRID_INDEPENDENCE_REASON" \
@@ -2132,11 +2027,11 @@ if status == "fail" and stats.get("observed_work") == 0 and int(repo_exit_code) 
         f"shapes; a declared '{channel}' channel this target does not have and a shape that "
         f"crashes before the route both look exactly like this"
     )
-# A red grid is still a red grid: a duplicate grid that FAILS is reporting a real defect in
-# the target and must keep its "fail". What a duplicate cannot do is earn a pass, because the
-# only thing a passing duplicate proves is that the repository run passed -- which
-# correctness_repo_tests already said.
-if status == "pass" and independence == "duplicates-target-defaults":
+# A red grid is still a red grid: a grid that FAILS is reporting a real defect in the target
+# whatever its independence, and must keep its "fail". What an undeclared or duplicate grid
+# cannot do is earn a pass, because the only thing a passing duplicate proves is that the
+# repository run passed -- which correctness_repo_tests already said.
+if status == "pass" and independence != "adds-coverage":
     status = "skip"
     note = independence_reason
 data["stages"]["correctness_s1_grid"] = {
@@ -2155,10 +2050,10 @@ if note:
 json.dump(data, open(path, "w"), indent=2)
 PY
         mark_runtime_coverage "$HEAD_GRID_STATS" "$TARGET_RUNNER" "$HEAD_GRID_LOG"
-        if [ "$GRID_INDEPENDENCE" = "duplicates-target-defaults" ] \
+        if [ "$GRID_INDEPENDENCE" != "adds-coverage" ] \
             && [ "$HEAD_GRID_RC" -eq 0 ]; then
           finding "note" "correctness" \
-            "the independent shape grid was not independent: $GRID_INDEPENDENCE_REASON"
+            "the shape grid is not credited as independent coverage: $GRID_INDEPENDENCE_REASON"
         fi
         if [ "$HEAD_GRID_RC" -eq 0 ] && [ "$HEAD_GRID_EXECUTED" -eq 0 ]; then
           finding "note" "correctness" \
