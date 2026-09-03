@@ -348,7 +348,14 @@ def unified_attention(
         else:
             _unified_attention_2d_triton(params)
     else:
-        config = get_unified_attention_config("kv_split", params, backend=backend)
+        # NUM_SEGMENTS and TILE_SIZE go to whichever 3d kernel actually runs, so
+        # they have to come from that kernel's table: a gluon request whose arch
+        # gate declines still lands on the Triton kernel, and the two backends'
+        # tables are not interchangeable.
+        use_gluon_3d = is_3d_gluon_available(params, backend)
+        config = get_unified_attention_config(
+            "kv_split", params, backend="gluon" if use_gluon_3d else "triton"
+        )
         NUM_SEGMENTS = config["NUM_SEGMENTS"]
         if shuffled_kv_cache:
             TILE_SIZE = block_size
@@ -383,7 +390,6 @@ def unified_attention(
             segm_max = out  # dummy ptr
             segm_expsum = out  # dummy ptr
 
-        use_gluon_3d = is_3d_gluon_available(params, backend)
         if use_gluon_3d:
             if DEVICE_ARCH == "gfx1250":
                 _unified_attention_3d_gfx1250(
