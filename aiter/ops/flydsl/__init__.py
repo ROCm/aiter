@@ -25,6 +25,10 @@ if _base_version < _MIN_FLYDSL_VERSION:
     )
 
 _LAZY_IMPORTS = {
+    "ActivationSource": (".gemm_kernels", "ActivationSource"),
+    "BlockMfmaDecodeConfig": (".gemm_kernels", "BlockMfmaDecodeConfig"),
+    "ContractionMode": (".gemm_kernels", "ContractionMode"),
+    "DecodeConfig": (".gemm_kernels", "DecodeConfig"),
     "FP8_MQA_LOGITS_DEFAULT_VARIANT": (
         ".kernels.mqa_logits.fp8_mqa_logits",
         "DEFAULT_VARIANT",
@@ -33,6 +37,10 @@ _LAZY_IMPORTS = {
         ".kernels.mqa_logits.fp8_mqa_logits",
         "KERNEL_VARIANTS",
     ),
+    "OutputRounding": (".gemm_kernels", "OutputRounding"),
+    "ReductionMode": (".gemm_kernels", "ReductionMode"),
+    "WaveDecodeConfig": (".gemm_kernels", "WaveDecodeConfig"),
+    "compile_gemm_decode_bf16": (".gemm_kernels", "compile_gemm_decode_bf16"),
     "compute_varqlen_windows": (
         ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
         "compute_varqlen_windows",
@@ -66,12 +74,29 @@ _LAZY_IMPORTS = {
         ".kernels.qk_norm_rope_quant",
         "flydsl_qk_norm_rope_quant",
     ),
+    "flydsl_small_m_hgemm": (".gemm_kernels", "flydsl_small_m_hgemm"),
+    "gemm_decode_bf16": (".gemm_kernels", "gemm_decode_bf16"),
+    "gemm_decode_kernel_name": (".gemm_kernels", "gemm_decode_kernel_name"),
+    "get_decode_arch_traits": (".gemm_kernels", "get_decode_arch_traits"),
+    "iter_gemm_decode_configs": (".gemm_kernels", "iter_gemm_decode_configs"),
+    "parse_gemm_decode_kernel_name": (
+        ".gemm_kernels",
+        "parse_gemm_decode_kernel_name",
+    ),
 }
 
 __all__ = [
     "FP8_MQA_LOGITS_DEFAULT_VARIANT",
     "FP8_MQA_LOGITS_VARIANTS",
+    "ActivationSource",
+    "BlockMfmaDecodeConfig",
+    "ContractionMode",
+    "DecodeConfig",
     "GateMode",
+    "OutputRounding",
+    "ReductionMode",
+    "WaveDecodeConfig",
+    "compile_gemm_decode_bf16",
     "compute_varqlen_windows",
     "flydsl_flash_attn_func",
     "flydsl_fp8_mqa_logits",
@@ -84,6 +109,12 @@ __all__ = [
     "flydsl_pa_mqa_logits_fp4_varqlen",
     "flydsl_preshuffle_gemm_a8",
     "flydsl_qk_norm_rope_quant",
+    "flydsl_small_m_hgemm",
+    "gemm_decode_bf16",
+    "gemm_decode_kernel_name",
+    "get_decode_arch_traits",
+    "iter_gemm_decode_configs",
+    "parse_gemm_decode_kernel_name",
 ]
 
 

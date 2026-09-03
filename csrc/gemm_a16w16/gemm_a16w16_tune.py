@@ -23,11 +23,7 @@ import torch.nn.functional as F
 import aiter
 from aiter import dtypes, logger
 from aiter.jit.core import AITER_CONFIG_GEMM_BF16, get_asm_dir
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx
-from aiter.ops.flydsl.gemm_kernels import (
-    flydsl_hgemm,
-    get_flydsl_splitk_hgemm_kernels,
-)
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.gemm_op_a16w16 import ASM_SPLITK_MAX_GRID
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16 as triton_gemm_a16w16
 from aiter.utility.base_tuner import GemmCommonTuner
@@ -36,6 +32,45 @@ from aiter.utility.mp_tuner import mp_tuner
 # ---------------------------------------------------------------------------
 # Optional backend imports
 # ---------------------------------------------------------------------------
+
+FLYDSL_TUNE_ERROR = None
+try:
+    from aiter.ops.flydsl.gemm_kernels import (
+        SPLIT_K_SEMAPHORE_MAX_LEN,
+        flydsl_hgemm,
+        gemm_decode_bf16,
+        gemm_decode_kernel_name,
+        get_flydsl_splitk_hgemm_kernels,
+        iter_gemm_decode_configs,
+    )
+except ImportError as exc:
+    flydsl_hgemm = None
+    SPLIT_K_SEMAPHORE_MAX_LEN = 256
+    get_flydsl_splitk_hgemm_kernels = None
+    gemm_decode_bf16 = None
+    gemm_decode_kernel_name = None
+    iter_gemm_decode_configs = None
+    FLYDSL_TUNE_ERROR = str(exc)
+
+
+def _try_vllm_wvsplitk():
+    """Resolve wvSplitK only when the experimental tuner flag is on."""
+    try:
+        from vllm._custom_ops import wvSplitK as wrapper
+    except Exception:  # noqa: BLE001
+        wrapper = None
+    if callable(wrapper):
+        return lambda weight, activation, bias, cu_count: wrapper(
+            weight, activation, cu_count, bias
+        )
+    try:
+        op = torch.ops._rocm_C.wvSplitK
+    except Exception:  # noqa: BLE001
+        return None
+    return lambda weight, activation, bias, cu_count: op(
+        weight, activation, bias, cu_count
+    )
+
 
 OPUS_TUNE_ERROR = None
 try:
@@ -89,6 +124,9 @@ try:
 except Exception as _hipb_exc:  # noqa: BLE001
     HipblasltGemm = None
     HIPBLASLT_TUNE_ERROR = str(_hipb_exc)
+
+
+_VLLM_WVSPLITK_OP = None
 
 # ---------------------------------------------------------------------------
 # Tolerance helpers
@@ -277,44 +315,41 @@ def run_skinny_gemm_a16w16(input, weight, bias=None, otype=dtypes.bf16):
 
 
 def run_flydsl_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, config=None):
-    if config is None:
+    if flydsl_hgemm is None:
+        raise RuntimeError(f"flydsl is not available for tuning: {FLYDSL_TUNE_ERROR}")
+    if config is None or not config.get("kernelName"):
         raise ValueError("flydsl tuning requires a kernel config")
-    stages = config.get("stages", config.get("stage", 2))
-    fused_bias = None
-    if (
-        bias is not None
-        and (otype is None or otype == input.dtype)
-        and bias.dtype == input.dtype
-    ):
-        fused_bias = bias
-    out = flydsl_hgemm(
+    from aiter.tuned_gemm import flydsl_gemm
+
+    return flydsl_gemm(
         input,
         weight,
-        bias=fused_bias,
-        kernel_family=config.get("kernel_family"),
-        tile_m=config["tile_m"],
-        tile_n=config["tile_n"],
-        tile_k=config["tile_k"],
-        split_k=config["split_k"],
-        block_m_warps=config["block_m_warps"],
-        block_n_warps=config["block_n_warps"],
-        block_k_warps=config["block_k_warps"],
-        n_tile_repeat=config.get("n_tile_repeat", 1),
-        persistent_n_tiles=config.get("persistent_n_tiles", 1),
-        waves_per_eu=config.get("waves_per_eu", 0),
-        b_to_lds_unroll=config.get("b_to_lds_unroll", 0),
-        stages=stages,
-        async_copy=config.get("async_copy", False),
-        b_to_lds=config["b_to_lds"],
-        b_preshuffle=config.get("b_preshuffle", False),
-        auto_shuffle_b=False,
-        c_to_lds=config.get("c_to_lds", False),
+        0,
+        bias=bias,
+        otype=otype,
+        config=config,
     )
-    if bias is not None and fused_bias is None:
-        out = out.to(bias.dtype) + bias
-    if otype is not None and out.dtype != otype:
-        out = out.to(otype)
-    return out
+
+
+def run_vllm_wvsplitk_bf16(input, weight, bias=None, otype=dtypes.bf16):
+    del otype
+    if _VLLM_WVSPLITK_OP is None:
+        raise RuntimeError("vLLM wvSplitK was not resolved")
+    return _VLLM_WVSPLITK_OP(weight, input, bias, get_cu_num())
+
+
+def run_flydsl_decode_bf16(input, weight, output, bias, otype, arch, config):
+    """Run one exact-shape unified decode candidate for the shared tuner."""
+    del arch
+    if gemm_decode_bf16 is None:
+        raise RuntimeError(f"flydsl is not available for tuning: {FLYDSL_TUNE_ERROR}")
+    if otype != dtypes.bf16:
+        raise ValueError("FlyDSL decode candidates require BF16 output")
+    # Launch directly, like every other provider. Wrapping the kernel in a
+    # one-launch HIP graph made each timed sample carry a full graph replay,
+    # which dominates any decode shape below roughly 14 us.
+    gemm_decode_bf16(input, weight, output, config, bias=bias)
+    return output
 
 
 # ---------------------------------------------------------------------------
@@ -363,6 +398,7 @@ ALL_LIBTYPES = [
     "hipblaslt",
     "triton",
     "flydsl",
+    "flydsl_decode",
     "torch",
     "skinny",
     "opus",
@@ -375,6 +411,10 @@ def libtype_list(string):
         if value not in ALL_LIBTYPES:
             raise argparse.ArgumentTypeError(f"Invalid libtype: {value}")
     return values
+
+
+def _bounded_decode_configs(configs, limit=12):
+    return list(configs)[:limit]
 
 
 # ---------------------------------------------------------------------------
@@ -435,8 +475,9 @@ class GemmA16W16Tuner(GemmCommonTuner):
             type=libtype_list,
             default=["all"],
             required=False,
-            help="choose libtype to tune: all, asm, hipblaslt, triton, flydsl, torch, skinny, opus. "
-            "hipblaslt requires --with-hipblaslt.",
+            help="choose libtype to tune: all, asm, hipblaslt, triton, flydsl, "
+            "flydsl_decode, torch, skinny, opus. "
+            "hipblaslt requires --with-hipblaslt; vLLM wvSplitK is a separate flag.",
         )
         self.parser.add_argument(
             "--with-hipblaslt",
@@ -445,6 +486,20 @@ class GemmA16W16Tuner(GemmCommonTuner):
             dest="with_hipblaslt",
             help="Include hipblaslt in tuning (disabled by default). "
             "hipblaslt tuning is also available standalone via gradlib/gradlib/gemm_tuner.py.",
+        )
+        self.parser.add_argument(
+            "--candidate-policy",
+            choices=("bounded", "deep"),
+            default="bounded",
+            help="Decode candidate breadth. 'bounded' keeps a small default set; "
+            "'deep' times the full decode registry.",
+        )
+        self.parser.add_argument(
+            "--with-vllm-wvsplitk",
+            action="store_true",
+            default=False,
+            dest="with_vllm_wvsplitk",
+            help="Optionally time vLLM wvSplitK. Comparison-only; never promoted.",
         )
 
     def _clear_op_caches(self):
@@ -585,11 +640,13 @@ class GemmA16W16Tuner(GemmCommonTuner):
         self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
     ):
         M, N, K = info_keys[2], info_keys[3], info_keys[4]
-        if (scaleAB or K % 64 != 0 or indtype != dtypes.bf16) and get_gfx() == "gfx942":
+        if (
+            scaleAB or K % 64 != 0 or indtype != dtypes.bf16
+        ) and get_gfx_runtime() == "gfx942":
             return []
         if (
             scaleAB or K % 64 != 0 or N % 64 != 0 or indtype != dtypes.bf16
-        ) and get_gfx() == "gfx950":
+        ) and get_gfx_runtime() == "gfx950":
             return []
         asm_kernel_list_csv = f"{get_asm_dir()}/bf16gemm/bf16gemm_fp32bf16.csv"
         asm_kernels = get_asm_kernels(asm_kernel_list_csv, is_shuffle)
@@ -732,7 +789,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 counters = ((M + config["tile_m"] - 1) // config["tile_m"]) * (
                     N // config["tile_n"]
                 )
-                if counters > 128:
+                if counters > SPLIT_K_SEMAPHORE_MAX_LEN:
                     continue
             info = (
                 info_keys,
@@ -742,13 +799,15 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 "flydsl",
                 is_shuffle,
             )
+            task_config = dict(config)
+            task_config["kernelName"] = kernel_name
             tasks.append(
                 (
                     info,
                     generate_data,
                     (M, N, K, indtype, outdtype, scaleAB, is_shuffle, 0, has_bias),
                     run_flydsl_gemm_bf16,
-                    (["inp", weight_key, "bias"], outdtype, config),
+                    (["inp", weight_key, "bias"], outdtype, task_config),
                     dict(run_kwargs),
                     get_gemm_ref,
                     (
@@ -764,6 +823,131 @@ class GemmA16W16Tuner(GemmCommonTuner):
             )
         logger.info(f"FlyDSL candidate count for M={M}, N={N}, K={K}: {len(tasks)}")
         return tasks
+
+    def _get_flydsl_decode_tasks(
+        self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
+    ):
+        if (
+            gemm_decode_bf16 is None
+            or iter_gemm_decode_configs is None
+            or gemm_decode_kernel_name is None
+        ):
+            logger.warning(
+                f"FlyDSL decode not available, skip. reason: {FLYDSL_TUNE_ERROR}"
+            )
+            return []
+        M, N, K = map(int, info_keys[2:5])
+        if (
+            not 1 <= M <= 5
+            or scaleAB
+            or is_shuffle
+            or indtype != dtypes.bf16
+            or outdtype != dtypes.bf16
+        ):
+            return []
+        arch = str(info_keys[0])
+        runtime_arch = get_gfx_runtime()
+        if arch != runtime_arch:
+            raise ValueError(
+                f"FlyDSL decode tuner row targets {arch}, "
+                f"but the runtime device is {runtime_arch}"
+            )
+        tasks = []
+        # Decode shares the tuner's timing settings with every other provider.
+        # Giving it its own timing backend and iteration counts made its numbers
+        # incomparable to the candidates it is ranked against.
+        decode_run_kwargs = dict(run_kwargs)
+        # Decode has a deliberately stricter absolute/relative correctness gate
+        # than the general GEMM catalog. Every candidate is rejected independently.
+        configs = list(
+            iter_gemm_decode_configs(M, N, K, arch, num_cus=int(info_keys[1]))
+        )
+        if getattr(self, "candidate_policy", "bounded") == "bounded":
+            configs = _bounded_decode_configs(configs)
+        for solidx, config in enumerate(configs):
+            kernel_name = gemm_decode_kernel_name(
+                arch,
+                M,
+                N,
+                K,
+                config,
+                has_bias=has_bias,
+            )
+            info = (
+                info_keys,
+                solidx,
+                0,
+                kernel_name,
+                "flydsl_decode",
+                False,
+            )
+            tasks.append(
+                (
+                    info,
+                    generate_data,
+                    (M, N, K, indtype, outdtype, False, False, 0, has_bias),
+                    run_flydsl_decode_bf16,
+                    (
+                        ["inp", "weights", "out_asm", "bias"],
+                        outdtype,
+                        arch,
+                        config,
+                    ),
+                    decode_run_kwargs,
+                    get_gemm_ref,
+                    (
+                        ["inp", "weights", "bias", "x_scale", "w_scale"],
+                        indtype,
+                        outdtype,
+                    ),
+                    {},
+                    None,
+                    0.01,
+                    0.125,
+                    None,
+                    None,
+                    ("out_asm",),
+                )
+            )
+        logger.info(
+            f"FlyDSL decode candidate count for M={M}, N={N}, K={K}: {len(tasks)}"
+        )
+        return tasks
+
+    def _get_vllm_wvsplitk_tasks(
+        self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
+    ):
+        M, N, K = map(int, info_keys[2:5])
+        if (
+            _VLLM_WVSPLITK_OP is None
+            or scaleAB
+            or is_shuffle
+            or indtype != dtypes.bf16
+            or outdtype != dtypes.bf16
+            or not 1 <= M <= 5
+        ):
+            return []
+        info = (info_keys, 0, 0, "vllm_wvsplitk", "vllm_wvsplitk", False)
+        return [
+            (
+                info,
+                generate_data,
+                (M, N, K, indtype, outdtype, False, False, 0, has_bias),
+                run_vllm_wvsplitk_bf16,
+                (["inp", "weights", "bias"], outdtype),
+                dict(run_kwargs),
+                get_gemm_ref,
+                (
+                    ["inp", "weights", "bias", "x_scale", "w_scale"],
+                    indtype,
+                    outdtype,
+                ),
+                {},
+                None,
+                0.01,
+                0.125,
+            )
+        ]
 
     def _get_skinny_tasks(
         self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
@@ -905,11 +1089,23 @@ class GemmA16W16Tuner(GemmCommonTuner):
     # -------------------------------------------------------------------
 
     def tune(self, untunedf, tunedf, args):
+        global _VLLM_WVSPLITK_OP
         libtype = args.libtype
         with_hipblaslt = getattr(args, "with_hipblaslt", False)
+        with_vllm_wvsplitk = getattr(args, "with_vllm_wvsplitk", False)
+        self.candidate_policy = getattr(args, "candidate_policy", "bounded")
+        _VLLM_WVSPLITK_OP = _try_vllm_wvsplitk() if with_vllm_wvsplitk else None
         gfx = self.get_gfx()
         cu_num = self.get_cu_num()
-        run_kwargs = {"num_warmup": 10, "num_iters": 101}
+        # Time every provider on the shared profiler path, which reports
+        # self_device_time_total (GPU kernel time) and excludes host launch
+        # gaps. Per-call wall clock charges each provider its own host launch
+        # cost, which differs between backends and therefore does not cancel
+        # when candidates are ranked against each other.
+        run_kwargs = {
+            "num_warmup": 10,
+            "num_iters": 101,
+        }
 
         task = []
         tasks_data = []
@@ -951,6 +1147,10 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 task.extend(self._get_asm_tasks(*common))
             if "all" in libtype or "flydsl" in libtype:
                 task.extend(self._get_flydsl_tasks(*common))
+            if "all" in libtype or "flydsl_decode" in libtype:
+                task.extend(self._get_flydsl_decode_tasks(*common))
+            if with_vllm_wvsplitk:
+                task.extend(self._get_vllm_wvsplitk_tasks(*common))
             if "all" in libtype or "skinny" in libtype:
                 task.extend(self._get_skinny_tasks(*common))
             if "all" in libtype or "torch" in libtype:
@@ -988,6 +1188,11 @@ class GemmA16W16Tuner(GemmCommonTuner):
             )
 
         return ret + hipblaslt_rets
+
+    def post_process(self, rets, args, topk=-1, fast_mode=False):
+        # Comparison-only vLLM rows must not win the tuned CSV.
+        rets = [result for result in rets if result[0][4] != "vllm_wvsplitk"]
+        return super().post_process(rets, args, topk, fast_mode)
 
     def result_to_df(self, results):
         resultdf = pd.DataFrame(columns=self.columns)
