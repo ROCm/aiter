@@ -2,7 +2,7 @@
 """Step 1b triage: derive which rule families apply, and collect their evidence.
 
 Replaces Step 3's self-applied prose checklist. Emits only the matching rules so
-the model reads ~10 instead of 44.  Conservative: when a type cannot be decided
+the model reads ~12 instead of all of them.  Conservative: when a type cannot be decided
 structurally it is INCLUDED, never dropped.
 """
 import re, sys, pathlib
@@ -26,6 +26,51 @@ def parse(diff):
             elif ln.startswith("+") and not ln.startswith("+++"): files[cur]["add"].append(ln[1:])
             elif ln.startswith("-") and not ln.startswith("---"): files[cur]["del"].append(ln[1:])
     return files
+
+
+def _calls(src, name):
+    """Argument text of each `name(...)` call, paren-balanced.
+
+    A regex with `[^)]*` stops at the first close paren, so `tl.load(p, mask=(a<b),
+    other=0.0)` reads as having no `other=` -- 20 of the 195 Triton PRs in the corpus
+    contain exactly that shape."""
+    out, i, key = [], 0, name + "("
+    while True:
+        j = src.find(key, i)
+        if j < 0:
+            return out
+        k, depth = j + len(key), 1
+        while k < len(src) and depth:
+            if src[k] == "(":
+                depth += 1
+            elif src[k] == ")":
+                depth -= 1
+            k += 1
+        out.append(src[j + len(key):k - 1])
+        i = k
+
+
+def triton_families(add):
+    """Triton-specific families. Kept separate from the generic derivation because the
+    generic one was tuned on the whole corpus and barely discriminates here: over the 195
+    Triton PRs among 600 open aiter PRs, `ops-wrapper` fires on 88% and `modified-kernel`
+    on 79%, so a Triton PR arrived carrying a rule set that said little about being Triton.
+    Each family below fires on at most 52% of Triton PRs and at most 17% of all of them."""
+    fams = []
+    loads, stores = _calls(add, "tl.load"), _calls(add, "tl.store")
+    unmasked = [c for c in loads + stores if "mask=" not in c]
+    no_other = [c for c in loads if "mask=" in c and "other=" not in c]
+    if unmasked or no_other:
+        fams.append(("triton-mask-bounds", "T1 T2"))
+    if re.search(r"\bnum_warps\b|\bnum_stages\b|\bnum_ctas\b|waves_per_eu|"
+                 r"matrix_instr|\bkpack\b", add):
+        fams.append(("triton-launch-cfg", "T3 T4"))
+    if re.search(r"tl\.dot\(|\.to\(tl\.float32\)|allow_tf32|input_precision", add):
+        fams.append(("triton-accum-prec", "T5"))
+    if re.search(r"grid\s*=\s*lambda|tl\.program_id|tl\.cdiv\(", add):
+        fams.append(("triton-grid-map", "T6"))
+    return fams
+
 
 def derive(files, title=""):
     paths = list(files)
@@ -107,10 +152,15 @@ def derive(files, title=""):
         hit("weight-variant", "F1")
     if re.search(r'os\.environ\.get\(\s*["\']AITER_', add):
         hit("new-env-var", "HK9 D2")
+    if any(p.startswith(("aiter/ops/triton/",)) or "/triton/" in p or
+           "_triton_kernels/" in p or "_gluon_kernels/" in p or "/gluon/" in p
+           for p in paths):
+        t.extend(triton_families(add))
     return t
 
 ALL_RULES = ("A1 A2 A3 B1 B2 B3 B4 B5 B6 B7 C1 C2 C3 C4 D1 D1b D2 D3 D4 D5 D6 D7 D8 "
-             "D10 D10b E1 E2 E3 E4 E5 F1 G1 G1b P1 P2 P3 P4 P5 P6 HK1 HK2 HK3 STEP4")
+             "D10 D10b E1 E2 E3 E4 E5 F1 G1 G1b P1 P2 P3 P4 P5 P6 HK1 HK2 HK3 "
+             "T1 T2 T3 T4 T5 T6 STEP4")
 
 def deleted_guard_symbols(diff_text):
     """Symbols named by assert / *_CHECK lines the diff removes."""
@@ -375,7 +425,7 @@ if __name__ == "__main__":
         raise SystemExit(0)
     if not types:
         # GitHub refuses a diff over 20000 lines and returns a JSON error body instead.
-        # Falling back to all 44 rules is safe but backwards: a 74-file PR is exactly the
+        # Falling back to the full rule set is safe but backwards: a 74-file PR is exactly the
         # case that needs narrowing. Say so, so the caller can re-run off the file list.
         if diff.lstrip().startswith("{") and "exceeded the maximum number of lines" in diff:
             print("    [diff-too-large        ] " + ALL_RULES)
@@ -387,5 +437,5 @@ if __name__ == "__main__":
         print("    [underivable           ] " + ALL_RULES)
         raise SystemExit(0)
     rules = sorted({r for _, rs in types for r in rs.split()})
-    print(f"  files={len(files)}  types={len(types)}  rules={len(rules)}/44")
+    print(f"  files={len(files)}  types={len(types)}  rules={len(rules)}/{len(ALL_RULES.split())}")
     for n, rs in types: print(f"    [{n:20s}] {rs}")

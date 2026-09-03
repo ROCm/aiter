@@ -1367,6 +1367,71 @@ Real example (aiter#4538): a FlyDSL kernel whose entire justification was perf w
 
 ---
 
+### T — Triton / Gluon Kernel
+
+_"The kernel is written in Python, so the C++ rules never look at it."_
+
+These fire only on `aiter/ops/triton/`, `_triton_kernels/`, `_gluon_kernels/`, `/gluon/`.
+Triton is already 195 of 600 open aiter PRs and rising, and the generic families say almost
+nothing about them — `ops-wrapper` fires on 88% of Triton PRs and `modified-kernel` on 79%,
+which is a label, not a triage. Each family below fires on at most 52% of Triton PRs.
+
+**T1 — `tl.load` / `tl.store` with no `mask`** 🔴 (⚠️ if the bound is provably a multiple of the block)
+
+Trigger: a `tl.load(...)` or `tl.store(...)` whose args contain no `mask=`. Present in 23% /
+19% of Triton PRs respectively. Triton does not bounds-check; an unmasked access at the tail
+tile reads or writes past the tensor. Reading garbage is the quiet version, writing is the
+one that corrupts a neighbouring allocation.
+FP self-check: masking is unnecessary when the axis length is a `tl.constexpr` multiple of
+the block, or when the pointer arithmetic is already clamped (`tl.minimum`, `% n`). Confirm
+which, and say so — do not fire on "no mask" alone.
+→ `🔴 T1: tl.load at [file:line] has no mask; [dim] is not a multiple of [BLOCK] so the last program reads [n] elements past the end`
+
+**T2 — `mask=` with no `other=`** ⚠️
+
+Trigger: `tl.load(..., mask=...)` and no `other=`. 10% of Triton PRs. The masked-off lanes
+default to zero — usually fine for a sum, wrong for a max/min reduction (zero beats a
+negative running max) and wrong for any accumulator seeded from the load.
+Check what consumes the loaded value before clearing this.
+→ `⚠️ T2: masked load at [file:line] feeds a max-reduction with no other=-inf; padded lanes win the max`
+
+**T3 — `num_warps` / `num_stages` carried over unre-tuned** ⚠️
+
+Trigger: `num_warps` / `num_stages` / `num_ctas` in added lines. 50% of Triton PRs — the
+single most common Triton edit. These are per-shape and per-arch: a config tuned on gfx942
+is not tuned for gfx950, and one copied from a sibling kernel with a different BLOCK is not
+tuned at all. `num_stages` above what LDS can hold silently drops occupancy rather than
+failing.
+This is a perf finding, so it needs perf evidence: without a base-vs-head number it is
+`[inferred]` and phrased as a question, per Step 8.
+→ `⚠️ T3: num_stages raised to [n] for [kernel] with no measurement on [arch]; is this tuned here or inherited from [sibling]?`
+
+**T4 — AMD launch knobs hardcoded across archs** ⚠️
+
+Trigger: `waves_per_eu`, `matrix_instr_nonkdim`, `kpack`. 34% of Triton PRs. These are
+AMD-specific and MI300/MI355 differ; `matrix_instr_nonkdim` in particular selects an MFMA
+instruction that must exist on the target arch.
+→ `⚠️ T4: matrix_instr_nonkdim=[n] set unconditionally; gfx950 [does/does not] have that MFMA shape`
+
+**T5 — accumulator precision** 🔴
+
+Trigger: `tl.dot(`, `.to(tl.float32)`, `allow_tf32`, `input_precision`. 25% of Triton PRs.
+Two failure shapes: an accumulator left in fp16/bf16 over a long K loop loses the tail of the
+sum, and `tl.dot` inputs downcast to save registers change the result silently. On fp8 paths
+check the scale is applied in fp32, not after a downcast.
+→ `🔴 T5: acc declared [dtype] over K=[n]; at [scale] the running sum loses [x] — accumulate in float32 and cast once at the store`
+
+**T6 — grid and `program_id` disagree** 🔴
+
+Trigger: `grid=lambda`, `tl.program_id`, `tl.cdiv(`. 27% of Triton PRs. The launch grid is
+computed on the host and the tile mapping inside the kernel; nothing checks that they agree.
+A `cdiv` on the host with a kernel that assumes exact division leaves the tail tile
+unprocessed — output is correct everywhere the tests look and wrong in the last block.
+Check the host grid expression against every `program_id` axis, including which axis is which
+after a swizzle.
+→ `🔴 T6: grid is cdiv(M,BLOCK_M) x cdiv(N,BLOCK_N) but the kernel derives pid_n from pid // grid_m using the pre-swizzle grid_m; tiles [range] are never written`
+
+
 ## Step 6 — AI Code Diagnostic
 
 For each question below, note if the answer is a warning sign:
