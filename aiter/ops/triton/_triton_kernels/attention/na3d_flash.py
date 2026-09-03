@@ -92,7 +92,9 @@ def _na3d_flash_fwd(
     """
     pid_q = tl.program_id(0)
     pid_bnh = tl.program_id(1)
-    HW = H * W
+    H64 = H.to(tl.int64)
+    W64 = W.to(tl.int64)
+    HW = H64 * W64
 
     # Decompose pid_q into (t,h) row and W-block within that row.
     W_blocks = (W + BLOCK_Q - 1) // BLOCK_Q  # programs per (t,h) row
@@ -106,8 +108,9 @@ def _na3d_flash_fwd(
     q_w = w_bid * BLOCK_Q + q_offs  # W positions for this block
     q_mask = q_w < W  # last block in a row may be partial
 
-    q_idx = prog_t * HW + prog_h * W + q_w  # for Q load and Out store
-
+    q_idx = (
+        prog_t.to(tl.int64) * HW + prog_h.to(tl.int64) * W64 + q_w.to(tl.int64)
+    )  # for Q load and Out store
     # Inward-shifted centered neighborhood window starts.
     # prog_t / prog_h are scalars; t_ws / h_ws need no tl.min reduction.
     q_w_ws = tl.minimum(tl.maximum(q_w - KW // 2, 0), W - KW)
