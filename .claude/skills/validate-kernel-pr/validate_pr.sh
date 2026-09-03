@@ -207,6 +207,7 @@ PROBE_DIR="$WORK/probe"
 PROBE_MODULE="validation_probe_${RANDOM}_${RANDOM}"
 mkdir -p "$PROBE_DIR"
 REPORT_TOOL="$SCRIPT_DIR/report.py"
+TARGET_TOOL="$SCRIPT_DIR/target_run.py"
 python3 "$REPORT_TOOL" init "$JSON" "$LABEL"
 
 # Every write to the report goes through report.py, which is its only writer. These wrappers
@@ -1026,20 +1027,8 @@ run_pytest() {
     "$cache_root/aiter-jit"
   rm -f "$junit" "$receipt"
   if [ "$TARGET_RUNNER" = "pytest" ] || [ -n "$EXPECTED_ROUTE" ]; then
-    python3 - "$SCRIPT_DIR/validation_probe.py" \
-      "$PROBE_DIR/$PROBE_MODULE.py" "$EXPECTED_ROUTE" "$SHAPE_VARS" "$receipt" <<'PY'
-import pathlib
-import sys
-
-source, output, route, shape_vars, receipt = sys.argv[1:6]
-text = pathlib.Path(source).read_text()
-text += (
-    f"\n_VALIDATION_EXPECTED_ROUTE = {route!r}\n"
-    f"_VALIDATION_SHAPE_VARS = {shape_vars!r}\n"
-    f"_VALIDATION_RECEIPT_PATH = {receipt!r}\n"
-)
-pathlib.Path(output).write_text(text)
-PY
+    python3 "$TARGET_TOOL" probe-module "$SCRIPT_DIR/validation_probe.py" \
+      "$PROBE_DIR/$PROBE_MODULE.py" "$EXPECTED_ROUTE" "$SHAPE_VARS" "$receipt"
   fi
   local -a environment=(
     "HIP_VISIBLE_DEVICES=$PICK"
@@ -1062,59 +1051,8 @@ PY
     # Remove first: a generator that fails must not leave the PREVIOUS phase's plugin in
     # place, or the next phase silently re-runs the grid it was carrying.
     rm -f "$PROBE_DIR/${PROBE_MODULE}_shapes.py"
-    python3 - "$SCRIPT_DIR/shape_grid_plugin.py" \
-      "$PROBE_DIR/${PROBE_MODULE}_shapes.py" "$SHAPE_ARGNAMES" "$_grid_value" <<'PY'
-import pathlib
-import sys
-
-source, output, argnames, grid = sys.argv[1:5]
-names = tuple(part.strip() for part in argnames.split(",") if part.strip())
-SENTINEL = "__VALIDATOR_INVALID_GRID__"
-if grid.strip() == SENTINEL:
-    # The invalid-grid probe must reach the TARGET, not crash the plugin. A row of the wrong
-    # arity would raise inside pytest's parametrize and the non-zero exit would credit the
-    # channel without the target ever having consumed a shape. Keep the arity, poison the
-    # values: the target then fails on its own, which is the evidence the probe is for.
-    rows = [tuple(SENTINEL for _ in names)]
-else:
-    rows = [
-        tuple(cell.strip() for cell in row.split(","))
-        for row in grid.split(";")
-        if row.strip()
-    ]
-bad = [row for row in rows if len(row) != len(names)]
-if bad:
-    raise SystemExit(
-        f"grid rows must have {len(names)} cells to match --shape-argnames "
-        f"{','.join(names)}; offending rows: {bad}"
-    )
-# Cells arrive as text. Anything that is an integer is passed as one, because a test that
-# indexes or allocates with a shape argument needs an int, not "128". Everything else is left
-# as the string the caller wrote, which is what a dtype argument wants.
-def _coerce(cell):
-    if cell in ("True", "False"):
-        # Before this, "False" reached the target as a non-empty string, which is truthy, and
-        # every row of a boolean dimension silently ran the True branch.
-        return cell == "True"
-    if cell in ("None", "none"):
-        return None
-    try:
-        return int(cell)
-    except ValueError:
-        pass
-    try:
-        return float(cell)
-    except ValueError:
-        return cell
-
-rows = [tuple(_coerce(cell) for cell in row) for row in rows]
-text = pathlib.Path(source).read_text()
-text += (
-    f"\n_VALIDATION_SHAPE_ARGNAMES = {names!r}\n"
-    f"_VALIDATION_SHAPE_GRID = {rows!r}\n"
-)
-pathlib.Path(output).write_text(text)
-PY
+    python3 "$TARGET_TOOL" shape-plugin "$SCRIPT_DIR/shape_grid_plugin.py" \
+      "$PROBE_DIR/${PROBE_MODULE}_shapes.py" "$SHAPE_ARGNAMES" "$_grid_value"
     if [ ! -s "$PROBE_DIR/${PROBE_MODULE}_shapes.py" ]; then
       echo "shape plugin generation failed for $label" >&2
       printf '%s|%s\n' 2 "$log"
@@ -1390,48 +1328,8 @@ target_stats() {
     # coverage. When a route was named, the run's own receipt carries observable work, and
     # that count is used instead. With no route named there is still nothing to observe, and
     # the basis says so rather than implying a case count.
-    python3 - "$result" "$WORK/$phase/execution-receipt-$label.json" "$EXPECTED_ROUTE" <<'PY'
-import json
-import sys
-
-result = int(sys.argv[1])
-receipt_path, expected_route = sys.argv[2], sys.argv[3]
-# `executed` keeps its old meaning for everything that consumes it as a liveness signal
-# (the no-GPU requirement probe, the pass/skip decision), because a script that ran is a
-# script that ran. What changes is that it no longer PRETENDS to be a case count, and that
-# `observed_work` -- the only number here backed by evidence -- is published beside it.
-observed = None
-basis = "script process exit; no route was named, so no executed work could be counted"
-if expected_route:
-    try:
-        with open(receipt_path) as handle:
-            receipt = json.load(handle)
-    except (OSError, ValueError):
-        receipt = None
-    if receipt is None:
-        observed = 0
-        basis = (
-            "script process exit; a route was named and this run wrote no execution "
-            "receipt, so no executed work was observed"
-        )
-    else:
-        symbols = len(receipt.get("kernel_symbols") or [])
-        shapes = len(receipt.get("executed_shapes") or [])
-        observed = max(symbols, shapes)
-        basis = (
-            "observed route calls in this run's own execution receipt "
-            f"({symbols} symbol(s), {shapes} shape record(s))"
-        )
-print(json.dumps({
-    "tests": 1,
-    "failures": int(result != 0),
-    "errors": 0,
-    "skipped": 0,
-    "executed": 1,
-    "observed_work": observed,
-    "basis": basis,
-}))
-PY
+    python3 "$TARGET_TOOL" script-stats "$result" \
+      "$WORK/$phase/execution-receipt-$label.json" "$EXPECTED_ROUTE"
   elif [ -f "$junit" ]; then
     python3 "$SCRIPT_DIR/validate_evidence.py" pytest-stats "$junit"
   else
@@ -1444,89 +1342,23 @@ PY
 # exercised the injected shapes; otherwise the repository run's receipt stands. A phase that
 # observed nothing never speaks over one that observed something.
 head_receipt() {
-  local grid="$WORK/head/execution-receipt-head-grid.json"
-  local repo="$WORK/head/execution-receipt-head-repo.json"
-  if [ -f "$grid" ] && python3 -c '
-import json, sys
-print(0 if json.load(open(sys.argv[1])).get("route") else 1)
-' "$grid" 2>/dev/null | grep -q '^0$'; then
-    printf '%s\n' "$grid"
-    return 0
-  fi
-  if [ -f "$repo" ]; then
-    printf '%s\n' "$repo"
-    return 0
-  fi
-  printf '%s\n' "$grid"
+  python3 "$TARGET_TOOL" pick-receipt \
+    "$WORK/head/execution-receipt-head-grid.json" \
+    "$WORK/head/execution-receipt-head-repo.json"
 }
 
 # ---------- credential-free execution isolation ----------
 #
-# The target is arbitrary code from an unmerged pull request, and it used to run with the
-# reviewer's whole environment attached: `env VAR=... <cmd>` ADDS to the inherited
-# environment, it does not replace it. Any GITHUB_TOKEN, GH_TOKEN, API key, SSH agent socket
-# or provider credential in the reviewer's shell was readable from `os.environ` inside the
-# code under review, and would land in a log the moment a target printed its environment.
-#
-# So the target's environment is CONSTRUCTED, not inherited. Everything a ROCm/PyTorch run
-# legitimately needs is passed by name or prefix; everything else is dropped; and anything
-# that looks like a secret is dropped even if a prefix would have kept it, because the
-# allowlist is about function and the denylist is about consequence.
-ENV_ALLOW_PREFIXES=(
-  PATH LD_LIBRARY_PATH LIBRARY_PATH CPATH TMPDIR TZ LANG LC_ TERM
-  USER LOGNAME HOSTNAME
-  ROCM HIP HSA HCC AMD GPU_ ROCR RCCL NCCL OMP_ MKL_ OPENBLAS NUMEXPR
-  CUDA TORCH PYTORCH TRITON FLYDSL AITER
-  VIRTUAL_ENV CC CXX CMAKE MAX_JOBS
-)
-ENV_DENY_RE='TOKEN|SECRET|PASSWD|PASSWORD|CREDENTIAL|_KEY|APIKEY|API_KEY|COOKIE|SESSION|AUTH|PRIVATE|GH_|GITHUB|SSH_|GPG_|NETRC'
+# The allowlist, the secret-shaped denylist, and the reasons for both live in target_run.py.
+# What stays here is only the handoff: the pairs are read once, and every launch below runs
+# under `env -i` with exactly this set and nothing inherited.
 TARGET_BASE_ENV=()
-
-build_target_environment() {
-  # Emits NUL-separated NAME=VALUE pairs for the passthrough set.
-  python3 - "$ENV_DENY_RE" "${ENV_ALLOW_PREFIXES[@]}" <<'PY'
-import os
-import re
-import sys
-
-deny = re.compile(sys.argv[1])
-prefixes = tuple(sys.argv[2:])
-out = []
-for name, value in os.environ.items():
-    if not name.startswith(prefixes):
-        continue
-    if deny.search(name.upper()):
-        continue
-    out.append(f"{name}={value}")
-sys.stdout.write("\0".join(out))
-PY
-}
-
-mapfile -d '' -t TARGET_BASE_ENV < <(build_target_environment)
-jset_json "isolation.target_environment" "$(python3 - "${TARGET_BASE_ENV[@]}" <<'PY'
-import json
-import sys
-
-names = sorted(pair.split("=", 1)[0] for pair in sys.argv[1:])
-print(json.dumps({
-    "policy": "constructed (env -i + name/prefix allowlist + secret-shaped denylist)",
-    "passed_through": names,
-    "note": (
-        "the target is unmerged third-party code; it runs with a built environment rather "
-        "than the reviewer's, so a credential in the calling shell is not readable from it "
-        "and cannot reach a log"
-    ),
-}))
-PY
-)"
+mapfile -d '' -t TARGET_BASE_ENV < <(python3 "$TARGET_TOOL" env)
+jset_json "isolation.target_environment" \
+  "$(python3 "$TARGET_TOOL" env-summary "${TARGET_BASE_ENV[@]}")"
 
 stats_field() {
-  python3 - "$1" "$2" <<'PY'
-import json
-import sys
-
-print(json.loads(sys.argv[1])[sys.argv[2]])
-PY
+  python3 "$TARGET_TOOL" stats-field "$1" "$2"
 }
 
 # ---------- does this target actually need a GPU? ----------
