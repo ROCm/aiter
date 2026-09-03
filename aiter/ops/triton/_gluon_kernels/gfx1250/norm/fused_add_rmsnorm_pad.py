@@ -161,8 +161,3 @@ def _gluon_fused_add_rmsnorm_pad_kernel(
     gl.amd.gfx1250.tdm.async_store(out_desc, [start_pid, 0], smemOut)
 
     gl.amd.gfx1250.tdm.async_wait(0)
-
-
-_KERNEL_MAP = {
-    "tdm": _gluon_fused_add_rmsnorm_pad_kernel,
-}
