@@ -15,20 +15,22 @@ from aiter import dtypes
 from aiter.jit.core import AITER_ROOT_DIR
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha_v4 import (
-    MHA_V4_LOG2E,
     AttentionFormat,
     AttentionPack,
     AttentionScaleMode,
     mha_v4,
     mha_v4_kv_tile,
-    mha_v4_mxfp8,
     mha_v4_packed,
-    mha_v4_q_multiplier,
     mha_v4_sparse_work_table,
+    native_fp8_format,
+    scale_modes_for_formats,
+)
+from aiter.ops.mha_v4_quant import (
+    MHA_V4_LOG2E,
+    mha_v4_q_multiplier,
     mxfp4_k_view,
     mxfp4_v_view,
     mxfp6_k_view,
-    native_fp8_format,
     quantize_fp8,
     quantize_fp8_rotated,
     quantize_int8,
@@ -42,7 +44,6 @@ from aiter.ops.mha_v4 import (
     quantize_v_mxfp6_fp6_p,
     rotate_activation_hd128,
     rotate_activation_mxfp6_quant,
-    scale_modes_for_formats,
 )
 from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
 from aiter.ops.triton.quant.mxfp6_fmha_pack import (
@@ -608,7 +609,7 @@ def test_mha_v4_mxfp4_v_backing_storage_covers_logical_view(batch, sequence, hea
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP4 V validation")
-@pytest.mark.parametrize("sequence", [1, 127, 128, 129, 257])
+@pytest.mark.parametrize("sequence", [1, 63, 64, 127, 128, 129, 255, 257])
 def test_mha_v4_mxfp4_v_pack_matches_reference(sequence):
     torch.manual_seed(sequence)
     value = torch.randn((2, sequence, 3, 128), device="cuda", dtype=torch.bfloat16)
@@ -635,7 +636,7 @@ def test_mha_v4_mxfp4_v_pack_matches_reference(sequence):
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP4 V validation")
-@pytest.mark.parametrize("sequence", [128, 129, 257])
+@pytest.mark.parametrize("sequence", [1, 63, 64, 127, 128, 129, 255, 257])
 def test_mha_v4_mxfp4_fp6_p_pack_matches_permuted_canonical(sequence):
     torch.manual_seed(sequence)
     value = torch.randn((2, sequence, 3, 128), device="cuda", dtype=torch.bfloat16)
@@ -770,6 +771,36 @@ def test_mha_v4_rejects_reserved_raw_formats(q_format):
             q_format,
             q_format,
             AttentionFormat.FP8,
+        )
+
+
+def test_mha_v4_raw_rejects_partial_scale_recipe():
+    q = torch.empty((1, 128, 2, 128), device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="must all be set or all omitted"):
+        mha_v4(
+            q,
+            q,
+            q,
+            AttentionFormat.FP8,
+            AttentionFormat.FP8,
+            AttentionFormat.FP8,
+            q_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
+        )
+
+
+def test_mha_v4_raw_rejects_unsupported_scale_recipe():
+    q = torch.empty((1, 128, 2, 128), device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="unsupported scale recipe"):
+        mha_v4(
+            q,
+            q,
+            q,
+            AttentionFormat.FP8,
+            AttentionFormat.FP8,
+            AttentionFormat.FP8,
+            q_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
+            k_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
+            v_scale_mode=AttentionScaleMode.F32_PER_CHANNEL,
         )
 
 
@@ -1119,7 +1150,7 @@ def test_mha_v4_raw_compile_parity(q_format, v_format):
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8 validation")
-def test_mha_v4_mxfp8_raw_compile_parity():
+def test_mha_v4_raw_mxfp8_compile_parity():
     torch.manual_seed(41)
     q = torch.randn((1, 257, 5, 128), device="cuda", dtype=torch.bfloat16)
     k = torch.randn_like(q)
@@ -1127,8 +1158,36 @@ def test_mha_v4_mxfp8_raw_compile_parity():
     eager_out = torch.empty_like(q)
     compiled_out = torch.empty_like(q)
 
-    eager = mha_v4_mxfp8(q, k, v, out=eager_out)
-    compiled = torch.compile(mha_v4_mxfp8, fullgraph=True)(q, k, v, out=compiled_out)
+    fp8_format = native_fp8_format()
+    scale_modes = (
+        AttentionScaleMode.E8M0_PER_1X32,
+        AttentionScaleMode.E8M0_PER_1X32,
+        AttentionScaleMode.F32_PER_TENSOR,
+    )
+    eager = mha_v4(
+        q,
+        k,
+        v,
+        fp8_format,
+        fp8_format,
+        fp8_format,
+        out=eager_out,
+        q_scale_mode=scale_modes[0],
+        k_scale_mode=scale_modes[1],
+        v_scale_mode=scale_modes[2],
+    )
+    compiled = torch.compile(mha_v4, fullgraph=True)(
+        q,
+        k,
+        v,
+        fp8_format,
+        fp8_format,
+        fp8_format,
+        out=compiled_out,
+        q_scale_mode=scale_modes[0],
+        k_scale_mode=scale_modes[1],
+        v_scale_mode=scale_modes[2],
+    )
     torch.cuda.synchronize()
 
     assert eager.data_ptr() == eager_out.data_ptr()
@@ -1346,7 +1405,18 @@ def test_mha_v4_sparse_work_table_leaves_uniform_counts_in_raster_order(
             id="i8fp8",
         ),
         pytest.param(
-            lambda q, k, v, mask: mha_v4_mxfp8(q, k, v, block_mask=mask),
+            lambda q, k, v, mask: mha_v4(
+                q,
+                k,
+                v,
+                native_fp8_format(),
+                native_fp8_format(),
+                native_fp8_format(),
+                block_mask=mask,
+                q_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
+                k_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
+                v_scale_mode=AttentionScaleMode.F32_PER_TENSOR,
+            ),
             marks=pytest.mark.skipif(
                 get_gfx() != "gfx950", reason="gfx950 MX sparse"
             ),
@@ -1411,21 +1481,6 @@ def test_mha_v4_sparse_work_table_leaves_uniform_counts_in_raster_order(
                 get_gfx() != "gfx950", reason="gfx950 MX sparse"
             ),
             id="mxfp4",
-        ),
-        pytest.param(
-            lambda q, k, v, mask: mha_v4(
-                q,
-                k,
-                v,
-                AttentionFormat.MXFP4,
-                AttentionFormat.MXFP4,
-                AttentionFormat.MXFP4,
-                block_mask=mask,
-            ),
-            marks=pytest.mark.skipif(
-                get_gfx() != "gfx950", reason="gfx950 MX sparse"
-            ),
-            id="f4f4",
         ),
     ],
 )
@@ -1827,8 +1882,6 @@ def _gfx950_only(launch, label):
     )
 
 
-# An FP8 Q always canonicalizes to per-tensor scales, so MXFP8 is unreachable through raw mha_v4
-# and goes through its own entry point instead.
 _EMPTY_ROW_LAUNCHES = [
     pytest.param(
         lambda q, k, v, m: mha_v4(
@@ -1854,7 +1907,21 @@ _EMPTY_ROW_LAUNCHES = [
         ),
         id="i8fp8",
     ),
-    _gfx950_only(lambda q, k, v, m: mha_v4_mxfp8(q, k, v, block_mask=m), "mxfp8"),
+    _gfx950_only(
+        lambda q, k, v, m: mha_v4(
+            q,
+            k,
+            v,
+            native_fp8_format(),
+            native_fp8_format(),
+            native_fp8_format(),
+            block_mask=m,
+            q_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
+            k_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
+            v_scale_mode=AttentionScaleMode.F32_PER_TENSOR,
+        ),
+        "mxfp8",
+    ),
     _gfx950_only(
         lambda q, k, v, m: mha_v4(
             q,

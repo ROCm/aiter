@@ -27,11 +27,14 @@ from aiter.ops.mha_v4 import (
     mha_v4,
     mha_v4_kv_tile,
     mha_v4_packed,
+    native_fp8_format,
+    scale_modes_for_formats,
+)
+from aiter.ops.mha_v4_quant import (
     mha_v4_q_multiplier,
     mxfp4_k_view,
     mxfp4_v_view,
     mxfp6_k_view,
-    native_fp8_format,
     quantize_fp8,
     quantize_fp8_rotated,
     quantize_int8,
@@ -46,7 +49,6 @@ from aiter.ops.mha_v4 import (
     quantize_v_mxfp6,
     quantize_v_mxfp6_fp6_p,
     rotate_activation_hd128,
-    scale_modes_for_formats,
 )
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 from aiter.ops.triton.attention.fav3_sage import (
