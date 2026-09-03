@@ -20,6 +20,13 @@ The schema was never checked by the thing that produces reports -- only by tests
 publishable, and a consumer reading a field the producer had stopped writing would see a missing
 key rather than a failed run. Validation happens here, before the report is copied to its
 published path, and a report that does not validate cannot be PASS.
+
+WHY EVERY WRITE COMES THROUGH HERE
+----------------------------------
+The report had five writers, each a separate heredoc in the shell, and one of them --
+``mark_runtime_coverage`` -- was not boilerplate at all: it carried three early-exit rules
+deciding when a run may claim it exercised an architecture. Policy embedded in a heredoc is
+policy no test can reach, and those three rules had none. They are functions here, and tested.
 """
 
 from __future__ import annotations
@@ -98,6 +105,52 @@ def backfill_missing_stages(data: dict, required: list[str]) -> None:
             )
 
 
+def assign(data: dict, dotted_key: str, value) -> None:
+    """Set ``a.b.c`` on the report, creating the intermediate objects."""
+    parts = dotted_key.split(".")
+    current = data
+    for part in parts[:-1]:
+        current = current.setdefault(part, {})
+    current[parts[-1]] = value
+
+
+def runtime_credit_refusal(stats: dict, runner: str, log_size: int) -> str | None:
+    """Why this run may not claim it exercised an architecture, or None if it may.
+
+    A script that exits 0 with output has proved that a process ran, not that an architecture
+    was exercised: aiter#4538's own target returns silently with exit 0 and a log line when the
+    arch is unsupported or an optional package is missing. When a route WAS named and the run's
+    receipt observed no call to it, there is positive evidence that no work reached the device.
+    With no route named -- ``observed_work`` absent rather than zero -- nothing was observed
+    either way, so this does not refuse; the basis string says so instead of implying a
+    measurement.
+    """
+    if stats.get("executed", 0) < 1:
+        return "nothing executed"
+    if runner == "script":
+        if log_size == 0:
+            return "the script produced no output"
+        if stats.get("observed_work") == 0:
+            return "a route was named and the receipt observed no call to it"
+    return None
+
+
+def runtime_credit_basis(stats: dict, runner: str) -> str:
+    """How this run knows the architecture was exercised.
+
+    "script-exit-zero-with-output" described the process, not the work: a target that printed
+    one line and returned earned the same credit as one that graded 56 cases. The basis names
+    the count the stats carry and where it came from, so a reader can see whether an
+    architecture was exercised or merely visited.
+    """
+    if runner == "pytest":
+        return f"pytest-junit-executed:{stats['executed']}"
+    basis = stats.get("basis", "unknown basis")
+    if stats.get("failures", 0) != 0:
+        return f"script-nonzero-with-output ({basis})"
+    return f"script-observed-work:{stats.get('observed_work')} ({basis})"
+
+
 def compute_verdict(data: dict, required: list[str]) -> str:
     """The verdict the recorded evidence supports -- the one judgement call no one narrates.
 
@@ -131,6 +184,57 @@ def cmd_init(args: argparse.Namespace) -> int:
         {"label": args.label, "stages": {}, "findings": []},
     )
     return 0
+
+
+def _edit(path_str: str, mutate) -> int:
+    path = pathlib.Path(path_str)
+    data = json.loads(path.read_text())
+    mutate(data)
+    _write(path, data)
+    return 0
+
+
+def cmd_set(args: argparse.Namespace) -> int:
+    value = json.loads(args.value) if args.json else args.value
+    return _edit(args.report, lambda data: assign(data, args.key, value))
+
+
+def cmd_stage(args: argparse.Namespace) -> int:
+    return _edit(
+        args.report,
+        lambda data: data["stages"].__setitem__(
+            args.name, {"status": args.status, "note": args.note}
+        ),
+    )
+
+
+def cmd_finding(args: argparse.Namespace) -> int:
+    return _edit(
+        args.report,
+        lambda data: data["findings"].append(
+            {"severity": args.severity, "stage": args.stage, "detail": args.detail}
+        ),
+    )
+
+
+def cmd_coverage(args: argparse.Namespace) -> int:
+    stats = json.loads(args.stats)
+    log = pathlib.Path(args.log)
+    log_size = log.stat().st_size if log.exists() else 0
+    if runtime_credit_refusal(stats, args.runner, log_size) is not None:
+        return 0
+
+    def mutate(data: dict) -> None:
+        gpu = data["stages"].get("gpu_claim", {})
+        arch = gpu.get("arch")
+        if gpu.get("status") != "pass" or not arch:
+            return
+        data["arch_coverage"][arch] = "runtime"
+        data.setdefault("arch_coverage_basis", {})[arch] = runtime_credit_basis(
+            stats, args.runner
+        )
+
+    return _edit(args.report, mutate)
 
 
 def cmd_finish(args: argparse.Namespace) -> int:
@@ -181,6 +285,39 @@ def main(argv: list[str]) -> int:
     init.add_argument("report")
     init.add_argument("label")
     init.set_defaults(func=cmd_init)
+
+    setter = sub.add_parser("set", help="set a dotted key on the report")
+    setter.add_argument("report")
+    setter.add_argument("key")
+    setter.add_argument("value")
+    setter.add_argument(
+        "--json", action="store_true", help="parse VALUE as JSON rather than a string"
+    )
+    setter.set_defaults(func=cmd_set)
+
+    stage = sub.add_parser("stage", help="record a stage's status and note")
+    stage.add_argument("report")
+    stage.add_argument("name")
+    stage.add_argument("status")
+    stage.add_argument("note")
+    stage.set_defaults(func=cmd_stage)
+
+    found = sub.add_parser("finding", help="append a finding")
+    found.add_argument("report")
+    found.add_argument("severity")
+    found.add_argument("stage")
+    found.add_argument("detail")
+    found.set_defaults(func=cmd_finding)
+
+    coverage = sub.add_parser(
+        "coverage",
+        help="credit an architecture as runtime-exercised, if the run earned it",
+    )
+    coverage.add_argument("report")
+    coverage.add_argument("stats")
+    coverage.add_argument("runner")
+    coverage.add_argument("log")
+    coverage.set_defaults(func=cmd_coverage)
 
     finish = sub.add_parser("finish", help="compute the verdict and publish the report")
     finish.add_argument("report")
