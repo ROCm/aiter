@@ -369,9 +369,9 @@ space this is here to make visible.
 
 ### 6 — `execution_receipt`
 
-The validator loads its own pytest profiling plugin before test collection. The caller names an
-exact Python `module:function` route and the route's shape-local variable names; the plugin
-records actual calls and writes:
+Name the exact Python `module:function` route the diff is supposed to make execute, and the local
+variable names inside it that carry the shapes. A validator-owned profiler loads before collection
+and records what actually got called:
 
 ```json
 {
@@ -382,36 +382,32 @@ records actual calls and writes:
 }
 ```
 
-`PASS` requires the observed route to equal `--expected-route`, at least one observed route
-symbol, and every shape named by `--grid`. The tested PR cannot obtain credit merely by writing
-its own receipt; `validate-kernel-pr.validation_probe` owns the receipt producer, and the script
-runner calls that producer's own hooks rather than re-implementing them.
+`PASS` requires the observed route to equal the one you named, at least one observed route symbol,
+and every shape the grid asked for. The tested PR cannot earn credit by writing its own receipt:
+the producer is validator-owned, and the script runner calls that producer's hooks rather than
+re-implementing them — a re-implementation would be a second thing the PR's tree could influence.
 
-A receipt is validated whenever a route was named, including when no grid was configured or the
-grid channel could not be established. With no grid it asserts route execution and nothing about
-shapes, which is all it is then entitled to claim. Abandoning the receipt along with the grid
-would discard evidence that was already collected.
+Validate a receipt whenever a route was named, **including** when no grid was configured or its
+channel could not be established. With no grid it attests route execution and nothing about
+shapes, which is all it is then entitled to claim; abandoning it alongside the grid would throw
+away evidence already collected.
 
-**One receipt per run, not per phase.** `head-repo` and `head-grid` both execute inside the
-head phase. They shared a receipt path, so the second erased the first, and with the grid
-cells a subset of the target's defaults a receipt written by *either* run satisfied `--grid`
-— which made the grid's own evidence unfalsifiable. Each run now writes
-`execution-receipt-<label>.json`, the stage reads the grid run's own file when a grid ran,
-and `execution_receipt.receipt_scope` names which run the published receipt describes.
+**One receipt per run, not per phase.** The repo-tests run and the grid run both execute inside
+the head phase. Sharing one receipt path meant the second erased the first — and with the grid
+cells a subset of the target's defaults, a receipt written by *either* run satisfied the grid's
+requirement, which made the grid's own evidence unfalsifiable. One file per run, read the grid
+run's own file when a grid ran, and record which run the published receipt describes.
 
-**A route is resolved to a code object, not matched as a string.** A frame's identity is
-`f_globals["__name__"] + ":" + f_code.co_name`, which stops being the declared route the
-moment the function is wrapped: `functools.wraps` copies `__name__` onto the wrapper object
-and leaves `co_name` alone, so aiter's entire `@compile_ops` family executes as
-`aiter.jit.core:wrapper` and naming the op a reviewer cares about matched nothing. The probe
-imports the declared module, resolves the attribute, walks its `__wrapped__` chain and matches
-on the resulting code objects; the string match remains as a fallback, so a route into a module
-that cannot be imported behaves exactly as before.
+**Name the op a reviewer cares about, not the wrapper it runs through.** The probe resolves the
+declared route to a code object and walks the `__wrapped__` chain, so decoration does not have to
+be worked around by hand — aiter's entire `@compile_ops` family executes as `aiter.jit.core:wrapper`
+under a plain string match, and naming the actual op matched nothing.
 
-**Shape capture still needs the route's own frame to bind the shape locals.** A dispatch
-wrapper declared `(*args, **kwargs)` binds none of them, so a route through one attests
-execution and nothing about shapes; the receipt then says *"missing required shapes"* rather
-than passing. Naming a route whose frame does carry the shape names is the caller's move.
+**Shape capture is a separate question, and it constrains which route to name.** The shape locals
+have to be bound in that route's own frame. A dispatch wrapper declared `(*args, **kwargs)` binds
+none of them, so a route through one attests execution and nothing about shapes, and the receipt
+says *missing required shapes* rather than passing. Choosing a route whose frame actually carries
+those names is your judgement to make before the run, not a defect to diagnose after it.
 
 **A route is not a variant.** The receipt records that
 `…mqa_logits.fp8_mqa_logits:flydsl_fp8_mqa_logits` was entered and with which shape-locals.
@@ -440,19 +436,21 @@ exercises an entry point that already exists on base, dropping that exact file i
 tree times the pre-PR implementation through the same harness. `perf.baseline_method` says
 which baseline was used, `patch-reversed-same-worktree` or `target-transplant`.
 
-A transplant spans two trees, so it carries one extra burden: `--perf-control-column` names a
-timing column the patch does not touch — typically a reference implementation the target times
-alongside the kernel under test — and the stage `skip`s unless that column reproduces within
-`PERF_CONTROL_TOL` (default 10 %) across the two runs. Without a control the transplant is
-declined rather than guessed at, and the reason names the missing flag instead of claiming
-there was nothing to measure. Note that `median_ratio` remains the *worst* column, so an
-unchanged reference column sitting at 1.0 caps the reported ratio; read `columns` for the
-kernel's own movement.
+A transplant spans two trees, so it carries one extra burden: name a **control column** — a timing
+column the patch does not touch, typically a reference implementation the target times alongside
+the kernel under test — and `skip` unless that column reproduces within `PERF_CONTROL_TOL`
+(default 10 %) across the two runs. Two trees can differ in ways that have nothing to do with the
+kernel, and the control is what distinguishes "the kernel got slower" from "these are different
+machines wearing the same name". With no control, decline the transplant rather than guess, and
+say the control was missing instead of claiming there was nothing to measure.
 
-On by default, because the regression this stage exists to catch is the one nobody suspected and an
-opt-in flag is only ever set by someone who already suspects. The entry point is detected from the
-target (`--scenario bench`, or a `perftest`/`@benchmark` harness); `--perf-args` names it explicitly
-and `--no-perf` turns the stage off.
+Note that the headline ratio is the *worst* column, so an unchanged reference column sitting at
+1.0 caps it; read the per-column numbers for the kernel's own movement.
+
+Time by default. The regression this stage catches is the one nobody suspected, and an opt-in
+switch is only ever flipped by someone who already suspects. Detect the entry point from the
+target — a bench scenario, a `perftest` or `@benchmark` harness — and name it explicitly when
+detection would decline.
 
 Rows are matched across the two sides by their identity columns. A header carrying no
 recognised unit is treated as an identity column — but aiter bench tables routinely print
@@ -494,6 +492,10 @@ comparison was made: read `stages.perf` for that, and read a `skip` there as "no
 "no regression".
 
 Process exit codes match the verdict: `PASS=0`, `BLOCK/NEEDS_WORK=1`, and `INCONCLUSIVE=2`.
+
+You do not write this. `finish` derives it from the stages on record and is the only writer of
+both the verdict and the exit code — which is what makes the list above a consequence of what ran
+rather than a summary of it.
 
 ---
 
