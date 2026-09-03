@@ -63,6 +63,12 @@ def main(argv: list[str]) -> int:
         else:
             print(code, file=sys.stderr)
             status = 1
+    except BaseException:
+        # Any other uncaught exception -- AssertionError is the standard shape of
+        # aiter's op_tests -- means the target failed. Record that in the receipt
+        # before re-raising, or a red run lands a receipt claiming exitstatus 0.
+        status = 1
+        raise
     finally:
         sys.argv = saved_argv
         # Always write the receipt, including on failure: "the route never ran" is exactly
