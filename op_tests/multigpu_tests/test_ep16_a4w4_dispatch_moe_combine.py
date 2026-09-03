@@ -18,6 +18,7 @@ Launch (2 nodes, one torchrun process per node, 8 local GPUs spawned inside):
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import time
@@ -318,7 +319,15 @@ def _run_one_bs(
     torch.cuda.synchronize()
     total_recv = int(recv_num_token[0].item())
 
-    moe_out = backend.fused_moe(dispatched)
+    # Capture the two compute launch callables so GEMM1/GEMM2 can be timed
+    # independently on the actual post-MORI routing distribution.
+    fused_moe_module = importlib.import_module("aiter.fused_moe")
+    kernel_calls = []
+    fused_moe_module.kernel_bench_callable = kernel_calls
+    try:
+        moe_out = backend.fused_moe(dispatched)
+    finally:
+        fused_moe_module.kernel_bench_callable = None
 
     # combine()'s indices/weights must be THIS rank's own [tokens, topk]
     # routing passed to dispatch() -- NOT dispatch()'s returned recv_idx/
@@ -332,6 +341,25 @@ def _run_one_bs(
         # GEMM2 uses atomic accumulation, so two otherwise identical launches
         # are not bitwise deterministic. Keep this as a BF16 consistency check.
         torch.testing.assert_close(out, diagnostic_out, rtol=1e-2, atol=1.25e-1)
+
+    def _time_captured_kernel(call):
+        for _ in range(3):
+            call()
+        torch.cuda.synchronize()
+        starts = [torch.cuda.Event(enable_timing=True) for _ in range(20)]
+        ends = [torch.cuda.Event(enable_timing=True) for _ in range(20)]
+        for start, end in zip(starts, ends):
+            start.record()
+            call()
+            end.record()
+        torch.cuda.synchronize()
+        return sum(start.elapsed_time(end) for start, end in zip(starts, ends)) / 20
+
+    kernel_us = {name: _time_captured_kernel(call) * 1000 for name, call in kernel_calls}
+    gemm1_us_local = kernel_us.get("stage1", 0.0)
+    gemm2_us_local = kernel_us.get("stage2", 0.0)
+    gemm1_us = _reduce_float(gemm1_us_local, dist.ReduceOp.SUM) / world_size
+    gemm2_us = _reduce_float(gemm2_us_local, dist.ReduceOp.SUM) / world_size
 
     # ---- correctness (only below accuracy_max_bs, all-gather ref is O(bs*world)) ----
     rel_l2 = -1.0
@@ -541,7 +569,9 @@ def _run_one_bs(
             f"{moe_tflops:.2f}/{moe_tflops_best:.2f}/{moe_tflops_worst:.2f} TFLOPS mean/best/worst  "
             f"{moe_gbps:.2f}/{moe_gbps_best:.2f}/{moe_gbps_worst:.2f} GB/s mean/best/worst\n"
             f"  combine : {combine_avg:.4f}/{combine_min:.4f}/{combine_max:.4f}ms mean/best/worst  "
-            f"{combine_gbps:.2f}/{combine_gbps_best:.2f}/{combine_gbps_worst:.2f} GB/s mean/best/worst",
+            f"{combine_gbps:.2f}/{combine_gbps_best:.2f}/{combine_gbps_worst:.2f} GB/s mean/best/worst\n"
+            f"  kernels : gemm1={gemm1_us:.2f}us gemm2={gemm2_us:.2f}us "
+            f"sum={gemm1_us + gemm2_us:.2f}us",
             flush=True,
         )
         if perf_out:
@@ -587,6 +617,8 @@ def _run_one_bs(
                     "active_experts_mean": round(active_experts_avg, 1),
                     "active_experts_max": round(active_experts_max, 1),
                     "moe_rel_l2": None if rel_l2 < 0 else round(rel_l2, 6),
+                    "gemm1_us": round(gemm1_us, 2),
+                    "gemm2_us": round(gemm2_us, 2),
                 },
                 "ts": time.time(),
             }
