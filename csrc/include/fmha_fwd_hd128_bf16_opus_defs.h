@@ -28,8 +28,17 @@ struct opus_gqa_kargs {
     int stride_v_n;
     int stride_v_h;
     float softmax_scale;  // QK^T scale (host passes 1/sqrt(D) by default)
-    // Optional fp32 log-sum-exp (natural log) output, [B, H, N] with unit stride along
-    // the query dim. nullptr => not produced (the kernel skips the store).
+    // ── group mode (varlen / packed sequences) ──
+    // Prefix sums (length B+1) locating each group in the packed buffers: *_seqstart_* are
+    // real lengths (masks / KV-tile count / short-circuit), *_seqstart_*_pad are physical
+    // row offsets (equal when unpadded). A null ptr_seqstart_q selects batch mode.
+    const int* ptr_seqstart_q;
+    const int* ptr_seqstart_k;
+    const int* ptr_seqstart_q_pad;
+    const int* ptr_seqstart_k_pad;
+    // Optional fp32 log-sum-exp (natural log), unit stride along the query dim; nullptr =>
+    // not produced. batch: [B, H, N] (stride_lse_b/h). group: [H, total_q] (stride_lse_h,
+    // row offset from seqstart_q_pad, as Q/O).
     void* __restrict__ ptr_lse;
     int stride_lse_b;
     int stride_lse_h;
@@ -49,7 +58,8 @@ template<int Q_TILE_SIZE_ = 32,
         int KV_TILE_SIZE_ = 64,
         int D_TILE_SIZE_ = 128,
         int NUM_WARPS_ = 8,
-        bool CAUSAL_ = false>
+        bool CAUSAL_ = false,
+        bool GROUP_MODE_ = false>
 struct opus_gqa_traits {
     static_assert(D_TILE_SIZE_ == 64 || D_TILE_SIZE_ == 128,
                   "opus_gqa_traits supports D_TILE_SIZE 64 or 128");
@@ -59,6 +69,8 @@ struct opus_gqa_traits {
     static constexpr int D_TILE_SIZE = D_TILE_SIZE_;
     static constexpr int NUM_WARPS = NUM_WARPS_;
     static constexpr bool CAUSAL = CAUSAL_;
+    // Group (varlen) mode: locate sequences via seqstart, not a uniform batch stride.
+    static constexpr bool GROUP_MODE = GROUP_MODE_;
 
     static constexpr int WARP_SIZE = 64; // AMD wavefront size
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;

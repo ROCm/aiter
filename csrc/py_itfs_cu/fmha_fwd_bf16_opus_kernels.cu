@@ -3,7 +3,7 @@
 //
 // Torch entry point for the OPUS gfx950 bf16 flash-attention forward kernels.
 // `fmha_fwd_bf16_opus_fwd` validates the tensors and dispatches by head dim:
-//   * (D_QK,D_V) = (128,128) -> gqa_d128_kernel        (batch mode only)
+//   * (D_QK,D_V) = (64,64) | (128,128) -> gqa_d128_kernel  (batch + group / varlen)
 //   * (D_QK,D_V) = (192,128) -> gqa_d192_v128_kernel   (batch + group / varlen)
 //
 // This file owns the torch-facing validation and the tensor -> stride extraction only. The
@@ -22,8 +22,7 @@
 
 namespace {
 
-// ─── D_QK=128 / D_V=128 (symmetric) launch — logic unchanged from the original
-//     fmha_fwd_hd128_bf16_opus_fwd, only moved under the shared entry point. ───
+// ─── D_QK = D_V in {64, 128} (symmetric) launch — batch + group (varlen). ───
 void launch_d128(at::Tensor& q,
                  at::Tensor& k,
                  at::Tensor& v,
@@ -31,43 +30,122 @@ void launch_d128(at::Tensor& q,
                  bool causal,
                  float softmax_scale,
                  std::optional<at::Tensor>& lse,
-                 std::optional<at::Tensor>& sink)
+                 std::optional<at::Tensor>& sink,
+                 std::optional<at::Tensor>& seqstart_q,
+                 std::optional<at::Tensor>& seqstart_k,
+                 std::optional<at::Tensor>& seqstart_q_pad,
+                 std::optional<at::Tensor>& seqstart_k_pad,
+                 int max_seqlen_q,
+                 int max_seqlen_k)
 {
-    TORCH_CHECK(q.dim() == 4, "q must be 4-D [B, N, H, D], got ndim=", q.dim());
-    TORCH_CHECK(k.dim() == 4, "k must be 4-D [B, N, H_KV, D], got ndim=", k.dim());
-    TORCH_CHECK(v.dim() == 4, "v must be 4-D [B, N, H_KV, D], got ndim=", v.dim());
-    TORCH_CHECK(out.dim() == 4, "out must be 4-D [B, N, H, D], got ndim=", out.dim());
+    const bool is_group = seqstart_q.has_value() && seqstart_q->numel() > 0;
 
-    const int B    = static_cast<int>(q.size(0));
-    const int N    = static_cast<int>(q.size(1));      // seqlen_q
-    const int H    = static_cast<int>(q.size(2));
-    const int D    = static_cast<int>(q.size(3));
-    const int H_KV = static_cast<int>(k.size(2));
-    const int N_KV = static_cast<int>(k.size(1));      // seqlen_kv (cross-attn: may != N)
+    int B, N, N_KV, H, H_KV, D;
+    int total_q = 0;   // group mode only, for the packed LSE extent
+    fmha_fwd_bf16_opus_args args{};
+
+    if (is_group) {
+        // Packed / varlen: q [total_q, H, D], k/v [total_k, H_KV, D], out [total_q, H, D].
+        // B is the group count; N/N_KV are the maxima that drive the grid, while each
+        // group's real length comes from seqstart in the kernel.
+        TORCH_CHECK(q.dim() == 3 && k.dim() == 3 && v.dim() == 3 && out.dim() == 3,
+                    "group mode expects packed 3-D q/k/v/out [total, H, D]");
+        D       = static_cast<int>(q.size(2));
+        H       = static_cast<int>(q.size(1));
+        H_KV    = static_cast<int>(k.size(1));
+        total_q = static_cast<int>(q.size(0));
+        TORCH_CHECK(static_cast<int>(k.size(2)) == D && static_cast<int>(v.size(2)) == D &&
+                        static_cast<int>(out.size(2)) == D,
+                    "group mode k/v/out head dim must equal q head dim D");
+        TORCH_CHECK(static_cast<int>(v.size(1)) == H_KV, "group mode k/v must share H_KV");
+        TORCH_CHECK(v.size(0) == k.size(0), "group mode k/v must share total_k");
+        TORCH_CHECK(static_cast<int>(out.size(0)) == total_q &&
+                        static_cast<int>(out.size(1)) == H,
+                    "group mode out must be [total_q, H, D]");
+        TORCH_CHECK(seqstart_k.has_value(), "group mode requires seqstart_k");
+        B = static_cast<int>(seqstart_q->numel()) - 1;   // num groups
+        TORCH_CHECK(B > 0, "group mode requires seqstart_q length >= 2");
+        TORCH_CHECK(max_seqlen_q > 0 && max_seqlen_k > 0,
+                    "group mode requires max_seqlen_q / max_seqlen_k > 0");
+        N    = max_seqlen_q;
+        N_KV = max_seqlen_k;
+
+        // Validate before reinterpreting the storage as int32: a wrong dtype, layout or
+        // length would silently corrupt every per-group offset.
+        auto check_seqstart = [&](const at::Tensor& s, const char* name) {
+            TORCH_CHECK(s.device() == q.device(), name, " must be on the same device as q");
+            TORCH_CHECK(s.scalar_type() == at::kInt, name, " must be int32");
+            TORCH_CHECK(s.dim() == 1, name, " must be 1-D");
+            TORCH_CHECK(s.is_contiguous(), name, " must be contiguous");
+            TORCH_CHECK(static_cast<int>(s.numel()) == B + 1, name, " length must be num_groups+1");
+        };
+        check_seqstart(*seqstart_q, "seqstart_q");
+        check_seqstart(*seqstart_k, "seqstart_k");
+        if (seqstart_q_pad.has_value()) check_seqstart(*seqstart_q_pad, "seqstart_q_pad");
+        if (seqstart_k_pad.has_value()) check_seqstart(*seqstart_k_pad, "seqstart_k_pad");
+
+        // Packed: no batch stride, the group's row offset comes from seqstart.
+        args.stride_q_b = 0; args.stride_q_n = static_cast<int>(q.stride(0));   args.stride_q_h = static_cast<int>(q.stride(1));
+        args.stride_o_b = 0; args.stride_o_n = static_cast<int>(out.stride(0)); args.stride_o_h = static_cast<int>(out.stride(1));
+        args.stride_k_b = 0; args.stride_k_n = static_cast<int>(k.stride(0));   args.stride_k_h = static_cast<int>(k.stride(1));
+        args.stride_v_b = 0; args.stride_v_n = static_cast<int>(v.stride(0));   args.stride_v_h = static_cast<int>(v.stride(1));
+
+        args.seqstart_q_ptr     = reinterpret_cast<const int*>(seqstart_q->data_ptr());
+        args.seqstart_k_ptr     = reinterpret_cast<const int*>(seqstart_k->data_ptr());
+        args.seqstart_q_pad_ptr = reinterpret_cast<const int*>(
+            (seqstart_q_pad.has_value() ? *seqstart_q_pad : *seqstart_q).data_ptr());
+        args.seqstart_k_pad_ptr = reinterpret_cast<const int*>(
+            (seqstart_k_pad.has_value() ? *seqstart_k_pad : *seqstart_k).data_ptr());
+    } else {
+        TORCH_CHECK(q.dim() == 4, "q must be 4-D [B, N, H, D], got ndim=", q.dim());
+        TORCH_CHECK(k.dim() == 4, "k must be 4-D [B, N, H_KV, D], got ndim=", k.dim());
+        TORCH_CHECK(v.dim() == 4, "v must be 4-D [B, N, H_KV, D], got ndim=", v.dim());
+        TORCH_CHECK(out.dim() == 4, "out must be 4-D [B, N, H, D], got ndim=", out.dim());
+
+        B    = static_cast<int>(q.size(0));
+        N    = static_cast<int>(q.size(1));      // seqlen_q
+        H    = static_cast<int>(q.size(2));
+        D    = static_cast<int>(q.size(3));
+        H_KV = static_cast<int>(k.size(2));
+        N_KV = static_cast<int>(k.size(1));      // seqlen_kv (cross-attn: may != N)
+
+        TORCH_CHECK(k.size(0) == B && v.size(0) == B, "k/v batch must equal q batch B");
+        TORCH_CHECK(v.size(1) == N_KV, "k/v seqlen must match (v seqlen != k seqlen)");
+        TORCH_CHECK(v.size(2) == H_KV, "k/v must share H_KV");
+        TORCH_CHECK(k.size(3) == D && v.size(3) == D, "k/v head dim must equal q head dim D");
+        TORCH_CHECK(out.size(0) == B && out.size(1) == N && out.size(2) == H && out.size(3) == D,
+                    "out shape must match q [B, N, H, D]");
+
+        args.stride_q_b  = static_cast<int>(q.stride(0));
+        args.stride_q_n  = static_cast<int>(q.stride(1));
+        args.stride_q_h  = static_cast<int>(q.stride(2));
+        args.stride_o_b  = static_cast<int>(out.stride(0));
+        args.stride_o_n  = static_cast<int>(out.stride(1));
+        args.stride_o_h  = static_cast<int>(out.stride(2));
+        args.stride_k_b  = static_cast<int>(k.stride(0));
+        args.stride_k_n  = static_cast<int>(k.stride(1));
+        args.stride_k_h  = static_cast<int>(k.stride(2));
+        args.stride_v_b  = static_cast<int>(v.stride(0));
+        args.stride_v_n  = static_cast<int>(v.stride(1));
+        args.stride_v_h  = static_cast<int>(v.stride(2));
+    }
 
     TORCH_CHECK(D == 64 || D == 128, "launch_d128 compiles D=64 or D=128, got D=", D);
-    TORCH_CHECK(k.size(0) == B && v.size(0) == B, "k/v batch must equal q batch B");
-    TORCH_CHECK(v.size(1) == N_KV, "k/v seqlen must match (v seqlen != k seqlen)");
-    TORCH_CHECK(v.size(2) == H_KV, "k/v must share H_KV");
-    TORCH_CHECK(k.size(3) == D && v.size(3) == D, "k/v head dim must equal q head dim D");
     TORCH_CHECK(H_KV > 0 && (H % H_KV) == 0, "H must be divisible by H_KV (GQA group)");
-    TORCH_CHECK(out.size(0) == B && out.size(1) == N && out.size(2) == H && out.size(3) == D,
-                "out shape must match q [B, N, H, D]");
-
-    TORCH_CHECK(q.stride(3) == 1 && k.stride(3) == 1 && v.stride(3) == 1 && out.stride(3) == 1,
+    TORCH_CHECK(q.stride(-1) == 1 && k.stride(-1) == 1 && v.stride(-1) == 1 &&
+                    out.stride(-1) == 1,
                 "q/k/v/out must be contiguous along the head dim D");
 
     // 32-bit KV buffer-offset guard: extent >= 2^32 wraps the async-load soffset (silent
-    // wrong output), reject instead.
+    // wrong output), reject instead. N_KV is max_seqlen_k in group mode, bounding all.
     const long long kv_slice_bytes =
-        (long long)N_KV * std::max(k.stride(1), v.stride(1)) * 2LL;  // bf16
+        (long long)N_KV * std::max(args.stride_k_n, args.stride_v_n) * 2LL;  // bf16
     TORCH_CHECK(kv_slice_bytes < (1LL << 32),
-                "OPUS D=", D, ": KV byte extent ", kv_slice_bytes,
+                "OPUS symmetric D=", D, ": KV byte extent ", kv_slice_bytes,
                 " reaches the 32-bit buffer-offset limit (2^32); reduce seqlen_kv or use another backend");
 
     if (B == 0 || N == 0 || H == 0) return;
 
-    fmha_fwd_bf16_opus_args args{};
     args.q_ptr    = q.data_ptr();
     args.k_ptr    = k.data_ptr();
     args.v_ptr    = v.data_ptr();
@@ -79,34 +157,32 @@ void launch_d128(at::Tensor& q,
     args.seqlen_k = N_KV;
     args.hdim_q   = D;
     args.hdim_v   = D;
-    args.stride_q_b  = static_cast<int>(q.stride(0));
-    args.stride_q_n  = static_cast<int>(q.stride(1));
-    args.stride_q_h  = static_cast<int>(q.stride(2));
-    args.stride_o_b  = static_cast<int>(out.stride(0));
-    args.stride_o_n  = static_cast<int>(out.stride(1));
-    args.stride_o_h  = static_cast<int>(out.stride(2));
-    args.stride_k_b  = static_cast<int>(k.stride(0));
-    args.stride_k_n  = static_cast<int>(k.stride(1));
-    args.stride_k_h  = static_cast<int>(k.stride(2));
-    args.stride_v_b  = static_cast<int>(v.stride(0));
-    args.stride_v_n  = static_cast<int>(v.stride(1));
-    args.stride_v_h  = static_cast<int>(v.stride(2));
     args.softmax_scale = softmax_scale;  // <= 0 picks the launcher's 1/sqrt(D) default
     args.causal        = causal;
 
-    // Optional LSE (fp32, natural log; one value per (head, query row)). Left as nullptr
-    // when absent, which the kernel reads as "skip the store".
+    // Optional LSE (fp32, natural log; one per (head, query row)); nullptr => skip the
+    // store. Batch: [B, H, N]. Group: packed [H, total_q], row offset from seqstart_q_pad.
     if (lse.has_value()) {
         const at::Tensor& l = *lse;
         TORCH_CHECK(l.device() == q.device(), "lse must be on the same device as q");
         TORCH_CHECK(l.scalar_type() == at::kFloat, "lse must be float32");
         TORCH_CHECK(l.stride(-1) == 1, "lse must be contiguous along the query dim");
-        TORCH_CHECK(l.dim() == 3 && static_cast<int>(l.size(0)) == B &&
-                        static_cast<int>(l.size(1)) == H && static_cast<int>(l.size(2)) == N,
-                    "lse must be [B, H, N]");
-        args.lse_ptr      = l.data_ptr();
-        args.stride_lse_b = static_cast<int>(l.stride(0));
-        args.stride_lse_h = static_cast<int>(l.stride(1));
+        if (is_group) {
+            TORCH_CHECK(l.dim() == 2 && static_cast<int>(l.size(0)) == H &&
+                            static_cast<int>(l.size(1)) == total_q,
+                        "group mode lse must be [H, total_q]");
+            args.lse_ptr      = l.data_ptr();
+            args.stride_lse_b = 0;
+            args.stride_lse_h = static_cast<int>(l.stride(0));
+        } else {
+            TORCH_CHECK(l.dim() == 3 && static_cast<int>(l.size(0)) == B &&
+                            static_cast<int>(l.size(1)) == H &&
+                            static_cast<int>(l.size(2)) == N,
+                        "lse must be [B, H, N]");
+            args.lse_ptr      = l.data_ptr();
+            args.stride_lse_b = static_cast<int>(l.stride(0));
+            args.stride_lse_h = static_cast<int>(l.stride(1));
+        }
     }
 
     // Attention sinks: one fp32 logit per QUERY head, [H], unit stride. Only the
@@ -123,7 +199,7 @@ void launch_d128(at::Tensor& q,
 
     HipDeviceGuard guard(q.device().index());
     TORCH_CHECK(fmha_fwd_bf16_opus_launch(args, at::hip::getCurrentHIPStream()),
-                "OPUS D=128: the launcher rejected this shape");
+                "OPUS symmetric D=", D, ": the launcher rejected this shape");
 }
 
 // ─── D_QK=192 / D_V=128 (asymmetric) launch — batch + group (varlen). ───
@@ -305,12 +381,11 @@ void fmha_fwd_bf16_opus_fwd(at::Tensor& q,
 
     const int D_QK = static_cast<int>(q.size(-1));
     const int D_V  = static_cast<int>(v.size(-1));
-    const bool is_group = seqstart_q.has_value() && seqstart_q->numel() > 0;
 
     if (D_QK == D_V && (D_QK == 64 || D_QK == 128)) {
-        TORCH_CHECK(!is_group, "OPUS symmetric D=", D_QK,
-                    " kernel supports batch mode only (no varlen)");
-        launch_d128(q, k, v, out, causal, softmax_scale, lse, sink);
+        launch_d128(q, k, v, out, causal, softmax_scale, lse, sink,
+                    seqstart_q, seqstart_k, seqstart_q_pad, seqstart_k_pad,
+                    max_seqlen_q, max_seqlen_k);
     } else if (D_QK == 192 && D_V == 128) {
         TORCH_CHECK(!sink.has_value(),
                     "OPUS D_QK=192/D_V=128 kernel does not support attention sinks");

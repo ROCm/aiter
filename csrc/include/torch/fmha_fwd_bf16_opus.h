@@ -3,7 +3,7 @@
 //
 // Shared public API for the OPUS gfx950 bf16 flash-attention forward kernels.
 // A single entry point dispatches (by head dim, inferred from the tensors) to:
-//   * the symmetric  D_QK=128 / D_V=128 kernel (gqa_d128_kernel), batch mode only, or
+//   * the symmetric  D_QK = D_V in {64, 128} kernel (gqa_d128_kernel), batch + group, or
 //   * the asymmetric D_QK=192 / D_V=128 kernel (gqa_d192_v128_kernel), batch + group.
 //
 // This replaces the former per-hd `fmha_fwd_hd128_bf16_opus_fwd`. The kernel/launch
@@ -19,8 +19,8 @@
 //   Group mode  : q [total_q, H, D_QK]  k [total_k, H_KV, D_QK]  v [total_k, H_KV, D_V]
 //                 out [total_q, H, D_V]   (packed / varlen; group = num sequences)
 //
-// Supported head dims: (D_QK, D_V) in {(128,128), (192,128)}. Group mode requires
-// (192,128) (the D=128 kernel is batch only).
+// Supported head dims: (D_QK, D_V) in {(64,64), (128,128), (192,128)}. Every one of them
+// supports batch and group mode; only the symmetric kernels accept `sink`.
 //
 // `causal` selects the causal mask (bottom-right aligned when seqlen_q != seqlen_kv).
 // `softmax_scale` is applied to Q·K^T internally (pass <= 0 for the default 1/sqrt(D_QK)).
