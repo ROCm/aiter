@@ -132,13 +132,21 @@ def _gfx950_gluon_supported(params: _UAParams):
     cache. One predicate for all three gates: the arch ships a single kernel,
     so the 2d and 3d paths accept exactly the same shapes.
     """
+    # A shuffled tile is exactly one page, and the PV dot reduces over the tile,
+    # so the page must be a power of 2 and at least the MFMA's K width.
+    if params.shuffled_kv_cache and (
+        params.kv_cache_dtype == torch.uint8
+        or params.block_size & (params.block_size - 1)
+        or params.block_size < 64
+    ):
+        return False
+
     return (
         DEVICE_ARCH == "gfx950"
         and _unified_attention_kernel_gfx950 is not None
         and not params.softcap
         and not params.use_qq_bias
         and not params.use_alibi_slopes
-        and not params.shuffled_kv_cache
         and params.head_size <= 256
         and triton.next_power_of_2(params.head_size) == params.head_size
         and params.head_size_v == params.head_size
@@ -973,6 +981,8 @@ def _unified_attention_gfx950(
     """
     BLOCK_Q = BLOCK_M // params.num_queries_per_kv
     assert BLOCK_Q >= 1
+    if params.shuffled_kv_cache:
+        TILE_SIZE = params.block_size
 
     if params.all_decode:
         total_query_blocks = params.num_seqs
@@ -1043,6 +1053,8 @@ def _unified_attention_gfx950(
         # useful for debugging when needed
         REMOVE_INDIRECT_ACCESS=False,
         NUM_BUFFERS=NUM_BUFFERS,
+        SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
+        KV_SHUFFLE_WIDTH=params.k_width,
         NUM_SPLITS=NUM_SEGMENTS,
         partial_m_ptr=partial_m,
         partial_l_ptr=partial_l,

@@ -90,7 +90,35 @@ def _offset_bases_to_blocked(offset_bases, contiguity, num_warps, warp_size, sha
 
 
 @gluon.constexpr_function
-def _make_cdna4_kv_load_layouts(HEAD_SIZE, TILE_SIZE, NUM_WARPS, FP8_KV, WARP_SIZE=64):
+def _swizzled_pair(n0, n1, CONTIGUITY, NUM_WARPS, WARP_SIZE, padding):
+    """Shared + load layout for a tile whose dim0 is the contiguous axis in memory.
+
+    dim0 gets identity bases, dim1 an XOR rotation by the lane bits dim0 leaves
+    over. K always looks like this; so does V once the cache is pre-shuffled,
+    with the two dims swapped.
+    """
+    lg0 = n0.bit_length() - 1
+    lg1 = n1.bit_length() - 1
+    lane0 = lg0 - (CONTIGUITY.bit_length() - 1)
+    bases = [[1 << i, 0] for i in range(lg0)] + [
+        [0, 1 << ((i + lane0) % lg1)] for i in range(lg1)
+    ]
+    shared = gl.PaddedSharedLayout(
+        interval_padding_pairs=[padding],
+        offset_bases=bases,
+        cga_layout=[],
+        shape=[n0, n1],
+    )
+    blocked = _offset_bases_to_blocked(
+        bases, CONTIGUITY, NUM_WARPS, WARP_SIZE, [n0, n1]
+    )
+    return blocked, shared
+
+
+@gluon.constexpr_function
+def _make_cdna4_kv_load_layouts(
+    HEAD_SIZE, TILE_SIZE, NUM_WARPS, FP8_KV, WARP_SIZE=64, SHUFFLED=False
+):
     """
     Build load and shared memory layouts for CDNA4 async KV cache loading.
 
@@ -102,6 +130,19 @@ def _make_cdna4_kv_load_layouts(HEAD_SIZE, TILE_SIZE, NUM_WARPS, FP8_KV, WARP_SI
     """
     # To support different triton versions: use the offset_bases /
     # DistributedLinearLayout path only when async_copy accepts that layout.
+    if SHUFFLED:
+        # The cache already sits in dot-operand order, so LDS needs no swizzle and no
+        # padding: copy the bytes straight in and un-shuffle with a view on read.
+        CONTIGUITY = 16 if FP8_KV else 8
+        flat = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
+        blocked = gl.BlockedLayout(
+            size_per_thread=[1, CONTIGUITY],
+            threads_per_warp=[1, WARP_SIZE],
+            warps_per_cta=[1, NUM_WARPS],
+            order=[1, 0],
+        )
+        return blocked, blocked, flat, flat
+
     if TRITON_BEYOND_37 and ASYNC_COPY_SUPPORTS_DISTRIBUTED:
         CONTIGUITY = 16 if FP8_KV else 8  # elements per 128-bit vector load
         LG2_C = CONTIGUITY.bit_length() - 1
@@ -115,17 +156,16 @@ def _make_cdna4_kv_load_layouts(HEAD_SIZE, TILE_SIZE, NUM_WARPS, FP8_KV, WARP_SI
         ts_lane = LG2_WS - hs_lane  # remaining lane bits for the TILE_SIZE dim
         ts_reg = LG2_TS - ts_lane - LG2_NW  # leftover reg bits for TILE_SIZE dim
 
-        # K shared [HEAD_SIZE, TILE_SIZE]
-        # dim0 (HEAD_SIZE): identity.  dim1 (TILE_SIZE): XOR rotation by hs_lane.
-        k_offset = [[1 << i, 0] for i in range(LG2_HS)] + [
-            [0, 1 << ((i + hs_lane) % LG2_TS)] for i in range(LG2_TS)
-        ]
-
-        shared_k = gl.PaddedSharedLayout(
-            interval_padding_pairs=[[1024, 16] if FP8_KV else [512, 8]],
-            offset_bases=k_offset,
-            cga_layout=[],
-            shape=[HEAD_SIZE, TILE_SIZE],
+        # K shared [HEAD_SIZE, TILE_SIZE]: HEAD_SIZE is the contiguous axis in
+        # both layouts -- plain runs the whole head, shuffled runs K_WIDTH of it
+        # and K_WIDTH == CONTIGUITY -- so one construction covers both.
+        blocked_k, shared_k = _swizzled_pair(
+            HEAD_SIZE,
+            TILE_SIZE,
+            CONTIGUITY,
+            NUM_WARPS,
+            WARP_SIZE,
+            [1024, 16] if FP8_KV else [512, 8],
         )
 
         # V shared [TILE_SIZE, HEAD_SIZE]
@@ -155,9 +195,6 @@ def _make_cdna4_kv_load_layouts(HEAD_SIZE, TILE_SIZE, NUM_WARPS, FP8_KV, WARP_SI
             shape=[TILE_SIZE, HEAD_SIZE],
         )
 
-        blocked_k = _offset_bases_to_blocked(
-            k_offset, CONTIGUITY, NUM_WARPS, WARP_SIZE, [HEAD_SIZE, TILE_SIZE]
-        )
         blocked_v = _offset_bases_to_blocked(
             v_offset, CONTIGUITY, NUM_WARPS, WARP_SIZE, [TILE_SIZE, HEAD_SIZE]
         )
@@ -230,6 +267,8 @@ class AttentionConfig:
     NUM_MASKED_TILES: gl.constexpr
     NUM_BUFFERS: gl.constexpr
     MFMA_DIM: gl.constexpr
+    SHUFFLED_KV_CACHE: gl.constexpr
+    KV_SHUFFLE_WIDTH: gl.constexpr
     # constexpr so the allocated-once vLLM cache strides constant-fold into addressing
     stride_k_cache_0: gl.constexpr
     stride_k_cache_1: gl.constexpr
@@ -263,6 +302,8 @@ class AttentionConfig:
         CAUSAL,
         NUM_BUFFERS,
         MFMA_DIM,
+        SHUFFLED_KV_CACHE,
+        KV_SHUFFLE_WIDTH,
         stride_k_cache_0,
         stride_k_cache_1,
         stride_k_cache_2,
@@ -294,6 +335,8 @@ class AttentionConfig:
         self.NUM_WARPS = gl.constexpr(NUM_WARPS)
         self.DOT_FP8 = gl.constexpr(self.Q_FP8)
         self.MFMA_DIM = gl.constexpr(MFMA_DIM)
+        self.SHUFFLED_KV_CACHE = gl.constexpr(SHUFFLED_KV_CACHE)
+        self.KV_SHUFFLE_WIDTH = gl.constexpr(KV_SHUFFLE_WIDTH)
         # CDNA4 shapes: bf16 32x32x16 / 16x16x32, fp8 32x32x64 / 16x16x128.
         if MFMA_DIM == 32:
             mfma_instr = [32, 32, 16] if not self.DOT_FP8 else [32, 32, 64]
@@ -379,7 +422,12 @@ class AsyncKVLoaderConfig:
     @gluon.constexpr_function
     def __init__(self, cfg, REMOVE_INDIRECT_ACCESS):
         blocked_k, blocked_v, shared_k, shared_v = _make_cdna4_kv_load_layouts(
-            cfg.HEAD_SIZE, cfg.TILE_SIZE, cfg.NUM_WARPS, cfg.KV_FP8, cfg.WARP_SIZE
+            cfg.HEAD_SIZE,
+            cfg.TILE_SIZE,
+            cfg.NUM_WARPS,
+            cfg.KV_FP8,
+            cfg.WARP_SIZE,
+            cfg.SHUFFLED_KV_CACHE,
         )
         self.blocked_k = gl.constexpr(blocked_k)
         self.blocked_v = gl.constexpr(blocked_v)
@@ -435,15 +483,27 @@ class AsyncKVLoader:
         REMOVE_INDIRECT_ACCESS,
     ):
         kv_cfg = AsyncKVLoaderConfig(cfg, REMOVE_INDIRECT_ACCESS)
+        KW: gl.constexpr = cfg.KV_SHUFFLE_WIDTH
+        if cfg.SHUFFLED_KV_CACHE:
+            # HBM order, so a tile is one contiguous run; read un-shuffles by view.
+            k_shape: gl.constexpr = [
+                cfg.NUM_BUFFERS,
+                cfg.HEAD_SIZE // KW,
+                cfg.TILE_SIZE * KW,
+            ]
+            v_shape: gl.constexpr = [
+                cfg.NUM_BUFFERS,
+                cfg.TILE_SIZE // KW,
+                cfg.HEAD_SIZE * KW,
+            ]
+        else:
+            k_shape: gl.constexpr = [cfg.NUM_BUFFERS, cfg.HEAD_SIZE, cfg.TILE_SIZE]
+            v_shape: gl.constexpr = [cfg.NUM_BUFFERS, cfg.TILE_SIZE, cfg.HEAD_SIZE]
         k_shared = gl.allocate_shared_memory(
-            key_cache_ptr.type.element_ty,
-            [cfg.NUM_BUFFERS, cfg.HEAD_SIZE, cfg.TILE_SIZE],
-            layout=kv_cfg.shared_k_layout,
+            key_cache_ptr.type.element_ty, k_shape, layout=kv_cfg.shared_k_layout
         )
         v_shared = gl.allocate_shared_memory(
-            value_cache_ptr.type.element_ty,
-            [cfg.NUM_BUFFERS, cfg.TILE_SIZE, cfg.HEAD_SIZE],
-            layout=kv_cfg.shared_v_layout,
+            value_cache_ptr.type.element_ty, v_shape, layout=kv_cfg.shared_v_layout
         )
 
         # Precompute KV load offsets (constant across tiles)
@@ -453,11 +513,26 @@ class AsyncKVLoader:
         offs_n_k = gl.arange(
             0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, kv_cfg.blocked_k)
         )[None, :]
-        k_base_offset = (
-            kv_head_idx * cfg.stride_k_cache_2
-            + offs_d_k * cfg.stride_k_cache_3
-            + offs_n_k * cfg.stride_k_cache_1
-        )
+        if cfg.SHUFFLED_KV_CACHE:
+            # [.., HEAD_SIZE // W, TILE_SIZE, W]: row i is stride_k_cache_2 apart,
+            # and within a row the shuffled bytes are already consecutive.
+            rows_k = gl.arange(
+                0, cfg.HEAD_SIZE // KW, layout=gl.SliceLayout(1, kv_cfg.blocked_k)
+            )[:, None]
+            cols_k = gl.arange(
+                0, cfg.TILE_SIZE * KW, layout=gl.SliceLayout(0, kv_cfg.blocked_k)
+            )[None, :]
+            k_base_offset = (
+                kv_head_idx * cfg.stride_k_cache_1
+                + rows_k * cfg.stride_k_cache_2
+                + cols_k
+            )
+        else:
+            k_base_offset = (
+                kv_head_idx * cfg.stride_k_cache_2
+                + offs_d_k * cfg.stride_k_cache_3
+                + offs_n_k * cfg.stride_k_cache_1
+            )
 
         offs_d_v = gl.arange(
             0, cfg.HEAD_SIZE, layout=gl.SliceLayout(0, kv_cfg.blocked_v)
@@ -465,11 +540,24 @@ class AsyncKVLoader:
         offs_n_v = gl.arange(
             0, cfg.TILE_SIZE, layout=gl.SliceLayout(1, kv_cfg.blocked_v)
         )[:, None]
-        v_base_offset = (
-            kv_head_idx * cfg.stride_v_cache_2
-            + offs_d_v * cfg.stride_v_cache_3
-            + offs_n_v * cfg.stride_v_cache_1
-        )
+        if cfg.SHUFFLED_KV_CACHE:
+            rows_v = gl.arange(
+                0, cfg.TILE_SIZE // KW, layout=gl.SliceLayout(1, kv_cfg.blocked_v)
+            )[:, None]
+            cols_v = gl.arange(
+                0, cfg.HEAD_SIZE * KW, layout=gl.SliceLayout(0, kv_cfg.blocked_v)
+            )[None, :]
+            v_base_offset = (
+                kv_head_idx * cfg.stride_v_cache_1
+                + rows_v * cfg.stride_v_cache_2
+                + cols_v
+            )
+        else:
+            v_base_offset = (
+                kv_head_idx * cfg.stride_v_cache_2
+                + offs_d_v * cfg.stride_v_cache_3
+                + offs_n_v * cfg.stride_v_cache_1
+            )
 
         return AsyncKVLoader(
             cfg,
@@ -520,6 +608,34 @@ class AsyncKVLoader:
         gl.amd.cdna4.async_copy.commit_group()
 
     @gluon.jit
+    def k_tile(self, buffer_id):
+        # [HEAD_SIZE // W, TILE_SIZE * W] -> [HEAD_SIZE, TILE_SIZE]
+        KW: gl.constexpr = self.cfg.KV_SHUFFLE_WIDTH
+        if self.cfg.SHUFFLED_KV_CACHE:
+            return (
+                self.k_shared.index(buffer_id)
+                .reshape((self.cfg.HEAD_SIZE // KW, self.cfg.TILE_SIZE, KW))
+                .permute((0, 2, 1))
+                .reshape((self.cfg.HEAD_SIZE, self.cfg.TILE_SIZE))
+            )
+        else:
+            return self.k_shared.index(buffer_id)
+
+    @gluon.jit
+    def v_tile(self, buffer_id):
+        # [TILE_SIZE // W, HEAD_SIZE * W] -> [TILE_SIZE, HEAD_SIZE]
+        KW: gl.constexpr = self.cfg.KV_SHUFFLE_WIDTH
+        if self.cfg.SHUFFLED_KV_CACHE:
+            return (
+                self.v_shared.index(buffer_id)
+                .reshape((self.cfg.TILE_SIZE // KW, self.cfg.HEAD_SIZE, KW))
+                .permute((0, 2, 1))
+                .reshape((self.cfg.TILE_SIZE, self.cfg.HEAD_SIZE))
+            )
+        else:
+            return self.v_shared.index(buffer_id)
+
+    @gluon.jit
     def load_k_from_shared(
         self,
         wait_count,
@@ -534,10 +650,10 @@ class AsyncKVLoader:
         # keep the partial vmcnt that a plain .load() widens to vmcnt(0)
         if self.cfg.NUM_WARPS == 1 or RELAXED:
             raw = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                self.k_shared.index(buffer_id), self.cfg.k_layout
+                self.k_tile(buffer_id), self.cfg.k_layout
             )
         else:
-            raw = self.k_shared.index(buffer_id).load(layout=self.cfg.k_layout)
+            raw = self.k_tile(buffer_id).load(layout=self.cfg.k_layout)
         return raw.to(target_dtype)
 
     @gluon.jit
@@ -555,10 +671,10 @@ class AsyncKVLoader:
         # keep the partial vmcnt that a plain .load() widens to vmcnt(0)
         if self.cfg.NUM_WARPS == 1 or RELAXED:
             raw = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                self.v_shared.index(buffer_id), self.cfg.v_layout
+                self.v_tile(buffer_id), self.cfg.v_layout
             )
         else:
-            raw = self.v_shared.index(buffer_id).load(layout=self.cfg.v_layout)
+            raw = self.v_tile(buffer_id).load(layout=self.cfg.v_layout)
         return raw.to(target_dtype)
 
     @gluon.jit
@@ -1440,6 +1556,8 @@ def _unified_attention_gluon_kernel(
     REMOVE_INDIRECT_ACCESS: gl.constexpr = False,
     NUM_BUFFERS: gl.constexpr = 2,
     MFMA_DIM: gl.constexpr = 32,
+    SHUFFLED_KV_CACHE: gl.constexpr = False,
+    KV_SHUFFLE_WIDTH: gl.constexpr = 0,
     # Split-KV (3d grid)
     NUM_SPLITS: gl.constexpr = 1,
     partial_m_ptr=None,  # [num_tokens, num_query_heads, NUM_SPLITS]
@@ -1478,6 +1596,8 @@ def _unified_attention_gluon_kernel(
         CAUSAL,
         NUM_BUFFERS,
         MFMA_DIM,
+        SHUFFLED_KV_CACHE,
+        KV_SHUFFLE_WIDTH,
         stride_k_cache_0,
         stride_k_cache_1,
         stride_k_cache_2,
@@ -1590,6 +1710,10 @@ def _unified_attention_gluon_kernel(
     if NUM_SPLITS > 1 and pgm.tile_start >= pgm.tile_end:
         return
 
+    gl.static_assert(
+        (not SHUFFLED_KV_CACHE) | (TILE_SIZE == BLOCK_SIZE),
+        "a pre-shuffled tile is exactly one page, so TILE_SIZE must equal BLOCK_SIZE",
+    )
     # TILE_SIZE == BLOCK_SIZE: one page per tile (fast path). Otherwise gather
     if TILE_SIZE == BLOCK_SIZE:
         KVLoader: gl.constexpr = AsyncKVLoader

@@ -614,6 +614,7 @@ def test_triton_unified_attn(
             head_size=head_size,
             head_size_v=head_size,
             shuffled_kv_cache=shuffled_kv_cache,
+            block_size=block_size,
         ),
         backend,
     )
