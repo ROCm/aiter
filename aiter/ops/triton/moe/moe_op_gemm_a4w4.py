@@ -568,6 +568,21 @@ def moe_gemm_a4w4(
         clamp_bounds = (K % config["block_k"] != 0) or (
             triton.cdiv(K, config["block_k"]) < config["num_buffers"]
         )
+        XS_SLAB_MAX_BYTES = 32 * 1024
+        xs_slab_cols = triton.next_power_of_2(
+            triton.cdiv(K, MXFP4_QUANT_BLOCK_SIZE)
+        )
+        x_scales_preload = (
+            not clamp_bounds
+            and config["block_m"] <= 32
+            and K > 1024
+            and config["block_m"] * (config["block_k"] // MXFP4_QUANT_BLOCK_SIZE)
+            <= 256
+            and config["block_m"] * xs_slab_cols <= XS_SLAB_MAX_BYTES
+            and config["num_ctas"] == 1
+        )
+        if not x_scales_preload:
+            xs_slab_cols = 0
         # launch gluon kernel
         _moe_gemm_a4w4_prefill[(grid,)](
             y_ptr,
@@ -616,6 +631,8 @@ def moe_gemm_a4w4(
             UPCAST_INDICES=should_upcast_indices(x, w, y_ptr),
             X_SCALES_TDM=x_scales_tdm,
             CLAMP_BOUNDS=clamp_bounds,
+            PRELOAD_X_SCALES=x_scales_preload,
+            XS_SLAB_COLS=xs_slab_cols,
             **layouts,
             YMxScale=y_scale,
             stride_y_mx_m=stride_y_mx_m,
