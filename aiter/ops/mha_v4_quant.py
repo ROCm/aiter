@@ -113,6 +113,15 @@ def rotate_activation_mxfp4_quant_k(
     """Apply hd128 Walsh-Hadamard rotation and pack K in the MXFP4 ASM tile order."""
 
 
+@compile_ops("module_fmha_v4_fwd", develop=True)
+def _quantize_v_mxfp4_fp6_p_hip(
+    out: Tensor,
+    scale: Tensor,
+    input: Tensor,
+) -> None:
+    """Pack MXFP4 V in the contraction order required by an FP6 P operand."""
+
+
 def _validate_bshd_hd128(input: Tensor, operation: str) -> tuple[int, int, int, int]:
     if input.dim() != 4 or input.shape[-1] != 128 or not input.is_contiguous():
         raise ValueError(f"{operation} requires contiguous hd128 BSHD input")
@@ -468,6 +477,28 @@ def _quantize_v_mxfp4_raw_fake(input: Tensor) -> tuple[Tensor, Tensor]:
     ), input.new_empty(
         (batch, heads, tiles * MHA_V4_MXFP4_V_SCALE_TILE_BYTES), dtype=torch.uint8
     )
+
+
+@torch.library.custom_op("aiter::mha_v4_quantize_v_mxfp4_fp6_p_raw", mutates_args=())
+def quantize_v_mxfp4_fp6_p(input: Tensor) -> tuple[Tensor, Tensor]:
+    """Pack MXFP4 V in the token order consumed by the FP6-P F4F4 kernel."""
+    batch, sequence, heads, _ = _validate_bshd_hd128(
+        input, "MXFP4 V-for-FP6-P quantization"
+    )
+    tiles = mxfp4_v_tiles(sequence)
+    raw = input.new_empty(
+        (mxfp4_v_raw_buffer_size(batch, sequence, heads),), dtype=torch.uint8
+    )
+    scale = input.new_empty(
+        (batch, heads, tiles * MHA_V4_MXFP4_V_SCALE_TILE_BYTES), dtype=torch.uint8
+    )
+    _quantize_v_mxfp4_fp6_p_hip(raw, scale, input)
+    return raw, scale
+
+
+@quantize_v_mxfp4_fp6_p.register_fake
+def _quantize_v_mxfp4_fp6_p_raw_fake(input: Tensor) -> tuple[Tensor, Tensor]:
+    return _quantize_v_mxfp4_raw_fake(input)
 
 
 @torch.library.custom_op("aiter::mha_v4_quantize_v_mxfp6", mutates_args=())

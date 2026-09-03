@@ -40,6 +40,7 @@ from aiter.ops.mha_v4_quant import (
     quantize_mxfp8_k,
     quantize_mxfp8_q,
     quantize_v_mxfp4,
+    quantize_v_mxfp4_fp6_p,
     quantize_v_mxfp6,
     quantize_v_mxfp6_fp6_p,
     rotate_activation_hd128,
@@ -652,6 +653,7 @@ def test_mha_v4_mxfp4_fp6_p_pack_matches_permuted_canonical(sequence):
     )
 
     raw, scale = pack_v_mxfp4_colmajor_fp6_p_raw(value)
+    production_raw, production_scale = quantize_v_mxfp4_fp6_p(value)
     compiled_raw, compiled_scale = torch.compile(
         pack_v_mxfp4_colmajor_fp6_p_raw, fullgraph=True
     )(value)
@@ -661,6 +663,8 @@ def test_mha_v4_mxfp4_fp6_p_pack_matches_permuted_canonical(sequence):
 
     assert torch.equal(raw, expected_raw)
     assert torch.equal(scale, expected_scale)
+    assert torch.equal(production_raw, expected_raw)
+    assert torch.equal(production_scale, expected_scale)
     assert torch.equal(compiled_raw, expected_raw)
     assert torch.equal(compiled_scale, expected_scale)
 
@@ -1505,6 +1509,28 @@ def _assert_sparse_matches_dense(sparse, dense, message=None):
     )
     assert cosine > 0.99, message
     assert torch.isfinite(sparse).all()
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MX sparse")
+@pytest.mark.skipif(
+    not _mha_v4_sparse_co_available(),
+    reason="sorted-sparse MHA v4 code object is not deployed",
+)
+def test_mha_v4_f4f4_sparse_all_true_mask_matches_dense():
+    """Retained FP8-P sparse F4F4 remains close to dense FP6-P on an all-true mask."""
+    torch.manual_seed(41)
+    q = torch.randn((1, 511, 5, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 512, 5, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    mask = torch.ones(
+        (1, 5, 2, 512 // mha_v4_kv_tile()), device="cuda", dtype=torch.bool
+    )
+    args = (AttentionFormat.MXFP4,) * 3
+    dense = mha_v4(q, k, v, *args)
+    sparse = mha_v4(q, k, v, *args, block_mask=mask)
+    torch.cuda.synchronize()
+
+    _assert_sparse_matches_dense(sparse, dense)
 
 
 @pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 sparse validation")

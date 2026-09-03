@@ -38,6 +38,7 @@ from aiter.ops.mha_v4_quant import (
     quantize_mxfp8_q,
     quantize_v_fp8,
     quantize_v_mxfp4,
+    quantize_v_mxfp4_fp6_p,
     quantize_v_mxfp6,
     quantize_v_mxfp6_fp6_p,
     rotate_activation_hd128,
@@ -70,6 +71,7 @@ __all__ = (
     "quantize_mxfp8_q",
     "quantize_v_fp8",
     "quantize_v_mxfp4",
+    "quantize_v_mxfp4_fp6_p",
     "quantize_v_mxfp6",
     "quantize_v_mxfp6_fp6_p",
     "rotate_activation_hd128",
@@ -789,7 +791,7 @@ def mha_v4_packed(
 
 
 @torch.library.custom_op(
-    "aiter::mha_v4_launch_mxfp4_coalesced_v2", mutates_args=("out",)
+    "aiter::mha_v4_launch_mxfp4_coalesced_v3", mutates_args=("out",)
 )
 def _launch_mxfp4_coalesced(
     q: Tensor,
@@ -800,9 +802,11 @@ def _launch_mxfp4_coalesced(
     v_descale: Tensor,
     out: Tensor,
     v_format: int,
+    v_pack: int,
     softmax_scale: float,
 ) -> None:
     resolved_v_format = AttentionFormat(v_format)
+    resolved_v_pack = AttentionPack(v_pack)
     k = mxfp4_k_view(k_data, k_descale)
     v = (
         v_data
@@ -827,6 +831,7 @@ def _launch_mxfp4_coalesced(
         *scale_modes,
         softmax_scale=softmax_scale,
         out=out,
+        v_pack=resolved_v_pack,
     )
 
 
@@ -840,9 +845,10 @@ def _launch_mxfp4_coalesced_fake(
     v_descale: Tensor,
     out: Tensor,
     v_format: int,
+    v_pack: int,
     softmax_scale: float,
 ) -> None:
-    del q, q_descale, k_data, k_descale, v_data, v_descale, v_format, softmax_scale
+    del q, q_descale, k_data, k_descale, v_data, v_descale, v_format, v_pack, softmax_scale
     del out
 
 
@@ -1072,6 +1078,9 @@ def mha_v4(
         k_quantized, k_descale = quantize_mxfp4_k(k)
         if _is_fp8_format(v_format):
             v_quantized, v_descale = quantize_v_fp8(v)
+        elif lut_indices is None:
+            v_quantized, v_descale = quantize_v_mxfp4_fp6_p(v)
+            v_pack = AttentionPack.V_FOR_FP6_P
         else:
             v_quantized, v_descale = quantize_v_mxfp4(v)
         if lut_indices is None:
@@ -1084,6 +1093,7 @@ def mha_v4(
                 v_descale,
                 out,
                 int(v_format),
+                int(v_pack),
                 softmax_scale,
             )
             return out
@@ -1109,6 +1119,7 @@ def mha_v4(
             softmax_scale=softmax_scale,
             out=out,
             return_lse=return_lse,
+            v_pack=v_pack,
             **packed_lut,
         )
     elif q_format == AttentionFormat.MXFP6 and v_format in (
