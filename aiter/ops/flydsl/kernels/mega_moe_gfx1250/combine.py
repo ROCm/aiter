@@ -46,13 +46,10 @@ from .config import (
 
 # MX combine wire format, mirrored from the gemm2 scatter epilogue: a slot is a
 # payload plane of hidden fp8 (or half that many fp4) bytes followed by a scale
-# plane of hidden/32 e8m0 bytes. Interleaving them per chunk instead would need every chunk padded to a
-# cache line to keep payload and scale one interval, and that pad was a third of
-# the wire. See EP_SCALE_BLOCK in mxfp4_preshuffle_gfx1250_tdm.py; keep the two in
-# sync.
+# plane of hidden/32 e8m0 bytes. Keep in sync with EP_SCALE_BLOCK in
+# mxfp4_preshuffle_gfx1250_tdm.py.
 #
-# CHUNK_ELEMS is this kernel's own tile unit -- the elements one lane-slot group
-# covers -- and no longer a structure the wire knows about.
+# CHUNK_ELEMS is this kernel's own lane-tile unit, not a wire structure.
 CHUNK_ELEMS = 256
 SCALE_BLOCK = 32
 # Elements each lane reduces per round. On the MXFP8 wire 16 fp8 sit inside one
@@ -114,6 +111,10 @@ def _make_combine_fused_sync(
                 window.lsa_ptr(my_lsa_rank, off_xdb_mem)
             ) + fx.Int64(tid) * fx.Int64(8)
             comm_ops.spin_until_ge_i64(xdb_peer_slot, phase)
+        # The spin above is a relaxed load, so nothing invalidates this rank's
+        # stale comb_inp lines from the previous forward. Pair the peers'
+        # system-scope release stores with an acquire here.
+        comm_ops.fence_system_acquire()
 
     @flyc.jit
     def run(
@@ -167,17 +168,7 @@ def _make_combine_fused_reduce(
 
     On an MX wire ``chunks_per_iter`` wants to cover as much of the hidden dim as
     it can: the scale plane contributes only C*8 bytes to a row, and anything
-    under a cache line makes the second load fetch lines it mostly discards,
-    giving back what dropping the interleave pad won.
-
-    Staging beats reading the slots straight to registers on both wires, which
-    is why the bf16 path lives here too. It used to have its own kernel that had
-    each warp pull its topk slots in with non-temporal ``global_load_dwordx4``
-    and never touched LDS; that measured 110.6us against this one's 102.3 at 16k
-    tokens/rank (14.91 vs 16.11 TB/s) and 6.60 vs 6.46 at 512. The DMA engine
-    keeps more of the strided wire in flight than per-lane loads do, and the LDS
-    round trip it costs is cheap next to that. Both sum in the same order, so
-    the switch left ``logits_diff`` identical to every printed digit.
+    under a cache line makes the second load fetch lines it mostly discards.
     """
     topk = experts_per_token
     lanes = warp_num_per_block * WAVE
@@ -215,14 +206,8 @@ def _make_combine_fused_reduce(
     # Two tiles on both sides, so at any point the next trip's load and the
     # previous trip's store are in flight across this trip's dequantize. A single
     # output tile exposes the store latency instead: the wait that frees the tile
-    # has to retire the store issued one line earlier.
-    #
-    # One trip of prefetch is the measured sweet spot. Going to two (three tiles
-    # a side, wait 4) buys 0.7us of 88.8 at 16k tokens/rank and loses 0.07us at
-    # 512, not worth taking the tile from 88KB to 132KB -- 2 blocks/CU would then
-    # need 264KB of the 320KB a workgroup has. Three does not fit at all. The
-    # reduce already runs at 66% of HBM peak, so there is little latency left for
-    # a deeper pipeline to hide.
+    # has to retire the store issued one line earlier. One trip of prefetch is
+    # the measured sweet spot; a third tile a side does not fit the budget below.
     IN_BUFS = 2
     OUT_BUFS = 2
     IN_TILE_BYTES = IN_ROWS * (P_ROW_BYTES + S_ROW_BYTES)
@@ -249,11 +234,10 @@ def _make_combine_fused_reduce(
         vector operand), or the single dword holding 8 fp4 e2m1 (the fp4 op
         takes a scalar one).
 
-        The scale is applied here rather than by the instruction. Letting the HW
-        fold in the e8m0 (passing it as the scale operand instead of 127) costs
-        an extra ~27x of error -- 61-layer logits_diff 0.618 vs 0.068, where the
-        MXFP8 wire format alone only accounts for 0.070 -- so the conversion is
-        run unscaled and the exact power of two is multiplied in afterwards.
+        The scale is applied here rather than by the instruction: folding the
+        e8m0 into the HW scale operand instead of 127 costs ~27x the error
+        (61-layer logits_diff 0.618 vs 0.068), so the conversion runs unscaled
+        and the exact power of two is multiplied in afterwards.
         """
         if quant_bits == 8:
             unscaled = cvt_scale_pk8_f32_fp8(
