@@ -14,16 +14,6 @@ void opus_gemm_a16w16_launch(aiter_tensor_t& XQ,
                              int kid,
                              int split_k);
 
-// Production A16W16 C ABI. Optional tensors use nullptr; stream is caller-owned.
-AITER_C_ITFS int opus_gemm_a16w16_launch_cabi(aiter_tensor_t* XQ,
-                                              aiter_tensor_t* WQ,
-                                              aiter_tensor_t* Y,
-                                              aiter_tensor_t* bias,
-                                              aiter_tensor_t* workspace,
-                                              int64_t kid,
-                                              int64_t split_k,
-                                              hipStream_t stream);
-
 void opus_gemm_a8w8_launch(aiter_tensor_t& XQ,
                            aiter_tensor_t& WQ,
                            aiter_tensor_t& Y,

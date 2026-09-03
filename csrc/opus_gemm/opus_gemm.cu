@@ -18,51 +18,8 @@
 #include "opus_gemm_common.cuh"
 #include "opus_gemm_manifest.h"                    // a8w8 launcher symbols
 #include "opus_gemm_utils.cuh"                     // bf16_t / fp32_t
-#include "aiter_stream.h"                          // aiter::getCurrentHIPStream
-#include "aiter_ctypes_error.h"                    // safe exported C ABI
 
-#include <cstdint>
-#include <limits>
 #include <optional>
-
-AITER_CTYPES_ERROR_DEF
-
-namespace
-{
-class OpusCabiDeviceStreamGuard
-{
-public:
-  OpusCabiDeviceStreamGuard(int device, hipStream_t stream)
-      : previous_stream_(aiter::getCurrentHIPStream())
-  {
-    HIP_CALL(hipGetDevice(&previous_device_));
-    if (previous_device_ != device)
-    {
-      HIP_CALL(hipSetDevice(device));
-      restore_device_ = true;
-    }
-    aiter::setCurrentHIPStream(stream);
-  }
-
-  ~OpusCabiDeviceStreamGuard() noexcept
-  {
-    aiter::setCurrentHIPStream(previous_stream_);
-    if (restore_device_)
-    {
-      // Never throw while restoring state across the C ABI.
-      (void)hipSetDevice(previous_device_);
-    }
-  }
-
-  OpusCabiDeviceStreamGuard(const OpusCabiDeviceStreamGuard&) = delete;
-  OpusCabiDeviceStreamGuard& operator=(const OpusCabiDeviceStreamGuard&) = delete;
-
-private:
-  int previous_device_ = -1;
-  hipStream_t previous_stream_;
-  bool restore_device_ = false;
-};
-} // namespace
 
 #ifndef OPUS_A8W8_DISPATCH_KERNEL_TYPES_DEFINED
 #define OPUS_A8W8_DISPATCH_KERNEL_TYPES_DEFINED
@@ -371,7 +328,6 @@ static void opus_gemm_a16w16_launch_impl(
   }
 }
 
-// A16W16 exact-kid entry used by pybind and the C ABI.
 void opus_gemm_a16w16_launch(
     aiter_tensor_t &XQ,
     aiter_tensor_t &WQ,
@@ -383,50 +339,6 @@ void opus_gemm_a16w16_launch(
 {
   opus_gemm_a16w16_launch_impl(
       XQ, WQ, Y, bias, workspace, kid, split_k);
-}
-
-AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
-    opus_gemm_a16w16_launch_cabi,
-    (aiter_tensor_t* XQ,
-     aiter_tensor_t* WQ,
-     aiter_tensor_t* Y,
-     aiter_tensor_t* bias,
-     aiter_tensor_t* workspace,
-     int64_t kid,
-     int64_t split_k,
-     hipStream_t stream),
-    (XQ, WQ, Y, bias, workspace, kid, split_k, stream))
-{
-  AITER_CHECK(XQ != nullptr,
-              "opus_gemm_a16w16_launch_cabi: XQ must not be null");
-  AITER_CHECK(WQ != nullptr,
-              "opus_gemm_a16w16_launch_cabi: WQ must not be null");
-  AITER_CHECK(Y != nullptr,
-              "opus_gemm_a16w16_launch_cabi: Y must not be null");
-  AITER_CHECK(kid >= static_cast<int64_t>(std::numeric_limits<int>::min())
-                  && kid <= static_cast<int64_t>(std::numeric_limits<int>::max()),
-              "opus_gemm_a16w16_launch_cabi: kid is outside the C++ int range: ",
-              kid);
-  AITER_CHECK(split_k >= static_cast<int64_t>(std::numeric_limits<int>::min())
-                  && split_k <= static_cast<int64_t>(std::numeric_limits<int>::max()),
-              "opus_gemm_a16w16_launch_cabi: split_k is outside the C++ int range: ",
-              split_k);
-
-  const std::optional<aiter_tensor_t> optional_bias =
-      bias == nullptr ? std::nullopt
-                      : std::optional<aiter_tensor_t>{*bias};
-  const std::optional<aiter_tensor_t> optional_workspace =
-      workspace == nullptr ? std::nullopt
-                           : std::optional<aiter_tensor_t>{*workspace};
-  const OpusCabiDeviceStreamGuard device_stream_guard(XQ->device_id, stream);
-  opus_gemm_a16w16_launch(
-      *XQ,
-      *WQ,
-      *Y,
-      optional_bias,
-      optional_workspace,
-      static_cast<int>(kid),
-      static_cast<int>(split_k));
 }
 
 static void opus_check_a8_family_tensors(

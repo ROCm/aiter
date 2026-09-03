@@ -181,13 +181,6 @@ def _launch_a8w8_backend(
     kid: int,
     split_k: int,
 ) -> None:
-    """Launch one resolved physical A8W8 ABI through its pybind binding.
-
-    A8W8 currently has no stable C ABI, so unlike the A16W16 backend this
-    facade does not prime pybind and switch to ctypes.  It is nevertheless the
-    single low-level entry used by all A8 adapters, keeping raw binding choice
-    out of shape, registry and workspace policy.
-    """
     if family == _A8W8_FAMILY:
         if x_scale is not None or w_scale is not None:
             raise RuntimeError("A8W8 no-scale backend received scale tensors")

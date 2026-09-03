@@ -226,13 +226,6 @@ compiles against.
 
 ## Dispatch
 
-Both tags are ordinary non-workspace members of the canonical A16W16 registry.
-Python resolves a tuned CSV row or explicit request to one exact kid, validates
-its BF16/no-bias/no-workspace/no-split-K contract, and passes that id through the
-unified A16 C ABI. The generated gfx1250 BF16 direct table maps the id to the
-five-argument host launcher above; the FP32 and workspace tables contain no CO
-entries. There is no CO-specific C++ `(M,N,K)` table or heuristic header.
-
 The launcher then loads the image whose filename and ELF symbol equal the
 registered instance name. Because no allocator or reducer belongs to this
 family, C++ never performs `hipMalloc`, synchronization, or `hipFree` for a CO

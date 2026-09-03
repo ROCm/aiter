@@ -2,17 +2,11 @@
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 """A16W16 exact launch, Torch workspace, and shape-driven compatibility."""
 
-import ctypes
-from functools import lru_cache, wraps
-from threading import local
-
 import torch
 
 from csrc.opus_gemm.opus_gemm_common import OpusGemmInstance
 
-from ...jit.core import compile_ops, get_module
-from ...jit.utils.torch_guard import torch_compile_guard
-from ...utility.dtypes import _aiter_dtype_id, aiter_tensor_t
+from ...jit.core import compile_ops
 from ._arch import _device_arch_and_cu
 from .launch_plan import _get_cached_a16w16_launch_plan
 
@@ -48,209 +42,6 @@ def _opus_gemm_a16w16_launch_raw(
 ) -> torch.Tensor: ...
 
 
-# Keep pybind for the normal JIT build and A/B.  The small OPUS-local ctypes
-# adapter below reuses that mixed module without changing aiter.jit.core.
-
-_OPUS_A16W16_MODULE = "module_deepgemm_opus"
-_opus_a16w16_cabi_primed = False
-_NULL_AITER_TENSOR = ctypes.POINTER(aiter_tensor_t)()
-_RAW_CURRENT_STREAM = getattr(torch._C, "_cuda_getCurrentRawStream", None)
-_TORCH_IS_COMPILING = torch.compiler.is_compiling
-
-
-class _OpusA16DescriptorPool(local):
-    def __init__(self) -> None:
-        self.xq = aiter_tensor_t()
-        self.wq = aiter_tensor_t()
-        self.y = aiter_tensor_t()
-        self.bias = aiter_tensor_t()
-        self.workspace = aiter_tensor_t()
-
-
-_OPUS_A16_DESCRIPTOR_POOL = _OpusA16DescriptorPool()
-
-
-def _fill_aiter_tensor_descriptor(
-    tensor: torch.Tensor, out: aiter_tensor_t
-) -> aiter_tensor_t:
-    """Refresh one OPUS-local reusable C descriptor without allocating it."""
-    shape = tensor.shape
-    strides = tensor.stride()
-    ndim = len(shape)
-    assert ndim <= 8, f"aiter_tensor_t supports at most 8 dims, got {ndim}"
-    out.ptr = tensor.data_ptr()
-    out.numel_ = tensor.numel()
-    out.ndim = ndim
-    out.shape[:ndim] = shape
-    out.strides[:ndim] = strides
-    out.dtype_ = _aiter_dtype_id(tensor.dtype)
-    # get_device() returns the ordinal directly and -1 for a CPU tensor.  It
-    # avoids materializing tensor.device on every hot-path descriptor refresh.
-    out.device_id = tensor.get_device()
-    return out
-
-
-@lru_cache(maxsize=1)
-def _load_opus_a16w16_cabi():
-    """Load the already-built mixed OPUS module's private A16 C ABI."""
-    module = get_module(_OPUS_A16W16_MODULE)
-    module_path = module.__file__
-    if not module_path:
-        raise RuntimeError(
-            f"{_OPUS_A16W16_MODULE} has no shared-library path for its C ABI"
-        )
-
-    library = ctypes.CDLL(module_path)
-    launch = library.opus_gemm_a16w16_launch_cabi
-    tensor_ptr = ctypes.POINTER(aiter_tensor_t)
-    launch.argtypes = [
-        tensor_ptr,
-        tensor_ptr,
-        tensor_ptr,
-        tensor_ptr,
-        tensor_ptr,
-        ctypes.c_int64,
-        ctypes.c_int64,
-        ctypes.c_void_p,
-    ]
-    launch.restype = ctypes.c_int
-
-    abi_version = getattr(library, "aiter_ctypes_abi_version", None)
-    if abi_version is None:
-        raise RuntimeError(
-            f"{_OPUS_A16W16_MODULE} does not export aiter_ctypes_abi_version"
-        )
-    abi_version.argtypes = []
-    abi_version.restype = ctypes.c_int
-    version = abi_version()
-    if version < 2:
-        raise RuntimeError(
-            f"{_OPUS_A16W16_MODULE} has unsupported ctypes ABI version {version}"
-        )
-
-    get_error = library.aiter_get_last_error
-    get_error.argtypes = []
-    get_error.restype = ctypes.c_char_p
-    clear_error = library.aiter_clear_last_error
-    clear_error.argtypes = []
-    clear_error.restype = None
-    return library, launch, get_error, clear_error
-
-
-def _invoke_opus_a16w16_cabi(
-    XQ: torch.Tensor,
-    WQ: torch.Tensor,
-    Y: torch.Tensor,
-    bias: torch.Tensor | None,
-    workspace: torch.Tensor | None,
-    kid: int,
-    split_k: int,
-) -> None:
-    _library, launch, get_error, clear_error = _load_opus_a16w16_cabi()
-    pool = _OPUS_A16_DESCRIPTOR_POOL
-    xq_descriptor = _fill_aiter_tensor_descriptor(XQ, pool.xq)
-    wq_descriptor = _fill_aiter_tensor_descriptor(WQ, pool.wq)
-    y_descriptor = _fill_aiter_tensor_descriptor(Y, pool.y)
-    bias_descriptor = (
-        None if bias is None else _fill_aiter_tensor_descriptor(bias, pool.bias)
-    )
-    workspace_descriptor = (
-        None
-        if workspace is None
-        else _fill_aiter_tensor_descriptor(workspace, pool.workspace)
-    )
-    bias_arg = (
-        _NULL_AITER_TENSOR if bias_descriptor is None else ctypes.byref(bias_descriptor)
-    )
-    workspace_arg = (
-        _NULL_AITER_TENSOR
-        if workspace_descriptor is None
-        else ctypes.byref(workspace_descriptor)
-    )
-
-    device_index = XQ.get_device()
-    stream_handle = (
-        _RAW_CURRENT_STREAM(device_index)
-        if _RAW_CURRENT_STREAM is not None
-        else torch.cuda.current_stream(device_index).cuda_stream
-    )
-    stream = ctypes.c_void_p(stream_handle)
-    status = launch(
-        ctypes.byref(xq_descriptor),
-        ctypes.byref(wq_descriptor),
-        ctypes.byref(y_descriptor),
-        bias_arg,
-        workspace_arg,
-        kid,
-        split_k,
-        stream,
-    )
-    if status != 0:
-        # aiter_safe_call clears the thread-local error before every launch.
-        # Avoid two extra C ABI crossings on the successful hot path and only
-        # retrieve the message when the status reports a failure.
-        raw_error = get_error()
-        message = (
-            raw_error.decode(errors="replace")
-            if raw_error
-            else f"ctypes status={status}"
-        )
-        clear_error()
-        raise RuntimeError(f"opus_gemm_a16w16_launch_cabi failed: {message}")
-
-
-def _gen_a16w16_backend_fake(
-    XQ: torch.Tensor,
-    WQ: torch.Tensor,
-    Y: torch.Tensor,
-    bias: torch.Tensor | None,
-    workspace: torch.Tensor | None,
-    kid: int,
-    split_k: int,
-) -> None:
-    return None
-
-
-def _register_a16w16_backend_op(func):
-    """Use a registered op for compilation and a direct call for eager.
-
-    ``torch_compile_guard`` must remain the Dynamo/FakeTensor boundary, but its
-    eager ``torch.ops`` dispatcher costs a measurable fixed amount on the very
-    short gfx950 split-K kernels.  Manual CUDA graph capture also executes the
-    real call once while capturing, so it needs no dispatcher.  Keep eager and
-    capture on the direct backend body while routing compilation, fake and meta
-    tensors through the registered operator and its fake implementation.
-    """
-    guarded = torch_compile_guard(
-        device="cuda",
-        gen_fake=_gen_a16w16_backend_fake,
-    )(func)
-
-    @wraps(func)
-    def eager_or_compiled(
-        XQ: torch.Tensor,
-        WQ: torch.Tensor,
-        Y: torch.Tensor,
-        bias: torch.Tensor | None,
-        workspace: torch.Tensor | None,
-        kid: int,
-        split_k: int,
-    ) -> None:
-        if (
-            _TORCH_IS_COMPILING()
-            or XQ.is_meta
-            or getattr(XQ, "fake_mode", None) is not None
-        ):
-            return guarded(XQ, WQ, Y, bias, workspace, kid, split_k)
-        return func(XQ, WQ, Y, bias, workspace, kid, split_k)
-
-    # Tests and diagnostics can verify the compile boundary without making the
-    # registered operator part of the public module surface.
-    eager_or_compiled._torch_compile_guarded = guarded
-    return eager_or_compiled
-
-
-@_register_a16w16_backend_op
 def _launch_a16w16_backend(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -260,35 +51,31 @@ def _launch_a16w16_backend(
     kid: int,
     split_k: int,
 ) -> None:
-    """Launch through the unified pybind-primed, C ABI-backed backend.
-
-    The first call uses the existing pybind wrapper so its normal lazy-build,
-    rebuild and architecture checks remain authoritative.  Run that priming
-    launch on the input tensor's device: unlike the C ABI below, the pybind
-    entry does not install its own device guard.  It then loads the C ABI from
-    that same module; subsequent calls use the lower-overhead path.
-    """
-    global _opus_a16w16_cabi_primed
-    if not _opus_a16w16_cabi_primed:
-        # torch.cuda.device restores the caller's current device on both the
-        # success and exception paths.  This is required when XQ lives on a
-        # non-current device, because the generated pybind launcher obtains
-        # its launch stream from the current device's TLS state.
-        with torch.cuda.device(XQ.device):
-            _opus_gemm_a16w16_launch_raw(
-                XQ,
-                WQ,
-                Y,
-                bias,
-                workspace,
-                kid,
-                split_k,
-            )
-            _load_opus_a16w16_cabi()
-        _opus_a16w16_cabi_primed = True
+    if (
+        torch.compiler.is_compiling()
+        or XQ.is_meta
+        or getattr(XQ, "fake_mode", None) is not None
+    ):
+        _opus_gemm_a16w16_launch_raw(
+            XQ,
+            WQ,
+            Y,
+            bias,
+            workspace,
+            kid,
+            split_k,
+        )
         return
-    _invoke_opus_a16w16_cabi(XQ, WQ, Y, bias, workspace, kid, split_k)
-    return
+    with torch.cuda.device(XQ.device):
+        _opus_gemm_a16w16_launch_raw(
+            XQ,
+            WQ,
+            Y,
+            bias,
+            workspace,
+            kid,
+            split_k,
+        )
 
 
 def _check_a16w16_launch_layout(

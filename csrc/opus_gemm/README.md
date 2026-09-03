@@ -83,15 +83,6 @@ void opus_gemm_a8w8_mxscale_bmm_launch(
     int split_k);
 ```
 
-The A16 production path uses the exported status-returning
-`opus_gemm_a16w16_launch_cabi`. Nullable tensors represent optional bias and
-workspace. The caller supplies the live HIP stream. The bridge validates
-integer conversions, switches/restores device and thread-local stream state,
-and reports exceptions through thread-local error text before returning to
-Python. Its small ctypes adapter is local to
-`aiter/ops/opus/gemm_op_a16w16.py`. The pybind A16 entry owns normal lazy JIT
-build and remains private for parity and performance A/B tests.
-
 ## Registry and capability
 
 | Family | gfx942 | gfx950 | gfx1250 |
@@ -148,12 +139,6 @@ deduplicated by generated symbol name rather than entering the ordinary
 per-kid subset. All available gfx1250 CO ids are in the gfx1250 compile floor;
 codegen emits their five-argument host launchers but no device translation
 units. The device bodies come from `gen_co/gfx1250/<symbol>.co`.
-
-The two CO tags (`a16w16_4wave_co` and `a16w16_4wave_wl_co`) use the existing
-BF16 direct exact-kid table. Their contract is BF16 XQ/WQ/Y, no bias, no
-workspace, and `split_k` 0 or 1. The current gfx1250 public shape policy also
-keeps batch at one. Python validates these capabilities before the unchanged
-unified A16 C ABI is called; there is no C++ `(M,N,K)` CO lookup table.
 
 ## A16 workspace checks
 
@@ -219,7 +204,6 @@ specialization that writes partial sums. Its direct BF16/FP32
 
 | Path | Role |
 |---|---|
-| `opus_gemm.cu` | family routers, C ABI bridge and strict current-arch dispatch |
 | `opus_bmm.cu` / `include/opus_bmm.h` | MXFP8 BMM exact-kid family entry and Torch-workspace forwarding |
 | `opus_gemm_common.py` | canonical registry, unique route map and compile-floor constants |
 | `gen_instances.py` | subset selection, manifests and typed dispatch generation |

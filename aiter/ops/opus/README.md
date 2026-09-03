@@ -129,13 +129,6 @@ to the same `_execute_a16w16` planner/executor used by A16W16 GEMM.
 Empty family tables on another architecture are valid capability states. A
 kid registered for another architecture is rejected before family launch.
 
-gfx1250 also has 219 pre-built A16W16 CO exact kids under the two tags
-`a16w16_4wave_co` and `a16w16_4wave_wl_co`. They accept BF16 XQ/WQ/Y only,
-reject bias and explicit workspace, and permit `split_k` only in `{0,1}`. The
-current gfx1250 batch-one guard remains in force. Their actual ids are
-21016--21315 in the reserved `[21000,27000)` CO band; callers still select one
-exact id through the same registry and A16 C ABI as every other A16 kernel.
-
 ## Examples
 
 ### A16W16 GEMM and BMM
@@ -273,22 +266,12 @@ validate exact kid and split_k
   -> derive immutable workspace plan from the exact instance
   -> reuse caller workspace or torch.empty for this call
   -> _launch_a16w16_backend
-       -> first call: existing pybind wrapper owns normal lazy JIT build
-       -> eager / manual graph capture: call the cached C ABI directly
-       -> torch.compile / Meta / FakeTensor: registered torch.ops boundary
-            -> the same cached C ABI on the live stream
 ```
 
 There is no process-global Tensor, pointer registry, HIP allocator, or prewarm
 API. The bounded public-contract and A16 launch-plan caches store only registry
 metadata, integers, dtypes, option-presence flags and shapes; they never retain
 Tensor objects, data pointers, devices, streams or workspaces.
-
-The registered operator remains the Dynamo/FakeTensor boundary, but ordinary
-eager execution does not pay its dispatcher cost. The eager path refreshes
-thread-local descriptors, reads the raw current stream and invokes the same C
-ABI body directly. This changes host dispatch only; kernel selection, launch
-arguments, C++ validation and Torch workspace ownership are identical.
 
 Let `padded_M=ceil_div(M,B_M)*B_M` and
 `padded_N=ceil_div(N,B_N)*B_N`:
@@ -355,23 +338,9 @@ validated family + resolved kid + physical Tensor views
        -> MXFP8 BMM pybind raw launcher
 ```
 
-This matches A16's policy/backend boundary, but not its transport choice. A8
-has no stable C ABI and did not need the A16 host-overhead workaround, so it
-does not have pybind priming, a ctypes loader or a descriptor pool. Its normal
-pybind bindings continue to own lazy JIT loading and remain directly visible
-to `torch.compile`.
-
 ## Graphs and streams
 
 Automatic `torch.empty` during graph capture uses the graph-private pool.
-Concurrent eager calls own independent workspace Tensors. The private C ABI
-switches to the XQ device and live PyTorch stream for the call, restores the
-previous state, and carries C++ errors through a thread-local status bridge.
-The pybind raw remains available privately for the normal lazy JIT build and
-A/B measurement. `_launch_a16w16_backend` is the executor's only low-level
-entry; its priming state, mixed-module C ABI loader and thread-local descriptor
-pool live in the same backend section of `gemm_op_a16w16.py`. Generic JIT
-machinery owns module discovery and build, but not per-call workspace state.
 
 A CO image is opened and registered on the first call to its launcher. That
 first load must happen before graph capture; warm-up followed by capture/replay
@@ -429,7 +398,6 @@ skip on another architecture is not a pass for that target.
 | `_arch.py` | per-explicit-device architecture/CU scalar cache |
 | `policy.py` | A16 tuned/heuristic candidate selection plus MXFP8 tuned CSV discovery, padded-M lookup, local-to-global kid normalization and heuristic fallback |
 | `launch_plan.py` | shared `WorkspaceSpec`, A16 exact-kid/split-K planning, and A8 family contract/MXFP8 BMM planning |
-| `gemm_op_a16w16.py` | retained shape-driven OPUS wrapper plus A16 GEMM/BMM adapters, call-scoped Torch workspace materialization, and the unified `_launch_a16w16_backend` entry over pybind priming/C ABI |
 | `gemm_op_a8w8.py` | three non-MX A8 GEMM adapters, the legacy bpreshuffle tuner compatibility entry, MXFP8 BMM workspace materialization, and the unified `_launch_a8w8_backend` over four pybind raw bindings |
 | `moe_stage1_a8w4.py` | A8W4 MoE stage-1 runtime binding and launcher |
 | `moe_stage2_a8w4.py` | A8W4 MoE stage-2 runtime bindings and launchers |

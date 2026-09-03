@@ -84,9 +84,6 @@ def _run_exact_a16w16(
     )
     kwargs["workspace"] = workspace
 
-    # Prime lazy module/C-ABI state and the caller-owned workspace before graph
-    # capture. The side-stream warmup also establishes the allocator/stream state
-    # used by the captured exact-kid launch.
     opus_bmm(A, B, Y, **kwargs)
     current = torch.cuda.current_stream(A.device)
     side = torch.cuda.Stream(device=A.device)
