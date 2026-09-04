@@ -11,6 +11,7 @@ import tempfile
 import time
 
 logger = logging.getLogger("aiter")
+_GUARD_PROTOCOL = b"flock\n"
 
 
 def _pid_namespace():
@@ -245,51 +246,121 @@ class FileBaton:
 
     def _try_acquire_steal_guard(self):
         """Try to hold the recovery guard; kernel releases it on process exit."""
-        legacy_guard_path = self.lock_file_path + ".steal"
-        if self._legacy_steal_guard_is_active(legacy_guard_path):
-            return None
-
-        # Use a versioned pathname so an inaccessible orphan left by the
-        # pre-flock implementation cannot prevent upgraded cache peers from
-        # synchronizing. The legacy marker above is honored for a grace period
-        # and indefinitely when it carries a live flock from an earlier
-        # revision of this protocol.
-        guard_path = legacy_guard_path + ".flock"
+        guard_path = self.lock_file_path + ".steal"
         while True:
             try:
                 sfd = os.open(guard_path, os.O_RDWR)
-                break
             except FileNotFoundError:
-                guard_dir = os.path.dirname(guard_path) or "."
-                guard_name = os.path.basename(guard_path)
-                sfd, private_path = tempfile.mkstemp(
-                    prefix=f".{guard_name}.", suffix=".tmp", dir=guard_dir
-                )
-                published = False
-                try:
-                    os.fchmod(sfd, 0o666)
-                    fcntl.flock(sfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    try:
-                        os.link(private_path, guard_path)
-                    except FileExistsError:
-                        continue
-                    published = True
+                sfd = self._publish_guard(guard_path)
+                if sfd is not None:
                     return sfd
-                finally:
+                continue
+            except PermissionError:
+                sfd = None
+            else:
+                try:
+                    protocol = os.pread(sfd, len(_GUARD_PROTOCOL), 0)
+                except OSError:
+                    protocol = b""
+                if protocol != _GUARD_PROTOCOL:
+                    os.close(sfd)
+                    sfd = None
+                else:
                     try:
-                        os.unlink(private_path)
-                    except OSError:
-                        # A leftover private alias cannot hold the flock once
-                        # this descriptor is closed.
-                        pass
-                    if not published:
+                        fcntl.flock(sfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
                         os.close(sfd)
+                        return None
+                    except OSError:
+                        os.close(sfd)
+                        raise
+                if sfd is not None:
+                    return sfd
+
+            if self._legacy_steal_guard_is_active(guard_path):
+                return None
+
+            # Serialize migration among upgraded peers, then atomically
+            # replace the legacy inode in place. Older peers keep observing
+            # the same .steal pathname and their O_EXCL acquisition remains
+            # excluded throughout the replacement.
+            migration_path = guard_path + ".migrate"
+            mfd = self._try_acquire_protocol_guard(migration_path)
+            if mfd is None:
+                return None
+            retry = False
+            try:
+                if self._guard_has_protocol(guard_path):
+                    retry = True
+                elif self._legacy_steal_guard_is_active(guard_path):
+                    return None
+                else:
+                    return self._publish_guard(guard_path, replace=True)
+            finally:
+                self._release_steal_guard(mfd)
+            if retry:
+                continue
+
+    @staticmethod
+    def _guard_has_protocol(guard_path):
         try:
-            fcntl.flock(sfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            os.close(sfd)
-            return None
-        return sfd
+            with open(guard_path, "rb") as guard:
+                return guard.read(len(_GUARD_PROTOCOL)) == _GUARD_PROTOCOL
+        except OSError:
+            return False
+
+    def _try_acquire_protocol_guard(self, guard_path):
+        """Acquire a guard pathname known to use the current protocol."""
+        while True:
+            try:
+                fd = os.open(guard_path, os.O_RDWR)
+            except FileNotFoundError:
+                fd = self._publish_guard(guard_path)
+                if fd is not None:
+                    return fd
+                continue
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(fd)
+                return None
+            return fd
+
+    @staticmethod
+    def _publish_guard(guard_path, replace=False):
+        """Atomically publish a shared, flocked recovery-guard inode."""
+        guard_dir = os.path.dirname(guard_path) or "."
+        guard_name = os.path.basename(guard_path)
+        fd, private_path = tempfile.mkstemp(
+            prefix=f".{guard_name}.", suffix=".tmp", dir=guard_dir
+        )
+        published = False
+        try:
+            os.fchmod(fd, 0o666)
+            remaining = memoryview(_GUARD_PROTOCOL)
+            while remaining:
+                written = os.write(fd, remaining)
+                if written <= 0:
+                    raise OSError("could not write recovery-guard protocol")
+                remaining = remaining[written:]
+            os.fsync(fd)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if replace:
+                os.replace(private_path, guard_path)
+            else:
+                try:
+                    os.link(private_path, guard_path)
+                except FileExistsError:
+                    return None
+            published = True
+            return fd
+        finally:
+            try:
+                os.unlink(private_path)
+            except OSError:
+                pass
+            if not published:
+                os.close(fd)
 
     def _legacy_steal_guard_is_active(self, guard_path):
         """Whether a pre-versioned recovery marker may still be active."""
@@ -316,10 +387,6 @@ class FileBaton:
             fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
-        try:
-            os.remove(guard_path)
-        except OSError:
-            pass
         return False
 
     @staticmethod
