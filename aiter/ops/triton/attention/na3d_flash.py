@@ -50,7 +50,13 @@ def na3d_flash_attn(
     SEQ = T * H * W
 
     _LOGGER.info(
-        f"NA3D_FLASH_FWD: q={tuple(q.shape)} kernel=({KT},{KH},{KW}) SEQ={SEQ} HD={HD}"
+        "NA3D_FLASH_FWD: q=%s kernel=(%d,%d,%d) SEQ=%d HD=%d",
+        tuple(q.shape),
+        KT,
+        KH,
+        KW,
+        SEQ,
+        HD,
     )
 
     assert q.dtype == torch.bfloat16, "na3d_flash_attn: inputs must be bfloat16"
