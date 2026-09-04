@@ -78,11 +78,11 @@ Selected purely from metadata: `run_1stage=0`, `flat=0`, `output_aux`,
 `sort_block_m` matches stage1 `BM`. `_is_mxfp4_inline_sort` in
 `aiter/fused_moe.py` performs that check; there is no name allowlist.
 
-The path stops at the `token=32` bucket. Stage1 inline quant re-quantizes the
-`BM` rows of every block, so its cost scales with padded rows while the saving
-(two frontend launches, about 8 us) is fixed. At `E=896, topk=16` the two cross
-near `M=57`; since a bucket must be chosen for its worst case, `token=64` keeps
-the legacy frontend.
+Stage1 inline quant re-quantizes the `BM` rows of every block, so its cost
+grows with padded rows while the saving (two frontend launches, about 8 us) is
+fixed. At `E=896, topk=16` that is still a net win at `M=64`, where BM16 beats
+the best BM32 candidate by 13%; whether it holds for a given shape is a tuning
+question, not a fixed threshold.
 
 ## Dispatch and fallback
 
@@ -115,16 +115,35 @@ Current MXFP4 rows:
 | bucket | path |
 |---|---|
 | `M == 1` | direct M1 |
-| `M = 2..16` | BM16 inline-sort |
-| `M = 17..32` | BM16 inline-sort |
-| `M = 33..64` | legacy two-stage, `t32x64x256` stage1 |
+| `M = 2..64` | BM16 inline-sort |
 | `M > 64` | legacy |
 
 The `token=1` row of every shipped MXFP4 tuned config uses the direct pair.
 
-CSV timing fields are kernel medians, not graph latency: `us1` and `us2` are
-the stage1/stage2 kernel durations and `us = us1 + us2`. Sort/quant and host
-overhead are excluded by construction.
+CSV timing fields are not graph latency. For legacy rows `us1` and `us2` are
+the stage1/stage2 kernel medians and `us = us1 + us2`, excluding sort/quant and
+host overhead. The fast paths are tuned as a coupled pair, so their whole
+eager e2e time lands in `us1` and `us2` is 0.
+
+## Tuning a new shape
+
+Both fast paths are candidates in the normal tuner, so a new model picks them
+up without any code change:
+
+```
+python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py --mxfp4-flydsl \
+    --untune_file <shapes>.csv --tune_file <model>_a4w4_tuned_fmoe.csv
+```
+
+`Mxfp4FlydslTuner` enumerates, per shape: the mxmoe stage1 registry across all
+`BM` and both XCD swizzles, coupled with both stage2 families, plus -- at
+`token=1` only -- the direct pairs from `moe_direct_m1.candidate_kernel_pairs`.
+Candidates whose tiles do not divide the shape are rejected up front, so the
+pair cannot be copied from another model.
+
+The tuner times eagerly. That resolves choices worth more than a few percent
+(`BM`, `_nt`), but not `_xcd` or `waves_per_eu`, which are around 1% and need
+an AB/BA comparison under HIP Graph.
 
 ## Measured result
 
@@ -135,25 +154,21 @@ replays each, over 7 route distributions.
 
 | M | geomean | worst |
 |---|---|---|
-| 1 | 1.403x | 1.391x |
-| 2 | 1.207x | 1.188x |
-| 4 | 1.238x | 1.186x |
-| 8 | 1.129x | 1.110x |
-| 16 | 1.162x | 1.125x |
-| 17 | 1.142x | 1.077x |
-| 24 | 1.102x | 1.029x |
-| 32 | 1.059x | 0.966x |
-| 40 | 1.018x | 1.011x |
-| 48 | 1.016x | 1.009x |
-| 64 | 1.012x | 1.003x |
+| 1 | 1.415x | 1.409x |
+| 2 | 1.214x | 1.176x |
+| 4 | 1.290x | 1.167x |
+| 8 | 1.130x | 1.109x |
+| 16 | 1.168x | 1.131x |
+| 17 | 1.130x | 1.058x |
+| 24 | 1.106x | 1.062x |
+| 32 | 1.095x | 1.055x |
+| 40 | 1.101x | 1.048x |
+| 48 | 1.096x | 1.044x |
+| 64 | 1.086x | 1.030x |
 
-Overall geomean 1.140x, i.e. 12.3% end-to-end latency reduction across the
-`M <= 64` matrix. Cosine similarity against a BF16 oracle is unchanged.
-
-The single sub-1.0 cell is `M=32` under a synthetic route that assigns all 512
-slots to 512 distinct experts; real grouped-topk routing at `M=32` produces
-about 76.5% distinct experts, where the same configuration gains 3-7%.
-Reverting the `token=32` row to legacy would cost `M=17..31` a 3-14% gain.
+Overall geomean 1.163x, i.e. 14.0% end-to-end latency reduction across the
+`M <= 64` matrix, with no scenario below 1.030x. Cosine similarity against a
+BF16 oracle is unchanged.
 
 Direct M1 was measured against the tuned `token=1` row of every other shipped
 MXFP4 config (11 shapes across three models, 3 routes each): geomean 1.189x
