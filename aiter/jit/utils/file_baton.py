@@ -190,12 +190,6 @@ class FileBaton:
                 # whether a guarded operation is actually active.
                 sfd = self._try_acquire_steal_guard()
                 if sfd is None:
-                    if self._try_recover_absent_legacy_guard():
-                        logger.warning(
-                            f"[pid={os.getpid()}] recovered an abandoned legacy "
-                            f"guard at {self.lock_file_path}"
-                        )
-                        return False
                     time.sleep(self.wait_seconds)
                     continue
                 try:
@@ -402,21 +396,6 @@ class FileBaton:
         finally:
             os.close(fd)
         return True
-
-    def _try_recover_absent_legacy_guard(self):
-        """Reacquire work abandoned after a legacy breaker removed the lock.
-
-        With no canonical lock, a paused legacy breaker has already passed its
-        destructive step; publishing our lock is safe. Rebuilding is the
-        conservative result because the old breaker may have died before it
-        could start the replacement work.
-        """
-        guard_path = self.lock_file_path + ".steal"
-        if self._guard_has_protocol(guard_path):
-            return False
-        if not self._legacy_steal_guard_can_migrate(guard_path):
-            return False
-        return self.try_acquire()
 
     @staticmethod
     def _release_steal_guard(sfd):
