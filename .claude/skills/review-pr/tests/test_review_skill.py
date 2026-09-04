@@ -1707,3 +1707,73 @@ class TestPerfClaims(unittest.TestCase):
     def test_step_1b_writes_the_artifact(self):
         self.assertIn("perfclaims", FETCH.read_text())
         self.assertIn("perf_claims.txt", SKILL_MD.read_text())
+
+
+class TestCommentDominated(unittest.TestCase):
+    """When a diff is almost all comments, the few lines that are not are the review.
+
+    2 of 600 open PRs, and the leverage is the point: aiter#4062 is 7963 changed lines
+    across 252 files and reduces to nothing at all.
+    """
+
+    def run_it(self, diff):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            f = pathlib.Path(td) / "d.diff"
+            f.write_text(diff)
+            r = subprocess.run([sys.executable, str(TRIAGE), "commentonly", str(f)],
+                               capture_output=True, text=True)
+        self.assertEqual(0, r.returncode, r.stderr)
+        return r.stdout
+
+    @staticmethod
+    def diff_of(path, lines):
+        return (f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
+                "@@ -1 +1 @@\n" + "".join(f"{l}\n" for l in lines))
+
+    def test_a_normal_diff_is_not_reported(self):
+        body = [f"+    x{i} = compute({i})" for i in range(70)]
+        self.assertIn("not a comment-dominated",
+                      self.run_it(self.diff_of("aiter/x.py", body)))
+
+    def test_a_small_diff_is_not_reported(self):
+        """Below the floor the ratio means nothing -- two comment lines is not a pattern."""
+        self.assertIn("not a comment-dominated",
+                      self.run_it(self.diff_of("aiter/x.py", ["+# a", "+# b"])))
+
+    def test_the_code_lines_of_a_comment_diff_are_listed(self):
+        body = [f"+# prose line {i}" for i in range(70)] + ["+REVISION = 26"]
+        out = self.run_it(self.diff_of("aiter/x.py", body))
+        self.assertIn("COMMENT-DOMINATED", out)
+        self.assertIn("REVISION = 26", out)
+
+    def test_a_changed_trailing_comment_is_not_a_code_change(self):
+        """`X = 25  # old` -> `X = 25  # new` changes no code. aiter#4062 read as four
+        code lines until trailing comments were stripped, and as zero after."""
+        body = ([f"+# prose {i}" for i in range(70)]
+                + ["-REVISION = 25  # rev24, drop the token-major path",
+                   "+REVISION = 25  # g layout fixed head-major"])
+        out = self.run_it(self.diff_of("aiter/x.py", body))
+        self.assertIn("0 of them code", out)
+
+    def test_a_real_code_change_beside_a_comment_change_survives(self):
+        body = ([f"+# prose {i}" for i in range(70)]
+                + ["-REVISION = 25  # old", "+REVISION = 26  # new"])
+        out = self.run_it(self.diff_of("aiter/x.py", body))
+        self.assertIn("REVISION = 26", out)
+
+    def test_a_hash_inside_a_string_is_not_a_comment_marker(self):
+        body = ([f"+# prose {i}" for i in range(70)]
+                + ['-tag = "a#b"', '+tag = "a#c"'])
+        self.assertIn('tag = "a#c"', self.run_it(self.diff_of("aiter/x.py", body)))
+
+    def test_c_block_comment_continuations_are_prose(self):
+        """A `/* ... */` block whose continuation lines carry no leading `*` reads as code
+        line by line; aiter#4061's rewritten header is exactly that."""
+        body = ["+/* Convention of the scale in API:"] + \
+               [f"+   line {i} of the explanation" for i in range(70)] + ["+*/"]
+        self.assertIn("0 of them code", self.run_it(self.diff_of("csrc/x.cuh", body)))
+
+    def test_step_1b_writes_the_artifact(self):
+        self.assertIn("commentonly", FETCH.read_text())
+        self.assertIn("comment_only.txt", SKILL_MD.read_text())

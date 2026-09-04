@@ -5,7 +5,7 @@ Replaces Step 3's self-applied prose checklist. Emits only the matching rules so
 the model reads ~12 instead of all of them.  Conservative: when a type cannot be decided
 structurally it is INCLUDED, never dropped.
 """
-import re, sys, pathlib
+import re, sys, pathlib, collections
 from collections import OrderedDict
 
 TIER = ("aiter/jit/core.py", "aiter/__init__.py", "aiter/fused_moe.py",
@@ -197,6 +197,92 @@ def uncollectable_test_file(diff_text):
     return [] if collectable else candidates
 
 
+
+def is_comment_line(line):
+    s = line.strip()
+    return (not s) or s.startswith(("#", "//", "/*", "*", '"""', "'''"))
+
+
+def comment_dominated(diff_text, threshold=0.10, floor=60):
+    """The non-comment lines of a diff that is almost entirely comments.
+
+    Rare -- 2 of 600 open PRs -- and worth having for the leverage: aiter#4062 changes
+    7963 lines across 252 files of which 4 are code, and aiter#4061 changes 6328 of which
+    128 are. Those few lines are the entire review; everything else is prose. A reviewer
+    facing an 8000-line "condense comments" diff either reads none of it or reads it for
+    hours, and both of those miss the four lines."""
+    changed = []
+    cur = None
+    # A `/* ... */` block whose continuation lines carry no leading `*` reads as code
+    # line by line. aiter#4061's rewritten quant_utils.cuh header is exactly that, and
+    # every one of its prose lines was listed as something to review.
+    in_block = {"+": False, "-": False}
+    for ln in diff_text.splitlines():
+        m = re.match(r"^diff --git a/\S+ b/(\S+)", ln)
+        if m:
+            cur = m.group(1)
+            in_block = {"+": False, "-": False}
+            continue
+        if ln[:1] not in "+-" or ln.startswith(("+++", "---")):
+            continue
+        sign, body = ln[0], ln[1:]
+        was_in = in_block[sign]
+        opens = body.count("/*")
+        closes = body.count("*/")
+        if opens > closes:
+            in_block[sign] = True
+        elif closes and was_in:
+            in_block[sign] = False
+        # Marked as prose, not dropped: the floor and the ratio are about the whole
+        # diff, and dropping these left a 6000-line comment rewrite looking like a
+        # two-line diff that fell under the floor.
+        changed.append((cur, sign, body, was_in))
+    if len(changed) < floor:
+        return None
+    code = [(p_, sg, b) for p_, sg, b, prose in changed
+            if not prose and not is_comment_line(b)]
+    if len(code) / len(changed) > threshold:
+        return None
+    # A line whose only change is its trailing comment is not a code change.
+    # aiter#4062 reads as four code lines until the trailing comments are stripped,
+    # and then as zero, which is the truthful answer for a comment-only PR.
+    removed = collections.Counter()
+    added = collections.Counter()
+    for path, sign, body in code:
+        key = (path, strip_trailing_comment(body))
+        (removed if sign == "-" else added)[key] += 1
+    real = []
+    for path, sign, body in code:
+        key = (path, strip_trailing_comment(body))
+        other = added if sign == "-" else removed
+        if other[key]:
+            other[key] -= 1
+            continue
+        real.append((path, sign, body))
+    return len(changed), real
+
+
+def strip_trailing_comment(line):
+    out, quote = [], None
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            if ch == "\\":
+                out.append(line[i:i + 2])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "#" or line[i:i + 2] == "//":
+            break
+        out.append(ch)
+        i += 1
+    return "".join(out).rstrip()
+
+
 def derive(files, title="", raw_diff=""):
     paths = list(files)
     add = "\n".join(l for f in files.values() for l in f["add"])
@@ -263,7 +349,11 @@ def derive(files, title="", raw_diff=""):
         hit("new-compile-op", "D7 D6")
     if re.search(r"mutates_args|torch_compile_guard|register_fake|_fake\b|gen_fake|abstract_impl", add):
         hit("compile-contract", "D6 D7")
-    if re.search(r"(assert |torch\.zeros|\.contiguous\(\)|AITER_CHECK|TORCH_CHECK)", dele):
+    # Only code lines. A comment mentioning `.contiguous()` is not a removed invariant;
+    # aiter#4062 condenses comments across 252 files and tripped this on prose alone.
+    dele_code = "\n".join(l for l in dele.splitlines() if not is_comment_line(l))
+    if re.search(r"(assert |torch\.zeros|\.contiguous\(\)|AITER_CHECK|TORCH_CHECK)",
+                 dele_code):
         hit("invariant-removed", "D4 B7")
     if re.search(r"\bOOB\b|out.of.bounds|overflow|garbage|race|deadlock|leak", T) \
        or re.search(r"__threadfence|__syncthreads|__builtin_amdgcn_s_barrier|atomicAdd|atomic_", add):
@@ -1178,7 +1268,7 @@ if __name__ == "__main__":
     if mode not in ("rules", "evidence", "symbols", "ledger", "expand", "answers",
                         "mapping", "diagnostic", "testquality",
                         "twins", "citest", "perfclaims",
-                        "structabi"):
+                        "structabi", "commentonly"):
         print("usage: triage.py rules <diff> [title]\n"
               "       triage.py evidence <diff> <head-file>...\n"
               "       triage.py symbols <diff> <merge-target-root>\n"
@@ -1191,8 +1281,24 @@ if __name__ == "__main__":
               "       triage.py twins <diff> <root>\n"
               "       triage.py citest <diff> <root>\n"
               "       triage.py perfclaims <pr_meta.json>\n"
-              "       triage.py structabi <diff> <root>", file=sys.stderr)
+              "       triage.py structabi <diff> <root>\n"
+              "       triage.py commentonly <diff>", file=sys.stderr)
         raise SystemExit(2)
+
+    if mode == "commentonly":
+        res = comment_dominated(open(sys.argv[2], errors="replace").read())
+        if res is None:
+            print("not a comment-dominated diff")
+            raise SystemExit(0)
+        total, code = res
+        print(f"COMMENT-DOMINATED: {total} changed lines, {len(code)} of them code "
+              f"({len(code)/total:.1%})")
+        print("  Everything else is prose. These are the lines to review:")
+        for path, sign, body in code[:40]:
+            print(f"    {sign} {path}: {body.strip()[:96]}")
+        if len(code) > 40:
+            print(f"    ... and {len(code) - 40} more")
+        raise SystemExit(0)
 
     if mode == "structabi":
         root = pathlib.Path(sys.argv[3] if len(sys.argv) > 3 else ".")

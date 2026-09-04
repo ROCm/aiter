@@ -772,6 +772,13 @@ if grep -q "invariant-removed\|api-signature" "$WORK/rules.txt"; then
   fi
 fi
 
+# When a diff is almost entirely comments, the few lines that are not are the whole
+# review. Rare -- 2 of 600 open PRs -- but aiter#4062 is 7963 changed lines across 252
+# files with no code change at all, and reading it any other way costs hours or gets
+# skipped.
+"$SKILLS_ROOT/review-pr/triage.py" commentonly "$WORK/pr.diff" \
+  | tee "$WORK/comment_only.txt"
+
 # Structs whose layout the TREE pins with offsetof/sizeof assertions, and whose fields
 # this diff moves. Derived from the diff alone this fired on any struct field churn --
 # aiter#5223, six headers with no assertion near them. Whether a layout is pinned is a
@@ -827,5 +834,5 @@ fi
 
 echo
 echo "WORK=$WORK"
-echo "artifacts: pr.diff pr_meta.json base_head.txt rules.txt rules_expanded.txt test_quality.txt twins.txt ci_coverage.txt perf_claims.txt struct_abi.txt \
+echo "artifacts: pr.diff pr_meta.json base_head.txt rules.txt rules_expanded.txt test_quality.txt twins.txt ci_coverage.txt perf_claims.txt struct_abi.txt comment_only.txt \
 evidence.txt symbols.txt validation_requirement.json"

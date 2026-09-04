@@ -42,6 +42,12 @@ Read the diff and PR body before proceeding.
 ### Step 1b — Derive the applicable rules, and collect the evidence they need
 
 
+**`$WORK/comment_only.txt` is the whole review when a diff is almost all comments.** It
+lists the changed lines that are not prose, with trailing comments stripped and C block
+comments tracked, so a line whose only change is its trailing comment does not appear.
+aiter#4062 is 7963 changed lines across 252 files and reduces to nothing; a diff that size
+is otherwise either skimmed or not read.
+
 **`$WORK/struct_abi.txt` names any struct whose layout something asserts and whose fields
 this PR moves.** aiter pins every kargs struct a hand-written code object reads. Inserting a
 field anywhere but the end shifts every offset after it; the assertions turn that into a
