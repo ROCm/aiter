@@ -117,7 +117,12 @@ def _swizzled_pair(n0, n1, CONTIGUITY, NUM_WARPS, WARP_SIZE, padding):
 
 @gluon.constexpr_function
 def _make_cdna4_kv_load_layouts(
-    HEAD_SIZE, TILE_SIZE, NUM_WARPS, FP8_KV, WARP_SIZE=64, SHUFFLED=False,
+    HEAD_SIZE,
+    TILE_SIZE,
+    NUM_WARPS,
+    FP8_KV,
+    WARP_SIZE=64,
+    SHUFFLED=False,
     GATHER=False,
 ):
     """
@@ -836,15 +841,16 @@ class AsyncGatherKVLoader:
             # load_block_ids turns into a page plus a within-page token.
             bk: gl.constexpr = kv_cfg.blocked_k
             rows_k = gl.arange(
-                0, cfg.HEAD_SIZE // KW,
+                0,
+                cfg.HEAD_SIZE // KW,
                 layout=gl.SliceLayout(1, gl.SliceLayout(2, bk)),
             )[:, None, None]
             toks_k = gl.arange(
                 0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, gl.SliceLayout(2, bk))
             )[None, :, None]
-            lane_k = gl.arange(
-                0, KW, layout=gl.SliceLayout(0, gl.SliceLayout(1, bk))
-            )[None, None, :]
+            lane_k = gl.arange(0, KW, layout=gl.SliceLayout(0, gl.SliceLayout(1, bk)))[
+                None, None, :
+            ]
             offs_n_k = toks_k
             k_head_d_offset = (
                 kv_head_idx * cfg.stride_k_cache_1
@@ -856,15 +862,16 @@ class AsyncGatherKVLoader:
             # the group index needs the page.
             bv: gl.constexpr = kv_cfg.blocked_v
             rows_v = gl.arange(
-                0, cfg.TILE_SIZE // KW,
+                0,
+                cfg.TILE_SIZE // KW,
                 layout=gl.SliceLayout(1, gl.SliceLayout(2, bv)),
             )[:, None, None]
             cols_v = gl.arange(
                 0, cfg.HEAD_SIZE, layout=gl.SliceLayout(0, gl.SliceLayout(2, bv))
             )[None, :, None]
-            lane_v = gl.arange(
-                0, KW, layout=gl.SliceLayout(0, gl.SliceLayout(1, bv))
-            )[None, None, :]
+            lane_v = gl.arange(0, KW, layout=gl.SliceLayout(0, gl.SliceLayout(1, bv)))[
+                None, None, :
+            ]
             offs_n_v = rows_v * KW
             v_head_d_offset = (
                 kv_head_idx * cfg.stride_v_cache_1
@@ -910,7 +917,6 @@ class AsyncGatherKVLoader:
     @gluon.jit
     def k_tile(self, buffer_id):
         # [HEAD_SIZE // W, TILE_SIZE, W] -> [HEAD_SIZE, TILE_SIZE]
-        KW: gl.constexpr = self.cfg.KV_SHUFFLE_WIDTH
         if self.cfg.SHUFFLED_KV_CACHE:
             return (
                 self.k_shared.index(buffer_id)
@@ -923,7 +929,6 @@ class AsyncGatherKVLoader:
     @gluon.jit
     def v_tile(self, buffer_id):
         # [TILE_SIZE // W, HEAD_SIZE, W] -> [TILE_SIZE, HEAD_SIZE]
-        KW: gl.constexpr = self.cfg.KV_SHUFFLE_WIDTH
         if self.cfg.SHUFFLED_KV_CACHE:
             return (
                 self.v_shared.index(buffer_id)

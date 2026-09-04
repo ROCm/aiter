@@ -983,12 +983,12 @@ def _unified_attention_gfx950(
     then merges.
 
     With shuffled_kv_cache the caches must be in the layout shuffle_kv_cache
-    produces (op_tests/triton_tests/attention/test_unified_attention.py): 
-    
-    K = [num_blocks, num_kv_heads, head_size // W, block_size, W] 
-    V = [num_blocks, num_kv_heads, block_size // W, head_size, W], 
+    produces (op_tests/triton_tests/attention/test_unified_attention.py):
+
+    K = [num_blocks, num_kv_heads, head_size // W, block_size, W]
+    V = [num_blocks, num_kv_heads, block_size // W, head_size, W],
       where
-      W = 16 // element_size. 
+      W = 16 // element_size.
 
     The W run has to sit on each dot's reduction axis,
     so K groups head_size and V groups tokens. The triton backend reads the same
