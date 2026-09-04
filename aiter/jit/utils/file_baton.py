@@ -183,10 +183,10 @@ class FileBaton:
         )
         while True:
             if not os.path.exists(self.lock_file_path):
-                # A stale-lock breaker removes the old lock while holding this
-                # guard and creates its replacement before releasing the guard.
+                # Normal release removes the lock while holding this guard.
+                # Wait for that operation to finish before reporting success.
                 # A persistent .steal pathname is harmless; flock tells us
-                # whether a handoff is actually active.
+                # whether a guarded operation is actually active.
                 sfd = self._try_acquire_steal_guard()
                 if sfd is None:
                     time.sleep(self.wait_seconds)
