@@ -1122,15 +1122,17 @@ def _ensure_kids_compiled(candidate_kids):
     lock_path = f"{_jit_core.bd_dir}/lock_ensure_kids_opus"
     baton = FileBaton(lock_path)
 
-    if not baton.try_acquire():
-        # A peer parent (multi-GPU / multi-process tune harness) is already extending the sidecar +
-        # rebuilding.
-        baton.wait()
-        if required <= _read_sidecar(sidecar):
-            return False
-        # Peer's expand didn't cover us (rare: peer's `required` set was
-        # disjoint from ours). Re-enter to extend further.
-        return _ensure_kids_compiled(candidate_kids)
+    while not baton.try_acquire():
+        # A peer parent (multi-GPU / multi-process tune harness) is already
+        # extending the sidecar + rebuilding. A False result means wait()
+        # recovered and reacquired a stale lock for this baton, so loop and
+        # perform the rebuild ourselves.
+        if baton.wait():
+            if required <= _read_sidecar(sidecar):
+                return False
+            # Peer's expand didn't cover us (rare: peer's `required` set was
+            # disjoint from ours). Re-enter to extend further.
+            return _ensure_kids_compiled(candidate_kids)
 
     try:
         compiled = _read_sidecar(sidecar)
