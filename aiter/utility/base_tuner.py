@@ -26,6 +26,14 @@ _DEFAULT_CHECKPOINTS = 8
 INVALID_TIME = -1
 
 
+class _StoreBatchAction(argparse.Action):
+    """Store the batch size while remembering that the CLI supplied it."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        setattr(namespace, "_batch_was_explicit", True)
+
+
 def _read_csv(filepath, **kwargs):
     """Read CSV with automatic cleanup of common formatting issues:
     trailing tabs/spaces, extra unnamed columns, whitespace in headers/values.
@@ -114,6 +122,7 @@ class TunerCommon:
     def _setup_common_arguments(self):
         """set common arguments"""
         defaults = self.get_arg_defaults()
+        self.parser.set_defaults(_batch_was_explicit=False)
         self.parser.add_argument(
             "--verbose", "-v", action="store_true", help="more info"
         )
@@ -174,6 +183,7 @@ class TunerCommon:
         self.parser.add_argument(
             "--batch",
             type=int,
+            action=_StoreBatchAction,
             default=defaults["batch"],
             help="split untuned shapes to batches to tune",
         )
@@ -1436,7 +1446,7 @@ class TunerCommon:
         # When the user has not chosen a batch size, aim for a handful of
         # checkpoints. This can only make batches smaller, never larger, and
         # runs that already produce several batches are unaffected.
-        if args.batch == self.get_arg_defaults().get("batch"):
+        if not getattr(args, "_batch_was_explicit", True):
             batch_size = max(
                 1, min(batch_size, math.ceil(len(self.untunedf) / _DEFAULT_CHECKPOINTS))
             )
