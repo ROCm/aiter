@@ -814,6 +814,14 @@ fi
 # the judgement; this puts their evidence on screen instead of asking for a second look.
 "$SKILLS_ROOT/review-pr/triage.py" testquality "$WORK/pr.diff" | tee "$WORK/test_quality.txt"
 
+# New kernel files against the tests this PR adds. HK6 already fires on new-kernel, but it
+# was prose and the reader had to establish the absence themselves; 6.5% of 600 open PRs
+# add a kernel with no test pytest would collect. Collectibility is judged by filename --
+# an op_tests/-only whitelist called aiter#3991 untested while it added five test files
+# under aiter/aot/flydsl/tests/. Whether CI runs them is citest's question, not this one.
+"$SKILLS_ROOT/review-pr/triage.py" kerneltest "$WORK/pr.diff" \
+  | tee "$WORK/kernel_tests.txt"
+
 # Every first-party import the diff ADDS, resolved against the branch this PR merges
 # INTO -- fetched fresh, not the PR base and not whatever is on disk. A stale root
 # makes this check silently pass; that is the whole failure mode it exists to catch.

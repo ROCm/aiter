@@ -13,6 +13,10 @@ scan the same file for variants named `_opt`, `_prefill`, `_decode`, `_prefill_o
 Real example (PR#3841): strided q_nope OOB fix applied to decode kernel; `_prefill_opt` in the same file had the same bug unfixed.
 → `⚠️ A1: same bug may exist in [variant] — check kernel family in this file`
 
+**Evidence:** `$WORK/kernel_tests.txt` lists new kernel files for which this PR adds no
+test pytest would collect (6.5% of 600 open PRs). A benchmark is not a test. HK6 is where
+the judgement goes; that file is what saves establishing the absence by hand.
+
 **A2 — Shared path, no cross-model validation** ⚠️
 Changed code shared across model families (not model-specific): validated on all?
 Real example (PR#3891): valarLip: "please make sure e2e CI passes before changes to common part."

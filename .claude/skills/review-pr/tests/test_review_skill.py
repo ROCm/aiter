@@ -11,6 +11,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 
 SKILL_DIR = pathlib.Path(__file__).resolve().parents[1]
@@ -2217,3 +2218,110 @@ class TestCoreFileGate(unittest.TestCase):
         step8 = SKILL_MD.read_text()
         step8 = step8[step8.index("## Step 8"):]
         self.assertNotIn("The three gates", step8)
+
+
+class TestRecallDetectors(unittest.TestCase):
+    """Two gaps found by replaying the 600-PR corpus, and the shapes that must stay silent.
+
+    Both were measured before they were written, and a third candidate was measured and
+    dropped: added `except` blocks whose body is pass/continue/return fired on 10.7% of the
+    corpus, but 38 of those 64 PRs only ever matched a capability probe, and six sampled
+    from the narrowed pass/continue set were all deliberate -- a barrier timeout documented
+    in a comment, `int(os.environ[...])` falling through to a default, a ROCm-discovery
+    fallback chain. That is the shape of the already-rejected weak no-assertion check, and
+    it is not in the tree. Do not add it back without new numbers."""
+
+    def run_triage(self, mode, diff, *rest):
+        with tempfile.TemporaryDirectory() as d:
+            f = pathlib.Path(d) / "pr.diff"
+            f.write_text(diff)
+            r = subprocess.run([sys.executable, str(TRIAGE), mode, str(f), *rest],
+                               capture_output=True, text=True)
+            return r.stdout
+
+    def sig_diff(self, path, body, hunk_scope="def _kernel("):
+        return ("diff --git a/%s b/%s\n--- a/%s\n+++ b/%s\n@@ -1,6 +1,5 @@ %s\n"
+                % (path, path, path, path, hunk_scope)) + body
+
+    def new_file(self, path, lines):
+        return ("diff --git a/%s b/%s\nnew file mode 100644\n--- /dev/null\n+++ b/%s\n"
+                "@@ -0,0 +1,%d @@\n" % (path, path, path, len(lines))
+                + "".join("+%s\n" % l for l in lines))
+
+    # -- a parameter dropped from a signature reaches the api-signature family ----
+    def test_parameter_deleted_from_signature_derives_api_signature(self):
+        """The family required a `def` line on BOTH sides -- a signature rewritten in
+        place. Deleting one line of a multi-line signature never touched it, so B6/E1/E5
+        were never asked about 3.5% of open PRs."""
+        d = self.sig_diff("aiter/ops/triton/k.py",
+                          " def _kernel(\n     a_ptr,\n-    q_descale_ptr,\n     b_ptr,\n")
+        self.assertIn("api-signature", self.run_triage("rules", d, "t"))
+
+    def test_argument_dropped_from_a_call_is_not_a_parameter(self):
+        """A hunk header names the ENCLOSING def, so `transpose_out=True,` passed to a
+        call in the body of `def asm_moe(` read as a dropped parameter of asm_moe."""
+        d = self.sig_diff("aiter/fused_moe_bf16_asm.py",
+                          "     out = ck_moe(\n         hidden,\n"
+                          "-                transpose_out=True,\n     )\n",
+                          hunk_scope="def asm_moe(")
+        self.assertNotIn("api-signature", self.run_triage("rules", d, "t"))
+
+    def test_a_renamed_parameter_is_still_an_api_change(self):
+        """Written first as "a rename is not a drop", which was the wrong expectation:
+        the old name is gone from the signature either way, and a downstream caller
+        passing it as a kwarg breaks. That is what B6/E1/E5 are for."""
+        d = self.sig_diff("aiter/ops/triton/k.py",
+                          " def _kernel(\n     a_ptr,\n-    q_descale_ptr,\n"
+                          "+    q_descale_ptr_v2,\n     b_ptr,\n")
+        self.assertIn("api-signature", self.run_triage("rules", d, "t"))
+
+    def test_a_reordered_parameter_is_not_a_drop(self):
+        """The name still appears in the signature, so nothing was removed from it."""
+        d = self.sig_diff("aiter/ops/triton/k.py",
+                          " def _kernel(\n-    q_descale_ptr,\n     a_ptr,\n"
+                          "+    q_descale_ptr,\n     b_ptr,\n")
+        self.assertNotIn("api-signature", self.run_triage("rules", d, "t"))
+
+    def test_cpp_signatures_are_left_alone(self):
+        """The same line pattern reads `std::optional<Tensor>& fp8_out,` as a parameter
+        named `std`; telling a type prefix from a name there needs a real parser."""
+        d = self.sig_diff("csrc/kernels/attention_ragged.cu",
+                          " void launcher(\n     torch::Tensor& out,\n"
+                          "-    std::optional<torch::Tensor>& fp8_out,\n     int n,\n",
+                          hunk_scope="void launcher(")
+        self.assertNotIn("api-signature", self.run_triage("rules", d, "t"))
+
+    # -- kerneltest --------------------------------------------------------------
+    KERNEL = ["def k():"] + ["    pass"] * 12
+
+    def test_new_kernel_without_any_test_is_reported(self):
+        d = self.new_file("aiter/ops/triton/_triton_kernels/q.py", self.KERNEL)
+        self.assertIn("NO COLLECTIBLE TEST", self.run_triage("kerneltest", d))
+
+    def test_a_collectible_test_outside_op_tests_still_counts(self):
+        """aiter#3991 adds five test files under aiter/aot/flydsl/tests/; an op_tests-only
+        whitelist called it untested, which is a false statement, not a missing one."""
+        d = self.new_file("aiter/ops/triton/_triton_kernels/q.py", self.KERNEL) \
+            + self.new_file("aiter/aot/flydsl/tests/test_aot.py",
+                            ["def test_materializes():", "    assert True"])
+        self.assertNotIn("NO COLLECTIBLE TEST", self.run_triage("kerneltest", d))
+
+    def test_a_benchmark_is_not_a_test(self):
+        d = self.new_file("aiter/ops/triton/_triton_kernels/q.py", self.KERNEL) \
+            + self.new_file("op_tests/op_benchmarks/triton/bench_q.py",
+                            ["def test_bench():", "    run()"])
+        self.assertIn("NO COLLECTIBLE TEST", self.run_triage("kerneltest", d))
+
+    def test_bench_in_the_name_does_not_disqualify_a_test_file(self):
+        """aiter#2889's test_rmsnorm_bench_against_aiter.py holds two collectible tests."""
+        d = self.new_file("aiter/ops/triton/_triton_kernels/q.py", self.KERNEL) \
+            + self.new_file("aiter/ops/flydsl/test_rmsnorm_bench_against_aiter.py",
+                            ["def test_flydsl_rmsnorm_case():", "    assert True"])
+        self.assertNotIn("NO COLLECTIBLE TEST", self.run_triage("kerneltest", d))
+
+    def test_a_modified_kernel_is_not_a_new_one(self):
+        d = ("diff --git a/aiter/ops/triton/_triton_kernels/q.py "
+             "b/aiter/ops/triton/_triton_kernels/q.py\n"
+             "--- a/aiter/ops/triton/_triton_kernels/q.py\n"
+             "+++ b/aiter/ops/triton/_triton_kernels/q.py\n@@ -1 +1,2 @@\n+    x = 1\n")
+        self.assertNotIn("NO COLLECTIBLE TEST", self.run_triage("kerneltest", d))

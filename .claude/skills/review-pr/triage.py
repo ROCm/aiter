@@ -198,6 +198,112 @@ def uncollectable_test_file(diff_text):
 
 
 
+def dropped_parameter(diff_text):
+    """Parameters deleted from a Python signature without the name reappearing anywhere.
+
+    api-signature fires only when a `def`/`void`/`template` line is on both sides of the
+    diff -- a signature rewritten in place. Deleting one line of a multi-line signature
+    never touches the `def` line, so that family stayed silent on 9-11% of open PRs. The
+    Python only: the same regex over C++ reads `std::optional<Tensor>& fp8_out,` as a
+    parameter named `std`, and telling a type prefix from a parameter name there needs a
+    real declaration parser, not a line pattern.
+    """
+    files, out = parse(diff_text), []
+    add_all = "\n".join(l for f in files.values() for l in f["add"])
+    cur, old_side = None, []
+    for ln in diff_text.splitlines():
+        m = re.match(r"^diff --git a/(\S+) b/(\S+)", ln)
+        if m:
+            cur, old_side = m.group(2), []
+            continue
+        if ln.startswith("@@"):
+            old_side = []
+            continue
+        if not cur or ln.startswith(("---", "+++")):
+            continue
+        if ln.startswith("+"):
+            continue
+        if not ln.startswith(("-", " ")):
+            continue
+        body = ln[1:]
+        if ln.startswith("-") and cur.endswith(".py") \
+                and not re.search(r"^(op_tests|tests)/", cur) and "bench" not in cur:
+            m = re.match(r"\s*(\w+)\s*(?::[^=]+)?(?:=\s*\S.*)?,\s*(?:#.*)?$", body)
+            name = m.group(1) if m else None
+            sig = _open_signature(old_side)
+            if name and sig and name not in ("return", "if", "else", "for", "while",
+                                             "import", "from") \
+                    and not re.search(r"\b%s\b" % re.escape(name), add_all):
+                out.append((cur, name, sig))
+        old_side.append(body)
+    return out
+
+
+SIG_OPEN = re.compile(r"^\s*(def |void |template|__global__|__device__|\w[\w:<>\s\*&]*\s\w+\s*\()")
+
+
+def _open_signature(old_side):
+    """The signature this line sits inside, or None if its parens already closed.
+
+    A hunk header names the ENCLOSING def, not the construct the line belongs to, so
+    `transpose_out=True,` passed to a call in the body of `def asm_moe(` read as a dropped
+    parameter of asm_moe. Walking the old side back to an unbalanced `(` is what separates
+    the signature from everything written inside it.
+    """
+    depth = 0
+    for prev in reversed(old_side[-40:]):
+        code = prev.split("#")[0]
+        depth += code.count(")") - code.count("(")
+        if depth < 0:
+            return prev.strip()[:60] if SIG_OPEN.match(prev) else None
+    return None
+
+
+KERNEL_DIRS = ("aiter/ops/triton/", "_triton_kernels/", "_gluon_kernels/", "/gluon/",
+               "aiter/ops/flydsl/", "csrc/kernels/", "csrc/py_itfs_cu/")
+
+
+def untested_new_kernel(diff_text):
+    """New kernel files when the PR adds no test pytest will collect.
+
+    HK6 already fires on new-kernel, but it was prose: the reader had to work out whether
+    a test existed. Collectibility is decided by FILENAME, the rule pytest actually uses --
+    an earlier version looked only under op_tests/ and tests/, and reported aiter#3991 as
+    untested while the PR added five test files under aiter/aot/flydsl/tests/. Whether CI
+    then runs them is a separate question, and citest is what answers it. A benchmark is
+    not a test -- it is the shape these PRs ship instead of one -- so benchmark directories
+    and bench_* files do not count. Merely CONTAINING "bench" does not disqualify a file:
+    aiter#2889's test_rmsnorm_bench_against_aiter.py holds two collectible tests.
+    """
+    files = parse(diff_text)
+    new = [p for p, f in files.items()
+           if f["new"] and p.endswith((".py", ".cu", ".cuh", ".hip"))
+           and any(k in p for k in KERNEL_DIRS)
+           and not p.startswith(("op_tests/", "tests/"))
+           and not re.search(r"tutorial|template|bench", p)]
+    if not new:
+        return []
+    for p, f in files.items():
+        base = p.rsplit("/", 1)[-1]
+        if not (base.startswith("test_") or base.endswith("_test.py")):
+            continue
+        if base.startswith("bench") or re.search(r"/(op_)?benchmarks?/", p):
+            continue
+        if any(re.match(r"\s*(def test_\w+|class Test\w+)", l) for l in f["add"]):
+            return []
+    return new
+
+
+def render_untested_kernel(new):
+    if not new:
+        return "KERNEL TESTS: no new kernel file without a collectible test"
+    out = ["NEW KERNEL, NO COLLECTIBLE TEST -- %d file(s). Collectible means a test_*.py" % len(new),
+           "or *_test.py anywhere in the tree; benchmark dirs and bench_* files were not",
+           "counted. HK6 is the rule; this is its evidence."]
+    out += ["  %s" % p for p in new]
+    return "\n".join(out)
+
+
 def is_comment_line(line):
     s = line.strip()
     return (not s) or s.startswith(("#", "//", "/*", "*", '"""', "'''"))
@@ -360,7 +466,9 @@ def derive(files, title="", raw_diff=""):
              (p.startswith("aiter/") and p.count("/") == 1 and p.endswith(".py"))
              for p in paths):
         hit("ops-wrapper", "B6")
-    if re.search(r"^\s*(def |void |template)", dele, re.M) and re.search(r"^\s*(def |void |template)", add, re.M):
+    if (re.search(r"^\s*(def |void |template)", dele, re.M)
+            and re.search(r"^\s*(def |void |template)", add, re.M)) or \
+            dropped_parameter(raw_diff):
         hit("api-signature", "B6 E1 E5")
     if re.search(r"\b(fp8|e4m3|e5m2|fnuz|mxfp[48]|fp4|int8)\b|\bfp8_max\b|448\.0|240\.0", add, re.I):
         hit("fp8-quant", "C1 C2 D1")
@@ -1541,7 +1649,8 @@ if __name__ == "__main__":
     if mode not in ("rules", "evidence", "symbols", "ledger", "expand", "answers",
                         "mapping", "diagnostic", "testquality",
                         "twins", "citest", "perfclaims",
-                        "structabi", "commentonly", "card", "corefiles"):
+                        "structabi", "commentonly", "card", "corefiles",
+                        "kerneltest"):
         print("usage: triage.py rules <diff> [title]\n"
               "       triage.py evidence <diff> <head-file>...\n"
               "       triage.py symbols <diff> <merge-target-root>\n"
@@ -1557,9 +1666,13 @@ if __name__ == "__main__":
               "       triage.py structabi <diff> <root>\n"
               "       triage.py commentonly <diff>\n"
               "       triage.py corefiles <core_files.txt> <diff>\n"
+              "       triage.py kerneltest <diff>\n"
               "       triage.py card <card.md> <verdicts> <diagnostic> <answers> <diff>", file=sys.stderr)
         raise SystemExit(2)
 
+    if mode == "kerneltest":
+        print(render_untested_kernel(untested_new_kernel(open(sys.argv[2]).read())))
+        sys.exit(0)
     if mode == "corefiles":
         core_path = pathlib.Path(sys.argv[2]) if len(sys.argv) > 2 else None
         if core_path is None or not core_path.is_file():
