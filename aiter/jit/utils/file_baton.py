@@ -160,7 +160,8 @@ class FileBaton:
         finally:
             try:
                 os.unlink(private_path)
-            except FileNotFoundError:
+            except OSError:
+                # A leftover private alias cannot block the canonical lock.
                 pass
             if not published:
                 os.close(fd)
@@ -268,7 +269,9 @@ class FileBaton:
                 finally:
                     try:
                         os.unlink(private_path)
-                    except FileNotFoundError:
+                    except OSError:
+                        # A leftover private alias cannot hold the flock once
+                        # this descriptor is closed.
                         pass
                     if not published:
                         os.close(sfd)
