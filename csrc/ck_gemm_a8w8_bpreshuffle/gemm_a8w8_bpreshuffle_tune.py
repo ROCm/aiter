@@ -24,6 +24,7 @@ from aiter.utility.mp_tuner import mp_tuner
 sys.path.insert(0, f"{AITER_CSRC_DIR}/cktile_gemm_a8w8_bpreshuffle/")
 from gemm_a8w8_bpreshuffle_cktile_common import (
     BLOCK_PER_CU_MAX,
+    DEFAULT_PIPELINE,
 )
 from gemm_a8w8_bpreshuffle_cktile_common import (
     kernels_list as kernels_list_cktile,
@@ -389,10 +390,20 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
             for k, v in kernels_list_cktile.items()
             if v.BlockPerCu in args.blockPerCu
         }
+        # Every cktile pipeline consumes the same host-side data: B preshuffled
+        # with shuffle_weight(16, 16) plus the native per-token (M,) and
+        # per-channel (N,) fp32 scale vectors. rowcol_wp_v2 reads those scales
+        # through CK's RowColQuant windows, so there is nothing to replicate.
         gemm_keys = ["x", "weight_shuffle", "x_scale", "w_scale", "out"]
         ref_keys = ["x", "weight", "x_scale", "w_scale", "bias_f32"]
         tasks_ck = []
-        for i in filtered_cktile:
+        for i, kernel in filtered_cktile.items():
+            # Non-default pipelines are instantiated with the pads clamped
+            # false, so only offer them for tile-divisible shapes.
+            if getattr(kernel, "sPipeline", DEFAULT_PIPELINE) != DEFAULT_PIPELINE and (
+                M % kernel.MTile or N % kernel.NTile or K % kernel.KTile
+            ):
+                continue
             # cktile's flatmm accumulates into E without clearing it, so k_batch
             # stays 1 regardless of --splitK.
             for splitK in range(1):

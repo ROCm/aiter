@@ -13,6 +13,9 @@
 #include <numeric>
 
 #include "flatmm_basic.hpp"
+// QuantGemmKernel and the RowColQuant scale windows used by the
+// "rowcol_wp_v2" pipeline below.
+#include "ck_tile/ops/gemm_quant.hpp"
 #include <ATen/ATen.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
@@ -228,7 +231,8 @@ template <bool sTransposeC,
           int MWTile,
           int NWTile,
           int KWTile,
-          ck_tile::GemmPipelineScheduler sScheduler = ck_tile::GemmPipelineScheduler::Default>
+          ck_tile::GemmPipelineScheduler sScheduler = ck_tile::GemmPipelineScheduler::Default,
+          int sPipeline                             = 0>
 struct CreateTileConfig
 {
     static constexpr bool TransposeC                = sTransposeC;
@@ -251,6 +255,14 @@ struct CreateTileConfig
     static constexpr int N_Warp_Tile                = NWTile;
     static constexpr int K_Warp_Tile                = KWTile;
     static constexpr auto Scheduler                 = sScheduler;
+    // Which device composition consumes the tile geometry above.
+    // 0 = flatmm_v1    : ck_tile::FlatmmKernel + FlatmmPipelineAGmemBGmemCRegV1
+    //                    (the historical path; see flatmm_calc).
+    // 1 = rowcol_wp_v2 : ck_tile::QuantGemmKernel<QuantType::RowColQuant> +
+    //                    WeightPreshufflePipelineAGmemBGmemCRegV2
+    //                    (see gemm_calc_rowcol_wp_v2).
+    // Mirrors PIPELINE_IDS in gemm_a8w8_bpreshuffle_cktile_common.py.
+    static constexpr int PipelineId                 = sPipeline;
 };
 
 template <typename AccDataType,
@@ -274,7 +286,8 @@ template <typename AccDataType,
           int MWTile,
           int NWTile,
           int KWTile,
-          ck_tile::GemmPipelineScheduler Scheduler = ck_tile::GemmPipelineScheduler::Default>
+          ck_tile::GemmPipelineScheduler Scheduler = ck_tile::GemmPipelineScheduler::Default,
+          int sPipeline                            = 0>
 using CustomConfig = CreateTileConfig<sTransposeC,
                                       sUseStructuredSparsity,
                                       sTileParitionerGroupNum,
@@ -294,7 +307,161 @@ using CustomConfig = CreateTileConfig<sTransposeC,
                                       MWTile,
                                       NWTile,
                                       KWTile,
-                                      Scheduler>;
+                                      Scheduler,
+                                      sPipeline>;
+
+// ---------------------------------------------------------------------------
+// "rowcol_wp_v2": ck_tile::QuantGemmKernel in QuantType::RowColQuant mode
+// driving the plain weight-preshuffle pipeline.
+//
+// ptpc (per-token A x per-channel B) *is* CK's RowColQuant: the kernel builds
+// the aq window with strides (1, 0) and the bq window with strides (0, 1)
+// (gemm_quant_kernel.hpp), so the (M,) and (N,) scale vectors AITER already
+// hands the flatmm path are consumed natively -- no host-side replication.
+// The quant mode and the GEMM pipeline are orthogonal axes: RowColQuant calls
+// the pipeline with the plain (a, b, num_loop, smem) operator and applies the
+// scales in the epilogue, which is exactly what the weight-preshuffle
+// pipeline provides. That lets ptpc run on preshuffled B -- the same
+// shuffle_weight(16, 16) layout flatmm_v1 consumes.
+//
+// One bridge is required. QuantGemmKernel detects a preshuffled B by SFINAE on
+// `GemmPipeline::PreshuffleB`, and WeightPreshufflePipelineAGmemBGmemCRegV2
+// does not expose that member; without the alias the detection silently
+// defaults to false and the kernel reads shuffled B as if it were plain
+// (measured: ~39% of elements wrong). The alias is being added upstream in
+// ROCm/composable_kernel#3772; drop this wrapper once AITER's pinned CK
+// carries it and use the pipeline directly.
+// ---------------------------------------------------------------------------
+template <typename Problem>
+struct KtWp2RowcolPipeline : ck_tile::WeightPreshufflePipelineAGmemBGmemCRegV2<Problem>
+{
+    static constexpr bool PreshuffleB = true;
+};
+
+template <typename FlatmmConfig, typename CDataType_>
+float gemm_calc_rowcol_wp_v2(const ck_tile::QuantGemmHostArgs& args,
+                             const ck_tile::stream_config& s)
+{
+    using ADataType   = ck_tile::fp8_t;
+    using BDataType   = ck_tile::fp8_t;
+    using AccDataType = float;
+    using CDataType   = CDataType_;
+    using ALayout     = ck_tile::tensor_layout::gemm::RowMajor;
+    using BLayout     = ck_tile::tensor_layout::gemm::ColumnMajor;
+    using CLayout     = ck_tile::tensor_layout::gemm::RowMajor;
+
+    using GemmShape = ck_tile::TileGemmShape<
+        ck_tile::sequence<FlatmmConfig::M_Tile, FlatmmConfig::N_Tile, FlatmmConfig::K_Tile>,
+        ck_tile::sequence<FlatmmConfig::M_Warp, FlatmmConfig::N_Warp, FlatmmConfig::K_Warp>,
+        ck_tile::sequence<FlatmmConfig::M_Warp_Tile,
+                          FlatmmConfig::N_Warp_Tile,
+                          FlatmmConfig::K_Warp_Tile>>;
+
+    using TilePartitioner = ck_tile::GemmTile1DPartitioner<GemmShape>;
+
+    // Pads are clamped false: codegen emits a divisibility TORCH_CHECK for
+    // this pipeline and the tuner only issues tile-divisible shapes.
+    using UniversalTraits = ck_tile::TileGemmUniversalTraits<false, // kPadM
+                                                             false, // kPadN
+                                                             false, // kPadK
+                                                             true,  // DoubleSmemBuffer
+                                                                    // (required by WP2)
+                                                             ALayout,
+                                                             BLayout,
+                                                             CLayout,
+                                                             false, // TransposeC
+                                                             false, // UseStructuredSparsity
+                                                             false, // Persistent
+                                                             1,     // NumWaveGroups
+                                                             true>; // Preshuffle
+
+    using UniProblem = ck_tile::UniversalGemmPipelineProblem<ADataType,
+                                                             BDataType,
+                                                             AccDataType,
+                                                             GemmShape,
+                                                             UniversalTraits,
+                                                             FlatmmConfig::Scheduler,
+                                                             ck_tile::element_wise::PassThrough,
+                                                             ck_tile::element_wise::PassThrough>;
+
+    using GemmPipeline = KtWp2RowcolPipeline<UniProblem>;
+
+    using GemmEpilogue = ck_tile::CShuffleEpilogue<
+        ck_tile::CShuffleEpilogueProblem<typename UniProblem::AComputeDataType,
+                                         typename UniProblem::BComputeDataType,
+                                         ck_tile::tuple<>,
+                                         AccDataType,
+                                         CDataType,
+                                         ck_tile::tuple<>,
+                                         CLayout,
+                                         ck_tile::element_wise::PassThrough,
+                                         TilePartitioner::MPerBlock,
+                                         TilePartitioner::NPerBlock,
+                                         FlatmmConfig::M_Warp,
+                                         FlatmmConfig::N_Warp,
+                                         FlatmmConfig::M_Warp_Tile,
+                                         FlatmmConfig::N_Warp_Tile,
+                                         FlatmmConfig::K_Warp_Tile,
+                                         false>>;
+
+    using Kernel = ck_tile::QuantGemmKernel<TilePartitioner,
+                                            GemmPipeline,
+                                            GemmEpilogue,
+                                            ck_tile::QuantType::RowColQuant>;
+
+    auto kargs        = Kernel::MakeKernelArgs(args);
+    const dim3 grids  = Kernel::GridSize(args.M, args.N, args.k_batch);
+    const dim3 blocks = Kernel::BlockSize();
+
+    if(!Kernel::IsSupportedArgument(kargs))
+    {
+        throw std::runtime_error("Wrong! rowcol_wp_v2 arguments not supported! Skipping gemm!\n");
+    }
+
+    return ck_tile::launch_kernel(
+        s, ck_tile::make_kernel<FlatmmConfig::kBlockPerCu>(Kernel{}, grids, blocks, 0, kargs));
+}
+
+template <typename DDataType, typename EDataType, typename FlatmmInstance>
+__forceinline__ torch::Tensor
+gemm_a8w8_bpreshuffle_cktile_rowcol_wp_v2_impl(torch::Tensor& XQ,
+                                               torch::Tensor& WQ,
+                                               torch::Tensor& x_scale,
+                                               torch::Tensor& w_scale,
+                                               torch::Tensor& out,
+                                               int KBatch)
+{
+    int m = XQ.size(0);
+    int n = WQ.size(0);
+    int k = XQ.size(1);
+
+    // Native ptpc: x_scale is (M,) / (M,1) and w_scale is (N,) / (N,1), i.e.
+    // one quant group along K. QK_* == 1 is what puts the kernel on the
+    // stride-(1,0) / (0,1) RowCol scale windows.
+    ck_tile::QuantGemmHostArgs args;
+    args.a_ptr     = (void*)XQ.data_ptr();
+    args.aq_ptr    = (const void*)x_scale.data_ptr();
+    args.b_ptr     = (void*)WQ.data_ptr();
+    args.bq_ptr    = (const void*)w_scale.data_ptr();
+    args.c_ptr     = (void*)out.data_ptr();
+    args.k_batch   = KBatch;
+    args.M         = m;
+    args.N         = n;
+    args.K         = k;
+    args.QK_A      = 1;
+    args.QK_B      = 1;
+    args.stride_A  = XQ.stride(-2);
+    args.stride_B  = WQ.stride(-2);
+    args.stride_C  = n;
+    args.stride_AQ = 1;
+    args.stride_BQ = 1;
+
+    const c10::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(XQ));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    ck_tile::stream_config naive_config{stream};
+    gemm_calc_rowcol_wp_v2<FlatmmInstance, EDataType>(args, naive_config);
+    return out;
+}
 
 template <typename DDataType, typename EDataType, typename FlatmmInstance>
 __forceinline__ torch::Tensor
@@ -307,6 +474,15 @@ gemm_a8w8_bpreshuffle_cktile_impl(torch::Tensor& XQ,
 {
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
     TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
+    // A real else-branch, so the flatmm kernel is never instantiated for a
+    // quant-route config (and vice versa).
+    if constexpr(FlatmmInstance::PipelineId == 1)
+    {
+        return gemm_a8w8_bpreshuffle_cktile_rowcol_wp_v2_impl<DDataType, EDataType, FlatmmInstance>(
+            XQ, WQ, x_scale, w_scale, out, KBatch);
+    }
+    else
+    {
     using ADataType      = typename GemmBasicTypeConfig<ck_tile::fp8_t>::ADataType;
     using BDataType      = typename GemmBasicTypeConfig<ck_tile::fp8_t>::BDataType;
     using CDataType      = EDataType;
@@ -361,6 +537,7 @@ gemm_a8w8_bpreshuffle_cktile_impl(torch::Tensor& XQ,
                 CDEElementWise>(args, naive_config);
 
     return out;
+    } // else (PipelineId == 0, flatmm_v1)
 }
 
 #endif // USE_ROCM
