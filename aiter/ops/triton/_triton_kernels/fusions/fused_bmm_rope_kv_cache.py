@@ -288,6 +288,7 @@ def _fused_fp4_bmm_rope_cat_and_cache_mla_kernel(
             offs_ks = (pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE)) + tl.arange(
                 0, BLOCK_SIZE_K // SCALE_GROUP_SIZE
             )
+            offs_ks_local = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
             b_scale_ptrs = (
                 b_scales_ptr
                 + pid_head_i64 * stride_bsb_i64
@@ -298,7 +299,16 @@ def _fused_fp4_bmm_rope_cat_and_cache_mla_kernel(
             accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
             for k_idx in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
-                b_scales = tl.load(b_scale_ptrs)
+                if EVEN_K:
+                    b_scales = tl.load(b_scale_ptrs)
+                else:
+                    b_scales = tl.load(
+                        b_scale_ptrs,
+                        mask=offs_ks_local[None, :]
+                        < tl.cdiv(2 * K, SCALE_GROUP_SIZE)
+                        - k_idx * (BLOCK_SIZE_K // SCALE_GROUP_SIZE),
+                        other=0,
+                    )
 
                 if EVEN_K:
                     a_bf16 = tl.load(a_ptrs)
@@ -306,7 +316,7 @@ def _fused_fp4_bmm_rope_cat_and_cache_mla_kernel(
                 else:
                     a_bf16 = tl.load(
                         a_ptrs,
-                        mask=offs_k_bf16[None, :] < K - k_idx * BLOCK_SIZE_K,
+                        mask=offs_k_bf16[None, :] < 2 * K - k_idx * BLOCK_SIZE_K,
                         other=0,
                     )
                     b = tl.load(

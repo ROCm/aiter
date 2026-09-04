@@ -1,6 +1,9 @@
 import pytest
 import torch
 
+from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import (
+    _get_config as _get_fused_fp4_config,
+)
 from aiter.ops.triton.fusions.fused_bmm_rope_kv_cache import (
     fused_fp4_bmm_rope_cat_and_cache_mla,
     fused_fp8_bmm_rope_cat_and_cache_mla,
@@ -15,12 +18,16 @@ from aiter.ops.triton.gemm.batched.batched_gemm_a16wfp4 import (
     batched_gemm_a16wfp4,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.common_utils import serialize_dict
 from op_tests.test_rope import RotateStyle
 from op_tests.triton_tests.gemm.batched.test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     generate_batched_gemm_a16w8_inputs,
 )
 from op_tests.triton_tests.gemm.batched.test_batched_gemm_a16wfp4 import (
     generate_batched_gemm_a16wfp4_inputs,
+)
+from op_tests.triton_tests.gemm.batched.test_batched_gemm_a16wfp4 import (
+    run_torch as run_torch_batched_a16wfp4,
 )
 from op_tests.triton_tests.rope.test_rope import generate_rope_inputs
 
@@ -358,3 +365,90 @@ def test_fused_fp8_bmm_rope_cat_and_cache_mla(
     )
 
     torch.testing.assert_close(ref_kv_cache, triton_kv_cache, atol=1e-1, rtol=1e-1)
+
+
+@pytest.mark.parametrize("D_q_nope, BLOCK_SIZE_K", [(128, 64), (192, 128)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_fused_fp4_bmm_rope_odd_k_tail_masks(
+    D_q_nope: int, BLOCK_SIZE_K: int, dtype: torch.dtype
+):
+    """Regression: this kernel's copy of the batched FP4 GEMM loop had the same
+    two OOB reads -- A's bound must be 2*K (K is packed), and the b_scales load
+    must be masked or it reads past the scale tensor, where 0xFF is e8m0 NaN."""
+    if not arch_info.is_fp4_avail():
+        pytest.skip("MXFP4 is not available on this device")
+
+    torch.manual_seed(0)
+    T, QH_per_KH, KH, D, D_lora = 32, 16, 1, 128, 512
+    QH = QH_per_KH * KH
+    rotate_style = RotateStyle.GPTJ
+
+    config, _ = _get_fused_fp4_config(T, D_lora, D_q_nope // 2)
+    config = dict(config)
+    config["BLOCK_SIZE_K"] = BLOCK_SIZE_K
+    assert config["NUM_KSPLIT"] == 1, f"expected NUM_KSPLIT == 1, got {config}"
+    assert BLOCK_SIZE_K <= D_q_nope, "wrapper would clamp BLOCK_SIZE_K"
+    even_k = D_q_nope % BLOCK_SIZE_K == 0
+    assert even_k == (D_q_nope == 128), "case list assumes 128 even, 192 odd"
+
+    q_nope, w_k, _, w_k_scale, _ = generate_batched_gemm_a16wfp4_inputs(
+        QH, T, D_lora, D_q_nope, dtype, layout="TN", output=False
+    )
+
+    n_groups = D_q_nope // 32
+    numel = QH * n_groups * D_lora
+    poisoned = torch.full(
+        (2 * numel + 64 * D_lora,), 0xFF, dtype=torch.uint8, device="cuda"
+    )
+    w_k_scale_oob = poisoned[:numel].view(QH, n_groups, D_lora).transpose(1, 2)
+    assert w_k_scale_oob.shape == w_k_scale.shape
+    assert w_k_scale_oob.stride() == w_k_scale.stride()
+    w_k_scale_oob.copy_(w_k_scale)
+
+    _, _, _, _, _, positions, _, cos, sin = generate_rope_inputs(
+        1,
+        T,
+        KH,
+        QH_per_KH,
+        D,
+        cached=True,
+        reuse_freqs_front_part=True,
+        nope=False,
+        pos=True,
+        offs=False,
+        two_inputs=True,
+        layout="thd",
+        dtype=dtype,
+    )
+    q_pe = torch.randn((T, QH, D), dtype=dtype, device="cuda")
+    k_lora = torch.randn((T, KH, D_lora), dtype=dtype, device="cuda")
+    k_pe = torch.randn((T, KH, D), dtype=dtype, device="cuda")
+    kv_cache = torch.zeros((16384, KH, D_lora + D), dtype=dtype, device="cuda")
+    k_scale = torch.ones([1], dtype=torch.float32, device="cuda")[0]
+    slot_mapping = torch.randperm(T, device="cuda")
+
+    triton_q, _, _, _ = fused_fp4_bmm_rope_cat_and_cache_mla(
+        q_nope,
+        w_k,
+        w_k_scale_oob,
+        q_pe,
+        k_lora,
+        k_pe,
+        kv_cache,
+        slot_mapping,
+        positions,
+        cos,
+        sin,
+        y=None,
+        transpose_bm=True,
+        prequant=True,
+        y_scale=None,
+        config=serialize_dict(config),
+        k_scale=k_scale,
+        is_neox=(rotate_style == RotateStyle.NEOX),
+        q_out_dtype=None,
+        num_decode_toks_for_zeros=T,
+    )
+
+    ref = run_torch_batched_a16wfp4(q_nope, w_k, w_k_scale, dtype).transpose(0, 1)
+    torch.testing.assert_close(ref, triton_q[..., :D_lora], atol=1e-1, rtol=1e-1)
