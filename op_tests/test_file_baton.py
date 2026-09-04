@@ -51,9 +51,34 @@ class TestFileBaton(unittest.TestCase):
             self.assertTrue(baton.try_acquire())
             baton.release()
 
+    def test_failed_stale_replacement_leaves_lock_for_retry(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = os.path.join(tempdir, "build.lock")
+            with open(path, "w"):
+                pass
+
+            breaker = FileBaton(path, wait_seconds=0, stale_grace_seconds=-1)
+            with mock.patch(
+                "aiter.jit.utils.file_baton.os.replace",
+                side_effect=OSError("simulated death before publication"),
+            ):
+                with self.assertRaises(OSError):
+                    breaker.wait()
+
+            # The stale pathname was never removed. A subsequent waiter sees
+            # unfinished work, replaces it, and reports that the build must be
+            # retried rather than claiming successful completion.
+            self.assertTrue(os.path.exists(path))
+            retry = FileBaton(path, wait_seconds=0, stale_grace_seconds=-1)
+            self.assertFalse(retry.wait())
+            self.assertTrue(retry.try_acquire())
+            retry.release()
+
     def test_waiter_does_not_report_completion_during_handoff(self):
         with tempfile.TemporaryDirectory() as tempdir:
             path = os.path.join(tempdir, "build.lock")
+            with open(path, "w"):
+                pass
             breaker = FileBaton(path)
             waiter = FileBaton(path, wait_seconds=0.001)
             guard = breaker._try_acquire_steal_guard()
@@ -64,7 +89,7 @@ class TestFileBaton(unittest.TestCase):
             time.sleep(0.02)
             self.assertTrue(thread.is_alive())
 
-            self.assertTrue(breaker._try_acquire_under_guard())
+            self.assertTrue(breaker._publish_lock(replace=True))
             breaker._release_steal_guard(guard)
             time.sleep(0.02)
             self.assertTrue(thread.is_alive())
@@ -174,7 +199,7 @@ class TestFileBaton(unittest.TestCase):
                 os.umask(old_umask)
 
             self.assertIsNotNone(guard)
-            self.assertEqual(published, [guard_path, path])
+            self.assertEqual(published, [path, guard_path])
             baton._release_steal_guard(guard)
             baton.release()
 

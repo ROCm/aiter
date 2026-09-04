@@ -103,16 +103,10 @@ class FileBaton:
         # caller's normal retry loop observe that ownership.
         if self.fd is not None:
             return True
-        sfd = self._try_acquire_steal_guard()
-        if sfd is None:
-            return False
-        try:
-            return self._try_acquire_under_guard()
-        finally:
-            self._release_steal_guard(sfd)
+        return self._publish_lock()
 
-    def _try_acquire_under_guard(self):
-        """Publish a prepared lock while the recovery guard is held."""
+    def _publish_lock(self, replace=False):
+        """Publish a fully prepared lock, optionally replacing a stale one."""
         # open(O_CREAT, 0o666) publishes a mode filtered by the process umask.
         # A process killed before a following fchmod() can therefore strand a
         # 0600 lock that another cache UID can never probe.  Prepare a private
@@ -150,10 +144,16 @@ class FileBaton:
                     os.ftruncate(fd, 0)
                 except OSError:
                     pass
-            try:
-                os.link(private_path, self.lock_file_path)
-            except FileExistsError:
-                return False
+            if replace:
+                # The recovery guard excludes release and other breakers.
+                # Replacing the stale inode atomically avoids any absent-path
+                # interval that a waiter could mistake for completed work.
+                os.replace(private_path, self.lock_file_path)
+            else:
+                try:
+                    os.link(private_path, self.lock_file_path)
+                except FileExistsError:
+                    return False
             self.fd = fd
             published = True
             return True
@@ -386,11 +386,7 @@ class FileBaton:
         try:
             # Re-verify under the steal lock to avoid racing a fresh acquire.
             if os.path.exists(self.lock_file_path) and self._is_stale():
-                try:
-                    os.remove(self.lock_file_path)
-                except FileNotFoundError:
-                    pass
-                return self._try_acquire_under_guard()
+                return self._publish_lock(replace=True)
             return False
         finally:
             self._release_steal_guard(sfd)
