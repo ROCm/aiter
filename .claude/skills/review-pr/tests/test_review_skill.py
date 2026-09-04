@@ -574,6 +574,27 @@ class TestSymbolSweep(unittest.TestCase):
             "aiter/jit/utils/asm_guard.py",
             "from .chip_info import get_gfx_runtime", new_file=True)))
 
+    def test_a_relative_import_inside_a_package_init_resolves_to_that_package(self):
+        """For aiter/ops/flydsl/__init__.py the containing package IS aiter.ops.flydsl.
+        Stripping `.__init__` and then dropping a component as well resolved
+        `from .kernels.foo import ...` to aiter.ops.kernels.foo -- which does not exist --
+        and reported aiter#4515 for an import that was fine at that level."""
+        self.write("aiter/__init__.py")
+        self.write("aiter/ops/__init__.py")
+        self.write("aiter/ops/flydsl/kernels/__init__.py")
+        self.write("aiter/ops/flydsl/kernels/thing.py", "def go():\n    pass\n")
+        out = self.sweep(self.diff_adding(
+            "aiter/ops/flydsl/__init__.py", "from .kernels.thing import go"))
+        self.assertEqual([], out)
+
+    def test_a_package_init_still_reports_a_module_that_is_gone(self):
+        self.write("aiter/__init__.py")
+        self.write("aiter/ops/flydsl/kernels/__init__.py")
+        out = self.sweep(self.diff_adding(
+            "aiter/ops/flydsl/__init__.py", "from .kernels.gone import go"))
+        self.assertEqual(1, len(out), out)
+        self.assertIn("aiter.ops.flydsl.kernels.gone", out[0])
+
     def test_a_parent_relative_import_resolves_one_level_up(self):
         self.write("aiter/__init__.py")
         self.write("aiter/jit/__init__.py")

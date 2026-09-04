@@ -512,8 +512,15 @@ def added_imports(diff_text):
         m = re.match(r"^diff --git a/\S+ b/(\S+)", ln)
         if m:
             path = m.group(1)
+            # `is_pkg_init` matters: for aiter/ops/flydsl/__init__.py the containing
+            # package IS aiter.ops.flydsl, while for aiter/ops/flydsl/x.py it is the
+            # parent of x. Stripping `.__init__` and then dropping a component as well
+            # resolved `from .kernels.foo import ...` in aiter/ops/flydsl/__init__.py to
+            # aiter.ops.kernels.foo -- a module that does not exist -- and reported the
+            # PR that wrote it (aiter#4515).
             cur_pkg = path[:-3].replace("/", ".") if path.endswith(".py") else None
-            if cur_pkg and cur_pkg.endswith(".__init__"):
+            cur_is_pkg_init = bool(cur_pkg) and cur_pkg.endswith(".__init__")
+            if cur_is_pkg_init:
                 cur_pkg = cur_pkg[: -len(".__init__")]
             continue
         if not ln.startswith("+") or ln.startswith("+++"):
@@ -527,7 +534,7 @@ def added_imports(diff_text):
         rel = re.match(r"from\s+(\.+)([\w.]*)\s+import\s+(.+)$", body)
         if rel:
             dots, tail, names = rel.group(1), rel.group(2), rel.group(3)
-            parts = cur_pkg.split(".")[:-1]          # drop the module itself
+            parts = cur_pkg.split(".") if cur_is_pkg_init else cur_pkg.split(".")[:-1]
             up = len(dots) - 1
             if up > len(parts):
                 continue                              # escapes the tree; leave alone
