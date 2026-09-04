@@ -249,7 +249,18 @@ class FileBaton:
 
     def _try_acquire_steal_guard(self):
         """Try to hold the recovery guard; kernel releases it on process exit."""
-        sfd = os.open(self.lock_file_path + ".steal", os.O_CREAT | os.O_RDWR)
+        guard_path = self.lock_file_path + ".steal"
+        try:
+            sfd = os.open(guard_path, os.O_CREAT | os.O_EXCL | os.O_RDONLY, 0o666)
+        except FileExistsError:
+            # flock does not require write access on Linux. Opening read-only
+            # lets different UIDs sharing a cache coordinate through a marker
+            # created with another user's umask.
+            sfd = os.open(guard_path, os.O_RDONLY)
+        else:
+            # Creation mode is filtered by umask; immediately make the
+            # persistent rendezvous inode readable by every cache peer.
+            os.fchmod(sfd, 0o666)
         try:
             fcntl.flock(sfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:

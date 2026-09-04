@@ -39,6 +39,7 @@ class TestFileBaton(unittest.TestCase):
             # A leftover marker has no live flock and must not wedge recovery.
             with open(path + ".steal", "w"):
                 pass
+            os.chmod(path + ".steal", 0o444)
 
             baton = FileBaton(
                 path,
