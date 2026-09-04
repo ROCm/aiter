@@ -506,6 +506,8 @@ def stage2_uses_route_reduce(stage2: Callable) -> bool:
         # sorting (moe_buf zeroed). Treat any a16w4 stage2 as atomic here.
         if parsed.get("a_dtype") == "bf16" and parsed.get("b_dtype") == "fp4":
             return False
+        if parsed.get("a_dtype") == "bf16" and parsed.get("b_dtype") == "int4":
+            return parsed.get("mode") == "cshuffle"
         return parsed.get("mode", "atomic") == "reduce"
     if func is _opus_a8w4.opus_a8w4_stage2_wrapper:
         return _opus_a8w4.stage2_uses_route_reduce(stage2)
