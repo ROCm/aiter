@@ -20,7 +20,7 @@ import triton
 from aiter.ops.chunk_gated_delta_rule_fwd_h import (
     chunk_gated_delta_rule_fwd_h_hip,
 )
-from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill import (
+from aiter.ops.triton._triton_kernels.linear_attention.gated_delta_rule.prefill import (
     chunk_fwd_o_opt_vk,
 )
 
