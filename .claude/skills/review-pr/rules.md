@@ -467,7 +467,10 @@ correct shape. So is a literal inside a `triton.Config(...)` entry that IS the t
 
 **T5 — accumulator precision** 🔴
 
-Trigger: `tl.dot(`, `.to(tl.float32)`, `allow_tf32`, `input_precision`. 25% of Triton PRs.
+Trigger: `tl.dot(`, `allow_tf32`, `input_precision`, or a named accumulator (`acc += `,
+`acc = tl.zeros`). 19% of Triton PRs. A bare `.to(tl.float32)` used to trigger too and was
+20 of 54 firings, every sampled one an upcast on a load, a store or a quantisation max --
+which is the correct direction, not the loss this rule is about.
 Two failure shapes: an accumulator left in fp16/bf16 over a long K loop loses the tail of the
 sum, and `tl.dot` inputs downcast to save registers change the result silently. On fp8 paths
 check the scale is applied in fp32, not after a downcast.
@@ -475,7 +478,9 @@ check the scale is applied in fp32, not after a downcast.
 
 **T6 — grid and `program_id` disagree** 🔴
 
-Trigger: `grid=lambda`, `tl.program_id`, `tl.cdiv(`. 27% of Triton PRs. The launch grid is
+Trigger: `grid=lambda`, `tl.program_id`. 24% of Triton PRs. `tl.cdiv(` used to trigger it
+and is just ceiling division: all 7 firings it alone produced were a tile count, a
+block-pointer `shape=`, a mask bound or a loop bound. The launch grid is
 computed on the host and the tile mapping inside the kernel; nothing checks that they agree.
 A `cdiv` on the host with a kernel that assumes exact division leaves the tail tile
 unprocessed — output is correct everywhere the tests look and wrong in the last block.

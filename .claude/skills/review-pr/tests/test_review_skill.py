@@ -2220,6 +2220,15 @@ class TestCoreFileGate(unittest.TestCase):
         self.assertNotIn("The three gates", step8)
 
 
+def triage_families(added):
+    """triton_families() out of triage.py, loaded once, without importing the CLI."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_triage_mod", TRIAGE)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.triton_families(added)
+
+
 class TestRecallDetectors(unittest.TestCase):
     """Two gaps found by replaying the 600-PR corpus, and the shapes that must stay silent.
 
@@ -2530,4 +2539,58 @@ class TestTreeRootGuard(unittest.TestCase):
         self.assertEqual(
             [], raw,
             "a root-taking mode bypasses tree_root(); route it through the guard")
+
+
+class TestTritonTriggersCarryTheirMaterial(unittest.TestCase):
+    """T5 and T6 are both red rules, and both were triggered by tokens that say "this is
+    Triton code" rather than "this shape is present".
+
+    Measured over the 232 Triton PRs in the corpus: `tl.cdiv(` on its own produced 7 of
+    T6's firings and all 7 were a tile count, a block-pointer `shape=`, a mask bound or a
+    loop bound -- ceiling division, never a grid. A bare `.to(tl.float32)` produced 20 of
+    T5's 54 and every sampled one was an upcast on a load, a store, or a quantisation max,
+    which is the correct direction rather than the precision loss the rule is about.
+
+    Narrowing is not only subtraction: naming the manual accumulator brought in aiter#3613,
+    `acc_sq += gl.sum(out_h * out_h, axis=1)` with no `tl.dot` anywhere, which is exactly
+    T5's first failure shape and which the old trigger never saw."""
+
+    def fams(self, added):
+        return dict(triage_families(added))
+
+    def test_ceiling_division_alone_is_not_a_grid(self):
+        for line in ("    num_valid_n_tiles = tl.cdiv(N_o, BLOCK_SIZE_N * 2)",
+                     "    mask_n_s = offs_n_s < tl.cdiv(yN, 32)",
+                     "    for i_l in range(tl.cdiv(n_res, BL)):",
+                     "        shape=(M, tl.cdiv(K, MX_PACK_DIVISOR)),"):
+            self.assertNotIn("triton-grid-map", self.fams(line), line)
+
+    def test_a_host_grid_or_a_program_id_still_triggers_t6(self):
+        self.assertIn("triton-grid-map", self.fams("grid = lambda META: (  # noqa: E731"))
+        self.assertIn("triton-grid-map", self.fams("    pid = tl.program_id(0)"))
+
+    def test_an_upcast_alone_is_not_an_accumulator(self):
+        for line in ("    m = tl.max(tl.abs(x)).to(tl.float32)",
+                     "    x_tile = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)",
+                     "    tl.store(GateScal + pos, w.to(tl.float32), mask=live)"):
+            self.assertNotIn("triton-accum-prec", self.fams(line), line)
+
+    def test_a_named_accumulator_triggers_t5_without_a_dot(self):
+        """aiter#3613: a running sum of squares in a Gluon kernel, no tl.dot in the diff."""
+        self.assertIn("triton-accum-prec",
+                      self.fams("        acc_sq += gl.sum(out_h * out_h, axis=1)"))
+        self.assertIn("triton-accum-prec",
+                      self.fams("    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float16)"))
+
+    def test_a_dot_still_triggers_t5(self):
+        self.assertIn("triton-accum-prec", self.fams("    acc2 = tl.dot(a, b)"))
+
+    def test_the_rule_bodies_quote_the_triggers_that_are_live(self):
+        """rules.md states each trigger in prose. Prose drifts; this fails when it has."""
+        body = RULES_MD.read_text()
+        t6 = body[body.index("**T6 —"):body.index("**T6 —") + 600]
+        self.assertNotIn("`tl.cdiv(`, ", t6.split("Trigger:")[1][:120],
+                         "T6's stated trigger still lists tl.cdiv as live")
+        t5 = body[body.index("**T5 —"):body.index("**T5 —") + 600]
+        self.assertIn("accumulator", t5.split("Trigger:")[1][:200])
 

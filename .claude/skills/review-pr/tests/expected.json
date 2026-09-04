@@ -108,7 +108,7 @@
   "symbols": []
  },
  "3613": {
-  "rules": "  files=3  types=6  rules=14/53\n    [new-kernel          ] B1 B2 B4 A1 D1 D8 HK6 P6\n    [modified-kernel     ] A1 B2 D1 D8 P6\n    [new-routing-value   ] B4 C4\n    [tuning-config       ] D3 HK4\n    [ops-wrapper         ] B6\n    [triton-launch-cfg   ] T3 T4\n",
+  "rules": "  files=3  types=7  rules=15/53\n    [new-kernel          ] B1 B2 B4 A1 D1 D8 HK6 P6\n    [modified-kernel     ] A1 B2 D1 D8 P6\n    [new-routing-value   ] B4 C4\n    [tuning-config       ] D3 HK4\n    [ops-wrapper         ] B6\n    [triton-launch-cfg   ] T3 T4\n    [triton-accum-prec   ] T5\n",
   "symbols": []
  },
  "3733": {
@@ -161,7 +161,7 @@
   ]
  },
  "4268": {
-  "rules": "  files=4  types=14  rules=26/53\n    [new-kernel          ] B1 B2 B4 A1 D1 D8 HK6 P6\n    [modified-kernel     ] A1 B2 D1 D8 P6\n    [new-routing-value   ] B4 C4\n    [dispatch-change     ] B1 B3 B4 A3\n    [ops-wrapper         ] B6\n    [perf                ] P1 P2 P3 P5 P6\n    [compile-contract    ] D6 D7\n    [layout-contiguity   ] D8 B7\n    [hardcoded-launch-knob] T8\n    [conditional-binding ] D1b\n    [defaulted-param     ] E2\n    [triton-launch-cfg   ] T3 T4\n    [triton-accum-prec   ] T5\n    [triton-grid-map     ] T6\n",
+  "rules": "  files=4  types=13  rules=25/53\n    [new-kernel          ] B1 B2 B4 A1 D1 D8 HK6 P6\n    [modified-kernel     ] A1 B2 D1 D8 P6\n    [new-routing-value   ] B4 C4\n    [dispatch-change     ] B1 B3 B4 A3\n    [ops-wrapper         ] B6\n    [perf                ] P1 P2 P3 P5 P6\n    [compile-contract    ] D6 D7\n    [layout-contiguity   ] D8 B7\n    [hardcoded-launch-knob] T8\n    [conditional-binding ] D1b\n    [defaulted-param     ] E2\n    [triton-launch-cfg   ] T3 T4\n    [triton-grid-map     ] T6\n",
   "symbols": []
  },
  "4275": {

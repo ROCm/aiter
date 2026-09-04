@@ -65,9 +65,15 @@ def triton_families(add):
     if re.search(r"\bnum_warps\b|\bnum_stages\b|\bnum_ctas\b|waves_per_eu|"
                  r"matrix_instr|\bkpack\b", add):
         fams.append(("triton-launch-cfg", "T3 T4"))
-    if re.search(r"tl\.dot\(|\.to\(tl\.float32\)|allow_tf32|input_precision", add):
+    # `.to(tl.float32)` alone was 20 of the 54 firings and every sample was an upcast on
+    # a load, a store or a quantisation max -- the opposite of the accumulator T5 means.
+    # The manual reduction it also covers is kept by name instead.
+    if re.search(r"tl\.dot\(|allow_tf32|input_precision|"
+                 r"acc\w*\s*\+=|acc\w*\s*=\s*tl\.zeros", add):
         fams.append(("triton-accum-prec", "T5"))
-    if re.search(r"grid\s*=\s*lambda|tl\.program_id|tl\.cdiv\(", add):
+    # `tl.cdiv(` is ceiling division, not a grid: of the 7 firings it alone produced, all
+    # 7 were a tile count, a block-pointer `shape=`, a mask bound or a loop bound.
+    if re.search(r"grid\s*=\s*lambda|tl\.program_id", add):
         fams.append(("triton-grid-map", "T6"))
     return fams
 
