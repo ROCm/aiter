@@ -546,6 +546,41 @@ def test_inverse_rope_group_quant(
     return ret
 
 
+def check_layout_rejected(s, h, g, head_dim, rd, group_size, dtype, scale_layout):
+    """A wrong-family scale layout must raise, not abort.
+
+    The kernel refuses it too, but through AITER_CHECK -- which calls
+    std::abort(), so the process dies with SIGABRT and no traceback and nothing
+    can catch it. The wrapper's guard has to fire first; this asserts it does.
+    Deliberately does not reach the op, since getting there is the failure.
+    """
+    o, positions, cos, sin = _make_inputs(s, h, head_dim, rd, dtype)
+    try:
+        inverse_rope_group_quant_cpp(
+            o,
+            positions,
+            cos,
+            sin,
+            num_groups=g,
+            quant_group_size=group_size,
+            scale_layout=scale_layout,
+        )
+    except ValueError as e:
+        assert scale_layout in str(e), f"unhelpful rejection message: {e}"
+        aiter.logger.info(
+            "inverse_rope_group_quant %s rejected on %s: %s",
+            scale_layout,
+            get_gfx(),
+            e,
+        )
+        return
+    raise AssertionError(
+        f"scale_layout={scale_layout!r} is not built for {get_gfx()} but the "
+        "wrapper let the call through -- the kernel's AITER_CHECK would have "
+        "aborted the process here"
+    )
+
+
 def check_graph(s, h, g, head_dim, rd, group_size, dtype, scale_layout):
     """Capture the op in a HIP graph, replay on fresh data, compare against eager.
 
@@ -768,6 +803,22 @@ def main():
             # WMMA-K=128 step, so 4 * group_size has to be 128. The op rejects
             # anything else, so sweeping it here would only collect failures.
             if scale_layout == "n32k4" and group_size != 32:
+                continue
+            # mfma_tile (CDNA V_MFMA_SCALE) and n32k4 (RDNA WMMA scaleB) have
+            # disjoint consumers, so the module builds each only for the family
+            # that can launch it -- see AITER_INVERSE_ROPE_MFMA_TILE / _N32K4.
+            # Skipping the wrong-family layout here would leave the rejection
+            # itself untested, and the kernel's own AITER_CHECK aborts the
+            # process rather than raising, so assert the python-level guard
+            # instead: that is the only thing standing between a caller passing
+            # a legal-looking string and a core dump.
+            is_cdna = get_gfx().startswith("gfx9")
+            if (scale_layout == "mfma_tile" and not is_cdna) or (
+                scale_layout == "n32k4" and is_cdna
+            ):
+                check_layout_rejected(
+                    s, h, g, head_dim, rd, group_size, dtype, scale_layout
+                )
                 continue
             ret = test_inverse_rope_group_quant(
                 s, h, g, head_dim, rd, group_size, dtype, scale_layout

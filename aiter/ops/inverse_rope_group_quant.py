@@ -17,6 +17,34 @@ from ..utility.dtypes import get_dtype_fp8
 # Mirrors aiter::ScaleLayout in csrc/include/inverse_rope_group_quant.h.
 SCALE_LAYOUTS = {"row": 0, "mfma_tile": 1, "n32k4": 2}
 
+# The two padded layouts have disjoint consumers -- mfma_tile feeds CDNA's
+# V_MFMA_SCALE_F32_16x16x128_F8, n32k4 feeds RDNA's WMMA scaleB -- so the module
+# only builds each for the family that can launch it (AITER_INVERSE_ROPE_MFMA_TILE
+# / _N32K4 in csrc/kernels/inverse_rope_group_quant.cu). The kernel's host pass
+# refuses the wrong-family layout too, but AITER_CHECK aborts the process; catch
+# it here first so a bad `scale_layout` argument raises like every other one.
+_LAYOUT_REQUIRES_CDNA = {"mfma_tile": True, "n32k4": False}
+
+
+def _check_layout_arch(scale_layout: str) -> None:
+    wants_cdna = _LAYOUT_REQUIRES_CDNA.get(scale_layout)
+    if wants_cdna is None:
+        return
+    from ..jit.utils.chip_info import get_gfx_runtime
+
+    gfx = get_gfx_runtime()
+    # Mirrors is_cdna_arch() in the kernel: everything gfx9 is CDNA here.
+    if gfx.startswith("gfx9") is wants_cdna:
+        return
+    other = "n32k4" if wants_cdna else "mfma_tile"
+    consumer = (
+        "CDNA's V_MFMA_SCALE_F32_16x16x128_F8" if wants_cdna else "RDNA's WMMA scaleB"
+    )
+    raise ValueError(
+        f"scale_layout={scale_layout!r} feeds {consumer} and has no consumer on "
+        f"{gfx}, so it is not built there -- use {other!r} instead"
+    )
+
 
 @compile_ops(
     "module_inverse_rope_group_quant",
@@ -87,6 +115,10 @@ def inverse_rope_group_quant(
             * ``"n32k4"``: ``[ceil(S,32)/32, G, Ks*32]``, for gfx1250's WMMA
               scaleB. Requires ``quant_group_size == 32``.
 
+            The two padded layouts are built only for the family that consumes
+            them, so ``"mfma_tile"`` is CDNA-only and ``"n32k4"`` is RDNA-only;
+            asking for the other raises ``ValueError``. ``"row"`` runs anywhere.
+
         The two padded layouts round ``S`` up to 32 (``mfma_tile`` also rounds
         ``Ks`` up to its chunk width, 2 at ``quant_group_size == 128`` and 8
         otherwise), and **the bytes that padding adds are left undefined** --
@@ -99,6 +131,7 @@ def inverse_rope_group_quant(
     assert (
         scale_layout in SCALE_LAYOUTS
     ), f"scale_layout must be one of {sorted(SCALE_LAYOUTS)}, got {scale_layout!r}"
+    _check_layout_arch(scale_layout)
     assert o.dim() == 3, f"o must be [S,H,Dh], got {tuple(o.shape)}"
     S, H, head_dim = o.shape
     assert (
