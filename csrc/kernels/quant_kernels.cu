@@ -21,6 +21,14 @@ const int32_t groupQuantBlockSize = 64;
 
 namespace aiter {
 
+// Host-side twin of the kernel's kTunedForThisArch. Cached: get_gpu_arch() queries the
+// device properties, and this sits on the launch path of every quant call.
+static inline bool dyn_gq_tuned_arch()
+{
+    static const bool tuned = (get_gpu_arch() == "gfx1250");
+    return tuned;
+}
+
 #ifndef DYN_GQ_TDM_MIN_BLK_PER_SIMD
 #define DYN_GQ_TDM_MIN_BLK_PER_SIMD 6
 #endif
@@ -38,6 +46,12 @@ namespace aiter {
 // `per_1x32_mx_quant_hip(quant_dtype=fp8, scale_type=fp8_e8m0)` so the
 // produced byte scale is directly consumable by `mxfp4_moe_sort_hip` /
 // MXFP8 GEMM kernels without a post-hoc fp32 -> e8m0 conversion.
+// Everything below that is a TUNING choice rather than a correctness one is gated on
+// gfx1250, because gfx1250 is where it was measured. The group ordering, the 32B chunk
+// split and the per-layout block size were each picked off a sweep on that part, and each
+// leans on something arch-specific -- wave32, b128 as the widest per-lane access, that
+// part's cache-line and dispatch behaviour. None of it was measured on gfx950 (wave64,
+// different load widths), so that target keeps exactly the shape it had before.
 template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 32, int32_t group_size = 128, bool shuffle_scale = true, int32_t block_size = 64, bool emit_e8m0_scale = false, bool enable_tdm = false>
 __global__ void __launch_bounds__(block_size)
 dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
@@ -90,8 +104,13 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     // store contiguous instead. It strides the data reads across rows in exchange, but each
     // group still reads one contiguous 256B run, so DRAM absorbs it: the fp32-scale variant
     // measures unchanged either way. Net for the transposed path: 36.3 -> 32.0 us.
+#if defined(__gfx1250__)
+    static constexpr bool kTunedForThisArch = true;
+#else
+    static constexpr bool kTunedForThisArch = false;
+#endif
     static constexpr bool kColumnMajorGroups =
-        use_e8m0_scale && shuffle_scale && group_size == 128;
+        kTunedForThisArch && use_e8m0_scale && shuffle_scale && group_size == 128;
 
     // TDM staging parameters. Only the column-major path qualifies: it is the one whose
     // wave-sized run of groups forms a 2D tile (consecutive rows at one y). Row-major
@@ -177,8 +196,8 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     static constexpr int kChunkElems = 32 / static_cast<int>(sizeof(DTYPE_I));
     static constexpr int kChunks     = kChunkElems ? thread_data_size / kChunkElems : 0;
     static constexpr bool kInterleavedChunks =
-        !std::is_same_v<DTYPE_O, opus::fp4_t> && sizeof(DTYPE_I) == 2 && kChunkElems > 0 &&
-        thread_data_size % kChunkElems == 0 && kChunks > 1;
+        kTunedForThisArch && !std::is_same_v<DTYPE_O, opus::fp4_t> && sizeof(DTYPE_I) == 2 &&
+        kChunkElems > 0 && thread_data_size % kChunkElems == 0 && kChunks > 1;
 
     using chunk_t = opus::vector_t<DTYPE_I, kChunkElems>;
 
@@ -1009,18 +1028,22 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
             // and the lost read locality outweighs the saved launch overhead: 27.0 -> 27.7.
                 constexpr bool kColMajor =
                     std::is_same_v<out_t, opus::fp4_t> && ss && _GS == 128;
-                static constexpr int32_t dynGroupQuantBlockSize = kColMajor ? 64 : 256;
-                const int num_group_per_tg = dynGroupQuantBlockSize / num_thread_per_group;
+                // See the note at the other launch site: the 64/256 split is gfx1250-only.
+                static constexpr int32_t kBlkTuned = kColMajor ? 64 : 256;
+                const int32_t blk_rt = dyn_gq_tuned_arch() ? kBlkTuned : 64;
+                const int num_group_per_tg = blk_rt / num_thread_per_group;
                 static constexpr int32_t ooba = 4 / sizeof(out_t);
                 const int64_t oob_elems =
                     (static_cast<int64_t>(ori_rows) * ori_cols + ooba - 1) / ooba * ooba;
                 const int64_t oob_size = oob_elems * static_cast<int64_t>(sizeof(out_t));
                 dim3 const grid((num_group + num_group_per_tg - 1) / num_group_per_tg);
-                dim3 const block(dynGroupQuantBlockSize);
+                dim3 const block(blk_rt);
                 AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
                     input.dtype(), "dynamic_per_group_scaled_quant_kernel", [&] {
                         using input_dtype = typename aiter::hip2opus<scalar_t>::type;
-                        aiter::dynamic_per_group_scaled_quant_kernel<input_dtype, out_t, thread_data_size, _GS, ss, dynGroupQuantBlockSize>
+                        auto launch_bs = [&](auto blk_tag) {
+                        constexpr int32_t BS = decltype(blk_tag)::value;
+                        aiter::dynamic_per_group_scaled_quant_kernel<input_dtype, out_t, thread_data_size, _GS, ss, BS>
                             <<<grid, block, 0, stream>>>(
                             reinterpret_cast<out_t*>(out.data_ptr()),
                             reinterpret_cast<float*>(scales.data_ptr()),
@@ -1032,6 +1055,11 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
                             oob_size,
                             num_rows_ptr,
                             num_rows_factor);
+                        };
+                        if(blk_rt == kBlkTuned)
+                            launch_bs(std::integral_constant<int32_t, kBlkTuned>{});
+                        else
+                            launch_bs(std::integral_constant<int32_t, 64>{});
                     });
             };
             auto do_launch = [&](auto shuffle_tag) {
@@ -1154,9 +1182,14 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
             // and the lost read locality outweighs the saved launch overhead: 27.0 -> 27.7.
             constexpr bool kColMajor =
                 (std::is_same_v<out_t, opus::fp4_t> || ee) && ss && _GS == 128;
-            static constexpr int32_t dynGroupQuantBlockSize = kColMajor ? 64 : 256;
-            const int num_group_per_tg = dynGroupQuantBlockSize / num_thread_per_group;
-            dim3 const block(dynGroupQuantBlockSize);
+            // The 64/256 split was swept on gfx1250 and leans on that part's wave width
+            // and dispatch behaviour; nothing was measured on gfx950, so an untuned arch
+            // keeps the 64 it always had. Block size is a template argument, so both are
+            // instantiated and the arch picks between them at launch.
+            static constexpr int32_t kBlkTuned = kColMajor ? 64 : 256;
+            const int32_t blk_rt = dyn_gq_tuned_arch() ? kBlkTuned : 64;
+            const int num_group_per_tg = blk_rt / num_thread_per_group;
+            dim3 const block(blk_rt);
             // e8m0 + shuffle pads scaleN up to a multiple of 8 (tile width)
             // for the MX hw layout (_GS == 32 only); group_size == 128
             // shuffle is a plain transpose, no padding.
@@ -1182,11 +1215,11 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
             //     spare. Measured at [T, 7168]: staging costs 15% at T=128 (224 blocks)
             //     and 4% at T=512, and wins from a few thousand blocks up. The gate is
             //     blocks per SIMD, not T, so it travels across shapes.
-            static constexpr int kGroupsPerStagedBlock =
-                (dynGroupQuantBlockSize / num_thread_per_group) * DYN_GQ_TDM_KPT;
+            const int kGroupsPerStagedBlock = num_group_per_tg * DYN_GQ_TDM_KPT;
             static constexpr int kTdmMinBlocksPerSimd = DYN_GQ_TDM_MIN_BLK_PER_SIMD;
             const int simds = static_cast<int>(get_num_cu_func()) * 4;   // 4 SIMDs per CU
             const bool use_tdm =
+                dyn_gq_tuned_arch() &&
                 kColMajor && DYN_GQ_TDM_KPT > 1 && (rows % kGroupsPerStagedBlock) == 0 &&
                 (num_group / kGroupsPerStagedBlock) >= simds * kTdmMinBlocksPerSimd;
 
@@ -1203,9 +1236,10 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
             AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
                 input.dtype(), "dynamic_per_group_scaled_quant_kernel", [&] {
                     using input_dtype = typename aiter::hip2opus<scalar_t>::type;
-                    auto launch_one = [&](auto tdm_tag) {
+                    auto launch_one = [&](auto tdm_tag, auto blk_tag) {
                     constexpr bool tt = decltype(tdm_tag)::value;
-                    aiter::dynamic_per_group_scaled_quant_kernel<input_dtype, out_t, thread_data_size, _GS, ss, dynGroupQuantBlockSize, ee, tt>
+                    constexpr int32_t BS = decltype(blk_tag)::value;
+                    aiter::dynamic_per_group_scaled_quant_kernel<input_dtype, out_t, thread_data_size, _GS, ss, BS, ee, tt>
                         <<<grid, block, 0, stream>>>(
                         reinterpret_cast<out_t*>(out.data_ptr()),
                         reinterpret_cast<float*>(scales.data_ptr()),
@@ -1218,10 +1252,18 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                         num_rows_ptr,
                         num_rows_factor);
                     };
-                    if(use_tdm)
-                        launch_one(std::true_type{});
+                    using BlkTuned = std::integral_constant<int32_t, kBlkTuned>;
+                    using Blk64    = std::integral_constant<int32_t, 64>;
+                    if(blk_rt == kBlkTuned)
+                    {
+                        if(use_tdm) launch_one(std::true_type{},  BlkTuned{});
+                        else        launch_one(std::false_type{}, BlkTuned{});
+                    }
                     else
-                        launch_one(std::false_type{});
+                    {
+                        if(use_tdm) launch_one(std::true_type{},  Blk64{});
+                        else        launch_one(std::false_type{}, Blk64{});
+                    }
                 });
         };
 
