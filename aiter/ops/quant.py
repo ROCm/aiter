@@ -912,6 +912,23 @@ def fused_dynamic_mx_quant_moe_sort_hip(
 
 
 @compile_ops("module_quant", develop=True)
+def fused_dynamic_mx_quant_moe_sort_hip_bounded(
+    out: torch.Tensor,
+    scales: torch.Tensor,
+    input: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    token_num: int,
+    block_m: int,
+    total_routes: int,
+    num_experts_upper_bound: int,
+    group_size: int = 32,
+    sorted_weights: torch.Tensor | None = None,
+) -> None:
+    """Launch using a distribution-independent padded-row upper bound."""
+
+
+@compile_ops("module_quant", develop=True)
 def quant_mxfp4(
     inp: torch.Tensor,
     out_packed: torch.Tensor,
@@ -1045,6 +1062,7 @@ def fused_dynamic_mx_quant_moe_sort(
     num_rows: torch.Tensor | None = None,
     group_size: int = 32,
     sorted_weights: torch.Tensor | None = None,
+    num_experts_upper_bound: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Unified fused dynamic MX quant + MoE-sort entry (MXFP4 / MXFP8).
 
@@ -1076,6 +1094,9 @@ def fused_dynamic_mx_quant_moe_sort(
     ``M = 8*1024/topk * topk = 8*1024``. The previous ``fused_dynamic_mxfp4_*``
     /``fused_dynamic_mxfp8_*`` entries are retained as thin wrappers for
     backward compatibility.
+
+    ``num_experts_upper_bound`` caps the grid at a safe host-side bound without
+    exceeding the legacy extent or reading a device count.
     """
     if quant_dtype not in (dtypes.fp4x2, dtypes.fp8):
         raise ValueError(
@@ -1117,17 +1138,34 @@ def fused_dynamic_mx_quant_moe_sort(
     )
     if use_fused:
         out = torch.empty(M, out_cols, dtype=quant_dtype, device=input.device)
-        fused_dynamic_mx_quant_moe_sort_hip(
-            out,
-            scale,
-            input,
-            sorted_ids,
-            num_valid_ids,
-            token_num,
-            block_size,
-            group_size,
-            sorted_weights,
-        )
+        if num_experts_upper_bound is None:
+            fused_dynamic_mx_quant_moe_sort_hip(
+                out,
+                scale,
+                input,
+                sorted_ids,
+                num_valid_ids,
+                token_num,
+                block_size,
+                group_size,
+                sorted_weights,
+            )
+        else:
+            # Pass the routing top-k explicitly: at stage1 ``input`` has only M
+            # rows, from which the HIP kernel would infer a top-k of 1.
+            fused_dynamic_mx_quant_moe_sort_hip_bounded(
+                out,
+                scale,
+                input,
+                sorted_ids,
+                num_valid_ids,
+                token_num,
+                block_size,
+                token_num * topk,
+                num_experts_upper_bound,
+                group_size,
+                sorted_weights,
+            )
     else:
         # Split path: per-token quant produces unswizzled e8m0 byte scale,
         # then `mxfp4_moe_sort_hip` (dtype-agnostic byte shuffle) sorts +
@@ -1160,6 +1198,7 @@ def fused_dynamic_mxfp4_quant_moe_sort(
     num_rows: torch.Tensor | None = None,
     group_size: int = 32,
     sorted_weights: torch.Tensor | None = None,
+    num_experts_upper_bound: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Backward-compat wrapper around :func:`fused_dynamic_mx_quant_moe_sort`.
 
@@ -1178,6 +1217,7 @@ def fused_dynamic_mxfp4_quant_moe_sort(
         num_rows=num_rows,
         group_size=group_size,
         sorted_weights=sorted_weights,
+        num_experts_upper_bound=num_experts_upper_bound,
     )
 
 
@@ -1191,6 +1231,7 @@ def fused_dynamic_mxfp8_quant_moe_sort(
     num_rows: torch.Tensor | None = None,
     group_size: int = 32,
     sorted_weights: torch.Tensor | None = None,
+    num_experts_upper_bound: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Backward-compat wrapper around :func:`fused_dynamic_mx_quant_moe_sort`.
 
@@ -1219,6 +1260,7 @@ def fused_dynamic_mxfp8_quant_moe_sort(
         num_rows=num_rows,
         group_size=group_size,
         sorted_weights=sorted_weights,
+        num_experts_upper_bound=num_experts_upper_bound,
     )
 
 

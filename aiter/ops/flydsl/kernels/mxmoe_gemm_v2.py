@@ -168,6 +168,7 @@ def issue_a_load_lds_dt(
     KH_TILE_A,
     K_BYTES,
     BM=32,
+    route_centric_m1=False,
 ):
     """A->LDS DMA for one K-tile; gemm2 A is the already-sorted row, OOB-zero via the flat buffer view bounds."""
     lanes_per_row = KH_TILE_A // 16  # 8 (fp4) / 16 (fp8)
@@ -201,7 +202,10 @@ def issue_a_load_lds_dt(
             if const_expr(is_f8)
             else lds_swizzle_mask(lds_row + a_lane_row, KH_TILE_A)
         )
-        car = m_row + lds_row + a_lane_row  # direct sorted row
+        if const_expr(route_centric_m1):
+            car = _udiv(m_row, fx.Int32(BM))
+        else:
+            car = m_row + lds_row + a_lane_row  # direct sorted row
         voffset = (lane_col ^ mask) + car * K_BYTES
         off = fx.Int32(slot * (BM * KH_TILE_A)) + lds_row * KH_TILE_A
         # The byte offset is non-negative and 4-byte aligned; avoid signed-division fixup VGPRs.
@@ -255,6 +259,7 @@ def gemm2_body_v2(
     g2_epi_lanes=None,
     g2_apre=False,
     enable_bias=False,
+    route_centric_m1=False,
 ):
     # GEMM2 double-buffers B weight and scale one tile ahead. bhoist issues that
     # prefetch above the LDS barrier; ascale_pf prefetches A-scale one tile ahead.
@@ -310,7 +315,8 @@ def gemm2_body_v2(
     lds_acc_base = lds_base_i32
     mma_atoms = scale_mma_atoms(a_dtype, b_dtype)
 
-    aq_num_records = fx.Int64(i32_max_m_blocks) * fx.Int64(BM * K_BYTES)
+    aq_rows_per_block = 1 if route_centric_m1 else BM
+    aq_num_records = fx.Int64(i32_max_m_blocks) * fx.Int64(aq_rows_per_block * K_BYTES)
     A_NDW = 8 if is_f8_a else 4
     a_frags = [
         [fx.make_rmem_tensor(A_NDW, Int32) for _ in range_constexpr(kHalves)]
@@ -331,6 +337,7 @@ def gemm2_body_v2(
             KH_TILE_A,
             K_BYTES,
             BM=BM,
+            route_centric_m1=route_centric_m1,
         )
 
     def issue_a_ds_read(slot):
@@ -407,6 +414,21 @@ def gemm2_body_v2(
 
     def load_a_scale_tile(kt):
         chunk_kt = scale_chunk_tile(kt)
+        if const_expr(route_centric_m1):
+            compact_scale = global_typed_ptr(arg_ascale, T.i32, align=4)
+            compact_scale_cols = ((INTER_MAX // 32 + 7) // 8) * 8
+            base_dw = m_block_idx * fx.Int32(
+                compact_scale_cols // 4
+            ) + chunk_kt * fx.Int32(2)
+            raw0 = compact_scale[base_dw]
+            raw1 = compact_scale[base_dw + fx.Int32(1)]
+            lane_shift = lane_div_16 * fx.Int32(8)
+            scale_mask = fx.Int32(0xFF)
+            s0 = raw0.shrui(lane_shift) & scale_mask
+            s1 = raw1.shrui(lane_shift) & scale_mask
+            packed = s0 | (s0 << fx.Int32(8))
+            packed = packed | (s1 << fx.Int32(16)) | (s1 << fx.Int32(24))
+            return [packed]
         out = []
         for sub in range_constexpr(kScaleSubBlocks):
             saf = fx.make_fragment_like(sc_frag_tmpl)
@@ -615,6 +637,8 @@ def gemm2_body_v2(
             g2_scale_blk=g2_scale_blk,
             g2_epi_lanes=g2_epi_lanes,
             enable_bias=enable_bias,
+            route_centric_m1=route_centric_m1,
+            route_idx=m_block_idx,
             **kw,
         )
 
@@ -848,6 +872,8 @@ def atomic_bf16_epilog(
     emit_thunks=None,
     lds_ready=False,
     enable_bias=False,
+    route_centric_m1=False,
+    route_idx=None,
 ):
     if SBM is None:
         SBM = BM
@@ -887,7 +913,7 @@ def atomic_bf16_epilog(
         view = fx.Tensor(fx.make_view(ptr, fx.make_layout((1, 1), (1, 1))))
         return fx.rocdl.make_buffer_tensor(view, max_size=True)
 
-    stids = flat_buffer(arg_stids, T.i32, 4)
+    stids = None if const_expr(route_centric_m1) else flat_buffer(arg_stids, T.i32, 4)
     sweights = flat_buffer(arg_sweights, T.f32, 4)
     bias_f32 = None
     if const_expr(enable_bias):
@@ -921,10 +947,15 @@ def atomic_bf16_epilog(
     packed = []
     weight = []
     for mr in range_constexpr(M_REPS):
-        sorted_pos = m_row + mr * EPI_ROWS + m_lane
-        packed.append(load_scalar(load_i32, stids, sorted_pos, Int32))
-        if const_expr(not defer_w):
-            weight.append(load_scalar(load_f32, sweights, sorted_pos, Float32))
+        if const_expr(route_centric_m1):
+            packed.append(route_idx << fx.Int32(24))
+            if const_expr(not defer_w):
+                weight.append(load_scalar(load_f32, sweights, route_idx, Float32))
+        else:
+            sorted_pos = m_row + mr * EPI_ROWS + m_lane
+            packed.append(load_scalar(load_i32, stids, sorted_pos, Int32))
+            if const_expr(not defer_w):
+                weight.append(load_scalar(load_f32, sweights, sorted_pos, Float32))
 
     if const_expr(not lds_ready):
         if const_expr(emit_thunks is None):
@@ -933,14 +964,16 @@ def atomic_bf16_epilog(
 
             def _write_i(i, only_j=None):
                 row_base = fx.Int32(i * 16) + lane_div_16 * 4
-                w_row = (
-                    None
-                    if const_expr(defer_w)
-                    else [
+                if const_expr(defer_w):
+                    w_row = None
+                elif const_expr(route_centric_m1):
+                    route_weight = load_scalar(load_f32, sweights, route_idx, Float32)
+                    w_row = [route_weight for _ in range_constexpr(4)]
+                else:
+                    w_row = [
                         load_scalar(load_f32, sweights, m_row + row_base + v, Float32)
                         for v in range_constexpr(4)
                     ]
-                )
                 for J in range_constexpr(numAccN):
                     if const_expr(only_j is not None and J != only_j):
                         continue
@@ -1191,7 +1224,11 @@ def atomic_bf16_epilog(
 
         @flyc.jit
         def store_if_valid(token_id, mr):
-            if token_id < i32_M:
+            if const_expr(route_centric_m1):
+                row_in_block = fx.Int32(mr * EPI_ROWS) + m_lane
+                if (token_id < i32_M) & (row_in_block == fx.Int32(0)):
+                    store_one_mr(mr)
+            elif token_id < i32_M:
                 store_one_mr(mr)
 
         store_if_valid(token_id, mr)

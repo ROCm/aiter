@@ -8,6 +8,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int8, T
+from flydsl.expr.typing import as_ir_value as _raw
 
 from aiter.jit.utils.chip_info import get_cu_num
 
@@ -129,9 +130,27 @@ def compile_gemm2_a4w4_port(
     g2_kstatic=False,
     out_dtype="bf16",
     enable_bias=False,
+    route_centric_m1=False,
 ):
     """Compile gemm2 a4w4 down-proj; epilog 'atomic' (weighted atomic-fadd) or 'reduce' (store into out[token_id*topk+slot]). inter_dim runtime; SBM None -> SBM==BM byte-identical."""
     SBM = _norm_sbm(SBM, BM)
+    if route_centric_m1 and g2_spart is None:
+        g2_spart = 0
+    if route_centric_m1 and (
+        BM != 32
+        or BN != 128
+        or BK != 128
+        or epilog != "atomic"
+        or persist
+        or a_dtype != "fp4"
+        or b_dtype != "fp4"
+        or enable_bias
+        or SBM != BM
+        or g2_spart not in (None, 0)
+    ):
+        raise AssertionError(
+            "route_centric_m1 requires BM32/BN128/BK128 non-persistent A4W4 atomic"
+        )
     if BM not in (16, 32, 64, 128) or epilog not in ("atomic", "reduce"):
         raise AssertionError(
             f"mxfp4_moe_gemm2 supports only (BM in {{16,32,64,128}}, epilog in {{'atomic','reduce'}}); "
@@ -233,7 +252,10 @@ def compile_gemm2_a4w4_port(
     tile_tag = "" if (BN, BK) == (256, 256) else f"_bn{BN}_bk{BK}"
     bias_tag = "_bias" if enable_bias else ""
     g2_epi_lanes = _pick_epi_lanes(BM, BN, route_out_fp8, g2_scale_blk)
-    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{persist_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{dw_tag}{kst_tag}{pitch_tag}{sblk_tag}{out_tag}{bias_tag}_v2_biasabi7"
+    # The direct-M1 ABI carries a runtime expert bound. Keep a distinct symbol
+    # so an older cached binary cannot be reused with the shorter kernarg list.
+    route_tag = "_route_m1_eidguard" if route_centric_m1 else ""
+    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{persist_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{dw_tag}{kst_tag}{pitch_tag}{sblk_tag}{out_tag}{bias_tag}{route_tag}_v2_biasabi7"
     name = f"gemm2_a4w4_port_{tag}"
 
     @fx.struct
@@ -263,7 +285,8 @@ def compile_gemm2_a4w4_port(
     ):
         num_n_blocks = _udiv(i32_hidden, BN)
         k_bytes = _udiv(i32_inter, 1 if is_f8 else 2)
-        aq_num = fx.Int64(i32_max_m_blocks) * fx.Int64(BM * k_bytes)
+        aq_rows_per_block = 1 if route_centric_m1 else BM
+        aq_num = fx.Int64(i32_max_m_blocks) * fx.Int64(aq_rows_per_block * k_bytes)
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         lds_base_i32 = fx.Int32(fx.ptrtoint(lds.buf.ptr))
 
@@ -282,6 +305,7 @@ def compile_gemm2_a4w4_port(
                     KH_TILE_A,
                     k_bytes,
                     BM=BM,
+                    route_centric_m1=route_centric_m1,
                 )
 
         # One (m_block, n_block) unit for a synthesized unit_bx; non-persist calls once, persist per m-tile.
@@ -328,6 +352,7 @@ def compile_gemm2_a4w4_port(
                 g2_apre=g2_apre,
                 enable_bias=enable_bias,
                 mn_idx=mn_idx,
+                route_centric_m1=route_centric_m1,
             )
 
         if const_expr(not persist and g2_spart <= 0):
@@ -335,8 +360,11 @@ def compile_gemm2_a4w4_port(
             issue_all_a_loads(_udiv(bx_i32, num_n_blocks) * fx.Int32(BM))
             rocdl.sched_barrier(0)
 
-            cumsum0 = global_typed_ptr(arg_cumsum, T.i32)[0]
-            total_m_blocks = _udiv(cumsum0, BM)
+            if const_expr(route_centric_m1):
+                total_m_blocks = i32_grid_blocks
+            else:
+                cumsum0 = global_typed_ptr(arg_cumsum, T.i32)[0]
+                total_m_blocks = _udiv(cumsum0, BM)
             bound = total_m_blocks * fx.Int32(num_n_blocks)
 
             if fx.Int32(bx_i32) < bound:
@@ -383,6 +411,90 @@ def compile_gemm2_a4w4_port(
                 rocdl.sched_barrier(0)
                 if fx.Int32(m_block) < total_m_blocks:
                     run_unit(unit_bx)
+
+    if route_centric_m1:
+
+        @flyc.kernel(name=name, known_block_size=[256, 1, 1])
+        def gemm2_kernel(
+            arg_aq: fx.Int64,
+            arg_ascale: fx.Int64,
+            arg_bq: fx.Int64,
+            arg_bscale: fx.Int64,
+            arg_eids: fx.Int64,
+            arg_sweights: fx.Int64,
+            arg_out: fx.Int64,
+            i32_routes: fx.Int32,
+            i32_experts: fx.Int32,
+            i32_inter: fx.Int32,
+            i32_hidden: fx.Int32,
+        ):
+            tx_i32 = fx.Int32(gpu.thread_id("x"))
+            bx_i32 = fx.Int32(gpu.block_id("x"))
+            lane = tx_i32 % fx.Int32(64)
+            wave = rocdl.readfirstlane(T.i32, tx_i32 // fx.Int32(64))
+            num_n_blocks = _udiv(i32_hidden, BN)
+            route_idx = _udiv(bx_i32, num_n_blocks)
+            expert_id = rocdl.readfirstlane(
+                T.i32, _raw(global_typed_ptr(arg_eids, T.i32)[route_idx])
+            )
+            expert_valid = (expert_id >= fx.Int32(0)) & (expert_id < i32_experts)
+            # Stage1 leaves an invalid route's intermediate untouched, so guard
+            # the whole stage2 unit ahead of its A prefetch: the row is never
+            # read and the route adds zero to the pre-zeroed output.
+            if expert_valid:
+                _gemm2_kernel_body(
+                    arg_aq,
+                    arg_ascale,
+                    arg_bq,
+                    arg_bscale,
+                    arg_eids,
+                    None,
+                    None,
+                    arg_sweights,
+                    None,
+                    arg_out,
+                    bx_i32,
+                    lane,
+                    wave,
+                    fx.Int32(1),
+                    i32_routes,
+                    i32_inter,
+                    i32_hidden,
+                    i32_routes,
+                )
+
+        @flyc.jit
+        def launch_gemm2(
+            arg_aq: fx.Int64,
+            arg_ascale: fx.Int64,
+            arg_bq: fx.Int64,
+            arg_bscale: fx.Int64,
+            arg_eids: fx.Int64,
+            arg_sweights: fx.Int64,
+            arg_out: fx.Int64,
+            i32_routes: fx.Int32,
+            i32_experts: fx.Int32,
+            i32_inter: fx.Int32,
+            i32_hidden: fx.Int32,
+            stream: fx.Stream,
+        ):
+            num_n_blocks = fx.Int32(fx.Uint32(i32_hidden) // fx.Uint32(BN))
+            grid_x = i32_routes * num_n_blocks
+            gemm2_kernel(
+                arg_aq,
+                arg_ascale,
+                arg_bq,
+                arg_bscale,
+                arg_eids,
+                arg_sweights,
+                arg_out,
+                i32_routes,
+                i32_experts,
+                i32_inter,
+                i32_hidden,
+            ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
+
+        return launch_gemm2
 
     @flyc.kernel(name=name, known_block_size=[256, 1, 1])
     def gemm2_kernel(

@@ -24,6 +24,17 @@ from ..jit.core import compile_ops
 
 
 @compile_ops("module_moe_mxfp4_aux", develop=True)
+def _mxfp4_moe_sort_internal_is_supported(
+    NE: int,
+    TOPK: int,
+    D_HIDDEN: int,
+    MB: int,
+    zero_init: bool,
+) -> bool:
+    """Private dispatch probe; not exported through ``aiter.ops`` or ``aiter``."""
+
+
+@compile_ops("module_moe_mxfp4_aux", develop=True)
 def mxfp4_moe_sort_quant(
     a_input: Tensor,
     topk_ids: Tensor,

@@ -17,6 +17,7 @@ from typing import Any, ClassVar
 # ── Supported shape tuples ─────────────────────────────────────────────────
 # (NE, D_HIDDEN, D_INTER, TOPK)
 SHAPES = [
+    (896, 3584, 384, 16),  # Kimi-K3 A4W4 TP=8
     (385, 7168, 512, 9),  # Kimi-K2.5 TP=4
     (385, 7168, 1024, 9),  # Kimi-K2.5 TP=2 (kimik2_c)
     (257, 7168, 512, 9),  # DSR (dsv3_b)

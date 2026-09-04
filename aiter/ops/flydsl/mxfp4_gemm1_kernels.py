@@ -3,6 +3,7 @@
 
 
 import functools
+import math
 
 import torch
 
@@ -30,6 +31,7 @@ def _get_compiled_mxfp4_gemm1_port(
     BK,
     interleave=False,
     xcd_swizzle=0,
+    act="silu",
 ):
     from .kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port
 
@@ -45,6 +47,7 @@ def _get_compiled_mxfp4_gemm1_port(
         BK=BK,
         interleave=interleave,
         xcd_swizzle=xcd_swizzle,
+        act=act,
     )
 
 
@@ -91,8 +94,20 @@ def flydsl_mxfp4_gemm1(
     BK=256,
     interleave=False,
     xcd_swizzle=0,
+    act="silu",
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
     stream=None,
 ):
+    if act not in ("silu", "situv2"):
+        raise ValueError(f"unsupported activation variant {act!r}")
+    if act == "situv2" and (
+        not math.isfinite(float(situ_beta))
+        or not math.isfinite(float(situ_linear_beta))
+        or float(situ_beta) <= 0
+        or float(situ_linear_beta) <= 0
+    ):
+        raise ValueError("SiTUv2 beta and linear_beta must be finite and positive")
     _assert_supported(
         NE=NE,
         D_HIDDEN=D_HIDDEN,
@@ -118,23 +133,24 @@ def flydsl_mxfp4_gemm1(
         BK,
         interleave,
         xcd_swizzle,
+        act,
     )
     grid = gemm1_grid(n_tokens, BM, NE=NE, TOPK=topk, INTER=D_INTER, BN=BN)
-    _moe_kernels._run_compiled(
-        launch,
-        (
-            a_quant.data_ptr(),
-            a_scale_sorted_shuffled.data_ptr(),
-            w1_u8.data_ptr(),
-            w1_scale_u8.data_ptr(),
-            sorted_expert_ids.data_ptr(),
-            cumsum_tensor.data_ptr(),
-            m_indices.data_ptr(),
-            n_tokens,
-            grid,
-            inter_sorted_quant.data_ptr(),
-            inter_sorted_shuffled_scale.data_ptr(),
-            hidden_states.data_ptr(),
-            torch.cuda.current_stream() if stream is None else stream,
-        ),
+    args = (
+        a_quant.data_ptr(),
+        a_scale_sorted_shuffled.data_ptr(),
+        w1_u8.data_ptr(),
+        w1_scale_u8.data_ptr(),
+        sorted_expert_ids.data_ptr(),
+        cumsum_tensor.data_ptr(),
+        m_indices.data_ptr(),
+        n_tokens,
+        grid,
+        inter_sorted_quant.data_ptr(),
+        inter_sorted_shuffled_scale.data_ptr(),
+        hidden_states.data_ptr(),
     )
+    if act == "situv2":
+        args += (float(situ_beta), float(situ_linear_beta))
+    args += (torch.cuda.current_stream() if stream is None else stream,)
+    _moe_kernels._run_compiled(launch, args)

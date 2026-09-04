@@ -20,6 +20,7 @@ import time
 
 from aiter.aot.flydsl.common import collect_aot_jobs, compile_only_env, override_env
 from aiter.jit.core import AITER_CONFIGS, AITER_ROOT_DIR
+from aiter.ops.flydsl.moe_direct_m1 import is_direct_kernel_name
 
 _MODEL_CONFIG_DIR = f"{AITER_ROOT_DIR}/aiter/configs/model_configs"
 # moe.py defers every ``flydsl_moe2_layout_`` name to this module, so a CSV the
@@ -40,6 +41,15 @@ _STAGE2_FP8_ROUTE_OUT = os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
 
 def _job_key(job: dict) -> tuple:
     """Dedup key == the runtime FlyDSL cache key."""
+    if job.get("direct_m1"):
+        key = (
+            "direct_m1",
+            job["stage"],
+            job["kernel_name"],
+            job["D_HIDDEN"],
+            job["D_INTER"],
+        )
+        return key + (job["NE"], job["topk"]) if job["stage"] == 1 else key
     if job.get("v2_stage2"):
         return (
             2,
@@ -63,7 +73,7 @@ def _job_key(job: dict) -> tuple:
             job.get("g2_bf16_lds"),
         )
     if job["stage"] == 1:
-        return (
+        key = (
             1,
             job["BM"],
             job["use_nt"],
@@ -74,6 +84,8 @@ def _job_key(job: dict) -> tuple:
             job["topk"],
             job["xcd_swizzle"],
         )
+        activation = job.get("activation", "silu")
+        return key if activation == "silu" else key + (activation,)
     return (
         2,
         job["BM"],
@@ -109,6 +121,16 @@ def parse_csv(csv_path: str):
 
     with open(csv_path, newline="") as f:
         for row in csv.DictReader(f):
+            kn1 = (row.get("kernelName1") or "").strip()
+            kn2 = (row.get("kernelName2") or "").strip()
+            if is_direct_kernel_name(kn1) or is_direct_kernel_name(kn2):
+                from aiter.ops.flydsl.moe_direct_m1 import aot_jobs
+
+                for job in aot_jobs(row):
+                    _add(job)
+                continue
+            activation = str(row.get("act_type", "")).split(".")[-1].strip().lower()
+            activation = "situv2" if activation == "situv2" else "silu"
             topk = int(row["topk"])
             # Shape comes from CSV columns; layout-v2 uses the exact K.
             model_dim = int(row["model_dim"])
@@ -116,19 +138,18 @@ def parse_csv(csv_path: str):
             inter_dim = int(row["inter_dim"])
             d_inter = ((inter_dim + 255) // 256) * 256
             d_inter_real = inter_dim if inter_dim != d_inter else None
-            kn2 = (row.get("kernelName2") or "").strip()
             v2_g2 = parse_flydsl_v2_gemm2_kernel(kn2)
             if v2_g2 is not None:
                 v2_d_inter = inter_dim
             else:
                 v2_d_inter = d_inter
 
-            kn1 = (row.get("kernelName1") or "").strip()
             if _is_mxfp4_kname(kn1):
                 p1 = _parse_mxfp4_g1_kname(kn1)
                 _add(
                     {
                         "stage": 1,
+                        "activation": activation,
                         "kernel_name": kn1,
                         "BM": p1["BM"],
                         "use_nt": p1["use_nt"],
@@ -224,6 +245,10 @@ def _dummy(nbytes=256):
 
 
 def _compile_stage1(job):
+    from aiter.ops.flydsl.moe_common import (
+        DEFAULT_SITUV2_BETA,
+        DEFAULT_SITUV2_LINEAR_BETA,
+    )
     from aiter.ops.flydsl.mxfp4_gemm1_kernels import flydsl_mxfp4_gemm1
 
     d = _dummy()
@@ -247,6 +272,9 @@ def _compile_stage1(job):
         D_INTER=job["D_INTER"],
         topk=job["topk"],
         xcd_swizzle=job["xcd_swizzle"],
+        act=job.get("activation", "silu"),
+        situ_beta=DEFAULT_SITUV2_BETA,
+        situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
         stream=0,
     )
 
@@ -382,7 +410,11 @@ def compile_one_config(**job):
         # get_rocm_arch() detects gfx942 and the gfx950 intrinsics fail to
         # select (LLVM aborts), so pin FLYDSL_GPU_ARCH=gfx950.
         with compile_only_env(), override_env("FLYDSL_GPU_ARCH", "gfx950"):
-            if stage == 1:
+            if job.get("direct_m1"):
+                from aiter.ops.flydsl.moe_direct_m1 import compile_aot_job
+
+                compile_aot_job(**job)
+            elif stage == 1:
                 _compile_stage1(job)
             elif job.get("v2_stage2"):
                 _compile_v2_stage2(job)

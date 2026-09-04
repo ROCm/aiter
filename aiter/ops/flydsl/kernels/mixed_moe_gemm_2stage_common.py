@@ -143,8 +143,21 @@ def compile_mixed_moe_gemm1_common(
     k_wave: int = 1,
     shared_expert_id: int | None = None,
     v2_output_layout: bool = False,
+    route_centric_m1: bool = False,
 ):
     """Compile stage1 kernel: act(X @ W_gate.T, X @ W_up.T) -> [tokens*topk, inter_dim]."""
+    if route_centric_m1 and (
+        tile_m != 32
+        or persist_m != 1
+        or k_batch != 1
+        or a_dtype != "fp4"
+        or b_dtype != "fp4"
+        or out_dtype != "fp4"
+        or not v2_output_layout
+    ):
+        raise ValueError(
+            "route_centric_m1 requires BM32/PM1/non-split A4W4 with compact FP4 v2 output"
+        )
     heterogeneous_b = shared_expert_id is not None
     if heterogeneous_b and shared_expert_id != experts - 1:
         raise ValueError(
@@ -270,6 +283,7 @@ def compile_mixed_moe_gemm1_common(
     as1_tag = "_as1" if a_scale_one else ""
     xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
     v2out_tag = "_v2out" if v2_output_layout else ""
+    route_tag = "_route_m1" if route_centric_m1 else ""
     # Keep the historical name for silu; swiglu/situv2 get distinct symbols so
     # they cannot alias. SiTUv2 beta values are runtime kernel arguments and
     # therefore must not be part of the on-disk symbol/cache identity.
@@ -280,7 +294,7 @@ def compile_mixed_moe_gemm1_common(
     kernel_version = 34 if heterogeneous_b else 33
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}_v{kernel_version}"
+        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{route_tag}{heterogeneous_tag}_v{kernel_version}"
     ).replace("-", "_")
 
     cshuffle_elem_bytes = 4 if need_quant else (4 if out_is_f32 else 2)
@@ -623,26 +637,41 @@ def compile_mixed_moe_gemm1_common(
             x_nbytes_i32 = arith.index_cast(T.i32, x_nbytes_idx)
             x_rsrc = ptr_buffer_resource(arg_x, x_nbytes_i32)
 
-            shared_w_rsrc = ptr_buffer_resource(arg_shared_w, shared_w_nbytes)
+            shared_w_rsrc = (
+                ptr_buffer_resource(arg_shared_w, shared_w_nbytes)
+                if heterogeneous_b
+                else None
+            )
 
-            numids_rsrc = ptr_buffer_resource(
-                arg_num_valid_ids, arith.constant(4, type=T.i32)
-            )
-            num_valid_i32 = buffer_ops.buffer_load(
-                numids_rsrc, arith.constant(0, index=True), vec_width=1, dtype=T.i32
-            )
+            if const_expr(route_centric_m1):
+                num_valid_i32 = arith.index_cast(
+                    T.i32, size_expert_ids_in * arith.constant(sort_block_m, index=True)
+                )
+            else:
+                numids_rsrc = ptr_buffer_resource(
+                    arg_num_valid_ids, arith.constant(4, type=T.i32)
+                )
+                num_valid_i32 = buffer_ops.buffer_load(
+                    numids_rsrc,
+                    arith.constant(0, index=True),
+                    vec_width=1,
+                    dtype=T.i32,
+                )
 
             sx_rsrc = 1
             sw_rsrc = 1
             if const_expr(not a_scale_one):
                 c32 = arith.constant(32, index=True)
                 kblk = k_in // c32
-                scale_rows = (
-                    (sorted_m + arith.constant(31, index=True))
-                    // arith.constant(32, index=True)
-                    * arith.constant(32, index=True)
-                )
-                sx_nbytes_idx = scale_rows * kblk
+                if const_expr(route_centric_m1):
+                    sx_nbytes_idx = arith.constant(32, index=True) * kblk
+                else:
+                    scale_rows = (
+                        (sorted_m + arith.constant(31, index=True))
+                        // arith.constant(32, index=True)
+                        * arith.constant(32, index=True)
+                    )
+                    sx_nbytes_idx = scale_rows * kblk
                 sx_nbytes_i32 = arith.index_cast(T.i32, sx_nbytes_idx)
                 sx_rsrc = ptr_buffer_resource(arg_scale_x, sx_nbytes_i32)
 
@@ -661,16 +690,26 @@ def compile_mixed_moe_gemm1_common(
             shared_sw_nbytes_i32 = arith.index_cast(
                 T.i32, shared_scale_rows * shared_scale_cols
             )
-            shared_sw_rsrc = ptr_buffer_resource(
-                arg_shared_scale_w, shared_sw_nbytes_i32
+            shared_sw_rsrc = (
+                ptr_buffer_resource(arg_shared_scale_w, shared_sw_nbytes_i32)
+                if heterogeneous_b
+                else None
             )
 
             sorted_nbytes_idx = size_expert_ids_in * arith.constant(
-                sort_block_m * 4, index=True
+                4 if route_centric_m1 else sort_block_m * 4, index=True
             )
             sorted_nbytes_i32 = arith.index_cast(T.i32, sorted_nbytes_idx)
-            sorted_rsrc = ptr_buffer_resource(arg_sorted_token_ids, sorted_nbytes_i32)
-            sorted_w_rsrc = ptr_buffer_resource(arg_sorted_weights, sorted_nbytes_i32)
+            sorted_rsrc = (
+                None
+                if route_centric_m1
+                else ptr_buffer_resource(arg_sorted_token_ids, sorted_nbytes_i32)
+            )
+            sorted_w_rsrc = (
+                ptr_buffer_resource(arg_sorted_weights, sorted_nbytes_i32)
+                if doweight_stage1
+                else None
+            )
 
             eid_nbytes_idx = size_expert_ids_in * arith.constant(4, index=True)
             eid_nbytes_i32 = arith.index_cast(T.i32, eid_nbytes_idx)
@@ -684,20 +723,25 @@ def compile_mixed_moe_gemm1_common(
             sorted_scale_cols_i32 = arith.constant(sorted_scale_cols, type=T.i32)
             sorted_scale_rsrc = None
             if const_expr(need_sort):
-                sort_rows_idx = size_expert_ids_in * arith.constant(
-                    sort_block_m, index=True
-                )
-                sort_padded_rows = (
-                    (sort_rows_idx + arith.constant(255, index=True))
-                    // arith.constant(256, index=True)
-                    * arith.constant(256, index=True)
-                )
                 sort_padded_cols = arith.constant(
                     ((sorted_scale_cols + 7) // 8) * 8, index=True
                 )
-                sort_scale_nbytes = arith.index_cast(
-                    T.i32, sort_padded_rows * sort_padded_cols
-                )
+                if const_expr(route_centric_m1):
+                    sort_scale_nbytes = arith.index_cast(
+                        T.i32, size_expert_ids_in * sort_padded_cols
+                    )
+                else:
+                    sort_rows_idx = size_expert_ids_in * arith.constant(
+                        sort_block_m, index=True
+                    )
+                    sort_padded_rows = (
+                        (sort_rows_idx + arith.constant(255, index=True))
+                        // arith.constant(256, index=True)
+                        * arith.constant(256, index=True)
+                    )
+                    sort_scale_nbytes = arith.index_cast(
+                        T.i32, sort_padded_rows * sort_padded_cols
+                    )
                 sorted_scale_rsrc = ptr_buffer_resource(
                     arg_out_scale_sorted, sort_scale_nbytes
                 )
@@ -714,7 +758,10 @@ def compile_mixed_moe_gemm1_common(
             bx_m = bx * arith.constant(sort_block_m, index=True)
 
             bx_m_i32 = arith.index_cast(T.i32, bx_m)
-            blk_valid = arith.cmpi(CmpIPredicate.ult, bx_m_i32, num_valid_i32)
+            if const_expr(route_centric_m1):
+                blk_valid = arith.cmpi(CmpIPredicate.ult, bx, size_expert_ids_in)
+            else:
+                blk_valid = arith.cmpi(CmpIPredicate.ult, bx_m_i32, num_valid_i32)
             expert_i32 = buffer_ops.buffer_load(
                 expert_rsrc, bx, vec_width=1, dtype=T.i32
             )
@@ -839,11 +886,15 @@ def compile_mixed_moe_gemm1_common(
                     x_col_local_i32.append(col_local_i32)
 
                     sorted_row_i = bx_m + row_local
-                    fused_i = buffer_ops.buffer_load(
-                        sorted_rsrc, sorted_row_i, vec_width=1, dtype=T.i32
-                    )
-                    t_i32 = arith.andi(fused_i, mask24)
-                    s_i32 = arith.shrui(fused_i, arith.constant(24))
+                    if const_expr(route_centric_m1):
+                        t_i32 = arith.constant(0, type=T.i32)
+                        s_i32 = arith.index_cast(T.i32, bx)
+                    else:
+                        fused_i = buffer_ops.buffer_load(
+                            sorted_rsrc, sorted_row_i, vec_width=1, dtype=T.i32
+                        )
+                        t_i32 = arith.andi(fused_i, mask24)
+                        s_i32 = arith.shrui(fused_i, arith.constant(24))
                     t_valid = arith.cmpi(CmpIPredicate.ult, t_i32, tokens_i32)
                     s_valid = arith.cmpi(CmpIPredicate.ult, s_i32, topk_i32)
                     ts_valid = arith.andi(t_valid, s_valid)
@@ -1088,7 +1139,10 @@ def compile_mixed_moe_gemm1_common(
                 if const_expr(not a_scale_one):
                     a_scale_bases = []
                     for mi in range_constexpr(m_repeat_packed):
-                        a_mni = mi + bx_m // scale_mn_pack // 16
+                        if const_expr(route_centric_m1):
+                            a_mni = arith.constant(mi, index=True)
+                        else:
+                            a_mni = mi + bx_m // scale_mn_pack // 16
                         a_scale_bases.append(
                             a_mni * layout_a_scale.stride_n0 + scale_lane_elem
                         )
@@ -1870,9 +1924,15 @@ def compile_mixed_moe_gemm1_common(
                 if_tid = scf.IfOp(tid_in_range)
                 with ir.InsertionPoint(if_tid.then_block):
                     tid_row = bx_m + tx
-                    tid_val = buffer_ops.buffer_load(
-                        sorted_rsrc, tid_row, vec_width=1, dtype=T.i32
-                    )
+                    if const_expr(route_centric_m1):
+                        tid_val = arith.shli(
+                            arith.index_cast(T.i32, bx),
+                            arith.constant(24, type=T.i32),
+                        )
+                    else:
+                        tid_val = buffer_ops.buffer_load(
+                            sorted_rsrc, tid_row, vec_width=1, dtype=T.i32
+                        )
                     tid_vec1 = vector.from_elements(T.vec(1, T.i32), [tid_val])
                     vector.store(tid_vec1, lds_tid, [tx])
                     scf.YieldOp([])
@@ -2434,7 +2494,16 @@ def compile_mixed_moe_gemm1_common(
                 def precompute_row(*, row_local, row):
                     fused2 = memref.load(lds_tid, [row_local])
                     row_i32 = arith.index_cast(T.i32, row)
-                    row_valid0 = arith.cmpi(CmpIPredicate.ult, row_i32, num_valid_i32)
+                    if const_expr(route_centric_m1):
+                        row_valid0 = arith.cmpi(
+                            CmpIPredicate.eq,
+                            row_local,
+                            arith.constant(0, index=True),
+                        )
+                    else:
+                        row_valid0 = arith.cmpi(
+                            CmpIPredicate.ult, row_i32, num_valid_i32
+                        )
                     t = fused2 & mask24_i32
                     s = fused2 >> 24
                     t_ok = arith.cmpi(CmpIPredicate.ult, t, tokens_i32_v)
@@ -2443,7 +2512,9 @@ def compile_mixed_moe_gemm1_common(
                     t_idx = arith.index_cast(ir.IndexType.get(), t)
                     s_idx = arith.index_cast(ir.IndexType.get(), s)
                     ts_idx = t_idx * arith.constant(topk, index=True) + s_idx
-                    if const_expr(v2_output_layout):
+                    if const_expr(route_centric_m1):
+                        payload_row_idx = s_idx
+                    elif const_expr(v2_output_layout):
                         payload_row_idx = row
                     else:
                         payload_row_idx = ts_idx
@@ -2473,6 +2544,7 @@ def compile_mixed_moe_gemm1_common(
                 c15_i32 = arith.constant(15, type=T.i32)
                 c22_i32 = arith.constant(22, type=T.i32)
                 c23_i32 = arith.constant(23, type=T.i32)
+                c24_i32 = arith.constant(24, type=T.i32)
                 c28_i32 = arith.constant(28, type=T.i32)
                 c31_i32 = arith.constant(31, type=T.i32)
                 c32_i32 = arith.constant(32, type=T.i32)
@@ -2698,20 +2770,26 @@ def compile_mixed_moe_gemm1_common(
                             with ir.InsertionPoint(if_scale.then_block):
                                 row_i32_s = arith.index_cast(T.i32, row)
                                 col_s_i32 = col_g0_i32 >> c5_i32
-                                d0 = row_i32_s >> c5_i32
-                                d1 = (row_i32_s >> c4_i32) & c1_i32
-                                d2 = row_i32_s & c15_i32
-                                d3 = col_s_i32 >> c3_i32
-                                d4 = (col_s_i32 >> c2_i32) & c1_i32
-                                d5 = col_s_i32 & c3_i32
-                                byte_off = (
-                                    d0 * n32_sort
-                                    + d3 * c256_i32
-                                    + d5 * c64_i32
-                                    + d2 * c4_i32
-                                    + d4 * c2_i32
-                                    + d1
-                                )
+                                if const_expr(route_centric_m1):
+                                    route_i32 = _fused >> c24_i32
+                                    byte_off = (
+                                        route_i32 * sorted_scale_cols_i32 + col_s_i32
+                                    )
+                                else:
+                                    d0 = row_i32_s >> c5_i32
+                                    d1 = (row_i32_s >> c4_i32) & c1_i32
+                                    d2 = row_i32_s & c15_i32
+                                    d3 = col_s_i32 >> c3_i32
+                                    d4 = (col_s_i32 >> c2_i32) & c1_i32
+                                    d5 = col_s_i32 & c3_i32
+                                    byte_off = (
+                                        d0 * n32_sort
+                                        + d3 * c256_i32
+                                        + d5 * c64_i32
+                                        + d2 * c4_i32
+                                        + d4 * c2_i32
+                                        + d1
+                                    )
                                 e8m0_i8 = arith.TruncIOp(T.i8, e8m0_biased)
                                 buffer_ops.buffer_store(
                                     e8m0_i8,
@@ -3030,7 +3108,53 @@ def compile_mixed_moe_gemm1_common(
             scf.YieldOp([])
             for_ip.__exit__(None, None, None)
 
-    if heterogeneous_b:
+    if route_centric_m1:
+
+        @flyc.kernel(name=module_name, known_block_size=[total_threads, 1, 1])
+        def moe_gemm1(
+            arg_out: fx.Pointer,
+            arg_x: fx.Pointer,
+            arg_w: fx.Pointer,
+            arg_scale_x: fx.Pointer,
+            arg_scale_w: fx.Pointer,
+            arg_expert_ids: fx.Pointer,
+            arg_out_scale_sorted: fx.Pointer,
+            i32_tokens_in: fx.Int32,
+            i32_n_in: fx.Int32,
+            i32_k_in: fx.Int32,
+            i32_size_expert_ids_in: fx.Int32,
+            f32_situ_beta: fx.Float32,
+            f32_situ_beta_rcp: fx.Float32,
+            f32_situ_linear_beta: fx.Float32,
+            f32_situ_linear_beta_rcp: fx.Float32,
+            f32_swiglu_limit: fx.Float32,
+        ):
+            _emit_moe_gemm1(
+                arg_out,
+                arg_x,
+                arg_w,
+                arg_scale_x,
+                arg_scale_w,
+                None,
+                None,
+                None,
+                arg_expert_ids,
+                None,
+                None,
+                None,
+                arg_out_scale_sorted,
+                i32_tokens_in,
+                i32_n_in,
+                i32_k_in,
+                i32_size_expert_ids_in,
+                f32_situ_beta,
+                f32_situ_beta_rcp,
+                f32_situ_linear_beta,
+                f32_situ_linear_beta_rcp,
+                f32_swiglu_limit,
+            )
+
+    elif heterogeneous_b:
 
         @flyc.kernel(name=module_name, known_block_size=[total_threads, 1, 1])
         def moe_gemm1(
@@ -3154,6 +3278,7 @@ def compile_mixed_moe_gemm1_common(
         a_scale_one,
         xcd_swizzle,
         v2_output_layout,
+        route_centric_m1,
     )
     if heterogeneous_b:
         cache_tag += (shared_expert_id,)
@@ -3219,7 +3344,26 @@ def compile_mixed_moe_gemm1_common(
             - arith.constant(1, index=True)
         ) // c_pm_l
 
-        if const_expr(heterogeneous_b):
+        if const_expr(route_centric_m1):
+            launcher = moe_gemm1(
+                arg_out,
+                arg_x,
+                arg_w,
+                arg_scale_x,
+                arg_scale_w,
+                arg_expert_ids,
+                arg_out_scale_sorted,
+                i32_tokens_in,
+                i32_inter_in,
+                i32_k_in,
+                i32_size_expert_ids_in,
+                f32_situ_beta,
+                f32_situ_beta_rcp,
+                f32_situ_linear_beta,
+                f32_situ_linear_beta_rcp,
+                f32_swiglu_limit,
+            )
+        elif const_expr(heterogeneous_b):
             launcher = moe_gemm1(
                 arg_out,
                 arg_x,
@@ -3276,7 +3420,55 @@ def compile_mixed_moe_gemm1_common(
             grid=(gx, gy, k_batch), block=(total_threads, 1, 1), stream=stream
         )
 
-    if heterogeneous_b:
+    if route_centric_m1:
+
+        @flyc.jit
+        def launch_mixed_moe_gemm1(
+            arg_out: fx.Pointer,
+            arg_x: fx.Pointer,
+            arg_w: fx.Pointer,
+            arg_scale_x: fx.Pointer,
+            arg_scale_w: fx.Pointer,
+            arg_expert_ids: fx.Pointer,
+            arg_out_scale_sorted: fx.Pointer,
+            i32_tokens_in: fx.Int32,
+            i32_inter_in: fx.Int32,
+            i32_k_in: fx.Int32,
+            i32_size_expert_ids_in: fx.Int32,
+            f32_situ_beta: fx.Float32,
+            f32_situ_beta_rcp: fx.Float32,
+            f32_situ_linear_beta: fx.Float32,
+            f32_situ_linear_beta_rcp: fx.Float32,
+            f32_swiglu_limit: fx.Float32,
+            stream: fx.Stream,
+        ):
+            _launch_mixed_moe_gemm1(
+                arg_out,
+                arg_x,
+                arg_w,
+                arg_scale_x,
+                arg_scale_w,
+                None,
+                None,
+                None,
+                arg_expert_ids,
+                None,
+                None,
+                None,
+                arg_out_scale_sorted,
+                i32_tokens_in,
+                i32_inter_in,
+                i32_k_in,
+                i32_size_expert_ids_in,
+                f32_situ_beta,
+                f32_situ_beta_rcp,
+                f32_situ_linear_beta,
+                f32_situ_linear_beta_rcp,
+                f32_swiglu_limit,
+                stream,
+            )
+
+    elif heterogeneous_b:
 
         @flyc.jit
         def launch_mixed_moe_gemm1(

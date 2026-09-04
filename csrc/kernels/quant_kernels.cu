@@ -29,7 +29,7 @@ namespace aiter {
 // `per_1x32_mx_quant_hip(quant_dtype=fp8, scale_type=fp8_e8m0)` so the
 // produced byte scale is directly consumable by `mxfp4_moe_sort_hip` /
 // MXFP8 GEMM kernels without a post-hoc fp32 -> e8m0 conversion.
-template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 32, int32_t group_size = 128, bool shuffle_scale = true, int32_t block_size = 64, bool emit_e8m0_scale = false>
+template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 32, int32_t group_size = 128, bool shuffle_scale = true, int32_t block_size = 64, bool emit_e8m0_scale = false, bool zero_direct_m1_output = false>
 __global__ void __launch_bounds__(block_size)
 dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                       float* __restrict__ scale,
@@ -40,7 +40,9 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                       int32_t ori_row_stride,
                                       int64_t oob_size,
                                       int32_t const* __restrict__ num_rows = nullptr,
-                                      const int32_t num_cols_factor        = 1)
+                                      const int32_t num_cols_factor        = 1,
+                                      uint4* __restrict__ zero_output      = nullptr,
+                                      int64_t zero_output_num_vecs         = 0)
 {
     static_assert(!emit_e8m0_scale
                       || std::is_same_v<DTYPE_O, opus::fp4_t>
@@ -51,6 +53,14 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     // fp8 emits e8m0 byte scale iff caller opted in via emit_e8m0_scale.
     static constexpr bool use_e8m0_scale =
         std::is_same_v<DTYPE_O, opus::fp4_t> || emit_e8m0_scale;
+
+    if constexpr(zero_direct_m1_output)
+    {
+        for(int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+            i < zero_output_num_vecs;
+            i += static_cast<int64_t>(gridDim.x) * blockDim.x)
+            zero_output[i] = make_uint4(0, 0, 0, 0);
+    }
 
     if(num_rows != nullptr)
     {
@@ -979,6 +989,60 @@ void dynamic_per_group_scaled_quant_fp4(aiter_tensor_t& out,         // [..., d]
                 " expects fp4x2 / uint8 output; use dynamic_per_group_scaled_quant for fp8/i8");
     dynamic_per_group_scaled_quant(
         out, input, scales, group_size, shuffle_scale, num_rows, num_rows_factor);
+}
+
+void dynamic_per_group_scaled_quant_fp4_direct_m1_internal(
+    aiter_tensor_t& out,
+    const aiter_tensor_t& input,
+    aiter_tensor_t& scales,
+    aiter_tensor_t& zero_output)
+{
+    constexpr int32_t group_size = 32;
+    constexpr int32_t block_size = 64;
+    constexpr int32_t thread_data_size = 32;
+    AITER_CHECK(input.is_contiguous() && out.is_contiguous() && scales.is_contiguous() &&
+                zero_output.is_contiguous());
+    AITER_CHECK(input.dtype() == AITER_DTYPE_bf16 && zero_output.dtype() == AITER_DTYPE_bf16);
+    AITER_CHECK(out.dtype() == AITER_DTYPE_fp4x2 || out.dtype() == AITER_DTYPE_u8);
+    AITER_CHECK(scales.dtype() == AITER_DTYPE_fp8_e8m0 || scales.dtype() == AITER_DTYPE_u8);
+    AITER_CHECK(input.device_id == out.device_id && input.device_id == scales.device_id &&
+                input.device_id == zero_output.device_id);
+    const int cols = input.size(-1);
+    const int rows = input.numel() / cols;
+    const int scale_n_pad = ((cols / group_size + 7) / 8) * 8;
+    AITER_CHECK(rows == 1 && cols % group_size == 0);
+    AITER_CHECK(out.numel() == input.numel() / 2 && zero_output.numel() == input.numel());
+    AITER_CHECK(scales.numel() >= 256 * scale_n_pad && zero_output.numel() % 8 == 0);
+
+    constexpr int32_t groups_per_block = block_size;
+    dim3 grid((scale_n_pad + groups_per_block - 1) / groups_per_block);
+    HipDeviceGuard device_guard(input.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
+        input.dtype(), "dynamic_per_group_scaled_quant_fp4_direct_m1_internal", [&] {
+            using input_dtype = typename aiter::hip2opus<scalar_t>::type;
+            aiter::dynamic_per_group_scaled_quant_kernel<input_dtype,
+                                                         opus::fp4_t,
+                                                         thread_data_size,
+                                                         group_size,
+                                                         true,
+                                                         block_size,
+                                                         true,
+                                                         true>
+                <<<grid, dim3(block_size), 0, stream>>>(
+                    reinterpret_cast<opus::fp4_t*>(out.data_ptr()),
+                    reinterpret_cast<float*>(scales.data_ptr()),
+                    reinterpret_cast<input_dtype*>(input.data_ptr()),
+                    nullptr,
+                    rows,
+                    cols,
+                    input.stride(-2),
+                    (input.numel() + 3) / 4 * 4 * sizeof(opus::fp4_t),
+                    nullptr,
+                    1,
+                    reinterpret_cast<uint4*>(zero_output.data_ptr()),
+                    zero_output.numel() / 8);
+        });
 }
 
 #define SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL(quant_kernel, DTYPE_O, THREAD_DATA, BLOCK_SIZE, TRANSPOSE_OUT_DIM01, HAS_MAP, HAS_HASH) \
@@ -1935,17 +1999,16 @@ __global__ void fused_mx_quant_moe_sort_kernel(
         AITER_CHECK(false, "input last dim has exceeded the maximum value ", 32 * BlockSize);  \
     }
 
-void fused_dynamic_mx_quant_moe_sort_hip(
-    aiter_tensor_t& output,
-    aiter_tensor_t& scale,
-    const aiter_tensor_t& input,
-    const aiter_tensor_t& sorted_ids,
-    const aiter_tensor_t& num_valid_ids,
-    int token_num,
-    int block_m,
-    int group_size,
-    std::optional<aiter_tensor_t> sorted_weights
-)
+static void fused_dynamic_mx_quant_moe_sort_hip_impl(aiter_tensor_t& output,
+                                                     aiter_tensor_t& scale,
+                                                     const aiter_tensor_t& input,
+                                                     const aiter_tensor_t& sorted_ids,
+                                                     const aiter_tensor_t& num_valid_ids,
+                                                     int token_num,
+                                                     int block_m,
+                                                     int group_size,
+                                                     std::optional<aiter_tensor_t> sorted_weights,
+                                                     int64_t padded_rows_upper_bound)
 {
     int cols = input.size(-1);
     int topk = input.numel() / (cols * token_num);
@@ -1966,7 +2029,27 @@ void fused_dynamic_mx_quant_moe_sort_hip(
     int sub_block_m = (token_num * topk) > (num_cu * 8) || num_experts < 64 ? 2 : 4;
     AITER_CHECK(block_m % sub_block_m == 0, __func__, " block_m is not divisible by sub_block_m");
     int tgs_per_block_m = block_m / sub_block_m;
-    int num_blocks = (sorted_ids.size(0) + sub_block_m - 1) / sub_block_m;
+    const int64_t old_extent = sorted_ids.size(0);
+    int64_t effective_extent = old_extent;
+    if(padded_rows_upper_bound >= 0)
+    {
+        AITER_CHECK(padded_rows_upper_bound == 0 || padded_rows_upper_bound % block_m == 0,
+                    __func__,
+                    " padded row upper bound must be zero or divisible by block_m");
+        // An over-conservative host-side expert bound must never enlarge the
+        // old launch. This also preserves the legacy extent if the calculated
+        // upper bound is greater than the sorted_ids allocation.
+        effective_extent =
+            padded_rows_upper_bound < old_extent ? padded_rows_upper_bound : old_extent;
+    }
+    int num_blocks = (effective_extent + sub_block_m - 1) / sub_block_m;
+    if(num_blocks == 0 && old_extent > 0)
+    {
+        // HIP does not accept a zero-sized grid. One workgroup is enough to
+        // read num_valid_ids==0 and return; it is no larger than the legacy
+        // launch, which also contains at least one workgroup.
+        num_blocks = 1;
+    }
     const bool persistent_mode = false;
     const int input_stride     = input.stride(-2);
 
@@ -1987,6 +2070,57 @@ void fused_dynamic_mx_quant_moe_sort_hip(
     {
         AITER_CHECK(false, __func__, ": not support output type: ", AiterDtype_to_str(output.dtype()));
     }
+}
+
+void fused_dynamic_mx_quant_moe_sort_hip(aiter_tensor_t& output,
+                                         aiter_tensor_t& scale,
+                                         const aiter_tensor_t& input,
+                                         const aiter_tensor_t& sorted_ids,
+                                         const aiter_tensor_t& num_valid_ids,
+                                         int token_num,
+                                         int block_m,
+                                         int group_size,
+                                         std::optional<aiter_tensor_t> sorted_weights)
+{
+    fused_dynamic_mx_quant_moe_sort_hip_impl(output,
+                                             scale,
+                                             input,
+                                             sorted_ids,
+                                             num_valid_ids,
+                                             token_num,
+                                             block_m,
+                                             group_size,
+                                             sorted_weights,
+                                             -1);
+}
+
+void fused_dynamic_mx_quant_moe_sort_hip_bounded(aiter_tensor_t& output,
+                                                 aiter_tensor_t& scale,
+                                                 const aiter_tensor_t& input,
+                                                 const aiter_tensor_t& sorted_ids,
+                                                 const aiter_tensor_t& num_valid_ids,
+                                                 int token_num,
+                                                 int block_m,
+                                                 int64_t total_routes,
+                                                 int64_t num_experts_upper_bound,
+                                                 int group_size,
+                                                 std::optional<aiter_tensor_t> sorted_weights)
+{
+    AITER_CHECK(total_routes >= 0, __func__, " total_routes must be non-negative");
+    AITER_CHECK(
+        num_experts_upper_bound >= 0, __func__, " num_experts_upper_bound must be non-negative");
+    const int64_t padded_rows_upper_bound =
+        moe_quant_padded_rows_upper_bound(total_routes, num_experts_upper_bound, block_m);
+    fused_dynamic_mx_quant_moe_sort_hip_impl(output,
+                                             scale,
+                                             input,
+                                             sorted_ids,
+                                             num_valid_ids,
+                                             token_num,
+                                             block_m,
+                                             group_size,
+                                             sorted_weights,
+                                             padded_rows_upper_bound);
 }
 
 // Perf gate threshold for the coalesced LDS-staged store path in

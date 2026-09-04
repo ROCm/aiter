@@ -38,6 +38,7 @@ from aiter.aot.flydsl.common import (
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg as _ptr_view_safe
+from aiter.ops.flydsl.moe_direct_m1 import is_direct_kernel_name
 from aiter.ops.flydsl.moe_kernels import (
     _get_compiled_silu_fused,
     _run_compiled,
@@ -153,11 +154,10 @@ def parse_csv(csv_path: str):
                     continue
                 if name.startswith("flydsl_moe2_layout_"):
                     continue
-                # a4w4 mxmoe-port kernels are precompiled by mxfp4_moe.py; they
-                # share the flydsl_ prefix but are absent from this module's
-                # registry, so without this guard every CSV row naming one is
-                # reported as an unknown kernel.
-                if name.startswith("flydsl_mxmoe_"):
+                # mxmoe-port and direct-M1 kernels are precompiled by
+                # mxfp4_moe.py; they are absent from this registry, so without
+                # the guard every row naming one is flagged as unknown.
+                if name.startswith("flydsl_mxmoe_") or is_direct_kernel_name(name):
                     continue
 
                 params = get_flydsl_kernel_params(name)

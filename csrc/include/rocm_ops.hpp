@@ -1652,6 +1652,12 @@ namespace py = pybind11;
           py::arg("shuffle_scale")   = true,                             \
           py::arg("num_rows")        = std::nullopt,                     \
           py::arg("num_rows_factor") = 1);                               \
+    m.def("_dynamic_per_group_scaled_quant_fp4_direct_m1_internal",       \
+          &aiter::dynamic_per_group_scaled_quant_fp4_direct_m1_internal,  \
+          py::arg("out"),                                                 \
+          py::arg("input"),                                               \
+          py::arg("scales"),                                              \
+          py::arg("zero_output"));                                        \
     m.def("smooth_per_token_scaled_quant",                               \
           &aiter::smooth_per_token_scaled_quant,                         \
           py::arg("out"),                                                \
@@ -1695,6 +1701,19 @@ namespace py = pybind11;
           py::arg("num_valid_ids"),                                      \
           py::arg("token_num"),                                          \
           py::arg("block_m"),                                            \
+          py::arg("group_size")     = 32,                                \
+          py::arg("sorted_weights") = py::none());                       \
+    m.def("fused_dynamic_mx_quant_moe_sort_hip_bounded",                 \
+          &aiter::fused_dynamic_mx_quant_moe_sort_hip_bounded,           \
+          py::arg("out"),                                                \
+          py::arg("scales"),                                             \
+          py::arg("input"),                                              \
+          py::arg("sorted_ids"),                                         \
+          py::arg("num_valid_ids"),                                      \
+          py::arg("token_num"),                                          \
+          py::arg("block_m"),                                            \
+          py::arg("total_routes"),                                       \
+          py::arg("num_experts_upper_bound"),                            \
           py::arg("group_size")     = 32,                                \
           py::arg("sorted_weights") = py::none());                       \
     m.def("mxfp4_moe_sort_hip",                                          \
@@ -2658,6 +2677,13 @@ namespace py = pybind11;
           py::arg("scale"));
 
 #define MXFP4_MOE_AUX_PYBIND                  \
+    m.def("_mxfp4_moe_sort_internal_is_supported", \
+          &mxfp4_moe_sort_internal_is_supported,   \
+          py::arg("NE"),                           \
+          py::arg("TOPK"),                         \
+          py::arg("D_HIDDEN"),                     \
+          py::arg("MB"),                           \
+          py::arg("zero_init"));                   \
     m.def("mxfp4_moe_sort_quant",             \
           &mxfp4_moe_sort_quant_kernel,       \
           py::arg("a_input"),                 \

@@ -96,9 +96,37 @@ def n_out_for(inter):
 LOG2E = 1.4426950408889634
 
 
-def _silu_mul_batch(gs, us):
-    e = [fx.Float32(rocdl.exp2(T.f32, _raw(g * fx.Float32(-LOG2E)))) for g in gs]
-    sig = [fx.Float32(rocdl.rcp(T.f32, _raw(fx.Float32(1.0) + ei))) for ei in e]
+def _sigmoid_batch(xs):
+    e = [fx.Float32(rocdl.exp2(T.f32, _raw(x * fx.Float32(-LOG2E)))) for x in xs]
+    return [fx.Float32(rocdl.rcp(T.f32, _raw(fx.Float32(1.0) + ei))) for ei in e]
+
+
+def _tanh_batch(xs):
+    neg_two_log2e = fx.Float32(-2.8853900817779268)
+    es = []
+    for x in xs:
+        abs_x = x.maximumf(-x)
+        es.append(fx.Float32(rocdl.exp2(T.f32, _raw(abs_x * neg_two_log2e))))
+    recips = [fx.Float32(rocdl.rcp(T.f32, _raw(fx.Float32(1.0) + e))) for e in es]
+    zero = fx.Float32(0.0)
+    out = []
+    for i, x in enumerate(xs):
+        tanh_abs = (fx.Float32(1.0) - es[i]) * recips[i]
+        out.append((x > zero).select(tanh_abs, -tanh_abs))
+    return out
+
+
+def _activation_mul_batch(gs, us, act, situ_beta, situ_linear_beta):
+    sig = _sigmoid_batch(gs)
+    if const_expr(act == "situv2"):
+        beta_rcp = fx.Float32(rocdl.rcp(T.f32, _raw(situ_beta)))
+        linear_beta_rcp = fx.Float32(rocdl.rcp(T.f32, _raw(situ_linear_beta)))
+        gt = _tanh_batch([g * beta_rcp for g in gs])
+        ut = _tanh_batch([u * linear_beta_rcp for u in us])
+        return [
+            situ_beta * gt[i] * sig[i] * situ_linear_beta * ut[i]
+            for i in range(len(gs))
+        ]
     return [gs[i] * sig[i] * us[i] for i in range(len(gs))]
 
 
@@ -148,6 +176,8 @@ def _gemm1_body(
     use_nt,
     i32_ntok,
     i32_total_m_blocks,
+    f32_situ_beta,
+    f32_situ_linear_beta,
     *,
     BM,
     BN,
@@ -157,6 +187,7 @@ def _gemm1_body(
     N_OUT,
     NE,
     interleave=False,
+    act="silu",
 ):
     KH_TILE = BK // 2
     K_HALF = k_half_for(K)
@@ -701,7 +732,9 @@ def _gemm1_body(
             up_col = fx.Int32(128) + gate_col
             gate_vs[ee] = acc_load(acc_idx(row_local, gate_col))
             up_vs[ee] = acc_load(acc_idx(row_local, up_col))
-        result = _silu_mul_batch(gate_vs, up_vs)
+        result = _activation_mul_batch(
+            gate_vs, up_vs, act, f32_situ_beta, f32_situ_linear_beta
+        )
 
         local_max = _fabs_f32(result[0])
         for ee in range_constexpr(1, 8):
@@ -785,7 +818,10 @@ def compile_gemm1_a4w4_port(
     BK=256,
     interleave=False,
     xcd_swizzle=0,
+    act="silu",
 ):
+    if act not in ("silu", "situv2"):
+        raise ValueError(f"unsupported activation variant {act!r}")
     if (BM, use_nt, inline_quant) not in {
         (32, True, False),
         (32, False, False),
@@ -813,10 +849,11 @@ def compile_gemm1_a4w4_port(
     _, _, _, lds_bytes = _bm_constants(BM, BN, KH_TILE, _K_TILES_TOTAL)
 
     variant_tag = "iq" if inline_quant else ("nt" if use_nt else "cached")
-    # Tag with H/INTER/NE so different shape specializations get distinct
-    # kernel/smem symbols (so KIMI and non-KIMI instances never collide).
+    # Tag with H/INTER/NE so shape specializations get distinct kernel/smem symbols.
     gu_tag = "il" if interleave else "sep"
     name_suffix = f"h{_K}_i{_INTER}_ne{_NE}_bm{BM}_{variant_tag}_{gu_tag}"
+    if act == "situv2":
+        name_suffix += "_situv2"
     if xcd_swizzle > 0:
         name_suffix += f"_xcd{xcd_swizzle}"
 
@@ -824,8 +861,8 @@ def compile_gemm1_a4w4_port(
     class SharedStorage:
         raw: fx.Array[fx.Uint8, lds_bytes, 16]
 
-    @flyc.kernel(name=f"gemm1_a4w4_port_{name_suffix}", known_block_size=[256, 1, 1])
-    def gemm1_kernel(
+    @flyc.jit
+    def _emit_gemm1_kernel(
         arg_aq: fx.Int64,
         arg_ascale: fx.Int64,
         arg_bq: fx.Int64,
@@ -837,6 +874,8 @@ def compile_gemm1_a4w4_port(
         arg_aqout: fx.Int64,
         arg_ascaleout: fx.Int64,
         arg_hidden: fx.Int64,
+        f32_situ_beta: fx.Float32,
+        f32_situ_linear_beta: fx.Float32,
     ):
         lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
         tx = gpu.thread_id("x")
@@ -893,6 +932,8 @@ def compile_gemm1_a4w4_port(
                 use_nt,
                 i32_ntok,
                 total_m_blocks,
+                f32_situ_beta,
+                f32_situ_linear_beta,
                 BM=BM,
                 BN=BN,
                 BK=BK,
@@ -901,7 +942,113 @@ def compile_gemm1_a4w4_port(
                 N_OUT=_N_OUT,
                 NE=_NE,
                 interleave=interleave,
+                act=act,
             )
+
+    if act == "situv2":
+
+        @flyc.kernel(
+            name=f"gemm1_a4w4_port_{name_suffix}", known_block_size=[256, 1, 1]
+        )
+        def gemm1_kernel(
+            arg_aq: fx.Int64,
+            arg_ascale: fx.Int64,
+            arg_bq: fx.Int64,
+            arg_bscale: fx.Int64,
+            arg_eids: fx.Int64,
+            arg_cumsum: fx.Int64,
+            arg_mind: fx.Int64,
+            i32_ntok: fx.Int32,
+            arg_aqout: fx.Int64,
+            arg_ascaleout: fx.Int64,
+            arg_hidden: fx.Int64,
+            f32_situ_beta: fx.Float32,
+            f32_situ_linear_beta: fx.Float32,
+        ):
+            _emit_gemm1_kernel(
+                arg_aq,
+                arg_ascale,
+                arg_bq,
+                arg_bscale,
+                arg_eids,
+                arg_cumsum,
+                arg_mind,
+                i32_ntok,
+                arg_aqout,
+                arg_ascaleout,
+                arg_hidden,
+                f32_situ_beta,
+                f32_situ_linear_beta,
+            )
+
+        @flyc.jit
+        def launch_gemm1(
+            arg_aq: fx.Int64,
+            arg_ascale: fx.Int64,
+            arg_bq: fx.Int64,
+            arg_bscale: fx.Int64,
+            arg_eids: fx.Int64,
+            arg_cumsum: fx.Int64,
+            arg_mind: fx.Int64,
+            i32_ntok: fx.Int32,
+            i32_grid: fx.Int32,
+            arg_aqout: fx.Int64,
+            arg_ascaleout: fx.Int64,
+            arg_hidden: fx.Int64,
+            f32_situ_beta: fx.Float32,
+            f32_situ_linear_beta: fx.Float32,
+            stream: fx.Stream,
+        ):
+            grid_x = fx.Int64(i32_grid)
+            gemm1_kernel(
+                arg_aq,
+                arg_ascale,
+                arg_bq,
+                arg_bscale,
+                arg_eids,
+                arg_cumsum,
+                arg_mind,
+                i32_ntok,
+                arg_aqout,
+                arg_ascaleout,
+                arg_hidden,
+                f32_situ_beta,
+                f32_situ_linear_beta,
+            ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
+
+        return launch_gemm1
+
+    @flyc.kernel(
+        name=f"gemm1_a4w4_port_{name_suffix}", known_block_size=[256, 1, 1]
+    )
+    def gemm1_kernel(
+        arg_aq: fx.Int64,
+        arg_ascale: fx.Int64,
+        arg_bq: fx.Int64,
+        arg_bscale: fx.Int64,
+        arg_eids: fx.Int64,
+        arg_cumsum: fx.Int64,
+        arg_mind: fx.Int64,
+        i32_ntok: fx.Int32,
+        arg_aqout: fx.Int64,
+        arg_ascaleout: fx.Int64,
+        arg_hidden: fx.Int64,
+    ):
+        _emit_gemm1_kernel(
+            arg_aq,
+            arg_ascale,
+            arg_bq,
+            arg_bscale,
+            arg_eids,
+            arg_cumsum,
+            arg_mind,
+            i32_ntok,
+            arg_aqout,
+            arg_ascaleout,
+            arg_hidden,
+            fx.Float32(1.0),
+            fx.Float32(1.0),
+        )
 
     @flyc.jit
     def launch_gemm1(
