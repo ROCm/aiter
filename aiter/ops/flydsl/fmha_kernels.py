@@ -28,9 +28,14 @@ import torch
 import torch.nn.functional as F
 
 from .kernels.flash_attn_func_gfx1201 import build_flash_attn_func_module
+from .kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
+    flash_attn_batch_m32x8,
+    flash_attn_varlen_m32x8,
+)
 from .kernels.fmha_gfx1250.fmha_kernel import flash_attn_varlen_d192_gfx1250
 
 __all__ = [
+    "flydsl_flash_attn_batch_func",
     "flydsl_flash_attn_func",
     "flydsl_flash_attn_varlen_func",
 ]
@@ -234,31 +239,87 @@ def flydsl_flash_attn_varlen_func(
     Returns the result if FlyDSL can handle this configuration,
     otherwise returns None so the caller falls through to Triton/CK.
     """
+    from ...jit.core import is_experimental_enabled
     from ...jit.utils.chip_info import get_gfx
 
-    # FlyDSL handles only plain MHA. Any unsupported feature (bias, alibi, sink,
-    # dropout, sliding window, paging, probs/deterministic) falls through to
+    # FlyDSL m32x8 serves plain MHA plus attention-sink and sliding-window; other
+    # features (bias, alibi, dropout, paging, return_attn_probs) fall through to
     # CK/Triton instead of being silently dropped.
+    #
+    # Routing (D_v=128, bf16, gfx1250): our m32x8 kernel is the DEFAULT for qk_hdim 128 and 192.
+    # qk_hdim==256 routes to us only under AITER_ENABLE_EXPERIMENTAL=1 (else CK). The production
+    # d192 SIBLING is reached only for qk_hdim==192 under experimental (an A/B fallback to the old
+    # kernel); by default 192 takes ours (it's ~16% faster).
+    qk_hdim = q.shape[-1]
+    exp = is_experimental_enabled()
+    # Attention sink + finite sliding window are served only by our m32x8 path; the d192
+    # sibling is full/causal only. So under experimental the sibling is the 192 A/B
+    # fallback ONLY for plain full/causal — a sink or finite window on 192 stays on ours.
+    _needs_m32x8 = sink is not None or tuple(window_size[:2]) != (-1, -1)
+    # Sibling d192 is bf16-only; fp16 at 192 always takes ours.
+    _use_sibling = (
+        qk_hdim == 192 and exp and not _needs_m32x8 and q.dtype == torch.bfloat16
+    )
+    _use_fdsl_wave8_fmha = (
+        qk_hdim == 128
+        or (qk_hdim == 192 and not _use_sibling)
+        or (qk_hdim == 256 and exp)
+    )
+    # sink must route to ours AND be a valid [nheads_q] fp32 tensor; heads must divide;
+    # window_size[2] (sink_size) is unsupported (reject so it is never silently dropped).
+    _nq, _nkv = q.shape[-2], k.shape[-2]
+    _sink_ok = sink is None or (
+        _use_fdsl_wave8_fmha
+        and torch.is_tensor(sink)
+        and sink.dtype == torch.float32
+        and sink.shape == (_nq,)
+    )
+    _window_ok = tuple(window_size[:2]) == (-1, -1) or _use_fdsl_wave8_fmha
     supported = (
         get_gfx() == "gfx1250"
-        and q.shape[-1] == 192
+        and (_use_fdsl_wave8_fmha or _use_sibling)
         and v.shape[-1] == 128
-        and q.dtype == torch.bfloat16
+        and k.shape[-1] == qk_hdim
+        and q.dtype in (torch.bfloat16, torch.float16)
+        and k.dtype == q.dtype
+        and v.dtype == q.dtype
+        and _nkv > 0
+        and _nq % _nkv == 0
         and dropout_p == 0.0
-        and tuple(window_size[:2]) == (-1, -1)
+        and _window_ok
+        and (len(window_size) < 3 or window_size[2] == 0)
         and block_table is None
         and bias is None
         and alibi_slopes is None
-        and sink is None
-        and not deterministic
+        and _sink_ok
         and not return_attn_probs
     )
     if not supported:
         return None
 
-    # gfx1250 — varlen THD, D_qk=192 D_v=128, bf16
+    # gfx1250 — varlen THD, D_v=128, bf16
     if out is None:
         out = torch.empty_like(q[:, :, : v.shape[-1]])
+
+    if _use_fdsl_wave8_fmha:
+        # New clean-DSL 8-wave prefill kernel (m32x8), D_qk in {128,192,256}, D_v=128.
+        return flash_attn_varlen_m32x8(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            out=out,
+            return_lse=return_lse,
+            sink=sink,
+        )
+
+    # _use_sibling: qk_hdim==192 under experimental -> production d192 (D_qk=192, D_v=128).
     return flash_attn_varlen_d192_gfx1250(
         q,
         k,
@@ -271,4 +332,75 @@ def flydsl_flash_attn_varlen_func(
         causal=causal,
         out=out,
         return_lse=return_lse,
+    )
+
+
+def flydsl_flash_attn_batch_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float | None = None,
+    causal: bool = False,
+    return_lse: bool = False,
+    dropout_p: float = 0.0,
+    window_size=(-1, -1),
+    bias=None,
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+    sink=None,
+    out=None,
+):
+    """FlyDSL MHA forward, batched BSHD ``[B, S, H, D]`` layout.
+
+    Routes to the dedicated BSHD m32x8 kernel (uniform ``seq_len``, no
+    ``cu_seqlens`` — CUDA-graph safe). Returns the result if FlyDSL can handle
+    this configuration, otherwise returns ``None`` so the caller falls through
+    to Triton/CK.
+    """
+    from ...jit.core import is_experimental_enabled
+    from ...jit.utils.chip_info import get_gfx
+
+    # BSHD routes to the m32x8 kernel (no d192 sibling exists for BSHD). D_v=128. D_qk 128/192 are
+    # the DEFAULT; D_qk==256 needs AITER_ENABLE_EXPERIMENTAL=1 (else CK).
+    qk_hdim = q.shape[-1]
+    # Head count (BSHD [B,S,H,D]) and sink must satisfy the kernel's asserts, else validate
+    # up front so an unsupported request returns None instead of tripping a kernel assert.
+    _nq, _nkv = q.shape[-2], k.shape[-2]
+    _sink_ok = sink is None or (
+        torch.is_tensor(sink) and sink.dtype == torch.float32 and sink.shape == (_nq,)
+    )
+    supported = (
+        get_gfx() == "gfx1250"
+        and q.dim() == 4
+        and (qk_hdim in (128, 192) or (qk_hdim == 256 and is_experimental_enabled()))
+        and v.shape[-1] == 128
+        and k.shape[-1] == qk_hdim
+        and q.dtype in (torch.bfloat16, torch.float16)
+        and k.dtype == q.dtype
+        and v.dtype == q.dtype
+        and _nkv > 0
+        and _nq % _nkv == 0
+        and _sink_ok
+        and dropout_p == 0.0
+        and bias is None
+        and alibi_slopes is None
+        and (len(window_size) < 3 or window_size[2] == 0)
+        and not return_attn_probs
+    )
+    # No `not deterministic` gate: it is a backward-only flag (this forward is atomic-free
+    # / deterministic), and flash_attn_func defaults it True — gating would reject all.
+    if not supported:
+        return None
+
+    return flash_attn_batch_m32x8(
+        q,
+        k,
+        v,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        out=out,
+        return_lse=return_lse,
+        sink=sink,
     )

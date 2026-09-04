@@ -1,4 +1,22 @@
-"""D128 BF16 FMHA Forward Core Loop — GEMM1 (QK) Only — gfx1250 FlyDSL.
+"""
+=============================================================================
+LEGACY / DEPRECATED — DO NOT MODIFY
+=============================================================================
+Core loop of the ORIGINAL gfx1250 FMHA forward pipeline (the "d192
+sibling"); used only by ``fmha_kernel.py``.
+
+Superseded by the clean-DSL ``fmha_fwd_prefill_a16w16_m32x8.py``, which is
+the DEFAULT route for qk_hdim 128 and 192. This pipeline now survives only
+as the qk_hdim==192 A/B fallback under ``AITER_ENABLE_EXPERIMENTAL=1``.
+
+Frozen on purpose: the schedule is hand-interleaved WMMA/LDS/TDM tuned
+against a reference ISA listing, and it is NOT covered by
+``op_tests/test_mha_flydsl.py``. Edits here silently move the A/B baseline
+the new kernel is measured against. Put new work in
+``fmha_fwd_prefill_a16w16_m32x8.py`` instead.
+=============================================================================
+
+D128 BF16 FMHA Forward Core Loop — GEMM1 (QK) Only — gfx1250 FlyDSL.
 
 Translates core_loop stages 0-3 (GEMM1/QK) + cl_su_V3 interleaving.
 Target: align with BF16_FMHA_FWD_D128_1TG_4W_32mx4_256nx1_cas_brd_rxy.s L1701-~2400.
