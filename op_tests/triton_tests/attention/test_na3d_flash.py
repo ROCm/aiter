@@ -1,27 +1,23 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Test and benchmark for 3D neighborhood flash attention (na3d_flash).
+"""Correctness tests for 3D neighborhood flash attention (na3d_flash).
 
 Covers representative LTX-2.5 VAE decode shapes plus edge cases that exercise
 boundary masking and non-aligned sequence lengths.
 
-Each shape is compared against a pure-PyTorch tiled SDPA reference that implements
-the same inward-shifted centered window.  TFLOPS and TB/s are reported per shape.
+Each shape is compared against a pure-PyTorch tiled SDPA reference.
+Performance benchmarks live in op_tests/op_benchmarks/triton/bench_na3d_flash.py.
 """
 
-import argparse
 import math
 
-import pandas as pd
 import pytest
 import torch
 import torch.nn.functional as F
 
-import aiter
-from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.triton.attention.na3d_flash import na3d_flash_attn
-from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.test_common import checkAllclose
 
 
 @pytest.fixture(autouse=True)
@@ -115,7 +111,12 @@ def _na3d_sdpa_mask(
     dtype: torch.dtype,
     device: torch.device,
 ) -> torch.Tensor:
-    """Cached additive ``[1, 1, Nq, Nk]`` mask for one tile-geometry group."""
+    """Build an additive ``[1, 1, Nq, Nk]`` mask for one tile-geometry group.
+
+    Not cached: ``_na3d_sdpa_exact`` deduplicates geometries in the ``groups``
+    dict before calling this, so each unique geometry is computed exactly once
+    per call. Caching would only retain GPU tensors across tests with no benefit.
+    """
     bools = []
     for starts, ends in rel_bounds:
         st = torch.tensor(starts, device=device)
@@ -311,53 +312,6 @@ def test_na3d_flash(B, T, H, W, NH, HD, KT, KH, KW, dtype):
 
 
 # ---------------------------------------------------------------------------
-# Benchmark function (one row per shape)
-# ---------------------------------------------------------------------------
-@benchmark()
-def bench_na3d_flash(B, T, H, W, NH, HD, KT, KH, KW, dtype):
-    SEQ = T * H * W
-    C = NH * HD
-    K = KT * KH * KW  # neighborhood size
-
-    # Build inputs matching the real decoder call: pre-scaled Q, BF16, channels-last.
-    scale = HD**-0.5
-    q = torch.randn(B, T, H, W, NH, HD, dtype=dtype) * scale
-    k = torch.randn(B, T, H, W, NH, HD, dtype=dtype)
-    v = torch.randn(B, T, H, W, NH, HD, dtype=dtype)
-
-    # Reference (not timed): GPU-grouped exact SDPA, faster than na3d_sdpa_ref loop.
-    ref = _na3d_sdpa_exact(q, k, v, kernel_size=(KT, KH, KW))
-
-    # FLOPs: QK and AV dot products over K neighbors per query.
-    #   QK: 2 * B * SEQ * K * C
-    #   AV: 2 * B * SEQ * K * C
-    flops = 4 * B * SEQ * K * C
-    # Bytes: Q loaded once, K and V reloaded per (t_kv, h_kv) row.
-    elem = q.element_size()
-    nbytes = (B * SEQ * C + 2 * B * SEQ * K * C) * elem
-
-    candidates = {
-        "triton": lambda: na3d_flash_attn(q, k, v, kernel_size=(KT, KH, KW)),
-    }
-
-    ret = {"gfx": get_gfx()}
-    for name, fn in candidates.items():
-        out, us = run_perftest(fn)
-        err = checkAllclose(
-            ref.float(),
-            out.float(),
-            rtol=1e-2,
-            atol=5e-2,
-            msg=f"{name}: na3d_flash (T={T},H={H},W={W},k=({KT},{KH},{KW}))",
-        )
-        ret[f"{name} us"] = us
-        ret[f"{name} TFLOPS"] = flops / us / 1e6
-        ret[f"{name} TB/s"] = nbytes / us / 1e6
-        ret[f"{name} err"] = err
-    return ret
-
-
-# ---------------------------------------------------------------------------
 # _na3d_sdpa_exact tests
 # ---------------------------------------------------------------------------
 
@@ -388,50 +342,3 @@ def test_na3d_sdpa_exact_vs_ref(B, T, H, W, NH, HD, KT, KH, KW):
         atol=5e-2,
         msg=f"_na3d_sdpa_exact vs na3d_sdpa_ref (T={T},H={H},W={W},k=({KT},{KH},{KW}))",
     )
-
-
-def main():
-    if get_gfx() not in SUPPORTED_GFX:
-        aiter.logger.warning("na3d_flash unsupported on %s; skipping", get_gfx())
-        return
-
-    parser = argparse.ArgumentParser(
-        formatter_class=argparse.RawTextHelpFormatter,
-        description="Benchmark 3D neighborhood flash attention",
-    )
-    parser.add_argument(
-        "-d",
-        "--dtype",
-        type=dtypes.str2Dtype,
-        nargs="*",
-        default=[dtypes.d_dtypes["bf16"]],
-        help="Input dtype (default: bf16)",
-    )
-    parser.add_argument(
-        "-s",
-        "--shapes",
-        type=dtypes.str2tuple,
-        nargs="*",
-        default=_DEFAULT_SHAPES,
-        help=(
-            "Shapes as (B,T,H,W,NH,HD,KT,KH,KW) tuples.\n"
-            "e.g.: -s '(1,79,192,192,4,64,11,11,11)'"
-        ),
-    )
-    args = parser.parse_args()
-
-    for dtype in args.dtype:
-        rows = []
-        for shape in args.shapes:
-            B, T, H, W, NH, HD, KT, KH, KW = shape
-            rows.append(bench_na3d_flash(B, T, H, W, NH, HD, KT, KH, KW, dtype))
-        df = pd.DataFrame(rows)
-        aiter.logger.info(
-            "na3d_flash summary (%s):\n%s",
-            str(dtype).replace("torch.", ""),
-            df.to_markdown(index=False),
-        )
-
-
-if __name__ == "__main__":
-    main()
