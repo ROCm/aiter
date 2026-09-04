@@ -360,6 +360,10 @@ def _run_one_bs(
     gemm2_us_local = kernel_us.get("stage2", 0.0)
     gemm1_us = _reduce_float(gemm1_us_local, dist.ReduceOp.SUM) / world_size
     gemm2_us = _reduce_float(gemm2_us_local, dist.ReduceOp.SUM) / world_size
+    gemm_total_us_local = gemm1_us_local + gemm2_us_local
+    gemm_total_us = gemm1_us + gemm2_us
+    gemm_total_min_us = _reduce_float(gemm_total_us_local, dist.ReduceOp.MIN)
+    gemm_total_max_us = _reduce_float(gemm_total_us_local, dist.ReduceOp.MAX)
 
     # ---- correctness (only below accuracy_max_bs, all-gather ref is O(bs*world)) ----
     rel_l2 = -1.0
@@ -485,7 +489,10 @@ def _run_one_bs(
     # combined, same convention as test_dispatch_combine_internode.py's
     # disp_total_bytes/comb_total_bytes: total_recv_num_token * hidden * elem_size).
     # GB/s reported for both mean (typical) and max (worst-rank/bottleneck) time.
-    fp4_bytes_per_elem = 0.5  # float4_e2m1fn_x2: 2 packed values per byte
+    # Match AITER's tuning CSV convention: fp4x2 is accounted as one storage
+    # byte per logical matrix element. This is an effective-BW convention,
+    # not the physical nibble payload size.
+    fp4_bytes_per_elem = 1.0
     bf16_bytes_per_elem = 2.0
     dispatch_bytes = total_recv_avg * model_dim * fp4_bytes_per_elem
     combine_bytes = total_recv_avg * model_dim * bf16_bytes_per_elem
@@ -527,36 +534,29 @@ def _run_one_bs(
     # assumptions about internal kernel tiling/residency this script can't verify),
     # scoped to `active_experts` (local experts that actually received >=1 token this
     # bs, not all `local_experts` -- some may see zero at small bs).
-    per_expert_weight_bytes = (
-        w1_a.numel() * w1_a.element_size() + w2_a.numel() * w2_a.element_size()
-    ) / local_experts
-
     def _moe_flops(hits):
         return 2.0 * hits * model_dim * (2 * inter_dim) + 2.0 * hits * inter_dim * model_dim
 
-    def _moe_bytes(hits, active_experts):
-        gemm1_bytes = (
-            hits * model_dim * bf16_bytes_per_elem  # A: recv tokens read into gemm1
-            + per_expert_weight_bytes * active_experts  # B: w1 (+w2, folded in below)
-            + hits * inter_dim * bf16_bytes_per_elem  # C: hidden activation written
+    def _moe_bytes(received_tokens, _active_experts):
+        # Same aggregate convention as gemm_moe_tune.py: input + both local
+        # weight matrices + final output, divided by GEMM1+GEMM2 duration.
+        return (
+            received_tokens * model_dim * fp4_bytes_per_elem
+            + local_experts * (2 * inter_dim) * model_dim * fp4_bytes_per_elem
+            + local_experts * model_dim * inter_dim * fp4_bytes_per_elem
+            + received_tokens * model_dim * bf16_bytes_per_elem
         )
-        gemm2_bytes = (
-            hits * inter_dim * bf16_bytes_per_elem  # A: hidden activation read back
-            # B (w2) already folded into per_expert_weight_bytes above -- don't double count
-            + hits * model_dim * bf16_bytes_per_elem  # C: fused_moe output tokens written
-        )
-        return gemm1_bytes + gemm2_bytes
 
-    moe_tflops = _moe_flops(local_hits_avg) / 1e12 / (moe_avg / 1e3) if moe_avg > 0 else 0.0
+    moe_tflops = _moe_flops(local_hits_avg) / (gemm_total_us * 1e6) if gemm_total_us > 0 else 0.0
     moe_tflops_best = (
-        _moe_flops(local_hits_max) / 1e12 / (moe_min / 1e3) if moe_min > 0 else 0.0
+        _moe_flops(local_hits_max) / (gemm_total_min_us * 1e6) if gemm_total_min_us > 0 else 0.0
     )
     moe_tflops_worst = (
-        _moe_flops(local_hits_max) / 1e12 / (moe_max / 1e3) if moe_max > 0 else 0.0
+        _moe_flops(local_hits_max) / (gemm_total_max_us * 1e6) if gemm_total_max_us > 0 else 0.0
     )
-    moe_gbps = _gbps(_moe_bytes(local_hits_avg, active_experts_avg), moe_avg)
-    moe_gbps_best = _gbps(_moe_bytes(local_hits_max, active_experts_max), moe_min)
-    moe_gbps_worst = _gbps(_moe_bytes(local_hits_max, active_experts_max), moe_max)
+    moe_gbps = _gbps(_moe_bytes(total_recv_avg, active_experts_avg), gemm_total_us / 1000)
+    moe_gbps_best = _gbps(_moe_bytes(total_recv_avg, active_experts_avg), gemm_total_min_us / 1000)
+    moe_gbps_worst = _gbps(_moe_bytes(total_recv_avg, active_experts_avg), gemm_total_max_us / 1000)
 
     if rank == 0:
         print(
