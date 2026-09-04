@@ -33,18 +33,26 @@ def _expt_data_compute_stage1(
         token_acc = tl.zeros([BLOCK], dtype=TokenStart.dtype.element_ty)
         tile_acc = tl.zeros([BLOCK], dtype=TileStart.dtype.element_ty)
         offs_n = tl.arange(0, BLOCK)
+        # pid==0 must run the full loop: it reads TileStart[n_expts_tot-1]
+        # below for the sentinel, so it must have written it first.
+        # All other blocks can stop once they've written their own chunk.
+        store_pid = pid if pid < n_expts_tot else 0
+        done = False
         for i in range(0, n_expts_tot, BLOCK):
-            mask_n = offs_n < n_expts_tot
-            hist_token = tl.load(Hist + offs_n, mask=mask_n, other=0)
-            hist_tile = _cdiv_pow2(hist_token, tile_dim_log2)
-            token_starts = tl.cumsum(hist_token, 0) - hist_token + token_acc
-            tile_starts = tl.cumsum(hist_tile, 0) - hist_tile + tile_acc
-            token_acc += tl.sum(hist_token, 0)
-            tile_acc += tl.sum(hist_tile, 0)
-            tl.store(TokenStart + offs_n, token_starts)
-            tl.store(TileStart + offs_n, tile_starts)
-            offs_n += BLOCK
-
+            if not done:
+                mask_n = offs_n < n_expts_tot
+                hist_token = tl.load(Hist + offs_n, mask=mask_n, other=0)
+                hist_tile = _cdiv_pow2(hist_token, tile_dim_log2)
+                token_starts = tl.cumsum(hist_token, 0) - hist_token + token_acc
+                tile_starts = tl.cumsum(hist_tile, 0) - hist_tile + tile_acc
+                token_acc += tl.sum(hist_token, 0)
+                tile_acc += tl.sum(hist_tile, 0)
+                if store_pid == 0 or store_pid < i + BLOCK:
+                    tl.store(TokenStart + offs_n, token_starts, mask=mask_n)
+                    tl.store(TileStart + offs_n, tile_starts, mask=mask_n)
+                if store_pid != 0 and store_pid < i + BLOCK:
+                    done = True
+                offs_n += BLOCK
     if pid == 0:
         tl.store(TokenStart + n_expts_tot, n_gates)
 
