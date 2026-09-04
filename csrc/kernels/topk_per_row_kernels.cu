@@ -1158,7 +1158,7 @@ __device__ void filter_and_histogram(T const* in_buf,
 
     if(pass == 0)
     {
-        auto f = [select_min, start_bit, mask](T value, IdxT, int&, int&, bool) {
+        auto f = [select_min, start_bit, mask](T value, IdxT) {
             int bucket = calc_bucket<T, BitsPerPass>(value, start_bit, mask, select_min);
             atomicAdd(histogram_smem + bucket, static_cast<IdxT>(1));
         };
@@ -1187,7 +1187,7 @@ __device__ void filter_and_histogram(T const* in_buf,
                   kth_value_bits,
                   p_filter_cnt,
                   p_out_cnt,
-                  early_stop](T value, IdxT i, int&, int&, bool) {
+                  early_stop](T value, IdxT i) {
             const auto previous_bits = (twiddle_in(value, select_min) >> previous_start_bit)
                                        << previous_start_bit;
             if(previous_bits == kth_value_bits)
@@ -1716,7 +1716,7 @@ __global__ void last_filter_kernel(T const* in,
               in_idx_buf,
               out,
               out_idx,
-              rowStart](T value, IdxT i, int&, int&, bool) {
+              rowStart](T value, IdxT i) {
         const auto bits = (twiddle_in(value, select_min) >> start_bit) << start_bit;
         if(bits < kth_value_bits)
         {
@@ -2626,6 +2626,17 @@ inline void dispatch_topk_oneblock(void* buf, size_t& buf_size, T const* in, Idx
 }
 
 } } // namespace aiter::ob
+
+// Compile-time regression guard. standalone_stable_radix_topk_ has no callers,
+// so its templates are only type-checked if something instantiates them; without
+// this the body silently rots (it had drifted out of sync with vectorized_process
+// and no longer compiled). Instantiate one specialization so the build breaks
+// instead.
+namespace aiter { namespace ob {
+template void standalone_stable_radix_topk_<float, int, 11, 1024, false, Phase::Prefill>(
+    void*, size_t&, float const*, int const*, int, int64_t, int*, int*, int,
+    float*, int*, bool, bool, unsigned, hipStream_t, bool, int);
+} }
 
 // Top-level dispatcher: selects mb or ob path based on batch size and hardware.
 // TOPK_FORCE_PATH=mul/one  -- force a specific path
