@@ -4044,6 +4044,55 @@ def mha_batch_prefill_func(
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
+
+    # Triton fused paged-prefill fast path.
+    #
+    # Only taken for the narrow set of calls where it is both correct and measured
+    # faster than the CK-tile kernel below (causal, page_size=1, one kv head, head
+    # dim 64 or 256) -- see fused_paged_prefill.is_supported() for why each
+    # condition is load-bearing. Everything else falls through unchanged.
+    #
+    # Set AITER_FUSED_PAGED_PREFILL=0 to disable.
+    if os.environ.get("AITER_FUSED_PAGED_PREFILL", "1") != "0":
+        from aiter.ops.triton.attention import fused_paged_prefill as _fpp
+
+        _ok, _ = _fpp.is_supported(
+            q,
+            k,
+            v,
+            causal=causal,
+            logits_soft_cap=logits_soft_cap,
+            alibi_slopes=alibi_slopes,
+            return_lse=return_lse,
+            return_attn_probs=return_attn_probs,
+            window_size=window_size,
+            sink_ptr=sink_ptr,
+            sink_size=sink_size,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            kv_block_descale=kv_block_descale,
+            dropout_p=dropout_p,
+            kv_last_page_lens=kv_last_page_lens,
+            block_table=block_table,
+            seqlen_k=seqlen_k,
+        )
+        if _ok:
+            # every other argument is at its default here, guaranteed by is_supported
+            return _fpp.mha_batch_prefill_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                kv_indptr,
+                kv_page_indices,
+                max_seqlen_q,
+                max_seqlen_k,
+                causal=True,
+                out=out,
+                softmax_scale=softmax_scale,
+            )
+
     if sink_ptr is not None:
         assert sink_ptr.device == q.device, "sink_ptr must be on the same device as q"
         assert sink_ptr.shape[0] == q.size(1), "sink_ptr has incorrect shape"
