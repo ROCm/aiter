@@ -1427,6 +1427,12 @@ class TestTestQuality(unittest.TestCase):
                 f"--- /dev/null\n+++ b/{path}\n@@ -0,0 +1 @@\n"
                 + "".join(f"+{l}\n" for l in lines))
 
+    def test_a_test_file_with_nothing_measurable_is_not_listed(self):
+        """No tests, no assertions, no tolerances, no shapes: there is nothing to put in
+        front of the reviewer, so the file does not appear."""
+        out = self.run_tq(self.newfile("op_tests/test_empty.py", "import torch", "x = 1"))
+        self.assertIn("no test files touched", out)
+
     def test_a_diff_with_no_test_files_says_so(self):
         out = self.run_tq("diff --git a/aiter/x.py b/aiter/x.py\n--- a/aiter/x.py\n"
                           "+++ b/aiter/x.py\n@@ -0,0 +1 @@\n+x = 1\n")
@@ -1447,6 +1453,29 @@ class TestTestQuality(unittest.TestCase):
         self.assertIn("assertion primitives : 0", out)
         self.assertIn("may be in a helper", out,
                       "a zero count must carry the reason it is not a finding")
+
+    def test_a_benchmark_with_no_assertions_reads_as_expected(self):
+        """A benchmark asserts nothing because it measures. Telling the reviewer the check
+        "may be in a helper" about a bench_*.py is misleading, and 68 of 682 rows over the
+        corpus are exactly that (aiter#4016 ships one beside a real test)."""
+        out = self.run_tq(self.newfile(
+            "op_tests/triton_tests/bench_thing.py",
+            "def graph_time(fn, iters=50):", "    M = 8192", "    return timed(fn, M)"))
+        self.assertIn("benchmark", out)
+        self.assertIn("expected for a benchmark", out)
+        self.assertNotIn("may be in a helper", out)
+
+    def test_a_real_test_with_no_assertions_still_says_helper(self):
+        out = self.run_tq(self.newfile(
+            "op_tests/test_thing.py", "def test_alpha():", "    run_it(verify=True)"))
+        self.assertIn("may be in a helper", out)
+        self.assertNotIn("benchmark", out)
+
+    def test_op_benchmarks_directory_counts_as_benchmark(self):
+        out = self.run_tq(self.newfile(
+            "op_tests/op_benchmarks/triton/test_mha_perf.py",
+            "def sweep():", "    M = 4096", "    measure(M)"))
+        self.assertIn("expected for a benchmark", out)
 
     def test_a_loose_tolerance_is_flagged_in_the_evidence(self):
         out = self.run_tq(self.newfile(

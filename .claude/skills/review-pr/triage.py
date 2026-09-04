@@ -966,13 +966,16 @@ def test_quality(diff_text):
         if not added.strip():
             continue
         new_file = "\nnew file mode" in blk
+        base = path.rsplit("/", 1)[-1]
+        is_bench = (base.startswith(("bench", "profile")) or "benchmark" in path
+                    or "op_benchmarks" in path)
         tests = re.findall(r"^def (test_\w+)", added, re.M)
         asserts = len(ASSERT_PRIM.findall(added))
         tols = sorted({t for t in TOL.findall(added)}, key=lambda x: -float(x))
         shapes = sorted({int(x) for x in SHAPE.findall(added)})
         if not (tests or asserts or tols or shapes):
             continue
-        rows.append({"path": path, "new": new_file, "tests": tests,
+        rows.append({"path": path, "new": new_file, "tests": tests, "bench": is_bench,
                      "asserts": asserts, "tols": tols, "shapes": shapes})
     return rows
 
@@ -981,12 +984,20 @@ def render_test_quality(rows):
     out = []
     for r in rows:
         tag = "new file" if r["new"] else "modified"
+        # A benchmark with no assertions is a benchmark. Telling the reviewer the check
+        # "may be in a helper" about a bench_*.py is misleading, and 68 of 682 rows over
+        # the corpus are exactly that.
+        if r["bench"]:
+            tag += ", benchmark"
         out.append(f"{r['path']}  ({tag})")
         out.append(f"  test functions added : {len(r['tests'])}"
                    f"{'  ' + ', '.join(r['tests'][:4]) if r['tests'] else ''}")
-        out.append(f"  assertion primitives : {r['asserts']}"
-                   + ("   <- none in the added lines; the check may be in a helper, or"
-                      " there may be none" if r["asserts"] == 0 else ""))
+        note = ""
+        if r["asserts"] == 0:
+            note = ("   <- expected for a benchmark" if r["bench"] else
+                    "   <- none in the added lines; the check may be in a helper, or"
+                    " there may be none")
+        out.append(f"  assertion primitives : {r['asserts']}{note}")
         if r["tols"]:
             worst = float(r["tols"][0])
             note = "   <- loose for a kernel comparison" if worst >= 1e-1 else ""
