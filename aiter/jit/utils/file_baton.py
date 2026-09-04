@@ -106,12 +106,24 @@ class FileBaton:
         with the current owner (pid + host) for stale detection.
 
         Returns:
-            True if the file could be created, else False.
+            True if this instance owns the baton, else False.
         """
+        # A stale-lock breaker reacquires the baton inside _try_break_stale()
+        # before exposing the old lock's absence to other waiters. Let the
+        # caller's normal retry loop observe that ownership.
+        if self.fd is not None:
+            return True
         try:
             self.fd = os.open(self.lock_file_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
             return False
+        # The lock is visible before the handoff marker disappears, so waiters
+        # can never observe both paths absent between stale recovery and the
+        # replacement build.
+        try:
+            os.remove(self.lock_file_path + ".steal")
+        except OSError:
+            pass
         try:
             pid = os.getpid()
             os.write(
@@ -134,15 +146,25 @@ class FileBaton:
 
         Returns:
             True if the holder released the lock normally (its work is done).
-            False if a stale lock was broken — the caller should re-acquire
-            and redo the work, since no holder ever finished it.
+            False if a stale lock was broken and this instance atomically took
+            its place — the caller should retry ``try_acquire()`` and redo the
+            work, since no holder ever finished it.
         """
         logger.info(
             f"[pid={os.getpid()} pname={multiprocessing.current_process().name}] "
             f"waiting for baton release at {self.lock_file_path}"
         )
+        steal_path = self.lock_file_path + ".steal"
         while True:
             if not os.path.exists(self.lock_file_path):
+                # A stale-lock breaker removes the old lock while holding this
+                # guard. Join the reacquire race instead of mistaking that
+                # protected handoff for completed work. try_acquire() creates
+                # the replacement lock before it removes the guard.
+                if os.path.exists(steal_path):
+                    if self.try_acquire():
+                        return False
+                    continue
                 return True
             if self._is_stale() and self._try_break_stale():
                 logger.warning(
@@ -257,7 +279,9 @@ class FileBaton:
 
     def _try_break_stale(self):
         """Atomically break a stale lock. A secondary ``.steal`` lock ensures
-        only one waiter removes it; the rest just loop and re-check."""
+        only one waiter removes it. The breaker reacquires the baton before
+        dropping ``.steal`` so no waiter can mistake the handoff for a
+        successfully completed build."""
         steal_path = self.lock_file_path + ".steal"
         try:
             sfd = os.open(steal_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -270,7 +294,7 @@ class FileBaton:
                     os.remove(self.lock_file_path)
                 except FileNotFoundError:
                     pass
-                return True
+                return self.try_acquire()
             return False
         finally:
             os.close(sfd)
