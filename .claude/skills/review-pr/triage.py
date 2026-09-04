@@ -162,6 +162,41 @@ def struct_field_churn(diff_text):
     return False
 
 
+
+COLLECTABLE = re.compile(r"^def test_\w+|^\s+def test_\w+|^class Test\w+", re.M)
+
+
+def uncollectable_test_file(diff_text):
+    """A new test_*.py from which pytest collects nothing, and no other new test.
+
+    HK6 asks a new op to ship `op_tests/test_*.py`. A file named that but written as a
+    `main()` script with `_check()` helpers satisfies HK6 by name and contributes nothing
+    to CI: pytest imports it and collects zero tests. aiter#4821 ships two.
+
+    aiter already contains such files, so the style is tolerated and this is not a defect
+    on its own -- it fires only when the PR ships no collectable test at all, which is the
+    case where HK6 reads as satisfied and the code is in fact untested. 3.8% of the 600-PR
+    corpus."""
+    collectable = False
+    candidates = []
+    for blk in re.split(r"(?m)^diff --git ", diff_text)[1:]:
+        head = blk.split("\n", 1)[0]
+        m = re.match(r"a/(\S+) b/(\S+)", head)
+        if not m:
+            continue
+        path = m.group(2)
+        base = path.rsplit("/", 1)[-1]
+        if not (base.startswith("test_") and base.endswith(".py")):
+            continue
+        added = "\n".join(l[1:] for l in blk.split("\n")
+                           if l.startswith("+") and not l.startswith("+++"))
+        if COLLECTABLE.search(added):
+            collectable = True
+        elif "\nnew file mode" in blk and len(added) > 300:
+            candidates.append(path)
+    return [] if collectable else candidates
+
+
 def derive(files, title="", raw_diff=""):
     paths = list(files)
     add = "\n".join(l for f in files.values() for l in f["add"])
@@ -296,6 +331,8 @@ def derive(files, title="", raw_diff=""):
         hit("nth-variant", "HK5")
     if struct_field_churn(raw_diff):
         hit("struct-abi", "D11")
+    if uncollectable_test_file(raw_diff):
+        hit("uncollectable-test", "HK12")
 
     if any(p.startswith(("aiter/ops/triton/",)) or "/triton/" in p or
            "_triton_kernels/" in p or "_gluon_kernels/" in p or "/gluon/" in p
@@ -316,7 +353,7 @@ UNREACHABLE_BY_DESIGN = {
 
 ALL_RULES = ("A1 A2 A3 B1 B2 B3 B4 B5 B6 B7 C1 C2 C3 C4 D1 D1b D2 D3 D4 D5 D6 D7 D8 "
              "D10 D10b E1 E2 E3 E4 E5 F1 G1 G1b P1 P2 P3 P4 P5 P6 HK1 HK2 HK3 "
-             "T1 T2 T3 T4 T5 T6 D11 STEP4")
+             "T1 T2 T3 T4 T5 T6 D11 HK12 STEP4")
 
 def deleted_guard_symbols(diff_text):
     """Symbols named by a guard the diff removes.

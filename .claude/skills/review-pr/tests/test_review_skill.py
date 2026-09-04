@@ -1476,3 +1476,63 @@ class TestTwinDetection(unittest.TestCase):
     def test_step_1b_writes_the_artifact(self):
         self.assertIn("twins", FETCH.read_text())
         self.assertIn("twins.txt", SKILL_MD.read_text())
+
+
+class TestUncollectableTestFile(unittest.TestCase):
+    """HK12, from reviewing aiter#4821.
+
+    HK6 asks a new op to ship op_tests/test_*.py. A `main()` script named that satisfies
+    HK6 by name while pytest collects nothing from it. aiter already contains such files,
+    so the style is tolerated -- the rule is about the coverage claim, and fires only when
+    the PR ships no collectable test at all (3.8% of the 600-PR corpus)."""
+
+    SCRIPT = ["import sys", "def _check(op, cfg):", "    assert op(cfg)",
+              "def main():", "    _check(build(), cfg())", "    return 0",
+              'if __name__ == "__main__":', "    sys.exit(main())"] + \
+             [f"# padding to clear the size floor {i}" for i in range(40)]
+
+    def rules(self, diff):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            f = pathlib.Path(td) / "d.diff"
+            f.write_text(diff)
+            r = subprocess.run([sys.executable, str(TRIAGE), "rules", str(f), "x"],
+                               capture_output=True, text=True)
+        self.assertEqual(0, r.returncode, r.stderr)
+        return r.stdout
+
+    @staticmethod
+    def newfile(path, lines):
+        return (f"diff --git a/{path} b/{path}\nnew file mode 100644\n"
+                f"--- /dev/null\n+++ b/{path}\n@@ -0,0 +1 @@\n"
+                + "".join(f"+{l}\n" for l in lines))
+
+    def test_a_main_driven_script_named_like_a_test_fires(self):
+        out = self.rules(self.newfile("op_tests/test_thing.py", self.SCRIPT))
+        self.assertIn("uncollectable-test", out)
+        self.assertIn("HK12", out)
+
+    def test_a_collectable_test_in_the_same_pr_clears_it(self):
+        """The rule is about the coverage claim. A PR shipping both a manual script and a
+        real test has made the claim good."""
+        diff = (self.newfile("op_tests/test_thing.py", self.SCRIPT) +
+                self.newfile("op_tests/test_real.py",
+                             ["def test_it():", "    assert compute() == 1"]))
+        self.assertNotIn("uncollectable-test", self.rules(diff))
+
+    def test_a_class_based_test_counts_as_collectable(self):
+        diff = self.newfile("op_tests/test_thing.py",
+                            ["class TestThing:", "    def test_a(self):",
+                             "        assert 1"] + self.SCRIPT)
+        self.assertNotIn("uncollectable-test", self.rules(diff))
+
+    def test_a_modified_script_does_not_fire(self):
+        """Only a new file. Editing an existing manual script is not a new coverage claim."""
+        edited = ("diff --git a/op_tests/test_thing.py b/op_tests/test_thing.py\n"
+                  "--- a/op_tests/test_thing.py\n+++ b/op_tests/test_thing.py\n"
+                  "@@ -1 +1 @@\n" + "".join(f"+{l}\n" for l in self.SCRIPT))
+        self.assertNotIn("uncollectable-test", self.rules(edited))
+
+    def test_a_file_not_named_like_a_test_does_not_fire(self):
+        self.assertNotIn("uncollectable-test",
+                         self.rules(self.newfile("op_tests/bench_thing.py", self.SCRIPT)))
