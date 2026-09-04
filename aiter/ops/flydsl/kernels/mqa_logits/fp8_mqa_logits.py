@@ -388,11 +388,22 @@ DEFAULT_VARIANT = "mfma_r2_w4"
 
 
 def _auto_variant(seq_len, seq_len_kv):
-    """Pick (RPB, WPB) from the problem shape: RPB=2 always; WPB=2 packs more
-    column tiles per wave when M and N are both large, else WPB=4 for more
-    wavefronts on small-M / short-window shapes."""
+    """Pick (RPB, WPB) from the problem shape.
+
+    RPB from ``seq_len * seq_len_kv`` thresholds; step down to a divisor of
+    ``seq_len`` when padding overhead would dominate. WPB unchanged.
+    """
+    rpb2_min_elems = 2**19
+    rpb4_min_elems = 2**21
+    elems = seq_len * seq_len_kv
+    if elems < rpb2_min_elems:
+        rpb = 1
+    elif elems < rpb4_min_elems:
+        rpb = 2 if seq_len % 2 == 0 else 1
+    else:
+        rpb = 4
     wpb = 2 if (seq_len >= 2048 and seq_len_kv >= 8192) else 4
-    return f"mfma_r2_w{wpb}"
+    return f"mfma_r{rpb}_w{wpb}"
 
 
 def _resolve_variant(variant, seq_len, seq_len_kv):
