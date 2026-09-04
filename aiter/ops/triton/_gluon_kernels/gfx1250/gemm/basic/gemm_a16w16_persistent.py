@@ -128,31 +128,6 @@ def gemm_a16w16_persistent_kernel_(
             layout=SHARED_LAYOUT_B,
         )
 
-    a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=a_ptr,
-        shape=(M, K),
-        strides=(stride_am, stride_ak),
-        block_shape=(BLOCK_M, BLOCK_K),
-        layout=SHARED_LAYOUT_A,
-    )
-
-    if TRANSPOSE:
-        b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-            base=b_ptr,
-            shape=(K, N),
-            strides=(stride_bk, stride_bn),
-            block_shape=(BLOCK_K, BLOCK_N),
-            layout=SHARED_LAYOUT_B,
-        )
-    else:
-        b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-            base=b_ptr,
-            shape=(N, K),
-            strides=(stride_bn, stride_bk),
-            block_shape=(BLOCK_N, BLOCK_K),
-            layout=SHARED_LAYOUT_B,
-        )
-
     # Persistent loop
     for tile_id in range(start_pid, num_tiles, NUM_SMS):
 
@@ -181,6 +156,34 @@ def gemm_a16w16_persistent_kernel_(
             k_span = split_k_end - split_k_start
             num_k_tiles = gl.cdiv(k_span, BLOCK_K)
 
+            a_base = a_ptr + m_off.to(gl.int64) * stride_am + split_k_start.to(gl.int64) * stride_ak
+            a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                base=a_base,
+                shape=(M - m_off, K - split_k_start),
+                strides=(stride_am, stride_ak),
+                block_shape=(BLOCK_M, BLOCK_K),
+                layout=SHARED_LAYOUT_A,
+            )
+
+            if TRANSPOSE:
+                b_base = b_ptr + split_k_start.to(gl.int64) * stride_bk + n_off.to(gl.int64) * stride_bn
+                b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                    base=b_base,
+                    shape=(K - split_k_start, N - n_off),
+                    strides=(stride_bk, stride_bn),
+                    block_shape=(BLOCK_K, BLOCK_N),
+                    layout=SHARED_LAYOUT_B,
+                )
+            else:
+                b_base = b_ptr + n_off.to(gl.int64) * stride_bn + split_k_start.to(gl.int64) * stride_bk
+                b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                    base=b_base,
+                    shape=(N - n_off, K - split_k_start),
+                    strides=(stride_bn, stride_bk),
+                    block_shape=(BLOCK_N, BLOCK_K),
+                    layout=SHARED_LAYOUT_B,
+                )
+
             load_idx = 0
             compute_idx = 0
 
@@ -195,84 +198,126 @@ def gemm_a16w16_persistent_kernel_(
                 bias_vals = gl.load(bias_ptr + offs_bias, mask=offs_bias < N, other=0.0)
                 accumulator = accumulator + bias_vals[None, :]
 
-            # prologue: fill buffers with tiles
+            # prologue
             for _ in gl.static_range(NUM_BUFFERS - 1):
                 gl.amd.gfx1250.tdm.async_load(
-                    a_desc,
-                    [m_off, split_k_start + load_idx * BLOCK_K],
+                    a_desc, [0, 0],
                     a_buffer.index(load_idx % NUM_BUFFERS),
                 )
                 if TRANSPOSE:
                     gl.amd.gfx1250.tdm.async_load(
-                        b_desc,
-                        [split_k_start + load_idx * BLOCK_K, n_off],
+                        b_desc, [0, 0],
                         b_buffer.index(load_idx % NUM_BUFFERS),
                     )
                 else:
                     gl.amd.gfx1250.tdm.async_load(
-                        b_desc,
-                        [n_off, split_k_start + load_idx * BLOCK_K],
+                        b_desc, [0, 0],
                         b_buffer.index(load_idx % NUM_BUFFERS),
+                    )
+                a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                    a_desc, add_offsets=[0, BLOCK_K], clamp_bounds=True
+                )
+                if TRANSPOSE:
+                    b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                        b_desc, add_offsets=[BLOCK_K, 0], clamp_bounds=True
+                    )
+                else:
+                    b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                        b_desc, add_offsets=[0, BLOCK_K], clamp_bounds=True
                     )
                 load_idx += 1
 
-            # main loop: produce and consume k tiles
+            gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
+
+            cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                a_buffer.index(compute_idx % NUM_BUFFERS), OPERAND_LAYOUT_A
+            )
+            if TRANSPOSE:
+                cur_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                    b_buffer.index(compute_idx % NUM_BUFFERS), OPERAND_LAYOUT_B
+                )
+            else:
+                cur_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                    b_buffer.index(compute_idx % NUM_BUFFERS).permute([1, 0]),
+                    OPERAND_LAYOUT_B,
+                )
+
+            # main loop
             for _ in range(num_k_tiles - (NUM_BUFFERS - 1)):
+                # compute first then load next segment
+                accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+
                 gl.amd.gfx1250.tdm.async_load(
-                    a_desc,
-                    [m_off, split_k_start + load_idx * BLOCK_K],
+                    a_desc, [0, 0],
                     a_buffer.index(load_idx % NUM_BUFFERS),
                 )
                 if TRANSPOSE:
                     gl.amd.gfx1250.tdm.async_load(
-                        b_desc,
-                        [split_k_start + load_idx * BLOCK_K, n_off],
+                        b_desc, [0, 0],
                         b_buffer.index(load_idx % NUM_BUFFERS),
                     )
                 else:
                     gl.amd.gfx1250.tdm.async_load(
-                        b_desc,
-                        [n_off, split_k_start + load_idx * BLOCK_K],
+                        b_desc, [0, 0],
                         b_buffer.index(load_idx % NUM_BUFFERS),
                     )
-                # leave the NUM_BUFFERS-1 most recent pairs in flight
-                gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
 
+                a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                    a_desc, add_offsets=[0, BLOCK_K], clamp_bounds=True
+                )
+                if TRANSPOSE:
+                    b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                        b_desc, add_offsets=[BLOCK_K, 0], clamp_bounds=True
+                    )
+                else:
+                    b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                        b_desc, add_offsets=[0, BLOCK_K], clamp_bounds=True
+                    )
+
+                gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
                 load_idx += 1
 
-                cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                    a_buffer.index(compute_idx % NUM_BUFFERS), OPERAND_LAYOUT_A
+                next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                    a_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_A
                 )
                 if TRANSPOSE:
-                    cur_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                        b_buffer.index(compute_idx % NUM_BUFFERS), OPERAND_LAYOUT_B
+                    next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                        b_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_B
                     )
                 else:
-                    cur_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                        b_buffer.index(compute_idx % NUM_BUFFERS).permute([1, 0]),
+                    next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                        b_buffer.index((compute_idx + 1) % NUM_BUFFERS).permute([1, 0]),
+                        OPERAND_LAYOUT_B,
+                    )
+
+                cur_a = next_a
+                cur_b = next_b
+                compute_idx += 1
+
+            # epilogue
+            for i in gl.static_range(NUM_BUFFERS - 2):
+                gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 3 - i) * 2)
+
+                next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                    a_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_A
+                )
+                if TRANSPOSE:
+                    next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                        b_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_B
+                    )
+                else:
+                    next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                        b_buffer.index((compute_idx + 1) % NUM_BUFFERS).permute([1, 0]),
                         OPERAND_LAYOUT_B,
                     )
                 accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+
+                cur_a = next_a
+                cur_b = next_b
                 compute_idx += 1
 
-            # epilogue: drain remaining loads
-            for i in gl.static_range(NUM_BUFFERS - 1):
-                gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - i) * 2)
-
-                cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                    a_buffer.index(compute_idx % NUM_BUFFERS), OPERAND_LAYOUT_A
-                )
-                if TRANSPOSE:
-                    cur_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                        b_buffer.index(compute_idx % NUM_BUFFERS), OPERAND_LAYOUT_B
-                    )
-                else:
-                    cur_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                        b_buffer.index(compute_idx % NUM_BUFFERS).permute([1, 0]),
-                        OPERAND_LAYOUT_B,
-                    )
-                accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
-                compute_idx += 1
+            # final WMMA
+            accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
 
             if USE_ACTIVATION and WRITES_FINAL:
                 accumulator = activation(accumulator)
