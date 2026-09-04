@@ -20,6 +20,15 @@ const int32_t BlockSize           = 256;
 const int32_t groupQuantBlockSize = 64;
 
 namespace aiter {
+
+#ifndef DYN_GQ_TDM_MIN_BLK_PER_SIMD
+#define DYN_GQ_TDM_MIN_BLK_PER_SIMD 6
+#endif
+
+#ifndef DYN_GQ_TDM_KPT
+#define DYN_GQ_TDM_KPT 2
+#endif
+
 // emit_e8m0_scale = false (default): legacy behaviour — fp4 outputs an e8m0
 // byte scale, fp8 / i8 output a continuous fp32 per-group scale.
 //
@@ -29,7 +38,7 @@ namespace aiter {
 // `per_1x32_mx_quant_hip(quant_dtype=fp8, scale_type=fp8_e8m0)` so the
 // produced byte scale is directly consumable by `mxfp4_moe_sort_hip` /
 // MXFP8 GEMM kernels without a post-hoc fp32 -> e8m0 conversion.
-template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 32, int32_t group_size = 128, bool shuffle_scale = true, int32_t block_size = 64, bool emit_e8m0_scale = false>
+template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 32, int32_t group_size = 128, bool shuffle_scale = true, int32_t block_size = 64, bool emit_e8m0_scale = false, bool enable_tdm = false>
 __global__ void __launch_bounds__(block_size)
 dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                       float* __restrict__ scale,
@@ -84,30 +93,60 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     static constexpr bool kColumnMajorGroups =
         use_e8m0_scale && shuffle_scale && group_size == 128;
 
+    // TDM staging parameters. Only the column-major path qualifies: it is the one whose
+    // wave-sized run of groups forms a 2D tile (consecutive rows at one y). Row-major
+    // groups walk y, which would make a wave's slice a strided set of partial rows.
+    static constexpr int kGroupsPerWave     = WARP_SIZE / num_thread_per_group;
+    static constexpr int kTdmWaves          = block_size / WARP_SIZE;
+    // Tiles a wave stages before consuming any. Measured on gfx1250 at [16384, 7168],
+    // e8m0 + transposed, kernel time:
+    //     KPT   1(off)    2      3      4      8
+    //     us     27.0   25.96  29.3   32.1   54.8
+    // 2 wins and everything deeper loses badly: the whole per-group body is unrolled once
+    // per tile, so the instruction count grows with KPT (344 -> 1795 at KPT 4) and buys
+    // nothing once two loads are already in flight.
+    static constexpr int kTdmKPT            = DYN_GQ_TDM_KPT;
+    static constexpr int kTdmRing           = 3;
+    static constexpr int kTdmGroupsPerStep  = kTdmWaves * kGroupsPerWave;
+    static constexpr int kTdmGroupsPerBlock = kTdmGroupsPerStep * kTdmKPT;
+    static constexpr int kTdmSlotElems      = kTdmGroupsPerStep * group_size;
+    static constexpr int kTdmLdsWaves       = 1;   // one shared staging area per block
+    // The host owns this decision, because the two paths need different grids: a staged
+    // block covers kTdmGroupsPerBlock groups, an unstaged one covers kTdmGroupsPerStep.
+    // Deciding it here instead would let the host size the grid for staging while the
+    // kernel fell back, and half the groups would never be visited.
+    static constexpr bool kUseTdmShape =
+        enable_tdm && kColumnMajorGroups && kTdmKPT > 1 && kTdmWaves >= 1 &&
+        (block_size % WARP_SIZE) == 0;
+
+#if defined(__gfx1250__)
+    // One descriptor per BLOCK: the tile is every wave's rows at once. tensorcnt retires
+    // per wave, so the issuing wave is the only one that can wait on it and the others
+    // have to be released by a barrier -- the trade is half the descriptors and a 2x
+    // wider tile against two barriers per stage.
+    using TdmWindow = opus::tdm<DTYPE_I, opus::seq<group_size, kTdmGroupsPerStep>>;
+#endif
+
     // All four lanes of a group share a group id, hence the same (x, y), so the DPP reduce
     // below never reads across an active/inactive lane boundary.
+    auto resolve = [&](int64_t gid, int64_t& gx, int32_t& gy) -> bool {
+        if constexpr(kColumnMajorGroups)
+        {
+            gx = gid % ori_rows;
+            gy = static_cast<int32_t>(gid / ori_rows);
+        }
+        else
+        {
+            gx = gid / scaleN_pad;
+            gy = static_cast<int32_t>(gid % scaleN_pad);
+        }
+        if constexpr(use_e8m0_scale)
+            return gx < ori_rows && gy < scaleN;
+        else
+            return gx < ori_rows;
+    };
     int64_t x;
     int32_t y;
-    if constexpr(kColumnMajorGroups)
-    {
-        x = groupId % ori_rows;
-        y = static_cast<int32_t>(groupId / ori_rows);
-    }
-    else
-    {
-        x = groupId / scaleN_pad;
-        y = static_cast<int32_t>(groupId % scaleN_pad);
-    }
-    if constexpr(use_e8m0_scale)
-    {
-        if(x >= ori_rows || y >= scaleN)
-            return;
-    }
-    else
-    {
-        if(x >= ori_rows)
-            return;
-    }
 
     using vec_i = opus::vector_t<DTYPE_I, thread_data_size>;
     static constexpr int32_t vec_size_o =
@@ -141,23 +180,29 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         !std::is_same_v<DTYPE_O, opus::fp4_t> && sizeof(DTYPE_I) == 2 && kChunkElems > 0 &&
         thread_data_size % kChunkElems == 0 && kChunks > 1;
 
-    DTYPE_I const* gbase = input + x * ori_row_stride + y * group_size;
-    vec_i thread_data;
-    if constexpr(kInterleavedChunks)
-    {
-        using chunk_t = opus::vector_t<DTYPE_I, kChunkElems>;
-        auto const* chunks = reinterpret_cast<chunk_t const*>(gbase);
-        opus::static_for<kChunks>([&](auto i) {
-            chunk_t c = chunks[lane_in_group + i.value * num_thread_per_group];
-            opus::static_for<kChunkElems>(
-                [&](auto j) { thread_data[i.value * kChunkElems + j.value] = c[j.value]; });
-        });
-    }
-    else
-    {
-        thread_data = reinterpret_cast<vec_i const*>(gbase)[lane_in_group];
-    }
+    using chunk_t = opus::vector_t<DTYPE_I, kChunkElems>;
 
+    // Gather this thread's slice of one group out of a contiguous base pointer, which is
+    // either the group's address in global memory or its staging area in LDS.
+    auto gather = [&](DTYPE_I const* gbase) -> vec_i {
+        vec_i td;
+        if constexpr(kInterleavedChunks)
+        {
+            auto const* chunks = reinterpret_cast<chunk_t const*>(gbase);
+            opus::static_for<kChunks>([&](auto i) {
+                chunk_t c = chunks[lane_in_group + i.value * num_thread_per_group];
+                opus::static_for<kChunkElems>(
+                    [&](auto j) { td[i.value * kChunkElems + j.value] = c[j.value]; });
+            });
+        }
+        else
+        {
+            td = reinterpret_cast<vec_i const*>(gbase)[lane_in_group];
+        }
+        return td;
+    };
+
+    auto process = [&](vec_i thread_data, int64_t x, int32_t y, int64_t groupId) {
     float absMax      = 1e-10f;
     for(size_t j = 0; j < thread_data_size; j++)
     {
@@ -282,6 +327,101 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     {
         *scale_dst = scale_val;
     }
+    };   // process
+
+#if defined(__gfx1250__)
+    if constexpr(kUseTdmShape)
+    {
+        // Each wave stages its own groups through LDS with tensor_load_to_lds and keeps a
+        // ring of them in flight. tensorcnt retires per wave, so no barrier is needed: a
+        // wave only ever reads what it issued.
+        //
+        // kTdmRing is 3 because the hardware allows exactly 3 tensor ops in flight per wave
+        // (opus.hpp, "3 tensor ops in flight per wave, 6 per SIMD"). The sequence below
+        // sits at that cap and never above it: priming issues 3, and each iteration retires
+        // one (the staged wait) before issuing one. Raising the ring past 3 would stall the
+        // issue instead of deepening the pipeline.
+        //
+        // The tile is the whole reason this works: under column-major order a wave's
+        // kGroupsPerWave groups are that many CONSECUTIVE rows at one y, i.e. a plain 2D
+        // region -- dim0 = group_size contiguous elements, dim1 = the rows, dim0 stride =
+        // ori_row_stride. One descriptor moves it, and the hardware picks the transaction
+        // sizes instead of us paying the 50% per-instruction coverage of a b128 whose
+        // lanes sit 32B apart.
+        __shared__ DTYPE_I tdm_lds[kTdmLdsWaves * kTdmRing * kTdmSlotElems];
+
+        const int wave_id  = threadIdx.x / WARP_SIZE;
+        const int lane_grp = (threadIdx.x % WARP_SIZE) / num_thread_per_group;
+        DTYPE_I* my_lds    = tdm_lds;
+        const int slot_grp = wave_id * kGroupsPerWave + lane_grp;   // group within the tile
+        const bool issuer  = (wave_id == 0);
+
+        // Tile t of this wave starts at group base + t * kTdmGroupsPerStep.
+        const int64_t block_g0 = static_cast<int64_t>(blockIdx.x) * kTdmGroupsPerBlock;
+        const int64_t win_g0  = block_g0;                       // one window for the block
+        const int64_t wave_g0 = block_g0 + wave_id * kGroupsPerWave;
+        int64_t x0;
+        int32_t y0;
+        resolve(win_g0, x0, y0);
+
+        auto w = opus::make_tdm<TdmWindow>(
+            static_cast<u32_t>(reinterpret_cast<u64_t>(my_lds)), input,
+            static_cast<u32_t>(ori_cols), static_cast<u32_t>(ori_rows),
+            static_cast<u64_t>(ori_row_stride),
+            static_cast<u32_t>(y0 * group_size), static_cast<u32_t>(x0));
+
+        // Prime the ring, then for each tile wait only for ITS load. The count left
+        // outstanding is what is still in flight behind it -- waiting on <0> instead
+        // serialises the ring and gives back most of the gain.
+        if(issuer)
+        {
+            opus::static_for<kTdmRing < kTdmKPT ? kTdmRing : kTdmKPT>([&](auto i) {
+                if constexpr(i.value > 0) w.move(0, kTdmGroupsPerStep);
+                w.async_load(static_cast<u32_t>((i.value % kTdmRing) * kTdmSlotElems));
+            });
+        }
+
+        opus::static_for<kTdmKPT>([&](auto k) {
+            constexpr int issued    = (k.value + kTdmRing) < kTdmKPT ? (k.value + kTdmRing)
+                                                                     : kTdmKPT;
+            constexpr int remaining = issued - (k.value + 1);
+            if(issuer)
+                opus::s_wait_tensorcnt<(remaining < 0 ? 0 : remaining)>();
+            __builtin_amdgcn_s_barrier();   // publish the tile to the non-issuing waves
+
+            const int64_t gid = wave_g0 + static_cast<int64_t>(k.value) * kTdmGroupsPerStep
+                                + lane_grp;
+            int64_t gx;
+            int32_t gy;
+            if(resolve(gid, gx, gy))
+            {
+                DTYPE_I const* slot = my_lds + (k.value % kTdmRing) * kTdmSlotElems
+                                    + slot_grp * group_size;
+                process(gather(slot), gx, gy, gid);
+            }
+
+            if constexpr(k.value + kTdmRing < kTdmKPT)
+            {
+                // The refill lands in the slot this iteration just read -- (k + ring) % ring
+                // == k % ring -- and the DMA writes LDS asynchronously, which the compiler
+                // does not model as aliasing the ds_reads above. Without this the refill can
+                // overwrite the slot while those reads are still outstanding: a
+                // write-after-read race that happens to survive today only because
+                // `process` has a long tail of stores after its last LDS read.
+                opus::s_wait_dscnt<0>();
+                __builtin_amdgcn_s_barrier();   // all waves done reading before the refill
+                if(issuer)
+                { w.move(0, kTdmGroupsPerStep); w.async_load(
+                    static_cast<u32_t>(((k.value + kTdmRing) % kTdmRing) * kTdmSlotElems)); }
+            }
+        });
+        return;
+    }
+#endif
+
+    if(!resolve(groupId, x, y))
+        return;
+    process(gather(input + x * ori_row_stride + y * group_size), x, y, groupId);
 }
 
 __global__ void initializeScale(float *d_data, int size, float value)
@@ -1033,11 +1173,39 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
             const int64_t oob_elems =
                 (static_cast<int64_t>(rows) * cols + ooba - 1) / ooba * ooba;
             const int64_t oob_size = oob_elems * static_cast<int64_t>(sizeof(out_t));
+
+            // TDM staging, decided here because it changes the grid: a staged block owns
+            // DYN_GQ_TDM_KPT steps' worth of groups instead of one.
+            //   - It needs a wave's groups to stay inside one column and the block span to
+            //     tile the matrix, hence rows % groups-per-staged-block.
+            //   - It halves the block count, which only pays once there are blocks to
+            //     spare. Measured at [T, 7168]: staging costs 15% at T=128 (224 blocks)
+            //     and 4% at T=512, and wins from a few thousand blocks up. The gate is
+            //     blocks per SIMD, not T, so it travels across shapes.
+            static constexpr int kGroupsPerStagedBlock =
+                (dynGroupQuantBlockSize / num_thread_per_group) * DYN_GQ_TDM_KPT;
+            static constexpr int kTdmMinBlocksPerSimd = DYN_GQ_TDM_MIN_BLK_PER_SIMD;
+            const int simds = static_cast<int>(get_num_cu_func()) * 4;   // 4 SIMDs per CU
+            const bool use_tdm =
+                kColMajor && DYN_GQ_TDM_KPT > 1 && (rows % kGroupsPerStagedBlock) == 0 &&
+                (num_group / kGroupsPerStagedBlock) >= simds * kTdmMinBlocksPerSimd;
+
+            // The grid is sized by the UNSTAGED block span even when staging is on, so a
+            // staged block (which owns kGroupsPerStagedBlock) leaves the back half of the
+            // grid with nothing in range; those blocks reject on the first resolve and
+            // retire. That looks like waste and sizing the grid exactly instead is the
+            // obvious fix -- but it measured 15-24% SLOWER across M = 4096/8192/16384
+            // (8.05/14.38/25.24 us against 9.95/17.01/28.96), with device code identical
+            // and only the launch dimension differing. The mechanism is not understood, so
+            // this keeps the configuration that measures faster rather than the one that
+            // reasons better. Revisit with a dispatch-level profile.
             dim3 const grid((num_group + num_group_per_tg - 1) / num_group_per_tg);
             AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
                 input.dtype(), "dynamic_per_group_scaled_quant_kernel", [&] {
                     using input_dtype = typename aiter::hip2opus<scalar_t>::type;
-                    aiter::dynamic_per_group_scaled_quant_kernel<input_dtype, out_t, thread_data_size, _GS, ss, dynGroupQuantBlockSize, ee>
+                    auto launch_one = [&](auto tdm_tag) {
+                    constexpr bool tt = decltype(tdm_tag)::value;
+                    aiter::dynamic_per_group_scaled_quant_kernel<input_dtype, out_t, thread_data_size, _GS, ss, dynGroupQuantBlockSize, ee, tt>
                         <<<grid, block, 0, stream>>>(
                         reinterpret_cast<out_t*>(out.data_ptr()),
                         reinterpret_cast<float*>(scales.data_ptr()),
@@ -1049,6 +1217,11 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                         oob_size,
                         num_rows_ptr,
                         num_rows_factor);
+                    };
+                    if(use_tdm)
+                        launch_one(std::true_type{});
+                    else
+                        launch_one(std::false_type{});
                 });
         };
 
