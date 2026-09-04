@@ -2666,3 +2666,58 @@ class TestGuardChanges(unittest.TestCase):
     def test_fetch_runs_it(self):
         self.assertIn('triage.py" guards', FETCH.read_text())
 
+
+class TestSymbolSweepWorkedExample(unittest.TestCase):
+    """The sweep's example is prose about the tree, so run it against the tree.
+
+    D11's example was prose too, and reading it against the wrong checkout produced a
+    confident, wrong conclusion that the rule was fiction. The same shape is here:
+    aiter#4994 added `from aiter.ops.flydsl.utils import is_flydsl_available` and #5116 had
+    deleted that module 19 hours earlier; #4994 merged green and was reverted 5.5 hours
+    later. Whether this check fires at all is decided by which tree it resolves against,
+    which is exactly the thing prose cannot hold onto."""
+
+    TREE = SKILL_DIR.parents[2]
+
+    def setUp(self):
+        if not (self.TREE / "aiter").is_dir():
+            self.skipTest("not running inside an aiter checkout")
+
+    def sweep(self, diff):
+        with tempfile.TemporaryDirectory() as d:
+            f = pathlib.Path(d) / "pr.diff"
+            f.write_text(diff)
+            return subprocess.run(
+                [sys.executable, str(TRIAGE), "symbols", str(f), str(self.TREE)],
+                capture_output=True, text=True).stdout
+
+    def diff_adding(self, line, path="aiter/ops/flydsl/foo.py"):
+        return ("diff --git a/%s b/%s\n--- a/%s\n+++ b/%s\n@@ -1 +1,2 @@\n+%s\n"
+                % (path, path, path, path, line))
+
+    def test_the_module_the_docstring_names_is_still_gone(self):
+        """If it comes back, the worked example stops being one and the docstring lies."""
+        out = self.sweep(self.diff_adding(
+            "from aiter.ops.flydsl.utils import is_flydsl_available"))
+        self.assertIn("UNRESOLVED-IMPORT", out)
+        self.assertIn("aiter.ops.flydsl.utils", out)
+
+    def test_a_module_that_exists_is_not_reported(self):
+        """The control. Without it the test above passes on a sweep that flags everything."""
+        out = self.sweep(self.diff_adding("from aiter.ops.triton.utils.types import torch_to_triton_dtype"))
+        self.assertNotIn("UNRESOLVED-IMPORT", out)
+
+    def test_a_module_this_very_diff_adds_is_not_reported(self):
+        """`Files the diff ITSELF adds count as existing` -- otherwise every PR that adds a
+        module and imports it would be reported for importing its own new file."""
+        d = self.diff_adding("from aiter.ops.flydsl.brand_new_thing import go")
+        d += ("diff --git a/aiter/ops/flydsl/brand_new_thing.py "
+              "b/aiter/ops/flydsl/brand_new_thing.py\nnew file mode 100644\n"
+              "--- /dev/null\n+++ b/aiter/ops/flydsl/brand_new_thing.py\n@@ -0,0 +1 @@\n"
+              "+def go(): pass\n")
+        self.assertNotIn("UNRESOLVED-IMPORT", self.sweep(d))
+
+    def test_a_third_party_import_is_left_alone(self):
+        out = self.sweep(self.diff_adding("import numpy as np"))
+        self.assertNotIn("UNRESOLVED-IMPORT", out)
+
