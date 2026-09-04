@@ -191,6 +191,22 @@ class TestCachedLookupMissRecording(unittest.TestCase):
             (1, 2, 3, "fp8", "tuned.csv"),
         )
 
+    def test_default_a8w8_destination_keeps_quant_schema(self):
+        from aiter.ops import gemm_op_a8w8
+
+        with (
+            mock.patch.object(
+                gemm_op_a8w8, "_get_CKGEMM_config_cached", return_value=None
+            ),
+            mock.patch.object(gemm_op_a8w8, "_log_CKGEMM_miss_once"),
+            mock.patch.object(gemm_op_a8w8, "_record_untuned_shape") as record,
+        ):
+            gemm_op_a8w8.get_CKGEMM_config(1, 2, 3)
+
+        row = record.call_args.args[1]
+        self.assertEqual(list(row), ["M", "N", "K", "q_dtype_w"])
+        self.assertEqual(row["q_dtype_w"], gemm_op_a8w8.dtypes.i8)
+
     def test_a4w4_misses_record_outside_lookup_cache(self):
         from aiter.ops import gemm_op_a4w4
 

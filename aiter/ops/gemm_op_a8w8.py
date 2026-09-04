@@ -495,6 +495,7 @@ def _log_CKGEMM_miss_once(M: int, N: int, K: int, tuned_file):
 
 
 def get_CKGEMM_config(M: int, N: int, K: int, tuned_file=None):
+    uses_quant_schema = tuned_file is None
     if tuned_file is None:
         tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_FILE
     config = _get_CKGEMM_config_cached(M, N, K, tuned_file)
@@ -502,7 +503,10 @@ def get_CKGEMM_config(M: int, N: int, K: int, tuned_file=None):
         _log_CKGEMM_miss_once(M, N, K, tuned_file)
         # AITER_TUNE_GEMM=1 -> collect the miss in this family's untuned schema,
         # so a serving run yields a ready-to-tune shape list (see #5267).
-        _record_untuned_shape(tuned_file, {"M": M, "N": N, "K": K})
+        row = {"M": M, "N": N, "K": K}
+        if uses_quant_schema:
+            row["q_dtype_w"] = dtypes.i8
+        _record_untuned_shape(tuned_file, row)
     return config
 
 
