@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """FlyDSL -- high-performance GPU kernels implemented using FlyDSL."""
 
@@ -66,6 +66,14 @@ _LAZY_IMPORTS = {
         ".kernels.qk_norm_rope_quant",
         "flydsl_qk_norm_rope_quant",
     ),
+    "jagged_dense_bmm_autograd": (
+        ".jagged_dense_bmm_autograd",
+        "jagged_dense_bmm_autograd",
+    ),
+    "jagged_dense_bmm_bwd_dispatched": (
+        ".jagged_dense_bmm_bwd_dispatch",
+        "jagged_dense_bmm_bwd_dispatched",
+    ),
 }
 
 __all__ = [
@@ -84,6 +92,8 @@ __all__ = [
     "flydsl_pa_mqa_logits_fp4_varqlen",
     "flydsl_preshuffle_gemm_a8",
     "flydsl_qk_norm_rope_quant",
+    "jagged_dense_bmm_autograd",
+    "jagged_dense_bmm_bwd_dispatched",
 ]
 
 
