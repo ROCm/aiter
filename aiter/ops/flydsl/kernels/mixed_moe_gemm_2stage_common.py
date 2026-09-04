@@ -45,6 +45,7 @@ from .layout_utils import get as layout_get
 from .mfma_epilogues import c_shuffle_epilog, default_epilog
 from .mfma_preshuffle_pipeline import (
     _buffer_load_vec,
+    _global_load_vec,
     buffer_copy_gmem16_dwordx4,
     lds_store_4b_xor16,
     lds_store_8b_xor16,
@@ -3523,6 +3524,11 @@ def compile_mixed_moe_gemm2_common(
     w_elem_bytes = 1
     w_elem_pack = 2 if is_f4_b else 1
     w_nbytes = (experts * model_dim * inter_dim * w_elem_bytes) // w_elem_pack
+    # w spans every expert and buffer_load's voffset is 32-bit, so past 2**32 an expert
+    # silently reads another's weights. Use a 64-bit GEP above 2 GB (not 4: the signed
+    # index math breaks first); the name tag separates the two JIT cache entries.
+    _use_wptr64 = w_nbytes >= (1 << 31)
+    _wptr64_tag = "_wptr64" if _use_wptr64 else ""
     shared_w_nbytes = model_dim * inter_dim
     # #3476: host e8m0_shuffle pads scale group-N up to a multiple of 8, i.e.
     # 128- but not 256-aligned (e.g. 384) read OOB scales -> garbage e8m0 -> NaN.
@@ -3603,7 +3609,7 @@ def compile_mixed_moe_gemm2_common(
         )
     module_name = (
         f"mfma_moe2_a{a_dtype}_w{b_dtype}_{out_s}_{epilog_tag}"
-        f"_t{tile_m}x{tile_n}x{tile_k}{variant_tags}"
+        f"_t{tile_m}x{tile_n}x{tile_k}{variant_tags}{_wptr64_tag}"
     ).replace("-", "_")
     lds_x_bytes = 2 * int(tile_m) * int(lds_stride) * int(a_elem_bytes)
     lds_out_bytes = 2 * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
@@ -3787,7 +3793,8 @@ def compile_mixed_moe_gemm2_common(
             x_nbytes_i32 = arith.index_cast(T.i32, x_nbytes_idx)
             x_rsrc = ptr_buffer_resource(arg_x, x_nbytes_i32)
 
-            w_rsrc = ptr_buffer_resource(arg_w, w_nbytes)
+            # Bound to one resource only when it fits; see _use_wptr64.
+            w_rsrc = None if _use_wptr64 else ptr_buffer_resource(arg_w, w_nbytes)
             shared_w_rsrc = ptr_buffer_resource(arg_shared_w, shared_w_nbytes)
 
             out_elem_bytes = 1 if need_fp8_out else (4 if out_is_f32 else 2)
@@ -3950,6 +3957,16 @@ def compile_mixed_moe_gemm2_common(
                 delta_expert_idx = arith.index_cast(ir.IndexType.get(), delta_expert)
                 delta_b = delta_expert_idx * arith.constant(expert_b_stride, index=True)
                 expert_b_base = prev_expert_b_base + delta_b
+
+            # load_cell folds expert_b_base into the load offset, so past 2 GB that
+            # offset has to be formed off a raw 64-bit pointer instead of a voffset.
+            w_base_ptr = (
+                buffer_ops.create_llvm_ptr(
+                    arith.index_cast(T.i64, fx.ptrtoint(arg_w)), address_space=1
+                )
+                if _use_wptr64
+                else None
+            )
 
             first_tok = buffer_ops.buffer_load(
                 sorted_rsrc, bx_m, vec_width=1, dtype=T.i32
@@ -4208,7 +4225,9 @@ def compile_mixed_moe_gemm2_common(
                     k1 = lane_div_16
                     vec_elems = kpack_bytes // int(b_elem_bytes)
 
-                    def load_cell(rsrc, expert_base, stride_n0, elem_type, k0):
+                    def load_cell(
+                        rsrc, expert_base, stride_n0, elem_type, k0, via_ptr=False
+                    ):
                         idx_pack = (
                             expert_base
                             + blk[ni] * arith.constant(stride_n0, index=True)
@@ -4216,7 +4235,10 @@ def compile_mixed_moe_gemm2_common(
                             + k1 * arith.constant(b_stride_klane, index=True)
                             + intra[ni] * arith.constant(b_stride_nlane, index=True)
                         )
-                        b16 = _buffer_load_vec(
+                        # Routed weights take the raw-pointer path; the shared expert is
+                        # one expert wide, so it stays on a bounds-checked buffer.
+                        _load = _global_load_vec if via_ptr else _buffer_load_vec
+                        b16 = _load(
                             buffer_ops,
                             vector,
                             rsrc,
@@ -4256,19 +4278,21 @@ def compile_mixed_moe_gemm2_common(
                         return s0, s1, s2, s3
 
                     b0, b1 = load_cell(
-                        w_rsrc,
+                        w_base_ptr if _use_wptr64 else w_rsrc,
                         expert_b_base,
                         b_stride_n0,
                         w_elem_type(),
                         routed_k0_base,
+                        via_ptr=_use_wptr64,
                     )
                     if const_expr(is_f8_b):
                         b2, b3 = load_cell(
-                            w_rsrc,
+                            w_base_ptr if _use_wptr64 else w_rsrc,
                             expert_b_base,
                             b_stride_n0,
                             w_elem_type(),
                             routed_k0_base + arith.index(1),
+                            via_ptr=_use_wptr64,
                         )
                         return b0, b1, b2, b3
                     return b0, b1
