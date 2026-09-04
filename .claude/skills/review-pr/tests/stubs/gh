@@ -32,6 +32,12 @@ rc = 1
 if argv[:2] == ["pr", "view"]:
     rc = emit("pr_meta.json")
 elif argv[:2] == ["pr", "diff"]:
+    # A scenario can hand `gh pr diff` a failure instead of a diff: GitHub refuses a diff
+    # over 20000 lines with HTTP 406, and the wording it uses names the wrong cause.
+    err = d / "pr_diff_stderr.txt"
+    if err.exists():
+        sys.stderr.write(err.read_text())
+        sys.exit(1)
     rc = emit("pr.diff")
 elif argv[:2] == ["issue", "view"]:
     rc = emit("pr_issue.json", '{"title":"","body":""}')

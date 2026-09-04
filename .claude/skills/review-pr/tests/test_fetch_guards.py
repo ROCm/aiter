@@ -312,3 +312,44 @@ class TestGuardsDoNotFireSpuriously(GuardHarness):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDiffMustNotBeEmpty(GuardHarness):
+    """`gh pr diff` was unchecked, so a failure wrote an empty file and the run continued.
+
+    An empty diff does not come back looking clean -- the deriver answers `underivable`
+    and emits all 52 rules, which is the intended fail-open. It comes back looking like
+    52 unanswerable rules instead, with the reason on a stderr line a batch run throws
+    away. aiter#4961 is one of the 240 open PRs scanned: 27k lines of diff, refused by the
+    API with "could not find pull request diff", which reads as a bad PR number."""
+
+    def test_an_empty_diff_stops_the_run(self):
+        root = self.make_project(diff="")
+        self.assertGuardFired(self.run_fetch(root), "no diff was fetched")
+
+    def test_a_failing_gh_stops_the_run_and_quotes_it(self):
+        root = self.make_project()
+        (self.gh_dir / "pr.diff").unlink()
+        r = self.run_fetch(root)
+        self.assertGuardFired(r, "no diff was fetched")
+        self.assertIn("gh:", r.stdout + r.stderr,
+                      "gh's own explanation must reach the reader, not just our summary")
+
+    def test_a_diff_over_the_api_cap_says_so_instead_of_not_found(self):
+        root = self.make_project()
+        (self.gh_dir / "pr_diff_stderr.txt").write_text(
+            "could not find pull request diff: HTTP 406: Sorry, the diff exceeded the "
+            "maximum number of lines (20000) (https://api.github.com/repos/ROCm/aiter/"
+            "pulls/4961)\nPullRequest.diff too_large\n")
+        r = self.run_fetch(root)
+        self.assertGuardFired(r, "20000-line API cap")
+        combined = r.stdout + r.stderr
+        self.assertIn("not a missing PR", combined)
+        self.assertIn("local checkout", combined,
+                      "the reader needs the way forward, not just the refusal")
+
+    def test_a_real_diff_is_not_flagged(self):
+        """The control that keeps the three above honest: a present diff must pass."""
+        root = self.make_project(diff=RUNTIME_DIFF, paths=("csrc/kernels/foo.cu",))
+        self.assertEqual(0, self.run_fetch(root).returncode)
+

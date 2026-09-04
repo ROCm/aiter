@@ -44,8 +44,24 @@ gh pr view "$PR" --repo "$REPO" \
   --json title,body,number,labels,files,author,reviews,comments,baseRefName,headRefOid \
   > "$WORK/pr_meta.json"
 
-# Diff
-gh pr diff "$PR" --repo "$REPO" > "$WORK/pr.diff"
+# Diff. Unchecked, this wrote an empty file and the run continued: `gh` reports a diff
+# over GitHub's 20000-line cap as HTTP 406 "could not find pull request diff", which names
+# the wrong cause, and it says it on stderr where a batch run discards it. The review then
+# derives `underivable` and hands over all 52 rules against no diff at all -- every one of
+# them unanswerable, with the reason off screen. 1 of 240 open PRs scanned so far
+# (aiter#4961). Fail closed and say which of the two it was.
+if ! gh pr diff "$PR" --repo "$REPO" > "$WORK/pr.diff" 2>"$WORK/pr_diff_err.txt" \
+   || [ ! -s "$WORK/pr.diff" ]; then
+  if grep -q "too_large\|exceeded the maximum number of lines" "$WORK/pr_diff_err.txt"; then
+    echo "PR #$PR's diff is over GitHub's 20000-line API cap, so no diff was fetched." >&2
+    echo "This is not a missing PR. Review it from a local checkout of the head ref, or" >&2
+    echo "split it; do not report on the empty diff." >&2
+  else
+    echo "no diff was fetched for PR #$PR; reviewing an empty diff reports nothing" >&2
+    sed 's/^/  gh: /' "$WORK/pr_diff_err.txt" >&2
+  fi
+  exit 1
+fi
 
 # Current base branch tip. PR metadata's base OID can remain the historical merge base after
 # main advances, so it is not sufficient for stale merge-simulation detection.

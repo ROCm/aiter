@@ -2477,3 +2477,57 @@ class TestD11WorkedExampleIsExecutable(unittest.TestCase):
                 [sys.executable, str(TRIAGE), "structabi", str(f), str(self.TREE)],
                 capture_output=True, text=True).stdout
         self.assertNotIn("PINNED-LAYOUT", out)
+
+
+class TestTreeRootGuard(unittest.TestCase):
+    """Root-taking forensics answer questions about the merge target; a second checkout
+    answers them about itself, in the same shape, with no sign anything is wrong.
+
+    A sweep and the follow-up that checked it both read a checkout 53 days behind and
+    agreed that nothing pinned `pa_sparse_prefill_kargs`, so D11's worked example was
+    filed as fiction and the rule body was rewritten around the mistake. Two independent
+    greps confirmed it because the offsets are pinned through a macro, so a literal
+    `offsetof(` is missing from both trees. fetch.sh cannot make this error -- it takes
+    the root from `git rev-parse --show-toplevel` -- and the hand-run measurement is
+    exactly where it happened."""
+
+    DIFF = ("diff --git a/csrc/x.h b/csrc/x.h\n--- a/csrc/x.h\n+++ b/csrc/x.h\n"
+            "@@ -1,2 +1,3 @@ struct foo\n     int a;\n+    int b;\n")
+
+    def run_mode(self, root):
+        with tempfile.TemporaryDirectory() as d:
+            f = pathlib.Path(d) / "pr.diff"
+            f.write_text(self.DIFF)
+            return subprocess.run(
+                [sys.executable, str(TRIAGE), "structabi", str(f), str(root)],
+                capture_output=True, text=True)
+
+    def test_the_skills_own_tree_is_not_flagged(self):
+        r = self.run_mode(SKILL_DIR.parents[2])
+        self.assertNotIn("warning:", r.stderr)
+
+    def test_a_different_tree_is_flagged_with_both_heads(self):
+        with tempfile.TemporaryDirectory() as other:
+            r = self.run_mode(other)
+        self.assertIn("warning:", r.stderr)
+        self.assertIn("this skill ships from", r.stderr)
+
+    def test_the_warning_never_reaches_stdout(self):
+        """fetch.sh tees these modes straight into $WORK/*.txt. A warning on stdout would
+        be written into the evidence as though it were a finding."""
+        with tempfile.TemporaryDirectory() as other:
+            r = self.run_mode(other)
+        self.assertNotIn("warning:", r.stdout)
+        self.assertNotIn("ships from", r.stdout)
+
+    def test_every_root_taking_mode_goes_through_the_guard(self):
+        """symbols, twins, citest, structabi, siblings all read the tree. One that takes
+        a root straight from argv is one that can be pointed at a stale checkout in
+        silence."""
+        src = TRIAGE.read_text()
+        block = src[src.index("if __name__"):]
+        raw = re.findall(r"^\s+root = pathlib\.Path\(sys\.argv\[3\]", block, re.M)
+        self.assertEqual(
+            [], raw,
+            "a root-taking mode bypasses tree_root(); route it through the guard")
+
