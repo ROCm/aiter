@@ -421,6 +421,43 @@ def render_siblings(rows):
     return "\n".join(out)
 
 
+OWN_TREE = pathlib.Path(__file__).resolve().parents[3]
+
+
+def _head_date(root):
+    try:
+        import subprocess
+        r = subprocess.run(["git", "-C", str(root), "log", "-1", "--format=%h %ad",
+                            "--date=short"], capture_output=True, text=True, timeout=10)
+        return r.stdout.strip() or "not a git checkout"
+    except Exception:
+        return "unreachable"
+
+
+def tree_root(arg):
+    """The tree a forensic reads, with a warning when it is not the one shipping this file.
+
+    Every root-taking mode answers a question about the MERGE TARGET -- is this struct
+    pinned, does a CI job scan this path, does a sibling still carry this line. Pointed at
+    a second checkout the answers stay well-formed and quietly describe a different repo.
+
+    That is not hypothetical. A sweep and then a follow-up both read a checkout 53 days
+    behind, concluded that nothing pinned `pa_sparse_prefill_kargs`, and filed D11's worked
+    example as fiction -- confirmed twice over, because the field offsets are pinned through
+    a macro and a literal `offsetof(` is absent either way. The rule was right. fetch.sh
+    always passes the correct root because it takes it from `git rev-parse --show-toplevel`;
+    it is the hand-run measurement that goes wrong, and that is what this line is for.
+    """
+    root = pathlib.Path(arg).resolve()
+    if root != OWN_TREE:
+        print("warning: reading %s, but this skill ships from %s.\n"
+              "         given: %s\n         skill: %s\n"
+              "         Forensics answer questions about the merge target; a second "
+              "checkout answers them about itself."
+              % (root, OWN_TREE, _head_date(root), _head_date(OWN_TREE)), file=sys.stderr)
+    return root
+
+
 def is_comment_line(line):
     s = line.strip()
     return (not s) or s.startswith(("#", "//", "/*", "*", '"""', "'''"))
@@ -1789,7 +1826,7 @@ if __name__ == "__main__":
         raise SystemExit(2)
 
     if mode == "siblings":
-        print(render_siblings(sibling_variants(open(sys.argv[2]).read(), sys.argv[3])))
+        print(render_siblings(sibling_variants(open(sys.argv[2]).read(), tree_root(sys.argv[3]))))
         sys.exit(0)
     if mode == "kerneltest":
         print(render_untested_kernel(untested_new_kernel(open(sys.argv[2]).read())))
@@ -1879,7 +1916,7 @@ if __name__ == "__main__":
         raise SystemExit(0)
 
     if mode == "structabi":
-        root = pathlib.Path(sys.argv[3] if len(sys.argv) > 3 else ".")
+        root = tree_root(sys.argv[3] if len(sys.argv) > 3 else ".")
         rows = pinned_struct_churn(open(sys.argv[2], errors="replace").read(), root)
         if not rows:
             print("no struct with a pinned layout changed shape")
@@ -1902,7 +1939,7 @@ if __name__ == "__main__":
         raise SystemExit(0)
 
     if mode == "citest":
-        root = pathlib.Path(sys.argv[3] if len(sys.argv) > 3 else ".")
+        root = tree_root(sys.argv[3] if len(sys.argv) > 3 else ".")
         rows = uncovered_test_paths(open(sys.argv[2], errors="replace").read(), root)
         if not rows:
             print("every new test file lands where a CI job will run it")
@@ -1912,7 +1949,7 @@ if __name__ == "__main__":
         raise SystemExit(0)
 
     if mode == "twins":
-        root = pathlib.Path(sys.argv[3] if len(sys.argv) > 3 else ".")
+        root = tree_root(sys.argv[3] if len(sys.argv) > 3 else ".")
         pairs = near_duplicates(open(sys.argv[2], errors="replace").read(), root)
         if not pairs:
             print("no new file closely mirrors an existing one")
@@ -2022,7 +2059,7 @@ if __name__ == "__main__":
     diff = open(sys.argv[2], errors="replace").read()
 
     if mode == "symbols":
-        root = pathlib.Path(sys.argv[3] if len(sys.argv) > 3 else ".")
+        root = tree_root(sys.argv[3] if len(sys.argv) > 3 else ".")
         bad = sweep_symbols(diff, root)
         # One line per distinct (import, reason). A PR importing a deleted module from
         # four files produced four identical lines, which reads as four problems.
