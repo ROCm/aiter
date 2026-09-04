@@ -6,11 +6,11 @@ Imports the top-level @benchmark sweep fns from the aiter op_tests (which the
 aiter-op-test skill keeps importable for exactly this kind of combination
 testing) and runs each over its own shape axes.
 
-Output discipline: this script prints ONLY the per-op summary tables. All the
-underlying noise (per-config "calling ..." logs, JIT build output, aiter import
-banners, pandas/torch/ROCTracer warnings, including C-level fd writes) is
-silenced via os-level fd redirection while the kernels run; the markdown tables
-are then printed to real stdout.
+Output discipline: combo-owned pandas summaries are printed as record-oriented
+JSON. Existing child-UT summaries are extracted without changing those UTs. All
+the underlying noise (per-config "calling ..." logs, JIT build output, aiter
+import banners, pandas/torch/ROCTracer warnings, including C-level fd writes) is
+silenced via os-level fd redirection while the kernels run.
 
 Run from the aiter repo root so `op_tests/` siblings import cleanly:
 
@@ -81,15 +81,18 @@ Other variables:
                                        lose it outright -- see _pin_arch. Set
                                        either yourself and yours wins.
 
-Optional GPU telemetry wraps the whole selected-op sweep, never an individual
-kernel timing region:
+Optional GPU telemetry replays each already-prepared benchmark case in its own
+sampling window, after its normal latency measurement:
 
     python op_tests/bench_gfx1250_combo.py --dsv4 \
-      --smi-monitor --smi-device 0 --smi-interval 0.05
+      --smi-monitor --smi-device 0 --smi-interval 0.05 --smi-duration 1.0
 
-The monitor uses the Python ``amdsmi`` package and prints min/mean/median/max
-for the collected clocks, power, temperature, activity and VRAM metrics after
-the sweep.
+Input initialization, compilation, correctness and warmup are outside the SMI
+window. The monitor uses the Python ``amdsmi`` package and prints a case-tagged
+min/mean/median/max table for clocks, power, temperature, activity and VRAM.
+``mega_moe`` has every rank monitor its local GPU around synchronized graph
+replays, then gathers the four summaries to rank 0; ``mori_ep`` remains disabled
+until its dispatch/combine loop exposes an aligned telemetry window.
 
 Supported operator inputs can be overridden consistently with:
 
@@ -102,14 +105,13 @@ notice when these flags are supplied; the setting is never silently claimed.
 The current passthrough matrix is:
 
     DATA + SCALE + seed   moe, gemm, f8gemm, a8w8_blockscale
-    DATA + seed           a16w16, mega_moe, mhc, qk_norm
+    DATA + seed           a16w16, mega_moe, mhc, qk_norm, inverse_rope,
+                          score_qk, mla_v4_decode, mla_v4_prefill
     DATA mapping only     mha (norm -> randn, constant -> const0.25)
-    native init only      mla_v4_decode, mla_v4_prefill, score_qk,
-                          inverse_rope, mori_ep
+    native init only      mori_ep
 
 ``--scale-init`` is reported as not applicable for operators without a scale
-operand. ``mla_v4_prefill`` still receives ``--seed`` because its native data
-generator exposes that control even though it does not expose a distribution.
+operand.
 
 mega_moe at tokens/rank=65536 fails in setup(), asking 7.5 GB for cco's VMM
 arena against a 4 GiB default. MORI_SHMEM_HEAP_SIZE does not reach that arena
@@ -255,12 +257,13 @@ os.environ.setdefault("AITER_FORCE_GFX1250", "1")
 import argparse
 import contextlib
 import itertools
+import json
 import subprocess
 import sys
 import tempfile
 import warnings
 
-from smi_monitor import monitor_gpu
+from smi_monitor import SMI_RESULT_PREFIX
 
 warnings.filterwarnings("ignore")
 
@@ -317,6 +320,31 @@ with _silence():
     )
 
 SUPPORTED_GFX = ["gfx1250"]
+_SMI_ROWS = []
+
+
+@contextlib.contextmanager
+def _smi_case(label):
+    """Set the case label consumed by the common perftest hook."""
+    old = os.environ.get("AITER_SMI_LABEL")
+    if os.environ.get("AITER_SMI_MONITOR") == "1":
+        os.environ["AITER_SMI_LABEL"] = label
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop("AITER_SMI_LABEL", None)
+        else:
+            os.environ["AITER_SMI_LABEL"] = old
+
+
+def _without_smi(env):
+    """Return a child environment with single-GPU telemetry disabled."""
+    clean = env.copy()
+    for key in tuple(clean):
+        if key.startswith("AITER_SMI_"):
+            clean.pop(key)
+    return clean
 # a16w16 N shapes at K=7168: attention/router projections, then lm_head twice
 # (129280 is the DeepSeek vocab, 32320 is that sharded over TP4).
 _A16W16_NS = (64, 384, 1024, 2048, 32320, 129280)
@@ -488,75 +516,6 @@ def _int_quad(s):
     return int(a), int(b), int(c), int(d)
 
 
-def _tflops(flop, us):
-    """TFLOPS from a FLOP count and microseconds (None-safe)."""
-    return round(flop / us / 1e6, 2) if us else None
-
-
-def _bw(nbytes, us):
-    """Bandwidth (TB/s) from a byte count and microseconds (None-safe).
-    bytes / (us*1e-6) / 1e12 == bytes / us / 1e6."""
-    return round(nbytes / us / 1e6, 3) if us else None
-
-
-# bytes-per-VALUE for the MoE quant formats (dims below are logical value counts,
-# so fp4 must be 0.5 B/value, not the 1 B/element of the packed fp4x2 dtype).
-#   a4w4 : fp4 act (0.5) x fp4 weight (0.5)
-#   a8w4 : fp8 act (1.0) x fp4 weight (0.5)   (mxfp8 x mxfp4)
-# The bf16 stage output is 2 B/value. (act_bpe, weight_bpe) per data_format.
-_MOE_BPE = {"a4w4": (0.5, 0.5), "a8w4": (1.0, 0.5)}
-_OUT_BPE = 2  # bf16 stage outputs
-
-
-def _moe_stage_flops(token, topk, model_dim, inter_dim, use_g1u1=True):
-    """Per-stage FLOP counts for the fused 2-stage MoE (matches gemm_moe_tune.py):
-        stage1 GEMM: [token, model_dim] x [E, n, model_dim] -> token*n*model_dim*topk*2
-                     n = inter_dim*2 (g1u1 gate+up) or inter_dim
-        stage2 GEMM: [token, topk, inter_dim] x [E, model_dim, inter_dim]
-                     -> topk*token*model_dim*inter_dim*2
-    Returns (flop1, flop2)."""
-    n = inter_dim * 2 if use_g1u1 else inter_dim
-    flop1 = token * n * model_dim * topk * 2
-    flop2 = topk * token * model_dim * inter_dim * 2
-    return flop1, flop2
-
-
-# per_1x32 microscale: every 32 quantized values share one e8m0 (1B) scale, so
-# each quantized value carries an extra 1/32 B of scale traffic, on top of its
-# own bpe. Applies to BOTH activations and weights (fp4 => bpe 0.5 => 17/16;
-# fp8 => bpe 1.0 => 33/32). Output stays bf16 and is not microscaled.
-# (gemm_moe_tune.py's stage1/stage2 omit scale entirely; we include it.)
-_SCALE_PER_VALUE = 1 / 32
-
-
-def _moe_stage_bytes(
-    token, topk, model_dim, inter_dim, experts, aq_bpe, wq_bpe, use_g1u1=True
-):
-    """Per-stage MoE traffic (bytes), including per_1x32 e8m0 scale on every
-    quantized operand (act + weight). The stage1 output / stage2 input is the
-    expanded [token*topk, n] / [token*topk, inter] intermediate, so both carry
-    topk; the stage1 input act is read once per token (reused across its topk
-    experts):
-        stage1: act[token,model_dim]@aq + out[token,topk,n]@bf16 + w1[E,n,model_dim]@wq
-        stage2: act[token,topk,inter_dim]@aq + out[token,model_dim]@bf16
-                + w2[E,model_dim,inter_dim]@wq
-        n = inter_dim*2 (g1u1) or inter_dim.
-    Returns (bytes1, bytes2)."""
-    n = inter_dim * 2 if use_g1u1 else inter_dim
-    bo = _OUT_BPE
-    aq = aq_bpe + _SCALE_PER_VALUE  # quantized act: data + e8m0 scale per value
-    wq = wq_bpe + _SCALE_PER_VALUE  # quantized weight: data + e8m0 scale per value
-    bytes1 = (
-        token * model_dim * aq + token * topk * n * bo + experts * n * model_dim * wq
-    )
-    bytes2 = (
-        token * topk * inter_dim * aq
-        + token * model_dim * bo
-        + experts * model_dim * inter_dim * wq
-    )
-    return bytes1, bytes2
-
-
 # Per-op column whitelists: keep shape identifiers + perf, drop the constant
 # config/correctness columns @benchmark echoes (gfx/dtype/err/cos_diff/...).
 _MHA_KEEP = [
@@ -594,13 +553,10 @@ _MOE_KEEP = [
     "pass",
     "gemm1_us",
     "gemm1 TFLOPS",
-    "gemm1 TB/s",
+    "gemm1 GB/s",
     "gemm2_us",
     "gemm2 TFLOPS",
-    "gemm2 TB/s",
-    "total us",
-    "total TFLOPS",
-    "total TB/s",
+    "gemm2 GB/s",
     "kernel",
 ]
 # Fixed kernel-bench config (mirrors test_flydsl_grouped_gemm_gfx1250.py --scenario kernel).
@@ -683,6 +639,8 @@ _MLA_V4_DSV4_SHAPES = [
 ]
 _MLA_V4_COMPARE_KEEP = [
     "dtype",
+    "data_init",
+    "seed",
     "gqa_ratio",
     "batch",
     "kv_seq_lens",
@@ -725,9 +683,37 @@ def _capture():
             os.close(old2)
             tmp.seek(0)
             box.append(tmp.read())
+            _collect_smi_rows(box[0].splitlines())
+
+
+def _collect_smi_rows(lines):
+    """Collect structured per-case SMI records emitted by this or a child UT."""
+    for line in lines:
+        marker = line.find(SMI_RESULT_PREFIX)
+        if marker < 0:
+            continue
+        try:
+            record = json.loads(line[marker + len(SMI_RESULT_PREFIX) :])
+        except json.JSONDecodeError:
+            continue
+        base = {
+            "case": record.get("label"),
+            "rank": record.get("rank"),
+            "device": record.get("device"),
+            "duration_s": round(record.get("duration_s", 0.0), 3),
+            "launches": record.get("launches"),
+            "samples": record.get("samples"),
+            "sample_status": record.get("sample_status"),
+        }
+        metrics = record.get("metrics", {})
+        if not metrics:
+            _SMI_ROWS.append({**base, "metric": "(no metrics)"})
+        for metric, stats in metrics.items():
+            _SMI_ROWS.append({**base, "metric": metric, **stats})
 
 
 def _print_table(name, rows, keep=None):
+    """Print one named DataFrame as a JSON object with record-oriented rows."""
     df = pd.DataFrame([r for r in rows if r is not None])
     if not df.empty:
         # Drop columns that are entirely empty, then whitelist/order via `keep`.
@@ -739,8 +725,8 @@ def _print_table(name, rows, keep=None):
             cols = [c for c in keep if c in df.columns]
             cols += [c for c in df.columns if "err_msg" in c and c not in cols]
             df = df[cols]
-    print(f"\n===== {name} =====")
-    print(df.to_markdown(index=False))
+    records = json.loads(df.to_json(orient="records"))
+    print(json.dumps({"name": name, "rows": records}, indent=2), flush=True)
 
 
 # Compiler / logger / IR-dump chatter the child UTs interleave with results.
@@ -1043,7 +1029,7 @@ def _pin_arch(env):
 
 
 def _run_child(name, cmd, cwd, env=None, extract=None, timeout=None, tail=30,
-               kernels=True):
+               kernels=True, smi=True):
     """Run a child UT with its output captured and surface only its results.
 
     Child UTs print their own progress, aiter INFO lines and (with FlyDSL) a
@@ -1052,6 +1038,15 @@ def _run_child(name, cmd, cwd, env=None, extract=None, timeout=None, tail=30,
     when the child fails or emits nothing recognisable.
     """
     extract = extract or _DEFAULT_EXTRACT
+    # Give every child invocation its combo-owned SMI case label. UTs remain
+    # unaware of telemetry; the common perftest hook reads this environment.
+    if smi and os.environ.get("AITER_SMI_MONITOR") == "1":
+        env = os.environ.copy() if env is None else env.copy()
+        env["AITER_SMI_LABEL"] = name
+        old_pythonpath = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = (
+            f"{cwd}{os.pathsep}{old_pythonpath}" if old_pythonpath else str(cwd)
+        )
     # env=None means "inherit ours", which already carries these two.
     if env is not None:
         _pin_arch(env)
@@ -1068,6 +1063,7 @@ def _run_child(name, cmd, cwd, env=None, extract=None, timeout=None, tail=30,
         _note_failure(name, f"timed out after {timeout}s")
         return
     lines = proc.stdout.splitlines()
+    _collect_smi_rows(lines)
     # `results` decides whether the op reported anything; the kernel digest is
     # an annotation and must not stand in for a result table, or an extractor
     # that stops matching turns into a silent hole instead of a failure.
@@ -1108,12 +1104,17 @@ def run_mha(args):
     with _silence():
         for init in inits:
             for head_dim, seqlen, causal in _MHA_SHAPES:
-                hk = 8 if head_dim == 64 else 4
-                rows.append(
-                    mha_mod.test_fmha_fwd_with_sink_asm_perf(
-                        head_dim, 64, hk, seqlen, seqlen, 1, causal, init
+                with _smi_case(
+                    f"mha/batch=1/hq=64/hk={8 if head_dim == 64 else 4}/"
+                    f"sq={seqlen}/sk={seqlen}/d={head_dim}/causal={int(causal)}/"
+                    f"data={init}"
+                ):
+                    hk = 8 if head_dim == 64 else 4
+                    rows.append(
+                        mha_mod.test_fmha_fwd_with_sink_asm_perf(
+                            head_dim, 64, hk, seqlen, seqlen, 1, causal, init
+                        )
                     )
-                )
     for row in rows:
         if row is not None:
             row["dtype"] = "bf16"
@@ -1129,7 +1130,12 @@ def run_moe(args):
     for tokens, fmt, (data_init, scale_init) in itertools.product(
         cfg["tokens"], data_formats, init_pairs
     ):
-        with _capture() as box:
+        label = (
+            f"moe/fmt={fmt}/tokens={tokens}/experts={cfg['experts']}/"
+            f"topk={cfg['topk']}/hd={cfg['model_dim']}/id={cfg['inter_dim']}/"
+            f"data={data_init}/scale={scale_init}/seed={args.seed}"
+        )
+        with _smi_case(label), _capture() as box:
             moe_mod.set_data_format(fmt)
             metrics = moe_mod.run_moe(
                 fmt,
@@ -1147,32 +1153,7 @@ def run_moe(args):
                 check_aot_cache=False,
                 raise_on_fail=False,
             )
-        # stage1 n = inter_dim*2 (gate+up for silu/swiglu GUGU layout).
-        aq_bpe, wq_bpe = _MOE_BPE.get(fmt, (1, 1))
-        flop1, flop2 = _moe_stage_flops(
-            tokens,
-            cfg["topk"],
-            cfg["model_dim"],
-            cfg["inter_dim"],
-            use_g1u1=True,
-        )
-        bytes1, bytes2 = _moe_stage_bytes(
-            tokens,
-            cfg["topk"],
-            cfg["model_dim"],
-            cfg["inter_dim"],
-            cfg["experts"],
-            aq_bpe,
-            wq_bpe,
-            use_g1u1=True,
-        )
         us1, us2 = metrics.get("gemm1_us"), metrics.get("gemm2_us")
-        total_us = (us1 or 0) + (us2 or 0) if (us1 or us2) else None
-        bw1, bw2, bwt = (
-            _bw(bytes1, us1),
-            _bw(bytes2, us2),
-            _bw(bytes1 + bytes2, total_us),
-        )
         rows.append(
             {
                 "data_format": fmt,
@@ -1187,14 +1168,11 @@ def run_moe(args):
                 "seed": args.seed,
                 "pass": metrics["passed"],
                 "gemm1_us": us1,
-                "gemm1 TFLOPS": _tflops(flop1, us1),
-                "gemm1 TB/s": bw1,
+                "gemm1 TFLOPS": metrics.get("gemm1_tflops"),
+                "gemm1 GB/s": metrics.get("gemm1_bandwidth_gbs"),
                 "gemm2_us": us2,
-                "gemm2 TFLOPS": _tflops(flop2, us2),
-                "gemm2 TB/s": bw2,
-                "total us": round(total_us, 2) if total_us else None,
-                "total TFLOPS": _tflops(flop1 + flop2, total_us),
-                "total TB/s": bwt,
+                "gemm2 TFLOPS": metrics.get("gemm2_tflops"),
+                "gemm2 GB/s": metrics.get("gemm2_bandwidth_gbs"),
                 "kernel": " + ".join(_kernel_names(box[0].splitlines())) or None,
             }
         )
@@ -1215,20 +1193,24 @@ def run_gemm(args):
             ["mxfp4", "nvfp4"],
             ["bf16", "fp8"],
         ):
-            rows.append(
-                gemm_mod.test_gemm(
-                    intype,
-                    M,
-                    N,
-                    K,
-                    1,
-                    outtype,
-                    di,
-                    si,
-                    seed=args.seed,
-                    mode="perf",
+            with _smi_case(
+                f"gemm_a4w4/intype={intype}/out={outtype}/M={M}/N={N}/K={K}/"
+                f"data={di}/scale={si}/seed={args.seed}"
+            ):
+                rows.append(
+                    gemm_mod.test_gemm(
+                        intype,
+                        M,
+                        N,
+                        K,
+                        1,
+                        outtype,
+                        di,
+                        si,
+                        seed=args.seed,
+                        mode="perf",
+                    )
                 )
-            )
     _print_table("gemm_a4w4 (perf)", rows, keep=_GEMM_KEEP)
 
 
@@ -1249,17 +1231,21 @@ def run_f8gemm(args):
             for M, N, K in _F8GEMM_PERF_SHAPES[intype]
         ]
         for workload, intype, M, N, K, di, si in cases:
-            row = f8gemm_mod.test_gemm(
-                intype,
-                M,
-                N,
-                K,
-                1,
-                data_init=di,
-                scale_init=si,
-                seed=args.seed,
-                mode="perf",
-            )
+            with _smi_case(
+                f"mxfp8fp4gemm/intype={intype}/M={M}/N={N}/K={K}/"
+                f"data={di}/scale={si}/seed={args.seed}"
+            ):
+                row = f8gemm_mod.test_gemm(
+                    intype,
+                    M,
+                    N,
+                    K,
+                    1,
+                    data_init=di,
+                    scale_init=si,
+                    seed=args.seed,
+                    mode="perf",
+                )
             if row is not None:
                 row["workload"] = workload
             rows.append(row)
@@ -1274,42 +1260,61 @@ def run_a8w8_blockscale(args):
     # drop it for this child only -- every other op keeps it.
     env = os.environ.copy()
     env.pop("AITER_LOG_MORE", None)
-    _run_child(
-        "gemm_a8w8_blockscale (DSv4)",
-        [
-            sys.executable,
-            "op_tests/test_gemm_a8w8_blockscale.py",
-            *(
-                ["-m", *map(str, _A8W8_BLOCKSCALE_TOKENS)]
-                if _A8W8_BLOCKSCALE_TOKENS
-                else []
-            ),
-            "-nk",
-            "2048,7168",
-            "7168,16384",
-            "6144,7168",
-            "7168,3072",
-            "65536,1536",
-            "8192,1536",
-            "--ck_preshuffle",
-            "True",
-            "--flydsl",
-            *(
-                ["--data-init", *args.data_init]
-                if args.data_init is not None
-                else []
-            ),
-            *(
-                ["--scale-init", *args.scale_init]
-                if args.scale_init is not None
-                else []
-            ),
-            "--seed",
-            str(args.seed),
-        ],
-        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        env=env,
+    nk_shapes = (
+        (2048, 7168),
+        (7168, 16384),
+        (6144, 7168),
+        (7168, 3072),
+        (65536, 1536),
+        (8192, 1536),
     )
+
+    def run_case(tokens, shapes, init_pairs, label):
+        _run_child(
+            label,
+            [
+                sys.executable,
+                "op_tests/test_gemm_a8w8_blockscale.py",
+                "-m",
+                *map(str, tokens),
+                "-nk",
+                *(f"{n},{k}" for n, k in shapes),
+                "--ck_preshuffle",
+                "True",
+                "--flydsl",
+                "--data-init",
+                *(data for data, _ in init_pairs),
+                "--scale-init",
+                *(scale for _, scale in init_pairs),
+                "--seed",
+                str(args.seed),
+            ],
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            env=env,
+        )
+
+    init_pairs = _init_pairs(
+        args, defaults=(("constant", "constant"), ("uniform", "auto"))
+    )
+    if args.smi_monitor:
+        for m, (n, k), pair in itertools.product(
+            _A8W8_BLOCKSCALE_TOKENS, nk_shapes, init_pairs
+        ):
+            data_init, scale_init = pair
+            run_case(
+                (m,),
+                ((n, k),),
+                (pair,),
+                f"a8w8_blockscale/M={m}/N={n}/K={k}/data={data_init}/"
+                f"scale={scale_init}/seed={args.seed}",
+            )
+    else:
+        run_case(
+            _A8W8_BLOCKSCALE_TOKENS,
+            nk_shapes,
+            init_pairs,
+            "gemm_a8w8_blockscale (DSv4)",
+        )
 
 
 def run_a16w16(args):
@@ -1345,7 +1350,10 @@ def run_a16w16(args):
         # skipping shapes that tuning has already made runnable. Let the kernel
         # raise and record that instead.
         try:
-            with _capture() as box:
+            with _smi_case(
+                f"a16w16/batch={batch}/M={M}/N={n}/K={K}/"
+                f"data={data_init}/seed={args.seed}"
+            ), _capture() as box:
                 err = a16w16_mod.test_a16w16(
                     batch=batch,
                     M=M,
@@ -1461,38 +1469,47 @@ def run_mega_moe(args):
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             env={**env, "AITER_FORCE_A8W4": force_a8w4},
             extract=_md_kernel_table,
-                kernels=False,
+            kernels=False,
         )
 
 
 def run_mhc(args):
     """Run the DSv4 mHC fused-RMSNorm benchmark at M=512, N=7168."""
     _unused_scale_init(args, "mhc")
-    _run_child(
-        "mhc (DSv4, fused RMSNorm)",
-        [
-            sys.executable,
-            "op_tests/test_mhc.py",
-            "-n",
-            "7168",
-            "-m",
-            *map(str, _TOKENS),
-            "--fuse_rmsnorm",
-            *(
-                ["--data-init", *args.data_init]
-                if args.data_init is not None
-                else []
+    def run_case(tokens, data_inits, label):
+        _run_child(
+            label,
+            [
+                sys.executable,
+                "op_tests/test_mhc.py",
+                "-n",
+                "7168",
+                "-m",
+                *map(str, tokens),
+                "--fuse_rmsnorm",
+                "--data-init",
+                *data_inits,
+                "--seed",
+                str(args.seed),
+            ],
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            extract=_md_tables(
+                (("hip_nofuse_us",), "mhc: fused vs unfused RMSNorm"),
+                (("unfused_us",), "mhc_post_pre"),
+                (("hip_us",), "mhc_head"),
             ),
-            "--seed",
-            str(args.seed),
-        ],
-        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        extract=_md_tables(
-            (("hip_nofuse_us",), "mhc: fused vs unfused RMSNorm"),
-            (("unfused_us",), "mhc_post_pre"),
-            (("hip_us",), "mhc_head"),
-        ),
-    )
+        )
+
+    data_inits = args.data_init or ["norm"]
+    if args.smi_monitor:
+        for m, data_init in itertools.product(_TOKENS, data_inits):
+            run_case(
+                (m,),
+                (data_init,),
+                f"mhc/M={m}/N=7168/fuse_rmsnorm=1/data={data_init}/seed={args.seed}",
+            )
+    else:
+        run_case(_TOKENS, data_inits, "mhc (DSv4, fused RMSNorm)")
 
 
 def run_qk_norm(args):
@@ -1511,14 +1528,18 @@ def run_qk_norm(args):
     ]
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     _unused_scale_init(args, "qk_norm")
-    for data_init in args.data_init or [None]:
+    data_inits = args.data_init or [None]
+
+    def run_case(tokens, data_init):
         qk_init = "normal" if data_init == "norm" else data_init
         _run_child(
-            f"qk_norm (init={qk_init or 'native-default'}, seed={args.seed})",
+            f"qk_norm/T={','.join(map(str, tokens))}/H=128/D=512/RD=64/"
+            f"qweight=both/swa=direct,paged/init={qk_init or 'native-default'}/"
+            f"seed={args.seed}",
             [
                 *base_cmd,
                 "-T",
-                *map(str, _TOKENS),
+                *map(str, tokens),
                 *(["--init", qk_init] if qk_init else []),
                 "--seed",
                 str(args.seed),
@@ -1530,10 +1551,17 @@ def run_qk_norm(args):
             ),
         )
 
+    if args.smi_monitor:
+        for token, data_init in itertools.product(_TOKENS, data_inits):
+            run_case((token,), data_init)
+    else:
+        for data_init in data_inits:
+            run_case(_TOKENS, data_init)
+
 
 def run_score_qk(args):
     """Run DSv4 decode score-QK at batch 512 for short and long CSA KV."""
-    _unsupported_init(args, "score_qk")
+    _unused_scale_init(args, "score_qk")
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     base_cmd = [
         sys.executable,
@@ -1549,16 +1577,23 @@ def run_score_qk(args):
         "64",
     ]
     # None => let the UT pick the batch, so run the KV lengths once each.
-    for tokens, (label, kv_length) in itertools.product(
-        _SCORE_QK_TOKENS or (None,), _SCORE_QK_KV_LENGTHS
+    for tokens, (label, kv_length), data_init in itertools.product(
+        _SCORE_QK_TOKENS or (None,),
+        _SCORE_QK_KV_LENGTHS,
+        args.data_init or ["norm"],
     ):
         _run_child(
-            f"score_qk (decode, B={tokens or 'UT default'}, {label} CSA KV={kv_length})",
+            f"score_qk (decode, B={tokens or 'UT default'}, {label} "
+            f"CSA KV={kv_length}, init={data_init}, seed={args.seed})",
             [
                 *base_cmd,
                 *(["--batch", str(tokens)] if tokens else []),
                 "-kv_length",
                 kv_length,
+                "--data-init",
+                data_init,
+                "--seed",
+                str(args.seed),
             ],
             cwd=repo_root,
             extract=_md_from_pandas(
@@ -1575,7 +1610,7 @@ def run_mori_ep(args):
     # job. Updating it from here moved the measurement target between runs and
     # needed a dev ROCm toolchain the pip-wheel images do not ship.
     mori = os.environ.get("MORI", "/app/mori")
-    env = os.environ.copy()
+    env = _without_smi(os.environ)
     env["PYTHONPATH"] = f"{mori}/python:{mori}"
     env["MORI_SOCKET_IFNAME"] = "lo"
     env["GLOO_SOCKET_IFNAME"] = "lo"
@@ -1619,6 +1654,7 @@ def run_mori_ep(args):
             env=env,
             extract=_lines(_quiet),
             timeout=3600,
+            smi=False,
         )
 
 
@@ -1629,7 +1665,9 @@ def _perf_ratio(num, den):
     return f"{num / den:.2f}x"
 
 
-def _bench_mla_v4_asm_staged(gqa, batch, ctx, split_kv, num_iters, num_warmup):
+def _bench_mla_v4_asm_staged(
+    gqa, batch, ctx, split_kv, num_iters, num_warmup, data_init, seed
+):
     """Asm kernel (s1) + merge (s2) + total; lives in combo bench only."""
     mod = mla_v4_kargpreld_mod
     q_seq = 1
@@ -1645,7 +1683,8 @@ def _bench_mla_v4_asm_staged(gqa, batch, ctx, split_kv, num_iters, num_warmup):
         batch=batch,
         kv_seq_lens=ctx,
         q_seq_logical=q_seq,
-        seed=mod._SEED,
+        seed=seed,
+        data_init=data_init,
         gqa_ratio=gqa,
         attn_sink=True,
     )
@@ -1733,7 +1772,7 @@ def _bench_mla_v4_asm_staged(gqa, batch, ctx, split_kv, num_iters, num_warmup):
 
 def run_mla_v4_decode(args):
     # Side-by-side asm (kargpreld) vs Triton sparse decode on the same shape grid.
-    _unsupported_init(args, "mla_v4_decode")
+    _unused_scale_init(args, "mla_v4_decode")
     iters = args.mla_v4_kargpreld_iters
     warmup = args.mla_v4_kargpreld_warmup
     mla_v4_triton_mod._PERF["num_iters"] = iters
@@ -1744,23 +1783,43 @@ def run_mla_v4_decode(args):
         else _MLA_V4_KARGPRELD_SHAPES
     )
     shapes = args.mla_v4_kargpreld_shapes or default_shapes
+    data_inits = args.data_init or ["norm"]
     rows = []
     with _capture() as box:
-        for gqa, batch, ctx, split_kv in shapes:
+        for (gqa, batch, ctx, split_kv), data_init in itertools.product(
+            shapes, data_inits
+        ):
             row = {
+                "data_init": data_init,
+                "seed": args.seed,
                 "gqa_ratio": gqa,
                 "batch": batch,
                 "kv_seq_lens": ctx,
                 "num_kv_splits": split_kv,
             }
             try:
-                asm = _bench_mla_v4_asm_staged(gqa, batch, ctx, split_kv, iters, warmup)
-                tri = mla_v4_triton_mod.test_mla_v4_triton_staged(
-                    gqa_ratio=gqa,
-                    batch=batch,
-                    kv_seq_lens=ctx,
-                    num_kv_splits=split_kv,
-                )
+                with _smi_case(
+                    f"mla_v4_decode/gqa={gqa}/batch={batch}/ctx={ctx}/"
+                    f"split={split_kv}/data={data_init}/seed={args.seed}"
+                ):
+                    asm = _bench_mla_v4_asm_staged(
+                        gqa,
+                        batch,
+                        ctx,
+                        split_kv,
+                        iters,
+                        warmup,
+                        data_init,
+                        args.seed,
+                    )
+                    tri = mla_v4_triton_mod.test_mla_v4_triton_staged(
+                        gqa_ratio=gqa,
+                        batch=batch,
+                        kv_seq_lens=ctx,
+                        num_kv_splits=split_kv,
+                        data_init=data_init,
+                        seed=args.seed,
+                    )
                 row.update(asm)
                 row.update(tri)
                 row["s1 triton/asm"] = _perf_ratio(row["triton_s1"], row["asm_s1"])
@@ -1782,33 +1841,57 @@ def run_mla_v4_decode(args):
 
 def run_inverse_rope(args):
     """Run DSv4 inverse RoPE + group quant at the tp1 attention-output shape."""
-    _unsupported_init(args, "inverse_rope")
+    _unused_scale_init(args, "inverse_rope")
     # -b is (n_local_heads, n_local_groups); 128,16 is V4-Pro at dp/tp1. The UT
     # defaults to the two smallest configs instead, which never reach the shape
     # the model runs, so name it explicitly.
-    _run_child(
-        "inverse_rope_group_quant (DSv4, tp1)",
-        [
-            sys.executable,
-            "op_tests/test_inverse_rope_group_quant.py",
-            "-b",
-            "128,16",
-            *(["-s", *map(str, _INVERSE_ROPE_TOKENS)] if _INVERSE_ROPE_TOKENS else []),
-            "-l",
-            "n32k4",
-            "--group-size",
-            "32",
-        ],
-        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    )
+    def run_case(tokens, data_inits, label):
+        _run_child(
+            label,
+            [
+                sys.executable,
+                "op_tests/test_inverse_rope_group_quant.py",
+                "-b",
+                "128,16",
+                "-s",
+                *map(str, tokens),
+                "-l",
+                "n32k4",
+                "--group-size",
+                "32",
+                "--data-init",
+                *data_inits,
+                "--seed",
+                str(args.seed),
+            ],
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        )
+
+    data_inits = args.data_init or ["norm"]
+    if args.smi_monitor:
+        for tokens, data_init in itertools.product(_INVERSE_ROPE_TOKENS, data_inits):
+            run_case(
+                (tokens,),
+                (data_init,),
+                f"inverse_rope/s={tokens}/heads=128/groups=16/layout=n32k4/"
+                f"group_size=32/data={data_init}/seed={args.seed}",
+            )
+    else:
+        run_case(
+            _INVERSE_ROPE_TOKENS,
+            data_inits,
+            "inverse_rope_group_quant (DSv4, tp1)",
+        )
 
 
 def run_mla_v4_prefill(args):
     """Run DSv4 prefill across two precisions, pools and CSR modes."""
-    _unsupported_init(args, "mla_v4_prefill")
-    for tokens in _MLA_PREFILL_TOKENS:
+    _unused_scale_init(args, "mla_v4_prefill")
+    data_inits = args.data_init or ["norm"]
+
+    def run_case(tokens, pages, precs, modes, backends, init_values, label):
         _run_child(
-            f"mla_v4 prefill (M={tokens}, prec=fp8/bf16, pages=4096/16384)",
+            label,
             [
                 sys.executable,
                 "op_tests/test_pa_sparse_prefill.py",
@@ -1819,22 +1902,23 @@ def run_mla_v4_prefill(args):
                 "-d",
                 "512",
                 "--total_pages",
-                "4096",
-                "16384",
+                *map(str, pages),
                 "--total_tokens",
                 str(tokens),
                 "--prec",
-                "fp8",
-                "bf16",
+                *precs,
                 # bf16 takes the single-tensor Q/K/V/O kernel; only fp8 has an
                 # asm candidate, so the bf16 rows compare opus against triton
                 # and leave the asm columns empty.
                 "--mode",
-                "dense",
-                "sparse",
+                *modes,
+                "--backend",
+                *backends,
                 "--no-verify",
                 "--seed",
                 str(args.seed),
+                "--data-init",
+                *init_values,
             ],
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             # Not _table_row: the UT has no "latency_us" column (it prints
@@ -1843,6 +1927,39 @@ def run_mla_v4_prefill(args):
             # as data, and dropped the real header, which starts with "n".
             extract=_space_table("total_pages"),
         )
+
+    if args.smi_monitor:
+        backend_by_prec = {"fp8": ("opus", "asm"), "bf16": ("opus", "triton")}
+        for tokens, pages, prec, mode, data_init in itertools.product(
+            _MLA_PREFILL_TOKENS,
+            (4096, 16384),
+            ("fp8", "bf16"),
+            ("dense", "sparse"),
+            data_inits,
+        ):
+            for backend in backend_by_prec[prec]:
+                run_case(
+                    tokens,
+                    (pages,),
+                    (prec,),
+                    (mode,),
+                    (backend,),
+                    (data_init,),
+                    f"mla_v4_prefill/M={tokens}/H=128/D=512/pages={pages}/"
+                    f"total_tokens={tokens}/prec={prec}/mode={mode}/backend={backend}/"
+                    f"data={data_init}/seed={args.seed}",
+                )
+    else:
+        for tokens in _MLA_PREFILL_TOKENS:
+            run_case(
+                tokens,
+                (4096, 16384),
+                ("fp8", "bf16"),
+                ("dense", "sparse"),
+                ("opus", "asm", "triton"),
+                data_inits,
+                f"mla_v4 prefill (M={tokens}, prec=fp8/bf16, pages=4096/16384)",
+            )
 
 
 OPS = {
@@ -2003,7 +2120,7 @@ def main():
     p.add_argument(
         "--smi-monitor",
         action="store_true",
-        help="sample power/clocks/temperature/utilization for the whole sweep",
+        help="replay and sample each timed benchmark case after latency measurement",
     )
     p.add_argument(
         "--smi-device",
@@ -2016,6 +2133,12 @@ def main():
         type=float,
         default=0.05,
         help="amdsmi sampling interval in seconds (default: 0.05)",
+    )
+    p.add_argument(
+        "--smi-duration",
+        type=float,
+        default=1.0,
+        help="minimum replay window in seconds for each benchmark case (default: 1.0)",
     )
     # mha (SWA fwd asm) — fixed 4-shape grid; init sweep only
     p.add_argument(
@@ -2053,6 +2176,29 @@ def main():
         p.error("--smi-device must be non-negative")
     if args.smi_interval <= 0:
         p.error("--smi-interval must be positive")
+    if args.smi_duration <= 0:
+        p.error("--smi-duration must be positive")
+
+    if args.smi_monitor:
+        smi_output = tempfile.NamedTemporaryFile(
+            prefix="aiter_smi_", suffix=".jsonl", delete=False
+        )
+        smi_output.close()
+        os.environ.update(
+            {
+                "AITER_SMI_MONITOR": "1",
+                "AITER_SMI_DEVICE": str(args.smi_device),
+                "AITER_SMI_INTERVAL": str(args.smi_interval),
+                "AITER_SMI_DURATION": str(args.smi_duration),
+                "AITER_SMI_OUTPUT_PATH": smi_output.name,
+                # Reference implementations timed by a few legacy UTs are not
+                # hardware candidates and must not produce telemetry rows.
+                "AITER_SMI_SKIP_FUNCTIONS": "run_torch,run_torch2",
+            }
+        )
+    else:
+        smi_output = None
+        os.environ.pop("AITER_SMI_MONITOR", None)
 
     args.suite = "dsv4" if args.dsv4 else "perf"
     default_ops = DSV4_OPS if args.dsv4 else PERF_OPS
@@ -2061,26 +2207,25 @@ def main():
     # runnable by name to check whether a newer image fixed it. argparse already
     # rejects names outside OPS.
     selected_ops = args.ops or default_ops
-    monitor_context = (
-        monitor_gpu(device_index=args.smi_device, interval_s=args.smi_interval)
-        if args.smi_monitor
-        else contextlib.nullcontext(None)
-    )
-    with monitor_context as monitor:
-        for name in selected_ops:
-            with _keep_going(name):
-                OPS[name](args)
+    for name in selected_ops:
+        with _keep_going(name):
+            OPS[name](args)
 
-    if monitor is not None:
-        rows = [
-            {"metric": metric, **stats}
-            for metric, stats in monitor.summary().items()
-        ]
+    if args.smi_monitor:
+        try:
+            with open(smi_output.name, encoding="utf-8") as output:
+                _collect_smi_rows(output)
+        finally:
+            os.unlink(smi_output.name)
         _print_table(
-            f"amdsmi (device={args.smi_device}, interval={args.smi_interval}s, "
-            f"samples={len(monitor.samples)})",
-            rows,
-            keep=["metric", "min", "mean", "median", "max", "n"],
+            f"amdsmi per benchmark case (device={args.smi_device}, "
+            f"interval={args.smi_interval}s, min_duration={args.smi_duration}s)",
+            _SMI_ROWS,
+            keep=[
+                "case", "rank", "device", "duration_s", "launches", "samples",
+                "sample_status",
+                "metric", "min", "mean", "median", "max", "n",
+            ],
         )
 
     if _FAILURES:

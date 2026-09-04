@@ -16,11 +16,11 @@ from einops import repeat as eirp
 
 import aiter
 from aiter import dtypes
+from aiter import test_common as bench_init
 from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_ck, gemm_a8w8_blockscale_cktile
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.utility import fp4_utils
-from op_tests import bench_init
 
 block_shape = (128, 128)
 TEST_NUM_ITERS = 100

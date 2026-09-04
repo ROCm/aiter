@@ -588,7 +588,14 @@ def test_flydsl_swa_write(
     # a write; they change no in-pool byte, so only a dirtied guard row can show
     # that one regressed.
     G = _SWA_GUARD_ROWS
-    pool = torch.zeros(G + num_rows + G, D, dtype=torch.bfloat16, device=device)
+    # A zero-filled pool cannot distinguish "the kernel wrote a zero row" from
+    # "the kernel skipped this row" when --init zero. Seed every row with an
+    # unreachable sentinel so the write-mask check remains valid for all data
+    # distributions.
+    sentinel = torch.finfo(torch.bfloat16).max
+    pool = torch.full(
+        (G + num_rows + G, D), sentinel, dtype=torch.bfloat16, device=device
+    )
     swa_kv = pool[G : G + num_rows]
     mode_kw = (
         {"swa_dest_rows": index_t}
@@ -636,7 +643,7 @@ def test_flydsl_swa_write(
 
     # The scatter is a verbatim copy of kv_out, so the reference IS kv_out
     # gathered onto the rows the addressing mode selects.
-    expected = torch.zeros_like(swa_kv)
+    expected = torch.full_like(swa_kv, sentinel)
     n_written = 0
     for t in range(T):
         if dest[t] < 0:
@@ -658,10 +665,12 @@ def test_flydsl_swa_write(
     )
     # A skipped token must reach NO row, not merely the right one.
     assert (
-        int((swa_kv != 0).any(dim=1).sum()) == n_written
+        int((swa_kv != sentinel).any(dim=1).sum()) == n_written
     ), f"{mode}: a skipped token still reached the pool"
-    assert not pool[:G].any(), f"{mode}: scatter wrote BEFORE the pool"
-    assert not pool[G + num_rows :].any(), f"{mode}: scatter wrote PAST the pool"
+    assert (pool[:G] == sentinel).all(), f"{mode}: scatter wrote BEFORE the pool"
+    assert (pool[G + num_rows :] == sentinel).all(), (
+        f"{mode}: scatter wrote PAST the pool"
+    )
 
     # The scatter must not perturb the primary outputs.
     ref_q, ref_kv, _, _ = flydsl_qk_norm_rope_quant(

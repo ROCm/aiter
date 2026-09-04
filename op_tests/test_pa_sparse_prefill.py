@@ -44,7 +44,14 @@ from aiter.ops.pa_sparse_prefill_opus import (
     pa_sparse_prefill_fp8_opus,
     pa_sparse_prefill_opus,
 )
-from aiter.test_common import benchmark, checkAllclose, perftest
+from aiter.test_common import (
+    DATA_DISTS,
+    benchmark,
+    checkAllclose,
+    fill,
+    make_generator,
+    perftest,
+)
 
 try:
     from aiter.ops.triton.attention.pa_prefill_sparse import pa_prefill_sparse
@@ -307,19 +314,32 @@ def _make_inputs(
     mode: str = "sparse",
     device: torch.device | str = "cuda",
     seed: int = 0,
+    data_init: str = "norm",
 ) -> dict:
     assert mode in _MODES
-    torch.manual_seed(seed)
     device = torch.device(device)
+    gen = make_generator(seed, device=device)
 
-    q = (torch.randn(n, h, d, device=device, dtype=torch.float32) * 0.5).to(dtype)
-    unified_kv = (
-        torch.randn(total_pages, d, device=device, dtype=torch.float32) * 0.5
+    q = (
+        fill((n * h, d), data_init, gen, dtype=torch.float32, device=device)
+        .view(n, h, d)
+        .mul_(0.5)
     ).to(dtype)
-    kv = (torch.randn(total_tokens, d, device=device, dtype=torch.float32) * 0.5).to(
-        dtype
+    unified_kv = (
+        fill(
+            (total_pages, d), data_init, gen, dtype=torch.float32, device=device
+        )
+        * 0.5
+    ).to(dtype)
+    kv = (
+        fill(
+            (total_tokens, d), data_init, gen, dtype=torch.float32, device=device
+        )
+        * 0.5
+    ).to(dtype)
+    attn_sink = (
+        fill((h,), data_init, gen, dtype=torch.float32, device=device) * 0.25
     )
-    attn_sink = torch.randn(h, device=device, dtype=torch.float32) * 0.25
 
     def _csr(total_rows: int, seed_offset: int):
         if mode == "sparse":
@@ -357,19 +377,37 @@ def _make_inputs_fp8(
     mode: str = "sparse",
     device: torch.device | str = "cuda",
     seed: int = 0,
+    data_init: str = "norm",
 ) -> dict:
     """Returns ``{"kernel": ..., "ref": ...}``: the split fp8/bf16 tensors the
     kernels take, and the dequantized fp32 rows the reference takes.
     """
     assert mode in _MODES
-    torch.manual_seed(seed)
     device = torch.device(device)
+    gen = make_generator(seed, device=device)
 
     def _streams(rows: int):
         nope_fp8, deq = _quantize_nope(
-            torch.randn(rows, _FP8_D_NOPE, device=device) * 0.5
+            fill(
+                (rows, _FP8_D_NOPE),
+                data_init,
+                gen,
+                dtype=torch.float32,
+                device=device,
+            )
+            * 0.5
         )
-        rope = (torch.randn(rows, _FP8_D_ROPE, device=device) * 0.5).to(torch.bfloat16)
+        rope = (
+            fill(
+                (rows, _FP8_D_ROPE),
+                data_init,
+                gen,
+                dtype=torch.float32,
+                device=device,
+            )
+            * 0.5
+        )
+        rope = rope.to(torch.bfloat16)
         row_fp32 = torch.cat([deq, rope.to(torch.float32)], dim=1)  # [rows, 512]
         return nope_fp8, rope, row_fp32
 
@@ -380,7 +418,9 @@ def _make_inputs_fp8(
     ukn, ukr, ukv_fp32 = _streams(total_pages)
     kn, kr, kv_fp32 = _streams(total_tokens)
 
-    attn_sink = torch.randn(h, device=device, dtype=torch.float32) * 0.25
+    attn_sink = (
+        fill((h,), data_init, gen, dtype=torch.float32, device=device) * 0.25
+    )
 
     def _csr(total_rows: int, seed_offset: int):
         if mode == "sparse":
@@ -488,6 +528,7 @@ def run_pa_sparse_prefill(
     mode: str = "sparse",
     backends: tuple = _BACKENDS,
     seed: int = 0,
+    data_init: str = "norm",
     verify: bool = True,
     bench: bool = True,
 ) -> dict | None:
@@ -498,7 +539,7 @@ def run_pa_sparse_prefill(
     softmax_scale = 1.0 / math.sqrt(d)
     msg = (
         f"[N={n} H={h} D={d} total_pages={total_pages} total_tokens={total_tokens} "
-        f"prec={prec} mode={mode}]"
+        f"prec={prec} mode={mode} data_init={data_init} seed={seed}]"
     )
     wanted = [b for b in _PREC_BACKENDS[prec] if b in backends]
 
@@ -506,7 +547,15 @@ def run_pa_sparse_prefill(
     candidates: list = []
 
     if prec == "fp8":
-        data = _make_inputs_fp8(n, h, total_pages, total_tokens, mode=mode, seed=seed)
+        data = _make_inputs_fp8(
+            n,
+            h,
+            total_pages,
+            total_tokens,
+            mode=mode,
+            seed=seed,
+            data_init=data_init,
+        )
         kernel_inputs = data["kernel"]
         ref_fn, ref_inputs = _ref_pa_sparse_prefill_fp8, data["ref"]
         if "opus" in wanted:
@@ -537,6 +586,7 @@ def run_pa_sparse_prefill(
             _PREC_TO_DTYPE[prec],
             mode=mode,
             seed=seed,
+            data_init=data_init,
         )
         ref_fn, ref_inputs = _ref_pa_sparse_prefill_opus, kernel_inputs
         if "opus" in wanted:
@@ -744,6 +794,13 @@ parser.add_argument(
     default=0,
     help="RNG seed for input + CSR generation",
 )
+parser.add_argument(
+    "--data-init",
+    nargs="+",
+    choices=list(DATA_DISTS),
+    default=["norm"],
+    help="DATA initialization distribution(s) for Q, KV and attention sink",
+)
 
 
 if __name__ == "__main__":
@@ -751,12 +808,13 @@ if __name__ == "__main__":
 
     rows = []
     # product varies its last argument fastest -> this is also the row order.
-    for prec, mode, h, n, pages_arg in itertools.product(
+    for prec, mode, h, n, pages_arg, data_init in itertools.product(
         args.prec,
         args.mode,
         args.h_q,
         args.n_tokens,
         args.total_pages,
+        args.data_init,
     ):
         total_pages = pages_arg if pages_arg > 0 else n  # 0 is "mirror -n"
         total_tokens = args.total_tokens if args.total_tokens is not None else n
@@ -770,6 +828,7 @@ if __name__ == "__main__":
             mode=mode,
             backends=tuple(args.backend),
             seed=args.seed,
+            data_init=data_init,
             verify=not args.no_verify,
             bench=not args.no_bench,
         )
@@ -784,7 +843,9 @@ if __name__ == "__main__":
         if drop_cols:
             df = df.drop(columns=drop_cols)
         # Column order otherwise follows whichever row first ran a backend.
-        lead = [c for c in ("prec", "mode", "h", "n") if c in df.columns]
+        lead = [
+            c for c in ("prec", "mode", "data_init", "h", "n") if c in df.columns
+        ]
         rest = [c for c in df.columns if c not in lead]
         metrics = [c for b in _BACKENDS for c in rest if c.startswith(f"{b} ")]
         df = df[lead + [c for c in rest if c not in metrics] + metrics]

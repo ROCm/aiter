@@ -19,10 +19,14 @@ Usage (explicit start/stop):
 from __future__ import annotations
 
 import ctypes
+import json
+import os
 import threading
 import time
 from contextlib import contextmanager
 from typing import Generator
+
+SMI_RESULT_PREFIX = "AITER_SMI_RESULT "
 
 try:
     import amdsmi
@@ -156,6 +160,8 @@ class GpuMonitor:
         self._samples: list[dict] = []
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        self._ready_event = threading.Event()
+        self._error: BaseException | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -166,9 +172,18 @@ class GpuMonitor:
         if self._thread is not None and self._thread.is_alive():
             raise RuntimeError("GpuMonitor is already running")
         self._samples = []
+        self._error = None
         self._stop_event.clear()
+        self._ready_event.clear()
         self._thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._thread.start()
+        if not self._ready_event.wait(timeout=10.0):
+            self._stop_event.set()
+            raise RuntimeError("timed out while initializing amdsmi monitor")
+        if self._error is not None:
+            error = self._error
+            self.stop()
+            raise RuntimeError(f"failed to initialize amdsmi monitor: {error}")
 
     def stop(self) -> None:
         """Stop background polling and wait for the thread to finish."""
@@ -182,16 +197,24 @@ class GpuMonitor:
         """Collected samples; each is a dict with 'timestamp_s' plus metric keys."""
         return list(self._samples)
 
-    def summary(self) -> dict:
-        """Return min/mean/median/max for every numeric metric across all samples."""
-        if not self._samples:
+    def summary(
+        self, *, start_s: float | None = None, end_s: float | None = None
+    ) -> dict:
+        """Return metric summaries, optionally restricted to a timestamp window."""
+        samples = [
+            sample
+            for sample in self._samples
+            if (start_s is None or sample["timestamp_s"] >= start_s)
+            and (end_s is None or sample["timestamp_s"] <= end_s)
+        ]
+        if not samples:
             return {}
-        keys = [k for k in self._samples[0] if k != "timestamp_s"]
+        keys = {key for sample in samples for key in sample if key != "timestamp_s"}
         result: dict = {}
-        for key in keys:
+        for key in sorted(keys):
             vals = sorted(
                 s[key]
-                for s in self._samples
+                for s in samples
                 if s.get(key) is not None and s[key] != "N/A"
             )
             if not vals:
@@ -224,13 +247,27 @@ class GpuMonitor:
     # ------------------------------------------------------------------
 
     def _poll_loop(self) -> None:
-        amdsmi.amdsmi_init()
+        initialized = False
         try:
+            target_bdf = None
             if isinstance(self._device_index, int):
-                devices = amdsmi.amdsmi_get_processor_handles()
-                handle = devices[self._device_index]
+                target_bdf = _hip_device_bdf(self._device_index)
+            amdsmi.amdsmi_init()
+            initialized = True
+            if target_bdf is not None:
+                handles = {
+                    _amdsmi_bdf_str(handle): handle
+                    for handle in amdsmi.amdsmi_get_processor_handles()
+                }
+                if target_bdf not in handles:
+                    raise RuntimeError(
+                        f"no amdsmi handle for HIP device {self._device_index} "
+                        f"({target_bdf})"
+                    )
+                handle = handles[target_bdf]
             else:
                 handle = self._device_index
+            self._ready_event.set()
             while not self._stop_event.is_set():
                 t0 = time.perf_counter()
                 self._samples.append(_collect_sample(handle))
@@ -238,8 +275,13 @@ class GpuMonitor:
                 remaining = self._interval_s - elapsed
                 if remaining > 0:
                     self._stop_event.wait(timeout=remaining)
+        except BaseException as error:
+            self._error = error
+            self._ready_event.set()
         finally:
-            amdsmi.amdsmi_shut_down()
+            if initialized:
+                amdsmi.amdsmi_shut_down()
+            self._ready_event.set()
 
 
 # ------------------------------------------------------------------
@@ -262,3 +304,80 @@ def monitor_gpu(
     mon = GpuMonitor(device_index=device_index, interval_s=interval_s)
     with mon:
         yield mon
+
+
+def smi_replay_enabled() -> bool:
+    """Whether the benchmark requested an isolated SMI replay window."""
+    return os.environ.get("AITER_SMI_MONITOR", "0") == "1"
+
+
+def emit_smi_result(result: dict) -> None:
+    """Write one structured result to the combo JSONL sink or stdout."""
+    line = SMI_RESULT_PREFIX + json.dumps(result, sort_keys=True)
+    output_path = os.environ.get("AITER_SMI_OUTPUT_PATH")
+    if output_path:
+        with open(output_path, "a", encoding="utf-8") as output:
+            output.write(line + "\n")
+    else:
+        print(line, flush=True)
+
+
+def replay_with_smi(
+    fn,
+    *,
+    label: str,
+    synchronize,
+    estimated_us: float | None = None,
+) -> dict | None:
+    """Repeat one already-prepared benchmark case under the GPU monitor.
+
+    Input creation, compilation, correctness and the latency measurement happen
+    before this function is called.  Batching launches between synchronizations
+    keeps short kernels busy while still checking the wall-clock deadline often
+    enough for slow kernels.
+    """
+    if not smi_replay_enabled():
+        return None
+
+    device = int(os.environ.get("AITER_SMI_DEVICE", "0"))
+    interval_s = float(os.environ.get("AITER_SMI_INTERVAL", "0.05"))
+    duration_s = float(os.environ.get("AITER_SMI_DURATION", "1.0"))
+    if interval_s <= 0 or duration_s <= 0:
+        raise ValueError("AITER_SMI_INTERVAL and AITER_SMI_DURATION must be positive")
+
+    # Aim for roughly one synchronization per monitor tick.  The cap prevents a
+    # near-zero/invalid latency estimate from enqueueing an unbounded amount of
+    # work, while a slow case is synchronized after every launch.
+    if estimated_us is not None and estimated_us > 0:
+        batch_iters = max(1, min(1024, int(interval_s * 1e6 / estimated_us)))
+    else:
+        batch_iters = 1
+
+    synchronize()
+    launches = 0
+    start = time.perf_counter()
+    with monitor_gpu(device_index=device, interval_s=interval_s) as monitor:
+        while launches == 0 or time.perf_counter() - start < duration_s:
+            for _ in range(batch_iters):
+                fn()
+            launches += batch_iters
+            synchronize()
+    elapsed_s = time.perf_counter() - start
+
+    result = {
+        "label": label,
+        "device": device,
+        "interval_s": interval_s,
+        "duration_s": elapsed_s,
+        "launches": launches,
+        "samples": len(monitor.samples),
+        "metrics": monitor.summary(),
+    }
+    expected_samples = max(1, int(duration_s / interval_s))
+    result["sample_status"] = (
+        "ok" if len(monitor.samples) >= max(2, expected_samples // 2) else "insufficient"
+    )
+    # A shared JSONL sink survives fd silencing and child processes. Standalone
+    # UT runs without a sink still get a machine-readable stdout record.
+    emit_smi_result(result)
+    return result

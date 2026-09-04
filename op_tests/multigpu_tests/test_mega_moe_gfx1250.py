@@ -37,7 +37,9 @@ generated weights, never drawn independently.
 """
 
 import argparse
+import math
 import os
+import time
 
 import torch
 import torch.distributed as dist
@@ -786,6 +788,76 @@ def _event_device_us(e):
     return 0.0
 
 
+def _run_distributed_smi_replay(pipe, dist_ctx, median_us, n_layers):
+    """Replay the Mega graph while every rank monitors its local GPU."""
+    if os.environ.get("AITER_SMI_MONITOR", "0") != "1":
+        return
+
+    from op_tests.smi_monitor import GpuMonitor, emit_smi_result
+
+    interval_s = float(os.environ.get("AITER_SMI_INTERVAL", "0.05"))
+    duration_s = float(os.environ.get("AITER_SMI_DURATION", "1.0"))
+    if interval_s <= 0 or duration_s <= 0 or median_us <= 0:
+        raise ValueError(
+            "Mega MoE SMI interval, duration and measured median must be positive"
+        )
+    replay_count = max(1, math.ceil(duration_s * 1e6 / median_us))
+
+    monitor = None
+    monitor_error = None
+    try:
+        monitor = GpuMonitor(
+            device_index=torch.cuda.current_device(), interval_s=interval_s
+        )
+        monitor.start()
+    except Exception as error:  # noqa: BLE001 - propagate to every rank
+        monitor_error = f"rank {dist_ctx.rank}: {type(error).__name__}: {error}"
+
+    monitor_errors = dist_ctx.gather_objects(monitor_error)
+    failed = [error for error in monitor_errors if error is not None]
+    if failed:
+        if monitor is not None:
+            monitor.stop()
+        raise RuntimeError("Mega MoE SMI monitor failed to start: " + "; ".join(failed))
+
+    # Gloo barriers align CPU submission without adding a GPU collective to the
+    # measured Mega graph window. Every rank executes exactly the same replay
+    # count; a local duration loop would diverge and deadlock the collectives.
+    dist.barrier()
+    window_start = time.perf_counter()
+    for _ in range(replay_count):
+        pipe.graph.replay()
+        torch.cuda.synchronize()
+    window_end = time.perf_counter()
+    monitor.stop()
+    dist.barrier()
+
+    samples = [
+        sample
+        for sample in monitor.samples
+        if window_start <= sample["timestamp_s"] <= window_end
+    ]
+    expected_samples = max(1, int(duration_s / interval_s))
+    base_label = os.environ.get("AITER_SMI_LABEL", "mega_moe")
+    local_result = {
+        "label": f"{base_label}/mega_graph_{n_layers}_layers",
+        "device": dist_ctx.local_rank,
+        "rank": dist_ctx.rank,
+        "interval_s": interval_s,
+        "duration_s": window_end - window_start,
+        "launches": replay_count,
+        "samples": len(samples),
+        "sample_status": (
+            "ok" if len(samples) >= max(2, expected_samples // 2) else "insufficient"
+        ),
+        "metrics": monitor.summary(start_s=window_start, end_s=window_end),
+    }
+    results = dist_ctx.gather_objects(local_result)
+    if dist_ctx.rank == 0:
+        for result in results:
+            emit_smi_result(result)
+
+
 def _aggregate_prof_table(prof, dist_ctx, per_layer_denom=1.0, row_limit=200):
     """Collect the torch.profiler per-kernel table ACROSS ranks (collective; call
     on every rank). Each rank contributes {name: (self_device_us_total, count)};
@@ -960,6 +1032,7 @@ def main():
     stats = {k: dist_ctx.allreduce_avg_float(v) for k, v in stats.items()}
     per_layer_us = stats["median"] / n_layers
     prof_us = dist_ctx.allreduce_avg_float(prof_us)
+    _run_distributed_smi_replay(pipe, dist_ctx, stats["median"], n_layers)
     tbl = None
     if args.profile_table:
         tbl = _aggregate_prof_table(

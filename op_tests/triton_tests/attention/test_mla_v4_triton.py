@@ -9,7 +9,13 @@ import triton
 
 from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.test_common import (
+    benchmark,
+    checkAllclose,
+    fill,
+    make_generator,
+    run_perftest,
+)
 
 # MLA v4 sparse-decode parity: D=512 heads, page_size=1 unified pool.
 _PA_DECODE_SPARSE_D = 512
@@ -99,15 +105,25 @@ def _make_inputs(
     total_pages: int,
     dtype=torch.bfloat16,
     seed: int = 0,
+    data_init: str = "norm",
     include_sentinels: bool = False,
     variable_len: bool = False,
 ):
     torch.manual_seed(seed)
     device = torch.device("cuda")
+    gen = make_generator(seed)
 
-    q = torch.randn(T, H, D, dtype=dtype, device=device) * 0.5
-    unified_kv = torch.randn(total_pages, D, dtype=dtype, device=device) * 0.5
-    attn_sink = torch.randn(H, dtype=torch.float32, device=device) * 0.1
+    q = (
+        fill((T * H, D), data_init, gen, dtype=dtype, device=device)
+        .view(T, H, D)
+        .mul_(0.5)
+    )
+    unified_kv = (
+        fill((total_pages, D), data_init, gen, dtype=dtype, device=device) * 0.5
+    )
+    attn_sink = (
+        fill((H,), data_init, gen, dtype=torch.float32, device=device) * 0.1
+    )
 
     # Per-token kv_len: fixed or random in [1, kv_len_per_token].
     if variable_len:
@@ -117,6 +133,7 @@ def _make_inputs(
             size=(T,),
             device=device,
             dtype=torch.int64,
+            generator=gen,
         )
     else:
         kv_lens = torch.full((T,), kv_len_per_token, device=device, dtype=torch.int64)
@@ -131,11 +148,14 @@ def _make_inputs(
         size=(total_indices,),
         device=device,
         dtype=torch.int32,
+        generator=gen,
     )
     if include_sentinels and total_indices > 0:
         # Sprinkle a few -1 sentinels.
         n_sentinel = max(1, total_indices // 16)
-        sentinel_pos = torch.randperm(total_indices, device=device)[:n_sentinel]
+        sentinel_pos = torch.randperm(total_indices, device=device, generator=gen)[
+            :n_sentinel
+        ]
         indices[sentinel_pos] = -1
 
     indptr = indptr.to(torch.int32)
@@ -144,14 +164,28 @@ def _make_inputs(
 
 
 @benchmark()
-def test_mla_v4_triton_staged(gqa_ratio, batch, kv_seq_lens, num_kv_splits):
+def test_mla_v4_triton_staged(
+    gqa_ratio,
+    batch,
+    kv_seq_lens,
+    num_kv_splits,
+    data_init="norm",
+    seed=0,
+):
     """Perf-only stage split: main kernel (s1) + reduce (s2) + total."""
     T = batch
     H = gqa_ratio
     D = _PA_DECODE_SPARSE_D
     pages = T * kv_seq_lens
     q, unified_kv, indices, indptr, sink, scale = _make_inputs(
-        T, H, D, kv_seq_lens, pages, variable_len=False
+        T,
+        H,
+        D,
+        kv_seq_lens,
+        pages,
+        variable_len=False,
+        data_init=data_init,
+        seed=seed,
     )
     pa_kwargs = {
         "has_invalid": False,
@@ -195,7 +229,14 @@ def test_mla_v4_triton_staged(gqa_ratio, batch, kv_seq_lens, num_kv_splits):
 
 
 @benchmark()
-def test_mla_v4_triton_perf(gqa_ratio, batch, kv_seq_lens, num_kv_splits):
+def test_mla_v4_triton_perf(
+    gqa_ratio,
+    batch,
+    kv_seq_lens,
+    num_kv_splits,
+    data_init="norm",
+    seed=0,
+):
     """Perf sweep row for combo bench / gfx1250 Triton sparse MLA v4 decode.
 
     Shape ids mirror ``test_mla_v4_kargpreld.test_mla_v4_nm``:
@@ -207,7 +248,14 @@ def test_mla_v4_triton_perf(gqa_ratio, batch, kv_seq_lens, num_kv_splits):
     D = _PA_DECODE_SPARSE_D
     pages = T * kv_seq_lens
     q, unified_kv, indices, indptr, sink, scale = _make_inputs(
-        T, H, D, kv_seq_lens, pages, variable_len=False
+        T,
+        H,
+        D,
+        kv_seq_lens,
+        pages,
+        variable_len=False,
+        data_init=data_init,
+        seed=seed,
     )
     _, us = run_perftest(
         pa_decode_sparse,

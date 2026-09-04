@@ -32,8 +32,11 @@ from aiter.ops.inverse_rope_group_quant import (
 from aiter.ops.quant import dynamic_per_group_scaled_quant
 from aiter.ops.triton.rope.rope import RotateStyle, _rope_cached_bwd
 from aiter.test_common import (
+    DATA_DISTS,
     benchmark,
     checkAllclose,
+    fill,
+    make_generator,
     run_perftest,
 )
 
@@ -295,7 +298,7 @@ def _check_scale_layout(scale, s, g, ks, scale_layout, group_size, name):
     ), f"{name}: {scale_layout} scale should be {expect}, got {tuple(scale.shape)}"
 
 
-def _make_inputs(s, h, head_dim, rd, dtype, seed=0):
+def _make_inputs(s, h, head_dim, rd, dtype, data_init="norm", seed=0):
     """Build (o, positions, cos, sin) for one config.
 
     cos/sin are the 2D [max_pos, rd//2] the op takes. A model holding the
@@ -305,12 +308,16 @@ def _make_inputs(s, h, head_dim, rd, dtype, seed=0):
     own call site, the way run_inverse_rope_inplace does for the triton rope.
     Shared by the sweep and the graph check so the two cannot drift.
     """
-    torch.manual_seed(seed)
+    gen = make_generator(seed)
     positions = torch.arange(s, dtype=dtypes.i64) % MAX_POS
     # /10 keeps a group's amax away from fp8 saturation, like a real
     # post-softmax attention output.
-    o = torch.randn((s, h, head_dim), dtype=dtype) / 10
-    theta = torch.randn((MAX_POS, rd // 2), dtype=dtypes.fp32)
+    o = (
+        fill((s * h, head_dim), data_init, gen, dtype=dtype)
+        .view(s, h, head_dim)
+        .div_(10)
+    )
+    theta = fill((MAX_POS, rd // 2), data_init, gen, dtype=dtypes.fp32)
     cos = torch.cos(theta).to(dtype).contiguous()
     sin = torch.sin(theta).to(dtype).contiguous()
     return o, positions, cos, sin
@@ -440,12 +447,23 @@ def run_unfused(x, positions, cos, sin, num_groups, quant_group_size, rd, out):
 
 @benchmark()
 def test_inverse_rope_group_quant(
-    s, h, g, head_dim, rd, group_size, dtype, scale_layout
+    s,
+    h,
+    g,
+    head_dim,
+    rd,
+    group_size,
+    dtype,
+    scale_layout,
+    data_init="norm",
+    seed=0,
 ):
     d = h * head_dim // g
     scale_n = d // group_size
 
-    o, positions, cos, sin = _make_inputs(s, h, head_dim, rd, dtype)
+    o, positions, cos, sin = _make_inputs(
+        s, h, head_dim, rd, dtype, data_init=data_init, seed=seed
+    )
 
     ref = run_torch(o, positions, cos, sin, g, group_size, rd)
     ref_rt = run_torch(o, positions, cos, sin, g, group_size, rd, roundtrip=True)
@@ -546,14 +564,27 @@ def test_inverse_rope_group_quant(
     return ret
 
 
-def check_graph(s, h, g, head_dim, rd, group_size, dtype, scale_layout):
+def check_graph(
+    s,
+    h,
+    g,
+    head_dim,
+    rd,
+    group_size,
+    dtype,
+    scale_layout,
+    data_init="norm",
+    seed=0,
+):
     """Capture the op in a HIP graph, replay on fresh data, compare against eager.
 
     Not part of the perf table: this is a pass/fail check that the host-side
     dispatch tier and the pre-allocated buffers survive capture/replay.
     """
     d = h * head_dim // g
-    o, positions, cos, sin = _make_inputs(s, h, head_dim, rd, dtype)
+    o, positions, cos, sin = _make_inputs(
+        s, h, head_dim, rd, dtype, data_init=data_init, seed=seed
+    )
     x_fp8, x_scale = _alloc_outputs(s, g, d, group_size, scale_layout=scale_layout)
     kwargs = {
         "num_groups": g,
@@ -575,7 +606,9 @@ def check_graph(s, h, g, head_dim, rd, group_size, dtype, scale_layout):
         inverse_rope_group_quant_cpp(o, positions, cos, sin, **kwargs)
 
     # Replay on new data, then compare against an eager run on the same data.
-    o2, positions2, cos2, sin2 = _make_inputs(s, h, head_dim, rd, dtype, seed=7)
+    o2, positions2, cos2, sin2 = _make_inputs(
+        s, h, head_dim, rd, dtype, data_init=data_init, seed=seed + 7
+    )
     o.copy_(o2)
     positions.copy_(positions2)
     cos.copy_(cos2)
@@ -741,6 +774,19 @@ def main():
         e.g.: --graph -s 1 4 32 128 300 512 700 2048""",
     )
     parser.add_argument(
+        "--data-init",
+        nargs="+",
+        choices=list(DATA_DISTS),
+        default=["norm"],
+        help="DATA initialization distribution(s) (default: norm)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="RNG seed for o and the RoPE cache source (default: 0)",
+    )
+    parser.add_argument(
         "--opus-tree",
         default=os.environ.get("AITER_OPUS_TREE"),
         help="""Path to the opus aiter checkout. Round-trips this op's
@@ -756,13 +802,22 @@ def main():
 
     for dtype in args.dtype:
         df = []
-        for (h, g), s, head_dim, rd, group_size, scale_layout in itertools.product(
+        for (
+            (h, g),
+            s,
+            head_dim,
+            rd,
+            group_size,
+            scale_layout,
+            data_init,
+        ) in itertools.product(
             args.hg,
             args.tokens,
             args.head_dim,
             args.rope_dim,
             args.group_size,
             args.scale_layout,
+            args.data_init,
         ):
             # n32k4 only exists at group 32: its four packed k groups are one
             # WMMA-K=128 step, so 4 * group_size has to be 128. The op rejects
@@ -770,11 +825,31 @@ def main():
             if scale_layout == "n32k4" and group_size != 32:
                 continue
             ret = test_inverse_rope_group_quant(
-                s, h, g, head_dim, rd, group_size, dtype, scale_layout
+                s,
+                h,
+                g,
+                head_dim,
+                rd,
+                group_size,
+                dtype,
+                scale_layout,
+                data_init=data_init,
+                seed=args.seed,
             )
             df.append(ret)
             if args.graph:
-                check_graph(s, h, g, head_dim, rd, group_size, dtype, scale_layout)
+                check_graph(
+                    s,
+                    h,
+                    g,
+                    head_dim,
+                    rd,
+                    group_size,
+                    dtype,
+                    scale_layout,
+                    data_init=data_init,
+                    seed=args.seed,
+                )
         df = pd.DataFrame(df)
         aiter.logger.info(
             "inverse_rope_group_quant summary (markdown):\n%s",
