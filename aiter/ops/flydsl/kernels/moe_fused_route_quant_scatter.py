@@ -87,6 +87,11 @@ from aiter.utility.mx_types import (
 )
 
 BLOCK_THREADS = 256
+# Nominal extent of the grouped-scale descriptor when a destination is live, the
+# counterpart of the zero-length descriptor a dead one gets. It only has to
+# exceed any real scale buffer; it stays under 2 GiB because the size reaches
+# the V# through a signed extend.
+SCALE_RSRC_MAX_BYTES = 0x7FFFFFFF
 ELEMS_PER_LANE = 2  # bf16 columns each lane quantizes -> 1 fp4 byte / 2 fp8 bytes
 LANES_PER_MX_BLOCK = 32 // ELEMS_PER_LANE  # 16 lanes cover one 32-element MX block
 
@@ -284,9 +289,16 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
         row_addr = (
             c.payload_base + fx.Uint64(dst.payload_row_i32) * payload_bytes_per_row
         )
+        # A multi-destination caller cannot predicate the store pass per row --
+        # the quant pass has to stay one branch-free block -- so it disables a
+        # dead destination by handing over a zero-length descriptor instead, and
+        # the hardware bounds check drops every store to it.
+        records = getattr(dst, "payload_records", None)
+        if records is None:
+            records = payload_bytes_per_row
         dst_payload.append(
             buffer_ops.create_buffer_resource_from_addr(
-                row_addr, num_records_bytes=payload_bytes_per_row
+                row_addr, num_records_bytes=records
             )
         )
 
@@ -470,13 +482,17 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
     # per-iteration guard back above would produce invalid IR.
     # One quant result (payload_val + e8m0_scale) is written to every destination
     # row in ``c.dests``; current kernels pass one.
+    dst_scale_rsrc = []
+    for dst in c.dests:
+        rsrc = getattr(dst, "scale_rsrc", None)
+        dst_scale_rsrc.append(c.scale_rsrc if rsrc is None else rsrc)
+
     for mx_block, payload_val, e8m0_scale in quant_results:
         # The block-scale's dword/byte position depends only on ``mx_block``.
         scale_dword = fx.Uint32(mx_block) // fx.Uint32(c.c4_i32)
         byte_in_dword = mx_block - scale_dword * c.c4_i32
         e8m0_byte = arith.trunci(T.i8, e8m0_scale)
-        for di, dst in enumerate(c.dests):
-            payload_rsrc = dst_payload[di]
+        for payload_rsrc in dst_payload:
             payload_byte_off = (
                 mx_block * c.c_payload_bytes_per_block
                 + c.lane_in_block * c.c_payload_bytes_per_lane
@@ -485,15 +501,21 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
                 payload_val, payload_rsrc, payload_byte_off, offset_is_bytes=True
             )
 
-            # one e8m0 byte per block, written by the block's lead lane.
-            _if_lead = scf.IfOp(_raw(c.is_block_lead))
-            with ir.InsertionPoint(_if_lead.then_block):
+        # one e8m0 byte per block, written by the block's lead lane. Every
+        # destination shares this single branch: one scf.if each makes the
+        # backend re-materialise the shared operands into every region.
+        # The addresses stay inside the branch on purpose -- hoisting them
+        # shortens the instruction count but lengthens their live ranges, and
+        # this kernel is bandwidth-bound, so occupancy is worth more.
+        _if_lead = scf.IfOp(_raw(c.is_block_lead))
+        with ir.InsertionPoint(_if_lead.then_block):
+            for dst, scale_rsrc in zip(c.dests, dst_scale_rsrc):
                 dst_scale_dword = (
                     dst.scale_row_dword_base + scale_dword * c.c_wmma_rep * 16
                 )
                 dst_scale_byte = dst_scale_dword * c.c4_i32 + byte_in_dword
-                buffer_ops.buffer_store(e8m0_byte, c.scale_rsrc, dst_scale_byte)
-                scf.YieldOp([])
+                buffer_ops.buffer_store(e8m0_byte, scale_rsrc, dst_scale_byte)
+            scf.YieldOp([])
 
 
 def _emit_quant_one_k_group(c: SimpleNamespace, mx_group) -> None:
@@ -1337,6 +1359,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     ksplit: bool = True,
     prequantized: bool = False,
     src_scale_bytes_per_row: int = 0,
+    fuse_source_dests: bool = False,
 ):
     """Route-indexed grouped quant+preshuffle.
 
@@ -1347,6 +1370,16 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     across ``grid.y = block_iters`` so each workgroup handles one K-group.
     When ``ksplit=False`` (large token counts where grid.x already saturates),
     ``grid.y = 1`` and each warp loops over all K-groups internally.
+
+    ``fuse_source_dests`` gives a warp one SOURCE token instead of one route:
+    it reads and quantizes the row once and scatters the single result to all
+    ``source_topk`` grouped rows. The default one-route-per-warp mapping reads
+    and re-quantizes the same token once per route, so this cuts the read side
+    by ``source_topk`` (the write side is unchanged -- the same rows are still
+    written). It needs ``source_topk > 0`` and is incompatible with
+    ``remap_rows`` (which rewrites ``topids_to_rows`` per route). Because it
+    divides grid.x by ``source_topk``, pair it with ``ksplit=True`` unless the
+    token count alone already fills the machine.
 
     ``prequantized`` says ``grouped_in`` is an MX payload the sender already
     produced (fp8 or fp4 EP dispatch) and ``src_scale`` its row-major e8m0 rows,
@@ -1394,9 +1427,18 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
             f"{payload_bytes_per_lane} B/lane"
         )
 
+    if fuse_source_dests:
+        if source_topk <= 0:
+            raise ValueError("fuse_source_dests needs a known source_topk > 0")
+        if remap_rows:
+            raise ValueError("fuse_source_dests is incompatible with remap_rows")
+
     source_tag = f"srctk{source_topk}" if source_topk > 0 else "srcrow"
     remap_tag = "_remap" if remap_rows else ""
     ksplit_tag = "" if ksplit else "_noKS"
+    # In the name because it changes the grid contract (grid.x counts source
+    # tokens, not routes), so the two builds take different launch arguments.
+    fuse_tag = "_fusedst" if fuse_source_dests else ""
     # In the name because it changes what the kernel READS, not just how fast:
     # two builds with the same feat_dim/quant_mode are not interchangeable.
     prequant_tag = f"_pq{src_scale_bytes_per_row}" if prequantized else ""
@@ -1406,7 +1448,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     module_name = (
         f"moe_fused_quant_preshuffle_routeks_fd{feat_dim}_r{wmma_rep}"
         f"_{quant_mode}_{L.native_tag}_{source_tag}{remap_tag}{ksplit_tag}"
-        f"{prequant_tag}"
+        f"{prequant_tag}{fuse_tag}"
     )
 
     @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
@@ -1449,141 +1491,249 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         tid = fx.Uint32(fx.thread_idx.x)
         bid = fx.Uint32(fx.block_idx.x)
 
-        # One warp owns one route, so tid // wave is wave-invariant -- but the
-        # backend cannot see that. readfirstlane says it, which keeps `route`
-        # (and the row and destination descriptor derived from it) uniform;
-        # otherwise every payload store goes through a readfirstlane waterfall.
+        # A warp owns one route (or one source token under fuse_source_dests),
+        # so tid // wave is wave-invariant -- but the backend cannot see that.
+        # readfirstlane says it, which keeps the work index (and the rows and
+        # destination descriptors derived from it) uniform; otherwise every
+        # payload store goes through a readfirstlane waterfall.
         warp_in_block = fx.Uint32(rocdl.readfirstlane(i32, fx.Uint32(tid // c_wave)))
         lane = tid - warp_in_block * c_wave
-        route = bid * arith.constant(warps_per_block, type=i32) + warp_in_block
-
-        # Dynamic EP token count (capture-safe, no host sync): grid is launched over
-        # the static numel routes, but routes >= num_valid_routes (= total_recv*topk)
-        # are dead-tail padding rows of the dispatch buffer -> skip the gather+quant.
-        # When truncation is disabled the caller passes a null pointer, which must
-        # not be dereferenced, so the load is predicated rather than unconditional.
-        num_valid_routes_is_set = fx.Int64(ptrtoint(num_valid_routes)) != 0
-        valid_route_count = fx.Uint32(numel)
-        if num_valid_routes_is_set:
-            valid_route_count = fx.Uint32(
-                buffer_ops.buffer_load(
-                    ptr_rsrc(num_valid_routes), c0_i32, vec_width=1, dtype=i32
+        if fuse_source_dests:
+            # One warp owns one SOURCE token and covers its whole topk fan-out:
+            # the row is read and quantized once, then the single result is
+            # scattered to every grouped row the token routes to. A dead route
+            # (EP drop or dead tail) is switched off with a zero-length
+            # descriptor rather than a branch, so the quant pass above stays a
+            # single basic block and its loads still cluster.
+            src_token = (
+                bid * arith.constant(warps_per_block, type=i32) + warp_in_block
+            )
+            num_valid_routes_is_set = fx.Int64(ptrtoint(num_valid_routes)) != 0
+            valid_route_count = fx.Uint32(numel)
+            if num_valid_routes_is_set:
+                valid_route_count = fx.Uint32(
+                    buffer_ops.buffer_load(
+                        ptr_rsrc(num_valid_routes), c0_i32, vec_width=1, dtype=i32
+                    )
                 )
-            )
-        route_in_range = fx.Uint32(route) < fx.Uint32(valid_route_count)
-        rows_rsrc = ptr_rsrc(topids_to_rows)
-        # An EP route with no grouped row carries the negative DROPPED_ROUTE_ROW
-        # sentinel: a destination row derived from it would overwrite a kept
-        # route's payload. Dead-tail routes default to the same sentinel, so one
-        # predicate covers both.
-        row_raw = fx.Int32(DROPPED_ROUTE_ROW)
-        if route_in_range:
-            # Scalar (SMEM) load: `route` is wave-uniform, and landing the row in
-            # an SGPR is what makes the per-row destination descriptor uniform.
-            row_raw = fx.Int32(
-                buffer_ops.buffer_load(rows_rsrc, route, vec_width=1, is_scalar=True)
-            )
-        row_is_mapped = row_raw >= fx.Int32(0)
-        if row_is_mapped:
-            row = fx.Uint32(row_raw)
-            if const_expr(remap_rows):
-                m = fx.Uint32(route_max_m)
-                expert = fx.Uint32(row) // m
-                slot = row - expert * m
-                starts_rsrc = ptr_rsrc(row_starts)
-                # Overwrites `row`, so it has to stay scalar too.
-                row = (
-                    fx.Uint32(
+            rows_rsrc = ptr_rsrc(topids_to_rows)
+            n_tokens = fx.Uint32(valid_route_count) // fx.Uint32(c_source_topk)
+            if fx.Uint32(src_token) < fx.Uint32(n_tokens):
+                scale_base = fx.Int64(ptrtoint(grouped_scale))
+                payload_base = fx.Int64(ptrtoint(grouped_payload))
+                hidden_base = fx.Int64(ptrtoint(grouped_in))
+
+                block_in_wave = fx.Uint32(lane) // fx.Uint32(c_lanes_per_block)
+                lane_in_block = lane - block_in_wave * c_lanes_per_block
+                is_block_lead = lane_in_block == c0_i32
+
+                dests = []
+                for k in range_constexpr(source_topk):
+                    route_k = src_token * c_source_topk + arith.constant(k, type=i32)
+                    # Scalar (SMEM) load, same reason as the single-dest path:
+                    # a uniform row keeps the destination descriptor uniform.
+                    row_raw_k = fx.Int32(
                         buffer_ops.buffer_load(
-                            starts_rsrc, expert, vec_width=1, is_scalar=True
+                            rows_rsrc, route_k, vec_width=1, is_scalar=True
                         )
                     )
-                    + slot
-                )
-                is_lane0 = lane == c0_i32
-                if const_expr(ksplit):
-                    k_group = fx.Uint32(fx.block_idx.y)
-                    is_k0 = k_group == c0_i32
-                    store_cond = is_lane0 & is_k0
-                else:
-                    store_cond = is_lane0
-                if store_cond:
-                    buffer_ops.buffer_store(row, rows_rsrc, route)
-
-            scale_tile = fx.Uint32(row) // fx.Uint32(c_rows_per_tile)
-            row_in_tile = row - scale_tile * c_rows_per_tile
-            wmma_row = fx.Uint32(row_in_tile) // fx.Uint32(c16_i32)
-            row_lane16 = row_in_tile - wmma_row * c16_i32
-            scale_row_dword_base = (
-                scale_tile * c_dst_scale_dwords_per_row * c16_i32
-                + wmma_row * c16_i32
-                + row_lane16
-            )
-
-            if const_expr(source_topk > 0):
-                if const_expr(source_topk_is_pow2):
-                    source_row = route >> c_source_topk_shift
-                else:
-                    source_row = fx.Uint32(route) // fx.Uint32(c_source_topk)
-                feat_row_i32 = source_row
-            else:
-                feat_row_i32 = row
-
-            scale_rsrc = ptr_rsrc(grouped_scale)
-            payload_base = fx.Int64(ptrtoint(grouped_payload))
-            hidden_base = fx.Int64(ptrtoint(grouped_in))
-
-            block_in_wave = fx.Uint32(lane) // fx.Uint32(c_lanes_per_block)
-            lane_in_block = lane - block_in_wave * c_lanes_per_block
-            is_block_lead = lane_in_block == c0_i32
-
-            qc = SimpleNamespace(
-                i32=i32,
-                f32=f32,
-                block_iters=1 if ksplit else block_iters,
-                payload_base=payload_base,
-                payload_bytes_per_row=payload_bytes_per_row,
-                hidden_base=hidden_base,
-                feat_bytes_per_row=src_bytes_per_row,
-                feat_row_i32=feat_row_i32,
-                prequantized=prequantized,
-                payload_dwords_per_lane=payload_dwords_per_lane,
-                src_scale_base=fx.Int64(ptrtoint(src_scale)),
-                src_scale_bytes_per_row=src_scale_bytes_per_row,
-                mx_blocks_per_wave_iter=mx_blocks_per_wave_iter,
-                mx_blocks_per_row=mx_blocks_per_row,
-                amax_shuffle_dists=amax_shuffle_dists,
-                is_fp8=is_fp8,
-                use_native=use_native,
-                use_pk8=use_pk8,
-                mx_dtype=mx_dtype,
-                c0_i32=c0_i32,
-                c1_i32=c1_i32,
-                c4_i32=c4_i32,
-                c23_i32=c23_i32,
-                c254_i32=c254_i32,
-                c0_f32=c0_f32,
-                c_wave=c_wave,
-                c_elems_per_lane=c_elems_per_lane,
-                c_payload_bytes_per_block=c_payload_bytes_per_block,
-                c_payload_bytes_per_lane=c_payload_bytes_per_lane,
-                c_wmma_rep=c_wmma_rep,
-                block_in_wave=block_in_wave,
-                lane_in_block=lane_in_block,
-                is_block_lead=is_block_lead,
-                dests=[
-                    SimpleNamespace(
-                        payload_row_i32=row,
-                        scale_row_dword_base=scale_row_dword_base,
+                    mapped_k = row_raw_k >= fx.Int32(0)
+                    row_k = fx.Uint32(mapped_k.select(row_raw_k, fx.Int32(0)))
+                    scale_tile = fx.Uint32(row_k) // fx.Uint32(c_rows_per_tile)
+                    row_in_tile = row_k - scale_tile * c_rows_per_tile
+                    wmma_row = fx.Uint32(row_in_tile) // fx.Uint32(c16_i32)
+                    row_lane16 = row_in_tile - wmma_row * c16_i32
+                    dests.append(
+                        SimpleNamespace(
+                            payload_row_i32=row_k,
+                            scale_row_dword_base=(
+                                scale_tile * c_dst_scale_dwords_per_row * c16_i32
+                                + wmma_row * c16_i32
+                                + row_lane16
+                            ),
+                            payload_records=mapped_k.select(
+                                fx.Int32(payload_bytes_per_row), fx.Int32(0)
+                            ),
+                            scale_rsrc=buffer_ops.create_buffer_resource_from_addr(
+                                scale_base,
+                                num_records_bytes=mapped_k.select(
+                                    fx.Int32(SCALE_RSRC_MAX_BYTES), fx.Int32(0)
+                                ),
+                            ),
+                        )
                     )
-                ],
-                scale_rsrc=scale_rsrc,
-            )
-            if const_expr(ksplit):
-                k_group_val = fx.Uint32(fx.block_idx.y)
-                _emit_quant_one_k_group(qc, k_group_val)
-            else:
-                _emit_quant_block_loop(qc)
+
+                qc = SimpleNamespace(
+                    i32=i32,
+                    f32=f32,
+                    block_iters=1 if ksplit else block_iters,
+                    payload_base=payload_base,
+                    payload_bytes_per_row=payload_bytes_per_row,
+                    hidden_base=hidden_base,
+                    feat_bytes_per_row=src_bytes_per_row,
+                    feat_row_i32=src_token,
+                    prequantized=prequantized,
+                    payload_dwords_per_lane=payload_dwords_per_lane,
+                    src_scale_base=fx.Int64(ptrtoint(src_scale)),
+                    src_scale_bytes_per_row=src_scale_bytes_per_row,
+                    mx_blocks_per_wave_iter=mx_blocks_per_wave_iter,
+                    mx_blocks_per_row=mx_blocks_per_row,
+                    amax_shuffle_dists=amax_shuffle_dists,
+                    is_fp8=is_fp8,
+                    use_native=use_native,
+                    use_pk8=use_pk8,
+                    mx_dtype=mx_dtype,
+                    c0_i32=c0_i32,
+                    c1_i32=c1_i32,
+                    c4_i32=c4_i32,
+                    c23_i32=c23_i32,
+                    c254_i32=c254_i32,
+                    c0_f32=c0_f32,
+                    c_wave=c_wave,
+                    c_elems_per_lane=c_elems_per_lane,
+                    c_payload_bytes_per_block=c_payload_bytes_per_block,
+                    c_payload_bytes_per_lane=c_payload_bytes_per_lane,
+                    c_wmma_rep=c_wmma_rep,
+                    block_in_wave=block_in_wave,
+                    lane_in_block=lane_in_block,
+                    is_block_lead=is_block_lead,
+                    dests=dests,
+                    scale_rsrc=ptr_rsrc(grouped_scale),
+                )
+                if const_expr(ksplit):
+                    _emit_quant_one_k_group(qc, fx.Uint32(fx.block_idx.y))
+                else:
+                    _emit_quant_block_loop(qc)
+        else:
+            route = bid * arith.constant(warps_per_block, type=i32) + warp_in_block
+
+            # Dynamic EP token count (capture-safe, no host sync): grid is launched over
+            # the static numel routes, but routes >= num_valid_routes (= total_recv*topk)
+            # are dead-tail padding rows of the dispatch buffer -> skip the gather+quant.
+            # When truncation is disabled the caller passes a null pointer, which must
+            # not be dereferenced, so the load is predicated rather than unconditional.
+            num_valid_routes_is_set = fx.Int64(ptrtoint(num_valid_routes)) != 0
+            valid_route_count = fx.Uint32(numel)
+            if num_valid_routes_is_set:
+                valid_route_count = fx.Uint32(
+                    buffer_ops.buffer_load(
+                        ptr_rsrc(num_valid_routes), c0_i32, vec_width=1, dtype=i32
+                    )
+                )
+            route_in_range = fx.Uint32(route) < fx.Uint32(valid_route_count)
+            rows_rsrc = ptr_rsrc(topids_to_rows)
+            # An EP route with no grouped row carries the negative DROPPED_ROUTE_ROW
+            # sentinel: a destination row derived from it would overwrite a kept
+            # route's payload. Dead-tail routes default to the same sentinel, so one
+            # predicate covers both.
+            row_raw = fx.Int32(DROPPED_ROUTE_ROW)
+            if route_in_range:
+                # Scalar (SMEM) load: `route` is wave-uniform, and landing the row in
+                # an SGPR is what makes the per-row destination descriptor uniform.
+                row_raw = fx.Int32(
+                    buffer_ops.buffer_load(rows_rsrc, route, vec_width=1, is_scalar=True)
+                )
+            row_is_mapped = row_raw >= fx.Int32(0)
+            if row_is_mapped:
+                row = fx.Uint32(row_raw)
+                if const_expr(remap_rows):
+                    m = fx.Uint32(route_max_m)
+                    expert = fx.Uint32(row) // m
+                    slot = row - expert * m
+                    starts_rsrc = ptr_rsrc(row_starts)
+                    # Overwrites `row`, so it has to stay scalar too.
+                    row = (
+                        fx.Uint32(
+                            buffer_ops.buffer_load(
+                                starts_rsrc, expert, vec_width=1, is_scalar=True
+                            )
+                        )
+                        + slot
+                    )
+                    is_lane0 = lane == c0_i32
+                    if const_expr(ksplit):
+                        k_group = fx.Uint32(fx.block_idx.y)
+                        is_k0 = k_group == c0_i32
+                        store_cond = is_lane0 & is_k0
+                    else:
+                        store_cond = is_lane0
+                    if store_cond:
+                        buffer_ops.buffer_store(row, rows_rsrc, route)
+
+                scale_tile = fx.Uint32(row) // fx.Uint32(c_rows_per_tile)
+                row_in_tile = row - scale_tile * c_rows_per_tile
+                wmma_row = fx.Uint32(row_in_tile) // fx.Uint32(c16_i32)
+                row_lane16 = row_in_tile - wmma_row * c16_i32
+                scale_row_dword_base = (
+                    scale_tile * c_dst_scale_dwords_per_row * c16_i32
+                    + wmma_row * c16_i32
+                    + row_lane16
+                )
+
+                if const_expr(source_topk > 0):
+                    if const_expr(source_topk_is_pow2):
+                        source_row = route >> c_source_topk_shift
+                    else:
+                        source_row = fx.Uint32(route) // fx.Uint32(c_source_topk)
+                    feat_row_i32 = source_row
+                else:
+                    feat_row_i32 = row
+
+                scale_rsrc = ptr_rsrc(grouped_scale)
+                payload_base = fx.Int64(ptrtoint(grouped_payload))
+                hidden_base = fx.Int64(ptrtoint(grouped_in))
+
+                block_in_wave = fx.Uint32(lane) // fx.Uint32(c_lanes_per_block)
+                lane_in_block = lane - block_in_wave * c_lanes_per_block
+                is_block_lead = lane_in_block == c0_i32
+
+                qc = SimpleNamespace(
+                    i32=i32,
+                    f32=f32,
+                    block_iters=1 if ksplit else block_iters,
+                    payload_base=payload_base,
+                    payload_bytes_per_row=payload_bytes_per_row,
+                    hidden_base=hidden_base,
+                    feat_bytes_per_row=src_bytes_per_row,
+                    feat_row_i32=feat_row_i32,
+                    prequantized=prequantized,
+                    payload_dwords_per_lane=payload_dwords_per_lane,
+                    src_scale_base=fx.Int64(ptrtoint(src_scale)),
+                    src_scale_bytes_per_row=src_scale_bytes_per_row,
+                    mx_blocks_per_wave_iter=mx_blocks_per_wave_iter,
+                    mx_blocks_per_row=mx_blocks_per_row,
+                    amax_shuffle_dists=amax_shuffle_dists,
+                    is_fp8=is_fp8,
+                    use_native=use_native,
+                    use_pk8=use_pk8,
+                    mx_dtype=mx_dtype,
+                    c0_i32=c0_i32,
+                    c1_i32=c1_i32,
+                    c4_i32=c4_i32,
+                    c23_i32=c23_i32,
+                    c254_i32=c254_i32,
+                    c0_f32=c0_f32,
+                    c_wave=c_wave,
+                    c_elems_per_lane=c_elems_per_lane,
+                    c_payload_bytes_per_block=c_payload_bytes_per_block,
+                    c_payload_bytes_per_lane=c_payload_bytes_per_lane,
+                    c_wmma_rep=c_wmma_rep,
+                    block_in_wave=block_in_wave,
+                    lane_in_block=lane_in_block,
+                    is_block_lead=is_block_lead,
+                    dests=[
+                        SimpleNamespace(
+                            payload_row_i32=row,
+                            scale_row_dword_base=scale_row_dword_base,
+                        )
+                    ],
+                    scale_rsrc=scale_rsrc,
+                )
+                if const_expr(ksplit):
+                    k_group_val = fx.Uint32(fx.block_idx.y)
+                    _emit_quant_one_k_group(qc, k_group_val)
+                else:
+                    _emit_quant_block_loop(qc)
 
     _grid_y_dim = block_iters if ksplit else 1
 

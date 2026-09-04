@@ -2713,13 +2713,24 @@ def flydsl_moe_fused_route_quant_scatter(
             route_grid,
             stream=torch.cuda.current_stream(),
         )
-        use_ksplit_s1 = grid_blocks < _ROUTEKS_KSPLIT_GRID_THRESHOLD
+        # One warp per source token instead of per route: the token row is read
+        # and quantized once and the result is scattered to all topk grouped
+        # rows, so the read side shrinks by topk. grid.x then counts tokens, and
+        # the smaller grid is what usually pulls this onto the ksplit build.
+        fuse_dests_s1 = topk > 1 and _ROUTEKS_FUSE_DESTS
+        routeks_grid = (
+            (token_num + warps_per_block - 1) // warps_per_block
+            if fuse_dests_s1
+            else grid_blocks
+        )
+        use_ksplit_s1 = routeks_grid < _ROUTEKS_KSPLIT_GRID_THRESHOLD
         launch_routeks = _get_compiled_fused_quant_preshuffle_route_ksplit(
             feat_dim=model_dim,
             wmma_rep=wmma_rep,
             quant_mode=quant_mode,
             source_topk=topk,
             ksplit=use_ksplit_s1,
+            fuse_source_dests=fuse_dests_s1,
         )
         _null_i32 = torch.empty(0, dtype=torch.int32, device=device)
         assert _null_i32.data_ptr() == 0, "expected a null data_ptr"
@@ -2737,7 +2748,7 @@ def flydsl_moe_fused_route_quant_scatter(
             ptr_arg(_null_i32),
             # src_scale: read only by the prequantized build, which this is not.
             ptr_arg(grouped_a1_scale.view(-1)),
-            grid_blocks,
+            routeks_grid,
             stream=torch.cuda.current_stream(),
         )
         return (
@@ -2963,6 +2974,8 @@ def _get_compiled_fused_quant_preshuffle(
 
 
 _ROUTEKS_KSPLIT_GRID_THRESHOLD = 512
+# Escape hatch for A/B measurement; the fused-destination stage1 is the default.
+_ROUTEKS_FUSE_DESTS = os.environ.get("AITER_ROUTEKS_FUSE_DESTS", "1") != "0"
 
 
 @functools.cache
@@ -2975,6 +2988,7 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
     ksplit: bool = True,
     prequantized: bool = False,
     src_scale_bytes_per_row: int = 0,
+    fuse_source_dests: bool = False,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_fused_quant_preshuffle_route_ksplit_module,
@@ -2989,6 +3003,7 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
         ksplit=ksplit,
         prequantized=prequantized,
         src_scale_bytes_per_row=src_scale_bytes_per_row,
+        fuse_source_dests=fuse_source_dests,
     )
 
 
@@ -3104,6 +3119,16 @@ def flydsl_moe_fused_quant_preshuffle(
         else:
             row_starts_i32 = masked_m
             route_max_m_arg = 1
+        # One warp per source token instead of per route: with topk routes
+        # sharing a source row, the per-route mapping reads and re-quantizes
+        # that row topk times. Fusing the destinations reads it once and
+        # scatters the result, so the read side shrinks by topk. grid.x then
+        # counts tokens, and that smaller grid is usually what selects the
+        # ksplit build below, which is what keeps the machine full.
+        fuse_dests = source_topk > 1 and not remap_rows and _ROUTEKS_FUSE_DESTS
+        if fuse_dests:
+            n_src_tokens = numel // source_topk
+            grid_blocks = (n_src_tokens + warps_per_block - 1) // warps_per_block
         use_ksplit = grid_blocks < _ROUTEKS_KSPLIT_GRID_THRESHOLD
         launch = _get_compiled_fused_quant_preshuffle_route_ksplit(
             feat_dim=feat_dim,
@@ -3116,6 +3141,7 @@ def flydsl_moe_fused_quant_preshuffle(
             src_scale_bytes_per_row=(
                 int(prequantized_scale.shape[-1]) if prequantized else 0
             ),
+            fuse_source_dests=fuse_dests,
         )
         # Dead-tail skip (EP dynamic token count): routes >= num_valid_routes are
         # padding rows of the dispatch buffer and are not gathered/quantized. When

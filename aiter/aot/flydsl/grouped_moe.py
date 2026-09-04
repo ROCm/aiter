@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import itertools
 import sys
 import time
 import traceback
@@ -191,7 +192,10 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
         # build_moe_fused_quant_preshuffle_route_ksplit_module; runtime never
         # sets remap_rows on the grouped MoE fast path (row_starts stays None).
         # Precompile both ksplit=True (small token) and ksplit=False (large token).
-        for ks in (True, False):
+        # fuse_source_dests only exists for a known topk > 1, and the runtime
+        # picks it on the stage1 (source_topk > 0) call, so emit both there.
+        fuse_variants = (False, True) if source_topk > 1 else (False,)
+        for ks, fuse in itertools.product((True, False), fuse_variants):
             launch = build_moe_fused_quant_preshuffle_route_ksplit_module(
                 feat_dim=feat_dim,
                 wmma_rep=wmma_rep,
@@ -199,6 +203,7 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
                 source_topk=source_topk,
                 remap_rows=False,
                 ksplit=ks,
+                fuse_source_dests=fuse,
             )
             launch(
                 ptr_arg(torch.empty(0, dtype=bf16, device=dev)),
