@@ -978,6 +978,15 @@ def _unified_attention_gfx950(
     and, when NUM_SEGMENTS > 1, a third grid axis over the KV split. A split
     launch writes fp32 partials instead of the output, which reduce_segments
     then merges.
+
+    With shuffled_kv_cache the caches must be in the layout shuffle_kv_cache
+    produces (op_tests/triton_tests/attention/test_unified_attention.py; the MLA
+    equivalent is written at fill time by cat_and_cache_mla): K as
+    [num_blocks, num_kv_heads, head_size // W, block_size, W] and V as
+    [num_blocks, num_kv_heads, block_size // W, head_size, W], where
+    W = 16 // element_size. The W run has to sit on each dot's reduction axis,
+    so K groups head_size and V groups tokens. The triton backend reads the same
+    layout off the cache shape, so one shuffled cache serves both.
     """
     BLOCK_Q = BLOCK_M // params.num_queries_per_kv
     assert BLOCK_Q >= 1
