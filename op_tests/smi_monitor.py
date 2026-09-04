@@ -19,10 +19,14 @@ Usage (explicit start/stop):
 from __future__ import annotations
 
 import ctypes
+import json
+import os
 import threading
 import time
 from contextlib import contextmanager
 from typing import Generator
+
+SMI_RESULT_PREFIX = "AITER_SMI_RESULT "
 
 try:
     import amdsmi
@@ -262,3 +266,75 @@ def monitor_gpu(
     mon = GpuMonitor(device_index=device_index, interval_s=interval_s)
     with mon:
         yield mon
+
+
+def smi_replay_enabled() -> bool:
+    """Whether the benchmark requested an isolated SMI replay window."""
+    return os.environ.get("AITER_SMI_MONITOR", "0") == "1"
+
+
+def replay_with_smi(
+    fn,
+    *,
+    label: str,
+    synchronize,
+    estimated_us: float | None = None,
+) -> dict | None:
+    """Repeat one already-prepared benchmark case under the GPU monitor.
+
+    Input creation, compilation, correctness and the latency measurement happen
+    before this function is called.  Batching launches between synchronizations
+    keeps short kernels busy while still checking the wall-clock deadline often
+    enough for slow kernels.
+    """
+    if not smi_replay_enabled():
+        return None
+
+    device = int(os.environ.get("AITER_SMI_DEVICE", "0"))
+    interval_s = float(os.environ.get("AITER_SMI_INTERVAL", "0.05"))
+    duration_s = float(os.environ.get("AITER_SMI_DURATION", "1.0"))
+    if interval_s <= 0 or duration_s <= 0:
+        raise ValueError("AITER_SMI_INTERVAL and AITER_SMI_DURATION must be positive")
+
+    # Aim for roughly one synchronization per monitor tick.  The cap prevents a
+    # near-zero/invalid latency estimate from enqueueing an unbounded amount of
+    # work, while a slow case is synchronized after every launch.
+    if estimated_us is not None and estimated_us > 0:
+        batch_iters = max(1, min(1024, int(interval_s * 1e6 / estimated_us)))
+    else:
+        batch_iters = 1
+
+    synchronize()
+    launches = 0
+    start = time.perf_counter()
+    with monitor_gpu(device_index=device, interval_s=interval_s) as monitor:
+        while launches == 0 or time.perf_counter() - start < duration_s:
+            for _ in range(batch_iters):
+                fn()
+            launches += batch_iters
+            synchronize()
+    elapsed_s = time.perf_counter() - start
+
+    result = {
+        "label": label,
+        "device": device,
+        "interval_s": interval_s,
+        "duration_s": elapsed_s,
+        "launches": launches,
+        "samples": len(monitor.samples),
+        "metrics": monitor.summary(),
+    }
+    expected_samples = max(1, int(duration_s / interval_s))
+    result["sample_status"] = (
+        "ok" if len(monitor.samples) >= max(2, expected_samples // 2) else "insufficient"
+    )
+    # A shared JSONL sink survives fd silencing and child processes. Standalone
+    # UT runs without a sink still get a machine-readable stdout record.
+    line = SMI_RESULT_PREFIX + json.dumps(result, sort_keys=True)
+    output_path = os.environ.get("AITER_SMI_OUTPUT_PATH")
+    if output_path:
+        with open(output_path, "a", encoding="utf-8") as output:
+            output.write(line + "\n")
+    else:
+        print(line, flush=True)
+    return result

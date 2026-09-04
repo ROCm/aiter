@@ -12,6 +12,7 @@ import torch.profiler as tpf
 from aiter import logger
 
 pd.set_option("display.max_rows", 200)
+_SMI_LABEL_COUNTS = {}
 ## debug ##
 # pd.set_option("display.max_rows", None)
 # pd.set_option("display.max_columns", None)
@@ -123,6 +124,53 @@ def perftest(
                     run_iters(1, graph.replay)
                 avg = get_trace_perf(prof, num_iters)
                 logger.info(f"avg: {avg} us/iter with hipgraph")
+
+            if os.environ.get("AITER_SMI_MONITOR", "0") == "1":
+                fn_name = getattr(func, "__name__", "kernel")
+                skipped = {
+                    name.strip()
+                    for name in os.environ.get("AITER_SMI_SKIP_FUNCTIONS", "").split(",")
+                    if name.strip()
+                }
+                if fn_name in skipped:
+                    return data, avg
+                # Import lazily: normal library/test use has no amdsmi dependency.
+                # Combo and its child UTs run from the repository root, where the
+                # standalone op_tests monitor module is importable.
+                try:
+                    from op_tests.smi_monitor import replay_with_smi
+                except ModuleNotFoundError:
+                    # Direct ``python op_tests/foo.py`` puts op_tests itself,
+                    # rather than the repository root, at sys.path[0].
+                    from smi_monitor import replay_with_smi
+
+                if testGraph:
+                    replay = graph.replay
+                    # One replay contains num_iters calls captured above.
+                    replay_us = avg * num_iters
+                else:
+                    replay_index = 0
+
+                    def replay():
+                        nonlocal replay_index
+                        replay_args, replay_kwargs = rotate_args[
+                            replay_index % len(rotate_args)
+                        ]
+                        replay_index += 1
+                        return func(*replay_args, **replay_kwargs)
+
+                    replay_us = avg
+
+                case_label = os.environ.get("AITER_SMI_LABEL", "benchmark_case")
+                label_key = (case_label, fn_name)
+                occurrence = _SMI_LABEL_COUNTS.get(label_key, 0) + 1
+                _SMI_LABEL_COUNTS[label_key] = occurrence
+                replay_with_smi(
+                    replay,
+                    label=f"{case_label}/{fn_name}#{occurrence}",
+                    synchronize=torch.cuda.synchronize,
+                    estimated_us=replay_us,
+                )
 
             return data, avg
 
