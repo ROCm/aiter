@@ -39,6 +39,14 @@ try:
 except:  # noqa: E722
     _reduce_segments_kernel_gfx1250 = None
 
+# gfx950
+try:
+    from aiter.ops.triton._gluon_kernels.gfx950.attention.unified_attention import (
+        _unified_attention_gluon_kernel as _unified_attention_kernel_gfx950,
+    )
+except:  # noqa: E722
+    _unified_attention_kernel_gfx950 = None
+
 # Max NUM_SEGMENTS the gluon reduce holds in-thread; larger split counts fall back to the Triton reduce_segments.
 _GLUON_REDUCE_MAX_SEGMENTS = 8
 
@@ -46,7 +54,10 @@ DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
 
-_GLUON_SUPPORTED_ARCHS = ("gfx1250",)
+_GLUON_SUPPORTED_ARCHS = ("gfx1250", "gfx950")
+
+# LDS the gfx950 KV double buffer may occupy; a wider tile falls back to one buffer.
+_GFX950_LDS_BUDGET = 160 * 1024
 
 
 def _is_gluon_available():
@@ -77,6 +88,7 @@ class _UAParams(NamedTuple):
     num_kv_heads: int
     num_queries_per_kv: int
     head_size: int  # logical, i.e. already doubled for fp4-packed q
+    head_size_v: int  # v's head size, which may differ from q/k's
     num_seqs: int
     total_num_q_blocks: int  # query-block upper bound at the default BLOCK_Q
     num_2d_prgms: int  # total_num_q_blocks * num_kv_heads
@@ -112,10 +124,46 @@ class _UAParams(NamedTuple):
     skip_reduce: bool = False
 
 
-def use_2d_kernel(params: _UAParams):
+def _gfx950_gluon_supported(params: _UAParams):
+    """Shapes the gfx950 Gluon kernel covers.
+
+    bf16 or fp8 for both q and the KV cache, a power-of-2 head size up to 256
+    that k and v share, and neither qq_bias nor alibi. One predicate
+    for all three gates: the arch ships a single kernel, so the 2d and 3d paths
+    accept exactly the same shapes.
+    """
+    # A pre-shuffled cache is fine at any tile size -- the gather loader indexes
+    # the block table per token -- but V's shuffle groups W tokens, so a group
+    # must not straddle pages.
+    if params.shuffled_kv_cache and (
+        params.block_size & (params.block_size - 1)
+        or params.block_size < params.k_width
+    ):
+        return False
+
+    return (
+        DEVICE_ARCH == "gfx950"
+        and _unified_attention_kernel_gfx950 is not None
+        and not params.use_qq_bias
+        and not params.use_alibi_slopes
+        and params.head_size <= 256
+        and triton.next_power_of_2(params.head_size) == params.head_size
+        and params.head_size_v == params.head_size
+        and params.q_dtype in (e4m3_dtype, torch.bfloat16)
+        and params.q_dtype == params.kv_cache_dtype
+    )
+
+
+def use_2d_kernel(params: _UAParams, backend: str = "triton"):
     # if IS_DEVICE_ARCH_GFX12, always use 3D if all_decode and 2D otherwise
     if IS_DEVICE_ARCH_GFX12:
         return (params.sliding_window > 0) or (not params.all_decode)
+
+    # The gfx950 Gluon kernel is one kernel with a decode and a prefill grid,
+    # and it owns its KV split, so decode always takes the 3d path (a single
+    # segment simply drops the split axis) and everything else the 2d one.
+    if backend == "gluon" and _gfx950_gluon_supported(params):
+        return not params.all_decode
 
     if params.head_size >= 512 and not get_arch().is_rdna and not params.all_decode:
         return True
@@ -217,6 +265,9 @@ def unified_attention(
 
     num_seqs = len(seqused_k)
     num_queries_per_kv = num_query_heads // num_kv_heads
+    # only the plain layout exposes v's head size as its last dimension; a
+    # shuffled value cache carries the vectorization width there instead.
+    head_size_v = head_size if shuffled_kv_cache else v.shape[-1]
 
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
@@ -261,6 +312,7 @@ def unified_attention(
         num_kv_heads=num_kv_heads,
         num_queries_per_kv=num_queries_per_kv,
         head_size=head_size,
+        head_size_v=head_size_v,
         num_seqs=num_seqs,
         total_num_q_blocks=total_num_q_blocks,
         num_2d_prgms=num_2d_prgms,
@@ -289,21 +341,33 @@ def unified_attention(
     )
 
     # if batch contains a prefill
-    if use_2d_kernel(params):
+    if use_2d_kernel(params, backend):
         # The gfx1250 Gluon 2d kernel only handles bf16/fp8 q+kv (with optional
         # sinks / output_scale / shuffled_kv_cache)
         use_gluon_2d = is_2d_gluon_available(params, backend)
         if use_gluon_2d:
             if DEVICE_ARCH == "gfx1250":
                 _unified_attention_2d_gfx1250(params)
+            elif DEVICE_ARCH == "gfx950":
+                _unified_attention_2d_gfx950(params)
             else:
                 assert False, f"No gluon subwrapper for {DEVICE_ARCH}"
         else:
             _unified_attention_2d_triton(params)
     else:
-        config = get_unified_attention_config("kv_split", params, backend=backend)
+        # NUM_SEGMENTS and TILE_SIZE go to whichever 3d kernel actually runs, so
+        # they have to come from that kernel's table: a gluon request whose arch
+        # gate declines still lands on the Triton kernel, and the two backends'
+        # tables are not interchangeable.
+        use_gluon_3d = is_3d_gluon_available(params, backend)
+        config = get_unified_attention_config(
+            "kv_split", params, backend="gluon" if use_gluon_3d else "triton"
+        )
         NUM_SEGMENTS = config["NUM_SEGMENTS"]
-        if shuffled_kv_cache:
+        # The triton kernels read a shuffled tile as one contiguous page, so
+        # there the tile is the page. The gfx950 gluon loader gathers per token
+        # and keeps its tuned tile.
+        if shuffled_kv_cache and not use_gluon_3d:
             TILE_SIZE = block_size
         else:
             TILE_SIZE = config["TILE_SIZE"]
@@ -336,10 +400,18 @@ def unified_attention(
             segm_max = out  # dummy ptr
             segm_expsum = out  # dummy ptr
 
-        use_gluon_3d = is_3d_gluon_available(params, backend)
         if use_gluon_3d:
             if DEVICE_ARCH == "gfx1250":
                 _unified_attention_3d_gfx1250(
+                    params,
+                    segm_output,
+                    segm_max,
+                    segm_expsum,
+                    NUM_SEGMENTS,
+                    TILE_SIZE,
+                )
+            elif DEVICE_ARCH == "gfx950":
+                _unified_attention_3d_gfx950(
                     params,
                     segm_output,
                     segm_max,
@@ -408,6 +480,8 @@ def is_2d_gluon_available(params: _UAParams, backend: str):
             and params.kv_cache_dtype != torch.uint8
             and params.q_dtype == params.kv_cache_dtype
         )
+    elif DEVICE_ARCH == "gfx950":
+        use_gluon_arch = _gfx950_gluon_supported(params)
 
     return use_gluon and use_gluon_arch
 
@@ -422,6 +496,8 @@ def is_3d_gluon_available(params: _UAParams, backend: str):
             _unified_attention_kernel_3d_gfx1250 is not None
             and params.shuffled_kv_cache
         )
+    elif DEVICE_ARCH == "gfx950":
+        use_gluon_arch = _gfx950_gluon_supported(params)
 
     return use_gluon and use_gluon_arch
 
@@ -884,4 +960,171 @@ def _reduce_segments_gfx1250(
         NUM_WARPS=gluon_num_warps,
         num_warps=gluon_num_warps,
         **config,
+    )
+
+
+def _unified_attention_gfx950(
+    params: _UAParams,
+    config: dict,
+    BLOCK_M: int,
+    TILE_SIZE: int,
+    num_warps: int,
+    NUM_SEGMENTS: int = 1,
+    partial_acc=None,
+    partial_m=None,
+    partial_l=None,
+):
+    """Single launch site for the gfx950 gluon kernel.
+
+    One kernel serves both grids: ALL_DECODE selects the decode program order
+    and, when NUM_SEGMENTS > 1, a third grid axis over the KV split. A split
+    launch writes fp32 partials instead of the output, which reduce_segments
+    then merges.
+
+    With shuffled_kv_cache the caches must be in the layout shuffle_kv_cache
+    produces (op_tests/triton_tests/attention/test_unified_attention.py):
+
+    K = [num_blocks, num_kv_heads, head_size // W, block_size, W]
+    V = [num_blocks, num_kv_heads, block_size // W, head_size, W],
+      where
+      W = 16 // element_size.
+
+    The W run has to sit on each dot's reduction axis,
+    so K groups head_size and V groups tokens. The triton backend reads the same
+    layout off the cache shape, so one shuffled cache serves both.
+
+    Page size 64 is the best default on both the plain and the pre-shuffled path,
+    and it matches the tuned tile so the loader takes its one-page fast path.
+    head_size 256 is the most sensitive to getting it wrong.
+    """
+    BLOCK_Q = BLOCK_M // params.num_queries_per_kv
+    assert BLOCK_Q >= 1
+
+    if params.all_decode:
+        total_query_blocks = params.num_seqs
+        grid = (total_query_blocks, params.num_kv_heads)
+    else:
+        total_query_blocks = params.num_tokens // BLOCK_Q + params.num_seqs
+        grid = (params.num_kv_heads, total_query_blocks)
+    if NUM_SEGMENTS > 1:
+        grid = grid + (NUM_SEGMENTS,)
+
+    # k and v are both staged, twice over for a double buffer; drop to one
+    # buffer rather than overrun LDS.
+    NUM_BUFFERS = config["NUM_BUFFERS"]
+    if 4 * TILE_SIZE * params.head_size * params.k.element_size() > _GFX950_LDS_BUDGET:
+        NUM_BUFFERS = 1
+
+    # buffer ops need the tensor to fit a 32-bit offset
+    MAX_INT32 = 2**31 - 1
+    USE_LOAD_BUFFER_OP = params.k.nelement() * params.k.element_size() <= MAX_INT32
+    USE_STORE_BUFFER_OP = params.out.nelement() * params.out.element_size() <= MAX_INT32
+
+    _unified_attention_kernel_gfx950[grid](
+        query_ptr=params.q,
+        key_cache_ptr=params.k,
+        value_cache_ptr=params.v,
+        sink_ptr=params.sinks,
+        output_ptr=params.out,
+        block_tables_ptr=params.block_table,
+        seq_lens_ptr=params.seqused_k,
+        query_start_len_ptr=params.cu_seqlens_q,
+        query_stride_0=params.q.stride(0),
+        query_stride_1=params.q.stride(1),
+        output_stride_0=params.out.stride(0),
+        output_stride_1=params.out.stride(1),
+        k_descale_ptr=params.k_descale,
+        v_descale_ptr=params.v_descale,
+        q_descale_ptr=params.q_descale,
+        out_scale_ptr=params.output_scale,
+        USE_SINKS=(params.sinks is not None),
+        SLIDING_WINDOW=params.sliding_window,
+        num_blocks=params.num_blocks,
+        stride_k_cache_0=params.k.stride(0),
+        stride_k_cache_1=params.k.stride(1),
+        stride_k_cache_2=params.k.stride(2),
+        stride_k_cache_3=params.k.stride(3),
+        stride_v_cache_0=params.v.stride(0),
+        stride_v_cache_1=params.v.stride(1),
+        stride_v_cache_2=params.v.stride(2),
+        stride_v_cache_3=params.v.stride(3),
+        block_table_stride=params.block_table.stride(0),
+        num_seqs=params.num_seqs,
+        SCALE=params.softmax_scale,
+        SOFTCAP=params.softcap,
+        USE_SOFTCAP=(params.softcap > 0),
+        NUM_QUERY_HEADS=params.num_query_heads,
+        NUM_KV_HEADS=params.num_kv_heads,
+        BLOCK_SIZE=params.block_size,
+        TILE_SIZE=TILE_SIZE,
+        HEAD_SIZE=params.head_size,
+        BLOCK_Q=BLOCK_Q,
+        BLOCK_M=BLOCK_M,
+        MFMA_DIM=config["MFMA_DIM"],
+        ARCH_NAME=DEVICE_ARCH,
+        waves_per_eu=config["waves_per_eu"],
+        USE_LOAD_BUFFER_OP=USE_LOAD_BUFFER_OP,
+        USE_STORE_BUFFER_OP=USE_STORE_BUFFER_OP,
+        num_warps=num_warps,
+        ALL_DECODE=params.all_decode,
+        CAUSAL=params.causal,
+        # useful for debugging when needed
+        REMOVE_INDIRECT_ACCESS=False,
+        NUM_BUFFERS=NUM_BUFFERS,
+        SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
+        KV_SHUFFLE_WIDTH=params.k_width,
+        NUM_SPLITS=NUM_SEGMENTS,
+        partial_m_ptr=partial_m,
+        partial_l_ptr=partial_l,
+        partial_acc_ptr=partial_acc,
+    )
+
+
+def _unified_attention_2d_gfx950(params: _UAParams):
+    """Prefill and mixed batches: one program per (kv head, query block)."""
+
+    config = get_unified_attention_config("attn_2d", params, backend="gluon")
+    BLOCK_M = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
+    _unified_attention_gfx950(
+        params,
+        config,
+        BLOCK_M=BLOCK_M,
+        TILE_SIZE=config["TILE_SIZE"],
+        num_warps=config["num_warps"],
+    )
+
+
+def _unified_attention_3d_gfx950(
+    params: _UAParams,
+    segm_output,
+    segm_max,
+    segm_expsum,
+    NUM_SEGMENTS,
+    TILE_SIZE,
+):
+    """Decode: one program per (query block, kv head[, KV split]).
+
+    num_warps is not tuned directly here; BLOCK_M rows are split MFMA_DIM to a
+    warp, so the warp count follows the query group the launch has to cover.
+    """
+
+    config = get_unified_attention_config("attn_3d", params, backend="gluon")
+    MFMA_DIM = config["MFMA_DIM"]
+    BLOCK_M = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
+    # An unsplit launch that already leaves CUs idle can afford a wider query
+    # block, which buys back the warps the missing split axis would have used.
+    if NUM_SEGMENTS == 1 and params.num_2d_prgms <= 2 * params.num_sms:
+        BLOCK_M = max(config.get("WIDE_BLOCK_M_MULT", 1) * MFMA_DIM, BLOCK_M)
+
+    split = NUM_SEGMENTS > 1
+    _unified_attention_gfx950(
+        params,
+        config,
+        BLOCK_M=BLOCK_M,
+        TILE_SIZE=TILE_SIZE,
+        num_warps=BLOCK_M // MFMA_DIM,
+        NUM_SEGMENTS=NUM_SEGMENTS,
+        partial_acc=segm_output if split else None,
+        partial_m=segm_max if split else None,
+        partial_l=segm_expsum if split else None,
     )

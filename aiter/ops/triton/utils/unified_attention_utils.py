@@ -28,7 +28,8 @@ Dtypes fall back too: DT_fp8_fp8, then DT_fp8_any, DT_any_fp8, then "any".
 A section with no axes, like reduce above, is just a config.
 
 Tile size and number of splits (segments) are derived from the following parameters:
-TILE_SIZE_MIN/MAX, and MIN_SEGMENTS/MAX_SEGMENTS/SEGMENTS_PER_CU.
+TILE_SIZE_MIN/MAX, and MIN_SEGMENTS/MAX_SEGMENTS/SEGMENTS_PER_CU. SPLIT_POLICY
+picks how the segment count is rounded and floored; see compute_segment_params.
 """
 
 import copy
@@ -154,18 +155,41 @@ def compute_tile_params(config: dict, block_size: int) -> dict:
 def compute_segment_params(config: dict, params) -> dict:
     """Derive NUM_SEGMENTS: how many ways to split the KV range for one query.
 
+    Both policies below share the same budget arithmetic -- how many segments
+    one program may claim out of ``num_sms * SEGMENTS_PER_CU`` -- and differ
+    only in how that share is rounded and floored. ``SPLIT_POLICY`` picks one:
+
+    ``share`` (the default): round the share up, then up to a power of two. A
+        launch that already fills the machine still splits whenever the context
+        is long enough to pay for it.
+    ``occupancy``: first scale the budget down by the warps one program spans
+        (``next_power_of_2(num_queries_per_kv) // MFMA_DIM``, the warp count
+        the matching attn_3d entry will end up launching), then round the share
+        to nearest and *down* to a power of two, and decline to split at all
+        below ``SPLIT_MIN_TILES`` tiles of context or below
+        ``max(SPLIT_MIN_SEGMENTS, SPLIT_MIN_WORK // tiles)`` segments. The two
+        floors keep a split from costing more in the reduce than the extra
+        parallelism wins back.
+
     The reduce section carries the same parameters plus SMALL_SPLIT_MAX, and
     gets num_warps out of this instead of a segment count: one warp is enough
     when the split landed on its floor.
     """
     if "SEGMENTS_PER_CU" not in config:
         return config
+    policy = config.pop("SPLIT_POLICY", "share")
+    assert policy in ("share", "occupancy"), f"Unknown SPLIT_POLICY {policy!r}"
     small_split_max = config.pop("SMALL_SPLIT_MAX", None)
     per_cu = config.pop("SEGMENTS_PER_CU")
     lo = config.pop("MIN_SEGMENTS", 1)
     cap = config.pop("MAX_SEGMENTS", None)
     tile_lo = config.pop("SEGMENT_TILE_MIN", 1)
     tile_hi = config.pop("SEGMENT_TILE_MAX", None)
+    # occupancy-policy knobs only
+    mfma_dim = config.pop("MFMA_DIM", None)
+    min_tiles = config.pop("SPLIT_MIN_TILES", 0)
+    min_segments = config.pop("SPLIT_MIN_SEGMENTS", 0)
+    min_work = config.pop("SPLIT_MIN_WORK", 0)
 
     # tokens one segment must cover, so the split never outruns the context
     tile = triton.next_power_of_2(params.block_size)
@@ -176,8 +200,20 @@ def compute_segment_params(config: dict, params) -> dict:
 
     budget = params.num_sms * per_cu
     prgms = max(1, params.num_2d_prgms)
-    share = triton.cdiv(budget, prgms)
-    segments = triton.next_power_of_2(max(min(lo, limit), min(limit, max(1, share))))
+    if policy == "share":
+        share = triton.cdiv(budget, prgms)
+        segments = triton.next_power_of_2(
+            max(min(lo, limit), min(limit, max(1, share)))
+        )
+    else:
+        assert mfma_dim, "SPLIT_POLICY 'occupancy' needs MFMA_DIM"
+        warps = max(1, triton.next_power_of_2(params.num_queries_per_kv) // mfma_dim)
+        share = round(budget // warps / prgms)
+        if limit <= min_tiles or share < max(min_segments, min_work // limit):
+            segments = 1
+        else:
+            claim = max(min(lo, limit), min(limit, max(1, share)))
+            segments = 1 << (claim.bit_length() - 1)
     if small_split_max is None:
         config["NUM_SEGMENTS"] = segments
     elif segments <= min(small_split_max, limit):
