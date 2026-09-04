@@ -10,7 +10,6 @@ the same inward-shifted centered window.  TFLOPS and TB/s are reported per shape
 """
 
 import argparse
-import functools
 import math
 
 import pandas as pd
@@ -111,7 +110,6 @@ def na3d_sdpa_ref(
 # ---------------------------------------------------------------------------
 
 
-@functools.lru_cache(maxsize=256)
 def _na3d_sdpa_mask(
     rel_bounds: tuple[tuple[tuple[int, ...], tuple[int, ...]], ...],
     dtype: torch.dtype,
