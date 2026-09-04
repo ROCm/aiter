@@ -771,15 +771,26 @@ def gemm_a8w8_bpreshuffle(
             return gemm_a8w8_bpreshuffle_flydsl(
                 XQ, WQ, x_scale, w_scale, Y, {"kernelName": ki.name}
             )
+    if w_k > k:
+        return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y, 0)
     try:
-        if w_k > k:
-            return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y, 0)
         return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, 0)
-    except RuntimeError as e:
-        raise RuntimeError(
-            f"gemm_a8w8_bpreshuffle failed for shape M={m}, N={n}, K={k}, "
-            f"{dtype=}, config={config}: {e}"
-        ) from e
+    except RuntimeError as ck_error:
+        # The ck instances are GemmSpecialization::Default, so the one the
+        # heuristic picks rejects any N that its NPerBlock does not divide.
+        # cktile compiles a padded variant per kernel and takes every shape;
+        # it is slower on the skinny N it rescues, but it is not a crash.
+        logger.warning(
+            f"gemm_a8w8_bpreshuffle ck rejected M={m}, N={n}, K={k}; "
+            f"falling back to cktile."
+        )
+        try:
+            return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y, 0)
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"gemm_a8w8_bpreshuffle failed for shape M={m}, N={n}, K={k}, "
+                f"{dtype=}, config={config}: ck raised {ck_error}, cktile raised {e}"
+            ) from e
 
 
 def gemm_a8w8_blockscale_fake(
