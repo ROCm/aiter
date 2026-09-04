@@ -34,7 +34,7 @@ from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 _fwd_grouped_kernel_stage1_rope_repr = make_kernel_repr(
-    "_fwd_grouped_kernel_stage1_rope",
+    "mla_decode_rope_fwd_grouped_kernel_stage1",
     [
         "rotary_dim",
         "kv_lora_rank",
@@ -326,7 +326,7 @@ def _fwd_grouped_kernel_stage1_rope(
 
 
 _fwd_kernel_stage2_repr = make_kernel_repr(
-    "_fwd_kernel_stage2",
+    "mla_decode_rope_fwd_kernel_stage2",
     [
         "NUM_KV_SPLITS",
         "BLOCK_DV",
