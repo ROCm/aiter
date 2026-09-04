@@ -993,6 +993,10 @@ def _unified_attention_gfx950(
     The W run has to sit on each dot's reduction axis,
     so K groups head_size and V groups tokens. The triton backend reads the same
     layout off the cache shape, so one shuffled cache serves both.
+
+    Page size 64 is the best default on both the plain and the pre-shuffled path,
+    and it matches the tuned tile so the loader takes its one-page fast path.
+    head_size 256 is the most sensitive to getting it wrong.
     """
     BLOCK_Q = BLOCK_M // params.num_queries_per_kv
     assert BLOCK_Q >= 1
