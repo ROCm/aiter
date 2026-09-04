@@ -7,25 +7,10 @@ import triton
 from aiter.ops.triton._triton_kernels.conv.conv_1x1 import (
     _conv2d_1x1_kernel,
 )
-from aiter.ops.triton._triton_kernels.conv.conv_1x1 import (
-    _get_config as _get_config_1x1,
-)
 from aiter.ops.triton._triton_kernels.conv.conv_3x3 import (
     _conv2d_3x3_cblocked_kernel,
     _conv2d_3x3_nchw_kernel,
     _conv2d_3x3_nhwc_kernel,
-    _get_config_cblocked,
-    _get_config_nchw,
-    _get_config_nhwc,
-)
-from aiter.ops.triton._triton_kernels.conv.conv_3x3_winograd_f4x3 import (
-    _get_config_gemm as _get_config_wino_gemm,
-)
-from aiter.ops.triton._triton_kernels.conv.conv_3x3_winograd_f4x3 import (
-    _get_config_input as _get_config_wino_input,
-)
-from aiter.ops.triton._triton_kernels.conv.conv_3x3_winograd_f4x3 import (
-    _get_config_output as _get_config_wino_output,
 )
 from aiter.ops.triton._triton_kernels.conv.conv_3x3_winograd_f4x3 import (
     _winograd_f4x3_batched_gemm_kernel,
@@ -36,19 +21,62 @@ from aiter.ops.triton._triton_kernels.conv.conv_3x3_winograd_f4x3 import (
 from aiter.ops.triton._triton_kernels.conv.conv_general import (
     _conv2d_general_kernel,
 )
-from aiter.ops.triton._triton_kernels.conv.conv_general import (
-    _get_config as _get_config_general,
-)
-from aiter.ops.triton._triton_kernels.conv.nchw_to_cblocked import (
-    _get_config as _get_config_prepack,
-)
 from aiter.ops.triton._triton_kernels.conv.nchw_to_cblocked import (
     _nchw_to_cblocked_kernel,
 )
 from aiter.ops.triton.utils.conv_config_utils import (
     format_prepack_shape_key,
     format_shape_key,
+    get_conv_config,
 )
+
+# --------------------------------------------------------------------------
+# Config resolution
+#
+# Every conv kernel resolves its launch config here, in the wrapper layer;
+# the kernel-body modules stay free of config-table lookups.
+# --------------------------------------------------------------------------
+
+
+def _get_config_1x1(shape_key=None, M=None, variants=()):
+    return get_conv_config("CONV-1X1", shape_key=shape_key, M=M, variants=variants)
+
+
+def _get_config_nhwc(shape_key=None, M=None, variants=()):
+    return get_conv_config("CONV-3X3-NHWC", shape_key=shape_key, M=M, variants=variants)
+
+
+def _get_config_cblocked(shape_key=None, M=None, variants=()):
+    return get_conv_config(
+        "CONV-3X3-CBLOCKED", shape_key=shape_key, M=M, variants=variants
+    )
+
+
+def _get_config_nchw(shape_key=None, M=None, variants=()):
+    return get_conv_config("CONV-3X3-NCHW", shape_key=shape_key, M=M, variants=variants)
+
+
+def _get_config_wino_input(shape_key=None, M=None):
+    return get_conv_config("CONV-WINO-F4X3-INPUT", shape_key=shape_key, M=M)
+
+
+def _get_config_wino_gemm(shape_key=None, M=None):
+    return get_conv_config("CONV-WINO-F4X3-GEMM", shape_key=shape_key, M=M)
+
+
+def _get_config_wino_output(shape_key=None, M=None):
+    return get_conv_config("CONV-WINO-F4X3-OUTPUT", shape_key=shape_key, M=M)
+
+
+def _get_config_general(shape_key=None, M=None, variants=()):
+    return get_conv_config("CONV-GENERAL", shape_key=shape_key, M=M, variants=variants)
+
+
+def _get_config_prepack(shape_key=None, M=None, variants=()):
+    return get_conv_config("CONV-PREPACK", shape_key=shape_key, M=M, variants=variants)
+
+
+# --------------------------------------------------------------------------
 
 
 def _kernel_activation(activation):

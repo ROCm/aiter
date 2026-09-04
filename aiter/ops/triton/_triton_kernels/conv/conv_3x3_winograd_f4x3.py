@@ -5,22 +5,8 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils.conv_config_utils import get_conv_config
 
 from ..activation import _apply_activation_from_str
-
-
-def _get_config_input(shape_key=None, M=None):
-    return get_conv_config("CONV-WINO-F4X3-INPUT", shape_key=shape_key, M=M)
-
-
-def _get_config_gemm(shape_key=None, M=None):
-    return get_conv_config("CONV-WINO-F4X3-GEMM", shape_key=shape_key, M=M)
-
-
-def _get_config_output(shape_key=None, M=None):
-    return get_conv_config("CONV-WINO-F4X3-OUTPUT", shape_key=shape_key, M=M)
-
 
 _winograd_f4x3_input_transform_kernel_repr = make_kernel_repr(
     "_winograd_f4x3_input_transform_kernel",

@@ -5,14 +5,8 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils.conv_config_utils import get_conv_config
 
 from ..activation import _apply_activation_from_str
-
-
-def _get_config(shape_key=None, M=None, variants=()):
-    return get_conv_config("CONV-1X1", shape_key=shape_key, M=M, variants=variants)
-
 
 _conv2d_1x1_kernel_repr = make_kernel_repr(
     "_conv2d_1x1_kernel",
