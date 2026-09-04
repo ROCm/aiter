@@ -487,7 +487,7 @@ __global__ void radix_kernel_persistent(T const* in,
             vectorized_process(global_tid, total_threads, in_buf, row_len, hist_vec);
         }
 
-        // Flush LDS histogram to global via atomicAdd (no __threadfence needed on gfx942/gfx950).
+        // Flush LDS histogram to global via atomicAdd.
         __syncthreads();
         for(int i = threadIdx.x; i < num_buckets; i += blockDim.x)
         {
@@ -504,6 +504,7 @@ __global__ void radix_kernel_persistent(T const* in,
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 #endif
         __syncthreads();
+        __threadfence();
 
         // Cross-block barrier via atomicInc + spin-wait.
         bool isLastBlock = false;
