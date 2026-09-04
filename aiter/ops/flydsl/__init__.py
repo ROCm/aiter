@@ -37,6 +37,7 @@ _LAZY_IMPORTS = {
         ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
         "compute_varqlen_windows",
     ),
+    "flydsl_attn_res": (".kernels.attn_res", "flydsl_attn_res"),
     "flydsl_flash_attn_func": (".fmha_kernels", "flydsl_flash_attn_func"),
     "flydsl_fp8_mqa_logits": (
         ".kernels.mqa_logits.fp8_mqa_logits",
@@ -73,6 +74,7 @@ __all__ = [
     "FP8_MQA_LOGITS_VARIANTS",
     "GateMode",
     "compute_varqlen_windows",
+    "flydsl_attn_res",
     "flydsl_flash_attn_func",
     "flydsl_fp8_mqa_logits",
     "flydsl_hgemm",
