@@ -59,6 +59,7 @@ def fused_qk_rope_cat_and_cache_mla_fake_tensor(
     q_out_dtype: torch.dtype = None,
     shuffled_kv_cache: bool = False,
     upcast_operand: bool = False,
+    pad_slot_id: int = -1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     b, qh, d_nope = q_nope.shape
     _, _, d_pe = q_pe.shape
@@ -118,6 +119,7 @@ def fused_qk_rope_cat_and_cache_mla(
     q_out_dtype: torch.dtype = None,
     shuffled_kv_cache: bool = False,
     upcast_operand: bool = False,
+    pad_slot_id: int = -1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Perform RoPE on q_pe and k_pe and concat q_nope with q_pe and k_nope with k_pe along the last dimension
@@ -130,6 +132,9 @@ def fused_qk_rope_cat_and_cache_mla(
     - k_pe: Matrix W with shape (B_slot, KH, D2).
     - kv_cache: Matrix W with shape (B_cache, KH, D1 + D2).
     - slot_mapping: Matrix W with shape (B_slot, ).
+    - pad_slot_id: Optional non-negative cache slot reserved for padding. Cache
+      writes to this slot are skipped. The default preserves the existing
+      behavior where all non-negative slots, including slot 0, are writable.
 
     B is the number of decode tokens, B_slot is the number of prefill + decode tokens, B_cache is the max number of tokens of kv_cache
     QH must be multiple of KH
@@ -320,6 +325,7 @@ def fused_qk_rope_cat_and_cache_mla(
         OUTPUT_Q_NOPE_ZEROS_AND_Q_PE=(num_decode_toks_for_zeros > 0),
         HAVE_K_SCALE=(k_scale is not None and apply_scale),
         UPCAST_OPERAND=upcast_operand,
+        PAD_SLOT_ID=pad_slot_id,
         num_warps=1,
     )
 
