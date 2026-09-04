@@ -238,12 +238,8 @@ def _is_direct_m1(metadata):
     """Whether metadata names the raw-topk M1 executor rather than a sorted path."""
     from aiter.ops.flydsl.moe_direct_m1 import is_direct_kernel_pair
 
-    return (
-        metadata.flat
-        and not metadata.run_1stage
-        and is_direct_kernel_pair(
-            metadata_kernel_name(metadata, 1), metadata_kernel_name(metadata, 2)
-        )
+    return not metadata.run_1stage and is_direct_kernel_pair(
+        metadata_kernel_name(metadata, 1), metadata_kernel_name(metadata, 2)
     )
 
 
@@ -288,10 +284,6 @@ def _unsupported_fast_cfg_reason(
             return "direct-M1 execution disabled"
         supported, reason = moe_direct_m1.cfg_is_supported(cfg, **key)
         return "" if supported else reason
-    if int(float(cfg.get("flat", 0) or 0)) and not int(
-        float(cfg.get("run_1stage", 0) or 0)
-    ):
-        return "flat two-stage row without canonical direct-M1 kernels"
     if disable_inline_sort:
         try:
             if _parse_mxfp4_g1_kname(kn1)["inline_quant"]:
@@ -2810,7 +2802,10 @@ def get_2stage_cfgs(
             run_1stage_xbf16 = run_1stage and bool(int(cfg["xbf16"]))
         else:
             run_1stage_xbf16 = run_1stage and "blockscaleBf16" in str(kernelName1)
-        cfg_flat = int(float(cfg.get("flat", 0) or 0))
+        if "flat" in cfg:
+            cfg_flat = int(cfg["flat"]) if run_1stage else 0
+        else:
+            cfg_flat = 0
     is_opus_cfg = cfg is not None and _opus_a8w4.is_opus_a8w4_stage2_kernel(
         cfg.get("kernelName2", "")
     )
@@ -2830,24 +2825,23 @@ def get_2stage_cfgs(
         else:
             return 16 if token < 2048 else 32 if token < 16384 else 64
 
-    if cfg_flat and not run_1stage:
-        from aiter.ops.flydsl import moe_direct_m1
+    from aiter.ops.flydsl.moe_direct_m1 import is_direct_kernel_pair
 
-        if moe_direct_m1.is_direct_kernel_pair(kernelName1, kernelName2):
-            return MOEMetadata(
-                stage1=functools.partial(
-                    _flydsl_stage1_wrapper,
-                    kernelName=kernelName1,
-                    activation=activation,
-                ),
-                stage2=functools.partial(
-                    _flydsl_stage2_wrapper,
-                    kernelName=kernelName2,
-                ),
-                block_m=int(block_m),
-                ksplit=int(ksplit),
-                flat=True,
-            )
+    if not run_1stage and is_direct_kernel_pair(kernelName1, kernelName2):
+        return MOEMetadata(
+            stage1=functools.partial(
+                _flydsl_stage1_wrapper,
+                kernelName=kernelName1,
+                activation=activation,
+            ),
+            stage2=functools.partial(
+                _flydsl_stage2_wrapper,
+                kernelName=kernelName2,
+            ),
+            block_m=int(block_m),
+            ksplit=int(ksplit),
+            flat=True,
+        )
 
     if _is_mxfp4_kname(kernelName1) or _is_mxfp4_kname(kernelName2):
         # gate_mode is a runtime weight-layout property, not a tuning key: route

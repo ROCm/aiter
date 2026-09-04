@@ -47,15 +47,15 @@ Three kernels per call:
 2. route-centric stage1 over raw `(token, expert)` routes
 3. weighted atomic stage2
 
-Selected by `flat=1, run_1stage=0` plus the canonical kernel-name pair
+Selected by the canonical two-stage kernel-name pair on a `run_1stage=0` row
 
 ```text
 flydsl_moe1_direct_m1_afp4_wfp4_bf16_t32x32x256_w4_kw2_fp4
 flydsl_moe2_direct_m1_layout_afp4_wfp4_bf16_t32x128x128_atomic_sbm32
 ```
 
-`flat=1, run_1stage=1` keeps its pre-existing one-stage meaning. A flat
-two-stage row that does not name the canonical pair is rejected.
+The names are the only dispatch signal; the `flat` column keeps its
+pre-existing one-stage meaning and is not read for two-stage rows.
 
 The quant/zero fusion is a private pybind target
 (`_dynamic_per_group_scaled_quant_fp4_direct_m1_internal`); it is the canonical

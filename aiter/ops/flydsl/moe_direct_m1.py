@@ -255,9 +255,10 @@ def cfg_is_supported(
             int(key[name])
             for name in ("token", "model_dim", "inter_dim", "expert", "topk")
         )
+        # The kernel-name pair is what selects this executor; the row only has
+        # to agree on the launch flags it implies.
         flags = tuple(
-            _integer(config, name)
-            for name in ("block_m", "flat", "run_1stage", "ksplit")
+            _integer(config, name) for name in ("block_m", "run_1stage", "ksplit")
         )
     except (KeyError, TypeError, ValueError) as exc:
         return False, str(exc) if isinstance(exc, ValueError) else "malformed CSV row"
@@ -266,10 +267,10 @@ def cfg_is_supported(
         return False, f"requires gfx950, got {key['gfx']}"
     if token != 1:
         return False, f"direct-M1 only serves the token=1 row, got {token}"
-    if flags != (plan.block_m, 1, 0, 0):
+    if flags != (plan.block_m, 0, 0):
         return False, (
-            f"requires (block_m, flat, run_1stage, ksplit) == "
-            f"({plan.block_m}, 1, 0, 0), got {flags}"
+            f"requires (block_m, run_1stage, ksplit) == "
+            f"({plan.block_m}, 0, 0), got {flags}"
         )
     if enum_name(key["act_type"]) not in LOWM_ACTIVATIONS:
         return False, f"unsupported activation {key['act_type']}"

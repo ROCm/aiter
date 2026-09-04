@@ -169,16 +169,17 @@ def test_old_schema_flat_one_stage_and_two_stage_metadata(monkeypatch, tmp_path)
     pd.DataFrame([old_row]).to_csv(config, index=False)
     assert not _lookup(monkeypatch, config, 2).flat
 
-    pd.DataFrame([_row("direct")]).to_csv(config, index=False)
-    metadata = _lookup(monkeypatch, config, 1)
-    assert not metadata.run_1stage and metadata.flat
-    assert _metadata_kernels(metadata) == (D1, D2)
+    # The direct pair is recognised by kernel name; the flat column is not read.
+    for flat in (0, 1):
+        pd.DataFrame([{**_row("direct"), "flat": flat}]).to_csv(config, index=False)
+        metadata = _lookup(monkeypatch, config, 1)
+        assert not metadata.run_1stage and metadata.flat
+        assert _metadata_kernels(metadata) == (D1, D2)
 
 
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("flat", 0),
         ("run_1stage", 1),
         ("kernelName1", "flydsl_moe1_direct_m1_unknown"),
         ("kernelName2", BM2),
