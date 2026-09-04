@@ -1984,3 +1984,57 @@ class TestCardGate(unittest.TestCase):
         step8 = body[body.index("## Step 8"):]
         self.assertRegex(step8, r"triage\.py\"?\s+card\b",
                          "Step 8 does not run the card gate")
+
+
+class TestHardcodedLaunchKnob(unittest.TestCase):
+    """T8, from the aiter#5137 revert.
+
+    T4 is the cross-arch case. This is the single-arch one: `waves_per_eu=2` in
+    pa_decode.py with a six-line justification, reverted on one comment -- "change the
+    config file jsons instead of hardcoding it in the code". The justification was not the
+    problem; the location was. 11% of the 600-PR corpus.
+    """
+
+    def rules(self, path, *lines):
+        import tempfile
+        body = (f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
+                "@@ -1 +1 @@\n" + "".join(f"+{l}\n" for l in lines))
+        with tempfile.TemporaryDirectory() as td:
+            f = pathlib.Path(td) / "d.diff"
+            f.write_text(body)
+            r = subprocess.run([sys.executable, str(TRIAGE), "rules", str(f), "x"],
+                               capture_output=True, text=True)
+        self.assertEqual(0, r.returncode, r.stderr)
+        return r.stdout
+
+    def test_a_literal_knob_in_kernel_source_fires(self):
+        out = self.rules("aiter/ops/triton/attention/pa_decode.py", "        waves_per_eu=2,")
+        self.assertIn("hardcoded-launch-knob", out)
+        self.assertIn("T8", out)
+
+    def test_every_knob_name_fires(self):
+        for knob in ("waves_per_eu", "matrix_instr_nonkdim", "kpack", "num_stages",
+                     "num_warps", "num_ctas"):
+            self.assertIn("hardcoded-launch-knob",
+                          self.rules("aiter/ops/triton/x.py", f"    {knob}=4,"), knob)
+
+    def test_a_knob_read_from_config_does_not_fire(self):
+        """`num_warps=config["num_warps"]` is the config system working."""
+        for line in ('    num_warps=config["num_warps"],', "    num_warps=cfg.num_warps,",
+                     "    **config,", "    num_stages=tuned[key],"):
+            self.assertNotIn("hardcoded-launch-knob",
+                             self.rules("aiter/ops/triton/x.py", line), line)
+
+    def test_a_literal_in_a_config_file_does_not_fire(self):
+        self.assertNotIn("hardcoded-launch-knob",
+                         self.rules("aiter/ops/triton/configs/gfx950/x.py",
+                                    "    waves_per_eu=2,"))
+
+    def test_a_test_pinning_a_knob_does_not_fire(self):
+        """A test pinning a knob pins it on purpose."""
+        self.assertNotIn("hardcoded-launch-knob",
+                         self.rules("op_tests/test_thing.py", "    waves_per_eu=2,"))
+
+    def test_a_commented_out_knob_does_not_fire(self):
+        self.assertNotIn("hardcoded-launch-knob",
+                         self.rules("aiter/ops/triton/x.py", "    # waves_per_eu=2,"))

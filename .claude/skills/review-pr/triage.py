@@ -283,6 +283,38 @@ def strip_trailing_comment(line):
     return "".join(out).rstrip()
 
 
+
+LAUNCH_KNOB = re.compile(r"\b(waves_per_eu|matrix_instr_nonkdim|kpack|num_stages|"
+                         r"num_warps|num_ctas)\s*=\s*\d+")
+FROM_CONFIG = re.compile(r"=\s*(config|cfg|conf|tune|tuned|kwargs|\*\*|[A-Z_]+\[)")
+
+
+def hardcoded_launch_knob(files):
+    """A launch knob set to a literal in kernel source rather than in the tuned config.
+
+    T4 covers a knob hardcoded ACROSS archs. aiter#5137's revert was a single-arch case
+    and a different failure: `waves_per_eu=2` written into pa_decode.py with a six-line
+    justification, reverted with "change the config file jsons instead of hardcoding it
+    in the code". The config system exists so that a tuning sweep and the code disagree
+    loudly; a literal in the source is invisible to the sweep, which will either overwrite
+    it or fight it.
+
+    Config files and tests are exempt -- a literal in a JSON/CSV is the config system
+    working, and a test pinning a knob is pinning it on purpose."""
+    for path, f in files.items():
+        if not path.endswith(".py"):
+            continue
+        if "/configs/" in path or path.startswith(("op_tests/", "tests/")):
+            continue
+        for line in f["add"]:
+            if line.strip().startswith("#"):
+                continue
+            m = LAUNCH_KNOB.search(line)
+            if m and not FROM_CONFIG.search(line):
+                return True
+    return False
+
+
 def derive(files, title="", raw_diff=""):
     paths = list(files)
     add = "\n".join(l for f in files.values() for l in f["add"])
@@ -406,6 +438,8 @@ def derive(files, title="", raw_diff=""):
     if re.search(r"(torch\.(float16|bfloat16|float8\w*)|dtype\s*=\s*torch\.\w+)", add) and \
        not re.search(r"\.dtype\s*==|is_floating_point|\.dtype\b.*(in|==)", add):
         hit("dtype-assumed", "C3")
+    if hardcoded_launch_knob(files):
+        hit("hardcoded-launch-knob", "T8")
     if conditional_binding(files):
         hit("conditional-binding", "D1b")
     if re.search(r"def \w+\([^)]*\w+\s*=\s*(None|False|0|1|\"\")", add):
@@ -448,7 +482,7 @@ UNREACHABLE_BY_DESIGN = {
 
 ALL_RULES = ("A1 A2 A3 B1 B2 B3 B4 B5 B6 B7 C1 C2 C3 C4 D1 D1b D2 D3 D4 D5 D6 D7 D8 "
              "D10 D10b E1 E2 E3 E4 E5 F1 G1 G1b P1 P2 P3 P4 P5 P6 HK1 HK2 HK3 "
-             "T1 T2 T3 T4 T5 T6 D11 HK12 HK12b STEP4")
+             "T1 T2 T3 T4 T5 T6 T8 D11 HK12 HK12b STEP4")
 
 GUARD_NOISE = frozenset("""not is None True False and or in if else self len int float
 str bool tuple list dict set all any isinstance type return raise sizeof static_assert

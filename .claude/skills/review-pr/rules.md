@@ -424,6 +424,29 @@ AMD-specific and MI300/MI355 differ; `matrix_instr_nonkdim` in particular select
 instruction that must exist on the target arch.
 → `⚠️ T4: matrix_instr_nonkdim=[n] set unconditionally; gfx950 [does/does not] have that MFMA shape`
 
+**T8 — Launch knob hardcoded in kernel source instead of the config system** ⚠️
+
+Trigger: `waves_per_eu=`, `matrix_instr_nonkdim=`, `kpack=`, `num_stages=`, `num_warps=`,
+`num_ctas=` set to a literal in kernel launch code rather than in the tuned-config
+JSON/CSV. 11% of open PRs. Config files and `op_tests/` are exempt: a literal in a JSON is
+the config system working, and a test pinning a knob pins it deliberately.
+
+T4 is the cross-arch case — the same value forced onto every arch. T8 is the single-arch
+case and a different failure: the config system exists so that a tuning sweep and the code
+disagree loudly, and a literal in the source is invisible to the sweep. The next sweep
+either overwrites it or fights it, and neither is visible in a diff.
+
+Real example (aiter#5137): `waves_per_eu=2` written into `pa_decode.py` with a six-line
+justification comment, reverted on one review comment — "Please change the config file
+jsons instead of hardcoding it in the code waves_per_eu=2". The justification was not the
+problem; the location was.
+
+FP self-check: a knob read from a config (`num_warps=config["num_warps"]`, `**cfg`) is the
+correct shape. So is a literal inside a `triton.Config(...)` entry that IS the tuned table.
+→ `⚠️ T8: [knob]=[n] hardcoded in [file] — move it to the tuned config so sweeps can see it`
+
+---
+
 **T5 — accumulator precision** 🔴
 
 Trigger: `tl.dot(`, `.to(tl.float32)`, `allow_tf32`, `input_precision`. 25% of Triton PRs.
