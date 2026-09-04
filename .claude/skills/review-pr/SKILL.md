@@ -42,6 +42,12 @@ Read the diff and PR body before proceeding.
 ### Step 1b — Derive the applicable rules, and collect the evidence they need
 
 
+**`$WORK/ci_coverage.txt` says whether the tests this PR adds will ever run.** HK6 asks a
+new op to ship a test; a file under `op_tests/flydsl_tests/` satisfies HK6 by name and is
+scanned by no workflow, and one under `op_tests/multigpu_tests/` runs only with the
+`multigpu` label. Check this before crediting a PR for having tests — 9% of open PRs add one
+that never runs.
+
 **`$WORK/twins.txt` names the file each new file was copied from.** Step 6's check 2 asks
 for mirrored code and left finding the mirror to you; this does that part. The pair is not a
 finding — an arch-specific variant is the normal shape here — the finding is the

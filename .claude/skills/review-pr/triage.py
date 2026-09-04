@@ -332,7 +332,7 @@ def derive(files, title="", raw_diff=""):
     if struct_field_churn(raw_diff):
         hit("struct-abi", "D11")
     if uncollectable_test_file(raw_diff):
-        hit("uncollectable-test", "HK12")
+        hit("uncollectable-test", "HK12b")
 
     if any(p.startswith(("aiter/ops/triton/",)) or "/triton/" in p or
            "_triton_kernels/" in p or "_gluon_kernels/" in p or "/gluon/" in p
@@ -349,11 +349,15 @@ UNREACHABLE_BY_DESIGN = {
     # before the rule pass. The prose would be a second, weaker copy of a result already
     # on screen; a 14-PR run showed the prose version catching 0 of 3 known defects.
     "D9": "scanner-backed: scan_index_width.py reports it in Step 1",
+    # HK12's trigger is where a file LIVES against what .github/ actually scans, which the
+    # diff alone cannot answer. `triage.py citest` computes it in Step 1b and writes
+    # ci_coverage.txt; deriving a rule id from the diff would be guessing.
+    "HK12": "evidence-backed: triage.py citest writes ci_coverage.txt in Step 1b",
 }
 
 ALL_RULES = ("A1 A2 A3 B1 B2 B3 B4 B5 B6 B7 C1 C2 C3 C4 D1 D1b D2 D3 D4 D5 D6 D7 D8 "
              "D10 D10b E1 E2 E3 E4 E5 F1 G1 G1b P1 P2 P3 P4 P5 P6 HK1 HK2 HK3 "
-             "T1 T2 T3 T4 T5 T6 D11 HK12 STEP4")
+             "T1 T2 T3 T4 T5 T6 D11 HK12 HK12b STEP4")
 
 def deleted_guard_symbols(diff_text):
     """Symbols named by a guard the diff removes.
@@ -685,7 +689,7 @@ def expand_rules(rules_text, rules_md):
             continue
         if l.startswith("|") and len(table_head) < 2:
             table_head.append(l)
-        for rid in re.findall(r"\b(HK\d+)\b", l):
+        for rid in re.findall(r"\b(HK\d+[a-z]?)\b", l):
             if l.startswith("|"):
                 table_rows.setdefault(rid, l)
 
@@ -934,11 +938,106 @@ def near_duplicates(diff_text, root, threshold=0.60):
 
 
 
+# --------------------------------------------------------------- ci coverage
+def ci_test_scope(root):
+    """(patterns, note) describing which test paths a CI job actually scans.
+
+    Derived from .github/, never hardcoded: the shard script is where the truth is and a
+    copy of it here would drift the way Step 3's rule table did. Reads the `find` lines in
+    split_tests.sh, so a change to its maxdepth or its directories changes this answer."""
+    root = pathlib.Path(root)
+    scope = []
+    sh = root / ".github" / "scripts" / "split_tests.sh"
+    if sh.is_file():
+        text = sh.read_text(errors="replace")
+        for m in re.finditer(r'find\s+"?(\$?\w+|[\w/]+)"?\s+(-maxdepth\s+(\d+)\s+)?'
+                             r"-name\s+'([^']+)'", text):
+            var, _, depth, pat = m.groups()
+            scope.append((var, int(depth) if depth else None, pat))
+    dirs = dict(re.findall(r'TEST_DIR="([\w/]+)"', sh.read_text(errors="replace"))
+                and [] or [])
+    return scope
+
+
+def uncovered_test_paths(diff_text, root):
+    """Test files the diff adds that no CI job will run, and why.
+
+    aiter runs op_tests/*.py at maxdepth 1 plus all of op_tests/triton_tests/. Everything
+    else is either label-gated or scanned by nothing: op_tests/multigpu_tests/ needs the
+    `multigpu` label and is skipped by default, and op_tests/flydsl_tests/ appears in no
+    workflow at all. A test that lands there is not a weak test -- it is not a test, it is
+    a script that happens to be committed.
+
+    aiter#4821 ships two files under op_tests/flydsl_tests/. They would not run even if
+    every function in them were a `def test_`."""
+    root = pathlib.Path(root)
+    covered_top, covered_trees, label_gated = set(), [], []
+    sh = root / ".github" / "scripts" / "split_tests.sh"
+    if sh.is_file():
+        t = sh.read_text(errors="replace")
+        if re.search(r'TEST_DIR="op_tests"', t) and "-maxdepth 1" in t:
+            covered_top.add("op_tests")
+        for m in re.finditer(r'TEST_DIR="(op_tests/[\w/]+)"', t):
+            covered_trees.append(m.group(1))
+    # A path MENTIONED in a workflow is not a path that gets RUN. pr-title-tags.yaml
+    # names op_tests/flydsl_tests/ to decide a label, and counting that as coverage made
+    # this report aiter#4821 as covered -- the exact case it exists to catch. Only lines
+    # that execute something count.
+    RUNS = re.compile(r"pytest|python3?\s|run_tests\.sh|split_tests\.sh|\.sh\b")
+    wf = root / ".github" / "workflows"
+    if wf.is_dir():
+        for f in wf.glob("*.y*ml"):
+            for line in f.read_text(errors="replace").splitlines():
+                if not RUNS.search(line):
+                    continue
+                for m in re.finditer(r"(op_tests/[\w/]+)", line):
+                    d = m.group(1).rstrip("/")
+                    if not (root / d).is_dir():
+                        d = d.rsplit("/", 1)[0]
+                    if (root / d).is_dir() and d not in covered_trees:
+                        covered_trees.append(d)
+    # Label-gated directories: named in a workflow that also gates on a label.
+    for f in (wf.glob("*.y*ml") if wf.is_dir() else []):
+        txt = f.read_text(errors="replace")
+        if "labels.*.name" not in txt:
+            continue
+        for m in re.finditer(r"run_(\w+)_tests", txt):
+            d = root / "op_tests" / f"{m.group(1)}_tests"
+            if d.is_dir():
+                rel = str(d.relative_to(root))
+                label_gated.append(rel)
+                if rel in covered_trees:
+                    covered_trees.remove(rel)
+    out = []
+    for blk in re.split(r"(?m)^diff --git ", diff_text)[1:]:
+        head = blk.split("\n", 1)[0]
+        m = re.match(r"a/(\S+) b/(\S+)", head)
+        if not m or "\nnew file mode" not in blk:
+            continue
+        path = m.group(2)
+        base = path.rsplit("/", 1)[-1]
+        if not (base.startswith("test_") and base.endswith(".py")):
+            continue
+        parent = path.rsplit("/", 1)[0]
+        if parent in covered_top:
+            continue
+        if any(path.startswith(d.rstrip("/") + "/") for d in covered_trees):
+            continue
+        if any(path.startswith(d.rstrip("/") + "/") for d in label_gated):
+            out.append((path, "runs only when the `multigpu` label is set; skipped by "
+                              "default, so a merge without the label never runs it"))
+            continue
+        out.append((path, "no CI job scans this directory -- op_tests is shard-scanned at "
+                          "maxdepth 1 and op_tests/triton_tests recursively, nothing else"))
+    return out
+
+
+
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
     if mode not in ("rules", "evidence", "symbols", "ledger", "expand", "answers",
                         "mapping", "diagnostic", "testquality",
-                        "twins"):
+                        "twins", "citest"):
         print("usage: triage.py rules <diff> [title]\n"
               "       triage.py evidence <diff> <head-file>...\n"
               "       triage.py symbols <diff> <merge-target-root>\n"
@@ -948,8 +1047,19 @@ if __name__ == "__main__":
               "       triage.py mapping\n"
               "       triage.py diagnostic <ai_diagnostic.txt>\n"
               "       triage.py testquality <diff>\n"
-              "       triage.py twins <diff> <root>", file=sys.stderr)
+              "       triage.py twins <diff> <root>\n"
+              "       triage.py citest <diff> <root>", file=sys.stderr)
         raise SystemExit(2)
+
+    if mode == "citest":
+        root = pathlib.Path(sys.argv[3] if len(sys.argv) > 3 else ".")
+        rows = uncovered_test_paths(open(sys.argv[2], errors="replace").read(), root)
+        if not rows:
+            print("every new test file lands where a CI job will run it")
+        for path, why in rows:
+            print(f"UNRUN-TEST: {path}")
+            print(f"  {why}")
+        raise SystemExit(0)
 
     if mode == "twins":
         root = pathlib.Path(sys.argv[3] if len(sys.argv) > 3 else ".")

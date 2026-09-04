@@ -772,6 +772,15 @@ if grep -q "invariant-removed\|api-signature" "$WORK/rules.txt"; then
   fi
 fi
 
+# Whether a CI job will ever run the tests this PR adds. Computed from .github/ rather
+# than hardcoded: op_tests is shard-scanned at maxdepth 1 and op_tests/triton_tests
+# recursively, so op_tests/flydsl_tests/ (5 files in tree) is scanned by nothing and
+# op_tests/multigpu_tests/ (29) needs the `multigpu` label. 9% of open PRs add a test that
+# never runs. A path merely NAMED in a workflow does not count -- pr-title-tags.yaml names
+# these directories to pick a label.
+"$SKILLS_ROOT/review-pr/triage.py" citest "$WORK/pr.diff" "$PROJECT_ROOT" \
+  | tee "$WORK/ci_coverage.txt"
+
 # New files that are largely a copy of one already in the tree. Step 6 asks for the twin
 # and left finding it to the reader; 3% of open PRs add one at >=60% overlap. The pair is
 # evidence, not a finding -- an arch-specific variant is the normal shape, and the defect
@@ -805,5 +814,5 @@ fi
 
 echo
 echo "WORK=$WORK"
-echo "artifacts: pr.diff pr_meta.json base_head.txt rules.txt rules_expanded.txt test_quality.txt twins.txt \
+echo "artifacts: pr.diff pr_meta.json base_head.txt rules.txt rules_expanded.txt test_quality.txt twins.txt ci_coverage.txt \
 evidence.txt symbols.txt validation_requirement.json"

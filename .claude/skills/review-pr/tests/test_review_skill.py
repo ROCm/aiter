@@ -117,7 +117,7 @@ class TestRuleBodiesResolve(unittest.TestCase):
     def test_every_derivable_rule_has_a_body(self):
         rules = RULES_MD.read_text()
         blocks = set(re.findall(r"^\*\*([A-Z]+\d+[a-z]?) — ", rules, re.M))
-        rows = set(re.findall(r"\b(HK\d+)\b", rules))
+        rows = set(re.findall(r"\b(HK\d+[a-z]?)\b", rules))
         documented = blocks | rows
         missing = sorted(self._derivable_ids() - documented - {"STEP4"})
         self.assertEqual(missing, [],
@@ -139,7 +139,7 @@ class TestRuleBodiesResolve(unittest.TestCase):
         src = TRIAGE.read_text()
         rules = RULES_MD.read_text()
         documented = set(_re.findall(r"^\*\*([A-Z]+\d+[a-z]?) — ", rules, _re.M)) \
-            | set(_re.findall(r"\b(HK\d+)\b", rules))
+            | set(_re.findall(r"\b(HK\d+[a-z]?)\b", rules))
         block = _re.search(r"UNREACHABLE_BY_DESIGN = \{(.*?)\n\}", src, _re.S)
         self.assertIsNotNone(block, "UNREACHABLE_BY_DESIGN is gone")
         exempt = set(_re.findall(r'"(\w+)":\s*"', block.group(1)))
@@ -1536,3 +1536,82 @@ class TestUncollectableTestFile(unittest.TestCase):
     def test_a_file_not_named_like_a_test_does_not_fire(self):
         self.assertNotIn("uncollectable-test",
                          self.rules(self.newfile("op_tests/bench_thing.py", self.SCRIPT)))
+
+
+class TestCiCoverage(unittest.TestCase):
+    """Which added tests a CI job will actually run, computed from .github/.
+
+    HK6 asks a new op to ship a test, and the reviewer credits the PR for having one. The
+    file's *location* decides whether it runs: aiter shard-scans op_tests at maxdepth 1
+    and op_tests/triton_tests recursively, so op_tests/flydsl_tests/ is scanned by nothing
+    (5 files in tree) and op_tests/multigpu_tests/ needs a label (29). 9% of the 600-PR
+    corpus adds a test that never runs. aiter#4821 ships two.
+    """
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self._tmp.name)
+        sh = self.root / ".github" / "scripts" / "split_tests.sh"
+        sh.parent.mkdir(parents=True)
+        sh.write_text('TEST_DIR="op_tests"\n'
+                      "find \"$TEST_DIR\" -maxdepth 1 -name 'test_*.py'\n"
+                      'TEST_DIR="op_tests/triton_tests"\n'
+                      "find \"$TEST_DIR\" -name 'test_*.py'\n")
+        for d in ("op_tests", "op_tests/triton_tests", "op_tests/flydsl_tests",
+                  "op_tests/multigpu_tests"):
+            (self.root / d).mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def workflow(self, name, text):
+        wf = self.root / ".github" / "workflows"
+        wf.mkdir(parents=True, exist_ok=True)
+        (wf / name).write_text(text)
+
+    def citest(self, path):
+        d = self.root / "d.diff"
+        d.write_text(f"diff --git a/{path} b/{path}\nnew file mode 100644\n"
+                     f"--- /dev/null\n+++ b/{path}\n@@ -0,0 +1 @@\n"
+                     "+def test_a():\n+    assert 1\n")
+        r = subprocess.run([sys.executable, str(TRIAGE), "citest", str(d), str(self.root)],
+                           capture_output=True, text=True)
+        self.assertEqual(0, r.returncode, r.stderr)
+        return r.stdout
+
+    def test_a_top_level_op_test_is_covered(self):
+        self.assertIn("will run it", self.citest("op_tests/test_thing.py"))
+
+    def test_a_triton_test_at_depth_is_covered(self):
+        self.assertIn("will run it",
+                      self.citest("op_tests/triton_tests/gemm/test_thing.py"))
+
+    def test_an_unscanned_directory_is_reported(self):
+        out = self.citest("op_tests/flydsl_tests/test_thing.py")
+        self.assertIn("UNRUN-TEST", out)
+        self.assertIn("no CI job scans", out)
+
+    def test_a_nested_path_under_op_tests_is_reported(self):
+        """maxdepth 1: op_tests/block/test_x.py is not scanned even though op_tests is."""
+        (self.root / "op_tests" / "block").mkdir(parents=True, exist_ok=True)
+        self.assertIn("UNRUN-TEST", self.citest("op_tests/block/test_thing.py"))
+
+    def test_a_path_only_named_by_a_labelling_workflow_is_not_covered(self):
+        """pr-title-tags.yaml names op_tests/flydsl_tests/ to pick a label. Counting a
+        mention as coverage reported aiter#4821 as covered -- the case this exists for."""
+        self.workflow("pr-title-tags.yaml",
+                      "  const isFlydsl = f.startsWith('op_tests/flydsl_tests/');\n")
+        self.assertIn("UNRUN-TEST", self.citest("op_tests/flydsl_tests/test_thing.py"))
+
+    def test_a_label_gated_directory_says_so(self):
+        self.workflow("aiter-test.yaml",
+                      "        LABEL: ${{ contains(github.event.pull_request.labels.*.name,"
+                      " 'multigpu') }}\n          run_multigpu_tests: true\n")
+        out = self.citest("op_tests/multigpu_tests/test_thing.py")
+        self.assertIn("UNRUN-TEST", out)
+        self.assertIn("label", out)
+
+    def test_step_1b_writes_the_artifact(self):
+        self.assertIn("citest", FETCH.read_text())
+        self.assertIn("ci_coverage.txt", SKILL_MD.read_text())

@@ -51,8 +51,9 @@ fails when this file and the deriver disagree. Regenerate with
 | `scattered-diff`       | HK2 |
 | `nth-variant`          | HK5 |
 | `struct-abi`           | D11 |
-| `uncollectable-test`   | HK12 |
+| `uncollectable-test`   | HK12b |
 
 Documented but deliberately never derived:
 
 - **D9** — scanner-backed: scan_index_width.py reports it in Step 1
+- **HK12** — evidence-backed: triage.py citest writes ci_coverage.txt in Step 1b
