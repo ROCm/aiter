@@ -64,7 +64,7 @@ class TestFileBaton(unittest.TestCase):
             time.sleep(0.02)
             self.assertTrue(thread.is_alive())
 
-            self.assertTrue(breaker.try_acquire())
+            self.assertTrue(breaker._try_acquire_under_guard())
             breaker._release_steal_guard(guard)
             time.sleep(0.02)
             self.assertTrue(thread.is_alive())
@@ -144,6 +144,37 @@ class TestFileBaton(unittest.TestCase):
             self.assertIsNotNone(guard)
             self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o666)
             self.assertEqual(stat.S_IMODE(os.stat(path + ".steal").st_mode), 0o666)
+            baton._release_steal_guard(guard)
+            baton.release()
+
+    def test_lock_paths_are_shared_before_atomic_publication(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = os.path.join(tempdir, "build.lock")
+            guard_path = path + ".steal"
+            published = []
+            real_link = os.link
+
+            def checked_link(source, destination):
+                # A creator killed before this point can leave only the
+                # private temporary name, never an inaccessible lock path.
+                self.assertFalse(os.path.exists(destination))
+                self.assertEqual(stat.S_IMODE(os.stat(source).st_mode), 0o666)
+                published.append(destination)
+                return real_link(source, destination)
+
+            baton = FileBaton(path)
+            old_umask = os.umask(0o077)
+            try:
+                with mock.patch(
+                    "aiter.jit.utils.file_baton.os.link", side_effect=checked_link
+                ):
+                    self.assertTrue(baton.try_acquire())
+                    guard = baton._try_acquire_steal_guard()
+            finally:
+                os.umask(old_umask)
+
+            self.assertIsNotNone(guard)
+            self.assertEqual(published, [guard_path, path])
             baton._release_steal_guard(guard)
             baton.release()
 

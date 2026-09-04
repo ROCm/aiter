@@ -7,6 +7,7 @@ import logging
 import multiprocessing
 import os
 import socket
+import tempfile
 import time
 
 logger = logging.getLogger("aiter")
@@ -102,44 +103,67 @@ class FileBaton:
         # caller's normal retry loop observe that ownership.
         if self.fd is not None:
             return True
-        try:
-            fd = os.open(self.lock_file_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o666)
-        except FileExistsError:
+        sfd = self._try_acquire_steal_guard()
+        if sfd is None:
             return False
         try:
+            return self._try_acquire_under_guard()
+        finally:
+            self._release_steal_guard(sfd)
+
+    def _try_acquire_under_guard(self):
+        """Publish a prepared lock while the recovery guard is held."""
+        # open(O_CREAT, 0o666) publishes a mode filtered by the process umask.
+        # A process killed before a following fchmod() can therefore strand a
+        # 0600 lock that another cache UID can never probe.  Prepare a private
+        # same-directory inode completely, then hard-link it into place.  The
+        # link is an atomic no-replace publication and already has mode 0666.
+        lock_dir = os.path.dirname(self.lock_file_path) or "."
+        lock_name = os.path.basename(self.lock_file_path)
+        fd, private_path = tempfile.mkstemp(
+            prefix=f".{lock_name}.", suffix=".tmp", dir=lock_dir
+        )
+        published = False
+        try:
+            os.fchmod(fd, 0o666)
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            os.close(fd)
             try:
-                os.remove(self.lock_file_path)
+                pid = os.getpid()
+                remaining = memoryview(
+                    (
+                        f"{pid}\n{socket.gethostname()}\n"
+                        f"{_pid_namespace()}\n{_process_start_time(pid)}\nflock\n"
+                    ).encode()
+                )
+                while remaining:
+                    written = os.write(fd, remaining)
+                    if written <= 0:
+                        raise OSError("could not write baton owner record")
+                    remaining = remaining[written:]
+                os.fsync(fd)
+            except OSError:
+                # Never publish a valid-looking legacy prefix if owner
+                # metadata is only partially written. An empty record is
+                # protected by the lifetime flock while live and recoverable
+                # after process death.
+                try:
+                    os.ftruncate(fd, 0)
+                except OSError:
+                    pass
+            try:
+                os.link(private_path, self.lock_file_path)
+            except FileExistsError:
+                return False
+            self.fd = fd
+            published = True
+            return True
+        finally:
+            try:
+                os.unlink(private_path)
             except FileNotFoundError:
                 pass
-            raise
-        self.fd = fd
-        try:
-            os.fchmod(self.fd, 0o666)
-            pid = os.getpid()
-            remaining = memoryview(
-                (
-                    f"{pid}\n{socket.gethostname()}\n"
-                    f"{_pid_namespace()}\n{_process_start_time(pid)}\nflock\n"
-                ).encode()
-            )
-            while remaining:
-                written = os.write(self.fd, remaining)
-                if written <= 0:
-                    raise OSError("could not write baton owner record")
-                remaining = remaining[written:]
-            os.fsync(self.fd)
-        except OSError:
-            # Never leave a valid-looking legacy prefix if owner metadata is
-            # only partially written. An empty record is protected by the
-            # lifetime flock while live and recoverable after process death.
-            try:
-                os.ftruncate(self.fd, 0)
-            except OSError:
-                pass
-        return True
+            if not published:
+                os.close(fd)
 
     def wait(self):
         """
@@ -221,14 +245,33 @@ class FileBaton:
     def _try_acquire_steal_guard(self):
         """Try to hold the recovery guard; kernel releases it on process exit."""
         guard_path = self.lock_file_path + ".steal"
-        try:
-            sfd = os.open(guard_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o666)
-        except FileExistsError:
-            sfd = os.open(guard_path, os.O_RDWR)
-        else:
-            # Creation mode is filtered by umask; immediately make the
-            # persistent rendezvous inode writable by every cache peer.
-            os.fchmod(sfd, 0o666)
+        while True:
+            try:
+                sfd = os.open(guard_path, os.O_RDWR)
+                break
+            except FileNotFoundError:
+                guard_dir = os.path.dirname(guard_path) or "."
+                guard_name = os.path.basename(guard_path)
+                sfd, private_path = tempfile.mkstemp(
+                    prefix=f".{guard_name}.", suffix=".tmp", dir=guard_dir
+                )
+                published = False
+                try:
+                    os.fchmod(sfd, 0o666)
+                    fcntl.flock(sfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    try:
+                        os.link(private_path, guard_path)
+                    except FileExistsError:
+                        continue
+                    published = True
+                    return sfd
+                finally:
+                    try:
+                        os.unlink(private_path)
+                    except FileNotFoundError:
+                        pass
+                    if not published:
+                        os.close(sfd)
         try:
             fcntl.flock(sfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -344,7 +387,7 @@ class FileBaton:
                     os.remove(self.lock_file_path)
                 except FileNotFoundError:
                     pass
-                return self.try_acquire()
+                return self._try_acquire_under_guard()
             return False
         finally:
             self._release_steal_guard(sfd)
