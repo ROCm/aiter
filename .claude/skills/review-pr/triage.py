@@ -450,6 +450,11 @@ ALL_RULES = ("A1 A2 A3 B1 B2 B3 B4 B5 B6 B7 C1 C2 C3 C4 D1 D1b D2 D3 D4 D5 D6 D7
              "D10 D10b E1 E2 E3 E4 E5 F1 G1 G1b P1 P2 P3 P4 P5 P6 HK1 HK2 HK3 "
              "T1 T2 T3 T4 T5 T6 D11 HK12 HK12b STEP4")
 
+GUARD_NOISE = frozenset("""not is None True False and or in if else self len int float
+str bool tuple list dict set all any isinstance type return raise sizeof static_assert
+torch aiter np dtypes""".split())
+
+
 def deleted_guard_symbols(diff_text):
     """Symbols named by a guard the diff removes.
 
@@ -465,6 +470,19 @@ def deleted_guard_symbols(diff_text):
             continue
         body = ln[1:]
         if re.search(r"\b(assert|AITER_CHECK|TORCH_CHECK)\b", body):
+            # The subject of the guard, whatever shape it takes. Matching only
+            # `X is not None` and `X->` extracted nothing from 51 of the 57 corpus PRs
+            # that delete a guard: `assert causal, "..."`, `assert WQ.dtype == fp8`,
+            # `assert num_head_qo % 16 == 0`, `assert gfx_version in (...)` are all
+            # guards whose subject is simply the first identifier after the keyword.
+            cond = re.sub(r"^.*?\b(?:assert|AITER_CHECK|TORCH_CHECK)\b\s*\(?", "", body)
+            cond = cond.split(",")[0]
+            for m in re.finditer(r"\b([a-zA-Z_]\w*)\b", cond):
+                name = m.group(1)
+                if name in GUARD_NOISE:
+                    continue
+                syms.add(name)
+                break                      # the subject, not every token
             for m in re.finditer(r"\b([a-zA-Z_]\w*)\s+is\s+not\s+None", body):
                 syms.add(m.group(1))
             for m in re.finditer(r"\b([a-zA-Z_]\w*)->", body):

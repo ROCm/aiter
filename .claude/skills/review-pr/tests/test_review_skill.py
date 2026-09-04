@@ -1063,6 +1063,34 @@ class TestEvidenceCollector(unittest.TestCase):
         out = self.run_evidence(d, {"x.py": "acc = torch.empty(n)\nacc.zero_()\n"})
         self.assertIn("acc on head", out)
 
+    def test_every_shape_of_removed_guard_yields_its_subject(self):
+        """Matching only `X is not None` and `X->` extracted nothing from 51 of the 57
+        corpus PRs that delete a guard. The subject of `assert causal, "..."` is `causal`;
+        of `assert WQ.dtype == fp8` it is `WQ`; of `assert gfx_version in (...)` it is
+        `gfx_version`. Found on aiter#4255, where the assert was REPLACED by a stronger
+        named predicate and the reviewer had nothing on screen to see that with."""
+        cases = {
+            'assert gfx_version in ("gfx942", "gfx950")': "gfx_version",
+            'assert causal, "Only causal attention is supported"': "causal",
+            "assert WQ.dtype == dtypes.fp8, \"only fp8\"": "WQ",
+            "assert num_head_qo % 16 == 0": "num_head_qo",
+            'assert q_descale is None, "Q scales not supported"': "q_descale",
+            'TORCH_CHECK(out.is_contiguous(), "out must be contiguous");': "out",
+        }
+        for line, subject in cases.items():
+            d = ("diff --git a/aiter/x.py b/aiter/x.py\n--- a/aiter/x.py\n"
+                 "+++ b/aiter/x.py\n@@ -1 +0,0 @@\n-    " + line + "\n")
+            out = self.run_evidence(d, {"x.py": f"{subject} = compute()  # still here\n"})
+            self.assertIn(f"{subject} on head", out, line)
+
+    def test_guard_keywords_are_not_mistaken_for_the_subject(self):
+        """`assert not x` must yield `x`, not `not`."""
+        d = ("diff --git a/aiter/x.py b/aiter/x.py\n--- a/aiter/x.py\n+++ b/aiter/x.py\n"
+             "@@ -1 +0,0 @@\n-    assert not is_fnuz\n")
+        out = self.run_evidence(d, {"x.py": "is_fnuz = arch.startswith('gfx94')\n"})
+        self.assertIn("is_fnuz on head", out)
+        self.assertNotIn("not on head", out)
+
     def test_the_minus_minus_minus_header_is_not_a_deleted_line(self):
         """`--- a/file` starts with `-`. Counting it as a deleted line makes every diff
         whose header mentions a guard-like path look like a removed guard."""
