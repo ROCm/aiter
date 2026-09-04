@@ -223,12 +223,12 @@ def _flydsl_serves_thd(d_qk, d_v, causal, sink, window):
         return exp  # else CK
     if d_qk not in (128, 192):
         return False
-    if d_qk == 128 and not exp:
-        # The gfx1250 ASM kernel claims d128 only for plain causal attention with
-        # no sink and no finite window; non-causal / sink / windowed d128 is ours.
-        if causal and not sink and tuple(window) == (-1, -1):
-            return False
-    return True
+    # The gfx1250 ASM kernel claims d128 only for plain causal attention with
+    # no sink and no finite window; non-causal / sink / windowed d128 is ours.
+    asm_claims_d128 = (
+        d_qk == 128 and not exp and causal and not sink and tuple(window) == (-1, -1)
+    )
+    return not asm_claims_d128
 
 
 def _flydsl_serves_bshd(d_qk, d_v):

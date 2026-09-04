@@ -49,8 +49,8 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 from flydsl.expr.utils.arith import _to_raw as _raw
 
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels import buffer_ops
-from aiter.ops.flydsl.utils import get_shared_memory_per_block
 
 from ..tensor_shim import _run_compiled
 
@@ -623,9 +623,7 @@ def _alloc_lds():
     kernel body before the warp-type dispatch so both ``_core_attention`` traces share the
     single SharedAllocator flydsl permits; K/V, Q, and the O epilogue all carve this base.
     """
-    smem = fx.SharedAllocator().allocate(
-        get_shared_memory_per_block(fallback_gfx="gfx1250")
-    )
+    smem = fx.SharedAllocator().allocate(get_lds_capacity_bytes("gfx1250"))
     return fx.Int32(fx.ptrtoint(smem.peek().ptr))
 
 
