@@ -3,6 +3,7 @@
 """Regression tests for runtime untuned-shape recording (no GPU required)."""
 
 import builtins
+import functools
 import multiprocessing
 import os
 import tempfile
@@ -113,6 +114,47 @@ class TestUntunedShapes(unittest.TestCase):
         self.assertEqual(lines[0], "M,N,K")
         self.assertEqual(len(lines), 6)
         self.assertEqual(len(set(lines[1:])), 5)
+
+
+class TestCachedLookupMissRecording(unittest.TestCase):
+
+    def _assert_retry_outside_cache(self, module, cached_name, lookup, args):
+        resolver = mock.Mock(return_value=None)
+        cached_resolver = functools.lru_cache(maxsize=1)(resolver)
+        with (
+            mock.patch.object(module, cached_name, cached_resolver),
+            mock.patch.object(module, "_record_untuned_shape") as record,
+        ):
+            lookup(*args)
+            lookup(*args)
+        self.assertEqual(resolver.call_count, 1)
+        self.assertEqual(record.call_count, 2)
+
+    def test_a8w8_misses_record_outside_lookup_caches(self):
+        from aiter.ops import gemm_op_a8w8
+
+        self._assert_retry_outside_cache(
+            gemm_op_a8w8,
+            "_get_CKGEMM_config_cached",
+            gemm_op_a8w8.get_CKGEMM_config,
+            (1, 2, 3, "tuned.csv"),
+        )
+        self._assert_retry_outside_cache(
+            gemm_op_a8w8,
+            "_get_GEMM_config_with_quant_type_cached",
+            gemm_op_a8w8.get_GEMM_config_with_quant_type,
+            (1, 2, 3, "fp8", "tuned.csv"),
+        )
+
+    def test_a4w4_misses_record_outside_lookup_cache(self):
+        from aiter.ops import gemm_op_a4w4
+
+        self._assert_retry_outside_cache(
+            gemm_op_a4w4,
+            "_get_GEMM_config_cached",
+            gemm_op_a4w4.get_GEMM_config,
+            (1, 2, 3),
+        )
 
 
 if __name__ == "__main__":
