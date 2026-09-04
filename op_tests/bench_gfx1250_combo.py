@@ -90,9 +90,9 @@ sampling window, after its normal latency measurement:
 Input initialization, compilation, correctness and warmup are outside the SMI
 window. The monitor uses the Python ``amdsmi`` package and prints a case-tagged
 min/mean/median/max table for clocks, power, temperature, activity and VRAM.
-The single-GPU replay hook is intentionally disabled for ``mega_moe`` and
-``mori_ep``; their multi-rank communication loops need a separate rank/device
-telemetry design.
+``mega_moe`` has every rank monitor its local GPU around synchronized graph
+replays, then gathers the four summaries to rank 0; ``mori_ep`` remains disabled
+until its dispatch/combine loop exposes an aligned telemetry window.
 
 Supported operator inputs can be overridden consistently with:
 
@@ -698,6 +698,7 @@ def _collect_smi_rows(lines):
             continue
         base = {
             "case": record.get("label"),
+            "rank": record.get("rank"),
             "device": record.get("device"),
             "duration_s": round(record.get("duration_s", 0.0), 3),
             "launches": record.get("launches"),
@@ -1400,7 +1401,7 @@ def run_mega_moe(args):
     # The child ranks need GPU 0 as well. Release any cached allocations held by
     # this orchestration process before torchrun starts the four workers.
     torch.cuda.empty_cache()
-    env = _without_smi(os.environ)
+    env = os.environ.copy()
     # No MORI_SHMEM_HEAP_SIZE default here, for two independent reasons.
     #
     # Raising it sweep-wide took the machine down: the heap is preallocated per
@@ -1469,7 +1470,6 @@ def run_mega_moe(args):
             env={**env, "AITER_FORCE_A8W4": force_a8w4},
             extract=_md_kernel_table,
             kernels=False,
-            smi=False,
         )
 
 
@@ -2222,7 +2222,7 @@ def main():
             f"interval={args.smi_interval}s, min_duration={args.smi_duration}s)",
             _SMI_ROWS,
             keep=[
-                "case", "device", "duration_s", "launches", "samples",
+                "case", "rank", "device", "duration_s", "launches", "samples",
                 "sample_status",
                 "metric", "min", "mean", "median", "max", "n",
             ],
