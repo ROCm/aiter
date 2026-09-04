@@ -774,10 +774,134 @@ def render_mapping():
 
 
 
+# ------------------------------------------------------------- test quality
+ASSERT_PRIM = re.compile(r"\bassert\b|assert_close|allclose|checkAllclose|"
+                         r"pytest\.raises|\.approx|np\.testing|torch\.testing")
+TOL = re.compile(r"(?:atol|rtol)\s*=\s*(\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)")
+SHAPE = re.compile(r"\b(?:M|N|K|batch|num_tokens|seqlen|seq_len)\s*[=:]\s*(\d+)")
+
+
+def test_quality(diff_text):
+    """Facts about the tests a diff adds, for the reviewer to judge -- not a verdict.
+
+    "This test asserts nothing" cannot be decided from a diff: assertions routinely live
+    in a shared helper (`run_fp8(..., verify=True)`), so a rule that fires on a test body
+    with no `assert` is wrong more often than right, and over the 600-PR corpus the strict
+    version -- a whole new test file with no assertion primitive anywhere -- fires on 2,
+    one of which is a benchmark. Neither is a rule worth having.
+
+    What IS decidable is what the test contains, so this prints that: how many assertion
+    primitives, which tolerances, which shapes. Rule P2 and Step 6's check 5 are the
+    judgement; this is the evidence they need in front of them, the same way evidence.txt
+    serves the removed-guard rules."""
+    rows = []
+    for blk in re.split(r"(?m)^diff --git ", diff_text)[1:]:
+        head = blk.split("\n", 1)[0]
+        m = re.match(r"a/(\S+) b/(\S+)", head)
+        if not m:
+            continue
+        path = m.group(2)
+        if not (path.endswith(".py") and
+                (path.startswith(("op_tests/", "tests/")) or "test" in path.rsplit("/", 1)[-1])):
+            continue
+        added = "\n".join(l[1:] for l in blk.split("\n")
+                           if l.startswith("+") and not l.startswith("+++"))
+        if not added.strip():
+            continue
+        new_file = "\nnew file mode" in blk
+        tests = re.findall(r"^def (test_\w+)", added, re.M)
+        asserts = len(ASSERT_PRIM.findall(added))
+        tols = sorted({t for t in TOL.findall(added)}, key=lambda x: -float(x))
+        shapes = sorted({int(x) for x in SHAPE.findall(added)})
+        if not (tests or asserts or tols or shapes):
+            continue
+        rows.append({"path": path, "new": new_file, "tests": tests,
+                     "asserts": asserts, "tols": tols, "shapes": shapes})
+    return rows
+
+
+def render_test_quality(rows):
+    out = []
+    for r in rows:
+        tag = "new file" if r["new"] else "modified"
+        out.append(f"{r['path']}  ({tag})")
+        out.append(f"  test functions added : {len(r['tests'])}"
+                   f"{'  ' + ', '.join(r['tests'][:4]) if r['tests'] else ''}")
+        out.append(f"  assertion primitives : {r['asserts']}"
+                   + ("   <- none in the added lines; the check may be in a helper, or"
+                      " there may be none" if r["asserts"] == 0 else ""))
+        if r["tols"]:
+            worst = float(r["tols"][0])
+            note = "   <- loose for a kernel comparison" if worst >= 1e-1 else ""
+            out.append(f"  tolerances           : {', '.join(r['tols'])}{note}")
+        if r["shapes"]:
+            note = ("   <- every shape is small; P2 asks for production sizes"
+                    if max(r["shapes"]) <= 16 else "")
+            out.append(f"  shapes               : "
+                       f"{', '.join(str(x) for x in r['shapes'][:12])}{note}")
+        out.append("")
+    return "\n".join(out)
+
+
+
+# ------------------------------------------------------------------- twins
+def near_duplicates(diff_text, root, threshold=0.60):
+    """New files that are largely a copy of a file already in the tree.
+
+    Step 6 asks the reviewer to find "mirrored code -- fwd/bwd, v2/v3, prefill/decode,
+    gfx942/gfx950 -- and compare it field by field", which is the AI kernel bug signature.
+    Finding the twin was left to the reader. Over the 600-PR corpus 3% of PRs add a file
+    at least 60% identical to an existing one: fused_gemm_a16w16_copy_x.py against
+    _quant_x.py at 68%, test_opus_gmem_gfx1100.cu against _gfx1201.cu at 75%.
+
+    This names the pair and the ratio. It does not judge: a deliberate arch-specific
+    variant is the normal shape here, and the finding is an asymmetry BETWEEN the twins,
+    which needs a human diff of the two."""
+    added = {}
+    for blk in re.split(r"(?m)^diff --git ", diff_text)[1:]:
+        head = blk.split("\n", 1)[0]
+        m = re.match(r"a/(\S+) b/(\S+)", head)
+        if not m or "\nnew file mode" not in blk:
+            continue
+        path = m.group(2)
+        if not path.endswith((".py", ".cu", ".cuh", ".h", ".hpp", ".cpp")):
+            continue
+        lines = {l[1:].strip() for l in blk.split("\n")
+                 if l.startswith("+") and not l.startswith("+++") and len(l.strip()) > 21}
+        if len(lines) >= 40:
+            added[path] = lines
+    if not added:
+        return []
+    out = []
+    for path, lines in added.items():
+        best, best_path = 0.0, None
+        for cand in pathlib.Path(root).rglob("*"):
+            if cand.suffix not in (".py", ".cu", ".cuh", ".h", ".hpp", ".cpp"):
+                continue
+            rel = str(cand.relative_to(root))
+            if rel == path or ".git/" in rel or not cand.is_file():
+                continue
+            try:
+                other = {l.strip() for l in cand.read_text(errors="replace").splitlines()
+                         if len(l.strip()) > 21}
+            except OSError:
+                continue
+            if len(other) < 40:
+                continue
+            ratio = len(lines & other) / len(lines)
+            if ratio > best:
+                best, best_path = ratio, rel
+        if best >= threshold:
+            out.append((path, best_path, best))
+    return out
+
+
+
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
     if mode not in ("rules", "evidence", "symbols", "ledger", "expand", "answers",
-                        "mapping", "diagnostic"):
+                        "mapping", "diagnostic", "testquality",
+                        "twins"):
         print("usage: triage.py rules <diff> [title]\n"
               "       triage.py evidence <diff> <head-file>...\n"
               "       triage.py symbols <diff> <merge-target-root>\n"
@@ -785,8 +909,30 @@ if __name__ == "__main__":
               "       triage.py expand <rules.txt> <rules.md>\n"
               "       triage.py answers <answers.txt>\n"
               "       triage.py mapping\n"
-              "       triage.py diagnostic <ai_diagnostic.txt>", file=sys.stderr)
+              "       triage.py diagnostic <ai_diagnostic.txt>\n"
+              "       triage.py testquality <diff>\n"
+              "       triage.py twins <diff> <root>", file=sys.stderr)
         raise SystemExit(2)
+
+    if mode == "twins":
+        root = pathlib.Path(sys.argv[3] if len(sys.argv) > 3 else ".")
+        pairs = near_duplicates(open(sys.argv[2], errors="replace").read(), root)
+        if not pairs:
+            print("no new file closely mirrors an existing one")
+        for new, old, ratio in pairs:
+            print(f"TWIN: {new}")
+            print(f"  {ratio:.0%} of its substantive lines already appear in {old}")
+            print(f"  diff the two and look for the asymmetry: dtype width, a mask on one"
+                  f" side only, a flipped stride order, a bound the copy did not adapt")
+        raise SystemExit(0)
+
+    if mode == "testquality":
+        rows = test_quality(open(sys.argv[2], errors="replace").read())
+        if not rows:
+            print("no test files touched")
+        else:
+            sys.stdout.write(render_test_quality(rows))
+        raise SystemExit(0)
 
     if mode == "diagnostic":
         try:

@@ -1332,3 +1332,147 @@ class TestStructAbiRule(unittest.TestCase):
         py = ("diff --git a/aiter/x.py b/aiter/x.py\n--- a/aiter/x.py\n+++ b/aiter/x.py\n"
               "@@ -1,2 +1,3 @@ class Thing\n     a: int\n+    b: int\n     c: int\n")
         self.assertNotIn("struct-abi", self.rules(py))
+
+
+class TestTestQuality(unittest.TestCase):
+    """Evidence about added tests, deliberately not a verdict.
+
+    "This test asserts nothing" is undecidable from a diff -- the check is routinely in a
+    shared helper (`run_fp8(..., verify=True)`), so a rule firing on a body with no
+    `assert` was wrong on the first two corpus cases inspected. The strict version, a
+    whole new test file with no assertion primitive anywhere, fires on 2 of 600 and one of
+    those is a benchmark. Neither is worth a rule; both are worth printing.
+    """
+
+    def run_tq(self, diff):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            f = pathlib.Path(td) / "d.diff"
+            f.write_text(diff)
+            r = subprocess.run([sys.executable, str(TRIAGE), "testquality", str(f)],
+                               capture_output=True, text=True)
+        self.assertEqual(0, r.returncode, r.stderr)
+        return r.stdout
+
+    @staticmethod
+    def newfile(path, *lines):
+        return (f"diff --git a/{path} b/{path}\nnew file mode 100644\n"
+                f"--- /dev/null\n+++ b/{path}\n@@ -0,0 +1 @@\n"
+                + "".join(f"+{l}\n" for l in lines))
+
+    def test_a_diff_with_no_test_files_says_so(self):
+        out = self.run_tq("diff --git a/aiter/x.py b/aiter/x.py\n--- a/aiter/x.py\n"
+                          "+++ b/aiter/x.py\n@@ -0,0 +1 @@\n+x = 1\n")
+        self.assertIn("no test files touched", out)
+
+    def test_counts_and_names_the_added_tests(self):
+        out = self.run_tq(self.newfile(
+            "op_tests/test_thing.py",
+            "def test_alpha():", "    assert 1 == 1", "def test_beta():",
+            "    torch.testing.assert_close(a, b)"))
+        self.assertIn("test functions added : 2", out)
+        self.assertIn("test_alpha", out)
+        self.assertIn("(new file)", out)
+
+    def test_zero_assertions_is_reported_without_accusing(self):
+        out = self.run_tq(self.newfile(
+            "op_tests/test_thing.py", "def test_alpha():", "    run_it(verify=True)"))
+        self.assertIn("assertion primitives : 0", out)
+        self.assertIn("may be in a helper", out,
+                      "a zero count must carry the reason it is not a finding")
+
+    def test_a_loose_tolerance_is_flagged_in_the_evidence(self):
+        out = self.run_tq(self.newfile(
+            "op_tests/test_thing.py", "def test_alpha():",
+            "    torch.testing.assert_close(a, b, atol=0.5, rtol=0.01)"))
+        self.assertIn("0.5", out)
+        self.assertIn("loose", out)
+
+    def test_a_tight_tolerance_is_shown_without_a_note(self):
+        out = self.run_tq(self.newfile(
+            "op_tests/test_thing.py", "def test_a():",
+            "    assert_close(a, b, atol=1e-3, rtol=1e-3)"))
+        self.assertIn("tolerances", out)
+        self.assertNotIn("loose", out)
+
+    def test_toy_only_shapes_are_flagged(self):
+        out = self.run_tq(self.newfile(
+            "op_tests/test_thing.py", "def test_a():", "    M = 16", "    N = 8",
+            "    assert run(M, N)"))
+        self.assertIn("every shape is small", out)
+
+    def test_production_shapes_are_not_flagged(self):
+        out = self.run_tq(self.newfile(
+            "op_tests/test_thing.py", "def test_a():", "    M = 16", "    N = 8192",
+            "    assert run(M, N)"))
+        self.assertIn("shapes", out)
+        self.assertNotIn("every shape is small", out)
+
+    def test_step_1b_writes_the_artifact(self):
+        self.assertIn("testquality", FETCH.read_text())
+        self.assertIn("test_quality.txt", SKILL_MD.read_text())
+
+
+class TestTwinDetection(unittest.TestCase):
+    """Step 6's check 2 asks for mirrored code and left finding the mirror to the reader."""
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    BODY = [f"    some_substantive_line_number_{i} = compute(x, y, z, {i})" for i in range(60)]
+
+    def write(self, rel, lines):
+        p = self.root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("\n".join(lines) + "\n")
+
+    def twins(self, diff):
+        d = self.root / "d.diff"
+        d.write_text(diff)
+        r = subprocess.run([sys.executable, str(TRIAGE), "twins", str(d), str(self.root)],
+                           capture_output=True, text=True)
+        self.assertEqual(0, r.returncode, r.stderr)
+        return r.stdout
+
+    def newfile(self, path, lines):
+        return (f"diff --git a/{path} b/{path}\nnew file mode 100644\n"
+                f"--- /dev/null\n+++ b/{path}\n@@ -0,0 +1 @@\n"
+                + "".join(f"+{l}\n" for l in lines))
+
+    def test_a_copied_kernel_names_its_source(self):
+        self.write("aiter/ops/orig.py", self.BODY)
+        out = self.twins(self.newfile("aiter/ops/copy_v2.py", self.BODY))
+        self.assertIn("TWIN: aiter/ops/copy_v2.py", out)
+        self.assertIn("aiter/ops/orig.py", out)
+        self.assertIn("100%", out)
+
+    def test_an_unrelated_new_file_is_not_reported(self):
+        self.write("aiter/ops/orig.py", self.BODY)
+        other = [f"    entirely_different_content_{i} = other(a, b, c, {i})"
+                 for i in range(60)]
+        self.assertIn("no new file closely mirrors",
+                      self.twins(self.newfile("aiter/ops/fresh.py", other)))
+
+    def test_a_short_new_file_is_not_compared(self):
+        """Below 40 substantive lines the overlap is noise -- boilerplate imports and a
+        license header would match everything."""
+        self.write("aiter/ops/orig.py", self.BODY)
+        self.assertIn("no new file closely mirrors",
+                      self.twins(self.newfile("aiter/ops/tiny.py", self.BODY[:10])))
+
+    def test_a_modified_file_is_not_a_twin(self):
+        """Only `new file mode` counts; editing a file is not copying one."""
+        self.write("aiter/ops/orig.py", self.BODY)
+        edit = ("diff --git a/aiter/ops/orig.py b/aiter/ops/orig.py\n"
+                "--- a/aiter/ops/orig.py\n+++ b/aiter/ops/orig.py\n@@ -1 +1 @@\n"
+                + "".join(f"+{l}\n" for l in self.BODY))
+        self.assertIn("no new file closely mirrors", self.twins(edit))
+
+    def test_step_1b_writes_the_artifact(self):
+        self.assertIn("twins", FETCH.read_text())
+        self.assertIn("twins.txt", SKILL_MD.read_text())

@@ -42,6 +42,18 @@ Read the diff and PR body before proceeding.
 ### Step 1b — Derive the applicable rules, and collect the evidence they need
 
 
+**`$WORK/twins.txt` names the file each new file was copied from.** Step 6's check 2 asks
+for mirrored code and left finding the mirror to you; this does that part. The pair is not a
+finding — an arch-specific variant is the normal shape here — the finding is the
+*asymmetry*: one side int64 and the other int32, a mask on one side only, a flipped stride
+order, a bound the copy did not adapt. Diff the two before writing anything.
+
+**`$WORK/test_quality.txt` is what the added tests contain, not a verdict on them.**
+Assertion primitives, tolerances and shapes per test file. A count of zero means the added
+lines carry no check — it may still be in a helper the diff does not show, so read before
+firing. A tolerance at or above 1e-1, or every shape at 16 or below, is what P2 and Step 6's
+check 5 are asking about; the numbers are here so neither has to be answered from memory.
+
 **`$WORK/symbols.txt` is a rebase signal, not a hallucination finding.** Each
 `UNRESOLVED-IMPORT` line names a first-party import the PR adds that does not resolve
 against today's merge target. The import was very likely valid when it was written; the

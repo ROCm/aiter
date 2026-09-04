@@ -772,6 +772,19 @@ if grep -q "invariant-removed\|api-signature" "$WORK/rules.txt"; then
   fi
 fi
 
+# New files that are largely a copy of one already in the tree. Step 6 asks for the twin
+# and left finding it to the reader; 3% of open PRs add one at >=60% overlap. The pair is
+# evidence, not a finding -- an arch-specific variant is the normal shape, and the defect
+# is the asymmetry between them.
+"$SKILLS_ROOT/review-pr/triage.py" twins "$WORK/pr.diff" "$PROJECT_ROOT" \
+  | tee "$WORK/twins.txt"
+
+# What the tests this PR adds actually contain: how many assertion primitives, which
+# tolerances, which shapes. Not a verdict -- "this test asserts nothing" is undecidable
+# from a diff, because the check is often in a shared helper. P2 and Step 6's check 5 are
+# the judgement; this puts their evidence on screen instead of asking for a second look.
+"$SKILLS_ROOT/review-pr/triage.py" testquality "$WORK/pr.diff" | tee "$WORK/test_quality.txt"
+
 # Every first-party import the diff ADDS, resolved against the branch this PR merges
 # INTO -- fetched fresh, not the PR base and not whatever is on disk. A stale root
 # makes this check silently pass; that is the whole failure mode it exists to catch.
@@ -792,5 +805,5 @@ fi
 
 echo
 echo "WORK=$WORK"
-echo "artifacts: pr.diff pr_meta.json base_head.txt rules.txt rules_expanded.txt \
+echo "artifacts: pr.diff pr_meta.json base_head.txt rules.txt rules_expanded.txt test_quality.txt twins.txt \
 evidence.txt symbols.txt validation_requirement.json"
