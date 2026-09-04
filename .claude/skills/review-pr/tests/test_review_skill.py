@@ -2038,3 +2038,182 @@ class TestHardcodedLaunchKnob(unittest.TestCase):
     def test_a_commented_out_knob_does_not_fire(self):
         self.assertNotIn("hardcoded-launch-knob",
                          self.rules("aiter/ops/triton/x.py", "    # waves_per_eu=2,"))
+
+
+class TestCoreFileGate(unittest.TestCase):
+    """The fifth gate: Step 4 produced nothing, so it could be skipped in silence.
+
+    answers/diagnostic/ledger/card all pin a step to an artifact something else reads.
+    Step 4 -- the backbone risk assessment, the one step whose subject is the files where
+    being wrong costs every consumer -- was still prose, and prose is the failure mode the
+    other four gates exist to close.
+
+    What is checkable is not whether the risk was judged right. It is that every backbone
+    file in the diff was judged at all, and that the reason is about THIS PR rather than a
+    sentence equally true of every PR ever opened against that file."""
+
+    DIFF = (
+        "diff --git a/aiter/fused_moe.py b/aiter/fused_moe.py\n"
+        "--- a/aiter/fused_moe.py\n+++ b/aiter/fused_moe.py\n@@ -10,6 +10,7 @@\n"
+        "-    topk_weights = moe_sorting_fwd(a, b)\n"
+        "+    topk_weights = moe_sorting_fwd(a, b, num_local_experts)\n"
+        "diff --git a/aiter/__init__.py b/aiter/__init__.py\n"
+        "--- a/aiter/__init__.py\n+++ b/aiter/__init__.py\n@@ -3,0 +4 @@\n"
+        "+from .ops.gemm_op_a4w4 import *\n"
+        "diff --git a/op_tests/test_moe.py b/op_tests/test_moe.py\n"
+        "--- a/op_tests/test_moe.py\n+++ b/op_tests/test_moe.py\n@@ -1,0 +2 @@\n"
+        "+def test_num_local_experts(): pass\n")
+
+    GOOD = (
+        "aiter/fused_moe.py TIER2 COVERED -- num_local_experts is threaded through to "
+        "moe_sorting_fwd and op_tests/test_moe.py adds a DSv3 TP=8 decode case for it\n"
+        "aiter/__init__.py TIER1 GAP -- the new `from .ops.gemm_op_a4w4 import *` sits "
+        "above the rest of the block, so an ImportError inside it truncates the "
+        "namespace silently\n")
+
+    # A PR touching only a Tier 3 op wrapper: the gate must still demand an artifact, but
+    # must not demand a backbone line there is no backbone file for.
+    TIER3_DIFF = (
+        "diff --git a/aiter/ops/gemm_op_a4w4.py b/aiter/ops/gemm_op_a4w4.py\n"
+        "--- a/aiter/ops/gemm_op_a4w4.py\n+++ b/aiter/ops/gemm_op_a4w4.py\n@@ -1,0 +2 @@\n"
+        "+def gemm_a4w4_blockscale(x): pass\n")
+
+    def gate(self, text, diff=None, write=True):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            d = pathlib.Path(td)
+            if write:
+                (d / "core_files.txt").write_text(text)
+            (d / "d.diff").write_text(self.DIFF if diff is None else diff)
+            return subprocess.run(
+                [sys.executable, str(TRIAGE), "corefiles", str(d / "core_files.txt"),
+                 str(d / "d.diff")], capture_output=True, text=True)
+
+    def test_an_assessment_of_every_backbone_file_passes(self):
+        r = self.gate(self.GOOD)
+        self.assertEqual(0, r.returncode, r.stdout + r.stderr)
+        self.assertIn("CORE FILES ASSESSED: 2/2", r.stdout)
+
+    def test_a_missing_artifact_is_a_hard_failure(self):
+        """Not writing the file was the cheapest way past every gate that tolerated it."""
+        r = self.gate("", write=False)
+        self.assertEqual(1, r.returncode)
+        self.assertIn("CORE-FILES MISSING", r.stderr)
+
+    def test_an_empty_artifact_is_rejected(self):
+        r = self.gate("")
+        self.assertEqual(1, r.returncode)
+        self.assertIn("EMPTY", r.stdout)
+
+    def test_a_backbone_file_with_no_line_is_named(self):
+        r = self.gate(self.GOOD.split("\n")[0] + "\n")
+        self.assertEqual(1, r.returncode)
+        self.assertIn("UNASSESSED: aiter/__init__.py", r.stdout)
+
+    def test_a_reason_that_would_fit_any_pr_is_rejected(self):
+        """"core file, large blast radius, looks fine" is not an assessment of THIS diff:
+        it is a sentence about the file, and it is true whoever wrote the patch."""
+        r = self.gate(
+            "aiter/fused_moe.py TIER2 COVERED -- this is a core file with a large blast "
+            "radius, but the change looks fine to me\n"
+            "aiter/__init__.py TIER1 COVERED -- core import chain, seems fine overall and "
+            "nothing here looks broken\n")
+        self.assertEqual(1, r.returncode)
+        self.assertEqual(2, r.stdout.count("UNANCHORED"))
+
+    def test_a_reason_anchored_only_in_untouched_code_is_rejected(self):
+        """Citing a caller this PR does not change is legitimate *in addition* -- an
+        uncovered caller is exactly what a GAP looks like. What is not legitimate is a
+        reason whose only concrete referent is code the PR never touched: nothing in it
+        is evidence that this change was looked at."""
+        r = self.gate(
+            "aiter/fused_moe.py TIER2 COVERED -- callers in aiter/ops/shuffle.py and "
+            "aiter/ops/topk.py were checked and are unaffected by any of this\n"
+            "aiter/__init__.py TIER1 COVERED -- the import block in aiter/mha.py is "
+            "unrelated, so no truncation risk is introduced anywhere\n")
+        self.assertEqual(1, r.returncode)
+        self.assertEqual(2, r.stdout.count("UNANCHORED"))
+
+    def test_an_untouched_caller_alongside_a_real_anchor_passes(self):
+        """The inverse of the test above, and the reason the check is anchoring rather
+        than citation-banning: a GAP naming the uncovered caller must survive."""
+        r = self.gate(
+            "aiter/fused_moe.py TIER2 GAP -- num_local_experts changes moe_sorting_fwd's "
+            "arity and aiter/ops/shuffle.py calls it positionally, uncovered by any test\n"
+            "aiter/__init__.py TIER1 COVERED -- gemm_op_a4w4 is appended at the end of "
+            "the block with no try/except, so nothing below it can be truncated\n")
+        self.assertEqual(0, r.returncode, r.stdout + r.stderr)
+
+    def test_a_bare_verdict_with_no_reason_is_rejected(self):
+        r = self.gate(
+            "aiter/fused_moe.py TIER2 COVERED -- ok\n"
+            "aiter/__init__.py TIER1 COVERED -- fine\n")
+        self.assertEqual(1, r.returncode)
+        self.assertEqual(2, r.stdout.count("NO-EVIDENCE"))
+
+    def test_downgrading_a_tier_is_not_a_way_out(self):
+        """The tier decides which checks the reason has to answer, so the cheapest escape
+        from a Tier-2 assessment is to call the file Tier 3."""
+        r = self.gate(self.GOOD.replace("TIER2", "TIER3"))
+        self.assertEqual(1, r.returncode)
+        self.assertIn("TIER-MISMATCH: aiter/fused_moe.py", r.stdout)
+
+    def test_a_line_about_a_file_the_pr_does_not_change_is_rejected(self):
+        r = self.gate(self.GOOD +
+                      "aiter/mla.py TIER2 COVERED -- the mla decode path never calls "
+                      "moe_sorting_fwd, so num_local_experts cannot reach it\n")
+        self.assertEqual(1, r.returncode)
+        self.assertIn("UNTOUCHED-FILE: aiter/mla.py", r.stdout)
+
+    def test_a_malformed_line_is_not_silently_ignored(self):
+        r = self.gate("aiter/fused_moe.py is risky\n" + self.GOOD.split("\n", 1)[1])
+        self.assertEqual(1, r.returncode)
+        self.assertIn("MALFORMED", r.stdout)
+
+    def test_a_tier3_only_diff_may_declare_none(self):
+        r = self.gate("NONE -- no Tier 1/2 file here; only aiter/ops/gemm_op_a4w4.py, a "
+                      "single op wrapper\n", diff=self.TIER3_DIFF)
+        self.assertEqual(0, r.returncode, r.stdout + r.stderr)
+        self.assertIn("none in this diff, declared", r.stdout)
+
+    def test_declaring_none_over_a_backbone_diff_is_rejected(self):
+        """The one declaration that would let the whole step be skipped."""
+        r = self.gate("NONE -- nothing important changed here\n")
+        self.assertEqual(1, r.returncode)
+        self.assertIn("UNDECLARED-CORE", r.stdout)
+
+    def test_an_extra_line_for_a_tier3_file_in_the_diff_is_allowed(self):
+        """Q2/Q3 need judgement about a new file, so the reviewer may assess more than the
+        table knows. Only the table is demanded; extra lines are not punished."""
+        r = self.gate(self.GOOD +
+                      "op_tests/test_moe.py TIER3 COVERED -- adds test_num_local_experts, "
+                      "which exercises the new moe_sorting_fwd arity end to end\n")
+        self.assertEqual(0, r.returncode, r.stdout + r.stderr)
+
+    def test_a_missing_diff_fails_closed(self):
+        """Without the diff the backbone set is empty, and an empty backbone set would
+        accept any artifact at all -- including one written for a different PR."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            d = pathlib.Path(td)
+            (d / "core_files.txt").write_text(self.GOOD)
+            r = subprocess.run(
+                [sys.executable, str(TRIAGE), "corefiles", str(d / "core_files.txt"),
+                 str(d / "nope.diff")], capture_output=True, text=True)
+        self.assertEqual(1, r.returncode)
+        self.assertIn("CORE-FILES UNUSABLE", r.stderr)
+
+    def test_step_4_writes_an_artifact_and_step_8_gates_on_it(self):
+        body = SKILL_MD.read_text()
+        step4 = body[body.index("## Step 4"):body.index("## Step 5")]
+        self.assertIn("core_files.txt", step4,
+                      "Step 4 names no artifact, so it can be skipped in silence again")
+        step8 = body[body.index("## Step 8"):]
+        self.assertRegex(step8, r"triage\.py\"?\s+corefiles\b",
+                         "Step 8 does not run the corefiles gate")
+
+    def test_step_8_no_longer_calls_itself_three_gates(self):
+        """The count in the prose is the only thing telling a reader one is missing."""
+        step8 = SKILL_MD.read_text()
+        step8 = step8[step8.index("## Step 8"):]
+        self.assertNotIn("The three gates", step8)

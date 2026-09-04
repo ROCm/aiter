@@ -1333,6 +1333,125 @@ def pinned_struct_churn(diff_text, root):
 
 
 
+# ------------------------------------------------------------ core-file ledger
+# Step 4's backbone table, as data. Tier 1 is the two files whose failure mode is
+# `import aiter` itself; Tier 2 is the dispatch shared by more than one production model
+# family. Tier 3 (a single op wrapper, one kernel) is deliberately not required here --
+# a Tier-1 rule written to cover `aiter/ops/*.py` fires on 71% of PRs and the assessment
+# it mandates then stops being performed at all, which is the hole this gate exists to
+# close, not to reopen.
+TIER1 = ("aiter/jit/core.py", "aiter/__init__.py")
+TIER2 = tuple(p for p in TIER if p not in TIER1)
+
+CORE_LINE = re.compile(
+    r"^\s*([\w./+-]+)\s+TIER([123])\s+(COVERED|GAP|N/A)\s*(?:--|—|:)\s*(.+?)\s*$")
+MIN_CORE_REASON = 30
+# `\b` before a path fragment is useless (`/` is a non-word char), so anchors are matched
+# as substrings after normalising `./` -- the reason is prose, not a parseable field.
+ANCHOR_IDENT = re.compile(r"\b[a-z]+_[a-z_0-9]{2,}\b|\b[A-Z][A-Z0-9_]{3,}\b|"
+                          r"\b[a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]*\b")
+
+
+def core_files_in(diff_text):
+    """(path, tier) for every backbone file this diff touches, from the table only.
+
+    Q2/Q3 of Step 4 ("is this the dispatch for an op used by >1 model family") need
+    judgement about a new file and cannot be decided from a diff, so the reviewer may
+    add lines for files the table does not know. What a machine can decide is the
+    table, and the table is what it demands a line for."""
+    touched = changed_paths(diff_text)
+    out = []
+    for p in sorted(touched):
+        if p in TIER1:
+            out.append((p, "1"))
+        elif p in TIER2:
+            out.append((p, "2"))
+    return out
+
+
+def changed_tokens(diff_text):
+    """Identifier-shaped tokens on the added/deleted lines of this diff."""
+    body = "\n".join(l[1:] for l in diff_text.splitlines()
+                     if (l.startswith(("+", "-")) and not l.startswith(("+++", "---"))))
+    return set(ANCHOR_IDENT.findall(body))
+
+
+def audit_core_files(text, diff_text):
+    """Step 4 as an artifact: one adjudication per backbone file the diff touches.
+
+    Step 4 was the last step that produced nothing. It could be skipped in silence and
+    the review would read identically -- the same hole Step 2 had before answers.txt and
+    the rule pass had before the ledger, and the reason both of those exist.
+
+    What is checkable about a risk assessment is not whether the risk was judged right.
+    It is that every backbone file in the diff was judged at all, that the judgement
+    carries a reason, and that the reason is about THIS PR: a reason naming only the file
+    itself, or only code this PR never touched, is a sentence that would be equally true
+    of every other PR against that file, which is what "it is a core file, blast radius
+    is large" costs nothing to write."""
+    want = core_files_in(diff_text)
+    tier_of = dict(want)
+    touched = changed_paths(diff_text)
+    tokens = changed_tokens(diff_text)
+
+    declared_none = any(re.match(r"^\s*NONE\b", ln) for ln in text.splitlines())
+    seen, problems = {}, []
+    for ln in text.splitlines():
+        if not ln.strip() or ln.lstrip().startswith("#") or re.match(r"^\s*NONE\b", ln):
+            continue
+        m = CORE_LINE.match(ln)
+        if not m:
+            problems.append(("MALFORMED", ln.strip()[:70],
+                             "expected `<path> TIER<1|2|3> COVERED|GAP|N/A -- <reason>`"))
+            continue
+        path, tier, verdict, reason = m.groups()
+        base = path.lstrip("./")
+        if not any(t == base or t.endswith("/" + base) for t in touched):
+            problems.append(("UNTOUCHED-FILE", base,
+                             "assessed but absent from this diff -- a risk assessment of "
+                             "a file the PR does not change is a stale or invented line"))
+            continue
+        seen[base] = (tier, verdict, reason)
+        if base in tier_of and tier != tier_of[base]:
+            problems.append(("TIER-MISMATCH", base,
+                             f"recorded TIER{tier}; the backbone table puts it at "
+                             f"TIER{tier_of[base]} -- downgrading a tier is not a way "
+                             f"past the checks that tier requires"))
+        if len(reason) < MIN_CORE_REASON or SURFACE.match(reason):
+            problems.append(("NO-EVIDENCE", base,
+                             f"marked {verdict} with no reason -- what breaks, and what "
+                             f"in this PR makes you say it does not"))
+            continue
+        # The anchor: something in the reason has to come from this PR's own change.
+        # The file's own path does not count -- restating the subject is what a reason
+        # that would fit any PR against this file looks like.
+        anchored = any(t != base and (t in reason or t.rsplit("/", 1)[-1] in reason)
+                       for t in touched)
+        if not anchored:
+            anchored = any(tok in tokens for tok in ANCHOR_IDENT.findall(reason))
+        if not anchored:
+            problems.append(("UNANCHORED", base,
+                             "the reason names no file or symbol this PR changes -- it "
+                             "would read the same against any PR touching this file"))
+    for path, tier in want:
+        if path not in seen:
+            problems.append(("UNASSESSED", path,
+                             f"TIER{tier} backbone file in this diff with no assessment "
+                             f"line -- Step 4 was not performed for it"))
+    if declared_none and want:
+        problems.append(("UNDECLARED-CORE", ", ".join(p for p, _ in want)[:70],
+                         "declared NONE while the diff touches backbone files"))
+    if not text.strip():
+        problems.append(("EMPTY", "core_files.txt",
+                         "no assessment and no NONE declaration -- an empty artifact is "
+                         "a Step 4 that did not happen, not a Step 4 that found nothing"))
+    elif not want and not seen and not declared_none:
+        problems.append(("EMPTY", "core_files.txt",
+                         "no backbone file in this diff, and no `NONE -- <reason>` line "
+                         "saying so"))
+    return want, seen, problems
+
+
 # ----------------------------------------------------------------- card gate
 FINDING = re.compile(r"^\s*(\U0001F534|\u26A0\uFE0F?|\U0001F4DD)\s*(.+)$")
 VALUE = re.compile(r"\b\d+\b|fp8|fp16|bf16|fp4|int8|int32|int64|e4m3|e5m2|gfx\d+|"
@@ -1422,7 +1541,7 @@ if __name__ == "__main__":
     if mode not in ("rules", "evidence", "symbols", "ledger", "expand", "answers",
                         "mapping", "diagnostic", "testquality",
                         "twins", "citest", "perfclaims",
-                        "structabi", "commentonly", "card"):
+                        "structabi", "commentonly", "card", "corefiles"):
         print("usage: triage.py rules <diff> [title]\n"
               "       triage.py evidence <diff> <head-file>...\n"
               "       triage.py symbols <diff> <merge-target-root>\n"
@@ -1437,8 +1556,44 @@ if __name__ == "__main__":
               "       triage.py perfclaims <pr_meta.json>\n"
               "       triage.py structabi <diff> <root>\n"
               "       triage.py commentonly <diff>\n"
+              "       triage.py corefiles <core_files.txt> <diff>\n"
               "       triage.py card <card.md> <verdicts> <diagnostic> <answers> <diff>", file=sys.stderr)
         raise SystemExit(2)
+
+    if mode == "corefiles":
+        core_path = pathlib.Path(sys.argv[2]) if len(sys.argv) > 2 else None
+        if core_path is None or not core_path.is_file():
+            # Fail closed, like the card gate: not writing the file was the cheapest way
+            # past every gate that accepted its absence.
+            print(f"CORE-FILES MISSING: {core_path}. Step 4 writes its assessment there "
+                  f"before this gate runs", file=sys.stderr)
+            raise SystemExit(1)
+        try:
+            diff_text = open(sys.argv[3], errors="replace").read()
+        except (OSError, IndexError):
+            diff_text = ""
+        if not diff_text.strip():
+            print(f"CORE-FILES UNUSABLE: no diff read from "
+                  f"{sys.argv[3] if len(sys.argv) > 3 else '<missing>'}; without it the "
+                  f"backbone set cannot be computed", file=sys.stderr)
+            raise SystemExit(1)
+        want, seen, problems = audit_core_files(
+            core_path.read_text(errors="replace"), diff_text)
+        for kind, what, why in problems:
+            print(f"{kind}: {what}")
+            print(f"  {why}")
+        if problems:
+            print(f"CORE-FILE ASSESSMENT INCOMPLETE: {len(want) - sum(1 for p, _ in want if p not in seen)}"
+                  f"/{len(want)} backbone files assessed, {len(problems)} problem(s)",
+                  file=sys.stderr)
+            raise SystemExit(1)
+        if not want:
+            print(f"CORE FILES: none in this diff, declared")
+        else:
+            print(f"CORE FILES ASSESSED: {len(want)}/{len(want)} backbone files "
+                  f"({sum(1 for _, t in want if t == '1')} tier-1), "
+                  f"{sum(1 for v in seen.values() if v[1] == 'GAP')} gap(s)")
+        raise SystemExit(0)
 
     if mode == "card":
         def _read(i):

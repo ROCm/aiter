@@ -137,35 +137,49 @@ Step 4 assessment fires on 6% rather than on everything touching `aiter/ops/`.
 
 ## Step 4 — Core File Risk Assessment
 
+**Write one line per backbone file this diff touches into `$WORK/core_files.txt` — Step 8
+gates on it.** This step was prose only, so a review that skipped it was textually identical
+to one that performed it — the hole Step 2 had before `answers.txt`. Format:
+
+```
+<path> TIER1|TIER2|TIER3 COVERED|GAP|N/A -- <reason naming what THIS PR changed>
+aiter/fused_moe.py TIER2 COVERED -- num_local_experts is threaded through to moe_sorting_fwd and op_tests/test_moe.py adds a DSv3 TP=8 decode case for it
+aiter/__init__.py TIER1 GAP -- the new `from .ops.gemm_op_a4w4 import *` sits above the rest of the block, so an ImportError inside it truncates the namespace silently
+```
+
+`COVERED` = the blast radius below is exercised by this PR's tests or is unreachable from
+the change; `GAP` = it is not, and that goes on the card as a finding; `N/A` = the change
+cannot reach it at all (comment, docstring). Touching no Tier 1/2 file: write one
+`NONE -- <reason>` line naming the Tier 3 files it does touch.
+
+The gate rejects: a backbone file with no line (`UNASSESSED`); a tier recorded below the
+table's (`TIER-MISMATCH` — downgrading is not a way past the checks a tier requires); a
+formulaic or sub-30-character reason (`NO-EVIDENCE`); a reason naming no file or symbol
+this PR changes (`UNANCHORED` — "core file, large blast radius" is equally true of every
+PR ever opened against that file); a line about a file the diff does not contain
+(`UNTOUCHED-FILE`); `NONE` declared while a backbone file is present (`UNDECLARED-CORE`).
+A missing `core_files.txt` is a hard failure.
+
 **What makes a file "backbone"?** Apply these three questions to any file in the diff — including new files not in the table below.
 
 ```
-Q1 — Tier 1 test: If this file has a Python syntax error or fails to import,
-     does `import aiter` still succeed?
-     → NO  → Tier 1 (system-critical: aiter itself breaks)
-
-Q2 — Tier 2 test: Does this file contain the Python dispatch logic that
-     selects which kernel to run for an op class,
-     AND is that op used by >1 production model family (DSv3, Kimi, MiniMax…)?
+Q1 — If this file has a syntax error or fails to import, does `import aiter`
+     still succeed?  → NO → Tier 1 (system-critical: aiter itself breaks)
+Q2 — Does it hold the Python dispatch that selects which kernel runs for an op
+     class, AND is that op used by >1 production model family (DSv3, Kimi…)?
      → YES → Tier 2 (op-class critical: wrong result for ALL users of that op)
-
-Q3 — Tier 2 alt: Is this file the public aiter API for an op
-     (`from aiter import X` imports from here)?
+Q3 — Is it the public aiter API for an op (`from aiter import X` lands here)?
      → YES → Tier 2 (signature change silently breaks all consumers)
-
 Otherwise → Tier 3 (individual kernel or model-specific code).
 ```
 
-The table below is the current snapshot — use it to confirm, but Q1/Q2/Q3 to classify new files.
-
-Backbone files ranked by git commit frequency (2025–2026) and blast radius:
+The table is the snapshot the gate demands a line for; use Q1/Q2/Q3 on new files and add a
+line for any you judge Tier 1 or 2. Ranked by commit frequency (2025–2026), blast radius:
 
 | Tier | File | Git commits | Blast radius | Failure mode |
 |------|------|-------------|-------------|--------------|
 | **1** | `aiter/jit/core.py` | 182 | **ALL ops** — JIT compilation engine | Any import of aiter fails; zero ops load |
 | **1** | `aiter/__init__.py` | 52 | **ALL** vLLM/SGLang/ATOM users | `ImportError` or silent namespace truncation below broken import |
-| **1** | `aiter/jit/core.py`, `aiter/__init__.py` only | — | **ALL** ops / all consumers | `import aiter` itself fails |
-| **3** | `aiter/ops/*.py` (a single op's wrapper) | varies | Consumers of that one op | `AttributeError` at call time in downstream |
 | **2** | `aiter/fused_moe.py` | 119 | All MoE models (DeepSeek, Kimi, MiniMax) | Wrong expert routing, silent accuracy drop |
 | **2** | `aiter/ops/mha.py` | 89 | All MHA attention paths | Wrong attention output, crash |
 | **2** | `aiter/ops/attention.py` | 66 | MLA/paged attention dispatch | Wrong KV, accuracy drop |
@@ -174,17 +188,16 @@ Backbone files ranked by git commit frequency (2025–2026) and blast radius:
 | **2** | `aiter/tuned_gemm.py` | 52 | All GEMM-backed ops | `assert False` crash or silent fallback to slow path |
 | **2** | `aiter/ops/moe_op.py` | 51 | MoE op dispatch table | Wrong dispatch, wrong expert weights |
 | **2** | `aiter/ops/quant.py` | 49 | All quantization paths | Wrong scale, silent accuracy drop |
-| **3** | Individual kernel `.py`/`.cu` | — | Ops using that kernel | Depends on kernel type |
+| **3** | `aiter/ops/*.py` (a single op's wrapper), individual kernel `.py`/`.cu` | varies | Consumers of that one op | `AttributeError` at call time in downstream |
 
 **Why `aiter/ops/*.py` is Tier 3 and not Tier 1**: by the Q1 test it looks like Tier 1 —
 `__init__.py` does `from .ops.xxx import *`, so breaking any one of them breaks `import aiter`.
 But there are 200+ files under `aiter/ops/`, and putting every single-kernel wrapper in the
 same tier as `jit/core.py` empties the tier of meaning: measured over 597 open PRs, a Tier-1
-rule written that way fires on 71% of them and the mandatory full assessment stops being
-performed at all. A wrapper's real blast radius is its own op, which is Tier 3; what it does
-share with Tier 1 is the import-chain risk, and that is covered by the B6 export check
-`triage.py` attaches to the `ops-wrapper` family. Reserve Tier 1 for the two files
-whose failure mode is *every* op, not *one* op.
+rule written that way fires on 71% of them and the mandatory assessment stops being performed
+at all. A wrapper's real blast radius is its own op, which is Tier 3; the import-chain risk it
+does share with Tier 1 is covered by the B6 export check `triage.py` attaches to the
+`ops-wrapper` family. Reserve Tier 1 for the two files whose failure mode is *every* op.
 
 **`aiter/__init__.py` special rule**: The import block must NOT be wrapped in try/except.
 Any new import added here → check the imported module for bare `ImportError` paths that
@@ -194,18 +207,17 @@ could silently truncate the namespace.
 A syntax error, wrong default, or broken env-var handling here means zero aiter ops load.
 Changes here require e2e smoke test across all GPU arch targets.
 
-**Mandatory backbone checks — must be answered before writing the verdict:**
-
+**What the reason has to answer** — this is what makes a `COVERED` checkable.
 For **Tier 1** files (`jit/core.py`, `__init__.py` — these two only):
-- [ ] List every public symbol changed. Grep for all callers across aiter itself: `grep -rn '<symbol>' aiter/`. If a caller is not covered by the PR's test, flag it.
-- [ ] For `__init__.py`: does the new import have a bare `ImportError` path that could silently truncate the namespace?
-- [ ] For `jit/core.py`: is there an e2e smoke test that loads all kernels on gfx942 AND gfx950 after this change?
-- [ ] State explicitly: if this change is wrong, what breaks and how would it be detected? (all ops fail / one op family fails / silent wrong value)
+- Every public symbol changed, and its callers across aiter itself (`grep -rn '<symbol>' aiter/`). A caller not covered by the PR's test is a `GAP`.
+- For `__init__.py`: does the new import have a bare `ImportError` path that could silently truncate the namespace?
+- For `jit/core.py`: is there an e2e smoke test that loads all kernels on gfx942 AND gfx950 after this change?
+- If this change is wrong, what breaks and how would it be detected? (all ops fail / one op family fails / silent wrong value)
 
 For **Tier 2** files (fused_moe, mha, attention, gemm, mla, tuned_gemm, quant):
-- [ ] Which model families (DSv3, Kimi, MiniMax, GLM…) use this op? Is at least one from each family in the test?
-- [ ] Are production shapes tested? At minimum: decode (M=1, TP=4/TP=8) AND prefill (ISL=4096, TP=4/TP=8).
-- [ ] Does the change affect gfx942 only, gfx950 only, or both? If both, are both arch paths tested?
+- Which model families (DSv3, Kimi, MiniMax, GLM…) use this op? Is at least one from each family in the test?
+- Are production shapes tested? At minimum: decode (M=1, TP=4/TP=8) AND prefill (ISL=4096, TP=4/TP=8).
+- Does the change affect gfx942 only, gfx950 only, or both? If both, are both arch paths tested?
 
 **AI code red flag — verbatim duplication across backbone files:** Same algorithm copy-pasted into 2+ backbone files with only variable names changed. See D5.
 
@@ -331,8 +343,8 @@ what you looked for and did not find.
 
 ## Step 8 — Verdict
 
-**Before writing the card, run the ledger gate. A red gate means the rule pass did not
-happen; go back to Step 5 rather than reporting.**
+**Before writing the card, run the four gates below. A red gate means that step did not
+happen; go back to it rather than reporting.**
 
 ```bash
 "$SKILLS_ROOT/review-pr/triage.py" answers "$WORK/answers.txt" || {
@@ -343,13 +355,17 @@ happen; go back to Step 5 rather than reporting.**
   echo "Step 6 structural checks not recorded — the card must not be written yet" >&2
   exit 1
 }
+"$SKILLS_ROOT/review-pr/triage.py" corefiles "$WORK/core_files.txt" "$WORK/pr.diff" || {
+  echo "Step 4 not performed for every backbone file — the card must not be written yet" >&2
+  exit 1
+}
 "$SKILLS_ROOT/review-pr/triage.py" ledger "$WORK/rules.txt" "$WORK/verdicts.txt" \
   "$WORK/pr.diff" || {
   echo "rule pass incomplete — the card must not be written yet" >&2
   exit 1
 }
 
-# Then write the card to $WORK/card.md and run the last gate against it. The three gates
+# Then write the card to $WORK/card.md and run the last gate against it. The four gates
 # above check that the work happened; this one checks that the card reports THAT work.
 "$SKILLS_ROOT/review-pr/triage.py" card "$WORK/card.md" "$WORK/verdicts.txt" \
   "$WORK/ai_diagnostic.txt" "$WORK/answers.txt" "$WORK/pr.diff" || {
@@ -360,7 +376,11 @@ happen; go back to Step 5 rather than reporting.**
 
 The first names any of Step 2's five questions or Step 7.5's blind-spot question left
 unanswered (`UNANSWERED`) or answered with a formula rather than an answer
-(`NO-SUBSTANCE`). The second lists each derived rule with no verdict line (`UNADJUDICATED`), each verdict with no
+(`NO-SUBSTANCE`). The third names every Tier 1/2 backbone file in the diff with no
+assessment line (`UNASSESSED`), and every line whose reason is formulaic (`NO-EVIDENCE`)
+or anchored in nothing this PR changes (`UNANCHORED`); it computes the backbone set from
+the diff itself, so a missing or `NONE`-declaring artifact does not get past it. The
+fourth lists each derived rule with no verdict line (`UNADJUDICATED`), each verdict with no
 reason (`NO-EVIDENCE`), and each `FIRE` whose reason cites a file this PR does not change
 (`UNTOUCHED-CITATION`) — a defect claimed against untouched code is a stale or invented
 citation. `CLEAR` may cite anything: "E5 CLEAR: `aiter/__init__.py` unchanged" is correct
