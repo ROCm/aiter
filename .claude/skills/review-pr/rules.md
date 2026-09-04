@@ -214,8 +214,10 @@ Real example (aiter#3944): `arith.bitcast(val, ...)` inside a bf16/f16 output pa
 
 _"The layout is a contract with something that was compiled separately."_
 
-Trigger: a `struct`/`class` in `.h`/`.cuh`/`.cu` gains or loses a field, and the diff touches
-no `offsetof(` / `static_assert(sizeof(...))` line. aiter pins every kargs struct a
+Trigger: `$WORK/struct_abi.txt` names it — a `struct`/`class` whose fields this diff moves
+and which the tree pins with `offsetof(` / `static_assert(sizeof(...))`. Derived from the diff
+alone this fired on any field churn at all (aiter#5223: six headers, no assertion near them);
+whether a layout is pinned is a fact about the tree. aiter pins every kargs struct a
 hand-written code object reads — `csrc/py_itfs_cu/` carries 40 such assertions across 37
 files, and 6% of open PRs touch one.
 

@@ -42,6 +42,13 @@ Read the diff and PR body before proceeding.
 ### Step 1b — Derive the applicable rules, and collect the evidence they need
 
 
+**`$WORK/struct_abi.txt` names any struct whose layout something asserts and whose fields
+this PR moves.** aiter pins every kargs struct a hand-written code object reads. Inserting a
+field anywhere but the end shifts every offset after it; the assertions turn that into a
+compile error, and the fix is to rebuild the code objects and update the table, not to
+delete the assertion. A PR that updates the assertions in the same diff is the correct shape
+and is not reported.
+
 **`$WORK/perf_claims.txt` lists every number the description claims, and marks the ones
 that name no baseline.** P1 asks for the number with its units and its comparison; a line
 marked `->` has the number and not the comparison. A signed delta (`+8.64%`) and a table row

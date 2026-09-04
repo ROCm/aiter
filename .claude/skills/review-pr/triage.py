@@ -329,8 +329,6 @@ def derive(files, title="", raw_diff=""):
     if any(f["new"] and re.search(r"(_v\d+|_opt|_variant|_fast|_new)\.(py|cu|hip)$", p)
            for p, f in files.items()):
         hit("nth-variant", "HK5")
-    if struct_field_churn(raw_diff):
-        hit("struct-abi", "D11")
     if uncollectable_test_file(raw_diff):
         hit("uncollectable-test", "HK12b")
 
@@ -353,6 +351,9 @@ UNREACHABLE_BY_DESIGN = {
     # diff alone cannot answer. `triage.py citest` computes it in Step 1b and writes
     # ci_coverage.txt; deriving a rule id from the diff would be guessing.
     "HK12": "evidence-backed: triage.py citest writes ci_coverage.txt in Step 1b",
+    # Whether a struct's layout is pinned is a fact about the tree. Deriving D11 from the
+    # diff alone fired on aiter#5223, six headers with no assertion anywhere near them.
+    "D11": "evidence-backed: triage.py structabi writes struct_abi.txt in Step 1b",
 }
 
 ALL_RULES = ("A1 A2 A3 B1 B2 B3 B4 B5 B6 B7 C1 C2 C3 C4 D1 D1b D2 D3 D4 D5 D6 D7 D8 "
@@ -1038,9 +1039,12 @@ PERF_NUM = re.compile(r"(?<![A-Za-z0-9])(\d+(?:\.\d+)?)\s*"
                       r"(x\b|%|\bus\b|\b[mu]s\b|TFLOPS?\b|GB/s|tok/s)", re.I)
 HW_MODEL = re.compile(r"\b(MI\d+\w*|gfx\d+|CDNA\d*|RDNA\d*|fp\d+|bf\d+|int\d+|e\dm\d)",
                       re.I)
+# aiter PR descriptions are partly Chinese; an English-only word list marks a table that
+# does name its baseline as one that does not.
 BASELINE = re.compile(r"\bvs\.?\b|versus|baseline|\bbefore\b|\bafter\b|\bmain\b|torch|"
                       r"\bck\b|hipblas|current|previous|reference|speedup|faster|slower|"
-                      r"improv|regress|→|->", re.I)
+                      r"improv|regress|→|->|"
+                      r"对比|基线|之前|之后|原来|改进|提升|加速|优化前|优化后|提速", re.I)
 
 
 SHARE = re.compile(r"%\s*(of|prefill|decode|busy|utili|occupan|GPU time|end of|elements)"
@@ -1113,11 +1117,68 @@ def render_perf_claims(rows):
 
 
 
+def pinned_struct_churn(diff_text, root):
+    """Structs the diff changes that the TREE pins with an offsetof/sizeof assertion.
+
+    D11 originally fired on any struct field churn in C-like source, which over batch five
+    reported aiter#5223 -- six headers, no assertion anywhere near them. A layout change is
+    only a defect when something asserts the layout, and that fact lives in the tree, not
+    in the diff. This finds the struct names whose fields moved, then looks for an
+    assertion naming them."""
+    root = pathlib.Path(root)
+    changed = set()
+    for blk in re.split(r"(?m)^diff --git ", diff_text)[1:]:
+        head = blk.split("\n", 1)[0]
+        m = re.match(r"a/(\S+) b/(\S+)", head)
+        if not m or m.group(2).rsplit(".", 1)[-1] not in C_LIKE:
+            continue
+        scope = None
+        for ln in blk.split("\n"):
+            hh = re.match(r"@@ [^@]*@@\s*(.*)$", ln)
+            if hh:
+                sm = re.search(r"\b(?:struct|class)\s+(\w+)", hh.group(1))
+                scope = sm.group(1) if sm else None
+                continue
+            sm = re.search(r"\b(?:struct|class)\s+(\w+)[^;]*\{", ln[1:] if ln[:1] in "+- " else ln)
+            if sm:
+                scope = sm.group(1)
+            if not (scope and ln[:1] in "+-") or ln.startswith(("+++", "---")):
+                continue
+            body = ln[1:]
+            if NOT_A_FIELD.match(body) or "(" in body or body.strip().startswith("//"):
+                continue
+            if re.match(r"\s*(const\s+)?[\w:<>,\*&]+(\s+[\w:<>\*&]+)+"
+                        r"(\s*\[[^\]]*\])?\s*;\s*$", body):
+                changed.add(scope)
+    if not changed:
+        return []
+    if re.search(r"(?m)^[+-].*(offsetof\(|static_assert\(\s*sizeof)", diff_text):
+        return []                    # the PR updates the assertions: correct shape
+    out = []
+    for name in sorted(changed):
+        pat = re.compile(rf"(offsetof\(\s*{re.escape(name)}\b|"
+                         rf"static_assert\(\s*sizeof\(\s*{re.escape(name)}\s*\))")
+        for cand in root.rglob("*"):
+            if cand.suffix not in (".cu", ".cuh", ".h", ".hpp", ".cpp", ".cc"):
+                continue
+            try:
+                text = cand.read_text(errors="replace")
+            except OSError:
+                continue
+            hits = pat.findall(text)
+            if hits:
+                out.append((name, str(cand.relative_to(root)), len(hits)))
+                break
+    return out
+
+
+
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
     if mode not in ("rules", "evidence", "symbols", "ledger", "expand", "answers",
                         "mapping", "diagnostic", "testquality",
-                        "twins", "citest", "perfclaims"):
+                        "twins", "citest", "perfclaims",
+                        "structabi"):
         print("usage: triage.py rules <diff> [title]\n"
               "       triage.py evidence <diff> <head-file>...\n"
               "       triage.py symbols <diff> <merge-target-root>\n"
@@ -1129,8 +1190,23 @@ if __name__ == "__main__":
               "       triage.py testquality <diff>\n"
               "       triage.py twins <diff> <root>\n"
               "       triage.py citest <diff> <root>\n"
-              "       triage.py perfclaims <pr_meta.json>", file=sys.stderr)
+              "       triage.py perfclaims <pr_meta.json>\n"
+              "       triage.py structabi <diff> <root>", file=sys.stderr)
         raise SystemExit(2)
+
+    if mode == "structabi":
+        root = pathlib.Path(sys.argv[3] if len(sys.argv) > 3 else ".")
+        rows = pinned_struct_churn(open(sys.argv[2], errors="replace").read(), root)
+        if not rows:
+            print("no struct with a pinned layout changed shape")
+        for name, where, n in rows:
+            print(f"PINNED-LAYOUT: {name} gains or loses a field")
+            print(f"  {n} assertion(s) in {where} fix its size and field offsets, and this"
+                  f" diff changes none of them")
+            print(f"  appending at the end shifts nothing; inserting anywhere else shifts"
+                  f" every offset after it, and the code objects those assertions guard"
+                  f" must be rebuilt")
+        raise SystemExit(0)
 
     if mode == "perfclaims":
         import json as _json

@@ -1275,13 +1275,12 @@ class TestDiagnosticGate(unittest.TestCase):
                              f"Step 8 does not run the {mode} gate")
 
 
-class TestStructAbiRule(unittest.TestCase):
-    """D11, added after reviewing aiter#5220.
+class TestStructAbiEvidence(unittest.TestCase):
+    """D11, and the correction batch five forced on it.
 
-    The skill derived ten rules for that PR and none of them was about struct layout, so
-    the reviewer only reaches the defect by happening to read the file around the change.
-    aiter pins every kargs struct a hand-written code object reads: 40 assertions across
-    37 files in csrc/, touched by 6% of open PRs.
+    Derived from the diff alone -- "a field moved and no assertion line changed" -- it
+    fired on aiter#5223, six headers with no assertion anywhere near them. Whether a
+    layout is pinned is a fact about the tree, so the check reads the tree.
     """
 
     HUNK = ("diff --git a/csrc/include/k.h b/csrc/include/k.h\n"
@@ -1290,48 +1289,67 @@ class TestStructAbiRule(unittest.TestCase):
             "     int stride_qo_h;\n{added}"
             "     int stride_kv_page;\n")
 
-    def rules(self, diff):
+    def setUp(self):
         import tempfile
-        with tempfile.TemporaryDirectory() as td:
-            f = pathlib.Path(td) / "d.diff"
-            f.write_text(diff)
-            r = subprocess.run([sys.executable, str(TRIAGE), "rules", str(f), "x"],
-                               capture_output=True, text=True)
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self._tmp.name)
+        (self.root / "csrc").mkdir()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def pin(self, text):
+        (self.root / "csrc" / "k.cu").write_text(text)
+
+    def run_it(self, diff):
+        d = self.root / "d.diff"
+        d.write_text(diff)
+        r = subprocess.run([sys.executable, str(TRIAGE), "structabi", str(d),
+                            str(self.root)], capture_output=True, text=True)
         self.assertEqual(0, r.returncode, r.stderr)
         return r.stdout
 
-    def test_a_field_inserted_mid_struct_fires(self):
-        """The struct declaration is in the hunk header's scope context, not in the hunk
-        body -- which is the normal shape for adding a field to an existing struct."""
-        out = self.rules(self.HUNK.format(added="+    int stride_o_n;\n"))
-        self.assertIn("struct-abi", out)
-        self.assertIn("D11", out)
+    def test_a_pinned_struct_is_reported(self):
+        self.pin("static_assert(sizeof(pa_kargs) == 112);\n")
+        out = self.run_it(self.HUNK.format(added="+    int stride_o_n;\n"))
+        self.assertIn("PINNED-LAYOUT: pa_kargs", out)
+        self.assertIn("csrc/k.cu", out)
 
-    def test_a_removed_field_fires(self):
-        self.assertIn("struct-abi",
-                      self.rules(self.HUNK.format(added="-    int stride_o_n;\n")))
+    def test_an_offsetof_assertion_also_counts(self):
+        self.pin("PA_ABI(offsetof(pa_kargs, stride_kv_page) == 100);\n")
+        self.assertIn("PINNED-LAYOUT",
+                      self.run_it(self.HUNK.format(added="+    int stride_o_n;\n")))
 
-    def test_updating_the_assertions_in_the_same_diff_does_not_fire(self):
-        """A PR that shifts the layout and fixes the table is the correct shape. Firing on
-        it would train the reviewer to ignore the rule."""
+    def test_an_unpinned_struct_is_not_reported(self):
+        """aiter#5223: the field moved, nothing asserts the layout, nothing to say."""
+        self.pin("// no assertions here\n")
+        self.assertIn("no struct with a pinned layout",
+                      self.run_it(self.HUNK.format(added="+    int stride_o_n;\n")))
+
+    def test_an_assertion_for_a_different_struct_does_not_count(self):
+        self.pin("static_assert(sizeof(other_kargs) == 64);\n")
+        self.assertIn("no struct with a pinned layout",
+                      self.run_it(self.HUNK.format(added="+    int stride_o_n;\n")))
+
+    def test_updating_the_assertion_in_the_same_diff_clears_it(self):
+        self.pin("static_assert(sizeof(pa_kargs) == 112);\n")
         fixed = (self.HUNK.format(added="+    int stride_o_n;\n") +
                  "diff --git a/csrc/k.cu b/csrc/k.cu\n--- a/csrc/k.cu\n+++ b/csrc/k.cu\n"
                  "@@ -1 +1 @@\n-static_assert(sizeof(pa_kargs) == 112);\n"
                  "+static_assert(sizeof(pa_kargs) == 120);\n")
-        self.assertNotIn("struct-abi", self.rules(fixed))
+        self.assertIn("no struct with a pinned layout", self.run_it(fixed))
 
-    def test_control_flow_inside_a_struct_method_is_not_a_field(self):
-        """`break;` matched a naive "type name;" shape and fired on a PR that changed no
-        layout at all."""
+    def test_control_flow_is_not_a_field(self):
+        self.pin("static_assert(sizeof(Traits) == 8);\n")
         body = ("diff --git a/csrc/k.h b/csrc/k.h\n--- a/csrc/k.h\n+++ b/csrc/k.h\n"
                 "@@ -1,3 +1,4 @@ struct Traits\n     switch (x) {\n"
                 "+      break;\n     }\n")
-        self.assertNotIn("struct-abi", self.rules(body))
+        self.assertIn("no struct with a pinned layout", self.run_it(body))
 
-    def test_a_python_file_never_fires(self):
-        py = ("diff --git a/aiter/x.py b/aiter/x.py\n--- a/aiter/x.py\n+++ b/aiter/x.py\n"
-              "@@ -1,2 +1,3 @@ class Thing\n     a: int\n+    b: int\n     c: int\n")
-        self.assertNotIn("struct-abi", self.rules(py))
+    def test_step_1b_writes_the_artifact(self):
+        self.assertIn("structabi", FETCH.read_text())
+        self.assertIn("struct_abi.txt", SKILL_MD.read_text())
+
 
 
 class TestTestQuality(unittest.TestCase):
@@ -1655,6 +1673,20 @@ class TestPerfClaims(unittest.TestCase):
                 "| 1 | 35.76 | 27.00 | 1.32x |\n"
                 "| 2 | 41.61 | 31.30 | 1.33x |\n")
         self.assertNotIn("->", self.claims(body))
+
+    def test_a_chinese_before_after_header_counts_as_a_baseline(self):
+        """aiter PR descriptions are partly Chinese. An English-only word list marked
+        aiter#5043's table as unbaselined -- correctly, as it happens, since its header is
+        `场景 | 输入数据 | 时间 | TFLOPS` and names no comparison; but a table headed
+        `优化前 | 优化后 | 提速` does, and would have been marked too."""
+        body = ("| 场景 | 优化前 | 优化后 | 提速 |\n|---|---|---|---|\n"
+                "| non-causal | 3.0 ms | 2.348 ms | 1.28x |\n")
+        self.assertNotIn("->", self.claims(body))
+
+    def test_a_chinese_table_with_no_comparison_column_is_flagged(self):
+        body = ("| 场景 | 输入数据 | 时间 | TFLOPS |\n|---|---|---|---|\n"
+                "| non-causal | randn | 2.348 ms | 2341 |\n")
+        self.assertIn("->", self.claims(body))
 
     def test_a_share_of_time_is_not_a_speedup(self):
         """`33.07% of GPU time` says where the time goes. Asking what it is measured

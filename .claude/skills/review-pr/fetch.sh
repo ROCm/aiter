@@ -772,6 +772,13 @@ if grep -q "invariant-removed\|api-signature" "$WORK/rules.txt"; then
   fi
 fi
 
+# Structs whose layout the TREE pins with offsetof/sizeof assertions, and whose fields
+# this diff moves. Derived from the diff alone this fired on any struct field churn --
+# aiter#5223, six headers with no assertion near them. Whether a layout is pinned is a
+# fact about the tree.
+"$SKILLS_ROOT/review-pr/triage.py" structabi "$WORK/pr.diff" "$PROJECT_ROOT" \
+  | tee "$WORK/struct_abi.txt"
+
 # Numeric performance claims in the description, and which of them say what they are
 # measured against. Scoped to the description: kernel comments are full of `4x DS_READ`
 # and `num_tokens x 384 x 7168`, so reading claims out of code was 61% noise.
@@ -820,5 +827,5 @@ fi
 
 echo
 echo "WORK=$WORK"
-echo "artifacts: pr.diff pr_meta.json base_head.txt rules.txt rules_expanded.txt test_quality.txt twins.txt ci_coverage.txt perf_claims.txt \
+echo "artifacts: pr.diff pr_meta.json base_head.txt rules.txt rules_expanded.txt test_quality.txt twins.txt ci_coverage.txt perf_claims.txt struct_abi.txt \
 evidence.txt symbols.txt validation_requirement.json"

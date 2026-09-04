@@ -136,7 +136,7 @@
   "symbols": []
  },
  "4107": {
-  "rules": "  files=18  types=8  rules=14/52\n    [modified-kernel     ] A1 B2 D1 D8 P6\n    [ops-wrapper         ] B6\n    [api-signature       ] B6 E1 E5\n    [fp8-quant           ] C1 C2 D1\n    [invariant-removed   ] D4 B7\n    [memory-safety       ] B2 D1 G1\n    [alignment           ] B7 B2 D8\n    [struct-abi          ] D11\n",
+  "rules": "  files=18  types=7  rules=13/52\n    [modified-kernel     ] A1 B2 D1 D8 P6\n    [ops-wrapper         ] B6\n    [api-signature       ] B6 E1 E5\n    [fp8-quant           ] C1 C2 D1\n    [invariant-removed   ] D4 B7\n    [memory-safety       ] B2 D1 G1\n    [alignment           ] B7 B2 D8\n",
   "symbols": []
  },
  "4114": {
