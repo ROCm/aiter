@@ -5,7 +5,7 @@ Replaces Step 3's self-applied prose checklist. Emits only the matching rules so
 the model reads ~12 instead of all of them.  Conservative: when a type cannot be decided
 structurally it is INCLUDED, never dropped.
 """
-import re, sys, pathlib, collections
+import difflib, re, sys, pathlib, collections
 from collections import OrderedDict
 
 TIER = ("aiter/jit/core.py", "aiter/__init__.py", "aiter/fused_moe.py",
@@ -301,6 +301,123 @@ def render_untested_kernel(new):
            "or *_test.py anywhere in the tree; benchmark dirs and bench_* files were not",
            "counted. HK6 is the rule; this is its evidence."]
     out += ["  %s" % p for p in new]
+    return "\n".join(out)
+
+
+PYDEF = re.compile(r"^(\s*)def\s+(\w+)\s*\(")
+SIB_NOISE = re.compile(r"^\s*(from|import|def |@)")
+
+
+def _py_functions(text):
+    """[(name, body_lines)] -- each def's span runs to the next def at its indent or shallower."""
+    lines = text.splitlines()
+    starts = [(i, m.group(2), len(m.group(1)))
+              for i, l in enumerate(lines) for m in [PYDEF.match(l)] if m]
+    out = []
+    for k, (i, name, ind) in enumerate(starts):
+        end = len(lines)
+        for j, _, ind2 in starts[k + 1:]:
+            if ind2 <= ind:
+                end = j
+                break
+        out.append((name, lines[i + 1:end]))
+    return out
+
+
+def _variant_pair(a, b):
+    """True when two function names are variants: a shared stem, not the same name.
+
+    `_dynamic_per_tensor_quant_fp8_i8_kernel` and `_static_per_tensor_quant_fp8_i8_kernel`
+    share 30 characters; `_flydsl_stage1_wrapper` and `_adaptive_moe_sort` share nothing
+    that long. Without this the check fires on 23.3% of the corpus, mostly on helpers that
+    merely sit in the same file.
+
+    Deliberately not a list of variant suffixes. Adding one (_opt, _v2, _prefill, _decode,
+    ...) takes 18.0% to 10.8% and the 43 it drops are mostly real: kernel_unified_attention_2d
+    against _3d, three times over, and select_2d_config against select_3d_config. D9's rule
+    body records the same lesson from the other direction -- do not narrow it to a name list.
+    """
+    if not a or not b or a == b:
+        return False
+    m = difflib.SequenceMatcher(None, a, b).find_longest_match(0, len(a), 0, len(b))
+    return m.size >= 8
+
+
+def sibling_variants(diff_text, root):
+    """Lines this PR changed that a variant of the changed function still carries.
+
+    A1 asks whether the sibling kernel has the same bug and has never had an answer: twins
+    compares whole FILES, and A1's own example -- aiter#3841, a decode kernel fixed while
+    `_prefill_opt` beside it was not -- is two functions in ONE file. 18.0% of 600 open
+    PRs. Python only: every hit was, and splitting C bodies by brace depth is a heuristic
+    with nothing to show for it.
+
+    Evidence, not a finding. A variant legitimately diverges; what the reader is being
+    handed is the pair, so that judgement is made rather than skipped.
+    """
+    out = []
+    for path, blk in _diff_blocks(diff_text):
+        if not path.endswith(".py") or "new file mode" in blk:
+            continue
+        if re.search(r"^(op_tests|tests)/|bench|3rdparty", path):
+            continue
+        try:
+            funcs = _py_functions((pathlib.Path(root) / path).read_text(errors="replace"))
+        except OSError:
+            continue
+        if len(funcs) < 2:
+            continue
+        scope = ""
+        for ln in blk.split("\n"):
+            h = re.match(r"^@@ [^@]*@@\s*(.*)$", ln)
+            if h:
+                scope = h.group(1)
+                continue
+            if not ln.startswith("-") or ln.startswith("---"):
+                continue
+            s = ln[1:].strip()
+            if len(s) < 25 or TRIVIAL_LINE.match(ln[1:]) or SIB_NOISE.match(s):
+                continue
+            # a line that computes or decides something -- not a bare rebinding, and not
+            # a docstring's `x: [BLOCK_SIZE_M, BLOCK_SIZE_N], fp32`
+            if re.match(r"^\w+\s*=\s*[\w.\"\'()]+$", s) or re.match(r"^\w+\s*:\s*\[", s):
+                continue
+            if not re.search(r"[-+*/%<>]|\w\[|\)\s*\.|\bif\b|\breturn\b|=", s):
+                continue
+            fm = re.search(r"\b(\w+)\s*\(", scope)
+            changed = fm.group(1) if fm else None
+            for name, body in funcs:
+                if not _variant_pair(changed, name):
+                    continue
+                if any(x.strip() == s for x in body):
+                    out.append((path, changed, name, s[:70]))
+    seen, uniq = set(), []
+    for o in out:
+        if (o[0], o[2]) not in seen:
+            seen.add((o[0], o[2]))
+            uniq.append(o)
+    return uniq[:6]
+
+
+TRIVIAL_LINE = re.compile(r"^\s*[\}\{\)\(\];,\\]*\s*$|^\s*(#|//|\*)")
+
+
+def _diff_blocks(diff_text):
+    for blk in re.split(r"(?m)^diff --git ", diff_text)[1:]:
+        m = re.match(r"a/(\S+) b/(\S+)", blk.split("\n", 1)[0])
+        if m:
+            yield m.group(2), blk
+
+
+def render_siblings(rows):
+    if not rows:
+        return "SIBLINGS: no variant of a changed function still carries a changed line"
+    out = ["VARIANT SIBLING STILL CARRIES A CHANGED LINE -- %d pair(s). A1 is the rule;"
+           % len(rows),
+           "divergence can be correct, so this is the pair to judge, not a finding."]
+    for path, changed, sib, line in rows:
+        out.append("  %s: %s -> %s" % (path, changed, sib))
+        out.append("      %s" % line)
     return "\n".join(out)
 
 
@@ -1650,7 +1767,7 @@ if __name__ == "__main__":
                         "mapping", "diagnostic", "testquality",
                         "twins", "citest", "perfclaims",
                         "structabi", "commentonly", "card", "corefiles",
-                        "kerneltest"):
+                        "kerneltest", "siblings"):
         print("usage: triage.py rules <diff> [title]\n"
               "       triage.py evidence <diff> <head-file>...\n"
               "       triage.py symbols <diff> <merge-target-root>\n"
@@ -1667,9 +1784,13 @@ if __name__ == "__main__":
               "       triage.py commentonly <diff>\n"
               "       triage.py corefiles <core_files.txt> <diff>\n"
               "       triage.py kerneltest <diff>\n"
+              "       triage.py siblings <diff> <root>\n"
               "       triage.py card <card.md> <verdicts> <diagnostic> <answers> <diff>", file=sys.stderr)
         raise SystemExit(2)
 
+    if mode == "siblings":
+        print(render_siblings(sibling_variants(open(sys.argv[2]).read(), sys.argv[3])))
+        sys.exit(0)
     if mode == "kerneltest":
         print(render_untested_kernel(untested_new_kernel(open(sys.argv[2]).read())))
         sys.exit(0)

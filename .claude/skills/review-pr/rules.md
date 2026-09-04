@@ -11,18 +11,20 @@ _"Fixed one path; the same bug lives in a sibling."_
 Fix changes address calc, bounds check, type widening, or data layout in a CUDA/HIP kernel:
 scan the same file for variants named `_opt`, `_prefill`, `_decode`, `_prefill_opt`, `_v2`, `_fast`.
 Real example (PR#3841): strided q_nope OOB fix applied to decode kernel; `_prefill_opt` in the same file had the same bug unfixed.
-**No forensic backing, and one attempt at it was measured and dropped.** Deleted lines
-still present verbatim in an untouched file fires on 13.2% of 600 open PRs; requiring the
-line to carry an operation rather than be a declaration, a bare `for`, or a docstring
-brings it to 10.0%. Reading eight: roughly half are the shape A1 means (variant MoE ops
-sharing `A_scale.stride(0) if A_scale is not None ...`), and the rest are boilerplate a
-sibling shares for no reason at all -- a `for(int i = 0; i < 4; i++)`, a device guard, a
-`HEAD_DIMENSION_OPTIONS = [128]`. Narrowing removed two of four known-noise hits and cost
-one of three real ones, because a sibling needing the same fix and a sibling sharing
-boilerplate emit the identical evidence: the same line. Verbatim identity cannot separate
-them. A1's own example is same-FILE variants, so a detector scoped to sibling functions
-within the changed file is the direction that has not been tried -- and it needs its own
-measurement before it goes in.
+**Evidence:** `$WORK/siblings.txt` pairs the changed function with a variant of it in the
+same file that still carries a line this PR changed -- `_moe_gemm_a8w4_decode` against
+`_moe_gemm_a8w4_prefill`, `mla_decode_fwd` against `mla_v40_decode_fwd`,
+`kernel_unified_attention_2d` against `_3d`. 18.0% of 600 open PRs. A variant may
+legitimately diverge, so the pair is what is handed over, not a verdict.
+
+**What was tried first and dropped, so it is not retried:** the same idea across whole
+files -- a deleted line still present verbatim in a file this PR does not touch -- runs at
+13.2%, or 10.0% once the line must carry an operation. Half of eight read were real; the
+rest were boilerplate two files share for no reason (`for(int i = 0; i < 4; i++)`, a device
+guard, `HEAD_DIMENSION_OPTIONS = [128]`), and narrowing cost a real hit for every two noise
+hits it removed. Whole-file verbatim identity cannot separate a sibling that needs the same
+fix from one that shares boilerplate. Scoping to variant FUNCTIONS in the changed file is
+what made it work.
 → `⚠️ A1: same bug may exist in [variant] — check kernel family in this file`
 
 **Evidence:** `$WORK/kernel_tests.txt` lists new kernel files for which this PR adds no

@@ -2325,3 +2325,92 @@ class TestRecallDetectors(unittest.TestCase):
              "--- a/aiter/ops/triton/_triton_kernels/q.py\n"
              "+++ b/aiter/ops/triton/_triton_kernels/q.py\n@@ -1 +1,2 @@\n+    x = 1\n")
         self.assertNotIn("NO COLLECTIBLE TEST", self.run_triage("kerneltest", d))
+
+
+class TestSiblingVariants(unittest.TestCase):
+    """A1's evidence. The rule names the shape -- a decode kernel fixed while `_prefill_opt`
+    beside it was not -- and had no forensic answer for it, because twins compares whole
+    files and A1's own example is two functions in one.
+
+    The discriminator is the shared name stem. Without it any two functions in the same
+    file qualify and the check fires on 23.3% of the corpus, mostly on helpers that merely
+    sit together; with it, 18.0%. A list of variant suffixes in place of the stem gives a
+    tidier 10.8% and loses kernel_unified_attention_2d against _3d, which is the shape the
+    rule exists for -- the same failure D9's body records."""
+
+    FILE = '''
+def _dynamic_per_tensor_quant_fp8_i8_kernel(x_in_ptr, offs, mask):
+    x = tl.load(x_in_ptr + offs, mask=mask, cache_modifier=".cg")
+    return x * scale
+
+def _static_per_tensor_quant_fp8_i8_kernel(x_in_ptr, offs, mask):
+    x = tl.load(x_in_ptr + offs, mask=mask, cache_modifier=".cg")
+    return x
+
+def _unrelated_helper_name(a):
+    x = tl.load(x_in_ptr + offs, mask=mask, cache_modifier=".cg")
+    return a
+'''
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self._tmp.name)
+        (self.root / "aiter/ops/triton").mkdir(parents=True)
+        (self.root / "aiter/ops/triton/quant.py").write_text(self.FILE)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def diff(self, deleted, scope="def _dynamic_per_tensor_quant_fp8_i8_kernel(",
+             path="aiter/ops/triton/quant.py", new=False):
+        head = "diff --git a/%s b/%s\n" % (path, path)
+        if new:
+            head += "new file mode 100644\n"
+        return head + ("--- a/%s\n+++ b/%s\n@@ -1,4 +1,4 @@ %s\n-%s\n+    x = 0\n"
+                       % (path, path, scope, deleted))
+
+    def run_siblings(self, diff):
+        f = self.root / "pr.diff"
+        f.write_text(diff)
+        return subprocess.run([sys.executable, str(TRIAGE), "siblings", str(f), str(self.root)],
+                              capture_output=True, text=True).stdout
+
+    LINE = '    x = tl.load(x_in_ptr + offs, mask=mask, cache_modifier=".cg")'
+
+    def test_a_variant_still_carrying_the_changed_line_is_reported(self):
+        out = self.run_siblings(self.diff(self.LINE))
+        self.assertIn("_static_per_tensor_quant_fp8_i8_kernel", out)
+
+    def test_a_function_that_is_not_a_variant_is_not_a_sibling(self):
+        """It holds the identical line; it is not a variant of the changed function."""
+        out = self.run_siblings(self.diff(self.LINE))
+        self.assertNotIn("_unrelated_helper_name", out)
+
+    def test_a_new_file_has_no_siblings_to_diverge_from(self):
+        out = self.run_siblings(self.diff(self.LINE, new=True))
+        self.assertIn("no variant of a changed function", out)
+
+    def test_a_test_file_is_not_scanned(self):
+        (self.root / "op_tests").mkdir()
+        (self.root / "op_tests/test_q.py").write_text(self.FILE)
+        out = self.run_siblings(self.diff(self.LINE, path="op_tests/test_q.py"))
+        self.assertIn("no variant of a changed function", out)
+
+    def test_an_import_line_is_not_evidence(self):
+        line = "from aiter.ops.flydsl.moe_kernels import launch_moe_sorting"
+        (self.root / "aiter/ops/triton/quant.py").write_text(
+            self.FILE + "\ndef _static_per_tensor_quant_fp8_i8_kernel_v2(a):\n    %s\n" % line)
+        self.assertIn("no variant of a changed function", self.run_siblings(self.diff(line)))
+
+    def test_a_bare_rebinding_is_not_evidence(self):
+        """`dev = torch.device("cpu")` is shared because both variants need a device."""
+        line = '    dev = torch.device("cpu")'
+        (self.root / "aiter/ops/triton/quant.py").write_text(
+            self.FILE.replace('    return x\n', '    return x\n' + line + "\n"))
+        self.assertIn("no variant of a changed function", self.run_siblings(self.diff(line)))
+
+    def test_the_gate_is_silent_rather_than_loud_when_the_file_is_gone(self):
+        """The tree is the authority; a path it does not have yields nothing, not a crash."""
+        out = self.run_siblings(self.diff(self.LINE, path="aiter/ops/triton/absent.py"))
+        self.assertIn("no variant of a changed function", out)
+
