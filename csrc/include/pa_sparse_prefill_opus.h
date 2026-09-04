@@ -129,6 +129,10 @@ struct pa_sparse_prefill_kargs
     int total_tokens;
     int stride_qo_n;
     int stride_qo_h;
+    // Output strides, taken from the out tensor; q and out may have different
+    // layouts (e.g. a strided q view with a contiguous out).
+    int stride_o_n;
+    int stride_o_h;
     int stride_kv_page;
     float softmax_scale;
 };
@@ -1618,6 +1622,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
 
     const int h_block_start = h_block_idx * T::NUM_WARPS * T::Q_TILE_SIZE;
     const int64_t qo_gmem_offset = static_cast<int64_t>(q_token_idx) * kargs.stride_qo_n + static_cast<int64_t>(h_block_start) * kargs.stride_qo_h;
+    const int64_t o_gmem_offset  = static_cast<int64_t>(q_token_idx) * kargs.stride_o_n + static_cast<int64_t>(h_block_start) * kargs.stride_o_h;
 
     __shared__ char smem_kv_buf[T::smem_size_bytes()];
 
@@ -1686,12 +1691,12 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
     D_ACC o_scale = (l_final > D_ACC(0.0f)) ? (alpha / l_final) : D_ACC(0.0f);
     scale_output_tile<T>(v_o, o_scale);
 
-    auto g_o = make_gmem(reinterpret_cast<D_ATTN*>(kargs.out_ptr) + qo_gmem_offset, (kargs.H - h_block_start) * kargs.stride_qo_h * sizeof(D_ATTN));
+    auto g_o = make_gmem(reinterpret_cast<D_ATTN*>(kargs.out_ptr) + o_gmem_offset, (kargs.H - h_block_start) * kargs.stride_o_h * sizeof(D_ATTN));
     // Recompute lane/warp decomposition to prevent CSE with Q-load layout
     int lane_id_o = thread_id_x() % T::WARP_SIZE;
     asm volatile("" : "+v"(lane_id_o));
     int warp_id_o = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
-    auto u_o = make_layout_o<T>(warp_id_o, lane_id_o, kargs.stride_qo_h);
+    auto u_o = make_layout_o<T>(warp_id_o, lane_id_o, kargs.stride_o_h);
     auto v_o_attn = cast<D_ATTN>(v_o);
     store<T::VEC_O>(g_o, v_o_attn, u_o);
 }
@@ -2115,6 +2120,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
 
     const int h_block_start = h_block_idx * T::T_M * T::Q_TILE_SIZE;
     const int64_t qo_gmem_offset = static_cast<int64_t>(q_token_idx) * kargs.stride_qo_n + static_cast<int64_t>(h_block_start) * kargs.stride_qo_h;
+    const int64_t o_gmem_offset  = static_cast<int64_t>(q_token_idx) * kargs.stride_o_n + static_cast<int64_t>(h_block_start) * kargs.stride_o_h;
 
     __shared__ char smem_kv[T::smem_kv_tile_elems * sizeof(D_ATTN)]; // for KV tiles
     __shared__ char smem_ml[2 * T::T_N * T::W_M * sizeof(D_ACC)];  // for inter-warp reduction
@@ -2169,9 +2175,9 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
     D_ACC o_scale = (l_final > D_ACC(0.0f)) ? (alpha / l_final) : D_ACC(0.0f);
     scale_output_tile<T>(v_o, o_scale);
 
-    auto g_o = make_gmem(reinterpret_cast<D_ATTN*>(kargs.out_ptr) + qo_gmem_offset, (kargs.H - h_block_start) * kargs.stride_qo_h * sizeof(D_ATTN));
+    auto g_o = make_gmem(reinterpret_cast<D_ATTN*>(kargs.out_ptr) + o_gmem_offset, (kargs.H - h_block_start) * kargs.stride_o_h * sizeof(D_ATTN));
     int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
-    auto u_o = make_layout_o<T>(warp_id, lane_id, kargs.stride_qo_h);
+    auto u_o = make_layout_o<T>(warp_id, lane_id, kargs.stride_o_h);
     auto v_o_attn = cast<D_ATTN>(v_o);
     store<T::VEC_O>(g_o, v_o_attn, u_o);
 }
