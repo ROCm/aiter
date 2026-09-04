@@ -369,13 +369,16 @@ a run whose Step 1b never happened, so it exits non-zero rather than waving the 
 The gate checks that each rule was answered, not that the answer is right — it closes the
 cheapest failure, which is not answering.
 
-The card gate asks one question per finding: **is this nailed down?** A review can
-adjudicate every rule honestly and still write a finding that came from none of them; the
-card was the one artifact nothing read. It rejects a finding citing a file the PR does not
-change, one whose rule no verdict marked `FIRE`, and a 🔴 that names neither a value nor two
-code identifiers — the red threshold above, finally enforced. Naming the expressions counts;
-"the reduce kernel looks racy" does not. Whether a finding is *correct* is not checked, and
-is what a human reads the card for.
+The card gate asks one question per finding: **is this nailed down?** It runs in both
+directions. Nothing on the card may be untraceable: not a file the PR does not change, not a
+rule no verdict marked `FIRE`, not a 🔴 naming neither a value nor two code identifiers — the
+red threshold above, finally enforced. And nothing adjudicated `FIRE` may quietly not reach
+the card: report it, change the verdict, or write `-- not reported: <reason>` on the verdict
+line. The 5-finding cap is a real reason; leaving it out silently is not one.
+
+Write the card to `$WORK/card.md` before running the gate — a missing file is a hard
+failure, because not writing it was the cheapest way past this check. Whether a finding is
+*correct* is not checked, and is what a human reads the card for.
 
 **Output rules (strictly enforced):**
 - Run Steps 1–7 internally. Do NOT narrate steps, do NOT show checklists, do NOT show which rules fired.

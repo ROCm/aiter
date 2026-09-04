@@ -1317,6 +1317,16 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
     Three things are checkable, and only three. Whether a finding is CORRECT is not one
     of them -- that is what a human reads the card for."""
     touched = set(re.findall(r"^diff --git a/\S+ b/(\S+)", diff_text, re.M))
+    # Every FIRE has to reach the card. Checking only that findings trace back to work
+    # left the inverse open: a review can adjudicate nine rules FIRE, report none of
+    # them, and pass. FIRE means it goes in the card; if it is not going in, the verdict
+    # is not FIRE, and saying so is a one-word edit to the ledger. The escape is
+    # deliberate and must be written down: `-- not reported: <reason>` on the verdict.
+    fired = {}
+    for ln in (verdicts_text or "").splitlines():
+        m = re.match(r"\s*([A-Z]+\d+[a-z]?)\s+FIRE\b\s*(?:--|—|:)\s*(.*)$", ln)
+        if m and "not reported:" not in m.group(2).lower():
+            fired[m.group(1)] = m.group(2)[:60]
     backing = (verdicts_text or "") + "\n" + (diagnostic_text or "") + "\n" + (answers_text or "")
     problems = []
     findings = []
@@ -1324,6 +1334,16 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
         m = FINDING.match(line.strip())
         if m:
             findings.append((m.group(1), m.group(2).strip()))
+    reported = set()
+    for _, text in findings:
+        rid = re.match(r"([A-Z]+\d+[a-z]?):", text)
+        if rid:
+            reported.add(rid.group(1))
+    for rule, why in sorted(fired.items()):
+        if rule not in reported:
+            problems.append(("UNREPORTED-FIRE", f"{rule}: {why}",
+                             "adjudicated FIRE and absent from the card -- report it, or "
+                             "change the verdict, or append `-- not reported: <reason>`"))
     for sev, text in findings:
         red = sev.startswith("\U0001F534")
         cited = [p for p in re.findall(
@@ -1381,20 +1401,32 @@ if __name__ == "__main__":
                 return open(sys.argv[i], errors="replace").read()
             except (OSError, IndexError):
                 return ""
+        card_path = pathlib.Path(sys.argv[2]) if len(sys.argv) > 2 else None
+        if card_path is None or not card_path.is_file():
+            print(f"CARD MISSING: {card_path}. Write the card there before the gate runs "
+                  f"-- not writing it was the cheapest way past this check",
+                  file=sys.stderr)
+            raise SystemExit(1)
         findings, problems = audit_card(_read(2), _read(3), _read(4), _read(5), _read(6))
-        if not findings:
-            print("CARD: no findings to check")
+        if not findings and not problems:
+            print("CARD: no findings, and no verdict fired")
             raise SystemExit(0)
         for kind, text, why in problems:
             print(f"{kind}: {text}")
             print(f"  {why}")
         if problems:
-            bad = len({t for _, t, _ in problems})
-            print(f"CARD NOT NAILED DOWN: {bad} of {len(findings)} findings raise "
-                  f"{len(problems)} problem(s)", file=sys.stderr)
+            unreported = sum(1 for k, _, _ in problems if k == "UNREPORTED-FIRE")
+            about_findings = len({t for k, t, _ in problems if k != "UNREPORTED-FIRE"})
+            parts = []
+            if about_findings:
+                parts.append(f"{about_findings} of {len(findings)} findings cannot be "
+                             f"traced")
+            if unreported:
+                parts.append(f"{unreported} verdict(s) fired and are not on the card")
+            print("CARD NOT NAILED DOWN: " + "; ".join(parts), file=sys.stderr)
             raise SystemExit(1)
         print(f"CARD NAILED DOWN: {len(findings)} findings, each traced to an "
-              f"adjudication and anchored in a changed file")
+              f"adjudication and anchored in a changed file; every FIRE accounted for")
         raise SystemExit(0)
 
     if mode == "commentonly":

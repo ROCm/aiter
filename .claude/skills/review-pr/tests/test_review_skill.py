@@ -1841,24 +1841,25 @@ class TestCardGate(unittest.TestCase):
     VERDICTS = ("G1 FIRE -- aiter/mla.py:120 hands the buffer across streams\n"
                 "G1b CLEAR -- nothing is captured into a cudagraph here\n")
 
-    def gate(self, card, verdicts=None):
+    def gate(self, card, verdicts=None, blind=None):
         import tempfile
         with tempfile.TemporaryDirectory() as td:
             d = pathlib.Path(td)
             (d / "card.md").write_text(card)
             (d / "v.txt").write_text(self.VERDICTS if verdicts is None else verdicts)
             (d / "diag.txt").write_text("1: symbols.txt clean\n")
-            (d / "ans.txt").write_text("BLIND: nothing further found\n")
+            (d / "ans.txt").write_text(blind or "BLIND: nothing further found\n")
             (d / "d.diff").write_text(self.DIFF)
             return subprocess.run(
                 [sys.executable, str(TRIAGE), "card", str(d / "card.md"), str(d / "v.txt"),
                  str(d / "diag.txt"), str(d / "ans.txt"), str(d / "d.diff")],
                 capture_output=True, text=True)
 
-    def test_a_card_with_no_findings_passes(self):
-        r = self.gate("Review (advisory): NO FINDINGS\n")
+    def test_a_card_with_no_findings_and_no_fired_verdict_passes(self):
+        r = self.gate("Review (advisory): NO FINDINGS\n",
+                      verdicts="G1 CLEAR -- no cross-stream handoff in this diff\n")
         self.assertEqual(0, r.returncode, r.stdout + r.stderr)
-        self.assertIn("no findings to check", r.stdout)
+        self.assertIn("no verdict fired", r.stdout)
 
     def test_a_backed_anchored_concrete_finding_passes(self):
         r = self.gate("\U0001F534 G1: aiter/mla.py:120 hands the indptr buffer to another "
@@ -1894,8 +1895,60 @@ class TestCardGate(unittest.TestCase):
         self.assertEqual(0, r.returncode, r.stdout + r.stderr)
 
     def test_a_note_is_not_held_to_the_red_threshold(self):
-        r = self.gate("\U0001F4DD aiter/mla.py could use a comment here\n")
+        """A note names no value and no identifiers and that is fine; only red carries
+        the threshold. Verdicts with nothing fired, so the note stands alone."""
+        r = self.gate("\U0001F4DD aiter/mla.py could use a comment here\n",
+                      verdicts="G1 CLEAR -- no cross-stream handoff in this diff\n",
+                      blind="BLIND: nothing beyond a readability point in aiter/mla.py\n")
         self.assertEqual(0, r.returncode, r.stdout + r.stderr)
+
+    def test_a_note_from_nowhere_is_still_rejected(self):
+        """A free-form finding has to come from somewhere recorded -- Step 7.5 is where
+        "things Steps 1-7 did not catch" is written down. A note citing a file that
+        appears in no verdict, diagnostic or blind-spot line came from nowhere."""
+        r = self.gate("\U0001F4DD aiter/mla.py could use a comment here\n",
+                      verdicts="G1 CLEAR -- no cross-stream handoff in this diff\n")
+        self.assertEqual(1, r.returncode)
+        self.assertIn("UNBACKED-FINDING", r.stdout)
+
+    def test_a_missing_card_file_fails_closed(self):
+        """Not writing the card was the cheapest way past the gate: a missing file read
+        as an empty card, which read as no findings, which passed."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            d = pathlib.Path(td)
+            (d / "v.txt").write_text(self.VERDICTS)
+            (d / "d.diff").write_text(self.DIFF)
+            r = subprocess.run(
+                [sys.executable, str(TRIAGE), "card", str(d / "absent.md"),
+                 str(d / "v.txt"), str(d / "v.txt"), str(d / "v.txt"), str(d / "d.diff")],
+                capture_output=True, text=True)
+        self.assertEqual(1, r.returncode)
+        self.assertIn("CARD MISSING", r.stderr)
+
+    def test_a_fired_verdict_absent_from_the_card_is_rejected(self):
+        """The inverse of the trace check, and the one that was open: a review can
+        adjudicate nine rules FIRE, report none of them, and pass. FIRE means it goes in
+        the card."""
+        r = self.gate("Review (advisory): NO FINDINGS\n")
+        self.assertEqual(1, r.returncode)
+        self.assertIn("UNREPORTED-FIRE", r.stdout)
+        self.assertIn("G1", r.stdout)
+
+    def test_a_fire_withdrawn_in_writing_is_accepted(self):
+        """The 5-finding cap is real, so there has to be an escape -- and it has to be
+        written down rather than silent."""
+        withdrawn = ("G1 FIRE -- aiter/mla.py:120 hands the buffer across streams "
+                     "-- not reported: below the cap, lower blast radius than T6\n"
+                     "G1b CLEAR -- nothing is captured into a cudagraph here\n")
+        r = self.gate("Review (advisory): NO FINDINGS\n", verdicts=withdrawn)
+        self.assertEqual(0, r.returncode, r.stdout + r.stderr)
+
+    def test_a_card_reporting_its_fire_passes(self):
+        r = self.gate("\u26A0\uFE0F G1: aiter/mla.py:120 hands the indptr buffer to "
+                      "another stream with no record_event at 16384 tokens\n")
+        self.assertEqual(0, r.returncode, r.stdout + r.stderr)
+        self.assertIn("every FIRE accounted for", r.stdout)
 
     def test_step_8_runs_the_card_gate(self):
         body = SKILL_MD.read_text()
