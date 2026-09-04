@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Real git for everything local; a hard, instant failure for anything that would leave the
+# machine. fetch.sh reaches the network only through `git fetch <https URL> ...`, and both
+# of those calls are already written to tolerate failure -- so failing them here exercises
+# the same path an offline reviewer gets, without waiting on DNS.
+for a in "$@"; do
+  case "$a" in
+    https://*|http://*|git@*) exit 1 ;;
+  esac
+done
+exec "${REVIEW_TEST_REAL_GIT:-/usr/bin/git}" "$@"

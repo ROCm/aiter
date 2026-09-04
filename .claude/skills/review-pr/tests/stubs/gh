@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+"""Stand-in for the `gh` CLI, so fetch.sh's guards can be executed without a GitHub round trip.
+
+Every response comes from files in $GH_STUB_DIR, which the test writes per scenario. Any
+call this does not recognise is a hard error rather than an empty success: a silent empty
+answer is exactly the failure mode fetch.sh's guards exist to catch, and a stub that
+produced one would hide the guard under test.
+"""
+import os
+import pathlib
+import sys
+
+argv = sys.argv[1:]
+d = pathlib.Path(os.environ["GH_STUB_DIR"])
+with (d / "calls.log").open("a") as log:
+    log.write(" ".join(argv) + "\n")
+
+
+def emit(name, default=None):
+    p = d / name
+    if p.exists():
+        sys.stdout.write(p.read_text())
+        return 0
+    if default is not None:
+        sys.stdout.write(default)
+        return 0
+    sys.stderr.write(f"gh stub: scenario provides no {name}\n")
+    return 1
+
+
+rc = 1
+if argv[:2] == ["pr", "view"]:
+    rc = emit("pr_meta.json")
+elif argv[:2] == ["pr", "diff"]:
+    rc = emit("pr.diff")
+elif argv[:2] == ["issue", "view"]:
+    rc = emit("pr_issue.json", '{"title":"","body":""}')
+elif argv[:1] == ["api"] and "/branches/" in argv[1]:
+    rc = emit("base_sha.txt")
+elif argv[:1] == ["api"] and argv[1].endswith("/comments"):
+    rc = emit("comments.json", "[]\n")
+else:
+    sys.stderr.write(f"gh stub: unhandled invocation {argv!r}\n")
+sys.exit(rc)
