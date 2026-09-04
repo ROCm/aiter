@@ -527,6 +527,96 @@ def get_inter_dim(w1_shape, w2_shape):
     return E, model_dim, inter_dim
 
 
+def _bound_split(M, bound, below, at_or_above):
+    """`below if M < bound else at_or_above`, deferring when M is unknown."""
+    if M is not None:
+        return below if M < bound else at_or_above
+    # M >= 0, so a non-positive bound settles the branch without it.
+    return at_or_above if bound <= 0 else None
+
+
+def resolve_activation_dtype(
+    quant_type: QuantType | int,
+    q_dtype_w: torch.dtype,
+    *,
+    activation: ActivationType | int = ActivationType.Silu,
+    gate_mode: GateMode | str = GateMode.SEPARATED,
+    M: int | None = None,
+    hidden_dtype: torch.dtype | None = None,
+    has_a1_scale: bool = False,
+    gfx: str | None = None,
+) -> torch.dtype | None:
+    """The activation dtype fused_moe() quantizes its input to.
+
+    Lets a caller that produces the activations itself -- an all-to-all
+    dispatch, a fused epilogue -- emit that dtype directly rather than one
+    fused_moe() converts.
+
+    `M` is the token count. Omit it when the dtype has to be chosen before any
+    token exists: the result is then None wherever the answer would have needed
+    M, and the caller should fall back to bf16, which fused_moe() accepts from
+    any path.
+
+    `q_dtype_w` is `w1.dtype`; `hidden_dtype` / `has_a1_scale` only matter for
+    the per_1x128 fp8 passthrough.
+    """
+    quant_type = QuantType(quant_type)
+    quant_type = quant_remap.get(quant_type, quant_type)
+    activation = ActivationType(activation)
+    gate_mode = GateMode(gate_mode)
+    gfx = get_gfx() if gfx is None else gfx
+
+    q_dtype_a = q_dtype_w if q_dtype_w != torch.uint32 else dtypes.fp8
+    # If input is already FP8-quantized (e.g. from FP8 dispatch) with block scale,
+    # use FP8 as activation dtype to skip redundant re-quantization
+    if (
+        quant_type == QuantType.per_1x128
+        and hidden_dtype == dtypes.fp8
+        and has_a1_scale
+    ):
+        q_dtype_a = dtypes.fp8
+    bf16_fp8_bound = int(os.environ.get("AITER_BF16_FP8_MOE_BOUND", "256"))
+    if quant_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
+        # a16wi4: bf16 activations, int4 weights with groupwise scale
+        q_dtype_a = dtypes.bf16
+    elif quant_type == QuantType.per_1x32 and q_dtype_w == dtypes.fp8:
+        # mxfp8: both activation and weight are fp8 (per-1x32 e8m0 microscale).
+        q_dtype_a = dtypes.fp8
+    elif quant_type == QuantType.per_1x32:
+        if activation == ActivationType.Situv2:
+            # SiTUv2 defaults to a16w4 (bf16 activation x mxfp4 weight) on the
+            # mixed_moe kernels. AITER_SITUV2_A8W4 / AITER_SITUV2_A4W4 select the
+            # fp8 / fp4 activation instead; each has its own tuned config
+            # (kimik3_{a8w4,a4w4}_tuned_fmoe.csv). Tested before the INTERLEAVE
+            # branch below, which would otherwise claim SiTUv2 and pick the
+            # activation dtype itself.
+            if os.environ.get("AITER_SITUV2_A8W4", "0") == "1":
+                q_dtype_a = dtypes.fp8
+            elif os.environ.get("AITER_SITUV2_A4W4", "0") == "1":
+                q_dtype_a = dtypes.fp4x2
+            else:
+                q_dtype_a = dtypes.bf16
+        elif activation == ActivationType.Swiglu and gate_mode == GateMode.SEPARATED:
+            q_dtype_a = _bound_split(
+                M, _SWIGLU_MXFP4_BF16_BOUND, dtypes.bf16, dtypes.fp4x2
+            )
+        elif activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE:
+            if gfx != "gfx950":
+                q_dtype_a = dtypes.bf16
+            else:
+                q_dtype_a = _bound_split(M, bf16_fp8_bound, dtypes.bf16, dtypes.fp8)
+        else:
+            q_dtype_a = dtypes.fp4x2
+
+    if gfx == "gfx1250":
+        if os.environ.get("AITER_FORCE_A8W4", "0") in ("1"):
+            q_dtype_a = dtypes.fp8
+        else:
+            q_dtype_a = dtypes.fp4x2
+
+    return q_dtype_a
+
+
 def fused_moe(
     hidden_states,
     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -866,51 +956,15 @@ def _fused_moe_impl(
     _validate_output_buffer_no_overlap(output, hidden_states)
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
-    q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
-    # If input is already FP8-quantized (e.g. from FP8 dispatch) with block scale,
-    # use FP8 as activation dtype to skip redundant re-quantization
-    if (
-        quant_type == QuantType.per_1x128
-        and hidden_states.dtype == dtypes.fp8
-        and a1_scale is not None
-    ):
-        q_dtype_a = dtypes.fp8
-    bf16_fp8_bound = int(os.environ.get("AITER_BF16_FP8_MOE_BOUND", "256"))
-    if quant_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
-        # a16wi4: bf16 activations, int4 weights with groupwise scale
-        q_dtype_a = dtypes.bf16
-    elif quant_type == QuantType.per_1x32 and q_dtype_w == dtypes.fp8:
-        # mxfp8: both activation and weight are fp8 (per-1x32 e8m0 microscale).
-        q_dtype_a = dtypes.fp8
-    elif quant_type == QuantType.per_1x32:
-        if activation == ActivationType.Situv2:
-            # SiTUv2 defaults to a16w4 (bf16 activation x mxfp4 weight) on the
-            # mixed_moe kernels. AITER_SITUV2_A8W4 / AITER_SITUV2_A4W4 select the
-            # fp8 / fp4 activation instead; each has its own tuned config
-            # (kimik3_{a8w4,a4w4}_tuned_fmoe.csv). Tested before the INTERLEAVE
-            # branch below, which would otherwise claim SiTUv2 and pick the
-            # activation dtype itself.
-            if os.environ.get("AITER_SITUV2_A8W4", "0") == "1":
-                q_dtype_a = dtypes.fp8
-            elif os.environ.get("AITER_SITUV2_A4W4", "0") == "1":
-                q_dtype_a = dtypes.fp4x2
-            else:
-                q_dtype_a = dtypes.bf16
-        elif activation == ActivationType.Swiglu and gate_mode == GateMode.SEPARATED:
-            q_dtype_a = dtypes.bf16 if M < _SWIGLU_MXFP4_BF16_BOUND else dtypes.fp4x2
-        elif activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE:
-            if get_gfx() != "gfx950" or M < bf16_fp8_bound:
-                q_dtype_a = dtypes.bf16
-            else:
-                q_dtype_a = dtypes.fp8
-        else:
-            q_dtype_a = dtypes.fp4x2
-
-    if get_gfx() == "gfx1250":
-        if os.environ.get("AITER_FORCE_A8W4", "0") in ("1"):
-            q_dtype_a = dtypes.fp8
-        else:
-            q_dtype_a = dtypes.fp4x2
+    q_dtype_a = resolve_activation_dtype(
+        quant_type,
+        q_dtype_w,
+        activation=activation,
+        gate_mode=gate_mode,
+        M=M,
+        hidden_dtype=hidden_states.dtype,
+        has_a1_scale=a1_scale is not None,
+    )
 
     if _q_dtype_a is not None:
         q_dtype_a = _q_dtype_a
