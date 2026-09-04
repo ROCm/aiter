@@ -129,7 +129,14 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     // per tile, so the instruction count grows with KPT (344 -> 1795 at KPT 4) and buys
     // nothing once two loads are already in flight.
     static constexpr int kTdmKPT            = DYN_GQ_TDM_KPT;
-    static constexpr int kTdmRing           = 3;
+    // The ring is capped at 3 because that is the hardware's in-flight tensor-op limit
+    // per wave (opus.hpp), but it never needs more slots than there are steps to stage:
+    // with kTdmKPT steps at most that many loads are ever outstanding, so a slot beyond
+    // kTdmKPT is LDS nobody writes. At the shipped KPT of 2 that dead slot cost 4 KiB per
+    // block, and dropping it measured -3.6% kernel time at [16384, 7168] e8m0+transposed
+    // (24.40 -> 23.53 us) with the 834-instruction body byte-identical and the output
+    // bit-identical: the LDS request is the only thing that changes.
+    static constexpr int kTdmRing           = kTdmKPT < 3 ? kTdmKPT : 3;
     static constexpr int kTdmGroupsPerStep  = kTdmWaves * kGroupsPerWave;
     static constexpr int kTdmGroupsPerBlock = kTdmGroupsPerStep * kTdmKPT;
     static constexpr int kTdmSlotElems      = kTdmGroupsPerStep * group_size;
