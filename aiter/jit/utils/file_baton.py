@@ -348,15 +348,16 @@ class FileBaton:
             except OSError:
                 return False
             return age > self.stale_grace_seconds and self._owner_flock_released()
-        if host != socket.gethostname():
-            # Different host (e.g. shared filesystem): can't check liveness,
-            # never steal — avoid breaking a live remote builder's lock.
-            return False
         if protocol == "flock":
             # For new-format locks the kernel-held lifetime lock is the
-            # authority in every local PID namespace. It remains held while a
-            # process is paused and is released automatically on process exit.
+            # authority across PID/UTS namespaces and hosts sharing an NFS
+            # cache. It remains held while a process is paused and is released
+            # automatically on process exit.
             return self._owner_flock_released()
+        if host != socket.gethostname():
+            # Legacy locks have no cross-host liveness signal, so never steal
+            # one from a different host.
+            return False
         my_ns = _pid_namespace()
         if ns and my_ns and ns != my_ns:
             # Same host, different PID namespace: the recorded pid means
