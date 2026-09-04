@@ -106,6 +106,15 @@ _ATTN_RES_PACKED_CONFIGS = (
 _ATTN_RES_PACKED_CATCHALL = (4, 2, 2)  # N > largest bucket
 
 
+# Tuned on MI350X/gfx950 (H=7168 bf16, PEEL/non-PEEL A/B, B in 1..8): PEEL wins across all B for N >= 320
+# (1.05-1.22x) and regresses only at N <= 256 with large B (~0.90 at N=64/B=8),
+# because below the crossover the grid underfills the GPU (latency-bound) and
+# BL=1's B serial full-H row loads lose to the BL=2 tile. 256 captures the
+# previously-non-PEEL N in (256, 512] band while clearing the small-N regression
+# zone and the noisy N=256/B=1 point.
+_ATTN_RES_PREFILL_T = 256
+
+
 def _pick_attn_res_seq_config(tokens: int) -> tuple[int, int]:
     for max_tokens, num_warps, num_stages in _ATTN_RES_SEQ_CONFIGS:
         if tokens <= max_tokens:
@@ -473,6 +482,12 @@ def attn_res_gate(
 
     L2 = max(1, triton.next_power_of_2(L))
     num_warps, num_stages, bl = _pick_attn_res_packed_config(N, L2)
+    # Prefill regime: peel the prefix candidate out of the loop and drop to BL=1
+    # (see _ATTN_RES_PREFILL_T). The peeled loop covers only the B block_residual
+    # rows, so BL=1 is a flat 1-D row load with no candidate-axis raggedness.
+    peel = N > _ATTN_RES_PREFILL_T
+    if peel:
+        bl = 1
 
     attnres_fwd_kernel[(N,)](
         q=sw,
@@ -516,6 +531,7 @@ def attn_res_gate(
         HAS_W=False,
         QUANT_FP8=quant,
         FP8_MAX=get_dtype_max(out_quant_dtype) if quant else 1.0,
+        PEEL=peel,
         **_launch_tune_kwargs(num_warps, num_stages, bl),
     )
     y_out = (y.view(output_shape), y_scale) if quant else y.view(output_shape)

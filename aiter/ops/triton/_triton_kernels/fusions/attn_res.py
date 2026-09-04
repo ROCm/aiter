@@ -86,6 +86,7 @@ def attnres_fwd_kernel(
     HAS_W: tl.constexpr,
     QUANT_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    PEEL: tl.constexpr = False,
 ):
     """AttnRes forward, ported from fla 0.5.2 ``attnres_fwd_kernel``.
 
@@ -178,6 +179,88 @@ def attnres_fwd_kernel(
         n_res = L
 
     # online softmax over L; b_o accumulates in registers so each v tile is read once
+    if PEEL:
+        b_ps_rstd = tl.rsqrt(tl.sum(ps * ps, axis=0) / D + eps)
+        b_m = tl.sum(ps * b_qw, axis=0) * b_ps_rstd * scale
+        b_acc = tl.full([], 1.0, dtype=tl.float32)
+        b_o = ps
+        if BL == 1:
+            for i_l in range(n_res):
+                b_v = tl.load(
+                    tl.multiple_of(
+                        res_packed + i_n * stride_res_n + i_l * stride_res_l + o_d,
+                        (16,),
+                    ),
+                    mask=m_d,
+                    other=0.0,
+                ).to(tl.float32)
+                if WRITE_BLOCK_CAT:
+                    tl.store(
+                        block_out + i_n * stride_bo_n + i_l * stride_bo_l + o_d,
+                        b_v.to(block_out.dtype.element_ty),
+                        mask=m_d,
+                    )
+                b_rstd = tl.rsqrt(tl.sum(b_v * b_v, axis=0) / D + eps)
+                b_s = tl.sum(b_v * b_qw, axis=0) * b_rstd * scale
+                b_mp = b_m
+                b_m = tl.maximum(b_m, b_s)
+                b_r = tl.exp(b_mp - b_m)
+                b_p = tl.exp(b_s - b_m)
+                b_acc = b_acc * b_r + b_p
+                b_o = b_o * b_r + b_p * b_v
+        else:
+            for i_l in range(tl.cdiv(n_res, BL)):
+                o_l = i_l * BL + tl.arange(0, BL)
+                m_l = o_l < n_res
+                l_safe = tl.minimum(o_l, tl.maximum(n_res - 1, 0))
+                b_v = tl.load(
+                    res_packed
+                    + i_n * stride_res_n
+                    + l_safe[:, None] * stride_res_l
+                    + o_d[None, :],
+                    mask=m_l[:, None] & m_d[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                if WRITE_BLOCK_CAT:
+                    tl.store(
+                        block_out
+                        + i_n * stride_bo_n
+                        + l_safe[:, None] * stride_bo_l
+                        + o_d[None, :],
+                        b_v.to(block_out.dtype.element_ty),
+                        mask=m_l[:, None] & m_d[None, :],
+                    )
+                b_rstd = tl.rsqrt(tl.sum(b_v * b_v, axis=1) / D + eps)
+                b_s = tl.where(
+                    m_l,
+                    tl.sum(b_v * b_qw[None, :], axis=1) * b_rstd * scale,
+                    float("-inf"),
+                )
+                b_m, b_mp = tl.maximum(b_m, tl.max(b_s, axis=0)), b_m
+                b_r = tl.exp(b_mp - b_m)
+                b_p = tl.exp(b_s - b_m)
+                b_acc = b_acc * b_r + tl.sum(b_p, axis=0)
+                b_o = b_o * b_r + tl.sum(b_p[:, None] * b_v, axis=0)
+        # finalize (shared math with the generic path below; PEEL is a constexpr
+        # so this early-return branch is the entire kernel when PEEL is set and
+        # the generic path below is dead-code-eliminated).
+        b_o = b_o / b_acc
+        if SAVE_OPRE:
+            tl.store(o_pre + i_n * D + o_d, b_o.to(o_pre.dtype.element_ty), mask=m_d)
+        if HAS_ONORM:
+            b_o_rstd = tl.rsqrt(
+                tl.sum(tl.where(m_d, b_o * b_o, 0.0), axis=0) / D + out_eps
+            )
+            b_ow = tl.load(ow + o_d, mask=m_d, other=0.0).to(tl.float32)
+            b_o = b_o * b_o_rstd * b_ow
+        if QUANT_FP8:
+            b_amax = tl.max(tl.abs(tl.where(m_d, b_o, 0.0)), axis=0)
+            b_oscale = tl.where(b_amax > 0.0, b_amax / FP8_MAX, 1.0)
+            tl.store(o_scale + i_n, b_oscale.to(o_scale.dtype.element_ty))
+            b_o = b_o * (1.0 / b_oscale)
+        tl.store(o + i_n * D + o_d, b_o.to(o.dtype.element_ty), mask=m_d)
+        return
+
     b_m = tl.full([], float("-inf"), dtype=tl.float32)
     b_acc = tl.zeros([], dtype=tl.float32)
     b_o = tl.zeros([BD], dtype=tl.float32)
