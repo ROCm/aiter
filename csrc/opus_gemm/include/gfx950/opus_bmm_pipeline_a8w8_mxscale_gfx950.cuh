@@ -12,6 +12,33 @@
 
 #ifdef __HIP_DEVICE_COMPILE__
 
+// Diagnostic escape hatch: -DOPUS_KILL_BARRIER drops every workgroup barrier in
+// this file. Results are then numerically garbage (LDS buffers get overwritten
+// while peers still read them), but MFMA issue timing does not depend on operand
+// values, so the run still upper-bounds what removing barrier skew could buy.
+#ifdef OPUS_KILL_BARRIER
+#define OPUS_S_BARRIER() ((void)0)
+#else
+#define OPUS_S_BARRIER() __builtin_amdgcn_s_barrier()
+#endif
+
+// Companion probe: -DOPUS_KILL_LGKM drops the LDS waitcnts, so MFMAs consume
+// whatever happens to be in the fragment registers. Same deal as above - the
+// answer is garbage, but it prices the ds_read dependency chain.
+#ifdef OPUS_KILL_LGKM
+#define OPUS_WAIT_LGKM(x) ((void)0)
+#else
+#define OPUS_WAIT_LGKM(x) s_waitcnt_lgkmcnt(x)
+#endif
+
+// Third probe: -DOPUS_KILL_VM drops the global-load waitcnts, pricing the
+// latency (not the bandwidth) of the A/B async copies. Garbage results again.
+#ifdef OPUS_KILL_VM
+#define OPUS_WAIT_VM(x) ((void)0)
+#else
+#define OPUS_WAIT_VM(x) s_waitcnt_vmcnt(x)
+#endif
+
 template<typename T, int ELEM_C, typename Mma, typename VA, typename VB,
          typename VSFA, typename VSFB, typename VC>
 OPUS_D void mma_scale_accum(Mma& mma, const VA& v_a, const VB& v_b,
@@ -19,11 +46,15 @@ OPUS_D void mma_scale_accum(Mma& mma, const VA& v_a, const VB& v_b,
     using D_ACC = typename T::D_ACC;
     using D_SF = typename T::D_SF;
     if constexpr (std::is_same_v<D_SF, unsigned char>) {
-        // DSV4 scale is 128-block. The gfx950 scaled MFMA consumes 32-block
-        // E8M0 scale bytes; replicate one checkpoint byte across all four
-        // subblocks in the packed scale word to preserve 128-block semantics.
+        // DSV4 scale is 128-block, which is one byte per MFMA here: scale_op_sel
+        // picks a single byte out of the packed word and it applies to the whole
+        // W_K. These call sites select byte 0, so the replication below only has
+        // to put the right exponent there.
         static_assert(T::B_K == T::GROUP_K, "e8m0 path assumes one K scale block per B_K");
-        static_assert(T::HALF_B_N == T::GROUP_N, "e8m0 path assumes one B scale per half-tile");
+        // A half-tile may be narrower than a scale block (B_N=128 -> 64 columns
+        // against GROUP_N=128), in which case it consumes one block's scale and
+        // rep_n_per_scale below maps its whole E_N range onto that single entry.
+        static_assert(T::HALF_B_N <= T::GROUP_N, "e8m0 path assumes at most one B scale per half-tile");
         if constexpr (T::E_M == 1) {
             const int scale_a = pack_e8m0x4(v_sfa[0]);
             const int scale_b = pack_e8m0x4(v_sfb[0]);
@@ -152,9 +183,27 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     auto u_ga = make_layout_ga<T>(lane_id, wave_id_m, wave_id_n, kargs.stride_a);
     auto u_sa = make_layout_sa<T>(lane_id, wave_id_m, wave_id_n);
     auto u_ra = make_layout_ra<T>(lane_id, wave_id_m);
-    auto u_gb = make_layout_gb<T>(lane_id, wave_id_m, wave_id_n, kargs.stride_b);
-    auto u_sb = make_layout_sb<T>(lane_id, wave_id_m, wave_id_n);
-    auto u_rb = make_layout_rb<T>(lane_id, wave_id_n);
+    auto u_gb = [&] {
+        if constexpr (T::B_PRESHUFFLE) {
+            return make_layout_gb_preshuffle<T>(lane_id, wave_id_m, wave_id_n, kargs.stride_b);
+        } else {
+            return make_layout_gb<T>(lane_id, wave_id_m, wave_id_n, kargs.stride_b);
+        }
+    }();
+    auto u_sb = [&] {
+        if constexpr (T::B_PRESHUFFLE) {
+            return make_layout_sb_preshuffle<T>(lane_id, wave_id_m, wave_id_n);
+        } else {
+            return make_layout_sb<T>(lane_id, wave_id_m, wave_id_n);
+        }
+    }();
+    auto u_rb = [&] {
+        if constexpr (T::B_PRESHUFFLE) {
+            return make_layout_rb_preshuffle<T>(lane_id, wave_id_n);
+        } else {
+            return make_layout_rb<T>(lane_id, wave_id_n);
+        }
+    }();
 
     auto u_sfa = make_layout_sfa<T>(lane_id, wave_id_m, kargs.stride_sfa);
 
@@ -191,21 +240,25 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     clear(v_c[1][1]);
 
     using vtype_sfa = vector_t<D_SF, T::E_M * (T::B_K / T::GROUP_K)>;
-    using vtype_sfb = vector_t<D_SF, (T::HALF_B_N / T::GROUP_N) * (T::B_K / T::GROUP_K)>;
+    using vtype_sfb = vector_t<D_SF, T::SFB_GROUPS_PER_HALF * (T::B_K / T::GROUP_K)>;
     vtype_sfa v_sfa[2][2];
     vtype_sfb v_sfb[2][2];
 
     auto a_offset = [&](int half_tile_m, int tile_k) {
         return half_tile_m * T::HALF_B_M * kargs.stride_a + tile_k * T::B_K;
     };
+    // Advancing N by HALF_B_N is HALF_B_N/16 blocks of 16*stride_b either way, so
+    // only the K term differs: a preshuffled K tile is B_K columns of one
+    // 16-column block, i.e. B_K*16 bytes.
     auto b_offset = [&](int half_tile_n, int tile_k) {
-        return half_tile_n * T::HALF_B_N * kargs.stride_b + tile_k * T::B_K;
+        constexpr int k_step = T::B_PRESHUFFLE ? T::B_K * 16 : T::B_K;
+        return half_tile_n * T::HALF_B_N * kargs.stride_b + tile_k * k_step;
     };
     auto sfa_offset = [&](int half_tile_m, int tile_k) {
         return half_tile_m * (T::HALF_B_M / T::GROUP_M) * kargs.stride_sfa + tile_k * (T::B_K / T::GROUP_K);
     };
     auto sfb_offset = [&](int half_tile_n, int tile_k) {
-        return half_tile_n * (T::HALF_B_N / T::GROUP_N) * kargs.stride_sfb + tile_k * (T::B_K / T::GROUP_K);
+        return half_tile_n * T::SFB_HALF_STRIDE * kargs.stride_sfb + tile_k * (T::B_K / T::GROUP_K);
     };
 
     // kid157: preload the whole A-scale panel into LDS once, then read per-tile
@@ -214,9 +267,10 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     // [B_M/GROUP_M rows][K/B_K K-blocks] row-major byte tile (GROUP_M==1 and
     // B_K==GROUP_K for this traits). The LDS buffer is sized for a compile-time
     // K upper bound (SFA_K_MAX); the actual packed K-tile count is a runtime
-    // value so any K<=SFA_K_MAX (and K%B_K==0) works. SFA_K_MAX=8192 keeps the
-    // panel <=16 KiB, so total LDS stays 1 WG/CU.
-    constexpr int SFA_K_MAX     = 8192;
+    // value so any K<=SFA_K_MAX (and K%B_K==0) works. At 8192 the panel is
+    // <=16 KiB, so total LDS stays 1 WG/CU -- see the traits constant for the
+    // budget arithmetic that fixes it there.
+    constexpr int SFA_K_MAX     = T::SF_PRELOAD_K_MAX;
     constexpr int SFA_K_TILES_MAX = PRELOAD_SFA_LDS ? (SFA_K_MAX / T::B_K) : 1;
     constexpr int SFA_ROWS      = T::B_M / T::GROUP_M;
     constexpr int SFA_LDS_BYTES =
@@ -247,18 +301,18 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     // panel is a few dozen bytes; the win is purely removing the per-K-tile SFB
     // global buffer_load from the steady-state vmcnt gate. Read layout mirrors
     // sfb_offset with stride_sfb replaced by the compact per-N-group K length.
-    constexpr int SFB_K_MAX       = 8192;
+    constexpr int SFB_K_MAX       = T::SF_PRELOAD_K_MAX;
     constexpr int SFB_K_TILES_MAX = PRELOAD_SFB_LDS ? (SFB_K_MAX / T::B_K) : 1;
-    constexpr int SFB_SPK         = T::B_K / T::GROUP_K;      // scales per K-tile
-    constexpr int SFB_NG_PER_HALF = T::HALF_B_N / T::GROUP_N; // N-groups per half-n
-    constexpr int SFB_ROWS        = 2 * SFB_NG_PER_HALF;      // N-groups in B_N tile
+    constexpr int SFB_SPK         = T::B_K / T::GROUP_K;         // scales per K-tile
+    constexpr int SFB_NG_PER_HALF = T::SFB_GROUPS_PER_HALF;      // N-groups per half-n
+    constexpr int SFB_ROWS        = T::SFB_TILE_GROUPS;          // N-groups in B_N tile
     constexpr int SFB_LDS_BYTES =
         PRELOAD_SFB_LDS ? (SFB_ROWS * SFB_K_TILES_MAX * SFB_SPK * (int)sizeof(D_SF)) : 1;
     __shared__ char smem_sfb[SFB_LDS_BYTES];
     D_SF* s_sfb_ptr = reinterpret_cast<D_SF*>(smem_sfb);
     const int sfb_k_scales = PRELOAD_SFB_LDS ? ((kargs.k / T::B_K) * SFB_SPK) : 1;
     auto sfb_lds_offset = [&](int half_tile_n, int tile_k) {
-        return half_tile_n * SFB_NG_PER_HALF * sfb_k_scales + tile_k * SFB_SPK;
+        return half_tile_n * T::SFB_HALF_STRIDE * sfb_k_scales + tile_k * SFB_SPK;
     };
     auto load_sfb = [&](int half_tile_n, int tile_k) {
         if constexpr (PRELOAD_SFB_LDS) {
@@ -278,6 +332,11 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
         static_assert(T::B_K == 128, "K1024_ONLY expects eight 128-wide K tiles");
         if (kargs.k != 1024) return;
     }
+    // Bailing out here would overrun the LDS panels below, so the guard stays --
+    // but it must not be the only one: returning leaves Y untouched, which the
+    // caller cannot tell from a computed answer (a zeroed output tensor looks
+    // like a correct GEMM of zeros). The launcher checks the same bound with
+    // AITER_CHECK, so reaching this return means a caller went around it.
     if constexpr (PRELOAD_SFA_LDS) {
         if (kargs.k > SFA_K_MAX || (kargs.k % T::B_K) != 0) return;
     }
@@ -341,8 +400,8 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     // panels live in disjoint LDS, so the fills need no ordering between them.
     // s_barrier does not retire LDS traffic, hence the explicit lgkmcnt wait.
     if constexpr (PRELOAD_SFA_LDS || PRELOAD_SFB_LDS) {
-        s_waitcnt_lgkmcnt(0_I);
-        __builtin_amdgcn_s_barrier();
+        OPUS_WAIT_LGKM(0_I);
+        OPUS_S_BARRIER();
     }
 
     // Prologue
@@ -355,10 +414,10 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     async_load<T::VEC_A>(g_a, s_a[tic][1].ptr, u_ga, u_sa, a_offset(1, 0));
     async_load<T::VEC_B>(g_b, s_b[tic][1].ptr, u_gb, u_sb, b_offset(1, 0));
 
-    if (wave_id_n == 1) __builtin_amdgcn_s_barrier();
+    if (wave_id_n == 1) OPUS_S_BARRIER();
 
-    s_waitcnt_vmcnt(number<T::b_buffer_load_insts + T::a_buffer_load_insts + SFA_VM + SFB_VM>{});
-    __builtin_amdgcn_s_barrier();
+    OPUS_WAIT_VM(number<T::b_buffer_load_insts + T::a_buffer_load_insts + SFA_VM + SFB_VM>{});
+    OPUS_S_BARRIER();
 
     v_sfa[toc][0] = load_sfa(0, 1);
     v_sfb[toc][0] = load_sfb(0, 1);
@@ -366,11 +425,24 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     async_load<T::VEC_B>(g_b, s_b[toc][0].ptr, u_gb, u_sb, b_offset(0, 1));
     async_load<T::VEC_A>(g_a, s_a[toc][1].ptr, u_ga, u_sa, a_offset(1, 1));
 
-    s_waitcnt_vmcnt(number<2 * T::a_buffer_load_insts + T::b_buffer_load_insts + SFA_VM + SFB_VM>{});
-    __builtin_amdgcn_s_barrier();
+    // Must cover the *next* tile's first A half, not just this tile's: the main
+    // loop's first iteration reads s_a[toc][0] (the "v_a[0] = load(s_a[toc][0])"
+    // below the second mma) before reaching its own vmcnt wait, so on entry that
+    // buffer is only guaranteed by this wait. Leaving 2*a + b in flight leaves
+    // A(0,1) among them. a + b leaves exactly B(0,1) and A(1,1), which the loop
+    // does wait for before touching.
+    //
+    // Every other tile in this family had enough slack to hide that: the counts
+    // are per-half, so a=2,b=2 (kid150/158) and a=1,b=2 (kid159) put A(0,1)
+    // inside the completed prefix anyway. kid164 is the one tile with b < a
+    // (B_N=128 -> b=1, a=2), and there 2*a + b let A(0,1) stay in flight -- wrong
+    // results, varying run to run, once the grid exceeds the 512 workgroups that
+    // fit resident and a third workgroup starts on a busy CU.
+    OPUS_WAIT_VM(number<2 * T::a_buffer_load_insts + T::b_buffer_load_insts + SFA_VM + SFB_VM>{});
+    OPUS_S_BARRIER();
 
     v_a[0] = load<T::VEC_A>(s_a[tic][0], u_ra);
-    __builtin_amdgcn_s_barrier();
+    OPUS_S_BARRIER();
 
     // Main loop
     for(int tile = 0; tile < loops - 2; tile += 2) {
@@ -378,61 +450,67 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
         v_sfb[toc][1] = load_sfb(1, tile + 1);
         v_b = load<T::VEC_B>(s_b[tic][0], u_rb);
         async_load<T::VEC_B>(g_b, s_b[toc][1].ptr, u_gb, u_sb, b_offset(1, tile + 1));
-        s_waitcnt_lgkmcnt(number<T::b_ds_read_insts>{});
-        __builtin_amdgcn_s_barrier();
+        OPUS_WAIT_LGKM(number<T::b_ds_read_insts>{});
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
-        s_waitcnt_lgkmcnt(0_I);
+        OPUS_WAIT_LGKM(0_I);
         __builtin_amdgcn_s_setprio(1);
         mma_scale_accum<T, ELEM_C>(mma, v_a[0], v_b, v_sfa[tic][0], v_sfb[tic][0], v_c[0][0]);
         sched_barrier_pairs<2, 0, 0>();
         sched_barrier_pairs<1, 2, 0>();
         sched_barrier_pairs<5, 4, 0>();
         __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
         v_sfa[toc][1] = load_sfa(1, tile + 1);
         v_a[1] = load<T::VEC_A>(s_a[tic][1], u_ra);
         async_load<T::VEC_A>(g_a, s_a[tic][0].ptr, u_ga, u_sa, a_offset(0, tile + 2));
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
-        s_waitcnt_lgkmcnt(0_I);
+        OPUS_WAIT_LGKM(0_I);
         __builtin_amdgcn_s_setprio(1);
         mma_scale_accum<T, ELEM_C>(mma, v_a[1], v_b, v_sfa[tic][1], v_sfb[tic][0], v_c[1][0]);
         sched_barrier_pairs<2, 0, 0>();
         sched_barrier_pairs<1, 2, 0>();
         sched_barrier_pairs<5, 4, 0>();
         __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
         v_sfb[tic][0] = load_sfb(0, tile + 2);
         v_b = load<T::VEC_B>(s_b[tic][1], u_rb);
         async_load<T::VEC_B>(g_b, s_b[tic][0].ptr, u_gb, u_sb, b_offset(0, tile + 2));
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
-        s_waitcnt_lgkmcnt(0_I);
+        OPUS_WAIT_LGKM(0_I);
         __builtin_amdgcn_s_setprio(1);
         mma_scale_accum<T, ELEM_C>(mma, v_a[0], v_b, v_sfa[tic][0], v_sfb[tic][1], v_c[0][1]);
         sched_barrier_pairs<2, 0, 0>();
         sched_barrier_pairs<1, 2, 0>();
         sched_barrier_pairs<5, 4, 0>();
         __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
         v_sfa[tic][0] = load_sfa(0, tile + 2);
-        v_a[0] = load<T::VEC_A>(s_a[toc][0], u_ra);
         async_load<T::VEC_A>(g_a, s_a[tic][1].ptr, u_ga, u_sa, a_offset(1, tile + 2));
-        s_waitcnt_vmcnt(number<
+        OPUS_WAIT_VM(number<
             2 * T::a_buffer_load_insts +
             T::b_buffer_load_insts +
             2 * SFA_VM +
             SFB_VM>{});
-        __builtin_amdgcn_s_barrier();
+        // Reads the half filled by this tile's own A load, so it has to sit after
+        // that wait and not before it. Ahead of the wait it was covered only by
+        // the prologue's, which leaves 2*a + b in flight -- enough on every tile
+        // whose b >= a, and not enough on kid164 (B_N=128, b=1 < a=2), where the
+        // buffer was still landing. Between the wait and the barrier is the only
+        // correct place: after the barrier another wave may refill the buffer.
+        v_a[0] = load<T::VEC_A>(s_a[toc][0], u_ra);
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
         __builtin_amdgcn_s_setprio(1);
@@ -441,7 +519,7 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
         sched_barrier_pairs<1, 2, 0>();
         sched_barrier_pairs<5, 4, 0>();
         __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
         // Second tile
@@ -450,57 +528,57 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
         async_load<T::VEC_B>(
             g_b, s_b[tic][1].ptr, u_gb, u_sb,
             b_offset(1, tile + 2));
-        s_waitcnt_lgkmcnt(number<T::b_ds_read_insts>{});
-        __builtin_amdgcn_s_barrier();
+        OPUS_WAIT_LGKM(number<T::b_ds_read_insts>{});
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
-        s_waitcnt_lgkmcnt(0_I);
+        OPUS_WAIT_LGKM(0_I);
         __builtin_amdgcn_s_setprio(1);
         mma_scale_accum<T, ELEM_C>(mma, v_a[0], v_b, v_sfa[toc][0], v_sfb[toc][0], v_c[0][0]);
         sched_barrier_pairs<2, 0, 0>();
         sched_barrier_pairs<1, 2, 0>();
         sched_barrier_pairs<5, 4, 0>();
         __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
         v_sfa[tic][1] = load_sfa(1, tile + 2);
         v_a[1] = load<T::VEC_A>(s_a[toc][1], u_ra);
         async_load<T::VEC_A>(g_a, s_a[toc][0].ptr, u_ga, u_sa, a_offset(0, tile + 3));
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
-        s_waitcnt_lgkmcnt(0_I);
+        OPUS_WAIT_LGKM(0_I);
         __builtin_amdgcn_s_setprio(1);
         mma_scale_accum<T, ELEM_C>(mma, v_a[1], v_b, v_sfa[toc][1], v_sfb[toc][0], v_c[1][0]);
         sched_barrier_pairs<2, 0, 0>();
         sched_barrier_pairs<1, 2, 0>();
         sched_barrier_pairs<5, 4, 0>();
         __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
         v_sfb[toc][0] = load_sfb(0, tile + 3);
         v_b = load<T::VEC_B>(s_b[toc][1], u_rb);
         async_load<T::VEC_B>(g_b, s_b[toc][0].ptr, u_gb, u_sb, b_offset(0, tile + 3));
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
-        s_waitcnt_lgkmcnt(0_I);
+        OPUS_WAIT_LGKM(0_I);
         __builtin_amdgcn_s_setprio(1);
         mma_scale_accum<T, ELEM_C>(mma, v_a[0], v_b, v_sfa[toc][0], v_sfb[toc][1], v_c[0][1]);
         sched_barrier_pairs<2, 0, 0>();
         sched_barrier_pairs<1, 2, 0>();
         sched_barrier_pairs<5, 4, 0>();
         __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
         v_sfa[toc][0] = load_sfa(0, tile + 3);
-        v_a[0] = load<T::VEC_A>(s_a[tic][0], u_ra);
         async_load<T::VEC_A>(g_a, s_a[toc][1].ptr, u_ga, u_sa, a_offset(1, tile + 3));
-        s_waitcnt_vmcnt(number<2 * T::a_buffer_load_insts + T::b_buffer_load_insts + 2 * SFA_VM + SFB_VM>{});
-        __builtin_amdgcn_s_barrier();
+        OPUS_WAIT_VM(number<2 * T::a_buffer_load_insts + T::b_buffer_load_insts + 2 * SFA_VM + SFB_VM>{});
+        v_a[0] = load<T::VEC_A>(s_a[tic][0], u_ra);   // same ordering as above
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
         __builtin_amdgcn_s_setprio(1);
@@ -509,7 +587,7 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
         sched_barrier_pairs<1, 2, 0>();
         sched_barrier_pairs<5, 4, 0>();
         __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
     }
 
@@ -520,36 +598,36 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
         v_sfb[toc][1] = load_sfb(1, tile + 1);
         v_b = load<T::VEC_B>(s_b[tic][0], u_rb);
         async_load<T::VEC_B>(g_b, s_b[toc][1].ptr, u_gb, u_sb, b_offset(1, tile + 1));
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
 
-        s_waitcnt_lgkmcnt(0_I);
+        OPUS_WAIT_LGKM(0_I);
         __builtin_amdgcn_s_setprio(1);
         mma_scale_accum<T, ELEM_C>(mma, v_a[0], v_b, v_sfa[tic][0], v_sfb[tic][0], v_c[0][0]);
         __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
         v_sfa[toc][1] = load_sfa(1, tile + 1);
         v_a[1] = load<T::VEC_A>(s_a[tic][1], u_ra);
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
 
-        s_waitcnt_lgkmcnt(0_I);
+        OPUS_WAIT_LGKM(0_I);
         __builtin_amdgcn_s_setprio(1);
         mma_scale_accum<T, ELEM_C>(mma, v_a[1], v_b, v_sfa[tic][1], v_sfb[tic][0], v_c[1][0]);
         __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
         v_b = load<T::VEC_B>(s_b[tic][1], u_rb);
-        s_waitcnt_vmcnt(number<T::b_buffer_load_insts + T::a_buffer_load_insts + SFB_VM + 2 * SFA_VM>{});
-        __builtin_amdgcn_s_barrier();
+        OPUS_WAIT_VM(number<T::b_buffer_load_insts + T::a_buffer_load_insts + SFB_VM + 2 * SFA_VM>{});
+        OPUS_S_BARRIER();
 
-        s_waitcnt_lgkmcnt(0_I);
+        OPUS_WAIT_LGKM(0_I);
         __builtin_amdgcn_s_setprio(1);
         mma_scale_accum<T, ELEM_C>(mma, v_a[0], v_b, v_sfa[tic][0], v_sfb[tic][1], v_c[0][1]);
         mma_scale_accum<T, ELEM_C>(mma, v_a[1], v_b, v_sfa[tic][1], v_sfb[tic][1], v_c[1][1]);
         __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
         tic ^= 1;
@@ -559,40 +637,40 @@ __device__ __forceinline__ void gemm_a8w8_scale_kernel_impl(opus_gemm_scale_karg
     {
         v_a[0] = load<T::VEC_A>(s_a[tic][0], u_ra);
         v_b = load<T::VEC_B>(s_b[tic][0], u_rb);
-        s_waitcnt_vmcnt(number<T::b_buffer_load_insts + SFB_VM + SFA_VM>{});
-        __builtin_amdgcn_s_barrier();
+        OPUS_WAIT_VM(number<T::b_buffer_load_insts + SFB_VM + SFA_VM>{});
+        OPUS_S_BARRIER();
 
-        s_waitcnt_lgkmcnt(0_I);
+        OPUS_WAIT_LGKM(0_I);
         __builtin_amdgcn_s_setprio(1);
         mma_scale_accum<T, ELEM_C>(mma, v_a[0], v_b, v_sfa[tic][0], v_sfb[tic][0], v_c[0][0]);
         __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
         v_a[1] = load<T::VEC_A>(s_a[tic][1], u_ra);
-        s_waitcnt_vmcnt(0_I);
-        __builtin_amdgcn_s_barrier();
+        OPUS_WAIT_VM(0_I);
+        OPUS_S_BARRIER();
 
-        s_waitcnt_lgkmcnt(0_I);
+        OPUS_WAIT_LGKM(0_I);
         __builtin_amdgcn_s_setprio(1);
         mma_scale_accum<T, ELEM_C>(mma, v_a[1], v_b, v_sfa[tic][1], v_sfb[tic][0], v_c[1][0]);
         __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
         v_b = load<T::VEC_B>(s_b[tic][1], u_rb);
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
 
-        s_waitcnt_lgkmcnt(0_I);
+        OPUS_WAIT_LGKM(0_I);
         __builtin_amdgcn_s_setprio(1);
         mma_scale_accum<T, ELEM_C>(mma, v_a[0], v_b, v_sfa[tic][0], v_sfb[tic][1], v_c[0][1]);
         mma_scale_accum<T, ELEM_C>(mma, v_a[1], v_b, v_sfa[tic][1], v_sfb[tic][1], v_c[1][1]);
         __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
     }
 
-    if (wave_id_n == 0) __builtin_amdgcn_s_barrier();
+    if (wave_id_n == 0) OPUS_S_BARRIER();
 
     // Store results to global memory
     auto p_coord_c = opus::make_tuple(wave_id_m, lane_id % mma.grpn_c, wave_id_n, lane_id / mma.grpn_c);
@@ -712,9 +790,27 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_splitk_
     auto u_ga = make_layout_ga<T>(lane_id, wave_id_m, wave_id_n, kargs.stride_a);
     auto u_sa = make_layout_sa<T>(lane_id, wave_id_m, wave_id_n);
     auto u_ra = make_layout_ra<T>(lane_id, wave_id_m);
-    auto u_gb = make_layout_gb<T>(lane_id, wave_id_m, wave_id_n, kargs.stride_b);
-    auto u_sb = make_layout_sb<T>(lane_id, wave_id_m, wave_id_n);
-    auto u_rb = make_layout_rb<T>(lane_id, wave_id_n);
+    auto u_gb = [&] {
+        if constexpr (T::B_PRESHUFFLE) {
+            return make_layout_gb_preshuffle<T>(lane_id, wave_id_m, wave_id_n, kargs.stride_b);
+        } else {
+            return make_layout_gb<T>(lane_id, wave_id_m, wave_id_n, kargs.stride_b);
+        }
+    }();
+    auto u_sb = [&] {
+        if constexpr (T::B_PRESHUFFLE) {
+            return make_layout_sb_preshuffle<T>(lane_id, wave_id_m, wave_id_n);
+        } else {
+            return make_layout_sb<T>(lane_id, wave_id_m, wave_id_n);
+        }
+    }();
+    auto u_rb = [&] {
+        if constexpr (T::B_PRESHUFFLE) {
+            return make_layout_rb_preshuffle<T>(lane_id, wave_id_n);
+        } else {
+            return make_layout_rb<T>(lane_id, wave_id_n);
+        }
+    }();
 
     auto u_sfa = make_layout_sfa<T>(lane_id, wave_id_m, kargs.stride_sfa);
 
@@ -751,21 +847,25 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_splitk_
     clear(v_c[1][1]);
 
     using vtype_sfa = vector_t<D_SF, T::E_M * (T::B_K / T::GROUP_K)>;
-    using vtype_sfb = vector_t<D_SF, (T::HALF_B_N / T::GROUP_N) * (T::B_K / T::GROUP_K)>;
+    using vtype_sfb = vector_t<D_SF, T::SFB_GROUPS_PER_HALF * (T::B_K / T::GROUP_K)>;
     vtype_sfa v_sfa[2][2];
     vtype_sfb v_sfb[2][2];
 
     auto a_offset = [&](int half_tile_m, int tile_k) {
         return half_tile_m * T::HALF_B_M * kargs.stride_a + tile_k * T::B_K;
     };
+    // Advancing N by HALF_B_N is HALF_B_N/16 blocks of 16*stride_b either way, so
+    // only the K term differs: a preshuffled K tile is B_K columns of one
+    // 16-column block, i.e. B_K*16 bytes.
     auto b_offset = [&](int half_tile_n, int tile_k) {
-        return half_tile_n * T::HALF_B_N * kargs.stride_b + tile_k * T::B_K;
+        constexpr int k_step = T::B_PRESHUFFLE ? T::B_K * 16 : T::B_K;
+        return half_tile_n * T::HALF_B_N * kargs.stride_b + tile_k * k_step;
     };
     auto sfa_offset = [&](int half_tile_m, int tile_k) {
         return half_tile_m * (T::HALF_B_M / T::GROUP_M) * kargs.stride_sfa + tile_k * (T::B_K / T::GROUP_K);
     };
     auto sfb_offset = [&](int half_tile_n, int tile_k) {
-        return half_tile_n * (T::HALF_B_N / T::GROUP_N) * kargs.stride_sfb + tile_k * (T::B_K / T::GROUP_K);
+        return half_tile_n * T::SFB_HALF_STRIDE * kargs.stride_sfb + tile_k * (T::B_K / T::GROUP_K);
     };
 
     int tic = 0, toc = 1;
@@ -780,10 +880,10 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_splitk_
     async_load<T::VEC_A>(g_a, s_a[tic][1].ptr, u_ga, u_sa, a_offset(1, 0));
     async_load<T::VEC_B>(g_b, s_b[tic][1].ptr, u_gb, u_sb, b_offset(1, 0));
 
-    if (wave_id_n == 1) __builtin_amdgcn_s_barrier();
+    if (wave_id_n == 1) OPUS_S_BARRIER();
 
     s_waitcnt_vmcnt(number<T::b_buffer_load_insts + T::a_buffer_load_insts + T::sfa_buffer_load_insts + T::sfb_buffer_load_insts>{});
-    __builtin_amdgcn_s_barrier();
+    OPUS_S_BARRIER();
 
     v_sfa[toc][0] = load(g_sfa, u_sfa, sfa_offset(0, 1));
     v_sfb[toc][0] = load(g_sfb, sfb_offset(0, 1));
@@ -792,10 +892,10 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_splitk_
     async_load<T::VEC_A>(g_a, s_a[toc][1].ptr, u_ga, u_sa, a_offset(1, 1));
 
     s_waitcnt_vmcnt(number<2 * T::a_buffer_load_insts + T::b_buffer_load_insts + T::sfa_buffer_load_insts + T::sfb_buffer_load_insts>{});
-    __builtin_amdgcn_s_barrier();
+    OPUS_S_BARRIER();
 
     v_a[0] = load<T::VEC_A>(s_a[tic][0], u_ra);
-    __builtin_amdgcn_s_barrier();
+    OPUS_S_BARRIER();
 
     // Main loop
     for(int tile = 0; tile < loops - 2; tile += 2) {
@@ -803,57 +903,58 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_splitk_
         v_sfb[toc][1] = load(g_sfb, sfb_offset(1, tile + 1));
         v_b = load<T::VEC_B>(s_b[tic][0], u_rb);
         async_load<T::VEC_B>(g_b, s_b[toc][1].ptr, u_gb, u_sb, b_offset(1, tile + 1));
-        s_waitcnt_lgkmcnt(number<T::b_ds_read_insts>{});
-        __builtin_amdgcn_s_barrier();
+        OPUS_WAIT_LGKM(number<T::b_ds_read_insts>{});
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
-        s_waitcnt_lgkmcnt(0_I);
+        OPUS_WAIT_LGKM(0_I);
         __builtin_amdgcn_s_setprio(1);
         mma_scale_accum<T, ELEM_C>(mma, v_a[0], v_b, v_sfa[tic][0], v_sfb[tic][0], v_c[0][0]);
         sched_barrier_pairs<2, 0, 0>();
         sched_barrier_pairs<1, 2, 0>();
         sched_barrier_pairs<5, 4, 0>();
         __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
         v_sfa[toc][1] = load(g_sfa, u_sfa, sfa_offset(1, tile + 1));
         v_a[1] = load<T::VEC_A>(s_a[tic][1], u_ra);
         async_load<T::VEC_A>(g_a, s_a[tic][0].ptr, u_ga, u_sa, a_offset(0, tile + 2));
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
-        s_waitcnt_lgkmcnt(0_I);
+        OPUS_WAIT_LGKM(0_I);
         __builtin_amdgcn_s_setprio(1);
         mma_scale_accum<T, ELEM_C>(mma, v_a[1], v_b, v_sfa[tic][1], v_sfb[tic][0], v_c[1][0]);
         sched_barrier_pairs<2, 0, 0>();
         sched_barrier_pairs<1, 2, 0>();
         sched_barrier_pairs<5, 4, 0>();
         __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
         v_sfb[tic][0] = load(g_sfb, sfb_offset(0, tile + 2));
         v_b = load<T::VEC_B>(s_b[tic][1], u_rb);
         async_load<T::VEC_B>(g_b, s_b[tic][0].ptr, u_gb, u_sb, b_offset(0, tile + 2));
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
-        s_waitcnt_lgkmcnt(0_I);
+        OPUS_WAIT_LGKM(0_I);
         __builtin_amdgcn_s_setprio(1);
         mma_scale_accum<T, ELEM_C>(mma, v_a[0], v_b, v_sfa[tic][0], v_sfb[tic][1], v_c[0][1]);
         sched_barrier_pairs<2, 0, 0>();
         sched_barrier_pairs<1, 2, 0>();
         sched_barrier_pairs<5, 4, 0>();
         __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
         v_sfa[tic][0] = load(g_sfa, u_sfa, sfa_offset(0, tile + 2));
-        v_a[0] = load<T::VEC_A>(s_a[toc][0], u_ra);
         async_load<T::VEC_A>(g_a, s_a[tic][1].ptr, u_ga, u_sa, a_offset(1, tile + 2));
-        s_waitcnt_vmcnt(number<2 * T::a_buffer_load_insts + T::b_buffer_load_insts + 2 * T::sfa_buffer_load_insts + T::sfb_buffer_load_insts>{});
-        __builtin_amdgcn_s_barrier();
+        OPUS_WAIT_VM(number<2 * T::a_buffer_load_insts + T::b_buffer_load_insts + 2 * T::sfa_buffer_load_insts + T::sfb_buffer_load_insts>{});
+        // After the wait, not before: see the same ordering in the non-split-K loop.
+        v_a[0] = load<T::VEC_A>(s_a[toc][0], u_ra);
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
         __builtin_amdgcn_s_setprio(1);
@@ -862,64 +963,65 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_splitk_
         sched_barrier_pairs<1, 2, 0>();
         sched_barrier_pairs<5, 4, 0>();
         __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
         // Second tile
         v_sfb[tic][1] = load(g_sfb, sfb_offset(1, tile + 2));
         v_b = load<T::VEC_B>(s_b[toc][0], u_rb);
         async_load<T::VEC_B>(g_b, s_b[tic][1].ptr, u_gb, u_sb, b_offset(1, tile + 2));
-        s_waitcnt_lgkmcnt(number<T::b_ds_read_insts>{});
-        __builtin_amdgcn_s_barrier();
+        OPUS_WAIT_LGKM(number<T::b_ds_read_insts>{});
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
-        s_waitcnt_lgkmcnt(0_I);
+        OPUS_WAIT_LGKM(0_I);
         __builtin_amdgcn_s_setprio(1);
         mma_scale_accum<T, ELEM_C>(mma, v_a[0], v_b, v_sfa[toc][0], v_sfb[toc][0], v_c[0][0]);
         sched_barrier_pairs<2, 0, 0>();
         sched_barrier_pairs<1, 2, 0>();
         sched_barrier_pairs<5, 4, 0>();
         __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
         v_sfa[tic][1] = load(g_sfa, u_sfa, sfa_offset(1, tile + 2));
         v_a[1] = load<T::VEC_A>(s_a[toc][1], u_ra);
         async_load<T::VEC_A>(g_a, s_a[toc][0].ptr, u_ga, u_sa, a_offset(0, tile + 3));
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
-        s_waitcnt_lgkmcnt(0_I);
+        OPUS_WAIT_LGKM(0_I);
         __builtin_amdgcn_s_setprio(1);
         mma_scale_accum<T, ELEM_C>(mma, v_a[1], v_b, v_sfa[toc][1], v_sfb[toc][0], v_c[1][0]);
         sched_barrier_pairs<2, 0, 0>();
         sched_barrier_pairs<1, 2, 0>();
         sched_barrier_pairs<5, 4, 0>();
         __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
         v_sfb[toc][0] = load(g_sfb, sfb_offset(0, tile + 3));
         v_b = load<T::VEC_B>(s_b[toc][1], u_rb);
         async_load<T::VEC_B>(g_b, s_b[toc][0].ptr, u_gb, u_sb, b_offset(0, tile + 3));
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
-        s_waitcnt_lgkmcnt(0_I);
+        OPUS_WAIT_LGKM(0_I);
         __builtin_amdgcn_s_setprio(1);
         mma_scale_accum<T, ELEM_C>(mma, v_a[0], v_b, v_sfa[toc][0], v_sfb[toc][1], v_c[0][1]);
         sched_barrier_pairs<2, 0, 0>();
         sched_barrier_pairs<1, 2, 0>();
         sched_barrier_pairs<5, 4, 0>();
         __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
         v_sfa[toc][0] = load(g_sfa, u_sfa, sfa_offset(0, tile + 3));
-        v_a[0] = load<T::VEC_A>(s_a[tic][0], u_ra);
         async_load<T::VEC_A>(g_a, s_a[toc][1].ptr, u_ga, u_sa, a_offset(1, tile + 3));
-        s_waitcnt_vmcnt(number<2 * T::a_buffer_load_insts + T::b_buffer_load_insts + 2 * T::sfa_buffer_load_insts + T::sfb_buffer_load_insts>{});
-        __builtin_amdgcn_s_barrier();
+        OPUS_WAIT_VM(number<2 * T::a_buffer_load_insts + T::b_buffer_load_insts + 2 * T::sfa_buffer_load_insts + T::sfb_buffer_load_insts>{});
+        // After the wait, not before: see the same ordering in the non-split-K loop.
+        v_a[0] = load<T::VEC_A>(s_a[tic][0], u_ra);
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
         __builtin_amdgcn_s_setprio(1);
@@ -928,7 +1030,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_splitk_
         sched_barrier_pairs<1, 2, 0>();
         sched_barrier_pairs<5, 4, 0>();
         __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
     }
 
@@ -939,36 +1041,36 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_splitk_
         v_sfb[toc][1] = load(g_sfb, sfb_offset(1, tile + 1));
         v_b = load<T::VEC_B>(s_b[tic][0], u_rb);
         async_load<T::VEC_B>(g_b, s_b[toc][1].ptr, u_gb, u_sb, b_offset(1, tile + 1));
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
 
-        s_waitcnt_lgkmcnt(0_I);
+        OPUS_WAIT_LGKM(0_I);
         __builtin_amdgcn_s_setprio(1);
         mma_scale_accum<T, ELEM_C>(mma, v_a[0], v_b, v_sfa[tic][0], v_sfb[tic][0], v_c[0][0]);
         __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
         v_sfa[toc][1] = load(g_sfa, u_sfa, sfa_offset(1, tile + 1));
         v_a[1] = load<T::VEC_A>(s_a[tic][1], u_ra);
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
 
-        s_waitcnt_lgkmcnt(0_I);
+        OPUS_WAIT_LGKM(0_I);
         __builtin_amdgcn_s_setprio(1);
         mma_scale_accum<T, ELEM_C>(mma, v_a[1], v_b, v_sfa[tic][1], v_sfb[tic][0], v_c[1][0]);
         __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
         v_b = load<T::VEC_B>(s_b[tic][1], u_rb);
-        s_waitcnt_vmcnt(number<T::b_buffer_load_insts + T::a_buffer_load_insts + T::sfb_buffer_load_insts + 2 * T::sfa_buffer_load_insts>{});
-        __builtin_amdgcn_s_barrier();
+        OPUS_WAIT_VM(number<T::b_buffer_load_insts + T::a_buffer_load_insts + T::sfb_buffer_load_insts + 2 * T::sfa_buffer_load_insts>{});
+        OPUS_S_BARRIER();
 
-        s_waitcnt_lgkmcnt(0_I);
+        OPUS_WAIT_LGKM(0_I);
         __builtin_amdgcn_s_setprio(1);
         mma_scale_accum<T, ELEM_C>(mma, v_a[0], v_b, v_sfa[tic][0], v_sfb[tic][1], v_c[0][1]);
         mma_scale_accum<T, ELEM_C>(mma, v_a[1], v_b, v_sfa[tic][1], v_sfb[tic][1], v_c[1][1]);
         __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
         tic ^= 1;
@@ -978,40 +1080,40 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_splitk_
     {
         v_a[0] = load<T::VEC_A>(s_a[tic][0], u_ra);
         v_b = load<T::VEC_B>(s_b[tic][0], u_rb);
-        s_waitcnt_vmcnt(number<T::b_buffer_load_insts + T::sfb_buffer_load_insts + T::sfa_buffer_load_insts>{});
-        __builtin_amdgcn_s_barrier();
+        OPUS_WAIT_VM(number<T::b_buffer_load_insts + T::sfb_buffer_load_insts + T::sfa_buffer_load_insts>{});
+        OPUS_S_BARRIER();
 
-        s_waitcnt_lgkmcnt(0_I);
+        OPUS_WAIT_LGKM(0_I);
         __builtin_amdgcn_s_setprio(1);
         mma_scale_accum<T, ELEM_C>(mma, v_a[0], v_b, v_sfa[tic][0], v_sfb[tic][0], v_c[0][0]);
         __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
         v_a[1] = load<T::VEC_A>(s_a[tic][1], u_ra);
-        s_waitcnt_vmcnt(0_I);
-        __builtin_amdgcn_s_barrier();
+        OPUS_WAIT_VM(0_I);
+        OPUS_S_BARRIER();
 
-        s_waitcnt_lgkmcnt(0_I);
+        OPUS_WAIT_LGKM(0_I);
         __builtin_amdgcn_s_setprio(1);
         mma_scale_accum<T, ELEM_C>(mma, v_a[1], v_b, v_sfa[tic][1], v_sfb[tic][0], v_c[1][0]);
         __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
 
         v_b = load<T::VEC_B>(s_b[tic][1], u_rb);
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
 
-        s_waitcnt_lgkmcnt(0_I);
+        OPUS_WAIT_LGKM(0_I);
         __builtin_amdgcn_s_setprio(1);
         mma_scale_accum<T, ELEM_C>(mma, v_a[0], v_b, v_sfa[tic][0], v_sfb[tic][1], v_c[0][1]);
         mma_scale_accum<T, ELEM_C>(mma, v_a[1], v_b, v_sfa[tic][1], v_sfb[tic][1], v_c[1][1]);
         __builtin_amdgcn_s_setprio(0);
-        __builtin_amdgcn_s_barrier();
+        OPUS_S_BARRIER();
         __builtin_amdgcn_sched_barrier(0);
     }
 
-    if (wave_id_n == 0) __builtin_amdgcn_s_barrier();
+    if (wave_id_n == 0) OPUS_S_BARRIER();
 
     // Store results to global memory
     auto p_coord_c = opus::make_tuple(wave_id_m, lane_id % mma.grpn_c, wave_id_n, lane_id / mma.grpn_c);

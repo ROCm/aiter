@@ -141,6 +141,10 @@ def _unshuffle_scale(scale, s, g, ks, scale_layout, group_size):
         return _unshuffle_mfma_scale(scale, s, g, ks, group_size)
     if scale_layout == "n32k4":
         return _unshuffle_n32k4_scale(scale, s, g, ks)
+    if scale_layout == "transpose":
+        # [g, ks_pad, s_pad] -> [s, g, ks]; slice before permuting so an
+        # over-allocated s_pad/ks_pad is dropped rather than read.
+        return _scale_bytes(scale)[:, :ks, :s].permute(2, 0, 1).contiguous()
     return _scale_bytes(scale)
 
 
@@ -546,6 +550,18 @@ def test_inverse_rope_group_quant(
     return ret
 
 
+def _failed_checks(ret):
+    """Names of the accuracy checks that did not pass in one sweep row.
+
+    checkAllclose returns 0 exactly when torch.isclose held on every element,
+    and the mismatching fraction otherwise, so a non-zero entry here is the
+    same condition that logged "failed!". The other gates in this file
+    (_check_scale_layout, check_graph, check_opus_layout_identity) raise, so
+    these columns are the only results that can otherwise pass silently.
+    """
+    return sorted(k for k, v in ret.items() if k.endswith("err") and v)
+
+
 def check_graph(s, h, g, head_dim, rd, group_size, dtype, scale_layout):
     """Capture the op in a HIP graph, replay on fresh data, compare against eager.
 
@@ -729,7 +745,8 @@ def main():
         row = [s, g, ks],
         mfma_tile = [g, s_pad, ks_pad] for gfx950 V_MFMA_SCALE,
         n32k4 = [s_pad/32, g, ks*32] for gfx1250 WMMA scaleB
-                (needs group size 32).
+                (needs group size 32),
+        transpose = [g, ks_pad, s_pad], m contiguous.
         e.g.: -l n32k4""",
     )
     parser.add_argument(
@@ -754,6 +771,8 @@ def main():
     if args.opus_tree:
         check_opus_layout_identity(args.opus_tree)
 
+    swept = 0
+    failures = []
     for dtype in args.dtype:
         df = []
         for (h, g), s, head_dim, rd, group_size, scale_layout in itertools.product(
@@ -773,6 +792,14 @@ def main():
                 s, h, g, head_dim, rd, group_size, dtype, scale_layout
             )
             df.append(ret)
+            swept += 1
+            failed = _failed_checks(ret)
+            if failed:
+                failures.append(
+                    f"s={s} h={h} g={g} head_dim={head_dim} rope_dim={rd} "
+                    f"group_size={group_size} layout={scale_layout} "
+                    f"dtype={dtype}: {', '.join(failed)}"
+                )
             if args.graph:
                 check_graph(s, h, g, head_dim, rd, group_size, dtype, scale_layout)
         df = pd.DataFrame(df)
@@ -782,6 +809,27 @@ def main():
         )
         if args.graph:
             aiter.logger.info("all graph capture/replay checks passed")
+
+    # The perf table prints an err column per candidate and says nothing about
+    # it, so before this the run exited 0 with failures on screen.
+    if not swept:
+        # Every combination was filtered out -- e.g. `-l n32k4` without 32 in
+        # --group-size. Exiting 0 here would report a vacuous run as a pass.
+        aiter.logger.error(
+            "no configuration was swept; check --scale-layout against "
+            "--group-size (n32k4 exists only at group size 32)"
+        )
+        sys.exit(1)
+    if failures:
+        for failure in failures:
+            aiter.logger.error("FAILED %s", failure)
+        aiter.logger.error(
+            "%d of %d swept configurations failed an accuracy check",
+            len(failures),
+            swept,
+        )
+        sys.exit(1)
+    aiter.logger.info("all %d swept configurations passed", swept)
 
 
 if __name__ == "__main__":

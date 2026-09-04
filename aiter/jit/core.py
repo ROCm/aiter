@@ -155,6 +155,12 @@ AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/batched_gemm_a8w8_blockscale_mxscale_tuned.csv",
 )
 
+# The same table for callers whose wo_a is baked into the (16,16) MFMA-fragment
+# layout. Its own env var and filename rather than a flavour of the one above,
+# matching the AITER_CONFIG_GEMM_A8W8[_BLOCKSCALE]_BPRESHUFFLE split: every row
+# here names a kernel that reads B only in that layout, so it is correct for a
+# preshuffled caller and wrong for any other, and one process can serve both
+# layouts and so has to be able to hold both tables at once.
 AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE = os.getenv(
     "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
     f"{AITER_ROOT_DIR}/aiter/configs/"
@@ -293,6 +299,8 @@ class AITER_CONFIG:
 
     @property
     def AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE(self):
+        # The name carries _bpreshuffle_ between mxscale and tuned, so the glob
+        # above cannot pick these files up and this one cannot pick those up.
         return self.get_config_file(
             "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
             AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE,
