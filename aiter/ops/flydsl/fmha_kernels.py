@@ -22,6 +22,7 @@ The kernel implements self-attention only (Lq == Lk). Cross-attention
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 
 import torch
@@ -239,11 +240,11 @@ def flydsl_flash_attn_varlen_func(
     # FlyDSL handles only plain MHA. Any unsupported feature (bias, alibi, sink,
     # dropout, sliding window, paging, probs/deterministic) falls through to
     # CK/Triton instead of being silently dropped.
-    supported = (
-        get_gfx() == "gfx1250"
-        and q.shape[-1] == 192
-        and v.shape[-1] == 128
-        and q.dtype == torch.bfloat16
+    gfx = get_gfx()
+    plain = (
+        q.dtype == torch.bfloat16
+        and k.dtype == torch.bfloat16
+        and v.dtype == torch.bfloat16
         and dropout_p == 0.0
         and tuple(window_size[:2]) == (-1, -1)
         and block_table is None
@@ -253,22 +254,52 @@ def flydsl_flash_attn_varlen_func(
         and not deterministic
         and not return_attn_probs
     )
-    if not supported:
-        return None
+    if gfx == "gfx1250" and plain and q.shape[-1] == 192 and v.shape[-1] == 128:
+        if out is None:
+            out = torch.empty_like(q[:, :, : v.shape[-1]])
+        return flash_attn_varlen_d192_gfx1250(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            out=out,
+            return_lse=return_lse,
+        )
 
-    # gfx1250 — varlen THD, D_qk=192 D_v=128, bf16
-    if out is None:
-        out = torch.empty_like(q[:, :, : v.shape[-1]])
-    return flash_attn_varlen_d192_gfx1250(
-        q,
-        k,
-        v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        out=out,
-        return_lse=return_lse,
-    )
+    hd72_enabled = os.environ.get("AITER_FLYDSL_FMHA_HD72", "1") != "0"
+    if (
+        hd72_enabled
+        and gfx == "gfx950"
+        and plain
+        and not causal
+        and not return_lse
+        and q.shape[-1] == 72
+        and v.shape[-1] == 72
+        and k.shape[-1] == 72
+        and q.shape[1] == k.shape[1]
+        and q.shape[1] == v.shape[1]
+    ):
+        from .kernels.fmha_gfx950.fmha_kernel import flash_attn_varlen_d72_gfx950
+
+        if out is None:
+            out = torch.empty_like(q)
+        return flash_attn_varlen_d72_gfx950(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=False,
+            out=out,
+            return_lse=False,
+        )
+
+    return None
