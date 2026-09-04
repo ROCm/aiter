@@ -6,11 +6,20 @@ import triton
 
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a8w8 import (
     _batched_gemm_a8w8_kernel,
-    _get_config,
 )
+from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+
+def _get_config(
+    M: int,
+    N: int,
+    K: int,
+):
+
+    return get_gemm_config("BATCHED_GEMM-A8W8", M, N, K)
 
 
 def batched_gemm_a8w8(

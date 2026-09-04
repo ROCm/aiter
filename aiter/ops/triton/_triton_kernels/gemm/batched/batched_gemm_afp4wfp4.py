@@ -6,7 +6,6 @@ import triton.language as tl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
-from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 _batched_gemm_afp4_wfp4_repr = make_kernel_repr(
     "_batched_gemm_afp4_wfp4_kernel",
@@ -324,39 +323,3 @@ def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
         )
 
     return SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT
-
-
-def _get_config(
-    M: int,
-    N: int,
-    K: int,
-):
-    # Note: Config files use K=2*K in their naming
-    # Custom bounds add a dedicated M_LEQ_320 bucket (BLOCK_SIZE_M=128) so M~320
-    # avoids the ~37% tile padding of BLOCK_SIZE_M=256, without affecting M>320
-    # (which keeps BLOCK_SIZE_M=256 via the "any" bucket).
-    config, is_tunned = get_gemm_config(
-        "BATCHED_GEMM-AFP4WFP4",
-        M,
-        N,
-        2 * K,
-        bounds=(4, 8, 16, 32, 64, 128, 256, 320, 512, 1024, 2048, 4096, 8192),
-    )
-
-    # Apply custom split-K logic for AFP4WFP4
-    if config["NUM_KSPLIT"] > 1:
-        SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
-            K, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
-        )
-
-        config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE
-        config["BLOCK_SIZE_K"] = BLOCK_SIZE_K
-        config["NUM_KSPLIT"] = NUM_KSPLIT
-    else:
-        config["SPLITK_BLOCK_SIZE"] = 2 * K
-
-    if config["BLOCK_SIZE_K"] >= 2 * K:
-        config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
-        config["SPLITK_BLOCK_SIZE"] = 2 * K
-
-    return config, is_tunned

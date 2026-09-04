@@ -9,15 +9,29 @@ from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
 )
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_bf16 import (
     _batched_gemm_bf16_kernel,
-    _get_config,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
+from aiter.ops.triton.utils.gemm_config_utils import (
+    compute_splitk_params,
+    get_gemm_config,
+)
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
 _GLUON_SUPPORTED_ARCHS = ("gfx1250",)
+
+
+def _get_config(
+    M: int,
+    N: int,
+    K: int,
+    B: int | None = None,
+):
+
+    # BF16 uses the shared 16-bit activation / 16-bit weight batched GEMM config.
+    config, is_tunned = get_gemm_config("BATCHED_GEMM-A16W16", M, N, K, B=B)
+    return compute_splitk_params(config, K), is_tunned
 
 
 def _is_gluon_available():

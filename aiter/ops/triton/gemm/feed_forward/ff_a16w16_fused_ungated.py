@@ -9,11 +9,20 @@ import triton
 from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
 from aiter.ops.triton._triton_kernels.gemm.feed_forward.ff_a16w16_fused_ungated import (
     _ff_a16w16_fused_ungated,
-    _get_config,
 )
+from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+
+def _get_config(
+    M: int,
+    N: int,
+    K: int,
+):
+
+    return get_gemm_config("FF-A16W16-fused", M, N, K, bounds=(4, 8, 64, 4096))
 
 
 def ff_a16w16_fused_ungated(

@@ -6,7 +6,6 @@ import triton.language as tl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
-from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 _ff_a16w16_fused_gated_repr = make_kernel_repr(
     "_ff_a16w16_fused_gated",
@@ -205,11 +204,3 @@ def _ff_a16w16_fused_gated(
         else:
             w2_ptrs += BLOCK_SIZE_K * stride_w2k
             y_ptrs += BLOCK_SIZE_K * stride_yk
-
-
-def _get_config(
-    M: int,
-    N: int,
-    K: int,
-):
-    return get_gemm_config("FF-A16W16-fused", M, N, K, bounds=(4, 8, 64, 4096))
