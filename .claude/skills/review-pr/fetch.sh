@@ -846,6 +846,14 @@ fi
 "$SKILLS_ROOT/review-pr/triage.py" siblings "$WORK/pr.diff" "$PROJECT_ROOT" \
   | tee "$WORK/siblings.txt"
 
+# What became of each guard the diff deletes. D4 is red and fires on 69 of 600 open PRs;
+# 14.5% of those add every deleted guard straight back and are not an event at all. The
+# pair is printed rather than filtered on, because the guard that returns in changed form
+# is where the finding is: a null check swapped for a size check, a TORCH_CHECK bound
+# halved, an equality widened to a set membership.
+"$SKILLS_ROOT/review-pr/triage.py" guards "$WORK/pr.diff" \
+  | tee "$WORK/guards.txt"
+
 # Every first-party import the diff ADDS, resolved against the branch this PR merges
 # INTO -- fetched fresh, not the PR base and not whatever is on disk. A stale root
 # makes this check silently pass; that is the whole failure mode it exists to catch.

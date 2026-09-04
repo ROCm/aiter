@@ -171,6 +171,13 @@ Trigger: `::zeros() → ::empty()` / `torch.zeros → torch.empty` where old com
 Real example (aiter#4043): old: "trailing pad must read back as zero for the asm reader, so zero-initialise it here" → new: "trailing pad is never read by the asm reader, so no zero-init is needed" — two comments directly contradict; PR cites no spec. Human reviewers missed this, only saw the profiling screenshot.
 → `🔴 D4: [operation] reverses a documented safety invariant — cite the spec/asm/test proving new assumption is safe`
 
+**Evidence:** `$WORK/guards.txt` sorts every deleted guard into moved unchanged, returned
+in changed form, or gone, and prints the before/after pair for the changed ones. Start
+there: 14.5% of the PRs that trip this family put every guard straight back, and the
+changed pairs are where the reversal shows — `AITER_CHECK(p != nullptr)` becoming
+`AITER_CHECK(p->size(0) >= n)`, `hidden_size >= (tile_k * split_k) * 2` becoming
+`hidden_size >= (tile_k * split_k)`.
+
 **D5 — Verbatim duplication across backbone files** ⚠️
 The same fix is copy-pasted into 2+ Tier 1/2 backbone files with trivial name substitution (different variable names, identical algorithm and comments). AI code signature: changes look symmetric but each file's invariants may differ and were not independently verified.
 Trigger: nearly identical `+` blocks appearing in two backbone files in the same PR diff; same formula / same comment structure / same magic constants, only variable names differ.

@@ -464,6 +464,73 @@ def tree_root(arg):
     return root
 
 
+GUARD_LINE = re.compile(r"(\bassert\b|torch\.zeros|\.contiguous\(\)|AITER_CHECK|TORCH_CHECK)")
+
+
+def _guard_subject(line):
+    return set(re.findall(r"\b[a-z_][a-z0-9_]{3,}\b", line.lower())) - GUARD_NOISE
+
+
+def guard_changes(diff_text):
+    """Each guard the diff deletes, and what became of it: moved, changed, or gone.
+
+    `invariant-removed` fires on 69 of 600 open PRs and D4 is red, so the reviewer has to
+    establish what happened to every deleted assert by hand -- deleted_guard_symbols says
+    itself that the usual answer is "it moved". In 14.5% of them every deleted guard is
+    added straight back unchanged and there is nothing to review at all; 58% drop at least
+    one outright, and 46% return at least one in changed form.
+
+    The rest is why this reports the pair instead of filtering on it. A guard that returns
+    in changed form looked like the same non-event, and is where the finding actually
+    lives: aiter#4295 replaces a null check with a size check and the null check is simply
+    gone, aiter#4279 halves a TORCH_CHECK bound, aiter#5168 widens an equality to a set
+    membership. Suppressing those would have hidden three real weakenings out of seven read.
+    """
+    files = parse(diff_text)
+    dele = [l for f in files.values() for l in f["del"]
+            if GUARD_LINE.search(l) and not is_comment_line(l)]
+    add = [l for f in files.values() for l in f["add"] if not is_comment_line(l)]
+    add_exact = {l.strip() for l in add}
+    add_guards = [l.strip() for l in add if GUARD_LINE.search(l)]
+    moved, changed, gone = [], [], []
+    for d in dele:
+        ds = d.strip()
+        if ds in add_exact:
+            moved.append(ds)
+            continue
+        best, score = None, 0
+        for a in add_guards:
+            n = len(_guard_subject(ds) & _guard_subject(a))
+            if n > score:
+                best, score = a, n
+        if score >= 2:
+            changed.append((ds, best))
+        else:
+            gone.append(ds)
+    return moved, changed, gone
+
+
+def render_guard_changes(res):
+    moved, changed, gone = res
+    if not (moved or changed or gone):
+        return "GUARDS: this diff deletes no assert, check, zero-init or contiguous call"
+    out = ["GUARDS DELETED -- %d returned unchanged, %d returned in changed form, %d gone."
+           % (len(moved), len(changed), len(gone))]
+    if changed:
+        out.append("The changed ones are where D4 and B7 live: same subject, "
+                   "different bound.")
+    for a, b in changed[:8]:
+        out.append("  changed:")
+        out.append("    - %s" % a[:110])
+        out.append("    + %s" % b[:110])
+    for g in gone[:8]:
+        out.append("  gone:    %s" % g[:110])
+    if moved:
+        out.append("  moved unchanged: %d line(s); the invariant still holds somewhere"
+                   % len(moved))
+    return "\n".join(out)
+
+
 def is_comment_line(line):
     s = line.strip()
     return (not s) or s.startswith(("#", "//", "/*", "*", '"""', "'''"))
@@ -1810,7 +1877,7 @@ if __name__ == "__main__":
                         "mapping", "diagnostic", "testquality",
                         "twins", "citest", "perfclaims",
                         "structabi", "commentonly", "card", "corefiles",
-                        "kerneltest", "siblings"):
+                        "kerneltest", "siblings", "guards"):
         print("usage: triage.py rules <diff> [title]\n"
               "       triage.py evidence <diff> <head-file>...\n"
               "       triage.py symbols <diff> <merge-target-root>\n"
@@ -1828,9 +1895,13 @@ if __name__ == "__main__":
               "       triage.py corefiles <core_files.txt> <diff>\n"
               "       triage.py kerneltest <diff>\n"
               "       triage.py siblings <diff> <root>\n"
+              "       triage.py guards <diff>\n"
               "       triage.py card <card.md> <verdicts> <diagnostic> <answers> <diff>", file=sys.stderr)
         raise SystemExit(2)
 
+    if mode == "guards":
+        print(render_guard_changes(guard_changes(open(sys.argv[2]).read())))
+        sys.exit(0)
     if mode == "siblings":
         print(render_siblings(sibling_variants(open(sys.argv[2]).read(), tree_root(sys.argv[3]))))
         sys.exit(0)

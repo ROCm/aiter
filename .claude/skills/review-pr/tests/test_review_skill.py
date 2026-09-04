@@ -2594,3 +2594,75 @@ class TestTritonTriggersCarryTheirMaterial(unittest.TestCase):
         t5 = body[body.index("**T5 —"):body.index("**T5 —") + 600]
         self.assertIn("accumulator", t5.split("Trigger:")[1][:200])
 
+
+class TestGuardChanges(unittest.TestCase):
+    """D4 is red and `invariant-removed` fires on 69 of 600 open PRs, so what happened to
+    each deleted guard is work the reviewer does on every one of them.
+
+    Written first as a filter -- 14.5% re-add every guard verbatim, another quarter return
+    them "reworded on the same subject", so suppressing both looked like removing 40% of
+    the noise. Reading seven of the reworded ones killed that: aiter#4295 replaces a null
+    check with a size check and the null check is gone, aiter#4279 halves a TORCH_CHECK
+    bound, aiter#5168 widens an equality to a set membership. Three of seven were real
+    weakenings, which is the finding, not the noise. So it reports the pair."""
+
+    def diff(self, path, minus, plus=()):
+        head = ("diff --git a/%s b/%s\n--- a/%s\n+++ b/%s\n@@ -1,4 +1,4 @@\n"
+                % (path, path, path, path))
+        return head + "".join("-%s\n" % m for m in minus) + "".join("+%s\n" % a for a in plus)
+
+    def guards(self, diff):
+        with tempfile.TemporaryDirectory() as d:
+            f = pathlib.Path(d) / "pr.diff"
+            f.write_text(diff)
+            return subprocess.run([sys.executable, str(TRIAGE), "guards", str(f)],
+                                  capture_output=True, text=True).stdout
+
+    def test_a_guard_added_back_verbatim_is_a_non_event(self):
+        line = "    assert num_head_qo % 16 == 0"
+        out = self.guards(self.diff("aiter/ops/mla.py", [line], [line]))
+        self.assertIn("moved unchanged", out)
+        self.assertIn("0 returned in changed form, 0 gone", out)
+        self.assertNotIn("  gone:", out)
+        self.assertNotIn("  changed:", out)
+
+    def test_a_guard_that_simply_leaves_is_reported_gone(self):
+        out = self.guards(self.diff("aiter/ops/mla.py",
+                                    ["    assert num_head_qo % 16 == 0"], ["    pass"]))
+        self.assertIn("  gone:", out)
+        self.assertIn("num_head_qo", out)
+
+    def test_a_weakened_bound_is_shown_as_a_pair(self):
+        """aiter#4279 halves it. Filtering this out as "the check came back" was the
+        mistake this class exists to prevent."""
+        out = self.guards(self.diff(
+            "csrc/k.cu",
+            ["  TORCH_CHECK(hidden_size >= (tile_k * split_k) * 2, \"msg\");"],
+            ["  TORCH_CHECK(hidden_size >= (tile_k * split_k), \"msg\");"]))
+        self.assertIn("  changed:", out)
+        self.assertIn("* 2", out)
+        self.assertNotIn("moved unchanged", out)
+
+    def test_a_null_check_swapped_for_a_size_check_is_shown_as_a_pair(self):
+        """aiter#4295. Same subject, and the null guard is gone."""
+        out = self.guards(self.diff(
+            "csrc/k.cu",
+            ["  AITER_CHECK(valid_split_count != nullptr && valid_split_count->data_ptr(),"],
+            ["  AITER_CHECK(valid_split_count->size(0) >= num_seqs,"]))
+        self.assertIn("  changed:", out)
+        self.assertIn("nullptr", out)
+
+    def test_comments_are_not_guards(self):
+        """aiter#4062 condenses comments across 252 files; prose mentioning contiguous is
+        not a deleted invariant, and the family already learned this once."""
+        out = self.guards(self.diff("aiter/ops/mla.py",
+                                    ["    # x must be .contiguous() before the asm call"]))
+        self.assertIn("deletes no assert", out)
+
+    def test_a_diff_with_no_guards_says_so_rather_than_nothing(self):
+        out = self.guards(self.diff("aiter/ops/mla.py", ["    x = 1"], ["    x = 2"]))
+        self.assertIn("deletes no assert", out)
+
+    def test_fetch_runs_it(self):
+        self.assertIn('triage.py" guards', FETCH.read_text())
+
