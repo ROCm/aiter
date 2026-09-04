@@ -1,6 +1,8 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
 
 @triton.jit
 def _compute_static_fp8_quant(tensor, scale):
@@ -10,7 +12,16 @@ def _compute_static_fp8_quant(tensor, scale):
     return tensor
 
 
-@triton.jit
+_downcast_to_static_fp8_repr = make_kernel_repr(
+    "_downcast_to_static_fp8",
+    [
+        "BLOCK_M",
+        "BLOCK_N",
+    ],
+)
+
+
+@triton.jit(repr=_downcast_to_static_fp8_repr)
 def _downcast_to_static_fp8(
     x_ptr,
     stride_x_m,
@@ -165,7 +176,17 @@ def _compute_mx_quant_and_scale(
     return out_tensor, dequant_scale_exponent
 
 
-@triton.jit
+_downcast_to_mxfp_repr = make_kernel_repr(
+    "_downcast_to_mxfp",
+    [
+        "BLOCK_SIZE_OUT_DIM",
+        "BLOCK_SIZE_QUANT_DIM",
+        "DEQUANT_SCALE_ROUNDING_MODE",
+    ],
+)
+
+
+@triton.jit(repr=_downcast_to_mxfp_repr)
 def _downcast_to_mxfp(
     mx_tensor_ptr,
     stride_mxt_outer,
@@ -262,7 +283,16 @@ def _downcast_to_mxfp(
     tl.store(mx_tensor_ptr + mx_tensor_offsets, out_tensor, mask=full_mask_mxt)
 
 
-@triton.jit
+_upcast_from_mxfp_repr = make_kernel_repr(
+    "_upcast_from_mxfp",
+    [
+        "BLOCK_SIZE_OUT_DIM",
+        "BLOCK_SIZE_QUANT_DIM",
+    ],
+)
+
+
+@triton.jit(repr=_upcast_from_mxfp_repr)
 def _upcast_from_mxfp(
     out_ptr,
     stride_o_outer,
@@ -417,7 +447,16 @@ def _upcast_from_mxfp(
     tl.store(out_ptr + out_offsets, out_tensor, mask=full_mask_out)
 
 
-@triton.jit
+_smoothquant_fuse_quant_kernel_repr = make_kernel_repr(
+    "_smoothquant_fuse_quant_kernel",
+    [
+        "BLOCK_M",
+        "BLOCK_K",
+    ],
+)
+
+
+@triton.jit(repr=_smoothquant_fuse_quant_kernel_repr)
 def _smoothquant_fuse_quant_kernel(
     # Input tensors
     X_ptr,  # bf16 input [M, K]
@@ -537,7 +576,16 @@ def _smoothquant_fuse_quant_kernel(
         tl.store(y_ptrs, x_int8, mask=mask)
 
 
-@triton.jit
+_smoothquant_fuse_quant_kernel_single_pass_repr = make_kernel_repr(
+    "_smoothquant_fuse_quant_kernel_single_pass",
+    [
+        "BLOCK_M",
+        "BLOCK_K",
+    ],
+)
+
+
+@triton.jit(repr=_smoothquant_fuse_quant_kernel_single_pass_repr)
 def _smoothquant_fuse_quant_kernel_single_pass(
     # Input tensors
     X_ptr,  # bf16 input [M, K]
