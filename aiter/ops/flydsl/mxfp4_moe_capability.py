@@ -65,18 +65,19 @@ class MoeCall:
     gate_mode: Any
     isG1U1: bool
     doweight_stage1: bool
-    expert_mask: torch.Tensor | None
-    num_local_tokens: torch.Tensor | None
-    bias1: torch.Tensor | None
-    bias2: torch.Tensor | None
-    a1_scale: torch.Tensor | None
-    a2_scale: torch.Tensor | None
-    stage2_scatter: Any
-    hidden_pad: int
-    intermediate_pad: int
-    block_size_M: int | None
-    beta: float | None
-    linear_beta: float | None
+    # Optional beyond this point: absent means "not requested".
+    expert_mask: torch.Tensor | None = None
+    num_local_tokens: torch.Tensor | None = None
+    bias1: torch.Tensor | None = None
+    bias2: torch.Tensor | None = None
+    a1_scale: torch.Tensor | None = None
+    a2_scale: torch.Tensor | None = None
+    stage2_scatter: Any = None
+    hidden_pad: int = 0
+    intermediate_pad: int = 0
+    block_size_M: int | None = None
+    beta: float | None = None
+    linear_beta: float | None = None
 
     @property
     def tokens(self) -> int:

@@ -1,4 +1,3 @@
-# SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
@@ -48,6 +47,7 @@ from aiter.jit.core import (
     get_asm_dir,
 )
 from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime, gfx_from_cu_num
+from aiter.ops.flydsl import moe_direct_m1
 from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_BETA,
     DEFAULT_SITUV2_LINEAR_BETA,
@@ -6057,14 +6057,19 @@ class Mxfp4FlydslTuner(FmoeTuner):
         "config_env_name": "AITER_CONFIG_FMOE",
     }
 
+    #: Stage1 XCD swizzles to sweep; worth ~1% once the rows span enough blocks.
+    XCD_SWIZZLES: ClassVar[tuple[int, ...]] = (0, 4)
+
     @staticmethod
-    def _g1_kname(bm, use_nt, inline_quant):
-        # flydsl_mxmoe_g1_a4w4_<BM>x256x256[_f16in][_nt]; see mxfp4_kname.py.
+    def _g1_kname(bm, use_nt, inline_quant, xcd=0):
+        # flydsl_mxmoe_g1_a4w4_<BM>x256x256[_f16in][_nt][_xcd<n>]; see mxfp4_kname.py.
         name = f"flydsl_mxmoe_g1_a4w4_{bm}x256x256"
         if inline_quant:
             name += "_f16in"
         if use_nt:
             name += "_nt"
+        if xcd:
+            name += f"_xcd{xcd}"
         return name
 
     @staticmethod
@@ -6079,7 +6084,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             name += "_cshuffle"
         return name
 
-    def _candidate_row(self, row, bm, kn1, kn2):
+    def _candidate_row(self, row, bm, kn1, kn2, flat=0):
         cand = {k: row[k] for k in self.keys}
         cand.update(
             {
@@ -6094,7 +6099,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 "us": 0,
                 "run_1stage": 0,
                 "xbf16": 0,
-                "flat": 0,
+                "flat": flat,
                 "tflops": 0,
                 "bw": 0,
             }
@@ -6107,9 +6112,18 @@ class Mxfp4FlydslTuner(FmoeTuner):
 
         g2_bms = {v[0] for v in G2}
         cands = []
+        # (C) direct-M1: sortless, so only ever legal at token==1.
+        if int(row["token"]) == 1:
+            for kn1, kn2 in moe_direct_m1.candidate_kernel_pairs(
+                int(row["model_dim"]), int(row["inter_dim"])
+            ):
+                cands.append(self._candidate_row(row, 32, kn1, kn2, flat=1))
         for bm in sorted({v[0] for v in G1}):
-            for _, n1, iq1 in sorted(v for v in G1 if v[0] == bm):
-                kn1 = self._g1_kname(bm, n1, iq1)
+            for kn1 in [
+                self._g1_kname(bm, n1, iq1, xcd)
+                for _, n1, iq1 in sorted(v for v in G1 if v[0] == bm)
+                for xcd in self.XCD_SWIZZLES
+            ]:
                 # (A) native mxmoe g2 candidates (flydsl_mxmoe_g2_a4w4_*).
                 if bm in g2_bms:
                     for _, n2, ep in sorted(v for v in G2 if v[0] == bm):
@@ -6249,6 +6263,41 @@ class Mxfp4FlydslTuner(FmoeTuner):
             doweight_stage1=False,
         )
 
+    @staticmethod
+    def _direct_e2e(data, kn1, kn2, dtype, activation):
+        """Run one direct-M1 candidate through the production executor."""
+        from types import SimpleNamespace
+
+        from aiter.ops.flydsl.mxfp4_moe_capability import MoeCall
+
+        # MoeCall derives shapes, expert count and topk from the tensors, so
+        # only the kernel pair has to be injected as metadata.
+        call = MoeCall(
+            hidden_states=data["input"],
+            w1=data["w1_a16"],
+            w2=data["w2_a16"],
+            topk_weight=data["topk_weights"],
+            topk_ids=data["topk_ids"],
+            w1_scale=data["w1s_a16"],
+            w2_scale=data["w2s_a16"],
+            dtype=dtype,
+            q_dtype_a=dtypes.fp4x2,
+            q_dtype_w=dtypes.fp4x2,
+            quant_type=QuantType.per_1x32,
+            activation=activation,
+            gate_mode="separated",
+            isG1U1=True,
+            doweight_stage1=False,
+            block_size_M=32,
+        )
+        metadata = SimpleNamespace(
+            **{
+                f"stage{n}": SimpleNamespace(keywords={f"kernelName{n}": kn})
+                for n, kn in ((1, kn1), (2, kn2))
+            }
+        )
+        return moe_direct_m1.run(metadata, call)
+
     def _run_candidate(self, row, candidate, args):
         from aiter.test_common import run_perftest
 
@@ -6262,23 +6311,35 @@ class Mxfp4FlydslTuner(FmoeTuner):
             else ActivationType.Silu
         )
         data = self._prepare_case(token, h, e, ne, topk, dtype)
-        out = self._port_e2e(data, kn1, kn2, topk, ne, h, dtype)
+        if moe_direct_m1.is_direct_kernel_pair(kn1, kn2):
+
+            def run():
+                return self._direct_e2e(data, kn1, kn2, dtype, activation)
+
+        else:
+
+            def run():
+                return self._port_e2e(data, kn1, kn2, topk, ne, h, dtype)
+
+        out = run()
         ref = self._torch_ref(data, topk, dtype, activation)
         err = cosine_diff_compare(ref, out, msg=f"port[{kn1}+{kn2}]")
         if err is None or float(err) > args.errRatio:
             raise RuntimeError(f"cosine err_ratio {err} > {args.errRatio}")
         _, us = run_perftest(
-            lambda: self._port_e2e(data, kn1, kn2, topk, ne, h, dtype),
+            run,
             num_warmup=int(args.warmup),
             num_iters=int(args.iters),
         )
         us = round(float(us), 4)
+        # The pair is timed as a unit, so the whole e2e lands in us1 and us2 is
+        # 0. err is formatted the way the other tuners write the CSV column.
         candidate.update(
             {
                 "us1": us,
                 "us": us,
-                "err1": round(float(err), 6),
-                "err2": round(float(err), 6),
+                "err1": f"{float(err):.1%}",
+                "err2": f"{float(err):.1%}",
             }
         )
         return us

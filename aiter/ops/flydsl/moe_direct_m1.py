@@ -156,7 +156,8 @@ def _check_shapes(plan: DirectM1Plan, hidden: int, inter: int) -> str:
     """Return the first tiling invariant the shapes violate, or ``''``."""
     p1, p2 = plan.stage1, plan.stage2
     for label, size, tile in (
-        ("model_dim", hidden, p1["tile_k"]),
+        # k_wave splits the contraction; each wave covers model_dim / k_wave.
+        ("model_dim", hidden, p1["tile_k"] * int(p1.get("k_wave", 1) or 1)),
         ("2*inter_dim", 2 * inter, p1["tile_n"]),
         ("model_dim", hidden, p2["tile_n"]),
         ("inter_dim", inter, p2["tile_k"]),
@@ -164,6 +165,47 @@ def _check_shapes(plan: DirectM1Plan, hidden: int, inter: int) -> str:
         if size <= 0 or size % tile:
             return f"{label}={size} is not a positive multiple of {tile}"
     return ""
+
+
+def candidate_kernel_pairs(model_dim: int, inter_dim: int) -> list[tuple[str, str]]:
+    """Enumerate the direct kernel pairs legal for one shape, for the tuner.
+
+    ``parse_stage2`` pins stage2 down to the NT flag, so the space is stage1's
+    tiling, which is shape dependent -- hence per-model tuning.
+    """
+    from aiter.ops.flydsl.moe_kernels import (
+        build_flydslv2_gemm2_name,
+        get_flydsl_stage1_kernels,
+    )
+
+    stage2 = [
+        DIRECT_M1_STAGE2_PREFIX
+        + build_flydslv2_gemm2_name(
+            "fp4",
+            "fp4",
+            "bf16",
+            tm=32,
+            tn=128,
+            tk=128,
+            epilog="atomic",
+            persist=False,
+            use_nt=use_nt,
+            sbm=32,
+        ).removeprefix("flydsl_moe2_")
+        for use_nt in (False, True)
+    ]
+    pairs = []
+    # Stage1's packed fp4 output is spelled as a ``_fp4`` suffix on a bf16 name.
+    for base in get_flydsl_stage1_kernels("fp4", "fp4", "bf16"):
+        kn1 = DIRECT_M1_STAGE1_PREFIX + base.removeprefix("flydsl_moe1_") + "_fp4"
+        for kn2 in stage2:
+            try:
+                plan = parse_direct_plan(kn1, kn2)
+            except ValueError:
+                break  # stage1 rejected; kn2 cannot rescue it
+            if not _check_shapes(plan, model_dim, inter_dim):
+                pairs.append((kn1, kn2))
+    return pairs
 
 
 def cfg_is_supported(
