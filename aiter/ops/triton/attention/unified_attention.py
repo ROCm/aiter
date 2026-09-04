@@ -128,16 +128,16 @@ def _gfx950_gluon_supported(params: _UAParams):
     """Shapes the gfx950 Gluon kernel covers.
 
     bf16 or fp8 for both q and the KV cache, a power-of-2 head size up to 256
-    that k and v share, and none of softcap / qq_bias / alibi / pre-shuffled
-    cache. One predicate for all three gates: the arch ships a single kernel,
-    so the 2d and 3d paths accept exactly the same shapes.
+    that k and v share, and none of softcap / qq_bias / alibi. One predicate
+    for all three gates: the arch ships a single kernel, so the 2d and 3d paths
+    accept exactly the same shapes.
     """
-    # A shuffled tile is exactly one page, and the PV dot reduces over the tile,
-    # so the page must be a power of 2 and at least the MFMA's K width.
+    # A pre-shuffled cache is fine at any tile size -- the gather loader indexes
+    # the block table per token -- but V's shuffle groups W tokens, so a group
+    # must not straddle pages.
     if params.shuffled_kv_cache and (
-        params.kv_cache_dtype == torch.uint8
-        or params.block_size & (params.block_size - 1)
-        or params.block_size < 64
+        params.block_size & (params.block_size - 1)
+        or params.block_size < params.k_width
     ):
         return False
 
@@ -365,7 +365,10 @@ def unified_attention(
             "kv_split", params, backend="gluon" if use_gluon_3d else "triton"
         )
         NUM_SEGMENTS = config["NUM_SEGMENTS"]
-        if shuffled_kv_cache:
+        # The triton kernels read a shuffled tile as one contiguous page, so
+        # there the tile is the page. The gfx950 gluon loader gathers per token
+        # and keeps its tuned tile.
+        if shuffled_kv_cache and not use_gluon_3d:
             TILE_SIZE = block_size
         else:
             TILE_SIZE = config["TILE_SIZE"]
@@ -980,18 +983,19 @@ def _unified_attention_gfx950(
     then merges.
 
     With shuffled_kv_cache the caches must be in the layout shuffle_kv_cache
-    produces (op_tests/triton_tests/attention/test_unified_attention.py; the MLA
-    equivalent is written at fill time by cat_and_cache_mla): K as
-    [num_blocks, num_kv_heads, head_size // W, block_size, W] and V as
-    [num_blocks, num_kv_heads, block_size // W, head_size, W], where
-    W = 16 // element_size. The W run has to sit on each dot's reduction axis,
+    produces (op_tests/triton_tests/attention/test_unified_attention.py): 
+    
+    K = [num_blocks, num_kv_heads, head_size // W, block_size, W] 
+    V = [num_blocks, num_kv_heads, block_size // W, head_size, W], 
+      where
+      W = 16 // element_size. 
+
+    The W run has to sit on each dot's reduction axis,
     so K groups head_size and V groups tokens. The triton backend reads the same
     layout off the cache shape, so one shuffled cache serves both.
     """
     BLOCK_Q = BLOCK_M // params.num_queries_per_kv
     assert BLOCK_Q >= 1
-    if params.shuffled_kv_cache:
-        TILE_SIZE = params.block_size
 
     if params.all_decode:
         total_query_blocks = params.num_seqs
