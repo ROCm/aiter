@@ -19,10 +19,12 @@ from __future__ import annotations
 import torch
 import triton
 
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.triton._triton_kernels.attention.na3d_flash import _na3d_flash_fwd
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+_NA3D_FLASH_ARCHS = ("gfx942", "gfx950")
 
 
 def na3d_flash_attn(
@@ -48,6 +50,11 @@ def na3d_flash_attn(
     B, T, H, W, NH, HD = q.shape
     KT, KH, KW = kernel_size
     SEQ = T * H * W
+
+    gfx = get_gfx()
+    assert (
+        gfx in _NA3D_FLASH_ARCHS
+    ), f"na3d_flash_attn is only supported on {_NA3D_FLASH_ARCHS}; got {gfx}."
 
     _LOGGER.info(
         "NA3D_FLASH_FWD: q=%s kernel=(%d,%d,%d) SEQ=%d HD=%d",
