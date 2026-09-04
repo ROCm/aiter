@@ -469,6 +469,69 @@ def asm_gemm(
     return gemm_a16w16_asm(inp, weights, out_asm, bias, splitK, kernelName, bpreshuffle)
 
 
+_FLY_BS1250_NAME_RE = None
+
+
+def _parse_flydsl_blockscale_gfx1250_kname(name: str) -> dict:
+    """Parse flydsl_a8w8_blockscale_gfx1250_t{tm}x{tn}x{tk}_mw{mw}_nw{nw}_sb{sbn}x{sbk}_nb{nb}_sk{sk}_{cb|mb}."""
+    global _FLY_BS1250_NAME_RE
+    if _FLY_BS1250_NAME_RE is None:
+        import re
+
+        _FLY_BS1250_NAME_RE = re.compile(
+            r"flydsl_a8w8_blockscale_gfx1250_t(\d+)x(\d+)x(\d+)_mw(\d+)_nw(\d+)"
+            r"_sb(\d+)x(\d+)_nb(\d+)_sk(\d+)_(cb|mb)"
+        )
+    m = _FLY_BS1250_NAME_RE.match(name)
+    assert m is not None, f"unrecognized flydsl blockscale kernel name: {name!r}"
+    tm, tn, tk, mw, nw, sbn, sbk, nb, sk, var = m.groups()
+    return {
+        "tile_m": int(tm),
+        "tile_n": int(tn),
+        "tile_k": int(tk),
+        "m_warp": int(mw),
+        "n_warp": int(nw),
+        "scale_block_n": int(sbn),
+        "scale_block_k": int(sbk),
+        "num_buffers": int(nb),
+        "split_k": int(sk),
+        "variant": "compute_bound" if var == "cb" else "memory_bound",
+    }
+
+
+def flydsl_blockscale_gfx1250_gemm(
+    inp: Tensor,
+    weights: Tensor,
+    solidx: int,
+    bias: Tensor | None = None,
+    otype: torch.dtype | None = None,
+    scale_a: Tensor | None = None,
+    scale_b: Tensor | None = None,
+    scale_c: Tensor | None = None,
+    bpreshuffle=False,
+    config: dict | None = None,
+):
+    assert (
+        scale_a is not None and scale_b is not None
+    ), "flydsl a8w8 blockscale requires per-block x_scale and w_scale."
+    assert scale_c is None, "flydsl a8w8 blockscale does not support scale_c."
+    assert bias is None, "flydsl a8w8 blockscale does not support bias."
+    assert bpreshuffle, "flydsl a8w8 blockscale expects gfx1250-preshuffled weights."
+    from aiter.ops.flydsl.gemm_a8w8_blockscale_f32_gfx1250 import (
+        gemm_a8w8_blockscale as _fly_bs1250,
+    )
+
+    cfg = _parse_flydsl_blockscale_gfx1250_kname(config["kernelName"])
+    return _fly_bs1250(
+        inp,
+        weights,
+        scale_a,
+        scale_b,
+        dtype=otype if otype is not None else torch.bfloat16,
+        **cfg,
+    )
+
+
 def flydsl_gemm(
     inp: Tensor,
     weights: Tensor,
@@ -601,6 +664,7 @@ solMap = {
     "asm": asm_gemm,
     "triton": triton_gemm,
     "flydsl": flydsl_gemm,
+    "flydsl_blockscale_gfx1250": flydsl_blockscale_gfx1250_gemm,
     "opus": opus_gemm,
 }
 
