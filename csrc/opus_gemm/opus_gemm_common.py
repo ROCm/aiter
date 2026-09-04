@@ -1821,21 +1821,6 @@ default_kernels_dict = {
 # fmt: on
 
 
-# The gfx1250 _ws families are the ones that opt in to a bf16 split-K partial;
-# see splitk_workspace_dtype for what that buys and costs. Applied here rather
-# than in each constructor so the set is one list, and scoped by tag so it
-# cannot reach the gfx942/gfx950 split-K pipelines, several of which
-# static_assert an fp32 workspace.
-_GFX1250_WS_BF16_PARTIAL_TAGS = (
-    "a16w16_cluster_tdm_splitk_ws",
-    "a16w16_clusterlaunch_tdm_splitk_ws",
-)
-for _inst in kernels_list.values():
-    if _inst.kernel_tag in _GFX1250_WS_BF16_PARTIAL_TAGS:
-        _inst.splitk_workspace_dtype = "bf16_t"
-del _inst
-
-
 # Subset-compile kid taxonomy (consumed by gen_instances.py for the `HEURISTIC_DEFAULT_KIDS ?
 
 # Splitk kids: a16w16_flatmm_splitk pipeline (kid 200..223 + nooob mirror).

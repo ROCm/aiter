@@ -639,6 +639,16 @@ def kid_rejects_shape(k_inst, M, N, K):
             splitk main kernel's mask_va_tail cover both edge cases, so
             splitk is safe for any (M, N, K).
     """
+    # The gfx1250 _ws reduce launches as dim3(ceil(N, VEC*BLOCK), M, 1) and
+    # grid.y is capped at 65535. Past that it does not fail, it writes garbage:
+    # at M=65536 the output is NaN, while the same shape on a .co kid (no reduce)
+    # is exact, and M >= 65537 does not launch at all ("invalid configuration
+    # argument"). Tuning one tends to take the box down with it. The fuse family
+    # reduces in-kernel and is unaffected. The generated launcher re-checks, for
+    # a tuned CSV that predates this.
+    if M > 65535 and _kid_launches_reduce(k_inst):
+        return True
+
     # Pre-compiled (.co) kids: answered first, because almost none of the rules
     # below apply to them. The pipeline builds NO buffer resource at all (it is
     # the only a16w16 pipeline with zero make_gmem -- A, B and C all ride TDM
@@ -945,7 +955,7 @@ def candidate_kids_for_shape(M, N, K, bias, cu_num):
         from aiter.jit.utils.chip_info import get_gfx_runtime
 
         if get_gfx_runtime().lower() == "gfx1250":
-            return _drop_fp32_ws_kids(_gfx1250_select_candidates(M, N, K, cu_num))
+            return _gfx1250_select_candidates(M, N, K, cu_num)
     except Exception:  # noqa: BLE001,S110
         pass
 
@@ -985,40 +995,11 @@ def candidate_kids_for_shape(M, N, K, bias, cu_num):
         pass  # unknown arch -> keep legacy multi-arch behaviour
 
     # Step 6: drop known-bad kids permanently.
-    cands = cands - _OPUS_PERMA_BAD_KIDS
-    return _drop_fp32_ws_kids(cands)
+    return cands - _OPUS_PERMA_BAD_KIDS
 
 
 # Kids we never want tuner to probe.
 _OPUS_PERMA_BAD_KIDS = frozenset()
-
-
-def _drop_fp32_ws_kids(cands):
-    """Drop split-K kids that stage fp32 partials, unless opted back in.
-
-    An fp32 partial doubles both the workspace and the reduce's read traffic
-    for an accuracy the tuner's gate does not ask for: at rtol=atol=5e-2, which
-    is what _default_tol gives a bf16 output, bf16 partials score err_ratio
-    0.004-0.012 against a 0.05 line, flat across shapes. It also multiplies what
-    the sweep allocates -- every (tile padding x split_k) pair is a distinct
-    buffer -- which is what put a full 84-shape sweep at 450 GiB on a 432 GiB
-    part. Set OPUS_TUNE_FP32_WS=1 to sweep them anyway, e.g. when checking how
-    much accuracy the bf16 partial actually costs a given shape.
-    """
-    if os.environ.get("OPUS_TUNE_FP32_WS", "0") != "0":
-        return cands
-    try:
-        from opus_gemm_common import kernels_list as _klist
-    except Exception:  # noqa: BLE001
-        return cands
-    return frozenset(
-        kid
-        for kid in cands
-        if not (
-            getattr(_klist.get(kid), "kernel_tag", "") in _WS_SPLITK_TAGS
-            and getattr(_klist.get(kid), "splitk_workspace_dtype", "fp32_t") == "fp32_t"
-        )
-    )
 
 
 # The two families that stage a split-K partial the reduce then reads. The fuse
@@ -1029,6 +1010,17 @@ _WS_SPLITK_TAGS = frozenset(
 
 # The pre-compiled (.co) families. Mirrors codegen/common.py:_A16W16_CO_TAGS.
 _A16W16_CO_TAGS = frozenset({"a16w16_4wave_co", "a16w16_4wave_wl_co"})
+
+
+def _kid_launches_reduce(k_inst):
+    """True for the gfx1250 families whose launcher runs splitk_reduce separately.
+
+    The gfx942 _sk families and flatmm_splitk launch the same reduce with the
+    same grid.y, so the 65535 cap is theirs too -- they are left alone here
+    only because this change is scoped to gfx1250. The fuse family reduces
+    in-kernel and launches nothing.
+    """
+    return getattr(k_inst, "kernel_tag", "") in _WS_SPLITK_TAGS
 
 
 def _ensure_kids_compiled(candidate_kids):
