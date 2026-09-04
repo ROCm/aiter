@@ -29,6 +29,16 @@ NETWORKS = {
         "topk": 6,
         "swiglu_limit": 10.0,
     },
+    # Kimi-K3 routing/weight geometry.  This exercises topk16 and EP8/epr112;
+    # the numerical reference intentionally keeps MegaMoEV2's current bounded
+    # SwiGLU activation while the K3 activation integration remains separate.
+    "kimi_k3_route": {
+        "model_dim": 3584,
+        "inter_dim": 512,
+        "experts": 896,
+        "topk": 16,
+        "swiglu_limit": 10.0,
+    },
 }
 
 
@@ -70,7 +80,19 @@ def _next_power_of_two(value):
     return 1 << (int(value) - 1).bit_length()
 
 
-def _make_inputs(tokens, model_dim, experts, topk, rank, seed, device):
+def _make_inputs(
+    tokens,
+    model_dim,
+    experts,
+    topk,
+    rank,
+    seed,
+    device,
+    *,
+    force_fanout_boundary,
+    inject_invalid_route,
+    force_padding_boundary,
+):
     generator = torch.Generator(device=device).manual_seed(seed + rank)
     x = torch.randn(
         (tokens, model_dim), dtype=torch.bfloat16, device=device, generator=generator
@@ -79,6 +101,38 @@ def _make_inputs(tokens, model_dim, experts, topk, rank, seed, device):
         (tokens, experts), dtype=torch.float32, device=device, generator=generator
     )
     values, ids = torch.topk(scores, topk, dim=-1)
+    if force_fanout_boundary or inject_invalid_route or force_padding_boundary:
+        if topk != 16 or experts % dist.get_world_size():
+            raise ValueError("fanout adversarial cases require topk=16 and EP")
+        world = dist.get_world_size()
+        local_experts = experts // world
+        if local_experts < 112:
+            raise ValueError("fanout adversarial cases require at least 112 epr")
+        token = torch.arange(tokens, dtype=torch.int64, device=device)[:, None]
+        slot = torch.arange(topk, dtype=torch.int64, device=device)[None, :]
+        if force_padding_boundary:
+            if tokens != 1:
+                raise ValueError("--force-padding-boundary requires one token")
+            local = (rank * topk + slot) % local_experts
+            ids = local.expand(tokens, -1).clone()
+            if rank == world - 1:
+                ids[:, :-2] = torch.arange(
+                    1, topk - 1, dtype=torch.int64, device=device
+                )
+                ids[:, -2] = 0
+                ids[:, -1] = local_experts - 1
+        else:
+            destination = (token + rank) % world
+            local = (token * 17 + slot * 7) % (local_experts - 2)
+            if inject_invalid_route:
+                local = local + 1
+            ids = destination * local_experts + local
+            if inject_invalid_route:
+                ids[:, -2] = -1
+                ids[:, -1] = destination[:, 0] * local_experts + local_experts - 1
+            else:
+                ids[:, -2] = destination[:, 0] * local_experts + local_experts - 2
+                ids[:, -1] = destination[:, 0] * local_experts + local_experts - 1
     return (
         x.contiguous(),
         values.softmax(dim=-1).contiguous(),
@@ -136,10 +190,29 @@ def _dequant_expert(weight, scale, rows, cols):
     return values * scales.repeat_interleave(32, dim=-1)
 
 
-def _all_gather(tensor):
-    gathered = [torch.empty_like(tensor) for _ in range(dist.get_world_size())]
+def _all_gather_variable(tensor, token_counts=None):
+    world = dist.get_world_size()
+    if token_counts is None:
+        local_count = torch.tensor(
+            tensor.shape[0], dtype=torch.int64, device=tensor.device
+        )
+        gathered_counts = [torch.empty_like(local_count) for _ in range(world)]
+        dist.all_gather(gathered_counts, local_count)
+        token_counts = [int(count.item()) for count in gathered_counts]
+    max_count = max(token_counts)
+    if tensor.shape[0] < max_count:
+        padding = torch.empty(
+            (max_count - tensor.shape[0], *tensor.shape[1:]),
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+        tensor = torch.cat((tensor, padding))
+    gathered = [torch.empty_like(tensor) for _ in range(world)]
     dist.all_gather(gathered, tensor)
-    return torch.cat(gathered)
+    return (
+        torch.cat([value[:count] for value, count in zip(gathered, token_counts)]),
+        token_counts,
+    )
 
 
 @torch.no_grad()
@@ -155,11 +228,9 @@ def _reference(
     experts,
     swiglu_limit,
 ):
-    x_all, weights_all, ids_all = (
-        _all_gather(x),
-        _all_gather(route_weights),
-        _all_gather(ids),
-    )
+    x_all, token_counts = _all_gather_variable(x)
+    weights_all, _ = _all_gather_variable(route_weights, token_counts)
+    ids_all, _ = _all_gather_variable(ids, token_counts)
     partial = torch.zeros(
         (x_all.shape[0], model_dim), dtype=torch.float32, device=x.device
     )
@@ -185,7 +256,7 @@ def _reference(
         partial.index_add_(0, rows, out)
         del w1, w2, inp, hidden, out
     dist.all_reduce(partial)
-    start = rank * x.shape[0]
+    start = sum(token_counts[:rank])
     return partial[start : start + x.shape[0]]
 
 
@@ -200,8 +271,9 @@ def _time_graph(fn, device, iters):
     for _ in range(10):
         graph.replay()
     torch.cuda.synchronize()
-    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
-        enable_timing=True
+    start, end = (
+        torch.cuda.Event(enable_timing=True),
+        torch.cuda.Event(enable_timing=True),
     )
     start.record()
     for _ in range(iters):
@@ -217,9 +289,26 @@ def _time_graph(fn, device, iters):
 def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
     tokens = x.shape[0]
     output = moe(x, weights, ids)[:tokens]
+    if moe._active_config.stage2.aligned_pair:
+        aligned_output = output.clone()
+        full_output = moe(x, weights, ids, slice_output=False)
+        expected_shape = (moe.mtpr, moe.model_dim)
+        if tuple(full_output.shape) != expected_shape:
+            raise AssertionError(
+                f"slice_output=False returned {tuple(full_output.shape)}, "
+                f"expected {expected_shape}"
+            )
+        if not torch.equal(full_output[:tokens], aligned_output):
+            raise AssertionError("slice_output changed aligned-pair valid rows")
+        output = full_output[:tokens]
     _barrier()
+    eager_output = output.clone()
     rel_l2 = -1.0
-    if tokens <= args.accuracy_max_bs:
+    # Every rank must make the same decision before entering the reference
+    # collectives; the reference itself pads variable token counts for gather.
+    token_max = torch.tensor(tokens, dtype=torch.int32, device=device)
+    dist.all_reduce(token_max, op=dist.ReduceOp.MAX)
+    if 0 < int(token_max.item()) <= args.accuracy_max_bs:
         reference = _reference(
             x,
             weights,
@@ -232,11 +321,11 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
             moe.experts,
             moe.swiglu_limit,
         )
-        rel_l2 = float(
-            torch.linalg.vector_norm(output.float() - reference)
-            / torch.linalg.vector_norm(reference)
-        )
-        rel_l2 = _reduce_float(rel_l2, device, dist.ReduceOp.MAX)
+        error_sq = torch.sum((output.float() - reference) ** 2)
+        reference_sq = torch.sum(reference**2)
+        dist.all_reduce(error_sq)
+        dist.all_reduce(reference_sq)
+        rel_l2 = float(torch.sqrt(error_sq / reference_sq))
         if rel_l2 >= args.rtol:
             raise AssertionError(f"bs={tokens} relL2={rel_l2:.6f} exceeds {args.rtol}")
 
@@ -257,6 +346,13 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
     _barrier()
     stage2_ms = _time_graph(stage2, device, args.iters)
     e2e_ms = _time_graph(end_to_end, device, args.iters)
+    graph_output = state["output"][:tokens]
+    graph_replay_exact = torch.tensor(
+        int(torch.equal(graph_output, eager_output)), dtype=torch.int32, device=device
+    )
+    dist.all_reduce(graph_replay_exact, op=dist.ReduceOp.MIN)
+    if not int(graph_replay_exact.item()):
+        raise AssertionError(f"bs={tokens} CUDA Graph replay changed the output")
     sbm = int(moe._s1_active_tile_m)
     gemm2_bm = int(moe._g2_active_block_m)
     p2p_quant = moe._active_config.p2p_quant
@@ -264,6 +360,7 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
         print(
             f"[MEGA-V2] bs={tokens} relL2={rel_l2:.6f} "
             f"path={'fixed' if moe._s1_fixed_slot else 'compact'} "
+            f"graph_replay=PASS "
             f"p2p_quant={p2p_quant} SBM={sbm} G2_BM={gemm2_bm} "
             f"stage1={stage1_ms[0]:.4f}/{stage1_ms[1]:.4f}ms "
             f"stage2={stage2_ms[0]:.4f}/{stage2_ms[1]:.4f}ms "
@@ -313,6 +410,10 @@ def _install_config_policy(moe, config_tokens, unify_fields):
                     p2p_quant = reference.p2p_quant
                 else:
                     raise ValueError(f"invalid config field {field!r}")
+            coupled_stage1 = {"payload_tile_ready"}
+            if coupled_stage1 & stage1_updates.keys():
+                for name in coupled_stage1:
+                    stage1_updates.setdefault(name, getattr(reference.stage1, name))
             config = replace(
                 local,
                 stage1=replace(local.stage1, **stage1_updates),
@@ -338,7 +439,21 @@ def main():
     parser.add_argument("--config-tokens", type=int, default=0)
     parser.add_argument("--unify-fields", default="")
     parser.add_argument("--burst-depth", type=int, default=0)
+    parser.add_argument("--force-fanout-boundary", action="store_true")
+    parser.add_argument("--inject-invalid-route", action="store_true")
+    parser.add_argument("--force-padding-boundary", action="store_true")
     args = parser.parse_args()
+    if (
+        sum(
+            (
+                args.force_fanout_boundary,
+                args.inject_invalid_route,
+                args.force_padding_boundary,
+            )
+        )
+        > 1
+    ):
+        raise ValueError("fanout adversarial flags are mutually exclusive")
     batch_sizes = [int(value) for value in args.bs_list.split(",")]
     if not batch_sizes or min(batch_sizes) <= 0:
         raise ValueError("--bs-list must contain positive integers")
@@ -385,25 +500,50 @@ def main():
             rank,
             args.seed,
             device,
+            force_fanout_boundary=args.force_fanout_boundary,
+            inject_invalid_route=args.inject_invalid_route,
+            force_padding_boundary=args.force_padding_boundary,
         )
         ref_weights = w1_q, w1_ref_scale, w2_q, w2_ref_scale
+        # MegaMoE's producer/consumer wire geometry is rank-invariant. A
+        # deliberately skewed test therefore selects one configuration that
+        # covers the largest participating rank instead of mixing protocols.
+        config_tokens = args.config_tokens
+        if rank_tokens and not config_tokens:
+            config_tokens = max(1, max(rank_tokens))
+
+        shared_moe = None
         for batch_size in batch_sizes:
             local_batch_size = rank_tokens[rank] if rank_tokens else batch_size
             max_tok_per_rank = args.max_tok_per_rank or max(
                 16, _next_power_of_two(batch_size)
             )
-            moe = MegaMoEV2(
-                rank=rank,
-                world_size=world,
-                quant="a8w4",
-                w1=w1,
-                w1_scale=w1_scale,
-                w2=w2,
-                w2_scale=w2_scale,
-                max_tok_per_rank=max_tok_per_rank,
-                **network,
-            )
-            _install_config_policy(moe, args.config_tokens, args.unify_fields)
+            if shared_moe is None or args.max_tok_per_rank is None:
+                fanout_masks = ()
+                if args.force_fanout_boundary:
+                    pair_mask = (1 << (local_experts - 2)) | (1 << (local_experts - 1))
+                    fanout_masks = (pair_mask,) * world
+                elif args.inject_invalid_route or args.force_padding_boundary:
+                    pair_mask = 1 | (1 << (local_experts - 1))
+                    fanout_masks = (
+                        (pair_mask,) + (0,) * (world - 1)
+                        if args.force_padding_boundary
+                        else (pair_mask,) * world
+                    )
+                shared_moe = MegaMoEV2(
+                    rank=rank,
+                    world_size=world,
+                    quant="a8w4",
+                    w1=w1,
+                    w1_scale=w1_scale,
+                    w2=w2,
+                    w2_scale=w2_scale,
+                    max_tok_per_rank=max_tok_per_rank,
+                    fanout_masks=fanout_masks,
+                    **network,
+                )
+            moe = shared_moe
+            _install_config_policy(moe, config_tokens, args.unify_fields)
             if rank_tokens:
                 selected = moe._select_config(local_batch_size)
                 configs = [None] * world

@@ -205,7 +205,6 @@ def main():
     parser.add_argument("--stage1-payload-chunk-rows", type=int, default=0)
     parser.add_argument("--stage1-tile-ready", action="store_true")
     parser.add_argument("--disable-stage1-tile-ready", action="store_true")
-    parser.add_argument("--stage1-internal-grouping", action="store_true")
     parser.add_argument("--stage1-work-shards", type=int, default=0)
     parser.add_argument("--stage1-dispatch-cu", type=int, default=0)
     parser.add_argument("--stage1-grid-mult", type=int, default=0)
@@ -278,7 +277,6 @@ def main():
         or args.stage1_payload_chunk_rows
         or args.stage1_tile_ready
         or args.disable_stage1_tile_ready
-        or args.stage1_internal_grouping
         or args.stage1_work_shards
         or args.stage1_dispatch_cu
         or args.stage1_grid_mult
@@ -291,28 +289,25 @@ def main():
             config = default_select_config(args.config_tokens or tokens)
             stage1 = config.stage1
             stage2 = config.stage2
+            stage1_updates = {}
             if args.stage1_payload_chunk_rows:
-                stage1 = replace(
-                    stage1, payload_chunk_rows=args.stage1_payload_chunk_rows
-                )
+                stage1_updates["payload_chunk_rows"] = args.stage1_payload_chunk_rows
             if args.stage1_tile_ready:
-                stage1 = replace(stage1, payload_tile_ready=True)
+                stage1_updates["payload_tile_ready"] = True
             if args.disable_stage1_tile_ready:
-                stage1 = replace(stage1, payload_tile_ready=False)
-            if args.stage1_internal_grouping:
-                stage1 = replace(
-                    stage1, external_grouping=False, external_counting=False
-                )
+                stage1_updates["payload_tile_ready"] = False
             if args.stage1_work_shards:
-                stage1 = replace(stage1, work_shards=args.stage1_work_shards)
+                stage1_updates["work_shards"] = args.stage1_work_shards
             if args.stage1_dispatch_cu:
-                stage1 = replace(stage1, num_dispatch_cu=args.stage1_dispatch_cu)
+                stage1_updates["num_dispatch_cu"] = args.stage1_dispatch_cu
             if args.stage1_grid_mult:
-                stage1 = replace(stage1, grid_mult=args.stage1_grid_mult)
+                stage1_updates["grid_mult"] = args.stage1_grid_mult
             if args.stage1_b_nt >= 0:
-                stage1 = replace(stage1, b_nt=args.stage1_b_nt)
+                stage1_updates["b_nt"] = args.stage1_b_nt
             if args.stage1_tile_resource:
-                stage1 = replace(stage1, use_tile_resource=True)
+                stage1_updates["use_tile_resource"] = True
+            if stage1_updates:
+                stage1 = replace(stage1, **stage1_updates)
             if (
                 args.stage2_strided
                 or args.stage2_persist_cu
@@ -395,7 +390,6 @@ def main():
         else time_graph(mori_graph, args.iters, device)
     )
     mega_ms = time_graph(mega_graph, args.iters, device)
-
     x_q, x_scale = mega.quantize(x)
 
     def mega_stage1():

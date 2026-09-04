@@ -36,7 +36,7 @@ class _LdsF32View:
 @flyc.jit
 def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
     a_scale_lds, a_lds_i32, K_ITERS, M_REPEAT, NUM_ACC_N, A_K_STEP_BYTES, pipe_weights,
-    mfma_amajor, async_a_copy, trb_rsrc):
+    mfma_amajor, async_a_copy, trb_rsrc, tib_rsrc, indirect_input):
 # fmt: on
     N_ACC = M_REPEAT * NUM_ACC_N
     NUM_B_SCALE = NUM_ACC_N // _PACK
@@ -47,8 +47,11 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
     SB_STATE_END = B_STATE_END + NUM_B_SCALE
     last = fx.Int32(K_ITERS - 1)
     tile_row_base = _buffer_load(trb_rsrc, m_tile, fx.Int32)
+    tile_input_base = tile_row_base
+    if const_expr(indirect_input):
+        tile_input_base = _buffer_load(tib_rsrc, m_tile, fx.Int32)
     b_row = sched.gate_base_row(expert) + n_tile_base
-    a_gather.for_tile(tile_row_base)
+    a_gather.for_tile(tile_input_base)
     if const_expr(pipe_weights):
         if const_expr(async_a_copy):
             a_gather.prefetch_to_lds(
@@ -62,7 +65,7 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
                 a_gather.load_regs(fx.Int32(0)),
                 fx.Int32(0),
             )
-        a_scale.stage(a_scale_lds, tile_row_base)
+        a_scale.stage(a_scale_lds, tile_input_base)
         wait_lds_barrier(0 if async_a_copy else 63)
         b0 = b_loader.load_step(b_row, fx.Int32(0))
         init = [mfma.zero_value for _ in range(N_ACC)]
@@ -215,7 +218,7 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
                 a_gather.load_regs(fx.Int32(0)),
                 fx.Int32(0),
             )
-        a_scale.stage(a_scale_lds, tile_row_base)
+        a_scale.stage(a_scale_lds, tile_input_base)
         wait_lds_barrier(0 if async_a_copy else 63)
         init = [mfma.zero_value for _ in range(N_ACC)]
         for sp_i, state in range(0, K_ITERS, 1, init=init):
@@ -267,11 +270,12 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
 
 # fmt: off
 def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
-    out_rsrc, os_rsrc, trb_rsrc, expert_rsrc, out_tensor, a_buf, a_scale_lds, c_tile,
+    out_rsrc, os_rsrc, trb_rsrc, tib_rsrc, expert_rsrc, out_tensor, a_buf, a_scale_lds, c_tile,
     model_dim, inter_dim, sort_block_m, tile_n, num_waves, n_per_wave, wave_id,
     m_repeat, num_acc_n, a_k_step_bytes, total_threads, k_iters, a_lds_i32, n_tiles,
     expert_offset, b_cache_modifier, swizzle_a, pipe_weights, mfma_amajor, async_a_copy,
-    use_tile_resource, swiglu_limit=0.0):
+    use_tile_resource, indirect_input, indexed_input=False, row_map_rsrc=None,
+    source_rows=0, swiglu_limit=0.0):
     # fmt: on
     """Build the GEMM1 atoms and return its expert resolver and tile runner."""
     sched = TileScheduler(
@@ -284,7 +288,9 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     # fmt: off
     a_gather = ATileLoader(row_bytes=model_dim, sort_block_m=sort_block_m,
         k_step_bytes=a_k_step_bytes, total_threads=total_threads, swizzle=swizzle_a,
-        x_tensor=x_tensor, async_copy=async_a_copy)
+        x_tensor=x_tensor, async_copy=async_a_copy,
+        indexed_input=indexed_input, row_map_rsrc=row_map_rsrc,
+        source_rows=source_rows)
     # fmt: on
     a_s2r = AS2RLoader(k_step_bytes=a_k_step_bytes, swizzle=swizzle_a)
     b_loader = BWeightLoader(
@@ -300,6 +306,8 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
         model_dim=model_dim,
         sort_block_m=sort_block_m,
         total_threads=total_threads,
+        indexed_input=indexed_input,
+        row_map_rsrc=row_map_rsrc,
     )
     mfma = MfmaScaleGU(m_repeat=m_repeat, num_acc_n=num_acc_n)
     # fmt: off
@@ -327,7 +335,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
             a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
             a_scale_lds, a_lds_i32, k_iters, m_repeat, num_acc_n,
             a_k_step_bytes, pipe_weights, mfma_amajor, async_a_copy,
-            trb_rsrc)
+            trb_rsrc, tib_rsrc, indirect_input)
         # fmt: on
 
     return expert_of_flat, do_scheduled_tile
@@ -405,6 +413,7 @@ def compile_gemm1(
         _, run_tile = build_fused_gemm1(
             x_tensor=x, w_rsrc=w_rsrc, sw_rsrc=sw_rsrc,
             sx_rsrc=sx_rsrc, out_rsrc=out_rsrc, os_rsrc=os_rsrc, trb_rsrc=trb_rsrc,
+            tib_rsrc=trb_rsrc,
             expert_rsrc=expert_rsrc, out_tensor=out, a_buf=a_buf,
             a_scale_lds=a_scale_lds, c_tile=c_tile, model_dim=model_dim, inter_dim=inter_dim,
             sort_block_m=sort_block_m, tile_n=tile_n, num_waves=num_waves, n_per_wave=n_per_wave,
@@ -412,7 +421,8 @@ def compile_gemm1(
             total_threads=total_threads, k_iters=k_iters, a_lds_i32=a_lds_i32, n_tiles=n_tiles,
             expert_offset=expert_offset, b_cache_modifier=b_cache_modifier, swizzle_a=swizzle_a,
             pipe_weights=pipe_weights, mfma_amajor=mfma_amajor, async_a_copy=async_a_copy,
-            use_tile_resource=use_tile_resource, swiglu_limit=swiglu_limit,
+            use_tile_resource=use_tile_resource, indirect_input=False,
+            swiglu_limit=swiglu_limit,
         )
         total_work = (num_valid // fx.Int32(sort_block_m)) * fx.Int32(n_tiles)
         for flat in range(fx.block_idx.x, total_work, grid_x):

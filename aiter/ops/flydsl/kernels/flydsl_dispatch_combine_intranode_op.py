@@ -24,6 +24,7 @@ from .flydsl_dispatch_combine_intranode_kernel import (
     make_combine_jit,
     make_dispatch_jit,
 )
+from .tensor_shim import _preload_compiled
 
 # Reject unsupported token dtypes at construction, not deep in JIT codegen.
 _SUPPORTED_TOK_DTYPES = (
@@ -266,6 +267,7 @@ class FlyDSLDispatchCombineConfig:
     gm_unit_size: int = 0
     gm_scheme: str = "fixedslot"
     gm_compact: bool = False
+    gm_indexed_payload: bool = False
 
     def __post_init__(self):
         if self.data_type is not None and (
@@ -390,10 +392,16 @@ class FlyDSLDispatchGroupMajorOp:
         scale_dim,
         scale_type_size=1,
         compact=False,
+        indexed_payload=False,
     ):
         assert world_size <= 8
         # Compact mode uses a count-first layout without per-expert reservations.
         self.compact = bool(compact)
+        self.indexed_payload = bool(indexed_payload)
+        if self.indexed_payload and not self.compact:
+            raise ValueError(
+                "indexed payload storage requires compact group-major mode"
+            )
         self.rank = rank
         self.npes = world_size
         self.hidden = hidden_dim
@@ -415,15 +423,24 @@ class FlyDSLDispatchGroupMajorOp:
         self.row_bytes = _token_bytes_for(data_type, hidden_dim)
         self.row_view = _token_view_dim_for(data_type, hidden_dim)
 
-        # Compact capacity includes worst-case routes plus per-expert padding.
+        # Compact fanout may materialize the shared pair as two independently
+        # padded expert sections in addition to every normal expert section.
         if self.compact:
             num_valid_max = (
-                world_size * max_tok_per_rank * topk + experts_per_rank * unit_size
+                world_size * max_tok_per_rank * topk
+                + (experts_per_rank + 2) * unit_size
             )
         else:
             num_valid_max = experts_per_rank * self.ll_cap + 256
         self.num_valid_max = int(num_valid_max)
         self.max_blocks = (self.num_valid_max + unit_size - 1) // unit_size
+        # Route metadata remains expert-major.  Activations and scales use one
+        # deterministic row per (source rank, source token), plus a sentinel.
+        self.payload_rows_max = (
+            world_size * max_tok_per_rank + 1
+            if self.indexed_payload
+            else self.num_valid_max
+        )
 
         self._alloc()
         ms.shmem_barrier_all()
@@ -437,11 +454,14 @@ class FlyDSLDispatchGroupMajorOp:
     def _alloc(self):
         npes, epr = self.npes, self.epr
         nvm = self.num_valid_max
+        payload_rows = self.payload_rows_max
         self.done2 = self._sym((npes,), torch.int32)
         self.running = self._sym((epr,), torch.int32)
         self.ll_count = self._sym((epr,), torch.int32)
-        self.rx_em = self._sym((nvm * self.row_bytes,), torch.int8)
-        self.scale_em = self._sym((max(1, nvm * self.scale_n_i32),), torch.int32)
+        self.rx_em = self._sym((payload_rows * self.row_bytes,), torch.int8)
+        self.scale_em = self._sym(
+            (max(1, payload_rows * self.scale_n_i32),), torch.int32
+        )
         self.idx_em = self._sym((nvm,), torch.int32)
         self.wts_em = self._sym((nvm,), torch.float32)
         self.srcmap_em = self._sym((nvm,), torch.int32)
@@ -528,11 +548,15 @@ class FlyDSLDispatchGroupMajorOp:
 
     def _ll_views(self):
         rx_dtype = torch.float4_e2m1fn_x2 if _is_fp4_dtype(self.dtype) else self.dtype
-        rx_em_view = self.rx_em.view(rx_dtype).view(self.num_valid_max, self.row_view)
+        rx_em_view = self.rx_em.view(rx_dtype).view(
+            self.payload_rows_max, self.row_view
+        )
         scale_em_view = self.scale_em.view(torch.uint8).view(
-            self.num_valid_max, max(1, self.scale_n_i32 * 4)
+            self.payload_rows_max, max(1, self.scale_n_i32 * 4)
         )[:, : self.scale_bytes]
-        scale_em_i32 = self.scale_em.view(self.num_valid_max, max(1, self.scale_n_i32))
+        scale_em_i32 = self.scale_em.view(
+            self.payload_rows_max, max(1, self.scale_n_i32)
+        )
         return {
             "rx_em": rx_em_view,
             "scale_em": scale_em_view,
@@ -643,6 +667,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 scale_dim=config.scale_dim,
                 scale_type_size=config.scale_type_size,
                 compact=config.gm_compact,
+                indexed_payload=config.gm_indexed_payload,
             )
             # Fused dispatch and combine share one receive-count buffer.
             self._gm.total_recv = self.total_recv
@@ -1465,6 +1490,103 @@ class FlyDSLDispatchCombineIntraNodeOp:
             skip_stage1=True,
             stage2_p2p_quant=stage2_p2p_quant,
         )
+
+    def preload_combine_no_stage1(
+        self,
+        input,
+        *,
+        cur_tok,
+        enable_weights: bool = False,
+        stage2_p2p_quant=None,
+    ):
+        """Compile and load one fused-Stage2 combine geometry without launching it."""
+        if not type(self)._ENABLE_COMBINE_NO_STAGE1:
+            raise NotImplementedError("combine_no_stage1 preload is not enabled")
+        cfg = self.cfg
+        self._check_combine_inputs(input, None, None, None, strict_input_dtype=False)
+        p2p_quant = (
+            cfg.stage2_p2p_quant if stage2_p2p_quant is None else stage2_p2p_quant
+        )
+        if p2p_quant not in _SUPPORTED_STAGE2_P2P_QUANT_TYPES:
+            raise ValueError(f"unsupported stage2_p2p_quant={p2p_quant!r}")
+        fp8_dc = (
+            cfg.combine_quant_type == "fp8_direct_cast"
+            and input.dtype == torch.bfloat16
+        )
+        blockwise_fp8 = p2p_quant == "fp8_blockwise_1x32"
+        c_dtype = torch.float8_e4m3fn if fp8_dc else input.dtype
+        _cur_tok = self._resolve_cur_tok(cur_tok, "preload_combine_no_stage1()")
+        block_num, warp_num = _resolve_launch_geometry(
+            "combine",
+            cfg.combine_block_num,
+            cfg.combine_warp_num_per_block,
+            cfg.tuning_table,
+            _cur_tok,
+            _DEFAULT_COMBINE_BLOCK_NUM,
+            _DEFAULT_COMBINE_WARP_NUM,
+        )
+        _check_block_num_resident("combine", block_num)
+        key = (
+            c_dtype,
+            bool(cfg.zero_copy),
+            bool(enable_weights),
+            bool(fp8_dc),
+            bool(blockwise_fp8),
+            block_num,
+            warp_num,
+            True,
+        )
+        fn = self._comb_jit_cache.get(key)
+        if fn is None:
+            fn = make_combine_jit(
+                rank=cfg.rank,
+                npes=cfg.world_size,
+                experts_per_token=cfg.num_experts_per_token,
+                hidden_dim=cfg.hidden_dim,
+                max_tok_per_rank=cfg.max_num_inp_token_per_rank,
+                block_num=block_num,
+                warp_num_per_block=warp_num,
+                data_type=c_dtype,
+                enable_weights=bool(enable_weights),
+                enable_std_moe=cfg.enable_std_moe,
+                zero_copy=cfg.zero_copy,
+                skip_stage1=True,
+                fp8_direct_cast=bool(fp8_dc),
+                blockwise_fp8_transport=bool(blockwise_fp8),
+                max_recv=self._effective_max_recv,
+            )
+            self._comb_jit_cache[key] = fn
+        fixed = (
+            self._fx_comb_inp,
+            self._fx_comb_out,
+            self._fx_xdb_mem,
+            self._fx_xdev_flag,
+            self._fx_tok_map,
+            self._fx_comb_bar,
+            self._fx_trecv,
+            self._fx_out_shmem_tok_id_to_src,
+            self._fx_p2p_comb_inp,
+            self._fx_p2p_xdb_mem,
+        )
+        tail = (
+            self._fx_comb_inp_wts,
+            self._fx_comb_out_wts,
+            self._fx_p2p_comb_inp_wts,
+        )
+        std = (self._fx_disp_tok_map, self._fx_disp_out_wts)
+        compiled = _preload_compiled(
+            fn,
+            fx.Int64(input.data_ptr()),
+            *fixed,
+            fx.Int64(self.shmem_disp_out_wts.data_ptr()),
+            *tail,
+            fx.Int64(0),
+            *std,
+            _cur_tok,
+            torch.cuda.current_stream(),
+        )
+        self._comb_compiled_cache[key] = compiled
+        return compiled
 
     def get_dispatch_src_token_pos(self):
         torch.cuda.synchronize()
