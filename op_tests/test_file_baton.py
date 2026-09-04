@@ -155,6 +155,24 @@ class TestFileBaton(unittest.TestCase):
                 self.assertFalse(waiter.wait())
             waiter.release()
 
+    def test_lifetime_flock_is_authoritative_across_hostnames(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = os.path.join(tempdir, "build.lock")
+            holder = FileBaton(path)
+            waiter = FileBaton(path)
+            self.assertTrue(holder.try_acquire())
+
+            with mock.patch(
+                "aiter.jit.utils.file_baton.socket.gethostname",
+                return_value="another-container-hostname",
+            ):
+                self.assertFalse(waiter._is_stale())
+                os.close(holder.fd)  # simulate process death without release()
+                holder.fd = None
+                self.assertTrue(waiter._is_stale())
+                self.assertFalse(waiter.wait())
+            waiter.release()
+
     def test_lock_files_ignore_restrictive_umask_for_cache_peers(self):
         with tempfile.TemporaryDirectory() as tempdir:
             path = os.path.join(tempdir, "build.lock")
