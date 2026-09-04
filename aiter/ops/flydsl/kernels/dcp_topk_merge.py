@@ -7,7 +7,6 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import (
     Array,
     Int32,
@@ -20,6 +19,8 @@ from flydsl.expr import (
     rocdl as fly_rocdl,
 )
 from flydsl.expr.typing import T
+
+from .kernels_common import atomic_add_i32, uint32_to_int32
 
 _RADIX_BITS = 8
 _RADIX_MASK = (1 << _RADIX_BITS) - 1
@@ -43,10 +44,6 @@ _DPP_ROW_MASK = 0xF
 _DPP_BANK_MASK = 0xF
 
 
-def _uint32_to_int32(x: int) -> int:
-    return x - (1 << 32) if x >= (1 << 31) else x
-
-
 def _f32_to_ord(val):
     """Order-preserving float32 -> int32 map, with NaN forced to the bottom.
 
@@ -60,7 +57,7 @@ def _f32_to_ord(val):
     ords = bits ^ ((bits >> fx.Int32(31)) & fx.Int32(0x7FFFFFFF))
     abs_bits = bits & fx.Int32(0x7FFFFFFF)
     is_nan = arith.cmpi(arith.CmpIPredicate.ugt, abs_bits, fx.Int32(0x7F800000))
-    return arith.select(is_nan, fx.Int32(_uint32_to_int32(0x80000000)), ords)
+    return arith.select(is_nan, fx.Int32(uint32_to_int32(0x80000000)), ords)
 
 
 def _make_storage():
@@ -175,17 +172,6 @@ def build_dcp_topk_merge_module(n_cand, k_loc, topk_tokens, page_size, world_siz
             gpu.barrier()
             return res, tot
 
-        def atomic_add_shared(memref, val, offset):
-            ptr = fx.to_llvm_ptr(fx.get_iter(memref) + offset)
-            llvm.AtomicRMWOp(
-                llvm.AtomicBinOp.add,
-                ptr,
-                arith.unwrap(val),
-                llvm.AtomicOrdering.monotonic,
-                syncscope="workgroup",
-                alignment=4,
-            )
-
         if tid == 0:
             s_acc[0] = 0
             s_acc[1] = 0
@@ -226,7 +212,7 @@ def build_dcp_topk_merge_module(n_cand, k_loc, topk_tokens, page_size, world_siz
                         bv = (
                             (ords >> fx.Int32(shift)) & fx.Int32(_RADIX_MASK)
                         ) ^ fx.Int32(xor_val)
-                        atomic_add_shared(s_hist, 1, bv)
+                        atomic_add_i32(s_hist, 1, bv, "workgroup")
             gpu.barrier()
 
             sel = fx.Int32(_N_HIST_BINS - 1) - tid
@@ -243,7 +229,7 @@ def build_dcp_topk_merge_module(n_cand, k_loc, topk_tokens, page_size, world_siz
             if above < rem and above + cnt >= rem:
                 actual = sel ^ fx.Int32(xor_val)
                 s_acc[0] = prefix | (actual << fx.Int32(shift))
-                s_acc[1] = dmask | fx.Int32(_uint32_to_int32(_RADIX_MASK << shift))
+                s_acc[1] = dmask | fx.Int32(uint32_to_int32(_RADIX_MASK << shift))
                 s_acc[2] = rem - above
             gpu.barrier()
 

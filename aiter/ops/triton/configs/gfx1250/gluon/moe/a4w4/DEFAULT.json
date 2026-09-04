@@ -2116,5 +2116,77 @@
         "block_k": 256,
         "num_buffers": 1,
         "num_warps": 4
+    },
+    "bm32_n7168_k3072_tiny": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k3072_small": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k3072_medium": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k3072_medium2": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k3072_large": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n7168_k3072_xlarge": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n6144_k7168_tiny": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n6144_k7168_small": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n6144_k7168_medium": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n6144_k7168_medium2": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n6144_k7168_large": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm32_n6144_k7168_xlarge": {
+        "block_n": 512,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
     }
 }

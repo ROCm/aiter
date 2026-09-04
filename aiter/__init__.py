@@ -130,6 +130,8 @@ else:
     from .ops.sample import *
     from .ops.fused_qk_norm_mrope_cache_quant import *
     from .ops.fused_qknorm_idxrqknorm import (  # noqa: F401
+        FUSED_QKNORM_IDXRQKNORM_SUPPORTS_FP8_INDEX_Q,
+        FUSED_QKNORM_IDXRQKNORM_SUPPORTS_PACKED_SHUFFLE,
         fused_qknorm_idxrqknorm,
     )
     from .ops.fused_qk_norm_rope_cache_quant import *
