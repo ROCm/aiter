@@ -317,6 +317,11 @@ def test_fused_ar_rmsnorm(
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
+    # Seeded like the other cases in this file. Two runs that differ only in a
+    # kernel-selection env var then see identical inputs, which makes the
+    # reported error directly comparable between them instead of just being
+    # separately under tolerance.
+    torch.manual_seed(int(os.environ.get("AITER_TEST_SEED", "0")))
     pool = Pool(processes=tp_size)
     ref = torch.zeros(shape, dtype=dtype)
     rets = []

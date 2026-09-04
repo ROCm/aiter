@@ -24,6 +24,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <cstdlib>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
@@ -1337,6 +1338,186 @@ __global__ void __launch_bounds__(512, 1) reduce_scatter_cross_device_store(
     // output at per-rank volumes above ~1.2 MB (verified via
     // sglang/benchmark/kernels/all_reduce/repro_ar_rmsnorm_corruption.py).
     end_sync<ngpus, false>(sg, self_sg, rank);
+}
+
+// ---------------------------------------------------------------------------
+// Wide variant of the reduce-scatter producer (AITER_AR_RS_WIDE=1).
+//
+// The kernel above maps threads to peers rather than to data: each group of
+// THREAD_NUM/ngpus threads is bound to one peer via warp_id, so a thread issues
+// exactly one cross-device load and then waits on __syncthreads() while only
+// warp_id==0 performs the ngpus-way add. Two consequences:
+//
+//   * a block retires only THREAD_NUM/ngpus packs per trip, i.e. 1/ngpus of the
+//     threads' worth of work;
+//   * there is never more than one cross-device load in flight per thread, and
+//     the two __syncthreads() per iteration stop the next trip's loads from
+//     being issued early, so the remote latency is fully exposed.
+//
+// This variant gives every thread its own pack and lets it issue all ngpus
+// remote loads back to back before consuming any of them, which is what the
+// one-shot kernel (allreduce_fusion_kernel_1stage) already does. The reduction
+// happens in registers, so both __syncthreads() and the LDS staging disappear.
+// Traffic is byte-for-byte identical to the kernel above; only the number of
+// outstanding requests per thread changes.
+//
+// Addressing, the tmp-buffer layout and the end_sync ordering are unchanged, so
+// stage 2 (local_device_load_rmsnorm*) cannot tell the two apart.
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(THREAD_NUM, 1) reduce_scatter_cross_device_store_wide(
+    RankData* _dp,
+    RankSignals sg,
+    Signal* self_sg,
+    int rank,
+    int m,
+    int hidden_dim,
+    int input_hidden_dim)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    using P                 = typename opus::vector_t<T, pack_size>;
+    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
+
+    const P* ptrs[ngpus];
+    P* tmps[ngpus];
+#pragma unroll
+    for(int i = 0; i < ngpus; ++i)
+    {
+        ptrs[i] = (const P*)_dp->ptrs[i];
+        tmps[i] = get_tmp_buf<P>(sg.signals[i]);
+    }
+    start_sync<ngpus>(sg, self_sg, rank);
+
+    const int valid_pack_count = hidden_dim / pack_size;
+    const int input_pack_count = input_hidden_dim / pack_size;
+    const int part             = m * valid_pack_count / ngpus;
+    const int tid              = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride           = gridDim.x * blockDim.x;
+
+    for(int idx = tid; idx < part; idx += stride)
+    {
+        const int flat_idx  = rank * part + idx;
+        const int row       = flat_idx / valid_pack_count;
+        const int col       = flat_idx % valid_pack_count;
+        const int input_idx = row * input_pack_count + col;
+
+        // Issue every peer's load before touching any of them. Keeping the
+        // reads in a separate unrolled loop is what lets the ngpus round trips
+        // overlap; folding them into the accumulate loop below reintroduces the
+        // serialisation this variant exists to remove.
+        P in[ngpus];
+#pragma unroll
+        for(int i = 0; i < ngpus; ++i)
+        {
+            in[i] = ptrs[i][input_idx];
+        }
+
+        A acc;
+        {
+            const T* v = reinterpret_cast<const T*>(&in[0]);
+#pragma unroll
+            for(int j = 0; j < pack_size; ++j)
+            {
+                acc[j] = upcast_s(v[j]);
+            }
+        }
+#pragma unroll
+        for(int i = 1; i < ngpus; ++i)
+        {
+            const T* v = reinterpret_cast<const T*>(&in[i]);
+#pragma unroll
+            for(int j = 0; j < pack_size; ++j)
+            {
+                acc[j] += upcast_s(v[j]);
+            }
+        }
+
+        P rslt;
+#pragma unroll
+        for(int j = 0; j < pack_size; ++j)
+        {
+            rslt[j] = downcast_s<T>(acc[j]);
+        }
+
+        // Same broadcast as above, but all ngpus stores are issued by the same
+        // thread instead of one per warp group.
+#pragma unroll
+        for(int i = 0; i < ngpus; ++i)
+        {
+            tmps[i][flat_idx] = rslt;
+        }
+    }
+    // Same requirement as the non-wide kernel: RELEASE/ACQUIRE, not RELAXED.
+    // See the NOTE on reduce_scatter_cross_device_store.
+    end_sync<ngpus, false>(sg, self_sg, rank);
+}
+
+// Opt-in until it has run through the multi-GPU op tests on every world size.
+inline bool ar_rs_wide_enabled()
+{
+    static const bool enabled = []() {
+        const char* v = std::getenv("AITER_AR_RS_WIDE");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return enabled;
+}
+
+// Diagnostic: force the grid to sweep block count and separate "latency-bound"
+// (time falls as blocks rise) from "bandwidth-bound" (flat). Applies to the
+// wide kernel only.
+inline int ar_rs_wide_forced_blocks()
+{
+    static const int blocks = []() {
+        const char* v = std::getenv("AITER_AR_RS_WIDE_BLOCKS");
+        return v == nullptr ? 0 : std::atoi(v);
+    }();
+    return blocks;
+}
+
+// Single entry point for the producer so the two variants cannot drift apart at
+// the four call sites. The grids differ because the work per block differs: the
+// original retires THREAD_NUM/ngpus packs per trip, the wide one THREAD_NUM.
+//
+// baseline_grid_elems is the element count each call site already used to size
+// the stock kernel's grid. It has to be passed in rather than recomputed here:
+// dispatchFusedAllReduceRMSNorm sizes from m*hidden_dim while
+// allreduce_mhc_post_split_launcher sizes from m*input_hidden_dim, and those
+// differ whenever the input is padded. Recomputing would silently change the
+// grid of the path this variant is supposed to be measured against.
+template <typename T, int NGPUS>
+inline void launch_reduce_scatter_cross_device_store(RankData* _dp,
+                                                     RankSignals sg,
+                                                     Signal* self_sg,
+                                                     int rank,
+                                                     int m,
+                                                     int hidden_dim,
+                                                     int input_hidden_dim,
+                                                     int baseline_grid_elems,
+                                                     hipStream_t stream)
+{
+    dim3 block(THREAD_NUM);
+    if(ar_rs_wide_enabled())
+    {
+        constexpr int pack_size = 16 / sizeof(T);
+        const int part          = (m * (hidden_dim / pack_size)) / NGPUS;
+        int blocks              = (part + THREAD_NUM - 1) / THREAD_NUM;
+        if(const int forced = ar_rs_wide_forced_blocks(); forced > 0)
+        {
+            blocks = forced;
+        }
+        // kMaxBlocks is a hard bound, not a tuning choice: start_sync/end_sync
+        // index Signal::start/end/_flag by blockIdx.x and those arrays are
+        // sized [kMaxBlocks].
+        dim3 grid(std::max(1, std::min(blocks, kMaxBlocks)));
+        reduce_scatter_cross_device_store_wide<T, NGPUS>
+            <<<grid, block, 0, stream>>>(_dp, sg, self_sg, rank, m, hidden_dim, input_hidden_dim);
+    }
+    else
+    {
+        const int block_num = ((baseline_grid_elems / NGPUS) + THREAD_NUM - 1) / THREAD_NUM;
+        dim3 grid(std::max(1, std::min(block_num, kMaxBlocks)));
+        reduce_scatter_cross_device_store<T, NGPUS>
+            <<<grid, block, 0, stream>>>(_dp, sg, self_sg, rank, m, hidden_dim, input_hidden_dim);
+    }
 }
 
 template <int reduce_range>
@@ -3114,23 +3295,20 @@ void allreduce_fusion_kernel_split_per_group_launcher(RankData* _dp,
                                                       bool transpose_scale = false)
 {
     // step 1: reduce-scatter + allgather cross device store (same as per-token)
-    dim3 block(512);
-    int block_num = ((size / NGPUS) + 512 - 1) / 512;
-    dim3 grid(std::min(block_num, 80));
     int m = size / hidden_dim;
     switch(NGPUS)
     {
     case 8:
-        reduce_scatter_cross_device_store<T, 8>
-            <<<grid, block, 0, stream>>>(_dp, sg, self_sg, rank, m, hidden_dim, hidden_dim);
+        launch_reduce_scatter_cross_device_store<T, 8>(
+            _dp, sg, self_sg, rank, m, hidden_dim, hidden_dim, size, stream);
         break;
     case 4:
-        reduce_scatter_cross_device_store<T, 4>
-            <<<grid, block, 0, stream>>>(_dp, sg, self_sg, rank, m, hidden_dim, hidden_dim);
+        launch_reduce_scatter_cross_device_store<T, 4>(
+            _dp, sg, self_sg, rank, m, hidden_dim, hidden_dim, size, stream);
         break;
     case 2:
-        reduce_scatter_cross_device_store<T, 2>
-            <<<grid, block, 0, stream>>>(_dp, sg, self_sg, rank, m, hidden_dim, hidden_dim);
+        launch_reduce_scatter_cross_device_store<T, 2>(
+            _dp, sg, self_sg, rank, m, hidden_dim, hidden_dim, size, stream);
         break;
     default:
         throw std::runtime_error("unsupported NGPUS=" + std::to_string(NGPUS));
@@ -3171,23 +3349,20 @@ void allreduce_fusion_kernel_split_launcher(RankData* _dp,
                                             T* bf16_output = nullptr)
 {
     // step 1, run reduce-scatter + allgather cross device save
-    dim3 block(512);
-    int block_num = ((size / NGPUS) + 512 - 1) / 512;
-    dim3 grid(std::min(block_num, 80));
     int m = size / hidden_dim;
     switch(NGPUS)
     {
     case 8:
-        reduce_scatter_cross_device_store<T, 8>
-            <<<grid, block, 0, stream>>>(_dp, sg, self_sg, rank, m, hidden_dim, hidden_dim);
+        launch_reduce_scatter_cross_device_store<T, 8>(
+            _dp, sg, self_sg, rank, m, hidden_dim, hidden_dim, size, stream);
         break;
     case 4:
-        reduce_scatter_cross_device_store<T, 4>
-            <<<grid, block, 0, stream>>>(_dp, sg, self_sg, rank, m, hidden_dim, hidden_dim);
+        launch_reduce_scatter_cross_device_store<T, 4>(
+            _dp, sg, self_sg, rank, m, hidden_dim, hidden_dim, size, stream);
         break;
     case 2:
-        reduce_scatter_cross_device_store<T, 2>
-            <<<grid, block, 0, stream>>>(_dp, sg, self_sg, rank, m, hidden_dim, hidden_dim);
+        launch_reduce_scatter_cross_device_store<T, 2>(
+            _dp, sg, self_sg, rank, m, hidden_dim, hidden_dim, size, stream);
         break;
     default: throw std::runtime_error("fused allreduce rmsnorm: unsupported NGPUS=" + std::to_string(NGPUS));
     }
@@ -3222,22 +3397,19 @@ void allreduce_mhc_post_split_launcher(RankData* _dp,
                                        hipStream_t stream)
 {
     const int size = m * input_hidden_dim;
-    dim3 block(512);
-    int block_num = ((size / NGPUS) + 512 - 1) / 512;
-    dim3 grid(std::min(block_num, kMaxBlocks));
     switch(NGPUS)
     {
     case 8:
-        reduce_scatter_cross_device_store<T, 8><<<grid, block, 0, stream>>>(
-            _dp, sg, self_sg, rank, m, hidden_size, input_hidden_dim);
+        launch_reduce_scatter_cross_device_store<T, 8>(
+            _dp, sg, self_sg, rank, m, hidden_size, input_hidden_dim, size, stream);
         break;
     case 4:
-        reduce_scatter_cross_device_store<T, 4><<<grid, block, 0, stream>>>(
-            _dp, sg, self_sg, rank, m, hidden_size, input_hidden_dim);
+        launch_reduce_scatter_cross_device_store<T, 4>(
+            _dp, sg, self_sg, rank, m, hidden_size, input_hidden_dim, size, stream);
         break;
     case 2:
-        reduce_scatter_cross_device_store<T, 2><<<grid, block, 0, stream>>>(
-            _dp, sg, self_sg, rank, m, hidden_size, input_hidden_dim);
+        launch_reduce_scatter_cross_device_store<T, 2>(
+            _dp, sg, self_sg, rank, m, hidden_size, input_hidden_dim, size, stream);
         break;
     default:
         throw std::runtime_error("AR+MHC post split epilogue: unsupported NGPUS=" +
@@ -4178,18 +4350,18 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
     {
     case 8:
         MAYBE_DISPATCH_1S_KERNEL(8);
-        reduce_scatter_cross_device_store<T, 8>
-            <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, m, n, input_hidden_dim);
+        launch_reduce_scatter_cross_device_store<T, 8>(
+            ptrs, sg_, self_sg_, rank_, m, n, input_hidden_dim, size, stream);
         break;
     case 4:
         MAYBE_DISPATCH_1S_KERNEL(4);
-        reduce_scatter_cross_device_store<T, 4>
-            <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, m, n, input_hidden_dim);
+        launch_reduce_scatter_cross_device_store<T, 4>(
+            ptrs, sg_, self_sg_, rank_, m, n, input_hidden_dim, size, stream);
         break;
     case 2:
         MAYBE_DISPATCH_1S_KERNEL(2);
-        reduce_scatter_cross_device_store<T, 2>
-            <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, m, n, input_hidden_dim);
+        launch_reduce_scatter_cross_device_store<T, 2>(
+            ptrs, sg_, self_sg_, rank_, m, n, input_hidden_dim, size, stream);
         break;
     default: throw std::runtime_error("fused allreduce rmsnorm: unsupported world_size=" + std::to_string(world_size_));
     }
