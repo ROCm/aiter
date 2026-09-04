@@ -469,6 +469,14 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     {
         mt = 1;  // bottom-right → top-left (equivalent when sq == sk)
     }
+    // On gfx1250, only mask_type=2 (bottom-right causal) BWD kernels exist.
+    // When seqlen_q == seqlen_k the two masks are mathematically equivalent,
+    // so we can safely convert 1 → 2 to hit the existing gfx1250 causal kernels.
+    // See config: hsa/gfx1250/fmha_v3_bwd/fmha_bwd_dqdkdv.csv
+    if(arch_id == "gfx1250" && mt == 1 && a.seqlen_q == a.seqlen_k)
+    {
+        mt = 2;  // top-left → bottom-right (equivalent when sq == sk)
+    }
 
     auto [pre_kernel, dqdkdv_kernel, post_kernel] = get_heuristic_kernel(a.data_type,
                                                                          arch_id,
