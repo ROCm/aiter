@@ -29,6 +29,10 @@ static inline bool dyn_gq_tuned_arch()
     return tuned;
 }
 
+#ifndef DYN_GQ_WIDE_BLK_PER_SIMD
+#define DYN_GQ_WIDE_BLK_PER_SIMD 1
+#endif
+
 #ifndef DYN_GQ_TDM_MIN_BLK_PER_SIMD
 #define DYN_GQ_TDM_MIN_BLK_PER_SIMD 6
 #endif
@@ -1029,8 +1033,14 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
                 constexpr bool kColMajor =
                     std::is_same_v<out_t, opus::fp4_t> && ss && _GS == 128;
                 // See the note at the other launch site: the 64/256 split is gfx1250-only.
+                // See the note at the other launch site: the wide block needs blocks to spare.
                 static constexpr int32_t kBlkTuned = kColMajor ? 64 : 256;
-                const int32_t blk_rt = dyn_gq_tuned_arch() ? kBlkTuned : 64;
+                const int simds_bs = static_cast<int>(get_num_cu_func()) * 4;
+                const bool wide_ok =
+                    dyn_gq_tuned_arch() &&
+                    (static_cast<int64_t>(num_group) * num_thread_per_group / kBlkTuned) >=
+                        static_cast<int64_t>(simds_bs) * DYN_GQ_WIDE_BLK_PER_SIMD;
+                const int32_t blk_rt = wide_ok ? kBlkTuned : 64;
                 const int num_group_per_tg = blk_rt / num_thread_per_group;
                 static constexpr int32_t ooba = 4 / sizeof(out_t);
                 const int64_t oob_elems =
@@ -1186,8 +1196,19 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
             // and dispatch behaviour; nothing was measured on gfx950, so an untuned arch
             // keeps the 64 it always had. Block size is a template argument, so both are
             // instantiated and the arch picks between them at launch.
+            // The wider block only pays once there are blocks to spare: it covers 4x the
+            // groups, so it divides the block count by 4 and on a small tensor leaves the
+            // machine mostly idle. Measured on the fp32-scale path at [T, 7168], blk 256
+            // against blk 64: 1.23x SLOWER at T=8 (7 blocks against 28), even at T=1024,
+            // and 4-9% faster from T=2048 up. The gate is blocks per SIMD, not T, so it
+            // travels across column counts; 1 puts the switch between 1024 and 2048.
             static constexpr int32_t kBlkTuned = kColMajor ? 64 : 256;
-            const int32_t blk_rt = dyn_gq_tuned_arch() ? kBlkTuned : 64;
+            const int simds_bs = static_cast<int>(get_num_cu_func()) * 4;
+            const bool wide_ok =
+                dyn_gq_tuned_arch() &&
+                (static_cast<int64_t>(rows) * scaleN * num_thread_per_group / kBlkTuned) >=
+                    static_cast<int64_t>(simds_bs) * DYN_GQ_WIDE_BLK_PER_SIMD;
+            const int32_t blk_rt = wide_ok ? kBlkTuned : 64;
             const int num_group_per_tg = blk_rt / num_thread_per_group;
             dim3 const block(blk_rt);
             // e8m0 + shuffle pads scaleN up to a multiple of 8 (tile width)
