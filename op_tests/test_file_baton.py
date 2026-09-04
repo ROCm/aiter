@@ -38,10 +38,6 @@ class TestFileBaton(unittest.TestCase):
             path = os.path.join(tempdir, "build.lock")
             with open(path, "w"):
                 pass
-            # A leftover marker has no live flock and must not wedge recovery.
-            with open(path + ".steal", "w"):
-                pass
-
             baton = FileBaton(
                 path,
                 wait_seconds=0,
@@ -259,7 +255,7 @@ class TestFileBaton(unittest.TestCase):
                 "aiter.jit.utils.file_baton.os.open",
                 side_effect=deny_legacy_guard,
             ):
-                guard = baton._try_acquire_steal_guard()
+                guard = baton._try_acquire_steal_guard(allow_legacy_migration=True)
 
             self.assertIsNotNone(guard)
             with open(legacy_guard_path, "rb") as migrated_guard:
@@ -276,9 +272,35 @@ class TestFileBaton(unittest.TestCase):
             fcntl.flock(legacy_guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
             try:
                 baton = FileBaton(path, stale_grace_seconds=-1)
-                self.assertIsNone(baton._try_acquire_steal_guard())
+                self.assertIsNone(
+                    baton._try_acquire_steal_guard(allow_legacy_migration=True)
+                )
             finally:
                 os.close(legacy_guard)
+
+    def test_ambiguous_legacy_guard_is_not_migrated_during_stale_break(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = os.path.join(tempdir, "build.lock")
+            with open(path, "w"):
+                pass
+            with open(path + ".steal", "w"):
+                pass
+
+            baton = FileBaton(path, stale_grace_seconds=-1)
+            self.assertIsNone(baton._try_acquire_steal_guard())
+            with open(path + ".steal", "rb") as legacy_guard:
+                self.assertEqual(legacy_guard.read(), b"")
+
+    def test_absent_lock_with_legacy_guard_is_reacquired_for_rebuild(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = os.path.join(tempdir, "build.lock")
+            with open(path + ".steal", "w"):
+                pass
+
+            baton = FileBaton(path, wait_seconds=0, stale_grace_seconds=-1)
+            self.assertFalse(baton.wait())
+            self.assertTrue(baton.try_acquire())
+            baton.release()
 
 
 if __name__ == "__main__":

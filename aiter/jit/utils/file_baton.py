@@ -190,6 +190,12 @@ class FileBaton:
                 # whether a guarded operation is actually active.
                 sfd = self._try_acquire_steal_guard()
                 if sfd is None:
+                    if self._try_recover_absent_legacy_guard():
+                        logger.warning(
+                            f"[pid={os.getpid()}] recovered an abandoned legacy "
+                            f"guard at {self.lock_file_path}"
+                        )
+                        return False
                     time.sleep(self.wait_seconds)
                     continue
                 try:
@@ -217,7 +223,10 @@ class FileBaton:
         # remove(), letting an expired holder delete its successor's lock.
         sfd = None
         while self._owns_lock_path():
-            sfd = self._try_acquire_steal_guard()
+            # Finishing the build makes it safe to migrate an ambiguous
+            # flock-less legacy marker: a paused old breaker can only remove
+            # the lock this owner is about to remove itself.
+            sfd = self._try_acquire_steal_guard(allow_legacy_migration=True)
             if sfd is not None:
                 break
             time.sleep(self.wait_seconds)
@@ -244,7 +253,7 @@ class FileBaton:
             return False
         return (owner.st_dev, owner.st_ino) == (current.st_dev, current.st_ino)
 
-    def _try_acquire_steal_guard(self):
+    def _try_acquire_steal_guard(self, allow_legacy_migration=False):
         """Try to hold the recovery guard; kernel releases it on process exit."""
         guard_path = self.lock_file_path + ".steal"
         while True:
@@ -277,7 +286,12 @@ class FileBaton:
                 if sfd is not None:
                     return sfd
 
-            if self._legacy_steal_guard_is_active(guard_path):
+            # A flock-less legacy marker has no owner identity. It may belong
+            # to a paused old process regardless of age, so stale recovery
+            # must never replace it while a canonical lock still exists.
+            if not allow_legacy_migration:
+                return None
+            if not self._legacy_steal_guard_can_migrate(guard_path):
                 return None
 
             # Serialize migration among upgraded peers, then atomically
@@ -292,7 +306,7 @@ class FileBaton:
             try:
                 if self._guard_has_protocol(guard_path):
                     retry = True
-                elif self._legacy_steal_guard_is_active(guard_path):
+                elif not self._legacy_steal_guard_can_migrate(guard_path):
                     return None
                 else:
                     return self._publish_guard(guard_path, replace=True)
@@ -362,14 +376,14 @@ class FileBaton:
             if not published:
                 os.close(fd)
 
-    def _legacy_steal_guard_is_active(self, guard_path):
-        """Whether a pre-versioned recovery marker may still be active."""
+    def _legacy_steal_guard_can_migrate(self, guard_path):
+        """Whether a legacy marker passed its grace period and has no flock."""
         try:
             age = time.time() - os.path.getmtime(guard_path)
         except OSError:
             return False
         if age <= self.stale_grace_seconds:
-            return True
+            return False
 
         # Intermediate versions of this protocol retained a lifetime flock on
         # .steal. Honor it even after the grace period. A restrictive marker
@@ -378,16 +392,31 @@ class FileBaton:
         try:
             fd = os.open(guard_path, os.O_RDWR)
         except OSError:
-            return False
+            return True
         try:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                return True
+                return False
             fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
-        return False
+        return True
+
+    def _try_recover_absent_legacy_guard(self):
+        """Reacquire work abandoned after a legacy breaker removed the lock.
+
+        With no canonical lock, a paused legacy breaker has already passed its
+        destructive step; publishing our lock is safe. Rebuilding is the
+        conservative result because the old breaker may have died before it
+        could start the replacement work.
+        """
+        guard_path = self.lock_file_path + ".steal"
+        if self._guard_has_protocol(guard_path):
+            return False
+        if not self._legacy_steal_guard_can_migrate(guard_path):
+            return False
+        return self.try_acquire()
 
     @staticmethod
     def _release_steal_guard(sfd):
