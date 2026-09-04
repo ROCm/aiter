@@ -128,7 +128,7 @@ def _gfx950_gluon_supported(params: _UAParams):
     """Shapes the gfx950 Gluon kernel covers.
 
     bf16 or fp8 for both q and the KV cache, a power-of-2 head size up to 256
-    that k and v share, and none of softcap / qq_bias / alibi. One predicate
+    that k and v share, and neither qq_bias nor alibi. One predicate
     for all three gates: the arch ships a single kernel, so the 2d and 3d paths
     accept exactly the same shapes.
     """
@@ -144,7 +144,6 @@ def _gfx950_gluon_supported(params: _UAParams):
     return (
         DEVICE_ARCH == "gfx950"
         and _unified_attention_kernel_gfx950 is not None
-        and not params.softcap
         and not params.use_qq_bias
         and not params.use_alibi_slopes
         and params.head_size <= 256
@@ -1052,6 +1051,8 @@ def _unified_attention_gfx950(
         block_table_stride=params.block_table.stride(0),
         num_seqs=params.num_seqs,
         SCALE=params.softmax_scale,
+        SOFTCAP=params.softcap,
+        USE_SOFTCAP=(params.softcap > 0),
         NUM_QUERY_HEADS=params.num_query_heads,
         NUM_KV_HEADS=params.num_kv_heads,
         BLOCK_SIZE=params.block_size,
@@ -1081,7 +1082,6 @@ def _unified_attention_gfx950(
 
 def _unified_attention_2d_gfx950(params: _UAParams):
     """Prefill and mixed batches: one program per (kv head, query block)."""
-    assert params.softcap == 0, "Softcap is not supported"
 
     config = get_unified_attention_config("attn_2d", params, backend="gluon")
     BLOCK_M = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
@@ -1107,7 +1107,6 @@ def _unified_attention_3d_gfx950(
     num_warps is not tuned directly here; BLOCK_M rows are split MFMA_DIM to a
     warp, so the warp count follows the query group the launch has to cover.
     """
-    assert params.softcap == 0, "Softcap is not supported"
 
     config = get_unified_attention_config("attn_3d", params, backend="gluon")
     MFMA_DIM = config["MFMA_DIM"]

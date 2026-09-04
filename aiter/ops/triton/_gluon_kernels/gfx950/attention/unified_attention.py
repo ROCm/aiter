@@ -312,6 +312,7 @@ class AttentionConfig:
     MFMA_DIM: gl.constexpr
     SHUFFLED_KV_CACHE: gl.constexpr
     KV_SHUFFLE_WIDTH: gl.constexpr
+    USE_SOFTCAP: gl.constexpr
     # constexpr so the allocated-once vLLM cache strides constant-fold into addressing
     stride_k_cache_0: gl.constexpr
     stride_k_cache_1: gl.constexpr
@@ -347,6 +348,7 @@ class AttentionConfig:
         MFMA_DIM,
         SHUFFLED_KV_CACHE,
         KV_SHUFFLE_WIDTH,
+        USE_SOFTCAP,
         stride_k_cache_0,
         stride_k_cache_1,
         stride_k_cache_2,
@@ -380,6 +382,7 @@ class AttentionConfig:
         self.MFMA_DIM = gl.constexpr(MFMA_DIM)
         self.SHUFFLED_KV_CACHE = gl.constexpr(SHUFFLED_KV_CACHE)
         self.KV_SHUFFLE_WIDTH = gl.constexpr(KV_SHUFFLE_WIDTH)
+        self.USE_SOFTCAP = gl.constexpr(USE_SOFTCAP)
         # CDNA4 shapes: bf16 32x32x16 / 16x16x32, fp8 32x32x64 / 16x16x128.
         if MFMA_DIM == 32:
             mfma_instr = [32, 32, 16] if not self.DOT_FP8 else [32, 32, 64]
@@ -1081,6 +1084,9 @@ class AttentionProgram:
     query_mask_qk: gl.tensor
     context_len_q_pos_qk: gl.tensor
     QK_scale: gl.tensor
+    SM_scale: gl.tensor
+    SOFTCAP: gl.tensor
+    SOFTCAP_SCALE: gl.tensor
     out_scale: gl.tensor
     v_descale: gl.tensor
 
@@ -1098,6 +1104,9 @@ class AttentionProgram:
         query_mask_qk,
         context_len_q_pos_qk,
         QK_scale,
+        SM_scale,
+        SOFTCAP,
+        SOFTCAP_SCALE,
         out_scale,
         v_descale,
     ):
@@ -1112,6 +1121,9 @@ class AttentionProgram:
         self.query_mask_qk = query_mask_qk
         self.context_len_q_pos_qk = context_len_q_pos_qk
         self.QK_scale = QK_scale
+        self.SM_scale = SM_scale
+        self.SOFTCAP = SOFTCAP
+        self.SOFTCAP_SCALE = SOFTCAP_SCALE
         self.out_scale = out_scale
         self.v_descale = v_descale
 
@@ -1127,6 +1139,7 @@ class AttentionProgram:
         v_descale_ptr,
         out_scale_ptr,
         SCALE,
+        SOFTCAP,
         max_seq_prefix_len,
         q_block_local_idx,
         cur_batch_query_len,
@@ -1198,6 +1211,15 @@ class AttentionProgram:
         if k_descale_ptr is not None:
             QK_scale = QK_scale * gl.load(k_descale_ptr)
 
+        if cfg.USE_SOFTCAP:
+            # the cap consumes QK_scale, leaving the softmax the log2 conversion;
+            # folding the divide in here keeps the tanh to a multiply per element
+            SM_scale = cfg.RCP_LN2
+            SOFTCAP_SCALE = 2.0 * QK_scale / SOFTCAP
+        else:
+            SM_scale = QK_scale
+            SOFTCAP_SCALE = QK_scale
+
         if out_scale_ptr is not None:
             out_scale = 1.0 / gl.load(out_scale_ptr)
         else:
@@ -1219,6 +1241,9 @@ class AttentionProgram:
             query_mask_qk,
             context_len_q_pos_qk,
             QK_scale,
+            SM_scale,
+            SOFTCAP,
+            SOFTCAP_SCALE,
             out_scale,
             v_descale,
         )
@@ -1231,9 +1256,9 @@ class AttentionProgram:
             layout=self.cfg.qk_layout,
         )
         if not self.cfg.DOT_FP8:
-            return gl.amd.cdna4.mfma(self.q, k, S)
+            S = gl.amd.cdna4.mfma(self.q, k, S)
         else:
-            return gl.amd.cdna4.mfma_scaled(
+            S = gl.amd.cdna4.mfma_scaled(
                 a=self.q,
                 a_scale=None,
                 a_format="e4m3",
@@ -1242,6 +1267,18 @@ class AttentionProgram:
                 b_format="e4m3",
                 acc=S,
             )
+        if self.cfg.USE_SOFTCAP:
+            # before any mask: tanh(-inf) is -1, which would undo it
+            S = self.apply_softcap(S)
+        return S
+
+    @gluon.jit
+    def apply_softcap(self, S):
+        # softcap * tanh(score / softcap), as (e - 1)/(e + 1) with e = 2**(2d) since
+        # 2**-d is 1/2**d, so one exp2 instead of two, reusing the log2 in the scale.
+        # Returns natural units, which is why SM_scale drops to RCP_LN2.
+        e = gl.exp2(S * self.SOFTCAP_SCALE)
+        return self.SOFTCAP * (e - 1.0) / (e + 1.0)
 
     @gluon.jit
     def apply_mask_qk(self, S, j):
@@ -1271,10 +1308,10 @@ class AttentionProgram:
         m_ij = elementwise_max_prop_nan(M, m)
         # Guard against all-masked rows
         m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
-        m_ij_scaled = m_ij * self.QK_scale
-        q_shifted = S * self.QK_scale - m_ij_scaled[:, None]
+        m_ij_scaled = m_ij * self.SM_scale
+        q_shifted = S * self.SM_scale - m_ij_scaled[:, None]
         p = gl.exp2(q_shifted)
-        m_diff_scaled = M * self.QK_scale - m_ij_scaled
+        m_diff_scaled = M * self.SM_scale - m_ij_scaled
         alpha = gl.exp2(m_diff_scaled)
         return p, alpha, m_ij
 
@@ -1282,9 +1319,9 @@ class AttentionProgram:
     def softmax_part0_cdna4(self, S, M):
         # QK_scale > 0, so scaling the reduced vector is equivalent to scaling the tile.
         # Delaying the scaling fixes certain compilation issues
-        m_ij = gl.maximum(M, gl.max(S, axis=1) * self.QK_scale)
+        m_ij = gl.maximum(M, gl.max(S, axis=1) * self.SM_scale)
         m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
-        p = gl.exp2(S * self.QK_scale - m_ij[:, None])
+        p = gl.exp2(S * self.SM_scale - m_ij[:, None])
         alpha = gl.exp2(M - m_ij)
         return p, alpha, m_ij
 
@@ -1380,10 +1417,11 @@ class AttentionProgram:
             partial_m/l : [num_tokens, NUM_QUERY_HEADS, NUM_SPLITS]
         """
         cfg: gl.constexpr = self.cfg
-        # The CDNA4 sink softmax (softmax_part0_cdna4) already keeps the running max in
-        # QK-scaled space; the non-sink path keeps the raw row-max, so scale it here.
+        # The reduce takes no scale, so the partial max leaves here in log2 space.
+        # softmax_part0_cdna4 already keeps it there; the plain path keeps the raw
+        # row-max, so it needs whatever scale the softmax used.
         if not cfg.USE_SINKS:
-            M = M * self.QK_scale
+            M = M * self.SM_scale
         layout: gl.constexpr = cfg.pv_layout
         offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, layout))
         offs_d = gl.arange(0, cfg.HEAD_SIZE, layout=gl.SliceLayout(0, layout))
@@ -1682,6 +1720,7 @@ def _unified_attention_gluon_kernel(
     block_table_stride: gl.constexpr,
     num_seqs: tl.int32,
     SCALE,
+    SOFTCAP,
     NUM_QUERY_HEADS: gl.constexpr,
     NUM_KV_HEADS: gl.constexpr,
     BLOCK_SIZE: gl.constexpr,
@@ -1699,6 +1738,7 @@ def _unified_attention_gluon_kernel(
     REMOVE_INDIRECT_ACCESS: gl.constexpr = False,
     NUM_BUFFERS: gl.constexpr = 2,
     MFMA_DIM: gl.constexpr = 32,
+    USE_SOFTCAP: gl.constexpr = False,
     SHUFFLED_KV_CACHE: gl.constexpr = False,
     KV_SHUFFLE_WIDTH: gl.constexpr = 0,
     # Split-KV (3d grid)
@@ -1741,6 +1781,7 @@ def _unified_attention_gluon_kernel(
         MFMA_DIM,
         SHUFFLED_KV_CACHE,
         KV_SHUFFLE_WIDTH,
+        USE_SOFTCAP,
         stride_k_cache_0,
         stride_k_cache_1,
         stride_k_cache_2,
@@ -1835,6 +1876,7 @@ def _unified_attention_gluon_kernel(
         v_descale_ptr,
         out_scale_ptr,
         SCALE,
+        SOFTCAP,
         max_seq_prefix_len,
         q_block_local_idx,
         cur_batch_query_len,
