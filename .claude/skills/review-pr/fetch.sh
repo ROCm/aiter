@@ -824,7 +824,7 @@ fi
 
 # A variant of a changed function, in the same file, still carrying a line this PR changed.
 # A1's example is exactly this shape and it had no forensic answer: twins compares whole
-# files. 18.0% of 600 open PRs. Scoped to variant pairs by shared name stem -- any two
+# files. 18.3% of 600 open PRs. Scoped to variant pairs by shared name stem -- any two
 # functions in one file put it at 23.3%, mostly helpers that merely sit together, and a
 # list of variant suffixes instead of a stem drops it to 10.8% by losing _2d against _3d.
 "$SKILLS_ROOT/review-pr/triage.py" siblings "$WORK/pr.diff" "$PROJECT_ROOT" \

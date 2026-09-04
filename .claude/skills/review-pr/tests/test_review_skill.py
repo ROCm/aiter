@@ -2334,7 +2334,7 @@ class TestSiblingVariants(unittest.TestCase):
 
     The discriminator is the shared name stem. Without it any two functions in the same
     file qualify and the check fires on 23.3% of the corpus, mostly on helpers that merely
-    sit together; with it, 18.0%. A list of variant suffixes in place of the stem gives a
+    sit together; with it, 18.3%. A list of variant suffixes in place of the stem gives a
     tidier 10.8% and loses kernel_unified_attention_2d against _3d, which is the shape the
     rule exists for -- the same failure D9's body records."""
 
@@ -2414,3 +2414,66 @@ def _unrelated_helper_name(a):
         out = self.run_siblings(self.diff(self.LINE, path="aiter/ops/triton/absent.py"))
         self.assertIn("no variant of a changed function", out)
 
+
+class TestD11WorkedExampleIsExecutable(unittest.TestCase):
+    """D11's worked example is a claim about the repository, so run it against the
+    repository instead of trusting the prose.
+
+    This class exists because the claim was checked against the wrong tree.
+    /mnt/raid0/zufa/aiter is a second checkout two months behind main, and in it nothing
+    pins `pa_sparse_prefill_kargs` -- so a sweep concluded the example was fiction, that
+    D11 could not fire on aiter#5220, and that the rule body needed rewriting. The pin is
+    there on the branch under review: `pa_sparse_prefill_opus_kernels.cu` asserts
+    `sizeof(pa_sparse_prefill_kargs) == 112` and fixes each field offset through the
+    PA_GFX1250_CO_ABI macro, which is also why grepping for a literal `offsetof(` found
+    nothing. The rule was right and the measurement was stale."""
+
+    TREE = SKILL_DIR.parents[2]
+
+    def setUp(self):
+        if not (self.TREE / "csrc").is_dir():
+            self.skipTest("not running inside an aiter checkout")
+
+    def test_the_struct_the_rule_cites_is_pinned_in_this_tree(self):
+        hits = [f for f in self.TREE.glob("csrc/**/*.cu")
+                if "sizeof(pa_sparse_prefill_kargs)" in f.read_text(errors="replace")]
+        self.assertTrue(
+            hits,
+            "D11's worked example says this struct's size is asserted. Nothing in this "
+            "tree asserts it. Either the tree moved and the rule body needs a new example, "
+            "or the tree being read is not the merge target.")
+
+    def test_d11_fires_on_its_own_worked_example(self):
+        """aiter#5220 adds two ints to the pinned struct and touches no assertion."""
+        diff = ("diff --git a/csrc/include/pa_sparse_prefill_opus.h "
+                "b/csrc/include/pa_sparse_prefill_opus.h\n"
+                "--- a/csrc/include/pa_sparse_prefill_opus.h\n"
+                "+++ b/csrc/include/pa_sparse_prefill_opus.h\n"
+                "@@ -129,6 +129,8 @@ struct pa_sparse_prefill_kargs\n"
+                "     int stride_qo_h;\n+    int stride_o_n;\n+    int stride_o_h;\n"
+                "     int stride_kv_page;\n")
+        with tempfile.TemporaryDirectory() as d:
+            f = pathlib.Path(d) / "pr.diff"
+            f.write_text(diff)
+            out = subprocess.run(
+                [sys.executable, str(TRIAGE), "structabi", str(f), str(self.TREE)],
+                capture_output=True, text=True).stdout
+        self.assertIn("PINNED-LAYOUT", out)
+        self.assertIn("pa_sparse_prefill_kargs", out)
+
+    def test_it_stays_silent_when_the_same_diff_updates_the_assertions(self):
+        diff = ("diff --git a/csrc/include/pa_sparse_prefill_opus.h "
+                "b/csrc/include/pa_sparse_prefill_opus.h\n"
+                "--- a/csrc/include/pa_sparse_prefill_opus.h\n"
+                "+++ b/csrc/include/pa_sparse_prefill_opus.h\n"
+                "@@ -129,6 +129,8 @@ struct pa_sparse_prefill_kargs\n"
+                "     int stride_qo_h;\n+    int stride_o_n;\n"
+                "-static_assert(sizeof(pa_sparse_prefill_kargs) == 112,\n"
+                "+static_assert(sizeof(pa_sparse_prefill_kargs) == 116,\n")
+        with tempfile.TemporaryDirectory() as d:
+            f = pathlib.Path(d) / "pr.diff"
+            f.write_text(diff)
+            out = subprocess.run(
+                [sys.executable, str(TRIAGE), "structabi", str(f), str(self.TREE)],
+                capture_output=True, text=True).stdout
+        self.assertNotIn("PINNED-LAYOUT", out)

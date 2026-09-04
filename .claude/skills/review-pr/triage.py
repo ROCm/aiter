@@ -333,7 +333,7 @@ def _variant_pair(a, b):
     merely sit in the same file.
 
     Deliberately not a list of variant suffixes. Adding one (_opt, _v2, _prefill, _decode,
-    ...) takes 18.0% to 10.8% and the 43 it drops are mostly real: kernel_unified_attention_2d
+    ...) takes 18.3% to 10.8% and the 43 it drops are mostly real: kernel_unified_attention_2d
     against _3d, three times over, and select_2d_config against select_3d_config. D9's rule
     body records the same lesson from the other direction -- do not narrow it to a name list.
     """
@@ -348,7 +348,7 @@ def sibling_variants(diff_text, root):
 
     A1 asks whether the sibling kernel has the same bug and has never had an answer: twins
     compares whole FILES, and A1's own example -- aiter#3841, a decode kernel fixed while
-    `_prefill_opt` beside it was not -- is two functions in ONE file. 18.0% of 600 open
+    `_prefill_opt` beside it was not -- is two functions in ONE file. 18.3% of 600 open
     PRs. Python only: every hit was, and splitting C bodies by brace depth is a heuristic
     with nothing to show for it.
 
