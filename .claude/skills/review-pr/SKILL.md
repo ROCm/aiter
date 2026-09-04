@@ -42,6 +42,12 @@ Read the diff and PR body before proceeding.
 ### Step 1b — Derive the applicable rules, and collect the evidence they need
 
 
+**`$WORK/perf_claims.txt` lists every number the description claims, and marks the ones
+that name no baseline.** P1 asks for the number with its units and its comparison; a line
+marked `->` has the number and not the comparison. A signed delta (`+8.64%`) and a table row
+under a `before | after` header already carry theirs; a bare `198 TFLOPS` does not, and the
+question to ask is against what, on which shapes.
+
 **`$WORK/ci_coverage.txt` says whether the tests this PR adds will ever run.** HK6 asks a
 new op to ship a test; a file under `op_tests/flydsl_tests/` satisfies HK6 by name and is
 scanned by no workflow, and one under `op_tests/multigpu_tests/` runs only with the

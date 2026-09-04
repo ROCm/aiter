@@ -772,6 +772,12 @@ if grep -q "invariant-removed\|api-signature" "$WORK/rules.txt"; then
   fi
 fi
 
+# Numeric performance claims in the description, and which of them say what they are
+# measured against. Scoped to the description: kernel comments are full of `4x DS_READ`
+# and `num_tokens x 384 x 7168`, so reading claims out of code was 61% noise.
+"$SKILLS_ROOT/review-pr/triage.py" perfclaims "$WORK/pr_meta.json" \
+  | tee "$WORK/perf_claims.txt"
+
 # Whether a CI job will ever run the tests this PR adds. Computed from .github/ rather
 # than hardcoded: op_tests is shard-scanned at maxdepth 1 and op_tests/triton_tests
 # recursively, so op_tests/flydsl_tests/ (5 files in tree) is scanned by nothing and
@@ -814,5 +820,5 @@ fi
 
 echo
 echo "WORK=$WORK"
-echo "artifacts: pr.diff pr_meta.json base_head.txt rules.txt rules_expanded.txt test_quality.txt twins.txt ci_coverage.txt \
+echo "artifacts: pr.diff pr_meta.json base_head.txt rules.txt rules_expanded.txt test_quality.txt twins.txt ci_coverage.txt perf_claims.txt \
 evidence.txt symbols.txt validation_requirement.json"

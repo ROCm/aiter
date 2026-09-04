@@ -1615,3 +1615,63 @@ class TestCiCoverage(unittest.TestCase):
     def test_step_1b_writes_the_artifact(self):
         self.assertIn("citest", FETCH.read_text())
         self.assertIn("ci_coverage.txt", SKILL_MD.read_text())
+
+
+class TestPerfClaims(unittest.TestCase):
+    """Numbers the description claims, and which name a baseline.
+
+    Scoped to the PR body. Reading claims out of kernel comments over the 600-PR corpus
+    was 61% noise: `4x DS_READ`, `<4 x i32>`, `num_tokens x 384 x 7168`, `5% of elements`.
+    """
+
+    def claims(self, body):
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            f = pathlib.Path(td) / "pr_meta.json"
+            f.write_text(json.dumps({"body": body}))
+            r = subprocess.run([sys.executable, str(TRIAGE), "perfclaims", str(f)],
+                               capture_output=True, text=True)
+        self.assertEqual(0, r.returncode, r.stderr)
+        return r.stdout
+
+    def test_a_bare_absolute_number_is_flagged(self):
+        out = self.claims("FlyDSL (direct, no fallback): expect ~198 TFLOPS\n")
+        self.assertIn("->", out)
+        self.assertIn("198TFLOPS", out)
+
+    def test_a_number_next_to_its_comparison_is_not_flagged(self):
+        out = self.claims("reaches 902 TFLOP/s against CK-tile's 838\n")
+        self.assertNotIn("->", out)
+
+    def test_a_signed_delta_carries_its_own_baseline(self):
+        """`+8.64% end-to-end` compares against not having the change; asking what it is
+        measured against is pedantry, and pedantry is what makes a check ignorable."""
+        self.assertNotIn("->", self.claims("worth **+8.64% end-to-end** on an 8x server\n"))
+
+    def test_table_rows_inherit_the_header_baseline(self):
+        body = ("| batch | before | after | speedup |\n"
+                "|---|---|---|---|\n"
+                "| 1 | 35.76 | 27.00 | 1.32x |\n"
+                "| 2 | 41.61 | 31.30 | 1.33x |\n")
+        self.assertNotIn("->", self.claims(body))
+
+    def test_a_share_of_time_is_not_a_speedup(self):
+        """`33.07% of GPU time` says where the time goes. Asking what it is measured
+        against is nonsense, and the corpus is full of these."""
+        out = self.claims("FmhaBatchPrefill was 33.07% of GPU time, and the run is "
+                          "81.8% prefill by GPU time\n")
+        self.assertNotIn("->", out)
+
+    def test_hardware_model_numbers_are_not_claims(self):
+        """MI300X, MI35x, gfx950 all end in something the number matcher wants."""
+        out = self.claims("Tested on 8x MI355X (gfx950) and MI308X\n")
+        self.assertIn("no numeric performance claim", out)
+
+    def test_a_description_with_no_numbers_says_so(self):
+        self.assertIn("no numeric performance claim",
+                      self.claims("Refactor the dispatch table.\n"))
+
+    def test_step_1b_writes_the_artifact(self):
+        self.assertIn("perfclaims", FETCH.read_text())
+        self.assertIn("perf_claims.txt", SKILL_MD.read_text())

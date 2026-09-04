@@ -1033,11 +1033,91 @@ def uncovered_test_paths(diff_text, root):
 
 
 
+# --------------------------------------------------------------- perf claims
+PERF_NUM = re.compile(r"(?<![A-Za-z0-9])(\d+(?:\.\d+)?)\s*"
+                      r"(x\b|%|\bus\b|\b[mu]s\b|TFLOPS?\b|GB/s|tok/s)", re.I)
+HW_MODEL = re.compile(r"\b(MI\d+\w*|gfx\d+|CDNA\d*|RDNA\d*|fp\d+|bf\d+|int\d+|e\dm\d)",
+                      re.I)
+BASELINE = re.compile(r"\bvs\.?\b|versus|baseline|\bbefore\b|\bafter\b|\bmain\b|torch|"
+                      r"\bck\b|hipblas|current|previous|reference|speedup|faster|slower|"
+                      r"improv|regress|→|->", re.I)
+
+
+SHARE = re.compile(r"%\s*(of|prefill|decode|busy|utili|occupan|GPU time|end of|elements)"
+                   r"|of\s+(GPU|total|kernel)\s+time", re.I)
+
+
+def perf_claims(body):
+    """Numeric performance claims in the PR description, and whether each names what it
+    is measured against.
+
+    Scoped to the description on purpose. Kernel comments are full of `4x DS_READ`,
+    `<4 x i32>`, `num_tokens x 384 x 7168` and `5% of elements`, so extracting claims from
+    code produced more noise than signal over the 600-PR corpus -- 61% of what it called
+    unbaselined claims were shapes, vector widths and error bounds. A perf claim lives in
+    the description; that is where P1 and P3 ask for it, and that is where this looks."""
+    lines = (body or "").splitlines()
+    # A markdown table states its baseline in the header: `| batch | before | after |
+    # speedup |`. Judging each row alone called every row of aiter#4443's table
+    # unbaselined when the column names are the baseline.
+    table_header = None
+    rows = []
+    # `8x MI355X` is a GPU count, not a speedup. Substituting the model name away first
+    # left a bare `8x` looking like one.
+    COUNT = re.compile(r"\b\d+\s*[x×]\s*(?=MI\d|gfx|GPU|node|card|rank|device|CU\b|"
+                       r"warp|wave|stage|shard)", re.I)
+    for line in lines:
+        line = COUNT.sub(" ", line)
+        is_row = line.strip().startswith("|") and line.count("|") >= 3
+        if is_row and BASELINE.search(line) and not PERF_NUM.search(HW_MODEL.sub(" ", line)):
+            table_header = line
+            continue
+        if not is_row:
+            table_header = None
+        stripped = HW_MODEL.sub(" ", line)
+        if not PERF_NUM.search(stripped):
+            continue
+        # A share is not a speedup: "33.07% of GPU time", "81.8% prefill" describe where
+        # the time goes, and asking what they are measured against is nonsense.
+        if SHARE.search(line) and not re.search(r"\d\s*x\b", stripped):
+            continue
+        nums = [f"{a}{b}" for a, b in PERF_NUM.findall(stripped)]
+        # A signed percentage is a delta, and a delta's other side is "without this
+        # change" -- that is a stated baseline in ordinary English. `+8.64% end-to-end`
+        # needs no interrogation; a bare `198 TFLOPS` does.
+        signed = bool(re.search(r"[+\-−]\s*\**\d+(?:\.\d+)?\s*%", line))
+        based = (bool(BASELINE.search(line)) or signed
+                 or (is_row and table_header is not None))
+        rows.append((line.strip()[:100], nums, based))
+    return rows
+
+
+def render_perf_claims(rows):
+    if not rows:
+        return "no numeric performance claim in the PR description\n"
+    out = []
+    bare = [r for r in rows if not r[2]]
+    for line, nums, based in rows:
+        mark = "ok" if based else "->"
+        out.append(f"{mark} {line}")
+        if not based:
+            out.append(f"     {', '.join(nums)} with nothing said about what it is measured"
+                       f" against")
+    if bare:
+        out.append("")
+        out.append(f"{len(bare)} of {len(rows)} claim lines name no baseline. P1 wants the "
+                   f"number with its units AND its comparison; P3 wants it reproducible. "
+                   f"Ask what the other side of the comparison was -- main, torch, CK, the "
+                   f"previous kernel -- and on which shapes.")
+    return "\n".join(out) + "\n"
+
+
+
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
     if mode not in ("rules", "evidence", "symbols", "ledger", "expand", "answers",
                         "mapping", "diagnostic", "testquality",
-                        "twins", "citest"):
+                        "twins", "citest", "perfclaims"):
         print("usage: triage.py rules <diff> [title]\n"
               "       triage.py evidence <diff> <head-file>...\n"
               "       triage.py symbols <diff> <merge-target-root>\n"
@@ -1048,8 +1128,18 @@ if __name__ == "__main__":
               "       triage.py diagnostic <ai_diagnostic.txt>\n"
               "       triage.py testquality <diff>\n"
               "       triage.py twins <diff> <root>\n"
-              "       triage.py citest <diff> <root>", file=sys.stderr)
+              "       triage.py citest <diff> <root>\n"
+              "       triage.py perfclaims <pr_meta.json>", file=sys.stderr)
         raise SystemExit(2)
+
+    if mode == "perfclaims":
+        import json as _json
+        try:
+            body = _json.load(open(sys.argv[2])).get("body") or ""
+        except Exception:
+            body = ""
+        sys.stdout.write(render_perf_claims(perf_claims(body)))
+        raise SystemExit(0)
 
     if mode == "citest":
         root = pathlib.Path(sys.argv[3] if len(sys.argv) > 3 else ".")
