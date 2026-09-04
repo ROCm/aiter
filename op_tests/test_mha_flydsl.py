@@ -1,69 +1,58 @@
-"""Unit test for FlyDSL MHA kernels on gfx1250.
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-Two layouts: THD packed [total_tokens, H, D] with variable-length sequences
-via cu_seqlens, and batched BSHD [B, S, H, D] with a uniform seq_len. Covers
-causal, non-causal, sq!=sk, seqlen_k==0, mixed zero/nonzero batches, GQA,
-attention sink, and return_lse. Both suites run by default; --varlen or --batch
-runs just one.
+"""Unit test + perf sweep for the FlyDSL FMHA forward-prefill kernels on gfx1250.
+
+Two layouts, one table each:
+  - ``thd``  packed ``[total_tokens, H, D]``, variable-length via ``cu_seqlens``
+  - ``bshd`` batched ``[B, S, H, D]``, uniform ``seq_len``
+
+Covers causal, non-causal, sq != sk, seqlen_k == 0, mixed zero/nonzero batches,
+GQA/MQA, attention sink, sliding window, and return_lse.
+
+Both suites drive the public ``aiter.ops.mha`` entry points, so a case is only
+swept when the routing in ``aiter/ops/mha.py`` + ``aiter/ops/flydsl/fmha_kernels.py``
+lands on the FlyDSL m32x8 kernel; anything else would be testing CK/ASM/Triton.
 
 Usage:
     python op_tests/test_mha_flydsl.py
 """
 
 import argparse
+import itertools
 import math
-import sys
+import random
 
 import pandas as pd
 import torch
 
 import aiter
 from aiter.jit.core import is_experimental_enabled
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha import flash_attn_func, flash_attn_varlen_func
-from aiter.test_common import checkAllclose
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import dtypes
 
-if aiter.get_gfx() != "gfx1250":
-    print("Skipping: test requires gfx1250 " f"(current: {aiter.get_gfx()})")
-    sys.exit(0)
+SUPPORTED_GFX = ["gfx1250"]
 
-HEAD_DIM_QK = 192
-HEAD_DIM_V = 128
+# (d_qk, d_v) pairs the FlyDSL kernels can serve at all. Anything else is
+# rejected up front rather than silently falling through to CK/Triton.
+SUPPORTED_D_QK_V = [(256, 128), (192, 128), (128, 128)]
 
-# Element dtypes the m32x8 kernel serves (q/k/v share one).
-DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
-DTYPE_NAME = {v: k for k, v in DTYPES.items()}
+# Kernels that can be timed per case. "flydsl" is the path under test; "triton"
+# is an optional cross-check for plain (no sink / no window) thd configs.
+KERNELS = ["flydsl", "triton"]
 
-# (d_qk, d_v) pairs each layout's FlyDSL kernel can serve. Extend as the
-# kernels grow; anything else is rejected up front rather than silently
-# falling through to CK/Triton and testing nothing.
-SUPPORTED_D_QK_V = {
-    "thd": [(256, 128), (192, 128), (128, 128)],
-    "bshd": [(256, 128), (192, 128), (128, 128)],
-}
+# Pin the arg-rotation count. Left to itself, run_perftest derives it from
+# `free_memory` at call time, so two rows timed in one process rotate a
+# different number of times and land in different L2 states -- their `us`
+# columns then are not comparable with each other.
+_ROTATE = 4
 
 
-def _check_d_qk_v(layout, d_qk_v):
-    assert d_qk_v in SUPPORTED_D_QK_V[layout], (
-        f"layout={layout} supports d_qk,d_v in {SUPPORTED_D_QK_V[layout]}, "
-        f"got {d_qk_v}"
-    )
-
-
-def _time_fn(fn, warmup, repeat):
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    latencies = []
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    for _ in range(repeat):
-        start_event.record()
-        fn()
-        end_event.record()
-        end_event.synchronize()
-        latencies.append(start_event.elapsed_time(end_event))
-    return sum(latencies) / len(latencies)
+# ============================================================================
+# Masks / reference
+# ============================================================================
 
 
 def _expand_kv(t, gqa, dim=-2):
@@ -71,23 +60,14 @@ def _expand_kv(t, gqa, dim=-2):
     return t if gqa == 1 else t.repeat_interleave(gqa, dim=dim)
 
 
-def _causal_mask(sq, sk, device):
-    """Bottom-right aligned: query s attends kv [0, s + (sk - sq)]."""
-    return torch.triu(
-        torch.ones(sq, sk, device=device, dtype=torch.bool), diagonal=sk - sq + 1
-    )
-
-
 def _local_mask(sq, sk, window_left, window_right, device):
-    """Sliding-window mask, bottom-right aligned (offset ``sk - sq`` like
-    ``_causal_mask``). Returns a ``[sq, sk]`` bool tensor, True where masked out
-    (i.e. outside the band). ``window_left``/``window_right == -1`` means
-    infinite (no bound) on that side.
+    """Sliding-window mask, bottom-right aligned (offset ``sk - sq``). Returns a
+    ``[sq, sk]`` bool tensor, True where masked out (outside the band).
+    ``window_left``/``window_right == -1`` means infinite on that side.
 
     Query row ``s`` attends kv col ``j`` in the inclusive band
-    ``s + (sk - sq) - left <= j <= s + (sk - sq) + right``.
-
-    Note: ``_local_mask(sq, sk, -1, 0)`` is identical to ``_causal_mask``.
+    ``s + (sk - sq) - left <= j <= s + (sk - sq) + right``, so
+    ``_local_mask(sq, sk, -1, 0)`` is exactly the bottom-right causal mask.
     """
     row_idx = torch.arange(sq, device=device, dtype=torch.long).unsqueeze(-1)
     col_idx = torch.arange(sk, device=device, dtype=torch.long)
@@ -105,6 +85,12 @@ def _local_mask(sq, sk, window_left, window_right, device):
     return m
 
 
+def _effective_window(causal, window_size):
+    """Effective window: ``causal`` pins the right bound to 0 and leaves the left
+    bound as given, matching ``flash_attn_*_m32x8``."""
+    return window_size[0], (0 if causal else window_size[1])
+
+
 def _make_sink(nheads_q, device):
     """Per-head fp32 sink logits in the scaled-score domain (one extra virtual
     zero-value KV column in the softmax denominator). Spread so some heads' sink
@@ -114,41 +100,26 @@ def _make_sink(nheads_q, device):
 
 def _apply_sink(qk, sink):
     """Append the per-head virtual sink column to scaled scores ``qk``
-    ([H_q, sq, sk]) so softmax/logsumexp pick it up. Returns qk unchanged when
-    ``sink`` is None."""
+    (``[H_q, sq, sk]``) so softmax/logsumexp pick it up."""
     if sink is None:
         return qk
     sink_col = sink.to(qk.dtype).view(-1, 1, 1).expand(qk.shape[0], qk.shape[1], 1)
     return torch.cat([qk, sink_col], dim=-1)
 
 
-def _ref_mha_varlen(
-    q,
-    k,
-    v,
-    cu_q,
-    cu_k,
-    scale,
-    causal=False,
-    return_lse=False,
-    sink=None,
-    window_size=(-1, -1),
-):
+def run_torch_varlen(q, k, v, cu_q, cu_k, scale, causal, return_lse, sink, window_size):
     """PyTorch reference for varlen THD layout, per-batch.
 
     Causal is routed through the local (sliding-window) mask: ``causal`` forces
     the effective right window to 0 while leaving the left window as given, so
     ``_local_mask(sq, sk, -1, 0)`` reproduces the pure-causal mask exactly.
+    A batch with ``kv_len == 0`` yields O = 0 and LSE = -inf (or ``sink[h]``).
     """
     B = len(cu_q) - 1
-    gqa = q.shape[1] // k.shape[1]  # q head h reads kv head h // gqa
-    # Effective window: causal pins the right side to 0 (Mistral-style causal +
-    # finite left stays valid). Apply the mask whenever it's not full attention.
-    wl = window_size[0]
-    wr = 0 if causal else window_size[1]
-    apply_mask = causal or window_size != (-1, -1)
-    outs = []
-    lses = []
+    gqa = q.shape[1] // k.shape[1]
+    wl, wr = _effective_window(causal, window_size)
+    apply_mask = causal or tuple(window_size) != (-1, -1)
+    outs, lses = [], []
     for b in range(B):
         sq = cu_q[b + 1] - cu_q[b]
         sk = cu_k[b + 1] - cu_k[b]
@@ -157,274 +128,312 @@ def _ref_mha_varlen(
         vb = _expand_kv(v[cu_k[b] : cu_k[b + 1]].float(), gqa)
         qk = torch.bmm(qb.permute(1, 0, 2), kb.permute(1, 2, 0)) * scale
         if apply_mask:
-            mask = _local_mask(sq, sk, wl, wr, qk.device)
-            qk = qk.masked_fill(mask.unsqueeze(0), float("-inf"))
-        qk_aug = _apply_sink(qk, sink)  # extra sink column, if any
-        if return_lse:
-            lse_b = torch.logsumexp(qk_aug, dim=-1)
-            lses.append(lse_b)
-        p = torch.softmax(qk_aug, dim=-1)
-        p = torch.nan_to_num(p, nan=0.0)  # all-masked rows: softmax(-inf)=NaN → 0
-        if sink is not None:
-            p = p[..., :-1]  # drop virtual sink column (zero-value → 0 contribution)
-        ob = torch.bmm(p, vb.permute(1, 0, 2))
-        outs.append(ob.permute(1, 0, 2))
-    if return_lse:
-        return torch.cat(outs, dim=0), lses
-    return torch.cat(outs, dim=0)
-
-
-def run_varlen_test(
-    cu_q_list,
-    cu_k_list,
-    H_q=1,
-    H_kv=None,
-    d_qk=HEAD_DIM_QK,
-    d_v=HEAD_DIM_V,
-    causal=False,
-    return_lse=False,
-    sink=False,
-    window_size=(-1, -1),
-    dtype=torch.bfloat16,
-    warmup=1,
-    repeat=5,
-):
-    device = torch.device("cuda")
-    torch.manual_seed(42)
-
-    _check_d_qk_v("thd", (d_qk, d_v))
-    H_kv = H_q if H_kv is None else H_kv
-    assert H_q % H_kv == 0, f"nheads_q={H_q} must be a multiple of nheads_kv={H_kv}"
-
-    cu_q, cu_k = cu_q_list, cu_k_list
-    B = len(cu_q) - 1
-    total_q, total_k = cu_q[-1], cu_k[-1]
-
-    max_sq = max(cu_q[i + 1] - cu_q[i] for i in range(B))
-    max_sk = max(cu_k[i + 1] - cu_k[i] for i in range(B))
-
-    q = torch.randn(total_q, H_q, d_qk, dtype=dtype, device=device)
-    k = torch.randn(total_k, H_kv, d_qk, dtype=dtype, device=device)
-    v = torch.randn(total_k, H_kv, d_v, dtype=dtype, device=device)
-
-    scale = 1.0 / math.sqrt(d_qk)
-    # sink is [nheads_q] fp32, per-head logit in the same scaled-score domain.
-    sink_t = _make_sink(H_q, device) if sink else None
-
-    cu_seqlens_q = torch.tensor(cu_q, dtype=torch.int32, device=device)
-    cu_seqlens_k = torch.tensor(cu_k, dtype=torch.int32, device=device)
-
-    def _run():
-        return flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_sq,
-            max_sk,
-            softmax_scale=scale,
-            causal=causal,
-            window_size=window_size,
-            return_lse=return_lse,
-            sink_ptr=sink_t,
-        )
-
-    avg_ms = _time_fn(_run, warmup, repeat)
-    result = _run()
-
-    if return_lse:
-        o, lse = result
-    else:
-        o = result
-
-    fwd_flop = _fwd_flops_varlen(cu_q, cu_k, H_q, d_qk, d_v, causal)
-    fwd_tflops = _tflops(fwd_flop, avg_ms)
-    avg_us = avg_ms * 1000
-
-    seqs = [cu_q[i + 1] - cu_q[i] for i in range(B)]
-    tag = (
-        f"thd {DTYPE_NAME[dtype]} B={B} H={H_q}/{H_kv} d={d_qk}/{d_v} seqs={seqs} "
-        f"causal={causal} lse={return_lse} sink={sink} window={window_size}"
-    )
-    print(f"  [{tag}] avg: {avg_ms:.3f}ms ({avg_us:.1f} us)  {fwd_tflops:.1f} TFLOPS")
-
-    ref_result = _ref_mha_varlen(
-        q,
-        k,
-        v,
-        cu_q,
-        cu_k,
-        scale,
-        causal=causal,
-        return_lse=return_lse,
-        sink=sink_t,
-        window_size=window_size,
-    )
-    if return_lse:
-        ref, ref_lses = ref_result
-    else:
-        ref = ref_result
-
-    # A batch whose kv_len==0 attends to no keys: the kernel writes O=0 and LSE=-inf
-    # (or LSE=sink[head] with a sink). Exclude those rows from the main O compare
-    # (True = compare, False = ignore) and check them explicitly below.
-    kv_lens = [cu_k[b + 1] - cu_k[b] for b in range(B)]
-    o_f = o.float()
-    valid = torch.ones_like(o_f, dtype=torch.bool)
-    for b in range(B):
-        if kv_lens[b] == 0:
-            valid[cu_q[b] : cu_q[b + 1]] = False
-
-    err = checkAllclose(
-        o_f, ref, rtol=1e-2, atol=1e-2, msg=f"  [{tag}] out: ", mask=valid
-    )
-
-    # Empty-KV batches: O must be all-zero; LSE must be -inf (no sink) or sink[head].
-    for b in range(B):
-        if kv_lens[b] != 0:
-            continue
-        rows = slice(int(cu_q[b]), int(cu_q[b + 1]))
-        if not bool((o_f[rows] == 0).all()):
-            print(f"  [{tag}] kv0 batch {b}: O not all-zero")
-            err = max(err, 1.0)
-        if return_lse:
-            lse_b = lse[rows]  # [sq, nheads_q]
-            if sink_t is not None:
-                exp_lse = sink_t.to(lse_b.dtype).view(1, -1).expand_as(lse_b)
-                err = max(
-                    err,
-                    checkAllclose(lse_b, exp_lse, msg=f"  [{tag}] kv0 lse batch {b}: "),
-                )
-            elif not bool(torch.isneginf(lse_b).all()):
-                print(f"  [{tag}] kv0 batch {b}: LSE not all -inf")
-                err = max(err, 1.0)
-
-    if return_lse:
-        for b in range(B):
-            if kv_lens[b] == 0:
-                continue
-            sq = cu_q[b + 1] - cu_q[b]
-            ref_lse_b = ref_lses[b]
-            lse_b = lse[cu_q[b] : cu_q[b + 1]].permute(1, 0)
-            lse_err = checkAllclose(
-                lse_b,
-                ref_lse_b,
-                rtol=1e-2,
-                atol=1e-2,
-                msg=f"  [{tag}] lse batch {b} (sq={sq}): ",
+            qk = qk.masked_fill(
+                _local_mask(sq, sk, wl, wr, qk.device).unsqueeze(0), float("-inf")
             )
-            err = max(err, lse_err)
-
-    if err > 0.0 and B > 1:
-        for b in range(B):
-            if kv_lens[b] == 0:
-                continue
-            sq = cu_q[b + 1] - cu_q[b]
-            ob = o_f[cu_q[b] : cu_q[b + 1]]
-            rb = ref[cu_q[b] : cu_q[b + 1]]
-            isC = torch.isclose(ob, rb, rtol=1e-2, atol=1e-2)
-            bad = (~isC).sum().item()
-            if bad > 0:
-                delta = (ob[~isC] - rb[~isC]).abs()
-                bad_idx = torch.nonzero(~isC)
-                toks = bad_idx[:, 0].unique()
-                print(
-                    f"    batch {b} (sq={sq}): {bad} bad, max_err={delta.max():.6f}, "
-                    f"tok_range=[{toks.min().item()}..{toks.max().item()}], "
-                    f"n_bad_toks={len(toks)}"
-                )
-
-    passed = err < 0.05
-    ret = {
-        "layout": "thd",
-        "dtype": DTYPE_NAME[dtype],
-        "B": B,
-        "H_q": H_q,
-        "H_kv": H_kv,
-        "d_qk": d_qk,
-        "d_v": d_v,
-        "seqs_q": [cu_q[i + 1] - cu_q[i] for i in range(B)],
-        "seqs_k": [cu_k[i + 1] - cu_k[i] for i in range(B)],
-        "causal": causal,
-        "lse": return_lse,
-        "sink": sink,
-        "window": window_size,
-        "avg_us": round(avg_us, 2),
-        "tflops": round(fwd_tflops, 2),
-        "pass": passed,
-    }
-    return passed, ret
+        qk_aug = _apply_sink(qk, sink)
+        if return_lse:
+            lses.append(torch.logsumexp(qk_aug, dim=-1))
+        p = torch.softmax(qk_aug, dim=-1)
+        p = torch.nan_to_num(p, nan=0.0)  # all-masked rows: softmax(-inf) = NaN -> 0
+        if sink is not None:
+            p = p[..., :-1]  # drop virtual sink column (zero value -> 0 contribution)
+        outs.append(torch.bmm(p, vb.permute(1, 0, 2)).permute(1, 0, 2))
+    out = torch.cat(outs, dim=0)
+    return (out, lses) if return_lse else out
 
 
-def _ref_mha_batch(
-    q,
-    k,
-    v,
-    scale,
-    causal=False,
-    return_lse=False,
-    sink=None,
-    window_size=(-1, -1),
-):
+def run_torch_batch(q, k, v, scale, causal, return_lse, sink, window_size):
     """PyTorch reference for batched BSHD layout, per-batch.
 
-    Loops over the batch so peak scratch stays at one [H_q, sq, sk] score
-    matrix instead of [B, H_q, sq, sk]. Causal is routed through the local
-    (sliding-window) mask (see ``_ref_mha_varlen``).
+    Loops over the batch so peak scratch stays at one ``[H_q, sq, sk]`` score
+    matrix instead of ``[B, H_q, sq, sk]``. Causal is routed through the local
+    (sliding-window) mask (see ``run_torch_varlen``).
     """
     B, sq, _, _ = q.shape
     sk = k.shape[1]
     gqa = q.shape[2] // k.shape[2]
-    wl = window_size[0]
-    wr = 0 if causal else window_size[1]
-    apply_mask = causal or window_size != (-1, -1)
-    outs = []
-    lses = []
+    wl, wr = _effective_window(causal, window_size)
+    apply_mask = causal or tuple(window_size) != (-1, -1)
+    outs, lses = [], []
     for b in range(B):
         qb = q[b].float().permute(1, 0, 2)  # [H_q, sq, d_qk]
         kb = _expand_kv(k[b].float(), gqa).permute(1, 0, 2)
         vb = _expand_kv(v[b].float(), gqa).permute(1, 0, 2)
         qk = torch.bmm(qb, kb.transpose(1, 2)) * scale
         if apply_mask:
-            mask = _local_mask(sq, sk, wl, wr, qk.device)
-            qk = qk.masked_fill(mask.unsqueeze(0), float("-inf"))
-        qk_aug = _apply_sink(qk, sink)  # extra sink column, if any
+            qk = qk.masked_fill(
+                _local_mask(sq, sk, wl, wr, qk.device).unsqueeze(0), float("-inf")
+            )
+        qk_aug = _apply_sink(qk, sink)
         if return_lse:
             lses.append(torch.logsumexp(qk_aug, dim=-1))  # [H_q, sq]
         p = torch.softmax(qk_aug, dim=-1)
         p = torch.nan_to_num(p, nan=0.0)
         if sink is not None:
-            p = p[..., :-1]  # drop virtual sink column (zero-value → 0 contribution)
+            p = p[..., :-1]
         outs.append(torch.bmm(p, vb).permute(1, 0, 2))  # [sq, H_q, d_v]
     out = torch.stack(outs, dim=0)
+    return (out, torch.stack(lses, dim=0)) if return_lse else out  # lse [B, H_q, sq]
+
+
+# ============================================================================
+# Roofline
+# ============================================================================
+
+
+def _flops(shapes, H_q, d_qk, d_v, causal):
+    """FLOPs for forward: sum per-batch QK^T + PV, causal halves each batch."""
+    total = 0
+    for sq, sk in shapes:
+        f = H_q * (2 * sq * sk * d_qk + 2 * sq * sk * d_v)
+        total += f // 2 if causal else f
+    return total
+
+
+def _nbytes(tot_q, tot_k, H_q, H_kv, d_qk, d_v, elem_size, return_lse):
+    """Q + K + V reads and O (+ LSE) writes. Ignores re-reads of K/V across
+    M-blocks, so this is the compulsory-traffic lower bound."""
+    n = (
+        tot_q * H_q * d_qk  # Q
+        + tot_k * H_kv * d_qk  # K
+        + tot_k * H_kv * d_v  # V
+        + tot_q * H_q * d_v  # O
+    ) * elem_size
     if return_lse:
-        return out, torch.stack(lses, dim=0)  # [B, H_q, sq]
-    return out
+        n += tot_q * H_q * 4
+    return n
 
 
-def run_batch_test(
-    B,
-    sq,
-    sk,
-    H_q=1,
-    H_kv=None,
-    d_qk=128,
-    d_v=128,
-    causal=False,
-    return_lse=False,
-    sink=False,
-    window_size=(-1, -1),
-    dtype=torch.bfloat16,
-    warmup=1,
-    repeat=5,
+# ============================================================================
+# Routing mirrors -- only sweep configs that really reach the FlyDSL kernel
+# ============================================================================
+
+
+def _flydsl_serves_thd(d_qk, d_v, causal, sink, window):
+    """True when ``flash_attn_varlen_func`` lands on the FlyDSL m32x8 kernel.
+
+    Mirrors ``aiter/ops/mha.py`` (the PR3039 gfx1250 ASM gate) and
+    ``flydsl_flash_attn_varlen_func`` in ``aiter/ops/flydsl/fmha_kernels.py``.
+    """
+    if d_v != 128:
+        return False
+    exp = is_experimental_enabled()
+    if d_qk == 256:
+        return exp  # else CK
+    if d_qk not in (128, 192):
+        return False
+    if d_qk == 128 and not exp:
+        # The gfx1250 ASM kernel claims d128 only for plain causal attention with
+        # no sink and no finite window; non-causal / sink / windowed d128 is ours.
+        if causal and not sink and tuple(window) == (-1, -1):
+            return False
+    return True
+
+
+def _flydsl_serves_bshd(d_qk, d_v):
+    """True when ``flash_attn_func`` lands on the FlyDSL m32x8 BSHD kernel.
+    No ASM/sibling competes for BSHD, so routing is head-dim only."""
+    if d_v != 128:
+        return False
+    return d_qk in (128, 192) or (d_qk == 256 and is_experimental_enabled())
+
+
+# ============================================================================
+# Timed entry points (module level so run_perftest can rotate their tensor args)
+# ============================================================================
+
+
+def _call_varlen(q, k, v, cu_q, cu_k, max_sq, max_sk, scale, causal, window, lse, sink):
+    return flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        max_sq,
+        max_sk,
+        softmax_scale=scale,
+        causal=causal,
+        window_size=window,
+        return_lse=lse,
+        sink_ptr=sink,
+    )
+
+
+def _call_varlen_triton(
+    q, k, v, cu_q, cu_k, max_sq, max_sk, scale, causal, window, lse, sink
 ):
-    """Batched BSHD [B, S, H, D] — uniform seq_len, no cu_seqlens."""
+    """Cross-check candidate. Shares ``_call_varlen``'s signature so the same
+    tensors get rotated; ``window``/``lse``/``sink`` are ignored."""
+    from aiter.ops.triton.attention.mha import flash_attn_varlen_func as _tri
+
+    return _tri(
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_k,
+        max_seqlen_q=max_sq,
+        max_seqlen_k=max_sk,
+        softmax_scale=scale,
+        causal=causal,
+    )
+
+
+def _call_batch(q, k, v, scale, causal, window, lse, sink):
+    return flash_attn_func(
+        q,
+        k,
+        v,
+        softmax_scale=scale,
+        causal=causal,
+        window_size=window,
+        return_lse=lse,
+        sink_ptr=sink,
+    )
+
+
+# ============================================================================
+# Test functions -- one @benchmark per arg signature, one table each
+# ============================================================================
+
+
+@benchmark()
+def test_mha_flydsl_varlen(
+    seqs_q,
+    seqs_k,
+    H_q,
+    H_kv,
+    d_qk,
+    d_v,
+    dtype,
+    causal,
+    return_lse,
+    sink,
+    window,
+    kernels,
+):
+    """One varlen (thd) case. ``seqs_q``/``seqs_k`` are per-batch lengths."""
     device = torch.device("cuda")
     torch.manual_seed(42)
+    assert (d_qk, d_v) in SUPPORTED_D_QK_V, f"unsupported d_qk/d_v {(d_qk, d_v)}"
+    assert H_q % H_kv == 0, f"nheads_q={H_q} must be a multiple of nheads_kv={H_kv}"
 
-    _check_d_qk_v("bshd", (d_qk, d_v))
-    H_kv = H_q if H_kv is None else H_kv
+    B = len(seqs_q)
+    cu_q = [0]
+    cu_k = [0]
+    for s in seqs_q:
+        cu_q.append(cu_q[-1] + s)
+    for s in seqs_k:
+        cu_k.append(cu_k[-1] + s)
+    total_q, total_k = cu_q[-1], cu_k[-1]
+    max_sq, max_sk = max(seqs_q), max(seqs_k)
+
+    q = torch.randn(total_q, H_q, d_qk, dtype=dtype, device=device)
+    k = torch.randn(total_k, H_kv, d_qk, dtype=dtype, device=device)
+    v = torch.randn(total_k, H_kv, d_v, dtype=dtype, device=device)
+    cu_q_t = torch.tensor(cu_q, dtype=torch.int32, device=device)
+    cu_k_t = torch.tensor(cu_k, dtype=torch.int32, device=device)
+
+    scale = 1.0 / math.sqrt(d_qk)
+    sink_t = _make_sink(H_q, device) if sink else None
+
+    ref_result = run_torch_varlen(
+        q, k, v, cu_q, cu_k, scale, causal, return_lse, sink_t, window
+    )
+    ref, ref_lses = ref_result if return_lse else (ref_result, None)
+
+    candidates = {"flydsl": _call_varlen}
+    # Triton has no sink / sliding-window support here, so cross-check it only on
+    # plain configs; elsewhere its column stays nan.
+    if "triton" in kernels and not sink and tuple(window) == (-1, -1):
+        candidates["triton"] = _call_varlen_triton
+
+    flops = _flops(list(zip(seqs_q, seqs_k)), H_q, d_qk, d_v, causal)
+    nbytes = _nbytes(
+        total_q, total_k, H_q, H_kv, d_qk, d_v, q.element_size(), return_lse
+    )
+
+    ret = {"gfx": get_gfx()}
+    for name, fn in candidates.items():
+        data, us = run_perftest(
+            fn,
+            q,
+            k,
+            v,
+            cu_q_t,
+            cu_k_t,
+            max_sq,
+            max_sk,
+            scale,
+            causal,
+            window,
+            return_lse and name == "flydsl",
+            sink_t,
+            num_rotate_args=_ROTATE,
+        )
+        # Only the flydsl call was asked for an LSE.
+        if isinstance(data, (tuple, list)):
+            out = data[0]
+            lse = data[1] if (return_lse and name == "flydsl") else None
+        else:
+            out, lse = data, None
+
+        assert tuple(out.shape) == (
+            total_q,
+            H_q,
+            d_v,
+        ), f"{name}: bad out shape {tuple(out.shape)}"
+        err = checkAllclose(
+            ref,
+            out.float(),
+            rtol=1e-2,
+            atol=1e-2,
+            msg=f"{name} thd out: ",
+        )
+
+        if lse is not None:
+            # Kernel LSE is [total_q, nheads_q]; the reference is per batch
+            # [nheads_q, sq]. Empty-KV batches carry -inf (or sink[h]) and are
+            # compared the same way -- isclose(-inf, -inf) holds.
+            for b in range(B):
+                if seqs_k[b] == 0:
+                    exp_lse = (
+                        sink_t.view(1, -1).expand(seqs_q[b], H_q)
+                        if sink_t is not None
+                        else torch.full((seqs_q[b], H_q), float("-inf"), device=device)
+                    )
+                    got = lse[cu_q[b] : cu_q[b + 1]]
+                else:
+                    exp_lse = ref_lses[b]
+                    got = lse[cu_q[b] : cu_q[b + 1]].permute(1, 0)
+                err = max(
+                    err,
+                    checkAllclose(
+                        exp_lse,
+                        got,
+                        rtol=1e-2,
+                        atol=1e-2,
+                        msg=f"{name} thd lse batch {b}: ",
+                    ),
+                )
+
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+@benchmark()
+def test_mha_flydsl_batch(
+    B, sq, sk, H_q, H_kv, d_qk, d_v, dtype, causal, return_lse, sink, window
+):
+    """One batched (bshd) case: ``[B, S, H, D]``, uniform seq_len, no cu_seqlens."""
+    device = torch.device("cuda")
+    torch.manual_seed(42)
+    assert (d_qk, d_v) in SUPPORTED_D_QK_V, f"unsupported d_qk/d_v {(d_qk, d_v)}"
     assert H_q % H_kv == 0, f"nheads_q={H_q} must be a multiple of nheads_kv={H_kv}"
 
     q = torch.randn(B, sq, H_q, d_qk, dtype=dtype, device=device)
@@ -432,597 +441,431 @@ def run_batch_test(
     v = torch.randn(B, sk, H_kv, d_v, dtype=dtype, device=device)
 
     scale = 1.0 / math.sqrt(d_qk)
-    # sink is [nheads_q] fp32, per-head logit in the same scaled-score domain.
     sink_t = _make_sink(H_q, device) if sink else None
 
-    def _run():
-        return flash_attn_func(
-            q,
-            k,
-            v,
-            softmax_scale=scale,
-            causal=causal,
-            window_size=window_size,
-            return_lse=return_lse,
-            sink_ptr=sink_t,
-        )
+    ref_result = run_torch_batch(q, k, v, scale, causal, return_lse, sink_t, window)
+    ref, ref_lse = ref_result if return_lse else (ref_result, None)
 
-    tag = (
-        f"bshd {DTYPE_NAME[dtype]} B={B} H={H_q}/{H_kv} d={d_qk}/{d_v} sq={sq} sk={sk} "
-        f"causal={causal} lse={return_lse} sink={sink} window={window_size}"
-    )
+    flops = _flops([(sq, sk)] * B, H_q, d_qk, d_v, causal)
+    nbytes = _nbytes(B * sq, B * sk, H_q, H_kv, d_qk, d_v, q.element_size(), return_lse)
 
-    avg_ms = _time_fn(_run, warmup, repeat)
-    result = _run()
-
-    if return_lse:
-        o, lse = result
-    else:
-        o = result
-
-    fwd_flop = _fwd_flops_batch(B, sq, sk, H_q, d_qk, d_v, causal)
-    fwd_tflops = _tflops(fwd_flop, avg_ms)
-    avg_us = avg_ms * 1000
-
-    print(f"  [{tag}] avg: {avg_ms:.3f}ms ({avg_us:.1f} us)  {fwd_tflops:.1f} TFLOPS")
-
-    ref_result = _ref_mha_batch(
+    ret = {"gfx": get_gfx()}
+    data, us = run_perftest(
+        _call_batch,
         q,
         k,
         v,
         scale,
-        causal=causal,
-        return_lse=return_lse,
-        sink=sink_t,
-        window_size=window_size,
+        causal,
+        window,
+        return_lse,
+        sink_t,
+        num_rotate_args=_ROTATE,
     )
-    if return_lse:
-        ref, ref_lse = ref_result
-    else:
-        ref = ref_result
+    out, lse = data if return_lse else (data, None)
 
-    assert tuple(o.shape) == (B, sq, H_q, d_v), f"[{tag}] bad out {tuple(o.shape)}"
-
-    err = checkAllclose(o.float(), ref, rtol=1e-2, atol=1e-2, msg=f"  [{tag}] out: ")
-
-    if return_lse:
+    assert tuple(out.shape) == (
+        B,
+        sq,
+        H_q,
+        d_v,
+    ), f"bad out shape {tuple(out.shape)}"
+    err = checkAllclose(ref, out.float(), rtol=1e-2, atol=1e-2, msg="flydsl bshd out: ")
+    if lse is not None:
         # Kernel LSE is [B, nheads_q, sq]; the reference matches that layout.
-        lse_err = checkAllclose(
-            lse,
-            ref_lse,
-            rtol=1e-2,
-            atol=1e-2,
-            msg=f"  [{tag}] lse: ",
+        err = max(
+            err,
+            checkAllclose(ref_lse, lse, rtol=1e-2, atol=1e-2, msg="flydsl bshd lse: "),
         )
-        err = max(err, lse_err)
 
-    passed = err < 0.05
-    ret = {
-        "layout": "bshd",
-        "dtype": DTYPE_NAME[dtype],
-        "B": B,
-        "H_q": H_q,
-        "H_kv": H_kv,
-        "d_qk": d_qk,
-        "d_v": d_v,
-        "seqs_q": [sq] * B,
-        "seqs_k": [sk] * B,
-        "causal": causal,
-        "lse": return_lse,
-        "sink": sink,
-        "window": window_size,
-        "avg_us": round(avg_us, 2),
-        "tflops": round(fwd_tflops, 2),
-        "pass": passed,
-    }
-    return passed, ret
+    ret["flydsl us"] = us
+    ret["flydsl TFLOPS"] = flops / us / 1e6
+    ret["flydsl TB/s"] = nbytes / us / 1e6
+    ret["flydsl err"] = err
+    return ret
 
 
-def _fwd_flops_varlen(cu_q, cu_k, H_q, d_qk, d_v, causal):
-    """FLOPs for varlen forward: sum per-batch QK^T + PV, causal halves each batch."""
-    flop = 0
-    B = len(cu_q) - 1
-    for b in range(B):
-        sq = cu_q[b + 1] - cu_q[b]
-        sk = cu_k[b + 1] - cu_k[b]
-        f = H_q * (2 * sq * sk * d_qk + 2 * sq * sk * d_v)
-        if causal:
-            f //= 2
-        flop += f
-    return flop
+# ============================================================================
+# Shapes
+# ============================================================================
+
+# thd: (seqs_q, seqs_k, nheads_q, nheads_kv) -- per-batch lengths.
+THD_SHAPES = [
+    # --- basic sq == sk ---
+    ([128], [128], 1, 1),
+    ([184], [184], 128, 128),
+    ([341], [341], 128, 128),
+    ([5], [5], 128, 128),
+    # --- multi-batch ---
+    ([481, 100, 401], [481, 100, 401], 128, 128),
+    # --- sq != sk ---
+    ([128], [512], 1, 1),
+    ([128], [256], 1, 1),
+    ([128, 128], [512, 512], 1, 1),
+    ([128], [512], 2, 2),
+    ([128, 128], [256, 256], 2, 2),
+    # --- sq << sk (decode-like) ---
+    ([72], [600], 1, 1),
+    ([72], [600], 2, 2),
+    ([1], [512], 1, 1),
+    ([1], [512], 2, 2),
+    ([16], [1024], 2, 2),
+    ([72, 72], [600, 600], 2, 2),
+    ([1, 128], [512, 1024], 2, 2),
+    ([72, 1], [600, 256], 4, 4),
+    # --- noncausal various sq/sk ---
+    ([128, 256], [128, 256], 1, 1),
+    ([128, 256], [256, 384], 2, 2),
+    ([300], [300], 2, 2),
+    ([128, 128], [256, 256], 4, 4),
+    # --- cu_q != cu_k (chunked prefill) ---
+    ([693, 692, 461], [693, 692, 701], 128, 128),
+    # --- seqlen_k == 0 (output must be all zeros) ---
+    ([128], [0], 1, 1),
+    ([256], [0], 2, 2),
+    ([128, 128], [0, 0], 1, 1),
+    ([300], [0], 4, 4),
+    # --- mixed seqlen_k == 0 (some batches zero) ---
+    ([128, 128], [0, 128], 1, 1),
+    ([128, 128, 128], [0, 0, 128], 1, 1),
+    # --- GQA (nheads_q > nheads_kv) ---
+    ([128], [128], 2, 1),
+    ([256], [256], 8, 1),  # MQA
+    ([341], [341], 8, 2),  # non-tile-multiple seq
+    ([512], [512], 16, 4),
+    ([128], [512], 6, 3),  # non-power-of-two nheads
+    ([128, 256], [256, 384], 8, 2),  # multi-batch, sq != sk
+    ([72], [600], 32, 4),  # decode-like
+    ([481, 100, 401], [481, 100, 401], 32, 8),
+    ([128, 128], [0, 128], 8, 2),  # mixed seqlen_k == 0
+    ([1024], [1024], 32, 4),
+    # --- larger shapes ---
+    ([512], [512], 128, 128),
+    ([1024], [1024], 128, 128),
+    ([256, 256, 256, 256], [256, 256, 256, 256], 128, 128),
+    ([128], [2048], 128, 128),
+    ([1], [512], 128, 128),
+]
+
+# bshd: (batch, seqlen_q, seqlen_k, nheads_q, nheads_kv).
+BSHD_SHAPES = [
+    # --- basic sq == sk ---
+    (1, 128, 128, 1, 1),
+    (1, 128, 128, 8, 8),
+    (2, 256, 256, 8, 8),
+    (4, 512, 512, 8, 8),
+    # --- non-tile-multiple / tiny seq ---
+    (1, 5, 5, 8, 8),
+    (1, 341, 341, 4, 4),
+    (2, 184, 184, 4, 4),
+    # --- sq != sk ---
+    (1, 128, 512, 1, 1),
+    (2, 128, 512, 4, 4),
+    (2, 300, 1024, 2, 2),
+    # --- sq << sk (decode-like) ---
+    (1, 1, 512, 8, 8),
+    (2, 16, 1024, 4, 4),
+    # --- GQA (nheads_q > nheads_kv) ---
+    (1, 128, 128, 2, 1),
+    (2, 256, 256, 8, 1),  # MQA
+    (1, 341, 341, 8, 2),  # non-tile-multiple seq
+    (2, 512, 512, 16, 4),
+    (1, 128, 512, 6, 3),  # non-power-of-two nheads, sq != sk
+    (1, 16, 1024, 32, 4),  # decode-like
+    (2, 1024, 1024, 32, 8),
+    # --- larger shapes ---
+    (1, 2048, 2048, 8, 8),
+    (1, 4096, 4096, 4, 4),
+]
 
 
-def _fwd_flops_batch(B, sq, sk, H_q, d_qk, d_v, causal):
-    """FLOPs for batched forward: QK^T + PV over B uniform-length sequences."""
-    f = B * H_q * (2 * sq * sk * d_qk + 2 * sq * sk * d_v)
-    return f // 2 if causal else f
+def _rand_seqs(B, max_sq, max_sk, rng):
+    """Random per-batch lengths with ``1 <= sq_i <= sk_i <= max_sk``."""
+    seqs_k = [rng.randint(1, max_sk) for _ in range(B)]
+    seqs_q = [rng.randint(1, min(max_sq, sk)) for sk in seqs_k]
+    return seqs_q, seqs_k
 
 
-def _tflops(flop, ms):
-    if ms <= 0:
-        return float("inf")
-    return flop / ms / 1e9
+def _shape_lists(args):
+    """``(thd, bshd)`` shape lists for this run.
+
+    The ``-b/-nh/-nhkv/-sq/-sk`` axes replace the built-in lists when all of
+    ``-b/-nh/-sq/-sk`` are given, so a single shape can be driven from the CLI;
+    their cross product is the sweep. With ``--rand-seqlens N`` each combination
+    contributes N random varlen draws instead of one uniform ``[SQ]*B`` shape.
+    """
+    if not (args.batch_size and args.nheads and args.seqlen_q and args.seqlen_k):
+        if args.rand_seqlens:
+            aiter.logger.warning(
+                "--rand-seqlens needs -b/-nh/-sq/-sk; using built-in shapes"
+            )
+        return THD_SHAPES, BSHD_SHAPES
+
+    nheads_kv = args.nheads_kv or args.nheads
+    rng = random.Random(args.seed)
+    thd, bshd, skipped = [], [], 0
+    for B, H_q, H_kv, sq, sk in itertools.product(
+        args.batch_size, args.nheads, nheads_kv, args.seqlen_q, args.seqlen_k
+    ):
+        if H_q % H_kv:
+            skipped += 1
+            continue
+        bshd.append((B, sq, sk, H_q, H_kv))
+        for _ in range(args.rand_seqlens or 1):
+            if args.rand_seqlens:
+                seqs_q, seqs_k = _rand_seqs(B, sq, sk, rng)
+            else:
+                seqs_q, seqs_k = [sq] * B, [sk] * B
+            thd.append((seqs_q, seqs_k, H_q, H_kv))
+    if skipped:
+        aiter.logger.warning("skipped %d combos where nheads %% nheads_kv", skipped)
+    return thd, bshd
 
 
-if __name__ == "__main__":
+def _str2d_qk_v(v):
+    """Parse a ``d_qk,d_v`` pair and check it against ``SUPPORTED_D_QK_V``."""
+    pair = dtypes.str2tuple(v)
+    if (
+        not isinstance(pair, tuple)
+        or len(pair) != 2
+        or tuple(pair) not in [tuple(p) for p in SUPPORTED_D_QK_V]
+    ):
+        raise argparse.ArgumentTypeError(
+            f"d_qk,d_v must be one of {SUPPORTED_D_QK_V}, got {v!r}"
+        )
+    return tuple(pair)
+
+
+def _str2window(v):
+    """Parse a ``left,right`` sliding-window bound. ``i``/``inf`` (or ``-1``) mean
+    infinite on that side; ``i`` is preferred because argparse reads a leading
+    ``-1`` as an option string."""
+    try:
+        parts = [p.strip().lower() for p in v.strip("()").split(",")]
+        if len(parts) != 2:
+            raise ValueError("expected two comma-separated bounds")
+        return tuple(-1 if p in ("i", "inf", "-1") else int(p) for p in parts)
+    except Exception as e:
+        raise argparse.ArgumentTypeError(f"invalid window: {v}") from e
+
+
+def summarize(title, rows):
+    if not rows:
+        aiter.logger.warning("%s: no case routes to FlyDSL for this config", title)
+        return
+    df = pd.DataFrame(rows)
+    aiter.logger.info("%s (markdown):\n%s", title, df.to_markdown(index=False))
+
+
+def main():
+    if get_gfx() not in SUPPORTED_GFX:
+        aiter.logger.warning(
+            "FlyDSL FMHA forward-prefill unsupported on %s; skipping", get_gfx()
+        )
+        return
+
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
-        description="FlyDSL MHA unit test & benchmark (gfx1250, bf16/fp16).\n"
-        "Runs both the varlen (thd) and batched (bshd) suites by default.",
+        description="FlyDSL FMHA forward-prefill unit test & perf sweep (gfx1250).",
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        nargs="*",
+        default=[dtypes.bf16, dtypes.fp16],
+        help="Element dtype (q/k/v share one).\n        e.g.: -d bf16",
+    )
+    parser.add_argument(
+        "-l",
+        "--layout",
+        type=str,
+        nargs="*",
+        choices=["thd", "bshd"],
+        default=["thd", "bshd"],
+        help="Layouts to sweep.\n        e.g.: -l thd",
+    )
+    parser.add_argument(
+        "-k",
+        "--kernels",
+        type=str,
+        nargs="*",
+        choices=KERNELS,
+        default=["flydsl"],
+        help="Kernels to time per thd case.\n        e.g.: -k flydsl triton",
+    )
+    parser.add_argument(
+        "-s",
+        "--d_qk_v",
+        type=_str2d_qk_v,
+        nargs="*",
+        default=[(192, 128)],
+        help="(d_qk, d_v) for the thd suite.\n"
+        f"        Supported: {SUPPORTED_D_QK_V}.\n        e.g.: -s 192,128",
+    )
+    parser.add_argument(
+        "-bs",
+        "--batch_d_qk_v",
+        type=_str2d_qk_v,
+        nargs="*",
+        default=[(128, 128)],
+        help="(d_qk, d_v) for the bshd suite.\n"
+        f"        Supported: {SUPPORTED_D_QK_V}.\n        e.g.: -bs 128,128",
+    )
+    parser.add_argument(
+        "-c",
+        "--causal",
+        type=int,
+        nargs="*",
+        choices=[0, 1],
+        default=[0, 1],
+        help="Causal masking.\n        e.g.: -c 1",
+    )
+    parser.add_argument(
+        "-e",
+        "--return_lse",
+        type=int,
+        nargs="*",
+        choices=[0, 1],
+        default=[0, 1],
+        help="Return log-sum-exp.\n        e.g.: -e 0",
+    )
+    parser.add_argument(
+        "-n",
+        "--sink",
+        type=int,
+        nargs="*",
+        choices=[0, 1],
+        default=[0, 1],
+        help="Attention sink.\n        e.g.: -n 1",
     )
     parser.add_argument(
         "-b",
         "--batch_size",
         type=int,
+        nargs="*",
         default=None,
-        help="Batch size. When set, runs a single shape instead of the full suite.\ne.g.: -b 2",
+        help="Batch size. With -nh/-sq/-sk, replaces the built-in shape lists.\n"
+        "        e.g.: -b 1 2 4",
     )
     parser.add_argument(
         "-nh",
         "--nheads",
         type=int,
+        nargs="*",
         default=None,
-        help="Number of query heads.\ne.g.: -nh 2",
+        help="Number of query heads.\n        e.g.: -nh 8 32",
     )
     parser.add_argument(
         "-nhkv",
         "--nheads_kv",
         type=int,
+        nargs="*",
         default=None,
-        help="Number of key/value heads (GQA). Must divide --nheads.\n"
-        "Defaults to --nheads (plain MHA).\ne.g.: -nhkv 2",
+        help="Number of key/value heads (GQA); must divide --nheads.\n"
+        "        Defaults to --nheads (plain MHA).\n        e.g.: -nhkv 1 2",
     )
     parser.add_argument(
         "-sq",
         "--seqlen_q",
         type=int,
+        nargs="*",
         default=None,
-        help="Sequence length of query (uniform across batches).\ne.g.: -sq 124",
+        help="Query sequence length.\n        e.g.: -sq 128 512",
     )
     parser.add_argument(
         "-sk",
         "--seqlen_k",
         type=int,
+        nargs="*",
         default=None,
-        help="Sequence length of key (uniform across batches).\ne.g.: -sk 712",
-    )
-    parser.add_argument(
-        "-d_qk_v",
-        type=dtypes.str2tuple,
-        nargs="+",
-        default=[(192, 128)],
-        help="Dimension of query/key and value for the varlen (thd) suite.\n"
-        f"Supported: {SUPPORTED_D_QK_V['thd']}.\ne.g.: -d_qk_v 192,128",
-    )
-    parser.add_argument(
-        "-bd_qk_v",
-        "--batch_d_qk_v",
-        type=dtypes.str2tuple,
-        nargs="+",
-        default=[(128, 128)],
-        help="Dimension of query/key and value for the batched (bshd) suite.\n"
-        f"Supported: {SUPPORTED_D_QK_V['bshd']}.\ne.g.: -bd_qk_v 128,128",
-    )
-    parser.add_argument(
-        "-c",
-        "--causal",
-        type=str,
-        default=None,
-        help="Causal mode: true/false. Default runs both.\ne.g.: -c true",
-    )
-    parser.add_argument(
-        "-l",
-        "--return_lse",
-        type=str,
-        default=None,
-        help="Return LSE: true/false. Default runs both.\ne.g.: -l false",
-    )
-    parser.add_argument(
-        "-s",
-        "--sink",
-        type=str,
-        default=None,
-        help="Attention sink: true/false. Default runs both.\n"
-        "Served by the m32x8 kernel (v_hdim=128) wherever it is routed; the sink\n"
-        "axis is skipped only for (d_qk,d_v) pairs that fall through to CK/sibling.\n"
-        "e.g.: -s true",
-    )
-    parser.add_argument(
-        "--local",
-        action="store_true",
-        help="Exercise sliding-window (window_size=(left,right)) coverage: narrow\n"
-        "(tile-skipping) and wide bands across single/multi-tile seqs.\n"
-        "Without --local the window axis stays (-1,-1) (full/causal only).",
-    )
-    parser.add_argument(
-        "--warmup",
-        type=int,
-        default=2,
-        help="Warmup iterations for benchmark (default 2).",
-    )
-    parser.add_argument(
-        "--repeat",
-        type=int,
-        default=5,
-        help="Repeat iterations for benchmark (default 5).",
-    )
-    parser.add_argument(
-        "--dtype",
-        type=str,
-        default=None,
-        choices=list(DTYPES),
-        help="Element dtype: bf16/fp16. Default runs both.\ne.g.: --dtype fp16",
-    )
-    parser.add_argument(
-        "--varlen",
-        action="store_true",
-        help="Run only the varlen (thd) suite. Default runs thd and bshd.",
-    )
-    parser.add_argument(
-        "--batch",
-        action="store_true",
-        help="Run only the batched (bshd) suite. Default runs thd and bshd.",
+        help="Key sequence length.\n        e.g.: -sk 512 2048",
     )
     parser.add_argument(
         "--rand-seqlens",
-        action="store_true",
-        help="Randomize per-batch sq/sk for the thd suite (requires -b -sq -sk).\n"
-        "sq_i ~ [1, SQ], sk_i ~ [1, SK], with sq_i <= sk_i guaranteed.",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Draw N random per-batch thd seqlen sets per shape combo instead of\n"
+        "        a uniform one (sq_i <= sk_i). Needs -b/-nh/-sq/-sk. 0 = off.\n"
+        "        e.g.: --rand-seqlens 4",
     )
     parser.add_argument(
-        "--cmp-triton",
-        action="store_true",
-        help="Also time Triton for each case and print speedup.",
+        "--seed",
+        type=int,
+        default=42,
+        help="Seed for --rand-seqlens.\n        e.g.: --seed 7",
+    )
+    parser.add_argument(
+        "-w",
+        "--window",
+        type=_str2window,
+        nargs="*",
+        default=[(-1, -1)],
+        help="Sliding-window (left,right) bounds; 'i' = infinite on that side.\n"
+        "        ('i' rather than -1: argparse reads a leading -1 as a flag.)\n"
+        "        e.g.: -w i,i 64,64 128,0 256,i i,256",
     )
     args = parser.parse_args()
 
-    # Neither selector -> run both suites.
-    run_thd = args.varlen or not args.batch
-    run_bshd = args.batch or not args.varlen
+    causals = [bool(c) for c in args.causal]
+    lses = [bool(e) for e in args.return_lse]
+    sinks = [bool(n) for n in args.sink]
+    windows = [tuple(w) for w in args.window]
+    thd_shapes, bshd_shapes = _shape_lists(args)
 
-    # Without experimental: THD 128/128 -> ASM and 256/128 -> CK; BSHD 256/128 -> CK.
-    # Drop those so we never report a pass for a kernel other than ours.
-    if not is_experimental_enabled():
-        if run_thd:
-            keep = [d for d in args.d_qk_v if d not in ((128, 128), (256, 128))]
-            if keep != args.d_qk_v:
-                print(
-                    "  SKIP thd 128/128 (ASM) + 256/128 (CK): set AITER_ENABLE_EXPERIMENTAL=1"
+    if "thd" in args.layout:
+        rows = []
+        for (d_qk, d_v), shape, dtype, causal, lse, sink, window in itertools.product(
+            args.d_qk_v, thd_shapes, args.dtype, causals, lses, sinks, windows
+        ):
+            if not _flydsl_serves_thd(d_qk, d_v, causal, sink, window):
+                continue  # CK / ASM / sibling would run -- not what this test gates
+            seqs_q, seqs_k, H_q, H_kv = shape
+            rows.append(
+                test_mha_flydsl_varlen(
+                    seqs_q,
+                    seqs_k,
+                    H_q,
+                    H_kv,
+                    d_qk,
+                    d_v,
+                    dtype,
+                    causal,
+                    lse,
+                    sink,
+                    window,
+                    tuple(args.kernels),
                 )
-                args.d_qk_v = keep
-            run_thd = bool(args.d_qk_v)
-        if run_bshd:
-            keep = [d for d in args.batch_d_qk_v if d != (256, 128)]
-            if keep != args.batch_d_qk_v:
-                print("  SKIP bshd 256/128 (CK): set AITER_ENABLE_EXPERIMENTAL=1")
-                args.batch_d_qk_v = keep
-            run_bshd = bool(args.batch_d_qk_v)
-
-    for d_qk_v in args.d_qk_v:
-        _check_d_qk_v("thd", d_qk_v)
-    for d_qk_v in args.batch_d_qk_v:
-        _check_d_qk_v("bshd", d_qk_v)
-
-    def _parse_bool(s):
-        if s is None:
-            return None
-        return s.lower() in ("true", "1", "yes")
-
-    causal_filter = _parse_bool(args.causal)
-    lse_filter = _parse_bool(args.return_lse)
-    sink_filter = _parse_bool(args.sink)
-    single_shape = all(
-        x is not None
-        for x in [args.batch_size, args.nheads, args.seqlen_q, args.seqlen_k]
-    )
-
-    import random
-
-    def _build_varlen_cu(B, max_seq):
-        """Build random cu_seqlens where each batch has seq_i ~ [1, max_seq]."""
-        seqs = [random.randint(1, max_seq) for _ in range(B)]
-        cu = [0]
-        for s in seqs:
-            cu.append(cu[-1] + s)
-        return cu, seqs
-
-    # Build cu_seqlens once for single_shape mode; reused by both sections.
-    if single_shape:
-        B, H, SQ, SK = args.batch_size, args.nheads, args.seqlen_q, args.seqlen_k
-        H_KV = args.nheads_kv if args.nheads_kv is not None else H
-        assert H % H_KV == 0, f"--nheads {H} must be a multiple of --nheads_kv {H_KV}"
-        if args.rand_seqlens:
-            random.seed(42)
-            cu_k, sk_list = _build_varlen_cu(B, SK)
-            cu_q = [0]
-            for i in range(B):
-                sq_i = random.randint(1, min(SQ, sk_list[i]))
-                cu_q.append(cu_q[-1] + sq_i)
-            print(f"  [varlen] cu_q={cu_q} cu_k={cu_k}")
-        else:
-            cu_q = [i * SQ for i in range(B + 1)]
-            cu_k = [i * SK for i in range(B + 1)]
-
-    # =====================================================================
-    # Run all cases: correctness + timing in one pass
-    # =====================================================================
-    print("=" * 60)
-    print("FlyDSL MHA Tests")
-    print("=" * 60)
-
-    # thd shapes: (cu_seqlens_q, cu_seqlens_k, nheads_q[, nheads_kv]).
-    # nheads_kv defaults to nheads_q (plain MHA).
-    if single_shape:
-        base_shapes = [(cu_q, cu_k, H, H_KV)]
-    else:
-        base_shapes = [
-            # --- basic sq == sk ---
-            ([0, 128], [0, 128], 1),
-            ([0, 184], [0, 184], 128),
-            ([0, 341], [0, 341], 128),
-            ([0, 5], [0, 5], 128),
-            # --- multi-batch ---
-            ([0, 481, 581, 982], [0, 481, 581, 982], 128),
-            # --- sq != sk ---
-            ([0, 128], [0, 512], 1),
-            ([0, 128], [0, 256], 1),
-            ([0, 128, 256], [0, 512, 1024], 1),
-            ([0, 128], [0, 512], 2),
-            ([0, 128, 256], [0, 256, 512], 2),
-            # --- sq << sk (decode-like) ---
-            ([0, 72], [0, 600], 1),
-            ([0, 72], [0, 600], 2),
-            ([0, 1], [0, 512], 1),
-            ([0, 1], [0, 512], 2),
-            ([0, 16], [0, 1024], 2),
-            ([0, 72, 144], [0, 600, 1200], 2),
-            ([0, 1, 129], [0, 512, 1536], 2),
-            ([0, 72, 73], [0, 600, 856], 4),
-            # --- noncausal various sq/sk ---
-            ([0, 128], [0, 256], 1),
-            ([0, 128, 384], [0, 128, 384], 1),
-            ([0, 128, 384], [0, 256, 640], 2),
-            ([0, 300], [0, 300], 2),
-            ([0, 128, 256], [0, 256, 512], 4),
-            # --- cu_q != cu_k (chunked prefill) ---
-            ([0, 693, 1385, 1846], [0, 693, 1385, 2086], 128),
-            # --- seqlen_k == 0 (output must be all zeros) ---
-            ([0, 128], [0, 0], 1),
-            ([0, 256], [0, 0], 2),
-            ([0, 128, 256], [0, 0, 0], 1),
-            ([0, 300], [0, 0], 4),
-            # --- mixed seqlen_k == 0 (some batches zero) ---
-            ([0, 128, 256], [0, 0, 128], 1),
-            ([0, 128, 256, 384], [0, 0, 0, 128], 1),
-            # --- GQA (nheads_q > nheads_kv) ---
-            ([0, 128], [0, 128], 2, 1),
-            ([0, 256], [0, 256], 8, 1),  # MQA
-            ([0, 341], [0, 341], 8, 2),  # non-tile-multiple seq
-            ([0, 512], [0, 512], 16, 4),
-            ([0, 128], [0, 512], 6, 3),  # non-power-of-two nheads
-            ([0, 128, 384], [0, 256, 640], 8, 2),  # multi-batch, sq != sk
-            ([0, 72], [0, 600], 32, 4),  # decode-like
-            ([0, 481, 581, 982], [0, 481, 581, 982], 32, 8),
-            ([0, 128, 256], [0, 0, 128], 8, 2),  # mixed seqlen_k == 0
-            ([0, 1024], [0, 1024], 32, 4),
-            # --- larger shapes (converted from bench_shapes) ---
-            ([0, 512], [0, 512], 128),
-            ([0, 1024], [0, 1024], 128),
-            ([0, 256, 512, 768, 1024], [0, 256, 512, 768, 1024], 128),
-            ([0, 128], [0, 2048], 128),
-            ([0, 1], [0, 512], 128),
-        ]
-
-    # bshd shapes: (batch, seqlen_q, seqlen_k, nheads_q[, nheads_kv]).
-    if single_shape:
-        batch_shapes = [(B, SQ, SK, H, H_KV)]
-    else:
-        batch_shapes = [
-            # --- basic sq == sk ---
-            (1, 128, 128, 1),
-            (1, 128, 128, 8),
-            (2, 256, 256, 8),
-            (4, 512, 512, 8),
-            # --- non-tile-multiple / tiny seq ---
-            (1, 5, 5, 8),
-            (1, 341, 341, 4),
-            (2, 184, 184, 4),
-            # --- sq != sk ---
-            (1, 128, 512, 1),
-            (2, 128, 512, 4),
-            (2, 300, 1024, 2),
-            # --- sq << sk (decode-like) ---
-            (1, 1, 512, 8),
-            (2, 16, 1024, 4),
-            # --- GQA (nheads_q > nheads_kv) ---
-            (1, 128, 128, 2, 1),
-            (2, 256, 256, 8, 1),  # MQA
-            (1, 341, 341, 8, 2),  # non-tile-multiple seq
-            (2, 512, 512, 16, 4),
-            (1, 128, 512, 6, 3),  # non-power-of-two nheads, sq != sk
-            (1, 16, 1024, 32, 4),  # decode-like
-            (2, 1024, 1024, 32, 8),
-            # --- larger shapes ---
-            (1, 2048, 2048, 8),
-            (1, 4096, 4096, 4),
-        ]
-
-    causal_list = [causal_filter] if causal_filter is not None else [False, True]
-    lse_list = [lse_filter] if lse_filter is not None else [False, True]
-    sink_list = [sink_filter] if sink_filter is not None else [False, True]
-    dtype_list = [DTYPES[args.dtype]] if args.dtype else [torch.bfloat16, torch.float16]
-
-    # Sliding-window axis. Default is pure regression (full attention only); with
-    # --local, exercise narrow (tile-skipping) and wide bands over single/
-    # multi-tile seqs, including causal-with-finite-left (128,0).
-    window_list = (
-        [(-1, -1), (64, 64), (128, 0), (256, -1), (-1, 256)]
-        if args.local
-        else [(-1, -1)]
-    )
-
-    def _m32x8_serves_sink_window(d_qk, d_v):
-        if d_v != 128:
-            return False
-        exp = is_experimental_enabled()
-        return d_qk in (128, 192) or (d_qk == 256 and exp)
-
-    def _sink_axis(d_qk, d_v):
-        return (
-            sink_list
-            if _m32x8_serves_sink_window(d_qk, d_v)
-            else [s for s in sink_list if not s]
-        )
-
-    def _window_axis(d_qk, d_v):
-        return window_list if _m32x8_serves_sink_window(d_qk, d_v) else [(-1, -1)]
-
-    tests = []
-    if run_thd:
-        for d_qk, d_v in args.d_qk_v:
-            for shape in base_shapes:
-                cu_q, cu_k, H = shape[:3]
-                H_kv = shape[3] if len(shape) > 3 else H
-                for dtype in dtype_list:
-                    for causal in causal_list:
-                        for return_lse in lse_list:
-                            for sink in _sink_axis(d_qk, d_v):
-                                for window in _window_axis(d_qk, d_v):
-                                    tests.append(
-                                        (
-                                            "thd",
-                                            cu_q,
-                                            cu_k,
-                                            H,
-                                            H_kv,
-                                            d_qk,
-                                            d_v,
-                                            dtype,
-                                            causal,
-                                            return_lse,
-                                            sink,
-                                            window,
-                                        )
-                                    )
-    if run_bshd:
-        for d_qk, d_v in args.batch_d_qk_v:
-            for shape in batch_shapes:
-                bs, sq_i, sk_i, H = shape[:4]
-                H_kv = shape[4] if len(shape) > 4 else H
-                for dtype in dtype_list:
-                    for causal in causal_list:
-                        for return_lse in lse_list:
-                            for sink in _sink_axis(d_qk, d_v):
-                                for window in _window_axis(d_qk, d_v):
-                                    tests.append(
-                                        (
-                                            "bshd",
-                                            bs,
-                                            sq_i,
-                                            sk_i,
-                                            H,
-                                            H_kv,
-                                            d_qk,
-                                            d_v,
-                                            dtype,
-                                            causal,
-                                            return_lse,
-                                            sink,
-                                            window,
-                                        )
-                                    )
-
-    if args.cmp_triton:
-        from aiter.ops.triton.attention.mha import (
-            flash_attn_varlen_func as triton_varlen_func,
-        )
-
-    n_pass = 0
-    collected = []
-    for case in tests:
-        causal, return_lse, sink, window = case[-4], case[-3], case[-2], case[-1]
-        try:
-            if case[0] == "thd":
-                _, cu_q, cu_k, H, H_kv, d_qk, d_v, dtype, _, _, _, _ = case
-                ok, ret = run_varlen_test(
-                    cu_q,
-                    cu_k,
-                    H_q=H,
-                    H_kv=H_kv,
-                    d_qk=d_qk,
-                    d_v=d_v,
-                    causal=causal,
-                    return_lse=return_lse,
-                    sink=sink,
-                    window_size=window,
-                    dtype=dtype,
-                    warmup=args.warmup,
-                    repeat=args.repeat,
-                )
-                if args.cmp_triton:
-                    device = torch.device("cuda")
-                    total_q, total_k = cu_q[-1], cu_k[-1]
-                    max_sq = max(cu_q[i + 1] - cu_q[i] for i in range(len(cu_q) - 1))
-                    max_sk = max(cu_k[i + 1] - cu_k[i] for i in range(len(cu_k) - 1))
-                    scale = 1.0 / math.sqrt(d_qk)
-                    torch.manual_seed(42)
-                    q = torch.randn(total_q, H, d_qk, dtype=dtype, device=device)
-                    k = torch.randn(total_k, H_kv, d_qk, dtype=dtype, device=device)
-                    v = torch.randn(total_k, H_kv, d_v, dtype=dtype, device=device)
-                    cu_q_t = torch.tensor(cu_q, dtype=torch.int32, device=device)
-                    cu_k_t = torch.tensor(cu_k, dtype=torch.int32, device=device)
-                    tri_ms = _time_fn(
-                        lambda causal=causal, cu_k_t=cu_k_t, cu_q_t=cu_q_t, k=k, max_sk=max_sk, max_sq=max_sq, q=q, scale=scale, v=v: triton_varlen_func(
-                            q=q,
-                            k=k,
-                            v=v,
-                            cu_seqlens_q=cu_q_t,
-                            cu_seqlens_k=cu_k_t,
-                            max_seqlen_q=max_sq,
-                            max_seqlen_k=max_sk,
-                            softmax_scale=scale,
-                            causal=causal,
-                        ),
-                        args.warmup,
-                        args.repeat,
-                    )
-                    fwd_flop = _fwd_flops_varlen(cu_q, cu_k, H, d_qk, d_v, causal)
-                    ret["triton_us"] = round(tri_ms * 1000, 2)
-                    ret["triton_tflops"] = round(_tflops(fwd_flop, tri_ms), 2)
-                    ret["speedup"] = round(tri_ms / ret["avg_us"] * 1000, 2)
-            else:
-                _, bs, sq_i, sk_i, H, H_kv, d_qk, d_v, dtype, _, _, _, _ = case
-                ok, ret = run_batch_test(
-                    bs,
-                    sq_i,
-                    sk_i,
-                    H_q=H,
-                    H_kv=H_kv,
-                    d_qk=d_qk,
-                    d_v=d_v,
-                    causal=causal,
-                    return_lse=return_lse,
-                    sink=sink,
-                    window_size=window,
-                    dtype=dtype,
-                    warmup=args.warmup,
-                    repeat=args.repeat,
-                )
-            collected.append(ret)
-            if ok:
-                n_pass += 1
-        except Exception as e:  # noqa: BLE001 - per-case guard, continue suite
-            print(
-                f"  [{case[:-4]} causal={causal} lse={return_lse} sink={sink} "
-                f"window={window}] ERROR: {e}"
             )
-            import traceback
+        summarize("FlyDSL FMHA prefill thd summary", rows)
 
-            traceback.print_exc()
+    if "bshd" in args.layout:
+        rows = []
+        for (d_qk, d_v), shape, dtype, causal, lse, sink, window in itertools.product(
+            args.batch_d_qk_v, bshd_shapes, args.dtype, causals, lses, sinks, windows
+        ):
+            if not _flydsl_serves_bshd(d_qk, d_v):
+                continue
+            B, sq, sk, H_q, H_kv = shape
+            rows.append(
+                test_mha_flydsl_batch(
+                    B,
+                    sq,
+                    sk,
+                    H_q,
+                    H_kv,
+                    d_qk,
+                    d_v,
+                    dtype,
+                    causal,
+                    lse,
+                    sink,
+                    window,
+                )
+            )
+        summarize("FlyDSL FMHA prefill bshd summary", rows)
 
-    print(f"\n{'='*60}")
-    print(f"{n_pass}/{len(tests)} passed")
-    print(f"{'='*60}")
-    if collected:
-        df = pd.DataFrame(collected)
-        aiter.logger.info(f"flydsl_mha summary:\n{df.to_string(index=False)}")
+
+if __name__ == "__main__":
+    main()
