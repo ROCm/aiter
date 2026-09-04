@@ -30,12 +30,16 @@ class MegaMoEV2:
         quant: str, w1: torch.Tensor, w1_scale: torch.Tensor, w2: torch.Tensor, w2_scale: torch.Tensor,
         max_tok_per_rank: int, mega_scheme: str = "fixedslot", swiglu_limit: float = 0.0):
     # fmt: on
-        if quant != "a8w4":
-            raise ValueError("MegaMoEV2 currently supports quant='a8w4' only")
+        if quant not in ("a8w4", "a4w4"):
+            raise ValueError("MegaMoEV2 supports quant='a8w4' or quant='a4w4'")
+        if not 0 <= rank < world_size:
+            raise ValueError(f"rank={rank} must be in [0, world_size={world_size})")
         if experts % world_size != 0:
             raise ValueError(f"experts={experts} must be divisible by world_size={world_size}")
-        if max_tok_per_rank <= 0 or max_tok_per_rank & (max_tok_per_rank - 1):
-            raise ValueError(f"max_tok_per_rank={max_tok_per_rank} must be a power of two")
+        if max_tok_per_rank <= 0:
+            raise ValueError("max_tok_per_rank must be positive")
+        if quant == "a8w4" and max_tok_per_rank & (max_tok_per_rank - 1):
+            raise ValueError(f"max_tok_per_rank={max_tok_per_rank} must be a power of two for A8W4")
         self.rank = int(rank)
         self.world_size = int(world_size)
         self.model_dim = int(model_dim)
@@ -47,8 +51,29 @@ class MegaMoEV2:
         self.swiglu_limit = float(swiglu_limit)
         if self.swiglu_limit < 0:
             raise ValueError("swiglu_limit must be non-negative")
-        self.dev = torch.device("cuda", rank)
+        # Global EP rank is not a CUDA device index on node 1.
+        self.dev = torch.device("cuda", torch.cuda.current_device())
         self.max_recv = self.world_size * self.mtpr
+        self.quant = quant
+        self.w1 = w1 if w1.is_contiguous() else w1.contiguous()
+        self.w1_scale = w1_scale if w1_scale.is_contiguous() else w1_scale.contiguous()
+        self.w2 = w2 if w2.is_contiguous() else w2.contiguous()
+        self.w2_scale = w2_scale if w2_scale.is_contiguous() else w2_scale.contiguous()
+        self._inter_node = None
+        if self.world_size == 16:
+            from aiter.jit.utils.chip_info import get_gfx_runtime
+
+            if get_gfx_runtime() != "gfx950" or quant != "a4w4":
+                raise ValueError("EP16 is only support on quant='a4w4' and gfx950")
+            local_start = self.rank * self.epr
+            self.expert_mask = torch.zeros(self.experts + 1, dtype=torch.int32, device=self.dev)
+            self.expert_mask[local_start : local_start + self.epr] = 1
+            from .inter_node import MegaMoEInterNodeBackend
+
+            self._inter_node = MegaMoEInterNodeBackend(self)
+            return
+        if quant == "a4w4":
+            raise ValueError("quant='a4w4' is supported only for EP16 on gfx950")
         compact = self.mtpr > FIXED_SLOT_MAX_MTPR
         capacity_tile_m = 128 if compact else 32
         self._s1_fixed_slot = not compact
@@ -64,8 +89,6 @@ class MegaMoEV2:
         self.comb_op = FlyDSLDispatchCombineIntraNodeOp(self.comb_cfg)
         torch.cuda.synchronize()
         ms.shmem_barrier_all()
-        self.w2 = w2 if w2.is_contiguous() else w2.contiguous()
-        self.w2_scale = w2_scale if w2_scale.is_contiguous() else w2_scale.contiguous()
         self._build_fused_stage1(w1, w1_scale)
         self._build_fused_stage2()
 
@@ -258,7 +281,8 @@ class MegaMoEV2:
         return self._s1_active_tile_m
 
     def quantize(self, x_bf16):
-        return per_1x32_mx_quant(x_bf16, quant_mode="fp8")
+        quant_mode = "fp4" if self.quant == "a4w4" else "fp8"
+        return per_1x32_mx_quant(x_bf16, quant_mode=quant_mode)
 
     def _run_joint(self, x, scales, wts, topk_ids, run_tokens, stream, slice_output):
         config = self._select_config(run_tokens)
@@ -278,6 +302,10 @@ class MegaMoEV2:
         return out_tok[:run_tokens] if slice_output else out_tok
 
     def forward(self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True):
+        if self._inter_node is not None:
+            if stream is not None or not slice_output:
+                raise ValueError("EP16 A4W4 currently supports current stream and slice_output=True only")
+            return self._inter_node.forward(x_bf16, wts, topk_ids)
         run_tokens = int(x_bf16.shape[0])
         if run_tokens > self.mtpr:
             raise ValueError(f"run_tokens={run_tokens} > max_tok_per_rank={self.mtpr}")
@@ -291,6 +319,11 @@ class MegaMoEV2:
         return self._run_joint(x_q, scales, wts, topk_ids, run_tokens, stream, slice_output)
 
     def forward_prequant(self, x_q, scales, wts, topk_ids, *, stream=None, slice_output=True):
+        if self._inter_node is not None:
+            if stream is not None or not slice_output:
+                raise ValueError("EP16 A4W4 currently supports current stream and slice_output=True only")
+            dispatched = self._inter_node.dispatch_prequant(x_q, scales, wts, topk_ids)
+            return self._inter_node.combine(self._inter_node.fused_moe(dispatched), dispatched)[0]
         run_tokens = int(x_q.shape[0])
         if run_tokens > self.mtpr:
             raise ValueError(f"run_tokens={run_tokens} > max_tok_per_rank={self.mtpr}")
