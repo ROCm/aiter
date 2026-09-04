@@ -52,7 +52,9 @@ def untuned_path_for(tuned_file: str) -> str:
         base = base.replace("_tuned_", "_untuned_", 1)
     else:
         base = "untuned_" + base
-    out_dir = os.environ.get("AITER_TUNE_GEMM_DIR") or os.path.join(_THIS_DIR, "configs")
+    out_dir = os.environ.get("AITER_TUNE_GEMM_DIR") or os.path.join(
+        _THIS_DIR, "configs"
+    )
     return os.path.join(out_dir, base)
 
 
@@ -92,8 +94,17 @@ def record(tuned_file: str, row: dict) -> None:
                 logger.info(f"[AITER_TUNE_GEMM] recording untuned shapes to {path}")
             if key in state["rows"]:
                 return
-            state["rows"].add(key)
+            needs_separator = os.path.getsize(path) > 0
+            if needs_separator:
+                with open(path, "rb") as fh:
+                    fh.seek(-1, os.SEEK_END)
+                    needs_separator = fh.read(1) not in (b"\n", b"\r")
             with open(path, "a") as fh:
+                if needs_separator:
+                    fh.write("\n")
                 fh.write(",".join(key) + "\n")
+            # Only cache a row after its append succeeds. A transient write
+            # failure must remain retryable on the next dispatch.
+            state["rows"].add(key)
     except Exception as e:  # noqa: BLE001 - never break dispatch over telemetry
         logger.warning(f"[AITER_TUNE_GEMM] could not record untuned shape: {e}")
