@@ -1263,12 +1263,76 @@ def pinned_struct_churn(diff_text, root):
 
 
 
+# ----------------------------------------------------------------- card gate
+FINDING = re.compile(r"^\s*(\U0001F534|\u26A0\uFE0F?|\U0001F4DD)\s*(.+)$")
+VALUE = re.compile(r"\b\d+\b|fp8|fp16|bf16|fp4|int8|int32|int64|e4m3|e5m2|gfx\d+|"
+                   r"nullptr|None\b|2\^\d+", re.I)
+IDENT = re.compile(r"\b[a-z]+_[a-z_0-9]{2,}\b|\b[A-Z][A-Z0-9_]{3,}\b")
+
+
+def is_concrete(text):
+    """Does the finding name something, or is it a feeling?
+
+    The red threshold asks for the input that makes it fire. A value satisfies that; so
+    does naming the exact expressions involved -- "row=(tail_blk*num_kv_heads+kv_head_idx)
+    *BLOCK_M vs nrows=tail*num_kv_heads*BLOCK_M" is as concrete as a finding gets, and has
+    no bare digit in it. "The reduce kernel looks racy" names nothing. Two distinct code
+    identifiers is the line between them."""
+    return bool(VALUE.search(text)) or len(set(IDENT.findall(text))) >= 2
+
+
+def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_text):
+    """Every finding in the card must trace back to something already adjudicated.
+
+    The three gates before this one check that the work happened. None of them checks
+    that the card reports THAT work: a review can adjudicate 27 rules honestly and then
+    write a finding that appears in none of them. And the 'before firing any red, write
+    down the concrete input that triggers it' threshold was prose with nothing reading it.
+
+    Three things are checkable, and only three. Whether a finding is CORRECT is not one
+    of them -- that is what a human reads the card for."""
+    touched = set(re.findall(r"^diff --git a/\S+ b/(\S+)", diff_text, re.M))
+    backing = (verdicts_text or "") + "\n" + (diagnostic_text or "") + "\n" + (answers_text or "")
+    problems = []
+    findings = []
+    for line in (card_text or "").splitlines():
+        m = FINDING.match(line.strip())
+        if m:
+            findings.append((m.group(1), m.group(2).strip()))
+    for sev, text in findings:
+        red = sev.startswith("\U0001F534")
+        cited = [p for p in re.findall(
+            r"([\w./-]+\.(?:py|cu|cuh|hip|h|hpp|cpp|cc|csv|json|yaml|yml|sh|md))", text)]
+        untouched = [c for c in cited
+                     if not any(t == c.lstrip("./") or t.endswith("/" + c.lstrip("./"))
+                                for t in touched)]
+        if untouched:
+            problems.append(("UNTOUCHED-FINDING", text[:70],
+                             f"cites {untouched[0]}, which this PR does not change"))
+        # Does anything already adjudicated mention this? Match on the rule id if the
+        # finding carries one, else on a distinctive token from the text.
+        rid = re.match(r"([A-Z]+\d+[a-z]?):", text)
+        if rid:
+            if not re.search(rf"(?<![\w]){re.escape(rid.group(1))}\b\s+FIRE", backing):
+                problems.append(("UNBACKED-FINDING", text[:70],
+                                 f"{rid.group(1)} is reported but was not adjudicated FIRE"))
+        elif cited and not any(c.rsplit("/", 1)[-1] in backing for c in cited):
+            problems.append(("UNBACKED-FINDING", text[:70],
+                             "appears in no verdict, diagnostic or blind-spot line"))
+        if red and not is_concrete(text):
+            problems.append(("UNPROVEN-RED", text[:70],
+                             "names no concrete shape, dtype, arch or value -- the red "
+                             "threshold asks for the input that makes it fire"))
+    return findings, problems
+
+
+
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
     if mode not in ("rules", "evidence", "symbols", "ledger", "expand", "answers",
                         "mapping", "diagnostic", "testquality",
                         "twins", "citest", "perfclaims",
-                        "structabi", "commentonly"):
+                        "structabi", "commentonly", "card"):
         print("usage: triage.py rules <diff> [title]\n"
               "       triage.py evidence <diff> <head-file>...\n"
               "       triage.py symbols <diff> <merge-target-root>\n"
@@ -1282,8 +1346,31 @@ if __name__ == "__main__":
               "       triage.py citest <diff> <root>\n"
               "       triage.py perfclaims <pr_meta.json>\n"
               "       triage.py structabi <diff> <root>\n"
-              "       triage.py commentonly <diff>", file=sys.stderr)
+              "       triage.py commentonly <diff>\n"
+              "       triage.py card <card.md> <verdicts> <diagnostic> <answers> <diff>", file=sys.stderr)
         raise SystemExit(2)
+
+    if mode == "card":
+        def _read(i):
+            try:
+                return open(sys.argv[i], errors="replace").read()
+            except (OSError, IndexError):
+                return ""
+        findings, problems = audit_card(_read(2), _read(3), _read(4), _read(5), _read(6))
+        if not findings:
+            print("CARD: no findings to check")
+            raise SystemExit(0)
+        for kind, text, why in problems:
+            print(f"{kind}: {text}")
+            print(f"  {why}")
+        if problems:
+            bad = len({t for _, t, _ in problems})
+            print(f"CARD NOT NAILED DOWN: {bad} of {len(findings)} findings raise "
+                  f"{len(problems)} problem(s)", file=sys.stderr)
+            raise SystemExit(1)
+        print(f"CARD NAILED DOWN: {len(findings)} findings, each traced to an "
+              f"adjudication and anchored in a changed file")
+        raise SystemExit(0)
 
     if mode == "commentonly":
         res = comment_dominated(open(sys.argv[2], errors="replace").read())

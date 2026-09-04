@@ -42,52 +42,24 @@ Read the diff and PR body before proceeding.
 ### Step 1b — Derive the applicable rules, and collect the evidence they need
 
 
-**`$WORK/comment_only.txt` is the whole review when a diff is almost all comments.** It
-lists the changed lines that are not prose, with trailing comments stripped and C block
-comments tracked, so a line whose only change is its trailing comment does not appear.
-aiter#4062 is 7963 changed lines across 252 files and reduces to nothing; a diff that size
-is otherwise either skimmed or not read.
+**Step 1b writes nine artifacts into `$WORK`. Read them; each explains its own output,
+so what follows is the map, not the manual.**
 
-**`$WORK/struct_abi.txt` names any struct whose layout something asserts and whose fields
-this PR moves.** aiter pins every kargs struct a hand-written code object reads. Inserting a
-field anywhere but the end shifts every offset after it; the assertions turn that into a
-compile error, and the fix is to rebuild the code objects and update the table, not to
-delete the assertion. A PR that updates the assertions in the same diff is the correct shape
-and is not reported.
+| file | what it answers | the trap it exists for |
+|---|---|---|
+| `rules_expanded.txt` | the full text of exactly the rules this diff derives | reading all 51 means attending to none |
+| `evidence.txt` | how a removed guard is handled on head | prose telling you to grep was read and not acted on (aiter#5143) |
+| `symbols.txt` | first-party imports that do not resolve against the merge target | a **rebase** signal, not invented code — #4994's import was valid when written |
+| `twins.txt` | which existing file each new file was copied from | the defect is the *asymmetry* between them, not the copy |
+| `test_quality.txt` | assertion count, tolerances, shapes of added tests | zero assertions may mean a helper asserts — read before firing |
+| `ci_coverage.txt` | whether a CI job will ever run the added tests | HK6 is satisfied by a file in a directory nothing scans |
+| `perf_claims.txt` | every number claimed, and which name no baseline | a signed delta and a `before \| after` table already carry theirs |
+| `struct_abi.txt` | structs whose pinned layout this diff shifts | the assertions exist to force a code-object rebuild |
+| `comment_only.txt` | the non-prose lines of a comment-dominated diff | 7963 lines that reduce to none (aiter#4062) |
 
-**`$WORK/perf_claims.txt` lists every number the description claims, and marks the ones
-that name no baseline.** P1 asks for the number with its units and its comparison; a line
-marked `->` has the number and not the comparison. A signed delta (`+8.64%`) and a table row
-under a `before | after` header already carry theirs; a bare `198 TFLOPS` does not, and the
-question to ask is against what, on which shapes.
+A `SKIPPED:` or empty artifact means that axis was **not checked** — say so rather than
+reading silence as clean.
 
-**`$WORK/ci_coverage.txt` says whether the tests this PR adds will ever run.** HK6 asks a
-new op to ship a test; a file under `op_tests/flydsl_tests/` satisfies HK6 by name and is
-scanned by no workflow, and one under `op_tests/multigpu_tests/` runs only with the
-`multigpu` label. Check this before crediting a PR for having tests — 9% of open PRs add one
-that never runs.
-
-**`$WORK/twins.txt` names the file each new file was copied from.** Step 6's check 2 asks
-for mirrored code and left finding the mirror to you; this does that part. The pair is not a
-finding — an arch-specific variant is the normal shape here — the finding is the
-*asymmetry*: one side int64 and the other int32, a mask on one side only, a flipped stride
-order, a bound the copy did not adapt. Diff the two before writing anything.
-
-**`$WORK/test_quality.txt` is what the added tests contain, not a verdict on them.**
-Assertion primitives, tolerances and shapes per test file. A count of zero means the added
-lines carry no check — it may still be in a helper the diff does not show, so read before
-firing. A tolerance at or above 1e-1, or every shape at 16 or below, is what P2 and Step 6's
-check 5 are asking about; the numbers are here so neither has to be answered from memory.
-
-**`$WORK/symbols.txt` is a rebase signal, not a hallucination finding.** Each
-`UNRESOLVED-IMPORT` line names a first-party import the PR adds that does not resolve
-against today's merge target. The import was very likely valid when it was written; the
-module moved or was deleted underneath it, and both PRs pass CI alone. aiter#4994 is the
-worked case — it added `from aiter.ops.flydsl.utils import is_flydsl_available`, #5116
-(3b2a9ce6) had deleted that module from main 19 hours earlier, #4994 merged green
-(83571d9b) and was reverted 5.5 hours later (283e1d4b). Report it as *needs rebase +
-re-run*, never as invented code. A `SKIPPED:` line means the sweep did not run and the PR
-is unchecked on this axis — say so rather than reading silence as clean.
 
 **Read `$WORK/rules_expanded.txt` — it is the full text of exactly the rules in
 `$WORK/rules.txt`, and it is the rule list for this review.** They are derived from paths, added/deleted
@@ -376,6 +348,14 @@ happen; go back to Step 5 rather than reporting.**
   echo "rule pass incomplete — the card must not be written yet" >&2
   exit 1
 }
+
+# Then write the card to $WORK/card.md and run the last gate against it. The three gates
+# above check that the work happened; this one checks that the card reports THAT work.
+"$SKILLS_ROOT/review-pr/triage.py" card "$WORK/card.md" "$WORK/verdicts.txt" \
+  "$WORK/ai_diagnostic.txt" "$WORK/answers.txt" "$WORK/pr.diff" || {
+  echo "a finding in the card is not nailed down — fix or drop it before reporting" >&2
+  exit 1
+}
 ```
 
 The first names any of Step 2's five questions or Step 7.5's blind-spot question left
@@ -388,6 +368,14 @@ citation. `CLEAR` may cite anything: "E5 CLEAR: `aiter/__init__.py` unchanged" i
 a run whose Step 1b never happened, so it exits non-zero rather than waving the run through.
 The gate checks that each rule was answered, not that the answer is right — it closes the
 cheapest failure, which is not answering.
+
+The card gate asks one question per finding: **is this nailed down?** A review can
+adjudicate every rule honestly and still write a finding that came from none of them; the
+card was the one artifact nothing read. It rejects a finding citing a file the PR does not
+change, one whose rule no verdict marked `FIRE`, and a 🔴 that names neither a value nor two
+code identifiers — the red threshold above, finally enforced. Naming the expressions counts;
+"the reduce kernel looks racy" does not. Whether a finding is *correct* is not checked, and
+is what a human reads the card for.
 
 **Output rules (strictly enforced):**
 - Run Steps 1–7 internally. Do NOT narrate steps, do NOT show checklists, do NOT show which rules fired.

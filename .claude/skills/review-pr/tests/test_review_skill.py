@@ -1777,3 +1777,79 @@ class TestCommentDominated(unittest.TestCase):
     def test_step_1b_writes_the_artifact(self):
         self.assertIn("commentonly", FETCH.read_text())
         self.assertIn("comment_only.txt", SKILL_MD.read_text())
+
+
+class TestCardGate(unittest.TestCase):
+    """The fourth gate: does the card report the work that was done?
+
+    answers, diagnostic and ledger all check that the work happened. None of them looks
+    at the card, so a review could adjudicate 27 rules honestly and then write a finding
+    that appears in none of them.
+    """
+
+    DIFF = ("diff --git a/aiter/mla.py b/aiter/mla.py\n--- a/aiter/mla.py\n"
+            "+++ b/aiter/mla.py\n")
+    VERDICTS = ("G1 FIRE -- aiter/mla.py:120 hands the buffer across streams\n"
+                "G1b CLEAR -- nothing is captured into a cudagraph here\n")
+
+    def gate(self, card, verdicts=None):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            d = pathlib.Path(td)
+            (d / "card.md").write_text(card)
+            (d / "v.txt").write_text(self.VERDICTS if verdicts is None else verdicts)
+            (d / "diag.txt").write_text("1: symbols.txt clean\n")
+            (d / "ans.txt").write_text("BLIND: nothing further found\n")
+            (d / "d.diff").write_text(self.DIFF)
+            return subprocess.run(
+                [sys.executable, str(TRIAGE), "card", str(d / "card.md"), str(d / "v.txt"),
+                 str(d / "diag.txt"), str(d / "ans.txt"), str(d / "d.diff")],
+                capture_output=True, text=True)
+
+    def test_a_card_with_no_findings_passes(self):
+        r = self.gate("Review (advisory): NO FINDINGS\n")
+        self.assertEqual(0, r.returncode, r.stdout + r.stderr)
+        self.assertIn("no findings to check", r.stdout)
+
+    def test_a_backed_anchored_concrete_finding_passes(self):
+        r = self.gate("\U0001F534 G1: aiter/mla.py:120 hands the indptr buffer to another "
+                      "stream with no record_event, so the consumer reads it at 16384 "
+                      "tokens before the producer has written it\n")
+        self.assertEqual(0, r.returncode, r.stdout + r.stderr)
+        self.assertIn("NAILED DOWN", r.stdout)
+
+    def test_a_finding_citing_an_untouched_file_is_rejected(self):
+        r = self.gate("\u26A0\uFE0F G1: aiter/fused_moe.py:88 consumes it on another "
+                      "stream at 4096 tokens\n")
+        self.assertEqual(1, r.returncode)
+        self.assertIn("UNTOUCHED-FINDING", r.stdout)
+
+    def test_a_finding_whose_rule_was_never_fired_is_rejected(self):
+        """G1b was adjudicated CLEAR. Reporting it as a finding contradicts the ledger."""
+        r = self.gate("\u26A0\uFE0F G1b: aiter/mla.py:200 captures a host sync inside "
+                      "the graph at 8192 tokens\n")
+        self.assertEqual(1, r.returncode)
+        self.assertIn("UNBACKED-FINDING", r.stdout)
+
+    def test_a_vague_red_is_rejected(self):
+        r = self.gate("\U0001F534 the reduce kernel looks racy\n")
+        self.assertEqual(1, r.returncode)
+        self.assertIn("UNPROVEN-RED", r.stdout)
+
+    def test_a_red_naming_expressions_rather_than_values_passes(self):
+        """The threshold asks for the input that makes it fire. Naming the exact
+        expressions is concrete even with no digit in the sentence."""
+        r = self.gate("\U0001F534 G1: aiter/mla.py hands row=(tail_blk*num_kv_heads+"
+                      "kv_head_idx)*BLOCK_M to a consumer decoding nrows=tail*"
+                      "num_kv_heads*BLOCK_M\n")
+        self.assertEqual(0, r.returncode, r.stdout + r.stderr)
+
+    def test_a_note_is_not_held_to_the_red_threshold(self):
+        r = self.gate("\U0001F4DD aiter/mla.py could use a comment here\n")
+        self.assertEqual(0, r.returncode, r.stdout + r.stderr)
+
+    def test_step_8_runs_the_card_gate(self):
+        body = SKILL_MD.read_text()
+        step8 = body[body.index("## Step 8"):]
+        self.assertRegex(step8, r"triage\.py\"?\s+card\b",
+                         "Step 8 does not run the card gate")
