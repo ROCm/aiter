@@ -11,6 +11,18 @@ _"Fixed one path; the same bug lives in a sibling."_
 Fix changes address calc, bounds check, type widening, or data layout in a CUDA/HIP kernel:
 scan the same file for variants named `_opt`, `_prefill`, `_decode`, `_prefill_opt`, `_v2`, `_fast`.
 Real example (PR#3841): strided q_nope OOB fix applied to decode kernel; `_prefill_opt` in the same file had the same bug unfixed.
+**No forensic backing, and one attempt at it was measured and dropped.** Deleted lines
+still present verbatim in an untouched file fires on 13.2% of 600 open PRs; requiring the
+line to carry an operation rather than be a declaration, a bare `for`, or a docstring
+brings it to 10.0%. Reading eight: roughly half are the shape A1 means (variant MoE ops
+sharing `A_scale.stride(0) if A_scale is not None ...`), and the rest are boilerplate a
+sibling shares for no reason at all -- a `for(int i = 0; i < 4; i++)`, a device guard, a
+`HEAD_DIMENSION_OPTIONS = [128]`. Narrowing removed two of four known-noise hits and cost
+one of three real ones, because a sibling needing the same fix and a sibling sharing
+boilerplate emit the identical evidence: the same line. Verbatim identity cannot separate
+them. A1's own example is same-FILE variants, so a detector scoped to sibling functions
+within the changed file is the direction that has not been tried -- and it needs its own
+measurement before it goes in.
 → `⚠️ A1: same bug may exist in [variant] — check kernel family in this file`
 
 **Evidence:** `$WORK/kernel_tests.txt` lists new kernel files for which this PR adds no
