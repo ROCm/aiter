@@ -7,13 +7,13 @@ import triton
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
 )
-from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8 import (
-    _gemm_a8w8_kernel,
-    _get_config,
-)
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8 import _gemm_a8w8_kernel
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.device_info import get_num_xcds
-from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
+from aiter.ops.triton.utils.gemm_config_utils import (
+    compute_splitk_params,
+    get_gemm_config,
+)
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import (
     get_scaled_dot_format_string,
@@ -23,6 +23,15 @@ from aiter.ops.triton.utils.types import (
 _LOGGER = AiterTritonLogger()
 
 _GLUON_SUPPORTED_ARCHS = ("gfx950",)
+
+
+def _get_config(
+    M: int,
+    N: int,
+    K: int,
+):
+    config, is_tuned = get_gemm_config("GEMM-A8W8", M, N, K)
+    return compute_splitk_params(config, K), is_tuned
 
 
 def gemm_a8w8(

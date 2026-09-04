@@ -6,7 +6,6 @@ import triton.language as tl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
-from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 _gemm_a8w8_per_token_scale_repr = make_kernel_repr(
     "_gemm_a8w8_per_token_scale_kernel",
@@ -178,12 +177,3 @@ def _gemm_a8w8_per_token_scale_kernel(
         )
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         tl.store(c_ptrs, c, mask=c_mask)
-
-
-def _get_config(
-    M: int,
-    N: int,
-    K: int,
-):
-
-    return get_gemm_config("GEMM-A8W8_PER_TOKEN_SCALE", M, N, K)

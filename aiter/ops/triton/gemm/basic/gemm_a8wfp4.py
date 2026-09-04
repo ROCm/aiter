@@ -7,16 +7,68 @@ import triton
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
 )
-from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8wfp4 import (
-    _gemm_a8wfp4_kernel,
-    _get_config,
-)
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8wfp4 import _gemm_a8wfp4_kernel
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
 _USE_GEMM_SPLITK_BF16 = False
+
+
+def _get_config(
+    M: int,
+    N: int,
+    K: int,
+):
+
+    config, is_tuned = get_gemm_config("GEMM-A8WFP4", M, N, K)
+
+    if M <= 128:
+        SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = _get_splitk(
+            K, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
+        )
+        config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE
+        config["BLOCK_SIZE_K"] = BLOCK_SIZE_K
+        config["NUM_KSPLIT"] = NUM_KSPLIT
+    else:
+        config["SPLITK_BLOCK_SIZE"] = 2 * K
+
+    return config, is_tuned
+
+
+def _get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
+    # heuristics for make "EVEN_K == True" as much as possible
+    NUM_KSPLIT_STEP = 4
+    BLOCK_SIZE_K_STEP = 4
+    SPLITK_BLOCK_SIZE = (
+        triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
+    )
+    while NUM_KSPLIT > 1 and BLOCK_SIZE_K > 16:
+        if (
+            K % (SPLITK_BLOCK_SIZE // 2) == 0
+            and SPLITK_BLOCK_SIZE % BLOCK_SIZE_K == 0
+            and K % (BLOCK_SIZE_K // 2) == 0
+        ):
+            break
+        elif K % (SPLITK_BLOCK_SIZE // 2) != 0 and NUM_KSPLIT > 1:
+            NUM_KSPLIT = NUM_KSPLIT // NUM_KSPLIT_STEP
+        elif SPLITK_BLOCK_SIZE % BLOCK_SIZE_K != 0:
+            if NUM_KSPLIT > 1:
+                NUM_KSPLIT = NUM_KSPLIT // NUM_KSPLIT_STEP
+            elif BLOCK_SIZE_K > 16:
+                BLOCK_SIZE_K = BLOCK_SIZE_K // BLOCK_SIZE_K_STEP
+        elif K % (BLOCK_SIZE_K // 2) != 0 and BLOCK_SIZE_K > 16:
+            BLOCK_SIZE_K = BLOCK_SIZE_K // BLOCK_SIZE_K_STEP
+        else:
+            break
+
+        SPLITK_BLOCK_SIZE = (
+            triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
+        )
+
+    return SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT
 
 
 def set_use_gemm_splitk_bf16(value: bool):

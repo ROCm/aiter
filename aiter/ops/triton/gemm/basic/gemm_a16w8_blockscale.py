@@ -10,12 +10,21 @@ from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w8_blockscale import (
     _gemm_a16w8_blockscale_kernel,
     _gemm_a16w8_blockscale_preshuffle_kernel,
-    _get_config,
 )
-from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
+from aiter.ops.triton.utils.gemm_config_utils import (
+    compute_splitk_params,
+    get_gemm_config,
+)
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+
+def _get_config(M: int, N: int, K: int, shuffle: bool = False):
+    shuffle_suffix = "_PRESHUFFLED" if shuffle else ""
+    config_name = f"GEMM-A16W8_BLOCKSCALE{shuffle_suffix}"
+
+    return get_gemm_config(config_name, M, N, K)
 
 
 def gemm_a16w8_blockscale(

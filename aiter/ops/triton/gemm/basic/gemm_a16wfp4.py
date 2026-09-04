@@ -11,16 +11,28 @@ from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16wfp4 import (
     _gemm_a16wfp4_kernel,
     _gemm_a16wfp4_preshuffle_kernel,
-    _get_config,
 )
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     get_splitk,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
+from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+
+def _get_config(
+    M: int,
+    N: int,
+    K: int,
+    shuffle: bool = False,
+):
+    shuffle_suffix = "_PRESHUFFLED" if shuffle else ""
+    config_name = f"GEMM-A16WFP4{shuffle_suffix}"
+    # Note: Config files use K=2*K in their naming
+    return get_gemm_config(config_name, M, N, 2 * K)
 
 
 def gemm_a16wfp4_fake_tensor(

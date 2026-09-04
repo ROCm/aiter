@@ -12,17 +12,26 @@ from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16 import (
     _gemm_a16_w16_kernel,
 )
-from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16 import (
-    _get_config as _get_triton_config,
-)
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
-from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
+from aiter.ops.triton.utils.gemm_config_utils import (
+    compute_splitk_params,
+    get_gemm_config,
+)
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
 _GLUON_SUPPORTED_ARCHS = ("gfx1250",)
+
+
+def _get_triton_config(
+    M: int,
+    N: int,
+    K: int,
+):
+    config, is_tuned = get_gemm_config("GEMM-A16W16", M, N, K)
+    return compute_splitk_params(config, K), is_tuned
 
 
 def _is_gluon_available():

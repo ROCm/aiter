@@ -9,8 +9,17 @@ from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
 )
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_per_token_scale import (
     _gemm_a8w8_per_token_scale_kernel,
-    _get_config,
 )
+from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
+
+
+def _get_config(
+    M: int,
+    N: int,
+    K: int,
+):
+
+    return get_gemm_config("GEMM-A8W8_PER_TOKEN_SCALE", M, N, K)
 
 
 def gemm_a8w8_per_token_scale(

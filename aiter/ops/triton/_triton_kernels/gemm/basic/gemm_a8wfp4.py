@@ -6,7 +6,6 @@ import triton.language as tl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
-from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 _gemm_a8wfp4_repr = make_kernel_repr(
     "_gemm_a8wfp4_kernel",
@@ -199,57 +198,3 @@ def _gemm_a8wfp4_kernel(
         )
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         tl.store(c_ptrs, c, mask=c_mask)
-
-
-def _get_config(
-    M: int,
-    N: int,
-    K: int,
-):
-
-    config, is_tunned = get_gemm_config("GEMM-A8WFP4", M, N, K)
-
-    if M <= 128:
-        SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = _get_splitk(
-            K, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
-        )
-        config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE
-        config["BLOCK_SIZE_K"] = BLOCK_SIZE_K
-        config["NUM_KSPLIT"] = NUM_KSPLIT
-    else:
-        config["SPLITK_BLOCK_SIZE"] = 2 * K
-
-    return config, is_tunned
-
-
-def _get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
-    # heuristics for make "EVEN_K == True" as much as possible
-    NUM_KSPLIT_STEP = 4
-    BLOCK_SIZE_K_STEP = 4
-    SPLITK_BLOCK_SIZE = (
-        triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
-    )
-    while NUM_KSPLIT > 1 and BLOCK_SIZE_K > 16:
-        if (
-            K % (SPLITK_BLOCK_SIZE // 2) == 0
-            and SPLITK_BLOCK_SIZE % BLOCK_SIZE_K == 0
-            and K % (BLOCK_SIZE_K // 2) == 0
-        ):
-            break
-        elif K % (SPLITK_BLOCK_SIZE // 2) != 0 and NUM_KSPLIT > 1:
-            NUM_KSPLIT = NUM_KSPLIT // NUM_KSPLIT_STEP
-        elif SPLITK_BLOCK_SIZE % BLOCK_SIZE_K != 0:
-            if NUM_KSPLIT > 1:
-                NUM_KSPLIT = NUM_KSPLIT // NUM_KSPLIT_STEP
-            elif BLOCK_SIZE_K > 16:
-                BLOCK_SIZE_K = BLOCK_SIZE_K // BLOCK_SIZE_K_STEP
-        elif K % (BLOCK_SIZE_K // 2) != 0 and BLOCK_SIZE_K > 16:
-            BLOCK_SIZE_K = BLOCK_SIZE_K // BLOCK_SIZE_K_STEP
-        else:
-            break
-
-        SPLITK_BLOCK_SIZE = (
-            triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
-        )
-
-    return SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT
