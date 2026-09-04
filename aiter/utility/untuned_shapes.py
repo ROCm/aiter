@@ -112,10 +112,22 @@ def record(tuned_file: str, row: dict) -> None:
                     with open(path, "rb") as fh:
                         fh.seek(-1, os.SEEK_END)
                         needs_separator = fh.read(1) not in (b"\n", b"\r")
-                with open(path, "a") as fh:
-                    if needs_separator:
-                        fh.write("\n")
-                    fh.write(",".join(key) + "\n")
+                original_size = os.path.getsize(path)
+                try:
+                    with open(path, "a") as fh:
+                        if needs_separator:
+                            fh.write("\n")
+                        fh.write(",".join(key) + "\n")
+                except Exception:
+                    # write() and close() may fail after flushing only a prefix.
+                    # Restore the last known-good boundary while holding the
+                    # interprocess lock so the next dispatch can retry cleanly.
+                    try:
+                        with open(path, "r+b") as fh:
+                            fh.truncate(original_size)
+                    except OSError:
+                        pass
+                    raise
                 # Only cache a row after its append succeeds. A transient write
                 # failure must remain retryable on the next dispatch.
                 state["rows"].add(key)

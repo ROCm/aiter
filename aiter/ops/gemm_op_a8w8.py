@@ -487,21 +487,31 @@ def _get_CKGEMM_config_cached(M: int, N: int, K: int, tuned_file):
     return config
 
 
+@functools.lru_cache(maxsize=1024)
+def _log_CKGEMM_miss_once(M: int, N: int, K: int, tuned_file):
+    logger.info(
+        f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in {tuned_file}, will use default config!"
+    )
+
+
 def get_CKGEMM_config(M: int, N: int, K: int, tuned_file=None):
     if tuned_file is None:
         tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_FILE
     config = _get_CKGEMM_config_cached(M, N, K, tuned_file)
     if config is None:
-        logger.info(
-            f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in {tuned_file}, will use default config!"
-        )
+        _log_CKGEMM_miss_once(M, N, K, tuned_file)
         # AITER_TUNE_GEMM=1 -> collect the miss in this family's untuned schema,
         # so a serving run yields a ready-to-tune shape list (see #5267).
         _record_untuned_shape(tuned_file, {"M": M, "N": N, "K": K})
     return config
 
 
-get_CKGEMM_config.cache_clear = _get_CKGEMM_config_cached.cache_clear
+def _clear_CKGEMM_config_cache():
+    _get_CKGEMM_config_cached.cache_clear()
+    _log_CKGEMM_miss_once.cache_clear()
+
+
+get_CKGEMM_config.cache_clear = _clear_CKGEMM_config_cache
 get_CKGEMM_config.cache_info = _get_CKGEMM_config_cached.cache_info
 
 
@@ -563,6 +573,13 @@ def _get_GEMM_config_with_quant_type_cached(
     return config
 
 
+@functools.lru_cache(maxsize=1024)
+def _log_quant_type_miss_once(M, N, K, q_dtype_w, tuned_file):
+    logger.info(
+        f"shape is M:{M}, N:{N}, K:{K}, q_dtype_w:{q_dtype_w}, not found tuned config in {tuned_file}, will use default config!"
+    )
+
+
 def get_GEMM_config_with_quant_type(
     M: int,
     N: int,
@@ -575,18 +592,19 @@ def get_GEMM_config_with_quant_type(
         tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
     config = _get_GEMM_config_with_quant_type_cached(M, N, K, q_dtype_w, tuned_file)
     if config is None and record_untuned:
-        logger.info(
-            f"shape is M:{M}, N:{N}, K:{K}, q_dtype_w:{q_dtype_w}, not found tuned config in {tuned_file}, will use default config!"
-        )
+        _log_quant_type_miss_once(M, N, K, q_dtype_w, tuned_file)
         _record_untuned_shape(
             tuned_file, {"M": M, "N": N, "K": K, "q_dtype_w": q_dtype_w}
         )
     return config
 
 
-get_GEMM_config_with_quant_type.cache_clear = (
-    _get_GEMM_config_with_quant_type_cached.cache_clear
-)
+def _clear_quant_type_config_cache():
+    _get_GEMM_config_with_quant_type_cached.cache_clear()
+    _log_quant_type_miss_once.cache_clear()
+
+
+get_GEMM_config_with_quant_type.cache_clear = _clear_quant_type_config_cache
 get_GEMM_config_with_quant_type.cache_info = (
     _get_GEMM_config_with_quant_type_cached.cache_info
 )

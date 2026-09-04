@@ -94,6 +94,45 @@ class TestUntunedShapes(unittest.TestCase):
         with open(path) as fh:
             self.assertEqual(fh.read(), "M,N,K\n1,2,3\n")
 
+    def test_partial_append_is_rolled_back_before_retry(self):
+        row = {"M": 1, "N": 2, "K": 3}
+        path = os.path.join(self.tempdir.name, "a8w8_untuned_gemm.csv")
+        real_open = builtins.open
+        failed_once = False
+
+        class PartialAppend:
+            def __init__(self, fh):
+                self.fh = fh
+
+            def __enter__(self):
+                self.fh.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self.fh.__exit__(*args)
+
+            def write(self, text):
+                self.fh.write(text[:2])
+                self.fh.flush()
+                raise OSError("partial write")
+
+        def partially_write_first_row(file, mode="r", *args, **kwargs):
+            nonlocal failed_once
+            fh = real_open(file, mode, *args, **kwargs)
+            if os.fspath(file) == path and mode == "a" and not failed_once:
+                failed_once = True
+                return PartialAppend(fh)
+            return fh
+
+        with mock.patch("builtins.open", side_effect=partially_write_first_row):
+            untuned_shapes.record("a8w8_tuned_gemm.csv", row)
+
+        with open(path) as fh:
+            self.assertEqual(fh.read(), "M,N,K\n")
+        untuned_shapes.record("a8w8_tuned_gemm.csv", row)
+        with open(path) as fh:
+            self.assertEqual(fh.read(), "M,N,K\n1,2,3\n")
+
     def test_processes_do_not_lose_or_duplicate_rows(self):
         shared = {"M": 1, "N": 2, "K": 3}
         processes = []
@@ -118,16 +157,20 @@ class TestUntunedShapes(unittest.TestCase):
 
 class TestCachedLookupMissRecording(unittest.TestCase):
 
-    def _assert_retry_outside_cache(self, module, cached_name, lookup, args):
+    def _assert_retry_outside_cache(self, module, cached_name, log_name, lookup, args):
         resolver = mock.Mock(return_value=None)
         cached_resolver = functools.lru_cache(maxsize=1)(resolver)
+        miss_logger = mock.Mock()
+        cached_logger = functools.lru_cache(maxsize=1)(miss_logger)
         with (
             mock.patch.object(module, cached_name, cached_resolver),
+            mock.patch.object(module, log_name, cached_logger),
             mock.patch.object(module, "_record_untuned_shape") as record,
         ):
             lookup(*args)
             lookup(*args)
         self.assertEqual(resolver.call_count, 1)
+        self.assertEqual(miss_logger.call_count, 1)
         self.assertEqual(record.call_count, 2)
 
     def test_a8w8_misses_record_outside_lookup_caches(self):
@@ -136,12 +179,14 @@ class TestCachedLookupMissRecording(unittest.TestCase):
         self._assert_retry_outside_cache(
             gemm_op_a8w8,
             "_get_CKGEMM_config_cached",
+            "_log_CKGEMM_miss_once",
             gemm_op_a8w8.get_CKGEMM_config,
             (1, 2, 3, "tuned.csv"),
         )
         self._assert_retry_outside_cache(
             gemm_op_a8w8,
             "_get_GEMM_config_with_quant_type_cached",
+            "_log_quant_type_miss_once",
             gemm_op_a8w8.get_GEMM_config_with_quant_type,
             (1, 2, 3, "fp8", "tuned.csv"),
         )
@@ -152,6 +197,7 @@ class TestCachedLookupMissRecording(unittest.TestCase):
         self._assert_retry_outside_cache(
             gemm_op_a4w4,
             "_get_GEMM_config_cached",
+            "_log_GEMM_miss_once",
             gemm_op_a4w4.get_GEMM_config,
             (1, 2, 3),
         )

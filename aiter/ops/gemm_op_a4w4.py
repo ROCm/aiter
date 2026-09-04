@@ -76,18 +76,28 @@ def _get_GEMM_config_cached(M: int, N: int, K: int):
     return config
 
 
+@functools.lru_cache(maxsize=1024)
+def _log_GEMM_miss_once(M: int, N: int, K: int, tuned_file):
+    logger.info(
+        f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in {tuned_file}, will use default config!"
+    )
+
+
 def get_GEMM_config(M: int, N: int, K: int):
     tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE
     config = _get_GEMM_config_cached(M, N, K)
     if config is None:
-        logger.info(
-            f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in {tuned_file}, will use default config!"
-        )
+        _log_GEMM_miss_once(M, N, K, tuned_file)
         _record_untuned_shape(tuned_file, {"M": M, "N": N, "K": K})
     return config
 
 
-get_GEMM_config.cache_clear = _get_GEMM_config_cached.cache_clear
+def _clear_GEMM_config_cache():
+    _get_GEMM_config_cached.cache_clear()
+    _log_GEMM_miss_once.cache_clear()
+
+
+get_GEMM_config.cache_clear = _clear_GEMM_config_cache
 get_GEMM_config.cache_info = _get_GEMM_config_cached.cache_info
 
 
