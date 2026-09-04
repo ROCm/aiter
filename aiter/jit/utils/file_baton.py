@@ -117,13 +117,6 @@ class FileBaton:
             self.fd = os.open(self.lock_file_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
             return False
-        # The lock is visible before the handoff marker disappears, so waiters
-        # can never observe both paths absent between stale recovery and the
-        # replacement build.
-        try:
-            os.remove(self.lock_file_path + ".steal")
-        except OSError:
-            pass
         try:
             pid = os.getpid()
             os.write(
@@ -137,6 +130,13 @@ class FileBaton:
         except OSError:
             pass
         self._start_heartbeat()
+        # The initialized lock is visible before the handoff marker disappears,
+        # so waiters can never observe both paths absent between stale recovery
+        # and the replacement build.
+        try:
+            os.remove(self.lock_file_path + ".steal")
+        except OSError:
+            pass
         return True
 
     def wait(self):
