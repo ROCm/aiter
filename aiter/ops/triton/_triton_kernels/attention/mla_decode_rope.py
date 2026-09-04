@@ -23,7 +23,6 @@ It supports page size = 1.
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage1.py
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage2.py
 
-import functools
 
 import triton
 import triton.language as tl
@@ -31,7 +30,6 @@ import triton.language as tl
 from aiter.ops.triton._triton_kernels.activation import _tanh
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
-from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 _fwd_grouped_kernel_stage1_rope_repr = make_kernel_repr(
     "_fwd_grouped_kernel_stage1_rope",
@@ -398,9 +396,3 @@ def _fwd_kernel_stage2(
         acc / e_sum,
         mask=mask_d,
     )
-
-
-@functools.lru_cache(maxsize=1024)
-def _get_config():
-    cfg_dir = resolve_config_dir("attention", "MLA_DECODE_ROPE", backend="triton")
-    return load_config_json(f"{cfg_dir}/DEFAULT.json")

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
+
 import torch
 import triton
 
@@ -8,13 +10,20 @@ from aiter.ops.triton._triton_kernels.attention.mha_fused_bwd import (
     _bwd_kernel_dkdvdq_causal,
     _bwd_kernel_dkdvdq_noncausal,
     _bwd_preprocess,
-    _get_config,
 )
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import _is_fp8
 
 _LOGGER = AiterTritonLogger()
+
+
+@functools.lru_cache(maxsize=1024)
+def _get_config():
+    cfg_dir = resolve_config_dir("attention", "MHA", backend="triton")
+    config = load_config_json(f"{cfg_dir}/DEFAULT.json")
+    return config["bkwd_fused"]
 
 
 def flash_attn_fused_backward(

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import functools
 
 import torch
 import triton
@@ -13,7 +12,6 @@ from aiter.ops.triton.utils._triton.pid_preprocessing import (
     remap_workgroup_spatial,
     remap_xcd,
 )
-from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 
 @triton.jit
@@ -942,31 +940,3 @@ def _attn_fwd(
         out_mask = out_mask & (offs_d[None, :] < BLOCK_DMODEL)
     op = acc.to(out_ptr.dtype.element_ty)
     tl.store(out_ptr + offs_out, op, mask=out_mask)
-
-
-@functools.lru_cache(maxsize=1024)
-def _get_config(
-    enable_dropout: bool,
-    dtype: torch.dtype,
-    has_pe: bool = False,
-    head_dim_v: int | None = None,
-):
-    cfg_dir = resolve_config_dir("attention", "MHA", backend="triton")
-    config = load_config_json(f"{cfg_dir}/DEFAULT.json")
-    fwd_cfg = config["fwd"]
-    has_dropout_or_fp32 = enable_dropout or dtype == torch.float32
-    # TODO: pe + dropout is not tuned
-    if has_pe and has_dropout_or_fp32 and "pe_dropout_or_fp32" in fwd_cfg:
-        return fwd_cfg["pe_dropout_or_fp32"]
-    elif has_pe and "pe" in fwd_cfg:
-        return fwd_cfg["pe"]
-    elif enable_dropout or dtype == torch.float32:
-        return fwd_cfg["dropout_or_fp32"]
-    elif head_dim_v is not None and 16 < head_dim_v <= 64 and "small_head" in fwd_cfg:
-        # Mid-small V head dims (16 < d <= 64) hit a num_stages=1 software-pipelining
-        # pathology on this backend (e.g. ~3x slower at d64). Using num_stages=3
-        # recovers performance and is numerically verified for these dims, but
-        # regresses d128 and miscompiles d<=16, so only 16 < d <= 64 uses this path.
-        return fwd_cfg["small_head"]
-    else:
-        return fwd_cfg["default"]

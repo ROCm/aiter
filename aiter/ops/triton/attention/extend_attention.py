@@ -17,18 +17,30 @@ Memory-efficient attention for prefill.
 It supports page size = 1 and prefill with KV cache (i.e. extend).
 """
 
+import functools
+
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.attention.extend_attention import (
-    _fwd_kernel,
-    _get_config,
-)
+from aiter.ops.triton._triton_kernels.attention.extend_attention import _fwd_kernel
 from aiter.ops.triton.attention.prefill_attention import context_attention_fwd
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+
+@functools.lru_cache(maxsize=1024)
+def _get_config(HEAD_SIZE, dtype):
+    cfg_dir = resolve_config_dir("attention", "EXTEND_ATTENTION", backend="triton")
+    config = load_config_json(f"{cfg_dir}/DEFAULT.json")
+
+    # HEAD_SIZE 192 = 128 head and 64 pe head dim
+    if (HEAD_SIZE > 192) or dtype == torch.float32:
+        return config["large_head_or_fp32"]
+
+    return config["default"]
 
 
 def extend_attention_fwd(

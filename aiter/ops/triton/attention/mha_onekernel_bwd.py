@@ -1,16 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
+
 import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
 from aiter.ops.triton._triton_kernels.attention.mha_onekernel_bwd import (
     _bwd_preprocess,
-    _get_config,
     bwd_kernel_causal,
     bwd_kernel_noncausal,
 )
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import _is_fp8
 
@@ -23,6 +25,13 @@ DROPOUT_DUMP = False
 
 tl_DROPOUT_USE_PYTORCH: tl.constexpr = triton.language.constexpr(DROPOUT_USE_PYTORCH)
 tl_DROPOUT_DUMP: tl.constexpr = triton.language.constexpr(DROPOUT_DUMP)
+
+
+@functools.lru_cache(maxsize=1024)
+def _get_config():
+    cfg_dir = resolve_config_dir("attention", "MHA", backend="triton")
+    config = load_config_json(f"{cfg_dir}/DEFAULT.json")
+    return config["bkwd_onekernel"]
 
 
 def flash_attn_onekernel_backward(

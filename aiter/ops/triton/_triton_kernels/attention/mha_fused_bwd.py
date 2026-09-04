@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import functools
 
 import triton
 import triton.language as tl
@@ -9,7 +8,6 @@ import triton.language as tl
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
 from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
-from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 # This function computes delta given output Out and gradient DO
 # Here is the I/O shape:
@@ -1056,10 +1054,3 @@ def _bwd_kernel_dkdvdq_noncausal(
     tl.store(DV + adj_dkdv, dv, mask=mask_kv)
     dk *= sm_scale
     tl.store(DK + adj_dkdv, dk, mask=mask_kv)
-
-
-@functools.lru_cache(maxsize=1024)
-def _get_config():
-    cfg_dir = resolve_config_dir("attention", "MHA", backend="triton")
-    config = load_config_json(f"{cfg_dir}/DEFAULT.json")
-    return config["bkwd_fused"]
