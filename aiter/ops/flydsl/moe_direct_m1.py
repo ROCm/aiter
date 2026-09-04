@@ -198,13 +198,13 @@ def candidate_kernel_pairs(model_dim: int, inter_dim: int) -> list[tuple[str, st
     # Stage1's packed fp4 output is spelled as a ``_fp4`` suffix on a bf16 name.
     for base in get_flydsl_stage1_kernels("fp4", "fp4", "bf16"):
         kn1 = DIRECT_M1_STAGE1_PREFIX + base.removeprefix("flydsl_moe1_") + "_fp4"
-        for kn2 in stage2:
-            try:
-                plan = parse_direct_plan(kn1, kn2)
-            except ValueError:
-                break  # stage1 rejected; kn2 cannot rescue it
-            if not _check_shapes(plan, model_dim, inter_dim):
-                pairs.append((kn1, kn2))
+        try:
+            # The two stage2 names differ only in NT, so one parse decides both.
+            plan = parse_direct_plan(kn1, stage2[0])
+        except ValueError:
+            continue
+        if not _check_shapes(plan, model_dim, inter_dim):
+            pairs.extend((kn1, kn2) for kn2 in stage2)
     return pairs
 
 
@@ -309,8 +309,8 @@ def runtime_is_supported(metadata: Any, call: MoeCall) -> tuple[bool, str]:
     """Make a host-only dispatch decision; tensor values are never read."""
     if get_gfx() != "gfx950":
         return False, f"requires gfx950, got {get_gfx()}"
-    if not metadata.flat or metadata.run_1stage or metadata.ksplit:
-        return False, "requires flat=1, run_1stage=0, ksplit=0 metadata"
+    if metadata.run_1stage or metadata.ksplit:
+        return False, "requires two-stage metadata with ksplit=0"
     try:
         plan = parse_direct_plan(
             metadata_kernel_name(metadata, 1), metadata_kernel_name(metadata, 2)
@@ -430,6 +430,7 @@ def run(metadata: Any, call: MoeCall) -> torch.Tensor:
     # The quant kernel also zeroes `out`, which stage2 accumulates into.
     out = torch.empty((1, hidden), dtype=torch.bfloat16, device=device)
     aq = torch.empty((1, hidden // 2), dtype=dtypes.fp4x2, device=device)
+    # One scale row is used; the shuffled e8m0 layout addresses a 256-row tile.
     ascale = torch.empty(
         (256, scale_cols(hidden)), dtype=dtypes.fp8_e8m0, device=device
     )

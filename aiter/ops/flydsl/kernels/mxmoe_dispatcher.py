@@ -134,23 +134,20 @@ def compile_gemm2_a4w4_port(
 ):
     """Compile gemm2 a4w4 down-proj; epilog 'atomic' (weighted atomic-fadd) or 'reduce' (store into out[token_id*topk+slot]). inter_dim runtime; SBM None -> SBM==BM byte-identical."""
     SBM = _norm_sbm(SBM, BM)
-    if route_centric_m1 and g2_spart is None:
-        g2_spart = 0
-    if route_centric_m1 and (
-        BM != 32
-        or BN != 128
-        or BK != 128
-        or epilog != "atomic"
-        or persist
-        or a_dtype != "fp4"
-        or b_dtype != "fp4"
-        or enable_bias
-        or SBM != BM
-        or g2_spart not in (None, 0)
-    ):
-        raise AssertionError(
-            "route_centric_m1 requires BM32/BN128/BK128 non-persistent A4W4 atomic"
-        )
+    if route_centric_m1:
+        # The route-centric launcher owns the grid, so the default partitioner
+        # must not remap it.
+        g2_spart = 0 if g2_spart is None else g2_spart
+        if (
+            (BM, BN, BK, SBM, epilog) != (32, 128, 128, 32, "atomic")
+            or (a_dtype, b_dtype) != ("fp4", "fp4")
+            or persist
+            or enable_bias
+            or g2_spart
+        ):
+            raise AssertionError(
+                "route_centric_m1 requires BM32/BN128/BK128 non-persistent A4W4 atomic"
+            )
     if BM not in (16, 32, 64, 128) or epilog not in ("atomic", "reduce"):
         raise AssertionError(
             f"mxfp4_moe_gemm2 supports only (BM in {{16,32,64,128}}, epilog in {{'atomic','reduce'}}); "

@@ -1080,8 +1080,8 @@ def _fused_moe_impl(
                     f"a16w4 (bf16 A x MXFP4 W) SiTUv2 is not supported: {_why}."
                 )
 
-    def _lookup_metadata(disable_direct_m1=False, disable_inline_sort=False):
-        return get_2stage_cfgs(
+    def _resolve_metadata(disable_direct_m1=False, disable_inline_sort=False):
+        metadata = get_2stage_cfgs(
             get_padded_M(M),  # consider token_num > 1024 as prefill
             model_dim,
             inter_dim,
@@ -1106,9 +1106,6 @@ def _fused_moe_impl(
             _disable_direct_m1=disable_direct_m1,
             _disable_inline_sort=disable_inline_sort,
         )
-
-    def _resolve_metadata(**disable):
-        metadata = _lookup_metadata(**disable)
         return metadata if _metadata_transform is None else _metadata_transform(metadata)
 
     call = MoeCall(
@@ -1204,15 +1201,9 @@ def _fused_moe_impl(
         _kn2 = metadata_kernel_name(metadata, 2)
         _atomic = parse_g2_kname_any(_kn2)["atomic"]
         if use_inline_sort:
-            (
-                sorted_ids,
-                sorted_weights,
-                sorted_expert_ids,
-                num_valid_ids,
-                moe_buf,
-                sort_m_indices,
-                sort_reverse_sorted,
-            ) = _adaptive_moe_sort(
+            # Inline-quant stage1 quantizes the sorted rows itself, so the sort
+            # only has to emit route rows and zero the atomic output.
+            sorting_ret = _adaptive_moe_sort(
                 topk_ids,
                 topk_weight,
                 global_E,
@@ -1225,15 +1216,7 @@ def _fused_moe_impl(
                 moebuf_dtype=dtype,
             )
         else:
-            (
-                sorted_ids,
-                sorted_weights,
-                sorted_expert_ids,
-                num_valid_ids,
-                moe_buf,
-                sort_m_indices,
-                sort_reverse_sorted,
-            ) = moe_sorting(
+            sorting_ret = moe_sorting(
                 topk_ids,
                 topk_weight,
                 global_E,
@@ -1244,6 +1227,15 @@ def _fused_moe_impl(
                 output_aux=True,
                 output=output,
             )
+        (
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            sort_m_indices,
+            sort_reverse_sorted,
+        ) = sorting_ret
         local_topk_ids = None
     else:
         sorting_ret = moe_sorting(
@@ -1346,7 +1338,7 @@ def _fused_moe_impl(
             # Reuse the capability-validated row selected above. Re-looking it
             # up inside fused_moe_2stages could resurrect a tuned row that was
             # deliberately discarded before sorting.
-            _metadata_transform=lambda _metadata: metadata,
+            _metadata_transform=lambda _: metadata,
             _metadata_config_file=_metadata_config_file,
             _stage1_extra_args=_stage1_extra_args,
             _stage2_extra_args=_stage2_extra_args,

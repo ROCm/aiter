@@ -1138,29 +1138,14 @@ def fused_dynamic_mx_quant_moe_sort(
     )
     if use_fused:
         out = torch.empty(M, out_cols, dtype=quant_dtype, device=input.device)
+        common = (out, scale, input, sorted_ids, num_valid_ids, token_num, block_size)
         if num_experts_upper_bound is None:
-            fused_dynamic_mx_quant_moe_sort_hip(
-                out,
-                scale,
-                input,
-                sorted_ids,
-                num_valid_ids,
-                token_num,
-                block_size,
-                group_size,
-                sorted_weights,
-            )
+            fused_dynamic_mx_quant_moe_sort_hip(*common, group_size, sorted_weights)
         else:
             # Pass the routing top-k explicitly: at stage1 ``input`` has only M
             # rows, from which the HIP kernel would infer a top-k of 1.
             fused_dynamic_mx_quant_moe_sort_hip_bounded(
-                out,
-                scale,
-                input,
-                sorted_ids,
-                num_valid_ids,
-                token_num,
-                block_size,
+                *common,
                 token_num * topk,
                 num_experts_upper_bound,
                 group_size,
