@@ -21,6 +21,7 @@ Environment:
                              inside a container you would rather not reach into
 """
 
+import fcntl
 import os
 import threading
 
@@ -73,8 +74,18 @@ def record(tuned_file: str, row: dict) -> None:
         key = tuple(str(v) for v in row.values())
         with _LOCK:
             state = _SEEN.get(path)
-            if state is None:
-                cols = list(row.keys())
+            if state is not None and key in state["rows"]:
+                return
+
+            cols = list(row.keys())
+            first_use = state is None
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            # _LOCK only covers threads in this process. Serving commonly has
+            # several worker processes writing the same collection, so protect
+            # initialization, the disk-level duplicate check, and append with
+            # an advisory interprocess lock as one transaction.
+            with open(path + ".lock", "a") as lock_fh:
+                fcntl.flock(lock_fh, fcntl.LOCK_EX)
                 existing = set()
                 if os.path.exists(path):
                     with open(path) as fh:
@@ -86,25 +97,27 @@ def record(tuned_file: str, row: dict) -> None:
                                     existing.add(tuple(line.split(",")))
                         else:  # different schema on disk: start a fresh file
                             os.replace(path, path + ".bak")
-                state = _SEEN[path] = {"cols": cols, "rows": existing}
-                os.makedirs(os.path.dirname(path), exist_ok=True)
                 if not os.path.exists(path):
                     with open(path, "w") as fh:
                         fh.write(",".join(cols) + "\n")
-                logger.info(f"[AITER_TUNE_GEMM] recording untuned shapes to {path}")
-            if key in state["rows"]:
-                return
-            needs_separator = os.path.getsize(path) > 0
-            if needs_separator:
-                with open(path, "rb") as fh:
-                    fh.seek(-1, os.SEEK_END)
-                    needs_separator = fh.read(1) not in (b"\n", b"\r")
-            with open(path, "a") as fh:
+                # Publish initialization state only after the directory and a
+                # valid CSV header exist, so a transient failure can recover.
+                state = _SEEN[path] = {"cols": cols, "rows": existing}
+                if first_use:
+                    logger.info(f"[AITER_TUNE_GEMM] recording untuned shapes to {path}")
+                if key in state["rows"]:
+                    return
+                needs_separator = os.path.getsize(path) > 0
                 if needs_separator:
-                    fh.write("\n")
-                fh.write(",".join(key) + "\n")
-            # Only cache a row after its append succeeds. A transient write
-            # failure must remain retryable on the next dispatch.
-            state["rows"].add(key)
+                    with open(path, "rb") as fh:
+                        fh.seek(-1, os.SEEK_END)
+                        needs_separator = fh.read(1) not in (b"\n", b"\r")
+                with open(path, "a") as fh:
+                    if needs_separator:
+                        fh.write("\n")
+                    fh.write(",".join(key) + "\n")
+                # Only cache a row after its append succeeds. A transient write
+                # failure must remain retryable on the next dispatch.
+                state["rows"].add(key)
     except Exception as e:  # noqa: BLE001 - never break dispatch over telemetry
         logger.warning(f"[AITER_TUNE_GEMM] could not record untuned shape: {e}")

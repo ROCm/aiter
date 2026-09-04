@@ -505,6 +505,7 @@ def get_GEMM_config_with_quant_type(
     K: int,
     q_dtype_w: torch.dtype,
     tuned_file=None,
+    record_untuned=True,
 ):
     if tuned_file is None:
         tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
@@ -550,7 +551,7 @@ def get_GEMM_config_with_quant_type(
                     msg += f" kernelName is {config['kernelName']} (kernelId {config.get('kernelId')})!"
                 logger.info(msg)
             break
-    if config is None:
+    if config is None and record_untuned:
         logger.info(
             f"shape is M:{M}, N:{N}, K:{K}, q_dtype_w:{q_dtype_w}, not found tuned config in {tuned_file}, will use default config!"
         )
@@ -741,6 +742,7 @@ def gemm_a8w8_bpreshuffle(
         k,
         dtypes.fp8,
         AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
+        record_untuned=w_k == k,
     )
     if config is None and w_k > k:
         config = get_GEMM_config_with_quant_type(
