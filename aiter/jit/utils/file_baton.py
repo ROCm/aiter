@@ -103,7 +103,7 @@ class FileBaton:
         if self.fd is not None:
             return True
         try:
-            fd = os.open(self.lock_file_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o644)
+            fd = os.open(self.lock_file_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o666)
         except FileExistsError:
             return False
         try:
@@ -117,7 +117,7 @@ class FileBaton:
             raise
         self.fd = fd
         try:
-            os.fchmod(self.fd, 0o644)
+            os.fchmod(self.fd, 0o666)
             pid = os.getpid()
             remaining = memoryview(
                 (
@@ -222,15 +222,12 @@ class FileBaton:
         """Try to hold the recovery guard; kernel releases it on process exit."""
         guard_path = self.lock_file_path + ".steal"
         try:
-            sfd = os.open(guard_path, os.O_CREAT | os.O_EXCL | os.O_RDONLY, 0o666)
+            sfd = os.open(guard_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o666)
         except FileExistsError:
-            # flock does not require write access on Linux. Opening read-only
-            # lets different UIDs sharing a cache coordinate through a marker
-            # created with another user's umask.
-            sfd = os.open(guard_path, os.O_RDONLY)
+            sfd = os.open(guard_path, os.O_RDWR)
         else:
             # Creation mode is filtered by umask; immediately make the
-            # persistent rendezvous inode readable by every cache peer.
+            # persistent rendezvous inode writable by every cache peer.
             os.fchmod(sfd, 0o666)
         try:
             fcntl.flock(sfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -277,7 +274,10 @@ class FileBaton:
     def _owner_flock_released(self):
         """Whether the kernel released the build owner's lifetime lock."""
         try:
-            fd = os.open(self.lock_file_path, os.O_RDONLY)
+            # NFS emulates flock with byte-range locks and requires a writable
+            # descriptor for LOCK_EX. Lock files are explicitly mode 0666 so
+            # every cache peer can perform this liveness probe.
+            fd = os.open(self.lock_file_path, os.O_RDWR)
         except OSError:
             return False
         try:

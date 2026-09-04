@@ -4,6 +4,7 @@
 
 import os
 import socket
+import stat
 import tempfile
 import threading
 import time
@@ -39,7 +40,6 @@ class TestFileBaton(unittest.TestCase):
             # A leftover marker has no live flock and must not wedge recovery.
             with open(path + ".steal", "w"):
                 pass
-            os.chmod(path + ".steal", 0o444)
 
             baton = FileBaton(
                 path,
@@ -129,6 +129,23 @@ class TestFileBaton(unittest.TestCase):
                 self.assertTrue(waiter._is_stale())
                 self.assertFalse(waiter.wait())
             waiter.release()
+
+    def test_lock_files_ignore_restrictive_umask_for_cache_peers(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = os.path.join(tempdir, "build.lock")
+            baton = FileBaton(path)
+            old_umask = os.umask(0o077)
+            try:
+                self.assertTrue(baton.try_acquire())
+                guard = baton._try_acquire_steal_guard()
+            finally:
+                os.umask(old_umask)
+
+            self.assertIsNotNone(guard)
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o666)
+            self.assertEqual(stat.S_IMODE(os.stat(path + ".steal").st_mode), 0o666)
+            baton._release_steal_guard(guard)
+            baton.release()
 
 
 if __name__ == "__main__":
