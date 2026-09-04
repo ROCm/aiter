@@ -119,16 +119,26 @@ class FileBaton:
         try:
             os.fchmod(self.fd, 0o644)
             pid = os.getpid()
-            os.write(
-                self.fd,
+            remaining = memoryview(
                 (
                     f"{pid}\n{socket.gethostname()}\n"
                     f"{_pid_namespace()}\n{_process_start_time(pid)}\nflock\n"
-                ).encode(),
+                ).encode()
             )
+            while remaining:
+                written = os.write(self.fd, remaining)
+                if written <= 0:
+                    raise OSError("could not write baton owner record")
+                remaining = remaining[written:]
             os.fsync(self.fd)
         except OSError:
-            pass
+            # Never leave a valid-looking legacy prefix if owner metadata is
+            # only partially written. An empty record is protected by the
+            # lifetime flock while live and recoverable after process death.
+            try:
+                os.ftruncate(self.fd, 0)
+            except OSError:
+                pass
         return True
 
     def wait(self):
