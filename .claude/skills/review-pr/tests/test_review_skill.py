@@ -2721,3 +2721,58 @@ class TestSymbolSweepWorkedExample(unittest.TestCase):
         out = self.sweep(self.diff_adding("import numpy as np"))
         self.assertNotIn("UNRESOLVED-IMPORT", out)
 
+
+class TestFlydslKernelsAreKernels(unittest.TestCase):
+    """FlyDSL is a kernel backend and the deriver did not treat it as one.
+
+    KERNEL_PY lists `aiter/ops/triton/`, `_triton_kernels/`, `_gluon_kernels/` and
+    `/gluon/`. A FlyDSL kernel matched none of them, so it reached `flydsl` -- D10 and D10b,
+    which are about compile-result handling -- and nothing else. 108 of 600 open PRs edit
+    `aiter/ops/flydsl/kernels/*.py` and 95 of them derived neither kernel family, so A1's
+    sibling variant, D1's uninitialised accumulator, D8's missing contiguous check and P6's
+    unmeasured cost were never put to an entire backend. The siblings forensic had already
+    been pairing `_flydsl_stage1_wrapper` against `_flydsl_stage2_wrapper` in those files.
+
+    Median rules per PR is unchanged at 15 and the mean moves 14.7 to 15.1: these PRs
+    already carried most of what this adds."""
+
+    def diff(self, path, added="    x = compile_flydsl_moe_stage1(a, b)"):
+        return ("diff --git a/%s b/%s\n--- a/%s\n+++ b/%s\n@@ -1 +1,2 @@\n+%s\n"
+                % (path, path, path, path, added))
+
+    def fams(self, diff, title=""):
+        with tempfile.TemporaryDirectory() as d:
+            f = pathlib.Path(d) / "pr.diff"
+            f.write_text(diff)
+            return subprocess.run([sys.executable, str(TRIAGE), "rules", str(f), title],
+                                  capture_output=True, text=True).stdout
+
+    def test_a_flydsl_kernel_derives_the_kernel_rules(self):
+        out = self.fams(self.diff("aiter/ops/flydsl/kernels/moe_gemm_2stage.py"))
+        self.assertIn("flydsl-kernel", out)
+        for rule in ("A1", "D1", "D8", "P6"):
+            self.assertRegex(out, r"flydsl-kernel\s*\][^\n]*\b%s\b" % rule)
+
+    def test_it_does_not_claim_the_triton_mask_rule(self):
+        """B2 is `tl.load`/`tl.store` without a mask. There is no tl in FlyDSL."""
+        out = self.fams(self.diff("aiter/ops/flydsl/kernels/moe_gemm_2stage.py"))
+        line = [l for l in out.splitlines() if "flydsl-kernel" in l][0]
+        self.assertNotIn("B2", line)
+
+    def test_the_compile_result_family_still_fires_too(self):
+        out = self.fams(self.diff("aiter/ops/flydsl/kernels/moe_gemm_2stage.py"))
+        self.assertIn("[flydsl ", out)
+
+    def test_a_flydsl_file_outside_kernels_is_not_one(self):
+        """`aiter/ops/flydsl/utils.py` is a helper module, not a kernel."""
+        out = self.fams(self.diff("aiter/ops/flydsl/utils.py"))
+        self.assertNotIn("flydsl-kernel", out)
+
+    def test_a_non_python_file_under_kernels_is_left_to_the_c_path(self):
+        """`.cu`/`.cuh` already reach modified-kernel through is_kernel, whatever the path."""
+        out = self.fams(self.diff("aiter/ops/flydsl/kernels/foo.cuh", "+  int x = 1;"))
+        self.assertIn("modified-kernel", out)
+
+    def test_mapping_lists_the_new_family(self):
+        self.assertIn("flydsl-kernel", (SKILL_DIR / "MAPPING.md").read_text())
+

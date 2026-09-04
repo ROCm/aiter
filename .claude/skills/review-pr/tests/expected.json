@@ -64,7 +64,7 @@
   "symbols": []
  },
  "2565": {
-  "rules": "  files=6  types=7  rules=13/53\n    [tier2-dispatch      ] E5 E4\n    [fp8-quant           ] C1 C2 D1\n    [flydsl              ] D10 D10b\n    [downstream-op       ] E4 E5 A2\n    [codegen-buildtool   ] A1 D5 B6\n    [incomplete-code     ] HK7\n    [conditional-binding ] D1b\n",
+  "rules": "  files=6  types=8  rules=15/53\n    [tier2-dispatch      ] E5 E4\n    [fp8-quant           ] C1 C2 D1\n    [flydsl              ] D10 D10b\n    [flydsl-kernel       ] A1 D1 D8 P6\n    [downstream-op       ] E4 E5 A2\n    [codegen-buildtool   ] A1 D5 B6\n    [incomplete-code     ] HK7\n    [conditional-binding ] D1b\n",
   "symbols": []
  },
  "2577": {
@@ -80,7 +80,7 @@
   "symbols": []
  },
  "2725": {
-  "rules": "  files=5  types=10  rules=18/53\n    [new-routing-value   ] B4 C4\n    [tuning-config       ] D3 HK4\n    [dispatch-change     ] B1 B3 B4 A3\n    [tier2-dispatch      ] E5 E4\n    [async-stream        ] G1 G1b\n    [flydsl              ] D10 D10b\n    [layout-contiguity   ] D8 B7\n    [test-reference-dtype] HK10\n    [conditional-binding ] D1b\n    [defaulted-param     ] E2\n",
+  "rules": "  files=5  types=11  rules=21/53\n    [new-routing-value   ] B4 C4\n    [tuning-config       ] D3 HK4\n    [dispatch-change     ] B1 B3 B4 A3\n    [tier2-dispatch      ] E5 E4\n    [async-stream        ] G1 G1b\n    [flydsl              ] D10 D10b\n    [flydsl-kernel       ] A1 D1 D8 P6\n    [layout-contiguity   ] D8 B7\n    [test-reference-dtype] HK10\n    [conditional-binding ] D1b\n    [defaulted-param     ] E2\n",
   "symbols": []
  },
  "2898": {
@@ -140,7 +140,7 @@
   "symbols": []
  },
  "4114": {
-  "rules": "  files=16  types=16  rules=25/53\n    [new-routing-value   ] B4 C4\n    [dispatch-change     ] B1 B3 B4 A3\n    [tier1-import-chain  ] STEP4 E5\n    [api-signature       ] B6 E1 E5\n    [async-stream        ] G1 G1b\n    [flydsl              ] D10 D10b\n    [downstream-op       ] E4 E5 A2\n    [invariant-removed   ] D4 B7\n    [layout-contiguity   ] D8 B7\n    [alignment           ] B7 B2 D8\n    [temp-script         ] HK1\n    [test-reference-dtype] HK10\n    [dtype-assumed       ] C3\n    [conditional-binding ] D1b\n    [defaulted-param     ] E2\n    [scattered-diff      ] HK2\n",
+  "rules": "  files=16  types=17  rules=28/53\n    [new-routing-value   ] B4 C4\n    [dispatch-change     ] B1 B3 B4 A3\n    [tier1-import-chain  ] STEP4 E5\n    [api-signature       ] B6 E1 E5\n    [async-stream        ] G1 G1b\n    [flydsl              ] D10 D10b\n    [flydsl-kernel       ] A1 D1 D8 P6\n    [downstream-op       ] E4 E5 A2\n    [invariant-removed   ] D4 B7\n    [layout-contiguity   ] D8 B7\n    [alignment           ] B7 B2 D8\n    [temp-script         ] HK1\n    [test-reference-dtype] HK10\n    [dtype-assumed       ] C3\n    [conditional-binding ] D1b\n    [defaulted-param     ] E2\n    [scattered-diff      ] HK2\n",
   "symbols": []
  },
  "4166": {
@@ -154,7 +154,7 @@
   "symbols": []
  },
  "4254": {
-  "rules": "  files=13  types=14  rules=25/53\n    [new-routing-value   ] B4 C4\n    [tuning-config       ] D3 HK4\n    [dispatch-change     ] B1 B3 B4 A3\n    [tier1-import-chain  ] STEP4 E5\n    [fp8-quant           ] C1 C2 D1\n    [async-stream        ] G1 G1b\n    [flydsl              ] D10 D10b\n    [downstream-op       ] E4 E5 A2\n    [layout-contiguity   ] D8 B7\n    [alignment           ] B7 B2 D8\n    [test-reference-dtype] HK10\n    [dtype-assumed       ] C3\n    [conditional-binding ] D1b\n    [defaulted-param     ] E2\n",
+  "rules": "  files=13  types=15  rules=27/53\n    [new-routing-value   ] B4 C4\n    [tuning-config       ] D3 HK4\n    [dispatch-change     ] B1 B3 B4 A3\n    [tier1-import-chain  ] STEP4 E5\n    [fp8-quant           ] C1 C2 D1\n    [async-stream        ] G1 G1b\n    [flydsl              ] D10 D10b\n    [flydsl-kernel       ] A1 D1 D8 P6\n    [downstream-op       ] E4 E5 A2\n    [layout-contiguity   ] D8 B7\n    [alignment           ] B7 B2 D8\n    [test-reference-dtype] HK10\n    [dtype-assumed       ] C3\n    [conditional-binding ] D1b\n    [defaulted-param     ] E2\n",
   "symbols": [
    "UNRESOLVED-IMPORT: module 'aiter.ops.flydsl.utils' exists neither in the tree nor in this diff",
    "UNRESOLVED-IMPORT: module 'aiter.ops.flydsl.utils' exists neither in the tree nor in this diff"
@@ -177,7 +177,7 @@
   ]
  },
  "4441": {
-  "rules": "  files=6  types=12  rules=21/53\n    [new-routing-value   ] B4 C4\n    [tuning-config       ] D3 HK4\n    [dispatch-change     ] B1 B3 B4 A3\n    [ops-wrapper         ] B6\n    [async-stream        ] G1 G1b\n    [flydsl              ] D10 D10b\n    [downstream-op       ] E4 E5 A2\n    [layout-contiguity   ] D8 B7\n    [alignment           ] B7 B2 D8\n    [conditional-binding ] D1b\n    [defaulted-param     ] E2\n    [tp-shapes           ] P4\n",
+  "rules": "  files=6  types=13  rules=24/53\n    [new-routing-value   ] B4 C4\n    [tuning-config       ] D3 HK4\n    [dispatch-change     ] B1 B3 B4 A3\n    [ops-wrapper         ] B6\n    [async-stream        ] G1 G1b\n    [flydsl              ] D10 D10b\n    [flydsl-kernel       ] A1 D1 D8 P6\n    [downstream-op       ] E4 E5 A2\n    [layout-contiguity   ] D8 B7\n    [alignment           ] B7 B2 D8\n    [conditional-binding ] D1b\n    [defaulted-param     ] E2\n    [tp-shapes           ] P4\n",
   "symbols": [
    "UNRESOLVED-IMPORT: module 'aiter.ops.flydsl.utils' exists neither in the tree nor in this diff"
   ]
@@ -187,14 +187,14 @@
   "symbols": []
  },
  "4514": {
-  "rules": "  files=9  types=12  rules=20/53\n    [new-routing-value   ] B4 C4\n    [dispatch-change     ] B1 B3 B4 A3\n    [tier2-dispatch      ] E5 E4\n    [fp8-quant           ] C1 C2 D1\n    [flydsl              ] D10 D10b\n    [downstream-op       ] E4 E5 A2\n    [layout-contiguity   ] D8 B7\n    [alignment           ] B7 B2 D8\n    [incomplete-code     ] HK7\n    [test-reference-dtype] HK10\n    [conditional-binding ] D1b\n    [defaulted-param     ] E2\n",
+  "rules": "  files=9  types=13  rules=22/53\n    [new-routing-value   ] B4 C4\n    [dispatch-change     ] B1 B3 B4 A3\n    [tier2-dispatch      ] E5 E4\n    [fp8-quant           ] C1 C2 D1\n    [flydsl              ] D10 D10b\n    [flydsl-kernel       ] A1 D1 D8 P6\n    [downstream-op       ] E4 E5 A2\n    [layout-contiguity   ] D8 B7\n    [alignment           ] B7 B2 D8\n    [incomplete-code     ] HK7\n    [test-reference-dtype] HK10\n    [conditional-binding ] D1b\n    [defaulted-param     ] E2\n",
   "symbols": [
    "UNRESOLVED-IMPORT: module 'aiter.ops.flydsl.kernels.moe_gemm_2stage' exists neither in the tree nor in this diff",
    "UNRESOLVED-IMPORT: module 'aiter.ops.flydsl.kernels.moe_gemm_2stage' exists neither in the tree nor in this diff"
   ]
  },
  "4526": {
-  "rules": "  files=24  types=21  rules=33/53\n    [modified-kernel     ] A1 B2 D1 D8 P6\n    [tuning-config       ] D3 HK4\n    [dispatch-change     ] B1 B3 B4 A3\n    [tier2-dispatch      ] E5 E4\n    [api-signature       ] B6 E1 E5\n    [fp8-quant           ] C1 C2 D1\n    [async-stream        ] G1 G1b\n    [flydsl              ] D10 D10b\n    [downstream-op       ] E4 E5 A2\n    [codegen-buildtool   ] A1 D5 B6\n    [compile-contract    ] D6 D7\n    [invariant-removed   ] D4 B7\n    [memory-safety       ] B2 D1 G1\n    [layout-contiguity   ] D8 B7\n    [alignment           ] B7 B2 D8\n    [syspath-mutation    ] HK3\n    [incomplete-code     ] HK7\n    [conditional-binding ] D1b\n    [defaulted-param     ] E2\n    [tp-shapes           ] P4\n    [scattered-diff      ] HK2\n",
+  "rules": "  files=24  types=22  rules=33/53\n    [modified-kernel     ] A1 B2 D1 D8 P6\n    [tuning-config       ] D3 HK4\n    [dispatch-change     ] B1 B3 B4 A3\n    [tier2-dispatch      ] E5 E4\n    [api-signature       ] B6 E1 E5\n    [fp8-quant           ] C1 C2 D1\n    [async-stream        ] G1 G1b\n    [flydsl              ] D10 D10b\n    [flydsl-kernel       ] A1 D1 D8 P6\n    [downstream-op       ] E4 E5 A2\n    [codegen-buildtool   ] A1 D5 B6\n    [compile-contract    ] D6 D7\n    [invariant-removed   ] D4 B7\n    [memory-safety       ] B2 D1 G1\n    [layout-contiguity   ] D8 B7\n    [alignment           ] B7 B2 D8\n    [syspath-mutation    ] HK3\n    [incomplete-code     ] HK7\n    [conditional-binding ] D1b\n    [defaulted-param     ] E2\n    [tp-shapes           ] P4\n    [scattered-diff      ] HK2\n",
   "symbols": []
  },
  "4715": {
@@ -238,7 +238,7 @@
   "symbols": []
  },
  "5129": {
-  "rules": "  files=5  types=7  rules=17/53\n    [tuning-config       ] D3 HK4\n    [dispatch-change     ] B1 B3 B4 A3\n    [tier1-import-chain  ] STEP4 E5\n    [api-signature       ] B6 E1 E5\n    [fp8-quant           ] C1 C2 D1\n    [flydsl              ] D10 D10b\n    [downstream-op       ] E4 E5 A2\n",
+  "rules": "  files=5  types=8  rules=20/53\n    [tuning-config       ] D3 HK4\n    [dispatch-change     ] B1 B3 B4 A3\n    [tier1-import-chain  ] STEP4 E5\n    [api-signature       ] B6 E1 E5\n    [fp8-quant           ] C1 C2 D1\n    [flydsl              ] D10 D10b\n    [flydsl-kernel       ] A1 D1 D8 P6\n    [downstream-op       ] E4 E5 A2\n",
   "symbols": []
  },
  "5163": {

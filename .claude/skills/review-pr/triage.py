@@ -707,6 +707,15 @@ def derive(files, title="", raw_diff=""):
         hit("async-stream", "G1 G1b")
     if any("flydsl" in p.lower() for p in paths):
         hit("flydsl", "D10 D10b")
+    # KERNEL_PY lists the triton and gluon paths and stops there, so a FlyDSL kernel was a
+    # kernel to `flydsl` (D10, D10b -- compile-result handling) and to nothing else: 95 of
+    # 600 open PRs edit aiter/ops/flydsl/kernels/*.py and derive neither kernel family, so
+    # the sibling variant, the uninitialised accumulator, the missing contiguous check and
+    # the unmeasured cost were never asked about a whole backend. B2 stays out: it is
+    # `tl.load`/`tl.store` without a mask, and there is no tl in FlyDSL.
+    if any("aiter/ops/flydsl/kernels/" in p and p.endswith(".py") and (f["add"] or f["del"])
+           for p, f in files.items()):
+        hit("flydsl-kernel", "A1 D1 D8 P6")
     if any(d in p for p in paths for d in DOWNSTREAM):
         hit("downstream-op", "E4 E5 A2")   # A2 is the same shared-path condition
     if any("codegen" in p or p.startswith("csrc/cpp_itfs/") or p.endswith("Makefile")
