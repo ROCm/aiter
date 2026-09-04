@@ -14,8 +14,7 @@ from flydsl.expr.typing import (
 )
 from flydsl.expr.typing import Vector as Vec
 
-from aiter.ops.flydsl.kernels import buffer_ops
-
+from .. import buffer_ops
 from ..mxfp4_gemm_common import _lds_swizzle_mask as lds_swizzle_mask
 from ..mxfp4_gemm_common import (
     flat_buffer_view,
@@ -156,7 +155,7 @@ def issue_a_load_lds_dt(
 
 
 @flyc.jit
-def gemm2_compute_v2(
+def gemm2_compute(
     lds_base_i32,
     arg_ascale,
     arg_bq,
@@ -183,9 +182,13 @@ def gemm2_compute_v2(
     SBM=None,
     g2_bhoist=True,
     g2_ascale_pf=True,
+    g2_b2stage=True,
+    g2_deep_a_pipeline=False,
     expert_offset=0,
 ):
     """Run the GEMM2 K-loop and return accumulators for the selected epilogue."""
+    assert aStages == (4 if g2_deep_a_pipeline else kStages + 1)
+    assert not g2_deep_a_pipeline or g2_b2stage
     # SBM is the sort padding unit; BM is the compute tile and must divide SBM.
     if SBM is None:
         SBM = BM
@@ -217,6 +220,10 @@ def gemm2_compute_v2(
     num_n_blocks = N_OUT_rt // fx.Int32(BN)
     KH4 = K_rt // fx.Int32(8)  # i32 col stride (= K_HALF//4)
     K_SCALE_CHUNKS_MAX = INTER_MAX // 256
+    # Four A slots make read/write reuse distance two K tiles; one WG barrier
+    # can safely retire both slots instead of fencing every iteration.
+    kFenceEvery = (aStages - kStages) if g2_deep_a_pipeline else 1
+    assert kFenceEvery >= 1, "deep A pipeline needs aStages > kStages"
 
     # Padded shapes mask weight tiles beyond the real K/N extents.
     N_real = None
@@ -244,7 +251,8 @@ def gemm2_compute_v2(
     s_aq_base = lds_base_i32
     mma_atoms = scale_mma_atoms(a_dtype)
 
-    # A activation: global->LDS DMA (issue_a_load_lds), then LDS->reg ds-read (issue_a_ds_read).
+    # A uses separate global-to-LDS DMA and LDS-to-register ds-read stages;
+    # keeping that boundary explicit is required by the rotating LDS ring.
     A_NDW = (
         8 if is_f8_a else 4
     )  # fp8 packs two 128-K halves -> i32<8:1>; fp4 -> i32<4:1>
@@ -332,6 +340,7 @@ def gemm2_compute_v2(
     ascale_views = [make_ascale_view(sub) for sub in range_constexpr(kScaleSubBlocks)]
     sc_frag_tmpl = ascale_views[0][0, 0, 0, None]  # i32<1:1> (one e8m0 word)
 
+    # Fragment stores and scaled-MFMA atom state still require raw MLIR values.
     def load_a_scale_tile(kt):
         # One i32 A-scale register per 32-row chunk (kScaleSubBlocks).
         chunk_kt = (
@@ -373,10 +382,9 @@ def gemm2_compute_v2(
     ]
 
     frag_tmpl = fx.make_rmem_tensor(4, Int32)
-    # B-scale word template shares the A-scale layout (sc_frag_tmpl).
+    # B-scale uses the same one-word fragment layout as A-scale.
 
     def issue_b_load_into(bqf, bsf, kt_rt):
-        # Issue B-weight + B-scale vmem loads for K-tile kt_rt into the given (per-stage) fragments.
         for j in range_constexpr(numAccN):
             for half in range_constexpr(kHalves):
                 bq_off_dw = (
@@ -414,7 +422,8 @@ def gemm2_compute_v2(
             )
 
     def stream_b_tile(kt_rt):
-        # Fresh per-iter fragments (B streamed, not register-resident) then issue_b_load_into.
+        # B streams through fresh per-iteration fragments instead of occupying
+        # registers for the entire K loop.
         bqf = [
             [fx.make_fragment_like(frag_tmpl) for _ in range_constexpr(kHalves)]
             for _ in range_constexpr(numAccN)
@@ -423,7 +432,6 @@ def gemm2_compute_v2(
         issue_b_load_into(bqf, bsf, kt_rt)
         return bqf, bsf
 
-    # Scaled-MFMA clusters over the loaded A / B / scale fragments.
     def shift_scale_word(scale, kt_rt):
         if const_expr(tilesPerScaleChunk == 1):
             return scale
@@ -472,7 +480,8 @@ def gemm2_compute_v2(
                     k_halves=kHalves,
                 )
 
-    # C accumulator: register fragments, zeroed then accumulated in place; (un)packed to K-loop carry.
+    # C remains in register fragments; these helpers only serialize it into
+    # loop-carried state for the runtime K loop.
     zero4 = Vec.filled(4, 0.0, Float32)
     c_frags = [
         [fx.make_rmem_tensor(4, Float32) for _ in range_constexpr(numAccN)]
@@ -483,7 +492,11 @@ def gemm2_compute_v2(
             c_frags[i][J].store(zero4)
 
     def load_c_carry():
-        return [c_frags[i][J].load() for i in range(kMChunks) for J in range(numAccN)]
+        return [
+            c_frags[i][J].load()
+            for i in range_constexpr(kMChunks)
+            for J in range_constexpr(numAccN)
+        ]
 
     def store_c_carry(state):
         n = 0
@@ -493,8 +506,8 @@ def gemm2_compute_v2(
                 n += 1
         return n
 
-    if const_expr(BM == 64 and BN == 256):
-        # BM64/BN256 uses the 1-stage B path unconditionally.
+    if const_expr(BM == 64 and BN == 256 and not g2_b2stage):
+        # Explicit g2_b2stage=False retains the one-stage fallback.
         for kt_iv, state in range(
             fx.Int32(0),
             K_TILES_RT,
@@ -627,12 +640,17 @@ def gemm2_compute_v2(
             kt_rt = fx.Int32(kt_iv)
             if const_expr(g2_bhoist):
                 prefetch_next_b(kt_rt)
-            gpu.barrier()
-            issue_a_ds_read(kt_rt % fx.Int32(aStages))
+            if const_expr(g2_deep_a_pipeline):
+                if (kt_rt % fx.Int32(kFenceEvery)) == fx.Int32(0):
+                    gpu.barrier()
+            else:
+                gpu.barrier()
             nxt_a = kt_rt + fx.Int32(kStages)
+            issue_a_ds_read(kt_rt % fx.Int32(aStages))
             if nxt_a < K_TILES_RT:
                 issue_a_load_lds(nxt_a % fx.Int32(aStages), nxt_a)
-            # A-scale from the prefetch carry (g2_ascale_pf) or loaded synchronously here.
+            # Consume the prefetched A-scale carry or use the synchronous
+            # fallback when scale prefetching is disabled.
             if const_expr(g2_ascale_pf):
                 sa = [
                     Vec(cur_saf[sub].load())[0]
@@ -651,11 +669,12 @@ def gemm2_compute_v2(
             results = yield yield_carry()
         store_carry(results)
 
-    # Load the C fragments (fp8/fp4 unified onto the same fx.gemm path) and hand them to the epilog.
+    # Stage2 owns CShuffle and the P2P epilogue; return register accumulators.
     accm_vecs = [
-        [c_frags[i][J].load() for J in range(numAccN)] for i in range(kMChunks)
+        [c_frags[i][J].load() for J in range_constexpr(numAccN)]
+        for i in range_constexpr(kMChunks)
     ]
-    return accm_vecs, m_row, n_block_idx, N_OUT_rt
+    return accm_vecs, n_block_idx
 
 
 def _spart_output_tile_index(block_1d_id, M0, N0, group_num, m01):

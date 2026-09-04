@@ -259,12 +259,13 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
     e2e_ms = _time_graph(end_to_end, device, args.iters)
     sbm = int(moe._s1_active_tile_m)
     gemm2_bm = int(moe._g2_active_block_m)
+    grid_mult = int(moe._active_config.stage1.grid_mult)
     p2p_quant = moe._active_config.p2p_quant
     if rank == 0:
         print(
-            f"[MEGA-V2] bs={tokens} relL2={rel_l2:.6f} "
+            f"[MEGA] bs={tokens} relL2={rel_l2:.6f} "
             f"path={'fixed' if moe._s1_fixed_slot else 'compact'} "
-            f"p2p_quant={p2p_quant} SBM={sbm} G2_BM={gemm2_bm} "
+            f"p2p_quant={p2p_quant} SBM={sbm} G2_BM={gemm2_bm} GRID={grid_mult} "
             f"stage1={stage1_ms[0]:.4f}/{stage1_ms[1]:.4f}ms "
             f"stage2={stage2_ms[0]:.4f}/{stage2_ms[1]:.4f}ms "
             f"e2e={e2e_ms[0]:.4f}/{e2e_ms[1]:.4f}ms mean/max",
@@ -272,11 +273,11 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
         )
 
 
-def _run_burst(moe, x, weights, ids, depth, rank):
-    moe(x, weights, ids)
+def _run_burst(moe, x, weights, ids, depth, rank, config_tokens=None):
+    moe(x, weights, ids, config_tokens=config_tokens)
     _barrier()
     for _ in range(depth):
-        moe(x, weights, ids)
+        moe(x, weights, ids, config_tokens=config_tokens)
     torch.cuda.synchronize()
     if rank == 0:
         print(f"[BURST] completed={depth}/{depth}", flush=True)
@@ -328,17 +329,26 @@ def _install_config_policy(moe, config_tokens, unify_fields):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--network", choices=NETWORKS, default="v4_pro")
+    parser.add_argument("--quant", choices=("a4w4", "a8w4"), default="a8w4")
+    parser.add_argument(
+        "--stage2-p2p-quant",
+        choices=("auto", "none", "fp8_blockwise_1x32"),
+        default="auto",
+    )
     parser.add_argument("--bs-list", default="128")
     parser.add_argument("--iters", type=int, default=30)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--accuracy-max-bs", type=int, default=128)
-    parser.add_argument("--rtol", type=float, default=0.10)
+    parser.add_argument("--rtol", type=float)
     parser.add_argument("--max-tok-per-rank", type=int)
     parser.add_argument("--rank-tokens", default="")
     parser.add_argument("--config-tokens", type=int, default=0)
     parser.add_argument("--unify-fields", default="")
     parser.add_argument("--burst-depth", type=int, default=0)
+    parser.add_argument("--forward-config-tokens", type=int)
     args = parser.parse_args()
+    if args.rtol is None:
+        args.rtol = 0.25 if args.quant == "a4w4" else 0.10
     batch_sizes = [int(value) for value in args.bs_list.split(",")]
     if not batch_sizes or min(batch_sizes) <= 0:
         raise ValueError("--bs-list must contain positive integers")
@@ -395,12 +405,13 @@ def main():
             moe = MegaMoEV2(
                 rank=rank,
                 world_size=world,
-                quant="a8w4",
+                quant=args.quant,
                 w1=w1,
                 w1_scale=w1_scale,
                 w2=w2,
                 w2_scale=w2_scale,
                 max_tok_per_rank=max_tok_per_rank,
+                stage2_p2p_quant=args.stage2_p2p_quant,
                 **network,
             )
             _install_config_policy(moe, args.config_tokens, args.unify_fields)
@@ -425,7 +436,13 @@ def main():
             local_ids = ids[:local_batch_size].contiguous()
             if args.burst_depth:
                 _run_burst(
-                    moe, local_x, local_weights, local_ids, args.burst_depth, rank
+                    moe,
+                    local_x,
+                    local_weights,
+                    local_ids,
+                    args.burst_depth,
+                    rank,
+                    args.forward_config_tokens,
                 )
             else:
                 _run_size(

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Compare Mori EP and MegaMoEV2 with the same v4_pro A8W4 CUDA Graph workload."""
+"""Compare Mori EP and MegaMoE with the same v4_pro CUDA Graph workload."""
 
 from __future__ import annotations
 
