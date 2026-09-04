@@ -57,8 +57,10 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         ori_rows = static_cast<int64_t>(*num_rows) * num_cols_factor;
     }
     static constexpr int num_thread_per_group = group_size / thread_data_size;
-    int64_t row_offset       = static_cast<int64_t>(blockIdx.x) * block_size;
-    int64_t groupId          = (row_offset + threadIdx.x) / num_thread_per_group;
+    const int lane_in_group  = threadIdx.x % num_thread_per_group;
+    // Reused at the end as the scale-store index, which the shuffled layouts rewrite.
+    int64_t groupId          = static_cast<int64_t>(blockIdx.x) * block_size / num_thread_per_group
+                               + threadIdx.x / num_thread_per_group;
     int32_t scaleN           = ori_cols / group_size;
     // Shuffle tiles e8m0 bytes 8-wide along scaleN for the MX hardware
     // scale-load layout (group_size == 32 only); group_size == 128 shuffle
@@ -66,14 +68,40 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     int32_t scaleN_pad       = (use_e8m0_scale && shuffle_scale && group_size == 32)
                                    ? (((scaleN + 7) / 8) * 8)
                                    : scaleN;
-    int64_t x                = groupId / scaleN_pad;
-    int32_t y                = static_cast<int32_t>(groupId % scaleN_pad);
+    // Group ordering follows whichever stream is the scattered one.
+    //
+    // The scale store is one byte (or float) per group from a single lane, so its access
+    // pattern is decided entirely by how consecutive groups map to (x, y). Row-major order
+    // (consecutive groups walk y within a row) suits the plain `scale[groupId]` layout, but
+    // the transposed layout writes `y * ori_rows + x`, which then puts consecutive lanes
+    // `ori_rows` bytes apart -- one byte touched per cache line. Measured on gfx1250 at
+    // [16384, 7168] that scattering cost 4.8 us, 15% of the kernel, to move 0.9 MB.
+    //
+    // Column-major order (consecutive groups walk x at a fixed y) makes the transposed
+    // store contiguous instead. It strides the data reads across rows in exchange, but each
+    // group still reads one contiguous 256B run, so DRAM absorbs it: the fp32-scale variant
+    // measures unchanged either way. Net for the transposed path: 36.3 -> 32.0 us.
+    static constexpr bool kColumnMajorGroups =
+        use_e8m0_scale && shuffle_scale && group_size == 128;
+
+    // All four lanes of a group share a group id, hence the same (x, y), so the DPP reduce
+    // below never reads across an active/inactive lane boundary.
+    int64_t x;
+    int32_t y;
+    if constexpr(kColumnMajorGroups)
+    {
+        x = groupId % ori_rows;
+        y = static_cast<int32_t>(groupId / ori_rows);
+    }
+    else
+    {
+        x = groupId / scaleN_pad;
+        y = static_cast<int32_t>(groupId % scaleN_pad);
+    }
     if constexpr(use_e8m0_scale)
     {
         if(x >= ori_rows || y >= scaleN)
-        {
             return;
-        }
     }
     else
     {
@@ -81,7 +109,6 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
             return;
     }
 
-    row_offset  = x * ori_row_stride + y * group_size;
     using vec_i = opus::vector_t<DTYPE_I, thread_data_size>;
     static constexpr int32_t vec_size_o =
         std::is_same_v<DTYPE_O, opus::fp4_t> ? thread_data_size / 2 : thread_data_size;
@@ -92,8 +119,45 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     const float inverted_DTYPE_MAX =
         (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
 
-    auto const* input_vecs = reinterpret_cast<vec_i const*>(input + row_offset);
-    vec_i thread_data = input_vecs[threadIdx.x % num_thread_per_group];
+    // How a group's elements are split across its threads.
+    //
+    // The obvious split -- thread t takes the contiguous run [t*64B, +64B) -- strides the
+    // lanes of a load 64B apart, so one b128 pulls 16B out of each of 32 separate 64B
+    // segments and nothing merges; the matching store covers 16B of every 32B. Handing each
+    // thread two 32B chunks instead (chunks t and t+ntpg) halves both strides: a load
+    // covers 16B of every 32B and the store becomes fully contiguous across a group.
+    //
+    // 32B is the sweet spot, not 16B. b128 is the widest per-lane access gfx1250 has (no
+    // b256), so a 16B chunk would make the loads perfectly contiguous but shrink the fp8
+    // store to 8B per lane -- 4x buffer_store_b64 instead of 2x b128. Measured, that trade
+    // lost: the store side gave back more than the load side gained.
+    //
+    // The elements a thread holds are no longer contiguous within the group, but nothing
+    // downstream cares: amax is order-independent, and store_vector's interleave mode lays
+    // the output back down in exactly this pattern.
+    static constexpr int kChunkElems = 32 / static_cast<int>(sizeof(DTYPE_I));
+    static constexpr int kChunks     = kChunkElems ? thread_data_size / kChunkElems : 0;
+    static constexpr bool kInterleavedChunks =
+        !std::is_same_v<DTYPE_O, opus::fp4_t> && sizeof(DTYPE_I) == 2 && kChunkElems > 0 &&
+        thread_data_size % kChunkElems == 0 && kChunks > 1;
+
+    DTYPE_I const* gbase = input + x * ori_row_stride + y * group_size;
+    vec_i thread_data;
+    if constexpr(kInterleavedChunks)
+    {
+        using chunk_t = opus::vector_t<DTYPE_I, kChunkElems>;
+        auto const* chunks = reinterpret_cast<chunk_t const*>(gbase);
+        opus::static_for<kChunks>([&](auto i) {
+            chunk_t c = chunks[lane_in_group + i.value * num_thread_per_group];
+            opus::static_for<kChunkElems>(
+                [&](auto j) { thread_data[i.value * kChunkElems + j.value] = c[j.value]; });
+        });
+    }
+    else
+    {
+        thread_data = reinterpret_cast<vec_i const*>(gbase)[lane_in_group];
+    }
+
     float absMax      = 1e-10f;
     for(size_t j = 0; j < thread_data_size; j++)
     {
@@ -125,50 +189,99 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     {
         inverted_scale = absMax * inverted_DTYPE_MAX;
     }
-    row_offset           = std::is_same_v<DTYPE_O, opus::fp4_t>
-                               ? groupId * group_size / 2 + (threadIdx.x % num_thread_per_group) * vec_size_o
-                               : groupId * group_size + (threadIdx.x % num_thread_per_group) * vec_size_o;
-    if(threadIdx.x % num_thread_per_group == 0)
+    // The output is always laid out row-major, whatever order the groups were walked in,
+    // so index it by (x, y) rather than by the raw linear group id -- under
+    // kColumnMajorGroups that id counts down a column and would scatter the data store.
+    const int64_t out_group = kColumnMajorGroups ? (x * scaleN_pad + y) : groupId;
+    // Interleaved layout: this thread's first chunk sits at lane * kChunkElems, and
+    // store_vector's interleave mode strides the rest by num_thread_per_group chunks.
+    static constexpr int kLaneStride = kInterleavedChunks ? kChunkElems : vec_size_o;
+    const int64_t row_offset = std::is_same_v<DTYPE_O, opus::fp4_t>
+                               ? out_group * group_size / 2 + lane_in_group * kLaneStride
+                               : out_group * group_size + lane_in_group * kLaneStride;
+    // The scale write is deferred to the very end of the kernel, but its ADDRESS and VALUE
+    // are resolved here, before the conversion. Leaving that arithmetic in the tail put it
+    // right after the data stores, where it reused their address and data VGPRs and forced
+    // the compiler to guard them with `s_wait_xcnt 0x0` -- a wait for every outstanding
+    // VMEM to read its operands. An ATT capture charged 18% of the kernel's total latency
+    // to that single wait. Resolved up front, the tail is a bare store with nothing after
+    // it to clobber, at a cost of three VGPRs held live across the conversion.
+    //
+    // A null `scale_dst` doubles as the "not the group's first lane" predicate.
+    const float row_scale = inverted_scale;
+    using scale_elem_t    = std::conditional_t<use_e8m0_scale, uint8_t, float>;
+    scale_elem_t* scale_dst = nullptr;
+    scale_elem_t  scale_val{};
+    if(lane_in_group == 0)
     {
+        int64_t scale_idx = groupId;
+        if constexpr(shuffle_scale)
+        {
+            if constexpr(use_e8m0_scale && group_size == 32)
+                scale_idx = aiter::mx_scale_shuffle_idx(scaleN_pad, static_cast<int>(x), y);
+            else
+                scale_idx = y * ori_rows + x;
+        }
         if constexpr(use_e8m0_scale)
         {
-            auto* tmp        = reinterpret_cast<uint8_t*>(scale);
-            uint8_t exponent = (__builtin_bit_cast(uint32_t, inverted_scale) >> 23) & 0b11111111;
-            if constexpr(shuffle_scale)
-            {
-                if constexpr(group_size == 32)
-                    groupId = aiter::mx_scale_shuffle_idx(scaleN_pad, static_cast<int>(x), y);
-                else
-                    groupId = y * ori_rows + x;
-            }
-            tmp[groupId] = exponent;
+            scale_dst = reinterpret_cast<uint8_t*>(scale) + scale_idx;
+            scale_val = static_cast<uint8_t>(
+                (__builtin_bit_cast(uint32_t, row_scale) >> 23) & 0b11111111);
         }
         else
         {
-            if constexpr(shuffle_scale)
-            {
-                groupId = y * ori_rows + x;
-            }
-            scale[groupId] = inverted_scale;
+            scale_dst = scale + scale_idx;
+            scale_val = row_scale;
         }
     }
-    // The reciprocal is required by the store path, not by the scale-derivation
-    // mode: fp4 store uses the hardware `cvt_scalef32_pk_fp4_f32` intrinsic
-    // which consumes the e8m0 byte directly (so `inverted_scale` stays as the
-    // scale factor `pow2_amax / max_pow2`); fp8/i8 store does software
-    // `input * inv_scale` and therefore needs `inv_scale = 1 / row_scale`
-    // regardless of whether `row_scale` was derived via e8m0 (power-of-2)
-    // or the continuous `absMax * inv_DTYPE_MAX` formula. Earlier this gate
-    // was on `use_e8m0_scale` which silently skipped the reciprocal for the
-    // fp8 + e8m0 path and produced fp8 bytes ~2x off (`split_elem_err ≈ 100%`).
-    inverted_scale =
-        std::is_same_v<DTYPE_O, opus::fp4_t> ? inverted_scale : 1.0f / inverted_scale;
+    // Which form of the scale the store path consumes:
+    //   - fp4 takes `row_scale` directly, via `cvt_scalef32_pk_fp4_f32`.
+    //   - kStoreTakesDivisor: `scaled_cast_div` also takes `row_scale` directly, which lets
+    //     gfx1250 lower bf16 -> fp8 to `v_cvt_scalef32_pk8_fp8_bf16` -- 8 elements per
+    //     instruction, replacing the per-element fma_mix + med3 and per-pair cvt_pk chain
+    //     (90 instructions -> 4 at thread_data_size 32) and the fp32 divide below with it.
+    //   - everything else does software `input * inv_scale`, so it needs the reciprocal.
+    //
+    // use_e8m0_scale is a correctness precondition here, not a tuning gate: that hardware
+    // convert reads its scale operand as an MX E8M0 factor, keeping the exponent bits and
+    // discarding the mantissa, so it is exact iff the row scale is a power of two. The
+    // continuous `absMax * inv_DTYPE_MAX` scale is not, and gets silently truncated to the
+    // enclosing power of two -- measured 1.79x off, with the large codes saturating to NaN.
+    //
+    // Conversely the reciprocal must stay gated on the store form and not on
+    // use_e8m0_scale: gating it that way once skipped the reciprocal for fp8 + e8m0 on the
+    // software path and produced fp8 bytes ~2x off (`split_elem_err ≈ 100%`).
+    static constexpr bool kStoreTakesDivisor =
+        use_e8m0_scale && std::is_same_v<DTYPE_O, opus::fp8_t> &&
+        std::is_same_v<DTYPE_I, opus::bf16_t> && (thread_data_size % 8 == 0);
+    if constexpr(!std::is_same_v<DTYPE_O, opus::fp4_t> && !kStoreTakesDivisor)
+    {
+        inverted_scale = 1.0f / inverted_scale;
+    }
 
     using DTYPE_STORE = std::conditional_t<std::is_same_v<DTYPE_O, opus::fp4_t>, uint8_t, DTYPE_O>;
     auto* out_ptr     = reinterpret_cast<DTYPE_STORE*>(out);
     auto buffer_o = opus::make_gmem<DTYPE_STORE>(out_ptr, oob_size);
 
-    store_vector<DTYPE_STORE, DTYPE_I, thread_data_size, RT, false, WARP_SIZE, 1, DTYPE_O>(buffer_o, thread_data, row_offset, inverted_scale);
+    if constexpr(kInterleavedChunks)
+    {
+        store_vector<DTYPE_STORE, DTYPE_I, thread_data_size, RT, true, num_thread_per_group,
+                     kChunks, DTYPE_O, kStoreTakesDivisor>(
+            buffer_o, thread_data, row_offset, inverted_scale);
+    }
+    else
+    {
+        store_vector<DTYPE_STORE, DTYPE_I, thread_data_size, RT, false, WARP_SIZE, 1, DTYPE_O,
+                     kStoreTakesDivisor>(buffer_o, thread_data, row_offset, inverted_scale);
+    }
+
+    // Scale write, deferred to last on purpose: address and value were resolved above, so
+    // this is a bare store with no arithmetic after it competing for the data stores'
+    // registers. See the note at `scale_dst`.
+    if(scale_dst != nullptr)
+    {
+        *scale_dst = scale_val;
+    }
 }
 
 __global__ void initializeScale(float *d_data, int size, float value)
@@ -745,11 +858,19 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
         DISPATCH_GROUP_SIZE(cols,
             static constexpr int thread_data_size     = 32;
             static constexpr int num_thread_per_group = _GS / thread_data_size;
-            static constexpr int32_t dynGroupQuantBlockSize = 64;
-            const int num_group_per_tg = dynGroupQuantBlockSize / num_thread_per_group;
             auto launch_group_quant = [&](auto out_type_tag, int ori_cols, int ori_rows, int num_group, auto shuffle_tag) {
                 using out_t = decltype(out_type_tag);
                 constexpr bool ss = decltype(shuffle_tag)::value;
+            // Block size follows the group ordering, which is what decides whether a bigger
+            // block helps or hurts. Row-major order walks y inside a row, so a wider block
+            // just reads a longer contiguous run -- measured 28.7 -> 26.4 us going 64 ->
+            // 256. Column-major order (the transposed-scale layout) walks x instead, so a
+            // wider block spans more rows, each a separate 256B run ori_row_stride apart,
+            // and the lost read locality outweighs the saved launch overhead: 27.0 -> 27.7.
+                constexpr bool kColMajor =
+                    std::is_same_v<out_t, opus::fp4_t> && ss && _GS == 128;
+                static constexpr int32_t dynGroupQuantBlockSize = kColMajor ? 64 : 256;
+                const int num_group_per_tg = dynGroupQuantBlockSize / num_thread_per_group;
                 static constexpr int32_t ooba = 4 / sizeof(out_t);
                 const int64_t oob_elems =
                     (static_cast<int64_t>(ori_rows) * ori_cols + ooba - 1) / ooba * ooba;
@@ -879,16 +1000,23 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
     DISPATCH_GROUP_SIZE(group_size,
         static constexpr int thread_data_size     = 32;
         static constexpr int num_thread_per_group = _GS / thread_data_size;
-        static constexpr int32_t dynGroupQuantBlockSize = 64;
-        const int num_group_per_tg = dynGroupQuantBlockSize / num_thread_per_group;
-
         int scaleN    = cols / _GS;
-        dim3 const block(dynGroupQuantBlockSize);
 
         auto launch = [&](auto out_type_tag, auto shuffle_tag, auto e8m0_tag) {
             using out_t = decltype(out_type_tag);
             constexpr bool ss = decltype(shuffle_tag)::value;
             constexpr bool ee = decltype(e8m0_tag)::value;
+            // Block size follows the group ordering, which is what decides whether a bigger
+            // block helps or hurts. Row-major order walks y inside a row, so a wider block
+            // just reads a longer contiguous run -- measured 28.7 -> 26.4 us going 64 ->
+            // 256. Column-major order (the transposed-scale layout) walks x instead, so a
+            // wider block spans more rows, each a separate 256B run ori_row_stride apart,
+            // and the lost read locality outweighs the saved launch overhead: 27.0 -> 27.7.
+            constexpr bool kColMajor =
+                (std::is_same_v<out_t, opus::fp4_t> || ee) && ss && _GS == 128;
+            static constexpr int32_t dynGroupQuantBlockSize = kColMajor ? 64 : 256;
+            const int num_group_per_tg = dynGroupQuantBlockSize / num_thread_per_group;
+            dim3 const block(dynGroupQuantBlockSize);
             // e8m0 + shuffle pads scaleN up to a multiple of 8 (tile width)
             // for the MX hw layout (_GS == 32 only); group_size == 128
             // shuffle is a plain transpose, no padding.
