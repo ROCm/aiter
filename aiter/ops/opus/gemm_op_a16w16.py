@@ -90,6 +90,15 @@ def _opus_gemm_a16w16_tune_raw(
 ) -> torch.Tensor: ...
 
 
+def _is_missing_tuned_kernel(error: RuntimeError) -> bool:
+    message = str(error)
+    return (
+        "Kernel id " in message
+        and "a16w16" in message
+        and "tune lookup table" in message
+    )
+
+
 def _check_a16w16_tune_layout(XQ: torch.Tensor, WQ: torch.Tensor, Y: torch.Tensor):
     """Reject layouts that the opus launcher's hardcoded strides cannot serve.
 
@@ -654,7 +663,17 @@ def gemm_a16w16_opus(
         # Both bf16 and fp32 Y are now valid for splitk kids (the reduce
         # kernel handles the cast / passthrough), so no Y.dtype gating is
         # needed here -- always honor the tuned winner.
-        opus_gemm_a16w16_tune(XQ, WQ, Y, bias, kid, int(cfg["splitK"]))
+        try:
+            opus_gemm_a16w16_tune(XQ, WQ, Y, bias, kid, int(cfg["splitK"]))
+        except RuntimeError as error:
+            if not _is_missing_tuned_kernel(error):
+                raise
+            logger.warning(
+                "Opus tuned config selected kernel %d, but it is absent from "
+                "the loaded module; falling back to the Opus heuristic.",
+                kid,
+            )
+            _opus_gemm_bf16_dispatch(XQ, WQ, Y, None, None, None, bias)
         return _finalize_output(Y, reshape_out_to_2d)
 
     # 3) CSV miss: fall through to the C++ heuristic dispatcher via
