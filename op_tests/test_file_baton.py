@@ -187,16 +187,14 @@ class TestFileBaton(unittest.TestCase):
 
             self.assertIsNotNone(guard)
             self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o666)
-            self.assertEqual(
-                stat.S_IMODE(os.stat(path + ".steal.flock").st_mode), 0o666
-            )
+            self.assertEqual(stat.S_IMODE(os.stat(path + ".steal").st_mode), 0o666)
             baton._release_steal_guard(guard)
             baton.release()
 
     def test_lock_paths_are_shared_before_atomic_publication(self):
         with tempfile.TemporaryDirectory() as tempdir:
             path = os.path.join(tempdir, "build.lock")
-            guard_path = path + ".steal.flock"
+            guard_path = path + ".steal"
             published = []
             real_link = os.link
 
@@ -264,7 +262,8 @@ class TestFileBaton(unittest.TestCase):
                 guard = baton._try_acquire_steal_guard()
 
             self.assertIsNotNone(guard)
-            self.assertTrue(os.path.exists(legacy_guard_path + ".flock"))
+            with open(legacy_guard_path, "rb") as migrated_guard:
+                self.assertEqual(migrated_guard.read(), b"flock\n")
             baton._release_steal_guard(guard)
 
     def test_live_preversioned_flock_guard_is_still_honored(self):
