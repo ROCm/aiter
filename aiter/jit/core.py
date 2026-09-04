@@ -1141,6 +1141,32 @@ def build_module(
             f"\033[32mfinish build [{md_name}], cost {time.perf_counter() - startTS:.1f}s \033[0m"
         )
 
+    _orig_final_func = FinalFunc
+
+    def FinalFunc():
+        _orig_final_func()
+        # Shared-filesystem (NFS/Lustre) barrier: the build lock only serializes
+        # *who* compiles, not when the freshly-written .so becomes visible to a
+        # peer rank on another node. mp_lock releases the lock right after this
+        # runs, so fsync the .so and its directory here to guarantee the artifact
+        # is durably visible before any waiter returns from baton.wait() and
+        # imports it (otherwise the waiter can hit ModuleNotFoundError).
+        try:
+            so_path = f"{get_user_jit_dir()}/{target_name}"
+            if os.path.exists(so_path):
+                fd = os.open(so_path, os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                dir_fd = os.open(get_user_jit_dir(), os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+        except OSError as e:
+            logger.warning(f"[{md_name}] fsync after build failed: {e}")
+
     mp_lock(lockPath=lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
 
 
