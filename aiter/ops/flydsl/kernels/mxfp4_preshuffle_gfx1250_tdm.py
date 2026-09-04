@@ -32,6 +32,7 @@ from .mega_moe_gfx1250.tdm_gather_shim import (
 from .quant_utils import (
     emit_amax_e8m0_native_scale,
     emit_cvt_scalef32_pk8_fp4_bf16,
+    emit_cvt_scalef32_pk8_fp4_f32,
     emit_cvt_scalef32_pk8_fp8_f32,
 )
 from .tensor_shim import (
@@ -41,6 +42,30 @@ from .tensor_shim import (
 )
 
 TDM_DESCRIPTOR_VERSION = 1
+
+# MXFP8 combine wire format (``ep_quant_bits``): a slot holds two planes, N
+# payload bytes followed by N/32 e8m0 scale bytes. The block is 32 elements,
+# fixed rather than tied to tile_n so the wire does not drift with the GEMM
+# tuning table.
+#
+# The planes used to be interleaved per 256-element chunk, each chunk padded to
+# 384 bytes so payload and scale formed one cache-line-aligned interval that a
+# single TDM descriptor moved together. That pad was 33% of the wire. Splitting
+# the planes drops it and costs a second gather-store here plus a second TDM
+# load in the reduce.
+#
+# Only the reduce's read gets smaller. A tile contributes tile_n/32 scale bytes
+# per row, far under the 128-byte store granularity, so this side writes the
+# same number of lines either way: splitting a chunk's store into 256B+8B
+# rather than 256B+128B moved 82.6MB less and ran within noise (1089.1 vs
+# 1084.9us). Both plane bases stay line-aligned -- N is a multiple of 128 and
+# the slot stride is a power of two -- and that must not slip; an earlier
+# 272-byte chunk pitch started every row mid-line and cost 123us/layer at 16k
+# tokens/rank despite moving 41% fewer bytes.
+EP_SCALE_BLOCK = 32
+# GEMM2 has no activation, so one acc holds 8 f32 -> 2 wn subtiles per lane give
+# 16 values, and the two kgrp halves merge into the full 32-element MX block.
+WN_PER_MX_BLOCK_EP = 2
 
 
 @flyc.jit
@@ -80,6 +105,7 @@ def launch_gemm_a8w4_tdm(
     ep_slot_stride_bytes: Constexpr[int] = 0,
     ep_destination_stride: Constexpr[int] = 0,
     ep_world_size: Constexpr[int] = 0,
+    ep_quant_bits: Constexpr[int] = 0,
     arg_ep_row_map: fx.Tensor = None,
     f32_situ_beta: fx.Float32 = 1.0,
     f32_situ_linear_beta: fx.Float32 = 1.0,
@@ -146,6 +172,7 @@ def launch_gemm_a8w4_tdm(
         ep_slot_stride_bytes,
         ep_destination_stride,
         ep_world_size,
+        ep_quant_bits,
     )
     _ = cache_tag
     if enable_ep_scatter:
@@ -153,6 +180,25 @@ def launch_gemm_a8w4_tdm(
             raise ValueError("enable_ep_scatter is gemm2-only (stage1_act must be 0)")
         if stage1_quant_out:
             raise ValueError("enable_ep_scatter is incompatible with stage1_quant_out")
+    if ep_quant_bits not in (0, 8, 4):
+        raise ValueError(f"ep_quant_bits must be 0, 8 or 4, got {ep_quant_bits}")
+    if ep_quant_bits:
+        if not enable_ep_scatter:
+            raise ValueError("ep_quant_bits requires enable_ep_scatter")
+        # A tile row must hold whole scale blocks, else its slice of the scale
+        # plane is not a whole number of bytes. 128 rather than EP_SCALE_BLOCK so
+        # the tile's slice of each plane also starts on a cache line. The tuning
+        # table only emits tile_n2 in {256, 512}, but env overrides (*_N2) bypass
+        # it.
+        if tile_n % 256 != 0:
+            raise ValueError(f"ep_quant_bits requires tile_n % 256 == 0, got {tile_n}")
+        # Each MX block is WN_PER_MX_BLOCK_EP wn-subtiles wide (2 kgrp halves
+        # merged by the shuffle_xor(16) inside emit_amax_e8m0_native_scale).
+        if (tile_n // n_warp // 16) % WN_PER_MX_BLOCK_EP != 0:
+            raise ValueError(
+                "ep_quant_bits requires wmma_n_rep % "
+                f"{WN_PER_MX_BLOCK_EP} == 0, got {tile_n // n_warp // 16}"
+            )
     warp_tile_m = tile_m // m_warp
     warp_tile_n = tile_n // n_warp
     wmma_m_rep = warp_tile_m // WMMA_M
@@ -189,18 +235,31 @@ def launch_gemm_a8w4_tdm(
     PITCH = ((STAGE_A + STAGE_B + STAGE_SA + STAGE_SB + 511) // 512) * 512
 
     out_elem = T.f16 if out_is_f16 else T.bf16
+
     # +16 cols: the bf16 passthrough epilogue stages C with a padded row pitch
     # to break the ds_store bank conflict; reserve it so the padded tile fits.
     # The scatter epilogue instead pads to the smallest 16B-aligned row that is
     # not a multiple of 32B, the least padding the gather-store descriptor can
     # take while still spreading the b128 writes off one bank.
     # Ternaries, not if/else: @flyc.jit does not let branch-local names escape.
-    C_ROW_BYTES = tile_n * 2
-    _lds_row_bytes = ((C_ROW_BYTES + 15) // 16) * 16
-    _lds_row_bytes = _lds_row_bytes + (16 if _lds_row_bytes % 32 == 0 else 0)
+    # Quantized rows are payload bytes, not bf16 elements, and their scale plane
+    # is staged in a second region sitting right behind the payload one.
+    def _lds_pitch(nbytes):
+        p = ((nbytes + 15) // 16) * 16
+        return p + (16 if p % 32 == 0 else 0)
+
+    C_ROW_BYTES = tile_n * ep_quant_bits // 8 if ep_quant_bits else tile_n * 2
+    EP_SCALE_ROW_BYTES = tile_n // EP_SCALE_BLOCK
+    _lds_row_bytes = _lds_pitch(C_ROW_BYTES)
+    _lds_scale_row_bytes = _lds_pitch(EP_SCALE_ROW_BYTES) if ep_quant_bits else 0
+    _ep_scale_lds_off = tile_m * _lds_row_bytes
     c_lds_pad_elems = (_lds_row_bytes - C_ROW_BYTES) // 2 if enable_ep_scatter else 0
     store_pad = c_lds_pad_elems if enable_ep_scatter else 16
-    C_STORE_B = ((tile_m * (tile_n + store_pad) * 2 + 127) // 128) * 128
+    C_STORE_B = (
+        ((_ep_scale_lds_off + tile_m * _lds_scale_row_bytes + 127) // 128) * 128
+        if ep_quant_bits
+        else ((tile_m * (tile_n + store_pad) * 2 + 127) // 128) * 128
+    )
     ARENA_B = max(num_buffers * PITCH, C_STORE_B)
 
     # Quant epilogue compile-time constants.
@@ -225,11 +284,12 @@ def launch_gemm_a8w4_tdm(
         f"_wpt{num_waves_per_tensor_tdm}" if num_waves_per_tensor_tdm != 2 else ""
     )
     _ep = "_epscatter" if enable_ep_scatter else ""
+    _epq = f"_epq{ep_quant_bits}" if ep_quant_bits else ""
     _kname = (
         f"a8w4_tdm_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_K{K}"
-        f"{_grouped}{_act}{_bias}{_qout}{_cl}{_next_stage}{_waves_per_tensor}{_ep}"
+        f"{_grouped}{_act}{_bias}{_qout}{_cl}{_next_stage}{_waves_per_tensor}{_ep}{_epq}"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
@@ -670,8 +730,10 @@ def launch_gemm_a8w4_tdm(
         # activations: 4 is safe for both, 16 costs 2.5%; 2..8 is within noise.
         MMA_GROUP = 4
         # WMMA held back as a closing pure-MFMA group, covering the next k128's
-        # REUSE fence; the prefetch reads interleave evenly over the rest.
-        FENCE_COVER_MMA = 8
+        # REUSE fence; the prefetch reads interleave evenly over the rest. Narrow
+        # tiles can have n_acc as low as the tail itself, so clamp it to keep at
+        # least one group for the interleaved part.
+        FENCE_COVER_MMA = min(8, max(0, n_acc - MMA_GROUP))
 
         def mma_rows(wm_list, act, wt, sa_k, sb_k):
             for i in range_constexpr(len(wm_list)):
@@ -1236,64 +1298,157 @@ def launch_gemm_a8w4_tdm(
                         ].bitcast(fx.Float32)
                         for wm in range_constexpr(wmma_m_rep)
                     ]
-                for wm in range_constexpr(wmma_m_rep):
-                    row_rel = wmb + wm * 16 + lane16
-                    for wn in range_constexpr(output_n_rep):
-                        col_rel = wnb + wn * 16 + kgrp * 8
-                        acc = Vec(accs[wm * output_n_rep + wn])
-                        if const_expr(has_bias):
-                            acc = acc + Vec(
-                                fx.ptr_load(
-                                    bias_map + expert * i32_n + col_rel,
-                                    result_type=T.vec(8, out_elem),
-                                )
-                            ).to(fx.Float32)
-                        if const_expr(stage1_act):
-                            if const_expr(is_situv2):
-                                act_vals = [
-                                    fused_situv2_elem(
-                                        acc[2 * p],
-                                        acc[2 * p + 1],
-                                        consts=situ_c,
-                                    )
-                                    for p in range_constexpr(4)
-                                ]
-                            else:
-                                act_vals = [
-                                    fused_silu_swiglu_elem(
-                                        acc[2 * p],
-                                        acc[2 * p + 1],
-                                        swiglu=is_swiglu,
-                                        limit_f32=f32_swiglu_limit,
-                                        neg_limit_f32=neg_limit,
-                                    )
-                                    for p in range_constexpr(4)
-                                ]
-                            hv = Vec.from_elements(act_vals, fx.Float32).to(oc)
-                            lds_store_b64(
-                                stC_idx,
-                                (row_rel * STORE_N + col_rel // 2) * 2,
-                                hv.bitcast(fx.Int32).ir_value(),
+                if const_expr(ep_quant_bits):
+                    # MX staging. The per-32 block amax is reduced across the
+                    # kgrp lane pair by the shuffle_xor(16) inside
+                    # emit_amax_e8m0_native_scale, so quantization has to happen
+                    # HERE, in registers: once the values reach LDS they are
+                    # scattered by column and can no longer be reduced. What
+                    # lands in LDS is already wire bytes, so the TDM store below
+                    # is a pure move.
+                    _v2i32_ty = T.vec(2, T.i32)
+                    _mx_dt = (
+                        MxDtype.FP8_E4M3 if ep_quant_bits == 8 else MxDtype.FP4_E2M1
+                    )
+                    _n_mx_blks = output_n_rep // WN_PER_MX_BLOCK_EP
+                    _is_kgrp0 = fx.Int32(kgrp) == fx.Int32(0)
+                    _p8_scale = fx.PointerType.get(
+                        elem_ty=fx.Int8.ir_type,
+                        address_space=fx.AddressSpace.Shared,
+                        alignment=1,
+                    )
+                    _scale_lds = fx.recast_iter(_p8_scale, base_ptr)
+                    for wm in range_constexpr(wmma_m_rep):
+                        row_rel = wmb + wm * 16 + lane16
+                        _wf = _wf_rows[wm]
+                        _row_byte = row_rel * _lds_row_bytes
+                        for mx_blk in range_constexpr(_n_mx_blks):
+                            _vals = []
+                            for sub_wn in range_constexpr(WN_PER_MX_BLOCK_EP):
+                                wn = mx_blk * WN_PER_MX_BLOCK_EP + sub_wn
+                                col_rel = wnb + wn * 16 + kgrp * 8
+                                acc = Vec(accs[wm * output_n_rep + wn])
+                                if const_expr(has_bias):
+                                    acc = acc + Vec(
+                                        fx.ptr_load(
+                                            bias_map + expert * i32_n + col_rel,
+                                            result_type=T.vec(8, out_elem),
+                                        )
+                                    ).to(fx.Float32)
+                                # Weight before quantizing: combine sums unweighted.
+                                for i in range_constexpr(8):
+                                    _vals.append(acc[i] * _wf)
+                            _scale_f32, _e8m0 = emit_amax_e8m0_native_scale(
+                                _vals, wave_size=WAVE, dtype=_mx_dt
                             )
-                        else:
-                            if const_expr(enable_ep_scatter):
-                                # Weight the row BEFORE truncating to bf16; the
-                                # combine kernel does an unweighted sum.
-                                _wf = _wf_rows[wm]
-                                hv = Vec.from_elements(
-                                    [acc[i] * _wf for i in range_constexpr(8)],
+                            for sub_wn in range_constexpr(WN_PER_MX_BLOCK_EP):
+                                wn = mx_blk * WN_PER_MX_BLOCK_EP + sub_wn
+                                col_rel = wnb + wn * 16 + kgrp * 8
+                                _src8 = Vec.from_elements(
+                                    _vals[sub_wn * 8 : sub_wn * 8 + 8],
                                     fx.Float32,
-                                ).to(oc)
+                                ).ir_value()
+                                # col_rel is a multiple of 8, so the byte column
+                                # lands 8-aligned on the fp8 wire and 4-aligned
+                                # on the fp4 one.
+                                if const_expr(ep_quant_bits == 8):
+                                    lds_store_b64(
+                                        stC_idx,
+                                        _row_byte + col_rel,
+                                        emit_cvt_scalef32_pk8_fp8_f32(
+                                            _src8,
+                                            _scale_f32,
+                                            v2i32_ty=_v2i32_ty,
+                                            rocdl=rocdl,
+                                        ),
+                                    )
+                                else:
+                                    lds_store_b32(
+                                        stC_idx,
+                                        _row_byte + col_rel // 2,
+                                        Vec.from_elements(
+                                            [
+                                                emit_cvt_scalef32_pk8_fp4_f32(
+                                                    _src8,
+                                                    _scale_f32,
+                                                    i32_ty=T.i32,
+                                                    rocdl=rocdl,
+                                                )
+                                            ],
+                                            fx.Int32,
+                                        ),
+                                    )
+                            # Both kgrp lanes hold the same block scale; one stores.
+                            _sc_col = wnb + mx_blk * WN_PER_MX_BLOCK_EP * 16
+                            if _is_kgrp0:
+                                fx.ptr_store(
+                                    _e8m0,
+                                    _scale_lds
+                                    + (
+                                        row_rel * _lds_scale_row_bytes
+                                        + _sc_col // EP_SCALE_BLOCK
+                                        + _ep_scale_lds_off
+                                    ),
+                                )
+                else:
+                    for wm in range_constexpr(wmma_m_rep):
+                        row_rel = wmb + wm * 16 + lane16
+                        for wn in range_constexpr(output_n_rep):
+                            col_rel = wnb + wn * 16 + kgrp * 8
+                            acc = Vec(accs[wm * output_n_rep + wn])
+                            if const_expr(has_bias):
+                                acc = acc + Vec(
+                                    fx.ptr_load(
+                                        bias_map + expert * i32_n + col_rel,
+                                        result_type=T.vec(8, out_elem),
+                                    )
+                                ).to(fx.Float32)
+                            if const_expr(stage1_act):
+                                if const_expr(is_situv2):
+                                    act_vals = [
+                                        fused_situv2_elem(
+                                            acc[2 * p],
+                                            acc[2 * p + 1],
+                                            consts=situ_c,
+                                        )
+                                        for p in range_constexpr(4)
+                                    ]
+                                else:
+                                    act_vals = [
+                                        fused_silu_swiglu_elem(
+                                            acc[2 * p],
+                                            acc[2 * p + 1],
+                                            swiglu=is_swiglu,
+                                            limit_f32=f32_swiglu_limit,
+                                            neg_limit_f32=neg_limit,
+                                        )
+                                        for p in range_constexpr(4)
+                                    ]
+                                hv = Vec.from_elements(act_vals, fx.Float32).to(oc)
+                                lds_store_b64(
+                                    stC_idx,
+                                    (row_rel * STORE_N + col_rel // 2) * 2,
+                                    hv.bitcast(fx.Int32).ir_value(),
+                                )
                             else:
-                                hv = Vec.from_elements(
-                                    [acc[i] for i in range_constexpr(8)], fx.Float32
-                                ).to(oc)
-                            hv_i32 = hv.bitcast(fx.Int32).ir_value()
-                            lds_store_b128(
-                                stC_idx,
-                                (row_rel * STORE_PITCH + col_rel) * 2,
-                                hv_i32,
-                            )
+                                if const_expr(enable_ep_scatter):
+                                    # Weight the row BEFORE truncating to bf16; the
+                                    # combine kernel does an unweighted sum.
+                                    _wf = _wf_rows[wm]
+                                    hv = Vec.from_elements(
+                                        [acc[i] * _wf for i in range_constexpr(8)],
+                                        fx.Float32,
+                                    ).to(oc)
+                                else:
+                                    hv = Vec.from_elements(
+                                        [acc[i] for i in range_constexpr(8)], fx.Float32
+                                    ).to(oc)
+                                hv_i32 = hv.bitcast(fx.Int32).ir_value()
+                                lds_store_b128(
+                                    stC_idx,
+                                    (row_rel * STORE_PITCH + col_rel) * 2,
+                                    hv_i32,
+                                )
 
             # -- Shared LDS -> global --
             # dscnt-only barrier: the store reads LDS, not the e8m0 scales still
@@ -1312,7 +1467,13 @@ def launch_gemm_a8w4_tdm(
                 # pe*K + slot over the single base lsa_ptr(0, off). perRankSize is
                 # measured in-kernel from the lsa_ptr stride. Each wave issues the
                 # gather-stores for its row groups, 8 rows per instruction.
-                elem_bytes = 2
+                # Quantized rows carry the payload plane; the scale plane is a
+                # second store into the same slots at a plane-base offset. The
+                # descriptor addresses the payload plane in bytes on both wires,
+                # so a 4-bit element just halves the row length.
+                elem_bytes = 1 if ep_quant_bits else 2
+                _row_elems = C_ROW_BYTES if ep_quant_bits else STORE_N
+                _lds_row_elems = _lds_row_bytes if ep_quant_bits else STORE_PITCH
                 _stride_elems = ep_slot_stride_bytes // elem_bytes
                 _GRP = 8
                 _ngrp = (tile_m + _GRP - 1) // _GRP
@@ -1324,21 +1485,34 @@ def launch_gemm_a8w4_tdm(
                 # slot<K); dropped/padding rows use this index so the HW drops them.
                 _oob = _K * fx.Int32(ep_world_size)
                 _comb_ptr_ty = fx.PointerType.get(
-                    T.i16, address_space=fx.AddressSpace.Global, alignment=16
+                    T.i8 if ep_quant_bits else T.i16,
+                    address_space=fx.AddressSpace.Global,
+                    alignment=16,
                 )
                 _comb_iter = fx.inttoptr(
                     _comb_ptr_ty,
                     fx.Int64(ep_win.lsa_ptr(fx.Int32(0), ep_combine_input_offset)),
                 )
                 _comb_view = global_view(
-                    _comb_iter, 0, (_oob, STORE_N), (_stride_elems, 1)
+                    _comb_iter, 0, (_oob, _row_elems), (_stride_elems, 1)
                 )
                 _lds_c = lds_view(
-                    fx.recast_iter(oc, base_ptr),
-                    (tile_m, STORE_PITCH),
-                    (STORE_PITCH, 1),
+                    fx.recast_iter(fx.Int8 if ep_quant_bits else oc, base_ptr),
+                    (tile_m, _lds_row_elems),
+                    (_lds_row_elems, 1),
                 )
-                _gboff = blk_n * elem_bytes
+                if const_expr(ep_quant_bits):
+                    # Byte column of this tile in the payload plane: one byte per
+                    # element on the fp8 wire, half that on fp4.
+                    _elem_div = 8 // ep_quant_bits
+                    _gboff = blk_n64 // _elem_div
+                    # The scale plane starts one payload plane (N*bits/8 bytes)
+                    # into the slot; blk_n is a multiple of tile_n, itself a
+                    # multiple of the scale block, so the tile's scale run starts
+                    # whole.
+                    _gboff_s = n64 // _elem_div + blk_n64 // EP_SCALE_BLOCK
+                else:
+                    _gboff = blk_n * elem_bytes
                 for g in range_constexpr(_ngrp):
                     base_row = g * _GRP
                     if wave == g % num_waves:
@@ -1364,16 +1538,34 @@ def launch_gemm_a8w4_tdm(
                             _comb_view,
                             _lds_c,
                             row_indices,
-                            row_width=STORE_PITCH,
-                            tensor_dim0=STORE_N,
+                            row_width=_lds_row_elems,
+                            tensor_dim0=_row_elems,
                             tensor_dim1=_oob.ir_value(),
                             stride=_stride_elems,
                             elem_bytes=elem_bytes,
                             index_size=32,
-                            lds_byte_offset=base_row * STORE_PITCH * elem_bytes,
+                            lds_byte_offset=base_row * _lds_row_elems * elem_bytes,
                             global_byte_offset=_gboff,
                         )
                         tensor_store_gather(desc)
+                        if const_expr(ep_quant_bits):
+                            # Same rows and slot stride as the payload store;
+                            # only the plane base and the row width differ.
+                            desc_s = make_tensor_gather_descriptor(
+                                _comb_view,
+                                _lds_c,
+                                row_indices,
+                                row_width=_lds_scale_row_bytes,
+                                tensor_dim0=EP_SCALE_ROW_BYTES,
+                                tensor_dim1=_oob.ir_value(),
+                                stride=_stride_elems,
+                                elem_bytes=1,
+                                index_size=32,
+                                lds_byte_offset=_ep_scale_lds_off
+                                + base_row * _lds_scale_row_bytes,
+                                global_byte_offset=_gboff_s,
+                            )
+                            tensor_store_gather(desc_s)
                 tdm_ops.tensor_wait(0)
             else:
                 if const_expr(stage1_act):

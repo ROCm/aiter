@@ -27,7 +27,7 @@ Launch (4x gfx1250; every env knob below is already the script's default):
     # Set MORI_CCO_BC to a prebuilt libmori_cco_device.bc to skip CCO JIT.
 
 Env / CLI: --layers --logits_tol --acc_verify --dispatch_wire --combine
-           -tpr -hd -id -e -k --shared_E -q
+           --combine_quant -tpr -hd -id -e -k --shared_E -q
 """
 
 import argparse
@@ -59,8 +59,7 @@ except Exception:  # noqa: BLE001 # pragma: no cover
 # gfx1250 grouped mxfp4 kernel knobs, all overridable from the environment.
 # AITER_FORCE_A8W4 picks the ACTIVATION dtype of the grouped kernel: 0 -> fp4
 # (a4w4), 1 -> fp8 (a8w4). The weights are mxfp4 either way; -q only decides how
-# they are laid out, so a4w4 is the default here and `AITER_FORCE_A8W4=1
-# -q a8w4_mxfp4` gets the fp8-activation variant back.
+# they are laid out. This pins a8w4; main() then drives it from the quant key.
 os.environ.setdefault("ENABLE_CK", "0")
 os.environ.setdefault("AITER_FORCE_A8W4", "0")
 os.environ.setdefault("AITER_USE_GROUPED_GEMM", "1")
@@ -68,7 +67,7 @@ os.environ.setdefault("AITER_BF16_FP8_MOE_BOUND", "0")
 # Both EP paths go through mori's HIP/JIT dispatch: MORI_V2_KERNEL_BACKEND picks
 # it for the `base` path's EpDispatchCombineOp, MEGA_DISPATCH for the dispatch
 # inside MegaMoEGfx1250. Same dispatch on both sides -> the kernel tables differ
-# only in the combine.
+# only in the combine.s
 os.environ.setdefault("MORI_V2_KERNEL_BACKEND", "hip")
 os.environ.setdefault("MEGA_DISPATCH", "mori")
 
@@ -371,7 +370,8 @@ def _calc_diff(x, y):
 
 
 # Accuracy budget, measured on gfx1250 (2 ranks, 1024 tok/rank, 7168x3072, E=384,
-# topk=6, --combine fused -- the worst of the quant x combine scenarios).
+# topk=6, --combine fused --combine_quant mxfp8 -- the worst of the six
+# quant x combine scenarios).
 #
 # _calc_diff is ||x-y||^2 / (||x||^2 + ||y||^2), a SQUARED error, and the per-layer
 # errors accumulate as a random walk: r ~ sqrt(L) makes r^2 ~ L, so the metric grows
@@ -391,6 +391,11 @@ _ACC_TOL = {  # quant key -> (per-layer slope, saturation)
 }
 _ACC_TOL_FALLBACK = _ACC_TOL["a4w4_mxfp4"]  # unknown key: assume the fp4 budget
 _ACC_TOL_SAFETY = 1.5
+# The table was calibrated with the mxfp8 wire; --combine_quant mxfp4 is NOT
+# covered by it. e2m1 keeps ~3 effective bits, so the wire alone costs several
+# times what fp8 does and will overshoot these numbers -- worst on a8w4, whose
+# baseline is small enough that the wire dominates it. Pin an explicit
+# --logits_tol when running mxfp4.
 
 
 def default_logits_tol(quant_key, n_layers):
@@ -526,6 +531,7 @@ class DeviceMoEPipeline:
         routings,
         ct,
         combine_mode="base",
+        combine_quant="none",
     ):
         self.dist_ctx = dist_ctx
         self.E, self.hdim, self.idim, self.topk = E, hdim, idim, topk
@@ -536,6 +542,7 @@ class DeviceMoEPipeline:
         self.routings = routings
         self.ct = ct
         self.combine_mode = combine_mode
+        self.combine_quant = combine_quant
         self.EPR = E // dist_ctx.world
         self.dev = torch.device("cuda", dist_ctx.local_rank)
         self.comm = None
@@ -595,6 +602,7 @@ class DeviceMoEPipeline:
                 quant_type=self.spec["aiter_qtype"],
                 # Explicit so a stale $MEGA_DISPATCH_WIRE cannot change what is measured.
                 dispatch_wire=self.spec["dispatch_wire"],
+                combine_quant=self.combine_quant,
             )
         else:
             EpDispatchCombineConfig, EpDispatchCombineOp = _import_mori_v2()
@@ -854,6 +862,7 @@ def main():
             f"[cfg] world={dist_ctx.world} layers={n_layers} tokens/rank={ct} hidden={hdim} "
             f"inter={idim} E={E} topk={topk} EPR={E // dist_ctx.world} quant={args.quant_type} "
             f"combine={args.combine} dispatch_wire={spec['dispatch_wire']} "
+            f"combine_quant={args.combine_quant} "
             f"force_a8w4={os.environ['AITER_FORCE_A8W4']} "
             f"gate={spec['gate_mode'].name} shared_E={args.shared_experts} gfx={get_gfx()}",
             flush=True,
@@ -900,6 +909,7 @@ def main():
         routings,
         ct,
         combine_mode=args.combine,
+        combine_quant=args.combine_quant,
     )
     pipe.setup(x0)
     pipe.capture(x0)
@@ -1049,6 +1059,15 @@ def _parse_args():
         default=os.environ.get("COMBINE", "base"),
         help="EP combine mode: base (mori v2 dispatch/combine around fused_moe) "
         "| fused (gemm2-fused P2P scatter; mxfp4 only). Falls back to $COMBINE.",
+    )
+    p.add_argument(
+        "--combine_quant",
+        type=str,
+        choices=["none", "mxfp8", "mxfp4"],
+        default=os.environ.get("COMBINE_QUANT", "none"),
+        help="combine wire dtype for the fused combine: none (bf16) | mxfp8 "
+        "(fp8 e4m3 payload) | mxfp4 (fp4 e2m1 payload), both with a per-1x32 "
+        "e8m0 scale plane. Falls back to $COMBINE_QUANT.",
     )
     return p.parse_args()
 

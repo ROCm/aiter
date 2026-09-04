@@ -63,8 +63,16 @@ class Stage2ScatterContext:
     max_tokens_per_rank: int
     world_size: int
     source_token_map: torch.Tensor
+    # Combine wire payload width in bits: 0 leaves it bf16, 8 and 4 make the
+    # gemm2 epilogue quantize per 1x32 e8m0 before the P2P write and have
+    # ep_combine_fused dequantize on the way out.
+    combine_quant_bits: int = 0
 
     def __post_init__(self):
+        if self.combine_quant_bits not in (0, 8, 4):
+            raise ValueError(
+                f"combine_quant_bits must be 0, 8 or 4, got {self.combine_quant_bits}"
+            )
         if self.arena_handle < 0:
             raise ValueError("arena_handle must be non-negative")
         if self.combine_input_offset < 0:

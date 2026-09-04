@@ -161,6 +161,9 @@ def flydsl_grouped_gemm_a8w4_masked(
         ),
         ep_destination_stride=int(ep_destination_stride),
         ep_world_size=int(stage2_scatter.world_size) if enable_ep_scatter else 0,
+        ep_quant_bits=(
+            int(stage2_scatter.combine_quant_bits) if enable_ep_scatter else 0
+        ),
         arg_ep_row_map=ep_row_map_tensor,
         f32_situ_beta=float(situ_beta),
         f32_situ_linear_beta=float(situ_linear_beta),

@@ -6447,7 +6447,10 @@ if __name__ == "__main__":
         "use_g1u1",
         "doweight_stage1",
     ]
-    grouped_key = key + ["gate_mode"]
+    # ep_fused is part of the shape identity (gemm2 doing the EP scatter shifts
+    # the stage2 tile optimum), so it must be in the dedup key or the write-back
+    # collapses an ep_fused row into the generic one for the same shape.
+    grouped_key = key + ["gate_mode", "ep_fused"]
     resultList = [
         "block_m",
         "ksplit",
