@@ -1,0 +1,9 @@
+This directory contains code adapted from the native HIP/MFMA backend of
+MoonshotAI/FlashKDA, source revision 7557ca0.
+
+Upstream project: https://github.com/MoonshotAI/FlashKDA
+Upstream copyright: Copyright (c) 2026 MoonshotAI
+License: MIT (see LICENSE in this directory)
+
+The aiter adapter, int32 packed-sequence ABI, HIP runtime spelling, and build
+integration are maintained by Advanced Micro Devices, Inc.

@@ -68,6 +68,7 @@ def chunk_delta_attn_fwd(
     use_qk_l2norm_in_kernel: bool = False,
     use_beta_sigmoid_in_kernel: bool = False,
     state_v_first: bool = False,
+    allow_flash_kda: bool = True,
 ) -> tuple:
     """
     Forward pass for chunk_delta_attn.
@@ -103,6 +104,8 @@ def chunk_delta_attn_fwd(
         state_v_first:      Store the recurrent state V-first (``[V, K]``) instead
                             of the default ``[K, V]``. Matches fla's option of the
                             same name.
+        allow_flash_kda:    Whether the PR #4683 Triton FlashKDA fast path may
+                            serve this call. False forces the original pipeline.
 
     Returns:
         (o, final_state, g_cumsum, Aqk, Akk, w, u, qg, kg)
@@ -126,7 +129,8 @@ def chunk_delta_attn_fwd(
     # the two apart risks landing on the default pipeline at 32, the slowest
     # combination of the three.
     use_flash_kda = (
-        CHUNK_DELTA_ATTN_USE_FLASH_KDA
+        allow_flash_kda
+        and CHUNK_DELTA_ATTN_USE_FLASH_KDA
         and not disable_recompute
         and flash_kda_supported(
             q=q,

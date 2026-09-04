@@ -1914,5 +1914,29 @@
         "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": "''"
+    },
+    "module_flash_kda_hip": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/flash_kda_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/flash_kda/flash_kda_aiter.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/flash_kda/hip_workspace.cpp'",
+            "f'{AITER_CSRC_DIR}/kernels/flash_kda/hip_launch.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/flash_kda/hip_launch_common.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/flash_kda/gfx942/flash_kda_gfx942_launch.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/flash_kda/gfx950/flash_kda_gfx950_launch.cu'"
+        ],
+        "flags_extra_cc": [
+            "'-Wno-psabi'"
+        ],
+        "flags_extra_hip": [
+            "'-Wno-psabi'",
+            "'-mwavefrontsize64'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/kernels/flash_kda'"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
     }
 }
