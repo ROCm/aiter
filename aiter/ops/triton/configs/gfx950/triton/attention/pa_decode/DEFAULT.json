@@ -1,0 +1,8 @@
+{
+    "_paged_attn_decode_v1_w_dot_kernel": {
+        "waves_per_eu": 2
+    },
+    "_paged_attn_decode_v1_w_dot_kernel_per_token_quant": {
+        "waves_per_eu": 2
+    }
+}
