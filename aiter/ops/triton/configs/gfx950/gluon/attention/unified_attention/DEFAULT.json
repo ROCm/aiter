@@ -3,6 +3,7 @@
     "attn_2d": [
       "D",
       "SW",
+      "SKLT",
       "DT"
     ],
     "attn_3d": [
@@ -40,6 +41,15 @@
       "MFMA_DIM": 32,
       "NUM_BUFFERS": 2,
       "waves_per_eu": 3,
+      "TILE_SIZE_MIN": 64,
+      "TILE_SIZE_MAX": 64
+    },
+    "D_GEQ_256.SKLT.DT_fp8_fp8": {
+      "BLOCK_M": 128,
+      "num_warps": 4,
+      "MFMA_DIM": 32,
+      "NUM_BUFFERS": 1,
+      "waves_per_eu": 1,
       "TILE_SIZE_MIN": 64,
       "TILE_SIZE_MAX": 64
     },
