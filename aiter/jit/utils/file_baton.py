@@ -217,10 +217,7 @@ class FileBaton:
         # remove(), letting an expired holder delete its successor's lock.
         sfd = None
         while self._owns_lock_path():
-            # Finishing the build makes it safe to migrate an ambiguous
-            # flock-less legacy marker: a paused old breaker can only remove
-            # the lock this owner is about to remove itself.
-            sfd = self._try_acquire_steal_guard(allow_legacy_migration=True)
+            sfd = self._try_acquire_steal_guard()
             if sfd is not None:
                 break
             time.sleep(self.wait_seconds)
@@ -247,7 +244,7 @@ class FileBaton:
             return False
         return (owner.st_dev, owner.st_ino) == (current.st_dev, current.st_ino)
 
-    def _try_acquire_steal_guard(self, allow_legacy_migration=False):
+    def _try_acquire_steal_guard(self):
         """Try to hold the recovery guard; kernel releases it on process exit."""
         guard_path = self.lock_file_path + ".steal"
         while True:
@@ -259,7 +256,7 @@ class FileBaton:
                     return sfd
                 continue
             except PermissionError:
-                sfd = None
+                return None
             else:
                 try:
                     protocol = os.pread(sfd, len(_GUARD_PROTOCOL), 0)
@@ -267,75 +264,22 @@ class FileBaton:
                     protocol = b""
                 if protocol != _GUARD_PROTOCOL:
                     os.close(sfd)
-                    sfd = None
-                else:
-                    try:
-                        fcntl.flock(sfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    except BlockingIOError:
-                        os.close(sfd)
-                        return None
-                    except OSError:
-                        os.close(sfd)
-                        raise
-                if sfd is not None:
-                    return sfd
-
-            # A flock-less legacy marker has no owner identity. It may belong
-            # to a paused old process regardless of age, so stale recovery
-            # must never replace it while a canonical lock still exists.
-            if not allow_legacy_migration:
-                return None
-            if not self._legacy_steal_guard_can_migrate(guard_path):
-                return None
-
-            # Serialize migration among upgraded peers, then atomically
-            # replace the legacy inode in place. Older peers keep observing
-            # the same .steal pathname and their O_EXCL acquisition remains
-            # excluded throughout the replacement.
-            migration_path = guard_path + ".migrate"
-            mfd = self._try_acquire_protocol_guard(migration_path)
-            if mfd is None:
-                return None
-            retry = False
-            try:
-                if self._guard_has_protocol(guard_path):
-                    retry = True
-                elif not self._legacy_steal_guard_can_migrate(guard_path):
+                    # Pre-protocol .steal files carry no owner identity or
+                    # liveness signal. A dead owner is indistinguishable from
+                    # a paused old process, so automatic migration is unsafe.
                     return None
-                else:
-                    return self._publish_guard(guard_path, replace=True)
-            finally:
-                self._release_steal_guard(mfd)
-            if retry:
-                continue
+                try:
+                    fcntl.flock(sfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    os.close(sfd)
+                    return None
+                except OSError:
+                    os.close(sfd)
+                    raise
+                return sfd
 
     @staticmethod
-    def _guard_has_protocol(guard_path):
-        try:
-            with open(guard_path, "rb") as guard:
-                return guard.read(len(_GUARD_PROTOCOL)) == _GUARD_PROTOCOL
-        except OSError:
-            return False
-
-    def _try_acquire_protocol_guard(self, guard_path):
-        """Acquire a guard pathname known to use the current protocol."""
-        while True:
-            try:
-                fd = os.open(guard_path, os.O_RDWR)
-            except FileNotFoundError:
-                fd = self._publish_guard(guard_path)
-                if fd is not None:
-                    return fd
-                continue
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                os.close(fd)
-                return None
-            return fd
-
-    @staticmethod
-    def _publish_guard(guard_path, replace=False):
+    def _publish_guard(guard_path):
         """Atomically publish a shared, flocked recovery-guard inode."""
         guard_dir = os.path.dirname(guard_path) or "."
         guard_name = os.path.basename(guard_path)
@@ -353,13 +297,10 @@ class FileBaton:
                 remaining = remaining[written:]
             os.fsync(fd)
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            if replace:
-                os.replace(private_path, guard_path)
-            else:
-                try:
-                    os.link(private_path, guard_path)
-                except FileExistsError:
-                    return None
+            try:
+                os.link(private_path, guard_path)
+            except FileExistsError:
+                return None
             published = True
             return fd
         finally:
@@ -369,33 +310,6 @@ class FileBaton:
                 pass
             if not published:
                 os.close(fd)
-
-    def _legacy_steal_guard_can_migrate(self, guard_path):
-        """Whether a legacy marker passed its grace period and has no flock."""
-        try:
-            age = time.time() - os.path.getmtime(guard_path)
-        except OSError:
-            return False
-        if age <= self.stale_grace_seconds:
-            return False
-
-        # Intermediate versions of this protocol retained a lifetime flock on
-        # .steal. Honor it even after the grace period. A restrictive marker
-        # from the original O_EXCL-only protocol cannot be opened by a peer
-        # UID; after the grace period it is safe to bypass via .steal.flock.
-        try:
-            fd = os.open(guard_path, os.O_RDWR)
-        except OSError:
-            return True
-        try:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return False
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
-        return True
 
     @staticmethod
     def _release_steal_guard(sfd):
