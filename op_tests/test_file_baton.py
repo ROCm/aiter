@@ -58,6 +58,25 @@ class TestFileBaton(unittest.TestCase):
             self.assertFalse(os.path.exists(path + ".steal"))
             baton.release()
 
+    def test_expired_holder_cannot_touch_or_release_successor(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = os.path.join(tempdir, "build.lock")
+            expired = FileBaton(path, heartbeat_seconds=0)
+            successor = FileBaton(path, heartbeat_seconds=0)
+            self.assertTrue(expired.try_acquire())
+
+            # Simulate stale recovery replacing the pathname while the expired
+            # holder remains alive (for example, a paused container resumes).
+            os.remove(path)
+            self.assertTrue(successor.try_acquire())
+            successor_mtime = os.stat(path).st_mtime_ns
+
+            self.assertTrue(expired._touch_owned_lock())
+            self.assertEqual(os.stat(path).st_mtime_ns, successor_mtime)
+            expired.release()
+            self.assertTrue(os.path.exists(path))
+            successor.release()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

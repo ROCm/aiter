@@ -99,6 +99,7 @@ class FileBaton:
         self.heartbeat_stale_seconds = heartbeat_stale_seconds
         self.fd = None
         self._stop_heartbeat = None
+        self._heartbeat_thread = None
 
     def try_acquire(self):
         """
@@ -179,13 +180,38 @@ class FileBaton:
         if self._stop_heartbeat is not None:
             self._stop_heartbeat.set()
             self._stop_heartbeat = None
-        if self.fd is not None:
+        if self._heartbeat_thread is not None:
+            self._heartbeat_thread.join()
+            self._heartbeat_thread = None
+        if self.fd is None:
+            return
+
+        # Serialize the verify+unlink step with stale replacement. Without this
+        # guard, the path could be replaced after the inode check and before
+        # remove(), letting an expired holder delete its successor's lock.
+        steal_path = self.lock_file_path + ".steal"
+        sfd = None
+        while self._owns_lock_path():
+            try:
+                sfd = os.open(steal_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                break
+            except FileExistsError:
+                time.sleep(self.wait_seconds)
+        try:
+            if sfd is not None and self._owns_lock_path():
+                try:
+                    os.remove(self.lock_file_path)
+                except FileNotFoundError:
+                    pass
+        finally:
             os.close(self.fd)
             self.fd = None
-        try:
-            os.remove(self.lock_file_path)
-        except FileNotFoundError:
-            pass
+            if sfd is not None:
+                os.close(sfd)
+                try:
+                    os.remove(steal_path)
+                except FileNotFoundError:
+                    pass
 
     def _start_heartbeat(self):
         """Touch the lock while we hold it, so waiters that cannot check our
@@ -193,20 +219,40 @@ class FileBaton:
         if self.heartbeat_seconds <= 0:
             return
         stop = threading.Event()
-        path = self.lock_file_path
         interval = self.heartbeat_seconds
 
         def _beat():
             while not stop.wait(interval):
-                try:
-                    os.utime(path, None)
-                except OSError:
+                if not self._touch_owned_lock():
                     return  # lock gone or unwritable: nothing useful to do
 
-        threading.Thread(
+        thread = threading.Thread(
             target=_beat, name="aiter-baton-heartbeat", daemon=True
-        ).start()
+        )
+        thread.start()
         self._stop_heartbeat = stop
+        self._heartbeat_thread = thread
+
+    def _touch_owned_lock(self):
+        """Heartbeat the acquired inode, never a successor at the same path."""
+        if self.fd is None:
+            return False
+        try:
+            os.utime(self.fd, None)
+        except OSError:
+            return False
+        return True
+
+    def _owns_lock_path(self):
+        """Whether the path still names the inode acquired by this instance."""
+        if self.fd is None:
+            return False
+        try:
+            owner = os.fstat(self.fd)
+            current = os.stat(self.lock_file_path)
+        except OSError:
+            return False
+        return (owner.st_dev, owner.st_ino) == (current.st_dev, current.st_ino)
 
     # ---- stale-lock detection ----
 
