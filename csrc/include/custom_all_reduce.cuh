@@ -3343,6 +3343,569 @@ __global__ void __launch_bounds__(1024, 1) allreduce_mhc_post_large_m_kernel(
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
+// ===========================================================================
+// LL / LL128 low-latency small-message all-reduce (gfx9 POC kernels)
+// ===========================================================================
+// Two flag-in-data, zero-GPU-barrier all-reduce kernels for small messages:
+//   * ar_ll_gfx9       — LL, 16B lines carrying 8B payload + epoch flags.
+//   * ar_ll128_unroll2 — LL128, 128B/16-lane lines, 15 payload words + 1 flag.
+// Both stage into a per-rank scratch that peers write into and the owner polls
+// (spinning on a per-epoch flag), then reduce in fp32. On this port the scratch
+// is NOT independently allocated: it reuses the meta/Signal buffer's post-Signal
+// region (the same region the 2-stage kernel uses as tmp), which is already
+// IPC-exchanged at construction. A peer's scratch base is therefore
+// (char*)sg_.signals[peer] + sizeof(Signal). LL and 2-stage never run on the
+// same message concurrently, and the per-epoch flag + double-buffered banks keep
+// scratch reuse safe across CUDA-graph replay.
+
+constexpr int    kLLMaxRanks       = 8;      // gfx9 supports up to 8 ranks
+constexpr size_t kLLPocSlotCapPk   = 16384;  // per-rank slot cap in 8B packets (<=128KB msg)
+// LL sub-region size in the reused scratch: 2 banks * ngpus * slotCap * 16B.
+// Sized for the worst case (kLLMaxRanks) so the LL128 sub-region can start after
+// it at a fixed offset regardless of world size.
+constexpr size_t kLLPocRegionBytes =
+    (size_t)2 * kLLMaxRanks * kLLPocSlotCapPk * sizeof(uint4);
+// Max message (bytes) the LL128 fast path serves; bounds its dynamic scratch.
+constexpr size_t kLL128PocCapBytes = (size_t)4 * 1024 * 1024;
+
+// 16-byte LL line: two (4B data, 4B flag) pairs carrying 8B of payload.
+union LLPackedMsg
+{
+    struct
+    {
+        uint32_t data0;
+        uint32_t flag0;
+        uint32_t data1;
+        uint32_t flag1;
+    };
+    uint4 raw;
+};
+static_assert(sizeof(LLPackedMsg) == 16, "LLPackedMsg must be exactly 16 bytes");
+
+// gfx9 16B single-transaction store/load: a 16B vector via nontemporal
+// store/load lowers to a single global_store/load_dwordx4 (nt).
+using llx_v4u = __attribute__((__vector_size__(4 * sizeof(unsigned int)))) unsigned int;
+
+DINLINE void ll_store_b128(uint32_t* dst, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3)
+{
+    union
+    {
+        llx_v4u  v;
+        uint32_t w[4];
+    } u;
+    u.w[0] = a0;
+    u.w[1] = a1;
+    u.w[2] = a2;
+    u.w[3] = a3;
+    __builtin_nontemporal_store(u.v, reinterpret_cast<llx_v4u*>(dst));
+    asm volatile("" ::: "memory");
+}
+
+template <typename T>
+DINLINE void remote_store_b128(uint32_t* dst, opus::vector_t<T, 16 / sizeof(T)> data)
+{
+  union
+  {
+    llx_v4u v;
+    T w[16 / sizeof(T)];
+  } u;
+#pragma unroll
+  for (int i = 0; i < 16 / sizeof(T); ++i)
+  {
+    u.w[i] = data[i];
+  }
+  __builtin_nontemporal_store(u.v, reinterpret_cast<llx_v4u*>(dst));
+  asm volatile("" ::: "memory");
+}
+
+template <typename T>
+DINLINE void remote_load_b128(const uint32_t* src, opus::vector_t<T, 16 / sizeof(T)>& data)
+{
+  asm volatile("" ::: "memory");
+  union
+  {
+    llx_v4u v;
+    T w[16 / sizeof(T)];
+  } u;
+  u.v = __builtin_nontemporal_load(reinterpret_cast<llx_v4u*>(const_cast<uint32_t*>(src)));
+#pragma unroll
+  for (int i = 0; i < 16 / sizeof(T); ++i)
+  {
+    data[i] = u.w[i];
+  }
+}
+
+DINLINE void ll_load_b128(
+    const uint32_t* src, uint32_t& o0, uint32_t& o1, uint32_t& o2, uint32_t& o3)
+{
+    asm volatile("" ::: "memory");
+    union
+    {
+        llx_v4u  v;
+        uint32_t w[4];
+    } u;
+    u.v = __builtin_nontemporal_load(reinterpret_cast<llx_v4u*>(const_cast<uint32_t*>(src)));
+    o0  = u.w[0];
+    o1  = u.w[1];
+    o2  = u.w[2];
+    o3  = u.w[3];
+}
+
+// LL flat all-reduce. 1D grid over 8-byte packets.
+//
+// Phase 1 (publish): rank writes its full sendbuff into every peer's scratch at
+// slot[rank], as LL lines carrying the epoch flag.
+// Phase 2 (reduce): rank polls its own scratch slots for the other ranks
+// (waiting on the flag), sums them with its own sendbuff (fp32 accumulation),
+// and writes recvbuff. Self is read directly from sendbuff.
+//
+// Graph-safe device epoch: each block owns a persistent device flag
+// block_flags[blockIdx.x] that the kernel itself bumps. Scratch is
+// double-buffered (bank = epoch & 1); the per-epoch flag disambiguates stale
+// lines, so no clearing is needed and it survives CUDA-graph replay.
+template <typename T, int ngpus, int BLOCK_SIZE = 256>
+__global__ void __launch_bounds__(BLOCK_SIZE) ar_ll_gfx9(
+    T* const* __restrict__ peer_scratch, // ngpus scratch bases (device table)
+    T* __restrict__ recvbuff,
+    const T* __restrict__ sendbuff,
+    size_t nPk,          // number of 8-byte packets = bytes / 8
+    int rank,
+    uint32_t* __restrict__ block_flags, // device array[gridDim.x], persisted
+    size_t slotStridePk = kLLPocSlotCapPk) // per-rank slot capacity in packets
+{
+    constexpr int LP = 8 / sizeof(T); // elements per 8-byte payload
+    using PL         = typename opus::vector_t<T, LP>;
+    using AL         = typename opus::vector_t<opus::fp32_t, LP>;
+    const size_t slot = slotStridePk;
+
+    __shared__ uint32_t s_flag;
+    if(threadIdx.x == 0)
+    {
+        uint32_t f = block_flags[blockIdx.x] + 1u;
+        if(f == 0u)
+            f = 1u; // flag is never 0 (0 == cleared scratch)
+        s_flag = f;
+    }
+    __syncthreads();
+    const uint32_t flag        = s_flag;
+    const size_t   bankOffPkts = (size_t)(flag & 1u) * (size_t)ngpus * slot;
+
+    const size_t gtid   = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+
+    const uint32_t* in = reinterpret_cast<const uint32_t*>(sendbuff);
+
+    // Phase 1: publish my payload into every peer's slot[rank].
+    for(size_t pk = gtid; pk < nPk; pk += stride)
+    {
+        const uint32_t d0 = in[2 * pk];
+        const uint32_t d1 = in[2 * pk + 1];
+#pragma unroll
+        for(int r = 1; r < ngpus; ++r)
+        {
+            int          peer = (rank + r) % ngpus;
+            LLPackedMsg* dst  = reinterpret_cast<LLPackedMsg*>(peer_scratch[peer]) +
+                               bankOffPkts + (size_t)rank * slot;
+            ll_store_b128(reinterpret_cast<uint32_t*>(&dst[pk]), d0, flag, d1, flag);
+        }
+    }
+
+    // Phase 2: poll my slots for the other ranks, reduce with my own data.
+    LLPackedMsg* myBase =
+        reinterpret_cast<LLPackedMsg*>(peer_scratch[rank]) + bankOffPkts;
+    for(size_t pk = gtid; pk < nPk; pk += stride)
+    {
+        PL selfv = *reinterpret_cast<const PL*>(&in[2 * pk]);
+        AL acc;
+#pragma unroll
+        for(int j = 0; j < LP; ++j)
+            acc[j] = upcast_s(selfv[j]);
+
+        uint32_t load_reg[ngpus - 1][4];
+        volatile LLPackedMsg* src[ngpus - 1];
+#pragma unroll
+        for (int i = 1; i < ngpus; ++i)
+        {
+          int peer = (rank + i) % ngpus;
+          src[i - 1] = myBase + (size_t)peer * slot;
+        }
+        bool still_loop;
+        do
+        {
+          still_loop = false;
+#pragma unroll
+          for (int i = 0; i < ngpus - 1; ++i)
+          {
+            ll_load_b128(
+                reinterpret_cast<const uint32_t*>(const_cast<LLPackedMsg*>(&src[i][pk])),
+                load_reg[i][0], load_reg[i][1], load_reg[i][2], load_reg[i][3]
+            );
+          }
+#pragma unroll
+          for (int i = 0; i < ngpus - 1; ++i)
+          {
+            still_loop = still_loop || load_reg[i][1] != flag;
+            still_loop = still_loop || load_reg[i][3] != flag;
+          }
+        } while (still_loop);
+#pragma unroll
+        for (int i = 0; i < ngpus - 1; ++i)
+        {
+          const uint32_t w[2] = {load_reg[i][0], load_reg[i][2]};
+          PL pv = *reinterpret_cast<const PL*>(w);
+#pragma unroll
+          for (int j = 0; j < LP; ++j)
+          {
+            acc[j] += upcast_s(pv[j]);
+          }
+        }
+
+        PL ov;
+#pragma unroll
+        for(int j = 0; j < LP; ++j)
+            ov[j] = downcast_s<T>(acc[j]);
+        reinterpret_cast<PL*>(recvbuff)[pk] = ov;
+    }
+
+    if(threadIdx.x == 0)
+        block_flags[blockIdx.x] = flag;
+}
+
+// ---------------------------------------------------------------------------
+// LL128: 128B / 16-lane lines, 15 payload words + 1 flag word. Same
+// double-buffered scratch model as ar_ll_gfx9 above; only the line geometry
+// (128B / 16 lanes) and the paired-b128 access pattern differ.
+// ---------------------------------------------------------------------------
+
+constexpr int    kLL128MaxBlocks = 80;
+constexpr int    kLL128LineElems = 16;
+constexpr int    kLL128DataElems = 15;
+constexpr int    kLL128FlagElem  = 15;
+constexpr int    kLL128Lanes     = 16;
+
+struct LLLine128
+{
+    uint64_t w[kLL128LineElems];
+};
+static_assert(sizeof(LLLine128) == 128, "LLLine128 must be exactly 128 bytes");
+
+__host__ __device__ __forceinline__ size_t ll128NumLines(size_t nWords)
+{
+    return (nWords + (size_t)kLL128DataElems - 1) / (size_t)kLL128DataElems;
+}
+
+// Add two 8B payload words element-wise in fp32 (matches ar_ll_gfx9 accumulate).
+template <typename T>
+DINLINE uint64_t ll128_add_word(uint64_t a, uint64_t b)
+{
+    constexpr int LP = 8 / sizeof(T);
+    using PL         = typename opus::vector_t<T, LP>;
+    PL pa = *reinterpret_cast<const PL*>(&a);
+    PL pb = *reinterpret_cast<const PL*>(&b);
+    PL pr;
+#pragma unroll
+    for(int j = 0; j < LP; ++j)
+        pr[j] = downcast_s<T>(upcast_s(pa[j]) + upcast_s(pb[j]));
+    uint64_t r;
+    __builtin_memcpy(&r, &pr, 8);
+    return r;
+}
+
+// Per-block epoch (graph-safe).
+DINLINE uint32_t ll128EpochBegin(const uint32_t* __restrict__ epochDev,
+                                 int flatBlockId,
+                                 uint32_t& s_flag)
+{
+    if(threadIdx.x == 0)
+    {
+        uint32_t f = epochDev[flatBlockId] + 1u;
+        if(f == 0u)
+            f = 2u; // skip 0 sentinel; preserve bank parity
+        s_flag = f;
+    }
+    __syncthreads();
+    return s_flag;
+}
+
+DINLINE void ll128EpochEnd(uint32_t* __restrict__ epochDev,
+                           int flatBlockId,
+                           int total,
+                           int epochLen,
+                           uint32_t flag)
+{
+    if(threadIdx.x == 0)
+    {
+        for(int e = flatBlockId; e < epochLen; e += total)
+            epochDev[e] = flag;
+    }
+}
+template <typename T>
+__device__ void ll128_store_b128(opus::vector_t<T, 16 / sizeof(T)> data, uint32_t* dst)
+{
+  union
+  {
+    llx_v4u v;
+    opus::vector_t<T, 16 / sizeof(T)> vec;
+  } u;
+  u.vec = data;
+  __builtin_nontemporal_store(u.v, reinterpret_cast<llx_v4u*>(dst));
+  asm volatile("" ::: "memory");
+}
+
+template <typename T>
+__device__ void ll128_load_b128(opus::vector_t<T, 16 / sizeof(T)>& data, uint32_t* src)
+{
+  asm volatile("" ::: "memory");
+  union
+  {
+    llx_v4u v;
+    opus::vector_t<T, 16 / sizeof(T)> vec;
+  } u;
+  u.v = __builtin_nontemporal_load(reinterpret_cast<llx_v4u*>(const_cast<uint32_t*>(src)));
+  data = u.vec;
+}
+
+DINLINE void ll128_check_flag(uint32_t& flag0, uint32_t& flag1, uint32_t* src)
+{
+  asm volatile("" ::: "memory");
+  union
+  {
+    llx_v4u v;
+    uint32_t w[4];
+  } u;
+  u.v = __builtin_nontemporal_load(reinterpret_cast<llx_v4u*>(const_cast<uint32_t*>(src)));
+  flag0 = u.w[2];
+  flag1 = u.w[3];
+}
+
+template <typename T>
+__device__ void loadDataFromHBMToReg(
+    int group_index, int lane_index, int total_group, int last_group_pack_num, uint32_t flag,
+    const T* hbm_buffer, opus::vector_t<T, 16 / sizeof(T)> (&dst_reg)[2]
+)
+{
+  using P = opus::vector_t<T, 16 / sizeof(T)>;
+  constexpr int pack_per_group = 15;
+  if (group_index != total_group - 1)
+  {
+    dst_reg[0] = *(reinterpret_cast<const P*>(hbm_buffer) + group_index * pack_per_group + lane_index);
+    if (lane_index < 7)
+    {
+      dst_reg[1] = *(reinterpret_cast<const P*>(hbm_buffer) + group_index * pack_per_group + lane_index + 8);
+    }
+    else
+    {
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+      {
+        *(reinterpret_cast<uint32_t*>(&dst_reg[1]) + i) = flag;
+      }
+    }
+  }
+  else // last group
+  {
+    if (lane_index < last_group_pack_num)
+    {
+      dst_reg[0] = *(reinterpret_cast<const P*>(hbm_buffer) + group_index * pack_per_group + lane_index);
+    }
+    else
+    {
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+      {
+        *(reinterpret_cast<uint32_t*>(&dst_reg[0]) + i) = 0;
+      }
+    }
+
+    if (lane_index < last_group_pack_num - 8)
+    {
+      dst_reg[1] = *(reinterpret_cast<const P*>(hbm_buffer) + group_index * pack_per_group + 8 + lane_index);
+    }
+    else if (lane_index == 7)
+    {
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+      {
+        *(reinterpret_cast<uint32_t*>(&dst_reg[1]) + i) = flag;
+      }
+    }
+    else
+    {
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+      {
+        *(reinterpret_cast<uint32_t*>(&dst_reg[1]) + i) = 0;
+      }
+    }
+  }
+
+  if (lane_index == 7)
+  {
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+    {
+      dst_reg[1][i] = dst_reg[0][4 + i];
+      dst_reg[0][4 + i] = dst_reg[1][4 + i];
+    }
+  }
+}
+
+#define LL128_MAX_BLOCK_NUM 192
+
+// LL128 unroll2 1-shot all-reduce. 2B dtype only (fp16 / bf16). 8-lane groups,
+// 15-pack lines. Internally resets the per-block epoch up to LL128_MAX_BLOCK_NUM.
+template <typename T, int ngpus, int block_size>
+__global__ void __launch_bounds__(block_size) ar_ll128_unroll2(
+    const T* __restrict__ input, T* __restrict__ output,
+    T* const* __restrict__ peer_scratch, uint32_t* __restrict__ graph_safe_flag,
+    int self_rank, int size
+)
+{
+  constexpr int pack_size = 16 / sizeof(T);
+  using P = opus::vector_t<T, pack_size>;
+  using A = opus::vector_t<opus::fp32_t, pack_size>;
+
+  constexpr int group_per_block = block_size / 8;
+  constexpr int pack_per_group = 15;
+  constexpr int bytes_per_group = 240;
+  int total_bytes = size * sizeof(T);
+  int total_pack = total_bytes / 16;
+  int total_group = (total_bytes + bytes_per_group - 1) / bytes_per_group;
+  int lane_id = threadIdx.x % 8;
+  int group_id = threadIdx.x / 8;
+  int g_index = blockIdx.x * group_per_block + group_id;
+  int stride = gridDim.x * group_per_block;
+  int last_group_pack_num = total_pack % 15 == 0 ? 15 : total_pack % 15;
+
+  __shared__ uint32_t s_flag;
+  const uint32_t flag = ll128EpochBegin(graph_safe_flag, blockIdx.x, s_flag);
+  int bank_offset = (flag & 1u) * ngpus * (total_group * 128 * 2 / 4);
+
+  for (int idx = g_index; idx < total_group; idx += stride)
+  {
+    P inp_reg[2];
+    loadDataFromHBMToReg<T>(idx, lane_id, total_group, last_group_pack_num, flag, input, inp_reg);
+#pragma unroll
+    for (int i = 1; i < ngpus; ++i)
+    {
+      int peer = (self_rank + i) % ngpus;
+      uint32_t* scratch_dst = reinterpret_cast<uint32_t*>(peer_scratch[peer])
+                              + bank_offset
+                              + self_rank * (total_group * 128 * 2 / 4)
+                              + idx * 8 * 2 * 4 + lane_id * 4;
+      ll128_store_b128<T>(inp_reg[0], scratch_dst);
+      ll128_store_b128<T>(inp_reg[1], scratch_dst + 8 * 4);
+    }
+  }
+
+  uint32_t* self_scratch = reinterpret_cast<uint32_t*>(peer_scratch[self_rank]) + bank_offset;
+  for (int idx = g_index; idx < total_group; idx += stride)
+  {
+    P inp_reg[2];
+    loadDataFromHBMToReg<T>(idx, lane_id, total_group, last_group_pack_num, flag, input, inp_reg);
+    A reduce_rslt_f32[2];
+#pragma unroll
+    for (int i = 0; i < pack_size; ++i)
+    {
+      reduce_rslt_f32[0][i] = upcast_s(inp_reg[0][i]);
+      reduce_rslt_f32[1][i] = upcast_s(inp_reg[1][i]);
+    }
+    uint32_t* scratch_base[ngpus - 1];
+    uint32_t* scratch_flag_addr[2][ngpus - 1];
+#pragma unroll
+    for (int i = 1; i < ngpus; ++i)
+    {
+      scratch_base[i - 1] = self_scratch + ((self_rank + i) % ngpus) * (total_group * 128 * 2 / 4) + idx * 8 * 2 * 4;
+      scratch_flag_addr[0][i - 1] = scratch_base[i - 1] + 7 * 4;
+      scratch_flag_addr[1][i - 1] = scratch_flag_addr[0][i - 1] + 8 * 4;
+    }
+    uint32_t s_f[2][2 * (ngpus - 1)];
+    bool still_loop;
+    do
+    {
+      still_loop = false;
+#pragma unroll
+      for (int i = 0; i < ngpus - 1; ++i)
+      {
+        ll128_check_flag(s_f[0][2 * i], s_f[0][2 * i + 1], scratch_flag_addr[0][i]);
+      }
+#pragma unroll
+      for (int i = 0; i < ngpus - 1; ++i)
+      {
+        still_loop = still_loop || s_f[0][2 * i] != flag;
+        still_loop = still_loop || s_f[0][2 * i + 1] != flag;
+      }
+    } while (still_loop);
+    P reduce_elem[ngpus - 1];
+#pragma unroll
+    for (int i = 0; i < ngpus - 1; ++i)
+    {
+      ll128_load_b128<T>(reduce_elem[i], scratch_base[i] + lane_id * 4);
+#pragma unroll
+      for (int j = 0; j < pack_size; ++j)
+      {
+        reduce_rslt_f32[0][j] += upcast_s(reduce_elem[i][j]);
+      }
+    }
+
+    do
+    {
+      still_loop = false;
+#pragma unroll
+      for (int i = 0; i < ngpus - 1; ++i)
+      {
+        ll128_check_flag(s_f[1][2 * i], s_f[1][2 * i + 1], scratch_flag_addr[1][i]);
+      }
+#pragma unroll
+      for (int i = 0; i < ngpus - 1; ++i)
+      {
+        still_loop = still_loop || s_f[1][2 * i] != flag;
+        still_loop = still_loop || s_f[1][2 * i + 1] != flag;
+      }
+    } while (still_loop);
+#pragma unroll
+    for (int i = 0; i < ngpus - 1; ++i)
+    {
+      ll128_load_b128<T>(reduce_elem[i], scratch_base[i] + lane_id * 4 + 8 * 4);
+#pragma unroll
+      for (int j = 0; j < pack_size; ++j)
+      {
+        reduce_rslt_f32[1][j] += upcast_s(reduce_elem[i][j]);
+      }
+    }
+
+    // write output
+    P reduce_rslt[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+    {
+#pragma unroll
+      for (int j = 0; j < pack_size; ++j)
+      {
+        reduce_rslt[i][j] = downcast_s<T>(reduce_rslt_f32[i][j]);
+      }
+    }
+    if (lane_id == 7)
+    {
+#pragma unroll
+      for (int i = 0; i < pack_size / 2; ++i)
+      {
+        reduce_rslt[0][pack_size / 2 + i] = reduce_rslt[1][i];
+      }
+    }
+    bool is_last_group = (idx == total_group - 1);
+    if (!is_last_group || lane_id < last_group_pack_num)
+    {
+      *(reinterpret_cast<P*>(output) + idx * pack_per_group + lane_id) = reduce_rslt[0];
+    }
+    if (lane_id != 7 && (!is_last_group || lane_id + 8 < last_group_pack_num))
+    {
+      *(reinterpret_cast<P*>(output) + idx * pack_per_group + lane_id + 8) = reduce_rslt[1];
+    }
+  }
+  ll128EpochEnd(graph_safe_flag, blockIdx.x, gridDim.x, LL128_MAX_BLOCK_NUM, flag);
+}
+
 class CustomAllreduce
 {
     public:
@@ -3362,6 +3925,17 @@ class CustomAllreduce
     std::vector<void*> graph_unreg_output_buffers_;
     // a map from IPC handles to opened IPC pointers
     std::map<IPC_KEY, char*> ipc_handles_;
+
+    // LL / LL128 fast-path staging (reuses the meta buffer's post-Signal region,
+    // already IPC-exchanged via sg_). Device table of per-rank scratch bases,
+    // computed in the constructor from sg_.signals[]; no second IPC exchange.
+    //   [0, world_size_)              -> LL   scratch bases (signals[i]+sizeof(Signal))
+    //   [world_size_, 2*world_size_)  -> LL128 scratch bases (+ kLLPocRegionBytes)
+    void**    d_ll_scratch_peers_    = nullptr;
+    // Rank-local per-block epoch arrays (not exchanged). Allocated at init time
+    // (not during graph capture) so the LL kernels are graph-capture safe.
+    uint32_t* d_ll_poc_block_flags_  = nullptr; // array[kMaxBlocks]
+    uint32_t* d_ll128_unroll2_epoch_ = nullptr; // array[LL128_MAX_BLOCK_NUM]
 
     template <typename T>
     T* local_tmp_reduced_ptr() const
@@ -3407,6 +3981,34 @@ class CustomAllreduce
             }
             sg_.signals[i] = rank_sg;
         }
+        init_ll_fast_path_();
+    }
+
+    // LL / LL128 fast-path init. Builds the device scratch-base table from the
+    // already-exchanged sg_.signals[] (peer scratch = post-Signal region of each
+    // peer's meta buffer) and allocates the rank-local per-block epoch arrays.
+    // Runs at construction (never during graph capture) so replays never malloc.
+    void init_ll_fast_path_()
+    {
+        std::vector<void*> peers(2 * world_size_);
+        for(int i = 0; i < world_size_; ++i)
+        {
+            char* base =
+                reinterpret_cast<char*>(const_cast<Signal*>(sg_.signals[i])) + sizeof(Signal);
+            peers[i]               = base;                       // LL scratch base
+            peers[world_size_ + i] = base + kLLPocRegionBytes;   // LL128 scratch base
+        }
+        HIP_CALL(hipMalloc(&d_ll_scratch_peers_, sizeof(void*) * 2 * world_size_));
+        HIP_CALL(hipMemcpy(d_ll_scratch_peers_, peers.data(),
+                           sizeof(void*) * 2 * world_size_, hipMemcpyHostToDevice));
+
+        HIP_CALL(hipMalloc((void**)&d_ll_poc_block_flags_, sizeof(uint32_t) * kMaxBlocks));
+        HIP_CALL(hipMemset(d_ll_poc_block_flags_, 0, sizeof(uint32_t) * kMaxBlocks));
+
+        HIP_CALL(hipMalloc((void**)&d_ll128_unroll2_epoch_,
+                           sizeof(uint32_t) * LL128_MAX_BLOCK_NUM));
+        HIP_CALL(hipMemset(d_ll128_unroll2_epoch_, 0,
+                           sizeof(uint32_t) * LL128_MAX_BLOCK_NUM));
     }
 
     char* open_ipc_handle(const void* ipc_handle)
@@ -3723,6 +4325,132 @@ class CustomAllreduce
      * Not quite sure the underlying reason, but my guess is that too many SMs
      * will cause contention on NVLink bus.
      */
+
+    // -----------------------------------------------------------------------
+    // LL / LL128 small-message fast paths (gfx9 POC). Staging scratch reuses the
+    // meta buffer's post-Signal region (peer bases in d_ll_scratch_peers_, built
+    // at construction from sg_.signals[]); no separate alloc / IPC exchange. NOT
+    // wired into the size-based dispatch below yet — that lands in step 2 once
+    // the bench thresholds are in. The caller must keep the message within the
+    // LL / LL128 caps (kLLPocSlotCapPk / kLL128PocCapBytes) so the scratch fits
+    // the reused tmp region (2 * max_size).
+    // -----------------------------------------------------------------------
+    template <typename T>
+    void allreduce_ll_poc(hipStream_t stream, const T* input, T* output,
+                          int numel, int threads_per_block = 256)
+    {
+        const size_t bytes = (size_t)numel * sizeof(T);
+        if(bytes % 8 != 0)
+            throw std::runtime_error(
+                "allreduce_ll_poc: byte count must be a multiple of 8");
+        const size_t nPk     = bytes >> 3;
+        const size_t slotCap = kLLPocSlotCapPk;
+        if(nPk > slotCap)
+            throw std::runtime_error(
+                "allreduce_ll_poc: packet count exceeds scratch slot capacity");
+
+        int blocks = std::min<int>(
+            kMaxBlocks, (int)((nPk + threads_per_block - 1) / threads_per_block));
+        if(blocks < 1)
+            blocks = 1;
+
+        T* const* peers = reinterpret_cast<T* const*>(d_ll_scratch_peers_);
+
+#define LAUNCH_LL_POC(NGPUS, BS)                                             \
+    ar_ll_gfx9<T, NGPUS, BS><<<blocks, BS, 0, stream>>>(                     \
+        peers, output, input, nPk, rank_, d_ll_poc_block_flags_, slotCap)
+
+#define DISPATCH_LL_POC_BS(NGPUS)                                            \
+    switch(threads_per_block)                                               \
+    {                                                                        \
+    case 256: LAUNCH_LL_POC(NGPUS, 256); break;                             \
+    case 512: LAUNCH_LL_POC(NGPUS, 512); break;                             \
+    case 1024: LAUNCH_LL_POC(NGPUS, 1024); break;                           \
+    default:                                                                 \
+        throw std::invalid_argument(                                        \
+            "allreduce_ll_poc: threads_per_block must be 256, 512 or 1024"); \
+    }
+
+        switch(world_size_)
+        {
+        case 2: DISPATCH_LL_POC_BS(2); break;
+        case 4: DISPATCH_LL_POC_BS(4); break;
+        case 8: DISPATCH_LL_POC_BS(8); break;
+        default:
+            throw std::runtime_error(
+                "allreduce_ll_poc only supports world_size in (2,4,8). Actual = " +
+                std::to_string(world_size_));
+        }
+
+#undef DISPATCH_LL_POC_BS
+#undef LAUNCH_LL_POC
+    }
+
+    // LL128 unroll2 1-shot all-reduce. 2-byte dtype only (fp16 / bf16). The
+    // kernel sizes its scratch from the message internally (per total_group);
+    // the cap bounds it to the LL128 sub-region of the reused tmp buffer.
+    template <typename T>
+    void allreduce_ll128_unroll2(hipStream_t stream, const T* input, T* output,
+                                 int numel, int threads_per_block = 512)
+    {
+        static_assert(sizeof(T) == 2,
+                      "allreduce_ll128_unroll2 only supports 2-byte dtypes");
+        const size_t bytes = (size_t)numel * sizeof(T);
+        if(bytes % 16 != 0)
+            throw std::runtime_error(
+                "allreduce_ll128_unroll2: byte count must be a multiple of 16");
+        if(bytes > kLL128PocCapBytes)
+            throw std::runtime_error(
+                "allreduce_ll128_unroll2: message " + std::to_string(bytes) +
+                "B exceeds LL128 fast-path cap " +
+                std::to_string(kLL128PocCapBytes) + "B");
+
+        constexpr int bytesPerGroup = 240; // 15 packs * 16B
+        const int     totalGroup = (int)((bytes + bytesPerGroup - 1) / bytesPerGroup);
+
+        T* const* peers =
+            reinterpret_cast<T* const*>(d_ll_scratch_peers_ + world_size_);
+
+#define LAUNCH_LL128_UNROLL2(NGPUS, BS)                                          \
+    do                                                                          \
+    {                                                                           \
+        constexpr int groupsPerBlock = (BS) / 8;                                \
+        int           blocks         = std::min<int>(                           \
+            LL128_MAX_BLOCK_NUM, (totalGroup + groupsPerBlock - 1) / groupsPerBlock); \
+        if(blocks < 1)                                                          \
+            blocks = 1;                                                         \
+        ar_ll128_unroll2<T, NGPUS, BS><<<blocks, (BS), 0, stream>>>(            \
+            input, output, peers, d_ll128_unroll2_epoch_, rank_, numel);        \
+    } while(0)
+
+#define DISPATCH_LL128_UNROLL2_BS(NGPUS)                                        \
+    switch(threads_per_block)                                                   \
+    {                                                                           \
+    case 256: LAUNCH_LL128_UNROLL2(NGPUS, 256); break;                          \
+    case 512: LAUNCH_LL128_UNROLL2(NGPUS, 512); break;                          \
+    case 1024: LAUNCH_LL128_UNROLL2(NGPUS, 1024); break;                        \
+    default:                                                                    \
+        throw std::invalid_argument(                                            \
+            "allreduce_ll128_unroll2: threads_per_block must be 256, 512 or "   \
+            "1024");                                                            \
+    }
+
+        switch(world_size_)
+        {
+        case 2: DISPATCH_LL128_UNROLL2_BS(2); break;
+        case 4: DISPATCH_LL128_UNROLL2_BS(4); break;
+        case 8: DISPATCH_LL128_UNROLL2_BS(8); break;
+        default:
+            throw std::runtime_error(
+                "allreduce_ll128_unroll2 only supports world_size in (2,4,8). "
+                "Actual = " +
+                std::to_string(world_size_));
+        }
+
+#undef DISPATCH_LL128_UNROLL2_BS
+#undef LAUNCH_LL128_UNROLL2
+    }
+
     template <typename T>
     void allreduce(hipStream_t stream,
                    T* input,
@@ -3746,6 +4474,65 @@ class CustomAllreduce
     if(block_limit > kMaxBlocks)
         throw std::runtime_error("max supported block limit is " + std::to_string(kMaxBlocks) +
                                  ". Got " + std::to_string(block_limit));
+
+    // -----------------------------------------------------------------------
+    // LL / LL128 small-message fast path (gfx9). Routes small messages to the
+    // ar_ll_gfx9 / ar_ll128_unroll2 kernels per measured thresholds; anything
+    // larger falls through to the existing 1-/2-stage dispatch below. Staging
+    // scratch reuses the meta buffer's post-Signal region (see
+    // allreduce_ll_poc / allreduce_ll128_unroll2), which assumes the tmp region
+    // (2 * max_size) comfortably exceeds the fast-path scratch (worst case
+    // ~18 MiB at tp2); true for the default max_size (1 GiB).
+    //
+    // `size` here is still the element count (numel); it is divided down to
+    // 16-byte packs only after this block. Thresholds were measured on bf16, so
+    // the path is gated to 2-byte dtypes (if constexpr also keeps the LL128
+    // 2-byte static_assert out of the fp32 instantiation). numel notation a*b
+    // mirrors the (tokens, hidden) bench shapes.
+    if constexpr(sizeof(T) == 2)
+    {
+        if(use_new && !is_broadcast_reg_outptr)
+        {
+            const int numel    = size;
+            int       ll_bs    = 0; // >0 -> LL    with this block size
+            int       ll128_bs = 0; // >0 -> LL128 with this block size
+            if(world_size_ == 8)
+            {
+                if(numel <= 4 * 8192)
+                    ll_bs = 256;
+            }
+            else if(world_size_ == 4)
+            {
+                if(numel <= 4 * 7168)
+                    ll_bs = 256;
+                else if(numel <= 8 * 8192)
+                    ll128_bs = 256;
+                else if(numel <= 16 * 8192)
+                    ll128_bs = 512;
+            }
+            else if(world_size_ == 2)
+            {
+                if(numel <= 4 * 8192)
+                    ll_bs = 256;
+                else if(numel <= 16 * 8192)
+                    ll128_bs = 256;
+                else if(numel <= 128 * 7168)
+                    ll128_bs = 512;
+                else if(numel <= 256 * 8192)
+                    ll128_bs = 1024;
+            }
+            if(ll_bs)
+            {
+                allreduce_ll_poc<T>(stream, input, output, numel, ll_bs);
+                return;
+            }
+            if(ll128_bs)
+            {
+                allreduce_ll128_unroll2<T>(stream, input, output, numel, ll128_bs);
+                return;
+            }
+        }
+    }
 
     RankData* input_ptrs  = get_buffer_RD(stream, input);
     RankData* output_ptrs = nullptr;
@@ -4888,6 +5675,12 @@ void dispatchAllReduceMhcPostSplit(hipStream_t stream,
 
 ~CustomAllreduce()
 {
+    if(d_ll_scratch_peers_)
+        (void)hipFree(d_ll_scratch_peers_);
+    if(d_ll_poc_block_flags_)
+        (void)hipFree(d_ll_poc_block_flags_);
+    if(d_ll128_unroll2_epoch_)
+        (void)hipFree(d_ll128_unroll2_epoch_);
     for(auto [_, ptr] : ipc_handles_)
     {
         HIP_CALL(hipIpcCloseMemHandle(ptr));
