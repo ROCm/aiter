@@ -562,7 +562,7 @@ def gemm_afp4wfp4_preshuffle(
 
     if config["NUM_KSPLIT"] > 1:
         SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
-            K_elems, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
+            K_bytes, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
         )
 
         config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE
@@ -611,7 +611,7 @@ def gemm_afp4wfp4_preshuffle(
         w_scales,
         M,
         N,
-        K_elems,
+        K_bytes,
         x_fp4.stride(0),
         x_fp4.stride(1),
         w_preshuf.stride(0),
@@ -634,7 +634,7 @@ def gemm_afp4wfp4_preshuffle(
         # NOTE: REDUCE_BLOCK_SIZE_N=16 gives best perf with fp32 partials and
         # REDUCE_BLOCK_SIZE_N=128 gives best perf with bf16 partials
         REDUCE_BLOCK_SIZE_N = 128 if _USE_GEMM_SPLITK_BF16 else 64
-        ACTUAL_KSPLIT = triton.cdiv(K_elems, (config["SPLITK_BLOCK_SIZE"] // 2))
+        ACTUAL_KSPLIT = triton.cdiv(K_bytes, (config["SPLITK_BLOCK_SIZE"] // 2))
 
         grid_reduce = (
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
