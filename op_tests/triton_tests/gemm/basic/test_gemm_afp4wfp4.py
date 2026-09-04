@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+import functools
+
 import pytest
 import torch
 import triton
@@ -10,9 +12,6 @@ from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
 )
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4_preshuffle,
-)
-from aiter.ops.triton.gluon.gemm_afp4wfp4 import (
-    gemm_afp4wfp4 as gluon_gemm_afp4wfp4_CDNA4,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import str_to_torch_dtype
@@ -254,7 +253,7 @@ def test_gemm_afp4_wfp4(
         if impl == "triton":
             fn = triton_gemm_afp4wfp4
         elif impl == "gluon":
-            fn = gluon_gemm_afp4wfp4_CDNA4
+            fn = functools.partial(triton_gemm_afp4wfp4, backend="gluon")
         else:
             raise ValueError(f"Unknown implementation: {impl}")
         triton_out = fn(
