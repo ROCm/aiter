@@ -17,6 +17,7 @@ import subprocess
 import sys
 import sysconfig
 import warnings
+import platform
 
 import setuptools
 from _cpp_extension_versioner import ExtensionVersioner
@@ -37,6 +38,9 @@ SHARED_FLAG = "-shared"
 SUBPROCESS_DECODE_ARGS = ()
 MINIMUM_GCC_VERSION = (5, 0, 0)
 MINIMUM_MSVC_VERSION = (19, 0, 24215)
+CMODEL = 'large'
+if platform.machine() == 'loongarch64':
+    CMODEL = 'extreme'
 
 VersionRange = tuple[tuple[int, ...], tuple[int, ...]]
 VersionMap = dict[str, VersionRange]
@@ -300,7 +304,7 @@ COMMON_HIPCC_FLAGS = [
     "-DCUDA_HAS_FP16=1",
     "-D__HIP_NO_HALF_OPERATORS__=1",
     "-D__HIP_NO_HALF_CONVERSIONS__=1",
-    "-mcmodel=large",
+    "-mcmodel=" + CMODEL,
     "-fno-unique-section-names",
     "-ffunction-sections",
     "-fdata-sections",
@@ -1470,7 +1474,7 @@ def verify_ninja_availability():
 
 
 def _prepare_ldflags(extra_ldflags, with_cuda, verbose, is_standalone, torch_exclude):
-    extra_ldflags.append("-mcmodel=large")
+    extra_ldflags.append("-mcmodel=" + CMODEL)
     extra_ldflags.append("-ffunction-sections")
     extra_ldflags.append("-fdata-sections ")
     extra_ldflags.append("-Wl,--gc-sections")
