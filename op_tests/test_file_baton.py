@@ -5,6 +5,8 @@
 import os
 import socket
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -34,6 +36,9 @@ class TestFileBaton(unittest.TestCase):
             path = os.path.join(tempdir, "build.lock")
             with open(path, "w"):
                 pass
+            # A leftover marker has no live flock and must not wedge recovery.
+            with open(path + ".steal", "w"):
+                pass
 
             baton = FileBaton(
                 path,
@@ -46,17 +51,26 @@ class TestFileBaton(unittest.TestCase):
             self.assertTrue(baton.try_acquire())
             baton.release()
 
-    def test_handoff_marker_causes_reacquire_not_completion(self):
+    def test_waiter_does_not_report_completion_during_handoff(self):
         with tempfile.TemporaryDirectory() as tempdir:
             path = os.path.join(tempdir, "build.lock")
-            with open(path + ".steal", "w"):
-                pass
+            breaker = FileBaton(path, heartbeat_seconds=0)
+            waiter = FileBaton(path, wait_seconds=0.001, heartbeat_seconds=0)
+            guard = breaker._try_acquire_steal_guard()
+            self.assertIsNotNone(guard)
+            result = []
+            thread = threading.Thread(target=lambda: result.append(waiter.wait()))
+            thread.start()
+            time.sleep(0.02)
+            self.assertTrue(thread.is_alive())
 
-            baton = FileBaton(path, wait_seconds=0, heartbeat_seconds=0)
-            self.assertFalse(baton.wait())
-            self.assertTrue(os.path.exists(path))
-            self.assertFalse(os.path.exists(path + ".steal"))
-            baton.release()
+            self.assertTrue(breaker.try_acquire())
+            breaker._release_steal_guard(guard)
+            time.sleep(0.02)
+            self.assertTrue(thread.is_alive())
+            breaker.release()
+            thread.join(1)
+            self.assertEqual(result, [True])
 
     def test_expired_holder_cannot_touch_or_release_successor(self):
         with tempfile.TemporaryDirectory() as tempdir:

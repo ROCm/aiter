@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 # mypy: allow-untyped-defs
+import fcntl
 import logging
 import multiprocessing
 import os
@@ -131,13 +132,6 @@ class FileBaton:
         except OSError:
             pass
         self._start_heartbeat()
-        # The initialized lock is visible before the handoff marker disappears,
-        # so waiters can never observe both paths absent between stale recovery
-        # and the replacement build.
-        try:
-            os.remove(self.lock_file_path + ".steal")
-        except OSError:
-            pass
         return True
 
     def wait(self):
@@ -155,18 +149,23 @@ class FileBaton:
             f"[pid={os.getpid()} pname={multiprocessing.current_process().name}] "
             f"waiting for baton release at {self.lock_file_path}"
         )
-        steal_path = self.lock_file_path + ".steal"
         while True:
             if not os.path.exists(self.lock_file_path):
                 # A stale-lock breaker removes the old lock while holding this
-                # guard. Join the reacquire race instead of mistaking that
-                # protected handoff for completed work. try_acquire() creates
-                # the replacement lock before it removes the guard.
-                if os.path.exists(steal_path):
-                    if self.try_acquire():
-                        return False
+                # guard and creates its replacement before releasing the guard.
+                # A persistent .steal pathname is harmless; flock tells us
+                # whether a handoff is actually active.
+                sfd = self._try_acquire_steal_guard()
+                if sfd is None:
+                    time.sleep(self.wait_seconds)
                     continue
-                return True
+                try:
+                    completed = not os.path.exists(self.lock_file_path)
+                finally:
+                    self._release_steal_guard(sfd)
+                if completed:
+                    return True
+                continue
             if self._is_stale() and self._try_break_stale():
                 logger.warning(
                     f"[pid={os.getpid()}] broke stale lock at "
@@ -189,14 +188,12 @@ class FileBaton:
         # Serialize the verify+unlink step with stale replacement. Without this
         # guard, the path could be replaced after the inode check and before
         # remove(), letting an expired holder delete its successor's lock.
-        steal_path = self.lock_file_path + ".steal"
         sfd = None
         while self._owns_lock_path():
-            try:
-                sfd = os.open(steal_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            sfd = self._try_acquire_steal_guard()
+            if sfd is not None:
                 break
-            except FileExistsError:
-                time.sleep(self.wait_seconds)
+            time.sleep(self.wait_seconds)
         try:
             if sfd is not None and self._owns_lock_path():
                 try:
@@ -207,11 +204,7 @@ class FileBaton:
             os.close(self.fd)
             self.fd = None
             if sfd is not None:
-                os.close(sfd)
-                try:
-                    os.remove(steal_path)
-                except FileNotFoundError:
-                    pass
+                self._release_steal_guard(sfd)
 
     def _start_heartbeat(self):
         """Touch the lock while we hold it, so waiters that cannot check our
@@ -253,6 +246,21 @@ class FileBaton:
         except OSError:
             return False
         return (owner.st_dev, owner.st_ino) == (current.st_dev, current.st_ino)
+
+    def _try_acquire_steal_guard(self):
+        """Try to hold the recovery guard; kernel releases it on process exit."""
+        sfd = os.open(self.lock_file_path + ".steal", os.O_CREAT | os.O_RDWR)
+        try:
+            fcntl.flock(sfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(sfd)
+            return None
+        return sfd
+
+    @staticmethod
+    def _release_steal_guard(sfd):
+        fcntl.flock(sfd, fcntl.LOCK_UN)
+        os.close(sfd)
 
     # ---- stale-lock detection ----
 
@@ -324,14 +332,14 @@ class FileBaton:
         return False
 
     def _try_break_stale(self):
-        """Atomically break a stale lock. A secondary ``.steal`` lock ensures
-        only one waiter removes it. The breaker reacquires the baton before
-        dropping ``.steal`` so no waiter can mistake the handoff for a
-        successfully completed build."""
-        steal_path = self.lock_file_path + ".steal"
-        try:
-            sfd = os.open(steal_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
+        """Atomically break a stale lock under a process-lifetime flock.
+
+        The breaker reacquires the baton before dropping the guard so no waiter
+        can mistake the handoff for a successfully completed build. The guard's
+        pathname may persist, but a crashed process cannot leave its flock held.
+        """
+        sfd = self._try_acquire_steal_guard()
+        if sfd is None:
             return False
         try:
             # Re-verify under the steal lock to avoid racing a fresh acquire.
@@ -343,8 +351,4 @@ class FileBaton:
                 return self.try_acquire()
             return False
         finally:
-            os.close(sfd)
-            try:
-                os.remove(steal_path)
-            except FileNotFoundError:
-                pass
+            self._release_steal_guard(sfd)
