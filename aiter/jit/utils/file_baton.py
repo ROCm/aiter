@@ -185,7 +185,7 @@ class FileBaton:
             if not os.path.exists(self.lock_file_path):
                 # Normal release removes the lock while holding this guard.
                 # Wait for that operation to finish before reporting success.
-                # A persistent .steal pathname is harmless; flock tells us
+                # A persistent recovery-guard pathname is harmless; flock tells us
                 # whether a guarded operation is actually active.
                 sfd = self._try_acquire_steal_guard()
                 if sfd is None:
@@ -245,7 +245,16 @@ class FileBaton:
 
     def _try_acquire_steal_guard(self):
         """Try to hold the recovery guard; kernel releases it on process exit."""
-        guard_path = self.lock_file_path + ".steal"
+        legacy_guard_path = self.lock_file_path + ".steal"
+        if self._legacy_steal_guard_is_active(legacy_guard_path):
+            return None
+
+        # Use a versioned pathname so an inaccessible orphan left by the
+        # pre-flock implementation cannot prevent upgraded cache peers from
+        # synchronizing. The legacy marker above is honored for a grace period
+        # and indefinitely when it carries a live flock from an earlier
+        # revision of this protocol.
+        guard_path = legacy_guard_path + ".flock"
         while True:
             try:
                 sfd = os.open(guard_path, os.O_RDWR)
@@ -281,6 +290,37 @@ class FileBaton:
             os.close(sfd)
             return None
         return sfd
+
+    def _legacy_steal_guard_is_active(self, guard_path):
+        """Whether a pre-versioned recovery marker may still be active."""
+        try:
+            age = time.time() - os.path.getmtime(guard_path)
+        except OSError:
+            return False
+        if age <= self.stale_grace_seconds:
+            return True
+
+        # Intermediate versions of this protocol retained a lifetime flock on
+        # .steal. Honor it even after the grace period. A restrictive marker
+        # from the original O_EXCL-only protocol cannot be opened by a peer
+        # UID; after the grace period it is safe to bypass via .steal.flock.
+        try:
+            fd = os.open(guard_path, os.O_RDWR)
+        except OSError:
+            return False
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+        try:
+            os.remove(guard_path)
+        except OSError:
+            pass
+        return False
 
     @staticmethod
     def _release_steal_guard(sfd):
@@ -318,12 +358,17 @@ class FileBaton:
         return True
 
     def _owner_flock_released(self):
-        """Whether the kernel released the build owner's lifetime lock."""
+        """Return True if released, False if held, or None if non-writable."""
         try:
             # NFS emulates flock with byte-range locks and requires a writable
             # descriptor for LOCK_EX. Lock files are explicitly mode 0666 so
             # every cache peer can perform this liveness probe.
             fd = os.open(self.lock_file_path, os.O_RDWR)
+        except PermissionError:
+            # An old empty lock may predate shared 0666 publication. The
+            # caller can recover it by age; protocol=flock records remain
+            # conservative when this probe is unavailable.
+            return None
         except OSError:
             return False
         try:
@@ -347,13 +392,18 @@ class FileBaton:
                 age = time.time() - os.path.getmtime(self.lock_file_path)
             except OSError:
                 return False
-            return age > self.stale_grace_seconds and self._owner_flock_released()
+            if age <= self.stale_grace_seconds:
+                return False
+            # None identifies an inaccessible pre-flock orphan. New locks are
+            # published mode 0666, so a protocol=flock record never takes this
+            # legacy fallback.
+            return self._owner_flock_released() is not False
         if protocol == "flock":
             # For new-format locks the kernel-held lifetime lock is the
             # authority across PID/UTS namespaces and hosts sharing an NFS
             # cache. It remains held while a process is paused and is released
             # automatically on process exit.
-            return self._owner_flock_released()
+            return self._owner_flock_released() is True
         if host != socket.gethostname():
             # Legacy locks have no cross-host liveness signal, so never steal
             # one from a different host.

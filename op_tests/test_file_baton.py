@@ -2,6 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Regression tests for JIT file-baton stale-owner detection."""
 
+import fcntl
 import os
 import socket
 import stat
@@ -186,14 +187,16 @@ class TestFileBaton(unittest.TestCase):
 
             self.assertIsNotNone(guard)
             self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o666)
-            self.assertEqual(stat.S_IMODE(os.stat(path + ".steal").st_mode), 0o666)
+            self.assertEqual(
+                stat.S_IMODE(os.stat(path + ".steal.flock").st_mode), 0o666
+            )
             baton._release_steal_guard(guard)
             baton.release()
 
     def test_lock_paths_are_shared_before_atomic_publication(self):
         with tempfile.TemporaryDirectory() as tempdir:
             path = os.path.join(tempdir, "build.lock")
-            guard_path = path + ".steal"
+            guard_path = path + ".steal.flock"
             published = []
             real_link = os.link
 
@@ -220,6 +223,63 @@ class TestFileBaton(unittest.TestCase):
             self.assertEqual(published, [path, guard_path])
             baton._release_steal_guard(guard)
             baton.release()
+
+    def test_nonwritable_legacy_empty_lock_is_recoverable(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = os.path.join(tempdir, "build.lock")
+            with open(path, "w"):
+                pass
+            baton = FileBaton(path, stale_grace_seconds=-1)
+            real_open = os.open
+
+            def deny_legacy_probe(candidate, flags, *args, **kwargs):
+                if candidate == path and flags == os.O_RDWR:
+                    raise PermissionError("different cache UID")
+                return real_open(candidate, flags, *args, **kwargs)
+
+            with mock.patch(
+                "aiter.jit.utils.file_baton.os.open",
+                side_effect=deny_legacy_probe,
+            ):
+                self.assertTrue(baton._is_stale())
+
+    def test_nonwritable_legacy_steal_marker_is_bypassed_after_grace(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = os.path.join(tempdir, "build.lock")
+            legacy_guard_path = path + ".steal"
+            with open(legacy_guard_path, "w"):
+                pass
+            baton = FileBaton(path, stale_grace_seconds=-1)
+            real_open = os.open
+
+            def deny_legacy_guard(candidate, flags, *args, **kwargs):
+                if candidate == legacy_guard_path and flags == os.O_RDWR:
+                    raise PermissionError("different cache UID")
+                return real_open(candidate, flags, *args, **kwargs)
+
+            with mock.patch(
+                "aiter.jit.utils.file_baton.os.open",
+                side_effect=deny_legacy_guard,
+            ):
+                guard = baton._try_acquire_steal_guard()
+
+            self.assertIsNotNone(guard)
+            self.assertTrue(os.path.exists(legacy_guard_path + ".flock"))
+            baton._release_steal_guard(guard)
+
+    def test_live_preversioned_flock_guard_is_still_honored(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = os.path.join(tempdir, "build.lock")
+            legacy_guard_path = path + ".steal"
+            legacy_guard = os.open(
+                legacy_guard_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o666
+            )
+            fcntl.flock(legacy_guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                baton = FileBaton(path, stale_grace_seconds=-1)
+                self.assertIsNone(baton._try_acquire_steal_guard())
+            finally:
+                os.close(legacy_guard)
 
 
 if __name__ == "__main__":
