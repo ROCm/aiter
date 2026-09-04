@@ -237,31 +237,6 @@ class TestFileBaton(unittest.TestCase):
             ):
                 self.assertTrue(baton._is_stale())
 
-    def test_nonwritable_legacy_steal_marker_is_bypassed_after_grace(self):
-        with tempfile.TemporaryDirectory() as tempdir:
-            path = os.path.join(tempdir, "build.lock")
-            legacy_guard_path = path + ".steal"
-            with open(legacy_guard_path, "w"):
-                pass
-            baton = FileBaton(path, stale_grace_seconds=-1)
-            real_open = os.open
-
-            def deny_legacy_guard(candidate, flags, *args, **kwargs):
-                if candidate == legacy_guard_path and flags == os.O_RDWR:
-                    raise PermissionError("different cache UID")
-                return real_open(candidate, flags, *args, **kwargs)
-
-            with mock.patch(
-                "aiter.jit.utils.file_baton.os.open",
-                side_effect=deny_legacy_guard,
-            ):
-                guard = baton._try_acquire_steal_guard(allow_legacy_migration=True)
-
-            self.assertIsNotNone(guard)
-            with open(legacy_guard_path, "rb") as migrated_guard:
-                self.assertEqual(migrated_guard.read(), b"flock\n")
-            baton._release_steal_guard(guard)
-
     def test_live_preversioned_flock_guard_is_still_honored(self):
         with tempfile.TemporaryDirectory() as tempdir:
             path = os.path.join(tempdir, "build.lock")
@@ -272,9 +247,7 @@ class TestFileBaton(unittest.TestCase):
             fcntl.flock(legacy_guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
             try:
                 baton = FileBaton(path, stale_grace_seconds=-1)
-                self.assertIsNone(
-                    baton._try_acquire_steal_guard(allow_legacy_migration=True)
-                )
+                self.assertIsNone(baton._try_acquire_steal_guard())
             finally:
                 os.close(legacy_guard)
 
