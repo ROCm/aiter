@@ -91,10 +91,11 @@ void topk_softmax_asm(aiter_tensor_t* topk_weights,         // [num_tokens, topk
                 __func__,
                 ": topk_indices must be int32, got ",
                 AiterDtype_to_str(topk_indices->dtype()));
-    AITER_CHECK(token_expert_indices->dtype() == AITER_DTYPE_i32,
-                __func__,
-                ": token_expert_indices must be int32, got ",
-                AiterDtype_to_str(token_expert_indices->dtype()));
+    // token_expert_indices is accepted but never forwarded into KernelArgs
+    // below (only ptr_T/ptr_W/ptr_A are) -- this kernel neither reads nor
+    // writes it, so no dtype contract applies to it here. The existing
+    // test_asm case discards this buffer explicitly ("Not used. Will be
+    // used in the future.").
 
     KernelArgs args;
     size_t arg_size = sizeof(args);
