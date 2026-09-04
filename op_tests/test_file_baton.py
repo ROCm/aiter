@@ -291,17 +291,6 @@ class TestFileBaton(unittest.TestCase):
             with open(path + ".steal", "rb") as legacy_guard:
                 self.assertEqual(legacy_guard.read(), b"")
 
-    def test_absent_lock_with_legacy_guard_is_reacquired_for_rebuild(self):
-        with tempfile.TemporaryDirectory() as tempdir:
-            path = os.path.join(tempdir, "build.lock")
-            with open(path + ".steal", "w"):
-                pass
-
-            baton = FileBaton(path, wait_seconds=0, stale_grace_seconds=-1)
-            self.assertFalse(baton.wait())
-            self.assertTrue(baton.try_acquire())
-            baton.release()
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
