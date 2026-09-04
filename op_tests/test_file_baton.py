@@ -29,6 +29,35 @@ class TestFileBaton(unittest.TestCase):
             ):
                 self.assertFalse(baton._is_stale())
 
+    def test_stale_breaker_reacquires_before_returning(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = os.path.join(tempdir, "build.lock")
+            with open(path, "w"):
+                pass
+
+            baton = FileBaton(
+                path,
+                wait_seconds=0,
+                stale_grace_seconds=-1,
+                heartbeat_seconds=0,
+            )
+            self.assertFalse(baton.wait())
+            self.assertTrue(os.path.exists(path))
+            self.assertTrue(baton.try_acquire())
+            baton.release()
+
+    def test_handoff_marker_causes_reacquire_not_completion(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = os.path.join(tempdir, "build.lock")
+            with open(path + ".steal", "w"):
+                pass
+
+            baton = FileBaton(path, wait_seconds=0, heartbeat_seconds=0)
+            self.assertFalse(baton.wait())
+            self.assertTrue(os.path.exists(path))
+            self.assertFalse(os.path.exists(path + ".steal"))
+            baton.release()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

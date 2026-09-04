@@ -104,19 +104,20 @@ def mp_lock(
     from aiter.jit.utils.file_baton import FileBaton
 
     baton = FileBaton(lock_path)
-    if baton.try_acquire():
-        try:
-            ret = main_func()
-        finally:
-            if final_func is not None:
-                final_func()
-            baton.release()
-    else:
-        baton.wait()
-        if wait_func is not None:
-            ret = wait_func()
-        ret = None
-    return ret
+    while True:
+        if baton.try_acquire():
+            try:
+                return main_func()
+            finally:
+                if final_func is not None:
+                    final_func()
+                baton.release()
+        # False means wait() recovered a stale lock and atomically reacquired
+        # it for us; retry the ownership check and run main_func ourselves.
+        if baton.wait():
+            if wait_func is not None:
+                return wait_func()
+            return None
 
 
 def get_hip_version():
