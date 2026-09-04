@@ -10,6 +10,18 @@
 #include <torch/nn/functional.h>
 #include <torch/python.h>
 
+#include <cstdint>
+#include <cstdlib>
+#include <iostream>
+#include <mutex>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include "mha_fwd.h"
+#include "mha_fwd_dump.h"
+
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
 #define CHECK_SHAPE(x, ...)                                     \
     TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), \
@@ -140,6 +152,112 @@ inline void print_fmha_fwd_args(ARG args)
     printf("mask_type = %d\n", args.mask_type);
     printf("p_drop = %f\n", args.p_drop);
     printf("s_randval = %d\n", args.s_randval);
+}
+
+// =============================================================================
+// Runtime dump of mha forward args (group-mode extension).
+// The torch-free primitives (env-var sampling, mutex, common field builder,
+// batch-mode dumper) are defined in mha_fwd_dump.h and reused here.
+// =============================================================================
+
+// Helper: copy an int32 device tensor of length `n` to a host vector.
+inline std::vector<int32_t> mha_dump_copy_int32_to_host(const at::Tensor& t)
+{
+    auto host = t.to(torch::kCPU, /*non_blocking=*/false, /*copy=*/true).contiguous();
+    const int32_t* p = host.data_ptr<int32_t>();
+    const int64_t n  = host.numel();
+    return std::vector<int32_t>(p, p + n);
+}
+
+// Append the full contents of `v` as [x,y,z,...] (no truncation, per user requirement).
+inline void mha_dump_append_int_list(std::ostringstream& os, const std::vector<int32_t>& v)
+{
+    os << "[";
+    for(size_t i = 0; i < v.size(); ++i)
+    {
+        if(i)
+            os << ",";
+        os << v[i];
+    }
+    os << "]";
+}
+
+// Group-mode dumper: emit per-sequence Q/K varlen info (from host-side tensors
+// available at the varlen entry point).
+//
+// Semantics of the tensor inputs (mirrors get_ck_fmha_varlen_fwd_args):
+//   - cu_seqlens_q     : int32 [batch+1], cumulative *logical* Q seqlens
+//   - cu_seqlens_k_opt : int32 [batch+1], cumulative K seqlens (optional)
+//   - seqlens_k_opt    : int32 [batch],   per-sequence K seqlens (optional; used
+//                                        when cu_seqlens_k is absent)
+inline void dump_mha_fwd_info_group(const mha_fwd_args& a,
+                                    const at::Tensor& cu_seqlens_q,
+                                    const std::optional<const at::Tensor>& cu_seqlens_k_opt,
+                                    const std::optional<const at::Tensor>& seqlens_k_opt)
+{
+    if(!mha_dump_should_emit())
+        return;
+
+    std::ostringstream os;
+    append_mha_common_fields(os, a, "group");
+
+    // ---- Q side: differentiate cu_seqlens_q -> per-seq q lengths + total_q ----
+    std::vector<int32_t> cu_q = mha_dump_copy_int32_to_host(cu_seqlens_q);
+    std::vector<int32_t> seqlens_q;
+    int64_t total_q = 0;
+    if(cu_q.size() >= 2)
+    {
+        seqlens_q.reserve(cu_q.size() - 1);
+        for(size_t i = 1; i < cu_q.size(); ++i)
+            seqlens_q.push_back(cu_q[i] - cu_q[i - 1]);
+        total_q = cu_q.back();
+    }
+
+    // ---- K side: prefer cu_seqlens_k, else fall back to seqlens_k ----
+    std::vector<int32_t> seqlens_k;
+    int64_t total_k       = 0;
+    bool has_k_varlen_info = false;
+    if(cu_seqlens_k_opt.has_value())
+    {
+        std::vector<int32_t> cu_k = mha_dump_copy_int32_to_host(cu_seqlens_k_opt.value());
+        if(cu_k.size() >= 2)
+        {
+            seqlens_k.reserve(cu_k.size() - 1);
+            for(size_t i = 1; i < cu_k.size(); ++i)
+                seqlens_k.push_back(cu_k[i] - cu_k[i - 1]);
+            total_k          = cu_k.back();
+            has_k_varlen_info = true;
+        }
+    }
+    else if(seqlens_k_opt.has_value())
+    {
+        seqlens_k = mha_dump_copy_int32_to_host(seqlens_k_opt.value());
+        for(auto x : seqlens_k)
+            total_k += x;
+        has_k_varlen_info = true;
+    }
+
+    os << " total_q=" << total_q;
+    if(has_k_varlen_info)
+        os << " total_k=" << total_k;
+    else
+        os << " total_k=<unknown>";
+
+    os << " seqlens_q=";
+    mha_dump_append_int_list(os, seqlens_q);
+
+    if(has_k_varlen_info)
+    {
+        os << " seqlens_k=";
+        mha_dump_append_int_list(os, seqlens_k);
+    }
+    else
+    {
+        os << " seqlens_k=<unknown>";
+    }
+    os << "\n";
+
+    mha_dump_write(os.str());
 }
 
 } // namespace aiter
