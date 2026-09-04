@@ -181,7 +181,9 @@ class FileBaton:
                 except OSError:
                     return  # lock gone or unwritable: nothing useful to do
 
-        threading.Thread(target=_beat, name="aiter-baton-heartbeat", daemon=True).start()
+        threading.Thread(
+            target=_beat, name="aiter-baton-heartbeat", daemon=True
+        ).start()
         self._stop_heartbeat = stop
 
     # ---- stale-lock detection ----
@@ -249,7 +251,8 @@ class FileBaton:
         if start:
             # Same pid, different start time: the original holder died and the
             # pid was recycled.
-            return _process_start_time(pid) != start
+            current_start = _process_start_time(pid)
+            return bool(current_start) and current_start != start
         return False
 
     def _try_break_stale(self):
