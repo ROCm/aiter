@@ -1,21 +1,59 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-#
-# Pure mxmoe kernel-name parsing (no torch / JIT deps) so the AOT pre-compile
-# pass can import it without triggering JIT module loads.
-#
-# Name: flydsl_mxmoe_g{1,2}_a4w4_<BM>x256x256[_flag...], lowercase. Shape is in
-# the CSV columns, not the name. g1 flags: f16in (inline act quant), nt (else
-# cached). g2 flags: atomic (else nonatomic), nt (atomic only), f4out / cshuffle.
 
 import re
 
-_MXMOE_NUMERIC_TOKENS = {"SK": "kSplitK", "XCD": "xcd_swizzle"}
-_MXMOE_G1_FLAG_TOKENS = {"NT", "F16IN"}
+_MXMOE_NUMERIC_TOKENS = {
+    "SK": "kSplitK",
+    "KW": "k_wave",
+    "XCD": "xcd_swizzle",
+}
+_MXMOE_G1_FLAG_TOKENS = {
+    "NT",
+    "F16IN",
+    "HPF",
+    "FP8OUT",
+    "IL",
+    "SITUV2",
+    "SWIGLU",
+    "BIAS",
+    "W2",
+}
 _MXMOE_G2_FLAG_TOKENS = {"NT", "ATOMIC", "F4OUT", "CSHUFFLE"}
 _MXMOE_NUMERIC_RE = re.compile(r"^([A-Z]+)(\d+)$")
-_MXMOE_TILE_RE = re.compile(r"^(\d+)x(\d+)x(\d+)$")  # <BM>x<BN>x<BK>
+_MXMOE_TILE_RE = re.compile(r"^(\d+)x(\d+)x(\d+)$")
 _MXMOE_PREFIX = {1: "flydsl_mxmoe_g1_a4w4_", 2: "flydsl_mxmoe_g2_a4w4_"}
+_MXMOE_G1_PREFIX_RE = re.compile(r"^flydsl_mxmoe_g1_a(?P<a>[48])w4_")
+MXFP4_G1_VARIANTS = {
+    "fp4": {
+        (32, True, False),
+        (32, False, False),
+        (64, True, False),
+        (64, False, False),
+        (128, False, False),
+        (16, True, True),
+    },
+    "fp8": {
+        (32, True, False),
+        (32, False, False),
+        (64, False, False),
+        (128, False, False),
+        (16, True, True),
+    },
+}
+
+
+def native_scale_layout_for(BM: int, out_dtype: str) -> bool:
+    """The A-scale layout GEMM1 must emit for a block_m and output dtype.
+
+    This is a GEMM1/GEMM2 contract, not a tuning knob: BM16 FP4 output writes
+    the native scale layout and the matching GEMM2 reads it back. FP8 output
+    uses the regular scale layout. Every caller must agree, so the rule lives
+    here.
+    """
+    return int(BM) == 16 and str(out_dtype).lower() == "fp4"
+
+
 _FLYDSL_V2_GEMM2_RE = re.compile(
     r"^flydsl_moe2_layout_a(?P<a>\w+?)_w(?P<b>\w+?)_(?P<out>\w+?)_"
     r"t(?P<tm>\d+)x(?P<tn>\d+)x(?P<tk>\d+)_(?P<epilog>atomic|reduce)"
@@ -26,8 +64,15 @@ _FLYDSL_V2_GEMM2_RE = re.compile(
 
 def _tokenize_mxfp4_kname(kname: str, stage: int, flag_tokens: set) -> dict:
     kname = (kname or "").replace("_FLYDSL", "")
-    pfx = _MXMOE_PREFIX[stage]
-    if not kname.startswith(pfx):
+    mode = {}
+    if stage == 1:
+        prefix_match = _MXMOE_G1_PREFIX_RE.match(kname)
+        pfx = prefix_match.group(0) if prefix_match else ""
+        if prefix_match:
+            mode["a_dtype"] = "fp8" if prefix_match.group("a") == "8" else "fp4"
+    else:
+        pfx = _MXMOE_PREFIX[stage]
+    if not pfx or not kname.startswith(pfx):
         raise ValueError(f"bad mxmoe kernel name: {kname!r} (expected prefix {pfx!r})")
     nums: dict = {}
     flags: set = set()
@@ -37,6 +82,8 @@ def _tokenize_mxfp4_kname(kname: str, stage: int, flag_tokens: set) -> dict:
         mt = _MXMOE_TILE_RE.match(tok)
         if mt:
             nums["BM"] = int(mt.group(1))
+            nums["BN"] = int(mt.group(2))
+            nums["BK"] = int(mt.group(3))
             continue
         utok = tok.upper()
         if utok in flag_tokens:
@@ -47,19 +94,30 @@ def _tokenize_mxfp4_kname(kname: str, stage: int, flag_tokens: set) -> dict:
         if field is None:
             raise ValueError(f"bad mxmoe kernel name {kname!r}: unknown token {tok!r}")
         nums[field] = int(m.group(2))
-    return {"nums": nums, "flags": flags}
+    return {"nums": nums, "flags": flags, "mode": mode}
 
 
 def _parse_mxfp4_g1_kname(kname: str) -> dict:
     parsed = _tokenize_mxfp4_kname(kname, 1, _MXMOE_G1_FLAG_TOKENS)
     nums, flags = parsed["nums"], parsed["flags"]
+    act = "situv2" if "SITUV2" in flags else ("swiglu" if "SWIGLU" in flags else "silu")
     return {
         "BM": nums["BM"],
+        "BN": nums["BN"],
+        "BK": nums["BK"],
         "splitk": "kSplitK" in nums,
         "kSplitK": nums.get("kSplitK", 0),
         "inline_quant": "F16IN" in flags,
+        "prefetch_hidden": "HPF" in flags,
         "use_nt": "NT" in flags,
         "xcd_swizzle": nums.get("xcd_swizzle", 0),
+        "a_dtype": parsed["mode"].get("a_dtype", "fp4"),
+        "out_dtype": "fp8" if "FP8OUT" in flags else "fp4",
+        "interleave": "IL" in flags,
+        "act": act,
+        "enable_bias": "BIAS" in flags,
+        "num_waves": 2 if "W2" in flags else 4,
+        "k_wave": nums.get("k_wave", 1),
     }
 
 
@@ -77,6 +135,8 @@ def _parse_mxfp4_g2_kname(kname: str) -> dict:
         )
     return {
         "BM": nums["BM"],
+        "BN": nums["BN"],
+        "BK": nums["BK"],
         "splitk": "kSplitK" in nums,
         "kSplitK": nums.get("kSplitK", 0),
         "atomic": atomic,

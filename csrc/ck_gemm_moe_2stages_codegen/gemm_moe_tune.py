@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
+import math
 import os
 import re
 import sys
@@ -4726,6 +4727,20 @@ class FmoeTuner(TunerCommon):
                     activation=act_type,
                     quant_type=q_type,
                     doweight_stage1=doweight_stage1,
+                    # The torch reference runs SiTUv2 with the model's betas;
+                    # fused_moe defaults to 1.0. Without this every Situv2 shape
+                    # reports logits_diff ~0.14 (out_norm/ref_norm ~0.61)
+                    # regardless of which kernel it dispatched.
+                    beta=(
+                        DEFAULT_SITUV2_BETA
+                        if act_type == ActivationType.Situv2
+                        else None
+                    ),
+                    linear_beta=(
+                        DEFAULT_SITUV2_LINEAR_BETA
+                        if act_type == ActivationType.Situv2
+                        else None
+                    ),
                     w1_scale=w1_scale_fmoe,
                     w2_scale=w2_scale_fmoe,
                     dtype=dtype,
@@ -6045,6 +6060,37 @@ class GroupedFmoeTuner(FmoeTuner):
         resultdf.to_csv(file, index=False)
 
 
+@functools.lru_cache(maxsize=8)
+def _load_mxfp4_candidate_csv(path, keys):
+    """Index a recommend_mxfp4_candidates.py CSV by shape key.
+
+    lru_cache'd on (path, keys) so each --mp worker process parses the file once;
+    the parent cannot hand the table down, because _mxfp4_tune_shape_worker
+    rebuilds a bare tuner carrying only `keys`.
+    """
+    frame = pd.read_csv(path)
+    required = {*keys, "block_m", "kernelName1", "kernelName2"}
+    missing = required - set(frame.columns)
+    if missing:
+        raise ValueError(
+            f"candidate CSV {path} is missing columns {sorted(missing)}; "
+            "regenerate it with recommend_mxfp4_candidates.py"
+        )
+    if "rank" in frame.columns:
+        frame = frame.sort_values("rank", kind="stable")
+    table = {}
+    for _, row in frame.iterrows():
+        table.setdefault(tuple(str(row[k]) for k in keys), []).append(
+            {
+                "block_m": int(row["block_m"]),
+                "ksplit": int(row.get("ksplit", 0) or 0),
+                "kernelName1": str(row["kernelName1"]),
+                "kernelName2": str(row["kernelName2"]),
+            }
+        )
+    return table
+
+
 class Mxfp4FlydslTuner(FmoeTuner):
     """Tune the FlyDSL mxfp4 a4w4 *port* (flydsl_mxmoe_g{1,2}_a4w4_*) as one coupled
     unit.
@@ -6057,15 +6103,133 @@ class Mxfp4FlydslTuner(FmoeTuner):
         "config_env_name": "AITER_CONFIG_FMOE",
     }
 
+    def _setup_specific_arguments(self):
+        super()._setup_specific_arguments()
+        self.parser.add_argument(
+            "--candidate-csv",
+            dest="candidate_csv",
+            default="",
+            required=False,
+            help=(
+                "Tune only the candidates listed in this CSV instead of enumerating "
+                "the full space. Produced by recommend_mxfp4_candidates.py."
+            ),
+        )
+
     @staticmethod
-    def _g1_kname(bm, use_nt, inline_quant):
-        # flydsl_mxmoe_g1_a4w4_<BM>x256x256[_f16in][_nt]; see mxfp4_kname.py.
-        name = f"flydsl_mxmoe_g1_a4w4_{bm}x256x256"
+    def _g1_kname(
+        bm,
+        use_nt,
+        inline_quant,
+        act="silu",
+        prefetch_hidden=False,
+        bn=256,
+        bk=256,
+        k_wave=1,
+        xcd_swizzle=0,
+        num_waves=4,
+    ):
+        # flydsl_mxmoe_g1_a4w4_<BM>x<BN>x<BK>[_f16in][_hpf][_nt]
+        #   [_situv2|_swiglu][_kw<n>][_xcd<n>][_w2];
+        # token order must match _parse_mxfp4_g1_kname in mxfp4_kname.py.
+        if prefetch_hidden and not inline_quant:
+            raise ValueError("hidden prefetch requires inline quantization")
+        name = f"flydsl_mxmoe_g1_a4w4_{bm}x{bn}x{bk}"
         if inline_quant:
             name += "_f16in"
+        if prefetch_hidden:
+            name += "_hpf"
         if use_nt:
             name += "_nt"
+        if act == "situv2":
+            name += "_situv2"
+        elif act == "swiglu":
+            name += "_swiglu"
+        if k_wave > 1:
+            name += f"_kw{int(k_wave)}"
+        if xcd_swizzle:
+            name += f"_xcd{int(xcd_swizzle)}"
+        if num_waves == 2:
+            name += "_w2"
         return name
+
+    # GEMM1 axes swept on top of (BM, use_nt, inline_quant). Their constraints
+    # interact (BN64 implies BM32 non-inline separated; num_waves==2 implies
+    # BN64; k_wave>1 implies BM32 non-inline and num_waves*k_wave<=8), so
+    # _g1_variants enumerates the cross-product and lets the kernel's own
+    # _assert_supported reject the rest instead of duplicating that logic.
+    _G1_BN = (64, 128, 256)
+    _G1_XCD_SWIZZLE = (0, 2, 4)
+    _G1_K_WAVE = (1, 2, 4)
+    _G1_NUM_WAVES = (4, 2)
+
+    def _g1_variants(self, row):
+        """Valid _g1_kname kwargs for one shape, most-default first."""
+        from aiter.ops.flydsl.mxfp4_gemm1_kernels import _assert_supported
+        from aiter.ops.flydsl.mxfp4_kname import MXFP4_G1_VARIANTS
+
+        ne, h, e = int(row["expert"]), int(row["model_dim"]), int(row["inter_dim"])
+        topk = int(row["topk"])
+        act = self._row_act(row)
+        out = []
+        for bm, use_nt, inline_quant in sorted(MXFP4_G1_VARIANTS["fp4"]):
+            for bn in self._G1_BN:
+                for num_waves in self._G1_NUM_WAVES:
+                    for k_wave in self._G1_K_WAVE:
+                        # Hidden prefetch hoists the next K-tile's hidden_states
+                        # load, which only the inline-quant path performs.
+                        for hpf in (False, True) if inline_quant else (False,):
+                            for xcd in self._G1_XCD_SWIZZLE:
+                                try:
+                                    _assert_supported(
+                                        NE=ne,
+                                        D_HIDDEN=h,
+                                        D_INTER=e,
+                                        topk=topk,
+                                        BM=bm,
+                                        BN=bn,
+                                        BK=256,
+                                        use_nt=use_nt,
+                                        inline_quant=inline_quant,
+                                        prefetch_hidden=hpf,
+                                        act=act,
+                                        situ_beta=DEFAULT_SITUV2_BETA,
+                                        situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+                                        num_waves=num_waves,
+                                        k_wave=k_wave,
+                                        native_scale_layout=bm == 16,
+                                    )
+                                except NotImplementedError:
+                                    continue
+                                out.append(
+                                    {
+                                        "bm": bm,
+                                        "use_nt": use_nt,
+                                        "inline_quant": inline_quant,
+                                        "act": act,
+                                        "prefetch_hidden": hpf,
+                                        "bn": bn,
+                                        "bk": 256,
+                                        "k_wave": k_wave,
+                                        "xcd_swizzle": xcd,
+                                        "num_waves": num_waves,
+                                    }
+                                )
+        return out
+
+    @staticmethod
+    def _row_act(row):
+        """The GEMM1 activation tag for this row.
+
+        Folding Situv2 into Silu makes the tuner write a name without
+        `_situv2`, which fused_moe then rejects on activation mismatch.
+        """
+        act_type = str(row.get("act_type", ""))
+        if act_type.endswith("Situv2"):
+            return "situv2"
+        if act_type.endswith("Swiglu"):
+            return "swiglu"
+        return "silu"
 
     @staticmethod
     def _g2_kname(bm, use_nt, epilog):
@@ -6102,37 +6266,55 @@ class Mxfp4FlydslTuner(FmoeTuner):
         return cand
 
     def _candidate_rows(self, row):
-        from aiter.ops.flydsl.mxfp4_gemm1_kernels import _SUPPORTED as G1
-        from aiter.ops.flydsl.mxfp4_gemm2_kernels import _SUPPORTED as G2
+        # An agent-recommended CSV replaces enumeration outright. A shape missing
+        # from it is an error rather than a silent fall back to the full sweep --
+        # falling back would quietly cost hours of GPU time and produce a result
+        # the CSV never sanctioned.
+        candidate_csv = getattr(self, "_candidate_csv", "")
+        if candidate_csv:
+            keys = tuple(self.keys)
+            table = _load_mxfp4_candidate_csv(candidate_csv, keys)
+            shape_key = tuple(str(row[k]) for k in keys)
+            listed = table.get(shape_key)
+            if not listed:
+                raise ValueError(
+                    f"no candidates in {candidate_csv} for shape "
+                    + ", ".join(f"{k}={row[k]}" for k in keys)
+                    + " -- regenerate it for this shape set and arch"
+                )
+            listed_rows = []
+            for c in listed:
+                cand = self._candidate_row(
+                    row, c["block_m"], c["kernelName1"], c["kernelName2"]
+                )
+                # _candidate_row hardcodes ksplit=0; honour the CSV so the column
+                # is not silently ignored if a future recommender varies it.
+                cand["ksplit"] = c["ksplit"]
+                listed_rows.append(cand)
+            return listed_rows
 
-        g2_bms = {v[0] for v in G2}
         cands = []
-        for bm in sorted({v[0] for v in G1}):
-            for _, n1, iq1 in sorted(v for v in G1 if v[0] == bm):
-                kn1 = self._g1_kname(bm, n1, iq1)
-                # (A) native mxmoe g2 candidates (flydsl_mxmoe_g2_a4w4_*).
-                if bm in g2_bms:
-                    for _, n2, ep in sorted(v for v in G2 if v[0] == bm):
-                        cands.append(
-                            self._candidate_row(
-                                row, bm, kn1, self._g2_kname(bm, n2, ep)
-                            )
-                        )
-                # (B) path B: flydsl_moe2_layout g2 candidates coupled with this
-                # mxmoe g1. Only the native SBM==tile_m==bm variants (verified
-                # correct for BM in {16,32,64,128} x {atomic,reduce}); re-tiling
-                # (tile_m<bm) is not enabled. Selected e2e-fastest by _tune_one_shape.
-                for kn2v, kp in get_flydsl_stage2_v2_kernels(
-                    "fp4",
-                    "fp4",
-                    "bf16",
-                    bm,
-                    model_dim=int(row["model_dim"]),
-                    inter_dim=int(row["inter_dim"]),
-                ).items():
-                    if kp["tile_m"] != bm:
-                        continue
-                    cands.append(self._candidate_row(row, bm, kn1, kn2v))
+        for g1 in self._g1_variants(row):
+            bm = g1["bm"]
+            kn1 = self._g1_kname(**g1)
+            # a4w4 pairs flydsl_mxmoe_g1_* with flydsl_moe2_layout_* only. The
+            # native flydsl_mxmoe_g2_a4w4_* family is deliberately not proposed:
+            # its BK=256 contraction requires D_INTER % 256 == 0, so it cannot
+            # serve inter_dim like 384, and the layout family covers the same
+            # tile space with the sort_block_m contract the port's intermediate
+            # needs. Only native SBM==tile_m==bm variants are used; re-tiling
+            # (tile_m < bm) is not supported by that layout.
+            for kn2v, kp in get_flydsl_stage2_v2_kernels(
+                "fp4",
+                "fp4",
+                "bf16",
+                bm,
+                model_dim=int(row["model_dim"]),
+                inter_dim=int(row["inter_dim"]),
+            ).items():
+                if kp["tile_m"] != bm:
+                    continue
+                cands.append(self._candidate_row(row, bm, kn1, kn2v))
         return cands
 
     @staticmethod
@@ -6173,9 +6355,18 @@ class Mxfp4FlydslTuner(FmoeTuner):
     def _port_e2e(data, kn1, kn2, topk, ne, h, dtype):
         # kn2 may name either gemm2 family (path B or native mxmoe).
         _g2 = parse_g2_kname_any(kn2)
-        BM = _g2["BM"]
         atomic = _g2["atomic"]
-        BM1 = _parse_mxfp4_g1_kname(kn1)["BM"]
+        p1 = _parse_mxfp4_g1_kname(kn1)
+        # One block_m for the whole pipeline, taken from kernelName1 -- mirrors
+        # production, where metadata.block_m comes from kernelName1 and feeds the
+        # sort, the prequant, stage1 and stage2 alike. _candidate_rows only pairs
+        # a g1 with a g2 of the same tile_m, so the two always agree today;
+        # assert it rather than reading both, so relaxing that pairing cannot
+        # silently desync the prequant's block stride from the sorted_ids it walks.
+        BM = p1["BM"]
+        assert (
+            _g2["BM"] == BM
+        ), f"block_m mismatch between {kn1!r} (BM={BM}) and {kn2!r} (BM={_g2['BM']})"
         M = data["input"].shape[0]
         sti, sw, sei, nvi, moe_buf, m_indices, reverse_sorted = moe_sorting(
             data["topk_ids"],
@@ -6185,11 +6376,26 @@ class Mxfp4FlydslTuner(FmoeTuner):
             dtype,
             block_size=BM,
             accumulate=atomic,
-            output_aux=True,
+            output_aux="opus",
         )
         moe_out = moe_buf if moe_buf.numel() else torch.empty((M, h), dtype=dtype)
+        stage1_input = data["input"]
+        stage1_scale = None
+        # Keep the tuner aligned with the production fused_moe_2stages pipeline:
+        # BM16 quantizes inline; the other A4W4 variants consume the fused Opus
+        # prequant output.
+        if BM != 16:
+            stage1_input, stage1_scale = aiter.fused_dynamic_mxfp4_quant_moe_sort(
+                input=data["input"],
+                sorted_ids=sti,
+                num_valid_ids=nvi,
+                token_num=M,
+                topk=topk,
+                block_size=BM,
+                sorted_weights=sw,
+            )
         inter_q, inter_s = _mxfp4_a4w4_stage1_fw(
-            data["input"],
+            stage1_input,
             data["w1_a16"],
             data["w2_a16"],
             sti,
@@ -6197,11 +6403,19 @@ class Mxfp4FlydslTuner(FmoeTuner):
             nvi,
             None,
             topk,
-            block_m=BM1,
+            block_m=BM,
+            a1_scale=stage1_scale,
             w1_scale=data["w1s_a16"],
             kernelName1=kn1,
             m_indices=m_indices,
             moe_buf=moe_buf,
+            # _torch_ref runs SiTUv2 at run_torch_moe_stage1's default betas, so
+            # the kernel has to use the same pair or the candidate fails the
+            # accuracy gate for a reason that is not the kernel's fault.
+            situ_beta=DEFAULT_SITUV2_BETA if p1["act"] == "situv2" else 1.0,
+            situ_linear_beta=(
+                DEFAULT_SITUV2_LINEAR_BETA if p1["act"] == "situv2" else 1.0
+            ),
         )
         return _mxfp4_a4w4_stage2_fw(
             inter_q,
@@ -6256,16 +6470,18 @@ class Mxfp4FlydslTuner(FmoeTuner):
         token, topk = int(row["token"]), int(row["topk"])
         dtype = dtypes.bf16
         kn1, kn2 = candidate["kernelName1"], candidate["kernelName2"]
-        activation = (
-            ActivationType.Swiglu
-            if str(row["act_type"]).endswith("Swiglu")
-            else ActivationType.Silu
-        )
+        activation = {
+            "situv2": ActivationType.Situv2,
+            "swiglu": ActivationType.Swiglu,
+            "silu": ActivationType.Silu,
+        }[self._row_act(row)]
         data = self._prepare_case(token, h, e, ne, topk, dtype)
         out = self._port_e2e(data, kn1, kn2, topk, ne, h, dtype)
         ref = self._torch_ref(data, topk, dtype, activation)
         err = cosine_diff_compare(ref, out, msg=f"port[{kn1}+{kn2}]")
-        if err is None or float(err) > args.errRatio:
+        # NaN must reject explicitly: `nan > errRatio` is False, so a candidate
+        # producing garbage would otherwise pass the gate and, being fast, win.
+        if err is None or not math.isfinite(float(err)) or float(err) > args.errRatio:
             raise RuntimeError(f"cosine err_ratio {err} > {args.errRatio}")
         _, us = run_perftest(
             lambda: self._port_e2e(data, kn1, kn2, topk, ne, h, dtype),
@@ -6293,6 +6509,11 @@ class Mxfp4FlydslTuner(FmoeTuner):
         candidates are caught reliably.
         """
         import signal
+
+        # The only place both the sequential and --mp paths pass through holding
+        # `args`: the mp worker rebuilds a bare tuner carrying just `keys`, so
+        # _candidate_rows cannot read the CSV path off the parent instance.
+        self._candidate_csv = getattr(args, "candidate_csv", "")
 
         timeout = int(getattr(args, "timeout", 0) or 0)
 
@@ -6355,25 +6576,28 @@ class Mxfp4FlydslTuner(FmoeTuner):
             return [self._tune_one_shape(row, args) for row in rows]
 
         # One fresh process per shape (memory fully released between shapes),
-        # spread across mp_num GPUs. A shared queue hands out distinct GPU ids so
-        # the mp_num concurrent workers never collide on the same device.
+        # spread across mp_num GPUs, each on a distinct device.
         import multiprocessing as _mp
 
         print(
             f"[mxfp4-port] tuning {len(rows)} shapes across {mp_num} GPUs", flush=True
         )
         ctx = _mp.get_context("spawn")
-        mgr = ctx.Manager()
-        gpu_q = mgr.Queue()
-        for g in range(mp_num):
-            gpu_q.put(g)
-        payloads = [(self.keys, row, args, gpu_q) for row in rows]
-        with ctx.Pool(processes=mp_num, maxtasksperchild=1) as pool:
-            # chunksize=1 so each shape is its own task: with maxtasksperchild=1
-            # the worker is torn down after every shape (memory fully released,
-            # and one process never spans multiple GPUs via the shared queue).
-            results = pool.map(_mxfp4_tune_shape_worker, payloads, chunksize=1)
-        return results
+        payloads = [(self.keys, row, args, None) for row in rows]
+        results = _run_shapes_isolated(payloads, mp_num, ctx)
+        # A None means the shape's process died mid-shape (e.g. a C++ abort()).
+        # Report it as a failed shape rather than dropping it, so the run
+        # finishes and the failure shows up in the summary.
+        return [
+            (
+                res
+                if res is not None
+                else _mxfp4_failed_row(
+                    self.keys, row, args, "FAILED: worker died mid-shape"
+                )
+            )
+            for row, res in zip(rows, results)
+        ]
 
     def post_process(self, results, args, topk=-1, fast_mode=False):
         del args, topk, fast_mode
@@ -6402,10 +6626,10 @@ class Mxfp4FlydslTuner(FmoeTuner):
 
 
 def _mxfp4_tune_shape_worker(payload):
-    """Spawned worker: tune one shape on a queue-assigned GPU (for --mxfp4-flydsl
-    --mp). Rebuilds a minimal tuner since the instance need only carry ``keys``."""
-    keys, row, args, gpu_q = payload
-    gpu = gpu_q.get()
+    """Spawned worker: tune one shape on the parent-assigned GPU (for
+    --mxfp4-flydsl --mp). Rebuilds a minimal tuner since the instance need only
+    carry ``keys``."""
+    keys, row, args, gpu = payload
     try:
         torch.cuda.set_device(gpu)
         tuner = Mxfp4FlydslTuner.__new__(Mxfp4FlydslTuner)
@@ -6418,16 +6642,90 @@ def _mxfp4_tune_shape_worker(payload):
         return tuner._tune_one_shape(row, args)
     except Exception as exc:  # noqa: BLE001
         # Catastrophic (non per-candidate) failure: record as a failed shape so
-        # the pool keeps going instead of aborting the whole run.
-        best = Mxfp4FlydslTuner.__new__(Mxfp4FlydslTuner)
-        best.keys = keys
-        cand = best._candidate_rows(row)[0]
-        cand["us"] = Mxfp4FlydslTuner.INVALID_TIME
-        cand["kernelName1"] = (f"FAILED(GPU{gpu}): {exc}")[:240]
+        # the run keeps going instead of aborting.
         print(f"[mxfp4-port] shape failed on GPU{gpu}: {exc}", flush=True)
-        return cand
-    finally:
-        gpu_q.put(gpu)
+        return _mxfp4_failed_row(keys, row, args, f"FAILED(GPU{gpu}): {exc}")
+
+
+def _mxfp4_failed_row(keys, row, args, reason):
+    """A tuned-CSV row standing in for a shape that produced no timing.
+
+    Carries `args` only to hand _candidate_rows the same candidate source the
+    shape would have been tuned from, so an agent-recommended CSV still governs
+    the placeholder instead of it falling back to the full sweep.
+    """
+    tuner = Mxfp4FlydslTuner.__new__(Mxfp4FlydslTuner)
+    tuner.keys = keys
+    tuner._candidate_csv = getattr(args, "candidate_csv", "")
+    cand = tuner._candidate_rows(row)[0]
+    cand["us"] = Mxfp4FlydslTuner.INVALID_TIME
+    cand["kernelName1"] = reason[:240]
+    return cand
+
+
+def _mxfp4_shape_proc(payload, out_q, idx):
+    """Child entry point: post the shape's result so the parent can tell a
+    finished shape apart from a worker that died mid-shape."""
+    out_q.put((idx, _mxfp4_tune_shape_worker(payload)))
+
+
+def _run_shapes_isolated(payloads, mp_num, ctx, entry=_mxfp4_shape_proc):
+    """Run each payload in its own fresh process, at most ``mp_num`` at a time.
+
+    Returns one entry per payload: the worker's result, or None if its process
+    died without producing one.
+
+    Why not Pool.map: a pool worker that dies mid-task (a C++ ``abort()`` is not
+    catchable from Python, so an unsupported shape takes the process down with
+    it) is never noticed -- the result simply never arrives and map() waits
+    forever, while the pool quietly spawns idle replacements. Owning the
+    processes lets us read ``exitcode`` and turn a dead worker into a reported
+    failure. GPU ids come from a parent-held free list rather than a shared
+    queue for the same reason: a killed child cannot leak the id it was holding
+    and starve every later shape.
+    """
+    import queue as _queue
+
+    out_q = ctx.Queue()
+    results = [None] * len(payloads)
+    running = {}  # idx -> (Process, gpu)
+    free_gpus = list(range(mp_num))
+    done, nxt = set(), 0
+
+    while len(done) < len(payloads):
+        while nxt < len(payloads) and free_gpus:
+            gpu = free_gpus.pop(0)
+            keys, row, args, _ = payloads[nxt]
+            proc = ctx.Process(
+                target=entry, args=((keys, row, args, gpu), out_q, nxt), daemon=True
+            )
+            proc.start()
+            running[nxt] = (proc, gpu)
+            nxt += 1
+
+        def _reap(idx):
+            proc, gpu = running.pop(idx)
+            proc.join()
+            free_gpus.append(gpu)
+            done.add(idx)
+
+        try:
+            idx, res = out_q.get(timeout=1.0)
+            results[idx] = res
+            _reap(idx)
+        except _queue.Empty:
+            # Nothing arrived for a full second, so any result a just-exited
+            # child had queued would already be here: an exited-but-unreported
+            # index really did die mid-shape.
+            for idx, (proc, _gpu) in list(running.items()):
+                if not proc.is_alive():
+                    print(
+                        f"[mxfp4-port] worker for shape {idx} died "
+                        f"(exitcode={proc.exitcode}) without a result",
+                        flush=True,
+                    )
+                    _reap(idx)
+    return results
 
 
 if __name__ == "__main__":

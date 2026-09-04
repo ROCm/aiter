@@ -34,7 +34,7 @@ def _warn_tile_override(axis: str, inter_dim: int, requested: int, resolved: int
 
     logger.warning(
         "FlyDSL MoE: %s=%d does not divide inter_dim=%d (not 256-aligned); "
-        "forcing %s=%d. tile=%d is NOT usable/tunable for this shape — any tuned "
+        "forcing %s=%d. tile=%d is NOT usable/tunable for this shape -- any tuned "
         "config naming tile=%d here actually runs %d.",
         axis,
         requested,
@@ -919,6 +919,7 @@ def _s2_args_fp4(
     sorted_weights,
     num_valid_ids,
     token_num,
+    x_rows,
     n_in,
     k_in,
     blocks,
@@ -945,6 +946,7 @@ def _s2_args_fp4(
         ptr_arg(num_valid_ids),
         ptr_arg(_bias),
         token_num,
+        x_rows,
         n_in,
         k_in,
         blocks,
@@ -1002,7 +1004,7 @@ def _run_compiled(exe, args):
     except Exception:
         # JitFunction.__call__ leaks ir.Context on compilation failure,
         # causing all subsequent JitFunction calls to take a wrong code path
-        # (self.func(*args) without CompilationContext → gpu_module_body error).
+        # (self.func(*args) without CompilationContext -> gpu_module_body error).
         # Clean up leaked contexts to isolate failures.
         try:
             from flydsl._mlir import ir
@@ -1024,6 +1026,7 @@ def _run_moe_reduction(
     token_num,
     topk,
     model_dim,
+    model_dim_pad=0,
     expert_mask=None,
     topk_ids=None,
     stream=None,
@@ -1049,7 +1052,7 @@ def _run_moe_reduction(
         _reduce_dtype_str = None
 
     if _reduce_dtype_str is None:
-        # Unsupported dtype for the masked kernel — fall back to torch.sum.
+        # Unsupported dtype for the masked kernel -- fall back to torch.sum.
         # This drops the EP mask, so only valid for non-EP runs.
         if use_mask:
             raise NotImplementedError(
@@ -1094,11 +1097,12 @@ def _run_moe_reduction(
     )
     if stream is None:
         stream = torch.cuda.current_stream()
-    # expert_mask is sized by the global expert count (≠ w2.shape[0] under EP).
+    # expert_mask is sized by the global expert count (!= w2.shape[0] under EP).
     num_experts = int(expert_mask.numel()) if use_mask else 0
     reduce_exe = compile_moe_reduction(
         topk=topk,
         model_dim=model_dim,
+        model_dim_pad=model_dim_pad,
         dtype_str=_reduce_dtype_str,
         use_mask=use_mask,
         num_experts=num_experts,
@@ -1135,7 +1139,7 @@ def _run_moe_reduction(
 # largest legal tile_n that divides the required N dims, and (b) zero-pad
 # activations, weights and scales on the K dim to the next multiple of
 # tile_k. Zero padding is algebraically safe for mx-quantized GEMM (the
-# extra K-slice contributes 0·anything = 0), and is cheap relative to the
+# extra K-slice contributes 0 * anything = 0), and is cheap relative to the
 # kernel cost (~2% for 2944 vs 2880).
 # ---------------------------------------------------------------------------
 
@@ -2081,7 +2085,13 @@ def _flydsl_moe_stage2_impl(
         )
         return out
 
+    if inter_states.ndim != 3:
+        raise ValueError(
+            "stage2 intermediate must be 3D "
+            f"[token_num, topk, inter_dim], got shape={tuple(inter_states.shape)}"
+        )
     token_num = inter_states.shape[0]
+    x_rows = inter_states.shape[0] * inter_states.shape[1]
     E = w2.shape[0]
     model_dim = w2.shape[1]
     inter_dim = inter_states.shape[2]
@@ -2210,6 +2220,7 @@ def _flydsl_moe_stage2_impl(
             sw,
             num_valid_ids,
             token_num,
+            x_rows,
             _n_in,
             _k_in,
             m_blocks,
@@ -2272,12 +2283,17 @@ def _flydsl_moe_stage2_impl(
             token_num,
             topk,
             model_dim,
+            model_dim_pad,
             expert_mask,
             topk_ids,
             is_fp8=_s2_fp8_inter,
             fp8_scale_blk=_S2_LEGACY_FP8_SCALE_BLK,
             fp8_pitch_align=_S2_LEGACY_FP8_PITCH_ALIGN,
         )
+    if return_per_slot and model_dim_pad > 0:
+        # No reduction kernel runs in this debug/raw-output mode, so normalize
+        # its unlaunched padded tiles here.
+        out.view(-1, model_dim)[:, model_dim - model_dim_pad :].zero_()
     return out
 
 
