@@ -45,7 +45,6 @@ class TestFileBaton(unittest.TestCase):
                 path,
                 wait_seconds=0,
                 stale_grace_seconds=-1,
-                heartbeat_seconds=0,
             )
             self.assertFalse(baton.wait())
             self.assertTrue(os.path.exists(path))
@@ -55,8 +54,8 @@ class TestFileBaton(unittest.TestCase):
     def test_waiter_does_not_report_completion_during_handoff(self):
         with tempfile.TemporaryDirectory() as tempdir:
             path = os.path.join(tempdir, "build.lock")
-            breaker = FileBaton(path, heartbeat_seconds=0)
-            waiter = FileBaton(path, wait_seconds=0.001, heartbeat_seconds=0)
+            breaker = FileBaton(path)
+            waiter = FileBaton(path, wait_seconds=0.001)
             guard = breaker._try_acquire_steal_guard()
             self.assertIsNotNone(guard)
             result = []
@@ -73,24 +72,63 @@ class TestFileBaton(unittest.TestCase):
             thread.join(1)
             self.assertEqual(result, [True])
 
-    def test_expired_holder_cannot_touch_or_release_successor(self):
+    def test_expired_holder_cannot_release_successor(self):
         with tempfile.TemporaryDirectory() as tempdir:
             path = os.path.join(tempdir, "build.lock")
-            expired = FileBaton(path, heartbeat_seconds=0)
-            successor = FileBaton(path, heartbeat_seconds=0)
+            expired = FileBaton(path)
+            successor = FileBaton(path)
             self.assertTrue(expired.try_acquire())
 
             # Simulate stale recovery replacing the pathname while the expired
             # holder remains alive (for example, a paused container resumes).
             os.remove(path)
             self.assertTrue(successor.try_acquire())
-            successor_mtime = os.stat(path).st_mtime_ns
 
-            self.assertTrue(expired._touch_owned_lock())
-            self.assertEqual(os.stat(path).st_mtime_ns, successor_mtime)
             expired.release()
             self.assertTrue(os.path.exists(path))
             successor.release()
+
+    def test_foreign_namespace_holder_is_not_stolen_while_paused(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = os.path.join(tempdir, "build.lock")
+            holder = FileBaton(path)
+            waiter = FileBaton(path)
+            self.assertTrue(holder.try_acquire())
+
+            with mock.patch(
+                "aiter.jit.utils.file_baton._pid_namespace",
+                return_value="pid:[different]",
+            ):
+                self.assertFalse(waiter._is_stale())
+            holder.release()
+
+    def test_incomplete_owner_record_is_not_stolen_while_flock_is_held(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = os.path.join(tempdir, "build.lock")
+            holder = FileBaton(path)
+            waiter = FileBaton(path, stale_grace_seconds=-1)
+            self.assertTrue(holder.try_acquire())
+            os.ftruncate(holder.fd, 0)
+
+            self.assertFalse(waiter._is_stale())
+            holder.release()
+
+    def test_foreign_namespace_dead_holder_is_recoverable(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = os.path.join(tempdir, "build.lock")
+            holder = FileBaton(path)
+            waiter = FileBaton(path)
+            self.assertTrue(holder.try_acquire())
+            os.close(holder.fd)  # simulate process death without release()
+            holder.fd = None
+
+            with mock.patch(
+                "aiter.jit.utils.file_baton._pid_namespace",
+                return_value="pid:[different]",
+            ):
+                self.assertTrue(waiter._is_stale())
+                self.assertFalse(waiter.wait())
+            waiter.release()
 
 
 if __name__ == "__main__":

@@ -7,7 +7,6 @@ import logging
 import multiprocessing
 import os
 import socket
-import threading
 import time
 
 logger = logging.getLogger("aiter")
@@ -61,10 +60,10 @@ class FileBaton:
       restarts, so the wedge is permanent until someone deletes the file.
     * **PID reuse** after the holder dies, on any host.
 
-    The namespace id and start time disambiguate both. For a holder in another
-    namespace, whose liveness cannot be checked from here at all, the holder
-    heartbeats the lock's mtime while it works, so waiters can fall back to
-    "has not been touched in ``heartbeat_stale_seconds``".
+    The namespace id and start time disambiguate identity. New-format holders
+    also retain a kernel ``flock`` for the full build: process death releases
+    it automatically, while a paused process keeps it, so cross-namespace
+    recovery never has to guess from a heartbeat timeout.
     """
 
     def __init__(
@@ -72,8 +71,6 @@ class FileBaton:
         lock_file_path,
         wait_seconds=0.2,
         stale_grace_seconds=10.0,
-        heartbeat_seconds=5.0,
-        heartbeat_stale_seconds=60.0,
     ):
         """
         Create a new :class:`FileBaton`.
@@ -86,21 +83,11 @@ class FileBaton:
                 info (e.g. a 0-byte lock from a crash), how old it must be
                 before being treated as stale. Protects the brief window
                 between create and write in a healthy builder.
-            heartbeat_seconds: How often the holder touches the lock while it
-                works, so that waiters in another PID namespace can tell a
-                working builder from a dead one.
-            heartbeat_stale_seconds: How long a lock held by a holder in
-                another PID namespace may go untouched before it is considered
-                stale. Must be comfortably larger than heartbeat_seconds.
         """
         self.lock_file_path = lock_file_path
         self.wait_seconds = wait_seconds
         self.stale_grace_seconds = stale_grace_seconds
-        self.heartbeat_seconds = heartbeat_seconds
-        self.heartbeat_stale_seconds = heartbeat_stale_seconds
         self.fd = None
-        self._stop_heartbeat = None
-        self._heartbeat_thread = None
 
     def try_acquire(self):
         """
@@ -116,22 +103,32 @@ class FileBaton:
         if self.fd is not None:
             return True
         try:
-            self.fd = os.open(self.lock_file_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            fd = os.open(self.lock_file_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o644)
         except FileExistsError:
             return False
         try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            try:
+                os.remove(self.lock_file_path)
+            except FileNotFoundError:
+                pass
+            raise
+        self.fd = fd
+        try:
+            os.fchmod(self.fd, 0o644)
             pid = os.getpid()
             os.write(
                 self.fd,
                 (
                     f"{pid}\n{socket.gethostname()}\n"
-                    f"{_pid_namespace()}\n{_process_start_time(pid)}\n"
+                    f"{_pid_namespace()}\n{_process_start_time(pid)}\nflock\n"
                 ).encode(),
             )
             os.fsync(self.fd)
         except OSError:
             pass
-        self._start_heartbeat()
         return True
 
     def wait(self):
@@ -176,12 +173,6 @@ class FileBaton:
 
     def release(self):
         """Release the baton and remove its file."""
-        if self._stop_heartbeat is not None:
-            self._stop_heartbeat.set()
-            self._stop_heartbeat = None
-        if self._heartbeat_thread is not None:
-            self._heartbeat_thread.join()
-            self._heartbeat_thread = None
         if self.fd is None:
             return
 
@@ -205,36 +196,6 @@ class FileBaton:
             self.fd = None
             if sfd is not None:
                 self._release_steal_guard(sfd)
-
-    def _start_heartbeat(self):
-        """Touch the lock while we hold it, so waiters that cannot check our
-        pid (another PID namespace) can still tell we are alive."""
-        if self.heartbeat_seconds <= 0:
-            return
-        stop = threading.Event()
-        interval = self.heartbeat_seconds
-
-        def _beat():
-            while not stop.wait(interval):
-                if not self._touch_owned_lock():
-                    return  # lock gone or unwritable: nothing useful to do
-
-        thread = threading.Thread(
-            target=_beat, name="aiter-baton-heartbeat", daemon=True
-        )
-        thread.start()
-        self._stop_heartbeat = stop
-        self._heartbeat_thread = thread
-
-    def _touch_owned_lock(self):
-        """Heartbeat the acquired inode, never a successor at the same path."""
-        if self.fd is None:
-            return False
-        try:
-            os.utime(self.fd, None)
-        except OSError:
-            return False
-        return True
 
     def _owns_lock_path(self):
         """Whether the path still names the inode acquired by this instance."""
@@ -276,21 +237,22 @@ class FileBaton:
     # ---- stale-lock detection ----
 
     def _read_owner(self):
-        """Return (pid, host, ns, start_time) from the lock file.
+        """Return (pid, host, ns, start_time, protocol) from the lock file.
 
         Locks written by an older AITER carry only pid + host; they parse with
-        ns and start_time empty and keep the previous behaviour.
+        the remaining fields empty and keep the previous behaviour.
         """
         try:
             with open(self.lock_file_path, "r") as f:
                 lines = f.read().splitlines()
         except (FileNotFoundError, OSError):
-            return None, None, "", ""
+            return None, None, "", "", ""
         if len(lines) < 2 or not lines[0].strip().isdigit():
-            return None, None, "", ""
+            return None, None, "", "", ""
         ns = lines[2].strip() if len(lines) > 2 else ""
         start = lines[3].strip() if len(lines) > 3 else ""
-        return int(lines[0].strip()), lines[1].strip(), ns, start
+        protocol = lines[4].strip() if len(lines) > 4 else ""
+        return int(lines[0].strip()), lines[1].strip(), ns, start, protocol
 
     @staticmethod
     def _pid_alive(pid):
@@ -302,17 +264,26 @@ class FileBaton:
             return True  # exists but owned by another user
         return True
 
-    def _untouched_for(self):
-        """Seconds since the lock file was last touched, or None."""
+    def _owner_flock_released(self):
+        """Whether the kernel released the build owner's lifetime lock."""
         try:
-            return time.time() - os.path.getmtime(self.lock_file_path)
+            fd = os.open(self.lock_file_path, os.O_RDONLY)
         except OSError:
-            return None
+            return False
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return True
+        finally:
+            os.close(fd)
 
     def _is_stale(self):
         """A lock is stale if its recorded holder is dead, or if it carries no
         owner info and has outlived the grace period (orphaned/0-byte lock)."""
-        pid, host, ns, start = self._read_owner()
+        pid, host, ns, start, protocol = self._read_owner()
         if pid is None:
             # No readable owner: only trust mtime, and only for our own host
             # cannot be verified, so fall back to an age-based grace window.
@@ -320,19 +291,23 @@ class FileBaton:
                 age = time.time() - os.path.getmtime(self.lock_file_path)
             except OSError:
                 return False
-            return age > self.stale_grace_seconds
+            return age > self.stale_grace_seconds and self._owner_flock_released()
         if host != socket.gethostname():
             # Different host (e.g. shared filesystem): can't check liveness,
             # never steal — avoid breaking a live remote builder's lock.
             return False
+        if protocol == "flock":
+            # For new-format locks the kernel-held lifetime lock is the
+            # authority in every local PID namespace. It remains held while a
+            # process is paused and is released automatically on process exit.
+            return self._owner_flock_released()
         my_ns = _pid_namespace()
         if ns and my_ns and ns != my_ns:
             # Same host, different PID namespace: the recorded pid means
-            # nothing here (every container has a pid 1 and low worker pids),
-            # so pid liveness would be a coin flip that reliably says "alive".
-            # Decide on the holder's heartbeat instead.
-            untouched = self._untouched_for()
-            return untouched is not None and untouched > self.heartbeat_stale_seconds
+            # nothing here. A lifetime flock distinguishes a dead process from
+            # a paused one without guessing from a delayed heartbeat. Locks
+            # from the pre-flock format are not safe to steal across namespaces.
+            return False
         if not self._pid_alive(pid):
             return True
         if start:
