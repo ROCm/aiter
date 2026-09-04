@@ -210,6 +210,31 @@ Real example (aiter#3944): `arith.bitcast(val, ...)` inside a bf16/f16 output pa
 
 ---
 
+**D11 — Struct field added or removed with a pinned ABI** 🔴
+
+_"The layout is a contract with something that was compiled separately."_
+
+Trigger: a `struct`/`class` in `.h`/`.cuh`/`.cu` gains or loses a field, and the diff touches
+no `offsetof(` / `static_assert(sizeof(...))` line. aiter pins every kargs struct a
+hand-written code object reads — `csrc/py_itfs_cu/` carries 40 such assertions across 37
+files, and 6% of open PRs touch one.
+
+Inserting a field anywhere but the end shifts every offset after it. The assertions exist to
+turn that into a compile error rather than a wrong-address launch; the failure to look for is
+a PR that changes the layout and leaves them alone.
+
+Real example (aiter#5220): two `int`s added between `stride_qo_h` and `stride_kv_page` of
+`pa_sparse_prefill_kargs`. `sizeof` goes 112 → 120 and the offsets of `stride_kv_page` and
+`softmax_scale` each shift by 8, so all three assertions in the *same translation unit the PR
+edits* fail. The assertion text says what is actually required: rebuild the gfx1250 code
+objects, then update the table.
+
+FP self-check: appending at the end of the struct shifts nothing, and a PR that updates the
+assertions alongside the field is the correct shape — do not fire on either.
+→ `🔴 D11: [field] added to [struct] before [next field] — sizeof and the offsets after it shift; update the PA_GFX1250_CO_ABI table and rebuild the code objects, or append at the end`
+
+---
+
 ### E — Cross-Repo Sync
 _"The change is incomplete without a matching update in another repo."_
 

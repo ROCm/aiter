@@ -72,7 +72,97 @@ def triton_families(add):
     return fams
 
 
-def derive(files, title=""):
+
+def conditional_binding(files):
+    """D1b: a name assigned only inside an added `if/elif` and used after the block.
+
+    Matching "an `if` exists and something is indented" fired on 68% of 600 PRs, which
+    is not a triage. D1b's own text says: assigned on some branches, referenced
+    unconditionally later, and exempt when a definitive `else` also assigns it."""
+    for f in files.values():
+        lines = f["add"]
+        for i, l in enumerate(lines):
+            m = re.match(r"(\s*)(el)?if\b.*:\s*$", l)
+            if not m:
+                continue
+            base = len(m.group(1))
+            assigned, has_else, j = set(), False, i + 1
+            while j < len(lines):
+                cur = lines[j]
+                if not cur.strip():
+                    j += 1
+                    continue
+                ind = len(cur) - len(cur.lstrip())
+                if ind <= base:
+                    if re.match(r"\s*(else|elif)\b", cur):
+                        has_else = has_else or cur.lstrip().startswith("else")
+                        j += 1
+                        continue
+                    break
+                a = re.match(r"\s*([A-Za-z_]\w*)\s*=(?!=)", cur)
+                if a:
+                    assigned.add(a.group(1))
+                j += 1
+            if has_else or not assigned:
+                continue
+            after = "\n".join(lines[j:j + 25])
+            for name in assigned:
+                if re.search(rf"(?<![\w.]){re.escape(name)}\b", after):
+                    return True
+    return False
+
+
+
+C_LIKE = ("cu", "cuh", "h", "hpp", "cpp", "cc")
+NOT_A_FIELD = re.compile(r"^\s*(break|continue|return|goto|else|case|default|using|"
+                         r"typedef|friend|public|private|protected)\b")
+
+
+def struct_field_churn(diff_text):
+    """A struct gained or lost a field, and the diff touched no ABI assertion.
+
+    aiter pins the layout of every kargs struct a hand-written code object reads:
+    `static_assert(sizeof(pa_sparse_prefill_kargs) == 112)` plus one `offsetof` per
+    field. Inserting a field in the middle shifts every offset after it, which is a
+    build break at best and a silent ABI mismatch with a prebuilt code object at worst.
+    aiter#5220 adds two ints between `stride_qo_h` and `stride_kv_page` in the same
+    translation unit that carries the assertions, and updates none of them.
+
+    Fires only when the diff itself does NOT touch an assertion -- a PR that moves the
+    fields and fixes the table is the correct shape and needs no finding."""
+    if re.search(r"(?m)^[+-].*(offsetof\(|static_assert\(\s*sizeof)", diff_text):
+        return False
+    for blk in re.split(r"(?m)^diff --git ", diff_text)[1:]:
+        head = blk.split("\n", 1)[0]
+        m = re.match(r"a/(\S+) b/(\S+)", head)
+        if not m or m.group(2).rsplit(".", 1)[-1] not in C_LIKE:
+            continue
+        in_struct = False
+        for ln in blk.split("\n"):
+            # git puts the enclosing scope after the second @@, and a field added to an
+            # existing struct is exactly the case where the `struct X {` line is context
+            # the hunk never shows. aiter#5220's hunk header is
+            # `@@ -129,6 +129,10 @@ struct pa_sparse_prefill_kargs`.
+            hh = re.match(r"@@ [^@]*@@\s*(.*)$", ln)
+            if hh:
+                in_struct = bool(re.search(r"\b(struct|class)\s+\w+", hh.group(1)))
+                continue
+            body = ln[1:] if ln[:1] in "+- " else ln
+            if re.search(r"\b(struct|class)\s+\w+.*\{", body):
+                in_struct = True
+            elif re.match(r"\s*\}\s*;", body):
+                in_struct = False
+            if not (in_struct and ln[:1] in "+-") or ln.startswith(("+++", "---")):
+                continue
+            if NOT_A_FIELD.match(body) or "(" in body or body.strip().startswith("//"):
+                continue
+            if re.match(r"\s*(const\s+)?[\w:<>,\*&]+(\s+[\w:<>\*&]+)+"
+                        r"(\s*\[[^\]]*\])?\s*;\s*$", body):
+                return True
+    return False
+
+
+def derive(files, title="", raw_diff=""):
     paths = list(files)
     add = "\n".join(l for f in files.values() for l in f["add"])
     dele = "\n".join(l for f in files.values() for l in f["del"])
@@ -130,7 +220,7 @@ def derive(files, title=""):
     if any("flydsl" in p.lower() for p in paths):
         hit("flydsl", "D10 D10b")
     if any(d in p for p in paths for d in DOWNSTREAM):
-        hit("downstream-op", "E4 E5")
+        hit("downstream-op", "E4 E5 A2")   # A2 is the same shared-path condition
     if any("codegen" in p or p.startswith("csrc/cpp_itfs/") or p.endswith("Makefile")
            for p in paths):
         hit("codegen-buildtool", "A1 D5 B6")
@@ -150,31 +240,110 @@ def derive(files, title=""):
         hit("alignment", "B7 B2 D8")
     if re.search(r"_preshuffled|_quantized|weight_transform", add):
         hit("weight-variant", "F1")
-    if re.search(r'os\.environ\.get\(\s*["\']AITER_', add):
+    # Any new module-level env knob, not only AITER_-prefixed ones. The prefix was in the
+    # pattern, so aiter#5157 -- which adds six permanent switches named KR_TAILSPLIT,
+    # KR_TS_OCC, KR_TS_MAX_SEG, KR_TS_MIN_SEG, KR_TS_CAP_BLOCKS, KR_TS_TRIM_GRID -- derived
+    # no env-var family at all, and HK9 exists precisely because aiter rejects permanent
+    # env flags (AITER_MOE_FORCE_BF16_ACT in #3593 was reverted by #4225).
+    # HK9 is about a permanent RUNTIME knob. A benchmark or profiling script setting
+    # PROF_WARMUP/PROF_ITERS is not one, and firing there teaches the reviewer that the
+    # family is noise (aiter#3976 adds three, all in op_tests/flydsl_tests/).
+    runtime_env = "\n".join(
+        l for p, f in files.items() if not p.startswith(("op_tests/", "tests/"))
+        and "bench" not in p and "profile" not in p for l in f["add"])
+    if re.search(r'^\w+\s*=.*os\.environ\.(get|\[)|^\s*os\.environ\.get\(',
+                 runtime_env, re.M) \
+       or re.search(r'os\.environ\.get\(\s*["\']AITER_', runtime_env):
         hit("new-env-var", "HK9 D2")
+    # --- rules whose trigger is textual but which no family emitted ---------------
+    # Sixteen documented rules were derivable by nothing at all, so every review read
+    # past them 100% of the time. Their own trigger text is structural -- "`# TODO` on a
+    # `+` line", "develop=True in added code" -- it was simply never wired up.
+    if any(p.endswith(".sh") or re.search(r"(^|/)(runperf|test_local_)", p) for p in paths):
+        hit("temp-script", "HK1")
+    if re.search(r"sys\.path\.(insert|append)\(", add):
+        hit("syspath-mutation", "HK3")
+    if re.search(r"#\s*(TODO|FIXME)|raise NotImplementedError|^\s*pass\s*$", add, re.M):
+        hit("incomplete-code", "HK7")
+    if re.search(r"@compile_ops\([^)]*develop\s*=\s*True", add) or "develop=True" in add:
+        hit("develop-flag", "HK8")
+    if any(p.startswith(("op_tests/", "tests/")) for p in paths) and \
+       re.search(r"\.to\(torch\.float32\)|\.double\(\)|\.float\(\)", add):
+        hit("test-reference-dtype", "HK10")
+    if any(re.search(r"requirements.*\.txt$|setup\.py$|pyproject\.toml$", p) for p in paths):
+        hit("new-dependency", "HK11")
+    # B5 names the signal itself: a new tl.constexpr bool gating a validity check,
+    # e.g. CHECK_NEG_ONE_SENTINEL, CHECK_BOUNDS.
+    if re.search(r"\b(CHECK|VALIDATE|VERIFY|ASSERT|GUARD|BOUNDS|SENTINEL|MASK|CLAMP)\w*"
+                 r"\s*:\s*tl\.constexpr", add) or \
+       re.search(r"\b\w*(CHECK|BOUNDS|SENTINEL|VALID)\w*\s*=\s*(True|False)\b", add):
+        hit("constexpr-guard-off", "B5")
+    if re.search(r"(torch\.(float16|bfloat16|float8\w*)|dtype\s*=\s*torch\.\w+)", add) and \
+       not re.search(r"\.dtype\s*==|is_floating_point|\.dtype\b.*(in|==)", add):
+        hit("dtype-assumed", "C3")
+    if conditional_binding(files):
+        hit("conditional-binding", "D1b")
+    if re.search(r"def \w+\([^)]*\w+\s*=\s*(None|False|0|1|\"\")", add):
+        hit("defaulted-param", "E2")
+    if any("bridge" in p or "plugin" in p or "_ext" in p for p in paths):
+        hit("plugin-bridge", "E3")
+    if re.search(r"num_heads|\btp_size\b|tensor_parallel|\bTP\b", add):
+        hit("tp-shapes", "P4")
+    if len({p.split("/")[0] for p in paths}) >= 3:
+        hit("scattered-diff", "HK2")
+    if any(f["new"] and re.search(r"(_v\d+|_opt|_variant|_fast|_new)\.(py|cu|hip)$", p)
+           for p, f in files.items()):
+        hit("nth-variant", "HK5")
+    if struct_field_churn(raw_diff):
+        hit("struct-abi", "D11")
+
     if any(p.startswith(("aiter/ops/triton/",)) or "/triton/" in p or
            "_triton_kernels/" in p or "_gluon_kernels/" in p or "/gluon/" in p
            for p in paths):
         t.extend(triton_families(add))
     return t
 
+# Rules deliberately absent from every derivation, with the reason. A rule not on this
+# list and not emitted by any family is unreachable: documented, and read by nobody, ever.
+# tests/test_review_skill.py fails on that, because the failure is invisible from inside a
+# review -- the ledger only sees rules that were derived.
+UNREACHABLE_BY_DESIGN = {
+    # scan_index_width.py runs in Step 1 and puts its candidates in front of the reviewer
+    # before the rule pass. The prose would be a second, weaker copy of a result already
+    # on screen; a 14-PR run showed the prose version catching 0 of 3 known defects.
+    "D9": "scanner-backed: scan_index_width.py reports it in Step 1",
+}
+
 ALL_RULES = ("A1 A2 A3 B1 B2 B3 B4 B5 B6 B7 C1 C2 C3 C4 D1 D1b D2 D3 D4 D5 D6 D7 D8 "
              "D10 D10b E1 E2 E3 E4 E5 F1 G1 G1b P1 P2 P3 P4 P5 P6 HK1 HK2 HK3 "
-             "T1 T2 T3 T4 T5 T6 STEP4")
+             "T1 T2 T3 T4 T5 T6 D11 STEP4")
 
 def deleted_guard_symbols(diff_text):
-    """Symbols named by assert / *_CHECK lines the diff removes."""
+    """Symbols named by a guard the diff removes.
+
+    The `invariant-removed` family fires on assert / *_CHECK / `.contiguous()` /
+    `torch.zeros` in deleted lines, but this collected symbols only from the first three.
+    A removed `.contiguous()` normalisation -- the most common shape of the finding, and
+    the one where the answer is usually "it moved" -- produced no evidence at all, so the
+    reviewer was back to grepping by hand, which is what this exists to stop.
+    aiter#5235 relocates two of them and the collector said nothing."""
     syms = set()
     for ln in diff_text.splitlines():
         if not ln.startswith("-") or ln.startswith("---"):
             continue
         body = ln[1:]
-        if not re.search(r"\b(assert|AITER_CHECK|TORCH_CHECK)\b", body):
-            continue
-        for m in re.finditer(r"\b([a-zA-Z_]\w*)\s+is\s+not\s+None", body):
-            syms.add(m.group(1))
-        for m in re.finditer(r"\b([a-zA-Z_]\w*)->", body):
-            syms.add(m.group(1))
+        if re.search(r"\b(assert|AITER_CHECK|TORCH_CHECK)\b", body):
+            for m in re.finditer(r"\b([a-zA-Z_]\w*)\s+is\s+not\s+None", body):
+                syms.add(m.group(1))
+            for m in re.finditer(r"\b([a-zA-Z_]\w*)->", body):
+                syms.add(m.group(1))
+        if re.search(r"\.contiguous\(\)|torch\.zeros|\.zero_\(\)", body):
+            # the thing being normalised: `self.w2 = w2 if ... else w2.contiguous()`
+            m = re.match(r"\s*(?:self\.)?([a-zA-Z_]\w*)\s*=", body)
+            if m:
+                syms.add(m.group(1))
+            for m in re.finditer(r"\b([a-zA-Z_]\w*)\.(?:contiguous|zero_)\(\)", body):
+                syms.add(m.group(1))
     return sorted(syms)
 
 def evidence(sym, files):
@@ -198,12 +367,44 @@ STDLIB_OR_THIRD_PARTY = re.compile(
 
 
 def added_imports(diff_text):
-    """(module, [names], line) for every import line the diff ADDS."""
+    """(module, [names], line) for every import line the diff ADDS.
+
+    Relative imports are resolved against the file they appear in, so `from .chip_info
+    import get_asic_revision` inside aiter/jit/utils/asm_guard.py becomes
+    aiter.jit.utils.chip_info. Skipping them entirely left the one case where an
+    unresolvable import is worst -- a Tier-1 PR wiring a new module into
+    aiter/__init__.py, where a bad relative import breaks `import aiter` outright."""
     out = []
+    cur_pkg = None
     for ln in diff_text.splitlines():
+        m = re.match(r"^diff --git a/\S+ b/(\S+)", ln)
+        if m:
+            path = m.group(1)
+            cur_pkg = path[:-3].replace("/", ".") if path.endswith(".py") else None
+            if cur_pkg and cur_pkg.endswith(".__init__"):
+                cur_pkg = cur_pkg[: -len(".__init__")]
+            continue
         if not ln.startswith("+") or ln.startswith("+++"):
             continue
+        if cur_pkg is None:
+            # Not a .py file. An `import` line inside docs/tutorials/add_new_op.rst is a
+            # worked example, not code, and `from ..jit.core import compile_ops` there
+            # was reported as a missing module on two PRs.
+            continue
         body = ln[1:].strip()
+        rel = re.match(r"from\s+(\.+)([\w.]*)\s+import\s+(.+)$", body)
+        if rel:
+            dots, tail, names = rel.group(1), rel.group(2), rel.group(3)
+            parts = cur_pkg.split(".")[:-1]          # drop the module itself
+            up = len(dots) - 1
+            if up > len(parts):
+                continue                              # escapes the tree; leave alone
+            base = parts[: len(parts) - up] if up else parts
+            mod = ".".join(base + ([tail] if tail else []))
+            names = names.split("#")[0].replace("(", "").replace(")", "")
+            out.append((mod, [n.strip().split(" as ")[0]
+                              for n in names.split(",") if n.strip()], body))
+            continue
         m = re.match(r"from\s+([\w.]+)\s+import\s+(.+)$", body)
         if m:
             mod, names = m.group(1), m.group(2)
@@ -285,6 +486,14 @@ def sweep_symbols(diff_text, root):
             cur = m.group(2)
         elif ln.startswith("new file mode") and cur:
             added_paths.add(cur)
+        elif ln.startswith(("rename to ", "copy to ")):
+            # A moved file has no `new file mode`; git writes `rename from`/`rename to`
+            # and, at similarity 100%, no hunks at all. Counting only new-file markers
+            # made every reorganisation PR report its own destination paths as missing
+            # modules -- aiter#5254 moves 74 files under a new linear_attention/ package
+            # with 53 renames and 5 new files, and produced 83 UNRESOLVED-IMPORT lines,
+            # every one of them pointing at a path the PR itself creates.
+            added_paths.add(ln.split(" to ", 1)[1].strip())
     added_syms = set()
     for ln in diff_text.splitlines():
         if ln.startswith("+") and not ln.startswith("+++"):
@@ -295,7 +504,9 @@ def sweep_symbols(diff_text, root):
             if m:
                 added_syms.add(m.group(1))
     for mod, names, line in added_imports(diff_text):
-        if STDLIB_OR_THIRD_PARTY.match(mod) or mod.startswith("."):
+        # No `mod.startswith(".")` here: added_imports resolves relative imports against
+        # the file they appear in, so nothing dotted-relative reaches this point.
+        if STDLIB_OR_THIRD_PARTY.match(mod):
             continue
         top = mod.split(".")[0]
         if not (root / top).exists() and not (root / f"{top}.py").exists():
@@ -310,6 +521,13 @@ def sweep_symbols(diff_text, root):
         for n in names:
             if n in added_syms:
                 continue      # this PR defines the symbol
+            # `from pkg import sub` where THIS PR adds pkg/sub.py. The added-module check
+            # above only covers the dotted module itself, so a PR that adds a submodule
+            # and imports it by name was reported against its own new file -- aiter#5157
+            # adds aiter/ops/triton/attention/kr_ua.py and imports `kr_ua` from the
+            # package.
+            if f"{rel}/{n}.py" in added_paths or f"{rel}/{n}/__init__.py" in added_paths:
+                continue
             if not symbol_defined(target, n):
                 bad.append((line, f"'{n}' is defined neither in {target.relative_to(root)} nor in this diff"))
     return bad
@@ -413,6 +631,12 @@ def expand_rules(rules_text, rules_md):
     # names Step 4 rather than a rule body. Treating either as a missing body reported 277
     # of 600 PRs as drifted when nothing had drifted.
     table_rows, table_head = {}, []
+    # Both assignments of this flag are equivalent mutants today and that is contingent,
+    # not safe: the flag is closed by the first `###` before any table row appears, and
+    # nothing after Housekeeping carries a table, so flipping either changes no output.
+    # Move a table into the span this scan walks and the equivalence ends -- rows from
+    # another section would be emitted as housekeeping rules. No test can distinguish the
+    # two today; writing one that passes regardless would only have flattered the score.
     in_hk = False
     for i, l in enumerate(lines):
         if l.startswith("### Housekeeping"):
@@ -452,15 +676,154 @@ def expand_rules(rules_text, rules_md):
     return "\n".join(out).rstrip() + "\n", emitted, unresolved
 
 
+# --------------------------------------------------------------- answers ledger
+ANSWER_KEY = re.compile(r"^\s*(Q[1-5]|BLIND)\s*[:\-]\s*(.+?)\s*$", re.I)
+MIN_ANSWER = 40
+SURFACE = re.compile(
+    r"^(n/?a|none|no|yes|ok|nothing|same|unchanged|see above|tbd|clean|fine|-+)\.?$", re.I)
+
+
+DIAGNOSTIC_KEY = re.compile(r"^\s*([1-6])\s*[:\-]\s*(.+?)\s*$")
+
+
+def audit_diagnostic(text):
+    """Step 6's six structural checks, as lines rather than as intentions.
+
+    Check 1 is now a pointer at $WORK/symbols.txt rather than a request to grep every new
+    symbol by hand -- the sweep already ran. The other five have no tool behind them, which
+    is exactly why they need to leave a trace."""
+    seen = {}
+    for ln in text.splitlines():
+        m = DIAGNOSTIC_KEY.match(ln)
+        if m:
+            seen[m.group(1)] = m.group(2).strip()
+    want = [str(i) for i in range(1, 7)]
+    missing = [q for q in want if q not in seen]
+    thin = [q for q in want
+            if q in seen and (len(seen[q]) < MIN_ANSWER or SURFACE.match(seen[q]))]
+    return missing, thin
+
+
+def audit_answers(text):
+    """Step 2's five questions and Step 7.5's one, as an artifact.
+
+    They were prose asking the model to fill in `_Answer:_` inline, which leaves nothing
+    behind: a review that skipped them is textually identical to one that did them. This
+    is the same failure D9 had before its scan moved into Step 1, and the same one the
+    rule pass had before the ledger.
+
+    A bare "no" to the blind-spot question is the answer that costs nothing to give and
+    is worth nothing to receive, so short and formulaic answers are rejected. This checks
+    that an answer was written, not that it is right -- being wrong is visible in the
+    card, being absent is not."""
+    seen = {}
+    for ln in text.splitlines():
+        m = ANSWER_KEY.match(ln)
+        if m:
+            seen[m.group(1).upper()] = m.group(2).strip()
+    want = ["Q1", "Q2", "Q3", "Q4", "Q5", "BLIND"]
+    missing = [q for q in want if q not in seen]
+    thin = [q for q in want
+            if q in seen and (len(seen[q]) < MIN_ANSWER or SURFACE.match(seen[q]))]
+    return missing, thin
+
+
+
+# ------------------------------------------------------------------- mapping
+def family_mapping():
+    """(family, rules) for every family `derive` can emit, read out of this file.
+
+    Step 3 carried this table by hand and it drifted: it claimed D9 was derived (D9 is
+    scanner-backed and deliberately is not) and omitted 21 rules that are, including all
+    six Triton rules. A mapping a reviewer is told not to apply by hand has no business
+    being maintained by hand either -- it is generated now, and tests/ fails if the
+    committed copy and this function disagree."""
+    src = pathlib.Path(__file__).read_text()
+    out, seen = [], set()
+    for m in re.finditer(r'(?:hit|fams\.append)\(\(?"([\w-]+)",\s*"([^"]+)"\)?\)', src):
+        fam, rules = m.group(1), m.group(2)
+        if fam in seen:
+            continue
+        seen.add(fam)
+        out.append((fam, rules))
+    return out
+
+
+def render_mapping():
+    rows = family_mapping()
+    width = max(len(f) for f, _ in rows)
+    lines = ["# Family -> rule mapping",
+             "",
+             "Generated by `triage.py mapping`. Do not edit: `tests/test_review_skill.py`",
+             "fails when this file and the deriver disagree. Regenerate with",
+             "`python3 triage.py mapping > MAPPING.md`.",
+             "",
+             f"{len(rows)} families, {len(set(r for _, rs in rows for r in rs.split()))} "
+             f"distinct rule ids.",
+             "",
+             "| family | rules |",
+             "|---|---|"]
+    for fam, rules in rows:
+        lines.append(f"| `{fam}`{' ' * (width - len(fam))} | {rules} |")
+    excl = sorted(UNREACHABLE_BY_DESIGN)
+    if excl:
+        lines += ["", "Documented but deliberately never derived:", ""]
+        for rid in excl:
+            lines.append(f"- **{rid}** — {UNREACHABLE_BY_DESIGN[rid]}")
+    return "\n".join(lines) + "\n"
+
+
+
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
-    if mode not in ("rules", "evidence", "symbols", "ledger", "expand"):
+    if mode not in ("rules", "evidence", "symbols", "ledger", "expand", "answers",
+                        "mapping", "diagnostic"):
         print("usage: triage.py rules <diff> [title]\n"
               "       triage.py evidence <diff> <head-file>...\n"
               "       triage.py symbols <diff> <merge-target-root>\n"
               "       triage.py ledger <rules.txt> <verdicts.txt> [diff]\n"
-              "       triage.py expand <rules.txt> <rules.md>", file=sys.stderr)
+              "       triage.py expand <rules.txt> <rules.md>\n"
+              "       triage.py answers <answers.txt>\n"
+              "       triage.py mapping\n"
+              "       triage.py diagnostic <ai_diagnostic.txt>", file=sys.stderr)
         raise SystemExit(2)
+
+    if mode == "diagnostic":
+        try:
+            text = open(sys.argv[2], errors="replace").read()
+        except OSError:
+            text = ""
+        missing, thin = audit_diagnostic(text)
+        for q in missing:
+            print(f"UNCHECKED: structural check {q} has no line in {sys.argv[2]}")
+        for q in thin:
+            print(f"NO-SUBSTANCE: check {q} records a verdict but not what was looked at")
+        if missing or thin:
+            print(f"DIAGNOSTIC INCOMPLETE: {6 - len(missing) - len(thin)}/6",
+                  file=sys.stderr)
+            raise SystemExit(1)
+        print("DIAGNOSTIC COMPLETE: 6/6")
+        raise SystemExit(0)
+
+    if mode == "mapping":
+        sys.stdout.write(render_mapping())
+        raise SystemExit(0)
+
+    if mode == "answers":
+        try:
+            text = open(sys.argv[2], errors="replace").read()
+        except OSError:
+            text = ""
+        missing, thin = audit_answers(text)
+        for q in missing:
+            print(f"UNANSWERED: {q} has no line in {sys.argv[2]}")
+        for q in thin:
+            print(f"NO-SUBSTANCE: {q} is answered with a formula, not an answer")
+        if missing or thin:
+            print(f"ANSWERS INCOMPLETE: {6 - len(missing) - len(thin)}/6", file=sys.stderr)
+            raise SystemExit(1)
+        print("ANSWERS COMPLETE: 6/6")
+        raise SystemExit(0)
 
     if mode == "expand":
         rules_text = open(sys.argv[2], errors="replace").read()
@@ -518,6 +881,10 @@ if __name__ == "__main__":
     if mode == "symbols":
         root = pathlib.Path(sys.argv[3] if len(sys.argv) > 3 else ".")
         bad = sweep_symbols(diff, root)
+        # One line per distinct (import, reason). A PR importing a deleted module from
+        # four files produced four identical lines, which reads as four problems.
+        seen_pairs = set()
+        bad = [b for b in bad if not (b in seen_pairs or seen_pairs.add(b))]
         for line, why in bad:
             print(f"UNRESOLVED-IMPORT: {why}")
             print(f"  added by: {line}")
@@ -540,7 +907,7 @@ if __name__ == "__main__":
     title = sys.argv[3] if len(sys.argv) > 3 else ""
     try:
         files = parse(diff)
-        types = derive(files, title)
+        types = derive(files, title, diff)
     except Exception as exc:
         # Never take the review down, and never silently narrow it: a diff this cannot
         # parse falls back to the full rule set, which is the pre-derivation behaviour.
