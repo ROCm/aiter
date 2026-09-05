@@ -402,14 +402,12 @@ def _fold_seqlen_indptr(indptr, fold_factor):
     """Repeat each batch's seqlen ``fold_factor`` times (head-folding pseudo-batches)."""
     lens = indptr[1:] - indptr[:-1]
     folded_lens = lens.repeat_interleave(fold_factor)
-    out = torch.empty(
-        indptr.shape[0] + (fold_factor - 1) * (indptr.shape[0] - 1),
-        dtype=indptr.dtype,
-        device=indptr.device,
-    )
-    out[0] = 0
-    out[1:] = torch.cumsum(folded_lens, dim=0).to(indptr.dtype)
-    return out
+    cumsum = torch.cumsum(folded_lens, dim=0).to(indptr.dtype)
+    # Prepend the leading 0 on device. Writing it as ``out[0] = 0`` stages the
+    # Python scalar through unpinned host memory, which is illegal under CUDA-
+    # graph capture ("Cannot copy between CPU and CUDA tensors during CUDA graph
+    # capture unless the CPU tensor is pinned").
+    return torch.nn.functional.pad(cumsum, (1, 0))
 
 
 def _use_persistent_mla_decode(bs, nhead, max_seqlen_q, q_dtype, kv_dtype):
