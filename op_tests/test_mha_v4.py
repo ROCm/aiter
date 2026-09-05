@@ -1465,7 +1465,7 @@ def test_mha_v4_sparse_work_table_leaves_uniform_counts_in_raster_order(
             marks=pytest.mark.skipif(
                 get_gfx() != "gfx950", reason="gfx950 MX sparse"
             ),
-            id="mxfp6",
+            id="f6f8",
         ),
         pytest.param(
             lambda q, k, v, mask: mha_v4(
@@ -1569,8 +1569,8 @@ def test_mha_v4_sparse_dense_only_formats_reject_block_mask(v_format):
         )
 
 
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 F6666 validation")
-def test_mha_v4_f6666_rejects_block_mask():
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP6 validation")
+def test_mha_v4_mxfp6_rejects_block_mask():
     q = torch.zeros((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
     mask = torch.ones(
         (1, 2, 1, 256 // mha_v4_kv_tile()), device="cuda", dtype=torch.bool
@@ -1999,7 +1999,7 @@ _EMPTY_ROW_LAUNCHES = [
             native_fp8_format(),
             block_mask=m,
         ),
-        "mxfp6",
+        "f6f8",
     ),
     _gfx950_only(
         lambda q, k, v, m: mha_v4(

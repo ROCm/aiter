@@ -201,12 +201,12 @@ KERNEL_SPECS = {
         supports_block_sparse=True,
         uses_hadamard=True,
     ),
-    "mha4_mxfp6": _mha_v4_spec(
+    "mha4_f6f8": _mha_v4_spec(
         (0.75, 0.75, 1.0),
         supports_block_sparse=True,
         uses_hadamard=True,
     ),
-    "mha4_f6666": _mha_v4_spec(
+    "mha4_mxfp6": _mha_v4_spec(
         (0.75, 0.75, 0.75),
         uses_hadamard=True,
     ),
@@ -1368,9 +1368,9 @@ def make_kernel_runner(
         packed = _quantize_mxfp4()
         return lambda: _kernel_mxfp4(*packed)
 
-    if args.kernel in ("mha4_mxfp6", "mha4_f6666", "mha4_f6f4"):
+    if args.kernel in ("mha4_f6f8", "mha4_mxfp6", "mha4_f6f4"):
         is_f6f4 = args.kernel == "mha4_f6f4"
-        is_f6666 = args.kernel == "mha4_f6666"
+        is_mxfp6 = args.kernel == "mha4_mxfp6"
         block_r = args.block_r
         if args.qsmooth or (args.hadamard_rotate and block_r != 128):
             raise ValueError(
@@ -1390,15 +1390,15 @@ def make_kernel_runner(
                 v_format=(
                     AttentionFormat.MXFP4
                     if is_f6f4
-                    else AttentionFormat.MXFP6 if is_f6666 else None
+                    else AttentionFormat.MXFP6 if is_mxfp6 else None
                 ),
-                fp6_p=(is_f6f4 or is_f6666) and block_lut is None,
+                fp6_p=(is_f6f4 or is_mxfp6) and block_lut is None,
             )
 
         v_format = (
             AttentionFormat.MXFP4
             if is_f6f4
-            else AttentionFormat.MXFP6 if is_f6666 else fp8_format
+            else AttentionFormat.MXFP6 if is_mxfp6 else fp8_format
         )
         scale_modes = scale_modes_for_formats(
             AttentionFormat.MXFP6, AttentionFormat.MXFP6, v_format
@@ -1418,7 +1418,7 @@ def make_kernel_runner(
                 *scale_modes,
                 v_pack=(
                     AttentionPack.V_FOR_FP6_P
-                    if (is_f6f4 or is_f6666) and block_lut is None
+                    if (is_f6f4 or is_mxfp6) and block_lut is None
                     else AttentionPack.DEFAULT
                 ),
                 softmax_scale=softmax_scale,
