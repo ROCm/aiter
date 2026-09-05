@@ -63,6 +63,8 @@ def get_x_vals():
     x_vals += [(2**i, 256, 7168) for i in range(5, 9)]  # DSR1 router GEMM
     # GPT-OSS-120B attention projections
     x_vals += [(2**i, 5120, 2880) for i in range(5, 9)]  # GPTOSS QKV input projection
+    x_vals += [(2048, 5120, 2880)]  # GPTOSS QKV @ M=2048
+    x_vals += [(8192, 5120, 2880)]  # GPTOSS QKV @ M=8192
     x_vals += [(2**i, 2880, 4096) for i in range(5, 9)]  # output projection
     x_vals += [(2**i, 128, 2880) for i in range(5, 9)]  # Router GEMM
     x_vals += [(v, 106496, 16384) for v in (256, 4096)]  # LL3 405B FC1
@@ -212,5 +214,37 @@ def test_gemm_a16_w16_atomic_layout(M: int, N: int, K: int, layout):
 
     y = y.to(torch.float32).zero_()
     triton_out = gemm_a16w16_atomic(x, w, torch.float32, y).to(torch.bfloat16)
+
+    torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+
+
+@pytest.mark.parametrize("M, N, K", get_x_vals())
+@pytest.mark.parametrize("output", [True, False])
+@pytest.mark.parametrize("layout", ["TN", "TT"])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+def test_gemm_a16w16_persistent_output(M: int, N: int, K: int, layout, output, backend):
+    if backend == "gluon" and not is_gluon_supported():
+        pytest.skip("Gluon not supported on this architecture")
+    if backend == "triton":
+        from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+        if "gfx1250" in (get_arch() or ""):
+            pytest.skip("triton backend has no gfx1250 a16w16 config (gluon-only arch)")
+    torch.cuda.empty_cache()
+
+    x, w, _, _out_dtype, y = generate_gemm_a16w16_inputs(
+        M, N, K, torch.bfloat16, layout=layout, output=output
+    )
+
+    torch_out = F.linear(x, w, bias=None)
+
+    if output:
+        triton_out = gemm_a16w16(
+            x, w, None, torch.bfloat16, y, backend=backend, persistent=True
+        )
+    else:
+        triton_out = gemm_a16w16(
+            x, w, dtype=torch.bfloat16, backend=backend, persistent=True
+        )
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)

@@ -1,18 +1,20 @@
 {
     "M_LEQ_2048": {
-        "BLOCK_M": 256,
-        "BLOCK_N": 256,
-        "BLOCK_K": 64,
-        "NUM_BUFFERS": 2,
         "num_warps": 8,
-        "kernel_type": "compute_bound"
+        "BLOCK_SIZE_M": 256,
+        "BLOCK_SIZE_N": 256,
+        "BLOCK_SIZE_K": 64,
+        "GROUP_SIZE_M": 1,
+        "cache_modifier": null,
+        "NUM_KSPLIT": 1
     },
     "any": {
-        "BLOCK_M": 256,
-        "BLOCK_N": 256,
-        "BLOCK_K": 64,
-        "NUM_BUFFERS": 2,
         "num_warps": 8,
-        "kernel_type": "compute_bound"
+        "BLOCK_SIZE_M": 256,
+        "BLOCK_SIZE_N": 256,
+        "BLOCK_SIZE_K": 64,
+        "GROUP_SIZE_M": 1,
+        "cache_modifier": null,
+        "NUM_KSPLIT": 1
     }
 }

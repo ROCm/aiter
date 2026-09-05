@@ -30,7 +30,8 @@ def bench_gemm_fn(
     backend: str,
     atomic: bool = False,
     activation: str | None = None,
-    cudagraph: bool = False,
+    persistent: bool = False,
+    kernel_type: str = "bandwidth_bound",
     **kwargs,
 ):
     # NOTE: Assume bias and output has the same dtype
@@ -47,10 +48,7 @@ def bench_gemm_fn(
     mem_write = (M * N) * x.element_size()
     mem = mem_read + mem_write
 
-    bench_fn = (
-        triton.testing.do_bench_cudagraph if cudagraph else triton.testing.do_bench
-    )
-    bench_kwargs = {} if cudagraph else {"warmup": 25, "rep": 100}
+    bench_fn = triton.testing.do_bench_cudagraph
 
     if atomic:
         # Accumulation in bf16/fp16 leads to precision loss, cast y to fp32 to prevent that
@@ -61,14 +59,30 @@ def bench_gemm_fn(
         y = y.to(torch.float32).zero_()
         ms = bench_fn(
             lambda: gemm_a16w16_atomic(x, w, torch.float32, y),
-            **bench_kwargs,
+        )
+    elif persistent:
+        assert not (backend == "gluon" and layout not in ("TN", "TT")), (
+            f"--persistent with --backend gluon requires --layout TN or TT, got "
+            f"'{layout}' (the gluon persistent kernel has no 'N' path for A)"
+        )
+        ms = bench_fn(
+            lambda: gemm_a16w16(
+                x,
+                w,
+                bias,
+                c_dtype,
+                y,
+                activation=activation,
+                kernel_type=kernel_type,
+                backend=backend,
+                persistent=True,
+            ),
         )
     else:
         ms = bench_fn(
             lambda: gemm_a16w16(
                 x, w, bias, c_dtype, y, activation=activation, backend=backend
             ),
-            **bench_kwargs,
         )
 
     # Return exactly one scalar depending on which metric is active
@@ -125,7 +139,8 @@ def run_model_benchmark(args, backend):
             backend,
             atomic=args.atomic,
             activation=args.activation,
-            cudagraph=args.cudagraph,
+            persistent=args.persistent,
+            kernel_type=args.kernel_type,
         )
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
@@ -149,7 +164,8 @@ def run_shape_benchmark(args, backend):
             args.layout,
             backend,
             atomic=args.atomic,
-            cudagraph=args.cudagraph,
+            persistent=args.persistent,
+            kernel_type=args.kernel_type,
         )
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
@@ -208,10 +224,18 @@ def parse_args(args: list[str] | None = None):
         help="Backend to use. Default: auto-detect (gluon on gfx1250, triton elsewhere).",
     )
     parser.add_argument(
-        "--cudagraph",
+        "--persistent",
         action="store_true",
         default=False,
-        help="Use do_bench_cudagraph instead of do_bench to reduce CPU overhead for bandwidth-bound kernels.",
+        help="Use the persistent kernel (gemm_a16w16(..., persistent=True)) instead of "
+        "the standard a16w16 kernel",
+    )
+    parser.add_argument(
+        "--kernel-type",
+        type=str,
+        choices=["bandwidth_bound", "compute_bound"],
+        default="bandwidth_bound",
+        help="Kernel variant to use (gluon only). Default: bandwidth_bound.",
     )
     return get_ff_args(parser, args=args)
 
