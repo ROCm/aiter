@@ -41,8 +41,7 @@ Read the diff and PR body before proceeding.
 
 ### Step 1b — Derive the applicable rules, and collect the evidence they need
 
-
-**Step 1b writes nine artifacts into `$WORK`. Read them; each explains its own output,
+**Step 1b writes its artifacts into `$WORK`. Read them; each explains its own output,
 so what follows is the map, not the manual.**
 
 | file | what it answers | the trap it exists for |
@@ -190,14 +189,7 @@ line for any you judge Tier 1 or 2. Ranked by commit frequency (2025–2026), bl
 | **2** | `aiter/ops/quant.py` | 49 | All quantization paths | Wrong scale, silent accuracy drop |
 | **3** | `aiter/ops/*.py` (a single op's wrapper), individual kernel `.py`/`.cu` | varies | Consumers of that one op | `AttributeError` at call time in downstream |
 
-**Why `aiter/ops/*.py` is Tier 3 and not Tier 1**: by the Q1 test it looks like Tier 1 —
-`__init__.py` does `from .ops.xxx import *`, so breaking any one of them breaks `import aiter`.
-But there are 200+ files under `aiter/ops/`, and putting every single-kernel wrapper in the
-same tier as `jit/core.py` empties the tier of meaning: measured over 597 open PRs, a Tier-1
-rule written that way fires on 71% of them and the mandatory assessment stops being performed
-at all. A wrapper's real blast radius is its own op, which is Tier 3; the import-chain risk it
-does share with Tier 1 is covered by the B6 export check `triage.py` attaches to the
-`ops-wrapper` family. Reserve Tier 1 for the two files whose failure mode is *every* op.
+**Why `aiter/ops/*.py` is Tier 3 and not Tier 1**, and what happens to the assessment if it is not: `rules.md` § Tiering.
 
 **`aiter/__init__.py` special rule**: The import block must NOT be wrapped in try/except.
 Any new import added here → check the imported module for bare `ImportError` paths that
@@ -339,6 +331,12 @@ Append it to `$WORK/answers.txt` as a `BLIND:` line. If the answer is yes, add i
 findings. A bare "no" is rejected: it costs nothing to write and carries nothing, so say
 what you looked for and did not find.
 
+## Step 7.6 — Refutation
+
+**Try to kill each finding before reporting it.** One line per attempt in
+`$WORK/refutations.txt`: `RED|WARN|NOTE SURVIVED|KILLED -- what you opened and what it said`.
+`rules.md` § Refutation says what to attack; a killed finding never reaches the card.
+
 ---
 
 ## Step 8 — Verdict
@@ -365,13 +363,15 @@ happen; go back to it rather than reporting.**
   exit 1
 }
 
-# Then write the card to $WORK/card.md and run the last gate against it. The four gates
+# Then write the card to $WORK/card.md and run the last two gates against it. The four gates
 # above check that the work happened; this one checks that the card reports THAT work.
 "$SKILLS_ROOT/review-pr/triage.py" card "$WORK/card.md" "$WORK/verdicts.txt" \
   "$WORK/ai_diagnostic.txt" "$WORK/answers.txt" "$WORK/pr.diff" || {
   echo "a finding in the card is not nailed down — fix or drop it before reporting" >&2
   exit 1
 }
+"$SKILLS_ROOT/review-pr/triage.py" refutations "$WORK/refutations.txt" "$WORK/pr.diff" \
+  "$WORK/card.md" || { echo "a finding reached the card unattacked" >&2; exit 1; }
 ```
 
 The first names any of Step 2's five questions or Step 7.5's blind-spot question left

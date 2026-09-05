@@ -531,6 +531,72 @@ def render_guard_changes(res):
     return "\n".join(out)
 
 
+REFUTATION = re.compile(r"^\s*(RED|WARN|NOTE)\s+(SURVIVED|KILLED)\s*(?:--|—|:)\s*(.+)$")
+REFUTE_SURFACE = re.compile(
+    r"^(i )?(re-?)?(checked|verified|confirmed|reviewed|looked)\b.{0,40}$", re.I)
+
+
+def audit_refutations(text, diff_text, card_text):
+    """Step 7.6: every finding the card reports had to survive an attempt to kill it.
+
+    A review that runs all five other gates can still ship a claim whose premise is
+    simply false. aiter#5072 reported 125 of 174 config rows as unreachable, marked
+    `[verified]`, having reasoned about `getPaddedM`'s padding chain -- and
+    `get_CKGEMM_config` loops `for gl in [None, 0, 1]`, so exact M is tried first and
+    those rows are reachable. Ten seconds of reading the lookup would have killed it.
+    Nothing in the review asked for those ten seconds.
+
+    So the gate asks for the attempt, not for a verdict it cannot judge. What it can
+    check is that an attempt was made per reported finding, that it names something
+    consulted -- a path, a symbol, a command -- and that the reasoning is not the word
+    "checked" with nothing behind it.
+
+    Self-refutation is the weaker tier. It catches a premise never tested; it does not
+    catch a reviewer attached to a conclusion. SKILL.md says so and points at the
+    independent pass for anyone who wants the stronger one.
+    """
+    if not (text or "").strip():
+        return ["REFUTATIONS MISSING: Step 7.6 writes one line per reported finding "
+                "before the card is judged"]
+    reported = len([l for l in (card_text or "").splitlines()
+                    if l.lstrip().startswith(("\U0001F534", "\u26A0", "\U0001F4DD"))])
+    rows, problems = [], []
+    for ln in text.splitlines():
+        m = REFUTATION.match(ln)
+        if not ln.strip() or ln.lstrip().startswith("#"):
+            continue
+        if not m:
+            problems.append(("MALFORMED", ln.strip()[:70],
+                             "expected `RED|WARN|NOTE SURVIVED|KILLED -- what was checked "
+                             "and why it did or did not die`"))
+            continue
+        sev, outcome, why = m.groups()
+        rows.append((sev, outcome, why))
+        if len(why.strip()) < MIN_CORE_REASON or REFUTE_SURFACE.match(why.strip()):
+            problems.append(("NO-ATTEMPT", why.strip()[:70],
+                             "names nothing that was consulted; a refutation that cannot "
+                             "be repeated is not one"))
+            continue
+        cited = [c for c, _ in CITATION.findall(why)]
+        tokens = set(re.findall(r"\b\w+\b", why))
+        if not cited and not (tokens & changed_tokens(diff_text)) \
+                and not re.search(r"`[^`]+`|\bgit \w+|\bgrep\b|\bpytest\b", why):
+            problems.append(("UNSOURCED", why.strip()[:70],
+                             "no file, symbol or command -- say what you opened"))
+    survived = [r for r in rows if r[1] == "SURVIVED"]
+    if reported and len(survived) < reported:
+        problems.append(("UNREFUTED-FINDING", f"{reported} reported, {len(survived)} survived",
+                         "every finding on the card needs a line saying it survived"))
+    if problems:
+        out = [f"REFUTATION INCOMPLETE: {len(rows)} attempt(s), {len(problems)} problem(s)"]
+        for kind, what, why in problems[:8]:
+            out.append(f"{kind}: {what}")
+            out.append(f"  {why}")
+        return out
+    return [f"REFUTATIONS COMPLETE: {len(rows)} attempted, {len(survived)} survived, "
+            f"{len(rows) - len(survived)} killed before reaching the card"]
+
+
 def is_comment_line(line):
     s = line.strip()
     return (not s) or s.startswith(("#", "//", "/*", "*", '"""', "'''"))
@@ -1929,7 +1995,7 @@ if __name__ == "__main__":
                         "mapping", "diagnostic", "testquality",
                         "twins", "citest", "perfclaims",
                         "structabi", "commentonly", "card", "corefiles",
-                        "kerneltest", "siblings", "guards"):
+                        "kerneltest", "siblings", "guards", "refutations"):
         print("usage: triage.py rules <diff> [title]\n"
               "       triage.py evidence <diff> <head-file>...\n"
               "       triage.py symbols <diff> <merge-target-root>\n"
@@ -1948,9 +2014,18 @@ if __name__ == "__main__":
               "       triage.py kerneltest <diff>\n"
               "       triage.py siblings <diff> <root>\n"
               "       triage.py guards <diff>\n"
+              "       triage.py refutations <refutations.txt> <diff> <card.md>\n"
               "       triage.py card <card.md> <verdicts> <diagnostic> <answers> <diff>", file=sys.stderr)
         raise SystemExit(2)
 
+    if mode == "refutations":
+        out = audit_refutations(open(sys.argv[2], errors="replace").read()
+                                if pathlib.Path(sys.argv[2]).exists() else "",
+                                open(sys.argv[3], errors="replace").read(),
+                                open(sys.argv[4], errors="replace").read()
+                                if len(sys.argv) > 4 and pathlib.Path(sys.argv[4]).exists() else "")
+        print("\n".join(out))
+        sys.exit(0 if out[0].startswith("REFUTATIONS COMPLETE") else 1)
     if mode == "guards":
         print(render_guard_changes(guard_changes(open(sys.argv[2]).read())))
         sys.exit(0)

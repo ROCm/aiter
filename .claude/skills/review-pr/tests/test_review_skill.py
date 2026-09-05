@@ -3003,3 +3003,86 @@ class TestTheToolTextAgreesWithTheInstruction(unittest.TestCase):
         self.assertGreater(i, 0)
         self.assertIn("executed at run time", body[i:i + 700])
 
+
+class TestRefutationGate(unittest.TestCase):
+    """The sixth gate, and the only one aimed at the review's own conclusions.
+
+    Five gates check that each step happened and that the card reports it. None of them
+    can tell a true finding from a confident false one. aiter#5072 reported 125 of 174
+    tuned-config rows as unreachable, marked `[verified]`, having reasoned about
+    `getPaddedM`; `get_CKGEMM_config` loops `for gl in [None, 0, 1]`, so exact M is tried
+    first and the rows are reachable. It passed every gate. What was missing was not
+    another check on the evidence but a requirement to attack the claim.
+
+    The gate cannot judge whether a refutation is right -- it checks that one was
+    attempted, per reported finding, naming something a second person could open."""
+
+    DIFF = ("diff --git a/aiter/ops/gemm_op_a8w8.py b/aiter/ops/gemm_op_a8w8.py\n"
+            "--- a/aiter/ops/gemm_op_a8w8.py\n+++ b/aiter/ops/gemm_op_a8w8.py\n"
+            "@@ -1 +1,2 @@\n+    padded_M = get_padded_m(M, N, K, gl)\n")
+    CARD = ("\u26A0\uFE0F aiter/ops/gemm_op_a8w8.py:1 the M grid has holes at 2048 "
+            "and 4096\n")
+    REAL = ("WARN SURVIVED -- read get_CKGEMM_config in aiter/ops/gemm_op_a8w8.py: the "
+            "loop is `for gl in [None, 0, 1]` so exact M is tried first, but 2048 and "
+            "4096 have no row for any K, so the nextPow2 fallback still lands nowhere\n")
+
+    def gate(self, refutations, card=None):
+        with tempfile.TemporaryDirectory() as d:
+            d = pathlib.Path(d)
+            (d / "pr.diff").write_text(self.DIFF)
+            (d / "card.md").write_text(self.CARD if card is None else card)
+            r = d / "refutations.txt"
+            if refutations is not None:
+                r.write_text(refutations)
+            return subprocess.run(
+                [sys.executable, str(TRIAGE), "refutations", str(r), str(d / "pr.diff"),
+                 str(d / "card.md")], capture_output=True, text=True)
+
+    def test_a_missing_artifact_fails_closed(self):
+        r = self.gate(None)
+        self.assertEqual(1, r.returncode)
+        self.assertIn("REFUTATIONS MISSING", r.stdout)
+
+    def test_i_checked_it_is_not_a_refutation(self):
+        r = self.gate("WARN SURVIVED -- I checked it\n")
+        self.assertEqual(1, r.returncode)
+        self.assertIn("NO-ATTEMPT", r.stdout)
+
+    def test_reasoning_that_names_no_source_is_rejected(self):
+        r = self.gate("WARN SURVIVED -- the reasoning still holds after thinking about "
+                      "it more carefully and at greater length\n")
+        self.assertEqual(1, r.returncode)
+        self.assertIn("UNSOURCED", r.stdout)
+
+    def test_a_real_attempt_passes(self):
+        r = self.gate(self.REAL)
+        self.assertEqual(0, r.returncode, r.stdout)
+        self.assertIn("1 survived", r.stdout)
+
+    def test_a_finding_on_the_card_with_no_surviving_line_is_caught(self):
+        """The killed one must not still be reported."""
+        r = self.gate(self.REAL.replace("SURVIVED", "KILLED"))
+        self.assertEqual(1, r.returncode)
+        self.assertIn("UNREFUTED-FINDING", r.stdout)
+
+    def test_a_killed_finding_that_stayed_off_the_card_is_fine(self):
+        r = self.gate(self.REAL.replace("SURVIVED", "KILLED"), card="")
+        self.assertEqual(0, r.returncode, r.stdout)
+        self.assertIn("1 killed", r.stdout)
+
+    def test_the_step_and_the_gate_stay_wired_together(self):
+        """A step with no gate is the state Step 4 was in, and it was skippable."""
+        body = (SKILL_DIR / "SKILL.md").read_text()
+        self.assertIn("Step 7.6", body)
+        self.assertIn('triage.py" refutations', body)
+        self.assertIn("## Refutation", (SKILL_DIR / "rules.md").read_text(),
+                      "Step 7.6 points at rules.md for what to attack")
+
+    def test_the_weaker_tier_is_named_as_such(self):
+        """Self-refutation catches an untested premise, not an attached conclusion.
+        Saying otherwise would oversell the gate."""
+        body = (SKILL_DIR / "rules.md").read_text()
+        i = body.index("## Refutation")
+        self.assertIn("weaker", body[i:])
+        self.assertIn("independent", body[i:])
+

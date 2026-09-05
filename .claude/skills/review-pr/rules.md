@@ -494,3 +494,46 @@ unprocessed — output is correct everywhere the tests look and wrong in the las
 Check the host grid expression against every `program_id` axis, including which axis is which
 after a swizzle.
 → `🔴 T6: grid is cdiv(M,BLOCK_M) x cdiv(N,BLOCK_N) but the kernel derives pid_n from pid // grid_m using the pre-swizzle grid_m; tiles [range] are never written`
+
+
+## Tiering
+
+**Why `aiter/ops/*.py` is Tier 3 and not Tier 1**: by the Q1 test it looks like Tier 1 —
+`__init__.py` does `from .ops.xxx import *`, so breaking any one of them breaks `import aiter`.
+But there are 200+ files under `aiter/ops/`, and putting every single-kernel wrapper in the
+same tier as `jit/core.py` empties the tier of meaning: measured over 597 open PRs, a Tier-1
+rule written that way fires on 71% of them and the mandatory assessment stops being performed
+at all. A wrapper's real blast radius is its own op, which is Tier 3; the import-chain risk it
+does share with Tier 1 is covered by the B6 export check `triage.py` attaches to the
+`ops-wrapper` family. Reserve Tier 1 for the two files whose failure mode is *every* op.
+
+## Refutation
+
+Step 7.6 attacks each finding before it is reported. What to attack, in the order that has
+actually killed things here:
+
+1. **The premise.** aiter#5072 reported 125 of 174 tuned-config rows as unreachable, marked
+   `[verified]`, reasoning about `getPaddedM`'s padding chain. `get_CKGEMM_config` loops
+   `for gl in [None, 0, 1]` — exact M is tried first, so those rows are reachable and the
+   finding was false. Ten seconds in the lookup function would have ended it. Read the code
+   the claim depends on, not the code the claim is about.
+2. **The tree you read.** A local worktree is not the merge target. Anchor line numbers with
+   `git show <base>:<path>`; `base_head.txt` has the sha.
+3. **Reachability.** Can the trigger you named actually occur, or does something upstream
+   already prevent it — a caller that never passes that value, a guard added since, an arch
+   gate?
+4. **Suspicion versus defect.** "This looks wrong" is not a finding. If you cannot name
+   inputs that produce a wrong result, it is a question, and 📝 is where questions go.
+5. **Severity.** A 🔴 asserts a wrong result or a crash. Without a reachable triggering case
+   it is ⚠️ at most.
+
+Write one line per attempt to `$WORK/refutations.txt`:
+`RED|WARN|NOTE SURVIVED|KILLED -- what you opened and what it said`. Name a file, a symbol
+or a command. "I checked" is rejected by the gate, because a refutation nobody can repeat is
+not one.
+
+**This is the weaker of the two tiers, and it is worth saying so.** Refuting your own finding
+catches a premise you never tested; it does not catch a conclusion you are attached to. The
+stronger tier is an independent reviewer — a second agent, or a person — given the card and
+told the findings are false until proven otherwise. Where that is available, use it; this
+step is what the skill can guarantee on its own.
