@@ -603,6 +603,73 @@ def audit_refutations(text, diff_text, card_text):
             f"{len(rows) - len(survived)} killed before reaching the card"]
 
 
+INDEP = re.compile(r"^\s*(SURVIVED|KILLED)\s*(\([^)]{0,60}\))?\s*(?:--|—|:)\s*(.+)$")
+INDEP_NONE = re.compile(r"^\s*NONE AVAILABLE\s*(?:--|—|:)\s*(.+)$")
+
+
+def audit_independent(text, card_text):
+    """Step 7.7: a reader who has not seen the reasoning judges each reported finding.
+
+    Measured over 200 PRs in four waves: Step 7.6's self-refutation kills 260-280
+    candidates per 50 PRs, real work by any measure -- and 28% of what survives it and
+    reaches a card is still killed by an independent adversary told the findings are false
+    until defended. Four rounds of fixing the tools moved the gate pushbacks (64 to 33) and
+    the completion rate (47/50 to 49/50) and did not move that number at all. Refuting your
+    own finding catches a premise you never tested. It does not catch a conclusion you are
+    committed to, and no amount of instructing yourself harder substitutes for a reader who
+    was never committed.
+
+    The step does not require the ability to spawn anything. Hand $WORK/card.md, the diff
+    and the merge-target path to a second agent or a person, with no part of your reasoning
+    attached, and record what comes back. What this gate can check is that it happened, per
+    finding, with something named that a third party could open -- and, when no such reader
+    exists, that the card says so instead of implying one looked.
+    """
+    reported = [l for l in (card_text or "").splitlines()
+                if l.lstrip().startswith(("\U0001F534", "\u26A0", "\U0001F4DD"))]
+    if not (text or "").strip():
+        return ["INDEPENDENT REFUTATION MISSING: Step 7.7 writes one line per reported "
+                "finding, or `NONE AVAILABLE -- <reason>` if no independent reader exists"]
+    none = INDEP_NONE.match((text or "").strip().splitlines()[0])
+    if none:
+        if reported and "not independently refuted" not in (card_text or "").lower():
+            return ["INDEPENDENT REFUTATION DECLARED UNAVAILABLE, CARD DOES NOT SAY SO: "
+                    "add `not independently refuted` to the review line, so a reader knows "
+                    "these findings carry only the author's own check"]
+        return ["INDEPENDENT REFUTATION: none available (%s); the card says so"
+                % none.group(1)[:60]]
+    rows, problems = [], []
+    for ln in text.splitlines():
+        if not ln.strip() or ln.lstrip().startswith("#"):
+            continue
+        m = INDEP.match(ln)
+        if not m:
+            problems.append(("MALFORMED", ln.strip()[:70],
+                             "expected `SURVIVED|KILLED -- what the reader checked`"))
+            continue
+        outcome, _note, why = m.groups()
+        rows.append((outcome, why))
+        if len(why.strip()) < MIN_CORE_REASON or REFUTE_SURFACE.match(why.strip()):
+            problems.append(("NO-ATTEMPT", why.strip()[:70],
+                             "names nothing the reader opened"))
+    killed = [r for r in rows if r[0] == "KILLED"]
+    survived = [r for r in rows if r[0] == "SURVIVED"]
+    if reported and len(survived) < len(reported):
+        problems.append(("UNDEFENDED-FINDING",
+                         f"{len(reported)} on the card, {len(survived)} defended",
+                         "a finding an independent reader did not clear must come off the "
+                         "card, not stay on it"))
+    if problems:
+        out = [f"INDEPENDENT REFUTATION INCOMPLETE: {len(rows)} judged, "
+               f"{len(problems)} problem(s)"]
+        for kind, what, why in problems[:8]:
+            out.append(f"{kind}: {what}")
+            out.append(f"  {why}")
+        return out
+    return [f"INDEPENDENTLY REFUTED: {len(rows)} judged, {len(survived)} defended, "
+            f"{len(killed)} killed by a reader who had not seen the reasoning"]
+
+
 def is_comment_line(line):
     s = line.strip()
     return (not s) or s.startswith(("#", "//", "/*", "*", '"""', "'''"))
@@ -2028,7 +2095,8 @@ if __name__ == "__main__":
                         "mapping", "diagnostic", "testquality",
                         "twins", "citest", "perfclaims",
                         "structabi", "commentonly", "card", "corefiles",
-                        "kerneltest", "siblings", "guards", "refutations"):
+                        "kerneltest", "siblings", "guards", "refutations",
+                        "independent"):
         print("usage: triage.py rules <diff> [title]\n"
               "       triage.py evidence <diff> <head-file>...\n"
               "       triage.py symbols <diff> <merge-target-root>\n"
@@ -2048,9 +2116,19 @@ if __name__ == "__main__":
               "       triage.py siblings <diff> <root>\n"
               "       triage.py guards <diff>\n"
               "       triage.py refutations <refutations.txt> <diff> <card.md>\n"
+              "       triage.py independent <independent.txt> <card.md>\n"
               "       triage.py card <card.md> <verdicts> <diagnostic> <answers> <diff>", file=sys.stderr)
         raise SystemExit(2)
 
+    if mode == "independent":
+        out = audit_independent(
+            open(sys.argv[2], errors="replace").read()
+            if pathlib.Path(sys.argv[2]).exists() else "",
+            open(sys.argv[3], errors="replace").read()
+            if len(sys.argv) > 3 and pathlib.Path(sys.argv[3]).exists() else "")
+        print("\n".join(out))
+        sys.exit(0 if out[0].startswith(("INDEPENDENTLY REFUTED",
+                                         "INDEPENDENT REFUTATION:")) else 1)
     if mode == "refutations":
         out = audit_refutations(open(sys.argv[2], errors="replace").read()
                                 if pathlib.Path(sys.argv[2]).exists() else "",

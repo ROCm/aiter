@@ -3233,3 +3233,102 @@ class TestArtifactTableIsTheArtifacts(unittest.TestCase):
         i = body.index("`evidence.txt`")
         self.assertIn("only written when", body[i:i + 300])
 
+
+class TestIndependentRefutationGate(unittest.TestCase):
+    """The seventh gate. Step 7.6 asks you to attack your own finding; this asks whether
+    anyone else did.
+
+    200 PRs across four waves: 7.6 killed 260-280 candidates per 50 before they reached a
+    card, and 28% of what survived it died anyway to a reader told the findings were false
+    until defended. Four rounds of tooling fixes moved the pushbacks from 64 to 33 and the
+    completion rate from 47/50 to 49/50 and did not move that 28%. Self-refutation catches
+    a premise never tested; it does not catch a conclusion already held.
+
+    The gate needs no ability to spawn anything -- it checks that the handover happened,
+    per finding, naming something openable, and that a review without an independent
+    reader says so rather than reading like one that had."""
+
+    CARD = ("\u26A0\uFE0F aiter/mla.py:1 the guard is dropped on the EP path at 8192 "
+            "tokens\n")
+    REAL = ("SURVIVED -- opened aiter/mla.py at the merge target: the EP branch really "
+            "does skip the check, and no caller pre-validates the shape\n")
+
+    def gate(self, indep, card=None):
+        with tempfile.TemporaryDirectory() as d:
+            d = pathlib.Path(d)
+            (d / "card.md").write_text(self.CARD if card is None else card)
+            f = d / "independent.txt"
+            if indep is not None:
+                f.write_text(indep)
+            return subprocess.run(
+                [sys.executable, str(TRIAGE), "independent", str(f), str(d / "card.md")],
+                capture_output=True, text=True)
+
+    def test_a_missing_artifact_fails_closed(self):
+        r = self.gate(None)
+        self.assertEqual(1, r.returncode)
+        self.assertIn("INDEPENDENT REFUTATION MISSING", r.stdout)
+
+    def test_a_real_handover_passes(self):
+        r = self.gate(self.REAL)
+        self.assertEqual(0, r.returncode, r.stdout)
+        self.assertIn("1 defended", r.stdout)
+
+    def test_i_checked_it_is_not_a_handover(self):
+        r = self.gate("SURVIVED -- I checked it\n")
+        self.assertEqual(1, r.returncode)
+        self.assertIn("NO-ATTEMPT", r.stdout)
+
+    def test_a_killed_finding_must_leave_the_card(self):
+        r = self.gate("KILLED -- the caller in aiter/fused_moe.py validates the same "
+                      "shape before dispatch, so the path is unreachable\n")
+        self.assertEqual(1, r.returncode)
+        self.assertIn("UNDEFENDED-FINDING", r.stdout)
+
+    def test_no_reader_available_is_allowed_if_the_card_admits_it(self):
+        """The point of the escape: a review that had an independent reader and one that
+        did not are different objects, and the card is where that difference has to be
+        visible."""
+        r = self.gate("NONE AVAILABLE -- single-operator run, no second agent on this box\n",
+                      card=self.CARD.rstrip("\n") + " -- not independently refuted\n")
+        self.assertEqual(0, r.returncode, r.stdout)
+        self.assertIn("none available", r.stdout)
+
+    def test_no_reader_available_is_rejected_if_the_card_hides_it(self):
+        r = self.gate("NONE AVAILABLE -- single-operator run, no second agent on this box\n")
+        self.assertEqual(1, r.returncode)
+        self.assertIn("CARD DOES NOT SAY SO", r.stdout)
+
+    def test_the_step_and_the_gate_stay_wired(self):
+        body = (SKILL_DIR / "SKILL.md").read_text()
+        self.assertIn("Step 7.7", body)
+        self.assertIn('triage.py" independent', body)
+
+
+class TestStepEightDescribesTheGatesItRuns(unittest.TestCase):
+    """The prose under Step 8 described the ledger as rejecting any FIRE that cites a file
+    the PR does not change. That stopped being true two commits earlier, when the gate
+    moved to requiring an anchor. Several reviews went on avoiding citations of unchanged
+    files -- the exact behaviour the change was meant to permit -- because the document
+    still forbade what the gate now allowed. Prose that outlives its implementation keeps
+    enforcing the old rule socially."""
+
+    def test_the_ledger_paragraph_describes_the_anchor_rule(self):
+        body = (SKILL_DIR / "SKILL.md").read_text()
+        i = body.index("UNTOUCHED-CITATION")
+        window = body[max(0, i - 400):i + 400]
+        self.assertIn("no** file this PR changes", window,
+                      "the paragraph still describes the pre-anchor behaviour")
+        self.assertIn("evidence", window,
+                      "it must say that other paths are evidence, not violations")
+
+    def test_every_gate_the_document_runs_is_described(self):
+        body = (SKILL_DIR / "SKILL.md").read_text()
+        run = set(re.findall(r'triage\.py" (\w+)', body))
+        run &= {"answers", "diagnostic", "ledger", "corefiles", "card", "refutations",
+                "independent"}
+        described = body[body.index("## Step 8"):]
+        missing = sorted(g for g in run if f"`{g}`" not in described)
+        self.assertEqual([], missing,
+                         f"Step 8 runs these and explains none of them: {missing}")
+

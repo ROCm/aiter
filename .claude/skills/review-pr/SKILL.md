@@ -329,6 +329,14 @@ what you looked for and did not find.
 `$WORK/refutations.txt`: `RED|WARN|NOTE SURVIVED|KILLED -- what you opened and what it said`.
 `rules.md` § Refutation says what to attack; a killed finding never reaches the card.
 
+## Step 7.7 — Independent refutation
+
+**Hand `$WORK/card.md`, the diff and `$WORK/merge_target.txt` to a reader who has not seen
+your reasoning** — a second agent, or a person — with the findings false until defended.
+One line per finding in `$WORK/independent.txt`: `SURVIVED|KILLED -- what they opened`; a
+killed finding comes off the card. With no such reader, write `NONE AVAILABLE -- <reason>`
+and put `not independently refuted` on the review line. `rules.md` § Refutation has why.
+
 ---
 
 ## Step 8 — Verdict
@@ -364,29 +372,30 @@ happen; go back to it rather than reporting.**
 }
 "$SKILLS_ROOT/review-pr/triage.py" refutations "$WORK/refutations.txt" "$WORK/pr.diff" \
   "$WORK/card.md" || { echo "a finding reached the card unattacked" >&2; exit 1; }
+"$SKILLS_ROOT/review-pr/triage.py" independent "$WORK/independent.txt" "$WORK/card.md" \
+  || { echo "a finding was never put to a reader who had not seen the reasoning" >&2
+       exit 1; }
 ```
 
-The first names any of Step 2's five questions or Step 7.5's blind-spot question left
-unanswered (`UNANSWERED`) or answered with a formula rather than an answer
-(`NO-SUBSTANCE`). The third names every Tier 1/2 backbone file in the diff with no
-assessment line (`UNASSESSED`), and every line whose reason is formulaic (`NO-EVIDENCE`)
-or anchored in nothing this PR changes (`UNANCHORED`); it computes the backbone set from
-the diff itself, so a missing or `NONE`-declaring artifact does not get past it. The
-fourth lists each derived rule with no verdict line (`UNADJUDICATED`), each verdict with no
-reason (`NO-EVIDENCE`), and each `FIRE` whose reason cites a file this PR does not change
-(`UNTOUCHED-CITATION`) — a defect claimed against untouched code is a stale or invented
-citation. `CLEAR` may cite anything: "E5 CLEAR: `aiter/__init__.py` unchanged" is correct
-*because* that file is absent from the diff. The gate fails closed: an empty or missing `rules.txt` is the state of
-a run whose Step 1b never happened, so it exits non-zero rather than waving the run through.
-The gate checks that each rule was answered, not that the answer is right — it closes the
-cheapest failure, which is not answering.
+`answers` names a Step 2 or Step 7.5 question left unanswered (`UNANSWERED`) or answered
+with a formula (`NO-SUBSTANCE`); `diagnostic` does the same for Step 6's six structural
+checks, which need one line each. `corefiles` names every Tier 1/2 backbone file with no
+assessment line (`UNASSESSED`) and every reason that is formulaic (`NO-EVIDENCE`) or
+anchored in nothing this PR changes (`UNANCHORED`); it derives the backbone set from the
+diff, so a `NONE` declaration does not get past it. `ledger` names each derived rule with
+no verdict (`UNADJUDICATED`), each verdict with no reason (`NO-EVIDENCE`), and each `FIRE`
+citing **no** file this PR changes (`UNTOUCHED-CITATION`). One changed file is the anchor;
+everything else — the header stating the contract, the workflow defining the label, the
+`$WORK` artifact the rule told you to read — is evidence and welcome beside it. `CLEAR` may
+cite anything. An empty `rules.txt` is a Step 1b that never ran and fails closed; a derived
+`NONE` is an answer and passes.
 
-The card gate asks one question per finding: **is this nailed down?** It runs in both
-directions. Nothing on the card may be untraceable: not a file the PR does not change, not a
-rule no verdict marked `FIRE`, not a 🔴 naming neither a value nor two code identifiers — the
-red threshold above, finally enforced. And nothing adjudicated `FIRE` may quietly not reach
-the card: report it, change the verdict, or write `-- not reported: <reason>` on the verdict
-line. The 5-finding cap is a real reason; leaving it out silently is not one.
+`card` asks whether each finding is nailed down, in both directions: nothing untraceable on
+the card — no finding anchored in no changed file, no rule no verdict marked `FIRE`, no 🔴
+naming neither a value nor two identifiers — and nothing `FIRE` quietly off it: report it,
+change the verdict, or write `-- not reported: <reason>`. `refutations` requires that you
+tried to kill each finding; `independent` requires that someone who had not seen your
+reasoning tried too, or that the card admits nobody did.
 
 Write the card to `$WORK/card.md` before running the gate — a missing file is a hard
 failure, because not writing it was the cheapest way past this check. Whether a finding is

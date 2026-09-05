@@ -532,11 +532,26 @@ Write one line per attempt to `$WORK/refutations.txt`:
 or a command. "I checked" is rejected by the gate, because a refutation nobody can repeat is
 not one.
 
-**This is the weaker of the two tiers, and it is worth saying so.** Refuting your own finding
-catches a premise you never tested; it does not catch a conclusion you are attached to. The
-stronger tier is an independent reviewer — a second agent, or a person — given the card and
-told the findings are false until proven otherwise. Where that is available, use it; this
-step is what the skill can guarantee on its own.
+**This is the weaker of the two tiers, and the numbers say how much weaker.** Across 200 PRs
+in four waves, Step 7.6 killed 260–280 candidates per 50 PRs before they reached a card — and
+28% of what survived it was still killed by an independent reader told the findings were
+false until defended. Four rounds of fixing the tooling moved the gate pushbacks from 64 to
+33 and the completion rate from 47/50 to 49/50, and moved that 28% not at all. Refuting your
+own finding catches a premise you never tested. It does not catch a conclusion you are
+committed to, and instructing yourself more firmly is not a substitute for a reader who was
+never committed.
+
+That is why Step 7.7 is a step and not a suggestion. It needs no ability to spawn anything:
+hand over the card, the diff and the merge-target path with none of your reasoning attached,
+and record what comes back. When no such reader exists, say so on the card — a review that
+had one and a review that did not are different objects, and a reader of the card cannot
+tell them apart unless it is written down.
+
+**A caveat that belongs next to that 28%:** it is the rate at which an adversary instructed
+to assume falsity judged a finding dead. That adversary has not itself been audited, so the
+number is an upper bound on the error rate, not a measurement of it. And it is not the bar
+in § Promotion bar, which asks about false *clearance* — reporting nothing when something is
+wrong. That number has never been measured here at all.
 
 
 ## Promotion bar
