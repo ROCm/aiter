@@ -66,12 +66,14 @@ _LAZY_IMPORTS = {
         ".kernels.qk_norm_rope_quant",
         "flydsl_qk_norm_rope_quant",
     ),
+    "QRInt4": (".kernels.qr_int4", "QRInt4"),
 }
 
 __all__ = [
     "FP8_MQA_LOGITS_DEFAULT_VARIANT",
     "FP8_MQA_LOGITS_VARIANTS",
     "GateMode",
+    "QRInt4",
     "compute_varqlen_windows",
     "flydsl_flash_attn_func",
     "flydsl_fp8_mqa_logits",
