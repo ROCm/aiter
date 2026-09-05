@@ -1133,6 +1133,7 @@ def test_mha_v4_native_schema_mutates_only_out():
         (AttentionFormat.MXFP4, AttentionFormat.FP8),
         (AttentionFormat.MXFP4, AttentionFormat.MXFP4),
         (AttentionFormat.MXFP6_E2M3, AttentionFormat.FP8),
+        (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP6),
         (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP4),
     ],
 )
@@ -1564,6 +1565,24 @@ def test_mha_v4_sparse_dense_only_formats_reject_block_mask(v_format):
             AttentionFormat.BF16,
             AttentionFormat.BF16,
             v_format,
+            block_mask=mask,
+        )
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 F6666 validation")
+def test_mha_v4_f6666_rejects_block_mask():
+    q = torch.zeros((1, 256, 2, 128), device="cuda", dtype=torch.bfloat16)
+    mask = torch.ones(
+        (1, 2, 1, 256 // mha_v4_kv_tile()), device="cuda", dtype=torch.bool
+    )
+    with pytest.raises(NotImplementedError, match="MXFP6 Q/K/V"):
+        mha_v4(
+            q,
+            q,
+            q,
+            AttentionFormat.MXFP6,
+            AttentionFormat.MXFP6,
+            AttentionFormat.MXFP6,
             block_mask=mask,
         )
 

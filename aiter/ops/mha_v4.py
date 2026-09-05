@@ -871,9 +871,9 @@ def _launch_mxfp6(
     resolved_v_pack = AttentionPack(v_pack)
     k, k_descale = mxfp6_k_view(k_raw, k_descale_raw, q.shape[0], sequence_k, heads)
     v = (
-        v_data
-        if _is_fp8_format(resolved_v_format)
-        else mxfp4_v_view(v_data, v_descale, sequence_k)
+        mxfp4_v_view(v_data, v_descale, sequence_k)
+        if resolved_v_format == AttentionFormat.MXFP4
+        else v_data
     )
     scale_modes = scale_modes_for_formats(
         AttentionFormat.MXFP6,
@@ -1128,6 +1128,7 @@ def mha_v4(
         )
     elif q_format == AttentionFormat.MXFP6 and v_format in (
         *_FP8_FORMATS,
+        AttentionFormat.MXFP6,
         AttentionFormat.MXFP4,
     ):
         if softmax_scale is None:
@@ -1136,6 +1137,13 @@ def mha_v4(
         k_quantized, k_descale = quantize_mxfp6_k(k)
         if _is_fp8_format(v_format):
             v_quantized, v_descale = quantize_v_fp8(v)
+        elif v_format == AttentionFormat.MXFP6:
+            if lut_indices is not None:
+                raise NotImplementedError(
+                    "sorted-sparse MXFP6 Q/K/V does not have a kernel row yet"
+                )
+            v_quantized, v_descale = quantize_v_mxfp6_fp6_p(v)
+            v_pack = AttentionPack.V_FOR_FP6_P
         elif lut_indices is None:
             v_quantized, v_descale = quantize_v_mxfp4_fp6_p(v)
             v_pack = AttentionPack.V_FOR_FP6_P
@@ -1162,7 +1170,7 @@ def mha_v4(
         )
         v_view = (
             v_quantized
-            if _is_fp8_format(v_format)
+            if v_format != AttentionFormat.MXFP4
             else mxfp4_v_view(v_quantized, v_descale, k.shape[1])
         )
         return mha_v4_packed(

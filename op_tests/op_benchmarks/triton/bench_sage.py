@@ -108,16 +108,21 @@ def _production_quantize_f4f4(query, key, value, softmax_scale, fp6_p=True):
 
 
 def _production_quantize_mxfp6(
-    query, key, value, softmax_scale, mxfp4_v=False, fp6_p=False
+    query, key, value, softmax_scale, v_format=None, fp6_p=False
 ):
     q_fp6, q_scale = quantize_mxfp6_q(query, mha_v4_q_multiplier(softmax_scale))
     k_raw, k_scale_raw = quantize_mxfp6_k(key)
     batch, sequence, heads, _ = key.shape
     k_fp6, k_scale = mxfp6_k_view(k_raw, k_scale_raw, batch, sequence, heads)
-    if not mxfp4_v:
+    if v_format is None:
         v_quantized, v_scale = quantize_v_fp8(value)
         return q_fp6, q_scale, k_fp6, k_scale, v_quantized, v_scale
 
+    if v_format == AttentionFormat.MXFP6:
+        quantize_v = quantize_v_mxfp6_fp6_p if fp6_p else quantize_v_mxfp6
+        return q_fp6, q_scale, k_fp6, k_scale, *quantize_v(value)
+    if v_format != AttentionFormat.MXFP4:
+        raise ValueError(f"unsupported MXFP6 Q/K V format: {v_format!r}")
     quantize_v = quantize_v_mxfp4_fp6_p if fp6_p else quantize_v_mxfp4
     v_raw, v_scale = quantize_v(value)
     v_quantized = mxfp4_v_view(v_raw, v_scale, value.shape[1])
@@ -199,6 +204,10 @@ KERNEL_SPECS = {
     "mha4_mxfp6": _mha_v4_spec(
         (0.75, 0.75, 1.0),
         supports_block_sparse=True,
+        uses_hadamard=True,
+    ),
+    "mha4_f6666": _mha_v4_spec(
+        (0.75, 0.75, 0.75),
         uses_hadamard=True,
     ),
     "mha4_f6f4": _mha_v4_spec(
@@ -1359,8 +1368,9 @@ def make_kernel_runner(
         packed = _quantize_mxfp4()
         return lambda: _kernel_mxfp4(*packed)
 
-    if args.kernel in ("mha4_mxfp6", "mha4_f6f4"):
+    if args.kernel in ("mha4_mxfp6", "mha4_f6666", "mha4_f6f4"):
         is_f6f4 = args.kernel == "mha4_f6f4"
+        is_f6666 = args.kernel == "mha4_f6666"
         block_r = args.block_r
         if args.qsmooth or (args.hadamard_rotate and block_r != 128):
             raise ValueError(
@@ -1377,11 +1387,19 @@ def make_kernel_runner(
                 quant_k,
                 v_bshd,
                 softmax_scale,
-                mxfp4_v=is_f6f4,
-                fp6_p=is_f6f4 and block_lut is None,
+                v_format=(
+                    AttentionFormat.MXFP4
+                    if is_f6f4
+                    else AttentionFormat.MXFP6 if is_f6666 else None
+                ),
+                fp6_p=(is_f6f4 or is_f6666) and block_lut is None,
             )
 
-        v_format = AttentionFormat.MXFP4 if is_f6f4 else fp8_format
+        v_format = (
+            AttentionFormat.MXFP4
+            if is_f6f4
+            else AttentionFormat.MXFP6 if is_f6666 else fp8_format
+        )
         scale_modes = scale_modes_for_formats(
             AttentionFormat.MXFP6, AttentionFormat.MXFP6, v_format
         )
@@ -1400,7 +1418,7 @@ def make_kernel_runner(
                 *scale_modes,
                 v_pack=(
                     AttentionPack.V_FOR_FP6_P
-                    if is_f6f4 and block_lut is None
+                    if (is_f6f4 or is_f6666) and block_lut is None
                     else AttentionPack.DEFAULT
                 ),
                 softmax_scale=softmax_scale,

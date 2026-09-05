@@ -22,6 +22,7 @@ Supported dense recipes:
 | FP8 | FP8 |
 | FP8 | MXFP6 |
 | MXFP6 | FP8 |
+| MXFP6 | MXFP6 (dense only) |
 | MXFP6 | MXFP4 |
 | MXFP4 | FP8 |
 | MXFP4 | MXFP4 |
