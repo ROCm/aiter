@@ -3,9 +3,9 @@
 # ruff: noqa: BLE001, PYI034, S110, UP035, UP037
 """AMD GPU metrics monitor using amdsmi.
 
-ROCm ships the binding without a setup.py. Make it importable with::
-
-    export PYTHONPATH=/opt/rocm/share/amd_smi${PYTHONPATH:+:$PYTHONPATH}
+ROCm ships the binding without a setup.py. If the normal import fails, this
+module temporarily searches ``/opt/rocm/share/amd_smi`` while importing it.
+Neither ``PYTHONPATH`` nor the caller's lasting ``sys.path`` is changed.
 
 Usage (context manager):
     with GpuMonitor(device_index=0, interval_s=0.05) as mon:
@@ -23,17 +23,38 @@ Usage (explicit start/stop):
 from __future__ import annotations
 
 import ctypes
+import importlib
 import json
 import os
+import sys
 import threading
 import time
 from contextlib import contextmanager
 from typing import Generator
 
 SMI_RESULT_PREFIX = "AITER_SMI_RESULT "
+_ROCM_AMDSMI_PATH = "/opt/rocm/share/amd_smi"
+
+
+def _import_amdsmi():
+    """Import amdsmi, temporarily searching ROCm's unpackaged binding."""
+    try:
+        return importlib.import_module("amdsmi")
+    except ImportError:
+        if not os.path.isdir(_ROCM_AMDSMI_PATH):
+            raise
+
+    added_path = _ROCM_AMDSMI_PATH not in sys.path
+    if added_path:
+        sys.path.insert(0, _ROCM_AMDSMI_PATH)
+    try:
+        return importlib.import_module("amdsmi")
+    finally:
+        if added_path:
+            sys.path.remove(_ROCM_AMDSMI_PATH)
 
 try:
-    import amdsmi
+    amdsmi = _import_amdsmi()
 
     _AMDSMI_AVAILABLE = True
 except ImportError:

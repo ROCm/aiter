@@ -85,14 +85,14 @@ Other variables:
 Optional GPU telemetry replays each already-prepared benchmark case in its own
 sampling window, after its normal latency measurement:
 
-    # ROCm ships the binding here without a setup.py; make it importable first.
-    export PYTHONPATH=/opt/rocm/share/amd_smi${PYTHONPATH:+:$PYTHONPATH}
     python op_tests/bench_gfx1250_combo.py --dsv4 \
       --smi-monitor --smi-device 0 --smi-interval 0.05 --smi-duration 1.0
 
 Input initialization, compilation, correctness and warmup are outside the SMI
-window. The monitor uses the Python ``amdsmi`` package and prints a case-tagged
-min/mean/median/max table for clocks, power, temperature, activity and VRAM.
+window. The monitor privately loads ROCm's unpackaged ``amdsmi`` binding from
+``/opt/rocm/share/amd_smi`` when needed, without changing combo's environment,
+and prints a case-tagged min/mean/median/max table for clocks, power,
+temperature, activity and VRAM.
 ``mega_moe`` has every rank monitor its local GPU around synchronized graph
 replays, then gathers the four summaries to rank 0; ``mori_ep`` remains disabled
 until its dispatch/combine loop exposes an aligned telemetry window.
