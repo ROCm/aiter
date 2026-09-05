@@ -5,6 +5,8 @@
 #include "aiter_tensor.h"
 #include "aiter_stream.h"
 #include "hip_reduce.h"
+#include "coop_topk.cuh"
+#include "dispatch_utils.h"
 #include <hipcub/hipcub.hpp>
 #include <hipcub/util_type.hpp>
 
@@ -2831,6 +2833,217 @@ void radix_topk_dispatch(void* buf,
                 k, nullptr, out_idx, select_min, stream, true);
         }
     }
+}
+
+namespace aiter { namespace coop {
+
+// 12-bit bins (16 KB) plus 4096 ties (32 KB) is 48 KB of LDS, inside the 64 KB
+// static ceiling. The bin count is what keeps the tie set small enough to fit: see
+// the precision discussion in coop_topk.cuh.
+constexpr uint32_t kCoopHistBits = 12;
+constexpr uint32_t kCoopTieCap   = 4096;
+constexpr uint32_t kCoopBlock    = 1024;
+
+using CoopWs = CoopMbWorkspace<kCoopHistBits, kCoopTieCap>;
+
+// Blocks per row, 0 meaning "use the one-block kernel".
+//
+// Splitting a row buys two things, both of which only matter when one block per row
+// leaves the device idle: it divides the LDS histogram contention that clustered
+// logits create, and it gives a row more than one block's worth of memory
+// parallelism. It costs three extra launches and a second read of the row in
+// scatter, so once the batch alone fills the machine it is a straight loss.
+//
+// The gates below are both needed because the two terms move independently. The
+// cost is close to fixed -- three extra launches and a second read of the row --
+// while the benefit grows with row length, since that is what sets how much
+// contention there is to divide. Measured on MI355X (us, clustered / diffuse, best
+// split against one-block):
+//   len  32768  b1  30.6/15.7 -> 24.3/19.1   b19 31.0/16.0 -> 28.7/21.3
+//   len  49152  b1  41.9/19.3 -> 27.2/19.2   b64 43.3/20.0 -> 36.8/26.0
+//   len  65536  b1  52.3/23.1 -> 22.3/19.7   b64 54.4/24.0 -> 43.9/27.7
+//   len 100500  b1  73.7/30.7 -> 23.2/20.2   b64 74.7/31.9 -> 43.1/33.2
+// Below 64K the clustered gain no longer covers the diffuse loss (at 32768/b64 it
+// is 0% against 48%), and the distribution is not knowable at dispatch time, so
+// short rows stay on the one-block kernel. Likewise from batch 128 up one block per
+// row already fills the machine, hence requiring at least four blocks per row
+// rather than merely more than one.
+static int coop_grid_split(int batch, int64_t row_len)
+{
+    if(const char* e = std::getenv("TOPK_COOP_G")) {
+        const int v = std::atoi(e);
+        if(v >= 0) return v;
+    }
+    static const int cu = []() {
+        int dev = 0;
+        (void)hipGetDevice(&dev);
+        hipDeviceProp_t p{};
+        (void)hipGetDeviceProperties(&p, dev);
+        return p.multiProcessorCount;
+    }();
+
+    constexpr int64_t kMinRowLen = 65536;
+    constexpr int kMinSplit      = 4;
+    // Holds the slice at >= 2048 elements given kMinRowLen, below which a block
+    // cannot amortise the 4096 global atomics of its own histogram flush.
+    constexpr int kMaxSplit = 32;
+
+    if(row_len < kMinRowLen) { return 0; }
+    const int g = std::min(cu / std::max(batch, 1), kMaxSplit);
+    return g < kMinSplit ? 0 : g;
+}
+
+// The row-split path's scratch now comes from the caller, like the mb/ob paths:
+// Python asks dsa_topk_workspace_size(), allocates a torch tensor and passes it
+// in. It used to grow a process-level static buffer with hipMalloc and hipFree
+// the old block, but that address is baked into every HIP graph captured while
+// it was current -- both as CoopTopKParams::ws and as the destination of the
+// hipMemsetAsync below -- so the free left those graphs writing to address space
+// the allocator no longer owned. Under 2 MiB the freed block stayed mapped in a
+// reserved arena and the stale write landed silently on whatever got the memory
+// next; at or above 2 MiB the free unmapped it and the next replay faulted.
+
+// page_table null selects raw positions; non-null makes the kernel emit the
+// physical KV slot instead, which is the DSA indexer's actual output. page_size
+// must be a power of two.
+static void launch(const float* in,
+                   int32_t* out_idx,
+                   const int32_t* row_starts,
+                   const int32_t* row_ends,
+                   int32_t* overflow,
+                   void* ws,
+                   int batch,
+                   int64_t stride,
+                   int64_t row_len_hint,
+                   hipStream_t stream,
+                   const int32_t* page_table = nullptr,
+                   const int32_t* pt_row_map = nullptr,
+                   int64_t pt_stride         = 0,
+                   int page_size             = 1)
+{
+    const int g = ws ? coop_grid_split(batch, row_len_hint) : 0;
+
+    uint32_t page_bits = 0;
+    while((1 << page_bits) < page_size) { ++page_bits; }
+    const uint32_t page_mask = (1u << page_bits) - 1u;
+
+    if(g == 0) {
+        CoopTopKParams<2048> p{};
+        p.input      = in;
+        p.out_idx    = out_idx;
+        p.row_starts = row_starts;
+        p.row_ends   = row_ends;
+        p.overflow   = overflow;
+        p.page_table = page_table;
+        p.pt_row_map = pt_row_map;
+        p.pt_stride  = pt_stride;
+        p.page_bits  = page_bits;
+        p.page_mask  = page_mask;
+        p.num_rows   = static_cast<uint32_t>(batch);
+        p.stride     = stride;
+        coop_topk_kernel<2048, kCoopHistBits, kCoopTieCap, kCoopBlock>
+            <<<batch, kCoopBlock, 0, stream>>>(p);
+        return;
+    }
+
+    CoopMbParams<2048> p{};
+    p.input      = in;
+    p.out_idx    = out_idx;
+    p.row_starts = row_starts;
+    p.row_ends   = row_ends;
+    p.overflow   = overflow;
+    p.page_table = page_table;
+    p.pt_row_map = pt_row_map;
+    p.pt_stride  = pt_stride;
+    p.page_bits  = page_bits;
+    p.page_mask  = page_mask;
+    p.ws         = ws;
+    p.stride     = stride;
+    p.batch      = static_cast<uint32_t>(batch);
+
+    // Histograms, state and counters must start at zero; the workspace groups them
+    // into one prefix so this is a single launch regardless of batch.
+    (void)hipMemsetAsync(ws, 0, CoopWs::zero_bytes(static_cast<size_t>(batch)), stream);
+
+    const dim3 grid(static_cast<unsigned>(batch), static_cast<unsigned>(g), 1);
+    coop_mb_hist0<2048, kCoopHistBits, kCoopTieCap, kCoopBlock>
+        <<<grid, kCoopBlock, 0, stream>>>(p, static_cast<uint32_t>(g));
+    coop_mb_hist1<2048, kCoopHistBits, kCoopTieCap, kCoopBlock>
+        <<<grid, kCoopBlock, 0, stream>>>(p, static_cast<uint32_t>(g));
+    coop_mb_scatter<2048, kCoopHistBits, kCoopTieCap, kCoopBlock>
+        <<<grid, kCoopBlock, 0, stream>>>(p, static_cast<uint32_t>(g));
+    coop_mb_refine<2048, kCoopHistBits, kCoopTieCap, kCoopBlock>
+        <<<batch, kCoopBlock, 0, stream>>>(p);
+}
+
+} }  // namespace aiter::coop
+
+// DSA indexer top-k + page-table transform, one launch.
+//
+// This is the op sglang calls topk_transform: select the top-k of each row of
+// indexer logits and report the physical KV slots rather than the raw positions.
+// The selection is the coop kernel; the transform rides along in its emit, so
+// there is no second pass over the [numRows, k] output and no second launch. In
+// sglang the same transform is a chain of tensor ops after top-k -- a score
+// gather, two torch.where, the page split, a torch.gather, the recombine and a
+// masked_fill (see _topk_transform_512_vectorized).
+//
+// pageTable is [ptRows, pages] int32, logical page -> physical page, and pageSize
+// must be a power of two. A null pageTable emits raw positions, which makes this a
+// plain per-row top-k. A null rowStarts means every row begins at 0, which is what
+// the decode path always wants and saves it a per-call zeros tensor.
+//
+// ptRowMap is [numRows] int32 mapping each logits row to its page-table row. Decode
+// has one row per sequence, so ptRows == numRows and the map is null (identity).
+// Speculative decoding hands us several rows per sequence -- one per draft token --
+// against a page table that still has one row per sequence, and ptRowMap is what
+// lets those shapes use this kernel rather than falling back to the unfused chain.
+//
+// Bytes the row-split (coop) path needs for this shape, or 0 when the shape does
+// not take it. Mirrors topk_mb_workspace_size so the caller owns the lifetime.
+int64_t dsa_topk_workspace_size(int64_t numRows, int64_t stride0)
+{
+    if(numRows <= 0) { return 0; }
+    if(aiter::coop::coop_grid_split(static_cast<int>(numRows), stride0) == 0) { return 0; }
+    return static_cast<int64_t>(aiter::coop::CoopWs::bytes(static_cast<size_t>(numRows)));
+}
+
+// A ctypes entry like the *_fast paths in topk.py: per-call binding cost is a
+// visible fraction of a 20 us op.
+void dsa_topk_transform(const aiter_tensor_t& logits,
+                        std::optional<aiter_tensor_t> rowStarts,
+                        const aiter_tensor_t& rowEnds,
+                        std::optional<aiter_tensor_t> pageTable,
+                        std::optional<aiter_tensor_t> ptRowMap,
+                        aiter_tensor_t& indices,
+                        int64_t numRows,
+                        int64_t pageSize,
+                        int64_t k,
+                        std::optional<aiter_tensor_t> workspace)
+{
+    if(numRows <= 0) { return; }
+    AITER_CHECK(k == 2048, "dsa_topk_transform is instantiated for k=2048 only");
+    AITER_CHECK(pageSize > 0 && (pageSize & (pageSize - 1)) == 0,
+                "dsa_topk_transform needs a power-of-two page size");
+
+    const HipDeviceGuard device_guard(logits.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+    const int batch          = static_cast<int>(numRows);
+
+    aiter::coop::launch(static_cast<float*>(logits.data_ptr()),
+                        static_cast<int*>(indices.data_ptr()),
+                        rowStarts.has_value() ? static_cast<int*>(rowStarts->data_ptr()) : nullptr,
+                        static_cast<int*>(rowEnds.data_ptr()),
+                        /*overflow=*/nullptr,
+                        workspace.has_value() ? workspace->data_ptr() : nullptr,
+                        batch,
+                        logits.stride(0),
+                        /*row_len_hint=*/logits.stride(0),
+                        stream,
+                        pageTable.has_value() ? static_cast<int*>(pageTable->data_ptr()) : nullptr,
+                        ptRowMap.has_value() ? static_cast<int*>(ptRowMap->data_ptr()) : nullptr,
+                        pageTable.has_value() ? pageTable->stride(0) : 0,
+                        static_cast<int>(pageSize));
 }
 
 // Prefill entry: dispatches to mb or ob based on batch size and seq_len.
