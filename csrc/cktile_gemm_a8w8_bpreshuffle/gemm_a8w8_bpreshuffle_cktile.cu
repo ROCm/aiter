@@ -11,7 +11,13 @@
 using RowwiseKernel = torch::Tensor (*)(
     torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, int);
 
-using RowwiseKernelMap = GemmDispatchMap<RowwiseKernel>;
+struct RowwiseDispatchEntry
+{
+    RowwiseKernel kernel;
+    bool supports_m_padding;
+};
+
+using RowwiseKernelMap = GemmDispatchMap<RowwiseDispatchEntry>;
 
 template <typename DDataType, typename EDataType = DDataType>
 RowwiseKernel rowwise_heuristic_dispatch(int M, int N, int K)
@@ -59,7 +65,7 @@ RowwiseKernel rowwise_dispatch(int M, int N, int K)
     // If we found an optimal kernel, use it.
     if(it != lookup.end())
     {
-        return it->second;
+        return it->second.kernel;
     }
 
     int padded_m = M;
@@ -69,9 +75,9 @@ RowwiseKernel rowwise_dispatch(int M, int N, int K)
     // Second check if this shape(padded_m,N,K) is available in the direct lookup.
     it = lookup.find({gfx, cu_num, padded_m, N, K});
     // If we found an optimal kernel, use it.
-    if(it != lookup.end())
+    if(it != lookup.end() && it->second.supports_m_padding)
     {
-        return it->second;
+        return it->second.kernel;
     }
 
     // Coarse-grained search
@@ -79,9 +85,9 @@ RowwiseKernel rowwise_dispatch(int M, int N, int K)
     // Third check if this shape(padded_m,N,K) is available in the direct lookup.
     it = lookup.find({gfx, cu_num, padded_m, N, K});
     // If we found an optimal kernel, use it.
-    if(it != lookup.end())
+    if(it != lookup.end() && it->second.supports_m_padding)
     {
-        return it->second;
+        return it->second.kernel;
     }
 
     // Otherwise, use heuristics.

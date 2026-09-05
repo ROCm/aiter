@@ -687,17 +687,22 @@ def test_write_lookup_header():
     from chip_info import write_lookup_header
 
     class _FakeKernel:
-        def __init__(self, name):
+        def __init__(self, name, supports_m_padding=True):
             self.name = name
+            self.supports_m_padding = supports_m_padding
 
     kernels_dict = {
         ("gfx942", 304, 128, 4096, 4096): _FakeKernel("kernel_non_batched"),
-        ("gfx942", 304, 2, 128, 4096, 4096): _FakeKernel("kernel_batched"),
+        ("gfx942", 304, 2, 128, 4096, 4096): _FakeKernel(
+            "kernel_batched", supports_m_padding=False
+        ),
         -1: _FakeKernel("default_kernel"),  # default_dict entry — must be skipped
     }
 
     LOOKUP_head = "#ifdef USE_ROCM\n#define GENERATE_LOOKUP_TABLE(DTYPE, ETYPE) {\\\n"
-    LOOKUP_template = "   {{{MNK}, {kernel_name}<DTYPE, ETYPE>}},\\\n"
+    LOOKUP_template = (
+        "   {{{MNK}, {{{kernel_name}<DTYPE, ETYPE>, {supports_m_padding}}}}},\\\n"
+    )
     LOOKUP_end = "}\n#endif\n"
 
     path = None
@@ -709,7 +714,14 @@ def test_write_lookup_header():
         path = f.name
         f.close()
         write_lookup_header(
-            path, kernels_dict, LOOKUP_head, LOOKUP_template, LOOKUP_end
+            path,
+            kernels_dict,
+            LOOKUP_head,
+            LOOKUP_template,
+            LOOKUP_end,
+            extra_format_args=lambda kernel: {
+                "supports_m_padding": str(kernel.supports_m_padding).lower()
+            },
         )
         with open(path) as fh:
             content = fh.read()
@@ -728,6 +740,11 @@ def test_write_lookup_header():
             "default_dict (-1) entry is skipped",
             "default_kernel" not in content,
             f"default_kernel unexpectedly in output:\n{content}",
+        )
+        _check(
+            "per-kernel metadata is emitted in the lookup value",
+            "{kernel_batched<DTYPE, ETYPE>, false}" in content,
+            f"padding metadata not found in output:\n{content}",
         )
         _check(
             "old-style key without gfx (regression guard): {304, 128, ...} absent",

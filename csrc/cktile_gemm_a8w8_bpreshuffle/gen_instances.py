@@ -229,9 +229,18 @@ template torch::Tensor
 #define GENERATE_LOOKUP_TABLE(DTYPE, ETYPE)                                                                                      \\
    {                                                                                                                             \\"""
 
-        LOOKUP_template = """
+        if self.istune:
+            LOOKUP_template = """
        {{{MNK},                                                                                                       \\
-        {kernel_name}<DTYPE, ETYPE>}},                       \\"""
+        {kernel_name}<DTYPE, ETYPE>}},                                                                                \\"""
+            extra_format_args = None
+        else:
+            LOOKUP_template = """
+       {{{MNK},                                                                                                       \\
+        RowwiseDispatchEntry{{{kernel_name}<DTYPE, ETYPE>, {supports_m_padding}}}}},                                  \\"""
+
+            def extra_format_args(kernel):
+                return {"supports_m_padding": str(kernel.supports_m_padding).lower()}
 
         LOOKUP_end = """
    }
@@ -245,6 +254,7 @@ template torch::Tensor
             LOOKUP_template,
             LOOKUP_end,
             self.istune,
+            extra_format_args=extra_format_args,
         )
 
     def gen_manifest_head(self, kernels_dict):
