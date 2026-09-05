@@ -375,6 +375,52 @@ class ValidatorFixture:
         return mutate
 
 
+class ConcurrentRunGuard(unittest.TestCase):
+    """Two of these suites at once make a third of the run look broken.
+
+    The validator claims a GPU with `flock -n` on /tmp/gpu-N.lock. A second validator finds
+    every candidate locked, degrades to NO_GPU, skips the runtime stages, and returns
+    INCONCLUSIVE -- correctly, and it says so in the report: "GPU claim raced with another
+    process". The tests that assert PASS then fail with `'PASS' != 'INCONCLUSIVE'`, which
+    names the symptom and not the cause, and the cause is off-screen unless the whole
+    report is read.
+
+    That cost five sessions of calling this suite flaky and nearly cost it a round of
+    "isolate the timing-sensitive tests", which would have deleted a true signal. Runs
+    alone: 89 passed, six times over. Two runs overlapping: 5 and 6 failures. So the suite
+    says up front when the machine is not its own.
+    """
+
+    def test_no_other_validator_holds_a_gpu_lock(self):
+        """Checks the contended resource, not a process name.
+
+        Written first as `pgrep -af validate_pr.sh`, which matched the shell command
+        running the grep -- the string is in its own argv. The lock is the thing that
+        actually decides the outcome, so ask the lock.
+        """
+        import fcntl
+        import glob
+        held = []
+        for path in sorted(glob.glob("/tmp/gpu-*.lock")):
+            try:
+                fd = os.open(path, os.O_RDWR)
+            except OSError:
+                continue
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                held.append(path)
+            finally:
+                os.close(fd)
+        self.assertEqual(
+            [], held,
+            "another validator holds %s. It will keep holding the GPU while this suite "
+            "runs, so the runtime stages degrade to NO_GPU and every test expecting PASS "
+            "reports INCONCLUSIVE. These are not regressions -- wait for the other run."
+            % ", ".join(held))
+
+
 class ValidateKernelPrTests(unittest.TestCase):
     def setUp(self):
         self.fixture = ValidatorFixture()
