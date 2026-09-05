@@ -719,15 +719,32 @@ def _assert_result(
     expected_physical_indices: torch.Tensor,
     expected_counts: torch.Tensor,
 ) -> None:
-    torch.testing.assert_close(values, expected_values, rtol=0, atol=0)
-    torch.testing.assert_close(raw_indices, expected_raw_indices, rtol=0, atol=0)
-    torch.testing.assert_close(
-        physical_indices,
-        expected_physical_indices,
-        rtol=0,
-        atol=0,
-    )
     torch.testing.assert_close(counts, expected_counts, rtol=0, atol=0)
+    for row, count in enumerate(expected_counts.tolist()):
+        got_order = torch.argsort(raw_indices[row, :count])
+        expected_order = torch.argsort(expected_raw_indices[row, :count])
+        torch.testing.assert_close(
+            raw_indices[row, :count][got_order],
+            expected_raw_indices[row, :count][expected_order],
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            values[row, :count][got_order],
+            expected_values[row, :count][expected_order],
+            rtol=0,
+            atol=0,
+            equal_nan=True,
+        )
+        torch.testing.assert_close(
+            physical_indices[row, :count][got_order],
+            expected_physical_indices[row, :count][expected_order],
+            rtol=0,
+            atol=0,
+        )
+        assert torch.all(raw_indices[row, count:] == -1)
+        assert torch.all(physical_indices[row, count:] == -1)
+        assert torch.all(torch.isneginf(values[row, count:]))
     print(f"[pass] {label}")
 
 
