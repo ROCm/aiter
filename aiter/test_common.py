@@ -487,8 +487,26 @@ def checkAllclose(
     printLog=True,
     max_abs_delta=None,
     catastrophic_check=False,
+    mask=None,
 ):
     isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
+    # mask (bool, broadcastable to a/b): True = compare, False = ignore.
+    # Error ratio is taken over the checked elements only.
+    if mask is not None:
+        mask = mask.to(device=isClose.device, dtype=torch.bool).broadcast_to(
+            isClose.shape
+        )
+        isClose = isClose | ~mask
+        denom = int(mask.sum().item())
+        if denom == 0:
+            if printLog:
+                logger.info(
+                    f"{msg}[checkAllclose {atol=} {rtol=} "
+                    f"\033[33mskipped: empty mask\033[0m]"
+                )
+            return 0
+    else:
+        denom = a.numel()
 
     if isClose.all():
         if printLog:
@@ -496,10 +514,10 @@ def checkAllclose(
         return 0
     else:
         try:
-            mask = ~isClose
-            num = mask.sum()
+            mismatch = ~isClose
+            num = int(mismatch.sum().item())
             printNum = min(printNum, num)
-            percent = (num / a.numel()).item()
+            percent = num / denom
             if not printLog:
                 if percent >= tol_err_ratio:
                     return percent
@@ -507,14 +525,15 @@ def checkAllclose(
                     a, b, max_abs_delta, catastrophic_check
                 )
                 return 1.0 if is_cat else percent
-            a_msked = a[mask]
-            b_msked = b[mask]
+            a_msked = a[mismatch]
+            b_msked = b[mismatch]
             delta = (a_msked - b_msked).abs()
         except RuntimeError:
-            mask = ~isClose.to("cpu")
-            num = mask.sum()
+            a, b = a.to("cpu"), b.to("cpu")
+            mismatch = ~isClose.to("cpu")
+            num = int(mismatch.sum().item())
             printNum = min(printNum, num)
-            percent = (num / a.numel()).item()
+            percent = num / denom
             if not printLog:
                 if percent >= tol_err_ratio:
                     return percent
@@ -522,8 +541,8 @@ def checkAllclose(
                     a, b, max_abs_delta, catastrophic_check
                 )
                 return 1.0 if is_cat else percent
-            a_msked = a[mask]
-            b_msked = b[mask]
+            a_msked = a[mismatch]
+            b_msked = b[mismatch]
             delta = (a_msked - b_msked).abs()
 
         actual_max_delta = delta.max().item()
@@ -554,12 +573,12 @@ def checkAllclose(
                 f"""{msg}[checkAllclose {atol=} {rtol=} \033[33mwarning!\033[0m] a and b results are not all close"""
             )
         logger.info(
-            f"-->max abs delta:{delta.max()}, delta details: {percent:.1%} ({num} of {a.numel()}) elements"
+            f"-->max abs delta:{delta.max()}, delta details: {percent:.1%} ({num} of {denom}) elements"
         )
         if is_catastrophic:
             raise AssertionError(
                 f"{msg}catastrophic error: max abs delta {actual_max_delta:.4f}, "
-                f"{percent:.1%} ({num} of {a.numel()}) elements mismatch"
+                f"{percent:.1%} ({num} of {denom}) elements mismatch"
             )
         return percent
 
