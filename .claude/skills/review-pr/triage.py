@@ -124,51 +124,6 @@ NOT_A_FIELD = re.compile(r"^\s*(break|continue|return|goto|else|case|default|usi
                          r"typedef|friend|public|private|protected)\b")
 
 
-def struct_field_churn(diff_text):
-    """A struct gained or lost a field, and the diff touched no ABI assertion.
-
-    aiter pins the layout of every kargs struct a hand-written code object reads:
-    `static_assert(sizeof(pa_sparse_prefill_kargs) == 112)` plus one `offsetof` per
-    field. Inserting a field in the middle shifts every offset after it, which is a
-    build break at best and a silent ABI mismatch with a prebuilt code object at worst.
-    aiter#5220 adds two ints between `stride_qo_h` and `stride_kv_page` in the same
-    translation unit that carries the assertions, and updates none of them.
-
-    Fires only when the diff itself does NOT touch an assertion -- a PR that moves the
-    fields and fixes the table is the correct shape and needs no finding."""
-    if re.search(r"(?m)^[+-].*(offsetof\(|static_assert\(\s*sizeof)", diff_text):
-        return False
-    for blk in re.split(r"(?m)^diff --git ", diff_text)[1:]:
-        head = blk.split("\n", 1)[0]
-        m = re.match(r"a/(\S+) b/(\S+)", head)
-        if not m or m.group(2).rsplit(".", 1)[-1] not in C_LIKE:
-            continue
-        in_struct = False
-        for ln in blk.split("\n"):
-            # git puts the enclosing scope after the second @@, and a field added to an
-            # existing struct is exactly the case where the `struct X {` line is context
-            # the hunk never shows. aiter#5220's hunk header is
-            # `@@ -129,6 +129,10 @@ struct pa_sparse_prefill_kargs`.
-            hh = re.match(r"@@ [^@]*@@\s*(.*)$", ln)
-            if hh:
-                in_struct = bool(re.search(r"\b(struct|class)\s+\w+", hh.group(1)))
-                continue
-            body = ln[1:] if ln[:1] in "+- " else ln
-            if re.search(r"\b(struct|class)\s+\w+.*\{", body):
-                in_struct = True
-            elif re.match(r"\s*\}\s*;", body):
-                in_struct = False
-            if not (in_struct and ln[:1] in "+-") or ln.startswith(("+++", "---")):
-                continue
-            if NOT_A_FIELD.match(body) or "(" in body or body.strip().startswith("//"):
-                continue
-            if re.match(r"\s*(const\s+)?[\w:<>,\*&]+(\s+[\w:<>\*&]+)+"
-                        r"(\s*\[[^\]]*\])?\s*;\s*$", body):
-                return True
-    return False
-
-
-
 COLLECTABLE = re.compile(r"^def test_\w+|^\s+def test_\w+|^class Test\w+", re.M)
 
 
@@ -1597,26 +1552,6 @@ def near_duplicates(diff_text, root, threshold=0.60):
 
 
 # --------------------------------------------------------------- ci coverage
-def ci_test_scope(root):
-    """(patterns, note) describing which test paths a CI job actually scans.
-
-    Derived from .github/, never hardcoded: the shard script is where the truth is and a
-    copy of it here would drift the way Step 3's rule table did. Reads the `find` lines in
-    split_tests.sh, so a change to its maxdepth or its directories changes this answer."""
-    root = pathlib.Path(root)
-    scope = []
-    sh = root / ".github" / "scripts" / "split_tests.sh"
-    if sh.is_file():
-        text = sh.read_text(errors="replace")
-        for m in re.finditer(r'find\s+"?(\$?\w+|[\w/]+)"?\s+(-maxdepth\s+(\d+)\s+)?'
-                             r"-name\s+'([^']+)'", text):
-            var, _, depth, pat = m.groups()
-            scope.append((var, int(depth) if depth else None, pat))
-    dirs = dict(re.findall(r'TEST_DIR="([\w/]+)"', sh.read_text(errors="replace"))
-                and [] or [])
-    return scope
-
-
 def uncovered_test_paths(diff_text, root):
     """Test files the diff adds that no CI job will run, and why.
 
