@@ -12,10 +12,27 @@ import flydsl.expr as fx
 import torch
 import triton
 import triton.language as tl
-from flydsl.expr import gpu, rocdl
+from flydsl.expr import const_expr, gpu, rocdl
 from flydsl.expr.primitive import range_constexpr
 from flydsl.expr.typing import Float4E2M1FN, Int32, T
 
+from ..candidate_topk_common import (
+    BLOCK_THREADS as TOPK_BLOCK_THREADS,
+)
+from ..candidate_topk_common import (
+    NUM_HIST_BINS,
+    NUM_KEY_BYTES,
+    NUM_WAVES,
+    RADIX_SIGN_BIT,
+    block_exclusive_prefix_i32,
+    f32_to_ordered_i32,
+    key_is_better,
+    key_matches_prefix,
+    make_streaming_topk_storage,
+    prefix_byte_mask,
+    radix_byte,
+)
+from ..kernels_common import atomic_add_i32
 from .pa_mqa_logits_fp4_common import (
     _i32_buffer,
     _load_vec4_i32,
@@ -32,6 +49,19 @@ DEFAULT_BLOCK_THREADS = DEFAULT_NUM_WARPS * WARP_SIZE  # 256
 # cta_info packed fields per CTA.
 CTA_INFO_WIDTH = 6
 
+_STREAM_RETAINED = 0
+_STREAM_PENDING = 1
+_STREAM_SCORE_PREFIX = 2
+_STREAM_SCORE_MASK = 3
+_STREAM_INDEX_PREFIX = 4
+_STREAM_INDEX_MASK = 5
+_STREAM_REMAINING = 6
+_STREAM_WRITE_CURSOR = 7
+_STREAM_EQUAL_SEEN = 8
+_STREAM_STATE_SIZE = 9
+_PACK_SHIFT = 16
+_PACK_MASK = (1 << _PACK_SHIFT) - 1
+
 
 def compute_prefill_schedule(
     row_to_batch,
@@ -41,6 +71,7 @@ def compute_prefill_schedule(
     parallel_unit_num,
     max_seq_len,
     cta_info_out=None,
+    row_offsets_out=None,
 ):
     """Compute the persistent-grid schedule for ragged-prefill MQA logits.
 
@@ -102,6 +133,23 @@ def compute_prefill_schedule(
         P,
         BLOCK_P=BLOCK_P,
     )
+    if row_offsets_out is not None:
+        if (
+            row_offsets_out.dtype != torch.int32
+            or row_offsets_out.ndim != 1
+            or row_offsets_out.shape[0] < T + 1
+            or row_offsets_out.device != device
+        ):
+            raise ValueError(
+                "row_offsets_out must be a one-dimensional int32 buffer with "
+                "at least rows + 1 entries on the schedule device"
+            )
+        _prefill_row_offsets_kernel[(triton.cdiv(T + 1, BLOCK_P),)](
+            plan.incl,
+            row_offsets_out,
+            T,
+            BLOCK=BLOCK_P,
+        )
     return plan.safe, cta_info, P
 
 
@@ -116,6 +164,65 @@ class _RowPlan(NamedTuple):
     chunks: torch.Tensor  # [T] ceil(local_end / block_k), 0 for an empty row
     safe: torch.Tensor  # [1] chunk-splits merged into one CTA
     total_splits: torch.Tensor  # [1] number of valid (row, split) slots
+
+
+class FP4PrefillTopKWorkspace(NamedTuple):
+    """Caller-owned scratch for graph-safe fused FP4 prefill TopK."""
+
+    cta_info: torch.Tensor
+    row_offsets: torch.Tensor
+    candidate_values: torch.Tensor
+    candidate_indices: torch.Tensor
+    candidate_counts: torch.Tensor
+
+
+class FP4PrefillTopKResult(NamedTuple):
+    values: torch.Tensor
+    raw_indices: torch.Tensor
+    physical_indices: torch.Tensor
+    counts: torch.Tensor
+
+
+def allocate_fp4_prefill_topk_workspace(
+    rows: int,
+    parallel_unit_num: int,
+    topk: int,
+    device: torch.device | str,
+) -> FP4PrefillTopKWorkspace:
+    """Allocate all scratch needed by the no-logits fused path."""
+
+    if rows <= 0:
+        raise ValueError("rows must be positive")
+    if parallel_unit_num < rows:
+        raise ValueError("parallel_unit_num must be at least rows")
+    if topk not in (512, 1024):
+        raise ValueError("topk must be 512 or 1024")
+    return FP4PrefillTopKWorkspace(
+        cta_info=torch.empty(
+            parallel_unit_num,
+            CTA_INFO_WIDTH,
+            dtype=torch.int32,
+            device=device,
+        ),
+        row_offsets=torch.empty(rows + 1, dtype=torch.int32, device=device),
+        candidate_values=torch.empty(
+            parallel_unit_num,
+            topk,
+            dtype=torch.float32,
+            device=device,
+        ),
+        candidate_indices=torch.empty(
+            parallel_unit_num,
+            topk,
+            dtype=torch.int32,
+            device=device,
+        ),
+        candidate_counts=torch.empty(
+            parallel_unit_num,
+            dtype=torch.int32,
+            device=device,
+        ),
+    )
 
 
 # Rows the fused arm plans, and the only two widths it plans them in. A block
@@ -355,6 +462,20 @@ def _prefill_cta_info_kernel(
     tl.store(cta_info_ptr + base + 5, le_out, mask=smask)
 
 
+@triton.jit(do_not_specialize=["T"])
+def _prefill_row_offsets_kernel(
+    incl_ptr,  # [T] inclusive prefix sum
+    row_offsets_ptr,  # [T + 1] output
+    T,
+    BLOCK: tl.constexpr,
+):
+    offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offset <= T
+    previous_row = tl.maximum(offset - 1, 0)
+    value = tl.load(incl_ptr + previous_row, mask=mask & (offset > 0), other=0)
+    tl.store(row_offsets_ptr + offset, value, mask=mask)
+
+
 def build_pa_mqa_logits_fp4_prefill_module(
     block_k=256,
     kv_block_size=64,
@@ -363,9 +484,36 @@ def build_pa_mqa_logits_fp4_prefill_module(
     num_warps=DEFAULT_NUM_WARPS,
     heads=DEFAULT_HEADS,
     head_dim=DEFAULT_HEAD_DIM,
+    candidate_topk=None,
+    score_batch_chunks=4,
 ):
-    """Build the ragged-prefill FP4 MQA logits kernel."""
+    """Build the ragged-prefill FP4 scorer.
+
+    With ``candidate_topk=None`` the score callback writes the legacy logits
+    matrix. With 512 or 1024 it instead streams bounded score batches through
+    LDS and keeps an exact per-CTA candidate set.
+    """
     block_threads_k = num_warps * WARP_SIZE
+    emit_candidates = candidate_topk is not None
+    if emit_candidates:
+        assert candidate_topk in (512, 1024), "candidate_topk must be 512 or 1024"
+        assert block_k == 256, "streaming TopK currently requires block_k=256"
+        assert (
+            block_threads_k == TOPK_BLOCK_THREADS
+        ), "streaming TopK requires the 256-thread/4-wave score body"
+        assert score_batch_chunks in (1, 2, 4), "score_batch_chunks must be 1, 2, or 4"
+        pool_capacity = candidate_topk + score_batch_chunks * block_k
+        pool_steps = (
+            pool_capacity + TOPK_BLOCK_THREADS - 1
+        ) // TOPK_BLOCK_THREADS
+        output_steps = (
+            candidate_topk + TOPK_BLOCK_THREADS - 1
+        ) // TOPK_BLOCK_THREADS
+        streaming_storage_type = make_streaming_topk_storage(
+            candidate_topk,
+            pool_capacity,
+            _STREAM_STATE_SIZE,
+        )
     m_tiles = heads // MFMA_M
     k_tiles = head_dim // 128  # outer K-loop iters (MFMA K=128)
     assert (
@@ -442,6 +590,9 @@ def build_pa_mqa_logits_fp4_prefill_module(
     @flyc.kernel
     def pa_mqa_logits_fp4_prefill_kernel(
         out_logits_ptr: fx.Tensor,
+        candidate_values_ptr: fx.Tensor,
+        candidate_indices_ptr: fx.Tensor,
+        candidate_counts_ptr: fx.Tensor,
         q_ptr: fx.Tensor,
         q_scale_ptr: fx.Tensor,
         kv_cache_ptr: fx.Tensor,
@@ -487,10 +638,40 @@ def build_pa_mqa_logits_fp4_prefill_module(
         chunk_start = cta_info_vec[2]
         chunk_count = cta_info_vec[3]
 
-        # out row base folded into an f32 global pointer (sizeof(f32)=4); the
-        # per-token store offset below stays small (no i32 overflow).
-        _row_elems = fx.Int64(row_id) * fx.Int64(stride_out_row)
-        out_base = fx.add_offset(fx.get_iter(out_logits_ptr), _row_elems)
+        if const_expr(emit_candidates):
+            topk_storage = fx.SharedAllocator().allocate(streaming_storage_type)
+            pool_values = topk_storage.pool_values.peek().view(
+                fx.make_layout(pool_capacity, 1)
+            )
+            pool_indices = topk_storage.pool_indices.peek().view(
+                fx.make_layout(pool_capacity, 1)
+            )
+            selected_values = topk_storage.selected_values.peek().view(
+                fx.make_layout(candidate_topk, 1)
+            )
+            selected_indices = topk_storage.selected_indices.peek().view(
+                fx.make_layout(candidate_topk, 1)
+            )
+            topk_histogram = topk_storage.histogram.peek().view(
+                fx.make_layout(NUM_HIST_BINS, 1)
+            )
+            topk_scan = topk_storage.scan.peek().view(
+                fx.make_layout(NUM_WAVES + 1, 1)
+            )
+            topk_state = topk_storage.state.peek().view(
+                fx.make_layout(_STREAM_STATE_SIZE, 1)
+            )
+            candidate_values_row = fx.slice(candidate_values_ptr, (pid, None))
+            candidate_indices_row = fx.slice(candidate_indices_ptr, (pid, None))
+            if tid == 0:
+                topk_state[_STREAM_RETAINED] = 0
+                topk_state[_STREAM_PENDING] = 0
+            gpu.barrier()
+        else:
+            # Fold the row into the f32 global base pointer; the per-token store
+            # offset below stays small (no i32 overflow).
+            _row_elems = fx.Int64(row_id) * fx.Int64(stride_out_row)
+            out_base = fx.add_offset(fx.get_iter(out_logits_ptr), _row_elems)
 
         # Q load (hoisted): per (k_tile, mi_idx) a thread loads its 16-byte FP4
         # chunk for head row mi_idx*16+lane_mod_16. Q: [total_tokens, H, D/2] uint8.
@@ -646,8 +827,258 @@ def build_pa_mqa_logits_fp4_prefill_module(
                     accs[mi_idx] = c_frag.load()
             return accs
 
+        def _select_score_pool(
+            pool_count,
+            topk_state,
+            topk_histogram,
+            topk_scan,
+            pool_values,
+            pool_indices,
+            selected_values,
+            selected_indices,
+        ):
+            """Reduce ``pool[0:pool_count]`` to exact ``candidate_topk`` in LDS."""
+            if tid == 0:
+                topk_state[_STREAM_SCORE_PREFIX] = 0
+                topk_state[_STREAM_SCORE_MASK] = 0
+                topk_state[_STREAM_INDEX_PREFIX] = 0
+                topk_state[_STREAM_INDEX_MASK] = 0
+                topk_state[_STREAM_REMAINING] = fx.Int32(candidate_topk)
+            gpu.barrier()
+
+            # Composite radix key: score ordinal descending, then raw index
+            # ascending. This makes NaN and signed-zero behavior explicit and
+            # does not rely on the order candidates happen to occupy in LDS.
+            for key_byte in range_constexpr(NUM_KEY_BYTES):
+                topk_histogram[tid] = 0
+                gpu.barrier()
+
+                score_prefix = topk_state[_STREAM_SCORE_PREFIX]
+                score_mask = topk_state[_STREAM_SCORE_MASK]
+                index_prefix = topk_state[_STREAM_INDEX_PREFIX]
+                index_mask = topk_state[_STREAM_INDEX_MASK]
+                if const_expr(key_byte < 4):
+                    byte_position = key_byte
+                    xor_value = RADIX_SIGN_BIT if key_byte == 0 else 0
+                else:
+                    byte_position = key_byte - 4
+                    xor_value = 0
+
+                for step in range_constexpr(pool_steps):
+                    pool_pos = fx.Int32(step * TOPK_BLOCK_THREADS) + tid
+                    live = pool_pos < pool_count
+                    safe_pos = live.select(pool_pos, fx.Int32(0))
+                    value = pool_values[safe_pos]
+                    score_ord = f32_to_ordered_i32(value)
+                    raw_index = pool_indices[safe_pos]
+                    prefix_match = live & key_matches_prefix(
+                        score_ord,
+                        raw_index,
+                        score_prefix,
+                        score_mask,
+                        index_prefix,
+                        index_mask,
+                    )
+                    if prefix_match:
+                        key = (
+                            score_ord
+                            if const_expr(key_byte < 4)
+                            else raw_index
+                        )
+                        bucket = radix_byte(key, byte_position) ^ fx.Int32(xor_value)
+                        atomic_add_i32(topk_histogram, 1, bucket, "workgroup")
+                gpu.barrier()
+
+                selected_bucket = (
+                    fx.Int32(NUM_HIST_BINS - 1) - tid
+                    if const_expr(key_byte < 4)
+                    else tid
+                )
+                bucket_count = topk_histogram[selected_bucket]
+                before, _ = block_exclusive_prefix_i32(
+                    tid,
+                    bucket_count,
+                    topk_scan,
+                )
+                remaining = topk_state[_STREAM_REMAINING]
+                gpu.barrier()
+                if (before < remaining) & (before + bucket_count >= remaining):
+                    actual_bucket = selected_bucket ^ fx.Int32(xor_value)
+                    byte_mask, shift = prefix_byte_mask(byte_position)
+                    if const_expr(key_byte < 4):
+                        topk_state[_STREAM_SCORE_PREFIX] = score_prefix | (
+                            actual_bucket << fx.Int32(shift)
+                        )
+                        topk_state[_STREAM_SCORE_MASK] = score_mask | byte_mask
+                    else:
+                        topk_state[_STREAM_INDEX_PREFIX] = index_prefix | (
+                            actual_bucket << fx.Int32(shift)
+                        )
+                        topk_state[_STREAM_INDEX_MASK] = index_mask | byte_mask
+                    topk_state[_STREAM_REMAINING] = remaining - before
+                gpu.barrier()
+
+            threshold_score = topk_state[_STREAM_SCORE_PREFIX]
+            threshold_index = topk_state[_STREAM_INDEX_PREFIX]
+            threshold_equal_needed = topk_state[_STREAM_REMAINING]
+            if tid == 0:
+                topk_state[_STREAM_WRITE_CURSOR] = 0
+                topk_state[_STREAM_EQUAL_SEEN] = 0
+            gpu.barrier()
+
+            for step in range_constexpr(pool_steps):
+                pool_pos = fx.Int32(step * TOPK_BLOCK_THREADS) + tid
+                live = pool_pos < pool_count
+                safe_pos = live.select(pool_pos, fx.Int32(0))
+                value = pool_values[safe_pos]
+                score_ord = f32_to_ordered_i32(value)
+                raw_index = pool_indices[safe_pos]
+                better = live & key_is_better(
+                    score_ord,
+                    raw_index,
+                    threshold_score,
+                    threshold_index,
+                )
+                equal = live & (score_ord == threshold_score) & (
+                    raw_index == threshold_index
+                )
+                better_i32 = better.select(fx.Int32(1), fx.Int32(0))
+                equal_i32 = equal.select(fx.Int32(1), fx.Int32(0))
+                packed = (better_i32 << fx.Int32(_PACK_SHIFT)) + equal_i32
+                packed_before, packed_total = block_exclusive_prefix_i32(
+                    tid,
+                    packed,
+                    topk_scan,
+                )
+                better_before = packed_before >> fx.Int32(_PACK_SHIFT)
+                equal_before = packed_before & fx.Int32(_PACK_MASK)
+                better_total = packed_total >> fx.Int32(_PACK_SHIFT)
+                equal_total = packed_total & fx.Int32(_PACK_MASK)
+
+                equal_seen = topk_state[_STREAM_EQUAL_SEEN]
+                room = threshold_equal_needed - equal_seen
+                room = (room < 0).select(fx.Int32(0), room)
+                admit_equal = equal & (equal_before < room)
+                keep = better | admit_equal
+                admitted_equal_before = (equal_before < room).select(
+                    equal_before,
+                    room,
+                )
+                destination = (
+                    topk_state[_STREAM_WRITE_CURSOR]
+                    + better_before
+                    + admitted_equal_before
+                )
+                if keep:
+                    selected_values[destination] = value
+                    selected_indices[destination] = raw_index
+                gpu.barrier()
+                if tid == 0:
+                    admitted_equal_total = (equal_total < room).select(
+                        equal_total,
+                        room,
+                    )
+                    topk_state[_STREAM_WRITE_CURSOR] = (
+                        topk_state[_STREAM_WRITE_CURSOR]
+                        + better_total
+                        + admitted_equal_total
+                    )
+                    topk_state[_STREAM_EQUAL_SEEN] = (
+                        topk_state[_STREAM_EQUAL_SEEN] + equal_total
+                    )
+                gpu.barrier()
+
+            for step in range_constexpr(output_steps):
+                out_pos = fx.Int32(step * TOPK_BLOCK_THREADS) + tid
+                if out_pos < fx.Int32(candidate_topk):
+                    pool_values[out_pos] = selected_values[out_pos]
+                    pool_indices[out_pos] = selected_indices[out_pos]
+            gpu.barrier()
+            if tid == 0:
+                topk_state[_STREAM_RETAINED] = fx.Int32(candidate_topk)
+                topk_state[_STREAM_PENDING] = 0
+            gpu.barrier()
+
+        def _commit_score_chunk(
+            c_i32_arg,
+            topk_state,
+            topk_histogram,
+            topk_scan,
+            pool_values,
+            pool_indices,
+            selected_values,
+            selected_indices,
+        ):
+            """Publish one score chunk and periodically reduce the bounded pool."""
+            gpu.barrier()
+            chunk_first = (chunk_start + c_i32_arg) * fx.Int32(block_k)
+            live_first = (chunk_first > local_start).select(
+                chunk_first,
+                local_start,
+            )
+            chunk_last = chunk_first + fx.Int32(block_k)
+            live_last = (chunk_last < local_end).select(chunk_last, local_end)
+            live_count = live_last - live_first
+            live_count = (live_count < 0).select(fx.Int32(0), live_count)
+            if tid == 0:
+                topk_state[_STREAM_PENDING] = (
+                    topk_state[_STREAM_PENDING] + live_count
+                )
+            gpu.barrier()
+
+            batch_boundary = (
+                (c_i32_arg + fx.Int32(1)) % fx.Int32(score_batch_chunks)
+            ) == 0
+            final_chunk = c_i32_arg == chunk_count - fx.Int32(1)
+            if batch_boundary | final_chunk:
+                pool_count = (
+                    topk_state[_STREAM_RETAINED]
+                    + topk_state[_STREAM_PENDING]
+                )
+                if pool_count > fx.Int32(candidate_topk):
+                    _select_score_pool(
+                        pool_count,
+                        topk_state,
+                        topk_histogram,
+                        topk_scan,
+                        pool_values,
+                        pool_indices,
+                        selected_values,
+                        selected_indices,
+                    )
+                else:
+                    if tid == 0:
+                        topk_state[_STREAM_RETAINED] = pool_count
+                        topk_state[_STREAM_PENDING] = 0
+                    gpu.barrier()
+
+        def _finish_score_candidates(
+            topk_state,
+            pool_values,
+            pool_indices,
+            candidate_values_row,
+            candidate_indices_row,
+            candidate_counts_ptr,
+        ):
+            retained = topk_state[_STREAM_RETAINED]
+            for step in range_constexpr(output_steps):
+                out_pos = fx.Int32(step * TOPK_BLOCK_THREADS) + tid
+                if out_pos < fx.Int32(candidate_topk):
+                    live = out_pos < retained
+                    safe_pos = live.select(out_pos, fx.Int32(0))
+                    candidate_values_row[out_pos] = live.select(
+                        pool_values[safe_pos],
+                        fx.Float32(float("-inf")),
+                    )
+                    candidate_indices_row[out_pos] = live.select(
+                        pool_indices[safe_pos],
+                        fx.Int32(-1),
+                    )
+            if tid == 0:
+                candidate_counts_ptr[pid] = retained
+
         def _post_process_nt(accs, nt, c_i32_arg):
-            """relu + per-head weight + per-thread sum + bperm + windowed store."""
+            """relu + weighted reduction + score callback."""
             zero = fx.Vector.filled(4, 0.0, fx.Float32)
             ni_warp = warp_id * fx.Int32(N_TILES_PER_WARP) + fx.Int32(nt)
             token_base = (chunk_start + c_i32_arg) * fx.Int32(
@@ -681,8 +1112,42 @@ def build_pa_mqa_logits_fp4_prefill_module(
             is_writer = lane_div_16 < fx.Int32(1)
             out_token = token_base + lane_mod_16
             in_window = (out_token >= local_start) & (out_token < local_end)
-            if is_writer & in_window:
-                fx.ptr_store(thread_sum, fx.add_offset(out_base, out_token))
+            should_write = is_writer & in_window
+            if const_expr(emit_candidates):
+                chunk_first = (chunk_start + c_i32_arg) * fx.Int32(block_k)
+                live_first = (chunk_first > local_start).select(
+                    chunk_first,
+                    local_start,
+                )
+                destination = (
+                    topk_state[_STREAM_RETAINED]
+                    + topk_state[_STREAM_PENDING]
+                    + out_token
+                    - live_first
+                )
+
+                def _write_candidate(
+                    _values=pool_values,
+                    _indices=pool_indices,
+                    _dst=destination,
+                    _value=thread_sum,
+                    _index=out_token,
+                ):
+                    _values[_dst] = _value
+                    _indices[_dst] = _index
+
+                @flyc.jit
+                def _guarded_candidate_write(
+                    _pred=should_write,
+                    _write=_write_candidate,
+                ):
+                    if _pred:
+                        _write()
+
+                _guarded_candidate_write()
+            else:
+                if should_write:
+                    fx.ptr_store(thread_sum, fx.add_offset(out_base, out_token))
 
         def _compute_chunk(kv_list_in, kvs_packed_list_in, c_i32_arg, nt0_accs_in=None):
             assert (
@@ -747,6 +1212,17 @@ def build_pa_mqa_logits_fp4_prefill_module(
             _compute_chunk(
                 kv_cur_list, kvs_cur_list, c_idx_i32, nt0_accs_in=nt0_accs_cur
             )
+            if const_expr(emit_candidates):
+                _commit_score_chunk(
+                    c_idx_i32,
+                    topk_state,
+                    topk_histogram,
+                    topk_scan,
+                    pool_values,
+                    pool_indices,
+                    selected_values,
+                    selected_indices,
+                )
 
             kv_next, kvs_next = _prefetch_chunk(c_next_i32, phys_next_list)
 
@@ -780,6 +1256,25 @@ def build_pa_mqa_logits_fp4_prefill_module(
         _compute_chunk(
             kv_last_list, kvs_last_list, last_c_i32, nt0_accs_in=nt0_accs_last
         )
+        if const_expr(emit_candidates):
+            _commit_score_chunk(
+                last_c_i32,
+                topk_state,
+                topk_histogram,
+                topk_scan,
+                pool_values,
+                pool_indices,
+                selected_values,
+                selected_indices,
+            )
+            _finish_score_candidates(
+                topk_state,
+                pool_values,
+                pool_indices,
+                candidate_values_row,
+                candidate_indices_row,
+                candidate_counts_ptr,
+            )
 
     return pa_mqa_logits_fp4_prefill_kernel, block_threads_k
 
@@ -824,11 +1319,90 @@ def compile_pa_mqa_logits_fp4_prefill(
         stream: fx.Stream,
     ):
         gxi = fx.Int64(gx)
-        kfn(out, q, qs, kv, kvs, bt, w, cta_info_, stride_out, weight_scale).launch(
+        kfn(
+            out,
+            out,
+            out,
+            out,
+            q,
+            qs,
+            kv,
+            kvs,
+            bt,
+            w,
+            cta_info_,
+            stride_out,
+            weight_scale,
+        ).launch(
             grid=(gxi,), block=(block_threads, 1, 1), stream=stream
         )
 
     return launch_pa_mqa_logits_fp4_prefill, block_threads
+
+
+@lru_cache(maxsize=32)
+def compile_pa_mqa_logits_fp4_prefill_topk(
+    *,
+    topk: int,
+    block_k: int = 256,
+    kv_block_size: int = 64,
+    max_blocks_per_seq: int = 256,
+    num_warps: int = DEFAULT_NUM_WARPS,
+    heads: int = DEFAULT_HEADS,
+    head_dim: int = DEFAULT_HEAD_DIM,
+    score_batch_chunks: int = 4,
+):
+    """Compile the score callback that emits bounded per-CTA TopK planes."""
+
+    kfn, block_threads = build_pa_mqa_logits_fp4_prefill_module(
+        block_k=block_k,
+        kv_block_size=kv_block_size,
+        max_blocks_per_seq=max_blocks_per_seq,
+        num_warps=num_warps,
+        heads=heads,
+        head_dim=head_dim,
+        candidate_topk=topk,
+        score_batch_chunks=score_batch_chunks,
+    )
+
+    @flyc.jit
+    def launch_pa_mqa_logits_fp4_prefill_topk(
+        candidate_values,
+        candidate_indices,
+        candidate_counts,
+        q,
+        qs,
+        kv,
+        kvs,
+        bt,
+        w,
+        cta_info_,
+        weight_scale: fx.Float32,
+        gx: fx.Int32,
+        stream: fx.Stream,
+    ):
+        gxi = fx.Int64(gx)
+        kfn(
+            candidate_values,
+            candidate_values,
+            candidate_indices,
+            candidate_counts,
+            q,
+            qs,
+            kv,
+            kvs,
+            bt,
+            w,
+            cta_info_,
+            fx.Int32(0),
+            weight_scale,
+        ).launch(
+            grid=(gxi,),
+            block=(block_threads, 1, 1),
+            stream=stream,
+        )
+
+    return launch_pa_mqa_logits_fp4_prefill_topk, block_threads
 
 
 def flydsl_pa_mqa_logits_fp4_prefill(
@@ -906,6 +1480,204 @@ def flydsl_pa_mqa_logits_fp4_prefill(
         float(weight_scale),
         n_ctas,
         stream,
+    )
+    return out
+
+
+def flydsl_pa_mqa_logits_fp4_prefill_topk(
+    q_fp4: torch.Tensor,
+    q_scale: torch.Tensor,
+    kv_cache: torch.Tensor,
+    kv_scale: torch.Tensor,
+    block_tables: torch.Tensor,
+    weights: torch.Tensor,
+    row_to_batch: torch.Tensor,
+    local_starts: torch.Tensor,
+    local_ends: torch.Tensor,
+    max_seq_len: int,
+    *,
+    topk: int = 512,
+    weight_scale: float = 1.0,
+    block_k: int = 256,
+    kv_block_size: int = 64,
+    num_warps: int = DEFAULT_NUM_WARPS,
+    parallel_unit_num: int = 512,
+    score_batch_chunks: int = 4,
+    workspace: FP4PrefillTopKWorkspace | None = None,
+    out: FP4PrefillTopKResult | None = None,
+    stream: torch.cuda.Stream | None = None,
+) -> FP4PrefillTopKResult:
+    """True kernel-fused FP4 paged-MQA scoring and exact TopK for gfx950.
+
+    The MFMA kernel never materializes ``[rows, max_seq_len]`` logits. Each CTA
+    streams up to ``score_batch_chunks * block_k`` new scores through LDS,
+    repeatedly retaining its exact ``topk`` under score-descending/index-
+    ascending order. A second kernel merges the split candidates exactly and
+    maps their logical sequence indices through ``block_tables``.
+
+    ``workspace`` exposes the per-CTA values, raw indices, and counts for
+    callers that need to exchange or inspect local candidates. Reuse both
+    workspace and output buffers to keep their addresses stable for capture.
+    """
+
+    if topk not in (512, 1024):
+        raise ValueError("topk must be 512 or 1024")
+    if block_k != 256 or num_warps != 4:
+        raise ValueError(
+            "the fused TopK path requires block_k=256 and num_warps=4"
+        )
+    if score_batch_chunks not in (1, 2, 4):
+        raise ValueError("score_batch_chunks must be 1, 2, or 4")
+
+    rows, heads, head_dim_packed = q_fp4.shape
+    if rows <= 0:
+        raise ValueError("the fused TopK path requires at least one query row")
+    head_dim = head_dim_packed * 2
+    device = q_fp4.device
+    if device.type != "cuda":
+        raise ValueError("q_fp4 must be a CUDA tensor")
+    metadata = (row_to_batch, local_starts, local_ends)
+    if any(t.dtype != torch.int32 or t.shape != (rows,) for t in metadata):
+        raise ValueError(
+            "row_to_batch/local_starts/local_ends must be int32 [rows]"
+        )
+    if block_tables.dtype != torch.int32 or block_tables.ndim != 2:
+        raise ValueError("block_tables must be a 2D int32 tensor")
+    inputs = (
+        q_fp4,
+        q_scale,
+        kv_cache,
+        kv_scale,
+        block_tables,
+        weights,
+        *metadata,
+    )
+    if any(t.device != device for t in inputs):
+        raise ValueError("all fused FP4 TopK inputs must be on one device")
+    if any(not t.is_contiguous() for t in inputs):
+        raise ValueError("all fused FP4 TopK inputs must be contiguous")
+
+    if workspace is None:
+        workspace = allocate_fp4_prefill_topk_workspace(
+            rows,
+            parallel_unit_num,
+            topk,
+            device,
+        )
+    expected_workspace = (
+        ((parallel_unit_num, CTA_INFO_WIDTH), torch.int32, workspace.cta_info),
+        ((rows + 1,), torch.int32, workspace.row_offsets),
+        (
+            (parallel_unit_num, topk),
+            torch.float32,
+            workspace.candidate_values,
+        ),
+        (
+            (parallel_unit_num, topk),
+            torch.int32,
+            workspace.candidate_indices,
+        ),
+        ((parallel_unit_num,), torch.int32, workspace.candidate_counts),
+    )
+    for expected_shape, expected_dtype, tensor in expected_workspace:
+        if (
+            tuple(tensor.shape) != expected_shape
+            or tensor.dtype != expected_dtype
+            or tensor.device != device
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError(
+                "workspace tensor mismatch: expected "
+                f"{expected_shape} {expected_dtype} contiguous on {device}"
+            )
+
+    if out is None:
+        out = FP4PrefillTopKResult(
+            values=torch.empty(rows, topk, dtype=torch.float32, device=device),
+            raw_indices=torch.empty(rows, topk, dtype=torch.int32, device=device),
+            physical_indices=torch.empty(
+                rows,
+                topk,
+                dtype=torch.int32,
+                device=device,
+            ),
+            counts=torch.empty(rows, dtype=torch.int32, device=device),
+        )
+    expected_outputs = (
+        ((rows, topk), torch.float32, out.values),
+        ((rows, topk), torch.int32, out.raw_indices),
+        ((rows, topk), torch.int32, out.physical_indices),
+        ((rows,), torch.int32, out.counts),
+    )
+    for expected_shape, expected_dtype, tensor in expected_outputs:
+        if (
+            tuple(tensor.shape) != expected_shape
+            or tensor.dtype != expected_dtype
+            or tensor.device != device
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError(
+                "output tensor mismatch: expected "
+                f"{expected_shape} {expected_dtype} contiguous on {device}"
+            )
+
+    if stream is None:
+        stream = torch.cuda.current_stream(device)
+    elif stream.device != device:
+        raise ValueError("stream must belong to the FP4 input device")
+    with torch.cuda.stream(stream):
+        compute_prefill_schedule(
+            row_to_batch,
+            local_starts,
+            local_ends,
+            block_k,
+            parallel_unit_num,
+            max_seq_len,
+            cta_info_out=workspace.cta_info,
+            row_offsets_out=workspace.row_offsets,
+        )
+    max_blocks_per_seq = block_tables.shape[1]
+    launcher, _ = compile_pa_mqa_logits_fp4_prefill_topk(
+        topk=topk,
+        block_k=block_k,
+        kv_block_size=kv_block_size,
+        max_blocks_per_seq=max_blocks_per_seq,
+        num_warps=num_warps,
+        heads=heads,
+        head_dim=head_dim,
+        score_batch_chunks=score_batch_chunks,
+    )
+    launcher(
+        workspace.candidate_values,
+        workspace.candidate_indices,
+        workspace.candidate_counts,
+        q_fp4,
+        q_scale,
+        kv_cache,
+        kv_scale,
+        block_tables,
+        weights,
+        workspace.cta_info,
+        float(weight_scale),
+        parallel_unit_num,
+        stream,
+    )
+
+    from ...candidate_topk_merge import flydsl_candidate_topk_merge
+
+    flydsl_candidate_topk_merge(
+        workspace.candidate_values,
+        workspace.candidate_indices,
+        workspace.candidate_counts,
+        workspace.row_offsets,
+        row_to_batch,
+        block_tables,
+        out.values,
+        out.raw_indices,
+        out.physical_indices,
+        out.counts,
+        kv_block_size,
+        stream=stream,
     )
     return out
 

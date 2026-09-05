@@ -25,6 +25,14 @@ if _base_version < _MIN_FLYDSL_VERSION:
     )
 
 _LAZY_IMPORTS = {
+    "FP4PrefillTopKResult": (
+        ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
+        "FP4PrefillTopKResult",
+    ),
+    "FP4PrefillTopKWorkspace": (
+        ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
+        "FP4PrefillTopKWorkspace",
+    ),
     "FP8_MQA_LOGITS_DEFAULT_VARIANT": (
         ".kernels.mqa_logits.fp8_mqa_logits",
         "DEFAULT_VARIANT",
@@ -36,6 +44,14 @@ _LAZY_IMPORTS = {
     "compute_varqlen_windows": (
         ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
         "compute_varqlen_windows",
+    ),
+    "allocate_fp4_prefill_topk_workspace": (
+        ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
+        "allocate_fp4_prefill_topk_workspace",
+    ),
+    "flydsl_candidate_topk_merge": (
+        ".candidate_topk_merge",
+        "flydsl_candidate_topk_merge",
     ),
     "flydsl_flash_attn_func": (".fmha_kernels", "flydsl_flash_attn_func"),
     "flydsl_fp8_mqa_logits": (
@@ -54,6 +70,10 @@ _LAZY_IMPORTS = {
         ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
         "flydsl_pa_mqa_logits_fp4_prefill",
     ),
+    "flydsl_pa_mqa_logits_fp4_prefill_topk": (
+        ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
+        "flydsl_pa_mqa_logits_fp4_prefill_topk",
+    ),
     "flydsl_pa_mqa_logits_fp4_varqlen": (
         ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
         "flydsl_pa_mqa_logits_fp4_varqlen",
@@ -71,8 +91,12 @@ _LAZY_IMPORTS = {
 __all__ = [
     "FP8_MQA_LOGITS_DEFAULT_VARIANT",
     "FP8_MQA_LOGITS_VARIANTS",
+    "FP4PrefillTopKResult",
+    "FP4PrefillTopKWorkspace",
     "GateMode",
+    "allocate_fp4_prefill_topk_workspace",
     "compute_varqlen_windows",
+    "flydsl_candidate_topk_merge",
     "flydsl_flash_attn_func",
     "flydsl_fp8_mqa_logits",
     "flydsl_hgemm",
@@ -81,6 +105,7 @@ __all__ = [
     "flydsl_moe_stage2",
     "flydsl_pa_mqa_logits_fp4",
     "flydsl_pa_mqa_logits_fp4_prefill",
+    "flydsl_pa_mqa_logits_fp4_prefill_topk",
     "flydsl_pa_mqa_logits_fp4_varqlen",
     "flydsl_preshuffle_gemm_a8",
     "flydsl_qk_norm_rope_quant",
