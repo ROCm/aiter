@@ -47,8 +47,23 @@ def convert_to_mxfp8(
     Returns:
         Tuple of (quantized_tensor, scales) where quantized_tensor has fp8_dtype
         and scales has uint8 dtype with e8m0 format.
+
+    Note:
+        M and N must be exact multiples of ``block_m`` / ``block_n`` (default
+        64).  The kernel loads full tiles without masking; unaligned shapes must
+        be padded before calling.  This is a deliberate constraint that enables
+        the gfx950 ASM path.
+
+        Scale rounding uses torchao round-to-nearest-even, which differs from
+        ``_downcast_to_mxfp`` in ``quant_moe.py`` (round-up / round-down, fnuz,
+        arbitrary shapes).  Quantising the same tensor through both will produce
+        different bits — see the kernel file header for the rationale.
     """
     _LOGGER.info(f"CONVERT_TO_MXFP8: x={tuple(x.shape)}")
+    if fp8_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+        raise ValueError(
+            f"fp8_dtype must be torch.float8_e4m3fn or torch.float8_e5m2, got {fp8_dtype}"
+        )
     # The ASM path (v_cvt_scalef32_*) is gfx950-only and _pack_fp8 only accepts
     # e4m3fn; anything else must take the portable path.
     asm_supported = (
@@ -82,6 +97,10 @@ def convert_to_mxfp8(
     s = torch.empty((scale_m, scale_n), dtype=torch.uint8, device=x.device)
 
     grid = (triton.cdiv(M, block_m), triton.cdiv(N, block_n))
+    # num_warps scales with tile area so it remains valid when block_m/block_n
+    # differ from the default 64×64 (MI308X benchmark: nw=1/2/4 differ < 1%
+    # at default tile, nw≥8 regresses).
+    num_warps = min(16, max(1, block_m * block_n // 1024))
     _convert_to_mxfp8_kernel[grid](
         x,
         y,
@@ -100,6 +119,9 @@ def convert_to_mxfp8(
         IS_2D_BLOCK=is_2d_block,
         USE_SR=use_sr,
         USE_ASM=use_asm,
+        num_warps=num_warps,
+        waves_per_eu=2,
+        num_stages=2,
     )
     return y, s
 
@@ -162,6 +184,7 @@ def convert_from_mxfp8(
     y = torch.empty((M, N), dtype=output_dtype, device=x.device)
 
     grid = (triton.cdiv(M, block_m), triton.cdiv(N, block_n))
+    num_warps = min(16, max(1, block_m * block_n // 1024))
     _convert_from_mxfp8_kernel[grid](
         x,
         y,
@@ -177,5 +200,8 @@ def convert_from_mxfp8(
         QUANT_BLOCK_SIZE=quant_block_size,
         IS_2D_BLOCK=is_2d_block,
         USE_ASM=use_asm,
+        num_warps=num_warps,
+        waves_per_eu=2,
+        num_stages=2,
     )
     return y
