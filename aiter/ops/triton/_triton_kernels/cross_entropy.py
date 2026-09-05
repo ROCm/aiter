@@ -162,6 +162,12 @@ def _ce_fused_loss_grad_kernel(
     eps = label_smoothing / (n_cols * world_size)
     scaled_x_sum: tl.float32 = 0.0
 
+    # local_y: target column offset within this rank's shard.
+    # When y is not on this rank, local_y falls outside [0, n_cols), so no lane
+    # in tl.arange(0, BLOCK_SIZE) will ever equal it and the correction below
+    # adds 0 everywhere — no explicit rank guard is needed.
+    local_y = y - rank * n_cols
+
     for i in range(0, n_cols, BLOCK_SIZE):
         offs = i + tl.arange(0, BLOCK_SIZE)
         blk = tl.load(X_ptr + offs, mask=offs < n_cols, other=float("-inf"))
@@ -173,24 +179,19 @@ def _ce_fused_loss_grad_kernel(
             blk = (tl.exp(blk - m) / d - eps) / n_valid
         else:
             blk = tl.exp(blk - m) / d - eps
+        # Apply the target-column correction in-register: avoids a debug_barrier,
+        # an extra global load/store, and the bf16 rounding that would occur if
+        # the corrected value were written and re-read through global memory.
+        if reduce_loss:
+            blk += tl.where(offs == local_y, -(1 - label_smoothing) / n_valid, 0.0)
+        else:
+            blk += tl.where(offs == local_y, -(1 - label_smoothing), 0.0)
         tl.store(X_ptr + offs, blk.to(grad_dtype), mask=offs < n_cols)
-
-    tl.debug_barrier()
 
     loss = -(ori_Xy - m - tl.log(d))
     if label_smoothing > 0:
         smooth = scaled_x_sum + label_smoothing * (m + tl.log(d))
         loss = loss * (1 - label_smoothing) + smooth
-
-    vocab_start = rank * n_cols
-    vocab_end = (rank + 1) * n_cols
-    if y >= vocab_start and y < vocab_end:
-        Xy_grad = tl.load(X_ptr + y - vocab_start)
-        if reduce_loss:
-            Xy_grad += -(1 - label_smoothing) / n_valid
-        else:
-            Xy_grad += -(1 - label_smoothing)
-        tl.store(X_ptr + y - vocab_start, Xy_grad)
 
     tl.store(loss_ptr, loss)
 
