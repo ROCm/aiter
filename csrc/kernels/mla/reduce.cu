@@ -7,6 +7,7 @@
 #include "custom_all_reduce.cuh"
 #include "mla.h"
 #include "opus/opus.hpp"
+#include <cassert>
 #include <cstdio>
 #include <optional>
 #include <sstream>
@@ -460,7 +461,11 @@ __device__ void mla_reduce_v1_impl_massive(const MlaReduceKernelV1Params& params
     __syncthreads();
 
     const int32_t reduce_partial_map_0 = p_lds_reduce_partial_map[0];
-    const int32_t reduce_partial_map_1 = p_lds_reduce_partial_map[1];
+    // single-split tiles must come with reduce_final_map, i.e. with need_lse
+    assert(num_splits > 1 || params.use_reduce_final_map);
+    // slot [1] isn't loaded when num_splits == 1
+    const int32_t reduce_partial_map_1 =
+        (num_splits > 1) ? p_lds_reduce_partial_map[1] : reduce_partial_map_0;
     const MlaPartialTileInfo final_loc = [&]() {
         if(params.use_reduce_final_map)
         {
@@ -574,7 +579,11 @@ __device__ void mla_reduce_v1_impl_simple(const MlaReduceKernelV1Params& params,
     __syncthreads();
 
     const int32_t reduce_partial_map_0 = p_lds_reduce_partial_map[0];
-    const int32_t reduce_partial_map_1 = p_lds_reduce_partial_map[1];
+    // single-split tiles must come with reduce_final_map, i.e. with need_lse
+    assert(num_splits > 1 || params.use_reduce_final_map);
+    // slot [1] isn't loaded when num_splits == 1
+    const int32_t reduce_partial_map_1 =
+        (num_splits > 1) ? p_lds_reduce_partial_map[1] : reduce_partial_map_0;
     const MlaPartialTileInfo final_loc = [&]() {
         if(params.use_reduce_final_map)
         {
@@ -622,6 +631,13 @@ __device__ void mla_reduce_v1_impl_simple(const MlaReduceKernelV1Params& params,
             partial_output_head_byte_offset +
             local_seqlen_idx * Traits::kNumHeadQ * Traits::kSizeDV * int32_t(sizeof(float));
 
+        // NOTE(need_lse): these are int32 byte offsets into the partial buffer and are
+        // handed to a raw_buffer_load whose voffset is 32-bit. For a large partial pool
+        // (need_lse routes single-split tiles through reduce, so the pool grows with
+        // batch*qo_split) `reduce_partial_map_0 * kNumHeadQ * kSizeDV * 4` can exceed 2^31
+        // and wrap. Keep the pool bounded (tight max_partials + caller-side chunking of
+        // the qo/context length) so offsets stay < 2 GiB. A full fix needs 64-bit
+        // base-pointer addressing here and must be GPU-validated.
         const int32_t reduce_tile_pos_lse_start = reduce_partial_map_0 * int32_t(Traits::kNumHeadQ);
         const int32_t reduce_tile_pos_out_byte_start =
             reduce_tile_pos_lse_start * Traits::kSizeDV * int32_t(sizeof(float));
@@ -762,9 +778,10 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
                                                   p_lds);
             }
         }
-        // In theory, we can handle the case that #split = 1. However, it is meaningless and
-        // metadata should be in charge of getting rid of this kind of scenario.
-        else if(num_splits > 1)
+        // num_split==1 with real partial slot (!=1) means need_lse has been set
+        // so we need to reduce even this single split tile to get a correct final_lse
+        else if(num_splits > 1 ||
+                (num_splits == 1 && params.p_reduce_partial_map[reduce_tile_start] != -1))
         {
             mla_reduce_v1_impl_simple<Traits, lse_t, out_t>(
                 params, head_idx, block_idx, tile_idx, reduce_tile_start, reduce_tile_end, p_lds);
@@ -860,9 +877,10 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
                 p_lds);
         }
     }
-    // In theory, we can handle the case that #split = 1. However, it is meaningless and metadata
-    // should be in charge of getting rid of this kind of scenario.
-    else if(num_splits > 1)
+    // num_split==1 with real partial slot (!=1) means need_lse has been set
+    // so we need to reduce even this single split tile to get a correct final_lse
+    else if(num_splits > 1 ||
+            (num_splits == 1 && params.p_reduce_partial_map[reduce_tile_start] != -1))
     {
         mla_reduce_v1_impl_simple<Traits, lse_t, out_t>(
             params, head_idx, block_idx, tile_idx, reduce_tile_start, reduce_tile_end, p_lds);

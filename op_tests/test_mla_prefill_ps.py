@@ -13,7 +13,7 @@ import torch
 import aiter
 from aiter import dtypes, per_tensor_quant
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
+from aiter.test_common import benchmark, checkAllclose, perftest
 
 # This test only supports gfx950, skip on gfx942
 if get_gfx() == "gfx942":
@@ -26,28 +26,25 @@ torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
 
 
-def calculate_pass_rate(df):
-    if "acc result" not in df.columns:
+def _print_pass_rate(df, column, label):
+    if column not in df.columns:
         return
-
-    num_tests = df["acc result"].value_counts().sum()
-    if "passed" in df["acc result"].value_counts():
-        num_passed = df["acc result"].value_counts()["passed"]
-    else:
-        num_passed = 0
-    if "warning" in df["acc result"].value_counts():
-        num_warning = df["acc result"].value_counts()["warning"]
-    else:
-        num_warning = 0
-    if "failed" in df["acc result"].value_counts():
-        num_failed = df["acc result"].value_counts()["failed"]
-    else:
-        num_failed = 0
+    counts = df[column].value_counts()
+    num_tests = counts.sum()
+    num_passed = counts.get("passed", 0)
+    num_warning = counts.get("warning", 0)
+    num_failed = counts.get("failed", 0)
     aiter.logger.info(
-        f"\033[32mpassed {num_passed}/{num_tests}({num_passed / num_tests * 100:.2f}%) \
-        \033[33mwarning {num_warning}/{num_tests}({num_warning / num_tests * 100:.2f}%) \
-        \033[31mfailed {num_failed}/{num_tests}({num_failed / num_tests * 100:.2f}%) \033[0m"
+        f"{label}: "
+        f"\033[32mpassed {num_passed}/{num_tests}({num_passed / num_tests * 100:.2f}%) "
+        f"\033[33mwarning {num_warning}/{num_tests}({num_warning / num_tests * 100:.2f}%) "
+        f"\033[31mfailed {num_failed}/{num_tests}({num_failed / num_tests * 100:.2f}%) \033[0m"
     )
+
+
+def calculate_pass_rate(df):
+    _print_pass_rate(df, "acc result", "Output")
+    _print_pass_rate(df, "lse result", "LSE")
 
 
 def ref_masked_attention(
@@ -149,7 +146,7 @@ def torch_mla_extend(
         os.append(o)
         lses.append(lse)
     o = torch.concat(os)
-    lse = torch.concat(lses).transpose(0, 1)
+    lse = torch.concat(lses, dim=1)  # [nhead, total_q]
     return o, lse
 
 
@@ -217,7 +214,7 @@ def run_aiter_mla_reduce(
         output,
         final_lse,
     )
-    return output, attn_lse
+    return output, final_lse
 
 
 @benchmark()
@@ -232,12 +229,14 @@ def test_mla_prefill(
     block_size: int,
     varlen: bool = False,
     is_causal: bool = True,
+    qo_len: int | None = None,
+    need_lse: bool = True,
     load_metadata: bool | None = False,
     dump_metadata: bool | None = False,
     profile_ps: bool | None = False,
     skip_reference: bool | None = False,
 ):
-    ret = {}
+    ret = {"qo_len": qo_len if qo_len is not None else ctx_lens}
     out_dtype = torch.bfloat16
     device = "cuda:0"
     torch.set_default_device(device)
@@ -257,7 +256,16 @@ def test_mla_prefill(
             )
     else:
         seq_lens_kv.fill_(ctx_lens)
-    seq_lens_qo = seq_lens_kv.clone()
+    if qo_len is None:
+        seq_lens_qo = seq_lens_kv.clone()
+    else:
+        # Chunked-prefill regime: qo_len < kv_len, exercises non-causal context
+        # attention path where new queries attend to a longer cached context.
+        seq_lens_qo = torch.full((batch_size,), qo_len, dtype=torch.int)
+        assert (seq_lens_qo <= seq_lens_kv).all(), (
+            f"qo_len ({qo_len}) must be <= every seq_lens_kv "
+            f"(min={seq_lens_kv.min().item()})"
+        )
     max_qlen = seq_lens_qo.max().item()
 
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
@@ -351,6 +359,7 @@ def test_mla_prefill(
             kvlen_granularity=kvlen_granularity,
             block_size=block_size,
             is_causal=is_causal,
+            need_lse=need_lse,
         )
         torch.cuda.synchronize()
         start_event = torch.cuda.Event(enable_timing=True)
@@ -373,6 +382,7 @@ def test_mla_prefill(
             kvlen_granularity=kvlen_granularity,
             block_size=block_size,
             is_causal=is_causal,
+            need_lse=need_lse,
         )
         end_event.record()
         end_event.synchronize()
@@ -387,58 +397,60 @@ def test_mla_prefill(
 
     output = torch.empty((num_tokens, num_head_q, v_head_dim), dtype=torch.bfloat16)
 
+    # Always run two-phase (asm + reduce) to get both output and final_lse
+    # for LSE validation, regardless of profile_ps.
+    total_s, nhead, _ = output.shape
+    tile_q = 256
+    logits = torch.empty(
+        (reduce_partial_map.size(0) * tile_q, nhead, v_head_dim),
+        dtype=dtypes.fp32,
+        device=device,
+    )
+    attn_lse = torch.empty(
+        (reduce_partial_map.size(0) * tile_q, nhead),
+        dtype=dtypes.fp32,
+        device=device,
+    )
+    final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+
+    out_mla_prefill_asm, us_mla_prefill_asm = run_aiter_mla_prefill_asm(
+        q_quant,
+        k_quant,
+        v_quant,
+        output,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        work_indptr,
+        work_info,
+        max_qlen,
+        is_causal,
+        softmax_scale,
+        logits,
+        attn_lse,
+        q_scale,
+        k_scale,
+        v_scale,
+    )
+    output, logits, attn_lse = out_mla_prefill_asm
+
+    out_reduce, us_reduce = run_aiter_mla_reduce(
+        logits,
+        attn_lse,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        tile_q,
+        output,
+        final_lse,
+    )
+    output, final_lse = out_reduce
+    output = output.view(total_s, nhead, v_head_dim)
+
+    us_mla_prefill_ps = us_mla_prefill_asm + us_reduce
+    ret["us_mla_prefill_ps"] = us_mla_prefill_ps
+
     if profile_ps:
-        # pre-allocate final and partial output & lse
-        total_s, nhead, v_head_dim = output.shape
-
-        tile_q = 256
-        logits = torch.empty(
-            (reduce_partial_map.size(0) * tile_q, nhead, v_head_dim),
-            dtype=dtypes.fp32,
-            device=device,
-        )
-        attn_lse = torch.empty(
-            (reduce_partial_map.size(0) * tile_q, nhead),
-            dtype=dtypes.fp32,
-            device=device,
-        )
-        final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
-
-        out_mla_prefill_asm, us_mla_prefill_asm = run_aiter_mla_prefill_asm(
-            q_quant,
-            k_quant,
-            v_quant,
-            output,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            work_indptr,
-            work_info,
-            max_qlen,
-            is_causal,
-            softmax_scale,
-            logits,
-            attn_lse,
-            q_scale,
-            k_scale,
-            v_scale,
-        )
-        output, logits, attn_lse = out_mla_prefill_asm
-
-        out_reduce, us_reduce = run_aiter_mla_reduce(
-            logits,
-            attn_lse,
-            reduce_indptr,
-            reduce_final_map,
-            reduce_partial_map,
-            tile_q,
-            output,
-            final_lse,
-        )
-        output, final_lse = out_reduce
-        output = output.view(total_s, nhead, v_head_dim)
-
-        us_mla_prefill_ps = us_mla_prefill_asm + us_reduce
         # calculate mla_prefill_ps kernel tflops
         # for causal, only take the lower triangle(ops/2)
         g_div = 2 if is_causal else 1
@@ -446,7 +458,7 @@ def test_mla_prefill(
             2.0
             * batch_size
             * num_head_q
-            * ctx_len
+            * (qo_len if qo_len is not None else ctx_len)
             * (qk_head_dim * ctx_len + v_head_dim * ctx_len)
         ) / g_div
         tflops_mla_prefill_asm = ops / us_mla_prefill_asm / (1e6)
@@ -503,35 +515,11 @@ def test_mla_prefill(
         ret["us_reduce"] = us_reduce
         ret["us_reduce_ratio"] = us_reduce / us_mla_prefill_ps
         ret["bw_reduce(TB/s)"] = bw_reduce if effective_final_tiles > 0 else 0
-    else:
-        _, us_aiter_asm = run_perftest(
-            aiter.mla.mla_prefill_ps_fwd,
-            q_quant,
-            k_quant,
-            v_quant,
-            output,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            work_indptr,
-            work_info,
-            max_qlen,
-            is_causal,
-            reduce_indptr,
-            reduce_final_map,
-            reduce_partial_map,
-            softmax_scale,
-            q_scale,
-            k_scale,
-            v_scale,
-        )
-
-        ret["us_mla_prefill_ps"] = us_aiter_asm
 
     if not skip_reference:
         # TODO: optimize reference implementation(too slow for large context length)
         kv_buffer = K_bf16.view(-1, num_head_kv, qk_head_dim)
-        out_ref, _lse_ref = torch_mla_extend(
+        out_ref, lse_ref = torch_mla_extend(
             Q_bf16,
             kv_buffer,
             qo_indptr,
@@ -559,6 +547,48 @@ def test_mla_prefill(
             status = "failed"
         ret["err fp8"] = err
         ret["acc result"] = status
+
+        # LSE validation: final_lse [total_q, nhead] vs lse_ref [nhead, total_q].
+        asm_lse = final_lse.transpose(0, 1)  # [nhead, total_q]
+        if not need_lse:
+            ret["err lse"] = 0
+            ret["lse result"] = "skipped"
+        else:
+            assert torch.equal(
+                asm_lse.isneginf(), lse_ref.isneginf()
+            ), "final_lse -inf mask mismatch: some tiles did not get an LSE written"
+            valid_mask = lse_ref.isfinite()
+            if valid_mask.any():
+                asm_lse_valid = asm_lse[valid_mask]
+                ref_lse_valid = lse_ref[valid_mask]
+                lse_err = checkAllclose(
+                    ref_lse_valid,
+                    asm_lse_valid,
+                    rtol=0,
+                    # fp8 rounding noise can give +-0.02, so keep tolerance just above this
+                    atol=3e-2,
+                    msg="mla_prefill_lse   [torch vs aiter_asm]: us......",
+                )
+                if lse_err == 0:
+                    lse_status = "passed"
+                elif 0 < lse_err <= 0.05:
+                    lse_status = "warning"
+                else:
+                    lse_status = "failed"
+                lse_diff = (asm_lse_valid - ref_lse_valid).abs()
+                ret["lse max_abs_diff"] = lse_diff.max().item()
+                ret["lse mean_abs_diff"] = lse_diff.mean().item()
+                lse_denom = ref_lse_valid.abs().clamp(min=1e-6)
+                lse_rel = lse_diff / lse_denom
+                ret["lse max_rel_err"] = lse_rel.max().item()
+                ret["lse mean_rel_err"] = lse_rel.mean().item()
+            else:
+                # All rows fully masked: the isneginf equality above already validated
+                # every entry, so this is a genuine pass, not a vacuous one.
+                lse_err = 0
+                lse_status = "passed"
+            ret["err lse"] = lse_err
+            ret["lse result"] = lse_status
 
     return ret
 
@@ -672,6 +702,18 @@ parser.add_argument(
           --causal false  # [False]""",
 )
 parser.add_argument(
+    "--qo_len",
+    type=lambda v: None if v.lower() == "none" else int(v),
+    nargs="*",
+    default=[None],
+    help="""Query length per sequence (chunked-prefill regime).
+    When unset or "none", qo_len = kv_len (square Q x K, original behavior).
+    When set, exercises the non-causal context-attention path used by vLLM
+    chunked prefill, where new queries attend to a longer cached context.
+    e.g.: --qo_len 64
+          --qo_len none 8 64""",
+)
+parser.add_argument(
     "--load_metadata",
     action="store_true",
     help="""load metadata by metadata_map Default: False.
@@ -695,6 +737,15 @@ parser.add_argument(
     help="""skip reference implementation. Default: False.
     --skip_reference # True""",
 )
+parser.add_argument(
+    "--need_lse",
+    type=dtypes.str2bool,
+    default=True,
+    help="""request final_lse from the PS scheduler. Default: True.
+    True routes single-split tiles through reduce so final_lse is written;
+    False keeps the direct-to-O fast path and leaves final_lse unpopulated.
+    e.g.: --need_lse false""",
+)
 
 args = parser.parse_args()
 
@@ -713,6 +764,7 @@ for (
     batch_size,
     block_size,
     varlen,
+    qo_len,
 ) in itertools.product(
     args.causal,
     args.num_heads,
@@ -722,7 +774,11 @@ for (
     args.batch_size,
     args.block_size,
     args.varlen,
+    args.qo_len,
 ):
+    if qo_len is not None and qo_len > ctx_len:
+        # Skip invalid combos in the sweep rather than asserting mid-run.
+        continue
     ret = test_mla_prefill(
         ctx_len,
         batch_size,
@@ -734,6 +790,8 @@ for (
         block_size,
         varlen,
         is_causal,
+        qo_len=qo_len,
+        need_lse=args.need_lse,
         load_metadata=args.load_metadata,
         dump_metadata=args.dump_metadata,
         profile_ps=args.profile,

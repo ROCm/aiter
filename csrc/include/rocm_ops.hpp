@@ -2376,7 +2376,8 @@ namespace py = pybind11;
           py::arg("qlen_granularity")  = 256, \
           py::arg("kvlen_granularity") = 1,   \
           py::arg("block_size")        = 1,   \
-          py::arg("is_causal")         = true);
+          py::arg("is_causal")         = true, \
+          py::arg("need_lse")          = false);
 
 #define MLA_REDUCE_PYBIND                \
     m.def("mla_reduce_v1",               \
