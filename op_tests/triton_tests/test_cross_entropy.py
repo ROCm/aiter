@@ -253,7 +253,7 @@ def test_cross_entropy_forward_rejects_out_of_range_target(bad):
     logits = torch.randn(B, SQ, V, device="cuda")
     target = torch.randint(0, V, (B, SQ), device="cuda")
     target[0, 0] = bad
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError):
         cross_entropy_forward(logits, target, 0.0, False, None, -100)
 
 
