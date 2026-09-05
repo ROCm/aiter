@@ -12,21 +12,8 @@ merge. Only a reproducible blocker from an explicitly supplied, head-matched
 
 ## Promotion bar
 
-This skill is advisory now and stays advisory until both conditions below hold. Neither holds today,
-so no part of it may gate a merge.
-
-- **False clearance is measured and near zero for every family that raises a red verdict.** The
-  number that matters is not recall, and not a spot check: it is the rate at which the tool reports
-  nothing wrong when something is wrong. No committed replay corpus establishes it, so that number
-  does not currently exist.
-- **The judgement relied on is not an LLM's.** An LLM judgement never gates a merge, whatever its
-  measured accuracy. Only a reproducible blocker carried by a head-matched `validation_report.json`
-  may gate, because the report ships its reproducer with it.
-
-Until then `🔴 HIGH RISK` requests human attention and nothing more. Whoever proposes a rule edit as
-an improvement, or proposes letting this tool gate a merge, owns building the corpus and measuring
-against it. This bar lives in the header rather than in an issue because a header is read on every
-use and an issue sinks.
+The two conditions under which this could stop being advisory, and why neither
+holds yet: `rules.md` § Promotion bar.
 
 ---
 
@@ -47,17 +34,21 @@ so what follows is the map, not the manual.**
 | file | what it answers | the trap it exists for |
 |---|---|---|
 | `rules_expanded.txt` | the full text of exactly the rules this diff derives | reading all 51 means attending to none |
-| `evidence.txt` | how a removed guard is handled on head | prose telling you to grep was read and not acted on (aiter#5143) |
+| `applies.txt` | whether the diff still applies to the merge target | a stale PR's CI result describes a tree that moved |
+| `guards.txt` | each deleted assert/check: moved, returned changed, or gone | "it came back" and "it was weakened" look identical |
+| `siblings.txt` | a variant of a changed function still carrying a changed line | A1's sibling is in the same file, not another file |
 | `symbols.txt` | first-party imports that do not resolve against the merge target | a **rebase** signal, not invented code — #4994's import was valid when written |
 | `twins.txt` | which existing file each new file was copied from | the defect is the *asymmetry* between them, not the copy |
 | `test_quality.txt` | assertion count, tolerances, shapes of added tests | zero assertions may mean a helper asserts — read before firing |
+| `kernel_tests.txt` | new kernels for which no test pytest collects was added | a benchmark is the shape these ship instead of a test |
 | `ci_coverage.txt` | whether a CI job will ever run the added tests | HK6 is satisfied by a file in a directory nothing scans |
 | `perf_claims.txt` | every number claimed, and which name no baseline | a signed delta and a `before \| after` table already carry theirs |
 | `struct_abi.txt` | structs whose pinned layout this diff shifts | the assertions exist to force a code-object rebuild |
 | `comment_only.txt` | the non-prose lines of a comment-dominated diff | 7963 lines that reduce to none (aiter#4062) |
+| `evidence.txt` | how a removed guard is handled on head — **only written when a guard or signature changed** | prose telling you to grep was read and not acted on (#5143) |
 
-A `SKIPPED:` or empty artifact means that axis was **not checked** — say so rather than
-reading silence as clean.
+A `SKIPPED:` artifact means that axis was **not checked** — say so rather than reading
+silence as clean. A forensic that ran and found nothing says so in words.
 
 
 **Read `$WORK/rules_expanded.txt` — it is the full text of exactly the rules in

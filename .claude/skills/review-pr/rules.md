@@ -537,3 +537,24 @@ catches a premise you never tested; it does not catch a conclusion you are attac
 stronger tier is an independent reviewer — a second agent, or a person — given the card and
 told the findings are false until proven otherwise. Where that is available, use it; this
 step is what the skill can guarantee on its own.
+
+
+## Promotion bar
+
+This skill is advisory now and stays advisory until both conditions below hold. Neither holds today,
+so no part of it may gate a merge.
+
+- **False clearance is measured and near zero for every family that raises a red verdict.** The
+  number that matters is not recall, and not a spot check: it is the rate at which the tool reports
+  nothing wrong when something is wrong. No committed replay corpus establishes it, so that number
+  does not currently exist.
+- **The judgement relied on is not an LLM's.** An LLM judgement never gates a merge, whatever its
+  measured accuracy. Only a reproducible blocker carried by a head-matched `validation_report.json`
+  may gate, because the report ships its reproducer with it.
+
+Until then `🔴 HIGH RISK` requests human attention and nothing more. Whoever proposes a rule edit as
+an improvement, or proposes letting this tool gate a merge, owns building the corpus and measuring
+against it. This bar lives in the header rather than in an issue because a header is read on every
+use and an issue sinks.
+
+---

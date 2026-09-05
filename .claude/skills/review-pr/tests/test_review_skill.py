@@ -2249,6 +2249,22 @@ def triage_families(added):
     return mod.triton_families(added)
 
 
+def _triage_mod():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_tm", TRIAGE)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def triage_citation(text):
+    return _triage_mod().CITATION.findall(text)
+
+
+def triage_anchor(text):
+    return bool(_triage_mod().ANCHOR_IDENT.search(text))
+
+
 class TestRecallDetectors(unittest.TestCase):
     """Two gaps found by replaying the 600-PR corpus, and the shapes that must stay silent.
 
@@ -3085,4 +3101,114 @@ class TestRefutationGate(unittest.TestCase):
         i = body.index("## Refutation")
         self.assertIn("weaker", body[i:])
         self.assertIn("independent", body[i:])
+
+
+class TestCitationMechanicsFromWaveOne(unittest.TestCase):
+    """Fifty full reviews, and the gates spent them rejecting correct citations.
+
+    64 pushbacks, and the agents' own words for what they did to get past: "an edit made
+    for gate mechanics, not for review content"; "No claim changed -- only the citation
+    surface"; "I passed it by inserting a cross-reference to a *different* file, which is
+    weaker anchoring than what it rejected". A gate that makes a review worse in order to
+    pass is worse than no gate."""
+
+    def test_a_cuh_path_is_not_truncated_to_cu(self):
+        """`cu` came before `cuh` in the alternation with no boundary after it, so
+        gemm_a8w8_blockscale_cktile_common.cuh -- a file the PR changes -- was read as
+        `...common.cu`, which it does not."""
+        got = [p for p, _ in triage_citation("see gemm_a8w8_blockscale_cktile_common.cuh:40")]
+        self.assertEqual(["gemm_a8w8_blockscale_cktile_common.cuh"], got)
+
+    def test_an_equals_sign_does_not_cut_a_config_path_in_half(self):
+        p = "aiter/ops/triton/configs/gemm/gfx1201-GEMM-A8W8_BLOCKSCALE-N=1024-K=1024.json"
+        self.assertEqual([p], [x for x, _ in triage_citation("the row in " + p)])
+
+    def test_a_dot_directory_keeps_its_dot(self):
+        """`lstrip("./")` strips every leading dot and slash, so a PR that ADDS
+        .github/workflows/perf-parity.yaml had that finding rejected as citing nothing it
+        changes."""
+        diff = ("diff --git a/.github/workflows/perf-parity.yaml "
+                "b/.github/workflows/perf-parity.yaml\nnew file mode 100644\n"
+                "--- /dev/null\n+++ b/.github/workflows/perf-parity.yaml\n"
+                "@@ -0,0 +1 @@\n+on: pull_request\n")
+        with tempfile.TemporaryDirectory() as d:
+            d = pathlib.Path(d)
+            (d / "card.md").write_text(
+                "\u26A0\uFE0F .github/workflows/perf-parity.yaml runs on a label no PR "
+                "sets, so the job never fires\n")
+            (d / "v.txt").write_text("")
+            (d / "pr.diff").write_text(diff)
+            (d / "e.txt").write_text("")
+            r = subprocess.run(
+                [sys.executable, str(TRIAGE), "card", str(d / "card.md"), str(d / "v.txt"),
+                 str(d / "e.txt"), str(d / "e.txt"), str(d / "pr.diff")],
+                capture_output=True, text=True)
+        self.assertNotIn("UNANCHORED-FINDING", r.stdout)
+
+    def test_an_arch_name_can_anchor_a_reason(self):
+        """A one-line dict edit adding `18: "gfx1250",` names its subject with a token
+        that needs no underscore and carries no capital -- the three shapes ANCHOR_IDENT
+        knew all rejected it, so the reason that named exactly the right thing failed."""
+        self.assertTrue(triage_anchor('adds 18: "gfx1250" to GFX_MAP'))
+        self.assertTrue(triage_anchor("the a8w8 path"))
+        self.assertTrue(triage_anchor("bf16 accumulation"))
+
+
+class TestLedgerOnADiffWithNoRules(unittest.TestCase):
+    """Three .github-only PRs in a 50-PR run could not pass the ledger at all.
+
+    derive() short-circuits a diff confined to .github/ to `[infra-only] NONE`, which is
+    correct. `NONE` is not a rule id, so the ledger saw an empty rule set and reported the
+    state of a Step 1b that never ran. All three agents diagnosed it identically and left
+    the gate red rather than writing rule ids into rules.txt that the deriver never
+    emitted, which is the right call and is why this was found."""
+
+    DIFF = ("diff --git a/.github/workflows/x.yaml b/.github/workflows/x.yaml\n"
+            "--- a/.github/workflows/x.yaml\n+++ b/.github/workflows/x.yaml\n"
+            "@@ -1 +1,2 @@\n+  run: echo hi\n")
+
+    def ledger(self, rules):
+        with tempfile.TemporaryDirectory() as d:
+            d = pathlib.Path(d)
+            (d / "rules.txt").write_text(rules)
+            (d / "v.txt").write_text("")
+            (d / "pr.diff").write_text(self.DIFF)
+            return subprocess.run(
+                [sys.executable, str(TRIAGE), "ledger", str(d / "rules.txt"),
+                 str(d / "v.txt"), str(d / "pr.diff")], capture_output=True, text=True)
+
+    def test_a_derived_NONE_is_not_a_missing_derivation(self):
+        r = self.ledger("  files=3  types=1  rules=0/53\n    [infra-only          ] NONE\n")
+        self.assertEqual(0, r.returncode, r.stdout)
+        self.assertIn("LEDGER N/A", r.stdout)
+        self.assertIn("infra-only", r.stdout)
+
+    def test_an_empty_rules_file_still_fails_closed(self):
+        """The control. Skipping Step 1b must stay the most expensive path, not the
+        cheapest."""
+        r = self.ledger("")
+        self.assertEqual(1, r.returncode)
+        self.assertIn("LEDGER UNUSABLE", r.stdout + r.stderr)
+
+
+class TestArtifactTableIsTheArtifacts(unittest.TestCase):
+    """The Step 1b table listed nine files. fetch.sh writes thirteen, and evidence.txt --
+    which the table describes unconditionally -- is written only for guard or signature
+    diffs. Reviews went looking for it and reported the absence as a skipped axis. This is
+    the third time a forensic was added without the document that indexes it being
+    touched, all three times by me."""
+
+    def test_every_artifact_the_script_writes_is_in_the_table(self):
+        body = (SKILL_DIR / "SKILL.md").read_text()
+        written = set(re.findall(r'"\$WORK/([a-z_]+\.txt)"', FETCH.read_text()))
+        # not forensics: scratch files and inputs the table does not index
+        written -= {"pr_diff_err.txt", "base_head.txt", "rules.txt",
+                    "auto_validation_outcome.txt"}
+        missing = sorted(a for a in written if a not in body)
+        self.assertEqual([], missing, f"written by fetch.sh, absent from the table: {missing}")
+
+    def test_the_conditional_artifact_is_marked_conditional(self):
+        body = (SKILL_DIR / "SKILL.md").read_text()
+        i = body.index("`evidence.txt`")
+        self.assertIn("only written when", body[i:i + 300])
 

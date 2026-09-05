@@ -1150,8 +1150,12 @@ def expected_rules(rules_text):
     return sorted(set(ids))
 
 
-CITATION = re.compile(r"([\w./-]+\.(?:py|cu|cuh|hip|h|hpp|cpp|cc|csv|json|yaml|yml))"
-                      r"(?::(\d+))?")
+# Alternation is longest-first and the tail is guarded: with `cu` before `cuh` and no
+# boundary, `gemm_a8w8_blockscale_cktile_common.cuh` matched as `...common.cu`, a file the
+# PR changes read as one it does not. `=` belongs in the class because tuned-config names
+# carry it -- `gfx1201-GEMM-A8W8_BLOCKSCALE-N=1024-K=1024.json` matched as `1024.json`.
+CITATION = re.compile(r"([\w./=-]+\.(?:cuh|hpp|yaml|yml|json|csv|cpp|hip|py|cu|cc|h|md|sh))"
+                      r"(?![\w])(?::(\d+))?")
 
 
 def changed_paths(diff_text):
@@ -1191,7 +1195,9 @@ def check_citations(verdicts_text, diff_text):
         # tree; doing either put a path here that the diff does not contain, and the gate
         # called the correct move a stale citation. One cited file from the diff is what
         # separates "this PR" from "some other PR".
-        if not any(any(t == p.lstrip("./") or t.endswith("/" + p.lstrip("./"))
+        def _norm(p):
+            return p[2:] if p.startswith("./") else p
+        if not any(any(t == _norm(p) or t.endswith("/" + _norm(p))
                        for t in touched) for p in paths):
             bad.append((rule, verdict, paths[0]))
     return bad
@@ -1765,8 +1771,13 @@ CORE_LINE = re.compile(
 MIN_CORE_REASON = 30
 # `\b` before a path fragment is useless (`/` is a non-word char), so anchors are matched
 # as substrings after normalising `./` -- the reason is prose, not a parseable field.
+# The fourth shape is the one aiter is full of: an arch or dtype name, all lower case,
+# no underscore -- gfx1250, gfx942, fp8, a8w8, mxfp4, bf16. A one-line dict edit adding
+# `18: "gfx1250",` names its subject with a token the first three shapes all reject, so
+# the reason that named exactly the right thing was the reason that failed to anchor.
 ANCHOR_IDENT = re.compile(r"\b[a-z]+_[a-z_0-9]{2,}\b|\b[A-Z][A-Z0-9_]{3,}\b|"
-                          r"\b[a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]*\b")
+                          r"\b[a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]*\b|"
+                          r"\b(?=[a-z0-9]{3,}\b)[a-z]+\d[a-z0-9]*\b")
 
 
 def core_files_in(diff_text):
@@ -1958,7 +1969,10 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
             r"([\w./-]+\.(?:py|cu|cuh|hip|h|hpp|cpp|cc|csv|json|yaml|yml|sh|md)(?![\w]))",
             text)]
         def _is_touched(c):
-            c = c.lstrip("./")
+            # NOT lstrip("./"): it strips every leading dot and slash, so
+            # `.github/workflows/perf-parity.yaml` became `github/workflows/...` and a
+            # file the PR ADDS was reported as one it does not change.
+            c = c[2:] if c.startswith("./") else c
             return any(t == c or t.endswith("/" + c) for t in touched)
         # An ANCHOR is required, not citation purity. Rejecting every path the diff does
         # not contain rejected the forensics the rules ask for: aiter#2478's two strongest
@@ -2246,6 +2260,17 @@ if __name__ == "__main__":
                 diff_text = ""
         stale = check_citations(verdicts_text, diff_text)
         want = expected_rules(rules_text)
+        if not want and re.search(r"^\s*\[[\w-]+\s*\]\s*NONE\s*$", rules_text, re.M):
+            # The deriver ran and correctly concluded there is nothing to adjudicate:
+            # `[infra-only] NONE` for a diff confined to .github/, `[version-bump] NONE`
+            # for a submodule pointer. `NONE` is not an id, so `want` is empty and this
+            # gate used to read the right answer as proof the derivation never happened.
+            # Three .github-only PRs in a 50-PR run were unpassable without either editing
+            # the skill or writing rule ids into rules.txt that the deriver never emitted.
+            print("LEDGER N/A: the deriver produced no rules for this diff "
+                  "(%s), so there is nothing to adjudicate"
+                  % re.search(r"^\s*\[([\w-]+)\s*\]\s*NONE", rules_text, re.M).group(1))
+            raise SystemExit(0)
         if not want:
             # Fail closed. An empty or unreadable rules file is the state produced by a
             # Step 1b that never ran, which is precisely the run that must not reach a
