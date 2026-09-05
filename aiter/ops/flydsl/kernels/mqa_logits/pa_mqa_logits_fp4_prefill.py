@@ -110,7 +110,7 @@ def compute_prefill_schedule(
     )
 
     s_max = max(1, (max_seq_len + block_k - 1) // block_k)
-    plan = _row_plan(local_ends, block_k, P, s_max)
+    plan = _row_plan(local_starts, local_ends, block_k, P, s_max)
 
     # ── map each fixed slot → (row, split) + emit cta_info in ONE kernel ──
     if cta_info_out is None:
@@ -123,6 +123,7 @@ def compute_prefill_schedule(
         plan.incl,
         plan.excl,
         plan.chunks,
+        plan.first_chunks,
         row_to_batch,
         local_starts,
         local_ends,
@@ -161,7 +162,8 @@ class _RowPlan(NamedTuple):
 
     incl: torch.Tensor  # [T] inclusive prefix sum of per-row CTA counts
     excl: torch.Tensor  # [T] exclusive prefix sum
-    chunks: torch.Tensor  # [T] ceil(local_end / block_k), 0 for an empty row
+    chunks: torch.Tensor  # [T] chunks intersecting [local_start, local_end)
+    first_chunks: torch.Tensor  # [T] floor(max(local_start, 0) / block_k)
     safe: torch.Tensor  # [1] chunk-splits merged into one CTA
     total_splits: torch.Tensor  # [1] number of valid (row, split) slots
 
@@ -266,34 +268,37 @@ _ROW_PLAN_MAX_ROWS = 16384
 _I32_PER_16B = 4
 
 
-def _row_plan(le, block_k, P, s_max) -> _RowPlan:
+def _row_plan(ls, le, block_k, P, s_max) -> _RowPlan:
     T = le.shape[0]
     if T > _ROW_PLAN_MAX_ROWS:
-        return _row_plan_torch(le, block_k, P, s_max)
-    # One allocation, sliced: five `torch.empty` calls would put four more
+        return _row_plan_torch(ls, le, block_k, P, s_max)
+    # One allocation, sliced: separate `torch.empty` calls would add dispatches
     # dispatches back on the path this exists to shorten.
     #
     # Every region starts on a 16-byte boundary, which is not cosmetic: Triton
     # specializes a kernel on whether each pointer is 16-byte aligned, so a
     # stride of exactly T forks a variant per `T % 4` and the JIT never stops
-    # finding new ones mid-run. Rounding the stride up pins all six pointers to
+    # finding new ones mid-run. Rounding the stride up pins every pointer to
     # one alignment signature.
     stride = (T + _I32_PER_16B - 1) // _I32_PER_16B * _I32_PER_16B
-    tail = 3 * stride
+    tail = 4 * stride
     work = torch.empty(tail + 2 * _I32_PER_16B, dtype=torch.int32, device=le.device)
     plan = _RowPlan(
         incl=work[:T],
         excl=work[stride : stride + T],
         chunks=work[2 * stride : 2 * stride + T],
+        first_chunks=work[3 * stride : 3 * stride + T],
         safe=work[tail : tail + 1],
         total_splits=work[tail + _I32_PER_16B : tail + _I32_PER_16B + 1],
     )
     # Named, not `*plan`: field ORDER should not become load-bearing.
     _prefill_row_plan_kernel[(1,)](
+        ls,
         le,
         plan.incl,
         plan.excl,
         plan.chunks,
+        plan.first_chunks,
         plan.safe,
         plan.total_splits,
         T,
@@ -308,10 +313,11 @@ def _row_plan(le, block_k, P, s_max) -> _RowPlan:
     return plan
 
 
-def _row_plan_torch(le, block_k, P, s_max) -> _RowPlan:
+def _row_plan_torch(ls, le, block_k, P, s_max) -> _RowPlan:
     """The row plan as ~25 torch ops. Reference for `_prefill_row_plan_kernel`."""
-    # chunk count per row = ceil(le / block_k); le<=0 → 0 chunks.
-    chunks_per_row = torch.clamp((le + (block_k - 1)) // block_k, min=0)  # [T]
+    first_chunks = torch.clamp(ls, min=0) // block_k
+    end_chunks = torch.clamp((le + (block_k - 1)) // block_k, min=0)
+    chunks_per_row = torch.clamp(end_chunks - first_chunks, min=0)
 
     s_cand = torch.arange(1, s_max + 1, device=le.device, dtype=torch.int32)  # [s_max]
     ctas_per_r_s = (chunks_per_row[None, :] + (s_cand[:, None] - 1)) // s_cand[
@@ -331,6 +337,7 @@ def _row_plan_torch(le, block_k, P, s_max) -> _RowPlan:
         incl=incl,
         excl=incl - ctas_r,  # exclusive prefix sum
         chunks=chunks_per_row.to(torch.int32),
+        first_chunks=first_chunks.to(torch.int32),
         safe=safe.reshape(1).to(torch.int32),
         total_splits=incl[-1].reshape(1).to(torch.int32),
     )
@@ -348,10 +355,12 @@ def _row_plan_torch(le, block_k, P, s_max) -> _RowPlan:
 # decode runs stay hidden behind the call's own dispatch either way.
 @triton.jit(do_not_specialize=["T", "P"])
 def _prefill_row_plan_kernel(
+    ls_ptr,  # [T] int32 local_starts
     le_ptr,  # [T] int32 local_ends
     incl_ptr,  # [T] int32 out
     excl_ptr,  # [T] int32 out
     chunks_ptr,  # [T] int32 out
+    first_chunks_ptr,  # [T] int32 out
     safe_ptr,  # [1] int32 out
     total_splits_ptr,  # [1] int32 out
     T,
@@ -382,10 +391,11 @@ def _prefill_row_plan_kernel(
     """
     t = tl.arange(0, BLOCK_T)
     mask = t < T
+    ls = tl.load(ls_ptr + t, mask=mask, other=0)
     le = tl.load(le_ptr + t, mask=mask, other=0)
-    # The clamp puts `le <= 0` at 0 under either rounding, so this agrees with the
-    # torch path's floor division without asking which one Triton does.
-    chunks = tl.where(mask, tl.maximum((le + block_k - 1) // block_k, 0), 0)
+    first_chunks = tl.where(mask, tl.maximum(ls, 0) // block_k, 0)
+    end_chunks = tl.maximum((le + block_k - 1) // block_k, 0)
+    chunks = tl.where(mask, tl.maximum(end_chunks - first_chunks, 0), 0)
     max_chunks = tl.maximum(tl.max(chunks, axis=0), 1)
 
     lo = 1
@@ -406,6 +416,7 @@ def _prefill_row_plan_kernel(
     tl.store(incl_ptr + t, incl, mask=mask)
     tl.store(excl_ptr + t, incl - ctas, mask=mask)
     tl.store(chunks_ptr + t, chunks, mask=mask)
+    tl.store(first_chunks_ptr + t, first_chunks, mask=mask)
     tl.store(safe_ptr, safe)
     tl.store(total_splits_ptr, tl.sum(ctas, axis=0))
 
@@ -415,6 +426,7 @@ def _prefill_cta_info_kernel(
     incl_ptr,  # [T] int32 inclusive prefix sum of per-row CTA counts
     excl_ptr,  # [T] int32 exclusive prefix sum
     chunks_ptr,  # [T] int32 chunks_per_row
+    first_chunks_ptr,  # [T] first logical chunk
     rb_ptr,  # [T] int32 row_to_batch
     ls_ptr,  # [T] int32 local_starts
     le_ptr,  # [T] int32 local_ends
@@ -449,17 +461,18 @@ def _prefill_cta_info_kernel(
 
     excl_r = tl.load(excl_ptr + safe_row, mask=smask, other=0)
     chunks_r = tl.load(chunks_ptr + safe_row, mask=smask, other=0)
+    first_chunk_r = tl.load(first_chunks_ptr + safe_row, mask=smask, other=0)
     rb_r = tl.load(rb_ptr + safe_row, mask=smask, other=0)
     ls_r = tl.load(ls_ptr + safe_row, mask=smask, other=0)
     le_r = tl.load(le_ptr + safe_row, mask=smask, other=0)
 
     vi = valid.to(tl.int32)
     split_within = slot - excl_r
-    start = split_within * safe  # pre-mask (count uses this)
-    count = tl.maximum(tl.minimum(safe, chunks_r - start), 0)
+    relative_start = split_within * safe  # pre-mask (count uses this)
+    count = tl.maximum(tl.minimum(safe, chunks_r - relative_start), 0)
     row_id = safe_row * vi
     batch_id = rb_r * vi
-    start = start * vi
+    start = (first_chunk_r + relative_start) * vi
     count = tl.where(valid, count, 1)
     ls_out = ls_r * vi
     le_out = le_r * vi
@@ -765,6 +778,12 @@ def build_pa_mqa_logits_fp4_prefill_module(
                 + lane_mod_16
             )
             bi_base = _floordiv_kb(token_local_base)
+            # The software pipeline intentionally asks for one chunk beyond the
+            # epilogue. Clamp only that speculative page-table lookup so an
+            # exactly sized, unpadded table remains safe.
+            bi_base = (bi_base < fx.Int32(max_blocks_per_seq)).select(
+                bi_base, fx.Int32(max_blocks_per_seq - 1)
+            )
             phys_vec = bt_bt[batch_id * _stride_bt + bi_base]
             return _phys_to_list(phys_vec)
 
