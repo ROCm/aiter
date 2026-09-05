@@ -749,6 +749,34 @@ namespace py = pybind11;
           py::arg("kernelName")  = std::nullopt, \
           py::arg("bpreshuffle") = false);
 
+#define GEMM_A16W4_PYBIND                                                          \
+    m.def("gemm_a16w4",                                                            \
+          &aiter::gemm_a16w4,                                                      \
+          "Dense weight-only int4 GEMM (bf16/fp16 x int4 -> bf16/fp16), gfx1201. " \
+          "`weight` is [K/8, N] int32 packed along K; `scales`/`zeros` are "       \
+          "[K/128, N]. The fp16 path expects MAGIC-permuted weights and "          \
+          "+1024-biased zeros -- see aiter/ops/gemm_op_a16w4.py.",                 \
+          py::arg("x"),                                                            \
+          py::arg("weight"),                                                       \
+          py::arg("scales"),                                                       \
+          py::arg("zeros"),                                                        \
+          py::arg("out"),                                                          \
+          py::arg("workspace"));                                                   \
+    m.def("gemm_a16w4_unsupported_reason",                                         \
+          &aiter::gemm_a16w4_unsupported_reason,                                   \
+          "Empty string if (M, N, K) is supported, else the failing constraint.",  \
+          py::arg("M"),                                                            \
+          py::arg("N"),                                                            \
+          py::arg("K"),                                                            \
+          py::arg("is_fp16"));                                                     \
+    m.def("gemm_a16w4_workspace_elems",                                            \
+          &aiter::gemm_a16w4_workspace_elems,                                      \
+          "fp32 workspace elements gemm_a16w4 needs; 0 on the prefill path.",      \
+          py::arg("M"),                                                            \
+          py::arg("N"),                                                            \
+          py::arg("K"),                                                            \
+          py::arg("is_fp16"));
+
 #define GEMM_A4W4_BLOCKSCALE_PYBIND  \
     m.def("gemm_a4w4_blockscale",    \
           &gemm_a4w4_blockscale,     \
