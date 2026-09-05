@@ -1,3 +1,4 @@
+from aiter.ops.triton.quant.fast_transpose import fast_transpose_2d
 from aiter.ops.triton.quant.fused_fp8_quant import (
     calc_rows_per_block,
     fused_flatten_fp8_group_quant,
@@ -33,6 +34,10 @@ from aiter.ops.triton.quant.quant import (
     fp8_legacy_to_mxfp8,
     static_per_tensor_quant_fp8_i8,
 )
+from aiter.ops.triton.quant.quant_mxfp8 import (
+    convert_from_mxfp8,
+    convert_to_mxfp8,
+)
 
 __all__ = [
     "_mxfp4_quant_op",
@@ -40,12 +45,16 @@ __all__ = [
     "_nvfp4_quant_op",
     # fused_fp8_quant.py exports
     "calc_rows_per_block",
+    # fast_transpose.py exports
+    "convert_from_mxfp8",
+    "convert_to_mxfp8",
     "dynamic_mxfp4_quant",
     "dynamic_mxfp8_quant",
     "dynamic_mxfp8_quant_n32k4_mbn",
     "dynamic_nvfp4_quant",
     "dynamic_per_tensor_quant_fp8_i8",
     "dynamic_per_token_quant_fp8_i8",
+    "fast_transpose_2d",
     "fp8_legacy_to_mxfp8",
     "fused_dual_rmsnorm_mxfp8_quant",
     "fused_dynamic_mxfp4_quant_moe_sort",

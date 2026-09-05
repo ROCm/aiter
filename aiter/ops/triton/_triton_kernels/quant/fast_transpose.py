@@ -28,14 +28,16 @@ def _transpose_2d_kernel(
 
     Reads tiles from (M, N) input and writes transposed tiles to (N, M) output.
     Works with any element dtype including FP8 (e4m3, e5m2, fnuz variants).
+    Whether the transposed write is staged through LDS is compiler-determined;
+    the benchmark against ``t().contiguous()`` measures the net effect.
     """
     pid = tl.program_id(0)
     num_n_blocks = tl.cdiv(N, BLOCK_N)
     pid_m = pid // num_n_blocks
     pid_n = pid % num_n_blocks
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_m = tl.cast(pid_m * BLOCK_M + tl.arange(0, BLOCK_M), tl.int64)
+    offs_n = tl.cast(pid_n * BLOCK_N + tl.arange(0, BLOCK_N), tl.int64)
 
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
 

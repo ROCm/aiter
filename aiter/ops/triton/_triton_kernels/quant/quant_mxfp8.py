@@ -3,6 +3,16 @@
 #
 # MXFP8 quantization Triton kernels: scale calculation, pack/unpack, and
 # full-tensor convert-to / convert-from helpers for the MX FP8 format.
+#
+# Scale-rounding note
+# -------------------
+# _calculate_scales uses torchao round-to-nearest-even (adaptive to the
+# input mantissa width).  This differs from _downcast_to_mxfp in
+# quant_moe.py, which uses selectable round-up / round-down for MoE
+# throughput on gfx942 (e4m3fnuz).  The two functions target different
+# use cases and intentionally produce different bits for the same input:
+#   * This file  — OCP FP8 (e4m3fn / e5m2), gfx950, nearest-even, training accuracy
+#   * quant_moe  — fnuz, gfx942, configurable direction, MoE inference throughput
 
 import triton
 import triton.language as tl
@@ -58,6 +68,10 @@ def _calculate_scales(
     elif float8_dtype == tl.float8e5:
         mbits = 2
         target_max_pow2 = 15
+    else:
+        tl.static_assert(
+            False, "unsupported fp8_dtype: only float8e4nv and float8e5 are supported"
+        )
 
     NEW_BLOCK_N: tl.constexpr = BLOCK_N // QUANT_BLOCK_SIZE
     if IS_2D_BLOCK:
@@ -71,8 +85,10 @@ def _calculate_scales(
         max_abs = tl.max(tl.abs(x), axis=-1)
     max_abs = max_abs.to(x.type.element_ty)
 
-    # round even (adaptive)
+    # Round-to-nearest-even (adaptive to input mantissa width), per torchao:
     # https://github.com/pytorch/ao/blob/a5f2693089b4c6528f019a0fb17235c9f22180a9/torchao/prototype/mx_formats/mx_tensor.py#L148
+    # _downcast_to_mxfp (quant_moe.py) uses round-up or round-down instead;
+    # see the file-level note for why the two differ intentionally.
     max_abs = max_abs.to(hp_int_dtype, bitcast=True)
     val_to_add = 1 << (hp_mbits - mbits - 1)
     mask = ((1 << (hp_ebits + sbits)) - 1) << hp_mbits
@@ -81,8 +97,10 @@ def _calculate_scales(
     extracted_pow2 = ((max_abs >> hp_mbits) & 0b11111111) - hp_exp_bias
     scale_e8m0_unbiased = extracted_pow2 - target_max_pow2
 
+    # Upper clamp: E8M0_EXPONENT_BIAS (127) gives biased byte 254, the largest
+    # normal e8m0 value. E8M0_EXPONENT_BIAS+1 would give 255, the NaN encoding.
     scale_e8m0_unbiased = tl.minimum(
-        tl.maximum(scale_e8m0_unbiased, -1 * E8M0_EXPONENT_BIAS), E8M0_EXPONENT_BIAS + 1
+        tl.maximum(scale_e8m0_unbiased, -1 * E8M0_EXPONENT_BIAS), E8M0_EXPONENT_BIAS
     )
     scale_e8m0_biased = scale_e8m0_unbiased + E8M0_EXPONENT_BIAS
 
@@ -337,7 +355,7 @@ def _convert_to_mxfp8_kernel(
     pid_n = tl.program_id(axis=1)
     SCALE_BLOCK_M: tl.constexpr = BLOCK_M // QUANT_BLOCK_SIZE
     SCALE_BLOCK_N: tl.constexpr = BLOCK_N // QUANT_BLOCK_SIZE
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_m = tl.cast(pid_m * BLOCK_M + tl.arange(0, BLOCK_M), tl.int64)
     offs_xn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_yn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_sn = pid_n * SCALE_BLOCK_N + tl.arange(0, SCALE_BLOCK_N)
@@ -406,7 +424,7 @@ def _convert_from_mxfp8_kernel(
     pid_n = tl.program_id(axis=1)
     SCALE_BLOCK_M: tl.constexpr = BLOCK_M // QUANT_BLOCK_SIZE
     SCALE_BLOCK_N: tl.constexpr = BLOCK_N // QUANT_BLOCK_SIZE
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_m = tl.cast(pid_m * BLOCK_M + tl.arange(0, BLOCK_M), tl.int64)
     offs_xn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_yn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_sn = pid_n * SCALE_BLOCK_N + tl.arange(0, SCALE_BLOCK_N)
