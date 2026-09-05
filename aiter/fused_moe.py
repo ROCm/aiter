@@ -2817,8 +2817,9 @@ def get_2stage_cfgs(
             0,
             False,
         )
-    # Debug: AITER_FLYDSL_FORCE=1 is for debug use.
-    _flydsl_force = os.environ.get("AITER_FLYDSL_FORCE", "1") == "1"
+    # Keep untuned SiLU A4W4 on native CK. Other supported MX formats and the
+    # activations that explicitly select FlyDSL retain their existing routes.
+    _is_a4w4 = q_dtype_a == dtypes.fp4x2 and q_dtype_w == dtypes.fp4x2
     # a16w4-SiTUv2 (bf16 A x mxfp4 W) -> ported 2-stage path; SiTUv2 gate distinguishes gpt-oss (Swiglu -> cktile).
     _is_a16w4_situv2 = (
         dtype in [dtypes.bf16, dtypes.fp16]
@@ -2834,8 +2835,7 @@ def get_2stage_cfgs(
         dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
         and (
-            activation in (ActivationType.Swiglu, ActivationType.Situv2)
-            or _flydsl_force
+            activation in (ActivationType.Swiglu, ActivationType.Situv2) or not _is_a4w4
         )
         and (
             q_dtype_a in (dtypes.fp4x2, dtypes.fp8)
