@@ -14,33 +14,43 @@ from aiter.ops.triton._triton_kernels.attention.mla import (
 from aiter.ops.triton._triton_kernels.attention.mla import (
     _mla_prefill_fwd_kernel as triton_mla_prefill_fwd_kernel,
 )
-from aiter.ops.triton.utils.device_info import get_num_sms
-
-try:
-    from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
-        _mla_decode_fwd_kernel as gluon_mla_decode_fwd_kernel,
-    )
-    from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
-        _mla_decode_fwd_kernel_non_pipelined as gluon_mla_decode_fwd_kernel_non_pipelined,
-    )
-    from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
-        _mla_decode_fwd_reduce_kernel as gluon_mla_decode_fwd_reduce_kernel,
-    )
-    from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
-        _mla_prefill_fwd_kernel_non_pipelined as gluon_mla_prefill_fwd_kernel_non_pipelined,
-    )
-except:  # noqa: E722
-    gluon_mla_prefill_fwd_kernel_non_pipelined = None
-    gluon_mla_decode_fwd_kernel_non_pipelined = None
-    gluon_mla_decode_fwd_kernel = None
-    gluon_mla_decode_fwd_reduce_kernel = None
-
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
+
+gluon_mla_prefill_fwd_kernel_non_pipelined = None
+gluon_mla_decode_fwd_kernel_non_pipelined = None
+gluon_mla_decode_fwd_kernel = None
+gluon_mla_decode_fwd_reduce_kernel = None
+_mla_gluon_gfx942_impl = None
+
+if DEVICE_ARCH == "gfx1250":
+    try:
+        from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
+            _mla_decode_fwd_kernel as gluon_mla_decode_fwd_kernel,
+        )
+        from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
+            _mla_decode_fwd_kernel_non_pipelined as gluon_mla_decode_fwd_kernel_non_pipelined,
+        )
+        from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
+            _mla_decode_fwd_reduce_kernel as gluon_mla_decode_fwd_reduce_kernel,  # noqa: F401
+        )
+        from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
+            _mla_prefill_fwd_kernel_non_pipelined as gluon_mla_prefill_fwd_kernel_non_pipelined,
+        )
+    except Exception:  # noqa: BLE001, S110
+        pass
+elif DEVICE_ARCH == "gfx942":
+    try:
+        from aiter.ops.triton._gluon_kernels.gfx942.attention.mla import (
+            mla_gluon_gfx942 as _mla_gluon_gfx942_impl,
+        )
+    except Exception:  # noqa: BLE001, S110
+        pass
 
 
 def select_2d_config(
@@ -279,7 +289,35 @@ def mla_decode_fwd(
     out_scale=None,
     shuffled_kv_cache: bool = False,
     skip_reduce: bool = False,
+    *,
+    q_nope=None,
+    q_pe=None,
+    page_table=None,
+    seq_info=None,
+    within_2gb_override=None,
 ):
+    if (
+        DEVICE_ARCH == "gfx942"
+        and q_nope is not None
+        and q_pe is not None
+        and page_table is not None
+        and seq_info is not None
+    ):
+        assert (
+            _mla_gluon_gfx942_impl is not None
+        ), f"gfx942 graph MLA requires gfx942, got {DEVICE_ARCH}"
+        return _mla_gluon_gfx942_impl(
+            q_nope,
+            q_pe,
+            kv_buffer,
+            out,
+            page_table,
+            seq_info,
+            softmax_scale,
+            within_2gb_override=within_2gb_override,
+        )
+
+    assert q is not None, "q is required for the standard MLA decode path"
     assert causal, "Only causal attention is supported"
     q_dtype = q.dtype
     kv_buffer_dtype = kv_buffer.dtype
