@@ -111,6 +111,67 @@ def test_rmsnorm2d_fuseAdd(dtype, m, n):
     checkAllclose(gres_ref, gres, msg="gemma res check")
 
 
+# Rows whose byte length is not a multiple of 4 (#5044). The HIP rmsnorm kernel
+# bounded each row buffer in whole dwords, so an unaligned row reached into the
+# row after it -- reading its first element into the reduction and writing over
+# it -- and reached past the tensor on the last row. Guard rows catch the write
+# past the end; comparing every row against torch catches the write into the
+# next row, which lands inside the tensor and so passes a guard check.
+_GUARD_BYTE = 0x5A
+
+
+def _with_guard_row(m, n, dtype):
+    storage = torch.empty((m + 1, n), dtype=dtype, device="cuda")
+    guard = storage[-1:].view(torch.uint8)
+    guard.fill_(_GUARD_BYTE)
+    return storage[:-1], guard
+
+
+def _assert_guard_intact(guard, what):
+    changed = torch.count_nonzero(guard != _GUARD_BYTE).item()
+    assert changed == 0, f"{what}: {changed} bytes written past the last row"
+
+
+def test_rmsnorm2d_unaligned(dtype, m, n):
+    input, _ = _with_guard_row(m, n, dtype)
+    input.normal_()
+    weight = torch.randn(n, dtype=dtype, device="cuda")
+
+    ref = F.rms_norm(input=input, normalized_shape=(n,), weight=weight, eps=1e-5)
+    got = aiter.rms_norm(input, weight, 1e-5)
+    torch.testing.assert_close(
+        got, ref, atol=0.01, rtol=0.01, msg=f"rms_norm dim=({m}, {n}) dtype={dtype}"
+    )
+    print(f"[pass] rms_norm            dim: ({m}, {n}), dtype: {dtype}")
+
+
+def test_rmsnorm2d_fuseAdd_unaligned(dtype, m, n):
+    input, _ = _with_guard_row(m, n, dtype)
+    input.normal_()
+    residual, _ = _with_guard_row(m, n, dtype)
+    residual.normal_()
+    weight = torch.randn(n, dtype=dtype, device="cuda")
+    out, out_guard = _with_guard_row(m, n, dtype)
+    residual_out, residual_out_guard = _with_guard_row(m, n, dtype)
+
+    aiter.rmsnorm2d_fwd_with_add(out, input, residual, residual_out, weight, 1e-5)
+
+    residual_ref = input + residual
+    ref = F.rms_norm(input=residual_ref, normalized_shape=(n,), weight=weight, eps=1e-5)
+    where = f"dim=({m}, {n}) dtype={dtype}"
+    torch.testing.assert_close(
+        out, ref, atol=0.03, rtol=0.01, msg=f"rmsnorm2d_fwd_with_add out {where}"
+    )
+    torch.testing.assert_close(
+        residual_out, residual_ref, msg=f"rmsnorm2d_fwd_with_add residual {where}"
+    )
+    _assert_guard_intact(out_guard, f"rmsnorm2d_fwd_with_add out {where}")
+    _assert_guard_intact(
+        residual_out_guard, f"rmsnorm2d_fwd_with_add residual_out {where}"
+    )
+    print(f"[pass] rmsnorm2d_fwd_with_add dim: ({m}, {n}), dtype: {dtype}")
+
+
 # for dtype in [dtypes.fp16, dtypes.bf16]:
 #     for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
 #         for n in [4096, 8192, 16384, 32768, 65536]:
@@ -168,3 +229,14 @@ for dtype in l_dtype:
     for m in l_m:
         for n in l_n:
             test_rmsnorm2d_fuseAdd(dtype, m, n)
+
+# One n per bin of the kernel's n<=512/1024/2048/4096/6144/8192 dispatch, plus the
+# 7x769 shape from #5044. fp32 is routed to the opus backend, which is unaffected.
+print("\nstart unaligned hidden-size test")
+l_n_unaligned = [769, 1023, 2047, 4095, 6143, 8191]
+l_m_unaligned = [1, 7, 33]
+for dtype in [d for d in l_dtype if d.itemsize == 2]:
+    for m in l_m_unaligned:
+        for n in l_n_unaligned:
+            test_rmsnorm2d_unaligned(dtype, m, n)
+            test_rmsnorm2d_fuseAdd_unaligned(dtype, m, n)
