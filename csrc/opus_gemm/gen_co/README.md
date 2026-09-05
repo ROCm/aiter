@@ -75,7 +75,7 @@ an edit to this file and nothing else.
 
 | field | notes |
 |---|---|
-| `kid` | explicit, not positional; reordering the list must not renumber. Both gfx1250 co families share the band `[21000, 23000)` |
+| `kid` | explicit, not positional; reordering the list must not renumber. Both gfx1250 CO families share `[21000,27000)`; the shipped ids are 21016--21315 |
 | `tag` | `kernel_tag`, `a16w16_4wave_co` or `a16w16_4wave_wl_co`; picks the codegen emit branch and the traits/kargs names |
 | `block_size` | threads per workgroup; **must** equal `launch_bounds[0]` (asserted) |
 | `tile` | `[B_M, B_N, B_K]` |
@@ -90,7 +90,7 @@ name as `_w{m}x{n}`. |
 | `device_flags` | extra device-pass flags for this entry — there is no global default |
 | `variant` | optional name suffix, for two entries differing ONLY in `device_flags` |
 
-`wave_layout`, `wave_layout`, `num_vgpr`, `launch_bounds[1]` and `cluster` all land in the symbol
+`wave_layout`, `num_vgpr`, `launch_bounds[1]` and `cluster` all land in the symbol
 name (`...[_w{m}x{n}]_c{m}x{n}_p{slots}_v{vgpr}w{waves}[_{variant}]`), so no two
 entries can collide on one `.co`.
 
@@ -166,6 +166,31 @@ The reference for the 1024-VGPR entry is **`va_vdst0` = 21 and `wmma_dst_hi` =
 is deliberately no threshold on VGPR count any more — with several budgets in
 the table there is no single number that means "the pin worked".
 
+### CI provenance check
+
+Every full rebuild writes a `provenance` record to `build_info.json` with two
+SHA256 digests:
+
+- `source_sha256` covers every kid's rendered device stub, its normalized
+  compile arguments, and the recursive repository-local include closure;
+- `artifacts_sha256` covers the ordered `(kid, symbol, .co contents)` set.
+
+This lets ordinary CPU CI detect either side of a stale artifact update without
+the special LLVM toolchain or gfx1250 hardware:
+
+```sh
+python3 csrc/opus_gemm/gen_co/build_co.py --verify-provenance
+```
+
+The same check runs from `op_tests/test_opus_co_integration.py` and at the start
+of `op_tests/opus/run_tests.sh`, which is the existing OPUS CI entry point. It is
+a source/artifact consistency gate, not a claim that different LLVM revisions
+produce bit-identical ELF files; the compiler identity and flags remain recorded
+separately in `build_info.json`. Regenerate the complete CO set with the command
+in the **Rebuilding** section whenever the manifest, rendered stub, compile
+recipe, or included device headers change; do not update the recorded digests
+by hand.
+
 ## Runtime
 
 [`opus_co_launch_gfx1250.cuh`](../include/gfx1250/opus_co_launch_gfx1250.cuh)
@@ -201,19 +226,11 @@ compiles against.
 
 ## Dispatch
 
-Both tags share this path. These kids get **their own pair of tables** in
-[`opus_gemm_arch_gfx1250.cuh`](../include/gfx1250/opus_gemm_arch_gfx1250.cuh) —
-`opus_a16w16_co_tune_dispatch_gfx1250(kid)` for the explicit-`kernelId` / tuner
-path and `opus_a16w16_co_dispatch_gfx1250(M, N, K)` for tuned-CSV production —
-because the family takes no workspace and so its launchers do not fit the entry
-type the split-K kids share. `opus_gemm()` consults the `(M, N, K)` one first: a
-hit skips the `hipMalloc` / `hipDeviceSynchronize` / `hipFree` that every split-K
-kid needs. Bias and non-bf16 `Y` fall through to split-K, since this pipeline has
-neither an epilogue nor a reduce kernel to serve them.
-
-The shape heuristic never returns a `.co` kid; reaching one always means a tuned
-CSV row or an explicit `kernelId`. On the tuning side both tags are answered
-early by `kid_rejects_shape` — no buffer resource, every tail clamped by the D#,
-so no M/N/K alignment applies. Naming only one of them there once cost the `wl`
-family every shape whose `N` fell outside an unrelated gfx942 whitelist; see
-issue 4 in [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md).
+The launcher then loads the image whose filename and ELF symbol equal the
+registered instance name. Because no allocator or reducer belongs to this
+family, C++ never performs `hipMalloc`, synchronization, or `hipFree` for a CO
+launch. On the tuning side both tags return only split-K candidate 0 and are
+handled early by `kid_rejects_shape`: the TDM descriptors clamp M/N/K tails, so
+no alignment restriction is inherited from another family. Naming only one tag
+there once cost the `wl` family every shape whose `N` fell outside an unrelated
+gfx942 whitelist; see issue 4 in [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md).

@@ -1,82 +1,101 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""opus kernel Python user-facing API.
+"""Public OPUS GEMM/BMM interfaces backed by shared exact-kid launchers."""
 
-Public API: `gemm_a16w16_opus` (CSV lookup + C++ heuristic) and
-`opus_gemm_a16w16_tune` (id-based binding). The gfx942 A8W8 blockscale
-bpreshuffle entry is an explicit tune API.
-"""
+from __future__ import annotations
 
-from ._arch import _detect_arch
+import torch
+from torch import Tensor
 
-_SUPPORTED = {"gfx950", "gfx942", "gfx1250"}
-_FEATURE = "aiter.ops.opus"
-_HINT = (
-    "opus_gemm supports gfx950 (MFMA 16x16x32 / ds_read_b64_tr / 160 KiB "
-    "LDS) and gfx942 (MFMA 16x16x16 / ds_read_b128 / 64 KiB LDS). Set "
-    "GPU_ARCHS to one of these (or run on a matching device) to use this "
-    "module."
-)
-
-_arch_ok, _detected_arch = _detect_arch(_SUPPORTED)
+from .dispatch import _opus_dispatch
 
 
-def _make_unsupported_arch_stub(name: str):
-    """Build a callable that always raises with the detected-arch context."""
+def opus_gemm(
+    XQ: Tensor,
+    WQ: Tensor,
+    Y: Tensor,
+    *,
+    kid: int,
+    layout: str = "plain",
+    x_scale: Tensor | None = None,
+    w_scale: Tensor | None = None,
+    bias: Tensor | None = None,
+    split_k: int = 0,
+    workspace: Tensor | None = None,
+) -> Tensor:
+    """Launch logical 2D ``[M,K] x [N,K] -> [M,N]`` by exact ``kid``.
 
-    def _stub(*_args, **_kwargs):
-        raise RuntimeError(
-            f"{name} requires GPU arch in {sorted(_SUPPORTED)}; "
-            f"detected {_detected_arch!r}. {_HINT}"
-        )
-
-    _stub.__name__ = name
-    _stub.__qualname__ = name
-    _stub.__doc__ = f"Stub: {_FEATURE} unavailable on {_detected_arch!r}."
-    return _stub
-
-
-if _arch_ok:
-    from .bmm_op import bmm_a8w8_mxscale_opus
-    from .gemm_op_a16w16 import (
-        gemm_a16w16_opus,
-        opus_gemm_a16w16_tune,
-        opus_gemm_workspace_init,
-        opus_gemm_workspace_release,
-        opus_gemm_workspace_release_all,
-    )
-
-    def opus_gemm_a8w8_blockscale_bpreshuffle_tune(*args, **kwargs):
-        from .gemm_op_a8w8 import (
-            opus_gemm_a8w8_blockscale_bpreshuffle_tune as _impl,
-        )
-
-        return _impl(*args, **kwargs)
-
-else:
-    # Don't raise ImportError -- aiter/__init__.py's star-import would catch
-    # it and silently disable the 30+ subsequent op imports.
-    gemm_a16w16_opus = _make_unsupported_arch_stub("gemm_a16w16_opus")
-    opus_gemm_a16w16_tune = _make_unsupported_arch_stub("opus_gemm_a16w16_tune")
-    bmm_a8w8_mxscale_opus = _make_unsupported_arch_stub("bmm_a8w8_mxscale_opus")
-    opus_gemm_a8w8_blockscale_bpreshuffle_tune = _make_unsupported_arch_stub(
-        "opus_gemm_a8w8_blockscale_bpreshuffle_tune"
-    )
-    opus_gemm_workspace_init = _make_unsupported_arch_stub("opus_gemm_workspace_init")
-    opus_gemm_workspace_release = _make_unsupported_arch_stub(
-        "opus_gemm_workspace_release"
-    )
-    opus_gemm_workspace_release_all = _make_unsupported_arch_stub(
-        "opus_gemm_workspace_release_all"
+    ``Y`` is caller-owned and returned. ``layout='bpreshuffle'`` declares a
+    transformed WQ content layout that Tensor metadata cannot prove.
+    """
+    return _opus_dispatch(
+        "opus_gemm",
+        2,
+        XQ,
+        WQ,
+        Y,
+        kid=kid,
+        layout=layout,
+        x_scale=x_scale,
+        w_scale=w_scale,
+        bias=bias,
+        split_k=split_k,
+        workspace=workspace,
     )
 
 
-__all__ = [
-    "bmm_a8w8_mxscale_opus",
-    "gemm_a16w16_opus",
-    "opus_gemm_a8w8_blockscale_bpreshuffle_tune",
-    "opus_gemm_a16w16_tune",
-    "opus_gemm_workspace_init",
-    "opus_gemm_workspace_release",
-    "opus_gemm_workspace_release_all",
-]
+def opus_bmm(
+    XQ: Tensor,
+    WQ: Tensor,
+    Y: Tensor,
+    *,
+    kid: int,
+    layout: str = "plain",
+    x_scale: Tensor | None = None,
+    w_scale: Tensor | None = None,
+    bias: Tensor | None = None,
+    split_k: int = 0,
+    workspace: Tensor | None = None,
+) -> Tensor:
+    """Launch batch-first ``[B,M,K] x [B,N,K] -> [B,M,N]`` by exact kid."""
+    return _opus_dispatch(
+        "opus_bmm",
+        3,
+        XQ,
+        WQ,
+        Y,
+        kid=kid,
+        layout=layout,
+        x_scale=x_scale,
+        w_scale=w_scale,
+        bias=bias,
+        split_k=split_k,
+        workspace=workspace,
+    )
+
+
+def gemm_a16w16_opus(
+    A: Tensor,
+    B: Tensor,
+    bias: Tensor | None = None,
+    dtype: torch.dtype = torch.bfloat16,
+    *,
+    kernelId: int | None = None,
+    splitK: int | None = None,
+    out: Tensor | None = None,
+) -> Tensor:
+    """Run the legacy shape-driven A16W16 OPUS selection path."""
+    from .gemm_op_a16w16 import gemm_a16w16_opus as _impl
+
+    return _impl(
+        A,
+        B,
+        bias,
+        dtype,
+        kernelId=kernelId,
+        splitK=splitK,
+        out=out,
+    )
+
+
+__all__ = ["gemm_a16w16_opus", "opus_bmm", "opus_gemm"]

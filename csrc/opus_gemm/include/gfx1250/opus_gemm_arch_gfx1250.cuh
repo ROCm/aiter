@@ -1,184 +1,174 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// opus_gemm_arch_gfx1250.cuh -- gfx1250-specific dispatch.
-//
-// Wires both call paths for the cluster/TDM split-K (workspace + reduce) kids:
-//   * opus_a16w16_tune_dispatch_gfx1250<T>  -- id-based (explicit kernelId)
-//   * opus_dispatch_a16w16_gfx1250<T>       -- tuned (M,N,K) lookup -> heuristic
-//
-// Every gfx1250 kid is a split-K kid whose main kernel writes an fp32 workspace
-// (output_dtypes = ["fp32_t"]); the reduce kernel casts the partials to the
-// runtime Y dtype (bf16/fp32) and folds bias. So all dispatch resolves through
-// the <fp32_t> tune table -- the <bf16_t> specializations exist only to satisfy
-// the shared arch-router template instantiation and are never invoked for
-// gfx1250 (opus_gemm.cu forces <fp32_t> for split-K kids).
-//
-// Included exactly once, by opus_gemm.cu. Self-contained: the shared flat-array
-// dispatch types live in opus_gfx1250_detail (opus_gemm_heuristic_dispatch_
-// gfx1250.cuh), so this header does NOT depend on any gfx950 header and a
-// gfx1250-only build compiles without OPUS_BUILD_HAS_GFX950.
+// Exact-kid launcher tables for gfx1250.
 #pragma once
 
 #include "../opus_gemm_arch.cuh"
 #include "../opus_gemm_common.cuh"
-#include "opus_gemm_heuristic_dispatch_gfx1250.cuh"          // OpusA16W16NoscaleKernel + opus_gfx1250_detail::* + opus_a16w16_heuristic_kid_gfx1250
-#include "opus_gemm_lookup.h"                                // GENERATE_OPUS_LOOKUP_TABLE_FP32_GFX1250
-#include "opus_gemm_a16w16_tune_lookup.h"                    // GENERATE_A16W16_TUNE_LOOKUP_FP32_GFX1250
-#include "opus_gemm_manifest.h"                              // launcher symbols
-#include "../opus_gemm_utils.cuh"                            // bf16_t / fp32_t
+#include "../opus_gemm_utils.cuh"
+#include "opus_gemm_a16w16_kid_dispatch.h"
+#include "opus_gemm_a8w8_kid_dispatch.h"
+#include "opus_gemm_manifest.h"
 
-#include <algorithm>  // std::lower_bound
+#include <algorithm>
+#include <array>
 #include <cstddef>
+#include <optional>
 
-// ── a16w16 tune dispatch (id-based) ─────────────────────────────────────────
-// Only the <fp32_t> table is populated (gfx1250 kids are fp32-only split-K).
-// The <bf16_t> specialization is defensive: it never carries a table (which
-// would be an empty array in a gfx1250-only build) and is never called.
+#ifndef OPUS_A16W16_DISPATCH_KERNEL_TYPES_DEFINED
+#define OPUS_A16W16_DISPATCH_KERNEL_TYPES_DEFINED
+using OpusA16W16Kernel = void (*)(
+    aiter_tensor_t&, aiter_tensor_t&, aiter_tensor_t&,
+    std::optional<aiter_tensor_t>, int);
+using OpusA16W16WorkspaceKernel = void (*)(
+    aiter_tensor_t&, aiter_tensor_t&, aiter_tensor_t&,
+    aiter_tensor_t&, std::optional<aiter_tensor_t>, int);
+#endif
 
-template <typename CDataType>
-inline opus_gfx1250_detail::OpusA16W16TuneKernel
-opus_a16w16_tune_dispatch_gfx1250(int id);
-
-template <>
-inline opus_gfx1250_detail::OpusA16W16TuneKernel
-opus_a16w16_tune_dispatch_gfx1250<fp32_t>(int id)
-{
-    using namespace opus_gfx1250_detail;
-    static constexpr OpusA16W16TuneEntry kTune[] = {
-        GENERATE_A16W16_TUNE_LOOKUP_FP32_GFX1250(fp32_t)
-    };
-    constexpr size_t kSize = sizeof(kTune) / sizeof(kTune[0]);
-    OpusA16W16TuneEntry needle{id, nullptr};
-    auto it = std::lower_bound(kTune, kTune + kSize, needle,
-                               kid_entry_less<OpusA16W16TuneEntry>);
-    AITER_CHECK(it != kTune + kSize && it->kid == id,
-                "Kernel id ", id,
-                " not found in a16w16 fp32 tune lookup table (gfx1250)");
-    return it->func;
-}
-
-template <>
-inline opus_gfx1250_detail::OpusA16W16TuneKernel
-opus_a16w16_tune_dispatch_gfx1250<bf16_t>(int id)
-{
-    // gfx1250 split-K kids are emitted <fp32_t> only; the reduce kernel handles
-    // bf16 Y output. opus_gemm.cu always routes split-K kids through <fp32_t>,
-    // so this is unreachable -- but it must compile (no empty-array table).
-    AITER_CHECK(false,
-                "opus_gemm gfx1250: a16w16 <bf16_t> tune dispatch is not used "
-                "(split-K kids are fp32-workspace; bf16 Y is produced by the "
-                "reduce kernel). kid=", id);
-    return nullptr;
-}
-
-// ── a16w16 pre-compiled .co dispatch ────────────────────────────────────────
-// Two tables, mirroring the split-K pair above: id-based for the explicit
-// kernelId / tuner path, (M, N, K) for the tuned-CSV production path. Both hold
-// OpusA16W16CoKernel (no workspace argument -- see the type's comment), and both
-// are bf16-out only: the kernel writes bf16 C directly, with no reduce kernel in
-// the way to cast anything else.
-inline opus_gfx1250_detail::OpusA16W16CoKernel
-opus_a16w16_co_tune_dispatch_gfx1250(int id)
-{
-    using namespace opus_gfx1250_detail;
-    static constexpr OpusA16W16CoTuneEntry kTune[] = {
-        GENERATE_A16W16_CO_TUNE_LOOKUP_GFX1250()
-    };
-    constexpr size_t kSize = sizeof(kTune) / sizeof(kTune[0]);
-    OpusA16W16CoTuneEntry needle{id, nullptr};
-    auto it = std::lower_bound(kTune, kTune + kSize, needle,
-                               kid_entry_less<OpusA16W16CoTuneEntry>);
-    AITER_CHECK(it != kTune + kSize && it->kid == id,
-                "Kernel id ", id,
-                " not found in the a16w16 pre-compiled (.co) tune lookup table "
-                "(gfx1250). Either it is not in this build's compile set, or "
-                "the build saw no gen_co/co_kernels.json / no matching "
-                "gen_co/<arch>/*.co and the whole family is empty (the loader "
-                "drops kids whose image is missing).");
-    return it->func;
-}
-
-// (M, N, K) -> pre-compiled kernel, nullptr on miss. No heuristic fallback: the
-// shape heuristic never returns a .co kid, so a miss just means "this shape has
-// no tuned .co winner" and the caller carries on with the split-K path.
-inline opus_gfx1250_detail::OpusA16W16CoKernel
-opus_a16w16_co_dispatch_gfx1250(int M, int N, int K)
-{
-    using namespace opus_gfx1250_detail;
-    static constexpr OpusA16W16CoRuntimeEntry kLookup[] = {
-        GENERATE_OPUS_LOOKUP_TABLE_CO_GFX1250()
-    };
-    constexpr size_t kSize = sizeof(kLookup) / sizeof(kLookup[0]);
-    OpusA16W16CoRuntimeEntry needle{{M, N, K}, nullptr};
-    auto it = std::lower_bound(kLookup, kLookup + kSize, needle,
-                               shape_entry_less<OpusA16W16CoRuntimeEntry>);
-    if (it != kLookup + kSize && shape_entry_eq(*it, needle))
-        return it->func;
-    return nullptr;
-}
-
-// ── a16w16 runtime dispatch (tuned lookup -> heuristic fallback) ────────────
-// Both dtype specializations route split-K kids through the <fp32_t> tune
-// table (the launcher's reduce kernel produces the requested Y dtype).
+#ifndef OPUS_A8W8_DISPATCH_KERNEL_TYPES_DEFINED
+#define OPUS_A8W8_DISPATCH_KERNEL_TYPES_DEFINED
+using OpusA8W8Kernel = void (*)(
+    aiter_tensor_t&, aiter_tensor_t&, aiter_tensor_t&);
+using OpusA8W8BlockscaleKernel = void (*)(
+    aiter_tensor_t&, aiter_tensor_t&, aiter_tensor_t&,
+    aiter_tensor_t&, aiter_tensor_t&);
+using OpusA8W8BlockscaleBpreshuffleKernel = void (*)(
+    aiter_tensor_t&, aiter_tensor_t&, aiter_tensor_t&,
+    aiter_tensor_t&, aiter_tensor_t&);
+#endif
 
 namespace opus_gfx1250_detail
 {
-inline void check_shape_4g(int M, int N, int K, size_t c_elem_bytes)
+struct OpusA16W16KidEntry
 {
-    // 4 GiB buffer-resource guard: the launcher builds 32-bit-bounded gmem
-    // descriptors over A/B/C, so >4 GiB tensors wrap num_records -> silent OOB.
-    constexpr uint64_t U32_MAX_BYTES = (1ULL << 32) - 1;
-    const uint64_t a_bytes = (uint64_t)M * (uint64_t)K * sizeof(bf16_t);
-    const uint64_t b_bytes = (uint64_t)N * (uint64_t)K * sizeof(bf16_t);
-    const uint64_t c_bytes = (uint64_t)M * (uint64_t)N * (uint64_t)c_elem_bytes;
-    AITER_CHECK(a_bytes <= U32_MAX_BYTES && b_bytes <= U32_MAX_BYTES
-                    && c_bytes <= U32_MAX_BYTES,
-                "opus_gemm gfx1250: a16w16 heuristic refuses >4 GiB shape (M=",
-                M, " N=", N, " K=", K, "): launcher gmem descriptors are 32-bit.");
+    int kid;
+    OpusA16W16Kernel func;
+};
+
+struct OpusA16W16WorkspaceKidEntry
+{
+    int kid;
+    OpusA16W16WorkspaceKernel func;
+};
+
+template <typename Kernel>
+struct OpusA8W8KidEntry
+{
+    int kid;
+    Kernel func;
+};
+
+template <typename Entry, size_t Size>
+inline const Entry* find_kid(const std::array<Entry, Size>& entries, int kid)
+{
+    const auto it = std::lower_bound(
+        entries.begin(), entries.end(), kid,
+        [](const Entry& entry, int value) { return entry.kid < value; });
+    return it != entries.end() && it->kid == kid ? &*it : nullptr;
 }
-}  // namespace opus_gfx1250_detail
+
+inline const OpusA16W16WorkspaceKidEntry* workspace_entry(int kid)
+{
+    static constexpr std::array<
+        OpusA16W16WorkspaceKidEntry,
+        GENERATE_A16W16_WORKSPACE_KID_DISPATCH_GFX1250_SIZE>
+        kWorkspace = {{GENERATE_A16W16_WORKSPACE_KID_DISPATCH_GFX1250}};
+    return find_kid(kWorkspace, kid);
+}
+} // namespace opus_gfx1250_detail
 
 template <typename CDataType>
-inline opus_gfx1250_detail::OpusA16W16NoscaleKernel
-opus_dispatch_a16w16_gfx1250(int M, int N, int K, int batch, bool has_bias = false);
+inline OpusA8W8BlockscaleBpreshuffleKernel
+opus_a8w8_blockscale_bpreshuffle_kid_dispatch_gfx1250(int id);
 
 template <>
-inline opus_gfx1250_detail::OpusA16W16NoscaleKernel
-opus_dispatch_a16w16_gfx1250<bf16_t>(int M, int N, int K, int batch, bool has_bias)
+inline OpusA8W8BlockscaleBpreshuffleKernel
+opus_a8w8_blockscale_bpreshuffle_kid_dispatch_gfx1250<bf16_t>(int id)
 {
-    using namespace opus_gfx1250_detail;
-    static constexpr OpusA16W16RuntimeEntry kLookup[] = {
-        GENERATE_OPUS_LOOKUP_TABLE_BF16_GFX1250(bf16_t)
-    };
-    constexpr size_t kSize = sizeof(kLookup) / sizeof(kLookup[0]);
-    OpusA16W16RuntimeEntry needle{{M, N, K}, nullptr};
-    auto it = std::lower_bound(kLookup, kLookup + kSize, needle,
-                               shape_entry_less<OpusA16W16RuntimeEntry>);
-    if (it != kLookup + kSize && shape_entry_eq(*it, needle))
-        return it->func;
-    (void)batch;
-    opus_gfx1250_detail::check_shape_4g(M, N, K, sizeof(bf16_t));
-    const int kid = opus_a16w16_heuristic_kid_gfx1250(M, N, K, has_bias);
-    return opus_a16w16_tune_dispatch_gfx1250<fp32_t>(kid);
+    using Entry = opus_gfx1250_detail::OpusA8W8KidEntry<
+        OpusA8W8BlockscaleBpreshuffleKernel>;
+    static constexpr std::array<
+        Entry,
+        GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_KID_DISPATCH_GFX1250_BF16_SIZE>
+        kKids = {{GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_KID_DISPATCH_GFX1250_BF16}};
+    AITER_CHECK(!kKids.empty(),
+                "no registered kernel for OPUS "
+                "a8w8_blockscale_bpreshuffle on gfx1250 with bf16 Y");
+    const auto* entry = opus_gfx1250_detail::find_kid(kKids, id);
+    AITER_CHECK(entry != nullptr,
+                "unknown kid ", id, " for OPUS "
+                "a8w8_blockscale_bpreshuffle on gfx1250 with bf16 Y");
+    return entry->func;
 }
 
 template <>
-inline opus_gfx1250_detail::OpusA16W16NoscaleKernel
-opus_dispatch_a16w16_gfx1250<fp32_t>(int M, int N, int K, int batch, bool has_bias)
+inline OpusA8W8BlockscaleBpreshuffleKernel
+opus_a8w8_blockscale_bpreshuffle_kid_dispatch_gfx1250<fp32_t>(int id)
+{
+    using Entry = opus_gfx1250_detail::OpusA8W8KidEntry<
+        OpusA8W8BlockscaleBpreshuffleKernel>;
+    static constexpr std::array<
+        Entry,
+        GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_KID_DISPATCH_GFX1250_FP32_SIZE>
+        kKids = {{GENERATE_A8W8_BLOCKSCALE_BPRESHUFFLE_KID_DISPATCH_GFX1250_FP32}};
+    AITER_CHECK(!kKids.empty(),
+                "no registered kernel for OPUS "
+                "a8w8_blockscale_bpreshuffle on gfx1250 with fp32 Y");
+    const auto* entry = opus_gfx1250_detail::find_kid(kKids, id);
+    AITER_CHECK(entry != nullptr,
+                "unknown kid ", id, " for OPUS "
+                "a8w8_blockscale_bpreshuffle on gfx1250 with fp32 Y");
+    return entry->func;
+}
+
+// Empty direct-output tables reject unsupported gfx1250 A16W16 calls.
+template <typename CDataType>
+inline OpusA16W16Kernel opus_a16w16_kid_dispatch_gfx1250(int kid);
+
+template <>
+inline OpusA16W16Kernel opus_a16w16_kid_dispatch_gfx1250<bf16_t>(int kid)
 {
     using namespace opus_gfx1250_detail;
-    static constexpr OpusA16W16RuntimeEntry kLookup[] = {
-        GENERATE_OPUS_LOOKUP_TABLE_FP32_GFX1250(fp32_t)
-    };
-    constexpr size_t kSize = sizeof(kLookup) / sizeof(kLookup[0]);
-    OpusA16W16RuntimeEntry needle{{M, N, K}, nullptr};
-    auto it = std::lower_bound(kLookup, kLookup + kSize, needle,
-                               shape_entry_less<OpusA16W16RuntimeEntry>);
-    if (it != kLookup + kSize && shape_entry_eq(*it, needle))
-        return it->func;
-    (void)batch;
-    opus_gfx1250_detail::check_shape_4g(M, N, K, sizeof(fp32_t));
-    const int kid = opus_a16w16_heuristic_kid_gfx1250(M, N, K, has_bias);
-    return opus_a16w16_tune_dispatch_gfx1250<fp32_t>(kid);
+    static constexpr std::array<
+        OpusA16W16KidEntry,
+        GENERATE_A16W16_NONWORKSPACE_KID_DISPATCH_GFX1250_BF16_SIZE>
+        kKids = {{GENERATE_A16W16_NONWORKSPACE_KID_DISPATCH_GFX1250_BF16(bf16_t)}};
+    const auto* entry = find_kid(kKids, kid);
+    AITER_CHECK(entry != nullptr,
+                "unknown kid ", kid,
+                " for OPUS a16w16 on gfx1250 with bf16 Y in the "
+                "non-workspace launch table");
+    return entry->func;
+}
+
+template <>
+inline OpusA16W16Kernel opus_a16w16_kid_dispatch_gfx1250<fp32_t>(int kid)
+{
+    using namespace opus_gfx1250_detail;
+    static constexpr std::array<
+        OpusA16W16KidEntry,
+        GENERATE_A16W16_NONWORKSPACE_KID_DISPATCH_GFX1250_FP32_SIZE>
+        kKids = {{GENERATE_A16W16_NONWORKSPACE_KID_DISPATCH_GFX1250_FP32(fp32_t)}};
+    const auto* entry = find_kid(kKids, kid);
+    AITER_CHECK(entry != nullptr,
+                "unknown kid ", kid,
+                " for OPUS a16w16 on gfx1250 with fp32 Y in the "
+                "non-workspace launch table");
+    return entry->func;
+}
+
+inline bool opus_a16w16_has_workspace_kernel_gfx1250(int id)
+{
+    return opus_gfx1250_detail::workspace_entry(id) != nullptr;
+}
+
+inline OpusA16W16WorkspaceKernel
+opus_a16w16_workspace_dispatch_gfx1250(int id)
+{
+    const auto* entry = opus_gfx1250_detail::workspace_entry(id);
+    AITER_CHECK(entry != nullptr,
+                "unknown kid ", id,
+                " for OPUS a16w16 on gfx1250 in the workspace launch table");
+    return entry->func;
 }

@@ -6,7 +6,7 @@
     "",
     "Per-entry fields:",
     "  kid            explicit, not positional -- reordering this list must not renumber.",
-    "                 gfx1250 a16w16_4wave_co band is [21000, 23000).",
+    "                 gfx1250 4wave CO families share [21000, 27000).",
     "  tag            kernel_tag; selects the codegen emit branch and the traits/kargs names.",
     "  block_size     threads per workgroup. MUST equal launch_bounds[0].",
     "  tile           [B_M, B_N, B_K].",

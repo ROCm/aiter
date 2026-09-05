@@ -3,8 +3,9 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #
 # Run all OPUS tests:
-#   1. C++ host test (test_opus_basic)
-#   2. Device kernel tests via opus_device_test.so (hipcc, loaded via ctypes)
+#   1. Pre-built CO source/artifact provenance
+#   2. C++ host test (test_opus_basic)
+#   3. Device kernel tests via opus_device_test.so (hipcc, loaded via ctypes)
 #
 # Can be invoked from any directory, e.g.:
 #   ./op_tests/opus/run_tests.sh        (from repo root)
@@ -23,6 +24,11 @@ if ! command -v python3 &>/dev/null; then
 fi
 
 echo "=== OPUS tests (workdir: $SCRIPT_DIR) ==="
+
+echo ""
+echo "--- OPUS pre-built CO provenance ---"
+"$PYTHON" "$SCRIPT_DIR/../../csrc/opus_gemm/gen_co/build_co.py" \
+  --verify-provenance
 
 echo ""
 echo "--- C++ host test (test_opus_basic) ---"

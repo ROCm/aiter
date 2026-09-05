@@ -1,9 +1,9 @@
 {
   "arch": "gfx1250",
   "common_flags": [
-    "-D__HIPCC_RTC__",
+    "-std=c++20",
     "-O3",
-    "-std=c++20"
+    "-D__HIPCC_RTC__"
   ],
   "device_clang": "clang version 24.0.0git (git@github.com:demonsan/llvm-project.git a23ed35d43a65ca9e229abc9074a64d14009d907)",
   "hip_clang_path": "/wksp/llvm-project/build/bin",
@@ -9645,5 +9645,10 @@
       "vgpr_count": 304,
       "vgpr_spill_count": 0
     }
-  ]
+  ],
+  "provenance": {
+    "artifacts_sha256": "b087460efdbdcd955419b8b0b0d20ec362e622b403f8c912588e3708ce3ea1fc",
+    "schema": 1,
+    "source_sha256": "5899df63658f9fac51b64518fded83abcfe874cb1fda6ad268139d1adf3fec07"
+  }
 }

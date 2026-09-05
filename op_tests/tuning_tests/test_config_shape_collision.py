@@ -223,6 +223,53 @@ class TestConfigShapeCollision(unittest.TestCase):
             "batched_gemm_a8w8_blockscale_mxscale_tuned",
         )
 
+        # The generic config registry owns file discovery and merging; the
+        # dedicated caller policy still owns public-kid normalization.
+        from aiter.ops.opus import policy
+
+        policy._load_mxscale_bmm_tuned.cache_clear()
+        rows = policy._load_mxscale_bmm_tuned("opus")
+        self.assertTrue(rows)
+        self.assertEqual(len(rows), len(set(rows)))
+        self.assertEqual(
+            rows[("gfx950", 2, 1, 1024, 4096)]["kernelId"],
+            8311,
+            "legacy local OPUS kid 311 must become public global kid 8311",
+        )
+        self.assertEqual(
+            rows[("gfx950", 8, 128, 1024, 4096)]["kernelId"],
+            8653,
+            "legacy local OPUS kid 653 must become public global kid 8653",
+        )
+        policy._load_mxscale_bmm_tuned.cache_clear()
+
+    def test_mxscale_kid_translation_does_not_touch_other_backends(self):
+        from aiter.ops.opus import policy
+
+        env_name = "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE"
+        old_value = os.environ.get(env_name)
+        with tempfile.TemporaryDirectory(prefix="aiter_mxscale_kid_") as tmp:
+            config_path = os.path.join(tmp, "mixed.csv")
+            with open(config_path, "w") as f:
+                f.write("gfx,b,m,n,k,libtype,kernelId,splitK\n")
+                f.write("gfx950,2,1,1024,4096,opus,311,1\n")
+                f.write("gfx950,3,1,1024,4096,other,42,1\n")
+
+            try:
+                os.environ[env_name] = config_path
+                _cache_clear()
+                policy._load_mxscale_bmm_tuned.cache_clear()
+                rows = policy._load_mxscale_bmm_tuned()
+                self.assertEqual(rows[("gfx950", 2, 1, 1024, 4096)]["kernelId"], 8311)
+                self.assertEqual(rows[("gfx950", 3, 1, 1024, 4096)]["kernelId"], 42)
+            finally:
+                if old_value is None:
+                    os.environ.pop(env_name, None)
+                else:
+                    os.environ[env_name] = old_value
+                _cache_clear()
+                policy._load_mxscale_bmm_tuned.cache_clear()
+
     def test_batched_gemm_a8w8_blockscale_mxscale_bpreshuffle(self):
         self._check_family(
             "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",

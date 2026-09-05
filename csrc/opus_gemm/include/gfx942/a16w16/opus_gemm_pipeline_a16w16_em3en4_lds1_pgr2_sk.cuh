@@ -543,13 +543,13 @@ void gemm_a16w16_em3en4_lds1_pgr2_sk_kernel(opus_gemm_splitk_kargs kargs) {
     using T = opus::remove_cvref_t<Traits>;
     using D_A = typename T::D_A;
     using D_B = typename T::D_B;
-    using D_C = typename T::D_C;
+    using D_WS = typename T::D_WS;
     using D_ACC = typename T::D_ACC;
 
     static_assert(T::B_M == 96 && T::B_N == 128 && T::B_K == 128);
     static_assert(T::T_M == 2 && T::T_N == 2 && T::BLOCK_SIZE == 256);
     static_assert(T::E_M == 3 && T::E_N == 4 && T::E_K == 8);
-    static_assert(std::is_same_v<D_C, D_ACC>,
+    static_assert(std::is_same_v<D_WS, D_ACC>,
                   "EM3EN4 LDS1/PGR2 splitK main kernel writes fp32 workspace");
 
     int wgid_full = opus::block_id_x();
@@ -581,7 +581,7 @@ void gemm_a16w16_em3en4_lds1_pgr2_sk_kernel(opus_gemm_splitk_kargs kargs) {
     auto g_b = make_gmem(reinterpret_cast<const D_B*>(kargs.ptr_a)
                          + batch_id * kargs.stride_a_batch + row * kargs.stride_a + k_start,
                          ((kargs.m - row) * kargs.stride_a - k_start) * sizeof(D_B));
-    auto g_c = make_gmem(opus_splitk_ws_ptr<D_C>(kargs.ws_handle)
+    auto g_c = make_gmem(opus_gfx942_uniform_ws_ptr<D_WS>(kargs.ptr_ws)
                          + (size_t)split_id * kargs.batch * kargs.stride_ws_batch
                          + (size_t)batch_id * kargs.stride_ws_batch
                          + (size_t)row * kargs.stride_ws
