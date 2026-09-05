@@ -1,0 +1,15 @@
+{
+    "jobs": [
+        {
+            "kernel_include_regex": "gluon_dynamic_mxfp8_quant_kernel_gfx1250",
+            "kernel_exclude_regex": "",
+            "kernel_iteration_range": "1",
+            "advanced_thread_trace": true,
+            "att_parse" : "trace",
+            "att_target_cu" : 0,
+            "att_shader_engine_mask" : "0xFFFF",
+            "att_simd_select": "0xF",
+            "att_buffer_size": "0x6000000"
+        }
+    ]
+}

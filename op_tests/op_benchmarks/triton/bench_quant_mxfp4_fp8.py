@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
 import argparse
 import sys
 
@@ -5,6 +8,7 @@ import torch
 import triton
 
 from aiter.ops.triton.quant import dynamic_mxfp4_quant as triton_dynamic_mxfp4_quant
+from aiter.ops.triton.quant import dynamic_mxfp8_quant as triton_dynamic_mxfp8_quant
 from aiter.utility.fp4_utils import dynamic_mxfp4_quant as fp4_utils_dynamic_mxfp4_quant
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_available_models,
@@ -14,17 +18,9 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 
 
 def get_default_shapes() -> list[list[int]]:
-    return [
-        [1, 4],
-        [1, 32],
-        [1, 64],
-        [2, 32],
-        [128, 32],
-        [128, 64],
-        [256, 32],
-        [4096, 4096],
-        [4096, 8192],
-    ]
+    M = [8, 32, 256, 2048, 8192, 16384]
+    N = [1024, 3072, 7168]
+    return [[m, n] for n in N for m in M]
 
 
 def model_benchmark_shapes(args) -> list[tuple[str, int, int]]:
@@ -48,12 +44,29 @@ def get_dtype(dtype_str: str) -> torch.dtype:
     raise ValueError(f"Unsupported dtype: {dtype_str}")
 
 
-def get_provider(provider: str):
+def get_provider(fmt: str, provider: str):
+    if fmt == "mxfp8":
+        if provider == "triton":
+            return triton_dynamic_mxfp8_quant
+        raise ValueError(f"Unknown provider: {provider}")
     if provider == "triton":
         return triton_dynamic_mxfp4_quant
     if provider == "fp4_utils":
         return fp4_utils_dynamic_mxfp4_quant
     raise ValueError(f"Unknown provider: {provider}")
+
+
+def get_line_vals(args) -> list[str]:
+    """Each line is a "format-provider" combo; fp4_utils only applies to mxfp4."""
+    formats = args.format.split(",")
+    providers = args.provider.split(",")
+    line_vals = []
+    for fmt in formats:
+        for provider in providers:
+            if fmt == "mxfp8" and provider == "fp4_utils":
+                continue
+            line_vals.append(f"{fmt}-{provider}")
+    return line_vals
 
 
 def parse_shape_args(args) -> list[tuple[str, int, int]]:
@@ -70,7 +83,7 @@ def run_benchmark(args):
         raise ValueError("Use either --shape or --model, not both")
 
     x_vals = parse_shape_args(args)
-    providers = args.provider.split(",")
+    line_vals = get_line_vals(args)
 
     if args.metric == "time":
         ylabel = "Time (ms)"
@@ -79,36 +92,38 @@ def run_benchmark(args):
     else:
         raise NotImplementedError(f"{args.metric} is not supported")
 
+    colors = ["green", "blue", "red", "orange", "purple"]
     benchmark = triton.testing.Benchmark(
         x_names=["model_name", "M", "N"],
         x_vals=x_vals,
         x_log=True,
         y_log=True,
         line_arg="provider",
-        line_vals=providers,
-        line_names=providers,
-        styles=[("green", "-"), ("blue", "-")],
+        line_vals=line_vals,
+        line_names=line_vals,
+        styles=[(colors[i % len(colors)], "-") for i in range(len(line_vals))],
         ylabel=ylabel,
         plot_name=get_caller_name_no_ext(),
         args={"metric": args.metric, "dtype": args.dtype},
     )
 
     @triton.testing.perf_report([benchmark])
-    def bench_quant_mxfp4(M, N, metric, provider, dtype, model_name=None, **kwargs):
+    def bench_quant_mx(M, N, metric, provider, dtype, model_name=None, **kwargs):
+        fmt, provider = provider.split("-", 1)
         dtype = get_dtype(dtype)
         x = torch.randn((M, N), dtype=dtype, device="cuda")
-        quant_fn = get_provider(provider)
+        quant_fn = get_provider(fmt, provider)
 
         def fn():
             quant_fn(x)
 
-        ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+        ms = triton.testing.do_bench_cudagraph(fn, rep=100)
 
         # Read x and write quantized output + block scales.
         x_bytes = x.numel() * x.element_size()
-        x_fp4_bytes = M * (N // 2)
+        x_quant_bytes = M * (N // 2) if fmt == "mxfp4" else M * N
         x_scale_bytes = M * ((N + 31) // 32)
-        total_bytes = x_bytes + x_fp4_bytes + x_scale_bytes
+        total_bytes = x_bytes + x_quant_bytes + x_scale_bytes
 
         if metric == "time":
             return ms
@@ -116,13 +131,19 @@ def run_benchmark(args):
             return total_bytes / (ms * 1e-3) * 1e-9
         raise ValueError("Unknown metric: " + metric)
 
-    bench_quant_mxfp4.run(save_path="." if args.o else None, print_data=True)
+    bench_quant_mx.run(save_path="." if args.o else None, print_data=True)
 
 
 def parse_args(args: list[str] | None = None):
     parser = argparse.ArgumentParser(
-        prog="Benchmark MXFP4 Quant",
+        prog="Benchmark MX Quant",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--format",
+        type=str,
+        default="mxfp4,mxfp8",
+        help="Comma-separated quantized output format(s) to benchmark, from: mxfp4,mxfp8.",
     )
     parser.add_argument(
         "--shape",
@@ -154,7 +175,9 @@ def parse_args(args: list[str] | None = None):
         "--provider",
         type=str,
         default="triton",
-        help="Provider(s) to benchmark. Comma-separated values from: triton,fp4_utils.",
+        help="Provider(s) to benchmark, applied to each --format. Comma-separated "
+        "values from: triton,fp4_utils (fp4_utils only valid for mxfp4; silently "
+        "skipped for other formats).",
     )
     parser.add_argument(
         "--dtype",
