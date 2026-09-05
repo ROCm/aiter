@@ -1837,7 +1837,7 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
     # them, and pass. FIRE means it goes in the card; if it is not going in, the verdict
     # is not FIRE, and saying so is a one-word edit to the ledger. The escape is
     # deliberate and must be written down: `-- not reported: <reason>` on the verdict.
-    fired, fire_paths = {}, {}
+    fired, fire_paths, claims = {}, {}, {}
     for ln in (verdicts_text or "").splitlines():
         m = re.match(r"\s*([A-Z]+\d+[a-z]?)\s+FIRE\b\s*(?:--|—|:)\s*(.*)$", ln)
         if m and "not reported:" not in m.group(2).lower():
@@ -1864,7 +1864,19 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
         # a file the verdict cited is the same claim without the label.
         for rule, paths in fire_paths.items():
             if paths and any(pp in text for pp in paths):
-                reported.add(rule)
+                claims.setdefault(rule, []).append(text[:40])
+    # One finding cannot report three rules just by naming the file all three cited.
+    # aiter#2478 adjudicated D1, P6 and E4 FIRE and every verdict cited aiter/fused_moe.py,
+    # so any single sentence mentioning that path claimed all three. Where N fired rules
+    # share a path, N distinct findings have to mention it before they are all accounted
+    # for; the rule id, when the card carries one, still claims outright.
+    by_path = {}
+    for rule, paths in fire_paths.items():
+        by_path.setdefault(tuple(sorted(paths)), []).append(rule)
+    for _paths, rules in by_path.items():
+        got = {f for r in rules for f in claims.get(r, [])}
+        for rule in sorted(rules)[:len(got)]:
+            reported.add(rule)
     for rule, why in sorted(fired.items()):
         if rule not in reported:
             problems.append(("UNREPORTED-FIRE", f"{rule}: {why}",

@@ -721,8 +721,10 @@ else:
     print(
         "validation REQUIRED but not run: "
         f"{reason or 'reason unrecorded, which is itself a defect in this step'}. "
-        "Report it as a gap in the evidence, and if the reason is a missing test target, "
-        "as a finding about the PR."
+        "Report it as a gap in the evidence. A missing test target is a finding about the "
+        "PR only if the changed path is EXECUTED at run time: this triage counts anything "
+        "under aiter/ as runtime surface, and a tuned-config table, a tuner input CSV or a "
+        "codegen manifest is read and looked up, never executed. Establish which."
     )
 PY
 fi
@@ -856,6 +858,18 @@ fi
 "$SKILLS_ROOT/review-pr/triage.py" guards "$WORK/pr.diff" \
   | tee "$WORK/guards.txt"
 
+# Whether the diff still applies to the branch it targets. Free, and nothing else asks:
+# aiter#2478 is five months old, both hunks conflict, and the review found that only by
+# thinking to run this. symbols.txt reporting resolved imports reads as "no drift".
+if git -C "$PROJECT_ROOT" -c core.fileMode=false apply --check "$WORK/pr.diff" 2>"$WORK/.err"; then
+  echo "APPLIES: the diff still applies to $BASE_SHA" | tee "$WORK/applies.txt"
+else
+  { echo "STALE: no longer applies to merge target $BASE_SHA -- the PR needs a rebase,"
+    echo "  and any CI result on it describes a tree that has moved"
+    sed 's/^/  /' "$WORK/.err"; } | tee "$WORK/applies.txt"
+fi
+rm -f "$WORK/.err"
+
 # Every first-party import the diff ADDS, resolved against the branch this PR merges
 # INTO -- fetched fresh, not the PR base and not whatever is on disk. A stale root
 # makes this check silently pass; that is the whole failure mode it exists to catch.
@@ -880,5 +894,6 @@ echo "WORK=$WORK"
 # produced only when a guard or a signature actually changed, so it is listed as such.
 echo "artifacts: pr.diff pr_meta.json base_head.txt rules.txt rules_expanded.txt \
 test_quality.txt twins.txt ci_coverage.txt perf_claims.txt struct_abi.txt comment_only.txt \
-guards.txt siblings.txt kernel_tests.txt symbols.txt validation_requirement.json \
+guards.txt siblings.txt kernel_tests.txt applies.txt symbols.txt \
+validation_requirement.json \
 auto_validation_outcome.txt${HAVE_EVIDENCE:+ evidence.txt}"

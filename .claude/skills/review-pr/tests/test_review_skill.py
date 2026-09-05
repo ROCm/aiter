@@ -2911,3 +2911,95 @@ class TestArtifactsListMatchesWhatIsWritten(unittest.TestCase):
                       "announcing it unconditionally sends the reader after a file "
                       "that is not there")
 
+
+class TestFireClaimingIsNotFreeloadable(unittest.TestCase):
+    """Relaxing the FIRE claim to "names a file the verdict cited" made it too easy.
+
+    aiter#2478 adjudicated three rules FIRE and every verdict cited aiter/fused_moe.py,
+    so one sentence mentioning that path accounted for all three -- the review reported
+    three real findings, but the gate could not tell that from one. Where N fired rules
+    share a citation, N distinct findings have to name it."""
+
+    DIFF = ("diff --git a/aiter/fused_moe.py b/aiter/fused_moe.py\n"
+            "--- a/aiter/fused_moe.py\n+++ b/aiter/fused_moe.py\n@@ -1 +1,2 @@\n+    x = 1\n")
+    VERDICTS = ("D1 FIRE -- aiter/fused_moe.py:1 wrong predicate\n"
+                "P6 FIRE -- aiter/fused_moe.py:1 two extra launches\n"
+                "E4 FIRE -- aiter/fused_moe.py:1 downstream skipped\n")
+
+    def gate(self, card):
+        with tempfile.TemporaryDirectory() as d:
+            d = pathlib.Path(d)
+            (d / "card.md").write_text(card)
+            (d / "v.txt").write_text(self.VERDICTS)
+            (d / "pr.diff").write_text(self.DIFF)
+            (d / "e.txt").write_text("")
+            return subprocess.run(
+                [sys.executable, str(TRIAGE), "card", str(d / "card.md"), str(d / "v.txt"),
+                 str(d / "e.txt"), str(d / "e.txt"), str(d / "pr.diff")],
+                capture_output=True, text=True)
+
+    ONE = ("\u26A0\uFE0F aiter/fused_moe.py:1 uses the wrong predicate so the count "
+           "never shrinks at 384 experts\n")
+
+    def test_one_finding_cannot_claim_three_fires(self):
+        r = self.gate(self.ONE)
+        self.assertIn("UNREPORTED-FIRE", r.stdout)
+        self.assertEqual(1, r.returncode)
+
+    def test_three_findings_claim_three_fires(self):
+        r = self.gate(self.ONE +
+                      "\u26A0\uFE0F aiter/fused_moe.py:1 adds two kernel launches per "
+                      "call on the non-EP path at 61 layers\n"
+                      "\u26A0\uFE0F aiter/fused_moe.py:1 changes a shared contract with "
+                      "no downstream CI label set\n")
+        self.assertNotIn("UNREPORTED-FIRE", r.stdout)
+        self.assertEqual(0, r.returncode, r.stdout)
+
+
+class TestStalenessIsReported(unittest.TestCase):
+    """Whether the diff still applies to the branch it targets.
+
+    aiter#2478 is five months old and both hunks conflict; the review found that by
+    thinking to run `git apply --check` itself. Nothing in Step 1b asked, and
+    symbols.txt reporting every import resolved reads as evidence of no drift."""
+
+    def test_fetch_writes_an_applies_artifact(self):
+        src = FETCH.read_text()
+        self.assertIn("applies.txt", src)
+        self.assertIn("apply --check", src)
+
+    def test_the_artifact_is_announced(self):
+        src = FETCH.read_text()
+        block = src[src.index('echo "artifacts:'):]
+        self.assertIn("applies.txt", block[:500],
+                      "written but not named, which is how evidence.txt got lost")
+
+    def test_both_outcomes_say_which_one_it_is(self):
+        src = FETCH.read_text()
+        self.assertIn("APPLIES:", src)
+        self.assertIn("STALE:", src)
+
+
+class TestTheToolTextAgreesWithTheInstruction(unittest.TestCase):
+    """SKILL.md was amended so that a missing test target is a defect only on a path that
+    actually executes; fetch.sh went on printing the unconditional version.
+
+    A control PR run against the amended SKILL.md caught it: the reviewer followed the
+    document and overrode the tool, and said so. The next one may follow the tool. A fix
+    that lands in the prose and not in the string the program prints is half a fix, and
+    this is the exact path the original defect took."""
+
+    def test_fetch_does_not_order_the_missing_target_reported_unconditionally(self):
+        src = FETCH.read_text()
+        i = src.find("validation REQUIRED but not run")
+        self.assertGreater(i, 0, "the message moved; re-point this test")
+        msg = src[i:i + 800]
+        self.assertIn("EXECUTED at run time", msg)
+        self.assertIn("codegen manifest", msg)
+
+    def test_skill_md_carries_the_same_qualifier(self):
+        body = (SKILL_DIR / "SKILL.md").read_text()
+        i = body.find("no target existed to run")
+        self.assertGreater(i, 0)
+        self.assertIn("executed at run time", body[i:i + 700])
+
