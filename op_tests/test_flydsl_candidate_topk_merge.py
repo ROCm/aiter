@@ -132,7 +132,10 @@ def test_candidate_topk_merge_total_order_and_page_map(topk):
         atol=0,
     )
     for row, wanted in enumerate(expected):
-        wanted_indices = torch.tensor(sorted(index for _, index in wanted))
+        wanted_indices = torch.tensor(
+            sorted(index for _, index in wanted),
+            dtype=torch.int32,
+        )
         got_indices = torch.sort(out_raw[row].cpu()).values
         torch.testing.assert_close(got_indices, wanted_indices, rtol=0, atol=0)
 
