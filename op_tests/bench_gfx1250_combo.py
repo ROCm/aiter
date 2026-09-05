@@ -60,8 +60,8 @@ same thing to every op:
                     not in the kernel under test.
     mega_moe        1..2048. 65536 cannot allocate its symmetric arena; see
                     _MEGA_MOE_TOKENS.
-    a8w8_blockscale 1024..65536. Below 1024 it walks into a UT bug; see the
-                    note in DSV4_OPS.
+    a8w8_blockscale 512..65536. M=512 covers a DSv4 decode batch of 512;
+                    smaller M stays out because of a UT bug; see DSV4_OPS.
     mla_v4_prefill  1024..16384, the DSv4 prefill chunk. 65536 faults; see
                     _MLA_PREFILL_TOKENS.
 
@@ -457,18 +457,19 @@ _SCORE_QK_KV_LENGTHS = (
 )
 # Was unset, which let the UT sweep its own 27-value default down to M=1. Two
 # reasons to set it. First, M here is the token count of one step, so the small
-# end of that default is decode batch and the large end is prefill chunk; this
-# list is the prefill side, up to the 65536 the other DSv4 ops sweep and past
-# the UT default's own ceiling of 10240. Second, the small M are what walk into
+# end of that default is decode batch and the large end is prefill chunk. This
+# list retains the model-real decode point M=512, then covers the prefill side
+# up to the 65536 the other DSv4 ops sweep and past the UT default's own ceiling
+# of 10240. Second, the tiny M are what walk into
 # the UT bug described at "a8w8_blockscale" below: get_CKGEMM_config retries the
 # lookup as M -> get_padded_m(gl=0) -> nextPow2, so anything in [1, 16] or
 # [33, 64] can land on one of #4773's M=16/M=64 gluon rows (gemm_common.cu:13).
-# Starting at 1024 clears both ranges by a wide margin.
+# Starting at 512 clears both ranges by a wide margin.
 #
-# Two things stop being covered, both worth remembering: decode-side M, and the
-# 11 tuned rows that are the only shapes dispatching to gluon. This is a way
-# around the UT bug, not a fix for it.
-_A8W8_BLOCKSCALE_TOKENS = _tokens((1024, 2048, 4096, 8192, 16384, 65536))
+# Two things remain outside coverage, both worth remembering: decode-side M
+# below 512, and the 11 tuned rows that are the only shapes dispatching to
+# gluon. This is a way around the UT bug, not a fix for it.
+_A8W8_BLOCKSCALE_TOKENS = _tokens((512, 1024, 2048, 4096, 8192, 16384, 65536))
 # Decode carries one token per sequence, so this axis is the batch, not a token
 # count; past 1024 it stops being a shape the model runs, hence its own default
 # rather than _TOKENS. AITER_BENCH_TOKENS overrides it like everywhere else.
@@ -2041,12 +2042,14 @@ DSV4_OPS = [
     # -m 16 -nk 2048,7168 --ck_preshuffle True passes the strided check with
     # the line untouched, and only adding --flydsl makes it crash.
     #
-    # Back in the sweep because _A8W8_BLOCKSCALE_TOKENS now starts at 1024,
-    # which keeps every shape clear of the M that reach those rows. Verified on
-    # 20260828, rocm/fw-bringup:gfx1250-atom--20260827-ubench: 36/36 cases,
-    # err=0 on all, 2207-7003 TFLOPS. That run also clears M=10240, the shape
-    # the earlier sweep faulted on -- more evidence that fault was cross-case
-    # state and not the shape.
+    # Back in the sweep because _A8W8_BLOCKSCALE_TOKENS now starts at 512,
+    # which keeps every shape clear of the problematic tiny-M ranges while
+    # retaining a real DSv4 decode batch. M=512 was verified above across all
+    # six (n,k). The previous 1024..65536 sweep was verified on 20260828,
+    # rocm/fw-bringup:gfx1250-atom--20260827-ubench: 36/36 cases, err=0 on all,
+    # 2207-7003 TFLOPS. That run also clears M=10240, the shape the earlier
+    # sweep faulted on -- more evidence that fault was cross-case state and not
+    # the shape.
     "a8w8_blockscale",
     "a16w16",
     "mla_v4_decode",
