@@ -107,7 +107,9 @@ def _production_quantize_f4f4(query, key, value, softmax_scale, fp6_p=True):
     return q_fp4, q_scale, k_fp4, k_scale, v_fp4, v_scale
 
 
-def _production_quantize_mxfp6(query, key, value, softmax_scale, mxfp4_v=False):
+def _production_quantize_mxfp6(
+    query, key, value, softmax_scale, mxfp4_v=False, fp6_p=False
+):
     q_fp6, q_scale = quantize_mxfp6_q(query, mha_v4_q_multiplier(softmax_scale))
     k_raw, k_scale_raw = quantize_mxfp6_k(key)
     batch, sequence, heads, _ = key.shape
@@ -116,7 +118,8 @@ def _production_quantize_mxfp6(query, key, value, softmax_scale, mxfp4_v=False):
         v_quantized, v_scale = quantize_v_fp8(value)
         return q_fp6, q_scale, k_fp6, k_scale, v_quantized, v_scale
 
-    v_raw, v_scale = quantize_v_mxfp4(value)
+    quantize_v = quantize_v_mxfp4_fp6_p if fp6_p else quantize_v_mxfp4
+    v_raw, v_scale = quantize_v(value)
     v_quantized = mxfp4_v_view(v_raw, v_scale, value.shape[1])
     return q_fp6, q_scale, k_fp6, k_scale, v_quantized, v_scale
 
@@ -429,7 +432,7 @@ def generate_test_tensors(
         )
         return q.to(dtype), k.to(dtype), v.to(dtype)
 
-    if distribution == "latesink":
+    if distribution == "latepeak":
         # ADVERSARIAL TRIPWIRE for the frozen-max rollback (added 2026-06-14 after the black-video
         # regression). Mirrors `underflow` but places the high-norm "attention sink" hotspot in the
         # LAST KV tile instead of the first. With a frozen-max rollback that seeds from tile 0, the
@@ -437,9 +440,9 @@ def generate_test_tensors(
         # saturates to 0xFFFFFFFF (NaN bits) -> corrupt P -> NaN/black. The exact (proper running
         # max) path is immune (S - m_new <= 0 always). Random transformer/normal/underflow never
         # produce a late-tile outlier, so this is the structured input cosine-on-random missed.
-        #   AITER_LATESINK_GAP : late-hotspot logit in nats (default 40.0 -> well past the cvt
+        #   AITER_LATEPEAK_GAP : late-peak logit in nats (default 40.0 -> well past the cvt
         #                        saturation at scale_log2e*(S-seed) > 128 for 1/sqrt(d) scaling)
-        gap = float(os.environ.get("AITER_LATESINK_GAP", "40.0"))
+        gap = float(os.environ.get("AITER_LATEPEAK_GAP", os.environ.get("AITER_LATESINK_GAP", "40.0")))
         scale = float(d_head) ** -0.5
         hot_keys = min(128, sk)  # one KV tile
         u = torch.randn((1, 1, 1, d_head), device=device, dtype=torch.float32)
@@ -1375,6 +1378,7 @@ def make_kernel_runner(
                 v_bshd,
                 softmax_scale,
                 mxfp4_v=is_f6f4,
+                fp6_p=is_f6f4 and block_lut is None,
             )
 
         v_format = AttentionFormat.MXFP4 if is_f6f4 else fp8_format
@@ -1394,6 +1398,11 @@ def make_kernel_runner(
                 AttentionFormat.MXFP6,
                 v_format,
                 *scale_modes,
+                v_pack=(
+                    AttentionPack.V_FOR_FP6_P
+                    if is_f6f4 and block_lut is None
+                    else AttentionPack.DEFAULT
+                ),
                 softmax_scale=softmax_scale,
             )
 
@@ -2213,13 +2222,13 @@ def parse_args() -> argparse.Namespace:
             "transformer",
             "sink",
             "underflow",
-            "latesink",
+            "latepeak",
             "maxstair",
         ],
         help=(
             "Distribution used for generated Q/K/V tensors. 'zero' sets all Q/K/V values "
             "to zero; 'sink' is a realistic "
-            "StreamingLLM attention sink pattern; 'underflow'/'latesink' are "
+            "StreamingLLM attention sink pattern; 'underflow'/'latepeak' are "
             "adversarial fp8 tile-skip / frozen-max rollback regression tripwires; "
             "'maxstair' raises the max every KV tile and triggers rollback for alternating "
             "query-row groups."

@@ -852,7 +852,7 @@ def _launch_mxfp4_coalesced_fake(
     del out
 
 
-@torch.library.custom_op("aiter::mha_v4_launch_mxfp6_v2", mutates_args=("out",))
+@torch.library.custom_op("aiter::mha_v4_launch_mxfp6_v3", mutates_args=("out",))
 def _launch_mxfp6(
     q: Tensor,
     q_descale: Tensor,
@@ -864,9 +864,11 @@ def _launch_mxfp6(
     sequence_k: int,
     heads: int,
     v_format: int,
+    v_pack: int,
     softmax_scale: float,
 ) -> None:
     resolved_v_format = AttentionFormat(v_format)
+    resolved_v_pack = AttentionPack(v_pack)
     k, k_descale = mxfp6_k_view(k_raw, k_descale_raw, q.shape[0], sequence_k, heads)
     v = (
         v_data
@@ -891,6 +893,7 @@ def _launch_mxfp6(
         *scale_modes,
         softmax_scale=softmax_scale,
         out=out,
+        v_pack=resolved_v_pack,
     )
 
 
@@ -906,10 +909,11 @@ def _launch_mxfp6_fake(
     sequence_k: int,
     heads: int,
     v_format: int,
+    v_pack: int,
     softmax_scale: float,
 ) -> None:
     del q, q_descale, k_raw, k_descale_raw, v_data, v_descale
-    del sequence_k, heads, v_format, softmax_scale
+    del sequence_k, heads, v_format, v_pack, softmax_scale
     del out
 
 
@@ -1132,6 +1136,9 @@ def mha_v4(
         k_quantized, k_descale = quantize_mxfp6_k(k)
         if _is_fp8_format(v_format):
             v_quantized, v_descale = quantize_v_fp8(v)
+        elif lut_indices is None:
+            v_quantized, v_descale = quantize_v_mxfp4_fp6_p(v)
+            v_pack = AttentionPack.V_FOR_FP6_P
         else:
             v_quantized, v_descale = quantize_v_mxfp4(v)
         if lut_indices is None:
@@ -1146,6 +1153,7 @@ def mha_v4(
                 k.shape[1],
                 k.shape[2],
                 int(v_format),
+                int(v_pack),
                 softmax_scale,
             )
             return out
@@ -1173,6 +1181,7 @@ def mha_v4(
             softmax_scale=softmax_scale,
             out=out,
             return_lse=return_lse,
+            v_pack=v_pack,
             **packed_lut,
         )
     else:
