@@ -13,7 +13,7 @@ Examples:
         benchmark --rows 32
     python op_tests/op_benchmarks/bench_flydsl_pa_mqa_fp4_prefill_topk.py \
         benchmark --rows 1 8 32 --c4-context-width 65536 196608 262144 \
-        --topk 512 1024 --parallel-unit-num 512 --score-batch-chunks 4
+        --topk 512 1024 --parallel-unit-num 512 --score-batch-chunks 16
     python op_tests/op_benchmarks/bench_flydsl_pa_mqa_fp4_prefill_topk.py \
         correctness --topk 512 1024
 
@@ -45,7 +45,7 @@ BLOCK_K = 256
 DEFAULT_TILE_TOKENS = 4096
 DEFAULT_C4_CONTEXT_WIDTHS = (65536, 196608, 262144)
 SUPPORTED_TOPK = (512, 1024)
-SUPPORTED_SCORE_BATCH_CHUNKS = (1, 2, 4)
+SUPPORTED_SCORE_BATCH_CHUNKS = (1, 2, 4, 8, 16)
 WEIGHT_SCALE = 1.25
 
 
@@ -836,7 +836,7 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
         "--score_batch_chunks",
         type=int,
         choices=SUPPORTED_SCORE_BATCH_CHUNKS,
-        default=4,
+        default=16,
         help="chunks retained per in-kernel fused TopK score batch",
     )
     parser.add_argument(

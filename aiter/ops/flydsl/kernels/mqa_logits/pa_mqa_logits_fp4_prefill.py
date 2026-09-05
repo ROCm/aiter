@@ -410,9 +410,7 @@ def _row_plan_torch(
             (~feasible).to(torch.int32).sum() + 1,
             max=s_max,
         )
-        safe = torch.where(feasible.any(), first_feasible_s, max_chunks).to(
-            torch.int32
-        )
+        safe = torch.where(feasible.any(), first_feasible_s, max_chunks).to(torch.int32)
 
     # ── per-row number of CTAs (chunk-splits); 0 for empty rows ──
     ctas_r = (chunks_per_row + (safe - 1)) // safe  # [T]
@@ -688,8 +686,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
             block_threads_k == TOPK_BLOCK_THREADS
         ), "streaming TopK requires the 256-thread/4-wave score body"
         assert score_batch_chunks in SUPPORTED_SCORE_BATCH_CHUNKS, (
-            "score_batch_chunks must be one of "
-            f"{SUPPORTED_SCORE_BATCH_CHUNKS}"
+            "score_batch_chunks must be one of " f"{SUPPORTED_SCORE_BATCH_CHUNKS}"
         )
         pool_capacity = candidate_topk + score_batch_chunks * block_k
         lds_bytes = _streaming_topk_lds_bytes(candidate_topk, score_batch_chunks)
@@ -1759,8 +1756,7 @@ def flydsl_pa_mqa_topk_fp4_prefill(
         raise ValueError("the fused TopK path requires kv_block_size=64")
     if score_batch_chunks not in SUPPORTED_SCORE_BATCH_CHUNKS:
         raise ValueError(
-            "score_batch_chunks must be one of "
-            f"{SUPPORTED_SCORE_BATCH_CHUNKS}"
+            "score_batch_chunks must be one of " f"{SUPPORTED_SCORE_BATCH_CHUNKS}"
         )
 
     if q_fp4.ndim != 3:
