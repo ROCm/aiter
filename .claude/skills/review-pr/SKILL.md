@@ -484,15 +484,14 @@ Examples of bad findings (too vague, no action verb):
 When a human reviewer catches something real that this skill missed:
 1. Add the rule body to **`rules.md`**, with a real PR example as evidence
 2. Add its id to the family in `triage.py` that the diff would trigger — a rule no
-   derivation emits is never read, and `tests/test_review_skill.py` fails on a rule id the
-   deriver can emit with no body in `rules.md`
+   derivation emits is never read, and `triage.py expand` fails on a rule id the deriver
+   can emit with no body in `rules.md`
 3. Commit with message: `review-pr: add R[N] from PR#[NNN] — [one line description]`
 
 The skill grows from real review history, not hypothetical patterns.
 
 **Nothing new goes in this file.** SKILL.md is budgeted at 500 lines and holds only the
-prose every review needs; `tests/test_review_skill.py` fails past it, and fails on any code
-fence over 30 lines. That budget exists because this file went 487 → 632 → 1372 lines in
+prose every review needs, with no code fence over 30 lines. That budget exists because this file went 487 → 632 → 1372 lines in
 under two months while its instruction content barely moved: at 1210 lines, 825 were shell
 and 299 were prose. Conditional content goes in `rules.md` and reaches the reviewer through
 `triage.py expand`; executable content goes in a script and gets called, like `fetch.sh`.
