@@ -1616,6 +1616,7 @@ class GemmCommonTuner(TunerCommon):
 
     def result_to_df(self, results):
         resultdf = pd.DataFrame(columns=self.columns)
+        rows = []
         for el in results:
             info, time, err_ratio = el
             keys, kernelId, splitK, kernelName = info
@@ -1646,11 +1647,14 @@ class GemmCommonTuner(TunerCommon):
                     "bw": [bw],
                 }
             )
-            temp = pd.DataFrame(key_dict)
-            if resultdf.empty:
-                resultdf = temp
-            else:
-                resultdf = pd.concat([resultdf, temp], ignore_index=True)
+            rows.append(key_dict)
+        # Build the frame once. Concatenating per row is O(n^2) in both time and
+        # allocation: with -o2 (profile of every candidate) a 42-shape x ~600
+        # candidate run spends hours here AFTER all GPU work is done.
+        if rows:
+            resultdf = pd.concat(
+                [pd.DataFrame(r) for r in rows], ignore_index=True
+            )
         return resultdf
 
     def result_to_csv(self, resultdf, file, concat=False):
