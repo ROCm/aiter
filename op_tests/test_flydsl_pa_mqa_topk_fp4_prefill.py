@@ -208,3 +208,204 @@ def test_finalizer_orders_long_rows_and_keeps_short_rows_sequential(
             rtol=0,
             atol=0,
         )
+
+
+def _make_empty_window_case(table_width: int):
+    device = torch.device("cuda")
+    rows = 2
+    max_seq_len = table_width * 64
+    starts = (
+        torch.tensor([0, 17], dtype=torch.int32, device=device)
+        if table_width
+        else torch.zeros(rows, dtype=torch.int32, device=device)
+    )
+    return (
+        torch.zeros((rows, 64, 64), dtype=torch.uint8, device=device),
+        torch.zeros((rows, 1, 4, 16, 4), dtype=torch.uint8, device=device),
+        torch.empty((0, 1, 4, 64, 16), dtype=torch.uint8, device=device),
+        torch.empty((0, 1, 4, 64), dtype=torch.uint8, device=device),
+        torch.full((1, table_width), -1, dtype=torch.int32, device=device),
+        torch.zeros((rows, 64), dtype=torch.bfloat16, device=device),
+        torch.zeros(rows, dtype=torch.int32, device=device),
+        starts,
+        starts.clone(),
+        max_seq_len,
+    )
+
+
+@requires_gfx950_flydsl
+@pytest.mark.parametrize("table_width", [0, 1])
+def test_empty_windows_never_dereference_invalid_pages(table_width: int) -> None:
+    from aiter.ops.flydsl import flydsl_pa_mqa_topk_fp4_prefill
+
+    case = _make_empty_window_case(table_width)
+    result = flydsl_pa_mqa_topk_fp4_prefill(
+        *case,
+        topk=512,
+        parallel_unit_num=case[0].shape[0],
+    )
+    torch.cuda.synchronize()
+
+    assert torch.count_nonzero(result.counts) == 0
+    assert torch.all(result.raw_indices == -1)
+    assert torch.all(result.physical_indices == -1)
+    assert torch.all(torch.isneginf(result.values))
+
+
+@requires_gfx950_flydsl
+def test_fused_topk_allocates_on_supplied_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import importlib
+
+    module = importlib.import_module(
+        "aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill"
+    )
+    case = _make_empty_window_case(1)
+    stream = torch.cuda.Stream(device=case[0].device)
+    original_allocate = module.allocate_fp4_prefill_topk_workspace
+    allocation_streams: list[int] = []
+
+    def checked_allocate(rows, parallel_unit_num, topk, device):
+        allocation_streams.append(torch.cuda.current_stream(device).cuda_stream)
+        return original_allocate(rows, parallel_unit_num, topk, device)
+
+    monkeypatch.setattr(
+        module,
+        "allocate_fp4_prefill_topk_workspace",
+        checked_allocate,
+    )
+    result = module.flydsl_pa_mqa_topk_fp4_prefill(
+        *case,
+        topk=512,
+        parallel_unit_num=case[0].shape[0],
+        stream=stream,
+    )
+    stream.synchronize()
+
+    assert allocation_streams == [stream.cuda_stream]
+    assert torch.count_nonzero(result.counts) == 0
+
+
+@requires_gfx950_flydsl
+def test_fused_topk_validates_stream_before_allocating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import importlib
+
+    module = importlib.import_module(
+        "aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill"
+    )
+    case = _make_empty_window_case(1)
+    allocated = False
+
+    def unexpected_allocate(*args, **kwargs):
+        nonlocal allocated
+        allocated = True
+        raise AssertionError("workspace allocation must follow stream validation")
+
+    class WrongDeviceStream:
+        device = torch.device("cuda", (case[0].device.index or 0) + 1)
+
+    monkeypatch.setattr(
+        module,
+        "allocate_fp4_prefill_topk_workspace",
+        unexpected_allocate,
+    )
+    with pytest.raises(ValueError, match="stream must belong"):
+        module.flydsl_pa_mqa_topk_fp4_prefill(
+            *case,
+            topk=512,
+            parallel_unit_num=case[0].shape[0],
+            stream=WrongDeviceStream(),
+        )
+    assert not allocated
+
+
+@requires_gfx950_flydsl
+def test_tiled_topk_validates_stream_before_allocating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import importlib
+
+    module = importlib.import_module("aiter.ops.flydsl.fp4_prefill_topk")
+    case = _make_empty_window_case(1)
+    allocated = False
+
+    def unexpected_allocate(*args, **kwargs):
+        nonlocal allocated
+        allocated = True
+        raise AssertionError("workspace allocation must follow stream validation")
+
+    class WrongDeviceStream:
+        device = torch.device("cuda", (case[0].device.index or 0) + 1)
+
+    monkeypatch.setattr(
+        module,
+        "allocate_fp4_prefill_topk_workspace",
+        unexpected_allocate,
+    )
+    with pytest.raises(ValueError, match="stream must belong"):
+        module.flydsl_pa_mqa_fp4_prefill_topk(
+            *case,
+            k=512,
+            stream=WrongDeviceStream(),
+        )
+    assert not allocated
+
+
+@requires_gfx950_flydsl
+def test_fused_topk_rejects_capture_before_allocating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import importlib
+
+    module = importlib.import_module(
+        "aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill"
+    )
+    case = _make_empty_window_case(1)
+    allocated = False
+
+    def unexpected_allocate(*args, **kwargs):
+        nonlocal allocated
+        allocated = True
+        raise AssertionError("capture rejection must precede workspace allocation")
+
+    monkeypatch.setattr(
+        module,
+        "allocate_fp4_prefill_topk_workspace",
+        unexpected_allocate,
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    with pytest.raises(RuntimeError, match="does not support.*graph capture"):
+        module.flydsl_pa_mqa_topk_fp4_prefill(
+            *case,
+            topk=512,
+            parallel_unit_num=case[0].shape[0],
+        )
+    assert not allocated
+
+
+@requires_gfx950_flydsl
+def test_schedule_rejects_noncontiguous_row_offsets() -> None:
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
+        compute_prefill_schedule,
+    )
+
+    rows = 2
+    device = torch.device("cuda")
+    metadata = torch.zeros(rows, dtype=torch.int32, device=device)
+    backing = torch.empty(2 * (rows + 1), dtype=torch.int32, device=device)
+    row_offsets = backing[::2]
+    assert not row_offsets.is_contiguous()
+
+    with pytest.raises(ValueError, match="contiguous"):
+        compute_prefill_schedule(
+            metadata,
+            metadata,
+            metadata,
+            256,
+            rows,
+            64,
+            row_offsets_out=row_offsets,
+        )

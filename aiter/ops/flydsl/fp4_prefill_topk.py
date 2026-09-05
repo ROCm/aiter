@@ -14,7 +14,6 @@ same tile or 2K merge width and is context-independent as well.
 
 from __future__ import annotations
 
-from contextlib import nullcontext
 from dataclasses import dataclass, fields
 from typing import NamedTuple
 
@@ -170,13 +169,13 @@ def _build_tile_metadata_kernel(
     win_end = tl.minimum(raw_end, tile_end)
     live = mask & (win_end > win_start)
 
-    # The score kernel assumes chunk_count >= 1 because it has a mandatory
-    # prologue/epilogue. Empty rows point at safe logical chunk zero and carry
-    # an empty window, so they execute no store and never touch an invalid page.
+    # The score kernel treats chunk_count == 0 as a block-uniform inactive CTA.
+    # This is stronger than a dummy chunk-zero access: empty requests may have
+    # no valid page-table entry to use as a dummy.
     first_chunk = win_start // BLOCK_K
     chunk_start = tl.where(live, first_chunk, 0)
     chunk_count = (win_end + BLOCK_K - 1) // BLOCK_K - first_chunk
-    chunk_count = tl.where(live, tl.maximum(chunk_count, 1), 1)
+    chunk_count = tl.where(live, tl.maximum(chunk_count, 1), 0)
     cta_base = row * INFO_WIDTH
     tl.store(cta_info + cta_base + 0, row, mask=mask)
     tl.store(cta_info + cta_base + 1, tl.where(live, batch, 0), mask=mask)
@@ -469,6 +468,21 @@ def _validate_workspace(
             )
 
 
+def _resolve_stream(
+    stream: torch.cuda.Stream | None,
+    device: torch.device,
+) -> torch.cuda.Stream:
+    if stream is None:
+        return torch.cuda.current_stream(device)
+    try:
+        stream_device = torch.device(stream.device)
+    except (AttributeError, TypeError) as exc:
+        raise TypeError("stream must be a torch.cuda.Stream") from exc
+    if stream_device != device:
+        raise ValueError("stream must belong to the FP4 input device")
+    return stream
+
+
 def _launch_grid(rows: int, width: int, block: int) -> tuple[int, int]:
     return rows, triton.cdiv(width, block)
 
@@ -634,17 +648,13 @@ def flydsl_pa_mqa_fp4_score_tile_topk(
             f"tile_start={tile_start} must be a non-negative multiple of "
             f"tile_tokens={tile_tokens}"
         )
-    if workspace is None:
-        workspace = allocate_fp4_prefill_topk_workspace(
-            q_fp4.shape[0], k, q_fp4.device, tile_tokens=tile_tokens
-        )
-    _validate_workspace(workspace, q_fp4.shape[0], k, tile_tokens, q_fp4.device)
-    if stream is None:
-        stream = torch.cuda.current_stream(q_fp4.device)
-        stream_context = nullcontext()
-    else:
-        stream_context = torch.cuda.stream(stream)
-    with stream_context:
+    stream = _resolve_stream(stream, q_fp4.device)
+    with torch.cuda.stream(stream):
+        if workspace is None:
+            workspace = allocate_fp4_prefill_topk_workspace(
+                q_fp4.shape[0], k, q_fp4.device, tile_tokens=tile_tokens
+            )
+        _validate_workspace(workspace, q_fp4.shape[0], k, tile_tokens, q_fp4.device)
         return _score_tile_topk_into(
             q_fp4,
             q_scale,
@@ -705,26 +715,21 @@ def flydsl_pa_mqa_fp4_prefill_topk(
     rows = q_fp4.shape[0]
     from aiter.ops.topk import top_k_per_row_prefill
 
-    if workspace is None:
-        workspace = allocate_fp4_prefill_topk_workspace(
-            rows, k, q_fp4.device, tile_tokens=tile_tokens
-        )
-    _validate_workspace(workspace, rows, k, tile_tokens, q_fp4.device)
-    if rows == 0:
-        return FP4PrefillTopKResult(
-            workspace.accum_values_a,
-            workspace.accum_raw_indices_a,
-            workspace.mapped_kv_indices,
-            workspace.accum_valid_counts,
-        )
+    stream = _resolve_stream(stream, q_fp4.device)
+    with torch.cuda.stream(stream):
+        if workspace is None:
+            workspace = allocate_fp4_prefill_topk_workspace(
+                rows, k, q_fp4.device, tile_tokens=tile_tokens
+            )
+        _validate_workspace(workspace, rows, k, tile_tokens, q_fp4.device)
+        if rows == 0:
+            return FP4PrefillTopKResult(
+                workspace.accum_values_a,
+                workspace.accum_raw_indices_a,
+                workspace.mapped_kv_indices,
+                workspace.accum_valid_counts,
+            )
 
-    if stream is None:
-        stream = torch.cuda.current_stream(q_fp4.device)
-        stream_context = nullcontext()
-    else:
-        stream_context = torch.cuda.stream(stream)
-
-    with stream_context:
         workspace.accum_valid_counts.zero_()
         workspace.accum_values_a.fill_(float("-inf"))
         workspace.accum_raw_indices_a.fill_(-1)
