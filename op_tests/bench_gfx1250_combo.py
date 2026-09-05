@@ -6,10 +6,11 @@ Imports the top-level @benchmark sweep fns from the aiter op_tests (which the
 aiter-op-test skill keeps importable for exactly this kind of combination
 testing) and runs each over its own shape axes.
 
-Output discipline: combo-owned pandas summaries are printed as record-oriented
-JSON. Existing child-UT summaries are extracted without changing those UTs. All
-the underlying noise (per-config "calling ..." logs, JIT build output, aiter
-import banners, pandas/torch/ROCTracer warnings, including C-level fd writes) is
+Output discipline: combo-owned summaries and AITER child-UT summaries are
+printed as record-oriented JSON. Child JSON is validated and forwarded without
+parsing human-readable tables. MORI EP keeps its external tool output. All the
+underlying noise (per-config "calling ..." logs, JIT build output, aiter import
+banners, pandas/torch/ROCTracer warnings, including C-level fd writes) is
 silenced via os-level fd redirection while the kernels run.
 
 Run from the aiter repo root so `op_tests/` siblings import cleanly:
@@ -301,7 +302,6 @@ def _silence():
 
 # Import aiter + the op-test modules quietly (import-time banners suppressed).
 with _silence():
-    import pandas as pd
     import test_f4gemm as gemm_mod
     import test_flydsl_grouped_gemm_gfx1250 as moe_mod
     import test_fmha_fwd_with_sink_asm as mha_mod  # has __main__ guard
@@ -318,6 +318,7 @@ with _silence():
         DATA_DISTS,
         E8M0_SCALE_DISTS,
         make_generator,
+        print_json_table,
         run_perftest,
     )
 
@@ -717,19 +718,7 @@ def _collect_smi_rows(lines):
 
 def _print_table(name, rows, keep=None):
     """Print one named DataFrame as a JSON object with record-oriented rows."""
-    df = pd.DataFrame([r for r in rows if r is not None])
-    if not df.empty:
-        # Drop columns that are entirely empty, then whitelist/order via `keep`.
-        # The @benchmark decorator dumps every call arg as a column, which makes
-        # the tables wide; `keep` trims to shape ids + perf. ALWAYS surface any
-        # err_msg / *err column so failures never get silently hidden.
-        df = df.replace("", pd.NA).dropna(axis=1, how="all")
-        if keep is not None:
-            cols = [c for c in keep if c in df.columns]
-            cols += [c for c in df.columns if "err_msg" in c and c not in cols]
-            df = df[cols]
-    records = json.loads(df.to_json(orient="records"))
-    print(json.dumps({"name": name, "rows": records}, indent=2), flush=True)
+    print_json_table(name, rows, keep=keep)
 
 
 # Compiler / logger / IR-dump chatter the child UTs interleave with results.
@@ -749,47 +738,31 @@ _NOISE = (
 )
 
 
-def _md_row(line):
-    """Markdown table row emitted by a child UT."""
-    return line.startswith("|")
-
-
 def _quiet(line):
     """Any non-empty line that is not compiler/logger noise."""
     return bool(line.strip()) and not any(n in line for n in _NOISE)
 
 
+def _json_tables(lines):
+    """Validated one-line JSON tables emitted by child UTs."""
+    tables = []
+    for line in lines:
+        try:
+            table = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (
+            isinstance(table, dict)
+            and isinstance(table.get("name"), str)
+            and isinstance(table.get("rows"), list)
+        ):
+            tables.append(json.dumps(table))
+    return tables
+
+
 def _lines(pred):
     """Adapt a per-line predicate into a block extractor."""
     return lambda lines: [ln for ln in lines if pred(ln)]
-
-
-def _md_tables(*labels):
-    """Keep the markdown tables, labelling each by the columns it carries.
-
-    A child UT often emits several tables in a row with different columns and
-    nothing saying which is which. `labels` is ((column, ...), title) pairs; the
-    first entry whose columns all appear in a header row names that table.
-    """
-
-    def extract(lines):
-        md = [ln for ln in lines if _md_row(ln)]
-        out = []
-        for i, line in enumerate(md):
-            is_header = i + 1 < len(md) and set(md[i + 1]) <= set("|-: ")
-            if is_header:
-                title = next(
-                    (t for cols, t in labels if all(c in line for c in cols)),
-                    None,
-                )
-                if title:
-                    out.append(f"\n----- {title} -----")
-                elif out:
-                    out.append("")
-            out.append(line)
-        return out
-
-    return extract
 
 
 def _isnum(field):
@@ -799,125 +772,6 @@ def _isnum(field):
     except ValueError:
         return False
     return True
-
-
-def _md_kernel_table(lines):
-    """Render a rank-major kernel table as markdown, keeping the summary lines.
-
-    mega_moe prints '[cfg] ...' / '# MEGA-MOE ...' lines around a space-aligned
-    'Name rank0 rank1 rank2 rank3 avg calls' table. Kernel names contain spaces
-    ("void at::native::reduce_kernel<512, 1, ...>"), so split from the right:
-    the column count is fixed even when the name is not.
-    """
-    out, rows, cols = [], [], None
-    seen = set()
-
-    def flush():
-        if cols and rows:
-            out.append(pd.DataFrame(rows, columns=cols).to_markdown(index=False))
-            rows.clear()
-
-    for line in lines:
-        if not _quiet(line):
-            continue
-        if line.startswith("Name") and "rank0" in line:
-            flush()
-            cols = line.rsplit(maxsplit=6)
-            continue
-        fields = line.rsplit(maxsplit=6)
-        if cols and len(fields) == 7 and all(_isnum(f) for f in fields[1:]):
-            rows.append(fields)
-            continue
-        flush()
-        # Non-table lines are kept for the "[cfg] ..." summary, but the child
-        # also emits "no grouped CSV config matched (...)" once per layer per
-        # rank -- hundreds of byte-identical lines around one table. Keep the
-        # first of each; a repeat carries nothing the first did not.
-        if line in seen:
-            continue
-        seen.add(line)
-        out.append(line)
-    flush()
-    return "\n".join(out).splitlines()
-
-
-def _md_from_pandas(marker, columns):
-    """Re-emit a pandas-printed block as markdown.
-
-    Some UTs print their result with DataFrame.__str__ (space aligned, leading
-    index column) right after a marker line, which reads nothing like the
-    markdown every other op produces.
-    """
-
-    def extract(lines):
-        for i, line in enumerate(lines):
-            if line.strip() != marker or i + 2 >= len(lines):
-                continue
-            values = lines[i + 2].split()[1 : len(columns) + 1]
-            if len(values) != len(columns):
-                continue
-            df = pd.DataFrame([values], columns=list(columns))
-            return df.to_markdown(index=False).splitlines()
-        return []
-
-    return extract
-
-
-def _space_table(header_col):
-    """Keep a UT's own aligned summary table, verbatim.
-
-    Anchors on the header row carrying `header_col` and takes the data rows that
-    follow, so the table survives the trace fragments and compiler warnings
-    interleaved before it.
-
-    Emitted as the UT formatted it rather than rebuilt as markdown: pandas
-    writes multi-word column names ("opus us", "asm TFLOPS"), so the header
-    splits into 33 words against 21 data fields and cannot be mapped back to
-    columns. A column name also appears in a UT's argument echo
-    ("total_tokens = 1024,"), so require the next line to look like data.
-
-    "Looks like data" counts numeric fields rather than testing the first one:
-    the sparse-prefill table leads with prec/mode (bf16, dense), so a
-    first-field test drops the whole table. An argument echo carries one
-    number, a data row carries most of a row of them.
-    """
-
-    def is_data(fields):
-        return sum(1 for f in fields if _isnum(f)) >= 4
-
-    def extract(lines):
-        for i, line in enumerate(lines):
-            if header_col not in line.split() or i + 1 >= len(lines):
-                continue
-            first = lines[i + 1].split()
-            if not first or not is_data(first):
-                continue
-            width = len(first)
-            out = [line]
-            for follower in lines[i + 1 :]:
-                fields = follower.split()
-                if len(fields) != width or not is_data(fields):
-                    break
-                out.append(follower)
-            return out
-        return []
-
-    return extract
-
-
-def _table_row(*headers):
-    """Whitespace-aligned table: the header line plus its numeric rows."""
-
-    def keep(line):
-        if not _quiet(line):
-            return False
-        if any(h in line for h in headers):
-            return True
-        # A data row starts with a bare number; "100% |####|" (pip) does not.
-        head = line.split(maxsplit=1)[0]
-        return head.strip("-").replace(",", "").replace(".", "").isdigit()
-
-    return keep
 
 
 def _gpu_trace_rows(lines):
@@ -961,21 +815,11 @@ def _kernel_digest(lines):
     for name, n, us in _gpu_trace_rows(lines):
         total[name] = total.get(name, 0.0) + us
         calls[name] = calls.get(name, 0.0) + n
-    if not total:
-        return []
     ranked = sorted(total, key=total.get, reverse=True)
-    table = pd.DataFrame(
-        [
-            {"kernel": k, "calls": round(calls[k]), "device us": round(total[k], 1)}
-            for k in ranked
-        ]
-    )
-    return ["", "----- kernels on GPU -----"] + table.to_markdown(
-        index=False
-    ).splitlines()
-
-
-_DEFAULT_EXTRACT = _md_tables()
+    return [
+        {"kernel": k, "calls": round(calls[k]), "device_us": round(total[k], 1)}
+        for k in ranked
+    ]
 
 
 _FAILURES = []
@@ -1032,7 +876,7 @@ def _pin_arch(env):
 
 
 def _run_child(name, cmd, cwd, env=None, extract=None, timeout=None, tail=30,
-               kernels=True, smi=True):
+               kernels=True, smi=True, structured=False):
     """Run a child UT with its output captured and surface only its results.
 
     Child UTs print their own progress, aiter INFO lines and (with FlyDSL) a
@@ -1040,7 +884,7 @@ def _run_child(name, cmd, cwd, env=None, extract=None, timeout=None, tail=30,
     it, echo what `extract` pulls out, and fall back to the tail of the output
     when the child fails or emits nothing recognisable.
     """
-    extract = extract or _DEFAULT_EXTRACT
+    extract = extract or _json_tables
     # Give every child invocation its combo-owned SMI case label. UTs remain
     # unaware of telemetry; the common perftest hook reads this environment.
     if smi and os.environ.get("AITER_SMI_MONITOR") == "1":
@@ -1060,6 +904,13 @@ def _run_child(name, cmd, cwd, env=None, extract=None, timeout=None, tail=30,
         )
     except subprocess.TimeoutExpired as exc:
         captured = exc.output or ""
+        if structured:
+            _print_table(name, [{
+                "err_msg": f"timed out after {timeout}s",
+                "output_tail": "\n".join(captured.splitlines()[-tail:]),
+            }])
+            _note_failure(name, f"timed out after {timeout}s")
+            return
         print(f"\n===== {name} =====", flush=True)
         print(f"--- timed out after {timeout}s, last {tail} lines ---")
         print("\n".join(captured.splitlines()[-tail:]), flush=True)
@@ -1071,7 +922,28 @@ def _run_child(name, cmd, cwd, env=None, extract=None, timeout=None, tail=30,
     # an annotation and must not stand in for a result table, or an extractor
     # that stops matching turns into a silent hole instead of a failure.
     results = extract(lines)
-    rows = list(results) + (_kernel_digest(lines) if kernels else [])
+    kernel_rows = _kernel_digest(lines) if kernels else []
+    if structured:
+        print("\n".join(results), flush=True)
+        if kernel_rows:
+            _print_table(f"{name} kernels", kernel_rows)
+        if proc.returncode != 0 or not results:
+            reason = (
+                f"child exited {proc.returncode}"
+                if proc.returncode != 0
+                else "no JSON result tables recognised"
+            )
+            _print_table(name, [{
+                "exit_code": proc.returncode,
+                "err_msg": reason,
+                "output_tail": "\n".join(lines[-tail:]),
+            }])
+        if proc.returncode != 0:
+            _note_failure(name, f"child exited {proc.returncode}")
+        elif not results:
+            _note_failure(name, "no JSON result tables recognised")
+        return
+    rows = list(results)
     print(f"\n===== {name} =====", flush=True)
     print("\n".join(rows) if rows else "(no result rows recognised)", flush=True)
     if proc.returncode != 0 or not results:
@@ -1294,6 +1166,8 @@ def run_a8w8_blockscale(args):
             ],
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             env=env,
+            extract=_json_tables,
+            structured=True,
         )
 
     init_pairs = _init_pairs(
@@ -1471,8 +1345,9 @@ def run_mega_moe(args):
             ],
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             env={**env, "AITER_FORCE_A8W4": force_a8w4},
-            extract=_md_kernel_table,
+            extract=_json_tables,
             kernels=False,
+            structured=True,
         )
 
 
@@ -1496,11 +1371,8 @@ def run_mhc(args):
                 str(args.seed),
             ],
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            extract=_md_tables(
-                (("hip_nofuse_us",), "mhc: fused vs unfused RMSNorm"),
-                (("unfused_us",), "mhc_post_pre"),
-                (("hip_us",), "mhc_head"),
-            ),
+            extract=_json_tables,
+            structured=True,
         )
 
     data_inits = args.data_init or ["norm"]
@@ -1548,10 +1420,8 @@ def run_qk_norm(args):
                 str(args.seed),
             ],
             cwd=repo_root,
-            extract=_md_tables(
-                (("quant_group_size",), "rope + quant"),
-                (("rows_written",), "fused SWA write"),
-            ),
+            extract=_json_tables,
+            structured=True,
         )
 
     if args.smi_monitor:
@@ -1599,10 +1469,8 @@ def run_score_qk(args):
                 str(args.seed),
             ],
             cwd=repo_root,
-            extract=_md_from_pandas(
-                "paged_mqa_logits:",
-                ("batch", "next_n", "heads", "index_dim", "avg_kv_len", "TFLOPS"),
-            ),
+            extract=_json_tables,
+            structured=True,
         )
 
 
@@ -1839,7 +1707,9 @@ def run_mla_v4_decode(args):
         rows,
         keep=_MLA_V4_COMPARE_KEEP,
     )
-    print("\n".join(_kernel_digest(box[0].splitlines())), flush=True)
+    kernel_rows = _kernel_digest(box[0].splitlines())
+    if kernel_rows:
+        _print_table("mla_v4 decode kernels", kernel_rows)
 
 
 def run_inverse_rope(args):
@@ -1868,6 +1738,8 @@ def run_inverse_rope(args):
                 str(args.seed),
             ],
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            extract=_json_tables,
+            structured=True,
         )
 
     data_inits = args.data_init or ["norm"]
@@ -1924,11 +1796,8 @@ def run_mla_v4_prefill(args):
                 *init_values,
             ],
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            # Not _table_row: the UT has no "latency_us" column (it prints
-            # "opus us"/"asm us"), so that predicate fell through to its
-            # starts-with-a-number rule, swallowed the profiler's kernel lines
-            # as data, and dropped the real header, which starts with "n".
-            extract=_space_table("total_pages"),
+            extract=_json_tables,
+            structured=True,
         )
 
     if args.smi_monitor:

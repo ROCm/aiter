@@ -4,7 +4,6 @@
 
 import argparse
 
-import pandas as pd
 import torch
 
 import aiter
@@ -16,6 +15,7 @@ from aiter.test_common import (
     checkAllclose,
     fill,
     make_generator,
+    print_json_table,
     run_perftest,
 )
 
@@ -1108,9 +1108,7 @@ for dtype in args.dtype:
                         seed=args.seed,
                     )
                     df.append(ret)
-df = pd.DataFrame(df)
-df_md = df.to_markdown(index=False)
-aiter.logger.info("mhc_pre summary (markdown):\n%s", df_md)
+print_json_table("mhc_pre summary", df)
 
 if not args.hc_head:
     df = []
@@ -1128,9 +1126,7 @@ if not args.hc_head:
                             seed=args.seed,
                         )
                         df.append(ret)
-    df = pd.DataFrame(df)
-    df_md = df.to_markdown(index=False)
-    aiter.logger.info("mhc_post summary (markdown):\n%s", df_md)
+    print_json_table("mhc_post summary", df)
 
     df = []
     for dtype in args.dtype:
@@ -1153,8 +1149,6 @@ if not args.hc_head:
                             continue
                         df.append(ret)
     if df:
-        df = pd.DataFrame(df)
-        df_md = df.to_markdown(index=False)
-        aiter.logger.info("mhc_post_pre summary (markdown):\n%s", df_md)
+        print_json_table("mhc_post_pre summary", df)
     else:
         aiter.logger.info("mhc_post_pre: all cases skipped")
