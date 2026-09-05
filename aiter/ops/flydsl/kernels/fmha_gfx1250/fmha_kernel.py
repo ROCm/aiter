@@ -1150,7 +1150,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
             # correct rows
             q_frags_raw = _phase4_q_load_flydsl(
                 lane_id,
-                arith.unwrap(q_rsrc),
+                rocdl.get_buffer_rsrc(q_rsrc),
                 stride_q_seq,
                 wave_id,
                 q_tile_offset_bytes=q_offset,

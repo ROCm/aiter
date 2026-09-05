@@ -622,6 +622,7 @@ def compile_mixed_moe_gemm1_common(
             x_nbytes_idx = (tokens_in * k_in * c_elem_bytes) // c_a_pack
             x_nbytes_i32 = arith.index_cast(T.i32, x_nbytes_idx)
             x_rsrc = ptr_buffer_resource(arg_x, x_nbytes_i32)
+            x_rsrc_raw = rocdl.get_buffer_rsrc(x_rsrc)
 
             shared_w_rsrc = ptr_buffer_resource(arg_shared_w, shared_w_nbytes)
 
@@ -1265,7 +1266,7 @@ def compile_mixed_moe_gemm1_common(
                             lds_ptr = llvm.inttoptr(lds_ptr_type, lds_ptr_i64)
 
                             rocdl.raw_ptr_buffer_load_lds(
-                                x_rsrc,
+                                x_rsrc_raw,
                                 lds_ptr,
                                 arith.constant(dma_bytes, type=T.i32),
                                 global_offset,
@@ -3786,6 +3787,7 @@ def compile_mixed_moe_gemm2_common(
             )
             x_nbytes_i32 = arith.index_cast(T.i32, x_nbytes_idx)
             x_rsrc = ptr_buffer_resource(arg_x, x_nbytes_i32)
+            x_rsrc_raw = rocdl.get_buffer_rsrc(x_rsrc)
 
             w_rsrc = ptr_buffer_resource(arg_w, w_nbytes)
             shared_w_rsrc = ptr_buffer_resource(arg_shared_w, shared_w_nbytes)
@@ -3814,6 +3816,8 @@ def compile_mixed_moe_gemm2_common(
                 )
             out_nbytes_i32 = arith.index_cast(T.i32, out_nbytes_idx)
             out_rsrc = ptr_buffer_resource(arg_out, out_nbytes_i32)
+            # Raw !llvm.ptr<8> V# for the raw_ptr_buffer_atomic_fadd epilogues.
+            out_rsrc_raw = rocdl.get_buffer_rsrc(out_rsrc)
 
             numids_rsrc = ptr_buffer_resource(
                 arg_num_valid_ids, arith.constant(4, type=T.i32)
@@ -4494,7 +4498,7 @@ def compile_mixed_moe_gemm2_common(
                             lds_ptr = llvm.inttoptr(lds_ptr_type, lds_ptr_i64)
 
                             rocdl.raw_ptr_buffer_load_lds(
-                                x_rsrc,
+                                x_rsrc_raw,
                                 lds_ptr,
                                 arith.constant(dma_bytes, type=T.i32),
                                 global_offset,
@@ -5116,7 +5120,7 @@ def compile_mixed_moe_gemm2_common(
                 def atomic_add_f16x2(val_f16x2, byte_off_i32):
                     rocdl.raw_ptr_buffer_atomic_fadd(
                         val_f16x2,
-                        out_rsrc,
+                        out_rsrc_raw,
                         byte_off_i32,
                         zero_i32,
                         zero_i32,
@@ -5314,7 +5318,7 @@ def compile_mixed_moe_gemm2_common(
                         byte_off_i32 = row_byte_off_i32 + col_byte_off_i32
                         rocdl.raw_ptr_buffer_atomic_fadd(
                             frag,
-                            out_rsrc,
+                            out_rsrc_raw,
                             byte_off_i32,
                             zero_i32,
                             zero_i32,
