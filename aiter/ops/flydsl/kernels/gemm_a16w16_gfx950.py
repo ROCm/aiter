@@ -11,7 +11,6 @@ import torch
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.runtime.device import get_rocm_arch
 
-from .common import run_cached
 from .gemm_a16w16_gfx950_utils import (
     GFX950_DMA_BYTES,
     GFX950_WAVE_SIZE,
@@ -25,6 +24,7 @@ from .gemm_a16w16_gfx950_utils import (
     transposed_contiguous_idx,
     wait_vmcnt_and_barrier,
 )
+from .kernels_common import run_cached
 
 GEMM_A16W16_DTYPE_FP32 = 1
 GEMM_A16W16_DTYPE_BF16 = 2
