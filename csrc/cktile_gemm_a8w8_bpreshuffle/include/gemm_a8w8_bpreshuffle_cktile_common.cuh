@@ -329,7 +329,7 @@ using CustomConfig = CreateTileConfig<sTransposeC,
 // does not expose that member; without the alias the detection silently
 // defaults to false and the kernel reads shuffled B as if it were plain
 // (measured: ~39% of elements wrong). The alias is being added upstream in
-// ROCm/composable_kernel#3772; drop this wrapper once AITER's pinned CK
+// ROCm/rocm-libraries#11721; drop this wrapper once AITER's pinned CK
 // carries it and use the pipeline directly.
 // ---------------------------------------------------------------------------
 template <typename Problem>
