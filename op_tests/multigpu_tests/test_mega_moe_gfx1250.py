@@ -57,7 +57,7 @@ from aiter import (
 from aiter.fused_moe import fused_moe
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.shuffle import moe_shuffle_scale, shuffle_weight
-from aiter.test_common import add_data_init_args, fill, make_generator
+from aiter.test_common import add_data_init_args, fill, make_generator, print_json_table
 from aiter.utility import fp4_utils
 
 try:
@@ -861,7 +861,7 @@ def _run_distributed_smi_replay(pipe, dist_ctx, median_us, n_layers):
 def _aggregate_prof_table(prof, dist_ctx, per_layer_denom=1.0, row_limit=200):
     """Collect the torch.profiler per-kernel table ACROSS ranks (collective; call
     on every rank). Each rank contributes {name: (self_device_us_total, count)};
-    rank 0 returns a table of each kernel's per-call self device time with ONE
+    rank 0 returns rows with each kernel's per-call self device time with ONE
     COLUMN PER RANK plus the cross-rank mean, so a straggler (a throttled GPU, an
     unbalanced expert distribution) shows up as a row that disagrees across
     columns instead of being averaged away. `-` means the kernel never ran there.
@@ -895,31 +895,24 @@ def _aggregate_prof_table(prof, dist_ctx, per_layer_denom=1.0, row_limit=200):
         rows.append((avg_self, name, per_call, pc_avg, avg_count))
     rows.sort(key=lambda r: (-r[0], r[1]))
     dev_per_layer = total_self / per_layer_denom if per_layer_denom else 0.0
-    # Wide enough for a full TDM GEMM name, whose tile/warp/buffer recipe and its
-    # `_epscatter` / `_prefetch` suffix are the whole point of reading this table
-    # (e.g. a8w4_tdm_fp4_t256x256x256_w2x2_b3_K3072_e96_cn4_prefetch_epscatter).
-    name_w = 72
-    lines = [
-        (
-            f"# per-call self device time (us) by rank, {world} ranks "
-            f"(rows sorted by total self time):"
-        ),
-        f"{'Name':<{name_w}}"
-        + "".join(f"{f'rank{r}':>11}" for r in range(world))
-        + f"{'avg':>11}{'calls':>8}",
-    ]
-    for avg_self, name, per_call, pc_avg, avg_count in rows[:row_limit]:
-        cells = "".join(
-            f"{v:>11.3f}" if v is not None else f"{'-':>11}" for v in per_call
-        )
-        lines.append(
-            f"{name[:name_w]:<{name_w}}{cells}{pc_avg:>11.3f}{avg_count:>8.1f}"
-        )
-    lines.append(
-        f"# TOTAL self device time over ALL {len(rows)} kernels = {total_self:.1f} us "
-        f"-> {dev_per_layer:.1f} us/layer (device-busy; compare to per_layer wall)"
-    )
-    return "\n".join(lines)
+    table_rows = []
+    for _avg_self, name, per_call, pc_avg, avg_count in rows[:row_limit]:
+        row = {
+            "kernel": name,
+            "avg_us": pc_avg,
+            "calls": avg_count,
+        }
+        row.update({f"rank{rank}_us": value for rank, value in enumerate(per_call)})
+        table_rows.append(row)
+    return {
+        "rows": table_rows,
+        "summary": [{
+            "world_size": world,
+            "profiled_kernels": len(rows),
+            "total_self_device_us": total_self,
+            "device_us_per_layer": dev_per_layer,
+        }],
+    }
 
 
 def _device_shared_ffn(tokens, sw1, sw2):
@@ -1056,22 +1049,33 @@ def main():
                 if dist_ctx.rank == 0:
                     print(f"# trace export failed: {_e}", flush=True)
     if dist_ctx.rank == 0:
-        prof_note = (
-            f"prof_device={prof_us:.1f}us"
-            if prof_us > 0
-            else "prof_device=n/a (this ROCm torch.profiler emits no device time)"
-        )
-        print(
-            f"# MEGA-MOE layers={n_layers} tokens/rank={ct}: "
-            f"median={stats['median']:.1f} us per_layer={per_layer_us:.1f} us "
-            f"(min={stats['min']:.1f} mean={stats['mean']:.1f} max={stats['max']:.1f} us "
-            f"over {args.iters} timed replays after {args.warmup} warmup, avg over "
-            f"{dist_ctx.world} ranks; dispatch+gemm+combine, 1 replay = {n_layers} layers) "
-            f"{prof_note}",
-            flush=True,
+        print_json_table(
+            "mega_moe summary",
+            [{
+                "quant_type": args.quant_type,
+                "combine": args.combine,
+                "data_init": data_dist,
+                "seed": args.seed,
+                "world_size": dist_ctx.world,
+                "tokens_per_rank": ct,
+                "experts": E,
+                "topk": topk,
+                "hidden": hdim,
+                "intermediate": idim,
+                "layers": n_layers,
+                "warmup": args.warmup,
+                "iters": args.iters,
+                "min_us": stats["min"],
+                "mean_us": stats["mean"],
+                "median_us": stats["median"],
+                "max_us": stats["max"],
+                "per_layer_us": per_layer_us,
+                "prof_device_us": prof_us if prof_us > 0 else None,
+            }],
         )
         if tbl is not None:
-            print(tbl, flush=True)
+            print_json_table("mega_moe kernel profile", tbl["rows"])
+            print_json_table("mega_moe kernel profile summary", tbl["summary"])
 
     # ---- accuracy (isolated CPU/fp32 reference): end-to-end accumulated compare.
     accuracy_failure = None

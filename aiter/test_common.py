@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import copy
+import json
 import multiprocessing as mp
 import os
 
@@ -19,6 +20,30 @@ _SMI_LABEL_COUNTS = {}
 # pd.set_option("display.width", None)
 # pd.set_option("display.max_colwidth", None)
 # pd.set_option("display.expand_frame_repr", False)
+
+
+def print_json_table(name, rows, keep=None):
+    """Print benchmark rows as one record-oriented JSON object.
+
+    A single-line object is intentional: parent benchmark drivers can validate
+    and forward it without parsing pandas' human-readable table formats.
+    """
+    if isinstance(rows, pd.DataFrame):
+        df = rows.copy()
+    else:
+        df = pd.DataFrame([row for row in rows if row is not None])
+    if not df.empty:
+        df = df.replace("", pd.NA).dropna(axis=1, how="all")
+        if keep is not None:
+            cols = [column for column in keep if column in df.columns]
+            cols += [
+                column
+                for column in df.columns
+                if "err_msg" in column and column not in cols
+            ]
+            df = df[cols]
+    records = json.loads(df.to_json(orient="records"))
+    print(json.dumps({"name": name, "rows": records}), flush=True)
 
 
 def ensure_spawn_method():

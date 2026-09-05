@@ -3,6 +3,10 @@
 # ruff: noqa: BLE001, PYI034, S110, UP035, UP037
 """AMD GPU metrics monitor using amdsmi.
 
+ROCm ships the binding without a setup.py. Make it importable with::
+
+    export PYTHONPATH=/opt/rocm/share/amd_smi${PYTHONPATH:+:$PYTHONPATH}
+
 Usage (context manager):
     with GpuMonitor(device_index=0, interval_s=0.05) as mon:
         run_workload()

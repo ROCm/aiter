@@ -15,7 +15,13 @@ from aiter.ops.triton.attention.pa_mqa_logits import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
-from aiter.test_common import DATA_DISTS, fill, make_generator, run_perftest
+from aiter.test_common import (
+    DATA_DISTS,
+    fill,
+    make_generator,
+    print_json_table,
+    run_perftest,
+)
 
 
 def cdiv(x: int, y: int) -> int:
@@ -192,6 +198,7 @@ def create_paged_mqa_logits_configs(args: argparse.Namespace):
 def run_benchmark(args: argparse.Namespace, data_init: str = "norm"):
     ChunkK = 128
     WavePerEU = 5
+    rows = []
 
     @triton.testing.perf_report(create_paged_mqa_logits_configs(args))
     def test_deepgemm_fp8_paged_mqa_logits(
@@ -418,9 +425,26 @@ def run_benchmark(args: argparse.Namespace, data_init: str = "norm"):
 
             os.system("zip -r paged_mqa_logits_aot_kernel paged_mqa_logits")
 
+        rows.append(
+            {
+                "data_init": data_init,
+                "seed": args.seed,
+                "batch": batch_size,
+                "next_n": next_n,
+                "heads": heads,
+                "index_dim": index_dim,
+                "avg_kv_len": avg_kv_length,
+                "kv_storage": kv_storage_kind,
+                "blocksize": blocksize,
+                "latency_us": elapsed_us,
+                "TFLOPS": flops,
+                "logits_diff": float(logits_diff),
+            }
+        )
         return flops
 
-    test_deepgemm_fp8_paged_mqa_logits.run(print_data=True)
+    test_deepgemm_fp8_paged_mqa_logits.run(print_data=False)
+    print_json_table("paged_mqa_logits summary", rows)
 
 
 if __name__ == "__main__":
