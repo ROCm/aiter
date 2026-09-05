@@ -14,17 +14,9 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 
 
 def get_default_shapes() -> list[list[int]]:
-    return [
-        [1, 4],
-        [1, 32],
-        [1, 64],
-        [2, 32],
-        [128, 32],
-        [128, 64],
-        [256, 32],
-        [4096, 4096],
-        [4096, 8192],
-    ]
+    M = [8, 32, 256, 8192, 16384]
+    N = [3072, 7168]
+    return [[m, n] for m in M for n in N]
 
 
 def model_benchmark_shapes(args) -> list[tuple[str, int, int]]:
@@ -102,7 +94,7 @@ def run_benchmark(args):
         def fn():
             quant_fn(x)
 
-        ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+        ms = triton.testing.do_bench_cudagraph(fn, rep=100)
 
         # Read x and write quantized output + block scales.
         x_bytes = x.numel() * x.element_size()
