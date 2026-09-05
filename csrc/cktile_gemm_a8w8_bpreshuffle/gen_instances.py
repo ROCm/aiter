@@ -237,10 +237,13 @@ template torch::Tensor
         else:
             LOOKUP_template = """
        {{{MNK},                                                                                                       \\
-        RowwiseDispatchEntry{{{kernel_name}<DTYPE, ETYPE>, {supports_m_padding}}}}},                                  \\"""
+        RowwiseDispatchEntry{{{kernel_name}<DTYPE, ETYPE>, {supports_m_padding}, {supports_k_padding}}}}},            \\"""
 
             def extra_format_args(kernel):
-                return {"supports_m_padding": str(kernel.supports_m_padding).lower()}
+                return {
+                    "supports_m_padding": str(kernel.supports_m_padding).lower(),
+                    "supports_k_padding": str(kernel.supports_k_padding).lower(),
+                }
 
         LOOKUP_end = """
    }

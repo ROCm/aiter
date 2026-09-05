@@ -74,6 +74,10 @@ class kernelInstance:
         return self.sPipeline == DEFAULT_PIPELINE
 
     @property
+    def supports_k_padding(self) -> bool:
+        return self.sPipeline == DEFAULT_PIPELINE
+
+    @property
     def name(self) -> str:
         parts = [
             "a8w8_bpreshuffle_cktile",

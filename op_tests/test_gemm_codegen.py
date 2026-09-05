@@ -687,21 +687,25 @@ def test_write_lookup_header():
     from chip_info import write_lookup_header
 
     class _FakeKernel:
-        def __init__(self, name, supports_m_padding=True):
+        def __init__(self, name, supports_m_padding=True, supports_k_padding=True):
             self.name = name
             self.supports_m_padding = supports_m_padding
+            self.supports_k_padding = supports_k_padding
 
     kernels_dict = {
         ("gfx942", 304, 128, 4096, 4096): _FakeKernel("kernel_non_batched"),
         ("gfx942", 304, 2, 128, 4096, 4096): _FakeKernel(
-            "kernel_batched", supports_m_padding=False
+            "kernel_batched",
+            supports_m_padding=False,
+            supports_k_padding=False,
         ),
         -1: _FakeKernel("default_kernel"),  # default_dict entry — must be skipped
     }
 
     LOOKUP_head = "#ifdef USE_ROCM\n#define GENERATE_LOOKUP_TABLE(DTYPE, ETYPE) {\\\n"
     LOOKUP_template = (
-        "   {{{MNK}, {{{kernel_name}<DTYPE, ETYPE>, {supports_m_padding}}}}},\\\n"
+        "   {{{MNK}, {{{kernel_name}<DTYPE, ETYPE>, {supports_m_padding}, "
+        "{supports_k_padding}}}}},\\\n"
     )
     LOOKUP_end = "}\n#endif\n"
 
@@ -720,7 +724,8 @@ def test_write_lookup_header():
             LOOKUP_template,
             LOOKUP_end,
             extra_format_args=lambda kernel: {
-                "supports_m_padding": str(kernel.supports_m_padding).lower()
+                "supports_m_padding": str(kernel.supports_m_padding).lower(),
+                "supports_k_padding": str(kernel.supports_k_padding).lower(),
             },
         )
         with open(path) as fh:
@@ -743,7 +748,7 @@ def test_write_lookup_header():
         )
         _check(
             "per-kernel metadata is emitted in the lookup value",
-            "{kernel_batched<DTYPE, ETYPE>, false}" in content,
+            "{kernel_batched<DTYPE, ETYPE>, false, false}" in content,
             f"padding metadata not found in output:\n{content}",
         )
         _check(
