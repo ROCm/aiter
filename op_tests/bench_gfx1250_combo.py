@@ -84,6 +84,8 @@ Other variables:
 Optional GPU telemetry replays each already-prepared benchmark case in its own
 sampling window, after its normal latency measurement:
 
+    # ROCm ships the binding here without a setup.py; make it importable first.
+    export PYTHONPATH=/opt/rocm/share/amd_smi${PYTHONPATH:+:$PYTHONPATH}
     python op_tests/bench_gfx1250_combo.py --dsv4 \
       --smi-monitor --smi-device 0 --smi-interval 0.05 --smi-duration 1.0
 
