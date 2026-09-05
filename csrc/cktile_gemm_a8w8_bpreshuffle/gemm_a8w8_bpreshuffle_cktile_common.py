@@ -469,6 +469,7 @@ default_kernels_dict_950 = {
 
 # fmt: on
 
+
 def append_expanded(base_expanded, extra):
     """Append BlockPerCu-expanded `extra` after `base_expanded`, renumbering
     only the appended entries.
