@@ -601,6 +601,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
         weights_ptr: fx.Tensor,
         cta_info_ptr: fx.Tensor,  # [n_ctas, 6] i32
         stride_out_row: Int32,
+        output_token_base: Int32,
         weight_scale: fx.Float32,
     ):
         tid = gpu.thread_idx.x
@@ -1106,9 +1107,12 @@ def build_pa_mqa_logits_fp4_prefill_module(
             # `weight_scale` already folded into `w_per_lane` (hoisted, once/wave).
 
             # Only [local_start, local_end) is written (one writer lane per token);
-            # the rest stays at the caller's -inf pre-fill. Sparse 1-writer
-            # scatter: guard the plain store instead of a V# OOB sentinel. Row base
-            # is folded into out_base, so the store offset is the token index.
+            # the rest stays at the caller's -inf pre-fill. output_token_base is
+            # normally zero. The bounded score+top-k operator sets it to its
+            # aligned tile start, allowing this same score kernel to target a
+            # fixed [rows, tile_tokens] buffer instead of context-sized logits.
+            # Sparse 1-writer scatter: guard the plain store instead of a V# OOB
+            # sentinel. Row base is folded into out_base.
             is_writer = lane_div_16 < fx.Int32(1)
             out_token = token_base + lane_mod_16
             in_window = (out_token >= local_start) & (out_token < local_end)
@@ -1147,7 +1151,10 @@ def build_pa_mqa_logits_fp4_prefill_module(
                 _guarded_candidate_write()
             else:
                 if should_write:
-                    fx.ptr_store(thread_sum, fx.add_offset(out_base, out_token))
+                    fx.ptr_store(
+                        thread_sum,
+                        fx.add_offset(out_base, out_token - output_token_base),
+                    )
 
         def _compute_chunk(kv_list_in, kvs_packed_list_in, c_i32_arg, nt0_accs_in=None):
             assert (
@@ -1314,6 +1321,7 @@ def compile_pa_mqa_logits_fp4_prefill(
         w,
         cta_info_,
         stride_out: fx.Int32,
+        output_token_base: fx.Int32,
         weight_scale: fx.Float32,
         gx: fx.Int32,
         stream: fx.Stream,
@@ -1332,6 +1340,7 @@ def compile_pa_mqa_logits_fp4_prefill(
             w,
             cta_info_,
             stride_out,
+            output_token_base,
             weight_scale,
         ).launch(
             grid=(gxi,), block=(block_threads, 1, 1), stream=stream
@@ -1395,6 +1404,7 @@ def compile_pa_mqa_logits_fp4_prefill_topk(
             w,
             cta_info_,
             fx.Int32(0),
+            fx.Int32(0),
             weight_scale,
         ).launch(
             grid=(gxi,),
@@ -1425,9 +1435,15 @@ def flydsl_pa_mqa_logits_fp4_prefill(
     out: torch.Tensor | None = None,
     cta_info: torch.Tensor | None = None,
     n_ctas: int | None = None,
+    output_token_base: int = 0,
     stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
-    """Ragged-prefill FP4 paged MQA logits (gfx950)."""
+    """Ragged-prefill FP4 paged MQA logits (gfx950).
+
+    ``output_token_base`` is an internal tiling hook: logical token ``j`` is
+    stored at output column ``j - output_token_base``. Public full-logit calls
+    leave it at zero.
+    """
     total_tokens, heads, head_dim_packed = q_fp4.shape
     head_dim = head_dim_packed * 2
     max_blocks_per_seq = block_tables.shape[1]
@@ -1477,6 +1493,7 @@ def flydsl_pa_mqa_logits_fp4_prefill(
         weights,
         cta_info,
         out.stride(0),
+        output_token_base,
         float(weight_scale),
         n_ctas,
         stream,
@@ -1680,6 +1697,11 @@ def flydsl_pa_mqa_logits_fp4_prefill_topk(
         stream=stream,
     )
     return out
+
+
+# Canonical public spelling.  Keep the logits-prefixed spelling as a
+# compatibility alias for the original prototype branch.
+flydsl_pa_mqa_topk_fp4_prefill = flydsl_pa_mqa_logits_fp4_prefill_topk
 
 
 @triton.jit
