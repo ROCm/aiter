@@ -531,7 +531,12 @@ def render_guard_changes(res):
     return "\n".join(out)
 
 
-REFUTATION = re.compile(r"^\s*(RED|WARN|NOTE)\s+(SURVIVED|KILLED)\s*(?:--|—|:)\s*(.+)$")
+# A parenthetical between the verb and the dashes is how a reviewer says the claim was
+# narrowed rather than dropped -- `WARN SURVIVED (severity reduced) -- ...`. Rejecting it
+# as MALFORMED taught two reviews to re-encode the same fact as prose, which is a worse
+# record of what happened.
+REFUTATION = re.compile(
+    r"^\s*(RED|WARN|NOTE)\s+(SURVIVED|KILLED)\s*(\([^)]{0,60}\))?\s*(?:--|—|:)\s*(.+)$")
 REFUTE_SURFACE = re.compile(
     r"^(i )?(re-?)?(checked|verified|confirmed|reviewed|looked)\b.{0,40}$", re.I)
 
@@ -570,7 +575,7 @@ def audit_refutations(text, diff_text, card_text):
                              "expected `RED|WARN|NOTE SURVIVED|KILLED -- what was checked "
                              "and why it did or did not die`"))
             continue
-        sev, outcome, why = m.groups()
+        sev, outcome, _note, why = m.groups()
         rows.append((sev, outcome, why))
         if len(why.strip()) < MIN_CORE_REASON or REFUTE_SURFACE.match(why.strip()):
             problems.append(("NO-ATTEMPT", why.strip()[:70],
@@ -580,7 +585,8 @@ def audit_refutations(text, diff_text, card_text):
         cited = [c for c, _ in CITATION.findall(why)]
         tokens = set(re.findall(r"\b\w+\b", why))
         if not cited and not (tokens & changed_tokens(diff_text)) \
-                and not re.search(r"`[^`]+`|\bgit \w+|\bgrep\b|\bpytest\b", why):
+                and not WORK_ARTIFACT.search(why) \
+                and not re.search(r"`[^`]+`|\bgit \w+|\bgrep\b|\bpytest\b|\b\w+/\w+", why):
             problems.append(("UNSOURCED", why.strip()[:70],
                              "no file, symbol or command -- say what you opened"))
     survived = [r for r in rows if r[1] == "SURVIVED"]
@@ -1154,7 +1160,7 @@ def expected_rules(rules_text):
 # boundary, `gemm_a8w8_blockscale_cktile_common.cuh` matched as `...common.cu`, a file the
 # PR changes read as one it does not. `=` belongs in the class because tuned-config names
 # carry it -- `gfx1201-GEMM-A8W8_BLOCKSCALE-N=1024-K=1024.json` matched as `1024.json`.
-CITATION = re.compile(r"([\w./=-]+\.(?:cuh|hpp|yaml|yml|json|csv|cpp|hip|py|cu|cc|h|md|sh))"
+CITATION = re.compile(r"([\w./=-]+\.(?:cuh|hpp|yaml|yml|json|csv|cpp|hip|py|cu|cc|co|h|md|sh))"
                       r"(?![\w])(?::(\d+))?")
 
 
@@ -1186,7 +1192,8 @@ def check_citations(verdicts_text, diff_text):
         rule, verdict, reason = m.groups()
         if verdict != "FIRE":
             continue
-        paths = [p for p, _ in CITATION.findall(reason)]
+        paths = [p for p, _ in CITATION.findall(reason)
+                 if not WORK_ARTIFACT.search(p)]
         if not paths:
             continue
         # Same anchor rule as the card gate, and for the same reason. E4's own body tells
@@ -1766,8 +1773,21 @@ def pinned_struct_churn(diff_text, root):
 TIER1 = ("aiter/jit/core.py", "aiter/__init__.py")
 TIER2 = tuple(p for p in TIER if p not in TIER1)
 
+# $WORK artifacts are evidence, not citations of tree files. P6 is by construction about
+# the absence of a measurement, so validation_requirement.json IS where its evidence
+# lives; naming it tripped UNTOUCHED-CITATION on four PRs in one wave and the reviews had
+# to reword the line to cite source files instead, which made the ledger less accurate
+# about where the evidence actually was. SKILL.md tells the reader to ground verdicts in
+# these files; the gate must not then punish saying so.
+WORK_ARTIFACT = re.compile(r"(?:\$WORK/|\b)(?:rules_expanded|evidence|symbols|twins|"
+                           r"test_quality|ci_coverage|perf_claims|struct_abi|comment_only|"
+                           r"guards|siblings|kernel_tests|applies|pr_meta|rules|"
+                           r"validation_requirement|auto_validation_outcome)\.(?:txt|json)\b")
+
 CORE_LINE = re.compile(
-    r"^\s*([\w./+-]+)\s+TIER([123])\s+(COVERED|GAP|N/A)\s*(?:--|—|:)\s*(.+?)\s*$")
+    # `=` belongs here: gfx950-GEMM-A16W16-N=384-K=7168.json could not be written into
+    # core_files.txt at all, and the review deleted the line to get past the gate.
+    r"^\s*([\w./+=-]+)\s+TIER([123])\s+(COVERED|GAP|N/A)\s*(?:--|—|:)\s*(.+?)\s*$")
 MIN_CORE_REASON = 30
 # `\b` before a path fragment is useless (`/` is a non-word char), so anchors are matched
 # as substrings after normalising `./` -- the reason is prose, not a parseable field.
@@ -1942,17 +1962,16 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
         for rule, paths in fire_paths.items():
             if paths and any(pp in text for pp in paths):
                 claims.setdefault(rule, []).append(text[:40])
-    # One finding cannot report three rules just by naming the file all three cited.
-    # aiter#2478 adjudicated D1, P6 and E4 FIRE and every verdict cited aiter/fused_moe.py,
-    # so any single sentence mentioning that path claimed all three. Where N fired rules
-    # share a path, N distinct findings have to mention it before they are all accounted
-    # for; the rule id, when the card carries one, still claims outright.
-    by_path = {}
-    for rule, paths in fire_paths.items():
-        by_path.setdefault(tuple(sorted(paths)), []).append(rule)
-    for _paths, rules in by_path.items():
-        got = {f for r in rules for f in claims.get(r, [])}
-        for rule in sorted(rules)[:len(got)]:
+    # A finding may report more than one rule, and often should: aiter#3165 fired B4 and
+    # E5 on the same changed file and one accurate bullet covered both. Requiring N
+    # distinct bullets for N rules sharing a path -- which is what this did -- forced the
+    # review to annotate E5 `-- not reported: as a separate bullet`, a sentence that was
+    # false on its face, since E5 was on the card inside the B4 bullet. Making a reviewer
+    # write something untrue to satisfy a gate is worse than the freeloading it prevents,
+    # and the freeloading is visible anyway: a card with one bullet and nine FIREs reads
+    # as one bullet and nine FIREs.
+    for rule, texts in claims.items():
+        if texts:
             reported.add(rule)
     for rule, why in sorted(fired.items()):
         if rule not in reported:
@@ -1966,7 +1985,7 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
             # `torch.cu` and `x.contiguous.cuda()` as `x.contiguous.cu`. Those are the
             # two most ordinary words in a HIP review, so the gate produced a citation
             # complaint about a path nobody wrote.
-            r"([\w./-]+\.(?:py|cu|cuh|hip|h|hpp|cpp|cc|csv|json|yaml|yml|sh|md)(?![\w]))",
+            r"([\w./=-]+\.(?:cuh|hpp|yaml|yml|json|csv|cpp|hip|py|cu|cc|co|h|md|sh)(?![\w]))",
             text)]
         def _is_touched(c):
             # NOT lstrip("./"): it strips every leading dot and slash, so

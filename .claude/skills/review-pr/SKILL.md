@@ -35,6 +35,7 @@ so what follows is the map, not the manual.**
 |---|---|---|
 | `rules_expanded.txt` | the full text of exactly the rules this diff derives | reading all 51 means attending to none |
 | `applies.txt` | whether the diff still applies to the merge target | a stale PR's CI result describes a tree that moved |
+| `merge_target.txt` | where the base tree is checked out — **read base files from there** | grepping the local worktree answers about the wrong branch |
 | `guards.txt` | each deleted assert/check: moved, returned changed, or gone | "it came back" and "it was weakened" look identical |
 | `siblings.txt` | a variant of a changed function still carrying a changed line | A1's sibling is in the same file, not another file |
 | `symbols.txt` | first-party imports that do not resolve against the merge target | a **rebase** signal, not invented code — #4994's import was valid when written |

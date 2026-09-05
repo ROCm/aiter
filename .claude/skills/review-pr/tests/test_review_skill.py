@@ -32,7 +32,14 @@ MAX_FENCE_LINES = 30
 # entry file grew unchecked the first time precisely because nothing counted it. This is
 # generous on purpose -- it is a program, and it is not in the reviewer's reading path --
 # but it is counted.
-MAX_FETCH_LINES = 900
+#
+# Raised 900 -> 930 deliberately, once, to keep the merge-target checkout alive and
+# self-cleaning. Three quarters of the findings an independent adversary killed across a
+# 50-PR wave were premises about code the review had never read on the tree that decides
+# them, because that checkout was created for the symbol sweep and deleted on the next
+# line. The purpose of this number is that growth gets noticed and argued for, which is
+# what this comment is.
+MAX_FETCH_LINES = 930
 
 
 def fences(text):
@@ -2957,10 +2964,15 @@ class TestFireClaimingIsNotFreeloadable(unittest.TestCase):
     ONE = ("\u26A0\uFE0F aiter/fused_moe.py:1 uses the wrong predicate so the count "
            "never shrinks at 384 experts\n")
 
-    def test_one_finding_cannot_claim_three_fires(self):
+    def test_one_finding_may_report_several_rules(self):
+        """Reversed deliberately after a second wave. Requiring N bullets for N rules that
+        share a cited path made aiter#3165 annotate E5 `-- not reported: as a separate
+        bullet`, which was false on its face: E5 was on the card, merged into the B4
+        bullet. Forcing a reviewer to write something untrue to satisfy a gate is worse
+        than the freeloading it prevents, and freeloading stays visible anyway -- one
+        bullet against nine FIREs reads as one bullet against nine FIREs."""
         r = self.gate(self.ONE)
-        self.assertIn("UNREPORTED-FIRE", r.stdout)
-        self.assertEqual(1, r.returncode)
+        self.assertEqual(0, r.returncode, r.stdout)
 
     def test_three_findings_claim_three_fires(self):
         r = self.gate(self.ONE +

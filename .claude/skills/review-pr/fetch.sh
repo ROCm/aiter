@@ -878,14 +878,29 @@ rm -f "$WORK/.err"
 # breakage happens.
 git -C "$PROJECT_ROOT" cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null \
   || git -C "$PROJECT_ROOT" fetch -q "$REPO_URL" "$BASE_SHA" 2>/dev/null || true
+# Day-old worktrees are finished reviews; drop them so keeping this one does not
+# accumulate 182M per review.
+git -C "$PROJECT_ROOT" worktree list --porcelain 2>/dev/null \
+  | sed -n 's|^worktree \(/tmp/review-pr-.*\)$|\1|p' \
+  | while IFS= read -r w; do
+      [ -d "$w" ] && [ -z "$(find "$w" -maxdepth 0 -mtime -1 2>/dev/null)" ] \
+        && git -C "$PROJECT_ROOT" worktree remove --force "$w" >/dev/null 2>&1
+    done
 TARGET_WT="$WORK/merge-target"
 if git -C "$PROJECT_ROOT" worktree add --detach "$TARGET_WT" "$BASE_SHA" >/dev/null 2>&1; then
   "$SKILLS_ROOT/review-pr/triage.py" symbols "$WORK/pr.diff" "$TARGET_WT" \
     | tee "$WORK/symbols.txt"
-  git -C "$PROJECT_ROOT" worktree remove --force "$TARGET_WT" >/dev/null 2>&1 || true
+  # KEPT. Removing it left the reviewer grepping whatever branch the local worktree is on:
+  # of 47 findings an adversary killed in a 50-PR wave, ~3/4 were premises about code the
+  # review never read on the tree that decides them. This is that tree, at BASE_SHA.
+  echo "MERGE TARGET: $TARGET_WT (checked out at $BASE_SHA)" | tee "$WORK/merge_target.txt"
+  echo "  read base files from there, or: git -C $PROJECT_ROOT show $BASE_SHA:<path>" \
+    | tee -a "$WORK/merge_target.txt"
 else
   echo "SKIPPED: could not check out base $BASE_SHA; symbol sweep not run" \
     | tee "$WORK/symbols.txt"
+  echo "MERGE TARGET: unavailable -- use git -C $PROJECT_ROOT show $BASE_SHA:<path>" \
+    | tee "$WORK/merge_target.txt"
 fi
 
 echo
@@ -894,6 +909,6 @@ echo "WORK=$WORK"
 # produced only when a guard or a signature actually changed, so it is listed as such.
 echo "artifacts: pr.diff pr_meta.json base_head.txt rules.txt rules_expanded.txt \
 test_quality.txt twins.txt ci_coverage.txt perf_claims.txt struct_abi.txt comment_only.txt \
-guards.txt siblings.txt kernel_tests.txt applies.txt symbols.txt \
+guards.txt siblings.txt kernel_tests.txt applies.txt symbols.txt merge_target.txt \
 validation_requirement.json \
 auto_validation_outcome.txt${HAVE_EVIDENCE:+ evidence.txt}"
