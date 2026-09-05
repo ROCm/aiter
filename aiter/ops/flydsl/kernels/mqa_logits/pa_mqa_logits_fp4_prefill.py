@@ -17,6 +17,7 @@ from flydsl.expr.primitive import range_constexpr
 from flydsl.expr.typing import Float4E2M1FN, Int32, T
 
 from .pa_mqa_logits_fp4_common import (
+    _NON_WRITER_LANE_OFF,
     _i32_buffer,
     _load_vec4_i32,
 )
@@ -472,8 +473,15 @@ def build_pa_mqa_logits_fp4_prefill_module(
             fx.make_view(cta_it, fx.make_layout((1 << 28, 4), (4, 1)))
         )
         cta_info_vec = fx.Vector(_load_vec4_i32(cta_info_bt, fx.Int32(0)))
-        local_start = cta_info_bt[(fx.Int32(1), fx.Int32(0))]
-        local_end = cta_info_bt[(fx.Int32(1), fx.Int32(1))]
+
+        # Wave-uniform by construction, but they arrive in VGPRs via the buffer
+        # load; the V# below needs num_records in an SGPR or the store is wrapped
+        # in a waterfall loop.
+        def _uniform(v):
+            return fx.Int32(fx.rocdl.readfirstlane(T.i32, v.ir_value()))
+
+        local_start = _uniform(cta_info_bt[(fx.Int32(1), fx.Int32(0))])
+        local_end = _uniform(cta_info_bt[(fx.Int32(1), fx.Int32(1))])
 
         kv_bt = _i32_buffer(kv_cache_ptr, width=4)
         kvs_bt = _i32_buffer(kv_scale_ptr, width=1)
@@ -487,10 +495,37 @@ def build_pa_mqa_logits_fp4_prefill_module(
         chunk_start = cta_info_vec[2]
         chunk_count = cta_info_vec[3]
 
-        # out row base folded into an f32 global pointer (sizeof(f32)=4); the
-        # per-token store offset below stays small (no i32 overflow).
-        _row_elems = fx.Int64(row_id) * fx.Int64(stride_out_row)
-        out_base = fx.add_offset(fx.get_iter(out_logits_ptr), _row_elems)
+        # A V# spanning exactly [local_start, local_end) of this row: num_records
+        # then IS the window test, in hardware. A token below the window
+        # underflows to a huge unsigned offset and is dropped by the same bound,
+        # so one check covers both ends. Lanes 16..63 hold redundant copies of
+        # the butterfly result and must not write; a large constant added to
+        # their offset puts them past num_records. It must be a CONSTANT, not a
+        # multiple of win_len: `token_base - local_start` is negative for a
+        # token below a non-zero window start, and adding win_len to that lands
+        # back INSIDE the window, racing the lane that owns the column. Both
+        # terms are chunk-invariant, so both live here.
+        win_len = local_end - local_start
+        _row_elems = fx.Int64(row_id) * fx.Int64(stride_out_row) + fx.Int64(local_start)
+        out_win = fx.rocdl.make_buffer_tensor(
+            fx.make_view(
+                fx.recast_iter(
+                    fx.PointerType.get(T.f32, out_logits_ptr.memspace, 4),
+                    fx.add_offset(fx.get_iter(out_logits_ptr), _row_elems),
+                ),
+                fx.make_layout((win_len, 1), (1, 1)),
+            ),
+            max_size=False,
+            num_records_bytes=win_len * fx.Int32(4),
+        )
+        out_lane_off = lane_mod_16 + (lane_div_16 > fx.Int32(0)).select(
+            fx.Int32(_NON_WRITER_LANE_OFF), fx.Int32(0)
+        )
+        out_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), 1)
+        out_reg_ty = fx.MemRefType.get(
+            T.f32, fx.LayoutType.get(1, 1), fx.AddressSpace.Register
+        )
+        out_reg_lay = fx.make_layout(1, 1)
 
         # Q load (hoisted): per (k_tile, mi_idx) a thread loads its 16-byte FP4
         # chunk for head row mi_idx*16+lane_mod_16. Q: [total_tokens, H, D/2] uint8.
@@ -674,15 +709,17 @@ def build_pa_mqa_logits_fp4_prefill_module(
             thread_sum = _bperm_xor_add(thread_sum, 32)
             # `weight_scale` already folded into `w_per_lane` (hoisted, once/wave).
 
-            # Only [local_start, local_end) is written (one writer lane per token);
-            # the rest stays at the caller's -inf pre-fill. Sparse 1-writer
-            # scatter: guard the plain store instead of a V# OOB sentinel. Row base
-            # is folded into out_base, so the store offset is the token index.
-            is_writer = lane_div_16 < fx.Int32(1)
-            out_token = token_base + lane_mod_16
-            in_window = (out_token >= local_start) & (out_token < local_end)
-            if is_writer & in_window:
-                fx.ptr_store(thread_sum, fx.add_offset(out_base, out_token))
+            # Window and writer-lane guards are both in the V#; nothing is
+            # tested here. Cells outside stay at the caller's -inf pre-fill.
+            r_out = fx.memref_alloca(out_reg_ty, out_reg_lay)
+            fx.memref_store_vec(
+                fx.Vector.from_elements([thread_sum], dtype=fx.Float32), r_out
+            )
+            fx.copy(
+                out_atom,
+                r_out,
+                fx.slice(out_win, (token_base - local_start + out_lane_off, None)),
+            )
 
         def _compute_chunk(kv_list_in, kvs_packed_list_in, c_i32_arg, nt0_accs_in=None):
             assert (
