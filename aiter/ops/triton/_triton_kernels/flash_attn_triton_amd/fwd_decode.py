@@ -800,9 +800,16 @@ def _splitK_reduce(
     tl.store(out_ptr, acc_out, mask=o_mask)
 
     # Store lse
-    l_ptrs = LSE + pid_zhg * stride_lse_zhg_i64 + pid_m
-    lse_val = tl.where(g_sum > 0, (g_m + tl.math.log2(g_sum)) / 1.44269504, g_m)
-    tl.store(l_ptrs, lse_val)
+    # only one K-block program writes lse: its address does not depend on
+    # pid_k (unlike the output store above, which is partitioned by offs_k),
+    # so all pid_k programs would store the same value to the same location
+    # concurrently (an unsynchronized same-value WAW). This is the same
+    # `pid_k == 0` convention the moe and gemm kernels in this repository
+    # already apply to their K-split-redundant work.
+    if pid_k == 0:
+        l_ptrs = LSE + pid_zhg * stride_lse_zhg_i64 + pid_m
+        lse_val = tl.where(g_sum > 0, (g_m + tl.math.log2(g_sum)) / 1.44269504, g_m)
+        tl.store(l_ptrs, lse_val)
 
 
 @triton.jit
