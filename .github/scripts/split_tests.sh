@@ -144,6 +144,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_metadata.py]=10
     FILE_TIMES[op_tests/test_opus_a16w16_gemm.py]=10
     FILE_TIMES[op_tests/test_pa_mqa_logits_offset.py]=10
+    FILE_TIMES[op_tests/test_triton_fmoe_dispatch.py]=10
     FILE_TIMES[op_tests/test_fused_qk_norm_rope_1way_perhead.py]=9
     FILE_TIMES[op_tests/test_aiter_sigmoid.py]=8
     FILE_TIMES[op_tests/test_fused_qk_rmsnorm_per_token_quant.py]=8
