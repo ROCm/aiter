@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import math
 import os
 import shutil
 import sys
@@ -17,7 +18,20 @@ import torch
 from aiter import dtypes, logger
 from aiter.jit.utils.chip_info import get_gfx_runtime as _chip_get_gfx
 
+# How many checkpoints a run should have when the user did not pick a batch
+# size. Each batch writes the tuned CSV, and pre_process skips already-tuned
+# shapes on a rerun, so this bounds what an interrupted run loses.
+_DEFAULT_CHECKPOINTS = 8
+
 INVALID_TIME = -1
+
+
+class _StoreBatchAction(argparse.Action):
+    """Store the batch size while remembering that the CLI supplied it."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        setattr(namespace, "_batch_was_explicit", True)
 
 
 def _read_csv(filepath, **kwargs):
@@ -108,6 +122,7 @@ class TunerCommon:
     def _setup_common_arguments(self):
         """set common arguments"""
         defaults = self.get_arg_defaults()
+        self.parser.set_defaults(_batch_was_explicit=False)
         self.parser.add_argument(
             "--verbose", "-v", action="store_true", help="more info"
         )
@@ -168,6 +183,7 @@ class TunerCommon:
         self.parser.add_argument(
             "--batch",
             type=int,
+            action=_StoreBatchAction,
             default=defaults["batch"],
             help="split untuned shapes to batches to tune",
         )
@@ -1420,6 +1436,20 @@ class TunerCommon:
             )
             return self.tunedf if self.tunedf is not None else pd.DataFrame()
         batch_size = min(args.batch, len(self.untunedf))
+        # A batch is this tuner's checkpoint: results are appended to the tuned
+        # CSV after every batch (see result_to_csv below), and pre_process skips
+        # shapes already present there, so a rerun resumes. The default batch
+        # (100) is larger than most tuning runs, which silently collapses a run
+        # into ONE batch -- an interruption then loses everything, including the
+        # shapes that had already finished. On a shared machine that is the
+        # difference between losing minutes and losing hours.
+        # When the user has not chosen a batch size, aim for a handful of
+        # checkpoints. This can only make batches smaller, never larger, and
+        # runs that already produce several batches are unaffected.
+        if not getattr(args, "_batch_was_explicit", True):
+            batch_size = max(
+                1, min(batch_size, math.ceil(len(self.untunedf) / _DEFAULT_CHECKPOINTS))
+            )
         total_batches = (len(self.untunedf) + batch_size - 1) // batch_size
         compare_report_file = self._init_compare_report(
             args, output_file, batch_size, total_batches

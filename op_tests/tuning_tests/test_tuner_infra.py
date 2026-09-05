@@ -80,6 +80,19 @@ class TestReadCSV(unittest.TestCase):
             os.unlink(path)
 
 
+class TestBatchArgument(unittest.TestCase):
+
+    def test_omitted_batch_is_marked_as_default(self):
+        args = _StubTuner.get().parser.parse_args([])
+        self.assertEqual(args.batch, 100)
+        self.assertFalse(args._batch_was_explicit)
+
+    def test_explicit_default_batch_is_honored(self):
+        args = _StubTuner.get().parser.parse_args(["--batch", "100"])
+        self.assertEqual(args.batch, 100)
+        self.assertTrue(args._batch_was_explicit)
+
+
 class TestUpdateTunedf(unittest.TestCase):
 
     def test_merges_existing_key(self):
