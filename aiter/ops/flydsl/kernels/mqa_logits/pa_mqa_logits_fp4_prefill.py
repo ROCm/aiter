@@ -45,6 +45,13 @@ MFMA_M = 16
 MFMA_N = 16
 WARP_SIZE = 64
 DEFAULT_BLOCK_THREADS = DEFAULT_NUM_WARPS * WARP_SIZE  # 256
+# Reduce once per 4K produced scores instead of once per 1K. With 16-byte
+# aligned fields this consumes 42,064 bytes (K=512) or 50,256 bytes (K=1024),
+# leaving both variants below gfx950's 64-KiB per-workgroup LDS limit.
+DEFAULT_SCORE_BATCH_CHUNKS = 16
+SUPPORTED_SCORE_BATCH_CHUNKS = (1, 2, 4, 8, 16)
+_LDS_ALIGNMENT_BYTES = 16
+_GFX950_MAX_WORKGROUP_LDS_BYTES = 64 * 1024
 
 # cta_info packed fields per CTA.
 CTA_INFO_WIDTH = 6
@@ -63,6 +70,29 @@ _PACK_SHIFT = 16
 _PACK_MASK = (1 << _PACK_SHIFT) - 1
 
 
+def _align_up(value: int, alignment: int) -> int:
+    return (value + alignment - 1) // alignment * alignment
+
+
+def _streaming_topk_lds_bytes(candidate_topk: int, score_batch_chunks: int) -> int:
+    """Exact LDS footprint of ``make_streaming_topk_storage``."""
+
+    pool_capacity = candidate_topk + score_batch_chunks * DEFAULT_BLOCK_THREADS
+    field_bytes = (
+        pool_capacity * 4,  # pool_values
+        pool_capacity * 4,  # pool_indices
+        candidate_topk * 4,  # selected_values
+        candidate_topk * 4,  # selected_indices
+        NUM_HIST_BINS * 4,
+        (NUM_WAVES + 1) * 4,
+        _STREAM_STATE_SIZE * 4,
+    )
+    offset = 0
+    for size in field_bytes:
+        offset = _align_up(offset, _LDS_ALIGNMENT_BYTES) + size
+    return _align_up(offset, _LDS_ALIGNMENT_BYTES)
+
+
 def compute_prefill_schedule(
     row_to_batch,
     local_starts,
@@ -72,12 +102,16 @@ def compute_prefill_schedule(
     max_seq_len,
     cta_info_out=None,
     row_offsets_out=None,
+    *,
+    single_cta_per_row=False,
 ):
     """Compute the persistent-grid schedule for ragged-prefill MQA logits.
 
     Pass `cta_info_out` (a fixed [parallel_unit_num, CTA_INFO_WIDTH] int32 buffer)
     to write the schedule into a stable address (CUDAGraph decode: the captured
     kernel replays from this pointer while `build()` refreshes its contents).
+    ``single_cta_per_row`` coalesces every nonempty row into one slot; this is
+    used when the launch has exactly one available slot per row.
 
     Returns `(safe, cta_info, parallel_unit_num)`, `safe` being the [1] int32
     split factor the schedule was built with.
@@ -121,7 +155,14 @@ def compute_prefill_schedule(
         )
 
     s_max = max(1, (max_seq_len + block_k - 1) // block_k)
-    plan = _row_plan(local_starts, local_ends, block_k, P, s_max)
+    plan = _row_plan(
+        local_starts,
+        local_ends,
+        block_k,
+        P,
+        s_max,
+        single_cta_per_row=single_cta_per_row,
+    )
 
     # ── map each fixed slot → (row, split) + emit cta_info in ONE kernel ──
     if cta_info_out is None:
@@ -269,10 +310,25 @@ _ROW_PLAN_MAX_ROWS = 16384
 _I32_PER_16B = 4
 
 
-def _row_plan(ls, le, block_k, P, s_max) -> _RowPlan:
+def _row_plan(
+    ls,
+    le,
+    block_k,
+    P,
+    s_max,
+    *,
+    single_cta_per_row=False,
+) -> _RowPlan:
     T = le.shape[0]
     if T > _ROW_PLAN_MAX_ROWS:
-        return _row_plan_torch(ls, le, block_k, P, s_max)
+        return _row_plan_torch(
+            ls,
+            le,
+            block_k,
+            P,
+            s_max,
+            single_cta_per_row=single_cta_per_row,
+        )
     # One allocation, sliced: separate `torch.empty` calls would add dispatches
     # dispatches back on the path this exists to shorten.
     #
@@ -310,11 +366,20 @@ def _row_plan(ls, le, block_k, P, s_max) -> _RowPlan:
             _ROW_PLAN_BLOCK_FLOOR if T <= _ROW_PLAN_BLOCK_FLOOR else _ROW_PLAN_MAX_ROWS
         ),
         SEARCH_STEPS=max(1, (s_max - 1).bit_length() + 1),
+        SINGLE_CTA_PER_ROW=single_cta_per_row,
     )
     return plan
 
 
-def _row_plan_torch(ls, le, block_k, P, s_max) -> _RowPlan:
+def _row_plan_torch(
+    ls,
+    le,
+    block_k,
+    P,
+    s_max,
+    *,
+    single_cta_per_row=False,
+) -> _RowPlan:
     """The row plan as ~25 torch ops. Reference for `_prefill_row_plan_kernel`."""
     window_starts = torch.clamp(ls, min=0)
     first_chunks = window_starts // block_k
@@ -325,16 +390,29 @@ def _row_plan_torch(ls, le, block_k, P, s_max) -> _RowPlan:
         0,
     )
 
-    s_cand = torch.arange(1, s_max + 1, device=le.device, dtype=torch.int32)  # [s_max]
-    ctas_per_r_s = (chunks_per_row[None, :] + (s_cand[:, None] - 1)) // s_cand[
-        :, None
-    ]  # [s_max, T]
-    total_ctas_s = ctas_per_r_s.sum(dim=1)  # [s_max]
-    feasible = total_ctas_s <= P  # [s_max] bool, monotonic False..True
     max_chunks = torch.clamp(chunks_per_row.max(), min=1).to(torch.int32)
-    # smallest feasible s, via arithmetic (no tensor gather → no capture sync).
-    first_feasible_s = torch.clamp((~feasible).to(torch.int32).sum() + 1, max=s_max)
-    safe = torch.where(feasible.any(), first_feasible_s, max_chunks).to(torch.int32)
+    if single_cta_per_row:
+        safe = max_chunks
+    else:
+        s_cand = torch.arange(
+            1,
+            s_max + 1,
+            device=le.device,
+            dtype=torch.int32,
+        )  # [s_max]
+        ctas_per_r_s = (chunks_per_row[None, :] + (s_cand[:, None] - 1)) // (
+            s_cand[:, None]
+        )  # [s_max, T]
+        total_ctas_s = ctas_per_r_s.sum(dim=1)  # [s_max]
+        feasible = total_ctas_s <= P  # [s_max] bool, monotonic False..True
+        # smallest feasible s, via arithmetic (no tensor gather → no capture sync).
+        first_feasible_s = torch.clamp(
+            (~feasible).to(torch.int32).sum() + 1,
+            max=s_max,
+        )
+        safe = torch.where(feasible.any(), first_feasible_s, max_chunks).to(
+            torch.int32
+        )
 
     # ── per-row number of CTAs (chunk-splits); 0 for empty rows ──
     ctas_r = (chunks_per_row + (safe - 1)) // safe  # [T]
@@ -375,6 +453,7 @@ def _prefill_row_plan_kernel(
     s_max,
     BLOCK_T: tl.constexpr,
     SEARCH_STEPS: tl.constexpr,
+    SINGLE_CTA_PER_ROW: tl.constexpr,
 ):
     """Single-block row plan: chunk counts, split factor, and its prefix sums.
 
@@ -409,18 +488,21 @@ def _prefill_row_plan_kernel(
     )
     max_chunks = tl.maximum(tl.max(chunks, axis=0), 1)
 
-    lo = 1
-    hi = s_max
-    for _ in tl.static_range(SEARCH_STEPS):
-        mid = (lo + hi) // 2
-        feasible = tl.sum((chunks + mid - 1) // mid, axis=0) <= P
-        active = lo < hi
-        hi = tl.where(active & feasible, mid, hi)
-        lo = tl.where(active & (feasible == 0), mid + 1, lo)
-    # No s in [1, s_max] fits: fall back to one CTA per row, as torch's
-    # `feasible.any()` arm does.
-    total_smax = tl.sum((chunks + s_max - 1) // s_max, axis=0)
-    safe = tl.where(total_smax <= P, lo, max_chunks)
+    if SINGLE_CTA_PER_ROW:
+        safe = max_chunks
+    else:
+        lo = 1
+        hi = s_max
+        for _ in tl.static_range(SEARCH_STEPS):
+            mid = (lo + hi) // 2
+            feasible = tl.sum((chunks + mid - 1) // mid, axis=0) <= P
+            active = lo < hi
+            hi = tl.where(active & feasible, mid, hi)
+            lo = tl.where(active & (feasible == 0), mid + 1, lo)
+        # No s in [1, s_max] fits: fall back to one CTA per row, as torch's
+        # `feasible.any()` arm does.
+        total_smax = tl.sum((chunks + s_max - 1) // s_max, axis=0)
+        safe = tl.where(total_smax <= P, lo, max_chunks)
 
     ctas = tl.where(mask, (chunks + safe - 1) // safe, 0)
     incl = tl.cumsum(ctas, axis=0)
@@ -514,6 +596,72 @@ def _prefill_row_offsets_kernel(
     tl.store(row_offsets_ptr + offset, value, mask=mask)
 
 
+@triton.jit(do_not_specialize=["rows"])
+def _copy_single_cta_topk_candidates_kernel(
+    candidate_values,
+    candidate_indices,
+    candidate_counts,
+    row_offsets,
+    out_values,
+    out_indices,
+    out_counts,
+    rows,
+    TOPK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Copy one exact CTA plane per row without repeating radix selection."""
+
+    row = tl.program_id(0)
+    lane = tl.arange(0, BLOCK)
+    cta_begin = tl.load(row_offsets + row)
+    cta_end = tl.load(row_offsets + row + 1)
+    has_cta = cta_end > cta_begin
+    count = tl.load(candidate_counts + cta_begin, mask=has_cta, other=0)
+    count = tl.minimum(tl.maximum(count, 0), TOPK)
+
+    for step in tl.static_range(0, TOPK, BLOCK):
+        slot = step + lane
+        live = has_cta & (slot < count)
+        source = cta_begin * TOPK + slot
+        values = tl.load(
+            candidate_values + source,
+            mask=live,
+            other=-float("inf"),
+        )
+        indices = tl.load(candidate_indices + source, mask=live, other=-1)
+        destination = row * TOPK + slot
+        tl.store(out_values + destination, values)
+        tl.store(out_indices + destination, indices)
+    tl.store(out_counts + row + lane, count, mask=lane == 0)
+
+
+def _copy_single_cta_topk_candidates(
+    candidate_values: torch.Tensor,
+    candidate_indices: torch.Tensor,
+    candidate_counts: torch.Tensor,
+    row_offsets: torch.Tensor,
+    out_values: torch.Tensor,
+    out_indices: torch.Tensor,
+    out_counts: torch.Tensor,
+) -> None:
+    """Launch the no-radix merge for a schedule with at most one CTA per row."""
+
+    rows, topk = out_values.shape
+    block = 256
+    _copy_single_cta_topk_candidates_kernel[(rows,)](
+        candidate_values,
+        candidate_indices,
+        candidate_counts,
+        row_offsets,
+        out_values,
+        out_indices,
+        out_counts,
+        rows,
+        TOPK=topk,
+        BLOCK=block,
+    )
+
+
 def build_pa_mqa_logits_fp4_prefill_module(
     block_k=256,
     kv_block_size=64,
@@ -523,7 +671,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
     heads=DEFAULT_HEADS,
     head_dim=DEFAULT_HEAD_DIM,
     candidate_topk=None,
-    score_batch_chunks=4,
+    score_batch_chunks=DEFAULT_SCORE_BATCH_CHUNKS,
 ):
     """Build the ragged-prefill FP4 scorer.
 
@@ -539,8 +687,16 @@ def build_pa_mqa_logits_fp4_prefill_module(
         assert (
             block_threads_k == TOPK_BLOCK_THREADS
         ), "streaming TopK requires the 256-thread/4-wave score body"
-        assert score_batch_chunks in (1, 2, 4), "score_batch_chunks must be 1, 2, or 4"
+        assert score_batch_chunks in SUPPORTED_SCORE_BATCH_CHUNKS, (
+            "score_batch_chunks must be one of "
+            f"{SUPPORTED_SCORE_BATCH_CHUNKS}"
+        )
         pool_capacity = candidate_topk + score_batch_chunks * block_k
+        lds_bytes = _streaming_topk_lds_bytes(candidate_topk, score_batch_chunks)
+        assert lds_bytes <= _GFX950_MAX_WORKGROUP_LDS_BYTES, (
+            f"streaming TopK requires {lds_bytes} LDS bytes, exceeding the "
+            f"gfx950 workgroup limit of {_GFX950_MAX_WORKGROUP_LDS_BYTES}"
+        )
         pool_steps = (pool_capacity + TOPK_BLOCK_THREADS - 1) // TOPK_BLOCK_THREADS
         output_steps = (candidate_topk + TOPK_BLOCK_THREADS - 1) // TOPK_BLOCK_THREADS
         streaming_storage_type = make_streaming_topk_storage(
@@ -1411,7 +1567,7 @@ def compile_pa_mqa_logits_fp4_prefill_topk(
     num_warps: int = DEFAULT_NUM_WARPS,
     heads: int = DEFAULT_HEADS,
     head_dim: int = DEFAULT_HEAD_DIM,
-    score_batch_chunks: int = 4,
+    score_batch_chunks: int = DEFAULT_SCORE_BATCH_CHUNKS,
 ):
     """Compile the score callback that emits bounded per-CTA TopK planes."""
 
@@ -1571,7 +1727,7 @@ def flydsl_pa_mqa_topk_fp4_prefill(
     kv_block_size: int = 64,
     num_warps: int = DEFAULT_NUM_WARPS,
     parallel_unit_num: int | None = None,
-    score_batch_chunks: int = 4,
+    score_batch_chunks: int = DEFAULT_SCORE_BATCH_CHUNKS,
     workspace: FP4PrefillTopKWorkspace | None = None,
     out: FP4PrefillTopKResult | None = None,
     stream: torch.cuda.Stream | None = None,
@@ -1581,10 +1737,12 @@ def flydsl_pa_mqa_topk_fp4_prefill(
     The MFMA kernel never materializes ``[rows, max_seq_len]`` logits. Each CTA
     streams up to ``score_batch_chunks * block_k`` new scores through LDS,
     repeatedly retaining its exact ``topk`` under score-descending/index-
-    ascending order. A second kernel merges the split candidates exactly and
-    a bounded finalizer returns long rows in that total order and maps logical
-    sequence indices through ``block_tables``. Rows no longer than ``topk``
-    preserve sequential logical-index order.
+    ascending order. When the launch has one slot per row, a no-radix copier
+    forwards that CTA's exact set using the schedule offsets and candidate
+    count. Other geometries retain the exact split-candidate radix merge. A
+    bounded finalizer returns long rows in total order and maps logical sequence
+    indices through ``block_tables``. Rows no longer than ``topk`` preserve
+    sequential logical-index order.
 
     ``workspace`` exposes the per-CTA values, raw indices, and counts for
     callers that need to exchange or inspect local candidates. Reuse both the
@@ -1599,8 +1757,11 @@ def flydsl_pa_mqa_topk_fp4_prefill(
         raise ValueError("the fused TopK path requires block_k=256 and num_warps=4")
     if kv_block_size != 64:
         raise ValueError("the fused TopK path requires kv_block_size=64")
-    if score_batch_chunks not in (1, 2, 4):
-        raise ValueError("score_batch_chunks must be 1, 2, or 4")
+    if score_batch_chunks not in SUPPORTED_SCORE_BATCH_CHUNKS:
+        raise ValueError(
+            "score_batch_chunks must be one of "
+            f"{SUPPORTED_SCORE_BATCH_CHUNKS}"
+        )
 
     if q_fp4.ndim != 3:
         raise ValueError("q_fp4 must have shape [rows, 64, 64]")
@@ -1757,6 +1918,7 @@ def flydsl_pa_mqa_topk_fp4_prefill(
             out.counts.zero_()
         return out
 
+    single_cta_per_row = parallel_unit_num == rows
     with torch.cuda.stream(stream):
         compute_prefill_schedule(
             row_to_batch,
@@ -1767,6 +1929,7 @@ def flydsl_pa_mqa_topk_fp4_prefill(
             max_seq_len,
             cta_info_out=workspace.cta_info,
             row_offsets_out=workspace.row_offsets,
+            single_cta_per_row=single_cta_per_row,
         )
     max_blocks_per_seq = block_tables.shape[1]
     launcher, _ = compile_pa_mqa_logits_fp4_prefill_topk(
@@ -1795,22 +1958,34 @@ def flydsl_pa_mqa_topk_fp4_prefill(
         stream,
     )
 
-    from ...candidate_topk_merge import flydsl_candidate_topk_merge
+    if single_cta_per_row:
+        with torch.cuda.stream(stream):
+            _copy_single_cta_topk_candidates(
+                workspace.candidate_values,
+                workspace.candidate_indices,
+                workspace.candidate_counts,
+                workspace.row_offsets,
+                workspace.merge_values,
+                workspace.merge_indices,
+                out.counts,
+            )
+    else:
+        from ...candidate_topk_merge import flydsl_candidate_topk_merge
 
-    flydsl_candidate_topk_merge(
-        workspace.candidate_values,
-        workspace.candidate_indices,
-        workspace.candidate_counts,
-        workspace.row_offsets,
-        row_to_batch,
-        block_tables,
-        workspace.merge_values,
-        workspace.merge_indices,
-        workspace.merge_physical_indices,
-        out.counts,
-        kv_block_size,
-        stream=stream,
-    )
+        flydsl_candidate_topk_merge(
+            workspace.candidate_values,
+            workspace.candidate_indices,
+            workspace.candidate_counts,
+            workspace.row_offsets,
+            row_to_batch,
+            block_tables,
+            workspace.merge_values,
+            workspace.merge_indices,
+            workspace.merge_physical_indices,
+            out.counts,
+            kv_block_size,
+            stream=stream,
+        )
     from ...mqa_topk_finalize import order_and_map_mqa_topk
 
     with torch.cuda.stream(stream):

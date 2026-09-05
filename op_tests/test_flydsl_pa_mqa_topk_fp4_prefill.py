@@ -74,7 +74,10 @@ def test_true_and_tiled_public_paths_match_full_logits(topk: int) -> None:
         topk,
     )
 
-    parallel_unit_num = max(512, rows)
+    # Match serving: one schedule slot per row. The case includes an empty row,
+    # so this also verifies that compact row offsets, rather than row == CTA,
+    # drive the no-radix merge.
+    parallel_unit_num = rows
     fused_workspace = allocate_fp4_prefill_topk_workspace(
         rows,
         parallel_unit_num,
@@ -409,3 +412,128 @@ def test_schedule_rejects_noncontiguous_row_offsets() -> None:
             64,
             row_offsets_out=row_offsets,
         )
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("flydsl") is None,
+    reason="requires FlyDSL",
+)
+def test_single_cta_row_plan_property() -> None:
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
+        _row_plan_torch,
+    )
+
+    generator = torch.Generator().manual_seed(20260905)
+    rows = 1024
+    block_k = 256
+    s_max = 64
+    for _ in range(32):
+        starts = torch.randint(
+            -block_k,
+            s_max * block_k,
+            (rows,),
+            dtype=torch.int32,
+            generator=generator,
+        )
+        ends = torch.randint(
+            -block_k,
+            s_max * block_k,
+            (rows,),
+            dtype=torch.int32,
+            generator=generator,
+        )
+        plan = _row_plan_torch(
+            starts,
+            ends,
+            block_k,
+            rows,
+            s_max,
+            single_cta_per_row=True,
+        )
+
+        window_starts = torch.clamp(starts, min=0)
+        first_chunks = window_starts // block_k
+        end_chunks = torch.clamp((ends + block_k - 1) // block_k, min=0)
+        chunks = torch.where(
+            ends > window_starts,
+            torch.clamp(end_chunks - first_chunks, min=0),
+            0,
+        )
+        expected_ctas = (chunks > 0).to(torch.int32)
+        actual_ctas = plan.incl - plan.excl
+
+        torch.testing.assert_close(actual_ctas, expected_ctas, rtol=0, atol=0)
+        assert int(plan.safe) == max(int(chunks.max()), 1)
+        assert int(plan.total_splits) == int(expected_ctas.sum())
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("flydsl") is None,
+    reason="requires FlyDSL",
+)
+def test_score_batch_lds_budget() -> None:
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
+        DEFAULT_SCORE_BATCH_CHUNKS,
+        SUPPORTED_SCORE_BATCH_CHUNKS,
+        _streaming_topk_lds_bytes,
+    )
+
+    assert DEFAULT_SCORE_BATCH_CHUNKS == 16
+    assert SUPPORTED_SCORE_BATCH_CHUNKS == (1, 2, 4, 8, 16)
+    assert _streaming_topk_lds_bytes(512, 16) == 42_064
+    assert _streaming_topk_lds_bytes(1024, 16) == 50_256
+    assert _streaming_topk_lds_bytes(1024, 16) < 64 * 1024
+
+
+@requires_gfx950_flydsl
+@pytest.mark.parametrize("topk", [512, 1024])
+def test_single_cta_copy_uses_offsets_and_counts(topk: int) -> None:
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
+        _copy_single_cta_topk_candidates,
+    )
+
+    rows = 5
+    row_offsets = torch.tensor(
+        [0, 1, 1, 2, 3, 3],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    counts = torch.tensor([topk, 7, 0], dtype=torch.int32, device="cuda")
+    values = torch.arange(3 * topk, dtype=torch.float32, device="cuda").reshape(
+        3,
+        topk,
+    )
+    indices = torch.arange(3 * topk, dtype=torch.int32, device="cuda").reshape(
+        3,
+        topk,
+    )
+    out_values = torch.empty(rows, topk, dtype=torch.float32, device="cuda")
+    out_indices = torch.empty(rows, topk, dtype=torch.int32, device="cuda")
+    out_counts = torch.empty(rows, dtype=torch.int32, device="cuda")
+
+    _copy_single_cta_topk_candidates(
+        values,
+        indices,
+        counts,
+        row_offsets,
+        out_values,
+        out_indices,
+        out_counts,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        out_counts.cpu(),
+        torch.tensor([topk, 0, 7, 0, 0], dtype=torch.int32),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(out_values[0], values[0], rtol=0, atol=0)
+    torch.testing.assert_close(out_indices[0], indices[0], rtol=0, atol=0)
+    torch.testing.assert_close(out_values[2, :7], values[1, :7], rtol=0, atol=0)
+    torch.testing.assert_close(out_indices[2, :7], indices[1, :7], rtol=0, atol=0)
+    invalid_rows = torch.tensor([1, 3, 4], device="cuda")
+    assert torch.all(torch.isneginf(out_values[invalid_rows]))
+    assert torch.all(out_indices[invalid_rows] == -1)
+    assert torch.all(torch.isneginf(out_values[2, 7:]))
+    assert torch.all(out_indices[2, 7:] == -1)
