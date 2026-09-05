@@ -1093,7 +1093,7 @@ def changed_paths(diff_text):
 
 
 def check_citations(verdicts_text, diff_text):
-    """Verdict lines whose cited file is not in this PR's changed set.
+    """FIRE verdicts whose citations name no file this PR changes.
 
     A reason is free text, so the gate can only check the part of it that refers to
     something outside the model: the path. A FIRE on a file the diff never touched is
@@ -1116,11 +1116,18 @@ def check_citations(verdicts_text, diff_text):
         rule, verdict, reason = m.groups()
         if verdict != "FIRE":
             continue
-        for path, _line in CITATION.findall(reason):
-            base = path.lstrip("./")
-            if any(t == base or t.endswith("/" + base) for t in touched):
-                continue
-            bad.append((rule, verdict, path))
+        paths = [p for p, _ in CITATION.findall(reason)]
+        if not paths:
+            continue
+        # Same anchor rule as the card gate, and for the same reason. E4's own body tells
+        # the reviewer to "confirm the current ci:* definitions in .github/workflows/*.yaml"
+        # before quoting a label, and D11's tells them to find the assertion table in the
+        # tree; doing either put a path here that the diff does not contain, and the gate
+        # called the correct move a stale citation. One cited file from the diff is what
+        # separates "this PR" from "some other PR".
+        if not any(any(t == p.lstrip("./") or t.endswith("/" + p.lstrip("./"))
+                       for t in touched) for p in paths):
+            bad.append((rule, verdict, paths[0]))
     return bad
 
 
@@ -1830,11 +1837,14 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
     # them, and pass. FIRE means it goes in the card; if it is not going in, the verdict
     # is not FIRE, and saying so is a one-word edit to the ledger. The escape is
     # deliberate and must be written down: `-- not reported: <reason>` on the verdict.
-    fired = {}
+    fired, fire_paths = {}, {}
     for ln in (verdicts_text or "").splitlines():
         m = re.match(r"\s*([A-Z]+\d+[a-z]?)\s+FIRE\b\s*(?:--|—|:)\s*(.*)$", ln)
         if m and "not reported:" not in m.group(2).lower():
             fired[m.group(1)] = m.group(2)[:60]
+            # The files this verdict cited, so a card that obeys the no-rule-codes rule
+            # can still be matched to the FIRE it is reporting.
+            fire_paths[m.group(1)] = [pp for pp, _ in CITATION.findall(m.group(2))]
     backing = (verdicts_text or "") + "\n" + (diagnostic_text or "") + "\n" + (answers_text or "")
     problems = []
     findings = []
@@ -1847,6 +1857,14 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
         rid = re.match(r"([A-Z]+\d+[a-z]?):", text)
         if rid:
             reported.add(rid.group(1))
+        # SKILL.md's output rules say, in as many words, "Do NOT use rule codes (P1, D4,
+        # A1...) in output -- they are internal labels only". Claiming a FIRE by its rule
+        # id was therefore something the card was forbidden to do, and every correctly
+        # written card reported every fired rule as UNREPORTED-FIRE. A finding that names
+        # a file the verdict cited is the same claim without the label.
+        for rule, paths in fire_paths.items():
+            if paths and any(pp in text for pp in paths):
+                reported.add(rule)
     for rule, why in sorted(fired.items()):
         if rule not in reported:
             problems.append(("UNREPORTED-FIRE", f"{rule}: {why}",
@@ -1855,13 +1873,26 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
     for sev, text in findings:
         red = sev.startswith("\U0001F534")
         cited = [p for p in re.findall(
-            r"([\w./-]+\.(?:py|cu|cuh|hip|h|hpp|cpp|cc|csv|json|yaml|yml|sh|md))", text)]
-        untouched = [c for c in cited
-                     if not any(t == c.lstrip("./") or t.endswith("/" + c.lstrip("./"))
-                                for t in touched)]
-        if untouched:
-            problems.append(("UNTOUCHED-FINDING", text[:70],
-                             f"cites {untouched[0]}, which this PR does not change"))
+            # `(?![\w])`: without it `torch.cuda.device(...)` reads as a file called
+            # `torch.cu` and `x.contiguous.cuda()` as `x.contiguous.cu`. Those are the
+            # two most ordinary words in a HIP review, so the gate produced a citation
+            # complaint about a path nobody wrote.
+            r"([\w./-]+\.(?:py|cu|cuh|hip|h|hpp|cpp|cc|csv|json|yaml|yml|sh|md)(?![\w]))",
+            text)]
+        def _is_touched(c):
+            c = c.lstrip("./")
+            return any(t == c or t.endswith("/" + c) for t in touched)
+        # An ANCHOR is required, not citation purity. Rejecting every path the diff does
+        # not contain rejected the forensics the rules ask for: aiter#2478's two strongest
+        # findings are contracts stated in csrc/include/moe_sorting_opus.h, which the PR
+        # does not touch and which is where the mask convention and the local-id
+        # derivation live. The gate made that review delete the filename and describe the
+        # header in prose to get through -- it was rewarding vagueness and punishing the
+        # reader who went and looked. What it is actually for is stopping a finding that
+        # is about some other PR, and one changed file named in the text settles that.
+        if cited and not any(_is_touched(c) for c in cited):
+            problems.append(("UNANCHORED-FINDING", text[:70],
+                             f"cites only {cited[0]} and nothing this PR changes"))
         # Does anything already adjudicated mention this? Match on the rule id if the
         # finding carries one, else on a distinctive token from the text.
         rid = re.match(r"([A-Z]+\d+[a-z]?):", text)
@@ -2026,9 +2057,17 @@ if __name__ == "__main__":
 
     if mode == "citest":
         root = tree_root(sys.argv[3] if len(sys.argv) > 3 else ".")
-        rows = uncovered_test_paths(open(sys.argv[2], errors="replace").read(), root)
+        diff_src = open(sys.argv[2], errors="replace").read()
+        rows = uncovered_test_paths(diff_src, root)
+        added = [f for f in changed_paths(diff_src)
+                 if re.match(r"test_\w+\.py$|.*_test\.py$", f.rsplit("/", 1)[-1])]
         if not rows:
-            print("every new test file lands where a CI job will run it")
+            # "every new test file lands where a CI job will run it" reads as a green
+            # light on a PR that adds no test file at all, which is the opposite of what
+            # SKILL.md asks the reader to conclude from silence.
+            print("no new test file in this diff, so CI reachability was not exercised"
+                  if not added else
+                  "every new test file lands where a CI job will run it")
         for path, why in rows:
             print(f"UNRUN-TEST: {path}")
             print(f"  {why}")
@@ -2151,6 +2190,12 @@ if __name__ == "__main__":
         # four files produced four identical lines, which reads as four problems.
         seen_pairs = set()
         bad = [b for b in bad if not (b in seen_pairs or seen_pairs.add(b))]
+        if not bad:
+            # SKILL.md reads an empty artifact as "that axis was not checked". A sweep
+            # that ran and found nothing has to say so, or its silence is indistinguishable
+            # from the skip it warns about.
+            print("IMPORTS RESOLVED: every first-party import the diff adds exists in "
+                  "the merge target or in this diff")
         for line, why in bad:
             print(f"UNRESOLVED-IMPORT: {why}")
             print(f"  added by: {line}")

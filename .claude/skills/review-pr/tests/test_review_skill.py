@@ -1898,11 +1898,31 @@ class TestCardGate(unittest.TestCase):
         self.assertEqual(0, r.returncode, r.stdout + r.stderr)
         self.assertIn("NAILED DOWN", r.stdout)
 
-    def test_a_finding_citing_an_untouched_file_is_rejected(self):
+    def test_a_finding_anchored_nowhere_in_this_pr_is_rejected(self):
+        """The gate's purpose: a finding that is about some other PR."""
         r = self.gate("\u26A0\uFE0F G1: aiter/fused_moe.py:88 consumes it on another "
                       "stream at 4096 tokens\n")
         self.assertEqual(1, r.returncode)
-        self.assertIn("UNTOUCHED-FINDING", r.stdout)
+        self.assertIn("UNANCHORED-FINDING", r.stdout)
+
+    def test_a_finding_may_cite_the_tree_as_long_as_it_is_anchored(self):
+        """Rewritten deliberately. It used to require that every path in a finding be one
+        the diff changes, which rejected the forensics the rules ask for: aiter#2478's two
+        strongest findings rest on the mask contract in csrc/include/moe_sorting_opus.h,
+        a file the PR does not touch, and the review had to delete the filename and
+        describe the header vaguely to get past this gate. Anchored in a changed file and
+        citing the tree beside it is the shape of a well-evidenced finding, not a defect."""
+        r = self.gate("\U0001F534 D1: aiter/mla.py:200 sizes the buffer from a count "
+                      "the contract in csrc/include/moe_sorting_opus.h derives "
+                      "differently, so tokens past 96 index another expert\n")
+        self.assertNotIn("UNANCHORED-FINDING", r.stdout)
+
+    def test_a_finding_citing_no_file_at_all_is_not_flagged_as_unanchored(self):
+        """Concreteness is the vague-red gate's job, not this one's -- two gates reporting
+        the same defect under different names sends the reviewer to the wrong fix."""
+        r = self.gate("\u26A0\uFE0F D1: the padded buffer is one tile short at 8192 "
+                      "tokens on the EP path\n")
+        self.assertNotIn("UNANCHORED-FINDING", r.stdout)
 
     def test_a_finding_whose_rule_was_never_fired_is_rejected(self):
         """G1b was adjudicated CLEAR. Reporting it as a finding contradicts the ledger."""
@@ -2775,4 +2795,119 @@ class TestFlydslKernelsAreKernels(unittest.TestCase):
 
     def test_mapping_lists_the_new_family(self):
         self.assertIn("flydsl-kernel", (SKILL_DIR / "MAPPING.md").read_text())
+
+
+class TestGatesFoundByRunningTheSkill(unittest.TestCase):
+    """Four defects that only surfaced when the skill was run end to end on real PRs.
+
+    Everything before this was measured against the corpus, which exercises the deriver
+    and the forensics and never once writes a card. Four full reviews -- aiter#4295,
+    #2478, #3836, #5072 -- found these in one pass, and three of the four reported the
+    citation conflict independently."""
+
+    def gate(self, card, verdicts, diff):
+        with tempfile.TemporaryDirectory() as d:
+            d = pathlib.Path(d)
+            (d / "card.md").write_text(card)
+            (d / "verdicts.txt").write_text(verdicts)
+            (d / "pr.diff").write_text(diff)
+            (d / "ai_diagnostic.txt").write_text("")
+            (d / "answers.txt").write_text("")
+            return subprocess.run(
+                [sys.executable, str(TRIAGE), "card", str(d / "card.md"),
+                 str(d / "verdicts.txt"), str(d / "ai_diagnostic.txt"),
+                 str(d / "answers.txt"), str(d / "pr.diff")],
+                capture_output=True, text=True)
+
+    DIFF = ("diff --git a/aiter/mla.py b/aiter/mla.py\n--- a/aiter/mla.py\n"
+            "+++ b/aiter/mla.py\n@@ -1 +1,2 @@\n+    x = 1\n")
+
+    def test_a_card_obeying_the_no_rule_codes_rule_can_still_claim_its_fire(self):
+        """SKILL.md: "Do NOT use rule codes (P1, D4, A1...) in output". The gate matched
+        findings to fired rules by a leading `D8:`, so a card that followed the
+        instruction reported every fired rule as UNREPORTED-FIRE. The verdict's own cited
+        file is the same claim without the label."""
+        r = self.gate(
+            "\u26A0\uFE0F aiter/mla.py:1 drops the contiguous normalisation on the "
+            "EP path at 8192 tokens\n",
+            "D8 FIRE -- aiter/mla.py:1 no longer normalises the layout\n",
+            self.DIFF)
+        self.assertNotIn("UNREPORTED-FIRE", r.stdout)
+        self.assertEqual(0, r.returncode, r.stdout)
+
+    def test_an_unreported_fire_is_still_caught(self):
+        """The control: the relaxation above must not turn the gate off."""
+        r = self.gate(
+            "\u26A0\uFE0F aiter/mla.py:1 something unrelated to the verdict\n",
+            "D8 FIRE -- csrc/other.cu:9 a file the card never mentions\n",
+            self.DIFF)
+        self.assertIn("UNREPORTED-FIRE", r.stdout)
+
+    def test_torch_cuda_is_not_a_file_called_torch_cu(self):
+        """`torch.cuda.device(...)` and `x.contiguous.cuda()` are the two most ordinary
+        expressions in a HIP review; both parsed as citations of files nobody wrote."""
+        r = self.gate(
+            "\u26A0\uFE0F aiter/mla.py:1 launches without torch.cuda.device(Q.device) "
+            "so the module resolves against the wrong context at 2 GPUs\n",
+            "D8 FIRE -- aiter/mla.py:1 no device guard\n",
+            self.DIFF)
+        self.assertNotIn("torch.cu", r.stdout)
+        self.assertEqual(0, r.returncode, r.stdout)
+
+
+class TestSilenceIsDistinguishableFromSkipping(unittest.TestCase):
+    """SKILL.md tells the reader an empty artifact means the axis was not checked. Two
+    forensics broke that: the symbol sweep wrote 0 bytes when it ran and found nothing,
+    and ci_coverage said "every new test file lands where a CI job will run it" on a PR
+    that adds no test file, which reads as a pass."""
+
+    def run_mode(self, mode, diff):
+        with tempfile.TemporaryDirectory() as d:
+            f = pathlib.Path(d) / "pr.diff"
+            f.write_text(diff)
+            return subprocess.run(
+                [sys.executable, str(TRIAGE), mode, str(f), str(SKILL_DIR.parents[2])],
+                capture_output=True, text=True).stdout
+
+    CSV = ("diff --git a/aiter/configs/x.csv b/aiter/configs/x.csv\n"
+           "--- a/aiter/configs/x.csv\n+++ b/aiter/configs/x.csv\n@@ -1 +1,2 @@\n+1,2,3\n")
+
+    def test_a_clean_symbol_sweep_says_it_ran(self):
+        out = self.run_mode("symbols", self.CSV)
+        self.assertTrue(out.strip(), "an empty artifact reads as 'not checked'")
+        self.assertIn("IMPORTS RESOLVED", out)
+
+    def test_ci_coverage_does_not_pass_a_diff_with_no_tests(self):
+        out = self.run_mode("citest", self.CSV)
+        self.assertIn("not exercised", out)
+        self.assertNotIn("lands where a CI job will run it", out)
+
+    def test_ci_coverage_still_clears_a_real_test_file(self):
+        d = ("diff --git a/op_tests/test_new.py b/op_tests/test_new.py\n"
+             "new file mode 100644\n--- /dev/null\n+++ b/op_tests/test_new.py\n"
+             "@@ -0,0 +1 @@\n+def test_x(): pass\n")
+        self.assertIn("lands where a CI job will run it", self.run_mode("citest", d))
+
+
+class TestArtifactsListMatchesWhatIsWritten(unittest.TestCase):
+    """Three reviews went looking for evidence.txt because fetch.sh's closing line
+    promises it unconditionally; it is written only when a guard or signature changed.
+    The same line never learned about guards.txt, siblings.txt or kernel_tests.txt, which
+    were added later -- by me, three commits apart, without touching it."""
+
+    def test_every_named_artifact_is_one_the_script_writes(self):
+        src = FETCH.read_text()
+        line = [l for l in src.splitlines() if l.startswith("echo \"artifacts:")]
+        self.assertTrue(line, "fetch.sh no longer prints an artifacts line")
+        block = src[src.index('echo "artifacts:'):]
+        block = block[:block.index('"', block.index("artifacts:") + 40) + 400]
+        for name in ("guards.txt", "siblings.txt", "kernel_tests.txt"):
+            self.assertIn(name, block, f"{name} is written but never announced")
+
+    def test_the_conditional_artifact_is_announced_conditionally(self):
+        src = FETCH.read_text()
+        self.assertIn("${HAVE_EVIDENCE:+ evidence.txt}", src,
+                      "evidence.txt is written only for guard/signature diffs; "
+                      "announcing it unconditionally sends the reader after a file "
+                      "that is not there")
 

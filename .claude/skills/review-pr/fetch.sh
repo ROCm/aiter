@@ -782,9 +782,11 @@ if grep -q "invariant-removed\|api-signature" "$WORK/rules.txt"; then
   if [ -n "$HEAD_FILES" ]; then
     "$SKILLS_ROOT/review-pr/triage.py" evidence "$WORK/pr.diff" $HEAD_FILES \
       | tee "$WORK/evidence.txt"
+  HAVE_EVIDENCE=1
   else
     echo "SKIPPED: no head images available; cross-file evidence not collected" \
       | tee "$WORK/evidence.txt"
+  HAVE_EVIDENCE=1
   fi
 fi
 
@@ -874,5 +876,9 @@ fi
 
 echo
 echo "WORK=$WORK"
-echo "artifacts: pr.diff pr_meta.json base_head.txt rules.txt rules_expanded.txt test_quality.txt twins.txt ci_coverage.txt perf_claims.txt struct_abi.txt comment_only.txt \
-evidence.txt symbols.txt validation_requirement.json"
+# Naming a file that was not written sends the reviewer looking for it. evidence.txt is
+# produced only when a guard or a signature actually changed, so it is listed as such.
+echo "artifacts: pr.diff pr_meta.json base_head.txt rules.txt rules_expanded.txt \
+test_quality.txt twins.txt ci_coverage.txt perf_claims.txt struct_abi.txt comment_only.txt \
+guards.txt siblings.txt kernel_tests.txt symbols.txt validation_requirement.json \
+auto_validation_outcome.txt${HAVE_EVIDENCE:+ evidence.txt}"
