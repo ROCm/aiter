@@ -8,11 +8,23 @@ from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_a8w8_blockscale_spli
     _fused_gemm_a8w8_blockscale_preshuffle_split_cat,
     _fused_gemm_a8w8_blockscale_split_cat,
     _fused_gemm_a8w8_blockscale_split_cat_reduce,
-    _get_config,
 )
+from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+
+
+def _get_config(
+    M: int,
+    N: int,
+    K: int,
+    shuffle: bool = False,
+) -> dict:
+    shuffle_suffix = "_PRESHUFFLED" if shuffle else ""
+    config_name = f"GEMM-A8W8_BLOCKSCALE{shuffle_suffix}"
+
+    return get_gemm_config(config_name, M, N, K)
 
 
 def fused_gemm_a8w8_blockscale_split_cat(

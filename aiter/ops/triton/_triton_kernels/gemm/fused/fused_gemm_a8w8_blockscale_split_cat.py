@@ -7,7 +7,6 @@ import triton.language as tl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
-from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 _fused_gemm_a8w8_blockscale_split_cat_repr = make_kernel_repr(
     "_fused_gemm_a8w8_blockscale_split_cat",
@@ -658,15 +657,3 @@ def _fused_gemm_a8w8_blockscale_split_cat_reduce(
         + stride_c1_s * (offs_s[None, :] + S1)
     )
     tl.store(c1_ptrs, y, mask=y_mask)
-
-
-def _get_config(
-    M: int,
-    N: int,
-    K: int,
-    shuffle: bool = False,
-) -> dict:
-    shuffle_suffix = "_PRESHUFFLED" if shuffle else ""
-    config_name = f"GEMM-A8W8_BLOCKSCALE{shuffle_suffix}"
-
-    return get_gemm_config(config_name, M, N, K)
