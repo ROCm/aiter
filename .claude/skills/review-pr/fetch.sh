@@ -41,7 +41,7 @@ REPO_URL="https://github.com/$REPO"
 
 # Full metadata
 gh pr view "$PR" --repo "$REPO" \
-  --json title,body,number,labels,files,author,reviews,comments,baseRefName,headRefOid \
+  --json title,body,number,labels,files,author,reviews,comments,baseRefName,baseRefOid,headRefOid \
   > "$WORK/pr_meta.json"
 
 # Diff. Unchecked, this wrote an empty file and the run continued: `gh` reports a diff
@@ -71,7 +71,21 @@ BASE_REF=$(python3 -c \
 BASE_REF_PATH=$(python3 -c \
   'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' \
   "$BASE_REF")
-gh api "repos/$REPO/branches/$BASE_REF_PATH" --jq .commit.sha > "$WORK/base_head.txt"
+# A merged PR's base is often a deleted branch and the tip lookup 404s. Unguarded, `set -e`
+# killed the run on aiter#4045 with one line naming neither PR nor ref, after the diff had
+# fetched fine. Falls back to the recorded base OID: historical, so staleness cannot be
+# judged from it -- worth saying, and it beats no run.
+if ! gh api "repos/$REPO/branches/$BASE_REF_PATH" --jq .commit.sha \
+     > "$WORK/base_head.txt" 2>/dev/null || [ ! -s "$WORK/base_head.txt" ]; then
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("baseRefOid") or "")' \
+    "$WORK/pr_meta.json" > "$WORK/base_head.txt" 2>/dev/null || true
+  # grep, not `[ -s ]`: a missing baseRefOid prints an empty line, and "\n" is not empty.
+  grep -qE '^[0-9a-f]{7,40}$' "$WORK/base_head.txt" || {
+    echo "no base commit for PR #$PR: branch '$BASE_REF' has no tip and the metadata" >&2
+    echo "  carries no baseRefOid; nothing downstream could be trusted" >&2; exit 1; }
+  echo "NOTE: '$BASE_REF' has no tip (deleted/renamed); using recorded base" >&2
+  echo "  $(cat "$WORK/base_head.txt") -- historical, so staleness cannot be judged" >&2
+fi
 
 # Linked issue (extract from body "fix: #NNN" or "close #NNN")
 ISSUE=$(cat "$WORK/pr_meta.json" | python3 -c "
@@ -878,14 +892,17 @@ rm -f "$WORK/.err"
 # breakage happens.
 git -C "$PROJECT_ROOT" cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null \
   || git -C "$PROJECT_ROOT" fetch -q "$REPO_URL" "$BASE_SHA" 2>/dev/null || true
-# Day-old worktrees are finished reviews; drop them so keeping this one does not
-# accumulate 182M per review.
+# Day-old worktrees are finished reviews; drop them, or this accumulates 182M each.
 git -C "$PROJECT_ROOT" worktree list --porcelain 2>/dev/null \
   | sed -n 's|^worktree \(/tmp/review-pr-.*\)$|\1|p' \
   | while IFS= read -r w; do
-      [ -d "$w" ] && [ -z "$(find "$w" -maxdepth 0 -mtime -1 2>/dev/null)" ] \
-        && git -C "$PROJECT_ROOT" worktree remove --force "$w" >/dev/null 2>&1
-    done
+      # `if`, not an `&&` chain: the chain's status is the loop's, so a worktree NEWER
+      # than a day made the while return 1 and `set -euo pipefail` kill the script, before
+      # the checkout this loop exists to afford. Any box that ran a review that day hit it.
+      if [ -d "$w" ] && [ -z "$(find "$w" -maxdepth 0 -mtime -1 2>/dev/null)" ]; then
+        git -C "$PROJECT_ROOT" worktree remove --force "$w" >/dev/null 2>&1 || true
+      fi
+    done || true
 TARGET_WT="$WORK/merge-target"
 if git -C "$PROJECT_ROOT" worktree add --detach "$TARGET_WT" "$BASE_SHA" >/dev/null 2>&1; then
   "$SKILLS_ROOT/review-pr/triage.py" symbols "$WORK/pr.diff" "$TARGET_WT" \

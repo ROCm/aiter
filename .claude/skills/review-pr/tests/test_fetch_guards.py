@@ -353,3 +353,74 @@ class TestDiffMustNotBeEmpty(GuardHarness):
         root = self.make_project(diff=RUNTIME_DIFF, paths=("csrc/kernels/foo.cu",))
         self.assertEqual(0, self.run_fetch(root).returncode)
 
+
+class TestStepOneSurvivesItsOwnHousekeeping(GuardHarness):
+    """Six reviews in one wave reported fetch.sh dying before it printed WORK=.
+
+    The stale-worktree cleanup added one commit earlier ended its loop body with an
+    `&&` chain. A chain's status is the loop's status, so a worktree NEWER than a day made
+    the last iteration return 1, the `while` return 1, and `set -euo pipefail` kill the
+    script -- after the diff and most artifacts, before the symbol sweep, the merge-target
+    checkout and the `WORK=` line. Any machine that ran a review in the past day hit it,
+    which is every machine that uses this. The reviews recovered by hand and said so.
+
+    The test registers a fresh worktree first, because that is the state that triggers it:
+    an empty worktree list exits the loop cleanly and proves nothing."""
+
+    def test_a_fresh_worktree_does_not_kill_the_run(self):
+        root = self.make_project()
+        fresh = self.tmp / "review-pr-fresh"
+        subprocess.run([self.real_git, "-C", str(root), "worktree", "add", "--detach",
+                        str(fresh), "HEAD"], capture_output=True)
+        try:
+            r = self.run_fetch(root)
+            self.assertEqual(0, r.returncode,
+                             f"fetch.sh died with a fresh worktree registered:\n"
+                             f"{r.stdout[-1500:]}\n{r.stderr[-1500:]}")
+            self.assertIn("WORK=/tmp/review-pr-", r.stdout,
+                          "the run ended before announcing its work dir")
+        finally:
+            subprocess.run([self.real_git, "-C", str(root), "worktree", "remove",
+                            "--force", str(fresh)], capture_output=True)
+
+    def test_the_loop_body_is_not_an_and_chain(self):
+        """Pinned in source too: the shape is what fails, and it fails only under a state
+        a unit test has to go out of its way to create."""
+        src = FETCH.read_text()
+        i = src.index("worktree list --porcelain")
+        block = src[i:i + 700]
+        self.assertIn("if [ -d", block,
+                      "the cleanup loop is back to an && chain; its status becomes the "
+                      "while's, and set -e kills the script on a fresh worktree")
+
+
+class TestADeletedBaseBranchIsNotFatal(GuardHarness):
+    """aiter#4045's base is `dev/randomflow_pr`, deleted after merge. The branch-tip
+    lookup 404s, and unguarded `set -e` killed the whole run with one line -- "gh: Branch
+    not found (HTTP 404)" -- naming neither the PR nor the ref, after the diff had already
+    been fetched successfully. The PR's own metadata carries the base OID."""
+
+    def test_a_404_on_the_base_branch_falls_back_to_the_recorded_oid(self):
+        root = self.make_project()
+        (self.gh_dir / "base_sha.txt").unlink()          # the stub then errors on `api`
+        (self.gh_dir / "pr_meta.json").write_text(
+            meta(("README.md",)).replace('"baseRefName": "main"',
+                                         '"baseRefName": "dev/gone", '
+                                         f'"baseRefOid": "{BASE_SHA}"'))
+        r = self.run_fetch(root)
+        self.assertEqual(0, r.returncode,
+                         f"a deleted base branch should not end the review:\n"
+                         f"{r.stdout[-1500:]}\n{r.stderr[-1500:]}")
+        self.assertIn("has no tip", r.stderr)
+        self.assertIn("staleness cannot be judged", r.stderr,
+                      "the fallback weakens staleness detection and must say so")
+
+    def test_no_base_at_all_still_fails_closed(self):
+        root = self.make_project()
+        (self.gh_dir / "base_sha.txt").unlink()
+        (self.gh_dir / "pr_meta.json").write_text(
+            meta(("README.md",)).replace('"baseRefName": "main"', '"baseRefName": "dev/gone"'))
+        r = self.run_fetch(root)
+        self.assertEqual(1, r.returncode)
+        self.assertIn("no base commit", r.stdout + r.stderr)
+

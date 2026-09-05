@@ -33,13 +33,20 @@ MAX_FENCE_LINES = 30
 # generous on purpose -- it is a program, and it is not in the reviewer's reading path --
 # but it is counted.
 #
-# Raised 900 -> 930 deliberately, once, to keep the merge-target checkout alive and
-# self-cleaning. Three quarters of the findings an independent adversary killed across a
-# 50-PR wave were premises about code the review had never read on the tree that decides
-# them, because that checkout was created for the symbol sweep and deleted on the next
-# line. The purpose of this number is that growth gets noticed and argued for, which is
-# what this comment is.
-MAX_FETCH_LINES = 930
+# Raised 900 -> 930 to keep the merge-target checkout alive and self-cleaning: three
+# quarters of the findings an independent adversary killed across a 50-PR wave were
+# premises about code the review had never read on the tree that decides them, because
+# that checkout was created for the symbol sweep and deleted on the next line.
+#
+# Raised 930 -> 945 for two bugs the next wave found in that same code. The cleanup loop
+# ended in an `&&` chain, so a worktree younger than a day made `set -euo pipefail` kill
+# Step 1 outright -- on every machine that had run a review that day. And a PR whose base
+# branch was deleted after merge (aiter#4045) 404'd the branch-tip lookup and took the
+# whole run with it. Both fixes carry the explanation of what failed, and shaving those
+# explanations to fit a number is the wrong trade: the number exists so growth is noticed
+# and argued, and this is the argument. Two raises, both recorded, both for capability
+# this file did not have before.
+MAX_FETCH_LINES = 945
 
 
 def fences(text):
@@ -58,7 +65,9 @@ def fences(text):
 
 class TestEntryBudget(unittest.TestCase):
     def test_skill_md_within_budget(self):
-        n = len(SKILL_MD.read_text().split("\n"))
+        # splitlines(), not split("\n"): a file ending in a newline has one more element
+        # than it has lines, so the constant silently meant one less than it says.
+        n = len(SKILL_MD.read_text().splitlines())
         self.assertLessEqual(
             n, MAX_SKILL_LINES,
             f"SKILL.md is {n} lines, over the {MAX_SKILL_LINES}-line budget. Conditional "
@@ -75,7 +84,7 @@ class TestEntryBudget(unittest.TestCase):
 
 
     def test_fetch_script_within_budget(self):
-        n = len(FETCH.read_text().split("\n"))
+        n = len(FETCH.read_text().splitlines())
         self.assertLessEqual(
             n, MAX_FETCH_LINES,
             f"fetch.sh is {n} lines, over the {MAX_FETCH_LINES}-line budget. Step 1 is a "
