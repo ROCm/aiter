@@ -92,6 +92,10 @@ from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
 from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
     v2_stage1_sorted_ref as _v2_stage1_ref,
 )
+from csrc.ck_gemm_moe_2stages_codegen.mxfp4_staged_search import (
+    build_staged_candidate_plan,
+    resolve_search_config,
+)
 from csrc.opus_moe.opus_moe_common import (
     OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT,
     get_opus_a8w4_stage2_kernels,
@@ -6072,6 +6076,45 @@ class Mxfp4FlydslTuner(FmoeTuner):
         "config_env_name": "AITER_CONFIG_FMOE",
     }
 
+    def _setup_specific_arguments(self):
+        super()._setup_specific_arguments()
+        self.parser.add_argument(
+            "--mxfp4-search",
+            choices=("full", "staged"),
+            default="full",
+            help="MXFP4 pipeline-pair search mode (default: full)",
+        )
+        self.parser.add_argument(
+            "--mxfp4-screen-topk",
+            dest="screen_topk",
+            type=int,
+            default=None,
+            help="stage candidates retained per screening context (default: 2)",
+        )
+
+    def parse_args(self):
+        args = super().parse_args()
+        try:
+            search = resolve_search_config(
+                search_mode=args.mxfp4_search,
+                explicit_screen_topk=args.screen_topk,
+                gfx=get_gfx(),
+            )
+        except ValueError as exc:
+            self.parser.error(str(exc))
+        args.mxfp4_search = search.mode
+        args.screen_topk = search.screen_topk
+        return args
+
+    def _staged_candidate_plan(self, row):
+        return build_staged_candidate_plan(
+            row,
+            self._candidate_rows(row),
+            mxfp4_intermediate=(
+                os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") == "1"
+            ),
+        )
+
     @staticmethod
     def _g1_kname(
         bm,
@@ -6460,8 +6503,15 @@ class Mxfp4FlydslTuner(FmoeTuner):
             except ValueError:
                 timeout = 0  # not on the main thread; cannot arm SIGALRM
 
+        search_mode = getattr(args, "mxfp4_search", "full")
+        if search_mode == "staged":
+            plan = self._staged_candidate_plan(row)
+            candidate_rows = [dict(pair.candidate_row) for pair in plan.pairs]
+        else:
+            candidate_rows = self._candidate_rows(row)
+
         best, failures = None, []
-        for candidate in self._candidate_rows(row):
+        for candidate in candidate_rows:
             if timeout > 0:
                 signal.alarm(timeout)
             try:
@@ -6482,7 +6532,11 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 if timeout > 0:
                     signal.alarm(0)
         if best is None:
-            best = self._candidate_rows(row)[0]
+            best = (
+                candidate_rows[0]
+                if search_mode == "staged"
+                else self._candidate_rows(row)[0]
+            )
             best["us"] = self.INVALID_TIME
             best["kernelName1"] = ("FAILED: " + "; ".join(failures))[:240]
             print(

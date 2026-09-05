@@ -36,6 +36,7 @@ from aiter.ops.flydsl.mxfp4_kname import (
     _is_mxfp4_kname,
     _parse_mxfp4_g1_kname,
     _parse_mxfp4_g2_kname,
+    mxfp4_intermediate_is_eligible,
     native_scale_layout_for,
     parse_flydsl_v2_gemm2_kernel,
     parse_g2_kname_any,
@@ -1922,8 +1923,11 @@ def _mxfp4_a4w4_stage2(
     if atomic:
         out_buf = out_dst
     else:
-        _mx_shape_ok = (
-            BM == 128 and D_HIDDEN == 7168 and D_INTER == 512 and NE in (257, 385)
+        _mx_shape_ok = mxfp4_intermediate_is_eligible(
+            BM=BM,
+            D_HIDDEN=D_HIDDEN,
+            D_INTER=D_INTER,
+            NE=NE,
         )
 
         # Lossy before-sum 4-bit quant (ok for gsm8k, degrades other evals): opt-in.

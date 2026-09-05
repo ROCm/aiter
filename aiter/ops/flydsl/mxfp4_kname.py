@@ -54,6 +54,18 @@ def native_scale_layout_for(BM: int, out_dtype: str) -> bool:
     return int(BM) == 16 and str(out_dtype).lower() == "fp4"
 
 
+def mxfp4_intermediate_is_eligible(
+    *, BM: int, D_HIDDEN: int, D_INTER: int, NE: int
+) -> bool:
+    """Whether the native non-atomic runtime can emit MXFP4 intermediate output."""
+    return (
+        int(BM) == 128
+        and int(D_HIDDEN) == 7168
+        and int(D_INTER) == 512
+        and int(NE) in (257, 385)
+    )
+
+
 _FLYDSL_V2_GEMM2_RE = re.compile(
     r"^flydsl_moe2_layout_a(?P<a>\w+?)_w(?P<b>\w+?)_(?P<out>\w+?)_"
     r"t(?P<tm>\d+)x(?P<tn>\d+)x(?P<tk>\d+)_(?P<epilog>atomic|reduce)"
