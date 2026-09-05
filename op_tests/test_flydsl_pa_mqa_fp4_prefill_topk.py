@@ -12,30 +12,6 @@ import argparse
 
 import torch
 
-from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl import (
-    FP4_PREFILL_TOPK_IN_KERNEL_FUSION_COMPLETE,
-    allocate_fp4_prefill_topk_workspace,
-    flydsl_pa_mqa_fp4_prefill_topk,
-    flydsl_pa_mqa_fp4_score_tile_topk,
-    flydsl_pa_mqa_logits_fp4_prefill,
-)
-from aiter.ops.topk import top_k_per_row_prefill
-from aiter.test_common import run_perftest
-
-try:
-    from op_tests.test_flydsl_pa_mqa_logits_fp4_prefill import (
-        indexer_k_fp4_paged_preshuffle,
-        quant_q_fp4_preshuffle,
-    )
-except ModuleNotFoundError:
-    # Direct ``python op_tests/<this file>`` puts op_tests, not the repository
-    # root, at sys.path[0].
-    from test_flydsl_pa_mqa_logits_fp4_prefill import (  # type: ignore[no-redef]
-        indexer_k_fp4_paged_preshuffle,
-        quant_q_fp4_preshuffle,
-    )
-
 HEADS = 64
 HEAD_DIM = 128
 KV_BLOCK_SIZE = 64
@@ -43,6 +19,18 @@ TILE_TOKENS = 4096
 
 
 def _make_case(seed=7, zero_q=False):
+    try:
+        from op_tests.test_flydsl_pa_mqa_logits_fp4_prefill import (
+            indexer_k_fp4_paged_preshuffle,
+            quant_q_fp4_preshuffle,
+        )
+    except ModuleNotFoundError:
+        # Direct execution puts op_tests, not the repository root, at sys.path[0].
+        from test_flydsl_pa_mqa_logits_fp4_prefill import (  # type: ignore[no-redef]
+            indexer_k_fp4_paged_preshuffle,
+            quant_q_fp4_preshuffle,
+        )
+
     torch.manual_seed(seed)
     device = torch.device("cuda")
     batch = 2
@@ -121,7 +109,9 @@ def _make_case(seed=7, zero_q=False):
     )
 
 
-def _stable_reference(full_logits, block_tables, rb, starts, ends, k):
+def _stable_reference(
+    full_logits, block_tables, rb, starts, ends, k, *, score_order=True
+):
     rows = full_logits.shape[0]
     values = torch.full(
         (rows, k), -float("inf"), dtype=torch.float32, device=full_logits.device
@@ -138,11 +128,14 @@ def _stable_reference(full_logits, block_tables, rb, starts, ends, k):
         valid_counts[row] = count
         if count == 0:
             continue
-        scores = full_logits[row, start:end]
-        # Stable descending rank makes the smaller raw index win a score tie.
-        ranked = torch.argsort(scores, descending=True, stable=True)[:count] + start
-        # The stable aiter emitter returns the winner set in raw-index order.
-        raw = torch.sort(ranked, stable=True).values
+        if end - start <= k:
+            raw = torch.arange(start, end, device=full_logits.device)
+        else:
+            scores = full_logits[row, start:end]
+            # Stable descending rank makes the smaller raw index win a score tie.
+            raw = torch.argsort(scores, descending=True, stable=True)[:count] + start
+            if not score_order:
+                raw = torch.sort(raw, stable=True).values
         raw_indices[row, :count] = raw.to(torch.int32)
         values[row, :count] = full_logits[row, raw]
         batch = int(rb[row])
@@ -154,6 +147,8 @@ def _stable_reference(full_logits, block_tables, rb, starts, ends, k):
 
 
 def _full_logits(case, weight_scale):
+    from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4_prefill
+
     (
         q_fp4,
         q_scale,
@@ -184,6 +179,12 @@ def _full_logits(case, weight_scale):
 
 
 def check_case(k, *, zero_q=False, check_tile=True):
+    from aiter.ops.flydsl import (
+        allocate_fp4_bounded_prefill_topk_workspace,
+        flydsl_pa_mqa_fp4_prefill_topk,
+        flydsl_pa_mqa_fp4_score_tile_topk,
+    )
+
     case = _make_case(seed=17 + k, zero_q=zero_q)
     weight_scale = 1.25
     full = _full_logits(case, weight_scale)
@@ -199,7 +200,7 @@ def check_case(k, *, zero_q=False, check_tile=True):
         ends,
         max_seq_len,
     ) = case
-    workspace = allocate_fp4_prefill_topk_workspace(
+    workspace = allocate_fp4_bounded_prefill_topk_workspace(
         q_fp4.shape[0], k, q_fp4.device, tile_tokens=TILE_TOKENS
     )
     result = flydsl_pa_mqa_fp4_prefill_topk(
@@ -238,7 +239,15 @@ def check_case(k, *, zero_q=False, check_tile=True):
         tile_ends = torch.minimum(
             ends, torch.full_like(ends, min(tile_start + TILE_TOKENS, max_seq_len))
         )
-        tile_ref = _stable_reference(full, block_tables, rb, tile_starts, tile_ends, k)
+        tile_ref = _stable_reference(
+            full,
+            block_tables,
+            rb,
+            tile_starts,
+            tile_ends,
+            k,
+            score_order=False,
+        )
         torch.cuda.synchronize()
         torch.testing.assert_close(candidates.raw_indices, tile_ref[1], rtol=0, atol=0)
         torch.testing.assert_close(candidates.valid_counts, tile_ref[3], rtol=0, atol=0)
@@ -253,6 +262,15 @@ def check_case(k, *, zero_q=False, check_tile=True):
 
 
 def benchmark_case(k, case, workspace, iters, warmup):
+    from aiter.ops.flydsl import (
+        allocate_fp4_prefill_topk_workspace,
+        flydsl_pa_mqa_fp4_prefill_topk,
+        flydsl_pa_mqa_logits_fp4_prefill,
+        flydsl_pa_mqa_topk_fp4_prefill,
+    )
+    from aiter.ops.topk import top_k_per_row_prefill
+    from aiter.test_common import run_perftest
+
     (
         q_fp4,
         _q_scale,
@@ -274,6 +292,13 @@ def benchmark_case(k, case, workspace, iters, warmup):
     full_idx = torch.empty((q_fp4.shape[0], k), dtype=torch.int32, device=q_fp4.device)
     full_val = torch.empty(
         (q_fp4.shape[0], k), dtype=torch.float32, device=q_fp4.device
+    )
+    parallel_unit_num = max(512, q_fp4.shape[0])
+    fused_workspace = allocate_fp4_prefill_topk_workspace(
+        q_fp4.shape[0],
+        parallel_unit_num,
+        k,
+        q_fp4.device,
     )
 
     def bounded():
@@ -314,12 +339,27 @@ def benchmark_case(k, case, workspace, iters, warmup):
             stable=True,
         )
 
+    def fused():
+        return flydsl_pa_mqa_topk_fp4_prefill(
+            *case[:6],
+            rb,
+            starts,
+            ends,
+            max_seq_len,
+            topk=k,
+            weight_scale=1.25,
+            parallel_unit_num=parallel_unit_num,
+            workspace=fused_workspace,
+        )
+
     _, bounded_us = run_perftest(bounded, num_iters=iters, num_warmup=warmup)
+    _, fused_us = run_perftest(fused, num_iters=iters, num_warmup=warmup)
     _, full_us = run_perftest(full_logits_topk, num_iters=iters, num_warmup=warmup)
     print(
-        f"[bench] k={k} bounded={bounded_us:.2f} us "
+        f"[bench] k={k} fused={fused_us:.2f} us bounded={bounded_us:.2f} us "
         f"full-logits+stable-topk={full_us:.2f} us "
-        f"ratio={full_us / bounded_us:.3f}x"
+        f"speedup(fused/full)={full_us / fused_us:.3f}x "
+        f"speedup(bounded/full)={full_us / bounded_us:.3f}x"
     )
 
 
@@ -329,13 +369,20 @@ def main():
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--warmup", type=int, default=10)
     args = parser.parse_args()
-    if not torch.cuda.is_available() or get_gfx() != "gfx950":
-        print(
-            f"[skip] requires gfx950 (current: {get_gfx() if torch.cuda.is_available() else 'none'})"
-        )
+    if not torch.cuda.is_available():
+        print("[skip] requires gfx950 (current: none)")
         return
 
-    assert not FP4_PREFILL_TOPK_IN_KERNEL_FUSION_COMPLETE
+    from aiter.jit.utils.chip_info import get_gfx
+    from aiter.ops.flydsl import (
+        FP4_TILED_PREFILL_TOPK_IN_KERNEL_FUSION_COMPLETE,
+    )
+
+    if get_gfx() != "gfx950":
+        print(f"[skip] requires gfx950 (current: {get_gfx()})")
+        return
+
+    assert not FP4_TILED_PREFILL_TOPK_IN_KERNEL_FUSION_COMPLETE
     for k in (512, 1024):
         case, workspace = check_case(k)
         check_case(k, zero_q=True, check_tile=False)

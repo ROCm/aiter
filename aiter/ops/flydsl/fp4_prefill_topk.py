@@ -22,8 +22,6 @@ import torch
 import triton
 import triton.language as tl
 
-from aiter.ops.topk import top_k_per_row_prefill
-
 from .kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
     CTA_INFO_WIDTH,
     flydsl_pa_mqa_logits_fp4_prefill,
@@ -37,9 +35,13 @@ _BLOCK_K = 256
 _NUM_WARPS = 4
 _DEFAULT_TILE_TOKENS = 4096
 
-# The public path below is exact and bounded, but its tile-local stable radix
-# selection is still a second launch over a bounded score tile.
-FP4_PREFILL_TOPK_IN_KERNEL_FUSION_COMPLETE = False
+# The tiled path below is exact and bounded, but its tile-local stable radix
+# selection is still a second launch over a bounded score tile. This flag says
+# nothing about the separate canonical score-CTA implementation.
+FP4_TILED_PREFILL_TOPK_IN_KERNEL_FUSION_COMPLETE = False
+FP4_PREFILL_TOPK_IN_KERNEL_FUSION_COMPLETE = (
+    FP4_TILED_PREFILL_TOPK_IN_KERNEL_FUSION_COMPLETE
+)
 
 
 class FP4PrefillTopKCandidates(NamedTuple):
@@ -306,35 +308,6 @@ def _gather_merged_raw_indices_kernel(
         tl.store(out_valid_counts + row, tl.minimum(total, K))
 
 
-@triton.jit(do_not_specialize=["rows", "block_table_stride"])
-def _map_raw_to_paged_kv_kernel(
-    raw_indices,
-    row_to_batch,
-    block_tables,
-    out_kv_indices,
-    rows,
-    block_table_stride,
-    K: tl.constexpr,
-    PAGE_SIZE: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    row = tl.program_id(0)
-    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    mask = col < K
-    raw = tl.load(raw_indices + row * K + col, mask=mask, other=-1)
-    live = mask & (raw >= 0)
-    safe_raw = tl.maximum(raw, 0)
-    batch = tl.load(row_to_batch + row)
-    logical_page = safe_raw // PAGE_SIZE
-    physical_page = tl.load(
-        block_tables + batch * block_table_stride + logical_page,
-        mask=live,
-        other=0,
-    )
-    mapped = physical_page * PAGE_SIZE + safe_raw % PAGE_SIZE
-    tl.store(out_kv_indices + row * K + col, tl.where(live, mapped, -1), mask=mask)
-
-
 def _validate_shape_parameters(rows: int, k: int, tile_tokens: int) -> None:
     if rows < 0:
         raise ValueError(f"rows must be non-negative, got {rows}")
@@ -500,6 +473,17 @@ def _launch_grid(rows: int, width: int, block: int) -> tuple[int, int]:
     return rows, triton.cdiv(width, block)
 
 
+@triton.jit
+def _canonicalize_nan_low_kernel(scores, elements, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < elements
+    values = tl.load(scores + offsets, mask=mask)
+    bits = values.to(tl.int32, bitcast=True)
+    is_nan = (bits & 0x7FFFFFFF) > 0x7F800000
+    negative_nan = tl.full((BLOCK,), -1, tl.int32).to(tl.float32, bitcast=True)
+    tl.store(scores + offsets, tl.where(is_nan, negative_nan, values), mask=mask)
+
+
 def _score_tile_topk_into(
     q_fp4: torch.Tensor,
     q_scale: torch.Tensor,
@@ -517,6 +501,8 @@ def _score_tile_topk_into(
     weight_scale: float,
     stream: torch.cuda.Stream,
 ) -> FP4PrefillTopKCandidates:
+    from aiter.ops.topk import top_k_per_row_prefill
+
     rows, k, tile_tokens = workspace.rows, workspace.k, workspace.tile_tokens
     if rows == 0:
         return FP4PrefillTopKCandidates(
@@ -563,6 +549,12 @@ def _score_tile_topk_into(
         n_ctas=rows,
         output_token_base=tile_start,
         stream=stream,
+    )
+    elements = rows * tile_tokens
+    _canonicalize_nan_low_kernel[(triton.cdiv(elements, 256),)](
+        workspace.tile_scores,
+        elements,
+        BLOCK=256,
     )
 
     # KERNEL-FUSION TODO(gfx950): reserve tile_tokens*f32 LDS in the score CTA,
@@ -691,9 +683,9 @@ def flydsl_pa_mqa_fp4_prefill_topk(
 ) -> FP4PrefillTopKResult:
     """Exact bounded FP4 score + stable TopK + page mapping on gfx950.
 
-    Stability is by ascending raw logical index. Ranking is descending score,
-    with the smaller raw index winning a threshold tie. K may be 512 or 1024;
-    short and empty ragged windows are padded with ``(-inf, -1, -1)``.
+    Long rows are returned in total order (score descending, raw logical index
+    ascending). Rows no longer than K preserve their complete sequential
+    window. Empty/short rows are padded with ``(-inf, -1, -1)``.
     """
 
     _validate_inputs(
@@ -711,6 +703,8 @@ def flydsl_pa_mqa_fp4_prefill_topk(
         tile_tokens,
     )
     rows = q_fp4.shape[0]
+    from aiter.ops.topk import top_k_per_row_prefill
+
     if workspace is None:
         workspace = allocate_fp4_prefill_topk_workspace(
             rows, k, q_fp4.device, tile_tokens=tile_tokens
@@ -806,18 +800,25 @@ def flydsl_pa_mqa_fp4_prefill_topk(
             accum_raw, next_raw = next_raw, accum_raw
 
         if rows:
-            block = 256
-            _map_raw_to_paged_kv_kernel[_launch_grid(rows, k, block)](
+            from .mqa_topk_finalize import order_and_map_mqa_topk
+
+            order_and_map_mqa_topk(
+                accum_values,
                 accum_raw,
+                workspace.accum_valid_counts,
+                local_starts,
+                local_ends,
                 row_to_batch,
                 block_tables,
+                next_values,
+                next_raw,
                 workspace.mapped_kv_indices,
-                rows,
-                block_tables.stride(0),
-                K=k,
-                PAGE_SIZE=_KV_BLOCK_SIZE,
-                BLOCK=block,
+                max_seq_len,
+                k,
+                _KV_BLOCK_SIZE,
             )
+            accum_values = next_values
+            accum_raw = next_raw
 
     return FP4PrefillTopKResult(
         accum_values,
@@ -838,6 +839,7 @@ flydsl_pa_mqa_topk_fp4_prefill_tiled = flydsl_pa_mqa_fp4_prefill_topk
 
 __all__ = [
     "FP4_PREFILL_TOPK_IN_KERNEL_FUSION_COMPLETE",
+    "FP4_TILED_PREFILL_TOPK_IN_KERNEL_FUSION_COMPLETE",
     "FP4BoundedPrefillTopKResult",
     "FP4BoundedPrefillTopKWorkspace",
     "FP4PrefillTopKCandidates",

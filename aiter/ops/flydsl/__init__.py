@@ -33,9 +33,9 @@ _LAZY_IMPORTS = {
         ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
         "FP4PrefillTopKWorkspace",
     ),
-    "FP4_PREFILL_TOPK_IN_KERNEL_FUSION_COMPLETE": (
+    "FP4_TILED_PREFILL_TOPK_IN_KERNEL_FUSION_COMPLETE": (
         ".fp4_prefill_topk",
-        "FP4_PREFILL_TOPK_IN_KERNEL_FUSION_COMPLETE",
+        "FP4_TILED_PREFILL_TOPK_IN_KERNEL_FUSION_COMPLETE",
     ),
     "FP4PrefillTopKCandidates": (
         ".fp4_prefill_topk",
@@ -125,7 +125,7 @@ _LAZY_IMPORTS = {
 }
 
 __all__ = [
-    "FP4_PREFILL_TOPK_IN_KERNEL_FUSION_COMPLETE",
+    "FP4_TILED_PREFILL_TOPK_IN_KERNEL_FUSION_COMPLETE",
     "FP8_MQA_LOGITS_DEFAULT_VARIANT",
     "FP8_MQA_LOGITS_VARIANTS",
     "FP4BoundedPrefillTopKResult",

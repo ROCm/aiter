@@ -174,6 +174,9 @@ class FP4PrefillTopKWorkspace(NamedTuple):
     candidate_values: torch.Tensor
     candidate_indices: torch.Tensor
     candidate_counts: torch.Tensor
+    merge_values: torch.Tensor
+    merge_indices: torch.Tensor
+    merge_physical_indices: torch.Tensor
 
 
 class FP4PrefillTopKResult(NamedTuple):
@@ -219,6 +222,14 @@ def allocate_fp4_prefill_topk_workspace(
         ),
         candidate_counts=torch.empty(
             parallel_unit_num,
+            dtype=torch.int32,
+            device=device,
+        ),
+        merge_values=torch.empty(rows, topk, dtype=torch.float32, device=device),
+        merge_indices=torch.empty(rows, topk, dtype=torch.int32, device=device),
+        merge_physical_indices=torch.empty(
+            rows,
+            topk,
             dtype=torch.int32,
             device=device,
         ),
@@ -503,12 +514,8 @@ def build_pa_mqa_logits_fp4_prefill_module(
         ), "streaming TopK requires the 256-thread/4-wave score body"
         assert score_batch_chunks in (1, 2, 4), "score_batch_chunks must be 1, 2, or 4"
         pool_capacity = candidate_topk + score_batch_chunks * block_k
-        pool_steps = (
-            pool_capacity + TOPK_BLOCK_THREADS - 1
-        ) // TOPK_BLOCK_THREADS
-        output_steps = (
-            candidate_topk + TOPK_BLOCK_THREADS - 1
-        ) // TOPK_BLOCK_THREADS
+        pool_steps = (pool_capacity + TOPK_BLOCK_THREADS - 1) // TOPK_BLOCK_THREADS
+        output_steps = (candidate_topk + TOPK_BLOCK_THREADS - 1) // TOPK_BLOCK_THREADS
         streaming_storage_type = make_streaming_topk_storage(
             candidate_topk,
             pool_capacity,
@@ -656,9 +663,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
             topk_histogram = topk_storage.histogram.peek().view(
                 fx.make_layout(NUM_HIST_BINS, 1)
             )
-            topk_scan = topk_storage.scan.peek().view(
-                fx.make_layout(NUM_WAVES + 1, 1)
-            )
+            topk_scan = topk_storage.scan.peek().view(fx.make_layout(NUM_WAVES + 1, 1))
             topk_state = topk_storage.state.peek().view(
                 fx.make_layout(_STREAM_STATE_SIZE, 1)
             )
@@ -881,11 +886,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
                         index_mask,
                     )
                     if prefix_match:
-                        key = (
-                            score_ord
-                            if const_expr(key_byte < 4)
-                            else raw_index
-                        )
+                        key = score_ord if const_expr(key_byte < 4) else raw_index
                         bucket = radix_byte(key, byte_position) ^ fx.Int32(xor_value)
                         atomic_add_i32(topk_histogram, 1, bucket, "workgroup")
                 gpu.barrier()
@@ -940,8 +941,10 @@ def build_pa_mqa_logits_fp4_prefill_module(
                     threshold_score,
                     threshold_index,
                 )
-                equal = live & (score_ord == threshold_score) & (
-                    raw_index == threshold_index
+                equal = (
+                    live
+                    & (score_ord == threshold_score)
+                    & (raw_index == threshold_index)
                 )
                 better_i32 = better.select(fx.Int32(1), fx.Int32(0))
                 equal_i32 = equal.select(fx.Int32(1), fx.Int32(0))
@@ -1022,9 +1025,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
             live_count = live_last - live_first
             live_count = (live_count < 0).select(fx.Int32(0), live_count)
             if tid == 0:
-                topk_state[_STREAM_PENDING] = (
-                    topk_state[_STREAM_PENDING] + live_count
-                )
+                topk_state[_STREAM_PENDING] = topk_state[_STREAM_PENDING] + live_count
             gpu.barrier()
 
             batch_boundary = (
@@ -1032,10 +1033,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
             ) == 0
             final_chunk = c_i32_arg == chunk_count - fx.Int32(1)
             if batch_boundary | final_chunk:
-                pool_count = (
-                    topk_state[_STREAM_RETAINED]
-                    + topk_state[_STREAM_PENDING]
-                )
+                pool_count = topk_state[_STREAM_RETAINED] + topk_state[_STREAM_PENDING]
                 if pool_count > fx.Int32(candidate_topk):
                     _select_score_pool(
                         pool_count,
@@ -1342,9 +1340,7 @@ def compile_pa_mqa_logits_fp4_prefill(
             stride_out,
             output_token_base,
             weight_scale,
-        ).launch(
-            grid=(gxi,), block=(block_threads, 1, 1), stream=stream
-        )
+        ).launch(grid=(gxi,), block=(block_threads, 1, 1), stream=stream)
 
     return launch_pa_mqa_logits_fp4_prefill, block_threads
 
@@ -1501,7 +1497,7 @@ def flydsl_pa_mqa_logits_fp4_prefill(
     return out
 
 
-def flydsl_pa_mqa_logits_fp4_prefill_topk(
+def flydsl_pa_mqa_topk_fp4_prefill(
     q_fp4: torch.Tensor,
     q_scale: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -1518,7 +1514,7 @@ def flydsl_pa_mqa_logits_fp4_prefill_topk(
     block_k: int = 256,
     kv_block_size: int = 64,
     num_warps: int = DEFAULT_NUM_WARPS,
-    parallel_unit_num: int = 512,
+    parallel_unit_num: int | None = None,
     score_batch_chunks: int = 4,
     workspace: FP4PrefillTopKWorkspace | None = None,
     out: FP4PrefillTopKResult | None = None,
@@ -1530,7 +1526,9 @@ def flydsl_pa_mqa_logits_fp4_prefill_topk(
     streams up to ``score_batch_chunks * block_k`` new scores through LDS,
     repeatedly retaining its exact ``topk`` under score-descending/index-
     ascending order. A second kernel merges the split candidates exactly and
-    maps their logical sequence indices through ``block_tables``.
+    a bounded finalizer returns long rows in that total order and maps logical
+    sequence indices through ``block_tables``. Rows no longer than ``topk``
+    preserve sequential logical-index order.
 
     ``workspace`` exposes the per-CTA values, raw indices, and counts for
     callers that need to exchange or inspect local candidates. Reuse both
@@ -1540,26 +1538,56 @@ def flydsl_pa_mqa_logits_fp4_prefill_topk(
     if topk not in (512, 1024):
         raise ValueError("topk must be 512 or 1024")
     if block_k != 256 or num_warps != 4:
-        raise ValueError(
-            "the fused TopK path requires block_k=256 and num_warps=4"
-        )
+        raise ValueError("the fused TopK path requires block_k=256 and num_warps=4")
+    if kv_block_size != 64:
+        raise ValueError("the fused TopK path requires kv_block_size=64")
     if score_batch_chunks not in (1, 2, 4):
         raise ValueError("score_batch_chunks must be 1, 2, or 4")
 
+    if q_fp4.ndim != 3:
+        raise ValueError("q_fp4 must have shape [rows, 64, 64]")
     rows, heads, head_dim_packed = q_fp4.shape
     if rows <= 0:
         raise ValueError("the fused TopK path requires at least one query row")
+    if parallel_unit_num is None:
+        parallel_unit_num = max(512, rows)
     head_dim = head_dim_packed * 2
+    if heads != 64 or head_dim != 128:
+        raise ValueError("the fused TopK path requires production H=64 and D=128")
+    if q_fp4.dtype != torch.uint8 or q_scale.dtype != torch.uint8:
+        raise ValueError("q_fp4 and q_scale must use the packed uint8 FP4 ABI")
+    if q_scale.shape != (rows, 1, 4, 16, 4):
+        raise ValueError("q_scale must have shape [rows, 1, 4, 16, 4]")
+    if weights.shape != (rows, 64) or weights.dtype != torch.bfloat16:
+        raise ValueError("weights must be contiguous bfloat16 [rows, 64]")
+    if kv_cache.dtype != torch.uint8 or tuple(kv_cache.shape[1:]) != (
+        1,
+        4,
+        64,
+        16,
+    ):
+        raise ValueError("kv_cache must be uint8 [blocks, 1, 4, 64, 16]")
+    if kv_scale.dtype != torch.uint8 or tuple(kv_scale.shape[1:]) != (
+        1,
+        4,
+        64,
+    ):
+        raise ValueError("kv_scale must be uint8 [blocks, 1, 4, 64]")
     device = q_fp4.device
     if device.type != "cuda":
         raise ValueError("q_fp4 must be a CUDA tensor")
+    arch = str(torch.cuda.get_device_properties(device).gcnArchName).split(":")[0]
+    if arch != "gfx950":
+        raise ValueError(f"the fused TopK path requires gfx950, got {arch}")
     metadata = (row_to_batch, local_starts, local_ends)
     if any(t.dtype != torch.int32 or t.shape != (rows,) for t in metadata):
-        raise ValueError(
-            "row_to_batch/local_starts/local_ends must be int32 [rows]"
-        )
+        raise ValueError("row_to_batch/local_starts/local_ends must be int32 [rows]")
     if block_tables.dtype != torch.int32 or block_tables.ndim != 2:
         raise ValueError("block_tables must be a 2D int32 tensor")
+    if max_seq_len <= 0:
+        raise ValueError("max_seq_len must be positive")
+    if max_seq_len > block_tables.shape[1] * kv_block_size:
+        raise ValueError("max_seq_len exceeds block_tables capacity")
     inputs = (
         q_fp4,
         q_scale,
@@ -1595,6 +1623,9 @@ def flydsl_pa_mqa_logits_fp4_prefill_topk(
             workspace.candidate_indices,
         ),
         ((parallel_unit_num,), torch.int32, workspace.candidate_counts),
+        ((rows, topk), torch.float32, workspace.merge_values),
+        ((rows, topk), torch.int32, workspace.merge_indices),
+        ((rows, topk), torch.int32, workspace.merge_physical_indices),
     )
     for expected_shape, expected_dtype, tensor in expected_workspace:
         if (
@@ -1689,19 +1720,37 @@ def flydsl_pa_mqa_logits_fp4_prefill_topk(
         workspace.row_offsets,
         row_to_batch,
         block_tables,
-        out.values,
-        out.raw_indices,
-        out.physical_indices,
+        workspace.merge_values,
+        workspace.merge_indices,
+        workspace.merge_physical_indices,
         out.counts,
         kv_block_size,
         stream=stream,
     )
+    from ...mqa_topk_finalize import order_and_map_mqa_topk
+
+    with torch.cuda.stream(stream):
+        order_and_map_mqa_topk(
+            workspace.merge_values,
+            workspace.merge_indices,
+            out.counts,
+            local_starts,
+            local_ends,
+            row_to_batch,
+            block_tables,
+            out.values,
+            out.raw_indices,
+            out.physical_indices,
+            max_seq_len,
+            topk,
+            kv_block_size,
+        )
     return out
 
 
-# Canonical public spelling.  Keep the logits-prefixed spelling as a
-# compatibility alias for the original prototype branch.
-flydsl_pa_mqa_topk_fp4_prefill = flydsl_pa_mqa_logits_fp4_prefill_topk
+# Keep the logits-prefixed spelling as a compatibility alias for the original
+# prototype branch.
+flydsl_pa_mqa_logits_fp4_prefill_topk = flydsl_pa_mqa_topk_fp4_prefill
 
 
 @triton.jit
