@@ -9,6 +9,7 @@ import torch
 
 from aiter import dtypes, logger
 from aiter.test_common import checkAllclose
+from aiter_worker_limits import configure_worker_subprocesses
 
 _TASK_START_TIMES = None
 
@@ -23,6 +24,7 @@ def _is_accelerator_error(exc: BaseException) -> bool:
 
 def _init_task_start_times(task_start_times):
     global _TASK_START_TIMES
+    configure_worker_subprocesses()
     _TASK_START_TIMES = task_start_times
 
 
@@ -364,6 +366,13 @@ def get_pid():
     return mp.current_process().pid
 
 
+def _resolve_tuner_process_count(gpu_count, requested_processes):
+    """Use one tuner process per selected GPU."""
+    if requested_processes < 1 or requested_processes > gpu_count:
+        return gpu_count
+    return requested_processes
+
+
 def mp_tuner(
     tasks,
     in_datas,
@@ -394,8 +403,7 @@ def mp_tuner(
     """
     gpu_num = torch.cuda.device_count()
     mp.set_start_method("spawn", force=True)
-    mp_num = gpu_num if mp_num < 1 or mp_num > gpu_num else mp_num
-    parallel_num = mp_num
+    mp_num = _resolve_tuner_process_count(gpu_num, mp_num)
     start_idx = 0
     if not tasks:
         return []
@@ -463,7 +471,7 @@ def mp_tuner(
     # Create initial pool and submit all tasks
     task_start_times = mp.RawArray("d", len(task_group))
     pool = mp.Pool(
-        processes=parallel_num,
+        processes=mp_num,
         initializer=_init_task_start_times,
         initargs=(task_start_times,),
     )
@@ -641,7 +649,7 @@ def mp_tuner(
                 print(f"Warning: Error during pool termination: {e}", flush=True)
             # Create new pool
             pool = mp.Pool(
-                processes=parallel_num,
+                processes=mp_num,
                 initializer=_init_task_start_times,
                 initargs=(task_start_times,),
             )

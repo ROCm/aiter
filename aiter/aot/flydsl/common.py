@@ -18,10 +18,10 @@ from dataclasses import dataclass
 from multiprocessing.connection import wait as wait_for_sentinels
 from typing import Any
 
+from aiter_worker_limits import configure_worker_subprocesses, get_worker_count_for
+
 _DEFAULT_KERNEL_TIMEOUT = 1200.0
-_DEFAULT_MAX_WORKERS = 64
 _DEFAULT_MAX_RETRIES = 2
-_DEFAULT_MEM_PER_WORKER_GB = 2.0
 _MAX_ERRORS_IN_MSG = 10
 
 
@@ -174,22 +174,12 @@ def _compile_one_config_for(kind: OpKind) -> Callable[..., dict[str, Any]]:
 def _run_one_to_file(
     worker: Callable[..., dict[str, Any]], kwargs: dict[str, Any], out_path: str
 ) -> None:
+    configure_worker_subprocesses()
     result = worker(**kwargs)
     tmp_path = out_path + ".tmp"
     with open(tmp_path, "w") as f:
         json.dump(result, f)
     os.replace(tmp_path, out_path)
-
-
-def _affinity_aware_cpu_count() -> int:
-    """Number of CPUs this process may actually use (respects cgroup /
-    cpuset limits via ``sched_getaffinity``, unlike ``os.cpu_count()``).
-    Falls back to ``cpu_count`` and is clamped to >=1."""
-    try:
-        n = len(os.sched_getaffinity(0))
-    except (AttributeError, OSError):
-        n = os.cpu_count() or 0
-    return max(n, 1)
 
 
 def get_kernel_timeout() -> float:
@@ -216,39 +206,8 @@ def get_max_retries() -> int:
         ) from e
 
 
-def _memory_worker_cap(default_workers: int) -> int:
-    env = os.environ.get("AITER_FLYDSL_AOT_MEM_PER_WORKER_GB")
-    try:
-        per_gb = float(env) if env else _DEFAULT_MEM_PER_WORKER_GB
-    except ValueError as e:
-        raise ValueError(
-            f"AITER_FLYDSL_AOT_MEM_PER_WORKER_GB must be a number, got {env!r}"
-        ) from e
-    if per_gb <= 0:
-        return default_workers
-    try:
-        import psutil
-
-        avail_gb = psutil.virtual_memory().available / (1024**3)
-    except Exception:  # noqa: BLE001
-        return default_workers
-    return min(default_workers, max(1, int(avail_gb / per_gb)))
-
-
 def get_max_workers(num_jobs: int) -> int:
-    workers_env = os.environ.get("AITER_FLYDSL_AOT_WORKERS")
-    if workers_env is not None:
-        try:
-            max_workers = max(int(workers_env), 1)
-        except ValueError as e:
-            raise ValueError(
-                f"AITER_FLYDSL_AOT_WORKERS must be an integer, got {workers_env!r}"
-            ) from e
-    else:
-        max_workers = min(_affinity_aware_cpu_count(), _DEFAULT_MAX_WORKERS)
-        # Auto path only: also bound by memory so we never trip the OOM-killer.
-        max_workers = _memory_worker_cap(max_workers)
-    return min(max_workers, num_jobs)
+    return get_worker_count_for(num_jobs)
 
 
 def _run_file_pool(

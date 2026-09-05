@@ -22,6 +22,7 @@ from aiter.aot.flydsl.common import (
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+from aiter_worker_limits import adopt_legacy_max_jobs
 
 DEFAULT_CSVS = [AITER_CONFIGS.AITER_CONFIG_GROUPED_FMOE_FILE]
 _WARP_TILE_N = 64
@@ -449,4 +450,5 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    adopt_legacy_max_jobs()
     main(sys.argv[1:])

@@ -26,8 +26,13 @@ if [[ "$MULTIGPU" == "TRUE" ]]; then
 else
     if [[ -z "${AITER_TEST:-}" ]]; then
         echo "AITER_TEST is not set"
-        # Recursively find all files under op_tests, excluding op_tests/multigpu_tests
-        mapfile -t files < <(find op_tests -maxdepth 1 -type f -name "*.py" | sort)
+        # Run the operator tests and the focused regression/unit-test suite.
+        mapfile -t files < <(
+            {
+                find op_tests -maxdepth 1 -type f -name "test_*.py"
+                find tests -maxdepth 1 -type f -name "test_*.py"
+            } | LC_ALL=C sort
+        )
     else
         # If AITER_TEST contains multiple files separated by whitespace, convert to an array
         read -r -a files <<< "$AITER_TEST"
