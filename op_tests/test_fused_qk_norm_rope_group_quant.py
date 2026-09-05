@@ -54,10 +54,21 @@ _FP8_MX_DTYPE = (
 _DEV = "cuda"
 # Positive allow-list: an unknown new card must not silently run an unbuilt
 # kernel. The fused SWA scatter rides the same HIP op, so no extra gate.
-SUPPORTED_GFX = ["gfx942", "gfx950"]
+SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1250"]
 PE_BYTE_OFFSET = 464
-# MI355X HBM3e peak. Used only for the "%peak" perf column.
-_PEAK_BW_GBPS = 8000.0
+# Peak HBM bandwidth per arch, for the "%peak" perf column only.
+# This was a bare MI355X constant, which silently overstated every other card:
+# on gfx1250 (20 TB/s spec) it reported 94% peak where the real figure is 42%,
+# i.e. 2.2x high -- enough to make a kernel with plenty of headroom look finished.
+# gfx1250's own achievable ceiling on a 2:1 read/write mix is ~17.9 TB/s (bus
+# turnaround costs ~15% before any kernel code runs), so treat >85% of the spec
+# number below as unreachable rather than as a target.
+_PEAK_BW_BY_GFX = {
+    "gfx942": 5300.0,   # MI300X HBM3
+    "gfx950": 8000.0,   # MI355X HBM3e
+    "gfx1250": 20000.0,
+}
+_PEAK_BW_GBPS = _PEAK_BW_BY_GFX.get(get_gfx(), 8000.0)
 # Pin the arg-rotation count. Left to itself, run_perftest derives it from
 # `free_memory` at call time, so two candidates timed in one process rotate a
 # different number of times, land in different L2 states, and their `us`
