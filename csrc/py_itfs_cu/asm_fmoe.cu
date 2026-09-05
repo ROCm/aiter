@@ -3,6 +3,7 @@
 #include "aiter_tensor.h"
 #include "aiter_ctypes_error.h"
 #include "asm_fmoe_configs.hpp"
+#include <hip/hip_bfloat16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <memory>
@@ -356,6 +357,99 @@ int get_heuristic_tile(int inter_dim, int sub_X_cnt, const std::vector<int>& ava
 };
 
 AITER_CTYPES_ERROR_DECL;
+
+namespace aiter {
+void launch_fmoe_g1u1_bf16_small_m(hip_bfloat16* out,
+                                   const hip_bfloat16* input,
+                                   const hip_bfloat16* gate,
+                                   const hip_bfloat16* down,
+                                   const int32_t* topk_ids,
+                                   const float* topk_weights,
+                                   hip_bfloat16* act_workspace,
+                                   int token_cnt,
+                                   int model_dim,
+                                   int inter_dim,
+                                   int expert_cnt,
+                                   int topk,
+                                   bool gate_is_shuffled,
+                                   bool down_is_shuffled,
+                                   hipStream_t stream);
+} // namespace aiter
+
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    fmoe_g1u1_bf16_small_m,
+    (
+    aiter_tensor_t* out,
+    aiter_tensor_t* input,
+    aiter_tensor_t* gate,
+    aiter_tensor_t* down,
+    aiter_tensor_t* topk_ids,
+    aiter_tensor_t* topk_weights,
+    aiter_tensor_t* act_workspace,
+    int topk,
+    bool gate_is_shuffled,
+    bool down_is_shuffled,
+    hipStream_t stream),
+    (out,
+     input,
+     gate,
+     down,
+     topk_ids,
+     topk_weights,
+     act_workspace,
+     topk,
+     gate_is_shuffled,
+     down_is_shuffled,
+     stream))
+{
+    const HipDeviceGuard device_guard(input->device_id);
+    AITER_CHECK(out->dtype() == AITER_DTYPE_bf16, __func__, " only supports bf16 output");
+    AITER_CHECK(input->dtype() == AITER_DTYPE_bf16 && gate->dtype() == AITER_DTYPE_bf16 &&
+                    down->dtype() == AITER_DTYPE_bf16,
+                __func__,
+                " only supports bf16 input and weights");
+    AITER_CHECK(topk_ids->dtype() == AITER_DTYPE_i32, __func__, " topk_ids must be int32");
+    AITER_CHECK(topk_weights->dtype() == AITER_DTYPE_fp32, __func__, " topk_weights must be fp32");
+    AITER_CHECK(act_workspace->dtype() == AITER_DTYPE_bf16,
+                __func__,
+                " act_workspace must be bf16");
+
+    int token_cnt = input->size(0);
+    int model_dim = input->size(1);
+    int expert_cnt = gate->size(0);
+    int inter_dim = down->size(2);
+    AITER_CHECK(gate->size(1) == inter_dim * 2,
+                __func__,
+                " expects G1U1 gate shape [E, 2*inter_dim, model_dim]");
+    AITER_CHECK(gate->size(2) == model_dim && down->size(1) == model_dim,
+                __func__,
+                " model_dim mismatch");
+    AITER_CHECK(topk_ids->size(0) == token_cnt && topk_ids->size(1) == topk,
+                __func__,
+                " topk_ids shape mismatch");
+    AITER_CHECK(topk_weights->size(0) == token_cnt && topk_weights->size(1) == topk,
+                __func__,
+                " topk_weights shape mismatch");
+    AITER_CHECK(act_workspace->size(0) == token_cnt * topk && act_workspace->size(1) == inter_dim,
+                __func__,
+                " act_workspace shape mismatch");
+
+    aiter::launch_fmoe_g1u1_bf16_small_m(reinterpret_cast<hip_bfloat16*>(out->ptr),
+                                         reinterpret_cast<const hip_bfloat16*>(input->ptr),
+                                         reinterpret_cast<const hip_bfloat16*>(gate->ptr),
+                                         reinterpret_cast<const hip_bfloat16*>(down->ptr),
+                                         reinterpret_cast<const int32_t*>(topk_ids->ptr),
+                                         reinterpret_cast<const float*>(topk_weights->ptr),
+                                         reinterpret_cast<hip_bfloat16*>(act_workspace->ptr),
+                                         token_cnt,
+                                         model_dim,
+                                         inter_dim,
+                                         expert_cnt,
+                                         topk,
+                                         gate_is_shuffled,
+                                         down_is_shuffled,
+                                         stream);
+}
 
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     fmoe,
