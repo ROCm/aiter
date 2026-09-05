@@ -17,7 +17,19 @@ from aiter.utility import fp4_utils
 
 torch.set_default_device("cuda")
 
-_FP4_OUTPUT_GUARD_VALUE = 0xA5
+_OUTPUT_GUARD_VALUE = 0xA5
+
+
+def _guarded(rows, cols, dtype):
+    """`rows` x `cols`, backed by one extra sentinel row.
+
+    Catches a kernel writing past the last row of an output. Rows whose byte
+    length is not a multiple of 4 used to do exactly that (#5044).
+    """
+    storage = torch.empty((rows + 1, cols), dtype=dtype)
+    guard = storage[-1:].view(torch.uint8)
+    guard.fill_(_OUTPUT_GUARD_VALUE)
+    return storage[:-1], guard
 
 
 @perftest(num_warmup=0, num_iters=10)
@@ -144,7 +156,7 @@ def run_hip(
         group_size = 128
     else:
         raise ValueError(f"Unsupported quant type: {quant_type}")
-    output_guard = None
+    guards = []
     if quant_type in [QuantType.per_1x32, QuantType.per_1x128]:
         group_per_row = (input.shape[1] + group_size - 1) // group_size
         if q_dtype == dtypes.fp4x2:
@@ -152,36 +164,34 @@ def run_hip(
         else:
             scale_per_row = group_per_row
         scale_shape = (input.shape[0], scale_per_row)
-    residual_out = torch.empty_like(input)
+    m, n = input.shape
     if quant_type == QuantType.No:
         scale = None
-        output = torch.empty_like(input)
+        output, output_guard = _guarded(m, n, input.dtype)
+        guards.append(("output", output_guard))
         if residual is None:
             residual_out = None
             aiter.rmsnorm(output, input, weight, eps)
         else:
-            residual_out = torch.empty_like(input)
+            residual_out, residual_out_guard = _guarded(m, n, input.dtype)
+            guards.append(("residual_out", residual_out_guard))
             aiter.add_rmsnorm(output, input, residual, residual_out, weight, eps)
     else:
-        if q_dtype == dtypes.fp4x2:
-            output_storage = torch.empty(
-                (input.shape[0] + 1, input.shape[1] // 2), dtype=q_dtype
-            )
-            output = output_storage[:-1]
-            output_guard = output_storage[-1:].view(torch.uint8)
-            output_guard.fill_(_FP4_OUTPUT_GUARD_VALUE)
-        else:
-            output = torch.empty(input.shape, dtype=q_dtype)
+        # fp4x2 packs two values per byte, so the row is half as wide in storage.
+        out_cols = n // 2 if q_dtype == dtypes.fp4x2 else n
+        output, output_guard = _guarded(m, out_cols, q_dtype)
+        guards.append(("output", output_guard))
         scale = torch.empty(scale_shape, dtype=dtypes.fp32)
         if residual is None:
             residual_out = None
             aiter.rmsnorm_quant(output, input, scale, weight, eps, group_size)
         else:
-            residual_out = torch.empty_like(input)
+            residual_out, residual_out_guard = _guarded(m, n, input.dtype)
+            guards.append(("residual_out", residual_out_guard))
             aiter.add_rmsnorm_quant(
                 output, input, residual, residual_out, scale, weight, eps, group_size
             )
-    return output, residual_out, scale, output_guard
+    return output, residual_out, scale, guards
 
 
 @benchmark()
@@ -201,6 +211,10 @@ def test_rmsnorm(
         quant_dtype is not dtypes.fp4x2 or get_gfx() not in ["gfx950"]
     ):
         print("per_1x32 is only supported for fp4x2 on gfx950")
+        return {}
+    group_size = {QuantType.per_1x32: 32, QuantType.per_1x128: 128}.get(quant_type)
+    if group_size is not None and n % group_size != 0:
+        print(f"{quant_type} needs n divisible by {group_size}, got {n}")
         return {}
     dim = (m, n)
     scale_type = dtypes.fp32
@@ -258,16 +272,14 @@ def test_rmsnorm(
             (read_datasize + write_datasize) / avg_b / 1024 / 1024 / 1024 * 1e6
         )
     if not smoothquant and n <= 8192:
-        (c, res_c, yscale_c, output_guard), avg_c = run_hip(
+        (c, res_c, yscale_c, guards), avg_c = run_hip(
             input, weight, 1e-5, res, q_dtype=quant_dtype, quant_type=quant_type
         )
-        if output_guard is not None:
-            changed_bytes = torch.count_nonzero(
-                output_guard != _FP4_OUTPUT_GUARD_VALUE
-            ).item()
+        for guard_name, guard in guards:
+            changed_bytes = torch.count_nonzero(guard != _OUTPUT_GUARD_VALUE).item()
             assert changed_bytes == 0, (
-                f"{'add_' if add_residual else ''}rmsnorm_quant wrote "
-                f"{changed_bytes} bytes past an FP4 output row"
+                f"{'add_' if add_residual else ''}rmsnorm wrote {changed_bytes} "
+                f"bytes past the last row of {guard_name} (m={m}, n={n})"
             )
         if quant_dtype == dtypes.fp4x2:
             a = fp4_utils.mxfp4_to_f32(a)
@@ -333,7 +345,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-n",
         type=int,
-        default=[1024, 2048, 3584, 4096, 8192],
+        default=[1024, 1027, 2048, 2050, 3584, 4096, 8192],
         nargs="*",
         help="""N of mnk.
     e.g.: -n 1024""",
