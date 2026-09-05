@@ -21,20 +21,35 @@ __all__ = [
     "requant_fp8_row_to_col",
 ]
 
+# 240.0 is torch.finfo(torch.float8_e4m3fnuz).max — the true hardware maximum.
+# fused_fp8_quant.get_fp8_min_max_bounds() returns 224.0 (vLLM convention for
+# per-tensor/per-token paths); blockwise quantization uses per-block scales so
+# the full hardware range is appropriate here.
 _FP8_MAX = torch.finfo(torch.float8_e4m3fnuz).max
 _BLOCK_SIZE = 128
 
 
-def _check_block_fp8(block_size: int, fp8_max: float) -> None:
+def _launch_params(block_size: int) -> dict:
+    # Each program loads a [block_size, block_size] tile promoted to fp32.
+    # Benchmarks on MI308X show num_warps=4 is the best stable choice across
+    # common shapes (4096/8192 × 7168/8192); larger values hurt weight kernel.
+    num_warps = min(16, max(1, block_size * block_size // 4096))
+    return {"num_warps": num_warps, "waves_per_eu": 2, "num_stages": 2}
+
+
+def _check_block_fp8(
+    block_size: int,
+    fp8_max: float,
+    quant_dtype: torch.dtype = torch.float8_e4m3fnuz,
+) -> None:
     # BLOCK_SIZE feeds tl.arange(0, BLOCK_SIZE), which needs a power of two.
     assert (
         block_size > 0 and (block_size & (block_size - 1)) == 0
     ), f"block_size must be a positive power of two, got {block_size}"
-    # Output is float8_e4m3fnuz; a bound above its max would clamp against a
-    # range the payload cannot represent.
+    dtype_max = torch.finfo(quant_dtype).max
     assert (
-        0 < fp8_max <= _FP8_MAX
-    ), f"fp8_max must be in (0, {_FP8_MAX}] for float8_e4m3fnuz, got {fp8_max}"
+        0 < fp8_max <= dtype_max
+    ), f"fp8_max must be in (0, {dtype_max}] for {quant_dtype}, got {fp8_max}"
 
 
 def quant_fp8_blockwise(
@@ -42,6 +57,7 @@ def quant_fp8_blockwise(
     block_size: int = _BLOCK_SIZE,
     fp8_max: float = _FP8_MAX,
     axis: int = 1,
+    quant_dtype: torch.dtype = torch.float8_e4m3fnuz,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Block-wise FP8 quantization of a 2-D tensor.
 
@@ -49,12 +65,14 @@ def quant_fp8_blockwise(
         x:          Contiguous input tensor ``[M, N]``, any float dtype.
         block_size: Quantization block size (positive power of two).
         fp8_max:    FP8 dynamic range maximum (default: e4m3fnuz max); must be
-                    in ``(0, e4m3fnuz max]``.
+                    in ``(0, quant_dtype max]``.
         axis:       Scale axis — ``1`` = row-wise (one scale per row-block),
                     ``0`` = col-wise (one scale per col-block).
+        quant_dtype: Output FP8 dtype (default: ``float8_e4m3fnuz`` for gfx942;
+                    pass ``torch.float8_e4m3fn`` for gfx950 / OCP).
 
     Returns:
-        ``(x_fp8, scales)`` where ``x_fp8`` is ``[M, N]`` float8_e4m3fnuz and
+        ``(x_fp8, scales)`` where ``x_fp8`` is ``[M, N]`` ``quant_dtype`` and
         ``scales`` are the per-block *inverse* quantisation scales.
     """
     # The kernel flat-indexes x as contiguous; a strided tensor would read/write
@@ -63,9 +81,9 @@ def quant_fp8_blockwise(
         x.ndim == 2 and x.is_contiguous()
     ), f"expected 2-D contiguous input, got shape {x.shape} strides {x.stride()}"
     assert axis in (0, 1), f"axis must be 0 or 1, got {axis}"
-    _check_block_fp8(block_size, fp8_max)
+    _check_block_fp8(block_size, fp8_max, quant_dtype)
     M, N = x.shape
-    x_fp8 = torch.empty_like(x, dtype=torch.float8_e4m3fnuz)
+    x_fp8 = torch.empty_like(x, dtype=quant_dtype)
     if axis == 1:
         scales = torch.empty(
             M, math.ceil(N / block_size), dtype=torch.float32, device=x.device
@@ -80,14 +98,15 @@ def quant_fp8_blockwise(
         x,
         x_fp8,
         scales,
-        x_fp8,  # col outputs unused when DUAL=False (constexpr-pruned)
-        scales,
+        x_fp8,  # col ptrs reuse primary buffers: DUAL=False is constexpr so
+        scales,  # Triton's dead-code elimination prunes the col stores entirely.
         M,
         N,
         BLOCK_SIZE=block_size,
         FP8_MAX=fp8_max,
         AXIS=axis,
         DUAL=False,
+        **_launch_params(block_size),
     )
     return x_fp8, scales
 
@@ -99,6 +118,7 @@ def quant_fp8_blockwise_segment_m(
     scales_seg_indptr: torch.Tensor,
     block_size: int = _BLOCK_SIZE,
     fp8_max: float = _FP8_MAX,
+    quant_dtype: torch.dtype = torch.float8_e4m3fnuz,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Col-wise (BLOCK×1) FP8 quantization over variable-length row segments.
 
@@ -116,19 +136,20 @@ def quant_fp8_blockwise_segment_m(
         scales_seg_indptr: ``[batch_size + 1]`` int tensor of cumulative
                            row-block counts per segment.
         block_size:        Quantization block size (positive power of two).
-        fp8_max:           FP8 bound in ``(0, e4m3fnuz max]``.
+        fp8_max:           FP8 bound in ``(0, quant_dtype max]``.
+        quant_dtype:       Output FP8 dtype (default: ``float8_e4m3fnuz``).
 
     Returns:
-        ``(x_fp8, scales)`` where ``x_fp8`` is ``[M, N]`` float8_e4m3fnuz and
+        ``(x_fp8, scales)`` where ``x_fp8`` is ``[M, N]`` ``quant_dtype`` and
         ``scales`` is ``[ceil(M / block_size) + batch_size, N]`` (an upper bound
         on the total row-block count; unused trailing rows are left untouched).
     """
     assert (
         x.ndim == 2 and x.is_contiguous()
     ), f"expected 2-D contiguous input, got shape {x.shape} strides {x.stride()}"
-    _check_block_fp8(block_size, fp8_max)
+    _check_block_fp8(block_size, fp8_max, quant_dtype)
     M, N = x.shape
-    x_fp8 = torch.empty_like(x, dtype=torch.float8_e4m3fnuz)
+    x_fp8 = torch.empty_like(x, dtype=quant_dtype)
     scales = torch.empty(
         math.ceil(M / block_size) + batch_size,
         N,
@@ -146,6 +167,7 @@ def quant_fp8_blockwise_segment_m(
         scales_seg_indptr,
         BLOCK_SIZE=block_size,
         FP8_MAX=fp8_max,
+        **_launch_params(block_size),
     )
     return x_fp8, scales
 
@@ -154,13 +176,15 @@ def quant_fp8_blockwise_for_weight(
     w: torch.Tensor,
     block_size: int = _BLOCK_SIZE,
     fp8_max: float = _FP8_MAX,
+    quant_dtype: torch.dtype = torch.float8_e4m3fnuz,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Block-wise FP8 quantization for a batched weight tensor.
 
     Args:
         w:          Contiguous weight tensor ``[B, M, N]`` or ``[M, N]``.
         block_size: Quantization block size (positive power of two).
-        fp8_max:    FP8 bound in ``(0, e4m3fnuz max]``.
+        fp8_max:    FP8 bound in ``(0, quant_dtype max]``.
+        quant_dtype: Output FP8 dtype (default: ``float8_e4m3fnuz``).
 
     Returns:
         ``(w_fp8, scales)`` where each block has its own scale.
@@ -173,9 +197,9 @@ def quant_fp8_blockwise_for_weight(
         f"expected contiguous 2-D or 3-D weight, got shape {w.shape} "
         f"strides {w.stride()}"
     )
-    _check_block_fp8(block_size, fp8_max)
+    _check_block_fp8(block_size, fp8_max, quant_dtype)
     B, M, N = w.shape
-    w_fp8 = torch.empty_like(w, dtype=torch.float8_e4m3fnuz)
+    w_fp8 = torch.empty_like(w, dtype=quant_dtype)
     scales = torch.empty(
         B,
         math.ceil(M / block_size),
@@ -192,6 +216,7 @@ def quant_fp8_blockwise_for_weight(
         N,
         BLOCK_SIZE=block_size,
         FP8_MAX=fp8_max,
+        **_launch_params(block_size),
     )
     return w_fp8, scales
 
@@ -200,6 +225,7 @@ def quant_fp8_blockwise_for_act_grad(
     x: torch.Tensor,
     block_size: int = _BLOCK_SIZE,
     fp8_max: float = _FP8_MAX,
+    quant_dtype: torch.dtype = torch.float8_e4m3fnuz,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Dual row+col FP8 quantization for activation gradients.
 
@@ -209,7 +235,8 @@ def quant_fp8_blockwise_for_act_grad(
     Args:
         x:          Contiguous input tensor ``[M, N]``.
         block_size: Quantization block size (positive power of two).
-        fp8_max:    FP8 bound in ``(0, e4m3fnuz max]``.
+        fp8_max:    FP8 bound in ``(0, quant_dtype max]``.
+        quant_dtype: Output FP8 dtype (default: ``float8_e4m3fnuz``).
 
     Returns:
         ``(x_fp8_row, scales_row, x_fp8_col, scales_col)``
@@ -217,10 +244,10 @@ def quant_fp8_blockwise_for_act_grad(
     assert (
         x.ndim == 2 and x.is_contiguous()
     ), f"expected 2-D contiguous input, got shape {x.shape} strides {x.stride()}"
-    _check_block_fp8(block_size, fp8_max)
+    _check_block_fp8(block_size, fp8_max, quant_dtype)
     M, N = x.shape
-    x_fp8_row = torch.empty_like(x, dtype=torch.float8_e4m3fnuz)
-    x_fp8_col = torch.empty_like(x, dtype=torch.float8_e4m3fnuz)
+    x_fp8_row = torch.empty_like(x, dtype=quant_dtype)
+    x_fp8_col = torch.empty_like(x, dtype=quant_dtype)
     scales_row = torch.empty(
         M, math.ceil(N / block_size), dtype=torch.float32, device=x.device
     )
@@ -243,6 +270,7 @@ def quant_fp8_blockwise_for_act_grad(
         FP8_MAX=fp8_max,
         AXIS=1,
         DUAL=True,
+        **_launch_params(block_size),
     )
     return x_fp8_row, scales_row, x_fp8_col, scales_col
 
@@ -252,6 +280,7 @@ def requant_fp8_row_to_col(
     x_scales: torch.Tensor,
     block_size: int = _BLOCK_SIZE,
     fp8_max: float = _FP8_MAX,
+    quant_dtype: torch.dtype = torch.float8_e4m3fnuz,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Re-quantize FP8 row-wise (1×BLOCK) to col-wise (BLOCK×1) in one pass.
 
@@ -263,7 +292,8 @@ def requant_fp8_row_to_col(
                   quantisation.
         x_scales: ``[M, ceil(K / block_size)]`` dequant scales for ``x_fp8``.
         block_size: Quantization block size (positive power of two).
-        fp8_max:    FP8 bound in ``(0, e4m3fnuz max]``.
+        fp8_max:    FP8 bound in ``(0, quant_dtype max]``.
+        quant_dtype: Output FP8 dtype (default: ``float8_e4m3fnuz``).
 
     Returns:
         ``(y_fp8, y_scales)`` col-wise quantised, shapes ``[M, K]`` and
@@ -273,7 +303,7 @@ def requant_fp8_row_to_col(
         f"expected 2-D contiguous input, got shape {x_fp8.shape} "
         f"strides {x_fp8.stride()}"
     )
-    _check_block_fp8(block_size, fp8_max)
+    _check_block_fp8(block_size, fp8_max, quant_dtype)
     M, K = x_fp8.shape
     # x_scales is read with flat contiguous indexing at [M, ceil(K/block)].
     expected_scale_shape = (M, math.ceil(K / block_size))
@@ -282,7 +312,7 @@ def requant_fp8_row_to_col(
         "or not contiguous"
     )
     assert x_scales.device == x_fp8.device, "x_fp8 and x_scales must share a device"
-    y_fp8 = torch.empty_like(x_fp8)
+    y_fp8 = torch.empty_like(x_fp8, dtype=quant_dtype)
     y_scales = torch.empty(
         math.ceil(M / block_size), K, dtype=torch.float32, device=x_fp8.device
     )
@@ -297,5 +327,6 @@ def requant_fp8_row_to_col(
         K,
         BLOCK_SIZE=block_size,
         FP8_MAX=fp8_max,
+        **_launch_params(block_size),
     )
     return y_fp8, y_scales

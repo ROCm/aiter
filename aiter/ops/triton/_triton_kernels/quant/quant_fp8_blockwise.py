@@ -4,6 +4,9 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.common.segment_tile import (
+    _find_segment_tile_range,
+)
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 # repr keys are the int constexprs that select the compiled variant; FP8_MAX
@@ -25,7 +28,13 @@ _requant_fp8_row_to_col_kernel_repr = make_kernel_repr(
 @triton.jit
 def _compute_scale_and_quant(x_tile, x_tile_abs, axis, FP8_MAX):
     x_tile_max = tl.max(x_tile_abs, axis=axis, keep_dims=True)
-    x_tile_max = tl.maximum(x_tile_max, 1e-4)
+    # Clamp Inf before dividing: FP8_MAX / Inf = 0 and x * 0 = NaN for any Inf
+    # element in the tile. Mapping Inf -> FP8_MAX saturates those elements via
+    # the clamp below instead of producing NaN.
+    x_tile_max = tl.minimum(x_tile_max, FP8_MAX)
+    # Tiny floor to prevent division by zero on all-zero blocks. 1e-30 (not
+    # 1e-4) so small-but-nonzero blocks still use the full FP8 dynamic range.
+    x_tile_max = tl.maximum(x_tile_max, 1e-30)
     x_scales_tile = FP8_MAX / x_tile_max
     x_fp8_tile = x_tile * x_scales_tile
     x_fp8_tile = tl.clamp(x_fp8_tile, min=-FP8_MAX, max=FP8_MAX)
@@ -73,7 +82,7 @@ def quant_fp8_blockwise_kernel(
         scale_offs = offs_m * tl.cdiv(N, BLOCK_SIZE) + pid_n
         scale_mask = offs_m < M
     else:  # col-wise scale: [M // BLOCK_SIZE, N]
-        scale_offs = pid_m * N + offs_n
+        scale_offs = tl.cast(pid_m, tl.int64) * N + offs_n
         scale_mask = offs_n < N
     tl.store(
         x_scales_ptr + scale_offs,
@@ -92,26 +101,10 @@ def quant_fp8_blockwise_kernel(
             mask=mask,
         )
         tl.store(
-            x_scales_col_ptr + pid_m * N + offs_n,
+            x_scales_col_ptr + tl.cast(pid_m, tl.int64) * N + offs_n,
             tl.reshape(1.0 / x_scales_col, BLOCK_SIZE),
             mask=offs_n < N,
         )
-
-
-@triton.jit
-def _compute_m_range(
-    pid, batch_size, seg_indptr, scales_seg_indptr_ptr, BLOCK_SIZE: tl.constexpr
-):
-    bid = 0
-    for bs in range(batch_size):
-        tiles = tl.load(scales_seg_indptr_ptr + bs)
-        if pid >= tiles:
-            bid = bs
-    idx_start = tl.load(scales_seg_indptr_ptr + bid)
-
-    m_range_start = tl.load(seg_indptr + bid) + (pid - idx_start) * BLOCK_SIZE
-    m_range_end = min(tl.load(seg_indptr + bid + 1), m_range_start + BLOCK_SIZE)
-    return m_range_start, m_range_end, bid
 
 
 # Blockwise for Segment M
@@ -133,7 +126,7 @@ def quant_fp8_blockwise_segment_m_kernel(
     if pid_m >= total_m_block:
         return
 
-    m_range_start, m_range_end, _bid = _compute_m_range(
+    m_range_start, m_range_end, _bid = _find_segment_tile_range(
         pid_m, batch_size, seg_indptr, scales_seg_indptr_ptr, BLOCK_SIZE
     )
     if m_range_end - m_range_start == 0:
@@ -197,11 +190,13 @@ def quant_fp8_blockwise_for_weight_kernel(
     w_tile = tl.load(w_ptrs, mask=mask, other=0.0).to(tl.float32)
 
     w_tile_abs = tl.abs(w_tile)
-    w_tile_max = tl.max(w_tile_abs)  # [1]
-    w_tile_max = tl.maximum(w_tile_max, 1e-4)
+    # Global (2-D) amax: _compute_scale_and_quant requires a 1-D axis so we
+    # inline the same semantics here for the scalar-scale weight case.
+    w_tile_max = tl.max(w_tile_abs)
+    w_tile_max = tl.minimum(w_tile_max, FP8_MAX)  # Inf guard (see helper)
+    w_tile_max = tl.maximum(w_tile_max, 1e-30)  # zero-block guard (see helper)
     w_scales = FP8_MAX / w_tile_max
-    w_fp8_tile = w_tile * w_scales
-    w_fp8_tile = tl.clamp(w_fp8_tile, min=-FP8_MAX, max=FP8_MAX)
+    w_fp8_tile = tl.clamp(w_tile * w_scales, min=-FP8_MAX, max=FP8_MAX)
 
     # Store
     w_fp8_ptrs = w_fp8_ptr + batch_offset_w + offs_m[:, None] * N + offs_n[None, :]
@@ -250,12 +245,9 @@ def requant_fp8_row_to_col_kernel(
     row_scales = tl.load(x_scales_ptr + row_scale_offs, mask=offs_m < M, other=1.0)
     x_f32 = x_f32 * row_scales[:, None]  # broadcast: (BLOCK,1) * (BLOCK, BLOCK)
 
-    # Col-wise (axis=0) requant: one scale per column in this tile.
+    # Col-wise (axis=0) requant via shared helper: Inf guard + zero-block floor.
     x_abs = tl.abs(x_f32)
-    col_amax = tl.max(x_abs, axis=0, keep_dims=True)  # (1, BLOCK)
-    col_amax = tl.maximum(col_amax, 1e-4)
-    col_scale = FP8_MAX / col_amax
-    y_f32 = tl.clamp(x_f32 * col_scale, min=-FP8_MAX, max=FP8_MAX)
+    y_f32, col_scale = _compute_scale_and_quant(x_f32, x_abs, 0, FP8_MAX)
 
     tl.store(
         y_fp8_ptr + offs_m[:, None] * K + offs_k[None, :],
