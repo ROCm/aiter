@@ -354,7 +354,9 @@ def _row_plan(
         BLOCK_T=(
             _ROW_PLAN_BLOCK_FLOOR if T <= _ROW_PLAN_BLOCK_FLOOR else _ROW_PLAN_MAX_ROWS
         ),
-        SEARCH_STEPS=max(1, (s_max - 1).bit_length() + 1),
+        SEARCH_STEPS=(
+            1 if single_cta_per_row else max(1, (s_max - 1).bit_length() + 1)
+        ),
         SINGLE_CTA_PER_ROW=single_cta_per_row,
     )
     return plan
@@ -663,7 +665,6 @@ def _copy_single_cta_topk_candidates(
 def build_pa_mqa_logits_fp4_prefill_module(
     block_k=256,
     kv_block_size=64,
-    max_blocks_per_seq=256,
     max_chunks_per_cta=16,
     num_warps=DEFAULT_NUM_WARPS,
     heads=DEFAULT_HEADS,
@@ -721,9 +722,6 @@ def build_pa_mqa_logits_fp4_prefill_module(
     ), f"block_k={block_k} must be a multiple of kv_block_size={kv_block_size}"
     TILES_PER_BLOCK = kv_block_size // MFMA_N
     N_PHYS = (N_TILES_PER_WARP + TILES_PER_BLOCK - 1) // TILES_PER_BLOCK
-
-    # block_tables row stride (i32 elements).
-    _stride_bt = max_blocks_per_seq
 
     # KV preshuffle layout: [block_id, K_TILES, K_chunk=4, kv_block_size, 16] uint8.
     _kv_chunk_bytes = 16
@@ -786,6 +784,8 @@ def build_pa_mqa_logits_fp4_prefill_module(
         kv_indices_ptr: fx.Tensor,
         weights_ptr: fx.Tensor,
         cta_info_ptr: fx.Tensor,  # [n_ctas, 6] i32
+        block_table_stride: Int32,
+        block_table_capacity: Int32,
         stride_out_row: Int32,
         output_token_base: Int32,
         weight_scale: fx.Float32,
@@ -812,7 +812,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
         cta_info_vec = fx.Vector(_load_vec4_i32(cta_info_bt, fx.Int32(0)))
         local_start = cta_info_bt[(fx.Int32(1), fx.Int32(0))]
         local_end = cta_info_bt[(fx.Int32(1), fx.Int32(1))]
-        table_capacity = fx.Int32(max_blocks_per_seq * kv_block_size)
+        table_capacity = block_table_capacity * fx.Int32(kv_block_size)
         local_start = (local_start > fx.Int32(0)).select(local_start, fx.Int32(0))
         local_start = (local_start < table_capacity).select(local_start, table_capacity)
         local_end = (local_end > fx.Int32(0)).select(local_end, fx.Int32(0))
@@ -958,10 +958,9 @@ def build_pa_mqa_logits_fp4_prefill_module(
             # epilogue. Clamp that speculative page-table lookup to the exact
             # inclusive table bounds so an unpadded table remains safe.
             bi_base = (bi_base < fx.Int32(0)).select(fx.Int32(0), bi_base)
-            bi_base = (bi_base < fx.Int32(max_blocks_per_seq)).select(
-                bi_base, fx.Int32(max_blocks_per_seq - 1)
-            )
-            phys_vec = bt_bt[batch_id * _stride_bt + bi_base]
+            last_block = block_table_capacity - fx.Int32(1)
+            bi_base = (bi_base < block_table_capacity).select(bi_base, last_block)
+            phys_vec = bt_bt[batch_id * block_table_stride + bi_base]
             return _phys_to_list(phys_vec)
 
         def _prefetch_chunk(c_i32_arg, phys_list):
@@ -1474,7 +1473,6 @@ def compile_pa_mqa_logits_fp4_prefill(
     kfn, block_threads = build_pa_mqa_logits_fp4_prefill_module(
         block_k=block_k,
         kv_block_size=kv_block_size,
-        max_blocks_per_seq=max_blocks_per_seq,
         num_warps=num_warps,
         heads=heads,
         head_dim=head_dim,
@@ -1509,6 +1507,8 @@ def compile_pa_mqa_logits_fp4_prefill(
             bt,
             w,
             cta_info_,
+            fx.Int32(max_blocks_per_seq),
+            fx.Int32(max_blocks_per_seq),
             stride_out,
             output_token_base,
             weight_scale,
@@ -1523,7 +1523,6 @@ def compile_pa_mqa_logits_fp4_prefill_topk(
     topk: int,
     block_k: int = 256,
     kv_block_size: int = 64,
-    max_blocks_per_seq: int = 256,
     num_warps: int = DEFAULT_NUM_WARPS,
     heads: int = DEFAULT_HEADS,
     head_dim: int = DEFAULT_HEAD_DIM,
@@ -1534,7 +1533,6 @@ def compile_pa_mqa_logits_fp4_prefill_topk(
     kfn, block_threads = build_pa_mqa_logits_fp4_prefill_module(
         block_k=block_k,
         kv_block_size=kv_block_size,
-        max_blocks_per_seq=max_blocks_per_seq,
         num_warps=num_warps,
         heads=heads,
         head_dim=head_dim,
@@ -1554,6 +1552,8 @@ def compile_pa_mqa_logits_fp4_prefill_topk(
         bt,
         w,
         cta_info_,
+        block_table_stride: fx.Int32,
+        block_table_capacity: fx.Int32,
         weight_scale: fx.Float32,
         gx: fx.Int32,
         stream: fx.Stream,
@@ -1571,6 +1571,8 @@ def compile_pa_mqa_logits_fp4_prefill_topk(
             bt,
             w,
             cta_info_,
+            block_table_stride,
+            block_table_capacity,
             fx.Int32(0),
             fx.Int32(0),
             weight_scale,
@@ -1889,12 +1891,10 @@ def flydsl_pa_mqa_topk_fp4_prefill(
             row_offsets_out=workspace.row_offsets,
             single_cta_per_row=single_cta_per_row,
         )
-    max_blocks_per_seq = block_tables.shape[1]
     launcher, _ = compile_pa_mqa_logits_fp4_prefill_topk(
         topk=topk,
         block_k=block_k,
         kv_block_size=kv_block_size,
-        max_blocks_per_seq=max_blocks_per_seq,
         num_warps=num_warps,
         heads=heads,
         head_dim=head_dim,
@@ -1911,6 +1911,8 @@ def flydsl_pa_mqa_topk_fp4_prefill(
         block_tables,
         weights,
         workspace.cta_info,
+        int(block_tables.stride(0)),
+        int(block_tables.shape[1]),
         float(weight_scale),
         parallel_unit_num,
         stream,

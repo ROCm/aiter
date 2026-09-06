@@ -10,7 +10,7 @@ import triton.language as tl
 from aiter.ops.triton._triton_kernels.topk import argsort as triton_argsort
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["rows", "max_seq_len", "block_table_stride"])
 def _order_and_map_topk_kernel(
     source_values,
     source_raw_indices,

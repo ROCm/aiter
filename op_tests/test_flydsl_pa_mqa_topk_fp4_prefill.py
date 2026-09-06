@@ -824,9 +824,51 @@ def test_score_batch_lds_budget() -> None:
 def test_legacy_compile_cache_does_not_evict_live_modules() -> None:
     from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
         compile_pa_mqa_logits_fp4_prefill,
+        compile_pa_mqa_logits_fp4_prefill_topk,
     )
 
     assert compile_pa_mqa_logits_fp4_prefill.cache_info().maxsize is None
+    assert compile_pa_mqa_logits_fp4_prefill_topk.cache_info().maxsize is None
+
+
+@requires_gfx950_flydsl
+def test_fused_compile_cache_reuses_runtime_page_table_stride() -> None:
+    from aiter.ops.flydsl import flydsl_pa_mqa_topk_fp4_prefill
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
+        compile_pa_mqa_logits_fp4_prefill_topk,
+    )
+
+    wide_case = list(_make_case(seed=149))
+    narrow_case = list(wide_case)
+    narrow_case[4] = wide_case[4][:, :64].contiguous()
+    narrow_case[8] = torch.clamp(wide_case[8], max=64 * KV_BLOCK_SIZE)
+    narrow_case[9] = 64 * KV_BLOCK_SIZE
+
+    compile_pa_mqa_logits_fp4_prefill_topk.cache_clear()
+    for case in (narrow_case, wide_case):
+        expected = _stable_reference(
+            _full_logits(case, 1.25),
+            case[4],
+            case[6],
+            case[7],
+            case[8],
+            512,
+        )
+        result = flydsl_pa_mqa_topk_fp4_prefill(
+            *case,
+            topk=512,
+            weight_scale=1.25,
+            parallel_unit_num=case[0].shape[0],
+        )
+        torch.cuda.synchronize()
+        for actual, wanted in zip(result, expected, strict=True):
+            torch.testing.assert_close(actual, wanted, rtol=0, atol=0)
+
+    cache_info = compile_pa_mqa_logits_fp4_prefill_topk.cache_info()
+    assert cache_info.misses == 1
+    assert cache_info.hits == 1
+    assert cache_info.currsize == 1
+    compile_pa_mqa_logits_fp4_prefill_topk.cache_clear()
 
 
 @requires_gfx950_flydsl
