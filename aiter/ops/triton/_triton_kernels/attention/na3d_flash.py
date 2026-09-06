@@ -72,8 +72,10 @@ def _na3d_flash_fwd(
     K_ptr,
     V_ptr,
     Out_ptr,
-    stride_bnh,
-    stride_seq,
+    stride_b,  # B stride   = SEQ * NH * HD  (elements between batches)
+    stride_nh,  # NH stride  = HD              (elements between heads)
+    stride_seq,  # seq stride = NH * HD         (elements between tokens)
+    NH,  # number of attention heads (runtime)
     T,
     H,
     W,
@@ -86,9 +88,13 @@ def _na3d_flash_fwd(
 ):
     """Flash-attention inner kernel. Grid dim[0] = T*H*ceil(W/BLOCK_Q).
 
-    Each program is assigned to exactly one (t, h) row via decomposition of
-    pid_q into (row_idx, w_block_idx).  This guarantees a shared (t, h) window
-    start regardless of whether W is divisible by BLOCK_Q.
+    Operates on (B, T, H, W, NH, HD) layout.
+    Each program is assigned to exactly one (t, h) row via
+    decomposition of pid_q into (row_idx, w_block_idx).
+
+    Addressing: for batch b and head nh,
+        element (b, t, h, w, nh, hd) = ptr + b*stride_b + seq*stride_seq + nh*stride_nh + hd
+    where seq = t*H*W + h*W + w.
     """
     pid_q = tl.program_id(0)
     pid_bnh = tl.program_id(1)
@@ -122,8 +128,13 @@ def _na3d_flash_fwd(
     hd_offs = tl.arange(0, HD)
     kv_offs = tl.arange(0, BLOCK_KV)
 
-    # Cast to int64 to avoid exceeding int32 range
-    base = pid_bnh.to(tl.int64) * stride_bnh.to(tl.int64)
+    # Decompose pid_bnh into (b, nh) for base address.
+    # int64: stride_b = SEQ * NH * HD can exceed int32 range for large volumes.
+    b_idx = pid_bnh // NH
+    nh_idx = pid_bnh % NH
+    base = b_idx.to(tl.int64) * stride_b.to(tl.int64) + nh_idx.to(
+        tl.int64
+    ) * stride_nh.to(tl.int64)
     kv_w = w_lo + kv_offs
     kv_ok = kv_w < W  # W-boundary guard, constant across the KT x KH loop
 

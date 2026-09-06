@@ -44,8 +44,10 @@ def na3d_flash_attn(
         Output tensor ``(B, T, H, W, NH, HD)`` bfloat16.
 
     Notes:
-        ``W >= 16`` is required so that all queries in a BLOCK_Q=16 program share
-        the same (t, h) grid row.  The autotune pruner enforces this.
+        Input tensors are consumed in their native ``(B, T, H, W, NH, HD)`` layout
+        without staging copies. Only a ``contiguous()`` call is made if a tensor is
+        not already contiguous in that order.  ``W >= 16`` is required so that all
+        queries in a BLOCK_Q=16 program share the same (t, h) grid row.
     """
     B, T, H, W, NH, HD = q.shape
     KT, KH, KW = kernel_size
@@ -83,24 +85,29 @@ def na3d_flash_attn(
     assert HD & (HD - 1) == 0, f"head_dim {HD} must be a power of 2"
     assert W >= 16, f"W={W} is too small; kernel requires W >= BLOCK_Q (default 16)."
 
-    def _flat(t: torch.Tensor) -> torch.Tensor:
-        """(B, T, H, W, NH, HD) -> (B*NH, SEQ, HD) contiguous."""
-        return t.permute(0, 4, 1, 2, 3, 5).reshape(B * NH, SEQ, HD).contiguous()
+    # Ensure contiguous layout
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    out = torch.empty_like(q)
 
-    q_f, k_f, v_f = _flat(q), _flat(k), _flat(v)
-    out_f = torch.empty_like(q_f)
+    stride_b = SEQ * NH * HD  # elements between batches
+    stride_nh = HD  # elements between heads
+    stride_seq = NH * HD  # elements between tokens
 
     # Grid: one program per (t, h) row per W-block.  This guarantees each
     # program covers queries from exactly one (t, h) row regardless of W % BLOCK_Q.
     grid = lambda meta: (T * H * triton.cdiv(W, meta["BLOCK_Q"]), B * NH)
 
     _na3d_flash_fwd[grid](
-        q_f,
-        k_f,
-        v_f,
-        out_f,
-        SEQ * HD,  # stride_bnh
-        HD,  # stride_seq
+        q,
+        k,
+        v,
+        out,
+        stride_b,
+        stride_nh,
+        stride_seq,
+        NH,
         T,
         H,
         W,
@@ -110,4 +117,4 @@ def na3d_flash_attn(
         KW=KW,
     )
 
-    return out_f.reshape(B, NH, T, H, W, HD).permute(0, 2, 3, 4, 1, 5).contiguous()
+    return out
