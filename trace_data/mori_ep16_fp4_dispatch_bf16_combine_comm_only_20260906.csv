@@ -1,0 +1,14 @@
+token_per_rank,total_recv,dispatch_mean_us,dispatch_best_us,dispatch_worst_us,combine_mean_us,combine_best_us,combine_worst_us,iters,stat_tail,routing,kernel
+1,16,83.24,75.46,100.11,146.63,130.64,154.62,100,20,cross_node,InterNodeV1LL
+2,32,81.55,74.00,100.89,149.80,131.23,157.39,100,20,cross_node,InterNodeV1LL
+4,64,87.63,78.18,101.29,156.07,143.08,165.21,100,20,cross_node,InterNodeV1LL
+8,128,83.01,75.92,102.65,159.40,140.28,166.62,100,20,cross_node,InterNodeV1LL
+16,256,84.00,75.68,102.55,157.00,138.82,164.92,100,20,cross_node,InterNodeV1LL
+32,512,83.95,81.14,100.53,155.69,139.59,158.36,100,20,cross_node,InterNodeV1LL
+64,1024,316.48,263.57,342.41,148.84,122.05,210.60,100,20,cross_node,InterNodeV1LL
+128,2048,100.98,90.31,106.59,138.83,134.14,148.11,100,20,cross_node,InterNodeV1LL
+256,4096,137.46,135.05,140.26,321.74,318.92,323.98,100,20,cross_node,InterNodeV1LL
+512,8192,259.62,252.31,266.83,489.38,482.93,496.21,100,20,cross_node,InterNodeV1LL
+1024,16384,479.72,469.48,490.87,939.65,928.75,949.80,100,20,cross_node,InterNodeV1LL
+2048,32768,862.31,833.35,890.73,2007.62,1979.26,2037.18,100,20,cross_node,InterNodeV1LL
+4096,65536,3300.02,2398.32,3640.78,4949.10,4616.39,5851.45,100,20,cross_node,InterNodeV1LL
