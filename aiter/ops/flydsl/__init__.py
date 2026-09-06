@@ -25,6 +25,30 @@ if _base_version < _MIN_FLYDSL_VERSION:
     )
 
 _LAZY_IMPORTS = {
+    "FP4PrefillTopKResult": (
+        ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
+        "FP4PrefillTopKResult",
+    ),
+    "FP4PrefillTopKWorkspace": (
+        ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
+        "FP4PrefillTopKWorkspace",
+    ),
+    "FP4_TILED_PREFILL_TOPK_IN_KERNEL_FUSION_COMPLETE": (
+        ".fp4_prefill_topk",
+        "FP4_TILED_PREFILL_TOPK_IN_KERNEL_FUSION_COMPLETE",
+    ),
+    "FP4PrefillTopKCandidates": (
+        ".fp4_prefill_topk",
+        "FP4PrefillTopKCandidates",
+    ),
+    "FP4BoundedPrefillTopKResult": (
+        ".fp4_prefill_topk",
+        "FP4BoundedPrefillTopKResult",
+    ),
+    "FP4BoundedPrefillTopKWorkspace": (
+        ".fp4_prefill_topk",
+        "FP4BoundedPrefillTopKWorkspace",
+    ),
     "FP8_MQA_LOGITS_DEFAULT_VARIANT": (
         ".kernels.mqa_logits.fp8_mqa_logits",
         "DEFAULT_VARIANT",
@@ -36,6 +60,18 @@ _LAZY_IMPORTS = {
     "compute_varqlen_windows": (
         ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
         "compute_varqlen_windows",
+    ),
+    "allocate_fp4_prefill_topk_workspace": (
+        ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
+        "allocate_fp4_prefill_topk_workspace",
+    ),
+    "allocate_fp4_bounded_prefill_topk_workspace": (
+        ".fp4_prefill_topk",
+        "allocate_fp4_bounded_prefill_topk_workspace",
+    ),
+    "flydsl_candidate_topk_merge": (
+        ".candidate_topk_merge",
+        "flydsl_candidate_topk_merge",
     ),
     "flydsl_flash_attn_func": (".fmha_kernels", "flydsl_flash_attn_func"),
     "flydsl_fp8_mqa_logits": (
@@ -54,9 +90,29 @@ _LAZY_IMPORTS = {
         ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
         "flydsl_pa_mqa_logits_fp4_prefill",
     ),
+    "flydsl_pa_mqa_logits_fp4_prefill_topk": (
+        ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
+        "flydsl_pa_mqa_logits_fp4_prefill_topk",
+    ),
+    "flydsl_pa_mqa_topk_fp4_prefill": (
+        ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
+        "flydsl_pa_mqa_topk_fp4_prefill",
+    ),
     "flydsl_pa_mqa_logits_fp4_varqlen": (
         ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
         "flydsl_pa_mqa_logits_fp4_varqlen",
+    ),
+    "flydsl_pa_mqa_fp4_prefill_topk": (
+        ".fp4_prefill_topk",
+        "flydsl_pa_mqa_fp4_prefill_topk",
+    ),
+    "flydsl_pa_mqa_fp4_score_tile_topk": (
+        ".fp4_prefill_topk",
+        "flydsl_pa_mqa_fp4_score_tile_topk",
+    ),
+    "flydsl_pa_mqa_topk_fp4_prefill_tiled": (
+        ".fp4_prefill_topk",
+        "flydsl_pa_mqa_topk_fp4_prefill_tiled",
     ),
     "flydsl_preshuffle_gemm_a8": (
         ".gemm_kernels",
@@ -69,19 +125,33 @@ _LAZY_IMPORTS = {
 }
 
 __all__ = [
+    "FP4_TILED_PREFILL_TOPK_IN_KERNEL_FUSION_COMPLETE",
     "FP8_MQA_LOGITS_DEFAULT_VARIANT",
     "FP8_MQA_LOGITS_VARIANTS",
+    "FP4BoundedPrefillTopKResult",
+    "FP4BoundedPrefillTopKWorkspace",
+    "FP4PrefillTopKCandidates",
+    "FP4PrefillTopKResult",
+    "FP4PrefillTopKWorkspace",
     "GateMode",
+    "allocate_fp4_bounded_prefill_topk_workspace",
+    "allocate_fp4_prefill_topk_workspace",
     "compute_varqlen_windows",
+    "flydsl_candidate_topk_merge",
     "flydsl_flash_attn_func",
     "flydsl_fp8_mqa_logits",
     "flydsl_hgemm",
     "flydsl_mla_reduce_v1",
     "flydsl_moe_stage1",
     "flydsl_moe_stage2",
+    "flydsl_pa_mqa_fp4_prefill_topk",
+    "flydsl_pa_mqa_fp4_score_tile_topk",
     "flydsl_pa_mqa_logits_fp4",
     "flydsl_pa_mqa_logits_fp4_prefill",
+    "flydsl_pa_mqa_logits_fp4_prefill_topk",
     "flydsl_pa_mqa_logits_fp4_varqlen",
+    "flydsl_pa_mqa_topk_fp4_prefill",
+    "flydsl_pa_mqa_topk_fp4_prefill_tiled",
     "flydsl_preshuffle_gemm_a8",
     "flydsl_qk_norm_rope_quant",
 ]
