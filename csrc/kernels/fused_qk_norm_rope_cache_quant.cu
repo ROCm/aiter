@@ -6330,10 +6330,19 @@ void fused_qk_norm_rope_group_quant(
 // FG_MANY_HEADS_MIN is an MI355 constant and is actively harmful here.
 #define AITER_XLARGE_USE_COARSE 1
 #endif
+  // FG_MANY_HEADS_MIN routing at the LARGE tier is the same MI355 constant, and on
+  // gfx1250 it reproduces exactly the pathology AITER_XLARGE_USE_COARSE fixed one
+  // tier up. Measured T=4096 H=128 G=64: FG launches 528,384 single-wave
+  // workgroups (one per (token,head)) against flydsl's 4,608 blocks / 36,864
+  // waves -- 14.3x the waves, each paying its own kernarg read, positions chase,
+  // cos/sin setup and descriptor build -- and runs 2.10x flydsl, the worst cell in
+  // the sweep. Coarse gives a wave HPW=8 heads and amortises all of it. Gated on
+  // the arch so gfx950/MI355 keeps the routing that was measured there.
+  const bool fg_many_heads_ok = (get_gpu_arch() != "gfx1250");
   const bool use_finegrained =
       (num_tokens <= 65535)
       && (((AITER_XLARGE_USE_COARSE == 0) && use_xlarge_prefill)
-          || (use_large_prefill && num_heads >= FG_MANY_HEADS_MIN)
+          || (use_large_prefill && num_heads >= FG_MANY_HEADS_MIN && fg_many_heads_ok)
           || use_decode_path);
   auto launch_all = [&](auto group_size_tag, auto scale_fp32_tag, auto has_qw_tag) {
     constexpr int  head_dim_val      = 512;
