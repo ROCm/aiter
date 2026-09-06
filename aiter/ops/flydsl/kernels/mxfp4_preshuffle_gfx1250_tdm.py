@@ -80,6 +80,29 @@ def _build_persistent_task_range(block_id, total_n_tiles, max_tasks_per_worker):
     return m_tile, n_begin, n_begin + task_count
 
 
+@flyc.jit
+def _find_expert(arg_m_tile_map, blk_m, n_experts: Constexpr[int]):
+    """Return the expert and valid row count for an M tile."""
+    i32_ptr = fx.PointerType.get(
+        elem_ty=fx.Int32.ir_type,
+        address_space=fx.AddressSpace.Global,
+        alignment=4,
+    )
+    tile_map = fx.recast_iter(i32_ptr, arg_m_tile_map)
+    lo, hi = blk_m * 0, blk_m * 0 + n_experts
+    iterations = max(1, math.ceil(math.log2(max(2, n_experts))) + 1)
+    for _ in range_constexpr(iterations):
+        mid = (lo + hi) >> 1
+        mid_clamped = (mid < n_experts - 1).select(mid, n_experts - 1)
+        go_right = tile_map[mid_clamped] <= blk_m
+        lo = go_right.select(mid + 1, lo)
+        hi = go_right.select(hi, mid)
+    expert = lo
+    expert_clamped = (expert < n_experts).select(expert, n_experts - 1)
+    mn_oob = tile_map[expert_clamped] - blk_m
+    return expert, mn_oob
+
+
 def _build_gemm_task(
     K: Constexpr[int],
     tile_m: Constexpr[int],
@@ -207,13 +230,14 @@ def _build_gemm_task(
         arg_b: fx.Pointer,
         arg_scale_a: fx.Tensor,
         arg_scale_b: fx.Tensor,
-        arg_m_tile_map: fx.Pointer,
         arg_bias: fx.Pointer,
         arg_quant_scale: fx.Tensor,
         arg_ep_row_map: fx.Tensor,
         i32_n: fx.Int32,
         m_tile: fx.Int32,
         n_tile: fx.Int32,
+        expert: fx.Int32,
+        mn_oob: fx.Int32,
         f32_swiglu_limit: fx.Float32,
         f32_situ_beta: fx.Float32,
         f32_situ_linear_beta: fx.Float32,
@@ -244,19 +268,6 @@ def _build_gemm_task(
         blk_n64 = fx.Int64(blk_n)
         n64 = fx.Int64(i32_n)
 
-        # In-kernel bisect: find expert owning this M-tile via psum
-        i32_ptr = fx.PointerType.get(
-            elem_ty=fx.Int32.ir_type, address_space=fx.AddressSpace.Global, alignment=4
-        )
-        tile_map = fx.recast_iter(i32_ptr, arg_m_tile_map)
-        lo, hi = blk_m * 0, blk_m * 0 + n_experts
-        for _ in range_constexpr(max(1, math.ceil(math.log2(max(2, n_experts))) + 1)):
-            mid = (lo + hi) >> 1
-            mid_clamped = (mid < n_experts - 1).select(mid, n_experts - 1)
-            go_right = tile_map[mid_clamped] <= blk_m
-            lo = go_right.select(mid + 1, lo)
-            hi = go_right.select(hi, mid)
-        expert = lo
         eb64 = fx.Int64(expert)
         B_BATCH_ROWS = n64 // 16
         N_SUPERS = (n64 + 31) // 32
@@ -265,9 +276,6 @@ def _build_gemm_task(
         c_outer_off, c_inner_off, c_stride = blk_m64, blk_n64, i32_n
         SB_OUTER_STRIDE = K4
         sb_batch_off = eb64 * (N_SUPERS * K4)
-        # Per-expert A-data OOB: bound to the owning expert's valid-row
-        mn_oob = tile_map[(expert < n_experts).select(expert, n_experts - 1)] - blk_m
-
         # static=False (one dyn-shared base) only where a second region is
         # needed, so the non-scatter path keeps its per-leaf static allocation.
         _smem = (
@@ -786,6 +794,7 @@ def _build_gemm_task(
                 return counts
 
             def emit_hints(ksl, tail_mfma=0):
+                return
                 has_next = ksl + 1 < KWS or (
                     ksl + 1 == KWS and next_stage_buf is not None
                 )
@@ -1747,20 +1756,28 @@ def launch_gemm_a8w4_tdm(
         total_n_tiles = (i32_n + (tile_n - 1)) // tile_n
         total_m_tiles = (i32_m + (tile_m - 1)) // tile_m
 
-        def run_task(m_tile, n_tile, is_first_task=False, has_next_task=False):
+        def run_task(
+            m_tile,
+            n_tile,
+            expert,
+            mn_oob,
+            is_first_task=False,
+            has_next_task=False,
+        ):
             gemm_task(
                 arg_c,
                 arg_a,
                 arg_b,
                 arg_scale_a,
                 arg_scale_b,
-                arg_m_tile_map,
                 arg_bias,
                 arg_quant_scale,
                 arg_ep_row_map,
                 i32_n,
                 m_tile,
                 n_tile,
+                expert,
+                mn_oob,
                 f32_swiglu_limit,
                 f32_situ_beta,
                 f32_situ_linear_beta,
@@ -1772,11 +1789,16 @@ def launch_gemm_a8w4_tdm(
             m_tile, n_tile, n_end = _build_persistent_task_range(
                 fx.block_idx.x, total_n_tiles, max_tasks_per_worker
             )
+            expert, mn_oob = _find_expert(
+                arg_m_tile_map, m_tile * tile_m, n_experts
+            )
             n_begin = n_tile
             while n_tile < n_end:
                 run_task(
                     m_tile,
                     n_tile,
+                    expert,
+                    mn_oob,
                     is_first_task=n_tile == n_begin,
                     has_next_task=n_tile + 1 < n_end,
                 )
@@ -1785,7 +1807,10 @@ def launch_gemm_a8w4_tdm(
             m_tile, n_tile = _build_static_task(
                 fx.block_idx.x, total_m_tiles, total_n_tiles, cluster_n
             )
-            run_task(m_tile, n_tile)
+            expert, mn_oob = _find_expert(
+                arg_m_tile_map, m_tile * tile_m, n_experts
+            )
+            run_task(m_tile, n_tile, expert, mn_oob)
 
     m_tiles = (i32_m + (tile_m - 1)) // tile_m
     n_tiles = (N + (tile_n - 1)) // tile_n
