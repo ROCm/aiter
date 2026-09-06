@@ -269,7 +269,7 @@ def _build_expert_mask(experts, local_expert_start, local_expert_end, device):
 
 def _run_comm_only_bs(bs, op, x_fp4, x_scale, weights, ids, model_dim, world_size,
                       iters, stat_iters, rank):
-    """Time MORI FP4 dispatch and BF16 combine without a GEMM between them."""
+    """Time rank-aligned dispatch-only and combine-only phases."""
     backend = op._backend
     x_fp4 = x_fp4[:bs].contiguous()
     x_scale = x_scale[:bs].contiguous()
@@ -282,19 +282,38 @@ def _run_comm_only_bs(bs, op, x_fp4, x_scale, weights, ids, model_dim, world_siz
     )
     backend.combine(combine_input, dispatched)
     torch.cuda.synchronize()
-    events = [torch.cuda.Event(enable_timing=True) for _ in range(3 * iters)]
-    dist.barrier()
+
+    # Dispatch phase: align ranks before the timed dispatch; consume the
+    # routing with an untimed combine so every epoch completes normally.
+    dispatch_events = [torch.cuda.Event(enable_timing=True) for _ in range(2 * iters)]
     for i in range(iters):
-        base = 3 * i
-        events[base].record()
+        torch.cuda.synchronize()
+        dist.barrier()
+        dispatch_events[2 * i].record()
         dispatched = backend.dispatch_prequant(x_fp4, x_scale, weights, ids)
-        events[base + 1].record()
+        dispatch_events[2 * i + 1].record()
         backend.combine(combine_input, dispatched)
-        events[base + 2].record()
     torch.cuda.synchronize()
+
+    # Combine phase: prepare dispatch outside the bracket, drain it locally,
+    # then align all ranks before timing only combine.
+    combine_events = [torch.cuda.Event(enable_timing=True) for _ in range(2 * iters)]
+    for i in range(iters):
+        dispatched = backend.dispatch_prequant(x_fp4, x_scale, weights, ids)
+        torch.cuda.synchronize()
+        dist.barrier()
+        combine_events[2 * i].record()
+        backend.combine(combine_input, dispatched)
+        combine_events[2 * i + 1].record()
+    torch.cuda.synchronize()
+
     keep = max(1, min(stat_iters, iters))
-    dispatch_ms = [events[3*i].elapsed_time(events[3*i+1]) for i in range(iters)][-keep:]
-    combine_ms = [events[3*i+1].elapsed_time(events[3*i+2]) for i in range(iters)][-keep:]
+    dispatch_ms = [
+        dispatch_events[2*i].elapsed_time(dispatch_events[2*i+1]) for i in range(iters)
+    ][-keep:]
+    combine_ms = [
+        combine_events[2*i].elapsed_time(combine_events[2*i+1]) for i in range(iters)
+    ][-keep:]
     d_local = sum(dispatch_ms) / keep
     c_local = sum(combine_ms) / keep
     d_avg = _reduce_float(d_local, dist.ReduceOp.SUM) / world_size
@@ -303,12 +322,15 @@ def _run_comm_only_bs(bs, op, x_fp4, x_scale, weights, ids, model_dim, world_siz
     d_max = _reduce_float(d_local, dist.ReduceOp.MAX)
     c_min = _reduce_float(c_local, dist.ReduceOp.MIN)
     c_max = _reduce_float(c_local, dist.ReduceOp.MAX)
+    d_iter_min = _reduce_float(min(dispatch_ms), dist.ReduceOp.MIN)
+    c_iter_min = _reduce_float(min(combine_ms), dist.ReduceOp.MIN)
     if rank == 0:
         print(
             f"[EP16-comm-only] bs={bs} stat={keep}/{iters} "
             f"dispatch={d_avg*1000:.2f}/{d_min*1000:.2f}/{d_max*1000:.2f}us "
             f"combine={c_avg*1000:.2f}/{c_min*1000:.2f}/{c_max*1000:.2f}us "
-            f"mean/best/worst", flush=True,
+            f"mean/best/worst min_iter={d_iter_min*1000:.2f}/{c_iter_min*1000:.2f}us",
+            flush=True,
         )
 
 
