@@ -10,11 +10,15 @@ whether the optional dependency exists before relying on FlyDSL kernels.
 
 from packaging.version import Version
 
+from aiter.fused_moe_registry import register_fused_moe_impl
+
+from .moe_common import GateMode
 from .utils import is_flydsl_available
 
-_MIN_FLYDSL_VERSION = Version("0.2.4")
+_MIN_FLYDSL_VERSION = Version("0.3.2")
 
 __all__ = [
+    "GateMode",
     "is_flydsl_available",
 ]
 
@@ -35,22 +39,7 @@ if is_flydsl_available():
             f"got `{installed_flydsl_version}`."
         )
 
-    from .gemm_kernels import (
-        flydsl_preshuffle_gemm_a8,
+    register_fused_moe_impl(
+        "flydsl_gfx942",
+        "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl",
     )
-    from .moe_kernels import (
-        flydsl_moe_stage1,
-        flydsl_moe_stage2,
-    )
-
-    from .gemm_kernels import flydsl_hgemm
-
-    from .linear_attention_kernels import flydsl_gdr_decode
-
-    __all__ += [
-        "flydsl_preshuffle_gemm_a8",
-        "flydsl_moe_stage1",
-        "flydsl_moe_stage2",
-        "flydsl_hgemm",
-        "flydsl_gdr_decode",
-    ]
