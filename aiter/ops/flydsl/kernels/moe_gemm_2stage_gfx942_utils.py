@@ -10,8 +10,10 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
-from flydsl.expr import range_constexpr
+from flydsl.expr import ptrtoint, range_constexpr
 from flydsl.expr.typing import Vector as Vec
+
+from aiter.ops.flydsl.kernels import buffer_ops
 
 
 def div_up(x, y):
@@ -340,6 +342,13 @@ def _as_ptr(p, dtype=None):
     return ptr
 
 
+def to_llvm_ptr(ptr):
+    converter = getattr(fx, "to_llvm_ptr", None)
+    if converter is not None:
+        return converter(ptr)
+    return buffer_ops.create_llvm_ptr(ptrtoint(ptr), address_space=1)
+
+
 def atomic_add_bf16(ptr_base, reg_vec):
     """Pairwise global atomic-add of a bf16 vector.
 
@@ -348,7 +357,7 @@ def atomic_add_bf16(ptr_base, reg_vec):
     """
     for i in range_constexpr(reg_vec.numel // 2):
         pair = Vec.from_elements([reg_vec[i * 2], reg_vec[i * 2 + 1]], fx.BFloat16)
-        llvm_ptr = fx.to_llvm_ptr(ptr_base + i * 2)
+        llvm_ptr = to_llvm_ptr(ptr_base + i * 2)
         llvm.AtomicRMWOp(
             llvm.AtomicBinOp.fadd,
             llvm_ptr,

@@ -28,12 +28,20 @@ Example:
 
 from __future__ import annotations
 
+from packaging.version import Version
+
+import flydsl
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import arith as std_arith
 from flydsl._mlir.dialects import llvm, rocdl
 from flydsl._mlir.extras import types as T
 from flydsl.expr.meta import dsl_loc_tracing
 from flydsl.runtime.device import is_rdna_arch
+
+
+_LEGACY_RAW_PTR_AUX_OPERAND = Version(flydsl.__version__.split("+")[0]) < Version(
+    "0.3.0"
+)
 
 
 def _get_buffer_flags(arch=None):
@@ -593,20 +601,27 @@ def buffer_load(
             soffset = _create_i32_constant(soffset_bytes)
         else:
             soffset = _to_i32_offset(_unwrap_value(soffset_bytes))
-    aux_attr = (
-        ir.IntegerAttr.get(ir.IntegerType.get_signless(32), cache_modifier)
-        if cache_modifier
-        else None
-    )
-
-    # Emit buffer load
-    load_op = rocdl.RawPtrBufferLoadOp(
-        result_type,
-        rsrc,
-        offset,
-        soffset,
-        aux=aux_attr,
-    )
+    if _LEGACY_RAW_PTR_AUX_OPERAND:
+        load_op = rocdl.RawPtrBufferLoadOp(
+            result_type,
+            rsrc,
+            offset,
+            soffset,
+            _create_i32_constant(cache_modifier),
+        )
+    else:
+        aux_attr = (
+            ir.IntegerAttr.get(ir.IntegerType.get_signless(32), cache_modifier)
+            if cache_modifier
+            else None
+        )
+        load_op = rocdl.RawPtrBufferLoadOp(
+            result_type,
+            rsrc,
+            offset,
+            soffset,
+            aux=aux_attr,
+        )
 
     return load_op.result
 
@@ -683,17 +698,24 @@ def buffer_store(
             soffset = _create_i32_constant(int(soffset_bytes))
         else:
             soffset = _to_i32_offset(_unwrap_value(soffset_bytes))
-    aux_attr = (
-        ir.IntegerAttr.get(ir.IntegerType.get_signless(32), cache_modifier)
-        if cache_modifier
-        else None
-    )
-
-    # Emit buffer store
-    rocdl.RawPtrBufferStoreOp(
-        data,
-        rsrc,
-        offset,
-        soffset,
-        aux=aux_attr,
-    )
+    if _LEGACY_RAW_PTR_AUX_OPERAND:
+        rocdl.RawPtrBufferStoreOp(
+            data,
+            rsrc,
+            offset,
+            soffset,
+            _create_i32_constant(cache_modifier),
+        )
+    else:
+        aux_attr = (
+            ir.IntegerAttr.get(ir.IntegerType.get_signless(32), cache_modifier)
+            if cache_modifier
+            else None
+        )
+        rocdl.RawPtrBufferStoreOp(
+            data,
+            rsrc,
+            offset,
+            soffset,
+            aux=aux_attr,
+        )

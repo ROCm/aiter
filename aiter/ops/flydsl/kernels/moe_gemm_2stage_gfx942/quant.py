@@ -72,7 +72,7 @@ def _flydsl_absmax_cached(device_cache_key):
 
         vmax = wave_reduce_max(vmax)
         if tid == 0:
-            llvm_ptr = fx.to_llvm_ptr(Amax)
+            llvm_ptr = fxh.to_llvm_ptr(Amax)
             llvm.AtomicRMWOp(
                 llvm.AtomicBinOp.fmax,
                 llvm_ptr,

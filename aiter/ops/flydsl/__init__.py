@@ -15,7 +15,7 @@ from aiter.fused_moe_registry import register_fused_moe_impl
 from .moe_common import GateMode
 from .utils import is_flydsl_available
 
-_MIN_FLYDSL_VERSION = Version("0.3.2")
+_MIN_FLYDSL_VERSION = Version("0.2.4")
 
 __all__ = [
     "GateMode",
