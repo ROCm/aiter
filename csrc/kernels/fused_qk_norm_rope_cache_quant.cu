@@ -6461,8 +6461,28 @@ void fused_qk_norm_rope_group_quant(
       // of the wave while FETCH_SIZE is 1.089x ideal, i.e. traffic is at the
       // floor and the serial load -> wave_reduce -> store chain leaves MLP at 1.
       // gfx1250-only; the LDS ring costs DEPTH*512*2 B per wave.
+      //
+      // DEPTH=2, not 3: every extra ring slot costs LDS and therefore residency,
+      // and at 2 the overlap is already there. MEASURED T=16384 H=128 G=64,
+      // paired A/B 6 reps: 308.23 -> 302.33 us, -1.91% (95% CI [-3.17, -0.66],
+      // 5/6 reps negative). Full sweep: 27 of 28 shapes faster, none slower
+      // (T=4096 -3.6..-14%, T=16384 -0.5..-3.9%). This corroborates the earlier
+      // H=32 sweep in 93aaf800, which put 3 -> 2 at -2.06% (T=4096) / -2.86%
+      // (T=16384).
+      //
+      // DO NOT go to DEPTH=1: it is a data race, not a tuning choice. Iteration i
+      // reads LDS slot (i % DEPTH) and then issues the refill TDM into that SAME
+      // slot for head i+DEPTH. At DEPTH>=2 the refill is not awaited until DEPTH-1
+      // iterations later, so the ds_read has long since sampled; at DEPTH=1 the
+      // next iteration's s_wait_tensorcnt<0> closes the window immediately and the
+      // async write races the read. err_q goes 1.36e-07 -> 0.964 at every prefill
+      // tier. See 508a86ac, which reverted 93aaf800 for exactly this.
+      //
+      // DEPTH=2 correctness verified before shipping (the condition 508a86ac
+      // attached to it): full sweep err_q max 5.45e-07 -- the same values the
+      // DEPTH=3 baseline produces -- and 40/40 SWA checks byte-exact.
 #ifndef AITER_COARSE_Q_TDM_DEPTH
-#define AITER_COARSE_Q_TDM_DEPTH 3
+#define AITER_COARSE_Q_TDM_DEPTH 2
 #endif
       constexpr int q_tdm_depth_val = AITER_COARSE_Q_TDM_DEPTH;
       if constexpr (q_tdm_depth_val > 0) {
