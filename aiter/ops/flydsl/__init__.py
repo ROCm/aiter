@@ -57,6 +57,9 @@ if is_flydsl_available():
     from .kernels.mqa_logits.fp8_paged_mqa_logits import (
         flydsl_fp8_paged_mqa_logits,
     )
+    from .kernels.mqa_logits.fp8_paged_mqa_logits_gfx950 import (
+        flydsl_fp8_paged_mqa_logits_gfx950,
+    )
     from .kernels.mqa_logits.pa_mqa_logits_fp4 import (
         flydsl_pa_mqa_logits_fp4,
     )
@@ -80,6 +83,7 @@ if is_flydsl_available():
         "flydsl_flash_attn_func",
         "flydsl_fp8_mqa_logits",
         "flydsl_fp8_paged_mqa_logits",
+        "flydsl_fp8_paged_mqa_logits_gfx950",
         "flydsl_hgemm",
         "flydsl_mla_reduce_v1",
         "flydsl_moe_stage1",
