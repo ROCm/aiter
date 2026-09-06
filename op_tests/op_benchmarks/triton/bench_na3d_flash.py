@@ -30,6 +30,7 @@ from op_tests.triton_tests.attention.test_na3d_flash import (
 )
 
 SUPPORTED_GFX = ["gfx942", "gfx950"]
+_SUPPORTED_DTYPES = (torch.bfloat16,)
 
 
 @benchmark()
@@ -111,6 +112,13 @@ def main():
     args = parser.parse_args()
 
     for dtype in args.dtype:
+        if dtype not in _SUPPORTED_DTYPES:
+            aiter.logger.warning(
+                "na3d_flash only supports %s; skipping dtype=%s",
+                _SUPPORTED_DTYPES,
+                str(dtype).replace("torch.", ""),
+            )
+            continue
         rows = []
         for shape in args.shapes:
             B, T, H, W, NH, HD, KT, KH, KW = shape
