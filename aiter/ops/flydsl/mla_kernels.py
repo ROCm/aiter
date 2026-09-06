@@ -20,6 +20,15 @@ __all__ = [
 
 _DECODE_PAGE_SIZE = 64
 _DECODE_NUM_Q_HEADS = (64, 128)
+# At or below this the kernel runs two waves that split the PV output dim rather
+# than the heads, which leaves each wave holding only part of a head's output
+# row. The single-split fast path writes bf16 straight out and has not been
+# validated for that, so these head counts always take the split-merge path.
+_DECODE_NARROW_HEADS = 32
+# Heads one block covers. Head counts above this are spread over the grid, and
+# each of those head groups reads the whole KV cache, which is what makes the
+# achieved bandwidth of a heads=128 launch twice its unique-byte figure. Read by
+# op_tests/_bench_flydsl_vs_gluon.py to model traffic.
 _DECODE_HEADS_PER_BLOCK = 64
 
 
@@ -264,25 +273,43 @@ def flydsl_mla_decode_reduce(
     return out
 
 
+_CU_COUNT_CACHE = {}
+
+
+def _cu_count(device=None):
+    index = (
+        torch.cuda.current_device() if device is None else torch.device(device).index
+    )
+    if index is None:
+        index = torch.cuda.current_device()
+    if index not in _CU_COUNT_CACHE:
+        _CU_COUNT_CACHE[index] = torch.cuda.get_device_properties(
+            index
+        ).multi_processor_count
+    return _CU_COUNT_CACHE[index]
+
+
 def _pick_num_splits(
-    batch, num_tokens_per_seq, max_seqlen_kv, page_size, requested, num_heads=128
+    batch,
+    num_tokens_per_seq,
+    max_seqlen_kv,
+    page_size,
+    requested,
+    num_heads=128,
+    device=None,
 ):
+
     if requested is not None:
         return requested
 
-    from aiter.mla import get_meta_param
-
-    meta_seqlen_q = min(num_tokens_per_seq, max(1, 512 // num_heads))
-    num_splits, _ = get_meta_param(
-        None,
-        batch,
-        batch * max_seqlen_kv,
-        num_heads,
-        meta_seqlen_q,
-        torch.float8_e4m3fn,
-    )
     pages_per_seq = max(1, (max_seqlen_kv + page_size - 1) // page_size)
-    return max(1, min(num_splits, pages_per_seq))
+    balanced = 1 << (pages_per_seq.bit_length() // 2)
+
+    head_groups = max(1, num_heads // _DECODE_HEADS_PER_BLOCK)
+    blocks_per_split = max(1, batch * num_tokens_per_seq * head_groups)
+    occupancy_cap = _cu_count(device) // blocks_per_split
+
+    return max(1, min(balanced, occupancy_cap, pages_per_seq))
 
 
 def flydsl_mla_decode_workspace(
@@ -349,7 +376,10 @@ def flydsl_mla_decode_fwd(
         page_size,
         num_splits,
         num_heads=num_q_heads,
+        device=q.device,
     )
+    if num_q_heads <= _DECODE_NARROW_HEADS and resolved_splits == 1:
+        resolved_splits = 2
 
     device = q.device
     if workspace is None:
