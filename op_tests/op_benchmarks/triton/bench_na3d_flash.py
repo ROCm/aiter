@@ -9,9 +9,6 @@ python bench_na3d_flash.py
 
 # Custom shapes
 python bench_na3d_flash.py -s '(1,79,192,192,4,64,11,11,11)'
-
-# FP16 (if supported)
-python bench_na3d_flash.py -d fp16
 """
 
 import argparse
