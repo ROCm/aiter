@@ -73,9 +73,9 @@ class MegaMoEInterNodeBackend:
             kernel_type=mori.ops.EpDispatchCombineKernelType.InterNodeV1LL,
             gpu_per_node=gpu_per_node,
             num_qp_per_pe=2,
-            rdma_block_num=64,
-            block_num=96,
-            warp_num_per_block=8,
+            rdma_block_num=int(os.environ.get("MORI_EP_RDMA_BLOCK_NUM", "64")),
+            block_num=int(os.environ.get("MORI_EP_BLOCK_NUM", "96")),
+            warp_num_per_block=int(os.environ.get("MORI_EP_WARP_PER_BLOCK", "8")),
         )
         self.op = mori.ops.EpDispatchCombineOp(cfg)
         self._owner_id = id(self)
