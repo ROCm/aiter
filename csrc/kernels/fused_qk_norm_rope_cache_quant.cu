@@ -4947,6 +4947,14 @@ namespace aiter {
       // so load it once per wave (not once per head) and reuse across the HPW-head loop.
       const bool is_pe_thread = (tid >= pe_tid_start && tid < pe_tid_end);
       float pe_cos[vec_size_i], pe_sin[vec_size_i];
+      // KEPT GUARDED. Dropping the `if` and clamping the row to 0 for the non-PE
+      // lanes -- inverse_rope_group_quant's cos/sin fix from 4571cfd4, which works
+      // there -- MEASURED NULL here: T=16384 H=128 G=64, paired A/B 6 reps,
+      // 308.64 -> 308.42 us, -0.07% (95% CI [-1.05, +0.92], 3/6 reps negative).
+      // The ISA says why: the exec region does go away (s_and_saveexec 20 -> 18,
+      // s_or_b32 35 -> 33) but s_wait_xcnt goes UP, 46 -> 48 -- the drain moves to
+      // another guarded register instead of disappearing, the same way the FG
+      // kernel's store_scale edit behaved. Do not retry.
       if (is_pe_thread) {
         const int32_t pe_local_tid = tid - pe_tid_start;
         // NOT vectorised, deliberately. The same load_rope_cos_sin<> treatment that
