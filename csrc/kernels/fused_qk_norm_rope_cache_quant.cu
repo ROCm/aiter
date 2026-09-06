@@ -4849,6 +4849,36 @@ namespace aiter {
       using opus_vec_q = opus::vector_t<query_t, vec_size_o>;
 
       // ---- Wave-level indexing: each wave handles one token ----
+      //
+      // The alternative -- a block owning ONE token and a contiguous run of
+      // TOKENS_PER_BLOCK*HPW heads, wave w taking head run_base + t*TPB + w at step
+      // t so the concurrent Q row loads are ADJACENT rows -- was implemented and
+      // MEASURED. That is flydsl's `row_of(tile) = tile*RT + wave`, whose workgroup
+      // owns one token's whole head set (CT*RT == H) for exactly this reason.
+      //
+      // It does not pay here: T=16384 H=128 G=64, paired A/B 6 reps, 301.44 ->
+      // 304.58 us, +1.04% (95% CI [-0.12, +2.21], 4/6 reps positive). Outputs were
+      // correct (err_q identical to baseline, 40/40 SWA byte-exact).
+      //
+      // Caveat on that number: the adjacent-row grid needs grid.x == num_tokens for
+      // the Q blocks, and grid.x is shared with the K row (blockIdx.y == 0), so the
+      // K row gets num_tokens blocks instead of ceil(num_tokens/TPB) -- 49152 blocks
+      // / 196608 wave slots against 36864 / 147456, i.e. arm B carried a +33%
+      // dispatch handicap (the surplus blocks retire whole on the token bounds
+      // test). The true mapping effect is therefore somewhere at or slightly below
+      // neutral, not the measured +1.04%.
+      //
+      // Either way it cannot be a large win, because there is nothing for it to
+      // share: head_dim=512 bf16 is a 1 KB row consumed entirely by one wave, and
+      // two adjacent rows are 1 KB apart, so they share no 128 B cache line. No
+      // mapping makes waves reuse each other's lines; only DRAM-side locality is
+      // left, and each wave already streams its own row sequentially.
+      //
+      // Making the comparison handicap-free would require the block's waves to share
+      // a token AND still cover 16 rows each, i.e. a wave spanning TOKENS_PER_BLOCK
+      // tokens -- which turns the per-token hoists (cos/sin, positions, the q SRD,
+      // the output bases) from once per wave into once per token. That is a
+      // different trade, not a free one.
       // threadIdx.x is divergent as far as the compiler is concerned, so wave_id --
       // and with it token_idx and every output base pointer derived from it -- lands
       // in VGPRs, and each buffer-descriptor build then needs a v_readfirstlane_b32
