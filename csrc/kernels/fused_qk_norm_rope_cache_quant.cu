@@ -4849,7 +4849,13 @@ namespace aiter {
       using opus_vec_q = opus::vector_t<query_t, vec_size_o>;
 
       // ---- Wave-level indexing: each wave handles one token ----
-      const uint32_t wave_id = threadIdx.x / WARP_SIZE;
+      // threadIdx.x is divergent as far as the compiler is concerned, so wave_id --
+      // and with it token_idx and every output base pointer derived from it -- lands
+      // in VGPRs, and each buffer-descriptor build then needs a v_readfirstlane_b32
+      // to recover a scalar base. wave_id is wave-uniform by construction, so state
+      // that and let the whole address chain stay scalar.
+      const uint32_t wave_id =
+          static_cast<uint32_t>(__builtin_amdgcn_readfirstlane(static_cast<int>(threadIdx.x / WARP_SIZE)));
       const uint32_t tid = threadIdx.x % WARP_SIZE;
       const int32_t token_idx = static_cast<int32_t>(blockIdx.x) * TOKENS_PER_BLOCK + wave_id;
       if (token_idx >= params.num_tokens) return;
@@ -5826,7 +5832,9 @@ namespace aiter {
       // waves now read q[t..t+N, h, :], striding by q_stride_0, instead of the
       // contiguous q[t, h..h+N, :]). flydsl takes that trade.
       constexpr int TOKENS_PER_WG = TOKENS_PER_BLOCK;
-      const int32_t wave_id = static_cast<int32_t>(threadIdx.x) / WARP_SIZE;
+      // Wave-uniform by construction -- see the coarse kernel's wave_id.
+      const int32_t wave_id =
+          __builtin_amdgcn_readfirstlane(static_cast<int32_t>(threadIdx.x) / WARP_SIZE);
       const int32_t tid     = static_cast<int32_t>(threadIdx.x) % WARP_SIZE;
       const int32_t token_idx =
           static_cast<int32_t>(blockIdx.y) * TOKENS_PER_WG + wave_id;
