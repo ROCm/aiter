@@ -267,6 +267,51 @@ def _build_expert_mask(experts, local_expert_start, local_expert_end, device):
     return expert_mask
 
 
+def _run_comm_only_bs(bs, op, x_fp4, x_scale, weights, ids, model_dim, world_size,
+                      iters, stat_iters, rank):
+    """Time MORI FP4 dispatch and BF16 combine without a GEMM between them."""
+    backend = op._backend
+    x_fp4 = x_fp4[:bs].contiguous()
+    x_scale = x_scale[:bs].contiguous()
+    weights = weights[:bs].contiguous()
+    ids = ids[:bs].contiguous()
+    dispatched = backend.dispatch_prequant(x_fp4, x_scale, weights, ids)
+    combine_input = torch.zeros(
+        (dispatched.tokens.shape[0], model_dim), dtype=torch.bfloat16,
+        device=x_fp4.device,
+    )
+    backend.combine(combine_input, dispatched)
+    torch.cuda.synchronize()
+    events = [torch.cuda.Event(enable_timing=True) for _ in range(3 * iters)]
+    dist.barrier()
+    for i in range(iters):
+        base = 3 * i
+        events[base].record()
+        dispatched = backend.dispatch_prequant(x_fp4, x_scale, weights, ids)
+        events[base + 1].record()
+        backend.combine(combine_input, dispatched)
+        events[base + 2].record()
+    torch.cuda.synchronize()
+    keep = max(1, min(stat_iters, iters))
+    dispatch_ms = [events[3*i].elapsed_time(events[3*i+1]) for i in range(iters)][-keep:]
+    combine_ms = [events[3*i+1].elapsed_time(events[3*i+2]) for i in range(iters)][-keep:]
+    d_local = sum(dispatch_ms) / keep
+    c_local = sum(combine_ms) / keep
+    d_avg = _reduce_float(d_local, dist.ReduceOp.SUM) / world_size
+    c_avg = _reduce_float(c_local, dist.ReduceOp.SUM) / world_size
+    d_min = _reduce_float(d_local, dist.ReduceOp.MIN)
+    d_max = _reduce_float(d_local, dist.ReduceOp.MAX)
+    c_min = _reduce_float(c_local, dist.ReduceOp.MIN)
+    c_max = _reduce_float(c_local, dist.ReduceOp.MAX)
+    if rank == 0:
+        print(
+            f"[EP16-comm-only] bs={bs} stat={keep}/{iters} "
+            f"dispatch={d_avg*1000:.2f}/{d_min*1000:.2f}/{d_max*1000:.2f}us "
+            f"combine={c_avg*1000:.2f}/{c_min*1000:.2f}/{c_max*1000:.2f}us "
+            f"mean/best/worst", flush=True,
+        )
+
+
 def _run_one_bs(
     bs,
     op,
@@ -298,6 +343,13 @@ def _run_one_bs(
     x_scale_bs = x_scale[:bs].contiguous()
     topk_weights_bs = topk_weights[:bs].contiguous()
     topk_ids_bs = topk_ids[:bs].contiguous()
+
+    if os.environ.get("MORI_COMM_ONLY", "0") == "1":
+        _run_comm_only_bs(
+            bs, op, x_fp4, x_scale, topk_weights, topk_ids, model_dim,
+            world_size, iters, stat_iters, rank,
+        )
+        return
 
     # Public MegaMoEV2 contract: the facade owns the complete inter-node
     # dispatch -> fused_moe -> combine sequence.
@@ -665,9 +717,18 @@ def run_ep16_a4w4(
             routing=routing, max_tok_anchor=max_bs,
             world_size=world_size, gpu_per_node=gpu_per_node,
         )
-        (w1_a, w1_s, w2_a, w2_s), (w1_qt, w1_scale, w2_qt, w2_scale) = (
-            _quantize_local_weights(model_dim, inter_dim, local_experts, rank, seed, device)
-        )
+        if os.environ.get("MORI_COMM_ONLY", "0") == "1":
+            # The inter-node backend does not touch weights in comm-only mode.
+            # Avoid allocating/quantizing the multi-GB MoE weights.
+            w1_a = w2_a = torch.empty(1, dtype=dtypes.fp4x2, device=device)
+            w1_s = w2_s = torch.empty(1, dtype=torch.uint8, device=device)
+            w1_qt = w2_qt = w1_scale = w2_scale = w1_a
+        else:
+            (w1_a, w1_s, w2_a, w2_s), (w1_qt, w1_scale, w2_qt, w2_scale) = (
+                _quantize_local_weights(
+                    model_dim, inter_dim, local_experts, rank, seed, device
+                )
+            )
         expert_mask = _build_expert_mask(experts, local_expert_start, local_expert_end, device)
 
         if rank == 0:
