@@ -181,6 +181,15 @@ __device__ __forceinline__ float fp_f32_to_e8m0_scale(float amax)
 struct E8m0BlockScale {
     uint8_t byte;
     float   dq_scale;
+
+    // 1 / dq_scale without a divide. dq_scale is 2^(byte-127) by construction, so
+    // its reciprocal is 2^(127-byte), which is the float whose biased exponent is
+    // 254-byte and whose mantissa is zero. Bit-exact for byte in [1, 254]; byte==0
+    // and byte==255 (the e8m0 NaN encoding) do not occur for a finite amax.
+    __device__ __forceinline__ float inv_scale() const
+    {
+        return __builtin_bit_cast(float, static_cast<uint32_t>(254u - byte) << 23);
+    }
 };
 
 // One-shot E8M0 block scale: computes BOTH the storage byte and the f32 dequant

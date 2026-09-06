@@ -4687,7 +4687,7 @@ namespace aiter {
               }
             }
           }
-          inv_scale = is_nope_thread ? (1.0f / s.dq_scale) : 0.0f;
+          inv_scale = is_nope_thread ? s.inv_scale() : 0.0f;
         } else {
           const float group_scale = thread_max / opus::finfo<cache_t>::max();
           inv_scale = is_nope_thread ? (1.0f / group_scale) : 0.0f;
@@ -5121,7 +5121,7 @@ namespace aiter {
           constexpr MxDtype kQMxDt = kHwFp8E4m3Dtype;
           const E8m0BlockScale qs_scale =
               fp_f32_to_e8m0_block_scale<MxScaleRoundMode::RoundUp, kQMxDt>(thread_max);
-          const float inv_scale = is_nope_thr ? (1.0f / qs_scale.dq_scale) : 0.0f;
+          const float inv_scale = is_nope_thr ? qs_scale.inv_scale() : 0.0f;
 
           query_t* q_out_head = q_out + token_qout_base + q_head_idx * params.q_out_stride_1;
           if (is_nope_thr) {
@@ -5533,7 +5533,7 @@ namespace aiter {
                 *reinterpret_cast<uint16_t*>(swa_tmp + group_id * 2) = scale_pair;
               }
             }
-            factor = rms_scale / s.dq_scale;
+            factor = rms_scale * s.inv_scale();
           } else {
             const float group_scale = amax_norm / opus::finfo<cache_t>::max();
             factor = rms_scale / group_scale;
@@ -5703,7 +5703,7 @@ namespace aiter {
         const E8m0BlockScale qs_scale =
             fp_f32_to_e8m0_block_scale<MxScaleRoundMode::RoundUp, kQMxDt>(
                 fmaxf(amax_norm, kFp8KvQuantAbsmaxFloorF32));
-        const float factor = q_rms_scale / qs_scale.dq_scale;  // x_in -> fp8 (rstd folded)
+        const float factor = q_rms_scale * qs_scale.inv_scale();  // x_in -> fp8 (rstd folded)
 
         query_t* q_out_head = q_out + token_qout_base + q_head_idx * params.q_out_stride_1;
         if (is_nope_thr) {
