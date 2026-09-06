@@ -1,4 +1,20 @@
 """
+=============================================================================
+LEGACY / DEPRECATED — DO NOT MODIFY
+=============================================================================
+Schedule table of the ORIGINAL gfx1250 FMHA forward pipeline (the "d192
+sibling"); consumed only by ``fmha_core_loop.py``.
+
+Superseded by the clean-DSL ``fmha_fwd_prefill_a16w16_m32x8.py``, which is
+the DEFAULT route for qk_hdim 128 and 192. This pipeline now survives only
+as the qk_hdim==192 A/B fallback under ``AITER_ENABLE_EXPERIMENTAL=1``.
+
+Frozen on purpose: every row was hand-tuned against a reference ISA listing,
+and it is NOT covered by ``op_tests/test_mha_flydsl.py``. Edits here
+silently move the A/B baseline the new kernel is measured against. Put new
+work in ``fmha_fwd_prefill_a16w16_m32x8.py`` instead.
+=============================================================================
+
 Per-WMMA fine-grained schedule table for d128 FMHA on gfx1250.
 
 160-row table (96 GEMM1 + 64 GEMM2 WMMAs) where each row is a flat list of
