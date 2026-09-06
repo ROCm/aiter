@@ -72,9 +72,9 @@ def _na3d_flash_fwd(
     K_ptr,
     V_ptr,
     Out_ptr,
-    stride_b,  # B stride   = SEQ * NH * HD  (elements between batches)
-    stride_nh,  # NH stride  = HD              (elements between heads)
-    stride_seq,  # seq stride = NH * HD         (elements between tokens)
+    stride_b: tl.int64,  # B stride   = SEQ * NH * HD  (elements between batches)
+    stride_nh: tl.int64,  # NH stride  = HD              (elements between heads)
+    stride_seq: tl.int64,  # seq stride = NH * HD         (elements between tokens)
     NH,  # number of attention heads (runtime)
     T,
     H,

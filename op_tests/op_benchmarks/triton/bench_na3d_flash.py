@@ -79,8 +79,13 @@ def bench_na3d_flash(B, T, H, W, NH, HD, KT, KH, KW, dtype):
 
 
 def main():
-    if get_gfx() not in SUPPORTED_GFX:
-        aiter.logger.warning("na3d_flash unsupported on %s; skipping", get_gfx())
+    try:
+        gfx = get_gfx()
+    except RuntimeError as e:
+        aiter.logger.warning("na3d_flash: could not detect GPU arch, skipping (%s)", e)
+        return
+    if gfx not in SUPPORTED_GFX:
+        aiter.logger.warning("na3d_flash unsupported on %s; skipping", gfx)
         return
 
     parser = argparse.ArgumentParser(
