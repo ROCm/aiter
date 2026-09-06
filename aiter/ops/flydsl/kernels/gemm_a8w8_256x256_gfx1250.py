@@ -52,6 +52,7 @@ def launch_gemm_a8w8_256x256(
     is_mxscale: Constexpr[bool],
     block_size: Constexpr[int],
     split_k: Constexpr[int] = 1,
+    a_preshuffle: Constexpr[int] = 0,
 ):
     """N must be a multiple of ``tile_n * cluster_n``; M is unrestricted;
     K must be divisible by 128 and at least 512 per split."""
@@ -91,11 +92,16 @@ def launch_gemm_a8w8_256x256(
     KPAIR = 1 if num_buffers == 4 and tile_n == 256 else 2
     UNROLL = KPAIR * num_buffers
     SUPER_K = tile_k * KPAIR
-    LDS_PAD_A = 16
-    A_LDS_ROW = SUPER_K + LDS_PAD_A
+    # A preshuffled the same way B is: LDS rows become 16-row groups whose K
+    # bytes are contiguous, so a fragment read is lane-contiguous like B's and
+    # needs no conflict pad.  Row-major A instead has consecutive lanes striding
+    # a whole LDS row apart, which is why it carries LDS_PAD_A.
+    a_pre = bool(a_preshuffle)
+    LDS_PAD_A = 0 if a_pre else 16
+    A_LDS_ROW = (PACK_TK * 16 * KPAIR) if a_pre else (SUPER_K + LDS_PAD_A)
     C_LDS_ROW = tile_n + 8
     B_LDS_ROW = PACK_TK * 16 * KPAIR
-    STAGE_A = tile_m * A_LDS_ROW
+    STAGE_A = ((tile_m // 16) if a_pre else tile_m) * A_LDS_ROW
     STAGE_B = (tile_n // 16) * B_LDS_ROW
     SC_K = K_WS * KPAIR
     # block128 stages SC_K K-blocks per slot; the TDM lands their rows contiguously.
@@ -122,6 +128,7 @@ def launch_gemm_a8w8_256x256(
         f"gemm_a8w8_mx{block_size}_compute_t{tile_m}x{tile_n}x{tile_k}"
         f"_mw{m_warp}_nw{n_warp}_nb{num_buffers}_sk{split_k}"
         f"_cm{cluster_m}_cn{cluster_n}"
+        + ("_apre1" if a_pre else "")
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
@@ -190,7 +197,10 @@ def launch_gemm_a8w8_256x256(
         gB_base = fx.recast_iter(fx.Int8, arg_b)
 
         k_elem0 = kt_base * tile_k
-        a_off0 = blk_m64 * lda64 + k_elem0
+        if const_expr(a_pre):
+            a_off0 = (blk_m64 // 16) * Kp16 + k_elem0 * 16
+        else:
+            a_off0 = blk_m64 * lda64 + k_elem0
         b_off0 = (blk_n64 // 16) * Kp16 + k_elem0 * 16
         if const_expr(mx32):
             sa_off0 = (blk_m64 // 32) * k64 + k_elem0
@@ -200,7 +210,15 @@ def launch_gemm_a8w8_256x256(
             sa_off0 = blk_m64 + scale_k0 * fx.Int64(i32_stride_ascale_k)
             sb_off0 = (blk_n64 // 128) * (k64 // 128) + scale_k0
 
-        gA = _gv(gA_base, a_off0, (tile_m, tile_k), (tile_k, 1))
+        if const_expr(a_pre):
+            gA = _gv(
+                gA_base,
+                a_off0,
+                (tile_m // 16, PACK_TK * 16),
+                (PACK_TK * 16, 1),
+            )
+        else:
+            gA = _gv(gA_base, a_off0, (tile_m, tile_k), (tile_k, 1))
         gB = _gv(
             gB_base,
             b_off0,
@@ -233,13 +251,13 @@ def launch_gemm_a8w8_256x256(
                 tensor, offset, shape, lds_stride = (
                     gA,
                     PLANAR_A_BASE,
-                    (tile_m, SUPER_K),
+                    (tile_m // 16, A_LDS_ROW) if a_pre else (tile_m, SUPER_K),
                     A_LDS_ROW,
                 )
                 stride, mask, bound, pad, early = (
-                    i32_lda,
+                    (i32_k * 16) if a_pre else i32_lda,
                     a_mask,
-                    mn_oob,
+                    ((mn_oob + 15) // 16) if a_pre else mn_oob,
                     LDS_PAD_A,
                     True,
                 )
@@ -385,11 +403,6 @@ def launch_gemm_a8w8_256x256(
         for cf in c_frags:
             cf.store(fx.constant_vector(0.0, T.vec(8, T.f32)))
 
-        def _rmem(n, v):
-            t = fx.make_rmem_tensor(n, fx.Int32)
-            t.store(v)
-            return t
-
         def _mma_one(wm, wn, act, wt, sa_k, sb_k):
             idx = wm * wmma_n_rep + wn
             fx.gemm(
@@ -438,7 +451,12 @@ def launch_gemm_a8w8_256x256(
             [],
         )
         sa_row, sb_col = wmb + lane, wnb + lane
-        a_byte = fx.index_cast(T.index, (wmb + lane16) * A_LDS_ROW + kgrp * 16)
+        if const_expr(a_pre):
+            a_byte = fx.index_cast(
+                T.index, (wmb // 16) * A_LDS_ROW + kgrp * 256 + lane16 * 16
+            )
+        else:
+            a_byte = fx.index_cast(T.index, (wmb + lane16) * A_LDS_ROW + kgrp * 16)
         b_byte = fx.index_cast(
             T.index,
             (wnb // 16) * B_LDS_ROW + kgrp * 256 + lane16 * 16,
@@ -462,7 +480,9 @@ def launch_gemm_a8w8_256x256(
         for addr_stage in range_constexpr(UNROLL):
             slot, par = addr_stage // KPAIR, addr_stage % KPAIR
             stage_a_addr.append(
-                _planar_base(PLANAR_A_BASE, STAGE_A, slot) + a_byte + par * tile_k
+                _planar_base(PLANAR_A_BASE, STAGE_A, slot)
+                + a_byte
+                + par * (PACK_TK * 16 if a_pre else tile_k)
             )
             stage_b_addr.append(
                 _planar_base(PLANAR_B_BASE, STAGE_B, slot) + b_byte + par * PACK_TK * 16
@@ -484,6 +504,8 @@ def launch_gemm_a8w8_256x256(
 
         def _frag_geom(kind, stage):
             if const_expr(kind == "a"):
+                if const_expr(a_pre):
+                    return stage_a_addr[stage], A_LDS_ROW, 512
                 return stage_a_addr[stage], 16 * A_LDS_ROW, 32
             return stage_b_addr[stage], B_LDS_ROW, 512
 
@@ -535,15 +557,52 @@ def launch_gemm_a8w8_256x256(
 
         N_SA = half_m // 2 * 2 if const_expr(mx32) else wmma_m_rep
         N_SB = half_n // 2 * 2 if const_expr(mx32) else 1
-        N_SA_LO = N_SA // 2 if const_expr(not mx32) else N_SA
+        # Seed as many scale words a K-tile ahead as the producer slots allow.
+        # An in-stage scale word costs far more than the one i32 it saves: its
+        # ds_load and the v_perm_b32 that unpacks it land in adjacent slots, and
+        # DS returns in order, so that wait drains nearly every fragment load
+        # still in flight.  The budget is what Q3+Q4 can still absorb once the
+        # fragment seeds have taken their slots; only the narrowest tile is
+        # tight enough to keep loading the upper half in stage.
+        N_SA_MIN = N_SA if const_expr(mx32) else N_SA // 2
+        _q34 = 2 * (half_m * half_n) - (half_m * half_n) // 4 - half_m - half_n
+        N_SA_LO = min(N_SA, max(N_SA_MIN, _q34 - N_SB))
 
-        seed_a = [fx.make_rmem_tensor(16, fx.Int32) for _ in range_constexpr(half_m)]
-        seed_b = [fx.make_rmem_tensor(16, fx.Int32) for _ in range_constexpr(half_n)]
+        # Two fragment banks per operand, holding exactly the four groups that
+        # were live before (a0/b0/a1/b1) -- no extra VGPRs.  The quadrant order
+        # retires one of the in-stage groups a whole quadrant before the tile
+        # ends, so the next tile's seed can land there instead of overwriting
+        # the group the last quadrant is still reading.  `bank` picks which of
+        # the pair currently plays a0/b0; it flips every K-tile.
+        #
+        #   parity 0  Q1(A0,B0) Q2(A0,B1) Q3(A1,B1) Q4(A1,B0)  -> B1 dies at Q3
+        #   parity 1  Q1(A0,B0) Q2(A1,B0) Q3(A1,B1) Q4(A0,B1)  -> A1 dies at Q3
+        #
+        # so the trailing seed group moves from the last few WMMA slots up to
+        # the head of Q4, and its DS latency is covered by 16 WMMAs instead of
+        # spilling into the next tile's first quadrant.
+        buf_a = [
+            [fx.make_rmem_tensor(16, fx.Int32) for _ in range_constexpr(half_m)]
+            for _ in range_constexpr(2)
+        ]
+        buf_b = [
+            [fx.make_rmem_tensor(16, fx.Int32) for _ in range_constexpr(half_n)]
+            for _ in range_constexpr(2)
+        ]
+        seed_a, seed_b = buf_a[0], buf_b[0]
         seed_sa = [fx.make_rmem_tensor(1, fx.Int32) for _ in range_constexpr(N_SA_LO)]
         seed_sb = [fx.make_rmem_tensor(1, fx.Int32) for _ in range_constexpr(N_SB)]
 
-        def _seed_thunks(stage, parity=0):
+        def _roles(parity, bank):
+            """(a0, b0, a1, b1) fragment banks for a tile at this rotation."""
+            if const_expr(parity == 0):
+                return buf_a[0], buf_b[bank], buf_a[1], buf_b[1 - bank]
+            return buf_a[bank], buf_b[0], buf_a[1 - bank], buf_b[1]
+
+        def _seed_thunks(stage, parity=0, dst_a=None, dst_b=None):
             """One producer per WMMA slot, same cadence as the in-stage _mk producers."""
+            dst_a = const_expr(seed_a if dst_a is None else dst_a)
+            dst_b = const_expr(seed_b if dst_b is None else dst_b)
             head = []
             for sm in range_constexpr(N_SA_LO):
 
@@ -571,13 +630,13 @@ def launch_gemm_a8w8_256x256(
             for wm in range_constexpr(half_m):
 
                 def _go_a(wm=wm):
-                    seed_a[wm].store(_stage_load_frag("a", stage, wm))
+                    dst_a[wm].store(_stage_load_frag("a", stage, wm))
 
                 a_thunks.append(_go_a)
             for wn in range_constexpr(half_n):
 
                 def _go_b(wn=wn):
-                    seed_b[wn].store(_stage_load_frag("b", stage, wn))
+                    dst_b[wn].store(_stage_load_frag("b", stage, wn))
 
                 b_thunks.append(_go_b)
             if const_expr(parity == 0):
@@ -600,10 +659,14 @@ def launch_gemm_a8w8_256x256(
             """One K-tile, four 64x64 quadrants, at most three fragment groups live."""
             sa_k = [_sa_of(seed_sa[sm].load()[0]) for sm in range_constexpr(N_SA_LO)]
             sb_k = [_sb_of(seed_sb[sn].load()[0]) for sn in range_constexpr(N_SB)]
-            a0, b0 = seed_a, seed_b
+            a0, b0, dst_a1, dst_b1 = _roles(parity, bank)
+            # The tile after this one seeds into the bank that Q3 retires, so
+            # the seed writes never race the quadrants still reading a0/b0.
+            nxt_a0, nxt_b0, _, _ = _roles(parity, next_bank)
             sa_k = sa_k + [None] * (N_SA - N_SA_LO)
 
             def _mk_sa_hi():
+                """Scale words the seed budget could not carry, loaded in stage."""
                 out = []
                 for sm in range_constexpr(N_SA_LO, N_SA):
 
@@ -657,12 +720,12 @@ def launch_gemm_a8w8_256x256(
 
             nxt = {}
 
-            def _mk(kind, half, key):
+            def _mk(kind, half, key, dst):
                 """One thunk per WMMA slot. Only the 256-row tile has enough slots for
                 block128 to split per ds_load rather than per fragment."""
                 n = half_m if kind == "a" else half_n
                 addr, row, span = _frag_geom(kind, stage)
-                nxt[key] = [None] * n
+                nxt[key] = dst
                 parts = {}
 
                 def _load(i, j):
@@ -675,7 +738,7 @@ def launch_gemm_a8w8_256x256(
                         )
                     )
                     if const_expr(j == DS_PER_FRAG - 1):
-                        nxt[key][i] = _rmem(16, _join(parts[i]))
+                        dst[i].store(_join(parts[i]))
 
                 per = const_expr(DS_PER_FRAG if mx32 or tile_m != 256 else 1)
                 return [
@@ -712,7 +775,9 @@ def launch_gemm_a8w8_256x256(
             n_slots = half_m * half_n
             SLACK = n_slots // 4
             early, tail = (
-                _seed_thunks(next_stage, parity) if const_expr(has_next) else ([], [])
+                _seed_thunks(next_stage, parity, dst_a=nxt_a0, dst_b=nxt_b0)
+                if const_expr(has_next)
+                else ([], [])
             )
             n_q2 = n_slots - SLACK
             assert len(early) - n_q2 <= n_slots - len(
@@ -721,7 +786,14 @@ def launch_gemm_a8w8_256x256(
             q2 = {SLACK - 1: _wait_refill}
             q2.update({SLACK + i: t for i, t in enumerate(early[:n_q2])})
             q3 = {i: t for i, t in enumerate(early[n_q2:])}
-            tail_at = [n_slots - len(tail) + i for i in range_constexpr(len(tail))]
+            # The tail seeds now write the bank Q3 retired, so they no longer
+            # have to sit behind the last quadrant's reads; pack them against
+            # the Q3 spill-over instead of against the end of the tile.
+            tail_base = len(early) - n_q2 if const_expr(len(early) > n_q2) else 0
+            tail_at = [tail_base + i for i in range_constexpr(len(tail))]
+            assert (
+                tail_base + len(tail) <= n_slots
+            ), "tail seeds overflow the last quadrant"
             assert not (
                 set(tail_at) & set(q3)
             ), "tail seeds collide with the Q3 early seeds"
@@ -749,7 +821,7 @@ def launch_gemm_a8w8_256x256(
                     0,
                     a0,
                     b0,
-                    _seq(_mk("b", 1, "b1"), _mk_sa_hi()),
+                    _seq(_mk("b", 1, "b1", dst_b1), _mk_sa_hi()),
                     False,
                 )
                 _quad(
@@ -757,7 +829,7 @@ def launch_gemm_a8w8_256x256(
                     half_n,
                     a0,
                     nxt["b1"],
-                    _seq(_mk("a", 1, "a1")),
+                    _seq(_mk("a", 1, "a1", dst_a1)),
                     q1_fast,
                     pre=sched_fence,
                 )
@@ -786,7 +858,7 @@ def launch_gemm_a8w8_256x256(
                     0,
                     a0,
                     b0,
-                    _seq(_mk("a", 1, "a1"), _mk_sa_hi()),
+                    _seq(_mk("a", 1, "a1", dst_a1), _mk_sa_hi()),
                     True,
                 )
                 _quad(
@@ -794,7 +866,7 @@ def launch_gemm_a8w8_256x256(
                     0,
                     nxt["a1"],
                     b0,
-                    _seq(_mk("b", 1, "b1")),
+                    _seq(_mk("b", 1, "b1", dst_b1)),
                     q1_fast,
                     pre=sched_fence,
                 )

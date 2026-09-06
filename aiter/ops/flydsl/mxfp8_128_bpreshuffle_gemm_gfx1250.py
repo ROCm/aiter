@@ -89,6 +89,7 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
     cluster_m: int = 1,
     cluster_n: int = 1,
     split_k: int = 1,
+    a_preshuffle: int = 0,
     x_scale_transposed: bool = True,
 ) -> Tensor:
     """Run the gfx1250 WMMA mxfp8_128 bpreshuffle GEMM.
@@ -120,6 +121,11 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
     cluster_m = max(1, int(cluster_m))
     cluster_n = max(1, int(cluster_n))
 
+    if a_preshuffle and M % 16 != 0:
+        raise RuntimeError(
+            "[FlyDSL gfx1250 mxfp8_128] a_preshuffle needs M divisible by 16 "
+            f"(A is staged as 16-row groups), got M={M}"
+        )
     if N % _BLOCK_N != 0 or K % BLOCK_K != 0:
         raise RuntimeError(
             f"[FlyDSL gfx1250 mxfp8_128] N/K must be multiples of "
@@ -252,7 +258,7 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
         True,
     )
     launch = _launch_gemm_a8w8_compute_bound if compute_bound else _launch_gemm_a8w8
-    launch(*launch_args, BLOCK_K, split_k)
+    launch(*launch_args, BLOCK_K, split_k, a_preshuffle)
     if partials is not None:
         dense = ldc == N
         _run_compiled(
@@ -272,7 +278,8 @@ NAME_SUFFIX_RE = (
     r"t(?P<tile_m>\d+)x(?P<tile_n>\d+)x(?P<tile_k>\d+)_"
     r"mw(?P<m_warp>\d+)_nw(?P<n_warp>\d+)_"
     r"nb(?P<num_buffers>\d+)_sk(?P<split_k>\d+)_"
-    r"cm(?P<cluster_m>\d+)_cn(?P<cluster_n>\d+)$"
+    r"cm(?P<cluster_m>\d+)_cn(?P<cluster_n>\d+)"
+    r"(?:_apre(?P<a_preshuffle>\d+))?$"
 )
 _KERNEL_NAME_RE = re.compile(rf"^{re.escape(WMMA_NAME_PREFIX)}_{NAME_SUFFIX_RE}")
 _COMPUTE_KERNEL_NAME_RE = re.compile(
@@ -283,9 +290,11 @@ _COMPUTE_KERNEL_NAME_RE = re.compile(
 def parse_wmma_kernel_name(name: str):
     """Parse a generic or compute-bound mxfp8_128 kernelName."""
     match = _COMPUTE_KERNEL_NAME_RE.fullmatch(name) or _KERNEL_NAME_RE.fullmatch(name)
-    return (
-        {key: int(value) for key, value in match.groupdict().items()} if match else None
-    )
+    if match is None:
+        return None
+    cfg = {k: int(v) for k, v in match.groupdict().items() if v is not None}
+    cfg.setdefault("a_preshuffle", 0)
+    return cfg
 
 
 def compute_kernel_k_pair(num_buffers: int, tile_n: int) -> int:
@@ -334,6 +343,7 @@ def run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
         split_k=cfg["split_k"],
         cluster_m=cfg["cluster_m"],
         cluster_n=cfg["cluster_n"],
+        a_preshuffle=cfg["a_preshuffle"],
         m_warp=cfg["m_warp"],
         n_warp=cfg["n_warp"],
         x_scale_transposed=True,
