@@ -5158,9 +5158,11 @@ namespace aiter {
               *reinterpret_cast<uint16_t*>(qs + group_id * 2) = scale_pair;
             }
             const uint32_t nope_out_offset = tid * vec_size_i;  // nope-first
-            opus_vec_q vec_out;
+            // One vector cast, not vec_size_i scalar ones -- see the coarse Q store.
+            opus::vector_t<float, vec_size_i> vec_f32;
             #pragma unroll
-            for (int i = 0; i < vec_size_i; i++) vec_out[i] = opus::cast<query_t>(rotated[i] * inv_scale);
+            for (int i = 0; i < vec_size_i; i++) vec_f32[i] = rotated[i] * inv_scale;
+            opus_vec_q vec_out = opus::cast<query_t>(vec_f32);
             auto q_out_buf = opus::make_gmem<query_t>(q_out_head, q_oob_o * sizeof(query_t));
             q_out_buf.template store<vec_size_o>(vec_out, nope_out_offset);
           }
@@ -5722,12 +5724,19 @@ namespace aiter {
                 static_cast<uint16_t>(qs_scale.byte) | (static_cast<uint16_t>(qs_scale.byte) << 8);
             *reinterpret_cast<uint16_t*>(qs + group_id * 2) = scale_pair;
           }
-          opus_vec_q vec_out;
+          // Scale into an f32 vector first, then cast the whole vector in one call.
+          // opus::cast dispatches fp32 -> fp8 at size%4==0 to v_cvt_pk_fp8_f32 with
+          // BOTH operands live: 2 instructions per 4 elements. Casting element by
+          // element instead emits one packed convert per element with its high half
+          // thrown away, plus a v_lshlrev_b16 / v_bitop3_b16 pair to reassemble each
+          // byte -- ~24 extra instructions per row at vec_size_i=16.
+          opus::vector_t<float, vec_size_i> vec_f32;
           #pragma unroll
           for (int i = 0; i < vec_size_i; i++) {
             float w = HAS_Q_WEIGHT ? static_cast<float>(vec_q_weight[i]) : 1.0f;
-            vec_out[i] = opus::cast<query_t>(static_cast<float>(vec_q[i]) * w * factor);
+            vec_f32[i] = static_cast<float>(vec_q[i]) * w * factor;
           }
+          opus_vec_q vec_out = opus::cast<query_t>(vec_f32);
           auto q_out_buf = opus::make_gmem<query_t>(q_out_head, q_oob_o * sizeof(query_t));
           q_out_buf.template store<vec_size_o>(vec_out, tid * vec_size_i);
         }
