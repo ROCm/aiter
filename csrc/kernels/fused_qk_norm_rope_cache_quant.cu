@@ -5139,24 +5139,20 @@ namespace aiter {
             // the lanes of a group agree on both address and value, and the
             // `% Q_REDUCE == 0` test only suppressed duplicate writes.
             //
-            // It did not pay for itself. ATT at T=16384 (319 waves) puts this
-            // store's exec region at 1030 cyc/wave -- 7.7% of the kernel -- because
-            // restoring EXEC (`s_or_b32 exec_lo`) while the store is in flight is a
-            // WAR hazard that costs a full `s_wait_xcnt 0x0` address-queue drain,
-            // once per head of the HPW loop (hit=2032 over 319 waves = 6.4/wave).
-            // Same fix, same argument as inverse_rope_group_quant's store_scale.
+            // The dedup did not pay for itself: restoring EXEC (`s_or_b32 exec_lo`)
+            // while the store is in flight is a WAR hazard costing a full
+            // `s_wait_xcnt 0x0` address-queue drain. Same fix, same argument as
+            // inverse_rope_group_quant's store_scale (commit 4571cfd4).
             //
-            // UNVALIDATED: never run. Default keeps the original dedup; build with
-            // -DAITER_COARSE_SCALE_ALL_LANES=1 to try it. On the FG kernel the same
-            // edit cut s_and_saveexec 5->2 but left the s_wait_xcnt count at 18 --
-            // the drain moved to a different guarded register rather than going
-            // away -- so the gain here may not materialise either.
-#ifndef AITER_COARSE_SCALE_ALL_LANES
-#define AITER_COARSE_SCALE_ALL_LANES 0
-#endif
-            if (AITER_COARSE_SCALE_ALL_LANES ? true : (tid % Q_REDUCE == 0)) {
-              // group_id = (tid * vec_size_i) / Q_GROUP_SIZE = tid / Q_REDUCE; generic over
-              // Q_GROUP_SIZE (the compiler folds to a shift since Q_REDUCE is a power of 2).
+            // MEASURED gfx1250 T=16384 H=128 G=64: 309.67 -> 307.83 us, -0.59%
+            // (95% CI [-1.18, -0.00], 6/6 reps same sign, outputs bit-identical).
+            // Real but an order of magnitude below the 7.7% the ATT exec-region
+            // share suggested: the coarse kernel only loses s_and_saveexec 22->20
+            // and s_wait_xcnt 48->46, i.e. LLVM never replicated this region per
+            // head of the HPW loop, so the drain is paid ~2x per wave, not 16x.
+            // group_id = (tid * vec_size_i) / Q_GROUP_SIZE = tid / Q_REDUCE; generic over
+            // Q_GROUP_SIZE (the compiler folds to a shift since Q_REDUCE is a power of 2).
+            {
               const int group_id = tid / Q_REDUCE;  // 0..Q_NUM_GROUPS-1
               auto* qs = reinterpret_cast<uint8_t*>(q_out_head) + nope_dim;
               const uint16_t scale_pair =
