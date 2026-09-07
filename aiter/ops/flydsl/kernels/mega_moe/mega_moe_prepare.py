@@ -12,8 +12,7 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 
 from .. import communication_ops_utils as comm_ops
-from ..tensor_shim import ptr_buf_tensor
-from ..tensor_shim import _preload_compiled, _run_compiled
+from ..tensor_shim import _preload_compiled, _run_compiled, ptr_buf_tensor
 from .dispatch import DispatchSlot, emit_dispatch_group, emit_dispatch_plan
 from .gemm_util import _buffer_load, _buffer_store, _make_buffer_from_addr
 from .quant import emit_per_1x32_mx_fp8_group
