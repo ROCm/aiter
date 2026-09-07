@@ -21,7 +21,11 @@ from aiter.jit.core import (
     bd_dir,
     mp_lock,
 )
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime, gfx_from_cu_num
+from aiter.jit.utils.chip_info import (
+    backfill_dataframe_gfx,
+    get_cu_num,
+    get_gfx_runtime,
+)
 from aiter.utility import fp4_utils
 from aiter.utility.fp4_utils import moe_mxfp4_sort
 
@@ -382,18 +386,7 @@ def get_2stage_cfgs(
     def get_cfg_2stages(tune_file):
         import pandas as pd
 
-        cfg_2stages = pd.read_csv(tune_file)
-        # Migrate legacy cu_num-only CSVs to the (gfx, cu_num, ...) schema.
-        if "gfx" not in cfg_2stages.columns:
-            cfg_2stages["gfx"] = cfg_2stages["cu_num"].map(gfx_from_cu_num)
-        else:
-            bad = cfg_2stages["gfx"].isna() | cfg_2stages["gfx"].astype(str).isin(
-                ["0", "", "nan", "None"]
-            )
-            if bad.any():
-                cfg_2stages.loc[bad, "gfx"] = cfg_2stages.loc[bad, "cu_num"].map(
-                    gfx_from_cu_num
-                )
+        cfg_2stages = backfill_dataframe_gfx(pd.read_csv(tune_file), tune_file)
         cfg_2stages = cfg_2stages.set_index(
             [
                 "gfx",

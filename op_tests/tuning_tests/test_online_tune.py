@@ -19,6 +19,7 @@ import tempfile
 import unittest
 
 SAMPLE_KEYS = (
+    "gfx950",
     256,
     16,
     7168,
@@ -344,7 +345,10 @@ class TestGetCfg2stages(unittest.TestCase):
     def test_loads_and_indexes_correctly(self):
         import pandas as pd
 
+        from aiter.jit.utils.chip_info import backfill_dataframe_gfx
+
         _INDEX_COLS = [
+            "gfx",
             "cu_num",
             "token",
             "model_dim",
@@ -362,19 +366,19 @@ class TestGetCfg2stages(unittest.TestCase):
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
             f.write(
-                "cu_num,token,model_dim,inter_dim,expert,topk,act_type,dtype,"
+                "gfx,cu_num,token,model_dim,inter_dim,expert,topk,act_type,dtype,"
                 "q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1,"
                 "block_m,ksplit,kernelName1,kernelName2,us\n"
             )
             f.write(
-                "256,16,7168,256,256,8,ActivationType.Silu,torch.bfloat16,"
+                "gfx950,256,16,7168,256,256,8,ActivationType.Silu,torch.bfloat16,"
                 "torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Token,"
                 "1,0,64,0,ck2stages_k1,ck2stages_k2,42.0\n"
             )
             path = f.name
 
         try:
-            df = pd.read_csv(path)
+            df = backfill_dataframe_gfx(pd.read_csv(path), path)
             cfg_2stages = df.set_index(_INDEX_COLS).to_dict("index")
             cfg = cfg_2stages.get(SAMPLE_KEYS)
             self.assertIsNotNone(cfg)
@@ -387,7 +391,10 @@ class TestGetCfg2stages(unittest.TestCase):
         """Rows with non-empty _tag should be filtered out (fused_moe.py behavior)."""
         import pandas as pd
 
+        from aiter.jit.utils.chip_info import backfill_dataframe_gfx
+
         _INDEX_COLS = [
+            "gfx",
             "cu_num",
             "token",
             "model_dim",
@@ -405,24 +412,24 @@ class TestGetCfg2stages(unittest.TestCase):
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
             f.write(
-                "cu_num,token,model_dim,inter_dim,expert,topk,act_type,dtype,"
+                "gfx,cu_num,token,model_dim,inter_dim,expert,topk,act_type,dtype,"
                 "q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1,"
                 "block_m,ksplit,kernelName1,kernelName2,us,_tag\n"
             )
             f.write(
-                "256,16,7168,256,256,8,ActivationType.Silu,torch.bfloat16,"
+                "gfx950,256,16,7168,256,256,8,ActivationType.Silu,torch.bfloat16,"
                 "torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Token,"
                 "1,0,64,0,ck_k1,ck_k2,42.0,\n"
             )
             f.write(
-                "256,16,7168,256,256,8,ActivationType.Silu,torch.bfloat16,"
+                "gfx950,256,16,7168,256,256,8,ActivationType.Silu,torch.bfloat16,"
                 "torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Token,"
                 "1,0,32,0,legacy_k1,legacy_k2,50.0,legacy_tag\n"
             )
             path = f.name
 
         try:
-            df = pd.read_csv(path)
+            df = backfill_dataframe_gfx(pd.read_csv(path), path)
             if "_tag" in df.columns:
                 df = df[df["_tag"].fillna("") == ""]
             cfg_2stages = df.set_index(_INDEX_COLS).to_dict("index")

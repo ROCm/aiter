@@ -119,6 +119,44 @@ _LEGACY_CU_NUM_TO_GFX = {
     304: "gfx942",
 }
 
+_LEGACY_GFX_WARNED_SOURCES: set[str] = set()
+
+
+def reset_legacy_gfx_warnings_for_tests() -> None:
+    """Clear one-shot legacy gfx warnings (test helper only)."""
+    _LEGACY_GFX_WARNED_SOURCES.clear()
+
+
+def warn_legacy_gfx_inference(source: str) -> None:
+    """Emit one warning per legacy tuned file lacking explicit ``gfx``."""
+    if not source or source in _LEGACY_GFX_WARNED_SOURCES:
+        return
+    _LEGACY_GFX_WARNED_SOURCES.add(source)
+    logger.warning(
+        "[fused_moe] %s lacks explicit gfx; inferring architecture from cu_num "
+        "(256->gfx950, 80/304->gfx942). Re-tune or migrate the artifact to "
+        "remove this ambiguity.",
+        source,
+    )
+
+
+def backfill_dataframe_gfx(df, source: str | None = None):
+    """Return ``df`` with a usable ``gfx`` column; warn once per source on inference."""
+    warned = False
+    if "gfx" not in df.columns:
+        df = df.copy()
+        df["gfx"] = df["cu_num"].map(gfx_from_cu_num)
+        warned = True
+    else:
+        bad = df["gfx"].isna() | df["gfx"].astype(str).isin(["0", "", "nan", "None"])
+        if bad.any():
+            df = df.copy()
+            df.loc[bad, "gfx"] = df.loc[bad, "cu_num"].map(gfx_from_cu_num)
+            warned = True
+    if warned and source:
+        warn_legacy_gfx_inference(source)
+    return df
+
 
 def gfx_from_cu_num(cu_num) -> str:
     """Infer the gfx arch for a legacy config row that has no `gfx` column.

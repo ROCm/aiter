@@ -18,8 +18,14 @@ import os
 import sys
 import time
 
-from aiter.aot.flydsl.common import collect_aot_jobs, compile_only_env, override_env
+from aiter.aot.flydsl.common import (
+    collect_aot_jobs,
+    compile_only_env,
+    job_arch,
+    override_env,
+)
 from aiter.jit.core import AITER_CONFIGS, AITER_ROOT_DIR
+from aiter.jit.utils.chip_info import warn_legacy_gfx_inference
 
 _MODEL_CONFIG_DIR = f"{AITER_ROOT_DIR}/aiter/configs/model_configs"
 # moe.py defers every ``flydsl_moe2_layout_`` name to this module, so a CSV the
@@ -108,7 +114,12 @@ def parse_csv(csv_path: str):
         jobs.append(job)
 
     with open(csv_path, newline="") as f:
-        for row in csv.DictReader(f):
+        reader = csv.DictReader(f)
+        has_gfx = "gfx" in (reader.fieldnames or [])
+        if not has_gfx:
+            warn_legacy_gfx_inference(csv_path)
+        for row in reader:
+            gfx = row.get("gfx", "").strip()
             topk = int(row["topk"])
             # Shape comes from CSV columns; layout-v2 uses the exact K.
             model_dim = int(row["model_dim"])
@@ -137,6 +148,8 @@ def parse_csv(csv_path: str):
                         "D_INTER": v2_d_inter,
                         "NE": expert,
                         "topk": topk,
+                        "gfx": gfx,
+                        "cu_num": int(row.get("cu_num", "0") or "0"),
                         "xcd_swizzle": p1["xcd_swizzle"],
                     }
                 )
@@ -171,6 +184,7 @@ def parse_csv(csv_path: str):
                             "SBM": v2_g2["sort_block_m"] or bm,
                             "persist": v2_g2["persist"],
                             "cu_num": int(row.get("cu_num", "0") or "0"),
+                            "gfx": gfx,
                             "a_dtype": v2_g2["a_dtype"],
                             "b_dtype": v2_g2["b_dtype"],
                             "out_dtype": out_dtype,
@@ -208,6 +222,8 @@ def parse_csv(csv_path: str):
                             "D_INTER": d_inter,
                             "D_INTER_REAL": d_inter_real,
                             "topk": topk,  # unused by the kernel; for the entry signature
+                            "gfx": gfx,
+                            "cu_num": int(row.get("cu_num", "0") or "0"),
                             "xcd_swizzle": p2["xcd_swizzle"],
                         }
                     )
@@ -369,6 +385,13 @@ def _compile_v2_stage2(job):
 
 def compile_one_config(**job):
     stage = job["stage"]
+    cu_num = int(job.get("cu_num", 0) or 0)
+    gfx = (job.get("gfx") or "").strip()
+    aot_arch = job_arch(cu_num, gfx)
+    if aot_arch != "gfx950":
+        raise ValueError(
+            f"mxfp4 MoE AOT is gfx950-only; row specifies gfx={gfx!r} cu_num={cu_num}"
+        )
     shape_str = (
         f"{job['kernel_name']} NE={job['NE']} D_INTER={job['D_INTER']} BM={job['BM']}"
     )
@@ -380,8 +403,8 @@ def compile_one_config(**job):
     try:
         # mxfp4 a4w4 kernels are gfx950-only. In the GPU-free AOT build,
         # get_rocm_arch() detects gfx942 and the gfx950 intrinsics fail to
-        # select (LLVM aborts), so pin FLYDSL_GPU_ARCH=gfx950.
-        with compile_only_env(), override_env("FLYDSL_GPU_ARCH", "gfx950"):
+        # select (LLVM aborts), so pin FLYDSL_GPU_ARCH from the row's gfx.
+        with compile_only_env(), override_env("FLYDSL_GPU_ARCH", aot_arch):
             if stage == 1:
                 _compile_stage1(job)
             elif job.get("v2_stage2"):

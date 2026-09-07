@@ -59,6 +59,11 @@ def cu_num_to_arch(cu_num: int, default: str = "gfx950") -> str:
     return _CU_NUM_TO_ARCH.get(cu_num, default)
 
 
+def job_arch(cu_num: int = 0, gfx: str = "") -> str:
+    """Target arch a job would compile for -- shared by dispatch and AOT filtering."""
+    return gfx or cu_num_to_arch(cu_num, default="gfx950")
+
+
 def job_identity(job: dict[str, Any]) -> tuple:
     return tuple(sorted(job.items()))
 
