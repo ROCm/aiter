@@ -78,15 +78,40 @@ static std::tuple<std::string, int> get_heuristic_kernel(int M,
                                                          int a_preshuffle,
                                                          CFG* cfgs)
 {
-    // Tile choice is a plain size rule, not a round/efficiency search: a tiny M
-    // wastes most of a 256-tall tile's rows, so M<=64 takes the 64x512 variant;
-    // any larger M takes 256x256 (which also fills a full persistent 256-TG wave).
-    const int want_tile_m = (M <= 64) ? 64 : 256;
-    const int want_tile_n = (M <= 64) ? 512 : 256;
+    // ---- Pass 1: tile band by M (availability-aware) ----
+    // A tiny M wastes a taller tile's rows: M<=16 prefers the 16x512 decode tile
+    // (FP4 + a_preshuffle=0 only), M<=64 the 64x512 variant, larger M 256x256. Only
+    // the tiles actually registered in the csv are eligible, so when a preferred tile
+    // isn't shipped for this combo the next rank resolves it (e.g. a 256x256-only
+    // deployment lands every M on 256x256).
+    const int(*tile_prefs)[2];
+    int n_tile_prefs;
+    static const int tp_m16[][2] = {{16, 512}, {64, 512}, {256, 256}};
+    static const int tp_m64[][2] = {{64, 512}, {256, 256}};
+    static const int tp_big[][2] = {{256, 256}, {64, 512}};
+    if(M <= 16)
+    {
+        tile_prefs   = tp_m16;
+        n_tile_prefs = 3;
+    }
+    else if(M <= 64)
+    {
+        tile_prefs   = tp_m64;
+        n_tile_prefs = 2;
+    }
+    else
+    {
+        tile_prefs   = tp_big;
+        n_tile_prefs = 2;
+    }
 
-    std::string selectedKernelName = "";
-    std::string fallbackKernelName = ""; // any valid variant if the wanted tile is absent
+    const int  m_align  = a_preshuffle ? F8GEMM_M_ALIGN_APRE : 1;
+    const bool align_ok = (M % m_align) == 0 && (N % F8GEMM_N_ALIGN) == 0 &&
+                          (K % F8GEMM_K_ALIGN) == 0;
 
+    int         bestTileRank = n_tile_prefs; // == "no preferred tile registered"
+    int         selTileM = 0, selTileN = 0;
+    std::string fallbackKernelName = ""; // any valid variant if no preferred tile is present
     for(const auto& el : *cfgs)
     {
         if(el.first.find(arch_id) != 0)
@@ -94,23 +119,69 @@ static std::tuple<std::string, int> get_heuristic_kernel(int M,
         const auto& cfg = el.second;
         if(cfg.b_intype != b_intype || cfg.a_preshuffle != a_preshuffle)
             continue;
-
         if(cfg.outtype != outtype)
             continue;
-
-        const int m_align = a_preshuffle ? F8GEMM_M_ALIGN_APRE : 1;
-        if((M % m_align) != 0 || (N % F8GEMM_N_ALIGN) != 0 || (K % F8GEMM_K_ALIGN) != 0)
+        if(!align_ok)
             continue;
 
-        // Remember the first valid variant so an odd (b_intype,outtype) combo that
-        // only ships one tile still resolves.
+        // Remember the first valid variant so an odd combo that ships one tile resolves.
         if(fallbackKernelName.empty())
             fallbackKernelName = el.first;
 
-        if(cfg.tile_m == want_tile_m && cfg.tile_n == want_tile_n)
+        for(int r = 0; r < bestTileRank; ++r)
         {
-            selectedKernelName = el.first;
-            break;
+            if(cfg.tile_m == tile_prefs[r][0] && cfg.tile_n == tile_prefs[r][1])
+            {
+                bestTileRank = r;
+                selTileM     = tile_prefs[r][0];
+                selTileN     = tile_prefs[r][1];
+                break;
+            }
+        }
+    }
+
+    // ---- Pass 2: cluster that best fits the selected tile's grid ----
+    // cluster_x groups TILE_N columns (N), cluster_y groups TILE_M rows (M). The
+    // largest cluster whose macro-tile stays within the problem (cx<=ntiles,
+    // cy<=mtiles) maximizes data reuse; ties break toward the aspect closest to the
+    // tile grid, then larger cx. 1x1 always fits, so a valid pick always exists.
+    std::string selectedKernelName = "";
+    if(bestTileRank < n_tile_prefs)
+    {
+        const int mtiles = (M + selTileM - 1) / selTileM;
+        const int ntiles = (N + selTileN - 1) / selTileN;
+        int       bestScore     = -1;   // cx*cy for a fitting cluster, else 0
+        double    bestAspectErr = 1e30; // |cx*mtiles - cy*ntiles|, smaller = better
+        int       bestCx        = -1;
+        for(const auto& el : *cfgs)
+        {
+            if(el.first.find(arch_id) != 0)
+                continue;
+            const auto& cfg = el.second;
+            if(cfg.b_intype != b_intype || cfg.a_preshuffle != a_preshuffle)
+                continue;
+            if(cfg.outtype != outtype)
+                continue;
+            if(cfg.tile_m != selTileM || cfg.tile_n != selTileN)
+                continue;
+
+            const int    cx        = cfg.cluster_x > 0 ? cfg.cluster_x : 1;
+            const int    cy        = cfg.cluster_y > 0 ? cfg.cluster_y : 1;
+            const bool   fits      = (cx <= ntiles) && (cy <= mtiles);
+            const int    score     = fits ? cx * cy : 0;
+            const double aspectErr = std::fabs((double)cx * mtiles - (double)cy * ntiles);
+
+            bool better = score > bestScore;
+            if(!better && score == bestScore)
+                better = (aspectErr < bestAspectErr) ||
+                         (aspectErr == bestAspectErr && cx > bestCx);
+            if(better)
+            {
+                bestScore          = score;
+                bestAspectErr      = aspectErr;
+                bestCx             = cx;
+                selectedKernelName = el.first;
+            }
         }
     }
 
@@ -246,13 +317,20 @@ static void mxfp8fp4_launch(aiter_tensor_t* A,
         cfg.knl_name, [&]() { return AiterAsmKernel(cfg.knl_name.c_str(), cfg.co_name.c_str()); });
 
     // ----- Launch geometry: cluster + persistent -----
-    // Every f8gemm .co is a persistent shader, so the launch is fixed-size and
-    // independent of M/N/K: exactly WG_MAX threadgroups, laid out 1D along X with
-    // Y carrying only the cluster_y rows. The tile-walk swizzle (GRID_X/GRID_Y) is
-    // baked into the .co at assemble time, which asserts
-    // (GRID_X*CLUSTER_X) * (GRID_Y*CLUSTER_Y) == WG_MAX -- so the host only has to
-    // ship the right *total* threadgroup count, not the same grid shape.
-    const int cluster_x = cfg.cluster_x > 0 ? cfg.cluster_x : 1; // compile-time per .co
+    // Every f8gemm .co is a persistent shader launching exactly WG_MAX threadgroups
+    // regardless of M/N/K. The tile-walk swizzle (GRID_X/GRID_Y) is baked into the .co
+    // and re-derived from a flat workgroup id, so the launch is NOT free to reshape the
+    // grid: it must reproduce the geometry the shader was assembled and validated for.
+    //
+    // That geometry is the reference host's persistent branch,
+    // scripts/mi400/mxfp8fp4gemm/mxfp8fp4gemm.cpp:487-503:
+    //   clusters = WG_MAX / (cluster_x*cluster_y)   (gridX; gridY=1)
+    //   blocks_x = cluster_x * clusters             (== gridX*CLUSTER_X)
+    //   blocks_y = cluster_y * 1                     (== gridY*CLUSTER_Y)
+    //   blockDim = 32 * WAVES(=4) = 128 threads, 1 TG
+    // clusterDim=(cluster_x,cluster_y) then evenly divides (blocks_x,blocks_y) and the
+    // total is blocks_x*blocks_y == WG_MAX. cluster_x/cluster_y are compile-time per .co.
+    const int cluster_x = cfg.cluster_x > 0 ? cfg.cluster_x : 1;
     const int cluster_y = cfg.cluster_y > 0 ? cfg.cluster_y : 1;
 
     constexpr int WG_MAX = 256; // must match the .co's WG_MAX
@@ -265,10 +343,10 @@ static void mxfp8fp4_launch(aiter_tensor_t* A,
                 " not divisible by cluster_x*cluster_y=",
                 cluster_size);
 
-    // HIP gridDim must be a multiple of clusterDim per axis.
-    const int gdx = (WG_MAX / cluster_size) * cluster_x;
-    const int gdy = 1 * cluster_y;
-    const int gdz = 1;
+    const int clusters = WG_MAX / cluster_size; // reference gridX (gridY is 1)
+    const int gdx      = clusters * cluster_x;  // blocks along X
+    const int gdy      = cluster_y;             // blocks along Y (gridY==1)
+    const int gdz      = 1;
 
     const int bdx = 128; // 4 waves * 32 threads on gfx1250
 
