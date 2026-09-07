@@ -1649,16 +1649,29 @@ def _write_ninja_file_to_build_library(
         system_includes += include_paths(with_cuda)
         system_includes = list(set(system_includes))
 
-    # FIXME: build python module excluded with torch, use `pybind11`
-    # But we can't use this now because all aiter op based on torch
-    # which means pybind11 related build flags must from torch now
     common_cflags = []
     if is_python_module:
         import pybind11
 
         extra_include_paths.append(pybind11.get_include())
-        common_cflags += [f"{x}" for x in _get_pybind11_abi_build_flags()]
-        common_cflags += [f"{x}" for x in _get_glibcxx_abi_build_flags()]
+        if not torch_exclude:
+            # This family links libtorch, so it has to answer to torch's own
+            # pybind world and inherits whatever ABI the installed torch was
+            # built with.
+            common_cflags += [f"{x}" for x in _get_pybind11_abi_build_flags()]
+            common_cflags += [f"{x}" for x in _get_glibcxx_abi_build_flags()]
+        else:
+            # Torch-free family. Deliberately does NOT set PYBIND11_COMPILER_TYPE
+            # / STDLIB / BUILD_ABI: leaving them to pybind11's own defaults
+            # (pybind11/conduit/pybind11_platform_abi_id.h) is what decouples
+            # these modules from whichever torch happens to be installed, and it
+            # keeps them in the standard `_system` registry pool. _GLIBCXX_USE_
+            # CXX11_ABI is pinned rather than left to the toolchain default only
+            # because it feeds PYBIND11_BUILD_ABI: a container defaulting to 0
+            # would otherwise land in a different pool with no diagnostic. Safe
+            # to pin here precisely because nothing in this family links libtorch
+            # (the C++ libs it does link -- rocblas, hipblaslt -- are C ABIs).
+            common_cflags.append("-D_GLIBCXX_USE_CXX11_ABI=1")
 
     # sysconfig.get_path('include') gives us the location of Python.h
     # Explicitly specify 'posix_prefix' scheme on non-Windows platforms to workaround error on some MacOS
@@ -1672,11 +1685,15 @@ def _write_ninja_file_to_build_library(
     # file wherever it is.
     user_includes = [os.path.abspath(file) for file in extra_include_paths]
 
-    if not torch_exclude:
-        common_cflags.append(f"-DTORCH_EXTENSION_NAME={name}")
-        # common_cflags.append("-DTORCH_API_INCLUDE_EXTENSION_H")
-        # common_cflags += [f"{x}" for x in _get_pybind11_abi_build_flags()]
-        # common_cflags += [f"{x}" for x in _get_glibcxx_abi_build_flags()]
+    # CPython requires the init symbol to be PyInit_<module name>, and aiter's
+    # module name lives in optCompilerConfig.json rather than in the source, so
+    # the name has to come in on the command line. It used to sit behind
+    # `if not torch_exclude:` under torch's own spelling; the torch-free modules
+    # need it just as much, so it is now unconditional and spelled AITER_.
+    # TORCH_EXTENSION_NAME stays defined as a deprecated alias for out-of-tree
+    # sources that still use it -- no in-tree file does.
+    common_cflags.append(f"-DAITER_EXTENSION_NAME={name}")
+    common_cflags.append(f"-DTORCH_EXTENSION_NAME={name}")
 
     # Windows does not understand `-isystem` and quotes flags later.
     common_cflags += [f"-I{shlex.quote(include)}" for include in user_includes]
