@@ -73,7 +73,7 @@ def launch_gemm_a8w8_256x256(
     assert (
         cluster_m >= 1 and cluster_n >= 1 and 1 < cluster_m * cluster_n <= 16
     ), f"cluster_m*cluster_n must be 2..16, got {cluster_m}x{cluster_n}"
-    assert split_k in (1, 2, 4, 8), f"split_k must be 1/2/4/8, got {split_k}"
+    assert split_k in (1, 2, 4, 6, 8), f"split_k must be 1/2/4/6/8, got {split_k}"
     assert (
         persistent_n_tiles >= 1
     ), f"persistent_n_tiles must be >= 1, got {persistent_n_tiles}"

@@ -83,6 +83,8 @@ from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
     WMMA_NAME_PREFIX as MXFP8_128_WMMA_PREFIX,
 )
 from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
+    check_persistent_n_tiles,
+    cluster_m_fallback_values,
     is_compute_wmma_kernel_name,
 )
 from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
@@ -561,25 +563,27 @@ def _compile_mxfp8_128_wmma_to_cache(
             cluster_n,
             True,
         )
-        launch = (
-            launch_gemm_a8w8_256x256
-            if is_compute_wmma_kernel_name(kernel_name)
-            else launch_gemm_a8w8
+        compute_bound = is_compute_wmma_kernel_name(kernel_name)
+        launch = launch_gemm_a8w8_256x256 if compute_bound else launch_gemm_a8w8
+        check_persistent_n_tiles(
+            persistent_n_tiles, n, tile_n, cluster_n, split_k, compute_bound
         )
-        if persistent_n_tiles == 1:
-            launch(*launch_args, SCALE_BLOCK_SIZE, split_k)
-        elif is_compute_wmma_kernel_name(kernel_name):
-            launch(
-                *launch_args,
-                SCALE_BLOCK_SIZE,
-                split_k,
-                a_preshuffle,
-                persistent_n_tiles,
-            )
-        else:
-            raise ValueError(
-                "persistent_n_tiles>1 is supported only by compute WMMA kernels"
-            )
+        for variant_cm in cluster_m_fallback_values(
+            cluster_m, cluster_n, compute_bound
+        ):
+            variant_args = launch_args[:-3] + (variant_cm, cluster_n, True)
+            if compute_bound:
+                launch(
+                    *variant_args,
+                    SCALE_BLOCK_SIZE,
+                    split_k,
+                    a_preshuffle,
+                    persistent_n_tiles,
+                )
+            else:
+                launch(
+                    *variant_args, SCALE_BLOCK_SIZE, split_k, False, 0, 1, a_preshuffle
+                )
         if split_k > 1:
             compile_gemm_a8w8_splitk_reduce(split_k=split_k, out_dtype_str="bf16")(
                 _ptr_view_safe(out),

@@ -72,6 +72,39 @@ def _require_e8m0_scale(scale: Tensor, shape: tuple[int, int], name: str) -> Ten
     return scale
 
 
+def check_persistent_n_tiles(
+    persistent_n_tiles: int,
+    N: int,
+    tile_n: int,
+    cluster_n: int,
+    split_k: int,
+    compute_bound: bool,
+) -> None:
+    """Validate a persistent (multi-tile-per-CTA) config against the shape."""
+    if persistent_n_tiles < 1:
+        raise RuntimeError(
+            f"[FlyDSL gfx1250 mxfp8_128] persistent_n_tiles must be >= 1, "
+            f"got {persistent_n_tiles}"
+        )
+    if persistent_n_tiles == 1:
+        return
+    if not compute_bound:
+        raise RuntimeError(
+            "[FlyDSL gfx1250 mxfp8_128] persistent_n_tiles>1 is compute-bound only"
+        )
+    if split_k != 1:
+        raise RuntimeError(
+            "[FlyDSL gfx1250 mxfp8_128] persistent_n_tiles>1 requires split_k=1"
+        )
+    n_tiles = N // tile_n
+    if n_tiles % persistent_n_tiles or (n_tiles // persistent_n_tiles) % cluster_n:
+        raise RuntimeError(
+            f"[FlyDSL gfx1250 mxfp8_128] persistent_n_tiles={persistent_n_tiles} needs "
+            f"N/tile_n={n_tiles} divisible by it and the quotient a multiple "
+            f"of cluster_n={cluster_n}"
+        )
+
+
 def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
     XQ: Tensor,
     WQ: Tensor,
@@ -207,26 +240,9 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
                 f"stride(0)={Out.stride(0)}"
             )
 
-    if persistent_n_tiles < 1:
-        raise RuntimeError(
-            f"[FlyDSL gfx1250 mxfp8_128] persistent_n_tiles must be >= 1, got {persistent_n_tiles}"
-        )
-    if persistent_n_tiles > 1:
-        if not compute_bound:
-            raise RuntimeError(
-                "[FlyDSL gfx1250 mxfp8_128] persistent_n_tiles>1 is compute-bound only"
-            )
-        if split_k != 1:
-            raise RuntimeError(
-                "[FlyDSL gfx1250 mxfp8_128] persistent_n_tiles>1 requires split_k=1"
-            )
-        n_tiles = N // tile_n
-        if n_tiles % persistent_n_tiles or (n_tiles // persistent_n_tiles) % cluster_n:
-            raise RuntimeError(
-                f"[FlyDSL gfx1250 mxfp8_128] persistent_n_tiles={persistent_n_tiles} needs "
-                f"N/tile_n={n_tiles} divisible by it and the quotient a multiple "
-                f"of cluster_n={cluster_n}"
-            )
+    check_persistent_n_tiles(
+        persistent_n_tiles, N, tile_n, cluster_n, split_k, compute_bound
+    )
 
     if a_preshuffle and M % 2 != 0:
         raise RuntimeError(
@@ -341,6 +357,33 @@ def cluster_m_grid_ok(M: int, tile_m: int, cluster_m: int) -> bool:
     return m_blocks % cluster_m == 0
 
 
+def resolve_cluster_m(
+    M: int,
+    tile_m: int,
+    cluster_m: int,
+    cluster_n: int,
+    compute_bound: bool,
+) -> int | None:
+    for cm in range(max(1, int(cluster_m)), 0, -1):
+        if not cluster_m_grid_ok(M, tile_m, cm):
+            continue
+        # A compute-bound cluster must hold at least two workgroups.
+        if compute_bound and cm * cluster_n < 2:
+            continue
+        return cm
+    return None
+
+
+def cluster_m_fallback_values(
+    cluster_m: int, cluster_n: int, compute_bound: bool
+) -> list[int]:
+    return [
+        cm
+        for cm in range(1, max(1, int(cluster_m)) + 1)
+        if not compute_bound or cm * cluster_n >= 2
+    ]
+
+
 def is_compute_wmma_kernel_name(name: str) -> bool:
     """Return whether ``name`` selects the compute-bound implementation."""
     return _COMPUTE_KERNEL_NAME_RE.fullmatch(name) is not None
@@ -354,17 +397,24 @@ def run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
     Out: Tensor,
     kernel_name: str,
     a_is_preshuffled: bool = False,
+    allow_cluster_m_fallback: bool = True,
 ) -> Tensor:
-    """Decode a tuned kernelName and dispatch its internal implementation.
-
-    ``a_is_preshuffled`` is the caller's assertion that XQ is already in
-    shuffle_mxfp8fp4_a's (2, 128) layout. Nothing about a tensor distinguishes
-    that from row-major, so an "_apre" kernel needs this explicit opt-in.
-    """
+    """Decode a tuned kernelName and dispatch its internal implementation."""
     cfg = parse_wmma_kernel_name(kernel_name)
     if cfg is None:
         raise ValueError(
             f"[FlyDSL gfx1250 mxfp8_128] unrecognised kernelName: {kernel_name!r}"
+        )
+    if allow_cluster_m_fallback:
+        cfg["cluster_m"] = (
+            resolve_cluster_m(
+                XQ.shape[0],
+                cfg["tile_m"],
+                cfg["cluster_m"],
+                cfg["cluster_n"],
+                is_compute_wmma_kernel_name(kernel_name),
+            )
+            or cfg["cluster_m"]
         )
     if cfg["a_preshuffle"] and not a_is_preshuffled:
         raise ValueError(

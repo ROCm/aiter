@@ -1,7 +1,6 @@
 gfx,cu_num,M,N,K,libtype,kernelId,splitK,us,kernelName,tflops,bw,errRatio
-gfx1250,256,512,2048,7168,flydsl,0,4,10.0384,flydsl_mxfp8_128_bpreshuffle_compute_wmma_t128x128x128_mw2_nw2_nb4_sk4_cm1_cn4_apre,1497.49,0,0
-gfx1250,256,512,6144,7168,flydsl,0,4,16.3983,flydsl_mxfp8_128_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb4_sk4_cm2_cn4_apre,2750.1,0,0
-gfx1250,256,512,7168,3072,flydsl,0,1,10.6145,flydsl_mxfp8_128_bpreshuffle_compute_wmma_t128x128x128_mw2_nw2_nb4_sk1_cm1_cn4_apre,2124.32,0,0
-gfx1250,256,512,7168,16384,flydsl,0,4,29.7586,flydsl_mxfp8_128_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk4_cm2_cn4_apre,4041.15,0,0
-gfx1250,256,512,8192,1536,flydsl,0,1,7.8453,flydsl_mxfp8_128_bpreshuffle_compute_wmma_t128x128x128_mw2_nw2_nb4_sk1_cm1_cn4_apre,1642.36,0,0
-gfx1250,256,512,65536,1536,flydsl,0,1,27.6484,flydsl_mxfp8_128_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb4_sk1_cm2_cn4_apre,3728.21,0,0
+gfx1250,256,512,6144,7168,flydsl,1445,4,14.9648,flydsl_mxfp8_128_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb4_sk4_cm2_cn2_apre,3013.55,3608.58,0.0
+gfx1250,256,512,7168,3072,flydsl,1372,1,9.5398,flydsl_mxfp8_128_bpreshuffle_compute_wmma_t128x128x128_mw2_nw2_nb4_sk1_cm4_cn4_apre,2363.63,3242.52,0.0
+gfx1250,256,512,8192,1536,flydsl,1372,1,7.0079,flydsl_mxfp8_128_bpreshuffle_compute_wmma_t128x128x128_mw2_nw2_nb4_sk1_cm4_cn4_apre,1838.63,3104.77,0.0
+gfx1250,256,512,65536,1536,flydsl,1349,1,23.4377,flydsl_mxfp8_128_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk1_cm2_cn4_apre_ps2,4398.01,7191.77,0.0
+gfx1250,256,512,7168,16384,flydsl,1447,4,25.297,flydsl_mxfp8_128_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb4_sk4_cm2_cn4_apre,4753.89,5264.23,0.0
