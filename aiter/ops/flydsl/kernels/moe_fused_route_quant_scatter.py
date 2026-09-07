@@ -263,6 +263,13 @@ def _buf_rsrc(t):
 _LANE_UNIT_ELEM = {1: fx.Int8, 2: fx.Int16, 4: fx.Int32}
 
 
+def _g_i32_pt():
+    """i32 global pointer type, for the atomicrmw builder's raw !llvm.ptr."""
+    return fx.PointerType.get(
+        fx.Int32.ir_type, address_space=fx.AddressSpace.Global, alignment=4
+    )
+
+
 def _lane_unit_tensor(row_addr, unit_bytes, row_bytes):
     """Row view whose element is one lane's ``unit_bytes``-wide payload slice."""
     if unit_bytes in _LANE_UNIT_ELEM:
@@ -711,7 +718,7 @@ def build_moe_fused_route_quant_scatter_module(
             slot_on_lane0 = arith.constant(0, type=i32)
             if lane == 0:
                 counter_addr = fx.Int64(ptrtoint(counter)) + fx.Int64(expert) * 4
-                counter_ptr = buffer_ops.create_llvm_ptr(counter_addr, address_space=1)
+                counter_ptr = fx.to_llvm_ptr(fx.inttoptr(_g_i32_pt(), counter_addr))
                 counter_ptr = (
                     counter_ptr._value
                     if hasattr(counter_ptr, "_value")
@@ -1768,7 +1775,7 @@ def build_moe_fused_route_psum_quant_scatter_module(
 
         def _elem_ptr(tensor, elem_idx_i32):
             addr = fx.Int64(ptrtoint(tensor)) + fx.Int64(elem_idx_i32) * 4
-            p = buffer_ops.create_llvm_ptr(addr, address_space=1)
+            p = fx.to_llvm_ptr(fx.inttoptr(_g_i32_pt(), addr))
             return p._value if hasattr(p, "_value") else p
 
         def _atomic_add(tensor, elem_idx_i32, addend):
