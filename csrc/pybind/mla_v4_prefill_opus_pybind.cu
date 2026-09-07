@@ -2,7 +2,7 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "rocm_ops.hpp"
 #include "aiter_stream.h"
-#include "pa_sparse_prefill_opus.h"
+#include "mla_v4_prefill_opus.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {

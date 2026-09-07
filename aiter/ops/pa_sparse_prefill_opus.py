@@ -9,7 +9,7 @@ softmax-denominator sink. The two regions share a single online-softmax
 accumulator, making the order region-invariant.
 
 The user-facing entry is :func:`pa_sparse_prefill_opus`, which dispatches on
-the running GPU. Both backends live in ``module_pa_sparse_prefill_opus``:
+the running GPU. Both backends live in ``module_mla_v4_prefill_opus``:
 
 * ``gfx950`` -- :func:`pa_sparse_prefill_gfx950_opus_fwd`, kernel compiled
   from source by the JIT.
@@ -25,7 +25,7 @@ Constraints common to both:
   valid row index into ``unified_kv`` / ``kv`` respectively. Empty CSR rows
   (``kv_indptr[i] == kv_indptr[i+1]``) are allowed.
 
-See ``aiter/csrc/include/pa_sparse_prefill_opus.h`` for the C++ API.
+See ``aiter/csrc/include/mla_v4_prefill_opus.h`` for the C++ API.
 """
 
 import torch
@@ -34,7 +34,7 @@ from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_gfx_runtime
 from ..jit.utils.torch_guard import torch_compile_guard
 
-MD_NAME = "module_pa_sparse_prefill_opus"
+MD_NAME = "module_mla_v4_prefill_opus"
 
 SUPPORTED_ARCHS = ("gfx950", "gfx1250")
 
@@ -45,7 +45,7 @@ def _dispatch(gfx: str, op_gfx950, op_gfx1250):
     gfx950 compiles the kernel from source. gfx1250 instead loads a prebuilt
     code object (``hsa/gfx1250/mla_v4_opus/``), because its kernel needs
     the CoExec scheduler from a custom LLVM build that release images do not
-    ship; see ``csrc/py_itfs_cu/pa_sparse_prefill_opus_kernels.cu``.
+    ship; see ``csrc/py_itfs_cu/mla_v4_prefill_opus_kernels.cu``.
     """
     if gfx == "gfx1250":
         return op_gfx1250
