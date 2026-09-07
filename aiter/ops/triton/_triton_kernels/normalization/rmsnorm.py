@@ -1033,8 +1033,8 @@ def _rmsnorm_kernel_large_m_small_n(
     BLOCK_N: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
-    m_off = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    n_off = tl.arange(0, BLOCK_N)
+    m_off = tl.cast(pid_m * BLOCK_M + tl.arange(0, BLOCK_M), tl.int64)
+    n_off = tl.cast(tl.arange(0, BLOCK_N), tl.int64)
 
     mask_m = m_off < M
     mask_n = n_off < N
@@ -1092,8 +1092,8 @@ def _rmsnorm_bwd_kernel_large_m_small_n(
     # _rmsnorm_kernel_large_m_small_n). dgamma is reduced over rows within the
     # block into a per-program partial, then finished by _rmsnorm_bwd_dg_reduce.
     pid_m = tl.program_id(0)
-    m_off = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    n_off = tl.arange(0, BLOCK_N)
+    m_off = tl.cast(pid_m * BLOCK_M + tl.arange(0, BLOCK_M), tl.int64)
+    n_off = tl.cast(tl.arange(0, BLOCK_N), tl.int64)
 
     mask_m = m_off < M
     mask_n = n_off < N
@@ -1127,4 +1127,4 @@ def _rmsnorm_bwd_kernel_large_m_small_n(
     dg = grad_output * x * norm_factor[:, None]
     dg = tl.where(mask, dg, 0.0)
     dg_partial = tl.sum(dg, axis=0)  # [BLOCK_N]
-    tl.store(dg_ptr + pid_m * N + n_off, dg_partial, mask=mask_n)
+    tl.store(dg_ptr + tl.cast(pid_m, tl.int64) * N + n_off, dg_partial, mask=mask_n)
