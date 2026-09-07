@@ -64,6 +64,13 @@ CLOSE_ATOL = 1e-1
 CLOSE_ERR_RATIO = 0.5
 SUPER_TILE = 8
 TP = WORLD
+_FILLS = (
+    "normal",
+    "pos_underflow",
+    "neg_underflow",
+    "overflow_512",
+    "zeros",
+)
 
 pytestmark = pytest.mark.skipif(
     ARCH not in SUPPORTED_ARCHS,
@@ -90,6 +97,32 @@ _PYTEST_CASES = (
 def _num_tiles(tokens: int, hidden: int) -> int:
     nbytes = tokens * hidden * 2
     return max(1, (nbytes + TILE_BYTES - 1) // TILE_BYTES)
+
+
+def _make_inp(
+    tokens: int, hidden: int, fill: str, *, rank: int, device: torch.device
+) -> torch.Tensor:
+    shape = (tokens, hidden)
+    if fill == "normal":
+        gen = torch.Generator().manual_seed(1234 + rank)
+        return (torch.randn(shape, generator=gen, dtype=torch.float32) * 0.1).to(
+            device=device, dtype=torch.bfloat16
+        )
+    if fill == "pos_underflow":
+        val = 2.0**-8
+    elif fill == "neg_underflow":
+        val = -(2.0**-8)
+    elif fill == "overflow_512":
+        # All-rank 512 saturates INT4 during the two-shot add (~5.5 dB vs
+        # NCCL) even with a max-finite scale. Rank 0 only: recon 480 vs
+        # ref 512 after the mantissa saturate, or 256 vs 512 if overflow
+        # keeps m3=0.
+        val = 512.0 if rank == 0 else 0.0
+    elif fill == "zeros":
+        val = 0.0
+    else:
+        raise ValueError(f"unknown fill {fill!r}; expected one of {_FILLS}")
+    return torch.full(shape, val, device=device, dtype=torch.bfloat16)
 
 
 def _pick_st(
@@ -176,11 +209,9 @@ def _run_rank(args) -> None:
     del compile_inp, compile_out
 
     rows = []
+    fill = getattr(args, "fill", "normal")
     for tokens, hidden in zip(args.tokens, args.hiddens, strict=True):
-        gen = torch.Generator().manual_seed(1234 + rank)
-        inp = (
-            torch.randn(tokens, hidden, generator=gen, dtype=torch.float32) * 0.1
-        ).to(device=device, dtype=torch.bfloat16)
+        inp = _make_inp(tokens, hidden, fill, rank=rank, device=device)
         out = torch.empty_like(inp)
         ref = inp.to(torch.float32)
         dist.all_reduce(ref, group=group)
@@ -247,6 +278,7 @@ def _spawn(
     time_it: bool,
     super_tile: int = SUPER_TILE,
     grid_cap: int = DEFAULT_GRID_CAP,
+    fill: str = "normal",
 ) -> list[list[dict]]:
     # HIP QR/fused-AR use multiprocessing.Pool from ``python3`` __main__.
     # This file is also collected by pytest, and FlyDSL JIT needs a fresh
@@ -287,6 +319,8 @@ def _spawn(
             str(super_tile),
             "--grid-cap",
             str(grid_cap),
+            "--fill",
+            fill,
         ]
         if time_it:
             cmd.append("--time-it")
@@ -368,6 +402,26 @@ def _assert_validity(
             + "; ".join(fails)
         )
     return ranks[0][0]
+
+
+_CODEC_FILL_CASES = (
+    ("pos_underflow", "pos-underflow-2^-8"),
+    ("neg_underflow", "neg-underflow-2^-8"),
+    ("overflow_512", "overflow-512"),
+    ("zeros", "true-zero-scale"),
+)
+
+
+@pytest.mark.parametrize("fill,label", _CODEC_FILL_CASES)
+def test_qr_int4_e4m3_codec_fill(fill, label):
+    ranks = _spawn(2, [(16, 1024)], time_it=False, fill=fill)
+    _assert_validity(
+        ranks,
+        tokens=16,
+        hidden=1024,
+        world_size=2,
+        label=label,
+    )
 
 
 @pytest.mark.parametrize("world_size,tokens,hidden,label", _PYTEST_CASES)
@@ -532,6 +586,7 @@ if __name__ == "__main__":
     parser.add_argument("--super-tile", type=int, default=SUPER_TILE)
     parser.add_argument("--grid-cap", type=int, default=DEFAULT_GRID_CAP)
     parser.add_argument("--time-it", action="store_true")
+    parser.add_argument("--fill", default="normal", choices=_FILLS)
     parser.add_argument("--out", default=None)
     known, rest = parser.parse_known_args()
     if known.rank is not None:

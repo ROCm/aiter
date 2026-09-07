@@ -157,7 +157,11 @@ def _f32_to_e4m3(x):
 
     Group-16 wire scale. Not IEEE OCP E4M3 denorms: e=0 still encodes
     ``(1+m/8)*2^-7`` so typical INT4 extrema (~0.1) stay in range after
-    ×−1/8. Byte 0 is +0.
+    ×−1/8. Byte ``0x00`` is +0 only. Any other nonzero input that would
+    pack to ``0x00`` (underflow clamp or exact ``2**-7``) becomes ``0x01``.
+    Negative underflow stays ``0x80``. Overflow saturates to max finite
+    (``0x7F`` / ``0xFF``), including mantissa, so ``512`` does not decode
+    as ``256``.
     """
     is_z = x == fx.Float32(0.0)
     sign = (x < fx.Float32(0.0)).select(fx.Int32(0x80), fx.Int32(0))
@@ -169,13 +173,11 @@ def _f32_to_e4m3(x):
     e = e + carry.select(fx.Int32(1), fx.Int32(0))
     m3 = carry.select(fx.Int32(0), m3)
     e4 = e + fx.Int32(7)
-    min_exp = e4 == fx.Int32(0)
     overflow = e4 > fx.Int32(15)
     m3 = overflow.select(fx.Int32(7), m3)
     e4 = (e4 < fx.Int32(0)).select(fx.Int32(0), overflow.select(fx.Int32(15), e4))
     byte = sign | (e4 << fx.Int32(3)) | (m3 & fx.Int32(7))
-    byte = min_exp.select((byte == fx.Int32(0)).select(fx.Int32(1), byte), byte)
-    return is_z.select(fx.Int32(0), byte)
+    return is_z.select(fx.Int32(0), (byte == fx.Int32(0)).select(fx.Int32(1), byte))
 
 
 def _e4m3_to_f32(b):
