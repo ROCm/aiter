@@ -447,7 +447,9 @@ _A16W16_MS = _tokens(tuple(sorted({*_TOKENS, 4096, 8192, 16384})))
 # against rather than in the kernel under test. AITER_BENCH_TOKENS still wins if
 # set -- what an explicit request sweeps is the caller's business.
 _INVERSE_ROPE_TOKENS = _tokens((1, 16, 32, 64, 128, 256, 512, 1024, 2048, 16384))
-_SCORE_QK_TOKENS = _tokens()
+# Score-QK runs once per decode step. With MTP disabled, this axis is both the
+# number of concurrent sequences and the number of query tokens in the launch.
+_SCORE_QK_TOKENS = _tokens((1, 16, 32, 64, 128, 256, 512, 1024))
 # score_qk is decode, so its KV length is the average context a decode step
 # scans: input + output/2, then CSA's 4x compression.
 #   1K in / 1K out  -> (1024  + 512)  / 4 =   384
@@ -1424,18 +1426,18 @@ def run_score_qk(args):
         "--blocksize",
         "64",
     ]
-    # None => let the UT pick the batch, so run the KV lengths once each.
     for tokens, (label, kv_length), data_init in itertools.product(
-        _SCORE_QK_TOKENS or (None,),
+        _SCORE_QK_TOKENS,
         _SCORE_QK_KV_LENGTHS,
         args.data_init or ["norm"],
     ):
         _run_child(
-            f"score_qk (decode, B={tokens or 'UT default'}, {label} "
+            f"score_qk (decode, B={tokens}, {label} "
             f"CSA KV={kv_length}, init={data_init}, seed={args.seed})",
             [
                 *base_cmd,
-                *(["--batch", str(tokens)] if tokens else []),
+                "--batch",
+                str(tokens),
                 "-kv_length",
                 kv_length,
                 "--data-init",
