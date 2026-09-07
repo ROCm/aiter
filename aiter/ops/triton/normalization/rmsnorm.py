@@ -113,7 +113,7 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
 
     M, N = x_.shape
 
-    if _should_use_large_m_small_n(M, N):
+    if _should_use_large_m_small_n(M, N, backward=True):
         # Row-parallel tiling for large-M / small-N (q/k per-head norm). Avoids
         # the generic kernel's get_num_sms()-capped grid that serializes rows.
         BLOCK_N = triton.next_power_of_2(N)
@@ -194,9 +194,22 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
     return dx, dgamma
 
 
-def _should_use_large_m_small_n(M: int, N: int) -> bool:
+def _should_use_large_m_small_n(M: int, N: int, backward: bool = False) -> bool:
+    """Return True when the large-M/small-N tiled kernel should be used.
 
-    return bool(M > 8192 and N <= 2048)
+    Forward and backward have different crossover points: the backward kernel
+    produces ceil(M/BLOCK_M) partial dgamma rows that must be reduced, so its
+    net benefit shrinks as N grows.  Benchmarks on MI308X (M=16384, bf16):
+
+      N=128  → fwd 13.6×, bwd 5.1×   N=512  → fwd 7.8×, bwd 3.0×
+      N=1024 → fwd 5.0×,  bwd 1.2×   N=1280 → fwd 2.6×, bwd ~1×
+
+    Forward benefit persists to N≈2048; backward benefit drops below noise at
+    N>1024, so separate thresholds avoid a regression for larger N.
+    """
+    if not (M > 8192):
+        return False
+    return N <= 1024 if backward else N <= 2048
 
 
 def rmsnorm_forward_inference(x: torch.Tensor, weight: torch.Tensor, eps: float):
