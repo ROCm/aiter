@@ -21,7 +21,8 @@ from .communication_ops_utils import (
     store_i64_global_system,
 )
 
-_JIT_SCHEMA_VERSION = "v11-split-in-hop"
+_JIT_SCHEMA_VERSION = "v12-quant"
+_TRANSPORT_CHUNK_BYTES = 16
 _PUSH_PIPELINE_DEPTH = 16
 _OUT_CHANNEL_COUNT = 8
 _OUT_CHANNEL_DEPTH = 1
@@ -38,14 +39,20 @@ def make_fused_a2a_kernel(
     warp_num_per_block,
     fuse_norm_rope,
     split=False,
+    quant=False,
+    element_size=2,
 ):
-    row_nbytes = head_dim * 2
-    if row_nbytes % 16 != 0:
-        raise ValueError(f"head row must be 16-byte aligned, got {row_nbytes}")
+    row_nbytes = head_dim * element_size
+    if row_nbytes % _TRANSPORT_CHUNK_BYTES != 0:
+        raise ValueError(
+            f"head row must be {_TRANSPORT_CHUNK_BYTES}-byte aligned, got {row_nbytes}"
+        )
 
     heads_local = heads // npes
     seq_full = seq_len * npes
-    chunks_per_row = row_nbytes // 16
+    elements_per_chunk = _TRANSPORT_CHUNK_BYTES // element_size
+    chunks_per_row = head_dim // elements_per_chunk
+    chunk_words = _TRANSPORT_CHUNK_BYTES // 4
     total_chunks = heads * seq_len * chunks_per_row
     vec = 8
     block_threads = 64
@@ -252,7 +259,8 @@ def make_fused_a2a_kernel(
                 peer_base_lo
             )
             rsrc_dst = create_buffer_resource_from_addr(
-                uniform_peer_base, num_records_bytes=total_chunks * 16
+                uniform_peer_base,
+                num_records_bytes=total_chunks * _TRANSPORT_CHUNK_BYTES,
             )
             group_step = peer_warp_num * _PUSH_PIPELINE_DEPTH
             for group_base in range(peer_warp_id, peer_group_count, group_step):
@@ -273,8 +281,8 @@ def make_fused_a2a_kernel(
                     values.append(
                         buffer_load(
                             input_rsrc,
-                            src_chunk * 4,
-                            vec_width=4,
+                            src_chunk * chunk_words,
+                            vec_width=chunk_words,
                             dtype=T.i32,
                         )
                     )
@@ -283,7 +291,7 @@ def make_fused_a2a_kernel(
                         + (rank * seq_len + seq) * chunks_per_row
                         + row_chunk
                     )
-                    destinations.append(dst_chunk * 4)
+                    destinations.append(dst_chunk * chunk_words)
                     valid_values.append(valid)
                 for batch_idx in range_constexpr(_PUSH_PIPELINE_DEPTH):
                     if valid_values[batch_idx]:
@@ -407,6 +415,8 @@ def make_fused_a2a_jit(
     warp_num_per_block,
     fuse_norm_rope,
     split=False,
+    quant=False,
+    element_size=2,
 ):
     kernel = make_fused_a2a_kernel(
         rank=rank,
@@ -418,6 +428,8 @@ def make_fused_a2a_jit(
         warp_num_per_block=warp_num_per_block,
         fuse_norm_rope=fuse_norm_rope,
         split=split,
+        quant=quant,
+        element_size=element_size,
     )
     key = (
         rank,
@@ -429,6 +441,8 @@ def make_fused_a2a_jit(
         warp_num_per_block,
         fuse_norm_rope,
         split,
+        quant,
+        element_size,
         _JIT_SCHEMA_VERSION,
     )
 

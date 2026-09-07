@@ -15,7 +15,11 @@ import torch
 from flydsl.expr.typing import Stream
 from mori.shmem import mori_shmem_create_tensor
 
-from .fused_a2a_intranode_kernel import make_fused_a2a_jit, make_fused_a2a_out_jit
+from .fused_a2a_intranode_kernel import (
+    _TRANSPORT_CHUNK_BYTES,
+    make_fused_a2a_jit,
+    make_fused_a2a_out_jit,
+)
 
 _DEFAULT_BLOCK_NUM = 128
 _DEFAULT_WARP_NUM_PER_BLOCK = 8
@@ -38,6 +42,8 @@ class FusedA2AIntraNodeOp:
     """Own symmetric receive and handshake buffers for one tensor shape.
 
     Set split=True or FUSED_A2A_SPLIT=1 for three ordered per-tensor launches.
+    Set quant=True or FUSED_A2A_QUANT=1 to allocate byte payloads and E8M0 scales;
+    quantized execution is not implemented yet.
     All ranks must use the same mode and serialize calls on one stream.
     """
 
@@ -52,9 +58,13 @@ class FusedA2AIntraNodeOp:
         warp_num_per_block=_DEFAULT_WARP_NUM_PER_BLOCK,
         fuse_norm_rope=True,
         split=False,
+        quant=False,
     ):
-        if dtype != torch.bfloat16:
-            raise ValueError(f"only torch.bfloat16 is supported, got {dtype}")
+        self.quant = quant or os.environ.get("FUSED_A2A_QUANT", "0") == "1"
+        if dtype != torch.bfloat16 and not (self.quant and dtype == torch.uint8):
+            raise ValueError(
+                f"expected torch.bfloat16 or torch.uint8 with quant enabled, got {dtype}"
+            )
         if world_size <= 0 or world_size > _MAX_INTRANODE_NPES:
             raise ValueError(f"world_size must be in [1, 8], got {world_size}")
         if rank < 0 or rank >= world_size:
@@ -79,9 +89,13 @@ class FusedA2AIntraNodeOp:
             numel *= dim
         if numel % world_size != 0:
             raise ValueError("input numel must divide evenly across ranks")
-        row_nbytes = shape[-1] * torch.tensor([], dtype=dtype).element_size()
-        if row_nbytes % 16 != 0:
-            raise ValueError(f"head row must be 16-byte aligned, got {row_nbytes}")
+        payload_dtype = torch.uint8 if self.quant else dtype
+        element_size = torch.tensor([], dtype=payload_dtype).element_size()
+        row_nbytes = shape[-1] * element_size
+        if row_nbytes % _TRANSPORT_CHUNK_BYTES != 0:
+            raise ValueError(
+                f"head row must be {_TRANSPORT_CHUNK_BYTES}-byte aligned, got {row_nbytes}"
+            )
 
         self.rank = rank
         self.world_size = world_size
@@ -89,7 +103,14 @@ class FusedA2AIntraNodeOp:
         self.dtype = dtype
         self.peer_numel = numel // world_size
         self.outputs_sets = tuple(
-            tuple(mori_shmem_create_tensor((numel,), dtype) for _ in range(3))
+            tuple(mori_shmem_create_tensor((numel,), payload_dtype) for _ in range(3))
+            for _ in range(2)
+        )
+        # One E8M0 byte per block of 32 values; left unwritten until quantization.
+        self.scales_sets = tuple(
+            tuple(
+                mori_shmem_create_tensor((numel // 32,), torch.uint8) for _ in range(3)
+            )
             for _ in range(2)
         )
         self.output = self.outputs_sets[0][0]
@@ -108,6 +129,13 @@ class FusedA2AIntraNodeOp:
                 for output in outputs
             )
             for outputs in self.outputs_sets
+        )
+        self.p2p_scales_sets = tuple(
+            tuple(
+                _build_p2p_table(scale, rank, world_size, self.output.device)
+                for scale in scales
+            )
+            for scales in self.scales_sets
         )
         self.p2p_xdb_mem = _build_p2p_table(
             self.xdb_mem, rank, world_size, self.output.device
@@ -131,6 +159,8 @@ class FusedA2AIntraNodeOp:
                 warp_num_per_block=warp_num_per_block,
                 fuse_norm_rope=role,
                 split=self.split,
+                quant=self.quant,
+                element_size=element_size,
             )
             for role in roles
         )
@@ -139,6 +169,10 @@ class FusedA2AIntraNodeOp:
     def __call__(
         self, q, k, v, norm_q=None, norm_k=None, cos=None, sin=None, stream=None
     ):
+        if self.quant:
+            raise NotImplementedError(
+                "quantized transport is allocation-only scaffolding"
+            )
         inputs = (q, k, v)
         for input in inputs:
             if input.dtype != self.dtype or tuple(input.shape) != self.shape:
