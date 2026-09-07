@@ -10,7 +10,7 @@ import torch
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 
-from ..tensor_shim import _run_compiled
+from ..tensor_shim import _run_compiled, ptr_buf_tensor
 from .gemm_util import (
     _PACK,
     AS2RLoader,
@@ -21,8 +21,6 @@ from .gemm_util import (
     MfmaScaleGU,
     SiluQuantEpilogue,
     TileScheduler,
-    _buffer_load,
-    _make_buffer,
     wait_lds_barrier,
 )
 
@@ -46,10 +44,10 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
     )
     SB_STATE_END = B_STATE_END + NUM_B_SCALE
     last = fx.Int32(K_ITERS - 1)
-    tile_row_base = _buffer_load(trb_rsrc, m_tile, fx.Int32)
+    tile_row_base = trb_rsrc[m_tile]
     tile_input_base = tile_row_base
     if const_expr(indirect_input):
-        tile_input_base = _buffer_load(tib_rsrc, m_tile, fx.Int32)
+        tile_input_base = tib_rsrc[m_tile]
     b_row = sched.gate_base_row(expert) + n_tile_base
     a_gather.for_tile(tile_input_base)
     if const_expr(pipe_weights):
@@ -390,22 +388,23 @@ def compile_gemm1(
         a_scale_lds = lds.A_scale
         c_tile = _LdsF32View(fx.recast_iter(fx.Float32, lds.pool.ptr))
 
-        w_rsrc = _make_buffer(w, fx.Int32, 4)
-        sx_rsrc = _make_buffer(scale_x, fx.Int32, 4)
-        sw_rsrc = _make_buffer(scale_w, fx.Int32)
-        trb_rsrc = _make_buffer(tile_row_base, fx.Int32)
-        expert_rsrc = _make_buffer(expert_ids, fx.Int32)
+        w_rsrc = ptr_buf_tensor(fx.get_iter(w), fx.Int32, unit_elems=4)
+        sx_rsrc = ptr_buf_tensor(fx.get_iter(scale_x), fx.Int32, unit_elems=4)
+        sw_rsrc = ptr_buf_tensor(fx.get_iter(scale_w), fx.Int32)
+        trb_rsrc = ptr_buf_tensor(fx.get_iter(tile_row_base), fx.Int32)
+        expert_rsrc = ptr_buf_tensor(fx.get_iter(expert_ids), fx.Int32)
         if const_expr(use_tile_resource):
             out_rsrc = None
         else:
-            out_rsrc = _make_buffer(
-                out, fx.Int16, max_size=False, num_records_bytes=num_valid * fx.Int32(inter_dim)
+            out_rsrc = ptr_buf_tensor(
+                fx.get_iter(out),
+                fx.Int16,
+                num_records_bytes=num_valid * fx.Int32(inter_dim),
             )
         scale_cols = (inter_dim // 32 + 7) // 8 * 8
-        os_rsrc = _make_buffer(
-            out_scale,
+        os_rsrc = ptr_buf_tensor(
+            fx.get_iter(out_scale),
             fx.Int8,
-            max_size=False,
             num_records_bytes=num_valid * fx.Int32(scale_cols) + fx.Int32(8192),
         )
         wave_id = fx.thread_idx.x // 64

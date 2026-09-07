@@ -25,7 +25,7 @@ from ..mxfp4_gemm_common import (
     lds_swizzle_mask_f8,
     lds_vec_load,
 )
-from .gemm_util import _buffer_load, _make_buffer_from_addr
+from ..tensor_shim import buf_copy_load, ptr_buf_tensor
 
 
 def scale_view(
@@ -359,7 +359,7 @@ def gemm2_compute_v2(
         return out
 
     # Stream B weights and scales through registers so use_nt reaches the ISA cache policy.
-    bq_buffer = _make_buffer_from_addr(arg_bq, fx.Int32, 4)
+    bq_buffer = ptr_buf_tensor(arg_bq, fx.Int32, unit_elems=4)
 
     bq_base_dw = [
         rocdl.readfirstlane(
@@ -405,11 +405,11 @@ def gemm2_compute_v2(
                     if load_mask is not None
                     else bq_off_dw
                 )
-                loaded_bq = _buffer_load(
+                loaded_bq = buf_copy_load(
                     bq_buffer,
                     safe_bq_off_dw // fx.Int32(4),
                     fx.Int32,
-                    4,
+                    unit_elems=4,
                     cache_modifier=2 if use_nt else 0,
                 )
                 bq_vec = (

@@ -11,8 +11,7 @@ from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 
 from .. import communication_ops_utils as comm_ops
-from ..tensor_shim import ptr_buf_tensor
-from .gemm_util import _buffer_load, _buffer_store, _make_buffer_from_addr
+from ..tensor_shim import buf_copy_load, buf_copy_store, ptr_buf_tensor
 
 
 class DispatchSlot(IntEnum):
@@ -344,7 +343,7 @@ def _initialize_section_ready(
 
     sender_prefix = fx.Int32(0)
     for source in range_constexpr(fz_npes):
-        source_count = _buffer_load(
+        source_count = buf_copy_load(
             count_buffer,
             fx.Int32(source * count_stride) + count_column,
             fx.Int32,
@@ -376,14 +375,22 @@ def _copy_token_row(
     n_vec = fz_n_i32 // 4
     if const_expr(fz_safe_end_i32 > 0):
         for unit in range(lane, safe_end_vec, 128):
-            value0 = _buffer_load(source_buffer, unit, fx.Int32, 4)
-            value1 = _buffer_load(source_buffer, unit + fx.Int32(64), fx.Int32, 4)
-            _buffer_store(destination_buffer, unit, value0, fx.Int32, 4)
-            _buffer_store(destination_buffer, unit + fx.Int32(64), value1, fx.Int32, 4)
+            value0 = buf_copy_load(source_buffer, unit, fx.Int32, unit_elems=4)
+            value1 = buf_copy_load(
+                source_buffer, unit + fx.Int32(64), fx.Int32, unit_elems=4
+            )
+            buf_copy_store(destination_buffer, unit, value0, fx.Int32, unit_elems=4)
+            buf_copy_store(
+                destination_buffer,
+                unit + fx.Int32(64),
+                value1,
+                fx.Int32,
+                unit_elems=4,
+            )
     if const_expr(fz_safe_end_i32 < fz_n_i32):
         for unit in range(lane + safe_end_vec, n_vec, 64):
-            value = _buffer_load(source_buffer, unit, fx.Int32, 4)
-            _buffer_store(destination_buffer, unit, value, fx.Int32, 4)
+            value = buf_copy_load(source_buffer, unit, fx.Int32, unit_elems=4)
+            buf_copy_store(destination_buffer, unit, value, fx.Int32, unit_elems=4)
 
 
 @flyc.jit
@@ -508,19 +515,23 @@ def emit_direct_fixed_slot_payload(
 
         if publish:
             remote_token = token_table[destination]
-            destination_buffer = _make_buffer_from_addr(
+            destination_buffer = ptr_buf_tensor(
                 remote_token + fx.Int64(payload_row) * fx.Int64(fz_nbytes),
                 fx.Int32,
-                4,
+                unit_elems=4,
             )
-            source_buffer = _make_buffer_from_addr(
+            source_buffer = ptr_buf_tensor(
                 addr_in_tok + fx.Int64(source_token) * fx.Int64(fz_nbytes),
                 fx.Int32,
-                4,
+                unit_elems=4,
             )
             for unit in range(lane, fz_n_i32 // 4, 64):
-                value = _buffer_load(source_buffer, unit, fx.Int32, 4)
-                _buffer_store(destination_buffer, unit, value, fx.Int32, 4)
+                value = buf_copy_load(
+                    source_buffer, unit, fx.Int32, unit_elems=4
+                )
+                buf_copy_store(
+                    destination_buffer, unit, value, fx.Int32, unit_elems=4
+                )
 
             if const_expr(fz_enable_scales):
                 if lane < fx.Int32(fz_scale_n_i32):
@@ -674,7 +685,7 @@ def _derive_allgather_offsets(
     def dp(slot):
         return dispatch_table[fx.Int32(int(slot))]
 
-    count_buffer = _make_buffer_from_addr(dp(DispatchSlot.COUNT_MATRIX), fx.Int32)
+    count_buffer = ptr_buf_tensor(dp(DispatchSlot.COUNT_MATRIX), fx.Int32)
     task_base = ptr_buf_tensor(dp(DispatchSlot.TASK_ROW_BASE), fx.Int32)
     group_base = ptr_buf_tensor(dp(DispatchSlot.GROUP_TASK_BASE), fx.Int32)
     ready_rows_table = ptr_buf_tensor(
@@ -707,7 +718,7 @@ def _derive_allgather_offsets(
         destination_group_counts = []
         for source in range_constexpr(npes):
             destination_group_counts.append(
-                _buffer_load(
+                buf_copy_load(
                     count_buffer,
                     fx.Int32(source * total_segments + total_experts)
                     + destination,
@@ -749,7 +760,7 @@ def _derive_allgather_offsets(
             normal_source_counts = []
             for source in range_constexpr(npes):
                 normal_source_counts.append(
-                    _buffer_load(
+                    buf_copy_load(
                         count_buffer,
                         fx.Int32(source * total_segments) + ge,
                         fx.Int32,
@@ -811,7 +822,7 @@ def _derive_next_fanout_pairs(
     Every rank owns the same gathered matrix and therefore makes the same
     deterministic choice without another communication phase.
     """
-    counts = _make_buffer_from_addr(addr_count_matrix, fx.Int32)
+    counts = ptr_buf_tensor(addr_count_matrix, fx.Int32)
     next_parity = parity ^ fx.Int32(1)
     score_stride = fx.Int32(epr + 1)
     for destination in range_constexpr(npes):
@@ -833,7 +844,7 @@ def _derive_next_fanout_pairs(
             ge = fx.Int32(destination * epr) + safe_expert
             normal_count = fx.Int32(0)
             for source in range_constexpr(npes):
-                source_count = _buffer_load(
+                source_count = buf_copy_load(
                     counts,
                     fx.Int32(source * total_segments) + ge,
                     fx.Int32,
@@ -845,7 +856,7 @@ def _derive_next_fanout_pairs(
             group_count_lane = fx.Int32(0)
             if lane == fx.Int32(0):
                 for source in range_constexpr(npes):
-                    group_count_lane = group_count_lane + _buffer_load(
+                    group_count_lane = group_count_lane + buf_copy_load(
                         counts,
                         fx.Int32(
                             source * total_segments + total_experts + destination
@@ -876,7 +887,7 @@ def _derive_next_fanout_pairs(
             group_count_lane = fx.Int32(0)
             if lane == fx.Int32(0):
                 for source in range_constexpr(npes):
-                    group_count_lane = group_count_lane + _buffer_load(
+                    group_count_lane = group_count_lane + buf_copy_load(
                         counts,
                         fx.Int32(
                             source * total_segments + total_experts + destination
@@ -896,7 +907,7 @@ def _derive_next_fanout_pairs(
                 ge = fx.Int32(destination * epr) + safe_expert
                 normal_count = fx.Int32(0)
                 for source in range_constexpr(npes):
-                    source_count = _buffer_load(
+                    source_count = buf_copy_load(
                         counts,
                         fx.Int32(source * total_segments) + ge,
                         fx.Int32,
@@ -1006,7 +1017,7 @@ def emit_dispatch_plan(
     addr_pair_config = dp(DispatchSlot.FANOUT_PAIR_CONFIG)
     local_hist = ptr_buf_tensor(a_lh, fx.Int32)
     block_hist = ptr_buf_tensor(a_block_hist, fx.Int32)
-    count_matrix = _make_buffer_from_addr(a_bc, fx.Int32)
+    count_matrix = ptr_buf_tensor(a_bc, fx.Int32)
     pair_base = ptr_buf_tensor(a_pair_base, fx.Int32)
     count_matrix_table = ptr_buf_tensor(p_bc, fx.Int64)
     count_done_table = ptr_buf_tensor(p_cd, fx.Int64)
@@ -1133,7 +1144,7 @@ def emit_dispatch_plan(
                     (safe_expert == pair_a) | (safe_expert == pair_b)
                 )
             for source in range_constexpr(fz_npes):
-                source_count = _buffer_load(
+                source_count = buf_copy_load(
                     count_matrix,
                     fx.Int32(source * count_stride) + safe_ge,
                     fx.Int32,
@@ -1142,7 +1153,7 @@ def emit_dispatch_plan(
                 source_count = valid_expert.select(source_count, fx.Int32(0))
                 normal_source_counts.append(source_count)
                 normal_count = normal_count + source_count
-                source_group_count = _buffer_load(
+                source_group_count = buf_copy_load(
                     count_matrix,
                     fx.Int32(source * count_stride + fz_total_experts + fz_rank),
                     fx.Int32,
@@ -1264,7 +1275,7 @@ def emit_dispatch_plan(
             group_count_lane = fx.Int32(0)
             if lane == fx.Int32(0):
                 for source in range_constexpr(fz_npes):
-                    group_count_lane = group_count_lane + _buffer_load(
+                    group_count_lane = group_count_lane + buf_copy_load(
                         count_matrix,
                         fx.Int32(source * count_stride + fz_total_experts + fz_rank),
                         fx.Int32,
@@ -1595,7 +1606,9 @@ def emit_dispatch_payload(
     srcmap_table = ptr_buf_tensor(p_sm, fx.Int64)
     payload_ready_rows_table = ptr_buf_tensor(p_payload_ready_rows, fx.Int64)
     source_scale_buffer = ptr_buf_tensor(addr_in_sc, fx.Int32)
-    source_scale_vec_buffer = _make_buffer_from_addr(addr_in_sc, fx.Int32, 4)
+    source_scale_vec_buffer = ptr_buf_tensor(
+        addr_in_sc, fx.Int32, unit_elems=4
+    )
     row0 = warp
     row_stride = fx.Int32(num_waves)
 
@@ -1696,8 +1709,8 @@ def emit_dispatch_payload(
                 remote_scale_buffer = ptr_buf_tensor(
                     scale_table[destination], fx.Int32
                 )
-                remote_scale_vec_buffer = _make_buffer_from_addr(
-                    scale_table[destination], fx.Int32, 4
+                remote_scale_vec_buffer = ptr_buf_tensor(
+                    scale_table[destination], fx.Int32, unit_elems=4
                 )
         for row in range(row_begin + row0, row_end, row_stride):
             wk_lane = fx.Int32(0)
@@ -1773,14 +1786,14 @@ def emit_dispatch_payload(
                         scale_unit = (
                             source_token * fx.Int32(fz_scale_n_i32) + scale_offset
                         ) // fx.Int32(4)
-                        scale = _buffer_load(
+                        scale = buf_copy_load(
                             source_scale_vec_buffer,
                             scale_unit,
                             fx.Int32,
-                            4,
+                            unit_elems=4,
                         )
                         if const_expr(hoist_remote_resources):
-                            _buffer_store(
+                            buf_copy_store(
                                 remote_scale_vec_buffer,
                                 (
                                     payload_row * fx.Int32(fz_scale_n_i32)
@@ -1789,13 +1802,13 @@ def emit_dispatch_payload(
                                 // fx.Int32(4),
                                 scale,
                                 fx.Int32,
-                                4,
+                                unit_elems=4,
                             )
                         else:
-                            row_scale_remote = _make_buffer_from_addr(
-                                scale_table[destination], fx.Int32, 4
+                            row_scale_remote = ptr_buf_tensor(
+                                scale_table[destination], fx.Int32, unit_elems=4
                             )
-                            _buffer_store(
+                            buf_copy_store(
                                 row_scale_remote,
                                 (
                                     payload_row * fx.Int32(fz_scale_n_i32)
@@ -1804,7 +1817,7 @@ def emit_dispatch_payload(
                                 // fx.Int32(4),
                                 scale,
                                 fx.Int32,
-                                4,
+                                unit_elems=4,
                             )
                 elif scale_lane < fx.Int32(fz_scale_n_i32):
                     scale = source_scale_buffer[
@@ -1821,24 +1834,24 @@ def emit_dispatch_payload(
                         row_scale_remote[
                             payload_row * fx.Int32(fz_scale_n_i32) + scale_lane
                         ] = scale
-            source_buffer = _make_buffer_from_addr(
+            source_buffer = ptr_buf_tensor(
                 addr_in_tok + fx.Int64(source_token) * fx.Int64(fz_nbytes),
                 fx.Int32,
-                4,
+                unit_elems=4,
             )
             if const_expr(hoist_remote_resources):
-                destination_buffer = _make_buffer_from_addr(
+                destination_buffer = ptr_buf_tensor(
                     token_remote + fx.Int64(payload_row) * fx.Int64(fz_nbytes),
                     fx.Int32,
-                    4,
+                    unit_elems=4,
                 )
             else:
                 row_token_remote = token_table[destination]
-                destination_buffer = _make_buffer_from_addr(
+                destination_buffer = ptr_buf_tensor(
                     row_token_remote
                     + fx.Int64(payload_row) * fx.Int64(fz_nbytes),
                     fx.Int32,
-                    4,
+                    unit_elems=4,
                 )
             _copy_token_row(
                 source_buffer,

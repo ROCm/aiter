@@ -18,14 +18,18 @@ from flydsl.runtime.device import get_rocm_arch
 
 from ..mxfp4_gemm_common import _fabs_f32 as fabs_f32
 from ..mxfp4_gemm_common import lds_typed_ptr, lds_vec_load
-from ..tensor_shim import _preload_compiled, _run_compiled, ptr_buf_tensor
+from ..tensor_shim import (
+    _preload_compiled,
+    _run_compiled,
+    buf_copy_store,
+    ptr_buf_tensor,
+)
 from .gemm2 import (
     _resolve_g2_knobs,
     gemm2_compute_v2,
     issue_a_load_lds_dt,
     kStages,
 )
-from .gemm_util import _buffer_store, _make_buffer_from_addr
 from .mega_moe_stage2 import (
     _fp8_scale_for_leader,
     _stage2_lds_bytes,
@@ -103,10 +107,10 @@ def _pair_routewise_half_scatter(lds_a, lds_b, n_block_idx, wave, lane, *,
                 )
             )
         )
-        payload_buf = _make_buffer_from_addr(
+        payload_buf = ptr_buf_tensor(
             peer_base,
             fx.Int32,
-            ALIGNED_PAIR_SCATTER_VEC // 4,
+            unit_elems=ALIGNED_PAIR_SCATTER_VEC // 4,
             num_records_bytes=comb_inp_nbytes,
         )
         row_base = (dest_lid * fx.Int32(topk) + slot) * fx.Int32(
@@ -177,12 +181,12 @@ def _pair_routewise_half_scatter(lds_a, lds_b, n_block_idx, wave, lane, *,
             row_base + n_block_idx * fx.Int32(BN) + col,
             fx.Int32(comb_inp_nbytes),
         )
-        _buffer_store(
+        buf_copy_store(
             payload_buf,
             payload_off // fx.Int32(ALIGNED_PAIR_SCATTER_VEC),
             payload,
             fx.Int32,
-            ALIGNED_PAIR_SCATTER_VEC // 4,
+            unit_elems=ALIGNED_PAIR_SCATTER_VEC // 4,
             cache_modifier=2,
         )
 
@@ -196,12 +200,12 @@ def _pair_routewise_half_scatter(lds_a, lds_b, n_block_idx, wave, lane, *,
                     + half_lane // fx.Int32(scale_group_lanes),
                     fx.Int32(comb_inp_nbytes),
                 )
-                scale_buf = _make_buffer_from_addr(
+                scale_buf = ptr_buf_tensor(
                     peer_base,
                     fx.Int8,
                     num_records_bytes=comb_inp_nbytes,
                 )
-                _buffer_store(
+                buf_copy_store(
                     scale_buf,
                     scale_off,
                     e8m0.to(fx.Int8),

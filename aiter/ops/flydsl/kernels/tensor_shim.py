@@ -15,6 +15,7 @@ from flydsl._mlir.dialects import fly, llvm
 from flydsl.compiler.protocol import extract_to_ir_values
 from flydsl.expr import ptrtoint, range_constexpr
 from flydsl.expr.typing import T
+from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels import buffer_ops, vector
 
@@ -93,9 +94,43 @@ def ptr_buf_tensor(
     return fx.rocdl.make_buffer_tensor(view, num_records_bytes=num_records_bytes)
 
 
-def buf_copy_atom(unit_bytes, elem=fx.Int32):
+def buf_copy_atom(unit_bytes, elem=fx.Int32, cache_modifier=0):
     """Copy atom for a ``unit_bytes``-wide buffer access."""
-    return fx.make_copy_atom(_BUF_COPY_ATOM[unit_bytes](), elem)
+    return fx.make_copy_atom(_BUF_COPY_ATOM[unit_bytes](cache_modifier), elem)
+
+
+def _buf_copy_slice(buffer, index, unit_elems):
+    if unit_elems == 1:
+        grouped = fx.logical_divide(buffer, fx.make_layout(1, 1))
+        return fx.slice(grouped, (None, index))
+    return fx.slice(buffer, (index, None))
+
+
+def buf_copy_load(buffer, index, elem=fx.Int32, unit_elems=1, cache_modifier=0):
+    """Load one vector unit, preserving an explicit buffer cache policy."""
+    fragment = fx.make_rmem_tensor(unit_elems, elem)
+    fx.copy(
+        buf_copy_atom(
+            unit_elems * (elem.width // 8), elem, cache_modifier=cache_modifier
+        ),
+        _buf_copy_slice(buffer, index, unit_elems),
+        fragment,
+    )
+    value = Vec(fragment.load())
+    return value[0] if unit_elems == 1 else value
+
+
+def buf_copy_store(buffer, index, value, elem=fx.Int32, unit_elems=1, cache_modifier=0):
+    """Store one vector unit, preserving an explicit buffer cache policy."""
+    fragment = fx.make_rmem_tensor(unit_elems, elem)
+    fragment.store(Vec.from_elements([value], elem) if unit_elems == 1 else Vec(value))
+    fx.copy(
+        buf_copy_atom(
+            unit_elems * (elem.width // 8), elem, cache_modifier=cache_modifier
+        ),
+        fragment,
+        _buf_copy_slice(buffer, index, unit_elems),
+    )
 
 
 def ptr_arg(t: torch.Tensor, dtype=None):

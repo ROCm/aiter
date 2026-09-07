@@ -14,7 +14,6 @@ from flydsl.runtime.device import get_rocm_arch
 from .. import communication_ops_utils as comm_ops
 from ..tensor_shim import _preload_compiled, _run_compiled, ptr_buf_tensor
 from .dispatch import DispatchSlot, emit_dispatch_group, emit_dispatch_plan
-from .gemm_util import _buffer_load, _buffer_store, _make_buffer_from_addr
 from .quant import emit_per_1x32_mx_fp8_group
 
 
@@ -94,10 +93,10 @@ def compile_mega_moe_prepare(
         ticket_scratch = fx.recast_iter(fx.Int64, lds.ticket.ptr)
         count_scratch = lds.count_scratch.ptr
         ticket_view = fx.make_view(ticket_scratch, fx.make_layout(1, 1))
-        disp_rsrc = _make_buffer_from_addr(addr_disp, fx.Int64)
+        disp_rsrc = ptr_buf_tensor(addr_disp, fx.Int64)
 
         def disp_ptr(slot):
-            return _buffer_load(disp_rsrc, fx.Int32(int(slot)), fx.Int64)
+            return disp_rsrc[fx.Int32(int(slot))]
 
         entry_slot = prepare_blocks * (quant_cu_capacity + 1) + quant_blocks
         entry_count = disp_ptr(DispatchSlot.PREP_ENTRY_COUNT) + fx.Int64(entry_slot * 8)
@@ -164,22 +163,17 @@ def compile_mega_moe_prepare(
                     comm_ops.fence_system_release()
                 fx.barrier()
                 if tid == fx.Int32(0):
-                    work_head_rsrc = _make_buffer_from_addr(work_head, fx.Int32)
+                    work_head_rsrc = ptr_buf_tensor(work_head, fx.Int32)
                     for work_shard in range(8):
-                        _buffer_store(
-                            work_head_rsrc,
-                            fx.Int32(work_shard * 16),
-                            fx.Int32(0),
-                            fx.Int32,
-                        )
+                        work_head_rsrc[fx.Int32(work_shard * 16)] = fx.Int32(0)
                     comm_ops.store_i32_system(work_tail, fx.Int32(0), fx.Int32(0))
                     # Payload publishers reserve queue slots with a system-scope
                     # atomic.  Reset the tail in that same coherence domain so a
                     # layout transition cannot append after the previous epoch.
                     comm_ops.store_i32_system(ready_tile_tail, next_parity, fx.Int32(0))
-                hist_rsrc = _make_buffer_from_addr(local_hist, fx.Int32)
+                hist_rsrc = ptr_buf_tensor(local_hist, fx.Int32)
                 for segment in range(tid, total_segments, block_threads):
-                    _buffer_store(hist_rsrc, segment, fx.Int32(0), fx.Int32)
+                    hist_rsrc[segment] = fx.Int32(0)
                 fx.rocdl.s_waitcnt(0)
                 fx.barrier()
                 if tid == fx.Int32(0):

@@ -15,7 +15,12 @@ from ..mxfp4_gemm_common import (
     lds_typed_ptr,
     lds_vec_load,
 )
-from ..tensor_shim import _preload_compiled, _run_compiled, ptr_buf_tensor
+from ..tensor_shim import (
+    _preload_compiled,
+    _run_compiled,
+    buf_copy_store,
+    ptr_buf_tensor,
+)
 
 from .gemm2 import (
     _resolve_g2_knobs,
@@ -24,7 +29,6 @@ from .gemm2 import (
     issue_a_load_lds_dt,
     kStages,
 )
-from .gemm_util import _buffer_store, _make_buffer_from_addr
 
 _BUFFER_OFFSET_ABI_BYTES = 1 << 31
 
@@ -222,18 +226,18 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
             )
             # Adjacent active lanes issue contiguous 8-byte stores without ds_bpermute gathers.
             payload_words = scatter_vec // 4
-            payload_buf = _make_buffer_from_addr(
+            payload_buf = ptr_buf_tensor(
                 peer_base,
                 fx.Int32,
-                payload_words,
+                unit_elems=payload_words,
                 num_records_bytes=comb_inp_nbytes,
             )
-            _buffer_store(
+            buf_copy_store(
                 payload_buf,
                 payload_off // fx.Int32(scatter_vec),
                 payload,
                 fx.Int32,
-                payload_words,
+                unit_elems=payload_words,
                 cache_modifier=2,
             )
 
@@ -247,12 +251,12 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
                         + lane // fx.Int32(scale_group_lanes),
                         fx.Int32(comb_inp_nbytes),
                     )
-                    scale_buf = _make_buffer_from_addr(
+                    scale_buf = ptr_buf_tensor(
                         peer_base,
                         fx.Int8,
                         num_records_bytes=comb_inp_nbytes,
                     )
-                    _buffer_store(
+                    buf_copy_store(
                         scale_buf,
                         scale_off,
                         e8m0.to(fx.Int8),
@@ -266,18 +270,18 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
                 row_off + col * fx.Int32(out_elem_bytes),
                 fx.Int32(comb_inp_nbytes),
             )
-            output_buf = _make_buffer_from_addr(
+            output_buf = ptr_buf_tensor(
                 peer_base,
                 fx.BFloat16,
-                scatter_vec,
+                unit_elems=scatter_vec,
                 num_records_bytes=comb_inp_nbytes,
             )
-            _buffer_store(
+            buf_copy_store(
                 output_buf,
                 off // fx.Int32(scatter_vec * 2),
                 pk,
                 fx.BFloat16,
-                scatter_vec,
+                unit_elems=scatter_vec,
                 cache_modifier=2,
             )
 
