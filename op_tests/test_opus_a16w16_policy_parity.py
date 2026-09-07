@@ -19,16 +19,8 @@ from csrc.opus_gemm.opus_gemm_common import (
     get_kernel_instance,
 )
 
-# These are literal control-flow translations of the three headers at the
-# pre-PR merge base. Keep this reference independent of policy.py.
-_PRE_PR_REF = "ded4e3e8eee11f56853054c4ed4bdf2790545e5d"
-_PRE_PR_HEADERS = {
-    "gfx950": "4c8f03542e4459b51a17c0bd9fe224533af0c594",
-    "gfx942": "7906b9ba0e32a1c89d0752961f321fb9b6c26dd9",
-    "gfx1250": "ff4b83daa5e074d8cc2ebdc3c29e1d8cfaa8e02c",
-}
 
-
+# Keep the original C++ heuristic reference independent of policy.py.
 def _pre_pr_gfx950(M: int, N: int, K: int, has_bias: bool, _output: str) -> int:
     split_barrier_ok = N % 16 == 0 and K % 64 == 0 and (K // 64) % 2 == 0
     if M <= 4:
@@ -194,10 +186,7 @@ def test_python_heuristics_match_pre_pr_cpp_boundary_sweep():
             break
 
     assert checked > 500_000
-    assert not mismatches, (
-        f"Python heuristic differs from pre-PR {_PRE_PR_REF} header blobs "
-        f"{_PRE_PR_HEADERS}: {mismatches}"
-    )
+    assert not mismatches, f"Python heuristic differs from C++ reference: {mismatches}"
 
 
 @cache
