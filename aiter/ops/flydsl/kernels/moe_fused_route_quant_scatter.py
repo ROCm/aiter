@@ -1648,8 +1648,8 @@ def build_moe_fused_route_psum_quant_scatter_module(
 
     A single persistent grid (``num_workers`` resident workgroups) runs three
     phases separated by a hand-rolled grid-wide barrier (FlyDSL has no
-    ``grid.sync`` / cooperative launch; this mirrors the global-atomic spin in
-    ``splitk_hgemm.py``). Each worker owns a strided slice of the
+    ``grid.sync`` / cooperative launch; this uses a global-atomic spin
+    protocol). Each worker owns a strided slice of the
     ``numel = token_num*topk`` routes (warp-per-route, ``stride =
     num_workers*warps_per_block``):
 
