@@ -36,9 +36,20 @@ AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE = bool(
 )
 
 
-def ptr_rsrc(ptr):
-    """Convert an fx.Pointer kernel arg to a buffer resource for buffer_load/store."""
-    return buffer_ops.create_buffer_resource_from_addr(fx.Int64(ptrtoint(ptr)))
+def ptr_rsrc(ptr, num_records_bytes=None):
+    """Convert an fx.Pointer kernel arg to a buffer resource for buffer_load/store.
+
+    ``num_records_bytes`` may be a runtime value, for a hardware OOB check that
+    zero-fills rather than reading stale bytes.
+    """
+    return buffer_ops.create_buffer_resource_from_addr(
+        fx.Int64(ptrtoint(ptr)), num_records_bytes=num_records_bytes
+    )
+
+
+def buf_load_scalar(rsrc, dword_index, dwords=4):
+    """Uniform load of ``dwords`` dwords from *rsrc*, landing directly in SGPRs."""
+    return buffer_ops.buffer_load(rsrc, dword_index, vec_width=dwords, is_scalar=True)
 
 
 _BUF_COPY_ATOM = {

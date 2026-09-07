@@ -75,7 +75,7 @@ def _rope_row_to_lds(src, src_dword, lds_base, lds_offset):
     _llvm.inline_asm(
         None, [], "s_wait_alu depctr_va_vdst(0)", "", has_side_effects=True
     )
-    rocdl.global_load_async_to_lds_b128(gptr, lds_ptr, 0, 0)
+    rocdl.global_load_async_to_lds_b128(gptr, lds_ptr, 0)
     rocdl.sched_barrier(0)
 
 
@@ -134,10 +134,7 @@ def launch_mla_pagesize64_fp8_fp8(
         q_t = ptr_buf_tensor(ptr_q, fx.Int32, unit_elems=4)
         q_atom = buf_copy_atom(16)
         q_frag = fx.make_fragment_like(fx.slice(q_t, (0, None)))
-        # Batch metadata and page ids are wave-uniform and feed scalar state --
-        # loop bounds and the TDM page base -- so they take the SMEM path. A
-        # vector load would land them in VGPRs and force a readfirstlane before
-        # the descriptor can use them.
+
         kv_indptr_rsrc = ptr_rsrc(kv_indptr)
         kv_page_indices_rsrc = ptr_rsrc(kv_page_indices)
         kv_last_page_lens_rsrc = ptr_rsrc(kv_last_page_lens)

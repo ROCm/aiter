@@ -6,8 +6,9 @@ import flydsl.expr as fx
 import torch
 from flydsl.runtime.device import get_rocm_arch
 
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+
 from .kernels.tensor_shim import ptr_arg
-from .utils import addressable_lds_bytes_for_gfx
 
 __all__ = [
     "flydsl_mla_decode_fwd",
@@ -84,9 +85,7 @@ def _validate_pagesize1_inputs(
 
     properties = torch.cuda.get_device_properties(q.device)
     lds_size = getattr(properties, "shared_memory_per_multiprocessor", None)
-    lds_size = (
-        int(lds_size) if lds_size is not None else addressable_lds_bytes_for_gfx(arch)
-    )
+    lds_size = int(lds_size) if lds_size is not None else get_lds_capacity_bytes(arch)
     return work_indptr.numel() - 1, lds_size, softmax_scale
 
 
