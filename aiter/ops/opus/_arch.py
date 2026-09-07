@@ -23,10 +23,11 @@ failure mode:
 
 Detection order (shared by both helpers):
 
-1. ``GPU_ARCHS`` env var (split on ``';'``). Skips the special
-   ``'native'`` token. This path covers build-only hosts (no GPU) and
-   CI workflows that pin GPU_ARCHS explicitly.
-2. ``GPU_ARCHS=native`` (default) -> probe ``rocminfo`` via
+1. ``AITER_GPU_TARGETS`` when set, otherwise ``GPU_ARCHS``. The former is
+   authoritative for compilation and must not be unioned with a conflicting
+   legacy value. This path covers build-only hosts (no GPU) and CI workflows
+   that pin their targets explicitly.
+2. Neither names an arch -> probe ``rocminfo`` via
    ``aiter.jit.utils.chip_info.get_gfx_runtime``.
 3. ``rocminfo`` unavailable (no GPU / CPU host) -> log debug and treat
    as "unknown"; the host-side dispatcher in ``opus_gemm.cu`` catches
@@ -63,21 +64,36 @@ def _detect_arch(
     supported_set = {a.lower() for a in supported}
 
     gpu_archs_env = os.getenv("GPU_ARCHS", "native").strip()
-    explicit_archs = [
-        a.strip().lower()
-        for a in gpu_archs_env.split(";")
-        if a.strip() and a.strip() != "native"
-    ]
-    # Path 1: GPU_ARCHS lists explicit arch(es). Use that as the source of
+    named = os.getenv("AITER_GPU_TARGETS", "").strip()
+    try:
+        from aiter.jit.utils.build_targets import get_build_archs_env
+
+        target_archs = get_build_archs_env()
+    except Exception as e:  # noqa: BLE001
+        logger.debug("opus: could not read AITER_GPU_TARGETS (%s)", e)
+        # A malformed authoritative target must not silently fall back to a
+        # conflicting GPU_ARCHS value and expose code that was never compiled.
+        return False, named or None
+
+    if target_archs is not None:
+        explicit_archs = list(target_archs)
+    else:
+        explicit_archs = [
+            a.strip().lower()
+            for a in gpu_archs_env.split(";")
+            if a.strip() and a.strip() != "native"
+        ]
+
+    # Path 1: the build named its arch(es) explicitly. Use that as the source of
     # truth -- handles build-only hosts and multi-arch wheel scenarios where
     # ``rocminfo`` cannot tell us which arch the wheel was built for.
     if explicit_archs:
         match = next((a for a in explicit_archs if a in supported_set), None)
         if match is not None:
             return True, match
-        return False, gpu_archs_env
+        return False, named if target_archs is not None else gpu_archs_env
 
-    # Path 2: GPU_ARCHS='native' (default). Probe rocminfo.
+    # Path 2: nothing named. Probe rocminfo.
     try:
         from aiter.jit.utils.chip_info import get_gfx_runtime
 

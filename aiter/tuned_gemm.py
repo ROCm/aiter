@@ -30,7 +30,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gemm_op_common import get_padded_m
 
 try:
-    from aiter.ops.opus.gemm_op_a16w16 import opus_gemm_a16w16_tune as _opus_tune
+    from aiter.ops.opus.gemm_op_a16w16 import try_opus_gemm_a16w16_tune as _opus_tune
 except Exception:  # noqa: BLE001  blanket catch is intentional here
     _opus_tune = None
 
@@ -557,14 +557,26 @@ def opus_gemm(
     # The split-K workspace (if any) is allocated capture-safely inside
     # opus_gemm_a16w16_tune -> _get_opus_workspace; no eager pre-warm needed.
     Y = torch.empty(m, n, dtype=otype or inp.dtype, device=inp.device)
-    _opus_tune(
+    if not _opus_tune(
         inp.unsqueeze(0),
         weights.unsqueeze(0),
         Y.unsqueeze(0),
         bias=bias,
         kernelId=int(solidx),
         splitK=splitK,
-    )
+    ):
+        return torch_gemm(
+            inp,
+            weights,
+            solidx,
+            bias,
+            otype,
+            scale_a,
+            scale_b,
+            scale_c,
+            bpreshuffle,
+            config,
+        )
     # NOTE: do NOT add bias again here -- the opus splitk reduce kernel already
     # folds `bias` into the fp32 accumulator before the bf16/fp32 cast (HAS_BIAS
     # path). The previous `Y = Y + bias` double-counted bias (output = A@B^T +

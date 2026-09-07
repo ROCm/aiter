@@ -17,7 +17,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$SCRIPT_DIR"
 
 HIPCC="${HIPCC:-hipcc}"
-CXXFLAGS="-std=c++17 -O2 -Wall -Wextra -I${REPO_ROOT}/csrc/include"
+CXXFLAGS="-std=c++17 -O2 -Wall -Wextra -I${REPO_ROOT}/csrc/include -I${REPO_ROOT}/csrc/opus_gemm/include"
 
 # Bare hipcc does not always bake an rpath for the HIP runtime (e.g. the ROCm
 # python-SDK layout in newer rocm/pytorch images), and ld.so.conf may not cover

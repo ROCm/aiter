@@ -30,6 +30,7 @@ import os
 import sys
 import tempfile
 import textwrap
+from unittest import mock
 
 # Ensure the repo-local aiter is imported, not any system/site-packages install.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -232,6 +233,209 @@ def test_get_build_targets():
 # ---------------------------------------------------------------------------
 # Section 2: gen_instances filter — uses filter_tune_df from build_targets
 # ---------------------------------------------------------------------------
+
+
+def test_opus_bakes_both_skus():
+    _section("1a. opus gen_instances — bakes every named (gfx, cu_num)")
+
+    opus_dir = os.path.join(_REPO_ROOT, "csrc", "opus_gemm")
+    if not os.path.isdir(opus_dir):
+        print("  SKIP  csrc/opus_gemm not present")
+        return
+
+    orig_path = list(sys.path)
+    orig_modules = set(sys.modules)
+    orig_env = {
+        k: os.environ.pop(k, None) for k in ("AITER_GPU_TARGETS", "GPU_ARCHS", "CU_NUM")
+    }
+    tmp_name = None
+    legacy_tmp_name = None
+    try:
+        sys.path.insert(0, opus_dir)
+        try:
+            import gen_instances as opus
+        except Exception as e:  # noqa: BLE001
+            print(f"  SKIP  opus gen_instances not importable ({e})")
+            return
+
+        # Both SKUs use the SAME (M, N, K) and different kernels: that is the
+        # case a cu_num-less key silently collapses to one winner.
+        kids = sorted(opus.kernels_list)
+        eligible = [
+            k
+            for k in kids
+            if opus.kernels_list[k].kernel_tag in opus.A16W16_TUNE_TAGS
+            and "bf16_t" in opus.kernels_list[k].output_dtypes
+        ]
+        if not eligible:
+            print("  SKIP  no bf16 a16w16 kernels registered")
+            return
+        arch = opus._kid_arch_common(opus.kernels_list[eligible[0]])
+        same_arch = [
+            k for k in eligible if opus._kid_arch_common(opus.kernels_list[k]) == arch
+        ]
+        if len(same_arch) < 2:
+            print(f"  SKIP  fewer than two bf16 a16w16 {arch} kernels registered")
+            return
+        kid_256, kid_128 = same_arch[0], same_arch[1]
+        # Keep the same CU as an on-target row so a broken CU-only filter cannot
+        # accidentally make this assertion pass.
+        off_arch = next(
+            (
+                k
+                for k in eligible
+                if opus._kid_arch_common(opus.kernels_list[k]) != arch
+            ),
+            None,
+        )
+
+        with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False) as tmp:
+            tmp_name = tmp.name
+        rows = {
+            "gfx": [arch, arch],
+            "cu_num": [256, 128],
+            "M": [1, 1],
+            "N": [8, 8],
+            "K": [16, 16],
+            "outdtype": ["torch.bfloat16", "torch.bfloat16"],
+            "libtype": ["opus", "opus"],
+            "solidx": [kid_256, kid_128],
+        }
+        if off_arch is not None:
+            rows["gfx"].append(opus._kid_arch_common(opus.kernels_list[off_arch]))
+            rows["cu_num"].append(128)
+            rows["M"].append(3)
+            rows["N"].append(8)
+            rows["K"].append(16)
+            rows["outdtype"].append("torch.bfloat16")
+            rows["libtype"].append("opus")
+            rows["solidx"].append(off_arch)
+        pd.DataFrame(rows).to_csv(tmp_name, index=False)
+
+        compile_kids = opus._collect_csv_kids([tmp_name], [(arch, 128)])
+        _check(
+            "production OPUS compile set excludes off-CU and off-gfx kids",
+            compile_kids == {kid_128},
+            str(sorted(compile_kids)),
+        )
+
+        os.environ["AITER_GPU_TARGETS"] = f"{arch}:128;{arch}:256"
+        d = opus.get_tune_dict(tmp_name)
+        baked = {
+            (k[0], k[5]): v.name
+            for k, v in d.items()
+            if isinstance(k, tuple) and k[0] > 0
+        }
+        _check(
+            f"AITER_GPU_TARGETS={arch}:128;{arch}:256 keeps both SKUs of one shape",
+            {(1, 128), (1, 256)} <= set(baked),
+            str(sorted(baked)),
+        )
+        _check(
+            "the two SKUs keep their own winner",
+            baked.get((1, 256)) == opus.kernels_list[kid_256].name
+            and baked.get((1, 128)) == opus.kernels_list[kid_128].name,
+            str(sorted(baked.items())),
+        )
+        with tempfile.TemporaryDirectory() as out_dir:
+            opus.opus_gemm_codegen(out_dir).gen_lookup_dict(d)
+            lookup = os.path.join(out_dir, "opus_gemm_lookup.h")
+            with open(lookup) as f:
+                generated = f.read()
+        _check(
+            "generated a16w16 lookup retains both CU-specific entries",
+            "{1, 8, 16, 128}" in generated and "{1, 8, 16, 256}" in generated,
+        )
+        _check(
+            "generated a16w16 lookup retains each CU's winner",
+            opus.kernels_list[kid_128].name in generated
+            and opus.kernels_list[kid_256].name in generated,
+        )
+        if off_arch is not None:
+            _check(
+                "off-target row is dropped",
+                not any(m == 3 for m, _ in baked),
+                str(sorted(baked)),
+            )
+
+        os.environ["AITER_GPU_TARGETS"] = f"{arch}:128"
+        d = opus.get_tune_dict(tmp_name)
+        cus = {k[5] for k in d if isinstance(k, tuple) and k[0] > 0}
+        _check(
+            f"AITER_GPU_TARGETS={arch}:128 bakes only the 128-CU row",
+            cus == {128},
+            str(sorted(cus)),
+        )
+
+        # A target with no rows must not raise, and must not smuggle others in.
+        os.environ["AITER_GPU_TARGETS"] = f"{arch}:64"
+        d = opus.get_tune_dict(tmp_name)
+        _check(
+            "a target with no tuned rows bakes nothing",
+            not any(isinstance(k, tuple) and k[0] > 0 for k in d),
+            str(sorted(k for k in d if isinstance(k, tuple))),
+        )
+
+        # Legacy rows without cu_num remain shape fallbacks (CU=0) instead of
+        # failing during target filtering.
+        with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False) as tmp:
+            legacy_tmp_name = tmp.name
+        pd.DataFrame(
+            {
+                "gfx": [arch, arch],
+                "cu_num": [128, None],
+                "M": [2, 1],
+                "N": [8, 8],
+                "K": [16, 16],
+                "outdtype": ["torch.bfloat16", None],
+                "solidx": [kid_256, kid_128],
+            }
+        ).to_csv(legacy_tmp_name, index=False)
+        os.environ["AITER_GPU_TARGETS"] = f"{arch}:128"
+        d = opus.get_tune_dict(legacy_tmp_name)
+        legacy_keys = [k for k in d if isinstance(k, tuple) and k[0] > 0]
+        _check(
+            "mixed-schema opus CSV retains exact and CU=0 fallback rows",
+            {k[5] for k in legacy_keys} == {0, 128},
+            str(legacy_keys),
+        )
+        with (
+            mock.patch.object(
+                opus,
+                "get_build_targets",
+                side_effect=RuntimeError("no GPU or target"),
+            ),
+            mock.patch.object(opus, "has_named_targets", return_value=False),
+        ):
+            d = opus.get_tune_dict(legacy_tmp_name)
+        _check(
+            "GPU-less mixed-schema opus generation accepts NaN cu_num",
+            len([k for k in d if isinstance(k, tuple) and k[0] > 0]) == 2,
+        )
+
+        for bad in (f"{arch}:abc", "gfx955", f"{arch}:0"):
+            os.environ["AITER_GPU_TARGETS"] = bad
+            raised = False
+            try:
+                opus.get_tune_dict(tmp_name)
+            except RuntimeError:
+                raised = True
+            _check(f"AITER_GPU_TARGETS={bad} → RuntimeError", raised)
+    finally:
+        if tmp_name is not None:
+            os.unlink(tmp_name)
+        if legacy_tmp_name is not None:
+            os.unlink(legacy_tmp_name)
+        for name, val in orig_env.items():
+            if val is not None:
+                os.environ[name] = val
+            else:
+                os.environ.pop(name, None)
+        # csrc/*_gemm_*/ each ship their own gen_instances.py / codegen package;
+        # leaving this one on sys.path shadows the others for the rest of the run.
+        sys.path[:] = orig_path
+        for name in set(sys.modules) - orig_modules:
+            del sys.modules[name]
 
 
 def test_gen_instances_filter(
@@ -1027,13 +1231,159 @@ def test_unmatched_targets():
     )
 
 
+def test_opus_serving_degrades_to_default():
+    _section("1f. opus serving survives a missing row and an unknown kernel id")
+
+    import aiter.ops.opus.gemm_op_a16w16 as g
+
+    orig_lookup = g._opus_common.lookup_tuned
+    orig_tune = g.opus_gemm_a16w16_tune
+    orig_dispatch = g._opus_gemm_bf16_dispatch
+    orig_bad = set(g._UNBAKED_KIDS)
+    calls = {"tune": 0, "heuristic": 0}
+
+    def fake_tune(*_a, **_k):
+        calls["tune"] += 1
+        raise RuntimeError(
+            "[AITER] Kernel id 999999 not found in a16w16 bf16 tune lookup table"
+        )
+
+    def fake_dispatch(*_a, **_k):
+        calls["heuristic"] += 1
+
+    try:
+        g._UNBAKED_KIDS.clear()
+        g.opus_gemm_a16w16_tune = fake_tune
+        g._opus_gemm_bf16_dispatch = fake_dispatch
+        import torch
+
+        A = torch.zeros(16, 64, dtype=torch.bfloat16)
+        B = torch.zeros(64, 64, dtype=torch.bfloat16)
+
+        # A tuned row naming a kid this build does not contain must not escape.
+        g._opus_common.lookup_tuned = lambda **_k: {
+            "solidx": 999999,
+            "splitK": 0,
+            "kernelName": "ghost",
+        }
+        g.gemm_a16w16_opus(A, B)
+        _check(
+            "unknown kernel id falls back to the default kernel",
+            calls["tune"] == 1 and calls["heuristic"] == 1,
+            str(calls),
+        )
+
+        # The miss is remembered, so a serving loop stops paying for it.
+        g.gemm_a16w16_opus(A, B)
+        _check(
+            "the unavailable id is not retried on the next call",
+            calls["tune"] == 1 and calls["heuristic"] == 2,
+            str(calls),
+        )
+
+        # No row at all for this target is the ordinary miss path.
+        g._opus_common.lookup_tuned = lambda **_k: None
+        g.gemm_a16w16_opus(A, B)
+        _check(
+            "a missing tuned row falls back to the default kernel",
+            calls["tune"] == 1 and calls["heuristic"] == 3,
+            str(calls),
+        )
+
+        g._UNBAKED_KIDS.clear()
+        g.opus_gemm_a16w16_tune = lambda *_a, **_k: (_ for _ in ()).throw(
+            RuntimeError("HIP out of memory")
+        )
+        g._opus_common.lookup_tuned = lambda **_k: {
+            "solidx": 7,
+            "splitK": 0,
+            "kernelName": "oom",
+        }
+        raised = False
+        try:
+            g.gemm_a16w16_opus(A, B)
+        except RuntimeError:
+            raised = True
+        _check(
+            "an unrelated RuntimeError is not swallowed as an unbaked kid",
+            raised and (7, 0) not in g._UNBAKED_KIDS,
+            f"raised={raised} memo={g._UNBAKED_KIDS}",
+        )
+    finally:
+        g._opus_common.lookup_tuned = orig_lookup
+        g.opus_gemm_a16w16_tune = orig_tune
+        g._opus_gemm_bf16_dispatch = orig_dispatch
+        g._UNBAKED_KIDS.clear()
+        g._UNBAKED_KIDS.update(orig_bad)
+
+
+def test_tuned_gemm_opus_degrades_to_default():
+    _section("1g. tuned_gemm's opus route survives an unknown kernel id")
+
+    import torch
+
+    import aiter.ops.opus.gemm_op_a16w16 as g
+    import aiter.tuned_gemm as tg
+
+    orig_tune = g.opus_gemm_a16w16_tune
+    orig_torch = tg.torch_gemm
+    orig_bad = set(g._UNBAKED_KIDS)
+    calls = {"tune": 0, "torch": 0}
+
+    def fake_tune(*_a, **_k):
+        calls["tune"] += 1
+        raise RuntimeError(
+            "[AITER] Kernel id 999999 not found in a16w16 bf16 tune lookup table"
+        )
+
+    def fake_torch(inp, weights, *_a, **_k):
+        calls["torch"] += 1
+        return torch.zeros(
+            inp.shape[0], weights.shape[0], dtype=inp.dtype, device=inp.device
+        )
+
+    try:
+        g._UNBAKED_KIDS.clear()
+        g.opus_gemm_a16w16_tune = fake_tune
+        tg.torch_gemm = fake_torch
+        _check(
+            "tuned_gemm routes opus through the guarded entry point",
+            tg._opus_tune is g.try_opus_gemm_a16w16_tune,
+            str(tg._opus_tune),
+        )
+
+        A = torch.zeros(16, 64, dtype=torch.bfloat16)
+        B = torch.zeros(64, 64, dtype=torch.bfloat16)
+        out = tg.opus_gemm(A, B, 999999)
+        _check(
+            "an unknown kernel id does not escape tuned_gemm.opus_gemm",
+            calls["tune"] == 1 and calls["torch"] == 1 and out.shape == (16, 64),
+            str(calls),
+        )
+
+        tg.opus_gemm(A, B, 999999)
+        _check(
+            "the unbaked id is not retried on the next call",
+            calls["tune"] == 1 and calls["torch"] == 2,
+            str(calls),
+        )
+    finally:
+        g.opus_gemm_a16w16_tune = orig_tune
+        tg.torch_gemm = orig_torch
+        g._UNBAKED_KIDS.clear()
+        g._UNBAKED_KIDS.update(orig_bad)
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     test_get_build_targets()
+    test_opus_bakes_both_skus()
     test_unmatched_targets()
+    test_opus_serving_degrades_to_default()
+    test_tuned_gemm_opus_degrades_to_default()
     test_gen_instances_filter(
         csv_path=REPRO_CSV,
         target_a=TARGET_C,

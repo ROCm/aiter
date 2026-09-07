@@ -9,10 +9,11 @@
 //
 // Every gfx1250 kid is a split-K kid whose main kernel writes an fp32 workspace
 // (output_dtypes = ["fp32_t"]); the reduce kernel casts the partials to the
-// runtime Y dtype (bf16/fp32) and folds bias. So all dispatch resolves through
-// the <fp32_t> tune table -- the <bf16_t> specializations exist only to satisfy
-// the shared arch-router template instantiation and are never invoked for
-// gfx1250 (opus_gemm.cu forces <fp32_t> for split-K kids).
+// runtime Y dtype (bf16/fp32) and folds bias. The runtime table follows Y dtype;
+// the template slot on each entry is the kid's split-K PARTIAL type, taken from
+// its splitk_workspace_dtype, so which table an entry lands in does not change
+// how it is instantiated. The heuristic fallback resolves through the <fp32_t>
+// tune table, whose slot is a real dtype.
 //
 // Included exactly once, by opus_gemm.cu. Self-contained: the shared flat-array
 // dispatch types live in opus_gfx1250_detail (opus_gemm_heuristic_dispatch_
@@ -102,25 +103,27 @@ opus_a16w16_co_tune_dispatch_gfx1250(int id)
 // (M, N, K) -> pre-compiled kernel, nullptr on miss. No heuristic fallback: the
 // shape heuristic never returns a .co kid, so a miss just means "this shape has
 // no tuned .co winner" and the caller carries on with the split-K path.
+// allow_fallback has no default, unlike opus_lookup_find: this table is consulted
+// both before and after the exact-CU split-K tables, and only the second consult
+// may resolve a shape through a count-less row.
 inline opus_gfx1250_detail::OpusA16W16CoKernel
-opus_a16w16_co_dispatch_gfx1250(int M, int N, int K)
+opus_a16w16_co_dispatch_gfx1250(int M, int N, int K, bool allow_fallback)
 {
     using namespace opus_gfx1250_detail;
     static constexpr OpusA16W16CoRuntimeEntry kLookup[] = {
         GENERATE_OPUS_LOOKUP_TABLE_CO_GFX1250()
     };
     constexpr size_t kSize = sizeof(kLookup) / sizeof(kLookup[0]);
-    OpusA16W16CoRuntimeEntry needle{{M, N, K}, nullptr};
-    auto it = std::lower_bound(kLookup, kLookup + kSize, needle,
-                               shape_entry_less<OpusA16W16CoRuntimeEntry>);
-    if (it != kLookup + kSize && shape_entry_eq(*it, needle))
-        return it->func;
+    if (auto* e = opus_lookup_find(kLookup, kLookup + kSize, M, N, K,
+                                   opus_get_device_cu_num(),
+                                   allow_fallback))
+        return e->func;
     return nullptr;
 }
 
 // ── a16w16 runtime dispatch (tuned lookup -> heuristic fallback) ────────────
-// Both dtype specializations route split-K kids through the <fp32_t> tune
-// table (the launcher's reduce kernel produces the requested Y dtype).
+// Both output-dtype tables store <fp32_t> split-K launchers; the reduce kernel
+// produces the requested Y dtype.
 
 namespace opus_gfx1250_detail
 {
@@ -157,20 +160,46 @@ template <typename CDataType>
 inline opus_gfx1250_detail::OpusA16W16NoscaleKernel
 opus_dispatch_a16w16_gfx1250(int M, int N, int K, int batch, bool has_bias = false);
 
+template <typename CDataType>
+inline opus_gfx1250_detail::OpusA16W16NoscaleKernel
+opus_lookup_a16w16_gfx1250(int M, int N, int K, bool allow_fallback = true);
+
 template <>
 inline opus_gfx1250_detail::OpusA16W16NoscaleKernel
-opus_dispatch_a16w16_gfx1250<bf16_t>(int M, int N, int K, int batch, bool has_bias)
+opus_lookup_a16w16_gfx1250<bf16_t>(int M, int N, int K, bool allow_fallback)
 {
     using namespace opus_gfx1250_detail;
     static constexpr OpusA16W16RuntimeEntry kLookup[] = {
         GENERATE_OPUS_LOOKUP_TABLE_BF16_GFX1250(bf16_t)
     };
     constexpr size_t kSize = sizeof(kLookup) / sizeof(kLookup[0]);
-    OpusA16W16RuntimeEntry needle{{M, N, K}, nullptr};
-    auto it = std::lower_bound(kLookup, kLookup + kSize, needle,
-                               shape_entry_less<OpusA16W16RuntimeEntry>);
-    if (it != kLookup + kSize && shape_entry_eq(*it, needle))
-        return it->func;
+    if (auto* e = opus_lookup_find(kLookup, kLookup + kSize, M, N, K,
+                                   opus_get_device_cu_num(), allow_fallback))
+        return e->func;
+    return nullptr;
+}
+
+template <>
+inline opus_gfx1250_detail::OpusA16W16NoscaleKernel
+opus_lookup_a16w16_gfx1250<fp32_t>(int M, int N, int K, bool allow_fallback)
+{
+    using namespace opus_gfx1250_detail;
+    static constexpr OpusA16W16RuntimeEntry kLookup[] = {
+        GENERATE_OPUS_LOOKUP_TABLE_FP32_GFX1250(fp32_t)
+    };
+    constexpr size_t kSize = sizeof(kLookup) / sizeof(kLookup[0]);
+    if (auto* e = opus_lookup_find(kLookup, kLookup + kSize, M, N, K,
+                                   opus_get_device_cu_num(), allow_fallback))
+        return e->func;
+    return nullptr;
+}
+
+template <>
+inline opus_gfx1250_detail::OpusA16W16NoscaleKernel
+opus_dispatch_a16w16_gfx1250<bf16_t>(int M, int N, int K, int batch, bool has_bias)
+{
+    if (auto fn = opus_lookup_a16w16_gfx1250<bf16_t>(M, N, K))
+        return fn;
     (void)batch;
     opus_gfx1250_detail::check_shape_4g(M, N, K, sizeof(bf16_t));
     opus_gfx1250_detail::check_shape_reduce_grid(M);
@@ -182,16 +211,8 @@ template <>
 inline opus_gfx1250_detail::OpusA16W16NoscaleKernel
 opus_dispatch_a16w16_gfx1250<fp32_t>(int M, int N, int K, int batch, bool has_bias)
 {
-    using namespace opus_gfx1250_detail;
-    static constexpr OpusA16W16RuntimeEntry kLookup[] = {
-        GENERATE_OPUS_LOOKUP_TABLE_FP32_GFX1250(fp32_t)
-    };
-    constexpr size_t kSize = sizeof(kLookup) / sizeof(kLookup[0]);
-    OpusA16W16RuntimeEntry needle{{M, N, K}, nullptr};
-    auto it = std::lower_bound(kLookup, kLookup + kSize, needle,
-                               shape_entry_less<OpusA16W16RuntimeEntry>);
-    if (it != kLookup + kSize && shape_entry_eq(*it, needle))
-        return it->func;
+    if (auto fn = opus_lookup_a16w16_gfx1250<fp32_t>(M, N, K))
+        return fn;
     (void)batch;
     opus_gfx1250_detail::check_shape_4g(M, N, K, sizeof(fp32_t));
     opus_gfx1250_detail::check_shape_reduce_grid(M);

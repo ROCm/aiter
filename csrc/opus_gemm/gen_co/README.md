@@ -204,12 +204,16 @@ compiles against.
 Both tags share this path. These kids get **their own pair of tables** in
 [`opus_gemm_arch_gfx1250.cuh`](../include/gfx1250/opus_gemm_arch_gfx1250.cuh) —
 `opus_a16w16_co_tune_dispatch_gfx1250(kid)` for the explicit-`kernelId` / tuner
-path and `opus_a16w16_co_dispatch_gfx1250(M, N, K)` for tuned-CSV production —
+path and `opus_a16w16_co_dispatch_gfx1250(M, N, K, allow_fallback)` for tuned-CSV
+production —
 because the family takes no workspace and so its launchers do not fit the entry
 type the split-K kids share. `opus_gemm()` consults the `(M, N, K)` one first: a
 hit skips the `hipMalloc` / `hipDeviceSynchronize` / `hipFree` that every split-K
-kid needs. Bias and non-bf16 `Y` fall through to split-K, since this pipeline has
-neither an epilogue nor a reduce kernel to serve them.
+kid needs. That first consult passes `allow_fallback=false`, so an entry tuned for
+another CU count cannot displace a split-K winner tuned for the running device;
+the split-K tables are tried next, and only then is this table consulted again
+with the fallback enabled. Bias and non-bf16 `Y` fall through to split-K, since
+this pipeline has neither an epilogue nor a reduce kernel to serve them.
 
 The shape heuristic never returns a `.co` kid; reaching one always means a tuned
 CSV row or an explicit `kernelId`. On the tuning side both tags are answered

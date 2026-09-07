@@ -26,6 +26,7 @@ struct OpusArchInfo
     OpusGfxArch arch;
     std::string name;  // full gcnArchName, e.g. "gfx950:sramecc+:xnack-"
     int dev;
+    int cu_num;
 };
 }  // namespace opus_arch_detail
 
@@ -53,7 +54,7 @@ inline const opus_arch_detail::OpusArchInfo &opus_get_arch_info()
         {
             a = OpusGfxArch::Gfx1250;
         }
-        return OpusArchInfo{a, std::move(name), dev};
+        return OpusArchInfo{a, std::move(name), dev, prop.multiProcessorCount};
     }();
     return info;
 }
@@ -61,4 +62,11 @@ inline const opus_arch_detail::OpusArchInfo &opus_get_arch_info()
 inline OpusGfxArch opus_get_gfx_arch()
 {
     return opus_get_arch_info().arch;
+}
+
+// CU count of the active device, matching the `cu_num` column the tuner stamps
+// on every row. Selects between the CU-count variants baked into one build.
+inline int opus_get_device_cu_num()
+{
+    return opus_get_arch_info().cu_num;
 }

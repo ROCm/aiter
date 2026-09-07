@@ -193,7 +193,24 @@ void opus_gemm(
       // split-K path even when the CSV named a .co kid.
       if (!has_bias && Y.dtype() == AITER_DTYPE_bf16)
       {
-        if (auto co_fn = opus_a16w16_co_dispatch_gfx1250(M, N, K))
+        if (auto co_fn = opus_a16w16_co_dispatch_gfx1250(
+                M, N, K, /*allow_fallback=*/false))
+        {
+          co_fn(XQ, WQ, Y, bias, 0);
+          return;
+        }
+      }
+      // An exact split-K winner must beat a legacy CU=0 .co row. Only consult
+      // that legacy .co fallback after both exact-CU tables miss.
+      auto fn = Y.dtype() == AITER_DTYPE_bf16
+          ? opus_lookup_a16w16_gfx1250<bf16_t>(
+                M, N, K, /*allow_fallback=*/false)
+          : opus_lookup_a16w16_gfx1250<fp32_t>(
+                M, N, K, /*allow_fallback=*/false);
+      if (fn == nullptr && !has_bias && Y.dtype() == AITER_DTYPE_bf16)
+      {
+        if (auto co_fn = opus_a16w16_co_dispatch_gfx1250(
+                M, N, K, /*allow_fallback=*/true))
         {
           co_fn(XQ, WQ, Y, bias, 0);
           return;
@@ -203,10 +220,15 @@ void opus_gemm(
       // dispatch returns a 6-arg function pointer (with workspace). We allocate
       // a temporary workspace here for the auto/heuristic path. For the tuned
       // path, Python allocates via torch.empty.
-      auto fn = opus_dispatch_a16w16_gfx1250<fp32_t>(M, N, K, batch, has_bias);
+      if (fn == nullptr)
+        fn = Y.dtype() == AITER_DTYPE_bf16
+            ? opus_dispatch_a16w16_gfx1250<bf16_t>(M, N, K, batch, has_bias)
+            : opus_dispatch_a16w16_gfx1250<fp32_t>(M, N, K, batch, has_bias);
       int padded_M = ((M + 63) / 64) * 64;
       int padded_N = ((N + 63) / 64) * 64;
       size_t ws_elems = (size_t)16 * padded_M * padded_N;
+      static_assert(OPUS_GFX1250_WS_PARTIAL_BYTES == sizeof(bf16_t),
+                    "gfx1250 split-K workspace: a baked kid stores a wider partial");
       size_t ws_bytes = ws_elems * sizeof(bf16_t);
       void* ws_ptr = nullptr;
       HIP_CALL(hipMalloc(&ws_ptr, ws_bytes));
