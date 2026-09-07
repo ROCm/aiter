@@ -776,34 +776,34 @@ PR_TITLE=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('t
 # For the families that turn on cross-file context, fetch that context NOW rather
 # than reminding the reviewer to go and read it. A deleted guard is judged by how
 # the symbol is handled on head, not by the hunk that removed it.
+# Materialise the PR's head images under $WORK; $PROJECT_ROOT would read the reviewer's
+# working tree, so one PR gave different evidence on two machines. UNCONDITIONAL: it used to
+# sit inside the invariant-removed/api-signature test, yet every forensic reading a FILE
+# needs head -- an ADDED file is in no other tree. flydslbounds returned empty on #5207 (six
+# buffer calls, one max_size=True) only because that PR derives neither family.
+mkdir -p "$WORK/head"
+HEAD_FILES=""
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  dst="$WORK/head/$f"
+  mkdir -p "$(dirname "$dst")"
+  if git -C "$PROJECT_ROOT" cat-file -e "$HEAD_SHA:$f" 2>/dev/null \
+     && git -C "$PROJECT_ROOT" show "$HEAD_SHA:$f" > "$dst" 2>/dev/null; then
+    HEAD_FILES="$HEAD_FILES $dst"
+  else
+    echo "note: $f unavailable at head $HEAD_SHA; not in the evidence set" >&2
+  fi
+done < <(git -C "$PROJECT_ROOT" diff --name-only "$BASE_SHA...$HEAD_SHA" 2>/dev/null \
+         || grep '^+++ b/' "$WORK/pr.diff" | sed 's|^+++ b/||')
 if grep -q "invariant-removed\|api-signature" "$WORK/rules.txt"; then
-  # Materialise the PR's own head images under $WORK. Prefixing the changed paths with
-  # $PROJECT_ROOT read the reviewer's WORKING TREE instead -- whatever branch they happen to
-  # have checked out, with whatever uncommitted edits -- so the same PR produced different
-  # evidence on two machines, and evidence for a PR that was never checked out at all.
-  mkdir -p "$WORK/head"
-  HEAD_FILES=""
-  while IFS= read -r f; do
-    [ -n "$f" ] || continue
-    dst="$WORK/head/$f"
-    mkdir -p "$(dirname "$dst")"
-    if git -C "$PROJECT_ROOT" cat-file -e "$HEAD_SHA:$f" 2>/dev/null \
-       && git -C "$PROJECT_ROOT" show "$HEAD_SHA:$f" > "$dst" 2>/dev/null; then
-      HEAD_FILES="$HEAD_FILES $dst"
-    else
-      echo "note: $f unavailable at head $HEAD_SHA; not in the evidence set" >&2
-    fi
-  done < <(git -C "$PROJECT_ROOT" diff --name-only "$BASE_SHA...$HEAD_SHA" 2>/dev/null \
-           || grep '^+++ b/' "$WORK/pr.diff" | sed 's|^+++ b/||')
   if [ -n "$HEAD_FILES" ]; then
     "$SKILLS_ROOT/review-pr/triage.py" evidence "$WORK/pr.diff" $HEAD_FILES \
       | tee "$WORK/evidence.txt"
-  HAVE_EVIDENCE=1
   else
     echo "SKIPPED: no head images available; cross-file evidence not collected" \
       | tee "$WORK/evidence.txt"
-  HAVE_EVIDENCE=1
   fi
+  HAVE_EVIDENCE=1
 fi
 
 # When a diff is almost entirely comments, the few lines that are not are the whole
