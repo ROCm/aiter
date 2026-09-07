@@ -29,17 +29,10 @@ static inline bool dyn_gq_tuned_arch()
     return tuned;
 }
 
-#ifndef DYN_GQ_WIDE_BLK_PER_SIMD
-#define DYN_GQ_WIDE_BLK_PER_SIMD 1
-#endif
-
-#ifndef DYN_GQ_TDM_MIN_BLK_PER_SIMD
-#define DYN_GQ_TDM_MIN_BLK_PER_SIMD 6
-#endif
-
-#ifndef DYN_GQ_TDM_KPT
-#define DYN_GQ_TDM_KPT 2
-#endif
+// gfx1250 tuning. All three are swept values; the sweeps are at the use sites.
+constexpr int kDynGqWideBlkMinPerSimd = 1;  // blocks/SIMD before the 256-thread block beats the 64
+constexpr int kDynGqTdmMinBlkPerSimd  = 6;  // blocks/SIMD below which TDM staging never amortises
+constexpr int kDynGqTdmKPT            = 2;  // staged steps per block
 
 // emit_e8m0_scale = false (default): legacy behaviour — fp4 outputs an e8m0
 // byte scale, fp8 / i8 output a continuous fp32 per-group scale.
@@ -50,12 +43,9 @@ static inline bool dyn_gq_tuned_arch()
 // `per_1x32_mx_quant_hip(quant_dtype=fp8, scale_type=fp8_e8m0)` so the
 // produced byte scale is directly consumable by `mxfp4_moe_sort_hip` /
 // MXFP8 GEMM kernels without a post-hoc fp32 -> e8m0 conversion.
-// Everything below that is a TUNING choice rather than a correctness one is gated on
-// gfx1250, because gfx1250 is where it was measured. The group ordering, the 32B chunk
-// split and the per-layout block size were each picked off a sweep on that part, and each
-// leans on something arch-specific -- wave32, b128 as the widest per-lane access, that
-// part's cache-line and dispatch behaviour. None of it was measured on gfx950 (wave64,
-// different load widths), so that target keeps exactly the shape it had before.
+// Every TUNING choice below is gated on gfx1250: each was swept there and leans on
+// something arch-specific (wave32, b128 as the widest per-lane access). Nothing was
+// measured on gfx950, so that target keeps the shape it had before.
 template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 32, int32_t group_size = 128, bool shuffle_scale = true, int32_t block_size = 64, bool emit_e8m0_scale = false, bool enable_tdm = false>
 __global__ void __launch_bounds__(block_size)
 dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
@@ -95,19 +85,11 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     int32_t scaleN_pad       = (use_e8m0_scale && shuffle_scale && group_size == 32)
                                    ? (((scaleN + 7) / 8) * 8)
                                    : scaleN;
-    // Group ordering follows whichever stream is the scattered one.
-    //
-    // The scale store is one byte (or float) per group from a single lane, so its access
-    // pattern is decided entirely by how consecutive groups map to (x, y). Row-major order
-    // (consecutive groups walk y within a row) suits the plain `scale[groupId]` layout, but
-    // the transposed layout writes `y * ori_rows + x`, which then puts consecutive lanes
-    // `ori_rows` bytes apart -- one byte touched per cache line. Measured on gfx1250 at
-    // [16384, 7168] that scattering cost 4.8 us, 15% of the kernel, to move 0.9 MB.
-    //
-    // Column-major order (consecutive groups walk x at a fixed y) makes the transposed
-    // store contiguous instead. It strides the data reads across rows in exchange, but each
-    // group still reads one contiguous 256B run, so DRAM absorbs it: the fp32-scale variant
-    // measures unchanged either way. Net for the transposed path: 36.3 -> 32.0 us.
+    // Group ordering follows whichever stream is the scattered one. The transposed layout
+    // writes `y * ori_rows + x`, so under row-major order consecutive lanes land ori_rows
+    // apart -- one byte per cache line, measured at 4.8 us (15% of the kernel) to move
+    // 0.9 MB. Column-major makes that store contiguous and strides the data reads instead,
+    // but each group still reads one contiguous 256B run. Net: 36.3 -> 32.0 us.
 #if defined(__gfx1250__)
     static constexpr bool kTunedForThisArch = true;
 #else
@@ -121,39 +103,32 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     // groups walk y, which would make a wave's slice a strided set of partial rows.
     static constexpr int kGroupsPerWave     = WARP_SIZE / num_thread_per_group;
     static constexpr int kTdmWaves          = block_size / WARP_SIZE;
-    // Tiles a wave stages before consuming any. Measured on gfx1250 at [16384, 7168],
-    // e8m0 + transposed, kernel time:
+    // Tiles a wave stages before consuming any. Swept at [16384, 7168] e8m0+transposed:
     //     KPT   1(off)    2      3      4      8
     //     us     27.0   25.96  29.3   32.1   54.8
-    // 2 wins and everything deeper loses badly: the whole per-group body is unrolled once
-    // per tile, so the instruction count grows with KPT (344 -> 1795 at KPT 4) and buys
-    // nothing once two loads are already in flight.
-    static constexpr int kTdmKPT            = DYN_GQ_TDM_KPT;
-    // The ring is capped at 3 because that is the hardware's in-flight tensor-op limit
-    // per wave (opus.hpp), but it never needs more slots than there are steps to stage:
-    // with kTdmKPT steps at most that many loads are ever outstanding, so a slot beyond
-    // kTdmKPT is LDS nobody writes. At the shipped KPT of 2 that dead slot cost 4 KiB per
-    // block, and dropping it measured -3.6% kernel time at [16384, 7168] e8m0+transposed
-    // (24.40 -> 23.53 us) with the 834-instruction body byte-identical and the output
-    // bit-identical: the LDS request is the only thing that changes.
+    // The body is unrolled once per tile, so deeper only grows the instruction count
+    // (344 -> 1795 at 4) once two loads are already in flight.
+    static constexpr int kTdmKPT            = kDynGqTdmKPT;
+    // 3 is the hardware's in-flight tensor-op limit per wave (opus.hpp), but kTdmKPT steps
+    // never leave more than that outstanding, so a slot beyond kTdmKPT is LDS nobody
+    // writes. Dropping it at KPT 2 freed 4 KiB/block for -3.6% (24.40 -> 23.53 us) with
+    // the body byte-identical -- the LDS request is the only thing that changes.
     static constexpr int kTdmRing           = kTdmKPT < 3 ? kTdmKPT : 3;
     static constexpr int kTdmGroupsPerStep  = kTdmWaves * kGroupsPerWave;
     static constexpr int kTdmGroupsPerBlock = kTdmGroupsPerStep * kTdmKPT;
     static constexpr int kTdmSlotElems      = kTdmGroupsPerStep * group_size;
     static constexpr int kTdmLdsWaves       = 1;   // one shared staging area per block
-    // The host owns this decision, because the two paths need different grids: a staged
-    // block covers kTdmGroupsPerBlock groups, an unstaged one covers kTdmGroupsPerStep.
-    // Deciding it here instead would let the host size the grid for staging while the
-    // kernel fell back, and half the groups would never be visited.
+    // The host owns this decision: the two paths need different grids, and deciding it
+    // here would let the host size for staging while the kernel fell back, leaving half
+    // the groups unvisited.
     static constexpr bool kUseTdmShape =
         enable_tdm && kColumnMajorGroups && kTdmKPT > 1 && kTdmWaves >= 1 &&
         (block_size % WARP_SIZE) == 0;
 
 #if defined(__gfx1250__)
     // One descriptor per BLOCK: the tile is every wave's rows at once. tensorcnt retires
-    // per wave, so the issuing wave is the only one that can wait on it and the others
-    // have to be released by a barrier -- the trade is half the descriptors and a 2x
-    // wider tile against two barriers per stage.
+    // per wave, so only the issuer can wait and the rest need a barrier -- half the
+    // descriptors and a 2x wider tile against two barriers per stage.
     using TdmWindow = opus::tdm<DTYPE_I, opus::seq<group_size, kTdmGroupsPerStep>>;
 #endif
 
@@ -188,22 +163,13 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     const float inverted_DTYPE_MAX =
         (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
 
-    // How a group's elements are split across its threads.
-    //
-    // The obvious split -- thread t takes the contiguous run [t*64B, +64B) -- strides the
-    // lanes of a load 64B apart, so one b128 pulls 16B out of each of 32 separate 64B
-    // segments and nothing merges; the matching store covers 16B of every 32B. Handing each
-    // thread two 32B chunks instead (chunks t and t+ntpg) halves both strides: a load
-    // covers 16B of every 32B and the store becomes fully contiguous across a group.
-    //
-    // 32B is the sweet spot, not 16B. b128 is the widest per-lane access gfx1250 has (no
-    // b256), so a 16B chunk would make the loads perfectly contiguous but shrink the fp8
-    // store to 8B per lane -- 4x buffer_store_b64 instead of 2x b128. Measured, that trade
-    // lost: the store side gave back more than the load side gained.
-    //
-    // The elements a thread holds are no longer contiguous within the group, but nothing
-    // downstream cares: amax is order-independent, and store_vector's interleave mode lays
-    // the output back down in exactly this pattern.
+    // How a group's elements split across its threads. The obvious contiguous 64B run per
+    // thread strides a load's lanes 64B apart, so nothing merges; two 32B chunks (t and
+    // t+ntpg) halve both strides and make the store contiguous across a group. 16B chunks
+    // would perfectly coalesce the loads but shrink the fp8 store to 8B per lane, and that
+    // trade measured worse. A thread's elements are no longer contiguous, which nothing
+    // downstream cares about: amax is order-independent and store_vector's interleave mode
+    // lays the output back down in this pattern.
     static constexpr int kChunkElems = 32 / static_cast<int>(sizeof(DTYPE_I));
     static constexpr int kChunks     = kChunkElems ? thread_data_size / kChunkElems : 0;
     static constexpr bool kInterleavedChunks =
@@ -291,14 +257,10 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     const int64_t row_offset = std::is_same_v<DTYPE_O, opus::fp4_t>
                                ? out_group * group_size / 2 + lane_in_group * kLaneStride
                                : out_group * group_size + lane_in_group * kLaneStride;
-    // The scale write is deferred to the very end of the kernel, but its ADDRESS and VALUE
-    // are resolved here, before the conversion. Leaving that arithmetic in the tail put it
-    // right after the data stores, where it reused their address and data VGPRs and forced
-    // the compiler to guard them with `s_wait_xcnt 0x0` -- a wait for every outstanding
-    // VMEM to read its operands. An ATT capture charged 18% of the kernel's total latency
-    // to that single wait. Resolved up front, the tail is a bare store with nothing after
-    // it to clobber, at a cost of three VGPRs held live across the conversion.
-    //
+    // The scale write happens at the end of the kernel, but its address and value are
+    // resolved HERE. Left in the tail, that arithmetic reused the data stores' VGPRs and
+    // forced an `s_wait_xcnt 0x0` guarding every outstanding VMEM -- an ATT capture
+    // charged 18% of kernel latency to that one wait. Costs three VGPRs held live.
     // A null `scale_dst` doubles as the "not the group's first lane" predicate.
     const float row_scale = inverted_scale;
     using scale_elem_t    = std::conditional_t<use_e8m0_scale, uint8_t, float>;
@@ -326,23 +288,15 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
             scale_val = row_scale;
         }
     }
-    // Which form of the scale the store path consumes:
-    //   - fp4 takes `row_scale` directly, via `cvt_scalef32_pk_fp4_f32`.
-    //   - kStoreTakesDivisor: `scaled_cast_div` also takes `row_scale` directly, which lets
-    //     gfx1250 lower bf16 -> fp8 to `v_cvt_scalef32_pk8_fp8_bf16` -- 8 elements per
-    //     instruction, replacing the per-element fma_mix + med3 and per-pair cvt_pk chain
-    //     (90 instructions -> 4 at thread_data_size 32) and the fp32 divide below with it.
-    //   - everything else does software `input * inv_scale`, so it needs the reciprocal.
+    // Which form of the scale the store path consumes: fp4 and kStoreTakesDivisor take
+    // `row_scale` directly (the latter lets gfx1250 use `v_cvt_scalef32_pk8_fp8_bf16`,
+    // 80 instructions -> 4 per 32 elements); everything else needs the reciprocal.
     //
-    // use_e8m0_scale is a correctness precondition here, not a tuning gate: that hardware
-    // convert reads its scale operand as an MX E8M0 factor, keeping the exponent bits and
-    // discarding the mantissa, so it is exact iff the row scale is a power of two. The
-    // continuous `absMax * inv_DTYPE_MAX` scale is not, and gets silently truncated to the
-    // enclosing power of two -- measured 1.79x off, with the large codes saturating to NaN.
-    //
-    // Conversely the reciprocal must stay gated on the store form and not on
-    // use_e8m0_scale: gating it that way once skipped the reciprocal for fp8 + e8m0 on the
-    // software path and produced fp8 bytes ~2x off (`split_elem_err ≈ 100%`).
+    // use_e8m0_scale is a correctness precondition, not a tuning gate: that convert reads
+    // its scale as an MX E8M0 factor, keeping the exponent and discarding the mantissa, so
+    // it is exact only for a power-of-two scale. The continuous one measured 1.79x off.
+    // Conversely the reciprocal must gate on the store form, not on use_e8m0_scale --
+    // gating it that way once skipped it on the software path (`split_elem_err ~ 100%`).
     if constexpr(!std::is_same_v<DTYPE_O, opus::fp4_t> && !kStoreTakesDivisor)
     {
         inverted_scale = 1.0f / inverted_scale;
@@ -395,22 +349,14 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
 #if defined(__gfx1250__)
     if constexpr(kUseTdmShape)
     {
-        // Each wave stages its own groups through LDS with tensor_load_to_lds and keeps a
-        // ring of them in flight. tensorcnt retires per wave, so no barrier is needed: a
-        // wave only ever reads what it issued.
+        // Each wave stages its own groups through LDS and keeps a ring in flight. tensorcnt
+        // retires per wave, so no barrier is needed -- a wave only reads what it issued --
+        // and the ring sits at the hardware's 3-op cap without exceeding it.
         //
-        // kTdmRing is 3 because the hardware allows exactly 3 tensor ops in flight per wave
-        // (opus.hpp, "3 tensor ops in flight per wave, 6 per SIMD"). The sequence below
-        // sits at that cap and never above it: priming issues 3, and each iteration retires
-        // one (the staged wait) before issuing one. Raising the ring past 3 would stall the
-        // issue instead of deepening the pipeline.
-        //
-        // The tile is the whole reason this works: under column-major order a wave's
-        // kGroupsPerWave groups are that many CONSECUTIVE rows at one y, i.e. a plain 2D
-        // region -- dim0 = group_size contiguous elements, dim1 = the rows, dim0 stride =
-        // ori_row_stride. One descriptor moves it, and the hardware picks the transaction
-        // sizes instead of us paying the 50% per-instruction coverage of a b128 whose
-        // lanes sit 32B apart.
+        // The tile is why this works: under column-major order a wave's kGroupsPerWave
+        // groups are that many CONSECUTIVE rows at one y, a plain 2D region one descriptor
+        // can move. The hardware then picks transaction sizes instead of us paying the 50%
+        // coverage of a b128 whose lanes sit 32B apart.
         __shared__ DTYPE_I tdm_lds[kTdmLdsWaves * kTdmRing * kTdmSlotElems];
 
         const int wave_id  = threadIdx.x / WARP_SIZE;
@@ -465,12 +411,10 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
 
             if constexpr(k.value + kTdmRing < kTdmKPT)
             {
-                // The refill lands in the slot this iteration just read -- (k + ring) % ring
-                // == k % ring -- and the DMA writes LDS asynchronously, which the compiler
-                // does not model as aliasing the ds_reads above. Without this the refill can
-                // overwrite the slot while those reads are still outstanding: a
-                // write-after-read race that happens to survive today only because
-                // `process` has a long tail of stores after its last LDS read.
+                // The refill lands in the slot this iteration just read, and the compiler
+                // does not model the async DMA as aliasing the ds_reads above -- without
+                // this barrier the refill can overwrite the slot while they are still
+                // outstanding.
                 opus::s_wait_dscnt<0>();
                 __builtin_amdgcn_s_barrier();   // all waves done reading before the refill
                 if(issuer)
@@ -1064,12 +1008,9 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
             auto launch_group_quant = [&](auto out_type_tag, int ori_cols, int ori_rows, int num_group, auto shuffle_tag) {
                 using out_t = decltype(out_type_tag);
                 constexpr bool ss = decltype(shuffle_tag)::value;
-            // Block size follows the group ordering, which is what decides whether a bigger
-            // block helps or hurts. Row-major order walks y inside a row, so a wider block
-            // just reads a longer contiguous run -- measured 28.7 -> 26.4 us going 64 ->
-            // 256. Column-major order (the transposed-scale layout) walks x instead, so a
-            // wider block spans more rows, each a separate 256B run ori_row_stride apart,
-            // and the lost read locality outweighs the saved launch overhead: 27.0 -> 27.7.
+            // Block size follows the group ordering. Row-major reads a longer contiguous
+            // run when widened (28.7 -> 26.4 us at 64 -> 256); column-major spans more
+            // rows instead, and the lost locality outweighs it (27.0 -> 27.7).
                 constexpr bool kColMajor =
                     std::is_same_v<out_t, opus::fp4_t> && ss && _GS == 128;
                 // See the note at the other launch site: the 64/256 split is gfx1250-only.
@@ -1079,7 +1020,7 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
                 const bool wide_ok =
                     dyn_gq_tuned_arch() &&
                     (static_cast<int64_t>(num_group) * num_thread_per_group / kBlkTuned) >=
-                        static_cast<int64_t>(simds_bs) * DYN_GQ_WIDE_BLK_PER_SIMD;
+                        static_cast<int64_t>(simds_bs) * kDynGqWideBlkMinPerSimd;
                 const int32_t blk_rt = wide_ok ? kBlkTuned : 64;
                 const int num_group_per_tg = blk_rt / num_thread_per_group;
                 static constexpr int32_t ooba = 4 / sizeof(out_t);
@@ -1224,30 +1165,22 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
             using out_t = decltype(out_type_tag);
             constexpr bool ss = decltype(shuffle_tag)::value;
             constexpr bool ee = decltype(e8m0_tag)::value;
-            // Block size follows the group ordering, which is what decides whether a bigger
-            // block helps or hurts. Row-major order walks y inside a row, so a wider block
-            // just reads a longer contiguous run -- measured 28.7 -> 26.4 us going 64 ->
-            // 256. Column-major order (the transposed-scale layout) walks x instead, so a
-            // wider block spans more rows, each a separate 256B run ori_row_stride apart,
-            // and the lost read locality outweighs the saved launch overhead: 27.0 -> 27.7.
+            // Block size follows the group ordering. Row-major reads a longer contiguous
+            // run when widened (28.7 -> 26.4 us at 64 -> 256); column-major spans more
+            // rows instead, and the lost locality outweighs it (27.0 -> 27.7).
             constexpr bool kColMajor =
                 (std::is_same_v<out_t, opus::fp4_t> || ee) && ss && _GS == 128;
-            // The 64/256 split was swept on gfx1250 and leans on that part's wave width
-            // and dispatch behaviour; nothing was measured on gfx950, so an untuned arch
-            // keeps the 64 it always had. Block size is a template argument, so both are
-            // instantiated and the arch picks between them at launch.
-            // The wider block only pays once there are blocks to spare: it covers 4x the
-            // groups, so it divides the block count by 4 and on a small tensor leaves the
-            // machine mostly idle. Measured on the fp32-scale path at [T, 7168], blk 256
-            // against blk 64: 1.23x SLOWER at T=8 (7 blocks against 28), even at T=1024,
-            // and 4-9% faster from T=2048 up. The gate is blocks per SIMD, not T, so it
-            // travels across column counts; 1 puts the switch between 1024 and 2048.
+            // The 64/256 split was swept on gfx1250; an untuned arch keeps the 64 it
+            // always had. Block size is a template argument, so both are instantiated and
+            // the arch picks at launch. The wider block covers 4x the groups, so it only
+            // pays once there are blocks to spare: at [T, 7168] it is 1.23x SLOWER at
+            // T=8 and 4-9% faster from T=2048 up.
             static constexpr int32_t kBlkTuned = kColMajor ? 64 : 256;
             const int simds_bs = static_cast<int>(get_num_cu_func()) * 4;
             const bool wide_ok =
                 dyn_gq_tuned_arch() &&
                 (static_cast<int64_t>(rows) * scaleN * num_thread_per_group / kBlkTuned) >=
-                    static_cast<int64_t>(simds_bs) * DYN_GQ_WIDE_BLK_PER_SIMD;
+                    static_cast<int64_t>(simds_bs) * kDynGqWideBlkMinPerSimd;
             const int32_t blk_rt = wide_ok ? kBlkTuned : 64;
             const int num_group_per_tg = blk_rt / num_thread_per_group;
             dim3 const block(blk_rt);
@@ -1269,30 +1202,22 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
             const int64_t oob_size = oob_elems * static_cast<int64_t>(sizeof(out_t));
 
             // TDM staging, decided here because it changes the grid: a staged block owns
-            // DYN_GQ_TDM_KPT steps' worth of groups instead of one.
-            //   - It needs a wave's groups to stay inside one column and the block span to
-            //     tile the matrix, hence rows % groups-per-staged-block.
-            //   - It halves the block count, which only pays once there are blocks to
-            //     spare. Measured at [T, 7168]: staging costs 15% at T=128 (224 blocks)
-            //     and 4% at T=512, and wins from a few thousand blocks up. The gate is
-            //     blocks per SIMD, not T, so it travels across shapes.
-            const int kGroupsPerStagedBlock = num_group_per_tg * DYN_GQ_TDM_KPT;
-            static constexpr int kTdmMinBlocksPerSimd = DYN_GQ_TDM_MIN_BLK_PER_SIMD;
+            // kDynGqTdmKPT steps' worth of groups. It needs the block span to tile the
+            // matrix (hence rows % groups-per-staged-block) and it halves the block count,
+            // which costs 15% at T=128 and wins from a few thousand blocks up.
+            const int kGroupsPerStagedBlock = num_group_per_tg * kDynGqTdmKPT;
+            static constexpr int kTdmMinBlocksPerSimd = kDynGqTdmMinBlkPerSimd;
             const int simds = static_cast<int>(get_num_cu_func()) * 4;   // 4 SIMDs per CU
             const bool use_tdm =
                 dyn_gq_tuned_arch() &&
-                kColMajor && DYN_GQ_TDM_KPT > 1 && (rows % kGroupsPerStagedBlock) == 0 &&
+                kColMajor && kDynGqTdmKPT > 1 && (rows % kGroupsPerStagedBlock) == 0 &&
                 (num_group / kGroupsPerStagedBlock) >= simds * kTdmMinBlocksPerSimd;
 
-            // The grid is sized by the UNSTAGED block span even when staging is on, so a
-            // staged block (which owns kGroupsPerStagedBlock) leaves the back half of the
-            // grid with nothing in range; those blocks reject on the first resolve and
-            // retire. That looks like waste and sizing the grid exactly instead is the
-            // obvious fix -- but it measured 15-24% SLOWER across M = 4096/8192/16384
-            // (8.05/14.38/25.24 us against 9.95/17.01/28.96), with device code identical
-            // and only the launch dimension differing. The mechanism is not understood, so
-            // this keeps the configuration that measures faster rather than the one that
-            // reasons better. Revisit with a dispatch-level profile.
+            // The grid is deliberately sized by the UNSTAGED block span, so the back half
+            // dispatches blocks that reject on the first resolve and retire. Sizing it
+            // exactly is the obvious fix and measured 15-24% SLOWER (M=4096/8192/16384),
+            // with device code identical and only the launch dimension differing. The
+            // mechanism is not understood; this keeps what measures faster.
             dim3 const grid((num_group + num_group_per_tg - 1) / num_group_per_tg);
             AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
                 input.dtype(), "dynamic_per_group_scaled_quant_kernel", [&] {
