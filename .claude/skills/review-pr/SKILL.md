@@ -165,8 +165,8 @@ Otherwise → Tier 3 (individual kernel or model-specific code).
 ```
 
 The table is the snapshot the gate demands a line for; use Q1/Q2/Q3 on new files and add a
-line for any you judge Tier 1 or 2. **A C++ header 10+ translation units include is Tier 2
-too**, counted from the tree, not listed — `rules.md` § Tiering has the numbers. Ranked by commit frequency (2025–2026), blast radius:
+line for any you judge Tier 1 or 2. **A header 10+ TUs include is Tier 2 too**, counted
+from the tree, not listed — `rules.md` § Tiering. Ranked by commit frequency, blast radius:
 
 | Tier | File | Git commits | Blast radius | Failure mode |
 |------|------|-------------|-------------|--------------|
