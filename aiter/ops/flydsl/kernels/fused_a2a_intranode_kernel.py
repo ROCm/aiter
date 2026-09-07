@@ -24,7 +24,7 @@ from .communication_ops_utils import (
 )
 from .quant_utils import emit_mx_e8m0_scale
 
-_JIT_SCHEMA_VERSION = "v14-recv-dequant"
+_JIT_SCHEMA_VERSION = "v15-v-quant"
 _TRANSPORT_CHUNK_BYTES = 16
 _PUSH_PIPELINE_DEPTH = 16
 _OUT_CHANNEL_COUNT = 8
@@ -53,7 +53,7 @@ def make_fused_a2a_kernel(
 
     heads_local = heads // npes
     seq_full = seq_len * npes
-    # V and unfused transport retain their bf16 geometry.
+    # Source chunks remain bf16-sized even when the wire payload is fp8.
     elements_per_chunk = _TRANSPORT_CHUNK_BYTES // 2
     chunks_per_row = head_dim // elements_per_chunk
     chunk_words = _TRANSPORT_CHUNK_BYTES // 4
@@ -93,6 +93,7 @@ def make_fused_a2a_kernel(
         addr_p2p_output_v: fx.Int64,
         addr_p2p_scale_q: fx.Int64,
         addr_p2p_scale_k: fx.Int64,
+        addr_p2p_scale_v: fx.Int64,
         addr_xdb_mem: fx.Int64,
         addr_p2p_xdb_mem: fx.Int64,
         addr_xdb_flag: fx.Int64,
@@ -320,7 +321,7 @@ def make_fused_a2a_kernel(
                                             lane_in_group // 4,
                                         )
 
-        def transport(input_rsrc, p2p_bases):
+        def transport(input_rsrc, p2p_bases, addr_p2p_scale):
             peer_chunks = total_chunks // npes
             peer_group_count = (peer_chunks + 63) // 64
             peer_warp_num = global_warp_num // npes
@@ -334,13 +335,27 @@ def make_fused_a2a_kernel(
             )
             rsrc_dst = create_buffer_resource_from_addr(
                 uniform_peer_base,
-                num_records_bytes=total_chunks * _TRANSPORT_CHUNK_BYTES,
+                num_records_bytes=total_chunks * elements_per_chunk * element_size,
             )
+            if const_expr(quant):
+                rsrc_p2p_scale = create_buffer_resource_from_addr(addr_p2p_scale)
+                scale_base = fx.Uint64(
+                    buffer_load(rsrc_p2p_scale, dest_pe, vec_width=1, dtype=T.i64)
+                )
+                scale_lo = readfirstlane(T.i32, fx.Uint32(scale_base))
+                scale_hi = readfirstlane(T.i32, fx.Uint32(scale_base >> 32))
+                uniform_scale_base = (fx.Uint64(scale_hi) << 32) | fx.Uint64(scale_lo)
+                rsrc_scale = create_buffer_resource_from_addr(
+                    uniform_scale_base,
+                    num_records_bytes=total_chunks * elements_per_chunk // 32,
+                )
             group_step = peer_warp_num * _PUSH_PIPELINE_DEPTH
             for group_base in range(peer_warp_id, peer_group_count, group_step):
                 values = []
                 destinations = []
                 valid_values = []
+                scales = []
+                scale_destinations = []
                 for batch_idx in range_constexpr(_PUSH_PIPELINE_DEPTH):
                     group_idx = group_base + batch_idx * peer_warp_num
                     dest_chunk = group_idx * 64 + lane
@@ -352,37 +367,80 @@ def make_fused_a2a_kernel(
                     row_chunk = seq_chunk % chunks_per_row
                     head = dest_pe * heads_local + local_head
                     src_chunk = (seq * heads + head) * chunks_per_row + row_chunk
-                    values.append(
-                        buffer_load(
-                            input_rsrc,
-                            src_chunk * chunk_words,
-                            vec_width=chunk_words,
-                            dtype=T.i32,
-                        )
+                    raw = buffer_load(
+                        input_rsrc,
+                        src_chunk * chunk_words,
+                        vec_width=chunk_words,
+                        dtype=T.i32,
                     )
+                    if const_expr(quant):
+                        decoded = fx.Vector(raw).bitcast(fx.BFloat16).to(fx.Float32)
+                        amax = fx.Float32(0.0)
+                        for i in range_constexpr(elements_per_chunk):
+                            amax = amax.maximumf(fmath.absf(decoded[i]))
+                        # Tail lanes load a safe row, but must not contribute its max.
+                        amax = fx.Float32(valid.select(amax, fx.Float32(0.0)))
+                        # Each aligned four-lane group owns 32 contiguous head values.
+                        for shift in (1, 2):
+                            amax = amax.maximumf(amax.shuffle_xor(shift, 64))
+                        scale = fx.Int32(
+                            emit_mx_e8m0_scale(
+                                amax.ir_value(),
+                                mode=MxScaleRoundModeInt.RoundUp,
+                                dtype=MxDtypeInt.FP8_E4M3,
+                            )
+                        )
+                        reciprocal = ((fx.Int32(254) - scale) << 23).bitcast(fx.Float32)
+                        packed = []
+                        for pair in range_constexpr(elements_per_chunk // 2):
+                            word = fx.rocdl.cvt_pk_fp8_f32(
+                                T.i32,
+                                (decoded[2 * pair] * reciprocal).ir_value(),
+                                (decoded[2 * pair + 1] * reciprocal).ir_value(),
+                                fx.Int32(0).ir_value(),
+                                0,
+                            )
+                            packed.append(fx.Int32(word).to(fx.Int16))
+                        values.append(
+                            fx.Vector.from_elements(packed, dtype=fx.Int16).bitcast(
+                                fx.Int32
+                            )
+                        )
+                        scales.append(scale.to(fx.Int8))
+                    else:
+                        values.append(raw)
                     dst_chunk = (
                         local_head * seq_full * chunks_per_row
                         + (rank * seq_len + seq) * chunks_per_row
                         + row_chunk
                     )
-                    destinations.append(dst_chunk * chunk_words)
+                    destinations.append(dst_chunk * (2 if quant else chunk_words))
+                    scale_destinations.append(dst_chunk // 4)
                     valid_values.append(valid)
                 for batch_idx in range_constexpr(_PUSH_PIPELINE_DEPTH):
                     if valid_values[batch_idx]:
                         buffer_store(
                             values[batch_idx], rsrc_dst, destinations[batch_idx]
                         )
+                        # Keep compile-time specialization outside the lane predicate.
+                        if const_expr(quant):  # noqa: SIM102
+                            if lane % 4 == 0:
+                                buffer_store(
+                                    scales[batch_idx],
+                                    rsrc_scale,
+                                    scale_destinations[batch_idx],
+                                )
 
         if const_expr(fuse_norm_rope):
             process_qk(rsrc_input_q, rsrc_norm_q, p2p_bases_q, addr_p2p_scale_q)
             if const_expr(not split):
                 process_qk(rsrc_input_k, rsrc_norm_k, p2p_bases_k, addr_p2p_scale_k)
         else:
-            transport(rsrc_input_q, p2p_bases_q)
+            transport(rsrc_input_q, p2p_bases_q, addr_p2p_scale_q)
             if const_expr(not split):
-                transport(rsrc_input_k, p2p_bases_k)
+                transport(rsrc_input_k, p2p_bases_k, addr_p2p_scale_k)
         if const_expr(not split):
-            transport(rsrc_input_v, p2p_bases_v)
+            transport(rsrc_input_v, p2p_bases_v, addr_p2p_scale_v)
 
         fx.rocdl.s_waitcnt(vmcnt=0)
 
@@ -425,6 +483,7 @@ def make_fused_a2a_kernel(
         addr_p2p_output_v: fx.Int64,
         addr_p2p_scale_q: fx.Int64,
         addr_p2p_scale_k: fx.Int64,
+        addr_p2p_scale_v: fx.Int64,
         addr_xdb_mem: fx.Int64,
         addr_p2p_xdb_mem: fx.Int64,
         addr_xdb_flag: fx.Int64,
@@ -443,6 +502,7 @@ def make_fused_a2a_kernel(
             addr_p2p_output_v,
             addr_p2p_scale_q,
             addr_p2p_scale_k,
+            addr_p2p_scale_v,
             addr_xdb_mem,
             addr_p2p_xdb_mem,
             addr_xdb_flag,
@@ -474,6 +534,7 @@ def make_fused_a2a_kernel(
             addr_p2p_output,
             addr_p2p_output,
             addr_p2p_output,
+            addr_p2p_scale,
             addr_p2p_scale,
             addr_p2p_scale,
             addr_xdb_mem,
@@ -543,6 +604,7 @@ def make_fused_a2a_jit(
         addr_p2p_output_v: fx.Int64,
         addr_p2p_scale_q: fx.Int64,
         addr_p2p_scale_k: fx.Int64,
+        addr_p2p_scale_v: fx.Int64,
         addr_xdb_mem: fx.Int64,
         addr_p2p_xdb_mem: fx.Int64,
         addr_xdb_flag: fx.Int64,
@@ -563,6 +625,7 @@ def make_fused_a2a_jit(
             addr_p2p_output_v,
             addr_p2p_scale_q,
             addr_p2p_scale_k,
+            addr_p2p_scale_v,
             addr_xdb_mem,
             addr_p2p_xdb_mem,
             addr_xdb_flag,
@@ -617,20 +680,27 @@ def make_fused_a2a_dequant_jit(*, numel, return_mode="bf16"):
     def fused_a2a_dequant(
         addr_q: fx.Int64,
         addr_k: fx.Int64,
+        addr_v: fx.Int64,
         addr_scale_q: fx.Int64,
         addr_scale_k: fx.Int64,
+        addr_scale_v: fx.Int64,
         addr_out_q: fx.Int64,
         addr_out_k: fx.Int64,
+        addr_out_v: fx.Int64,
     ):
-        is_q = fx.gpu.block_id("y") == 0
+        tensor_id = fx.gpu.block_id("y")
+        is_q = tensor_id == 0
+        is_k = tensor_id == 1
         payload = create_buffer_resource_from_addr(
-            is_q.select(addr_q, addr_k), num_records_bytes=numel
+            is_q.select(addr_q, is_k.select(addr_k, addr_v)), num_records_bytes=numel
         )
         scales = create_buffer_resource_from_addr(
-            is_q.select(addr_scale_q, addr_scale_k), num_records_bytes=numel // 32
+            is_q.select(addr_scale_q, is_k.select(addr_scale_k, addr_scale_v)),
+            num_records_bytes=numel // 32,
         )
         output = create_buffer_resource_from_addr(
-            is_q.select(addr_out_q, addr_out_k), num_records_bytes=numel * 2
+            is_q.select(addr_out_q, is_k.select(addr_out_k, addr_out_v)),
+            num_records_bytes=numel * 2,
         )
         offset = fx.Int32(
             (fx.gpu.block_id("x") * block_threads + fx.gpu.thread_id("x")) * vec
@@ -664,17 +734,28 @@ def make_fused_a2a_dequant_jit(*, numel, return_mode="bf16"):
     def launch(
         addr_q: fx.Int64,
         addr_k: fx.Int64,
+        addr_v: fx.Int64,
         addr_scale_q: fx.Int64,
         addr_scale_k: fx.Int64,
+        addr_scale_v: fx.Int64,
         addr_out_q: fx.Int64,
         addr_out_k: fx.Int64,
+        addr_out_v: fx.Int64,
         stream: Stream = Stream(None),  # noqa: B008
     ):
         _ = key
         fused_a2a_dequant(
-            addr_q, addr_k, addr_scale_q, addr_scale_k, addr_out_q, addr_out_k
+            addr_q,
+            addr_k,
+            addr_v,
+            addr_scale_q,
+            addr_scale_k,
+            addr_scale_v,
+            addr_out_q,
+            addr_out_k,
+            addr_out_v,
         ).launch(
-            grid=((numel + block_threads * vec - 1) // (block_threads * vec), 2, 1),
+            grid=((numel + block_threads * vec - 1) // (block_threads * vec), 3, 1),
             block=(block_threads, 1, 1),
             stream=stream,
         )

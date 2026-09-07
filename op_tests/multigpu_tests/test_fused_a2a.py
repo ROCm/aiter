@@ -161,6 +161,15 @@ def _run_rank(rank, world_size, port):
                 ).reshape(heads, head_dim).float() / 32
             k = q * 0.75 + 0.125
             v = q + 2
+            if case_name == "small":
+                v[:, 0].zero_()
+                # Distinct block scales and isolated outliers in the final peer group.
+                blocks = v[:, -1].view(heads, head_dim // 32, 32)
+                block_id = torch.arange(heads * (head_dim // 32), device=device)
+                amplitude = torch.exp2((block_id % 9 - 4).float()).view(heads, -1, 1)
+                pattern = (torch.arange(32, device=device).float() - 15) / 17
+                blocks.copy_(pattern * amplitude)
+                blocks[..., 31] = (63.75 * amplitude.squeeze(-1)).to(torch.bfloat16)
             hd = heads * head_dim
             norm_q = torch.linspace(0.5, 1.5, hd, device=device).to(torch.bfloat16)
             norm_k = torch.linspace(1.5, 0.5, hd, device=device).to(torch.bfloat16)
@@ -265,56 +274,70 @@ def _run_rank(rank, world_size, port):
                             flush=True,
                         )
 
-            quantized = [
-                _mx_fp8_reference(_norm_rope(input, weight, cos, sin, torch.float32))
-                for input, weight in zip((q, k), (norm_q, norm_k), strict=True)
-            ]
-            quant_references = a2a_references(
-                [_dequantize(payload, scale) for payload, scale in quantized],
-                heads_local,
-                seq_len,
-                head_dim,
-            )
-            scale_references = a2a_references(
-                [scale for _, scale in quantized],
-                heads_local,
-                seq_len,
-                head_dim // 32,
-            )
-            for split in (False, True):
-                for return_mode in ("bf16", "fp8"):
+            for fuse_norm_rope in ((True, False) if case_name == "small" else (True,)):
+                quant_inputs = (
+                    (
+                        _norm_rope(q, norm_q, cos, sin, torch.float32),
+                        _norm_rope(k, norm_k, cos, sin, torch.float32),
+                        v,
+                    )
+                    if fuse_norm_rope
+                    else inputs
+                )
+                quantized = [_mx_fp8_reference(input) for input in quant_inputs]
+                quant_references = a2a_references(
+                    [_dequantize(payload, scale) for payload, scale in quantized],
+                    heads_local,
+                    seq_len,
+                    head_dim,
+                )
+                scale_references = a2a_references(
+                    [scale for _, scale in quantized],
+                    heads_local,
+                    seq_len,
+                    head_dim // 32,
+                )
+                expected = references if fuse_norm_rope else transport_references
+                aux = (norm_q, norm_k, cos, sin) if fuse_norm_rope else ()
+                modes = (
+                    ((False, "bf16"), (False, "fp8"), (True, "bf16"), (True, "fp8"))
+                    if fuse_norm_rope
+                    else ((False, "bf16"), (True, "fp8"))
+                )
+                for split, return_mode in modes:
                     op = FusedA2AIntraNodeOp(
                         rank=rank,
                         world_size=world_size,
                         shape=q.shape,
+                        fuse_norm_rope=fuse_norm_rope,
                         split=split,
                         quant=True,
                         return_mode=None if return_mode == "bf16" else return_mode,
                     )
                     for epoch in range(3):
-                        result = op(*inputs, norm_q, norm_k, cos, sin)
+                        result = op(*inputs, *aux)
                         torch.cuda.synchronize()
                         quant_metrics = []
                         if return_mode == "fp8":
                             actuals, scales = result
-                            for i, tensor_name in enumerate("qk"):
+                            for i, tensor_name in enumerate("qkv"):
                                 quant_metrics.append(
                                     _assert_quantized(
                                         actuals[i].view(expected_shape),
                                         scales[i].view(scale_references[i].shape),
                                         quant_references[i],
                                         scale_references[i],
-                                        references[i],
+                                        expected[i],
                                         tensor_name,
                                     )
                                 )
                         else:
                             actuals = result
-                            for i, tensor_name in enumerate("qk"):
+                            for i, tensor_name in enumerate("qkv"):
                                 actual = actuals[i].view(expected_shape)
                                 if actual.dtype != torch.bfloat16:
                                     raise AssertionError(
-                                        "bf16 return must produce bf16 Q/K"
+                                        "bf16 return must produce bf16 Q/K/V"
                                     )
                                 parity = epoch % 2
                                 received_reference = _dequantize(
@@ -329,22 +352,18 @@ def _run_rank(rank, world_size, port):
                                     _assert_quantized_values(
                                         actual,
                                         quant_references[i].to(torch.bfloat16),
-                                        references[i],
+                                        expected[i],
                                         tensor_name,
                                     )
                                     + " native-dequant=bit-exact"
                                 )
-                        _assert_equal(
-                            actuals[2].view(expected_shape),
-                            references[2],
-                            f"{case_name} quant split={split} V rank {rank} epoch {epoch}",
-                        )
                         dist.barrier()
                     if rank == 0:
                         print(
-                            f"PASS {case_name} quant=True split={split} return={return_mode}: "
+                            f"PASS {case_name} quant=True split={split} "
+                            f"norm_rope={fuse_norm_rope} return={return_mode}: "
                             + " ".join(quant_metrics)
-                            + " full-V=byte-identical epochs=3",
+                            + " epochs=3",
                             flush=True,
                         )
 
@@ -397,7 +416,9 @@ def main():
         return 0
 
     mp.spawn(_run_rank, args=(_WORLD_SIZE, _free_port()), nprocs=_WORLD_SIZE, join=True)
-    passed = len(_CASES) * (8 + int(_WORLD_SIZE >= 8))
+    passed = sum(
+        8 + 2 * (name == "small") + int(_WORLD_SIZE >= 8) for name, *_ in _CASES
+    )
     skipped = len(_CASES) * int(_WORLD_SIZE < 8)
     print(f"{passed} passed, {skipped} skipped on {arch}")
     return 0

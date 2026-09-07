@@ -43,10 +43,10 @@ class FusedA2AIntraNodeOp:
     """Own symmetric receive and handshake buffers for one tensor shape.
 
     Set split=True or FUSED_A2A_SPLIT=1 for three ordered per-tensor launches.
-    Set quant=True or FUSED_A2A_QUANT=1 for fused Q/K MX E4M3 payloads.
-    Quantized calls return local bf16 Q/K and received bf16 V by default.
+    Set quant=True or FUSED_A2A_QUANT=1 for Q/K/V MX E4M3 payloads.
+    Quantized calls return locally dequantized bf16 Q/K/V by default.
     Set return_mode="fp8" or FUSED_A2A_QUANT_RETURN=fp8 for
-    (outputs, (q_scales, k_scales)); an explicit return_mode overrides the env.
+    (outputs, (q_scales, k_scales, v_scales)); explicit return_mode overrides the env.
     Scales follow the receive layout with one E8M0 byte per 32 adjacent values.
     All ranks must use the same mode and serialize calls on one stream.
     """
@@ -78,10 +78,6 @@ class FusedA2AIntraNodeOp:
         if dtype != torch.bfloat16 and not (self.quant and dtype == torch.uint8):
             raise ValueError(
                 f"expected torch.bfloat16 or torch.uint8 with quant enabled, got {dtype}"
-            )
-        if self.quant and not fuse_norm_rope:
-            raise NotImplementedError(
-                "quantized transport requires fused Q/K norm/RoPE"
             )
         if world_size <= 0 or world_size > _MAX_INTRANODE_NPES:
             raise ValueError(f"world_size must be in [1, 8], got {world_size}")
@@ -121,13 +117,10 @@ class FusedA2AIntraNodeOp:
         self.dtype = torch.bfloat16
         self.peer_numel = numel // world_size
         self.outputs_sets = tuple(
-            tuple(
-                mori_shmem_create_tensor((numel,), output_dtype)
-                for output_dtype in (payload_dtype, payload_dtype, torch.bfloat16)
-            )
+            tuple(mori_shmem_create_tensor((numel,), payload_dtype) for _ in range(3))
             for _ in range(2)
         )
-        # Q/K scales use the payload's receive ordering; V scales remain unused.
+        # Q/K/V scales use the payload's receive ordering.
         self.scales_sets = tuple(
             tuple(
                 mori_shmem_create_tensor((numel // 32,), torch.uint8) for _ in range(3)
@@ -143,7 +136,7 @@ class FusedA2AIntraNodeOp:
             self.bf16_outputs_sets = tuple(
                 tuple(
                     torch.empty(numel, dtype=torch.bfloat16, device=self.output.device)
-                    for _ in range(2)
+                    for _ in range(3)
                 )
                 for _ in range(2)
             )
@@ -195,8 +188,8 @@ class FusedA2AIntraNodeOp:
                 warp_num_per_block=warp_num_per_block,
                 fuse_norm_rope=role,
                 split=self.split,
-                quant=self.quant and role,
-                element_size=element_size if role else 2,
+                quant=self.quant,
+                element_size=element_size,
                 return_mode=self.return_mode,
             )
             for role in roles
@@ -279,7 +272,7 @@ class FusedA2AIntraNodeOp:
                     cos.data_ptr(),
                     sin.data_ptr(),
                     *(table.data_ptr() for table in tables),
-                    *(table.data_ptr() for table in scale_tables[:2]),
+                    *(table.data_ptr() for table in scale_tables),
                     *sync_args,
                 ),
             )
@@ -295,8 +288,8 @@ class FusedA2AIntraNodeOp:
         if self._dequant_launch is not None:
             bf16_outputs = self.bf16_outputs_sets[parity]
             args = (
-                *(output.data_ptr() for output in outputs[:2]),
-                *(scale.data_ptr() for scale in self.scales_sets[parity][:2]),
+                *(output.data_ptr() for output in outputs),
+                *(scale.data_ptr() for scale in self.scales_sets[parity]),
                 *(output.data_ptr() for output in bf16_outputs),
                 stream,
             )
@@ -309,10 +302,10 @@ class FusedA2AIntraNodeOp:
                 )
             else:
                 self._dequant_compiled(*args)
-            outputs = (*bf16_outputs, outputs[2])
+            outputs = bf16_outputs
         self._epoch += 1
         if self.quant and self.return_mode == "fp8":
-            return outputs, self.scales_sets[parity][:2]
+            return outputs, self.scales_sets[parity]
         return outputs
 
 
