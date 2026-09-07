@@ -56,9 +56,9 @@ same thing to every op:
     mla_v4_decode   1..1024. Decode carries one token per sequence, so the
                     axis is really the batch, and 65536 is not a shape the
                     model runs.
-    inverse_rope    1..16384. The axis is -s at a fixed -b 128,16, and 65536
-                    faults -- in the triton reference the UT compares against,
-                    not in the kernel under test.
+    inverse_rope    1..16384. The axis is -s at fixed TP1/TP4 shapes
+                    -b 128,16 32,4, and 65536 faults -- in the triton reference
+                    the UT compares against, not in the kernel under test.
     mega_moe        1..2048. 65536 cannot allocate its symmetric arena; see
                     _MEGA_MOE_TOKENS.
     a8w8_blockscale 512..65536. M=512 covers a DSv4 decode batch of 512;
@@ -193,11 +193,11 @@ backends. There is no nnz axis to sweep: the CSR is generated from --mode
 (sparse draws a random nnz per row, dense fills every row) under --seed, so
 nnz is an outcome, not an input.
 
-The ``inverse_rope`` op runs the tp1 attention-output shape (-b is
-(n_local_heads, n_local_groups); 128,16 is V4-Pro at dp/tp1):
+The ``inverse_rope`` op runs the TP1 and TP4 attention-output shapes (-b is
+(n_local_heads, n_local_groups); 128,16 and 32,4 are V4-Pro at TP1 and TP4):
 
     python3 op_tests/test_inverse_rope_group_quant.py \
-      -b 128,16 -s <token sweep> -l n32k4 --group-size 32
+      -b 128,16 32,4 -s <token sweep> -l n32k4 --group-size 32
 
 The ``a8w8_blockscale`` op runs:
 
@@ -1690,11 +1690,11 @@ def run_mla_v4_decode(args):
 
 
 def run_inverse_rope(args):
-    """Run DSv4 inverse RoPE + group quant at the tp1 attention-output shape."""
+    """Run DSv4 inverse RoPE + group quant at TP1/TP4 attention shapes."""
     _unused_scale_init(args, "inverse_rope")
-    # -b is (n_local_heads, n_local_groups); 128,16 is V4-Pro at dp/tp1. The UT
-    # defaults to the two smallest configs instead, which never reach the shape
-    # the model runs, so name it explicitly.
+    # -b is (n_local_heads, n_local_groups); 128,16 and 32,4 are V4-Pro at TP1
+    # and TP4. The UT defaults to the two smallest configs instead, which never
+    # reach these model shapes, so name them explicitly.
     def run_case(tokens, data_inits, label):
         _run_child(
             label,
@@ -1703,6 +1703,7 @@ def run_inverse_rope(args):
                 "op_tests/test_inverse_rope_group_quant.py",
                 "-b",
                 "128,16",
+                "32,4",
                 "-s",
                 *map(str, tokens),
                 "-l",
@@ -1723,7 +1724,7 @@ def run_inverse_rope(args):
     run_case(
         _INVERSE_ROPE_TOKENS,
         data_inits,
-        "inverse_rope_group_quant (DSv4, tp1)",
+        "inverse_rope_group_quant (DSv4, TP1/TP4)",
     )
 
 
