@@ -1057,7 +1057,7 @@ def derive(files, title="", raw_diff=""):
     if paths and all(p.startswith(INFRA) or p.endswith((".md", ".txt", ".cfg", ".toml"))
                      or "/docs/" in p for p in paths):
         return [("infra-only", "NONE")]
-    # 纯 submodule / 版本指针更新: 只动 subproject commit 行
+    # Pure submodule / version-pointer bump: subproject commit lines and nothing else
     if add and all(re.match(r"^(Subproject commit|[0-9a-f]{40}$|.*version.*=)", l.strip())
                    for l in add.splitlines() if l.strip()):
         return [("version-bump", "NONE")]
@@ -1070,7 +1070,7 @@ def derive(files, title="", raw_diff=""):
         return p.endswith((".cu", ".cuh", ".hip", ".h", ".hpp")) or \
                (p.endswith(".py") and any(k in p for k in KERNEL_PY))
     if any(not f["new"] and is_kernel(p) and (f["add"] or f["del"]) for p, f in files.items()):
-        hit("modified-kernel", "A1 B2 D1 D8 P6")   # D9 由 scan_index_width.py 出结果, 不读散文
+        hit("modified-kernel", "A1 B2 D1 D8 P6")   # D9 is scanner-backed, not read as prose
     if re.search(r"tl\.constexpr", add) or re.search(r"['\"]gfx\d+['\"]", add):
         hit("new-routing-value", "B4 C4")
     if any(p.endswith((".csv", ".yaml", ".yml")) or
@@ -1078,13 +1078,13 @@ def derive(files, title="", raw_diff=""):
         hit("tuning-config", "D3 HK4")
     if re.search(r"^\s*(el)?if .*(dtype|arch|layout|quant|backend)", add, re.M):
         hit("dispatch-change", "B1 B3 B4 A3")
-    # Tier1 真身: 坏了整个 import aiter 就废, 值得完整 Step4
+    # Tier-1 proper: break it and `import aiter` is dead, which earns a full Step 4
     if any(p in ("aiter/__init__.py", "aiter/jit/core.py") for p in paths):
         hit("tier1-import-chain", "STEP4 E5")
-    # Tier2 骨干: 多模型族共用的 dispatch, 需要 owner 签字
+    # Tier-2 backbone: dispatch shared across model families; needs an owner's sign-off
     elif any(p in TIER for p in paths):
         hit("tier2-dispatch", "E5 E4")
-    # 其余 op wrapper: 只需确认导出符号没断, 不必走完整 Step4
+    # Any other op wrapper: confirm the exported symbols still resolve; no full Step 4
     elif any(p.startswith(("aiter/ops/", "aiter/jit/")) or
              (p.startswith("aiter/") and p.count("/") == 1 and p.endswith(".py"))
              for p in paths):
@@ -1946,11 +1946,15 @@ DURATION_DELTA = re.compile(
 HW_MODEL = re.compile(r"\b(MI\d+\w*|gfx\d+|CDNA\d*|RDNA\d*|fp\d+|bf\d+|int\d+|e\dm\d)",
                       re.I)
 # aiter PR descriptions are partly Chinese; an English-only word list marks a table that
-# does name its baseline as one that does not.
+# does name its baseline as one that does not. The CJK alternatives are spelled as escapes
+# so this file stays ASCII -- they read, in order: comparison, baseline, before, after,
+# originally, improvement, gain, speed-up, pre-optimisation, post-optimisation, speed-up.
 BASELINE = re.compile(r"\bvs\.?\b|versus|baseline|\bbefore\b|\bafter\b|\bmain\b|torch|"
                       r"\bck\b|hipblas|current|previous|reference|speedup|faster|slower|"
-                      r"improv|regress|→|->|"
-                      r"对比|基线|之前|之后|原来|改进|提升|加速|优化前|优化后|提速", re.I)
+                      r"improv|regress|\u2192|->|"
+                      r"\u5bf9\u6bd4|\u57fa\u7ebf|\u4e4b\u524d|\u4e4b\u540e|\u539f\u6765|"
+                      r"\u6539\u8fdb|\u63d0\u5347|\u52a0\u901f|\u4f18\u5316\u524d|"
+                      r"\u4f18\u5316\u540e|\u63d0\u901f", re.I)
 
 
 SHARE = re.compile(r"%\s*(of|prefill|decode|busy|utili|occupan|GPU time|end of|elements)"
