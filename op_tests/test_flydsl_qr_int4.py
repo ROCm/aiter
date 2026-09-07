@@ -4,7 +4,8 @@
 """Runtime correctness for FlyDSL INT4 QuickReduce (``QRInt4``).
 
 Pytest collects validity cases only (no timing). ``python3`` this file
-runs an aiter-op-test ``@benchmark`` / markdown sweep. Each rank times
+runs an aiter-op-test ``@benchmark`` / markdown sweep. Ranks are
+``multiprocessing`` spawn workers (same path as HIP QR); each times
 ``fly.allreduce`` with ``run_perftest`` after ``compile()``. The oracle
 is an untimed fp32 NCCL all-reduce of the same per-rank inputs. INT4 is
 lossy, so validity uses SQNR, a calibrated mismatch ratio, and a
@@ -22,10 +23,8 @@ import itertools
 import json
 import os
 import statistics
-import subprocess
 import sys
-import tempfile
-import time
+from multiprocessing import Pool, freeze_support, set_start_method
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _REPO_ROOT not in sys.path:
@@ -42,6 +41,8 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 pytest.importorskip("flydsl")
+
+set_start_method("spawn", force=True)
 
 from aiter.ops.flydsl.kernels.qr_int4 import DEFAULT_GRID_CAP
 from aiter.ops.flydsl.kernels.qr_int4_kernel import (
@@ -172,19 +173,29 @@ def _min_tile_sqnr_db(got: torch.Tensor, reference: torch.Tensor) -> float:
     return min(vals) if vals else _sqnr_db(got, reference)
 
 
-def _run_rank(args) -> None:
+def _run_rank(
+    rank: int,
+    tp: int,
+    init_method: str,
+    tokens: list[int],
+    hiddens: list[int],
+    super_tile: int,
+    grid_cap: int,
+    fill: str,
+    time_it: bool,
+) -> list[dict]:
     import torch.distributed as dist
 
     from aiter.ops.flydsl import QRInt4
 
-    rank = args.rank
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
     dist.init_process_group(
         backend="nccl",
-        init_method=args.init_method,
-        world_size=args.tp,
+        init_method=init_method,
+        world_size=tp,
         rank=rank,
+        device_id=device,
     )
     gloo = dist.new_group(backend="gloo")
     group = dist.group.WORLD
@@ -193,12 +204,12 @@ def _run_rank(args) -> None:
         group=gloo,
         device=device,
         rank=rank,
-        world_size=args.tp,
-        super_tile=args.super_tile,
-        grid_cap=args.grid_cap,
+        world_size=tp,
+        super_tile=super_tile,
+        grid_cap=grid_cap,
     )
-    compile_tokens = min(512, max(args.tokens))
-    compile_hidden = max(args.hiddens)
+    compile_tokens = min(512, max(tokens))
+    compile_hidden = max(hiddens)
     compile_inp = torch.empty(
         (compile_tokens, compile_hidden), device=device, dtype=torch.bfloat16
     )
@@ -209,66 +220,60 @@ def _run_rank(args) -> None:
     del compile_inp, compile_out
 
     rows = []
-    fill = getattr(args, "fill", "normal")
-    for tokens, hidden in zip(args.tokens, args.hiddens, strict=True):
-        inp = _make_inp(tokens, hidden, fill, rank=rank, device=device)
-        out = torch.empty_like(inp)
-        ref = inp.to(torch.float32)
-        dist.all_reduce(ref, group=group)
+    try:
+        for ntok, hidden in zip(tokens, hiddens, strict=True):
+            inp = _make_inp(ntok, hidden, fill, rank=rank, device=device)
+            ref = inp.to(torch.float32)
+            dist.all_reduce(ref, group=group)
+            dist.barrier()
 
-        dist.barrier()
-        out.zero_()
-        fly.allreduce(inp, out)
-        torch.cuda.synchronize()
-        got = out.to(torch.float32)
-        dist.barrier()
-        nbytes = int(inp.numel()) * int(inp.element_size())
-        tiles = max(1, (nbytes + TILE_BYTES - 1) // TILE_BYTES)
-        st_used = fly._pick_st(tiles)
-        st1 = fly._by_st.get(1, fly._by_st[st_used])
-        close_err = checkAllclose(
-            ref,
-            got,
-            rtol=CLOSE_RTOL,
-            atol=CLOSE_ATOL,
-            tol_err_ratio=CLOSE_ERR_RATIO,
-            printLog=False,
-            msg=f"qr_int4 rank {rank}",
-        )
-        row = {
-            "tokens": tokens,
-            "hidden": hidden,
-            "grid_cap": args.grid_cap,
-            "st1_grid": st1.grid,
-            "st_used": st_used,
-            "grid": fly._by_st[st_used].grid,
-            "sqnr_db": _sqnr_db(got, ref),
-            "min_tile_sqnr_db": _min_tile_sqnr_db(got, ref),
-            "err": close_err,
-            "us": None,
-        }
-        if args.time_it:
-            dist.barrier(group=group)
-            torch.cuda.synchronize()
+            out = torch.empty_like(inp)
+            fly.allreduce(inp, out)
+            got = out.to(torch.float32)
+            dist.barrier()
 
-            def _allreduce(eng=fly, src=inp, dst=out):
-                eng.allreduce(src, dst)
-                return dst
+            nbytes = int(inp.numel()) * int(inp.element_size())
+            n_tiles = max(1, (nbytes + TILE_BYTES - 1) // TILE_BYTES)
+            st_used = fly._pick_st(n_tiles)
+            st1 = fly._by_st.get(1, fly._by_st[st_used])
+            close_err = checkAllclose(
+                ref,
+                got,
+                rtol=CLOSE_RTOL,
+                atol=CLOSE_ATOL,
+                tol_err_ratio=CLOSE_ERR_RATIO,
+                printLog=False,
+                msg=f"qr_int4 rank {rank}",
+            )
+            row = {
+                "tokens": ntok,
+                "hidden": hidden,
+                "grid_cap": grid_cap,
+                "st1_grid": int(st1.grid),
+                "st_used": int(st_used),
+                "grid": int(fly._by_st[st_used].grid),
+                "sqnr_db": _sqnr_db(got, ref),
+                "min_tile_sqnr_db": _min_tile_sqnr_db(got, ref),
+                "err": float(close_err),
+                "us": None,
+            }
+            if time_it:
+                dist.barrier(group=group)
+                torch.cuda.synchronize()
 
-            _, us = run_perftest(_allreduce)
-            row["us"] = us
-        rows.append(row)
-        del inp, out, ref, got
-        torch.cuda.empty_cache()
+                def _allreduce(eng=fly, src=inp, dst=out):
+                    eng.allreduce(src, dst)
+                    return dst
 
-    gathered = [None] * args.tp
-    dist.all_gather_object(gathered, rows, group=gloo)
-    if rank == 0 and args.out:
-        with open(args.out, "w") as fh:
-            json.dump({"ranks": gathered}, fh)
-    dist.barrier(group=group)
-    fly.close()
-    dist.destroy_process_group()
+                _, us = run_perftest(_allreduce, use_cuda_event=True)
+                row["us"] = float(us)
+            rows.append(row)
+            del inp, out, ref, got
+            torch.cuda.empty_cache()
+    finally:
+        fly.close()
+        dist.destroy_process_group()
+    return rows
 
 
 def _spawn(
@@ -280,83 +285,42 @@ def _spawn(
     grid_cap: int = DEFAULT_GRID_CAP,
     fill: str = "normal",
 ) -> list[list[dict]]:
-    # HIP QR/fused-AR use multiprocessing.Pool from ``python3`` __main__.
-    # This file is also collected by pytest, and FlyDSL JIT needs a fresh
-    # interpreter per rank, so ranks are Popen of this file with --rank
-    # (not Pool / torchrun). Init method matches the HIP QR helpers.
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(f"unsupported world_size={world_size}")
     n_gpu = torch.cuda.device_count()
     if n_gpu < world_size:
         pytest.skip(f"QRInt4 needs {world_size} GPUs, have {n_gpu}")
     init_method = get_distributed_init_method(get_ip(), get_open_port())
-    out_path = os.path.join(tempfile.mkdtemp(prefix="flydsl_qr_int4_"), "rank0.json")
-    env = dict(os.environ)
-    env["PYTHONPATH"] = (
-        f"{_REPO_ROOT}:{env['PYTHONPATH']}" if env.get("PYTHONPATH") else _REPO_ROOT
-    )
-    env["PYTHONUNBUFFERED"] = "1"
-    env.setdefault("FLYDSL_GPU_ARCH", ARCH)
-    tokens = ",".join(str(t) for t, _ in pairs)
-    hiddens = ",".join(str(h) for _, h in pairs)
-    procs = []
-    logs = []
-    for rank in range(world_size):
-        cmd = [
-            sys.executable,
-            os.path.abspath(__file__),
-            "--rank",
-            str(rank),
-            "--init-method",
-            init_method,
-            "--tp",
-            str(world_size),
-            "--tokens",
-            tokens,
-            "--hiddens",
-            hiddens,
-            "--super-tile",
-            str(super_tile),
-            "--grid-cap",
-            str(grid_cap),
-            "--fill",
-            fill,
+    token_list = [t for t, _ in pairs]
+    hidden_list = [h for _, h in pairs]
+    timeout = float(os.environ.get("FLYDSL_QR_TIMEOUT", "3600"))
+    pool = Pool(processes=world_size)
+    try:
+        results = [
+            pool.apply_async(
+                _run_rank,
+                kwds={
+                    "rank": rank,
+                    "tp": world_size,
+                    "init_method": init_method,
+                    "tokens": token_list,
+                    "hiddens": hidden_list,
+                    "super_tile": super_tile,
+                    "grid_cap": grid_cap,
+                    "fill": fill,
+                    "time_it": time_it,
+                },
+            )
+            for rank in range(world_size)
         ]
-        if time_it:
-            cmd.append("--time-it")
-        if rank == 0:
-            cmd += ["--out", out_path]
-        log = open(  # noqa: SIM115
-            f"/tmp/flydsl_qr_int4_tp{world_size}_rank{rank}.log",
-            "w",
-        )
-        procs.append(
-            subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
-        )
-        logs.append(log)
-    rc = 0
-    deadline = time.time() + float(os.environ.get("FLYDSL_QR_TIMEOUT", "3600"))
-    for proc in procs:
-        try:
-            rc |= proc.wait(timeout=max(1.0, deadline - time.time()))
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            rc |= 1
-    for log in logs:
-        log.close()
-    if rc != 0:
-        tails = []
-        for rank in range(world_size):
-            path = f"/tmp/flydsl_qr_int4_tp{world_size}_rank{rank}.log"
-            try:
-                with open(path) as fh:
-                    tails.append(f"===== rank {rank} =====\n{fh.read()[-4000:]}")
-            except OSError:
-                pass
-        raise RuntimeError("QRInt4 ranks failed\n" + "\n".join(tails))
-    with open(out_path) as fh:
-        payload = json.load(fh)
-    ranks = payload["ranks"]
+        ranks = [fut.get(timeout=timeout) for fut in results]
+    except Exception:
+        pool.terminate()
+        raise
+    else:
+        pool.close()
+    finally:
+        pool.join()
     if len(ranks) != world_size:
         raise RuntimeError(f"QRInt4 gathered {len(ranks)} ranks, expected {world_size}")
     return ranks
@@ -578,26 +542,5 @@ def main():
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--rank", type=int, default=None)
-    parser.add_argument("--init-method", default=None)
-    parser.add_argument("--tokens", default="")
-    parser.add_argument("--hiddens", default="")
-    parser.add_argument("--super-tile", type=int, default=SUPER_TILE)
-    parser.add_argument("--grid-cap", type=int, default=DEFAULT_GRID_CAP)
-    parser.add_argument("--time-it", action="store_true")
-    parser.add_argument("--fill", default="normal", choices=_FILLS)
-    parser.add_argument("--out", default=None)
-    known, rest = parser.parse_known_args()
-    if known.rank is not None:
-        rank_parser = argparse.ArgumentParser()
-        rank_parser.add_argument("--tp", type=int, default=TP)
-        rank_args, _ = rank_parser.parse_known_args(rest)
-        known.tp = rank_args.tp
-        known.tokens = [int(t) for t in known.tokens.split(",") if t]
-        known.hiddens = [int(h) for h in known.hiddens.split(",") if h]
-        if len(known.tokens) != len(known.hiddens):
-            raise SystemExit("tokens and hiddens lists must match")
-        _run_rank(known)
-    else:
-        main()
+    freeze_support()
+    main()
