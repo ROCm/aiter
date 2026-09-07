@@ -148,4 +148,56 @@ def pre_pruning_rules(M: int, N: int, K: int, config_list: list[int], verbose: b
                 f"Remove case {config_list} because BLOCK_SIZE_K < K // NUM_KSPLIT and num_stages == 1"
             )
         return True
+    if _extra_pruning_rules(
+        M, N, _BLOCK_SIZE_M, _BLOCK_SIZE_N, _num_warps, config_list, verbose
+    ):
+        return True
+    return False
+
+
+def _extra_pruning_rules(
+    M: int,
+    N: int,
+    BLOCK_SIZE_M: int,
+    BLOCK_SIZE_N: int,
+    num_warps: int,
+    config_list: list[int],
+    verbose: bool,
+):
+    """Opt-in cross-dimension rules, enabled only via $SCREEN_EXTRA_PRUNE.
+
+    Disabled by default, so every existing tuning flow is unaffected. The spec
+    is a comma-separated key=value list:
+
+      B=<batch>   batch dim of a batched GEMM (grid multiplier); default 1
+      CU=<count>  compute units to fill; 0 disables the occupancy rule
+
+    Example: SCREEN_EXTRA_PRUNE="B=128,CU=256"
+    """
+    spec = os.environ.get("SCREEN_EXTRA_PRUNE", "")
+    if not spec:
+        return False
+    kv = dict(p.split("=", 1) for p in spec.split(",") if "=" in p)
+    B = int(kv.get("B", 1))
+    CU = int(kv.get("CU", 0))
+
+    # A workgroup grid smaller than the CU count leaves compute units idle for
+    # the whole kernel; no other knob can recover that.
+    if CU:
+        grid = B * -(-M // BLOCK_SIZE_M) * -(-N // BLOCK_SIZE_N)
+        if grid < CU:
+            if verbose:
+                print(f"Remove case {config_list} because grid {grid} < {CU} CUs")
+            return True
+
+    # Warp/tile balance: every warp should own at least one 16x16 mfma tile,
+    # and no warp should be handed an oversized slab.
+    tile = BLOCK_SIZE_M * BLOCK_SIZE_N
+    if not (tile / 8192 <= num_warps <= tile / 256):
+        if verbose:
+            print(
+                f"Remove case {config_list} because num_warps={num_warps} "
+                f"is unbalanced for a {BLOCK_SIZE_M}x{BLOCK_SIZE_N} tile"
+            )
+        return True
     return False
