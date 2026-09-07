@@ -52,8 +52,12 @@ def _apre_configs():
 
 def apre_kernel_name(m, n, k, tuned_name):
     """Best a_preshuffle kernel for this shape, else the tuned config with the
-    flag flipped -- valid, but usually not the optimal apre config."""
-    return _apre_configs().get((m, n, k), tuned_name + "_apre")
+    flag flipped."""
+    cached = _apre_configs().get((m, n, k))
+    if cached:
+        return cached
+    base, sep, ps = tuned_name.partition("_ps")
+    return base + "_apre" + sep + ps
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
