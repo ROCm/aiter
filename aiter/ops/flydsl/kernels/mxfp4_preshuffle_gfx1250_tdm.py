@@ -585,17 +585,18 @@ def launch_gemm_a8w4_tdm(
         def lds_sb_base(buf):
             return buf + fx.index_cast(T.index, lds_sb_lane_off)
 
-        def lds_bases(buf):
-            """Return ``buf``'s four region bases, the handles keepalive pins."""
-            return (
-                lds_a_base(buf),
-                lds_b_base(buf),
-                lds_sa_base(buf),
-                lds_sb_base(buf),
+        LdsAddr = namedtuple("LdsAddr", "a b sa sb")
+
+        def calc_lds_addr(buf):
+            """Calculate the lane-specific LDS bases for one stage buffer."""
+            return LdsAddr(
+                a=lds_a_base(buf),
+                b=lds_b_base(buf),
+                sa=lds_sa_base(buf),
+                sb=lds_sb_base(buf),
             )
 
-        def load_a(buf, wm, ksl):
-            base = lds_a_base(buf)
+        def load_a(base, wm, ksl):
             off = wm * 16 * A_LDS_ROW + ksl * A_KSTEP
             if const_expr(a_is_fp4):
                 return Vec(lds_load_b128(base, fx.Int32(off))).shuffle(
@@ -611,9 +612,7 @@ def launch_gemm_a8w4_tdm(
                 .shuffle(v[2].shuffle(v[3], list(range(8))), list(range(16)))
             )
 
-        def load_b(buf, wn, ksl):
-            base = lds_b_base(buf)
-
+        def load_b(base, wn, ksl):
             def load_half(half):
                 off = half * B_LDS_ROW + ksl * 1024
                 return Vec(lds_load_b128(base, fx.Int32(off))).shuffle(
@@ -624,13 +623,13 @@ def launch_gemm_a8w4_tdm(
                 return load_half(wn * 2).shuffle(load_half(wn * 2 + 1), list(range(16)))
             return load_half(wn)
 
-        def load_sa(buf, sm, ksl):
+        def load_sa(base, sm, ksl):
             off = (ksl * wmma_m_rep + sm * 2) * 16 * 4
-            return lds_load_b32(lds_sa_base(buf), fx.Int32(off))[0]
+            return lds_load_b32(base, fx.Int32(off))[0]
 
-        def load_sb(buf, sn, ksl):
+        def load_sb(base, sn, ksl):
             off = (sn * SC_INNER + ksl * 32) * 4
-            return lds_load_b32(lds_sb_base(buf), fx.Int32(off))[0]
+            return lds_load_b32(base, fx.Int32(off))[0]
 
         wmma_atoms = (
             []
@@ -738,16 +737,22 @@ def launch_gemm_a8w4_tdm(
         # cannot carry a Python value, and a prefetch needs a slot no WMMA reads.
         rmem_slots = [make_rmem_slot() for _ in range_constexpr(2)]
 
-        def load_state(slot, buf, ksl):
-            """Load one k128 of ``buf``'s A/B/scales into ``slot``."""
-            sb_v = [load_sb(buf, sn, ksl) for sn in range_constexpr(sb_pairs)]
-            sa_v = [load_sa(buf, sm, ksl) for sm in range_constexpr(sa_pairs)]
+        def load_lds_data(slot, lds_addr, ksl):
+            """Load one k128 from precomputed LDS bases into ``slot``."""
+            sb_v = [
+                load_sb(lds_addr.sb, sn, ksl)
+                for sn in range_constexpr(sb_pairs)
+            ]
+            sa_v = [
+                load_sa(lds_addr.sa, sm, ksl)
+                for sm in range_constexpr(sa_pairs)
+            ]
             slot.sb.store(Vec.from_elements(sb_v + sb_v[: SB_WIDTH - sb_pairs]))
             slot.sa.store(Vec.from_elements(sa_v + sa_v[: SA_WIDTH - sa_pairs]))
             for wn in range_constexpr(wmma_n_rep):
-                slot.b[wn].store(load_b(buf, wn, ksl))
+                slot.b[wn].store(load_b(lds_addr.b, wn, ksl))
             for wm in range_constexpr(wmma_m_rep):
-                slot.a[wm].store(load_a(buf, wm, ksl))
+                slot.a[wm].store(load_a(lds_addr.a, wm, ksl))
 
         def k_step(
             cur_rmem,
@@ -795,6 +800,14 @@ def launch_gemm_a8w4_tdm(
             ``prefetch_kt`` is None.
             """
 
+            lds_addr = calc_lds_addr(buf)
+            next_stage_lds_addr = (
+                calc_lds_addr(next_stage_buf)
+                if const_expr(next_stage_buf is not None)
+                else None
+            )
+            rocdl.sched_barrier(0)
+
             def do_issue():
                 issue(prefetch_kt % num_buffers, prefetch_kt, my_jobs)
 
@@ -809,7 +822,7 @@ def launch_gemm_a8w4_tdm(
 
             def emit_hints(ksl, tail_mfma=0):
                 has_next = ksl + 1 < KWS or (
-                    ksl + 1 == KWS and next_stage_buf is not None
+                    ksl + 1 == KWS and next_stage_lds_addr is not None
                 )
                 if const_expr(ksl == 0):
                     rocdl.sched_dsrd(STATE_DS if not rmem_preloaded else 0)
@@ -837,18 +850,22 @@ def launch_gemm_a8w4_tdm(
                     rocdl.sched_mfma(tail_mfma)
 
             if const_expr(not rmem_preloaded):
-                load_state(rmem_slots[0], buf, 0)
+                load_lds_data(rmem_slots[0], lds_addr, 0)
             for ksl in range_constexpr(KWS):
                 is_last = ksl + 1 == KWS
-                carries = is_last and next_stage_buf is not None
+                carries = is_last and next_stage_lds_addr is not None
                 # At most one prefetch per k128: the next subtile of this tile,
                 # or -- on the last one -- the next tile's subtile 0, into slot 0.
                 if const_expr(not is_last):
                     next_rmem = rmem_slots[(ksl + 1) % 2]
-                    load_nxt_fn = lambda n=next_rmem, k=ksl + 1: load_state(n, buf, k)
+                    load_nxt_fn = lambda n=next_rmem, k=ksl + 1: load_lds_data(
+                        n, lds_addr, k
+                    )
                 elif const_expr(carries):
                     next_rmem = rmem_slots[0]
-                    load_nxt_fn = lambda n=next_rmem: load_state(n, next_stage_buf, 0)
+                    load_nxt_fn = lambda n=next_rmem: load_lds_data(
+                        n, next_stage_lds_addr, 0
+                    )
                 else:
                     next_rmem, load_nxt_fn = None, None
                 k_step(
@@ -870,7 +887,11 @@ def launch_gemm_a8w4_tdm(
                     ksl,
                     (
                         FENCE_COVER_MMA
-                        if (tile_m > 32 and not is_last and next_stage_buf is not None)
+                        if (
+                            tile_m > 32
+                            and not is_last
+                            and next_stage_lds_addr is not None
+                        )
                         else 0
                     ),
                 )
@@ -910,7 +931,9 @@ def launch_gemm_a8w4_tdm(
                     # outside ``dispatch_wave_job``, since every wave runs this once.
                     tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
                     workgroup_barrier()
-                    load_state(rmem_slots[0], ptr_to_idx(buf_ptr(0)), 0)
+                    first_lds_addr = calc_lds_addr(ptr_to_idx(buf_ptr(0)))
+                    rocdl.sched_barrier(0)
+                    load_lds_data(rmem_slots[0], first_lds_addr, 0)
 
                 def steady_post(my_jobs):
                     for kt in range(n_steady):
@@ -966,7 +989,9 @@ def launch_gemm_a8w4_tdm(
                 n_steady = K_TILES - PRE
                 if const_expr(next_stage_on):
                     pipeline_fence(outstanding=TDM_PER * (PRE - 1))
-                    load_state(rmem_slots[0], ptr_to_idx(buf_ptr(0)), 0)
+                    first_lds_addr = calc_lds_addr(ptr_to_idx(buf_ptr(0)))
+                    rocdl.sched_barrier(0)
+                    load_lds_data(rmem_slots[0], first_lds_addr, 0)
 
                 # With the carry, a tile's only fence is at its last k128 (see
                 # k_step); buffer 0 and the first drain tile use the prologue's.
