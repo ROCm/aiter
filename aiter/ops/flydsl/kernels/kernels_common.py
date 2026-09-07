@@ -10,6 +10,7 @@ from typing import Any
 
 import flydsl.expr as fx
 from flydsl._mlir import ir
+from flydsl._mlir.dialects import arith as _std_arith
 from flydsl._mlir.dialects import builtin
 from flydsl._mlir.dialects import gpu as _gpu
 from flydsl._mlir.dialects import llvm as _llvm
@@ -133,6 +134,73 @@ def create_llvm_ptr(value, address_space: int = 1):
     )
     ptr = fx.to_llvm_ptr(fx.inttoptr(pt, value))
     return ptr._value if hasattr(ptr, "_value") else ptr
+
+
+def _unwrap_ir(value):
+    """Materialise a DSL Numeric / ArithValue wrapper as a raw ir.Value."""
+    if hasattr(value, "ir_value") and not isinstance(value, ir.Value):
+        return value.ir_value()
+    while not isinstance(value, ir.Value) and hasattr(value, "_value"):
+        value = value._value
+    return value
+
+
+def get_element_ptr(
+    base_ptr,
+    byte_offset: int | ir.Value | None = None,
+    static_byte_offset: int = 0,
+    elem_type: ir.Type | None = None,
+    no_wrap_flags=None,
+) -> ir.Value:
+    """Build an LLVM GEP from a base pointer plus byte offsets."""
+    _gep_dynamic_index_sentinel = -(2**31)
+
+    base_ptr = _unwrap_ir(base_ptr)
+    if not isinstance(static_byte_offset, int):
+        raise TypeError(
+            f"static_byte_offset must be int, got {type(static_byte_offset).__name__}"
+        )
+    if elem_type is None:
+        elem_type = T.i8
+    elif callable(elem_type):
+        elem_type = elem_type()
+
+    if byte_offset is None:
+        dynamic_indices = []
+        raw_constant_indices = [int(static_byte_offset)]
+    elif isinstance(byte_offset, int):
+        dynamic_indices = []
+        raw_constant_indices = [int(byte_offset) + int(static_byte_offset)]
+    else:
+        offset_val = _unwrap_ir(byte_offset)
+        if isinstance(offset_val.type, ir.IndexType):
+            i64_type = T.i64
+            offset_val = _unwrap_ir(_std_arith.IndexCastOp(i64_type, offset_val).result)
+        elif not isinstance(offset_val.type, ir.IntegerType):
+            raise TypeError(
+                "byte_offset must be int, index, or integer-typed MLIR value; "
+                f"got {offset_val.type}"
+            )
+
+        if static_byte_offset != 0:
+            static_type = offset_val.type
+            static_attr = ir.IntegerAttr.get(static_type, int(static_byte_offset))
+            static_const = _unwrap_ir(
+                _std_arith.ConstantOp(static_type, static_attr).result
+            )
+            offset_val = _unwrap_ir(_std_arith.AddIOp(offset_val, static_const).result)
+
+        dynamic_indices = [offset_val]
+        raw_constant_indices = [_gep_dynamic_index_sentinel]
+
+    return _llvm.GEPOp(
+        base_ptr.type,
+        base_ptr,
+        dynamic_indices,
+        raw_constant_indices,
+        elem_type,
+        no_wrap_flags,
+    ).result
 
 
 def stream_ptr_to_async_token(stream_ptr_value, loc=None, ip=None):

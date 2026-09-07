@@ -39,7 +39,7 @@ from flydsl.expr.rocdl import tdm_ops
 
 from aiter.ops.flydsl.kernels import buffer_ops
 
-from ..kernels_common import create_llvm_ptr
+from ..kernels_common import create_llvm_ptr, get_element_ptr
 
 _scf_if_dispatch = ReplaceIfWithDispatch.scf_if_dispatch
 
@@ -694,7 +694,7 @@ class KManager16bV1:
                 for half in range(2):
                     p = base_ptrs[half]
                     if imm:
-                        p = buffer_ops.get_element_ptr(p, static_byte_offset=imm)
+                        p = get_element_ptr(p, static_byte_offset=imm)
                     out.append(fx.Vector(llvm_dialect.load(v8_ty, p)))
         return out
 
@@ -907,7 +907,7 @@ class VManager16bV1:
                     imm = (key_off - rep_off) + lds_imm_offset
                     p = base_ptrs[dt % 2]
                     if imm:
-                        p = buffer_ops.get_element_ptr(p, static_byte_offset=imm)
+                        p = get_element_ptr(p, static_byte_offset=imm)
                     out.append(fx.Vector(rocdl.ds_load_tr16_b128(v8_ty, p)))
         return out
 
@@ -1144,9 +1144,9 @@ class QManager16bV2:
                 p_lo = (
                     base
                     if imm_lo == 0
-                    else buffer_ops.get_element_ptr(base, static_byte_offset=imm_lo)
+                    else get_element_ptr(base, static_byte_offset=imm_lo)
                 )
-                p_hi = buffer_ops.get_element_ptr(base, static_byte_offset=imm_hi)
+                p_hi = get_element_ptr(base, static_byte_offset=imm_hi)
                 lo = fx.Vector(llvm_dialect.load(v8_ty, p_lo))
                 hi = fx.Vector(llvm_dialect.load(v8_ty, p_hi))
                 q_frags_list[qt].append(lo.shuffle(hi, list(range(16))) * scale_bf16)
@@ -1235,7 +1235,7 @@ class KManager16bV2:
                     )
                     p = base
                     if imm:
-                        p = buffer_ops.get_element_ptr(base, static_byte_offset=imm)
+                        p = get_element_ptr(base, static_byte_offset=imm)
                     out.append(fx.Vector(llvm_dialect.load(v8_ty, p)))
         return out
 
@@ -1323,7 +1323,7 @@ class VManager16bV2:
                     )
                     p = base
                     if imm:
-                        p = buffer_ops.get_element_ptr(base, static_byte_offset=imm)
+                        p = get_element_ptr(base, static_byte_offset=imm)
                     out.append(fx.Vector(rocdl.ds_load_tr16_b128(v8_ty, p)))
         return out
 
@@ -1651,7 +1651,7 @@ class OManager16bV2:
             p = (
                 base_ptr
                 if imm == 0
-                else buffer_ops.get_element_ptr(base_ptr, static_byte_offset=imm)
+                else get_element_ptr(base_ptr, static_byte_offset=imm)
             )
             llvm_dialect.store(_ir(bf), p, alignment=_CHUNK_BYTES)
         rocdl.s_wait_dscnt(0)  # drain b128 stores so the TDM read sees coherent LDS
@@ -1815,7 +1815,7 @@ class OManager16bV3:
             p = (
                 base_ptr
                 if imm == 0
-                else buffer_ops.get_element_ptr(base_ptr, static_byte_offset=imm)
+                else get_element_ptr(base_ptr, static_byte_offset=imm)
             )
             ds_ops.append((bf, p))
         self._pending.append(ds_ops)

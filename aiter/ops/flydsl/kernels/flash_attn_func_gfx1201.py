@@ -46,9 +46,7 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
 
-from aiter.ops.flydsl.kernels import buffer_ops
-
-from .kernels_common import dtype_to_elem_type
+from .kernels_common import dtype_to_elem_type, get_element_ptr
 from .tensor_shim import _run_compiled
 
 KERNEL_NAME = "flash_attn_func_gfx1201_c_exp_a_k_noswizzle_kernel"
@@ -263,15 +261,11 @@ def build_flash_attn_func_module_primary(
             return token * STRIDE_TOKEN + head_idx * HEAD_DIM + col
 
         def _load_global_half_vec(ptr, base_idx, vec_type):
-            gep = buffer_ops.get_element_ptr(
-                ptr, fx.Int64(base_idx), elem_type=elem_type
-            )
+            gep = get_element_ptr(ptr, fx.Int64(base_idx), elem_type=elem_type)
             return _pointer_load(vec_type, gep)
 
         def _store_global_half(ptr, base_idx, val):
-            gep = buffer_ops.get_element_ptr(
-                ptr, fx.Int64(base_idx), elem_type=elem_type
-            )
+            gep = get_element_ptr(ptr, fx.Int64(base_idx), elem_type=elem_type)
             _pointer_store(val, gep)
 
         def load_global_f16xN(base_ptr, base_idx):

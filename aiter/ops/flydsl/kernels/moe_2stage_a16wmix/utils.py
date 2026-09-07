@@ -22,9 +22,10 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.layout_utils import crd2idx
 from aiter.ops.flydsl.kernels.tensor_shim import _to_raw as _raw
+
+from ..kernels_common import get_element_ptr
 
 # a16wi4 (int4 W) groupwise scale: group_size = 32 == one MFMA K32 step (one ku per
 # K-group). Scale packed bf16 pairs (E, G//2, N, 2); even/odd ku selects lo/hi half.
@@ -98,9 +99,7 @@ def _global_base_ptr1(addr_i64):
 
 def _gep(base_ptr, byte_off_i32):
     # Byte GEP; polymorphic in the base ptr's address space (global ptr<1> / LDS ptr<3>).
-    return buffer_ops.get_element_ptr(
-        base_ptr, byte_offset=_raw(byte_off_i32), elem_type=T.i8
-    )
+    return get_element_ptr(base_ptr, byte_offset=_raw(byte_off_i32), elem_type=T.i8)
 
 
 def _cvt_pk_bf16_f32_se(src_a_f32, src_b_f32):
