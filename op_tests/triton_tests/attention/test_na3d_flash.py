@@ -302,12 +302,15 @@ def test_na3d_flash(B, T, H, W, NH, HD, KT, KH, KW, dtype):
     ref = _na3d_sdpa_exact(q, k, v, kernel_size=(KT, KH, KW))
     out = na3d_flash_attn(q, k, v, kernel_size=(KT, KH, KW))
 
-    checkAllclose(
-        ref.float(),
-        out.float(),
-        rtol=1e-2,
-        atol=5e-2,
-        msg=f"na3d_flash (T={T},H={H},W={W},k=({KT},{KH},{KW}))",
+    assert (
+        checkAllclose(
+            ref.float(),
+            out.float(),
+            rtol=1e-2,
+            atol=5e-2,
+            msg=f"na3d_flash (T={T},H={H},W={W},k=({KT},{KH},{KW}))",
+        )
+        <= 0.05
     )
 
 
@@ -335,10 +338,13 @@ def test_na3d_sdpa_exact_vs_ref(B, T, H, W, NH, HD, KT, KH, KW):
     ref = na3d_sdpa_ref(q, k, v, kernel_size=(KT, KH, KW))
     exact = _na3d_sdpa_exact(q, k, v, kernel_size=(KT, KH, KW))  # w_offset=0 default
 
-    checkAllclose(
-        ref.float(),
-        exact.float(),
-        rtol=1e-2,
-        atol=5e-2,
-        msg=f"_na3d_sdpa_exact vs na3d_sdpa_ref (T={T},H={H},W={W},k=({KT},{KH},{KW}))",
+    assert (
+        checkAllclose(
+            ref.float(),
+            exact.float(),
+            rtol=1e-2,
+            atol=5e-2,
+            msg=f"_na3d_sdpa_exact vs na3d_sdpa_ref (T={T},H={H},W={W},k=({KT},{KH},{KW}))",
+        )
+        <= 0.05
     )
