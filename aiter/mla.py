@@ -21,17 +21,6 @@ _FLYDSL_MLA_REDUCE_TARGET_H = 16
 _FLYDSL_MLA_REDUCE_TARGET_DV = 512
 
 
-@functools.lru_cache(maxsize=1)
-def _flydsl_mla_reduce_available() -> bool:
-    """Whether the optional FlyDSL package is available on this device."""
-    try:
-        from aiter.ops.flydsl import is_flydsl_available
-
-        return is_flydsl_available()
-    except (ImportError, OSError, RuntimeError):
-        return False
-
-
 def _flydsl_mla_reduce_supported(
     partial_output: torch.Tensor,
     partial_lse: torch.Tensor,
@@ -99,20 +88,14 @@ def _flydsl_mla_reduce_enabled() -> bool:
     use the HIP path; the latter is routed directly by its caller rather than
     inferred from ``max_seqlen_q``. Calls outside the permitted ABI and shape scope
     use the HIP path.
-    Not memoized, so the env var can be toggled at runtime; only the optional
-    package availability probe above is cached.
+    Not memoized, so the env var can be toggled at runtime.
     """
-    try:
-        from flydsl.utils.env import EnvManager, OptBool
+    from flydsl.utils.env import EnvManager, OptBool
 
-        class _Env(EnvManager):
-            enabled = OptBool(False, env_var="AITER_MLA_REDUCE_FLYDSL")
+    class _Env(EnvManager):
+        enabled = OptBool(False, env_var="AITER_MLA_REDUCE_FLYDSL")
 
-        if not _Env().enabled:
-            return False
-        return _flydsl_mla_reduce_available()
-    except (ImportError, OSError, RuntimeError, ValueError):
-        return False
+    return bool(_Env().enabled)
 
 
 def _mla_decode_reduce_v1_dispatch(
@@ -402,13 +385,8 @@ def _fold_seqlen_indptr(indptr, fold_factor):
     """Repeat each batch's seqlen ``fold_factor`` times (head-folding pseudo-batches)."""
     lens = indptr[1:] - indptr[:-1]
     folded_lens = lens.repeat_interleave(fold_factor)
-    out = torch.empty(
-        indptr.shape[0] + (fold_factor - 1) * (indptr.shape[0] - 1),
-        dtype=indptr.dtype,
-        device=indptr.device,
-    )
-    out[0] = 0
-    out[1:] = torch.cumsum(folded_lens, dim=0).to(indptr.dtype)
+    cumsum = torch.cumsum(folded_lens, dim=0).to(indptr.dtype)
+    out = torch.nn.functional.pad(cumsum, (1, 0), value=0)
     return out
 
 

@@ -1,4 +1,22 @@
-"""D128 BF16 FMHA Forward Prologue — gfx1250 Pure FlyDSL Implementation.
+"""
+=============================================================================
+LEGACY / DEPRECATED — DO NOT MODIFY
+=============================================================================
+Prologue of the ORIGINAL gfx1250 FMHA forward pipeline (the "d192
+sibling"); used only by ``fmha_kernel.py``.
+
+Superseded by the clean-DSL ``fmha_fwd_prefill_a16w16_m32x8.py``, which is
+the DEFAULT route for qk_hdim 128 and 192. This pipeline now survives only
+as the qk_hdim==192 A/B fallback under ``AITER_ENABLE_EXPERIMENTAL=1``.
+
+Frozen on purpose: the schedule is hand-interleaved WMMA/LDS/TDM tuned
+against a reference ISA listing, and it is NOT covered by
+``op_tests/test_mha_flydsl.py``. Edits here silently move the A/B baseline
+the new kernel is measured against. Put new work in
+``fmha_fwd_prefill_a16w16_m32x8.py`` instead.
+=============================================================================
+
+D128 BF16 FMHA Forward Prologue — gfx1250 Pure FlyDSL Implementation.
 
 FlyDSL-native implementation of the FMHA prologue with compiler-managed
 VGPR bank allocation via @llvm.amdgcn.set.vgpr.bank intrinsic.

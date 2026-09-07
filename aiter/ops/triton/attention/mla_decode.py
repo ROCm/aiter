@@ -30,6 +30,8 @@ import torch
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
 is_hip_ = hasattr(torch.version, "hip") and torch.version.hip is not None
 
 
@@ -38,7 +40,23 @@ def tanh(x):
     return 2 * tl.sigmoid(2 * x) - 1
 
 
-@triton.jit
+_fwd_kernel_stage1_repr = make_kernel_repr(
+    "_fwd_kernel_stage1",
+    [
+        "kv_group_num",
+        "BLOCK_DMODEL",
+        "BLOCK_DPE",
+        "BLOCK_DV",
+        "BLOCK_N",
+        "NUM_KV_SPLITS",
+        "PAGE_SIZE",
+        "Lk",
+        "Lv",
+    ],
+)
+
+
+@triton.jit(repr=_fwd_kernel_stage1_repr)
 def _fwd_kernel_stage1(
     Q,
     K_Buffer,
@@ -277,7 +295,25 @@ def _decode_att_m_fwd(
     )
 
 
-@triton.jit
+_fwd_grouped_kernel_stage1_repr = make_kernel_repr(
+    "_fwd_grouped_kernel_stage1",
+    [
+        "kv_group_num",
+        "q_head_num",
+        "BLOCK_DMODEL",
+        "BLOCK_DPE",
+        "BLOCK_DV",
+        "BLOCK_N",
+        "BLOCK_H",
+        "NUM_KV_SPLITS",
+        "PAGE_SIZE",
+        "Lk",
+        "Lv",
+    ],
+)
+
+
+@triton.jit(repr=_fwd_grouped_kernel_stage1_repr)
 def _fwd_grouped_kernel_stage1(
     Q,
     K_Buffer,
@@ -543,7 +579,17 @@ def _decode_grouped_att_m_fwd(
     )
 
 
-@triton.jit
+_fwd_kernel_stage2_repr = make_kernel_repr(
+    "_fwd_kernel_stage2",
+    [
+        "NUM_KV_SPLITS",
+        "BLOCK_DV",
+        "Lv",
+    ],
+)
+
+
+@triton.jit(repr=_fwd_kernel_stage2_repr)
 def _fwd_kernel_stage2(
     Mid_O,
     o,
@@ -646,7 +692,15 @@ def _decode_softmax_reducev_fwd(
     )
 
 
-@triton.jit
+_csr_to_dense_kernel_repr = make_kernel_repr(
+    "_csr_to_dense_kernel",
+    [
+        "BLOCK_N",
+    ],
+)
+
+
+@triton.jit(repr=_csr_to_dense_kernel_repr)
 def _csr_to_dense_kernel(
     kv_indices,
     kv_indptr,

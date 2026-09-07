@@ -4,12 +4,17 @@ Keep helper naming consistent with other kernel helpers (e.g. `mfma_preshuffle_p
 but this module is intentionally small and MLIR-dialect facing.
 """
 
+from collections.abc import Callable
+from threading import Lock
+from typing import Any
+
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import arith as _std_arith
 from flydsl._mlir.dialects import builtin
 from flydsl._mlir.dialects import gpu as _gpu
 from flydsl._mlir.dialects import llvm as _llvm
+from flydsl.expr import as_ir_value
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch, is_rdna_arch
 
@@ -25,6 +30,26 @@ def format_kernel_name(name: str) -> str:
     ``.amdhsa_kernel`` directive and the whole module fails to link.
     """
     return name.replace("-", "_")
+
+
+def uint32_to_int32(x: int) -> int:
+    """Return the signed int32 value with the same low 32-bit pattern."""
+    return x - (1 << 32) if x >= (1 << 31) else x
+
+
+def atomic_add_i32(memref, val, offset, syncscope):
+    """Atomically add an int32 value and return the previous value."""
+    ptr = fx.to_llvm_ptr(fx.get_iter(memref) + offset)
+    val = fx.Int32(val) if isinstance(val, int) else val
+    old = _llvm.AtomicRMWOp(
+        _llvm.AtomicBinOp.add,
+        ptr,
+        as_ir_value(val),
+        _llvm.AtomicOrdering.monotonic,
+        syncscope=syncscope,
+        alignment=4,
+    ).result
+    return fx.Int32(old)
 
 
 def get_warp_size(arch=None):
@@ -109,3 +134,41 @@ def stream_ptr_to_async_token(stream_ptr_value, loc=None, ip=None):
         [async_token_type], [stream_llvm_ptr], loc=loc, ip=ip
     )
     return cast_op.results[0]
+
+
+_compiled_cache_lock = Lock()
+
+
+def run_cached(
+    jit_func: Any,
+    *compile_args: Any,
+    constexpr_param: Any,
+    compiler: Callable[..., Any],
+    dispatch_args: tuple[Any, ...],
+) -> Any:
+    """Cache a layout-dynamic FlyDSL dispatcher by constexpr param."""
+    cache_key = constexpr_param.__cache_signature__()
+    compiled_cache = getattr(jit_func, "_compiled_cache", None)
+    if compiled_cache is not None:
+        compiled = compiled_cache.get(cache_key)
+        if compiled is not None:
+            compiled(*dispatch_args)
+            return compiled
+
+    dispatch_after_wait = False
+    with _compiled_cache_lock:
+        compiled_cache = getattr(jit_func, "_compiled_cache", None)
+        if compiled_cache is None:
+            compiled_cache = {}
+            jit_func._compiled_cache = compiled_cache
+
+        compiled = compiled_cache.get(cache_key)
+        if compiled is None:
+            compiled = compiler(jit_func, *compile_args)
+            compiled_cache[cache_key] = compiled
+        else:
+            dispatch_after_wait = True
+
+    if dispatch_after_wait:
+        compiled(*dispatch_args)
+    return compiled
