@@ -495,6 +495,12 @@ def flydsl_gemm(
         and bias.dtype == inp.dtype
     ):
         fused_bias = bias
+
+        inp = inp.detach()
+        weights = weights.detach()
+        if fused_bias is not None:
+            fused_bias = fused_bias.detach()
+
     out = flydsl_gemm_kernels.flydsl_hgemm(
         inp,
         weights,
