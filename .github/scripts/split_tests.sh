@@ -53,7 +53,6 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     mapfile -t ALL_FILES < <(find "$TEST_DIR" -maxdepth 1 -name 'test_*.py' -type f | LC_ALL=C sort)
     FLYDSL_GEMM_TESTS=(
         "op_tests/flydsl_tests/test_flydsl_decode_gemm.py"
-        "op_tests/flydsl_tests/test_flydsl_small_m_hgemm.py"
         "op_tests/flydsl_tests/test_flydsl_preshuffle_gemm_splitk.py"
     )
     for test_file in "${FLYDSL_GEMM_TESTS[@]}"; do
@@ -99,7 +98,6 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_flydsl_qk_norm_rope_quant.py]=88
     FILE_TIMES[op_tests/flydsl_tests/test_flydsl_preshuffle_gemm_splitk.py]=60
     FILE_TIMES[op_tests/flydsl_tests/test_flydsl_decode_gemm.py]=45
-    FILE_TIMES[op_tests/flydsl_tests/test_flydsl_small_m_hgemm.py]=30
     FILE_TIMES[op_tests/test_kvcache.py]=73
     FILE_TIMES[op_tests/test_gemm_a8w8_blockscale.py]=69
     FILE_TIMES[op_tests/test_jit_dir_with_enum.py]=69
@@ -182,7 +180,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_gemm_a8w8_bpreshuffle_pad_k.py]=7
     FILE_TIMES[op_tests/test_gemm_codegen.py]=7
     FILE_TIMES[op_tests/test_jit_arch_guard.py]=7
-    FILE_TIMES[op_tests/test_mha_flydsl_varlen.py]=7
+    FILE_TIMES[op_tests/test_mha_flydsl.py]=7
     FILE_TIMES[op_tests/test_mla_decode_pagesize64.py]=7
     FILE_TIMES[op_tests/test_mla_v40_persistent.py]=7
     FILE_TIMES[op_tests/test_mla_v4_kargpreld.py]=7
@@ -249,6 +247,7 @@ elif [[ "$TEST_TYPE" == "triton" ]]; then
     FILE_TIMES[op_tests/triton_tests/gemm/batched/test_batched_gemm_a8w8.py]=28
     FILE_TIMES[op_tests/triton_tests/attention/test_pa_decode_sparse.py]=26
     FILE_TIMES[op_tests/triton_tests/moe/test_moe_routing_herd.py]=24
+    FILE_TIMES[op_tests/triton_tests/test_fused_kda_decode.py]=24
     FILE_TIMES[op_tests/triton_tests/fusions/test_fused_reduce_qk_norm_rope_swa_write.py]=23
     FILE_TIMES[op_tests/triton_tests/gemm/basic/test_gemm_a16w8_blockscale.py]=22
     FILE_TIMES[op_tests/triton_tests/gemm/basic/test_gemm_afp8wfp8.py]=22
