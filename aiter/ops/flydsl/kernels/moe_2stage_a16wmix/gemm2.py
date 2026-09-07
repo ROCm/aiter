@@ -5,7 +5,6 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -17,10 +16,7 @@ from aiter.ops.flydsl.kernels.mxfp4_gemm_common import (
 )
 
 from .utils import (
-    _gep,
-    _global_base_ptr1,
     _global_i32_at,
-    _lds_ptr3,
     _mma_bf16,
     _raw,
     _udiv,
@@ -152,11 +148,11 @@ def _cshuffle_bf16_epilog(
 ):
     """CShuffle then coalesced vec2 store into unique [token*topk+slot, N] rows.
 
-    Same 4-wave N-split / MFMA acc layout as ``_atomic_bf16_epilog``. Writes
-    routing-weighted bf16 into LDS (half the atomic f32 staging), remaps to
-    (MLane=8, NLane=32), and ``llvm.StoreOp``s — no atomics. Invalid/padded
-    rows are skipped; every valid (token, slot) is unique so a later topk
-    sum is race-free.
+    Same 4-wave N-split / MFMA acc layout and BufferCopy loads/stores as
+    ``_atomic_bf16_epilog``. Writes routing-weighted bf16 into LDS, remaps to
+    (MLane=8, NLane=32), and buffer-stores — no atomics. Invalid/padded rows
+    are skipped; every valid (token, slot) is unique so a later topk sum is
+    race-free.
     """
     _kMChunks = BM // 16
     M_REPS = BM // 8
@@ -165,46 +161,42 @@ def _cshuffle_bf16_epilog(
     _s_count = BN // 64
     lane_div_16 = lane // fx.Int32(16)
     lane_mod_16 = lane % fx.Int32(16)
-    lds_base = _lds_ptr3(lds_acc_base_i32, fx.Int32(0))
+    lds_bf16 = lds_typed_ptr(lds_acc_base_i32, T.bf16)
 
     tx_i32 = fx.Int32(gpu.thread_id("x"))
     m_lane = tx_i32 // fx.Int32(32)
     n_lane = tx_i32 % fx.Int32(32)
     col_start = n_lane * fx.Int32(2)
-    stids_base = _global_base_ptr1(arg_stids)
-    sweights_base = _global_base_ptr1(arg_sweights)
-    out_base = _global_base_ptr1(arg_out)
+
+    def _flat_buffer(arg, elem_ty, align):
+        ptr = global_typed_ptr(arg, elem_ty, align=align)
+        view = fx.Tensor(fx.make_view(ptr, fx.make_layout((1, 1), (1, 1))))
+        return fx.rocdl.make_buffer_tensor(view, max_size=True)
+
+    stids = _flat_buffer(arg_stids, T.i32, 4)
+    sweights = _flat_buffer(arg_sweights, T.f32, 4)
+    out_bf16 = _flat_buffer(arg_out, T.bf16, 4)
+
+    load_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
+    load_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+    store_bf16x2 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.BFloat16)
+
+    def load_scalar(atom, src, index, elem_ty):
+        frag = fx.make_rmem_tensor(1, elem_ty)
+        fx.copy(atom, src[None, index], frag)
+        return Vec(frag.load())[0]
 
     packed = []
     for mr in range_constexpr(M_REPS):
         sorted_pos = m_row + fx.Int32(mr * 8) + m_lane
-        packed.append(
-            llvm.load(T.i32, _gep(stids_base, sorted_pos * fx.Int32(4)), invariant=True)
-        )
+        packed.append(load_scalar(load_i32, stids, sorted_pos, fx.Int32))
 
-    # Weighted f32 -> bf16 into row-major LDS (CShuffle write).
     for i in range_constexpr(_kMChunks):
         row_base = fx.Int32(i * 16) + lane_div_16 * fx.Int32(4)
-        w0 = llvm.load(
-            T.f32,
-            _gep(sweights_base, (m_row + row_base) * fx.Int32(4)),
-            invariant=True,
-        )
-        w1 = llvm.load(
-            T.f32,
-            _gep(sweights_base, (m_row + row_base + fx.Int32(1)) * fx.Int32(4)),
-            invariant=True,
-        )
-        w2 = llvm.load(
-            T.f32,
-            _gep(sweights_base, (m_row + row_base + fx.Int32(2)) * fx.Int32(4)),
-            invariant=True,
-        )
-        w3 = llvm.load(
-            T.f32,
-            _gep(sweights_base, (m_row + row_base + fx.Int32(3)) * fx.Int32(4)),
-            invariant=True,
-        )
+        w0 = load_scalar(load_f32, sweights, m_row + row_base, fx.Float32)
+        w1 = load_scalar(load_f32, sweights, m_row + row_base + fx.Int32(1), fx.Float32)
+        w2 = load_scalar(load_f32, sweights, m_row + row_base + fx.Int32(2), fx.Float32)
+        w3 = load_scalar(load_f32, sweights, m_row + row_base + fx.Int32(3), fx.Float32)
         for J in range_constexpr(num_acc_n):
             col = wave * fx.Int32(_n_per_wave) + fx.Int32(J * 16) + lane_mod_16
             vec = Vec(accm[i][J])
@@ -214,7 +206,7 @@ def _cshuffle_bf16_epilog(
             ).to(fx.BFloat16)
             for v in range_constexpr(4):
                 idx = (row_base + fx.Int32(v)) * fx.Int32(BN) + col
-                llvm.StoreOp(_raw(bf4[v]), _gep(lds_base, idx * fx.Int32(2)))
+                lds_bf16[idx] = bf4[v]
 
     gpu.barrier()
 
@@ -231,10 +223,18 @@ def _cshuffle_bf16_epilog(
             for s in range_constexpr(_s_count):
                 idx0 = row_in_block * fx.Int32(BN) + col_start + fx.Int32(s * 64)
                 pk = Vec(
-                    llvm.load(T.vec(2, T.bf16), _gep(lds_base, idx0 * fx.Int32(2)))
+                    lds_vec_load(
+                        lds_acc_base_i32,
+                        idx0 * fx.Int32(2),
+                        Vec.make_type(2, fx.BFloat16),
+                        fx.BFloat16,
+                        align=4,
+                    )
                 )
-                off = (row_base_addr + fx.Int32(s * 64)) * fx.Int32(2)
-                llvm.StoreOp(_raw(pk), _gep(out_base, off))
+                out_frag = fx.make_rmem_tensor(2, fx.BFloat16)
+                out_frag.store(pk)
+                out_off = row_base_addr + fx.Int32(s * 64)
+                fx.copy(store_bf16x2, out_frag, out_bf16[None, out_off])
 
 
 def _gemm2_body_a16w4(
