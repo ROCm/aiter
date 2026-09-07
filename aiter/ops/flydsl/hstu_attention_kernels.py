@@ -940,7 +940,7 @@ def _make_bwd_kernel_runners(
     block_n: int | None = None,
     num_waves: int | None = None,
     waves_per_eu: int | None = None,
-    sort_by_length: bool = False,
+    sort_by_length: bool = True,
     stream: torch.cuda.Stream | None = None,
 ) -> dict:
     """Tuning/profiling helper: build the (dV+dK, dQ) launcher pair with an
