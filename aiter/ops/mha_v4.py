@@ -694,7 +694,7 @@ def mha_v4_packed(
 ) -> Tensor:
     """Launch non-causal MHA v4 over pre-quantized BSHD operands.
 
-    Formats and scale modes select an explicit ASM row. Packed widths and
+    Formats, packing, and scale modes select an explicit ASM row. Packed widths and
     nonstandard K layouts are validated before launch; output is BF16 BSHD.
     Pass the ragged LUT triple to select the sorted-sparse row; omit all three
     tensors for dense. The work table is built inside the sparse custom op.
@@ -1082,9 +1082,6 @@ def mha_v4(
         k_quantized, k_descale = quantize_mxfp4_k(k)
         if _is_fp8_format(v_format):
             v_quantized, v_descale = quantize_v_fp8(v)
-        elif lut_indices is None:
-            v_quantized, v_descale = quantize_v_mxfp4_fp6_p(v)
-            v_pack = AttentionPack.V_FOR_FP6_P
         else:
             v_quantized, v_descale = quantize_v_mxfp4(v)
         if lut_indices is None:

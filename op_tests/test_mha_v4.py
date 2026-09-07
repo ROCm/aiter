@@ -986,7 +986,7 @@ def test_mha_v4_mxfp4_gqa_matches_repeated_kv():
         v,
         AttentionFormat.MXFP4,
         AttentionFormat.MXFP4,
-        AttentionFormat.FP8,
+        AttentionFormat.MXFP4,
     )
     mha = mha_v4(
         q,
@@ -994,7 +994,7 @@ def test_mha_v4_mxfp4_gqa_matches_repeated_kv():
         v.repeat_interleave(16, dim=2),
         AttentionFormat.MXFP4,
         AttentionFormat.MXFP4,
-        AttentionFormat.FP8,
+        AttentionFormat.MXFP4,
     )
     torch.cuda.synchronize()
 
@@ -1130,7 +1130,6 @@ def test_mha_v4_native_schema_mutates_only_out():
         (AttentionFormat.INT8, AttentionFormat.FP8),
         (AttentionFormat.FP8, AttentionFormat.FP8),
         (AttentionFormat.FP8, AttentionFormat.MXFP6),
-        (AttentionFormat.MXFP4, AttentionFormat.FP8),
         (AttentionFormat.MXFP4, AttentionFormat.MXFP4),
         (AttentionFormat.MXFP6_E2M3, AttentionFormat.FP8),
         (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP6),
@@ -1489,7 +1488,7 @@ def test_mha_v4_sparse_work_table_leaves_uniform_counts_in_raster_order(
                 v,
                 AttentionFormat.MXFP4,
                 AttentionFormat.MXFP4,
-                native_fp8_format(),
+                AttentionFormat.MXFP4 if mask is None else native_fp8_format(),
                 block_mask=mask,
             ),
             marks=pytest.mark.skipif(
@@ -1658,9 +1657,7 @@ def test_mha_v4_sparse_gqa_all_true_mask_matches_repeated_kv(q_format, v_format)
     k_repeated = k.repeat_interleave(gqa_ratio, dim=2)
     v_repeated = v.repeat_interleave(gqa_ratio, dim=2)
 
-    gqa_dense = mha_v4(q, k, v, q_format, q_format, v_format)
     gqa_sparse = mha_v4(q, k, v, q_format, q_format, v_format, block_mask=mask)
-    mha_dense = mha_v4(q, k_repeated, v_repeated, q_format, q_format, v_format)
     mha_sparse = mha_v4(
         q,
         k_repeated,
@@ -1672,8 +1669,12 @@ def test_mha_v4_sparse_gqa_all_true_mask_matches_repeated_kv(q_format, v_format)
     )
     torch.cuda.synchronize()
 
-    assert torch.equal(gqa_dense, mha_dense)
-    _assert_sparse_matches_dense(gqa_sparse, gqa_dense)
+    assert torch.equal(gqa_sparse, mha_sparse)
+    if q_format != AttentionFormat.MXFP4:
+        gqa_dense = mha_v4(q, k, v, q_format, q_format, v_format)
+        mha_dense = mha_v4(q, k_repeated, v_repeated, q_format, q_format, v_format)
+        assert torch.equal(gqa_dense, mha_dense)
+        _assert_sparse_matches_dense(gqa_sparse, gqa_dense)
     assert torch.equal(gqa_sparse, mha_sparse)
 
 

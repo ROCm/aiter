@@ -209,12 +209,12 @@ const fmha_v4_fwdConfig& find_config(const std::string& arch,
     for(const auto& entry : cfg_fmha_v4_fwd)
     {
         const auto& cfg = entry.second;
-          if(cfg.arch == arch && cfg.q_format == q_format && cfg.k_format == k_format &&
-              cfg.v_format == v_format && cfg.v_pack == v_pack && cfg.q_scale_mode == q_scale_mode &&
-           cfg.k_scale_mode == k_scale_mode && cfg.v_scale_mode == v_scale_mode &&
-           cfg.o_format == format_id(AttentionFormat::Bf16) &&
-           cfg.o_scale_mode == scale_mode_id(AttentionScaleMode::None) && cfg.hdim_q == kHeadDim &&
-           cfg.hdim_v == kHeadDim && cfg.mask == 0 && cfg.mode == mode)
+                if(cfg.arch == arch && cfg.q_format == q_format && cfg.k_format == k_format &&
+                     cfg.v_format == v_format && cfg.v_pack == v_pack &&
+                     cfg.q_scale_mode == q_scale_mode && cfg.k_scale_mode == k_scale_mode &&
+                     cfg.v_scale_mode == v_scale_mode && cfg.o_format == format_id(AttentionFormat::Bf16) &&
+                     cfg.o_scale_mode == scale_mode_id(AttentionScaleMode::None) && cfg.hdim_q == kHeadDim &&
+                     cfg.hdim_v == kHeadDim && cfg.mask == 0 && cfg.mode == mode)
             return cfg;
     }
     TORCH_CHECK(false,

@@ -86,8 +86,9 @@ def _production_quantize_mxfp4(query, key, value, softmax_scale):
     q_fp4, q_scale = quantize_mxfp4_q(query, mha_v4_q_multiplier(softmax_scale))
     k_raw, k_scale = quantize_mxfp4_k(key)
     k_fp4 = mxfp4_k_view(k_raw, k_scale)
-    v_fp8, v_scale = quantize_v_fp8(value)
-    return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale
+    v_raw, v_scale = quantize_v_mxfp4(value)
+    v_fp4 = mxfp4_v_view(v_raw, v_scale, value.shape[1])
+    return q_fp4, q_scale, k_fp4, k_scale, v_fp4, v_scale
 
 
 def _production_quantize_mxfp8(query, key, value, softmax_scale):
@@ -216,7 +217,7 @@ KERNEL_SPECS = {
         uses_hadamard=True,
     ),
     "mha4_mxfp4": _mha_v4_spec(
-        (0.5, 0.5, 1.0),
+        (0.5, 0.5, 0.5),
         supports_block_sparse=True,
         uses_hadamard=True,
     ),
@@ -1317,12 +1318,17 @@ def make_kernel_runner(
             raise ValueError(f"{args.kernel} does not support --qsmooth")
 
         is_f4f4 = args.kernel == "mha4_f4f4"
-        v_format = AttentionFormat.MXFP4 if is_f4f4 else fp8_format
+        sparse_mxfp4 = args.kernel == "mha4_mxfp4" and block_lut is not None
+        v_format = fp8_format if sparse_mxfp4 else AttentionFormat.MXFP4
         scale_modes = scale_modes_for_formats(
             AttentionFormat.MXFP4, AttentionFormat.MXFP4, v_format
         )
-        use_fp6_p_pack = is_f4f4 and block_lut is None
-        v_pack = AttentionPack.V_FOR_FP6_P if use_fp6_p_pack else AttentionPack.DEFAULT
+        use_dense_p_pack = block_lut is None
+        v_pack = (
+            AttentionPack.V_FOR_FP6_P
+            if is_f4f4 and use_dense_p_pack
+            else AttentionPack.DEFAULT
+        )
 
         def _quantize_mxfp4():
             quant_q, quant_k = q_bshd, k_bshd
@@ -1330,8 +1336,16 @@ def make_kernel_runner(
                 quant_q, quant_k = cancel_internal_qk_rotation(quant_q, quant_k)
             if is_f4f4:
                 return _production_quantize_f4f4(
-                    quant_q, quant_k, v_bshd, softmax_scale, use_fp6_p_pack
+                    quant_q, quant_k, v_bshd, softmax_scale, use_dense_p_pack
                 )
+            if sparse_mxfp4:
+                q_fp4, q_scale = quantize_mxfp4_q(
+                    quant_q, mha_v4_q_multiplier(softmax_scale)
+                )
+                k_raw, k_scale = quantize_mxfp4_k(quant_k)
+                k_fp4 = mxfp4_k_view(k_raw, k_scale)
+                v_fp8, v_scale = quantize_v_fp8(v_bshd)
+                return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale
             return _production_quantize_mxfp4(
                 quant_q, quant_k, v_bshd, softmax_scale
             )
@@ -1617,9 +1631,13 @@ def benchmark_payload_bytes(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    *,
+    sparse: bool = False,
 ) -> tuple[float, float, float]:
     if args.e2e:
         return float(q.element_size()), float(k.element_size()), float(v.element_size())
+    if args.kernel == "mha4_mxfp4" and sparse:
+        return 0.5, 0.5, 1.0
     return KERNEL_SPECS[args.kernel].payload_bytes
 
 
@@ -1679,7 +1697,10 @@ def benchmark_single_case(
         * (shape.d_head + shape.d_head_v)
     )
 
-    mem = compute_memory_bytes(shape, *benchmark_payload_bytes(args, q, k, v))
+    mem = compute_memory_bytes(
+        shape,
+        *benchmark_payload_bytes(args, q, k, v, sparse=block_lut is not None),
+    )
 
     sparse_flops = None
     if block_lut is not None:

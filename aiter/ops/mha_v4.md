@@ -24,7 +24,6 @@ Supported dense recipes:
 | MXFP6 | FP8 |
 | MXFP6 | MXFP6 (dense only) |
 | MXFP6 | MXFP4 |
-| MXFP4 | FP8 |
 | MXFP4 | MXFP4 |
 
 ## Ownership
@@ -117,8 +116,9 @@ MXFP4 V uses E2M1 values with one E8M0 scale per `(channel, 32-token)` block. Ea
 contributes 8,192 data bytes and 512 scale bytes. The data buffer includes 64 bytes of launch slack.
 
 `AttentionPack.DEFAULT` is the canonical V token order used by sparse kernels and FP8-P rows.
-`AttentionPack.V_FOR_FP6_P` selects the token order consumed by dense FP6-P rows. Numeric format and
-packing order are separate contracts.
+`AttentionPack.V_FOR_FP6_P` selects the shared dense V token order for FP6-P and FP4-P consumers.
+Numeric format and consumer pairing are separate dispatch contracts even when the physical V
+layout is identical.
 
 Changing a custom op's output shape or packed layout requires a versioned custom-op name.
 
