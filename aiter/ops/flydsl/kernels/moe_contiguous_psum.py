@@ -223,6 +223,9 @@ def build_moe_contiguous_psum_remap_module():
         # Uint32: every value here is a non-negative count/index, so `<`, `>=`
         # and `//` lower to ult/uge/divui rather than their signed forms.
         tid = fx.Uint32(fx.thread_idx.x)
+        bid = fx.Uint32(fx.block_idx.x)
+        gtid = bid * fx.Uint32(MAX_EXPERTS_PER_BLOCK) + tid
+        is_blk0 = bid == fx.Uint32(0)
         tile_v = fx.Uint32(tile_m)
         tile_minus_1 = tile_v - 1
 
@@ -267,7 +270,7 @@ def build_moe_contiguous_psum_remap_module():
                 src, dst = dst, src
 
             base_off = carry[0]
-            if in_expert:
+            if in_expert and is_blk0:
                 is_not_first = tid != 0
                 excl = fx.Int32(0)
                 if is_not_first:
@@ -283,38 +286,59 @@ def build_moe_contiguous_psum_remap_module():
                 carry[0] = base_off + chunk_total
             gpu.barrier()
 
-        if is_lane0:
+        scan_out = src
+        starts_lds = dst
+
+        if is_lane0 and is_blk0:
             total = carry[0]
             gt = total > fx.Int32(tile_v)
             c_p[0] = gt.select(total, tile_v)
 
         gpu.barrier()
 
-        # Only remap valid routes ([0, valid_route_count)); dead-tail routes
-        # hold unwritten/garbage rows from the route kernel and must NOT be used
-        # as a row index (would OOB-read starts[expert]). They are never read
-        # downstream. When truncation is disabled the caller passes a null pointer
-        # instead of a (1,) tensor, so the load must not run unconditionally.
+        # Multi-block remap (E <= MAX_EXPERTS_PER_BLOCK): fill exclusive
+        # starts into the spare ping-pong buffer (scan_out stays cumulative).
+        experts_u32 = fx.Uint32(experts)
+        use_parallel_remap = experts_u32 < fx.Uint32(MAX_EXPERTS_PER_BLOCK)
+        if use_parallel_remap and tid < experts_u32:
+            is_not_first = tid != 0
+            start = fx.Int32(0)
+            if is_not_first:
+                start = scan_out[tid - 1]
+            starts_lds[tid] = start
+        gpu.barrier()
+
         num_valid_routes_is_set = fx.Int64(ptrtoint(num_valid_routes)) != 0
         valid_route_count = fx.Uint32(numel)
         if num_valid_routes_is_set:
-            valid_route_count = fx.Uint32(
-                ptr_buf_tensor(num_valid_routes)[fx.Uint32(0)]
-            )
-        for route_i32 in range(tid, valid_route_count, MAX_EXPERTS_PER_BLOCK):
-            row_raw = rows_p[route_i32]
-            # An EP route with no grouped row carries the negative
-            # DROPPED_ROUTE_ROW sentinel: the row math would turn it into a wild
-            # expert index (OOB starts[] read), and downstream consumers check for
-            # the sentinel, so leave the slot untouched.
-            row_is_mapped = fx.Int32(row_raw) >= fx.Int32(0)
-            if row_is_mapped:
-                row = fx.Uint32(row_raw)
-                m = fx.Uint32(route_max_m)
-                expert = row // m
-                slot = row - expert * m
-                start = fx.Uint32(s_p[expert])
-                rows_p[route_i32] = start + slot
+            valid_route_count = ptr_buf_tensor(num_valid_routes)[fx.Uint32(0)]
+        remap_stride = EP_REMAP_NBLK * MAX_EXPERTS_PER_BLOCK
+        if use_parallel_remap:
+            for route_i32 in range(gtid, valid_route_count, remap_stride):
+                row_raw = rows_p[route_i32]
+                # An EP route with no grouped row carries the negative
+                # DROPPED_ROUTE_ROW sentinel: the row math would turn it into a wild
+                # expert index (OOB starts[] read), and downstream consumers check for
+                # the sentinel, so leave the slot untouched.
+                row_is_mapped = fx.Int32(row_raw) >= fx.Int32(0)
+                if row_is_mapped:
+                    row = fx.Uint32(row_raw)
+                    m = fx.Uint32(route_max_m)
+                    expert = row // m
+                    slot = row - expert * m
+                    start = fx.Uint32(starts_lds[expert])
+                    rows_p[route_i32] = start + slot
+        elif is_blk0:
+            for route_i32 in range(tid, valid_route_count, MAX_EXPERTS_PER_BLOCK):
+                row_raw = rows_p[route_i32]
+                row_is_mapped = fx.Int32(row_raw) >= fx.Int32(0)
+                if row_is_mapped:
+                    row = fx.Uint32(row_raw)
+                    m = fx.Uint32(route_max_m)
+                    expert = row // m
+                    slot = row - expert * m
+                    start = fx.Uint32(s_p[expert])
+                    rows_p[route_i32] = start + slot
 
     @flyc.jit
     def launch_psum_remap(
@@ -342,7 +366,7 @@ def build_moe_contiguous_psum_remap_module():
             tile_m,
             num_valid_routes,
         ).launch(
-            grid=(1, 1, 1),
+            grid=(EP_REMAP_NBLK, 1, 1),
             block=(MAX_EXPERTS_PER_BLOCK, 1, 1),
             stream=stream,
         )
