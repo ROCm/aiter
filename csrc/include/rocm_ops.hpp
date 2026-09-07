@@ -2498,7 +2498,7 @@ namespace py = pybind11;
           py::arg("x"),                           \
           py::arg("fn"),                          \
           py::arg("tile_k")          = 128,       \
-          py::arg("is_res_w_preshuffle_bf16") = 0);  \
+          py::arg("is_w_preshuffle_bf16") = 0);  \
     m.def("mhc_pre_convert_fn",                   \
           &aiter::mhc_pre_convert_fn,             \
           "mhc_pre_convert_fn",                   \
