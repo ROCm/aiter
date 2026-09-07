@@ -12,11 +12,12 @@ Buffer instructions are an AMD hardware feature (buffer resource descriptor
 plus ROCDL intrinsics) providing out-of-bounds protection and better memory
 throughput; plain memref load/store is not a substitute.
 
-Upstream: FlyDSL ``kernels/common/buffer_ops.py`` @ ROCm/FlyDSL#880, since
-narrowed to buffer accesses only. The raw-pointer helpers (``create_llvm_ptr``,
-``get_element_ptr``) moved to ``kernels_common``, and the uniform/SGPR load
-(``is_scalar``) to ``tensor_shim.buf_scalar_load``, next to the buffer views
-its callers index. Everything kept behaves as upstream.
+Upstream: FlyDSL ``kernels/common/buffer_ops.py`` @ ROCm/FlyDSL#880, minus two
+paths that had no business here: ``create_llvm_ptr`` (now
+``kernels_common.create_llvm_ptr``, built on fx so the backend resolves the
+address space) and the uniform/SGPR load ``is_scalar`` (now
+``tensor_shim.buf_scalar_load``, next to the buffer views its callers index).
+Everything kept behaves as upstream.
 
 Example:
     >>> from aiter.ops.flydsl.kernels import buffer_ops
@@ -80,6 +81,7 @@ __all__ = [
     "buffer_store",
     "create_buffer_resource",
     "create_buffer_resource_from_addr",
+    "get_element_ptr",
 ]
 
 
@@ -153,6 +155,69 @@ def _create_i64_constant(value: int) -> ir.Value:
     return _unwrap_value(op.result)
 
 
+@dsl_loc_tracing
+def get_element_ptr(
+    base_ptr,
+    byte_offset: int | ir.Value | None = None,
+    static_byte_offset: int = 0,
+    elem_type: ir.Type | None = None,
+    no_wrap_flags=None,
+) -> ir.Value:
+    """Build an LLVM GEP from a base pointer plus byte offsets."""
+    _gep_dynamic_index_sentinel = -(2**31)
+
+    base_ptr = _unwrap_value(base_ptr)
+    if not isinstance(static_byte_offset, int):
+        raise TypeError(
+            f"static_byte_offset must be int, got {type(static_byte_offset).__name__}"
+        )
+    if elem_type is None:
+        elem_type = T.i8()
+    elif callable(elem_type):
+        elem_type = elem_type()
+
+    if byte_offset is None:
+        dynamic_indices = []
+        raw_constant_indices = [int(static_byte_offset)]
+    elif isinstance(byte_offset, int):
+        dynamic_indices = []
+        raw_constant_indices = [int(byte_offset) + int(static_byte_offset)]
+    else:
+        offset_val = _unwrap_value(byte_offset)
+        if isinstance(offset_val.type, ir.IndexType):
+            i64_type = T.i64()
+            offset_val = _unwrap_value(
+                std_arith.IndexCastOp(i64_type, offset_val).result
+            )
+        elif not isinstance(offset_val.type, ir.IntegerType):
+            raise TypeError(
+                "byte_offset must be int, index, or integer-typed MLIR value; "
+                f"got {offset_val.type}"
+            )
+
+        if static_byte_offset != 0:
+            static_type = offset_val.type
+            static_attr = ir.IntegerAttr.get(static_type, int(static_byte_offset))
+            static_const = _unwrap_value(
+                std_arith.ConstantOp(static_type, static_attr).result
+            )
+            offset_val = _unwrap_value(
+                std_arith.AddIOp(offset_val, static_const).result
+            )
+
+        dynamic_indices = [offset_val]
+        raw_constant_indices = [_gep_dynamic_index_sentinel]
+
+    return llvm.GEPOp(
+        base_ptr.type,
+        base_ptr,
+        dynamic_indices,
+        raw_constant_indices,
+        elem_type,
+        no_wrap_flags,
+    ).result
+
+
 class BufferResourceDescriptor:
     """AMD Buffer Resource Descriptor
 
@@ -203,14 +268,7 @@ class BufferResourceDescriptor:
         ptr_type = ir.Type.parse("!llvm.ptr")
         base_ptr = _fly.extract_aligned_pointer_as_index(ptr_type, raw_val)
         if base_byte_offset is not None:
-            # Byte GEP on an i8 pointer; inlined so this module stays free of
-            # kernels_common, which imports it.
-            off = _unwrap_value(base_byte_offset)
-            if isinstance(off.type, ir.IndexType):
-                off = _unwrap_value(std_arith.IndexCastOp(T.i64(), off).result)
-            base_ptr = llvm.GEPOp(
-                base_ptr.type, base_ptr, [off], [-(2**31)], T.i8(), None
-            ).result
+            base_ptr = get_element_ptr(base_ptr, byte_offset=base_byte_offset)
 
         # Create buffer resource descriptor
         flags_val = _get_buffer_flags()

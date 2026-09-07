@@ -13,6 +13,7 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, ptrtoint, range_constexpr
 from flydsl.expr.typing import Int32, T
 
+from aiter.ops.flydsl.kernels.kernels_common import create_llvm_ptr
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -62,17 +63,13 @@ class _RouteG2LStorage:
     lut: fx.Array[fx.Int32, MAX_G2L_EXPERTS, 16]
 
 
-def _slot_ptr(base_i64, elem_idx, address_space=fx.AddressSpace.Global):
+def _slot_ptr(base_i64, elem_idx, address_space=1):
     """Raw LLVM pointer to i32 element ``elem_idx`` of the buffer at ``base_i64``.
 
     The atomicrmw builder needs a raw ``!llvm.ptr<n>``, which the layout/buffer
-    ops do not produce, so the byte address is formed by hand here. Take the
-    space as an ``fx.AddressSpace`` and let ``to_llvm_ptr`` resolve it to the
-    backend's number -- Shared is 2 here but lowers to ``!llvm.ptr<3>``.
+    ops do not produce, so the byte address is formed by hand here.
     """
-    pt = fx.PointerType.get(fx.Int32.ir_type, address_space=address_space, alignment=4)
-    ptr = fx.to_llvm_ptr(fx.inttoptr(pt, base_i64 + fx.Int64(elem_idx) * 4))
-    return ptr._value if hasattr(ptr, "_value") else ptr
+    return create_llvm_ptr(base_i64 + fx.Int64(elem_idx) * 4, address_space)
 
 
 def build_moe_route_maps_module():

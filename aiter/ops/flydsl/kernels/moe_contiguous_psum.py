@@ -18,6 +18,7 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, ptrtoint, range_constexpr
 from flydsl.expr.typing import Int32, T
 
+from aiter.ops.flydsl.kernels.kernels_common import create_llvm_ptr
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -601,14 +602,7 @@ def build_moe_route_psum_fused_module():
         numel_i32 = fx.Uint32(numel)
         for route_i32 in range(tid, numel_i32, MAX_EXPERTS_PER_BLOCK):
             e = topk_p[route_i32]
-            # Shared is 2 here; to_llvm_ptr resolves it to !llvm.ptr<3>.
-            lds_i32_pt = fx.PointerType.get(
-                fx.Int32.ir_type, address_space=fx.AddressSpace.Shared, alignment=4
-            )
-            ptr = fx.to_llvm_ptr(
-                fx.inttoptr(lds_i32_pt, cnt_base_i64 + fx.Int64(e) * 4)
-            )
-            ptr = ptr._value if hasattr(ptr, "_value") else ptr
+            ptr = create_llvm_ptr(cnt_base_i64 + fx.Int64(e) * 4, 3)
             slot = llvm.AtomicRMWOp(
                 llvm.AtomicBinOp.add,
                 ptr,
