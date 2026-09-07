@@ -237,6 +237,86 @@ def cmd_shape_plugin(args) -> int:
     return 0
 
 
+# Where the evidence came from, relative to the patch under review.
+#
+# A test that arrives with the patch and a test that was already in the repository are not the
+# same kind of evidence, and a report that calls both "the target passed" has flattened the one
+# difference a reviewer most needs. The pre-existing test was not written to make this PR pass.
+# The added one was written by the same hand as the code it grades, and it can pass vacuously
+# without anyone noticing -- which is why the execution receipt matters most in exactly that case.
+#
+# Both are worth running. Only one of them is independent, and the report should say which it got.
+#
+# This is a lookup in `git status`, not a reading of the test, which is why it is bookkeeping and
+# belongs here rather than in the prompt. Whether the test is any GOOD is the other kind of
+# question, and it stays in review-pr where a reader can answer it.
+
+PROVENANCE_PRE_EXISTING = "pre-existing"
+PROVENANCE_ADDED = "pr-added"
+PROVENANCE_MODIFIED = "pr-modified"
+PROVENANCE_UNKNOWN = "unknown"
+
+
+def provenance(status_text: str, test_file: str, patch_supplied: bool) -> dict:
+    """How the declared target relates to the patch: ``{"provenance", "reason"}``.
+
+    ``status_text`` is ``git status --porcelain`` taken at the one moment it means only the
+    patch: immediately after ``git apply`` succeeded on a worktree that was verified clean.
+    The patch is applied to the working tree and never staged, so an added target is untracked
+    (``??``) and a changed one is unstaged-modified; nothing here reaches a rename entry.
+
+    With no patch there is nothing to attribute against, and the answer is ``unknown`` rather
+    than ``pre-existing``: a checkout validated directly cannot tell a test the author wrote
+    from one they did not, and saying "pre-existing" there would claim an independence nobody
+    established.
+    """
+    if not patch_supplied:
+        return {
+            "provenance": PROVENANCE_UNKNOWN,
+            "reason": "no patch was supplied, so nothing separates this target from the change under review",
+        }
+    unspellable = None
+    for line in status_text.splitlines():
+        if len(line) <= 3:
+            continue
+        code, path = line[:2], line[3:]
+        if path.startswith('"'):
+            # git quotes paths it cannot spell plainly. Comparing a quoted form against the
+            # caller's plain one produces a confident wrong answer, so it holds the path aside
+            # and only reports it if the target was not found some other way.
+            unspellable = path
+            continue
+        if path != test_file:
+            continue
+        if code == "??":
+            return {
+                "provenance": PROVENANCE_ADDED,
+                "reason": "the patch adds this target, so the test and the code it grades have the same author",
+            }
+        return {
+            "provenance": PROVENANCE_MODIFIED,
+            "reason": "the patch changes this target, so whichever parts of it are evidence for the change arrived with the change",
+        }
+    if unspellable is not None:
+        return {
+            "provenance": PROVENANCE_UNKNOWN,
+            "reason": f"the patch touches a path git could not spell plainly ({unspellable}) and the target was not found elsewhere in the patch, so the two could not be compared",
+        }
+    return {
+        "provenance": PROVENANCE_PRE_EXISTING,
+        "reason": "the patch does not touch this target, so it was not written to make this change pass",
+    }
+
+
+def cmd_provenance(args) -> int:
+    # Two lines rather than JSON, because the only caller is bash and the value it wants first
+    # is the one word. The reason follows, and neither can contain a newline.
+    result = provenance(sys.stdin.read(), args.target, args.patch_supplied)
+    print(result["provenance"])
+    print(result["reason"])
+    return 0
+
+
 def cmd_script_stats(args) -> int:
     print(json.dumps(script_stats(args.exit_code, args.receipt, args.route)))
     return 0
@@ -280,6 +360,13 @@ def main(argv=None) -> int:
     plugin.add_argument("argnames")
     plugin.add_argument("grid")
     plugin.set_defaults(func=cmd_shape_plugin)
+
+    prov = sub.add_parser(
+        "provenance", help="how the target relates to the patch (git status on stdin)"
+    )
+    prov.add_argument("target")
+    prov.add_argument("--patch-supplied", action="store_true")
+    prov.set_defaults(func=cmd_provenance)
 
     stats = sub.add_parser("script-stats", help="stats for a script target's run")
     stats.add_argument("exit_code", type=int)

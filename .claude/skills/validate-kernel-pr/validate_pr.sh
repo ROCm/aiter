@@ -255,6 +255,7 @@ finish_report() {
 #   PATCH_APPLIED=1  this process applied the patch and still owes the caller a revert
 BASE_ACTIVE=0
 PATCH_APPLIED=0
+PATCH_STATUS=""
 restore_head() {
   if [ "$BASE_ACTIVE" -eq 0 ]; then
     return 0
@@ -318,6 +319,12 @@ jset_string "test_selection.expected_route" "$EXPECTED_ROUTE"
 jset_string "test_selection.shape_vars" "$SHAPE_VARS"
 jset_string "test_selection.runner" "unresolved"
 jset_string "test_selection.runner_reason" "merge simulation has not completed"
+# Provisional, for the same reason the runner above is: a run that exits before the patch is
+# applied still owes the reader a legal report, and a required field that is simply absent
+# reads as an oversight rather than as a stage that never got to run.
+jset_string "test_selection.test_provenance" "unknown"
+jset_string "test_selection.test_provenance_reason" \
+  "merge simulation has not completed, so the target has not been compared against the patch"
 
 # ---------- stage 1: merge simulation ----------
 BASE_SHA=$(git -C "$REPO_WT" rev-parse HEAD)
@@ -348,6 +355,10 @@ if [ -n "$PATCHF" ]; then
   if git -C "$REPO_WT" apply --check "$PATCHF" >/dev/null 2>&1 \
       && git -C "$REPO_WT" apply "$PATCHF" >/dev/null 2>&1; then
     PATCH_APPLIED=1
+    # Taken here and nowhere else: the worktree was verified clean four lines up, so this is
+    # the only moment at which `git status` describes the patch and nothing else. Later stages
+    # write caches, receipts and bench artifacts into the same tree.
+    PATCH_STATUS=$(git -C "$REPO_WT" status --porcelain --untracked-files=all)
     stage_note "merge_sim" "pass" "patch applies cleanly to the recorded base"
     jset_string "repo.patch_sha256" "$(sha256sum "$PATCHF" | awk '{print $1}')"
     if [ -n "$HEAD_SHA" ]; then
@@ -849,6 +860,29 @@ fi
 jset_string "test_selection.runner" "$TARGET_RUNNER"
 jset_string "test_selection.runner_reason" "$TARGET_RUNNER_REASON"
 jset_string "test_selection.runner_basis" "$TARGET_RUNNER_BASIS"
+
+# Which of the two kinds of evidence this run is about to gather. The status was captured at
+# stage 1, when it still described the patch alone.
+# `-n "$PATCHF"` and not PATCH_APPLIED: the latter tracks a liability -- whether this process
+# still owes the caller a revert -- and it is toggled by every phase switch. The question here is
+# the immutable one, whether a patch was supplied at all.
+if [ -n "$PATCHF" ]; then
+  PROVENANCE_OUT=$(printf '%s' "$PATCH_STATUS" \
+    | "$SCRIPT_DIR/target_run.py" provenance "$TEST_FILE" --patch-supplied)
+else
+  PROVENANCE_OUT=$("$SCRIPT_DIR/target_run.py" provenance "$TEST_FILE" </dev/null)
+fi
+TEST_PROVENANCE=${PROVENANCE_OUT%%$'\n'*}
+TEST_PROVENANCE_REASON=${PROVENANCE_OUT#*$'\n'}
+jset_string "test_selection.test_provenance" "$TEST_PROVENANCE"
+jset_string "test_selection.test_provenance_reason" "$TEST_PROVENANCE_REASON"
+# Not a defect, and deliberately not a should-fix: a PR is entitled to bring its own test, and
+# whether that test is a good one is a reading, which belongs to review-pr. What the report owes
+# the reader is the fact that the evidence and the code under review came from the same hand.
+if [ "$TEST_PROVENANCE" = "pr-added" ] || [ "$TEST_PROVENANCE" = "pr-modified" ]; then
+  finding "note" "correctness" \
+    "the evidence is not independent of the change: $TEST_PROVENANCE_REASON"
+fi
 
 # Two independent channels can carry the S1 grid: the target's own CLI flag (--shape-arg)
 # and an environment variable it reads (--shape-env). They are probed separately and the

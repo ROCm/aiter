@@ -303,6 +303,7 @@
         "grid",
         "expected_route",
         "shape_vars",
+        "test_provenance",
         "runner",
         "runner_reason"
       ],
@@ -456,6 +457,20 @@
             "undeclared"
           ],
           "description": "Where the runner came from. The validator no longer classifies the target, so 'declared-by-caller' marks the runner as the caller's claim rather than a measurement -- a distinction a reader needs to weigh a failure that the runner choice, not the code, produced."
+        },
+        "test_provenance": {
+          "type": "string",
+          "enum": [
+            "pre-existing",
+            "pr-added",
+            "pr-modified",
+            "unknown"
+          ],
+          "description": "Where the evidence came from, relative to the patch. A pre-existing test was not written to make this PR pass; a pr-added or pr-modified one was written by the same hand as the code it grades and can pass vacuously. Both are worth running, only one is independent, and a report that says only 'the target passed' has hidden which it got."
+        },
+        "test_provenance_reason": {
+          "type": "string",
+          "description": "How that classification was reached, in terms a reader can check against the patch."
         },
         "grid_channel_basis": {
           "type": "string",

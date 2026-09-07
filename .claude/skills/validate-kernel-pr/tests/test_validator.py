@@ -4040,6 +4040,53 @@ class TargetRunTests(unittest.TestCase):
 
         self.tool = target_run
 
+    def test_a_target_the_patch_adds_is_not_independent_evidence(self):
+        # `git apply` never stages, so a file the patch creates is untracked.
+        result = self.tool.provenance(
+            "?? tests/test_new.py\n", "tests/test_new.py", True
+        )
+        self.assertEqual("pr-added", result["provenance"])
+        self.assertIn("same author", result["reason"])
+
+    def test_a_target_the_patch_edits_is_not_independent_evidence(self):
+        result = self.tool.provenance(
+            " M tests/test_gemm.py\n", "tests/test_gemm.py", True
+        )
+        self.assertEqual("pr-modified", result["provenance"])
+
+    def test_a_target_the_patch_leaves_alone_is_independent_evidence(self):
+        result = self.tool.provenance(
+            " M aiter/ops/gemm.py\n?? tests/test_new.py\n", "tests/test_gemm.py", True
+        )
+        self.assertEqual("pre-existing", result["provenance"])
+
+    def test_no_patch_means_unknown_and_never_pre_existing(self):
+        # A checkout validated directly cannot tell a test the author wrote from one they did
+        # not. Answering "pre-existing" there would claim an independence nobody established --
+        # the same substitution of "not checked" for "checked and fine" refused everywhere else.
+        result = self.tool.provenance("", "tests/test_gemm.py", False)
+        self.assertEqual("unknown", result["provenance"])
+        self.assertIn("no patch", result["reason"])
+
+    def test_a_path_git_cannot_spell_plainly_is_reported_not_guessed_at(self):
+        # git quotes what it cannot spell. Comparing the quoted form against the caller's plain
+        # one yields a confident wrong answer, and "pre-existing" is the answer that overclaims.
+        result = self.tool.provenance(
+            '?? "tests/t\\303\\251st.py"\n', "tests/tést.py", True
+        )
+        self.assertEqual("unknown", result["provenance"])
+        self.assertIn("could not spell", result["reason"])
+
+    def test_a_quoted_path_elsewhere_does_not_hide_a_target_the_patch_touches(self):
+        # The unspellable path only matters if it could have BEEN the target. Bailing out on
+        # sight would turn every patch carrying one non-ASCII filename into "unknown".
+        result = self.tool.provenance(
+            '?? "tests/t\\303\\251st.py"\n M tests/test_gemm.py\n',
+            "tests/test_gemm.py",
+            True,
+        )
+        self.assertEqual("pr-modified", result["provenance"])
+
     def test_a_boolean_cell_arrives_as_a_boolean(self):
         # "False" is a non-empty string, so it is truthy, and every row of a boolean dimension
         # silently ran the True branch -- a grid that looked like it covered both.
