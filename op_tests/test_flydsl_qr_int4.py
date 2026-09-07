@@ -4,16 +4,16 @@
 """Runtime correctness for FlyDSL INT4 QuickReduce (``QRInt4``).
 
 Pytest collects validity cases only (no timing). ``python3`` this file
-runs an aiter-op-test ``@benchmark`` / markdown sweep. Ranks are
-``multiprocessing`` spawn workers (same path as HIP QR); each times
-``fly.allreduce`` with ``run_perftest`` after ``compile()``. The oracle
-is an untimed fp32 NCCL all-reduce of the same per-rank inputs. INT4 is
-lossy, so validity uses SQNR, a calibrated mismatch ratio, and a
-per-tile SQNR floor.
+runs an aiter-op-test ``@benchmark`` / markdown sweep. Every rank is a
+``multiprocessing`` spawn worker that builds its own ``QRInt4`` engine,
+calls ``compile()``, and in the sweep times ``fly.allreduce`` with
+``run_perftest``. The oracle is an untimed fp32 NCCL all-reduce of the
+same per-rank inputs. INT4 is lossy, so validity uses SQNR, a calibrated
+mismatch ratio, and a per-tile SQNR floor.
 
-5120 is a measured calibration width, not an ABI requirement. The kernel
-is gfx942/gfx950 TP∈{2,4,8}; other archs skip. Pytest skips a world size
-when fewer GPUs are visible than TP.
+hidden=5120 is the width the kernel was tuned on, not a shape the kernel
+requires. QRInt4 runs on gfx942/gfx950 at TP∈{2,4,8}; other archs skip,
+and pytest skips a world size when fewer GPUs are visible than TP.
 """
 
 from __future__ import annotations
@@ -57,7 +57,7 @@ except (KeyError, RuntimeError):
     ARCH = None
 SUPPORTED_ARCHS = ("gfx942", "gfx950")
 SQNR_MIN_DB = 18.0
-# Dropped/stale 32 KiB tile is ~0 dB; INT4 codec tiles stay well above this.
+# A 32 KiB tile the kernel never wrote scores ~0 dB; codec noise stays above 8.
 TILE_SQNR_MIN_DB = 8.0
 # Calibrated to the INT4 group-16 codec vs fp32 all-reduce, not bit identity.
 CLOSE_RTOL = 1e-1
@@ -79,9 +79,10 @@ pytestmark = pytest.mark.skipif(
 )
 
 # Distinct correctness branches, not a tokens x hidden product.
-# hidden=5120 is calibration; 4096 proves the map is not width-locked.
-# (8, 1024) is a half-tile tail (TILE_BYTES = 32 KiB).
-# TP2/4: ST=1 calib plus one ST=8 case (num_tiles > grid_cap) each.
+# hidden=5120 is the calibrated width; hidden=4096 covers a width the tuning
+# was not fitted to. (8, 1024) is a payload smaller than one 32 KiB tile.
+# Every world size gets a super_tile=1 case and at least one super_tile=8
+# case, the latter sized so num_tiles exceeds the ST=1 grid.
 # Pytest skips a world size when fewer GPUs are visible than TP.
 _PYTEST_CASES = (
     (8, 8, 1024, "partial-tile"),
@@ -114,10 +115,10 @@ def _make_inp(
     elif fill == "neg_underflow":
         val = -(2.0**-8)
     elif fill == "overflow_512":
-        # All-rank 512 saturates INT4 during the two-shot add (~5.5 dB vs
-        # NCCL) even with a max-finite scale. Rank 0 only: recon 480 vs
-        # ref 512 after the mantissa saturate, or 256 vs 512 if overflow
-        # keeps m3=0.
+        # Drives the E4M3 scale above its largest exponent, which the encoder
+        # has to saturate. Only rank 0 carries the value: if every rank sent
+        # 512 the reduced sum would also saturate the INT4 group codec, and
+        # the case would fail on codec range rather than on scale encoding.
         val = 512.0 if rank == 0 else 0.0
     elif fill == "zeros":
         val = 0.0
@@ -133,6 +134,7 @@ def _pick_st(
     *,
     grid_cap: int = DEFAULT_GRID_CAP,
 ) -> int:
+    """Expected ST: the engine only uses ST>1 when tiles exceed its ST=1 grid."""
     tiles = _num_tiles(tokens, hidden)
     if requested == 1 or tiles > grid_cap:
         return requested
@@ -155,7 +157,7 @@ def _sqnr_db(got: torch.Tensor, reference: torch.Tensor) -> float:
 
 
 def _min_tile_sqnr_db(got: torch.Tensor, reference: torch.Tensor) -> float:
-    """Worst 32 KiB-tile SQNR. A dropped or stale tile is ~0 dB."""
+    """Worst 32 KiB-tile SQNR, so one unwritten tile cannot be averaged away."""
     tile_elems = TILE_BYTES // 2
     g = got.reshape(-1)
     r = reference.reshape(-1)
@@ -197,6 +199,8 @@ def _run_rank(
         rank=rank,
         device_id=device,
     )
+    # QRInt4 exchanges IPC metadata over a non-NCCL group; NCCL stays for the
+    # fp32 reference all-reduce.
     gloo = dist.new_group(backend="gloo")
     group = dist.group.WORLD
 
@@ -208,6 +212,8 @@ def _run_rank(
         super_tile=super_tile,
         grid_cap=grid_cap,
     )
+    # compile() launches every ST binary on this shape and all ranks must pass
+    # the same one, so keep the JIT buffer small at the widest hidden size.
     compile_tokens = min(512, max(tokens))
     compile_hidden = max(hiddens)
     compile_inp = torch.empty(
@@ -265,6 +271,10 @@ def _run_rank(
                     eng.allreduce(src, dst)
                     return dst
 
+                # use_cuda_event is mandatory here: run_perftest's default
+                # timer wraps the iterations in torch.profiler, which collects
+                # no device rows inside a spawn worker and then fails reducing
+                # its empty trace. cuda.Event timing is unaffected.
                 _, us = run_perftest(_allreduce, use_cuda_event=True)
                 row["us"] = float(us)
             rows.append(row)
@@ -334,6 +344,8 @@ def _assert_validity(
     world_size: int,
     label: str,
 ) -> dict:
+    # The ST switch compares tiles against the ST=1 grid, which the engine
+    # clamps below the requested grid_cap for occupancy.
     st1_grid = ranks[0][0]["st1_grid"]
     expected_st = _pick_st(tokens, hidden, grid_cap=st1_grid)
     if len(ranks) != world_size:
@@ -411,7 +423,7 @@ def test_qr_int4(tokens, hidden, dtype, tp, grid_cap=DEFAULT_GRID_CAP):
         label="bench",
     )
     nbytes = tokens * hidden * 2
-    # Reduce of tp ranks: (world-1) adds per element, plus INT4 codec ALU.
+    # (tp - 1) adds per element; codec ALU work is not counted.
     flops = tokens * hidden * (tp - 1)
     rank_us = [r[0]["us"] for r in ranks]
     us = statistics.median(rank_us)
@@ -455,7 +467,7 @@ def main():
         type=int,
         nargs="*",
         default=[1],
-        help="Unused (not batch). Values other than 1 are skipped.",
+        help="Not a QRInt4 dimension; only 1 runs, other values are skipped.",
     )
     parser.add_argument(
         "--tp",
@@ -474,20 +486,21 @@ def main():
             (9216, 5120),
             (32768, 5120),
         ],
-        help="(tokens, hidden) pairs. 5120 is calibration, not ABI.\n"
+        help="(tokens, hidden) pairs; hidden is free, 5120 is the tuned width.\n"
         "    e.g.: -s 512,5120 9216,5120",
     )
     parser.add_argument(
         "-o",
         "--out",
         default=None,
-        help="Optional JSON output path (rank-0 bench payload).",
+        help="Optional JSON output path for the sweep rows.",
     )
     parser.add_argument(
         "--grid-cap",
         type=int,
         default=DEFAULT_GRID_CAP,
-        help="Persistent launch/inbox block cap (default 304*4=1216, occupancy-clamped).",
+        help="Persistent-launch block cap; the engine clamps it to the\n"
+        "    measured resident workgroups per CU.",
     )
     args = parser.parse_args()
 
@@ -530,7 +543,7 @@ def main():
                             "meta": {
                                 "gfx": ARCH,
                                 "grid_cap": args.grid_cap,
-                                "timer": "run_perftest",
+                                "timer": "run_perftest cuda_event",
                             },
                             "rows": df,
                         },
