@@ -144,7 +144,9 @@ Which kernels a module *contains* is decided at **build** time: config CSVs are 
 `(gfx, cu_num)` before codegen, so a library built before the new rows existed holds only the
 default kernel for that SKU. The tuned kernels are not merely unselected, they were never
 compiled. A requested target with no rows emits a warning and retains its existing runtime
-fallback. Adding rows therefore requires a rebuild, not just a config update.
+fallback. The FlyDSL GEMM AOT packaging path applies the same `(gfx, cu_num)` filter, so a
+wheel bakes only the jobs its targets need. Adding rows therefore requires a rebuild, not
+just a config update.
 
 Some ops read the tuned CSV again at run time and index it on `(gfx, cu_num, M, N, K)` —
 `get_CKGEMM_config` in `aiter/ops/gemm_op_a8w8.py` and the MoE equivalent in
