@@ -4389,13 +4389,38 @@ namespace aiter {
         row = static_cast<int64_t>(swa_dest_row[token_idx]);
         if (row < 0) return -1;
       } else {
-        const int32_t blk = static_cast<int32_t>(pos / params.swa_block_size);
+        // 32-bit index math, widened only for the final row/address product.
+        //
+        // `pos` arrives as int64 (torch positions tensor) and swa_block_size is a
+        // runtime int, so `pos / params.swa_block_size` promoted to a SIGNED 64-bit
+        // divide -- which AMDGPU has no instruction for. LLVM expands it inline as
+        // a float-reciprocal seed plus two Newton steps built from 128-bit products
+        // (s_mul_u64 + four s_mul_hi_u32 each) plus sign fixup: ~55 SALU, and the
+        // `%` costs a second one. Both operands are known non-negative three lines
+        // up (`if (bid < 0 || pos < 0) return -1;`), so a 32-bit unsigned divide is
+        // sufficient and is roughly half the sequence.
+        //
+        // This is what flydsl does: its swa_cache_size is a runtime Int32 kernel
+        // argument -- NOT a compile-time constant -- and it divides Int32 by Int32
+        // after clamping pos to >= 0, widening to Int64 only for the final
+        // `row * swa_pos_stride` byte offset ("a unified V4 pool runs to ~150M
+        // rows, so at D=512 that product passes 2^31").
+        //
+        // Assumption: pos < 2^31. Token positions are sequence offsets; a 2-billion
+        // token position is not reachable, and the same 32-bit assumption is already
+        // baked into params.max_position and the cos/sin index below.
+        const uint32_t upos = static_cast<uint32_t>(pos);
+        const uint32_t ubs  = static_cast<uint32_t>(params.swa_block_size);
+        const uint32_t ublk = upos / ubs;
+        // Derive the remainder from the quotient so only ONE divide is emitted.
+        const uint32_t urem = upos - ublk * ubs;
+        const int32_t blk = static_cast<int32_t>(ublk);
         if (blk >= params.swa_block_tables_blocks) return -1;
         const int32_t phys = swa_block_tables[
             static_cast<int64_t>(bid) * params.swa_block_tables_stride + blk];
         if (phys < 0) return -1;
         row = static_cast<int64_t>(phys) * params.swa_block_size +
-              (pos % params.swa_block_size);
+              static_cast<int64_t>(urem);
       }
       return (row < params.swa_num_rows) ? row : -1;
     }
