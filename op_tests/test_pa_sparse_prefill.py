@@ -491,8 +491,8 @@ _ERR_TOL = 0.01
 
 
 @perftest()
-def _profile_func(target_func, *args, **kwargs):
-    return target_func(*args, **kwargs)
+def _profile_func(target_func, *, backend: str):
+    return target_func()
 
 
 # ---------------------------------------------------------------------------
@@ -641,7 +641,7 @@ def run_pa_sparse_prefill(
             )
 
         if bench:
-            _, lat_us = _profile_func(invoke)  # (data, avg_us_per_iter)
+            _, lat_us = _profile_func(invoke, backend=name)
             flops = 4.0 * h * total_nnz * d
             tflops = flops / max(lat_us * 1e-6, 1e-12) / 1e12
             row[f"{name} us"] = round(float(lat_us), 2)

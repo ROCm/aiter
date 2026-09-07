@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import copy
+import inspect
 import json
 import multiprocessing as mp
 import os
+from contextvars import ContextVar
+from enum import Enum
 
 import numpy as np
 import pandas as pd
@@ -14,6 +17,7 @@ from aiter import logger
 
 pd.set_option("display.max_rows", 200)
 _SMI_LABEL_COUNTS = {}
+_SMI_CALL_LABEL = ContextVar("aiter_smi_call_label", default=None)
 ## debug ##
 # pd.set_option("display.max_rows", None)
 # pd.set_option("display.max_columns", None)
@@ -44,6 +48,67 @@ def print_json_table(name, rows, keep=None):
             df = df[cols]
     records = json.loads(df.to_json(orient="records"))
     print(json.dumps({"name": name, "rows": records}), flush=True)
+
+
+def _smi_label_value(value):
+    """Return a compact, stable label value, or None for opaque arguments."""
+    if isinstance(value, torch.Tensor):
+        shape = "x".join(map(str, value.shape)) or "scalar"
+        return f"{shape}:{str(value.dtype).removeprefix('torch.')}"
+    if isinstance(value, torch.dtype):
+        return str(value).removeprefix("torch.")
+    if isinstance(value, Enum):
+        return str(value.value)
+    if value is None or isinstance(value, (str, bool, int, float, np.generic)):
+        return str(value)
+    if isinstance(value, (tuple, list)):
+        items = [_smi_label_value(item) for item in value]
+        if all(item is not None for item in items):
+            return ",".join(items)
+    return None
+
+
+def _smi_call_tag(func, callargs):
+    """Build a call-local SMI label from @benchmark's named arguments."""
+    source = os.path.splitext(os.path.basename(func.__code__.co_filename))[0]
+    parts = [f"{source}.{func.__name__}"]
+    aliases = {"m": "M", "n": "N", "k": "K", "t": "T", "h": "H", "d": "D"}
+    for name, value in callargs.items():
+        formatted = _smi_label_value(value)
+        if formatted is None:
+            continue
+        formatted = formatted.replace("/", "_").replace("\n", "")
+        parts.append(f"{aliases.get(name, name)}={formatted}")
+    return "/".join(parts)
+
+
+def _smi_perftest_tag(func, args, kwargs):
+    """Return scalar call details that distinguish one perftest invocation."""
+    try:
+        signature = inspect.signature(func)
+        callargs = signature.bind(*args, **kwargs)
+        callargs.apply_defaults()
+    except (TypeError, ValueError):
+        return None
+
+    parts = []
+    for name, parameter in signature.parameters.items():
+        if parameter.kind in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            continue
+        value = callargs.arguments.get(name)
+        # The outer @benchmark call already supplies tensor-derived shapes.
+        # Keep this suffix for lightweight selectors such as a backend name.
+        if value is None or isinstance(value, torch.Tensor) or callable(value):
+            continue
+        formatted = _smi_label_value(value)
+        if formatted is None:
+            continue
+        formatted = formatted.replace("/", "_").replace("\n", "")
+        parts.append(f"{name}={formatted}")
+    return "/".join(parts) or None
 
 
 def ensure_spawn_method():
@@ -186,7 +251,12 @@ def perftest(
 
                     replay_us = avg
 
-                case_label = os.environ.get("AITER_SMI_LABEL", "benchmark_case")
+                case_label = _SMI_CALL_LABEL.get() or os.environ.get(
+                    "AITER_SMI_LABEL", "benchmark_case"
+                )
+                perftest_tag = _smi_perftest_tag(func, args, kwargs)
+                if perftest_tag:
+                    case_label = f"{case_label}/{perftest_tag}"
                 label_key = (case_label, fn_name)
                 occurrence = _SMI_LABEL_COUNTS.get(label_key, 0) + 1
                 _SMI_LABEL_COUNTS[label_key] = occurrence
@@ -208,7 +278,14 @@ def benchmark():
     def decorator(func):
         def wrapper(*args, **kwargs):
             callargs = log_args(func, *args, **kwargs)
-            ret = func(*args, **kwargs)
+            token = None
+            if os.environ.get("AITER_SMI_MONITOR", "0") == "1":
+                token = _SMI_CALL_LABEL.set(_smi_call_tag(func, callargs))
+            try:
+                ret = func(*args, **kwargs)
+            finally:
+                if token is not None:
+                    _SMI_CALL_LABEL.reset(token)
             if ret is not None:
                 callargs.update(ret)
             return callargs

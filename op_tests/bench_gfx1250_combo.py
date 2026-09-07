@@ -56,12 +56,12 @@ same thing to every op:
     mla_v4_decode   1..1024. Decode carries one token per sequence, so the
                     axis is really the batch, and 65536 is not a shape the
                     model runs.
-    inverse_rope    1..16384. The axis is -s at a fixed -b 128,16, and 65536
-                    faults -- in the triton reference the UT compares against,
-                    not in the kernel under test.
-    mega_moe        1..2048. 65536 cannot allocate its symmetric arena; see
-                    _MEGA_MOE_TOKENS.
-    a8w8_blockscale 512..65536. M=512 covers a DSv4 decode batch of 512;
+    inverse_rope    1..16384. The axis is -s at fixed TP1/TP4 shapes
+                    -b 128,16 32,4, and 65536 faults -- in the triton reference
+                    the UT compares against, not in the kernel under test.
+    mega_moe        1..2048 plus 65536. The 65536 tier is expected to expose
+                    the current cco symmetric-arena limit; see _MEGA_MOE_TOKENS.
+    a8w8_blockscale 256..65536. M=256/512 cover DSv4 decode batches;
                     smaller M stays out because of a UT bug; see DSV4_OPS.
     mla_v4_prefill  1024..16384, the DSv4 prefill chunk. 65536 faults; see
                     _MLA_PREFILL_TOKENS.
@@ -116,12 +116,12 @@ The current passthrough matrix is:
 ``--scale-init`` is reported as not applicable for operators without a scale
 operand.
 
-mega_moe at tokens/rank=65536 fails in setup(), asking 7.5 GB for cco's VMM
-arena against a 4 GiB default. MORI_SHMEM_HEAP_SIZE does not reach that arena
-(see run_mega_moe), so exporting it changes nothing -- and exporting it
-sweep-wide takes the machine down, because that heap is preallocated per rank
-for every case. The tier is out of the sweep; fixing it means passing
-per_rank_vmm at Communicator.init().
+mega_moe at tokens/rank=65536 has previously failed in setup(), asking 7.5 GB
+for cco's VMM arena against a 4 GiB default. MORI_SHMEM_HEAP_SIZE does not reach
+that arena (see run_mega_moe), so exporting it changes nothing -- and exporting
+it sweep-wide takes the machine down, because that heap is preallocated per
+rank for every case. The tier is included to expose the limit; fixing it means
+passing per_rank_vmm at Communicator.init().
 
 Failures do not stop the sweep: a case that aborts is recorded and the run
 moves to the next one, with a "N failed, M ops selected" list at the end and a
@@ -193,16 +193,16 @@ backends. There is no nnz axis to sweep: the CSR is generated from --mode
 (sparse draws a random nnz per row, dense fills every row) under --seed, so
 nnz is an outcome, not an input.
 
-The ``inverse_rope`` op runs the tp1 attention-output shape (-b is
-(n_local_heads, n_local_groups); 128,16 is V4-Pro at dp/tp1):
+The ``inverse_rope`` op runs the TP1 and TP4 attention-output shapes (-b is
+(n_local_heads, n_local_groups); 128,16 and 32,4 are V4-Pro at TP1 and TP4):
 
     python3 op_tests/test_inverse_rope_group_quant.py \
-      -b 128,16 -s <token sweep> -l n32k4 --group-size 32
+      -b 128,16 32,4 -s <token sweep> -l n32k4 --group-size 32
 
 The ``a8w8_blockscale`` op runs:
 
     python3 op_tests/test_gemm_a8w8_blockscale.py \
-      -m 512 \
+      -m 256 512 1024 2048 4096 8192 16384 65536 \
       -nk 2048,7168 7168,16384 6144,7168 \
           7168,3072 65536,1536 8192,1536 \
       --ck_preshuffle True --flydsl
@@ -328,7 +328,7 @@ _SMI_ROWS = []
 
 @contextlib.contextmanager
 def _smi_case(label):
-    """Set the case label consumed by the common perftest hook."""
+    """Set the fallback label for calls without @benchmark context."""
     old = os.environ.get("AITER_SMI_LABEL")
     if os.environ.get("AITER_SMI_MONITOR") == "1":
         os.environ["AITER_SMI_LABEL"] = label
@@ -447,7 +447,9 @@ _A16W16_MS = _tokens(tuple(sorted({*_TOKENS, 4096, 8192, 16384})))
 # against rather than in the kernel under test. AITER_BENCH_TOKENS still wins if
 # set -- what an explicit request sweeps is the caller's business.
 _INVERSE_ROPE_TOKENS = _tokens((1, 16, 32, 64, 128, 256, 512, 1024, 2048, 16384))
-_SCORE_QK_TOKENS = _tokens()
+# Score-QK runs once per decode step. With MTP disabled, this axis is both the
+# number of concurrent sequences and the number of query tokens in the launch.
+_SCORE_QK_TOKENS = _tokens((1, 16, 32, 64, 128, 256, 512, 1024))
 # score_qk is decode, so its KV length is the average context a decode step
 # scans: input + output/2, then CSA's 4x compression.
 #   1K in / 1K out  -> (1024  + 512)  / 4 =   384
@@ -461,18 +463,20 @@ _SCORE_QK_KV_LENGTHS = (
 # Was unset, which let the UT sweep its own 27-value default down to M=1. Two
 # reasons to set it. First, M here is the token count of one step, so the small
 # end of that default is decode batch and the large end is prefill chunk. This
-# list retains the model-real decode point M=512, then covers the prefill side
+# list retains the model-real decode points M=256/512, then covers the prefill side
 # up to the 65536 the other DSv4 ops sweep and past the UT default's own ceiling
 # of 10240. Second, the tiny M are what walk into
 # the UT bug described at "a8w8_blockscale" below: get_CKGEMM_config retries the
 # lookup as M -> get_padded_m(gl=0) -> nextPow2, so anything in [1, 16] or
 # [33, 64] can land on one of #4773's M=16/M=64 gluon rows (gemm_common.cu:13).
-# Starting at 512 clears both ranges by a wide margin.
+# Starting at 256 clears both ranges by a wide margin.
 #
 # Two things remain outside coverage, both worth remembering: decode-side M
-# below 512, and the 11 tuned rows that are the only shapes dispatching to
+# below 256, and the 11 tuned rows that are the only shapes dispatching to
 # gluon. This is a way around the UT bug, not a fix for it.
-_A8W8_BLOCKSCALE_TOKENS = _tokens((512, 1024, 2048, 4096, 8192, 16384, 65536))
+_A8W8_BLOCKSCALE_TOKENS = _tokens(
+    (256, 512, 1024, 2048, 4096, 8192, 16384, 65536)
+)
 # Decode carries one token per sequence, so this axis is the batch, not a token
 # count; past 1024 it stops being a shape the model runs, hence its own default
 # rather than _TOKENS. AITER_BENCH_TOKENS overrides it like everywhere else.
@@ -493,12 +497,12 @@ _MLA_DECODE_TOKENS = _tokens((1, 16, 32, 64, 128, 256, 512, 1024))
 # that is fixed these are timings from an unverified kernel -- the same footing
 # as a16w16's M=65536 rows before _A16W16_MAX_ERR caught them.
 _MLA_PREFILL_TOKENS = _tokens((1024, 2048, 4096, 8192, 16384))
-# Default stops at 2048: tokens/rank=65536 dies in pipe.setup() building the
-# symmetric arena -- cco sizes it from Communicator.DEFAULT_PER_RANK_VMM (4 GiB)
+# tokens/rank=65536 has previously died in pipe.setup() while building the
+# symmetric arena: cco sizes it from Communicator.DEFAULT_PER_RANK_VMM (4 GiB)
 # and asks for 7.5 GB. That is a per_rank_vmm the UT never passes, not something
-# MORI_SHMEM_HEAP_SIZE reaches, so the tier cannot run from here. Ask for it via
-# AITER_BENCH_TOKENS anyway and you get it, along with that failure.
-_MEGA_MOE_TOKENS = _tokens((1, 16, 32, 64, 128, 256, 512, 1024, 2048))
+# MORI_SHMEM_HEAP_SIZE reaches. Keep the tier in the sweep so the limitation is
+# visible in the structured failure output rather than silently unmeasured.
+_MEGA_MOE_TOKENS = _tokens((1, 16, 32, 64, 128, 256, 512, 1024, 2048, 65536))
 # What dispatch puts on the wire; combine is always bf16, so anything but bf16
 # is an asymmetric pair. fp4 is the wire DSv4 actually serves on -- the receiver
 # hands the payload straight to the expert GEMM as its A operand, and that GEMM
@@ -632,13 +636,13 @@ _MLA_V4_KARGPRELD_SHAPES = [
 ]
 _MLA_V4_DSV4_SHAPES = [
     (128, 512, kv_seq_lens, num_kv_splits)
-    for kv_seq_lens in (256, 512, 1024)
+    for kv_seq_lens in (256, 512, 1024, 1152)
     for num_kv_splits in (1, 2, 4)
 ] + [
     (128, tokens, kv_seq_lens, num_kv_splits)
     for tokens in _MLA_DECODE_TOKENS
     if tokens != 512
-    for kv_seq_lens in (256, 512, 1024)
+    for kv_seq_lens in (256, 512, 1024, 1152)
     for num_kv_splits in (1, 2, 4)
 ]
 _MLA_V4_COMPARE_KEEP = [
@@ -885,8 +889,8 @@ def _run_child(name, cmd, cwd, env=None, extract=None, timeout=None, tail=30,
     when the child fails or emits nothing recognisable.
     """
     extract = extract or _json_tables
-    # Give every child invocation its combo-owned SMI case label. UTs remain
-    # unaware of telemetry; the common perftest hook reads this environment.
+    # Give calls without @benchmark context a combo-owned fallback label.
+    # Decorated UT calls derive their per-case label from their actual args.
     if smi and os.environ.get("AITER_SMI_MONITOR") == "1":
         env = os.environ.copy() if env is None else env.copy()
         env["AITER_SMI_LABEL"] = name
@@ -1128,7 +1132,7 @@ def run_f8gemm(args):
 
 
 def run_a8w8_blockscale(args):
-    """Run DSv4 FP8 blockscale linear projections at M=512."""
+    """Run DSv4 FP8 blockscale linear projections across decode/prefill M."""
     # AITER_LOG_MORE=1 is set at module scope for the FlyDSL MoE ops, and a
     # child started with env=None inherits this process's whole environ. In this
     # UT that turned a clean sweep into an intermittent HSA memory fault, so
@@ -1173,25 +1177,12 @@ def run_a8w8_blockscale(args):
     init_pairs = _init_pairs(
         args, defaults=(("constant", "constant"), ("uniform", "auto"))
     )
-    if args.smi_monitor:
-        for m, (n, k), pair in itertools.product(
-            _A8W8_BLOCKSCALE_TOKENS, nk_shapes, init_pairs
-        ):
-            data_init, scale_init = pair
-            run_case(
-                (m,),
-                ((n, k),),
-                (pair,),
-                f"a8w8_blockscale/M={m}/N={n}/K={k}/data={data_init}/"
-                f"scale={scale_init}/seed={args.seed}",
-            )
-    else:
-        run_case(
-            _A8W8_BLOCKSCALE_TOKENS,
-            nk_shapes,
-            init_pairs,
-            "gemm_a8w8_blockscale (DSv4)",
-        )
+    run_case(
+        _A8W8_BLOCKSCALE_TOKENS,
+        nk_shapes,
+        init_pairs,
+        "gemm_a8w8_blockscale (DSv4)",
+    )
 
 
 def run_a16w16(args):
@@ -1376,15 +1367,7 @@ def run_mhc(args):
         )
 
     data_inits = args.data_init or ["norm"]
-    if args.smi_monitor:
-        for m, data_init in itertools.product(_TOKENS, data_inits):
-            run_case(
-                (m,),
-                (data_init,),
-                f"mhc/M={m}/N=7168/fuse_rmsnorm=1/data={data_init}/seed={args.seed}",
-            )
-    else:
-        run_case(_TOKENS, data_inits, "mhc (DSv4, fused RMSNorm)")
+    run_case(_TOKENS, data_inits, "mhc (DSv4, fused RMSNorm)")
 
 
 def run_qk_norm(args):
@@ -1424,12 +1407,8 @@ def run_qk_norm(args):
             structured=True,
         )
 
-    if args.smi_monitor:
-        for token, data_init in itertools.product(_TOKENS, data_inits):
-            run_case((token,), data_init)
-    else:
-        for data_init in data_inits:
-            run_case(_TOKENS, data_init)
+    for data_init in data_inits:
+        run_case(_TOKENS, data_init)
 
 
 def run_score_qk(args):
@@ -1449,18 +1428,18 @@ def run_score_qk(args):
         "--blocksize",
         "64",
     ]
-    # None => let the UT pick the batch, so run the KV lengths once each.
     for tokens, (label, kv_length), data_init in itertools.product(
-        _SCORE_QK_TOKENS or (None,),
+        _SCORE_QK_TOKENS,
         _SCORE_QK_KV_LENGTHS,
         args.data_init or ["norm"],
     ):
         _run_child(
-            f"score_qk (decode, B={tokens or 'UT default'}, {label} "
+            f"score_qk (decode, B={tokens}, {label} "
             f"CSA KV={kv_length}, init={data_init}, seed={args.seed})",
             [
                 *base_cmd,
-                *(["--batch", str(tokens)] if tokens else []),
+                "--batch",
+                str(tokens),
                 "-kv_length",
                 kv_length,
                 "--data-init",
@@ -1713,11 +1692,11 @@ def run_mla_v4_decode(args):
 
 
 def run_inverse_rope(args):
-    """Run DSv4 inverse RoPE + group quant at the tp1 attention-output shape."""
+    """Run DSv4 inverse RoPE + group quant at TP1/TP4 attention shapes."""
     _unused_scale_init(args, "inverse_rope")
-    # -b is (n_local_heads, n_local_groups); 128,16 is V4-Pro at dp/tp1. The UT
-    # defaults to the two smallest configs instead, which never reach the shape
-    # the model runs, so name it explicitly.
+    # -b is (n_local_heads, n_local_groups); 128,16 and 32,4 are V4-Pro at TP1
+    # and TP4. The UT defaults to the two smallest configs instead, which never
+    # reach these model shapes, so name them explicitly.
     def run_case(tokens, data_inits, label):
         _run_child(
             label,
@@ -1726,6 +1705,7 @@ def run_inverse_rope(args):
                 "op_tests/test_inverse_rope_group_quant.py",
                 "-b",
                 "128,16",
+                "32,4",
                 "-s",
                 *map(str, tokens),
                 "-l",
@@ -1743,20 +1723,11 @@ def run_inverse_rope(args):
         )
 
     data_inits = args.data_init or ["norm"]
-    if args.smi_monitor:
-        for tokens, data_init in itertools.product(_INVERSE_ROPE_TOKENS, data_inits):
-            run_case(
-                (tokens,),
-                (data_init,),
-                f"inverse_rope/s={tokens}/heads=128/groups=16/layout=n32k4/"
-                f"group_size=32/data={data_init}/seed={args.seed}",
-            )
-    else:
-        run_case(
-            _INVERSE_ROPE_TOKENS,
-            data_inits,
-            "inverse_rope_group_quant (DSv4, tp1)",
-        )
+    run_case(
+        _INVERSE_ROPE_TOKENS,
+        data_inits,
+        "inverse_rope_group_quant (DSv4, TP1/TP4)",
+    )
 
 
 def run_mla_v4_prefill(args):
@@ -1800,38 +1771,16 @@ def run_mla_v4_prefill(args):
             structured=True,
         )
 
-    if args.smi_monitor:
-        backend_by_prec = {"fp8": ("opus", "asm"), "bf16": ("opus", "triton")}
-        for tokens, pages, prec, mode, data_init in itertools.product(
-            _MLA_PREFILL_TOKENS,
+    for tokens in _MLA_PREFILL_TOKENS:
+        run_case(
+            tokens,
             (4096, 16384),
             ("fp8", "bf16"),
             ("dense", "sparse"),
+            ("opus", "asm", "triton"),
             data_inits,
-        ):
-            for backend in backend_by_prec[prec]:
-                run_case(
-                    tokens,
-                    (pages,),
-                    (prec,),
-                    (mode,),
-                    (backend,),
-                    (data_init,),
-                    f"mla_v4_prefill/M={tokens}/H=128/D=512/pages={pages}/"
-                    f"total_tokens={tokens}/prec={prec}/mode={mode}/backend={backend}/"
-                    f"data={data_init}/seed={args.seed}",
-                )
-    else:
-        for tokens in _MLA_PREFILL_TOKENS:
-            run_case(
-                tokens,
-                (4096, 16384),
-                ("fp8", "bf16"),
-                ("dense", "sparse"),
-                ("opus", "asm", "triton"),
-                data_inits,
-                f"mla_v4 prefill (M={tokens}, prec=fp8/bf16, pages=4096/16384)",
-            )
+            f"mla_v4 prefill (M={tokens}, prec=fp8/bf16, pages=4096/16384)",
+        )
 
 
 OPS = {
@@ -1913,10 +1862,11 @@ DSV4_OPS = [
     # -m 16 -nk 2048,7168 --ck_preshuffle True passes the strided check with
     # the line untouched, and only adding --flydsl makes it crash.
     #
-    # Back in the sweep because _A8W8_BLOCKSCALE_TOKENS now starts at 512,
+    # Back in the sweep because _A8W8_BLOCKSCALE_TOKENS now starts at 256,
     # which keeps every shape clear of the problematic tiny-M ranges while
-    # retaining a real DSv4 decode batch. M=512 was verified above across all
-    # six (n,k). The previous 1024..65536 sweep was verified on 20260828,
+    # retaining real DSv4 decode batches. M=512 was verified above across all
+    # six (n,k); M=256 is also included in the workload sweep. The previous
+    # 1024..65536 sweep was verified on 20260828,
     # rocm/fw-bringup:gfx1250-atom--20260827-ubench: 36/36 cases, err=0 on all,
     # 2207-7003 TFLOPS. That run also clears M=10240, the shape the earlier
     # sweep faulted on -- more evidence that fault was cross-case state and not
