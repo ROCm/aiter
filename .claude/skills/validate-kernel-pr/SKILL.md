@@ -55,7 +55,7 @@ boundary, whatever the file layout.)
 
 | command | what it owns |
 |---|---|
-| `report.py init \| set \| stage \| finding \| finish` | the report itself. `finish` computes the verdict from the stages actually recorded, validates against `report_schema.json`, and is the **sole** writer of `verdict` and of the process exit code. |
+| `report.py init \| set \| stage \| finding \| coverage \| finish` | the report itself. `finish` computes the verdict from the stages actually recorded, validates against `report_schema.json`, and is the **sole** writer of `verdict` and of the process exit code. |
 | `pick-idle-gpu.py` | the sampling window that decides a GPU is idle, and the `idleness-basis:` line saying how it knows. |
 | `gpu_probe.py` | which device the run actually holds — arch, BDF, activity — asked of amd-smi, never turning an unreadable reading into an idle one. |
 | `target_run.py` | the decisions around one target run: what goes into the receipt probe, how a grid cell becomes a Python value, what a script target's exit code may be counted as, and which environment variables the target is allowed to see. |
@@ -97,7 +97,41 @@ HEAD=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid)
 
 git worktree add --detach "/tmp/pr-$PR" "$BASE"
 gh pr diff "$PR" --repo "$REPO" > "/tmp/pr-$PR.patch"
+
+.claude/skills/validate-kernel-pr/validate_pr.sh \
+    --repo "/tmp/pr-$PR" \
+    --patch "/tmp/pr-$PR.patch" \
+    --head-sha "$HEAD" \
+    --target tests/kernels/test_softmax.py \
+    --runner pytest --runner-reason "the file is a pytest module the PR ships" \
+    --expected-route kernels.softmax_kernel:build_softmax_module \
+    --shape-vars M,N,dtype_str \
+    --shape-env ROCDSL_SOFTMAX_SHAPES \
+    --grid "64,2048,f32;64,2000,f32" \
+    --grid-novelty "the target's own cells are all powers of two; 2000 is the unaligned tail" \
+    --tol-table "f32=1e-5,f16=2e-3,bf16=1e-2" \
+    --out validation_report.json
 ```
+
+Everything that describes the PR is a flag; everything that describes the host is an environment
+variable (next section).
+
+| flag | meaning |
+|---|---|
+| `--repo` | worktree to validate (required) |
+| `--patch` | patch to apply first; a conflict is a blocker, not a skip |
+| `--head-sha` | the exact remote head this patch represents; omit only for a local candidate |
+| `--target` | the script file or pytest node the PR ships (`--tests` is an alias) |
+| `--runner` `--runner-reason` | `pytest`, `script`, or `none`, and **why** — you read the target, the validator does not check you. `none` means you have decided nothing here is runnable |
+| `--expected-route` | the `module:function` the profiler must observe; without it there is no receipt and no observed work |
+| `--shape-vars` | local names captured at each route call, in grid order |
+| `--shape-env` \| `--shape-arg` \| `--shape-argnames` | how the grid reaches the target: an env var it reads, its own CLI flag, or the `parametrize` names to replace |
+| `--grid` `--grid-novelty` | the cells, and what they cover that the target's own defaults do not. Undeclared novelty means a passing grid earns `skip` |
+| `--axis` | repeatable `NAME=--flag:v1;v2` — an independent axis that is not a shape |
+| `--tol-table` | tolerances recorded alongside the comparison |
+| `--perf-args` \| `--no-perf` | force the timing entry point, or skip timing entirely |
+| `--perf-control-column` | a column the patch does not touch; **required** before a transplanted baseline is believed |
+| `--label` `--out` | run name and report path (default `./validation_report.json`) |
 
 Take the base from the **branch tip**, not from `baseRefOid`. `baseRefOid` is where the branch
 stood when the PR was opened; comparing against it attributes every intervening merge on the base
@@ -278,12 +312,15 @@ Two traps, both of which have already produced that false blocker:
 
 So when a run executes nothing, say that in those words. *"Red on both sides"* is an attribution,
 not an explanation, and a reader who is not told otherwise concludes the code is broken when the
-runner choice was. The report records `runner_basis` — whether the runner was your declaration or
-a fact about the target — so that a reader can tell your claim from a measurement.
+runner choice was. The report records `runner_basis` — `declared-by-caller` when it was your
+declaration, `explicit-node-selector` when the target string carried a `::` node and settled it,
+`target-missing` when there was no file to run, `undeclared` when nobody said — so that a reader
+can tell your claim from a measurement.
 
-Both runners are profiled identically: the probe is installed by a validator-owned wrapper that
-then executes the file under `runpy` with `run_name="__main__"`, because nothing about
-`sys.setprofile` ever needed pytest; pytest was only where the hook was convenient to install.
+Both runners are profiled by the same `sys.setprofile` hook, so the receipt means the same thing
+either way; only the delivery differs, because pytest owns its own startup and a script does not.
+A pytest target loads the probe as a plugin; a script target is executed by a validator-owned
+wrapper under `runpy` with `run_name="__main__"`, which is what makes a `__main__` guard fire.
 
 #### What counts as having run
 
@@ -369,7 +406,8 @@ exactly the duplication this stage exists to prevent, and invisible in the repor
 you pick the cells, read the target's own default for the channel you are using, and pass
 `--grid-novelty "<which cells are outside it, and what they exercise>"`. That reason is published
 verbatim as `grid_independence_reason` with `grid_independence_basis: declared-by-caller`, so a
-reader can see it is your claim and go check it against the same source you read.
+reader can see it is your claim and go check it against the same source you read. With no `--grid`
+at all the basis is `no-grid` — nothing was asked for, so nothing is owed.
 
 | value | meaning |
 |---|---|
@@ -410,6 +448,7 @@ that never reached the kernel.
 |---|---|
 | `none` / `unusable` | none requested, or the target is not a script — argv reaches script targets only |
 | `malformed-spec` | the `name=--flag:v1;v2` spelling does not parse; nothing is guessed from it |
+| `declared` | parsed and usable, but the probe has not reported yet. A finished report carrying this means the run died before the axis was proven, so believe nothing about the axis |
 | `hook-not-consumed` | a flag accepted the invalid value; the axis is **dropped and named**, never dropped quietly |
 | `proven` | every axis flag refused the invalid value, and its values rode the grid run's argv |
 
