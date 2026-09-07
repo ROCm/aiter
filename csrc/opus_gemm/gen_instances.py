@@ -1432,12 +1432,18 @@ if __name__ == "__main__":
             "Path to the subset-compile sidecar (JSON list of int kids). "
             "Defaults to {working_path}/compiled_kids.json. The sidecar "
             "captures the union of CSV opus rows + previous sidecar "
-            "contents + HEURISTIC_DEFAULT_KIDS so subsequent rebuilds "
-            "are idempotent (no rebuild if every required kid is already "
-            "in the .so). gradlib's GemmTuner and opus_gemm_tune.py "
-            "expand this sidecar in tuner-startup to add new kids before "
-            "triggering an AITER_REBUILD."
+            "contents + extra kids + HEURISTIC_DEFAULT_KIDS. JIT supplies a "
+            "staged copy and publishes it after successful compilation. "
+            "Tuners pass new candidates with --extra_kids."
         ),
+    )
+
+    parser.add_argument(
+        "--extra_kids",
+        nargs="*",
+        type=int,
+        default=[],
+        help="Additional tuner candidates for this build; persisted only after success.",
     )
 
     # Legacy --tune_file alias kept for backward compat with any existing
@@ -1517,7 +1523,9 @@ if __name__ == "__main__":
 
     # The compile set: union, intersected with valid kernels_list entries.
     valid_kids = set(kernels_list.keys())
-    S = (csv_kids | sidecar_kids | set(HEURISTIC_DEFAULT_KIDS)) & valid_kids
+    S = (
+        csv_kids | sidecar_kids | set(args.extra_kids) | set(HEURISTIC_DEFAULT_KIDS)
+    ) & valid_kids
 
     # Per-arch filter: drop kids whose arch_prefix is not in the target build set.
     _kid_arch = _kid_arch_common
@@ -1694,7 +1702,8 @@ if __name__ == "__main__":
             f"existing files; using empty lookup"
         )
 
-    # Persist the expanded compile set so subsequent rebuilds reuse it.
+    # Write the generated set inside staging. JIT publishes it to bd_dir only
+    # after the binary is installed, so a failed compile cannot advance it.
     try:
         os.makedirs(os.path.dirname(sidecar_path) or ".", exist_ok=True)
     except OSError:

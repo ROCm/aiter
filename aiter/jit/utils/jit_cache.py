@@ -2,6 +2,8 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Transactional helpers for JIT-generated sources and binaries."""
 
+import hashlib
+import json
 import os
 import shlex
 import shutil
@@ -22,6 +24,7 @@ _ABANDONED_ARTIFACT_PREFIXES = (
     ".blob-publish-",
     ".blob-backup-",
     ".blob-reset-",
+    "blob.backup.",  # backups used by older revisions
 )
 
 # Keep fault injection local to this module. Tests patch these aliases instead
@@ -49,12 +52,37 @@ def _copy_directory(source, destination):
     shutil.copytree(source, destination, copy_function=_copy2)
 
 
+def _transaction_prefix(kind):
+    return f".blob-{kind}-{socket.gethostname()}.{os.getpid()}."
+
+
+def _artifact_owner_active(name):
+    """Return None for legacy names; never reclaim a live or remote owner."""
+    for kind in ("publish", "backup", "reset"):
+        prefix = f".blob-{kind}-"
+        if not name.startswith(prefix):
+            continue
+        parts = name[len(prefix) :].rsplit(".", 2)
+        if len(parts) != 3 or not parts[1].isdigit():
+            return None
+        if parts[0] != socket.gethostname():
+            return True
+        try:
+            os.kill(int(parts[1]), 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+    return None
+
+
 def _restore_staging_directory(staging_dir, blob_dir, op_dir):
     """Restore the deterministic working tree from the last published cache."""
     discarded_dir = None
     if os.path.lexists(staging_dir):
         discarded_dir = os.path.join(
-            op_dir, f".blob-reset-{os.getpid()}-{uuid.uuid4().hex}"
+            op_dir, f"{_transaction_prefix('reset')}{uuid.uuid4().hex}"
         )
         _replace(staging_dir, discarded_dir)
     try:
@@ -97,6 +125,7 @@ def _recover_blob_backup(blob_dir):
             os.path.join(op_dir, name)
             for name in os.listdir(op_dir)
             if name.startswith(".blob-backup-")
+            and _artifact_owner_active(name) is not True
         ),
         key=lambda path: os.path.getmtime(path),
         reverse=True,
@@ -110,7 +139,13 @@ def _recover_blob_backup(blob_dir):
 
 
 def cleanup_abandoned_blob_artifacts(op_dir, max_age_seconds=24 * 60 * 60):
-    """Remove abandoned transaction artifacts after a bounded grace period."""
+    """Reap dead local owners on the next build; age out legacy artifacts.
+
+    Stable blob/staging trees are retained for incremental Ninja retries.
+    The 24-hour grace applies only to legacy names without owner information,
+    not to new artifacts whose local owner has died. This is not a timer:
+    cleanup runs when the same module next enters code generation.
+    """
     if not os.path.isdir(op_dir):
         return
     cutoff = time.time() - max_age_seconds
@@ -119,9 +154,12 @@ def cleanup_abandoned_blob_artifacts(op_dir, max_age_seconds=24 * 60 * 60):
             continue
         if not name.startswith(_ABANDONED_ARTIFACT_PREFIXES):
             continue
+        owner_active = _artifact_owner_active(name)
+        if owner_active is True:
+            continue
         path = os.path.join(op_dir, name)
         try:
-            if os.path.getmtime(path) > cutoff:
+            if owner_active is None and os.path.getmtime(path) > cutoff:
                 continue
         except OSError:
             continue
@@ -317,9 +355,12 @@ def publish_blob_sources(staging_dir, blob_dir):
         raise RuntimeError("refusing to publish incomplete JIT blob sources")
 
     op_dir = os.path.dirname(blob_dir)
-    candidate_dir = tempfile.mkdtemp(prefix=".blob-publish-", dir=op_dir)
+    candidate_dir = tempfile.mkdtemp(prefix=_transaction_prefix("publish"), dir=op_dir)
     backup_dir = None
     try:
+        # mkdtemp starts at 0700. Correct it before copying any contents, even
+        # if publication later fails or the builder is killed during the copy.
+        os.chmod(candidate_dir, _directory_mode(op_dir))
         previous_blob_dir = blob_dir if os.path.isdir(blob_dir) else None
         _copy_blob_snapshot(staging_dir, candidate_dir, previous_blob_dir)
         if _complete_stage_token(staging_dir) != token_before:
@@ -327,7 +368,7 @@ def publish_blob_sources(staging_dir, blob_dir):
 
         if os.path.lexists(blob_dir):
             backup_dir = os.path.join(
-                op_dir, f".blob-backup-{os.getpid()}-{uuid.uuid4().hex}"
+                op_dir, f"{_transaction_prefix('backup')}{uuid.uuid4().hex}"
             )
             _replace(blob_dir, backup_dir)
         try:
@@ -363,3 +404,53 @@ def atomic_copy(source, destination):
             os.remove(temporary_path)
         except FileNotFoundError:
             pass
+
+
+def _artifact_identity(path):
+    info = os.stat(path)
+    return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+
+
+def compiled_kids_are_current(sidecar, artifact, required):
+    """A sidecar is evidence only when its receipt matches the installed .so.
+
+    Missing/legacy metadata, a failed publication or a replaced/copied binary
+    conservatively requires rebuilding. Neither file lives under clear_build.
+    """
+    try:
+        with open(sidecar, "rb") as source:
+            contents = source.read()
+        with open(sidecar + ".receipt", encoding="utf-8") as source:
+            receipt = json.load(source)
+        return (
+            receipt["artifact"] == _artifact_identity(artifact)
+            and receipt["sha256"] == hashlib.sha256(contents).hexdigest()
+            and set(required) <= set(json.loads(contents))
+        )
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def publish_compiled_kids(staged_sidecar, sidecar, artifact):
+    """Publish successful codegen metadata after installing its binary.
+
+    The receipt detects the gap between the two atomic replacements. If this
+    step fails, the installed binary remains usable and the tuner must rebuild
+    before relying on the sidecar again. Called under the module build lock.
+    """
+    identity = _artifact_identity(artifact)
+    with open(staged_sidecar, "rb") as source:
+        contents = source.read()
+    receipt = {"artifact": identity, "sha256": hashlib.sha256(contents).hexdigest()}
+    atomic_copy(staged_sidecar, sidecar)
+    fd, temporary_path = tempfile.mkstemp(
+        prefix=".opus-receipt-", dir=os.path.dirname(sidecar)
+    )
+    try:
+        # Avoid leaving a root-owned, unreadable tempfile in a packaged JIT tree.
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            os.chmod(temporary_path, _directory_mode(sidecar) & 0o666)
+            json.dump(receipt, output)
+        _replace(temporary_path, sidecar + ".receipt")
+    finally:
+        _remove_path(temporary_path)

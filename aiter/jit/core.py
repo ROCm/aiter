@@ -25,7 +25,12 @@ sys.path.insert(0, f"{this_dir}/utils/")
 from chip_info import get_gfx, get_gfx_list, get_gfx_runtime
 from cpp_extension import _jit_compile, executable_path, get_hip_version
 from file_baton import FileBaton
-from jit_cache import atomic_copy, publish_blob_sources, stage_blob_sources
+from jit_cache import (
+    atomic_copy,
+    publish_blob_sources,
+    publish_compiled_kids,
+    stage_blob_sources,
+)
 from torch_guard import torch_compile_guard
 
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
@@ -1167,6 +1172,22 @@ def build_module(
             raise_build_error(error)
 
         if staged_blob_dir is not None:
+            if md_name == "module_deepgemm_opus":
+                try:
+                    publish_compiled_kids(
+                        f"{staged_blob_dir}/compiled_kids_opus.json",
+                        f"{bd_dir}/compiled_kids_opus.json",
+                        f"{get_user_jit_dir()}/{target_name}",
+                    )
+                except Exception:
+                    # A stale receipt cannot validate the newly installed .so.
+                    # Do not make a successful build fail because of metadata.
+                    logger.warning(
+                        "JIT build [%s] succeeded, but publishing its compiled-kid "
+                        "metadata failed; the tuner will revalidate by rebuilding",
+                        md_name,
+                        exc_info=AITER_LOG_MORE > 0,
+                    )
             try:
                 publish_blob_sources(staged_blob_dir, blob_dir)
             except Exception:
