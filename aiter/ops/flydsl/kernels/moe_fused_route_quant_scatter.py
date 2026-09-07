@@ -77,7 +77,8 @@ from aiter.ops.flydsl.kernels.quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
-    ptr_rsrc,
+    buf_copy_atom,
+    ptr_buf_tensor,
 )
 from aiter.utility.mx_types import (
     MX_DEFAULT_ROUND_MODE as _ROUND_MODE,
@@ -251,13 +252,35 @@ def _quant_layout(feat_dim: int, quant_mode: str, wmma_rep: int) -> SimpleNamesp
     )
 
 
+def _buf_rsrc(t):
+    """The V# behind a ``ptr_buf_tensor``, for the ops with no copy-atom form."""
+    return fx.rocdl.get_buffer_rsrc(fx.get_iter(t))
+
+
+# A lane's payload slice is 1, 2, 4 or 8 bytes. Up to 4 it is one integer the
+# hardware can load/store directly, so the view is scalar and `t[unit]` is the
+# whole access; 8 B has no scalar type and goes through a 2-dword unit.
+_LANE_UNIT_ELEM = {1: fx.Int8, 2: fx.Int16, 4: fx.Int32}
+
+
+def _lane_unit_tensor(row_addr, unit_bytes, row_bytes):
+    """Row view whose element is one lane's ``unit_bytes``-wide payload slice."""
+    if unit_bytes in _LANE_UNIT_ELEM:
+        return ptr_buf_tensor(
+            row_addr, _LANE_UNIT_ELEM[unit_bytes], num_records_bytes=row_bytes
+        )
+    return ptr_buf_tensor(
+        row_addr, unit_elems=unit_bytes // 4, num_records_bytes=row_bytes
+    )
+
+
 def _emit_quant_block_loop(c: SimpleNamespace) -> None:
     """Emit one warp's per-MX-block quant + e8m0 scale-preshuffle loop.
 
     ``c`` carries the layout flags, SSA constants/types, the i64 row bases
     (``payload_base``, ``hidden_base``) with their per-row byte strides
     (``payload_bytes_per_row``, ``feat_bytes_per_row``, ``feat_row_i32``), the
-    scale resource, the intra-warp mapping (``block_in_wave``, ``lane_in_block``,
+    scale tensor, the intra-warp mapping (``block_in_wave``, ``lane_in_block``,
     ``is_block_lead``), and ``c.dests``: a list of destination namespaces, each
     with ``payload_row_i32`` and ``scale_row_dword_base``. The current callers
     pass a single destination; keeping this as a list lets a future caller
@@ -276,39 +299,71 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
     if mx_group_base is None:
         mx_group_base = arith.constant(0, type=i32)
 
+    # Every per-lane access below -- the hidden/payload row and the pre-quantized
+    # e8m0 row -- is one unit of exactly this lane's share of an MX block, so all
+    # of them index by the same unit number and cannot drift apart. The unit
+    # width differs per tensor (bf16 columns vs payload bytes) and lives in that
+    # tensor's layout.
+    lanes_per_mx_block = c.lanes_per_mx_block
+    payload_bytes_per_lane = c.payload_bytes_per_lane
+    hidden_dwords_per_lane = c.elems_per_lane // 2  # 2 bf16 per dword
+
     # i64 row base: at >64k tokens a grouped row index times model_dim exceeds the
     # 32-bit buffer voffset (contiguous_m * feat_dim > 2**32), corrupting the store.
     payload_bytes_per_row = c.payload_bytes_per_row
-    dst_payload = []
-    for dst in c.dests:
-        row_addr = (
-            c.payload_base + fx.Uint64(dst.payload_row_i32) * payload_bytes_per_row
+    dst_payload = [
+        _lane_unit_tensor(
+            c.payload_base + fx.Uint64(dst.payload_row_i32) * payload_bytes_per_row,
+            payload_bytes_per_lane,
+            payload_bytes_per_row,
         )
-        dst_payload.append(
-            buffer_ops.create_buffer_resource_from_addr(
-                row_addr, num_records_bytes=payload_bytes_per_row
-            )
-        )
+        for dst in c.dests
+    ]
 
-    hidden_row_addr = c.hidden_base + fx.Uint64(c.feat_row_i32) * c.feat_bytes_per_row
-    hidden_rsrc = buffer_ops.create_buffer_resource_from_addr(
-        hidden_row_addr, num_records_bytes=c.feat_bytes_per_row
-    )
-    feat_elem_base = arith.constant(0, type=i32)
+    prequantized = getattr(c, "prequantized", False)
+    if const_expr(prequantized):
+        # A pre-quantized row is payload bytes, so it is read through the same
+        # lane-unit view the payload is written through.
+        hidden_t = _lane_unit_tensor(
+            c.hidden_base + fx.Uint64(c.feat_row_i32) * c.feat_bytes_per_row,
+            payload_bytes_per_lane,
+            c.feat_bytes_per_row,
+        )
+        src_bytes_per_lane = payload_bytes_per_lane
+    else:
+        hidden_t = ptr_buf_tensor(
+            c.hidden_base + fx.Uint64(c.feat_row_i32) * c.feat_bytes_per_row,
+            unit_elems=hidden_dwords_per_lane,
+            num_records_bytes=c.feat_bytes_per_row,
+        )
+        src_bytes_per_lane = hidden_dwords_per_lane * 4
+
+    # Up to 4 B the unit is one integer the hardware loads directly; wider needs
+    # an atom. Hoisted out of the block loop: a per-iteration atom + fragment
+    # costs more than the copy it feeds.
+    if const_expr(src_bytes_per_lane > 4):
+        src_atom = buf_copy_atom(src_bytes_per_lane)
+        src_frag = fx.make_fragment_like(fx.slice(hidden_t, (0, None)))
+
+    def _load_src_unit(lane_unit):
+        """This lane's source unit: payload bytes, or its bf16 columns."""
+        if const_expr(src_bytes_per_lane > 4):
+            fx.copy(src_atom, fx.slice(hidden_t, (lane_unit, None)), src_frag)
+            return fx.memref_load_vec(src_frag)
+        return hidden_t[lane_unit]
 
     # Pre-quantized source: load what the quant pass would have computed, so the
     # store pass below stays shared. That destination arithmetic has already
     # moved once (to WMMA-contiguous); a second copy of it would fail silently,
     # by writing to the wrong offset.
-    prequantized = getattr(c, "prequantized", False)
-    src_scale_rsrc = None
+    src_scale_t = None
     if const_expr(prequantized):
-        c2_i32 = arith.constant(2, type=i32)
         # Its own stride: a sender pads the e8m0 row (mori pads to 128 B so every
         # token's TDM run starts aligned), so it is a build constant rather than
         # feat_dim // 32.
-        src_scale_rsrc = buffer_ops.create_buffer_resource_from_addr(
+        src_scale_t = ptr_buf_tensor(
             c.src_scale_base + fx.Uint64(c.feat_row_i32) * c.src_scale_bytes_per_row,
+            fx.Int8,
             num_records_bytes=c.src_scale_bytes_per_row,
         )
 
@@ -318,42 +373,22 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
         mx_block = (mx_group_base + arith.constant(it, type=i32)) * arith.constant(
             c.mx_blocks_per_wave_iter, type=i32
         ) + c.block_in_wave
+        lane_unit = fx.Uint32(mx_block) * lanes_per_mx_block + c.lane_in_block
         if const_expr(prequantized):
-            # This lane's payload bytes sit at exactly the offset the store pass
-            # writes them to, so both sides share the expression and cannot drift.
             # fp8: 8 B/lane = 2 dwords; fp4: 4 B/lane = 1 dword -- the same types
             # the pk8 converts produce, so the store needs no special case.
-            byte_off = (
-                mx_block * c.c_payload_bytes_per_block
-                + c.lane_in_block * c.c_payload_bytes_per_lane
-            )
-            payload_val = buffer_ops.buffer_load(
-                hidden_rsrc,
-                byte_off >> c2_i32,
-                vec_width=c.payload_dwords_per_lane,
-                dtype=i32,
-            )
+            payload_val = _load_src_unit(lane_unit)
             # Every lane of an MX block loads the same e8m0 byte (one cache line)
             # and only the lead lane stores it. Unconditional on purpose: a value
             # defined inside an scf.if would not dominate the store pass below.
-            e8m0_byte = buffer_ops.buffer_load(
-                src_scale_rsrc, mx_block, vec_width=1, dtype=T.i8
-            )
+            e8m0_byte = src_scale_t[mx_block]
             # Widen so the store pass's trunci sees the same i32 it does on the
             # quant path, where e8m0 comes out of emit_mx_e8m0_scale as i32.
             e8m0_scale = arith.extui(i32, ArithValue(e8m0_byte))
         elif const_expr(c.use_pk8):
-            # gfx1250 native pk8: 8 contiguous bf16 cols this lane.
-            # col_base = mx_block*32 + lane_in_block*8.
-            col_base = (
-                mx_block * arith.constant(32, type=i32)
-                + c.lane_in_block * c.c_elems_per_lane
-            )
-            # 2 bf16/dword -> 4 dwords; one aligned dwordx4 = 8 bf16.
-            hidden_dword = (feat_elem_base + col_base) >> c.c1_i32
-            dwords4 = buffer_ops.buffer_load(
-                hidden_rsrc, hidden_dword, vec_width=4, dtype=i32
-            )
+            # gfx1250 native pk8: this lane's 8 contiguous bf16 cols, as one
+            # aligned dwordx4.
+            dwords4 = _load_src_unit(lane_unit)
             vec8_bf16_ty = T.vec(8, T.bf16)
             vec8_f32_ty = T.vec(8, f32)
             bf16x8 = vector.bitcast(vec8_bf16_ty, dwords4)
@@ -387,16 +422,8 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
                     bf16x8, block_scale_f32, i32_ty=i32
                 )  # i32 = 4 fp4x2 bytes
         else:
-            # two contiguous bf16 columns: col_base = mx_block*32 + lane_in_block*2
-            col_base = (
-                mx_block * arith.constant(32, type=i32)
-                + c.lane_in_block * c.c_elems_per_lane
-            )
-            hidden_dword = (feat_elem_base + col_base) >> c.c1_i32  # 2 bf16/dword
-
-            dword_raw = buffer_ops.buffer_load(
-                hidden_rsrc, hidden_dword, vec_width=1, dtype=i32
-            )
+            # this lane's two contiguous bf16 columns -- one dword.
+            dword_raw = _load_src_unit(lane_unit)
             vec1_i32_ty = T.vec(1, i32)
             vec2_bf16_ty = T.vec(ELEMS_PER_LANE, T.bf16)
             vec2_f32_ty = T.vec(ELEMS_PER_LANE, f32)
@@ -462,7 +489,7 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
                     packed_byte = ArithValue(nib0) | (ArithValue(nib1) << c.c4_i32)
                     payload_val = arith.trunci(T.i8, packed_byte)  # 1 fp4x2 B
 
-        quant_results.append((mx_block, payload_val, e8m0_scale))
+        quant_results.append((mx_block, lane_unit, payload_val, e8m0_scale))
 
     # Stores are a separate pass so the quant pass above stays one basic block and
     # its loads can cluster. That only works while the quant pass is branch-free:
@@ -470,20 +497,25 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
     # per-iteration guard back above would produce invalid IR.
     # One quant result (payload_val + e8m0_scale) is written to every destination
     # row in ``c.dests``; current kernels pass one.
-    for mx_block, payload_val, e8m0_scale in quant_results:
+    if const_expr(payload_bytes_per_lane > 4):
+        store_atom = buf_copy_atom(payload_bytes_per_lane)
+        store_frag = fx.make_fragment_like(fx.slice(dst_payload[0], (0, None)))
+    for mx_block, lane_unit, payload_val, e8m0_scale in quant_results:
         # The block-scale's dword/byte position depends only on ``mx_block``.
         scale_dword = fx.Uint32(mx_block) // fx.Uint32(c.c4_i32)
         byte_in_dword = mx_block - scale_dword * c.c4_i32
         e8m0_byte = arith.trunci(T.i8, e8m0_scale)
+        if const_expr(payload_bytes_per_lane > 4):
+            fx.memref_store_vec(payload_val, store_frag)
         for di, dst in enumerate(c.dests):
-            payload_rsrc = dst_payload[di]
-            payload_byte_off = (
-                mx_block * c.c_payload_bytes_per_block
-                + c.lane_in_block * c.c_payload_bytes_per_lane
-            )
-            buffer_ops.buffer_store(
-                payload_val, payload_rsrc, payload_byte_off, offset_is_bytes=True
-            )
+            if const_expr(payload_bytes_per_lane > 4):
+                fx.copy(
+                    store_atom,
+                    store_frag,
+                    fx.slice(dst_payload[di], (lane_unit, None)),
+                )
+            else:
+                dst_payload[di][lane_unit] = payload_val
 
             # one e8m0 byte per block, written by the block's lead lane.
             _if_lead = scf.IfOp(_raw(c.is_block_lead))
@@ -492,7 +524,7 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
                     dst.scale_row_dword_base + scale_dword * c.c_wmma_rep * 16
                 )
                 dst_scale_byte = dst_scale_dword * c.c4_i32 + byte_in_dword
-                buffer_ops.buffer_store(e8m0_byte, c.scale_rsrc, dst_scale_byte)
+                c.scale_t[dst_scale_byte] = e8m0_byte
                 scf.YieldOp([])
 
 
@@ -566,6 +598,9 @@ def build_moe_fused_route_quant_scatter_module(
     """
     if not use_expert_row_base and max_m <= 0:
         raise ValueError("max_m must be positive when expert_row_base is fused")
+    # Builder scope, not kernel scope: an fx type is a class, and the tracer
+    # tries to yield a kernel-scope name out of the scf.if that reads it.
+    w_fx = {"bf16": fx.BFloat16, "f16": fx.Float16}[weight_dtype]
     L = _quant_layout(model_dim, quant_mode, wmma_rep)
     is_fp8 = L.is_fp8
     use_native = L.use_native
@@ -574,7 +609,6 @@ def build_moe_fused_route_quant_scatter_module(
     lanes_per_mx_block = L.lanes_per_mx_block
     mx_dtype = L.mx_dtype
     payload_bytes_per_row = L.payload_bytes_per_row
-    payload_bytes_per_block = L.payload_bytes_per_block
     payload_bytes_per_lane = L.payload_bytes_per_lane
     wave_size = L.wave_size
     warps_per_block = L.warps_per_block
@@ -627,13 +661,10 @@ def build_moe_fused_route_quant_scatter_module(
         c_topk_shift = arith.constant(topk_shift, type=i32)
         _c_model_dim = arith.constant(model_dim, type=i32)
         _c_payload_bytes_per_row = arith.constant(payload_bytes_per_row, type=i32)
-        c_payload_bytes_per_block = arith.constant(payload_bytes_per_block, type=i32)
-        c_payload_bytes_per_lane = arith.constant(payload_bytes_per_lane, type=i32)
         c_dst_scale_dwords_per_row = arith.constant(dst_scale_dwords_per_row, type=i32)
         c_wmma_rep = arith.constant(wmma_rep, type=i32)
         c_rows_per_tile = arith.constant(rows_per_tile, type=i32)
         c_lanes_per_block = arith.constant(lanes_per_mx_block, type=i32)
-        c_elems_per_lane = arith.constant(elems_per_lane, type=i32)
         c_max_m = arith.constant(max_m, type=i32)
 
         tid = fx.Uint32(fx.thread_idx.x)
@@ -645,11 +676,8 @@ def build_moe_fused_route_quant_scatter_module(
 
         route_in_range = fx.Uint32(route) < fx.Uint32(numel)
         if route_in_range:
-            topk_ids_rsrc = ptr_rsrc(topk_ids)
             # expert id for this route (uniform across the warp)
-            expert = fx.Uint32(
-                buffer_ops.buffer_load(topk_ids_rsrc, route, vec_width=1, dtype=i32)
-            )
+            expert = fx.Uint32(ptr_buf_tensor(topk_ids)[route])
 
             # EP global->local remap (warp-uniform), replacing the host
             # cumsum/index/eq/where/masked_fill chain. Dropped (non-local) routes
@@ -659,20 +687,17 @@ def build_moe_fused_route_quant_scatter_module(
             # the quant+scatter below, and get a zero gather weight.
             is_drop = None
             if const_expr(use_g2l):
-                g2l_rsrc = ptr_rsrc(g2l_lut)
-                le = buffer_ops.buffer_load(g2l_rsrc, expert, vec_width=1, dtype=i32)
+                le = ptr_buf_tensor(g2l_lut)[expert]
                 is_drop = le == fx.Uint32(n_buckets)
                 expert = fx.Uint32(is_drop.select(c0_i32, le))
                 # Fused weight cast+mask (warp-uniform: every lane writes the same
                 # value to gather_w[route], redundant but race-free). Reads f32
                 # weight_in and writes weight_dtype (kept -> cast, dropped -> 0),
                 # folding the host topk_weight.to(bf16) copy + masked_fill.
-                wi_rsrc = ptr_rsrc(weight_in)
-                gather_w_rsrc = ptr_rsrc(gather_w)
-                w_f32 = buffer_ops.buffer_load(wi_rsrc, route, vec_width=1, dtype=f32)
+                w_f32 = ptr_buf_tensor(weight_in, fx.Float32)[route]
                 w_cast = arith.trunc_f(wdt, w_f32)
                 w_out = is_drop.select(arith.constant(0.0, type=wdt), w_cast)
-                buffer_ops.buffer_store(w_out, gather_w_rsrc, route)
+                ptr_buf_tensor(gather_w, w_fx)[route] = w_out
 
             # Lane 0 claims the within-expert slot via atomicAdd, then broadcasts
             # it to the warp. Single-token pow2 cases use the dedicated st_ksplit
@@ -710,10 +735,7 @@ def build_moe_fused_route_quant_scatter_module(
             # layout fuses the former Python-side arange(E)*max_m into this
             # kernel; contiguous-M still loads starts[e] from expert_row_base.
             if const_expr(use_expert_row_base):
-                erb_rsrc = ptr_rsrc(expert_row_base)
-                row_base = fx.Uint32(
-                    buffer_ops.buffer_load(erb_rsrc, expert, vec_width=1, dtype=i32)
-                )
+                row_base = fx.Uint32(ptr_buf_tensor(expert_row_base)[expert])
             else:
                 row_base = expert * c_max_m
             grouped_row = slot + row_base
@@ -734,8 +756,7 @@ def build_moe_fused_route_quant_scatter_module(
             else:
                 row_out = grouped_row
             if lane == 0:
-                topids_to_rows_rsrc = ptr_rsrc(topids_to_rows)
-                buffer_ops.buffer_store(row_out, topids_to_rows_rsrc, route)
+                ptr_buf_tensor(topids_to_rows)[route] = row_out
 
             def _emit_row_quant_scatter():
                 # --- per-row scale-preshuffle geometry (uniform; from the *global*
@@ -754,7 +775,7 @@ def build_moe_fused_route_quant_scatter_module(
 
                 payload_base = fx.Int64(ptrtoint(grouped_payload))
                 hidden_base = fx.Int64(ptrtoint(hidden))
-                scale_rsrc = ptr_rsrc(grouped_scale)
+                scale_t = ptr_buf_tensor(grouped_scale, fx.Int8)
 
                 # this lane's position inside its MX block group
                 block_in_wave = fx.Uint32(lane) // fx.Uint32(c_lanes_per_block)
@@ -773,15 +794,14 @@ def build_moe_fused_route_quant_scatter_module(
                     use_pk8=use_pk8,
                     mx_dtype=mx_dtype,
                     c0_i32=c0_i32,
-                    c1_i32=c1_i32,
                     c4_i32=c4_i32,
                     c23_i32=c23_i32,
                     c254_i32=c254_i32,
                     c0_f32=c0_f32,
                     c_wave=c_wave,
-                    c_elems_per_lane=c_elems_per_lane,
-                    c_payload_bytes_per_block=c_payload_bytes_per_block,
-                    c_payload_bytes_per_lane=c_payload_bytes_per_lane,
+                    elems_per_lane=elems_per_lane,
+                    lanes_per_mx_block=lanes_per_mx_block,
+                    payload_bytes_per_lane=payload_bytes_per_lane,
                     c_wmma_rep=c_wmma_rep,
                     block_in_wave=block_in_wave,
                     lane_in_block=lane_in_block,
@@ -797,7 +817,7 @@ def build_moe_fused_route_quant_scatter_module(
                     hidden_base=hidden_base,
                     feat_bytes_per_row=model_dim * 2,
                     feat_row_i32=token,
-                    scale_rsrc=scale_rsrc,
+                    scale_t=scale_t,
                 )
                 _emit_quant_block_loop(c)
 
@@ -901,7 +921,6 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
     lanes_per_mx_block = L.lanes_per_mx_block
     mx_dtype = L.mx_dtype
     payload_bytes_per_row = L.payload_bytes_per_row
-    payload_bytes_per_block = L.payload_bytes_per_block
     payload_bytes_per_lane = L.payload_bytes_per_lane
     wave_size = L.wave_size
     # This specialization is used only for token_num == 1. Use exactly one warp
@@ -947,13 +966,10 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
 
         c_wave = arith.constant(wave_size, type=i32)
         _c_payload_bytes_per_row = arith.constant(payload_bytes_per_row, type=i32)
-        c_payload_bytes_per_block = arith.constant(payload_bytes_per_block, type=i32)
-        c_payload_bytes_per_lane = arith.constant(payload_bytes_per_lane, type=i32)
         c_dst_scale_dwords_per_row = arith.constant(dst_scale_dwords_per_row, type=i32)
         c_wmma_rep = arith.constant(wmma_rep, type=i32)
         c_rows_per_tile = arith.constant(rows_per_tile, type=i32)
         c_lanes_per_block = arith.constant(lanes_per_mx_block, type=i32)
-        c_elems_per_lane = arith.constant(elems_per_lane, type=i32)
         c_max_m = arith.constant(max_m, type=i32)
 
         tid = fx.Uint32(fx.thread_idx.x)
@@ -966,10 +982,7 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
 
         route_in_range = fx.Uint32(route) < fx.Uint32(numel)
         if route_in_range:
-            topk_ids_rsrc = ptr_rsrc(topk_ids)
-            expert = fx.Uint32(
-                buffer_ops.buffer_load(topk_ids_rsrc, route, vec_width=1, dtype=i32)
-            )
+            expert = fx.Uint32(ptr_buf_tensor(topk_ids)[route])
 
             # torch.topk over experts returns distinct expert indices for one
             # token. Therefore each selected expert receives exactly one route:
@@ -981,21 +994,16 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
             is_k0 = k_group == c0_i32
             is_lane0_k0 = is_lane0 & is_k0
             if is_lane0_k0:
-                counter_rsrc = ptr_rsrc(counter)
-                buffer_ops.buffer_store(c1_i32, counter_rsrc, expert)
+                ptr_buf_tensor(counter)[expert] = c1_i32
 
             if const_expr(use_expert_row_base):
-                erb_rsrc = ptr_rsrc(expert_row_base)
-                row_base = fx.Uint32(
-                    buffer_ops.buffer_load(erb_rsrc, expert, vec_width=1, dtype=i32)
-                )
+                row_base = fx.Uint32(ptr_buf_tensor(expert_row_base)[expert])
             else:
                 row_base = expert * c_max_m
             grouped_row = slot + row_base
 
             if is_lane0_k0:
-                topids_to_rows_rsrc = ptr_rsrc(topids_to_rows)
-                buffer_ops.buffer_store(grouped_row, topids_to_rows_rsrc, route)
+                ptr_buf_tensor(topids_to_rows)[route] = grouped_row
 
             scale_tile = fx.Uint32(grouped_row) // fx.Uint32(c_rows_per_tile)
             row_in_tile = grouped_row - scale_tile * c_rows_per_tile
@@ -1009,7 +1017,7 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
 
             payload_base = fx.Int64(ptrtoint(grouped_payload))
             hidden_base = fx.Int64(ptrtoint(hidden))
-            scale_rsrc = ptr_rsrc(grouped_scale)
+            scale_t = ptr_buf_tensor(grouped_scale, fx.Int8)
 
             block_in_wave = fx.Uint32(lane) // fx.Uint32(c_lanes_per_block)
             lane_in_block = lane - block_in_wave * c_lanes_per_block
@@ -1027,15 +1035,14 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
                 use_pk8=use_pk8,
                 mx_dtype=mx_dtype,
                 c0_i32=c0_i32,
-                c1_i32=c1_i32,
                 c4_i32=c4_i32,
                 c23_i32=c23_i32,
                 c254_i32=c254_i32,
                 c0_f32=c0_f32,
                 c_wave=c_wave,
-                c_elems_per_lane=c_elems_per_lane,
-                c_payload_bytes_per_block=c_payload_bytes_per_block,
-                c_payload_bytes_per_lane=c_payload_bytes_per_lane,
+                elems_per_lane=elems_per_lane,
+                lanes_per_mx_block=lanes_per_mx_block,
+                payload_bytes_per_lane=payload_bytes_per_lane,
                 c_wmma_rep=c_wmma_rep,
                 block_in_wave=block_in_wave,
                 lane_in_block=lane_in_block,
@@ -1051,7 +1058,7 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
                 hidden_base=hidden_base,
                 feat_bytes_per_row=model_dim * 2,
                 feat_row_i32=c0_i32,
-                scale_rsrc=scale_rsrc,
+                scale_t=scale_t,
             )
             _emit_quant_one_k_group(c, k_group)
 
@@ -1150,7 +1157,6 @@ def build_moe_fused_quant_preshuffle_module(
     lanes_per_mx_block = L.lanes_per_mx_block
     mx_dtype = L.mx_dtype
     payload_bytes_per_row = L.payload_bytes_per_row
-    payload_bytes_per_block = L.payload_bytes_per_block
     payload_bytes_per_lane = L.payload_bytes_per_lane
     wave_size = L.wave_size
     warps_per_block = L.warps_per_block
@@ -1185,7 +1191,6 @@ def build_moe_fused_quant_preshuffle_module(
         f32 = T.f32
 
         c0_i32 = arith.constant(0, type=i32)
-        c1_i32 = arith.constant(1, type=i32)
         c4_i32 = arith.constant(4, type=i32)
         c16_i32 = arith.constant(16, type=i32)
         c23_i32 = arith.constant(23, type=i32)
@@ -1195,14 +1200,11 @@ def build_moe_fused_quant_preshuffle_module(
         c_wave = arith.constant(wave_size, type=i32)
         _c_feat_dim = arith.constant(feat_dim, type=i32)
         _c_payload_bytes_per_row = arith.constant(payload_bytes_per_row, type=i32)
-        c_payload_bytes_per_block = arith.constant(payload_bytes_per_block, type=i32)
-        c_payload_bytes_per_lane = arith.constant(payload_bytes_per_lane, type=i32)
         c_scale_dwords_per_row = arith.constant(scale_dwords_per_row, type=i32)
         c_dst_scale_dwords_per_row = arith.constant(dst_scale_dwords_per_row, type=i32)
         c_wmma_rep = arith.constant(wmma_rep, type=i32)
         c_rows_per_tile = arith.constant(rows_per_tile, type=i32)
         c_lanes_per_block = arith.constant(lanes_per_mx_block, type=i32)
-        c_elems_per_lane = arith.constant(elems_per_lane, type=i32)
 
         tid = fx.Uint32(fx.thread_idx.x)
         bid = fx.Uint32(fx.block_idx.x)
@@ -1233,7 +1235,7 @@ def build_moe_fused_quant_preshuffle_module(
 
                 payload_base = fx.Int64(ptrtoint(grouped_payload))
                 hidden_base = fx.Int64(ptrtoint(grouped_in))
-                scale_rsrc = ptr_rsrc(grouped_scale)
+                scale_t = ptr_buf_tensor(grouped_scale, fx.Int8)
 
                 block_in_wave = fx.Uint32(lane) // fx.Uint32(c_lanes_per_block)
                 lane_in_block = lane - block_in_wave * c_lanes_per_block
@@ -1251,15 +1253,14 @@ def build_moe_fused_quant_preshuffle_module(
                     use_pk8=use_pk8,
                     mx_dtype=mx_dtype,
                     c0_i32=c0_i32,
-                    c1_i32=c1_i32,
                     c4_i32=c4_i32,
                     c23_i32=c23_i32,
                     c254_i32=c254_i32,
                     c0_f32=c0_f32,
                     c_wave=c_wave,
-                    c_elems_per_lane=c_elems_per_lane,
-                    c_payload_bytes_per_block=c_payload_bytes_per_block,
-                    c_payload_bytes_per_lane=c_payload_bytes_per_lane,
+                    elems_per_lane=elems_per_lane,
+                    lanes_per_mx_block=lanes_per_mx_block,
+                    payload_bytes_per_lane=payload_bytes_per_lane,
                     c_wmma_rep=c_wmma_rep,
                     block_in_wave=block_in_wave,
                     lane_in_block=lane_in_block,
@@ -1275,7 +1276,7 @@ def build_moe_fused_quant_preshuffle_module(
                     hidden_base=hidden_base,
                     feat_bytes_per_row=feat_dim * 2,
                     feat_row_i32=row,
-                    scale_rsrc=scale_rsrc,
+                    scale_t=scale_t,
                 )
                 _emit_quant_block_loop(c)
 
@@ -1283,10 +1284,7 @@ def build_moe_fused_quant_preshuffle_module(
                 # Skip padding rows: the masked GEMM never reads rows beyond
                 # masked_m[expert], so quantizing them is pure waste. With high
                 # capacity-factor padding this elides most of the work.
-                masked_rsrc = ptr_rsrc(masked_m)
-                valid = fx.Uint32(
-                    buffer_ops.buffer_load(masked_rsrc, expert, vec_width=1, dtype=i32)
-                )
+                valid = fx.Uint32(ptr_buf_tensor(masked_m)[expert])
                 slot_valid = fx.Uint32(slot) < fx.Uint32(valid)
                 if slot_valid:
                     _emit_row()
@@ -1368,7 +1366,6 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     lanes_per_mx_block = L.lanes_per_mx_block
     mx_dtype = L.mx_dtype
     payload_bytes_per_row = L.payload_bytes_per_row
-    payload_bytes_per_block = L.payload_bytes_per_block
     payload_bytes_per_lane = L.payload_bytes_per_lane
     wave_size = L.wave_size
     warps_per_block = L.warps_per_block
@@ -1387,7 +1384,6 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     # The payload row IS the source row here, so the loop's bounds and its
     # per-lane offsets both come off the payload geometry.
     src_bytes_per_row = payload_bytes_per_row if prequantized else feat_dim * 2
-    payload_dwords_per_lane = payload_bytes_per_lane // 4
     if prequantized:
         assert payload_bytes_per_lane % 4 == 0, (
             f"prequantized load is dword-wide; {quant_mode} gives "
@@ -1426,7 +1422,6 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         f32 = T.f32
 
         c0_i32 = arith.constant(0, type=i32)
-        c1_i32 = arith.constant(1, type=i32)
         c4_i32 = arith.constant(4, type=i32)
         c16_i32 = arith.constant(16, type=i32)
         c23_i32 = arith.constant(23, type=i32)
@@ -1436,13 +1431,10 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         c_wave = arith.constant(wave_size, type=i32)
         _c_feat_dim = arith.constant(feat_dim, type=i32)
         _c_payload_bytes_per_row = arith.constant(payload_bytes_per_row, type=i32)
-        c_payload_bytes_per_block = arith.constant(payload_bytes_per_block, type=i32)
-        c_payload_bytes_per_lane = arith.constant(payload_bytes_per_lane, type=i32)
         c_dst_scale_dwords_per_row = arith.constant(dst_scale_dwords_per_row, type=i32)
         c_wmma_rep = arith.constant(wmma_rep, type=i32)
         c_rows_per_tile = arith.constant(rows_per_tile, type=i32)
         c_lanes_per_block = arith.constant(lanes_per_mx_block, type=i32)
-        c_elems_per_lane = arith.constant(elems_per_lane, type=i32)
         c_source_topk = arith.constant(source_topk, type=i32)
         c_source_topk_shift = arith.constant(source_topk_shift, type=i32)
 
@@ -1465,13 +1457,9 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         num_valid_routes_is_set = fx.Int64(ptrtoint(num_valid_routes)) != 0
         valid_route_count = fx.Uint32(numel)
         if num_valid_routes_is_set:
-            valid_route_count = fx.Uint32(
-                buffer_ops.buffer_load(
-                    ptr_rsrc(num_valid_routes), c0_i32, vec_width=1, dtype=i32
-                )
-            )
+            valid_route_count = fx.Uint32(ptr_buf_tensor(num_valid_routes)[c0_i32])
         route_in_range = fx.Uint32(route) < fx.Uint32(valid_route_count)
-        rows_rsrc = ptr_rsrc(topids_to_rows)
+        rows_t = ptr_buf_tensor(topids_to_rows)
         # An EP route with no grouped row carries the negative DROPPED_ROUTE_ROW
         # sentinel: a destination row derived from it would overwrite a kept
         # route's payload. Dead-tail routes default to the same sentinel, so one
@@ -1480,8 +1468,12 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         if route_in_range:
             # Scalar (SMEM) load: `route` is wave-uniform, and landing the row in
             # an SGPR is what makes the per-row destination descriptor uniform.
+            # Indexing the tensor would emit a vector load instead -- there is no
+            # s_buffer_load copy atom -- so this one reuses the tensor's V#.
             row_raw = fx.Int32(
-                buffer_ops.buffer_load(rows_rsrc, route, vec_width=1, is_scalar=True)
+                buffer_ops.buffer_load(
+                    _buf_rsrc(rows_t), route, vec_width=1, is_scalar=True
+                )
             )
         row_is_mapped = row_raw >= fx.Int32(0)
         if row_is_mapped:
@@ -1490,12 +1482,14 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                 m = fx.Uint32(route_max_m)
                 expert = fx.Uint32(row) // m
                 slot = row - expert * m
-                starts_rsrc = ptr_rsrc(row_starts)
                 # Overwrites `row`, so it has to stay scalar too.
                 row = (
                     fx.Uint32(
                         buffer_ops.buffer_load(
-                            starts_rsrc, expert, vec_width=1, is_scalar=True
+                            _buf_rsrc(ptr_buf_tensor(row_starts)),
+                            expert,
+                            vec_width=1,
+                            is_scalar=True,
                         )
                     )
                     + slot
@@ -1508,7 +1502,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                 else:
                     store_cond = is_lane0
                 if store_cond:
-                    buffer_ops.buffer_store(row, rows_rsrc, route)
+                    rows_t[route] = row
 
             scale_tile = fx.Uint32(row) // fx.Uint32(c_rows_per_tile)
             row_in_tile = row - scale_tile * c_rows_per_tile
@@ -1529,7 +1523,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
             else:
                 feat_row_i32 = row
 
-            scale_rsrc = ptr_rsrc(grouped_scale)
+            scale_t = ptr_buf_tensor(grouped_scale, fx.Int8)
             payload_base = fx.Int64(ptrtoint(grouped_payload))
             hidden_base = fx.Int64(ptrtoint(grouped_in))
 
@@ -1547,7 +1541,6 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                 feat_bytes_per_row=src_bytes_per_row,
                 feat_row_i32=feat_row_i32,
                 prequantized=prequantized,
-                payload_dwords_per_lane=payload_dwords_per_lane,
                 src_scale_base=fx.Int64(ptrtoint(src_scale)),
                 src_scale_bytes_per_row=src_scale_bytes_per_row,
                 mx_blocks_per_wave_iter=mx_blocks_per_wave_iter,
@@ -1558,15 +1551,14 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                 use_pk8=use_pk8,
                 mx_dtype=mx_dtype,
                 c0_i32=c0_i32,
-                c1_i32=c1_i32,
                 c4_i32=c4_i32,
                 c23_i32=c23_i32,
                 c254_i32=c254_i32,
                 c0_f32=c0_f32,
                 c_wave=c_wave,
-                c_elems_per_lane=c_elems_per_lane,
-                c_payload_bytes_per_block=c_payload_bytes_per_block,
-                c_payload_bytes_per_lane=c_payload_bytes_per_lane,
+                elems_per_lane=elems_per_lane,
+                lanes_per_mx_block=lanes_per_mx_block,
+                payload_bytes_per_lane=payload_bytes_per_lane,
                 c_wmma_rep=c_wmma_rep,
                 block_in_wave=block_in_wave,
                 lane_in_block=lane_in_block,
@@ -1577,7 +1569,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                         scale_row_dword_base=scale_row_dword_base,
                     )
                 ],
-                scale_rsrc=scale_rsrc,
+                scale_t=scale_t,
             )
             if const_expr(ksplit):
                 k_group_val = fx.Uint32(fx.block_idx.y)
@@ -1701,7 +1693,6 @@ def build_moe_fused_route_psum_quant_scatter_module(
     lanes_per_mx_block = L.lanes_per_mx_block
     mx_dtype = L.mx_dtype
     payload_bytes_per_row = L.payload_bytes_per_row
-    payload_bytes_per_block = L.payload_bytes_per_block
     payload_bytes_per_lane = L.payload_bytes_per_lane
     wave_size = L.wave_size
     warps_per_block = L.warps_per_block
@@ -1759,13 +1750,10 @@ def build_moe_fused_route_psum_quant_scatter_module(
         c_topk = arith.constant(topk, type=i32)
         _c_model_dim = arith.constant(model_dim, type=i32)
         _c_payload_bytes_per_row = arith.constant(payload_bytes_per_row, type=i32)
-        c_payload_bytes_per_block = arith.constant(payload_bytes_per_block, type=i32)
-        c_payload_bytes_per_lane = arith.constant(payload_bytes_per_lane, type=i32)
         c_dst_scale_dwords_per_row = arith.constant(dst_scale_dwords_per_row, type=i32)
         c_wmma_rep = arith.constant(wmma_rep, type=i32)
         c_rows_per_tile = arith.constant(rows_per_tile, type=i32)
         c_lanes_per_block = arith.constant(lanes_per_mx_block, type=i32)
-        c_elems_per_lane = arith.constant(elems_per_lane, type=i32)
 
         # --- cross-block scratch access helpers (raw !llvm.ptr<1> at elem idx) ---
         def _wait_mem():
@@ -1803,8 +1791,8 @@ def build_moe_fused_route_psum_quant_scatter_module(
         route0 = bid * c_warps_per_block + warp_in_block  # first route this warp owns
         stride = fx.Uint32(num_workers) * c_warps_per_block
 
-        topk_ids_rsrc = ptr_rsrc(topk_ids)
-        count_rsrc = ptr_rsrc(count)
+        topk_ids_t = ptr_buf_tensor(topk_ids)
+        count_t = ptr_buf_tensor(count)
 
         # ============================ Phase 1: count ============================
         # Strided warp-per-route histogram into ``count`` (== masked_m). Loop bounds
@@ -1812,9 +1800,7 @@ def build_moe_fused_route_psum_quant_scatter_module(
         # by every thread of the block.
         numel_i32 = fx.Uint32(numel)
         for route_i32 in range(route0, numel_i32, stride):
-            expert = fx.Uint32(
-                buffer_ops.buffer_load(topk_ids_rsrc, route_i32, vec_width=1, dtype=i32)
-            )
+            expert = fx.Uint32(topk_ids_t[route_i32])
             if lane == 0:
                 _atomic_add(count, expert, c1_i32)
 
@@ -1857,11 +1843,7 @@ def build_moe_fused_route_psum_quant_scatter_module(
                     # producer/consumer pattern that is reliably L2-coherent on
                     # gfx1250; the inline-asm coherent store can linger in this
                     # block's L0 and not be visible to Phase 3 readers in time.
-                    cnt = fx.Uint32(
-                        buffer_ops.buffer_load(
-                            count_rsrc, e_i32, vec_width=1, dtype=i32
-                        )
-                    )
+                    cnt = fx.Uint32(count_t[e_i32])
                     aligned = (cnt + tile_minus_1) // tile_v * tile_v
                     _atomic_add(starts, e_i32, _raw(cur))
                     _atomic_add(psum, e_i32, _raw(cur + cnt))
@@ -1893,16 +1875,14 @@ def build_moe_fused_route_psum_quant_scatter_module(
         # coherent load is unreliable here (same miscompile as the Phase 2 prefix
         # sum: it can return a stale 0 instead of the published row base, which
         # scatters the first route of an expert into row 0).
-        starts_rd_rsrc = ptr_rsrc(starts)
+        starts_rd_t = ptr_buf_tensor(starts)
         payload_base = fx.Int64(ptrtoint(grouped_payload))
         hidden_base = fx.Int64(ptrtoint(hidden))
-        scale_rsrc = ptr_rsrc(grouped_scale)
-        topids_to_rows_rsrc = ptr_rsrc(topids_to_rows)
+        scale_t = ptr_buf_tensor(grouped_scale, fx.Int8)
+        topids_to_rows_t = ptr_buf_tensor(topids_to_rows)
 
         for route_i32 in range(route0, numel_i32, stride):
-            expert = fx.Uint32(
-                buffer_ops.buffer_load(topk_ids_rsrc, route_i32, vec_width=1, dtype=i32)
-            )
+            expert = fx.Uint32(topk_ids_t[route_i32])
 
             # lane 0 claims the within-expert slot and reads the (published) per-
             # expert row base; both are warp-uniform, broadcast via readlane.
@@ -1910,9 +1890,7 @@ def build_moe_fused_route_psum_quant_scatter_module(
             rowbase_on_lane0 = arith.constant(0, type=i32)
             if lane == 0:
                 slot_on_lane0 = _atomic_add(slot_counter, expert, c1_i32)
-                rowbase_on_lane0 = buffer_ops.buffer_load(
-                    starts_rd_rsrc, _raw(expert), vec_width=1, dtype=i32
-                )
+                rowbase_on_lane0 = starts_rd_t[expert]
             slot = fx.Uint32(rocdl.readlane(i32, _raw(slot_on_lane0), _raw(c0_i32)))
             row_base = fx.Uint32(
                 rocdl.readlane(i32, _raw(rowbase_on_lane0), _raw(c0_i32))
@@ -1921,7 +1899,7 @@ def build_moe_fused_route_psum_quant_scatter_module(
             token = fx.Uint32(route_i32) // fx.Uint32(c_topk)
 
             if lane == 0:
-                buffer_ops.buffer_store(grouped_row, topids_to_rows_rsrc, route_i32)
+                topids_to_rows_t[route_i32] = grouped_row
 
             # per-row scale-preshuffle geometry from the global grouped_row.
             scale_tile = fx.Uint32(grouped_row) // fx.Uint32(c_rows_per_tile)
@@ -1950,15 +1928,14 @@ def build_moe_fused_route_psum_quant_scatter_module(
                 use_pk8=use_pk8,
                 mx_dtype=mx_dtype,
                 c0_i32=c0_i32,
-                c1_i32=c1_i32,
                 c4_i32=c4_i32,
                 c23_i32=c23_i32,
                 c254_i32=c254_i32,
                 c0_f32=c0_f32,
                 c_wave=c_wave,
-                c_elems_per_lane=c_elems_per_lane,
-                c_payload_bytes_per_block=c_payload_bytes_per_block,
-                c_payload_bytes_per_lane=c_payload_bytes_per_lane,
+                elems_per_lane=elems_per_lane,
+                lanes_per_mx_block=lanes_per_mx_block,
+                payload_bytes_per_lane=payload_bytes_per_lane,
                 c_wmma_rep=c_wmma_rep,
                 block_in_wave=block_in_wave,
                 lane_in_block=lane_in_block,
@@ -1974,7 +1951,7 @@ def build_moe_fused_route_psum_quant_scatter_module(
                 hidden_base=hidden_base,
                 feat_bytes_per_row=model_dim * 2,
                 feat_row_i32=token,
-                scale_rsrc=scale_rsrc,
+                scale_t=scale_t,
             )
             _emit_quant_block_loop(c)
 
