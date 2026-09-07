@@ -1063,7 +1063,13 @@ def _rmsnorm_kernel_large_m_small_n(
         tl.store(RSIGMA + m_off, rsigma, mask=mask_m)
 
 
-@triton.jit
+_rmsnorm_bwd_kernel_large_m_small_n_repr = make_kernel_repr(
+    "_rmsnorm_bwd_kernel_large_m_small_n",
+    ["BLOCK_M", "BLOCK_N"],
+)
+
+
+@triton.jit(repr=_rmsnorm_bwd_kernel_large_m_small_n_repr)
 def _rmsnorm_bwd_kernel_large_m_small_n(
     grad_output_ptr,  # [M, N]
     input_ptr,  # [M, N]

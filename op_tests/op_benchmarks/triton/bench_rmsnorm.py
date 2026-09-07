@@ -46,6 +46,10 @@ def get_x_vals():
         (4096, 1280),
         (8192, 1280),
         (16384, 1280),
+        # Large-M / small-N: exercises _rmsnorm_bwd_kernel_large_m_small_n
+        (16384, 128),
+        (32768, 128),
+        (16384, 512),
     ]
     return x_vals
 
@@ -87,6 +91,7 @@ def run_benchmark(args):
 
     quant = args.quant
     add_residual = args.add_residual
+    do_backward = args.backward
 
     @triton.testing.perf_report([benchmark])
     def bench_rmsnorm(M, N, metric, model_name=None, **kwargs):
@@ -108,6 +113,22 @@ def run_benchmark(args):
                 mem_write += M * N * x.element_size()
             mem = mem_read + mem_write
             flops = 4 * M * N  # dominated by the norm; quant is elementwise
+        elif do_backward:
+            # Backward: read x, dy, g, rsigma; write dx, dg partial.
+            x.requires_grad_(True)
+            w.requires_grad_(True)
+            y = rms_norm(x, w, eps)
+            dy = torch.randn_like(y)
+
+            def fn():
+                x.grad, w.grad = None, None
+                y = rms_norm(x, w, eps)
+                y.backward(dy)
+
+            mem_read = (2 * M * N + M + N) * x.element_size()  # x, dy, rsigma, g
+            mem_write = (M * N + N) * x.element_size()  # dx, dg
+            mem = mem_read + mem_write
+            flops = 8 * M * N
         else:
             fn = lambda: rms_norm(x, w, eps)
             # memory transfer
@@ -193,6 +214,15 @@ def parse_args(args: list[str] | None = None):
         action="store_true",
         default=False,
         help="Print VGPR usage for Triton kernels.",
+    )
+    parser.add_argument(
+        "--backward",
+        action="store_true",
+        default=False,
+        help=(
+            "Benchmark the backward pass instead of forward. Exercises "
+            "_rmsnorm_bwd_kernel_large_m_small_n for M>8192,N<=2048 shapes."
+        ),
     )
     parser.add_argument(
         "-o", action="store_true", help="Write performance results to CSV file"
