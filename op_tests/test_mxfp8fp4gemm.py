@@ -59,11 +59,35 @@ _OUT_DTYPE = {"bf16": dtypes.bf16}
 PERSISTENT_TG = 256
 
 
+# Per-tile cluster sets (cluster_x, cluster_y) deployed in mxfp8fp4gemm.csv, kept in
+# sync with the cover in poc_kl/mi400/mxfp8fp4gemm/run.sh COVER_CONFIGS so the reported
+# label names the .co the cpp heuristic (get_heuristic_kernel) actually dispatches to.
+# This round ships the 256x256 cluster sweep only.
+_CLUSTERS = {
+    (256, 256): [(4, 4), (2, 4), (4, 2), (2, 2), (1, 1)],
+}
+
+
 def _heuristic_tile(M):
-    """Tile (tile_m, tile_n) the cpp dispatch picks for this M (mirrors
-    get_heuristic_kernel in asm_mxfp8fp4gemm.cu): M<=64 wastes most of a 256-tall
-    tile's rows, so it takes the 64x512 variant; any larger M takes 256x256."""
-    return (64, 512) if M <= 64 else (256, 256)
+    """Tile (tile_m, tile_n) the cpp dispatch picks (mirrors get_heuristic_kernel in
+    asm_mxfp8fp4gemm.cu). Only 256x256 is deployed this round, so every M resolves to
+    256x256 (small M falls back to it since no 64x512/16x512 tile is registered)."""
+    return (256, 256)
+
+
+def _heuristic_cluster(tile_m, tile_n, M, N):
+    """(cluster_x, cluster_y) the cpp dispatch picks within the tile: the largest
+    cluster that fits the tile grid (cx<=ntiles, cy<=mtiles), tie-break by aspect
+    closeness then larger cx. 1x1 always fits, so a pick always exists."""
+    mtiles = (M + tile_m - 1) // tile_m
+    ntiles = (N + tile_n - 1) // tile_n
+    best, best_key = (1, 1), None
+    for cx, cy in _CLUSTERS.get((tile_m, tile_n), [(1, 1)]):
+        score = cx * cy if (cx <= ntiles and cy <= mtiles) else 0
+        key = (score, -abs(cx * mtiles - cy * ntiles), cx)
+        if best_key is None or key > best_key:
+            best, best_key = (cx, cy), key
+    return best
 
 
 def _report_active_tg(M, N, tile_m, tile_n, label):
@@ -260,11 +284,12 @@ def test_gemm(
             K,
         )
         _tm, _tn = _heuristic_tile(M)
+        _cx, _cy = _heuristic_cluster(_tm, _tn, M, N)
         return {
             "gfx": get_gfx(),
             "knl_name": knl_name or "(heuristic)",
             "tile": f"{_tm}x{_tn}",
-            "cluster": "4x4",
+            "cluster": f"{_cx}x{_cy}",
             "asm us": float("nan"),
             "asm TFLOPS": float("nan"),
             "asm TB/s": float("nan"),
@@ -294,7 +319,9 @@ def test_gemm(
     elif knl_name == "auto":
         middle = "mxfp8fp8" if intype == "a8w8" else "mxfp8fp4"
         pre = "ABpreShuffle" if apre else "BpreShuffle"
-        base = f"f8gemm_{outtype}_{middle}_{pre}_256x256_4x4_ps"
+        _tm, _tn = _heuristic_tile(M)
+        _cx, _cy = _heuristic_cluster(_tm, _tn, M, N)
+        base = f"f8gemm_{outtype}_{middle}_{pre}_{_tm}x{_tn}_{_cx}x{_cy}_ps"
         knl = f"_ZN5aiter{len(base)}{base}E"
     else:
         knl = knl_name
@@ -316,16 +343,17 @@ def test_gemm(
     in_bytes = inp["A"].nbytes + inp["B"].nbytes + scale_bytes
 
     ret = {"gfx": get_gfx(), "knl_name": knl_name or "(heuristic)"}
-    # Report TG occupancy for the tile the cpp dispatch picks (M<=64 -> 64x512).
+    # Report TG occupancy for the tile+cluster the cpp dispatch picks.
     _middle = "mxfp8fp8" if intype == "a8w8" else "mxfp8fp4"
     _pre = "ABpreShuffle" if apre else "BpreShuffle"
     _tile_m, _tile_n = _heuristic_tile(M)
-    _label = f"f8gemm_{outtype}_{_middle}_{_pre}_{_tile_m}x{_tile_n}_4x4_ps"
+    _cx, _cy = _heuristic_cluster(_tile_m, _tile_n, M, N)
+    _label = f"f8gemm_{outtype}_{_middle}_{_pre}_{_tile_m}x{_tile_n}_{_cx}x{_cy}_ps"
     _report_active_tg(M, N, _tile_m, _tile_n, _label)
     # Structured algo details (mxfp8fp4gemm.csv columns): the cpp-dispatch tile
-    # (M<=64 -> 64x512, else 256x256) and the 4x4 cluster; no splitk/unroll axis.
+    # (256x256 this round) and the aspect-selected cluster; no splitk/unroll axis.
     ret["tile"] = f"{_tile_m}x{_tile_n}"
-    ret["cluster"] = "4x4"
+    ret["cluster"] = f"{_cx}x{_cy}"
     # Only a missing .co is reported as "not support"; any other failure (OOM,
     # memory fault, shape assert, ...) must propagate, not show as a green cell.
     # An explicit --knl-name that isn't in the cfg is a real error (typo / missing
@@ -590,8 +618,8 @@ def main():
         aiter.logger.info(
             "wrote JSON summary (%d rows) to %s", len(df_full), args.json_out
         )
-    # Keep knl_name (the actual .co) + tile; drop columns constant within a table
-    # (cluster is always 4x4).
+    # Keep knl_name (the actual .co) + tile + cluster; drop columns constant within a
+    # table (cluster now varies with shape via the aspect heuristic, so it is kept).
     df = df_full.drop(
         columns=[
             "seed",
