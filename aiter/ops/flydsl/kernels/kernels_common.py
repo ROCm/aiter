@@ -17,8 +17,6 @@ from flydsl.expr import as_ir_value
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch, is_rdna_arch
 
-from aiter.ops.flydsl.kernels import buffer_ops
-
 
 def format_kernel_name(name: str) -> str:
     """Sanitize a kernel symbol name for the amdhsa assembler.
@@ -116,12 +114,29 @@ def dtype_to_elem_type(dtype_str: str):
     )
 
 
-def _create_llvm_ptr(value, address_space: int = 1):
-    return buffer_ops.create_llvm_ptr(value, address_space=address_space)
+# LLVM address-space numbers as fx spaces: Global(1) and Shared, which is 2 in
+# fx terms but lowers to !llvm.ptr<3>. to_llvm_ptr resolves it, so the backend's
+# number never appears at a call site.
+FX_ADDRESS_SPACE = {1: fx.AddressSpace.Global, 3: fx.AddressSpace.Shared}
+
+
+def create_llvm_ptr(value, address_space: int = 1):
+    """Raw ``!llvm.ptr<n>`` at *value*, for ops that need one directly.
+
+    The atomicrmw builder and the plain llvm load/store take a raw pointer,
+    which no layout op produces, so the address is formed by hand here.
+    """
+    pt = fx.PointerType.get(
+        fx.Int32.ir_type,
+        address_space=FX_ADDRESS_SPACE[address_space],
+        alignment=4,
+    )
+    ptr = fx.to_llvm_ptr(fx.inttoptr(pt, value))
+    return ptr._value if hasattr(ptr, "_value") else ptr
 
 
 def stream_ptr_to_async_token(stream_ptr_value, loc=None, ip=None):
-    stream_llvm_ptr = _create_llvm_ptr(stream_ptr_value)
+    stream_llvm_ptr = create_llvm_ptr(stream_ptr_value)
 
     async_token_type = _gpu.AsyncTokenType.get()
     cast_op = builtin.UnrealizedConversionCastOp(

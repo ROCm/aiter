@@ -70,7 +70,7 @@ from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import Int32, T
 from flydsl.runtime.device import get_rocm_arch
 
-from aiter.ops.flydsl.kernels import buffer_ops, vector
+from aiter.ops.flydsl.kernels import vector
 from aiter.ops.flydsl.kernels.kernels_common import format_kernel_name, get_warp_size
 from aiter.ops.flydsl.kernels.moe_route_maps import DROPPED_ROUTE_ROW
 from aiter.ops.flydsl.kernels.quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
@@ -78,6 +78,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
     buf_copy_atom,
+    buf_scalar_load,
     ptr_buf_tensor,
 )
 from aiter.utility.mx_types import (
@@ -250,11 +251,6 @@ def _quant_layout(feat_dim: int, quant_mode: str, wmma_rep: int) -> SimpleNamesp
         amax_shuffle_dists=amax_shuffle_dists,
         native_tag=native_tag,
     )
-
-
-def _buf_rsrc(t):
-    """The V# behind a ``ptr_buf_tensor``, for the ops with no copy-atom form."""
-    return fx.rocdl.get_buffer_rsrc(fx.get_iter(t))
 
 
 # A lane's payload slice is 1, 2, 4 or 8 bytes. Up to 4 it is one integer the
@@ -1475,14 +1471,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         if route_in_range:
             # Scalar (SMEM) load: `route` is wave-uniform, and landing the row in
             # an SGPR is what makes the per-row destination descriptor uniform.
-            # Indexing the tensor would emit a vector load instead -- there is
-            # no s_buffer_load copy atom -- so this reuses the tensor's V# with
-            # buffer_ops' existing scalar path.
-            row_raw = fx.Int32(
-                buffer_ops.buffer_load(
-                    _buf_rsrc(rows_t), route, vec_width=1, is_scalar=True
-                )
-            )
+            row_raw = fx.Int32(buf_scalar_load(rows_t, route))
         row_is_mapped = row_raw >= fx.Int32(0)
         if row_is_mapped:
             row = fx.Uint32(row_raw)
@@ -1492,14 +1481,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                 slot = row - expert * m
                 # Overwrites `row`, so it has to stay scalar too.
                 row = (
-                    fx.Uint32(
-                        buffer_ops.buffer_load(
-                            _buf_rsrc(ptr_buf_tensor(row_starts)),
-                            expert,
-                            vec_width=1,
-                            is_scalar=True,
-                        )
-                    )
+                    fx.Uint32(buf_scalar_load(ptr_buf_tensor(row_starts), expert))
                     + slot
                 )
                 is_lane0 = lane == c0_i32

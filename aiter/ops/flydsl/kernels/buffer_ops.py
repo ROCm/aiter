@@ -78,7 +78,6 @@ __all__ = [
     "buffer_store",
     "create_buffer_resource",
     "create_buffer_resource_from_addr",
-    "create_llvm_ptr",
     "get_element_ptr",
 ]
 
@@ -151,30 +150,6 @@ def _create_i64_constant(value: int) -> ir.Value:
     attr = ir.IntegerAttr.get(i64_type, value)
     op = std_arith.ConstantOp(i64_type, attr)
     return _unwrap_value(op.result)
-
-
-@dsl_loc_tracing
-def _ptr8_to_v4i32(ptr8_val) -> ir.Value:
-    """Reinterpret a buffer resource (!llvm.ptr<8>) as a <4 x i32> vector.
-
-    Required by the scalar ``s.buffer.load`` intrinsic, whose resource operand is
-    a v4i32 rather than the opaque buffer pointer used by the vector path.
-    """
-    i128_ty = ir.IntegerType.get_signless(128)
-    v4i32_ty = ir.VectorType.get([4], ir.IntegerType.get_signless(32))
-    i128_val = llvm.ptrtoint(i128_ty, _unwrap_value(ptr8_val))
-    return llvm.bitcast(v4i32_ty, i128_val)
-
-
-@dsl_loc_tracing
-def create_llvm_ptr(value, address_space: int = 0) -> ir.Value:
-    """Create an LLVM pointer from an integer or index value."""
-    value = _unwrap_value(value)
-    if isinstance(value.type, ir.IndexType):
-        i64_type = T.i64()
-        value = _unwrap_value(std_arith.IndexCastOp(i64_type, value).result)
-    ptr_type = ir.Type.parse(f"!llvm.ptr<{address_space}>")
-    return llvm.IntToPtrOp(ptr_type, value).result
 
 
 @dsl_loc_tracing
@@ -463,7 +438,6 @@ def buffer_load(
     mask: ir.Value | None = None,
     cache_modifier: int = 0,
     soffset_bytes: int | ir.Value | None = None,
-    is_scalar: bool = False,
 ) -> ir.Value:
     """AMD buffer load operation.
 
@@ -480,11 +454,6 @@ def buffer_load(
         soffset_bytes: Optional scalar offset (in BYTES) added by the buffer instruction (soffset).
                       Use this to fold small constant deltas into the instruction instead of emitting
                       extra VGPR address arithmetic.
-        is_scalar: Emit a uniform/SGPR scalar load (llvm.amdgcn.s.buffer.load) instead of the
-                      vector buffer load. Use only for wave-uniform addresses to route through the
-                      SMEM cache and land the result directly in SGPRs. Restricted to vec_width 1 or 4;
-                      dtype is forced to i32 (the result is raw i32 dwords). mask and soffset_bytes
-                      are not supported in this mode and raise ValueError if provided.
 
     Returns:
         Loaded data (scalar or vector depending on vec_width)
@@ -496,20 +465,8 @@ def buffer_load(
         >>> # Load with mask
         >>> data = buffer_load(rsrc, offset, vec_width=4, mask=valid)
     """
-    # Scalar (uniform) loads return raw i32 dwords; force the element type so the
-    # element->byte offset math below uses 4 and the result type is i32 / v4i32.
-    if is_scalar:
-        if vec_width not in (1, 4):
-            raise ValueError(
-                f"buffer_load(is_scalar=True): unsupported vec_width={vec_width}"
-            )
-        if mask is not None or soffset_bytes is not None:
-            raise ValueError(
-                "buffer_load(is_scalar=True) does not support mask or soffset_bytes"
-            )
-        dtype = T.i32()
     # Default dtype to f32
-    elif dtype is None:
+    if dtype is None:
         dtype = T.f32()
     # Accept DSL Numeric class (e.g. fx.Int32) as dtype: unwrap to ir.Type
     elif hasattr(dtype, "ir_type"):
@@ -544,20 +501,6 @@ def buffer_load(
         result_type = dtype
     else:
         result_type = ir.VectorType.get([vec_width], dtype)
-
-    # Scalar/uniform load path: emit s.buffer.load with a v4i32 resource and the
-    # byte offset computed above. Returns i32 (vec_width 1) or v4i32 (vec_width 4).
-    if is_scalar:
-        rsrc_v4 = _ptr8_to_v4i32(rsrc)
-        cache_policy = _create_i32_constant(cache_modifier)
-        suffix = "i32" if vec_width == 1 else "v4i32"
-        return llvm.call_intrinsic(
-            result_type,
-            f"llvm.amdgcn.s.buffer.load.{suffix}",
-            [rsrc_v4, offset, cache_policy],
-            [],
-            [],
-        )
 
     # Create instruction offset and aux flags
     if soffset_bytes is None:
