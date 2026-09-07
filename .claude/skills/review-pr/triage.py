@@ -310,11 +310,46 @@ def _bound_arg(node):
             return a.id
         if isinstance(a, ast.Attribute):
             return a.attr
-        return type(a).__name__
+        # The bound tensor is often built inline -- make_buffer_tensor(make_view(...)).
+        # Printing the node class ("Call") tells the reader nothing about which tensor.
+        try:
+            src = ast.unparse(a)
+        except Exception:
+            return type(a).__name__
+        return src if len(src) <= 48 else src[:45] + "..."
     for k in node.keywords:
         if k.arg in ("ptr", "tensor", "global_ptr") and isinstance(k.value, ast.Name):
             return k.value.id
     return "?"
+
+
+def _buffer_bounded(name, node):
+    """(bounded, explicit): does this call bound the descriptor, and did it say so?
+
+    `max_size` DEFAULTS to True in both constructors, and flydsl's own docstring spells
+    out what that means: "max_size=True (default) sets the descriptor to 0xFFFFFFFF".
+    Omitting the argument is therefore identical to asking for no bound at all -- and 21
+    of the 138 calls in aiter/ops/flydsl (15%) omit it. Matching only the literal text
+    `max_size=True` reads those 21 as clean. That is how PR#5301 came back with nothing:
+    its one added buffer call is `fx.rocdl.make_buffer_tensor(view)`, bare.
+
+    Positional forms differ per constructor and are read per constructor:
+      create_buffer_resource(memref, stride=0, max_size=True, *, num_records_bytes=None)
+      make_buffer_tensor(tensor, max_size=True, *, num_records_bytes=None)
+      ptr_buffer_resource(ptr, num_records_bytes)   -- a local helper; arg 2 IS the bound
+    """
+    kw = {k.arg: k.value for k in node.keywords}
+    if kw.get("num_records_bytes") is not None:
+        return True, None
+    if name == "ptr_buffer_resource":
+        return len(node.args) >= 2, None
+    ms = kw.get("max_size")
+    if ms is None:
+        pos = 2 if name == "create_buffer_resource" else 1
+        ms = node.args[pos] if len(node.args) > pos else None
+    if isinstance(ms, ast.Constant) and ms.value is False:
+        return True, None
+    return False, ms is not None
 
 
 def flydsl_bounds(diff_text, root):
@@ -364,11 +399,12 @@ def flydsl_bounds(diff_text, root):
                 continue
             name = _call_name(node)
             if name in FLYDSL_BUF_CALLS:
-                for k in node.keywords:
-                    if (k.arg == "max_size" and isinstance(k.value, ast.Constant)
-                            and k.value.value is True):
-                        rows.append((path, node.lineno, name, _bound_arg(node),
-                                     "max_size=True -- no num_records bound"))
+                bounded, explicit = _buffer_bounded(name, node)
+                if not bounded:
+                    rows.append((path, node.lineno, name, _bound_arg(node),
+                                 "max_size=True -- descriptor is 0xFFFFFFFF" if explicit
+                                 else "max_size omitted, so True -- descriptor is "
+                                      "0xFFFFFFFF and the call does not say so"))
             elif name == "make_tensor_descriptor_2d":
                 kws = {k.arg for k in node.keywords}
                 if "oob_outer_bound" in kws and "oob_inner_bound" not in kws:
@@ -433,7 +469,7 @@ def _aot_side_text(diff_text):
     return "\n".join(out)
 
 
-def aot_pairing(diff_text, root):
+def aot_pairing(diff_text, root, symbol_root=None):
     """New ops-side contracts that aiter/aot/flydsl/ was not taught about.
 
     The first cut of this looked for "ops changed, AOT untouched" and would have caught
@@ -456,7 +492,13 @@ def aot_pairing(diff_text, root):
     Private helpers (leading underscore) are excluded: they are not a contract.
     """
     added = added_line_numbers(diff_text)
-    table = aot_symbol_table(root)
+    # The symbol table describes what AOT depends on TODAY, so it is read from the merge
+    # target; the changed files are read from the PR head, because `root` here is a tree of
+    # the diff's own files and a file this PR ADDS exists nowhere else. Reading both from
+    # one tree is what made this collector silent on PR#5301: its two new kernel files are
+    # absent from the merge target, and for a MODIFIED file the base-side text does not
+    # line up with head-side line numbers at all.
+    table = aot_symbol_table(symbol_root or root)
     if not table:
         return []
     aot_modules = {mod for mod, _ in table}
@@ -2447,8 +2489,8 @@ if __name__ == "__main__":
         print("usage: triage.py rules <diff> [title]\n"
               "       triage.py evidence <diff> <head-file>...\n"
               "       triage.py symbols <diff> <merge-target-root>\n"
-              "       triage.py flydslbounds <diff> <merge-target-root>\n"
-              "       triage.py aotpair <diff> <merge-target-root>\n"
+              "       triage.py flydslbounds <diff> <head-root>\n"
+              "       triage.py aotpair <diff> <head-root> [merge-target-root]\n"
               "       triage.py ledger <rules.txt> <verdicts.txt> [diff]\n"
               "       triage.py expand <rules.txt> <rules.md>\n"
               "       triage.py answers <answers.txt>\n"
@@ -2504,8 +2546,9 @@ if __name__ == "__main__":
         print(render_siblings(sibling_variants(open(sys.argv[2]).read(), tree_root(sys.argv[3]))))
         sys.exit(0)
     if mode == "aotpair":
-        print(render_aot_pairing(aot_pairing(open(sys.argv[2]).read(),
-                                             tree_root(sys.argv[3]))))
+        print(render_aot_pairing(aot_pairing(
+            open(sys.argv[2]).read(), tree_root(sys.argv[3]),
+            tree_root(sys.argv[4]) if len(sys.argv) > 4 else None)))
         sys.exit(0)
     if mode == "flydslbounds":
         print(render_flydsl_bounds(flydsl_bounds(open(sys.argv[2]).read(),

@@ -868,13 +868,13 @@ fi
 # this class: B2 is `tl.load` without a mask and FlyDSL has no tl, so memory-safety handed a
 # FlyDSL PR three rules none of which could fire. FlyDSL needs patching after merge 1.66x as
 # often as the repo average (20/98 fix-commits vs 12.3% share, p=0.015); 4 of 21 are this.
-"$SKILLS_ROOT/review-pr/triage.py" flydslbounds "$WORK/pr.diff" "$PROJECT_ROOT" \
+"$SKILLS_ROOT/review-pr/triage.py" flydslbounds "$WORK/pr.diff" "$WORK/head" \
   | tee "$WORK/flydsl_bounds.txt"
 
 # New ops-side contracts aiter/aot/flydsl/ was not taught. D12. AOT re-derives the runtime's
 # variant conditions into a second copy that drifts -- 5 of the 21 precise fixes. Paired by
 # symbol from AOT's imports: a name stem cannot relate parse_csv to resolve_stage1_tile_n.
-"$SKILLS_ROOT/review-pr/triage.py" aotpair "$WORK/pr.diff" "$PROJECT_ROOT" \
+"$SKILLS_ROOT/review-pr/triage.py" aotpair "$WORK/pr.diff" "$WORK/head" "$PROJECT_ROOT" \
   | tee "$WORK/aot_pairing.txt"
 
 # What became of each guard the diff deletes. D4 is red and fires on 69 of 600 open PRs;
