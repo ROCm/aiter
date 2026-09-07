@@ -66,6 +66,18 @@ _LAZY_IMPORTS = {
         ".kernels.qk_norm_rope_quant",
         "flydsl_qk_norm_rope_quant",
     ),
+    "flydsl_sparse_mla_decode": (
+        ".sparse_mla_decode_kernels",
+        "flydsl_sparse_mla_decode",
+    ),
+    "flydsl_sparse_mla_prefill": (
+        ".kernels.sparse_mla_prefill",
+        "flydsl_sparse_mla_prefill",
+    ),
+    "sparse_mla_decode_workspace_shape": (
+        ".sparse_mla_decode_kernels",
+        "sparse_mla_decode_workspace_shape",
+    ),
 }
 
 __all__ = [
@@ -84,6 +96,9 @@ __all__ = [
     "flydsl_pa_mqa_logits_fp4_varqlen",
     "flydsl_preshuffle_gemm_a8",
     "flydsl_qk_norm_rope_quant",
+    "flydsl_sparse_mla_decode",
+    "flydsl_sparse_mla_prefill",
+    "sparse_mla_decode_workspace_shape",
 ]
 
 

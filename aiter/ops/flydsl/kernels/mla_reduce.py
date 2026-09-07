@@ -134,6 +134,26 @@ def _load_partial_out(buf, row, head_idx, tid, vec):
     return elems
 
 
+def _narrow_numeric_t(name: str):
+    """Resolve a 2-byte partial-output element type."""
+    if name in ("bf16", "bfloat16"):
+        return fx.BFloat16
+    if name in ("fp16", "f16", "float16", "half"):
+        return fx.Float16
+    raise ValueError(f"Unsupported partial dtype: {name}")
+
+
+def _load_partial_out_narrow(buf, row, head_idx, tid, vec, numeric_t):
+    """Load VEC packed 2-byte partials and widen them to fp32 registers."""
+    atom = _out_copy_atom(vec, numeric_t)
+    reg_layout = fx.make_layout(vec, 1)
+    row_tiled = fx.logical_divide(fx.slice(buf, (row, head_idx, None)), reg_layout)
+    frag = fx.make_rmem_tensor(reg_layout, numeric_t)
+    fx.copy_atom_call(atom, fx.slice(row_tiled, (None, tid)), frag)
+    v = frag.load()
+    return [v[i].to(fx.Float32) for i in fx.range_constexpr(vec)]
+
+
 def _out_copy_atom(vec: int, out_numeric_t):
     """Widest legal buffer copy atom for a VEC-element output fragment.
 
@@ -253,6 +273,10 @@ def compile_mla_reduce(
     grp_m64: int = 8,
     m64_hi_thr: int = 8,
     m64_hi_grp: int = 16,
+    partial_dtype: str = "fp32",
+    lse_base2: bool = False,
+    num_threads: int = NUM_THREADS,
+    dv_split: int = 1,
 ):
     """Compile an MLA reduce kernel for fixed (H, Dv, out_dtype, tier).
 
@@ -279,11 +303,34 @@ def compile_mla_reduce(
     ``m64_hi_grp`` pipeline once ``n_splits`` exceeds ``m64_hi_thr``, without
     changing CUDA-graph topology. Set ``m64_hi_thr=0`` to disable it.
     """
-    assert (
-        Dv % NUM_THREADS == 0
-    ), f"Dv ({Dv}) must be divisible by NUM_THREADS ({NUM_THREADS})"
-    assert tier in _TIER_NLSE, f"bad tier {tier}"
-    VEC = Dv // NUM_THREADS
+    NT = int(num_threads)
+    DVS = int(dv_split)
+    if Dv % (NT * DVS) != 0:
+        raise ValueError(f"Dv ({Dv}) must be divisible by NT*DVS ({NT * DVS})")
+    if tier not in _TIER_NLSE:
+        raise ValueError(f"bad tier {tier}")
+    VEC = Dv // (NT * DVS)
+    partial_is_narrow = partial_dtype != "fp32"
+    partial_numeric_t = (
+        _narrow_numeric_t(partial_dtype) if partial_is_narrow else fx.Float32
+    )
+    if partial_is_narrow and VEC not in (1, 2, 4, 8):
+        raise ValueError(f"narrow partial needs VEC in 1/2/4/8, got {VEC}")
+
+    if lse_base2:
+
+        def _xexp(x):
+            return fx.rocdl.exp2(T.f32, fx.Float32(x).ir_value())
+
+        def _xlog(x):
+            return fly_math.log2(x, fastmath=fm_fast)
+
+    else:
+        _xexp = _exp
+
+        def _xlog(x):
+            return fly_math.log(x, fastmath=fm_fast)
+
     is_runtime_tier = tier == Tier.ALL
     is_massive = tier != Tier.SIMPLE
     if tier == Tier.MLDS:
@@ -309,7 +356,7 @@ def compile_mla_reduce(
         if is_massive:
             lse_scale: fx.Array[fx.Float32, LDS_PADDED_SPLITS, 16]
 
-    @flyc.kernel(known_block_size=[NUM_THREADS, 1, 1])
+    @flyc.kernel(known_block_size=[NT, 1, 1])
     def mla_reduce_kernel(
         partial_output: fx.Pointer,  # fp32 [row, H, Dv]
         partial_lse: fx.Pointer,  # fp32 [row, H]
@@ -330,21 +377,40 @@ def compile_mla_reduce(
 
         def load_o_elems(row_idx, head_idx):
             """Load VEC fp32 elements as a python list of scalars."""
-            return _load_partial_out(partial_output_buf, row_idx, head_idx, tid, VEC)
+            if fx.const_expr(partial_is_narrow):
+                return _load_partial_out_narrow(
+                    partial_output_buf,
+                    row_idx,
+                    head_idx,
+                    dv_tid,
+                    VEC,
+                    partial_numeric_t,
+                )
+            return _load_partial_out(partial_output_buf, row_idx, head_idx, dv_tid, VEC)
 
         def store_o_elems(row_idx, head_idx, elems_f32):
             """Cast VEC fp32 scalars to out_t and emit one packed store."""
             _store_final_out(
-                final_output_buf, row_idx, head_idx, tid, elems_f32, VEC, out_numeric_t
+                final_output_buf,
+                row_idx,
+                head_idx,
+                dv_tid,
+                elems_f32,
+                VEC,
+                out_numeric_t,
             )
 
         tid = fx.thread_idx.x
         lane = tid % WARP
         wave = tid // WARP
+        if fx.const_expr(DVS > 1):
+            dv_tid = tid + (fx.block_idx.x % fx.Int32(DVS)) * fx.Int32(NT)
+        else:
+            dv_tid = tid
 
         partial_output_buf = _pointer_buffer_tensor(
             partial_output,
-            fx.Float32,
+            partial_numeric_t,
             (num_partial_rows, H, Dv),
             (H * Dv, Dv, 1),
         )
@@ -434,7 +500,7 @@ def compile_mla_reduce(
                 This is the normal high-split path (mirrors reduce.cu:431-438).
                 The direct path bypasses the staging barrier for low split counts.
                 """
-                for split_i in range(tid, n_splits, fx.Int32(NUM_THREADS), init=None):
+                for split_i in range(tid, n_splits, fx.Int32(NT), init=None):
                     split_i32 = fx.Int32(split_i)
                     lds_pmap[split_i32] = g_pmap[t0 + split_i32]
                 fx.gpu.barrier()
@@ -509,11 +575,15 @@ def compile_mla_reduce(
             def store_lse(seq, max_lse, sum_e):
                 if fx.const_expr(output_lse):
                     bad = _is_zero_or_nan(sum_e)
-                    lse_val = fly_math.log(sum_e, fastmath=fm_fast) + max_lse
+                    lse_val = _xlog(sum_e) + max_lse
                     inf = fx.Float32(float("inf"))
                     final_lse_val = bad.select(inf, lse_val)
                     if tid == fx.Int32(0):
-                        store_lse_value(g_flse, seq, head, final_lse_val)
+                        if fx.const_expr(DVS > 1):
+                            if (fx.block_idx.x % fx.Int32(DVS)) == fx.Int32(0):
+                                store_lse_value(g_flse, seq, head, final_lse_val)
+                        else:
+                            store_lse_value(g_flse, seq, head, final_lse_val)
 
             # Runtime range without carried state lets scheduling overlap the
             # split-loop VMEM loads with compute.
@@ -535,8 +605,8 @@ def compile_mla_reduce(
                     os = load_split_o(fx.Int32(s), local_seq, direct_pmap)
                     lse = load_split_lse(fx.Int32(s), local_seq, direct_pmap)
                     new_max = fx.Float32(max_lse).maximumf(lse)
-                    old = _exp(fx.Float32(max_lse) - new_max)
-                    new = _exp(lse - new_max)
+                    old = _xexp(fx.Float32(max_lse) - new_max)
+                    new = _xexp(lse - new_max)
                     new_regs = [
                         (fx.Float32(regs[i]) * old + os[i] * new).ir_value()
                         for i in fx.range_constexpr(VEC)
@@ -590,7 +660,7 @@ def compile_mla_reduce(
                         max_lse = fx.Float32(max_lse).maximumf(peer)
                     sum_e = fx.Float32(0.0)
                     for j in fx.range_constexpr(nlse):
-                        sum_e = sum_e + _exp(local_lses[j] - max_lse)
+                        sum_e = sum_e + _xexp(local_lses[j] - max_lse)
                     for off in [32, 16, 8, 4, 2, 1]:
                         peer = fx.Float32(sum_e).shuffle_xor(
                             fx.Int32(off), fx.Int32(WARP)
@@ -598,16 +668,18 @@ def compile_mla_reduce(
                         sum_e = sum_e + peer
                     bad = _is_zero_or_nan(sum_e)
                     inf = fx.Float32(float("inf"))
-                    global_lse = bad.select(
-                        inf, fly_math.log(sum_e, fastmath=fm_fast) + max_lse
-                    )
+                    global_lse = bad.select(inf, _xlog(sum_e) + max_lse)
                     for j in fx.range_constexpr(nlse):
                         split_idx = lane + fx.Int32(j * WARP)
                         in_rng = split_idx < n_splits
-                        sc = _exp(local_lses[j] - global_lse)
+                        sc = _xexp(local_lses[j] - global_lse)
                         store_lse_scale(split_idx, in_rng.select(sc, zero_f))
                     if fx.const_expr(output_lse) and lane == fx.Int32(0):
-                        store_lse_value(g_flse, seq_i32, head, global_lse)
+                        if fx.const_expr(DVS > 1):
+                            if (fx.block_idx.x % fx.Int32(DVS)) == fx.Int32(0):
+                                store_lse_value(g_flse, seq_i32, head, global_lse)
+                        else:
+                            store_lse_value(g_flse, seq_i32, head, global_lse)
 
                 # Keep GRP output loads in flight while computing the prior group.
                 # Tail gathers use slot zero and the scale select zeros invalid
@@ -829,7 +901,10 @@ def compile_mla_reduce(
 
                 work_idx = is_past_end.select(tot_work, work_idx + grid_stride)
         else:
-            head = fx.block_idx.x
+            if fx.const_expr(DVS > 1):
+                head = fx.block_idx.x // fx.Int32(DVS)
+            else:
+                head = fx.block_idx.x
             block_idx = fx.block_idx.y  # q-pos group (NTG)
             tile = fx.block_idx.z
             ntg = fx.grid_dim.y
@@ -856,7 +931,7 @@ def compile_mla_reduce(
         stream: fx.Stream = default_stream,
     ):
         idx_tiles = num_reduce_tile
-        idx_H = fx.Int32(H)
+        idx_H = fx.Int32(H * DVS)
         idx_ntg = max_seqlen_q
         if fx.const_expr(persistent and not adaptive):
             ps_grid = max_splits * fx.Int32(PS_GRID_MULT)
@@ -884,7 +959,7 @@ def compile_mla_reduce(
             value_attrs=kernel_value_attrs,
         ).launch(
             grid=grid,
-            block=(NUM_THREADS, 1, 1),
+            block=(NT, 1, 1),
             stream=stream,
         )
 
@@ -1038,7 +1113,8 @@ def compile_mla_reduce_splitk(
     writes ``final_output``). ``use_reduce_final_map`` is always True here (the
     combine needs the per-tile q-range).
     """
-    assert Dv % NUM_THREADS == 0
+    if Dv % NUM_THREADS != 0:
+        raise ValueError(f"Dv ({Dv}) must be divisible by NUM_THREADS ({NUM_THREADS})")
     VEC = Dv // NUM_THREADS
     kernel_value_attrs = (
         {"rocdl.waves_per_eu": int(waves_per_eu)} if waves_per_eu >= 1 else {}
