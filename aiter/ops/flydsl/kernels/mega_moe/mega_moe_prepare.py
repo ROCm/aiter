@@ -34,11 +34,7 @@ def compile_mega_moe_prepare(
     quant_cu_capacity: int,
     model_dim: int,
     payload_chunk_rows: int,
-    payload_tile_ready: bool,
     tile_state_stride: int,
-    fanout_masks: tuple[int, ...],
-    runtime_fanout: bool = False,
-    dynamic_fanout: bool = False,
 ):
     """Compile compact count/group/plan without the GEMM1 shared footprint."""
     arch = str(get_rocm_arch() or "")
@@ -61,15 +57,14 @@ def compile_mega_moe_prepare(
     chunk_rows = int(payload_chunk_rows)
     tile_state_stride = int(tile_state_stride)
     total_experts = npes * epr
-    fanout_enabled = bool(fanout_masks) or runtime_fanout
-    total_segments = total_experts + (npes if fanout_enabled else 0)
+    total_segments = total_experts + npes
     block_threads = num_waves * 64
     assert prepare_blocks >= 1
     launch_grid = prepare_blocks + quant_blocks + 1
     assert dispatch_blocks % npes == 0
     assert 0 <= quant_blocks <= quant_cu_capacity
     assert model_dim % 32 == 0
-    assert chunk_rows > 0 and payload_tile_ready
+    assert chunk_rows > 0
     assert tile_state_stride > 0
 
     @fx.struct
@@ -80,8 +75,7 @@ def compile_mega_moe_prepare(
     kernel_name = (
         f"megamoe_prepare_compact_m{tile_m}_dcu{dispatch_blocks}_pcu{prepare_blocks}_pc{chunk_rows}"
         f"_qcu{quant_blocks}qcap{quant_cu_capacity}"
-        f"_fov{int(fanout_enabled)}r{int(runtime_fanout)}"
-        f"_dyn{int(dynamic_fanout)}"
+        "_fov_runtime_dyn"
         f"_tss{tile_state_stride}_v13"
     )
 
@@ -232,11 +226,7 @@ def compile_mega_moe_prepare(
                     group_done_slot=entry_slot,
                     group_phase_base=group_phase_base,
                     payload_chunk_rows=chunk_rows,
-                    payload_tile_ready=True,
                     tile_state_stride=tile_state_stride,
-                    fanout_masks=fanout_masks,
-                    runtime_fanout=runtime_fanout,
-                    dynamic_fanout=dynamic_fanout,
                 )
             if producer:
                 emit_dispatch_group(
@@ -253,8 +243,6 @@ def compile_mega_moe_prepare(
                     producer_slot=producer_slot,
                     parity=parity,
                     expected=expected,
-                    fanout_masks=fanout_masks,
-                    runtime_fanout=runtime_fanout,
                     count_scratch=count_scratch,
                 )
 

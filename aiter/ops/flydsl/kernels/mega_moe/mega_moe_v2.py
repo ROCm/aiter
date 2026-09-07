@@ -2,7 +2,6 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 """MegaMoE v2 fused dispatch, GEMM1, GEMM2, and combine implementation."""
 
-import ctypes
 import os
 from dataclasses import replace
 
@@ -23,32 +22,10 @@ from .mega_moe_config import (
     build_mega_moe_bundle_plan,
     fixed_stage1_epoch_slot_count,
 )
+from .mega_moe_stage2_aligned_pair import ALIGNED_PAIR_SCATTER_VEC
 from .quant import per_1x32_mx_quant
 
 __all__ = ["MegaMoEV2"]
-
-
-def _create_masked_stream(device: torch.device, cu_num: int, cus_per_word: int):
-    """Create an experimental HIP stream using the high CUs of each 32-CU group."""
-    if not 0 < cus_per_word <= 32:
-        raise ValueError("cus_per_word must be in [1, 32]")
-    word_count = (cu_num + 31) // 32
-    word = ((1 << cus_per_word) - 1) << (32 - cus_per_word)
-    words = (ctypes.c_uint32 * word_count)(*([word] * word_count))
-    hip = ctypes.CDLL("libamdhip64.so")
-    create = hip.hipExtStreamCreateWithCUMask
-    create.argtypes = [
-        ctypes.POINTER(ctypes.c_void_p),
-        ctypes.c_uint32,
-        ctypes.POINTER(ctypes.c_uint32),
-    ]
-    create.restype = ctypes.c_int
-    raw_stream = ctypes.c_void_p()
-    result = create(ctypes.byref(raw_stream), word_count, words)
-    if result != 0 or not raw_stream.value:
-        raise RuntimeError(f"hipExtStreamCreateWithCUMask failed with {result}")
-    stream = torch.cuda.ExternalStream(raw_stream.value, device=device)
-    return stream, hip, raw_stream
 
 
 class MegaMoEV2:
@@ -85,13 +62,8 @@ class MegaMoEV2:
             world_size=self.world_size,
         )
         self._active_bundle_entry = None
-        debug_fanout = os.environ.get("MEGA_DEBUG_FANOUT_MASKS", "")
-        if not fanout_masks and debug_fanout:
-            fanout_masks = tuple(
-                int(item, 0) for item in debug_fanout.split(",") if item
-            )
-        self._s1_fanout_masks = tuple(int(mask) for mask in fanout_masks)
-        if self._s1_fanout_masks and len(self._s1_fanout_masks) != self.world_size:
+        self._initial_fanout_masks = tuple(int(mask) for mask in fanout_masks)
+        if self._initial_fanout_masks and len(self._initial_fanout_masks) != self.world_size:
             raise ValueError("fanout_masks must contain one mask per destination")
         if self.swiglu_limit < 0:
             raise ValueError("swiglu_limit must be non-negative")
@@ -101,7 +73,6 @@ class MegaMoEV2:
         # Compact Stage1 always uses the deterministic runtime fanout protocol.
         # Keeping this wire format identical for every MAX-MTPR bucket is what
         # makes uneven-rank dynamic prefill safe.
-        self._s1_runtime_fanout = compact
         capacity_tile_m = 128 if compact else 32
         self._s1_fixed_slot = not compact
         self._s1_scale_dim = self.model_dim // 32
@@ -152,7 +123,7 @@ class MegaMoEV2:
         if op.indexed_payload != expected_indexed_payload:
             raise ValueError("group-major payload layout disagrees with Stage1")
         self._s1_op = op
-        # Payload capacity follows the largest SBM; metadata covers the smallest candidate.
+        # Payload capacity follows the largest SBM; metadata covers the smallest tile.
         metadata_blocks = (op.num_valid_max + self.sort_block_m - 1) // self.sort_block_m
         if metadata_blocks > op.max_blocks:
             op.max_blocks = metadata_blocks
@@ -167,7 +138,9 @@ class MegaMoEV2:
         self._s1_epoch_parity = torch.zeros(1, dtype=torch.int32, device=self.dev)
         self._s1_epoch_expected = torch.zeros(2, dtype=torch.int32, device=self.dev)
         self._s1_num_cu = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
-        self._s1_prepare_cu_capacity = self._s1_num_cu
+        self._s1_prepare_cu_capacity = max(
+            entry.config.stage1.num_dispatch_cu for entry in self._bundle_plan.entries
+        )
         # Quant is shorter than compact prepare.  Limiting its resident CTA
         # population keeps it under prepare's critical path without letting
         # quant saturate all CUs and stretch the histogram/P2P allgather.
@@ -218,7 +191,6 @@ class MegaMoEV2:
                 dtype=torch.int32,
                 device=self.dev,
             ),
-            "local_cursor": torch.zeros(total_segments, dtype=torch.int32, device=self.dev),
             "pair_order": torch.empty(self.mtpr * self.topk, dtype=torch.int32, device=self.dev),
             "route_segment": torch.empty(
                 self.mtpr * self.topk, dtype=torch.int32, device=self.dev
@@ -274,8 +246,8 @@ class MegaMoEV2:
         initial_pairs = []
         for destination in range(self.world_size):
             mask = (
-                int(self._s1_fanout_masks[destination])
-                if destination < len(self._s1_fanout_masks)
+                int(self._initial_fanout_masks[destination])
+                if destination < len(self._initial_fanout_masks)
                 else 0
             )
             if mask:
@@ -299,7 +271,6 @@ class MegaMoEV2:
         workspace["my_base"] = op._sym((total_experts,), torch.int32)
         workspace["group_base"] = op._sym((total_experts,), torch.int32)
         workspace["plan_ready"] = op._sym((2 * self.world_size,), torch.int32)
-        workspace["payload_ready"] = op._sym((2 * self.epr,), torch.int32)
         workspace["launch_ready"] = op._sym((self.world_size,), torch.int32)
         workspace["tile_ready"] = op._sym((tile_state_blocks,), torch.int32)
         workspace["tile_expected"] = op._sym((tile_state_blocks,), torch.int32)
@@ -308,110 +279,88 @@ class MegaMoEV2:
         workspace["ready_tile_tail"] = op._sym((2,), torch.int32)
         workspace["payload_ready_rows"] = op._sym((1,), torch.int32)
         ms.shmem_barrier_all()
-        workspace["p2p_bigcnt"] = op._p2p_table(workspace["bigcnt"])
-        workspace["p2p_count_done"] = op._p2p_table(workspace["count_done"])
-        workspace["p2p_my_base"] = op._p2p_table(workspace["my_base"])
-        workspace["p2p_group_base"] = op._p2p_table(workspace["group_base"])
-        workspace["p2p_plan_ready"] = op._p2p_table(workspace["plan_ready"])
-        workspace["p2p_payload_ready"] = op._p2p_table(workspace["payload_ready"])
-        workspace["p2p_launch_ready"] = op._p2p_table(workspace["launch_ready"])
-        workspace["p2p_tile_ready"] = op._p2p_table(workspace["tile_ready"])
-        workspace["p2p_tile_expected"] = op._p2p_table(workspace["tile_expected"])
-        workspace["p2p_ready_tile_queue"] = op._p2p_table(
-            workspace["ready_tile_queue"]
-        )
-        workspace["p2p_ready_tile_epoch"] = op._p2p_table(
-            workspace["ready_tile_epoch"]
-        )
-        workspace["p2p_ready_tile_tail"] = op._p2p_table(
-            workspace["ready_tile_tail"]
-        )
-        workspace["p2p_payload_ready_rows"] = op._p2p_table(workspace["payload_ready_rows"])
+        for name in (
+            "bigcnt",
+            "count_done",
+            "plan_ready",
+            "launch_ready",
+            "tile_ready",
+            "tile_expected",
+            "ready_tile_queue",
+            "ready_tile_epoch",
+            "ready_tile_tail",
+            "payload_ready_rows",
+        ):
+            workspace[f"p2p_{name}"] = op._p2p_table(workspace[name])
         self._s1_dispatch_workspace = workspace
 
     def _build_v2_disp_table(self):
         op = self._s1_op
         workspace = self._s1_dispatch_workspace
         table = [0] * DISPATCH_TABLE_SIZE
-        table[DispatchSlot.PAIR_BASE] = workspace["pair_base"].data_ptr()
-        table[DispatchSlot.P2P_TOKEN] = op.p2p_rx_em.data_ptr()
-        table[DispatchSlot.P2P_SCALE] = op.p2p_scale_em.data_ptr()
-        table[DispatchSlot.P2P_WEIGHT] = op.p2p_wts_em.data_ptr()
-        table[DispatchSlot.P2P_SRCMAP] = op.p2p_srcmap_em.data_ptr()
-        table[DispatchSlot.SORTED_EXPERT] = op.sorted_expert_ids.data_ptr()
-        table[DispatchSlot.TILE_ROW_BASE] = op.tile_row_base.data_ptr()
+        op_slots = {
+            DispatchSlot.P2P_TOKEN: "p2p_rx_em",
+            DispatchSlot.P2P_SCALE: "p2p_scale_em",
+            DispatchSlot.P2P_WEIGHT: "p2p_wts_em",
+            DispatchSlot.P2P_SRCMAP: "p2p_srcmap_em",
+            DispatchSlot.SORTED_EXPERT: "sorted_expert_ids",
+            DispatchSlot.TILE_ROW_BASE: "tile_row_base",
+            DispatchSlot.NUM_VALID: "num_valid",
+            DispatchSlot.SRCMAP: "srcmap_em",
+            DispatchSlot.RUNNING: "running",
+            DispatchSlot.P2P_RUNNING: "p2p_running",
+        }
+        workspace_slots = {
+            DispatchSlot.PAIR_BASE: "pair_base",
+            DispatchSlot.LOCAL_HIST: "local_hist",
+            DispatchSlot.BLOCK_HIST: "block_hist",
+            DispatchSlot.COUNT_MATRIX: "bigcnt",
+            DispatchSlot.P2P_COUNT_MATRIX: "p2p_bigcnt",
+            DispatchSlot.COUNT_DONE: "count_done",
+            DispatchSlot.P2P_COUNT_DONE: "p2p_count_done",
+            DispatchSlot.TASK_ROW_BASE: "my_base",
+            DispatchSlot.GROUP_TASK_BASE: "group_base",
+            DispatchSlot.PAIR_ORDER: "pair_order",
+            DispatchSlot.ROUTE_SEGMENT: "route_segment",
+            DispatchSlot.P2P_PLAN_READY: "p2p_plan_ready",
+            DispatchSlot.PLAN_READY: "plan_ready",
+            DispatchSlot.PAIR_READY: "pair_ready",
+            DispatchSlot.ENTRY_COUNT: "entry_count",
+            DispatchSlot.EPOCH_GATE: "epoch_gate",
+            DispatchSlot.PREP_ENTRY_COUNT: "prep_entry_count",
+            DispatchSlot.PREP_EPOCH_GATE: "prep_epoch_gate",
+            DispatchSlot.PAIR_ORDER_READY: "pair_order_ready",
+            DispatchSlot.WORK_HEAD: "work_head",
+            DispatchSlot.WORK_TAIL: "work_tail",
+            DispatchSlot.EXPERT_TILE_END: "expert_tile_end",
+            DispatchSlot.GROUP_DONE: "group_done",
+            DispatchSlot.LAUNCH_READY: "launch_ready",
+            DispatchSlot.P2P_LAUNCH_READY: "p2p_launch_ready",
+            DispatchSlot.MAX_EXPERT_TILES: "max_expert_tiles",
+            DispatchSlot.PAYLOAD_CHUNK_DONE: "payload_chunk_done",
+            DispatchSlot.TILE_READY: "tile_ready",
+            DispatchSlot.P2P_TILE_READY: "p2p_tile_ready",
+            DispatchSlot.TILE_EXPECTED: "tile_expected",
+            DispatchSlot.P2P_TILE_EXPECTED: "p2p_tile_expected",
+            DispatchSlot.FANOUT_PAIR_CONFIG: "fanout_pair_config",
+            DispatchSlot.READY_TILE_QUEUE: "ready_tile_queue",
+            DispatchSlot.P2P_READY_TILE_QUEUE: "p2p_ready_tile_queue",
+            DispatchSlot.READY_TILE_EPOCH: "ready_tile_epoch",
+            DispatchSlot.P2P_READY_TILE_EPOCH: "p2p_ready_tile_epoch",
+            DispatchSlot.READY_TILE_TAIL: "ready_tile_tail",
+            DispatchSlot.P2P_READY_TILE_TAIL: "p2p_ready_tile_tail",
+            DispatchSlot.PAYLOAD_READY_ROWS: "payload_ready_rows",
+            DispatchSlot.P2P_PAYLOAD_READY_ROWS: "p2p_payload_ready_rows",
+            DispatchSlot.PAYLOAD_BLOCKS_PER_DESTINATION: "payload_blocks_per_destination",
+            DispatchSlot.PAYLOAD_CHUNKS_PER_DESTINATION: "payload_chunks_per_destination",
+        }
+        for slot, name in op_slots.items():
+            table[slot] = getattr(op, name).data_ptr()
+        for slot, name in workspace_slots.items():
+            table[slot] = workspace[name].data_ptr()
         table[DispatchSlot.TILE_INPUT_BASE] = self._s1_tile_input_base.data_ptr()
-        table[DispatchSlot.NUM_VALID] = op.num_valid.data_ptr()
-        table[DispatchSlot.SRCMAP] = op.srcmap_em.data_ptr()
-        table[DispatchSlot.LOCAL_HIST] = workspace["local_hist"].data_ptr()
-        table[DispatchSlot.BLOCK_HIST] = workspace["block_hist"].data_ptr()
-        table[DispatchSlot.COUNT_MATRIX] = workspace["bigcnt"].data_ptr()
-        table[DispatchSlot.P2P_COUNT_MATRIX] = workspace["p2p_bigcnt"].data_ptr()
-        table[DispatchSlot.COUNT_DONE] = workspace["count_done"].data_ptr()
-        table[DispatchSlot.P2P_COUNT_DONE] = workspace["p2p_count_done"].data_ptr()
-        table[DispatchSlot.TASK_ROW_BASE] = workspace["my_base"].data_ptr()
-        table[DispatchSlot.GROUP_TASK_BASE] = workspace["group_base"].data_ptr()
-        table[DispatchSlot.LOCAL_CURSOR] = workspace["local_cursor"].data_ptr()
-        table[DispatchSlot.P2P_PAYLOAD_READY] = workspace["p2p_payload_ready"].data_ptr()
-        table[DispatchSlot.PAIR_ORDER] = workspace["pair_order"].data_ptr()
-        table[DispatchSlot.ROUTE_SEGMENT] = workspace["route_segment"].data_ptr()
-        table[DispatchSlot.P2P_TASK_ROW_BASE] = workspace["p2p_my_base"].data_ptr()
-        table[DispatchSlot.P2P_GROUP_TASK_BASE] = workspace[
-            "p2p_group_base"
-        ].data_ptr()
-        table[DispatchSlot.P2P_PLAN_READY] = workspace["p2p_plan_ready"].data_ptr()
-        table[DispatchSlot.PLAN_READY] = workspace["plan_ready"].data_ptr()
-        table[DispatchSlot.PAIR_READY] = workspace["pair_ready"].data_ptr()
-        table[DispatchSlot.ENTRY_COUNT] = workspace["entry_count"].data_ptr()
-        table[DispatchSlot.EPOCH_GATE] = workspace["epoch_gate"].data_ptr()
-        table[DispatchSlot.PREP_ENTRY_COUNT] = workspace["prep_entry_count"].data_ptr()
-        table[DispatchSlot.PREP_EPOCH_GATE] = workspace["prep_epoch_gate"].data_ptr()
-        table[DispatchSlot.PAIR_ORDER_READY] = workspace["pair_order_ready"].data_ptr()
-        table[DispatchSlot.WORK_HEAD] = workspace["work_head"].data_ptr()
-        table[DispatchSlot.WORK_TAIL] = workspace["work_tail"].data_ptr()
-        table[DispatchSlot.EXPERT_TILE_END] = workspace["expert_tile_end"].data_ptr()
-        table[DispatchSlot.GROUP_DONE] = workspace["group_done"].data_ptr()
-        table[DispatchSlot.RUNNING] = op.running.data_ptr()
-        table[DispatchSlot.P2P_RUNNING] = op.p2p_running.data_ptr()
-        table[DispatchSlot.LAUNCH_READY] = workspace["launch_ready"].data_ptr()
-        table[DispatchSlot.P2P_LAUNCH_READY] = workspace["p2p_launch_ready"].data_ptr()
-        table[DispatchSlot.MAX_EXPERT_TILES] = workspace["max_expert_tiles"].data_ptr()
-        table[DispatchSlot.PAYLOAD_CHUNK_DONE] = workspace["payload_chunk_done"].data_ptr()
-        table[DispatchSlot.TILE_READY] = workspace["tile_ready"].data_ptr()
-        table[DispatchSlot.P2P_TILE_READY] = workspace["p2p_tile_ready"].data_ptr()
-        table[DispatchSlot.TILE_EXPECTED] = workspace["tile_expected"].data_ptr()
-        table[DispatchSlot.P2P_TILE_EXPECTED] = workspace[
-            "p2p_tile_expected"
-        ].data_ptr()
-        table[DispatchSlot.FANOUT_PAIR_CONFIG] = workspace[
-            "fanout_pair_config"
-        ].data_ptr()
-        table[DispatchSlot.READY_TILE_QUEUE] = workspace[
-            "ready_tile_queue"
-        ].data_ptr()
-        table[DispatchSlot.P2P_READY_TILE_QUEUE] = workspace[
-            "p2p_ready_tile_queue"
-        ].data_ptr()
-        table[DispatchSlot.READY_TILE_EPOCH] = workspace[
-            "ready_tile_epoch"
-        ].data_ptr()
-        table[DispatchSlot.P2P_READY_TILE_EPOCH] = workspace[
-            "p2p_ready_tile_epoch"
-        ].data_ptr()
-        table[DispatchSlot.READY_TILE_TAIL] = workspace[
-            "ready_tile_tail"
-        ].data_ptr()
-        table[DispatchSlot.P2P_READY_TILE_TAIL] = workspace[
-            "p2p_ready_tile_tail"
-        ].data_ptr()
-        table[DispatchSlot.PAYLOAD_READY_ROWS] = workspace["payload_ready_rows"].data_ptr()
-        table[DispatchSlot.P2P_PAYLOAD_READY_ROWS] = workspace["p2p_payload_ready_rows"].data_ptr()
-        table[DispatchSlot.PAYLOAD_BLOCKS_PER_DESTINATION] = workspace[
-            "payload_blocks_per_destination"
-        ].data_ptr()
-        table[DispatchSlot.PAYLOAD_CHUNKS_PER_DESTINATION] = workspace[
-            "payload_chunks_per_destination"
-        ].data_ptr()
+        if any(pointer == 0 for pointer in table):
+            raise RuntimeError("incomplete MegaMoE dispatch table")
         self._s1_disp = torch.tensor(table, dtype=torch.int64, device=self.dev)
 
     def preload_stage1_bundle(self):
@@ -422,17 +371,17 @@ class MegaMoEV2:
             bucket = entry.token_bucket
             if self._s1_fixed_slot:
                 continue
-            prepare_blocks = max(1, min(config.prepare_cu, (bucket + 63) // 64))
+            prepare_blocks = max(
+                1, min(config.num_dispatch_cu, (bucket + 63) // 64)
+            )
             quant_groups = bucket * self._s1_scale_dim
             quant_blocks = min(
                 self._s1_quant_cu_capacity,
                 config.prepare_quant_cu,
                 (quant_groups + 511) // 512,
             )
-            # Production executes the quant+prepare artifact, while standalone
-            # Stage1 attribution reuses the same prepare kernel with quant
-            # disabled.  Preload both finite identities so run-only mode also
-            # covers diagnostics without compiling after warmup.
+            # Preload fused-quant and prequantized-input variants so both public
+            # forward paths remain AOT-only after warmup.
             for preload_quant_blocks in sorted({0, quant_blocks}):
                 self._s1_preload_prepare(
                     fx.Int64(self._s1_disp.data_ptr()),
@@ -456,11 +405,7 @@ class MegaMoEV2:
                     quant_cu_capacity=self._s1_quant_cu_capacity,
                     model_dim=self.model_dim,
                     payload_chunk_rows=config.payload_chunk_rows,
-                    payload_tile_ready=config.payload_tile_ready,
                     tile_state_stride=self._s1_tile_state_stride,
-                    fanout_masks=(),
-                    runtime_fanout=self._s1_runtime_fanout,
-                    dynamic_fanout=self._s1_runtime_fanout,
                 )
 
         op = self._s1_op
@@ -517,20 +462,14 @@ class MegaMoEV2:
             raise ValueError("topk_ids must be contiguous int32")
         if tuple(topk_ids.shape) != (cur_tok, self.topk):
             raise ValueError(f"topk_ids must have shape ({cur_tok}, {self.topk})")
-        compile_fanout_masks = (
-            () if self._s1_runtime_fanout else self._s1_fanout_masks
-        )
         entry = self._active_bundle_entry
         compile_tokens = (
             entry.token_bucket
             if entry is not None and entry.config.stage1 == config
             else cur_tok
         )
-        if compile_fanout_masks or self._s1_runtime_fanout:
-            prepare_blocks = (compile_tokens + 63) // 64
-        else:
-            prepare_blocks = (compile_tokens * self.topk + 511) // 512
-        prepare_blocks = max(1, min(config.prepare_cu, prepare_blocks))
+        prepare_blocks = (compile_tokens + 63) // 64
+        prepare_blocks = max(1, min(config.num_dispatch_cu, prepare_blocks))
         quant_blocks = 0
         quant_input_ptr = 0
         quant_output_ptr = 0
@@ -573,25 +512,8 @@ class MegaMoEV2:
             quant_cu_capacity=self._s1_quant_cu_capacity,
             model_dim=self.model_dim,
             payload_chunk_rows=config.payload_chunk_rows,
-            payload_tile_ready=config.payload_tile_ready,
             tile_state_stride=self._s1_tile_state_stride,
-            fanout_masks=compile_fanout_masks,
-            runtime_fanout=self._s1_runtime_fanout,
-            dynamic_fanout=self._s1_runtime_fanout,
         )
-        if os.environ.get("MEGA_DEBUG_PREPARE_ONLY") == "1":
-            torch.cuda.synchronize()
-            pair_rows = self._s1_dispatch_workspace["fanout_pair_config"].view(
-                2, self.world_size
-            ).cpu().tolist()
-            print(
-                f"[MEGA_DEBUG] rank={self.rank} prepare-kernel-complete "
-                f"group_done={int(self._s1_dispatch_workspace['group_done'][0].item())} "
-                f"parity={int(self._s1_epoch_parity.item())} pairs={pair_rows}",
-                flush=True,
-            )
-            raise RuntimeError("MEGA_DEBUG_PREPARE_ONLY complete")
-
     def _run_fused_stage1(
         self,
         x,
@@ -667,12 +589,9 @@ class MegaMoEV2:
             "swiglu_limit": self.swiglu_limit,
         }
         entry = self._active_bundle_entry
-        debug_role = int(os.environ.get("MEGA_DEBUG_STAGE1_ROLE", "0"))
         use_bundle = (
             entry is not None
             and entry.config.stage1 == config
-            and not self._s1_fanout_masks
-            and debug_role == 0
         )
         if use_bundle:
             self._s1_mega_bundle(
@@ -703,68 +622,8 @@ class MegaMoEV2:
                 b_nt=config.b_nt,
                 work_shards=config.work_shards,
                 payload_chunk_rows=config.payload_chunk_rows,
-                payload_tile_ready=config.payload_tile_ready,
                 tile_state_stride=self._s1_tile_state_stride,
-                fanout_masks=(
-                    () if self._s1_runtime_fanout else self._s1_fanout_masks
-                ),
-                runtime_fanout=self._s1_runtime_fanout,
-                debug_role_mode=debug_role,
             )
-        if os.environ.get("MEGA_DEBUG_STAGE1_ONLY") == "1":
-            torch.cuda.synchronize()
-            torch.distributed.barrier()
-            tile_ready = self._s1_dispatch_workspace["tile_ready"]
-            tile_expected = self._s1_dispatch_workspace["tile_expected"]
-            num_valid = int(op.num_valid[0].item())
-            num_tiles = (num_valid + config.sort_block_m - 1) // config.sort_block_m
-            parity = int(self._s1_epoch_parity.item())
-            state_base = parity * self._s1_tile_state_stride
-            ready = tile_ready[state_base : state_base + num_tiles].cpu()
-            expected = tile_expected[state_base : state_base + num_tiles].cpu()
-            expert = op.sorted_expert_ids[:num_tiles].cpu()
-            tile_row = op.tile_row_base[:num_tiles].cpu()
-            tile_input = self._s1_tile_input_base[:num_tiles].cpu()
-            mismatch = ready != expected
-            expert_low = self.rank * self.epr
-            expert_high = expert_low + self.epr
-            bad_expert = (expert < expert_low) | (expert >= expert_high)
-            bad_row = (tile_row < 0) | (tile_row + config.sort_block_m > self._s1_nvm)
-            bad_input = (tile_input < 0) | (
-                tile_input + config.sort_block_m > self._s1_nvm
-            )
-            print(
-                f"[MEGA_DEBUG] rank={self.rank} stage1-kernel-complete "
-                f"tiles={num_tiles} mismatch={int(mismatch.sum())} "
-                f"ready_sum={int(ready.sum())} expected_sum={int(expected.sum())} "
-                f"bad_expert={int(bad_expert.sum())} bad_row={int(bad_row.sum())} "
-                f"bad_input={int(bad_input.sum())} "
-                f"trb=[{int(tile_row.min())},{int(tile_row.max())}] "
-                f"tib=[{int(tile_input.min())},{int(tile_input.max())}]",
-                flush=True,
-            )
-            dump_prefix = os.environ.get("MEGA_DEBUG_DUMP_META", "")
-            if dump_prefix:
-                workspace = self._s1_dispatch_workspace
-                torch.save(
-                    {
-                        "expert": expert,
-                        "tile_row": tile_row,
-                        "tile_input": tile_input,
-                        "expected": expected,
-                        "pair_order": workspace["pair_order"][: x.shape[0] * self.topk]
-                        .cpu(),
-                        "route_segment": workspace["route_segment"][: x.shape[0] * self.topk]
-                        .cpu(),
-                        "pair_base": workspace["pair_base"].cpu(),
-                        "local_cursor": workspace["local_cursor"].cpu(),
-                        "task_base": workspace["my_base"].cpu(),
-                        "group_base": workspace["group_base"].cpu(),
-                        "count_matrix": workspace["bigcnt"].cpu(),
-                    },
-                    f"{dump_prefix}.rank{self.rank}.pt",
-                )
-            raise RuntimeError("MEGA_DEBUG_STAGE1_ONLY complete")
         self._s1_active_tile_m = config.sort_block_m
         return self._s1_active_tile_m
 
@@ -803,24 +662,15 @@ class MegaMoEV2:
 
     def _run_stage2(self, run_tokens, stream, slice_output, config: MegaMoEConfig):
         if config.stage2.aligned_pair:
-            return self._run_aligned_pair_stage2_candidate(
-                run_tokens,
-                config,
-                stream,
-                pair_cu=config.stage2.pair_cu,
-                pair_bm=config.stage2.pair_block_m,
-                pair_bn=config.stage2.pair_block_n,
-                parallel=True,
-                pair_work_weight=config.stage2.pair_work_weight,
-                pair_dual_accumulator=True,
-                residual_block_m=config.stage2.block_m,
-                residual_persist_cu=config.stage2.persist_cu,
-                scatter_vec=config.stage2.pair_scatter_vec,
-                pair_main_first=True,
-                pair_m_swizzle=True,
-                slice_output=slice_output,
+            return self._run_aligned_pair_stage2(
+                run_tokens, config, stream, slice_output
             )
         ret = self._run_fused_stage2(run_tokens, config, stream)
+        return self._stage2_output(ret, run_tokens, slice_output)
+
+    def _stage2_output(self, result, run_tokens, slice_output):
+        """Normalize combine output and optionally expose only active rows."""
+        ret = result
         out_tok = ret[0] if isinstance(ret, (tuple, list)) else ret
         if out_tok is None:
             cfg = self.comb_cfg
@@ -904,31 +754,9 @@ class MegaMoEV2:
         self._g2_preload = preload_mega_moe_stage2
         self._g2_pair_run = run_mega_moe_stage2_aligned_pair
         self._g2_pair_preload = preload_mega_moe_stage2_aligned_pair
-        self._g2_pair_stream = torch.cuda.Stream(device=dev, priority=-1)
-        self._g2_pair_start = torch.cuda.Event()
-        self._g2_pair_done = torch.cuda.Event()
-        self._g2_residual_stream = None
-        self._g2_residual_stream_owner = None
-        self._g2_residual_stream_raw = None
-        self._g2_residual_aux_stream = torch.cuda.Stream(device=dev, priority=0)
+        self._g2_residual_stream = torch.cuda.Stream(device=dev, priority=0)
         self._g2_residual_start = torch.cuda.Event()
         self._g2_residual_done = torch.cuda.Event()
-        masked_ranks = {
-            int(value)
-            for value in os.environ.get(
-                "MEGA_DEBUG_STAGE2_MASKED_RESIDUAL_RANKS", ""
-            ).split(",")
-            if value
-        }
-        if self.rank in masked_ranks:
-            cus_per_word = int(
-                os.environ.get("MEGA_DEBUG_STAGE2_RESIDUAL_CUS_PER_XCD", "4")
-            )
-            (
-                self._g2_residual_stream,
-                self._g2_residual_stream_owner,
-                self._g2_residual_stream_raw,
-            ) = _create_masked_stream(dev, int(cu_num), cus_per_word)
         self._g2_invariants_by_quant = {}
         for p2p_quant in ("none", "fp8_blockwise_1x32"):
             p2p_row_nbytes = (
@@ -949,34 +777,27 @@ class MegaMoEV2:
             1, comb_cfg.hidden_dim, dtype=comb_cfg.combine_dtype, device=dev
         )
 
-    def _preload_fused_stage2(
-        self,
-        config: MegaMoEConfig,
-        stream,
-        *,
-        runtime_pair_skip: bool = False,
-        scatter_vec: int = 8,
-    ):
-        comb_op = self.comb_op
+    def _fused_stage2_call(self, launcher, config, stream, *, runtime_pair_skip, scatter_vec):
+        """Invoke one normal Stage2 variant through its shared ABI."""
         op = self._s1_op
+        workspace = self._s1_dispatch_workspace
         stage2 = config.stage2
-        invariants = self._g2_invariants_by_quant[config.p2p_quant]
-        self._g2_preload(
+        launcher(
             fx.Int64(self._s1_out.view(-1).data_ptr()),
             fx.Int64(self._s1_osd.data_ptr()),
             fx.Int64(self.w2.data_ptr()),
             fx.Int64(self.w2_scale.data_ptr()),
             fx.Int64(op.sorted_expert_ids.data_ptr()),
             fx.Int64(op.num_valid.data_ptr()),
-            fx.Int64(self._s1_dispatch_workspace["max_expert_tiles"].data_ptr()),
+            fx.Int64(workspace["max_expert_tiles"].data_ptr()),
             fx.Int64(op.srcmap_em.data_ptr()),
             fx.Int64(op.wts_em.data_ptr()),
             fx.Int64(op.tile_row_base.data_ptr()),
-            fx.Int64(self._s1_dispatch_workspace["expert_tile_end"].data_ptr()),
-            fx.Int64(self._s1_dispatch_workspace["bigcnt"].data_ptr()),
-            fx.Int64(self._s1_dispatch_workspace["fanout_pair_config"].data_ptr()),
+            fx.Int64(workspace["expert_tile_end"].data_ptr()),
+            fx.Int64(workspace["bigcnt"].data_ptr()),
+            fx.Int64(workspace["fanout_pair_config"].data_ptr()),
             fx.Int64(self._s1_epoch_parity.data_ptr()),
-            comb_op._fx_p2p_comb_inp,
+            self.comb_op._fx_p2p_comb_inp,
             self._s1_nvm,
             self._g2v2_inter,
             self._g2v2_hidden,
@@ -996,24 +817,38 @@ class MegaMoEV2:
             g2_bf16_lds=stage2.bf16_lds,
             runtime_pair_skip=runtime_pair_skip,
             scatter_vec=scatter_vec,
-            **invariants,
+            **self._g2_invariants_by_quant[config.p2p_quant],
         )
 
-    def _preload_aligned_pair_stage2(self, config: MegaMoEConfig, stream):
+    def _preload_fused_stage2(
+        self,
+        config: MegaMoEConfig,
+        stream,
+        *,
+        runtime_pair_skip: bool = False,
+        scatter_vec: int = 8,
+    ):
+        self._fused_stage2_call(
+            self._g2_preload,
+            config,
+            stream,
+            runtime_pair_skip=runtime_pair_skip,
+            scatter_vec=scatter_vec,
+        )
+
+    def _aligned_pair_stage2_call(self, launcher, config: MegaMoEConfig, stream):
+        """Invoke the aligned-pair Stage2 kernel through its shared ABI."""
         stage2 = config.stage2
         invariants = self._g2_invariants_by_quant[config.p2p_quant]
         workspace = self._s1_dispatch_workspace
         op = self._s1_op
-        self._g2_pair_preload(
+        launcher(
             fx.Int64(self._s1_out.view(-1).data_ptr()),
             fx.Int64(self._s1_osd.data_ptr()),
             fx.Int64(self.w2.data_ptr()),
             fx.Int64(self.w2_scale.data_ptr()),
             fx.Int64(op.srcmap_em.data_ptr()),
             fx.Int64(op.wts_em.data_ptr()),
-            fx.Int64(op.sorted_expert_ids.data_ptr()),
-            fx.Int64(op.num_valid.data_ptr()),
-            fx.Int64(op.tile_row_base.data_ptr()),
             fx.Int64(workspace["expert_tile_end"].data_ptr()),
             fx.Int64(workspace["bigcnt"].data_ptr()),
             fx.Int64(workspace["fanout_pair_config"].data_ptr()),
@@ -1032,8 +867,6 @@ class MegaMoEV2:
             max_tok=int(invariants["max_tok"]),
             recv_cap=int(invariants["recv_cap"]),
             comb_inp_nbytes=int(invariants["comb_inp_nbytes"]),
-            pair_mask=0,
-            runtime_pair=self._s1_runtime_fanout,
             BM=stage2.pair_block_m,
             SBM=config.stage1.sort_block_m,
             BN=stage2.pair_block_n,
@@ -1043,11 +876,10 @@ class MegaMoEV2:
             cu_num=stage2.pair_cu,
             g2_bhoist=stage2.b_hoist,
             g2_ascale_pf=stage2.ascale_prefetch,
-            pair_work_weight=stage2.pair_work_weight,
-            dual_accumulator=True,
-            scatter_vec=stage2.pair_scatter_vec,
-            m_swizzle=True,
         )
+
+    def _preload_aligned_pair_stage2(self, config: MegaMoEConfig, stream):
+        self._aligned_pair_stage2_call(self._g2_pair_preload, config, stream)
 
     def preload_stage2_bundle(self):
         """Load every production Stage2 variant without GPU dispatch."""
@@ -1069,8 +901,8 @@ class MegaMoEV2:
             self._preload_fused_stage2(
                 residual_config,
                 stream,
-                runtime_pair_skip=self._s1_runtime_fanout,
-                scatter_vec=config.stage2.pair_scatter_vec,
+                runtime_pair_skip=True,
+                scatter_vec=ALIGNED_PAIR_SCATTER_VEC,
             )
             self._preload_aligned_pair_stage2(config, stream)
         for entry in self._bundle_plan.entries:
@@ -1087,49 +919,23 @@ class MegaMoEV2:
         config: MegaMoEConfig,
         stream=None,
         *,
-        skip_pair_mask: int = 0,
         runtime_pair_skip: bool = False,
         combine: bool = True,
-        lds_reserve_bytes: int = 0,
-        skip_pair_compact_work: bool = False,
-        skip_pair_tiles_per_cu: int = 0,
         scatter_vec: int = 8,
     ):
         comb_op = self.comb_op
-        op = self._s1_op
         if stream is None:
             stream = torch.cuda.current_stream()
         s_fx = fx.Stream(stream.cuda_stream)
         stage2 = config.stage2
         p2p_quant = config.p2p_quant
-        invariants = self._g2_invariants_by_quant[p2p_quant]
-        # fmt: off
-        self._g2_run(
-            fx.Int64(self._s1_out.view(-1).data_ptr()), fx.Int64(self._s1_osd.data_ptr()),
-            fx.Int64(self.w2.data_ptr()), fx.Int64(self.w2_scale.data_ptr()),
-            fx.Int64(op.sorted_expert_ids.data_ptr()), fx.Int64(op.num_valid.data_ptr()),
-            fx.Int64(self._s1_dispatch_workspace["max_expert_tiles"].data_ptr()),
-            fx.Int64(op.srcmap_em.data_ptr()), fx.Int64(op.wts_em.data_ptr()),
-            fx.Int64(op.tile_row_base.data_ptr()),
-            fx.Int64(self._s1_dispatch_workspace["expert_tile_end"].data_ptr()),
-            fx.Int64(self._s1_dispatch_workspace["bigcnt"].data_ptr()),
-            fx.Int64(self._s1_dispatch_workspace["fanout_pair_config"].data_ptr()),
-            fx.Int64(self._s1_epoch_parity.data_ptr()),
-            comb_op._fx_p2p_comb_inp, self._s1_nvm,
-            self._g2v2_inter, self._g2v2_hidden, s_fx, BM=stage2.block_m,
-            SBM=config.stage1.sort_block_m, BN=stage2.block_n, BK=stage2.block_k,
-            use_nt=stage2.use_nt, g2_bhoist=stage2.b_hoist,
-            g2_ascale_pf=stage2.ascale_prefetch, g2_spart=stage2.spatial_partition,
-            persist=stage2.persist, persist_cu=stage2.persist_cu,
-            persist_strided=stage2.persist_strided, skew_cu=stage2.skew_cu,
-            g2_bf16_lds=stage2.bf16_lds, skip_pair_mask=int(skip_pair_mask),
+        self._fused_stage2_call(
+            self._g2_run,
+            config,
+            s_fx,
             runtime_pair_skip=bool(runtime_pair_skip),
-            lds_reserve_bytes=int(lds_reserve_bytes),
-            skip_pair_compact_work=bool(skip_pair_compact_work),
-            skip_pair_tiles_per_cu=int(skip_pair_tiles_per_cu),
             scatter_vec=int(scatter_vec),
-            **invariants)
-        # fmt: on
+        )
         self._g2_active_block_m = stage2.block_m
         if not combine:
             return None
@@ -1138,325 +944,46 @@ class MegaMoEV2:
             stage2_p2p_quant=p2p_quant,
         )
 
-    def _run_aligned_pair_stage2(
-        self,
-        config: MegaMoEConfig,
-        stream=None,
-        *,
-        pair_cu: int = 112,
-        pair_bm: int = 64,
-        pair_bn: int = 0,
-        pair_first_bf16: bool = False,
-        pair_no_scatter: bool = False,
-        pair_include_residual: bool = False,
-        pair_work_weight: int = 2,
-        pair_lds_reserve: int = 0,
-        pair_dual_accumulator: bool = False,
-        pair_parallel_experts: bool = False,
-        pair_scatter_vec: int = 8,
-        pair_m_swizzle: bool = False,
-    ):
-        """Run the isolated aligned-common-row Stage2 prototype."""
+    def _launch_aligned_pair_stage2(self, config: MegaMoEConfig, stream):
+        """Launch the production common-pair kernel on ``stream``."""
         if config.p2p_quant != "fp8_blockwise_1x32":
-            raise ValueError("aligned-pair Stage2 currently requires FP8 P2P output")
-        if not self._s1_fanout_masks and not self._s1_runtime_fanout:
-            raise ValueError("aligned-pair Stage2 requires Stage1 fanout masks")
-        pair_mask = (
-            0
-            if self._s1_runtime_fanout
-            else int(self._s1_fanout_masks[self.rank])
-        )
-        if not self._s1_runtime_fanout and pair_mask.bit_count() != 2:
-            raise ValueError("aligned-pair Stage2 currently requires one expert pair per rank")
-        if stream is None:
-            stream = torch.cuda.current_stream()
-        stage2 = config.stage2
-        invariants = self._g2_invariants_by_quant[config.p2p_quant]
-        workspace = self._s1_dispatch_workspace
-        op = self._s1_op
-        pair_use_nt = bool(
-            int(
-                os.environ.get(
-                    "MEGA_DEBUG_STAGE2_PAIR_USE_NT", int(stage2.use_nt)
-                )
-            )
-        )
-        pair_bhoist = bool(
-            int(
-                os.environ.get(
-                    "MEGA_DEBUG_STAGE2_PAIR_BHOIST", int(stage2.b_hoist)
-                )
-            )
-        )
-        pair_ascale_pf = bool(
-            int(
-                os.environ.get(
-                    "MEGA_DEBUG_STAGE2_PAIR_ASCALE_PF",
-                    int(stage2.ascale_prefetch),
-                )
-            )
-        )
-        self._g2_pair_run(
-            fx.Int64(self._s1_out.view(-1).data_ptr()),
-            fx.Int64(self._s1_osd.data_ptr()),
-            fx.Int64(self.w2.data_ptr()),
-            fx.Int64(self.w2_scale.data_ptr()),
-            fx.Int64(op.srcmap_em.data_ptr()),
-            fx.Int64(op.wts_em.data_ptr()),
-            fx.Int64(op.sorted_expert_ids.data_ptr()),
-            fx.Int64(op.num_valid.data_ptr()),
-            fx.Int64(op.tile_row_base.data_ptr()),
-            fx.Int64(workspace["expert_tile_end"].data_ptr()),
-            fx.Int64(workspace["bigcnt"].data_ptr()),
-            fx.Int64(workspace["fanout_pair_config"].data_ptr()),
-            fx.Int64(self._s1_epoch_parity.data_ptr()),
-            self.comb_op._fx_p2p_comb_inp,
-            self._s1_nvm,
-            self._g2v2_inter,
-            self._g2v2_hidden,
+            raise ValueError("aligned-pair Stage2 requires FP8 P2P output")
+        self._aligned_pair_stage2_call(
+            self._g2_pair_run,
+            config,
             fx.Stream(stream.cuda_stream),
-            model_dim=int(invariants["model_dim"]),
-            inter_dim=int(invariants["inter_dim"]),
-            experts=int(invariants["experts"]),
-            topk=int(invariants["topk"]),
-            rank=int(invariants["rank"]),
-            npes=int(invariants["npes"]),
-            max_tok=int(invariants["max_tok"]),
-            recv_cap=int(invariants["recv_cap"]),
-            comb_inp_nbytes=int(invariants["comb_inp_nbytes"]),
-            pair_mask=pair_mask,
-            runtime_pair=self._s1_runtime_fanout,
-            BM=int(pair_bm),
-            SBM=config.stage1.sort_block_m,
-            BN=int(pair_bn or stage2.block_n),
-            BK=stage2.block_k,
-            INTER_MAX=int(invariants["INTER_MAX"]),
-            use_nt=pair_use_nt,
-            cu_num=int(pair_cu),
-            g2_bhoist=pair_bhoist,
-            g2_ascale_pf=pair_ascale_pf,
-            first_bf16=bool(pair_first_bf16),
-            diagnostic_no_scatter=bool(pair_no_scatter),
-            include_residual=bool(pair_include_residual),
-            pair_work_weight=int(pair_work_weight),
-            lds_reserve_bytes=int(pair_lds_reserve),
-            dual_accumulator=bool(pair_dual_accumulator),
-            parallel_experts=bool(pair_parallel_experts),
-            scatter_vec=int(pair_scatter_vec),
-            m_swizzle=bool(pair_m_swizzle),
         )
 
-    def _run_aligned_pair_stage2_candidate(
+    def _run_aligned_pair_stage2(
         self,
         run_tokens: int,
         config: MegaMoEConfig,
-        stream=None,
-        *,
-        pair_cu: int = 256,
-        pair_bm: int = 32,
-        pair_bn: int = 0,
-        pair_first_bf16: bool = False,
-        pair_no_scatter: bool = False,
-        parallel: bool = False,
-        unified: bool = False,
-        pair_work_weight: int = 2,
-        co_resident: bool = False,
-        pair_dual_accumulator: bool = False,
-        pair_parallel_experts: bool = False,
-        residual_compact_work: bool = False,
-        residual_tiles_per_cu: int = 0,
-        residual_block_m: int = 0,
-        residual_persist_cu: int = 0,
-        scatter_vec: int = 8,
-        pair_first_submit: bool = False,
-        pair_main_first: bool = False,
-        pair_m_swizzle: bool = False,
-        slice_output: bool = True,
+        stream,
+        slice_output: bool,
     ):
-        """Run direct-skip plus aligned pair fusion, then the normal combine."""
-        pair_mask = (
-            0
-            if self._s1_runtime_fanout
-            else int(self._s1_fanout_masks[self.rank])
-        )
+        """Overlap the common-pair kernel with the residual Stage2 kernel."""
         main_stream = torch.cuda.current_stream() if stream is None else stream
-        if unified:
-            self._run_aligned_pair_stage2(
-                config,
-                main_stream,
-                pair_cu=pair_cu,
-                pair_bm=pair_bm,
-                pair_bn=pair_bn,
-                pair_first_bf16=pair_first_bf16,
-                pair_no_scatter=pair_no_scatter,
-                pair_include_residual=True,
-                pair_work_weight=pair_work_weight,
-                pair_dual_accumulator=pair_dual_accumulator,
-                pair_parallel_experts=pair_parallel_experts,
-                pair_scatter_vec=scatter_vec,
-            )
-        else:
-            residual_config = config
-            if residual_block_m or residual_persist_cu:
-                residual_stage2 = config.stage2
-                if residual_block_m:
-                    residual_stage2 = replace(
-                        residual_stage2, block_m=int(residual_block_m)
-                    )
-                if residual_persist_cu:
-                    residual_stage2 = replace(
-                        residual_stage2,
-                        persist_cu=int(residual_persist_cu),
-                        skew_cu=int(residual_persist_cu),
-                    )
-                residual_config = replace(
-                    config,
-                    stage2=residual_stage2,
-                )
-            pair_main_first = parallel and pair_main_first
-            masked_residual = (
-                parallel
-                and not pair_main_first
-                and self._g2_residual_stream is not None
-            )
-            if pair_main_first:
-                self._g2_residual_start.record(main_stream)
-                self._g2_residual_aux_stream.wait_event(self._g2_residual_start)
-                self._run_aligned_pair_stage2(
-                    config,
-                    main_stream,
-                    pair_cu=pair_cu,
-                    pair_bm=pair_bm,
-                    pair_bn=pair_bn,
-                    pair_first_bf16=pair_first_bf16,
-                    pair_no_scatter=pair_no_scatter,
-                    pair_dual_accumulator=pair_dual_accumulator,
-                    pair_parallel_experts=pair_parallel_experts,
-                    pair_scatter_vec=scatter_vec,
-                    pair_m_swizzle=pair_m_swizzle,
-                )
-                self._run_fused_stage2(
-                    run_tokens,
-                    residual_config,
-                    self._g2_residual_aux_stream,
-                    skip_pair_mask=pair_mask,
-                    runtime_pair_skip=self._s1_runtime_fanout,
-                    combine=False,
-                    lds_reserve_bytes=94 * 1024 if co_resident else 0,
-                    skip_pair_compact_work=residual_compact_work,
-                    skip_pair_tiles_per_cu=residual_tiles_per_cu,
-                    scatter_vec=scatter_vec,
-                )
-                self._g2_residual_done.record(self._g2_residual_aux_stream)
-                main_stream.wait_event(self._g2_residual_done)
-            elif masked_residual:
-                self._g2_residual_start.record(main_stream)
-                self._g2_residual_stream.wait_event(self._g2_residual_start)
-                self._run_fused_stage2(
-                    run_tokens,
-                    residual_config,
-                    self._g2_residual_stream,
-                    skip_pair_mask=pair_mask,
-                    runtime_pair_skip=self._s1_runtime_fanout,
-                    combine=False,
-                    lds_reserve_bytes=94 * 1024 if co_resident else 0,
-                    skip_pair_compact_work=residual_compact_work,
-                    skip_pair_tiles_per_cu=residual_tiles_per_cu,
-                    scatter_vec=scatter_vec,
-                )
-                self._g2_residual_done.record(self._g2_residual_stream)
-                self._run_aligned_pair_stage2(
-                    config,
-                    main_stream,
-                    pair_cu=pair_cu,
-                    pair_bm=pair_bm,
-                    pair_bn=pair_bn,
-                    pair_first_bf16=pair_first_bf16,
-                    pair_no_scatter=pair_no_scatter,
-                    pair_dual_accumulator=pair_dual_accumulator,
-                    pair_parallel_experts=pair_parallel_experts,
-                    pair_scatter_vec=scatter_vec,
-                    pair_m_swizzle=pair_m_swizzle,
-                )
-                main_stream.wait_event(self._g2_residual_done)
-            elif parallel:
-                self._g2_pair_start.record(main_stream)
-            if (
-                parallel
-                and not pair_main_first
-                and not masked_residual
-                and pair_first_submit
-            ):
-                self._g2_pair_stream.wait_event(self._g2_pair_start)
-                self._run_aligned_pair_stage2(
-                    config,
-                    self._g2_pair_stream,
-                    pair_cu=pair_cu,
-                    pair_bm=pair_bm,
-                    pair_bn=pair_bn,
-                    pair_first_bf16=pair_first_bf16,
-                    pair_no_scatter=pair_no_scatter,
-                    pair_dual_accumulator=pair_dual_accumulator,
-                    pair_parallel_experts=pair_parallel_experts,
-                    pair_scatter_vec=scatter_vec,
-                    pair_m_swizzle=pair_m_swizzle,
-                )
-                self._g2_pair_done.record(self._g2_pair_stream)
-            if not pair_main_first and not masked_residual:
-                self._run_fused_stage2(
-                    run_tokens,
-                    residual_config,
-                    main_stream,
-                    skip_pair_mask=pair_mask,
-                    runtime_pair_skip=self._s1_runtime_fanout,
-                    combine=False,
-                    lds_reserve_bytes=94 * 1024 if co_resident else 0,
-                    skip_pair_compact_work=residual_compact_work,
-                    skip_pair_tiles_per_cu=residual_tiles_per_cu,
-                    scatter_vec=scatter_vec,
-                )
-            if (
-                parallel
-                and not pair_main_first
-                and not masked_residual
-                and not pair_first_submit
-            ):
-                self._g2_pair_stream.wait_event(self._g2_pair_start)
-                self._run_aligned_pair_stage2(
-                    config,
-                    self._g2_pair_stream,
-                    pair_cu=pair_cu,
-                    pair_bm=pair_bm,
-                    pair_bn=pair_bn,
-                    pair_first_bf16=pair_first_bf16,
-                    pair_no_scatter=pair_no_scatter,
-                    pair_lds_reserve=(
-                        0 if pair_dual_accumulator else 95 * 1024
-                    )
-                    if co_resident
-                    else 0,
-                    pair_dual_accumulator=pair_dual_accumulator,
-                    pair_parallel_experts=pair_parallel_experts,
-                    pair_scatter_vec=scatter_vec,
-                    pair_m_swizzle=pair_m_swizzle,
-                )
-                self._g2_pair_done.record(self._g2_pair_stream)
-            if parallel and not pair_main_first and not masked_residual:
-                main_stream.wait_event(self._g2_pair_done)
-            elif not parallel:
-                self._run_aligned_pair_stage2(
-                    config,
-                    main_stream,
-                    pair_cu=pair_cu,
-                    pair_bm=pair_bm,
-                    pair_bn=pair_bn,
-                    pair_first_bf16=pair_first_bf16,
-                    pair_no_scatter=pair_no_scatter,
-                    pair_dual_accumulator=pair_dual_accumulator,
-                    pair_parallel_experts=pair_parallel_experts,
-                    pair_scatter_vec=scatter_vec,
-                )
-        ret = self.comb_op.combine_no_stage1(
+        residual_stage2 = replace(
+            config.stage2,
+            skew_cu=config.stage2.persist_cu,
+        )
+        residual_config = replace(config, stage2=residual_stage2)
+
+        self._g2_residual_start.record(main_stream)
+        self._g2_residual_stream.wait_event(self._g2_residual_start)
+        self._launch_aligned_pair_stage2(config, main_stream)
+        self._run_fused_stage2(
+            run_tokens,
+            residual_config,
+            self._g2_residual_stream,
+            runtime_pair_skip=True,
+            combine=False,
+            scatter_vec=ALIGNED_PAIR_SCATTER_VEC,
+        )
+        self._g2_residual_done.record(self._g2_residual_stream)
+        main_stream.wait_event(self._g2_residual_done)
+
+        result = self.comb_op.combine_no_stage1(
             self._g2_combine_placeholder,
             None,
             None,
@@ -1464,14 +991,4 @@ class MegaMoEV2:
             enable_weights=False,
             stage2_p2p_quant=config.p2p_quant,
         )
-        out_tok = ret[0] if isinstance(ret, (tuple, list)) else ret
-        if out_tok is None:
-            cfg = self.comb_cfg
-            out_tok = (
-                self.comb_op.shmem_comb_out_tok.view(torch.int8)[
-                    : self.mtpr * cfg.combine_token_bytes
-                ]
-                .view(cfg.combine_dtype)
-                .view(self.mtpr, cfg.combine_token_view_dim)
-            )
-        return out_tok[:run_tokens] if slice_output else out_tok
+        return self._stage2_output(result, run_tokens, slice_output)

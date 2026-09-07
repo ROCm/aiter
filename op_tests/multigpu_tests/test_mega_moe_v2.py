@@ -410,10 +410,6 @@ def _install_config_policy(moe, config_tokens, unify_fields):
                     p2p_quant = reference.p2p_quant
                 else:
                     raise ValueError(f"invalid config field {field!r}")
-            coupled_stage1 = {"payload_tile_ready"}
-            if coupled_stage1 & stage1_updates.keys():
-                for name in coupled_stage1:
-                    stage1_updates.setdefault(name, getattr(reference.stage1, name))
             config = replace(
                 local,
                 stage1=replace(local.stage1, **stage1_updates),

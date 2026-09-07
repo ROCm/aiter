@@ -131,7 +131,9 @@ def _compile_stage1(
     seen_prepare = set()
     for entry in plan.entries:
         config = entry.config.stage1
-        prepare_blocks = max(1, min(config.prepare_cu, (entry.token_bucket + 63) // 64))
+        prepare_blocks = max(
+            1, min(config.num_dispatch_cu, (entry.token_bucket + 63) // 64)
+        )
         quant_groups = entry.token_bucket * scale_dim
         quant_blocks = min(
             NUM_CU,
@@ -145,7 +147,6 @@ def _compile_stage1(
                 prepare_blocks,
                 num_quant_cu,
                 config.payload_chunk_rows,
-                config.payload_tile_ready,
             )
             if identity in seen_prepare:
                 continue
@@ -172,11 +173,7 @@ def _compile_stage1(
                 quant_cu_capacity=NUM_CU,
                 model_dim=model_dim,
                 payload_chunk_rows=config.payload_chunk_rows,
-                payload_tile_ready=config.payload_tile_ready,
                 tile_state_stride=tile_state_stride,
-                fanout_masks=(),
-                runtime_fanout=True,
-                dynamic_fanout=True,
             )
 
     # The production E2E path quantizes inside prepare.  Keep the public
@@ -247,6 +244,7 @@ def _compile_stage2(
         preload_mega_moe_stage2,
     )
     from aiter.ops.flydsl.kernels.mega_moe.mega_moe_stage2_aligned_pair import (
+        ALIGNED_PAIR_SCATTER_VEC,
         preload_mega_moe_stage2_aligned_pair,
     )
 
@@ -278,7 +276,7 @@ def _compile_stage2(
             "INTER_MAX": inter_dim,
             "cu_num": NUM_CU,
             "p2p_quant_type": key.p2p_quant,
-            "fixed_slot_dispatch": key.fixed_slot_dispatch,
+            "fixed_slot_dispatch": plan.fixed_slot_dispatch,
         }
         residual = (
             replace(stage2, skew_cu=stage2.persist_cu)
@@ -305,13 +303,13 @@ def _compile_stage2(
             skew_cu=residual.skew_cu,
             g2_bf16_lds=residual.bf16_lds,
             runtime_pair_skip=stage2.aligned_pair,
-            scatter_vec=stage2.pair_scatter_vec if stage2.aligned_pair else 8,
+            scatter_vec=ALIGNED_PAIR_SCATTER_VEC if stage2.aligned_pair else 8,
             **common,
         )
         if not stage2.aligned_pair:
             continue
         preload_mega_moe_stage2_aligned_pair(
-            *([fx.Int64(0)] * 14),
+            *([fx.Int64(0)] * 11),
             num_valid_max,
             fx.Int32(inter_dim),
             fx.Int32(model_dim),
@@ -325,8 +323,6 @@ def _compile_stage2(
             max_tok=mtpr,
             recv_cap=world_size * mtpr,
             comb_inp_nbytes=mtpr * topk * row_bytes,
-            pair_mask=0,
-            runtime_pair=True,
             BM=stage2.pair_block_m,
             SBM=key.sbm,
             BN=stage2.pair_block_n,
@@ -336,10 +332,6 @@ def _compile_stage2(
             cu_num=stage2.pair_cu,
             g2_bhoist=stage2.b_hoist,
             g2_ascale_pf=stage2.ascale_prefetch,
-            pair_work_weight=stage2.pair_work_weight,
-            dual_accumulator=True,
-            scatter_vec=stage2.pair_scatter_vec,
-            m_swizzle=True,
         )
 
     # Stage2's production bundle includes the terminal fused combine kernels.

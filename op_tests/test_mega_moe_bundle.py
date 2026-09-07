@@ -85,11 +85,11 @@ def test_aligned_pair_stage2_forwards_slice_output(monkeypatch, slice_output):
     marker = object()
     observed = []
 
-    def fake_candidate(_self, _run_tokens, _config, _stream, **kwargs):
-        observed.append(kwargs["slice_output"])
+    def fake_aligned(_self, _run_tokens, _config, _stream, forwarded_slice_output):
+        observed.append(forwarded_slice_output)
         return marker
 
-    monkeypatch.setattr(MegaMoEV2, "_run_aligned_pair_stage2_candidate", fake_candidate)
+    monkeypatch.setattr(MegaMoEV2, "_run_aligned_pair_stage2", fake_aligned)
     moe = object.__new__(MegaMoEV2)
     config = select_mega_moe_config(8192, 8192)
     assert config.stage2.aligned_pair
@@ -129,7 +129,6 @@ def test_non_reference_expert_profiles_use_compact_small_mtpr(experts_per_rank):
     )
 
     assert not plan.fixed_slot_dispatch
-    assert all(not key.fixed_slot_dispatch for key in plan.stage2_variants)
 
 
 @pytest.mark.parametrize("old_value", [None, "0"])
@@ -158,7 +157,6 @@ def test_mtpr8192_bundle_deduplicates_expected_variants():
     assert len(plan.entries) == 13
     assert len(plan.stage1_variants) == 8
     assert len(plan.stage2_variants) == 6
-    assert [entry.pair_id for entry in plan.entries] == list(range(13))
 
 
 def test_aot_jobs_cover_all_large_mtpr_profiles_ranks_and_stages():
@@ -243,7 +241,7 @@ def test_role_retirement_is_not_a_configurable_stage1_variant():
             continue
         stage1 = plan.entry_for_tokens(bucket).config.stage1
         assert not hasattr(stage1, "retire_control_ctas")
-        assert stage1.payload_tile_ready
+        assert stage1.payload_chunk_rows > 0
 
 
 @pytest.mark.parametrize("mtpr", [8192, 16384, 32768])
@@ -263,10 +261,7 @@ def test_every_deployment_bucket_maps_to_its_exact_production_pair(
             plan.stage1_variants[entry.stage1_variant_id]
         ) == stage1_bundle_identity(expected.stage1)
         assert plan.stage2_variants[entry.stage2_variant_id] == Stage2BundleKey(
-            expected.stage2,
-            expected.stage1.sort_block_m,
-            expected.p2p_quant,
-            False,
+            expected.stage2, expected.stage1.sort_block_m, expected.p2p_quant
         )
 
 
@@ -301,8 +296,8 @@ def test_stage2_bundle_identity_includes_stage1_sbm():
         use_nt=False,
     )
 
-    key64 = Stage2BundleKey(config, 64, "fp8_blockwise_1x32", False)
-    key128 = Stage2BundleKey(config, 128, "fp8_blockwise_1x32", False)
+    key64 = Stage2BundleKey(config, 64, "fp8_blockwise_1x32")
+    key128 = Stage2BundleKey(config, 128, "fp8_blockwise_1x32")
     assert key64 != key128
 
 
@@ -316,21 +311,19 @@ def test_stage2_bundle_rejects_incompatible_sbm():
     )
 
     with pytest.raises(ValueError, match="must divide bundle SBM"):
-        Stage2BundleKey(config, 32, "fp8_blockwise_1x32", False)
+        Stage2BundleKey(config, 32, "fp8_blockwise_1x32")
 
 
 def test_small_mtpr_bundle_keeps_stage1_and_stage2_in_fixed_slot_mode():
     plan = build_mega_moe_bundle_plan(128)
 
     assert plan.fixed_slot_dispatch
-    assert all(key.fixed_slot_dispatch for key in plan.stage2_variants)
 
 
 def test_large_mtpr_bundle_keeps_stage1_and_stage2_in_compact_mode():
     plan = build_mega_moe_bundle_plan(8192)
 
     assert not plan.fixed_slot_dispatch
-    assert all(not key.fixed_slot_dispatch for key in plan.stage2_variants)
 
 
 def test_empty_rank_uses_smallest_collective_bundle_entry():

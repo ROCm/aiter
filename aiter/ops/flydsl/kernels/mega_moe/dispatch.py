@@ -31,48 +31,44 @@ class DispatchSlot(IntEnum):
     COUNT_DONE = 12
     P2P_COUNT_DONE = 13
     TASK_ROW_BASE = 14
-    LOCAL_CURSOR = 15
-    P2P_PAYLOAD_READY = 16
-    PAIR_ORDER = 17
-    P2P_TASK_ROW_BASE = 18
-    P2P_PLAN_READY = 19
-    PLAN_READY = 20
-    PAIR_READY = 21
-    ENTRY_COUNT = 22
-    EPOCH_GATE = 23
-    PAIR_ORDER_READY = 24
-    WORK_HEAD = 25
-    WORK_TAIL = 26
-    EXPERT_TILE_END = 27
-    GROUP_DONE = 28
-    RUNNING = 29
-    P2P_RUNNING = 30
-    LAUNCH_READY = 31
-    P2P_LAUNCH_READY = 32
-    MAX_EXPERT_TILES = 33
-    PAYLOAD_CHUNK_DONE = 34
-    TILE_READY = 35
-    P2P_TILE_READY = 36
-    TILE_EXPECTED = 37
-    PAYLOAD_READY_ROWS = 39
-    P2P_PAYLOAD_READY_ROWS = 40
-    PAYLOAD_BLOCKS_PER_DESTINATION = 41
-    PAYLOAD_CHUNKS_PER_DESTINATION = 42
-    TILE_INPUT_BASE = 48
-    GROUP_TASK_BASE = 49
-    P2P_GROUP_TASK_BASE = 50
-    ROUTE_SEGMENT = 51
-    PREP_ENTRY_COUNT = 52
-    PREP_EPOCH_GATE = 53
-    READY_TILE_QUEUE = 54
-    P2P_READY_TILE_QUEUE = 55
-    READY_TILE_EPOCH = 56
-    P2P_READY_TILE_EPOCH = 57
-    READY_TILE_TAIL = 58
-    P2P_READY_TILE_TAIL = 59
-    P2P_TILE_EXPECTED = 60
-    FANOUT_PAIR_CONFIG = 61
-    BLOCK_HIST = 62
+    PAIR_ORDER = 15
+    P2P_PLAN_READY = 16
+    PLAN_READY = 17
+    PAIR_READY = 18
+    ENTRY_COUNT = 19
+    EPOCH_GATE = 20
+    PAIR_ORDER_READY = 21
+    WORK_HEAD = 22
+    WORK_TAIL = 23
+    EXPERT_TILE_END = 24
+    GROUP_DONE = 25
+    RUNNING = 26
+    P2P_RUNNING = 27
+    LAUNCH_READY = 28
+    P2P_LAUNCH_READY = 29
+    MAX_EXPERT_TILES = 30
+    PAYLOAD_CHUNK_DONE = 31
+    TILE_READY = 32
+    P2P_TILE_READY = 33
+    TILE_EXPECTED = 34
+    PAYLOAD_READY_ROWS = 35
+    P2P_PAYLOAD_READY_ROWS = 36
+    PAYLOAD_BLOCKS_PER_DESTINATION = 37
+    PAYLOAD_CHUNKS_PER_DESTINATION = 38
+    TILE_INPUT_BASE = 39
+    GROUP_TASK_BASE = 40
+    ROUTE_SEGMENT = 41
+    PREP_ENTRY_COUNT = 42
+    PREP_EPOCH_GATE = 43
+    READY_TILE_QUEUE = 44
+    P2P_READY_TILE_QUEUE = 45
+    READY_TILE_EPOCH = 46
+    P2P_READY_TILE_EPOCH = 47
+    READY_TILE_TAIL = 48
+    P2P_READY_TILE_TAIL = 49
+    P2P_TILE_EXPECTED = 50
+    FANOUT_PAIR_CONFIG = 51
+    BLOCK_HIST = 52
 
 
 DISPATCH_TABLE_SIZE = max(DispatchSlot) + 1
@@ -85,8 +81,6 @@ def _load_fanout_pair(
     parity,
     *,
     npes,
-    fanout_masks,
-    runtime_fanout,
 ):
     """Return the selected expert pair for one destination.
 
@@ -96,49 +90,20 @@ def _load_fanout_pair(
     the pair as ids instead of an i64 bitmap so a destination may own more than
     64 experts (Kimi-K3 EP8 owns 112).
     """
-    selected_mask = fx.Int64(0)
-    pair_a = fx.Int32(0)
-    pair_b = fx.Int32(0)
-    enabled = fx.Int32(0) != fx.Int32(0)
-    canonical = fx.Int32(0)
-    if const_expr(runtime_fanout):
-        packed = comm_ops.load_i32_system(
-            addr_pair_config,
-            parity * fx.Int32(npes) + destination,
-        )
-        # ``packed`` controls route classification, destination offsets, and
-        # the producer task mapping.  Keep the runtime-table VMEM dependency
-        # explicit before those values cross lane/control-flow boundaries.
-        fx.rocdl.s_waitcnt(0)
-        enabled = (packed & fx.Int32(1 << 16)) != fx.Int32(0)
-        pair_a = packed & fx.Int32(0xFF)
-        pair_b = (packed >> fx.Int32(8)) & fx.Int32(0xFF)
-        pair_mask = (fx.Int64(1) << fx.Int64(pair_a)) | (
-            fx.Int64(1) << fx.Int64(pair_b)
-        )
-        selected_mask = enabled.select(pair_mask, fx.Int64(0))
-        canonical = enabled.select(pair_a, fx.Int32(0))
-    else:
-        for peer in range_constexpr(len(fanout_masks)):
-            mask = int(fanout_masks[peer])
-            if mask:
-                assert mask.bit_count() == 2, "fanout masks must describe pairs"
-                local_a = (mask & -mask).bit_length() - 1
-                local_b = (mask ^ (1 << local_a)).bit_length() - 1
-                selected_destination = destination == fx.Int32(peer)
-                # The legacy bitmap is consumed only by <=64-EPR artifacts.
-                # Keep its signed i64 spelling identical there; wider shapes
-                # use the pair ids returned alongside it.
-                mask_low = mask & ((1 << 64) - 1)
-                if mask_low >= 1 << 63:
-                    mask_low -= 1 << 64
-                selected_mask = selected_destination.select(
-                    fx.Int64(mask_low), selected_mask
-                )
-                pair_a = selected_destination.select(fx.Int32(local_a), pair_a)
-                pair_b = selected_destination.select(fx.Int32(local_b), pair_b)
-                enabled = selected_destination | enabled
-                canonical = selected_destination.select(fx.Int32(local_a), canonical)
+    packed = comm_ops.load_i32_system(
+        addr_pair_config,
+        parity * fx.Int32(npes) + destination,
+    )
+    # ``packed`` controls route classification, destination offsets, and the
+    # producer task mapping. Keep the VMEM dependency explicit before those
+    # values cross lane/control-flow boundaries.
+    fx.rocdl.s_waitcnt(0)
+    enabled = (packed & fx.Int32(1 << 16)) != fx.Int32(0)
+    pair_a = packed & fx.Int32(0xFF)
+    pair_b = (packed >> fx.Int32(8)) & fx.Int32(0xFF)
+    pair_mask = (fx.Int64(1) << fx.Int64(pair_a)) | (fx.Int64(1) << fx.Int64(pair_b))
+    selected_mask = enabled.select(pair_mask, fx.Int64(0))
+    canonical = enabled.select(pair_a, fx.Int32(0))
     return selected_mask, pair_a, pair_b, enabled, canonical
 
 
@@ -188,8 +153,6 @@ def _classify_fanout_wave_route(
     fz_epr,
     fz_total_experts,
     fz_npes,
-    fanout_masks,
-    runtime_fanout,
 ):
     """Classify one route after a wave has loaded grouped top-k routes.
 
@@ -205,8 +168,6 @@ def _classify_fanout_wave_route(
         destination,
         parity,
         npes=fz_npes,
-        fanout_masks=fanout_masks,
-        runtime_fanout=runtime_fanout,
     )
 
     assert 0 < fz_k <= 16, "wave-grouped fanout classification supports topk <= 16"
@@ -292,7 +253,6 @@ def _configure_payload_geometry(
     fz_npes,
     fz_epr,
     fz_total_experts,
-    fanout_enabled,
     payload_chunk_rows,
     dispatch_blocks,
 ):
@@ -312,19 +272,18 @@ def _configure_payload_geometry(
                 source_count, max_source_count
             )
         max_source_count = _wave_reduce_max_i32(max_source_count, lane)
-        if const_expr(fanout_enabled):
-            group_count = fx.Int32(0)
-            if lane == fx.Int32(0):
-                group_count = buffer_ops.buffer_load(
-                    local_hist,
-                    fx.Int32(fz_total_experts + destination),
-                    vec_width=1,
-                    dtype=fx.Int32,
-                )
-            group_count = fx.Int32(fx.rocdl.readfirstlane(T.i32, group_count))
-            max_source_count = (group_count > max_source_count).select(
-                group_count, max_source_count
+        group_count = fx.Int32(0)
+        if lane == fx.Int32(0):
+            group_count = buffer_ops.buffer_load(
+                local_hist,
+                fx.Int32(fz_total_experts + destination),
+                vec_width=1,
+                dtype=fx.Int32,
             )
+        group_count = fx.Int32(fx.rocdl.readfirstlane(T.i32, group_count))
+        max_source_count = (group_count > max_source_count).select(
+            group_count, max_source_count
+        )
         if lane == fx.Int32(0):
             chunks = (max_source_count + fx.Int32(payload_chunk_rows - 1)) // fx.Int32(
                 payload_chunk_rows
@@ -464,7 +423,6 @@ def _publish_tile_range(
     payload_epoch,
     parity,
     *,
-    ready_tile_queue,
     tile_state_stride,
 ):
     if row_end > row_begin:
@@ -475,23 +433,22 @@ def _publish_tile_range(
         )
         state_byte_offset = fx.Int64(parity) * fx.Int64(tile_state_stride) * fx.Int64(4)
         remote_tile_ready = remote_tile_ready + state_byte_offset
-        if const_expr(ready_tile_queue):
-            remote_tile_expected = buffer_ops.buffer_load(
-                crfa(p_tile_expected), destination, vec_width=1, dtype=fx.Int64
-            )
-            remote_queue = buffer_ops.buffer_load(
-                crfa(p_ready_tile_queue), destination, vec_width=1, dtype=fx.Int64
-            )
-            remote_queue_epoch = buffer_ops.buffer_load(
-                crfa(p_ready_tile_epoch), destination, vec_width=1, dtype=fx.Int64
-            )
-            remote_queue_tail = buffer_ops.buffer_load(
-                crfa(p_ready_tile_tail), destination, vec_width=1, dtype=fx.Int64
-            )
-            remote_tile_expected = remote_tile_expected + state_byte_offset
-            remote_queue = remote_queue + state_byte_offset
-            remote_queue_epoch = remote_queue_epoch + state_byte_offset
-            remote_queue_tail = remote_queue_tail + fx.Int64(parity) * fx.Int64(4)
+        remote_tile_expected = buffer_ops.buffer_load(
+            crfa(p_tile_expected), destination, vec_width=1, dtype=fx.Int64
+        )
+        remote_queue = buffer_ops.buffer_load(
+            crfa(p_ready_tile_queue), destination, vec_width=1, dtype=fx.Int64
+        )
+        remote_queue_epoch = buffer_ops.buffer_load(
+            crfa(p_ready_tile_epoch), destination, vec_width=1, dtype=fx.Int64
+        )
+        remote_queue_tail = buffer_ops.buffer_load(
+            crfa(p_ready_tile_tail), destination, vec_width=1, dtype=fx.Int64
+        )
+        remote_tile_expected = remote_tile_expected + state_byte_offset
+        remote_queue = remote_queue + state_byte_offset
+        remote_queue_epoch = remote_queue_epoch + state_byte_offset
+        remote_queue_tail = remote_queue_tail + fx.Int64(parity) * fx.Int64(4)
         first_tile = (destination_base + row_begin) // rows_per_tile
         last_tile = (destination_base + row_end - fx.Int32(1)) // rows_per_tile
         for tile in range(first_tile, last_tile + fx.Int32(1), 1):
@@ -500,24 +457,20 @@ def _publish_tile_range(
                     remote_tile_ready + fx.Int64(tile) * fx.Int64(4), fx.Int32(1)
                 )
             )
-            if const_expr(ready_tile_queue):
-                expected = buffer_ops.buffer_load(
-                    crfa(remote_tile_expected), tile, vec_width=1, dtype=fx.Int32
+            expected = buffer_ops.buffer_load(
+                crfa(remote_tile_expected), tile, vec_width=1, dtype=fx.Int32
+            )
+            if previous + fx.Int32(1) == expected:
+                # The final RMW observes the release sequence from all payload
+                # publishers before publishing the completion-order entry.
+                comm_ops.fence_system_acquire()
+                ready_slot = fx.Int32(
+                    comm_ops.atomic_add_system(remote_queue_tail, fx.Int32(1))
                 )
-                if previous + fx.Int32(1) == expected:
-                    # The final RMW observes the release sequence from all
-                    # payload publishers for this tile.  Acquire it before
-                    # publishing the completion-order queue entry.
-                    comm_ops.fence_system_acquire()
-                    ready_slot = fx.Int32(
-                        comm_ops.atomic_add_system(remote_queue_tail, fx.Int32(1))
-                    )
-                    buffer_ops.buffer_store(tile, crfa(remote_queue), ready_slot)
-                    fx.rocdl.s_waitcnt(0)
-                    comm_ops.fence_system_release()
-                    comm_ops.store_i32_system(
-                        remote_queue_epoch, ready_slot, payload_epoch
-                    )
+                buffer_ops.buffer_store(tile, crfa(remote_queue), ready_slot)
+                fx.rocdl.s_waitcnt(0)
+                comm_ops.fence_system_release()
+                comm_ops.store_i32_system(remote_queue_epoch, ready_slot, payload_epoch)
 
 
 # fmt: off
@@ -728,8 +681,6 @@ def _derive_allgather_offsets(
     epr,
     total_experts,
     total_segments,
-    fanout_masks,
-    runtime_fanout,
 ):
     """Derive this source's remote row offsets from the gathered histogram."""
     crfa = buffer_ops.create_buffer_resource_from_addr
@@ -745,7 +696,6 @@ def _derive_allgather_offsets(
     r_group_base = crfa(dp(DispatchSlot.GROUP_TASK_BASE))
     r_ready_rows_table = crfa(dp(DispatchSlot.P2P_PAYLOAD_READY_ROWS))
     addr_pair_config = dp(DispatchSlot.FANOUT_PAIR_CONFIG)
-    fanout_enabled = bool(fanout_masks) or runtime_fanout
     tid = fx.thread_idx.x
     warp = tid >> fx.Int32(6)
     lane = tid & fx.Int32(63)
@@ -774,41 +724,38 @@ def _derive_allgather_offsets(
             destination,
             parity,
             npes=npes,
-            fanout_masks=fanout_masks,
-            runtime_fanout=runtime_fanout,
         )
         destination_group_count = fx.Int32(0)
         destination_group_source_prefix = fx.Int32(0)
-        if const_expr(fanout_enabled):
-            destination_group_counts = []
-            for source in range_constexpr(npes):
-                destination_group_counts.append(
-                    buffer_ops.buffer_load(
-                        r_count,
-                        fx.Int32(source * total_segments + total_experts)
-                        + destination,
-                        vec_width=1,
-                        dtype=fx.Int32,
-                        mask=lane == fx.Int32(0),
-                        cache_modifier=2,
-                    )
+        destination_group_counts = []
+        for source in range_constexpr(npes):
+            destination_group_counts.append(
+                buffer_ops.buffer_load(
+                    r_count,
+                    fx.Int32(source * total_segments + total_experts)
+                    + destination,
+                    vec_width=1,
+                    dtype=fx.Int32,
+                    mask=lane == fx.Int32(0),
+                    cache_modifier=2,
                 )
-            fx.rocdl.s_waitcnt(0)
-            group_count_lane = fx.Int32(0)
-            group_source_prefix_lane = fx.Int32(0)
-            for source in range_constexpr(npes):
-                source_group_count = destination_group_counts[source]
-                if const_expr(source < rank):
-                    group_source_prefix_lane = (
-                        group_source_prefix_lane + source_group_count
-                    )
-                group_count_lane = group_count_lane + source_group_count
-            destination_group_count = fx.Int32(
-                fx.rocdl.readfirstlane(T.i32, group_count_lane)
             )
-            destination_group_source_prefix = fx.Int32(
-                fx.rocdl.readfirstlane(T.i32, group_source_prefix_lane)
-            )
+        fx.rocdl.s_waitcnt(0)
+        group_count_lane = fx.Int32(0)
+        group_source_prefix_lane = fx.Int32(0)
+        for source in range_constexpr(npes):
+            source_group_count = destination_group_counts[source]
+            if const_expr(source < rank):
+                group_source_prefix_lane = (
+                    group_source_prefix_lane + source_group_count
+                )
+            group_count_lane = group_count_lane + source_group_count
+        destination_group_count = fx.Int32(
+            fx.rocdl.readfirstlane(T.i32, group_count_lane)
+        )
+        destination_group_source_prefix = fx.Int32(
+            fx.rocdl.readfirstlane(T.i32, group_source_prefix_lane)
+        )
         row_carry = fx.Int32(0)
         for expert_chunk in range_constexpr((epr + 63) // 64):
             local_expert = fx.Int32(expert_chunk * 64) + lane
@@ -913,8 +860,6 @@ def _derive_next_fanout_pairs(
             fx.Int32(destination),
             parity,
             npes=npes,
-            fanout_masks=(),
-            runtime_fanout=True,
         )
         if const_expr(epr <= 64):
             valid_expert = lane < fx.Int32(epr)
@@ -1050,10 +995,7 @@ def _derive_next_fanout_pairs(
 def emit_dispatch_plan(
     *, num_waves, fz_npes, fz_epr, fz_k, fz_mtpr, fz_rank, fz_tile_m, fz_total_experts, addr_disp,
     i32_cur_tok, addr_in_idx, parity, expected,
-    dispatch_blocks, group_blocks, group_done_slot, group_phase_base, payload_chunk_rows=0, payload_tile_ready=False, fanout_masks=(),
-    tile_state_stride=0,
-    runtime_fanout=False,
-    dynamic_fanout=False,
+    dispatch_blocks, group_blocks, group_done_slot, group_phase_base, payload_chunk_rows, tile_state_stride,
 ):
 # fmt: on
     """Build a destination-owned compact plan in one producer-only CTA."""
@@ -1083,15 +1025,12 @@ def emit_dispatch_plan(
     a_max_expert_tiles = dp(DispatchSlot.MAX_EXPERT_TILES)
     a_tile_ready = dp(DispatchSlot.TILE_READY)
     a_tile_expected = dp(DispatchSlot.TILE_EXPECTED)
-    if const_expr(payload_tile_ready):
-        assert tile_state_stride > 0
-        tile_state_byte_offset = (
-            fx.Int64(parity)
-            * fx.Int64(tile_state_stride)
-            * fx.Int64(4)
-        )
-        a_tile_ready = a_tile_ready + tile_state_byte_offset
-        a_tile_expected = a_tile_expected + tile_state_byte_offset
+    assert payload_chunk_rows > 0 and tile_state_stride > 0
+    tile_state_byte_offset = (
+        fx.Int64(parity) * fx.Int64(tile_state_stride) * fx.Int64(4)
+    )
+    a_tile_ready = a_tile_ready + tile_state_byte_offset
+    a_tile_expected = a_tile_expected + tile_state_byte_offset
     a_payload_blocks_per_destination = dp(DispatchSlot.PAYLOAD_BLOCKS_PER_DESTINATION)
     a_payload_chunks_per_destination = dp(DispatchSlot.PAYLOAD_CHUNKS_PER_DESTINATION)
 
@@ -1102,8 +1041,7 @@ def emit_dispatch_plan(
 
     gtid = tid
     gnt = fx.Int32(block_threads)
-    fanout_enabled = bool(fanout_masks) or runtime_fanout
-    total_segments = fz_total_experts + (fz_npes if fanout_enabled else 0)
+    total_segments = fz_total_experts + fz_npes
     addr_pair_config = dp(DispatchSlot.FANOUT_PAIR_CONFIG)
     r_lh = crfa(a_lh)
     r_block_hist = crfa(a_block_hist)
@@ -1135,23 +1073,21 @@ def emit_dispatch_plan(
     fx.rocdl.s_waitcnt(0)
     fx.barrier()
 
-    if const_expr(payload_tile_ready):
-        if warp == fx.Int32(0):
-            _configure_payload_geometry(
-                a_lh,
-                a_payload_chunks_per_destination,
-                a_payload_blocks_per_destination,
-                lane,
-                fz_npes=fz_npes,
-                fz_epr=fz_epr,
-                fz_total_experts=fz_total_experts,
-                fanout_enabled=fanout_enabled,
-                payload_chunk_rows=payload_chunk_rows,
-                dispatch_blocks=dispatch_blocks,
-            )
-        fx.rocdl.s_waitcnt(0)
-        fx.barrier()
-        comm_ops.fence_agent_release()
+    if warp == fx.Int32(0):
+        _configure_payload_geometry(
+            a_lh,
+            a_payload_chunks_per_destination,
+            a_payload_blocks_per_destination,
+            lane,
+            fz_npes=fz_npes,
+            fz_epr=fz_epr,
+            fz_total_experts=fz_total_experts,
+            payload_chunk_rows=payload_chunk_rows,
+            dispatch_blocks=dispatch_blocks,
+        )
+    fx.rocdl.s_waitcnt(0)
+    fx.barrier()
+    comm_ops.fence_agent_release()
 
     # Exchange route counts once.  The full-histogram path makes the offset
     # calculation deterministic on every source and removes remote base
@@ -1188,17 +1124,16 @@ def emit_dispatch_plan(
             )
         comm_ops.fence_system_acquire()
 
-        if const_expr(runtime_fanout and dynamic_fanout):
-            _derive_next_fanout_pairs(
-                a_bc,
-                addr_pair_config,
-                parity,
-                lane,
-                npes=fz_npes,
-                epr=fz_epr,
-                total_experts=fz_total_experts,
-                total_segments=total_segments,
-            )
+        _derive_next_fanout_pairs(
+            a_bc,
+            addr_pair_config,
+            parity,
+            lane,
+            npes=fz_npes,
+            epr=fz_epr,
+            total_experts=fz_total_experts,
+            total_segments=total_segments,
+        )
 
         r_nv = crfa(a_nv)
         row_carry = fx.Int32(0)
@@ -1214,8 +1149,6 @@ def emit_dispatch_plan(
             fx.Int32(fz_rank),
             parity,
             npes=fz_npes,
-            fanout_masks=fanout_masks,
-            runtime_fanout=runtime_fanout,
         )
         pair_a_group_base = fx.Int32(0)
         pair_b_group_base = fx.Int32(0)
@@ -1229,20 +1162,18 @@ def emit_dispatch_plan(
             normal_count = fx.Int32(0)
             group_source_counts = []
             group_count = fx.Int32(0)
-            group_member = fx.Int32(0) == fx.Int32(1)
-            if const_expr(fanout_enabled):
-                if const_expr(fz_epr <= 64):
-                    group_member = valid_expert & (
-                        (
-                            (local_fanout_mask >> fx.Int64(safe_expert))
-                            & fx.Int64(1)
-                        )
-                        != fx.Int64(0)
+            if const_expr(fz_epr <= 64):
+                group_member = valid_expert & (
+                    (
+                        (local_fanout_mask >> fx.Int64(safe_expert))
+                        & fx.Int64(1)
                     )
-                else:
-                    group_member = valid_expert & pair_enabled & (
-                        (safe_expert == pair_a) | (safe_expert == pair_b)
-                    )
+                    != fx.Int64(0)
+                )
+            else:
+                group_member = valid_expert & pair_enabled & (
+                    (safe_expert == pair_a) | (safe_expert == pair_b)
+                )
             for source in range_constexpr(fz_npes):
                 source_count = buffer_ops.buffer_load(
                     r_bc,
@@ -1254,19 +1185,16 @@ def emit_dispatch_plan(
                 source_count = valid_expert.select(source_count, fx.Int32(0))
                 normal_source_counts.append(source_count)
                 normal_count = normal_count + source_count
-                if const_expr(fanout_enabled):
-                    source_group_count = buffer_ops.buffer_load(
-                        r_bc,
-                        fx.Int32(source * count_stride + fz_total_experts + fz_rank),
-                        vec_width=1,
-                        dtype=fx.Int32,
-                        cache_modifier=2,
-                    )
-                    source_group_count = group_member.select(
-                        source_group_count, fx.Int32(0)
-                    )
-                else:
-                    source_group_count = fx.Int32(0)
+                source_group_count = buffer_ops.buffer_load(
+                    r_bc,
+                    fx.Int32(source * count_stride + fz_total_experts + fz_rank),
+                    vec_width=1,
+                    dtype=fx.Int32,
+                    cache_modifier=2,
+                )
+                source_group_count = group_member.select(
+                    source_group_count, fx.Int32(0)
+                )
                 group_source_counts.append(source_group_count)
                 group_count = group_count + source_group_count
 
@@ -1314,32 +1242,31 @@ def emit_dispatch_plan(
                 )
 
             if valid_expert:
-                if const_expr(payload_tile_ready):
-                    if group_member:
-                        _initialize_section_ready(
-                            a_tile_ready,
-                            a_tile_expected,
-                            r_bc,
-                            fx.Int32(fz_total_experts + fz_rank),
-                            group_row_base,
-                            group_num_tiles,
-                            fz_npes=fz_npes,
-                            count_stride=count_stride,
-                            payload_chunk_rows=payload_chunk_rows,
-                            fz_tile_m=fz_tile_m,
-                        )
+                if group_member:
                     _initialize_section_ready(
                         a_tile_ready,
                         a_tile_expected,
                         r_bc,
-                        safe_ge,
-                        normal_row_base,
-                        normal_num_tiles,
+                        fx.Int32(fz_total_experts + fz_rank),
+                        group_row_base,
+                        group_num_tiles,
                         fz_npes=fz_npes,
                         count_stride=count_stride,
                         payload_chunk_rows=payload_chunk_rows,
                         fz_tile_m=fz_tile_m,
                     )
+                _initialize_section_ready(
+                    a_tile_ready,
+                    a_tile_expected,
+                    r_bc,
+                    safe_ge,
+                    normal_row_base,
+                    normal_num_tiles,
+                    fz_npes=fz_npes,
+                    count_stride=count_stride,
+                    payload_chunk_rows=payload_chunk_rows,
+                    fz_tile_m=fz_tile_m,
+                )
                 buffer_ops.buffer_store(
                     (local_row_base + padded_rows) // fx.Int32(fz_tile_m),
                     crfa(a_expert_tile_end),
@@ -1498,8 +1425,6 @@ def emit_dispatch_plan(
         epr=fz_epr,
         total_experts=fz_total_experts,
         total_segments=total_segments,
-        fanout_masks=fanout_masks,
-        runtime_fanout=runtime_fanout,
     )
     fx.rocdl.s_waitcnt(0)
     fx.barrier()
@@ -1522,8 +1447,7 @@ def emit_dispatch_plan(
 @flyc.jit
 def emit_dispatch_group(
     *, num_waves, fz_npes, fz_k, fz_epr, fz_total_experts, addr_disp, i32_cur_tok, addr_in_idx,
-    dispatch_blocks, group_done_slot, producer_slot, parity, expected, fanout_masks=(),
-    runtime_fanout=False,
+    dispatch_blocks, group_done_slot, producer_slot, parity, expected,
     count_scratch=None,
 ):
 # fmt: on
@@ -1546,14 +1470,9 @@ def emit_dispatch_group(
     r_route_segment = crfa(a_route_segment)
     tid = fx.thread_idx.x
     block_threads = fx.Int32(num_waves * 64)
-    group_tid = producer_slot * block_threads + tid
-    group_threads = fx.Int32(dispatch_blocks) * block_threads
-    route_limit = i32_cur_tok * fx.Int32(fz_k)
-    fanout_enabled = bool(fanout_masks) or runtime_fanout
-    aggregate_counting = 3 if fanout_enabled else 1
-    count_segments = fz_total_experts + (fz_npes if fanout_enabled else 0)
+    count_segments = fz_total_experts + fz_npes
     assert count_segments <= 1024, "route metadata supports at most 1024 segments"
-    legacy_route_metadata = fz_k <= 6 and count_segments <= 512
+    packed_topk6_metadata = fz_k <= 6 and count_segments <= 512
     assert count_scratch is not None
     def record_count(segment):
         scratch_addr = fx.Int64(fx.ptrtoint(count_scratch))
@@ -1568,84 +1487,56 @@ def emit_dispatch_group(
         fx.ptr_store(fx.Int32(0), count_scratch + fx.Int64(segment))
     fx.barrier()
 
-    if const_expr(fanout_enabled):
-        assert 0 < fz_k <= 16, "wave-grouped fanout requires topk <= 16"
-        route_group_width = 8 if fz_k <= 8 else 16
-        route_group_shift = 3 if route_group_width == 8 else 4
-        tokens_per_wave = 64 // route_group_width
-        lane = tid & fx.Int32(63)
-        warp = tid >> fx.Int32(6)
-        wave_id = producer_slot * fx.Int32(num_waves) + warp
-        token_batch0 = wave_id * fx.Int32(tokens_per_wave)
-        token_stride = fx.Int32(dispatch_blocks * num_waves * tokens_per_wave)
-        topk_slot = lane & fx.Int32(route_group_width - 1)
-        active_slot = topk_slot < fx.Int32(fz_k)
-        for token_batch in range(token_batch0, i32_cur_tok, token_stride):
-            token = token_batch + (lane >> fx.Int32(route_group_shift))
-            active_route = active_slot & (token < i32_cur_tok)
-            safe_token = (token < i32_cur_tok).select(token, fx.Int32(0))
-            safe_slot = active_slot.select(topk_slot, fx.Int32(0))
-            route = safe_token * fx.Int32(fz_k) + safe_slot
-            expert = buffer_ops.buffer_load(
-                r_idx, route, vec_width=1, dtype=fx.Int32
-            )
-            valid = active_route & (expert >= fx.Int32(0))
-            valid = valid & (expert < fx.Int32(fz_total_experts))
-            safe_expert = valid.select(expert, fx.Int32(0))
-            segment, emit, member_slots = _classify_fanout_wave_route(
-                safe_expert,
-                expert,
-                lane,
-                addr_pair_config,
-                parity,
-                fz_k=fz_k,
-                fz_epr=fz_epr,
-                fz_total_experts=fz_total_experts,
-                fz_npes=fz_npes,
-                fanout_masks=fanout_masks,
-                runtime_fanout=runtime_fanout,
-            )
-            if const_expr(legacy_route_metadata):
-                cached_segment = segment | (member_slots << fx.Int32(16))
+    assert 0 < fz_k <= 16, "wave-grouped fanout requires topk <= 16"
+    route_group_width = 8 if fz_k <= 8 else 16
+    route_group_shift = 3 if route_group_width == 8 else 4
+    tokens_per_wave = 64 // route_group_width
+    lane = tid & fx.Int32(63)
+    warp = tid >> fx.Int32(6)
+    wave_id = producer_slot * fx.Int32(num_waves) + warp
+    token_batch0 = wave_id * fx.Int32(tokens_per_wave)
+    token_stride = fx.Int32(dispatch_blocks * num_waves * tokens_per_wave)
+    topk_slot = lane & fx.Int32(route_group_width - 1)
+    active_slot = topk_slot < fx.Int32(fz_k)
+    for token_batch in range(token_batch0, i32_cur_tok, token_stride):
+        token = token_batch + (lane >> fx.Int32(route_group_shift))
+        active_route = active_slot & (token < i32_cur_tok)
+        safe_token = (token < i32_cur_tok).select(token, fx.Int32(0))
+        safe_slot = active_slot.select(topk_slot, fx.Int32(0))
+        route = safe_token * fx.Int32(fz_k) + safe_slot
+        expert = buffer_ops.buffer_load(
+            r_idx, route, vec_width=1, dtype=fx.Int32
+        )
+        valid = active_route & (expert >= fx.Int32(0))
+        valid = valid & (expert < fx.Int32(fz_total_experts))
+        safe_expert = valid.select(expert, fx.Int32(0))
+        segment, emit, member_slots = _classify_fanout_wave_route(
+            safe_expert,
+            expert,
+            lane,
+            addr_pair_config,
+            parity,
+            fz_k=fz_k,
+            fz_epr=fz_epr,
+            fz_total_experts=fz_total_experts,
+            fz_npes=fz_npes,
+        )
+        cached_segment = fx.Int32(-1)
+        if valid & emit:
+            intra_rank = record_count(segment)
+            if const_expr(packed_topk6_metadata):
+                cached_segment = (
+                    segment
+                    | (member_slots << fx.Int32(9))
+                    | (intra_rank << fx.Int32(15))
+                )
             else:
-                cached_segment = segment | (member_slots << fx.Int32(10))
-            cached_segment = (valid & emit).select(
-                cached_segment, fx.Int32(-1)
-            )
-            if valid & emit:
-                intra_rank = record_count(segment)
-                if const_expr(aggregate_counting == 3):
-                    if const_expr(legacy_route_metadata):
-                        cached_segment = (
-                            segment
-                            | (member_slots << fx.Int32(9))
-                            | (intra_rank << fx.Int32(15))
-                        )
-                    else:
-                        cached_segment = (
-                            segment
-                            | (member_slots << fx.Int32(10))
-                            | (intra_rank << fx.Int32(18))
-                        )
-            if active_route:
-                buffer_ops.buffer_store(cached_segment, r_route_segment, route)
-    else:
-        for route in range(group_tid, route_limit, group_threads):
-            expert = buffer_ops.buffer_load(
-                r_idx, route, vec_width=1, dtype=fx.Int32
-            )
-            valid = (expert >= fx.Int32(0)) & (
-                expert < fx.Int32(fz_total_experts)
-            )
-            safe_expert = valid.select(expert, fx.Int32(0))
-            intra_block = fx.Int32(0)
-            if valid:
-                intra_block = record_count(safe_expert)
-            metadata_shift = 9 if legacy_route_metadata else 10
-            cached_segment = valid.select(
-                safe_expert | (intra_block << fx.Int32(metadata_shift)),
-                fx.Int32(-1),
-            )
+                cached_segment = (
+                    segment
+                    | (member_slots << fx.Int32(10))
+                    | (intra_rank << fx.Int32(18))
+                )
+        if active_route:
             buffer_ops.buffer_store(cached_segment, r_route_segment, route)
 
     fx.rocdl.s_waitcnt(0)
@@ -1665,18 +1556,6 @@ def emit_dispatch_group(
         comm_ops.fence_agent_acquire()
     fx.barrier()
 
-    fill_lane = tid & fx.Int32(63)
-    fill_warp = tid >> fx.Int32(6)
-    fill_wave_id = producer_slot * fx.Int32(num_waves) + fill_warp
-    fill_group_width = 8 if fz_k <= 8 else 16
-    fill_group_shift = 3 if fill_group_width == 8 else 4
-    fill_tokens_per_wave = 64 // fill_group_width
-    fill_token_batch0 = fill_wave_id * fx.Int32(fill_tokens_per_wave)
-    fill_token_stride = fx.Int32(
-        dispatch_blocks * num_waves * fill_tokens_per_wave
-    )
-    fill_topk_slot = fill_lane & fx.Int32(fill_group_width - 1)
-    fill_active_slot = fill_topk_slot < fx.Int32(fz_k)
     for segment in range(tid, count_segments, block_threads):
         block_index = producer_slot * fx.Int32(count_segments) + segment
         block_base = buffer_ops.buffer_load(
@@ -1688,58 +1567,34 @@ def emit_dispatch_group(
         fx.ptr_store(block_base, count_scratch + fx.Int64(segment))
     fx.rocdl.s_waitcnt(0)
     fx.barrier()
-    if const_expr(aggregate_counting == 3):
-        assert fanout_enabled
-        for token_batch in range(
-            fill_token_batch0, i32_cur_tok, fill_token_stride
-        ):
-            token = token_batch + (fill_lane >> fx.Int32(fill_group_shift))
-            active_route = fill_active_slot & (token < i32_cur_tok)
-            safe_token = (token < i32_cur_tok).select(token, fx.Int32(0))
-            safe_slot = fill_active_slot.select(fill_topk_slot, fx.Int32(0))
-            route = safe_token * fx.Int32(fz_k) + safe_slot
-            packed_segment = buffer_ops.buffer_load(
-                r_route_segment, route, vec_width=1, dtype=fx.Int32
-            )
-            if const_expr(legacy_route_metadata):
-                emit = active_route & (packed_segment >= fx.Int32(0))
-                segment = packed_segment & fx.Int32(0x1FF)
-                member_slots = (packed_segment >> fx.Int32(9)) & fx.Int32(0x3F)
-                intra_rank = (packed_segment >> fx.Int32(15)) & fx.Int32(0xFFFF)
-            else:
-                emit = active_route & (packed_segment != fx.Int32(-1))
-                segment = packed_segment & fx.Int32(0x3FF)
-                member_slots = (packed_segment >> fx.Int32(10)) & fx.Int32(0xFF)
-                intra_rank = (packed_segment >> fx.Int32(18)) & fx.Int32(0x3FFF)
-            if emit:
-                block_base = fx.ptr_load(count_scratch + fx.Int64(segment))
-                position = block_base + intra_rank
-                shared_group = segment >= fx.Int32(fz_total_experts)
-                group_entry = token | (member_slots << fx.Int32(24))
-                pair_entry = shared_group.select(group_entry, route)
-                buffer_ops.buffer_store(pair_entry, r_pair, position)
-    else:
-        for route in range(group_tid, route_limit, group_threads):
-            packed_segment = buffer_ops.buffer_load(
-                r_route_segment, route, vec_width=1, dtype=fx.Int32
-            )
-            if const_expr(legacy_route_metadata):
-                emit = packed_segment >= fx.Int32(0)
-                segment = packed_segment & fx.Int32(0x1FF)
-                intra_block = packed_segment >> fx.Int32(9)
-            else:
-                emit = packed_segment != fx.Int32(-1)
-                segment = packed_segment & fx.Int32(0x3FF)
-                intra_block = packed_segment >> fx.Int32(10)
-            if emit:
-                block_base = fx.ptr_load(
-                    count_scratch + fx.Int64(segment)
-                )
-                buffer_ops.buffer_store(
-                    route,
-                    r_pair,
-                    block_base + intra_block,
-                )
+    for token_batch in range(
+        token_batch0, i32_cur_tok, token_stride
+    ):
+        token = token_batch + (lane >> fx.Int32(route_group_shift))
+        active_route = active_slot & (token < i32_cur_tok)
+        safe_token = (token < i32_cur_tok).select(token, fx.Int32(0))
+        safe_slot = active_slot.select(topk_slot, fx.Int32(0))
+        route = safe_token * fx.Int32(fz_k) + safe_slot
+        packed_segment = buffer_ops.buffer_load(
+            r_route_segment, route, vec_width=1, dtype=fx.Int32
+        )
+        if const_expr(packed_topk6_metadata):
+            emit = active_route & (packed_segment >= fx.Int32(0))
+            segment = packed_segment & fx.Int32(0x1FF)
+            member_slots = (packed_segment >> fx.Int32(9)) & fx.Int32(0x3F)
+            intra_rank = (packed_segment >> fx.Int32(15)) & fx.Int32(0xFFFF)
+        else:
+            emit = active_route & (packed_segment != fx.Int32(-1))
+            segment = packed_segment & fx.Int32(0x3FF)
+            member_slots = (packed_segment >> fx.Int32(10)) & fx.Int32(0xFF)
+            intra_rank = (packed_segment >> fx.Int32(18)) & fx.Int32(0x3FFF)
+        if emit:
+            block_base = fx.ptr_load(count_scratch + fx.Int64(segment))
+            position = block_base + intra_rank
+            shared_group = segment >= fx.Int32(fz_total_experts)
+            group_entry = token | (member_slots << fx.Int32(24))
+            pair_entry = shared_group.select(group_entry, route)
+            buffer_ops.buffer_store(pair_entry, r_pair, position)
 
     fx.rocdl.s_waitcnt(0)
     fx.barrier()
@@ -1756,25 +1611,19 @@ def emit_dispatch_payload(
     fz_scale_n_i32, fz_enable_scales, addr_disp, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc,
     dispatch_blocks,
     producer_slot, parity, expected, producers_per_destination, chunks_per_destination,
-    payload_chunk_rows=0,
-    payload_tile_ready=False,
-    ready_tile_queue=False,
-    tile_state_stride=0,
+    payload_chunk_rows,
+    tile_state_stride,
     indexed_payload=False,
-    fanout_masks=(),
-    runtime_fanout=False,
 ):
 # fmt: on
     """Produce independently publishable expert payloads from a compact plan."""
-    if const_expr(payload_tile_ready):
-        assert tile_state_stride > 0
+    assert payload_chunk_rows > 0 and tile_state_stride > 0
     crfa = buffer_ops.create_buffer_resource_from_addr
     rdisp = crfa(addr_disp)
 
     def dp(i):
         return buffer_ops.buffer_load(rdisp, fx.Int32(i), vec_width=1, dtype=fx.Int64)
 
-    fanout_enabled = bool(fanout_masks) or runtime_fanout
     p_rx = dp(DispatchSlot.P2P_TOKEN)
     p_sc = dp(DispatchSlot.P2P_SCALE)
     p_wts = dp(DispatchSlot.P2P_WEIGHT)
@@ -1782,30 +1631,17 @@ def emit_dispatch_payload(
     a_pair_base = dp(DispatchSlot.PAIR_BASE)
     a_lh = dp(DispatchSlot.LOCAL_HIST)
     a_mb = dp(DispatchSlot.TASK_ROW_BASE)
-    a_gb = fx.Int64(0)
-    if const_expr(fanout_enabled):
-        a_gb = dp(DispatchSlot.GROUP_TASK_BASE)
-    p_payload_ready = dp(DispatchSlot.P2P_PAYLOAD_READY)
+    a_gb = dp(DispatchSlot.GROUP_TASK_BASE)
     a_pair_order = dp(DispatchSlot.PAIR_ORDER)
     a_plan_ready = dp(DispatchSlot.PLAN_READY)
     a_chunk_done = dp(DispatchSlot.PAYLOAD_CHUNK_DONE)
-    p_tile_ready = fx.Int64(0)
-    p_payload_ready_rows = fx.Int64(0)
-    if const_expr(payload_tile_ready):
-        p_tile_ready = dp(DispatchSlot.P2P_TILE_READY)
-        p_payload_ready_rows = dp(DispatchSlot.P2P_PAYLOAD_READY_ROWS)
-    p_tile_expected = fx.Int64(0)
-    p_ready_tile_queue = fx.Int64(0)
-    p_ready_tile_epoch = fx.Int64(0)
-    p_ready_tile_tail = fx.Int64(0)
-    if const_expr(ready_tile_queue):
-        p_tile_expected = dp(DispatchSlot.P2P_TILE_EXPECTED)
-        p_ready_tile_queue = dp(DispatchSlot.P2P_READY_TILE_QUEUE)
-        p_ready_tile_epoch = dp(DispatchSlot.P2P_READY_TILE_EPOCH)
-        p_ready_tile_tail = dp(DispatchSlot.P2P_READY_TILE_TAIL)
-    addr_pair_config = fx.Int64(0)
-    if const_expr(fanout_enabled):
-        addr_pair_config = dp(DispatchSlot.FANOUT_PAIR_CONFIG)
+    p_tile_ready = dp(DispatchSlot.P2P_TILE_READY)
+    p_payload_ready_rows = dp(DispatchSlot.P2P_PAYLOAD_READY_ROWS)
+    p_tile_expected = dp(DispatchSlot.P2P_TILE_EXPECTED)
+    p_ready_tile_queue = dp(DispatchSlot.P2P_READY_TILE_QUEUE)
+    p_ready_tile_epoch = dp(DispatchSlot.P2P_READY_TILE_EPOCH)
+    p_ready_tile_tail = dp(DispatchSlot.P2P_READY_TILE_TAIL)
+    addr_pair_config = dp(DispatchSlot.FANOUT_PAIR_CONFIG)
 
     tid = fx.thread_idx.x
     lane = tid & fx.Int32(63)
@@ -1815,48 +1651,30 @@ def emit_dispatch_payload(
     r_mb = crfa(a_mb)
     r_gb = crfa(a_gb)
     r_pair = crfa(a_pair_order)
-    r_idx = crfa(fx.Int64(0))
-    if const_expr(fanout_enabled):
-        r_idx = crfa(addr_in_idx)
+    r_idx = crfa(addr_in_idx)
     r_wts = crfa(addr_in_wts)
     r_chunk_done = crfa(a_chunk_done)
     row0 = warp
     row_stride = fx.Int32(num_waves)
 
-    def _publish_task(destination, local_expert, ge):
+    def _finish_task(ge, num_chunks):
         comm_ops.fence_system_release()
-        ready_remote = buffer_ops.buffer_load(crfa(p_payload_ready), destination, vec_width=1, dtype=fx.Int64)
-        ready_index = parity * fx.Int32(fz_epr) + local_expert
-        comm_ops.atomic_add_system(ready_remote + fx.Int64(ready_index) * fx.Int64(4), fx.Int32(1))
-        buffer_ops.buffer_store(fx.Int32(0), r_lh, ge)
-
-    def _finish_task(destination, local_expert, ge, num_chunks):
-        if const_expr(payload_chunk_rows > 0):
-            comm_ops.fence_system_release()
-            completed = fx.Int32(
-                comm_ops.atomic_add_agent(a_chunk_done + fx.Int64(ge) * fx.Int64(4), fx.Int32(1))
+        completed = fx.Int32(
+            comm_ops.atomic_add_agent(
+                a_chunk_done + fx.Int64(ge) * fx.Int64(4), fx.Int32(1)
             )
-            if completed == num_chunks - fx.Int32(1):
-                comm_ops.fence_agent_acquire()
-                buffer_ops.buffer_store(fx.Int32(0), r_chunk_done, ge)
-                _publish_task(destination, local_expert, ge)
-        else:
-            _publish_task(destination, local_expert, ge)
+        )
+        if completed == num_chunks - fx.Int32(1):
+            comm_ops.fence_agent_acquire()
+            buffer_ops.buffer_store(fx.Int32(0), r_chunk_done, ge)
 
     num_destinations = fz_total_experts // fz_epr
-    segments_per_destination = fz_epr + (1 if fanout_enabled else 0)
-    payload_epoch = fx.Int32(0)
-    if const_expr(ready_tile_queue):
-        payload_epoch = (expected // fx.Int32(num_destinations)) * fx.Int32(2) - parity
-    if const_expr(payload_chunk_rows > 0):
-        assert dispatch_blocks % num_destinations == 0
-        task_limit = fx.Int32(segments_per_destination) * chunks_per_destination
-        task0 = producer_slot // fx.Int32(num_destinations)
-        task_stride = fx.Int32(producers_per_destination)
-    else:
-        task_limit = fx.Int32(fz_total_experts)
-        task0 = producer_slot
-        task_stride = fx.Int32(dispatch_blocks)
+    segments_per_destination = fz_epr + 1
+    payload_epoch = (expected // fx.Int32(num_destinations)) * fx.Int32(2) - parity
+    assert dispatch_blocks % num_destinations == 0
+    task_limit = fx.Int32(segments_per_destination) * chunks_per_destination
+    task0 = producer_slot // fx.Int32(num_destinations)
+    task_stride = fx.Int32(producers_per_destination)
     hoist_remote_resources = fz_mtpr >= 1024
     producer_destination = producer_slot % fx.Int32(num_destinations)
     ready_index = parity * fx.Int32(num_destinations) + producer_destination
@@ -1864,62 +1682,44 @@ def emit_dispatch_payload(
         comm_ops.wait_i32_until_equals(a_plan_ready + fx.Int64(ready_index) * fx.Int64(4), expected)
         comm_ops.fence_system_acquire()
     destination_ready_rows = fx.Int32(0)
-    if const_expr(payload_tile_ready):
-        if tid == fx.Int32(0):
-            remote_ready_rows = buffer_ops.buffer_load(
-                crfa(p_payload_ready_rows), producer_destination, vec_width=1, dtype=fx.Int64
-            )
-            destination_ready_rows = buffer_ops.buffer_load(
-                crfa(remote_ready_rows), fx.Int32(0), vec_width=1, dtype=fx.Int32
-            )
+    if tid == fx.Int32(0):
+        remote_ready_rows = buffer_ops.buffer_load(
+            crfa(p_payload_ready_rows), producer_destination, vec_width=1, dtype=fx.Int64
+        )
+        destination_ready_rows = buffer_ops.buffer_load(
+            crfa(remote_ready_rows), fx.Int32(0), vec_width=1, dtype=fx.Int32
+        )
     fx.barrier()
     for task_index in range(task0, task_limit, task_stride):
-        if const_expr(payload_chunk_rows > 0):
-            chunk_id = task_index // fx.Int32(segments_per_destination)
-            rotated_segment = task_index - chunk_id * fx.Int32(
-                segments_per_destination
-            )
-            rotation = (chunk_id * fx.Int32(17)) % fx.Int32(
-                segments_per_destination
-            )
-            local_segment = (
-                rotated_segment
-                + fx.Int32(segments_per_destination)
-                - rotation
-            ) % fx.Int32(segments_per_destination)
-        else:
-            chunk_id = fx.Int32(0)
-            local_segment = task_index // fx.Int32(num_destinations)
+        chunk_id = task_index // fx.Int32(segments_per_destination)
+        rotated_segment = task_index - chunk_id * fx.Int32(
+            segments_per_destination
+        )
+        rotation = (chunk_id * fx.Int32(17)) % fx.Int32(
+            segments_per_destination
+        )
+        local_segment = (
+            rotated_segment + fx.Int32(segments_per_destination) - rotation
+        ) % fx.Int32(segments_per_destination)
         destination = producer_destination
-        selected_mask = fx.Int64(0)
-        pair_a = fx.Int32(0)
-        pair_b = fx.Int32(0)
-        pair_enabled = fx.Int32(0) != fx.Int32(0)
-        group_task = fx.Int32(0) != fx.Int32(0)
-        local_expert = local_segment
-        if const_expr(fanout_enabled):
-            (
-                selected_mask,
-                pair_a,
-                pair_b,
-                pair_enabled,
-                canonical_expert,
-            ) = _load_fanout_pair(
-                addr_pair_config,
-                destination,
-                parity,
-                npes=num_destinations,
-                fanout_masks=fanout_masks,
-                runtime_fanout=runtime_fanout,
-            )
-            group_task = local_segment == fx.Int32(fz_epr)
-            local_expert = group_task.select(canonical_expert, local_segment)
+        (
+            selected_mask,
+            pair_a,
+            pair_b,
+            pair_enabled,
+            canonical_expert,
+        ) = _load_fanout_pair(
+            addr_pair_config,
+            destination,
+            parity,
+            npes=num_destinations,
+        )
+        group_task = local_segment == fx.Int32(fz_epr)
+        local_expert = group_task.select(canonical_expert, local_segment)
         ge = destination * fx.Int32(fz_epr) + local_expert
-        segment = ge
-        if const_expr(fanout_enabled):
-            segment = group_task.select(
-                fx.Int32(fz_total_experts) + destination, ge
-            )
+        segment = group_task.select(
+            fx.Int32(fz_total_experts) + destination, ge
+        )
         source_count_lane = fx.Int32(0)
         source_base_lane = fx.Int32(0)
         destination_base_lane = fx.Int32(0)
@@ -1933,30 +1733,23 @@ def emit_dispatch_payload(
             destination_base_lane = buffer_ops.buffer_load(
                 r_mb, ge, vec_width=1, dtype=fx.Int32
             )
-            if const_expr(fanout_enabled):
-                destination_base_lane = group_task.select(
-                    buffer_ops.buffer_load(r_gb, ge, vec_width=1, dtype=fx.Int32),
-                    destination_base_lane,
-                )
+            destination_base_lane = group_task.select(
+                buffer_ops.buffer_load(r_gb, ge, vec_width=1, dtype=fx.Int32),
+                destination_base_lane,
+            )
         source_count = fx.Int32(fx.rocdl.readfirstlane(T.i32, source_count_lane))
         source_base = fx.Int32(fx.rocdl.readfirstlane(T.i32, source_base_lane))
         destination_base = fx.Int32(fx.rocdl.readfirstlane(T.i32, destination_base_lane))
-        if const_expr(payload_chunk_rows > 0):
-            num_chunks = (source_count + fx.Int32(payload_chunk_rows - 1)) // fx.Int32(
-                payload_chunk_rows
-            )
-            num_chunks = (num_chunks > fx.Int32(0)).select(num_chunks, fx.Int32(1))
-            chunk_active = chunk_id < num_chunks
-            chunk_begin = chunk_id * fx.Int32(payload_chunk_rows)
-            chunk_limit = chunk_begin + fx.Int32(payload_chunk_rows)
-            chunk_end = (source_count < chunk_limit).select(source_count, chunk_limit)
-            row_begin = chunk_active.select(chunk_begin, fx.Int32(0))
-            row_end = chunk_active.select(chunk_end, fx.Int32(0))
-        else:
-            num_chunks = fx.Int32(1)
-            chunk_active = fx.Int32(0) == fx.Int32(0)
-            row_begin = fx.Int32(0)
-            row_end = source_count
+        num_chunks = (source_count + fx.Int32(payload_chunk_rows - 1)) // fx.Int32(
+            payload_chunk_rows
+        )
+        num_chunks = (num_chunks > fx.Int32(0)).select(num_chunks, fx.Int32(1))
+        chunk_active = chunk_id < num_chunks
+        chunk_begin = chunk_id * fx.Int32(payload_chunk_rows)
+        chunk_limit = chunk_begin + fx.Int32(payload_chunk_rows)
+        chunk_end = (source_count < chunk_limit).select(source_count, chunk_limit)
+        row_begin = chunk_active.select(chunk_begin, fx.Int32(0))
+        row_end = chunk_active.select(chunk_end, fx.Int32(0))
         if const_expr(hoist_remote_resources):
             wts_remote_rsrc = crfa(buffer_ops.buffer_load(crfa(p_wts), destination, vec_width=1, dtype=fx.Int64))
             srcmap_remote_rsrc = crfa(buffer_ops.buffer_load(crfa(p_sm), destination, vec_width=1, dtype=fx.Int64))
@@ -1972,13 +1765,11 @@ def emit_dispatch_payload(
             wk = fx.Int32(fx.rocdl.readfirstlane(T.i32, wk_lane))
             source_token = wk // fx.Int32(fz_k)
             topk_slot = wk % fx.Int32(fz_k)
-            group_member_slots = fx.Int32(0)
-            if const_expr(fanout_enabled):
-                group_member_slots = (wk >> fx.Int32(24)) & fx.Int32(0xFF)
-                source_token = group_task.select(
-                    wk & fx.Int32(0xFFFFFF), source_token
-                )
-                topk_slot = group_task.select(fx.Int32(0), topk_slot)
+            group_member_slots = (wk >> fx.Int32(24)) & fx.Int32(0xFF)
+            source_token = group_task.select(
+                wk & fx.Int32(0xFFFFFF), source_token
+            )
+            topk_slot = group_task.select(fx.Int32(0), topk_slot)
             destination_row = destination_base + row
             source_key = fx.Int32(fz_rank * fz_mtpr) + source_token
 
@@ -1986,9 +1777,7 @@ def emit_dispatch_payload(
                 weight = buffer_ops.buffer_load(
                     r_wts, route_index, vec_width=1, dtype=fx.Float32
                 )
-                route_slot = topk_slot
-                if const_expr(fanout_enabled):
-                    route_slot = route_index % fx.Int32(fz_k)
+                route_slot = route_index % fx.Int32(fz_k)
                 source_encoding = source_key | (route_slot << fx.Int32(24))
                 weight_bits = fx.Vector.from_elements([weight], fx.Float32).bitcast(fx.Int32)[0]
                 if const_expr(hoist_remote_resources):
@@ -2001,38 +1790,16 @@ def emit_dispatch_payload(
                     buffer_ops.buffer_store(source_encoding, crfa(srcmap_remote), route_row)
 
             if lane == fx.Int32(0):
-                if const_expr(fanout_enabled):
-                    if group_task:
-                        if const_expr(fz_k <= 8):
-                            for slot in range_constexpr(fz_k):
-                                member_active = (
-                                    group_member_slots >> fx.Int32(slot)
-                                ) & fx.Int32(1)
-                                if member_active != fx.Int32(0):
-                                    member_route = (
-                                        source_token * fx.Int32(fz_k)
-                                        + fx.Int32(slot)
-                                    )
-                                    member_ge = buffer_ops.buffer_load(
-                                        r_idx,
-                                        member_route,
-                                        vec_width=1,
-                                        dtype=fx.Int32,
-                                    )
-                                    member_base = buffer_ops.buffer_load(
-                                        r_gb, member_ge, vec_width=1, dtype=fx.Int32
-                                    )
-                                    _copy_route_header(
-                                        member_route, member_base + row
-                                    )
-                        else:
-                            slot_a = group_member_slots & fx.Int32(0xF)
-                            slot_b = (group_member_slots >> fx.Int32(4)) & fx.Int32(
-                                0xF
-                            )
-                            for member_slot in (slot_a, slot_b):
+                if group_task:
+                    if const_expr(fz_k <= 8):
+                        for slot in range_constexpr(fz_k):
+                            member_active = (
+                                group_member_slots >> fx.Int32(slot)
+                            ) & fx.Int32(1)
+                            if member_active != fx.Int32(0):
                                 member_route = (
-                                    source_token * fx.Int32(fz_k) + member_slot
+                                    source_token * fx.Int32(fz_k)
+                                    + fx.Int32(slot)
                                 )
                                 member_ge = buffer_ops.buffer_load(
                                     r_idx,
@@ -2043,9 +1810,28 @@ def emit_dispatch_payload(
                                 member_base = buffer_ops.buffer_load(
                                     r_gb, member_ge, vec_width=1, dtype=fx.Int32
                                 )
-                                _copy_route_header(member_route, member_base + row)
+                                _copy_route_header(
+                                    member_route, member_base + row
+                                )
                     else:
-                        _copy_route_header(wk, destination_row)
+                        slot_a = group_member_slots & fx.Int32(0xF)
+                        slot_b = (group_member_slots >> fx.Int32(4)) & fx.Int32(
+                            0xF
+                        )
+                        for member_slot in (slot_a, slot_b):
+                            member_route = (
+                                source_token * fx.Int32(fz_k) + member_slot
+                            )
+                            member_ge = buffer_ops.buffer_load(
+                                r_idx,
+                                member_route,
+                                vec_width=1,
+                                dtype=fx.Int32,
+                            )
+                            member_base = buffer_ops.buffer_load(
+                                r_gb, member_ge, vec_width=1, dtype=fx.Int32
+                            )
+                            _copy_route_header(member_route, member_base + row)
                 else:
                     _copy_route_header(wk, destination_row)
 
@@ -2128,63 +1914,38 @@ def emit_dispatch_payload(
             fx.rocdl.s_waitcnt(0)
             fx.barrier()
             if tid == fx.Int32(0):
-                if const_expr(payload_tile_ready):
-                    if const_expr(fanout_enabled):
-                        if group_task:
-                            if const_expr(fz_epr <= 64):
-                                for member in range_constexpr(fz_epr):
-                                    member_bit = (
-                                        selected_mask >> fx.Int64(member)
-                                    ) & fx.Int64(1)
-                                    if member_bit != fx.Int64(0):
-                                        member_ge = destination * fx.Int32(
-                                            fz_epr
-                                        ) + fx.Int32(member)
-                                        member_base = buffer_ops.buffer_load(
-                                            r_gb,
-                                            member_ge,
-                                            vec_width=1,
-                                            dtype=fx.Int32,
-                                        )
-                                        _publish_tile_range(
-                                            p_tile_ready,
-                                            p_tile_expected,
-                                            p_ready_tile_queue,
-                                            p_ready_tile_epoch,
-                                            p_ready_tile_tail,
-                                            destination,
-                                            member_base,
-                                            row_begin,
-                                            row_end,
-                                            destination_ready_rows,
-                                            payload_epoch,
-                                            parity,
-                                            ready_tile_queue=ready_tile_queue,
-                                            tile_state_stride=tile_state_stride,
-                                        )
-                            elif pair_enabled:
-                                for member in (pair_a, pair_b):
-                                    member_ge = destination * fx.Int32(fz_epr) + member
-                                    member_base = buffer_ops.buffer_load(
-                                        r_gb, member_ge, vec_width=1, dtype=fx.Int32
-                                    )
-                                    _publish_tile_range(
-                                        p_tile_ready,
-                                        p_tile_expected,
-                                        p_ready_tile_queue,
-                                        p_ready_tile_epoch,
-                                        p_ready_tile_tail,
-                                        destination,
-                                        member_base,
-                                        row_begin,
-                                        row_end,
-                                        destination_ready_rows,
-                                        payload_epoch,
-                                        parity,
-                                        ready_tile_queue=ready_tile_queue,
-                                        tile_state_stride=tile_state_stride,
-                                    )
-                        else:
+                if group_task:
+                    if const_expr(fz_epr <= 64):
+                        for member in range_constexpr(fz_epr):
+                            member_bit = (
+                                selected_mask >> fx.Int64(member)
+                            ) & fx.Int64(1)
+                            if member_bit != fx.Int64(0):
+                                member_ge = destination * fx.Int32(fz_epr) + member
+                                member_base = buffer_ops.buffer_load(
+                                    r_gb, member_ge, vec_width=1, dtype=fx.Int32
+                                )
+                                _publish_tile_range(
+                                    p_tile_ready,
+                                    p_tile_expected,
+                                    p_ready_tile_queue,
+                                    p_ready_tile_epoch,
+                                    p_ready_tile_tail,
+                                    destination,
+                                    member_base,
+                                    row_begin,
+                                    row_end,
+                                    destination_ready_rows,
+                                    payload_epoch,
+                                    parity,
+                                    tile_state_stride=tile_state_stride,
+                                )
+                    elif pair_enabled:
+                        for member in (pair_a, pair_b):
+                            member_ge = destination * fx.Int32(fz_epr) + member
+                            member_base = buffer_ops.buffer_load(
+                                r_gb, member_ge, vec_width=1, dtype=fx.Int32
+                            )
                             _publish_tile_range(
                                 p_tile_ready,
                                 p_tile_expected,
@@ -2192,31 +1953,29 @@ def emit_dispatch_payload(
                                 p_ready_tile_epoch,
                                 p_ready_tile_tail,
                                 destination,
-                                destination_base,
+                                member_base,
                                 row_begin,
                                 row_end,
                                 destination_ready_rows,
                                 payload_epoch,
                                 parity,
-                                ready_tile_queue=ready_tile_queue,
                                 tile_state_stride=tile_state_stride,
                             )
-                    else:
-                        _publish_tile_range(
-                            p_tile_ready,
-                            p_tile_expected,
-                            p_ready_tile_queue,
-                            p_ready_tile_epoch,
-                            p_ready_tile_tail,
-                            destination,
-                            destination_base,
-                            row_begin,
-                            row_end,
-                            destination_ready_rows,
-                            payload_epoch,
-                            parity,
-                            ready_tile_queue=ready_tile_queue,
-                            tile_state_stride=tile_state_stride,
-                        )
-                _finish_task(destination, local_expert, segment, num_chunks)
+                else:
+                    _publish_tile_range(
+                        p_tile_ready,
+                        p_tile_expected,
+                        p_ready_tile_queue,
+                        p_ready_tile_epoch,
+                        p_ready_tile_tail,
+                        destination,
+                        destination_base,
+                        row_begin,
+                        row_end,
+                        destination_ready_rows,
+                        payload_epoch,
+                        parity,
+                        tile_state_stride=tile_state_stride,
+                    )
+                _finish_task(segment, num_chunks)
             fx.barrier()

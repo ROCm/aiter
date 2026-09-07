@@ -32,7 +32,6 @@ MAX_MTPR_CLASS = 32768
 INDEXED_PAYLOAD_MIN_MTPR = MAX_MTPR_CLASS
 INDEXED_PAYLOAD_MIN_SBM = 128
 REFERENCE_EXPERTS_PER_RANK = 48
-EXPERT_CONFIG_GRANULARITY = 64
 # Compact route metadata dedicates ten bits to the global expert/group segment.
 # Under the EP8 protocol this admits 8 * 127 expert segments plus 8 group
 # segments.  The next expert would require segment 1024 and cannot be encoded.
@@ -72,14 +71,12 @@ class Stage1Config:
     swizzle_a: bool = True
     work_shards: int = 8
     payload_chunk_rows: int = 0
-    payload_tile_ready: bool = False
-    prepare_cu: int = 32
     prepare_quant_cu: int = 64
 
 
 def stage1_bundle_identity(config: Stage1Config) -> Stage1Config:
     """Return the Stage1 kernel identity without prepare-only launch knobs."""
-    return replace(config, prepare_cu=0, prepare_quant_cu=0)
+    return replace(config, prepare_quant_cu=0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,8 +97,6 @@ class Stage2Config:
     pair_cu: int = 0
     pair_block_m: int = 32
     pair_block_n: int = 256
-    pair_work_weight: int = 2
-    pair_scatter_vec: int = 16
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,7 +125,6 @@ class Stage2BundleKey:
     config: Stage2Config
     sbm: int
     p2p_quant: str
-    fixed_slot_dispatch: bool
 
     def __post_init__(self):
         if self.config.block_m > self.sbm or self.sbm % self.config.block_m:
@@ -143,7 +137,6 @@ class Stage2BundleKey:
 
 @dataclass(frozen=True, slots=True)
 class MegaMoEBundleEntry:
-    pair_id: int
     token_bucket: int
     config: MegaMoEConfig
     stage1_variant_id: int
@@ -189,19 +182,6 @@ def mtpr_config_class(mtpr: int) -> int:
     return mtpr if mtpr <= P2P_FP8_MIN_MTPR else MAX_MTPR_CLASS
 
 
-def expert_config_class(experts_per_rank: int) -> int:
-    return (
-        (experts_per_rank + EXPERT_CONFIG_GRANULARITY - 1)
-        // EXPERT_CONFIG_GRANULARITY
-        * EXPERT_CONFIG_GRANULARITY
-    )
-
-
-def _scale_dispatch_cu(dispatch_cu: int, experts_per_rank: int) -> int:
-    expert_waves = (experts_per_rank + 63) // 64
-    return min(224, dispatch_cu * expert_waves)
-
-
 def _fixed_dispatch_cu(bucket: int) -> int:
     if bucket <= 1:
         return 64
@@ -214,16 +194,14 @@ def _fixed_dispatch_cu(bucket: int) -> int:
     return min(224, 16 * (bucket.bit_length() + 7))
 
 
-def _select_fixed_stage1(bucket: int, experts_per_rank: int) -> Stage1Config:
+def _select_fixed_stage1(bucket: int) -> Stage1Config:
     grid_mult = max(1, bucket // 4) if bucket <= 16 else 3
     return Stage1Config(
         sort_block_m=32,
         tile_n=256 if bucket <= 8 else 128,
         num_waves=4,
         grid_mult=grid_mult,
-        num_dispatch_cu=_scale_dispatch_cu(
-            _fixed_dispatch_cu(bucket), experts_per_rank
-        ),
+        num_dispatch_cu=_fixed_dispatch_cu(bucket),
         mfma_amajor=False,
         async_a_copy=False,
         use_tile_resource=bucket <= 16,
@@ -232,9 +210,7 @@ def _select_fixed_stage1(bucket: int, experts_per_rank: int) -> Stage1Config:
     )
 
 
-def _select_bounded_stage1(
-    bucket: int, mtpr: int, experts_per_rank: int, inter_dim: int
-) -> Stage1Config:
+def _select_bounded_stage1(bucket: int, inter_dim: int) -> Stage1Config:
     if bucket <= 4:
         sort_block_m, tile_n, num_waves = 32, 256, 4
         grid_mult, mfma_amajor, async_a_copy = 1, False, False
@@ -269,13 +245,10 @@ def _select_bounded_stage1(
         b_nt=b_nt,
         work_shards=4,
         payload_chunk_rows=256,
-        payload_tile_ready=True,
     )
 
 
-def _select_large_stage1(
-    bucket: int, experts_per_rank: int, inter_dim: int
-) -> Stage1Config:
+def _select_large_stage1(bucket: int, inter_dim: int) -> Stage1Config:
     if bucket <= 4:
         sort_block_m, tile_n, num_waves = 32, 256, 4
         mfma_amajor, async_a_copy = False, False
@@ -310,7 +283,6 @@ def _select_large_stage1(
         b_nt=3 if 1 < bucket <= 256 else 0,
         work_shards=work_shards,
         payload_chunk_rows=384,
-        payload_tile_ready=True,
         prepare_quant_cu=prepare_quant_cu,
     )
 
@@ -381,25 +353,23 @@ def _select_large_stage2(
 def _select_bucket_config(
     bucket: int,
     mtpr_class: int,
-    experts_per_rank: int,
     model_dim: int,
     inter_dim: int,
     fixed_slot_dispatch: bool,
 ) -> MegaMoEConfig:
     if mtpr_class == MAX_MTPR_CLASS:
-        stage1 = _select_large_stage1(bucket, experts_per_rank, inter_dim)
+        stage1 = _select_large_stage1(bucket, inter_dim)
         stage2 = _select_large_stage2(bucket, stage1.sort_block_m, model_dim)
         return MegaMoEConfig(
             stage1=stage1, stage2=stage2, p2p_quant="fp8_blockwise_1x32"
         )
 
-    fixed_slot = fixed_slot_dispatch
-    if fixed_slot:
-        stage1 = _select_fixed_stage1(bucket, experts_per_rank)
+    if fixed_slot_dispatch:
+        stage1 = _select_fixed_stage1(bucket)
     else:
-        stage1 = _select_bounded_stage1(bucket, mtpr_class, experts_per_rank, inter_dim)
+        stage1 = _select_bounded_stage1(bucket, inter_dim)
     stage2 = _select_bounded_stage2(
-        bucket, fixed_slot, mtpr_class, stage1.sort_block_m, model_dim
+        bucket, fixed_slot_dispatch, mtpr_class, stage1.sort_block_m, model_dim
     )
     return MegaMoEConfig(stage1=stage1, stage2=stage2, p2p_quant="none")
 
@@ -446,7 +416,6 @@ def select_mega_moe_config(
     return _select_bucket_config(
         bucket,
         mtpr_class,
-        expert_config_class(experts_per_rank),
         model_dim,
         inter_dim,
         fixed_slot_dispatch,
@@ -496,14 +465,12 @@ def build_mega_moe_bundle_plan(
             config.stage2,
             config.stage1.sort_block_m,
             config.p2p_quant,
-            fixed_slot_dispatch,
         )
         stage2_id = stage2_ids.setdefault(stage2_key, len(stage2_variants))
         if stage2_id == len(stage2_variants):
             stage2_variants.append(stage2_key)
         entries.append(
             MegaMoEBundleEntry(
-                pair_id=len(entries),
                 token_bucket=bucket,
                 config=config,
                 stage1_variant_id=stage1_id,

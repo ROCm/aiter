@@ -279,10 +279,8 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     SBM: int | None = None,
     persist: bool = False, cu_num: int = 0, has_pad: bool = False, g2_bhoist=None, g2_ascale_pf=None,
     g2_spart=None, persist_strided: bool = False, g2_bf16_lds: bool = False, p2p_quant_type: str = "none",
-    fixed_slot_dispatch: bool = False, skew_cu: int = 0, skip_pair_mask: int = 0,
-    runtime_pair_skip: bool = False,
-    lds_reserve_bytes: int = 0, skip_pair_compact_work: bool = False,
-    skip_pair_tiles_per_cu: int = 0, scatter_vec: int = 8):
+    fixed_slot_dispatch: bool = False, skew_cu: int = 0,
+    runtime_pair_skip: bool = False, scatter_vec: int = 8):
 # fmt: on
     """Compile fused GEMM2 and weighted cross-rank P2P scatter."""
     arch = str(get_rocm_arch() or "")
@@ -325,11 +323,8 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     lds_weight_off = lds_packed_off + BM * 4
     lds_peer_off = lds_weight_off + BM * 4
     lds_bytes = lds_peer_off + npes * 8
-    if lds_reserve_bytes < 0 or lds_reserve_bytes % 16:
-        raise ValueError("Stage2 LDS reservation must be non-negative and 16-byte aligned")
-    allocated_lds_bytes = max(lds_bytes, lds_reserve_bytes)
-    if allocated_lds_bytes > 160 * 1024:
-        raise ValueError(f"Stage2 LDS use {allocated_lds_bytes} exceeds 160 KiB")
+    if lds_bytes > 160 * 1024:
+        raise ValueError(f"Stage2 LDS use {lds_bytes} exceeds 160 KiB")
     _recv_cap = npes * max_tok if recv_cap is None else int(recv_cap)
     _row_nbytes = N_OUT + N_OUT // 32 if p2p_quant_type == "fp8_blockwise_1x32" else N_OUT * 2
     _comb_inp_nbytes = max_tok * topk * _row_nbytes if comb_inp_nbytes is None else int(comb_inp_nbytes)
@@ -338,33 +333,12 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     _expert_offset = rank * experts
     if runtime_pair_skip and fixed_slot_dispatch:
         raise ValueError("runtime pair skipping requires compact dispatch")
-    if skip_pair_mask and skip_pair_mask.bit_count() != 2:
-        raise ValueError("Stage2 pair skipping requires exactly two local experts")
-    _skip_a = (
-        (skip_pair_mask & -skip_pair_mask).bit_length() - 1
-        if skip_pair_mask
-        else 0
-    )
-    _skip_b = (
-        (skip_pair_mask ^ (1 << _skip_a)).bit_length() - 1
-        if skip_pair_mask
-        else 0
-    )
-    if skip_pair_mask and _skip_b >= experts:
-        raise ValueError("Stage2 pair skip expert is outside the local range")
-    pair_skip_enabled = bool(skip_pair_mask) or runtime_pair_skip
-    if skip_pair_compact_work and not pair_skip_enabled:
-        raise ValueError("compact pair-skip work requires a non-empty pair mask")
-    if skip_pair_tiles_per_cu < 0:
-        raise ValueError("pair-skip tiles per CU must be non-negative")
-    if skip_pair_tiles_per_cu and not skip_pair_compact_work:
-        raise ValueError("adaptive pair-skip CUs require compact pair-skip work")
     _total_experts = npes * experts
     _total_segments = _total_experts + npes
 
     @fx.struct
     class SharedStorage:
-        buf: fx.Array[Int8, allocated_lds_bytes, 16]
+        buf: fx.Array[Int8, lds_bytes, 16]
 
     dispatch_path = "fixedslot" if fixed_slot_dispatch else "compact"
     kernel_name = (
@@ -373,11 +347,9 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         f"_p{int(persist)}cu{cu_num}s{int(persist_strided)}_pad{int(has_pad)}"
         f"_sk{skew_cu}"
         f"_bh{int(g2_bhoist)}apf{int(g2_ascale_pf)}sp{g2_group_num}x{g2_m01}"
-        f"_bf16lds{int(g2_bf16_lds)}_{p2p_quant_type}_sto1_spm{skip_pair_mask:x}"
-        f"_rps{int(runtime_pair_skip)}"
-        f"_rtv3{int(runtime_pair_skip)}"
-        f"_lr{lds_reserve_bytes}_scw{int(skip_pair_compact_work)}"
-        f"_stc{skip_pair_tiles_per_cu}_sv{scatter_vec}_tb2_rsm1"
+        f"_bf16lds{int(g2_bf16_lds)}_{p2p_quant_type}"
+        f"_rps{int(runtime_pair_skip)}_rtv3{int(runtime_pair_skip)}"
+        f"_sv{scatter_vec}_tb2_rsm1"
     )
 
     # fmt: off
@@ -407,9 +379,6 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         skip_base_a = fx.Int32(0)
         skip_base_b = fx.Int32(0)
         skip_rows = fx.Int32(0)
-        skip_a = fx.Int32(_skip_a)
-        skip_b = fx.Int32(_skip_b)
-        pair_enabled = fx.Int32(1 if skip_pair_mask else 0) == fx.Int32(1)
         if const_expr(runtime_pair_skip):
             pair_config = buffer_ops.create_buffer_resource_from_addr(arg_pair_config)
             parity_rsrc = buffer_ops.create_buffer_resource_from_addr(arg_parity)
@@ -426,7 +395,6 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
             pair_enabled = (packed_pair & fx.Int32(1 << 16)) != fx.Int32(0)
             skip_a = packed_pair & fx.Int32(0xFF)
             skip_b = packed_pair.shrui(fx.Int32(8)) & fx.Int32(0xFF)
-        if const_expr(pair_skip_enabled):
             expert_tile_end = buffer_ops.create_buffer_resource_from_addr(
                 arg_expert_tile_end
             )
@@ -542,7 +510,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
 
         def run_unskipped_unit(unit_bx, m_block_idx):
             skip = fx.Int32(0)
-            if const_expr(pair_skip_enabled):
+            if const_expr(runtime_pair_skip):
                 m_row = m_block_idx * fx.Int32(BM)
                 expert = buffer_ops.buffer_load(
                     eids_rsrc,
@@ -594,37 +562,14 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
             n_block = skewed.select(skew_n_block, normal_n_block)
             m_slot = skewed.select(skew_m_slot, normal_m_slot)
             active_cu = skewed.select(fx.Int32(skew_cu), fx.Int32(cu_num))
-            scheduled_m_blocks = total_m_blocks
-            pair_blocks = fx.Int32(0)
-            group_a_block = fx.Int32(0)
-            second_threshold = fx.Int32(0)
-            if const_expr(skip_pair_compact_work):
-                pair_blocks = skip_rows // fx.Int32(BM)
-                group_a_block = skip_base_a // fx.Int32(BM)
-                group_b_block = skip_base_b // fx.Int32(BM)
-                second_threshold = group_b_block - pair_blocks
-                scheduled_m_blocks = total_m_blocks - pair_blocks * fx.Int32(2)
-                if const_expr(skip_pair_tiles_per_cu > 0):
-                    requested_cu = (
-                        scheduled_m_blocks
-                        + fx.Int32(skip_pair_tiles_per_cu - 1)
-                    ) // fx.Int32(skip_pair_tiles_per_cu)
-                    requested_cu = (requested_cu < fx.Int32(1)).select(
-                        fx.Int32(1), requested_cu
-                    )
-                    pair_dominant = pair_blocks * fx.Int32(4) >= total_m_blocks
-                    reduced_cu = (requested_cu < active_cu).select(
-                        requested_cu, active_cu
-                    )
-                    active_cu = pair_dominant.select(reduced_cu, active_cu)
-            strided_diff = scheduled_m_blocks - m_slot
+            strided_diff = total_m_blocks - m_slot
             strided_rem = (strided_diff > fx.Int32(0)).select(strided_diff, fx.Int32(0))
             strided_iters = (strided_rem + active_cu - fx.Int32(1)) // active_cu
             tiles_per_slot = (
-                scheduled_m_blocks + active_cu - fx.Int32(1)
+                total_m_blocks + active_cu - fx.Int32(1)
             ) // active_cu
             m_tile0 = m_slot * tiles_per_slot
-            contiguous_diff = scheduled_m_blocks - m_tile0
+            contiguous_diff = total_m_blocks - m_tile0
             contiguous_rem = (contiguous_diff > fx.Int32(0)).select(
                 contiguous_diff, fx.Int32(0)
             )
@@ -636,20 +581,11 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
             for _it in range(fx.Int32(0), n_iters, fx.Int32(1)):
                 strided_m = m_slot + fx.Int32(_it) * active_cu
                 contiguous_m = m_tile0 + fx.Int32(_it)
-                scheduled_m = skewed.select(strided_m, contiguous_m)
-                m_block = scheduled_m
-                if const_expr(skip_pair_compact_work):
-                    after_a = scheduled_m >= group_a_block
-                    after_b = scheduled_m >= second_threshold
-                    m_block = (
-                        scheduled_m
-                        + after_a.select(pair_blocks, fx.Int32(0))
-                        + after_b.select(pair_blocks, fx.Int32(0))
-                    )
+                m_block = skewed.select(strided_m, contiguous_m)
                 if active:
                     unit_bx = m_block * fx.Int32(num_n_blocks) + n_block
                     fx.barrier()
-                    if scheduled_m < scheduled_m_blocks:
+                    if m_block < total_m_blocks:
                         run_unskipped_unit(unit_bx, m_block)
         else:
             m_slot = bx_i32 // fx.Int32(num_n_blocks)
@@ -721,9 +657,7 @@ def run_mega_moe_stage2(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cu
     HIDDEN_MAX, INTER_MAX, cu_num, BN=256, BK=256, use_nt=True, g2_bhoist=True,
     g2_ascale_pf=True, g2_spart=402, persist=False, persist_cu=0, persist_strided=False,
     g2_bf16_lds=False, p2p_quant_type="none", fixed_slot_dispatch=False, skew_cu=0,
-    skip_pair_mask=0, runtime_pair_skip=False, lds_reserve_bytes=0,
-    skip_pair_compact_work=False,
-    skip_pair_tiles_per_cu=0, scatter_vec=8):
+    runtime_pair_skip=False, scatter_vec=8):
     # fmt: on
     """Compile or reuse one fused Stage2 configuration and launch it."""
     launch_cu_num = min(cu_num, persist_cu) if persist and persist_cu > 0 else cu_num
@@ -734,10 +668,7 @@ def run_mega_moe_stage2(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cu
         cu_num=launch_cu_num, g2_bhoist=g2_bhoist, g2_ascale_pf=g2_ascale_pf,
         g2_spart=g2_spart, persist_strided=persist_strided, g2_bf16_lds=g2_bf16_lds,
         p2p_quant_type=p2p_quant_type, fixed_slot_dispatch=fixed_slot_dispatch, skew_cu=skew_cu,
-        skip_pair_mask=skip_pair_mask, lds_reserve_bytes=lds_reserve_bytes,
         runtime_pair_skip=runtime_pair_skip,
-        skip_pair_compact_work=skip_pair_compact_work,
-        skip_pair_tiles_per_cu=skip_pair_tiles_per_cu,
         scatter_vec=scatter_vec,
     )
     max_m_blocks = (row_capacity + BM - 1) // BM
@@ -759,8 +690,7 @@ def preload_mega_moe_stage2(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, ar
     HIDDEN_MAX, INTER_MAX, cu_num, BN=256, BK=256, use_nt=True, g2_bhoist=True,
     g2_ascale_pf=True, g2_spart=402, persist=False, persist_cu=0, persist_strided=False,
     g2_bf16_lds=False, p2p_quant_type="none", fixed_slot_dispatch=False, skew_cu=0,
-    skip_pair_mask=0, runtime_pair_skip=False, lds_reserve_bytes=0,
-    skip_pair_compact_work=False, skip_pair_tiles_per_cu=0, scatter_vec=8):
+    runtime_pair_skip=False, scatter_vec=8):
 # fmt: on
     """Compile and load one fused Stage2 variant without dispatching it."""
     launch_cu_num = min(cu_num, persist_cu) if persist and persist_cu > 0 else cu_num
@@ -771,10 +701,7 @@ def preload_mega_moe_stage2(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, ar
         cu_num=launch_cu_num, g2_bhoist=g2_bhoist, g2_ascale_pf=g2_ascale_pf,
         g2_spart=g2_spart, persist_strided=persist_strided, g2_bf16_lds=g2_bf16_lds,
         p2p_quant_type=p2p_quant_type, fixed_slot_dispatch=fixed_slot_dispatch, skew_cu=skew_cu,
-        skip_pair_mask=skip_pair_mask, lds_reserve_bytes=lds_reserve_bytes,
         runtime_pair_skip=runtime_pair_skip,
-        skip_pair_compact_work=skip_pair_compact_work,
-        skip_pair_tiles_per_cu=skip_pair_tiles_per_cu,
         scatter_vec=scatter_vec,
     )
     max_m_blocks = (row_capacity + BM - 1) // BM
