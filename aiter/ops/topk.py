@@ -419,6 +419,53 @@ def top_k_per_row_prefill(
     )
 
 
+def flydsl_top_k_per_row_prefill(
+    logits: torch.Tensor,
+    rowStarts: torch.Tensor,
+    rowEnds: torch.Tensor,
+    indices: torch.Tensor,
+    values: torch.Tensor | None,
+    numRows: int,
+    stride0: int,
+    stride1: int,
+    k: int = 2048,
+    stable: bool = False,
+    max_effective_row_len: int | None = None,
+) -> None:
+    """Use FlyDSL for unordered indices-only prefill TopK, otherwise HIP."""
+    if values is not None or stable:
+        return top_k_per_row_prefill(
+            logits,
+            rowStarts,
+            rowEnds,
+            indices,
+            values,
+            numRows,
+            stride0,
+            stride1,
+            k,
+            stable,
+        )
+
+    from .flydsl.topk_per_row_prefill import (
+        flydsl_top_k_per_row_prefill as _impl,
+    )
+
+    return _impl(
+        logits,
+        rowStarts,
+        rowEnds,
+        indices,
+        values,
+        numRows,
+        stride0,
+        stride1,
+        k,
+        stable,
+        max_effective_row_len,
+    )
+
+
 @compile_ops("module_top_k_per_row", ffi_type="ctypes")
 def top_k_per_row_prefill_fast(
     logits: torch.Tensor,
