@@ -165,7 +165,8 @@ Otherwise → Tier 3 (individual kernel or model-specific code).
 ```
 
 The table is the snapshot the gate demands a line for; use Q1/Q2/Q3 on new files and add a
-line for any you judge Tier 1 or 2. Ranked by commit frequency (2025–2026), blast radius:
+line for any you judge Tier 1 or 2. **A C++ header 10+ translation units include is Tier 2
+too**, counted from the tree, not listed — `rules.md` § Tiering has the numbers. Ranked by commit frequency (2025–2026), blast radius:
 
 | Tier | File | Git commits | Blast radius | Failure mode |
 |------|------|-------------|-------------|--------------|
@@ -353,7 +354,7 @@ happen; go back to it rather than reporting.**
   echo "Step 6 structural checks not recorded — the card must not be written yet" >&2
   exit 1
 }
-"$SKILLS_ROOT/review-pr/triage.py" corefiles "$WORK/core_files.txt" "$WORK/pr.diff" || {
+"$SKILLS_ROOT/review-pr/triage.py" corefiles "$WORK/core_files.txt" "$WORK/pr.diff" "$PROJECT_ROOT" || {
   echo "Step 4 not performed for every backbone file — the card must not be written yet" >&2
   exit 1
 }

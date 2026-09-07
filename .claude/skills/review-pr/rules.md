@@ -498,6 +498,24 @@ after a swizzle.
 
 ## Tiering
 
+**A C++ header is Tier 2 when 10 or more translation units include it.** Step 4's tiers were
+all Python — "can `import aiter` still succeed" — so a review of a pure C++ PR reached the
+gate with nothing to declare and passed on a single `NONE` line. aiter#5273 rewrites a quant
+kernel and changes `csrc/include/aiter_opus_plus.h`, which 18 translation units include, and
+Step 4 exerted no force on it whatsoever.
+
+The threshold is measured, not chosen. Over 600 open PRs, fan-in >= 10 puts 56 diffs into
+tier 2 (9.3%) beside the Python table's 137 (22.8%); >= 20 drops to 47 and excludes
+`aiter_opus_plus.h` at 18, and no touched header sits between fan-in 20 and 50 — so the
+choice is this band or only the three giants. It is counted from the tree rather than listed
+for the reason D9's body already records: a list goes stale, and a header that becomes widely
+included later joins on its own.
+
+One exemption, by name, because there is exactly one of its kind: `rocm_ops.hpp`, the pybind11
+op registry. Fan-in 104, changed in 36 of the 600, and every one of those changes is a
+mechanical append for a new operator. A tier-2 rule that fires on all 36 teaches the reader to
+skip it.
+
 **Why `aiter/ops/*.py` is Tier 3 and not Tier 1**: by the Q1 test it looks like Tier 1 —
 `__init__.py` does `from .ops.xxx import *`, so breaking any one of them breaks `import aiter`.
 But there are 200+ files under `aiter/ops/`, and putting every single-kernel wrapper in the

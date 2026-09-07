@@ -1818,7 +1818,41 @@ ANCHOR_IDENT = re.compile(r"\b[a-z]+_[a-z_0-9]{2,}\b|\b[A-Z][A-Z0-9_]{3,}\b|"
                           r"\b(?=[a-z0-9]{3,}\b)[a-z]+\d[a-z0-9]*\b")
 
 
-def core_files_in(diff_text):
+# A header included by this many translation units is backbone whatever language it is in.
+# Step 4's tiers were all Python -- "can `import aiter` still succeed" -- so a review of a
+# pure C++ PR reached the gate with nothing to declare and passed on one `NONE` line. The
+# threshold is measured, not chosen: over 600 open PRs, >=10 puts 56 diffs into tier 2
+# (9.3%), against 137 (22.8%) for the Python table; >=20 drops to 47 and excludes
+# aiter_opus_plus.h at fan-in 18, and nothing sits between 20 and 50, so the choice is
+# this band or only the three giants.
+HEADER_FANIN_TIER2 = 10
+# The one exemption, and it is a name because there is exactly one of its kind: a pybind11
+# op registry that every new operator appends to mechanically. Fan-in 104, changed in 36 of
+# the 600, and a tier-2 rule that fires on all of them teaches the reader to ignore it.
+GENERATED_REGISTRIES = ("rocm_ops.hpp",)
+_FANIN_CACHE = {}
+
+
+def header_fanin(root):
+    """{header basename: how many files include it} for one tree, computed once."""
+    root = pathlib.Path(root)
+    key = str(root)
+    if key not in _FANIN_CACHE:
+        counts = collections.Counter()
+        for f in root.rglob("*"):
+            if f.suffix not in (".cu", ".cuh", ".cpp", ".hpp", ".h") or ".git/" in str(f):
+                continue
+            try:
+                txt = f.read_text(errors="replace")
+            except OSError:
+                continue
+            for m in re.finditer(r'#\s*include\s*[<"]([^">]+)[">]', txt):
+                counts[m.group(1).rsplit("/", 1)[-1]] += 1
+        _FANIN_CACHE[key] = counts
+    return _FANIN_CACHE[key]
+
+
+def core_files_in(diff_text, root=None):
     """(path, tier) for every backbone file this diff touches, from the table only.
 
     Q2/Q3 of Step 4 ("is this the dispatch for an op used by >1 model family") need
@@ -1826,11 +1860,17 @@ def core_files_in(diff_text):
     add lines for files the table does not know. What a machine can decide is the
     table, and the table is what it demands a line for."""
     touched = changed_paths(diff_text)
+    fanin = header_fanin(root) if root else {}
     out = []
     for p in sorted(touched):
+        base = p.rsplit("/", 1)[-1]
         if p in TIER1:
             out.append((p, "1"))
         elif p in TIER2:
+            out.append((p, "2"))
+        elif (base.endswith((".h", ".hpp", ".cuh"))
+              and base not in GENERATED_REGISTRIES
+              and fanin.get(base, 0) >= HEADER_FANIN_TIER2):
             out.append((p, "2"))
     return out
 
@@ -1842,7 +1882,7 @@ def changed_tokens(diff_text):
     return set(ANCHOR_IDENT.findall(body))
 
 
-def audit_core_files(text, diff_text):
+def audit_core_files(text, diff_text, root=None):
     """Step 4 as an artifact: one adjudication per backbone file the diff touches.
 
     Step 4 was the last step that produced nothing. It could be skipped in silence and
@@ -1855,7 +1895,7 @@ def audit_core_files(text, diff_text):
     itself, or only code this PR never touched, is a sentence that would be equally true
     of every other PR against that file, which is what "it is a core file, blast radius
     is large" costs nothing to write."""
-    want = core_files_in(diff_text)
+    want = core_files_in(diff_text, root)
     tier_of = dict(want)
     touched = changed_paths(diff_text)
     tokens = changed_tokens(diff_text)
@@ -2077,7 +2117,7 @@ if __name__ == "__main__":
               "       triage.py perfclaims <pr_meta.json>\n"
               "       triage.py structabi <diff> <root>\n"
               "       triage.py commentonly <diff>\n"
-              "       triage.py corefiles <core_files.txt> <diff>\n"
+              "       triage.py corefiles <core_files.txt> <diff> [root]\n"
               "       triage.py kerneltest <diff>\n"
               "       triage.py siblings <diff> <root>\n"
               "       triage.py guards <diff>\n"
@@ -2141,7 +2181,8 @@ if __name__ == "__main__":
                   f"backbone set cannot be computed", file=sys.stderr)
             raise SystemExit(1)
         want, seen, problems = audit_core_files(
-            core_path.read_text(errors="replace"), diff_text)
+            core_path.read_text(errors="replace"), diff_text,
+            tree_root(sys.argv[4]) if len(sys.argv) > 4 else None)
         for kind, what, why in problems:
             print(f"{kind}: {what}")
             print(f"  {why}")
