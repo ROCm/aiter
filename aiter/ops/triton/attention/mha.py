@@ -14,7 +14,7 @@ try:
         mha_fwd_gluon,
     )
 except:  # noqa: E722
-    is_mha_gluon_avail = lambda **kwargs: False
+    is_mha_gluon_avail = lambda *args, **kwargs: False
     mha_fwd_gluon = None
 
 from aiter.ops.triton._triton_kernels.attention.mha import _attn_fwd, _get_config
