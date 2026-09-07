@@ -114,15 +114,23 @@ def perftest(
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     data = run_iters_rotate(num_iters, func, rotate_args)
-                with tpf.profile(
-                    activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
-                    profile_memory=True,
-                    with_stack=True,
-                    with_modules=True,
-                ) as prof:
-                    run_iters(1, graph.replay)
-                avg = get_trace_perf(prof, num_iters)
-                logger.info(f"avg: {avg} us/iter with hipgraph")
+                # Time the replay's WALL clock / num_iters, NOT per-kernel trace time.
+                # One replay runs num_iters kernels back-to-back with no host gaps, so
+                # wall/num_iters is steady-state throughput (matches a C++ event-around-
+                # the-loop benchmark). get_trace_perf instead sums each kernel's own
+                # device-time window, which double-counts the memory-pipeline fill/drain
+                # and negates the graph -- for memory-bound kernels that reads ~10% high.
+                for _ in range(3):
+                    graph.replay()
+                torch.cuda.synchronize()
+                g_start = torch.cuda.Event(enable_timing=True)
+                g_end = torch.cuda.Event(enable_timing=True)
+                g_start.record()
+                graph.replay()
+                g_end.record()
+                torch.cuda.synchronize()
+                avg = g_start.elapsed_time(g_end) * 1000.0 / num_iters
+                logger.info(f"avg: {avg} us/iter with hipgraph (wall/N)")
 
             if os.environ.get("AITER_SMI_MONITOR", "0") == "1":
                 # Import lazily: normal library/test use has no amdsmi dependency.

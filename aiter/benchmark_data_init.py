@@ -18,8 +18,9 @@ import torch
 # data plus a tiny E8M0 (or E4M3) scale per block. fill_fp* emit those on-wire
 # buffers. Large 2-D tensors are filled in row chunks (~1 GiB f32 staging).
 # --------------------------------------------------------------------------- #
-DATA_DISTS = ("zero", "constant", "uniform", "norm")
-SCALE_DISTS = DATA_DISTS
+DATA_DISTS = ("zero", "constant", "uniform", "norm", "poc")
+# POC scales are supported by the E8M0 helper, not the generic float-scale helper.
+SCALE_DISTS = ("zero", "constant", "uniform", "norm")
 SCALE_UNIFORM = (0.5, 2.0)
 SCALE_NORM_MEAN, SCALE_NORM_STD = 1.0, 0.25
 FP8_E4M3 = torch.float8_e4m3fn
@@ -30,7 +31,15 @@ E8M0_NEUTRAL = 0x7F  # 2^0 = 1.0
 E4M3_NEUTRAL = 0x38  # e4m3 exp bias -> 1.0
 E4M3_SCALE_MEAN, E4M3_SCALE_STD = 0.34375, 0.08
 POW2_BINOMIAL_N = 10
-E8M0_SCALE_DISTS = ("zero", "constant", "uniform", "norm", "auto", "pow2_binomial")
+E8M0_SCALE_DISTS = (
+    "zero",
+    "constant",
+    "uniform",
+    "norm",
+    "auto",
+    "pow2_binomial",
+    "poc",
+)
 E4M3_SCALE_DISTS = ("zero", "constant", "uniform", "norm", "auto")
 _STAGE_ELEMS = 1 << 28  # 256M f32 = 1 GiB per chunk
 
@@ -55,7 +64,7 @@ def add_data_init_args(
         nargs="+",
         choices=list(DATA_DISTS),
         default=[default_dist],
-        help="DATA init: zero | constant | uniform | norm (N(0,1)). "
+        help="DATA init: zero | constant | uniform | norm (N(0,1)) | poc. "
         "e.g.: --data-init uniform norm",
     )
     if include_scale:
@@ -101,6 +110,14 @@ def _sample_data_f32(shape, dist, gen, *, lo, hi, device):
         return torch.empty(shape, dtype=torch.float32, device=device).normal_(
             0.0, 1.0, generator=gen
         )
+    if dist == "poc":
+        # Match the POC data distribution: random signed FP4-representable levels.
+        levels = torch.tensor(
+            [0.5, 1.0, 1.5, 2.0, 3.0], dtype=torch.float32, device=device
+        )
+        idx = torch.randint(0, 5, shape, generator=gen, device=device)
+        sign = torch.randint(0, 2, shape, generator=gen, device=device) * 2 - 1
+        return levels[idx] * sign.to(torch.float32)
     raise ValueError(f"data dist {dist!r} is not continuous; use fill dispatch")
 
 
@@ -148,8 +165,9 @@ def fill(
 ):
     """Return a ``dtype`` DATA tensor of ``shape``.
 
-    ``dist`` in {zero, constant, uniform, norm}. ``uniform`` is U(lo, hi);
+    ``dist`` in {zero, constant, uniform, norm, poc}. ``uniform`` is U(lo, hi);
     ``norm`` / ``gaussian`` is N(0, 1). ``zero`` / ``constant`` ignore ``gen``.
+    ``poc`` samples random signed values from {0.5, 1, 1.5, 2, 3}.
     """
     dist = _canon_dist(dist, DATA_DISTS)
     return _fill_sampled(
@@ -176,8 +194,9 @@ def fill_scale(
 ):
     """Return a non-negative float SCALE tensor of ``shape``.
 
-    Same dist names as ``fill``, sampled independently. ``constant`` defaults
-    to 1.0 (neutral). ``norm`` is N(1, 0.25) clamped >= 0 -- not DATA's N(0,1).
+    ``dist`` in {zero, constant, uniform, norm}, sampled independently of DATA.
+    ``constant`` defaults to 1.0 (neutral). ``norm`` is N(1, 0.25) clamped >= 0
+    -- not DATA's N(0,1).
     For MX on-wire scales use ``fill_scale_e8m0`` / ``fill_scale_e4m3``.
     """
     dist = _canon_dist(dist, SCALE_DISTS)
@@ -299,6 +318,7 @@ def fill_scale_e8m0(
     ``zero`` / ``constant`` / ``uniform`` / ``norm`` map from our SCALE dists
     (float then round to nearest power-of-two byte). ``auto`` /
     ``pow2_binomial`` match the MX GEMM default: 2^(Binomial(21,0.5)-11).
+    ``poc`` samples powers of two with uniformly distributed exponents in [-2, 2].
     """
     if dist == "gaussian":
         dist = "norm"
@@ -311,6 +331,10 @@ def fill_scale_e8m0(
     if dist in ("uniform", "norm"):
         v = fill_scale(shape, dist, gen, device=device)
         return _f32_to_e8m0(v)
+    if dist == "poc":
+        # Match the POC E8M0 scales: {0.25, 0.5, 1, 2, 4}, encoded as exponent+127.
+        e = torch.randint(-2, 3, shape, dtype=torch.int32, device=device, generator=gen)
+        return (e + E8M0_BIAS).clamp_(0, 255).to(torch.uint8)
     # auto / pow2_binomial: Binomial(k, 0.5) == popcount of a uniform k-bit int
     trials = 2 * n + 1
     assert trials <= 24, "pow2_binomial popcount path assumes <= 24 trials"
