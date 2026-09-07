@@ -13,7 +13,7 @@ import csv
 import functools
 import os
 from enum import IntEnum
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 from torch import Tensor
@@ -153,6 +153,22 @@ class AttentionScaleMode(IntEnum):
     F32_PER_TOKEN = 3
     F32_PER_CHANNEL = 4
     E8M0_PER_1X32 = 5
+
+
+class _RawRecipeKind(IntEnum):
+    BF16 = 0
+    BF16_FP8 = 1
+    INT8_FP8 = 2
+    MXFP8 = 3
+    FP8 = 4
+    MXFP6 = 5
+    MXFP4 = 6
+
+
+class _RawRecipePlan(NamedTuple):
+    kind: _RawRecipeKind
+    scale_modes: tuple[AttentionScaleMode, AttentionScaleMode, AttentionScaleMode]
+    v_pack: AttentionPack
 
 
 _FP8_FORMATS = (AttentionFormat.FP8_E4M3, AttentionFormat.FP8_E4M3_FNUZ)
@@ -368,6 +384,82 @@ def _raw_scale_recipe(
     scale_modes = (q_scale_mode, k_scale_mode, v_scale_mode)
     _validate_scale_recipe(q_format, k_format, v_format, scale_modes)
     return scale_modes
+
+
+def _resolve_raw_recipe(
+    q_format: AttentionFormat,
+    k_format: AttentionFormat,
+    v_format: AttentionFormat,
+    q_scale_mode: Optional[AttentionScaleMode],  # noqa: UP045
+    k_scale_mode: Optional[AttentionScaleMode],  # noqa: UP045
+    v_scale_mode: Optional[AttentionScaleMode],  # noqa: UP045
+    *,
+    sparse: bool,
+) -> _RawRecipePlan:
+    scale_modes = _raw_scale_recipe(
+        q_format,
+        k_format,
+        v_format,
+        q_scale_mode,
+        k_scale_mode,
+        v_scale_mode,
+    )
+
+    if q_format == AttentionFormat.BF16:
+        if sparse:
+            raise NotImplementedError(
+                "sorted-sparse MHA v4 does not have a BF16 manifest row yet"
+            )
+        kind = (
+            _RawRecipeKind.BF16
+            if v_format == AttentionFormat.BF16
+            else _RawRecipeKind.BF16_FP8
+        )
+    elif scale_modes == _MXFP8_SCALE_MODES:
+        kind = _RawRecipeKind.MXFP8
+    elif q_format == AttentionFormat.INT8:
+        kind = _RawRecipeKind.INT8_FP8
+    elif q_format in _FP8_FORMATS:
+        kind = _RawRecipeKind.FP8
+    elif q_format == AttentionFormat.MXFP4:
+        if v_format == AttentionFormat.MXFP6:
+            raise NotImplementedError(
+                "raw preprocessing is not implemented yet for "
+                f"Q={q_format.name}, K={k_format.name}, V={v_format.name}"
+            )
+        # Sparse still uses the legacy FP8-V row; update this mode split when its MXFP4-V row lands.
+        if not sparse and _is_fp8_format(v_format):
+            raise NotImplementedError(
+                "dense MXFP4 Q/K with FP8 V does not have a kernel row yet"
+            )
+        kind = _RawRecipeKind.MXFP4
+    elif q_format == AttentionFormat.MXFP6:
+        # Dense already has MXFP6 Q/K/V; remove this guard when the matching sparse row lands.
+        if sparse and v_format == AttentionFormat.MXFP6:
+            raise NotImplementedError(
+                "sorted-sparse MXFP6 Q/K/V does not have a kernel row yet"
+            )
+        kind = _RawRecipeKind.MXFP6
+    else:
+        raise NotImplementedError(
+            "raw preprocessing is not implemented yet for "
+            f"Q={q_format.name}, K={k_format.name}, V={v_format.name}"
+        )
+
+    # Sparse FP6-P recipes still use canonical V packing; align them when those rows are updated.
+    uses_dense_p_pack = not sparse and (
+        (kind == _RawRecipeKind.FP8 and v_format == AttentionFormat.MXFP6)
+        or (
+            kind == _RawRecipeKind.MXFP6
+            and v_format in (AttentionFormat.MXFP6, AttentionFormat.MXFP4)
+        )
+    )
+    v_pack = (
+        AttentionPack.V_FOR_FP6_P
+        if uses_dense_p_pack
+        else AttentionPack.DEFAULT
+    )
+    return _RawRecipePlan(kind, scale_modes, v_pack)
 
 
 def _packed_lut_triple(
@@ -988,15 +1080,17 @@ def mha_v4(
     if return_lse:
         raise NotImplementedError("MHA v4 kernels do not produce LSE yet")
     out = _validate_mha_v4_raw_inputs(q, k, v, out, "mha_v4")
-    scale_modes = _raw_scale_recipe(
+    sparse = block_mask is not None
+    recipe = _resolve_raw_recipe(
         q_format,
         k_format,
         v_format,
         q_scale_mode,
         k_scale_mode,
         v_scale_mode,
+        sparse=sparse,
     )
-    q_scale_mode, k_scale_mode, v_scale_mode = scale_modes
+    q_scale_mode, k_scale_mode, v_scale_mode = recipe.scale_modes
 
     lut_indices: Optional[Tensor] = None  # noqa: UP045
     lut_start: Optional[Tensor] = None  # noqa: UP045
@@ -1008,46 +1102,15 @@ def mha_v4(
         "lut_start": lut_start,
         "lut_count": lut_count,
     }
-    v_pack = AttentionPack.DEFAULT
-    if q_format == AttentionFormat.BF16 and v_format == AttentionFormat.BF16:
-        return mha_v4_packed(
-            q,
-            k,
-            v,
-            q,
-            k,
-            v,
-            q_format,
-            k_format,
-            v_format,
-            q_scale_mode,
-            k_scale_mode,
-            v_scale_mode,
-            softmax_scale=softmax_scale,
-            out=out,
-            return_lse=return_lse,
-            **packed_lut,
-        )
-    if q_format == AttentionFormat.BF16 and _is_fp8_format(v_format):
+    if recipe.kind == _RawRecipeKind.BF16:
+        q_quantized, q_descale = q, q
+        k_quantized, k_descale = k, k
+        v_quantized, v_descale = v, v
+    elif recipe.kind == _RawRecipeKind.BF16_FP8:
+        q_quantized, q_descale = q, q
+        k_quantized, k_descale = k, k
         v_quantized, v_descale = quantize_fp8(v)
-        return mha_v4_packed(
-            q,
-            k,
-            v_quantized,
-            q,
-            k,
-            v_descale,
-            q_format,
-            k_format,
-            v_format,
-            q_scale_mode,
-            k_scale_mode,
-            v_scale_mode,
-            softmax_scale=softmax_scale,
-            out=out,
-            **packed_lut,
-        )
-    if scale_modes == _MXFP8_SCALE_MODES:
+    elif recipe.kind == _RawRecipeKind.MXFP8:
         if softmax_scale is None:
             softmax_scale = 128**-0.5
         q_quantized, q_descale = quantize_mxfp8_q(
@@ -1055,27 +1118,20 @@ def mha_v4(
         )
         k_quantized, k_descale = quantize_mxfp8_k(k)
         v_quantized, v_descale = quantize_fp8(v)
-    elif q_format == AttentionFormat.INT8 and _is_fp8_format(v_format):
+    elif recipe.kind == _RawRecipeKind.INT8_FP8:
         q_quantized, q_descale = quantize_int8(q)
         k_quantized, k_descale = quantize_int8(k)
         v_quantized, v_descale = quantize_fp8(v)
-    elif q_format in _FP8_FORMATS and v_format in (
-        q_format,
-        AttentionFormat.MXFP6,
-    ):
+    elif recipe.kind == _RawRecipeKind.FP8:
         q_quantized, q_descale = quantize_fp8_rotated(q)
         k_quantized, k_descale = quantize_fp8_rotated(k)
         if _is_fp8_format(v_format):
             v_quantized, v_descale = quantize_fp8(v)
-        elif lut_indices is None:
+        elif recipe.v_pack == AttentionPack.V_FOR_FP6_P:
             v_quantized, v_descale = quantize_v_mxfp6_fp6_p(v)
-            v_pack = AttentionPack.V_FOR_FP6_P
         else:
             v_quantized, v_descale = quantize_v_mxfp6(v)
-    elif q_format == AttentionFormat.MXFP4 and v_format in (
-        *_FP8_FORMATS,
-        AttentionFormat.MXFP4,
-    ):
+    elif recipe.kind == _RawRecipeKind.MXFP4:
         if softmax_scale is None:
             softmax_scale = 128**-0.5
         q_quantized, q_descale = quantize_mxfp4_q(q, mha_v4_q_multiplier(softmax_scale))
@@ -1094,7 +1150,7 @@ def mha_v4(
                 v_descale,
                 out,
                 int(v_format),
-                int(v_pack),
+                int(recipe.v_pack),
                 softmax_scale,
             )
             return out
@@ -1104,30 +1160,9 @@ def mha_v4(
             if _is_fp8_format(v_format)
             else mxfp4_v_view(v_quantized, v_descale, k.shape[1])
         )
-        return mha_v4_packed(
-            q_quantized,
-            k_view,
-            v_view,
-            q_descale,
-            k_descale,
-            v_descale,
-            q_format,
-            k_format,
-            v_format,
-            q_scale_mode,
-            k_scale_mode,
-            v_scale_mode,
-            softmax_scale=softmax_scale,
-            out=out,
-            return_lse=return_lse,
-            v_pack=v_pack,
-            **packed_lut,
-        )
-    elif q_format == AttentionFormat.MXFP6 and v_format in (
-        *_FP8_FORMATS,
-        AttentionFormat.MXFP6,
-        AttentionFormat.MXFP4,
-    ):
+        k_quantized = k_view
+        v_quantized = v_view
+    elif recipe.kind == _RawRecipeKind.MXFP6:
         if softmax_scale is None:
             softmax_scale = 128**-0.5
         q_quantized, q_descale = quantize_mxfp6_q(q, mha_v4_q_multiplier(softmax_scale))
@@ -1135,15 +1170,9 @@ def mha_v4(
         if _is_fp8_format(v_format):
             v_quantized, v_descale = quantize_v_fp8(v)
         elif v_format == AttentionFormat.MXFP6:
-            if lut_indices is not None:
-                raise NotImplementedError(
-                    "sorted-sparse MXFP6 Q/K/V does not have a kernel row yet"
-                )
             v_quantized, v_descale = quantize_v_mxfp6_fp6_p(v)
-            v_pack = AttentionPack.V_FOR_FP6_P
-        elif lut_indices is None:
+        elif recipe.v_pack == AttentionPack.V_FOR_FP6_P:
             v_quantized, v_descale = quantize_v_mxfp4_fp6_p(v)
-            v_pack = AttentionPack.V_FOR_FP6_P
         else:
             v_quantized, v_descale = quantize_v_mxfp4(v)
         if lut_indices is None:
@@ -1158,7 +1187,7 @@ def mha_v4(
                 k.shape[1],
                 k.shape[2],
                 int(v_format),
-                int(v_pack),
+                int(recipe.v_pack),
                 softmax_scale,
             )
             return out
@@ -1170,30 +1199,11 @@ def mha_v4(
             if v_format != AttentionFormat.MXFP4
             else mxfp4_v_view(v_quantized, v_descale, k.shape[1])
         )
-        return mha_v4_packed(
-            q_quantized,
-            k_view,
-            v_view,
-            q_descale,
-            k_descale_view,
-            v_descale,
-            q_format,
-            k_format,
-            v_format,
-            q_scale_mode,
-            k_scale_mode,
-            v_scale_mode,
-            softmax_scale=softmax_scale,
-            out=out,
-            return_lse=return_lse,
-            v_pack=v_pack,
-            **packed_lut,
-        )
+        k_quantized = k_view
+        k_descale = k_descale_view
+        v_quantized = v_view
     else:
-        raise NotImplementedError(
-            "raw preprocessing is not implemented yet for "
-            f"Q={q_format.name}, K={k_format.name}, V={v_format.name}"
-        )
+        raise AssertionError(f"unhandled MHA v4 raw recipe: {recipe.kind!r}")
 
     return mha_v4_packed(
         q_quantized,
@@ -1211,6 +1221,6 @@ def mha_v4(
         softmax_scale=softmax_scale,
         out=out,
         return_lse=return_lse,
-        v_pack=v_pack,
+        v_pack=recipe.v_pack,
         **packed_lut,
     )

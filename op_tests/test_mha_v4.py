@@ -18,6 +18,8 @@ from aiter.ops.mha_v4 import (
     AttentionFormat,
     AttentionPack,
     AttentionScaleMode,
+    _RawRecipeKind,
+    _resolve_raw_recipe,
     mha_v4,
     mha_v4_kv_tile,
     mha_v4_packed,
@@ -215,6 +217,110 @@ def test_mha_v4_bf16fp8_scale_recipe():
         AttentionScaleMode.NONE,
         AttentionScaleMode.F32_PER_TENSOR,
     )
+
+
+@pytest.mark.parametrize(
+    ("q_format", "v_format", "sparse", "kind", "v_pack"),
+    [
+        (
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            False,
+            _RawRecipeKind.BF16,
+            AttentionPack.DEFAULT,
+        ),
+        (
+            AttentionFormat.FP8,
+            AttentionFormat.MXFP6,
+            False,
+            _RawRecipeKind.FP8,
+            AttentionPack.V_FOR_FP6_P,
+        ),
+        (
+            AttentionFormat.FP8,
+            AttentionFormat.MXFP6,
+            True,
+            _RawRecipeKind.FP8,
+            AttentionPack.DEFAULT,
+        ),
+        (
+            AttentionFormat.MXFP4,
+            AttentionFormat.MXFP4,
+            False,
+            _RawRecipeKind.MXFP4,
+            AttentionPack.DEFAULT,
+        ),
+        (
+            AttentionFormat.MXFP6,
+            AttentionFormat.MXFP4,
+            False,
+            _RawRecipeKind.MXFP6,
+            AttentionPack.V_FOR_FP6_P,
+        ),
+        (
+            AttentionFormat.MXFP6,
+            AttentionFormat.MXFP4,
+            True,
+            _RawRecipeKind.MXFP6,
+            AttentionPack.DEFAULT,
+        ),
+    ],
+)
+def test_mha_v4_resolves_raw_recipe(q_format, v_format, sparse, kind, v_pack):
+    recipe = _resolve_raw_recipe(
+        q_format,
+        q_format,
+        v_format,
+        None,
+        None,
+        None,
+        sparse=sparse,
+    )
+    assert recipe.kind == kind
+    assert recipe.v_pack == v_pack
+    assert recipe.scale_modes == scale_modes_for_formats(q_format, q_format, v_format)
+
+
+@pytest.mark.parametrize(
+    ("q_format", "v_format", "message"),
+    [
+        (
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            "does not have a BF16 manifest row",
+        ),
+        (
+            AttentionFormat.MXFP6,
+            AttentionFormat.MXFP6,
+            "MXFP6 Q/K/V",
+        ),
+    ],
+)
+def test_mha_v4_rejects_unavailable_sparse_recipe(q_format, v_format, message):
+    with pytest.raises(NotImplementedError, match=message):
+        _resolve_raw_recipe(
+            q_format,
+            q_format,
+            v_format,
+            None,
+            None,
+            None,
+            sparse=True,
+        )
+
+
+@pytest.mark.parametrize("sparse", [False, True])
+def test_mha_v4_rejects_unimplemented_mxfp4_mxfp6_recipe(sparse):
+    with pytest.raises(NotImplementedError, match="raw preprocessing is not implemented"):
+        _resolve_raw_recipe(
+            AttentionFormat.MXFP4,
+            AttentionFormat.MXFP4,
+            AttentionFormat.MXFP6,
+            None,
+            None,
+            None,
+            sparse=sparse,
+        )
 
 
 def test_mha_v4_rejects_f8f4_format_pair():
