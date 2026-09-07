@@ -52,7 +52,7 @@ BUF_VIEW_MAX_ELEMS = 0xFFFFFFFF
 
 
 def buf_base_i64(base):
-    """i64 base address of *base*: an fx pointer, or an already-computed address.
+    """i64 base address of *base*: an fx pointer, a tensor/memref, or an address.
 
     Lets a caller narrow a descriptor to one row (``ptr + row * row_bytes``)
     without first materialising a pointer for it.
@@ -60,7 +60,11 @@ def buf_base_i64(base):
     raw = extract_to_ir_values(base)[0]
     if str(raw.type).startswith(("!fly.ptr", "!llvm.ptr")):
         return fx.Int64(ptrtoint(base))
-    return fx.Int64(base)
+    if isinstance(raw.type, (ir.IntegerType, ir.IndexType)):
+        return fx.Int64(base)
+    # tensor / memref kernel arg: take its aligned base pointer.
+    aligned = fly.extract_aligned_pointer_as_index(ir.Type.parse("!llvm.ptr<1>"), raw)
+    return fx.Int64(llvm.PtrToIntOp(T.i64, aligned).result)
 
 
 def ptr_buf_tensor(
@@ -117,6 +121,33 @@ def ptr_buf_tensor(
 def buf_copy_atom(unit_bytes, elem=fx.Int32, cache_modifier=0):
     """Copy atom for a ``unit_bytes``-wide buffer access (0=cached, 2=nt)."""
     return fx.make_copy_atom(_BUF_COPY_ATOM[unit_bytes](cache_modifier), elem)
+
+
+def buf_scalar_load(t, index, cache_modifier=0):
+    """``t[index]`` as an ``s_buffer_load``: one dword landing in an SGPR.
+
+    *index* must be wave-uniform; nothing here checks that. Use it where the
+    result has to stay scalar -- e.g. a row that then narrows a per-row buffer
+    descriptor, which otherwise goes through a readfirstlane waterfall.
+
+    The layout API has no scalar spelling: ``t[i]`` and every ``BufferCopy*``
+    atom lower to ``rocdl.raw.ptr.buffer.load`` (VGPR), and ROCDL exposes no
+    ``s.buffer.load`` op to wrap. Hence the raw intrinsic, whose resource
+    operand is a v4i32 rather than the opaque buffer pointer.
+    """
+    rsrc = _to_raw(fx.rocdl.get_buffer_rsrc(fx.get_iter(t)))
+    rsrc_v4 = llvm.bitcast(
+        ir.VectorType.get([4], T.i32),
+        llvm.ptrtoint(ir.IntegerType.get_signless(128), rsrc),
+    )
+    return llvm.call_intrinsic(
+        T.i32,
+        "llvm.amdgcn.s.buffer.load.i32",
+        # The intrinsic offset is in bytes; `index` counts dwords.
+        [rsrc_v4, _to_raw(fx.Int32(index) * 4), _to_raw(fx.Int32(cache_modifier))],
+        [],
+        [],
+    )
 
 
 # GTensor takes MLIR scalar types (``T.f32``); the buffer views take fx classes.
@@ -445,11 +476,7 @@ class GTensor(TensorBase):
     @staticmethod
     def base_addr_i64(ptr, ptr_type="!llvm.ptr<1>"):
         """i64 base address of an fx pointer or a fly/memref value."""
-        raw = extract_to_ir_values(ptr)[0]
-        if str(raw.type).startswith("!fly.ptr"):
-            return fx.Int64(ptrtoint(ptr))
-        base_ptr = fly.extract_aligned_pointer_as_index(ir.Type.parse(ptr_type), raw)
-        return fx.Int64(llvm.PtrToIntOp(T.i64, base_ptr).result)
+        return buf_base_i64(ptr)
 
     def get_llvm_ptr(self, ptr, bytes_offset_i64, ptr_type="!llvm.ptr<1>"):
         # fx.Int64 coerces index / i32 / i64 byte offsets to i64.
