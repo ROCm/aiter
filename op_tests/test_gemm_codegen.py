@@ -1037,6 +1037,47 @@ def test_runtime_arch_resolution():
         core.get_gfx_list.cache_clear()
 
 
+def test_cpp_itfs_cache_identity():
+    _section("1c. cpp_itfs cache paths include architecture")
+
+    import csrc.cpp_itfs.utils as cpp_utils
+
+    original_gpu_arch = cpp_utils.GPU_ARCH
+    original_build_dir = cpp_utils.BUILD_DIR
+    try:
+        cpp_utils.GPU_ARCH = "gfx942"
+        cpp_utils.get_arch_key.cache_clear()
+        gfx942_dir = cpp_utils.get_template_build_dir("same_specialization")
+        cpp_utils.GPU_ARCH = "gfx950"
+        cpp_utils.get_arch_key.cache_clear()
+        gfx950_dir = cpp_utils.get_template_build_dir("same_specialization")
+        _check(
+            "template library cache separates gfx942 and gfx950",
+            gfx942_dir != gfx950_dir,
+            f"{gfx942_dir!r} vs {gfx950_dir!r}",
+        )
+
+        with tempfile.TemporaryDirectory() as build_dir:
+            cpp_utils.BUILD_DIR = build_dir
+            cpp_utils.GPU_ARCH = "gfx942;gfx950"
+            cpp_utils.get_arch_key.cache_clear()
+            constexprs = {"X": 1}
+            hsaco_name = cpp_utils.get_default_func_name("kernel", (1,))
+            actual_dir = os.path.join(build_dir, "gfx950")
+            os.makedirs(actual_dir)
+            with open(os.path.join(actual_dir, f"{hsaco_name}.hsaco"), "wb") as f:
+                f.write(b"test")
+            with mock.patch.object(cpp_utils, "get_gfx_runtime", return_value="gfx950"):
+                _check(
+                    "HSACO lookup uses live arch, not composite build target path",
+                    cpp_utils.check_hsaco("kernel", constexprs),
+                )
+    finally:
+        cpp_utils.GPU_ARCH = original_gpu_arch
+        cpp_utils.BUILD_DIR = original_build_dir
+        cpp_utils.get_arch_key.cache_clear()
+
+
 def test_unmatched_targets():
     _section("2b. unmatched_targets — which build targets have no tuned rows")
 
@@ -1082,6 +1123,7 @@ def test_unmatched_targets():
 if __name__ == "__main__":
     test_get_build_targets()
     test_runtime_arch_resolution()
+    test_cpp_itfs_cache_identity()
     test_unmatched_targets()
     test_gen_instances_filter(
         csv_path=REPRO_CSV,
