@@ -1059,6 +1059,44 @@ def test_runtime_arch_resolution():
         core.get_gfx_list.cache_clear()
 
 
+def test_unmatched_targets():
+    _section("2b. unmatched_targets — which build targets have no tuned rows")
+
+    import pandas as pd
+
+    df = pd.DataFrame(
+        {
+            "gfx": [TARGET_A[0], TARGET_B[0]],
+            "cu_num": [TARGET_A[1], TARGET_B[1]],
+            "libtype": ["ck", "ck"],
+        }
+    )
+
+    _check(
+        "every target tuned -> nothing reported",
+        unmatched_targets(df, [TARGET_A, TARGET_B]) == [],
+    )
+    _check(
+        "untuned target is named as 'gfx:cu_num'",
+        unmatched_targets(df, [TARGET_A, TARGET_D]) == [f"{TARGET_D[0]}:{TARGET_D[1]}"],
+        str(unmatched_targets(df, [TARGET_A, TARGET_D])),
+    )
+    # The frame reaching the check is empty when the CSV has no rows of that
+    # libtype at all -- the case the old len(tune_df) guard swallowed.
+    empty = df[df["libtype"] == "cktile"]
+    _check(
+        "wholly missing libtype reports every target",
+        unmatched_targets(empty, [TARGET_A, TARGET_B])
+        == [f"{TARGET_A[0]}:{TARGET_A[1]}", f"{TARGET_B[0]}:{TARGET_B[1]}"],
+        str(unmatched_targets(empty, [TARGET_A, TARGET_B])),
+    )
+    _check(
+        "filter_tune_df takes only the frame and the targets",
+        list(inspect.signature(filter_tune_df).parameters) == ["tune_df", "targets"],
+        str(inspect.signature(filter_tune_df)),
+    )
+
+
 def test_cpp_itfs_cache_identity():
     _section("1c. cpp_itfs cache paths include architecture")
 
@@ -1100,44 +1138,6 @@ def test_cpp_itfs_cache_identity():
         cpp_utils.get_arch_key.cache_clear()
 
 
-def test_unmatched_targets():
-    _section("2b. unmatched_targets — which build targets have no tuned rows")
-
-    import pandas as pd
-
-    df = pd.DataFrame(
-        {
-            "gfx": [TARGET_A[0], TARGET_B[0]],
-            "cu_num": [TARGET_A[1], TARGET_B[1]],
-            "libtype": ["ck", "ck"],
-        }
-    )
-
-    _check(
-        "every target tuned -> nothing reported",
-        unmatched_targets(df, [TARGET_A, TARGET_B]) == [],
-    )
-    _check(
-        "untuned target is named as 'gfx:cu_num'",
-        unmatched_targets(df, [TARGET_A, TARGET_D]) == [f"{TARGET_D[0]}:{TARGET_D[1]}"],
-        str(unmatched_targets(df, [TARGET_A, TARGET_D])),
-    )
-    # The frame reaching the check is empty when the CSV has no rows of that
-    # libtype at all -- the case the old len(tune_df) guard swallowed.
-    empty = df[df["libtype"] == "cktile"]
-    _check(
-        "wholly missing libtype reports every target",
-        unmatched_targets(empty, [TARGET_A, TARGET_B])
-        == [f"{TARGET_A[0]}:{TARGET_A[1]}", f"{TARGET_B[0]}:{TARGET_B[1]}"],
-        str(unmatched_targets(empty, [TARGET_A, TARGET_B])),
-    )
-    _check(
-        "filter_tune_df takes only the frame and the targets",
-        list(inspect.signature(filter_tune_df).parameters) == ["tune_df", "targets"],
-        str(inspect.signature(filter_tune_df)),
-    )
-
-
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -1145,8 +1145,8 @@ def test_unmatched_targets():
 if __name__ == "__main__":
     test_get_build_targets()
     test_runtime_arch_resolution()
-    test_cpp_itfs_cache_identity()
     test_unmatched_targets()
+    test_cpp_itfs_cache_identity()
     test_gen_instances_filter(
         csv_path=REPRO_CSV,
         target_a=TARGET_C,
