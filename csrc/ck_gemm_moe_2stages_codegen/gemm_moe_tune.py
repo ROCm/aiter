@@ -6080,14 +6080,38 @@ class Mxfp4FlydslTuner(FmoeTuner):
         "config_env_name": "AITER_CONFIG_FMOE",
     }
 
+    # mxmoe G1 `_xcdN` counts across all tuned CSVs (131 names): 0=125, 2=2, 4=2, 5=1, 6=1.
+    # Nonzero hits are BM=128 except one BM=32 `_xcd2`, so do not cartesian onto every BM.
+    @classmethod
+    def _g1_xcds(cls, bm: int) -> tuple[int, ...]:
+        if bm == 128:
+            return (0, 2, 4, 5, 6)
+        if bm == 32:
+            return (0, 2)
+        return (0,)
+
+    # Layout G2 `_spN` = GroupNum*100+M01 (0 = no suffix). Persist ignores remap.
+    # CSV hits: BM=128 {102,801,6404}, BM=64 {801,1601}. Other BMs stay unsuffixed.
+    @classmethod
+    def _layout_g2_sparts(cls, bm: int, persist: bool) -> tuple[int, ...]:
+        if persist:
+            return (0,)
+        if bm == 128:
+            return (0, 102, 801, 6404)
+        if bm == 64:
+            return (0, 801, 1601)
+        return (0,)
+
     @staticmethod
-    def _g1_kname(bm, use_nt, inline_quant):
-        # flydsl_mxmoe_g1_a4w4_<BM>x256x256[_f16in][_nt]; see mxfp4_kname.py.
+    def _g1_kname(bm, use_nt, inline_quant, xcd_swizzle=0):
+        # flydsl_mxmoe_g1_a4w4_<BM>x256x256[_f16in][_nt][_xcdN]; see mxfp4_kname.py.
         name = f"flydsl_mxmoe_g1_a4w4_{bm}x256x256"
         if inline_quant:
             name += "_f16in"
         if use_nt:
             name += "_nt"
+        if xcd_swizzle:
+            name += f"_xcd{xcd_swizzle}"
         return name
 
     @staticmethod
@@ -6129,33 +6153,42 @@ class Mxfp4FlydslTuner(FmoeTuner):
         from aiter.ops.flydsl.mxfp4_gemm2_kernels import _SUPPORTED as G2
 
         g2_bms = {v[0] for v in G2}
+        model_dim = int(row["model_dim"])
+        inter_dim = int(row["inter_dim"])
         cands = []
         for bm in sorted({v[0] for v in G1}):
-            for _, n1, iq1 in sorted(v for v in G1 if v[0] == bm):
-                kn1 = self._g1_kname(bm, n1, iq1)
-                # (A) native mxmoe g2 candidates (flydsl_mxmoe_g2_a4w4_*).
-                if bm in g2_bms:
-                    for _, n2, ep in sorted(v for v in G2 if v[0] == bm):
-                        cands.append(
-                            self._candidate_row(
-                                row, bm, kn1, self._g2_kname(bm, n2, ep)
-                            )
-                        )
-                # (B) path B: flydsl_moe2_layout g2 candidates coupled with this
-                # mxmoe g1. Only the native SBM==tile_m==bm variants (verified
-                # correct for BM in {16,32,64,128} x {atomic,reduce}); re-tiling
-                # (tile_m<bm) is not enabled. Selected e2e-fastest by _tune_one_shape.
+            layout_g2 = [
+                (kn2v, kp)
                 for kn2v, kp in get_flydsl_stage2_v2_kernels(
                     "fp4",
                     "fp4",
                     "bf16",
                     bm,
-                    model_dim=int(row["model_dim"]),
-                    inter_dim=int(row["inter_dim"]),
-                ).items():
-                    if kp["tile_m"] != bm:
-                        continue
-                    cands.append(self._candidate_row(row, bm, kn1, kn2v))
+                    model_dim=model_dim,
+                    inter_dim=inter_dim,
+                ).items()
+                if kp["tile_m"] == bm
+            ]
+            for _, n1, iq1 in sorted(v for v in G1 if v[0] == bm):
+                for xcd in self._g1_xcds(bm):
+                    kn1 = self._g1_kname(bm, n1, iq1, xcd)
+                    # (A) native mxmoe g2 candidates (flydsl_mxmoe_g2_a4w4_*).
+                    # Native g2 uses the MXFP4_G2_SPART compile tag, not `_sp*`.
+                    if bm in g2_bms:
+                        for _, n2, ep in sorted(v for v in G2 if v[0] == bm):
+                            cands.append(
+                                self._candidate_row(
+                                    row, bm, kn1, self._g2_kname(bm, n2, ep)
+                                )
+                            )
+                    # (B) path B: flydsl_moe2_layout g2 candidates coupled with this
+                    # mxmoe g1. Only the native SBM==tile_m==bm variants (verified
+                    # correct for BM in {16,32,64,128} x {atomic,reduce}); re-tiling
+                    # (tile_m<bm) is not enabled. Selected e2e-fastest by _tune_one_shape.
+                    for kn2v, kp in layout_g2:
+                        for sp in self._layout_g2_sparts(bm, bool(kp.get("persist"))):
+                            kn2 = kn2v if not sp else f"{kn2v}_sp{sp}"
+                            cands.append(self._candidate_row(row, bm, kn1, kn2))
         return cands
 
     @staticmethod
