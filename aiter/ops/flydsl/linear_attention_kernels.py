@@ -108,6 +108,107 @@ def _tuned_config(
     )
 
 
+def _tile_warps(tile_v, warp_threads_v, max_warps=4):
+    """Most warps up to ``max_warps`` whose group tiles ``tile_v``, or None.
+
+    The group has to divide the tile exactly, and a head width that is a
+    multiple of 32 without being a power of two has splits where no warp count
+    does.
+    """
+    for num_warps in range(min(max_warps, tile_v // warp_threads_v), 0, -1):
+        if tile_v % (num_warps * warp_threads_v) == 0:
+            return num_warps
+    return None
+
+
+# Decode launches one block per (batch, v-head) pair, so a short batch leaves
+# most of the part idle and splitting the value dimension is the only way to
+# make more blocks. Each split adds a reduction across the blocks that share a
+# head, so it stops paying once the grid covers the machine: these are the
+# grids to split up to, in blocks per CU. Measured on gfx942; the fp32 state
+# moves twice the bytes per block and so tolerates one split more.
+_DECODE_GRID_PER_CU = 1
+_DECODE_GRID_PER_CU_F32_STATE = 2
+
+# Splits worth considering, largest first. Not every power of two earns a
+# place: with an fp32 state the 32-wide value tile is beaten at every grid by
+# either the 16-wide tile above it or the 64-wide one below, so that ladder
+# steps straight from 8 to 2 and never lands on it.
+_DECODE_V_SPLITS = (8, 4, 2, 1)
+_DECODE_V_SPLITS_F32_STATE = (8, 2, 1)
+
+# Warp shape for the value tile a split leaves, as (NUM_WARPS,
+# WARP_THREADS_K), keyed on (tile width, fp32 state). A tile of 64 or wider is
+# covered best by four warps over a narrow K group; from 32 down there is no
+# longer enough value width to spread four warps across, and the coverage has
+# to be bought from a wider K group instead, at the price of one more stage in
+# the cross-lane reduction.
+_DECODE_WARP_SHAPE = {
+    (128, False): (4, 8),
+    (128, True): (4, 8),
+    (64, False): (4, 4),
+    (64, True): (4, 8),
+    (32, False): (4, 8),
+    (32, True): (4, 16),
+    (16, False): (2, 8),
+    (16, True): (4, 16),
+}
+
+
+def _decode_warp_shape(head_k_dim, tile_v, f32_state):
+    """The warp shape for a value tile: the measured entry, or a derived one.
+
+    A K group of ``WARP_THREADS_K`` lanes reads ``values_per_thread_k`` values
+    each, so it only divides some head widths. The measured entry is used where
+    it divides, and the rest fall back to the widest group that fits.
+    """
+    values_per_thread_k = 4 if f32_state else 8
+    shape = _DECODE_WARP_SHAPE.get((tile_v, f32_state))
+    if shape is not None:
+        num_warps, warp_threads_k = shape
+        if head_k_dim % (warp_threads_k * values_per_thread_k) == 0 and (
+            tile_v % (num_warps * (64 // warp_threads_k)) == 0
+        ):
+            return shape
+    best = None
+    for warp_threads_k in (8, 16, 4):
+        if head_k_dim % (warp_threads_k * values_per_thread_k):
+            continue
+        num_warps = _tile_warps(tile_v, 64 // warp_threads_k)
+        if num_warps is not None and (best is None or num_warps > best[0]):
+            best = (num_warps, warp_threads_k)
+    return best
+
+
+def _decode_tiling(batch_size, num_v_heads, head_k_dim, head_v_dim, state_dtype_str):
+    """Split the value dimension until the grid covers the machine.
+
+    The split is a function of ``batch_size * num_v_heads`` alone -- the grid
+    the launch would have without one -- and the warp shape then follows from
+    the value tile the split leaves. Neither depends on the head counts beyond
+    that product, which is why a rule can stand in for a table keyed on batch.
+    """
+    f32_state = state_dtype_str == "torch.float32"
+    target = get_num_sms() * (
+        _DECODE_GRID_PER_CU_F32_STATE if f32_state else _DECODE_GRID_PER_CU
+    )
+    splits = _DECODE_V_SPLITS_F32_STATE if f32_state else _DECODE_V_SPLITS
+    for num_blocks in splits:
+        if head_v_dim % num_blocks or batch_size * num_v_heads * num_blocks > target:
+            continue
+        shape = _decode_warp_shape(head_k_dim, head_v_dim // num_blocks, f32_state)
+        if shape is not None:
+            return {
+                "NUM_BLOCKS_PER_V_DIM": num_blocks,
+                "NUM_WARPS": shape[0],
+                "WARP_THREADS_K": shape[1],
+            }
+    # Either the grid already covers the machine or nothing tiles the head; hand
+    # back the old default and let the builder be the one to refuse it, with its
+    # own message.
+    return {"NUM_BLOCKS_PER_V_DIM": 1, "NUM_WARPS": 4, "WARP_THREADS_K": 8}
+
+
 def get_default_kwargs(
     dtype_str,
     state_dtype_str,
@@ -118,10 +219,7 @@ def get_default_kwargs(
     head_k_dim,
     head_v_dim,
 ):
-    d = {}
-    d["NUM_BLOCKS_PER_V_DIM"] = 1
-    d["NUM_WARPS"] = 4
-    d["WARP_THREADS_K"] = 8
+    d = _decode_tiling(batch_size, num_v_heads, head_k_dim, head_v_dim, state_dtype_str)
     config = _tuned_config(
         dtype_str,
         state_dtype_str,
@@ -139,72 +237,91 @@ def get_default_kwargs(
     return d
 
 
-# Past this the grid already covers the machine and the narrower value tile
-# costs more in warps than the extra blocks return.
-_MTP_MAX_V_SPLIT = 8
-# Blocks per CU to aim for; small batches need it this high to reach a split
-# that still pays.
-_MTP_BLOCKS_PER_CU = 4
 _MTP_WARPS = 4
+# Tilings, as (blocks, warps, K group, waves per EU). The last spends a block on
+# a single warp over a quarter of the value dimension, thin enough that it needs
+# the occupancy hint with it.
+_MTP_SPLIT_4 = (4, _MTP_WARPS, 8, 0)
+_MTP_SPLIT_2 = (2, _MTP_WARPS, 8, 0)
+_MTP_WHOLE = (1, _MTP_WARPS, 8, 0)
+_MTP_WIDE_K = (2, _MTP_WARPS, 16, 0)
+_MTP_THIN = (4, 1, 8, 3)
+
+# Grid coverage each rung holds up to, in blocks per CU, while the grid is still
+# short enough that splitting fills it.
+_MTP_FILL = ((0.75, _MTP_SPLIT_4), (1, _MTP_SPLIT_2), (2, _MTP_WHOLE))
+# Coverage past which the splits are close and a block's own shape decides.
+_MTP_SATURATED = 8
+# Longest draft that is still a single pair.
+_MTP_PAIR = 2
+# Tried in order when the head dims do not divide into the chosen tiling.
+_MTP_FALLBACK = (_MTP_SPLIT_4, _MTP_SPLIT_2, _MTP_WHOLE)
 
 
-def _mtp_warps(tile_v, warp_threads_v):
-    """Most warps up to ``_MTP_WARPS`` whose group tiles ``tile_v``, or None.
+def _mtp_rung(grid, seq_length, variant, num_sms):
+    """The tiling for the grid this launch would have.
 
-    The group has to divide the tile exactly, and a head width that is a
-    multiple of 32 without being a power of two has splits where no warp count
-    does; those give None so the caller stops splitting.
+    Verify runs at the batch that has draft tokens outstanding, so the grid
+    leaves most of the part idle and splitting the value dimension is what
+    fills it. Filling stops paying once the grid covers the part and reverses
+    past it, which is why the ladder comes back down to one block.
+
+    Past coverage what is left is how a block spends itself: the contracts that
+    do more per token -- the tree, which reads a parent for each one, and
+    vLLM's chain, which rolls the state back by the accepted count -- want a
+    thin block, and so does a draft longer than a pair.
     """
-    for num_warps in range(min(_MTP_WARPS, tile_v // warp_threads_v), 0, -1):
-        if tile_v % (num_warps * warp_threads_v) == 0:
-            return num_warps
-    return None
+    for coverage, tiling in _MTP_FILL:
+        if grid <= coverage * num_sms:
+            return tiling
+    if grid <= _MTP_SATURATED * num_sms:
+        return _MTP_SPLIT_2 if variant == MTP_MODE_SNAPSHOT else _MTP_THIN
+    return _MTP_WIDE_K if seq_length <= _MTP_PAIR else _MTP_THIN
 
 
-def _mtp_tiling(batch_size, num_v_heads, head_k_dim, head_v_dim, state_dtype, target):
-    """Split the value dimension until the grid covers the machine.
+def _mtp_shape(head_k_dim, head_v_dim, state_dtype, num_blocks, warps, warp_threads_k):
+    """One tiling, or None where the head dims do not divide into it.
 
     ``NUM_BLOCKS_PER_V_DIM`` and ``NUM_WARPS`` are not independent: a warp group
     covers ``NUM_WARPS * (64 // WARP_THREADS_K)`` of a value tile that is
     ``head_v_dim // NUM_BLOCKS_PER_V_DIM`` wide, so their product has to divide
-    the tile. Splitting therefore costs warps, which this gives back so every
+    the tile. Splitting therefore costs warps, which this gives back, so every
     config it returns is one the builder accepts.
-
-    ``WARP_THREADS_K`` is the second lever. A wider K group narrows a warp's
-    value footprint, admitting a further split at the price of one more stage
-    in the cross-lane reduction, and is taken only where splitting under the
-    narrow group leaves the grid short.
     """
     values_per_thread_k = 4 if state_dtype == torch.float32 else 8
-    best = None
-    for warp_threads_k in (8, 16):
-        if head_k_dim % (warp_threads_k * values_per_thread_k):
-            continue
-        warp_threads_v = 64 // warp_threads_k
-        limit = head_v_dim // warp_threads_v  # largest num_blocks * num_warps
-        num_warps = _mtp_warps(head_v_dim, warp_threads_v)
-        if num_warps is None:
-            continue
-        num_blocks = 1
-        while (
-            num_blocks < _MTP_MAX_V_SPLIT
-            and num_blocks * _MTP_WARPS <= limit
-            and head_v_dim % (num_blocks * 2) == 0
-            and batch_size * num_v_heads * num_blocks < target
-        ):
-            split_warps = _mtp_warps(head_v_dim // (num_blocks * 2), warp_threads_v)
-            if split_warps is None:
-                break
-            num_blocks *= 2
-            num_warps = split_warps
-        best = {
-            "NUM_BLOCKS_PER_V_DIM": num_blocks,
-            "NUM_WARPS": num_warps,
-            "WARP_THREADS_K": warp_threads_k,
-        }
-        if batch_size * num_v_heads * num_blocks >= target:
-            break
-    return best
+    if head_k_dim % (warp_threads_k * values_per_thread_k) or head_v_dim % num_blocks:
+        return None
+    num_warps = _tile_warps(head_v_dim // num_blocks, 64 // warp_threads_k, warps)
+    if num_warps is None:
+        return None
+    return {
+        "NUM_BLOCKS_PER_V_DIM": num_blocks,
+        "NUM_WARPS": num_warps,
+        "WARP_THREADS_K": warp_threads_k,
+    }
+
+
+def _mtp_tiling(
+    batch_size,
+    num_v_heads,
+    seq_length,
+    head_k_dim,
+    head_v_dim,
+    state_dtype,
+    variant,
+    num_sms,
+):
+    """The rung the launch lands on, dropped to one the head dims admit."""
+    rung = _mtp_rung(batch_size * num_v_heads, seq_length, variant, num_sms)
+    for num_blocks, warps, warp_threads_k, waves_per_eu in (rung, *_MTP_FALLBACK):
+        d = _mtp_shape(
+            head_k_dim, head_v_dim, state_dtype, num_blocks, warps, warp_threads_k
+        )
+        if d is not None:
+            if waves_per_eu:
+                d["WAVES_PER_EU"] = waves_per_eu
+            return d
+    return None
 
 
 def get_mtp_default_kwargs(*args):
@@ -233,18 +350,16 @@ def _mtp_kwargs(
     batch that has draft tokens outstanding, which is small by construction, and
     the same default would then launch ``num_v_heads`` blocks onto a part with
     hundreds of CUs.
-
-    From batch 16 up the rule goes flat, where the default already fills the
-    grid, and what it leaves above that is the tuned table's to reclaim: the
-    three contracts want different splits at the same shape.
     """
     d = _mtp_tiling(
         batch_size,
         num_v_heads,
+        seq_length,
         head_k_dim,
         head_v_dim,
         state_dtype,
-        _MTP_BLOCKS_PER_CU * get_num_sms(),
+        variant,
+        get_num_sms(),
     )
     if d is None:
         # No tiling fits; hand back the decode default and let the builder be
