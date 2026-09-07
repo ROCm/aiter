@@ -49,7 +49,7 @@ IO_BYTES_AT_4096 = int(26.24 * (1 << 20))
 
 
 def _worker(tp, rank, init_method, shapes, grid_cap=None, super_tile=None,
-            iters=ITERS, warmup=WARMUP):
+            iters=ITERS, warmup=WARMUP, inbox="auto"):
     import torch
     import torch.distributed as dist
 
@@ -83,7 +83,15 @@ def _worker(tp, rank, init_method, shapes, grid_cap=None, super_tile=None,
     tp_group = get_tp_group()
     group = tp_group.device_group
 
-    kw = {}
+    # Pin the inbox rather than letting "auto" resolve it. `auto` reads the KFD
+    # topology and picks `uncached` on an xGMI host and `finegrained` on a PCIe
+    # one -- and that single choice also flips the fanout order (sector vs peer),
+    # the flag policy, whether `buffer_wbl2` is emitted at all, and, through
+    # `has_release_fence` -> `_batch_publishes` -> `_grid_x`, the launched grid
+    # and hence the publish cadence. A cross-machine capture left on "auto" is
+    # therefore not one kernel on two fabrics; it is two kernels. That is exactly
+    # what the 2026-09-07 MI350X/MI350P trace pair turned out to be.
+    kw = {"inbox_memory": inbox}
     if grid_cap is not None:
         kw["grid_cap"] = grid_cap
     if super_tile is not None:
@@ -130,7 +138,7 @@ def _worker(tp, rank, init_method, shapes, grid_cap=None, super_tile=None,
 
 
 def run_one(tp, shapes, grid_cap=None, super_tile=None, iters=ITERS,
-            warmup=WARMUP):
+            warmup=WARMUP, inbox="auto"):
     import torch  # noqa: F401  -- import here so --all's parent stays HIP-free
 
     from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
@@ -140,7 +148,7 @@ def run_one(tp, shapes, grid_cap=None, super_tile=None, iters=ITERS,
     with Pool(processes=tp) as pool:
         rets = [
             pool.apply_async(_worker, args=(tp, r, init_method, shapes, grid_cap, super_tile,
-                                   iters, warmup))
+                                   iters, warmup, inbox))
             for r in range(tp)
         ]
         pool.close()
@@ -167,6 +175,12 @@ def main():
                          "so the run leaves few dispatch folders, but non-zero "
                          "warmup so the traced dispatch is a warm one.")
     ap.add_argument("--warmup", type=int, default=WARMUP)
+    ap.add_argument("--inbox", default="finegrained",
+                    choices=("auto", "uncached", "finegrained", "default"),
+                    help="QRInt4 inbox_memory. Defaults to finegrained rather "
+                         "than auto so a run means the same thing on an xGMI "
+                         "box as on a PCIe one -- auto changes the fanout "
+                         "order, the flag policy and the launched grid.")
     ap.add_argument("--shapes", type=int, nargs="*", default=list(SHAPES))
     args = ap.parse_args()
 
@@ -189,7 +203,7 @@ def main():
 
     os.environ["AITER_QRINT4_ABLATE"] = args.ablate
     res = run_one(args.tp, args.shapes, args.grid_cap, args.super_tile,
-                  args.iters, args.warmup)
+                  args.iters, args.warmup, args.inbox)
     for m, us in sorted(res.items()):
         print(f"RESULT {args.ablate} {m} {us:.3f}")
 
