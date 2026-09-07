@@ -13,6 +13,7 @@ import torch
 import torch.distributed._symmetric_memory as symm_mem
 
 from aiter.dist.device_communicators.rocm_version import get_rocm_version
+from aiter.fused_moe import stage2_uses_route_reduce
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.flydsl.kernels.comm_fused_moe.gfx950.a8w4 import (
@@ -32,8 +33,7 @@ from aiter.ops.flydsl.kernels.comm_fused_moe.gfx950.a8w4.config import (
     Shape,
     WindowConfig,
 )
-from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
-from aiter.ops.flydsl.moe_kernels import _run_compiled
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, ptr_arg
 
 _PEER_VMM_ALLOCATION_ALIGNMENT = 2 * 1024 * 1024
 _MIN_ROCM_VERSION = (7, 2)
@@ -156,8 +156,6 @@ def config_name(config: PipelineConfig) -> str:
         value = getattr(config, field_name)
         if value != defaults[field_name]:
             parts.append(f"{tag}{value}")
-    if config.route_store_scope != defaults["route_store_scope"]:
-        parts.append(f"rts{config.route_store_scope}")
     if config.collective != defaults["collective"]:
         parts.append(
             {
@@ -219,8 +217,6 @@ def _parse_megakernel_name(name: str, shape: Shape, m: int):
             values["producer_mode"] = "atomic_shared"
         elif part == "flat":
             values["flat_producer_grid"] = True
-        elif part.startswith("rts"):
-            values["route_store_scope"] = part[3:]
         else:
             for tag, field_name in sorted(
                 numeric_tags.items(), key=lambda item: -len(item[0])
@@ -401,7 +397,10 @@ def _register(tp_group, rank: int, tp: int, tensors):
 def _barrier(tensor, flat_base, ready_offset, tp_size, stream) -> None:
     _run_compiled(
         compile_epoch_barrier(tp_size),
-        (ptr_arg(tensor), fx.Int64(flat_base), fx.Int64(ready_offset), stream),
+        ptr_arg(tensor),
+        fx.Int64(flat_base),
+        fx.Int64(ready_offset),
+        stream,
     )
 
 
@@ -462,6 +461,7 @@ class _AtomicRunner:
         self.comm, self.windows, (workspace_base,) = _register(
             tp_group, self.rank, shape.tp_size, (self.workspace,)
         )
+        tp_group.barrier()
         (
             self.partial_flat_base,
             self.reduced_payload_base,
@@ -479,16 +479,22 @@ class _AtomicRunner:
         ordinary_stage2,
     ):
         config = self.config
+        add_shared = stage2_uses_route_reduce(ordinary_stage2)
+        if not add_shared:
+            self.output.copy_(shared_partial)
         ordinary_stage2(
             *stage2_args[:6],
-            shared_partial,
+            self.output,
             *stage2_args[7:],
             **stage2_kwargs,
         )
         stream = torch.cuda.current_stream(self.device)
         _run_compiled(
-            atomic.compile_quantize(config),
-            (ptr_arg(shared_partial), ptr_arg(self.partial), stream),
+            atomic.compile_quantize(config, add_shared),
+            ptr_arg(self.output),
+            ptr_arg(shared_partial),
+            ptr_arg(self.partial),
+            stream,
         )
         _barrier(
             self.partial,
@@ -499,14 +505,12 @@ class _AtomicRunner:
         )
         _run_compiled(
             atomic.compile_reduce_scatter(config),
-            (
-                fx.Int64(self.partial_flat_base),
-                ptr_arg(self.reduced_shard),
-                ptr_arg(self.reduced_payload),
-                ptr_arg(self.reduced_scale),
-                self.rank,
-                stream,
-            ),
+            fx.Int64(self.partial_flat_base),
+            ptr_arg(self.reduced_shard),
+            ptr_arg(self.reduced_payload),
+            ptr_arg(self.reduced_scale),
+            self.rank,
+            stream,
         )
         _barrier(
             self.reduced_payload,
@@ -517,13 +521,11 @@ class _AtomicRunner:
         )
         _run_compiled(
             atomic.compile_all_gather(config),
-            (
-                fx.Int64(self.reduced_payload_base),
-                fx.Int64(self.reduced_scale_base),
-                ptr_arg(self.output),
-                self.rank,
-                stream,
-            ),
+            fx.Int64(self.reduced_payload_base),
+            fx.Int64(self.reduced_scale_base),
+            ptr_arg(self.output),
+            self.rank,
+            stream,
         )
         return self.output
 
@@ -568,6 +570,8 @@ class _MegakernelRunner:
 
         if not self.config.shared_bf16_partials:
             return shared_partial
+        if self.config.producer_mode == "atomic_shared":
+            return shared_partial
         if shared_partial.data_ptr() != self.output.data_ptr():
             self.output.copy_(shared_partial)
         return self.output
@@ -582,7 +586,10 @@ class _MegakernelRunner:
     ):
         del ordinary_stage2
         stream = torch.cuda.current_stream(self.device)
-        if self.config.shared_bf16_partials:
+        if (
+            self.config.shared_bf16_partials
+            and self.config.producer_mode != "atomic_shared"
+        ):
             shared_partial_ptr = shared_partial.data_ptr()
             if shared_partial_ptr == self.output.data_ptr():
                 if self.shared_partial_ptr not in (None, shared_partial_ptr):
@@ -612,14 +619,12 @@ class _MegakernelRunner:
         common = _stage2_args(stage2_args, stage2_kwargs, self.config)
         _run_compiled(
             megakernel.compile_megakernel(self.config, self.rank),
-            (
-                ptr_arg(self.workspace),
-                ptr_arg(shared_partial),
-                fx.Int64(self.shared_partial_flat_base),
-                *common[:8],
-                *common[9:],
-                stream,
-            ),
+            ptr_arg(self.workspace),
+            ptr_arg(shared_partial),
+            fx.Int64(self.shared_partial_flat_base),
+            *common[:8],
+            *common[9:],
+            stream,
         )
         return self.output
 
@@ -669,6 +674,7 @@ class _WindowRunner:
         self.comm, self.windows, (workspace_base,) = _register(
             tp_group, self.rank, shape.tp_size, (self.workspace,)
         )
+        tp_group.barrier()
         bases = tuple(workspace_base + offset for offset in offsets)
         self.partial_bases = bases[:SLOTS]
         self.reduced_payload_bases = bases[SLOTS : 2 * SLOTS]
@@ -716,15 +722,13 @@ class _WindowRunner:
                 reduce_scatter is not None,
                 all_gather is not None,
             ),
-            (
-                *self._local_args(0 if local is None else local, shared_partial),
-                *self._collective_args(
-                    0 if reduce_scatter is None else reduce_scatter,
-                    0 if all_gather is None else all_gather,
-                ),
-                self.rank,
-                stream,
+            *self._local_args(0 if local is None else local, shared_partial),
+            *self._collective_args(
+                0 if reduce_scatter is None else reduce_scatter,
+                0 if all_gather is None else all_gather,
             ),
+            self.rank,
+            stream,
         )
 
     def __call__(
@@ -741,7 +745,9 @@ class _WindowRunner:
         common = _stage2_args(stage2_args, stage2_kwargs, config)
         _run_compiled(
             k.compile_compute(config, 0),
-            (ptr_arg(self.routes[0]), *common, stream),
+            ptr_arg(self.routes[0]),
+            *common,
+            stream,
         )
         for local in range(len(self.reduced_shards) - 1):
             reduce_scatter = local - 1
@@ -750,17 +756,13 @@ class _WindowRunner:
                 k.compile_cycle(
                     config,
                     local + 1,
-                    reduce_scatter >= 0,
-                    all_gather >= 0,
                 ),
-                (
-                    ptr_arg(self.routes[(local + 1) % SLOTS]),
-                    *common,
-                    *self._local_args(local, shared_partial),
-                    *self._collective_args(max(reduce_scatter, 0), max(all_gather, 0)),
-                    self.rank,
-                    stream,
-                ),
+                ptr_arg(self.routes[(local + 1) % SLOTS]),
+                *common,
+                *self._local_args(local, shared_partial),
+                *self._collective_args(max(reduce_scatter, 0), max(all_gather, 0)),
+                self.rank,
+                stream,
             )
             local_slot = local % SLOTS
             _barrier(

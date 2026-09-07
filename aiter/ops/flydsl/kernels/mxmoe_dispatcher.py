@@ -129,6 +129,10 @@ def compile_gemm2_a4w4_port(
     g2_kstatic=False,
     out_dtype="bf16",
     enable_bias=False,
+    _composition=None,
+    _reduce_store=None,
+    _input_row_resolver=None,
+    _output_n_range=None,
 ):
     """Compile gemm2 a4w4 down-proj; epilog 'atomic' (weighted atomic-fadd) or 'reduce' (store into out[token_id*topk+slot]). inter_dim runtime; SBM None -> SBM==BM byte-identical."""
     SBM = _norm_sbm(SBM, BM)
@@ -144,6 +148,10 @@ def compile_gemm2_a4w4_port(
         )
     if SBM % BM != 0:
         raise AssertionError(f"SBM ({SBM}) must be a multiple of BM ({BM})")
+    if (_composition is None) != (_input_row_resolver is None):
+        raise ValueError("a composed GEMM2 requires an input row resolver")
+    if _reduce_store is not None and _composition is None:
+        raise ValueError("a custom reduce store requires a composition")
     use_reduce = epilog == "reduce"
     out_dtype = str(out_dtype).strip().lower()
     if out_dtype not in ("bf16", "fp8"):
@@ -152,7 +160,14 @@ def compile_gemm2_a4w4_port(
     if route_out_fp8 and not use_reduce:
         raise AssertionError("out_dtype='fp8' is supported only with epilog='reduce'")
     g2_kstatic = bool(g2_kstatic)
-    if g2_kstatic and route_out_fp8:
+    compact_route = _output_n_range is not None
+    if compact_route:
+        if not route_out_fp8:
+            raise ValueError("weighted compact routes require FP8 reduce output")
+        g2_defer_weight = False
+        g2_out_pitch_align = 0
+        g2_scale_blk = 8
+    elif g2_kstatic and route_out_fp8:
         from .mxfp4_gemm_common import FP8OUT_PITCH_ALIGN, FP8OUT_SCALE_BLK
 
         g2_defer_weight = True
@@ -204,12 +219,34 @@ def compile_gemm2_a4w4_port(
     assert (
         HIDDEN_MAX % BN == 0
     ), f"HIDDEN_MAX must be a multiple of {BN}, got {HIDDEN_MAX}"
+    if _output_n_range is None:
+        output_n_base = 0
+        output_width = None
+        output_range_tag = ""
+    else:
+        output_n_base, output_n_end = _output_n_range
+        if (
+            output_n_base < 0
+            or output_n_end > HIDDEN_MAX
+            or output_n_base >= output_n_end
+            or output_n_base % BN
+            or output_n_end % BN
+        ):
+            raise ValueError(
+                f"invalid output N range {_output_n_range} for "
+                f"HIDDEN_MAX={HIDDEN_MAX}, BN={BN}"
+            )
+        if _composition is None:
+            raise ValueError("output N range requires a composition")
+        output_width = output_n_end - output_n_base
+        output_range_tag = f"_nr{output_n_base}x{output_n_end}"
 
     # Kernel-name tags empty on the default so its name/IR stays byte-identical (each variant distinct).
     atag = "_a8" if is_f8 else ""
     btag = "_w8" if b_dtype == "fp8" else ""
     etag = "atomic" if not use_reduce else f"reduce_tk{topk}"
     sbm_tag = "" if SBM == BM else f"_sbm{SBM}"
+    shared_scale_tag = "_shared_scale" if BM < 32 and SBM != BM else ""
     if persist and cu_num <= 0:
         raise AssertionError(f"persist=True requires cu_num>0, got {cu_num}")
     if persist and is_f8:
@@ -223,6 +260,7 @@ def compile_gemm2_a4w4_port(
     apf_tag = "_apf" if g2_ascale_pf else ""
     spart_tag = f"_spart{g2_group_num}x{g2_m01}" if g2_spart > 0 else ""
     bf16lds_tag = "_bf16lds" if g2_bf16_lds else ""
+    noil_tag = "_noil" if g2_kstatic and g2_bf16_lds and compact_route else ""
     dw_tag = "_dw" if g2_defer_weight else ""
     kst_tag = "_kst" if g2_kstatic else ""
     pitch_tag = (
@@ -230,15 +268,35 @@ def compile_gemm2_a4w4_port(
     )
     sblk_tag = f"_sblk{g2_scale_blk}" if (route_out_fp8 and g2_scale_blk != 8) else ""
     out_tag = "_fp8out" if route_out_fp8 else ""
+    compact_tag = "_weighted_compact_s8" if compact_route else ""
+    route_guard_tag = "_routeguard" if use_reduce else ""
     tile_tag = "" if (BN, BK) == (256, 256) else f"_bn{BN}_bk{BK}"
     bias_tag = "_bias" if enable_bias else ""
     g2_epi_lanes = _pick_epi_lanes(BM, BN, route_out_fp8, g2_scale_blk)
-    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{persist_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{dw_tag}{kst_tag}{pitch_tag}{sblk_tag}{out_tag}{bias_tag}_v2_biasabi7"
+    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{shared_scale_tag}{persist_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{noil_tag}{dw_tag}{kst_tag}{pitch_tag}{sblk_tag}{out_tag}{compact_tag}{bias_tag}{output_range_tag}_v2_biasabi7{route_guard_tag}"
     name = f"gemm2_a4w4_port_{tag}"
 
     @fx.struct
     class SharedStorage:
         buf: fx.Array[Int8, lds_bytes, 16]
+
+    def resolve_input_rows(arg_stids, i32_M, m_row, wave, lane):
+        lanes_per_row = KH_TILE_A // 16
+        rows_per_call = 64 // lanes_per_row
+        rows_per_wave = BM // 4
+        if rows_per_wave < rows_per_call:
+            gather_base_row = (wave % fx.Int32(BM // rows_per_call)) * rows_per_call
+            n_row_groups = 1
+        else:
+            gather_base_row = wave * rows_per_wave
+            n_row_groups = rows_per_wave // rows_per_call
+        lane_row = lane // lanes_per_row
+        rows = []
+        for g in range_constexpr(n_row_groups):
+            local_row = gather_base_row + g * rows_per_call + lane_row
+            packed = global_typed_ptr(arg_stids, T.i32)[m_row + local_row]
+            rows.append(_input_row_resolver(packed, i32_M))
+        return rows
 
     @flyc.jit
     def _gemm2_kernel_body(
@@ -260,11 +318,18 @@ def compile_gemm2_a4w4_port(
         i32_inter,
         i32_hidden,
         i32_grid_blocks,
+        lds,
+        mn_idx=None,
+        resolved_input_rows=(),
     ):
         num_n_blocks = _udiv(i32_hidden, BN)
         k_bytes = _udiv(i32_inter, 1 if is_f8 else 2)
-        aq_num = fx.Int64(i32_max_m_blocks) * fx.Int64(BM * k_bytes)
-        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        aq_rows = (
+            fx.Int64(i32_M) * fx.Int64(topk)
+            if len(resolved_input_rows) > 0
+            else fx.Int64(i32_max_m_blocks) * fx.Int64(BM)
+        )
+        aq_num = aq_rows * fx.Int64(k_bytes)
         lds_base_i32 = fx.Int32(fx.ptrtoint(lds.buf.ptr))
 
         def issue_all_a_loads(m_row0):
@@ -282,9 +347,9 @@ def compile_gemm2_a4w4_port(
                     KH_TILE_A,
                     k_bytes,
                     BM=BM,
+                    resolved_rows=resolved_input_rows,
                 )
 
-        # One (m_block, n_block) unit for a synthesized unit_bx; non-persist calls once, persist per m-tile.
         def run_unit(unit_bx, mn_idx=None):
             gemm2_body_v2(
                 lds_base_i32,
@@ -328,9 +393,17 @@ def compile_gemm2_a4w4_port(
                 g2_apre=g2_apre,
                 enable_bias=enable_bias,
                 mn_idx=mn_idx,
+                reduce_store=_reduce_store,
+                resolved_input_rows=resolved_input_rows,
+                output_n_base=output_n_base,
+                output_width=output_width,
             )
 
-        if const_expr(not persist and g2_spart <= 0):
+        if const_expr(mn_idx is not None):
+            issue_all_a_loads(mn_idx[0] * fx.Int32(BM))
+            rocdl.sched_barrier(0)
+            run_unit(fx.Int32(0), mn_idx=mn_idx)
+        elif const_expr(not persist and g2_spart <= 0):
             # One-shot naive linear block->(m,n): issue A->LDS before the cumsum load (latency overlap).
             issue_all_a_loads(_udiv(bx_i32, num_n_blocks) * fx.Int32(BM))
             rocdl.sched_barrier(0)
@@ -384,6 +457,63 @@ def compile_gemm2_a4w4_port(
                 if fx.Int32(m_block) < total_m_blocks:
                     run_unit(unit_bx)
 
+    @flyc.jit
+    def _gemm2_tile(
+        arg_aq,
+        arg_ascale,
+        arg_bq,
+        arg_bscale,
+        arg_eids,
+        arg_stids,
+        arg_sweights,
+        arg_bias,
+        arg_out,
+        m_block_idx,
+        n_block_idx,
+        lane,
+        wave,
+        i32_M,
+        i32_max_m_blocks,
+        i32_inter,
+        i32_hidden,
+        lds,
+    ):
+        m_row = m_block_idx * fx.Int32(BM)
+        resolved_rows = resolve_input_rows(arg_stids, i32_M, m_row, wave, lane)
+        _gemm2_kernel_body(
+            arg_aq,
+            arg_ascale,
+            arg_bq,
+            arg_bscale,
+            arg_eids,
+            arg_stids,
+            arg_stids,
+            arg_sweights,
+            arg_bias,
+            arg_out,
+            fx.Int32(0),
+            lane,
+            wave,
+            i32_M,
+            i32_max_m_blocks,
+            i32_inter,
+            i32_hidden,
+            fx.Int32(0),
+            lds,
+            mn_idx=(m_block_idx, n_block_idx),
+            resolved_input_rows=resolved_rows,
+        )
+
+    if _composition is not None:
+        launch_gemm2 = _composition(
+            module_name=name,
+            emit_gemm2_tile=_gemm2_tile,
+            shared_storage=SharedStorage,
+        )
+        if BM == 16:
+            launch_gemm2.compile_hints["llvm_options"] = {"enable-post-misched": False}
+        return launch_gemm2
+
     @flyc.kernel(name=name, known_block_size=[256, 1, 1])
     def gemm2_kernel(
         arg_aq: fx.Int64,
@@ -409,6 +539,7 @@ def compile_gemm2_a4w4_port(
         bx_i32 = fx.Int32(bx)
         lane = tx_i32 % fx.Int32(64)
         wave = rocdl.readfirstlane(T.i32, tx_i32 // fx.Int32(64))
+        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         _gemm2_kernel_body(
             arg_aq,
             arg_ascale,
@@ -428,6 +559,7 @@ def compile_gemm2_a4w4_port(
             i32_inter,
             i32_hidden,
             i32_grid_blocks,
+            lds,
         )
 
     @flyc.jit

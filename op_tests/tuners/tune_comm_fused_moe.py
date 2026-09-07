@@ -152,7 +152,7 @@ def _make_stage2_case(args, rank: int, device, *, accumulate: bool):
             value=0.0,
         ).contiguous()
 
-    generator = torch.Generator(device=device).manual_seed(20260819 + rank)
+    generator = torch.Generator(device=device).manual_seed(args.seed + rank)
     activations = torch.randn(
         (args.token, args.topk, args.inter_dim),
         dtype=torch.bfloat16,
@@ -386,21 +386,24 @@ def benchmark(
     """Measure one complete Stage2 + shared + TP communication candidate."""
 
     runner = create_runner(tp_group, config)
+    runner.output.fill_(float("nan"))
     candidate_shared = shared_partial.clone()
     prepare_shared_partial = getattr(runner, "prepare_shared_partial", None)
-    if prepare_shared_partial is not None:
-        candidate_shared = prepare_shared_partial(candidate_shared)
 
     def run():
+        current_shared = candidate_shared
+        if prepare_shared_partial is not None:
+            current_shared = prepare_shared_partial(current_shared)
         return runner(
             stage2_args=stage2_args,
             stage2_kwargs=stage2_kwargs,
-            shared_partial=candidate_shared,
+            shared_partial=current_shared,
             ordinary_stage2=ordinary_stage2,
         )
 
     reference_f32 = reference.float()
-    diff = run().float() - reference_f32
+    output = run()
+    diff = output.float() - reference_f32
     error = torch.stack(
         (
             diff.abs().max(),
@@ -409,17 +412,28 @@ def benchmark(
     )
     dist.all_reduce(error, op=dist.ReduceOp.MAX, group=process_group)
 
+    latency_us = _graph_latency_us(
+        run,
+        tp_group=tp_group,
+        process_group=process_group,
+        device=shared_partial.device,
+        warmup_replays=warmup_replays,
+        rounds=rounds,
+        iterations=iterations,
+    )
+    graph_diff = output.float() - reference_f32
+    graph_error = torch.stack(
+        (
+            graph_diff.abs().max(),
+            graph_diff.norm() / reference_f32.norm().clamp_min(1.0e-12),
+        )
+    )
+    dist.all_reduce(graph_error, op=dist.ReduceOp.MAX, group=process_group)
+    error = torch.maximum(error, graph_error)
+
     return TuningResult(
         config,
-        _graph_latency_us(
-            run,
-            tp_group=tp_group,
-            process_group=process_group,
-            device=shared_partial.device,
-            warmup_replays=warmup_replays,
-            rounds=rounds,
-            iterations=iterations,
-        ),
+        latency_us,
         float(error[0].item()),
         float(error[1].item()),
         int(stage2_kwargs["block_m"]),
@@ -588,6 +602,7 @@ def _parse_args():
     parser.add_argument("--topk", type=int, default=6)
     parser.add_argument("--tp", type=int, default=8)
     parser.add_argument("--route", choices=("uniform", "skew"), default="uniform")
+    parser.add_argument("--seed", type=int, default=20260819)
     parser.add_argument(
         "--family",
         choices=("current", *_CONFIG_TYPES),
