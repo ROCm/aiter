@@ -340,9 +340,7 @@ def build_moe_contiguous_psum_remap_module():
             valid_route_count = fx.Uint32(
                 ptr_buf_tensor(num_valid_routes)[fx.Uint32(0)]
             )
-        for route in range(
-            gtid, valid_route_count, REMAP_NBLK * MAX_EXPERTS_PER_BLOCK
-        ):
+        for route in range(gtid, valid_route_count, REMAP_NBLK * MAX_EXPERTS_PER_BLOCK):
             row_raw = rows_p[route]
             # An EP route with no grouped row carries the negative
             # DROPPED_ROUTE_ROW sentinel: the row math would turn it into a wild

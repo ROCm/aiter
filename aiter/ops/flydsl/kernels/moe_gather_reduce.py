@@ -149,7 +149,9 @@ def build_moe_gather_reduce_module(
                 is_mapped = raw_row >= fx.Int32(0)
                 row_i32 = is_mapped.select(raw_row, oob_row_i32)
                 _lds_si32(rows_lds, row_i32, tid)
-                w_loaded = buffer_ops.buffer_load(w_rsrc, map_off, vec_width=1, dtype=w_dt)
+                w_loaded = buffer_ops.buffer_load(
+                    w_rsrc, map_off, vec_width=1, dtype=w_dt
+                )
                 w_f32 = w_dt_fx(w_loaded).to(fx.Float32)
                 _lds_si32(wbits_lds, w_f32.bitcast(fx.Int32), tid)
             gpu.barrier()
@@ -171,18 +173,14 @@ def build_moe_gather_reduce_module(
                 off_dw = row_u32 * out_dwords_i32 + dw_off
                 if sk != 0:
                     off_dw = off_dw + sk * slice_stride_dw_i32
-                return buffer_ops.buffer_load(
-                    in_rsrc, off_dw, vec_width=VEC, dtype=i32
-                )
+                return buffer_ops.buffer_load(in_rsrc, off_dw, vec_width=VEC, dtype=i32)
 
             def load_flat_dw(row_u32, sk, dw_off):
                 off_dw = row_u32 * out_dwords_i32 + dw_off
                 if sk != 0:
                     off_dw = off_dw + sk * slice_stride_dw_i32
                 return fx.Uint32(
-                    buffer_ops.buffer_load(
-                        in_rsrc, off_dw, vec_width=1, dtype=i32
-                    )
+                    buffer_ops.buffer_load(in_rsrc, off_dw, vec_width=1, dtype=i32)
                 )
 
             dw_base = thread_id * vec_i32 + iter_idx_i32 * DWORDS_PER_ITER
