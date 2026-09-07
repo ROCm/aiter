@@ -53,6 +53,19 @@ def na3d_flash_attn(
     KT, KH, KW = kernel_size
     SEQ = T * H * W
 
+    assert (
+        q.is_cuda and k.is_cuda and v.is_cuda
+    ), "na3d_flash_attn requires CUDA/HIP tensors"
+    assert q.device == k.device == v.device, (
+        f"na3d_flash_attn: q/k/v must be on the same device; got "
+        f"q={q.device}, k={k.device}, v={v.device}"
+    )
+    current_device = torch.cuda.current_device()
+    assert q.device.index == current_device, (
+        f"na3d_flash_attn: kernel will launch on cuda:{current_device}, "
+        f"but inputs are on {q.device}"
+    )
+
     gfx = get_gfx()
     assert (
         gfx in _NA3D_FLASH_ARCHS
