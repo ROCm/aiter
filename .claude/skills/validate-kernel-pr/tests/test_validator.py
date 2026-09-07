@@ -3502,10 +3502,40 @@ class SkillProseContractTests(unittest.TestCase):
         # run means but not how to start one.
         self.assertIn("validate_pr.sh \\", self.skill)
 
-    def test_every_flag_the_prose_shows_is_one_the_script_accepts(self):
+    def accepted_flags(self):
         parser = re.search(r'\n  case "\$1" in\n(.*?)\n  esac', self.script, re.DOTALL)
         self.assertIsNotNone(parser)
-        accepted = set(re.findall(r"--[a-z][a-z-]*", parser.group(1)))
+        return set(re.findall(r"--[a-z][a-z-]*", parser.group(1)))
+
+    def test_every_flag_the_script_accepts_is_documented(self):
+        # The direction that actually caught the missing flag table. Checking only that the
+        # documented flags exist passes trivially when the documentation is empty.
+        #
+        # Whole-token, not substring: `--grid` occurs inside `--grid-novelty`, so a plain
+        # `in` check would let the `--grid` row vanish and pass on a sentence about a
+        # different flag. The same trap as `declared` inside `declared-by-caller`.
+        for flag in sorted(self.accepted_flags()):
+            with self.subTest(flag=flag):
+                self.assertRegex(
+                    self.skill,
+                    re.escape(flag) + r"(?![a-z-])",
+                    f"{flag} is accepted but undocumented",
+                )
+
+    def test_every_host_setting_is_in_the_host_table(self):
+        # A setting read from the environment and named nowhere is unreachable in practice:
+        # nobody sets a variable they have not been told about. PERF_CONTROL_TOL spent the
+        # refactor explained in the perf prose but absent from the table a caller reads.
+        settings = set(re.findall(r'\n([A-Z_]+)="\$\{([A-Z_]+):-', self.script))
+        table = re.search(r"\n## Host settings\n(.*?)\n---", self.skill, re.DOTALL)
+        self.assertIsNotNone(table)
+        documented = set(re.findall(r"^\| `([A-Z_]+)`", table.group(1), re.MULTILINE))
+        for _, name in sorted(settings):
+            with self.subTest(setting=name):
+                self.assertIn(name, documented, f"{name} is read but not in the table")
+
+    def test_every_flag_the_prose_shows_is_one_the_script_accepts(self):
+        accepted = self.accepted_flags()
         # Only the flags shown in the skill's own invocation block, so an example the model
         # copies cannot name a flag that exits 2.
         block = re.search(r"validate_pr\.sh \\\n(.*?)\n```", self.skill, re.DOTALL)

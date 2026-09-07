@@ -163,6 +163,7 @@ caller validating many PRs on one machine sets them once and never thinks about 
 | `PERF_REPEAT` | runs per side, default 3 |
 | `PERF_THRESHOLD` | head/base ratio that counts as a regression, default 0.95 |
 | `PERF_MIN_ROWS` | matched rows required before any ratio is reported, default 3 |
+| `PERF_CONTROL_TOL` | how far `--perf-control-column` may move across two trees before the comparison is refused as unattributable, default 0.10 |
 
 Each phase additionally gets a fresh private `AITER_JIT_DIR` and sets
 `PYTHONDONTWRITEBYTECODE=1`, so JIT output cannot cross between base and head or dirty the
