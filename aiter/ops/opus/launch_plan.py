@@ -151,7 +151,6 @@ def _build_a16w16_workspace_spec(
     batch: int,
     M: int,
     N: int,
-    K: int,
 ) -> WorkspaceSpec | None:
     """Build workspace metadata from the already-resolved registry instance."""
     needs_workspace = resolved_kid in SPLITK_KIDS
@@ -176,14 +175,6 @@ def _build_a16w16_workspace_spec(
 
     block_m = int(instance.B_M)
     block_n = int(instance.B_N)
-    block_k = int(instance.B_K)
-    max_useful_split_k = (K + block_k - 1) // block_k
-    if split_k > max_useful_split_k:
-        raise ValueError(
-            "opus_gemm_a16w16_launch: "
-            f"workspace capacity split_k={split_k} exceeds the per-kid "
-            f"K-tile limit {max_useful_split_k} for K={K}, B_K={block_k}"
-        )
 
     if registry_arch == GFX1250:
         if batch != 1:
@@ -349,6 +340,18 @@ def _build_a16w16_launch_plan(
                 requested=requested_split_k,
             )
 
+        # gfx942 may reserve more workspace slices than it launches after
+        # clamping. The K-tile limit applies to the launch, not its capacity.
+        launch_split_k = max(1, abi_split_k)
+        block_k = int(instance.B_K)
+        max_useful_split_k = (K + block_k - 1) // block_k
+        if launch_split_k > max_useful_split_k:
+            raise ValueError(
+                "opus_gemm_a16w16_launch: "
+                f"launch split_k={launch_split_k} exceeds the per-kid "
+                f"K-tile limit {max_useful_split_k} for K={K}, B_K={block_k}"
+            )
+
     workspace_spec = _build_a16w16_workspace_spec(
         instance,
         registry_arch=registry_arch,
@@ -357,7 +360,6 @@ def _build_a16w16_launch_plan(
         batch=batch,
         M=M,
         N=N,
-        K=K,
     )
     return A16W16LaunchPlan(
         registry_arch=registry_arch,

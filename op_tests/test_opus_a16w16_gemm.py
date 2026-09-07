@@ -383,6 +383,28 @@ def test_split_k_matches_torch_golden(arch, kid, M, N, K, split_k, out_dtype):
     _assert_matches_golden(actual, A, B)
 
 
+@pytest.mark.parametrize("workspace_splits", (None, 1, 16))
+def test_gfx942_short_k_auto_split_matches_torch(workspace_splits):
+    if _runtime_arch() != "gfx942":
+        pytest.skip("requires gfx942 hardware")
+    torch.manual_seed(10201)
+    A = torch.randn((1, 128), device="cuda", dtype=torch.bfloat16)
+    B = torch.randn((64, 128), device="cuda", dtype=torch.bfloat16)
+    Y = torch.empty((1, 64), device="cuda", dtype=torch.bfloat16)
+    # kid 10201 uses FP32 workspace with 64x64 tiles. The short K launches
+    # one split, so both one slice and the conservative 16 slices are valid.
+    workspace = (
+        None
+        if workspace_splits is None
+        else torch.empty(
+            (workspace_splits, 1, 64, 64), device="cuda", dtype=torch.float32
+        )
+    )
+    actual = opus_gemm(A, B, Y, kid=10201, split_k=0, workspace=workspace)
+    torch.cuda.synchronize()
+    _assert_matches_golden(actual, A, B)
+
+
 @pytest.mark.parametrize("kid", (1400, 6400))
 def test_gfx950_mono_fp32_overwrites_poisoned_output(kid):
     """Regress the ordinary and 4G-safe mono FP32 physical-store paths."""
@@ -472,6 +494,40 @@ def test_gfx1250_bf16_output_accepts_fp32_bias():
     )
     torch.cuda.synchronize()
     _assert_matches_golden(actual, A, B, bias)
+
+
+@pytest.mark.parametrize(
+    ("K", "split_k", "capacity", "launch_split_k"),
+    ((128, 0, 16, 1), (128, 1, 1, 1), (128, 16, 16, 1), (512, 0, 16, 4)),
+)
+def test_gfx942_split_k_plan_allows_capacity_overestimate(
+    K, split_k, capacity, launch_split_k
+):
+    args = _a16_policy_args("gfx942", 1, 64, K)
+    args["cu_num"] = 80
+    plan = _get_cached_a16w16_launch_plan(**args, kid=10201, split_k=split_k)
+
+    assert plan.resolved_kid == 10201
+    assert plan.workspace_capacity_split_k == capacity
+    assert plan.abi_split_k == launch_split_k
+    assert plan.workspace_spec.shape == (capacity, 1, 64, 64)
+    assert plan.workspace_spec.dtype == torch.float32
+
+
+@pytest.mark.parametrize(
+    ("arch", "kid", "K", "split_k", "error"),
+    (
+        ("gfx942", 10201, 64, 0, "too small for gfx942"),
+        ("gfx942", 10201, 192, 0, "needs even loops per split"),
+        ("gfx950", 200, 128, 3, "K-tile limit 2"),
+        ("gfx1250", 20000, 128, 2, "K-tile limit 1"),
+    ),
+)
+def test_a16w16_launch_plan_preserves_split_k_limits(arch, kid, K, split_k, error):
+    with pytest.raises(ValueError, match=error):
+        _get_cached_a16w16_launch_plan(
+            **_a16_policy_args(arch, 1, 64, K), kid=kid, split_k=split_k
+        )
 
 
 def test_global_a16_stale_opus_row_keeps_framework_fallback(monkeypatch):
