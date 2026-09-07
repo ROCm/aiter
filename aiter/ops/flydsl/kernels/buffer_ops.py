@@ -12,9 +12,11 @@ Buffer instructions are an AMD hardware feature (buffer resource descriptor
 plus ROCDL intrinsics) providing out-of-bounds protection and better memory
 throughput; plain memref load/store is not a substitute.
 
-Upstream: FlyDSL ``kernels/common/buffer_ops.py`` @ ROCm/FlyDSL#880.
-Behavior matches upstream; formatting and type annotations differ only to
-satisfy aiter's lint.
+Upstream: FlyDSL ``kernels/common/buffer_ops.py`` @ ROCm/FlyDSL#880, since
+narrowed to buffer accesses only. The raw-pointer helpers (``create_llvm_ptr``,
+``get_element_ptr``) moved to ``kernels_common``, and the uniform/SGPR load
+(``is_scalar``) to ``tensor_shim.buf_scalar_load``, next to the buffer views
+its callers index. Everything kept behaves as upstream.
 
 Example:
     >>> from aiter.ops.flydsl.kernels import buffer_ops
