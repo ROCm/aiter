@@ -205,15 +205,23 @@ def perftest(
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     data = run_iters_rotate(num_iters, func, rotate_args)
-                with tpf.profile(
-                    activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
-                    profile_memory=True,
-                    with_stack=True,
-                    with_modules=True,
-                ) as prof:
-                    run_iters(1, graph.replay)
-                avg = get_trace_perf(prof, num_iters)
-                logger.info(f"avg: {avg} us/iter with hipgraph")
+                # Time the replay's WALL clock / num_iters, NOT per-kernel trace time.
+                # One replay runs num_iters kernels back-to-back with no host gaps, so
+                # wall/num_iters is steady-state throughput (matches a C++ event-around-
+                # the-loop benchmark). get_trace_perf instead sums each kernel's own
+                # device-time window, which double-counts the memory-pipeline fill/drain
+                # and negates the graph -- for memory-bound kernels that reads ~10% high.
+                for _ in range(3):
+                    graph.replay()
+                torch.cuda.synchronize()
+                g_start = torch.cuda.Event(enable_timing=True)
+                g_end = torch.cuda.Event(enable_timing=True)
+                g_start.record()
+                graph.replay()
+                g_end.record()
+                torch.cuda.synchronize()
+                avg = g_start.elapsed_time(g_end) * 1000.0 / num_iters
+                logger.info(f"avg: {avg} us/iter with hipgraph (wall/N)")
 
             if os.environ.get("AITER_SMI_MONITOR", "0") == "1":
                 fn_name = getattr(func, "__name__", "kernel")
@@ -728,7 +736,7 @@ def checkAllclose(
 # data plus a tiny E8M0 (or E4M3) scale per block. fill_fp* emit those on-wire
 # buffers. Large 2-D tensors are filled in row chunks (~1 GiB f32 staging).
 # --------------------------------------------------------------------------- #
-DATA_DISTS = ("zero", "constant", "uniform", "norm")
+DATA_DISTS = ("zero", "constant", "uniform", "norm", "poc")
 SCALE_DISTS = DATA_DISTS
 SCALE_UNIFORM = (0.5, 2.0)
 SCALE_NORM_MEAN, SCALE_NORM_STD = 1.0, 0.25
@@ -740,7 +748,7 @@ E8M0_NEUTRAL = 0x7F  # 2^0 = 1.0
 E4M3_NEUTRAL = 0x38  # e4m3 exp bias -> 1.0
 E4M3_SCALE_MEAN, E4M3_SCALE_STD = 0.34375, 0.08
 POW2_BINOMIAL_N = 10
-E8M0_SCALE_DISTS = ("zero", "constant", "uniform", "norm", "auto", "pow2_binomial")
+E8M0_SCALE_DISTS = ("zero", "constant", "uniform", "norm", "auto", "pow2_binomial", "poc")
 E4M3_SCALE_DISTS = ("zero", "constant", "uniform", "norm", "auto")
 _STAGE_ELEMS = 1 << 28  # 256M f32 = 1 GiB per chunk
 
@@ -805,6 +813,16 @@ def _sample_data_f32(shape, dist, gen, *, lo, hi, device):
         return torch.empty(shape, dtype=torch.float32, device=device).normal_(
             0.0, 1.0, generator=gen
         )
+    if dist == "poc":
+        # poc mxfp8fp4gemm.cpp initTestMatrix(pattern=1): random draw from the exact
+        # fp4 e2m1 levels {0.5,1,1.5,2,3} with random sign (max |v| = 3). Matches the
+        # poc perf harness's "random" data so the two benchmarks draw the same values.
+        levels = torch.tensor(
+            [0.5, 1.0, 1.5, 2.0, 3.0], dtype=torch.float32, device=device
+        )
+        idx = torch.randint(0, 5, shape, generator=gen, device=device)
+        sign = torch.randint(0, 2, shape, generator=gen, device=device) * 2 - 1
+        return levels[idx] * sign.to(torch.float32)
     raise ValueError(f"data dist {dist!r} is not continuous; use fill dispatch")
 
 
@@ -1001,6 +1019,11 @@ def fill_scale_e8m0(
     if dist in ("uniform", "norm"):
         v = fill_scale(shape, dist, gen, device=device)
         return _f32_to_e8m0(v)
+    if dist == "poc":
+        # poc mxfp8fp4gemm.cpp initTestScale(pattern=1): exponent uniform in [-2,2]
+        # -> scale in {0.25,0.5,1,2,4}; e8m0 on-wire byte = exponent + 127.
+        e = torch.randint(-2, 3, shape, dtype=torch.int32, device=device, generator=gen)
+        return (e + E8M0_BIAS).clamp_(0, 255).to(torch.uint8)
     # auto / pow2_binomial: Binomial(k, 0.5) == popcount of a uniform k-bit int
     trials = 2 * n + 1
     assert trials <= 24, "pow2_binomial popcount path assumes <= 24 trials"

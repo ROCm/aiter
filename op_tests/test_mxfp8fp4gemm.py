@@ -463,7 +463,7 @@ def main():
         "--data-init",
         dest="data_init",
         nargs="*",
-        choices=["zero", "constant", "uniform", "norm"],
+        choices=["zero", "constant", "uniform", "norm", "poc"],
         default=None,
         help="DATA init distribution(s) (sampled independently of scale).\n"
         "Paired position-wise with --scale-init (length-1 broadcasts).\n"
@@ -471,13 +471,14 @@ def main():
         "  zero     = all-zero on-wire codes\n"
         "  constant = A/B = 0.5 (deterministic)\n"
         "  uniform  = FP8 U(-6,6) / FP4 U(-3,3)  [default]\n"
-        "  norm     = N(0,1)                     [norm-dist / LLM-like]",
+        "  norm     = N(0,1)                     [norm-dist / LLM-like]\n"
+        "  poc      = {+-0.5,1,1.5,2,3} random    [matches poc perf harness]",
     )
     parser.add_argument(
         "--scale-init",
         dest="scale_init",
         nargs="*",
-        choices=["auto", "pow2_binomial", "zero", "constant", "uniform", "norm"],
+        choices=["auto", "pow2_binomial", "zero", "constant", "uniform", "norm", "poc"],
         default=None,
         help="SCALE init distribution(s) (e8m0 for both operands)\n"
         "Default (unset): perf/profile = 'constant auto', func = 'auto'\n"
@@ -486,7 +487,8 @@ def main():
         "  zero          = all-zero e8m0 bytes\n"
         "  constant      = neutral scale 0x7F (2^0 = 1.0)\n"
         "  uniform       = U(0.5,2) -> nearest e8m0 byte\n"
-        "  norm          = N(1,0.25) -> nearest e8m0 byte",
+        "  norm          = N(1,0.25) -> nearest e8m0 byte\n"
+        "  poc           = 2^[-2,2] (exp+127)              [matches poc perf harness]",
     )
     parser.add_argument(
         "--seed",
