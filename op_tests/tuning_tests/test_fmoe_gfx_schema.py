@@ -1,0 +1,94 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+"""CPU regressions for fused-MoE legacy loading and AOT architecture handling."""
+
+import unittest
+
+import pandas as pd
+
+try:
+    from aiter.jit.utils.chip_info import (
+        backfill_dataframe_gfx,
+        reset_legacy_gfx_warnings_for_tests,
+    )
+
+    _CHIP_INFO_ERR = None
+except Exception as e:  # noqa: BLE001
+    backfill_dataframe_gfx = None
+    reset_legacy_gfx_warnings_for_tests = None
+    _CHIP_INFO_ERR = e
+
+try:
+    from aiter.aot.flydsl.common import job_arch
+
+    _JOB_ARCH_ERR = None
+except Exception as e:  # noqa: BLE001
+    job_arch = None
+    _JOB_ARCH_ERR = e
+
+try:
+    from aiter.aot.flydsl import mxfp4_moe as flydsl_mxfp4_aot
+
+    _MXFP4_AOT_ERR = None
+except Exception as e:  # noqa: BLE001
+    flydsl_mxfp4_aot = None
+    _MXFP4_AOT_ERR = e
+
+
+@unittest.skipUnless(
+    backfill_dataframe_gfx is not None, f"chip_info not importable: {_CHIP_INFO_ERR}"
+)
+class TestFmoeLegacyGfxLoading(unittest.TestCase):
+    def setUp(self):
+        reset_legacy_gfx_warnings_for_tests()
+
+    def test_legacy_file_warns_once_per_source(self):
+        with self.assertLogs("aiter", level="WARNING") as logs:
+            df1 = backfill_dataframe_gfx(pd.DataFrame({"cu_num": [256]}), "legacy.csv")
+            df2 = backfill_dataframe_gfx(pd.DataFrame({"cu_num": [256]}), "legacy.csv")
+        self.assertEqual(df1.loc[0, "gfx"], "gfx950")
+        self.assertEqual(df2.loc[0, "gfx"], "gfx950")
+        legacy_msgs = [m for m in logs.output if "lacks explicit gfx" in m]
+        self.assertEqual(len(legacy_msgs), 1)
+
+    def test_explicit_gfx_file_emits_no_migration_warning(self):
+        with self.assertNoLogs("aiter", level="WARNING"):
+            df = backfill_dataframe_gfx(
+                pd.DataFrame({"gfx": ["gfx1250"], "cu_num": [256]}), "modern.csv"
+            )
+        self.assertEqual(df.loc[0, "gfx"], "gfx1250")
+
+
+@unittest.skipUnless(job_arch is not None, f"job_arch not importable: {_JOB_ARCH_ERR}")
+class TestFlydslMoeAotGfx(unittest.TestCase):
+    def test_explicit_gfx_overrides_cu_inference(self):
+        self.assertEqual(job_arch(80, "gfx950"), "gfx950")
+        self.assertEqual(job_arch(256, "gfx942"), "gfx942")
+        self.assertEqual(job_arch(256, ""), "gfx950")
+
+
+@unittest.skipUnless(
+    flydsl_mxfp4_aot is not None, f"FlyDSL mxfp4 AOT not importable: {_MXFP4_AOT_ERR}"
+)
+class TestFlydslMxfp4MoeAotGfx(unittest.TestCase):
+    def test_rejects_explicit_incompatible_architecture(self):
+        job = {
+            "stage": 1,
+            "kernel_name": "flydsl_mxmoe_g1_a4w4_16x256x256_f16in_nt",
+            "BM": 16,
+            "use_nt": 2,
+            "inline_quant": 0,
+            "D_HIDDEN": 2048,
+            "D_INTER": 1024,
+            "NE": 8,
+            "topk": 2,
+            "gfx": "gfx942",
+            "cu_num": 80,
+            "xcd_swizzle": 0,
+        }
+        with self.assertRaisesRegex(ValueError, "gfx950-only"):
+            flydsl_mxfp4_aot.compile_one_config(**job)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

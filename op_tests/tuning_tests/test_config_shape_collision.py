@@ -235,6 +235,40 @@ class TestConfigShapeCollision(unittest.TestCase):
     def test_fmoe(self):
         self._check_family("AITER_CONFIG_FMOE", "tuned_fmoe")
 
+    def test_fmoe_cross_gfx_same_cu_coexists(self):
+        """Two 256-CU rows for gfx950 and gfx1250 must survive merge/dedup."""
+        tmp = tempfile.mkdtemp(prefix="aiter_fmoe_cross_gfx_")
+        try:
+            cfg = os.path.join(tmp, "aiter", "configs")
+            model_dir = os.path.join(cfg, "model_configs")
+            os.makedirs(model_dir, exist_ok=True)
+            header = (
+                "gfx,cu_num,token,model_dim,inter_dim,expert,topk,act_type,dtype,"
+                "q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1,block_m,ksplit,"
+                "kernelName1,kernelName2,us\n"
+            )
+            shape = (
+                "256,16,7168,256,256,8,ActivationType.Silu,torch.bfloat16,"
+                "torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Token,"
+                "1,0,64,0,k1,k2,1.0"
+            )
+            with open(os.path.join(cfg, "tuned_fmoe.csv"), "w") as f:
+                f.write(header)
+                f.write(f"gfx950,{shape}\n")
+            with open(os.path.join(model_dir, "cross_gfx_tuned_fmoe.csv"), "w") as f:
+                f.write(header)
+                f.write(f"gfx1250,{shape}\n")
+            merged = self._resolve(tmp, "AITER_CONFIG_FMOE", "tuned_fmoe")
+            with open(merged, newline="") as f:
+                rows = list(csv.DictReader(f))
+            self.assertEqual(
+                sorted({row["gfx"] for row in rows}), ["gfx1250", "gfx950"]
+            )
+        finally:
+            core.AITER_ROOT_DIR = self._tmp
+            _cache_clear()
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_fhmoe(self):
         merged = self._resolve(
             self._tmp,
