@@ -168,6 +168,11 @@ def test_rmsnorm(M, N, in_dtype_str):
             # Large-M/small-N path uses tiled 2-D grid; looser tolerance matches
             # the per-block rounding accumulated over BLOCK_M rows.
             atol, rtol = 1e-2, 1e-2
+        elif N >= 32768:
+            # Large-N BLOCKED path: two-pass reduction (kernel partial sums +
+            # _rmsnorm_bwd_dg_reduce) reorders fp32 additions vs PyTorch's
+            # sequential sum, accumulating ~2e-4 error over N=65536 elements.
+            atol, rtol = 5e-4, 5e-4
         else:
             # float32 typically can be tighter
             atol, rtol = 1e-4, 1e-4
@@ -223,6 +228,11 @@ def test_fused_add_rmsnorm(M, N, in_dtype_str):
             # Large-M/small-N path uses tiled 2-D grid; looser tolerance matches
             # the per-block rounding accumulated over BLOCK_M rows.
             atol, rtol = 1e-2, 1e-2
+        elif N >= 32768:
+            # Large-N BLOCKED path: two-pass reduction (kernel partial sums +
+            # _rmsnorm_bwd_dg_reduce) reorders fp32 additions vs PyTorch's
+            # sequential sum, accumulating ~2e-4 error over N=65536 elements.
+            atol, rtol = 5e-4, 5e-4
         else:
             # float32 typically can be tighter
             atol, rtol = 1e-4, 1e-4
