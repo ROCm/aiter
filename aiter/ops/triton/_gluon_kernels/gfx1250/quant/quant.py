@@ -314,9 +314,10 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
         shape=[NUM_BUFFERS, BLOCK_SIZE_M, BLOCK_SIZE_N],
         layout=SHARED_LAYOUT_X,
     )
+    # Store side is also ring-buffered, like x_buffer (see STORE_WAIT below).
     out_smem = gl.allocate_shared_memory(
         x_fp8_ptr.type.element_ty,
-        shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+        shape=[NUM_BUFFERS, BLOCK_SIZE_M, BLOCK_SIZE_N],
         layout=SHARED_LAYOUT_X,
     )
     SHARED_LAYOUT_BS: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
@@ -324,9 +325,12 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
     )
     bs_smem = gl.allocate_shared_memory(
         bs_ptr.type.element_ty,
-        shape=[BLOCK_SIZE_M, NUM_QUANT_BLOCKS],
+        shape=[NUM_BUFFERS, BLOCK_SIZE_M, NUM_QUANT_BLOCKS],
         layout=SHARED_LAYOUT_BS,
     )
+    # 2 stores/iter (out, bs); same-kind TDM ops complete in issue order, so
+    # waiting for all but the oldest NUM_BUFFERS-1 pairs is enough before reuse.
+    STORE_WAIT: gl.constexpr = 2 * (NUM_BUFFERS - 1)
 
     # TDM descriptor: base at this CTA's (M, N) origin
     x_base = (
@@ -391,20 +395,21 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
         )
 
         pid_n = start_n + compute_idx
-        out_smem.store(out_fp8)
-        bs_smem.store(bs_e8m0)
+        store_slot = compute_idx % NUM_BUFFERS
+        gl.amd.gfx1250.tdm.async_wait(STORE_WAIT)
+        out_smem.index(store_slot).store(out_fp8)
+        bs_smem.index(store_slot).store(bs_e8m0)
         gl.barrier()  # single barrier covers both LDS writes
         gl.amd.gfx1250.tdm.async_store(
             out_desc,
             [pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N],
-            out_smem,
+            out_smem.index(store_slot),
         )
         gl.amd.gfx1250.tdm.async_store(
             bs_desc,
             [pid_m * BLOCK_SIZE_M, pid_n * NUM_QUANT_BLOCKS],
-            bs_smem,
+            bs_smem.index(store_slot),
         )
-        gl.amd.gfx1250.tdm.async_wait(0)  # waits for both stores above
         compute_idx += 1
 
     # ---- Epilogue: drain remaining NUM_BUFFERS-1 tiles ----
@@ -422,19 +427,24 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
         )
 
         pid_n = start_n + compute_idx
-        out_smem.store(out_fp8)
-        bs_smem.store(bs_e8m0)
+        store_slot = compute_idx % NUM_BUFFERS
+        gl.amd.gfx1250.tdm.async_wait(STORE_WAIT)
+        out_smem.index(store_slot).store(out_fp8)
+        bs_smem.index(store_slot).store(bs_e8m0)
         gl.barrier()  # single barrier covers both LDS writes
         gl.amd.gfx1250.tdm.async_store(
             out_desc,
             [pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N],
-            out_smem,
+            out_smem.index(store_slot),
         )
         gl.amd.gfx1250.tdm.async_store(
             bs_desc,
             [pid_m * BLOCK_SIZE_M, pid_n * NUM_QUANT_BLOCKS],
-            bs_smem,
+            bs_smem.index(store_slot),
         )
-        gl.amd.gfx1250.tdm.async_wait(0)  # waits for both stores above
         compute_idx += 1
+
+    # Final drain: up to STORE_WAIT stores may still be in flight; a CTA must
+    # not retire with any TDM store still outstanding against its LDS.
+    gl.amd.gfx1250.tdm.async_wait(0)
 
