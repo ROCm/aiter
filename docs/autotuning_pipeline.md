@@ -151,4 +151,6 @@ Some ops read the tuned CSV again at run time and index it on `(gfx, cu_num, M, 
 `aiter/fused_moe.py` do. There the key has to match too: setting `CU_NUM` in a serving
 environment changes the runtime key. If that row was not baked, the wrapper either takes its
 documented default or the C++ registry rejects the unavailable kernel name; do not use
-`CU_NUM` to impersonate hardware in serving.
+`CU_NUM` to impersonate hardware in serving. Opus checks the exact-CU tables first; on a
+miss it prefers a legacy `cu_num=0` row and then the shape's lowest baked CU count before
+the heuristic, so an untuned SKU behaves as it did before the key gained `cu_num`.
