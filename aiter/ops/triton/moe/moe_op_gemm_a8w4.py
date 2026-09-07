@@ -22,7 +22,12 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w4 import (
     _moe_gemm_a8w4 as _moe_gemm_a8w4_triton,
 )
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
-from aiter.ops.triton.moe.reduce import reduce_grouped
+from aiter.ops.triton.moe.reduce import (
+    EpCombineScatter,
+    reduce_grouped,
+    scatter_grouped,
+    validate_reduce_out,
+)
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
@@ -53,6 +58,9 @@ def allocate_output(
     block_m,
     split_k,
     device,
+    y_out=None,
+    skip_final=False,
+    skip_matmul=False,
 ):
     # if the activations are gathered, then M is number of gather indices
     if gather_indx is not None:
@@ -66,10 +74,30 @@ def allocate_output(
         )  # compressed number of rows
     matmul_shape = (split_k, M, N // reduction_n_matmul)
     final_shape = (y_rows, N // reduction_n_matmul // reduction_n_reduction)
-    matmul_output = torch.empty(matmul_shape, device=device, dtype=out_dtype)
-    if scatter_indx is not None or split_k > 1:
-        final_output = torch.empty(final_shape, device=device, dtype=out_dtype)
+    if skip_matmul:
+        # The epilogue scatters straight into a caller-owned window, so nothing
+        # ever reads this buffer -- and at (M x hidden) bf16 it is tens of MB per
+        # layer, allocated and dirtied for nothing.
+        matmul_output = None
     else:
+        matmul_output = torch.empty(matmul_shape, device=device, dtype=out_dtype)
+    if skip_final:
+        # The rows are delivered elsewhere (expert-parallel scatter), so a
+        # reduced output would only be allocated to be thrown away -- and at
+        # (tokens x hidden) bf16 that is tens of MB per layer.
+        assert y_out is None, "y_out names a reduced output; skip_final has none"
+        final_output = None
+    elif scatter_indx is not None or split_k > 1:
+        final_output = validate_reduce_out(y_out, final_shape, out_dtype, device)
+    else:
+        # No reduction runs: reduce_grouped early-returns the matmul buffer
+        # itself (indx is None and split_k == 1), so a caller-provided buffer
+        # would be silently dropped. Say so instead of writing nowhere.
+        assert y_out is None, (
+            "y_out was provided but this call has no grouped reduction "
+            "(scatter_indx is None and split_k == 1), so nothing would write "
+            "into it -- the result comes straight out of the matmul buffer."
+        )
         final_output = None
     return matmul_output, final_output
 
@@ -342,6 +370,24 @@ def moe_gemm_a8w4(
     # standalone routed+shared elementwise add).
     residual=None,
     backend=None,
+    # Per-gate validity, same layout as scatter_indx. Default None == every gate
+    # slot is live, which holds whenever routing() produced the indices. Pass a
+    # mask when only some of a token's n_expts_act slots are computed here --
+    # expert parallelism, where the other slots belong to another rank and are
+    # never written, so the reduce must not sum them.
+    gate_valid=None,
+    # Destination for the grouped reduction's result, instead of a freshly
+    # allocated buffer. May be a slice of a taller tensor -- the reduce writes
+    # through `out`'s strides -- which lets a caller whose consumer wants more
+    # rows than this GEMM produces skip a full-width copy. Requires a grouped
+    # reduction to actually run, i.e. scatter_indx is not None or split_k > 1.
+    y_out=None,
+    # Expert-parallel combine: deliver the un-reduced rows to a combine staging
+    # window instead of reducing them here (see EpCombineScatter). The peers'
+    # rows for a token are missing at this point, so there is nothing to reduce;
+    # whoever owns the staging window sums them once every rank has delivered.
+    # Mutually exclusive with y_out, which names a reduced output.
+    ep_scatter: EpCombineScatter | None = None,
 ):
     """
     Y[:, :] = 0.
@@ -434,6 +480,39 @@ def moe_gemm_a8w4(
         out_dtype = torch.float8_e4m3fn
     else:
         out_dtype = out_dtype  # noqa: PLW0127
+    if ep_scatter is not None:
+        assert scatter_indx is not None, (
+            "ep_scatter needs the scatter indices' row order: dst_row is indexed "
+            "by sorted row, which only exists once the gates are sorted"
+        )
+        assert not out_mx_quant, "ep_scatter delivers bf16 rows, not MXFP8"
+        assert (
+            not apply_swiglu
+        ), "ep_scatter is a GEMM2-side delivery; the activation belongs to GEMM1"
+        # `residual` is folded in by reduce_grouped, which does not run here --
+        # so accepting both would drop the residual silently. It cannot simply
+        # move into the scatter either: the residual is per TOKEN, and the rows
+        # leaving here are per (token, expert), so adding it to each would count
+        # it once per expert. It belongs after the combine.
+        assert residual is None, (
+            "ep_scatter cannot apply `residual`: it is per-token, but this path "
+            "emits per-(token, expert) rows and never reduces them. Fold the "
+            "residual into the combine's output instead."
+        )
+    # Fold the EP scatter into the GEMM epilogue when the kernel we are about to
+    # launch has one. Only the two non-persistent gluon kernels do: the persistent
+    # decode kernel writes back inside its N-tile loop through a rolling
+    # descriptor, and the triton kernel has no gfx1250 epilogue at all. Both fall
+    # through to the standalone `_scatter_grouped`, which writes the same bytes.
+    fused_ep_scatter = (
+        ep_scatter is not None
+        and ep_scatter.fused
+        and use_gluon
+        and config["persistent_iters"] <= 1
+        # split-k partials must be summed before a row can be delivered, and the
+        # epilogue sees only its own partial.
+        and config["split_k"] == 1
+    )
     y, y_final = allocate_output(
         M,
         padded_N,
@@ -446,7 +525,24 @@ def moe_gemm_a8w4(
         config["block_m"],
         config["split_k"],
         x.device,
+        y_out=y_out,
+        skip_final=ep_scatter is not None,
+        # The epilogue writes straight into the staging window, so the
+        # (M x hidden) matmul buffer is never read. Skip allocating it.
+        skip_matmul=fused_ep_scatter,
     )
+    if fused_ep_scatter:
+        # `Y` and its strides now name the staging window; the kernel indexes it
+        # by dst_row instead of by sorted row, so no `start_m` bias applies.
+        y_ptr = ep_scatter.out
+        stride_y_m = ep_scatter.out.stride(0)
+        stride_y_n = ep_scatter.out.stride(1)
+        dst_row = ep_scatter.dst_row
+    else:
+        y_ptr = y
+        stride_y_m = y.stride(1)
+        stride_y_n = y.stride(2)
+        dst_row = None
     # Companion ue8m0 scale buffer for the MXFP8 emit path.
     if out_mx_quant:
         n_out = padded_N // reduction_n_matmul  # post-swiglu width
@@ -525,7 +621,7 @@ def moe_gemm_a8w4(
             CLAMP_BOUNDS=K % config["block_k"] != 0,
             N_ITERS=config["persistent_iters"],
             num_warps=config["num_warps"],
-            UPCAST_INDICES=should_upcast_indices(x, w, y),
+            UPCAST_INDICES=should_upcast_indices(x, w, y_ptr),
             waves_per_eu=config["waves_per_eu"],
             YMxScale=y_scale,
             stride_y_mx_m=stride_y_mx_m,
@@ -534,9 +630,9 @@ def moe_gemm_a8w4(
         )
     elif use_gluon and block_m == 16:
         _moe_gemm_a8w4_decode_gluon[(grid,)](
-            y,
-            y.stride(1),
-            y.stride(2),
+            y_ptr,
+            stride_y_m,
+            stride_y_n,
             x,
             x.stride(0),
             x.stride(1),
@@ -582,12 +678,15 @@ def moe_gemm_a8w4(
             PRESHUFFLED=preshuffled,
             CLAMP_BOUNDS=K % config["block_k"] != 0,
             num_warps=config["num_warps"],
-            UPCAST_INDICES=should_upcast_indices(x, w, y),
+            UPCAST_INDICES=should_upcast_indices(x, w, y_ptr),
             waves_per_eu=config["waves_per_eu"],
             YMxScale=y_scale,
             stride_y_mx_m=stride_y_mx_m,
             stride_y_mx_n=stride_y_mx_n,
             HAS_MX_OUT=out_mx_quant,
+            DstRow=dst_row,
+            EP_SCATTER=fused_ep_scatter,
+            Y_ROWS=(ep_scatter.out.shape[0] if fused_ep_scatter else 0),
         )
     elif use_gluon:
         layouts = get_moe_a8w4_layouts(
@@ -608,9 +707,9 @@ def moe_gemm_a8w4(
             is_prefill=M >= 1024,
         )
         _moe_gemm_a8w4_prefill_gluon[(grid,)](
-            y,
-            y.stride(1),
-            y.stride(2),
+            y_ptr,
+            stride_y_m,
+            stride_y_n,
             x,
             x.stride(0),
             x.stride(1),
@@ -657,12 +756,15 @@ def moe_gemm_a8w4(
             CLAMP_BOUNDS=K % config["block_k"] != 0,
             num_warps=config["num_warps"],
             num_ctas=config["num_ctas"],
-            UPCAST_INDICES=should_upcast_indices(x, w, y),
+            UPCAST_INDICES=should_upcast_indices(x, w, y_ptr),
             waves_per_eu=config["waves_per_eu"],
             YMxScale=y_scale,
             stride_y_mx_m=stride_y_mx_m,
             stride_y_mx_n=stride_y_mx_n,
             HAS_MX_OUT=out_mx_quant,
+            DstRow=dst_row,
+            EP_SCATTER=fused_ep_scatter,
+            Y_ROWS=(ep_scatter.out.shape[0] if fused_ep_scatter else 0),
             **layouts,
         )
     else:
@@ -717,7 +819,7 @@ def moe_gemm_a8w4(
             W_CACHE_MODIFIER=config["w_cache_modifier"],
             num_warps=config["num_warps"],
             num_stages=config["num_stages"],
-            UPCAST_INDICES=should_upcast_indices(x, w, y),
+            UPCAST_INDICES=should_upcast_indices(x, w, y_ptr),
             waves_per_eu=config["waves_per_eu"],
             matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
             kpack=config["kpack"],
@@ -731,11 +833,24 @@ def moe_gemm_a8w4(
     # reduce_grouped and return (fp8 values, ue8m0 scales) directly.
     if out_mx_quant:
         return y.squeeze(0), y_scale
+    # Expert-parallel combine: hand the rows to the staging window instead of
+    # reducing them. Returns the window view, which is not a per-token output --
+    # the caller's combine produces that once every rank has delivered.
+    if ep_scatter is not None:
+        if fused_ep_scatter:
+            # The epilogue already placed every row in the window.
+            return ep_scatter.out
+        return scatter_grouped(y, ep_scatter.dst_row, ep_scatter.out)
     # Build grouped reduction inputs in a uniform way
     group_indx = (
         None
         if scatter_indx is None
         else scatter_indx.view(-1, routing_data.n_expts_act)
+    )
+    group_valid = (
+        None
+        if (gate_valid is None or scatter_indx is None)
+        else gate_valid.view(-1, routing_data.n_expts_act)
     )
     # Step 9: external residual fold-in is now wired into reduce_grouped.
     y_final = reduce_grouped(
@@ -749,6 +864,7 @@ def moe_gemm_a8w4(
         out_dtype=out_dtype,
         swiglu_add_residual=swiglu_add_residual,
         residual=residual,
+        indx_valid=group_valid,
     )
     return y_final
 
