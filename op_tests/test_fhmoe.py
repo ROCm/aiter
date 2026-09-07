@@ -921,7 +921,6 @@ def _mock_dsv4_i384_fhmoe_metadata(monkeypatch: pytest.MonkeyPatch):
     fused_moe_module = importlib.import_module("aiter.fused_moe")
     monkeypatch.setattr(fused_moe_module, "get_cu_num", lambda: 256)
     monkeypatch.setattr(fused_moe_module, "get_gfx_runtime", lambda: "gfx950")
-    monkeypatch.setattr(fused_moe_module, "is_flydsl_available", lambda: True)
     monkeypatch.delenv("AITER_BYPASS_TUNE_CONFIG", raising=False)
     fused_moe_module.get_2stage_cfgs.cache_clear()
     fused_moe_module.cfg_2stages_by_file.clear()
@@ -1114,7 +1113,6 @@ def test_dsv4_i384_fhmoe_uses_dedicated_config(
     config_path = Path(__file__).resolve().parents[1] / "aiter/configs/tuned_fhmoe.csv"
     monkeypatch.setattr(fused_moe_module, "get_cu_num", lambda: 256)
     monkeypatch.setattr(fused_moe_module, "get_gfx_runtime", lambda: "gfx950")
-    monkeypatch.setattr(fused_moe_module, "is_flydsl_available", lambda: True)
     fused_moe_module.get_2stage_cfgs.cache_clear()
     fused_moe_module.cfg_2stages_by_file.clear()
 
@@ -1168,7 +1166,6 @@ def test_dsv4_i384_fhmoe_config_requires_exact_bucket(
 
     monkeypatch.setattr(fused_moe_module, "get_cu_num", lambda: 256)
     monkeypatch.setattr(fused_moe_module, "get_gfx_runtime", lambda: "gfx950")
-    monkeypatch.setattr(fused_moe_module, "is_flydsl_available", lambda: True)
     monkeypatch.setenv("AITER_ONLINE_TUNE", "1")
     fused_moe_module.get_2stage_cfgs.cache_clear()
     fused_moe_module.cfg_2stages_by_file.clear()

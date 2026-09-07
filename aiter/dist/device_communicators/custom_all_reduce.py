@@ -29,19 +29,16 @@ from torch.distributed import ProcessGroup
 import aiter as ops
 from aiter import logger
 from aiter.dist.parallel_state import in_the_same_node_as
+from aiter.dist.utils import env_flag
 from aiter.utility.dtypes import fp8
 
 from .rocm_version import get_rocm_version
 
 
-def _env_flag(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
-
-
 def _detect_gfx1250() -> bool:
     # Escape hatch for validating the old-arch (IPC + old kernel) path on gfx1250
     # hardware: forces the non-gfx1250 code path end to end.
-    if _env_flag("AITER_CUSTOM_AR_DISABLE_GFX1250"):
+    if env_flag("AITER_CUSTOM_AR_DISABLE_GFX1250"):
         return False
     try:
         import torch
@@ -248,9 +245,9 @@ def _should_use_vmm(is_gfx1250: bool) -> bool:
     """
     if not is_gfx1250:
         return False
-    if _env_flag("AITER_CUSTOM_AR_FORCE_IPC"):
+    if env_flag("AITER_CUSTOM_AR_FORCE_IPC"):
         return False
-    if _env_flag("AITER_CUSTOM_AR_FORCE_VMM"):
+    if env_flag("AITER_CUSTOM_AR_FORCE_VMM"):
         return True
     v = get_rocm_version()
     if v is None:
@@ -1065,7 +1062,7 @@ class CustomAllreduce:
         # hipIpcGetMemHandle outright, and the raw pool sidesteps that while
         # everything else (meta pool, capture-time outputs) stays exportable
         # under the default allocator.
-        raw_cached = _expandable_segments_enabled() or _env_flag(
+        raw_cached = _expandable_segments_enabled() or env_flag(
             "AITER_CUSTOM_AR_RAW_INPUT_POOL"
         )
         self._pool.create("input", max_size, raw_cached=raw_cached)
@@ -1078,7 +1075,7 @@ class CustomAllreduce:
             "AITER_CUSTOM_AR_RAW_INPUT_POOL=%s)",
             "raw_cached/hipMalloc" if raw_cached else "torch.empty",
             _expandable_segments_enabled(),
-            _env_flag("AITER_CUSTOM_AR_RAW_INPUT_POOL"),
+            env_flag("AITER_CUSTOM_AR_RAW_INPUT_POOL"),
         )
 
         handles, offsets = self._pool.get_ipc_meta("meta")
