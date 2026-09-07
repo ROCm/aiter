@@ -6,6 +6,8 @@
 ROCm ships the binding without a setup.py. If the normal import fails, this
 module temporarily searches ``/opt/rocm/share/amd_smi`` while importing it.
 Neither ``PYTHONPATH`` nor the caller's lasting ``sys.path`` is changed.
+The amdsmi session and HIP-device handle mapping are initialized lazily once
+per process and reused by every monitor instance.
 
 Usage (context manager):
     with GpuMonitor(device_index=0, interval_s=0.05) as mon:
@@ -22,6 +24,7 @@ Usage (explicit start/stop):
 
 from __future__ import annotations
 
+import atexit
 import ctypes
 import importlib
 import json
@@ -30,6 +33,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
+from functools import cache
 from typing import Generator
 
 SMI_RESULT_PREFIX = "AITER_SMI_RESULT "
@@ -61,34 +65,44 @@ except ImportError:
     _AMDSMI_AVAILABLE = False
 
 
+_AMDSMI_LOCK = threading.Lock()
+_AMDSMI_INITIALIZED = False
+_AMDSMI_HANDLES_BY_BDF = {}
+_AMDSMI_HANDLES_BY_HIP_DEVICE = {}
+
+
 # ------------------------------------------------------------------
 # HIP device -> amdsmi handle via PCIe BDF
 # ------------------------------------------------------------------
 
 
+@cache
+def _hip_runtime_library():
+    """Load and cache the HIP runtime used for device-to-BDF lookup."""
+    import glob as _glob
+
+    candidates = ["libamdhip64.so"] + sorted(
+        _glob.glob("/opt/rocm/lib/libamdhip64.so.*"), reverse=True
+    )
+    for name in candidates:
+        try:
+            return ctypes.CDLL(name)
+        except OSError:
+            continue
+    raise RuntimeError(
+        "libamdhip64.so not found (tried unversioned and /opt/rocm/lib/libamdhip64.so.*); "
+        "is ROCm installed?"
+    )
+
+
+@cache
 def _hip_device_bdf(hip_device: int) -> str:
     """Return the PCIe BDF string for a HIP device index, e.g. '0000:03:00.0'.
 
     Calls ``hipDeviceGetPCIBusId`` via ctypes so there is no hard dependency on
     PyTorch or the hip-python package.
     """
-    import glob as _glob
-
-    candidates = ["libamdhip64.so"] + sorted(
-        _glob.glob("/opt/rocm/lib/libamdhip64.so.*"), reverse=True
-    )
-    libhip = None
-    for name in candidates:
-        try:
-            libhip = ctypes.CDLL(name)
-            break
-        except OSError:
-            continue
-    if libhip is None:
-        raise RuntimeError(
-            "libamdhip64.so not found (tried unversioned and /opt/rocm/lib/libamdhip64.so.*); "
-            "is ROCm installed?"
-        )
+    libhip = _hip_runtime_library()
     buf = ctypes.create_string_buffer(64)
     ret = libhip.hipDeviceGetPCIBusId(buf, ctypes.c_int(64), ctypes.c_int(hip_device))
     if ret != 0:
@@ -107,6 +121,45 @@ def _amdsmi_bdf_str(handle) -> str:
     )
 
 
+def _ensure_amdsmi_initialized() -> None:
+    """Initialize amdsmi and enumerate processor handles once per process."""
+    global _AMDSMI_INITIALIZED, _AMDSMI_HANDLES_BY_BDF
+
+    if not _AMDSMI_AVAILABLE:
+        raise ImportError("amdsmi is not installed or not importable")
+    with _AMDSMI_LOCK:
+        if _AMDSMI_INITIALIZED:
+            return
+        amdsmi.amdsmi_init()
+        try:
+            _AMDSMI_HANDLES_BY_BDF = {
+                _amdsmi_bdf_str(handle): handle
+                for handle in amdsmi.amdsmi_get_processor_handles()
+            }
+        except BaseException:
+            amdsmi.amdsmi_shut_down()
+            raise
+        _AMDSMI_INITIALIZED = True
+
+
+def _shutdown_amdsmi() -> None:
+    """Release the process-wide amdsmi session during interpreter shutdown."""
+    global _AMDSMI_INITIALIZED
+
+    with _AMDSMI_LOCK:
+        if not _AMDSMI_INITIALIZED:
+            return
+        try:
+            amdsmi.amdsmi_shut_down()
+        finally:
+            _AMDSMI_INITIALIZED = False
+            _AMDSMI_HANDLES_BY_BDF.clear()
+            _AMDSMI_HANDLES_BY_HIP_DEVICE.clear()
+
+
+atexit.register(_shutdown_amdsmi)
+
+
 def hip_device_to_amdsmi_handle(hip_device: int):
     """Return the amdsmi processor handle that corresponds to a HIP device index.
 
@@ -122,24 +175,20 @@ def hip_device_to_amdsmi_handle(hip_device: int):
         RuntimeError: if no amdsmi handle matches the HIP device's BDF.
         ImportError: if amdsmi is not available.
     """
-    if not _AMDSMI_AVAILABLE:
-        raise ImportError("amdsmi is not installed or not importable")
-
-    target_bdf = _hip_device_bdf(hip_device)
-
-    amdsmi.amdsmi_init()
-    try:
-        handles = amdsmi.amdsmi_get_processor_handles()
-        for handle in handles:
-            if _amdsmi_bdf_str(handle) == target_bdf:
-                return handle
-    finally:
-        amdsmi.amdsmi_shut_down()
-
-    raise RuntimeError(
-        f"No amdsmi handle found with BDF {target_bdf!r} "
-        f"(HIP device {hip_device})"
-    )
+    _ensure_amdsmi_initialized()
+    with _AMDSMI_LOCK:
+        cached = _AMDSMI_HANDLES_BY_HIP_DEVICE.get(hip_device)
+        if cached is not None:
+            return cached
+        target_bdf = _hip_device_bdf(hip_device)
+        handle = _AMDSMI_HANDLES_BY_BDF.get(target_bdf)
+        if handle is None:
+            raise RuntimeError(
+                f"No amdsmi handle found with BDF {target_bdf!r} "
+                f"(HIP device {hip_device})"
+            )
+        _AMDSMI_HANDLES_BY_HIP_DEVICE[hip_device] = handle
+        return handle
 
 
 def _collect_sample(handle) -> dict:
@@ -187,6 +236,7 @@ class GpuMonitor:
         self._stop_event = threading.Event()
         self._ready_event = threading.Event()
         self._error: BaseException | None = None
+        self._handle = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -200,6 +250,14 @@ class GpuMonitor:
         self._error = None
         self._stop_event.clear()
         self._ready_event.clear()
+        try:
+            if isinstance(self._device_index, int):
+                self._handle = hip_device_to_amdsmi_handle(self._device_index)
+            else:
+                _ensure_amdsmi_initialized()
+                self._handle = self._device_index
+        except BaseException as error:
+            raise RuntimeError(f"failed to initialize amdsmi monitor: {error}") from error
         self._thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._thread.start()
         if not self._ready_event.wait(timeout=10.0):
@@ -272,30 +330,11 @@ class GpuMonitor:
     # ------------------------------------------------------------------
 
     def _poll_loop(self) -> None:
-        initialized = False
         try:
-            target_bdf = None
-            if isinstance(self._device_index, int):
-                target_bdf = _hip_device_bdf(self._device_index)
-            amdsmi.amdsmi_init()
-            initialized = True
-            if target_bdf is not None:
-                handles = {
-                    _amdsmi_bdf_str(handle): handle
-                    for handle in amdsmi.amdsmi_get_processor_handles()
-                }
-                if target_bdf not in handles:
-                    raise RuntimeError(
-                        f"no amdsmi handle for HIP device {self._device_index} "
-                        f"({target_bdf})"
-                    )
-                handle = handles[target_bdf]
-            else:
-                handle = self._device_index
             self._ready_event.set()
             while not self._stop_event.is_set():
                 t0 = time.perf_counter()
-                self._samples.append(_collect_sample(handle))
+                self._samples.append(_collect_sample(self._handle))
                 elapsed = time.perf_counter() - t0
                 remaining = self._interval_s - elapsed
                 if remaining > 0:
@@ -304,8 +343,6 @@ class GpuMonitor:
             self._error = error
             self._ready_event.set()
         finally:
-            if initialized:
-                amdsmi.amdsmi_shut_down()
             self._ready_event.set()
 
 
