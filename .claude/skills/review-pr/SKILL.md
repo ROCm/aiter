@@ -38,6 +38,8 @@ so what follows is the map, not the manual.**
 | `merge_target.txt` | where the base tree is checked out — **read base files from there** | grepping the local worktree answers about the wrong branch |
 | `guards.txt` | each deleted assert/check: moved, returned changed, or gone | "it came back" and "it was weakened" look identical |
 | `siblings.txt` | a variant of a changed function still carrying a changed line | A1's sibling is in the same file, not another file |
+| `flydsl_bounds.txt` | FlyDSL buffer/descriptor bounds not tied to the tensor's real extent | B2 is `tl.load` without a mask and FlyDSL has no `tl`, so this class had no rule at all |
+| `aot_pairing.txt` | new ops-side contracts `aiter/aot/flydsl/` was not taught | #4397 wired stage2 into AOT and missed stage1; it drifted for 32 commits |
 | `symbols.txt` | first-party imports that do not resolve against the merge target | a **rebase** signal, not invented code — #4994's import was valid when written |
 | `twins.txt` | which existing file each new file was copied from | the defect is the *asymmetry* between them, not the copy |
 | `test_quality.txt` | assertion count, tolerances, shapes of added tests | zero assertions may mean a helper asserts — read before firing |
@@ -50,7 +52,6 @@ so what follows is the map, not the manual.**
 
 A `SKIPPED:` artifact means that axis was **not checked** — say so rather than reading
 silence as clean. A forensic that ran and found nothing says so in words.
-
 
 **Read `$WORK/rules_expanded.txt` — it is the full text of exactly the rules in
 `$WORK/rules.txt`, and it is the rule list for this review.** They are derived from paths, added/deleted
@@ -252,7 +253,6 @@ of irrelevant rule text into every review, on top of a skill that is already lon
 "read all of it" is a hope rather than a guarantee. Cutting *which rules you are told to
 check* from 44 to 12 while still shipping all 44 rule texts was half a fix.
 
-
 ## Step 6 — AI Code Diagnostic
 
 For each question below, note if the answer is a warning sign:
@@ -320,9 +320,9 @@ Before writing the verdict, answer this one question in full:
 
 **"Is there any correctness risk, resource hazard, or behavioral edge case in this diff that none of Steps 1–7 above caught?"**
 
-Append it to `$WORK/answers.txt` as a `BLIND:` line. If the answer is yes, add it to the
-findings. A bare "no" is rejected: it costs nothing to write and carries nothing, so say
-what you looked for and did not find.
+Append it to `$WORK/answers.txt` as a `BLIND:` line; if yes, add it to the findings. A bare
+"no" is rejected — say what you looked for and did not find. **Anything found AFTER this goes
+in `$WORK/late_findings.txt`, appended, with the card marked `-- late finding: <step>`; never edit a green artifact — the gate hashes them and reports `BACKDATED-ARTIFACT`.**
 
 ## Step 7.6 — Refutation
 
@@ -367,7 +367,7 @@ happen; go back to it rather than reporting.**
 # Then write the card to $WORK/card.md and run the last two gates against it. The four gates
 # above check that the work happened; this one checks that the card reports THAT work.
 "$SKILLS_ROOT/review-pr/triage.py" card "$WORK/card.md" "$WORK/verdicts.txt" \
-  "$WORK/ai_diagnostic.txt" "$WORK/answers.txt" "$WORK/pr.diff" || {
+  "$WORK/ai_diagnostic.txt" "$WORK/answers.txt" "$WORK/pr.diff" "$WORK/late_findings.txt" || {
   echo "a finding in the card is not nailed down — fix or drop it before reporting" >&2
   exit 1
 }

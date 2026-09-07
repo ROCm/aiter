@@ -104,6 +104,16 @@ Real example (PR#3998): wrapper asserted alignment; asm kernel padded — valid 
 FP self-check: Does the kernel actually handle non-aligned inputs, or does the assert reflect a real hardware requirement?
 → `⚠️ B7: assert [constraint] may be unnecessary — verify kernel handles non-aligned inputs before removing`
 
+**B8 — FlyDSL buffer or descriptor bound not tied to the tensor's real extent** 🔴
+`create_buffer_resource(t, max_size=True)` (also `ptr_buffer_resource`, `make_buffer_tensor`) declares "this buffer is as large as its allocation". When `t`'s bound dimension is a runtime extent — M, token count, `num_valid`, a per-expert count — the hardware `num_records` field then permits reads past the live data: silent garbage, no fault. Same defect in `make_tensor_descriptor_2d` when `oob_outer_bound` is set and `oob_inner_bound` is not, and in a 32-bit `voffset` that overflows on a >4GB weight.
+**Evidence:** `$WORK/flydsl_bounds.txt` lists every such site on a line this diff adds, naming the bound argument. It is a candidate list, not a verdict.
+FP self-check (do this before firing): confirm the bound dimension is NOT a compile-time constant, NOT an exact multiple, and NOT padded by the caller. Weights and caches — `sin_cache`, `cos_cache`, `rms_weight`, `block_table`, `plan` — are full-size and `max_size=True` is correct for them; do not fire. Of 76 such sites in the tree, the suspicious ones are those bound to M / token / expert counts. Name the concrete runtime value at which the read leaves the allocation.
+Real example (aiter#4151 → fixed in #4546): `preshuffle_gemm.py` bound `arg_scale_a` with `max_size=True` while `scale_a` is per-row(M) and M is ragged. The same commit's comment — "B and scales are exact-multiple in N and stay max_size" — was false for `scale_a`; the code was written to match a premise that did not hold. `arg_scale_b` and `arg_bias` in the same function are per-N exact-multiple and were correctly left alone by the fix.
+Second example (aiter#4849 → fixed in `e6592c373`): `make_tensor_descriptor_2d` bounded the outer extent of a scale tensor and not the inner one.
+**Not D9.** D9 is `index * stride` overflowing int32 in Python, and its scanner already reads FlyDSL — it knows the `fx.Int64` spelling. B8 is the descriptor's `num_records` and the hardware voffset: nothing overflows in Python, the read leaves the allocation on the GPU. Two mechanisms, two rules; do not merge them.
+**Not B2.** B2 is `tl.load` without a mask. There is no `tl` in FlyDSL, so B2 cannot fire on this backend at all — which is why a FlyDSL PR deriving `memory-safety` (B2 D1 G1) used to get nothing that could reach this class.
+→ `🔴 B8: [call] binds [tensor] with max_size=True but [dim] is runtime-ragged — reads past the allocation at [value]`
+
 ---
 
 ### C — Hardcoded Arch / Dtype Assumptions
@@ -259,6 +269,16 @@ objects, then update the table.
 FP self-check: appending at the end of the struct shifts nothing, and a PR that updates the
 assertions alongside the field is the correct shape — do not fire on either.
 → `🔴 D11: [field] added to [struct] before [next field] — sizeof and the offsets after it shift; update the PA_GFX1250_CO_ABI table and rebuild the code objects, or append at the end`
+
+
+**D12 — New FlyDSL runtime contract the AOT pre-compiler was not taught** ⚠️ (🔴 once it forces a cache miss)
+`aiter/aot/flydsl/` pre-compiles kernel variants by re-deriving the runtime's own conditions, so it holds a second copy of them — and the copy drifts. When a PR adds a public definition to a module AOT imports from and never wires it in, AOT keeps enumerating the variants it knew about: the cache covers shapes the runtime no longer asks for, and the runtime asks for shapes nothing compiled. The symptom is a miss, a fallback, or the wrong tile — not a crash.
+**Evidence:** `$WORK/aot_pairing.txt`. Pairing is by symbol, taken from AOT's own import statements (24 modules, 62 symbols on the tree this was written against). A candidate is a public top-level definition the diff ADDS, in a module AOT imports from, that AOT does not already import and whose name appears nowhere in the diff's AOT hunks.
+FP self-check (do this before firing): a helper the pre-compiler has no reason to call is fine. Ask whether the new symbol decides WHICH variant gets built — a tile resolver, an activation or bias condition, a dtype parse. If it does not participate in AOT's variant enumeration, do not fire.
+Real example (aiter#4397 → fixed in #4429): `313502261` added `resolve_flydsl_stage1_tile_n` and `resolve_flydsl_stage2_tile_k` together, wired only stage2 into AOT, and left stage1 unmentioned in its AOT hunks. AOT pre-compiled a `tile_n` the runtime never requests; `a177781d4` imported it 32 commits later. Note that #4397 *does* touch AOT — the defect is a path missed, not a side untouched, which is why "ops changed, AOT untouched" would catch nothing.
+Second example (`e4c980fec`): AOT's `parse_csv` derived `enable_bias` from a hand-copied runtime condition. The comment that fix deleted names the mechanism: "Match the RT condition in fused_moe.py / test_moe_2stage.py".
+**Not A1.** A1 pairs a changed function with a variant of itself by shared name stem. `parse_csv` and `resolve_flydsl_stage1_tile_n` share nothing; these are two layers that must agree, not two copies of one bug.
+→ `⚠️ D12: [symbol] added to [module] which aiter/aot/flydsl/[file] imports from, and no AOT hunk mentions it — AOT will enumerate variants the runtime no longer requests`
 
 ---
 

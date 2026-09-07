@@ -5,7 +5,7 @@ Replaces Step 3's self-applied prose checklist. Emits only the matching rules so
 the model reads ~12 instead of all of them.  Conservative: when a type cannot be decided
 structurally it is INCLUDED, never dropped.
 """
-import difflib, re, sys, pathlib, collections
+import ast, difflib, re, sys, pathlib, collections
 from collections import OrderedDict
 
 TIER = ("aiter/jit/core.py", "aiter/__init__.py", "aiter/fused_moe.py",
@@ -262,6 +262,266 @@ def render_untested_kernel(new):
            "or *_test.py anywhere in the tree; benchmark dirs and bench_* files were not",
            "counted. HK6 is the rule; this is its evidence."]
     out += ["  %s" % p for p in new]
+    return "\n".join(out)
+
+
+FLYDSL_BUF_CALLS = ("create_buffer_resource", "ptr_buffer_resource", "make_buffer_tensor")
+
+
+def added_line_numbers(diff_text):
+    """path -> {new-side line numbers this diff adds}.
+
+    The collector reads the HEAD file, not the diff text, because a FlyDSL buffer call is
+    written across four lines and a `+` prefix on each of them is not a parse tree. Line
+    numbers are how the two are joined: parse the whole file, keep the calls whose span
+    touches a line this diff added. Reporting a site the PR did not write is how a
+    forensic turns into 76 rows of noise.
+    """
+    out, path, newno = {}, None, 0
+    for ln in diff_text.splitlines():
+        m = re.match(r"^diff --git a/(\S+) b/(\S+)", ln)
+        if m:
+            path, newno = m.group(2), 0
+            continue
+        if ln.startswith("@@"):
+            m = re.search(r"\+(\d+)", ln)
+            newno = int(m.group(1)) if m else 1
+            continue
+        if path is None or newno == 0 or ln.startswith(("+++", "---")):
+            continue
+        if ln.startswith("+"):
+            out.setdefault(path, set()).add(newno)
+            newno += 1
+        elif not ln.startswith(("-", "\\")):
+            newno += 1
+    return out
+
+
+def _call_name(node):
+    f = node.func
+    return f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")
+
+
+def _bound_arg(node):
+    """The tensor whose extent is at stake -- first positional, else the pointer kwarg."""
+    if node.args:
+        a = node.args[0]
+        if isinstance(a, ast.Name):
+            return a.id
+        if isinstance(a, ast.Attribute):
+            return a.attr
+        return type(a).__name__
+    for k in node.keywords:
+        if k.arg in ("ptr", "tensor", "global_ptr") and isinstance(k.value, ast.Name):
+            return k.value.id
+    return "?"
+
+
+def flydsl_bounds(diff_text, root):
+    """Candidate FlyDSL buffer/descriptor bounds not tied to the tensor's real extent.
+
+    FlyDSL needs patching after merge 1.66x as often as the repo average: 20 of the 98
+    fix-commits that reference another PR touch it, against a 12.3% share of all commits
+    (194/1577), one-sided binomial p=0.015, measured on aiter main 636098e5a. Four of its
+    21 precise fixes are this one mechanism:
+
+      de9f1f84a  create_buffer_resource(arg_scale_a, max_size=True) while scale_a is
+                 per-row(M) and M is ragged -- fixed to max_size=False plus an explicit
+                 num_records_bytes. The comment it also corrected ("B and scales are
+                 exact-multiple in N and stay max_size") was false for scale_a: the code
+                 was written to match a premise that did not hold.
+      e6592c373  make_tensor_descriptor_2d bounding the outer extent and not the inner.
+      d19f33251  a 32-bit hardware voffset field overflowing on a >4GB weight.
+      8cfa77e48  host declaring i64 for a pointer it passes as i32.
+
+    Nothing covered it. `num_records`, `max_size`, `buffer_resource` and `oob_` appear
+    nowhere in rules.md, and B2 -- the single out-of-bounds rule -- is `tl.load` without a
+    mask. There is no `tl` in FlyDSL, so even a PR deriving `memory-safety` (B2 D1 G1) got
+    a rule that cannot fire on this backend.
+
+    NOT D9. D9 is `index * stride` overflowing int32 in Python, and its scanner already
+    reads FlyDSL (it knows the `fx.Int64` spelling). This is the descriptor's num_records
+    and the hardware voffset: nothing overflows in Python, the read goes out of bounds on
+    the GPU. Two mechanisms, two rules -- do not merge them.
+    """
+    added = added_line_numbers(diff_text)
+    rows = []
+    for path in sorted(added):
+        if not path.endswith(".py") or "flydsl" not in path.lower():
+            continue
+        try:
+            tree = ast.parse((pathlib.Path(root) / path).read_text(errors="replace"))
+        except (OSError, SyntaxError, ValueError):
+            # A file that will not parse is a file this forensic cannot speak about. It is
+            # not a finding, and it must not take the rest of the diff down with it.
+            continue
+        lines = added[path]
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            span = range(node.lineno, getattr(node, "end_lineno", node.lineno) + 1)
+            if not any(l in lines for l in span):
+                continue
+            name = _call_name(node)
+            if name in FLYDSL_BUF_CALLS:
+                for k in node.keywords:
+                    if (k.arg == "max_size" and isinstance(k.value, ast.Constant)
+                            and k.value.value is True):
+                        rows.append((path, node.lineno, name, _bound_arg(node),
+                                     "max_size=True -- no num_records bound"))
+            elif name == "make_tensor_descriptor_2d":
+                kws = {k.arg for k in node.keywords}
+                if "oob_outer_bound" in kws and "oob_inner_bound" not in kws:
+                    rows.append((path, node.lineno, name, _bound_arg(node),
+                                 "oob_outer_bound set, oob_inner_bound missing"))
+    return rows
+
+
+AOT_DIR = "aiter/aot/flydsl/"
+OPS_PREFIX = "aiter.ops.flydsl"
+
+
+def aot_symbol_table(root):
+    """(module, symbol) -> [aot files importing it]: the contract AOT copies from runtime.
+
+    FlyDSL keeps a second copy of "which variant do we compile" under aiter/aot/flydsl/,
+    and the copy drifts. Five of the 21 precise FlyDSL fixes are that drift, and the
+    deleted comment in e4c980fec is its confession -- "Match the RT condition in
+    fused_moe.py / test_moe_2stage.py" -- a hand-copied runtime condition that stopped
+    matching.
+
+    Pairing is by SYMBOL. Two cheaper schemes were measured and rejected:
+
+      name similarity  what sibling_variants already does, which is why A1 never caught
+                       this: `parse_csv` and `resolve_flydsl_stage1_tile_n` share nothing.
+      directory mirror aot/flydsl/X.py <-> ops/flydsl/X_kernels.py does not hold.
+                       chunk_gdn_h.py imports kernels.gdr_prefill and kernels.tensor_shim
+                       and there is no chunk_gdn_h_kernels.py; gemm.py alone imports 11
+                       ops-side modules. The mirror is a coincidence on three files.
+
+    The import statement is the thing that actually holds: 24 modules, 62 symbols on the
+    tree this was written against. Symbol level and not module level is what keeps it
+    quiet -- editing an ops-side module without touching AOT is routine, editing one of
+    these 62 definitions is not.
+    """
+    table = {}
+    d = pathlib.Path(root) / AOT_DIR
+    for f in sorted(d.glob("*.py")) if d.is_dir() else []:
+        try:
+            tree = ast.parse(f.read_text(errors="replace"))
+        except (OSError, SyntaxError, ValueError):
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module \
+                    and node.module.startswith(OPS_PREFIX):
+                for a in node.names:
+                    table.setdefault((node.module, a.name), []).append(
+                        AOT_DIR + f.name)
+    return table
+
+
+def _aot_side_text(diff_text):
+    """Every line this diff adds under aiter/aot/flydsl/, as one blob."""
+    out, keep = [], False
+    for ln in diff_text.splitlines():
+        m = re.match(r"^diff --git a/(\S+) b/(\S+)", ln)
+        if m:
+            keep = m.group(2).startswith(AOT_DIR)
+            continue
+        if keep and ln.startswith("+") and not ln.startswith("+++"):
+            out.append(ln[1:])
+    return "\n".join(out)
+
+
+def aot_pairing(diff_text, root):
+    """New ops-side contracts that aiter/aot/flydsl/ was not taught about.
+
+    The first cut of this looked for "ops changed, AOT untouched" and would have caught
+    nothing. Measured against the real pair it was built from -- #4397 (313502261) adding
+    resolve_flydsl_stage1_tile_n, #4429 (a177781d4) importing it 32 commits later -- #4397
+    DOES touch AOT: grouped_moe.py +19, moe.py +9. The defect is not that AOT was left
+    alone. It is that AOT was updated and one path was missed: `resolve_flydsl_stage1_tile_n`
+    appears zero times in that commit's AOT hunks.
+
+    So the signal is narrower. A symbol is a candidate when all of:
+
+      1. it is a public top-level definition this diff ADDS (the `def` line itself is an
+         added line -- a changed body is not a new contract);
+      2. it lands in a module aiter/aot/flydsl/ already imports from, so AOT demonstrably
+         depends on that module's contract;
+      3. AOT does not already import the symbol -- if it does, the two sides agree;
+      4. the name appears nowhere in this diff's AOT hunks, so this PR did not teach AOT
+         about it.
+
+    Private helpers (leading underscore) are excluded: they are not a contract.
+    """
+    added = added_line_numbers(diff_text)
+    table = aot_symbol_table(root)
+    if not table:
+        return []
+    aot_modules = {mod for mod, _ in table}
+    aot_text = _aot_side_text(diff_text)
+    rows = []
+    for path in sorted(added):
+        if not path.endswith(".py") or not path.startswith("aiter/ops/flydsl"):
+            continue
+        module = path[:-3].replace("/", ".")
+        if module not in aot_modules:
+            continue
+        try:
+            tree = ast.parse((pathlib.Path(root) / path).read_text(errors="replace"))
+        except (OSError, SyntaxError, ValueError):
+            continue
+        users = sorted({u for (mod, _), uu in table.items() if mod == module for u in uu})
+        lines = added[path]
+        for node in tree.body:
+            names = []
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names = [node.name]
+            elif isinstance(node, ast.Assign):
+                names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+            for name in names:
+                if name.startswith("_") or (module, name) in table:
+                    continue
+                if node.lineno not in lines:
+                    continue
+                if re.search(r"(?<![\w])%s(?![\w])" % re.escape(name), aot_text):
+                    continue
+                rows.append((path, node.lineno, name, users))
+    return rows
+
+
+def render_aot_pairing(rows):
+    if not rows:
+        return ("AOT PAIRING: no new ops-side contract that aiter/aot/flydsl/ was left "
+                "unaware of")
+    out = ["NEW OPS-SIDE CONTRACT, AOT NOT TAUGHT -- %d symbol(s). D12 is the rule; this is "
+           "its evidence." % len(rows),
+           "aiter/aot/flydsl/ pre-compiles kernel variants by re-deriving the runtime's own",
+           "conditions, so it holds a second copy of them and the copy drifts. Each symbol",
+           "below is newly public in a module AOT already imports from, and its name does",
+           "not appear in this diff's AOT hunks. CANDIDATES: a helper the pre-compiler has",
+           "no reason to call is fine. Ask whether it decides WHICH variant gets built --",
+           "a tile resolver, an activation or bias condition, a dtype parse. #4397 added",
+           "resolve_flydsl_stage1_tile_n exactly this way and AOT compiled the wrong tile_n",
+           "until #4429."]
+    for path, line, name, users in rows:
+        out.append("  %s:%d  %s  -- module imported by %s" % (path, line, name, ", ".join(users)))
+    return "\n".join(out)
+
+
+def render_flydsl_bounds(rows):
+    if not rows:
+        return ("FLYDSL BOUNDS: no unbounded buffer resource or descriptor on an added line")
+    out = ["FLYDSL BUFFER BOUNDS -- %d candidate(s). B8 is the rule; this is its evidence."
+           % len(rows),
+           "CANDIDATES, NOT VERDICTS. max_size=True is right whenever the bound tensor is",
+           "full-size, and most are: weights and caches (sin_cache, cos_cache, rms_weight,",
+           "block_table, plan) have no ragged dimension. It is a defect only when the bound",
+           "dimension is a runtime extent -- M, token count, num_valid, a per-expert count.",
+           "B8's FP self-check decides which; name the value that overflows before firing."]
+    for path, line, call, arg, why in rows:
+        out.append("  %s:%d  %s(%s)  -- %s" % (path, line, call, arg, why))
     return "\n".join(out)
 
 
@@ -800,7 +1060,7 @@ def derive(files, title="", raw_diff=""):
     if re.search(r"cuda\.Stream|stream=|wait_stream", add):
         hit("async-stream", "G1 G1b")
     if any("flydsl" in p.lower() for p in paths):
-        hit("flydsl", "D10 D10b")
+        hit("flydsl", "D10 D10b D12")
     # KERNEL_PY lists the triton and gluon paths and stops there, so a FlyDSL kernel was a
     # kernel to `flydsl` (D10, D10b -- compile-result handling) and to nothing else: 95 of
     # 600 open PRs edit aiter/ops/flydsl/kernels/*.py and derive neither kernel family, so
@@ -809,7 +1069,7 @@ def derive(files, title="", raw_diff=""):
     # `tl.load`/`tl.store` without a mask, and there is no tl in FlyDSL.
     if any("aiter/ops/flydsl/kernels/" in p and p.endswith(".py") and (f["add"] or f["del"])
            for p, f in files.items()):
-        hit("flydsl-kernel", "A1 D1 D8 P6")
+        hit("flydsl-kernel", "A1 B8 D1 D8 D12 P6")
     if any(d in p for p in paths for d in DOWNSTREAM):
         hit("downstream-op", "E4 E5 A2")   # A2 is the same shared-path condition
     if any("codegen" in p or p.startswith("csrc/cpp_itfs/") or p.endswith("Makefile")
@@ -1990,7 +2250,67 @@ def _fold_punct(text):
     return re.sub(r"(?<=\d),(?=\d{3}\b)", "", text)
 
 
-def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_text):
+HASH_LEDGER = ".artifact_hashes"
+LATE_MARK = re.compile(r"--\s*late finding:", re.I)
+
+
+def record_artifact_hash(path):
+    """Append `<sha256>  <name>` when an artifact passes its own gate.
+
+    Append-only, and the card gate reads the FIRST line for a name rather than the last.
+    A most-recent-wins ledger would leave the back door open in a new shape: edit the
+    artifact, re-run its gate, walk through with a fresh hash.
+    """
+    import hashlib
+    f = pathlib.Path(path)
+    try:
+        digest = hashlib.sha256(f.read_bytes()).hexdigest()
+        with open(f.parent / HASH_LEDGER, "a") as fh:
+            fh.write("%s  %s\n" % (digest, f.name))
+    except OSError:
+        pass
+
+
+def backdated_artifacts(*paths):
+    """Artifacts whose bytes no longer match the hash recorded when they passed.
+
+    wave5 PR4862: the agent found a CI problem at Step 7 that no rule covered, the card
+    gate called it UNBACKED, and the only way through was for the finding to have been
+    known earlier -- so it edited answers.txt, which had already passed its own gate, and
+    wrote the finding in as a Step 7.5 blind spot. It called that "slightly dishonest
+    bookkeeping". The gate was rewarding fabrication.
+
+    No record is not an accusation. A hand-run card gate never went through the answers
+    gate, and treating a missing baseline as tampering would make the honest path the
+    noisy one.
+    """
+    import hashlib
+    out = []
+    for path in paths:
+        f = pathlib.Path(path) if path else None
+        if f is None or not f.is_file():
+            continue
+        ledger = f.parent / HASH_LEDGER
+        if not ledger.is_file():
+            continue
+        first = None
+        try:
+            for line in ledger.read_text(errors="replace").splitlines():
+                parts = line.split(None, 1)
+                if len(parts) == 2 and parts[1].strip() == f.name:
+                    first = parts[0]
+                    break
+            if first is None:
+                continue
+            if hashlib.sha256(f.read_bytes()).hexdigest() != first:
+                out.append(f.name)
+        except OSError:
+            continue
+    return out
+
+
+def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_text,
+               late_text="", answers_path=None):
     """Every finding in the card must trace back to something already adjudicated.
 
     The three gates before this one check that the work happened. None of them checks
@@ -2081,9 +2401,24 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
         # finding carries one, else on a distinctive token from the text.
         rid = re.match(r"([A-Z]+\d+[a-z]?):", text)
         if rid:
+            # `-- late finding:` is the exit for what no rule covers, so it cannot excuse a
+            # finding that names a rule: claiming G1 the ledger adjudicated CLEAR is a
+            # contradiction of the ledger, not a discovery arriving late.
             if not re.search(rf"(?<![\w]){re.escape(rid.group(1))}\b\s+FIRE", backing):
                 problems.append(("UNBACKED-FINDING", text[:70],
                                  f"{rid.group(1)} is reported but was not adjudicated FIRE"))
+        elif LATE_MARK.search(text):
+            # The honest path for a Step 7 discovery no rule covers. Before this existed
+            # the only way past the gate was to edit an artifact that had already passed
+            # and make the finding have been known earlier (wave5 PR4862). The claim still
+            # has to be backed -- by an append-only record, not by a rewritten one.
+            anchors = [w for w in re.findall(r"[\w./-]{6,}", LATE_MARK.split(text)[0])
+                       if not w.isdigit()]
+            folded = _fold_punct(late_text or "")
+            if not folded.strip() or not any(_fold_punct(a) in folded for a in anchors):
+                problems.append(("UNBACKED-LATE", text[:70],
+                                 "claims `-- late finding:` with no matching entry in "
+                                 "late_findings.txt -- write the record, appending to it"))
         elif cited and not any(_fold_punct(c).rsplit("/", 1)[-1] in backing for c in cited):
             problems.append(("UNBACKED-FINDING", text[:70],
                              "appears in no verdict, diagnostic or blind-spot line"))
@@ -2091,6 +2426,12 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
             problems.append(("UNPROVEN-RED", text[:70],
                              "names no concrete shape, dtype, arch or value -- the red "
                              "threshold asks for the input that makes it fire"))
+    for name in backdated_artifacts(answers_path):
+        problems.append(("BACKDATED-ARTIFACT", name,
+                         "its bytes changed after it passed its own gate. A finding that "
+                         "arrived late is reported with `-- late finding:` and recorded in "
+                         "late_findings.txt; it is not written back into an artifact that "
+                         "had already gone green"))
     return findings, problems
 
 
@@ -2098,7 +2439,7 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
     if mode not in ("rules", "evidence", "symbols", "ledger", "expand", "answers",
-                        "mapping", "diagnostic", "testquality",
+                        "mapping", "diagnostic", "testquality", "flydslbounds", "aotpair",
                         "twins", "citest", "perfclaims",
                         "structabi", "commentonly", "card", "corefiles",
                         "kerneltest", "siblings", "guards", "refutations",
@@ -2106,6 +2447,8 @@ if __name__ == "__main__":
         print("usage: triage.py rules <diff> [title]\n"
               "       triage.py evidence <diff> <head-file>...\n"
               "       triage.py symbols <diff> <merge-target-root>\n"
+              "       triage.py flydslbounds <diff> <merge-target-root>\n"
+              "       triage.py aotpair <diff> <merge-target-root>\n"
               "       triage.py ledger <rules.txt> <verdicts.txt> [diff]\n"
               "       triage.py expand <rules.txt> <rules.md>\n"
               "       triage.py answers <answers.txt>\n"
@@ -2123,7 +2466,7 @@ if __name__ == "__main__":
               "       triage.py guards <diff>\n"
               "       triage.py refutations <refutations.txt> <diff> <card.md>\n"
               "       triage.py independent <independent.txt> <card.md>\n"
-              "       triage.py card <card.md> <verdicts> <diagnostic> <answers> <diff>", file=sys.stderr)
+              "       triage.py card <card.md> <verdicts> <diagnostic> <answers> <diff> [late_findings]", file=sys.stderr)
         raise SystemExit(2)
 
     if mode == "independent":
@@ -2159,6 +2502,14 @@ if __name__ == "__main__":
         sys.exit(0)
     if mode == "siblings":
         print(render_siblings(sibling_variants(open(sys.argv[2]).read(), tree_root(sys.argv[3]))))
+        sys.exit(0)
+    if mode == "aotpair":
+        print(render_aot_pairing(aot_pairing(open(sys.argv[2]).read(),
+                                             tree_root(sys.argv[3]))))
+        sys.exit(0)
+    if mode == "flydslbounds":
+        print(render_flydsl_bounds(flydsl_bounds(open(sys.argv[2]).read(),
+                                                 tree_root(sys.argv[3]))))
         sys.exit(0)
     if mode == "kerneltest":
         print(render_untested_kernel(untested_new_kernel(open(sys.argv[2]).read())))
@@ -2211,7 +2562,9 @@ if __name__ == "__main__":
                   f"-- not writing it was the cheapest way past this check",
                   file=sys.stderr)
             raise SystemExit(1)
-        findings, problems = audit_card(_read(2), _read(3), _read(4), _read(5), _read(6))
+        findings, problems = audit_card(_read(2), _read(3), _read(4), _read(5), _read(6),
+                                        _read(7),
+                                        sys.argv[5] if len(sys.argv) > 5 else None)
         if not findings and not problems:
             print("CARD: no findings, and no verdict fired")
             raise SystemExit(0)
@@ -2343,6 +2696,7 @@ if __name__ == "__main__":
         if missing or thin:
             print(f"ANSWERS INCOMPLETE: {6 - len(missing) - len(thin)}/6", file=sys.stderr)
             raise SystemExit(1)
+        record_artifact_hash(sys.argv[2])
         print("ANSWERS COMPLETE: 6/6")
         raise SystemExit(0)
 

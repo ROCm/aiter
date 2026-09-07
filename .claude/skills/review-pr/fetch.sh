@@ -864,6 +864,19 @@ fi
 "$SKILLS_ROOT/review-pr/triage.py" siblings "$WORK/pr.diff" "$PROJECT_ROOT" \
   | tee "$WORK/siblings.txt"
 
+# FlyDSL buffer/descriptor bounds not tied to the tensor's real extent. B8. Nothing covered
+# this class: B2 is `tl.load` without a mask and FlyDSL has no tl, so memory-safety handed a
+# FlyDSL PR three rules none of which could fire. FlyDSL needs patching after merge 1.66x as
+# often as the repo average (20/98 fix-commits vs 12.3% share, p=0.015); 4 of 21 are this.
+"$SKILLS_ROOT/review-pr/triage.py" flydslbounds "$WORK/pr.diff" "$PROJECT_ROOT" \
+  | tee "$WORK/flydsl_bounds.txt"
+
+# New ops-side contracts aiter/aot/flydsl/ was not taught. D12. AOT re-derives the runtime's
+# variant conditions into a second copy that drifts -- 5 of the 21 precise fixes. Paired by
+# symbol from AOT's imports: a name stem cannot relate parse_csv to resolve_stage1_tile_n.
+"$SKILLS_ROOT/review-pr/triage.py" aotpair "$WORK/pr.diff" "$PROJECT_ROOT" \
+  | tee "$WORK/aot_pairing.txt"
+
 # What became of each guard the diff deletes. D4 is red and fires on 69 of 600 open PRs;
 # 14.5% of those add every deleted guard straight back and are not an event at all. The
 # pair is printed rather than filtered on, because the guard that returns in changed form
@@ -927,5 +940,6 @@ echo "WORK=$WORK"
 echo "artifacts: pr.diff pr_meta.json base_head.txt rules.txt rules_expanded.txt \
 test_quality.txt twins.txt ci_coverage.txt perf_claims.txt struct_abi.txt comment_only.txt \
 guards.txt siblings.txt kernel_tests.txt applies.txt symbols.txt merge_target.txt \
+flydsl_bounds.txt aot_pairing.txt \
 validation_requirement.json \
 auto_validation_outcome.txt${HAVE_EVIDENCE:+ evidence.txt}"
