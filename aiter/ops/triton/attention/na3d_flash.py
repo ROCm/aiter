@@ -19,7 +19,7 @@ from __future__ import annotations
 import torch
 import triton
 
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.triton._triton_kernels.attention.na3d_flash import _na3d_flash_fwd
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
