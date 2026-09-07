@@ -310,7 +310,7 @@ def test_na3d_flash(B, T, H, W, NH, HD, KT, KH, KW, dtype):
             atol=5e-2,
             msg=f"na3d_flash (T={T},H={H},W={W},k=({KT},{KH},{KW}))",
         )
-        <= 0.05
+        <= 0.01
     )
 
 
