@@ -1935,17 +1935,16 @@ __global__ void fused_mx_quant_moe_sort_kernel(
         AITER_CHECK(false, "input last dim has exceeded the maximum value ", 32 * BlockSize);  \
     }
 
-void fused_dynamic_mx_quant_moe_sort_hip(
-    aiter_tensor_t& output,
-    aiter_tensor_t& scale,
-    const aiter_tensor_t& input,
-    const aiter_tensor_t& sorted_ids,
-    const aiter_tensor_t& num_valid_ids,
-    int token_num,
-    int block_m,
-    int group_size,
-    std::optional<aiter_tensor_t> sorted_weights
-)
+static void fused_dynamic_mx_quant_moe_sort_hip_impl(aiter_tensor_t& output,
+                                                     aiter_tensor_t& scale,
+                                                     const aiter_tensor_t& input,
+                                                     const aiter_tensor_t& sorted_ids,
+                                                     const aiter_tensor_t& num_valid_ids,
+                                                     int token_num,
+                                                     int block_m,
+                                                     int group_size,
+                                                     std::optional<aiter_tensor_t> sorted_weights,
+                                                     int64_t padded_rows_upper_bound)
 {
     int cols = input.size(-1);
     int topk = input.numel() / (cols * token_num);
@@ -1966,7 +1965,24 @@ void fused_dynamic_mx_quant_moe_sort_hip(
     int sub_block_m = (token_num * topk) > (num_cu * 8) || num_experts < 64 ? 2 : 4;
     AITER_CHECK(block_m % sub_block_m == 0, __func__, " block_m is not divisible by sub_block_m");
     int tgs_per_block_m = block_m / sub_block_m;
-    int num_blocks = (sorted_ids.size(0) + sub_block_m - 1) / sub_block_m;
+    const int64_t old_extent = sorted_ids.size(0);
+    int64_t effective_extent = old_extent;
+    if(padded_rows_upper_bound >= 0)
+    {
+        // An over-conservative host-side expert bound must never enlarge the
+        // old launch. This also preserves the legacy extent if the calculated
+        // upper bound is greater than the sorted_ids allocation.
+        effective_extent =
+            padded_rows_upper_bound < old_extent ? padded_rows_upper_bound : old_extent;
+    }
+    int num_blocks = (effective_extent + sub_block_m - 1) / sub_block_m;
+    if(num_blocks == 0 && old_extent > 0)
+    {
+        // HIP does not accept a zero-sized grid. One workgroup is enough to
+        // read num_valid_ids==0 and return; it is no larger than the legacy
+        // launch, which also contains at least one workgroup.
+        num_blocks = 1;
+    }
     const bool persistent_mode = false;
     const int input_stride     = input.stride(-2);
 
@@ -1987,6 +2003,57 @@ void fused_dynamic_mx_quant_moe_sort_hip(
     {
         AITER_CHECK(false, __func__, ": not support output type: ", AiterDtype_to_str(output.dtype()));
     }
+}
+
+void fused_dynamic_mx_quant_moe_sort_hip(aiter_tensor_t& output,
+                                         aiter_tensor_t& scale,
+                                         const aiter_tensor_t& input,
+                                         const aiter_tensor_t& sorted_ids,
+                                         const aiter_tensor_t& num_valid_ids,
+                                         int token_num,
+                                         int block_m,
+                                         int group_size,
+                                         std::optional<aiter_tensor_t> sorted_weights)
+{
+    fused_dynamic_mx_quant_moe_sort_hip_impl(output,
+                                             scale,
+                                             input,
+                                             sorted_ids,
+                                             num_valid_ids,
+                                             token_num,
+                                             block_m,
+                                             group_size,
+                                             sorted_weights,
+                                             -1);
+}
+
+void fused_dynamic_mx_quant_moe_sort_hip_bounded(aiter_tensor_t& output,
+                                                 aiter_tensor_t& scale,
+                                                 const aiter_tensor_t& input,
+                                                 const aiter_tensor_t& sorted_ids,
+                                                 const aiter_tensor_t& num_valid_ids,
+                                                 int token_num,
+                                                 int block_m,
+                                                 int64_t total_routes,
+                                                 int64_t num_experts_upper_bound,
+                                                 int group_size,
+                                                 std::optional<aiter_tensor_t> sorted_weights)
+{
+    AITER_CHECK(total_routes >= 0, __func__, " total_routes must be non-negative");
+    AITER_CHECK(
+        num_experts_upper_bound >= 0, __func__, " num_experts_upper_bound must be non-negative");
+    const int64_t padded_rows_upper_bound =
+        moe_quant_padded_rows_upper_bound(total_routes, num_experts_upper_bound, block_m);
+    fused_dynamic_mx_quant_moe_sort_hip_impl(output,
+                                             scale,
+                                             input,
+                                             sorted_ids,
+                                             num_valid_ids,
+                                             token_num,
+                                             block_m,
+                                             group_size,
+                                             sorted_weights,
+                                             padded_rows_upper_bound);
 }
 
 // Perf gate threshold for the coalesced LDS-staged store path in
