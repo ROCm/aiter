@@ -531,7 +531,10 @@ def _grouped_a8w4_tdm_moe(
             num_valid_routes=_ep_nvr,
         )
     else:
-        _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(topk_ids, E, max_m)
+        _route_counter = torch.zeros(E, dtype=torch.int32, device=device)
+        _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(
+            topk_ids, E, max_m, counter=_route_counter
+        )
     # EP gemm2-fused scatter: build the ep_rowmap inside the remap pass, which
     # already knows each route's final contiguous row, so the gemm2 TDM epilogue
     # can P2P each weighted row into peers' comb_inp.
@@ -1020,17 +1023,19 @@ def grouped_gemm_gfx1250_a8w4(
     ):
         _grouped_dbg("unsupported activation")
         return None
-    # mxfp4 weights arrive as fp4x2 or as the uint8 view of the same bytes --
-    # ATOM's loader keeps them uint8, and MegaMoE accepts both. Requiring the
-    # packed dtype on the a4w4 arm alone silently routed a4w4-with-uint8-weights
-    # to the 2-stage fallback.
-    w_is_mxfp4 = q_dtype_w == dtypes.fp4x2 or w1.dtype == torch.uint8
-    is_grouped_a4w4 = q_dtype_a == dtypes.fp4x2 and w_is_mxfp4
-    is_grouped_a8w4 = q_dtype_a == dtypes.fp8 and w_is_mxfp4
+    is_grouped_a4w4 = q_dtype_a == dtypes.fp4x2 and q_dtype_w == dtypes.fp4x2
+    is_grouped_a8w4 = q_dtype_a == dtypes.fp8 and (
+        q_dtype_w == dtypes.fp4x2 or w1.dtype == torch.uint8
+    )
     if not (is_grouped_a4w4 or is_grouped_a8w4):
         return None
     data_format = "fp4" if is_grouped_a4w4 else "a8w4"
-    q_dtype_w_key = dtypes.fp4x2 if w_is_mxfp4 else q_dtype_w
+    # Normalize uint8-viewed fp4 weights back to fp4x2 for CSV key matching.
+    q_dtype_w_key = (
+        dtypes.fp4x2
+        if (q_dtype_w == dtypes.fp4x2 or w1.dtype == torch.uint8)
+        else q_dtype_w
+    )
     _grouped_dbg(f"eligible data_format={data_format}")
     if w1_scale is None or w2_scale is None:
         return None

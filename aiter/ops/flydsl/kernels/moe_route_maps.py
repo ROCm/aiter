@@ -157,16 +157,16 @@ def build_moe_topids_to_rows_module():
         max_m: Int32,
     ):
         i32 = T.i32
-        # Raw i32 constant: llvm.atomicrmw takes ir.Value operands, not fx types.
         c1_i32 = arith.constant(1, type=i32)
+        topk_p = ptr_buf_tensor(topk_ids)
+        out_p = ptr_buf_tensor(topids_to_rows)
+        cnt_base = fx.Int64(ptrtoint(atomic_buffer))
+        max_m_u32 = fx.Uint32(max_m)
         route = fx.Uint32(fx.block_idx.x) * BLOCK_THREADS + fx.Uint32(fx.thread_idx.x)
         in_range = route < fx.Uint32(numel)
         if in_range:
-            topk_p = ptr_buf_tensor(topk_ids)
-            out_p = ptr_buf_tensor(topids_to_rows)
-
             e = topk_p[route]
-            ptr = _slot_ptr(fx.Int64(ptrtoint(atomic_buffer)), e)
+            ptr = _slot_ptr(cnt_base, e)
             slot = llvm.AtomicRMWOp(
                 llvm.AtomicBinOp.add,
                 ptr,
@@ -175,8 +175,7 @@ def build_moe_topids_to_rows_module():
                 syncscope="agent",
                 alignment=4,
             ).result
-            row = fx.Uint32(slot) + fx.Uint32(e) * fx.Uint32(max_m)
-            out_p[route] = row
+            out_p[route] = fx.Uint32(slot) + fx.Uint32(e) * max_m_u32
 
     @flyc.jit
     def launch_topids_to_rows(
@@ -202,6 +201,119 @@ def build_moe_topids_to_rows_module():
         },
     }
     return launch_topids_to_rows
+
+
+def build_moe_topids_to_rows_lds_module():
+    """Plain route with per-block LDS atomics then one global atomic per bucket.
+
+    Compared to ``moe_route`` (one device-scope atomic per route), this collapses
+    each block's contribution to a bucket into a single global ``atomicAdd`` and
+    is much faster when a few experts are hot (EP drops / skewed gates). For
+    uniform routing across many experts the extra LDS init + barriers usually
+    lose to the plain kernel, so the dispatcher keeps this opt-in.
+    """
+
+    @flyc.kernel(
+        name="moe_route_lds",
+        known_block_size=[BLOCK_THREADS, 1, 1],
+    )
+    def route_kernel(
+        topk_ids: fx.Pointer,
+        atomic_buffer: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        numel: Int32,
+        max_m: Int32,
+        n_experts: Int32,
+    ):
+        i32 = T.i32
+        c1 = arith.constant(1, type=i32)
+        tid = fx.Uint32(fx.thread_idx.x)
+        route = fx.Uint32(fx.block_idx.x) * BLOCK_THREADS + tid
+
+        lds_cnt = fx.SharedAllocator().allocate(_RouteCntStorage).peek().cnt.ptr
+        cnt_base_i64 = fx.Int64(fx.ptrtoint(lds_cnt))
+
+        tk_p = ptr_buf_tensor(topk_ids)
+        out_p = ptr_buf_tensor(topids_to_rows)
+
+        n_exp_u32 = fx.Uint32(n_experts)
+        for b in range(tid, n_exp_u32, BLOCK_THREADS):
+            lds_cnt[fx.Uint32(b)] = fx.Int32(0)
+        gpu.barrier()
+
+        in_range = route < fx.Uint32(numel)
+        e = fx.Uint32(0)
+        if in_range:
+            e = fx.Uint32(tk_p[route])
+
+        my_rank = fx.Uint32(0)
+        if in_range:
+            my_rank = fx.Uint32(
+                llvm.AtomicRMWOp(
+                    llvm.AtomicBinOp.add,
+                    _slot_ptr(cnt_base_i64, e, address_space=3),
+                    c1,
+                    llvm.AtomicOrdering.monotonic,
+                    syncscope="workgroup",
+                    alignment=4,
+                ).result
+            )
+
+        gpu.barrier()
+
+        for b in range(tid, n_exp_u32, BLOCK_THREADS):
+            cnt = lds_cnt[fx.Uint32(b)]
+            nz = cnt != 0
+            base_v = fx.Int32(0)
+            if nz:
+                base_v = fx.Int32(
+                    llvm.AtomicRMWOp(
+                        llvm.AtomicBinOp.add,
+                        _slot_ptr(fx.Int64(ptrtoint(atomic_buffer)), b),
+                        cnt.ir_value(),
+                        llvm.AtomicOrdering.monotonic,
+                        syncscope="agent",
+                        alignment=4,
+                    ).result
+                )
+            lds_cnt[fx.Uint32(b)] = base_v
+        gpu.barrier()
+
+        if in_range:
+            base = fx.Uint32(lds_cnt[e])
+            out_p[route] = base + my_rank + e * fx.Uint32(max_m)
+
+    @flyc.jit
+    def launch_topids_to_rows_lds(
+        topk_ids: fx.Pointer,
+        atomic_buffer: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        numel: fx.Int32,
+        max_m: fx.Int32,
+        n_experts: fx.Int32,
+        grid_blocks: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        route_kernel(
+            topk_ids,
+            atomic_buffer,
+            topids_to_rows,
+            numel,
+            max_m,
+            n_experts,
+        ).launch(
+            grid=(fx.Int64(grid_blocks), 1, 1),
+            block=(BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    launch_topids_to_rows_lds.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+        },
+    }
+    return launch_topids_to_rows_lds
 
 
 def build_moe_topids_to_rows_g2l_module(weight_dtype="bf16"):

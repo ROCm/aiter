@@ -286,9 +286,6 @@ def build_moe_contiguous_psum_remap_module():
                 carry[0] = base_off + chunk_total
             gpu.barrier()
 
-        scan_out = src
-        starts_lds = dst
-
         if is_lane0 and is_blk0:
             total = carry[0]
             gt = total > fx.Int32(tile_v)
@@ -296,16 +293,17 @@ def build_moe_contiguous_psum_remap_module():
 
         gpu.barrier()
 
-        # Multi-block remap (E <= MAX_EXPERTS_PER_BLOCK): fill exclusive
-        # starts into the spare ping-pong buffer (scan_out stays cumulative).
+        # Multi-block remap (E < MAX_EXPERTS_PER_BLOCK): fill exclusive starts
+        # into lds0. The Hillis-Steele scan above is 9 power-of-2 swaps, so the
+        # inclusive tile-aligned totals land in lds1 and lds0 is spare.
         experts_u32 = fx.Uint32(experts)
         use_parallel_remap = experts_u32 < fx.Uint32(MAX_EXPERTS_PER_BLOCK)
         if use_parallel_remap and tid < experts_u32:
             is_not_first = tid != 0
             start = fx.Int32(0)
             if is_not_first:
-                start = scan_out[tid - 1]
-            starts_lds[tid] = start
+                start = lds1[tid - 1]
+            lds0[tid] = start
         gpu.barrier()
 
         num_valid_routes_is_set = fx.Int64(ptrtoint(num_valid_routes)) != 0
@@ -326,7 +324,7 @@ def build_moe_contiguous_psum_remap_module():
                     m = fx.Uint32(route_max_m)
                     expert = row // m
                     slot = row - expert * m
-                    start = fx.Uint32(starts_lds[expert])
+                    start = fx.Uint32(lds0[expert])
                     rows_p[route_i32] = start + slot
         elif is_blk0:
             for route_i32 in range(tid, valid_route_count, MAX_EXPERTS_PER_BLOCK):
