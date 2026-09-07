@@ -91,7 +91,10 @@ def na3d_flash_attn(
         f"na3d_flash_attn: KW={KW} > 17 requires W >= 32 "
         f"(only the BLOCK_Q=32/BLOCK_KV=64 config covers KW > 17); got W={W}."
     )
-    assert HD & (HD - 1) == 0, f"head_dim {HD} must be a power of 2"
+    assert HD >= 16 and HD & (HD - 1) == 0, (
+        f"head_dim {HD} must be a power of 2 and >= 16 "
+        f"(tl.dot requires matrix dimensions of at least 16)."
+    )
     assert W >= 16, f"W={W} is too small; kernel requires W >= BLOCK_Q (default 16)."
 
     # Ensure contiguous layout
