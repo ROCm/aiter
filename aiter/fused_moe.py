@@ -822,6 +822,7 @@ def _fused_moe_impl(
     _metadata_config_file: str | None = None,
     _stage1_extra_args: dict | None = None,
     _stage2_extra_args: dict | None = None,
+    _stage2_override: Callable | None = None,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -1099,6 +1100,8 @@ def _fused_moe_impl(
     _opus_a8w4.check_route_bucket_metadata(metadata, sorted_expert_ids, logger)
 
     if metadata.run_1stage:
+        if _stage2_override is not None:
+            raise RuntimeError("_stage2_override requires a two-stage MoE config")
         _stage1_call = functools.partial(
             metadata.stage1,
             hidden_states,
@@ -1168,6 +1171,7 @@ def _fused_moe_impl(
             _metadata_config_file=_metadata_config_file,
             _stage1_extra_args=_stage1_extra_args,
             _stage2_extra_args=_stage2_extra_args,
+            _stage2_override=_stage2_override,
             output=output,
         )
         return _return_output(ret, output)
@@ -3142,6 +3146,7 @@ def fused_moe_2stages(
     _metadata_config_file: str | None = None,
     _stage1_extra_args: dict | None = None,
     _stage2_extra_args: dict | None = None,
+    _stage2_override: Callable | None = None,
     output=None,
 ):
     quant_func = get_quant(quant_type)
@@ -3480,8 +3485,7 @@ def fused_moe_2stages(
         a2 = a2.view(token_num, topk, inter_dim)
 
     stage2_sorted_weights = sorted_weights if not doweight_stage1 else None
-    _stage2_call = functools.partial(
-        metadata.stage2,
+    stage2_args = (
         a2,
         w1,
         w2,
@@ -3490,6 +3494,8 @@ def fused_moe_2stages(
         num_valid_ids,
         moe_out,
         topk,
+    )
+    stage2_kwargs = dict(
         w2_scale=(
             # See stage1 w1_scale note: only reinterpret packed (e8m0) scales;
             # per_Token fp8 uses an fp32 scale and must be passed through as-is
@@ -3505,11 +3511,23 @@ def fused_moe_2stages(
         sorted_weights=stage2_sorted_weights,
         **extra_stage2_args,
     )
+    if _stage2_override is None:
+        _stage2_call = functools.partial(
+            metadata.stage2,
+            *stage2_args,
+            **stage2_kwargs,
+        )
+    else:
+        _stage2_call = functools.partial(
+            _stage2_override,
+            ordinary_stage2=metadata.stage2,
+            stage2_args=stage2_args,
+            stage2_kwargs=stage2_kwargs,
+        )
     if kernel_bench_callable is not None:
         kernel_bench_callable.append(("stage2", _stage2_call))
-    _stage2_call()
-
-    return moe_out
+    stage2_output = _stage2_call()
+    return moe_out if _stage2_override is None else stage2_output
 
 
 def torch_moe_act(act_input, torch_act, inter_dim):

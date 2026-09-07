@@ -131,6 +131,91 @@ def make_weights(local_experts, model_dim, inter_dim, rank, device):
     return w1_q, w1_scale, w2_q, w2_scale
 
 
+def make_weights_tp(experts, model_dim, inter_dim, world, rank, device):
+    """TP-sharded weights: every rank holds ALL experts, sharded along inter_dim.
+
+    Rebuilds each EP owner rank's full-precision weights from the same seeds
+    `make_weights` uses (9000 + owner), then takes this rank's inter_dim shard,
+    so the result is numerically comparable to the EP (mori_body) weights for
+    accuracy checks. The raw (pre-shuffle) w1 is always block-concatenated
+    GGUU — rows [0, inter_dim) = gate, [inter_dim, 2*inter_dim) = up, regardless
+    of GateMode — so the inter_dim shard [lo, hi) must be taken from BOTH
+    halves separately and re-concatenated; GateMode.INTERLEAVE's row-pairwise
+    layout is produced later, inside shuffle_weight_a16w4 itself.
+    """
+    local_experts_ep = experts // world
+    inter_shard = inter_dim // world
+    lo, hi = rank * inter_shard, (rank + 1) * inter_shard
+    quantize = aiter.get_torch_quant(aiter.QuantType.per_1x32)
+
+    w1_shards = []
+    w2_shards = []
+    for owner in range(world):
+        generator = torch.Generator(device=device).manual_seed(9000 + owner)
+        w1_full = torch.randn(
+            (local_experts_ep, 2 * inter_dim, model_dim),
+            dtype=torch.bfloat16,
+            device=device,
+            generator=generator,
+        )
+        w1_full.mul_(model_dim**-0.25)
+        w2_full = torch.randn(
+            (local_experts_ep, model_dim, inter_dim),
+            dtype=torch.bfloat16,
+            device=device,
+            generator=generator,
+        )
+        w2_full.mul_(inter_dim**-0.25)
+        w1_shards.append(
+            torch.cat(
+                (
+                    w1_full[:, lo:hi, :],
+                    w1_full[:, inter_dim + lo : inter_dim + hi, :],
+                ),
+                dim=1,
+            ).clone()
+        )
+        w2_shards.append(w2_full[:, :, lo:hi].clone())
+        del w1_full, w2_full
+    w1_shard = torch.cat(w1_shards, dim=0).contiguous()
+    w2_shard = torch.cat(w2_shards, dim=0).contiguous()
+    del w1_shards, w2_shards
+
+    w1_q, w1_scale = quantize(w1_shard, quant_dtype=dtypes.fp4x2)
+    del w1_shard
+    w1_q = w1_q.view(experts, 2 * inter_shard, model_dim // 2)
+    w1_q = shuffle_weight_a16w4(w1_q, 16, True).contiguous()
+    w1_scale = shuffle_scale_a16w4(w1_scale, experts, True).contiguous()
+
+    w2_q, w2_scale = quantize(w2_shard, quant_dtype=dtypes.fp4x2)
+    del w2_shard
+    w2_q = w2_q.view(experts, model_dim, inter_shard // 2)
+    w2_q = shuffle_weight_a16w4(w2_q, 16, False).contiguous()
+    w2_scale = shuffle_scale_a16w4(w2_scale, experts, False).contiguous()
+    torch.cuda.empty_cache()
+    return w1_q, w1_scale, w2_q, w2_scale
+
+
+class TpGroupShim:
+    """Minimal ``tp_group`` for ``comm_fused_moe_host``.
+
+    The comm-fused host runtime only needs the rank/world/device triple plus an
+    object broadcast to hand out the MORI communicator id, so the bench uses the
+    default process group directly instead of standing up
+    ``aiter.dist.parallel_state``.
+    """
+
+    def __init__(self, rank, world, device):
+        self.rank_in_group = rank
+        self.world_size = world
+        self.device = device
+
+    def broadcast_object(self, obj=None, src=0):
+        payload = [obj]
+        dist.broadcast_object_list(payload, src=src)
+        return payload[0]
+
+
 def capture(body):
     barrier()
     body()
@@ -215,6 +300,15 @@ def main():
     parser.add_argument("--profile-dir", default="")
     parser.add_argument("--mega-only", action="store_true")
     parser.add_argument("--perf-guard", action="store_true")
+    parser.add_argument(
+        "--tp",
+        action="store_true",
+        help=(
+            "Also run a dp-input/tp-weight variant (all-gather + fused_moe with "
+            "inter_dim-sharded, all-experts-resident weights + all-reduce) and "
+            "check its accuracy against the mori (dp+ep) output, sliced per rank."
+        ),
+    )
     args = parser.parse_args()
 
     rank, world, device = setup_dist()
@@ -431,6 +525,132 @@ def main():
         ).norm() / reference.float().norm()
         dist.all_reduce(rel_l2, op=dist.ReduceOp.MAX)
 
+    tp_rel_l2 = None
+    tp_ms = (float("nan"), float("nan"))
+    tp_comm_fused = os.environ.get("AITER_TP_COMM_FUSED", "0") == "1"
+    if args.tp:
+        if rank_tokens:
+            raise ValueError(
+                "--tp requires equal per-rank tokens (no --rank-tokens) in this "
+                "first version"
+            )
+        if mori_graph is None:
+            raise ValueError("--tp accuracy check requires Mori (no --mega-only)")
+        w1_tp, w1_scale_tp, w2_tp, w2_scale_tp = make_weights_tp(
+            args.experts, args.model_dim, args.inter_dim, world, rank, device
+        )
+        world_tokens = world * tokens
+        x_g = torch.empty(
+            (world_tokens, args.model_dim), dtype=torch.bfloat16, device=device
+        )
+        route_weights_g = torch.empty(
+            (world_tokens, args.topk), dtype=torch.float32, device=device
+        )
+        ids_g = torch.empty((world_tokens, args.topk), dtype=torch.int32, device=device)
+        tp_local_out = torch.empty(
+            (tokens, args.model_dim), dtype=torch.bfloat16, device=device
+        )
+
+        # AITER_TP_COMM_FUSED=1 replaces the `fused_moe` + NCCL reduce_scatter
+        # pair with the comm-fused Stage2: the ordinary Stage2 GEMM still runs,
+        # but its BF16 result is MXFP8-quantized and reduce-scattered by FlyDSL
+        # kernels over MORI symmetric memory. Only the ReduceScatter half runs -
+        # DP consumes just this rank's shard, so the AllGather is skipped.
+        fused_runner = None
+        if tp_comm_fused:
+            from aiter.fused_moe import _fused_moe_impl, get_padded_M
+            from aiter.ops.flydsl.comm_fused_moe_host import (
+                create_flydsl_comm_fused_runners,
+            )
+
+            bucket = int(get_padded_M(world_tokens))
+            if bucket != world_tokens:
+                raise ValueError(
+                    f"AITER_TP_COMM_FUSED needs an exact padded-M bucket, but "
+                    f"world_tokens={world_tokens} pads to {bucket}"
+                )
+            runners = create_flydsl_comm_fused_runners(
+                tp_group=TpGroupShim(rank, world, device),
+                model_dim=args.model_dim,
+                inter_dim=args.inter_dim // world,
+                experts=args.experts,
+                topk=args.topk,
+            )
+            if bucket not in runners:
+                raise ValueError(f"no comm-fused config for M={bucket}")
+            # Instantiate here: the symmetric-memory allocation and MORI window
+            # registration must happen outside CUDA Graph capture.
+            fused_runner = runners[bucket]
+            print(f"[STEP] rank={rank} tp-comm-fused-runner m={bucket}", flush=True)
+
+        def tp_stage2_override(*, ordinary_stage2, stage2_args, stage2_kwargs):
+            # stage2_args[6] is the framework's moe_out, already zeroed by
+            # moe_sorting for the accumulating Stage2. There is no shared expert
+            # here, so it doubles as the runner's `shared_partial` and no extra
+            # buffer or per-replay zeroing is needed.
+            return fused_runner(
+                stage2_args=stage2_args,
+                stage2_kwargs=stage2_kwargs,
+                shared_partial=stage2_args[6],
+                ordinary_stage2=ordinary_stage2,
+                all_gather=False,
+            )
+
+        def tp_body():
+            dist.all_gather_into_tensor(x_g, x.contiguous())
+            dist.all_gather_into_tensor(route_weights_g, route_weights.contiguous())
+            dist.all_gather_into_tensor(ids_g, ids.contiguous())
+            if fused_runner is not None:
+                holders["tp"] = _fused_moe_impl(
+                    x_g,
+                    w1_tp,
+                    w2_tp,
+                    route_weights_g,
+                    ids_g,
+                    quant_type=aiter.QuantType.per_1x32.value,
+                    w1_scale=w1_scale_tp,
+                    w2_scale=w2_scale_tp,
+                    a1_scale=None,
+                    dtype=torch.bfloat16,
+                    swiglu_limit=SWIGLU_LIMIT,
+                    gate_mode=GateMode.INTERLEAVE.value,
+                    _stage2_override=tp_stage2_override,
+                )
+                return
+            tp_out = fused_moe(
+                x_g,
+                w1_tp,
+                w2_tp,
+                route_weights_g,
+                ids_g,
+                quant_type=aiter.QuantType.per_1x32,
+                w1_scale=w1_scale_tp,
+                w2_scale=w2_scale_tp,
+                a1_scale=None,
+                dtype=torch.bfloat16,
+                swiglu_limit=SWIGLU_LIMIT,
+                gate_mode=GateMode.INTERLEAVE.value,
+            )
+            # Only this rank's [rank*tokens:(rank+1)*tokens) slice of the fully-reduced
+            # output is ever used, so replace all_reduce (= reduce_scatter + all_gather)
+            # with just reduce_scatter to skip the unneeded all_gather half.
+            dist.reduce_scatter_tensor(tp_local_out, tp_out, op=dist.ReduceOp.SUM)
+            holders["tp"] = tp_local_out
+
+        tp_graph = capture(tp_body)
+        print(f"[STEP] rank={rank} tp-capture-done", flush=True)
+        tp_ms = time_graph(tp_graph, args.iters, device)
+
+        tp_local = holders["tp"]
+        barrier()
+        mori_graph.replay()
+        torch.cuda.synchronize()
+        mori_ref = holders["mori"][:tokens]
+        tp_rel_l2 = (
+            tp_local.float() - mori_ref.float()
+        ).norm() / mori_ref.float().norm()
+        dist.all_reduce(tp_rel_l2, op=dist.ReduceOp.MAX)
+
     if args.profile_dir:
         if mori_graph is not None:
             profile_graph(mori_graph, f"mori_{args.route}", rank, args.profile_dir)
@@ -466,6 +686,8 @@ def main():
             print(
                 f"[ACCURACY] variant_vs_default_rel_l2={rel_l2.item():.6e}", flush=True
             )
+        if tp_rel_l2 is not None:
+            print(f"[ACCURACY] tp_vs_mori_rel_l2={tp_rel_l2.item():.6e}", flush=True)
         print(
             f"[RESULT] route={args.route} hot_bias={args.hot_bias} tokens={tokens} "
             f"rank_tokens={rank_tokens or 'same'} mtpr={args.mtpr} "
@@ -473,7 +695,9 @@ def main():
             f"mori_e2e={mori_ms[0]:.4f}/{mori_ms[1]:.4f}ms "
             f"mega_e2e={mega_ms[0]:.4f}/{mega_ms[1]:.4f}ms speedup={speedup:.2f}% "
             f"stage1={stage1_ms[0]:.4f}/{stage1_ms[1]:.4f}ms "
-            f"stage2_combine={stage2_ms[0]:.4f}/{stage2_ms[1]:.4f}ms rank-mean/max",
+            f"stage2_combine={stage2_ms[0]:.4f}/{stage2_ms[1]:.4f}ms "
+            f"tp_e2e={tp_ms[0]:.4f}/{tp_ms[1]:.4f}ms "
+            f"tp_path={'comm_fused_rs' if tp_comm_fused else 'nccl_rs'} rank-mean/max",
             flush=True,
         )
         if guard_floor is not None:
