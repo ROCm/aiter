@@ -63,7 +63,7 @@ def _job_key(job: dict) -> tuple:
             job.get("g2_bf16_lds"),
         )
     if job["stage"] == 1:
-        return (
+        key = (
             1,
             job["BM"],
             job["use_nt"],
@@ -74,6 +74,8 @@ def _job_key(job: dict) -> tuple:
             job["topk"],
             job["xcd_swizzle"],
         )
+        activation = job.get("activation", "silu")
+        return key if activation == "silu" else key + (activation,)
     return (
         2,
         job["BM"],
@@ -109,6 +111,10 @@ def parse_csv(csv_path: str):
 
     with open(csv_path, newline="") as f:
         for row in csv.DictReader(f):
+            kn1 = (row.get("kernelName1") or "").strip()
+            kn2 = (row.get("kernelName2") or "").strip()
+            activation = str(row.get("act_type", "")).split(".")[-1].strip().lower()
+            activation = "situv2" if activation == "situv2" else "silu"
             topk = int(row["topk"])
             # Shape comes from CSV columns; layout-v2 uses the exact K.
             model_dim = int(row["model_dim"])
@@ -116,19 +122,18 @@ def parse_csv(csv_path: str):
             inter_dim = int(row["inter_dim"])
             d_inter = ((inter_dim + 255) // 256) * 256
             d_inter_real = inter_dim if inter_dim != d_inter else None
-            kn2 = (row.get("kernelName2") or "").strip()
             v2_g2 = parse_flydsl_v2_gemm2_kernel(kn2)
             if v2_g2 is not None:
                 v2_d_inter = inter_dim
             else:
                 v2_d_inter = d_inter
 
-            kn1 = (row.get("kernelName1") or "").strip()
             if _is_mxfp4_kname(kn1):
                 p1 = _parse_mxfp4_g1_kname(kn1)
                 _add(
                     {
                         "stage": 1,
+                        "activation": activation,
                         "kernel_name": kn1,
                         "BM": p1["BM"],
                         "use_nt": p1["use_nt"],
@@ -224,6 +229,10 @@ def _dummy(nbytes=256):
 
 
 def _compile_stage1(job):
+    from aiter.ops.flydsl.moe_common import (
+        DEFAULT_SITUV2_BETA,
+        DEFAULT_SITUV2_LINEAR_BETA,
+    )
     from aiter.ops.flydsl.mxfp4_gemm1_kernels import flydsl_mxfp4_gemm1
 
     d = _dummy()
@@ -247,6 +256,9 @@ def _compile_stage1(job):
         D_INTER=job["D_INTER"],
         topk=job["topk"],
         xcd_swizzle=job["xcd_swizzle"],
+        act=job.get("activation", "silu"),
+        situ_beta=DEFAULT_SITUV2_BETA,
+        situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
         stream=0,
     )
 

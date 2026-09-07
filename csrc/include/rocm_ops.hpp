@@ -2671,6 +2671,13 @@ namespace py = pybind11;
           py::arg("scale"));
 
 #define MXFP4_MOE_AUX_PYBIND                  \
+    m.def("_mxfp4_moe_sort_internal_is_supported", \
+          &mxfp4_moe_sort_internal_is_supported,   \
+          py::arg("NE"),                           \
+          py::arg("TOPK"),                         \
+          py::arg("D_HIDDEN"),                     \
+          py::arg("MB"),                           \
+          py::arg("zero_init"));                   \
     m.def("mxfp4_moe_sort_quant",             \
           &mxfp4_moe_sort_quant_kernel,       \
           py::arg("a_input"),                 \
