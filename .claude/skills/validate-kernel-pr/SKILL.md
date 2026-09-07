@@ -59,7 +59,7 @@ boundary, whatever the file layout.)
 | `pick-idle-gpu.py` | the sampling window that decides a GPU is idle, and the `idleness-basis:` line saying how it knows. |
 | `gpu_probe.py` | which device the run actually holds — arch, BDF, activity — asked of amd-smi, never turning an unreadable reading into an idle one. |
 | `target_run.py` | the decisions around one target run: what goes into the receipt probe, how a grid cell becomes a Python value, what a script target's exit code may be counted as, and which environment variables the target is allowed to see. |
-| `scrape_perf.py` | parsing a benchmark's rows into comparable numbers. |
+| `scrape_perf.py` | everything around a timing run except the run: which harness the target exposes, how a benchmark's rows become comparable numbers, whether a cross-tree difference is attributable to the patch, and what a timing run is allowed to have left in the worktree. |
 | `scan_index_width.py` | the 32-bit index-width scan. |
 
 Two things are deliberately **not** on this list, for the same reason: they cannot survive being a
@@ -71,8 +71,9 @@ release it on exit, and every concurrent validator would then pick the same one.
 
 **Launching the target** needs that locked device, the private cache roots, and the constructed
 environment assembled together at `env -i` time; handing all of it to a child would just move the
-assembly, not isolate it. So the entry point spawns the target, and `target_run.py` owns
-everything that had to be *decided* around the launch.
+assembly, not isolate it. So the entry point spawns the target — for correctness and for timing
+alike — and `target_run.py` and `scrape_perf.py` own everything that had to be *decided* around
+those launches.
 
 You choose what to run and you explain why. You do not hand-write a stage result, and you do not
 compute the verdict — `finish` does, from what is on record.

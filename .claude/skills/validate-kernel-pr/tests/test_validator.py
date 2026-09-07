@@ -3483,20 +3483,20 @@ class ReviewSkillContractTests(unittest.TestCase):
         point" for a target the validator happily timed.
         """
         review_skill = (SKILL_DIR.parent / "review-pr" / "SKILL.md").read_text()
-        validator = VALIDATOR.read_text()
+        validator = (SKILL_DIR / "scrape_perf.py").read_text()
 
         review_body = re.search(
             r"def perf_command\(path\):(.*?)\n\n", review_skill, re.DOTALL
         )
         validator_body = re.search(
-            r"perf_detect\(\).*?<<'PY'\n(.*?)\nPY", validator, re.DOTALL
+            r"def detect_harness\(text\):(.*?)\n    return None", validator, re.DOTALL
         )
         self.assertIsNotNone(review_body)
         self.assertIsNotNone(validator_body)
 
         for name, body in (
             ("review-pr", review_body.group(1)),
-            ("validate_pr.sh", validator_body.group(1)),
+            ("scrape_perf.py", validator_body.group(1)),
         ):
             self.assertIn('"--scenario" in text', body, name)
             self.assertIn('"bench" in text', body, name)
@@ -4044,6 +4044,210 @@ class TargetRunTests(unittest.TestCase):
         summary = self.tool.environment_summary(["B=2", "A=1"])
         self.assertEqual(["A", "B"], summary["passed_through"])
         self.assertIn("env -i", summary["policy"])
+
+
+class PerfDecisionTests(unittest.TestCase):
+    """The decisions around a timing run, which used to live inside bash heredocs.
+
+    The timing runs themselves stay in the entry point -- they need the locked GPU and the
+    warm cache root -- but what the runs MEAN was untestable where it was.
+    """
+
+    def setUp(self):
+        sys.path.insert(0, str(SKILL_DIR))
+        self.addCleanup(sys.path.remove, str(SKILL_DIR))
+        import scrape_perf
+
+        self.perf = scrape_perf
+
+    def context(self, **overrides):
+        base = {
+            "base_log": "/w/base.log",
+            "head_log": "/w/head.log",
+            "base_sha": "abc123",
+            "command": "--scenario bench",
+            "basis": "target exposes --scenario bench",
+            "baseline_method": "patch-reversed-same-worktree",
+            "control_column": "",
+            "control_tol": "0.10",
+        }
+        base.update(overrides)
+        return base
+
+    # ---- which harness the target has
+
+    def test_the_bare_perftest_decorator_counts_as_a_harness(self):
+        # Matching only `run_perftest` missed 12 of the 123 targets in op_tests/, and
+        # reported them as "there was nothing to measure" when the detector was the problem.
+        harness = self.perf.detect_harness("@perftest\ndef test_x():\n    pass\n")
+        self.assertEqual("", harness["args"])
+        self.assertIn("perftest", harness["basis"])
+
+    def test_a_scenario_sweep_is_detected_with_its_arguments(self):
+        harness = self.perf.detect_harness("parser.add_argument('--scenario')  # bench")
+        self.assertEqual("--scenario bench", harness["args"])
+
+    def test_a_target_with_no_harness_is_not_given_one(self):
+        self.assertIsNone(self.perf.detect_harness("def test_x():\n    assert True\n"))
+
+    def test_no_harness_exits_three_so_a_crash_is_distinguishable(self):
+        target = Path(self.enterContext(tempfile.TemporaryDirectory())) / "t.py"
+        target.write_text("def test_x():\n    assert True\n")
+        completed = run(
+            [sys.executable, str(SKILL_DIR / "scrape_perf.py"), "detect", str(target)],
+            check=False,
+        )
+        self.assertEqual(3, completed.returncode)
+
+    def test_the_empty_argument_line_survives_the_round_trip(self):
+        # The decorator harness takes no arguments, so `detect` prints an empty first line.
+        # It goes first because command substitution strips a trailing newline and not a
+        # leading one -- with the order reversed, the caller reads the basis as the args.
+        target = Path(self.enterContext(tempfile.TemporaryDirectory())) / "t.py"
+        target.write_text("@perftest\ndef test_x():\n    pass\n")
+        script = SKILL_DIR / "validate_pr.sh"
+        probe = (
+            f'harness=$("{SKILL_DIR / "scrape_perf.py"}" detect "{target}")\n'
+            'printf "[%s][%s]" "${harness%%$\'\\n\'*}" "${harness#*$\'\\n\'}"\n'
+        )
+        self.assertTrue(script.exists())
+        out = run(["bash", "-c", probe]).stdout
+        self.assertEqual("[][target uses the perftest/@benchmark harness]", out)
+
+    # ---- what a timing run may leave behind
+
+    def restore(self, before, current, root="/repo"):
+        calls = {"unlink": [], "rmtree": [], "checkout": []}
+        outcome = self.perf.restore_worktree(
+            root,
+            before,
+            current,
+            unlink=lambda p: calls["unlink"].append(str(p)),
+            rmtree=lambda p: calls["rmtree"].append(str(p)),
+            checkout=lambda p: calls["checkout"].append(p),
+        )
+        return outcome, calls
+
+    def test_an_artifact_the_timing_run_dropped_is_removed(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (root / "tuned_op_bench.csv").write_text("x\n")
+        outcome, calls = self.restore("", "?? tuned_op_bench.csv\n", root)
+        self.assertEqual(["tuned_op_bench.csv"], outcome["removed"])
+        self.assertEqual(1, len(calls["unlink"]))
+
+    def test_a_file_that_was_already_dirty_is_left_alone(self):
+        # It is somebody else's edit. Reverting it would silently destroy uncommitted work
+        # that has nothing to do with this run.
+        outcome, calls = self.restore(" M kernel.py\n", " M kernel.py\n")
+        self.assertEqual([], outcome["removed"] + outcome["reverted"])
+        self.assertEqual([], calls["unlink"] + calls["checkout"])
+
+    def test_a_path_that_escapes_the_worktree_is_reported_not_deleted(self):
+        outcome, calls = self.restore("", "?? ../../etc/passwd\n")
+        self.assertEqual(["../../etc/passwd"], outcome["skipped"])
+        self.assertEqual([], calls["unlink"] + calls["rmtree"])
+
+    def test_a_git_quoted_path_is_reported_not_guessed_at(self):
+        # Un-quoting git's escapes correctly is fiddly and this code deletes files.
+        outcome, calls = self.restore("", '?? "od\\303\\251.csv"\n')
+        self.assertEqual(1, len(outcome["skipped"]))
+        self.assertEqual([], calls["unlink"] + calls["rmtree"])
+
+    # ---- whether a difference can be charged to the patch
+
+    def test_a_same_worktree_baseline_needs_no_control_column(self):
+        result = {"status": "ok", "reason": "fine", "median_ratio": 1.02, "columns": {}}
+        stage, findings = self.perf.perf_stage(result, self.context())
+        self.assertEqual("pass", stage["status"])
+        self.assertNotIn("control_note", stage)
+
+    def test_a_cross_tree_comparison_without_its_control_makes_no_claim(self):
+        result = {
+            "status": "regression",
+            "reason": "slower",
+            "median_ratio": 0.8,
+            "worst_column": "aiter us",
+            "regressed_rows": [{"row": "128", "base": 1.0, "head": 2.0}],
+            "columns": {"aiter us": {"median_ratio": 0.8}},
+        }
+        stage, findings = self.perf.perf_stage(
+            result,
+            self.context(baseline_method="target-transplant", control_column="torch"),
+        )
+        self.assertEqual("skip", stage["status"])
+        # The numbers the gate rejected must not ship beside the skip: a median_ratio next
+        # to `status: skip` reads as a regression somebody chose not to act on.
+        self.assertNotIn("median_ratio", stage)
+        self.assertNotIn("regressed_rows", stage)
+        self.assertEqual(["note"], [f["severity"] for f in findings])
+
+    def test_a_control_column_that_moved_disqualifies_the_comparison(self):
+        result = {
+            "status": "regression",
+            "reason": "slower",
+            "median_ratio": 0.8,
+            "columns": {"torch us": {"median_ratio": 0.6}, "aiter us": {}},
+        }
+        stage, _ = self.perf.perf_stage(
+            result,
+            self.context(baseline_method="target-transplant", control_column="torch"),
+        )
+        self.assertEqual("skip", stage["status"])
+        self.assertIn("40.0%", stage["control_note"])
+        self.assertEqual(0.6, stage["control_ratio"])
+
+    def test_a_control_column_that_held_lets_the_regression_stand(self):
+        result = {
+            "status": "regression",
+            "reason": "aiter us: median head/base speedup 0.800 < 0.95",
+            "median_ratio": 0.8,
+            "regressed_rows": [{"row": "128", "base": 1.0, "head": 2.0}],
+            "columns": {"torch us": {"median_ratio": 1.01}, "aiter us": {}},
+        }
+        stage, findings = self.perf.perf_stage(
+            result,
+            self.context(baseline_method="target-transplant", control_column="torch"),
+        )
+        self.assertEqual("fail", stage["status"])
+        self.assertEqual(0.8, stage["median_ratio"])
+        self.assertIn("reproduced within", stage["control_note"])
+        self.assertEqual(["should-fix"], [f["severity"] for f in findings])
+        self.assertIn("128: 1 -> 2", findings[0]["detail"])
+
+    def test_only_a_measured_regression_can_fail_the_stage(self):
+        # A timeout, a crash, a missing harness and a one-row table must all land on skip:
+        # a false regression blocks a good PR and gets the stage switched off within a week.
+        for status in ("insufficient", "error", "unknown"):
+            with self.subTest(status=status):
+                stage, _ = self.perf.perf_stage(
+                    {"status": status, "reason": "nope", "columns": {}}, self.context()
+                )
+                self.assertEqual("skip", stage["status"])
+
+    def test_the_repeat_count_ships_with_the_claim(self):
+        # The threshold is only defensible because each cell is a best-of-N, so N has to be
+        # visible to a reader.
+        stage, _ = self.perf.perf_stage(
+            {
+                "status": "ok",
+                "reason": "",
+                "columns": {},
+                "base_runs": 3,
+                "head_runs": 3,
+            },
+            self.context(),
+        )
+        self.assertEqual(3, stage["repeats"]["base"])
+        self.assertIn("best sample", stage["repeats"]["reduction"])
+
+    def test_a_missing_measurement_is_omitted_rather_than_nulled(self):
+        # report_schema.json types median_ratio as a number; a null fails validation at
+        # review-pr's identity gate, turning "we could not measure" into "this is malformed".
+        stage, _ = self.perf.perf_stage(
+            {"status": "insufficient", "reason": "no rows", "median_ratio": None},
+            self.context(),
+        )
+        self.assertNotIn("median_ratio", stage)
 
 
 def report_module_status(report, stage):

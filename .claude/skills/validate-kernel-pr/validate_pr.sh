@@ -1113,47 +1113,22 @@ run_pytest() {
   echo "$result|$log"
 }
 
-# Decide whether the target can be timed at all, and with what arguments. A perf harness
-# cannot be inferred from the diff, only from the target's own text, and aiter carries three
-# conventions for it.
+# Decide whether the target can be timed at all, and with what arguments. Which harness a
+# target has is a reading of its source, and it lives in scrape_perf.py with the reasons for
+# it; what stays here is only whether there is a file to read.
 perf_detect() {
   local file="$REPO_WT/$TEST_FILE"
   if [ ! -f "$file" ]; then
     PERF_BASIS="the target file is not present in this checkout"
     return 1
   fi
-  local detected
-  detected=$(python3 - "$file" <<'PY'
-import pathlib
-import sys
-
-text = pathlib.Path(sys.argv[1]).read_text(errors="replace")
-if "--scenario" in text and "bench" in text:
-    print("--scenario bench")
-elif "perftest" in text or "@benchmark" in text:
-    # `perftest`, not `run_perftest`. aiter has three timing conventions and the bare
-    # `perftest` decorator is one of them; matching only the longer name misses 12 of the
-    # 123 targets in op_tests/, 11 of which have live `perftest` usage. Reporting those as
-    # "no benchmark entry point" reads as "there was nothing to measure" when the truth is
-    # that the detector was too narrow -- the failure mode this whole stage exists to avoid.
-    # This is a substring test, not a parse, so it also matches a commented-out import (the
-    # 12th target). That error is the safe one: the run finds no timing table and the stage
-    # reports `skip`, which is where it would have landed anyway.
-    print("")
-else:
-    raise SystemExit(3)
-PY
-  )
-  if [ $? -ne 0 ]; then
+  local harness
+  if ! harness=$("$SCRIPT_DIR/scrape_perf.py" detect "$file"); then
     PERF_BASIS="the target exposes no benchmark entry point (no --scenario bench, no perftest/@benchmark harness)"
     return 1
   fi
-  PERF_ARGS="$detected"
-  if [ -n "$detected" ]; then
-    PERF_BASIS="target exposes --scenario bench"
-  else
-    PERF_BASIS="target uses the perftest/@benchmark harness"
-  fi
+  PERF_ARGS=${harness%%$'\n'*}
+  PERF_BASIS=${harness#*$'\n'}
   return 0
 }
 
@@ -1164,16 +1139,11 @@ PY
 #     already warm and the table measures the kernel rather than a compile.
 #   * PERF_TIMEOUT is separate from TIMEOUT, because silently killing a legitimately long
 #     sweep would produce an empty log -- indistinguishable from "this target has no harness".
-# A bench harness routinely writes its results next to the code -- aiter targets drop a
-# tuned_op_bench.csv in the repo root. The baseline phase asserts a CLEAN worktree after the
-# base runs, so an artifact left by the timing run sets BASE_READY=0 and skips the entire head
-# correctness phase: measured, the same target went PASS with --no-perf and INCONCLUSIVE with
-# perf on, with head correctness never executed. A perf stage that silently disables
-# correctness validation is far worse than no perf stage, so the timing run has to leave the
-# worktree exactly as it found it.
 #
-# Scoped deliberately: only paths whose git status CHANGED across the timing run are touched.
-# Anything already dirty beforehand is somebody else's and is left alone.
+# A timing run leaves artifacts behind -- aiter targets drop a tuned_op_bench.csv in the repo
+# root -- and the baseline phase asserts a clean worktree, so the run has to leave the tree as
+# it found it. These two record the tree before and put it back after; which paths may be
+# touched, and which must only be reported, is decided in scrape_perf.py.
 perf_snapshot() {
   git -C "$REPO_WT" status --porcelain --untracked-files=all \
     >"$WORK/perf-worktree-$1.txt" 2>/dev/null || : >"$WORK/perf-worktree-$1.txt"
@@ -1182,75 +1152,7 @@ perf_snapshot() {
 perf_restore() {
   local before="$WORK/perf-worktree-$1.txt"
   [ -r "$before" ] || return 0
-  python3 - "$REPO_WT" "$before" <<'PY'
-import pathlib
-import shutil
-import subprocess
-import sys
-
-root = pathlib.Path(sys.argv[1]).resolve()
-
-
-def parse(text):
-    entries = {}
-    for line in text.splitlines():
-        if len(line) > 3:
-            entries[line[3:]] = line[:2]
-    return entries
-
-
-before = parse(pathlib.Path(sys.argv[2]).read_text(errors="replace"))
-current = parse(
-    subprocess.run(
-        ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=all"],
-        capture_output=True,
-        text=True,
-        check=False,
-    ).stdout
-)
-
-removed, reverted, skipped = [], [], []
-for path, code in current.items():
-    if before.get(path) == code:
-        continue
-    # git quotes paths with unusual characters. Un-quoting them correctly is fiddly and
-    # this code deletes files, so refuse to guess and report instead.
-    if path.startswith('"'):
-        skipped.append(path)
-        continue
-    target = root / path
-    try:
-        resolved = target.resolve()
-    except OSError:
-        skipped.append(path)
-        continue
-    if root != resolved and root not in resolved.parents:
-        skipped.append(path)
-        continue
-    if code == "??":
-        if resolved.is_dir() and not resolved.is_symlink():
-            shutil.rmtree(resolved, ignore_errors=True)
-        else:
-            try:
-                resolved.unlink()
-            except OSError:
-                skipped.append(path)
-                continue
-        removed.append(path)
-    else:
-        subprocess.run(
-            ["git", "-C", str(root), "checkout", "--", path],
-            capture_output=True,
-            check=False,
-        )
-        reverted.append(path)
-
-if removed or reverted or skipped:
-    print(
-        f"timing run artifacts cleaned: removed={removed} "
-        f"reverted={reverted} skipped={skipped}"
-    )
-PY
+  "$SCRIPT_DIR/scrape_perf.py" restore-worktree "$REPO_WT" "$before"
 }
 
 # Run one side PERF_REPEAT times. Results go to globals rather than a packed string because
@@ -2067,146 +1969,12 @@ else
     finding "note" "perf" \
       "base and head both produced benchmark logs, but they could not be compared"
   else
-    python3 - "$JSON" "$PERF_JSON" "$PERF_BASE_LOG" "$PERF_HEAD_LOG" \
-      "$BASE_SHA" "$PERF_ARGS" "$PERF_BASIS" \
-      "$PERF_BASELINE_METHOD" "$PERF_CONTROL_COLUMN" "$PERF_CONTROL_TOL" <<'PY'
-import json
-import sys
-
-(
-    report_path,
-    compare_path,
-    base_log,
-    head_log,
-    base_sha,
-    command,
-    basis,
-    baseline_method,
-    control_column,
-    control_tol,
-) = sys.argv[1:11]
-data = json.load(open(report_path))
-result = json.load(open(compare_path))
-
-# A transplanted baseline is only attributable if a column the patch does not touch
-# reproduces across the two trees. Without that agreement the difference could be anything
-# -- a different harness path, a different allocation, a different clock state -- and a
-# number nobody can attribute is worse than no number, so the stage skips and says why.
-control_note = ""
-control_ratio = None
-if baseline_method == "target-transplant":
-    columns = result.get("columns") or {}
-    match = None
-    for name in columns:
-        if control_column.lower() in name.lower():
-            match = name
-            break
-    if match is None:
-        control_note = (
-            f"the named control column {control_column!r} is not present in both logs, so "
-            "this cross-tree comparison cannot be attributed"
-        )
-        result["status"] = "insufficient"
-        result["reason"] = control_note
-    else:
-        control_ratio = columns[match].get("median_ratio")
-        tolerance = float(control_tol)
-        if control_ratio is None or abs(control_ratio - 1.0) > tolerance:
-            control_note = (
-                f"the control column {match!r} moved by "
-                f"{'unknown' if control_ratio is None else f'{abs(control_ratio - 1.0):.1%}'}"
-                f" across the two trees (tolerance {tolerance:.0%}); the patch does not "
-                "touch it, so the two runs are not comparable and no ratio is reported"
-            )
-            result["status"] = "insufficient"
-            result["reason"] = control_note
-        else:
-            control_note = (
-                f"control column {match!r} reproduced within "
-                f"{abs(control_ratio - 1.0):.1%} across the two trees"
-            )
-
-stage = {
-    "status": {"regression": "fail", "ok": "pass"}.get(result["status"], "skip"),
-    "baseline_method": baseline_method,
-    "baseline": (
-        f"{base_sha} with the candidate patch reversed, same worktree and GPU"
-        if baseline_method != "target-transplant"
-        else (
-            f"{base_sha} with the candidate patch reversed and this PR's own target file "
-            "copied in, same worktree and GPU; the target drives an entry point that exists "
-            "on both sides, so this times the pre-PR implementation through the same harness"
-        )
-    ),
-    "command": command or "(target's default entry point)",
-    "harness": basis,
-    "threshold": result.get("threshold"),
-    "matched_rows": result.get("matched_rows", 0),
-    # How rows were paired across the two sides. A relaxed key is a fact a reader needs: it
-    # means the target printed an unlabeled measurement column that the strict key would
-    # have treated as part of each row's identity.
-    "row_key_basis": result.get("row_key_basis", "unknown"),
-    "columns": result.get("columns", {}),
-    # Repeat count is part of the claim, not trivia: the threshold is only defensible
-    # because each cell is a best-of-N, so a reader has to be able to see N.
-    "repeats": {
-        "base": result.get("base_runs", 1),
-        "head": result.get("head_runs", 1),
-        "reduction": "best sample per cell (min latency / max throughput)",
-    },
-    "base_log": base_log,
-    "head_log": head_log,
-    "note": result.get("reason") or "",
-}
-if control_note:
-    stage["control_column"] = control_column
-    stage["control_note"] = control_note
-    if control_ratio is not None:
-        stage["control_ratio"] = control_ratio
-# median_ratio is omitted, never nulled, when there is no measurement: report_schema.json
-# types it as a number, and a null would fail validation at review-pr's identity gate --
-# turning "we could not measure" into "this report is malformed".
-# A stage the control gate rejected must not carry the numbers it rejected. Publishing a
-# median_ratio and a regressed_rows list beside `status: skip` reads as a regression that
-# was merely not acted on, when what happened is that the comparison was found
-# unattributable and no ratio is claimed at all.
-if control_note and result["status"] == "insufficient":
-    for field in ("median_ratio", "worst_column", "regressed_rows"):
-        result.pop(field, None)
-if result.get("median_ratio") is not None:
-    stage["median_ratio"] = result["median_ratio"]
-if result.get("worst_column"):
-    stage["worst_column"] = result["worst_column"]
-if result.get("regressed_rows"):
-    stage["regressed_rows"] = result["regressed_rows"]
-data["stages"]["perf"] = stage
-
-if result["status"] == "regression":
-    rows = ", ".join(
-        f"{row['row']}: {row['base']:g} -> {row['head']:g}"
-        for row in result.get("regressed_rows", [])[:3]
-    )
-    data["findings"].append(
-        {
-            "severity": "should-fix",
-            "stage": "perf",
-            "detail": (
-                "head is slower than base on the same locked GPU -- "
-                + result["reason"]
-                + (f"; worst rows: {rows}" if rows else "")
-            ),
-        }
-    )
-elif result["status"] == "insufficient":
-    data["findings"].append(
-        {
-            "severity": "note",
-            "stage": "perf",
-            "detail": f"no perf comparison was made: {result['reason']}",
-        }
-    )
-json.dump(data, open(report_path, "w"), indent=2)
-PY
+    "$SCRIPT_DIR/scrape_perf.py" stage \
+      --report "$JSON" --compare "$PERF_JSON" \
+      --base-log "$PERF_BASE_LOG" --head-log "$PERF_HEAD_LOG" \
+      --base-sha "$BASE_SHA" --command "$PERF_ARGS" --basis "$PERF_BASIS" \
+      --baseline-method "$PERF_BASELINE_METHOD" \
+      --control-column "$PERF_CONTROL_COLUMN" --control-tol "$PERF_CONTROL_TOL"
   fi
 fi
 

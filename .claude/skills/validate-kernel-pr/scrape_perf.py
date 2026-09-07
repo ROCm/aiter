@@ -434,7 +434,364 @@ def compare(base_texts, head_texts, threshold, min_rows):
     return result
 
 
+# --------------------------------------------------------------------------------------
+# The decisions that surround a timing run.
+#
+# The runs themselves stay in the entry point, for the same reason the target launch does:
+# they need the locked GPU, the phase's warm cache root, and a timeout the entry point owns.
+# What does not need to be there is the reasoning -- which harness the target has, what a
+# timing run is allowed to leave behind, and whether a measured difference is attributable.
+# Those were bash heredocs, which is to say they were untestable, and they are here instead.
+
+
+def detect_harness(text):
+    """Which benchmark entry point the target's own source offers, if any.
+
+    Returns {"args": ..., "basis": ...}, or None when the target exposes no harness.
+
+    Keep this in step with perf_command() in review-pr/SKILL.md, which computes the manual
+    fallback recipe. If the two disagree, that step prints a recipe for a harness this stage
+    declined to use, or "no benchmark entry point" for a target this stage happily timed.
+    A test asserts they agree, because a comment cannot enforce it.
+
+    A harness cannot be inferred from the diff, only from the target's text, and aiter
+    carries three conventions for it. Getting this wrong is survivable in one direction
+    only, which is why the tests below matter: a MISSED harness reports `skip` when there
+    was something to measure, while a FALSE harness produces a run with no timing table --
+    which lands on `skip` as well. Neither can manufacture a regression, because the
+    comparison is the ledger and it only ever counts rows it actually parsed.
+    """
+    if "--scenario" in text and "bench" in text:
+        return {"args": "--scenario bench", "basis": "target exposes --scenario bench"}
+    if "perftest" in text or "@benchmark" in text:
+        # `perftest`, not `run_perftest`. The bare decorator is one of aiter's three timing
+        # conventions; matching only the longer name misses 12 of the 123 targets in
+        # op_tests/, 11 with live `perftest` usage. Reporting those as "no benchmark entry
+        # point" reads as "there was nothing to measure" when the truth is that the detector
+        # was too narrow -- the failure mode this whole stage exists to avoid.
+        #
+        # A substring test, not a parse, so it also matches a commented-out import (the
+        # 12th target). That error is the safe one, per the docstring above.
+        return {"args": "", "basis": "target uses the perftest/@benchmark harness"}
+    return None
+
+
+def _status_entries(text):
+    """`git status --porcelain` output as {path: two-letter code}."""
+    return {line[3:]: line[:2] for line in text.splitlines() if len(line) > 3}
+
+
+def restore_worktree(root, before_text, current_text, unlink, rmtree, checkout):
+    """Undo what the timing run left in the worktree, and only that.
+
+    A bench harness routinely writes its results next to the code -- aiter targets drop a
+    tuned_op_bench.csv in the repo root. The baseline phase asserts a CLEAN worktree after
+    the base runs, so an artifact left by the timing run sets BASE_READY=0 and skips the
+    entire head correctness phase: measured, the same target went PASS with --no-perf and
+    INCONCLUSIVE with perf on, with head correctness never executed. A perf stage that
+    silently disables correctness validation is far worse than no perf stage.
+
+    Scoped deliberately: only paths whose status CHANGED across the run are touched.
+    Anything already dirty beforehand is somebody else's and is left alone. Anything this
+    function cannot be sure of -- a git-quoted path, a path that resolves outside the
+    worktree -- is reported as skipped rather than guessed at, because this code deletes
+    files and a wrong guess is unrecoverable.
+
+    The three filesystem effects are injected so the decision can be tested without a
+    worktree to wreck.
+    """
+    root = Path(root).resolve()
+    before = _status_entries(before_text)
+    removed, reverted, skipped = [], [], []
+    for path, code in _status_entries(current_text).items():
+        if before.get(path) == code:
+            continue
+        if path.startswith('"'):
+            skipped.append(path)
+            continue
+        try:
+            resolved = (root / path).resolve()
+        except OSError:
+            skipped.append(path)
+            continue
+        if root != resolved and root not in resolved.parents:
+            skipped.append(path)
+            continue
+        if code == "??":
+            if resolved.is_dir() and not resolved.is_symlink():
+                rmtree(resolved)
+            else:
+                try:
+                    unlink(resolved)
+                except OSError:
+                    skipped.append(path)
+                    continue
+            removed.append(path)
+        else:
+            checkout(path)
+            reverted.append(path)
+    return {"removed": removed, "reverted": reverted, "skipped": skipped}
+
+
+def attribute(result, baseline_method, control_column, control_tol):
+    """Whether a measured difference can be charged to the patch.
+
+    Only meaningful for a transplanted baseline, where the two sides are two different
+    trees. There the difference could be anything -- a different harness path, a different
+    allocation, a different clock state -- unless a column the patch does not touch
+    reproduces across both. A number nobody can attribute is worse than no number, so
+    without that agreement the comparison is downgraded to `insufficient` and says why.
+
+    Mutates `result` (the comparison's own verdict) and returns the note, or "" when there
+    was nothing to attribute.
+    """
+    if baseline_method != "target-transplant":
+        return "", None
+    columns = result.get("columns") or {}
+    match = next(
+        (name for name in columns if control_column.lower() in name.lower()), None
+    )
+    if match is None:
+        note = (
+            f"the named control column {control_column!r} is not present in both logs, so "
+            "this cross-tree comparison cannot be attributed"
+        )
+        result["status"] = "insufficient"
+        result["reason"] = note
+        return note, None
+    ratio = columns[match].get("median_ratio")
+    tolerance = float(control_tol)
+    if ratio is None or abs(ratio - 1.0) > tolerance:
+        moved = "unknown" if ratio is None else f"{abs(ratio - 1.0):.1%}"
+        note = (
+            f"the control column {match!r} moved by {moved} across the two trees "
+            f"(tolerance {tolerance:.0%}); the patch does not touch it, so the two runs "
+            "are not comparable and no ratio is reported"
+        )
+        result["status"] = "insufficient"
+        result["reason"] = note
+        return note, ratio
+    return (
+        f"control column {match!r} reproduced within {abs(ratio - 1.0):.1%} "
+        "across the two trees"
+    ), ratio
+
+
+def perf_stage(result, context):
+    """The perf stage entry and any finding it earns, from a finished comparison.
+
+    Returns (stage, findings). The verdict mapping is the narrow one on purpose: only
+    `regression` may fail and only `ok` may pass. A timeout, a crash, a missing harness and
+    a one-row table all land on `skip`, because a false regression here blocks a good PR
+    and would get the stage switched off within a week.
+    """
+    control_note, control_ratio = attribute(
+        result,
+        context["baseline_method"],
+        context["control_column"],
+        context["control_tol"],
+    )
+    baseline_method = context["baseline_method"]
+    base_sha = context["base_sha"]
+    stage = {
+        "status": {"regression": "fail", "ok": "pass"}.get(result["status"], "skip"),
+        "baseline_method": baseline_method,
+        "baseline": (
+            f"{base_sha} with the candidate patch reversed, same worktree and GPU"
+            if baseline_method != "target-transplant"
+            else (
+                f"{base_sha} with the candidate patch reversed and this PR's own target "
+                "file copied in, same worktree and GPU; the target drives an entry point "
+                "that exists on both sides, so this times the pre-PR implementation "
+                "through the same harness"
+            )
+        ),
+        "command": context["command"] or "(target's default entry point)",
+        "harness": context["basis"],
+        "threshold": result.get("threshold"),
+        "matched_rows": result.get("matched_rows", 0),
+        # How rows were paired across the two sides. A relaxed key is a fact a reader
+        # needs: it means the target printed an unlabeled measurement column that the
+        # strict key would have treated as part of each row's identity.
+        "row_key_basis": result.get("row_key_basis", "unknown"),
+        "columns": result.get("columns", {}),
+        # Repeat count is part of the claim, not trivia: the threshold is only defensible
+        # because each cell is a best-of-N, so a reader has to be able to see N.
+        "repeats": {
+            "base": result.get("base_runs", 1),
+            "head": result.get("head_runs", 1),
+            "reduction": "best sample per cell (min latency / max throughput)",
+        },
+        "base_log": context["base_log"],
+        "head_log": context["head_log"],
+        "note": result.get("reason") or "",
+    }
+    if control_note:
+        stage["control_column"] = context["control_column"]
+        stage["control_note"] = control_note
+        if control_ratio is not None:
+            stage["control_ratio"] = control_ratio
+        # A stage the control gate rejected must not carry the numbers it rejected.
+        # Publishing a median_ratio and a regressed_rows list beside `status: skip` reads
+        # as a regression that was merely not acted on, when what happened is that the
+        # comparison was found unattributable and no ratio is claimed at all.
+        if result["status"] == "insufficient":
+            for field in ("median_ratio", "worst_column", "regressed_rows"):
+                result.pop(field, None)
+    # median_ratio is omitted, never nulled, when there is no measurement:
+    # report_schema.json types it as a number, and a null would fail validation at
+    # review-pr's identity gate -- turning "we could not measure" into "this report is
+    # malformed".
+    if result.get("median_ratio") is not None:
+        stage["median_ratio"] = result["median_ratio"]
+    if result.get("worst_column"):
+        stage["worst_column"] = result["worst_column"]
+    if result.get("regressed_rows"):
+        stage["regressed_rows"] = result["regressed_rows"]
+
+    findings = []
+    if result["status"] == "regression":
+        rows = ", ".join(
+            f"{row['row']}: {row['base']:g} -> {row['head']:g}"
+            for row in result.get("regressed_rows", [])[:3]
+        )
+        findings.append(
+            {
+                "severity": "should-fix",
+                "stage": "perf",
+                "detail": (
+                    "head is slower than base on the same locked GPU -- "
+                    + result["reason"]
+                    + (f"; worst rows: {rows}" if rows else "")
+                ),
+            }
+        )
+    elif result["status"] == "insufficient":
+        findings.append(
+            {
+                "severity": "note",
+                "stage": "perf",
+                "detail": f"no perf comparison was made: {result['reason']}",
+            }
+        )
+    return stage, findings
+
+
+def cmd_detect(args):
+    """Exit 3, not 1, when there is no harness: 1 is what a crashed detector returns.
+
+    Arguments first, basis second, one per line -- and the arguments line is empty for the
+    decorator harness, which is why it goes first: the caller splits on the first newline,
+    and a leading empty field survives command substitution where a trailing one does not.
+    """
+    harness = detect_harness(Path(args.target).read_text(errors="replace"))
+    if harness is None:
+        return 3
+    print(harness["args"])
+    print(harness["basis"])
+    return 0
+
+
+def cmd_restore(args):
+    import shutil
+    import subprocess
+
+    root = Path(args.root).resolve()
+    current = subprocess.run(
+        ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=all"],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout
+    outcome = restore_worktree(
+        root,
+        Path(args.before).read_text(errors="replace"),
+        current,
+        unlink=lambda path: path.unlink(),
+        rmtree=lambda path: shutil.rmtree(path, ignore_errors=True),
+        checkout=lambda path: subprocess.run(
+            ["git", "-C", str(root), "checkout", "--", path],
+            capture_output=True,
+            check=False,
+        ),
+    )
+    if any(outcome.values()):
+        print(
+            "timing run artifacts cleaned: "
+            f"removed={outcome['removed']} reverted={outcome['reverted']} "
+            f"skipped={outcome['skipped']}"
+        )
+    return 0
+
+
+def cmd_stage(args):
+    report = json.loads(Path(args.report).read_text())
+    result = json.loads(Path(args.compare).read_text())
+    stage, findings = perf_stage(
+        result,
+        {
+            "base_log": args.base_log,
+            "head_log": args.head_log,
+            "base_sha": args.base_sha,
+            "command": args.command,
+            "basis": args.basis,
+            "baseline_method": args.baseline_method,
+            "control_column": args.control_column,
+            "control_tol": args.control_tol,
+        },
+    )
+    report["stages"]["perf"] = stage
+    report["findings"].extend(findings)
+    Path(args.report).write_text(json.dumps(report, indent=2))
+    return 0
+
+
+def subcommand(argv):
+    """The three surrounding decisions, dispatched by name.
+
+    Kept off the main parser so that comparing two logs stays the bare `--base/--head`
+    invocation it has always been -- that is the interface the entry point and the tests
+    already use, and renaming it would be churn with no reader on the other end.
+    """
+    parser = argparse.ArgumentParser(prog="scrape_perf.py")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    detect = sub.add_parser("detect", help="which benchmark harness a target exposes")
+    detect.add_argument("target")
+    detect.set_defaults(func=cmd_detect)
+
+    restore = sub.add_parser(
+        "restore-worktree", help="undo what a timing run left behind"
+    )
+    restore.add_argument("root")
+    restore.add_argument("before")
+    restore.set_defaults(func=cmd_restore)
+
+    stage = sub.add_parser("stage", help="write the perf stage into the report")
+    stage.add_argument("--report", required=True)
+    stage.add_argument("--compare", required=True)
+    stage.add_argument("--base-log", required=True)
+    stage.add_argument("--head-log", required=True)
+    stage.add_argument("--base-sha", required=True)
+    stage.add_argument("--command", default="")
+    stage.add_argument("--basis", default="")
+    stage.add_argument("--baseline-method", required=True)
+    stage.add_argument("--control-column", default="")
+    stage.add_argument("--control-tol", default="0.10")
+    stage.set_defaults(func=cmd_stage)
+
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+SUBCOMMANDS = ("detect", "restore-worktree", "stage")
+
+
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv and argv[0] in SUBCOMMANDS:
+        return subcommand(argv)
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--base",
