@@ -27,7 +27,10 @@ Usage:
 
 Environment variables:
     FLYDSL_RUNTIME_CACHE_DIR  Cache directory (default: ~/.flydsl/cache)
-    GPU_ARCHS / ARCH          Target GPU architecture information for logging.
+    AITER_GPU_TARGETS         ';'/','-separated 'gfx' or 'gfx:cu_num' build
+                              targets; missing pairs retain runtime fallback.
+    GPU_ARCHS                 Legacy arch-wide filter.
+    ARCH                      Legacy bare-arch filter.
 """
 
 from __future__ import annotations
@@ -52,6 +55,8 @@ from aiter.aot.flydsl.common import (
     run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.utils.build_targets import KNOWN_GFX, _parse_gpu_targets_env
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.bpreshuffle_gemm_gfx1250 import (
     parse_wmma_kernel_name as parse_ptpc_wmma_kernel_name,
 )
@@ -180,7 +185,7 @@ def parse_csv(csv_path: str):
             m = int(row["M"])
             n = int(row["N"])
             k = int(row["K"])
-            cu_num = int(row.get("cu_num", "0"))
+            cu_num = int(row.get("cu_num") or 0)
             gfx = row.get("gfx", "").strip()
 
             if kernel_name.startswith("flydsl_bpreshuflle_"):
@@ -654,6 +659,113 @@ def job_arch(cu_num: int = 0, gfx: str = "") -> str:
     return gfx or cu_num_to_arch(cu_num, default=GEMM_AOT_ARCH_DEFAULT)
 
 
+def _job_target(job: dict) -> tuple[str, int]:
+    gfx = str(job.get("gfx") or "").strip().lower()
+    cu_num = int(job.get("cu_num") or 0)
+    return gfx or job_arch(cu_num), cu_num
+
+
+def _legacy_cu_nums(jobs: list[dict]) -> list[int]:
+    return sorted(
+        {
+            int(job.get("cu_num") or 0)
+            for job in jobs
+            if not str(job.get("gfx") or "").strip()
+        }
+    )
+
+
+def _select_for_targets(
+    jobs: list[dict], targets: list[tuple[str, int]]
+) -> tuple[list[dict], list[str]]:
+    """Jobs matching any target, and the targets nothing matched."""
+    wanted = set(targets)
+    selected: list[dict] = []
+    covered: set[tuple[str, int]] = set()
+    for job in jobs:
+        gfx, cu_num = _job_target(job)
+        # cu_num 0 means no count was recorded, so the row stays in for
+        # every target of its arch.
+        hits = {t for t in wanted if t[0] == gfx and (t[1] == cu_num or cu_num == 0)}
+        if hits:
+            selected.append(job)
+            covered |= hits
+    return selected, [f"{gfx}:{cu}" for gfx, cu in sorted(wanted - covered)]
+
+
+def _select_for_archs(
+    jobs: list[dict], archs: set[str]
+) -> tuple[list[dict], list[str]]:
+    """Jobs whose arch was requested, and the arches nothing matched."""
+    selected = [job for job in jobs if _job_target(job)[0] in archs]
+    present = {_job_target(job)[0] for job in selected}
+    return selected, sorted(archs - present)
+
+
+def _warn_legacy_rows(jobs: list[dict]) -> None:
+    for cu_num in _legacy_cu_nums(jobs):
+        # Inferring the arch from a CU count is ambiguous for arches sharing one.
+        print(
+            f"  [WARN] FlyDSL GEMM row has no gfx; inferring {job_arch(cu_num)} "
+            f"from legacy cu_num={cu_num}. Re-run the tuner to record gfx."
+        )
+
+
+def _warn_unmatched(missing: list[str]) -> None:
+    if missing:
+        print(
+            f"  [WARN] The configured GEMM CSVs have no FlyDSL GEMM jobs for "
+            f"{', '.join(missing)}; those targets will use their existing "
+            "runtime fallback."
+        )
+
+
+def _archs_from_env(value: str) -> set[str]:
+    """Arch names in an ARCH/GPU_ARCHS value. Raises ValueError on a bad one."""
+    archs = {a.strip().lower() for a in re.split(r"[;,]", value) if a.strip()}
+    if not archs:
+        raise ValueError("contains no valid architecture names")
+    if "native" in archs:
+        if len(archs) != 1:
+            raise ValueError("'native' cannot be combined with other targets")
+        archs = {get_gfx_runtime()}
+    unknown = archs - KNOWN_GFX
+    if unknown:
+        raise ValueError(f"contains unknown target(s): {sorted(unknown)}")
+    return archs
+
+
+def active_target_env() -> tuple[str, str] | None:
+    """The env var driving target selection, and its value."""
+    for var_name in ("AITER_GPU_TARGETS", "ARCH", "GPU_ARCHS"):
+        value = (os.environ.get(var_name) or "").strip()
+        if value:
+            return var_name, value
+    return None
+
+
+def filter_jobs_for_build_targets(jobs: list[dict]) -> list[dict]:
+    """Apply the same target selection to CLI and packaging AOT paths."""
+    active = active_target_env()
+    if active is None:
+        return jobs
+    var_name, value = active
+    if var_name == "AITER_GPU_TARGETS":
+        # Not get_build_targets_env: it folds GPU_ARCHS in, and the two are
+        # separate contracts here.
+        selected, missing = _select_for_targets(jobs, _parse_gpu_targets_env())
+    else:
+        # ARCH and GPU_ARCHS stay arch-wide, including when CU_NUM is set.
+        try:
+            archs = _archs_from_env(value)
+        except ValueError as e:
+            raise RuntimeError(f"{var_name} {e}.") from None
+        selected, missing = _select_for_archs(jobs, archs)
+    _warn_legacy_rows(jobs)
+    _warn_unmatched(missing)
+    return selected
+
+
 def compile_one_config(
     kernel_name: str,
     kind: str,
@@ -736,17 +848,17 @@ def main():
     cache_dir = os.path.expanduser(
         os.environ.get("FLYDSL_RUNTIME_CACHE_DIR", "~/.flydsl/cache")
     )
-    arch = os.environ.get("ARCH") or os.environ.get("GPU_ARCHS")
-
     all_jobs = collect_aot_jobs(csv_paths, parse_csv)
-    if arch:
-        # GPU_ARCHS may be a ';'- or ','-separated list (e.g. "gfx942;gfx950").
-        arch_set = {a.strip() for a in re.split(r"[;,]", arch) if a.strip()}
-        n_before = len(all_jobs)
-        all_jobs = [
-            j for j in all_jobs if job_arch(j["cu_num"], j.get("gfx", "")) in arch_set
-        ]
-        print(f"[aiter] ARCH={arch}: {len(all_jobs)}/{n_before} jobs match")
+    n_before = len(all_jobs)
+    try:
+        all_jobs = filter_jobs_for_build_targets(all_jobs)
+    except RuntimeError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+    active = active_target_env()
+    target_spec = active[1] if active else ""
+    if target_spec:
+        print(f"[aiter] targets={target_spec}: {len(all_jobs)}/{n_before} jobs match")
 
     hgemm_jobs = [j for j in all_jobs if j["kind"] == "hgemm"]
     preshuffle_jobs = [j for j in all_jobs if j["kind"] == "preshuffle"]
@@ -766,7 +878,7 @@ def main():
     print(f"  PTPC wmma jobs:   {len(ptpc_wmma_jobs)}")
     print(f"  Total jobs:       {len(all_jobs)}")
     print(f"  Cache dir:        {cache_dir}")
-    print(f"  Target arch:      {arch or '(all archs found in CSVs)'}")
+    print(f"  Target arch:      {target_spec or '(all archs found in CSVs)'}")
     print("=" * 72)
 
     total_t0 = time.time()
