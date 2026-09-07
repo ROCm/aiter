@@ -720,7 +720,7 @@ def _get_config(
     N: int,
     K: int,
     shuffle: bool = False,
-    backend: str | None = None,
+    backend: str = "triton",
 ):
     # Note: Config files use K=2*K in their naming
     K = 2 * K

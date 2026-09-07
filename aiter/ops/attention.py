@@ -1224,6 +1224,12 @@ def get_mla_metadata_info_v1(
         and kv_dtype == dtypes.bf16
         and q_dtype == dtypes.bf16
         and num_head_qo != 48
+    ) or (
+        get_gfx() == "gfx950"
+        and q_dtype == dtypes.fp8
+        and kv_dtype == dtypes.fp8
+        and num_head_qo == 96
+        and effective_seqlen_qo <= 6
     ):
         if num_head_qo * 2 > 128:
             max_qo_tiles_per_batch = effective_seqlen_qo
@@ -1633,6 +1639,13 @@ def decode_update_mla_metadata_v1(
             and num_heads_per_head_k == 128
             and q_is_fp8
             and kv_is_fp8
+        )
+        or (
+            arch_id == "gfx950"
+            and num_heads_per_head_k == 96
+            and q_is_fp8
+            and kv_is_fp8
+            and max_seqlen_qo <= 6
         )
     )
     cu_num = work_indptr.shape[0] - 1

@@ -4,8 +4,17 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-@triton.jit
+_static_per_tensor_quant_fp8_i8_repr = make_kernel_repr(
+    "_static_per_tensor_quant_fp8_i8_kernel",
+    [
+        "NUM_COL_POW2",
+    ],
+)
+
+
+@triton.jit(repr=_static_per_tensor_quant_fp8_i8_repr)
 def _static_per_tensor_quant_fp8_i8_kernel(
     qx_ptr,
     x_in_ptr,
@@ -30,7 +39,15 @@ def _static_per_tensor_quant_fp8_i8_kernel(
     tl.store(qx_ptr + offs, qx, mask=mask)
 
 
-@triton.jit
+_dynamic_per_tensor_quant_fp8_i8_repr = make_kernel_repr(
+    "_dynamic_per_tensor_quant_fp8_i8_kernel",
+    [
+        "NUM_COL_POW2",
+    ],
+)
+
+
+@triton.jit(repr=_dynamic_per_tensor_quant_fp8_i8_repr)
 def _dynamic_per_tensor_quant_fp8_i8_kernel(
     x_in_ptr,
     scale_out_ptr,
@@ -51,7 +68,15 @@ def _dynamic_per_tensor_quant_fp8_i8_kernel(
     tl.atomic_max(scale_out_ptr, m / DTYPE_MAX, sem="relaxed")
 
 
-@triton.jit
+_dynamic_per_token_quant_fp8_i8_repr = make_kernel_repr(
+    "_dynamic_per_token_quant_fp8_i8_kernel",
+    [
+        "NUM_COL_POW2",
+    ],
+)
+
+
+@triton.jit(repr=_dynamic_per_token_quant_fp8_i8_repr)
 def _dynamic_per_token_quant_fp8_i8_kernel(
     qx_ptr,
     scale_out_ptr,
@@ -286,13 +311,29 @@ def _nvfp4_quant_op(
     return x_fp4, scale_e4m3.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS)
 
 
+_dynamic_mxfp4_quant_repr = make_kernel_repr(
+    "_dynamic_mxfp4_quant_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "NUM_ITER",
+        "NUM_STAGES",
+        "MXFP4_QUANT_BLOCK_SIZE",
+        "EVEN_M_N",
+        "SCALING_MODE",
+        "num_warps",
+        "num_stages",
+    ],
+)
+
+
 @triton.heuristics(
     {
         "EVEN_M_N": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0
         and args["N"] % (args["BLOCK_SIZE_N"] * args["NUM_ITER"]) == 0,
     }
 )
-@triton.jit
+@triton.jit(repr=_dynamic_mxfp4_quant_repr)
 def _dynamic_mxfp4_quant_kernel(
     x_ptr,
     x_fp4_ptr,
@@ -396,7 +437,16 @@ def _mxfp8_quant_op(x_grouped, QUANT_AXIS: tl.constexpr):
     return scale_e8m0, quant_scale
 
 
-@triton.jit
+_dynamic_mxfp8_quant_repr = make_kernel_repr(
+    "_dynamic_mxfp8_quant_kernel",
+    [
+        "BLOCK_SIZE_N",
+        "QUANT_BLOCK_SIZE",
+    ],
+)
+
+
+@triton.jit(repr=_dynamic_mxfp8_quant_repr)
 def _dynamic_mxfp8_quant_kernel(
     x_ptr,
     y_ptr,
@@ -455,7 +505,16 @@ def _dynamic_mxfp8_quant_kernel(
         )
 
 
-@triton.jit
+_dynamic_mxfp8_quant_n32k4_mbn_repr = make_kernel_repr(
+    "_dynamic_mxfp8_quant_n32k4_mbn_kernel",
+    [
+        "BLOCK_SIZE_N",
+        "QUANT_BLOCK_SIZE",
+    ],
+)
+
+
+@triton.jit(repr=_dynamic_mxfp8_quant_n32k4_mbn_repr)
 def _dynamic_mxfp8_quant_n32k4_mbn_kernel(
     x_ptr,
     y_ptr,
@@ -537,7 +596,17 @@ def _dynamic_mxfp8_quant_n32k4_mbn_kernel(
 #      y_scale_e8m0 (M, N//32) — uint8 e8m0 (1x32 MX scale)
 
 
-@triton.jit
+_fp8_legacy_to_mxfp8_repr = make_kernel_repr(
+    "_fp8_legacy_to_mxfp8_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "QUANT_BLOCK_SIZE",
+        "LEGACY_BLOCK_SIZE",
+    ],
+)
+
+
+@triton.jit(repr=_fp8_legacy_to_mxfp8_repr)
 def _fp8_legacy_to_mxfp8_kernel(
     x_fnuz_ptr,
     x_scale_fp32_ptr,
@@ -598,13 +667,26 @@ def _fp8_legacy_to_mxfp8_kernel(
     tl.store(y_scale_e8m0_ptr + s_offs, scale_e8m0, mask=s_mask)
 
 
+_dynamic_nvfp4_quant_repr = make_kernel_repr(
+    "_dynamic_nvfp4_quant_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "NUM_ITER",
+        "NUM_STAGES",
+        "NVFP4_QUANT_BLOCK_SIZE",
+        "EVEN_M_N",
+    ],
+)
+
+
 @triton.heuristics(
     {
         "EVEN_M_N": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0
         and args["N"] % (args["BLOCK_SIZE_N"] * args["NUM_ITER"]) == 0,
     }
 )
-@triton.jit
+@triton.jit(repr=_dynamic_nvfp4_quant_repr)
 def _dynamic_nvfp4_quant_kernel(
     x_ptr,
     x_fp4_ptr,
