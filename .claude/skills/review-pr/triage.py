@@ -314,7 +314,7 @@ def _bound_arg(node):
         # Printing the node class ("Call") tells the reader nothing about which tensor.
         try:
             src = ast.unparse(a)
-        except Exception:
+        except Exception:  # noqa: BLE001 - a label must never take the forensic down
             return type(a).__name__
         return src if len(src) <= 48 else src[:45] + "..."
     for k in node.keywords:
@@ -527,7 +527,7 @@ def aot_pairing(diff_text, root, symbol_root=None):
                     continue
                 if node.lineno not in lines:
                     continue
-                if re.search(r"(?<![\w])%s(?![\w])" % re.escape(name), aot_text):
+                if re.search(rf"(?<![\w]){re.escape(name)}(?![\w])", aot_text):
                     continue
                 rows.append((path, node.lineno, name, users))
     return rows
@@ -537,8 +537,8 @@ def render_aot_pairing(rows):
     if not rows:
         return ("AOT PAIRING: no new ops-side contract that aiter/aot/flydsl/ was left "
                 "unaware of")
-    out = ["NEW OPS-SIDE CONTRACT, AOT NOT TAUGHT -- %d symbol(s). D12 is the rule; this is "
-           "its evidence." % len(rows),
+    out = [(f"NEW OPS-SIDE CONTRACT, AOT NOT TAUGHT -- {len(rows)} symbol(s). D12 is the "
+            f"rule; this is its evidence."),
            "aiter/aot/flydsl/ pre-compiles kernel variants by re-deriving the runtime's own",
            "conditions, so it holds a second copy of them and the copy drifts. Each symbol",
            "below is newly public in a module AOT already imports from, and its name does",
@@ -548,22 +548,22 @@ def render_aot_pairing(rows):
            "resolve_flydsl_stage1_tile_n exactly this way and AOT compiled the wrong tile_n",
            "until #4429."]
     for path, line, name, users in rows:
-        out.append("  %s:%d  %s  -- module imported by %s" % (path, line, name, ", ".join(users)))
+        out.append(f"  {path}:{line}  {name}  -- module imported by {', '.join(users)}")
     return "\n".join(out)
 
 
 def render_flydsl_bounds(rows):
     if not rows:
         return ("FLYDSL BOUNDS: no unbounded buffer resource or descriptor on an added line")
-    out = ["FLYDSL BUFFER BOUNDS -- %d candidate(s). B8 is the rule; this is its evidence."
-           % len(rows),
+    out = [(f"FLYDSL BUFFER BOUNDS -- {len(rows)} candidate(s). B8 is the rule; this is its "
+            f"evidence."),
            "CANDIDATES, NOT VERDICTS. max_size=True is right whenever the bound tensor is",
            "full-size, and most are: weights and caches (sin_cache, cos_cache, rms_weight,",
            "block_table, plan) have no ragged dimension. It is a defect only when the bound",
            "dimension is a runtime extent -- M, token count, num_valid, a per-expert count.",
            "B8's FP self-check decides which; name the value that overflows before firing."]
     for path, line, call, arg, why in rows:
-        out.append("  %s:%d  %s(%s)  -- %s" % (path, line, call, arg, why))
+        out.append(f"  {path}:{line}  {call}({arg})  -- {why}")
     return "\n".join(out)
 
 
@@ -2297,7 +2297,7 @@ def _fold_punct(text):
 
 
 HASH_LEDGER = ".artifact_hashes"
-LATE_MARK = re.compile(r"--\s*late finding:", re.I)
+LATE_MARK = re.compile(r"--\s*late finding:", re.IGNORECASE)
 
 
 def record_artifact_hash(path):
@@ -2312,7 +2312,7 @@ def record_artifact_hash(path):
     try:
         digest = hashlib.sha256(f.read_bytes()).hexdigest()
         with open(f.parent / HASH_LEDGER, "a") as fh:
-            fh.write("%s  %s\n" % (digest, f.name))
+            fh.write(f"{digest}  {f.name}\n")
     except OSError:
         pass
 
@@ -2463,8 +2463,8 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
             folded = _fold_punct(late_text or "")
             if not folded.strip() or not any(_fold_punct(a) in folded for a in anchors):
                 problems.append(("UNBACKED-LATE", text[:70],
-                                 "claims `-- late finding:` with no matching entry in "
-                                 "late_findings.txt -- write the record, appending to it"))
+                                 ("claims `-- late finding:` with no matching entry in "
+                                  "late_findings.txt -- write the record, appending to it")))
         elif cited and not any(_fold_punct(c).rsplit("/", 1)[-1] in backing for c in cited):
             problems.append(("UNBACKED-FINDING", text[:70],
                              "appears in no verdict, diagnostic or blind-spot line"))
@@ -2474,10 +2474,10 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
                              "threshold asks for the input that makes it fire"))
     for name in backdated_artifacts(answers_path):
         problems.append(("BACKDATED-ARTIFACT", name,
-                         "its bytes changed after it passed its own gate. A finding that "
-                         "arrived late is reported with `-- late finding:` and recorded in "
-                         "late_findings.txt; it is not written back into an artifact that "
-                         "had already gone green"))
+                         ("its bytes changed after it passed its own gate. A finding that "
+                          "arrived late is reported with `-- late finding:` and recorded in "
+                          "late_findings.txt; it is not written back into an artifact that "
+                          "had already gone green")))
     return findings, problems
 
 
@@ -2551,11 +2551,11 @@ if __name__ == "__main__":
         sys.exit(0)
     if mode == "aotpair":
         print(render_aot_pairing(aot_pairing(
-            open(sys.argv[2]).read(), tree_root(sys.argv[3]),
+            pathlib.Path(sys.argv[2]).read_text(), tree_root(sys.argv[3]),
             tree_root(sys.argv[4]) if len(sys.argv) > 4 else None)))
         sys.exit(0)
     if mode == "flydslbounds":
-        print(render_flydsl_bounds(flydsl_bounds(open(sys.argv[2]).read(),
+        print(render_flydsl_bounds(flydsl_bounds(pathlib.Path(sys.argv[2]).read_text(),
                                                  tree_root(sys.argv[3]))))
         sys.exit(0)
     if mode == "kerneltest":
