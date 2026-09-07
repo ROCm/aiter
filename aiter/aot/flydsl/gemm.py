@@ -46,9 +46,9 @@ import flydsl.expr as fx
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
     compile_only_env,
-    cu_num_to_arch,
     job_identity,
     override_env,
+    resolve_job_arch,
     run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
@@ -100,7 +100,6 @@ DEFAULT_CSVS = [
     AITER_CONFIGS.AITER_CONFIG_BF16_BATCHED_GEMM_FILE,
     AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE,
 ]
-GEMM_AOT_ARCH_DEFAULT = "gfx950"
 
 _PRESHUFFLE_RE = re.compile(
     r"^flydsl_bpreshuflle_"
@@ -649,11 +648,6 @@ def _compile_ptpc_wmma_to_cache(
             )
 
 
-def job_arch(cu_num: int = 0, gfx: str = "") -> str:
-    """Target arch a job would compile for -- shared by dispatch and ARCH filtering."""
-    return gfx or cu_num_to_arch(cu_num, default=GEMM_AOT_ARCH_DEFAULT)
-
-
 def compile_one_config(
     kernel_name: str,
     kind: str,
@@ -667,7 +661,7 @@ def compile_one_config(
     """Compile one GEMM kernel configuration and save it to cache."""
     from torch._subclasses.fake_tensor import FakeTensorMode
 
-    aot_arch = job_arch(cu_num, gfx)
+    aot_arch = resolve_job_arch(cu_num, gfx)
     shape_str = f"{kernel_name}  M={m} N={n} K={k}"
     result = {
         "kernel_name": kernel_name,
@@ -744,7 +738,9 @@ def main():
         arch_set = {a.strip() for a in re.split(r"[;,]", arch) if a.strip()}
         n_before = len(all_jobs)
         all_jobs = [
-            j for j in all_jobs if job_arch(j["cu_num"], j.get("gfx", "")) in arch_set
+            j
+            for j in all_jobs
+            if resolve_job_arch(j["cu_num"], j.get("gfx", "")) in arch_set
         ]
         print(f"[aiter] ARCH={arch}: {len(all_jobs)}/{n_before} jobs match")
 

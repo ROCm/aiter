@@ -1081,6 +1081,7 @@ def compile_one_config(
 
                         precompile = precompile_fhmoe_to_cache
                         kwargs["shared_expert_id"] = shared_expert_id
+                        kwargs["gfx"] = gfx
                     else:
                         precompile = _precompile_to_cache
                     precompile(
@@ -1138,7 +1139,7 @@ def main():
     print(f"  Stage2 jobs:    {len(stage2_jobs)}")
     print(f"  Epilogue jobs:  {len(epilogue_jobs)}")
     print(f"  Total jobs:     {len(all_jobs)}")
-    print("  Compile arch: (from cu_num)")
+    print("  Compile arch: (from gfx, else known cu_num mapping)")
     print(f"  Cache dir:    {cache_dir}")
     print(f"  Target arch:  {arch}")
     print("=" * 72)

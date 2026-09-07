@@ -36,16 +36,15 @@ import flydsl.expr as fx
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
     compile_only_env,
-    cu_num_to_arch,
     job_identity,
     override_env,
+    resolve_job_arch,
     run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.kernels.gdr_prefill import compile_chunk_gated_delta_h
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
-CHUNK_GDN_H_AOT_ARCH_DEFAULT = "gfx950"
 _KERNEL_NAME = "chunk_gdn_fwd_h_flydsl_opt"
 
 _TORCH_DTYPE = {
@@ -123,6 +122,7 @@ def parse_csv(csv_path: str) -> list[dict[str, Any]]:
                 H = int(row["H"])
                 Hg = int(row["Hg"])
                 cu_num = int(row.get("cu_num") or 0)
+                gfx = (row.get("gfx") or "").strip()
                 is_varlen = _parse_bool(row.get("is_varlen") or "True")
                 use_h0 = _parse_bool(row.get("use_h0") or "True")
                 store_fs = _parse_bool(row.get("store_fs") or "True")
@@ -148,6 +148,7 @@ def parse_csv(csv_path: str) -> list[dict[str, Any]]:
                     "kernel_name": _KERNEL_NAME,
                     "dtype": dtype,
                     "cu_num": cu_num,
+                    "gfx": gfx,
                     "K": K,
                     "V": V,
                     "BT": BT,
@@ -302,9 +303,9 @@ def _format_shape_str(job: dict) -> str:
     )
 
 
-def compile_one_config(*, cu_num: int = 0, **kwargs) -> dict:
+def compile_one_config(*, cu_num: int = 0, gfx: str = "", **kwargs) -> dict:
     """Compile one opt configuration and save it to cache."""
-    aot_arch = cu_num_to_arch(cu_num, default=CHUNK_GDN_H_AOT_ARCH_DEFAULT)
+    aot_arch = resolve_job_arch(cu_num, gfx)
     kwargs.pop("kernel_name", None)
     shape_str = _format_shape_str(kwargs)
     result = {
@@ -364,7 +365,7 @@ def main():
     for csv_path in csv_paths:
         print(f"  CSV:          {csv_path}")
     print(f"  Total jobs:   {len(jobs)}")
-    print("  Compile arch: (from cu_num)")
+    print("  Compile arch: (from gfx, else known cu_num mapping)")
     print(f"  Cache dir:    {cache_dir}")
     print(f"  Target arch:  {arch}")
     print("=" * 72)

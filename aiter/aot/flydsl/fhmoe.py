@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from aiter.aot.flydsl.common import cu_num_to_arch
+from aiter.aot.flydsl.common import resolve_job_arch
 
 
 def _shared_weight(device, n_in: int, k_in: int):
@@ -149,6 +149,7 @@ def precompile_fhmoe_to_cache(
     b_dtype: str = "fp4",
     act: str = "silu",
     cu_num: int = 0,
+    gfx: str = "",
     enable_bias: bool = False,
     **kwargs,
 ):
@@ -167,8 +168,11 @@ def precompile_fhmoe_to_cache(
         raise ValueError("FHMoE AOT does not support expert bias")
     if act != "silu":
         raise ValueError(f"FHMoE AOT supports only SiLU, got {act=}")
-    if cu_num_to_arch(cu_num) != "gfx950":
-        raise ValueError(f"FHMoE AOT supports only gfx950, got {cu_num=}")
+    aot_arch = resolve_job_arch(cu_num, gfx)
+    if aot_arch != "gfx950":
+        raise ValueError(
+            f"FHMoE AOT supports only gfx950, got gfx={gfx!r} cu_num={cu_num}"
+        )
 
     from aiter.aot.flydsl.moe import _precompile_to_cache
 

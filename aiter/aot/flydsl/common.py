@@ -54,9 +54,18 @@ _CU_NUM_TO_ARCH = {
 }
 
 
-def cu_num_to_arch(cu_num: int, default: str = "gfx950") -> str:
-    """Map compute-unit count to GPU architecture string."""
-    return _CU_NUM_TO_ARCH.get(cu_num, default)
+def cu_num_to_arch(cu_num: int) -> str:
+    """Map a known legacy compute-unit count to its historical architecture."""
+    try:
+        mapped = _CU_NUM_TO_ARCH.get(int(cu_num))
+    except (TypeError, ValueError):
+        mapped = None
+    if mapped is None:
+        raise ValueError(
+            f"cannot map cu_num={cu_num!r} to an architecture; known values are "
+            f"{sorted(_CU_NUM_TO_ARCH)}"
+        )
+    return mapped
 
 
 def resolve_job_arch(cu_num: int = 0, gfx: str = "") -> str:
@@ -70,17 +79,7 @@ def resolve_job_arch(cu_num: int = 0, gfx: str = "") -> str:
     gfx = (gfx or "").strip()
     if gfx:
         return gfx
-    try:
-        mapped = _CU_NUM_TO_ARCH.get(int(cu_num))
-    except (TypeError, ValueError):
-        mapped = None
-    if mapped is None:
-        raise ValueError(
-            "cannot resolve AOT architecture: "
-            f"gfx={gfx!r} cu_num={cu_num!r}; provide an explicit gfx, "
-            f"or a known legacy cu_num ({sorted(_CU_NUM_TO_ARCH)})"
-        )
-    return mapped
+    return cu_num_to_arch(cu_num)
 
 
 def job_identity(job: dict[str, Any]) -> tuple:

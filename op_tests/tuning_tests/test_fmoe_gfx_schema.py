@@ -73,11 +73,11 @@ class TestFlydslMoeAotGfx(unittest.TestCase):
         self.assertEqual(resolve_job_arch(304, ""), "gfx942")
 
     def test_unknown_or_missing_arch_raises(self):
-        with self.assertRaisesRegex(ValueError, "cannot resolve AOT architecture"):
+        with self.assertRaisesRegex(ValueError, "cannot map cu_num"):
             resolve_job_arch(0, "")
-        with self.assertRaisesRegex(ValueError, "cannot resolve AOT architecture"):
+        with self.assertRaisesRegex(ValueError, "cannot map cu_num"):
             resolve_job_arch(128, "")
-        with self.assertRaisesRegex(ValueError, "cannot resolve AOT architecture"):
+        with self.assertRaisesRegex(ValueError, "cannot map cu_num"):
             resolve_job_arch("not-a-cu", "")
 
 

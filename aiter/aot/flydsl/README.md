@@ -71,11 +71,12 @@ python -m aiter.aot.flydsl.chunk_gdn_h --csv /path/to/tuned.csv
 | `ARCH` / `GPU_ARCHS` | **Banner/logging only** — printed as the "Target arch" line. Does **not** control the compiled target. | auto-detect |
 
 > **About the compile target arch.** The arch each kernel is actually compiled
-> for is derived per-job from the CSV's `cu_num` column (`cu_num_to_arch(...)`)
-> and applied internally via `FLYDSL_GPU_ARCH`. That internal var is overwritten
-> for every job, so setting `ARCH` / `GPU_ARCHS` / `FLYDSL_GPU_ARCH` in your shell
-> does **not** change what gets built. To cross-compile, edit the `cu_num`
-> column in the CSV.
+> for comes from `resolve_job_arch(...)`: an explicit CSV `gfx` if present,
+> otherwise only the known historical `cu_num` mapping (80/304 → gfx942,
+> 256 → gfx950). Missing or unknown values fail rather than silently compiling
+> for gfx950. The chosen arch is applied internally via `FLYDSL_GPU_ARCH`.
+> Setting `ARCH` / `GPU_ARCHS` / `FLYDSL_GPU_ARCH` in your shell does **not**
+> change what gets built. To cross-compile, set the `gfx` column in the CSV.
 
 Example:
 
