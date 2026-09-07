@@ -235,7 +235,15 @@ class ValidatorFixture:
         cwd=None,
         axes=(),
         perf_control_column=None,
-        runner=None,
+        # The validator no longer classifies the target; the caller declares how to run it. This
+        # default matches the fixture target, and a test whose subject is a script target says so
+        # explicitly -- the same obligation a real caller now has.
+        runner="pytest",
+        # Likewise the validator no longer reads the target to see whether the grid duplicates
+        # its own defaults -- the caller declares what the cells cover. This default keeps that
+        # obligation met for every test whose subject is something else; the tests that ARE
+        # about independence pass grid_novelty=None to exercise the undeclared path.
+        grid_novelty="these cells are outside the fixture target's own defaults",
     ):
         report = self.root / f"{patch.stem}-report.json"
         # `cwd` exists for one reason: the validator has to accept RELATIVE --patch/--out from
@@ -268,6 +276,8 @@ class ValidatorFixture:
             if shape_env:
                 command.extend(["--shape-env", shape_env])
             command.extend(["--grid", grid_value])
+            if grid_novelty:
+                command.extend(["--grid-novelty", grid_novelty])
         if shape_arg:
             command.extend(["--shape-arg", shape_arg])
         if shape_argnames:
@@ -419,9 +429,7 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assert_complete_stage_objects(report)
 
     def test_no_gpu_withholds_correctness_from_a_target_that_needs_a_device(self):
-        patch = self.fixture.make_patch(
-            self.gpu_requiring_change, "needs-device.patch"
-        )
+        patch = self.fixture.make_patch(self.gpu_requiring_change, "needs-device.patch")
         no_gpu_picker = self.fixture.tools / "no-gpu-picker"
         write_executable(no_gpu_picker, "#!/usr/bin/env bash\nexit 1\n")
 
@@ -472,7 +480,7 @@ class ValidateKernelPrTests(unittest.TestCase):
     def test_new_failing_test_is_not_mislabeled_preexisting(self):
         def add_failing_test(repo):
             (repo / "tests" / "test_new.py").write_text(
-                "def test_new():\n" "    assert False, 'candidate failure'\n"
+                "def test_new():\n    assert False, 'candidate failure'\n"
             )
 
         patch = self.fixture.make_patch(add_failing_test, "new-test.patch")
@@ -505,6 +513,7 @@ class ValidateKernelPrTests(unittest.TestCase):
         result, report = self.fixture.validate(
             patch,
             tests="tests/verify_kernel.py",
+            runner="script",
             grid=False,
         )
 
@@ -541,6 +550,7 @@ class ValidateKernelPrTests(unittest.TestCase):
         result, report = self.fixture.validate(
             patch,
             tests="tests/verify_kernel.py",
+            runner="script",
             grid=False,
         )
 
@@ -552,7 +562,7 @@ class ValidateKernelPrTests(unittest.TestCase):
     def test_target_without_entry_point_is_skipped(self):
         def add_library_only_target(repo):
             (repo / "tests" / "kernel_helpers.py").write_text(
-                "def verify_kernel():\n" "    return True\n"
+                "def verify_kernel():\n    return True\n"
             )
 
         patch = self.fixture.make_patch(
@@ -563,6 +573,9 @@ class ValidateKernelPrTests(unittest.TestCase):
             patch,
             tests="tests/kernel_helpers.py",
             grid=False,
+            # Neither runner can execute a library-only file, so a caller reading it declares
+            # nothing -- and a target nobody can run is a skip, never a test failure.
+            runner=None,
         )
 
         self.assertEqual(2, result.returncode)
@@ -787,10 +800,11 @@ class ValidateKernelPrTests(unittest.TestCase):
 
         self.assertEqual("INCONCLUSIVE", report["verdict"])
         self.assertEqual("skip", report["stages"]["correctness_s1_grid"]["status"])
-        self.assertIn(
-            "not referenced",
-            report["stages"]["correctness_s1_grid"]["note"],
-        )
+        # The channel is no longer refuted by reading the file, but by running the target with
+        # a deliberately invalid grid and watching it not care.
+        note = report["stages"]["correctness_s1_grid"]["note"]
+        self.assertIn("was not consumed", note)
+        self.assertIn("no shape reached the kernel", note)
 
     def test_grid_pass_requires_runtime_shape_handshake(self):
         def ignore_grid_value(repo):
@@ -978,6 +992,7 @@ class ValidateKernelPrTests(unittest.TestCase):
         _, report = self.fixture.validate(
             patch,
             tests="tests/verify_kernel.py",
+            runner="script",
             shape_env=None,
             shape_arg="--shapes",
         )
@@ -987,20 +1002,25 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertEqual("skip", report["stages"]["correctness_s1_grid"]["status"])
         note = report["stages"]["correctness_s1_grid"]["note"]
         self.assertNotIn("no configured shape override", note)
-        self.assertIn("is not passed to add_argument", note)
-        self.assertIn("tests/verify_kernel.py", note)
-        self.assertIn("--shapes", note)
+        # The skip names the channel and what was observed, and it does NOT say the target
+        # ignores it: a caller who named a flag that does not exist gets the same runtime
+        # evidence, and blaming the target for that publishes the caller's mistake as a
+        # property of someone's code.
+        self.assertIn("was not consumed", note)
+        self.assertIn("cli", note)
+        self.assertNotIn("target ignores", note)
+        # This target is ADDED by the patch, so on base it does not exist. The old static
+        # probe read a missing file and called the result "hook-not-found", stating something
+        # about a flag in a file it never opened; the base side now says which it was.
         self.assertEqual(
-            "hook-not-found",
+            "target-not-present",
             report["stages"]["baseline_control"]["s1_grid"]["state"],
         )
-        # `grid_channel` names the channel that actually CARRIED the grid, so a hook
-        # that was requested and not found leaves it empty; the reason field is where
-        # the request survives, and it distinguishes a validator limit from a target
-        # property.
-        self.assertEqual("", report["test_selection"]["grid_channel"])
-        self.assertIn(
-            "--shapes", report["test_selection"]["grid_channel_reason"]
+        # `grid_channel` records the channel the caller declared, and the run is what refutes
+        # it. Erasing the declaration before the run lost the request itself.
+        self.assertEqual("cli", report["test_selection"]["grid_channel"])
+        self.assertEqual(
+            "declared-by-caller", report["test_selection"]["grid_channel_basis"]
         )
 
     def bench_body(self, scale, trailer=""):
@@ -1416,6 +1436,9 @@ class ValidateKernelPrTests(unittest.TestCase):
         return self.fixture.make_patch(mutate, name)
 
     def _validate_axis_target(self, patch, **kwargs):
+        # This target takes its shapes on its own CLI flag and runs from __main__: a script, and
+        # the caller is the one who has to say so now.
+        kwargs.setdefault("runner", "script")
         return self.fixture.validate(
             patch,
             tests=self.AXIS_TARGET_PATH,
@@ -1426,60 +1449,80 @@ class ValidateKernelPrTests(unittest.TestCase):
             **kwargs,
         )
 
-    def test_a_grid_that_duplicates_the_targets_own_defaults_is_not_a_control(self):
+    def test_an_undeclared_grid_is_not_credited_as_a_control(self):
         # SKILL.md calls the S1 grid "a positive control against reporting the same default
         # test run twice under different stage names". On aiter#4538 all three requested
         # shapes were already in the target's own --shapes default list, so the stage
         # reported `pass` for re-running a strict subset of correctness_repo_tests, and the
-        # verdict was PASS. A duplicate grid proves nothing the repository run did not
-        # already prove, so it cannot be credited.
-        patch = self._axis_patch("grid-duplicate.patch")
-        result, report = self._validate_axis_target(patch, grid_value="7,257,f32")
+        # verdict was PASS.
+        #
+        # The validator no longer reads --shapes to catch that, so it cannot tell a duplicate
+        # grid from a novel one -- which is exactly why silence cannot be credited. A caller
+        # who has not said what their cells cover gets the same answer aiter#4538's duplicate
+        # would have got.
+        patch = self._axis_patch("grid-undeclared.patch")
+        result, report = self._validate_axis_target(
+            patch, grid_value="9,1023,f32", grid_novelty=None
+        )
 
         selection = report["test_selection"]
-        self.assertEqual("duplicates-target-defaults", selection["grid_independence"])
-        self.assertIn("--shapes", selection["grid_independence_reason"])
+        self.assertEqual("unknown", selection["grid_independence"])
+        self.assertEqual("undeclared", selection["grid_independence_basis"])
+        self.assertIn("--grid-novelty", selection["grid_independence_reason"])
         grid_stage = report["stages"]["correctness_s1_grid"]
-        self.assertEqual("skip", grid_stage["status"])
+        # The run itself was green. It is the missing claim, not a failure, that costs it.
         self.assertEqual(0, grid_stage["exit"])
+        self.assertEqual("skip", grid_stage["status"])
         self.assertEqual("INCONCLUSIVE", report["verdict"])
         self.assertEqual(2, result.returncode)
 
-    def test_a_duplicate_grid_rescued_by_an_axis_says_so_in_one_place(self):
-        # A duplicate shape grid is rescued when a PROVEN axis asks for values the target
-        # does not run by default -- the configuration reaching the kernel is genuinely new.
-        # But test_selection carries the same two fields and is written before the axes are
-        # proven, so it kept the pre-override answer and the report contradicted itself:
-        # test_selection said "duplicates-target-defaults" while the stage said
-        # "adds-coverage". Observed on ROCm/aiter#5081. One question, one answer.
-        patch = self._axis_patch("duplicate-rescued.patch")
+    def test_a_declared_grid_is_recorded_as_a_declaration_in_one_place(self):
+        # The caller's sentence is published verbatim, marked as their claim rather than a
+        # measurement, and written to ONE place. test_selection and the stage used to be
+        # filled in at different moments and could disagree -- test_selection saying
+        # "duplicates-target-defaults" beside a stage saying "adds-coverage", observed on
+        # ROCm/aiter#5081. One question, one answer.
+        patch = self._axis_patch("grid-declared.patch")
         _, report = self._validate_axis_target(
             patch,
-            grid_value="7,257,f32",
-            axes=("num_heads=--num-heads:32;64",),
+            grid_value="9,1023,f32",
+            grid_novelty="9,1023 is outside the target's own --shapes default of 7,257",
         )
 
-        stage = report["stages"]["correctness_s1_grid"]
         selection = report["test_selection"]
-        self.assertEqual("proven", selection["axis_state"])
-        self.assertEqual("adds-coverage", stage["independence"])
+        stage = report["stages"]["correctness_s1_grid"]
+        self.assertEqual("adds-coverage", selection["grid_independence"])
+        self.assertEqual("declared-by-caller", selection["grid_independence_basis"])
         self.assertEqual(
-            stage["independence"], selection["grid_independence"]
+            "9,1023 is outside the target's own --shapes default of 7,257",
+            selection["grid_independence_reason"],
         )
+        self.assertEqual(stage["independence"], selection["grid_independence"])
         self.assertEqual(
             stage["independence_reason"], selection["grid_independence_reason"]
         )
         self.assertEqual("pass", stage["status"])
 
-    def test_a_grid_outside_the_targets_defaults_still_counts_as_coverage(self):
-        # The control case for the test above: the fix must not turn every grid into a skip.
-        patch = self._axis_patch("grid-novel.patch")
-        _, report = self._validate_axis_target(patch, grid_value="9,1023,f32")
-
-        self.assertEqual(
-            "adds-coverage", report["test_selection"]["grid_independence"]
+    def test_a_red_grid_stays_red_even_when_nobody_declared_what_it_covers(self):
+        # The downgrade is a refusal to CREDIT, not a way to make a failure disappear. A grid
+        # that fails is reporting a defect whatever the caller did or did not say about it.
+        # The target runs its defaults fine and dies on the shape only the grid asks for --
+        # after calling the route, so the failure is the kernel's, not a delivery problem.
+        red = self.AXIS_TARGET.replace(
+            "            run_kernel(M, N, dtype_str, num_heads)\n",
+            "            run_kernel(M, N, dtype_str, num_heads)\n"
+            "            if N == 1023:\n"
+            "                raise SystemExit('kernel is wrong at N=1023')\n",
         )
-        self.assertEqual("pass", report["stages"]["correctness_s1_grid"]["status"])
+        patch = self._axis_patch("grid-red-undeclared.patch", body=red)
+        _, report = self._validate_axis_target(
+            patch, grid_value="9,1023,f32", grid_novelty=None
+        )
+
+        stage = report["stages"]["correctness_s1_grid"]
+        self.assertEqual("unknown", report["test_selection"]["grid_independence"])
+        self.assertEqual("fail", stage["status"])
+        self.assertNotEqual(0, stage["exit"])
 
     def test_each_head_run_keeps_its_own_execution_receipt(self):
         # head-repo and head-grid both ran inside the head phase and shared one receipt
@@ -1503,7 +1546,9 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertIn("7,257,f32", repo_shapes)
         self.assertNotIn("9,1023,f32", repo_shapes)
         self.assertEqual({"9,1023,f32"}, grid_shapes)
-        self.assertIn("head-grid", report["stages"]["execution_receipt"]["receipt_scope"])
+        self.assertIn(
+            "head-grid", report["stages"]["execution_receipt"]["receipt_scope"]
+        )
 
     def test_an_extra_axis_reaches_a_configuration_the_shape_grid_cannot_express(self):
         # The shape channel is one ordered tuple bound to --shape-vars, so on aiter#4538 it
@@ -1521,9 +1566,10 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertEqual("proven", selection["axis_state"])
         axis = selection["axes"][0]
         self.assertEqual("num_heads", axis["name"])
-        self.assertEqual("flag-declared-in-add_argument", axis["hook_proof"])
+        # The probe's own verdict, not a reading of the source: this flag was fed an
+        # invalid value and refused it.
+        self.assertEqual("refused-invalid-value", axis["hook_proof"])
         self.assertEqual(["16", "32"], axis["values"])
-        self.assertEqual("adds-coverage", axis["independence"])
         # The configuration the grid alone could never request now fails, loudly, and is
         # attributed to the PR that adds the target.
         self.assertEqual("fail", report["stages"]["correctness_s1_grid"]["status"])
@@ -1562,6 +1608,10 @@ class ValidateKernelPrTests(unittest.TestCase):
         selection = report["test_selection"]
         self.assertEqual("hook-not-consumed", selection["axis_state"])
         self.assertIn("--num-heads", selection["axis_state_reason"])
+        # And the axis itself carries the probe's verdict. The source declares --num-heads
+        # perfectly well, so a structural reading called this axis proven; only the refusal
+        # probe can tell that the value never reached the kernel.
+        self.assertEqual("accepted-invalid-value", selection["axes"][0]["hook_proof"])
         self.assertTrue(
             any(
                 "requested test axes were dropped" in item["detail"]
@@ -1569,6 +1619,26 @@ class ValidateKernelPrTests(unittest.TestCase):
             ),
             report["findings"],
         )
+
+    def test_an_axis_spelled_wrong_is_refused_rather_than_guessed_at(self):
+        # --axis takes name=--flag:v1;v2. A spec missing any of the three used to be folded
+        # in with the flags the source did not declare and reported as a fact about the
+        # TARGET; it is the caller's own argument that is wrong, and the values must not be
+        # half-guessed onto the run's argv either way.
+        patch = self._axis_patch("axis-malformed.patch")
+        _, report = self._validate_axis_target(
+            patch,
+            grid_value="9,1023,f32",
+            axes=("num_heads=--num-heads",),
+        )
+
+        selection = report["test_selection"]
+        self.assertEqual("malformed-spec", selection["axis_state"])
+        self.assertIn("num_heads", selection["axis_state_reason"])
+        self.assertEqual("malformed-axis-spec", selection["axes"][0]["hook_proof"])
+        # The request survives in the report; what does not happen is a run pretending to
+        # cover an axis it never delivered.
+        self.assertEqual([], selection["axes"][0]["values"])
 
     def test_a_script_that_returns_without_working_earns_no_architecture_credit(self):
         # aiter#4538's target returns with exit 0 and a log line when the arch is
@@ -1598,6 +1668,7 @@ class ValidateKernelPrTests(unittest.TestCase):
             shape_env=None,
             shape_arg="--shapes",
             perf=False,
+            runner="script",
             grid=False,
         )
 
@@ -1674,9 +1745,7 @@ class ValidateKernelPrTests(unittest.TestCase):
         # while the reference column sits at exactly 1.0. median_ratio is the WORST column
         # by design, so the improvement is read off the kernel column itself.
         kernel_column = next(
-            stats
-            for name, stats in perf["columns"].items()
-            if "kernel" in name.lower()
+            stats for name, stats in perf["columns"].items() if "kernel" in name.lower()
         )
         self.assertGreater(kernel_column["median_ratio"], 1.5)
         self.assertGreaterEqual(perf["median_ratio"], 0.95)
@@ -1861,9 +1930,11 @@ class ValidateKernelPrTests(unittest.TestCase):
         )
 
         selection = report["test_selection"]
-        # "Defines a test* function" is not the same as "pytest can collect it".
+        # "Defines a test* function" is not the same as "pytest can collect it" -- that
+        # judgement now lives in SKILL.md and arrives as a declaration, which the report marks
+        # as one so a reader can weigh it.
         self.assertEqual("script", selection["runner"])
-        self.assertIn("pytest cannot collect them", selection["runner_reason"])
+        self.assertEqual("declared-by-caller", selection["runner_basis"])
         # And because it is a script, the shape grid and the axis both reach it.
         self.assertEqual("cli", selection["grid_channel"])
         self.assertEqual("proven", selection["axis_state"])
@@ -1920,7 +1991,10 @@ class ValidateKernelPrTests(unittest.TestCase):
             report["stages"]["correctness_repo_tests"]["stats"]["observed_work"], 0
         )
 
-    def test_the_caller_can_force_a_runner_the_classifier_got_wrong(self):
+    def test_a_declared_runner_is_recorded_as_a_declaration(self):
+        # The validator does not classify the target any more, so the runner in the report is
+        # the caller's claim. A reader who cannot tell a claim from a measurement cannot weigh
+        # a runner-caused failure, and that failure lands on the PR author.
         patch = self._axis_patch(
             "forced-runner.patch", body=self.UNCOLLECTABLE_WORKER_TARGET
         )
@@ -1937,14 +2011,96 @@ class ValidateKernelPrTests(unittest.TestCase):
 
         selection = report["test_selection"]
         self.assertEqual("pytest", selection["runner"])
-        self.assertIn("caller forced --runner pytest", selection["runner_reason"])
-        self.assertIn("structural selection said script", selection["runner_reason"])
+        self.assertEqual("declared-by-caller", selection["runner_basis"])
+
+    def test_a_channel_that_does_not_exist_is_not_charged_to_the_target(self):
+        # The channel is the caller's declaration and is no longer checked against the file. A
+        # flag the target does not define makes argparse exit non-zero, which from the exit
+        # code alone is indistinguishable from a red kernel -- and publishing it as one bills
+        # the caller's typo to the PR author.
+        #
+        # The run separates them without reading the source: this same target passed its
+        # repository run moments earlier, so it imports and executes. If the grid run then does
+        # no work at all, the delivery is what broke.
+        patch = self._axis_patch("bogus-channel.patch")
+        _, report = self.fixture.validate(
+            patch,
+            tests=self.AXIS_TARGET_PATH,
+            expected_route="axis_kernel:run_kernel",
+            shape_env=None,
+            shape_arg="--no-such-shape-flag",
+            grid_value="9,1023,f32",
+            perf=False,
+            runner="script",
+        )
+
+        grid = report["stages"]["correctness_s1_grid"]
+        # A red grid stays red -- the run did fail, and hiding that would be its own lie.
+        self.assertEqual("fail", grid["status"])
+        # But the note refuses to pick between the two things this looks like, because the
+        # evidence does not distinguish them.
+        self.assertIn("never seen failing on these shapes", grid["note"])
+        # Both explanations must be named. Asserting only that the note mentions a missing
+        # channel would still pass if the note went on to declare that the single cause --
+        # which is the judgement the evidence cannot support.
+        self.assertIn("channel this target does not have", grid["note"])
+        self.assertIn("crashes before the route", grid["note"])
+        self.assertIn("both look exactly like this", grid["note"])
+        # And nothing is charged to the author: the kernel was never observed running.
+        self.assertFalse(
+            any(item["severity"] == "blocker" for item in report["findings"]),
+            report["findings"],
+        )
+        self.assertTrue(
+            any(
+                "without reaching the routed work" in item["detail"]
+                for item in report["findings"]
+            ),
+            report["findings"],
+        )
+        # And the repository run, which did do work, keeps its own result.
+        self.assertEqual("pass", report["stages"]["correctness_repo_tests"]["status"])
+
+    def test_an_undeclared_runner_runs_nothing_rather_than_guessing(self):
+        # The guess is what this replaced: classifying an op_tests script as pytest published
+        # a collection error as "the PR's own test fails on head" (ROCm/aiter#5081). Refusing
+        # is inconclusive, which is the honest word for it.
+        patch = self._axis_patch(
+            "undeclared-runner.patch", body=self.UNCOLLECTABLE_WORKER_TARGET
+        )
+        result, report = self.fixture.validate(
+            patch,
+            tests=self.AXIS_TARGET_PATH,
+            expected_route="axis_kernel:run_kernel",
+            shape_env=None,
+            shape_arg="--shapes",
+            perf=False,
+            grid=False,
+            runner=None,
+        )
+
+        selection = report["test_selection"]
+        self.assertEqual("none", selection["runner"])
+        self.assertEqual("undeclared", selection["runner_basis"])
+        self.assertIn("no --runner was declared", selection["runner_reason"])
+        self.assertEqual("INCONCLUSIVE", report["verdict"])
+        self.assertEqual(2, result.returncode)
+        # Refusing to run is not the same as finding a defect, and must never be charged to
+        # the author as one.
+        self.assertFalse(
+            any(item["severity"] == "blocker" for item in report["findings"]),
+            report["findings"],
+        )
 
     def test_a_runner_that_cannot_run_the_target_is_named_as_such(self):
-        # "Red on both sides" is an attribution, not an explanation. When the target carries
-        # a structural reason the SELECTED runner cannot run it, a reader who is not told so
-        # concludes the code is broken when the runner choice is.
-        patch = self._axis_patch("argv-at-import.patch", body=self.ARGV_AT_IMPORT_TARGET)
+        # "Red on both sides" is an attribution, not an explanation. This target parses argv in
+        # its module body, so pytest dies at collection while the same file is green as a
+        # script (ROCm/aiter#5172). The validator no longer detects that shape -- it now says
+        # so whenever NOTHING executed, which covers this case and every other one where the
+        # runner, not the code, is the candidate cause.
+        patch = self._axis_patch(
+            "argv-at-import.patch", body=self.ARGV_AT_IMPORT_TARGET
+        )
         _, report = self.fixture.validate(
             patch,
             tests=self.AXIS_TARGET_PATH,
@@ -1954,14 +2110,14 @@ class ValidateKernelPrTests(unittest.TestCase):
             grid_value="9,1023,f32",
             axes=("num_heads=--num-heads:16;32",),
             perf=False,
+            runner="pytest",
         )
 
         selection = report["test_selection"]
         self.assertEqual("pytest", selection["runner"])
-        self.assertIn("parses argv in its module body", selection["runner_risk"])
         self.assertTrue(
             any(
-                "under the selected pytest runner" in item["detail"]
+                "the runner selection is a candidate cause" in item["detail"]
                 for item in report["findings"]
             ),
             report["findings"],
@@ -1974,21 +2130,18 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertEqual(1, len(selection["axes"]))
         self.assertEqual("num_heads", selection["axes"][0]["name"])
         self.assertEqual(["16", "32"], selection["axes"][0]["values"])
+        # The refusal probe never ran for this target, and nothing else may stand in for it.
         self.assertEqual("not-evaluated", selection["axes"][0]["hook_proof"])
 
         # And the grid-independence reason must describe THIS run. The old default claimed
         # "the channel exposes no declared defaults to compare against" whenever the
         # comparison did not happen - a statement about the target that this run never
-        # established, and false here: the target declares a default for --shapes.
-        self.assertEqual("unknown", selection["grid_independence"])
-        self.assertNotIn(
-            "no declared defaults", selection["grid_independence_reason"]
-        )
-        # The channel this run established, named -- rather than a claim about the target.
-        self.assertIn(
-            "independence is only computed for the CLI-flag channel",
-            selection["grid_independence_reason"],
-        )
+        # established, and false here: the target declares a default for --shapes. Now the
+        # reason is either the caller's own sentence or the absence of one, and the basis
+        # says which, so a reader is never handed a finding about the target on the
+        # validator's authority.
+        self.assertEqual("declared-by-caller", selection["grid_independence_basis"])
+        self.assertNotIn("no declared defaults", selection["grid_independence_reason"])
 
     def test_a_killed_run_leaves_no_stale_verdict_at_the_output_path(self):
         # The process exit code used to be read back out of `--out` AFTER finish_report, so
@@ -2082,6 +2235,8 @@ class ValidateKernelPrTests(unittest.TestCase):
             str(patch),
             "--target",
             self.AXIS_TARGET_PATH,
+            "--runner",
+            "script",
             "--expected-route",
             "axis_kernel:run_kernel",
             "--shape-vars",
@@ -2101,7 +2256,11 @@ class ValidateKernelPrTests(unittest.TestCase):
         log = Path(report["stages"]["correctness_repo_tests"]["log"]).read_text()
         for canary in ("leakcanary-token", "leakcanary-key", "leakcanary-unrelated"):
             self.assertNotIn(canary, log)
-        for name in ("VALIDATOR_TEST_GITHUB_TOKEN", "MY_API_KEY", "UNRELATED_HOME_DECOR"):
+        for name in (
+            "VALIDATOR_TEST_GITHUB_TOKEN",
+            "MY_API_KEY",
+            "UNRELATED_HOME_DECOR",
+        ):
             self.assertNotIn(name, log)
         # The policy is a reported fact, not an implicit one.
         policy = report["isolation"]["target_environment"]
@@ -2128,16 +2287,28 @@ class ValidateKernelPrTests(unittest.TestCase):
         head_log = self.fixture.root / "rowkey-head.log"
         base_log.write_text(
             table.format(
-                a=10.0, b=20.0, c=40.0,
-                r1=1.11e-5, r2=2.22e-5, r3=3.33e-5,
-                s1=1.0101, s2=1.0202, s3=1.0303,
+                a=10.0,
+                b=20.0,
+                c=40.0,
+                r1=1.11e-5,
+                r2=2.22e-5,
+                r3=3.33e-5,
+                s1=1.0101,
+                s2=1.0202,
+                s3=1.0303,
             )
         )
         head_log.write_text(
             table.format(
-                a=5.0, b=10.0, c=20.0,
-                r1=1.19e-5, r2=2.28e-5, r3=3.37e-5,
-                s1=2.0404, s2=2.0505, s3=2.0606,
+                a=5.0,
+                b=10.0,
+                c=20.0,
+                r1=1.19e-5,
+                r2=2.28e-5,
+                r3=3.37e-5,
+                s1=2.0404,
+                s2=2.0505,
+                s3=2.0606,
             )
         )
 
@@ -2446,6 +2617,7 @@ class GridChannelTests(unittest.TestCase):
         _, report = self.fixture.validate(
             patch,
             tests="tests/run_shapes.py",
+            runner="script",
             expected_route="__main__:run_kernel",
             shape_env="UNREAD_GRID_ENV",
             shape_arg="--shape",
@@ -2458,9 +2630,7 @@ class GridChannelTests(unittest.TestCase):
 
         self.assertEqual("cli", report["test_selection"]["grid_channel"])
         self.assertEqual("", report["test_selection"]["grid_channel_reason"])
-        self.assertEqual(
-            "adds-coverage", report["test_selection"]["grid_independence"]
-        )
+        self.assertEqual("adds-coverage", report["test_selection"]["grid_independence"])
         grid_stage = report["stages"]["correctness_s1_grid"]
         self.assertNotEqual("skip", grid_stage["status"])
         self.assertEqual("pass", grid_stage["status"])
@@ -2521,12 +2691,20 @@ class GridChannelTests(unittest.TestCase):
             shape_arg="--shape",
         )
 
-        self.assertEqual("", report["test_selection"]["grid_channel"])
-        reason = report["test_selection"]["grid_channel_reason"]
-        self.assertIn("a validator limit, not a target property", reason)
-        self.assertIn("--shape", reason)
-        self.assertIn("does not read $UNREAD_GRID_ENV", reason)
+        selection = report["test_selection"]
+        # The caller named an env var this target does not read. That claim is now recorded AS
+        # a claim and refuted by the run, rather than silently erased before the run --
+        # a reader can see both what was asked for and what happened to it.
+        self.assertEqual("env", selection["grid_channel"])
+        self.assertEqual("declared-by-caller", selection["grid_channel_basis"])
         self.assertEqual("skip", report["stages"]["correctness_s1_grid"]["status"])
+        note = report["stages"]["correctness_s1_grid"]["note"]
+        self.assertIn("was not consumed", note)
+        # And the blame still lands nowhere: not on the kernel, which is not broken.
+        self.assertFalse(
+            any(item["severity"] == "blocker" for item in report["findings"]),
+            report["findings"],
+        )
 
 
 class ExecutionReceiptTests(unittest.TestCase):
@@ -2761,7 +2939,9 @@ class EvidenceCheckerTests(unittest.TestCase):
         self.assertEqual(["3,5"], result["executed_shapes"])
         self.assertIn("different vocabularies", result["shape_namespace"])
 
-    def test_a_channel_that_shares_the_receipt_namespace_still_must_contain_the_grid(self):
+    def test_a_channel_that_shares_the_receipt_namespace_still_must_contain_the_grid(
+        self,
+    ):
         """The control for the test above: without the pytest channel, nothing is relaxed.
 
         The env and CLI channels put the grid into the same vocabulary the receipt records,
@@ -3195,7 +3375,9 @@ class ShapeGridPluginTests(unittest.TestCase):
             target.write_text(target_source)
             return subprocess.run(
                 [sys.executable, "-m", "pytest", "-p", "sgp", str(target), "-q"],
-                cwd=root, capture_output=True, text=True,
+                cwd=root,
+                capture_output=True,
+                text=True,
             )
 
     def test_dict_valued_parametrize_is_refused_rather_than_poisoned(self):
@@ -3226,12 +3408,17 @@ class ShapeGridPluginTests(unittest.TestCase):
             result = subprocess.run(
                 [
                     str(VALIDATOR),
-                    "--repo", str(fixture.repo),
-                    "--target", "tests/test_sample.py",
-                    "--shape-argnames", "m",
-                    "--grid", "255,3;512,4",
+                    "--repo",
+                    str(fixture.repo),
+                    "--target",
+                    "tests/test_sample.py",
+                    "--shape-argnames",
+                    "m",
+                    "--grid",
+                    "255,3;512,4",
                 ],
-                capture_output=True, text=True,
+                capture_output=True,
+                text=True,
             )
         finally:
             fixture.close()
@@ -3251,6 +3438,111 @@ class ShapeGridPluginTests(unittest.TestCase):
         )
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         self.assertIn("3 passed", result.stdout)
+
+
+class SkillProseContractTests(unittest.TestCase):
+    """SKILL.md is the prose a model acts on, so a stale sentence is a live defect.
+
+    The refactor that deleted the source-reading checks left three kinds of drift behind at
+    once: the schema still admitted a verdict nothing writes, the prose still named a state
+    the code no longer reached, and the invocation example had gone missing entirely while
+    every flag it used stayed real. None of that could fail a run, which is exactly why it
+    needs a test -- a wrong SKILL.md misleads silently and forever.
+    """
+
+    def setUp(self):
+        self.skill = (SKILL_DIR / "SKILL.md").read_text()
+        self.script = VALIDATOR.read_text()
+        self.schema = json.loads((SKILL_DIR / "report_schema.json").read_text())
+
+    # The fields that separate a caller's claim from a measurement. These are the ones a
+    # reader has to be able to look up, and the ones the refactor churned.
+    DECLARATION_FIELDS = (
+        "grid_independence",
+        "grid_independence_basis",
+        "grid_channel_basis",
+        "axis_state",
+        "runner_basis",
+    )
+
+    def declaration_fields(self):
+        properties = self.schema["properties"]["test_selection"]["properties"]
+        return {name: properties[name] for name in self.DECLARATION_FIELDS}
+
+    def test_every_value_the_schema_admits_is_one_the_code_can_write(self):
+        # A schema that allows a value nothing produces is a promise to a reader that some
+        # run, somewhere, might report it. `duplicates-target-defaults` outlived the AST
+        # check that derived it and sat here for a full refactor saying the validator still
+        # compared a grid against the target's defaults, which it no longer does.
+        for field, spec in self.declaration_fields().items():
+            for value in spec.get("enum", []):
+                if not value:
+                    continue
+                with self.subTest(field=field, value=value):
+                    self.assertIn(
+                        value, self.script, f"{field}: {value} is unreachable"
+                    )
+
+    def test_every_value_the_schema_admits_is_one_the_prose_explains(self):
+        # Backticked, not merely present: `declared` occurs inside `declared-by-caller`, so a
+        # bare substring check would let the axis_state row vanish and still pass on a
+        # sentence about a different field entirely.
+        for field, spec in self.declaration_fields().items():
+            for value in spec.get("enum", []):
+                if not value:
+                    continue
+                with self.subTest(field=field, value=value):
+                    self.assertIn(
+                        f"`{value}`", self.skill, f"{field}: {value} is undocumented"
+                    )
+
+    def test_the_skill_still_shows_how_to_invoke_the_validator(self):
+        # It briefly did not. The prose described the boundary, the stages and every field
+        # of the report, and never once showed the command -- a skill that explains what a
+        # run means but not how to start one.
+        self.assertIn("validate_pr.sh \\", self.skill)
+
+    def accepted_flags(self):
+        parser = re.search(r'\n  case "\$1" in\n(.*?)\n  esac', self.script, re.DOTALL)
+        self.assertIsNotNone(parser)
+        return set(re.findall(r"--[a-z][a-z-]*", parser.group(1)))
+
+    def test_every_flag_the_script_accepts_is_documented(self):
+        # The direction that actually caught the missing flag table. Checking only that the
+        # documented flags exist passes trivially when the documentation is empty.
+        #
+        # Whole-token, not substring: `--grid` occurs inside `--grid-novelty`, so a plain
+        # `in` check would let the `--grid` row vanish and pass on a sentence about a
+        # different flag. The same trap as `declared` inside `declared-by-caller`.
+        for flag in sorted(self.accepted_flags()):
+            with self.subTest(flag=flag):
+                self.assertRegex(
+                    self.skill,
+                    re.escape(flag) + r"(?![a-z-])",
+                    f"{flag} is accepted but undocumented",
+                )
+
+    def test_every_host_setting_is_in_the_host_table(self):
+        # A setting read from the environment and named nowhere is unreachable in practice:
+        # nobody sets a variable they have not been told about. PERF_CONTROL_TOL spent the
+        # refactor explained in the perf prose but absent from the table a caller reads.
+        settings = set(re.findall(r'\n([A-Z_]+)="\$\{([A-Z_]+):-', self.script))
+        table = re.search(r"\n## Host settings\n(.*?)\n---", self.skill, re.DOTALL)
+        self.assertIsNotNone(table)
+        documented = set(re.findall(r"^\| `([A-Z_]+)`", table.group(1), re.MULTILINE))
+        for _, name in sorted(settings):
+            with self.subTest(setting=name):
+                self.assertIn(name, documented, f"{name} is read but not in the table")
+
+    def test_every_flag_the_prose_shows_is_one_the_script_accepts(self):
+        accepted = self.accepted_flags()
+        # Only the flags shown in the skill's own invocation block, so an example the model
+        # copies cannot name a flag that exits 2.
+        block = re.search(r"validate_pr\.sh \\\n(.*?)\n```", self.skill, re.DOTALL)
+        self.assertIsNotNone(block)
+        for flag in sorted(set(re.findall(r"--[a-z][a-z-]*", block.group(1)))):
+            with self.subTest(flag=flag):
+                self.assertIn(flag, accepted)
 
 
 class ReviewSkillContractTests(unittest.TestCase):
@@ -3296,20 +3588,20 @@ class ReviewSkillContractTests(unittest.TestCase):
         point" for a target the validator happily timed.
         """
         review_skill = (SKILL_DIR.parent / "review-pr" / "SKILL.md").read_text()
-        validator = VALIDATOR.read_text()
+        validator = (SKILL_DIR / "scrape_perf.py").read_text()
 
         review_body = re.search(
             r"def perf_command\(path\):(.*?)\n\n", review_skill, re.DOTALL
         )
         validator_body = re.search(
-            r"perf_detect\(\).*?<<'PY'\n(.*?)\nPY", validator, re.DOTALL
+            r"def detect_harness\(text\):(.*?)\n    return None", validator, re.DOTALL
         )
         self.assertIsNotNone(review_body)
         self.assertIsNotNone(validator_body)
 
         for name, body in (
             ("review-pr", review_body.group(1)),
-            ("validate_pr.sh", validator_body.group(1)),
+            ("scrape_perf.py", validator_body.group(1)),
         ):
             self.assertIn('"--scenario" in text', body, name)
             self.assertIn('"bench" in text', body, name)
@@ -3318,6 +3610,753 @@ class ReviewSkillContractTests(unittest.TestCase):
             # only narrows coverage. It missed 12 of aiter's 123 op_tests/ targets, every
             # one of which does have a timing harness.
             self.assertNotIn('"run_perftest" in text', body, name)
+
+
+class ReportToolTests(unittest.TestCase):
+    """The verdict rule, exercised directly.
+
+    Reached only through a full validation run, each branch of this rule cost minutes to
+    observe, so most of them never were. These are the cases that decide whether a PASS means
+    anything.
+    """
+
+    def setUp(self):
+        sys.path.insert(0, str(SKILL_DIR))
+        self.addCleanup(sys.path.remove, str(SKILL_DIR))
+        import report
+
+        self.report = report
+        self.required = report.required_stages(REPORT_SCHEMA)
+
+    def complete_report(self):
+        return {
+            "runtime_identity": {"module_path": "/somewhere/aiter"},
+            "stages": {
+                name: {
+                    "status": report_module_status(self.report, name),
+                    "note": "recorded",
+                }
+                for name in self.required
+            },
+            "findings": [],
+        }
+
+    def test_required_stages_come_from_the_schema(self):
+        # The list existed in four copies and nothing compared them. This test is the
+        # comparison, so a stage added to the schema alone can no longer leave the verdict
+        # rule behind.
+        self.assertEqual(set(self.required), REQUIRED_STAGES)
+
+    def test_a_complete_run_passes(self):
+        self.assertEqual(
+            self.report.compute_verdict(self.complete_report(), self.required), "PASS"
+        )
+
+    def test_each_required_stage_can_withhold_a_pass(self):
+        # Asserting one stage would leave the other eight untested, which is how a term can
+        # be dropped from the rule without any test noticing.
+        for name in self.required:
+            with self.subTest(stage=name):
+                data = self.complete_report()
+                data["stages"][name] = {"status": "skip", "note": "did not run"}
+                self.assertEqual(
+                    self.report.compute_verdict(data, self.required), "INCONCLUSIVE"
+                )
+
+    def test_the_scan_passes_on_info_and_not_on_pass(self):
+        # index_width_scan is informational: it reports "info", and a "pass" there would mean
+        # some other stage had written it.
+        data = self.complete_report()
+        data["stages"]["index_width_scan"] = {"status": "pass", "note": "wrong status"}
+        self.assertEqual(
+            self.report.compute_verdict(data, self.required), "INCONCLUSIVE"
+        )
+
+    def test_a_missing_runtime_identity_withholds_a_pass(self):
+        data = self.complete_report()
+        data["runtime_identity"] = {}
+        self.assertEqual(
+            self.report.compute_verdict(data, self.required), "INCONCLUSIVE"
+        )
+
+    def test_findings_outrank_completeness(self):
+        for severity, expected in (("blocker", "BLOCK"), ("should-fix", "NEEDS_WORK")):
+            with self.subTest(severity=severity):
+                data = self.complete_report()
+                data["findings"].append(
+                    {"severity": severity, "stage": "correctness", "detail": "d"}
+                )
+                self.assertEqual(
+                    self.report.compute_verdict(data, self.required), expected
+                )
+
+    def test_a_blocker_outranks_a_should_fix(self):
+        data = self.complete_report()
+        data["findings"] = [
+            {"severity": "should-fix", "stage": "perf", "detail": "d"},
+            {"severity": "blocker", "stage": "correctness", "detail": "d"},
+        ]
+        self.assertEqual(self.report.compute_verdict(data, self.required), "BLOCK")
+
+    def test_an_absent_stage_is_recorded_as_a_skip(self):
+        # A stage that never ran and never appears reads exactly like one that passed.
+        data = {"stages": {}, "findings": []}
+        self.report.backfill_missing_stages(data, self.required)
+        self.assertEqual(set(data["stages"]), set(self.required))
+        for name in self.required:
+            self.assertEqual(data["stages"][name]["status"], "skip")
+        self.assertEqual(len(data["findings"]), len(self.required))
+
+    def test_exit_codes_follow_the_verdict(self):
+        self.assertEqual(self.report.exit_code_for("PASS"), 0)
+        self.assertEqual(self.report.exit_code_for("INCONCLUSIVE"), 2)
+        self.assertEqual(self.report.exit_code_for("BLOCK"), 1)
+        self.assertEqual(self.report.exit_code_for("NEEDS_WORK"), 1)
+
+    def test_a_schema_violation_is_detected(self):
+        # The producer never checked the schema, so this is the first thing standing between
+        # a malformed report and a consumer reading a field that is no longer written.
+        broken = {"label": "x", "stages": {}, "findings": []}
+        self.assertIsNotNone(self.report._schema_violation(broken, REPORT_SCHEMA))
+
+    def test_a_schema_violation_downgrades_a_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, out = root / "report.json", root / "out.json"
+            data = self.complete_report()
+            # Complete enough to earn PASS from the verdict rule, and nowhere near what the
+            # schema requires -- which is the combination the gate exists for.
+            source.write_text(json.dumps(data))
+            result = run(
+                [sys.executable, str(SKILL_DIR / "report.py"), "finish"]
+                + [str(source), str(out)],
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            published = json.loads(out.read_text())
+            self.assertEqual(published["verdict"], "INCONCLUSIVE")
+            self.assertEqual(published["process_exit_code"], 2)
+            self.assertEqual((root / "verdict").read_text().strip(), "INCONCLUSIVE")
+            self.assertTrue(
+                any(f["stage"] == "report" for f in published["findings"]),
+                published["findings"],
+            )
+
+
+class RuntimeCreditTests(unittest.TestCase):
+    """When a run may claim it exercised an architecture.
+
+    These three refusals lived inside a shell heredoc, where no test could reach them, and had
+    none. Each one exists because a run once took credit it had not earned.
+    """
+
+    def setUp(self):
+        sys.path.insert(0, str(SKILL_DIR))
+        self.addCleanup(sys.path.remove, str(SKILL_DIR))
+        import report
+
+        self.report = report
+
+    def stats(self, **overrides):
+        base = {"executed": 4, "failures": 0, "observed_work": 12, "basis": "receipt"}
+        base.update(overrides)
+        return base
+
+    def refusal(self, stats, runner="script", log_size=100):
+        return self.report.runtime_credit_refusal(stats, runner, log_size)
+
+    def test_work_earns_credit(self):
+        self.assertIsNone(self.refusal(self.stats()))
+        self.assertIsNone(self.refusal(self.stats(), runner="pytest", log_size=0))
+
+    def test_nothing_executed_earns_nothing(self):
+        self.assertIsNotNone(self.refusal(self.stats(executed=0), runner="pytest"))
+
+    def test_a_silent_script_earns_nothing(self):
+        # aiter#4538: the target returns exit 0 on an unsupported arch. An exit code is not
+        # evidence that work reached the device.
+        self.assertIsNotNone(self.refusal(self.stats(), log_size=0))
+
+    def test_a_named_route_never_called_earns_nothing(self):
+        self.assertIsNotNone(self.refusal(self.stats(observed_work=0)))
+
+    def test_an_unnamed_route_is_not_a_refusal(self):
+        # Absent is not zero: with no route named, nothing was observed either way, and the
+        # basis string says so rather than implying a measurement.
+        stats = self.stats()
+        del stats["observed_work"]
+        self.assertIsNone(self.refusal(stats))
+
+    def test_the_basis_names_the_count_not_the_exit_code(self):
+        self.assertEqual(
+            self.report.runtime_credit_basis(self.stats(), "pytest"),
+            "pytest-junit-executed:4",
+        )
+        self.assertIn(
+            "observed-work:12", self.report.runtime_credit_basis(self.stats(), "script")
+        )
+        self.assertIn(
+            "nonzero",
+            self.report.runtime_credit_basis(self.stats(failures=2), "script"),
+        )
+
+    def test_credit_is_withheld_end_to_end(self):
+        for label, stats, expected in [
+            ("earned", self.stats(), {"gfx942": "runtime"}),
+            ("refused", self.stats(observed_work=0), {}),
+        ]:
+            with self.subTest(label), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "report.json"
+                log = Path(directory) / "run.log"
+                log.write_text("output\n")
+                path.write_text(
+                    json.dumps(
+                        {
+                            "stages": {
+                                "gpu_claim": {"status": "pass", "arch": "gfx942"}
+                            },
+                            "findings": [],
+                            "arch_coverage": {},
+                        }
+                    )
+                )
+                run(
+                    [sys.executable, str(SKILL_DIR / "report.py"), "coverage", "--"]
+                    + [str(path), json.dumps(stats), "script", str(log)],
+                    check=True,
+                )
+                self.assertEqual(
+                    json.loads(path.read_text())["arch_coverage"], expected
+                )
+
+    def test_credit_needs_a_claimed_gpu(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.json"
+            log = Path(directory) / "run.log"
+            log.write_text("output\n")
+            path.write_text(
+                json.dumps(
+                    {
+                        "stages": {"gpu_claim": {"status": "fail", "arch": "gfx942"}},
+                        "findings": [],
+                        "arch_coverage": {},
+                    }
+                )
+            )
+            run(
+                [sys.executable, str(SKILL_DIR / "report.py"), "coverage", "--"]
+                + [str(path), json.dumps(self.stats()), "script", str(log)],
+                check=True,
+            )
+            self.assertEqual(json.loads(path.read_text())["arch_coverage"], {})
+
+
+class ReportWriterTests(unittest.TestCase):
+    """The four write paths the shell used to own a heredoc apiece."""
+
+    def setUp(self):
+        sys.path.insert(0, str(SKILL_DIR))
+        self.addCleanup(sys.path.remove, str(SKILL_DIR))
+        import report
+
+        self.report = report
+
+    def test_a_dotted_key_creates_the_path(self):
+        data = {}
+        self.report.assign(data, "stages.gpu_claim.arch", "gfx942")
+        self.assertEqual(data, {"stages": {"gpu_claim": {"arch": "gfx942"}}})
+
+    def test_a_dotted_key_keeps_its_siblings(self):
+        data = {"stages": {"gpu_claim": {"status": "pass"}}}
+        self.report.assign(data, "stages.gpu_claim.arch", "gfx942")
+        self.assertEqual(data["stages"]["gpu_claim"]["status"], "pass")
+
+    def test_writes_survive_a_leading_dash(self):
+        # The call sites pass notes and numbers verbatim; a value beginning with "-" must not
+        # be read as an option by the tool that replaced the heredocs.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.json"
+            path.write_text(json.dumps({"stages": {}, "findings": []}))
+            tool = [sys.executable, str(SKILL_DIR / "report.py")]
+            run(tool + ["set", "--", str(path), "note", "-dashed"], check=True)
+            run(tool + ["set", "--json", "--", str(path), "count", "-1"], check=True)
+            run(
+                tool + ["stage", "--", str(path), "merge_sim", "fail", "-dashed"],
+                check=True,
+            )
+            run(
+                tool + ["finding", "--", str(path), "note", "merge_sim", "-dashed"],
+                check=True,
+            )
+            data = json.loads(path.read_text())
+            self.assertEqual(data["note"], "-dashed")
+            self.assertEqual(data["count"], -1)
+            self.assertEqual(data["stages"]["merge_sim"]["note"], "-dashed")
+            self.assertEqual(data["findings"][0]["detail"], "-dashed")
+
+    def test_a_stage_replaces_rather_than_merges(self):
+        # stage_note has always overwritten the whole entry; keys set under a stage before it
+        # records a status do not survive, and callers order their writes accordingly.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.json"
+            path.write_text(
+                json.dumps(
+                    {"stages": {"gpu_claim": {"arch": "gfx942"}}, "findings": []}
+                )
+            )
+            run(
+                [sys.executable, str(SKILL_DIR / "report.py"), "stage", "--"]
+                + [str(path), "gpu_claim", "pass", "claimed"],
+                check=True,
+            )
+            self.assertEqual(
+                json.loads(path.read_text())["stages"]["gpu_claim"],
+                {"status": "pass", "note": "claimed"},
+            )
+
+
+class StubAmdSmi:
+    """Enough amd-smi to answer the two questions gpu_probe asks."""
+
+    def __init__(self, devices):
+        self.devices = devices
+
+    def amdsmi_get_processor_handles(self):
+        return list(range(len(self.devices)))
+
+    def amdsmi_get_gpu_enumeration_info(self, handle):
+        return {"hip_id": self.devices[handle]["hip_id"]}
+
+    def amdsmi_get_gpu_asic_info(self, handle):
+        return self.devices[handle].get("asic", {})
+
+    def amdsmi_get_gpu_device_bdf(self, handle):
+        return self.devices[handle].get("bdf", "0000:00:00.0")
+
+
+class StubPicker:
+    def __init__(self, gfx):
+        self.gfx = gfx
+
+    def read_activity(self, amdsmi, handle):
+        return self.gfx, None
+
+
+class GpuProbeTests(unittest.TestCase):
+    """What the report is told about the device this run claimed.
+
+    Both queries lived in heredocs and could only be exercised on a host with the hardware, so
+    on any other host they were never exercised at all.
+    """
+
+    def setUp(self):
+        sys.path.insert(0, str(SKILL_DIR))
+        self.addCleanup(sys.path.remove, str(SKILL_DIR))
+        import gpu_probe
+
+        self.probe = gpu_probe
+        # amd-smi orders devices independently of HIP, so the two indices differ here on
+        # purpose: a probe that returned one where the report wants the other would look
+        # correct on any machine whose orders happen to agree.
+        self.amdsmi = StubAmdSmi(
+            [
+                {"hip_id": 3},
+                {"hip_id": 0},
+                {
+                    "hip_id": 1,
+                    "asic": {
+                        "market_name": "MI300X",
+                        "target_graphics_version": "gfx942",
+                    },
+                    "bdf": "0000:c5:00.0",
+                },
+            ]
+        )
+
+    def test_the_device_is_found_by_hip_index_not_position(self):
+        info = self.probe.describe(self.amdsmi, StubPicker(7), 1, "host-a")
+        self.assertEqual(info["hip_index"], 1)
+        self.assertEqual(info["amd_smi_index"], 2)
+        self.assertEqual(info["arch"], "gfx942")
+        self.assertEqual(info["model"], "MI300X")
+        self.assertEqual(info["bdf"], "0000:c5:00.0")
+        self.assertEqual(info["gfx_activity_before_pct"], 7)
+        self.assertEqual(info["host"], "host-a")
+        self.assertEqual(info["status"], "pass")
+
+    def test_an_unmapped_hip_index_raises(self):
+        # The shell turns a nonzero exit into "GPU identity could not be verified" and makes no
+        # runtime claim. Returning a device that is not the one locked would be worse than
+        # failing.
+        with self.assertRaises(RuntimeError):
+            self.probe.describe(self.amdsmi, StubPicker(0), 9, "host-a")
+
+    def test_a_device_missing_asic_fields_says_unknown(self):
+        info = self.probe.describe(self.amdsmi, StubPicker(0), 3, "host-a")
+        self.assertEqual(info["arch"], "unknown")
+        self.assertEqual(info["model"], "unknown")
+
+    def test_unreadable_activity_is_not_reported_as_idle(self):
+        # The distinction the whole probe exists to preserve: a query that failed must not
+        # arrive at the report as a measured 0.
+        self.assertEqual(
+            self.probe.activity(self.amdsmi, StubPicker(None), 1),
+            self.probe.ACTIVITY_UNAVAILABLE,
+        )
+        self.assertEqual(self.probe.activity(self.amdsmi, StubPicker(0), 1), "0")
+
+    def test_a_measured_zero_survives_as_a_number(self):
+        # "0" and "unavailable" take different branches in the shell; only the first is
+        # recorded as a percentage.
+        self.assertRegex(
+            self.probe.activity(self.amdsmi, StubPicker(0), 1), r"^[0-9]+$"
+        )
+        self.assertNotRegex(
+            self.probe.activity(self.amdsmi, StubPicker(None), 1), r"^[0-9]+$"
+        )
+
+    def test_the_shipped_picker_is_the_one_borrowed(self):
+        # The picker is the thing that knows how to read activity without reporting unknown as
+        # idle; loading a different copy from PATH is the substitution stage 2 already records
+        # having been burned by.
+        self.assertEqual(self.probe.PICKER_PATH.parent, SKILL_DIR)
+        self.assertTrue(self.probe.PICKER_PATH.exists())
+        picker = self.probe.load_picker()
+        self.assertTrue(hasattr(picker, "read_activity"))
+        self.assertTrue(hasattr(picker, "import_amdsmi"))
+
+
+class TargetRunTests(unittest.TestCase):
+    """The decisions around one target run, which used to live inside bash heredocs.
+
+    Each of these had end-to-end coverage only, through a full validator run that took four
+    minutes and could not say which of a dozen decisions had gone wrong.
+    """
+
+    def setUp(self):
+        sys.path.insert(0, str(SKILL_DIR))
+        self.addCleanup(sys.path.remove, str(SKILL_DIR))
+        import target_run
+
+        self.tool = target_run
+
+    def test_a_boolean_cell_arrives_as_a_boolean(self):
+        # "False" is a non-empty string, so it is truthy, and every row of a boolean dimension
+        # silently ran the True branch -- a grid that looked like it covered both.
+        self.assertIs(False, self.tool.coerce("False"))
+        self.assertIs(True, self.tool.coerce("True"))
+        self.assertIsNone(self.tool.coerce("None"))
+
+    def test_a_shape_cell_arrives_as_a_number_and_a_dtype_as_text(self):
+        # A test that indexes or allocates with a shape argument needs an int, not "128".
+        self.assertEqual(128, self.tool.coerce("128"))
+        self.assertIsInstance(self.tool.coerce("128"), int)
+        self.assertEqual(1.5, self.tool.coerce("1.5"))
+        self.assertEqual("bf16", self.tool.coerce("bf16"))
+
+    def test_the_invalid_grid_sentinel_keeps_the_arity_it_poisons(self):
+        # The probe must reach the TARGET, not crash the plugin: a row of the wrong arity
+        # raises inside pytest's parametrize, and that non-zero exit would credit the channel
+        # without the target ever having consumed a shape.
+        rows = self.tool.grid_rows(self.tool.SENTINEL, ("M", "N", "dtype"))
+        self.assertEqual([(self.tool.SENTINEL,) * 3], rows)
+
+    def test_a_row_that_does_not_match_the_argnames_is_refused(self):
+        with self.assertRaises(SystemExit) as caught:
+            self.tool.grid_rows("7,257", ("M", "N", "dtype"))
+        self.assertIn("3 cells", str(caught.exception))
+
+    def test_a_script_run_reports_observed_work_not_a_case_count(self):
+        # aiter#4538's target returns 0 with log output when the arch is unsupported, so a run
+        # that graded 56 cases and one that graded none both reported executed=1. The count
+        # that is backed by evidence is published beside it.
+        with tempfile.TemporaryDirectory() as root:
+            receipt = Path(root) / "receipt.json"
+            receipt.write_text(
+                json.dumps(
+                    {"kernel_symbols": ["a", "b"], "executed_shapes": [1, 2, 3, 4]}
+                )
+            )
+            stats = self.tool.script_stats(0, str(receipt), "mod:run")
+        self.assertEqual(1, stats["executed"])
+        self.assertEqual(4, stats["observed_work"])
+        self.assertIn("execution receipt", stats["basis"])
+
+    def test_a_named_route_that_wrote_no_receipt_observed_zero_not_nothing(self):
+        # Zero is a finding: a route was named and the run never reached it. That is different
+        # from no route having been named, where there is nothing to observe either way.
+        stats = self.tool.script_stats(0, "/nonexistent/receipt.json", "mod:run")
+        self.assertEqual(0, stats["observed_work"])
+        self.assertIn("wrote no execution receipt", stats["basis"])
+
+        unnamed = self.tool.script_stats(0, "/nonexistent/receipt.json", "")
+        self.assertIsNone(unnamed["observed_work"])
+        self.assertIn("no route was named", unnamed["basis"])
+
+    def test_a_phase_that_observed_nothing_does_not_speak_over_one_that_did(self):
+        with tempfile.TemporaryDirectory() as root:
+            grid = Path(root) / "grid.json"
+            repo = Path(root) / "repo.json"
+            repo.write_text(json.dumps({"route": "mod:run"}))
+
+            # No grid receipt at all: the repository run's stands.
+            self.assertEqual(
+                str(repo), self.tool.preferred_receipt(str(grid), str(repo))
+            )
+
+            # A grid receipt that proves no route does not displace it either.
+            grid.write_text(json.dumps({"route": None}))
+            self.assertEqual(
+                str(repo), self.tool.preferred_receipt(str(grid), str(repo))
+            )
+
+            # One that does prove the route is the run that exercised the injected shapes.
+            grid.write_text(json.dumps({"route": "mod:run"}))
+            self.assertEqual(
+                str(grid), self.tool.preferred_receipt(str(grid), str(repo))
+            )
+
+    def test_a_credential_in_the_calling_shell_is_not_readable_from_the_target(self):
+        # `env VAR=... <cmd>` ADDS to the inherited environment. The target is unmerged
+        # third-party code, and anything in the reviewer's shell was readable from os.environ
+        # inside it -- and would land in a log the moment a target printed its environment.
+        environ = {
+            "ROCM_PATH": "/opt/rocm",
+            "HIP_VISIBLE_DEVICES": "3",
+            "GITHUB_TOKEN": "ghp_secret",
+            "AITER_API_KEY": "sk-secret",
+            "TORCH_AUTH_COOKIE": "c",
+            "SSH_AUTH_SOCK": "/tmp/agent",
+            "EDITOR": "vim",
+        }
+        kept = self.tool.passthrough(environ)
+        self.assertIn("ROCM_PATH=/opt/rocm", kept)
+        self.assertIn("HIP_VISIBLE_DEVICES=3", kept)
+        # AITER_ and TORCH_ are on the allowlist; the denylist is about consequence and wins.
+        for leaked in (
+            "GITHUB_TOKEN",
+            "AITER_API_KEY",
+            "TORCH_AUTH_COOKIE",
+            "SSH_AUTH_SOCK",
+        ):
+            self.assertFalse(
+                any(pair.startswith(leaked + "=") for pair in kept), f"{leaked} leaked"
+            )
+        # And nothing outside the allowlist rides along just because it looks harmless.
+        self.assertFalse(any(pair.startswith("EDITOR=") for pair in kept))
+
+    def test_the_isolation_record_names_what_was_passed(self):
+        summary = self.tool.environment_summary(["B=2", "A=1"])
+        self.assertEqual(["A", "B"], summary["passed_through"])
+        self.assertIn("env -i", summary["policy"])
+
+
+class PerfDecisionTests(unittest.TestCase):
+    """The decisions around a timing run, which used to live inside bash heredocs.
+
+    The timing runs themselves stay in the entry point -- they need the locked GPU and the
+    warm cache root -- but what the runs MEAN was untestable where it was.
+    """
+
+    def setUp(self):
+        sys.path.insert(0, str(SKILL_DIR))
+        self.addCleanup(sys.path.remove, str(SKILL_DIR))
+        import scrape_perf
+
+        self.perf = scrape_perf
+
+    def context(self, **overrides):
+        base = {
+            "base_log": "/w/base.log",
+            "head_log": "/w/head.log",
+            "base_sha": "abc123",
+            "command": "--scenario bench",
+            "basis": "target exposes --scenario bench",
+            "baseline_method": "patch-reversed-same-worktree",
+            "control_column": "",
+            "control_tol": "0.10",
+        }
+        base.update(overrides)
+        return base
+
+    # ---- which harness the target has
+
+    def test_the_bare_perftest_decorator_counts_as_a_harness(self):
+        # Matching only `run_perftest` missed 12 of the 123 targets in op_tests/, and
+        # reported them as "there was nothing to measure" when the detector was the problem.
+        harness = self.perf.detect_harness("@perftest\ndef test_x():\n    pass\n")
+        self.assertEqual("", harness["args"])
+        self.assertIn("perftest", harness["basis"])
+
+    def test_a_scenario_sweep_is_detected_with_its_arguments(self):
+        harness = self.perf.detect_harness("parser.add_argument('--scenario')  # bench")
+        self.assertEqual("--scenario bench", harness["args"])
+
+    def test_a_target_with_no_harness_is_not_given_one(self):
+        self.assertIsNone(self.perf.detect_harness("def test_x():\n    assert True\n"))
+
+    def test_no_harness_exits_three_so_a_crash_is_distinguishable(self):
+        target = Path(self.enterContext(tempfile.TemporaryDirectory())) / "t.py"
+        target.write_text("def test_x():\n    assert True\n")
+        completed = run(
+            [sys.executable, str(SKILL_DIR / "scrape_perf.py"), "detect", str(target)],
+            check=False,
+        )
+        self.assertEqual(3, completed.returncode)
+
+    def test_the_empty_argument_line_survives_the_round_trip(self):
+        # The decorator harness takes no arguments, so `detect` prints an empty first line.
+        # It goes first because command substitution strips a trailing newline and not a
+        # leading one -- with the order reversed, the caller reads the basis as the args.
+        target = Path(self.enterContext(tempfile.TemporaryDirectory())) / "t.py"
+        target.write_text("@perftest\ndef test_x():\n    pass\n")
+        script = SKILL_DIR / "validate_pr.sh"
+        probe = (
+            f'harness=$("{SKILL_DIR / "scrape_perf.py"}" detect "{target}")\n'
+            'printf "[%s][%s]" "${harness%%$\'\\n\'*}" "${harness#*$\'\\n\'}"\n'
+        )
+        self.assertTrue(script.exists())
+        out = run(["bash", "-c", probe]).stdout
+        self.assertEqual("[][target uses the perftest/@benchmark harness]", out)
+
+    # ---- what a timing run may leave behind
+
+    def restore(self, before, current, root="/repo"):
+        calls = {"unlink": [], "rmtree": [], "checkout": []}
+        outcome = self.perf.restore_worktree(
+            root,
+            before,
+            current,
+            unlink=lambda p: calls["unlink"].append(str(p)),
+            rmtree=lambda p: calls["rmtree"].append(str(p)),
+            checkout=lambda p: calls["checkout"].append(p),
+        )
+        return outcome, calls
+
+    def test_an_artifact_the_timing_run_dropped_is_removed(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (root / "tuned_op_bench.csv").write_text("x\n")
+        outcome, calls = self.restore("", "?? tuned_op_bench.csv\n", root)
+        self.assertEqual(["tuned_op_bench.csv"], outcome["removed"])
+        self.assertEqual(1, len(calls["unlink"]))
+
+    def test_a_file_that_was_already_dirty_is_left_alone(self):
+        # It is somebody else's edit. Reverting it would silently destroy uncommitted work
+        # that has nothing to do with this run.
+        outcome, calls = self.restore(" M kernel.py\n", " M kernel.py\n")
+        self.assertEqual([], outcome["removed"] + outcome["reverted"])
+        self.assertEqual([], calls["unlink"] + calls["checkout"])
+
+    def test_a_path_that_escapes_the_worktree_is_reported_not_deleted(self):
+        outcome, calls = self.restore("", "?? ../../etc/passwd\n")
+        self.assertEqual(["../../etc/passwd"], outcome["skipped"])
+        self.assertEqual([], calls["unlink"] + calls["rmtree"])
+
+    def test_a_git_quoted_path_is_reported_not_guessed_at(self):
+        # Un-quoting git's escapes correctly is fiddly and this code deletes files.
+        outcome, calls = self.restore("", '?? "od\\303\\251.csv"\n')
+        self.assertEqual(1, len(outcome["skipped"]))
+        self.assertEqual([], calls["unlink"] + calls["rmtree"])
+
+    # ---- whether a difference can be charged to the patch
+
+    def test_a_same_worktree_baseline_needs_no_control_column(self):
+        result = {"status": "ok", "reason": "fine", "median_ratio": 1.02, "columns": {}}
+        stage, findings = self.perf.perf_stage(result, self.context())
+        self.assertEqual("pass", stage["status"])
+        self.assertNotIn("control_note", stage)
+
+    def test_a_cross_tree_comparison_without_its_control_makes_no_claim(self):
+        result = {
+            "status": "regression",
+            "reason": "slower",
+            "median_ratio": 0.8,
+            "worst_column": "aiter us",
+            "regressed_rows": [{"row": "128", "base": 1.0, "head": 2.0}],
+            "columns": {"aiter us": {"median_ratio": 0.8}},
+        }
+        stage, findings = self.perf.perf_stage(
+            result,
+            self.context(baseline_method="target-transplant", control_column="torch"),
+        )
+        self.assertEqual("skip", stage["status"])
+        # The numbers the gate rejected must not ship beside the skip: a median_ratio next
+        # to `status: skip` reads as a regression somebody chose not to act on.
+        self.assertNotIn("median_ratio", stage)
+        self.assertNotIn("regressed_rows", stage)
+        self.assertEqual(["note"], [f["severity"] for f in findings])
+
+    def test_a_control_column_that_moved_disqualifies_the_comparison(self):
+        result = {
+            "status": "regression",
+            "reason": "slower",
+            "median_ratio": 0.8,
+            "columns": {"torch us": {"median_ratio": 0.6}, "aiter us": {}},
+        }
+        stage, _ = self.perf.perf_stage(
+            result,
+            self.context(baseline_method="target-transplant", control_column="torch"),
+        )
+        self.assertEqual("skip", stage["status"])
+        self.assertIn("40.0%", stage["control_note"])
+        self.assertEqual(0.6, stage["control_ratio"])
+
+    def test_a_control_column_that_held_lets_the_regression_stand(self):
+        result = {
+            "status": "regression",
+            "reason": "aiter us: median head/base speedup 0.800 < 0.95",
+            "median_ratio": 0.8,
+            "regressed_rows": [{"row": "128", "base": 1.0, "head": 2.0}],
+            "columns": {"torch us": {"median_ratio": 1.01}, "aiter us": {}},
+        }
+        stage, findings = self.perf.perf_stage(
+            result,
+            self.context(baseline_method="target-transplant", control_column="torch"),
+        )
+        self.assertEqual("fail", stage["status"])
+        self.assertEqual(0.8, stage["median_ratio"])
+        self.assertIn("reproduced within", stage["control_note"])
+        self.assertEqual(["should-fix"], [f["severity"] for f in findings])
+        self.assertIn("128: 1 -> 2", findings[0]["detail"])
+
+    def test_only_a_measured_regression_can_fail_the_stage(self):
+        # A timeout, a crash, a missing harness and a one-row table must all land on skip:
+        # a false regression blocks a good PR and gets the stage switched off within a week.
+        for status in ("insufficient", "error", "unknown"):
+            with self.subTest(status=status):
+                stage, _ = self.perf.perf_stage(
+                    {"status": status, "reason": "nope", "columns": {}}, self.context()
+                )
+                self.assertEqual("skip", stage["status"])
+
+    def test_the_repeat_count_ships_with_the_claim(self):
+        # The threshold is only defensible because each cell is a best-of-N, so N has to be
+        # visible to a reader.
+        stage, _ = self.perf.perf_stage(
+            {
+                "status": "ok",
+                "reason": "",
+                "columns": {},
+                "base_runs": 3,
+                "head_runs": 3,
+            },
+            self.context(),
+        )
+        self.assertEqual(3, stage["repeats"]["base"])
+        self.assertIn("best sample", stage["repeats"]["reduction"])
+
+    def test_a_missing_measurement_is_omitted_rather_than_nulled(self):
+        # report_schema.json types median_ratio as a number; a null fails validation at
+        # review-pr's identity gate, turning "we could not measure" into "this is malformed".
+        stage, _ = self.perf.perf_stage(
+            {"status": "insufficient", "reason": "no rows", "median_ratio": None},
+            self.context(),
+        )
+        self.assertNotIn("median_ratio", stage)
+
+
+def report_module_status(report, stage):
+    return report.SATISFYING_STATUS.get(stage, report.DEFAULT_SATISFYING_STATUS)
 
 
 if __name__ == "__main__":

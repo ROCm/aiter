@@ -226,7 +226,7 @@ else:
 # The measurement itself belongs to the validator's `perf` stage, which times base and head
 # back to back on one locked GPU and gates on the result. What is computed HERE is only the
 # fallback: which command a human would run if that stage could not. Keep the detection below
-# in step with perf_detect() in validate-kernel-pr/validate_pr.sh -- if the two disagree, this
+# in step with detect_harness() in validate-kernel-pr/scrape_perf.py -- if the two disagree, this
 # step prints a recipe for a harness the validator declined to use, or vice versa.
 #
 # `perf_claimed` only separates two reports ("the PR's own claim is unverified" vs "no claim
@@ -277,7 +277,7 @@ def perf_command(path):
     # a substring test and not a parse. That direction is the safe one: an over-eager match
     # runs the target, finds no timing table, and the perf stage reports `skip` -- the same
     # outcome as not matching, one wasted run later. The opposite error stays silent.
-    # Keep this in step with perf_detect() in validate-kernel-pr/validate_pr.sh.
+    # Keep this in step with detect_harness() in validate-kernel-pr/scrape_perf.py.
     if "perftest" in text or "@benchmark" in text:
         return f"python3 {path}", "target uses the perftest/@benchmark harness"
     return None, (

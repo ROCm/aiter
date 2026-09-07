@@ -379,13 +379,21 @@
           "type": "string",
           "enum": [
             "adds-coverage",
-            "duplicates-target-defaults",
             "unknown"
           ],
-          "description": "Whether the requested grid cells ask for anything outside the target's own declared default for the same channel. A proven hook says the target CONSUMES the grid; this says whether the grid adds coverage."
+          "description": "Whether the requested grid cells ask for anything outside the target's own defaults. The validator does not read the target to decide; the caller declares it with --grid-novelty. Only 'adds-coverage' can earn a pass for correctness_s1_grid."
         },
         "grid_independence_reason": {
           "type": "string"
+        },
+        "grid_independence_basis": {
+          "type": "string",
+          "enum": [
+            "declared-by-caller",
+            "undeclared",
+            "no-grid"
+          ],
+          "description": "Where grid_independence came from. 'declared-by-caller' marks it as the caller's claim rather than a measurement; 'undeclared' means nobody stated what the grid covers, which is why an otherwise green grid is not credited."
         },
         "axis_state": {
           "type": "string",
@@ -393,18 +401,14 @@
             "none",
             "declared",
             "proven",
-            "hook-not-found",
+            "malformed-spec",
             "hook-not-consumed",
             "unusable"
           ],
-          "description": "How far the requested extra axes got. Only `proven` means every axis flag was observed refusing a deliberately invalid value and its values rode the grid run."
+          "description": "How far the requested extra axes got. Only `proven` means every axis flag was observed refusing a deliberately invalid value and its values rode the grid run. The validator does not read the target to see whether a flag exists; a flag that does not exist shows up as the grid run failing, not as a state here."
         },
         "axis_state_reason": {
           "type": "string"
-        },
-        "runner_risk": {
-          "type": "string",
-          "description": "A structural reason the SELECTED runner may be unable to run this target, e.g. a module body that parses argv, which pytest executes at collection with its own argv."
         },
         "axes": {
           "type": "array",
@@ -427,31 +431,12 @@
               "hook_proof": {
                 "type": "string",
                 "enum": [
-                  "flag-declared-in-add_argument",
-                  "flag-not-declared",
+                  "not-evaluated",
                   "malformed-axis-spec",
-                  "not-evaluated"
-                ]
-              },
-              "target_defaults": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                }
-              },
-              "novel_values": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                }
-              },
-              "independence": {
-                "type": "string",
-                "enum": [
-                  "adds-coverage",
-                  "duplicates-target-defaults",
-                  "unknown"
-                ]
+                  "refused-invalid-value",
+                  "accepted-invalid-value"
+                ],
+                "description": "The runtime refusal probe's verdict for this axis. 'not-evaluated' means the probe never ran. Nothing else is evidence that the axis reached the kernel."
               }
             },
             "required": [
@@ -462,9 +447,23 @@
             ]
           }
         },
-        "runner_risk": {
+        "runner_basis": {
           "type": "string",
-          "description": "A structural reason the SELECTED runner may be unable to run this target, e.g. a module body that parses argv, which pytest executes at collection with its own argv."
+          "enum": [
+            "declared-by-caller",
+            "explicit-node-selector",
+            "target-missing",
+            "undeclared"
+          ],
+          "description": "Where the runner came from. The validator no longer classifies the target, so 'declared-by-caller' marks the runner as the caller's claim rather than a measurement -- a distinction a reader needs to weigh a failure that the runner choice, not the code, produced."
+        },
+        "grid_channel_basis": {
+          "type": "string",
+          "enum": [
+            "declared-by-caller",
+            ""
+          ],
+          "description": "Where the grid channel came from. The validator no longer reads the target to confirm a channel exists; the caller names it and the invalid-grid probe proves at runtime that the target consumes it."
         }
       }
     },

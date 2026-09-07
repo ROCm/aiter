@@ -1,6 +1,25 @@
 #!/usr/bin/env python3
 """Structural pre-filter for rule D9 (int32 overflow in index x stride arithmetic).
 
+WHY D9 NEEDS A PRE-FILTER AT ALL
+--------------------------------
+`review-pr`'s D9 already covers 32-bit overflow in pointer arithmetic, so a separate scanner
+looks redundant. It is not: D9's original trigger was a list of variable names -- `token_id`,
+`seq_start`, `batch_offset`, `total_tokens` -- and real defects were spelled otherwise, so the
+rule stayed silent on all of them.
+
+  aiter#1674  `stride_out_batch` not tl.int64        output offset wraps at large MTP batch;
+                                                     tail rows keep stale sparse-KV indices
+  aiter#1674  `block_id * stride`, no .to(int64)     every block past INT32_MAX returns logits
+                                                     of exactly 0.0, silently
+  aiter#3541  `ArithValue(physical_block) * stride`  wraps on a ~150M-row KV pool, and the
+                                                     wrapped offset still lands inside the
+                                                     allocation, so nothing faults
+
+Note what those three share: no crash. Each one returns wrong numbers that a suite comparing
+against a small-shape reference never sees. That is why the check is structural and deliberately
+noisy in the safe direction -- there is no runtime signal to wait for.
+
 WHY THIS IS AN AST PASS AND NOT A REGEX
 ---------------------------------------
 The previous implementation matched `([\\w\\.\\[\\]]+)\\s*\\*\\s*([\\w\\.\\[\\]]+)` on raw diff
