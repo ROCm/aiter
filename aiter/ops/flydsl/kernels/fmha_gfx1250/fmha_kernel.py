@@ -67,14 +67,10 @@ import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import scf
-from flydsl.compiler.kernel_function import (
-    CompilationContext,
-)
 from flydsl.expr import arith, gpu, rocdl
 from flydsl.expr.primitive import const_expr
 from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import T
-from flydsl.utils.smem_allocator import SmemAllocator
 
 from aiter.ops.flydsl.kernels import buffer_ops, vector
 
@@ -162,35 +158,27 @@ def _if_then(if_op):
 TILE_N = K_TILE_N  # 128 — KV tile width
 
 # ============================================================================
-# SmemAllocators — 4 separate LDS regions for K/V ping-pong
+# LDS layout — 4 regions for K/V ping-pong in one SharedAllocator arena
 # ============================================================================
 # K per tile: CNT_SU(4) * LDS_K_SU_P_SIZE(0x3200)
 # = 0xC800 = 51200 bytes (for QK_HDIM=192)
 # V per tile: CNT_SU(4) × LDS_V_SU_P_SIZE(0x2400) = 0x9000 = 36864 bytes
 #
-# K_a, K_b, V_a are padded to 64KB segment boundary to prevent TDM cross-segment.
-# V_b is last — no padding needed. D output reuses V_a (PV done before D store).
+# K_a, K_b, V_a are placed on 64KB segment boundaries to prevent TDM
+# cross-segment. V_b is last — no padding needed. D output reuses V_a
+# (PV done before D store). Byte offsets are into a single static=False
+# SharedAllocator arena whose base is a Uint8 LDS pointer.
 LDS_SEGMENT = 0x10000  # 64KB
-
-_lds_alloc_k_a = SmemAllocator(None, arch="gfx1250", global_sym_name="smem_k_a")
-_lds_alloc_k_a.ptr = LDS_SEGMENT
-
-_lds_alloc_k_b = SmemAllocator(None, arch="gfx1250", global_sym_name="smem_k_b")
-_lds_alloc_k_b.ptr = LDS_SEGMENT
-
-_lds_alloc_v_a = SmemAllocator(None, arch="gfx1250", global_sym_name="smem_v_a")
-_lds_alloc_v_a.ptr = LDS_SEGMENT
-
-_lds_alloc_v_b = SmemAllocator(None, arch="gfx1250", global_sym_name="smem_v_b")
-# 0x9000, last buffer — no segment padding
-_lds_alloc_v_b.ptr = CNT_SU * LDS_V_SU_P_SIZE
+LDS_OFF_K_A = 0x00000
+LDS_OFF_K_B = 0x10000
+LDS_OFF_V_A = 0x20000
+LDS_OFF_V_B = 0x30000
+LDS_TOTAL = LDS_OFF_V_B + CNT_SU * LDS_V_SU_P_SIZE  # 0x39000 (< gfx1250 320KB LDS)
 
 TDM_D_TILE_DIM0 = 128 * 2  # 256 bytes per LDS row
 TDM_D_TENSOR_DIM0 = 128 * 2
 WV_SUBQD = 32
 LDS_D_WV_SIZE = WV_SUBQD * TDM_D_TILE_DIM0 + 1024  # 9216 bytes per wave
-
-_lds_allocator = _lds_alloc_k_a
 
 
 # ============================================================================
@@ -198,12 +186,15 @@ _lds_allocator = _lds_alloc_k_a
 # ============================================================================
 
 
-def _extract_lds_base_i32(memref_base):
-    """Extract i32 LDS address from SmemAllocator memref base."""
-    from flydsl._mlir.dialects import memref as _memref_d
+def _lds_base_i32(arena_base, byte_off):
+    """i32 LDS address of an arena sub-region.
 
-    idx = _memref_d.extract_aligned_pointer_as_index(memref_base)
-    return arith.unwrap(arith.index_cast(T.i32, idx))
+    ``arena_base`` is the Uint8 LDS pointer from
+    ``fx.SharedAllocator(static=False).base_ptr``; ``ptrtoint`` of an
+    addrspace-3 pointer yields the LDS byte address, matching the old
+    ``extract_aligned_pointer_as_index`` path fed to TDM.
+    """
+    return arith.unwrap(fx.Int32(fx.ptrtoint(fx.add_offset(arena_base, byte_off))))
 
 
 def _build_kv_lds_addrs(lane_id, k_base_i32, v_base_i32):
@@ -688,7 +679,7 @@ def _tdm_prime_full_tile(
 
     K: 4 TDM loads (SU 0-3). V: 4 TDM loads (SU 0-3).
     Blocking — waits for all TDM to complete before returning.
-    k_lds_base_i32/v_lds_base_i32: i32 LDS base addresses from SmemAllocator.
+    k_lds_base_i32/v_lds_base_i32: i32 LDS base addresses from the LDS arena.
     """
     i64 = ir.IntegerType.get_signless(64)
 
@@ -1186,13 +1177,16 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 arith.muli(arith.unwrap(head_index), stride_v_head),
             )
 
-            # SmemAllocator bases → i32 LDS addresses
-            k_a_base_i32 = _extract_lds_base_i32(_lds_alloc_k_a.get_base())
-            k_b_base_i32 = _extract_lds_base_i32(_lds_alloc_k_b.get_base())
-            v_a_base_i32 = _extract_lds_base_i32(_lds_alloc_v_a.get_base())
-            v_b_base_i32 = _extract_lds_base_i32(_lds_alloc_v_b.get_base())
+            # Single LDS arena; sub-region i32 bases from its Uint8 base pointer.
+            _lds_arena = fx.SharedAllocator(static=False)
+            _lds_arena.allocate(LDS_TOTAL)
+            _lds_base = _lds_arena.base_ptr
+            k_a_base_i32 = _lds_base_i32(_lds_base, LDS_OFF_K_A)
+            k_b_base_i32 = _lds_base_i32(_lds_base, LDS_OFF_K_B)
+            v_a_base_i32 = _lds_base_i32(_lds_base, LDS_OFF_V_A)
+            v_b_base_i32 = _lds_base_i32(_lds_base, LDS_OFF_V_B)
 
-            # K/V LDS address generation — from SmemAllocator bases
+            # K/V LDS address generation — from arena sub-region bases
             # kv_lds_addrs_a[0..3]=K_a, [4..7]=V_a  (ping / blk=0)
             # kv_lds_addrs_b[0..3]=K_b, [4..7]=V_b  (pong / blk=1)
             rocdl.sched_barrier(0)
@@ -2944,7 +2938,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 _i32t = ir.IntegerType.get_signless(32)
                 _ldst = ir.Type.parse("!llvm.ptr<3>")
                 _v4i32t = ir.VectorType.get([4], _i32t)
-                _db32 = _extract_lds_base_i32(_lds_alloc_v_a.get_base())
+                _db32 = _lds_base_i32(_lds_base, LDS_OFF_V_A)
                 _dw_wv = arith.muli(
                     arith.unwrap(wave_id),
                     arith.unwrap(arith.constant(LDS_D_WV_SIZE, type=T.i32)),
@@ -3025,7 +3019,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 _oadr64 = arith.addi(_o64, _boff64)
                 _alo, _ahi = _split_i64_to_lo_hi(_oadr64)
                 _olds2 = arith.addi(
-                    _extract_lds_base_i32(_lds_alloc_v_a.get_base()),
+                    _lds_base_i32(_lds_base, LDS_OFF_V_A),
                     arith.muli(
                         _wsgpr,
                         arith.unwrap(arith.constant(LDS_D_WV_SIZE, type=T.i32)),
@@ -3295,17 +3289,8 @@ def _ensure_kernel(is_causal: bool, return_lse: bool = False):
         batch_size: fx.Int32,
         stream: fx.Stream,
     ):
-        _lds_alloc_k_a.finalized = False
-        _lds_alloc_k_b.finalized = False
-        _lds_alloc_v_a.finalized = False
-        _lds_alloc_v_b.finalized = False
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            _lds_alloc_k_a.finalize()
-            _lds_alloc_k_b.finalize()
-            _lds_alloc_v_a.finalize()
-            _lds_alloc_v_b.finalize()
-
+        # LDS bytes are tracked automatically from the kernel's
+        # SharedAllocator(static=False) arena — no manual finalize needed.
         num_tg = arith.index_cast(
             T.index,
             arith.ceildivui(
