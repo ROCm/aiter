@@ -443,6 +443,40 @@ _SPLITK_KID_MIN = 200
 _SPLITK_KID_MAX = 299
 
 
+# The id dispatcher writes to stderr before it throws, so remembering the miss
+# is what keeps a serving loop from paying that cost per call.
+_UNBAKED_KIDS: set[tuple[int, int]] = set()
+
+
+def try_opus_gemm_a16w16_tune(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    Y: torch.Tensor,
+    bias=None,
+    kernelId: int = 0,
+    splitK: int = 0,
+) -> bool:
+    """Run the tuned kid; False when this build does not contain it."""
+    key = (kernelId, splitK)
+    if key in _UNBAKED_KIDS:
+        return False
+    try:
+        opus_gemm_a16w16_tune(XQ, WQ, Y, bias, kernelId, splitK)
+    except RuntimeError as e:
+        # A split-K workspace OOM is a RuntimeError too, and must escape.
+        if "tune lookup table" not in str(e):
+            raise
+        _UNBAKED_KIDS.add(key)
+        logger.warning(
+            "opus a16w16: tuned kernel id %s is not in this build; falling "
+            "back for it from now on. Re-tune for this target, or rebuild "
+            "with the target named.",
+            kernelId,
+        )
+        return False
+    return True
+
+
 def _validate_and_reshape(A: Tensor, B: Tensor, bias, dtype, out):
     if A.dtype != torch.bfloat16 or B.dtype != torch.bfloat16:
         raise NotImplementedError(
@@ -649,12 +683,12 @@ def gemm_a16w16_opus(
         scaleAB=False,
         bpreshuffle=False,
     )
-    if cfg is not None:
-        kid = cfg["solidx"]
-        # Both bf16 and fp32 Y are now valid for splitk kids (the reduce
-        # kernel handles the cast / passthrough), so no Y.dtype gating is
-        # needed here -- always honor the tuned winner.
-        opus_gemm_a16w16_tune(XQ, WQ, Y, bias, kid, int(cfg["splitK"]))
+    # Both bf16 and fp32 Y are now valid for splitk kids (the reduce kernel
+    # handles the cast / passthrough), so no Y.dtype gating is needed here --
+    # always honor the tuned winner.
+    if cfg is not None and try_opus_gemm_a16w16_tune(
+        XQ, WQ, Y, bias, int(cfg["solidx"]), int(cfg["splitK"])
+    ):
         return _finalize_output(Y, reshape_out_to_2d)
 
     # 3) CSV miss: fall through to the C++ heuristic dispatcher via
