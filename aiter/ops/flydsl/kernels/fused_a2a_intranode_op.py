@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import functools
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -34,7 +35,11 @@ def _build_p2p_table(tensor, rank, world_size, device):
 
 
 class FusedA2AIntraNodeOp:
-    """Own the symmetric receive and handshake buffers for one tensor shape."""
+    """Own symmetric receive and handshake buffers for one tensor shape.
+
+    Set split=True or FUSED_A2A_SPLIT=1 for three ordered per-tensor launches.
+    All ranks must use the same mode and serialize calls on one stream.
+    """
 
     def __init__(
         self,
@@ -46,6 +51,7 @@ class FusedA2AIntraNodeOp:
         block_num=_DEFAULT_BLOCK_NUM,
         warp_num_per_block=_DEFAULT_WARP_NUM_PER_BLOCK,
         fuse_norm_rope=True,
+        split=False,
     ):
         if dtype != torch.bfloat16:
             raise ValueError(f"only torch.bfloat16 is supported, got {dtype}")
@@ -109,18 +115,26 @@ class FusedA2AIntraNodeOp:
         ms.shmem_barrier_all()
         self._epoch = 0
 
-        self._launch = make_fused_a2a_jit(
-            rank=rank,
-            npes=world_size,
-            heads=shape[2],
-            seq_len=shape[1],
-            head_dim=shape[3],
-            block_num=block_num,
-            warp_num_per_block=warp_num_per_block,
-            fuse_norm_rope=fuse_norm_rope,
-        )
+        self.split = split or os.environ.get("FUSED_A2A_SPLIT", "0") == "1"
         self.fuse_norm_rope = fuse_norm_rope
-        self._compiled = None
+        roles = (
+            (fuse_norm_rope, fuse_norm_rope, False) if self.split else (fuse_norm_rope,)
+        )
+        self._launches = tuple(
+            make_fused_a2a_jit(
+                rank=rank,
+                npes=world_size,
+                heads=shape[2],
+                seq_len=shape[1],
+                head_dim=shape[3],
+                block_num=block_num,
+                warp_num_per_block=warp_num_per_block,
+                fuse_norm_rope=role,
+                split=self.split,
+            )
+            for role in roles
+        )
+        self._compiled = [None] * len(self._launches)
 
     def __call__(
         self, q, k, v, norm_q=None, norm_k=None, cos=None, sin=None, stream=None
@@ -165,27 +179,47 @@ class FusedA2AIntraNodeOp:
         parity = self._epoch % 2
         outputs = self.outputs_sets[parity]
         stream = Stream(torch.cuda.current_stream() if stream is None else stream)
-        args = (
-            *(input.data_ptr() for input in inputs),
-            norm_q.data_ptr(),
-            norm_k.data_ptr(),
-            cos.data_ptr(),
-            sin.data_ptr(),
-            *(table.data_ptr() for table in self.p2p_outputs_sets[parity]),
+        sync_args = (
             self.xdb_mem.data_ptr(),
             self.p2p_xdb_mem.data_ptr(),
             self.xdb_flag.data_ptr(),
             self.grid_barrier.data_ptr(),
             stream,
         )
-        if self._compiled is None:
-            self._compiled = flyc.compile(
-                self._launch,
-                *(fx.Int64(arg) for arg in args[:-1]),
-                args[-1],
+        tables = self.p2p_outputs_sets[parity]
+        if self.split:
+            launch_args = tuple(
+                (
+                    input.data_ptr(),
+                    norm.data_ptr(),
+                    cos.data_ptr(),
+                    sin.data_ptr(),
+                    table.data_ptr(),
+                    *sync_args,
+                )
+                for input, norm, table in zip(inputs, (norm_q, norm_k, v), tables)
             )
         else:
-            self._compiled(*args)
+            launch_args = (
+                (
+                    *(input.data_ptr() for input in inputs),
+                    norm_q.data_ptr(),
+                    norm_k.data_ptr(),
+                    cos.data_ptr(),
+                    sin.data_ptr(),
+                    *(table.data_ptr() for table in tables),
+                    *sync_args,
+                ),
+            )
+        for i, args in enumerate(launch_args):
+            if self._compiled[i] is None:
+                self._compiled[i] = flyc.compile(
+                    self._launches[i],
+                    *(fx.Int64(arg) for arg in args[:-1]),
+                    args[-1],
+                )
+            else:
+                self._compiled[i](*args)
         self._epoch += 1
         return outputs
 

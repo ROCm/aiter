@@ -21,7 +21,7 @@ from .communication_ops_utils import (
     store_i64_global_system,
 )
 
-_JIT_SCHEMA_VERSION = "v10-head-major-output"
+_JIT_SCHEMA_VERSION = "v11-split-in-hop"
 _PUSH_PIPELINE_DEPTH = 16
 _OUT_CHANNEL_COUNT = 8
 _OUT_CHANNEL_DEPTH = 1
@@ -37,6 +37,7 @@ def make_fused_a2a_kernel(
     block_num,
     warp_num_per_block,
     fuse_norm_rope,
+    split=False,
 ):
     row_nbytes = head_dim * 2
     if row_nbytes % 16 != 0:
@@ -67,8 +68,8 @@ def make_fused_a2a_kernel(
         )
     )
 
-    @flyc.kernel(known_block_size=[warp_num_per_block * 64, 1, 1])
-    def fused_a2a_push(
+    @flyc.jit
+    def push_body(
         addr_input_q: fx.Int64,
         addr_input_k: fx.Int64,
         addr_input_v: fx.Int64,
@@ -105,11 +106,16 @@ def make_fused_a2a_kernel(
         p2p_bases_v = shared.p2p_bases_v.view(fx.make_layout(npes, 1))
         if lane < npes:
             peer_base_q = buffer_load(rsrc_p2p_output_q, lane, vec_width=1, dtype=T.i64)
-            peer_base_k = buffer_load(rsrc_p2p_output_k, lane, vec_width=1, dtype=T.i64)
-            peer_base_v = buffer_load(rsrc_p2p_output_v, lane, vec_width=1, dtype=T.i64)
             fx.memref_store(peer_base_q, p2p_bases_q, lane)
-            fx.memref_store(peer_base_k, p2p_bases_k, lane)
-            fx.memref_store(peer_base_v, p2p_bases_v, lane)
+            if const_expr(not split):
+                peer_base_k = buffer_load(
+                    rsrc_p2p_output_k, lane, vec_width=1, dtype=T.i64
+                )
+                peer_base_v = buffer_load(
+                    rsrc_p2p_output_v, lane, vec_width=1, dtype=T.i64
+                )
+                fx.memref_store(peer_base_k, p2p_bases_k, lane)
+                fx.memref_store(peer_base_v, p2p_bases_v, lane)
         fx.barrier()
 
         rsrc_input_q = create_buffer_resource_from_addr(addr_input_q)
@@ -287,11 +293,14 @@ def make_fused_a2a_kernel(
 
         if const_expr(fuse_norm_rope):
             process_qk(rsrc_input_q, rsrc_norm_q, p2p_bases_q)
-            process_qk(rsrc_input_k, rsrc_norm_k, p2p_bases_k)
+            if const_expr(not split):
+                process_qk(rsrc_input_k, rsrc_norm_k, p2p_bases_k)
         else:
             transport(rsrc_input_q, p2p_bases_q)
-            transport(rsrc_input_k, p2p_bases_k)
-        transport(rsrc_input_v, p2p_bases_v)
+            if const_expr(not split):
+                transport(rsrc_input_k, p2p_bases_k)
+        if const_expr(not split):
+            transport(rsrc_input_v, p2p_bases_v)
 
         fx.rocdl.s_waitcnt(vmcnt=0)
 
@@ -320,7 +329,71 @@ def make_fused_a2a_kernel(
             fence_system_acquire()
         fx.barrier()
 
-    return fused_a2a_push
+    @flyc.kernel(known_block_size=[warp_num_per_block * 64, 1, 1])
+    def fused_a2a_push(
+        addr_input_q: fx.Int64,
+        addr_input_k: fx.Int64,
+        addr_input_v: fx.Int64,
+        addr_norm_q: fx.Int64,
+        addr_norm_k: fx.Int64,
+        addr_cos: fx.Int64,
+        addr_sin: fx.Int64,
+        addr_p2p_output_q: fx.Int64,
+        addr_p2p_output_k: fx.Int64,
+        addr_p2p_output_v: fx.Int64,
+        addr_xdb_mem: fx.Int64,
+        addr_p2p_xdb_mem: fx.Int64,
+        addr_xdb_flag: fx.Int64,
+        addr_grid_barrier: fx.Int64,
+    ):
+        push_body(
+            addr_input_q,
+            addr_input_k,
+            addr_input_v,
+            addr_norm_q,
+            addr_norm_k,
+            addr_cos,
+            addr_sin,
+            addr_p2p_output_q,
+            addr_p2p_output_k,
+            addr_p2p_output_v,
+            addr_xdb_mem,
+            addr_p2p_xdb_mem,
+            addr_xdb_flag,
+            addr_grid_barrier,
+        )
+
+    @flyc.kernel(known_block_size=[warp_num_per_block * 64, 1, 1])
+    def fused_a2a_single_push(
+        addr_input: fx.Int64,
+        addr_norm: fx.Int64,
+        addr_cos: fx.Int64,
+        addr_sin: fx.Int64,
+        addr_p2p_output: fx.Int64,
+        addr_xdb_mem: fx.Int64,
+        addr_p2p_xdb_mem: fx.Int64,
+        addr_xdb_flag: fx.Int64,
+        addr_grid_barrier: fx.Int64,
+    ):
+        # The split specialization prunes K/V work, but retains the full handshake.
+        push_body(
+            addr_input,
+            addr_input,
+            addr_input,
+            addr_norm,
+            addr_norm,
+            addr_cos,
+            addr_sin,
+            addr_p2p_output,
+            addr_p2p_output,
+            addr_p2p_output,
+            addr_xdb_mem,
+            addr_p2p_xdb_mem,
+            addr_xdb_flag,
+            addr_grid_barrier,
+        )
+
+    return fused_a2a_single_push if split else fused_a2a_push
 
 
 def make_fused_a2a_jit(
@@ -333,6 +406,7 @@ def make_fused_a2a_jit(
     block_num,
     warp_num_per_block,
     fuse_norm_rope,
+    split=False,
 ):
     kernel = make_fused_a2a_kernel(
         rank=rank,
@@ -343,6 +417,7 @@ def make_fused_a2a_jit(
         block_num=block_num,
         warp_num_per_block=warp_num_per_block,
         fuse_norm_rope=fuse_norm_rope,
+        split=split,
     )
     key = (
         rank,
@@ -353,6 +428,7 @@ def make_fused_a2a_jit(
         block_num,
         warp_num_per_block,
         fuse_norm_rope,
+        split,
         _JIT_SCHEMA_VERSION,
     )
 
@@ -396,7 +472,37 @@ def make_fused_a2a_jit(
             stream=stream,
         )
 
-    return launch
+    @flyc.jit
+    def launch_single(
+        addr_input: fx.Int64,
+        addr_norm: fx.Int64,
+        addr_cos: fx.Int64,
+        addr_sin: fx.Int64,
+        addr_p2p_output: fx.Int64,
+        addr_xdb_mem: fx.Int64,
+        addr_p2p_xdb_mem: fx.Int64,
+        addr_xdb_flag: fx.Int64,
+        addr_grid_barrier: fx.Int64,
+        stream: Stream = Stream(None),  # noqa: B008
+    ):
+        _ = key
+        kernel(
+            addr_input,
+            addr_norm,
+            addr_cos,
+            addr_sin,
+            addr_p2p_output,
+            addr_xdb_mem,
+            addr_p2p_xdb_mem,
+            addr_xdb_flag,
+            addr_grid_barrier,
+        ).launch(
+            grid=(block_num, 1, 1),
+            block=(warp_num_per_block * 64, 1, 1),
+            stream=stream,
+        )
+
+    return launch_single if split else launch
 
 
 def make_fused_a2a_out_kernel(
