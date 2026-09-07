@@ -76,6 +76,14 @@ _LAZY_IMPORTS = {
         ".kernels.qk_norm_rope_quant",
         "flydsl_qk_norm_rope_quant",
     ),
+    "flydsl_sparse_mla_decode": (
+        ".sparse_mla_decode_kernels",
+        "flydsl_sparse_mla_decode",
+    ),
+    "flydsl_sparse_mla_prefill": (
+        ".kernels.sparse_mla_prefill",
+        "flydsl_sparse_mla_prefill",
+    ),
     "gather_kv_b_proj_flydsl": (
         ".gather_kv_b_proj",
         "gather_kv_b_proj_flydsl",
@@ -83,6 +91,10 @@ _LAZY_IMPORTS = {
     "gather_kv_b_proj_flydsl_supported": (
         ".gather_kv_b_proj",
         "gather_kv_b_proj_flydsl_supported",
+    ),
+    "sparse_mla_decode_workspace_shape": (
+        ".sparse_mla_decode_kernels",
+        "sparse_mla_decode_workspace_shape",
     ),
 }
 
@@ -104,8 +116,11 @@ __all__ = [
     "flydsl_pa_mqa_logits_fp4_varqlen",
     "flydsl_preshuffle_gemm_a8",
     "flydsl_qk_norm_rope_quant",
+    "flydsl_sparse_mla_decode",
+    "flydsl_sparse_mla_prefill",
     "gather_kv_b_proj_flydsl",
     "gather_kv_b_proj_flydsl_supported",
+    "sparse_mla_decode_workspace_shape",
 ]
 
 _fused_moe_impl_path = "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl"
