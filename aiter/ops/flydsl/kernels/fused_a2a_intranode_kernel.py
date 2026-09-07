@@ -24,7 +24,7 @@ from .communication_ops_utils import (
 )
 from .quant_utils import emit_mx_e8m0_scale
 
-_JIT_SCHEMA_VERSION = "v13-qk-fp8"
+_JIT_SCHEMA_VERSION = "v14-recv-dequant"
 _TRANSPORT_CHUNK_BYTES = 16
 _PUSH_PIPELINE_DEPTH = 16
 _OUT_CHANNEL_COUNT = 8
@@ -498,6 +498,7 @@ def make_fused_a2a_jit(
     split=False,
     quant=False,
     element_size=2,
+    return_mode="bf16",
 ):
     kernel = make_fused_a2a_kernel(
         rank=rank,
@@ -524,6 +525,7 @@ def make_fused_a2a_jit(
         split,
         quant,
         element_size,
+        return_mode,
         _JIT_SCHEMA_VERSION,
     )
 
@@ -604,6 +606,80 @@ def make_fused_a2a_jit(
         )
 
     return launch_single if split else launch
+
+
+def make_fused_a2a_dequant_jit(*, numel, return_mode="bf16"):
+    block_threads = 256
+    vec = 8
+    key = (numel, return_mode, _JIT_SCHEMA_VERSION)
+
+    @flyc.kernel(known_block_size=[block_threads, 1, 1])
+    def fused_a2a_dequant(
+        addr_q: fx.Int64,
+        addr_k: fx.Int64,
+        addr_scale_q: fx.Int64,
+        addr_scale_k: fx.Int64,
+        addr_out_q: fx.Int64,
+        addr_out_k: fx.Int64,
+    ):
+        is_q = fx.gpu.block_id("y") == 0
+        payload = create_buffer_resource_from_addr(
+            is_q.select(addr_q, addr_k), num_records_bytes=numel
+        )
+        scales = create_buffer_resource_from_addr(
+            is_q.select(addr_scale_q, addr_scale_k), num_records_bytes=numel // 32
+        )
+        output = create_buffer_resource_from_addr(
+            is_q.select(addr_out_q, addr_out_k), num_records_bytes=numel * 2
+        )
+        offset = fx.Int32(
+            (fx.gpu.block_id("x") * block_threads + fx.gpu.thread_id("x")) * vec
+        )
+        if offset < numel:
+            words = fx.Vector(
+                buffer_load(payload, offset // 4, vec_width=2, dtype=T.i32)
+            )
+            # Four neighboring lanes share a scale; four scales fit in one dword.
+            scale_index = offset // 32
+            scale_word = fx.Uint32(
+                buffer_load(scales, scale_index // 4, vec_width=1, dtype=T.i32)
+            )
+            exponent = (scale_word >> ((scale_index % 4) * 8)) & 255
+            scale_bits = (exponent == 0).select(fx.Uint32(0x00400000), exponent << 23)
+            scale_bits = (exponent == 255).select(fx.Uint32(0x7FC00000), scale_bits)
+            scale = scale_bits.bitcast(fx.Float32)
+            values = []
+            for pair_index in range_constexpr(vec // 2):
+                pair = fx.Vector(
+                    fx.rocdl.cvt_pk_f32_fp8(
+                        T.f32x2, words[pair_index // 2], bool(pair_index % 2)
+                    )
+                )
+                values.append(pair[0] * scale)
+                values.append(pair[1] * scale)
+            bf16 = fx.Vector.from_elements(values, fx.Float32).to(fx.BFloat16)
+            buffer_store(bf16, output, offset)
+
+    @flyc.jit
+    def launch(
+        addr_q: fx.Int64,
+        addr_k: fx.Int64,
+        addr_scale_q: fx.Int64,
+        addr_scale_k: fx.Int64,
+        addr_out_q: fx.Int64,
+        addr_out_k: fx.Int64,
+        stream: Stream = Stream(None),  # noqa: B008
+    ):
+        _ = key
+        fused_a2a_dequant(
+            addr_q, addr_k, addr_scale_q, addr_scale_k, addr_out_q, addr_out_k
+        ).launch(
+            grid=((numel + block_threads * vec - 1) // (block_threads * vec), 2, 1),
+            block=(block_threads, 1, 1),
+            stream=stream,
+        )
+
+    return launch
 
 
 def make_fused_a2a_out_kernel(

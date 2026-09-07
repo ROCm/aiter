@@ -78,10 +78,10 @@ def _mx_fp8_reference(values):
     return payload.view(torch.uint8).reshape_as(values), exponent.to(torch.uint8)
 
 
-def _dequantize(payload, scales):
+def _dequantize(payload, scales, dtype=torch.float32):
     blocks = payload.view(torch.float8_e4m3fn).float().reshape(*scales.shape, 32)
     scale = torch.exp2(scales.float() - 127)
-    return (blocks * scale.unsqueeze(-1)).reshape_as(payload)
+    return (blocks * scale.unsqueeze(-1)).reshape_as(payload).to(dtype)
 
 
 def _assert_quantized(payload, scales, reference, reference_scales, oracle, label):
@@ -89,6 +89,10 @@ def _assert_quantized(payload, scales, reference, reference_scales, oracle, labe
         raise AssertionError(f"{label}: payload and E8M0 scales must be uint8")
     _assert_equal(scales, reference_scales, f"{label} scales")
     actual = _dequantize(payload, scales)
+    return _assert_quantized_values(actual, reference, oracle, label)
+
+
+def _assert_quantized_values(actual, reference, oracle, label):
     format_sqnr, _, _ = _metrics(actual, reference)
     mismatch_fraction = (actual != reference).float().mean().item()
     # FP32 norm/RoPE can cross an FP8 rounding midpoint, but only very rarely.
@@ -278,41 +282,71 @@ def _run_rank(rank, world_size, port):
                 head_dim // 32,
             )
             for split in (False, True):
-                op = FusedA2AIntraNodeOp(
-                    rank=rank,
-                    world_size=world_size,
-                    shape=q.shape,
-                    split=split,
-                    quant=True,
-                )
-                for epoch in range(3):
-                    actuals, scales = op(*inputs, norm_q, norm_k, cos, sin)
-                    torch.cuda.synchronize()
-                    quant_metrics = []
-                    for i, tensor_name in enumerate("qk"):
-                        quant_metrics.append(
-                            _assert_quantized(
-                                actuals[i].view(expected_shape),
-                                scales[i].view(scale_references[i].shape),
-                                quant_references[i],
-                                scale_references[i],
-                                references[i],
-                                tensor_name,
-                            )
+                for return_mode in ("bf16", "fp8"):
+                    op = FusedA2AIntraNodeOp(
+                        rank=rank,
+                        world_size=world_size,
+                        shape=q.shape,
+                        split=split,
+                        quant=True,
+                        return_mode=None if return_mode == "bf16" else return_mode,
+                    )
+                    for epoch in range(3):
+                        result = op(*inputs, norm_q, norm_k, cos, sin)
+                        torch.cuda.synchronize()
+                        quant_metrics = []
+                        if return_mode == "fp8":
+                            actuals, scales = result
+                            for i, tensor_name in enumerate("qk"):
+                                quant_metrics.append(
+                                    _assert_quantized(
+                                        actuals[i].view(expected_shape),
+                                        scales[i].view(scale_references[i].shape),
+                                        quant_references[i],
+                                        scale_references[i],
+                                        references[i],
+                                        tensor_name,
+                                    )
+                                )
+                        else:
+                            actuals = result
+                            for i, tensor_name in enumerate("qk"):
+                                actual = actuals[i].view(expected_shape)
+                                if actual.dtype != torch.bfloat16:
+                                    raise AssertionError(
+                                        "bf16 return must produce bf16 Q/K"
+                                    )
+                                parity = epoch % 2
+                                received_reference = _dequantize(
+                                    op.outputs_sets[parity][i].view(expected_shape),
+                                    op.scales_sets[parity][i].view(
+                                        scale_references[i].shape
+                                    ),
+                                    torch.bfloat16,
+                                )
+                                _assert_equal(actual, received_reference, tensor_name)
+                                quant_metrics.append(
+                                    _assert_quantized_values(
+                                        actual,
+                                        quant_references[i].to(torch.bfloat16),
+                                        references[i],
+                                        tensor_name,
+                                    )
+                                    + " native-dequant=bit-exact"
+                                )
+                        _assert_equal(
+                            actuals[2].view(expected_shape),
+                            references[2],
+                            f"{case_name} quant split={split} V rank {rank} epoch {epoch}",
                         )
-                    _assert_equal(
-                        actuals[2].view(expected_shape),
-                        references[2],
-                        f"{case_name} quant split={split} V rank {rank} epoch {epoch}",
-                    )
-                    dist.barrier()
-                if rank == 0:
-                    print(
-                        f"PASS {case_name} quant=True split={split}: "
-                        + " ".join(quant_metrics)
-                        + " full-V=byte-identical epochs=3",
-                        flush=True,
-                    )
+                        dist.barrier()
+                    if rank == 0:
+                        print(
+                            f"PASS {case_name} quant=True split={split} return={return_mode}: "
+                            + " ".join(quant_metrics)
+                            + " full-V=byte-identical epochs=3",
+                            flush=True,
+                        )
 
             if world_size >= 8:
                 out_input = references[0].contiguous()
@@ -363,7 +397,7 @@ def main():
         return 0
 
     mp.spawn(_run_rank, args=(_WORLD_SIZE, _free_port()), nprocs=_WORLD_SIZE, join=True)
-    passed = len(_CASES) * (6 + int(_WORLD_SIZE >= 8))
+    passed = len(_CASES) * (8 + int(_WORLD_SIZE >= 8))
     skipped = len(_CASES) * int(_WORLD_SIZE < 8)
     print(f"{passed} passed, {skipped} skipped on {arch}")
     return 0

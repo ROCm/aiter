@@ -17,6 +17,7 @@ from mori.shmem import mori_shmem_create_tensor
 
 from .fused_a2a_intranode_kernel import (
     _TRANSPORT_CHUNK_BYTES,
+    make_fused_a2a_dequant_jit,
     make_fused_a2a_jit,
     make_fused_a2a_out_jit,
 )
@@ -43,7 +44,9 @@ class FusedA2AIntraNodeOp:
 
     Set split=True or FUSED_A2A_SPLIT=1 for three ordered per-tensor launches.
     Set quant=True or FUSED_A2A_QUANT=1 for fused Q/K MX E4M3 payloads.
-    Quantized calls return (outputs, (q_scales, k_scales)); V stays bf16.
+    Quantized calls return local bf16 Q/K and received bf16 V by default.
+    Set return_mode="fp8" or FUSED_A2A_QUANT_RETURN=fp8 for
+    (outputs, (q_scales, k_scales)); an explicit return_mode overrides the env.
     Scales follow the receive layout with one E8M0 byte per 32 adjacent values.
     All ranks must use the same mode and serialize calls on one stream.
     """
@@ -60,8 +63,18 @@ class FusedA2AIntraNodeOp:
         fuse_norm_rope=True,
         split=False,
         quant=False,
+        return_mode=None,
     ):
         self.quant = quant or os.environ.get("FUSED_A2A_QUANT", "0") == "1"
+        self.return_mode = (
+            os.environ.get("FUSED_A2A_QUANT_RETURN", "bf16")
+            if return_mode is None
+            else return_mode
+        )
+        if self.return_mode not in ("bf16", "fp8"):
+            raise ValueError(
+                f"expected return_mode 'bf16' or 'fp8', got {self.return_mode}"
+            )
         if dtype != torch.bfloat16 and not (self.quant and dtype == torch.uint8):
             raise ValueError(
                 f"expected torch.bfloat16 or torch.uint8 with quant enabled, got {dtype}"
@@ -122,6 +135,21 @@ class FusedA2AIntraNodeOp:
             for _ in range(2)
         )
         self.output = self.outputs_sets[0][0]
+        self.bf16_outputs_sets = ()
+        self._dequant_launch = None
+        self._dequant_compiled = None
+        if self.quant and self.return_mode == "bf16":
+            # Local consumers retain the same two-parity lifetime as received payloads.
+            self.bf16_outputs_sets = tuple(
+                tuple(
+                    torch.empty(numel, dtype=torch.bfloat16, device=self.output.device)
+                    for _ in range(2)
+                )
+                for _ in range(2)
+            )
+            self._dequant_launch = make_fused_a2a_dequant_jit(
+                numel=numel, return_mode=self.return_mode
+            )
         self.xdb_mem = mori_shmem_create_tensor((world_size,), torch.int64)
         for outputs in self.outputs_sets:
             for output in outputs:
@@ -169,6 +197,7 @@ class FusedA2AIntraNodeOp:
                 split=self.split,
                 quant=self.quant and role,
                 element_size=element_size if role else 2,
+                return_mode=self.return_mode,
             )
             for role in roles
         )
@@ -263,8 +292,26 @@ class FusedA2AIntraNodeOp:
                 )
             else:
                 self._compiled[i](*args)
+        if self._dequant_launch is not None:
+            bf16_outputs = self.bf16_outputs_sets[parity]
+            args = (
+                *(output.data_ptr() for output in outputs[:2]),
+                *(scale.data_ptr() for scale in self.scales_sets[parity][:2]),
+                *(output.data_ptr() for output in bf16_outputs),
+                stream,
+            )
+            # The ordered in-hop launches have completed their receive-acquire handshake.
+            if self._dequant_compiled is None:
+                self._dequant_compiled = flyc.compile(
+                    self._dequant_launch,
+                    *(fx.Int64(arg) for arg in args[:-1]),
+                    args[-1],
+                )
+            else:
+                self._dequant_compiled(*args)
+            outputs = (*bf16_outputs, outputs[2])
         self._epoch += 1
-        if self.quant:
+        if self.quant and self.return_mode == "fp8":
             return outputs, self.scales_sets[parity][:2]
         return outputs
 
