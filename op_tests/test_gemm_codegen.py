@@ -30,6 +30,7 @@ import os
 import sys
 import tempfile
 import textwrap
+from unittest import mock
 
 # Ensure the repo-local aiter is imported, not any system/site-packages install.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1027,6 +1028,126 @@ def test_unmatched_targets():
     )
 
 
+def test_flydsl_aot_target_filter():
+    _section("1d. production FlyDSL AOT — compatible target filtering")
+
+    import aiter.aot.flydsl.common as aot_common
+    from aiter.aot.flydsl.common import OpKind, _filter_collected_aot_jobs
+
+    env_names = ("AITER_GPU_TARGETS", "GPU_ARCHS", "CU_NUM", "ARCH")
+    original = {name: os.environ.pop(name, None) for name in env_names}
+    jobs = [
+        {"kernel_name": "k128", "gfx": "gfx950", "cu_num": 128},
+        {"kernel_name": "k256", "gfx": "gfx950", "cu_num": 256},
+        # Same CU as k128, so gfx must participate in the filter.
+        {"kernel_name": "other_arch", "gfx": "gfx942", "cu_num": 128},
+    ]
+    try:
+        os.environ["AITER_GPU_TARGETS"] = "gfx950:256;gfx950:128"
+        with mock.patch.object(aot_common, "collect_aot_jobs", return_value=jobs):
+            selected = aot_common._collect_aot_jobs_for(OpKind.GEMM)
+        _check(
+            "production packaging collector filters targets and same-CU other gfx",
+            {job["kernel_name"] for job in selected} == {"k128", "k256"},
+            str(selected),
+        )
+
+        os.environ["AITER_GPU_TARGETS"] = "gfx950:128;gfx950:64"
+        selected = _filter_collected_aot_jobs(OpKind.GEMM, jobs)
+        _check(
+            "partial requested target coverage preserves available jobs",
+            [job["kernel_name"] for job in selected] == ["k128"],
+            str(selected),
+        )
+
+        os.environ["AITER_GPU_TARGETS"] = "gfx950:128"
+        selected = _filter_collected_aot_jobs(
+            OpKind.GEMM,
+            [{"kernel_name": "legacy", "gfx": "", "cu_num": 128}],
+        )
+        _check(
+            "targeted AOT preserves legacy rows missing gfx identity",
+            [job["kernel_name"] for job in selected] == ["legacy"],
+            str(selected),
+        )
+
+        del os.environ["AITER_GPU_TARGETS"]
+        os.environ["GPU_ARCHS"] = "gfx950"
+        os.environ["CU_NUM"] = "128"
+        selected = _filter_collected_aot_jobs(OpKind.GEMM, jobs)
+        _check(
+            "legacy GPU_ARCHS remains arch-wide when CU_NUM is set",
+            [job["kernel_name"] for job in selected] == ["k128", "k256"],
+            str(selected),
+        )
+        del os.environ["CU_NUM"]
+        os.environ["GPU_ARCHS"] = "gfx942"
+        selected = _filter_collected_aot_jobs(OpKind.GEMM, jobs)
+        _check(
+            "legacy GPU_ARCHS without CU_NUM remains an arch-wide filter",
+            [job["kernel_name"] for job in selected] == ["other_arch"],
+            str(selected),
+        )
+        del os.environ["GPU_ARCHS"]
+        os.environ["AITER_GPU_TARGETS"] = "gfx950:256"
+        selected = _filter_collected_aot_jobs(
+            OpKind.GEMM,
+            jobs + [{"kernel_name": "no_cu", "gfx": "gfx950", "cu_num": 0}],
+        )
+        _check(
+            "a row with no recorded CU count is kept for its arch",
+            "no_cu" in {job["kernel_name"] for job in selected},
+            str(selected),
+        )
+        del os.environ["AITER_GPU_TARGETS"]
+
+        def _only(var, value):
+            for name in ("AITER_GPU_TARGETS", "ARCH", "GPU_ARCHS"):
+                os.environ.pop(name, None)
+            os.environ[var] = value
+
+        def _rejects(var, value):
+            _only(var, value)
+            try:
+                _filter_collected_aot_jobs(OpKind.GEMM, jobs)
+            except RuntimeError:
+                return True
+            return False
+
+        def _selects(var, value):
+            _only(var, value)
+            return [
+                job["kernel_name"]
+                for job in _filter_collected_aot_jobs(OpKind.GEMM, jobs)
+            ]
+
+        _check("separator-only GPU_ARCHS is rejected", _rejects("GPU_ARCHS", " ; "))
+        _check("separator-only ARCH is rejected", _rejects("ARCH", " , "))
+        _check("unknown GPU_ARCHS arch is rejected", _rejects("GPU_ARCHS", "gfx9999"))
+        _check("unknown ARCH arch is rejected", _rejects("ARCH", "gfx9999"))
+        _check(
+            "GPU_ARCHS native combined with another target is rejected",
+            _rejects("GPU_ARCHS", "native;gfx942"),
+        )
+        _check(
+            "ARCH native combined with another target is rejected",
+            _rejects("ARCH", "native,gfx942"),
+        )
+        # GPU_ARCHS accepted ',' before the filter moved here; keep it that way.
+        comma = _selects("GPU_ARCHS", "gfx942,gfx950")
+        _check(
+            "comma-separated GPU_ARCHS selects both arches",
+            comma == ["k128", "k256", "other_arch"],
+            str(comma),
+        )
+    finally:
+        for name, value in original.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -1034,6 +1155,7 @@ def test_unmatched_targets():
 if __name__ == "__main__":
     test_get_build_targets()
     test_unmatched_targets()
+    test_flydsl_aot_target_filter()
     test_gen_instances_filter(
         csv_path=REPRO_CSV,
         target_a=TARGET_C,
