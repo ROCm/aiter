@@ -59,8 +59,8 @@ same thing to every op:
     inverse_rope    1..16384. The axis is -s at fixed TP1/TP4 shapes
                     -b 128,16 32,4, and 65536 faults -- in the triton reference
                     the UT compares against, not in the kernel under test.
-    mega_moe        1..2048. 65536 cannot allocate its symmetric arena; see
-                    _MEGA_MOE_TOKENS.
+    mega_moe        1..2048 plus 65536. The 65536 tier is expected to expose
+                    the current cco symmetric-arena limit; see _MEGA_MOE_TOKENS.
     a8w8_blockscale 256..65536. M=256/512 cover DSv4 decode batches;
                     smaller M stays out because of a UT bug; see DSV4_OPS.
     mla_v4_prefill  1024..16384, the DSv4 prefill chunk. 65536 faults; see
@@ -116,12 +116,12 @@ The current passthrough matrix is:
 ``--scale-init`` is reported as not applicable for operators without a scale
 operand.
 
-mega_moe at tokens/rank=65536 fails in setup(), asking 7.5 GB for cco's VMM
-arena against a 4 GiB default. MORI_SHMEM_HEAP_SIZE does not reach that arena
-(see run_mega_moe), so exporting it changes nothing -- and exporting it
-sweep-wide takes the machine down, because that heap is preallocated per rank
-for every case. The tier is out of the sweep; fixing it means passing
-per_rank_vmm at Communicator.init().
+mega_moe at tokens/rank=65536 has previously failed in setup(), asking 7.5 GB
+for cco's VMM arena against a 4 GiB default. MORI_SHMEM_HEAP_SIZE does not reach
+that arena (see run_mega_moe), so exporting it changes nothing -- and exporting
+it sweep-wide takes the machine down, because that heap is preallocated per
+rank for every case. The tier is included to expose the limit; fixing it means
+passing per_rank_vmm at Communicator.init().
 
 Failures do not stop the sweep: a case that aborts is recorded and the run
 moves to the next one, with a "N failed, M ops selected" list at the end and a
@@ -497,12 +497,12 @@ _MLA_DECODE_TOKENS = _tokens((1, 16, 32, 64, 128, 256, 512, 1024))
 # that is fixed these are timings from an unverified kernel -- the same footing
 # as a16w16's M=65536 rows before _A16W16_MAX_ERR caught them.
 _MLA_PREFILL_TOKENS = _tokens((1024, 2048, 4096, 8192, 16384))
-# Default stops at 2048: tokens/rank=65536 dies in pipe.setup() building the
-# symmetric arena -- cco sizes it from Communicator.DEFAULT_PER_RANK_VMM (4 GiB)
+# tokens/rank=65536 has previously died in pipe.setup() while building the
+# symmetric arena: cco sizes it from Communicator.DEFAULT_PER_RANK_VMM (4 GiB)
 # and asks for 7.5 GB. That is a per_rank_vmm the UT never passes, not something
-# MORI_SHMEM_HEAP_SIZE reaches, so the tier cannot run from here. Ask for it via
-# AITER_BENCH_TOKENS anyway and you get it, along with that failure.
-_MEGA_MOE_TOKENS = _tokens((1, 16, 32, 64, 128, 256, 512, 1024, 2048))
+# MORI_SHMEM_HEAP_SIZE reaches. Keep the tier in the sweep so the limitation is
+# visible in the structured failure output rather than silently unmeasured.
+_MEGA_MOE_TOKENS = _tokens((1, 16, 32, 64, 128, 256, 512, 1024, 2048, 65536))
 # What dispatch puts on the wire; combine is always bf16, so anything but bf16
 # is an asymmetric pair. fp4 is the wire DSv4 actually serves on -- the receiver
 # hands the payload straight to the expert GEMM as its A operand, and that GEMM
