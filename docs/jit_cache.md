@@ -7,6 +7,14 @@ atomically installed, JIT snapshots generated inputs into `{module}/blob`.
 Source-cache publication is best-effort: a failed copy or a peer winning the
 directory swap logs a warning and leaves the installed binary usable.
 
+`build_module` calls `_jit_compile(..., use_versioner=False)` because it installs
+a fixed target name such as `module_deepgemm_opus.so`. Each invocation reaches
+Ninja's incremental dependency checks instead of the Python extension versioner.
+This avoids compiling a `_v1.so` but installing an older unversioned `.so`, and
+prevents the versioner's unchanged-input shortcut from suppressing a retry after
+compiler failure, a header-only change, or rebuilding a missing output. Ninja
+can still skip compilation when its dependency graph is up to date.
+
 The build carries the token returned by its own codegen through compilation.
 It checks the token before and after compilation, and again after copying the
 binary into its installation tempfile, before replacing the installed artifact.
@@ -23,15 +31,21 @@ reads CSV/C++ lookup tables, not this sidecar. A rebuild copies the canonical
 sidecar into staging; codegen unions it with CSV kids, heuristic defaults and
 the tuner's `--extra_kids` request, then applies validity/architecture filters.
 Requests are passed on the command line, never written over the successful
-sidecar before compiling.
+sidecar before compiling. An explicit extra kid must remain in the final compile
+set: unknown, off-target-architecture or family-filtered requests fail codegen
+before compilation rather than silently returning a binary without that kid.
+Filtering historical sidecar or CSV entries for the current target remains
+supported. A direct generator invocation without `--compiled_kids_sidecar` still
+defaults to `{working_path}/compiled_kids.json`; JIT supplies the staged Opus path.
 
 Before compiling, JIT snapshots the generated sidecar in memory and checks its
 generation token. After installing `module_deepgemm_opus.so`, JIT atomically
 writes that snapshot back to `{bd_dir}` and publishes an adjacent `.receipt`.
 This happens independently of source-cache publication. The receipt contains a SHA-256 of
 the sidecar and the installed binary's device, inode, size and nanosecond
-mtime/ctime. The tuner skips a rebuild only when the required kids are present
-and both fingerprints match. Missing/legacy metadata, a replaced or copied
+mtime/ctime. The tuner skips a rebuild only when the required kids are present,
+both fingerprints match, and no unfulfilled explicit rebuild is requested.
+Missing/legacy metadata, a replaced or copied
 binary, and an interrupted metadata publication conservatively cause a
 rebuild. This receipt is a local freshness check, not a portable wheel manifest.
 The binary fingerprint comes from an open descriptor for the exact inode this
@@ -46,12 +60,26 @@ as completion of that request. This does not loop on metadata-write failures;
 after its own successful compile the binary is usable even if publishing the
 receipt fails. Other callers retain the existing skip-after-peer-success policy.
 
+The tuner honors an explicit `AITER_REBUILD` once in the parent even if a current
+receipt already covers its candidates. After a successful synchronous build or
+reuse of a current binary, it sets the environment variable to `0` so spawned
+workers do not rebuild again. It restores the parent's in-process flag; its
+rebuilt-module list records the completed request. A failed build restores the
+original environment value so the request can be retried, including cancellation
+by `KeyboardInterrupt` or `SystemExit`.
+
 `AITER_REBUILD=1` removes the module's build directory and installed `.so`;
 the canonical sidecar and receipt live one level above the module directory.
 The old kids therefore survive `clear_build`, while the missing/replaced
 binary makes an old receipt invalid. A failed compile does not advance the
 canonical sidecar. A metadata publication failure logs a warning after binary
 installation; a later tuner invocation cannot trust the old receipt.
+`AITER_REBUILD=2` removes only the installed `.so`, preserving the module's
+incremental build tree. These explicit rebuild modes retain the existing
+removal contract: they do not promise that the old binary remains available
+to unrelated readers during a rebuild. The tuner waits for its own build
+before spawning workers; it does not lock out every other process that could
+explicitly rebuild the same module later.
 
 ## Storage and reclamation
 
@@ -72,7 +100,13 @@ again or its build tree is explicitly cleared.
 
 If both publication and rollback fail, the last published backup is retained.
 The next locked codegen can restore a dead owner's backup or a backup retained
-by the same still-running process. If restoration remains denied and `blob`
+by the same still-running process. If `blob` is missing, legacy `.blob-backup-*`
+and `blob.backup.*` snapshots without owner metadata can also be recovered
+immediately under that lock; the 24-hour grace applies to deletion, not recovery.
+Staging recovery copies the last published
+snapshot into a temporary candidate and atomically installs it only after the
+copy completes; an interrupted recovery does not expose a partial staging tree
+as a completed generation. If restoration remains denied and `blob`
 is absent, cleanup keeps backups regardless of age or dead-owner status.
 It still leaves live peers' and remote owners' backups alone. This exceptional
 retention prioritizes recoverability over reclaiming the last good snapshot.

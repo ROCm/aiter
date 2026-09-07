@@ -4,11 +4,13 @@
 
 import ast
 import builtins
+import contextlib
 import importlib.util
 import json
 import multiprocessing
 import os
 import re
+import shlex
 import shutil
 import socket
 import stat
@@ -26,13 +28,25 @@ from unittest import mock
 JIT_CACHE_PATH = (
     Path(__file__).resolve().parents[1] / "aiter" / "jit" / "utils" / "jit_cache.py"
 )
-JIT_CACHE_SPEC = importlib.util.spec_from_file_location(
-    "aiter_jit_cache_transaction_under_test", JIT_CACHE_PATH
+
+
+def _load_module(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+jit_cache = _load_module(JIT_CACHE_PATH, "aiter_jit_cache_transaction_under_test")
+versioner_module = _load_module(
+    JIT_CACHE_PATH.with_name("_cpp_extension_versioner.py"),
+    "aiter_versioner_under_test",
 )
-if JIT_CACHE_SPEC is None or JIT_CACHE_SPEC.loader is None:
-    raise RuntimeError(f"cannot load {JIT_CACHE_PATH}")
-jit_cache = importlib.util.module_from_spec(JIT_CACHE_SPEC)
-JIT_CACHE_SPEC.loader.exec_module(jit_cache)
+baton_module = _load_module(
+    JIT_CACHE_PATH.with_name("file_baton.py"), "aiter_file_baton_under_test"
+)
 
 
 def _write_generator(directory, body):
@@ -522,6 +536,127 @@ with open(args.output_dir + "/generated.hpp", "w") as header:
             self.assertEqual(os.listdir(os.path.dirname(destination)), ["module.so"])
 
 
+class TestJitCacheRecovery(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = temporary.name
+        self.op_dir = os.path.join(self.root, "module")
+        self.blob_dir = os.path.join(self.op_dir, "blob")
+        self.staging_dir = os.path.join(self.op_dir, jit_cache.STAGING_DIRECTORY_NAME)
+        _write(os.path.join(self.blob_dir, "first.cpp"), "// first\n")
+        _write(os.path.join(self.blob_dir, "second.cpp"), "// second\n")
+        os.chmod(self.op_dir, 0o755)
+        self.generator = _write_generator(self.root, "pass\n")
+
+    def _restore_with_copy_failure(self):
+        original_copy = jit_cache._copy2
+
+        def fail_second_file(source, destination, *args, **kwargs):
+            # Recovery must correct mkdtemp's 0700 before copying any sources.
+            candidate = os.path.dirname(destination)
+            self.assertTrue(os.path.basename(candidate).startswith(".blob-reset-"))
+            self.assertEqual(stat.S_IMODE(os.stat(candidate).st_mode), 0o755)
+            if os.path.basename(source) == "second.cpp":
+                raise OSError("simulated partial restore failure")
+            return original_copy(source, destination, *args, **kwargs)
+
+        return mock.patch.object(jit_cache, "_copy2", side_effect=fail_second_file)
+
+    def _assert_complete_retry(self):
+        jit_cache.stage_blob_sources(self.generator, self.op_dir, sys.executable)
+        for name, contents in (
+            ("first.cpp", "// first\n"),
+            ("second.cpp", "// second\n"),
+        ):
+            self.assertEqual(_read(os.path.join(self.staging_dir, name)), contents)
+            self.assertEqual(_read(os.path.join(self.blob_dir, name)), contents)
+        self.assertEqual(stat.S_IMODE(os.stat(self.staging_dir).st_mode), 0o755)
+        self.assertEqual(_transaction_artifacts(self.op_dir), [])
+
+    def test_initial_restore_copy_failure_does_not_install_partial_staging(self):
+        with self._restore_with_copy_failure(), self.assertRaisesRegex(
+            OSError, "partial restore failure"
+        ):
+            jit_cache.stage_blob_sources(self.generator, self.op_dir, sys.executable)
+        self.assertFalse(os.path.lexists(self.staging_dir))
+        self._assert_complete_retry()
+
+    def test_failed_codegen_rollback_copy_failure_can_retry_in_same_process(self):
+        jit_cache.stage_blob_sources(self.generator, self.op_dir, sys.executable)
+        failing_generator = os.path.join(self.root, "failing.py")
+        _write(failing_generator, "raise SystemExit(7)\n")
+        with self._restore_with_copy_failure(), self.assertRaises(
+            subprocess.CalledProcessError
+        ):
+            jit_cache.stage_blob_sources(failing_generator, self.op_dir, sys.executable)
+        # The failed generator's own live PID must not strand an incomplete
+        # marker at the stable path after its rollback copy also fails.
+        self.assertFalse(os.path.lexists(self.staging_dir))
+        self._assert_complete_retry()
+
+    def test_abrupt_restore_owner_exit_is_recovered_and_reclaimed(self):
+        worker = """import importlib.util
+import os
+import sys
+spec = importlib.util.spec_from_file_location("cache_child", sys.argv[1])
+cache = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(cache)
+copy = cache._copy2
+def die_mid_copy(source, destination, *args, **kwargs):
+    if os.path.basename(source) == "second.cpp":
+        os._exit(99)
+    return copy(source, destination, *args, **kwargs)
+cache._copy2 = die_mid_copy
+cache.stage_blob_sources(sys.argv[3], sys.argv[2], sys.executable)
+"""
+        child = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                worker,
+                str(JIT_CACHE_PATH),
+                self.op_dir,
+                self.generator,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(child.returncode, 99, child.stderr)
+        self.assertFalse(os.path.lexists(self.staging_dir))
+        self.assertTrue(_transaction_artifacts(self.op_dir))
+        self._assert_complete_retry()
+
+    def test_fresh_legacy_backup_formats_recover_without_age_delay(self):
+        for name in (".blob-backup-old-format", "blob.backup.legacy"):
+            with self.subTest(name=name):
+                backup = os.path.join(self.op_dir, name)
+                os.replace(self.blob_dir, backup)
+                os.utime(backup, None)
+                jit_cache._recover_blob_backup(self.blob_dir)
+                self.assertFalse(os.path.lexists(backup))
+                self.assertEqual(
+                    _read(os.path.join(self.blob_dir, "second.cpp")), "// second\n"
+                )
+
+    def test_recovery_does_not_take_live_peer_or_remote_backups(self):
+        live_backup = os.path.join(
+            self.op_dir,
+            f".blob-backup-{socket.gethostname()}.{os.getppid()}.live",
+        )
+        remote_backup = os.path.join(
+            self.op_dir, f".blob-backup-{socket.gethostname()}.remote.123.remote"
+        )
+        os.replace(self.blob_dir, live_backup)
+        _write(os.path.join(remote_backup, "remote.cpp"), "// remote\n")
+        jit_cache._recover_blob_backup(self.blob_dir)
+        self.assertFalse(os.path.lexists(self.blob_dir))
+        self.assertTrue(os.path.isdir(live_backup))
+        self.assertTrue(os.path.isdir(remote_backup))
+
+
 class TestModuleBuildLock(unittest.TestCase):
     def test_wait_policy_preserves_default_and_retries_request_or_stale_lock(self):
         for force, normal_release in ((False, True), (True, True), (False, False)):
@@ -553,6 +688,9 @@ class TestModuleBuildLock(unittest.TestCase):
 
 class TestBuildPublication(unittest.TestCase):
     def setUp(self):
+        environment = mock.patch.dict(os.environ, {"AITER_REBUILD": "0"})
+        environment.start()
+        self.addCleanup(environment.stop)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = temporary.name
@@ -572,25 +710,47 @@ parser.add_argument("--extra_kids", type=int, nargs="*", default=[])
 args = parser.parse_args()
 path = os.path.join(args.output_dir, "compiled_kids_opus.json")
 kids = set(json.load(open(path))) if os.path.exists(path) else set()
+kids = sorted(kids | set(args.extra_kids) | {1})
 with open(path, "w") as output:
-    json.dump(sorted(kids | set(args.extra_kids) | {1}), output)
+    json.dump(kids, output)
 with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
-    output.write("// generated")
+    output.write("// generated: " + json.dumps(kids))
 """,
         )
 
-        def fake_compile(_name, _sources, **kwargs):
+        self.ninja_targets = []
+
+        def fake_ninja(**kwargs):
+            self.ninja_targets.append(kwargs["name"])
             staged = os.path.join(
                 self.op_dir, "blob.staging", "compiled_kids_opus.json"
             )
             _write(
-                os.path.join(kwargs["build_directory"], "module_deepgemm_opus.so"),
+                os.path.join(kwargs["build_directory"], kwargs["name"] + ".so"),
                 _read(staged),
             )
 
+        # Run the real JIT/versioner/baton control flow. Only the HIP/Ninja build
+        # and binary loading are stubbed; fake outputs represent compiled kids.
+        self.compiler = _load_functions(
+            JIT_CACHE_PATH.with_name("cpp_extension.py"),
+            ["_jit_compile"],
+            {
+                "os": os,
+                "sys": sys,
+                "JIT_EXTENSION_VERSIONER": versioner_module.ExtensionVersioner(),
+                "FileBaton": baton_module.FileBaton,
+                "GeneratedFileCleaner": lambda **kwargs: contextlib.nullcontext(),
+                "IS_HIP_EXTENSION": False,
+                "_write_ninja_file_and_build_library": fake_ninja,
+                "_import_module_from_library": lambda *args: None,
+                "_get_exec_path": lambda name, directory: os.path.join(directory, name),
+            },
+        )
         version = lambda value: tuple(int(part) for part in value.split("."))
         namespace = {
             "os": os,
+            "shutil": shutil,
             "sys": sys,
             "time": time,
             "multiprocessing": multiprocessing,
@@ -615,7 +775,6 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
             "validate_and_update_archs": lambda: ["gfx942"],
             "hip_flag_checker": lambda _flag: True,
             "check_and_set_ninja_worker": lambda: None,
-            "rename_cpp_to_cu": lambda sources, *args, **kwargs: sources,
             "stage_blob_sources": jit_cache.stage_blob_sources,
             "publish_blob_sources": jit_cache.publish_blob_sources,
             "publish_compiled_kids": jit_cache.publish_compiled_kids,
@@ -627,11 +786,11 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
                 os.remove(self.artifact) if os.path.exists(self.artifact) else None
             ),
             "clear_build": lambda _name: shutil.rmtree(self.op_dir, ignore_errors=True),
-            "_jit_compile": fake_compile,
+            "_jit_compile": self.compiler["_jit_compile"],
         }
         self.core = _load_functions(
             JIT_CACHE_PATH.parents[1] / "core.py",
-            ["build_module", "_stage_blob_sources"],
+            ["build_module", "_stage_blob_sources", "rename_cpp_to_cu"],
             namespace,
         )
 
@@ -663,6 +822,90 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
         self.assertTrue(
             jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {1, 7, 9})
         )
+
+    def test_repeated_build_installs_new_kids_under_stable_target_name(self):
+        self.build(7)
+        self.build(9)
+        self.assertEqual(self.ninja_targets, ["module_deepgemm_opus"] * 2)
+        self.assertEqual(set(json.loads(_read(self.artifact))), {1, 7, 9})
+        self.assertTrue(
+            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {9})
+        )
+        self.assertEqual(self.compiler["JIT_EXTENSION_VERSIONER"].entries, {})
+
+    def test_failed_ninja_retry_in_same_process_does_not_skip_compilation(self):
+        self.build(7)
+        original_ninja = self.compiler["_write_ninja_file_and_build_library"]
+        self.compiler["_write_ninja_file_and_build_library"] = mock.Mock(
+            side_effect=OSError("hipcc OOM")
+        )
+        with self.assertRaisesRegex(RuntimeError, "build .* failed"):
+            self.build(9)
+        self.assertFalse(
+            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {9})
+        )
+        self.assertFalse(os.path.exists(os.path.join(self.op_dir, "build", "lock")))
+        self.compiler["_write_ninja_file_and_build_library"] = original_ninja
+        self.build(9)
+        self.assertEqual(self.ninja_targets, ["module_deepgemm_opus"] * 2)
+        self.assertEqual(set(json.loads(_read(self.artifact))), {1, 7, 9})
+        self.assertTrue(
+            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {9})
+        )
+
+    def test_interrupted_ninja_retry_releases_lock_and_recompiles(self):
+        self.build(7)
+        original_ninja = self.compiler["_write_ninja_file_and_build_library"]
+        self.compiler["_write_ninja_file_and_build_library"] = mock.Mock(
+            side_effect=KeyboardInterrupt()
+        )
+        with self.assertRaises(KeyboardInterrupt):
+            self.build(9)
+        self.assertFalse(os.path.exists(os.path.join(self.op_dir, "build", "lock")))
+        self.compiler["_write_ninja_file_and_build_library"] = original_ninja
+        self.build(9)
+        self.assertEqual(set(json.loads(_read(self.artifact))), {1, 7, 9})
+
+    def test_deleted_build_output_is_recreated_for_identical_inputs(self):
+        self.build(7)
+        os.remove(os.path.join(self.op_dir, "build", "module_deepgemm_opus.so"))
+        self.build(7)
+        self.assertEqual(self.ninja_targets, ["module_deepgemm_opus"] * 2)
+        self.assertTrue(
+            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {7})
+        )
+
+    def test_rebuild_level_two_removes_binary_but_keeps_objects_and_sidecar(self):
+        self.build(7)
+        sentinel = os.path.join(self.op_dir, "build", "kept.o")
+        _write(sentinel, "object")
+        self.core["AITER_REBUILD"] = 2
+        original_ninja = self.compiler["_write_ninja_file_and_build_library"]
+
+        def check_rebuild_state(**kwargs):
+            self.assertFalse(os.path.exists(self.artifact))
+            self.assertEqual(_read(sentinel), "object")
+            self.assertEqual(set(json.loads(_read(self.sidecar))), {1, 7})
+            return original_ninja(**kwargs)
+
+        self.compiler["_write_ninja_file_and_build_library"] = check_rebuild_state
+        self.build(9)
+        self.assertEqual(_read(sentinel), "object")
+        self.assertTrue(
+            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {9})
+        )
+
+    def test_codegen_failure_preserves_formatted_runtime_error_contract(self):
+        self.build(7)
+        _write(self.generator, "raise SystemExit(7)\n")
+        with self.assertRaisesRegex(RuntimeError, "build .* failed") as failure:
+            self.build(9)
+        self.assertIsInstance(
+            failure.exception.__cause__, subprocess.CalledProcessError
+        )
+        self.logger.error.assert_called_once()
+        self.assertIn("failed jit build", self.logger.error.call_args.args[0])
+        self.assertEqual(set(json.loads(_read(self.artifact))), {1, 7})
 
     def test_module_without_codegen_does_not_require_a_generation(self):
         sources = ["user.cu"]
@@ -787,6 +1030,7 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
             return self.core["build_module"](**kwargs)
 
         proxy.build_module = build
+        self.tuner_core = proxy
         imports = {
             "aiter.jit": types.SimpleNamespace(core=proxy),
             "aiter.jit.utils.file_baton": types.SimpleNamespace(
@@ -800,6 +1044,7 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
                 heuristic_kids_for_arch=lambda _arches: {1}
             ),
         }
+        self.tuner_imports = imports
 
         def import_dependency(name, *args, **kwargs):
             if name in imports:
@@ -834,10 +1079,111 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
             self.assertTrue(tuner({9}))
             self.assertFalse(tuner({9}))
         self.assertEqual(len(calls), 2)
-        self.assertTrue(all("--extra_kids 1 9" in command for command in calls))
+        self.assertTrue(all("--extra_kids 9" in command for command in calls))
         self.assertTrue(
             jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {1, 7, 9})
         )
+
+    def test_tuner_forced_rebuild_runs_once_even_when_receipt_matches(self):
+        self.build(7)
+        tuner, calls = self.load_tuner()
+        self.tuner_core.AITER_REBUILD = 1
+        with mock.patch.dict(os.environ, {"AITER_REBUILD": "1"}), mock.patch.object(
+            sys, "stderr"
+        ):
+            self.assertTrue(tuner({7}))
+            self.assertEqual(os.environ["AITER_REBUILD"], "0")
+            self.assertEqual(self.tuner_core.AITER_REBUILD, 1)
+            self.assertFalse(tuner({7}))
+        self.assertEqual(len(calls), 1)
+
+    def test_tuner_reuse_clears_inherited_flag_on_every_cache_hit_path(self):
+        self.build(7)
+        for route in ("fast", "waiter", "locked"):
+            with self.subTest(route=route):
+                tuner, calls = self.load_tuner()
+                self.tuner_core.rebuilded_list = ["module_deepgemm_opus"]
+                baton = mock.Mock()
+                baton.try_acquire.return_value = route != "waiter"
+                self.tuner_imports["aiter.jit.utils.file_baton"].FileBaton = mock.Mock(
+                    return_value=baton
+                )
+                receipt_results = [True] if route == "fast" else [False, True]
+                with mock.patch.dict(
+                    os.environ, {"AITER_REBUILD": "1"}
+                ), mock.patch.object(
+                    jit_cache, "compiled_kids_are_current", side_effect=receipt_results
+                ):
+                    self.assertFalse(tuner({7}))
+                    self.assertEqual(os.environ["AITER_REBUILD"], "0")
+                self.assertEqual(calls, [])
+
+    def test_tuner_failed_forced_rebuild_restores_flags_and_remains_retryable(self):
+        self.build(7)
+        tuner, calls = self.load_tuner()
+        self.tuner_core.AITER_REBUILD = 1
+        original_ninja = self.compiler["_write_ninja_file_and_build_library"]
+        self.compiler["_write_ninja_file_and_build_library"] = mock.Mock(
+            side_effect=OSError("hipcc OOM")
+        )
+        with mock.patch.dict(os.environ, {"AITER_REBUILD": "1"}), mock.patch.object(
+            sys, "stderr"
+        ):
+            with self.assertRaisesRegex(RuntimeError, "subset-compile rebuild failed"):
+                tuner({7})
+            self.assertEqual(os.environ["AITER_REBUILD"], "1")
+            self.assertEqual(self.tuner_core.AITER_REBUILD, 1)
+            self.compiler["_write_ninja_file_and_build_library"] = original_ninja
+            self.assertTrue(tuner({7}))
+            self.assertEqual(os.environ["AITER_REBUILD"], "0")
+        self.assertEqual(len(calls), 2)
+
+    def test_tuner_runtime_probe_fallback_respects_explicit_build_arches(self):
+        self.build(7)
+        tuner, calls = self.load_tuner()
+        self.tuner_imports["aiter.jit.utils.chip_info"].get_gfx_runtime = mock.Mock(
+            side_effect=RuntimeError("no rocminfo")
+        )
+        heuristic = mock.Mock(
+            side_effect=lambda arches: {1} if arches == {"gfx942"} else {1, 200}
+        )
+        self.tuner_imports["opus_gemm_common"].heuristic_kids_for_arch = heuristic
+        with mock.patch.dict(os.environ, {"GPU_ARCHS": "gfx942"}):
+            self.assertFalse(tuner({7}))
+        heuristic.assert_called_once_with({"gfx942"})
+        self.assertEqual(calls, [])
+
+    def test_tuner_interruption_restores_environment_and_releases_locks(self):
+        self.build(7)
+        for interruption in (KeyboardInterrupt, SystemExit):
+            for previous_env in (None, "1", "2"):
+                with self.subTest(interruption=interruption, env=previous_env):
+                    tuner, calls = self.load_tuner()
+                    self.tuner_core.AITER_REBUILD = 2
+                    baton = mock.Mock(try_acquire=lambda: True)
+                    self.tuner_imports["aiter.jit.utils.file_baton"].FileBaton = (
+                        mock.Mock(return_value=baton)
+                    )
+                    with mock.patch.dict(os.environ), mock.patch.dict(
+                        self.compiler,
+                        _write_ninja_file_and_build_library=mock.Mock(
+                            side_effect=interruption()
+                        ),
+                    ), mock.patch.object(sys, "stderr"):
+                        if previous_env is None:
+                            os.environ.pop("AITER_REBUILD", None)
+                        else:
+                            os.environ["AITER_REBUILD"] = previous_env
+                        with self.assertRaises(interruption):
+                            tuner({7})
+                        self.assertEqual(os.environ.get("AITER_REBUILD"), previous_env)
+                        self.assertEqual(self.tuner_core.AITER_REBUILD, 2)
+                    self.assertEqual(len(calls), 1)
+                    baton.release.assert_called_once()
+                    self.assertFalse(
+                        os.path.exists(os.path.join(self.op_dir, "build", "lock"))
+                    )
+                    self.assertEqual(set(json.loads(_read(self.sidecar))), {1, 7})
 
     def test_tuner_module_lock_waiter_executes_its_own_request(self):
         self.build(7)  # A runtime builder's completed binary lacks kid 9.
@@ -1009,6 +1355,179 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
             set(json.loads(_read(os.path.join(blob, "compiled_kids_opus.json")))),
             {1, 7},
         )
+
+
+class TestCppExtensionControl(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = temporary.name
+        self.source = os.path.join(self.root, "source.cpp")
+        self.header = os.path.join(self.root, "value.h")
+        _write(self.source, '#include "value.h"\nint value() { return VALUE; }\n')
+        _write(self.header, "#define VALUE 1\n")
+        self.targets = []
+
+        def fake_ninja(**kwargs):
+            self.targets.append(kwargs["name"])
+            _write(os.path.join(self.root, kwargs["name"] + ".so"), _read(self.header))
+
+        self.namespace = _load_functions(
+            JIT_CACHE_PATH.with_name("cpp_extension.py"),
+            ["_jit_compile"],
+            {
+                "os": os,
+                "sys": sys,
+                "JIT_EXTENSION_VERSIONER": versioner_module.ExtensionVersioner(),
+                "FileBaton": baton_module.FileBaton,
+                "GeneratedFileCleaner": lambda **kwargs: contextlib.nullcontext(),
+                "IS_HIP_EXTENSION": False,
+                "_write_ninja_file_and_build_library": fake_ninja,
+                "_import_module_from_library": lambda *args: None,
+            },
+        )
+
+    def compile(self, **options):
+        self.namespace["_jit_compile"](
+            name="module",
+            sources=[self.source],
+            extra_cflags=[],
+            extra_cuda_cflags=[],
+            extra_ldflags=[],
+            extra_include_paths=[self.root],
+            build_directory=self.root,
+            verbose=False,
+            with_cuda=False,
+            is_python_module=True,
+            is_standalone=False,
+            torch_exclude=True,
+            **options,
+        )
+
+    def test_default_extension_loader_keeps_versioned_names_and_cache(self):
+        self.compile()
+        self.compile()
+        self.assertEqual(self.targets, ["module"])
+        _write(self.source, _read(self.source) + "// changed source\n")
+        self.compile()
+        self.assertEqual(self.targets, ["module", "module_v1"])
+
+    def test_stable_target_checks_headers_missing_outputs_and_identical_inputs(self):
+        self.compile(use_versioner=False)
+        self.compile(use_versioner=False)
+        _write(self.header, "#define VALUE 2\n")
+        self.compile(use_versioner=False)
+        self.assertEqual(
+            _read(os.path.join(self.root, "module.so")), _read(self.header)
+        )
+        os.remove(os.path.join(self.root, "module.so"))
+        self.compile(use_versioner=False)
+        self.assertEqual(self.targets, ["module"] * 4)
+        self.assertTrue(os.path.isfile(os.path.join(self.root, "module.so")))
+
+    def test_stable_target_waiter_enters_ninja_for_its_own_inputs(self):
+        baton = mock.Mock()
+        baton.try_acquire.side_effect = [False, True]
+        baton.wait.return_value = True
+        self.namespace["FileBaton"] = mock.Mock(return_value=baton)
+        self.compile(use_versioner=False)
+        self.assertEqual(self.targets, ["module"])
+        self.assertEqual(baton.try_acquire.call_count, 2)
+        baton.wait.assert_called_once()
+        baton.release.assert_called_once()
+
+    def test_real_cpu_ninja_reuses_unchanged_output_and_rebuilds_header_change(self):
+        ninja = shutil.which("ninja")
+        if ninja is None:
+            candidate = Path(sys.executable).with_name("ninja")
+            ninja = str(candidate) if candidate.is_file() else None
+        compiler = shutil.which("c++")
+        if ninja is None or compiler is None:
+            self.skipTest("CPU Ninja integration requires ninja and c++")
+        outputs = []
+
+        def run_cpu_ninja(**kwargs):
+            target = kwargs["name"] + ".so"
+            _write(
+                os.path.join(self.root, "build.ninja"),
+                "rule compile\n"
+                f"  command = {shlex.quote(compiler)} -shared -fPIC -MMD -MF $out.d $in -o $out\n"
+                "  depfile = $out.d\n"
+                "  deps = gcc\n"
+                f"build {target}: compile source.cpp\n"
+                f"default {target}\n",
+            )
+            result = subprocess.run(
+                [ninja, "-C", self.root], check=True, capture_output=True, text=True
+            )
+            outputs.append(result.stdout)
+
+        self.namespace["_write_ninja_file_and_build_library"] = run_cpu_ninja
+        artifact = os.path.join(self.root, "module.so")
+        self.compile(use_versioner=False)
+        unchanged_mtime = os.stat(artifact).st_mtime_ns
+        self.compile(use_versioner=False)
+        self.assertIn("no work to do", outputs[-1])
+        self.assertEqual(os.stat(artifact).st_mtime_ns, unchanged_mtime)
+        _write(self.header, "#define VALUE 2\n")
+        future = max(time.time_ns(), unchanged_mtime) + 1_000_000_000
+        os.utime(self.header, ns=(future, future))
+        self.compile(use_versioner=False)
+        self.assertNotIn("no work to do", outputs[-1])
+        self.assertNotEqual(os.stat(artifact).st_mtime_ns, unchanged_mtime)
+
+
+@unittest.skipUnless(importlib.util.find_spec("pandas"), "Opus codegen requires pandas")
+class TestOpusRequestedKids(unittest.TestCase):
+    def test_real_generator_accepts_valid_requests_and_rejects_filtered_requests(self):
+        generator = JIT_CACHE_PATH.parents[3] / "csrc/opus_gemm/gen_instances.py"
+        runner = (
+            "import os, runpy, sys, types; "
+            "sys.argv = sys.argv[1:]; "
+            "sys.path.insert(0, os.path.dirname(sys.argv[0])); "
+            "sys.modules['torch'] = types.SimpleNamespace("
+            "cuda=types.SimpleNamespace(is_available=lambda: False)); "
+            "runpy.run_path(sys.argv[0], run_name='__main__')"
+        )
+        cases = (
+            (10006, [], True),
+            (999999, [], False),
+            (200, [], False),
+            (200, ["--kernel_tag", "a16w16"], False),
+            (10006, ["--kernel_tag", "a8w8"], False),
+        )
+        for kid, extra_args, accepted in cases:
+            with self.subTest(
+                kid=kid, extra_args=extra_args
+            ), tempfile.TemporaryDirectory() as tmp:
+                sidecar = os.path.join(tmp, "compiled_kids.json")
+                _write(sidecar, "[]")
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        runner,
+                        str(generator),
+                        "--working_path",
+                        tmp,
+                        "--extra_kids",
+                        str(kid),
+                        *extra_args,
+                    ],
+                    env={**os.environ, "GPU_ARCHS": "gfx942"},
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if accepted:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn(kid, json.loads(_read(sidecar)))
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(
+                        "cannot compile requested --extra_kids", result.stderr
+                    )
+                    self.assertEqual(_read(sidecar), "[]")
 
 
 if __name__ == "__main__":

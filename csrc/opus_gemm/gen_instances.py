@@ -1518,7 +1518,7 @@ if __name__ == "__main__":
         try:
             with open(sidecar_path) as f:
                 sidecar_kids = {int(x) for x in json.load(f)}
-        except (OSError, ValueError):
+        except (OSError, ValueError, TypeError):
             sidecar_kids = set()
 
     # The compile set: union, intersected with valid kernels_list entries.
@@ -1587,7 +1587,7 @@ if __name__ == "__main__":
         tag_keys = set(TAG_TO_LIST.get(args.kernel_tag, {}).keys())
         if tag_keys:
             # Restrict to the requested family + heuristic defaults.
-            S = (S & tag_keys) | set(HEURISTIC_DEFAULT_KIDS)
+            S = (S & tag_keys) | set(heuristic_kids_for_arch(target_arches))
             if target_arches is None or "gfx950" in target_arches:
                 S |= set(a8w8_scale_kernels_list.keys())
                 S |= set(a8w8_kernels_list.keys())
@@ -1602,6 +1602,15 @@ if __name__ == "__main__":
         f"kid. Add them to the compile set or update HEURISTIC_DEFAULT_KIDS "
         f"in csrc/opus_gemm/opus_gemm_common.py."
     )
+
+    missing_requested = set(args.extra_kids) - S
+    if missing_requested:
+        parser.error(
+            "cannot compile requested --extra_kids "
+            f"{sorted(missing_requested)}: unknown kernel, outside target arches "
+            f"{sorted(target_arches) if target_arches is not None else 'all'}, "
+            "or excluded by --kernel_tag"
+        )
 
     # Build the per-kid dict that drives codegen.
     kdict = {kid: kernels_list[kid] for kid in sorted(S)}

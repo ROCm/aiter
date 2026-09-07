@@ -49,7 +49,7 @@ def _directory_mode(path):
 
 
 def _copy_directory(source, destination):
-    shutil.copytree(source, destination, copy_function=_copy2)
+    shutil.copytree(source, destination, copy_function=_copy2, dirs_exist_ok=True)
 
 
 def _transaction_prefix(kind):
@@ -80,18 +80,28 @@ def _artifact_owner_active(name):
 def _restore_staging_directory(staging_dir, blob_dir, op_dir):
     """Restore the deterministic working tree from the last published cache."""
     discarded_dir = None
+    candidate_dir = None
     if os.path.lexists(staging_dir):
         discarded_dir = os.path.join(
             op_dir, f"{_transaction_prefix('reset')}{uuid.uuid4().hex}"
         )
         _replace(staging_dir, discarded_dir)
     try:
+        # A failed or killed copy must not leave a partially restored tree at
+        # the stable path: the next invocation would mistake it for a complete
+        # working tree. Build the replacement separately and install it whole.
+        candidate_dir = tempfile.mkdtemp(
+            prefix=_transaction_prefix("reset"), dir=op_dir
+        )
+        os.chmod(candidate_dir, _directory_mode(op_dir))
         if os.path.isdir(blob_dir):
-            _copy_directory(blob_dir, staging_dir)
-        else:
-            os.makedirs(staging_dir, exist_ok=True)
-        os.chmod(staging_dir, _directory_mode(op_dir))
+            _copy_directory(blob_dir, candidate_dir)
+        os.chmod(candidate_dir, _directory_mode(op_dir))
+        _replace(candidate_dir, staging_dir)
+        candidate_dir = None
     finally:
+        if candidate_dir is not None:
+            _remove_path(candidate_dir)
         if discarded_dir is not None:
             _remove_path(discarded_dir)
 
@@ -118,7 +128,9 @@ def _marker_owner_is_active(marker_path):
 def _recover_blob_backup(blob_dir):
     """Recover a dead publisher's backup, or our own failed rollback.
 
-    Called under the module build lock. A live peer's backup is never moved.
+    Called under the module build lock. Owner-tagged live peers are left alone.
+    Legacy backups have no owner metadata; recovering the only published cache
+    under this lock does not wait for the age grace used to delete old artifacts.
     """
     if os.path.lexists(blob_dir):
         return
@@ -127,7 +139,7 @@ def _recover_blob_backup(blob_dir):
         (
             os.path.join(op_dir, name)
             for name in os.listdir(op_dir)
-            if name.startswith(".blob-backup-")
+            if name.startswith((".blob-backup-", "blob.backup."))
             and (
                 name.startswith(_transaction_prefix("backup"))
                 or _artifact_owner_active(name) is not True

@@ -91,7 +91,6 @@ from opus_gemm_common import (
     GFX1250_SPLITK_FUSE_ENABLED,
     GFX1250_SPLITK_FUSE_KID_OF,
     GFX1250_SPLITK_FUSE_KIDS,
-    HEURISTIC_DEFAULT_KIDS,
     NON_SPLITK_KIDS,
     SPLITK_KIDS,
     _opus_sidecar_path,
@@ -1042,9 +1041,9 @@ def _ensure_kids_compiled(candidate_kids):
 
     1. Passes the new candidates as ``--extra_kids`` to codegen. The last
        successful sidecar remains intact until the new binary is installed.
-    2. Clears the aiter.jit.core in-process module caches and removes
-       the on-disk .so so the next ``@compile_ops("module_deepgemm_opus")``
-       call rebuilds from scratch (the codegen step re-reads the sidecar).
+    2. Clears the aiter.jit.core in-process module caches and requests a
+       synchronous rebuild, which removes the old .so and re-reads the
+       successful sidecar as a seed for codegen.
     3. **Synchronously triggers the rebuild here** by calling
        build_module() directly so subsequent ``mp_tuner`` spawn-ed
        children inherit a .so on disk that already contains every
@@ -1058,7 +1057,8 @@ def _ensure_kids_compiled(candidate_kids):
     Two race vectors are explicitly defended against:
 
     A. **Concurrent GemmTuner / parent processes** (multi-GPU multi-script):
-       sidecar read + expand + write + build is wrapped in a ``FileBaton``
+       request + build + successful metadata publication is wrapped in a
+       ``FileBaton``
        (`$JIT_BUILD/lock_ensure_kids_opus`). One parent runs the full
        expand+build; the rest spin on the baton, then recheck the sidecar receipt
        (it may already contain what they need, in which case they skip).
@@ -1072,11 +1072,12 @@ def _ensure_kids_compiled(candidate_kids):
        baked, and the rest then race against an in-flight build,
        producing intermittent `FileNotFoundError` / partial ELF errors.
        To shut this off we **also clear `os.environ["AITER_REBUILD"]`**
-       once our synchronous build succeeds, so every spawn child
+       once our synchronous build succeeds or a current binary is reused,
+       so every spawn child
        inherits a clean env (read: `AITER_REBUILD=0`) and goes straight
-       to `dlopen()` of the .so we just produced. The original env is
-       restored on the parent process only after this call returns;
-       the parent itself does not need the rebuild flag past this
+       to `dlopen()` of the ready .so. On build failure the original env is
+       restored; on success only the parent's in-process flag is restored.
+       The parent itself does not need the rebuild flag past this
        point because we already added ``module_deepgemm_opus`` to
        ``rebuilded_list``.
 
@@ -1100,7 +1101,14 @@ def _ensure_kids_compiled(candidate_kids):
         _run_arch = get_gfx_runtime().lower()
         _heuristic = heuristic_kids_for_arch({_run_arch})
     except Exception:  # noqa: BLE001
-        _heuristic = HEURISTIC_DEFAULT_KIDS  # unknown -> multi-arch fallback
+        # A runtime probe can fail in a prebuild environment with explicit
+        # targets. Do not require off-arch defaults in that case.
+        _target_arches = {
+            arch.strip().lower()
+            for arch in os.getenv("GPU_ARCHS", "native").split(";")
+            if arch.strip() and arch.strip().lower() != "native"
+        }
+        _heuristic = heuristic_kids_for_arch(_target_arches or None)
     required = candidate_kids | _heuristic
 
     def _read_sidecar(path):
@@ -1109,15 +1117,27 @@ def _ensure_kids_compiled(candidate_kids):
         try:
             with open(path) as f:
                 return set(json.load(f))
-        except (OSError, ValueError):
+        except (OSError, ValueError, TypeError):
             return set()
 
     sidecar = _opus_sidecar_path()
     artifact = os.path.join(_jit_core.get_user_jit_dir(), "module_deepgemm_opus.so")
+    rebuild_requested = _jit_core.AITER_REBUILD or int(os.getenv("AITER_REBUILD", "0"))
+    force_rebuild = (
+        rebuild_requested and "module_deepgemm_opus" not in _jit_core.rebuilded_list
+    )
+
+    def _reuse_current_binary():
+        # A receipt proves kid membership, not that a user-requested source
+        # rebuild has run. Honor that request once in this parent before spawn.
+        if force_rebuild or not compiled_kids_are_current(sidecar, artifact, required):
+            return False
+        os.environ["AITER_REBUILD"] = "0"
+        return True
 
     # A bare sidecar may come from an old version or a failed build. Require
     # successful metadata for the currently installed artifact, not membership alone.
-    if compiled_kids_are_current(sidecar, artifact, required):
+    if _reuse_current_binary():
         return False
 
     os.makedirs(_jit_core.bd_dir, exist_ok=True)
@@ -1128,7 +1148,7 @@ def _ensure_kids_compiled(candidate_kids):
         # A peer parent (multi-GPU / multi-process tune harness) is already extending the sidecar +
         # rebuilding.
         baton.wait()
-        if compiled_kids_are_current(sidecar, artifact, required):
+        if _reuse_current_binary():
             return False
         # Peer's expand didn't cover us (rare: peer's `required` set was
         # disjoint from ours). Re-enter to extend further.
@@ -1137,7 +1157,7 @@ def _ensure_kids_compiled(candidate_kids):
     try:
         compiled = _read_sidecar(sidecar)
         missing = required - compiled
-        if compiled_kids_are_current(sidecar, artifact, required):
+        if _reuse_current_binary():
             # Another writer beat us inside the critical section.
             return False
 
@@ -1164,27 +1184,13 @@ def _ensure_kids_compiled(candidate_kids):
             _mds.clear()
         # Reset rebuilded_list (used by compile_ops to track "we already rebuilt this once in this process").
         _jit_core.rebuilded_list = ["module_aiter_enum"]
-        # Reset the in-process torch JIT extension versioner so the second synchronous rebuild here
-        # (sidecar grew between shape N and N+1...
-        try:
-            import sys as _sys
-
-            for _modname in ("cpp_extension", "aiter.jit.utils.cpp_extension"):
-                _mod = _sys.modules.get(_modname)
-                if _mod is None:
-                    continue
-                _jev = getattr(_mod, "JIT_EXTENSION_VERSIONER", None)
-                if _jev is None:
-                    continue
-                _entries = getattr(_jev, "entries", None)
-                if isinstance(_entries, dict):
-                    _entries.pop("module_deepgemm_opus", None)
-        except Exception:  # noqa: BLE001,S110
-            pass
+        # build_module uses fixed target names and always enters incremental
+        # Ninja checks; no tuner-specific versioner reset is needed.
 
         # Synchronously drive the rebuild in this (parent) process so that mp_tuner's spawn-ed children
         # see a fully-baked .so on disk and...
         _build_exc = None
+        _build_succeeded = False
         try:
             d_args = _jit_core.get_args_of_build("module_deepgemm_opus")
             # Keep requests in this build invocation: clear_build cannot erase
@@ -1193,7 +1199,7 @@ def _ensure_kids_compiled(candidate_kids):
             blob_gen_cmd = (
                 d_args["blob_gen_cmd"]
                 + " --extra_kids "
-                + " ".join(str(kid) for kid in sorted(required))
+                + " ".join(str(kid) for kid in sorted(candidate_kids))
             )
             _jit_core.build_module(
                 md_name="module_deepgemm_opus",
@@ -1216,6 +1222,7 @@ def _ensure_kids_compiled(candidate_kids):
             )
             if "module_deepgemm_opus" not in _jit_core.rebuilded_list:
                 _jit_core.rebuilded_list.append("module_deepgemm_opus")
+            _build_succeeded = True
         except Exception as exc:  # noqa: BLE001
             _build_exc = exc
             import traceback
@@ -1239,9 +1246,9 @@ def _ensure_kids_compiled(candidate_kids):
             # Restore in-process flag for the parent (mp_tuner children
             # spawn from os.environ, not from this in-process value).
             _jit_core.AITER_REBUILD = _prev_rebuild
-            # For children: if build succeeded, force AITER_REBUILD=0 in env so spawned workers go straight
-            # to dlopen(); if build failed, res...
-            if _build_exc is None:
+            # Clear the child flag only after success. KeyboardInterrupt and
+            # SystemExit bypass the Exception handler but must restore it too.
+            if _build_succeeded:
                 os.environ["AITER_REBUILD"] = "0"
             else:
                 if _prev_rebuild_env is None:
@@ -2150,9 +2157,9 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             opus_candidate_kids |= shape_cands
         if opus_candidate_kids and _ensure_kids_compiled(opus_candidate_kids):
             logger.info(
-                f"opus_gemm_tune: expanded subset-compile sidecar to cover "
+                f"opus_gemm_tune: synchronously rebuilt the module to cover "
                 f"{len(opus_candidate_kids)} candidate kids; "
-                f"module_deepgemm_opus will rebuild on next call."
+                f"module_deepgemm_opus is ready for spawned workers."
             )
 
         # mp_tuner.worker calls `run_perftest(func, *args, **kwargs)` with the func/kwargs we provide here.

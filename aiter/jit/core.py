@@ -1179,6 +1179,9 @@ def build_module(
                 torch_exclude=torch_exclude,
                 hipify=hipify,
                 extra_cuda_cflags_per_source=flags_extra_hip_per_source,
+                # We install a stable module name. Let Ninja check incremental
+                # dependencies and retry failures, not the Python loader cache.
+                use_versioner=False,
             )
             validate_generation()
             if is_python_module and not is_standalone:
