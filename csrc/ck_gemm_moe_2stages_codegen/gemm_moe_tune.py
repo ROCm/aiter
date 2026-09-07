@@ -6183,7 +6183,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         return data
 
     @staticmethod
-    def _port_e2e(data, kn1, kn2, topk, ne, h, dtype):
+    def _port_e2e(data, kn1, kn2, topk, ne, h, dtype, act="silu"):
         # kn2 may name either gemm2 family (path B or native mxmoe).
         _g2 = parse_g2_kname_any(kn2)
         BM = _g2["BM"]
@@ -6215,6 +6215,10 @@ class Mxfp4FlydslTuner(FmoeTuner):
             kernelName1=kn1,
             m_indices=m_indices,
             moe_buf=moe_buf,
+            act=act,
+            # Betas match run_torch_moe_stage1's defaults; silu compiles them out.
+            situ_beta=DEFAULT_SITUV2_BETA,
+            situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
         )
         return _mxfp4_a4w4_stage2_fw(
             inter_q,
@@ -6269,19 +6273,23 @@ class Mxfp4FlydslTuner(FmoeTuner):
         token, topk = int(row["token"]), int(row["topk"])
         dtype = dtypes.bf16
         kn1, kn2 = candidate["kernelName1"], candidate["kernelName2"]
-        activation = (
-            ActivationType.Swiglu
-            if str(row["act_type"]).endswith("Swiglu")
-            else ActivationType.Silu
-        )
+        act_type = str(row["act_type"])
+        if act_type.endswith("Situv2"):
+            activation = ActivationType.Situv2
+        elif act_type.endswith("Swiglu"):
+            activation = ActivationType.Swiglu
+        else:
+            activation = ActivationType.Silu
+        # mxmoe stage1 emits silu or situv2; anything else tunes as silu.
+        act = "situv2" if activation == ActivationType.Situv2 else "silu"
         data = self._prepare_case(token, h, e, ne, topk, dtype)
-        out = self._port_e2e(data, kn1, kn2, topk, ne, h, dtype)
+        out = self._port_e2e(data, kn1, kn2, topk, ne, h, dtype, act)
         ref = self._torch_ref(data, topk, dtype, activation)
         err = cosine_diff_compare(ref, out, msg=f"port[{kn1}+{kn2}]")
         if err is None or float(err) > args.errRatio:
             raise RuntimeError(f"cosine err_ratio {err} > {args.errRatio}")
         _, us = run_perftest(
-            lambda: self._port_e2e(data, kn1, kn2, topk, ne, h, dtype),
+            lambda: self._port_e2e(data, kn1, kn2, topk, ne, h, dtype, act),
             num_warmup=int(args.warmup),
             num_iters=int(args.iters),
         )
