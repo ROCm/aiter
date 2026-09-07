@@ -107,7 +107,6 @@ jobs:
           docker exec ${CONTAINER} bash -lc '
             set -e
             pip uninstall -y amd-aiter aiter 2>/dev/null || true
-            pip install --upgrade "pybind11>=3.0.1"
             cd /workspace
             MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 pip install -e .
             (pip show amd-aiter || pip show aiter) | grep -E "^Version|^Location" || true

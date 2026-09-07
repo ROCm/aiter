@@ -469,7 +469,6 @@ if AITER_TRITON_ONLY:
     install_requires = ["einops", "packaging", "psutil"]
 else:
     install_requires = [
-        "pybind11>=3.0.1",
         "ninja",
         "pandas",
         "einops",

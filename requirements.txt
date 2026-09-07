@@ -19,6 +19,5 @@ psutil==7.2.2
 matplotlib==3.10.9
 pyyaml==6.0.3
 einops==0.8.2
-pybind11==3.0.4
 ninja==1.13.0
 flydsl==0.3.2

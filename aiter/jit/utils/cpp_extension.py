@@ -1649,14 +1649,16 @@ def _write_ninja_file_to_build_library(
         system_includes += include_paths(with_cuda)
         system_includes = list(set(system_includes))
 
-    # FIXME: build python module excluded with torch, use `pybind11`
-    # But we can't use this now because all aiter op based on torch
-    # which means pybind11 related build flags must from torch now
     common_cflags = []
     if is_python_module:
-        import pybind11
+        # pybind11 headers come from torch (torch/include) for every module so
+        # they share torch's internals version without a pip pybind11 (#4770).
+        import torch
 
-        extra_include_paths.append(pybind11.get_include())
+        torch_include = os.path.join(os.path.dirname(torch.__file__), "include")
+        # torch_exclude omits torch/include; re-add it (header-only, no libtorch).
+        if torch_include not in system_includes:
+            system_includes.append(torch_include)
         common_cflags += [f"{x}" for x in _get_pybind11_abi_build_flags()]
         common_cflags += [f"{x}" for x in _get_glibcxx_abi_build_flags()]
 
