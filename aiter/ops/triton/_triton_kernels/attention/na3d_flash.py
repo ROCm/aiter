@@ -26,15 +26,15 @@ from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 #   BLOCK_Q=32  ->  BLOCK_KV=64
 # The W >= BLOCK_Q constraint is enforced by the pruner below.
 _NA3D_AUTOTUNE_CONFIGS = [
-    triton.Config({"BLOCK_Q": 16, "BLOCK_KV": 32, "num_stages": 2}, num_warps=4),
-    triton.Config({"BLOCK_Q": 16, "BLOCK_KV": 32, "num_stages": 2}, num_warps=8),
-    triton.Config({"BLOCK_Q": 16, "BLOCK_KV": 32, "num_stages": 3}, num_warps=4),
-    triton.Config({"BLOCK_Q": 16, "BLOCK_KV": 32, "num_stages": 3}, num_warps=8),
-    triton.Config({"BLOCK_Q": 16, "BLOCK_KV": 32, "num_stages": 4}, num_warps=4),
-    triton.Config({"BLOCK_Q": 16, "BLOCK_KV": 32, "num_stages": 4}, num_warps=8),
+    triton.Config({"BLOCK_Q": 16, "BLOCK_KV": 32}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_Q": 16, "BLOCK_KV": 32}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_Q": 16, "BLOCK_KV": 32}, num_warps=4, num_stages=3),
+    triton.Config({"BLOCK_Q": 16, "BLOCK_KV": 32}, num_warps=8, num_stages=3),
+    triton.Config({"BLOCK_Q": 16, "BLOCK_KV": 32}, num_warps=4, num_stages=4),
+    triton.Config({"BLOCK_Q": 16, "BLOCK_KV": 32}, num_warps=8, num_stages=4),
     # BLOCK_Q=32 halves program count but doubles BLOCK_KV (more masked compute).
-    triton.Config({"BLOCK_Q": 32, "BLOCK_KV": 64, "num_stages": 2}, num_warps=4),
-    triton.Config({"BLOCK_Q": 32, "BLOCK_KV": 64, "num_stages": 2}, num_warps=8),
+    triton.Config({"BLOCK_Q": 32, "BLOCK_KV": 64}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_Q": 32, "BLOCK_KV": 64}, num_warps=8, num_stages=2),
 ]
 
 
