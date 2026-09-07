@@ -6057,14 +6057,24 @@ class Mxfp4FlydslTuner(FmoeTuner):
         "config_env_name": "AITER_CONFIG_FMOE",
     }
 
+    #: Stage1 XCD swizzles to sweep; worth ~1% once the rows span enough blocks.
+    XCD_SWIZZLES: ClassVar[tuple[int, ...]] = (0, 4)
+
+    #: Key columns holding a torch dtype rather than a plain scalar.
+    DTYPE_KEYS: ClassVar[frozenset[str]] = frozenset(
+        {"dtype", "q_dtype_a", "q_dtype_w"}
+    )
+
     @staticmethod
-    def _g1_kname(bm, use_nt, inline_quant):
-        # flydsl_mxmoe_g1_a4w4_<BM>x256x256[_f16in][_nt]; see mxfp4_kname.py.
+    def _g1_kname(bm, use_nt, inline_quant, xcd=0):
+        # flydsl_mxmoe_g1_a4w4_<BM>x256x256[_f16in][_nt][_xcd<n>]; see mxfp4_kname.py.
         name = f"flydsl_mxmoe_g1_a4w4_{bm}x256x256"
         if inline_quant:
             name += "_f16in"
         if use_nt:
             name += "_nt"
+        if xcd:
+            name += f"_xcd{xcd}"
         return name
 
     @staticmethod
@@ -6108,8 +6118,11 @@ class Mxfp4FlydslTuner(FmoeTuner):
         g2_bms = {v[0] for v in G2}
         cands = []
         for bm in sorted({v[0] for v in G1}):
-            for _, n1, iq1 in sorted(v for v in G1 if v[0] == bm):
-                kn1 = self._g1_kname(bm, n1, iq1)
+            for kn1 in [
+                self._g1_kname(bm, n1, iq1, xcd)
+                for _, n1, iq1 in sorted(v for v in G1 if v[0] == bm)
+                for xcd in self.XCD_SWIZZLES
+            ]:
                 # (A) native mxmoe g2 candidates (flydsl_mxmoe_g2_a4w4_*).
                 if bm in g2_bms:
                     for _, n2, ep in sorted(v for v in G2 if v[0] == bm):
@@ -6273,12 +6286,21 @@ class Mxfp4FlydslTuner(FmoeTuner):
             num_iters=int(args.iters),
         )
         us = round(float(us), 4)
+        # The pair is timed as one unit, so the fused-MoE estimate in calculate()
+        # is the right roofline for it. Untuned rows keep dtypes as strings, while
+        # calculate() looks bpe up by torch dtype.
+        key = tuple(
+            eval(row[col]) if col in self.DTYPE_KEYS else row[col] for col in self.keys
+        )
+        tflops, bw = self.calculate((key, "", kn1, candidate["block_m"], us, err))
         candidate.update(
             {
                 "us1": us,
                 "us": us,
-                "err1": round(float(err), 6),
-                "err2": round(float(err), 6),
+                "err1": f"{float(err):.1%}",
+                "err2": f"{float(err):.1%}",
+                "tflops": tflops,
+                "bw": bw,
             }
         )
         return us
