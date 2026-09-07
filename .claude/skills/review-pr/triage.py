@@ -1629,6 +1629,18 @@ def uncovered_test_paths(diff_text, root):
 # --------------------------------------------------------------- perf claims
 PERF_NUM = re.compile(r"(?<![A-Za-z0-9])(\d+(?:\.\d+)?)\s*"
                       r"(x\b|%|\bus\b|\b[mu]s\b|TFLOPS?\b|GB/s|tok/s)", re.I)
+# Wall clock in whole seconds or minutes, but only as a TRANSITION between two of them:
+# `from 100.0 s to 62-67 s`, `4.2s -> 1.8s`. aiter#5221's headline claim is exactly that
+# shape, and perf_claims told the reviewer "no numeric performance claim in the PR
+# description" -- an actively wrong sentence, not a silent miss.
+#
+# Deliberately not a bare `s` unit. Over 279 PR descriptions a bare second matches four
+# lines and two of them are not claims at all: a `600s wait` timeout constant and a
+# `4 passed in 541.10s` pytest summary. The transition shape matches one line in the same
+# 279 -- aiter#5221's -- and neither trap.
+_DUR = r"\d+(?:\.\d+)?(?:\s*-\s*\d+(?:\.\d+)?)?\s*(?:s|sec|secs|seconds?|min|minutes?)\b"
+DURATION_DELTA = re.compile(
+    rf"(?:from\s+)?\*{{0,2}}{_DUR}\*{{0,2}}\s*(?:to|→|->|—>)\s*\*{{0,2}}{_DUR}", re.I)
 HW_MODEL = re.compile(r"\b(MI\d+\w*|gfx\d+|CDNA\d*|RDNA\d*|fp\d+|bf\d+|int\d+|e\dm\d)",
                       re.I)
 # aiter PR descriptions are partly Chinese; an English-only word list marks a table that
@@ -1671,18 +1683,22 @@ def perf_claims(body):
         if not is_row:
             table_header = None
         stripped = HW_MODEL.sub(" ", line)
-        if not PERF_NUM.search(stripped):
+        dur = DURATION_DELTA.search(stripped)
+        if not PERF_NUM.search(stripped) and not dur:
             continue
         # A share is not a speedup: "33.07% of GPU time", "81.8% prefill" describe where
         # the time goes, and asking what they are measured against is nonsense.
         if SHARE.search(line) and not re.search(r"\d\s*x\b", stripped):
             continue
         nums = [f"{a}{b}" for a, b in PERF_NUM.findall(stripped)]
+        if dur and not nums:
+            nums = [dur.group(0).replace("*", "").strip()]
         # A signed percentage is a delta, and a delta's other side is "without this
         # change" -- that is a stated baseline in ordinary English. `+8.64% end-to-end`
         # needs no interrogation; a bare `198 TFLOPS` does.
         signed = bool(re.search(r"[+\-−]\s*\**\d+(?:\.\d+)?\s*%", line))
-        based = (bool(BASELINE.search(line)) or signed
+        # `from A to B` names both sides of the comparison in the sentence itself.
+        based = (bool(BASELINE.search(line)) or signed or bool(dur)
                  or (is_row and table_header is not None))
         rows.append((line.strip()[:100], nums, based))
     return rows
