@@ -21,7 +21,7 @@ def mhc_pre_gemm_sqrsum(
     x: Tensor,
     fn: Tensor,
     tile_k: int = 128,  # 64 or 128
-    is_res_w_preshuffle_bf16: int = 0,  # 1: fn is pre-packed int32 (hi<<16|lo) from mhc_pre_convert_fn
+    is_w_preshuffle_bf16: int = 0,  # 1: fn is pre-packed BF16 hi/lo from mhc_pre_convert_fn
 ) -> None: ...
 
 
@@ -332,12 +332,13 @@ _MHC_FUSED_POST_PRE_CONFIG = {
 
 @functools.lru_cache(maxsize=1024)
 def get_mhc_fused_post_pre_config(
-    m: int, hidden_size: int
+    m: int, hidden_size: int, is_res_w_preshuffle_bf16: bool = False
 ) -> tuple[int, int, int, int]:
     """Select (split_k, tile_m, tile_n, tile_k) for the fused post+pre GEMM.
 
     Looks up a per-chip tuned policy keyed by (gfx_arch, cu_num); falls back to a
-    conservative default for untuned chips. K = hidden_size per stream.
+    conservative default for untuned chips. Packed BF16 decode uses a separate
+    adjustment for the direct-store pipeline. K = hidden_size per stream.
     """
     num_cu = get_cu_num()
     try:
@@ -345,7 +346,21 @@ def get_mhc_fused_post_pre_config(
     except Exception:  # noqa: BLE001
         arch = "unknown"
     policy = _MHC_FUSED_POST_PRE_CONFIG.get((arch, num_cu), _mhc_fused_config_default)
-    return policy(m, hidden_size, num_cu)
+    split_k, tile_m, tile_n, tile_k = policy(m, hidden_size, num_cu)
+    if (
+        is_res_w_preshuffle_bf16
+        and MHC_RES_SHUFFLE
+        and arch == "gfx1250"
+        and num_cu == 256
+        and 1 <= m <= 1024
+    ):
+        # Direct residual stores change the best GEMM + reduction configuration.
+        # Keep the packed decode policy separate from FP32 and prefill tuning.
+        if hidden_size == 7168 and 512 < m <= 768:
+            tile_m = 16
+        elif hidden_size == 4096 and 960 < m:
+            split_k = 16
+    return split_k, tile_m, tile_n, tile_k
 
 
 def mhc_pre_fake(
@@ -361,7 +376,7 @@ def mhc_pre_fake(
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
     large_m_splitk: bool = False,
-    is_res_w_preshuffle_bf16: int = 0,
+    is_w_preshuffle_bf16: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     m = residual.size(0)
     hc_mult = residual.size(1)
@@ -387,7 +402,7 @@ def mhc_pre(
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
     large_m_splitk: bool = False,
-    is_res_w_preshuffle_bf16: int = 0,  # 1: fn is pre-packed int32 (hi<<16|lo) from mhc_pre_convert_fn
+    is_w_preshuffle_bf16: int = 0,  # 1: fn is pre-packed BF16 hi/lo from mhc_pre_convert_fn
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     m = residual.size(0)
     hc_mult = residual.size(1)
@@ -407,8 +422,15 @@ def mhc_pre(
     )
     out = out_pad[:, :, :hc_mult3]
     sqrsum = torch.empty(selected_splitk, m, dtype=dtypes.fp32, device=device)
-    # is_res_w_preshuffle_bf16=1: fn is the pre-packed int32 tensor (bf16 hi/lo MFMA path).
-    mhc_pre_gemm_sqrsum(out, sqrsum, residual, fn, selected_tile_k, is_res_w_preshuffle_bf16)
+    # The flag selects packed weights and BF16 compute; residual keeps its plain layout.
+    mhc_pre_gemm_sqrsum(
+        out,
+        sqrsum,
+        residual,
+        fn,
+        selected_tile_k,
+        is_w_preshuffle_bf16=is_w_preshuffle_bf16,
+    )
     # out = out.sum(0)
     # sqrsum = sqrsum.sum(0)
 
@@ -574,7 +596,7 @@ def mhc_fused_post_pre_large_m(
         norm_weight,
         norm_eps,
         large_m_splitk=True,
-        is_res_w_preshuffle_bf16=is_res_w_preshuffle_bf16,
+        is_w_preshuffle_bf16=is_res_w_preshuffle_bf16,
     )
     return post_mix, comb_mix, layer_input_out, next_residual
 
@@ -651,7 +673,7 @@ def mhc_fused_post_pre(
             sinkhorn_repeat,
             norm_weight,
             norm_eps,
-            is_res_w_preshuffle_bf16=is_res_w_preshuffle_bf16,
+            is_w_preshuffle_bf16=is_res_w_preshuffle_bf16,
         )
         return post_mix, comb_mix, layer_input_out, next_residual
 
@@ -704,7 +726,9 @@ def mhc_fused_post_pre(
     )
 
     selected_splitk, selected_tile_m, selected_tile_n, selected_tile_k = (
-        get_mhc_fused_post_pre_config(m, hidden_size)
+        get_mhc_fused_post_pre_config(
+            m, hidden_size, is_res_w_preshuffle_bf16=bool(is_res_w_preshuffle_bf16)
+        )
     )
     n_splits = selected_splitk
     device = layer_input.device

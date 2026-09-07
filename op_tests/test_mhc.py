@@ -460,7 +460,7 @@ def mhc_pre_norm_split_hip(
 
 @benchmark()
 def test_mhc_pre(
-    m, hidden_size, hc_mult, test_hc_head=False, fuse_rmsnorm=False, res_w_preshuffle_bf16=False
+    m, hidden_size, hc_mult, test_hc_head=False, fuse_rmsnorm=False, w_preshuffle_bf16=False
 ):
     if fuse_rmsnorm and test_hc_head:
         raise ValueError("fuse_rmsnorm and hc_head are mutually exclusive")
@@ -527,10 +527,10 @@ def test_mhc_pre(
     ret["hip_us"] = hip_us
 
     # bf16 GEMM path: pre-pack fn (fp32) -> int32 (hi<<16|lo) ONCE via mhc_pre_convert_fn
-    # (fn are constant weights), then run mhc_pre with is_res_w_preshuffle_bf16=1 so the gemm
+    # (fn are constant weights), then run mhc_pre with is_w_preshuffle_bf16=1 so the gemm
     # bit-extracts hi/lo instead of recomputing the fp32->bf16 split per (m_block, k).
     # On gfx950 this uses the native bf16 MFMA; gfx1250 the wave32 bf16 WMMA (UNVERIFIED).
-    if res_w_preshuffle_bf16:
+    if w_preshuffle_bf16:
         from aiter.ops.mhc import mhc_pre_convert_fn
 
         fn_packed = torch.empty(
@@ -547,7 +547,7 @@ def test_mhc_pre(
             fn_packed,
             hc_scale,
             hc_base,
-            is_res_w_preshuffle_bf16=1,
+            is_w_preshuffle_bf16=1,
             **hip_kwargs,
         )
         ret["hip_bf16_err"] = checkAllclose(
@@ -799,7 +799,8 @@ def test_mhc_post_pre(
     """Fused mhc_post + mhc_pre: HIP ``mhc_fused_post_pre`` vs ref / unfused HIP / Triton.
 
     --res_w_preshuffle_bf16 toggles the gemm compute for ALL HIP paths (unfused, fused, large_m):
-    on -> pre-packed bf16 hi/lo MFMA (is_res_w_preshuffle_bf16=1); off -> fp32.
+    on -> pre-packed BF16 hi/lo compute; off -> fp32.
+    Only the fused path additionally switches the residual to a shuffled layout.
     """
     if hidden_size < 512:
         aiter.logger.info(
@@ -859,7 +860,7 @@ def test_mhc_post_pre(
     ret = {"fuse_rmsnorm": fuse_rmsnorm, "res_w_preshuffle_bf16": res_w_preshuffle_bf16}
 
     # --res_w_preshuffle_bf16 toggles the gemm compute for all HIP paths: on -> pre-pack fn (fp32)
-    # into int32 (hi<<16|lo) ONCE via mhc_pre_convert_fn and run with is_res_w_preshuffle_bf16=1 so
+    # into int32 BF16 hi/lo ONCE via mhc_pre_convert_fn and enable BF16 GEMM so
     # the gemm bit-extracts hi/lo (gfx950 native bf16 MFMA; gfx1250 wave32 bf16 WMMA,
     # UNVERIFIED; other arches fall back to fp32); off -> plain fp32 fn.
     if res_w_preshuffle_bf16:
@@ -902,7 +903,7 @@ def test_mhc_post_pre(
         fn_gemm,
         hc_scale,
         hc_base,
-        is_res_w_preshuffle_bf16=pack_flag,
+        is_w_preshuffle_bf16=pack_flag,
         **hip_kwargs,
     )
 
@@ -1099,7 +1100,7 @@ for dtype in args.dtype:
                     hc_mult=hc_mult,
                     test_hc_head=args.hc_head,
                     fuse_rmsnorm=args.fuse_rmsnorm,
-                    res_w_preshuffle_bf16=args.res_w_preshuffle_bf16,
+                    w_preshuffle_bf16=args.res_w_preshuffle_bf16,
                 )
                 df.append(ret)
 df = pd.DataFrame(df)

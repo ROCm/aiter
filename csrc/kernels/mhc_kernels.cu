@@ -21,7 +21,7 @@ namespace aiter {
     static constexpr bool mhc_async_load_oob_guard = false;
 #endif
 
-    // is_res_w_preshuffle_bf16 selects the bf16 (fn hi/lo split) matrix compute over the fp32
+    // The packed-weight path selects the bf16 (fn hi/lo split) matrix compute over the fp32
     // one. Wave64 CDNA (gfx942/gfx950/gfx9_4_generic) use opus::mfma<bf16,..,16,16,32>
     // (8 bf16/lane) -- native K=32 on gfx950, chained K=16 (mfma_..16x16x16bf16_1k) on
     // gfx942; gfx1250 uses the wave32 wmma_f32_16x16x32_bf16 (16 bf16/lane, UNVERIFIED
@@ -121,7 +121,7 @@ namespace aiter {
 
     // Pre-convert fn (fp32) into a packed dword: hi = bf16(fn) in [31:16], lo = bf16(fn -
     // fp32(hi)) in [15:0]. Same 4-byte width as fp32 so the gemm's load / LDS / swizzle are
-    // unchanged; the bf16 gemm (is_res_w_preshuffle_bf16) then bit-extracts hi/lo instead of
+    // unchanged; the bf16 gemm then reads the pre-packed hi/lo instead of
     // recomputing the fp32->bf16 split per (m_block, k) -- the split was redundant work
     // repeated m_blocks times. fn are model weights (constant across forward passes), so
     // this runs once and the packed int32 tensor is reused every forward.
@@ -222,7 +222,7 @@ namespace aiter {
     mma_f32_16x16x4_fma((a), (b), (c))
 #endif
 
-    template <typename DTYPE_I, int num_warps, int tile_m, int tile_n, int tile_k, bool is_res_w_preshuffle_bf16 = false>
+    template <typename DTYPE_I, int num_warps, int tile_m, int tile_n, int tile_k, bool is_w_preshuffle_bf16 = false>
     __global__ __launch_bounds__(num_warps *  opus::get_warp_size(), 2)
     void mhc_pre_gemm_sqrsum_kernel(
         float* out,
@@ -261,7 +261,7 @@ namespace aiter {
         // The LDS test keeps tile_k=128 -- 67584 B/workgroup, past the 64 KiB limit --
         // degrading to the per-lane load instead of failing to launch, should gfx1250
         // ever dispatch it (get_mhc_pre_splitk offers only 64 off gfx9).
-        static constexpr bool x_tdm = mhc_pre_x_tdm && is_res_w_preshuffle_bf16
+        static constexpr bool x_tdm = mhc_pre_x_tdm && is_w_preshuffle_bf16
                                       && (x_tdm_lds_bytes <= 64 * 1024);
 #else
         static constexpr bool x_tdm = false;
@@ -835,20 +835,20 @@ namespace aiter {
                 if constexpr (x_tdm) { lds_load_x_tile((k) + 2, (LDS_SLOT)); }                     \
             }                                                                                      \
         } while (0)
-        // is_res_w_preshuffle_bf16: bf16 hi/lo MFMA; otherwise fp32 MFMA. The bf16 body (and the
+        // is_w_preshuffle_bf16: bf16 hi/lo MFMA; otherwise fp32 MFMA. The bf16 body (and the
         // gfx950-only mfma_f32_16x16x32_bf16 builtin) exists only in the gfx950 device
         // pass; every other arch compiles the fp32 path unconditionally, so the flag is
         // a no-op there (falls back to fp32).
 #if MHC_BF16_MFMA
 #define MHC_PRE_GEMM_STEP(BUF, LDS_SLOT, k, DO_PREFETCH, X_WAIT)                    \
-        if constexpr (is_res_w_preshuffle_bf16) {                                   \
+        if constexpr (is_w_preshuffle_bf16) {                                   \
             GEMM_LOOP_BODY_BF16(BUF, LDS_SLOT, k, DO_PREFETCH);           \
         } else {                                                          \
             GEMM_LOOP_BODY(BUF, LDS_SLOT, k, DO_PREFETCH, X_WAIT);               \
         }
 #elif defined(__gfx1250__)
 #define MHC_PRE_GEMM_STEP(BUF, LDS_SLOT, k, DO_PREFETCH, X_WAIT)                    \
-        if constexpr (is_res_w_preshuffle_bf16) {                                   \
+        if constexpr (is_w_preshuffle_bf16) {                                   \
             GEMM_LOOP_BODY_BF16_W32(BUF, LDS_SLOT, k, DO_PREFETCH, X_WAIT);       \
         } else {                                                          \
             GEMM_LOOP_BODY(BUF, LDS_SLOT, k, DO_PREFETCH, X_WAIT);               \
@@ -937,9 +937,9 @@ namespace aiter {
         aiter_tensor_t& out, // (split_k, m, hc_mult3) / (m, hc_mult3)
         aiter_tensor_t& sqrsum, // (split_k, m) / (m)
         aiter_tensor_t& x, // (m, hc_hidden_size)
-        aiter_tensor_t& fn, // (hc_mult3, hc_hidden_size) fp32; packed int32 (hi<<16|lo) when is_res_w_preshuffle_bf16
+        aiter_tensor_t& fn, // (hc_mult3, hc_hidden_size) fp32; packed int32 BF16 hi/lo when is_w_preshuffle_bf16
         int tile_k = 128,
-        int is_res_w_preshuffle_bf16 = 0
+        int is_w_preshuffle_bf16 = 0
     )
     {
         AITER_CHECK(out.size(0) == sqrsum.size(0), "out and sqrsum must have the same number of split_k or m");
@@ -958,7 +958,7 @@ namespace aiter {
         const HipDeviceGuard device_guard(x.device_id);
         const hipStream_t stream = aiter::getCurrentHIPStream();
 
-        if (is_res_w_preshuffle_bf16) {
+        if (is_w_preshuffle_bf16) {
 #define MHC_PRE_BF16 true
             MHC_PRE_GEMM_SQRSUM_KERNEL_DISPATCH(tile_k);
 #undef MHC_PRE_BF16
@@ -2482,7 +2482,7 @@ namespace aiter {
         MHC_PRE_BIG_FUSE_RM_KERNEL_DISPATCH(m);
     }
 
-    template <typename DTYPE_I, int num_warps, int hc_mult, int tile_m, int tile_n, int tile_k, bool store_nt, bool is_res_w_preshuffle_bf16 = false>
+    template <typename DTYPE_I, int num_warps, int hc_mult, int tile_m, int tile_n, int tile_k, bool store_nt, bool is_res_w_preshuffle_bf16 = false, bool decode_direct_store = false>
     __global__ __launch_bounds__(num_warps * opus::get_warp_size(), 1)
     void mhc_fused_post_pre_gemm_sqrsum_kernel(
         float* out,
@@ -2521,9 +2521,14 @@ namespace aiter {
         // (warps 0/1 issue residual/x), or that warp would carry n_stages loads +
         // n_stages stores = 4 tensor ops in flight, over the per-wave limit of 3.
         static constexpr bool nres_tdm = mhc_nres_tdm_store && is_res_w_preshuffle_bf16
-                                         && mhc_res_shuffle && (num_warps > 2);
+                                         && mhc_res_shuffle && (num_warps > 2) && !decode_direct_store;
 #else
         static constexpr bool nres_tdm = false;
+#endif
+#if defined(__gfx1250__)
+        static constexpr bool decode_pipeline = decode_direct_store && is_res_w_preshuffle_bf16 && mhc_res_shuffle;
+#else
+        static constexpr bool decode_pipeline = false;
 #endif
         // Staging tile for the next_residual TDM store; same layout as s_residual.
         __shared__ DTYPE_I s_nres[nres_tdm ? n_stages * tile_m * hc_mult * tile_k : 1];
@@ -2813,7 +2818,7 @@ namespace aiter {
         __builtin_amdgcn_sched_barrier(0);
         opus::static_for<n_stages>([&](auto S) {
             constexpr int s = S.value;
-            if constexpr (s >= 1) {
+            if constexpr (s >= 1 && !decode_pipeline) {
                 if (s < k_loop) {
                     lds_load_x_tile(s, s);
                     lds_load_residual_tile(s, s);
@@ -2842,16 +2847,37 @@ namespace aiter {
             for(int b = 0; b < m_repeat; b++) {
                 int s_offset = b * band_mk + lane_id % mfma_m * tile_k + lane_id / mfma_m * vec_tile;
                 [[maybe_unused]] float res_buf[2][ds_read_vec];  // gfx1250 bf16: buffer 2 j's -> 16/lane
+                // Issue both halves of the BF16 fragment before consuming either.
+                // Native LDS loads retain their register dependencies, so the
+                // compiler can wait at use instead of draining to a fixed count.
+                using pref_vec = opus::vector_t<DTYPE_I, ds_read_vec>;
+                pref_vec pref_x[band_j], pref_res[band_j][hc_mult];
+                if constexpr (decode_pipeline) {
+                    for (int pj = 0; pj < band_j; ++pj) {
+                        const int off = s_offset + pj * step;
+                        pref_x[pj] = *reinterpret_cast<pref_vec*>(s_x_rd_ptr + off);
+                        const int kl = off % tile_k;
+                        const int row = b * mfma_m + lane_id % mfma_m;
+                        const int rb = (kl / res_ks) * res_kb_stride_lds + row * res_ks + kl % res_ks;
+                        for (int h = 0; h < hc_mult; ++h)
+                            pref_res[pj][h] = *reinterpret_cast<pref_vec*>(s_residual_rd_ptr + rb + h * res_h_stride_lds);
+                    }
+                    __builtin_amdgcn_sched_barrier(0);
+                }
                 for(int j = 0; j < band_j; j++) {
                     opus::vector_t<float, ds_read_vec> res;
                     using DTYPE_I_vec = opus::vector_t<DTYPE_I, ds_read_vec>;
-                    DTYPE_I_vec x_vec = *(reinterpret_cast<DTYPE_I_vec*>(s_x_rd_ptr + s_offset));
+                    DTYPE_I_vec x_vec;
+                    if constexpr (decode_pipeline) x_vec = pref_x[j];
+                    else x_vec = *(reinterpret_cast<DTYPE_I_vec*>(s_x_rd_ptr + s_offset));
                     DTYPE_I_vec residual_vec[hc_mult];
                     // k_local within the k-step; ds_read_vec == KS keeps each read
                     // inside exactly one kk run, so only the addressing changes.
                     [[maybe_unused]] const int res_kl = s_offset % tile_k;
                     [[maybe_unused]] const int res_row = b * mfma_m + lane_id % mfma_m;
-                    if constexpr (res_shuf) {
+                    if constexpr (decode_pipeline) {
+                        for (int h = 0; h < hc_mult; ++h) residual_vec[h] = pref_res[j][h];
+                    } else if constexpr (res_shuf) {
                         static_assert(ds_read_vec <= res_ks && res_ks % ds_read_vec == 0,
                                       "ds_read_vec must divide mhc_res_ks");
                         const int r_base = (res_kl / res_ks) * res_kb_stride_lds
@@ -2865,7 +2891,7 @@ namespace aiter {
                             residual_vec[h] = *(reinterpret_cast<DTYPE_I_vec*>(s_residual_rd_ptr + s_offset + h * tile_mk));
                         }
                     }
-                    s_wait_all_dscnt(opus::number<hc_mult>{});
+                    if constexpr (!decode_pipeline) s_wait_all_dscnt(opus::number<hc_mult>{});
                     for(int k = 0; k < ds_read_vec; k++) {
                         res[k] = static_cast<float>(x_vec[k]) * post_mix_v[b];
                     }
@@ -3083,58 +3109,84 @@ namespace aiter {
         auto tdm_store_nres_tile = [](int, int){};
 #endif
 
-        int i = 0;
-        for(; i + 2 * n_stages - 1 < k_loop; i += n_stages) {
-            opus::static_for<n_stages>([&](auto S) {
-                constexpr int s = S.value;
-                wait_load_cnt();
-                compute_store_tile(i + s, s, v_fn[s]);
-                nres_deposit_fence();
-                __builtin_amdgcn_s_barrier();
-                tdm_store_nres_tile(i + s, s);
-                lds_load_x_tile(i + s + n_stages, s);
-                lds_load_residual_tile(i + s + n_stages, s);
-                v_fn[s] = vgpr_load_fn_tile(i + s + n_stages);
-                __builtin_amdgcn_sched_barrier(0);
-            });
-        }
-
-        // Tail: at most 2*n_stages-1 stages left. Unrolled over the same slot
-        // sequence (slot = s % n_stages, compile-time) with two runtime guards:
-        //   k < k_loop            -- this stage exists at all
-        //   k + n_stages < k_loop -- the ring can still be refilled from this step
-        // Once refilling stops the outstanding count falls below n_stages-1, so
-        // wait_load_cnt()'s partial drain would no longer prove residency; those
-        // steps take the full drain instead. Conservative by at most one step (the
-        // k+n_stages == k_loop case still has n_stages-1 outstanding), which is
-        // exactly what the previous hand-rolled 2-stage tail did.
-        opus::static_for<2 * n_stages - 1>([&](auto S) {
-            constexpr int s = S.value;
-            const int k = i + s;
-            if (k < k_loop) {
-                constexpr int slot = s % n_stages;
-                if (k + n_stages < k_loop) {
+        if constexpr (decode_pipeline) {
+            // Publish the current TDM tile and finish the preceding tile's reads
+            // at one barrier. Only then overwrite the preceding LDS slot with
+            // the next tile. Its transfer overlaps the current tile's compute.
+            // Direct next_residual stores need no cross-wave LDS deposit.
+            for (int i = 0; i < k_loop; i += n_stages) {
+                opus::static_for<n_stages>([&](auto S) {
+                    constexpr int slot = S.value;
+                    const int k = i + slot;
+                    if (k < k_loop) {
+                        MHC_TDM_DRAIN();
+                        s_wait_all_loadcnt(0_I, opus::number<-1>{});
+                        __builtin_amdgcn_s_barrier();
+                        if (k + 1 < k_loop) {
+                            constexpr int next_slot = (slot + 1) % n_stages;
+                            lds_load_x_tile(k + 1, next_slot);
+                            lds_load_residual_tile(k + 1, next_slot);
+                            v_fn[next_slot] = vgpr_load_fn_tile(k + 1);
+                            __builtin_amdgcn_sched_barrier(0);
+                        }
+                        compute_store_tile(k, slot, v_fn[slot]);
+                    }
+                });
+            }
+        } else {
+            int i = 0;
+            for(; i + 2 * n_stages - 1 < k_loop; i += n_stages) {
+                opus::static_for<n_stages>([&](auto S) {
+                    constexpr int s = S.value;
                     wait_load_cnt();
-                    compute_store_tile(k, slot, v_fn[slot]);
+                    compute_store_tile(i + s, s, v_fn[s]);
                     nres_deposit_fence();
                     __builtin_amdgcn_s_barrier();
-                    tdm_store_nres_tile(k, slot);
-                    lds_load_x_tile(k + n_stages, slot);
-                    lds_load_residual_tile(k + n_stages, slot);
-                    v_fn[slot] = vgpr_load_fn_tile(k + n_stages);
-                } else {
-                    s_wait_all_loadcnt(0_I, 0_I);
-                    MHC_TDM_DRAIN();
-                    __builtin_amdgcn_s_barrier();
-                    compute_store_tile(k, slot, v_fn[slot]);
-                    if constexpr (nres_tdm) {
+                    tdm_store_nres_tile(i + s, s);
+                    lds_load_x_tile(i + s + n_stages, s);
+                    lds_load_residual_tile(i + s + n_stages, s);
+                    v_fn[s] = vgpr_load_fn_tile(i + s + n_stages);
+                    __builtin_amdgcn_sched_barrier(0);
+                });
+            }
+
+            // Tail: at most 2*n_stages-1 stages left. Unrolled over the same slot
+            // sequence (slot = s % n_stages, compile-time) with two runtime guards:
+            //   k < k_loop            -- this stage exists at all
+            //   k + n_stages < k_loop -- the ring can still be refilled from this step
+            // Once refilling stops the outstanding count falls below n_stages-1, so
+            // wait_load_cnt()'s partial drain would no longer prove residency; those
+            // steps take the full drain instead. Conservative by at most one step (the
+            // k+n_stages == k_loop case still has n_stages-1 outstanding), which is
+            // exactly what the previous hand-rolled 2-stage tail did.
+            opus::static_for<2 * n_stages - 1>([&](auto S) {
+                constexpr int s = S.value;
+                const int k = i + s;
+                if (k < k_loop) {
+                    constexpr int slot = s % n_stages;
+                    if (k + n_stages < k_loop) {
+                        wait_load_cnt();
+                        compute_store_tile(k, slot, v_fn[slot]);
                         nres_deposit_fence();
                         __builtin_amdgcn_s_barrier();
                         tdm_store_nres_tile(k, slot);
+                        lds_load_x_tile(k + n_stages, slot);
+                        lds_load_residual_tile(k + n_stages, slot);
+                        v_fn[slot] = vgpr_load_fn_tile(k + n_stages);
+                    } else {
+                        s_wait_all_loadcnt(0_I, 0_I);
+                        MHC_TDM_DRAIN();
+                        __builtin_amdgcn_s_barrier();
+                        compute_store_tile(k, slot, v_fn[slot]);
+                        if constexpr (nres_tdm) {
+                            nres_deposit_fence();
+                            __builtin_amdgcn_s_barrier();
+                            tdm_store_nres_tile(k, slot);
+                        }
                     }
                 }
-            }
-        });
+            });
+        }
         // Every next_residual TDM store must retire before the kernel ends.
         if constexpr (nres_tdm) { MHC_TDM_DRAIN(); }
 
@@ -3160,7 +3212,14 @@ namespace aiter {
             for (int b = 0; b < m_repeat; b++)
                 sqrsum_w[b] = cross_row_sum_4(sqrsum_part[b], lane_id);
         }
-        __syncthreads();  // (1) s_residual reads (last compute tile) done before reuse
+        if constexpr (decode_pipeline) {
+            // Only LDS is exchanged across waves here. next_residual stores
+            // can remain in flight until kernel completion.
+            s_wait_all_dscnt(0_I);
+            __builtin_amdgcn_s_barrier();
+        } else {
+            __syncthreads();
+        }  // (1) finish reads before scratch reuse
         if (warp_id != 0) {
             int base = (warp_id - 1) * warp_size * v_per_lane + lane_id * v_per_lane;
             int c = 0;
@@ -3172,7 +3231,12 @@ namespace aiter {
                 for (int b = 0; b < m_repeat; b++)
                     s_sq[((warp_id - 1) * mfma_m + lane_id) * m_repeat + b] = sqrsum_w[b];
         }
-        __syncthreads();  // (2) all deposits visible
+        if constexpr (decode_pipeline) {
+            s_wait_all_dscnt(0_I);
+            __builtin_amdgcn_s_barrier();
+        } else {
+            __syncthreads();
+        }  // (2) all LDS deposits visible
         if (warp_id == 0) {
             for (int w = 0; w < hc_mult - 1; w++) {
                 int base = w * warp_size * v_per_lane + lane_id * v_per_lane;
@@ -3201,7 +3265,7 @@ namespace aiter {
         }
     }
 
-#define MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL_(num_warps, tile_m, tile_n, tile_k, store_nt) \
+#define MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL_(num_warps, tile_m, tile_n, tile_k, store_nt, decode_direct_store) \
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(layer_input.dtype(), "mhc_fused_post_pre_gemm_sqrsum", [&] { \
         using DTYPE_I = typename hip2opus<scalar_t>::type; \
         int mb = (m + tile_m - 1) / tile_m; \
@@ -3211,7 +3275,7 @@ namespace aiter {
                     "hidden_size must be divisible by tile_k * split_k"); \
         AITER_CHECK(hidden_size >= (tile_k * split_k), \
                     "hidden_size must be >= tile_k * split_k (>=1 k-tile per split)"); \
-        mhc_fused_post_pre_gemm_sqrsum_kernel<DTYPE_I, num_warps, 4, tile_m, tile_n, tile_k, store_nt, MHC_FUSED_BF16> \
+        mhc_fused_post_pre_gemm_sqrsum_kernel<DTYPE_I, num_warps, 4, tile_m, tile_n, tile_k, store_nt, MHC_FUSED_BF16, decode_direct_store> \
             <<<grid, block, 0, stream>>>( \
                 reinterpret_cast<float*>(gemm_out_mul.data_ptr()), \
                 reinterpret_cast<float*>(gemm_out_sqrsum.data_ptr()), \
@@ -3230,9 +3294,9 @@ namespace aiter {
 
 #define MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL(num_warps, tile_m, tile_n, tile_k) \
     if (m >= 8 * cu_num) { \
-        MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL_(num_warps, tile_m, tile_n, tile_k, true); \
+        MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL_(num_warps, tile_m, tile_n, tile_k, true, false); \
     } else { \
-        MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL_(num_warps, tile_m, tile_n, tile_k, false); \
+        MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL_(num_warps, tile_m, tile_n, tile_k, false, false); \
     }
 
 #define MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_CASE(TM, TN, TK) \
@@ -3324,6 +3388,20 @@ namespace aiter {
 
         if (is_res_w_preshuffle_bf16) {
 #define MHC_FUSED_BF16 true
+            // Packed BF16 decode: direct stores and the single-barrier pipeline
+            // support both row tile sizes throughout the measured decode range.
+            if (WARP_SIZE == 32 && cu_num == 256 && m > 0 && m <= 1024
+                && (hidden_size == 4096 || hidden_size == 7168)
+                && tile_n == 32 && tile_k == 32) {
+                if (tile_m == 16) {
+                    MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL_(4, 16, 32, 32, false, true);
+                    return;
+                }
+                if (tile_m == 32) {
+                    MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL_(4, 32, 32, 32, false, true);
+                    return;
+                }
+            }
             MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_DISPATCH(tile_k);
 #undef MHC_FUSED_BF16
         } else {
