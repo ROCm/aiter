@@ -91,6 +91,7 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
     split_k: int = 1,
     x_scale_transposed: bool = True,
     a_preshuffle: bool = False,
+    persistent_n_tiles: int = 1,
 ) -> Tensor:
     """Run the gfx1250 WMMA mxfp8_128 bpreshuffle GEMM.
 
@@ -206,6 +207,27 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
                 f"stride(0)={Out.stride(0)}"
             )
 
+    if persistent_n_tiles < 1:
+        raise RuntimeError(
+            f"[FlyDSL gfx1250 mxfp8_128] persistent_n_tiles must be >= 1, got {persistent_n_tiles}"
+        )
+    if persistent_n_tiles > 1:
+        if not compute_bound:
+            raise RuntimeError(
+                "[FlyDSL gfx1250 mxfp8_128] persistent_n_tiles>1 is compute-bound only"
+            )
+        if split_k != 1:
+            raise RuntimeError(
+                "[FlyDSL gfx1250 mxfp8_128] persistent_n_tiles>1 requires split_k=1"
+            )
+        n_tiles = N // tile_n
+        if n_tiles % persistent_n_tiles or (n_tiles // persistent_n_tiles) % cluster_n:
+            raise RuntimeError(
+                f"[FlyDSL gfx1250 mxfp8_128] persistent_n_tiles={persistent_n_tiles} needs "
+                f"N/tile_n={n_tiles} divisible by it and the quotient a multiple "
+                f"of cluster_n={cluster_n}"
+            )
+
     if a_preshuffle and M % 2 != 0:
         raise RuntimeError(
             f"[FlyDSL gfx1250 mxfp8_128] a_preshuffle needs M % 2 == 0, got M={M}; "
@@ -259,10 +281,8 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
         True,
     )
     launch = _launch_gemm_a8w8_compute_bound if compute_bound else _launch_gemm_a8w8
-    # a_preshuffle is last on both launchers; the generic one has
-    # batched/preload_ks/batch in between, left at their defaults.
     if compute_bound:
-        launch(*launch_args, BLOCK_K, split_k, a_preshuffle)
+        launch(*launch_args, BLOCK_K, split_k, a_preshuffle, persistent_n_tiles)
     else:
         launch(*launch_args, BLOCK_K, split_k, False, 0, 1, a_preshuffle)
     if partials is not None:
@@ -285,7 +305,8 @@ NAME_SUFFIX_RE = (
     r"mw(?P<m_warp>\d+)_nw(?P<n_warp>\d+)_"
     r"nb(?P<num_buffers>\d+)_sk(?P<split_k>\d+)_"
     r"cm(?P<cluster_m>\d+)_cn(?P<cluster_n>\d+)"
-    r"(?P<a_preshuffle>_apre)?$"
+    r"(?P<a_preshuffle>_apre)?"
+    r"(?:_ps(?P<persistent_n_tiles>\d+))?$"
 )
 _KERNEL_NAME_RE = re.compile(rf"^{re.escape(WMMA_NAME_PREFIX)}_{NAME_SUFFIX_RE}")
 _COMPUTE_KERNEL_NAME_RE = re.compile(
@@ -300,8 +321,10 @@ def parse_wmma_kernel_name(name: str):
         return None
     groups = match.groupdict()
     a_preshuffle = groups.pop("a_preshuffle", None) is not None
+    persistent_n_tiles = groups.pop("persistent_n_tiles", None)
     cfg = {key: int(value) for key, value in groups.items()}
     cfg["a_preshuffle"] = a_preshuffle
+    cfg["persistent_n_tiles"] = int(persistent_n_tiles) if persistent_n_tiles else 1
     return cfg
 
 
@@ -370,4 +393,5 @@ def run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
         n_warp=cfg["n_warp"],
         x_scale_transposed=True,
         a_preshuffle=cfg["a_preshuffle"],
+        persistent_n_tiles=cfg["persistent_n_tiles"],
     )
