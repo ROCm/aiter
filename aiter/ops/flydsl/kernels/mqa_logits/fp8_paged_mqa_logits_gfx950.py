@@ -22,10 +22,8 @@ from ._fp8_paged_mqa_logits_gfx950 import (
     HEAD_DIM,
     MFMA_M,
     MFMA_N,
-    NEXT_N_MAX,
     KV_BLOCK_SIZE,
     PAGE_VMEM_LOADS,
-    PAGE_VMEM_STORES,
     SUPPORTED_HEADS,
     guarded_store,
     imin,
@@ -36,6 +34,7 @@ from ._fp8_paged_mqa_logits_gfx950 import (
     reduce_scores,
     schedule_mfma_valu_pairs,
     uceildiv,
+    page_vmem_stores,
     wait_vmcnt,
 )
 from ._mqa_logits_common import (
@@ -52,11 +51,13 @@ def _unwrap(value):
     return value.ir_value() if hasattr(value, "ir_value") else value
 
 
-def _build_kernel(*, index_dim: int, num_heads: int):
+def _build_kernel(*, index_dim: int, num_heads: int, next_n: int):
     m_tiles = num_heads // MFMA_M
+    n_rows = int(next_n)
+    store_vmem = page_vmem_stores(n_rows)
     kernel_name = (
         f"fp8_paged_mqa_logits_gfx950_H{num_heads}_D{HEAD_DIM}_"
-        f"bkv64_kvb{KV_BLOCK_SIZE}_r{B_RING}_nq{NEXT_N_MAX}_w1_nt_ps_flydsl"
+        f"bkv64_kvb{KV_BLOCK_SIZE}_r{B_RING}_nq{n_rows}_w1_nt_ps_flydsl"
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[64, 1, 1])
@@ -67,7 +68,6 @@ def _build_kernel(*, index_dim: int, num_heads: int):
         out_logits: fx.Tensor,
         context_lens: fx.Tensor,
         kv_indices: fx.Tensor,
-        next_n: fx.Int32,
         batch_size: fx.Int32,
         split_kv: fx.Int32,
         stride_q_batch: fx.Int32,
@@ -98,18 +98,19 @@ def _build_kernel(*, index_dim: int, num_heads: int):
         col_lo = page_lo * KV_BLOCK_SIZE
         col_hi = page_hi * KV_BLOCK_SIZE
 
+        next_n_c = fx.Int32(n_rows)
         a_rows = [
             [None for _ in range_constexpr(m_tiles)]
-            for _ in range_constexpr(NEXT_N_MAX)
+            for _ in range_constexpr(n_rows)
         ]
         w_rows = [
             [[None for _ in range_constexpr(DREG)] for _ in range_constexpr(m_tiles)]
-            for _ in range_constexpr(NEXT_N_MAX)
+            for _ in range_constexpr(n_rows)
         ]
-        for row in range_constexpr(NEXT_N_MAX):
-            q_row = imin(fx.Int32(row), next_n - 1)
+        for row in range_constexpr(n_rows):
+            q_row = fx.Int32(row)
             q_base = pid_batch * stride_q_batch + q_row * stride_q_next_n
-            out_row = pid_batch * next_n + q_row
+            out_row = pid_batch * next_n_c + q_row
             for mi in range_constexpr(m_tiles):
                 h = mi * MFMA_M + lane_mod_16
                 byte_base = q_base + h * stride_q_heads
@@ -162,12 +163,11 @@ def _build_kernel(*, index_dim: int, num_heads: int):
 
         def _store_row(row, col, scores, scale):
             q_row = fx.Int32(row)
-            q_limit = context_len - next_n + q_row
-            out_row = pid_batch * next_n + q_row
+            q_limit = context_len - next_n_c + q_row
+            out_row = pid_batch * next_n_c + q_row
             logit = reduce_scores(scores, w_rows[row], scale, m_tiles=m_tiles)
             writer = (
                 (lane_div_16 == 0)
-                & (q_row < next_n)
                 & (col < context_len)
                 & (col <= q_limit)
             )
@@ -185,17 +185,17 @@ def _build_kernel(*, index_dim: int, num_heads: int):
                 col = page_col + slot * MFMA_N + lane_mod_16
                 scores = [
                     mfma_scores(a_rows[row], b_slots[slot], m_tiles=m_tiles)
-                    for row in range_constexpr(NEXT_N_MAX)
+                    for row in range_constexpr(n_rows)
                 ]
                 if slot > 0:
                     schedule_mfma_valu_pairs(m_tiles=m_tiles)
-                    for row in range_constexpr(NEXT_N_MAX):
+                    for row in range_constexpr(n_rows):
                         _store_row(row, prev_col, prev_scores[row], prev_scale)
                 prev_scores = scores
                 prev_col = col
                 prev_scale = scale_slots[slot]
             schedule_mfma_valu_pairs(m_tiles=m_tiles)
-            for row in range_constexpr(NEXT_N_MAX):
+            for row in range_constexpr(n_rows):
                 _store_row(row, prev_col, prev_scores[row], prev_scale)
             rocdl.sched_barrier(0)
 
@@ -215,7 +215,7 @@ def _build_kernel(*, index_dim: int, num_heads: int):
                     # the current page (or leftover stores) has retired.
                     wait_vmcnt(PAGE_VMEM_LOADS)
                     _compute_page(fx.Int32(page_col), current_b, current_scale)
-                    wait_vmcnt(PAGE_VMEM_STORES)
+                    wait_vmcnt(store_vmem)
                     results = yield _pack_state(next_b, next_scale)
                 final_b, final_scale = _unpack_state(results)
                 _compute_page(stop, final_b, final_scale)
@@ -232,7 +232,6 @@ def _build_kernel(*, index_dim: int, num_heads: int):
         context_lens,
         kv_indices,
         grid_blocks,
-        next_n,
         batch_size,
         split_kv,
         stride_q_batch,
@@ -250,7 +249,6 @@ def _build_kernel(*, index_dim: int, num_heads: int):
             out_logits,
             context_lens,
             kv_indices,
-            next_n,
             batch_size,
             split_kv,
             stride_q_batch,
@@ -270,8 +268,8 @@ def _build_kernel(*, index_dim: int, num_heads: int):
 
 
 @lru_cache(maxsize=8)
-def _compile(*, index_dim: int, num_heads: int):
-    return _build_kernel(index_dim=index_dim, num_heads=num_heads)
+def _compile(*, index_dim: int, num_heads: int, next_n: int):
+    return _build_kernel(index_dim=index_dim, num_heads=num_heads, next_n=next_n)
 
 
 def flydsl_fp8_paged_mqa_logits_gfx950(
@@ -329,7 +327,9 @@ def flydsl_fp8_paged_mqa_logits_gfx950(
         else max(1, min(max_pages, int(SplitKV)))
     )
     grid_blocks = batch_size * split_kv
-    launcher = _compile(index_dim=int(index_dim), num_heads=int(heads))
+    launcher = _compile(
+        index_dim=int(index_dim), num_heads=int(heads), next_n=int(next_n)
+    )
     launcher.compile_hints = {**DEFAULT_COMPILE_HINTS, "waves_per_eu": 2}
     stream = stream or torch.cuda.current_stream(q_fp8.device)
     with torch.cuda.device(q_fp8.device.index):
@@ -342,7 +342,6 @@ def flydsl_fp8_paged_mqa_logits_gfx950(
             context_lens,
             kv_indices,
             int(grid_blocks),
-            int(next_n),
             int(batch_size),
             int(split_kv),
             int(q_fp8.stride(0)),

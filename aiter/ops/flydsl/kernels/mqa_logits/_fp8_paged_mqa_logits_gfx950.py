@@ -23,9 +23,13 @@ DREG = 4
 B_RING = KV_BLOCK_SIZE // MFMA_N
 # Per physical page: 4 tiles × (2× dwordx4 K + 1× f32 scale).
 PAGE_VMEM_LOADS = B_RING * 3
-# Predicated logit stores: 2 query rows × 4 tiles. Hot-loop pages are full, so
-# these 8 VM ops land after the next-page loads and can stay in flight.
+# Predicated logit stores: next_n query rows × 4 tiles. Hot-loop pages are full,
+# so these VM ops land after the next-page loads and can stay in flight.
 PAGE_VMEM_STORES = NEXT_N_MAX * B_RING
+
+
+def page_vmem_stores(next_n):
+    return int(next_n) * B_RING
 
 _NEUTRAL_E8M0 = 0x7F7F7F7F
 
