@@ -1210,6 +1210,9 @@ def _ensure_kids_compiled(candidate_kids):
                 third_party=d_args.get("third_party", []),
                 hipify=d_args.get("hipify", False),
                 flags_extra_hip_per_source=d_args.get("flags_extra_hip_per_source", {}),
+                # A runtime builder may hold the module lock without our extra
+                # kids. Waiting for it is not evidence that our request ran.
+                build_after_wait=True,
             )
             if "module_deepgemm_opus" not in _jit_core.rebuilded_list:
                 _jit_core.rebuilded_list.append("module_deepgemm_opus")

@@ -29,6 +29,8 @@ from jit_cache import (
     atomic_copy,
     publish_blob_sources,
     publish_compiled_kids,
+    require_blob_generation,
+    snapshot_compiled_kids,
     stage_blob_sources,
 )
 from torch_guard import torch_compile_guard
@@ -59,9 +61,13 @@ def mp_lock(
     MainFunc: Callable,
     FinalFunc: Callable | None = None,
     WaitFunc: Callable | None = None,
+    build_after_wait: bool = False,
 ):
     """
     Using FileBaton for multiprocessing.
+
+    With build_after_wait, a peer completing does not satisfy this invocation:
+    acquire the lock and run MainFunc with our request-specific arguments.
     """
     baton = FileBaton(lockPath)
     while True:
@@ -77,7 +83,7 @@ def mp_lock(
         # wait() returns True if the holder released normally (work done),
         # or False if it broke a stale lock left by a dead/abandoned holder --
         # in which case we loop and try to acquire + build ourselves.
-        if baton.wait():
+        if baton.wait() and not build_after_wait:
             if WaitFunc is not None:
                 return WaitFunc()
             return None
@@ -693,18 +699,20 @@ def _stage_blob_sources(
     blob_gen_cmd, op_dir, src_dir, sources, hipify, seed_files=None
 ):
     """Generate JIT sources in a deterministic transactional working tree."""
-    staging_dir = stage_blob_sources(
+    staging_dir, token = stage_blob_sources(
         blob_gen_cmd,
         op_dir,
         PY,
         logger=logger,
         log_commands=AITER_LOG_MORE > 0,
         seed_files=seed_files,
+        return_token=True,
     )
     if staging_dir is None:
-        return sources, None
+        return sources, None, None
     generated_sources = rename_cpp_to_cu([staging_dir], src_dir, hipify, recursive=True)
-    return sources + generated_sources, staging_dir
+    require_blob_generation(staging_dir, token)
+    return sources + generated_sources, staging_dir, token
 
 
 @torch_compile_guard()
@@ -936,6 +944,7 @@ def build_module(
     third_party,
     hipify=False,
     flags_extra_hip_per_source=None,
+    build_after_wait=False,
 ):
     os.makedirs(bd_dir, exist_ok=True)
     lock_path = f"{bd_dir}/lock_{md_name}"
@@ -1070,6 +1079,8 @@ def build_module(
 
         blob_dir = f"{op_dir}/blob"
         staged_blob_dir = None
+        staged_token = None
+        compiled_kids_snapshot = None
         seed_files = None
         if md_name == "module_deepgemm_opus":
             seed_files = [
@@ -1079,7 +1090,7 @@ def build_module(
                 )
             ]
         try:
-            sources, staged_blob_dir = _stage_blob_sources(
+            sources, staged_blob_dir, staged_token = _stage_blob_sources(
                 blob_gen_cmd,
                 op_dir,
                 src_dir,
@@ -1087,6 +1098,11 @@ def build_module(
                 hipify,
                 seed_files=seed_files,
             )
+            if staged_blob_dir is not None and md_name == "module_deepgemm_opus":
+                compiled_kids_snapshot = snapshot_compiled_kids(
+                    f"{staged_blob_dir}/compiled_kids_opus.json"
+                )
+                require_blob_generation(staged_blob_dir, staged_token)
         except Exception as error:  # noqa: BLE001
             raise_build_error(error)
         active_blob_dir = staged_blob_dir or blob_dir
@@ -1142,6 +1158,12 @@ def build_module(
                 )
 
         try:
+
+            def validate_generation():
+                if staged_blob_dir is not None:
+                    require_blob_generation(staged_blob_dir, staged_token)
+
+            validate_generation()
             _jit_compile(
                 md_name,
                 sorted(set(sources)),
@@ -1158,16 +1180,16 @@ def build_module(
                 hipify=hipify,
                 extra_cuda_cflags_per_source=flags_extra_hip_per_source,
             )
+            validate_generation()
             if is_python_module and not is_standalone:
-                atomic_copy(
-                    f"{opbd_dir}/{target_name}",
-                    f"{get_user_jit_dir()}/{target_name}",
-                )
+                artifact_path = f"{get_user_jit_dir()}/{target_name}"
             else:
-                atomic_copy(
-                    f"{opbd_dir}/{target_name}",
-                    f"{AITER_ROOT_DIR}/op_tests/cpp/mha/{target_name}",
-                )
+                artifact_path = f"{AITER_ROOT_DIR}/op_tests/cpp/mha/{target_name}"
+            installed_identity = atomic_copy(
+                f"{opbd_dir}/{target_name}",
+                artifact_path,
+                validate=validate_generation,
+            )
         except Exception as error:  # noqa: BLE001
             raise_build_error(error)
 
@@ -1175,9 +1197,10 @@ def build_module(
             if md_name == "module_deepgemm_opus":
                 try:
                     publish_compiled_kids(
-                        f"{staged_blob_dir}/compiled_kids_opus.json",
+                        compiled_kids_snapshot,
                         f"{bd_dir}/compiled_kids_opus.json",
-                        f"{get_user_jit_dir()}/{target_name}",
+                        artifact_path,
+                        installed_identity,
                     )
                 except Exception:
                     # A stale receipt cannot validate the newly installed .so.
@@ -1189,7 +1212,9 @@ def build_module(
                         exc_info=AITER_LOG_MORE > 0,
                     )
             try:
-                publish_blob_sources(staged_blob_dir, blob_dir)
+                publish_blob_sources(
+                    staged_blob_dir, blob_dir, expected_token=staged_token
+                )
             except Exception:
                 logger.warning(
                     "JIT build [%s] succeeded, but publishing its generated-source "
@@ -1204,7 +1229,12 @@ def build_module(
             f"\033[32mfinish build [{md_name}], cost {time.perf_counter() - startTS:.1f}s \033[0m"
         )
 
-    mp_lock(lockPath=lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
+    mp_lock(
+        lockPath=lock_path,
+        MainFunc=MainFunc,
+        FinalFunc=FinalFunc,
+        build_after_wait=build_after_wait,
+    )
 
 
 def _get_ck_exclude_modules():

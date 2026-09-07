@@ -7,6 +7,15 @@ atomically installed, JIT snapshots generated inputs into `{module}/blob`.
 Source-cache publication is best-effort: a failed copy or a peer winning the
 directory swap logs a warning and leaves the installed binary usable.
 
+The build carries the token returned by its own codegen through compilation.
+It checks the token before and after compilation, and again after copying the
+binary into its installation tempfile, before replacing the installed artifact.
+A changed/incomplete generation at these checkpoints fails the build without
+installing that artifact. Source-cache publication also requires the original
+token; it cannot publish a later generation on behalf of the earlier build.
+These checks detect overlapping codegen; they do not replace the module lock
+or protect against external edits that bypass the generation markers.
+
 ## Opus compiled-kid metadata
 
 The tuner reads `{bd_dir}/compiled_kids_opus.json`. Normal runtime dispatch
@@ -16,14 +25,26 @@ the tuner's `--extra_kids` request, then applies validity/architecture filters.
 Requests are passed on the command line, never written over the successful
 sidecar before compiling.
 
-After installing `module_deepgemm_opus.so`, JIT atomically copies the generated
-sidecar back to `{bd_dir}` and publishes an adjacent `.receipt`. This happens
-independently of source-cache publication. The receipt contains a SHA-256 of
+Before compiling, JIT snapshots the generated sidecar in memory and checks its
+generation token. After installing `module_deepgemm_opus.so`, JIT atomically
+writes that snapshot back to `{bd_dir}` and publishes an adjacent `.receipt`.
+This happens independently of source-cache publication. The receipt contains a SHA-256 of
 the sidecar and the installed binary's device, inode, size and nanosecond
 mtime/ctime. The tuner skips a rebuild only when the required kids are present
 and both fingerprints match. Missing/legacy metadata, a replaced or copied
 binary, and an interrupted metadata publication conservatively cause a
 rebuild. This receipt is a local freshness check, not a portable wheel manifest.
+The binary fingerprint comes from an open descriptor for the exact inode this
+invocation installed, not a later path lookup that could identify a peer's
+replacement. Metadata publication refuses an already replaced binary and never
+re-reads a potentially changed staging sidecar to certify the earlier compile.
+
+The tuner's request uses `build_after_wait=True`: if a normal runtime builder
+holds the module lock, the tuner waits, acquires the lock, and runs its own
+`--extra_kids` invocation. A peer finishing an unrelated build is not treated
+as completion of that request. This does not loop on metadata-write failures;
+after its own successful compile the binary is usable even if publishing the
+receipt fails. Other callers retain the existing skip-after-peer-success policy.
 
 `AITER_REBUILD=1` removes the module's build directory and installed `.so`;
 the canonical sidecar and receipt live one level above the module directory.
@@ -48,6 +69,13 @@ reclaimed. Live owners and remote owners are retained. Old-format artifacts
 without owner information use a 24-hour age grace. Cleanup is invoked by a
 build, not by a timer; an unused module's artifacts remain until it is built
 again or its build tree is explicitly cleared.
+
+If both publication and rollback fail, the last published backup is retained.
+The next locked codegen can restore a dead owner's backup or a backup retained
+by the same still-running process. If restoration remains denied and `blob`
+is absent, cleanup keeps backups regardless of age or dead-owner status.
+It still leaves live peers' and remote owners' backups alone. This exceptional
+retention prioritizes recoverability over reclaiming the last good snapshot.
 
 CPU-only measurements using the PR's CK submodule commit
 `af9e1d1f1ae347c22feeb08fd2d42645075e0c5d`, `--receipt 600`, on macOS:

@@ -19,6 +19,7 @@ import time
 import traceback
 import types
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from unittest import mock
 
@@ -402,6 +403,7 @@ with open(args.output_dir + "/generated.hpp", "w") as header:
 
     def test_abandoned_artifacts_are_reaped(self):
         with tempfile.TemporaryDirectory() as tmp:
+            _write(os.path.join(tmp, "blob", "published.cpp"), "// published\n")
             abandoned = [
                 os.path.join(tmp, ".blob-old-random-stage"),
                 os.path.join(tmp, ".blob-publish-old"),
@@ -416,6 +418,7 @@ with open(args.output_dir + "/generated.hpp", "w") as header:
 
     def test_dead_owner_is_reaped_without_waiting_for_legacy_grace(self):
         with tempfile.TemporaryDirectory() as tmp:
+            _write(os.path.join(tmp, "blob", "published.cpp"), "// published\n")
             # Use an actual, already-reaped child PID rather than guessing a PID.
             child = subprocess.Popen([sys.executable, "-c", "pass"])
             child.wait()
@@ -425,7 +428,21 @@ with open(args.output_dir + "/generated.hpp", "w") as header:
             legacy = os.path.join(tmp, ".blob-old-format")
             _write(os.path.join(legacy, "x.cpp"), "// recent legacy\n")
             jit_cache.cleanup_abandoned_blob_artifacts(tmp)
-            self.assertEqual(os.listdir(tmp), [os.path.basename(legacy)])
+            self.assertEqual(set(os.listdir(tmp)), {"blob", os.path.basename(legacy)})
+
+    def test_only_backup_survives_cleanup_even_after_owner_dies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            child = subprocess.Popen([sys.executable, "-c", "pass"])
+            child.wait()
+            names = [
+                f".blob-backup-{socket.gethostname()}.{child.pid}.dead",
+                ".blob-backup-old-format",
+                "blob.backup.legacy",
+            ]
+            for name in names:
+                _write(os.path.join(tmp, name, "published.cpp"), "// keep\n")
+            jit_cache.cleanup_abandoned_blob_artifacts(tmp, max_age_seconds=0)
+            self.assertEqual(set(os.listdir(tmp)), set(names))
 
     def test_live_remote_and_stable_trees_survive_cleanup(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -505,6 +522,35 @@ with open(args.output_dir + "/generated.hpp", "w") as header:
             self.assertEqual(os.listdir(os.path.dirname(destination)), ["module.so"])
 
 
+class TestModuleBuildLock(unittest.TestCase):
+    def test_wait_policy_preserves_default_and_retries_request_or_stale_lock(self):
+        for force, normal_release in ((False, True), (True, True), (False, False)):
+            with self.subTest(force=force, normal_release=normal_release):
+                baton = mock.Mock()
+                baton.try_acquire.side_effect = [False, True]
+                baton.wait.return_value = normal_release
+                lock = _load_functions(
+                    JIT_CACHE_PATH.parents[1] / "core.py",
+                    ["mp_lock"],
+                    {"Callable": Callable, "FileBaton": mock.Mock(return_value=baton)},
+                )["mp_lock"]
+                main, final, waiter = mock.Mock(), mock.Mock(), mock.Mock()
+                result = lock(
+                    "module.lock", main, final, waiter, build_after_wait=force
+                )
+                if normal_release and not force:
+                    self.assertIs(result, waiter.return_value)
+                    main.assert_not_called()
+                    final.assert_not_called()
+                    baton.release.assert_not_called()
+                else:
+                    self.assertIs(result, main.return_value)
+                    main.assert_called_once()
+                    final.assert_called_once()
+                    waiter.assert_not_called()
+                    baton.release.assert_called_once()
+
+
 class TestBuildPublication(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -573,6 +619,8 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
             "stage_blob_sources": jit_cache.stage_blob_sources,
             "publish_blob_sources": jit_cache.publish_blob_sources,
             "publish_compiled_kids": jit_cache.publish_compiled_kids,
+            "snapshot_compiled_kids": jit_cache.snapshot_compiled_kids,
+            "require_blob_generation": jit_cache.require_blob_generation,
             "atomic_copy": jit_cache.atomic_copy,
             "mp_lock": lambda **kwargs: kwargs["MainFunc"](),
             "rm_module": lambda _name: (
@@ -614,6 +662,35 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
         self.assertEqual(set(json.loads(_read(self.artifact))), {1, 7, 9})
         self.assertTrue(
             jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {1, 7, 9})
+        )
+
+    def test_module_without_codegen_does_not_require_a_generation(self):
+        sources = ["user.cu"]
+        result = self.core["_stage_blob_sources"](
+            [], self.op_dir, self.root, sources, False
+        )
+        self.assertEqual(result, (sources, None, None))
+        self.assertFalse(os.path.exists(self.op_dir))
+
+    def test_codegen_returns_own_token_even_if_peer_finishes_before_return(self):
+        self.build(7)
+        original_replace = jit_cache._replace
+
+        def replace_then_peer_token(source, destination, *args, **kwargs):
+            result = original_replace(source, destination, *args, **kwargs)
+            if destination.endswith(jit_cache.CODEGEN_COMPLETE_MARKER):
+                _write(destination, "peer-generation")
+            return result
+
+        self.core["_jit_compile"] = mock.Mock()
+        with mock.patch.object(
+            jit_cache, "_replace", side_effect=replace_then_peer_token
+        ), self.assertRaisesRegex(RuntimeError, "build .* failed"):
+            self.build(9)
+        self.core["_jit_compile"].assert_not_called()
+        self.assertEqual(set(json.loads(_read(self.artifact))), {1, 7})
+        self.assertTrue(
+            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {7})
         )
 
     def test_failed_compile_does_not_advance_sidecar(self):
@@ -684,8 +761,7 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
             jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {7})
         )
 
-    def test_tuner_retries_failed_request_without_trusting_old_membership(self):
-        self.build(7)
+    def load_tuner(self):
         d_args = {
             "srcs": [],
             "flags_extra_cc": [],
@@ -742,6 +818,11 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
                 "_opus_sidecar_path": lambda: self.sidecar,
             },
         )["_ensure_kids_compiled"]
+        return tuner, calls
+
+    def test_tuner_retries_failed_request_without_trusting_old_membership(self):
+        self.build(7)
+        tuner, calls = self.load_tuner()
         original_compile = self.core["_jit_compile"]
         with mock.patch.dict(os.environ), mock.patch.object(sys, "stderr"):
             self.assertFalse(tuner({7}))
@@ -756,6 +837,177 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
         self.assertTrue(all("--extra_kids 1 9" in command for command in calls))
         self.assertTrue(
             jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {1, 7, 9})
+        )
+
+    def test_tuner_module_lock_waiter_executes_its_own_request(self):
+        self.build(7)  # A runtime builder's completed binary lacks kid 9.
+        tuner, calls = self.load_tuner()
+        baton = mock.Mock()
+        baton.try_acquire.side_effect = [False, True]
+        baton.wait.return_value = True
+        self.core["mp_lock"] = _load_functions(
+            JIT_CACHE_PATH.parents[1] / "core.py",
+            ["mp_lock"],
+            {"Callable": Callable, "FileBaton": lambda _path: baton},
+        )["mp_lock"]
+        with mock.patch.dict(os.environ), mock.patch.object(sys, "stderr"):
+            self.assertTrue(tuner({9}))
+            self.assertEqual(os.environ["AITER_REBUILD"], "0")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(baton.try_acquire.call_count, 2)
+        baton.wait.assert_called_once()
+        baton.release.assert_called_once()
+        self.assertEqual(set(json.loads(_read(self.artifact))), {1, 7, 9})
+        self.assertTrue(
+            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {9})
+        )
+
+    def test_tuner_metadata_failure_does_not_loop_or_fail_successful_compile(self):
+        self.build(7)
+        tuner, calls = self.load_tuner()
+        self.core["publish_compiled_kids"] = mock.Mock(
+            side_effect=PermissionError("metadata denied")
+        )
+        with mock.patch.dict(os.environ), mock.patch.object(sys, "stderr"):
+            self.assertTrue(tuner({9}))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(set(json.loads(_read(self.artifact))), {1, 7, 9})
+        self.assertFalse(
+            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {9})
+        )
+
+    def restage(self, kid):
+        return jit_cache.stage_blob_sources(
+            f"{self.generator} --output_dir {{}} --extra_kids {kid}",
+            self.op_dir,
+            sys.executable,
+            seed_files=[(self.sidecar, "compiled_kids_opus.json")],
+        )
+
+    def test_generation_change_during_compile_rejects_install(self):
+        self.build(7)
+        original_compile = self.core["_jit_compile"]
+
+        def compile_then_restage(*args, **kwargs):
+            original_compile(*args, **kwargs)
+            self.restage(11)
+
+        self.core["_jit_compile"] = compile_then_restage
+        with self.assertRaisesRegex(RuntimeError, "build .* failed") as failure:
+            self.build(9)
+        self.assertIn("generation changed", str(failure.exception.__cause__))
+        self.assertEqual(set(json.loads(_read(self.artifact))), {1, 7})
+        self.assertEqual(set(json.loads(_read(self.sidecar))), {1, 7})
+        self.assertTrue(
+            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {7})
+        )
+
+    def test_generation_change_during_binary_copy_rejects_install(self):
+        self.build(7)
+        original_copy = jit_cache._copy2
+
+        def copy_then_restage(source, destination, *args, **kwargs):
+            result = original_copy(source, destination, *args, **kwargs)
+            if source.endswith("/build/module_deepgemm_opus.so"):
+                self.restage(11)
+            return result
+
+        with mock.patch.object(
+            jit_cache, "_copy2", side_effect=copy_then_restage
+        ), self.assertRaisesRegex(RuntimeError, "build .* failed"):
+            self.build(9)
+        self.assertEqual(set(json.loads(_read(self.artifact))), {1, 7})
+        self.assertTrue(
+            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {7})
+        )
+
+    def test_post_install_restage_cannot_relabel_binary_or_publish_wrong_sources(self):
+        self.build(7)
+        original_replace = jit_cache._replace
+
+        def install_then_restage(source, destination, *args, **kwargs):
+            result = original_replace(source, destination, *args, **kwargs)
+            if destination == self.artifact:
+                self.restage(11)
+            return result
+
+        with mock.patch.object(jit_cache, "_replace", side_effect=install_then_restage):
+            self.build(9)
+        self.assertEqual(set(json.loads(_read(self.artifact))), {1, 7, 9})
+        self.assertEqual(set(json.loads(_read(self.sidecar))), {1, 7, 9})
+        self.assertTrue(
+            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {9})
+        )
+        self.assertFalse(
+            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {11})
+        )
+        self.assertEqual(
+            set(
+                json.loads(
+                    _read(os.path.join(self.op_dir, "blob", "compiled_kids_opus.json"))
+                )
+            ),
+            {1, 7},
+        )
+        self.logger.warning.assert_called_once()
+        self.logger.error.assert_not_called()
+
+    def test_receipt_cannot_bind_to_peer_binary_replacing_ours_during_install(self):
+        self.build(7)
+        original_replace = jit_cache._replace
+        peer = os.path.join(self.root, "peer.so")
+        _write(peer, "[1, 11]")
+
+        def replace_then_peer(source, destination, *args, **kwargs):
+            result = original_replace(source, destination, *args, **kwargs)
+            if destination == self.artifact:
+                original_replace(peer, destination)
+            return result
+
+        with mock.patch.object(jit_cache, "_replace", side_effect=replace_then_peer):
+            self.build(9)
+        self.assertEqual(set(json.loads(_read(self.artifact))), {1, 11})
+        self.assertFalse(
+            jit_cache.compiled_kids_are_current(self.sidecar, self.artifact, {9})
+        )
+        self.logger.warning.assert_called_once()
+        self.logger.error.assert_not_called()
+
+    def test_failed_publication_and_rollback_keep_backup_for_same_process_retry(self):
+        self.build(7)
+        blob = os.path.join(self.op_dir, "blob")
+        original_replace = jit_cache._replace
+
+        def deny_blob_replace(source, destination, *args, **kwargs):
+            if destination == blob:
+                raise PermissionError("blob publication and recovery denied")
+            return original_replace(source, destination, *args, **kwargs)
+
+        with mock.patch.object(jit_cache, "_replace", side_effect=deny_blob_replace):
+            self.build(9)
+            self.assertFalse(os.path.exists(blob))
+            backups = _transaction_artifacts(self.op_dir)
+            self.assertEqual(len(backups), 1)
+            self.assertTrue(backups[0].startswith(".blob-backup-"))
+            backup_sidecar = os.path.join(
+                self.op_dir, backups[0], "compiled_kids_opus.json"
+            )
+            self.assertEqual(set(json.loads(_read(backup_sidecar))), {1, 7})
+            # The next locked codegen attempts recovery, but permission is still
+            # denied. Neither recovery nor cleanup may destroy the last backup.
+            self.restage(11)
+            self.assertTrue(os.path.exists(backup_sidecar))
+            jit_cache.cleanup_abandoned_blob_artifacts(self.op_dir, max_age_seconds=0)
+            self.assertTrue(os.path.exists(backup_sidecar))
+        self.assertEqual(set(json.loads(_read(self.artifact))), {1, 7, 9})
+        self.logger.warning.assert_called_once()
+        self.logger.error.assert_not_called()
+        # Recovery also works before this owner PID has exited.
+        self.restage(11)
+        self.assertEqual(_transaction_artifacts(self.op_dir), [])
+        self.assertEqual(
+            set(json.loads(_read(os.path.join(blob, "compiled_kids_opus.json")))),
+            {1, 7},
         )
 
 

@@ -116,7 +116,10 @@ def _marker_owner_is_active(marker_path):
 
 
 def _recover_blob_backup(blob_dir):
-    """Recover a cache moved aside by a publisher that died mid-swap."""
+    """Recover a dead publisher's backup, or our own failed rollback.
+
+    Called under the module build lock. A live peer's backup is never moved.
+    """
     if os.path.lexists(blob_dir):
         return
     op_dir = os.path.dirname(blob_dir)
@@ -125,7 +128,10 @@ def _recover_blob_backup(blob_dir):
             os.path.join(op_dir, name)
             for name in os.listdir(op_dir)
             if name.startswith(".blob-backup-")
-            and _artifact_owner_active(name) is not True
+            and (
+                name.startswith(_transaction_prefix("backup"))
+                or _artifact_owner_active(name) is not True
+            )
         ),
         key=lambda path: os.path.getmtime(path),
         reverse=True,
@@ -153,6 +159,12 @@ def cleanup_abandoned_blob_artifacts(op_dir, max_age_seconds=24 * 60 * 60):
         if name in {STAGING_DIRECTORY_NAME, "blob"}:
             continue
         if not name.startswith(_ABANDONED_ARTIFACT_PREFIXES):
+            continue
+        if name.startswith((".blob-backup-", "blob.backup.")) and not os.path.lexists(
+            os.path.join(op_dir, "blob")
+        ):
+            # Recovery may still be denied. Age/dead-owner cleanup must not
+            # destroy the only remaining published snapshot.
             continue
         owner_active = _artifact_owner_active(name)
         if owner_active is True:
@@ -182,6 +194,7 @@ def stage_blob_sources(
     logger=None,
     log_commands=False,
     seed_files=None,
+    return_token=False,
 ):
     """Run code generators in a stable, recoverable working directory.
 
@@ -193,7 +206,7 @@ def stage_blob_sources(
     commands = blob_gen_cmd if isinstance(blob_gen_cmd, list) else [blob_gen_cmd]
     commands = [command for command in commands if command]
     if not commands:
-        return None
+        return (None, None) if return_token else None
 
     os.makedirs(op_dir, exist_ok=True)
     blob_dir = os.path.join(op_dir, "blob")
@@ -216,8 +229,9 @@ def stage_blob_sources(
     os.chmod(staging_dir, _directory_mode(op_dir))
 
     token = uuid.uuid4().hex
+    generation = f"{os.getpid()}\n{socket.gethostname()}\n{token}\n"
     with open(incomplete_marker, "x", encoding="utf-8") as marker:
-        marker.write(f"{os.getpid()}\n{socket.gethostname()}\n{token}\n")
+        marker.write(generation)
     try:
         try:
             os.remove(complete_marker)
@@ -249,7 +263,8 @@ def stage_blob_sources(
                     "blob staging directory changed during code generation"
                 )
         _replace(incomplete_marker, complete_marker)
-        return staging_dir
+        # Return our token, not a fresh read that could belong to a peer.
+        return (staging_dir, generation) if return_token else staging_dir
     except BaseException:
         try:
             _restore_staging_directory(staging_dir, blob_dir, op_dir)
@@ -343,7 +358,13 @@ def _complete_stage_token(staging_dir):
         return None
 
 
-def publish_blob_sources(staging_dir, blob_dir):
+def require_blob_generation(staging_dir, token):
+    """Reject codegen overlap before installing a potentially mixed binary."""
+    if token is None or _complete_stage_token(staging_dir) != token:
+        raise RuntimeError("JIT blob generation changed during build")
+
+
+def publish_blob_sources(staging_dir, blob_dir, expected_token=None):
     """Atomically snapshot a complete staging tree into the ``blob`` cache.
 
     ``staging_dir`` remains in place so ``build.ninja`` and debug metadata keep
@@ -353,10 +374,13 @@ def publish_blob_sources(staging_dir, blob_dir):
     token_before = _complete_stage_token(staging_dir)
     if token_before is None:
         raise RuntimeError("refusing to publish incomplete JIT blob sources")
+    if expected_token is not None and token_before != expected_token:
+        raise RuntimeError("JIT blob generation changed before publication")
 
     op_dir = os.path.dirname(blob_dir)
     candidate_dir = tempfile.mkdtemp(prefix=_transaction_prefix("publish"), dir=op_dir)
     backup_dir = None
+    retain_backup = False
     try:
         # mkdtemp starts at 0700. Correct it before copying any contents, even
         # if publication later fails or the builder is killed during the copy.
@@ -376,18 +400,28 @@ def publish_blob_sources(staging_dir, blob_dir):
             candidate_dir = None
         except Exception:
             if backup_dir is not None and not os.path.lexists(blob_dir):
-                _replace(backup_dir, blob_dir)
+                try:
+                    _replace(backup_dir, blob_dir)
+                except OSError:
+                    # Both publication and rollback failed. Leave the backup
+                    # for the next locked build, even if this process stays alive.
+                    retain_backup = True
+                    raise
                 backup_dir = None
             raise
     finally:
         if candidate_dir is not None:
             _remove_path(candidate_dir)
-        if backup_dir is not None:
+        if backup_dir is not None and not retain_backup:
             _remove_path(backup_dir)
 
 
-def atomic_copy(source, destination):
-    """Copy ``source`` without exposing a partial ``destination`` file."""
+def atomic_copy(source, destination, validate=None):
+    """Install a complete copy and return the identity of this exact inode.
+
+    ``validate`` runs after copying, immediately before replacement. Holding
+    the copied inode open avoids accidentally identifying a peer's replacement.
+    """
     destination_dir = os.path.dirname(destination)
     os.makedirs(destination_dir, exist_ok=True)
     fd, temporary_path = tempfile.mkstemp(
@@ -398,7 +432,11 @@ def atomic_copy(source, destination):
     os.close(fd)
     try:
         _copy2(source, temporary_path)
-        _replace(temporary_path, destination)
+        with open(temporary_path, "rb") as copied:
+            if validate is not None:
+                validate()
+            _replace(temporary_path, destination)
+            return _stat_identity(os.fstat(copied.fileno()))
     finally:
         try:
             os.remove(temporary_path)
@@ -406,9 +444,12 @@ def atomic_copy(source, destination):
             pass
 
 
-def _artifact_identity(path):
-    info = os.stat(path)
+def _stat_identity(info):
     return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+
+
+def _artifact_identity(path):
+    return _stat_identity(os.stat(path))
 
 
 def compiled_kids_are_current(sidecar, artifact, required):
@@ -431,25 +472,40 @@ def compiled_kids_are_current(sidecar, artifact, required):
         return False
 
 
-def publish_compiled_kids(staged_sidecar, sidecar, artifact):
+def snapshot_compiled_kids(staged_sidecar):
+    """Keep the metadata compiled by this invocation, not a later staging tree."""
+    with open(staged_sidecar, "rb") as source:
+        return source.read(), stat.S_IMODE(os.fstat(source.fileno()).st_mode) & 0o666
+
+
+def publish_compiled_kids(snapshot, sidecar, artifact, identity):
     """Publish successful codegen metadata after installing its binary.
 
     The receipt detects the gap between the two atomic replacements. If this
     step fails, the installed binary remains usable and the tuner must rebuild
     before relying on the sidecar again. Called under the module build lock.
     """
-    identity = _artifact_identity(artifact)
-    with open(staged_sidecar, "rb") as source:
-        contents = source.read()
+    if _artifact_identity(artifact) != identity:
+        raise RuntimeError("installed Opus binary changed before metadata publication")
+    contents, mode = snapshot
     receipt = {"artifact": identity, "sha256": hashlib.sha256(contents).hexdigest()}
-    atomic_copy(staged_sidecar, sidecar)
+    fd, temporary_path = tempfile.mkstemp(
+        prefix=".opus-sidecar-", dir=os.path.dirname(sidecar)
+    )
+    try:
+        with os.fdopen(fd, "wb") as output:
+            os.chmod(temporary_path, mode)
+            output.write(contents)
+        _replace(temporary_path, sidecar)
+    finally:
+        _remove_path(temporary_path)
     fd, temporary_path = tempfile.mkstemp(
         prefix=".opus-receipt-", dir=os.path.dirname(sidecar)
     )
     try:
         # Avoid leaving a root-owned, unreadable tempfile in a packaged JIT tree.
         with os.fdopen(fd, "w", encoding="utf-8") as output:
-            os.chmod(temporary_path, _directory_mode(sidecar) & 0o666)
+            os.chmod(temporary_path, mode)
             json.dump(receipt, output)
         _replace(temporary_path, sidecar + ".receipt")
     finally:
