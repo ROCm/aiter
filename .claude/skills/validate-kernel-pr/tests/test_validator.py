@@ -3440,6 +3440,81 @@ class ShapeGridPluginTests(unittest.TestCase):
         self.assertIn("3 passed", result.stdout)
 
 
+class SkillProseContractTests(unittest.TestCase):
+    """SKILL.md is the prose a model acts on, so a stale sentence is a live defect.
+
+    The refactor that deleted the source-reading checks left three kinds of drift behind at
+    once: the schema still admitted a verdict nothing writes, the prose still named a state
+    the code no longer reached, and the invocation example had gone missing entirely while
+    every flag it used stayed real. None of that could fail a run, which is exactly why it
+    needs a test -- a wrong SKILL.md misleads silently and forever.
+    """
+
+    def setUp(self):
+        self.skill = (SKILL_DIR / "SKILL.md").read_text()
+        self.script = VALIDATOR.read_text()
+        self.schema = json.loads((SKILL_DIR / "report_schema.json").read_text())
+
+    # The fields that separate a caller's claim from a measurement. These are the ones a
+    # reader has to be able to look up, and the ones the refactor churned.
+    DECLARATION_FIELDS = (
+        "grid_independence",
+        "grid_independence_basis",
+        "grid_channel_basis",
+        "axis_state",
+        "runner_basis",
+    )
+
+    def declaration_fields(self):
+        properties = self.schema["properties"]["test_selection"]["properties"]
+        return {name: properties[name] for name in self.DECLARATION_FIELDS}
+
+    def test_every_value_the_schema_admits_is_one_the_code_can_write(self):
+        # A schema that allows a value nothing produces is a promise to a reader that some
+        # run, somewhere, might report it. `duplicates-target-defaults` outlived the AST
+        # check that derived it and sat here for a full refactor saying the validator still
+        # compared a grid against the target's defaults, which it no longer does.
+        for field, spec in self.declaration_fields().items():
+            for value in spec.get("enum", []):
+                if not value:
+                    continue
+                with self.subTest(field=field, value=value):
+                    self.assertIn(
+                        value, self.script, f"{field}: {value} is unreachable"
+                    )
+
+    def test_every_value_the_schema_admits_is_one_the_prose_explains(self):
+        # Backticked, not merely present: `declared` occurs inside `declared-by-caller`, so a
+        # bare substring check would let the axis_state row vanish and still pass on a
+        # sentence about a different field entirely.
+        for field, spec in self.declaration_fields().items():
+            for value in spec.get("enum", []):
+                if not value:
+                    continue
+                with self.subTest(field=field, value=value):
+                    self.assertIn(
+                        f"`{value}`", self.skill, f"{field}: {value} is undocumented"
+                    )
+
+    def test_the_skill_still_shows_how_to_invoke_the_validator(self):
+        # It briefly did not. The prose described the boundary, the stages and every field
+        # of the report, and never once showed the command -- a skill that explains what a
+        # run means but not how to start one.
+        self.assertIn("validate_pr.sh \\", self.skill)
+
+    def test_every_flag_the_prose_shows_is_one_the_script_accepts(self):
+        parser = re.search(r'\n  case "\$1" in\n(.*?)\n  esac', self.script, re.DOTALL)
+        self.assertIsNotNone(parser)
+        accepted = set(re.findall(r"--[a-z][a-z-]*", parser.group(1)))
+        # Only the flags shown in the skill's own invocation block, so an example the model
+        # copies cannot name a flag that exits 2.
+        block = re.search(r"validate_pr\.sh \\\n(.*?)\n```", self.skill, re.DOTALL)
+        self.assertIsNotNone(block)
+        for flag in sorted(set(re.findall(r"--[a-z][a-z-]*", block.group(1)))):
+            with self.subTest(flag=flag):
+                self.assertIn(flag, accepted)
+
+
 class ReviewSkillContractTests(unittest.TestCase):
     def test_review_skill_is_advisory_and_has_no_dead_scanner_paths(self):
         review_skill = (SKILL_DIR.parent / "review-pr" / "SKILL.md").read_text()
