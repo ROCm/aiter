@@ -1,14 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx950 H32/H64 D128/KVB64 preshuffled paged FP8 MQA-logits kernel."""
+"""gfx950 H32/H64 D128/KVB64 preshuffled paged FP8 MQA-logits kernel.
+
+Default decode path for ``flydsl_fp8_paged_mqa_logits`` on this shape.
+``flydsl_fp8_paged_mqa_logits_gfx950`` remains the explicit entry.
+"""
 
 from functools import lru_cache
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import arith, range_constexpr, rocdl
+from flydsl.expr import arith, range_constexpr
 from flydsl.expr.typing import T
 
 from aiter.jit.utils.chip_info import get_gfx
@@ -20,9 +24,9 @@ from ._fp8_paged_mqa_logits_gfx950 import (
     B_RING,
     DREG,
     HEAD_DIM,
+    KV_BLOCK_SIZE,
     MFMA_M,
     MFMA_N,
-    KV_BLOCK_SIZE,
     PAGE_VMEM_LOADS,
     SUPPORTED_HEADS,
     guarded_store,
@@ -31,10 +35,10 @@ from ._fp8_paged_mqa_logits_gfx950 import (
     load_preshuffled_k_pack,
     load_q_pack,
     mfma_scores,
+    page_vmem_stores,
     reduce_scores,
     schedule_mfma_valu_pairs,
     uceildiv,
-    page_vmem_stores,
     wait_vmcnt,
 )
 from ._mqa_logits_common import (
@@ -100,8 +104,7 @@ def _build_kernel(*, index_dim: int, num_heads: int, next_n: int):
 
         next_n_c = fx.Int32(n_rows)
         a_rows = [
-            [None for _ in range_constexpr(m_tiles)]
-            for _ in range_constexpr(n_rows)
+            [None for _ in range_constexpr(m_tiles)] for _ in range_constexpr(n_rows)
         ]
         w_rows = [
             [[None for _ in range_constexpr(DREG)] for _ in range_constexpr(m_tiles)]
@@ -127,7 +130,9 @@ def _build_kernel(*, index_dim: int, num_heads: int, next_n: int):
                     w_rows[row][mi][ii] = fx.Float32(weight_vec[ii])
 
         def _load_physical(page_col):
-            table_idx = pid_batch * max_block_len + udiv(page_col, fx.Int32(KV_BLOCK_SIZE))
+            table_idx = pid_batch * max_block_len + udiv(
+                page_col, fx.Int32(KV_BLOCK_SIZE)
+            )
             return fx.Int32(
                 buffer_ops.buffer_load(
                     table_t.rsrc, table_idx, vec_width=1, dtype=T.i32, is_scalar=True
@@ -162,10 +167,7 @@ def _build_kernel(*, index_dim: int, num_heads: int, next_n: int):
                     fx.make_rmem_tensor(DREG * 2, fx.Int32)
                     for _ in range_constexpr(B_RING)
                 ],
-                [
-                    fx.make_rmem_tensor(1, fx.Float32)
-                    for _ in range_constexpr(B_RING)
-                ],
+                [fx.make_rmem_tensor(1, fx.Float32) for _ in range_constexpr(B_RING)],
             )
 
         def _store_page_bank(bank, b_slots, scale_slots):
@@ -173,18 +175,13 @@ def _build_kernel(*, index_dim: int, num_heads: int, next_n: int):
             for slot in range_constexpr(B_RING):
                 b_bank[slot].store(b_slots[slot])
                 scale_bank[slot].store(
-                    fx.Vector.from_elements(
-                        [_unwrap(scale_slots[slot])], fx.Float32
-                    )
+                    fx.Vector.from_elements([_unwrap(scale_slots[slot])], fx.Float32)
                 )
 
         def _load_page_bank(bank):
             b_bank, scale_bank = bank
             return (
-                [
-                    fx.Vector(b_bank[slot].load())
-                    for slot in range_constexpr(B_RING)
-                ],
+                [fx.Vector(b_bank[slot].load()) for slot in range_constexpr(B_RING)],
                 [
                     fx.Float32(fx.Vector(scale_bank[slot].load())[0])
                     for slot in range_constexpr(B_RING)
@@ -211,10 +208,7 @@ def _build_kernel(*, index_dim: int, num_heads: int, next_n: int):
             logit = logits[0]
             for slot in range_constexpr(1, B_RING):
                 logit = (lane_div_16 == slot).select(logits[slot], logit)
-            writer = (
-                (col < context_len)
-                & (col <= q_limit)
-            )
+            writer = (col < context_len) & (col <= q_limit)
 
             def _write(_row=out_row, _col=col, _value=logit):
                 out_t[_row * stride_out + _col] = _value
@@ -225,8 +219,7 @@ def _build_kernel(*, index_dim: int, num_heads: int, next_n: int):
             prev_scores = None
             prev_scale = None
             page_logits = [
-                [None for _ in range_constexpr(B_RING)]
-                for _ in range_constexpr(n_rows)
+                [None for _ in range_constexpr(B_RING)] for _ in range_constexpr(n_rows)
             ]
             for slot in range_constexpr(B_RING):
                 scores = [
@@ -262,9 +255,7 @@ def _build_kernel(*, index_dim: int, num_heads: int, next_n: int):
                 )
             page_col = col_lo
             while page_col + fx.Int32(KV_BLOCK_SIZE) < col_hi:
-                next_b, next_scale = _issue_physical(
-                    _load_physical_bank(next_physical)
-                )
+                next_b, next_scale = _issue_physical(_load_physical_bank(next_physical))
                 _store_page_bank(next_bank, next_b, next_scale)
                 has_following = page_col + fx.Int32(2 * KV_BLOCK_SIZE) < col_hi
                 if has_following:
@@ -285,9 +276,7 @@ def _build_kernel(*, index_dim: int, num_heads: int, next_n: int):
                     if page_col + fx.Int32(3 * KV_BLOCK_SIZE) < col_hi:
                         _store_physical(
                             next_physical,
-                            _load_physical(
-                                page_col + fx.Int32(3 * KV_BLOCK_SIZE)
-                            ),
+                            _load_physical(page_col + fx.Int32(3 * KV_BLOCK_SIZE)),
                         )
                     # following-page loads plus current-page stores can remain.
                     wait_vmcnt(PAGE_VMEM_LOADS + store_vmem)
@@ -295,9 +284,7 @@ def _build_kernel(*, index_dim: int, num_heads: int, next_n: int):
                     # Only current-page stores may remain.
                     wait_vmcnt(store_vmem)
                 next_b, next_scale = _load_page_bank(next_bank)
-                _compute_page(
-                    page_col + fx.Int32(KV_BLOCK_SIZE), next_b, next_scale
-                )
+                _compute_page(page_col + fx.Int32(KV_BLOCK_SIZE), next_b, next_scale)
                 page_col = page_col + fx.Int32(2 * KV_BLOCK_SIZE)
 
             if page_col < col_hi:
@@ -383,7 +370,7 @@ def flydsl_fp8_paged_mqa_logits_gfx950(
         raise ValueError(f"q_fp8 must be native FP8 E4M3, got {q_fp8.dtype}")
     if kv_cache.dtype != torch.uint8:
         raise ValueError("kv_cache must contain preshuffled uint8 FP8 data")
-    num_blocks, block_size, one, index_dim = kv_cache.shape
+    _, block_size, one, index_dim = kv_cache.shape
     if block_size != KV_BLOCK_SIZE or one != 1 or index_dim != HEAD_DIM + 4:
         raise ValueError(f"unexpected KV cache shape {tuple(kv_cache.shape)}")
 

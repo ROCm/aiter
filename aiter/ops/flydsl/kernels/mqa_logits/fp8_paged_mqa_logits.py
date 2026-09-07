@@ -19,6 +19,12 @@ the tensor contract of the Triton ``deepgemm_fp8_paged_mqa_logits`` so the two
 are interchangeable. ``Preshuffle=True`` consumes the production
 ``shuffle_weight(layout=(16,16))`` KV layout (needs ``KVBlockSize % 16 == 0``).
 
+The public ``flydsl_fp8_paged_mqa_logits`` entry dispatches the gfx950
+16x16x128 mapping (``fp8_paged_mqa_logits_gfx950``) for the production decode
+shape ``H in {32,64}``, ``D=128``, ``KVBlockSize=64``, ``next_n in {1,2}``,
+preshuffled cache. Other shapes keep this 32x32x64 generic kernel. Force the
+generic path with ``FLYDSL_FP8_PAGED_MQA_LOGITS_GENERIC=1``.
+
 Cache layout, per physical block of ``KVBlockSize`` tokens: the fp8 key rows
 (``D`` bytes each) grouped first, then the f32 dequant scales. Each lane
 resolves its own column through ``kv_indices[b, p // KVBlockSize]``, so a column
@@ -404,7 +410,46 @@ def compile_fp8_paged_mqa_logits(
     return launcher
 
 
-def flydsl_fp8_paged_mqa_logits(
+def _use_gfx950_fastpath(
+    q_fp8,
+    kv_cache,
+    *,
+    Preshuffle,
+    KVBlockSize,
+    ChunkK,
+    WavePerEU,
+    variant,
+):
+    """True for the production decode shape the 16x16x128 gfx950 kernel covers."""
+    if os.environ.get("FLYDSL_FP8_PAGED_MQA_LOGITS_GENERIC", "").strip() in (
+        "1",
+        "true",
+        "True",
+    ):
+        return False
+    env_variant = os.environ.get("FLYDSL_FP8_PAGED_MQA_LOGITS_VARIANT")
+    if variant not in (None, DEFAULT_VARIANT) or (
+        env_variant and env_variant != DEFAULT_VARIANT
+    ):
+        return False
+    if not Preshuffle or int(KVBlockSize) != 64:
+        return False
+    if int(ChunkK) != _BLOCK_KV or int(WavePerEU) != 2:
+        return False
+    if get_gfx() != "gfx950":
+        return False
+    _, next_n, num_heads, head_size = q_fp8.shape
+    if num_heads not in (32, 64) or head_size != 128 or next_n not in (1, 2):
+        return False
+    from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+
+    if q_fp8.dtype != get_fp8_e4m3_dtype():
+        return False
+    _, block_size, one, index_dim = kv_cache.shape
+    return block_size == 64 and one == 1 and index_dim == 132
+
+
+def flydsl_fp8_paged_mqa_logits_generic(
     q_fp8,
     kv_cache,
     weights,
@@ -422,9 +467,11 @@ def flydsl_fp8_paged_mqa_logits(
     variant=None,
     stream=None,
 ):
-    """FlyDSL paged FP8 MQA logits (decode) -- KVBlockSize>=1 with SplitKV.
+    """Generic 32x32x64 FlyDSL paged FP8 MQA logits (decode).
 
     Drop-in for the Triton ``deepgemm_fp8_paged_mqa_logits`` tensor contract.
+    Production H32/H64 D128 KVB64 preshuffle decode uses the gfx950 mapping via
+    ``flydsl_fp8_paged_mqa_logits`` instead.
 
     q_fp8:        [batch, next_n, heads, hidden_dim], float8 e4m3fn (gfx950 native)
     kv_cache:     [num_blocks, KVBlockSize, 1, index_dim] uint8, co-packed per
@@ -500,7 +547,7 @@ def flydsl_fp8_paged_mqa_logits(
     ), f"q_fp8 must be e4m3 fp8 (fnuz or fn); got {q_fp8.dtype}"
     assert (
         get_gfx() == "gfx950"
-    ), f"flydsl_fp8_paged_mqa_logits targets gfx950 (32x32x64 MFMA); got {get_gfx()}"
+    ), f"flydsl_fp8_paged_mqa_logits_generic targets gfx950 (32x32x64 MFMA); got {get_gfx()}"
 
     variant = _resolve_variant(variant)
 
@@ -558,3 +605,70 @@ def flydsl_fp8_paged_mqa_logits(
         )
 
     return out_logits
+
+
+def flydsl_fp8_paged_mqa_logits(
+    q_fp8,
+    kv_cache,
+    weights,
+    out_logits,
+    context_lens,
+    kv_indices,
+    max_model_len,
+    *,
+    Preshuffle=False,
+    KVBlockSize=1,
+    ChunkK=_BLOCK_KV,
+    SplitKV=None,
+    WavePerEU=2,
+    TotalCuCount=None,
+    variant=None,
+    stream=None,
+):
+    """FlyDSL paged FP8 MQA logits (decode) -- KVBlockSize>=1 with SplitKV.
+
+    Drop-in for the Triton ``deepgemm_fp8_paged_mqa_logits`` tensor contract.
+    Dispatches the gfx950 16x16x128 kernel for H32/H64 D128 KVB64 preshuffle
+    ``next_n in {1,2}``; otherwise the generic 32x32x64 kernel.
+    """
+    if _use_gfx950_fastpath(
+        q_fp8,
+        kv_cache,
+        Preshuffle=Preshuffle,
+        KVBlockSize=KVBlockSize,
+        ChunkK=ChunkK,
+        WavePerEU=WavePerEU,
+        variant=variant,
+    ):
+        from .fp8_paged_mqa_logits_gfx950 import flydsl_fp8_paged_mqa_logits_gfx950
+
+        return flydsl_fp8_paged_mqa_logits_gfx950(
+            q_fp8,
+            kv_cache,
+            weights,
+            out_logits,
+            context_lens,
+            kv_indices,
+            max_model_len,
+            KVBlockSize=KVBlockSize,
+            SplitKV=SplitKV,
+            TotalCuCount=TotalCuCount,
+            stream=stream,
+        )
+    return flydsl_fp8_paged_mqa_logits_generic(
+        q_fp8,
+        kv_cache,
+        weights,
+        out_logits,
+        context_lens,
+        kv_indices,
+        max_model_len,
+        Preshuffle=Preshuffle,
+        KVBlockSize=KVBlockSize,
+        ChunkK=ChunkK,
+        SplitKV=SplitKV,
+        WavePerEU=WavePerEU,
+        TotalCuCount=TotalCuCount,
+        variant=variant,
+        stream=stream,
+    )

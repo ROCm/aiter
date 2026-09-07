@@ -10,7 +10,7 @@ import torch
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import (
     flydsl_fp8_paged_mqa_logits,
-    flydsl_fp8_paged_mqa_logits_gfx950,
+    flydsl_fp8_paged_mqa_logits_generic,
 )
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_common import run_perftest
@@ -42,14 +42,12 @@ def _inputs(heads, next_n=NEXT_N, kv_len=KV_LEN, batch=BATCH):
         get_fp8_e4m3_dtype(),
         block_size=KV_BLOCK_SIZE,
     )
-    kv_cache, out = _kernel_inputs(
-        inp, batch, next_n, HEAD_DIM, True, KV_BLOCK_SIZE
-    )
+    kv_cache, out = _kernel_inputs(inp, batch, next_n, HEAD_DIM, True, KV_BLOCK_SIZE)
     return inp, kv_cache, out
 
 
 def _launch(inp, kv_cache, out):
-    return flydsl_fp8_paged_mqa_logits_gfx950(
+    return flydsl_fp8_paged_mqa_logits(
         inp.q_fp8,
         kv_cache,
         inp.weights,
@@ -57,6 +55,7 @@ def _launch(inp, kv_cache, out):
         inp.context_lens,
         inp.block_tables,
         inp.max_model_len,
+        Preshuffle=True,
         KVBlockSize=KV_BLOCK_SIZE,
     )
 
@@ -113,7 +112,7 @@ def _benchmark(heads):
         return _launch(inp, kv_cache, out_new)
 
     def old_kernel():
-        return flydsl_fp8_paged_mqa_logits(
+        return flydsl_fp8_paged_mqa_logits_generic(
             inp.q_fp8,
             kv_cache,
             inp.weights,

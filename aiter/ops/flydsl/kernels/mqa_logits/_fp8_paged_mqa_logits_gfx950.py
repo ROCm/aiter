@@ -22,9 +22,12 @@ DREG = 4
 B_RING = KV_BLOCK_SIZE // MFMA_N
 # Per physical page: 4 tiles × (2× dwordx4 K + 1× f32 scale).
 PAGE_VMEM_LOADS = B_RING * 3
+
+
 def page_vmem_stores(next_n):
     """One wave-wide contiguous store per query row and physical page."""
     return int(next_n)
+
 
 _NEUTRAL_E8M0 = 0x7F7F7F7F
 
@@ -100,8 +103,11 @@ def load_preshuffled_k_pack(
         kv_i32.rsrc, base, vec_width=4, dtype=T.i32, cache_modifier=2
     )
     hi = buffer_ops.buffer_load(
-        kv_i32.rsrc, base + fx.Int32(MFMA_N * 16 // 4),
-        vec_width=4, dtype=T.i32, cache_modifier=2,
+        kv_i32.rsrc,
+        base + fx.Int32(MFMA_N * 16 // 4),
+        vec_width=4,
+        dtype=T.i32,
+        cache_modifier=2,
     )
     return _concat_i32x4(lo, hi)
 
