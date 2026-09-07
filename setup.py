@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import glob
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -12,8 +14,6 @@ from setuptools.command.build_ext import build_ext
 this_dir = os.path.dirname(os.path.abspath(__file__))
 OPT_COMPILER_CONFIG = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
 PACKAGE_NAME = "amd-aiter"
-
-FLYDSL_VERSION = "flydsl==0.3.1"
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", "0"))
@@ -53,24 +53,93 @@ def is_develop_mode():
     return False
 
 
-if not AITER_TRITON_ONLY and is_develop_mode():
-    try:
-        from importlib.metadata import version as pkg_version
+FLYDSL_WHEEL_DIR = os.path.join(this_dir, "3rdparty", "flydsl_wheel")
 
-        from packaging.version import Version
 
-        if Version(pkg_version("flydsl")) != Version(FLYDSL_VERSION.split("==")[1]):
-            raise ImportError("version mismatch")
-    except Exception:  # noqa: BLE001
-        subprocess.check_call(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                FLYDSL_VERSION,
-            ]
+def _flydsl_local_wheel():
+    """Return the path of the single FlyDSL wheel vendored in 3rdparty/flydsl_wheel.
+
+    FlyDSL is installed exclusively from this directory. Resolving it from PyPI
+    or the AMD mirror is deliberately disabled: those indexes serve whatever
+    build currently sits behind the version number, so two machines running the
+    same aiter commit could silently end up on different FlyDSL binaries. The
+    vendored wheel makes the exact artifact part of the checkout.
+
+    Exactly one wheel must be present -- zero leaves nothing to install, and
+    several give no principled way to choose, so both are errors rather than a
+    guess.
+    """
+    if not os.path.isdir(FLYDSL_WHEEL_DIR):
+        raise SystemExit(
+            f"[aiter] FlyDSL wheel directory not found: {FLYDSL_WHEEL_DIR}\n"
+            "        Create it and place exactly one flydsl-*.whl inside."
         )
+
+    wheels = sorted(glob.glob(os.path.join(FLYDSL_WHEEL_DIR, "*.whl")))
+
+    if not wheels:
+        raise SystemExit(
+            f"[aiter] No FlyDSL wheel found in {FLYDSL_WHEEL_DIR}\n"
+            "        Place exactly one flydsl-*.whl there; aiter no longer\n"
+            "        installs FlyDSL from PyPI or the AMD mirror."
+        )
+
+    if len(wheels) > 1:
+        names = "\n".join(f"          - {os.path.basename(w)}" for w in wheels)
+        raise SystemExit(
+            f"[aiter] Expected exactly one wheel in {FLYDSL_WHEEL_DIR}, found {len(wheels)}:\n"
+            f"{names}\n"
+            "        Remove the ones you do not want; aiter will not guess."
+        )
+
+    wheel = wheels[0]
+
+    # Guard the directory's contract rather than trusting the filename: a wheel
+    # for another project installs cleanly and only surfaces later as a missing
+    # `flydsl` module, long after the cause has scrolled away.
+    basename = os.path.basename(wheel)
+    if not basename.lower().startswith("flydsl-"):
+        raise SystemExit(
+            f"[aiter] {basename} in {FLYDSL_WHEEL_DIR} is not a FlyDSL wheel.\n"
+            "        Expected a file named flydsl-<version>-....whl"
+        )
+
+    return wheel
+
+
+def _pip_is_available():
+    """True when this interpreter can run `-m pip`.
+
+    pip builds the project inside an isolated environment that deliberately
+    has no pip of its own, and setup.py is re-executed there. Shelling out to
+    pip in that context dies with "No module named pip", so the install is
+    skipped: the outer invocation -- the one the developer actually ran --
+    already performed it.
+    """
+    return importlib.util.find_spec("pip") is not None
+
+
+if not AITER_TRITON_ONLY and is_develop_mode() and _pip_is_available():
+    _flydsl_wheel = _flydsl_local_wheel()
+    print(f"[aiter] Installing FlyDSL from {os.path.basename(_flydsl_wheel)}")
+    # --no-index/--no-deps keep this install strictly local: without them pip
+    # may reach an index to satisfy FlyDSL's own requirements and pull a
+    # different build of the package the vendored wheel is meant to fix.
+    # --force-reinstall makes the wheel win over whatever is already present,
+    # since a same-version wheel would otherwise be skipped as "satisfied"
+    # even when its contents differ.
+    subprocess.check_call(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--no-index",
+            "--no-deps",
+            "--force-reinstall",
+            _flydsl_wheel,
+        ]
+    )
 
 
 def _is_triton_installed():
@@ -469,8 +538,11 @@ else:
         "einops",
         "psutil",
         "packaging",
-        FLYDSL_VERSION,
     ]
+    # No flydsl requirement is declared: doing so would let pip "repair" the
+    # environment from an index and replace the vendored wheel installed above
+    # with a mirror build carrying the same version number.
+    # 3rdparty/flydsl_wheel is the only supported source of FlyDSL.
 
 setup(
     name=PACKAGE_NAME,

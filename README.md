@@ -107,13 +107,26 @@ git submodule sync && git submodule update --init --recursive
 
 ### FlyDSL
 
-AITER uses [FlyDSL](https://github.com/ROCm/FlyDSL)-based kernels across a range of operators (e.g., GEMM and MoE). FlyDSL is a required dependency and is installed automatically when you run `python3 setup.py develop`.
+AITER uses [FlyDSL](https://github.com/ROCm/FlyDSL)-based kernels across a range of operators (e.g., GEMM and MoE). FlyDSL is a required dependency.
 
-To install it manually:
+FlyDSL is installed **only** from the wheel vendored in `3rdparty/flydsl_wheel/`;
+it is never resolved from PyPI or the AMD mirror. Pinning a version number is not
+enough to pin a build, so the exact artifact is part of the checkout instead.
+`python3 setup.py develop` installs it from there automatically.
+
+That directory must contain **exactly one** `flydsl-*.whl`. Zero wheels, several
+wheels, or a wheel for another project are all build errors rather than a guess.
+
+To swap in a different FlyDSL build, replace the file:
 
 ```bash
-pip install -r requirements.txt
+rm 3rdparty/flydsl_wheel/*.whl
+cp /path/to/flydsl-<version>-<abi>.whl 3rdparty/flydsl_wheel/
+python3 setup.py develop
 ```
+
+The wheel's ABI tag must match your interpreter (`cp312` for Python 3.12); a
+mismatched wheel installs cleanly but fails later on `import flydsl._mlir`.
 
 ### Triton
 

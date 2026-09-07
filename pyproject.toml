@@ -8,8 +8,10 @@ requires = [
     "psutil",
     "ninja",
     "pandas",
-    "flydsl==0.3.1"
 ]
+# FlyDSL is intentionally not a build requirement: pip would resolve it from an
+# index into the isolated build environment, which is exactly the install path
+# this repo disables. setup.py installs it from 3rdparty/flydsl_wheel instead.
 
 [tool.ruff]
 # The style CI runs plain `ruff check .`, so without this section the enforced
