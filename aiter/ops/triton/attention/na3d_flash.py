@@ -76,6 +76,9 @@ def na3d_flash_attn(
         k.shape == q.shape and v.shape == q.shape
     ), "na3d_flash_attn: q/k/v must have shape (B, T, H, W, NH, HD)"
     assert (
+        KT > 0 and KH > 0 and KW > 0
+    ), f"na3d_flash_attn: kernel_size dimensions must be positive; got ({KT},{KH},{KW})"
+    assert (
         KT <= T and KH <= H and KW <= W
     ), f"na3d_flash_attn: kernel_size=({KT},{KH},{KW}) must be <= (T,H,W)=({T},{H},{W})"
     assert KW <= 33, (
