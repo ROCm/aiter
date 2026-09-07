@@ -511,6 +511,8 @@ def _compile_mxfp8_128_wmma_to_cache(
     split_k: int,
     cluster_m: int,
     cluster_n: int,
+    a_preshuffle: bool = False,
+    persistent_n_tiles: int = 1,
     **kwargs,
 ):
     del kwargs
@@ -564,7 +566,20 @@ def _compile_mxfp8_128_wmma_to_cache(
             if is_compute_wmma_kernel_name(kernel_name)
             else launch_gemm_a8w8
         )
-        launch(*launch_args, SCALE_BLOCK_SIZE, split_k)
+        if persistent_n_tiles == 1:
+            launch(*launch_args, SCALE_BLOCK_SIZE, split_k)
+        elif is_compute_wmma_kernel_name(kernel_name):
+            launch(
+                *launch_args,
+                SCALE_BLOCK_SIZE,
+                split_k,
+                a_preshuffle,
+                persistent_n_tiles,
+            )
+        else:
+            raise ValueError(
+                "persistent_n_tiles>1 is supported only by compute WMMA kernels"
+            )
         if split_k > 1:
             compile_gemm_a8w8_splitk_reduce(split_k=split_k, out_dtype_str="bf16")(
                 _ptr_view_safe(out),

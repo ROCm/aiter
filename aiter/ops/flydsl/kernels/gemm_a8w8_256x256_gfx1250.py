@@ -57,6 +57,7 @@ def launch_gemm_a8w8_256x256(
     block_size: Constexpr[int],
     split_k: Constexpr[int] = 1,
     a_preshuffle: Constexpr[bool] = False,
+    persistent_n_tiles: Constexpr[int] = 1,
 ):
     """N must be a multiple of ``tile_n * cluster_n``; M is unrestricted (a
     multiple of 2 when ``a_preshuffle``); K must be divisible by 128 and at
@@ -73,6 +74,12 @@ def launch_gemm_a8w8_256x256(
         cluster_m >= 1 and cluster_n >= 1 and 1 < cluster_m * cluster_n <= 16
     ), f"cluster_m*cluster_n must be 2..16, got {cluster_m}x{cluster_n}"
     assert split_k in (1, 2, 4, 8), f"split_k must be 1/2/4/8, got {split_k}"
+    assert (
+        persistent_n_tiles >= 1
+    ), f"persistent_n_tiles must be >= 1, got {persistent_n_tiles}"
+    assert (
+        persistent_n_tiles == 1 or split_k == 1
+    ), "persistent_n_tiles>1 requires split_k=1"
     cluster_sync_revs = 8
     m_run_max, m_run_min = 32, 8
     WMMA_M = WMMA_N = 16
@@ -134,11 +141,12 @@ def launch_gemm_a8w8_256x256(
     kernel_name = format_kernel_name(
         f"gemm_a8w8_mx{block_size}_compute_t{tile_m}x{tile_n}x{tile_k}"
         f"_mw{m_warp}_nw{n_warp}_nb{num_buffers}_sk{split_k}"
-        f"_cm{cluster_m}_cn{cluster_n}" + ("_apre" if a_preshuffle else "")
+        f"_cm{cluster_m}_cn{cluster_n}"
+        + ("_apre" if a_preshuffle else "")
+        + (f"_ps{persistent_n_tiles}" if persistent_n_tiles > 1 else "")
     )
 
-    @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
-    def kernel_gemm_a8w8_256x256(
+    def _run_tile(
         arg_c: fx.Pointer,
         arg_a: fx.Pointer,
         arg_b: fx.Pointer,
@@ -150,8 +158,8 @@ def launch_gemm_a8w8_256x256(
         i32_stride_ascale_k: fx.Int32,
         i32_lda: fx.Int32,
         i32_ldc: fx.Int32,
+        tile_idx=0,
     ):
-
         K_TILES = i32_k // (tile_k * split_k)
         k64 = fx.Int64(i32_k)
         lda64 = fx.Int64(i32_lda)
@@ -160,6 +168,8 @@ def launch_gemm_a8w8_256x256(
 
         tid = fx.Int32(fx.thread_idx.x)
         bid_x, bid_y, bid_z = fx.block_idx
+        if const_expr(persistent_n_tiles > 1):
+            bid_y = bid_y + tile_idx * fx.Int32(fx.grid_dim.y)
         if const_expr(split_k > 1):
             m_chunks = fx.Int32(fx.grid_dim.z) // split_k
             split_idx = bid_z // m_chunks
@@ -447,6 +457,9 @@ def launch_gemm_a8w8_256x256(
                     sb_k,
                 )
 
+        if const_expr(persistent_n_tiles > 1):
+            rocdl.sched_barrier(0)
+            tdm_ops.tensor_wait(0)
         cluster.cluster_barrier()
         # Keep fragment displacements as DS immediates inside the K loop.
         stage_a_addr, stage_b_addr, stage_sa_addr, stage_sb_addr = (
@@ -468,7 +481,10 @@ def launch_gemm_a8w8_256x256(
                 T.index,
                 a_pair * A_LDS_ROW + (lane16 & 1) * WMMA_K + kgrp * 16,
             )
-            a_par_step, a_frag_row_step = A_PAIR * tile_k, (16 // A_PAIR) * A_LDS_ROW
+            a_par_step, a_frag_row_step = (
+                A_PAIR * tile_k,
+                (16 // A_PAIR) * A_LDS_ROW,
+            )
         else:
             a_byte = fx.index_cast(T.index, (wmb + lane16) * A_LDS_ROW + kgrp * 16)
             a_par_step, a_frag_row_step = tile_k, 16 * A_LDS_ROW
@@ -971,7 +987,44 @@ def launch_gemm_a8w8_256x256(
             ),
             gtC,
         )
-        tdm_ops.tensor_wait(0)
+        if const_expr(persistent_n_tiles == 1):
+            tdm_ops.tensor_wait(0)
+
+    @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
+    def kernel_gemm_a8w8_256x256(
+        arg_c: fx.Pointer,
+        arg_a: fx.Pointer,
+        arg_b: fx.Pointer,
+        arg_scale_a: fx.Pointer,
+        arg_scale_b: fx.Pointer,
+        i32_m: fx.Int32,
+        i32_n: fx.Int32,
+        i32_k: fx.Int32,
+        i32_stride_ascale_k: fx.Int32,
+        i32_lda: fx.Int32,
+        i32_ldc: fx.Int32,
+    ):
+        tile_args = (
+            arg_c,
+            arg_a,
+            arg_b,
+            arg_scale_a,
+            arg_scale_b,
+            i32_m,
+            i32_n,
+            i32_k,
+            i32_stride_ascale_k,
+            i32_lda,
+            i32_ldc,
+        )
+        if const_expr(persistent_n_tiles == 1):
+            _run_tile(*tile_args)
+        else:
+            for tile_idx in range(
+                fx.Int32(0), fx.Int32(persistent_n_tiles), fx.Int32(1)
+            ):
+                _run_tile(*tile_args, tile_idx)
+            tdm_ops.tensor_wait(0)
 
     gx = (i32_m + (tile_m - 1)) // tile_m
     gy = (N + (tile_n - 1)) // tile_n
@@ -983,7 +1036,8 @@ def launch_gemm_a8w8_256x256(
     fits_cluster = (capped % fx.Int32(cluster_m)) == 0
     m_run = ((gx > m_run_max) & (pow2 >= m_run_min) & fits_cluster).select(capped, gx)
     m_chunks = gx // m_run
-    grid_arg = (m_run, gy, m_chunks * split_k)
+    gy_launch = gy // persistent_n_tiles if const_expr(persistent_n_tiles > 1) else gy
+    grid_arg = (m_run, gy_launch, m_chunks * split_k)
     # Runtime N/K shape checks belong to the caller.
     cluster_arg = (cluster_m, cluster_n, 1)
     kernel_gemm_a8w8_256x256(
