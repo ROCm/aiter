@@ -10,7 +10,6 @@ from typing import Any
 
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import arith as _std_arith
 from flydsl._mlir.dialects import builtin
 from flydsl._mlir.dialects import gpu as _gpu
 from flydsl._mlir.dialects import llvm as _llvm
@@ -118,12 +117,7 @@ def dtype_to_elem_type(dtype_str: str):
 
 
 def _create_llvm_ptr(value, address_space: int = 1):
-    value = buffer_ops._unwrap_value(value)
-    if isinstance(value.type, ir.IndexType):
-        i64_type = T.i64
-        value = buffer_ops._unwrap_value(_std_arith.IndexCastOp(i64_type, value).result)
-    ptr_type = ir.Type.parse(f"!llvm.ptr<{address_space}>")
-    return _llvm.IntToPtrOp(ptr_type, value).result
+    return buffer_ops.create_llvm_ptr(value, address_space=address_space)
 
 
 def stream_ptr_to_async_token(stream_ptr_value, loc=None, ip=None):

@@ -123,33 +123,6 @@ def buf_copy_atom(unit_bytes, elem=fx.Int32, cache_modifier=0):
     return fx.make_copy_atom(_BUF_COPY_ATOM[unit_bytes](cache_modifier), elem)
 
 
-def buf_scalar_load(t, index, cache_modifier=0):
-    """``t[index]`` as an ``s_buffer_load``: one dword landing in an SGPR.
-
-    *index* must be wave-uniform; nothing here checks that. Use it where the
-    result has to stay scalar -- e.g. a row that then narrows a per-row buffer
-    descriptor, which otherwise goes through a readfirstlane waterfall.
-
-    The layout API has no scalar spelling: ``t[i]`` and every ``BufferCopy*``
-    atom lower to ``rocdl.raw.ptr.buffer.load`` (VGPR), and ROCDL exposes no
-    ``s.buffer.load`` op to wrap. Hence the raw intrinsic, whose resource
-    operand is a v4i32 rather than the opaque buffer pointer.
-    """
-    rsrc = _to_raw(fx.rocdl.get_buffer_rsrc(fx.get_iter(t)))
-    rsrc_v4 = llvm.bitcast(
-        ir.VectorType.get([4], T.i32),
-        llvm.ptrtoint(ir.IntegerType.get_signless(128), rsrc),
-    )
-    return llvm.call_intrinsic(
-        T.i32,
-        "llvm.amdgcn.s.buffer.load.i32",
-        # The intrinsic offset is in bytes; `index` counts dwords.
-        [rsrc_v4, _to_raw(fx.Int32(index) * 4), _to_raw(fx.Int32(cache_modifier))],
-        [],
-        [],
-    )
-
-
 # GTensor takes MLIR scalar types (``T.f32``); the buffer views take fx classes.
 _FX_ELEM = {
     "i8": fx.Int8,
