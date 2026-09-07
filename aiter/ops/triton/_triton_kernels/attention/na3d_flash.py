@@ -25,7 +25,7 @@ from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 #   BLOCK_Q=16  ->  BLOCK_KV=32
 #   BLOCK_Q=32  ->  BLOCK_KV=64
 # The W >= BLOCK_Q constraint is enforced by the pruner below.
-_CONFIGS = [
+_NA3D_AUTOTUNE_CONFIGS = [
     triton.Config({"BLOCK_Q": 16, "BLOCK_KV": 32, "num_stages": 2}, num_warps=4),
     triton.Config({"BLOCK_Q": 16, "BLOCK_KV": 32, "num_stages": 2}, num_warps=8),
     triton.Config({"BLOCK_Q": 16, "BLOCK_KV": 32, "num_stages": 3}, num_warps=4),
@@ -62,7 +62,7 @@ _na3d_flash_fwd_repr = make_kernel_repr(
 
 
 @triton.autotune(
-    configs=_CONFIGS,
+    configs=_NA3D_AUTOTUNE_CONFIGS,
     key=["KT", "KH", "KW", "HD", "W"],
     prune_configs_by={"early_config_prune": _prune_configs},
 )
