@@ -57,7 +57,7 @@ def _build_kernel(*, index_dim: int, num_heads: int, next_n: int):
     store_vmem = page_vmem_stores(n_rows)
     kernel_name = (
         f"fp8_paged_mqa_logits_gfx950_H{num_heads}_D{HEAD_DIM}_"
-        f"bkv64_kvb{KV_BLOCK_SIZE}_r{B_RING}_nq{n_rows}_w1_nt_ps_flydsl"
+        f"bkv64_kvb{KV_BLOCK_SIZE}_r{B_RING}_nq{n_rows}_db2_ws1_pfp_sb0_nt_ps_flydsl"
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[64, 1, 1])
@@ -126,13 +126,15 @@ def _build_kernel(*, index_dim: int, num_heads: int, next_n: int):
                 for ii in range_constexpr(DREG):
                     w_rows[row][mi][ii] = fx.Float32(weight_vec[ii])
 
-        def _issue_page(page_col):
+        def _load_physical(page_col):
             table_idx = pid_batch * max_block_len + udiv(page_col, fx.Int32(KV_BLOCK_SIZE))
-            physical = fx.Int32(
+            return fx.Int32(
                 buffer_ops.buffer_load(
                     table_t.rsrc, table_idx, vec_width=1, dtype=T.i32, is_scalar=True
                 )
             )
+
+        def _issue_physical(physical):
             b_slots, scale_slots = [], []
             for slot in range_constexpr(B_RING):
                 token = slot * MFMA_N + lane_mod_16
@@ -151,38 +153,82 @@ def _build_kernel(*, index_dim: int, num_heads: int, next_n: int):
                 )
             return b_slots, scale_slots
 
-        def _pack_state(b_slots, scale_slots):
-            return [_unwrap(v) for v in b_slots + scale_slots]
+        def _issue_page(page_col):
+            return _issue_physical(_load_physical(page_col))
 
-        def _unpack_state(state):
-            b_slots = [fx.Vector(state[i]) for i in range_constexpr(B_RING)]
-            scale_slots = [
-                fx.Float32(state[B_RING + i]) for i in range_constexpr(B_RING)
-            ]
-            return b_slots, scale_slots
+        def _make_page_bank():
+            return (
+                [
+                    fx.make_rmem_tensor(DREG * 2, fx.Int32)
+                    for _ in range_constexpr(B_RING)
+                ],
+                [
+                    fx.make_rmem_tensor(1, fx.Float32)
+                    for _ in range_constexpr(B_RING)
+                ],
+            )
 
-        def _store_row(row, col, scores, scale):
+        def _store_page_bank(bank, b_slots, scale_slots):
+            b_bank, scale_bank = bank
+            for slot in range_constexpr(B_RING):
+                b_bank[slot].store(b_slots[slot])
+                scale_bank[slot].store(
+                    fx.Vector.from_elements(
+                        [_unwrap(scale_slots[slot])], fx.Float32
+                    )
+                )
+
+        def _load_page_bank(bank):
+            b_bank, scale_bank = bank
+            return (
+                [
+                    fx.Vector(b_bank[slot].load())
+                    for slot in range_constexpr(B_RING)
+                ],
+                [
+                    fx.Float32(fx.Vector(scale_bank[slot].load())[0])
+                    for slot in range_constexpr(B_RING)
+                ],
+            )
+
+        def _make_physical_bank():
+            return fx.make_rmem_tensor(1, fx.Int32)
+
+        def _store_physical(bank, physical):
+            bank.store(fx.Vector.from_elements([_unwrap(physical)], fx.Int32))
+
+        def _load_physical_bank(bank):
+            return fx.Int32(fx.Vector(bank.load())[0])
+
+        def _reduce_row(row, scores, scale):
+            return reduce_scores(scores, w_rows[row], scale, m_tiles=m_tiles)
+
+        def _store_page_row(row, page_col, logits):
             q_row = fx.Int32(row)
             q_limit = context_len - next_n_c + q_row
             out_row = pid_batch * next_n_c + q_row
-            logit = reduce_scores(scores, w_rows[row], scale, m_tiles=m_tiles)
+            col = page_col + lane
+            logit = logits[0]
+            for slot in range_constexpr(1, B_RING):
+                logit = (lane_div_16 == slot).select(logits[slot], logit)
             writer = (
-                (lane_div_16 == 0)
-                & (col < context_len)
+                (col < context_len)
                 & (col <= q_limit)
             )
+
             def _write(_row=out_row, _col=col, _value=logit):
                 out_t[_row * stride_out + _col] = _value
 
             guarded_store(writer, _write)
 
         def _compute_page(page_col, b_slots, scale_slots):
-            rocdl.sched_barrier(0)
             prev_scores = None
-            prev_col = None
             prev_scale = None
+            page_logits = [
+                [None for _ in range_constexpr(B_RING)]
+                for _ in range_constexpr(n_rows)
+            ]
             for slot in range_constexpr(B_RING):
-                col = page_col + slot * MFMA_N + lane_mod_16
                 scores = [
                     mfma_scores(a_rows[row], b_slots[slot], m_tiles=m_tiles)
                     for row in range_constexpr(n_rows)
@@ -190,38 +236,74 @@ def _build_kernel(*, index_dim: int, num_heads: int, next_n: int):
                 if slot > 0:
                     schedule_mfma_valu_pairs(m_tiles=m_tiles)
                     for row in range_constexpr(n_rows):
-                        _store_row(row, prev_col, prev_scores[row], prev_scale)
+                        page_logits[row][slot - 1] = _reduce_row(
+                            row, prev_scores[row], prev_scale
+                        )
                 prev_scores = scores
-                prev_col = col
                 prev_scale = scale_slots[slot]
             schedule_mfma_valu_pairs(m_tiles=m_tiles)
             for row in range_constexpr(n_rows):
-                _store_row(row, prev_col, prev_scores[row], prev_scale)
-            rocdl.sched_barrier(0)
+                page_logits[row][B_RING - 1] = _reduce_row(
+                    row, prev_scores[row], prev_scale
+                )
+                _store_page_row(row, page_col, page_logits[row])
 
         if page_lo < page_hi:
+            current_bank = _make_page_bank()
+            next_bank = _make_page_bank()
             b_init, scale_init = _issue_page(col_lo)
-            if page_lo + 1 < page_hi:
-                stop = col_hi - KV_BLOCK_SIZE
-                init_state = _pack_state(b_init, scale_init)
-                for page_col, state in range(
-                    col_lo, stop, fx.Int32(KV_BLOCK_SIZE), init=init_state
-                ):
-                    current_b, current_scale = _unpack_state(state)
-                    next_b, next_scale = _issue_page(
-                        fx.Int32(page_col) + fx.Int32(KV_BLOCK_SIZE)
+            _store_page_bank(current_bank, b_init, scale_init)
+            current_physical = _make_physical_bank()
+            next_physical = _make_physical_bank()
+            if col_lo + fx.Int32(KV_BLOCK_SIZE) < col_hi:
+                _store_physical(
+                    next_physical,
+                    _load_physical(col_lo + fx.Int32(KV_BLOCK_SIZE)),
+                )
+            page_col = col_lo
+            while page_col + fx.Int32(KV_BLOCK_SIZE) < col_hi:
+                next_b, next_scale = _issue_physical(
+                    _load_physical_bank(next_physical)
+                )
+                _store_page_bank(next_bank, next_b, next_scale)
+                has_following = page_col + fx.Int32(2 * KV_BLOCK_SIZE) < col_hi
+                if has_following:
+                    _store_physical(
+                        current_physical,
+                        _load_physical(page_col + fx.Int32(2 * KV_BLOCK_SIZE)),
                     )
-                    # 12 next-page loads in flight: wait until those 12 remain so
-                    # the current page (or leftover stores) has retired.
-                    wait_vmcnt(PAGE_VMEM_LOADS)
-                    _compute_page(fx.Int32(page_col), current_b, current_scale)
+                # Leave the next-page gather outstanding while consuming current.
+                wait_vmcnt(PAGE_VMEM_LOADS)
+                current_b, current_scale = _load_page_bank(current_bank)
+                _compute_page(page_col, current_b, current_scale)
+
+                if has_following:
+                    following_b, following_scale = _issue_physical(
+                        _load_physical_bank(current_physical)
+                    )
+                    _store_page_bank(current_bank, following_b, following_scale)
+                    if page_col + fx.Int32(3 * KV_BLOCK_SIZE) < col_hi:
+                        _store_physical(
+                            next_physical,
+                            _load_physical(
+                                page_col + fx.Int32(3 * KV_BLOCK_SIZE)
+                            ),
+                        )
+                    # following-page loads plus current-page stores can remain.
+                    wait_vmcnt(PAGE_VMEM_LOADS + store_vmem)
+                else:
+                    # Only current-page stores may remain.
                     wait_vmcnt(store_vmem)
-                    results = yield _pack_state(next_b, next_scale)
-                final_b, final_scale = _unpack_state(results)
-                _compute_page(stop, final_b, final_scale)
-            else:
+                next_b, next_scale = _load_page_bank(next_bank)
+                _compute_page(
+                    page_col + fx.Int32(KV_BLOCK_SIZE), next_b, next_scale
+                )
+                page_col = page_col + fx.Int32(2 * KV_BLOCK_SIZE)
+
+            if page_col < col_hi:
                 wait_vmcnt(0)
-                _compute_page(col_lo, b_init, scale_init)
+                current_b, current_scale = _load_page_bank(current_bank)
+                _compute_page(page_col, current_b, current_scale)
 
     @flyc.jit
     def launch(

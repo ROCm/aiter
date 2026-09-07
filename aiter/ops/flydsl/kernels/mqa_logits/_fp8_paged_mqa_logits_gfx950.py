@@ -15,7 +15,6 @@ Vec = fx.Vector
 SUPPORTED_HEADS = (32, 64)
 HEAD_DIM = 128
 KV_BLOCK_SIZE = 64
-NEXT_N_MAX = 2
 MFMA_M = 16
 MFMA_N = 16
 MFMA_K = 128
@@ -23,13 +22,9 @@ DREG = 4
 B_RING = KV_BLOCK_SIZE // MFMA_N
 # Per physical page: 4 tiles × (2× dwordx4 K + 1× f32 scale).
 PAGE_VMEM_LOADS = B_RING * 3
-# Predicated logit stores: next_n query rows × 4 tiles. Hot-loop pages are full,
-# so these VM ops land after the next-page loads and can stay in flight.
-PAGE_VMEM_STORES = NEXT_N_MAX * B_RING
-
-
 def page_vmem_stores(next_n):
-    return int(next_n) * B_RING
+    """One wave-wide contiguous store per query row and physical page."""
+    return int(next_n)
 
 _NEUTRAL_E8M0 = 0x7F7F7F7F
 
