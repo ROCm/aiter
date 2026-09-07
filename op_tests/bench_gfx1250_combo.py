@@ -632,13 +632,13 @@ _MLA_V4_KARGPRELD_SHAPES = [
 ]
 _MLA_V4_DSV4_SHAPES = [
     (128, 512, kv_seq_lens, num_kv_splits)
-    for kv_seq_lens in (256, 512, 1024)
+    for kv_seq_lens in (256, 512, 1024, 1152)
     for num_kv_splits in (1, 2, 4)
 ] + [
     (128, tokens, kv_seq_lens, num_kv_splits)
     for tokens in _MLA_DECODE_TOKENS
     if tokens != 512
-    for kv_seq_lens in (256, 512, 1024)
+    for kv_seq_lens in (256, 512, 1024, 1152)
     for num_kv_splits in (1, 2, 4)
 ]
 _MLA_V4_COMPARE_KEEP = [
