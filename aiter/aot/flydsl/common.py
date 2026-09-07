@@ -59,9 +59,28 @@ def cu_num_to_arch(cu_num: int, default: str = "gfx950") -> str:
     return _CU_NUM_TO_ARCH.get(cu_num, default)
 
 
-def job_arch(cu_num: int = 0, gfx: str = "") -> str:
-    """Target arch a job would compile for -- shared by dispatch and AOT filtering."""
-    return gfx or cu_num_to_arch(cu_num, default="gfx950")
+def resolve_job_arch(cu_num: int = 0, gfx: str = "") -> str:
+    """Architecture this AOT job should compile for.
+
+    Prefer an explicit ``gfx`` from the row. If that is missing, fall back
+    only to the known historical CU-count mapping (80/304 -> gfx942,
+    256 -> gfx950). Unknown or missing values raise rather than inventing
+    an architecture.
+    """
+    gfx = (gfx or "").strip()
+    if gfx:
+        return gfx
+    try:
+        mapped = _CU_NUM_TO_ARCH.get(int(cu_num))
+    except (TypeError, ValueError):
+        mapped = None
+    if mapped is None:
+        raise ValueError(
+            "cannot resolve AOT architecture: "
+            f"gfx={gfx!r} cu_num={cu_num!r}; provide an explicit gfx, "
+            f"or a known legacy cu_num ({sorted(_CU_NUM_TO_ARCH)})"
+        )
+    return mapped
 
 
 def job_identity(job: dict[str, Any]) -> tuple:

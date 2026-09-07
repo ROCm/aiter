@@ -21,8 +21,8 @@ import time
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
     compile_only_env,
-    job_arch,
     override_env,
+    resolve_job_arch,
 )
 from aiter.jit.core import AITER_CONFIGS, AITER_ROOT_DIR
 from aiter.jit.utils.chip_info import warn_legacy_gfx_inference
@@ -387,7 +387,7 @@ def compile_one_config(**job):
     stage = job["stage"]
     cu_num = int(job.get("cu_num", 0) or 0)
     gfx = (job.get("gfx") or "").strip()
-    aot_arch = job_arch(cu_num, gfx)
+    aot_arch = resolve_job_arch(cu_num, gfx)
     if aot_arch != "gfx950":
         raise ValueError(
             f"mxfp4 MoE AOT is gfx950-only; row specifies gfx={gfx!r} cu_num={cu_num}"

@@ -19,11 +19,11 @@ except Exception as e:  # noqa: BLE001
     _CHIP_INFO_ERR = e
 
 try:
-    from aiter.aot.flydsl.common import job_arch
+    from aiter.aot.flydsl.common import resolve_job_arch
 
     _JOB_ARCH_ERR = None
 except Exception as e:  # noqa: BLE001
-    job_arch = None
+    resolve_job_arch = None
     _JOB_ARCH_ERR = e
 
 try:
@@ -59,12 +59,26 @@ class TestFmoeLegacyGfxLoading(unittest.TestCase):
         self.assertEqual(df.loc[0, "gfx"], "gfx1250")
 
 
-@unittest.skipUnless(job_arch is not None, f"job_arch not importable: {_JOB_ARCH_ERR}")
+@unittest.skipUnless(
+    resolve_job_arch is not None, f"resolve_job_arch not importable: {_JOB_ARCH_ERR}"
+)
 class TestFlydslMoeAotGfx(unittest.TestCase):
     def test_explicit_gfx_overrides_cu_inference(self):
-        self.assertEqual(job_arch(80, "gfx950"), "gfx950")
-        self.assertEqual(job_arch(256, "gfx942"), "gfx942")
-        self.assertEqual(job_arch(256, ""), "gfx950")
+        self.assertEqual(resolve_job_arch(80, "gfx950"), "gfx950")
+        self.assertEqual(resolve_job_arch(256, "gfx942"), "gfx942")
+        self.assertEqual(resolve_job_arch(256, ""), "gfx950")
+
+    def test_known_legacy_cu_num_without_gfx(self):
+        self.assertEqual(resolve_job_arch(80, ""), "gfx942")
+        self.assertEqual(resolve_job_arch(304, ""), "gfx942")
+
+    def test_unknown_or_missing_arch_raises(self):
+        with self.assertRaisesRegex(ValueError, "cannot resolve AOT architecture"):
+            resolve_job_arch(0, "")
+        with self.assertRaisesRegex(ValueError, "cannot resolve AOT architecture"):
+            resolve_job_arch(128, "")
+        with self.assertRaisesRegex(ValueError, "cannot resolve AOT architecture"):
+            resolve_job_arch("not-a-cu", "")
 
 
 @unittest.skipUnless(

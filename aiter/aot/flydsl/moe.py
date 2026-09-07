@@ -31,9 +31,9 @@ import time
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
     compile_only_env,
-    job_arch,
     job_identity,
     override_env,
+    resolve_job_arch,
     run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
@@ -60,7 +60,6 @@ DEFAULT_CSVS = [
     AITER_CONFIGS.AITER_CONFIG_FMOE_FILE,
     AITER_CONFIGS.AITER_CONFIG_FHMOE_FILE,
 ]
-MOE_AOT_ARCH_DEFAULT = "gfx950"
 
 
 def parse_csv(csv_path: str):
@@ -1020,7 +1019,7 @@ def compile_one_config(
 
     Returns a dict with timing info.
     """
-    aot_arch = job_arch(cu_num, gfx)
+    aot_arch = resolve_job_arch(cu_num, gfx)
     is_epilogue = kwargs.get("stage") == "epilogue"
     shape_str = (
         f"{kernel_name}  inter_dim={inter_dim} topk={topk}"
