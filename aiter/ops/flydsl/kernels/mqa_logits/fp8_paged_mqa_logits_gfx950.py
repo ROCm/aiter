@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx950 H64/D128/KVB64 preshuffled paged FP8 MQA-logits kernel."""
+"""gfx950 H32/H64 D128/KVB64 preshuffled paged FP8 MQA-logits kernel."""
 
 from functools import lru_cache
 
@@ -22,10 +22,11 @@ from ._fp8_paged_mqa_logits_gfx950 import (
     HEAD_DIM,
     MFMA_M,
     MFMA_N,
-    M_TILES,
     NEXT_N_MAX,
-    NUM_HEADS,
     KV_BLOCK_SIZE,
+    PAGE_VMEM_LOADS,
+    PAGE_VMEM_STORES,
+    SUPPORTED_HEADS,
     guarded_store,
     imin,
     load_kv_scale,
@@ -36,8 +37,6 @@ from ._fp8_paged_mqa_logits_gfx950 import (
     schedule_mfma_valu_pairs,
     uceildiv,
     wait_vmcnt,
-    PAGE_VMEM_LOADS,
-    PAGE_VMEM_STORES,
 )
 from ._mqa_logits_common import (
     DEFAULT_COMPILE_HINTS,
@@ -53,9 +52,10 @@ def _unwrap(value):
     return value.ir_value() if hasattr(value, "ir_value") else value
 
 
-def _build_kernel(*, index_dim: int):
+def _build_kernel(*, index_dim: int, num_heads: int):
+    m_tiles = num_heads // MFMA_M
     kernel_name = (
-        f"fp8_paged_mqa_logits_gfx950_H{NUM_HEADS}_D{HEAD_DIM}_"
+        f"fp8_paged_mqa_logits_gfx950_H{num_heads}_D{HEAD_DIM}_"
         f"bkv64_kvb{KV_BLOCK_SIZE}_r{B_RING}_nq{NEXT_N_MAX}_w1_nt_ps_flydsl"
     )
 
@@ -99,25 +99,25 @@ def _build_kernel(*, index_dim: int):
         col_hi = page_hi * KV_BLOCK_SIZE
 
         a_rows = [
-            [None for _ in range_constexpr(M_TILES)]
+            [None for _ in range_constexpr(m_tiles)]
             for _ in range_constexpr(NEXT_N_MAX)
         ]
         w_rows = [
-            [[None for _ in range_constexpr(DREG)] for _ in range_constexpr(M_TILES)]
+            [[None for _ in range_constexpr(DREG)] for _ in range_constexpr(m_tiles)]
             for _ in range_constexpr(NEXT_N_MAX)
         ]
         for row in range_constexpr(NEXT_N_MAX):
             q_row = imin(fx.Int32(row), next_n - 1)
             q_base = pid_batch * stride_q_batch + q_row * stride_q_next_n
             out_row = pid_batch * next_n + q_row
-            for mi in range_constexpr(M_TILES):
+            for mi in range_constexpr(m_tiles):
                 h = mi * MFMA_M + lane_mod_16
                 byte_base = q_base + h * stride_q_heads
                 a_rows[row][mi] = load_q_pack(q_i32, byte_base, lane_div_16)
                 weight_vec = fx.Vector(
                     buffer_ops.buffer_load(
                         weight_t.rsrc,
-                        out_row * NUM_HEADS + mi * MFMA_M + lane_div_16 * DREG,
+                        out_row * num_heads + mi * MFMA_M + lane_div_16 * DREG,
                         vec_width=DREG,
                         dtype=T.f32,
                     )
@@ -164,7 +164,7 @@ def _build_kernel(*, index_dim: int):
             q_row = fx.Int32(row)
             q_limit = context_len - next_n + q_row
             out_row = pid_batch * next_n + q_row
-            logit = reduce_scores(scores, w_rows[row], scale)
+            logit = reduce_scores(scores, w_rows[row], scale, m_tiles=m_tiles)
             writer = (
                 (lane_div_16 == 0)
                 & (q_row < next_n)
@@ -184,17 +184,17 @@ def _build_kernel(*, index_dim: int):
             for slot in range_constexpr(B_RING):
                 col = page_col + slot * MFMA_N + lane_mod_16
                 scores = [
-                    mfma_scores(a_rows[row], b_slots[slot])
+                    mfma_scores(a_rows[row], b_slots[slot], m_tiles=m_tiles)
                     for row in range_constexpr(NEXT_N_MAX)
                 ]
                 if slot > 0:
-                    schedule_mfma_valu_pairs()
+                    schedule_mfma_valu_pairs(m_tiles=m_tiles)
                     for row in range_constexpr(NEXT_N_MAX):
                         _store_row(row, prev_col, prev_scores[row], prev_scale)
                 prev_scores = scores
                 prev_col = col
                 prev_scale = scale_slots[slot]
-            schedule_mfma_valu_pairs()
+            schedule_mfma_valu_pairs(m_tiles=m_tiles)
             for row in range_constexpr(NEXT_N_MAX):
                 _store_row(row, prev_col, prev_scores[row], prev_scale)
             rocdl.sched_barrier(0)
@@ -270,8 +270,8 @@ def _build_kernel(*, index_dim: int):
 
 
 @lru_cache(maxsize=8)
-def _compile(*, index_dim: int):
-    return _build_kernel(index_dim=index_dim)
+def _compile(*, index_dim: int, num_heads: int):
+    return _build_kernel(index_dim=index_dim, num_heads=num_heads)
 
 
 def flydsl_fp8_paged_mqa_logits_gfx950(
@@ -288,12 +288,15 @@ def flydsl_fp8_paged_mqa_logits_gfx950(
     TotalCuCount=None,
     stream=None,
 ):
-    """Run the production-only H64/D128/KVB64/preshuffle gfx950 mapping."""
+    """Run the H32/H64 D128/KVB64/preshuffle gfx950 mapping."""
     if get_gfx() != _GFX950:
         raise RuntimeError(f"gfx950 kernel requested on {get_gfx()}")
     batch_size, next_n, heads, head_dim = q_fp8.shape
-    if (heads, head_dim, int(KVBlockSize)) != (NUM_HEADS, HEAD_DIM, KV_BLOCK_SIZE):
-        raise ValueError("requires H=64, D=128, KVBlockSize=64")
+    if heads not in SUPPORTED_HEADS or (head_dim, int(KVBlockSize)) != (
+        HEAD_DIM,
+        KV_BLOCK_SIZE,
+    ):
+        raise ValueError("requires H in {32, 64}, D=128, KVBlockSize=64")
     if next_n not in (1, 2):
         raise ValueError("requires next_n in {1, 2}")
     if q_fp8.dtype != get_fp8_e4m3_dtype():
@@ -305,7 +308,7 @@ def flydsl_fp8_paged_mqa_logits_gfx950(
         raise ValueError(f"unexpected KV cache shape {tuple(kv_cache.shape)}")
 
     context_lens = context_lens.reshape(batch_size)
-    weights = weights.reshape(batch_size * next_n, NUM_HEADS)
+    weights = weights.reshape(batch_size * next_n, heads)
     max_block_len = kv_indices.shape[-1]
     kv_indices = kv_indices.reshape(batch_size, max_block_len)
     total_cu = (
@@ -326,7 +329,7 @@ def flydsl_fp8_paged_mqa_logits_gfx950(
         else max(1, min(max_pages, int(SplitKV)))
     )
     grid_blocks = batch_size * split_kv
-    launcher = _compile(index_dim=int(index_dim))
+    launcher = _compile(index_dim=int(index_dim), num_heads=int(heads))
     launcher.compile_hints = {**DEFAULT_COMPILE_HINTS, "waves_per_eu": 2}
     stream = stream or torch.cuda.current_stream(q_fp8.device)
     with torch.cuda.device(q_fp8.device.index):

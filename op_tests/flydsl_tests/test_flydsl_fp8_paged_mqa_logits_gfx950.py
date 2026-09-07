@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Focused B16/Nq2/H64/D128/KVB64 test for the gfx950 indexer mapping."""
+"""Focused B16/Nq2/H{32,64}/D128/KVB64 test for the gfx950 indexer mapping."""
 
 import argparse
 
@@ -25,24 +25,25 @@ torch.set_default_device("cuda")
 
 BATCH = 16
 NEXT_N = 2
-HEADS = 64
+HEADS = (32, 64)
+DEFAULT_HEADS = 64
 HEAD_DIM = 128
 KV_LEN = 32768
 KV_BLOCK_SIZE = 64
 
 
-def _inputs():
+def _inputs(heads, next_n=NEXT_N, kv_len=KV_LEN, batch=BATCH):
     inp = _build_inputs(
-        BATCH,
-        NEXT_N,
-        HEADS,
+        batch,
+        next_n,
+        heads,
         HEAD_DIM,
-        KV_LEN,
+        kv_len,
         get_fp8_e4m3_dtype(),
         block_size=KV_BLOCK_SIZE,
     )
     kv_cache, out = _kernel_inputs(
-        inp, BATCH, NEXT_N, HEAD_DIM, True, KV_BLOCK_SIZE
+        inp, batch, next_n, HEAD_DIM, True, KV_BLOCK_SIZE
     )
     return inp, kv_cache, out
 
@@ -60,9 +61,7 @@ def _launch(inp, kv_cache, out):
     )
 
 
-def test_gfx950_indexer_mapping():
-    assert get_gfx() == "gfx950"
-    inp, kv_cache, out = _inputs()
+def _check(inp, kv_cache, out, tag):
     with torch.inference_mode():
         ref = ref_fp8_paged_mqa_logits(
             inp.q,
@@ -78,20 +77,35 @@ def test_gfx950_indexer_mapping():
 
     ref_mask = ref == float("-inf")
     got_mask = got == float("-inf")
-    assert torch.equal(got_mask, ref_mask), "causal/padding -inf mask mismatch"
+    assert torch.equal(got_mask, ref_mask), f"{tag}: causal/padding -inf mask mismatch"
     diff = calc_diff(got.masked_fill(got_mask, 0), ref.masked_fill(ref_mask, 0))
-    assert diff < 1e-3, f"calc_diff={diff}"
-    print(f"correctness: pass calc_diff={float(diff):.3e}")
+    assert diff < 1e-3, f"{tag} calc_diff={diff}"
+    print(f"correctness {tag}: pass calc_diff={float(diff):.3e}")
 
 
-def _benchmark():
+def test_gfx950_indexer_mapping(heads=DEFAULT_HEADS):
+    assert get_gfx() == "gfx950"
+    inp, kv_cache, out = _inputs(heads)
+    _check(inp, kv_cache, out, f"H={heads}")
+
+
+def test_gfx950_nq1_and_short_pages(heads=32):
+    assert get_gfx() == "gfx950"
+    inp, kv_cache, out = _inputs(heads, next_n=1)
+    _check(inp, kv_cache, out, f"H={heads} Nq=1")
+    for pages in (2, 3, 4):
+        inp, kv_cache, out = _inputs(heads, kv_len=pages * KV_BLOCK_SIZE, batch=2)
+        _check(inp, kv_cache, out, f"H={heads} pages={pages}")
+
+
+def _benchmark(heads):
     from aiter.ops.triton.attention.pa_mqa_logits import (
         deepgemm_fp8_paged_mqa_logits,
         enable_gluon_pa_mqa_logits,
         triton_version,
     )
 
-    inp, kv_cache, out_new = _inputs()
+    inp, kv_cache, out_new = _inputs(heads)
     out_old = torch.full_like(out_new, float("-inf"))
     out_triton = torch.full_like(out_new, float("-inf"))
 
@@ -127,37 +141,61 @@ def _benchmark():
         )
 
     backend = "gluon" if enable_gluon_pa_mqa_logits else "triton-jit"
-    print(f"triton {triton_version} backend={backend}")
+    print(f"H={heads} triton {triton_version} backend={backend}")
     with torch.inference_mode():
         _, new_us = run_perftest(new_kernel, num_iters=50, num_warmup=8)
         _, old_us = run_perftest(old_kernel, num_iters=50, num_warmup=8)
         _, triton_us = run_perftest(triton_kernel, num_iters=50, num_warmup=8)
-    print(f"time: {new_us:.3f} us")
+    # WaveScope benchmarkPattern matches the first `time: {us} us` line (H=64).
+    if heads == DEFAULT_HEADS:
+        print(f"time: {new_us:.3f} us")
+    else:
+        print(f"time H={heads}: {new_us:.3f} us")
     print(f"flydsl baseline: {old_us:.3f} us")
     print(f"{backend}: {triton_us:.3f} us")
     print(f"vs flydsl: {old_us / new_us:.3f}x")
     print(f"vs {backend}: {triton_us / new_us:.3f}x")
 
 
-def _profile():
-    inp, kv_cache, out = _inputs()
+def _profile(heads):
+    inp, kv_cache, out = _inputs(heads)
     with torch.inference_mode():
         _launch(inp, kv_cache, out)
     torch.cuda.synchronize()
-    print("profile launch: pass")
+    print(f"profile launch H={heads}: pass")
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--time", action="store_true")
+    parser.add_argument(
+        "--heads",
+        type=int,
+        choices=HEADS,
+        default=None,
+        help="Restrict to one head count (default: both; --time still prints H=64 first)",
+    )
     args = parser.parse_args()
-    if args.profile:
-        _profile()
-    elif args.time:
-        _benchmark()
+    heads = (args.heads,) if args.heads is not None else HEADS
+    if args.time:
+        # H=64 first so WaveScope still sees `time: {us} us` as the production line.
+        timed = tuple(h for h in (DEFAULT_HEADS,) + heads if h in heads)
+        seen = set()
+        ordered = []
+        for h in timed:
+            if h not in seen:
+                ordered.append(h)
+                seen.add(h)
+        for h in ordered:
+            _benchmark(h)
+    elif args.profile:
+        for h in heads:
+            _profile(h)
     else:
-        test_gfx950_indexer_mapping()
+        for h in heads:
+            test_gfx950_indexer_mapping(h)
+            test_gfx950_nq1_and_short_pages(h)
 
 
 if __name__ == "__main__":

@@ -12,14 +12,13 @@ from .. import buffer_ops
 
 Vec = fx.Vector
 
-NUM_HEADS = 64
+SUPPORTED_HEADS = (32, 64)
 HEAD_DIM = 128
 KV_BLOCK_SIZE = 64
 NEXT_N_MAX = 2
 MFMA_M = 16
 MFMA_N = 16
 MFMA_K = 128
-M_TILES = NUM_HEADS // MFMA_M
 DREG = 4
 B_RING = KV_BLOCK_SIZE // MFMA_N
 # Per physical page: 4 tiles × (2× dwordx4 K + 1× f32 scale).
@@ -118,12 +117,12 @@ def load_kv_scale(kv_i32, physical, token_in_page, *, index_dim):
     )
 
 
-def mfma_scores(a_tiles, b_pack):
-    """Return four 4-f32 score fragments, one per 16-head M tile."""
+def mfma_scores(a_tiles, b_pack, *, m_tiles):
+    """Return one 4-f32 score fragment per 16-head M tile."""
     result_type = Vec.make_type(DREG, fx.Float32)
     neutral = arith.constant(_NEUTRAL_E8M0, type=T.i32)
     scores = []
-    for mi in range_constexpr(M_TILES):
+    for mi in range_constexpr(m_tiles):
         acc = Vec.filled(DREG, 0.0, fx.Float32)
         acc = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
             result_type,
@@ -133,11 +132,11 @@ def mfma_scores(a_tiles, b_pack):
     return scores
 
 
-def reduce_scores(scores, weights, kv_scale):
+def reduce_scores(scores, weights, kv_scale, *, m_tiles):
     """ReLU, weighted H reduction, positive KV scale, then wave reduction."""
     zero = fx.Float32(0.0)
     total = zero
-    for mi in range_constexpr(M_TILES):
+    for mi in range_constexpr(m_tiles):
         frag = Vec(scores[mi])
         for ii in range_constexpr(DREG):
             total = total + fx.Float32(frag[ii]).maximumf(zero) * weights[mi][ii]
@@ -147,8 +146,8 @@ def reduce_scores(scores, weights, kv_scale):
     return total
 
 
-def schedule_mfma_valu_pairs():
+def schedule_mfma_valu_pairs(*, m_tiles):
     """Pair each 32-cycle MFMA with the prior tile's 12-op VALU fragment."""
-    for _ in range_constexpr(M_TILES):
+    for _ in range_constexpr(m_tiles):
         rocdl.sched_group_barrier(0x008, 1, 0)
         rocdl.sched_group_barrier(0x002, DREG * 3, 0)
