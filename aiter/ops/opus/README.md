@@ -284,13 +284,14 @@ Let `padded_M=ceil_div(M,B_M)*B_M` and
 | gfx1250 pre-built CO direct | none | none |
 | gfx1250 fused | not publicly registered | factory/emitter/source retained for repair |
 
-For gfx942, `workspace_capacity_split_k` records the allocated capacity while
-`abi_split_k` records the possibly down-clamped value passed to the launcher.
-Both are fields of the same immutable launch plan.
+For gfx942, `abi_split_k` records the converged value passed to the launcher.
+`workspace_capacity_split_k` uses the same value, so automatic allocation
+reserves one workspace slice per launched split.
 
 An explicit workspace must be on the XQ device, contiguous, 16-byte aligned,
-of the exact instance dtype, and large enough for the final split. A direct
-kid requires `workspace=None`.
+of the exact instance dtype, and large enough for the final split. Larger
+caller-provided workspaces are also accepted. A direct kid requires
+`workspace=None`.
 
 gfx1250 clusterlaunch exact kids round the physical launch grid up to complete
 clusters; tile-less workgroups exit inside the pipeline. This does not change

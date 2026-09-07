@@ -392,7 +392,7 @@ def test_gfx942_short_k_auto_split_matches_torch(workspace_splits):
     B = torch.randn((64, 128), device="cuda", dtype=torch.bfloat16)
     Y = torch.empty((1, 64), device="cuda", dtype=torch.bfloat16)
     # kid 10201 uses FP32 workspace with 64x64 tiles. The short K launches
-    # one split, so both one slice and the conservative 16 slices are valid.
+    # one split; a caller may provide either one slice or a larger workspace.
     workspace = (
         None
         if workspace_splits is None
@@ -497,21 +497,54 @@ def test_gfx1250_bf16_output_accepts_fp32_bias():
 
 
 @pytest.mark.parametrize(
-    ("K", "split_k", "capacity", "launch_split_k"),
-    ((128, 0, 16, 1), (128, 1, 1, 1), (128, 16, 16, 1), (512, 0, 16, 4)),
+    ("K", "split_k", "launch_split_k"),
+    ((128, 0, 1), (128, 1, 1), (128, 16, 1), (512, 0, 4)),
 )
-def test_gfx942_split_k_plan_allows_capacity_overestimate(
-    K, split_k, capacity, launch_split_k
-):
+def test_gfx942_split_k_plan_sizes_workspace_after_clamping(K, split_k, launch_split_k):
     args = _a16_policy_args("gfx942", 1, 64, K)
     args["cu_num"] = 80
     plan = _get_cached_a16w16_launch_plan(**args, kid=10201, split_k=split_k)
 
     assert plan.resolved_kid == 10201
-    assert plan.workspace_capacity_split_k == capacity
+    assert plan.workspace_capacity_split_k == launch_split_k
     assert plan.abi_split_k == launch_split_k
-    assert plan.workspace_spec.shape == (capacity, 1, 64, 64)
+    assert plan.workspace_spec.shape == (launch_split_k, 1, 64, 64)
     assert plan.workspace_spec.dtype == torch.float32
+
+
+@pytest.mark.parametrize(
+    ("K", "caller_splits", "allocated_splits", "launch_split_k"),
+    ((128, None, 1, 1), (512, None, 4, 4), (128, 1, 1, 1), (128, 16, 16, 1)),
+)
+def test_gfx942_workspace_allocation_and_launch_split_k(
+    monkeypatch, K, caller_splits, allocated_splits, launch_split_k
+):
+    from aiter.ops.opus import gemm_op_a16w16
+
+    calls = []
+
+    def capture(_A, _B, _Y, _bias, workspace, kid, split_k):
+        calls.append((workspace, kid, split_k))
+
+    monkeypatch.setattr(gemm_op_a16w16, "_device_arch_and_cu", lambda _: ("gfx942", 80))
+    monkeypatch.setattr(gemm_op_a16w16, "_opus_gemm_a16w16_launch_raw", capture)
+    A = torch.empty((1, K), device="meta", dtype=torch.bfloat16)
+    B = torch.empty((64, K), device="meta", dtype=torch.bfloat16)
+    Y = torch.empty((1, 64), device="meta", dtype=torch.bfloat16)
+    workspace = (
+        None
+        if caller_splits is None
+        else torch.empty((caller_splits, 1, 64, 64), device="meta", dtype=torch.float32)
+    )
+
+    assert opus_gemm(A, B, Y, kid=10201, split_k=0, workspace=workspace) is Y
+    assert len(calls) == 1
+    actual_workspace, actual_kid, actual_split_k = calls[0]
+    assert (actual_kid, actual_split_k) == (10201, launch_split_k)
+    assert actual_workspace.shape == (allocated_splits, 1, 64, 64)
+    assert actual_workspace.dtype == torch.float32
+    if workspace is not None:
+        assert actual_workspace is workspace
 
 
 @pytest.mark.parametrize(

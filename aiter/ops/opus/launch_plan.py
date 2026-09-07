@@ -93,10 +93,10 @@ def _plan_gfx942_split_k(
     batch: int,
     cu_num: int,
     requested: int,
-) -> tuple[int, int]:
-    """Return workspace-capacity and ABI split-K matching the gfx942 launcher."""
+) -> int:
+    """Return the converged ABI split-K matching the gfx942 launcher."""
     if requested > 0:
-        workspace_capacity = requested
+        abi_split_k = requested
     else:
         tiles_mn = (
             (M + instance.B_M - 1)
@@ -106,8 +106,8 @@ def _plan_gfx942_split_k(
         )
         tiles_mn = max(1, tiles_mn)
         target_wg = (2 * cu_num) if instance.kernel_tag.endswith("_p1") else cu_num
-        workspace_capacity = (target_wg + tiles_mn - 1) // tiles_mn
-        workspace_capacity = min(GFX942_MAX_AUTO_SPLIT_K, max(1, workspace_capacity))
+        abi_split_k = (target_wg + tiles_mn - 1) // tiles_mn
+        abi_split_k = min(GFX942_MAX_AUTO_SPLIT_K, max(1, abi_split_k))
 
     total_iters = (K + instance.B_K - 1) // instance.B_K
     if total_iters < GFX942_MIN_ITERS_PER_SPLIT:
@@ -116,7 +116,6 @@ def _plan_gfx942_split_k(
             f"need at least {instance.B_K * GFX942_MIN_ITERS_PER_SPLIT}"
         )
 
-    abi_split_k = workspace_capacity
     require_even = instance.kernel_tag in GFX942_EVEN_LOOP_SPLITK_TAGS
     while abi_split_k > 1:
         iters_full = (total_iters + abi_split_k - 1) // abi_split_k
@@ -139,7 +138,7 @@ def _plan_gfx942_split_k(
                 f"K={K}, split_k={abi_split_k}, "
                 f"loops=({iters_full},{last_loops})"
             )
-    return workspace_capacity, abi_split_k
+    return abi_split_k
 
 
 def _build_a16w16_workspace_spec(
@@ -330,7 +329,7 @@ def _build_a16w16_launch_plan(
             workspace_capacity_split_k = int(instance.fuse_split_k)
             abi_split_k = workspace_capacity_split_k
         elif registry_arch == GFX942:
-            workspace_capacity_split_k, abi_split_k = _plan_gfx942_split_k(
+            abi_split_k = _plan_gfx942_split_k(
                 instance,
                 M=M,
                 N=N,
@@ -339,9 +338,9 @@ def _build_a16w16_launch_plan(
                 cu_num=cu_num,
                 requested=requested_split_k,
             )
+            workspace_capacity_split_k = abi_split_k
 
-        # gfx942 may reserve more workspace slices than it launches after
-        # clamping. The K-tile limit applies to the launch, not its capacity.
+        # Validate the launch split-K independently of workspace sizing.
         launch_split_k = max(1, abi_split_k)
         block_k = int(instance.B_K)
         max_useful_split_k = (K + block_k - 1) // block_k
