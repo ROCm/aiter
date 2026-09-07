@@ -133,13 +133,21 @@ def build_moe_gather_reduce_module(
             rows_lds = route_lds.rows.ptr
             wbits_lds = route_lds.w_bits.ptr
             tid_u32 = fx.Uint32(tid)
+            # First row past the end of the flat tensor. A dropped EP route
+            # (DROPPED_ROUTE_ROW) owns no grouped row, and steering it to row 0
+            # would read bytes stage2 need never have written -- a stale NaN
+            # there survives the multiply by the route's (zero) weight. Sending
+            # it out of range instead makes the resource's num_records return 0,
+            # which is what the per-row zero-sized descriptor used to do.
+            oob_row_i32 = fx.Int32(slice_stride_dw) * sk_i32 // fx.Int32(out_dwords)
+
             if tid_u32 < topk_i32:
                 map_off = map_base + tid_u32
                 raw_row = fx.Int32(
                     buffer_ops.buffer_load(rows_rsrc, map_off, vec_width=1, dtype=i32)
                 )
                 is_mapped = raw_row >= fx.Int32(0)
-                row_i32 = is_mapped.select(raw_row, fx.Int32(0))
+                row_i32 = is_mapped.select(raw_row, oob_row_i32)
                 _lds_si32(rows_lds, row_i32, tid)
                 w_loaded = buffer_ops.buffer_load(w_rsrc, map_off, vec_width=1, dtype=w_dt)
                 w_f32 = w_dt_fx(w_loaded).to(fx.Float32)
