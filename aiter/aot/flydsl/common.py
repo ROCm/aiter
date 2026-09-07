@@ -53,6 +53,9 @@ _CU_NUM_TO_ARCH = {
     256: "gfx950",
 }
 
+# Keep in sync with aiter.jit.utils.chip_info.GFX_PLACEHOLDERS.
+_GFX_PLACEHOLDERS = frozenset(("", "0", "nan", "None"))
+
 
 def cu_num_to_arch(cu_num: int) -> str:
     """Map a known legacy compute-unit count to its historical architecture."""
@@ -71,13 +74,14 @@ def cu_num_to_arch(cu_num: int) -> str:
 def resolve_job_arch(cu_num: int = 0, gfx: str = "") -> str:
     """Architecture this AOT job should compile for.
 
-    Prefer an explicit ``gfx`` from the row. If that is missing, fall back
+    Prefer an explicit ``gfx`` from the row. Placeholder values (``0``, empty,
+    ``nan``, ``None``) are treated as missing. If gfx is missing, fall back
     only to the known historical CU-count mapping (80/304 -> gfx942,
     256 -> gfx950). Unknown or missing values raise rather than inventing
     an architecture.
     """
-    gfx = (gfx or "").strip()
-    if gfx:
+    gfx = "" if gfx is None else str(gfx).strip()
+    if gfx and gfx not in _GFX_PLACEHOLDERS:
         return gfx
     return cu_num_to_arch(cu_num)
 

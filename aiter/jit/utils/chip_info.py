@@ -119,6 +119,9 @@ _LEGACY_CU_NUM_TO_GFX = {
     304: "gfx942",
 }
 
+# Keep in sync with aiter.aot.flydsl.common._GFX_PLACEHOLDERS.
+GFX_PLACEHOLDERS = frozenset(("", "0", "nan", "None"))
+
 _LEGACY_GFX_WARNED_SOURCES: set[str] = set()
 
 
@@ -148,7 +151,8 @@ def backfill_dataframe_gfx(df, source: str | None = None):
         df["gfx"] = df["cu_num"].map(gfx_from_cu_num)
         warned = True
     else:
-        bad = df["gfx"].isna() | df["gfx"].astype(str).isin(["0", "", "nan", "None"])
+        gfx_text = df["gfx"].astype(str).str.strip()
+        bad = df["gfx"].isna() | gfx_text.isin(GFX_PLACEHOLDERS)
         if bad.any():
             df = df.copy()
             df.loc[bad, "gfx"] = df.loc[bad, "cu_num"].map(gfx_from_cu_num)
@@ -159,22 +163,26 @@ def backfill_dataframe_gfx(df, source: str | None = None):
 
 
 def gfx_from_cu_num(cu_num) -> str:
-    """Infer the gfx arch for a legacy config row that has no `gfx` column.
+    """Infer gfx for a legacy config row that has no usable ``gfx`` value.
 
-    Used to migrate old tuned CSVs (keyed on cu_num only) to the new
-    (gfx, cu_num, ...) schema. Unknown cu_num falls back to the live GPU arch.
+    Only the historical CU mappings are accepted (80/304 -> gfx942,
+    256 -> gfx950). Unknown or unparsable ``cu_num`` values raise rather than
+    labeling the row with the live GPU architecture.
     """
     try:
         cu_num = int(cu_num)
-    except (TypeError, ValueError):
-        return get_gfx_runtime()
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"cannot infer gfx from cu_num={cu_num!r}; known legacy mappings are "
+            f"{dict(sorted(_LEGACY_CU_NUM_TO_GFX.items()))}"
+        ) from e
     gfx = _LEGACY_CU_NUM_TO_GFX.get(cu_num)
-    if gfx is not None:
-        return gfx
-    try:
-        return get_gfx_runtime()
-    except Exception:  # noqa: BLE001
-        return "gfx942"
+    if gfx is None:
+        raise ValueError(
+            f"cannot infer gfx from cu_num={cu_num}; known legacy mappings are "
+            f"{dict(sorted(_LEGACY_CU_NUM_TO_GFX.items()))}"
+        )
+    return gfx
 
 
 @functools.lru_cache(maxsize=1)

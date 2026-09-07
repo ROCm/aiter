@@ -58,6 +58,16 @@ class TestFmoeLegacyGfxLoading(unittest.TestCase):
             )
         self.assertEqual(df.loc[0, "gfx"], "gfx1250")
 
+    def test_unknown_cu_num_raises_instead_of_using_live_gpu(self):
+        with self.assertRaisesRegex(ValueError, "cannot infer gfx from cu_num=128"):
+            backfill_dataframe_gfx(pd.DataFrame({"cu_num": [128]}), "unknown.csv")
+
+    def test_placeholder_gfx_with_unknown_cu_num_raises(self):
+        with self.assertRaisesRegex(ValueError, "cannot infer gfx from cu_num=128"):
+            backfill_dataframe_gfx(
+                pd.DataFrame({"gfx": ["0"], "cu_num": [128]}), "placeholder.csv"
+            )
+
 
 @unittest.skipUnless(
     resolve_job_arch is not None, f"resolve_job_arch not importable: {_JOB_ARCH_ERR}"
@@ -72,6 +82,11 @@ class TestFlydslMoeAotGfx(unittest.TestCase):
         self.assertEqual(resolve_job_arch(80, ""), "gfx942")
         self.assertEqual(resolve_job_arch(304, ""), "gfx942")
 
+    def test_placeholder_gfx_falls_back_to_known_cu_mapping(self):
+        self.assertEqual(resolve_job_arch(256, "0"), "gfx950")
+        self.assertEqual(resolve_job_arch(80, "None"), "gfx942")
+        self.assertEqual(resolve_job_arch(304, "nan"), "gfx942")
+
     def test_unknown_or_missing_arch_raises(self):
         with self.assertRaisesRegex(ValueError, "cannot map cu_num"):
             resolve_job_arch(0, "")
@@ -79,6 +94,8 @@ class TestFlydslMoeAotGfx(unittest.TestCase):
             resolve_job_arch(128, "")
         with self.assertRaisesRegex(ValueError, "cannot map cu_num"):
             resolve_job_arch("not-a-cu", "")
+        with self.assertRaisesRegex(ValueError, "cannot map cu_num"):
+            resolve_job_arch(128, "0")
 
 
 @unittest.skipUnless(
