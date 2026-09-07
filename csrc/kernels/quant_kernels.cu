@@ -239,6 +239,23 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         absMax = max(absMax, abs(static_cast<float>(thread_data[j])));
     }
     absMax = multithread_reduce(absMax, aiter::Max(), num_thread_per_group);
+    // `v_cvt_scalef32_pk8_fp8_bf16` does not saturate -- past 464, the midpoint between fp8
+    // e4m3's top two steps, it rounds into the NaN encoding -- where the software med3 path
+    // clamps. Cap amax so an inf group still gets a finite scale, then saturate below.
+    // (kStoreTakesDivisor is declared here because the cap has to precede the scale.)
+    static constexpr bool kStoreTakesDivisor =
+        use_e8m0_scale && std::is_same_v<DTYPE_O, opus::fp8_t> &&
+        std::is_same_v<DTYPE_I, opus::bf16_t> && (thread_data_size % 8 == 0);
+    static constexpr bool kHwConvertDiv = kTunedForThisArch && kStoreTakesDivisor;
+    static constexpr bool kScaleMayClip =
+        aiter::kDefaultMxScaleRoundMode == aiter::MxScaleRoundMode::RoundDown ||
+        aiter::kDefaultMxScaleRoundMode == aiter::MxScaleRoundMode::Even;
+    bool degenerate_group = false;
+    if constexpr(kHwConvertDiv)
+    {
+        degenerate_group = !(absMax < __builtin_inff());
+        absMax           = fminf(absMax, 448.0f * 0x1.0p119f);
+    }
 
     // MX e8m0 path: use the project-wide default round mode
     // (``kDefaultMxScaleRoundMode``, currently RoundUp = NV / DSv4 RCEIL).
@@ -326,12 +343,28 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     // Conversely the reciprocal must stay gated on the store form and not on
     // use_e8m0_scale: gating it that way once skipped the reciprocal for fp8 + e8m0 on the
     // software path and produced fp8 bytes ~2x off (`split_elem_err ≈ 100%`).
-    static constexpr bool kStoreTakesDivisor =
-        use_e8m0_scale && std::is_same_v<DTYPE_O, opus::fp8_t> &&
-        std::is_same_v<DTYPE_I, opus::bf16_t> && (thread_data_size % 8 == 0);
     if constexpr(!std::is_same_v<DTYPE_O, opus::fp4_t> && !kStoreTakesDivisor)
     {
         inverted_scale = 1.0f / inverted_scale;
+    }
+
+    // Only RoundDown / Even can floor the scale enough for finite data to overflow, so under
+    // the shipped RoundUp this folds to `if(degenerate_group)` -- never taken, and free.
+    // Compares rather than min/max-es: both tests are false for NaN, so NaN stays NaN.
+    if constexpr(kHwConvertDiv)
+    {
+        if(kScaleMayClip || degenerate_group)
+        {
+            const float hi = 448.0f * inverted_scale;
+            for(size_t j = 0; j < thread_data_size; j++)
+            {
+                const float v = static_cast<float>(thread_data[j]);
+                if(v > hi)
+                    thread_data[j] = static_cast<DTYPE_I>(hi);
+                if(v < -hi)
+                    thread_data[j] = static_cast<DTYPE_I>(-hi);
+            }
+        }
     }
 
     using DTYPE_STORE = std::conditional_t<std::is_same_v<DTYPE_O, opus::fp4_t>, uint8_t, DTYPE_O>;
