@@ -44,7 +44,7 @@ def _sequence_major_input(rank, heads, seq_len, head_dim, device):
     )
 
 
-def _norm_rope(input_tensor, weight, cos, sin):
+def _norm_rope(input_tensor, weight, cos, sin, dtype=torch.bfloat16):
     heads, head_dim = input_tensor.shape[-2:]
     norm = torch.nn.RMSNorm(
         heads * head_dim,
@@ -60,7 +60,55 @@ def _norm_rope(input_tensor, weight, cos, sin):
     output = torch.empty_like(values)
     output[..., 0::2] = even * cos[..., 0::2] - odd * sin[..., 1::2]
     output[..., 1::2] = even * sin[..., 1::2] + odd * cos[..., 0::2]
-    return output.to(torch.bfloat16)
+    return output.to(dtype)
+
+
+def _mx_fp8_reference(values):
+    """E4M3 RNE with RoundUp E8M0 scaling, independently expressed in torch."""
+    blocks = values.float().reshape(*values.shape[:-1], -1, 32)
+    amax = blocks.abs().amax(dim=-1)
+    inv_max = torch.tensor(0x3B124925, dtype=torch.int32, device=values.device).view(
+        torch.float32
+    )
+    bits = (amax * inv_max).view(torch.int32)
+    exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).int()
+    exponent = exponent.clamp(0, 255)
+    reciprocal = ((254 - exponent) << 23).view(torch.float32)
+    payload = (blocks * reciprocal.unsqueeze(-1)).to(torch.float8_e4m3fn)
+    return payload.view(torch.uint8).reshape_as(values), exponent.to(torch.uint8)
+
+
+def _dequantize(payload, scales):
+    blocks = payload.view(torch.float8_e4m3fn).float().reshape(*scales.shape, 32)
+    scale = torch.exp2(scales.float() - 127)
+    return (blocks * scale.unsqueeze(-1)).reshape_as(payload)
+
+
+def _assert_quantized(payload, scales, reference, reference_scales, oracle, label):
+    if payload.dtype != torch.uint8 or scales.dtype != torch.uint8:
+        raise AssertionError(f"{label}: payload and E8M0 scales must be uint8")
+    _assert_equal(scales, reference_scales, f"{label} scales")
+    actual = _dequantize(payload, scales)
+    format_sqnr, _, _ = _metrics(actual, reference)
+    mismatch_fraction = (actual != reference).float().mean().item()
+    # FP32 norm/RoPE can cross an FP8 rounding midpoint, but only very rarely.
+    if not (format_sqnr >= 60.0 and mismatch_fraction <= 1.0e-4):
+        raise AssertionError(
+            f"{label}: format SQNR={format_sqnr:.4f} dB, "
+            f"mismatch_fraction={mismatch_fraction:.6g}"
+        )
+    reference_sqnr, _, _ = _metrics(reference, oracle)
+    kernel_sqnr, _, _ = _metrics(actual, oracle)
+    if not kernel_sqnr >= reference_sqnr - 2.0:
+        raise AssertionError(
+            f"{label}: kernel SQNR={kernel_sqnr:.4f} dB, "
+            f"reference SQNR={reference_sqnr:.4f} dB (margin=2 dB)"
+        )
+    return (
+        f"{label}: format-correctness=PASS format-SQNR={format_sqnr:.4f}dB "
+        f"mismatch_fraction={mismatch_fraction:.6g} "
+        f"reference-SQNR={reference_sqnr:.4f}dB kernel-SQNR={kernel_sqnr:.4f}dB"
+    )
 
 
 def _metrics(actual, reference):
@@ -102,6 +150,11 @@ def _run_rank(rank, world_size, port):
 
         for case_name, heads, seq_len, head_dim in _CASES:
             q = _sequence_major_input(rank, heads, seq_len, head_dim, device)
+            if case_name == "small":
+                q[:, 0].zero_()
+                q[:, 1] = (
+                    torch.arange(heads * head_dim, device=device) % 127 - 63
+                ).reshape(heads, head_dim).float() / 32
             k = q * 0.75 + 0.125
             v = q + 2
             hd = heads * head_dim
@@ -208,6 +261,59 @@ def _run_rank(rank, world_size, port):
                             flush=True,
                         )
 
+            quantized = [
+                _mx_fp8_reference(_norm_rope(input, weight, cos, sin, torch.float32))
+                for input, weight in zip((q, k), (norm_q, norm_k), strict=True)
+            ]
+            quant_references = a2a_references(
+                [_dequantize(payload, scale) for payload, scale in quantized],
+                heads_local,
+                seq_len,
+                head_dim,
+            )
+            scale_references = a2a_references(
+                [scale for _, scale in quantized],
+                heads_local,
+                seq_len,
+                head_dim // 32,
+            )
+            for split in (False, True):
+                op = FusedA2AIntraNodeOp(
+                    rank=rank,
+                    world_size=world_size,
+                    shape=q.shape,
+                    split=split,
+                    quant=True,
+                )
+                for epoch in range(3):
+                    actuals, scales = op(*inputs, norm_q, norm_k, cos, sin)
+                    torch.cuda.synchronize()
+                    quant_metrics = []
+                    for i, tensor_name in enumerate("qk"):
+                        quant_metrics.append(
+                            _assert_quantized(
+                                actuals[i].view(expected_shape),
+                                scales[i].view(scale_references[i].shape),
+                                quant_references[i],
+                                scale_references[i],
+                                references[i],
+                                tensor_name,
+                            )
+                        )
+                    _assert_equal(
+                        actuals[2].view(expected_shape),
+                        references[2],
+                        f"{case_name} quant split={split} V rank {rank} epoch {epoch}",
+                    )
+                    dist.barrier()
+                if rank == 0:
+                    print(
+                        f"PASS {case_name} quant=True split={split}: "
+                        + " ".join(quant_metrics)
+                        + " full-V=byte-identical epochs=3",
+                        flush=True,
+                    )
+
             if world_size >= 8:
                 out_input = references[0].contiguous()
                 out_packed = out_input.permute(2, 0, 1, 3).contiguous()
@@ -257,7 +363,7 @@ def main():
         return 0
 
     mp.spawn(_run_rank, args=(_WORLD_SIZE, _free_port()), nprocs=_WORLD_SIZE, join=True)
-    passed = len(_CASES) * (4 + int(_WORLD_SIZE >= 8))
+    passed = len(_CASES) * (6 + int(_WORLD_SIZE >= 8))
     skipped = len(_CASES) * int(_WORLD_SIZE < 8)
     print(f"{passed} passed, {skipped} skipped on {arch}")
     return 0

@@ -14,14 +14,17 @@ from flydsl.expr.arith import FastMathFlags
 from flydsl.expr.rocdl import readfirstlane
 from flydsl.expr.typing import ReductionOp, Stream
 
+from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
+
 from .buffer_ops import buffer_load, buffer_store, create_buffer_resource_from_addr
 from .communication_ops_utils import (
     atomic_add_global_at,
     fence_system_acquire,
     store_i64_global_system,
 )
+from .quant_utils import emit_mx_e8m0_scale
 
-_JIT_SCHEMA_VERSION = "v12-quant"
+_JIT_SCHEMA_VERSION = "v13-qk-fp8"
 _TRANSPORT_CHUNK_BYTES = 16
 _PUSH_PIPELINE_DEPTH = 16
 _OUT_CHANNEL_COUNT = 8
@@ -50,7 +53,8 @@ def make_fused_a2a_kernel(
 
     heads_local = heads // npes
     seq_full = seq_len * npes
-    elements_per_chunk = _TRANSPORT_CHUNK_BYTES // element_size
+    # V and unfused transport retain their bf16 geometry.
+    elements_per_chunk = _TRANSPORT_CHUNK_BYTES // 2
     chunks_per_row = head_dim // elements_per_chunk
     chunk_words = _TRANSPORT_CHUNK_BYTES // 4
     total_chunks = heads * seq_len * chunks_per_row
@@ -87,6 +91,8 @@ def make_fused_a2a_kernel(
         addr_p2p_output_q: fx.Int64,
         addr_p2p_output_k: fx.Int64,
         addr_p2p_output_v: fx.Int64,
+        addr_p2p_scale_q: fx.Int64,
+        addr_p2p_scale_k: fx.Int64,
         addr_xdb_mem: fx.Int64,
         addr_p2p_xdb_mem: fx.Int64,
         addr_xdb_flag: fx.Int64,
@@ -142,7 +148,8 @@ def make_fused_a2a_kernel(
                 )
             return result
 
-        def process_qk(rsrc_input, rsrc_norm, p2p_bases):
+        def process_qk(rsrc_input, rsrc_norm, p2p_bases, addr_p2p_scale):
+            rsrc_p2p_scale = create_buffer_resource_from_addr(addr_p2p_scale)
             for seq in range(global_warp_id, seq_len, global_warp_num):
                 tiles = []
                 sq_acc = fx.Float32(0.0)
@@ -184,6 +191,7 @@ def make_fused_a2a_kernel(
                 )
                 for batch_start in range_constexpr(0, n_tiles, _PUSH_PIPELINE_DEPTH):
                     outputs = []
+                    scales = []
                     destinations = []
                     batch_size = min(_PUSH_PIPELINE_DEPTH, n_tiles - batch_start)
                     for batch_idx in range_constexpr(batch_size):
@@ -211,12 +219,46 @@ def make_fused_a2a_kernel(
                             )
                             rotated[2 * pair] = even * cos_even - odd * sin_odd
                             rotated[2 * pair + 1] = even * sin_odd + odd * cos_even
-                        outputs.append(
-                            fx.Vector.from_elements(
-                                [value.ir_value() for value in rotated],
-                                dtype=fx.Float32,
-                            ).to(fx.BFloat16)
-                        )
+                        if const_expr(quant):
+                            amax = fx.Float32(0.0)
+                            for i in range_constexpr(vec):
+                                amax = amax.maximumf(fmath.absf(rotated[i]))
+                            # Four adjacent vec=8 lanes own one post-RoPE MX block.
+                            for shift in (1, 2):
+                                amax = amax.maximumf(amax.shuffle_xor(shift, 64))
+                            scale = fx.Int32(
+                                emit_mx_e8m0_scale(
+                                    amax.ir_value(),
+                                    mode=MxScaleRoundModeInt.RoundUp,
+                                    dtype=MxDtypeInt.FP8_E4M3,
+                                )
+                            )
+                            reciprocal = ((fx.Int32(254) - scale) << 23).bitcast(
+                                fx.Float32
+                            )
+                            packed = []
+                            for pair in range_constexpr(vec // 2):
+                                word = fx.rocdl.cvt_pk_fp8_f32(
+                                    T.i32,
+                                    (rotated[2 * pair] * reciprocal).ir_value(),
+                                    (rotated[2 * pair + 1] * reciprocal).ir_value(),
+                                    fx.Int32(0).ir_value(),
+                                    0,
+                                )
+                                packed.append(fx.Int32(word).to(fx.Int16))
+                            outputs.append(
+                                fx.Vector.from_elements(packed, dtype=fx.Int16).bitcast(
+                                    fx.Int32
+                                )
+                            )
+                            scales.append(scale.to(fx.Int8))
+                        else:
+                            outputs.append(
+                                fx.Vector.from_elements(
+                                    [value.ir_value() for value in rotated],
+                                    dtype=fx.Float32,
+                                ).to(fx.BFloat16)
+                            )
                         destinations.append(tile_idx)
                     lane_group = lane >> 4
                     lane_in_group = lane & 15
@@ -243,8 +285,40 @@ def make_fused_a2a_kernel(
                                     uniform_dst_addr, num_records_bytes=row_nbytes
                                 )
                                 buffer_store(
-                                    outputs[batch_idx], rsrc_dst, lane_in_group * 8
+                                    outputs[batch_idx],
+                                    rsrc_dst,
+                                    lane_in_group * (2 if quant else 8),
                                 )
+                                if const_expr(quant):
+                                    scale_base = buffer_load(
+                                        rsrc_p2p_scale,
+                                        dest_pe,
+                                        vec_width=1,
+                                        dtype=T.i64,
+                                    )
+                                    scale_addr = fx.Uint64(
+                                        scale_base
+                                        + fx.Int64(dst_row * (head_dim // 32))
+                                    )
+                                    scale_lo = readfirstlane(
+                                        T.i32, fx.Uint32(scale_addr)
+                                    )
+                                    scale_hi = readfirstlane(
+                                        T.i32, fx.Uint32(scale_addr >> 32)
+                                    )
+                                    uniform_scale_addr = (
+                                        fx.Uint64(scale_hi) << 32
+                                    ) | fx.Uint64(scale_lo)
+                                    rsrc_scale = create_buffer_resource_from_addr(
+                                        uniform_scale_addr,
+                                        num_records_bytes=head_dim // 32,
+                                    )
+                                    if lane_in_group % 4 == 0:
+                                        buffer_store(
+                                            scales[batch_idx],
+                                            rsrc_scale,
+                                            lane_in_group // 4,
+                                        )
 
         def transport(input_rsrc, p2p_bases):
             peer_chunks = total_chunks // npes
@@ -300,9 +374,9 @@ def make_fused_a2a_kernel(
                         )
 
         if const_expr(fuse_norm_rope):
-            process_qk(rsrc_input_q, rsrc_norm_q, p2p_bases_q)
+            process_qk(rsrc_input_q, rsrc_norm_q, p2p_bases_q, addr_p2p_scale_q)
             if const_expr(not split):
-                process_qk(rsrc_input_k, rsrc_norm_k, p2p_bases_k)
+                process_qk(rsrc_input_k, rsrc_norm_k, p2p_bases_k, addr_p2p_scale_k)
         else:
             transport(rsrc_input_q, p2p_bases_q)
             if const_expr(not split):
@@ -349,6 +423,8 @@ def make_fused_a2a_kernel(
         addr_p2p_output_q: fx.Int64,
         addr_p2p_output_k: fx.Int64,
         addr_p2p_output_v: fx.Int64,
+        addr_p2p_scale_q: fx.Int64,
+        addr_p2p_scale_k: fx.Int64,
         addr_xdb_mem: fx.Int64,
         addr_p2p_xdb_mem: fx.Int64,
         addr_xdb_flag: fx.Int64,
@@ -365,6 +441,8 @@ def make_fused_a2a_kernel(
             addr_p2p_output_q,
             addr_p2p_output_k,
             addr_p2p_output_v,
+            addr_p2p_scale_q,
+            addr_p2p_scale_k,
             addr_xdb_mem,
             addr_p2p_xdb_mem,
             addr_xdb_flag,
@@ -378,6 +456,7 @@ def make_fused_a2a_kernel(
         addr_cos: fx.Int64,
         addr_sin: fx.Int64,
         addr_p2p_output: fx.Int64,
+        addr_p2p_scale: fx.Int64,
         addr_xdb_mem: fx.Int64,
         addr_p2p_xdb_mem: fx.Int64,
         addr_xdb_flag: fx.Int64,
@@ -395,6 +474,8 @@ def make_fused_a2a_kernel(
             addr_p2p_output,
             addr_p2p_output,
             addr_p2p_output,
+            addr_p2p_scale,
+            addr_p2p_scale,
             addr_xdb_mem,
             addr_p2p_xdb_mem,
             addr_xdb_flag,
@@ -458,6 +539,8 @@ def make_fused_a2a_jit(
         addr_p2p_output_q: fx.Int64,
         addr_p2p_output_k: fx.Int64,
         addr_p2p_output_v: fx.Int64,
+        addr_p2p_scale_q: fx.Int64,
+        addr_p2p_scale_k: fx.Int64,
         addr_xdb_mem: fx.Int64,
         addr_p2p_xdb_mem: fx.Int64,
         addr_xdb_flag: fx.Int64,
@@ -476,6 +559,8 @@ def make_fused_a2a_jit(
             addr_p2p_output_q,
             addr_p2p_output_k,
             addr_p2p_output_v,
+            addr_p2p_scale_q,
+            addr_p2p_scale_k,
             addr_xdb_mem,
             addr_p2p_xdb_mem,
             addr_xdb_flag,
@@ -493,6 +578,7 @@ def make_fused_a2a_jit(
         addr_cos: fx.Int64,
         addr_sin: fx.Int64,
         addr_p2p_output: fx.Int64,
+        addr_p2p_scale: fx.Int64,
         addr_xdb_mem: fx.Int64,
         addr_p2p_xdb_mem: fx.Int64,
         addr_xdb_flag: fx.Int64,
@@ -506,6 +592,7 @@ def make_fused_a2a_jit(
             addr_cos,
             addr_sin,
             addr_p2p_output,
+            addr_p2p_scale,
             addr_xdb_mem,
             addr_p2p_xdb_mem,
             addr_xdb_flag,

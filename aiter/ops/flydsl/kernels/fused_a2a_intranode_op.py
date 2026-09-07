@@ -42,8 +42,9 @@ class FusedA2AIntraNodeOp:
     """Own symmetric receive and handshake buffers for one tensor shape.
 
     Set split=True or FUSED_A2A_SPLIT=1 for three ordered per-tensor launches.
-    Set quant=True or FUSED_A2A_QUANT=1 to allocate byte payloads and E8M0 scales;
-    quantized execution is not implemented yet.
+    Set quant=True or FUSED_A2A_QUANT=1 for fused Q/K MX E4M3 payloads.
+    Quantized calls return (outputs, (q_scales, k_scales)); V stays bf16.
+    Scales follow the receive layout with one E8M0 byte per 32 adjacent values.
     All ranks must use the same mode and serialize calls on one stream.
     """
 
@@ -64,6 +65,10 @@ class FusedA2AIntraNodeOp:
         if dtype != torch.bfloat16 and not (self.quant and dtype == torch.uint8):
             raise ValueError(
                 f"expected torch.bfloat16 or torch.uint8 with quant enabled, got {dtype}"
+            )
+        if self.quant and not fuse_norm_rope:
+            raise NotImplementedError(
+                "quantized transport requires fused Q/K norm/RoPE"
             )
         if world_size <= 0 or world_size > _MAX_INTRANODE_NPES:
             raise ValueError(f"world_size must be in [1, 8], got {world_size}")
@@ -100,13 +105,16 @@ class FusedA2AIntraNodeOp:
         self.rank = rank
         self.world_size = world_size
         self.shape = tuple(shape)
-        self.dtype = dtype
+        self.dtype = torch.bfloat16
         self.peer_numel = numel // world_size
         self.outputs_sets = tuple(
-            tuple(mori_shmem_create_tensor((numel,), payload_dtype) for _ in range(3))
+            tuple(
+                mori_shmem_create_tensor((numel,), output_dtype)
+                for output_dtype in (payload_dtype, payload_dtype, torch.bfloat16)
+            )
             for _ in range(2)
         )
-        # One E8M0 byte per block of 32 values; left unwritten until quantization.
+        # Q/K scales use the payload's receive ordering; V scales remain unused.
         self.scales_sets = tuple(
             tuple(
                 mori_shmem_create_tensor((numel // 32,), torch.uint8) for _ in range(3)
@@ -159,8 +167,8 @@ class FusedA2AIntraNodeOp:
                 warp_num_per_block=warp_num_per_block,
                 fuse_norm_rope=role,
                 split=self.split,
-                quant=self.quant,
-                element_size=element_size,
+                quant=self.quant and role,
+                element_size=element_size if role else 2,
             )
             for role in roles
         )
@@ -169,10 +177,6 @@ class FusedA2AIntraNodeOp:
     def __call__(
         self, q, k, v, norm_q=None, norm_k=None, cos=None, sin=None, stream=None
     ):
-        if self.quant:
-            raise NotImplementedError(
-                "quantized transport is allocation-only scaffolding"
-            )
         inputs = (q, k, v)
         for input in inputs:
             if input.dtype != self.dtype or tuple(input.shape) != self.shape:
@@ -221,6 +225,7 @@ class FusedA2AIntraNodeOp:
             stream,
         )
         tables = self.p2p_outputs_sets[parity]
+        scale_tables = self.p2p_scales_sets[parity]
         if self.split:
             launch_args = tuple(
                 (
@@ -229,9 +234,12 @@ class FusedA2AIntraNodeOp:
                     cos.data_ptr(),
                     sin.data_ptr(),
                     table.data_ptr(),
+                    scale_table.data_ptr(),
                     *sync_args,
                 )
-                for input, norm, table in zip(inputs, (norm_q, norm_k, v), tables)
+                for input, norm, table, scale_table in zip(
+                    inputs, (norm_q, norm_k, v), tables, scale_tables
+                )
             )
         else:
             launch_args = (
@@ -242,6 +250,7 @@ class FusedA2AIntraNodeOp:
                     cos.data_ptr(),
                     sin.data_ptr(),
                     *(table.data_ptr() for table in tables),
+                    *(table.data_ptr() for table in scale_tables[:2]),
                     *sync_args,
                 ),
             )
@@ -255,6 +264,8 @@ class FusedA2AIntraNodeOp:
             else:
                 self._compiled[i](*args)
         self._epoch += 1
+        if self.quant:
+            return outputs, self.scales_sets[parity][:2]
         return outputs
 
 
