@@ -328,7 +328,7 @@ _SMI_ROWS = []
 
 @contextlib.contextmanager
 def _smi_case(label):
-    """Set the case label consumed by the common perftest hook."""
+    """Set the fallback label for calls without @benchmark context."""
     old = os.environ.get("AITER_SMI_LABEL")
     if os.environ.get("AITER_SMI_MONITOR") == "1":
         os.environ["AITER_SMI_LABEL"] = label
@@ -885,8 +885,8 @@ def _run_child(name, cmd, cwd, env=None, extract=None, timeout=None, tail=30,
     when the child fails or emits nothing recognisable.
     """
     extract = extract or _json_tables
-    # Give every child invocation its combo-owned SMI case label. UTs remain
-    # unaware of telemetry; the common perftest hook reads this environment.
+    # Give calls without @benchmark context a combo-owned fallback label.
+    # Decorated UT calls derive their per-case label from their actual args.
     if smi and os.environ.get("AITER_SMI_MONITOR") == "1":
         env = os.environ.copy() if env is None else env.copy()
         env["AITER_SMI_LABEL"] = name
@@ -1173,25 +1173,12 @@ def run_a8w8_blockscale(args):
     init_pairs = _init_pairs(
         args, defaults=(("constant", "constant"), ("uniform", "auto"))
     )
-    if args.smi_monitor:
-        for m, (n, k), pair in itertools.product(
-            _A8W8_BLOCKSCALE_TOKENS, nk_shapes, init_pairs
-        ):
-            data_init, scale_init = pair
-            run_case(
-                (m,),
-                ((n, k),),
-                (pair,),
-                f"a8w8_blockscale/M={m}/N={n}/K={k}/data={data_init}/"
-                f"scale={scale_init}/seed={args.seed}",
-            )
-    else:
-        run_case(
-            _A8W8_BLOCKSCALE_TOKENS,
-            nk_shapes,
-            init_pairs,
-            "gemm_a8w8_blockscale (DSv4)",
-        )
+    run_case(
+        _A8W8_BLOCKSCALE_TOKENS,
+        nk_shapes,
+        init_pairs,
+        "gemm_a8w8_blockscale (DSv4)",
+    )
 
 
 def run_a16w16(args):
@@ -1376,15 +1363,7 @@ def run_mhc(args):
         )
 
     data_inits = args.data_init or ["norm"]
-    if args.smi_monitor:
-        for m, data_init in itertools.product(_TOKENS, data_inits):
-            run_case(
-                (m,),
-                (data_init,),
-                f"mhc/M={m}/N=7168/fuse_rmsnorm=1/data={data_init}/seed={args.seed}",
-            )
-    else:
-        run_case(_TOKENS, data_inits, "mhc (DSv4, fused RMSNorm)")
+    run_case(_TOKENS, data_inits, "mhc (DSv4, fused RMSNorm)")
 
 
 def run_qk_norm(args):
@@ -1424,12 +1403,8 @@ def run_qk_norm(args):
             structured=True,
         )
 
-    if args.smi_monitor:
-        for token, data_init in itertools.product(_TOKENS, data_inits):
-            run_case((token,), data_init)
-    else:
-        for data_init in data_inits:
-            run_case(_TOKENS, data_init)
+    for data_init in data_inits:
+        run_case(_TOKENS, data_init)
 
 
 def run_score_qk(args):
@@ -1743,20 +1718,11 @@ def run_inverse_rope(args):
         )
 
     data_inits = args.data_init or ["norm"]
-    if args.smi_monitor:
-        for tokens, data_init in itertools.product(_INVERSE_ROPE_TOKENS, data_inits):
-            run_case(
-                (tokens,),
-                (data_init,),
-                f"inverse_rope/s={tokens}/heads=128/groups=16/layout=n32k4/"
-                f"group_size=32/data={data_init}/seed={args.seed}",
-            )
-    else:
-        run_case(
-            _INVERSE_ROPE_TOKENS,
-            data_inits,
-            "inverse_rope_group_quant (DSv4, tp1)",
-        )
+    run_case(
+        _INVERSE_ROPE_TOKENS,
+        data_inits,
+        "inverse_rope_group_quant (DSv4, tp1)",
+    )
 
 
 def run_mla_v4_prefill(args):
@@ -1800,38 +1766,16 @@ def run_mla_v4_prefill(args):
             structured=True,
         )
 
-    if args.smi_monitor:
-        backend_by_prec = {"fp8": ("opus", "asm"), "bf16": ("opus", "triton")}
-        for tokens, pages, prec, mode, data_init in itertools.product(
-            _MLA_PREFILL_TOKENS,
+    for tokens in _MLA_PREFILL_TOKENS:
+        run_case(
+            tokens,
             (4096, 16384),
             ("fp8", "bf16"),
             ("dense", "sparse"),
+            ("opus", "asm", "triton"),
             data_inits,
-        ):
-            for backend in backend_by_prec[prec]:
-                run_case(
-                    tokens,
-                    (pages,),
-                    (prec,),
-                    (mode,),
-                    (backend,),
-                    (data_init,),
-                    f"mla_v4_prefill/M={tokens}/H=128/D=512/pages={pages}/"
-                    f"total_tokens={tokens}/prec={prec}/mode={mode}/backend={backend}/"
-                    f"data={data_init}/seed={args.seed}",
-                )
-    else:
-        for tokens in _MLA_PREFILL_TOKENS:
-            run_case(
-                tokens,
-                (4096, 16384),
-                ("fp8", "bf16"),
-                ("dense", "sparse"),
-                ("opus", "asm", "triton"),
-                data_inits,
-                f"mla_v4 prefill (M={tokens}, prec=fp8/bf16, pages=4096/16384)",
-            )
+            f"mla_v4 prefill (M={tokens}, prec=fp8/bf16, pages=4096/16384)",
+        )
 
 
 OPS = {
