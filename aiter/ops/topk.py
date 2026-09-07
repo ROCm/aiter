@@ -475,17 +475,6 @@ _FLYDSL_TOPK_DECODE_GATES = {
 _FLYDSL_TOPK_DECODE_KS = (512, 1024, 2048, 4096)
 
 
-@functools.lru_cache(maxsize=1)
-def _flydsl_topk_decode_available() -> bool:
-    """Whether the optional FlyDSL package is available on this device."""
-    try:
-        from .flydsl.utils import is_flydsl_available
-
-        return is_flydsl_available()
-    except (ImportError, OSError, RuntimeError):
-        return False
-
-
 @functools.lru_cache(maxsize=128)
 def _flydsl_topk_decode_shape_supported(
     arch: str,
@@ -524,7 +513,7 @@ def _should_use_flydsl_topk_decode(
         return False
 
     arch = get_gfx()
-    if arch not in _FLYDSL_TOPK_DECODE_GATES or not _flydsl_topk_decode_available():
+    if arch not in _FLYDSL_TOPK_DECODE_GATES:
         return False
 
     if not _flydsl_topk_decode_shape_supported(
