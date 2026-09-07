@@ -175,10 +175,11 @@ class QRInt4:
         cap = DEFAULT_GRID_CAP if grid_cap is None else int(grid_cap)
         if cap < 1:
             raise ValueError(f"grid_cap must be positive, got {cap}")
-        torch.cuda.set_device(device)
-        self.group = group
-        self.device = device
+        # set_device rejects torch.device("cuda") with no index; resolve first.
         self._device_index = _cuda_index(device)
+        torch.cuda.set_device(self._device_index)
+        self.group = group
+        self.device = torch.device("cuda", self._device_index)
         self.rank = int(rank)
         self.world_size = int(world_size)
         self.super_tile = int(super_tile)
