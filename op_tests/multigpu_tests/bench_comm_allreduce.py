@@ -126,6 +126,29 @@ Examples::
         python3 op_tests/multigpu_tests/bench_comm_allreduce.py \
             -tp 4 -s 8,7168 12,7168 --iters 20 --warmup 2
     # then filter Kernel_Name for cross_device_reduce_{1,2}stage.
+
+    # hardware counters (PMC), which the recipe above cannot give you. Counter
+    # collection has to be joined across several passes, and a multi-process
+    # counter set has no stable cross-pass rank key -- start-order ranking would
+    # pair one rank's counters with another's -- so the tooling refuses it. Run
+    # one rank per process and profile only that one. The peers go first and
+    # --repeat is the number of passes the profiler will make (4 on gfx950):
+    INIT=tcp://127.0.0.1:29500
+    ARGS="-c fly_int4 --shape 1024,7168 --warmup 20 --iters 50"
+    for r in 1 2 3; do
+        HIP_VISIBLE_DEVICES=0,1,2,3 python3 \
+            op_tests/multigpu_tests/bench_comm_allreduce.py \
+            $ARGS --rank $r --init-method $INIT --repeat 4 &
+    done
+    HIP_VISIBLE_DEVICES=0,1,2,3 rocprofv3 -i pmc_recipe.txt -f csv -d /tmp/arpmc \
+        -o pass0_%pid% -- \
+        python3 op_tests/multigpu_tests/bench_comm_allreduce.py \
+            $ARGS --rank 0 --init-method $INIT
+    # Keep the JIT cache on (do not set FLYDSL_RUNTIME_ENABLE_CACHE=0): every
+    # pass must launch the identical kernel set or the join has nothing to
+    # match on. Warm up properly too -- a cold first rendezvous spins for
+    # milliseconds waiting on a peer that is still building, and that one
+    # outlier dominates any counter divided by GRBM_GUI_ACTIVE.
 """
 
 import argparse
@@ -1049,6 +1072,62 @@ def run_sweep(tp_size, shapes, dtype, args, keys, prod_regime):
     ]
 
 
+def run_single_rank(
+    tp_size, rank, shapes, dtype, args, keys, prod_regime, init_method, repeat
+):
+    """Run one rank in *this* process, re-joining the group ``repeat`` times.
+
+    The profiling counterpart to ``run_sweep``. rocprofv3 instruments the
+    process it launches and every descendant, so the ``Pool`` above puts all
+    four ranks under the profiler -- and WaveScope then refuses the resulting
+    PMC data outright, because a multi-process counter set has no stable
+    cross-pass rank key and start-order ranking would silently pair one rank's
+    counters with another's. One rank per process is what makes the profiler
+    wrap rank 0 alone while the peers run outside it.
+
+    ``repeat`` is for the peers, not the profiled rank. A multi-pass PMC
+    capture re-runs the application once per counter recipe -- four times on
+    gfx950 -- and the profiled rank is a fresh process each time. The peers are
+    not, so they must re-join once per pass. ``_worker`` already destroys the
+    process group and the model-parallel state in its own ``finally``, so each
+    iteration here starts clean; between iterations rank 0's TCPStore is gone
+    and the peers simply block in ``init_process_group`` until the next rank-0
+    process binds the port.
+
+    Returns the first join's per-shape scalars. There is only one rank here, so
+    there is nothing to collapse with ``_row``.
+    """
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    rows = None
+    for i in range(repeat):
+        logger.info(
+            "TP%d %s rank %d: %d shape(s), %d iters, join %d/%d via %s",
+            tp_size,
+            dtype2str(dtype),
+            rank,
+            len(shapes),
+            args.iters,
+            i + 1,
+            repeat,
+            init_method,
+        )
+        got = _worker(
+            tp_size,
+            rank,
+            shapes,
+            dtype,
+            args.iters,
+            args.warmup,
+            init_method,
+            args.profile,
+            keys,
+            prod_regime,
+        )
+        if rows is None:
+            rows = got
+    return rows
+
+
 def device_description() -> str:
     """Marketing name plus enough detail to pin the SKU when it is generic.
 
@@ -1626,6 +1705,37 @@ def main():
     parser.add_argument("--iters", type=int, default=101, help="timed iterations")
     parser.add_argument("--warmup", type=int, default=5, help="warmup iterations")
     parser.add_argument(
+        "--rank",
+        type=int,
+        default=None,
+        help="run only this rank in this process instead of spawning a pool of\n"
+        "them, and skip the summary tables (they need every rank's scalars).\n"
+        "Requires --init-method, and every rank of the group must be launched\n"
+        "separately with the same one. This exists so a profiler can wrap one\n"
+        "rank: rocprofv3 instruments the process it launches and all of its\n"
+        "descendants, so the default pool launch profiles all four ranks at\n"
+        "once and WaveScope refuses that PMC data as multi-process. See\n"
+        "--repeat for the peer side.",
+    )
+    parser.add_argument(
+        "--init-method",
+        metavar="URL",
+        default=None,
+        help="rendezvous for --rank, e.g. tcp://127.0.0.1:29500. Taken\n"
+        "verbatim, unlike the pool path which picks its own free port -- the\n"
+        "point is that separately launched ranks agree on it.",
+    )
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="with --rank, join the group and run this many times in sequence.\n"
+        "For the peers of a multi-pass PMC capture: the capture re-runs the\n"
+        "application once per counter recipe (four times on gfx950) with a\n"
+        "fresh profiled rank each pass, so the peers have to re-join that many\n"
+        "times. Leave it at 1 for the profiled rank itself.",
+    )
+    parser.add_argument(
         "--busbw",
         action="store_true",
         help="also print the busbw table (derived from the us table)",
@@ -1733,6 +1843,42 @@ def main():
         import aiter as ops
 
         ops.qr_max_size()
+
+    # Single-rank mode branches here, after the environment preamble above, so
+    # a profiled rank sees exactly what a pooled one would.
+    if args.rank is not None:
+        if args.init_method is None:
+            parser.error("--rank requires --init-method; every rank must agree on it")
+        if args.repeat < 1:
+            parser.error("--repeat must be at least 1")
+        if len(tps) != 1 or len(args.dtype) != 1:
+            parser.error(
+                "--rank runs one rank of one TP size at one dtype; pass a single "
+                "-tp and a single --dtype"
+            )
+        tp_size = tps[0]
+        if not 0 <= args.rank < tp_size:
+            parser.error(f"--rank {args.rank} is out of range for TP{tp_size}")
+        rows = run_single_rank(
+            tp_size,
+            args.rank,
+            args.shape,
+            dtypes.d_dtypes[args.dtype[0]],
+            args,
+            keys,
+            prod_regime,
+            args.init_method,
+            args.repeat,
+        )
+        for (tokens, hidden), ret in zip(args.shape, rows):
+            logger.info(
+                "rank %d %dx%d: %s",
+                args.rank,
+                tokens,
+                hidden,
+                {k: v for k, v in ret.items() if k.endswith("_us")},
+            )
+        return
 
     sections = []
     roofline_cus = None  # set once a roofline table actually lands in a section

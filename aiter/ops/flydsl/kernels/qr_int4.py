@@ -48,7 +48,7 @@ _SUPPORTED_ARCHS = ("gfx942", "gfx950")
 
 # How the IPC inbox is allocated. The wire protocol is identical in every
 # mode; only the memory type changes. See docs/qr_int4_mi350p.md.
-INBOX_MEMORY_MODES = ("auto", "uncached", "finegrained")
+INBOX_MEMORY_MODES = ("auto", "uncached", "finegrained", "default")
 
 # Smallest payload sent through this kernel, in bytes.
 #
@@ -215,11 +215,11 @@ def _resolve_inbox_flags(mode: str) -> tuple[int, str]:
         )
     if mode == "auto":
         mode = "uncached" if has_xgmi_peer_links() else "finegrained"
-    flags = (
-        UncachedIpcHeap._HIP_DEVICE_MALLOC_UNCACHED
-        if mode == "uncached"
-        else UncachedIpcHeap._HIP_DEVICE_MALLOC_FINEGRAINED
-    )
+    flags = {
+        "uncached": UncachedIpcHeap._HIP_DEVICE_MALLOC_UNCACHED,
+        "finegrained": UncachedIpcHeap._HIP_DEVICE_MALLOC_FINEGRAINED,
+        "default": UncachedIpcHeap._HIP_DEVICE_MALLOC_DEFAULT,
+    }[mode]
     return flags, mode
 
 

@@ -1,7 +1,39 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx942/gfx950 TP∈{2,4,8} INT4 two-shot all-reduce.
+"""ABLATION COPY of aiter/ops/flydsl/kernels/qr_int4_kernel.py.
+
+Not for import by aiter. This exists to answer step 4 of
+op_tests/dump_data/docs/mi350p_peer_write_primitive_2026-09-07.md: a standalone
+HIP model of the two-shot wire protocol runs at 28-33 GB/s on this host today,
+which is what fly_int4 achieved on 09-01 and 3.7x what it achieves now, so the
+missing time is in something the model does not contain. This copy switches
+pieces of the kernel off one at a time to find out which.
+
+``AITER_QRINT4_ABLATE`` selects the variant:
+
+  none      unmodified -- must reproduce the real kernel's time, and is the
+            control that says this copy is faithful
+  nocomm    no peer fanout, no publish, no wait. Every load, every store, every
+            LDS access and the whole codec still run, on stale inbox data. This
+            is "the kernel minus the network".
+  nocodec   the network, the LDS traffic and every load/store stay; the INT4
+            quantize and dequantize arithmetic is replaced by a passthrough.
+            "The kernel minus the maths."
+  comms     neither the codec nor the input/output tiles: fanout, publish and
+            wait only. The closest thing to peer_write_bw.cpp --handshake.
+  nowait    like `comms`, minus `_wait_release`. Fanout and publish only, so the
+            blocks never synchronise with their peers. The difference between
+            this and `comms` is what the handshake costs -- which the standalone
+            FlyDSL primitive cannot model, because it runs in one process. This
+            races by construction; only its time means anything.
+
+Timings are all that is meaningful in any mode but ``none``; the results are
+wrong by construction.
+
+Original docstring follows.
+
+gfx942/gfx950 TP∈{2,4,8} INT4 two-shot all-reduce.
 
 INT4 nibble: [-8,+7], −1/8, 4 B/thread, 1152 B rank-tile. Scale is
 group-16 signed E4M3 in the 128 B region. Super-tile ST∈{1,8}; host
@@ -20,9 +52,63 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, Stream, T, as_ir_value
 
-from . import buffer_ops
+from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels.qr_int4_kernel import _store_v4i32_peer_multi
 
 logger = logging.getLogger("aiter")
+
+# Which pieces to switch off. See the module docstring.
+ABLATE = os.environ.get("AITER_QRINT4_ABLATE", "none")
+# The bisection modes (section 12.4 of the 09-07 report). Every "add a qr_int4
+# property to the standalone primitive" experiment came back at 0-9% against a
+# 2x gap, so these go the other way: start from `nowait` (1839 us at M=4096) and
+# remove structure from `_fanout_nt` until it reaches the primitive's ~920 us.
+# The endpoints are known, so this bisects instead of guessing.
+#
+#   flatfan     `_fanout_nt` replaced wholesale: same 9216 B per call, same LDS
+#               read per store, same peers -- but a flat 576-store loop over all
+#               256 threads instead of the (peer, sector) layout, the 8+8+2
+#               stripe split and the rank_atoms loop. This is the endpoint. If it
+#               reaches ~30 GB/s the cause is inside the fanout; if it stays at
+#               15 the cause is outside it and nothing below matters.
+#   flataddr    keeps the stripes and the predication, but hoists the per-store
+#               address arithmetic (idx2crd/crd2idx/_sub_tile_i32) to precomputed
+#               per-thread offsets.
+#   onestripe   keeps the addressing, collapses 8+8+2 into one uniform stripe.
+#   empty       the control never run: no codec, no tiles, no fanout, no publish,
+#               no wait. Just the ST loop skeleton, its barriers and the colour
+#               bookkeeping. `nocomm` (1834 us) and `nowait` (1848 us) each look
+#               like "half the kernel", but if the skeleton alone is already most
+#               of that, neither half is what it appears to be.
+_ABLATIONS = ("none", "nocomm", "nocodec", "comms", "nowait", "multistore",
+              "multistore_comms", "flatfan", "flataddr", "onestripe", "empty")
+if ABLATE not in _ABLATIONS:
+    raise ValueError(f"AITER_QRINT4_ABLATE must be one of {_ABLATIONS}, got {ABLATE!r}")
+# Peer traffic and the publish.
+_BISECT = ("flatfan", "flataddr", "onestripe")
+_DO_COMM = ABLATE in ("none", "nocodec", "comms", "nowait", "multistore",
+                      "multistore_comms") + _BISECT
+# The peer spin-wait, separately: it is the one piece the standalone primitive
+# cannot reproduce in a single process.
+# The bisection modes inherit `nowait` semantics so they compare against 1839 us.
+_DO_WAIT = ABLATE in ("none", "nocodec", "comms", "multistore",
+                     "multistore_comms")
+# The INT4 codec's arithmetic. The loads that feed it are governed by _DO_TILES.
+_DO_CODEC = ABLATE in ("none", "nocomm", "multistore")
+# Reading the input tile and writing the output tile, plus the inbox recv loads
+# that the codec consumes.
+_DO_TILES = ABLATE in ("none", "nocomm", "nocodec", "multistore")
+# Emit each fanout's stores as ONE inline-asm block instead of six separate
+# ones. Every store in a group gets its own address and data VGPRs, so an
+# in-flight store's operands cannot be recycled by the next store's address
+# arithmetic. `_store_v4i32_peer_multi` exists for exactly this and is applied
+# to qr_1stage but never to qr_int4.
+_MULTISTORE = ABLATE in ("multistore", "multistore_comms")
+_FLAT_FANOUT = ABLATE == "flatfan"
+_FLAT_ADDR = ABLATE == "flataddr"
+_ONE_STRIPE = ABLATE == "onestripe"
+if ABLATE != "none":
+    logger.warning("QRInt4 ABLATION COPY: %s (results are wrong by design)", ABLATE)
 
 WORLD = 8  # Default value for world size
 SUPPORTED_WORLDS = (2, 4, 8)
@@ -698,6 +784,67 @@ def make_qr_int4_kernel(
             [8, 16), E4M3 [16, 18). ``stripe * 8`` is the first sector of
             each stripe (16 for the scale tail).
             """
+            if _FLAT_FANOUT:
+                # Byte-for-byte the same traffic: 576 x 16 B = 9216 B per call
+                # across world_size peers, 2304 B contiguous into each, one
+                # ds_read_b128 feeding each store. Only the *shape* of the loop
+                # differs -- 3 passes over 256 threads instead of 2 rank_atoms x
+                # 3 stripes over 32-of-64 quads.
+                n_st = world_size * rank_atoms * RANK_TILE_I32 // 4
+                per_peer = n_st // world_size
+                base = _sub_tile_i32(phase, inbox_src, fx.Int32(0)) if False else (
+                    _sub_tile_i32(phase, inbox_src, sub)
+                )
+                for i in range_constexpr((n_st + BLOCK - 1) // BLOCK):
+                    idx = fx.Int32(i * BLOCK) + tid
+                    if idx < fx.Int32(n_st):
+                        peer = idx // fx.Int32(per_peer)
+                        within = idx % fx.Int32(per_peer)
+                        v4 = fx.ptr_load(
+                            smem_ptr + idx * fx.Int32(4),
+                            result_type=fx.Vector.make_type(4, fx.Int32),
+                        )
+                        dest = peer_vec[peer]
+                        byte_off = _i32_to_bytes(base + within * fx.Int32(4))
+                        _store_v4i32_peer(dest + byte_off, v4, payload_policy)
+                return
+            if _MULTISTORE:
+                # Stripe-major so both rank_atoms sit under one predicate, then
+                # one asm block per predicate group: 2 stores for each of the
+                # three stripes. Same instructions, same order, same bytes --
+                # only the register allocation differs.
+                for stripe in range_constexpr(3):
+                    is_scale_tail = stripe == 2
+                    n_sectors = 2 if is_scale_tail else 8
+                    fanout = (
+                        fanout_scale_stripe if is_scale_tail else fanout_int4_stripe
+                    )
+                    n_quads = fx.Int32(world_size * n_sectors)
+                    safe = (quad_id < n_quads).select(quad_id, fx.Int32(0))
+                    peer, sector_in_stripe = fx.idx2crd(safe, fanout).unpack()
+                    sector = fx.Int32(stripe * 8) + sector_in_stripe
+                    if quad_id < n_quads:
+                        vec_idx = fx.get_scalar(
+                            fx.crd2idx((sector, lane_in_quad), nt_own_layout)
+                        )
+                        pairs = []
+                        for k in range_constexpr(rank_atoms):
+                            pack_peer = peer
+                            wire_idx = vec_idx
+                            if rank_atoms != 1:
+                                pack_peer = peer * fx.Int32(rank_atoms) + fx.Int32(k)
+                                wire_idx = vec_idx + fx.Int32(k * RANK_TILE_I32)
+                            v4 = fx.ptr_load(
+                                smem_ptr + _pack_off(pack_peer, vec_idx),
+                                result_type=fx.Vector.make_type(4, fx.Int32),
+                            )
+                            dest = peer_vec[peer]
+                            byte_off = _i32_to_bytes(
+                                _sub_tile_i32(phase, inbox_src, sub) + wire_idx
+                            )
+                            pairs.append((dest + byte_off, v4))
+                        _store_v4i32_peer_multi(pairs, payload_policy)
+                return
             for k in range_constexpr(rank_atoms):
                 for stripe in range_constexpr(3):
                     is_scale_tail = stripe == 2
@@ -834,23 +981,29 @@ def make_qr_int4_kernel(
         if super_tile == 1:
             for i in range(fx.Int32(0), n_block_tiles, fx.Int32(1)):
                 tile = bid + i * n_blocks
-                atoms = _load_tile_atoms(tile)
-                _pack_reduce_scatter(atoms)
+                if _DO_TILES:
+                    atoms = _load_tile_atoms(tile)
+                    _pack_reduce_scatter(atoms)
                 gpu.barrier()
-                _fanout_nt(PHASE_REDUCE_SCATTER, rank, fx.Int32(0))
-                _publish(PHASE_REDUCE_SCATTER, rank, color)
+                if _DO_COMM:
+                    _fanout_nt(PHASE_REDUCE_SCATTER, rank, fx.Int32(0))
+                    _publish(PHASE_REDUCE_SCATTER, rank, color)
+                if _DO_WAIT:
+                    _wait_release(PHASE_REDUCE_SCATTER, color)
 
-                _wait_release(PHASE_REDUCE_SCATTER, color)
-                acc = _reduce_scattered(fx.Int32(0))
-
-                _pack_all_gather(acc)
+                if _DO_TILES:
+                    acc = _reduce_scattered(fx.Int32(0))
+                    _pack_all_gather(acc)
                 gpu.barrier()
-                _fanout_nt(PHASE_ALL_GATHER, rank, fx.Int32(0))
-                _publish(PHASE_ALL_GATHER, rank, color)
+                if _DO_COMM:
+                    _fanout_nt(PHASE_ALL_GATHER, rank, fx.Int32(0))
+                    _publish(PHASE_ALL_GATHER, rank, color)
+                if _DO_WAIT:
+                    _wait_release(PHASE_ALL_GATHER, color)
 
-                _wait_release(PHASE_ALL_GATHER, color)
-                gathered = _recv_all_gather(fx.Int32(0))
-                _store_tile_atoms(tile, gathered)
+                if _DO_TILES:
+                    gathered = _recv_all_gather(fx.Int32(0))
+                    _store_tile_atoms(tile, gathered)
 
                 color = color + fx.Int32(1)
                 if color == fx.Int32(0):  # 0 is unset sentinel
@@ -863,10 +1016,12 @@ def make_qr_int4_kernel(
 
                 for s in range(fx.Int32(0), n_this, fx.Int32(1)):
                     tile = bid + (i + s) * n_blocks
-                    atoms = _load_tile_atoms(tile)
-                    _pack_reduce_scatter(atoms)
+                    if _DO_TILES:
+                        atoms = _load_tile_atoms(tile)
+                        _pack_reduce_scatter(atoms)
                     gpu.barrier()
-                    _fanout_nt(PHASE_REDUCE_SCATTER, rank, s)
+                    if _DO_COMM:
+                        _fanout_nt(PHASE_REDUCE_SCATTER, rank, s)
                     if (s + fx.Int32(1)) < n_this:
                         # Drain this wave's LDS loads, then join the WG.
                         # world_size<8 leaves waves idle in fanout; without the
@@ -876,25 +1031,32 @@ def make_qr_int4_kernel(
                         rocdl.s_waitcnt(lgkmcnt=0)
                         gpu.barrier()
 
-                _publish(PHASE_REDUCE_SCATTER, rank, color)
-                _wait_release(PHASE_REDUCE_SCATTER, color)
+                if _DO_COMM:
+                    _publish(PHASE_REDUCE_SCATTER, rank, color)
+                if _DO_WAIT:
+                    _wait_release(PHASE_REDUCE_SCATTER, color)
 
                 for s in range(fx.Int32(0), n_this, fx.Int32(1)):
-                    acc = _reduce_scattered(s)
-                    _pack_all_gather(acc)
+                    if _DO_TILES:
+                        acc = _reduce_scattered(s)
+                        _pack_all_gather(acc)
                     gpu.barrier()
-                    _fanout_nt(PHASE_ALL_GATHER, rank, s)
+                    if _DO_COMM:
+                        _fanout_nt(PHASE_ALL_GATHER, rank, s)
                     if (s + fx.Int32(1)) < n_this:
                         rocdl.s_waitcnt(lgkmcnt=0)
                         gpu.barrier()
 
-                _publish(PHASE_ALL_GATHER, rank, color)
-                _wait_release(PHASE_ALL_GATHER, color)
+                if _DO_COMM:
+                    _publish(PHASE_ALL_GATHER, rank, color)
+                if _DO_WAIT:
+                    _wait_release(PHASE_ALL_GATHER, color)
 
-                for s in range(fx.Int32(0), n_this, fx.Int32(1)):
-                    gathered = _recv_all_gather(s)
-                    tile = bid + (i + s) * n_blocks
-                    _store_tile_atoms(tile, gathered)
+                if _DO_TILES:
+                    for s in range(fx.Int32(0), n_this, fx.Int32(1)):
+                        gathered = _recv_all_gather(s)
+                        tile = bid + (i + s) * n_blocks
+                        _store_tile_atoms(tile, gathered)
 
                 color = color + fx.Int32(1)
                 if color == fx.Int32(0):  # 0 is unset sentinel
@@ -936,7 +1098,7 @@ def make_qr_int4_kernel(
     # The inbox memory type changes the emitted store policy, so it has to be
     # part of the symbol name -- two variants that differ only in cache bits
     # must not collide in the JIT cache.
-    tag = f"ws{world_size}_st{super_tile}_{inbox_memory}"
+    tag = f"ws{world_size}_st{super_tile}_{inbox_memory}_abl{ABLATE}"
     launch_qr_int4.func.__name__ = f"launch_qr_int4_{tag}"
     try:
         qr_int4.func.__name__ = f"qr_int4_{tag}"
