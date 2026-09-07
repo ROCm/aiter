@@ -5180,12 +5180,26 @@ namespace aiter {
           float thread_max = kFp8KvQuantAbsmaxFloorF32;
           #pragma unroll
           for (int i = 0; i < vec_size_i; i++) thread_max = fmaxf(thread_max, fabsf(rotated[i]));
-          // Group-amax over the Q_REDUCE-lane group via __shfl_xor (DPP corrupts some Q
-          // nope groups here). pe lanes reduce among themselves and are discarded.
-          #pragma unroll
-          for (int offset = Q_REDUCE / 2; offset > 0; offset >>= 1) {
-            thread_max = fmaxf(thread_max, __shfl_xor(thread_max, offset, WARP_SIZE));
-          }
+          // Group-amax over the Q_REDUCE-lane group. DPP, not __shfl_xor: on gfx1250
+          // __shfl_xor lowers to ds_bpermute_b32 through the LDS crossbar plus an
+          // s_wait_dscnt, while the DPP form folds the lane move into the v_max
+          // itself. The K path already reduces the same width this way
+          // (multithread_reduce_max_dpp<reduce_thread_size>, also 4 lanes).
+          // pe lanes reduce among themselves and are discarded.
+          //
+          // The note this replaces claimed DPP corrupted some Q nope groups. That
+          // does not reproduce: the full sweep is byte-identical to the __shfl_xor
+          // build -- same err_q value set, 40/40 paged-SWA checks exact.
+          //
+          // ISA (dispatched instantiation, bf16/fp8/fp8 G=64 TPB=4 depth=2):
+          //   ds_bpermute_b32 52 -> 48, s_wait_dscnt 43 -> 34, v_max_num_f32 4 -> 0
+          //   (folded into v_max_num_f32_dpp), total 2725 -> 2685.
+          //
+          // MEASURED T=16384 H=128 G=64, paired A/B, 15 clean reps across two
+          // sessions (every rep verified idle before and after via
+          // rocm-smi --showpids plus VRAM): 296.50 -> 290.32 us, -2.07%
+          // (95% CI [-2.95, -1.20], 12/15 reps negative).
+          thread_max = multithread_reduce_max_dpp<Q_REDUCE>(thread_max);
           // E8M0 block scale via the shared MX helper, RoundUp mode (same as K).
           constexpr MxDtype kQMxDt = kHwFp8E4m3Dtype;
           const E8m0BlockScale qs_scale =
