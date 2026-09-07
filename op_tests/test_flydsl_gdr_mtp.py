@@ -47,7 +47,6 @@ import itertools
 import os
 import statistics
 import sys
-import traceback
 from typing import NamedTuple
 
 import pandas as pd
@@ -1682,11 +1681,12 @@ def _run_perf_sweep(args):
 
 
 def main():
-    """Run every check without pytest, then the perf sweep.
+    """Run every check, then the perf sweep.
 
-    Exits non-zero if any check fails. CI shards ``op_tests/test_*.py`` by
-    invoking ``python3 <file>``, which would otherwise merely define the test
-    functions above and report success.
+    CI shards ``op_tests/test_*.py`` by invoking ``python3 <file>``, which would
+    otherwise merely define the test functions above and report success. Handing
+    the file back to pytest keeps collection automatic, so a test added above
+    cannot be one CI does not have.
     """
     args = _parse_args()
     if _SKIP_REASON is not None:
@@ -1697,85 +1697,15 @@ def main():
         return 0
 
     aiter.logger.info("gdr_mtp: running correctness checks...")
-    cases_run, failures = _run_correctness()
-    if failures:
-        for name, exc, tb in failures:
-            aiter.logger.error("FAILED %s: %r\n%s", name, exc, tb)
+    status = pytest.main([__file__, "-q", "-p", "no:cacheprovider"])
+    if status != pytest.ExitCode.OK:
         aiter.logger.error(
-            "gdr_mtp: %d of %d check(s) failed; skipping perf sweep",
-            len(failures),
-            cases_run,
+            "gdr_mtp: checks failed (pytest exit %s); skipping perf sweep", int(status)
         )
         return 1
-    aiter.logger.info("gdr_mtp: all %d checks passed", cases_run)
 
     _run_perf_sweep(args)
     return 0
-
-
-def _run_correctness():
-    torch.manual_seed(0)
-    dtypes = [(d,) for d in sorted(_SUPPORTED_DTYPES, key=str)]
-    state_dtypes = [(d,) for d in sorted(_SUPPORTED_STATE_DTYPES, key=str)]
-    cases = [
-        (test_chain_matches_upstream_vllm, _CHAIN_CASES),
-        (
-            test_chain_matches_upstream_across_dtypes,
-            [(d, n) for (d,) in dtypes for n in (False, True)],
-        ),
-        (test_chain_matches_upstream_across_state_dtypes, state_dtypes),
-        (test_chain_rolls_back_to_the_accepted_token, [()]),
-        (test_chain_skips_the_null_block, [()]),
-        (test_sglang_matches_upstream_sglang, _SGLANG_CASES),
-        (test_sglang_matches_upstream_across_dtypes, dtypes),
-        (test_sglang_disable_state_update_leaves_the_pool_alone, [()]),
-        (test_sglang_tree_is_not_running_a_chain, [()]),
-        (test_sglang_tree_without_a_snapshot_slot_runs_the_chain, [()]),
-        (test_a_snapshot_wider_than_the_state_is_refused_at_every_layer, [()]),
-        (test_chain_checkpoints_and_snapshots_are_the_same_state, [()]),
-        (test_chain_addresses_a_state_pool_past_2gib_elements, [()]),
-        (test_sglang_addresses_a_snapshot_buffer_past_2gib_elements, [()]),
-        (test_dispatch_seam_routes_to_flydsl, _SEAM_CASES),
-        (test_dispatch_seam_is_off_by_default, [()]),
-        (test_dispatch_seam_declines_a_ragged_batch, [()]),
-        (test_dispatch_seam_agrees_with_triton, [()]),
-        (test_perf_row_agrees_with_the_spec, [(m,) for m in BENCH_MODES]),
-    ]
-
-    # CI runs this file, not pytest, so a test that never makes it into `cases`
-    # is a test CI does not have. Compare by identity: `@benchmark` returns a
-    # bare closure, so the wrapped perf fn's ``__name__`` is not its own.
-    reached = {id(fn) for fn, _ in cases} | {id(test_gdr_mtp_perf)}
-    unreached = sorted(
-        name
-        for name, obj in globals().items()
-        if name.startswith("test_") and callable(obj) and id(obj) not in reached
-    )
-    assert not unreached, f"never run by the CI entry point: {unreached}"
-
-    cases_run = 0
-    skipped = 0
-    failures = []
-    for fn, arg_sets in cases:
-        for case_args in arg_sets:
-            name = f"{fn.__name__}{case_args if case_args else ''}"
-            try:
-                fn(*case_args)
-            except pytest.skip.Exception as exc:
-                # Skipped derives from BaseException, so it would sail past the
-                # collector below and abort the shard. A case that skips itself
-                # (too little free HBM for the >2**31-element pool) neither ran
-                # nor failed.
-                aiter.logger.info("gdr_mtp: skipped %s -- %s", name, exc)
-                skipped += 1
-            except Exception as exc:  # noqa: BLE001 - collect and keep going
-                failures.append((name, exc, traceback.format_exc()))
-                cases_run += 1
-            else:
-                cases_run += 1
-    if skipped:
-        aiter.logger.info("gdr_mtp: %d case(s) skipped", skipped)
-    return cases_run, failures
 
 
 if __name__ == "__main__":

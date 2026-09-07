@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import functools
 import os
 
 import torch
@@ -18,26 +17,13 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_rearrange_si
 )
 
 
-@functools.lru_cache(maxsize=1)
-def _flydsl_gdr_available() -> bool:
-    # Probes the module the fast path imports below: `aiter.ops.flydsl` raises
-    # on a flydsl that is missing or too old, so a bad install is a False here
-    # rather than an exception out of a Triton entry point.
-    try:
-        from aiter.ops.flydsl import linear_attention_kernels  # noqa: F401
-
-        return True
-    except (ImportError, OSError, RuntimeError):
-        return False
-
-
 def _flydsl_gdr_enabled() -> bool:
     """Opt-in gate for the FlyDSL gated-delta-rule MTP port.
 
     Off by default, so Triton keeps serving every call. Not memoized, so the env
-    var can be toggled at runtime; only the availability probe is cached.
+    var can be toggled at runtime.
     """
-    return os.environ.get("AITER_GDR_FLYDSL", "") == "1" and _flydsl_gdr_available()
+    return os.environ.get("AITER_GDR_FLYDSL", "") == "1"
 
 
 def _uniform_draft_window(cu_seqlens: torch.Tensor | None, total_tokens: int) -> int:
@@ -98,6 +84,23 @@ def _try_flydsl_mtp(
     if ssm_state_indices.ndim != 2:
         return None
     if qkv.ndim != 2 or qkv.stride(1) != 1:
+        return None
+    # What `flydsl_gdr_mtp` asserts rather than screens, and the support
+    # predicate only covers q/k/v and the state. Declining here is what keeps
+    # the env var from turning a call Triton would have served into an
+    # exception out of this entry point.
+    if A_log.dtype not in (torch.float32, torch.bfloat16):
+        return None
+    if any(t.device != qkv.device for t in (a, b, dt_bias, A_log, initial_state)):
+        return None
+    # The state vector is loaded 16 bytes at a time.
+    if initial_state.data_ptr() % 16 != 0:
+        return None
+    # The launch writes `out` at the operands' dtype, while the Triton path
+    # writes into whatever it is handed.
+    if core_attn_out is not None and (
+        core_attn_out.dtype != qkv.dtype or core_attn_out.device != qkv.device
+    ):
         return None
     # The gating constants are compiled into the kernel, so only the default
     # pair is routed.
@@ -212,6 +215,15 @@ def fused_rearrange_sigmoid_gated_delta_rule(
     assert (
         qkv.shape == expected_shape
     ), f"expect qkv to be in shape {expected_shape}, got {qkv.shape}"
+    # Both paths get their head counts by floor-dividing these, so a remainder
+    # silently narrows every view by its width and returns a result shaped for
+    # the heads that survived, rather than saying the layout does not divide.
+    assert (
+        key_dim % head_k_dim == 0
+    ), f"key_dim {key_dim} must be a multiple of head_k_dim {head_k_dim}"
+    assert (
+        value_dim % head_v_dim == 0
+    ), f"value_dim {value_dim} must be a multiple of head_v_dim {head_v_dim}"
 
     # FlyDSL port (opt-in). Only the speculative-verify shape is routed;
     # everything else falls through to Triton below unchanged.

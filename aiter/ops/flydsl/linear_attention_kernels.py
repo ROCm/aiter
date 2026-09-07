@@ -470,7 +470,12 @@ def flydsl_gdr_decode(
         use_qk_l2norm,
         **kwargs_,
     )
-    with torch.cuda.device(query.device.index):
+    # One setting for every float op the body traces, rather than a flag per
+    # call site. The jit compiles on first call, not on build, so it has to
+    # still be in scope at the launch.
+    with CompilationContext.compile_hints({"fastmath": "fast"}), torch.cuda.device(
+        query.device.index
+    ):
         _run_compiled(
             exe,
             query,
@@ -754,10 +759,14 @@ def _mtp_launch(
     inter_strides = tuple(inter_buffer.stride()) if inter_buffer is not None else ()
     parent_strides = tuple(parent_tokens.stride()) if parent_tokens is not None else ()
 
+    # One setting for every float op the body traces, rather than a flag per
+    # call site.
+    build_hints = {"fastmath": "fast"}
     # Measured per shape, so it rides in with the tuned tiling rather than
     # being derived here.
     waves_per_eu = kwargs_.get("WAVES_PER_EU", 0)
-    build_hints = {"waves_per_eu": waves_per_eu} if waves_per_eu else {}
+    if waves_per_eu:
+        build_hints["waves_per_eu"] = waves_per_eu
 
     with CompilationContext.compile_hints(build_hints):
         exe = create_vk_gdr_mtp_kernel(

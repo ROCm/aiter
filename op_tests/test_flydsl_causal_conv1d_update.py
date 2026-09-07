@@ -53,7 +53,6 @@ import argparse
 import itertools
 import os
 import sys
-import traceback
 from typing import NamedTuple
 
 import pandas as pd
@@ -2032,11 +2031,12 @@ def _run_perf_sweep(args):
 
 
 def main():
-    """Run every check without pytest, then the perf sweep.
+    """Run every check, then the perf sweep.
 
-    Exits non-zero if any check fails. CI shards ``op_tests/test_*.py`` by
-    invoking ``python3 <file>``, which would otherwise merely define the test
-    functions above and report success.
+    CI shards ``op_tests/test_*.py`` by invoking ``python3 <file>``, which would
+    otherwise merely define the test functions above and report success. Handing
+    the file back to pytest keeps collection automatic, so a test added above
+    cannot be one CI does not have.
     """
     args = _parse_args()
     if _SKIP_REASON is not None:
@@ -2051,93 +2051,16 @@ def main():
         return 0
 
     aiter.logger.info("causal_conv1d_update: running correctness checks...")
-    cases_run, failures = _run_correctness()
-    if failures:
-        for name, exc, tb in failures:
-            aiter.logger.error("FAILED %s: %r\n%s", name, exc, tb)
+    status = pytest.main([__file__, "-q", "-p", "no:cacheprovider"])
+    if status != pytest.ExitCode.OK:
         aiter.logger.error(
-            "causal_conv1d_update: %d of %d check(s) failed; skipping perf sweep",
-            len(failures),
-            cases_run,
+            "causal_conv1d_update: checks failed (pytest exit %s); skipping perf sweep",
+            int(status),
         )
         return 1
-    aiter.logger.info("causal_conv1d_update: all %d checks passed", cases_run)
 
     _run_perf_sweep(args)
     return 0
-
-
-def _run_correctness():
-    torch.manual_seed(0)
-    cases = [
-        (test_vllm_matches_upstream_vllm, _VLLM_CASES),
-        (
-            test_vllm_matches_upstream_across_widths_and_dtypes,
-            _VLLM_WIDTH_DTYPE_CASES,
-        ),
-        (test_vllm_addresses_a_conv_state_line_past_4gib, [()]),
-        (test_vllm_channels_per_thread_agree, [(1,), (2,)]),
-        (test_cpt_policy_backs_off_for_long_speculative_windows, [()]),
-        (test_vllm_skips_the_null_block, [()]),
-        (test_vllm_prefix_caching_writes_back_to_the_scheduled_block, _APC_CASES),
-        (test_sglang_matches_upstream_sglang, _SGLANG_CASES),
-        (
-            test_sglang_matches_upstream_across_widths_and_dtypes,
-            _SGLANG_WIDTH_DTYPE_CASES,
-        ),
-        (test_sglang_addresses_a_conv_state_line_past_4gib, [()]),
-        (test_sglang_addresses_a_snapshot_line_past_4gib, [()]),
-        (test_sglang_dedup_conv_window_matches_dense, _DEDUP_CASES),
-        (test_dispatch_seam_routes_to_flydsl, _SEAM_CASES),
-        (test_dispatch_seam_falls_through_when_out_of_scope, [()]),
-        (test_triton_refuses_unimplemented_width, [()]),
-        (test_dispatch_seam_preserves_2d_decode_shape, [()]),
-        (test_dispatch_seam_is_off_by_default, [()]),
-        (test_vllm_varlen_matches_the_dense_path, _VARLEN_DENSE_EQUIVALENT),
-        (test_vllm_varlen_matches_upstream_vllm, _VARLEN_CASES),
-        (test_vllm_reads_x_through_its_strides, [()]),
-        (test_sglang_reads_the_transposed_verify_window, [()]),
-        (test_predicates_accept_what_the_port_covers, [()]),
-        (test_out_of_scope_is_refused_rather_than_mishandled, [()]),
-        (test_perf_row_agrees_with_the_spec, [(m,) for m in BENCH_MODES]),
-    ]
-
-    # CI runs this file, not pytest, so a test that never makes it into `cases`
-    # is a test CI does not have. Compare by identity: `@benchmark` returns a
-    # bare closure, so the wrapped perf fn's ``__name__`` is not its own.
-    reached = {id(fn) for fn, _ in cases} | {id(test_causal_conv1d_update_perf)}
-    unreached = sorted(
-        name
-        for name, obj in globals().items()
-        if name.startswith("test_") and callable(obj) and id(obj) not in reached
-    )
-    assert not unreached, f"never run by the CI entry point: {unreached}"
-
-    # Report nothing per case, the way test_flydsl_mla_reduce.py's run_checks
-    # does, so a sweep run's perf table is not buried. Failures carry their
-    # traceback out to the caller.
-    cases_run = 0
-    skipped = 0
-    failures = []
-    for fn, arg_sets in cases:
-        for args in arg_sets:
-            name = f"{fn.__name__}{args if args else ''}"
-            try:
-                fn(*args)
-            except pytest.skip.Exception as exc:
-                # Skipped derives from BaseException, so it would sail past the
-                # collector below and abort the shard. A case that skips itself
-                # (too little free HBM for the >4GiB line) neither ran nor failed.
-                aiter.logger.info("causal_conv1d_update: skipped %s -- %s", name, exc)
-                skipped += 1
-            except Exception as exc:  # noqa: BLE001 - collect and keep going
-                failures.append((name, exc, traceback.format_exc()))
-                cases_run += 1
-            else:
-                cases_run += 1
-    if skipped:
-        aiter.logger.info("causal_conv1d_update: %d case(s) skipped", skipped)
-    return cases_run, failures
 
 
 if __name__ == "__main__":

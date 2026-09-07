@@ -153,21 +153,61 @@ def build_causal_conv1d_update_module(
         elem_dtype = fx.BFloat16 if dtype_str == "bf16" else fx.Float16
 
         def _rsrc(ptr):
+            # Index tensors keep the raw descriptor. Most of their loads are
+            # scalar, which a copy atom has no spelling for, since the values
+            # reach descriptor bases and those have to stay uniform; the rest
+            # are i32 and would each need an atom of their own to no gain.
             return buffer_ops.create_buffer_resource_from_addr(ptr)
 
         # A term scaling with the batch or the cache size goes in the 64-bit base;
         # the buffer offset is 32 bits. Both factors widen separately, their
         # product being what overflows.
-        def _rsrc_at(ptr, index, stride):
-            byte_offset = (
-                index.to(fx.Int64) * stride.to(fx.Int64) * fx.Int64(ELEM_BYTES)
+        def _addr_at(ptr, index, stride):
+            return ptr + index.to(fx.Int64) * stride.to(fx.Int64) * fx.Int64(ELEM_BYTES)
+
+        def _view(addr, vec_width):
+            """Buffer tensor over a raw pointer, indexed in elements.
+
+            The fast axis holds the ``vec_width`` elements one copy moves and
+            the other carries a unit stride, so a flat element index reaches
+            any element of the allocation. Repeats off one address fold back
+            together, the descriptor being the same value.
+            """
+            align = max(1, elem_dtype.width * vec_width // 8)
+            ptr_ty = fx.PointerType.get(
+                elem_dtype.ir_type, fx.AddressSpace.Global, align
             )
-            return buffer_ops.create_buffer_resource_from_addr(ptr + byte_offset)
+            base = fx.inttoptr(ptr_ty, fx.Int64(addr))
+            return rocdl.make_buffer_tensor(
+                fx.Tensor(fx.make_view(base, fx.make_layout((vec_width, 1), (1, 1))))
+            )
+
+        def _atom(vec_width):
+            return fx.make_copy_atom(
+                rocdl.BufferCopy(elem_dtype.width * vec_width), elem_dtype
+            )
+
+        def _load(addr, off, vec_width=1):
+            frag = fx.make_rmem_tensor(vec_width, elem_dtype)
+            fx.copy(
+                _atom(vec_width), fx.slice(_view(addr, vec_width), (None, off)), frag
+            )
+            vec = fx.Vector(frag.load())
+            return vec[0] if fx.const_expr(vec_width == 1) else vec
+
+        def _store(addr, off, value, vec_width=1):
+            frag = fx.make_rmem_tensor(vec_width, elem_dtype)
+            frag.store(
+                fx.Vector.from_elements([value], elem_dtype)
+                if fx.const_expr(vec_width == 1)
+                else value
+            )
+            fx.copy(
+                _atom(vec_width), frag, fx.slice(_view(addr, vec_width), (None, off))
+            )
 
         # Only the descriptors actually used: the rest are dummy (x) pointers, and
         # skipping them keeps their kernargs out of the prologue.
-        w_r = _rsrc(w_ptr)
-        b_r = _rsrc(bias_ptr) if fx.const_expr(HAS_BIAS) else None
         csi_r = _rsrc(csi_ptr)
         nacc_r = _rsrc(nacc_ptr) if fx.const_expr(IS_SPEC) else None
         qsl_r = _rsrc(qsl_ptr) if fx.const_expr(IS_VARLEN) else None
@@ -250,10 +290,10 @@ def build_causal_conv1d_update_module(
             o_seq_idx, o_seq_stride = idx_seq, so_seq
 
         # Read and write bases differ only under APC.
-        x_r = _rsrc_at(x_ptr, x_seq_idx, x_seq_stride)
-        o_r = _rsrc_at(o_ptr, o_seq_idx, o_seq_stride)
-        cs_r = _rsrc_at(cs_ptr, in_coord, scs_seq)
-        cs_out_r = _rsrc_at(cs_ptr, out_coord, scs_seq) if IS_APC else cs_r
+        x_a = _addr_at(x_ptr, x_seq_idx, x_seq_stride)
+        o_a = _addr_at(o_ptr, o_seq_idx, o_seq_stride)
+        cs_a = _addr_at(cs_ptr, in_coord, scs_seq)
+        cs_out_a = _addr_at(cs_ptr, out_coord, scs_seq) if IS_APC else cs_a
 
         # rollback point: spec -> num_accepted - 1, decode -> 0. Left per-lane
         # rather than scalar, since it never reaches a descriptor base.
@@ -272,7 +312,7 @@ def build_causal_conv1d_update_module(
         else:
             offset_dyn = fx.Int32(0)
 
-        def _store_run(vals, rsrc, base, stride, total, vectorize):
+        def _store_run(vals, addr, base, stride, total, vectorize):
             # Callers only set ``vectorize`` when the axis stride is 1, so the
             # slot offset is a constant here; spelling it as one keeps the byte
             # address out of the runtime path.
@@ -280,15 +320,15 @@ def build_causal_conv1d_update_module(
                 for start, wd in _vec_chunks(total):
                     off = base if fx.const_expr(start == 0) else base + fx.Int32(start)
                     if fx.const_expr(wd == 1):
-                        buffer_ops.buffer_store(vals[start], rsrc, off)
+                        _store(addr, off, vals[start])
                     else:
                         chunk = fx.Vector.from_elements(
                             [vals[start + j] for j in range(wd)], elem_dtype
                         )
-                        buffer_ops.buffer_store(chunk, rsrc, off)
+                        _store(addr, off, chunk, wd)
             else:
                 for t in fx.range_constexpr(total):
-                    buffer_ops.buffer_store(vals[t], rsrc, base + fx.Int32(t) * stride)
+                    _store(addr, base + fx.Int32(t) * stride, vals[t])
 
         # ================= per-channel work ==================================
         def _channel(gfeat):
@@ -323,57 +363,33 @@ def build_causal_conv1d_update_module(
                 else:
                     tok_idx = fx.Int32(tok)
                 off = x_base + tok_idx * sx_tok
-                x_raw.append(
-                    elem_dtype(
-                        buffer_ops.buffer_load(x_r, off, vec_width=1, dtype=elem_dtype)
-                    )
-                )
+                x_raw.append(_load(x_a, off))
 
             # STEP 4 weights (raw) + optional bias (raw)
             w_base = gfeat * sw_dim
             if fx.const_expr(WEIGHT_VEC):
-                wv = fx.Vector(
-                    buffer_ops.buffer_load(w_r, w_base, vec_width=W, dtype=elem_dtype)
-                )
+                wv = _load(w_ptr, w_base, W)
                 w_raw = [wv[j] for j in fx.range_constexpr(W)]
             else:
                 w_raw = []
                 for j in fx.range_constexpr(W):
                     off = w_base + fx.Int32(j) * sw_width
-                    w_raw.append(
-                        elem_dtype(
-                            buffer_ops.buffer_load(
-                                w_r, off, vec_width=1, dtype=elem_dtype
-                            )
-                        )
-                    )
+                    w_raw.append(_load(w_ptr, off))
             if fx.const_expr(HAS_BIAS):
-                bias_raw = elem_dtype(
-                    buffer_ops.buffer_load(b_r, gfeat, vec_width=1, dtype=elem_dtype)
-                )
+                bias_raw = _load(bias_ptr, gfeat)
 
             # ---- loads needing cs_base and offset_dyn ------------------------
             # STEP 1 history: W-1 taps starting at conv_state[offset + 0].
             col_raw = []
             for k in fx.range_constexpr(W - 1):
                 off = cs_base + (offset_dyn + fx.Int32(k)) * scs_tok
-                col_raw.append(
-                    elem_dtype(
-                        buffer_ops.buffer_load(cs_r, off, vec_width=1, dtype=elem_dtype)
-                    )
-                )
+                col_raw.append(_load(cs_a, off))
 
             if fx.const_expr(RUNTIME_SHIFT):
                 roll_raw = []
                 for t in fx.range_constexpr(VAL):
                     off = cs_base + (offset_dyn + s_len + fx.Int32(t)) * scs_tok
-                    roll_raw.append(
-                        elem_dtype(
-                            buffer_ops.buffer_load(
-                                cs_r, off, vec_width=1, dtype=elem_dtype
-                            )
-                        )
-                    )
+                    roll_raw.append(_load(cs_a, off))
 
             # STEP 2 needs no loads of its own. A rolled slot reads
             # conv_state[offset + SHIFT + t], and the roll condition bounds that
@@ -432,8 +448,10 @@ def build_causal_conv1d_update_module(
                         else active & (fx.Int32(t - VAL) < s_len)
                     )
                     if keep:
-                        buffer_ops.buffer_store(
-                            cs_vals[t], cs_out_r, cs_base + fx.Int32(t) * scs_tok
+                        _store(
+                            cs_out_a,
+                            cs_base + fx.Int32(t) * scs_tok,
+                            cs_vals[t],
                         )
                 for t in fx.range_constexpr(S):
                     keep = (
@@ -442,12 +460,10 @@ def build_causal_conv1d_update_module(
                         else active & (fx.Int32(t) < s_len)
                     )
                     if keep:
-                        buffer_ops.buffer_store(
-                            o_vals[t], o_r, o_base + fx.Int32(t) * so_tok
-                        )
+                        _store(o_a, o_base + fx.Int32(t) * so_tok, o_vals[t])
             elif active:
-                _store_run(cs_vals, cs_out_r, cs_base, scs_tok, ST, CS_VEC)
-                _store_run(o_vals, o_r, o_base, so_tok, S, O_VEC)
+                _store_run(cs_vals, cs_out_a, cs_base, scs_tok, ST, CS_VEC)
+                _store_run(o_vals, o_a, o_base, so_tok, S, O_VEC)
 
         for c in fx.range_constexpr(CPT):
             _channel(pid_y * fx.Int32(BN * CPT) + fx.Int32(c * BN) + tid)
@@ -673,14 +689,13 @@ def build_causal_conv1d_update_sglang_module(
         elem_dtype = fx.BFloat16 if dtype_str == "bf16" else fx.Float16
 
         def _rsrc(ptr):
+            # Index tensors keep the raw descriptor, for the reasons the
+            # vLLM-shaped kernel above spells out.
             return buffer_ops.create_buffer_resource_from_addr(ptr)
 
         # Same 64/32 split as the vLLM-shaped kernel above.
-        def _rsrc_at(ptr, index, stride):
-            byte_offset = (
-                index.to(fx.Int64) * stride.to(fx.Int64) * fx.Int64(ELEM_BYTES)
-            )
-            return buffer_ops.create_buffer_resource_from_addr(ptr + byte_offset)
+        def _addr_at(ptr, index, stride):
+            return ptr + index.to(fx.Int64) * stride.to(fx.Int64) * fx.Int64(ELEM_BYTES)
 
         def _load_i32(rsrc, off, is_scalar=False):
             return fx.Int32(
@@ -689,16 +704,43 @@ def build_causal_conv1d_update_sglang_module(
                 )
             )
 
-        def _load_elem(rsrc, off):
-            return elem_dtype(
-                buffer_ops.buffer_load(rsrc, off, vec_width=1, dtype=elem_dtype)
+        def _view(addr, vec_width):
+            align = max(1, elem_dtype.width * vec_width // 8)
+            ptr_ty = fx.PointerType.get(
+                elem_dtype.ir_type, fx.AddressSpace.Global, align
+            )
+            base = fx.inttoptr(ptr_ty, fx.Int64(addr))
+            return rocdl.make_buffer_tensor(
+                fx.Tensor(fx.make_view(base, fx.make_layout((vec_width, 1), (1, 1))))
+            )
+
+        def _atom(vec_width):
+            return fx.make_copy_atom(
+                rocdl.BufferCopy(elem_dtype.width * vec_width), elem_dtype
+            )
+
+        def _load(addr, off, vec_width=1):
+            frag = fx.make_rmem_tensor(vec_width, elem_dtype)
+            fx.copy(
+                _atom(vec_width), fx.slice(_view(addr, vec_width), (None, off)), frag
+            )
+            vec = fx.Vector(frag.load())
+            return vec[0] if fx.const_expr(vec_width == 1) else vec
+
+        def _store(addr, off, value, vec_width=1):
+            frag = fx.make_rmem_tensor(vec_width, elem_dtype)
+            frag.store(
+                fx.Vector.from_elements([value], elem_dtype)
+                if fx.const_expr(vec_width == 1)
+                else value
+            )
+            fx.copy(
+                _atom(vec_width), frag, fx.slice(_view(addr, vec_width), (None, off))
             )
 
         # Only the descriptors actually used; the rest are dummy pointers. The
-        # index buffers come first: the data descriptors below are based off the
-        # cache lines these carry.
-        w_r = _rsrc(w_ptr)
-        b_r = _rsrc(bias_ptr) if fx.const_expr(HAS_BIAS) else None
+        # index buffers come first: the data views below are based off the cache
+        # lines these carry.
         csi_r = _rsrc(csi_ptr)
         nacc_r = _rsrc(nacc_ptr) if fx.const_expr(IS_SPEC) else None
         isi_r = _rsrc(isi_ptr) if fx.const_expr(SAVE_ANY) else None
@@ -725,9 +767,9 @@ def build_causal_conv1d_update_sglang_module(
             if fx.const_expr(IS_SPEC)
             else in_coord
         )
-        x_r = _rsrc_at(x_ptr, idx_seq, sx_seq)
-        o_r = _rsrc_at(o_ptr, idx_seq, so_seq)
-        cs_r = _rsrc_at(cs_ptr, cs_line, scs_seq)
+        x_a = _addr_at(x_ptr, idx_seq, sx_seq)
+        o_a = _addr_at(o_ptr, idx_seq, so_seq)
+        cs_a = _addr_at(cs_ptr, cs_line, scs_seq)
 
         # rollback point: spec -> num_accept_tokens - 1, decode -> 0.
         if fx.const_expr(IS_SPEC):
@@ -738,7 +780,7 @@ def build_causal_conv1d_update_sglang_module(
         if fx.const_expr(SAVE_ANY):
             # Scalar because its only use is a descriptor base.
             inter_coord = _load_i32(isi_r, idx_seq * sisi, is_scalar=True)
-            inter_r = _rsrc_at(inter_ptr, inter_coord, si_seq)
+            inter_a = _addr_at(inter_ptr, inter_coord, si_seq)
 
         # ---- EAGLE tree: parent map + per-token tap chain -------------------
         # Channel-independent, so built once here; the per-channel loop below only
@@ -808,28 +850,26 @@ def build_causal_conv1d_update_sglang_module(
 
             # ============ PHASE 1: issue ALL loads up front ==================
             x_raw = [
-                _load_elem(x_r, x_base + fx.Int32(tok) * sx_tok)
+                _load(x_a, x_base + fx.Int32(tok) * sx_tok)
                 for tok in fx.range_constexpr(S)
             ]
 
             w_base = gfeat * sw_dim
             if fx.const_expr(WEIGHT_VEC):
-                wv = fx.Vector(
-                    buffer_ops.buffer_load(w_r, w_base, vec_width=W, dtype=elem_dtype)
-                )
+                wv = fx.Vector(_load(w_ptr, w_base, W))
                 w_raw = [wv[j] for j in fx.range_constexpr(W)]
             else:
                 w_raw = [
-                    _load_elem(w_r, w_base + fx.Int32(j) * sw_width)
+                    _load(w_ptr, w_base + fx.Int32(j) * sw_width)
                     for j in fx.range_constexpr(W)
                 ]
 
             if fx.const_expr(HAS_BIAS):
-                bias_raw = _load_elem(b_r, gfeat)
+                bias_raw = _load(bias_ptr, gfeat)
 
             # STEP 1 history columns, starting at conv_state[offset + 0].
             col_raw = [
-                _load_elem(cs_r, cs_base + (offset_dyn + fx.Int32(k)) * scs_tok)
+                _load(cs_a, cs_base + (offset_dyn + fx.Int32(k)) * scs_tok)
                 for k in fx.range_constexpr(W - 1)
             ]
 
@@ -844,7 +884,7 @@ def build_causal_conv1d_update_sglang_module(
                         if fx.const_expr(pidx is None):
                             per_tok.append(None)
                         else:
-                            per_tok.append(_load_elem(x_r, x_base + pidx * sx_tok))
+                            per_tok.append(_load(x_a, x_base + pidx * sx_tok))
                     tree_x.append(per_tok)
 
             # ================= PHASE 2: convert + convolution ================
@@ -935,7 +975,7 @@ def build_causal_conv1d_update_sglang_module(
                 for t in fx.range_constexpr(ST)
             ]
 
-            def _store_run(vals, rsrc, base, stride, total, vectorize):
+            def _store_run(vals, addr, base, stride, total, vectorize):
                 # Callers only set ``vectorize`` when the axis stride is 1, so
                 # the slot offset is a constant here; spelling it as one keeps
                 # the byte address out of the runtime path.
@@ -947,21 +987,19 @@ def build_causal_conv1d_update_sglang_module(
                             else base + fx.Int32(start)
                         )
                         if fx.const_expr(wd == 1):
-                            buffer_ops.buffer_store(vals[start], rsrc, off)
+                            _store(addr, off, vals[start])
                         else:
                             chunk = fx.Vector.from_elements(
                                 [vals[start + j] for j in range(wd)], elem_dtype
                             )
-                            buffer_ops.buffer_store(chunk, rsrc, off)
+                            _store(addr, off, chunk, wd)
                 else:
                     for t in fx.range_constexpr(total):
-                        buffer_ops.buffer_store(
-                            vals[t], rsrc, base + fx.Int32(t) * stride
-                        )
+                        _store(addr, base + fx.Int32(t) * stride, vals[t])
 
             if active:
-                _store_run(cs_vals, cs_r, cs_base, scs_tok, ST, CS_VEC)
-                _store_run(o_vals, o_r, o_base, so_tok, S, O_VEC)
+                _store_run(cs_vals, cs_a, cs_base, scs_tok, ST, CS_VEC)
+                _store_run(o_vals, o_a, o_base, so_tok, S, O_VEC)
 
                 if fx.const_expr(SAVE_STREAM):
                     # Every tap any token's window can reach, in one run. History
@@ -969,7 +1007,7 @@ def build_causal_conv1d_update_sglang_module(
                     # lines the stream up with conv_state's rolled layout.
                     _store_run(
                         [col_raw[k] for k in fx.range_constexpr(1, W - 1)] + x_raw,
-                        inter_r,
+                        inter_a,
                         gfeat * si_dim,
                         si_win,
                         STREAM_LEN,
@@ -982,7 +1020,7 @@ def build_causal_conv1d_update_sglang_module(
                         row = i_base + fx.Int32(t) * si_step
                         _store_run(
                             [v.to(elem_dtype) for v in inter_vals[t]],
-                            inter_r,
+                            inter_a,
                             row,
                             si_win,
                             W - 1,

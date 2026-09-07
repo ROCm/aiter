@@ -1,4 +1,3 @@
-import functools
 import os
 
 import torch
@@ -14,29 +13,13 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 _LOGGER = AiterTritonLogger()
 
 
-@functools.lru_cache(maxsize=1)
-def _flydsl_conv1d_update_available() -> bool:
-    # Probes the module the fast path imports below: `aiter.ops.flydsl` raises
-    # on a flydsl that is missing or too old, so a bad install is a False here
-    # rather than an exception out of a Triton entry point.
-    try:
-        from aiter.ops.flydsl import causal_conv1d_update_kernels  # noqa: F401
-
-        return True
-    except (ImportError, OSError, RuntimeError):
-        return False
-
-
 def _flydsl_conv1d_update_enabled() -> bool:
     """Opt-in gate for the FlyDSL causal_conv1d update port.
 
     Off by default, so Triton keeps serving every call. Not memoized, so the env
-    var can be toggled at runtime; only the availability probe is cached.
+    var can be toggled at runtime.
     """
-    return (
-        os.environ.get("AITER_CONV1D_UPDATE_FLYDSL", "") == "1"
-        and _flydsl_conv1d_update_available()
-    )
+    return os.environ.get("AITER_CONV1D_UPDATE_FLYDSL", "") == "1"
 
 
 def _assert_implemented_width(width: int, fn: str) -> None:

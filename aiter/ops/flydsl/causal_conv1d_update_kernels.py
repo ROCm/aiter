@@ -111,14 +111,17 @@ def _ceil_div(a: int, b: int) -> int:
 def _env_int(name: str | None) -> int | None:
     """Read an integer launch override, or ``None`` to keep the heuristic.
 
-    Unset, empty and ``"auto"`` all mean "no override"; anything unparseable
-    raises rather than being ignored. Cached, so a mid-process change is ignored.
+    Unset, empty, ``"auto"`` and anything at or below zero all mean "no
+    override", which is the reading the ``block_n`` and ``channels_per_thread``
+    arguments already give a zero; anything unparseable raises rather than being
+    ignored. Cached, so a mid-process change is ignored.
     """
     if name is None:
         return None
     if name not in _ENV_OVERRIDE_CACHE:
         raw = os.environ.get(name, "")
-        _ENV_OVERRIDE_CACHE[name] = None if raw in ("", "auto") else max(1, int(raw))
+        value = None if raw in ("", "auto") else int(raw)
+        _ENV_OVERRIDE_CACHE[name] = None if value is None or value <= 0 else value
     return _ENV_OVERRIDE_CACHE[name]
 
 

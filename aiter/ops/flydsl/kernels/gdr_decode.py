@@ -12,7 +12,6 @@ from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from .tensor_shim import (
-    GTensor,
     _to_raw,
     get_dtype_bytes,
     get_dtype_in_kernel,
@@ -26,6 +25,20 @@ def _gview(tensor, base, shape, stride):
     if base is not None:
         it = fx.add_offset(it, base)
     return fx.Tensor(fx.make_view(it, fx.make_layout(shape, stride)))
+
+
+def _gview64(tensor, base, shape, stride):
+    """Like :func:`_gview`, but ``base`` holds past a 32-bit offset.
+
+    Shifting the descriptor pointer instead can land the term in the
+    descriptor's own 32-bit offset and wrap silently; building the descriptor
+    off an already-shifted global pointer keeps it 64-bit. The pool and
+    snapshot bases below reach that far.
+    """
+    it = fx.add_offset(fx.get_iter(tensor), base)
+    return fx.Tensor(
+        fx.make_view(fx.rocdl.make_buffer_ptr(it), fx.make_layout(shape, stride))
+    )
 
 
 def _load_vec(atom, tile, width, numeric):
@@ -43,18 +56,6 @@ def _store_vec(atom, tile, value, width, numeric):
 
 def _fast_exp(x):
     return rocdl.exp2(T.f32, _to_raw(fx.Float32(x) * _LOG2E))
-
-
-def _fast_log1p(x):
-    return fx.math.log1p(x, fastmath=fx.FastMathFlags.fast)
-
-
-def _fast_rsqrt(x):
-    return rocdl.rsq(T.f32, _to_raw(fx.Float32(x)))
-
-
-def _fast_rcp(x):
-    return rocdl.rcp(T.f32, _to_raw(fx.Float32(x)))
 
 
 @functools.lru_cache(maxsize=1024)
@@ -324,7 +325,9 @@ def create_vk_gdr_decode_kernel(
                 # softplus with the large-x identity: for beta_x > threshold,
                 # softplus(x) == x. select computes both arms (the overflow arm
                 # is discarded) -> bit-identical to the old branch.
-                softplus_big = (f32_1 / softplus_beta_) * _fast_log1p(_fast_exp(beta_x))
+                softplus_big = (f32_1 / softplus_beta_) * fx.math.log1p(
+                    _fast_exp(beta_x)
+                )
                 softplus_x = (
                     fx.Float32(beta_x) <= fx.Float32(softplus_threshold_)
                 ).select(softplus_big, x)
@@ -595,7 +598,7 @@ def create_vk_gdr_decode_kernel(
     return launch_gdr_decode_kernel
 
 
-# Non-temporal bit for GTensor stores; loads do not forward it.
+# Non-temporal bit a copy atom's cache modifier takes; only stores honour it.
 NT_STORE = 2
 
 MTP_MODE_CHAIN = "chain"
@@ -668,6 +671,12 @@ def create_vk_gdr_mtp_kernel(
     else:
         VALUES_PER_THREAD_K = 8  # 16B
 
+    _NUM_BY_DTYPE = {"f32": fx.Float32, "f16": fx.Float16, "bf16": fx.BFloat16}
+    data_num = _NUM_BY_DTYPE[dtype]
+    A_log_num = _NUM_BY_DTYPE[A_log_dtype]
+    state_num = _NUM_BY_DTYPE[state_dtype]
+    inter_num = _NUM_BY_DTYPE[inter_dtype]
+
     WARP_SIZE = WARP_THREADS_V * WARP_THREADS_K
     BLOCK_THREADS = NUM_WARPS * WARP_SIZE
     assert WARP_SIZE == 64
@@ -694,7 +703,6 @@ def create_vk_gdr_mtp_kernel(
         offsets_ /= 2
     WARP_THREADS_K_SHFL_OFFSETS = WARP_THREADS_K_SHFL_OFFSETS[::-1]
 
-    STATE_BYTES = get_dtype_bytes(state_dtype)
     INTER_BYTES = get_dtype_bytes(inter_dtype) if SAVE_INTER else 0
 
     assert not SAVE_INTER or VALUES_PER_THREAD_K * INTER_BYTES <= 16, (
@@ -737,13 +745,9 @@ def create_vk_gdr_mtp_kernel(
         inv_softplus_beta_ = fx.Float32(1.0 / softplus_beta)
         softplus_threshold_ = fx.Float32(softplus_threshold)
 
-        dtype_ = get_dtype_in_kernel(dtype)
-        fx_dtype_ = fx.BFloat16 if dtype == "bf16" else fx.Float16
-        A_log_dtype_ = get_dtype_in_kernel(A_log_dtype)
-        state_dtype_ = get_dtype_in_kernel(state_dtype)
         f32_0 = fx.Float32(0.0)
         f32_1 = fx.Float32(1.0)
-        state_vec_t = T.vec(VALUES_PER_THREAD_K, state_dtype_)
+        state_vec_t = T.vec(VALUES_PER_THREAD_K, get_dtype_in_kernel(state_dtype))
         acc_vec_t = T.vec(VALUES_PER_THREAD_K, T.f32)
 
         tidx = fx.thread_idx.x
@@ -761,96 +765,142 @@ def create_vk_gdr_mtp_kernel(
         warp_k_vec_start = w_tid % WARP_THREADS_K * VALUES_PER_THREAD_K
         global_v_start = tile_v_start + wid * WARP_TILE_V + w_tid // WARP_THREADS_K
 
+        cp_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
+        cp_data = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), data_num)
+        cp_data_vec = fx.make_copy_atom(
+            fx.rocdl.BufferCopy(data_num.width * VALUES_PER_THREAD_K), data_num
+        )
+        cp_A_log = fx.make_copy_atom(fx.rocdl.BufferCopy(A_log_num.width), A_log_num)
+        cp_state_vec = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), state_num)
+        cp_inter_vec = fx.make_copy_atom(
+            fx.rocdl.BufferCopy(inter_num.width * VALUES_PER_THREAD_K), inter_num
+        )
+        # A snapshot slot nothing descends from is written past the cache.
+        cp_inter_vec_nt = fx.make_copy_atom(
+            fx.rocdl.BufferCopy(
+                inter_num.width * VALUES_PER_THREAD_K, cache_modifier=NT_STORE
+            ),
+            inter_num,
+        )
+
         # Addressed with the caller's strides, so 1-D [B] and 2-D [B, T] both map.
-        si_tensor = GTensor(state_indices, dtype=T.i32, shape=(-1,))
+        si_view = _gview(
+            state_indices, None, (batch_size, seq_length, 1), (*si_strides, 1)
+        )
+
+        def _slot_at(token):
+            return fx.Int32(
+                _load_vec(cp_i32, fx.slice(si_view, (b_i, token, None)), 1, fx.Int32)
+            )
 
         if const_expr(CHAIN):
-            token_slots = [
-                fx.Int32(si_tensor[b_i * si_strides[0] + t * si_strides[1]])
-                for t in range_constexpr(seq_length)
-            ]
+            token_slots = [_slot_at(t) for t in range_constexpr(seq_length)]
 
         # vLLM reserves slot 0 as its null block; SGLang's slot 0 is ordinary and
         # a dead slot is a negative sentinel instead.
         MIN_LIVE_SLOT = 1 if CHAIN else 0
 
         if const_expr(CHAIN):
-            nacc_tensor = GTensor(num_accepted, dtype=T.i32, shape=(-1,))
-            read_token = fx.Int32(nacc_tensor[b_i]) - fx.Int32(1)
-            read_slot = fx.Int32(
-                si_tensor[b_i * si_strides[0] + read_token * si_strides[1]]
-            )
+            nacc_view = _gview(num_accepted, None, (batch_size, 1), (1, 1))
+            read_token = fx.Int32(
+                _load_vec(cp_i32, fx.slice(nacc_view, (b_i, None)), 1, fx.Int32)
+            ) - fx.Int32(1)
+            read_slot = _slot_at(read_token)
         else:
-            read_slot = fx.Int32(si_tensor[b_i * si_strides[0]])
+            read_slot = _slot_at(0)
 
         if const_expr(SAVE_INTER):
-            isi_tensor = GTensor(inter_indices, dtype=T.i32, shape=(-1,))
-            cache_idx = fx.Int32(isi_tensor[b_i])
+            isi_view = _gview(inter_indices, None, (batch_size, 1), (1, 1))
+            cache_idx = fx.Int32(
+                _load_vec(cp_i32, fx.slice(isi_view, (b_i, None)), 1, fx.Int32)
+            )
         if const_expr(TREE):
-            parent_tensor = GTensor(parent_tokens, dtype=T.i32, shape=(-1,))
-
-        q_tensor = GTensor(
-            query,
-            dtype=dtype_,
-            shape=(-1, seq_length, num_k_heads, head_k_dim),
-            stride=q_strides,
-        )
-        k_tensor = GTensor(
-            key,
-            dtype=dtype_,
-            shape=(-1, seq_length, num_k_heads, head_k_dim),
-            stride=k_strides,
-        )
-        v_tensor = GTensor(
-            value,
-            dtype=dtype_,
-            shape=(-1, seq_length, num_v_heads, head_v_dim),
-            stride=v_strides,
-        )
-        a_tensor = GTensor(
-            a,
-            dtype=dtype_,
-            stride=(a_strides[0], a_strides[1], a_strides[2]),
-            shape=(-1, seq_length, num_v_heads),
-        )
-        b_tensor = GTensor(
-            b,
-            dtype=dtype_,
-            stride=(b_strides[0], b_strides[1], b_strides[2]),
-            shape=(-1, seq_length, num_v_heads),
-        )
-        dt_bias_tensor = GTensor(dt_bias, dtype=dtype_, shape=(num_v_heads,))
-        A_log_tensor = GTensor(A_log, dtype=A_log_dtype_, shape=(num_v_heads,))
-        out_tensor = GTensor(
-            out, dtype=dtype_, shape=(-1, seq_length, num_v_heads, head_v_dim)
-        )
-
-        # Any term scaling with the pool or the snapshot buffer goes in the
-        # 64-bit base; the buffer offset is 32 bits.
-        def _state_at(slot):
-            return GTensor(
-                state,
-                dtype=state_dtype_,
-                shape=(num_v_heads, head_v_dim, head_k_dim),
-                stride=(state_strides[1], state_strides[2], state_strides[3]),
-                static_bytes_offset_i64=fx.Int64(slot)
-                * fx.Int64(state_strides[0])
-                * STATE_BYTES,
+            parent_idx_view = _gview(
+                parent_tokens, None, (batch_size, seq_length, 1), (*parent_strides, 1)
             )
 
-        def _inter_at(slot, step, cache_modifier=0):
-            inter_dtype_ = get_dtype_in_kernel(inter_dtype)
-            return GTensor(
+        q_view = _gview(
+            query,
+            None,
+            (
+                batch_size,
+                seq_length,
+                num_k_heads,
+                head_k_dim // VALUES_PER_THREAD_K,
+                VALUES_PER_THREAD_K,
+            ),
+            (*q_strides[:-1], VALUES_PER_THREAD_K, 1),
+        )
+        k_view = _gview(
+            key,
+            None,
+            (
+                batch_size,
+                seq_length,
+                num_k_heads,
+                head_k_dim // VALUES_PER_THREAD_K,
+                VALUES_PER_THREAD_K,
+            ),
+            (*k_strides[:-1], VALUES_PER_THREAD_K, 1),
+        )
+        v_view = _gview(
+            value,
+            None,
+            (batch_size, seq_length, num_v_heads, head_v_dim, 1),
+            (*v_strides, 1),
+        )
+        a_view = _gview(
+            a, None, (batch_size, seq_length, num_v_heads, 1), (*a_strides, 1)
+        )
+        b_view = _gview(
+            b, None, (batch_size, seq_length, num_v_heads, 1), (*b_strides, 1)
+        )
+        dt_bias_view = _gview(dt_bias, None, (num_v_heads, 1), (1, 1))
+        A_log_view = _gview(A_log, None, (num_v_heads, 1), (1, 1))
+        out_view = _gview(
+            out,
+            None,
+            (batch_size, seq_length, num_v_heads, head_v_dim, 1),
+            (
+                seq_length * num_v_heads * head_v_dim,
+                num_v_heads * head_v_dim,
+                head_v_dim,
+                1,
+                1,
+            ),
+        )
+
+        # Only the term scaling with the pool or the snapshot buffer needs the
+        # 64-bit base; the buffer offset is 32 bits.
+        vec_shape = (
+            num_v_heads,
+            head_v_dim,
+            head_k_dim // VALUES_PER_THREAD_K,
+            VALUES_PER_THREAD_K,
+        )
+
+        def _state_at(slot):
+            return _gview64(
+                state,
+                fx.Int64(slot) * fx.Int64(state_strides[0]),
+                vec_shape,
+                (state_strides[1], state_strides[2], VALUES_PER_THREAD_K, 1),
+            )
+
+        # One descriptor for the sequence's whole record: a step is a layout
+        # dimension, since the window's own span stays well inside 32 bits.
+        if const_expr(SAVE_INTER):
+            inter_view = _gview64(
                 inter_buffer,
-                cache_modifier=cache_modifier,
-                dtype=inter_dtype_,
-                shape=(num_v_heads, head_v_dim, head_k_dim),
-                stride=(inter_strides[2], inter_strides[3], inter_strides[4]),
-                static_bytes_offset_i64=(
-                    fx.Int64(slot) * fx.Int64(inter_strides[0])
-                    + fx.Int64(step) * fx.Int64(inter_strides[1])
-                )
-                * INTER_BYTES,
+                fx.Int64(cache_idx) * fx.Int64(inter_strides[0]),
+                (seq_length, *vec_shape),
+                (
+                    inter_strides[1],
+                    inter_strides[2],
+                    inter_strides[3],
+                    VALUES_PER_THREAD_K,
+                    1,
+                ),
             )
 
         # The tree emits the body once per arm, so a hoisted value is live across both.
@@ -859,45 +909,77 @@ def create_vk_gdr_mtp_kernel(
         def _taps(sq):
             """The gate and value scalars one token reads."""
             return (
-                a_tensor[b_i, sq, hv_i],
-                b_tensor[b_i, sq, hv_i],
+                _load_vec(
+                    cp_data, fx.slice(a_view, (b_i, sq, hv_i, None)), 1, data_num
+                ).to(fx.Float32),
+                _load_vec(
+                    cp_data, fx.slice(b_view, (b_i, sq, hv_i, None)), 1, data_num
+                ).to(fx.Float32),
                 [
-                    v_tensor[b_i, sq, hv_i, global_v_start + vi * WARP_GROUP_TILE_V]
+                    _load_vec(
+                        cp_data,
+                        fx.slice(
+                            v_view,
+                            (
+                                b_i,
+                                sq,
+                                hv_i,
+                                global_v_start + vi * WARP_GROUP_TILE_V,
+                                None,
+                            ),
+                        ),
+                        1,
+                        data_num,
+                    ).to(fx.Float32)
                     for vi in range_constexpr(WARP_TILE_V_ITERS)
                 ],
             )
 
+        def _A_log_tap():
+            r = _load_vec(cp_A_log, fx.slice(A_log_view, (hv_i, None)), 1, A_log_num)
+            if const_expr("f32" not in A_log_dtype):
+                r = r.to(fx.Float32)
+            return r
+
+        def _dt_bias_tap():
+            return _load_vec(
+                cp_data, fx.slice(dt_bias_view, (hv_i, None)), 1, data_num
+            ).to(fx.Float32)
+
         if const_expr(HOIST_ENTRY):
-            if const_expr("f32" in A_log_dtype):
-                entry_A_log = A_log_tensor[hv_i]
-            else:
-                entry_A_log = A_log_tensor[hv_i].extf(T.f32)
-            entry_dt_bias = dt_bias_tensor[hv_i].extf(T.f32)
+            entry_A_log = _A_log_tap()
+            entry_dt_bias = _dt_bias_tap()
             entry_taps = _taps(0)
 
         # reload_parents and snapshot are traced flags, not runtime ones: a value
         # defined inside an scf.if does not dominate its use after it.
         def _do_mtp(reload_parents=False, snapshot="no"):
             if const_expr(not HOIST_ENTRY):
-                if const_expr("f32" in A_log_dtype):
-                    r_A_log = A_log_tensor[hv_i]
-                else:
-                    r_A_log = A_log_tensor[hv_i].extf(T.f32)
-                r_dt_bias = dt_bias_tensor[hv_i].extf(T.f32)
+                r_A_log = _A_log_tap()
+                r_dt_bias = _dt_bias_tap()
             else:
                 r_A_log = entry_A_log
                 r_dt_bias = entry_dt_bias
 
-            read_state_tensor = _state_at(read_slot)
+            read_state_view = _state_at(read_slot)
             state_vecs = [0] * (WARP_TILE_V_ITERS * WARP_TILE_K_ITERS)
             for vi in range_constexpr(WARP_TILE_V_ITERS):
                 global_v_i = global_v_start + vi * WARP_GROUP_TILE_V
                 for ki in range_constexpr(WARP_TILE_K_ITERS):
                     warp_k_vec_i = warp_k_vec_start + ki * WARP_TILE_K
-                    state_vecs[vi * WARP_TILE_K_ITERS + ki] = (
-                        read_state_tensor.vec_load(
-                            (hv_i, global_v_i, warp_k_vec_i), VALUES_PER_THREAD_K
-                        )
+                    state_vecs[vi * WARP_TILE_K_ITERS + ki] = _load_vec(
+                        cp_state_vec,
+                        fx.slice(
+                            read_state_view,
+                            (
+                                hv_i,
+                                global_v_i,
+                                warp_k_vec_i // VALUES_PER_THREAD_K,
+                                None,
+                            ),
+                        ),
+                        VALUES_PER_THREAD_K,
+                        state_num,
                     )
                     if const_expr("f32" in state_dtype):
                         pass
@@ -922,17 +1004,31 @@ def create_vk_gdr_mtp_kernel(
                         )
                 if const_expr(reload_parents and sq_i != 0 and not held):
                     parent_step = fx.Int32(
-                        parent_tensor[
-                            b_i * parent_strides[0] + sq_i * parent_strides[1]
-                        ]
+                        _load_vec(
+                            cp_i32,
+                            fx.slice(parent_idx_view, (b_i, sq_i, None)),
+                            1,
+                            fx.Int32,
+                        )
                     )
-                    parent_view = _inter_at(cache_idx, parent_step)
                     for vi in range_constexpr(WARP_TILE_V_ITERS):
                         gv = global_v_start + vi * WARP_GROUP_TILE_V
                         for ki in range_constexpr(WARP_TILE_K_ITERS):
                             kv = warp_k_vec_start + ki * WARP_TILE_K
-                            loaded = parent_view.vec_load(
-                                (hv_i, gv, kv), VALUES_PER_THREAD_K
+                            loaded = _load_vec(
+                                cp_inter_vec,
+                                fx.slice(
+                                    inter_view,
+                                    (
+                                        parent_step,
+                                        hv_i,
+                                        gv,
+                                        kv // VALUES_PER_THREAD_K,
+                                        None,
+                                    ),
+                                ),
+                                VALUES_PER_THREAD_K,
+                                inter_num,
                             )
                             if const_expr("f32" in inter_dtype):
                                 state_vecs[vi * WARP_TILE_K_ITERS + ki] = loaded
@@ -941,21 +1037,19 @@ def create_vk_gdr_mtp_kernel(
                                     acc_vec_t
                                 )
 
-                tap_a, tap_b, r_v_raw = taps
+                r_a, r_b, r_v_taps = taps
                 if const_expr(sq_i + 1 < seq_length):
                     taps = _taps(sq_i + 1)
 
-                r_a = tap_a.extf(T.f32)
-                r_b = tap_b.extf(T.f32)
                 x = r_a + r_dt_bias
                 beta_x = softplus_beta_ * x
 
                 # For beta_x > threshold, softplus(x) == x; both arms run and one is dropped.
-                softplus_big = inv_softplus_beta_ * _fast_log1p(_fast_exp(beta_x))
+                softplus_big = inv_softplus_beta_ * fx.math.log1p(_fast_exp(beta_x))
                 softplus_x = (beta_x <= softplus_threshold_).select(softplus_big, x)
 
                 r_g_value = -_fast_exp(r_A_log) * softplus_x
-                r_beta = _fast_rcp(f32_1 + _fast_exp(-r_b))
+                r_beta = f32_1 / (f32_1 + _fast_exp(-r_b))
                 r_g = _fast_exp(r_g_value)
 
                 r_g_vec = fx.Vector.filled(
@@ -976,11 +1070,35 @@ def create_vk_gdr_mtp_kernel(
 
                 for ki in range_constexpr(WARP_TILE_K_ITERS):
                     warp_k_vec_i = warp_k_vec_start + ki * WARP_TILE_K
-                    q_vec = q_tensor.vec_load(
-                        (b_i, sq_i, hk_i, warp_k_vec_i), VALUES_PER_THREAD_K
+                    q_vec = _load_vec(
+                        cp_data_vec,
+                        fx.slice(
+                            q_view,
+                            (
+                                b_i,
+                                sq_i,
+                                hk_i,
+                                warp_k_vec_i // VALUES_PER_THREAD_K,
+                                None,
+                            ),
+                        ),
+                        VALUES_PER_THREAD_K,
+                        data_num,
                     )
-                    k_vec = k_tensor.vec_load(
-                        (b_i, sq_i, hk_i, warp_k_vec_i), VALUES_PER_THREAD_K
+                    k_vec = _load_vec(
+                        cp_data_vec,
+                        fx.slice(
+                            k_view,
+                            (
+                                b_i,
+                                sq_i,
+                                hk_i,
+                                warp_k_vec_i // VALUES_PER_THREAD_K,
+                                None,
+                            ),
+                        ),
+                        VALUES_PER_THREAD_K,
+                        data_num,
                     )
                     sq_vecs[ki] = q_vec.extf(acc_vec_t)
                     sk_vecs[ki] = k_vec.extf(acc_vec_t)
@@ -1017,8 +1135,8 @@ def create_vk_gdr_mtp_kernel(
                     lane0 = w_tid // WARP_THREADS_K * WARP_THREADS_K
                     local_sum_q = fx.shuffle_idx(sum_q_partial, lane0, WARP_SIZE)
                     local_sum_k = fx.shuffle_idx(sum_k_partial, lane0, WARP_SIZE)
-                    inv_norm_q = _fast_rsqrt(local_sum_q + 1e-6)
-                    inv_norm_k = _fast_rsqrt(local_sum_k + 1e-6)
+                    inv_norm_q = fx.math.rsqrt(local_sum_q + 1e-6)
+                    inv_norm_k = fx.math.rsqrt(local_sum_k + 1e-6)
                     inv_norm_q_vec = fx.Vector.filled(
                         VALUES_PER_THREAD_K, fx.Float32(inv_norm_q), fx.Float32
                     )
@@ -1043,7 +1161,7 @@ def create_vk_gdr_mtp_kernel(
 
                 for vi in range_constexpr(WARP_TILE_V_ITERS):
                     global_v_i = global_v_start + vi * WARP_GROUP_TILE_V
-                    r_v = r_v_raw[vi].extf(T.f32)
+                    r_v = r_v_taps[vi]
 
                     sum_hk = fx.Vector.from_elements(
                         [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)],
@@ -1086,11 +1204,17 @@ def create_vk_gdr_mtp_kernel(
                         )
                         state_vecs[vi * WARP_TILE_K_ITERS + ki] = h_new
 
-                    sum_hq = sum_hq.to(fx_dtype_)
+                    sum_hq = sum_hq.to(data_num)
 
                     # Closure keeps the store opaque to the runtime-if state analysis.
                     def _write_q(_sum_hq=sum_hq, _gv=global_v_i, _sq=sq_i):
-                        out_tensor[b_i, _sq, hv_i, _gv] = _sum_hq
+                        _store_vec(
+                            cp_data,
+                            fx.slice(out_view, (b_i, _sq, hv_i, _gv, None)),
+                            _sum_hq,
+                            1,
+                            data_num,
+                        )
 
                     if warp_k_vec_start == 0:
                         _write_q()
@@ -1109,8 +1233,15 @@ def create_vk_gdr_mtp_kernel(
                                     out_vec = acc
                                 else:
                                     out_vec = acc.truncf(state_vec_t)
-                                _view.vec_store(
-                                    (hv_i, gv, kv), out_vec, VALUES_PER_THREAD_K
+                                _store_vec(
+                                    cp_state_vec,
+                                    fx.slice(
+                                        _view,
+                                        (hv_i, gv, kv // VALUES_PER_THREAD_K, None),
+                                    ),
+                                    out_vec,
+                                    VALUES_PER_THREAD_K,
+                                    state_num,
                                 )
 
                     if write_slot >= MIN_LIVE_SLOT:
@@ -1120,16 +1251,12 @@ def create_vk_gdr_mtp_kernel(
                     # The tree rereads a step when it walks to a child; nothing
                     # descends from the last.
                     keeps_reading = reload_parents and sq_i != seq_length - 1
-                    snap_view = _inter_at(
-                        cache_idx,
-                        sq_i,
-                        cache_modifier=0 if keeps_reading else NT_STORE,
-                    )
+                    snap_atom = cp_inter_vec if keeps_reading else cp_inter_vec_nt
                     inter_vec_t = T.vec(
                         VALUES_PER_THREAD_K, get_dtype_in_kernel(inter_dtype)
                     )
 
-                    def _snapshot(_view=snap_view, _vec_t=inter_vec_t):
+                    def _snapshot(_step=sq_i, _vec_t=inter_vec_t, _atom=snap_atom):
                         for vi in range_constexpr(WARP_TILE_V_ITERS):
                             gv = global_v_start + vi * WARP_GROUP_TILE_V
                             for ki in range_constexpr(WARP_TILE_K_ITERS):
@@ -1139,8 +1266,21 @@ def create_vk_gdr_mtp_kernel(
                                     out_vec = acc
                                 else:
                                     out_vec = acc.truncf(_vec_t)
-                                _view.vec_store(
-                                    (hv_i, gv, kv), out_vec, VALUES_PER_THREAD_K
+                                _store_vec(
+                                    _atom,
+                                    fx.slice(
+                                        inter_view,
+                                        (
+                                            _step,
+                                            hv_i,
+                                            gv,
+                                            kv // VALUES_PER_THREAD_K,
+                                            None,
+                                        ),
+                                    ),
+                                    out_vec,
+                                    VALUES_PER_THREAD_K,
+                                    inter_num,
                                 )
 
                     if const_expr(snapshot == "always"):
@@ -1150,8 +1290,10 @@ def create_vk_gdr_mtp_kernel(
                             _snapshot()
 
             # The chain's last token already checkpointed into its own slot.
+            # Snapshot mode writes back into the slot it read, so the read's
+            # descriptor already addresses it.
             if const_expr(SNAPSHOT and not NO_STATE_WRITE):
-                write_view = _state_at(read_slot)
+                write_view = read_state_view
                 for vi in range_constexpr(WARP_TILE_V_ITERS):
                     global_v_i = global_v_start + vi * WARP_GROUP_TILE_V
                     for ki in range_constexpr(WARP_TILE_K_ITERS):
@@ -1161,10 +1303,20 @@ def create_vk_gdr_mtp_kernel(
                             out_vec = acc
                         else:
                             out_vec = acc.truncf(state_vec_t)
-                        write_view.vec_store(
-                            (hv_i, global_v_i, warp_k_vec_i),
+                        _store_vec(
+                            cp_state_vec,
+                            fx.slice(
+                                write_view,
+                                (
+                                    hv_i,
+                                    global_v_i,
+                                    warp_k_vec_i // VALUES_PER_THREAD_K,
+                                    None,
+                                ),
+                            ),
                             out_vec,
                             VALUES_PER_THREAD_K,
+                            state_num,
                         )
 
         # Flat rather than nested, so no scf.if carries a value out of itself.
