@@ -432,21 +432,7 @@ def flydsl_top_k_per_row_prefill(
     stable: bool = False,
     max_effective_row_len: int | None = None,
 ) -> None:
-    """Use FlyDSL for unordered indices-only prefill TopK, otherwise HIP."""
-    if values is not None or stable:
-        return top_k_per_row_prefill(
-            logits,
-            rowStarts,
-            rowEnds,
-            indices,
-            values,
-            numRows,
-            stride0,
-            stride1,
-            k,
-            stable,
-        )
-
+    """Use FlyDSL for per-row prefill TopK."""
     from .flydsl.topk_per_row_prefill import (
         flydsl_top_k_per_row_prefill as _impl,
     )
