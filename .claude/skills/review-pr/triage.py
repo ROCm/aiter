@@ -1936,6 +1936,20 @@ def is_concrete(text):
     return bool(VALUE.search(text)) or len(set(IDENT.findall(text))) >= 2
 
 
+def _fold_punct(text):
+    """Normalise the punctuation a card and a verdict can spell differently.
+
+    A finding written `62–67 s` (en dash) against a verdict written `62-67 s`, or `414,720`
+    against `414720`, was reported as appearing "in no verdict, diagnostic or blind-spot
+    line" -- and the message named none of that, so the reviewer guessed. SKILL.md's own
+    example card is full of em dashes, so the document teaches the shape the gate rejects.
+    """
+    for a, b in (("\u2014", "-"), ("\u2013", "-"), ("\u2212", "-"),
+                 ("\u2019", "'"), ("\u201c", '"'), ("\u201d", '"')):
+        text = text.replace(a, b)
+    return re.sub(r"(?<=\d),(?=\d{3}\b)", "", text)
+
+
 def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_text):
     """Every finding in the card must trace back to something already adjudicated.
 
@@ -1960,7 +1974,8 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
             # The files this verdict cited, so a card that obeys the no-rule-codes rule
             # can still be matched to the FIRE it is reporting.
             fire_paths[m.group(1)] = [pp for pp, _ in CITATION.findall(m.group(2))]
-    backing = (verdicts_text or "") + "\n" + (diagnostic_text or "") + "\n" + (answers_text or "")
+    backing = _fold_punct((verdicts_text or "") + "\n" + (diagnostic_text or "")
+                          + "\n" + (answers_text or ""))
     problems = []
     findings = []
     for line in (card_text or "").splitlines():
@@ -2029,7 +2044,7 @@ def audit_card(card_text, verdicts_text, diagnostic_text, answers_text, diff_tex
             if not re.search(rf"(?<![\w]){re.escape(rid.group(1))}\b\s+FIRE", backing):
                 problems.append(("UNBACKED-FINDING", text[:70],
                                  f"{rid.group(1)} is reported but was not adjudicated FIRE"))
-        elif cited and not any(c.rsplit("/", 1)[-1] in backing for c in cited):
+        elif cited and not any(_fold_punct(c).rsplit("/", 1)[-1] in backing for c in cited):
             problems.append(("UNBACKED-FINDING", text[:70],
                              "appears in no verdict, diagnostic or blind-spot line"))
         if red and not is_concrete(text):
@@ -2072,20 +2087,31 @@ if __name__ == "__main__":
         raise SystemExit(2)
 
     if mode == "independent":
+        if len(sys.argv) > 3 and not pathlib.Path(sys.argv[3]).exists():
+            print("CARD MISSING: %s. Write the card first; this gate checks it against "
+                  "the independent verdicts and cannot do that without it" % sys.argv[3])
+            sys.exit(1)
         out = audit_independent(
             open(sys.argv[2], errors="replace").read()
             if pathlib.Path(sys.argv[2]).exists() else "",
-            open(sys.argv[3], errors="replace").read()
-            if len(sys.argv) > 3 and pathlib.Path(sys.argv[3]).exists() else "")
+            open(sys.argv[3], errors="replace").read() if len(sys.argv) > 3 else "")
         print("\n".join(out))
         sys.exit(0 if out[0].startswith(("INDEPENDENTLY REFUTED",
                                          "INDEPENDENT REFUTATION:")) else 1)
     if mode == "refutations":
+        # A missing card is not an empty card. Both this gate and `independent` decide
+        # "did every reported finding get attacked" by counting the findings ON the card;
+        # with no card to read, that check silently does not run and the gate goes green
+        # -- the one state in which it certainly cannot do its job.
+        if len(sys.argv) > 4 and not pathlib.Path(sys.argv[4]).exists():
+            print("CARD MISSING: %s. Write the card first; this gate checks it against "
+                  "the refutations and cannot do that without it" % sys.argv[4])
+            sys.exit(1)
         out = audit_refutations(open(sys.argv[2], errors="replace").read()
                                 if pathlib.Path(sys.argv[2]).exists() else "",
                                 open(sys.argv[3], errors="replace").read(),
                                 open(sys.argv[4], errors="replace").read()
-                                if len(sys.argv) > 4 and pathlib.Path(sys.argv[4]).exists() else "")
+                                if len(sys.argv) > 4 else "")
         print("\n".join(out))
         sys.exit(0 if out[0].startswith("REFUTATIONS COMPLETE") else 1)
     if mode == "guards":
