@@ -67,7 +67,6 @@ _LAZY_IMPORTS = {
         ".kernels.qk_norm_rope_quant",
         "flydsl_qk_norm_rope_quant",
     ),
-    "QRInt4": (".kernels.qr_int4", "QRInt4"),
 }
 
 __all__ = [
